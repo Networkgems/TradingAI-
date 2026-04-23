@@ -51,17 +51,15 @@ export async function fetchQuote(symbol: string): Promise<{ price: number; volum
   }
 }
 
-/** Batch-fetch quotes for all symbols. */
+const sleep = (ms: number) => new Promise(resolve => setTimeout(resolve, ms));
+
+/** Batch-fetch quotes for all symbols, serialised with a small delay to avoid rate limiting. */
 export async function fetchQuotes(symbols: readonly string[]): Promise<Map<string, { price: number; volume: number; change: number; changePct: number }>> {
   const results = new Map<string, { price: number; volume: number; change: number; changePct: number }>();
-  // Yahoo Finance supports batch via quoteSummary but simpler to fan out with concurrency limit
-  const batchSize = 5;
-  for (let i = 0; i < symbols.length; i += batchSize) {
-    const batch = symbols.slice(i, i + batchSize);
-    await Promise.all(batch.map(async sym => {
-      const q = await fetchQuote(sym);
-      if (q) results.set(sym, q);
-    }));
+  for (const sym of symbols) {
+    const q = await fetchQuote(sym);
+    if (q) results.set(sym, q);
+    await sleep(150); // 150 ms gap — ~4 s for 25 symbols, well under Yahoo Finance rate limits
   }
   return results;
 }

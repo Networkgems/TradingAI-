@@ -76,9 +76,10 @@ export class SignalEngine {
     const closed = this.account.checkExits(prices);
     if (closed.length > 0) this.allClosedPositions.push(...closed);
 
-    // Fetch candles for strategy evaluation (fan-out with concurrency limit)
-    const candlePromises = WATCHLIST.map(sym => this.refreshCandles(sym));
-    await Promise.all(candlePromises);
+    // Fetch candles serially to avoid Yahoo Finance rate limits
+    for (const sym of WATCHLIST) {
+      await this.refreshCandles(sym);
+    }
 
     // Run strategies and collect new signals
     for (const sym of WATCHLIST) {
