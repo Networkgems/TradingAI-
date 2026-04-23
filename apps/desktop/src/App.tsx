@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState } from 'react';
-import type { TradeSignal, Position, AccountState } from '@trading-app/shared';
+import type { TradeSignal, Position, AccountState, OptionPosition, OptionsAccountState } from '@trading-app/shared';
 import './index.css';
 
 const SERVER_URL = import.meta.env.VITE_SERVER_URL ?? 'ws://localhost:4242';
@@ -19,6 +19,7 @@ interface AppState {
   signals: TradeSignal[];
   account: AccountState;
   closedPositions: Position[];
+  options: OptionsAccountState;
   lastTick: number;
 }
 
@@ -50,7 +51,7 @@ function formatTime(ts: number) {
 export default function App() {
   const [state, setState] = useState<AppState | null>(null);
   const [connected, setConnected] = useState(false);
-  const [tab, setTab] = useState<'watchlist' | 'signals' | 'positions'>('watchlist');
+  const [tab, setTab] = useState<'watchlist' | 'signals' | 'positions' | 'options'>('watchlist');
   const wsRef = useRef<WebSocket | null>(null);
   const reconnectTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
 
@@ -98,6 +99,9 @@ export default function App() {
   const symbols = state?.symbols ?? [];
   const openPositions = account?.openPositions ?? [];
   const closedPositions = state?.closedPositions ?? [];
+  const optionsState = state?.options;
+  const openOptions: OptionPosition[] = optionsState?.openOptions ?? [];
+  const closedOptions: OptionPosition[] = optionsState?.closedOptions ?? [];
 
   return (
     <div className="app">
@@ -127,6 +131,20 @@ export default function App() {
                 <span className="stat-label">Positions</span>
                 <span className="stat-value">{openPositions.length}</span>
               </div>
+              {optionsState && (
+                <>
+                  <div className="stat">
+                    <span className="stat-label">Options P&amp;L</span>
+                    <span className={`stat-value ${optionsState.optionsPnl >= 0 ? 'green' : 'red'}`}>
+                      {fmtDollar(optionsState.optionsPnl)}
+                    </span>
+                  </div>
+                  <div className="stat">
+                    <span className="stat-label">Options</span>
+                    <span className="stat-value">{openOptions.length}</span>
+                  </div>
+                </>
+              )}
             </>
           )}
           <div className={`status-dot ${connected ? 'live' : 'offline'}`} title={connected ? 'Live' : 'Reconnecting...'} />
@@ -136,11 +154,12 @@ export default function App() {
       </header>
 
       <nav className="tabs">
-        {(['watchlist', 'signals', 'positions'] as const).map(t => (
+        {(['watchlist', 'signals', 'positions', 'options'] as const).map(t => (
           <button key={t} className={`tab ${tab === t ? 'active' : ''}`} onClick={() => setTab(t)}>
             {t === 'watchlist' ? `Watchlist (${symbols.length})` :
              t === 'signals' ? `Signals (${signals.length})` :
-             `Positions (${openPositions.length})`}
+             t === 'positions' ? `Positions (${openPositions.length})` :
+             `Options (${openOptions.length})`}
           </button>
         ))}
       </nav>
@@ -292,6 +311,108 @@ export default function App() {
 
             {openPositions.length === 0 && closedPositions.length === 0 && (
               <div className="empty">No positions yet. Signals will auto-open paper positions.</div>
+            )}
+          </div>
+        )}
+
+        {state && tab === 'options' && (
+          <div className="positions-panel">
+            {openOptions.length > 0 && (
+              <>
+                <h3>Open Option Positions</h3>
+                <table>
+                  <thead>
+                    <tr>
+                      <th>Symbol</th>
+                      <th>Type</th>
+                      <th>Contracts</th>
+                      <th>Premium Paid</th>
+                      <th>Current Mark</th>
+                      <th>TP Target</th>
+                      <th>SL</th>
+                      <th>Signal</th>
+                      <th>Opened</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {openOptions.map(o => {
+                      const pnlPct = ((o.currentPremium - o.premiumPaid) / o.premiumPaid) * 100;
+                      return (
+                        <tr key={o.id}>
+                          <td className="symbol">{o.symbol}</td>
+                          <td className={o.optionType === 'call' ? 'green' : 'red'}>
+                            {o.optionType.toUpperCase()}
+                          </td>
+                          <td>{o.contracts}</td>
+                          <td>${fmt(o.premiumPaid)}</td>
+                          <td className={pnlPct >= 0 ? 'green' : 'red'}>
+                            ${fmt(o.currentPremium)} ({fmtPct(pnlPct)})
+                          </td>
+                          <td className="green">${fmt(o.takeProfitPremium)}</td>
+                          <td className="red">${fmt(o.stopLossPremium)}</td>
+                          <td>{o.signalType === 'orb_breakout' ? 'ORB' : 'Reversal'}</td>
+                          <td className="muted">{formatTime(o.openedAt)}</td>
+                        </tr>
+                      );
+                    })}
+                  </tbody>
+                </table>
+              </>
+            )}
+
+            {closedOptions.length > 0 && (
+              <>
+                <h3 style={{ marginTop: '1.5rem' }}>Recent Closed Options</h3>
+                <table>
+                  <thead>
+                    <tr>
+                      <th>Symbol</th>
+                      <th>Type</th>
+                      <th>Contracts</th>
+                      <th>Entry Premium</th>
+                      <th>Exit Premium</th>
+                      <th>P&amp;L</th>
+                      <th>Signal</th>
+                      <th>Closed</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {closedOptions.map(o => {
+                      const exitPremium = o.closedAt ? o.currentPremium : 0;
+                      return (
+                        <tr key={o.id}>
+                          <td className="symbol">{o.symbol}</td>
+                          <td className={o.optionType === 'call' ? 'green' : 'red'}>
+                            {o.optionType.toUpperCase()}
+                          </td>
+                          <td>{o.contracts}</td>
+                          <td>${fmt(o.premiumPaid)}</td>
+                          <td>${fmt(exitPremium)}</td>
+                          <td className={(o.pnl ?? 0) >= 0 ? 'green' : 'red'}>{fmtDollar(o.pnl ?? 0)}</td>
+                          <td>{o.signalType === 'orb_breakout' ? 'ORB' : 'Reversal'}</td>
+                          <td className="muted">{o.closedAt ? formatTime(o.closedAt) : '—'}</td>
+                        </tr>
+                      );
+                    })}
+                  </tbody>
+                </table>
+              </>
+            )}
+
+            {openOptions.length === 0 && closedOptions.length === 0 && (
+              <div className="empty">
+                No option positions yet. Options (calls/puts) are auto-opened when ORB or Reversal signals trigger.
+                <br /><br />
+                <strong>Strategy:</strong> Bullish signals → buy CALL · Bearish signals → buy PUT<br />
+                <strong>Take profit:</strong> 20% gain on premium · <strong>Stop loss:</strong> 50% loss on premium
+              </div>
+            )}
+
+            {optionsState && (
+              <div style={{ marginTop: '1.5rem', display: 'flex', gap: '2rem', fontSize: '0.85rem', color: 'var(--muted)' }}>
+                <span>Options Cash: <strong>${fmt(optionsState.optionsCash)}</strong></span>
+                <span>Total Options P&amp;L: <strong className={optionsState.optionsPnl >= 0 ? 'green' : 'red'}>{fmtDollar(optionsState.optionsPnl)}</strong></span>
+              </div>
             )}
           </div>
         )}

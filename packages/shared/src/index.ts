@@ -3,6 +3,7 @@
 export type Side = 'buy' | 'sell';
 export type OrderStatus = 'pending' | 'filled' | 'cancelled' | 'rejected';
 export type SignalType = 'orb_breakout' | 'reversal';
+export type OptionType = 'call' | 'put';
 
 export interface Candle {
   symbol: string;
@@ -49,6 +50,37 @@ export interface AccountState {
 export const DEFAULT_RISK_PER_TRADE = 0.01; // 1% of account equity
 export const MANAGED_ACCOUNT_RATIO = 0.5;   // 50% of total account auto-managed
 export const WATCHLIST_SIZE = 25;
+export const OPTIONS_BUDGET_RATIO = 0.05;   // 5% of managed equity per options trade
+export const OPTIONS_TP_PCT = 0.20;          // take profit at 20% gain on premium
+export const OPTIONS_SL_PCT = 0.50;          // stop loss at 50% loss on premium
+export const OPTIONS_ATM_PREMIUM_RATIO = 0.02; // estimated ATM premium ≈ 2% of underlying
+
+export interface OptionPosition {
+  id: string;
+  symbol: string;
+  optionSymbol?: string;      // OCC format, e.g. AAPL240419C00150000
+  optionType: OptionType;
+  strike?: number;
+  expiration?: string;
+  contracts: number;
+  premiumPaid: number;        // per-share premium at entry
+  currentPremium: number;     // current mark (updated on each tick)
+  takeProfitPremium: number;  // exit at 20% gain
+  stopLossPremium: number;    // exit at 50% loss
+  underlyingEntryPrice: number;
+  openedAt: number;
+  closedAt?: number;
+  pnl?: number;
+  signalId: string;
+  signalType: SignalType;
+}
+
+export interface OptionsAccountState {
+  openOptions: OptionPosition[];
+  closedOptions: OptionPosition[];
+  optionsPnl: number;
+  optionsCash: number;
+}
 
 export const WATCHLIST: readonly string[] = [
   'AAPL', 'MSFT', 'NVDA', 'GOOGL', 'AMZN',

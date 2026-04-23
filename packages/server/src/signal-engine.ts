@@ -1,8 +1,9 @@
 import { OrbStrategy, ReversalStrategy } from '@trading-app/engine';
 import { WATCHLIST } from '@trading-app/shared';
-import type { TradeSignal, Candle } from '@trading-app/shared';
+import type { TradeSignal, Candle, OptionsAccountState } from '@trading-app/shared';
 import { fetchMinuteBars, fetchQuotes } from './yahoo-feed.js';
 import { PaperAccount } from './paper-account.js';
+import { PaperOptionsAccount } from './options-account.js';
 
 export interface SymbolState {
   symbol: string;
@@ -18,6 +19,7 @@ export interface EngineState {
   signals: TradeSignal[];
   account: ReturnType<PaperAccount['getState']>;
   closedPositions: ReturnType<PaperAccount['checkExits']>;
+  options: OptionsAccountState;
   lastTick: number;
 }
 
@@ -29,6 +31,7 @@ export class SignalEngine {
   private readonly orb = new OrbStrategy({ rangeMinutes: 30, minVolume: 5_000 });
   private readonly reversal = new ReversalStrategy();
   private readonly account = new PaperAccount();
+  private readonly optionsAccount = new PaperOptionsAccount();
 
   private symbolState: Map<string, SymbolState> = new Map();
   private candleCache: Map<string, Candle[]> = new Map();
@@ -72,9 +75,10 @@ export class SignalEngine {
       });
     }
 
-    // Check TP/SL exits against latest prices
+    // Check TP/SL exits against latest prices (equity + options)
     const closed = this.account.checkExits(prices);
     if (closed.length > 0) this.allClosedPositions.push(...closed);
+    this.optionsAccount.checkExits(prices);
 
     // Fetch candles serially to avoid Yahoo Finance rate limits
     for (const sym of WATCHLIST) {
@@ -101,9 +105,13 @@ export class SignalEngine {
         this.recentSignals.unshift(signal);
         if (this.recentSignals.length > MAX_SIGNALS) this.recentSignals.pop();
 
-        // Auto-open paper position
         const price = prices.get(sym);
-        if (price) this.account.openPosition(signal, price);
+        if (price) {
+          // Auto-open equity paper position
+          this.account.openPosition(signal, price);
+          // Auto-open options paper position (call for buy, put for sell)
+          this.optionsAccount.openOption(signal, price);
+        }
       }
     }
 
@@ -112,6 +120,7 @@ export class SignalEngine {
       signals: [...this.recentSignals],
       account: this.account.getState(),
       closedPositions: [...this.allClosedPositions].slice(-20),
+      options: this.optionsAccount.getState(),
       lastTick: Date.now(),
     };
 
@@ -129,6 +138,7 @@ export class SignalEngine {
       signals: [...this.recentSignals],
       account: this.account.getState(),
       closedPositions: [...this.allClosedPositions].slice(-20),
+      options: this.optionsAccount.getState(),
       lastTick: Date.now(),
     };
   }
