@@ -5,12 +5,18 @@
   "scripts": {
     "dev": "pnpm --filter desktop tauri dev",
     "build": "pnpm --filter desktop tauri build",
+    "server:dev": "pnpm --filter @trading-app/server dev",
+    "server:build": "pnpm --filter @trading-app/server build",
+    "server:start": "pnpm --filter @trading-app/server start",
+    "web:dev": "concurrently \"pnpm server:dev\" \"pnpm --filter desktop vite:dev\"",
+    "web:build": "pnpm -r --filter './packages/**' build && pnpm --filter desktop vite:build",
     "typecheck": "pnpm -r typecheck",
     "lint": "eslint . --max-warnings 0",
     "test": "pnpm -r --filter './packages/**' test"
   },
   "devDependencies": {
     "@eslint/js": "^9.0.0",
+    "concurrently": "^9.1.2",
     "eslint": "^9.0.0",
     "typescript": "^5.4.5",
     "typescript-eslint": "^8.0.0"
