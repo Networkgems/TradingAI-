@@ -1,15 +1,17 @@
-import yahooFinance from 'yahoo-finance2';
+import YahooFinance from 'yahoo-finance2';
 import type { Candle } from '@trading-app/shared';
 
-yahooFinance.setGlobalConfig({ validation: { logErrors: false } });
+const yf = new YahooFinance({ validation: { logErrors: false } });
+
+const sleep = (ms: number) => new Promise(resolve => setTimeout(resolve, ms));
 
 /** Fetch the last N 1-minute candles for a symbol from Yahoo Finance. */
 export async function fetchMinuteBars(symbol: string, count = 60): Promise<Candle[]> {
   try {
     const now = new Date();
-    const from = new Date(now.getTime() - count * 60 * 1000 * 2); // fetch 2× window to ensure enough bars
+    const from = new Date(now.getTime() - count * 60 * 1000 * 2); // 2× window to guarantee enough bars
 
-    const result = await yahooFinance.chart(symbol, {
+    const result = await yf.chart(symbol, {
       period1: from,
       period2: now,
       interval: '1m',
@@ -38,7 +40,7 @@ export async function fetchMinuteBars(symbol: string, count = 60): Promise<Candl
 /** Fetch the current quote for a symbol. */
 export async function fetchQuote(symbol: string): Promise<{ price: number; volume: number; change: number; changePct: number } | null> {
   try {
-    const q = await yahooFinance.quote(symbol);
+    const q = await yf.quote(symbol);
     if (q.regularMarketPrice == null) return null;
     return {
       price: q.regularMarketPrice,
@@ -51,15 +53,13 @@ export async function fetchQuote(symbol: string): Promise<{ price: number; volum
   }
 }
 
-const sleep = (ms: number) => new Promise(resolve => setTimeout(resolve, ms));
-
-/** Batch-fetch quotes for all symbols, serialised with a small delay to avoid rate limiting. */
+/** Fetch quotes for all symbols serially with a delay to stay under rate limits. */
 export async function fetchQuotes(symbols: readonly string[]): Promise<Map<string, { price: number; volume: number; change: number; changePct: number }>> {
   const results = new Map<string, { price: number; volume: number; change: number; changePct: number }>();
   for (const sym of symbols) {
     const q = await fetchQuote(sym);
     if (q) results.set(sym, q);
-    await sleep(150); // 150 ms gap — ~4 s for 25 symbols, well under Yahoo Finance rate limits
+    await sleep(200); // 200 ms gap — ~5 s for 25 symbols, well under Yahoo Finance rate limits
   }
   return results;
 }
