@@ -120,3 +120,71 @@ export interface MarketQuote {
   askPrice: number;
   askSize: number;
 }
+
+// ── EOD Report Types ─────────────────────────────────────────────────────────
+
+export interface EodTradeEntry {
+  id: string;
+  symbol: string;
+  strategy: 'ORB' | 'Reversal';
+  side: Side;
+  entryPrice: number;
+  exitPrice: number;
+  quantity: number;
+  pnl: number;
+  /** Achieved R:R — how many R units the trade made/lost */
+  rr: number;
+  openedAt: number;
+  closedAt: number;
+}
+
+export interface EodMover {
+  symbol: string;
+  price: number;
+  changePct: number;
+}
+
+export interface EodSignalAccuracy {
+  totalSignals: number;
+  /** Signals that closed with profit (TP hit) */
+  winningSignals: number;
+  winRate: number;
+  avgRR: number;
+}
+
+export interface EodReport {
+  date: string;          // YYYY-MM-DD
+  generatedAt: number;   // Unix ms
+
+  // P&L
+  realizedPnl: number;
+  unrealizedPnl: number;
+  totalPnl: number;
+  optionsPnl: number;
+  combinedPnl: number;
+
+  // Account
+  totalEquity: number;
+  managedEquity: number;  // 50% allocation
+  availableCash: number;
+
+  // Trades
+  trades: EodTradeEntry[];
+  openPositionCount: number;
+
+  // Performance
+  winRate: number;         // % of closed trades that were winners
+  avgRR: number;           // average risk-reward achieved
+  totalTrades: number;
+  winners: number;
+  losers: number;
+
+  // Market
+  top5Movers: EodMover[];
+
+  // Signal accuracy
+  signalAccuracy: EodSignalAccuracy;
+
+  // Markdown report body
+  markdown: string;
+}

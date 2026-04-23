@@ -230,3 +230,110 @@ tr:hover td { background: #1c2128; }
   padding: 3rem 1rem;
   font-size: 0.85rem;
 }
+
+/* ── EOD Report Panel ─────────────────────────────────────────────────────── */
+
+.app {
+  overflow: hidden;
+}
+
+.eod-panel {
+  flex-shrink: 0;
+  background: var(--surface);
+  border-top: 1px solid var(--border);
+  max-height: 40vh;
+  overflow: auto;
+}
+
+.eod-header {
+  display: flex;
+  align-items: center;
+  gap: 1rem;
+  padding: 0.5rem 1.2rem;
+  cursor: pointer;
+  user-select: none;
+  border-bottom: 1px solid var(--border);
+}
+
+.eod-header:hover { background: #1c2128; }
+
+.eod-title {
+  font-size: 0.78rem;
+  font-weight: 700;
+  color: var(--blue);
+  letter-spacing: 0.05em;
+}
+
+.eod-summary {
+  font-size: 0.75rem;
+  color: var(--muted);
+  flex: 1;
+}
+
+.eod-toggle {
+  font-size: 0.65rem;
+  color: var(--muted);
+  white-space: nowrap;
+}
+
+.eod-body {
+  padding: 0.75rem 1.2rem 1rem;
+  display: flex;
+  flex-direction: column;
+  gap: 0.75rem;
+}
+
+.eod-stats-row {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 1.5rem;
+}
+
+.eod-stat {
+  display: flex;
+  flex-direction: column;
+  min-width: 80px;
+}
+
+.eod-stat-label {
+  font-size: 0.6rem;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  color: var(--muted);
+}
+
+.eod-stat-value {
+  font-size: 0.85rem;
+  font-weight: 600;
+}
+
+.eod-movers {
+  display: flex;
+  align-items: center;
+  gap: 0.75rem;
+  flex-wrap: wrap;
+  font-size: 0.75rem;
+}
+
+.eod-section-label {
+  font-size: 0.6rem;
+  text-transform: uppercase;
+  letter-spacing: 0.07em;
+  color: var(--muted);
+  margin-right: 0.25rem;
+}
+
+.eod-mover {
+  background: var(--bg);
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  padding: 0.15em 0.5em;
+}
+
+.eod-trades { display: flex; flex-direction: column; gap: 0.4rem; }
+
+.eod-generated {
+  font-size: 0.65rem;
+  color: var(--muted);
+  text-align: right;
+}

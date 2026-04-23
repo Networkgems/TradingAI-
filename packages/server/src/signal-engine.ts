@@ -1,9 +1,10 @@
 import { OrbStrategy, ReversalStrategy } from '@trading-app/engine';
 import { WATCHLIST } from '@trading-app/shared';
-import type { TradeSignal, Candle, OptionsAccountState } from '@trading-app/shared';
+import type { TradeSignal, Candle, OptionsAccountState, SignalType, Position } from '@trading-app/shared';
 import { fetchMinuteBars, fetchQuotes } from './yahoo-feed.js';
 import { PaperAccount } from './paper-account.js';
 import { PaperOptionsAccount } from './options-account.js';
+import type { DailySignalRecord } from './reports/eod-report.js';
 
 export interface SymbolState {
   symbol: string;
@@ -36,7 +37,12 @@ export class SignalEngine {
   private symbolState: Map<string, SymbolState> = new Map();
   private candleCache: Map<string, Candle[]> = new Map();
   private recentSignals: TradeSignal[] = [];
-  private allClosedPositions: ReturnType<PaperAccount['checkExits']> = [];
+  private allClosedPositions: Position[] = [];
+
+  // Daily tracking for EOD reports
+  private dailySignals: DailySignalRecord[] = [];
+  /** Maps position id → signal type for strategy tagging in reports */
+  private positionSignalType: Map<string, SignalType> = new Map();
 
   private tickTimer: ReturnType<typeof setInterval> | null = null;
   private handlers: EngineEventHandler[] = [];
@@ -77,7 +83,19 @@ export class SignalEngine {
 
     // Check TP/SL exits against latest prices (equity + options)
     const closed = this.account.checkExits(prices);
-    if (closed.length > 0) this.allClosedPositions.push(...closed);
+    if (closed.length > 0) {
+      this.allClosedPositions.push(...closed);
+      // Annotate daily signal records with outcomes
+      for (const pos of closed) {
+        const sigType = this.positionSignalType.get(pos.id);
+        const rec = this.dailySignals.find(s => s.symbol === pos.symbol && s.type === sigType);
+        if (rec && rec.outcome == null) {
+          rec.outcome = (pos.pnl ?? 0) > 0 ? 'win' : 'loss';
+          const risk = Math.abs(pos.entryPrice - pos.stopLoss) * pos.quantity;
+          rec.rr = risk > 0 ? Math.abs(pos.pnl ?? 0) / risk : 0;
+        }
+      }
+    }
     this.optionsAccount.checkExits(prices);
 
     // Fetch candles serially to avoid Yahoo Finance rate limits
@@ -108,10 +126,19 @@ export class SignalEngine {
         const price = prices.get(sym);
         if (price) {
           // Auto-open equity paper position
-          this.account.openPosition(signal, price);
+          const pos = this.account.openPosition(signal, price);
+          if (pos) this.positionSignalType.set(pos.id, signal.type);
           // Auto-open options paper position (call for buy, put for sell)
           this.optionsAccount.openOption(signal, price);
         }
+
+        // Record signal for daily accuracy tracking
+        this.dailySignals.push({
+          id: signal.id,
+          symbol: signal.symbol,
+          type: signal.type,
+          firedAt: signal.timestamp,
+        });
       }
     }
 
@@ -140,6 +167,16 @@ export class SignalEngine {
       closedPositions: [...this.allClosedPositions].slice(-20),
       options: this.optionsAccount.getState(),
       lastTick: Date.now(),
+    };
+  }
+
+  /** Returns data needed to generate an EOD report. */
+  getReportSnapshot() {
+    return {
+      state: this.getState(),
+      allClosedPositions: [...this.allClosedPositions],
+      dailySignals: [...this.dailySignals],
+      signalTypeMap: new Map(this.positionSignalType),
     };
   }
 }

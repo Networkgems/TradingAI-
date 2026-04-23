@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState } from 'react';
-import type { TradeSignal, Position, AccountState, OptionPosition, OptionsAccountState } from '@trading-app/shared';
+import type { TradeSignal, Position, AccountState, OptionPosition, OptionsAccountState, EodReport } from '@trading-app/shared';
 import './index.css';
 
 const SERVER_URL = import.meta.env.VITE_SERVER_URL ?? 'ws://localhost:4242';
@@ -50,6 +50,8 @@ function formatTime(ts: number) {
 
 export default function App() {
   const [state, setState] = useState<AppState | null>(null);
+  const [eodReport, setEodReport] = useState<EodReport | null>(null);
+  const [eodCollapsed, setEodCollapsed] = useState(false);
   const [connected, setConnected] = useState(false);
   const [tab, setTab] = useState<'watchlist' | 'signals' | 'positions' | 'options'>('watchlist');
   const wsRef = useRef<WebSocket | null>(null);
@@ -70,6 +72,7 @@ export default function App() {
         try {
           const msg = JSON.parse(e.data as string);
           if (msg.type === 'state') setState(msg.payload as AppState);
+          if (msg.type === 'eod_report') setEodReport(msg.payload as EodReport);
         } catch { /* ignore malformed */ }
       };
     }
@@ -417,6 +420,127 @@ export default function App() {
           </div>
         )}
       </main>
+
+      {/* ── EOD Report Panel ─────────────────────────────────────────────── */}
+      {eodReport && (
+        <section className="eod-panel">
+          <div className="eod-header" onClick={() => setEodCollapsed(c => !c)}>
+            <span className="eod-title">EOD Report — {eodReport.date}</span>
+            <span className="eod-summary">
+              <span className={eodReport.combinedPnl >= 0 ? 'green' : 'red'}>
+                {fmtDollar(eodReport.combinedPnl)}
+              </span>
+              &nbsp;·&nbsp;Win rate {(eodReport.winRate * 100).toFixed(0)}%
+              &nbsp;·&nbsp;{eodReport.totalTrades} trades
+            </span>
+            <span className="eod-toggle">{eodCollapsed ? '▲ Show' : '▼ Hide'}</span>
+          </div>
+
+          {!eodCollapsed && (
+            <div className="eod-body">
+              {/* P&L summary row */}
+              <div className="eod-stats-row">
+                <div className="eod-stat">
+                  <span className="eod-stat-label">Realized P&amp;L</span>
+                  <span className={`eod-stat-value ${eodReport.realizedPnl >= 0 ? 'green' : 'red'}`}>
+                    {fmtDollar(eodReport.realizedPnl)}
+                  </span>
+                </div>
+                <div className="eod-stat">
+                  <span className="eod-stat-label">Unrealized P&amp;L</span>
+                  <span className={`eod-stat-value ${eodReport.unrealizedPnl >= 0 ? 'green' : 'red'}`}>
+                    {fmtDollar(eodReport.unrealizedPnl)}
+                  </span>
+                </div>
+                <div className="eod-stat">
+                  <span className="eod-stat-label">Options P&amp;L</span>
+                  <span className={`eod-stat-value ${eodReport.optionsPnl >= 0 ? 'green' : 'red'}`}>
+                    {fmtDollar(eodReport.optionsPnl)}
+                  </span>
+                </div>
+                <div className="eod-stat">
+                  <span className="eod-stat-label">Combined P&amp;L</span>
+                  <span className={`eod-stat-value ${eodReport.combinedPnl >= 0 ? 'green' : 'red'}`}>
+                    {fmtDollar(eodReport.combinedPnl)}
+                  </span>
+                </div>
+                <div className="eod-stat">
+                  <span className="eod-stat-label">Win Rate</span>
+                  <span className="eod-stat-value">{(eodReport.winRate * 100).toFixed(1)}%</span>
+                </div>
+                <div className="eod-stat">
+                  <span className="eod-stat-label">Avg R:R</span>
+                  <span className="eod-stat-value">1:{eodReport.avgRR.toFixed(2)}</span>
+                </div>
+                <div className="eod-stat">
+                  <span className="eod-stat-label">Signals Fired</span>
+                  <span className="eod-stat-value">{eodReport.signalAccuracy.totalSignals}</span>
+                </div>
+                <div className="eod-stat">
+                  <span className="eod-stat-label">Signal Win %</span>
+                  <span className="eod-stat-value">
+                    {(eodReport.signalAccuracy.winRate * 100).toFixed(1)}%
+                  </span>
+                </div>
+              </div>
+
+              {/* Top 5 movers */}
+              {eodReport.top5Movers.length > 0 && (
+                <div className="eod-movers">
+                  <span className="eod-section-label">Top 5 Movers:</span>
+                  {eodReport.top5Movers.map(m => (
+                    <span key={m.symbol} className="eod-mover">
+                      <strong>{m.symbol}</strong>
+                      <span className={m.changePct >= 0 ? 'green' : 'red'}>
+                        &nbsp;{m.changePct >= 0 ? '+' : ''}{m.changePct.toFixed(2)}%
+                      </span>
+                    </span>
+                  ))}
+                </div>
+              )}
+
+              {/* Trade log */}
+              {eodReport.trades.length > 0 && (
+                <div className="eod-trades">
+                  <span className="eod-section-label">Trade Log ({eodReport.trades.length})</span>
+                  <table>
+                    <thead>
+                      <tr>
+                        <th>Symbol</th>
+                        <th>Strategy</th>
+                        <th>Side</th>
+                        <th>Qty</th>
+                        <th>Entry</th>
+                        <th>Exit</th>
+                        <th>P&amp;L</th>
+                        <th>R:R</th>
+                      </tr>
+                    </thead>
+                    <tbody>
+                      {eodReport.trades.map(t => (
+                        <tr key={t.id}>
+                          <td className="symbol">{t.symbol}</td>
+                          <td>{t.strategy}</td>
+                          <td className={t.side === 'buy' ? 'green' : 'red'}>{t.side.toUpperCase()}</td>
+                          <td>{t.quantity}</td>
+                          <td>${fmt(t.entryPrice)}</td>
+                          <td>${fmt(t.exitPrice)}</td>
+                          <td className={t.pnl >= 0 ? 'green' : 'red'}>{fmtDollar(t.pnl)}</td>
+                          <td>1:{t.rr}</td>
+                        </tr>
+                      ))}
+                    </tbody>
+                  </table>
+                </div>
+              )}
+
+              <div className="eod-generated">
+                Generated at {new Date(eodReport.generatedAt).toLocaleTimeString()}
+              </div>
+            </div>
+          )}
+        </section>
+      )}
     </div>
   );
 }
