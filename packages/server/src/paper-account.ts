@@ -1,4 +1,4 @@
-import type { AccountState, Position, TradeSignal } from '@trading-app/shared';
+import type { AccountState, Position, TradeSignal, SignalType } from '@trading-app/shared';
 import { MANAGED_ACCOUNT_RATIO, DEFAULT_RISK_PER_TRADE } from '@trading-app/shared';
 import { randomUUID } from 'crypto';
 
@@ -46,6 +46,7 @@ export class PaperAccount {
       id: randomUUID(),
       symbol: signal.symbol,
       side: signal.side,
+      signalType: signal.type,
       entryPrice: currentPrice,
       quantity: qty,
       stopLoss: signal.stopLoss,
@@ -96,5 +97,11 @@ export class PaperAccount {
 
   hasOpenPosition(symbol: string): boolean {
     return Array.from(this.positions.values()).some(p => p.symbol === symbol);
+  }
+
+  hasOpenPositionForSignalType(symbol: string, signalType: SignalType): boolean {
+    return Array.from(this.positions.values()).some(
+      p => p.symbol === symbol && p.signalType === signalType,
+    );
   }
 }

@@ -31,6 +31,7 @@ export interface Position {
   id: string;
   symbol: string;
   side: Side;
+  signalType: SignalType;
   entryPrice: number;
   quantity: number;
   stopLoss: number;
@@ -51,9 +52,11 @@ export const DEFAULT_RISK_PER_TRADE = 0.01; // 1% of account equity
 export const MANAGED_ACCOUNT_RATIO = 0.5;   // 50% of total account auto-managed
 export const WATCHLIST_SIZE = 25;
 export const OPTIONS_BUDGET_RATIO = 0.05;   // 5% of managed equity per options trade
-export const OPTIONS_TP_PCT = 0.20;          // take profit at 20% gain on premium
-export const OPTIONS_SL_PCT = 0.50;          // stop loss at 50% loss on premium
+export const OPTIONS_TP_PCT = 0.25;          // take profit at 25% gain on premium
+export const OPTIONS_SL_PCT = 0.35;          // stop loss at 35% loss on premium
 export const OPTIONS_ATM_PREMIUM_RATIO = 0.02; // estimated ATM premium ≈ 2% of underlying
+export const OPTIONS_DAILY_LIMIT = 10;       // max 10 options trades per trading day
+export const OPTIONS_TRAIL_OFFSET_PCT = 0.15; // trailing stop 15% below peak once TP is hit
 
 export interface OptionPosition {
   id: string;
@@ -65,8 +68,11 @@ export interface OptionPosition {
   contracts: number;
   premiumPaid: number;        // per-share premium at entry
   currentPremium: number;     // current mark (updated on each tick)
-  takeProfitPremium: number;  // exit at 20% gain
-  stopLossPremium: number;    // exit at 50% loss
+  takeProfitPremium: number;  // initial TP trigger at +25%
+  stopLossPremium: number;    // hard stop loss at -35%
+  peakPremium: number;        // highest mark seen (used for trailing stop)
+  trailingActive: boolean;    // true once TP is hit and trailing mode engaged
+  trailingStopPremium: number; // current trailing stop level (peak * (1 - TRAIL_OFFSET))
   underlyingEntryPrice: number;
   openedAt: number;
   closedAt?: number;
@@ -80,6 +86,7 @@ export interface OptionsAccountState {
   closedOptions: OptionPosition[];
   optionsPnl: number;
   optionsCash: number;
+  dailyOptionsCount: number;  // number of options opened today (resets at market open)
 }
 
 export const WATCHLIST: readonly string[] = [

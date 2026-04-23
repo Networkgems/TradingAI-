@@ -105,7 +105,6 @@ export class SignalEngine {
 
     // Run strategies and collect new signals
     for (const sym of WATCHLIST) {
-      if (this.account.hasOpenPosition(sym)) continue;
       const candles = this.candleCache.get(sym) ?? [];
       if (candles.length < 15) continue;
 
@@ -114,6 +113,8 @@ export class SignalEngine {
 
       for (const signal of [orbSignal, reversalSignal]) {
         if (!signal) continue;
+        // Skip if an equity position for this symbol+strategy type is already open
+        if (this.account.hasOpenPositionForSignalType(sym, signal.type)) continue;
         // Deduplicate: skip if same symbol+type signal emitted in last 5 minutes
         const recent = this.recentSignals.find(
           s => s.symbol === signal.symbol && s.type === signal.type && Date.now() - s.timestamp < 5 * 60_000

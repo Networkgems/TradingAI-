@@ -9,6 +9,7 @@ export class PositionManager {
       id: randomUUID(),
       symbol: signal.symbol,
       side: signal.side,
+      signalType: signal.type,
       entryPrice: signal.entryPrice,
       quantity,
       stopLoss: signal.stopLoss,
