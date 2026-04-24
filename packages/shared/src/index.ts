@@ -2,7 +2,7 @@
 
 export type Side = 'buy' | 'sell';
 export type OrderStatus = 'pending' | 'filled' | 'cancelled' | 'rejected';
-export type SignalType = 'orb_breakout' | 'reversal';
+export type SignalType = 'orb_breakout' | 'reversal' | 'macd_cross' | 'ichimoku';
 export type OptionType = 'call' | 'put';
 
 export interface Candle {

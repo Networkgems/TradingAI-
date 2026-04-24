@@ -2,6 +2,8 @@
 
 export { OrbStrategy } from './strategies/orb.js';
 export { ReversalStrategy } from './strategies/reversal.js';
+export { MacdBollingerStrategy } from './strategies/macd-bollinger.js';
+export { IchimokuStrategy } from './strategies/ichimoku-strategy.js';
 export { RiskManager } from './risk.js';
 export { PositionManager } from './positions.js';
 export { AlpacaFeed } from './feed/index.js';

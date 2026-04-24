@@ -1,4 +1,4 @@
-import { OrbStrategy, ReversalStrategy } from '@trading-app/engine';
+import { OrbStrategy, ReversalStrategy, MacdBollingerStrategy, IchimokuStrategy } from '@trading-app/engine';
 import { WATCHLIST } from '@trading-app/shared';
 import type { TradeSignal, Candle, OptionsAccountState, SignalType, Position } from '@trading-app/shared';
 import { fetchMinuteBars, fetchQuotes } from './yahoo-feed.js';
@@ -31,6 +31,8 @@ const MAX_SIGNALS = 50;
 export class SignalEngine {
   private readonly orb = new OrbStrategy({ rangeMinutes: 30, minVolume: 5_000 });
   private readonly reversal = new ReversalStrategy();
+  private readonly macdBollinger = new MacdBollingerStrategy();
+  private readonly ichimoku = new IchimokuStrategy();
   private readonly account = new PaperAccount();
   private readonly optionsAccount = new PaperOptionsAccount();
 
@@ -110,8 +112,10 @@ export class SignalEngine {
 
       const orbSignal = this.orb.evaluate(sym, candles);
       const reversalSignal = this.reversal.evaluate(sym, candles);
+      const macdSignal = this.macdBollinger.evaluate(sym, candles);
+      const ichimokuSignal = this.ichimoku.evaluate(sym, candles);
 
-      for (const signal of [orbSignal, reversalSignal]) {
+      for (const signal of [orbSignal, reversalSignal, macdSignal, ichimokuSignal]) {
         if (!signal) continue;
         // Skip if an equity position for this symbol+strategy type is already open
         if (this.account.hasOpenPositionForSignalType(sym, signal.type)) continue;
