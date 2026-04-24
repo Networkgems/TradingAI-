@@ -9,6 +9,7 @@ function makePosition(overrides: Partial<Position> & { id: string }): Position {
   return {
     symbol: 'AAPL',
     side: 'buy',
+    signalType: 'orb_breakout',
     entryPrice: 100,
     quantity: 10,
     stopLoss: 98,
@@ -41,6 +42,7 @@ function makeEngineState(overrides: Partial<EngineState> = {}): EngineState {
       closedOptions: [],
       optionsPnl: 0,
       optionsCash: 25_000,
+      dailyOptionsCount: 0,
     },
     lastTick: Date.now(),
     ...overrides,

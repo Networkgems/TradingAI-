@@ -133,7 +133,7 @@ export interface MarketQuote {
 export interface EodTradeEntry {
   id: string;
   symbol: string;
-  strategy: 'ORB' | 'Reversal';
+  strategy: 'ORB' | 'Reversal' | 'MACD' | 'Ichimoku';
   side: Side;
   entryPrice: number;
   exitPrice: number;

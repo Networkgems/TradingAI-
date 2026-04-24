@@ -46,7 +46,7 @@ function toTradeEntry(pos: Position, signalType: SignalType): EodTradeEntry {
   return {
     id: pos.id,
     symbol: pos.symbol,
-    strategy: signalType === 'orb_breakout' ? 'ORB' : 'Reversal',
+    strategy: signalType === 'orb_breakout' ? 'ORB' : signalType === 'reversal' ? 'Reversal' : signalType === 'macd_cross' ? 'MACD' : 'Ichimoku',
     side: pos.side,
     entryPrice: pos.entryPrice,
     exitPrice: pos.closedAt ? exitPrice : pos.entryPrice,
