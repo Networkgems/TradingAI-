@@ -2,22 +2,31 @@ import type { AccountState, Position, TradeSignal, SignalType } from '@trading-a
 import { MANAGED_ACCOUNT_RATIO, DEFAULT_RISK_PER_TRADE } from '@trading-app/shared';
 import { randomUUID } from 'crypto';
 
-const INITIAL_EQUITY = 25_000; // paper account starting equity
+const INITIAL_EQUITY = 25_000;
 
 export class PaperAccount {
-  private equity = INITIAL_EQUITY;
-  private cash = INITIAL_EQUITY;
+  private equity: number;
+  private cash: number;
   private positions: Map<string, Position> = new Map();
-  private dailyPnl = 0;
-  private sessionStart = Date.now();
+  private openingEquityToday: number;
 
-  getState(): AccountState {
+  constructor(savedEquity = INITIAL_EQUITY, openingEquityToday = savedEquity) {
+    this.equity = savedEquity;
+    this.cash = savedEquity;
+    this.openingEquityToday = openingEquityToday;
+  }
+
+  getState(): Omit<AccountState, 'weeklyPnl' | 'monthlyPnl' | 'yearlyPnl' | 'allTimePnl'> {
     return {
       totalEquity: this.equity,
       availableCash: this.cash,
       openPositions: Array.from(this.positions.values()),
-      dailyPnl: this.dailyPnl,
+      dailyPnl: this.equity - this.openingEquityToday,
     };
+  }
+
+  getEquity(): number {
+    return this.equity;
   }
 
   managedEquity(): number {
@@ -81,18 +90,11 @@ export class PaperAccount {
         pos.closedAt = Date.now();
         this.cash += exitPrice * pos.quantity;
         this.equity += pnl;
-        this.dailyPnl += pnl;
         this.positions.delete(id);
         closed.push({ ...pos });
       }
     }
     return closed;
-  }
-
-  /** Reset daily P&L at session boundary. */
-  resetDay(): void {
-    this.dailyPnl = 0;
-    this.sessionStart = Date.now();
   }
 
   hasOpenPosition(symbol: string): boolean {

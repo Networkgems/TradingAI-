@@ -46,6 +46,10 @@ export interface AccountState {
   availableCash: number;
   openPositions: Position[];
   dailyPnl: number;
+  weeklyPnl: number;
+  monthlyPnl: number;
+  yearlyPnl: number;
+  allTimePnl: number;
 }
 
 export const DEFAULT_RISK_PER_TRADE = 0.01; // 1% of account equity

@@ -1,10 +1,11 @@
 import { OrbStrategy, ReversalStrategy, MacdBollingerStrategy, IchimokuStrategy } from '@trading-app/engine';
 import { WATCHLIST } from '@trading-app/shared';
-import type { TradeSignal, Candle, OptionsAccountState, SignalType, Position } from '@trading-app/shared';
+import type { TradeSignal, Candle, OptionsAccountState, SignalType, Position, AccountState } from '@trading-app/shared';
 import { fetchMinuteBars, fetchQuotes } from './yahoo-feed.js';
 import { PaperAccount } from './paper-account.js';
 import { PaperOptionsAccount } from './options-account.js';
 import type { DailySignalRecord } from './reports/eod-report.js';
+import type { PnlTracker } from './pnl-tracker.js';
 
 export interface SymbolState {
   symbol: string;
@@ -18,7 +19,7 @@ export interface SymbolState {
 export interface EngineState {
   symbols: SymbolState[];
   signals: TradeSignal[];
-  account: ReturnType<PaperAccount['getState']>;
+  account: AccountState;
   closedPositions: ReturnType<PaperAccount['checkExits']>;
   options: OptionsAccountState;
   lastTick: number;
@@ -33,8 +34,9 @@ export class SignalEngine {
   private readonly reversal = new ReversalStrategy();
   private readonly macdBollinger = new MacdBollingerStrategy();
   private readonly ichimoku = new IchimokuStrategy();
-  private readonly account = new PaperAccount();
-  private readonly optionsAccount = new PaperOptionsAccount();
+  private readonly account: PaperAccount;
+  private readonly optionsAccount: PaperOptionsAccount;
+  private readonly tracker: PnlTracker | undefined;
 
   private symbolState: Map<string, SymbolState> = new Map();
   private candleCache: Map<string, Candle[]> = new Map();
@@ -48,6 +50,18 @@ export class SignalEngine {
 
   private tickTimer: ReturnType<typeof setInterval> | null = null;
   private handlers: EngineEventHandler[] = [];
+
+  constructor(tracker?: PnlTracker) {
+    this.tracker = tracker;
+    this.account = new PaperAccount(
+      tracker?.getSavedEquity(),
+      tracker?.getOpeningEquity(),
+    );
+    this.optionsAccount = new PaperOptionsAccount(
+      tracker?.getSavedEquity(),
+      tracker?.getSavedOptionsPnl(),
+    );
+  }
 
   onTick(handler: EngineEventHandler): void {
     this.handlers.push(handler);
@@ -97,8 +111,15 @@ export class SignalEngine {
           rec.rr = risk > 0 ? Math.abs(pos.pnl ?? 0) / risk : 0;
         }
       }
+      // Persist equity after equity position closes
+      this.tracker?.saveEquity(this.account.getEquity(), this.optionsAccount.getOptionsPnl());
     }
-    this.optionsAccount.checkExits(prices);
+
+    const closedOpts = this.optionsAccount.checkExits(prices);
+    if (closedOpts.length > 0) {
+      // Persist equity after options position closes
+      this.tracker?.saveEquity(this.account.getEquity(), this.optionsAccount.getOptionsPnl());
+    }
 
     // Fetch candles serially to avoid Yahoo Finance rate limits
     for (const sym of WATCHLIST) {
@@ -147,15 +168,7 @@ export class SignalEngine {
       }
     }
 
-    const state: EngineState = {
-      symbols: Array.from(this.symbolState.values()),
-      signals: [...this.recentSignals],
-      account: this.account.getState(),
-      closedPositions: [...this.allClosedPositions].slice(-20),
-      options: this.optionsAccount.getState(),
-      lastTick: Date.now(),
-    };
-
+    const state = this.buildState();
     for (const h of this.handlers) h(state);
   }
 
@@ -164,15 +177,30 @@ export class SignalEngine {
     if (bars.length > 0) this.candleCache.set(symbol, bars);
   }
 
-  getState(): EngineState {
+  private buildState(): EngineState {
+    const accountBase = this.account.getState();
+    const cumulative = this.tracker?.getCumulativeStats(accountBase.totalEquity);
+
+    const account: AccountState = {
+      ...accountBase,
+      weeklyPnl: cumulative?.weeklyPnl ?? 0,
+      monthlyPnl: cumulative?.monthlyPnl ?? 0,
+      yearlyPnl: cumulative?.yearlyPnl ?? 0,
+      allTimePnl: cumulative?.allTimePnl ?? accountBase.totalEquity - 25_000,
+    };
+
     return {
       symbols: Array.from(this.symbolState.values()),
       signals: [...this.recentSignals],
-      account: this.account.getState(),
+      account,
       closedPositions: [...this.allClosedPositions].slice(-20),
       options: this.optionsAccount.getState(),
       lastTick: Date.now(),
     };
+  }
+
+  getState(): EngineState {
+    return this.buildState();
   }
 
   /** Returns data needed to generate an EOD report. */
@@ -182,6 +210,14 @@ export class SignalEngine {
       allClosedPositions: [...this.allClosedPositions],
       dailySignals: [...this.dailySignals],
       signalTypeMap: new Map(this.positionSignalType),
+    };
+  }
+
+  /** Returns raw equity values for snapshot saving at EOD. */
+  getEquitySnapshot() {
+    return {
+      equity: this.account.getEquity(),
+      optionsPnl: this.optionsAccount.getOptionsPnl(),
     };
   }
 }

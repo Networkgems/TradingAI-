@@ -35,6 +35,10 @@ function makeEngineState(overrides: Partial<EngineState> = {}): EngineState {
       availableCash: 24_000,
       openPositions: [],
       dailyPnl: 0,
+      weeklyPnl: 0,
+      monthlyPnl: 0,
+      yearlyPnl: 0,
+      allTimePnl: 0,
     },
     closedPositions: [],
     options: {
@@ -215,6 +219,10 @@ describe('generateEodReport', () => {
         availableCash: 23_000,
         openPositions: [openPos],
         dailyPnl: 0,
+        weeklyPnl: 0,
+        monthlyPnl: 0,
+        yearlyPnl: 0,
+        allTimePnl: 0,
       },
     });
 

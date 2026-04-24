@@ -19,13 +19,19 @@ function toDateKey(ts: number): string {
 }
 
 export class PaperOptionsAccount {
-  private equity = INITIAL_EQUITY;
-  private cash = INITIAL_EQUITY;
+  private equity: number;
+  private cash: number;
   private openOptions: Map<string, OptionPosition> = new Map();
   private closedOptions: OptionPosition[] = [];
-  private optionsPnl = 0;
+  private optionsPnl: number;
   private dailyCount = 0;
   private currentDayKey = toDateKey(Date.now());
+
+  constructor(savedEquity = INITIAL_EQUITY, savedOptionsPnl = 0) {
+    this.equity = savedEquity;
+    this.cash = savedEquity;
+    this.optionsPnl = savedOptionsPnl;
+  }
 
   getState(): OptionsAccountState {
     return {
@@ -35,6 +41,14 @@ export class PaperOptionsAccount {
       optionsCash: this.cash,
       dailyOptionsCount: this.dailyCount,
     };
+  }
+
+  getEquity(): number {
+    return this.equity;
+  }
+
+  getOptionsPnl(): number {
+    return this.optionsPnl;
   }
 
   private budgetPerTrade(): number {

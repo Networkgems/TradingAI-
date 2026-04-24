@@ -132,9 +132,33 @@ export default function App() {
                 <span className="stat-value">${fmt(account.totalEquity)}</span>
               </div>
               <div className="stat">
-                <span className="stat-label">Daily P&amp;L</span>
+                <span className="stat-label">Today P&amp;L</span>
                 <span className={`stat-value ${account.dailyPnl >= 0 ? 'green' : 'red'}`}>
                   {fmtDollar(account.dailyPnl)}
+                </span>
+              </div>
+              <div className="stat">
+                <span className="stat-label">Week P&amp;L</span>
+                <span className={`stat-value ${account.weeklyPnl >= 0 ? 'green' : 'red'}`}>
+                  {fmtDollar(account.weeklyPnl)}
+                </span>
+              </div>
+              <div className="stat">
+                <span className="stat-label">Month P&amp;L</span>
+                <span className={`stat-value ${account.monthlyPnl >= 0 ? 'green' : 'red'}`}>
+                  {fmtDollar(account.monthlyPnl)}
+                </span>
+              </div>
+              <div className="stat">
+                <span className="stat-label">Year P&amp;L</span>
+                <span className={`stat-value ${account.yearlyPnl >= 0 ? 'green' : 'red'}`}>
+                  {fmtDollar(account.yearlyPnl)}
+                </span>
+              </div>
+              <div className="stat">
+                <span className="stat-label">All-Time P&amp;L</span>
+                <span className={`stat-value ${account.allTimePnl >= 0 ? 'green' : 'red'}`}>
+                  {fmtDollar(account.allTimePnl)}
                 </span>
               </div>
               <div className="stat">

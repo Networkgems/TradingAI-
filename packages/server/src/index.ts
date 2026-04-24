@@ -8,12 +8,14 @@ import { fileURLToPath } from 'url';
 import { SignalEngine } from './signal-engine.js';
 import { MarketScheduler } from './scheduler.js';
 import { generateEodReport } from './reports/eod-report.js';
+import { PnlTracker } from './pnl-tracker.js';
 
 const PORT = Number(process.env.PORT ?? 4242);
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const REPORTS_DIR = join(__dirname, '..', 'reports');
+const DATA_DIR = join(__dirname, '..', 'data');
 
-// Ensure reports directory exists
+// Ensure directories exist
 if (!existsSync(REPORTS_DIR)) {
   await mkdir(REPORTS_DIR, { recursive: true });
 }
@@ -27,7 +29,8 @@ app.use((_req, res, next) => {
 });
 app.use(express.json());
 
-const engine = new SignalEngine();
+const tracker = new PnlTracker(DATA_DIR);
+const engine = new SignalEngine(tracker);
 const scheduler = new MarketScheduler();
 
 // ── EOD Report generation ────────────────────────────────────────────────────
@@ -39,6 +42,18 @@ async function generateAndSaveReport(): Promise<void> {
   const mdPath = join(REPORTS_DIR, `${report.date}.md`);
   const latestJsonPath = join(REPORTS_DIR, 'latest.json');
   const latestMdPath = join(REPORTS_DIR, 'latest.md');
+
+  // Save daily P&L snapshot for cumulative tracking
+  const equitySnap = engine.getEquitySnapshot();
+  tracker.saveSnapshot({
+    date: report.date,
+    openingEquity: tracker.getOpeningEquity(),
+    closingEquity: equitySnap.equity,
+    dailyPnl: report.realizedPnl + report.unrealizedPnl,
+    optionsPnl: report.optionsPnl,
+    combinedPnl: report.combinedPnl,
+    trades: report.totalTrades,
+  });
 
   await Promise.all([
     writeFile(datePath, JSON.stringify(report, null, 2), 'utf-8'),
@@ -120,6 +135,11 @@ app.post('/api/reports/generate', async (_req, res) => {
   }
 });
 
+// Historical P&L snapshots for the analytics view
+app.get('/api/snapshots', (_req, res) => {
+  res.json(tracker.getSnapshots());
+});
+
 // ── WebSocket ────────────────────────────────────────────────────────────────
 
 const httpServer = createServer(app);
@@ -157,6 +177,7 @@ httpServer.listen(PORT, () => {
   console.log(`Trading server running on http://localhost:${PORT}`);
   console.log(`WebSocket endpoint: ws://localhost:${PORT}`);
   console.log(`Reports directory: ${REPORTS_DIR}`);
+  console.log(`Data directory: ${DATA_DIR}`);
 });
 
 process.on('SIGINT', () => {
