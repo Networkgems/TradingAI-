@@ -1,5 +1,6 @@
 import { useEffect, useRef, useState } from 'react';
 import type { TradeSignal, Position, AccountState, OptionPosition, OptionsAccountState, EodReport } from '@trading-app/shared';
+import { OPTIONS_DAILY_LIMIT } from '@trading-app/shared';
 import './index.css';
 
 const SERVER_URL = import.meta.env.VITE_SERVER_URL ?? 'ws://localhost:4242';
@@ -46,6 +47,16 @@ function timeAgo(ts: number) {
 
 function formatTime(ts: number) {
   return new Date(ts).toLocaleTimeString('en-US', { hour: '2-digit', minute: '2-digit', second: '2-digit' });
+}
+
+function signalLabel(type: string) {
+  switch (type) {
+    case 'orb_breakout': return 'ORB';
+    case 'reversal': return 'Reversal';
+    case 'macd_cross': return 'MACD';
+    case 'ichimoku': return 'Ichimoku';
+    default: return type;
+  }
 }
 
 export default function App() {
@@ -111,7 +122,7 @@ export default function App() {
       <header className="header">
         <div className="header-left">
           <h1>TradingAI</h1>
-          <span className="subtitle">ORB + Reversal · 25 Symbols</span>
+          <span className="subtitle">ORB · Reversal · MACD · Ichimoku · 25 Symbols</span>
         </div>
         <div className="header-right">
           {account && (
@@ -145,6 +156,12 @@ export default function App() {
                   <div className="stat">
                     <span className="stat-label">Options</span>
                     <span className="stat-value">{openOptions.length}</span>
+                  </div>
+                  <div className="stat">
+                    <span className="stat-label">Daily Trades</span>
+                    <span className={`stat-value ${optionsState.dailyOptionsCount >= OPTIONS_DAILY_LIMIT ? 'red' : ''}`}>
+                      {optionsState.dailyOptionsCount}/{OPTIONS_DAILY_LIMIT}
+                    </span>
                   </div>
                 </>
               )}
@@ -218,7 +235,7 @@ export default function App() {
                     <div className="signal-header">
                       <span className="signal-symbol">{sig.symbol}</span>
                       <span className={`signal-side ${sig.side}`}>{sig.side.toUpperCase()}</span>
-                      <span className="signal-type">{sig.type === 'orb_breakout' ? 'ORB' : 'Reversal'}</span>
+                      <span className="signal-type">{signalLabel(sig.type)}</span>
                       <span className="signal-time">{formatTime(sig.timestamp)}</span>
                     </div>
                     <div className="signal-body">
@@ -331,8 +348,8 @@ export default function App() {
                       <th>Contracts</th>
                       <th>Premium Paid</th>
                       <th>Current Mark</th>
-                      <th>TP Target</th>
-                      <th>SL</th>
+                      <th>Status</th>
+                      <th>Trail / SL</th>
                       <th>Signal</th>
                       <th>Opened</th>
                     </tr>
@@ -351,9 +368,15 @@ export default function App() {
                           <td className={pnlPct >= 0 ? 'green' : 'red'}>
                             ${fmt(o.currentPremium)} ({fmtPct(pnlPct)})
                           </td>
-                          <td className="green">${fmt(o.takeProfitPremium)}</td>
-                          <td className="red">${fmt(o.stopLossPremium)}</td>
-                          <td>{o.signalType === 'orb_breakout' ? 'ORB' : 'Reversal'}</td>
+                          <td className={o.trailingActive ? 'green' : 'muted'}>
+                            {o.trailingActive ? 'TRAILING' : 'OPEN'}
+                          </td>
+                          <td className="red">
+                            {o.trailingActive
+                              ? `$${fmt(o.trailingStopPremium)} (trail)`
+                              : `$${fmt(o.stopLossPremium)} (SL)`}
+                          </td>
+                          <td>{signalLabel(o.signalType)}</td>
                           <td className="muted">{formatTime(o.openedAt)}</td>
                         </tr>
                       );
@@ -392,7 +415,7 @@ export default function App() {
                           <td>${fmt(o.premiumPaid)}</td>
                           <td>${fmt(exitPremium)}</td>
                           <td className={(o.pnl ?? 0) >= 0 ? 'green' : 'red'}>{fmtDollar(o.pnl ?? 0)}</td>
-                          <td>{o.signalType === 'orb_breakout' ? 'ORB' : 'Reversal'}</td>
+                          <td>{signalLabel(o.signalType)}</td>
                           <td className="muted">{o.closedAt ? formatTime(o.closedAt) : '—'}</td>
                         </tr>
                       );
@@ -404,10 +427,10 @@ export default function App() {
 
             {openOptions.length === 0 && closedOptions.length === 0 && (
               <div className="empty">
-                No option positions yet. Options (calls/puts) are auto-opened when ORB or Reversal signals trigger.
+                No option positions yet. Options (calls/puts) are auto-opened when any signal triggers (ORB, Reversal, MACD, or Ichimoku).
                 <br /><br />
                 <strong>Strategy:</strong> Bullish signals → buy CALL · Bearish signals → buy PUT<br />
-                <strong>Take profit:</strong> 20% gain on premium · <strong>Stop loss:</strong> 50% loss on premium
+                <strong>Take profit:</strong> +25% → activates trailing stop (15% below peak) · <strong>Stop loss:</strong> −35% · <strong>Max:</strong> 5 trades/day
               </div>
             )}
 
@@ -415,6 +438,7 @@ export default function App() {
               <div style={{ marginTop: '1.5rem', display: 'flex', gap: '2rem', fontSize: '0.85rem', color: 'var(--muted)' }}>
                 <span>Options Cash: <strong>${fmt(optionsState.optionsCash)}</strong></span>
                 <span>Total Options P&amp;L: <strong className={optionsState.optionsPnl >= 0 ? 'green' : 'red'}>{fmtDollar(optionsState.optionsPnl)}</strong></span>
+                <span>Daily Trades: <strong className={optionsState.dailyOptionsCount >= OPTIONS_DAILY_LIMIT ? 'red' : ''}>{optionsState.dailyOptionsCount}/{OPTIONS_DAILY_LIMIT}</strong></span>
               </div>
             )}
           </div>
