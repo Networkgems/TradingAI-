@@ -275,23 +275,33 @@ export default function App() {
                       <th>Side</th>
                       <th>Qty</th>
                       <th>Entry</th>
+                      <th>Current</th>
+                      <th>P&amp;L %</th>
                       <th>Stop</th>
                       <th>Target</th>
                       <th>Opened</th>
                     </tr>
                   </thead>
                   <tbody>
-                    {openPositions.map(p => (
-                      <tr key={p.id}>
-                        <td className="symbol">{p.symbol}</td>
-                        <td className={p.side === 'buy' ? 'green' : 'red'}>{p.side.toUpperCase()}</td>
-                        <td>{p.quantity}</td>
-                        <td>${fmt(p.entryPrice)}</td>
-                        <td className="red">${fmt(p.stopLoss)}</td>
-                        <td className="green">${fmt(p.takeProfit)}</td>
-                        <td className="muted">{formatTime(p.openedAt)}</td>
-                      </tr>
-                    ))}
+                    {openPositions.map(p => {
+                      const sym = symbols.find(s => s.symbol === p.symbol);
+                      const currentPrice = sym?.price ?? p.entryPrice;
+                      const multiplier = p.side === 'buy' ? 1 : -1;
+                      const pnlPct = ((currentPrice - p.entryPrice) / p.entryPrice) * 100 * multiplier;
+                      return (
+                        <tr key={p.id}>
+                          <td className="symbol">{p.symbol}</td>
+                          <td className={p.side === 'buy' ? 'green' : 'red'}>{p.side.toUpperCase()}</td>
+                          <td>{p.quantity}</td>
+                          <td>${fmt(p.entryPrice)}</td>
+                          <td>${fmt(currentPrice)}</td>
+                          <td className={pnlPct >= 0 ? 'green' : 'red'}>{fmtPct(pnlPct)}</td>
+                          <td className="red">${fmt(p.stopLoss)}</td>
+                          <td className="green">${fmt(p.takeProfit)}</td>
+                          <td className="muted">{formatTime(p.openedAt)}</td>
+                        </tr>
+                      );
+                    })}
                   </tbody>
                 </table>
               </>
