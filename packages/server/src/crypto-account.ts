@@ -88,6 +88,7 @@ export class CryptoPaperAccount {
         const pnl = (exitPrice - pos.entryPrice) * pos.quantity * multiplier;
         pos.pnl = pnl;
         pos.closedAt = Date.now();
+        pos.exitPrice = exitPrice;
         this.cash += exitPrice * pos.quantity;
         this.equity += pnl;
         this.positions.delete(id);

@@ -38,6 +38,7 @@ export interface Position {
   takeProfit: number;
   openedAt: number;
   closedAt?: number;
+  exitPrice?: number;
   pnl?: number;
 }
 

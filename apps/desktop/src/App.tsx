@@ -176,7 +176,7 @@ function CryptoDashboard({ onBack }: { onBack: () => void }) {
         <div className="header-left">
           <button className="back-btn" onClick={onBack} title="Back to dashboard selector">&#8592; Home</button>
           <h1>TradingAI <span className="mode-badge crypto">Crypto</span></h1>
-          <span className="subtitle">ORB · Reversal · 20 Symbols · 24/7</span>
+          <span className="subtitle">Reversal · MACD · Ichimoku · 20 Symbols · 24/7</span>
         </div>
         <div className="header-right">
           {account && (
@@ -387,7 +387,7 @@ function CryptoDashboard({ onBack }: { onBack: () => void }) {
                         <td className={p.side === 'buy' ? 'green' : 'red'}>{p.side.toUpperCase()}</td>
                         <td>{p.quantity}</td>
                         <td>${fmt(p.entryPrice)}</td>
-                        <td>${fmt(p.side === 'buy' ? p.takeProfit : p.stopLoss)}</td>
+                        <td>${fmt(p.exitPrice ?? (p.side === 'buy' ? p.takeProfit : p.stopLoss))}</td>
                         <td className={(p.pnl ?? 0) >= 0 ? 'green' : 'red'}>{fmtDollar(p.pnl ?? 0)}</td>
                         <td className="muted">{p.closedAt ? formatTime(p.closedAt) : '—'}</td>
                       </tr>
@@ -751,7 +751,7 @@ export default function App() {
                         <td className={p.side === 'buy' ? 'green' : 'red'}>{p.side.toUpperCase()}</td>
                         <td>{p.quantity}</td>
                         <td>${fmt(p.entryPrice)}</td>
-                        <td>${fmt(p.side === 'buy' ? p.takeProfit : p.stopLoss)}</td>
+                        <td>${fmt(p.exitPrice ?? (p.side === 'buy' ? p.takeProfit : p.stopLoss))}</td>
                         <td className={(p.pnl ?? 0) >= 0 ? 'green' : 'red'}>{fmtDollar(p.pnl ?? 0)}</td>
                         <td className="muted">{p.closedAt ? formatTime(p.closedAt) : '—'}</td>
                       </tr>
