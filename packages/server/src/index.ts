@@ -136,7 +136,7 @@ app.get('/api/reports', requireAuth, async (_req, res) => {
 });
 
 app.get('/api/reports/:date', requireAuth, async (req, res) => {
-  const { date } = req.params;
+  const { date } = req.params as Record<string, string>;
   if (!/^\d{4}-\d{2}-\d{2}$/.test(date)) {
     res.status(400).json({ error: 'Invalid date format. Use YYYY-MM-DD.' });
     return;
