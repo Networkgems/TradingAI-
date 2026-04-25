@@ -5,7 +5,7 @@ export interface BacktestConfig {
   startDate: number;
   endDate: number;
   initialEquity: number;
-  strategyType: 'orb' | 'reversal' | 'combined';
+  strategyType: 'orb' | 'reversal' | 'macd' | 'ichimoku' | 'combined';
 }
 
 export interface BacktestResult {
@@ -16,4 +16,8 @@ export interface BacktestResult {
   avgRiskReward: number;
   maxDrawdown: number;
   sharpeRatio: number;
+  totalTrades: number;
+  winners: number;
+  losers: number;
+  profitFactor: number;
 }
