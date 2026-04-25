@@ -6,6 +6,7 @@ import { existsSync } from 'fs';
 import { join, dirname } from 'path';
 import { fileURLToPath } from 'url';
 import { SignalEngine } from './signal-engine.js';
+import { CryptoSignalEngine } from './crypto-engine.js';
 import { MarketScheduler } from './scheduler.js';
 import { generateEodReport } from './reports/eod-report.js';
 import { PnlTracker } from './pnl-tracker.js';
@@ -31,6 +32,7 @@ app.use(express.json());
 
 const tracker = new PnlTracker(DATA_DIR);
 const engine = new SignalEngine(tracker);
+const cryptoEngine = new CryptoSignalEngine();
 const scheduler = new MarketScheduler();
 
 // ── EOD Report generation ────────────────────────────────────────────────────
@@ -75,6 +77,14 @@ async function generateAndSaveReport(): Promise<void> {
 
 app.get('/api/state', (_req, res) => {
   res.json(engine.getState());
+});
+
+app.get('/api/crypto/state', (_req, res) => {
+  res.json(cryptoEngine.getState());
+});
+
+app.get('/api/crypto/news', (_req, res) => {
+  res.json(cryptoEngine.getNews());
 });
 
 app.get('/api/health', (_req, res) => {
@@ -148,6 +158,7 @@ const wss = new WebSocketServer({ server: httpServer });
 wss.on('connection', async (ws) => {
   // Send current trading state immediately on connect
   ws.send(JSON.stringify({ type: 'state', payload: engine.getState() }));
+  ws.send(JSON.stringify({ type: 'crypto_state', payload: cryptoEngine.getState() }));
 
   // Also send latest report if available
   const latestPath = join(REPORTS_DIR, 'latest.json');
@@ -162,15 +173,21 @@ wss.on('connection', async (ws) => {
 engine.onTick((state) => {
   const msg = JSON.stringify({ type: 'state', payload: state });
   for (const client of wss.clients) {
-    if (client.readyState === WebSocket.OPEN) {
-      client.send(msg);
-    }
+    if (client.readyState === WebSocket.OPEN) client.send(msg);
+  }
+});
+
+cryptoEngine.onTick((state) => {
+  const msg = JSON.stringify({ type: 'crypto_state', payload: state });
+  for (const client of wss.clients) {
+    if (client.readyState === WebSocket.OPEN) client.send(msg);
   }
 });
 
 // ── Start ────────────────────────────────────────────────────────────────────
 
 engine.start();
+cryptoEngine.start();
 scheduler.start(generateAndSaveReport);
 
 httpServer.listen(PORT, () => {
@@ -182,6 +199,7 @@ httpServer.listen(PORT, () => {
 
 process.on('SIGINT', () => {
   engine.stop();
+  cryptoEngine.stop();
   scheduler.stop();
   process.exit(0);
 });

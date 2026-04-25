@@ -101,6 +101,39 @@ export const WATCHLIST: readonly string[] = [
   'SPY',   'QQQ',  'IWM',  'DIA',   'XLF',
 ] as const;
 
+export const CRYPTO_WATCHLIST: readonly string[] = [
+  'BTC-USD', 'ETH-USD', 'BNB-USD',  'SOL-USD',  'ADA-USD',
+  'DOT-USD', 'AVAX-USD','LINK-USD', 'MATIC-USD','XRP-USD',
+  'LTC-USD', 'BCH-USD', 'ATOM-USD', 'DOGE-USD', 'SHIB-USD',
+  'NEAR-USD','FTM-USD', 'SAND-USD', 'MANA-USD', 'AXS-USD',
+] as const;
+
+export interface NewsItem {
+  title: string;
+  url: string;
+  source: string;
+  publishedAt: string; // ISO 8601
+  summary?: string;
+}
+
+export interface CryptoSymbolState {
+  symbol: string;
+  price: number;
+  volume: number;
+  change: number;
+  changePct: number;
+  lastUpdated: number;
+}
+
+export interface CryptoEngineState {
+  symbols: CryptoSymbolState[];
+  signals: TradeSignal[];
+  account: AccountState;
+  closedPositions: Position[];
+  news: NewsItem[];
+  lastTick: number;
+}
+
 export interface MarketBar {
   symbol: string;
   timestamp: number;
