@@ -1,0 +1,29 @@
+{
+  "name": "@trading-app/backtest",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "import": "./dist/index.js",
+      "types": "./dist/index.d.ts"
+    }
+  },
+  "scripts": {
+    "build": "tsc -b",
+    "typecheck": "tsc --noEmit",
+    "dev": "tsc -b --watch",
+    "test": "vitest run --passWithNoTests"
+  },
+  "dependencies": {
+    "@trading-app/shared": "workspace:*",
+    "@trading-app/engine": "workspace:*"
+  },
+  "devDependencies": {
+    "@types/node": "^22.0.0",
+    "typescript": "^5.4.5",
+    "vitest": "^2.0.0"
+  }
+}
