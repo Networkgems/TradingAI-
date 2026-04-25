@@ -1,4 +1,4 @@
-import { OrbStrategy, ReversalStrategy } from '@trading-app/engine';
+import { ReversalStrategy, MacdBollingerStrategy } from '@trading-app/engine';
 import { CRYPTO_WATCHLIST } from '@trading-app/shared';
 import type { TradeSignal, Candle, AccountState, Position, CryptoEngineState, NewsItem } from '@trading-app/shared';
 import { fetchCryptoMinuteBars, fetchCryptoQuotes, fetchCryptoNews } from './crypto-feed.js';
@@ -10,8 +10,11 @@ const MAX_SIGNALS = 50;
 const NEWS_REFRESH_MS = 5 * 60_000;
 
 export class CryptoSignalEngine {
-  private readonly orb = new OrbStrategy({ rangeMinutes: 60, minVolume: 100 });
+  // Backtesting (TRA-52): ORB disabled (24/7 incompatible, -55% avg return).
+  // MACD-Bollinger enabled with crypto-tuned params (41.7% win rate, +1.73% avg return).
+  // Reversal kept with stock RSI 70/30 thresholds (outperforms 60/40 for crypto).
   private readonly reversal = new ReversalStrategy();
+  private readonly macdBollinger = new MacdBollingerStrategy({ bbPeriod: 14, bbMultiplier: 2.5, volumeMultiplier: 1.2 });
   private readonly account = new CryptoPaperAccount();
 
   private symbolState: Map<string, CryptoEngineState['symbols'][number]> = new Map();
@@ -69,10 +72,10 @@ export class CryptoSignalEngine {
       const candles = this.candleCache.get(sym) ?? [];
       if (candles.length < 15) continue;
 
-      const orbSignal = this.orb.evaluate(sym, candles);
       const reversalSignal = this.reversal.evaluate(sym, candles);
+      const macdSignal = this.macdBollinger.evaluate(sym, candles);
 
-      for (const signal of [orbSignal, reversalSignal]) {
+      for (const signal of [reversalSignal, macdSignal]) {
         if (!signal) continue;
         if (this.account.hasOpenPositionForSignalType(sym, signal.type)) continue;
         const recent = this.recentSignals.find(
