@@ -2,6 +2,7 @@ import { useEffect, useRef, useState } from 'react';
 import type { TradeSignal, Position, AccountState, OptionPosition, OptionsAccountState, EodReport } from '@trading-app/shared';
 import { OPTIONS_DAILY_LIMIT } from '@trading-app/shared';
 import LoginPage from './LoginPage.tsx';
+import { CalendarTab } from './CalendarTab.tsx';
 import './index.css';
 
 const SERVER_URL = import.meta.env.VITE_SERVER_URL ?? 'ws://localhost:4242';
@@ -65,7 +66,7 @@ function Dashboard({ token, onLogout }: { token: string; onLogout: () => void })
   const [eodReport, setEodReport] = useState<EodReport | null>(null);
   const [eodCollapsed, setEodCollapsed] = useState(false);
   const [connected, setConnected] = useState(false);
-  const [tab, setTab] = useState<'watchlist' | 'signals' | 'positions' | 'options'>('watchlist');
+  const [tab, setTab] = useState<'watchlist' | 'signals' | 'positions' | 'options' | 'calendar'>('watchlist');
   const wsRef = useRef<WebSocket | null>(null);
   const reconnectTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
 
@@ -192,6 +193,9 @@ function Dashboard({ token, onLogout }: { token: string; onLogout: () => void })
              `Options (${openOptions.length})`}
           </button>
         ))}
+        <button className={`tab ${tab === 'calendar' ? 'active' : ''}`} onClick={() => setTab('calendar')}>
+          Calendar
+        </button>
       </nav>
 
       <main className="content">
@@ -462,6 +466,10 @@ function Dashboard({ token, onLogout }: { token: string; onLogout: () => void })
               </div>
             )}
           </div>
+        )}
+
+        {tab === 'calendar' && (
+          <CalendarTab token={token} httpUrl={HTTP_URL} />
         )}
       </main>
 
