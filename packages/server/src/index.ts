@@ -391,6 +391,18 @@ engine.onTick((state) => {
   }
 });
 
+// ── Static frontend (production web) ────────────────────────────────────────
+// When the Vite build exists alongside this server, serve it so the web PWA
+// and the API share the same origin (avoids CORS and makes WS auth simpler).
+const DIST_DIR = join(__dirname, '..', '..', '..', 'apps', 'desktop', 'dist');
+if (existsSync(DIST_DIR)) {
+  app.use(express.static(DIST_DIR));
+  // SPA fallback: all non-API paths → index.html (supports React client-side routing)
+  app.get(/^(?!\/api\/).*/, (_req, res) => {
+    res.sendFile(join(DIST_DIR, 'index.html'));
+  });
+}
+
 // ── Start ────────────────────────────────────────────────────────────────────
 
 engine.start();

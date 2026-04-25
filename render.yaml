@@ -3,7 +3,7 @@ services:
     name: tradingai-server
     runtime: node
     plan: free
-    buildCommand: pnpm install --frozen-lockfile && pnpm run render-build
+    buildCommand: pnpm install --frozen-lockfile && pnpm run web:build
     startCommand: node packages/server/dist/index.js
     envVars:
       - key: AUTH_SECRET

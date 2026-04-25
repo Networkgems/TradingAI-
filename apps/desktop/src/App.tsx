@@ -7,7 +7,12 @@ import SettingsPage from './SettingsPage.tsx';
 import { CalendarTab } from './CalendarTab.tsx';
 import './index.css';
 
-const SERVER_URL = import.meta.env.VITE_SERVER_URL ?? 'ws://localhost:4242';
+// When served from the same origin (production), derive WS URL from window.location.
+// Falls back to localhost for local Tauri / dev builds.
+const SERVER_URL: string = import.meta.env.VITE_SERVER_URL ??
+  (typeof window !== 'undefined' && window.location.hostname !== 'localhost' && window.location.hostname !== '127.0.0.1'
+    ? `${window.location.protocol === 'https:' ? 'wss' : 'ws'}://${window.location.host}`
+    : 'ws://localhost:4242');
 const HTTP_URL = SERVER_URL.replace(/^ws/, 'http');
 
 interface SymbolState {
