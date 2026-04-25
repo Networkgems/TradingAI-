@@ -1,0 +1,12 @@
+services:
+  - type: web
+    name: tradingai-server
+    runtime: node
+    plan: free
+    buildCommand: pnpm install --frozen-lockfile && pnpm --filter @trading-app/shared build && pnpm --filter @trading-app/engine build && pnpm --filter @trading-app/server build
+    startCommand: node packages/server/dist/index.js
+    envVars:
+      - key: AUTH_SECRET
+        generateValue: true
+      - key: NODE_ENV
+        value: production

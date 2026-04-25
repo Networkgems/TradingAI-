@@ -8,24 +8,49 @@ import { fileURLToPath } from 'url';
 import { SignalEngine } from './signal-engine.js';
 import { MarketScheduler } from './scheduler.js';
 import { generateEodReport } from './reports/eod-report.js';
+import { createToken, validateCredentials, verifyToken } from './auth.js';
 
 const PORT = Number(process.env.PORT ?? 4242);
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const REPORTS_DIR = join(__dirname, '..', 'reports');
 
-// Ensure reports directory exists
 if (!existsSync(REPORTS_DIR)) {
   await mkdir(REPORTS_DIR, { recursive: true });
 }
 
 const app = express();
 
-app.use((_req, res, next) => {
+// ── CORS ─────────────────────────────────────────────────────────────────────
+
+app.use((req, res, next) => {
   res.setHeader('Access-Control-Allow-Origin', '*');
-  res.setHeader('Access-Control-Allow-Headers', 'Content-Type');
+  res.setHeader('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
+  res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization');
+  if (req.method === 'OPTIONS') {
+    res.status(204).end();
+    return;
+  }
   next();
 });
 app.use(express.json());
+
+// ── Auth middleware ───────────────────────────────────────────────────────────
+
+function requireAuth(req: express.Request, res: express.Response, next: express.NextFunction): void {
+  const header = req.headers.authorization;
+  if (!header?.startsWith('Bearer ')) {
+    res.status(401).json({ error: 'Unauthorized' });
+    return;
+  }
+  const user = verifyToken(header.slice(7));
+  if (!user) {
+    res.status(401).json({ error: 'Invalid or expired token' });
+    return;
+  }
+  next();
+}
+
+// ── Engines ───────────────────────────────────────────────────────────────────
 
 const engine = new SignalEngine();
 const scheduler = new MarketScheduler();
@@ -49,7 +74,6 @@ async function generateAndSaveReport(): Promise<void> {
 
   console.log(`[reports] EOD report saved → ${datePath}`);
 
-  // Broadcast report event to all WebSocket clients
   const msg = JSON.stringify({ type: 'eod_report', payload: report });
   for (const client of wss.clients) {
     if (client.readyState === WebSocket.OPEN) client.send(msg);
@@ -58,18 +82,32 @@ async function generateAndSaveReport(): Promise<void> {
 
 // ── REST endpoints ───────────────────────────────────────────────────────────
 
-app.get('/api/state', (_req, res) => {
-  res.json(engine.getState());
-});
-
 app.get('/api/health', (_req, res) => {
   res.json({ ok: true, time: new Date().toISOString() });
 });
 
-app.get('/api/reports/latest', async (_req, res) => {
+app.post('/api/auth/login', (req, res) => {
+  const { username, password } = req.body as { username?: string; password?: string };
+  if (typeof username !== 'string' || typeof password !== 'string') {
+    res.status(400).json({ error: 'username and password are required' });
+    return;
+  }
+  if (!validateCredentials(username, password)) {
+    res.status(401).json({ error: 'Invalid username or password' });
+    return;
+  }
+  res.json({ token: createToken(username) });
+});
+
+app.get('/api/state', requireAuth, (_req, res) => {
+  res.json(engine.getState());
+});
+
+app.get('/api/reports/latest', requireAuth, async (_req, res) => {
   const latestPath = join(REPORTS_DIR, 'latest.json');
   if (!existsSync(latestPath)) {
-    return res.status(404).json({ error: 'No report generated yet' });
+    res.status(404).json({ error: 'No report generated yet' });
+    return;
   }
   try {
     const raw = await readFile(latestPath, 'utf-8');
@@ -79,7 +117,7 @@ app.get('/api/reports/latest', async (_req, res) => {
   }
 });
 
-app.get('/api/reports', async (_req, res) => {
+app.get('/api/reports', requireAuth, async (_req, res) => {
   try {
     const files = await readdir(REPORTS_DIR);
     const dates = files
@@ -93,14 +131,16 @@ app.get('/api/reports', async (_req, res) => {
   }
 });
 
-app.get('/api/reports/:date', async (req, res) => {
+app.get('/api/reports/:date', requireAuth, async (req, res) => {
   const { date } = req.params;
   if (!/^\d{4}-\d{2}-\d{2}$/.test(date)) {
-    return res.status(400).json({ error: 'Invalid date format. Use YYYY-MM-DD.' });
+    res.status(400).json({ error: 'Invalid date format. Use YYYY-MM-DD.' });
+    return;
   }
   const filePath = join(REPORTS_DIR, `${date}.json`);
   if (!existsSync(filePath)) {
-    return res.status(404).json({ error: `No report for ${date}` });
+    res.status(404).json({ error: `No report for ${date}` });
+    return;
   }
   try {
     const raw = await readFile(filePath, 'utf-8');
@@ -110,8 +150,7 @@ app.get('/api/reports/:date', async (req, res) => {
   }
 });
 
-// Manual trigger endpoint (for testing / on-demand)
-app.post('/api/reports/generate', async (_req, res) => {
+app.post('/api/reports/generate', requireAuth, async (_req, res) => {
   try {
     await generateAndSaveReport();
     res.json({ ok: true, message: 'EOD report generated successfully' });
@@ -123,13 +162,25 @@ app.post('/api/reports/generate', async (_req, res) => {
 // ── WebSocket ────────────────────────────────────────────────────────────────
 
 const httpServer = createServer(app);
-const wss = new WebSocketServer({ server: httpServer });
+const wss = new WebSocketServer({ noServer: true });
+
+httpServer.on('upgrade', (req, socket, head) => {
+  const url = new URL(req.url ?? '/', `http://${req.headers.host}`);
+  const token = url.searchParams.get('token') ?? '';
+  const user = verifyToken(token);
+  if (!user) {
+    socket.write('HTTP/1.1 401 Unauthorized\r\n\r\n');
+    socket.destroy();
+    return;
+  }
+  wss.handleUpgrade(req, socket, head, (ws) => {
+    wss.emit('connection', ws, req);
+  });
+});
 
 wss.on('connection', async (ws) => {
-  // Send current trading state immediately on connect
   ws.send(JSON.stringify({ type: 'state', payload: engine.getState() }));
 
-  // Also send latest report if available
   const latestPath = join(REPORTS_DIR, 'latest.json');
   if (existsSync(latestPath)) {
     try {

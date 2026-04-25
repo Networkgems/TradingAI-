@@ -1,6 +1,7 @@
 import { useEffect, useRef, useState } from 'react';
 import type { TradeSignal, Position, AccountState, OptionPosition, OptionsAccountState, EodReport } from '@trading-app/shared';
 import { OPTIONS_DAILY_LIMIT } from '@trading-app/shared';
+import LoginPage from './LoginPage.tsx';
 import './index.css';
 
 const SERVER_URL = import.meta.env.VITE_SERVER_URL ?? 'ws://localhost:4242';
@@ -59,7 +60,7 @@ function signalLabel(type: string) {
   }
 }
 
-export default function App() {
+function Dashboard({ token, onLogout }: { token: string; onLogout: () => void }) {
   const [state, setState] = useState<AppState | null>(null);
   const [eodReport, setEodReport] = useState<EodReport | null>(null);
   const [eodCollapsed, setEodCollapsed] = useState(false);
@@ -70,12 +71,16 @@ export default function App() {
 
   useEffect(() => {
     function connect() {
-      const ws = new WebSocket(SERVER_URL);
+      const ws = new WebSocket(`${SERVER_URL}?token=${token}`);
       wsRef.current = ws;
 
       ws.onopen = () => setConnected(true);
-      ws.onclose = () => {
+      ws.onclose = (e) => {
         setConnected(false);
+        if (e.code === 1008) {
+          onLogout();
+          return;
+        }
         reconnectTimer.current = setTimeout(connect, 3000);
       };
       ws.onerror = () => ws.close();
@@ -88,25 +93,27 @@ export default function App() {
       };
     }
 
-    // Try WS first; if server not running, fall back to polling REST
     connect();
     return () => {
       wsRef.current?.close();
       if (reconnectTimer.current) clearTimeout(reconnectTimer.current);
     };
-  }, []);
+  }, [token, onLogout]);
 
   // Fallback REST polling when WS isn't connected
   useEffect(() => {
     if (connected) return;
     const id = setInterval(async () => {
       try {
-        const r = await fetch(`${HTTP_URL}/api/state`);
+        const r = await fetch(`${HTTP_URL}/api/state`, {
+          headers: { Authorization: `Bearer ${token}` },
+        });
+        if (r.status === 401) { onLogout(); return; }
         if (r.ok) setState(await r.json() as AppState);
       } catch { /* ignore */ }
     }, 5000);
     return () => clearInterval(id);
-  }, [connected]);
+  }, [connected, token, onLogout]);
 
   const account = state?.account;
   const signals = state?.signals ?? [];
@@ -170,6 +177,9 @@ export default function App() {
           <div className={`status-dot ${connected ? 'live' : 'offline'}`} title={connected ? 'Live' : 'Reconnecting...'} />
           <span className="status-label">{connected ? 'LIVE' : 'Reconnecting'}</span>
           {state && <span className="last-tick">Updated {timeAgo(state.lastTick)}</span>}
+          <button className="logout-btn" onClick={onLogout} title="Sign out">
+            Sign out
+          </button>
         </div>
       </header>
 
@@ -462,7 +472,6 @@ export default function App() {
 
           {!eodCollapsed && (
             <div className="eod-body">
-              {/* P&L summary row */}
               <div className="eod-stats-row">
                 <div className="eod-stat">
                   <span className="eod-stat-label">Realized P&amp;L</span>
@@ -508,7 +517,6 @@ export default function App() {
                 </div>
               </div>
 
-              {/* Top 5 movers */}
               {eodReport.top5Movers.length > 0 && (
                 <div className="eod-movers">
                   <span className="eod-section-label">Top 5 Movers:</span>
@@ -523,7 +531,6 @@ export default function App() {
                 </div>
               )}
 
-              {/* Trade log */}
               {eodReport.trades.length > 0 && (
                 <div className="eod-trades">
                   <span className="eod-section-label">Trade Log ({eodReport.trades.length})</span>
@@ -567,4 +574,19 @@ export default function App() {
       )}
     </div>
   );
+}
+
+export default function App() {
+  const [token, setToken] = useState<string | null>(() => localStorage.getItem('auth_token'));
+
+  function handleLogout() {
+    localStorage.removeItem('auth_token');
+    setToken(null);
+  }
+
+  if (!token) {
+    return <LoginPage onLogin={setToken} />;
+  }
+
+  return <Dashboard token={token} onLogout={handleLogout} />;
 }

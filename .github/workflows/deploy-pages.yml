@@ -43,6 +43,7 @@ jobs:
         run: pnpm --filter desktop vite:build
         env:
           VITE_BASE: /TradingAI-/
+          VITE_SERVER_URL: ${{ secrets.VITE_SERVER_URL }}
 
       - uses: actions/upload-pages-artifact@v3
         with:
