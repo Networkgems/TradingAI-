@@ -36,8 +36,12 @@ app.use(express.json());
 
 // ── Auth middleware ───────────────────────────────────────────────────────────
 
+function firstHeader(val: string | string[] | undefined): string | undefined {
+  return Array.isArray(val) ? val[0] : val;
+}
+
 function requireAuth(req: express.Request, res: express.Response, next: express.NextFunction): void {
-  const header = req.headers.authorization;
+  const header = firstHeader(req.headers.authorization);
   if (!header?.startsWith('Bearer ')) {
     res.status(401).json({ error: 'Unauthorized' });
     return;
@@ -165,8 +169,7 @@ const httpServer = createServer(app);
 const wss = new WebSocketServer({ noServer: true });
 
 httpServer.on('upgrade', (req, socket, head) => {
-  const rawHost = Array.isArray(req.headers.host) ? req.headers.host[0] : req.headers.host;
-  const url = new URL(req.url ?? '/', `http://${rawHost ?? 'localhost'}`);
+  const url = new URL(req.url ?? '/', `http://${firstHeader(req.headers.host) ?? 'localhost'}`);
   const token = url.searchParams.get('token') ?? '';
   const user = verifyToken(token);
   if (!user) {
