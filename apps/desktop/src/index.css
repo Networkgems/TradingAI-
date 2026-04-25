@@ -951,3 +951,223 @@ tr:hover td { background: #1c2128; }
 }
 
 .cal-year-wl { font-size: 0.65rem; }
+
+/* ── Mobile Responsive ─────────────────────────────────────────────────────── */
+
+@media (max-width: 768px) {
+  body {
+    font-size: 14px;
+  }
+
+  /* Header: allow wrapping, tighter spacing */
+  .header {
+    flex-wrap: wrap;
+    gap: 0.4rem;
+    padding: 0.5rem 0.75rem;
+  }
+
+  .header-right {
+    gap: 0.6rem;
+    flex-wrap: wrap;
+  }
+
+  /* Hide least-critical header items on tablet/mobile */
+  .last-tick {
+    display: none;
+  }
+
+  /* Tabs: horizontally scrollable, no wrapping */
+  .tabs {
+    overflow-x: auto;
+    -webkit-overflow-scrolling: touch;
+    scrollbar-width: none;
+  }
+
+  .tabs::-webkit-scrollbar {
+    display: none;
+  }
+
+  .tab {
+    white-space: nowrap;
+    flex-shrink: 0;
+    min-height: 44px;
+    display: flex;
+    align-items: center;
+    padding: 0 1rem;
+  }
+
+  /* Content area */
+  .content {
+    padding: 0.75rem;
+    overflow: auto;
+  }
+
+  /* Settings: single column, full width */
+  .settings-page {
+    padding: 0.75rem;
+    max-width: 100%;
+    max-height: calc(100vh - 110px);
+  }
+
+  .settings-grid {
+    grid-template-columns: 1fr;
+  }
+
+  .mode-cards {
+    grid-template-columns: 1fr;
+  }
+
+  /* Prevent iOS input zoom (font-size must be ≥ 16px) */
+  .settings-field input,
+  .settings-field select,
+  .login-input {
+    font-size: 16px;
+    min-height: 44px;
+  }
+
+  /* Touch-friendly buttons */
+  .login-btn,
+  .btn-primary {
+    min-height: 44px;
+  }
+
+  .logout-btn {
+    min-height: 40px;
+    padding: 0.35rem 0.65rem;
+  }
+
+  .btn-secondary,
+  .btn-danger {
+    min-height: 40px;
+  }
+
+  /* Login card */
+  .login-card {
+    padding: 1.5rem 1.25rem;
+    margin: 0 0.75rem;
+  }
+
+  /* Calendar: full width, responsive controls */
+  .cal-panel {
+    max-width: 100%;
+  }
+
+  .cal-header {
+    flex-wrap: wrap;
+    gap: 0.5rem;
+  }
+
+  .cal-controls {
+    flex-wrap: wrap;
+    gap: 0.5rem;
+    width: 100%;
+    justify-content: space-between;
+  }
+
+  .cal-period-label {
+    min-width: 90px;
+    font-size: 0.75rem;
+  }
+
+  /* Year grid: 2 columns instead of 4 */
+  .cal-year-grid {
+    grid-template-columns: repeat(2, 1fr);
+  }
+
+  /* Month cells: slightly smaller */
+  .cal-cell {
+    min-height: 50px;
+    padding: 0.4rem 0.25rem;
+  }
+
+  .cal-pnl {
+    font-size: 0.72rem;
+  }
+
+  /* Signal cards: single column */
+  .signal-list {
+    grid-template-columns: 1fr;
+  }
+
+  /* Tables: horizontal scroll containers */
+  .watchlist,
+  .positions-panel,
+  .eod-trades {
+    overflow-x: auto;
+    -webkit-overflow-scrolling: touch;
+  }
+
+  /* Allow tables to be wider than their container so scroll kicks in */
+  .watchlist table,
+  .positions-panel table,
+  .eod-trades table,
+  .user-table-wrap table {
+    min-width: max-content;
+  }
+
+  /* EOD panel */
+  .eod-header {
+    padding: 0.5rem 0.75rem;
+  }
+
+  .eod-body {
+    padding: 0.5rem 0.75rem 0.75rem;
+  }
+
+  .eod-stats-row {
+    gap: 0.75rem;
+  }
+
+  /* Modal: fit within screen */
+  .modal-card {
+    margin: 0.75rem;
+    max-width: calc(100% - 1.5rem);
+    width: 100%;
+  }
+}
+
+@media (max-width: 480px) {
+  /* Small phones */
+
+  /* Show only the most essential header stats */
+  .header-right .stat {
+    display: none;
+  }
+
+  .header-right .stat:nth-child(-n+3) {
+    display: flex;
+  }
+
+  .status-label {
+    display: none;
+  }
+
+  .subtitle {
+    display: none;
+  }
+
+  /* Tighten header further */
+  .header-right {
+    gap: 0.4rem;
+  }
+
+  /* Calendar cells: compact */
+  .cal-cell {
+    min-height: 40px;
+    padding: 0.3rem 0.1rem;
+  }
+
+  .cal-day-num {
+    font-size: 0.68rem;
+  }
+
+  .cal-pnl {
+    font-size: 0.6rem;
+  }
+
+  /* Summary bar: tighter gap */
+  .cal-summary {
+    gap: 0.75rem;
+    padding: 0.5rem 0.75rem;
+  }
+}
