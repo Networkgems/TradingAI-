@@ -15,6 +15,9 @@ permissions:
   pages: write
   id-token: write
 
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+
 jobs:
   build:
     name: Build web frontend
@@ -45,7 +48,7 @@ jobs:
           VITE_BASE: /TradingAI-/
           VITE_SERVER_URL: ${{ secrets.VITE_SERVER_URL }}
 
-      - uses: actions/upload-pages-artifact@v3
+      - uses: actions/upload-pages-artifact@v4
         with:
           path: apps/desktop/dist
 
