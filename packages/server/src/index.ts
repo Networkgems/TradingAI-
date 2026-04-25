@@ -165,7 +165,8 @@ const httpServer = createServer(app);
 const wss = new WebSocketServer({ noServer: true });
 
 httpServer.on('upgrade', (req, socket, head) => {
-  const url = new URL(req.url ?? '/', `http://${req.headers.host}`);
+  const rawHost = Array.isArray(req.headers.host) ? req.headers.host[0] : req.headers.host;
+  const url = new URL(req.url ?? '/', `http://${rawHost ?? 'localhost'}`);
   const token = url.searchParams.get('token') ?? '';
   const user = verifyToken(token);
   if (!user) {
