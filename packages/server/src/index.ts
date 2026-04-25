@@ -10,6 +10,7 @@ import { MarketScheduler } from './scheduler.js';
 import { generateEodReport } from './reports/eod-report.js';
 import { createToken, verifyToken, generateResetToken, consumeResetToken } from './auth.js';
 import { loadSettings, getSettings, saveSettings } from './account-settings.js';
+import { PnlTracker } from './pnl-tracker.js';
 import {
   loadUsers,
   validateUserCredentials,
@@ -28,6 +29,7 @@ import { DEFAULT_ACCOUNT_SETTINGS } from '@trading-app/shared';
 const PORT = Number(process.env.PORT ?? 4242);
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const REPORTS_DIR = join(__dirname, '..', 'reports');
+const DATA_DIR = join(__dirname, '..', 'data');
 
 if (!existsSync(REPORTS_DIR)) {
   await mkdir(REPORTS_DIR, { recursive: true });
@@ -86,7 +88,8 @@ function requireAdmin(req: express.Request, res: express.Response, next: express
 // ── Engines ───────────────────────────────────────────────────────────────────
 
 const initialSettings = await loadSettings();
-const engine = new SignalEngine(initialSettings);
+const tracker = new PnlTracker(DATA_DIR, initialSettings.demoEquity);
+const engine = new SignalEngine(initialSettings, tracker);
 const scheduler = new MarketScheduler();
 
 // ── EOD Report generation ────────────────────────────────────────────────────
@@ -105,6 +108,18 @@ async function generateAndSaveReport(): Promise<void> {
     writeFile(latestJsonPath, JSON.stringify(report, null, 2), 'utf-8'),
     writeFile(latestMdPath, report.markdown, 'utf-8'),
   ]);
+
+  // Persist daily equity snapshot for cumulative tracking
+  const equitySnap = engine.getEquitySnapshot();
+  tracker.saveSnapshot({
+    date: report.date,
+    openingEquity: tracker.getOpeningEquity(),
+    closingEquity: equitySnap.equity,
+    dailyPnl: equitySnap.equity - tracker.getOpeningEquity(),
+    optionsPnl: equitySnap.optionsPnl,
+    combinedPnl: (equitySnap.equity - tracker.getOpeningEquity()) + equitySnap.optionsPnl,
+    trades: snapshot.allClosedPositions.length,
+  });
 
   console.log(`[reports] EOD report saved → ${datePath}`);
 
@@ -310,6 +325,10 @@ app.post('/api/reports/generate', requireAuth, async (_req, res) => {
   } catch (err) {
     res.status(500).json({ error: String(err) });
   }
+});
+
+app.get('/api/snapshots', requireAuth, (_req, res) => {
+  res.json(tracker.getSnapshots());
 });
 
 // ── Account Settings ─────────────────────────────────────────────────────────

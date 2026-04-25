@@ -5,6 +5,7 @@ import { fetchMinuteBars, fetchQuotes } from './yahoo-feed.js';
 import { PaperAccount } from './paper-account.js';
 import { PaperOptionsAccount } from './options-account.js';
 import type { DailySignalRecord } from './reports/eod-report.js';
+import type { PnlTracker } from './pnl-tracker.js';
 
 export interface SymbolState {
   symbol: string;
@@ -94,6 +95,7 @@ export class SignalEngine {
   private account: PaperAccount;
   private optionsAccount: PaperOptionsAccount;
   private readonly riskGovernor = new DailyRiskGovernor();
+  private readonly tracker: PnlTracker | undefined;
 
   private symbolState: Map<string, SymbolState> = new Map();
   private candleCache: Map<string, Candle[]> = new Map();
@@ -106,17 +108,19 @@ export class SignalEngine {
   private tickTimer: ReturnType<typeof setInterval> | null = null;
   private handlers: EngineEventHandler[] = [];
 
-  constructor(settings?: AccountSettings) {
+  constructor(settings?: AccountSettings, tracker?: PnlTracker) {
+    this.tracker = tracker;
+    const savedEquity = tracker?.getSavedEquity();
     const config = settings
       ? {
-          initialEquity: settings.demoEquity,
+          initialEquity: savedEquity ?? settings.demoEquity,
           managedAccountRatio: settings.managedAccountRatio,
           riskPerTrade: settings.riskPerTrade,
         }
-      : {};
+      : { initialEquity: savedEquity };
     this.account = new PaperAccount(config);
     this.optionsAccount = new PaperOptionsAccount({
-      initialEquity: settings?.demoEquity,
+      initialEquity: savedEquity ?? settings?.demoEquity,
       managedAccountRatio: settings?.managedAccountRatio,
       dailyTradesLimit: settings?.dailyTradesLimit,
     });
@@ -189,8 +193,20 @@ export class SignalEngine {
         // Feed daily risk governor with the closed trade's P&L
         this.riskGovernor.recordTrade(pos.pnl ?? 0, managedEquity);
       }
+      // Persist equity after equity positions close
+      this.tracker?.saveEquity(
+        this.account.getState().totalEquity,
+        this.optionsAccount.getState().optionsPnl,
+      );
     }
-    this.optionsAccount.checkExits(prices);
+    const optsClosed = this.optionsAccount.checkExits(prices);
+    if (optsClosed.length > 0) {
+      // Persist equity after options positions close
+      this.tracker?.saveEquity(
+        this.account.getState().totalEquity,
+        this.optionsAccount.getState().optionsPnl,
+      );
+    }
 
     for (const sym of WATCHLIST) {
       await this.refreshCandles(sym);
@@ -279,6 +295,13 @@ export class SignalEngine {
       allClosedPositions: [...this.allClosedPositions],
       dailySignals: [...this.dailySignals],
       signalTypeMap: new Map(this.positionSignalType),
+    };
+  }
+
+  getEquitySnapshot() {
+    return {
+      equity: this.account.getState().totalEquity,
+      optionsPnl: this.optionsAccount.getState().optionsPnl,
     };
   }
 }
