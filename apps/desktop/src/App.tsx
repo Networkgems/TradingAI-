@@ -36,12 +36,12 @@ function DashboardSelector({ onSelect }: { onSelect: (mode: 'stocks' | 'crypto')
         <p className="selector-subtitle">Select your trading dashboard</p>
       </div>
       <div className="selector-cards">
-        <button className="selector-card" onClick={() => onSelect('stocks')}>
+        <button className="selector-card stocks" onClick={() => onSelect('stocks')}>
           <div className="selector-card-icon"><CandlestickIcon /></div>
           <div className="selector-card-title">Stocks Trading</div>
           <div className="selector-card-desc">Trade US equities with ORB, Reversal, MACD, and Ichimoku strategies</div>
         </button>
-        <button className="selector-card" onClick={() => onSelect('crypto')}>
+        <button className="selector-card crypto" onClick={() => onSelect('crypto')}>
           <div className="selector-card-icon"><BitcoinIcon /></div>
           <div className="selector-card-title">Crypto Trading</div>
           <div className="selector-card-desc">Trade crypto 24/7 with live data and algorithmic strategies</div>

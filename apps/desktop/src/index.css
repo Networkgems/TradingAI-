@@ -176,6 +176,13 @@ tr:hover td { background: #1c2128; }
 .signal-card.buy { border-left: 3px solid var(--green); background: var(--buy); }
 .signal-card.sell { border-left: 3px solid var(--red); background: var(--sell); }
 
+.news-card {
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  padding: 0.75rem;
+  background: var(--surface);
+}
+
 .signal-header {
   display: flex;
   align-items: center;
@@ -336,4 +343,126 @@ tr:hover td { background: #1c2128; }
   font-size: 0.65rem;
   color: var(--muted);
   text-align: right;
+}
+
+/* ── Dashboard Selector ───────────────────────────────────────────────────── */
+
+.selector-screen {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  height: 100vh;
+  background: var(--bg);
+  gap: 3rem;
+}
+
+.selector-header {
+  text-align: center;
+}
+
+.selector-title {
+  font-size: 2rem;
+  font-weight: 700;
+  color: var(--blue);
+  letter-spacing: 0.06em;
+}
+
+.selector-subtitle {
+  font-size: 0.85rem;
+  color: var(--muted);
+  margin-top: 0.5rem;
+}
+
+.selector-cards {
+  display: flex;
+  gap: 2rem;
+}
+
+.selector-card {
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  padding: 2.5rem 2rem;
+  width: 240px;
+  cursor: pointer;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 1rem;
+  font-family: inherit;
+  color: var(--text);
+  text-align: center;
+  transition: border-color 0.18s, background 0.18s, transform 0.15s;
+}
+
+.selector-card:hover {
+  background: #1c2128;
+  transform: translateY(-3px);
+}
+
+.selector-card.stocks:hover {
+  border-color: var(--green);
+}
+
+.selector-card.crypto:hover {
+  border-color: #f7931a;
+}
+
+.selector-card-icon {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+
+.selector-card-title {
+  font-size: 1rem;
+  font-weight: 700;
+  letter-spacing: 0.04em;
+}
+
+.selector-card-desc {
+  font-size: 0.75rem;
+  color: var(--muted);
+  line-height: 1.5;
+}
+
+/* ── Back Button & Mode Badge ─────────────────────────────────────────────── */
+
+.back-btn {
+  background: none;
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  color: var(--muted);
+  cursor: pointer;
+  font-family: inherit;
+  font-size: 0.72rem;
+  padding: 0.25rem 0.6rem;
+  margin-right: 0.75rem;
+  transition: color 0.15s, border-color 0.15s;
+}
+
+.back-btn:hover {
+  color: var(--text);
+  border-color: var(--blue);
+}
+
+.mode-badge {
+  font-size: 0.6rem;
+  font-weight: 700;
+  padding: 0.15em 0.5em;
+  border-radius: 3px;
+  letter-spacing: 0.08em;
+  vertical-align: middle;
+  text-transform: uppercase;
+}
+
+.mode-badge.stocks {
+  background: rgba(63, 185, 80, 0.15);
+  color: var(--green);
+}
+
+.mode-badge.crypto {
+  background: rgba(247, 147, 26, 0.15);
+  color: #f7931a;
 }
