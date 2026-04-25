@@ -6,6 +6,7 @@ import { existsSync } from 'fs';
 import { join, dirname } from 'path';
 import { fileURLToPath } from 'url';
 import { SignalEngine } from './signal-engine.js';
+import { CryptoSignalEngine } from './crypto-engine.js';
 import { MarketScheduler } from './scheduler.js';
 import { generateEodReport } from './reports/eod-report.js';
 import { createToken, verifyToken, generateResetToken, consumeResetToken } from './auth.js';
@@ -90,6 +91,7 @@ function requireAdmin(req: express.Request, res: express.Response, next: express
 const initialSettings = await loadSettings();
 const tracker = new PnlTracker(DATA_DIR, initialSettings.demoEquity);
 const engine = new SignalEngine(initialSettings, tracker);
+const cryptoEngine = new CryptoSignalEngine();
 const scheduler = new MarketScheduler();
 
 // ── EOD Report generation ────────────────────────────────────────────────────
@@ -271,6 +273,14 @@ app.get('/api/state', requireAuth, (_req, res) => {
   res.json(engine.getState());
 });
 
+app.get('/api/crypto/state', requireAuth, (_req, res) => {
+  res.json(cryptoEngine.getState());
+});
+
+app.get('/api/crypto/news', requireAuth, (_req, res) => {
+  res.json(cryptoEngine.getNews());
+});
+
 app.get('/api/reports/latest', requireAuth, async (_req, res) => {
   const latestPath = join(REPORTS_DIR, 'latest.json');
   if (!existsSync(latestPath)) {
@@ -391,6 +401,7 @@ httpServer.on('upgrade', (req, socket, head) => {
 
 wss.on('connection', async (ws) => {
   ws.send(JSON.stringify({ type: 'state', payload: engine.getState() }));
+  ws.send(JSON.stringify({ type: 'crypto_state', payload: cryptoEngine.getState() }));
 
   const latestPath = join(REPORTS_DIR, 'latest.json');
   if (existsSync(latestPath)) {
@@ -410,9 +421,17 @@ engine.onTick((state) => {
   }
 });
 
+cryptoEngine.onTick((state) => {
+  const msg = JSON.stringify({ type: 'crypto_state', payload: state });
+  for (const client of wss.clients) {
+    if (client.readyState === WebSocket.OPEN) client.send(msg);
+  }
+});
+
 // ── Start ────────────────────────────────────────────────────────────────────
 
 engine.start();
+cryptoEngine.start();
 scheduler.start(generateAndSaveReport);
 
 httpServer.listen(PORT, () => {
@@ -423,6 +442,7 @@ httpServer.listen(PORT, () => {
 
 process.on('SIGINT', () => {
   engine.stop();
+  cryptoEngine.stop();
   scheduler.stop();
   process.exit(0);
 });

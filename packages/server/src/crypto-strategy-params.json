@@ -1,0 +1,111 @@
+{
+  "_meta": {
+    "generatedAt": "2026-04-25",
+    "backtestPeriod": "90 days (Jan 25 – Apr 25 2026)",
+    "dataInterval": "1h candles from Yahoo Finance",
+    "symbols": ["BTC-USD", "ETH-USD", "SOL-USD"],
+    "initialEquity": 100000,
+    "notes": "Yahoo Finance limits 1m data to ~7 days; 1h candles provide 2,162 bars per asset over 90 days, sufficient for all strategies."
+  },
+  "orb": {
+    "enabled": false,
+    "reason": "ORB is fundamentally incompatible with 24/7 crypto markets. The strategy returned -55.16% average across symbols (1,435 trades at 20.4% win rate). Without a fixed market open, the 'opening range' resets constantly, generating hundreds of false breakout signals per symbol. Disable for crypto.",
+    "cryptoAdaptation": "If re-enabled, use midnight UTC as session start and treat the first 1h candle as the opening range. Requires explicit daily windowing not in the current runner.",
+    "params": {
+      "rangeMinutes": 60,
+      "minVolume": 500,
+      "maxSpreadPct": 0.001
+    }
+  },
+  "reversal": {
+    "enabled": true,
+    "recommendation": "Keep with stock params (RSI 70/30) — signals are rare but high quality. Crypto 60/40 generates 3.5× more trades but lower win rate and negative returns.",
+    "backtestResults": {
+      "stockParams_70_30": {
+        "totalTrades": 11,
+        "avgWinRate": "19.4%",
+        "avgReturn": "+0.18%",
+        "note": "Few signals but marginally positive. ETH best performer at +0.97%."
+      },
+      "cryptoTuned_60_40": {
+        "totalTrades": 38,
+        "avgWinRate": "23.6%",
+        "avgReturn": "-1.62%",
+        "note": "More frequent but noisier signals — lower RSI thresholds catch weaker reversals."
+      }
+    },
+    "params": {
+      "rsiPeriod": 14,
+      "rsiOverbought": 70,
+      "rsiOversold": 30,
+      "lookback": 5,
+      "_cryptoNote": "Stock RSI 70/30 outperforms 60/40 for crypto. Crypto's mean-reversion moves are most reliable at true extremes. Consider 75/25 for even higher selectivity."
+    },
+    "cryptoAdjustments": {
+      "vwapSession": "Reset VWAP at midnight UTC instead of market open for 24/7 trading",
+      "volumeClimax": "2× average volume threshold unchanged — effective for crypto as crypto volume spikes on reversals too",
+      "stopLossMultiplier": "3:1 R:R unchanged — crypto has fat tails so the extra reward compensates for higher stop-outs"
+    }
+  },
+  "macdBollinger": {
+    "enabled": true,
+    "recommendation": "Best-performing crypto strategy. Crypto-tuned params delivered +1.73% avg return with 41.7% win rate. ETH specifically returned +6.55% over 90 days. Use these params for all crypto assets.",
+    "backtestResults": {
+      "stockParams": {
+        "totalTrades": 43,
+        "avgWinRate": "20.0%",
+        "avgReturn": "-1.13%"
+      },
+      "cryptoTuned": {
+        "totalTrades": 61,
+        "avgWinRate": "41.7%",
+        "avgReturn": "+1.73%",
+        "breakdown": {
+          "BTC-USD": { "trades": 2, "winRate": "50.0%", "return": "+0.63%" },
+          "ETH-USD": { "trades": 34, "winRate": "47.1%", "return": "+6.55%" },
+          "SOL-USD": { "trades": 25, "winRate": "28.0%", "return": "-2.00%" }
+        }
+      }
+    },
+    "params": {
+      "bbPeriod": 14,
+      "bbMultiplier": 2.5,
+      "volumeMultiplier": 1.2,
+      "volumeLookback": 20,
+      "_reasoning": {
+        "bbPeriod": "Reduced from 20→14: shorter period makes Bollinger Bands more responsive to crypto's rapid price cycles. Avoids signal lag that causes missed entries.",
+        "bbMultiplier": "Widened from 2.0→2.5: crypto moves 2–5× more than stocks per day. Wider bands prevent false signals from normal crypto volatility being mistaken for BB extremes.",
+        "volumeMultiplier": "Lowered from 1.5→1.2: crypto trades continuously so volume is more evenly distributed vs. stocks' session-based spikes. 1.2× still confirms momentum without being too restrictive."
+      }
+    },
+    "cryptoAdjustments": {
+      "macdPeriods": "Default 12/26/9 unchanged — these periods work well for 1h crypto candles",
+      "stopLoss": "Uses opposite BB band — naturally wider in crypto due to larger bbMultiplier, giving appropriate stops for volatile moves",
+      "riskReward": "2:1 R:R unchanged — effective given MACD-BB's directional accuracy"
+    }
+  },
+  "ichimoku": {
+    "enabled": false,
+    "recommendation": "Deprioritize for crypto. Avg win rate 13.1%, avg return -3.69%. SOL performed worst at -9.47% with only 10.7% win rate. The 9/26/52 Ichimoku periods (designed for 5-day trading weeks) do not map well onto 24/7 crypto markets.",
+    "backtestResults": {
+      "BTC-USD": { "trades": 1, "winRate": "0.0%", "return": "-0.36%" },
+      "ETH-USD": { "trades": 21, "winRate": "28.6%", "return": "-1.24%" },
+      "SOL-USD": { "trades": 28, "winRate": "10.7%", "return": "-9.47%" }
+    },
+    "params": {
+      "tenkan": 9,
+      "kijun": 26,
+      "senkou": 52,
+      "_cryptoNote": "Standard 9/26/52 periods assume 5-day trading week. For 24/7 crypto, convert: tenkan=7 (1 week in hours/4h), kijun=22, senkou=44. Retest with 4h candles. Not implemented in current strategy."
+    },
+    "cryptoRecommendation": "If keeping Ichimoku for crypto, use 4h candles with adjusted periods (7/22/44) to align with 7-day crypto weeks instead of 5-day stock weeks. Current implementation should be disabled for crypto until re-parameterized."
+  },
+  "globalCryptoSettings": {
+    "sessionReset": "midnight UTC",
+    "tradingHours": "24/7",
+    "stopLossMultiplierVsStocks": 2.0,
+    "volatilityNote": "Crypto daily volatility is 2–5× stocks. All fixed-dollar stops from stock strategies must be re-scaled. The strategies' percentage-based stops (using price distance) adapt automatically.",
+    "preferredInterval": "1h candles for signal generation; 1m available for last 7 days only via Yahoo Finance",
+    "symbolFormat": "Yahoo Finance format: BTC-USD, ETH-USD, SOL-USD, DOGE-USD, etc."
+  }
+}
