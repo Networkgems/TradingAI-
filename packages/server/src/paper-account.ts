@@ -1,15 +1,39 @@
 import type { AccountState, Position, TradeSignal, SignalType } from '@trading-app/shared';
-import { MANAGED_ACCOUNT_RATIO, DEFAULT_RISK_PER_TRADE } from '@trading-app/shared';
+import { DEFAULT_ACCOUNT_SETTINGS } from '@trading-app/shared';
 import { randomUUID } from 'crypto';
 
-const INITIAL_EQUITY = 25_000; // paper account starting equity
+interface PaperAccountConfig {
+  initialEquity?: number;
+  managedAccountRatio?: number;
+  riskPerTrade?: number;
+}
 
 export class PaperAccount {
-  private equity = INITIAL_EQUITY;
-  private cash = INITIAL_EQUITY;
+  private initialEquity: number;
+  private managedAccountRatio: number;
+  private riskPerTrade: number;
+  private equity: number;
+  private cash: number;
   private positions: Map<string, Position> = new Map();
   private dailyPnl = 0;
-  private sessionStart = Date.now();
+
+  constructor(config: PaperAccountConfig = {}) {
+    this.initialEquity = config.initialEquity ?? DEFAULT_ACCOUNT_SETTINGS.demoEquity;
+    this.managedAccountRatio = config.managedAccountRatio ?? DEFAULT_ACCOUNT_SETTINGS.managedAccountRatio;
+    this.riskPerTrade = config.riskPerTrade ?? DEFAULT_ACCOUNT_SETTINGS.riskPerTrade;
+    this.equity = this.initialEquity;
+    this.cash = this.initialEquity;
+  }
+
+  reset(config: PaperAccountConfig = {}): void {
+    if (config.initialEquity !== undefined) this.initialEquity = config.initialEquity;
+    if (config.managedAccountRatio !== undefined) this.managedAccountRatio = config.managedAccountRatio;
+    if (config.riskPerTrade !== undefined) this.riskPerTrade = config.riskPerTrade;
+    this.equity = this.initialEquity;
+    this.cash = this.initialEquity;
+    this.positions.clear();
+    this.dailyPnl = 0;
+  }
 
   getState(): AccountState {
     return {
@@ -21,11 +45,11 @@ export class PaperAccount {
   }
 
   managedEquity(): number {
-    return this.equity * MANAGED_ACCOUNT_RATIO;
+    return this.equity * this.managedAccountRatio;
   }
 
   maxRiskPerTrade(): number {
-    return this.managedEquity() * DEFAULT_RISK_PER_TRADE;
+    return this.managedEquity() * this.riskPerTrade;
   }
 
   sizeFromStop(entryPrice: number, stopPrice: number): number {
@@ -34,7 +58,6 @@ export class PaperAccount {
     return Math.floor(this.maxRiskPerTrade() / dist);
   }
 
-  /** Open a position for a signal and return the position if funded. */
   openPosition(signal: TradeSignal, currentPrice: number): Position | null {
     const qty = this.sizeFromStop(signal.entryPrice, signal.stopLoss);
     if (qty <= 0) return null;
@@ -57,7 +80,6 @@ export class PaperAccount {
     return position;
   }
 
-  /** Check open positions against latest prices and close any that hit TP or SL. */
   checkExits(prices: Map<string, number>): Position[] {
     const closed: Position[] = [];
     for (const [id, pos] of this.positions) {
@@ -89,10 +111,8 @@ export class PaperAccount {
     return closed;
   }
 
-  /** Reset daily P&L at session boundary. */
   resetDay(): void {
     this.dailyPnl = 0;
-    this.sessionStart = Date.now();
   }
 
   hasOpenPosition(symbol: string): boolean {

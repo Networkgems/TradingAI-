@@ -2,6 +2,7 @@ import { useEffect, useRef, useState } from 'react';
 import type { TradeSignal, Position, AccountState, OptionPosition, OptionsAccountState, EodReport } from '@trading-app/shared';
 import { OPTIONS_DAILY_LIMIT } from '@trading-app/shared';
 import LoginPage from './LoginPage.tsx';
+import SettingsPage from './SettingsPage.tsx';
 import './index.css';
 
 const SERVER_URL = import.meta.env.VITE_SERVER_URL ?? 'ws://localhost:4242';
@@ -65,7 +66,7 @@ function Dashboard({ token, onLogout }: { token: string; onLogout: () => void })
   const [eodReport, setEodReport] = useState<EodReport | null>(null);
   const [eodCollapsed, setEodCollapsed] = useState(false);
   const [connected, setConnected] = useState(false);
-  const [tab, setTab] = useState<'watchlist' | 'signals' | 'positions' | 'options'>('watchlist');
+  const [tab, setTab] = useState<'watchlist' | 'signals' | 'positions' | 'options' | 'settings'>('watchlist');
   const wsRef = useRef<WebSocket | null>(null);
   const reconnectTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
 
@@ -177,6 +178,13 @@ function Dashboard({ token, onLogout }: { token: string; onLogout: () => void })
           <div className={`status-dot ${connected ? 'live' : 'offline'}`} title={connected ? 'Live' : 'Reconnecting...'} />
           <span className="status-label">{connected ? 'LIVE' : 'Reconnecting'}</span>
           {state && <span className="last-tick">Updated {timeAgo(state.lastTick)}</span>}
+          <button
+            className={`logout-btn${tab === 'settings' ? ' active' : ''}`}
+            onClick={() => setTab(t => t === 'settings' ? 'watchlist' : 'settings')}
+            title="Account settings"
+          >
+            ⚙ Settings
+          </button>
           <button className="logout-btn" onClick={onLogout} title="Sign out">
             Sign out
           </button>
@@ -194,8 +202,12 @@ function Dashboard({ token, onLogout }: { token: string; onLogout: () => void })
         ))}
       </nav>
 
+      {tab === 'settings' && (
+        <SettingsPage token={token} httpUrl={HTTP_URL} />
+      )}
+
       <main className="content">
-        {!state && (
+        {tab !== 'settings' && !state && (
           <div className="loading">
             <div className="spinner" />
             <p>Connecting to trading engine…</p>

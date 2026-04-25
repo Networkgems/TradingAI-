@@ -1,6 +1,6 @@
 import { OrbStrategy, ReversalStrategy, MacdBollingerStrategy, IchimokuStrategy } from '@trading-app/engine';
 import { WATCHLIST } from '@trading-app/shared';
-import type { TradeSignal, Candle, OptionsAccountState, SignalType, Position } from '@trading-app/shared';
+import type { TradeSignal, Candle, OptionsAccountState, SignalType, Position, AccountSettings } from '@trading-app/shared';
 import { fetchMinuteBars, fetchQuotes } from './yahoo-feed.js';
 import { PaperAccount } from './paper-account.js';
 import { PaperOptionsAccount } from './options-account.js';
@@ -33,21 +33,53 @@ export class SignalEngine {
   private readonly reversal = new ReversalStrategy();
   private readonly macdBollinger = new MacdBollingerStrategy();
   private readonly ichimoku = new IchimokuStrategy();
-  private readonly account = new PaperAccount();
-  private readonly optionsAccount = new PaperOptionsAccount();
+  private account: PaperAccount;
+  private optionsAccount: PaperOptionsAccount;
 
   private symbolState: Map<string, SymbolState> = new Map();
   private candleCache: Map<string, Candle[]> = new Map();
   private recentSignals: TradeSignal[] = [];
   private allClosedPositions: Position[] = [];
 
-  // Daily tracking for EOD reports
   private dailySignals: DailySignalRecord[] = [];
-  /** Maps position id → signal type for strategy tagging in reports */
   private positionSignalType: Map<string, SignalType> = new Map();
 
   private tickTimer: ReturnType<typeof setInterval> | null = null;
   private handlers: EngineEventHandler[] = [];
+
+  constructor(settings?: AccountSettings) {
+    const config = settings
+      ? {
+          initialEquity: settings.demoEquity,
+          managedAccountRatio: settings.managedAccountRatio,
+          riskPerTrade: settings.riskPerTrade,
+        }
+      : {};
+    this.account = new PaperAccount(config);
+    this.optionsAccount = new PaperOptionsAccount({
+      initialEquity: settings?.demoEquity,
+      managedAccountRatio: settings?.managedAccountRatio,
+      dailyTradesLimit: settings?.dailyTradesLimit,
+    });
+  }
+
+  /** Apply new demo account settings and reset both accounts. */
+  applySettings(settings: AccountSettings): void {
+    this.account.reset({
+      initialEquity: settings.demoEquity,
+      managedAccountRatio: settings.managedAccountRatio,
+      riskPerTrade: settings.riskPerTrade,
+    });
+    this.optionsAccount.reset({
+      initialEquity: settings.demoEquity,
+      managedAccountRatio: settings.managedAccountRatio,
+      dailyTradesLimit: settings.dailyTradesLimit,
+    });
+    this.allClosedPositions = [];
+    this.recentSignals = [];
+    this.dailySignals = [];
+    this.positionSignalType.clear();
+  }
 
   onTick(handler: EngineEventHandler): void {
     this.handlers.push(handler);
@@ -55,7 +87,6 @@ export class SignalEngine {
 
   start(): void {
     this.tick();
-    // Refresh quotes every 30 seconds, candles every 2 minutes
     this.tickTimer = setInterval(() => this.tick(), 30_000);
   }
 
@@ -67,7 +98,6 @@ export class SignalEngine {
   }
 
   private async tick(): Promise<void> {
-    // Fetch latest quotes for all symbols
     const quotes = await fetchQuotes(WATCHLIST);
 
     const prices = new Map<string, number>();
@@ -83,11 +113,9 @@ export class SignalEngine {
       });
     }
 
-    // Check TP/SL exits against latest prices (equity + options)
     const closed = this.account.checkExits(prices);
     if (closed.length > 0) {
       this.allClosedPositions.push(...closed);
-      // Annotate daily signal records with outcomes
       for (const pos of closed) {
         const sigType = this.positionSignalType.get(pos.id);
         const rec = this.dailySignals.find(s => s.symbol === pos.symbol && s.type === sigType);
@@ -100,12 +128,10 @@ export class SignalEngine {
     }
     this.optionsAccount.checkExits(prices);
 
-    // Fetch candles serially to avoid Yahoo Finance rate limits
     for (const sym of WATCHLIST) {
       await this.refreshCandles(sym);
     }
 
-    // Run strategies and collect new signals
     for (const sym of WATCHLIST) {
       const candles = this.candleCache.get(sym) ?? [];
       if (candles.length < 15) continue;
@@ -117,9 +143,7 @@ export class SignalEngine {
 
       for (const signal of [orbSignal, reversalSignal, macdSignal, ichimokuSignal]) {
         if (!signal) continue;
-        // Skip if an equity position for this symbol+strategy type is already open
         if (this.account.hasOpenPositionForSignalType(sym, signal.type)) continue;
-        // Deduplicate: skip if same symbol+type signal emitted in last 5 minutes
         const recent = this.recentSignals.find(
           s => s.symbol === signal.symbol && s.type === signal.type && Date.now() - s.timestamp < 5 * 60_000
         );
@@ -130,14 +154,11 @@ export class SignalEngine {
 
         const price = prices.get(sym);
         if (price) {
-          // Auto-open equity paper position
           const pos = this.account.openPosition(signal, price);
           if (pos) this.positionSignalType.set(pos.id, signal.type);
-          // Auto-open options paper position (call for buy, put for sell)
           this.optionsAccount.openOption(signal, price);
         }
 
-        // Record signal for daily accuracy tracking
         this.dailySignals.push({
           id: signal.id,
           symbol: signal.symbol,
@@ -175,7 +196,6 @@ export class SignalEngine {
     };
   }
 
-  /** Returns data needed to generate an EOD report. */
   getReportSnapshot() {
     return {
       state: this.getState(),

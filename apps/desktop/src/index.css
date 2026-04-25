@@ -442,3 +442,194 @@ tr:hover td { background: #1c2128; }
 }
 
 .logout-btn:hover { color: var(--text); border-color: var(--text); }
+.logout-btn.active { color: var(--blue); border-color: var(--blue); }
+
+/* ── Settings Page ────────────────────────────────────────────────────────── */
+
+.settings-page {
+  padding: 1.5rem 2rem;
+  max-width: 760px;
+  overflow-y: auto;
+  max-height: calc(100vh - 100px);
+}
+
+.settings-section {
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  padding: 1.25rem 1.5rem;
+  margin-bottom: 1.25rem;
+}
+
+.settings-section-title {
+  font-size: 0.95rem;
+  font-weight: 700;
+  color: var(--text);
+  margin-bottom: 1rem;
+  letter-spacing: 0.03em;
+}
+
+.settings-hint {
+  color: var(--muted);
+  font-size: 0.8rem;
+  margin-bottom: 1rem;
+}
+
+.settings-grid {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 1rem;
+}
+
+.settings-field {
+  display: flex;
+  flex-direction: column;
+  gap: 0.35rem;
+}
+
+.settings-field label {
+  font-size: 0.8rem;
+  color: var(--muted);
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+}
+
+.settings-field input,
+.settings-field select {
+  background: var(--bg);
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  color: var(--text);
+  font-family: inherit;
+  font-size: 0.9rem;
+  padding: 0.4rem 0.6rem;
+}
+
+.settings-field input:focus,
+.settings-field select:focus {
+  outline: none;
+  border-color: var(--blue);
+}
+
+.field-hint {
+  font-size: 0.72rem;
+  color: var(--muted);
+}
+
+.mode-cards {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 0.75rem;
+}
+
+.mode-card {
+  display: flex;
+  align-items: flex-start;
+  gap: 0.6rem;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  padding: 0.9rem 1rem;
+  cursor: pointer;
+  transition: border-color 0.15s;
+}
+
+.mode-card input[type="radio"] { margin-top: 2px; flex-shrink: 0; }
+
+.mode-card.active { border-color: var(--blue); }
+
+.mode-card-inner { display: flex; flex-direction: column; gap: 0.3rem; }
+
+.mode-card-title { font-weight: 700; font-size: 0.9rem; }
+
+.mode-card-desc { font-size: 0.78rem; color: var(--muted); }
+
+.radio-group {
+  display: flex;
+  flex-direction: column;
+  gap: 0.75rem;
+}
+
+.radio-option {
+  display: flex;
+  align-items: flex-start;
+  gap: 0.6rem;
+  border: 1px solid var(--border);
+  border-radius: 5px;
+  padding: 0.75rem 1rem;
+  cursor: pointer;
+}
+
+.radio-option input[type="radio"] { margin-top: 3px; flex-shrink: 0; }
+
+.live-notice {
+  background: #1c2333;
+  border: 1px solid #344;
+  border-radius: 5px;
+  color: var(--muted);
+  font-size: 0.8rem;
+  margin-top: 1.25rem;
+  padding: 0.75rem 1rem;
+}
+
+.live-notice strong { color: var(--text); }
+
+.settings-actions-row {
+  margin-top: 1rem;
+  display: flex;
+  gap: 0.75rem;
+}
+
+.settings-footer {
+  display: flex;
+  align-items: center;
+  gap: 1rem;
+  flex-wrap: wrap;
+}
+
+.btn-primary {
+  background: var(--blue);
+  border: none;
+  border-radius: 5px;
+  color: #000;
+  cursor: pointer;
+  font-family: inherit;
+  font-size: 0.85rem;
+  font-weight: 700;
+  padding: 0.5rem 1.2rem;
+  transition: opacity 0.15s;
+}
+
+.btn-primary:disabled { opacity: 0.5; cursor: default; }
+.btn-primary:hover:not(:disabled) { opacity: 0.85; }
+
+.btn-secondary {
+  background: transparent;
+  border: 1px solid var(--border);
+  border-radius: 5px;
+  color: var(--muted);
+  cursor: pointer;
+  font-family: inherit;
+  font-size: 0.82rem;
+  padding: 0.4rem 0.9rem;
+  transition: color 0.15s, border-color 0.15s;
+}
+
+.btn-secondary:hover { color: var(--text); border-color: var(--text); }
+
+.btn-danger {
+  background: transparent;
+  border: 1px solid var(--red);
+  border-radius: 5px;
+  color: var(--red);
+  cursor: pointer;
+  font-family: inherit;
+  font-size: 0.82rem;
+  padding: 0.4rem 0.9rem;
+  transition: opacity 0.15s;
+}
+
+.btn-danger:disabled { opacity: 0.5; cursor: default; }
+.btn-danger:hover:not(:disabled) { opacity: 0.75; }
+
+.save-error { color: var(--red); font-size: 0.8rem; }

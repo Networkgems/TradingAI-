@@ -50,6 +50,38 @@ export interface AccountState {
 
 export const DEFAULT_RISK_PER_TRADE = 0.01; // 1% of account equity
 export const MANAGED_ACCOUNT_RATIO = 0.5;   // 50% of total account auto-managed
+
+// ── Account Modes ─────────────────────────────────────────────────────────────
+
+export type AccountMode = 'demo' | 'live';
+export type BrokerageType = 'webull';
+export type LiveTradeMode = 'ai_in_brokerage' | 'transfer_to_platform';
+
+export interface AccountSettings {
+  mode: AccountMode;
+  // Demo mode settings
+  demoEquity: number;
+  dailyTradesLimit: number;
+  managedAccountRatio: number;
+  riskPerTrade: number;
+  // Live mode settings
+  liveBrokerageType?: BrokerageType;
+  liveTradeMode?: LiveTradeMode;
+  liveApiKey?: string;
+  liveAccountId?: string;
+}
+
+export const DEFAULT_ACCOUNT_SETTINGS: AccountSettings = {
+  mode: 'demo',
+  demoEquity: 25_000,
+  dailyTradesLimit: 10,
+  managedAccountRatio: 0.5,
+  riskPerTrade: 0.01,
+  liveBrokerageType: 'webull',
+  liveTradeMode: 'ai_in_brokerage',
+  liveApiKey: '',
+  liveAccountId: '',
+};
 export const WATCHLIST_SIZE = 25;
 export const OPTIONS_BUDGET_RATIO = 0.05;   // 5% of managed equity per options trade
 export const OPTIONS_TP_PCT = 0.25;          // take profit at 25% gain on premium

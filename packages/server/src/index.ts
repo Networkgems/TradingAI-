@@ -9,6 +9,9 @@ import { SignalEngine } from './signal-engine.js';
 import { MarketScheduler } from './scheduler.js';
 import { generateEodReport } from './reports/eod-report.js';
 import { createToken, validateCredentials, verifyToken } from './auth.js';
+import { loadSettings, getSettings, saveSettings } from './account-settings.js';
+import type { AccountSettings } from '@trading-app/shared';
+import { DEFAULT_ACCOUNT_SETTINGS } from '@trading-app/shared';
 
 const PORT = Number(process.env.PORT ?? 4242);
 const __dirname = dirname(fileURLToPath(import.meta.url));
@@ -56,7 +59,8 @@ function requireAuth(req: express.Request, res: express.Response, next: express.
 
 // ── Engines ───────────────────────────────────────────────────────────────────
 
-const engine = new SignalEngine();
+const initialSettings = await loadSettings();
+const engine = new SignalEngine(initialSettings);
 const scheduler = new MarketScheduler();
 
 // ── EOD Report generation ────────────────────────────────────────────────────
@@ -163,10 +167,50 @@ app.post('/api/reports/generate', requireAuth, async (_req, res) => {
   }
 });
 
+// ── Account Settings ─────────────────────────────────────────────────────────
+
+app.get('/api/account/settings', requireAuth, (_req, res) => {
+  res.json(getSettings());
+});
+
+app.put('/api/account/settings', requireAuth, async (req, res) => {
+  const body = req.body as Partial<AccountSettings>;
+  const current = getSettings();
+  const updated: AccountSettings = {
+    ...current,
+    ...body,
+    // Clamp numeric values to reasonable ranges
+    demoEquity: Math.max(1_000, Math.min(10_000_000, Number(body.demoEquity ?? current.demoEquity))),
+    dailyTradesLimit: Math.max(1, Math.min(100, Number(body.dailyTradesLimit ?? current.dailyTradesLimit))),
+    managedAccountRatio: Math.max(0.01, Math.min(1, Number(body.managedAccountRatio ?? current.managedAccountRatio))),
+    riskPerTrade: Math.max(0.001, Math.min(0.5, Number(body.riskPerTrade ?? current.riskPerTrade))),
+  };
+  await saveSettings(updated);
+  if (updated.mode === 'demo') {
+    engine.applySettings(updated);
+    broadcastEngineState();
+  }
+  res.json({ ok: true, settings: updated });
+});
+
+app.post('/api/account/reset-demo', requireAuth, async (_req, res) => {
+  const settings = getSettings();
+  engine.applySettings(settings);
+  broadcastEngineState();
+  res.json({ ok: true });
+});
+
 // ── WebSocket ────────────────────────────────────────────────────────────────
 
 const httpServer = createServer(app);
 const wss = new WebSocketServer({ noServer: true });
+
+function broadcastEngineState() {
+  const msg = JSON.stringify({ type: 'state', payload: engine.getState() });
+  for (const client of wss.clients) {
+    if (client.readyState === WebSocket.OPEN) client.send(msg);
+  }
+}
 
 httpServer.on('upgrade', (req, socket, head) => {
   const url = new URL(req.url ?? '/', `http://${firstHeader(req.headers.host) ?? 'localhost'}`);

@@ -1,31 +1,58 @@
 import { randomUUID } from 'crypto';
 import type { TradeSignal, OptionPosition, OptionsAccountState } from '@trading-app/shared';
 import {
-  MANAGED_ACCOUNT_RATIO,
+  DEFAULT_ACCOUNT_SETTINGS,
   OPTIONS_BUDGET_RATIO,
   OPTIONS_TP_PCT,
   OPTIONS_SL_PCT,
   OPTIONS_ATM_PREMIUM_RATIO,
-  OPTIONS_DAILY_LIMIT,
   OPTIONS_TRAIL_OFFSET_PCT,
 } from '@trading-app/shared';
 
-const INITIAL_EQUITY = 25_000;
-// ATM option delta approximation: $0.50 move per $1 move in underlying
 const ATM_DELTA = 0.50;
 
 function toDateKey(ts: number): string {
-  return new Date(ts).toISOString().slice(0, 10); // YYYY-MM-DD
+  return new Date(ts).toISOString().slice(0, 10);
+}
+
+interface OptionsAccountConfig {
+  initialEquity?: number;
+  managedAccountRatio?: number;
+  dailyTradesLimit?: number;
 }
 
 export class PaperOptionsAccount {
-  private equity = INITIAL_EQUITY;
-  private cash = INITIAL_EQUITY;
+  private initialEquity: number;
+  private managedAccountRatio: number;
+  private dailyTradesLimit: number;
+  private equity: number;
+  private cash: number;
   private openOptions: Map<string, OptionPosition> = new Map();
   private closedOptions: OptionPosition[] = [];
   private optionsPnl = 0;
   private dailyCount = 0;
   private currentDayKey = toDateKey(Date.now());
+
+  constructor(config: OptionsAccountConfig = {}) {
+    this.initialEquity = config.initialEquity ?? DEFAULT_ACCOUNT_SETTINGS.demoEquity;
+    this.managedAccountRatio = config.managedAccountRatio ?? DEFAULT_ACCOUNT_SETTINGS.managedAccountRatio;
+    this.dailyTradesLimit = config.dailyTradesLimit ?? DEFAULT_ACCOUNT_SETTINGS.dailyTradesLimit;
+    this.equity = this.initialEquity;
+    this.cash = this.initialEquity;
+  }
+
+  reset(config: OptionsAccountConfig = {}): void {
+    if (config.initialEquity !== undefined) this.initialEquity = config.initialEquity;
+    if (config.managedAccountRatio !== undefined) this.managedAccountRatio = config.managedAccountRatio;
+    if (config.dailyTradesLimit !== undefined) this.dailyTradesLimit = config.dailyTradesLimit;
+    this.equity = this.initialEquity;
+    this.cash = this.initialEquity;
+    this.openOptions.clear();
+    this.closedOptions = [];
+    this.optionsPnl = 0;
+    this.dailyCount = 0;
+    this.currentDayKey = toDateKey(Date.now());
+  }
 
   getState(): OptionsAccountState {
     return {
@@ -38,7 +65,7 @@ export class PaperOptionsAccount {
   }
 
   private budgetPerTrade(): number {
-    return this.equity * MANAGED_ACCOUNT_RATIO * OPTIONS_BUDGET_RATIO;
+    return this.equity * this.managedAccountRatio * OPTIONS_BUDGET_RATIO;
   }
 
   private resetDayIfNeeded(): void {
@@ -49,14 +76,11 @@ export class PaperOptionsAccount {
     }
   }
 
-  /** Open a paper option position for the given signal. */
   openOption(signal: TradeSignal, underlyingPrice: number): OptionPosition | null {
     this.resetDayIfNeeded();
 
-    // Enforce daily trade limit (5 options per day)
-    if (this.dailyCount >= OPTIONS_DAILY_LIMIT) return null;
+    if (this.dailyCount >= this.dailyTradesLimit) return null;
 
-    // Already have an open option on this symbol from this signal type
     const existing = Array.from(this.openOptions.values()).find(
       o => o.symbol === signal.symbol && o.signalType === signal.type,
     );
@@ -91,7 +115,7 @@ export class PaperOptionsAccount {
       stopLossPremium,
       peakPremium: premiumPaid,
       trailingActive: false,
-      trailingStopPremium: stopLossPremium, // initially same as hard SL
+      trailingStopPremium: stopLossPremium,
       underlyingEntryPrice: underlyingPrice,
       openedAt: Date.now(),
       signalId: signal.id,
@@ -102,7 +126,6 @@ export class PaperOptionsAccount {
     return position;
   }
 
-  /** Update mark prices, activate trailing stops at TP, and close on SL or trail stop. */
   checkExits(underlyingPrices: Map<string, number>): OptionPosition[] {
     const closed: OptionPosition[] = [];
 
@@ -110,28 +133,23 @@ export class PaperOptionsAccount {
       const currentUnderlying = underlyingPrices.get(opt.symbol);
       if (currentUnderlying == null) continue;
 
-      // Estimate current premium using delta approximation
       const underlyingMove = currentUnderlying - opt.underlyingEntryPrice;
       const premiumMove = underlyingMove * ATM_DELTA * (opt.optionType === 'call' ? 1 : -1);
       const mark = Math.max(0.01, opt.premiumPaid + premiumMove);
       opt.currentPremium = mark;
 
-      // Track peak premium for trailing stop
       if (mark > opt.peakPremium) {
         opt.peakPremium = mark;
       }
 
-      // Activate trailing mode once TP (+25%) is first hit
       if (!opt.trailingActive && mark >= opt.takeProfitPremium) {
         opt.trailingActive = true;
       }
 
-      // Keep trailing stop updated at 15% below peak
       if (opt.trailingActive) {
         opt.trailingStopPremium = opt.peakPremium * (1 - OPTIONS_TRAIL_OFFSET_PCT);
       }
 
-      // Determine exit: hard SL at -35% or trailing stop when momentum stalls
       let exitPremium: number | null = null;
 
       if (mark <= opt.stopLossPremium) {
