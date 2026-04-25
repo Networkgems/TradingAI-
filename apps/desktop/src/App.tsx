@@ -4,6 +4,7 @@ import { OPTIONS_DAILY_LIMIT } from '@trading-app/shared';
 import LoginPage from './LoginPage.tsx';
 import ForgotPasswordPage from './ForgotPasswordPage.tsx';
 import SettingsPage from './SettingsPage.tsx';
+import { CalendarTab } from './CalendarTab.tsx';
 import './index.css';
 
 const SERVER_URL = import.meta.env.VITE_SERVER_URL ?? 'ws://localhost:4242';
@@ -67,7 +68,7 @@ function Dashboard({ token, onLogout }: { token: string; onLogout: () => void })
   const [eodReport, setEodReport] = useState<EodReport | null>(null);
   const [eodCollapsed, setEodCollapsed] = useState(false);
   const [connected, setConnected] = useState(false);
-  const [tab, setTab] = useState<'watchlist' | 'signals' | 'positions' | 'options' | 'settings'>('watchlist');
+  const [tab, setTab] = useState<'watchlist' | 'signals' | 'positions' | 'options' | 'settings' | 'calendar'>('watchlist');
   const wsRef = useRef<WebSocket | null>(null);
   const reconnectTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
 
@@ -201,6 +202,9 @@ function Dashboard({ token, onLogout }: { token: string; onLogout: () => void })
              `Options (${openOptions.length})`}
           </button>
         ))}
+        <button className={`tab ${tab === 'calendar' ? 'active' : ''}`} onClick={() => setTab('calendar')}>
+          Calendar
+        </button>
       </nav>
 
       {tab === 'settings' && (
@@ -475,6 +479,10 @@ function Dashboard({ token, onLogout }: { token: string; onLogout: () => void })
               </div>
             )}
           </div>
+        )}
+
+        {tab === 'calendar' && (
+          <CalendarTab token={token} httpUrl={HTTP_URL} />
         )}
       </main>
 
