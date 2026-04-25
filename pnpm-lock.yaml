@@ -104,6 +104,9 @@ importers:
 
   packages/server:
     dependencies:
+      '@trading-app/backtest':
+        specifier: workspace:*
+        version: link:../backtest
       '@trading-app/engine':
         specifier: workspace:*
         version: link:../engine
