@@ -1,0 +1,14 @@
+node_modules
+dist
+.turbo
+*.local
+
+# Tauri / Rust
+target
+apps/desktop/src-tauri/gen
+
+# pnpm
+.pnpm-store
+
+# TypeScript incremental build info
+*.tsbuildinfo
