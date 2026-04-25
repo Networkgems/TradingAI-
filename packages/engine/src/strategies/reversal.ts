@@ -1,8 +1,10 @@
-import { Candle, TradeSignal, Side } from '@trading-app/shared';
+import { Candle, TradeSignal, Side, ADX_TRENDING_THRESHOLD, isValidTradingWindow } from '@trading-app/shared';
 import { randomUUID } from 'crypto';
 import { rsi, rsiDivergence } from '../indicators/rsi.js';
 import { VwapTracker } from '../indicators/vwap.js';
 import { detectPattern, isBullishPattern, isBearishPattern } from '../indicators/patterns.js';
+import { macdCross } from '../indicators/macd.js';
+import { adx } from '../indicators/adx.js';
 import type { AlpacaOrderClient } from '../alpaca/index.js';
 import type { RiskManager } from '../risk.js';
 
@@ -15,6 +17,12 @@ export interface ReversalOptions {
   lookback?: number;
 }
 
+/**
+ * RSI reversal strategy — improved with:
+ *   1. ADX regime filter: skip when ADX > 25 (trending market → reversals fail more often)
+ *   2. MACD confluence: MACD direction must agree with the reversal signal
+ *   3. Time filter: only fires in valid ET trading windows
+ */
 export class ReversalStrategy {
   private readonly rsiPeriod: number;
   private readonly rsiOverbought: number;
@@ -35,6 +43,9 @@ export class ReversalStrategy {
 
     const latest = candles[candles.length - 1];
 
+    // Time filter: avoid midday chop and after-hours noise
+    if (!isValidTradingWindow(latest.timestamp)) return null;
+
     // Reset VWAP at the start of each trading session (new calendar day)
     const sessionDay = Math.floor(latest.timestamp / 86_400_000);
     if (sessionDay !== this.lastSessionDate) {
@@ -45,6 +56,11 @@ export class ReversalStrategy {
     // Update VWAP with all candles for the session
     let vwapState = { vwap: 0, stdDev: 0, upperBand: 0, lowerBand: 0 };
     for (const c of candles) vwapState = this.vwap.update(c);
+
+    // ADX regime filter: reversals only work in ranging markets
+    // Skip if ADX > 25 (strong trend makes mean reversion risky)
+    const adxResult = adx(candles);
+    if (adxResult && adxResult.adx > ADX_TRENDING_THRESHOLD) return null;
 
     const closes = candles.map(c => c.close);
     const currentRsi = rsi(closes, this.rsiPeriod);
@@ -59,24 +75,29 @@ export class ReversalStrategy {
     const avgVolume = window.reduce((s, c) => s + c.volume, 0) / window.length;
     const volumeClimax = latest.volume > avgVolume * 2;
 
+    // MACD confluence: direction of MACD cross must confirm the reversal
+    const cross = macdCross(closes);
+
     let side: Side | null = null;
 
-    // Sell reversal: RSI overbought + (bearish pattern OR bearish divergence) + extended above VWAP
+    // Sell reversal: RSI overbought + (pattern OR divergence) + extended above VWAP + volume + MACD confirming
     if (
       currentRsi > this.rsiOverbought &&
       (isBearishPattern(pattern) || divergence === 'bearish') &&
       vwapExtension === 'above' &&
-      volumeClimax
+      volumeClimax &&
+      (cross === 'bearish' || cross === null) // allow null cross but block bullish cross
     ) {
       side = 'sell';
     }
 
-    // Buy reversal: RSI oversold + (bullish pattern OR bullish divergence) + extended below VWAP
+    // Buy reversal: RSI oversold + (pattern OR divergence) + extended below VWAP + volume + MACD confirming
     if (
       currentRsi < this.rsiOversold &&
       (isBullishPattern(pattern) || divergence === 'bullish') &&
       vwapExtension === 'below' &&
-      volumeClimax
+      volumeClimax &&
+      (cross === 'bullish' || cross === null)
     ) {
       side = 'buy';
     }

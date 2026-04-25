@@ -1,5 +1,6 @@
-import { Candle, MarketQuote, TradeSignal, Side } from '@trading-app/shared';
+import { Candle, MarketQuote, TradeSignal, Side, ADX_RANGING_THRESHOLD, isValidTradingWindow } from '@trading-app/shared';
 import { randomUUID } from 'crypto';
+import { adx } from '../indicators/adx.js';
 import type { AlpacaOrderClient } from '../alpaca/index.js';
 import type { RiskManager } from '../risk.js';
 
@@ -10,17 +11,27 @@ export interface OrbOptions {
   minVolume?: number;
   /** Maximum bid-ask spread as a fraction of mid price (default: 0.0005 = 0.05%). */
   maxSpreadPct?: number;
+  /** Volume spike multiplier: breakout candle must have volume > N × range average (default: 1.5). */
+  volumeSpikeMultiplier?: number;
 }
 
+/**
+ * Opening Range Breakout strategy — improved with:
+ *   1. ADX regime filter: skip when ADX < 20 (no trend → breakout likely to fail)
+ *   2. Volume spike confluence: breakout candle must have volume > 1.5× range average
+ *   3. Time filter: only fires in valid ET trading windows (9:35–11:30, 13:30–15:30)
+ */
 export class OrbStrategy {
   private readonly rangeMinutes: number;
   private readonly minVolume: number;
   private readonly maxSpreadPct: number;
+  private readonly volumeSpikeMultiplier: number;
 
   constructor(opts: OrbOptions = {}) {
     this.rangeMinutes = opts.rangeMinutes ?? 30;
     this.minVolume = opts.minVolume ?? 10_000;
     this.maxSpreadPct = opts.maxSpreadPct ?? 0.0005;
+    this.volumeSpikeMultiplier = opts.volumeSpikeMultiplier ?? 1.5;
   }
 
   evaluate(
@@ -29,6 +40,11 @@ export class OrbStrategy {
     latestQuote?: MarketQuote,
   ): TradeSignal | null {
     if (candles.length < 2) return null;
+
+    const latest = candles[candles.length - 1];
+
+    // Time filter: only trade during high-volume windows
+    if (!isValidTradingWindow(latest.timestamp)) return null;
 
     const openTime = candles[0].timestamp;
     const rangeCutoff = openTime + this.rangeMinutes * 60 * 1000;
@@ -48,14 +64,21 @@ export class OrbStrategy {
       }
     }
 
+    // ADX regime filter: ORB only works in trending markets (ADX ≥ 20)
+    const adxResult = adx(candles);
+    if (adxResult && adxResult.adx < ADX_RANGING_THRESHOLD) return null;
+
     const rangeHigh = Math.max(...rangeCandles.map(c => c.high));
     const rangeLow = Math.min(...rangeCandles.map(c => c.low));
-    const latest = candles[candles.length - 1];
 
     let side: Side | null = null;
     if (latest.close > rangeHigh) side = 'buy';
     else if (latest.close < rangeLow) side = 'sell';
     if (!side) return null;
+
+    // Volume spike confluence: breakout candle must spike above range average
+    const avgRangeVolume = rangeVolume / rangeCandles.length;
+    if (latest.volume < avgRangeVolume * this.volumeSpikeMultiplier) return null;
 
     const entryPrice = latest.close;
     const stopLoss = side === 'buy' ? rangeLow : rangeHigh;
@@ -79,7 +102,6 @@ export class OrbStrategy {
     };
   }
 
-  /** Evaluate and auto-submit a bracket order if a signal fires. */
   async evaluateAndOrder(
     symbol: string,
     candles: Candle[],

@@ -1,5 +1,5 @@
 import { OrbStrategy, ReversalStrategy, MacdBollingerStrategy, IchimokuStrategy } from '@trading-app/engine';
-import { WATCHLIST } from '@trading-app/shared';
+import { WATCHLIST, MANAGED_ACCOUNT_RATIO, MAX_CONSECUTIVE_LOSSES, DAILY_DRAWDOWN_HALT_PCT } from '@trading-app/shared';
 import type { TradeSignal, Candle, OptionsAccountState, SignalType, Position, AccountSettings } from '@trading-app/shared';
 import { fetchMinuteBars, fetchQuotes } from './yahoo-feed.js';
 import { PaperAccount } from './paper-account.js';
@@ -22,11 +22,69 @@ export interface EngineState {
   closedPositions: ReturnType<PaperAccount['checkExits']>;
   options: OptionsAccountState;
   lastTick: number;
+  /** True when the daily risk circuit-breaker has halted new entries. */
+  tradingHalted: boolean;
+  haltReason: string | null;
 }
 
 export type EngineEventHandler = (state: EngineState) => void;
 
 const MAX_SIGNALS = 50;
+
+/**
+ * Tracks daily consecutive losses and cumulative P&L to enforce circuit-breakers:
+ *   • Halt after MAX_CONSECUTIVE_LOSSES (3) consecutive losing trades
+ *   • Halt if daily drawdown exceeds DAILY_DRAWDOWN_HALT_PCT (8%) of managed equity
+ */
+class DailyRiskGovernor {
+  private consecutiveLosses = 0;
+  private dailyPnl = 0;
+  private currentDay = new Date().toISOString().slice(0, 10);
+  private halted = false;
+  private haltReason: string | null = null;
+
+  private resetIfNewDay(): void {
+    const today = new Date().toISOString().slice(0, 10);
+    if (today !== this.currentDay) {
+      this.consecutiveLosses = 0;
+      this.dailyPnl = 0;
+      this.halted = false;
+      this.haltReason = null;
+      this.currentDay = today;
+    }
+  }
+
+  recordTrade(pnl: number, managedEquity: number): void {
+    this.resetIfNewDay();
+    this.dailyPnl += pnl;
+
+    if (pnl < 0) {
+      this.consecutiveLosses += 1;
+    } else {
+      this.consecutiveLosses = 0; // reset streak on a win
+    }
+
+    if (!this.halted && this.consecutiveLosses >= MAX_CONSECUTIVE_LOSSES) {
+      this.halted = true;
+      this.haltReason = `${MAX_CONSECUTIVE_LOSSES} consecutive losses — no new entries for the day`;
+    }
+
+    const drawdownPct = managedEquity > 0 ? Math.abs(this.dailyPnl) / managedEquity : 0;
+    if (!this.halted && this.dailyPnl < 0 && drawdownPct >= DAILY_DRAWDOWN_HALT_PCT) {
+      this.halted = true;
+      this.haltReason = `Daily drawdown −${(drawdownPct * 100).toFixed(1)}% exceeded ${DAILY_DRAWDOWN_HALT_PCT * 100}% limit`;
+    }
+  }
+
+  isHalted(): boolean {
+    this.resetIfNewDay();
+    return this.halted;
+  }
+
+  getHaltReason(): string | null {
+    return this.haltReason;
+  }
+}
 
 export class SignalEngine {
   private readonly orb = new OrbStrategy({ rangeMinutes: 30, minVolume: 5_000 });
@@ -35,6 +93,7 @@ export class SignalEngine {
   private readonly ichimoku = new IchimokuStrategy();
   private account: PaperAccount;
   private optionsAccount: PaperOptionsAccount;
+  private readonly riskGovernor = new DailyRiskGovernor();
 
   private symbolState: Map<string, SymbolState> = new Map();
   private candleCache: Map<string, Candle[]> = new Map();
@@ -116,6 +175,9 @@ export class SignalEngine {
     const closed = this.account.checkExits(prices);
     if (closed.length > 0) {
       this.allClosedPositions.push(...closed);
+      const accountState = this.account.getState();
+      const managedEquity = accountState.totalEquity * MANAGED_ACCOUNT_RATIO;
+      // Annotate daily signal records with outcomes and feed risk governor
       for (const pos of closed) {
         const sigType = this.positionSignalType.get(pos.id);
         const rec = this.dailySignals.find(s => s.symbol === pos.symbol && s.type === sigType);
@@ -124,6 +186,8 @@ export class SignalEngine {
           const risk = Math.abs(pos.entryPrice - pos.stopLoss) * pos.quantity;
           rec.rr = risk > 0 ? Math.abs(pos.pnl ?? 0) / risk : 0;
         }
+        // Feed daily risk governor with the closed trade's P&L
+        this.riskGovernor.recordTrade(pos.pnl ?? 0, managedEquity);
       }
     }
     this.optionsAccount.checkExits(prices);
@@ -132,39 +196,48 @@ export class SignalEngine {
       await this.refreshCandles(sym);
     }
 
-    for (const sym of WATCHLIST) {
-      const candles = this.candleCache.get(sym) ?? [];
-      if (candles.length < 15) continue;
+    // If daily risk circuit-breaker is active, skip new entries
+    if (!this.riskGovernor.isHalted()) {
+      // Run strategies and collect new signals
+      for (const sym of WATCHLIST) {
+        const candles = this.candleCache.get(sym) ?? [];
+        if (candles.length < 15) continue;
 
-      const orbSignal = this.orb.evaluate(sym, candles);
-      const reversalSignal = this.reversal.evaluate(sym, candles);
-      const macdSignal = this.macdBollinger.evaluate(sym, candles);
-      const ichimokuSignal = this.ichimoku.evaluate(sym, candles);
+        const orbSignal = this.orb.evaluate(sym, candles);
+        const reversalSignal = this.reversal.evaluate(sym, candles);
+        const macdSignal = this.macdBollinger.evaluate(sym, candles);
+        const ichimokuSignal = this.ichimoku.evaluate(sym, candles);
 
-      for (const signal of [orbSignal, reversalSignal, macdSignal, ichimokuSignal]) {
-        if (!signal) continue;
-        if (this.account.hasOpenPositionForSignalType(sym, signal.type)) continue;
-        const recent = this.recentSignals.find(
-          s => s.symbol === signal.symbol && s.type === signal.type && Date.now() - s.timestamp < 5 * 60_000
-        );
-        if (recent) continue;
+        for (const signal of [orbSignal, reversalSignal, macdSignal, ichimokuSignal]) {
+          if (!signal) continue;
+          // Skip if an equity position for this symbol+strategy type is already open
+          if (this.account.hasOpenPositionForSignalType(sym, signal.type)) continue;
+          // Deduplicate: skip if same symbol+type signal emitted in last 5 minutes
+          const recent = this.recentSignals.find(
+            s => s.symbol === signal.symbol && s.type === signal.type && Date.now() - s.timestamp < 5 * 60_000
+          );
+          if (recent) continue;
 
-        this.recentSignals.unshift(signal);
-        if (this.recentSignals.length > MAX_SIGNALS) this.recentSignals.pop();
+          this.recentSignals.unshift(signal);
+          if (this.recentSignals.length > MAX_SIGNALS) this.recentSignals.pop();
 
-        const price = prices.get(sym);
-        if (price) {
-          const pos = this.account.openPosition(signal, price);
-          if (pos) this.positionSignalType.set(pos.id, signal.type);
-          this.optionsAccount.openOption(signal, price);
+          const price = prices.get(sym);
+          if (price) {
+            // Auto-open equity paper position
+            const pos = this.account.openPosition(signal, price);
+            if (pos) this.positionSignalType.set(pos.id, signal.type);
+            // Auto-open options paper position (call for buy, put for sell)
+            this.optionsAccount.openOption(signal, price);
+          }
+
+          // Record signal for daily accuracy tracking
+          this.dailySignals.push({
+            id: signal.id,
+            symbol: signal.symbol,
+            type: signal.type,
+            firedAt: signal.timestamp,
+          });
         }
-
-        this.dailySignals.push({
-          id: signal.id,
-          symbol: signal.symbol,
-          type: signal.type,
-          firedAt: signal.timestamp,
-        });
       }
     }
 
@@ -175,6 +248,8 @@ export class SignalEngine {
       closedPositions: [...this.allClosedPositions].slice(-20),
       options: this.optionsAccount.getState(),
       lastTick: Date.now(),
+      tradingHalted: this.riskGovernor.isHalted(),
+      haltReason: this.riskGovernor.getHaltReason(),
     };
 
     for (const h of this.handlers) h(state);
@@ -193,6 +268,8 @@ export class SignalEngine {
       closedPositions: [...this.allClosedPositions].slice(-20),
       options: this.optionsAccount.getState(),
       lastTick: Date.now(),
+      tradingHalted: this.riskGovernor.isHalted(),
+      haltReason: this.riskGovernor.getHaltReason(),
     };
   }
 

@@ -84,11 +84,39 @@ export const DEFAULT_ACCOUNT_SETTINGS: AccountSettings = {
 };
 export const WATCHLIST_SIZE = 25;
 export const OPTIONS_BUDGET_RATIO = 0.05;   // 5% of managed equity per options trade
-export const OPTIONS_TP_PCT = 0.25;          // take profit at 25% gain on premium
-export const OPTIONS_SL_PCT = 0.35;          // stop loss at 35% loss on premium
+export const OPTIONS_TP1_PCT = 0.25;         // take partial profit (50%) at +25% premium gain
+export const OPTIONS_TP2_PCT = 0.50;         // final TP target at +50% gain on remaining half
+export const OPTIONS_SL_PCT = 0.25;          // stop loss at 25% loss (improved R:R vs previous 35%)
 export const OPTIONS_ATM_PREMIUM_RATIO = 0.02; // estimated ATM premium ≈ 2% of underlying
-export const OPTIONS_DAILY_LIMIT = 10;       // max 10 options trades per trading day
-export const OPTIONS_TRAIL_OFFSET_PCT = 0.15; // trailing stop 15% below peak once TP is hit
+export const OPTIONS_DAILY_LIMIT = 4;        // max 4 high-quality trades per day (was 10)
+export const OPTIONS_TRAIL_ACTIVATE_PCT = 0.20; // activate trailing stop once position is up 20%
+export const OPTIONS_TRAIL_OFFSET_PCT = 0.12; // trail 12% below peak (tighter than previous 15%)
+export const OPTIONS_PARTIAL_EXIT_RATIO = 0.5; // exit 50% of contracts at TP1; trail the rest
+
+// Market regime thresholds (ADX-based)
+export const ADX_TRENDING_THRESHOLD = 25;   // ADX > 25 → trending → favor ORB/MACD/Ichimoku
+export const ADX_RANGING_THRESHOLD = 20;    // ADX < 20 → ranging → favor reversal; avoid ORB
+
+// Daily risk circuit-breakers
+export const MAX_CONSECUTIVE_LOSSES = 3;     // halt new entries after 3 consecutive losses
+export const DAILY_DRAWDOWN_HALT_PCT = 0.08; // halt if daily P&L < −8% of managed equity
+
+// Valid ET trading windows stored as [startMinuteOfDay, endMinuteOfDay]
+export const TRADING_WINDOWS: readonly [number, number][] = [
+  [9 * 60 + 35,  11 * 60 + 30],  // 9:35–11:30 AM ET (morning session)
+  [13 * 60 + 30, 15 * 60 + 30],  // 1:30–3:30 PM ET (afternoon session)
+] as const;
+
+/** Returns true when the UTC timestamp falls inside a valid ET trading window. */
+export function isValidTradingWindow(utcMs: number): boolean {
+  // Approximate ET as UTC-4 (EDT); adjust to UTC-5 (EST) in winter if needed
+  const etMs = utcMs - 4 * 60 * 60 * 1000;
+  const etMinutes = Math.floor(etMs / 60_000) % (24 * 60);
+  return TRADING_WINDOWS.some(([start, end]) => etMinutes >= start && etMinutes <= end);
+}
+
+// Backward-compat alias
+export const OPTIONS_TP_PCT = OPTIONS_TP1_PCT;
 
 export interface OptionPosition {
   id: string;
@@ -98,13 +126,15 @@ export interface OptionPosition {
   strike?: number;
   expiration?: string;
   contracts: number;
+  contractsRemaining: number; // after partial exit at TP1; starts equal to contracts
   premiumPaid: number;        // per-share premium at entry
   currentPremium: number;     // current mark (updated on each tick)
-  takeProfitPremium: number;  // initial TP trigger at +25%
-  stopLossPremium: number;    // hard stop loss at -35%
+  tp1Premium: number;         // partial exit trigger at +25%
+  tp1Hit: boolean;            // true once 50% has been exited at TP1
+  stopLossPremium: number;    // hard stop loss at -25% (improved from -35%)
   peakPremium: number;        // highest mark seen (used for trailing stop)
-  trailingActive: boolean;    // true once TP is hit and trailing mode engaged
-  trailingStopPremium: number; // current trailing stop level (peak * (1 - TRAIL_OFFSET))
+  trailingActive: boolean;    // true once price is up 20% and trailing mode engaged
+  trailingStopPremium: number; // current trailing stop level (peak * (1 - 0.12))
   underlyingEntryPrice: number;
   openedAt: number;
   closedAt?: number;
