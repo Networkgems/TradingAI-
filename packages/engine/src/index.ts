@@ -1,8 +1,11 @@
 // Trading engine sidecar — signal generation, order management, position tracking
 
 export { OrbStrategy } from './strategies/orb.js';
+export type { OrbOptions } from './strategies/orb.js';
 export { ReversalStrategy } from './strategies/reversal.js';
+export type { ReversalOptions } from './strategies/reversal.js';
 export { MacdBollingerStrategy } from './strategies/macd-bollinger.js';
+export type { MacdBollingerOptions } from './strategies/macd-bollinger.js';
 export { IchimokuStrategy } from './strategies/ichimoku-strategy.js';
 export { RiskManager } from './risk.js';
 export { PositionManager } from './positions.js';

@@ -12,6 +12,7 @@
     "test": "vitest run --passWithNoTests"
   },
   "dependencies": {
+    "@trading-app/backtest": "workspace:*",
     "@trading-app/engine": "workspace:*",
     "@trading-app/shared": "workspace:*",
     "express": "^4.21.2",

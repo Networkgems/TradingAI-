@@ -1,5 +1,5 @@
 import { Candle } from '@trading-app/shared';
-import { OrbStrategy, ReversalStrategy, RiskManager, PositionManager } from '@trading-app/engine';
+import { OrbStrategy, ReversalStrategy, MacdBollingerStrategy, IchimokuStrategy, RiskManager, PositionManager } from '@trading-app/engine';
 import { BacktestConfig, BacktestResult } from './types.js';
 
 export class BacktestRunner {
@@ -14,24 +14,36 @@ export class BacktestRunner {
     const risk = new RiskManager(account);
     const positions = new PositionManager();
     const orb = new OrbStrategy();
-    const reversal = new ReversalStrategy();
+    const reversal = new ReversalStrategy(config.reversalOpts);
+    const macdBollinger = new MacdBollingerStrategy(config.macdBollingerOpts);
+    const ichimoku = new IchimokuStrategy();
 
     const filtered = candles.filter(
       c => c.timestamp >= config.startDate && c.timestamp <= config.endDate
     );
 
     const closed: ReturnType<PositionManager['close']>[] = [];
+    const maxWindow = config.maxWindowSize ?? 150;
 
     for (let i = 1; i <= filtered.length; i++) {
-      const window = filtered.slice(0, i);
+      const windowStart = Math.max(0, i - maxWindow);
+      const window = filtered.slice(windowStart, i);
       const signals = [];
 
-      if (config.strategyType === 'orb' || config.strategyType === 'combined') {
+      if (config.strategyType === 'orb' || config.strategyType === 'combined' || config.strategyType === 'all') {
         const s = orb.evaluate(config.symbol, window);
         if (s) signals.push(s);
       }
-      if (config.strategyType === 'reversal' || config.strategyType === 'combined') {
+      if (config.strategyType === 'reversal' || config.strategyType === 'combined' || config.strategyType === 'all') {
         const s = reversal.evaluate(config.symbol, window);
+        if (s) signals.push(s);
+      }
+      if (config.strategyType === 'macd_bollinger' || config.strategyType === 'all') {
+        const s = macdBollinger.evaluate(config.symbol, window);
+        if (s) signals.push(s);
+      }
+      if (config.strategyType === 'ichimoku' || config.strategyType === 'all') {
+        const s = ichimoku.evaluate(config.symbol, window);
         if (s) signals.push(s);
       }
 
@@ -57,13 +69,23 @@ export class BacktestRunner {
     const totalPnl = closed.reduce((sum, t) => sum + (t.pnl ?? 0), 0);
     const winners = closed.filter(t => (t.pnl ?? 0) > 0);
     const winRate = closed.length > 0 ? winners.length / closed.length : 0;
+    const avgRR = closed.length > 0
+      ? closed.reduce((s, t) => {
+          const entry = t.entryPrice;
+          const stop = t.stopLoss;
+          const tp = t.takeProfit;
+          const stopDist = Math.abs(entry - stop);
+          const tpDist = Math.abs(tp - entry);
+          return s + (stopDist > 0 ? tpDist / stopDist : 0);
+        }, 0) / closed.length
+      : 0;
 
     return {
       config,
       trades: closed,
       totalPnl,
       winRate,
-      avgRiskReward: 2,
+      avgRiskReward: avgRR,
       maxDrawdown: 0,
       sharpeRatio: 0,
     };
