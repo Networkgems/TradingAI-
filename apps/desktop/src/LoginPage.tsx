@@ -4,9 +4,10 @@ const HTTP_URL = (import.meta.env.VITE_SERVER_URL ?? 'ws://localhost:4242').repl
 
 interface Props {
   onLogin: (token: string) => void;
+  onForgotPassword: () => void;
 }
 
-export default function LoginPage({ onLogin }: Props) {
+export default function LoginPage({ onLogin, onForgotPassword }: Props) {
   const [username, setUsername] = useState('');
   const [password, setPassword] = useState('');
   const [error, setError] = useState('');
@@ -69,6 +70,14 @@ export default function LoginPage({ onLogin }: Props) {
           {error && <p className="login-error">{error}</p>}
           <button type="submit" disabled={loading} className="login-btn">
             {loading ? 'Signing in…' : 'Sign In'}
+          </button>
+          <button
+            type="button"
+            className="login-forgot-link"
+            onClick={onForgotPassword}
+            disabled={loading}
+          >
+            Forgot password?
           </button>
         </form>
       </div>

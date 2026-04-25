@@ -8,8 +8,20 @@ import { fileURLToPath } from 'url';
 import { SignalEngine } from './signal-engine.js';
 import { MarketScheduler } from './scheduler.js';
 import { generateEodReport } from './reports/eod-report.js';
-import { createToken, validateCredentials, verifyToken } from './auth.js';
+import { createToken, verifyToken, generateResetToken, consumeResetToken } from './auth.js';
 import { loadSettings, getSettings, saveSettings } from './account-settings.js';
+import {
+  loadUsers,
+  validateUserCredentials,
+  changeUserPassword,
+  getUserByEmail,
+  getUser,
+  getAllUsers,
+  createUser,
+  updateUser,
+  deleteUser,
+} from './users.js';
+import { sendPasswordResetEmail } from './email.js';
 import type { AccountSettings } from '@trading-app/shared';
 import { DEFAULT_ACCOUNT_SETTINGS } from '@trading-app/shared';
 
@@ -21,13 +33,16 @@ if (!existsSync(REPORTS_DIR)) {
   await mkdir(REPORTS_DIR, { recursive: true });
 }
 
+// Load users before starting
+await loadUsers();
+
 const app = express();
 
 // ── CORS ─────────────────────────────────────────────────────────────────────
 
 app.use((req, res, next) => {
   res.setHeader('Access-Control-Allow-Origin', '*');
-  res.setHeader('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
+  res.setHeader('Access-Control-Allow-Methods', 'GET, POST, PUT, PATCH, DELETE, OPTIONS');
   res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization');
   if (req.method === 'OPTIONS') {
     res.status(204).end();
@@ -52,6 +67,17 @@ function requireAuth(req: express.Request, res: express.Response, next: express.
   const user = verifyToken(header.slice(7));
   if (!user) {
     res.status(401).json({ error: 'Invalid or expired token' });
+    return;
+  }
+  res.locals['authUser'] = user;
+  next();
+}
+
+function requireAdmin(req: express.Request, res: express.Response, next: express.NextFunction): void {
+  const username = res.locals['authUser'] as string;
+  const user = getUser(username);
+  if (!user || user.role !== 'admin') {
+    res.status(403).json({ error: 'Admin access required' });
     return;
   }
   next();
@@ -94,18 +120,137 @@ app.get('/api/health', (_req, res) => {
   res.json({ ok: true, time: new Date().toISOString() });
 });
 
-app.post('/api/auth/login', (req, res) => {
+// ── Auth endpoints ────────────────────────────────────────────────────────────
+
+app.post('/api/auth/login', async (req, res) => {
   const { username, password } = req.body as { username?: string; password?: string };
   if (typeof username !== 'string' || typeof password !== 'string') {
     res.status(400).json({ error: 'username and password are required' });
     return;
   }
-  if (!validateCredentials(username, password)) {
+  if (!(await validateUserCredentials(username, password))) {
     res.status(401).json({ error: 'Invalid username or password' });
     return;
   }
   res.json({ token: createToken(username) });
 });
+
+app.post('/api/auth/forgot-password', async (req, res) => {
+  const { email } = req.body as { email?: string };
+  if (typeof email !== 'string' || !email.includes('@')) {
+    res.status(400).json({ error: 'A valid email address is required' });
+    return;
+  }
+  const user = getUserByEmail(email);
+  // Always return success to prevent email enumeration
+  if (user) {
+    const code = generateResetToken(user.username);
+    try {
+      await sendPasswordResetEmail(email, user.username, code);
+    } catch (err) {
+      console.error('[auth] Failed to send reset email:', err);
+    }
+  }
+  res.json({ ok: true, message: 'If an account with that email exists, a reset code has been sent.' });
+});
+
+app.post('/api/auth/reset-password', async (req, res) => {
+  const { code, newPassword } = req.body as { code?: string; newPassword?: string };
+  if (typeof code !== 'string' || typeof newPassword !== 'string') {
+    res.status(400).json({ error: 'code and newPassword are required' });
+    return;
+  }
+  if (newPassword.length < 6) {
+    res.status(400).json({ error: 'Password must be at least 6 characters' });
+    return;
+  }
+  const username = consumeResetToken(code);
+  if (!username) {
+    res.status(400).json({ error: 'Invalid or expired reset code' });
+    return;
+  }
+  await changeUserPassword(username, newPassword);
+  res.json({ ok: true, message: 'Password has been reset. You can now log in.' });
+});
+
+app.post('/api/auth/change-password', requireAuth, async (req, res) => {
+  const username = res.locals['authUser'] as string;
+  const { currentPassword, newPassword } = req.body as {
+    currentPassword?: string;
+    newPassword?: string;
+  };
+  if (typeof currentPassword !== 'string' || typeof newPassword !== 'string') {
+    res.status(400).json({ error: 'currentPassword and newPassword are required' });
+    return;
+  }
+  if (newPassword.length < 6) {
+    res.status(400).json({ error: 'New password must be at least 6 characters' });
+    return;
+  }
+  if (!(await validateUserCredentials(username, currentPassword))) {
+    res.status(401).json({ error: 'Current password is incorrect' });
+    return;
+  }
+  await changeUserPassword(username, newPassword);
+  res.json({ ok: true, message: 'Password changed successfully' });
+});
+
+// ── Admin: user management ────────────────────────────────────────────────────
+
+app.get('/api/admin/users', requireAuth, requireAdmin, (_req, res) => {
+  res.json({ users: getAllUsers() });
+});
+
+app.post('/api/admin/users', requireAuth, requireAdmin, async (req, res) => {
+  const { username, email, password, role } = req.body as {
+    username?: string;
+    email?: string;
+    password?: string;
+    role?: 'admin' | 'user';
+  };
+  if (typeof username !== 'string' || typeof email !== 'string' || typeof password !== 'string') {
+    res.status(400).json({ error: 'username, email, and password are required' });
+    return;
+  }
+  if (password.length < 6) {
+    res.status(400).json({ error: 'Password must be at least 6 characters' });
+    return;
+  }
+  const result = await createUser(username, email, password, role ?? 'user');
+  if (result.error) {
+    res.status(409).json({ error: result.error });
+    return;
+  }
+  res.status(201).json({ ok: true, user: result.user });
+});
+
+app.patch('/api/admin/users/:username', requireAuth, requireAdmin, async (req, res) => {
+  const { username } = req.params as Record<string, string>;
+  const { email, newUsername } = req.body as { email?: string; newUsername?: string };
+  const result = await updateUser(username, { email, username: newUsername });
+  if (!result.ok) {
+    res.status(result.error === 'User not found' ? 404 : 409).json({ error: result.error });
+    return;
+  }
+  res.json({ ok: true });
+});
+
+app.delete('/api/admin/users/:username', requireAuth, requireAdmin, async (req, res) => {
+  const { username } = req.params as Record<string, string>;
+  const authUser = res.locals['authUser'] as string;
+  if (username === authUser) {
+    res.status(400).json({ error: 'Cannot delete your own account' });
+    return;
+  }
+  const deleted = await deleteUser(username);
+  if (!deleted) {
+    res.status(404).json({ error: 'User not found' });
+    return;
+  }
+  res.json({ ok: true });
+});
+
+// ── State ─────────────────────────────────────────────────────────────────────
 
 app.get('/api/state', requireAuth, (_req, res) => {
   res.json(engine.getState());
@@ -179,7 +324,6 @@ app.put('/api/account/settings', requireAuth, async (req, res) => {
   const updated: AccountSettings = {
     ...current,
     ...body,
-    // Clamp numeric values to reasonable ranges
     demoEquity: Math.max(1_000, Math.min(10_000_000, Number(body.demoEquity ?? current.demoEquity))),
     dailyTradesLimit: Math.max(1, Math.min(100, Number(body.dailyTradesLimit ?? current.dailyTradesLimit))),
     managedAccountRatio: Math.max(0.01, Math.min(1, Number(body.managedAccountRatio ?? current.managedAccountRatio))),

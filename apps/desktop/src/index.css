@@ -633,3 +633,97 @@ tr:hover td { background: #1c2128; }
 .btn-danger:hover:not(:disabled) { opacity: 0.75; }
 
 .save-error { color: var(--red); font-size: 0.8rem; }
+
+/* ── Forgot password link ─────────────────────────────────────────────────── */
+
+.login-forgot-link {
+  background: none;
+  border: none;
+  color: var(--blue);
+  cursor: pointer;
+  font-size: 0.82rem;
+  font-family: inherit;
+  padding: 0;
+  text-align: center;
+  text-decoration: underline;
+  opacity: 0.8;
+}
+.login-forgot-link:hover:not(:disabled) { opacity: 1; }
+.login-forgot-link:disabled { opacity: 0.4; cursor: not-allowed; }
+
+/* ── User management table ───────────────────────────────────────────────── */
+
+.user-table-wrap {
+  overflow-x: auto;
+  margin-bottom: 0.5rem;
+}
+
+.user-table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 0.85rem;
+}
+
+.user-table th,
+.user-table td {
+  padding: 0.5rem 0.75rem;
+  text-align: left;
+  border-bottom: 1px solid var(--border);
+}
+
+.user-table th {
+  color: var(--muted);
+  font-weight: 600;
+  font-size: 0.75rem;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+}
+
+.role-badge {
+  display: inline-block;
+  padding: 0.15rem 0.5rem;
+  border-radius: 3px;
+  font-size: 0.72rem;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+}
+
+.role-badge.admin { background: rgba(74, 144, 226, 0.15); color: var(--blue); }
+.role-badge.user { background: var(--surface2); color: var(--muted); }
+
+.btn-sm {
+  padding: 0.2rem 0.55rem;
+  font-size: 0.75rem;
+}
+
+/* ── Create user form ────────────────────────────────────────────────────── */
+
+.create-user-form {
+  background: var(--surface2);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  padding: 1rem 1.25rem;
+  margin-top: 0.5rem;
+}
+
+/* ── Modal ───────────────────────────────────────────────────────────────── */
+
+.modal-backdrop {
+  position: fixed;
+  inset: 0;
+  background: rgba(0, 0, 0, 0.55);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  z-index: 200;
+}
+
+.modal-card {
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 1.5rem;
+  width: 100%;
+  max-width: 380px;
+}

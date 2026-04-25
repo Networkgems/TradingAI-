@@ -8,12 +8,363 @@ interface Props {
 }
 
 type SaveStatus = 'idle' | 'saving' | 'saved' | 'error';
+type PwStatus = 'idle' | 'saving' | 'saved' | 'error';
+
+interface SafeUser {
+  username: string;
+  email: string;
+  role: 'admin' | 'user';
+  createdAt: string;
+}
+
+function ChangePasswordSection({ token, httpUrl }: { token: string; httpUrl: string }) {
+  const [currentPassword, setCurrentPassword] = useState('');
+  const [newPassword, setNewPassword] = useState('');
+  const [confirmPassword, setConfirmPassword] = useState('');
+  const [status, setStatus] = useState<PwStatus>('idle');
+  const [error, setError] = useState('');
+
+  async function handleSubmit(e: React.FormEvent) {
+    e.preventDefault();
+    if (newPassword !== confirmPassword) { setError('Passwords do not match'); return; }
+    if (newPassword.length < 6) { setError('New password must be at least 6 characters'); return; }
+    setStatus('saving');
+    setError('');
+    try {
+      const r = await fetch(`${httpUrl}/api/auth/change-password`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${token}` },
+        body: JSON.stringify({ currentPassword, newPassword }),
+      });
+      const data = await r.json() as { ok?: boolean; error?: string };
+      if (r.ok && data.ok) {
+        setStatus('saved');
+        setCurrentPassword('');
+        setNewPassword('');
+        setConfirmPassword('');
+        setTimeout(() => setStatus('idle'), 3000);
+      } else {
+        setError(data.error ?? 'Password change failed');
+        setStatus('error');
+      }
+    } catch {
+      setError('Cannot reach server');
+      setStatus('error');
+    }
+  }
+
+  return (
+    <section className="settings-section">
+      <h2 className="settings-section-title">Change Password</h2>
+      <form onSubmit={handleSubmit}>
+        <div className="settings-grid">
+          <div className="settings-field">
+            <label>Current Password</label>
+            <input
+              type="password"
+              value={currentPassword}
+              onChange={e => setCurrentPassword(e.target.value)}
+              autoComplete="current-password"
+              required
+              disabled={status === 'saving'}
+            />
+          </div>
+          <div className="settings-field">
+            <label>New Password</label>
+            <input
+              type="password"
+              value={newPassword}
+              onChange={e => setNewPassword(e.target.value)}
+              autoComplete="new-password"
+              minLength={6}
+              required
+              disabled={status === 'saving'}
+            />
+            <span className="field-hint">Minimum 6 characters</span>
+          </div>
+          <div className="settings-field">
+            <label>Confirm New Password</label>
+            <input
+              type="password"
+              value={confirmPassword}
+              onChange={e => setConfirmPassword(e.target.value)}
+              autoComplete="new-password"
+              minLength={6}
+              required
+              disabled={status === 'saving'}
+            />
+          </div>
+        </div>
+        {error && <p className="save-error" style={{ marginTop: '0.5rem' }}>{error}</p>}
+        {status === 'saved' && <p style={{ color: 'var(--green)', marginTop: '0.5rem' }}>Password changed successfully!</p>}
+        <div className="settings-footer" style={{ marginTop: '1rem', paddingTop: 0, borderTop: 'none' }}>
+          <button type="submit" className="btn-primary" disabled={status === 'saving'}>
+            {status === 'saving' ? 'Saving…' : 'Change Password'}
+          </button>
+        </div>
+      </form>
+    </section>
+  );
+}
+
+function UserManagementSection({ token, httpUrl }: { token: string; httpUrl: string }) {
+  const [users, setUsers] = useState<SafeUser[]>([]);
+  const [loading, setLoading] = useState(true);
+  const [showCreate, setShowCreate] = useState(false);
+  const [newUsername, setNewUsername] = useState('');
+  const [newEmail, setNewEmail] = useState('');
+  const [newPassword, setNewPassword] = useState('');
+  const [newRole, setNewRole] = useState<'admin' | 'user'>('user');
+  const [createError, setCreateError] = useState('');
+  const [creating, setCreating] = useState(false);
+  const [editUser, setEditUser] = useState<SafeUser | null>(null);
+  const [editEmail, setEditEmail] = useState('');
+  const [editUsernameVal, setEditUsernameVal] = useState('');
+  const [editError, setEditError] = useState('');
+  const [editing, setEditing] = useState(false);
+
+  async function loadUsers() {
+    try {
+      const r = await fetch(`${httpUrl}/api/admin/users`, {
+        headers: { Authorization: `Bearer ${token}` },
+      });
+      if (r.ok) {
+        const data = await r.json() as { users: SafeUser[] };
+        setUsers(data.users);
+      }
+    } finally {
+      setLoading(false);
+    }
+  }
+
+  useEffect(() => { void loadUsers(); }, [token, httpUrl]);
+
+  async function handleCreate(e: React.FormEvent) {
+    e.preventDefault();
+    setCreating(true);
+    setCreateError('');
+    try {
+      const r = await fetch(`${httpUrl}/api/admin/users`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${token}` },
+        body: JSON.stringify({ username: newUsername, email: newEmail, password: newPassword, role: newRole }),
+      });
+      const data = await r.json() as { ok?: boolean; error?: string };
+      if (r.ok && data.ok) {
+        setShowCreate(false);
+        setNewUsername('');
+        setNewEmail('');
+        setNewPassword('');
+        setNewRole('user');
+        await loadUsers();
+      } else {
+        setCreateError(data.error ?? 'Failed to create user');
+      }
+    } catch {
+      setCreateError('Cannot reach server');
+    } finally {
+      setCreating(false);
+    }
+  }
+
+  async function handleDelete(username: string) {
+    if (!confirm(`Delete user "${username}"? This cannot be undone.`)) return;
+    try {
+      const r = await fetch(`${httpUrl}/api/admin/users/${encodeURIComponent(username)}`, {
+        method: 'DELETE',
+        headers: { Authorization: `Bearer ${token}` },
+      });
+      if (r.ok) await loadUsers();
+    } catch { /* ignore */ }
+  }
+
+  function startEdit(user: SafeUser) {
+    setEditUser(user);
+    setEditEmail(user.email);
+    setEditUsernameVal(user.username);
+    setEditError('');
+  }
+
+  async function handleEdit(e: React.FormEvent) {
+    e.preventDefault();
+    if (!editUser) return;
+    setEditing(true);
+    setEditError('');
+    try {
+      const r = await fetch(`${httpUrl}/api/admin/users/${encodeURIComponent(editUser.username)}`, {
+        method: 'PATCH',
+        headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${token}` },
+        body: JSON.stringify({
+          email: editEmail,
+          newUsername: editUsernameVal !== editUser.username ? editUsernameVal : undefined,
+        }),
+      });
+      const data = await r.json() as { ok?: boolean; error?: string };
+      if (r.ok && data.ok) {
+        setEditUser(null);
+        await loadUsers();
+      } else {
+        setEditError(data.error ?? 'Failed to update user');
+      }
+    } catch {
+      setEditError('Cannot reach server');
+    } finally {
+      setEditing(false);
+    }
+  }
+
+  if (loading) return <div className="loading"><div className="spinner" /><p>Loading users…</p></div>;
+
+  return (
+    <section className="settings-section">
+      <h2 className="settings-section-title">Account Management</h2>
+      <p className="settings-hint">Manage user accounts that can access TradingAI.</p>
+
+      <div className="user-table-wrap">
+        <table className="user-table">
+          <thead>
+            <tr>
+              <th>Username</th>
+              <th>Email</th>
+              <th>Role</th>
+              <th>Created</th>
+              <th>Actions</th>
+            </tr>
+          </thead>
+          <tbody>
+            {users.map(u => (
+              <tr key={u.username}>
+                <td className="symbol">{u.username}</td>
+                <td className="muted">{u.email || '—'}</td>
+                <td>
+                  <span className={`role-badge ${u.role}`}>{u.role}</span>
+                </td>
+                <td className="muted">{new Date(u.createdAt).toLocaleDateString()}</td>
+                <td>
+                  <button className="btn-secondary btn-sm" onClick={() => startEdit(u)}>Edit</button>
+                  {' '}
+                  <button className="btn-danger btn-sm" onClick={() => handleDelete(u.username)}>Delete</button>
+                </td>
+              </tr>
+            ))}
+          </tbody>
+        </table>
+      </div>
+
+      {editUser && (
+        <div className="modal-backdrop">
+          <div className="modal-card">
+            <h3 style={{ marginBottom: '1rem' }}>Edit User: {editUser.username}</h3>
+            <form onSubmit={handleEdit}>
+              <div className="settings-field">
+                <label>Username</label>
+                <input
+                  type="text"
+                  value={editUsernameVal}
+                  onChange={e => setEditUsernameVal(e.target.value)}
+                  required
+                  disabled={editing}
+                />
+              </div>
+              <div className="settings-field" style={{ marginTop: '0.75rem' }}>
+                <label>Email</label>
+                <input
+                  type="email"
+                  value={editEmail}
+                  onChange={e => setEditEmail(e.target.value)}
+                  disabled={editing}
+                />
+              </div>
+              {editError && <p className="save-error" style={{ marginTop: '0.5rem' }}>{editError}</p>}
+              <div style={{ display: 'flex', gap: '0.75rem', marginTop: '1rem' }}>
+                <button type="submit" className="btn-primary" disabled={editing}>
+                  {editing ? 'Saving…' : 'Save'}
+                </button>
+                <button type="button" className="btn-secondary" onClick={() => setEditUser(null)} disabled={editing}>
+                  Cancel
+                </button>
+              </div>
+            </form>
+          </div>
+        </div>
+      )}
+
+      <div style={{ marginTop: '1rem' }}>
+        {!showCreate ? (
+          <button className="btn-secondary" onClick={() => setShowCreate(true)}>
+            + Add User
+          </button>
+        ) : (
+          <div className="create-user-form">
+            <h3 style={{ marginBottom: '0.75rem' }}>Create New User</h3>
+            <form onSubmit={handleCreate}>
+              <div className="settings-grid">
+                <div className="settings-field">
+                  <label>Username</label>
+                  <input
+                    type="text"
+                    value={newUsername}
+                    onChange={e => setNewUsername(e.target.value)}
+                    required
+                    disabled={creating}
+                  />
+                </div>
+                <div className="settings-field">
+                  <label>Email</label>
+                  <input
+                    type="email"
+                    value={newEmail}
+                    onChange={e => setNewEmail(e.target.value)}
+                    disabled={creating}
+                  />
+                </div>
+                <div className="settings-field">
+                  <label>Password</label>
+                  <input
+                    type="password"
+                    value={newPassword}
+                    onChange={e => setNewPassword(e.target.value)}
+                    minLength={6}
+                    required
+                    disabled={creating}
+                  />
+                  <span className="field-hint">Minimum 6 characters</span>
+                </div>
+                <div className="settings-field">
+                  <label>Role</label>
+                  <select
+                    value={newRole}
+                    onChange={e => setNewRole(e.target.value as 'admin' | 'user')}
+                    disabled={creating}
+                  >
+                    <option value="user">User</option>
+                    <option value="admin">Admin</option>
+                  </select>
+                </div>
+              </div>
+              {createError && <p className="save-error" style={{ marginTop: '0.5rem' }}>{createError}</p>}
+              <div style={{ display: 'flex', gap: '0.75rem', marginTop: '0.75rem' }}>
+                <button type="submit" className="btn-primary" disabled={creating}>
+                  {creating ? 'Creating…' : 'Create User'}
+                </button>
+                <button type="button" className="btn-secondary" onClick={() => { setShowCreate(false); setCreateError(''); }} disabled={creating}>
+                  Cancel
+                </button>
+              </div>
+            </form>
+          </div>
+        )}
+      </div>
+    </section>
+  );
+}
 
 export default function SettingsPage({ token, httpUrl }: Props) {
   const [settings, setSettings] = useState<AccountSettings>(DEFAULT_ACCOUNT_SETTINGS);
   const [loading, setLoading] = useState(true);
   const [saveStatus, setSaveStatus] = useState<SaveStatus>('idle');
   const [resetPending, setResetPending] = useState(false);
+  const [isAdmin, setIsAdmin] = useState(false);
 
   useEffect(() => {
     fetch(`${httpUrl}/api/account/settings`, {
@@ -25,6 +376,11 @@ export default function SettingsPage({ token, httpUrl }: Props) {
         setLoading(false);
       })
       .catch(() => setLoading(false));
+
+    // Check if admin
+    fetch(`${httpUrl}/api/admin/users`, { headers: { Authorization: `Bearer ${token}` } })
+      .then(r => { if (r.ok) setIsAdmin(true); })
+      .catch(() => { /* not admin */ });
   }, [token, httpUrl]);
 
   async function handleSave(e: React.FormEvent) {
@@ -282,6 +638,12 @@ export default function SettingsPage({ token, httpUrl }: Props) {
           )}
         </div>
       </form>
+
+      {/* ── Change Password ───────────────────────────────────────────────── */}
+      <ChangePasswordSection token={token} httpUrl={httpUrl} />
+
+      {/* ── User Management (admin only) ──────────────────────────────────── */}
+      {isAdmin && <UserManagementSection token={token} httpUrl={httpUrl} />}
     </div>
   );
 }

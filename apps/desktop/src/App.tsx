@@ -2,6 +2,7 @@ import { useEffect, useRef, useState } from 'react';
 import type { TradeSignal, Position, AccountState, OptionPosition, OptionsAccountState, EodReport } from '@trading-app/shared';
 import { OPTIONS_DAILY_LIMIT } from '@trading-app/shared';
 import LoginPage from './LoginPage.tsx';
+import ForgotPasswordPage from './ForgotPasswordPage.tsx';
 import SettingsPage from './SettingsPage.tsx';
 import './index.css';
 
@@ -598,16 +599,23 @@ function Dashboard({ token, onLogout }: { token: string; onLogout: () => void })
   );
 }
 
+type AuthScreen = 'login' | 'forgot';
+
 export default function App() {
   const [token, setToken] = useState<string | null>(() => localStorage.getItem('auth_token'));
+  const [authScreen, setAuthScreen] = useState<AuthScreen>('login');
 
   function handleLogout() {
     localStorage.removeItem('auth_token');
     setToken(null);
+    setAuthScreen('login');
   }
 
   if (!token) {
-    return <LoginPage onLogin={setToken} />;
+    if (authScreen === 'forgot') {
+      return <ForgotPasswordPage onBack={() => setAuthScreen('login')} />;
+    }
+    return <LoginPage onLogin={setToken} onForgotPassword={() => setAuthScreen('forgot')} />;
   }
 
   return <Dashboard token={token} onLogout={handleLogout} />;

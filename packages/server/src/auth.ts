@@ -2,10 +2,6 @@ import { createHmac, randomBytes, timingSafeEqual } from 'node:crypto';
 
 const SECRET = process.env.AUTH_SECRET ?? randomBytes(32).toString('hex');
 
-const CREDENTIALS: Record<string, string> = {
-  admin: '1234',
-};
-
 function sign(encoded: string): string {
   return createHmac('sha256', SECRET).update(encoded).digest('base64url');
 }
@@ -21,7 +17,6 @@ export function verifyToken(token: string): string | null {
   const payload = token.slice(0, dot);
   const sig = token.slice(dot + 1);
   const expected = sign(payload);
-  // Use timingSafeEqual to prevent timing attacks
   try {
     const a = Buffer.from(sig);
     const b = Buffer.from(expected);
@@ -37,13 +32,35 @@ export function verifyToken(token: string): string | null {
   }
 }
 
-export function validateCredentials(username: string, password: string): boolean {
-  const stored = CREDENTIALS[username];
-  if (!stored) return false;
-  // Use timingSafeEqual to prevent timing attacks
-  try {
-    return timingSafeEqual(Buffer.from(password), Buffer.from(stored));
-  } catch {
-    return false;
+// ── Password reset tokens ─────────────────────────────────────────────────────
+
+interface ResetEntry {
+  username: string;
+  expiresAt: number;
+}
+
+const resetTokens = new Map<string, ResetEntry>();
+const RESET_TTL_MS = 60 * 60 * 1000; // 1 hour
+
+export function generateResetToken(username: string): string {
+  // 8-digit numeric code
+  const code = String(Math.floor(10_000_000 + Math.random() * 90_000_000));
+  resetTokens.set(code, { username, expiresAt: Date.now() + RESET_TTL_MS });
+  return code;
+}
+
+export function validateResetToken(code: string): string | null {
+  const entry = resetTokens.get(code);
+  if (!entry) return null;
+  if (Date.now() > entry.expiresAt) {
+    resetTokens.delete(code);
+    return null;
   }
+  return entry.username;
+}
+
+export function consumeResetToken(code: string): string | null {
+  const username = validateResetToken(code);
+  if (username) resetTokens.delete(code);
+  return username;
 }

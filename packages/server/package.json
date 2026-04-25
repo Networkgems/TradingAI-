@@ -15,12 +15,14 @@
     "@trading-app/engine": "workspace:*",
     "@trading-app/shared": "workspace:*",
     "express": "^4.21.2",
+    "nodemailer": "^8.0.6",
     "ws": "^8.20.0",
     "yahoo-finance2": "^3.14.0"
   },
   "devDependencies": {
     "@types/express": "^5.0.1",
     "@types/node": "^22.0.0",
+    "@types/nodemailer": "^8.0.0",
     "@types/ws": "^8.18.1",
     "tsx": "^4.19.3",
     "typescript": "^5.4.5",
