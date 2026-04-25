@@ -5,6 +5,7 @@
   "scripts": {
     "dev": "pnpm --filter desktop tauri dev",
     "build": "pnpm --filter desktop tauri build",
+    "render-build": "pnpm --filter @trading-app/shared build && pnpm --filter @trading-app/engine build && pnpm --filter @trading-app/server build",
     "server:dev": "pnpm --filter @trading-app/server dev",
     "server:build": "pnpm --filter @trading-app/server build",
     "server:start": "pnpm --filter @trading-app/server start",
@@ -22,7 +23,7 @@
     "typescript-eslint": "^8.0.0"
   },
   "engines": {
-    "node": ">=20",
+    "node": "20.x",
     "pnpm": ">=9"
   }
 }

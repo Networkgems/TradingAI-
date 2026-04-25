@@ -3,10 +3,12 @@ services:
     name: tradingai-server
     runtime: node
     plan: free
-    buildCommand: pnpm install --frozen-lockfile && pnpm --filter @trading-app/shared build && pnpm --filter @trading-app/engine build && pnpm --filter @trading-app/server build
+    buildCommand: pnpm install --frozen-lockfile && pnpm run render-build
     startCommand: node packages/server/dist/index.js
     envVars:
       - key: AUTH_SECRET
         generateValue: true
       - key: NODE_ENV
         value: production
+      - key: NODE_VERSION
+        value: 20.19.0
