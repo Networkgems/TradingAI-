@@ -111,6 +111,7 @@ function CryptoDashboard({ onBack }: { onBack: () => void }) {
   const [state, setState] = useState<CryptoEngineState | null>(null);
   const [news, setNews] = useState<NewsItem[]>([]);
   const [connected, setConnected] = useState(false);
+  const [everConnected, setEverConnected] = useState(false);
   const [tab, setTab] = useState<'watchlist' | 'signals' | 'positions' | 'news'>('watchlist');
   const wsRef = useRef<WebSocket | null>(null);
   const reconnectTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
@@ -128,7 +129,7 @@ function CryptoDashboard({ onBack }: { onBack: () => void }) {
       ws.onmessage = (e) => {
         try {
           const msg = JSON.parse(e.data as string);
-          if (msg.type === 'crypto_state') setState(msg.payload as CryptoEngineState);
+          if (msg.type === 'crypto_state') { setState(msg.payload as CryptoEngineState); setEverConnected(true); }
         } catch { /* ignore */ }
       };
     }
@@ -243,11 +244,19 @@ function CryptoDashboard({ onBack }: { onBack: () => void }) {
       </nav>
 
       <main className="content">
-        {!state && (
+        {!state && !everConnected && (
           <div className="loading">
             <div className="spinner" />
             <p>Connecting to crypto engine…</p>
-            <p className="hint">Make sure the server is running: <code>pnpm server:dev</code></p>
+            {import.meta.env.DEV && (
+              <p className="hint">Make sure the server is running: <code>pnpm server:dev</code></p>
+            )}
+          </div>
+        )}
+        {!state && everConnected && (
+          <div className="loading">
+            <div className="spinner" />
+            <p>Connection lost — reconnecting…</p>
           </div>
         )}
 
@@ -273,7 +282,7 @@ function CryptoDashboard({ onBack }: { onBack: () => void }) {
                     <td className="price">${fmt(s.price)}</td>
                     <td className={s.change >= 0 ? 'green' : 'red'}>{fmtDollar(s.change)}</td>
                     <td className={s.changePct >= 0 ? 'green' : 'red'}>{fmtPct(s.changePct)}</td>
-                    <td>{(s.volume / 1_000_000).toFixed(2)}M</td>
+                    <td>{(s.volume / 1_000_000).toFixed(1)}M</td>
                     <td className="muted">{timeAgo(s.lastUpdated)}</td>
                   </tr>
                 ))}
@@ -294,7 +303,7 @@ function CryptoDashboard({ onBack }: { onBack: () => void }) {
                       <span className="signal-symbol">{sig.symbol}</span>
                       <span className={`signal-side ${sig.side}`}>{sig.side.toUpperCase()}</span>
                       <span className="signal-type">{signalLabel(sig.type)}</span>
-                      <span className="signal-time">{formatTime(sig.timestamp)}</span>
+                      <span className="signal-time" title={formatTime(sig.timestamp)}>{timeAgo(sig.timestamp)}</span>
                     </div>
                     <div className="signal-body">
                       <div className="sig-stat">
@@ -335,6 +344,7 @@ function CryptoDashboard({ onBack }: { onBack: () => void }) {
                       <th>Entry</th>
                       <th>Current</th>
                       <th>P&amp;L %</th>
+                      <th>P&L $</th>
                       <th>Stop</th>
                       <th>Target</th>
                       <th>Opened</th>
@@ -346,6 +356,7 @@ function CryptoDashboard({ onBack }: { onBack: () => void }) {
                       const currentPrice = sym?.price ?? p.entryPrice;
                       const multiplier = p.side === 'buy' ? 1 : -1;
                       const pnlPct = ((currentPrice - p.entryPrice) / p.entryPrice) * 100 * multiplier;
+                      const pnlDollar = (currentPrice - p.entryPrice) * p.quantity * multiplier;
                       return (
                         <tr key={p.id}>
                           <td className="symbol">{p.symbol}</td>
@@ -354,6 +365,7 @@ function CryptoDashboard({ onBack }: { onBack: () => void }) {
                           <td>${fmt(p.entryPrice)}</td>
                           <td>${fmt(currentPrice)}</td>
                           <td className={pnlPct >= 0 ? 'green' : 'red'}>{fmtPct(pnlPct)}</td>
+                          <td className={pnlDollar >= 0 ? 'green' : 'red'}>{fmtDollar(pnlDollar)}</td>
                           <td className="red">${fmt(p.stopLoss)}</td>
                           <td className="green">${fmt(p.takeProfit)}</td>
                           <td className="muted">{formatTime(p.openedAt)}</td>
@@ -409,8 +421,8 @@ function CryptoDashboard({ onBack }: { onBack: () => void }) {
               <div className="empty">Loading crypto news…</div>
             ) : (
               <div className="signal-list">
-                {news.slice(0, 10).map((item, i) => (
-                  <div key={i} className="signal-card buy">
+                {news.slice(0, 10).map((item) => (
+                  <div key={item.url} className="news-card">
                     <div className="signal-header">
                       <span className="signal-symbol">{item.source}</span>
                       <span className="signal-time muted">
@@ -422,6 +434,11 @@ function CryptoDashboard({ onBack }: { onBack: () => void }) {
                          style={{ color: 'var(--blue)', textDecoration: 'none', fontWeight: 500 }}>
                         {item.title}
                       </a>
+                      {item.summary && (
+                        <p style={{ marginTop: '0.3rem', color: 'var(--muted)', fontSize: '0.75rem', lineHeight: 1.5 }}>
+                          {item.summary}
+                        </p>
+                      )}
                     </div>
                   </div>
                 ))}
@@ -443,6 +460,7 @@ export default function App() {
   const [eodReport, setEodReport] = useState<EodReport | null>(null);
   const [eodCollapsed, setEodCollapsed] = useState(false);
   const [connected, setConnected] = useState(false);
+  const [everConnected, setEverConnected] = useState(false);
   const [tab, setTab] = useState<'watchlist' | 'signals' | 'positions' | 'options'>('watchlist');
   const wsRef = useRef<WebSocket | null>(null);
   const reconnectTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
@@ -462,7 +480,7 @@ export default function App() {
       ws.onmessage = (e) => {
         try {
           const msg = JSON.parse(e.data as string);
-          if (msg.type === 'state') setState(msg.payload as AppState);
+          if (msg.type === 'state') { setState(msg.payload as AppState); setEverConnected(true); }
           if (msg.type === 'eod_report') setEodReport(msg.payload as EodReport);
         } catch { /* ignore malformed */ }
       };
@@ -607,11 +625,19 @@ export default function App() {
       </nav>
 
       <main className="content">
-        {!state && (
+        {!state && !everConnected && (
           <div className="loading">
             <div className="spinner" />
             <p>Connecting to trading engine…</p>
-            <p className="hint">Make sure the server is running: <code>pnpm server:dev</code></p>
+            {import.meta.env.DEV && (
+              <p className="hint">Make sure the server is running: <code>pnpm server:dev</code></p>
+            )}
+          </div>
+        )}
+        {!state && everConnected && (
+          <div className="loading">
+            <div className="spinner" />
+            <p>Connection lost — reconnecting…</p>
           </div>
         )}
 
@@ -658,7 +684,7 @@ export default function App() {
                       <span className="signal-symbol">{sig.symbol}</span>
                       <span className={`signal-side ${sig.side}`}>{sig.side.toUpperCase()}</span>
                       <span className="signal-type">{signalLabel(sig.type)}</span>
-                      <span className="signal-time">{formatTime(sig.timestamp)}</span>
+                      <span className="signal-time" title={formatTime(sig.timestamp)}>{timeAgo(sig.timestamp)}</span>
                     </div>
                     <div className="signal-body">
                       <div className="sig-stat">
@@ -699,6 +725,7 @@ export default function App() {
                       <th>Entry</th>
                       <th>Current</th>
                       <th>P&amp;L %</th>
+                      <th>P&L $</th>
                       <th>Stop</th>
                       <th>Target</th>
                       <th>Opened</th>
@@ -710,6 +737,7 @@ export default function App() {
                       const currentPrice = sym?.price ?? p.entryPrice;
                       const multiplier = p.side === 'buy' ? 1 : -1;
                       const pnlPct = ((currentPrice - p.entryPrice) / p.entryPrice) * 100 * multiplier;
+                      const pnlDollar = (currentPrice - p.entryPrice) * p.quantity * multiplier;
                       return (
                         <tr key={p.id}>
                           <td className="symbol">{p.symbol}</td>
@@ -718,6 +746,7 @@ export default function App() {
                           <td>${fmt(p.entryPrice)}</td>
                           <td>${fmt(currentPrice)}</td>
                           <td className={pnlPct >= 0 ? 'green' : 'red'}>{fmtPct(pnlPct)}</td>
+                          <td className={pnlDollar >= 0 ? 'green' : 'red'}>{fmtDollar(pnlDollar)}</td>
                           <td className="red">${fmt(p.stopLoss)}</td>
                           <td className="green">${fmt(p.takeProfit)}</td>
                           <td className="muted">{formatTime(p.openedAt)}</td>
