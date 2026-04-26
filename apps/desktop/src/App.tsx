@@ -1,4 +1,5 @@
 import { useEffect, useRef, useState } from 'react';
+import { createPortal } from 'react-dom';
 import type { TradeSignal, Position, AccountState, OptionPosition, OptionsAccountState, EodReport, CryptoEngineState, NewsItem } from '@trading-app/shared';
 import { OPTIONS_DAILY_LIMIT } from '@trading-app/shared';
 import LoginPage from './LoginPage.tsx';
@@ -56,13 +57,77 @@ function DashboardSelector({ onSelect }: { onSelect: (mode: 'stocks' | 'crypto')
   );
 }
 
+function ProfileMenu({ onChangePassword, onUserManagement, onLogout, isAdmin }: {
+  onChangePassword: () => void;
+  onUserManagement: () => void;
+  onLogout: () => void;
+  isAdmin: boolean;
+}) {
+  const [open, setOpen] = useState(false);
+  const btnRef = useRef<HTMLButtonElement>(null);
+  const [pos, setPos] = useState({ top: 0, right: 0 });
+
+  useEffect(() => {
+    if (!open || !btnRef.current) return;
+    const rect = btnRef.current.getBoundingClientRect();
+    setPos({ top: rect.bottom + 6, right: window.innerWidth - rect.right });
+
+    function handleClick(e: MouseEvent) {
+      const target = e.target as HTMLElement;
+      if (btnRef.current && !btnRef.current.contains(target) && !target.closest('.profile-dropdown')) {
+        setOpen(false);
+      }
+    }
+    document.addEventListener('click', handleClick);
+    return () => document.removeEventListener('click', handleClick);
+  }, [open]);
+
+  return (
+    <div className="profile-wrap">
+      <button
+        ref={btnRef}
+        className="logout-btn"
+        onClick={() => setOpen(o => !o)}
+        title="Profile menu"
+      >
+        &#x1F464; Profile &#9660;
+      </button>
+      {open && createPortal(
+        <div className="profile-dropdown" style={{ position: 'fixed', top: pos.top, right: pos.right }}>
+          <button
+            className="profile-dropdown-item"
+            onClick={() => { onChangePassword(); setOpen(false); }}
+          >
+            Change Password
+          </button>
+          {isAdmin && (
+            <button
+              className="profile-dropdown-item"
+              onClick={() => { onUserManagement(); setOpen(false); }}
+            >
+              Account Management
+            </button>
+          )}
+          <div className="profile-dropdown-divider" />
+          <button
+            className="profile-dropdown-item danger"
+            onClick={onLogout}
+          >
+            Sign Out
+          </button>
+        </div>,
+        document.body
+      )}
+    </div>
+  );
+}
+
 function CryptoDashboard({ token, onBack, onLogout }: { token: string; onBack: () => void; onLogout: () => void }) {
   const [state, setState] = useState<CryptoEngineState | null>(null);
   const [news, setNews] = useState<NewsItem[]>([]);
   const [connected, setConnected] = useState(false);
   const [everConnected, setEverConnected] = useState(false);
   const [tab, setTab] = useState<'watchlist' | 'signals' | 'positions' | 'news' | 'calendar' | 'settings'>('watchlist');
-  const [profileOpen, setProfileOpen] = useState(false);
   const [profileModal, setProfileModal] = useState<null | 'change-password' | 'user-management'>(null);
   const [isAdmin, setIsAdmin] = useState(false);
   const [tradingToggling, setTradingToggling] = useState(false);
@@ -135,15 +200,6 @@ function CryptoDashboard({ token, onBack, onLogout }: { token: string; onBack: (
       .then((s: { mode?: 'demo' | 'live' } | null) => { if (s?.mode) setAccountMode(s.mode); })
       .catch(() => {});
   }, [tab, token]);
-
-  useEffect(() => {
-    if (!profileOpen) return;
-    function handleClick(e: MouseEvent) {
-      if (!(e.target as HTMLElement).closest('.profile-wrap')) setProfileOpen(false);
-    }
-    document.addEventListener('click', handleClick);
-    return () => document.removeEventListener('click', handleClick);
-  }, [profileOpen]);
 
   const account = state?.account;
   const signals = state?.signals ?? [];
@@ -235,40 +291,12 @@ function CryptoDashboard({ token, onBack, onLogout }: { token: string; onBack: (
             >
               ⚙ Settings
             </button>
-            <div className="profile-wrap">
-              <button
-                className="logout-btn"
-                onClick={() => setProfileOpen(o => !o)}
-                title="Profile menu"
-              >
-                &#x1F464; Profile &#9660;
-              </button>
-              {profileOpen && (
-                <div className="profile-dropdown">
-                  <button
-                    className="profile-dropdown-item"
-                    onClick={() => { setProfileModal('change-password'); setProfileOpen(false); }}
-                  >
-                    Change Password
-                  </button>
-                  {isAdmin && (
-                    <button
-                      className="profile-dropdown-item"
-                      onClick={() => { setProfileModal('user-management'); setProfileOpen(false); }}
-                    >
-                      Account Management
-                    </button>
-                  )}
-                  <div className="profile-dropdown-divider" />
-                  <button
-                    className="profile-dropdown-item danger"
-                    onClick={onLogout}
-                  >
-                    Sign Out
-                  </button>
-                </div>
-              )}
-            </div>
+            <ProfileMenu
+              onChangePassword={() => setProfileModal('change-password')}
+              onUserManagement={() => setProfileModal('user-management')}
+              onLogout={onLogout}
+              isAdmin={isAdmin}
+            />
           </div>
         </div>
       </header>
@@ -556,7 +584,6 @@ function Dashboard({ token, onLogout, onGoHome }: { token: string; onLogout: () 
   const [tab, setTab] = useState<'watchlist' | 'signals' | 'positions' | 'options' | 'news' | 'settings' | 'calendar'>('watchlist');
   const [news, setNews] = useState<NewsItem[]>([]);
   const [tradingToggling, setTradingToggling] = useState(false);
-  const [profileOpen, setProfileOpen] = useState(false);
   const [profileModal, setProfileModal] = useState<null | 'change-password' | 'user-management'>(null);
   const [isAdmin, setIsAdmin] = useState(false);
   const [accountMode, setAccountMode] = useState<'demo' | 'live'>('demo');
@@ -635,15 +662,6 @@ function Dashboard({ token, onLogout, onGoHome }: { token: string; onLogout: () 
       .then((s: { mode?: 'demo' | 'live' } | null) => { if (s?.mode) setAccountMode(s.mode); })
       .catch(() => {});
   }, [tab, token]);
-
-  useEffect(() => {
-    if (!profileOpen) return;
-    function handleClick(e: MouseEvent) {
-      if (!(e.target as HTMLElement).closest('.profile-wrap')) setProfileOpen(false);
-    }
-    document.addEventListener('click', handleClick);
-    return () => document.removeEventListener('click', handleClick);
-  }, [profileOpen]);
 
   const account = state?.account;
   const signals = state?.signals ?? [];
@@ -762,40 +780,12 @@ function Dashboard({ token, onLogout, onGoHome }: { token: string; onLogout: () 
             >
               ⚙ Settings
             </button>
-            <div className="profile-wrap">
-              <button
-                className="logout-btn"
-                onClick={() => setProfileOpen(o => !o)}
-                title="Profile menu"
-              >
-                &#x1F464; Profile &#9660;
-              </button>
-              {profileOpen && (
-                <div className="profile-dropdown">
-                  <button
-                    className="profile-dropdown-item"
-                    onClick={() => { setProfileModal('change-password'); setProfileOpen(false); }}
-                  >
-                    Change Password
-                  </button>
-                  {isAdmin && (
-                    <button
-                      className="profile-dropdown-item"
-                      onClick={() => { setProfileModal('user-management'); setProfileOpen(false); }}
-                    >
-                      Account Management
-                    </button>
-                  )}
-                  <div className="profile-dropdown-divider" />
-                  <button
-                    className="profile-dropdown-item danger"
-                    onClick={onLogout}
-                  >
-                    Sign Out
-                  </button>
-                </div>
-              )}
-            </div>
+            <ProfileMenu
+              onChangePassword={() => setProfileModal('change-password')}
+              onUserManagement={() => setProfileModal('user-management')}
+              onLogout={onLogout}
+              isAdmin={isAdmin}
+            />
           </div>
         </div>
       </header>
