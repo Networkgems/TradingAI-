@@ -539,6 +539,9 @@ function Dashboard({ token, onLogout, onGoHome }: { token: string; onLogout: () 
   const [tab, setTab] = useState<'watchlist' | 'signals' | 'positions' | 'options' | 'news' | 'settings' | 'calendar'>('watchlist');
   const [news, setNews] = useState<NewsItem[]>([]);
   const [tradingToggling, setTradingToggling] = useState(false);
+  const [profileOpen, setProfileOpen] = useState(false);
+  const [profileModal, setProfileModal] = useState<null | 'change-password' | 'user-management'>(null);
+  const [isAdmin, setIsAdmin] = useState(false);
   const wsRef = useRef<WebSocket | null>(null);
   const reconnectTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
 
@@ -601,6 +604,21 @@ function Dashboard({ token, onLogout, onGoHome }: { token: string; onLogout: () 
     const id = setInterval(loadNews, 5 * 60_000);
     return () => clearInterval(id);
   }, [token]);
+
+  useEffect(() => {
+    fetch(`${HTTP_URL}/api/admin/users`, { headers: { Authorization: `Bearer ${token}` } })
+      .then(r => { if (r.ok) setIsAdmin(true); })
+      .catch(() => {});
+  }, [token]);
+
+  useEffect(() => {
+    if (!profileOpen) return;
+    function handleClick(e: MouseEvent) {
+      if (!(e.target as HTMLElement).closest('.profile-wrap')) setProfileOpen(false);
+    }
+    document.addEventListener('click', handleClick);
+    return () => document.removeEventListener('click', handleClick);
+  }, [profileOpen]);
 
   const account = state?.account;
   const signals = state?.signals ?? [];
@@ -707,11 +725,66 @@ function Dashboard({ token, onLogout, onGoHome }: { token: string; onLogout: () 
           >
             ⚙ Settings
           </button>
-          <button className="logout-btn" onClick={onLogout} title="Sign out">
-            Sign out
-          </button>
+          <div className="profile-wrap">
+            <button
+              className="logout-btn"
+              onClick={() => setProfileOpen(o => !o)}
+              title="Profile menu"
+            >
+              &#x1F464; Profile &#9660;
+            </button>
+            {profileOpen && (
+              <div className="profile-dropdown">
+                <button
+                  className="profile-dropdown-item"
+                  onClick={() => { setProfileModal('change-password'); setProfileOpen(false); }}
+                >
+                  Change Password
+                </button>
+                {isAdmin && (
+                  <button
+                    className="profile-dropdown-item"
+                    onClick={() => { setProfileModal('user-management'); setProfileOpen(false); }}
+                  >
+                    Account Management
+                  </button>
+                )}
+                <div className="profile-dropdown-divider" />
+                <button
+                  className="profile-dropdown-item danger"
+                  onClick={onLogout}
+                >
+                  Sign Out
+                </button>
+              </div>
+            )}
+          </div>
         </div>
       </header>
+
+      {profileModal === 'change-password' && (
+        <div className="modal-backdrop" onClick={() => setProfileModal(null)}>
+          <div className="modal-card" onClick={e => e.stopPropagation()}>
+            <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '1rem' }}>
+              <h3 style={{ fontSize: '0.95rem', fontWeight: 700 }}>Change Password</h3>
+              <button className="btn-secondary btn-sm" onClick={() => setProfileModal(null)}>&#x2715;</button>
+            </div>
+            <ChangePasswordSection token={token} httpUrl={HTTP_URL} />
+          </div>
+        </div>
+      )}
+
+      {profileModal === 'user-management' && isAdmin && (
+        <div className="modal-backdrop" onClick={() => setProfileModal(null)}>
+          <div className="modal-card" style={{ maxWidth: '660px' }} onClick={e => e.stopPropagation()}>
+            <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '1rem' }}>
+              <h3 style={{ fontSize: '0.95rem', fontWeight: 700 }}>Account Management</h3>
+              <button className="btn-secondary btn-sm" onClick={() => setProfileModal(null)}>&#x2715;</button>
+            </div>
+            <UserManagementSection token={token} httpUrl={HTTP_URL} />
+          </div>
+        </div>
+      )}
 
       <nav className="tabs">
         {(['watchlist', 'signals', 'positions', 'options'] as const).map(t => (
@@ -731,7 +804,7 @@ function Dashboard({ token, onLogout, onGoHome }: { token: string; onLogout: () 
       </nav>
 
       {tab === 'settings' && (
-        <SettingsPage token={token} httpUrl={HTTP_URL} />
+        <SettingsPage token={token} httpUrl={HTTP_URL} context="stocks" />
       )}
 
       <main className="content">

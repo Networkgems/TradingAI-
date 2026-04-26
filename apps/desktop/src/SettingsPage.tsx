@@ -5,7 +5,7 @@ import { DEFAULT_ACCOUNT_SETTINGS } from '@trading-app/shared';
 interface Props {
   token: string;
   httpUrl: string;
-  context?: 'crypto';
+  context?: 'crypto' | 'stocks';
 }
 
 type SaveStatus = 'idle' | 'saving' | 'saved' | 'error';
