@@ -175,6 +175,28 @@ app.post('/api/auth/login', async (req, res) => {
   res.json({ token: createToken(username) });
 });
 
+app.post('/api/auth/signup', async (req, res) => {
+  const { username, email, password } = req.body as { username?: string; email?: string; password?: string };
+  if (typeof username !== 'string' || !username.trim()) {
+    res.status(400).json({ error: 'Username is required' });
+    return;
+  }
+  if (typeof email !== 'string' || !email.includes('@')) {
+    res.status(400).json({ error: 'A valid email address is required' });
+    return;
+  }
+  if (typeof password !== 'string' || password.length < 6) {
+    res.status(400).json({ error: 'Password must be at least 6 characters' });
+    return;
+  }
+  const result = await createUser(username.trim(), email.trim(), password);
+  if (result.error) {
+    res.status(409).json({ error: result.error });
+    return;
+  }
+  res.json({ token: createToken(username.trim()) });
+});
+
 app.post('/api/auth/forgot-password', async (req, res) => {
   const { email } = req.body as { email?: string };
   if (typeof email !== 'string' || !email.includes('@')) {

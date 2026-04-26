@@ -3,6 +3,7 @@ import type { TradeSignal, Position, AccountState, OptionPosition, OptionsAccoun
 import { OPTIONS_DAILY_LIMIT } from '@trading-app/shared';
 import LoginPage from './LoginPage.tsx';
 import ForgotPasswordPage from './ForgotPasswordPage.tsx';
+import SignUpPage from './SignUpPage.tsx';
 import SettingsPage, { ChangePasswordSection, UserManagementSection } from './SettingsPage.tsx';
 import { CalendarTab } from './CalendarTab.tsx';
 import './index.css';
@@ -1277,7 +1278,7 @@ function Dashboard({ token, onLogout, onGoHome }: { token: string; onLogout: () 
 const IDLE_TIMEOUT_MS = 30 * 60 * 1000;
 const IDLE_WARN_MS = 2 * 60 * 1000;
 
-type AuthScreen = 'login' | 'forgot';
+type AuthScreen = 'login' | 'forgot' | 'signup';
 
 export default function App() {
   const [token, setToken] = useState<string | null>(() => localStorage.getItem('auth_token'));
@@ -1336,7 +1337,10 @@ export default function App() {
     if (authScreen === 'forgot') {
       return <ForgotPasswordPage onBack={() => setAuthScreen('login')} />;
     }
-    return <LoginPage onLogin={setToken} onForgotPassword={() => setAuthScreen('forgot')} />;
+    if (authScreen === 'signup') {
+      return <SignUpPage onSignUp={setToken} onBack={() => setAuthScreen('login')} />;
+    }
+    return <LoginPage onLogin={setToken} onForgotPassword={() => setAuthScreen('forgot')} onSignUp={() => setAuthScreen('signup')} />;
   }
 
   const mainContent = appMode === null
