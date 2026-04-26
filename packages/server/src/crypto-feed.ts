@@ -8,10 +8,16 @@ export async function fetchCryptoMinuteBars(symbol: string, count = 60): Promise
   try {
     const now = new Date();
     const from = new Date(now.getTime() - count * 60 * 1000 * 2);
+    // Request one extra bar so we always have `count` completed bars after dropping
+    // the in-progress current-minute candle (which Yahoo Finance includes with partial
+    // data and near-zero volume, causing volume-confirmation to always fail).
     const result = await yf.chart(symbol, { period1: from, period2: now, interval: '1m' });
+    const currentMinuteStart = Math.floor(now.getTime() / 60_000) * 60_000;
     const quotes = result.quotes ?? [];
     return quotes
       .filter(q => q.open != null && q.high != null && q.low != null && q.close != null && q.volume != null)
+      .filter(q => (q.volume ?? 0) > 0)                                  // drop 0-volume gaps
+      .filter(q => new Date(q.date).getTime() < currentMinuteStart)     // drop in-progress bar
       .map(q => ({
         symbol,
         timestamp: new Date(q.date).getTime(),

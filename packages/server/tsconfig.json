@@ -8,6 +8,7 @@
     "declarationMap": true
   },
   "references": [
+    { "path": "../backtest" },
     { "path": "../engine" },
     { "path": "../shared" }
   ],
