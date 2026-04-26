@@ -77,7 +77,7 @@ function CryptoDashboard({ token, onBack, onLogout }: { token: string; onBack: (
       ws.onopen = () => setConnected(true);
       ws.onclose = (e) => {
         setConnected(false);
-        if (e.code === 1008) { onBack(); return; }
+        if (e.code === 1008) { onLogout(); return; }
         reconnectTimer.current = setTimeout(connect, 3000);
       };
       ws.onerror = () => ws.close();
@@ -102,7 +102,7 @@ function CryptoDashboard({ token, onBack, onLogout }: { token: string; onBack: (
         const r = await fetch(`${HTTP_URL}/api/crypto/state`, {
           headers: { Authorization: `Bearer ${token}` },
         });
-        if (r.status === 401) { onBack(); return; }
+        if (r.status === 401) { onLogout(); return; }
         if (r.ok) setState(await r.json() as CryptoEngineState);
       } catch { /* ignore */ }
     }, 5000);
@@ -850,7 +850,6 @@ function Dashboard({ token, onLogout, onGoHome }: { token: string; onLogout: () 
           <div className="loading">
             <div className="spinner" />
             <p>Connecting to trading engine…</p>
-            <p className="hint">Make sure the server is running: <code>pnpm server:dev</code></p>
           </div>
         )}
 
@@ -1282,6 +1281,7 @@ type AuthScreen = 'login' | 'forgot' | 'signup';
 
 export default function App() {
   const [token, setToken] = useState<string | null>(() => localStorage.getItem('auth_token'));
+  const [tokenChecked, setTokenChecked] = useState<boolean>(() => !localStorage.getItem('auth_token'));
   const [authScreen, setAuthScreen] = useState<AuthScreen>('login');
   const [appMode, setAppMode] = useState<null | 'stocks' | 'crypto'>(() => {
     const stored = localStorage.getItem('tradingMode');
@@ -1296,10 +1296,30 @@ export default function App() {
     localStorage.removeItem('auth_token');
     localStorage.removeItem('tradingMode');
     setToken(null);
+    setTokenChecked(true);
     setAuthScreen('login');
     setAppMode(null);
     setIdleWarning(false);
   }
+
+  useEffect(() => {
+    const stored = localStorage.getItem('auth_token');
+    if (!stored) return;
+    let cancelled = false;
+    fetch(`${HTTP_URL}/api/auth/me`, {
+      headers: { Authorization: `Bearer ${stored}` },
+    }).then(r => {
+      if (cancelled) return;
+      if (r.status === 401) {
+        handleLogout();
+      } else {
+        setTokenChecked(true);
+      }
+    }).catch(() => {
+      if (!cancelled) setTokenChecked(true);
+    });
+    return () => { cancelled = true; };
+  }, []); // eslint-disable-line react-hooks/exhaustive-deps
 
   function resetIdleTimer() {
     if (idleTimerRef.current) clearTimeout(idleTimerRef.current);
@@ -1338,10 +1358,12 @@ export default function App() {
       return <ForgotPasswordPage onBack={() => setAuthScreen('login')} />;
     }
     if (authScreen === 'signup') {
-      return <SignUpPage onSignUp={setToken} onBack={() => setAuthScreen('login')} />;
+      return <SignUpPage onSignUp={(t) => { setTokenChecked(true); setToken(t); }} onBack={() => setAuthScreen('login')} />;
     }
-    return <LoginPage onLogin={setToken} onForgotPassword={() => setAuthScreen('forgot')} onSignUp={() => setAuthScreen('signup')} />;
+    return <LoginPage onLogin={(t) => { setTokenChecked(true); setToken(t); }} onForgotPassword={() => setAuthScreen('forgot')} onSignUp={() => setAuthScreen('signup')} />;
   }
+
+  if (!tokenChecked) return null;
 
   const mainContent = appMode === null
     ? <DashboardSelector onSelect={selectMode} />
