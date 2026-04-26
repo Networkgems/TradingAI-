@@ -120,6 +120,21 @@ export function isValidTradingWindow(utcMs: number): boolean {
   return TRADING_WINDOWS.some(([start, end]) => etMinutes >= start && etMinutes <= end);
 }
 
+// Crypto trading windows (UTC minutes) — skip dead zone 04:00–07:59
+// Based on academic analysis: peak volume/volatility 12:00–17:00, secondary peaks at 00:00 and 08:00.
+export const CRYPTO_TRADING_WINDOWS: readonly [number, number][] = [
+  [0 * 60,   4 * 60],   // 00:00–04:00 UTC (Asian session open)
+  [8 * 60,  12 * 60],   // 08:00–12:00 UTC (London session open)
+  [12 * 60, 17 * 60],   // 12:00–17:00 UTC (London/NY overlap — peak volatility)
+  [21 * 60, 24 * 60],   // 21:00–24:00 UTC (pre-Asian accumulation)
+] as const;
+
+/** Returns true when the UTC timestamp falls inside an active crypto trading window. */
+export function isValidCryptoTradingWindow(utcMs: number): boolean {
+  const utcMinutes = Math.floor(utcMs / 60_000) % (24 * 60);
+  return CRYPTO_TRADING_WINDOWS.some(([start, end]) => utcMinutes >= start && utcMinutes < end);
+}
+
 // Backward-compat alias
 export const OPTIONS_TP_PCT = OPTIONS_TP1_PCT;
 

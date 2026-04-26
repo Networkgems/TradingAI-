@@ -13,25 +13,29 @@ export interface OrbOptions {
   maxSpreadPct?: number;
   /** Volume spike multiplier: breakout candle must have volume > N × range average (default: 1.5). */
   volumeSpikeMultiplier?: number;
+  /** Custom time filter. Defaults to ET stock windows. Pass isValidCryptoTradingWindow for crypto. */
+  timeFilter?: (timestampMs: number) => boolean;
 }
 
 /**
  * Opening Range Breakout strategy — improved with:
  *   1. ADX regime filter: skip when ADX < 20 (no trend → breakout likely to fail)
  *   2. Volume spike confluence: breakout candle must have volume > 1.5× range average
- *   3. Time filter: only fires in valid ET trading windows (9:35–11:30, 13:30–15:30)
+ *   3. Time filter: only fires in valid trading windows (ET for stocks; session-gated UTC for crypto)
  */
 export class OrbStrategy {
   private readonly rangeMinutes: number;
   private readonly minVolume: number;
   private readonly maxSpreadPct: number;
   private readonly volumeSpikeMultiplier: number;
+  private readonly timeFilter: (timestampMs: number) => boolean;
 
   constructor(opts: OrbOptions = {}) {
     this.rangeMinutes = opts.rangeMinutes ?? 30;
     this.minVolume = opts.minVolume ?? 10_000;
     this.maxSpreadPct = opts.maxSpreadPct ?? 0.0005;
     this.volumeSpikeMultiplier = opts.volumeSpikeMultiplier ?? 1.5;
+    this.timeFilter = opts.timeFilter ?? isValidTradingWindow;
   }
 
   evaluate(
@@ -44,7 +48,7 @@ export class OrbStrategy {
     const latest = candles[candles.length - 1];
 
     // Time filter: only trade during high-volume windows
-    if (!isValidTradingWindow(latest.timestamp)) return null;
+    if (!this.timeFilter(latest.timestamp)) return null;
 
     const openTime = candles[0].timestamp;
     const rangeCutoff = openTime + this.rangeMinutes * 60 * 1000;
