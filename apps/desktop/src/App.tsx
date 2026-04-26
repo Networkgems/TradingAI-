@@ -171,42 +171,46 @@ function CryptoDashboard({ token, onBack, onLogout }: { token: string; onBack: (
           <span className="subtitle">Reversal · MACD-Bollinger · 20 Symbols · 24/7</span>
         </div>
         <div className="header-right">
-          <div className="header-stats">
-            {account && (
-              <>
+          {account && (
+            <div className="stat-group">
+              <div className="stat">
+                <span className="stat-label">Equity</span>
+                <span className="stat-value">${fmt(account.totalEquity)}</span>
+              </div>
+              <div className="stat">
+                <span className="stat-label">Today P&amp;L</span>
+                <span className={`stat-value ${account.dailyPnl >= 0 ? 'green' : 'red'}`}>
+                  {fmtDollar(account.dailyPnl)}
+                </span>
+              </div>
+              {account.weeklyPnl !== undefined && (
                 <div className="stat">
-                  <span className="stat-label">Equity</span>
-                  <span className="stat-value">${fmt(account.totalEquity)}</span>
-                </div>
-                <div className="stat">
-                  <span className="stat-label">Today P&amp;L</span>
-                  <span className={`stat-value ${account.dailyPnl >= 0 ? 'green' : 'red'}`}>
-                    {fmtDollar(account.dailyPnl)}
+                  <span className="stat-label">Week P&amp;L</span>
+                  <span className={`stat-value ${account.weeklyPnl >= 0 ? 'green' : 'red'}`}>
+                    {fmtDollar(account.weeklyPnl)}
                   </span>
                 </div>
-                {account.weeklyPnl !== undefined && (
-                  <div className="stat">
-                    <span className="stat-label">Week P&amp;L</span>
-                    <span className={`stat-value ${account.weeklyPnl >= 0 ? 'green' : 'red'}`}>
-                      {fmtDollar(account.weeklyPnl)}
-                    </span>
-                  </div>
-                )}
-                <div className="stat">
-                  <span className="stat-label">Cash</span>
-                  <span className="stat-value">${fmt(account.availableCash)}</span>
-                </div>
-                <div className="stat">
-                  <span className="stat-label">Positions</span>
-                  <span className="stat-value">{openPositions.length}</span>
-                </div>
-              </>
-            )}
-          </div>
-          <div className="header-actions">
+              )}
+              <div className="stat">
+                <span className="stat-label">Cash</span>
+                <span className="stat-value">${fmt(account.availableCash)}</span>
+              </div>
+              <div className="stat">
+                <span className="stat-label">Positions</span>
+                <span className="stat-value">{openPositions.length}</span>
+              </div>
+            </div>
+          )}
+          <div className="stat-divider" />
+          <div className="status-group">
             <div className={`status-dot ${connected ? 'live' : 'offline'}`} title={connected ? 'Live' : 'Reconnecting...'} />
-            <span className="status-label">{connected ? 'LIVE' : 'Reconnecting'}</span>
-            {state && <span className="last-tick">Updated {timeAgo(state.lastTick)}</span>}
+            <div className="status-text">
+              <span className="status-label">{connected ? 'LIVE' : 'OFFLINE'}</span>
+              {state && <span className="last-tick">Updated {timeAgo(state.lastTick)}</span>}
+            </div>
+          </div>
+          <div className="stat-divider" />
+          <div className="action-group">
             <button
               className={`logout-btn${autoTradingEnabled ? ' trading-active' : ' trading-stopped'}`}
               onClick={toggleAutoTrading}
@@ -669,9 +673,9 @@ function Dashboard({ token, onLogout, onGoHome }: { token: string; onLogout: () 
           <span className="subtitle">ORB · Reversal · MACD · Ichimoku · 25 Symbols</span>
         </div>
         <div className="header-right">
-          <div className="header-stats">
-            {account && (
-              <>
+          {account && (
+            <>
+              <div className="stat-group">
                 <div className="stat">
                   <span className="stat-label">Equity</span>
                   <span className="stat-value">${fmt(account.totalEquity)}</span>
@@ -690,10 +694,13 @@ function Dashboard({ token, onLogout, onGoHome }: { token: string; onLogout: () 
                   <span className="stat-label">Positions</span>
                   <span className="stat-value">{openPositions.length}</span>
                 </div>
-                {optionsState && (
-                  <>
+              </div>
+              {optionsState && (
+                <>
+                  <div className="stat-divider" />
+                  <div className="stat-group">
                     <div className="stat">
-                      <span className="stat-label">Options P&amp;L</span>
+                      <span className="stat-label">Opts P&amp;L</span>
                       <span className={`stat-value ${optionsState.optionsPnl >= 0 ? 'green' : 'red'}`}>
                         {fmtDollar(optionsState.optionsPnl)}
                       </span>
@@ -708,15 +715,21 @@ function Dashboard({ token, onLogout, onGoHome }: { token: string; onLogout: () 
                         {optionsState.dailyOptionsCount}/{OPTIONS_DAILY_LIMIT}
                       </span>
                     </div>
-                  </>
-                )}
-              </>
-            )}
-          </div>
-          <div className="header-actions">
+                  </div>
+                </>
+              )}
+            </>
+          )}
+          <div className="stat-divider" />
+          <div className="status-group">
             <div className={`status-dot ${connected ? 'live' : 'offline'}`} title={connected ? 'Live' : 'Reconnecting...'} />
-            <span className="status-label">{connected ? 'LIVE' : 'Reconnecting'}</span>
-            {state && <span className="last-tick">Updated {timeAgo(state.lastTick)}</span>}
+            <div className="status-text">
+              <span className="status-label">{connected ? 'LIVE' : 'OFFLINE'}</span>
+              {state && <span className="last-tick">Updated {timeAgo(state.lastTick)}</span>}
+            </div>
+          </div>
+          <div className="stat-divider" />
+          <div className="action-group">
             <button
               className={`logout-btn${autoTradingEnabled ? ' trading-active' : ' trading-stopped'}`}
               onClick={toggleAutoTrading}
