@@ -10,10 +10,10 @@ const MAX_SIGNALS = 50;
 const NEWS_REFRESH_MS = 5 * 60_000;
 
 export class CryptoSignalEngine {
-  // TRA-52: ORB was disabled (24/7 incompatible, -55% avg return when run around the clock).
-  // TRA-70: Re-enabled with session-aware time filter (Asian/London/NY windows only).
-  //   Session-gated ORB avoids the dead zone (04:00–08:00 UTC) that caused the prior losses.
-  //   Range window 60 min (1 × hourly candle) matches crypto session structure.
+  // TRA-52: ORB disabled (24/7 incompatible, -55% avg return around the clock).
+  // TRA-70: Re-enabled with session-aware filter (Asian/London/NY windows only).
+  //   Range window 60 min matches crypto session structure; avoids 04:00–08:00 UTC dead zone.
+  // TRA-75: enforceTimeFilter: false on Reversal/MACD-Bollinger — crypto trades 24/7.
   // MACD-Bollinger: crypto-tuned params (41.7% win rate, +1.73% avg return).
   // Reversal: stock RSI 70/30 thresholds (outperforms 60/40 for crypto).
   private readonly orb = new OrbStrategy({
@@ -22,8 +22,8 @@ export class CryptoSignalEngine {
     volumeSpikeMultiplier: 1.5,
     timeFilter: isValidCryptoTradingWindow,
   });
-  private readonly reversal = new ReversalStrategy();
-  private readonly macdBollinger = new MacdBollingerStrategy({ bbPeriod: 14, bbMultiplier: 2.5, volumeMultiplier: 1.2 });
+  private readonly reversal = new ReversalStrategy({ enforceTimeFilter: false });
+  private readonly macdBollinger = new MacdBollingerStrategy({ bbPeriod: 14, bbMultiplier: 2.5, volumeMultiplier: 1.2, enforceTimeFilter: false });
   private readonly account = new CryptoPaperAccount();
 
   private symbolState: Map<string, CryptoEngineState['symbols'][number]> = new Map();
@@ -80,7 +80,7 @@ export class CryptoSignalEngine {
 
     if (this.autoTradingEnabled) for (const sym of CRYPTO_WATCHLIST) {
       const candles = this.candleCache.get(sym) ?? [];
-      if (candles.length < 15) continue;
+      if (candles.length < 35) continue; // MacdBollinger needs 35 bars minimum
 
       const orbSignal = this.orb.evaluate(sym, candles);
       const reversalSignal = this.reversal.evaluate(sym, candles);

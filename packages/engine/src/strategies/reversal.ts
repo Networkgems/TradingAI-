@@ -15,6 +15,8 @@ export interface ReversalOptions {
   /** RSI oversold threshold (default: 30). */
   rsiOversold?: number;
   lookback?: number;
+  /** Set false for 24/7 markets like crypto (default: true). */
+  enforceTimeFilter?: boolean;
 }
 
 /**
@@ -28,6 +30,7 @@ export class ReversalStrategy {
   private readonly rsiOverbought: number;
   private readonly rsiOversold: number;
   private readonly lookback: number;
+  private readonly enforceTimeFilter: boolean;
   private readonly vwap = new VwapTracker();
   private lastSessionDate = -1;
 
@@ -36,6 +39,7 @@ export class ReversalStrategy {
     this.rsiOverbought = opts.rsiOverbought ?? 70;
     this.rsiOversold = opts.rsiOversold ?? 30;
     this.lookback = opts.lookback ?? 5;
+    this.enforceTimeFilter = opts.enforceTimeFilter ?? true;
   }
 
   evaluate(symbol: string, candles: Candle[]): TradeSignal | null {
@@ -43,8 +47,8 @@ export class ReversalStrategy {
 
     const latest = candles[candles.length - 1];
 
-    // Time filter: avoid midday chop and after-hours noise
-    if (!isValidTradingWindow(latest.timestamp)) return null;
+    // Time filter: avoid midday chop and after-hours noise (equity only; disabled for crypto)
+    if (this.enforceTimeFilter && !isValidTradingWindow(latest.timestamp)) return null;
 
     // Reset VWAP at the start of each trading session (new calendar day)
     const sessionDay = Math.floor(latest.timestamp / 86_400_000);

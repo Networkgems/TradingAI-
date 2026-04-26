@@ -16,6 +16,8 @@ export interface MacdBollingerOptions {
   volumeMultiplier?: number;
   /** Bars to average for volume baseline (default: 20) */
   volumeLookback?: number;
+  /** Set false for 24/7 markets like crypto (default: true). */
+  enforceTimeFilter?: boolean;
 }
 
 /**
@@ -35,6 +37,7 @@ export class MacdBollingerStrategy {
   private readonly bbMultiplier: number;
   private readonly volumeMultiplier: number;
   private readonly volumeLookback: number;
+  private readonly enforceTimeFilter: boolean;
   private readonly vwap = new VwapTracker();
   private lastSessionDate = -1;
 
@@ -43,6 +46,7 @@ export class MacdBollingerStrategy {
     this.bbMultiplier = opts.bbMultiplier ?? 2;
     this.volumeMultiplier = opts.volumeMultiplier ?? 1.5;
     this.volumeLookback = opts.volumeLookback ?? 20;
+    this.enforceTimeFilter = opts.enforceTimeFilter ?? true;
   }
 
   evaluate(symbol: string, candles: Candle[]): TradeSignal | null {
@@ -52,8 +56,8 @@ export class MacdBollingerStrategy {
     const closes = candles.map(c => c.close);
     const latest = candles[candles.length - 1];
 
-    // Time filter: only trade during high-volume windows
-    if (!isValidTradingWindow(latest.timestamp)) return null;
+    // Time filter: only trade during high-volume windows (equity only; disabled for crypto)
+    if (this.enforceTimeFilter && !isValidTradingWindow(latest.timestamp)) return null;
 
     const cross = macdCross(closes);
     if (!cross) return null;
