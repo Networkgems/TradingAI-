@@ -1150,20 +1150,6 @@ tr:hover td { background: #1c2128; }
 }
 
 @media (max-width: 480px) {
-  /* Header: actions row first, stats scrollable below */
-  .header-right { gap: 0.4rem; }
-
-  /* Actions always on top, right-aligned */
-  .header-actions {
-    order: -1;
-    width: 100%;
-    justify-content: flex-end;
-    gap: 0.5rem;
-  }
-
-  /* Stats take full width and scroll horizontally */
-  .header-stats { width: 100%; }
-
   /* Hide the subtitle to save vertical space on phone */
   .subtitle { display: none; }
   .status-label { display: none; }
