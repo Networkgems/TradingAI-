@@ -131,15 +131,16 @@ export class SignalEngine {
     });
   }
 
-  /** Apply new demo account settings and reset both accounts. */
+  /** Apply account settings and reset both accounts. Uses 0 equity for live mode (no connected brokerage). */
   applySettings(settings: AccountSettings): void {
+    const equity = settings.mode === 'live' ? 0 : settings.demoEquity;
     this.account.reset({
-      initialEquity: settings.demoEquity,
+      initialEquity: equity,
       managedAccountRatio: settings.managedAccountRatio,
       riskPerTrade: settings.riskPerTrade,
     });
     this.optionsAccount.reset({
-      initialEquity: settings.demoEquity,
+      initialEquity: equity,
       managedAccountRatio: settings.managedAccountRatio,
       dailyTradesLimit: settings.dailyTradesLimit,
     });

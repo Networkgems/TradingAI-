@@ -461,10 +461,8 @@ app.put('/api/account/settings', requireAuth, async (req, res) => {
     riskPerTrade: Math.max(0.001, Math.min(0.5, Number(body.riskPerTrade ?? current.riskPerTrade))),
   };
   await saveSettings(updated);
-  if (updated.mode === 'demo') {
-    engine.applySettings(updated);
-    broadcastEngineState();
-  }
+  engine.applySettings(updated);
+  broadcastEngineState();
   cryptoEngine.applySettings(updated);
   broadcastCryptoState();
   res.json({ ok: true, settings: updated });
