@@ -287,7 +287,7 @@ function CryptoDashboard({ token, onBack, onLogout }: { token: string; onBack: (
       </nav>
 
       {tab === 'settings' && (
-        <SettingsPage token={token} httpUrl={HTTP_URL} context="crypto" />
+        <SettingsPage token={token} httpUrl={HTTP_URL} context="crypto" onModeChange={setAccountMode} />
       )}
 
       {profileModal === 'change-password' && (
@@ -841,7 +841,7 @@ function Dashboard({ token, onLogout, onGoHome }: { token: string; onLogout: () 
       </nav>
 
       {tab === 'settings' && (
-        <SettingsPage token={token} httpUrl={HTTP_URL} context="stocks" />
+        <SettingsPage token={token} httpUrl={HTTP_URL} context="stocks" onModeChange={setAccountMode} />
       )}
 
       <main className="content">

@@ -6,6 +6,7 @@ interface Props {
   token: string;
   httpUrl: string;
   context?: 'crypto' | 'stocks';
+  onModeChange?: (mode: 'demo' | 'live') => void;
 }
 
 type SaveStatus = 'idle' | 'saving' | 'saved' | 'error';
@@ -425,7 +426,7 @@ export function UserManagementSection({ token, httpUrl }: { token: string; httpU
   );
 }
 
-export default function SettingsPage({ token, httpUrl, context }: Props) {
+export default function SettingsPage({ token, httpUrl, context, onModeChange }: Props) {
   const [settings, setSettings] = useState<AccountSettings>(DEFAULT_ACCOUNT_SETTINGS);
   const [loading, setLoading] = useState(true);
   const [saveStatus, setSaveStatus] = useState<SaveStatus>('idle');
@@ -464,6 +465,7 @@ export default function SettingsPage({ token, httpUrl, context }: Props) {
       if (r.ok) {
         setSaveStatus('saved');
         setTimeout(() => setSaveStatus('idle'), 2000);
+        onModeChange?.(settings.mode);
       } else {
         setSaveStatus('error');
       }
