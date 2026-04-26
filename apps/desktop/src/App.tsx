@@ -168,7 +168,7 @@ function CryptoDashboard({ token, onBack, onLogout }: { token: string; onBack: (
         <div className="header-left">
           <button className="back-btn" onClick={onBack} title="Back to dashboard selector">&#8592; Home</button>
           <h1>TradingAI <span className="mode-badge crypto">Crypto</span></h1>
-          <span className="subtitle">Reversal · MACD · Ichimoku · 20 Symbols · 24/7</span>
+          <span className="subtitle">Reversal · MACD-Bollinger · 20 Symbols · 24/7</span>
         </div>
         <div className="header-right">
           {account && (
