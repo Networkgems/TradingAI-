@@ -1024,12 +1024,36 @@ tr:hover td { background: #1c2128; }
   }
   .tabs::-webkit-scrollbar { display: none; }
 
-  /* Header: wrap gracefully, hide timestamp */
+  /* Header: stack left then right, each full-width */
   .header {
     flex-wrap: wrap;
     gap: 0.4rem;
+    align-items: flex-start;
+  }
+  .header-left {
+    width: 100%;
   }
   .last-tick { display: none; }
+
+  /* Header-right: horizontally scrollable so Settings/Profile are always reachable */
+  .header-right {
+    width: 100%;
+    overflow-x: auto;
+    -webkit-overflow-scrolling: touch;
+    scrollbar-width: none;
+    gap: 0.8rem;
+    padding-bottom: 2px;
+  }
+  .header-right::-webkit-scrollbar { display: none; }
+
+  /* Prevent any header-right item from shrinking or disappearing */
+  .header-right .stat,
+  .header-right .logout-btn,
+  .header-right .profile-wrap,
+  .header-right .status-dot,
+  .header-right .status-label {
+    flex-shrink: 0;
+  }
 
   /* Settings page: single-column grid */
   .settings-grid { grid-template-columns: 1fr !important; }
@@ -1040,6 +1064,7 @@ tr:hover td { background: #1c2128; }
 
   /* Buttons: 44px touch targets */
   button.primary, .btn-primary { min-height: 44px; }
+  .logout-btn { min-height: 36px; padding: 0.4rem 0.7rem; }
 
   /* Tables: horizontal scroll */
   .watchlist-table,
@@ -1074,11 +1099,18 @@ tr:hover td { background: #1c2128; }
     margin: 0 1rem;
     max-width: calc(100vw - 2rem);
   }
+
+  /* Profile dropdown: anchor to viewport right edge on narrow screens */
+  .profile-dropdown {
+    position: fixed;
+    right: 0.5rem;
+    top: auto;
+  }
 }
 
 @media (max-width: 480px) {
-  /* Header: show only essential stats */
-  .header-stat:not(.stat-equity):not(.stat-daily-pnl):not(.stat-cash) {
+  /* Header: hide non-essential stats to reduce scroll distance to action buttons */
+  .header-right .stat:not(:first-child):not(:nth-child(2)) {
     display: none;
   }
   .status-label { display: none; }
