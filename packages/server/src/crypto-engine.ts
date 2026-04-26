@@ -68,6 +68,10 @@ export class CryptoSignalEngine {
     }
   }
 
+  refresh(): void {
+    this.tick().catch(() => {});
+  }
+
   getActiveSymbols(): string[] {
     const base = (CRYPTO_WATCHLIST as readonly string[]).filter(s => !this.hiddenSymbols.has(s));
     return [...base, ...Array.from(this.dynamicSymbols).filter(s => !base.includes(s))];

@@ -169,6 +169,10 @@ export class SignalEngine {
     }
   }
 
+  refresh(): void {
+    this.tick().catch(() => {});
+  }
+
   private async tick(): Promise<void> {
     if (Date.now() - this.lastNewsRefresh > NEWS_REFRESH_MS) {
       const news = await fetchStocksNews();

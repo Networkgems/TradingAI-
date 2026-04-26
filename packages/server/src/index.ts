@@ -585,6 +585,7 @@ app.post('/api/watchlist/crypto', requireAuth, async (req, res) => {
   const sym = symbol.trim().toUpperCase();
   await addCryptoSymbol(sym);
   cryptoEngine.addSymbol(sym);
+  cryptoEngine.refresh();
   res.json({ ok: true, symbol: sym });
 });
 
@@ -605,6 +606,7 @@ app.post('/api/watchlist/crypto/scan', requireAuth, async (_req, res) => {
       await addCryptoSymbol(r.symbol);
       cryptoEngine.addSymbol(r.symbol);
     }
+    cryptoEngine.refresh();
     res.json({ ok: true, added: results.map(r => r.symbol) });
   } catch (err) {
     res.status(500).json({ error: String(err) });
@@ -624,6 +626,7 @@ app.post('/api/watchlist/stocks', requireAuth, async (req, res) => {
   const sym = symbol.trim().toUpperCase();
   await addStocksSymbol(sym);
   engine.addSymbol(sym);
+  engine.refresh();
   res.json({ ok: true, symbol: sym });
 });
 
@@ -644,6 +647,7 @@ app.post('/api/watchlist/stocks/scan', requireAuth, async (_req, res) => {
       await addStocksSymbol(r.symbol);
       engine.addSymbol(r.symbol);
     }
+    engine.refresh();
     res.json({ ok: true, added: results.map(r => r.symbol) });
   } catch (err) {
     res.status(500).json({ error: String(err) });
