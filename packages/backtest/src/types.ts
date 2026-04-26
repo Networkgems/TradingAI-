@@ -1,11 +1,27 @@
 import { Position } from '@trading-app/shared';
 
+export interface BacktestReversalOpts {
+  rsiPeriod?: number;
+  rsiOverbought?: number;
+  rsiOversold?: number;
+  lookback?: number;
+}
+
+export interface BacktestMacdBollingerOpts {
+  bbPeriod?: number;
+  bbMultiplier?: number;
+  volumeMultiplier?: number;
+  volumeLookback?: number;
+}
+
 export interface BacktestConfig {
   symbol: string;
   startDate: number;
   endDate: number;
   initialEquity: number;
-  strategyType: 'orb' | 'reversal' | 'macd' | 'ichimoku' | 'combined';
+  strategyType: 'orb' | 'reversal' | 'macd' | 'ichimoku' | 'combined' | 'macd_bollinger';
+  reversalOpts?: BacktestReversalOpts;
+  macdBollingerOpts?: BacktestMacdBollingerOpts;
 }
 
 export interface BacktestResult {

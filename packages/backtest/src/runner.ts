@@ -48,7 +48,7 @@ export class BacktestRunner {
         const s = reversal.evaluate(config.symbol, window);
         if (s) signals.push(s);
       }
-      if (config.strategyType === 'macd' || config.strategyType === 'combined') {
+      if (config.strategyType === 'macd' || config.strategyType === 'macd_bollinger' || config.strategyType === 'combined') {
         const s = macd.evaluate(config.symbol, window);
         if (s) signals.push(s);
       }
