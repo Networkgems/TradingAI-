@@ -10,7 +10,7 @@ import { CryptoSignalEngine } from './crypto-engine.js';
 import { MarketScheduler } from './scheduler.js';
 import { generateEodReport } from './reports/eod-report.js';
 import { generateCryptoEodReport } from './reports/crypto-eod-report.js';
-import { createToken, verifyToken, generateResetToken, consumeResetToken } from './auth.js';
+import { createToken, verifyToken, generateResetToken, consumeResetToken, initResetTokenStore } from './auth.js';
 import { loadSettings, getSettings, saveSettings } from './account-settings.js';
 import {
   initWatchlistStore,
@@ -51,8 +51,9 @@ if (!existsSync(CRYPTO_REPORTS_DIR)) {
   await mkdir(CRYPTO_REPORTS_DIR, { recursive: true });
 }
 
-// Load users before starting
+// Load users and reset tokens from persistent storage
 await loadUsers();
+initResetTokenStore(DATA_DIR);
 
 const app = express();
 

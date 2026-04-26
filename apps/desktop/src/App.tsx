@@ -1368,7 +1368,9 @@ type AuthScreen = 'login' | 'forgot' | 'signup';
 export default function App() {
   const [token, setToken] = useState<string | null>(() => localStorage.getItem('auth_token'));
   const [tokenChecked, setTokenChecked] = useState<boolean>(() => !localStorage.getItem('auth_token'));
-  const [authScreen, setAuthScreen] = useState<AuthScreen>('login');
+  const [authScreen, setAuthScreen] = useState<AuthScreen>(() =>
+    new URLSearchParams(window.location.search).has('reset_code') ? 'forgot' : 'login'
+  );
   const [appMode, setAppMode] = useState<null | 'stocks' | 'crypto'>(() => {
     const stored = localStorage.getItem('tradingMode');
     return stored === 'stocks' || stored === 'crypto' ? stored : null;
