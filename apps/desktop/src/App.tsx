@@ -133,7 +133,7 @@ function CryptoDashboard({ token, onBack, onLogout }: { token: string; onBack: (
       .then(r => r.ok ? r.json() : null)
       .then((s: { mode?: 'demo' | 'live' } | null) => { if (s?.mode) setAccountMode(s.mode); })
       .catch(() => {});
-  }, [token]);
+  }, [tab, token]);
 
   useEffect(() => {
     if (!profileOpen) return;
@@ -633,7 +633,7 @@ function Dashboard({ token, onLogout, onGoHome }: { token: string; onLogout: () 
       .then(r => r.ok ? r.json() : null)
       .then((s: { mode?: 'demo' | 'live' } | null) => { if (s?.mode) setAccountMode(s.mode); })
       .catch(() => {});
-  }, [token]);
+  }, [tab, token]);
 
   useEffect(() => {
     if (!profileOpen) return;
