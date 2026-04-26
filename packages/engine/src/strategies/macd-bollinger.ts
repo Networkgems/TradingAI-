@@ -1,7 +1,9 @@
-import { Candle, TradeSignal, Side } from '@trading-app/shared';
+import { Candle, TradeSignal, Side, ADX_TRENDING_THRESHOLD, isValidTradingWindow } from '@trading-app/shared';
 import { randomUUID } from 'crypto';
 import { macdCross } from '../indicators/macd.js';
 import { bollinger, bollingerZone } from '../indicators/bollinger.js';
+import { VwapTracker } from '../indicators/vwap.js';
+import { adx } from '../indicators/adx.js';
 import type { AlpacaOrderClient } from '../alpaca/index.js';
 import type { RiskManager } from '../risk.js';
 
@@ -17,10 +19,14 @@ export interface MacdBollingerOptions {
 }
 
 /**
- * MACD-Bollinger confluence strategy.
+ * MACD-Bollinger confluence strategy — improved with:
+ *   1. VWAP directional filter: buy only when price is above VWAP; sell only below
+ *   2. ADX trending bias: require ADX ≥ 25 for best signal quality (trend strategy)
+ *   3. Time filter: only fires in valid ET trading windows
  *
- * Buy:  MACD bullish cross + price at/below BB middle + above-average volume
- * Sell: MACD bearish cross + price at/above BB middle + above-average volume
+ * Entry logic:
+ *   Buy:  MACD bullish cross + price at/below BB middle + above VWAP + volume + ADX trending
+ *   Sell: MACD bearish cross + price at/above BB middle + below VWAP + volume + ADX trending
  *
  * Stop loss at the opposite BB band; take-profit at 2:1 R:R.
  */
@@ -29,6 +35,8 @@ export class MacdBollingerStrategy {
   private readonly bbMultiplier: number;
   private readonly volumeMultiplier: number;
   private readonly volumeLookback: number;
+  private readonly vwap = new VwapTracker();
+  private lastSessionDate = -1;
 
   constructor(opts: MacdBollingerOptions = {}) {
     this.bbPeriod = opts.bbPeriod ?? 20;
@@ -44,6 +52,9 @@ export class MacdBollingerStrategy {
     const closes = candles.map(c => c.close);
     const latest = candles[candles.length - 1];
 
+    // Time filter: only trade during high-volume windows
+    if (!isValidTradingWindow(latest.timestamp)) return null;
+
     const cross = macdCross(closes);
     if (!cross) return null;
 
@@ -57,15 +68,37 @@ export class MacdBollingerStrategy {
     const volumeConfirm = latest.volume > avgVolume * this.volumeMultiplier;
     if (!volumeConfirm) return null;
 
+    // ADX regime filter: MACD is a trend strategy — require trending market
+    const adxResult = adx(candles);
+    if (adxResult && adxResult.adx < ADX_TRENDING_THRESHOLD) return null;
+
+    // VWAP directional filter
+    const sessionDay = Math.floor(latest.timestamp / 86_400_000);
+    if (sessionDay !== this.lastSessionDate) {
+      this.vwap.reset();
+      this.lastSessionDate = sessionDay;
+    }
+    let vwapState = { vwap: 0, stdDev: 0, upperBand: 0, lowerBand: 0 };
+    for (const c of candles) vwapState = this.vwap.update(c);
+    const aboveVwap = latest.close > vwapState.vwap;
+
     let side: Side | null = null;
 
-    // Bullish: MACD cross up + price not yet extended above middle (potential rally room)
-    if (cross === 'bullish' && (zone === 'near_lower' || zone === 'below_lower' || zone === 'middle')) {
+    // Bullish: MACD cross up + price not yet extended above middle + price above VWAP
+    if (
+      cross === 'bullish' &&
+      (zone === 'near_lower' || zone === 'below_lower' || zone === 'middle') &&
+      aboveVwap
+    ) {
       side = 'buy';
     }
 
-    // Bearish: MACD cross down + price near or above middle (potential drop room)
-    if (cross === 'bearish' && (zone === 'near_upper' || zone === 'above_upper' || zone === 'middle')) {
+    // Bearish: MACD cross down + price near or above middle + price below VWAP
+    if (
+      cross === 'bearish' &&
+      (zone === 'near_upper' || zone === 'above_upper' || zone === 'middle') &&
+      !aboveVwap
+    ) {
       side = 'sell';
     }
 

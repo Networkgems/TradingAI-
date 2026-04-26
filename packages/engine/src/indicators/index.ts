@@ -9,3 +9,5 @@ export { bollinger, bollingerZone } from './bollinger.js';
 export type { BollingerState } from './bollinger.js';
 export { ichimoku, tkCross } from './ichimoku.js';
 export type { IchimokuState } from './ichimoku.js';
+export { adx } from './adx.js';
+export type { AdxResult } from './adx.js';

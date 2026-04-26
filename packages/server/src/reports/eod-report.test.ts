@@ -45,6 +45,8 @@ function makeEngineState(overrides: Partial<EngineState> = {}): EngineState {
       dailyOptionsCount: 0,
     },
     lastTick: Date.now(),
+    tradingHalted: false,
+    haltReason: null,
     ...overrides,
   };
 }

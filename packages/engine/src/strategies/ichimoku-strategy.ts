@@ -1,14 +1,18 @@
-import { Candle, TradeSignal, Side } from '@trading-app/shared';
+import { Candle, TradeSignal, Side, ADX_TRENDING_THRESHOLD, isValidTradingWindow } from '@trading-app/shared';
 import { randomUUID } from 'crypto';
 import { ichimoku, tkCross } from '../indicators/ichimoku.js';
+import { adx } from '../indicators/adx.js';
 import type { AlpacaOrderClient } from '../alpaca/index.js';
 import type { RiskManager } from '../risk.js';
 
 /**
- * Ichimoku Cloud strategy.
+ * Ichimoku Cloud strategy — improved with:
+ *   1. ADX trending confirmation: require ADX ≥ 25 (cloud signals are trend-following)
+ *   2. Explicit cloud thickness check: price must be fully outside the cloud, not inside
+ *   3. Time filter: only fires in valid ET trading windows
  *
- * Buy:  Bullish TK cross + price above cloud + chikou span confirms bullish momentum
- * Sell: Bearish TK cross + price below cloud + chikou span confirms bearish momentum
+ * Buy:  Bullish TK cross + price above cloud top + chikou confirms + ADX trending
+ * Sell: Bearish TK cross + price below cloud bottom + chikou confirms + ADX trending
  *
  * Stop loss at kijun-sen (base line); take-profit at 2:1 R:R.
  * Requires ≥ 79 candles (78 for ichimoku + 1 for TK cross comparison).
@@ -17,20 +21,28 @@ export class IchimokuStrategy {
   evaluate(symbol: string, candles: Candle[]): TradeSignal | null {
     if (candles.length < 79) return null;
 
+    const latest = candles[candles.length - 1];
+
+    // Time filter: only trade during high-volume windows
+    if (!isValidTradingWindow(latest.timestamp)) return null;
+
     const cloud = ichimoku(candles);
     if (!cloud) return null;
 
     const cross = tkCross(candles);
     if (!cross) return null;
 
-    const latest = candles[candles.length - 1];
+    // ADX regime filter: Ichimoku is a trend-following system
+    const adxResult = adx(candles);
+    if (adxResult && adxResult.adx < ADX_TRENDING_THRESHOLD) return null;
+
     const price = latest.close;
 
     let side: Side | null = null;
 
     if (
       cross === 'bullish' &&
-      price > cloud.cloudTop &&
+      price > cloud.cloudTop &&   // price fully above cloud (not inside it)
       cloud.chikouAbove
     ) {
       side = 'buy';
@@ -38,7 +50,7 @@ export class IchimokuStrategy {
 
     if (
       cross === 'bearish' &&
-      price < cloud.cloudBottom &&
+      price < cloud.cloudBottom && // price fully below cloud (not inside it)
       !cloud.chikouAbove
     ) {
       side = 'sell';
@@ -47,7 +59,6 @@ export class IchimokuStrategy {
     if (!side) return null;
 
     const entryPrice = price;
-    // Kijun-sen acts as dynamic support/resistance — use as stop level
     const stopLoss = side === 'buy'
       ? Math.min(cloud.kijun, cloud.cloudBottom)
       : Math.max(cloud.kijun, cloud.cloudTop);

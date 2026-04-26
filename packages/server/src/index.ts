@@ -6,10 +6,12 @@ import { existsSync } from 'fs';
 import { join, dirname } from 'path';
 import { fileURLToPath } from 'url';
 import { SignalEngine } from './signal-engine.js';
+import { CryptoSignalEngine } from './crypto-engine.js';
 import { MarketScheduler } from './scheduler.js';
 import { generateEodReport } from './reports/eod-report.js';
 import { createToken, verifyToken, generateResetToken, consumeResetToken } from './auth.js';
 import { loadSettings, getSettings, saveSettings } from './account-settings.js';
+import { PnlTracker } from './pnl-tracker.js';
 import {
   loadUsers,
   validateUserCredentials,
@@ -28,6 +30,7 @@ import { DEFAULT_ACCOUNT_SETTINGS } from '@trading-app/shared';
 const PORT = Number(process.env.PORT ?? 4242);
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const REPORTS_DIR = join(__dirname, '..', 'reports');
+const DATA_DIR = join(__dirname, '..', 'data');
 
 if (!existsSync(REPORTS_DIR)) {
   await mkdir(REPORTS_DIR, { recursive: true });
@@ -86,7 +89,9 @@ function requireAdmin(req: express.Request, res: express.Response, next: express
 // ── Engines ───────────────────────────────────────────────────────────────────
 
 const initialSettings = await loadSettings();
-const engine = new SignalEngine(initialSettings);
+const tracker = new PnlTracker(DATA_DIR, initialSettings.demoEquity);
+const engine = new SignalEngine(initialSettings, tracker);
+const cryptoEngine = new CryptoSignalEngine();
 const scheduler = new MarketScheduler();
 
 // ── EOD Report generation ────────────────────────────────────────────────────
@@ -105,6 +110,18 @@ async function generateAndSaveReport(): Promise<void> {
     writeFile(latestJsonPath, JSON.stringify(report, null, 2), 'utf-8'),
     writeFile(latestMdPath, report.markdown, 'utf-8'),
   ]);
+
+  // Persist daily equity snapshot for cumulative tracking
+  const equitySnap = engine.getEquitySnapshot();
+  tracker.saveSnapshot({
+    date: report.date,
+    openingEquity: tracker.getOpeningEquity(),
+    closingEquity: equitySnap.equity,
+    dailyPnl: equitySnap.equity - tracker.getOpeningEquity(),
+    optionsPnl: equitySnap.optionsPnl,
+    combinedPnl: (equitySnap.equity - tracker.getOpeningEquity()) + equitySnap.optionsPnl,
+    trades: snapshot.allClosedPositions.length,
+  });
 
   console.log(`[reports] EOD report saved → ${datePath}`);
 
@@ -256,6 +273,14 @@ app.get('/api/state', requireAuth, (_req, res) => {
   res.json(engine.getState());
 });
 
+app.get('/api/crypto/state', requireAuth, (_req, res) => {
+  res.json(cryptoEngine.getState());
+});
+
+app.get('/api/crypto/news', requireAuth, (_req, res) => {
+  res.json(cryptoEngine.getNews());
+});
+
 app.get('/api/reports/latest', requireAuth, async (_req, res) => {
   const latestPath = join(REPORTS_DIR, 'latest.json');
   if (!existsSync(latestPath)) {
@@ -310,6 +335,10 @@ app.post('/api/reports/generate', requireAuth, async (_req, res) => {
   } catch (err) {
     res.status(500).json({ error: String(err) });
   }
+});
+
+app.get('/api/snapshots', requireAuth, (_req, res) => {
+  res.json(tracker.getSnapshots());
 });
 
 // ── Account Settings ─────────────────────────────────────────────────────────
@@ -372,6 +401,7 @@ httpServer.on('upgrade', (req, socket, head) => {
 
 wss.on('connection', async (ws) => {
   ws.send(JSON.stringify({ type: 'state', payload: engine.getState() }));
+  ws.send(JSON.stringify({ type: 'crypto_state', payload: cryptoEngine.getState() }));
 
   const latestPath = join(REPORTS_DIR, 'latest.json');
   if (existsSync(latestPath)) {
@@ -391,6 +421,13 @@ engine.onTick((state) => {
   }
 });
 
+cryptoEngine.onTick((state) => {
+  const msg = JSON.stringify({ type: 'crypto_state', payload: state });
+  for (const client of wss.clients) {
+    if (client.readyState === WebSocket.OPEN) client.send(msg);
+  }
+});
+
 // ── Static frontend (production web) ────────────────────────────────────────
 // When the Vite build exists alongside this server, serve it so the web PWA
 // and the API share the same origin (avoids CORS and makes WS auth simpler).
@@ -406,6 +443,7 @@ if (existsSync(DIST_DIR)) {
 // ── Start ────────────────────────────────────────────────────────────────────
 
 engine.start();
+cryptoEngine.start();
 scheduler.start(generateAndSaveReport);
 
 httpServer.listen(PORT, () => {
@@ -416,6 +454,7 @@ httpServer.listen(PORT, () => {
 
 process.on('SIGINT', () => {
   engine.stop();
+  cryptoEngine.stop();
   scheduler.stop();
   process.exit(0);
 });

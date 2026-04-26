@@ -3,10 +3,14 @@ import type { TradeSignal, OptionPosition, OptionsAccountState } from '@trading-
 import {
   DEFAULT_ACCOUNT_SETTINGS,
   OPTIONS_BUDGET_RATIO,
-  OPTIONS_TP_PCT,
+  OPTIONS_TP1_PCT,
   OPTIONS_SL_PCT,
   OPTIONS_ATM_PREMIUM_RATIO,
+  OPTIONS_DAILY_LIMIT,
+  OPTIONS_TRAIL_ACTIVATE_PCT,
   OPTIONS_TRAIL_OFFSET_PCT,
+  OPTIONS_PARTIAL_EXIT_RATIO,
+  isValidTradingWindow,
 } from '@trading-app/shared';
 
 const ATM_DELTA = 0.50;
@@ -21,6 +25,16 @@ interface OptionsAccountConfig {
   dailyTradesLimit?: number;
 }
 
+/**
+ * Paper options account — improved per TRA-40:
+ *
+ *   • SL tightened to −25% (was −35%) for better R:R
+ *   • Trailing stop activates at +20% gain (was at TP1 +25%)
+ *   • Trail offset tightened to 12% below peak (was 15%)
+ *   • Partial exit: 50% of contracts closed at TP1 (+25%); remaining half trailed
+ *   • Daily limit reduced to 4 high-quality trades (was 10)
+ *   • Time filter: only open options during valid ET trading windows
+ */
 export class PaperOptionsAccount {
   private initialEquity: number;
   private managedAccountRatio: number;
@@ -79,7 +93,10 @@ export class PaperOptionsAccount {
   openOption(signal: TradeSignal, underlyingPrice: number): OptionPosition | null {
     this.resetDayIfNeeded();
 
-    if (this.dailyCount >= this.dailyTradesLimit) return null;
+    // Time filter: only open options during high-volume trading windows
+    if (!isValidTradingWindow(Date.now())) return null;
+
+    if (this.dailyCount >= OPTIONS_DAILY_LIMIT) return null;
 
     const existing = Array.from(this.openOptions.values()).find(
       o => o.symbol === signal.symbol && o.signalType === signal.type,
@@ -101,21 +118,26 @@ export class PaperOptionsAccount {
     this.cash -= totalCost;
     this.dailyCount += 1;
 
-    const takeProfitPremium = premiumPaid * (1 + OPTIONS_TP_PCT);
+    const tp1Premium = premiumPaid * (1 + OPTIONS_TP1_PCT);
     const stopLossPremium = premiumPaid * (1 - OPTIONS_SL_PCT);
+    // Trailing activates when position is up 20% (before TP1)
+    const trailActivatePremium = premiumPaid * (1 + OPTIONS_TRAIL_ACTIVATE_PCT);
 
     const position: OptionPosition = {
       id: randomUUID(),
       symbol: signal.symbol,
       optionType,
       contracts,
+      contractsRemaining: contracts,
       premiumPaid,
       currentPremium: premiumPaid,
-      takeProfitPremium,
+      tp1Premium,
+      tp1Hit: false,
       stopLossPremium,
       peakPremium: premiumPaid,
       trailingActive: false,
-      trailingStopPremium: stopLossPremium,
+      // Store trailActivatePremium in trailingStopPremium until trailing is engaged
+      trailingStopPremium: trailActivatePremium,
       underlyingEntryPrice: underlyingPrice,
       openedAt: Date.now(),
       signalId: signal.id,
@@ -126,6 +148,12 @@ export class PaperOptionsAccount {
     return position;
   }
 
+  /**
+   * Update mark prices and handle exits:
+   *   1. Partial exit (50% contracts) when premium hits TP1 (+25%)
+   *   2. Trailing stop activates at +20% gain; trails 12% below peak
+   *   3. Full exit when hard SL (−25%) or trailing stop is breached
+   */
   checkExits(underlyingPrices: Map<string, number>): OptionPosition[] {
     const closed: OptionPosition[] = [];
 
@@ -138,18 +166,36 @@ export class PaperOptionsAccount {
       const mark = Math.max(0.01, opt.premiumPaid + premiumMove);
       opt.currentPremium = mark;
 
-      if (mark > opt.peakPremium) {
-        opt.peakPremium = mark;
-      }
+      if (mark > opt.peakPremium) opt.peakPremium = mark;
 
-      if (!opt.trailingActive && mark >= opt.takeProfitPremium) {
+      // Activate trailing once position reaches +20% gain
+      if (!opt.trailingActive && mark >= opt.premiumPaid * (1 + OPTIONS_TRAIL_ACTIVATE_PCT)) {
         opt.trailingActive = true;
+        opt.trailingStopPremium = opt.peakPremium * (1 - OPTIONS_TRAIL_OFFSET_PCT);
       }
 
+      // Keep trailing stop updated at 12% below peak while active
       if (opt.trailingActive) {
         opt.trailingStopPremium = opt.peakPremium * (1 - OPTIONS_TRAIL_OFFSET_PCT);
       }
 
+      // Partial exit at TP1 (+25%): sell half the contracts, trail the rest
+      if (!opt.tp1Hit && mark >= opt.tp1Premium && opt.contractsRemaining > 1) {
+        const exitContracts = Math.floor(opt.contractsRemaining * OPTIONS_PARTIAL_EXIT_RATIO);
+        if (exitContracts > 0) {
+          const partialPnl = (mark - opt.premiumPaid) * exitContracts * 100;
+          this.cash += mark * exitContracts * 100;
+          this.equity += partialPnl;
+          this.optionsPnl += partialPnl;
+          opt.contractsRemaining -= exitContracts;
+          opt.tp1Hit = true;
+          // After partial exit, trailing is engaged on the remainder
+          opt.trailingActive = true;
+          opt.trailingStopPremium = opt.peakPremium * (1 - OPTIONS_TRAIL_OFFSET_PCT);
+        }
+      }
+
+      // Determine full exit: hard SL or trailing stop breach
       let exitPremium: number | null = null;
 
       if (mark <= opt.stopLossPremium) {
@@ -159,12 +205,14 @@ export class PaperOptionsAccount {
       }
 
       if (exitPremium !== null) {
-        const pnl = (exitPremium - opt.premiumPaid) * opt.contracts * 100;
-        opt.pnl = pnl;
+        const remainingContracts = opt.contractsRemaining;
+        const pnl = (exitPremium - opt.premiumPaid) * remainingContracts * 100;
+        opt.pnl = (opt.pnl ?? 0) + pnl;
         opt.closedAt = Date.now();
         opt.currentPremium = exitPremium;
+        opt.contractsRemaining = 0;
 
-        this.cash += exitPremium * opt.contracts * 100;
+        this.cash += exitPremium * remainingContracts * 100;
         this.equity += pnl;
         this.optionsPnl += pnl;
 
