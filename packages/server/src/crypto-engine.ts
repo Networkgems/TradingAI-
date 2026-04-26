@@ -35,6 +35,7 @@ export class CryptoSignalEngine {
   private hiddenSymbols: Set<string> = new Set();
 
   private tickTimer: ReturnType<typeof setInterval> | null = null;
+  private tickRunning = false;
   private handlers: CryptoEngineEventHandler[] = [];
   private autoTradingEnabled = true;
 
@@ -94,6 +95,16 @@ export class CryptoSignalEngine {
   }
 
   private async tick(): Promise<void> {
+    if (this.tickRunning) return;
+    this.tickRunning = true;
+    try {
+      await this.doTick();
+    } finally {
+      this.tickRunning = false;
+    }
+  }
+
+  private async doTick(): Promise<void> {
     const activeSymbols = this.getActiveSymbols();
     const quotes = await fetchCryptoQuotes(activeSymbols);
 
@@ -110,14 +121,26 @@ export class CryptoSignalEngine {
       });
     }
 
+    // Broadcast watchlist state early so the UI populates without waiting for candles
+    if (this.symbolState.size > 0) {
+      const earlyState = this.buildState();
+      for (const h of this.handlers) h(earlyState);
+    }
+
     const closed = this.account.checkExits(prices);
     if (closed.length > 0) {
       this.allClosedPositions.push(...closed);
     }
 
-    for (const sym of activeSymbols) {
-      await this.refreshCandles(sym);
-      await this.refreshDailyCandles(sym);
+    // Fetch candles in parallel batches to avoid 60-100s sequential delay for 50 symbols
+    const CANDLE_BATCH = 5;
+    for (let i = 0; i < activeSymbols.length; i += CANDLE_BATCH) {
+      await Promise.all(
+        activeSymbols.slice(i, i + CANDLE_BATCH).map(sym => this.refreshCandles(sym)),
+      );
+      await Promise.all(
+        activeSymbols.slice(i, i + CANDLE_BATCH).map(sym => this.refreshDailyCandles(sym)),
+      );
     }
 
     if (this.autoTradingEnabled) for (const sym of activeSymbols) {
