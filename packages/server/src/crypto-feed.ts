@@ -43,6 +43,30 @@ async function fetchCMCBatchQuotes(
   }
 }
 
+export async function fetchCryptoDailyBars(symbol: string, count = 260): Promise<Candle[]> {
+  try {
+    const now = new Date();
+    const from = new Date(now.getTime() - count * 24 * 60 * 60 * 1000 * 1.5); // fetch with buffer
+    const result = await yf.chart(symbol, { period1: from, period2: now, interval: '1d' });
+    const quotes = result.quotes ?? [];
+    return quotes
+      .filter(q => q.open != null && q.high != null && q.low != null && q.close != null && q.volume != null)
+      .filter(q => (q.volume ?? 0) > 0)
+      .map(q => ({
+        symbol,
+        timestamp: new Date(q.date).getTime(),
+        open: q.open!,
+        high: q.high!,
+        low: q.low!,
+        close: q.close!,
+        volume: q.volume!,
+      }))
+      .slice(-count);
+  } catch {
+    return [];
+  }
+}
+
 export async function fetchCryptoMinuteBars(symbol: string, count = 60): Promise<Candle[]> {
   try {
     const now = new Date();

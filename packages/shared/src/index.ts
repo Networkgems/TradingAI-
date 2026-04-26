@@ -2,7 +2,7 @@
 
 export type Side = 'buy' | 'sell';
 export type OrderStatus = 'pending' | 'filled' | 'cancelled' | 'rejected';
-export type SignalType = 'orb_breakout' | 'reversal' | 'macd_cross' | 'ichimoku';
+export type SignalType = 'orb_breakout' | 'reversal' | 'macd_cross' | 'ichimoku' | 'scalping' | 'swing_trade';
 export type OptionType = 'call' | 'put';
 
 export interface Candle {
@@ -255,7 +255,7 @@ export interface MarketQuote {
 export interface EodTradeEntry {
   id: string;
   symbol: string;
-  strategy: 'ORB' | 'Reversal' | 'MACD' | 'Ichimoku';
+  strategy: 'ORB' | 'Reversal' | 'MACD' | 'Ichimoku' | 'Scalping' | 'Swing';
   side: Side;
   entryPrice: number;
   exitPrice: number;

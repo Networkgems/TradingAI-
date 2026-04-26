@@ -1,7 +1,7 @@
-import { ReversalStrategy, MacdBollingerStrategy } from '@trading-app/engine';
+import { ReversalStrategy, MacdBollingerStrategy, ScalpingStrategy, SwingStrategy } from '@trading-app/engine';
 import { CRYPTO_WATCHLIST } from '@trading-app/shared';
 import type { TradeSignal, Candle, AccountState, Position, CryptoEngineState, NewsItem, AccountSettings } from '@trading-app/shared';
-import { fetchCryptoMinuteBars, fetchCryptoQuotes, fetchCryptoNews } from './crypto-feed.js';
+import { fetchCryptoMinuteBars, fetchCryptoDailyBars, fetchCryptoQuotes, fetchCryptoNews } from './crypto-feed.js';
 import { CryptoPaperAccount } from './crypto-account.js';
 
 export type CryptoEngineEventHandler = (state: CryptoEngineState) => void;
@@ -15,13 +15,17 @@ export class CryptoSignalEngine {
   // TRA-75: enforceTimeFilter: false on Reversal/MACD-Bollinger — crypto trades 24/7.
   // MACD-Bollinger: crypto-tuned params (41.7% win rate, +1.73% avg return).
   // Reversal: stock RSI 70/30 thresholds (outperforms 60/40 for crypto).
+  // TRA-107: Scalping (1-min, 9/21 EMA + VWAP + RSI(9) + volume) and Swing (daily, 50/200 EMA + RSI(14) + MACD).
   private readonly reversal = new ReversalStrategy({ enforceTimeFilter: false });
   private readonly macdBollinger = new MacdBollingerStrategy({ bbPeriod: 14, bbMultiplier: 2.5, volumeMultiplier: 1.2, enforceTimeFilter: false });
+  private readonly scalping = new ScalpingStrategy({ enforceTimeFilter: false });
+  private readonly swing = new SwingStrategy();
   private readonly account: CryptoPaperAccount;
   private initialEquity: number;
 
   private symbolState: Map<string, CryptoEngineState['symbols'][number]> = new Map();
   private candleCache: Map<string, Candle[]> = new Map();
+  private dailyCandleCache: Map<string, Candle[]> = new Map();
   private recentSignals: TradeSignal[] = [];
   private allClosedPositions: Position[] = [];
   private newsCache: NewsItem[] = [];
@@ -109,16 +113,21 @@ export class CryptoSignalEngine {
 
     for (const sym of activeSymbols) {
       await this.refreshCandles(sym);
+      await this.refreshDailyCandles(sym);
     }
 
     if (this.autoTradingEnabled) for (const sym of activeSymbols) {
       const candles = this.candleCache.get(sym) ?? [];
+      const dailyCandles = this.dailyCandleCache.get(sym) ?? [];
+
       if (candles.length < 35) continue; // MacdBollinger needs 35 bars minimum
 
       const reversalSignal = this.reversal.evaluate(sym, candles);
       const macdSignal = this.macdBollinger.evaluate(sym, candles);
+      const scalpingSignal = this.scalping.evaluate(sym, candles);
+      const swingSignal = dailyCandles.length >= 205 ? this.swing.evaluate(sym, dailyCandles) : null;
 
-      for (const signal of [reversalSignal, macdSignal]) {
+      for (const signal of [reversalSignal, macdSignal, scalpingSignal, swingSignal]) {
         if (!signal) continue;
         if (this.account.hasOpenPositionForSignalType(sym, signal.type)) continue;
         const recent = this.recentSignals.find(
@@ -147,6 +156,18 @@ export class CryptoSignalEngine {
   private async refreshCandles(symbol: string): Promise<void> {
     const bars = await fetchCryptoMinuteBars(symbol, 80);
     if (bars.length > 0) this.candleCache.set(symbol, bars);
+  }
+
+  private async refreshDailyCandles(symbol: string): Promise<void> {
+    // Only refresh once per hour to avoid redundant API calls — daily bars change once per day
+    const cached = this.dailyCandleCache.get(symbol);
+    if (cached && cached.length > 0) {
+      const lastBar = cached[cached.length - 1];
+      const hourMs = 60 * 60 * 1000;
+      if (Date.now() - lastBar.timestamp < hourMs) return;
+    }
+    const bars = await fetchCryptoDailyBars(symbol, 260);
+    if (bars.length > 0) this.dailyCandleCache.set(symbol, bars);
   }
 
   private buildState(): CryptoEngineState {
