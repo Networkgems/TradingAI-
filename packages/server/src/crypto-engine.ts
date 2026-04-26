@@ -1,5 +1,5 @@
-import { ReversalStrategy, MacdBollingerStrategy, OrbStrategy } from '@trading-app/engine';
-import { CRYPTO_WATCHLIST, isValidCryptoTradingWindow } from '@trading-app/shared';
+import { ReversalStrategy, MacdBollingerStrategy } from '@trading-app/engine';
+import { CRYPTO_WATCHLIST } from '@trading-app/shared';
 import type { TradeSignal, Candle, AccountState, Position, CryptoEngineState, NewsItem, AccountSettings } from '@trading-app/shared';
 import { fetchCryptoMinuteBars, fetchCryptoQuotes, fetchCryptoNews } from './crypto-feed.js';
 import { CryptoPaperAccount } from './crypto-account.js';
@@ -11,17 +11,10 @@ const NEWS_REFRESH_MS = 5 * 60_000;
 
 export class CryptoSignalEngine {
   // TRA-52: ORB disabled (24/7 incompatible, -55% avg return around the clock).
-  // TRA-70: Re-enabled with session-aware filter (Asian/London/NY windows only).
-  //   Range window 60 min matches crypto session structure; avoids 04:00–08:00 UTC dead zone.
+  // TRA-70: Re-enabled with session-aware filter — reverted by TRA-106 (no true open range for crypto).
   // TRA-75: enforceTimeFilter: false on Reversal/MACD-Bollinger — crypto trades 24/7.
   // MACD-Bollinger: crypto-tuned params (41.7% win rate, +1.73% avg return).
   // Reversal: stock RSI 70/30 thresholds (outperforms 60/40 for crypto).
-  private readonly orb = new OrbStrategy({
-    rangeMinutes: 60,
-    minVolume: 1,
-    volumeSpikeMultiplier: 1.5,
-    timeFilter: isValidCryptoTradingWindow,
-  });
   private readonly reversal = new ReversalStrategy({ enforceTimeFilter: false });
   private readonly macdBollinger = new MacdBollingerStrategy({ bbPeriod: 14, bbMultiplier: 2.5, volumeMultiplier: 1.2, enforceTimeFilter: false });
   private readonly account: CryptoPaperAccount;
@@ -97,11 +90,10 @@ export class CryptoSignalEngine {
       const candles = this.candleCache.get(sym) ?? [];
       if (candles.length < 35) continue; // MacdBollinger needs 35 bars minimum
 
-      const orbSignal = this.orb.evaluate(sym, candles);
       const reversalSignal = this.reversal.evaluate(sym, candles);
       const macdSignal = this.macdBollinger.evaluate(sym, candles);
 
-      for (const signal of [orbSignal, reversalSignal, macdSignal]) {
+      for (const signal of [reversalSignal, macdSignal]) {
         if (!signal) continue;
         if (this.account.hasOpenPositionForSignalType(sym, signal.type)) continue;
         const recent = this.recentSignals.find(
