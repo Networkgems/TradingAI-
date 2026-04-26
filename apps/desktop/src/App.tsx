@@ -65,6 +65,7 @@ function CryptoDashboard({ token, onBack, onLogout }: { token: string; onBack: (
   const [profileModal, setProfileModal] = useState<null | 'change-password' | 'user-management'>(null);
   const [isAdmin, setIsAdmin] = useState(false);
   const [tradingToggling, setTradingToggling] = useState(false);
+  const [accountMode, setAccountMode] = useState<'demo' | 'live'>('demo');
   const wsRef = useRef<WebSocket | null>(null);
   const reconnectTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
 
@@ -128,6 +129,13 @@ function CryptoDashboard({ token, onBack, onLogout }: { token: string; onBack: (
   }, [token]);
 
   useEffect(() => {
+    fetch(`${HTTP_URL}/api/account/settings`, { headers: { Authorization: `Bearer ${token}` } })
+      .then(r => r.ok ? r.json() : null)
+      .then((s: { mode?: 'demo' | 'live' } | null) => { if (s?.mode) setAccountMode(s.mode); })
+      .catch(() => {});
+  }, [token]);
+
+  useEffect(() => {
     if (!profileOpen) return;
     function handleClick(e: MouseEvent) {
       if (!(e.target as HTMLElement).closest('.profile-wrap')) setProfileOpen(false);
@@ -168,7 +176,7 @@ function CryptoDashboard({ token, onBack, onLogout }: { token: string; onBack: (
         <div className="header-left">
           <button className="back-btn" onClick={onBack} title="Back to dashboard selector">&#8592; Home</button>
           <h1>TradingAI <span className="mode-badge crypto">Crypto</span></h1>
-          <span className="subtitle">Reversal · MACD-Bollinger · 20 Symbols · 24/7</span>
+          <span className={`account-mode-badge ${accountMode}`}>{accountMode === 'demo' ? 'Demo Account' : 'Live Account'}</span>
         </div>
         <div className="header-right">
           {account && (
@@ -550,6 +558,7 @@ function Dashboard({ token, onLogout, onGoHome }: { token: string; onLogout: () 
   const [profileOpen, setProfileOpen] = useState(false);
   const [profileModal, setProfileModal] = useState<null | 'change-password' | 'user-management'>(null);
   const [isAdmin, setIsAdmin] = useState(false);
+  const [accountMode, setAccountMode] = useState<'demo' | 'live'>('demo');
   const wsRef = useRef<WebSocket | null>(null);
   const reconnectTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
 
@@ -620,6 +629,13 @@ function Dashboard({ token, onLogout, onGoHome }: { token: string; onLogout: () 
   }, [token]);
 
   useEffect(() => {
+    fetch(`${HTTP_URL}/api/account/settings`, { headers: { Authorization: `Bearer ${token}` } })
+      .then(r => r.ok ? r.json() : null)
+      .then((s: { mode?: 'demo' | 'live' } | null) => { if (s?.mode) setAccountMode(s.mode); })
+      .catch(() => {});
+  }, [token]);
+
+  useEffect(() => {
     if (!profileOpen) return;
     function handleClick(e: MouseEvent) {
       if (!(e.target as HTMLElement).closest('.profile-wrap')) setProfileOpen(false);
@@ -670,7 +686,7 @@ function Dashboard({ token, onLogout, onGoHome }: { token: string; onLogout: () 
         <div className="header-left">
           <button className="back-btn" onClick={onGoHome} title="Back to dashboard selector">&#8592; Home</button>
           <h1>TradingAI <span className="mode-badge stocks">Stocks</span></h1>
-          <span className="subtitle">ORB · Reversal · MACD · Ichimoku · 25 Symbols</span>
+          <span className={`account-mode-badge ${accountMode}`}>{accountMode === 'demo' ? 'Demo Account' : 'Live Account'}</span>
         </div>
         <div className="header-right">
           {account && (

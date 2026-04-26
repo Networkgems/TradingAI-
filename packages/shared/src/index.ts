@@ -180,10 +180,16 @@ export const WATCHLIST: readonly string[] = [
 ] as const;
 
 export const CRYPTO_WATCHLIST: readonly string[] = [
-  'BTC-USD', 'ETH-USD', 'BNB-USD',  'SOL-USD',  'ADA-USD',
-  'DOT-USD', 'AVAX-USD','LINK-USD', 'MATIC-USD','XRP-USD',
-  'LTC-USD', 'BCH-USD', 'ATOM-USD', 'DOGE-USD', 'SHIB-USD',
-  'NEAR-USD','FTM-USD', 'SAND-USD', 'MANA-USD', 'AXS-USD',
+  'BTC-USD',   'ETH-USD',   'BNB-USD',   'SOL-USD',   'ADA-USD',
+  'DOT-USD',   'AVAX-USD',  'LINK-USD',  'MATIC-USD', 'XRP-USD',
+  'LTC-USD',   'BCH-USD',   'ATOM-USD',  'DOGE-USD',  'SHIB-USD',
+  'NEAR-USD',  'FTM-USD',   'SAND-USD',  'MANA-USD',  'AXS-USD',
+  'UNI-USD',   'AAVE-USD',  'MKR-USD',   'CRV-USD',   'ALGO-USD',
+  'XLM-USD',   'ETC-USD',   'TRX-USD',   'FIL-USD',   'VET-USD',
+  'THETA-USD', 'HBAR-USD',  'ICP-USD',   'FLOW-USD',  'GRT-USD',
+  'ARB-USD',   'OP-USD',    'APT-USD',   'SUI-USD',   'INJ-USD',
+  'RUNE-USD',  'RNDR-USD',  'IMX-USD',   'EGLD-USD',  'LDO-USD',
+  'SNX-USD',   'APE-USD',   'COMP-USD',  'CHZ-USD',   'ZEC-USD',
 ] as const;
 
 export interface NewsItem {
