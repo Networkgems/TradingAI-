@@ -1071,7 +1071,17 @@ tr:hover td { background: #1c2128; }
   }
   .header-left {
     width: 100%;
+    display: flex;
+    align-items: center;
+    flex-wrap: wrap;
+    gap: 0.3rem 0.5rem;
   }
+  /* h1 stays inline inside flex; badge naturally wraps on very small viewports */
+  .header-left h1 { display: flex; align-items: center; gap: 0.35rem; }
+  /* account-mode-badge: reset margin since flex gap handles spacing */
+  .account-mode-badge { margin-left: 0; }
+  /* back-btn: adequate touch target */
+  .back-btn { min-height: 36px; }
   .last-tick { display: none; }
 
   /* Header-right: single scrollable row on mobile */
