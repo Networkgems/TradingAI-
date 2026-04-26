@@ -714,7 +714,7 @@ export default function SettingsPage({ token, httpUrl, context, onModeChange }: 
       {/* ── Profile / Change Password / User Management (hidden in crypto/stocks context) */}
       {!context && <ProfileSection token={token} httpUrl={httpUrl} />}
       {!context && <ChangePasswordSection token={token} httpUrl={httpUrl} />}
-      {!context && isAdmin && <UserManagementSection token={token} httpUrl={httpUrl} />}
+      {isAdmin && <UserManagementSection token={token} httpUrl={httpUrl} />}
     </div>
   );
 }
