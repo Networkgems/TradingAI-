@@ -1177,6 +1177,7 @@ tr:hover td { background: #1c2128; }
 /* ── Dashboard Selector ─────────────────────────────────────────────────────── */
 
 .selector-screen {
+  position: relative;
   display: flex;
   flex-direction: column;
   align-items: center;
@@ -1186,6 +1187,12 @@ tr:hover td { background: #1c2128; }
   padding-top: env(safe-area-inset-top);
   padding-bottom: env(safe-area-inset-bottom);
   gap: 3rem;
+}
+
+.selector-topbar {
+  position: absolute;
+  top: calc(1rem + env(safe-area-inset-top));
+  right: 1.5rem;
 }
 
 .selector-header { text-align: center; }

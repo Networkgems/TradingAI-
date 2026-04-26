@@ -34,9 +34,12 @@ function BitcoinIcon() {
   );
 }
 
-function DashboardSelector({ onSelect }: { onSelect: (mode: 'stocks' | 'crypto') => void }) {
+function DashboardSelector({ onSelect, onLogout }: { onSelect: (mode: 'stocks' | 'crypto') => void; onLogout: () => void }) {
   return (
     <div className="selector-screen">
+      <div className="selector-topbar">
+        <button className="logout-btn" onClick={onLogout}>Sign Out</button>
+      </div>
       <div className="selector-header">
         <h1 className="selector-title">TradingAI</h1>
         <p className="selector-subtitle">Select your trading dashboard</p>
@@ -1356,7 +1359,7 @@ export default function App() {
   if (!tokenChecked) return null;
 
   const mainContent = appMode === null
-    ? <DashboardSelector onSelect={selectMode} />
+    ? <DashboardSelector onSelect={selectMode} onLogout={handleLogout} />
     : appMode === 'crypto'
       ? <CryptoDashboard token={token} onBack={goHome} onLogout={handleLogout} />
       : <Dashboard token={token} onLogout={handleLogout} onGoHome={goHome} />;
