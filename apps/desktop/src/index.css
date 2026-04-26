@@ -1291,6 +1291,43 @@ tr:hover td { background: #1c2128; }
   margin-bottom: 0.5rem;
 }
 
+/* ── Idle Warning Banner ─────────────────────────────────────────────────── */
+
+.idle-warning-banner {
+  position: fixed;
+  bottom: 1.5rem;
+  left: 50%;
+  transform: translateX(-50%);
+  display: flex;
+  align-items: center;
+  gap: 1rem;
+  background: #2d1f07;
+  border: 1px solid #f0a500;
+  border-radius: 8px;
+  padding: 0.75rem 1.25rem;
+  color: #f0c060;
+  font-size: 0.85rem;
+  z-index: 300;
+  box-shadow: 0 4px 16px rgba(0, 0, 0, 0.5);
+  white-space: nowrap;
+}
+
+.idle-warning-btn {
+  background: #f0a500;
+  color: #1a1208;
+  border: none;
+  border-radius: 5px;
+  padding: 0.3rem 0.85rem;
+  font-size: 0.8rem;
+  font-weight: 600;
+  cursor: pointer;
+  flex-shrink: 0;
+}
+
+.idle-warning-btn:hover {
+  background: #f5b830;
+}
+
 @media (max-width: 768px) {
   .selector-cards { flex-direction: column; align-items: center; }
   .selector-card { width: 90vw; max-width: 320px; padding: 1.5rem; }

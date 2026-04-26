@@ -1274,6 +1274,9 @@ function Dashboard({ token, onLogout, onGoHome }: { token: string; onLogout: () 
   );
 }
 
+const IDLE_TIMEOUT_MS = 30 * 60 * 1000;
+const IDLE_WARN_MS = 2 * 60 * 1000;
+
 type AuthScreen = 'login' | 'forgot';
 
 export default function App() {
@@ -1283,6 +1286,10 @@ export default function App() {
     const stored = localStorage.getItem('tradingMode');
     return stored === 'stocks' || stored === 'crypto' ? stored : null;
   });
+  const [idleWarning, setIdleWarning] = useState(false);
+  const idleTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const warnTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const resetIdleTimerRef = useRef<() => void>(() => {});
 
   function handleLogout() {
     localStorage.removeItem('auth_token');
@@ -1290,7 +1297,30 @@ export default function App() {
     setToken(null);
     setAuthScreen('login');
     setAppMode(null);
+    setIdleWarning(false);
   }
+
+  function resetIdleTimer() {
+    if (idleTimerRef.current) clearTimeout(idleTimerRef.current);
+    if (warnTimerRef.current) clearTimeout(warnTimerRef.current);
+    setIdleWarning(false);
+    warnTimerRef.current = setTimeout(() => setIdleWarning(true), IDLE_TIMEOUT_MS - IDLE_WARN_MS);
+    idleTimerRef.current = setTimeout(handleLogout, IDLE_TIMEOUT_MS);
+  }
+  resetIdleTimerRef.current = resetIdleTimer;
+
+  useEffect(() => {
+    if (!token) return;
+    const handler = () => resetIdleTimerRef.current();
+    const events = ['mousemove', 'mousedown', 'keydown', 'touchstart', 'scroll'] as const;
+    events.forEach(ev => document.addEventListener(ev, handler, { passive: true }));
+    resetIdleTimerRef.current();
+    return () => {
+      events.forEach(ev => document.removeEventListener(ev, handler));
+      if (idleTimerRef.current) clearTimeout(idleTimerRef.current);
+      if (warnTimerRef.current) clearTimeout(warnTimerRef.current);
+    };
+  }, [token]);
 
   function selectMode(mode: 'stocks' | 'crypto') {
     localStorage.setItem('tradingMode', mode);
@@ -1309,13 +1339,21 @@ export default function App() {
     return <LoginPage onLogin={setToken} onForgotPassword={() => setAuthScreen('forgot')} />;
   }
 
-  if (appMode === null) {
-    return <DashboardSelector onSelect={selectMode} />;
-  }
+  const mainContent = appMode === null
+    ? <DashboardSelector onSelect={selectMode} />
+    : appMode === 'crypto'
+      ? <CryptoDashboard token={token} onBack={goHome} onLogout={handleLogout} />
+      : <Dashboard token={token} onLogout={handleLogout} onGoHome={goHome} />;
 
-  if (appMode === 'crypto') {
-    return <CryptoDashboard token={token} onBack={goHome} onLogout={handleLogout} />;
-  }
-
-  return <Dashboard token={token} onLogout={handleLogout} onGoHome={goHome} />;
+  return (
+    <>
+      {mainContent}
+      {idleWarning && (
+        <div className="idle-warning-banner">
+          <span>You've been idle — you'll be signed out automatically in 2 minutes.</span>
+          <button className="idle-warning-btn" onClick={() => resetIdleTimerRef.current()}>Stay signed in</button>
+        </div>
+      )}
+    </>
+  );
 }
