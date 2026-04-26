@@ -1,7 +1,7 @@
 import { OrbStrategy, ReversalStrategy, MacdBollingerStrategy, IchimokuStrategy } from '@trading-app/engine';
 import { WATCHLIST, MANAGED_ACCOUNT_RATIO, MAX_CONSECUTIVE_LOSSES, DAILY_DRAWDOWN_HALT_PCT } from '@trading-app/shared';
-import type { TradeSignal, Candle, OptionsAccountState, SignalType, Position, AccountSettings } from '@trading-app/shared';
-import { fetchMinuteBars, fetchQuotes } from './yahoo-feed.js';
+import type { TradeSignal, Candle, OptionsAccountState, SignalType, Position, AccountSettings, NewsItem } from '@trading-app/shared';
+import { fetchMinuteBars, fetchQuotes, fetchStocksNews } from './yahoo-feed.js';
 import { PaperAccount } from './paper-account.js';
 import { PaperOptionsAccount } from './options-account.js';
 import type { DailySignalRecord } from './reports/eod-report.js';
@@ -32,6 +32,7 @@ export interface EngineState {
 export type EngineEventHandler = (state: EngineState) => void;
 
 const MAX_SIGNALS = 50;
+const NEWS_REFRESH_MS = 5 * 60_000;
 
 /**
  * Tracks daily consecutive losses and cumulative P&L to enforce circuit-breakers:
@@ -102,6 +103,8 @@ export class SignalEngine {
   private candleCache: Map<string, Candle[]> = new Map();
   private recentSignals: TradeSignal[] = [];
   private allClosedPositions: Position[] = [];
+  private newsCache: NewsItem[] = [];
+  private lastNewsRefresh = 0;
 
   private dailySignals: DailySignalRecord[] = [];
   private positionSignalType: Map<string, SignalType> = new Map();
@@ -163,6 +166,12 @@ export class SignalEngine {
   }
 
   private async tick(): Promise<void> {
+    if (Date.now() - this.lastNewsRefresh > NEWS_REFRESH_MS) {
+      const news = await fetchStocksNews();
+      if (news.length > 0) this.newsCache = news;
+      this.lastNewsRefresh = Date.now();
+    }
+
     const quotes = await fetchQuotes(WATCHLIST);
 
     const prices = new Map<string, number>();
@@ -319,6 +328,10 @@ export class SignalEngine {
       haltReason: this.riskGovernor.getHaltReason(),
       autoTradingEnabled: this.autoTradingEnabled,
     };
+  }
+
+  getNews(): NewsItem[] {
+    return [...this.newsCache];
   }
 
   getReportSnapshot() {

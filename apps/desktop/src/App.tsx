@@ -536,7 +536,8 @@ function Dashboard({ token, onLogout, onGoHome }: { token: string; onLogout: () 
   const [eodReport, setEodReport] = useState<EodReport | null>(null);
   const [eodCollapsed, setEodCollapsed] = useState(false);
   const [connected, setConnected] = useState(false);
-  const [tab, setTab] = useState<'watchlist' | 'signals' | 'positions' | 'options' | 'settings' | 'calendar'>('watchlist');
+  const [tab, setTab] = useState<'watchlist' | 'signals' | 'positions' | 'options' | 'news' | 'settings' | 'calendar'>('watchlist');
+  const [news, setNews] = useState<NewsItem[]>([]);
   const [tradingToggling, setTradingToggling] = useState(false);
   const wsRef = useRef<WebSocket | null>(null);
   const reconnectTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
@@ -586,6 +587,20 @@ function Dashboard({ token, onLogout, onGoHome }: { token: string; onLogout: () 
     }, 5000);
     return () => clearInterval(id);
   }, [connected, token, onLogout]);
+
+  useEffect(() => {
+    async function loadNews() {
+      try {
+        const r = await fetch(`${HTTP_URL}/api/news`, {
+          headers: { Authorization: `Bearer ${token}` },
+        });
+        if (r.ok) setNews(await r.json() as NewsItem[]);
+      } catch { /* ignore */ }
+    }
+    loadNews();
+    const id = setInterval(loadNews, 5 * 60_000);
+    return () => clearInterval(id);
+  }, [token]);
 
   const account = state?.account;
   const signals = state?.signals ?? [];
@@ -707,6 +722,9 @@ function Dashboard({ token, onLogout, onGoHome }: { token: string; onLogout: () 
              `Options (${openOptions.length})`}
           </button>
         ))}
+        <button className={`tab ${tab === 'news' ? 'active' : ''}`} onClick={() => setTab('news')}>
+          {`News (${news.length})`}
+        </button>
         <button className={`tab ${tab === 'calendar' ? 'active' : ''}`} onClick={() => setTab('calendar')}>
           Calendar
         </button>
@@ -985,6 +1003,36 @@ function Dashboard({ token, onLogout, onGoHome }: { token: string; onLogout: () 
                 <span>Options Cash: <strong>${fmt(optionsState.optionsCash)}</strong></span>
                 <span>Total Options P&amp;L: <strong className={optionsState.optionsPnl >= 0 ? 'green' : 'red'}>{fmtDollar(optionsState.optionsPnl)}</strong></span>
                 <span>Daily Trades: <strong className={optionsState.dailyOptionsCount >= OPTIONS_DAILY_LIMIT ? 'red' : ''}>{optionsState.dailyOptionsCount}/{OPTIONS_DAILY_LIMIT}</strong></span>
+              </div>
+            )}
+          </div>
+        )}
+
+        {tab === 'news' && (
+          <div className="signals-panel">
+            {news.length === 0 ? (
+              <div className="empty">Loading market news…</div>
+            ) : (
+              <div className="signal-list">
+                {news.slice(0, 10).map((item) => (
+                  <div key={item.url} className="news-card">
+                    <div className="signal-header">
+                      <span className="signal-symbol">{item.source}</span>
+                      <span className="signal-time muted">{timeAgo(new Date(item.publishedAt).getTime())}</span>
+                    </div>
+                    <div style={{ padding: '0.5rem 0' }}>
+                      <a href={item.url} target="_blank" rel="noopener noreferrer"
+                         style={{ color: 'var(--blue)', textDecoration: 'none', fontWeight: 500 }}>
+                        {item.title}
+                      </a>
+                      {item.summary && (
+                        <p style={{ marginTop: '0.3rem', color: 'var(--muted)', fontSize: '0.75rem', lineHeight: 1.5 }}>
+                          {item.summary}
+                        </p>
+                      )}
+                    </div>
+                  </div>
+                ))}
               </div>
             )}
           </div>

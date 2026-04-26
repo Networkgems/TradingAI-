@@ -304,6 +304,10 @@ app.get('/api/crypto/news', requireAuth, (_req, res) => {
   res.json(cryptoEngine.getNews());
 });
 
+app.get('/api/news', requireAuth, (_req, res) => {
+  res.json(engine.getNews());
+});
+
 app.get('/api/reports/latest', requireAuth, async (_req, res) => {
   const latestPath = join(REPORTS_DIR, 'latest.json');
   if (!existsSync(latestPath)) {

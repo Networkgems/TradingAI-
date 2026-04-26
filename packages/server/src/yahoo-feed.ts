@@ -1,5 +1,5 @@
 import YahooFinance from 'yahoo-finance2';
-import type { Candle } from '@trading-app/shared';
+import type { Candle, NewsItem } from '@trading-app/shared';
 
 const yf = new YahooFinance({ validation: { logErrors: false } });
 
@@ -62,4 +62,18 @@ export async function fetchQuotes(symbols: readonly string[]): Promise<Map<strin
     await sleep(200); // 200 ms gap — ~5 s for 25 symbols, well under Yahoo Finance rate limits
   }
   return results;
+}
+
+export async function fetchStocksNews(): Promise<NewsItem[]> {
+  try {
+    const results = await yf.search('stocks market NYSE trading', { newsCount: 10, quotesCount: 0 });
+    return (results.news ?? []).map(n => ({
+      title: n.title,
+      url: n.link,
+      source: n.publisher ?? 'Yahoo Finance',
+      publishedAt: new Date(Number(n.providerPublishTime ?? 0) * 1000).toISOString(),
+    }));
+  } catch {
+    return [];
+  }
 }
