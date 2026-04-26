@@ -2,6 +2,11 @@ import { useState } from 'react';
 
 const HTTP_URL = (import.meta.env.VITE_SERVER_URL ?? 'ws://localhost:4242').replace(/^ws/, 'http');
 
+function getUrlResetCode(): string {
+  const params = new URLSearchParams(window.location.search);
+  return params.get('reset_code') ?? '';
+}
+
 type Step = 'request' | 'reset' | 'done';
 
 interface Props {
@@ -9,9 +14,18 @@ interface Props {
 }
 
 export default function ForgotPasswordPage({ onBack }: Props) {
-  const [step, setStep] = useState<Step>('request');
+  const urlCode = getUrlResetCode();
+  const [step, setStep] = useState<Step>(urlCode ? 'reset' : 'request');
   const [email, setEmail] = useState('');
-  const [code, setCode] = useState('');
+  const [code, setCode] = useState(() => {
+    if (urlCode) {
+      // Remove the token from the URL so it isn't shared or bookmarked
+      const url = new URL(window.location.href);
+      url.searchParams.delete('reset_code');
+      window.history.replaceState(null, '', url.toString());
+    }
+    return urlCode;
+  });
   const [newPassword, setNewPassword] = useState('');
   const [confirmPassword, setConfirmPassword] = useState('');
   const [error, setError] = useState('');

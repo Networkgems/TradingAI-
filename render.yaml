@@ -2,9 +2,13 @@ services:
   - type: web
     name: tradingai-server
     runtime: node
-    plan: free
+    plan: starter
     buildCommand: pnpm install --frozen-lockfile && pnpm run web:build
     startCommand: node packages/server/dist/index.js
+    disk:
+      name: tradingai-data
+      mountPath: /data
+      sizeGB: 1
     envVars:
       - key: AUTH_SECRET
         generateValue: true
@@ -12,3 +16,17 @@ services:
         value: production
       - key: NODE_VERSION
         value: 20.19.0
+      - key: DATA_DIR
+        value: /data
+      - key: APP_URL
+        sync: false
+      - key: SMTP_HOST
+        sync: false
+      - key: SMTP_PORT
+        value: 587
+      - key: SMTP_USER
+        sync: false
+      - key: SMTP_PASS
+        sync: false
+      - key: SMTP_FROM
+        value: noreply@tradingai.app
