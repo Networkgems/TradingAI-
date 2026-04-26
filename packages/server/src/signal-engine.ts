@@ -109,6 +109,9 @@ export class SignalEngine {
   private dailySignals: DailySignalRecord[] = [];
   private positionSignalType: Map<string, SignalType> = new Map();
 
+  private dynamicSymbols: Set<string> = new Set();
+  private hiddenSymbols: Set<string> = new Set();
+
   private tickTimer: ReturnType<typeof setInterval> | null = null;
   private handlers: EngineEventHandler[] = [];
   private autoTradingEnabled = true;
@@ -173,7 +176,8 @@ export class SignalEngine {
       this.lastNewsRefresh = Date.now();
     }
 
-    const quotes = await fetchQuotes(WATCHLIST);
+    const activeSymbols = this.getActiveSymbols();
+    const quotes = await fetchQuotes(activeSymbols);
 
     const prices = new Map<string, number>();
     for (const [sym, q] of quotes) {
@@ -220,14 +224,14 @@ export class SignalEngine {
       );
     }
 
-    for (const sym of WATCHLIST) {
+    for (const sym of activeSymbols) {
       await this.refreshCandles(sym);
     }
 
     // If auto trading is disabled or daily risk circuit-breaker is active, skip new entries
     if (this.autoTradingEnabled && !this.riskGovernor.isHalted()) {
       // Run strategies and collect new signals
-      for (const sym of WATCHLIST) {
+      for (const sym of activeSymbols) {
         const candles = this.candleCache.get(sym) ?? [];
         if (candles.length < 15) continue;
 
@@ -270,7 +274,7 @@ export class SignalEngine {
     }
 
     const state: EngineState = {
-      symbols: Array.from(this.symbolState.values()),
+      symbols: Array.from(this.symbolState.values()).filter(s => !this.hiddenSymbols.has(s.symbol)),
       signals: [...this.recentSignals],
       account: this.account.getState(),
       closedPositions: [...this.allClosedPositions].slice(-20),
@@ -287,6 +291,27 @@ export class SignalEngine {
   private async refreshCandles(symbol: string): Promise<void> {
     const bars = await fetchMinuteBars(symbol, 80);
     if (bars.length > 0) this.candleCache.set(symbol, bars);
+  }
+
+  getActiveSymbols(): string[] {
+    const base = (WATCHLIST as readonly string[]).filter(s => !this.hiddenSymbols.has(s));
+    return [...base, ...Array.from(this.dynamicSymbols).filter(s => !base.includes(s))];
+  }
+
+  addSymbol(symbol: string): void {
+    this.hiddenSymbols.delete(symbol);
+    if (!(WATCHLIST as readonly string[]).includes(symbol)) {
+      this.dynamicSymbols.add(symbol);
+    }
+  }
+
+  removeSymbol(symbol: string): void {
+    if ((WATCHLIST as readonly string[]).includes(symbol)) {
+      this.hiddenSymbols.add(symbol);
+    } else {
+      this.dynamicSymbols.delete(symbol);
+    }
+    this.symbolState.delete(symbol);
   }
 
   setAutoTrading(enabled: boolean): void {
@@ -319,7 +344,7 @@ export class SignalEngine {
 
   getState(): EngineState {
     return {
-      symbols: Array.from(this.symbolState.values()),
+      symbols: Array.from(this.symbolState.values()).filter(s => !this.hiddenSymbols.has(s.symbol)),
       signals: [...this.recentSignals],
       account: this.account.getState(),
       closedPositions: [...this.allClosedPositions].slice(-20),

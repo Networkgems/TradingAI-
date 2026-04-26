@@ -135,6 +135,8 @@ function CryptoDashboard({ token, onBack, onLogout }: { token: string; onBack: (
   const [isAdmin, setIsAdmin] = useState(false);
   const [tradingToggling, setTradingToggling] = useState(false);
   const [accountMode, setAccountMode] = useState<'demo' | 'live'>('demo');
+  const [watchlistInput, setWatchlistInput] = useState('');
+  const [scanning, setScanning] = useState(false);
   const wsRef = useRef<WebSocket | null>(null);
   const reconnectTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
 
@@ -228,6 +230,36 @@ function CryptoDashboard({ token, onBack, onLogout }: { token: string; onBack: (
       method: 'POST',
       headers: { Authorization: `Bearer ${token}` },
     }).catch(() => {});
+  }
+
+  async function addToWatchlist() {
+    const sym = watchlistInput.trim().toUpperCase();
+    if (!sym) return;
+    setWatchlistInput('');
+    await fetch(`${HTTP_URL}/api/watchlist/crypto`, {
+      method: 'POST',
+      headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' },
+      body: JSON.stringify({ symbol: sym }),
+    }).catch(() => {});
+  }
+
+  async function removeFromWatchlist(symbol: string) {
+    await fetch(`${HTTP_URL}/api/watchlist/crypto/${encodeURIComponent(symbol)}`, {
+      method: 'DELETE',
+      headers: { Authorization: `Bearer ${token}` },
+    }).catch(() => {});
+  }
+
+  async function scanCryptoMarket() {
+    setScanning(true);
+    try {
+      await fetch(`${HTTP_URL}/api/watchlist/crypto/scan`, {
+        method: 'POST',
+        headers: { Authorization: `Bearer ${token}` },
+      });
+    } catch { /* ignore */ } finally {
+      setScanning(false);
+    }
   }
 
   return (
@@ -362,10 +394,23 @@ function CryptoDashboard({ token, onBack, onLogout }: { token: string; onBack: (
 
         {state && tab === 'watchlist' && (
           <div className="watchlist">
+            <div className="watchlist-toolbar">
+              <input
+                className="watchlist-add-input"
+                placeholder="Add symbol (e.g. ETH-USD)"
+                value={watchlistInput}
+                onChange={e => setWatchlistInput(e.target.value)}
+                onKeyDown={e => e.key === 'Enter' && addToWatchlist()}
+              />
+              <button className="btn-secondary btn-sm" onClick={addToWatchlist} disabled={!watchlistInput.trim()}>Add</button>
+              <button className="btn-secondary btn-sm" onClick={scanCryptoMarket} disabled={scanning}>
+                {scanning ? 'Scanning…' : '⚡ Scan Market'}
+              </button>
+            </div>
             <table>
               <thead>
                 <tr>
-                  <th>Symbol</th><th>Price</th><th>Change</th><th>Change %</th><th>Volume</th><th>Updated</th>
+                  <th>Symbol</th><th>Price</th><th>Change</th><th>Change %</th><th>Volume</th><th>Updated</th><th></th>
                 </tr>
               </thead>
               <tbody>
@@ -377,6 +422,7 @@ function CryptoDashboard({ token, onBack, onLogout }: { token: string; onBack: (
                     <td className={s.changePct >= 0 ? 'green' : 'red'}>{fmtPct(s.changePct)}</td>
                     <td>{(s.volume / 1_000_000).toFixed(1)}M</td>
                     <td className="muted">{timeAgo(s.lastUpdated)}</td>
+                    <td><button className="watchlist-remove-btn" onClick={() => removeFromWatchlist(s.symbol)} title="Remove">&#xd7;</button></td>
                   </tr>
                 ))}
               </tbody>
@@ -590,6 +636,8 @@ function Dashboard({ token, onLogout, onGoHome }: { token: string; onLogout: () 
   const [profileModal, setProfileModal] = useState<null | 'change-password' | 'user-management'>(null);
   const [isAdmin, setIsAdmin] = useState(false);
   const [accountMode, setAccountMode] = useState<'demo' | 'live'>('demo');
+  const [watchlistInput, setWatchlistInput] = useState('');
+  const [scanning, setScanning] = useState(false);
   const wsRef = useRef<WebSocket | null>(null);
   const reconnectTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
 
@@ -700,6 +748,36 @@ function Dashboard({ token, onLogout, onGoHome }: { token: string; onLogout: () 
       method: 'POST',
       headers: { Authorization: `Bearer ${token}` },
     }).catch(() => {});
+  }
+
+  async function addToStocksWatchlist() {
+    const sym = watchlistInput.trim().toUpperCase();
+    if (!sym) return;
+    setWatchlistInput('');
+    await fetch(`${HTTP_URL}/api/watchlist/stocks`, {
+      method: 'POST',
+      headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' },
+      body: JSON.stringify({ symbol: sym }),
+    }).catch(() => {});
+  }
+
+  async function removeFromStocksWatchlist(symbol: string) {
+    await fetch(`${HTTP_URL}/api/watchlist/stocks/${encodeURIComponent(symbol)}`, {
+      method: 'DELETE',
+      headers: { Authorization: `Bearer ${token}` },
+    }).catch(() => {});
+  }
+
+  async function scanStocksMarket() {
+    setScanning(true);
+    try {
+      await fetch(`${HTTP_URL}/api/watchlist/stocks/scan`, {
+        method: 'POST',
+        headers: { Authorization: `Bearer ${token}` },
+      });
+    } catch { /* ignore */ } finally {
+      setScanning(false);
+    }
   }
 
   return (
@@ -848,6 +926,19 @@ function Dashboard({ token, onLogout, onGoHome }: { token: string; onLogout: () 
 
         {state && tab === 'watchlist' && (
           <div className="watchlist">
+            <div className="watchlist-toolbar">
+              <input
+                className="watchlist-add-input"
+                placeholder="Add symbol (e.g. NVDA)"
+                value={watchlistInput}
+                onChange={e => setWatchlistInput(e.target.value)}
+                onKeyDown={e => e.key === 'Enter' && addToStocksWatchlist()}
+              />
+              <button className="btn-secondary btn-sm" onClick={addToStocksWatchlist} disabled={!watchlistInput.trim()}>Add</button>
+              <button className="btn-secondary btn-sm" onClick={scanStocksMarket} disabled={scanning}>
+                {scanning ? 'Scanning…' : '⚡ Scan Market'}
+              </button>
+            </div>
             <table>
               <thead>
                 <tr>
@@ -857,6 +948,7 @@ function Dashboard({ token, onLogout, onGoHome }: { token: string; onLogout: () 
                   <th>Change %</th>
                   <th>Volume</th>
                   <th>Updated</th>
+                  <th></th>
                 </tr>
               </thead>
               <tbody>
@@ -870,6 +962,7 @@ function Dashboard({ token, onLogout, onGoHome }: { token: string; onLogout: () 
                     <td className={s.changePct >= 0 ? 'green' : 'red'}>{fmtPct(s.changePct)}</td>
                     <td>{(s.volume / 1_000_000).toFixed(1)}M</td>
                     <td className="muted">{timeAgo(s.lastUpdated)}</td>
+                    <td><button className="watchlist-remove-btn" onClick={() => removeFromStocksWatchlist(s.symbol)} title="Remove">&#xd7;</button></td>
                   </tr>
                 ))}
               </tbody>

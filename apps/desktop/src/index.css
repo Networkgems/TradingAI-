@@ -1339,3 +1339,45 @@ tr:hover td { background: #1c2128; }
   .selector-cards { flex-direction: column; align-items: center; }
   .selector-card { width: 90vw; max-width: 320px; padding: 1.5rem; }
 }
+
+.watchlist-toolbar {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+  padding: 0.6rem 0.75rem;
+  border-bottom: 1px solid var(--border);
+  background: var(--surface);
+}
+
+.watchlist-add-input {
+  flex: 1;
+  max-width: 220px;
+  background: var(--bg);
+  border: 1px solid var(--border);
+  border-radius: 5px;
+  padding: 0.3rem 0.6rem;
+  color: var(--fg);
+  font-size: 0.8rem;
+}
+
+.watchlist-add-input:focus {
+  outline: none;
+  border-color: var(--blue);
+}
+
+.watchlist-remove-btn {
+  background: none;
+  border: none;
+  color: var(--muted);
+  font-size: 1rem;
+  line-height: 1;
+  padding: 0.15rem 0.4rem;
+  border-radius: 4px;
+  cursor: pointer;
+  transition: color 0.15s, background 0.15s;
+}
+
+.watchlist-remove-btn:hover {
+  color: var(--red);
+  background: rgba(248, 81, 73, 0.1);
+}

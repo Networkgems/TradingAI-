@@ -12,6 +12,16 @@ import { generateEodReport } from './reports/eod-report.js';
 import { generateCryptoEodReport } from './reports/crypto-eod-report.js';
 import { createToken, verifyToken, generateResetToken, consumeResetToken } from './auth.js';
 import { loadSettings, getSettings, saveSettings } from './account-settings.js';
+import {
+  initWatchlistStore,
+  getCryptoWatchlistData,
+  getStocksWatchlistData,
+  addCryptoSymbol,
+  removeCryptoSymbol,
+  addStocksSymbol,
+  removeStocksSymbol,
+} from './watchlist-store.js';
+import { scanStocksMarket, scanCryptoMarket } from './market-scanner.js';
 import { PnlTracker } from './pnl-tracker.js';
 import {
   loadUsers,
@@ -98,6 +108,15 @@ const tracker = new PnlTracker(DATA_DIR, initialSettings.demoEquity);
 const engine = new SignalEngine(initialSettings, tracker);
 const cryptoEngine = new CryptoSignalEngine(initialSettings);
 const scheduler = new MarketScheduler();
+
+// Restore persisted watchlist overrides into engines
+await initWatchlistStore();
+const savedCrypto = getCryptoWatchlistData();
+for (const sym of savedCrypto.hidden) cryptoEngine.removeSymbol(sym);
+for (const sym of savedCrypto.added) cryptoEngine.addSymbol(sym);
+const savedStocks = getStocksWatchlistData();
+for (const sym of savedStocks.hidden) engine.removeSymbol(sym);
+for (const sym of savedStocks.added) engine.addSymbol(sym);
 
 // ── EOD Report generation ────────────────────────────────────────────────────
 
@@ -549,6 +568,86 @@ app.post('/api/crypto/trading/stop', requireAuth, (_req, res) => {
   cryptoEngine.setAutoTrading(false);
   broadcastCryptoState();
   res.json({ ok: true, autoTradingEnabled: false });
+});
+
+// ── Watchlist management ──────────────────────────────────────────────────────
+
+app.get('/api/watchlist/crypto', requireAuth, (_req, res) => {
+  res.json(getCryptoWatchlistData());
+});
+
+app.post('/api/watchlist/crypto', requireAuth, async (req, res) => {
+  const { symbol } = req.body as { symbol?: string };
+  if (typeof symbol !== 'string' || !symbol.trim()) {
+    res.status(400).json({ error: 'symbol is required' });
+    return;
+  }
+  const sym = symbol.trim().toUpperCase();
+  await addCryptoSymbol(sym);
+  cryptoEngine.addSymbol(sym);
+  res.json({ ok: true, symbol: sym });
+});
+
+app.delete('/api/watchlist/crypto/:symbol', requireAuth, async (req, res) => {
+  const raw = req.params['symbol'];
+  const sym = (Array.isArray(raw) ? raw[0] : raw ?? '').toUpperCase();
+  if (!sym) { res.status(400).json({ error: 'symbol is required' }); return; }
+  await removeCryptoSymbol(sym);
+  cryptoEngine.removeSymbol(sym);
+  broadcastCryptoState();
+  res.json({ ok: true });
+});
+
+app.post('/api/watchlist/crypto/scan', requireAuth, async (_req, res) => {
+  try {
+    const results = await scanCryptoMarket();
+    for (const r of results) {
+      await addCryptoSymbol(r.symbol);
+      cryptoEngine.addSymbol(r.symbol);
+    }
+    res.json({ ok: true, added: results.map(r => r.symbol) });
+  } catch (err) {
+    res.status(500).json({ error: String(err) });
+  }
+});
+
+app.get('/api/watchlist/stocks', requireAuth, (_req, res) => {
+  res.json(getStocksWatchlistData());
+});
+
+app.post('/api/watchlist/stocks', requireAuth, async (req, res) => {
+  const { symbol } = req.body as { symbol?: string };
+  if (typeof symbol !== 'string' || !symbol.trim()) {
+    res.status(400).json({ error: 'symbol is required' });
+    return;
+  }
+  const sym = symbol.trim().toUpperCase();
+  await addStocksSymbol(sym);
+  engine.addSymbol(sym);
+  res.json({ ok: true, symbol: sym });
+});
+
+app.delete('/api/watchlist/stocks/:symbol', requireAuth, async (req, res) => {
+  const raw = req.params['symbol'];
+  const sym = (Array.isArray(raw) ? raw[0] : raw ?? '').toUpperCase();
+  if (!sym) { res.status(400).json({ error: 'symbol is required' }); return; }
+  await removeStocksSymbol(sym);
+  engine.removeSymbol(sym);
+  broadcastEngineState();
+  res.json({ ok: true });
+});
+
+app.post('/api/watchlist/stocks/scan', requireAuth, async (_req, res) => {
+  try {
+    const results = await scanStocksMarket();
+    for (const r of results) {
+      await addStocksSymbol(r.symbol);
+      engine.addSymbol(r.symbol);
+    }
+    res.json({ ok: true, added: results.map(r => r.symbol) });
+  } catch (err) {
+    res.status(500).json({ error: String(err) });
+  }
 });
 
 app.post('/api/crypto/positions/:id/close', requireAuth, (req, res) => {

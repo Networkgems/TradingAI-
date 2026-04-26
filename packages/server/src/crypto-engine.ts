@@ -27,6 +27,9 @@ export class CryptoSignalEngine {
   private newsCache: NewsItem[] = [];
   private lastNewsRefresh = 0;
 
+  private dynamicSymbols: Set<string> = new Set();
+  private hiddenSymbols: Set<string> = new Set();
+
   private tickTimer: ReturnType<typeof setInterval> | null = null;
   private handlers: CryptoEngineEventHandler[] = [];
   private autoTradingEnabled = true;
@@ -61,8 +64,30 @@ export class CryptoSignalEngine {
     }
   }
 
+  getActiveSymbols(): string[] {
+    const base = (CRYPTO_WATCHLIST as readonly string[]).filter(s => !this.hiddenSymbols.has(s));
+    return [...base, ...Array.from(this.dynamicSymbols).filter(s => !base.includes(s))];
+  }
+
+  addSymbol(symbol: string): void {
+    this.hiddenSymbols.delete(symbol);
+    if (!(CRYPTO_WATCHLIST as readonly string[]).includes(symbol)) {
+      this.dynamicSymbols.add(symbol);
+    }
+  }
+
+  removeSymbol(symbol: string): void {
+    if ((CRYPTO_WATCHLIST as readonly string[]).includes(symbol)) {
+      this.hiddenSymbols.add(symbol);
+    } else {
+      this.dynamicSymbols.delete(symbol);
+    }
+    this.symbolState.delete(symbol);
+  }
+
   private async tick(): Promise<void> {
-    const quotes = await fetchCryptoQuotes(CRYPTO_WATCHLIST);
+    const activeSymbols = this.getActiveSymbols();
+    const quotes = await fetchCryptoQuotes(activeSymbols);
 
     const prices = new Map<string, number>();
     for (const [sym, q] of quotes) {
@@ -82,11 +107,11 @@ export class CryptoSignalEngine {
       this.allClosedPositions.push(...closed);
     }
 
-    for (const sym of CRYPTO_WATCHLIST) {
+    for (const sym of activeSymbols) {
       await this.refreshCandles(sym);
     }
 
-    if (this.autoTradingEnabled) for (const sym of CRYPTO_WATCHLIST) {
+    if (this.autoTradingEnabled) for (const sym of activeSymbols) {
       const candles = this.candleCache.get(sym) ?? [];
       if (candles.length < 35) continue; // MacdBollinger needs 35 bars minimum
 
@@ -135,7 +160,7 @@ export class CryptoSignalEngine {
     };
 
     return {
-      symbols: Array.from(this.symbolState.values()),
+      symbols: Array.from(this.symbolState.values()).filter(s => !this.hiddenSymbols.has(s.symbol)),
       signals: [...this.recentSignals],
       account,
       closedPositions: [...this.allClosedPositions].slice(-20),
