@@ -543,18 +543,35 @@ export default function SettingsPage({ token, httpUrl, context, onModeChange }: 
             </p>
 
             <div className="settings-grid">
-              <div className="settings-field">
-                <label>Starting Equity ($)</label>
-                <input
-                  type="number"
-                  min={1000}
-                  max={10000000}
-                  step={1000}
-                  value={settings.demoEquity}
-                  onChange={e => set('demoEquity', Number(e.target.value))}
-                />
-                <span className="field-hint">Virtual starting balance (default: $25,000)</span>
-              </div>
+              {(!context || context === 'stocks') && (
+                <div className="settings-field">
+                  <label>{context === 'stocks' ? 'Starting Equity ($)' : 'Stock Starting Equity ($)'}</label>
+                  <input
+                    type="number"
+                    min={1000}
+                    max={10000000}
+                    step={1000}
+                    value={settings.demoEquityStocks ?? settings.demoEquity}
+                    onChange={e => set('demoEquityStocks', Number(e.target.value))}
+                  />
+                  <span className="field-hint">Virtual starting balance for stocks (default: $25,000)</span>
+                </div>
+              )}
+
+              {(!context || context === 'crypto') && (
+                <div className="settings-field">
+                  <label>{context === 'crypto' ? 'Starting Equity ($)' : 'Crypto Starting Equity ($)'}</label>
+                  <input
+                    type="number"
+                    min={1000}
+                    max={10000000}
+                    step={1000}
+                    value={settings.demoEquityCrypto ?? settings.demoEquity}
+                    onChange={e => set('demoEquityCrypto', Number(e.target.value))}
+                  />
+                  <span className="field-hint">Virtual starting balance for crypto (default: $25,000)</span>
+                </div>
+              )}
 
               <div className="settings-field">
                 <label>Daily Trades Limit</label>
@@ -601,6 +618,8 @@ export default function SettingsPage({ token, httpUrl, context, onModeChange }: 
                 onClick={() => setSettings(s => ({
                   ...s,
                   demoEquity: DEFAULT_ACCOUNT_SETTINGS.demoEquity,
+                  demoEquityStocks: DEFAULT_ACCOUNT_SETTINGS.demoEquityStocks,
+                  demoEquityCrypto: DEFAULT_ACCOUNT_SETTINGS.demoEquityCrypto,
                   dailyTradesLimit: DEFAULT_ACCOUNT_SETTINGS.dailyTradesLimit,
                   managedAccountRatio: DEFAULT_ACCOUNT_SETTINGS.managedAccountRatio,
                   riskPerTrade: DEFAULT_ACCOUNT_SETTINGS.riskPerTrade,

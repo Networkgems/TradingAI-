@@ -493,10 +493,13 @@ app.get('/api/account/settings', requireAuth, (_req, res) => {
 app.put('/api/account/settings', requireAuth, async (req, res) => {
   const body = req.body as Partial<AccountSettings>;
   const current = getSettings();
+  const clampEquity = (v: number) => Math.max(1_000, Math.min(10_000_000, Number(v)));
   const updated: AccountSettings = {
     ...current,
     ...body,
-    demoEquity: Math.max(1_000, Math.min(10_000_000, Number(body.demoEquity ?? current.demoEquity))),
+    demoEquity: clampEquity(body.demoEquity ?? current.demoEquity),
+    demoEquityStocks: clampEquity(body.demoEquityStocks ?? current.demoEquityStocks ?? current.demoEquity),
+    demoEquityCrypto: clampEquity(body.demoEquityCrypto ?? current.demoEquityCrypto ?? current.demoEquity),
     dailyTradesLimit: Math.max(1, Math.min(100, Number(body.dailyTradesLimit ?? current.dailyTradesLimit))),
     managedAccountRatio: Math.max(0.01, Math.min(1, Number(body.managedAccountRatio ?? current.managedAccountRatio))),
     riskPerTrade: Math.max(0.001, Math.min(0.5, Number(body.riskPerTrade ?? current.riskPerTrade))),

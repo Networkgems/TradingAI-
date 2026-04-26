@@ -66,6 +66,8 @@ export interface AccountSettings {
   mode: AccountMode;
   // Demo mode settings
   demoEquity: number;
+  demoEquityStocks: number;
+  demoEquityCrypto: number;
   dailyTradesLimit: number;
   managedAccountRatio: number;
   riskPerTrade: number;
@@ -79,6 +81,8 @@ export interface AccountSettings {
 export const DEFAULT_ACCOUNT_SETTINGS: AccountSettings = {
   mode: 'demo',
   demoEquity: 25_000,
+  demoEquityStocks: 25_000,
+  demoEquityCrypto: 25_000,
   dailyTradesLimit: 10,
   managedAccountRatio: 0.5,
   riskPerTrade: 0.01,

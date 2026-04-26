@@ -119,16 +119,17 @@ export class SignalEngine {
   constructor(settings?: AccountSettings, tracker?: PnlTracker) {
     this.tracker = tracker;
     const savedEquity = tracker?.getSavedEquity();
+    const stocksEquity = settings ? (settings.demoEquityStocks ?? settings.demoEquity) : undefined;
     const config = settings
       ? {
-          initialEquity: savedEquity ?? settings.demoEquity,
+          initialEquity: savedEquity ?? stocksEquity,
           managedAccountRatio: settings.managedAccountRatio,
           riskPerTrade: settings.riskPerTrade,
         }
       : { initialEquity: savedEquity };
     this.account = new PaperAccount(config);
     this.optionsAccount = new PaperOptionsAccount({
-      initialEquity: savedEquity ?? settings?.demoEquity,
+      initialEquity: savedEquity ?? stocksEquity,
       managedAccountRatio: settings?.managedAccountRatio,
       dailyTradesLimit: settings?.dailyTradesLimit,
     });
@@ -136,7 +137,7 @@ export class SignalEngine {
 
   /** Apply account settings and reset both accounts. Uses 0 equity for live mode (no connected brokerage). */
   applySettings(settings: AccountSettings): void {
-    const equity = settings.mode === 'live' ? 0 : settings.demoEquity;
+    const equity = settings.mode === 'live' ? 0 : (settings.demoEquityStocks ?? settings.demoEquity);
     this.account.reset({
       initialEquity: equity,
       managedAccountRatio: settings.managedAccountRatio,

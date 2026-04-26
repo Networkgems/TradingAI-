@@ -39,13 +39,13 @@ export class CryptoSignalEngine {
   private autoTradingEnabled = true;
 
   constructor(settings?: AccountSettings) {
-    const equity = settings?.mode === 'demo' ? (settings.demoEquity ?? 25_000) : 0;
+    const equity = settings?.mode === 'demo' ? (settings.demoEquityCrypto ?? settings.demoEquity ?? 25_000) : 0;
     this.initialEquity = equity;
     this.account = new CryptoPaperAccount(equity);
   }
 
   applySettings(settings: AccountSettings): void {
-    const equity = settings.mode === 'demo' ? settings.demoEquity : 0;
+    const equity = settings.mode === 'demo' ? (settings.demoEquityCrypto ?? settings.demoEquity) : 0;
     this.initialEquity = equity;
     this.account.reset(equity);
     this.recentSignals = [];
