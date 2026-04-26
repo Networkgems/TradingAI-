@@ -171,87 +171,91 @@ function CryptoDashboard({ token, onBack, onLogout }: { token: string; onBack: (
           <span className="subtitle">Reversal · MACD-Bollinger · 20 Symbols · 24/7</span>
         </div>
         <div className="header-right">
-          {account && (
-            <>
-              <div className="stat">
-                <span className="stat-label">Equity</span>
-                <span className="stat-value">${fmt(account.totalEquity)}</span>
-              </div>
-              <div className="stat">
-                <span className="stat-label">Today P&amp;L</span>
-                <span className={`stat-value ${account.dailyPnl >= 0 ? 'green' : 'red'}`}>
-                  {fmtDollar(account.dailyPnl)}
-                </span>
-              </div>
-              {account.weeklyPnl !== undefined && (
+          <div className="header-stats">
+            {account && (
+              <>
                 <div className="stat">
-                  <span className="stat-label">Week P&amp;L</span>
-                  <span className={`stat-value ${account.weeklyPnl >= 0 ? 'green' : 'red'}`}>
-                    {fmtDollar(account.weeklyPnl)}
+                  <span className="stat-label">Equity</span>
+                  <span className="stat-value">${fmt(account.totalEquity)}</span>
+                </div>
+                <div className="stat">
+                  <span className="stat-label">Today P&amp;L</span>
+                  <span className={`stat-value ${account.dailyPnl >= 0 ? 'green' : 'red'}`}>
+                    {fmtDollar(account.dailyPnl)}
                   </span>
                 </div>
-              )}
-              <div className="stat">
-                <span className="stat-label">Cash</span>
-                <span className="stat-value">${fmt(account.availableCash)}</span>
-              </div>
-              <div className="stat">
-                <span className="stat-label">Positions</span>
-                <span className="stat-value">{openPositions.length}</span>
-              </div>
-            </>
-          )}
-          <div className={`status-dot ${connected ? 'live' : 'offline'}`} title={connected ? 'Live' : 'Reconnecting...'} />
-          <span className="status-label">{connected ? 'LIVE' : 'Reconnecting'}</span>
-          {state && <span className="last-tick">Updated {timeAgo(state.lastTick)}</span>}
-          <button
-            className={`logout-btn${autoTradingEnabled ? ' trading-active' : ' trading-stopped'}`}
-            onClick={toggleAutoTrading}
-            disabled={tradingToggling}
-            title={autoTradingEnabled ? 'Stop auto trading' : 'Start auto trading'}
-          >
-            {autoTradingEnabled ? '⏹ Stop Trading' : '▶ Start Trading'}
-          </button>
-          <button
-            className={`logout-btn${tab === 'settings' ? ' active' : ''}`}
-            onClick={() => setTab(t => t === 'settings' ? 'watchlist' : 'settings')}
-            title="Account settings"
-          >
-            ⚙ Settings
-          </button>
-          <div className="profile-wrap">
+                {account.weeklyPnl !== undefined && (
+                  <div className="stat">
+                    <span className="stat-label">Week P&amp;L</span>
+                    <span className={`stat-value ${account.weeklyPnl >= 0 ? 'green' : 'red'}`}>
+                      {fmtDollar(account.weeklyPnl)}
+                    </span>
+                  </div>
+                )}
+                <div className="stat">
+                  <span className="stat-label">Cash</span>
+                  <span className="stat-value">${fmt(account.availableCash)}</span>
+                </div>
+                <div className="stat">
+                  <span className="stat-label">Positions</span>
+                  <span className="stat-value">{openPositions.length}</span>
+                </div>
+              </>
+            )}
+          </div>
+          <div className="header-actions">
+            <div className={`status-dot ${connected ? 'live' : 'offline'}`} title={connected ? 'Live' : 'Reconnecting...'} />
+            <span className="status-label">{connected ? 'LIVE' : 'Reconnecting'}</span>
+            {state && <span className="last-tick">Updated {timeAgo(state.lastTick)}</span>}
             <button
-              className="logout-btn"
-              onClick={() => setProfileOpen(o => !o)}
-              title="Profile menu"
+              className={`logout-btn${autoTradingEnabled ? ' trading-active' : ' trading-stopped'}`}
+              onClick={toggleAutoTrading}
+              disabled={tradingToggling}
+              title={autoTradingEnabled ? 'Stop auto trading' : 'Start auto trading'}
             >
-              &#x1F464; Profile &#9660;
+              {autoTradingEnabled ? '⏹ Stop Trading' : '▶ Start Trading'}
             </button>
-            {profileOpen && (
-              <div className="profile-dropdown">
-                <button
-                  className="profile-dropdown-item"
-                  onClick={() => { setProfileModal('change-password'); setProfileOpen(false); }}
-                >
-                  Change Password
-                </button>
-                {isAdmin && (
+            <button
+              className={`logout-btn${tab === 'settings' ? ' active' : ''}`}
+              onClick={() => setTab(t => t === 'settings' ? 'watchlist' : 'settings')}
+              title="Account settings"
+            >
+              ⚙ Settings
+            </button>
+            <div className="profile-wrap">
+              <button
+                className="logout-btn"
+                onClick={() => setProfileOpen(o => !o)}
+                title="Profile menu"
+              >
+                &#x1F464; Profile &#9660;
+              </button>
+              {profileOpen && (
+                <div className="profile-dropdown">
                   <button
                     className="profile-dropdown-item"
-                    onClick={() => { setProfileModal('user-management'); setProfileOpen(false); }}
+                    onClick={() => { setProfileModal('change-password'); setProfileOpen(false); }}
                   >
-                    Account Management
+                    Change Password
                   </button>
-                )}
-                <div className="profile-dropdown-divider" />
-                <button
-                  className="profile-dropdown-item danger"
-                  onClick={onLogout}
-                >
-                  Sign Out
-                </button>
-              </div>
-            )}
+                  {isAdmin && (
+                    <button
+                      className="profile-dropdown-item"
+                      onClick={() => { setProfileModal('user-management'); setProfileOpen(false); }}
+                    >
+                      Account Management
+                    </button>
+                  )}
+                  <div className="profile-dropdown-divider" />
+                  <button
+                    className="profile-dropdown-item danger"
+                    onClick={onLogout}
+                  >
+                    Sign Out
+                  </button>
+                </div>
+              )}
+            </div>
           </div>
         </div>
       </header>
@@ -665,99 +669,103 @@ function Dashboard({ token, onLogout, onGoHome }: { token: string; onLogout: () 
           <span className="subtitle">ORB · Reversal · MACD · Ichimoku · 25 Symbols</span>
         </div>
         <div className="header-right">
-          {account && (
-            <>
-              <div className="stat">
-                <span className="stat-label">Equity</span>
-                <span className="stat-value">${fmt(account.totalEquity)}</span>
-              </div>
-              <div className="stat">
-                <span className="stat-label">Daily P&amp;L</span>
-                <span className={`stat-value ${account.dailyPnl >= 0 ? 'green' : 'red'}`}>
-                  {fmtDollar(account.dailyPnl)}
-                </span>
-              </div>
-              <div className="stat">
-                <span className="stat-label">Cash</span>
-                <span className="stat-value">${fmt(account.availableCash)}</span>
-              </div>
-              <div className="stat">
-                <span className="stat-label">Positions</span>
-                <span className="stat-value">{openPositions.length}</span>
-              </div>
-              {optionsState && (
-                <>
-                  <div className="stat">
-                    <span className="stat-label">Options P&amp;L</span>
-                    <span className={`stat-value ${optionsState.optionsPnl >= 0 ? 'green' : 'red'}`}>
-                      {fmtDollar(optionsState.optionsPnl)}
-                    </span>
-                  </div>
-                  <div className="stat">
-                    <span className="stat-label">Options</span>
-                    <span className="stat-value">{openOptions.length}</span>
-                  </div>
-                  <div className="stat">
-                    <span className="stat-label">Daily Trades</span>
-                    <span className={`stat-value ${optionsState.dailyOptionsCount >= OPTIONS_DAILY_LIMIT ? 'red' : ''}`}>
-                      {optionsState.dailyOptionsCount}/{OPTIONS_DAILY_LIMIT}
-                    </span>
-                  </div>
-                </>
-              )}
-            </>
-          )}
-          <div className={`status-dot ${connected ? 'live' : 'offline'}`} title={connected ? 'Live' : 'Reconnecting...'} />
-          <span className="status-label">{connected ? 'LIVE' : 'Reconnecting'}</span>
-          {state && <span className="last-tick">Updated {timeAgo(state.lastTick)}</span>}
-          <button
-            className={`logout-btn${autoTradingEnabled ? ' trading-active' : ' trading-stopped'}`}
-            onClick={toggleAutoTrading}
-            disabled={tradingToggling}
-            title={autoTradingEnabled ? 'Stop auto trading' : 'Start auto trading'}
-          >
-            {autoTradingEnabled ? '⏹ Stop Trading' : '▶ Start Trading'}
-          </button>
-          <button
-            className={`logout-btn${tab === 'settings' ? ' active' : ''}`}
-            onClick={() => setTab(t => t === 'settings' ? 'watchlist' : 'settings')}
-            title="Account settings"
-          >
-            ⚙ Settings
-          </button>
-          <div className="profile-wrap">
+          <div className="header-stats">
+            {account && (
+              <>
+                <div className="stat">
+                  <span className="stat-label">Equity</span>
+                  <span className="stat-value">${fmt(account.totalEquity)}</span>
+                </div>
+                <div className="stat">
+                  <span className="stat-label">Daily P&amp;L</span>
+                  <span className={`stat-value ${account.dailyPnl >= 0 ? 'green' : 'red'}`}>
+                    {fmtDollar(account.dailyPnl)}
+                  </span>
+                </div>
+                <div className="stat">
+                  <span className="stat-label">Cash</span>
+                  <span className="stat-value">${fmt(account.availableCash)}</span>
+                </div>
+                <div className="stat">
+                  <span className="stat-label">Positions</span>
+                  <span className="stat-value">{openPositions.length}</span>
+                </div>
+                {optionsState && (
+                  <>
+                    <div className="stat">
+                      <span className="stat-label">Options P&amp;L</span>
+                      <span className={`stat-value ${optionsState.optionsPnl >= 0 ? 'green' : 'red'}`}>
+                        {fmtDollar(optionsState.optionsPnl)}
+                      </span>
+                    </div>
+                    <div className="stat">
+                      <span className="stat-label">Options</span>
+                      <span className="stat-value">{openOptions.length}</span>
+                    </div>
+                    <div className="stat">
+                      <span className="stat-label">Daily Trades</span>
+                      <span className={`stat-value ${optionsState.dailyOptionsCount >= OPTIONS_DAILY_LIMIT ? 'red' : ''}`}>
+                        {optionsState.dailyOptionsCount}/{OPTIONS_DAILY_LIMIT}
+                      </span>
+                    </div>
+                  </>
+                )}
+              </>
+            )}
+          </div>
+          <div className="header-actions">
+            <div className={`status-dot ${connected ? 'live' : 'offline'}`} title={connected ? 'Live' : 'Reconnecting...'} />
+            <span className="status-label">{connected ? 'LIVE' : 'Reconnecting'}</span>
+            {state && <span className="last-tick">Updated {timeAgo(state.lastTick)}</span>}
             <button
-              className="logout-btn"
-              onClick={() => setProfileOpen(o => !o)}
-              title="Profile menu"
+              className={`logout-btn${autoTradingEnabled ? ' trading-active' : ' trading-stopped'}`}
+              onClick={toggleAutoTrading}
+              disabled={tradingToggling}
+              title={autoTradingEnabled ? 'Stop auto trading' : 'Start auto trading'}
             >
-              &#x1F464; Profile &#9660;
+              {autoTradingEnabled ? '⏹ Stop Trading' : '▶ Start Trading'}
             </button>
-            {profileOpen && (
-              <div className="profile-dropdown">
-                <button
-                  className="profile-dropdown-item"
-                  onClick={() => { setProfileModal('change-password'); setProfileOpen(false); }}
-                >
-                  Change Password
-                </button>
-                {isAdmin && (
+            <button
+              className={`logout-btn${tab === 'settings' ? ' active' : ''}`}
+              onClick={() => setTab(t => t === 'settings' ? 'watchlist' : 'settings')}
+              title="Account settings"
+            >
+              ⚙ Settings
+            </button>
+            <div className="profile-wrap">
+              <button
+                className="logout-btn"
+                onClick={() => setProfileOpen(o => !o)}
+                title="Profile menu"
+              >
+                &#x1F464; Profile &#9660;
+              </button>
+              {profileOpen && (
+                <div className="profile-dropdown">
                   <button
                     className="profile-dropdown-item"
-                    onClick={() => { setProfileModal('user-management'); setProfileOpen(false); }}
+                    onClick={() => { setProfileModal('change-password'); setProfileOpen(false); }}
                   >
-                    Account Management
+                    Change Password
                   </button>
-                )}
-                <div className="profile-dropdown-divider" />
-                <button
-                  className="profile-dropdown-item danger"
-                  onClick={onLogout}
-                >
-                  Sign Out
-                </button>
-              </div>
-            )}
+                  {isAdmin && (
+                    <button
+                      className="profile-dropdown-item"
+                      onClick={() => { setProfileModal('user-management'); setProfileOpen(false); }}
+                    >
+                      Account Management
+                    </button>
+                  )}
+                  <div className="profile-dropdown-divider" />
+                  <button
+                    className="profile-dropdown-item danger"
+                    onClick={onLogout}
+                  >
+                    Sign Out
+                  </button>
+                </div>
+              )}
+            </div>
           </div>
         </div>
       </header>

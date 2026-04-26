@@ -59,6 +59,18 @@ body {
   gap: 1.4rem;
 }
 
+.header-stats {
+  display: flex;
+  align-items: center;
+  gap: 1.4rem;
+}
+
+.header-actions {
+  display: flex;
+  align-items: center;
+  gap: 0.8rem;
+}
+
 .stat { display: flex; flex-direction: column; align-items: flex-end; }
 .stat-label { font-size: 0.65rem; color: var(--muted); text-transform: uppercase; letter-spacing: 0.06em; }
 .stat-value { font-size: 0.85rem; font-weight: 600; }
@@ -1035,25 +1047,33 @@ tr:hover td { background: #1c2128; }
   }
   .last-tick { display: none; }
 
-  /* Header-right: horizontally scrollable so Settings/Profile are always reachable */
+  /* Header-right: wrap so stats and actions stack into two rows */
   .header-right {
     width: 100%;
+    flex-wrap: wrap;
+    gap: 0.5rem;
+  }
+
+  /* Stats row: horizontally scrollable */
+  .header-stats {
+    flex: 1;
     overflow-x: auto;
     -webkit-overflow-scrolling: touch;
     scrollbar-width: none;
-    gap: 0.8rem;
+    flex-wrap: nowrap;
+    gap: 0.9rem;
     padding-bottom: 2px;
   }
-  .header-right::-webkit-scrollbar { display: none; }
+  .header-stats::-webkit-scrollbar { display: none; }
+  .header-stats .stat { flex-shrink: 0; }
 
-  /* Prevent any header-right item from shrinking or disappearing */
-  .header-right .stat,
-  .header-right .logout-btn,
-  .header-right .profile-wrap,
-  .header-right .status-dot,
-  .header-right .status-label {
+  /* Actions row: always fully visible, pushed to the right */
+  .header-actions {
     flex-shrink: 0;
+    gap: 0.6rem;
   }
+  .header-actions .logout-btn,
+  .header-actions .profile-wrap { flex-shrink: 0; }
 
   /* Settings page: single-column grid */
   .settings-grid { grid-template-columns: 1fr !important; }
@@ -1109,10 +1129,22 @@ tr:hover td { background: #1c2128; }
 }
 
 @media (max-width: 480px) {
-  /* Header: hide non-essential stats to reduce scroll distance to action buttons */
-  .header-right .stat:not(:first-child):not(:nth-child(2)) {
-    display: none;
+  /* Header: actions row first, stats scrollable below */
+  .header-right { gap: 0.4rem; }
+
+  /* Actions always on top, right-aligned */
+  .header-actions {
+    order: -1;
+    width: 100%;
+    justify-content: flex-end;
+    gap: 0.5rem;
   }
+
+  /* Stats take full width and scroll horizontally */
+  .header-stats { width: 100%; }
+
+  /* Hide the subtitle to save vertical space on phone */
+  .subtitle { display: none; }
   .status-label { display: none; }
   .app-subtitle { display: none; }
 
