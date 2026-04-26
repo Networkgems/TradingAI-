@@ -110,6 +110,7 @@ export class SignalEngine {
   private positionSignalType: Map<string, SignalType> = new Map();
 
   private tickTimer: ReturnType<typeof setInterval> | null = null;
+  private tickRunning = false;
   private handlers: EngineEventHandler[] = [];
   private autoTradingEnabled = true;
 
@@ -166,6 +167,16 @@ export class SignalEngine {
   }
 
   private async tick(): Promise<void> {
+    if (this.tickRunning) return;
+    this.tickRunning = true;
+    try {
+      await this.doTick();
+    } finally {
+      this.tickRunning = false;
+    }
+  }
+
+  private async doTick(): Promise<void> {
     if (Date.now() - this.lastNewsRefresh > NEWS_REFRESH_MS) {
       const news = await fetchStocksNews();
       if (news.length > 0) this.newsCache = news;
@@ -185,6 +196,22 @@ export class SignalEngine {
         changePct: q.changePct,
         lastUpdated: Date.now(),
       });
+    }
+
+    // Broadcast watchlist state early so the UI populates without waiting for candles
+    if (this.symbolState.size > 0) {
+      const earlyState: EngineState = {
+        symbols: Array.from(this.symbolState.values()),
+        signals: [...this.recentSignals],
+        account: this.account.getState(),
+        closedPositions: [...this.allClosedPositions].slice(-20),
+        options: this.optionsAccount.getState(),
+        lastTick: Date.now(),
+        tradingHalted: this.riskGovernor.isHalted(),
+        haltReason: this.riskGovernor.getHaltReason(),
+        autoTradingEnabled: this.autoTradingEnabled,
+      };
+      for (const h of this.handlers) h(earlyState);
     }
 
     const closed = this.account.checkExits(prices);
@@ -219,8 +246,12 @@ export class SignalEngine {
       );
     }
 
-    for (const sym of WATCHLIST) {
-      await this.refreshCandles(sym);
+    // Fetch candles in parallel batches to avoid 25+ second sequential delay for 25 symbols
+    const CANDLE_BATCH = 5;
+    for (let i = 0; i < WATCHLIST.length; i += CANDLE_BATCH) {
+      await Promise.all(
+        (WATCHLIST as readonly string[]).slice(i, i + CANDLE_BATCH).map(sym => this.refreshCandles(sym)),
+      );
     }
 
     // If auto trading is disabled or daily risk circuit-breaker is active, skip new entries
