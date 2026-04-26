@@ -225,6 +225,23 @@ export class PaperOptionsAccount {
     return closed;
   }
 
+  closeOption(optionId: string): OptionPosition | null {
+    const opt = this.openOptions.get(optionId);
+    if (!opt) return null;
+    const mark = opt.currentPremium;
+    const remainingContracts = opt.contractsRemaining;
+    const pnl = (mark - opt.premiumPaid) * remainingContracts * 100;
+    opt.pnl = (opt.pnl ?? 0) + pnl;
+    opt.closedAt = Date.now();
+    opt.contractsRemaining = 0;
+    this.cash += mark * remainingContracts * 100;
+    this.equity += pnl;
+    this.optionsPnl += pnl;
+    this.openOptions.delete(optionId);
+    this.closedOptions.push({ ...opt });
+    return { ...opt };
+  }
+
   hasOpenOption(symbol: string): boolean {
     return Array.from(this.openOptions.values()).some(o => o.symbol === symbol);
   }

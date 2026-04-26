@@ -485,6 +485,24 @@ tr:hover td { background: #1c2128; }
 
 .logout-btn:hover { color: var(--text); border-color: var(--text); }
 .logout-btn.active { color: var(--blue); border-color: var(--blue); }
+.logout-btn.trading-active { color: var(--red); border-color: var(--red); }
+.logout-btn.trading-active:hover { color: #ff6b6b; border-color: #ff6b6b; }
+.logout-btn.trading-stopped { color: var(--green); border-color: var(--green); }
+.logout-btn.trading-stopped:hover { color: #5bff76; border-color: #5bff76; }
+.logout-btn:disabled { opacity: 0.5; cursor: not-allowed; }
+
+.btn-close-pos {
+  background: none;
+  border: 1px solid var(--red);
+  border-radius: 3px;
+  color: var(--red);
+  cursor: pointer;
+  font-family: inherit;
+  font-size: 0.65rem;
+  padding: 0.15rem 0.4rem;
+  transition: background 0.15s, color 0.15s;
+}
+.btn-close-pos:hover { background: var(--red); color: #fff; }
 
 /* ── Settings Page ────────────────────────────────────────────────────────── */
 

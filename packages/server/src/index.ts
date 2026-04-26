@@ -373,6 +373,73 @@ app.post('/api/account/reset-demo', requireAuth, async (_req, res) => {
   res.json({ ok: true });
 });
 
+// ── Trading controls ──────────────────────────────────────────────────────────
+
+app.post('/api/trading/start', requireAuth, (_req, res) => {
+  engine.setAutoTrading(true);
+  broadcastEngineState();
+  res.json({ ok: true, autoTradingEnabled: true });
+});
+
+app.post('/api/trading/stop', requireAuth, (_req, res) => {
+  engine.setAutoTrading(false);
+  broadcastEngineState();
+  res.json({ ok: true, autoTradingEnabled: false });
+});
+
+app.post('/api/positions/:id/close', requireAuth, (req, res) => {
+  const { id } = req.params as Record<string, string>;
+  const state = engine.getState();
+  const pos = state.account.openPositions.find(p => p.id === id);
+  if (!pos) {
+    res.status(404).json({ error: 'Position not found' });
+    return;
+  }
+  const sym = state.symbols.find(s => s.symbol === pos.symbol);
+  const price = sym?.price ?? pos.entryPrice;
+  engine.manualClosePosition(id, price);
+  broadcastEngineState();
+  res.json({ ok: true });
+});
+
+app.post('/api/options/:id/close', requireAuth, (req, res) => {
+  const { id } = req.params as Record<string, string>;
+  const closed = engine.manualCloseOption(id);
+  if (!closed) {
+    res.status(404).json({ error: 'Option position not found' });
+    return;
+  }
+  broadcastEngineState();
+  res.json({ ok: true });
+});
+
+app.post('/api/crypto/trading/start', requireAuth, (_req, res) => {
+  cryptoEngine.setAutoTrading(true);
+  broadcastCryptoState();
+  res.json({ ok: true, autoTradingEnabled: true });
+});
+
+app.post('/api/crypto/trading/stop', requireAuth, (_req, res) => {
+  cryptoEngine.setAutoTrading(false);
+  broadcastCryptoState();
+  res.json({ ok: true, autoTradingEnabled: false });
+});
+
+app.post('/api/crypto/positions/:id/close', requireAuth, (req, res) => {
+  const { id } = req.params as Record<string, string>;
+  const state = cryptoEngine.getState();
+  const pos = state.account.openPositions.find(p => p.id === id);
+  if (!pos) {
+    res.status(404).json({ error: 'Position not found' });
+    return;
+  }
+  const sym = state.symbols.find(s => s.symbol === pos.symbol);
+  const price = sym?.price ?? pos.entryPrice;
+  cryptoEngine.manualClosePosition(id, price);
+  broadcastCryptoState();
+  res.json({ ok: true });
+});
+
 // ── WebSocket ────────────────────────────────────────────────────────────────
 
 const httpServer = createServer(app);
@@ -380,6 +447,13 @@ const wss = new WebSocketServer({ noServer: true });
 
 function broadcastEngineState() {
   const msg = JSON.stringify({ type: 'state', payload: engine.getState() });
+  for (const client of wss.clients) {
+    if (client.readyState === WebSocket.OPEN) client.send(msg);
+  }
+}
+
+function broadcastCryptoState() {
+  const msg = JSON.stringify({ type: 'crypto_state', payload: cryptoEngine.getState() });
   for (const client of wss.clients) {
     if (client.readyState === WebSocket.OPEN) client.send(msg);
   }

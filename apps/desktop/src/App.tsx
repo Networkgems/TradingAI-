@@ -64,6 +64,7 @@ function CryptoDashboard({ token, onBack, onLogout }: { token: string; onBack: (
   const [profileOpen, setProfileOpen] = useState(false);
   const [profileModal, setProfileModal] = useState<null | 'change-password' | 'user-management'>(null);
   const [isAdmin, setIsAdmin] = useState(false);
+  const [tradingToggling, setTradingToggling] = useState(false);
   const wsRef = useRef<WebSocket | null>(null);
   const reconnectTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
 
@@ -140,6 +141,26 @@ function CryptoDashboard({ token, onBack, onLogout }: { token: string; onBack: (
   const symbols = state?.symbols ?? [];
   const openPositions = account?.openPositions ?? [];
   const closedPositions = state?.closedPositions ?? [];
+  const autoTradingEnabled = state?.autoTradingEnabled ?? true;
+
+  async function toggleAutoTrading() {
+    setTradingToggling(true);
+    try {
+      await fetch(`${HTTP_URL}/api/crypto/trading/${autoTradingEnabled ? 'stop' : 'start'}`, {
+        method: 'POST',
+        headers: { Authorization: `Bearer ${token}` },
+      });
+    } catch { /* ignore */ } finally {
+      setTradingToggling(false);
+    }
+  }
+
+  async function closePosition(positionId: string) {
+    await fetch(`${HTTP_URL}/api/crypto/positions/${positionId}/close`, {
+      method: 'POST',
+      headers: { Authorization: `Bearer ${token}` },
+    }).catch(() => {});
+  }
 
   return (
     <div className="app">
@@ -183,6 +204,14 @@ function CryptoDashboard({ token, onBack, onLogout }: { token: string; onBack: (
           <div className={`status-dot ${connected ? 'live' : 'offline'}`} title={connected ? 'Live' : 'Reconnecting...'} />
           <span className="status-label">{connected ? 'LIVE' : 'Reconnecting'}</span>
           {state && <span className="last-tick">Updated {timeAgo(state.lastTick)}</span>}
+          <button
+            className={`logout-btn${autoTradingEnabled ? ' trading-active' : ' trading-stopped'}`}
+            onClick={toggleAutoTrading}
+            disabled={tradingToggling}
+            title={autoTradingEnabled ? 'Stop auto trading' : 'Start auto trading'}
+          >
+            {autoTradingEnabled ? '⏹ Stop Trading' : '▶ Start Trading'}
+          </button>
           <button
             className={`logout-btn${tab === 'settings' ? ' active' : ''}`}
             onClick={() => setTab(t => t === 'settings' ? 'watchlist' : 'settings')}
@@ -340,7 +369,7 @@ function CryptoDashboard({ token, onBack, onLogout }: { token: string; onBack: (
                   <thead>
                     <tr>
                       <th>Symbol</th><th>Side</th><th>Qty</th><th>Entry</th><th>Current</th>
-                      <th>P&amp;L %</th><th>P&amp;L $</th><th>Stop</th><th>Target</th><th>Opened</th>
+                      <th>P&amp;L %</th><th>P&amp;L $</th><th>Stop</th><th>Target</th><th>Opened</th><th></th>
                     </tr>
                   </thead>
                   <tbody>
@@ -362,6 +391,7 @@ function CryptoDashboard({ token, onBack, onLogout }: { token: string; onBack: (
                           <td className="red">${fmt(p.stopLoss)}</td>
                           <td className="green">${fmt(p.takeProfit)}</td>
                           <td className="muted">{formatTime(p.openedAt)}</td>
+                          <td><button className="btn-close-pos" onClick={() => closePosition(p.id)}>Close</button></td>
                         </tr>
                       );
                     })}
@@ -454,6 +484,9 @@ interface AppState {
   closedPositions: Position[];
   options: OptionsAccountState;
   lastTick: number;
+  tradingHalted: boolean;
+  haltReason: string | null;
+  autoTradingEnabled: boolean;
 }
 
 function fmt(n: number, decimals = 2) {
@@ -497,6 +530,7 @@ function Dashboard({ token, onLogout, onGoHome }: { token: string; onLogout: () 
   const [eodCollapsed, setEodCollapsed] = useState(false);
   const [connected, setConnected] = useState(false);
   const [tab, setTab] = useState<'watchlist' | 'signals' | 'positions' | 'options' | 'settings' | 'calendar'>('watchlist');
+  const [tradingToggling, setTradingToggling] = useState(false);
   const wsRef = useRef<WebSocket | null>(null);
   const reconnectTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
 
@@ -554,6 +588,33 @@ function Dashboard({ token, onLogout, onGoHome }: { token: string; onLogout: () 
   const optionsState = state?.options;
   const openOptions: OptionPosition[] = optionsState?.openOptions ?? [];
   const closedOptions: OptionPosition[] = optionsState?.closedOptions ?? [];
+  const autoTradingEnabled = state?.autoTradingEnabled ?? true;
+
+  async function toggleAutoTrading() {
+    setTradingToggling(true);
+    try {
+      await fetch(`${HTTP_URL}/api/trading/${autoTradingEnabled ? 'stop' : 'start'}`, {
+        method: 'POST',
+        headers: { Authorization: `Bearer ${token}` },
+      });
+    } catch { /* ignore */ } finally {
+      setTradingToggling(false);
+    }
+  }
+
+  async function closePosition(positionId: string) {
+    await fetch(`${HTTP_URL}/api/positions/${positionId}/close`, {
+      method: 'POST',
+      headers: { Authorization: `Bearer ${token}` },
+    }).catch(() => {});
+  }
+
+  async function closeOption(optionId: string) {
+    await fetch(`${HTTP_URL}/api/options/${optionId}/close`, {
+      method: 'POST',
+      headers: { Authorization: `Bearer ${token}` },
+    }).catch(() => {});
+  }
 
   return (
     <div className="app">
@@ -609,6 +670,14 @@ function Dashboard({ token, onLogout, onGoHome }: { token: string; onLogout: () 
           <div className={`status-dot ${connected ? 'live' : 'offline'}`} title={connected ? 'Live' : 'Reconnecting...'} />
           <span className="status-label">{connected ? 'LIVE' : 'Reconnecting'}</span>
           {state && <span className="last-tick">Updated {timeAgo(state.lastTick)}</span>}
+          <button
+            className={`logout-btn${autoTradingEnabled ? ' trading-active' : ' trading-stopped'}`}
+            onClick={toggleAutoTrading}
+            disabled={tradingToggling}
+            title={autoTradingEnabled ? 'Stop auto trading' : 'Start auto trading'}
+          >
+            {autoTradingEnabled ? '⏹ Stop Trading' : '▶ Start Trading'}
+          </button>
           <button
             className={`logout-btn${tab === 'settings' ? ' active' : ''}`}
             onClick={() => setTab(t => t === 'settings' ? 'watchlist' : 'settings')}
@@ -736,6 +805,7 @@ function Dashboard({ token, onLogout, onGoHome }: { token: string; onLogout: () 
                       <th>Stop</th>
                       <th>Target</th>
                       <th>Opened</th>
+                      <th></th>
                     </tr>
                   </thead>
                   <tbody>
@@ -755,6 +825,7 @@ function Dashboard({ token, onLogout, onGoHome }: { token: string; onLogout: () 
                           <td className="red">${fmt(p.stopLoss)}</td>
                           <td className="green">${fmt(p.takeProfit)}</td>
                           <td className="muted">{formatTime(p.openedAt)}</td>
+                          <td><button className="btn-close-pos" onClick={() => closePosition(p.id)}>Close</button></td>
                         </tr>
                       );
                     })}
@@ -818,6 +889,7 @@ function Dashboard({ token, onLogout, onGoHome }: { token: string; onLogout: () 
                       <th>Trail / SL</th>
                       <th>Signal</th>
                       <th>Opened</th>
+                      <th></th>
                     </tr>
                   </thead>
                   <tbody>
@@ -844,6 +916,7 @@ function Dashboard({ token, onLogout, onGoHome }: { token: string; onLogout: () 
                           </td>
                           <td>{signalLabel(o.signalType)}</td>
                           <td className="muted">{formatTime(o.openedAt)}</td>
+                          <td><button className="btn-close-pos" onClick={() => closeOption(o.id)}>Close</button></td>
                         </tr>
                       );
                     })}

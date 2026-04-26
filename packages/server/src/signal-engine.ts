@@ -26,6 +26,7 @@ export interface EngineState {
   /** True when the daily risk circuit-breaker has halted new entries. */
   tradingHalted: boolean;
   haltReason: string | null;
+  autoTradingEnabled: boolean;
 }
 
 export type EngineEventHandler = (state: EngineState) => void;
@@ -107,6 +108,7 @@ export class SignalEngine {
 
   private tickTimer: ReturnType<typeof setInterval> | null = null;
   private handlers: EngineEventHandler[] = [];
+  private autoTradingEnabled = true;
 
   constructor(settings?: AccountSettings, tracker?: PnlTracker) {
     this.tracker = tracker;
@@ -212,8 +214,8 @@ export class SignalEngine {
       await this.refreshCandles(sym);
     }
 
-    // If daily risk circuit-breaker is active, skip new entries
-    if (!this.riskGovernor.isHalted()) {
+    // If auto trading is disabled or daily risk circuit-breaker is active, skip new entries
+    if (this.autoTradingEnabled && !this.riskGovernor.isHalted()) {
       // Run strategies and collect new signals
       for (const sym of WATCHLIST) {
         const candles = this.candleCache.get(sym) ?? [];
@@ -266,6 +268,7 @@ export class SignalEngine {
       lastTick: Date.now(),
       tradingHalted: this.riskGovernor.isHalted(),
       haltReason: this.riskGovernor.getHaltReason(),
+      autoTradingEnabled: this.autoTradingEnabled,
     };
 
     for (const h of this.handlers) h(state);
@@ -274,6 +277,34 @@ export class SignalEngine {
   private async refreshCandles(symbol: string): Promise<void> {
     const bars = await fetchMinuteBars(symbol, 80);
     if (bars.length > 0) this.candleCache.set(symbol, bars);
+  }
+
+  setAutoTrading(enabled: boolean): void {
+    this.autoTradingEnabled = enabled;
+  }
+
+  manualClosePosition(positionId: string, currentPrice: number): Position | null {
+    const closed = this.account.closePosition(positionId, currentPrice);
+    if (closed) {
+      this.allClosedPositions.push(closed);
+      this.riskGovernor.recordTrade(closed.pnl ?? 0, this.account.managedEquity());
+      this.tracker?.saveEquity(
+        this.account.getState().totalEquity,
+        this.optionsAccount.getState().optionsPnl,
+      );
+    }
+    return closed;
+  }
+
+  manualCloseOption(optionId: string): import('@trading-app/shared').OptionPosition | null {
+    const closed = this.optionsAccount.closeOption(optionId);
+    if (closed) {
+      this.tracker?.saveEquity(
+        this.account.getState().totalEquity,
+        this.optionsAccount.getState().optionsPnl,
+      );
+    }
+    return closed;
   }
 
   getState(): EngineState {
@@ -286,6 +317,7 @@ export class SignalEngine {
       lastTick: Date.now(),
       tradingHalted: this.riskGovernor.isHalted(),
       haltReason: this.riskGovernor.getHaltReason(),
+      autoTradingEnabled: this.autoTradingEnabled,
     };
   }
 

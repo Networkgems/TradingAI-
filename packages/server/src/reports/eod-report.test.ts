@@ -47,6 +47,7 @@ function makeEngineState(overrides: Partial<EngineState> = {}): EngineState {
     lastTick: Date.now(),
     tradingHalted: false,
     haltReason: null,
+    autoTradingEnabled: true,
     ...overrides,
   };
 }

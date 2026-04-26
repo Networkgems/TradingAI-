@@ -98,6 +98,20 @@ export class CryptoPaperAccount {
     return closed;
   }
 
+  closePosition(positionId: string, currentPrice: number): Position | null {
+    const pos = this.positions.get(positionId);
+    if (!pos) return null;
+    const multiplier = pos.side === 'buy' ? 1 : -1;
+    const pnl = (currentPrice - pos.entryPrice) * pos.quantity * multiplier;
+    pos.pnl = pnl;
+    pos.exitPrice = currentPrice;
+    pos.closedAt = Date.now();
+    this.cash += currentPrice * pos.quantity;
+    this.equity += pnl;
+    this.positions.delete(positionId);
+    return { ...pos };
+  }
+
   hasOpenPosition(symbol: string): boolean {
     return Array.from(this.positions.values()).some(p => p.symbol === symbol);
   }

@@ -26,6 +26,7 @@ export class CryptoSignalEngine {
 
   private tickTimer: ReturnType<typeof setInterval> | null = null;
   private handlers: CryptoEngineEventHandler[] = [];
+  private autoTradingEnabled = true;
 
   onTick(handler: CryptoEngineEventHandler): void {
     this.handlers.push(handler);
@@ -68,7 +69,7 @@ export class CryptoSignalEngine {
       await this.refreshCandles(sym);
     }
 
-    for (const sym of CRYPTO_WATCHLIST) {
+    if (this.autoTradingEnabled) for (const sym of CRYPTO_WATCHLIST) {
       const candles = this.candleCache.get(sym) ?? [];
       if (candles.length < 15) continue;
 
@@ -123,7 +124,18 @@ export class CryptoSignalEngine {
       closedPositions: [...this.allClosedPositions].slice(-20),
       news: [...this.newsCache],
       lastTick: Date.now(),
+      autoTradingEnabled: this.autoTradingEnabled,
     };
+  }
+
+  setAutoTrading(enabled: boolean): void {
+    this.autoTradingEnabled = enabled;
+  }
+
+  manualClosePosition(positionId: string, currentPrice: number): Position | null {
+    const closed = this.account.closePosition(positionId, currentPrice);
+    if (closed) this.allClosedPositions.push(closed);
+    return closed;
   }
 
   getState(): CryptoEngineState {

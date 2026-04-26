@@ -195,6 +195,7 @@ export interface CryptoEngineState {
   closedPositions: Position[];
   news: NewsItem[];
   lastTick: number;
+  autoTradingEnabled: boolean;
 }
 
 export interface MarketBar {
