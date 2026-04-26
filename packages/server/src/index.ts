@@ -235,6 +235,23 @@ app.post('/api/auth/change-password', requireAuth, async (req, res) => {
   res.json({ ok: true, message: 'Password changed successfully' });
 });
 
+app.get('/api/auth/me', requireAuth, (req, res) => {
+  const username = res.locals['authUser'] as string;
+  const user = getUser(username);
+  if (!user) { res.status(404).json({ error: 'User not found' }); return; }
+  const { passwordHash: _ph, ...safe } = user;
+  res.json(safe);
+});
+
+app.patch('/api/auth/me', requireAuth, async (req, res) => {
+  const username = res.locals['authUser'] as string;
+  const { email } = req.body as { email?: string };
+  if (typeof email !== 'string') { res.status(400).json({ error: 'email is required' }); return; }
+  const result = await updateUser(username, { email });
+  if (!result.ok) { res.status(404).json({ error: result.error }); return; }
+  res.json({ ok: true });
+});
+
 // ── Admin: user management ────────────────────────────────────────────────────
 
 app.get('/api/admin/users', requireAuth, requireAdmin, (_req, res) => {
