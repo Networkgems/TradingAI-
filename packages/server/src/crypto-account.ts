@@ -121,4 +121,11 @@ export class CryptoPaperAccount {
       p => p.symbol === symbol && p.signalType === signalType,
     );
   }
+
+  reset(equity: number): void {
+    this.equity = equity;
+    this.cash = equity;
+    this.openingEquityToday = equity;
+    this.positions.clear();
+  }
 }

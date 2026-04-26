@@ -39,7 +39,6 @@ export class MacdBollingerStrategy {
   private readonly volumeLookback: number;
   private readonly enforceTimeFilter: boolean;
   private readonly vwap = new VwapTracker();
-  private lastSessionDate = -1;
 
   constructor(opts: MacdBollingerOptions = {}) {
     this.bbPeriod = opts.bbPeriod ?? 20;
@@ -76,12 +75,8 @@ export class MacdBollingerStrategy {
     const adxResult = adx(candles);
     if (adxResult && adxResult.adx < ADX_TRENDING_THRESHOLD) return null;
 
-    // VWAP directional filter
-    const sessionDay = Math.floor(latest.timestamp / 86_400_000);
-    if (sessionDay !== this.lastSessionDate) {
-      this.vwap.reset();
-      this.lastSessionDate = sessionDay;
-    }
+    // VWAP directional filter — reset each evaluation to avoid accumulation drift
+    this.vwap.reset();
     let vwapState = { vwap: 0, stdDev: 0, upperBand: 0, lowerBand: 0 };
     for (const c of candles) vwapState = this.vwap.update(c);
     const aboveVwap = latest.close > vwapState.vwap;

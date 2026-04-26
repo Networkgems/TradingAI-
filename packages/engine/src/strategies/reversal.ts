@@ -32,7 +32,6 @@ export class ReversalStrategy {
   private readonly lookback: number;
   private readonly enforceTimeFilter: boolean;
   private readonly vwap = new VwapTracker();
-  private lastSessionDate = -1;
 
   constructor(opts: ReversalOptions = {}) {
     this.rsiPeriod = opts.rsiPeriod ?? 14;
@@ -50,14 +49,9 @@ export class ReversalStrategy {
     // Time filter: avoid midday chop and after-hours noise (equity only; disabled for crypto)
     if (this.enforceTimeFilter && !isValidTradingWindow(latest.timestamp)) return null;
 
-    // Reset VWAP at the start of each trading session (new calendar day)
-    const sessionDay = Math.floor(latest.timestamp / 86_400_000);
-    if (sessionDay !== this.lastSessionDate) {
-      this.vwap.reset();
-      this.lastSessionDate = sessionDay;
-    }
-
-    // Update VWAP with all candles for the session
+    // Recompute VWAP fresh from the current candle window each evaluation
+    // to avoid accumulation drift when the same candles are fed repeatedly.
+    this.vwap.reset();
     let vwapState = { vwap: 0, stdDev: 0, upperBand: 0, lowerBand: 0 };
     for (const c of candles) vwapState = this.vwap.update(c);
 

@@ -1,6 +1,6 @@
 import { ReversalStrategy, MacdBollingerStrategy, OrbStrategy } from '@trading-app/engine';
 import { CRYPTO_WATCHLIST, isValidCryptoTradingWindow } from '@trading-app/shared';
-import type { TradeSignal, Candle, AccountState, Position, CryptoEngineState, NewsItem } from '@trading-app/shared';
+import type { TradeSignal, Candle, AccountState, Position, CryptoEngineState, NewsItem, AccountSettings } from '@trading-app/shared';
 import { fetchCryptoMinuteBars, fetchCryptoQuotes, fetchCryptoNews } from './crypto-feed.js';
 import { CryptoPaperAccount } from './crypto-account.js';
 
@@ -24,7 +24,8 @@ export class CryptoSignalEngine {
   });
   private readonly reversal = new ReversalStrategy({ enforceTimeFilter: false });
   private readonly macdBollinger = new MacdBollingerStrategy({ bbPeriod: 14, bbMultiplier: 2.5, volumeMultiplier: 1.2, enforceTimeFilter: false });
-  private readonly account = new CryptoPaperAccount();
+  private readonly account: CryptoPaperAccount;
+  private initialEquity: number;
 
   private symbolState: Map<string, CryptoEngineState['symbols'][number]> = new Map();
   private candleCache: Map<string, Candle[]> = new Map();
@@ -36,6 +37,20 @@ export class CryptoSignalEngine {
   private tickTimer: ReturnType<typeof setInterval> | null = null;
   private handlers: CryptoEngineEventHandler[] = [];
   private autoTradingEnabled = true;
+
+  constructor(settings?: AccountSettings) {
+    const equity = settings?.mode === 'demo' ? (settings.demoEquity ?? 25_000) : 0;
+    this.initialEquity = equity;
+    this.account = new CryptoPaperAccount(equity);
+  }
+
+  applySettings(settings: AccountSettings): void {
+    const equity = settings.mode === 'demo' ? settings.demoEquity : 0;
+    this.initialEquity = equity;
+    this.account.reset(equity);
+    this.recentSignals = [];
+    this.allClosedPositions = [];
+  }
 
   onTick(handler: CryptoEngineEventHandler): void {
     this.handlers.push(handler);
@@ -124,7 +139,7 @@ export class CryptoSignalEngine {
       weeklyPnl: 0,
       monthlyPnl: 0,
       yearlyPnl: 0,
-      allTimePnl: accountBase.totalEquity - 25_000,
+      allTimePnl: accountBase.totalEquity - this.initialEquity,
     };
 
     return {
