@@ -1,10 +1,11 @@
 import { useEffect, useState } from 'react';
-import type { AccountSettings } from '@trading-app/shared';
+import type { AccountSettings, BrokerageType } from '@trading-app/shared';
 import { DEFAULT_ACCOUNT_SETTINGS } from '@trading-app/shared';
 
 interface Props {
   token: string;
   httpUrl: string;
+  context?: 'crypto';
 }
 
 type SaveStatus = 'idle' | 'saving' | 'saved' | 'error';
@@ -17,7 +18,7 @@ interface SafeUser {
   createdAt: string;
 }
 
-function ChangePasswordSection({ token, httpUrl }: { token: string; httpUrl: string }) {
+export function ChangePasswordSection({ token, httpUrl }: { token: string; httpUrl: string }) {
   const [currentPassword, setCurrentPassword] = useState('');
   const [newPassword, setNewPassword] = useState('');
   const [confirmPassword, setConfirmPassword] = useState('');
@@ -107,7 +108,7 @@ function ChangePasswordSection({ token, httpUrl }: { token: string; httpUrl: str
   );
 }
 
-function UserManagementSection({ token, httpUrl }: { token: string; httpUrl: string }) {
+export function UserManagementSection({ token, httpUrl }: { token: string; httpUrl: string }) {
   const [users, setUsers] = useState<SafeUser[]>([]);
   const [loading, setLoading] = useState(true);
   const [showCreate, setShowCreate] = useState(false);
@@ -359,7 +360,7 @@ function UserManagementSection({ token, httpUrl }: { token: string; httpUrl: str
   );
 }
 
-export default function SettingsPage({ token, httpUrl }: Props) {
+export default function SettingsPage({ token, httpUrl, context }: Props) {
   const [settings, setSettings] = useState<AccountSettings>(DEFAULT_ACCOUNT_SETTINGS);
   const [loading, setLoading] = useState(true);
   const [saveStatus, setSaveStatus] = useState<SaveStatus>('idle');
@@ -553,10 +554,14 @@ export default function SettingsPage({ token, httpUrl }: Props) {
               <div className="settings-field">
                 <label>Brokerage</label>
                 <select
-                  value={settings.liveBrokerageType ?? 'webull'}
-                  onChange={e => set('liveBrokerageType', e.target.value as 'webull')}
+                  value={settings.liveBrokerageType ?? (context === 'crypto' ? 'coinbase' : 'webull')}
+                  onChange={e => set('liveBrokerageType', e.target.value as BrokerageType)}
                 >
-                  <option value="webull">Webull</option>
+                  {context === 'crypto' ? (
+                    <option value="coinbase">Coinbase</option>
+                  ) : (
+                    <option value="webull">Webull</option>
+                  )}
                 </select>
               </div>
 
@@ -564,7 +569,7 @@ export default function SettingsPage({ token, httpUrl }: Props) {
                 <label>API Key</label>
                 <input
                   type="password"
-                  placeholder="Enter your Webull API key"
+                  placeholder={context === 'crypto' ? 'Enter your Coinbase API key' : 'Enter your Webull API key'}
                   value={settings.liveApiKey ?? ''}
                   onChange={e => set('liveApiKey', e.target.value)}
                 />
@@ -574,7 +579,7 @@ export default function SettingsPage({ token, httpUrl }: Props) {
                 <label>Account ID</label>
                 <input
                   type="text"
-                  placeholder="Enter your Webull account ID"
+                  placeholder={context === 'crypto' ? 'Enter your Coinbase account ID' : 'Enter your Webull account ID'}
                   value={settings.liveAccountId ?? ''}
                   onChange={e => set('liveAccountId', e.target.value)}
                 />
@@ -593,8 +598,8 @@ export default function SettingsPage({ token, httpUrl }: Props) {
                     onChange={() => set('liveTradeMode', 'ai_in_brokerage')}
                   />
                   <div>
-                    <strong>AI trades in Webull</strong>
-                    <p className="field-hint">AI controls your Webull account directly. Trades execute inside Webull using your Webull balance.</p>
+                    <strong>AI trades in {context === 'crypto' ? 'Coinbase' : 'Webull'}</strong>
+                    <p className="field-hint">AI controls your {context === 'crypto' ? 'Coinbase' : 'Webull'} account directly. Trades execute inside {context === 'crypto' ? 'Coinbase' : 'Webull'} using your balance.</p>
                   </div>
                 </label>
                 <label className="radio-option">
@@ -607,7 +612,7 @@ export default function SettingsPage({ token, httpUrl }: Props) {
                   />
                   <div>
                     <strong>Transfer funds to platform</strong>
-                    <p className="field-hint">Funds transfer from Webull into TradingAI, trades execute here, then profits transfer back to Webull.</p>
+                    <p className="field-hint">Funds transfer from {context === 'crypto' ? 'Coinbase' : 'Webull'} into TradingAI, trades execute here, then profits transfer back.</p>
                   </div>
                 </label>
               </div>
@@ -639,11 +644,9 @@ export default function SettingsPage({ token, httpUrl }: Props) {
         </div>
       </form>
 
-      {/* ── Change Password ───────────────────────────────────────────────── */}
-      <ChangePasswordSection token={token} httpUrl={httpUrl} />
-
-      {/* ── User Management (admin only) ──────────────────────────────────── */}
-      {isAdmin && <UserManagementSection token={token} httpUrl={httpUrl} />}
+      {/* ── Change Password & User Management (not shown in crypto context — use profile dropdown) */}
+      {!context && <ChangePasswordSection token={token} httpUrl={httpUrl} />}
+      {!context && isAdmin && <UserManagementSection token={token} httpUrl={httpUrl} />}
     </div>
   );
 }

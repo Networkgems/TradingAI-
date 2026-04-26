@@ -3,7 +3,7 @@ import type { TradeSignal, Position, AccountState, OptionPosition, OptionsAccoun
 import { OPTIONS_DAILY_LIMIT } from '@trading-app/shared';
 import LoginPage from './LoginPage.tsx';
 import ForgotPasswordPage from './ForgotPasswordPage.tsx';
-import SettingsPage from './SettingsPage.tsx';
+import SettingsPage, { ChangePasswordSection, UserManagementSection } from './SettingsPage.tsx';
 import { CalendarTab } from './CalendarTab.tsx';
 import './index.css';
 
@@ -55,12 +55,15 @@ function DashboardSelector({ onSelect }: { onSelect: (mode: 'stocks' | 'crypto')
   );
 }
 
-function CryptoDashboard({ token, onBack }: { token: string; onBack: () => void }) {
+function CryptoDashboard({ token, onBack, onLogout }: { token: string; onBack: () => void; onLogout: () => void }) {
   const [state, setState] = useState<CryptoEngineState | null>(null);
   const [news, setNews] = useState<NewsItem[]>([]);
   const [connected, setConnected] = useState(false);
   const [everConnected, setEverConnected] = useState(false);
-  const [tab, setTab] = useState<'watchlist' | 'signals' | 'positions' | 'news'>('watchlist');
+  const [tab, setTab] = useState<'watchlist' | 'signals' | 'positions' | 'news' | 'settings'>('watchlist');
+  const [profileOpen, setProfileOpen] = useState(false);
+  const [profileModal, setProfileModal] = useState<null | 'change-password' | 'user-management'>(null);
+  const [isAdmin, setIsAdmin] = useState(false);
   const wsRef = useRef<WebSocket | null>(null);
   const reconnectTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
 
@@ -117,6 +120,21 @@ function CryptoDashboard({ token, onBack }: { token: string; onBack: () => void 
     return () => clearInterval(id);
   }, [token]);
 
+  useEffect(() => {
+    fetch(`${HTTP_URL}/api/admin/users`, { headers: { Authorization: `Bearer ${token}` } })
+      .then(r => { if (r.ok) setIsAdmin(true); })
+      .catch(() => {});
+  }, [token]);
+
+  useEffect(() => {
+    if (!profileOpen) return;
+    function handleClick(e: MouseEvent) {
+      if (!(e.target as HTMLElement).closest('.profile-wrap')) setProfileOpen(false);
+    }
+    document.addEventListener('click', handleClick);
+    return () => document.removeEventListener('click', handleClick);
+  }, [profileOpen]);
+
   const account = state?.account;
   const signals = state?.signals ?? [];
   const symbols = state?.symbols ?? [];
@@ -165,6 +183,47 @@ function CryptoDashboard({ token, onBack }: { token: string; onBack: () => void 
           <div className={`status-dot ${connected ? 'live' : 'offline'}`} title={connected ? 'Live' : 'Reconnecting...'} />
           <span className="status-label">{connected ? 'LIVE' : 'Reconnecting'}</span>
           {state && <span className="last-tick">Updated {timeAgo(state.lastTick)}</span>}
+          <button
+            className={`logout-btn${tab === 'settings' ? ' active' : ''}`}
+            onClick={() => setTab(t => t === 'settings' ? 'watchlist' : 'settings')}
+            title="Account settings"
+          >
+            ⚙ Settings
+          </button>
+          <div className="profile-wrap">
+            <button
+              className="logout-btn"
+              onClick={() => setProfileOpen(o => !o)}
+              title="Profile menu"
+            >
+              &#x1F464; Profile &#9660;
+            </button>
+            {profileOpen && (
+              <div className="profile-dropdown">
+                <button
+                  className="profile-dropdown-item"
+                  onClick={() => { setProfileModal('change-password'); setProfileOpen(false); }}
+                >
+                  Change Password
+                </button>
+                {isAdmin && (
+                  <button
+                    className="profile-dropdown-item"
+                    onClick={() => { setProfileModal('user-management'); setProfileOpen(false); }}
+                  >
+                    Account Management
+                  </button>
+                )}
+                <div className="profile-dropdown-divider" />
+                <button
+                  className="profile-dropdown-item danger"
+                  onClick={onLogout}
+                >
+                  Sign Out
+                </button>
+              </div>
+            )}
+          </div>
         </div>
       </header>
 
@@ -179,7 +238,35 @@ function CryptoDashboard({ token, onBack }: { token: string; onBack: () => void 
         ))}
       </nav>
 
-      <main className="content">
+      {tab === 'settings' && (
+        <SettingsPage token={token} httpUrl={HTTP_URL} context="crypto" />
+      )}
+
+      {profileModal === 'change-password' && (
+        <div className="modal-backdrop" onClick={() => setProfileModal(null)}>
+          <div className="modal-card" onClick={e => e.stopPropagation()}>
+            <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '1rem' }}>
+              <h3 style={{ fontSize: '0.95rem', fontWeight: 700 }}>Change Password</h3>
+              <button className="btn-secondary btn-sm" onClick={() => setProfileModal(null)}>&#x2715;</button>
+            </div>
+            <ChangePasswordSection token={token} httpUrl={HTTP_URL} />
+          </div>
+        </div>
+      )}
+
+      {profileModal === 'user-management' && isAdmin && (
+        <div className="modal-backdrop" onClick={() => setProfileModal(null)}>
+          <div className="modal-card" style={{ maxWidth: '660px' }} onClick={e => e.stopPropagation()}>
+            <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '1rem' }}>
+              <h3 style={{ fontSize: '0.95rem', fontWeight: 700 }}>Account Management</h3>
+              <button className="btn-secondary btn-sm" onClick={() => setProfileModal(null)}>&#x2715;</button>
+            </div>
+            <UserManagementSection token={token} httpUrl={HTTP_URL} />
+          </div>
+        </div>
+      )}
+
+      <main className="content" style={tab === 'settings' ? { display: 'none' } : undefined}>
         {!state && !everConnected && (
           <div className="loading">
             <div className="spinner" />
@@ -989,7 +1076,7 @@ export default function App() {
   }
 
   if (appMode === 'crypto') {
-    return <CryptoDashboard token={token} onBack={goHome} />;
+    return <CryptoDashboard token={token} onBack={goHome} onLogout={handleLogout} />;
   }
 
   return <Dashboard token={token} onLogout={handleLogout} onGoHome={goHome} />;

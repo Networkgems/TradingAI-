@@ -59,7 +59,7 @@ export const MANAGED_ACCOUNT_RATIO = 0.5;   // 50% of total account auto-managed
 // ── Account Modes ─────────────────────────────────────────────────────────────
 
 export type AccountMode = 'demo' | 'live';
-export type BrokerageType = 'webull';
+export type BrokerageType = 'webull' | 'coinbase';
 export type LiveTradeMode = 'ai_in_brokerage' | 'transfer_to_platform';
 
 export interface AccountSettings {
