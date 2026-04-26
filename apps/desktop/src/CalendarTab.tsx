@@ -194,7 +194,7 @@ function YearView({ year, reports, onMonthClick }: {
 
 // ── Main CalendarTab export ──────────────────────────────────────────────────
 
-export function CalendarTab({ token, httpUrl }: { token: string; httpUrl: string }) {
+export function CalendarTab({ token, httpUrl, reportsPath = '/api/reports' }: { token: string; httpUrl: string; reportsPath?: string }) {
   const [view,    setView]    = useState<'month' | 'year'>('month');
   const [year,    setYear]    = useState(new Date().getFullYear());
   const [month,   setMonth]   = useState(new Date().getMonth()); // 0-indexed
@@ -206,7 +206,7 @@ export function CalendarTab({ token, httpUrl }: { token: string; httpUrl: string
     async function load() {
       setLoading(true);
       try {
-        const r = await fetch(`${httpUrl}/api/reports`, {
+        const r = await fetch(`${httpUrl}${reportsPath}`, {
           headers: { Authorization: `Bearer ${token}` },
         });
         if (!r.ok || cancelled) return;
@@ -214,7 +214,7 @@ export function CalendarTab({ token, httpUrl }: { token: string; httpUrl: string
 
         const results = await Promise.all(
           dates.map(d =>
-            fetch(`${httpUrl}/api/reports/${d}`, { headers: { Authorization: `Bearer ${token}` } })
+            fetch(`${httpUrl}${reportsPath}/${d}`, { headers: { Authorization: `Bearer ${token}` } })
               .then(res => (res.ok ? (res.json() as Promise<EodReport>) : null))
               .catch(() => null),
           ),

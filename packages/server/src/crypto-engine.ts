@@ -155,4 +155,12 @@ export class CryptoSignalEngine {
   getNews(): NewsItem[] {
     return [...this.newsCache];
   }
+
+  getReportSnapshot() {
+    return {
+      allClosedPositions: [...this.allClosedPositions],
+      accountState: this.account.getState(),
+      symbols: Array.from(this.symbolState.values()),
+    };
+  }
 }

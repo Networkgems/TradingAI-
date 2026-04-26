@@ -9,6 +9,7 @@ import { SignalEngine } from './signal-engine.js';
 import { CryptoSignalEngine } from './crypto-engine.js';
 import { MarketScheduler } from './scheduler.js';
 import { generateEodReport } from './reports/eod-report.js';
+import { generateCryptoEodReport } from './reports/crypto-eod-report.js';
 import { createToken, verifyToken, generateResetToken, consumeResetToken } from './auth.js';
 import { loadSettings, getSettings, saveSettings } from './account-settings.js';
 import { PnlTracker } from './pnl-tracker.js';
@@ -30,10 +31,14 @@ import { DEFAULT_ACCOUNT_SETTINGS } from '@trading-app/shared';
 const PORT = Number(process.env.PORT ?? 4242);
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const REPORTS_DIR = join(__dirname, '..', 'reports');
+const CRYPTO_REPORTS_DIR = join(__dirname, '..', 'crypto-reports');
 const DATA_DIR = join(__dirname, '..', 'data');
 
 if (!existsSync(REPORTS_DIR)) {
   await mkdir(REPORTS_DIR, { recursive: true });
+}
+if (!existsSync(CRYPTO_REPORTS_DIR)) {
+  await mkdir(CRYPTO_REPORTS_DIR, { recursive: true });
 }
 
 // Load users before starting
@@ -129,6 +134,24 @@ async function generateAndSaveReport(): Promise<void> {
   for (const client of wss.clients) {
     if (client.readyState === WebSocket.OPEN) client.send(msg);
   }
+}
+
+async function generateAndSaveCryptoReport(): Promise<void> {
+  const snapshot = cryptoEngine.getReportSnapshot();
+  const report = generateCryptoEodReport(snapshot);
+  const datePath = join(CRYPTO_REPORTS_DIR, `${report.date}.json`);
+  const mdPath = join(CRYPTO_REPORTS_DIR, `${report.date}.md`);
+  const latestJsonPath = join(CRYPTO_REPORTS_DIR, 'latest.json');
+  const latestMdPath = join(CRYPTO_REPORTS_DIR, 'latest.md');
+
+  await Promise.all([
+    writeFile(datePath, JSON.stringify(report, null, 2), 'utf-8'),
+    writeFile(mdPath, report.markdown, 'utf-8'),
+    writeFile(latestJsonPath, JSON.stringify(report, null, 2), 'utf-8'),
+    writeFile(latestMdPath, report.markdown, 'utf-8'),
+  ]);
+
+  console.log(`[crypto-reports] EOD report saved → ${datePath}`);
 }
 
 // ── REST endpoints ───────────────────────────────────────────────────────────
@@ -332,6 +355,64 @@ app.post('/api/reports/generate', requireAuth, async (_req, res) => {
   try {
     await generateAndSaveReport();
     res.json({ ok: true, message: 'EOD report generated successfully' });
+  } catch (err) {
+    res.status(500).json({ error: String(err) });
+  }
+});
+
+// ── Crypto Reports ────────────────────────────────────────────────────────────
+
+app.get('/api/crypto/reports/latest', requireAuth, async (_req, res) => {
+  const latestPath = join(CRYPTO_REPORTS_DIR, 'latest.json');
+  if (!existsSync(latestPath)) {
+    res.status(404).json({ error: 'No crypto report generated yet' });
+    return;
+  }
+  try {
+    const raw = await readFile(latestPath, 'utf-8');
+    res.json(JSON.parse(raw));
+  } catch {
+    res.status(500).json({ error: 'Failed to read crypto report' });
+  }
+});
+
+app.get('/api/crypto/reports', requireAuth, async (_req, res) => {
+  try {
+    const files = await readdir(CRYPTO_REPORTS_DIR);
+    const dates = files
+      .filter(f => /^\d{4}-\d{2}-\d{2}\.json$/.test(f))
+      .map(f => f.replace('.json', ''))
+      .sort()
+      .reverse();
+    res.json({ dates });
+  } catch {
+    res.json({ dates: [] });
+  }
+});
+
+app.get('/api/crypto/reports/:date', requireAuth, async (req, res) => {
+  const { date } = req.params as Record<string, string>;
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(date)) {
+    res.status(400).json({ error: 'Invalid date format. Use YYYY-MM-DD.' });
+    return;
+  }
+  const filePath = join(CRYPTO_REPORTS_DIR, `${date}.json`);
+  if (!existsSync(filePath)) {
+    res.status(404).json({ error: `No crypto report for ${date}` });
+    return;
+  }
+  try {
+    const raw = await readFile(filePath, 'utf-8');
+    res.json(JSON.parse(raw));
+  } catch {
+    res.status(500).json({ error: 'Failed to read crypto report' });
+  }
+});
+
+app.post('/api/crypto/reports/generate', requireAuth, async (_req, res) => {
+  try {
+    await generateAndSaveCryptoReport();
+    res.json({ ok: true, message: 'Crypto EOD report generated successfully' });
   } catch (err) {
     res.status(500).json({ error: String(err) });
   }

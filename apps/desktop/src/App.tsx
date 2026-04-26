@@ -60,7 +60,7 @@ function CryptoDashboard({ token, onBack, onLogout }: { token: string; onBack: (
   const [news, setNews] = useState<NewsItem[]>([]);
   const [connected, setConnected] = useState(false);
   const [everConnected, setEverConnected] = useState(false);
-  const [tab, setTab] = useState<'watchlist' | 'signals' | 'positions' | 'news' | 'settings'>('watchlist');
+  const [tab, setTab] = useState<'watchlist' | 'signals' | 'positions' | 'news' | 'calendar' | 'settings'>('watchlist');
   const [profileOpen, setProfileOpen] = useState(false);
   const [profileModal, setProfileModal] = useState<null | 'change-password' | 'user-management'>(null);
   const [isAdmin, setIsAdmin] = useState(false);
@@ -265,6 +265,9 @@ function CryptoDashboard({ token, onBack, onLogout }: { token: string; onBack: (
              `News (${news.length})`}
           </button>
         ))}
+        <button className={`tab ${tab === 'calendar' ? 'active' : ''}`} onClick={() => setTab('calendar')}>
+          P&amp;L Calendar
+        </button>
       </nav>
 
       {tab === 'settings' && (
@@ -456,6 +459,10 @@ function CryptoDashboard({ token, onBack, onLogout }: { token: string; onBack: (
               </div>
             )}
           </div>
+        )}
+
+        {tab === 'calendar' && (
+          <CalendarTab token={token} httpUrl={HTTP_URL} reportsPath="/api/crypto/reports" />
         )}
       </main>
     </div>
