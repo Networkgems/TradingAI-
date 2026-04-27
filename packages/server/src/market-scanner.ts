@@ -1,7 +1,7 @@
 import YahooFinance from 'yahoo-finance2';
 import { WATCHLIST, CRYPTO_WATCHLIST } from '@trading-app/shared';
 
-const yf = new YahooFinance({ validation: { logErrors: false } });
+const yf = new YahooFinance({ suppressNotices: ['yahooSurvey'], validation: { logErrors: true } });
 
 const CMC_API_KEY = process.env.CMC_API_KEY ?? '';
 const CMC_BASE = 'https://pro-api.coinmarketcap.com';
@@ -36,7 +36,9 @@ export async function scanStocksMarket(): Promise<ScanResult[]> {
         collected.push({ symbol: q.symbol, reason: 'gainer', changePct: q.regularMarketChangePercent });
       }
     }
-  } catch { /* screener may fail outside market hours */ }
+  } catch (err: unknown) {
+    console.warn('[market-scanner] screener(day_gainers):', err instanceof Error ? err.message : String(err));
+  }
 
   // Day losers (big moves worth watching)
   try {
@@ -46,7 +48,9 @@ export async function scanStocksMarket(): Promise<ScanResult[]> {
         collected.push({ symbol: q.symbol, reason: 'loser', changePct: q.regularMarketChangePercent });
       }
     }
-  } catch { /* ignore */ }
+  } catch (err: unknown) {
+    console.warn('[market-scanner] screener(day_losers):', err instanceof Error ? err.message : String(err));
+  }
 
   // Most active by volume
   try {
@@ -56,7 +60,9 @@ export async function scanStocksMarket(): Promise<ScanResult[]> {
         collected.push({ symbol: q.symbol, reason: 'volume', volume: q.regularMarketVolume });
       }
     }
-  } catch { /* ignore */ }
+  } catch (err: unknown) {
+    console.warn('[market-scanner] screener(most_actives):', err instanceof Error ? err.message : String(err));
+  }
 
   // Trending symbols (news/search-driven)
   try {
@@ -67,7 +73,9 @@ export async function scanStocksMarket(): Promise<ScanResult[]> {
         collected.push({ symbol: q.symbol, reason: 'trending' });
       }
     }
-  } catch { /* ignore */ }
+  } catch (err: unknown) {
+    console.warn('[market-scanner] trendingSymbols:', err instanceof Error ? err.message : String(err));
+  }
 
   return filterNew(dedup(collected), WATCHLIST);
 }
@@ -121,7 +129,9 @@ export async function scanCryptoMarket(): Promise<ScanResult[]> {
         collected.push({ symbol: q.symbol, reason: 'trending' });
       }
     }
-  } catch { /* ignore */ }
+  } catch (err: unknown) {
+    console.warn('[market-scanner] trendingSymbols(crypto):', err instanceof Error ? err.message : String(err));
+  }
 
   return filterNew(dedup(collected), CRYPTO_WATCHLIST);
 }

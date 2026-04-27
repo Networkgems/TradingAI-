@@ -1,11 +1,18 @@
 import YahooFinance from 'yahoo-finance2';
 import type { Candle, NewsItem } from '@trading-app/shared';
 
-const yf = new YahooFinance({ validation: { logErrors: false } });
+const yf = new YahooFinance({
+  suppressNotices: ['yahooSurvey'],
+  validation: { logErrors: true },
+});
 const sleep = (ms: number) => new Promise(resolve => setTimeout(resolve, ms));
 
 const CMC_API_KEY = process.env.CMC_API_KEY ?? '';
 const CMC_BASE = 'https://pro-api.coinmarketcap.com';
+
+if (!CMC_API_KEY) {
+  console.warn('[crypto-feed] CMC_API_KEY is not set — CoinMarketCap fallback disabled');
+}
 
 // Convert Yahoo Finance crypto symbol format to CMC symbol (BTC-USD -> BTC)
 function toCMCSymbol(yahooSymbol: string): string {
@@ -22,7 +29,10 @@ async function fetchCMCBatchQuotes(
       `${CMC_BASE}/v1/cryptocurrency/quotes/latest?symbol=${cmcSymbolList}&convert=USD`,
       { headers: { 'X-CMC_PRO_API_KEY': CMC_API_KEY, Accept: 'application/json' } },
     );
-    if (!resp.ok) return new Map();
+    if (!resp.ok) {
+      console.error(`[crypto-feed] CMC quotes/latest HTTP ${resp.status} for ${cmcSymbolList}`);
+      return new Map();
+    }
     const json = (await resp.json()) as any;
     const results = new Map<string, { price: number; volume: number; change: number; changePct: number }>();
     for (const sym of symbols) {
@@ -38,7 +48,8 @@ async function fetchCMCBatchQuotes(
       });
     }
     return results;
-  } catch {
+  } catch (err: unknown) {
+    console.error('[crypto-feed] CMC batch quotes error:', err instanceof Error ? err.message : String(err));
     return new Map();
   }
 }
@@ -62,7 +73,8 @@ export async function fetchCryptoDailyBars(symbol: string, count = 260): Promise
         volume: q.volume!,
       }))
       .slice(-count);
-  } catch {
+  } catch (err: unknown) {
+    console.error(`[crypto-feed] fetchCryptoDailyBars(${symbol}):`, err instanceof Error ? err.message : String(err));
     return [];
   }
 }
@@ -91,7 +103,8 @@ export async function fetchCryptoMinuteBars(symbol: string, count = 60): Promise
         volume: q.volume!,
       }))
       .slice(-count);
-  } catch {
+  } catch (err: unknown) {
+    console.error(`[crypto-feed] fetchCryptoMinuteBars(${symbol}):`, err instanceof Error ? err.message : String(err));
     return [];
   }
 }
@@ -109,8 +122,9 @@ export async function fetchCryptoQuote(
         changePct: q.regularMarketChangePercent ?? 0,
       };
     }
-  } catch {
-    // fall through to CoinMarketCap fallback
+    console.warn(`[crypto-feed] quote(${symbol}) returned no regularMarketPrice — trying CMC`);
+  } catch (err: unknown) {
+    console.warn(`[crypto-feed] quote(${symbol}) YF error: ${err instanceof Error ? err.message : String(err)} — trying CMC`);
   }
   const cmcResults = await fetchCMCBatchQuotes([symbol]);
   return cmcResults.get(symbol) ?? null;
@@ -133,18 +147,25 @@ export async function fetchCryptoQuotes(
           changePct: q.regularMarketChangePercent ?? 0,
         });
       } else {
+        console.warn(`[crypto-feed] quote(${sym}) no regularMarketPrice — queuing CMC fallback`);
         failed.push(sym);
       }
-    } catch {
+    } catch (err: unknown) {
+      console.warn(`[crypto-feed] quote(${sym}) YF error: ${err instanceof Error ? err.message : String(err)} — queuing CMC fallback`);
       failed.push(sym);
     }
     await sleep(200);
   }
 
   if (failed.length > 0) {
+    console.log(`[crypto-feed] CMC fallback for ${failed.length} symbols: ${failed.join(', ')}`);
     const cmcResults = await fetchCMCBatchQuotes(failed);
     for (const [sym, quote] of cmcResults) {
       results.set(sym, quote);
+    }
+    const stillFailed = failed.filter(s => !cmcResults.has(s));
+    if (stillFailed.length > 0) {
+      console.error(`[crypto-feed] fetchCryptoQuotes: ${stillFailed.length} symbols had no data from YF or CMC: ${stillFailed.join(', ')}`);
     }
   }
 
@@ -160,7 +181,17 @@ export async function fetchCryptoNews(): Promise<NewsItem[]> {
       source: n.publisher ?? 'Yahoo Finance',
       publishedAt: new Date(Number(n.providerPublishTime ?? 0) * 1000).toISOString(),
     }));
-  } catch {
+  } catch (err: unknown) {
+    console.error('[crypto-feed] fetchCryptoNews error:', err instanceof Error ? err.message : String(err));
     return [];
   }
+}
+
+/** Test CoinMarketCap connectivity — returns top coin or throws. */
+export async function testCoinMarketCap(): Promise<{ symbol: string; price: number } | null> {
+  if (!CMC_API_KEY) return null;
+  const results = await fetchCMCBatchQuotes(['BTC-USD']);
+  const btc = results.get('BTC-USD');
+  if (!btc) throw new Error('No BTC-USD data from CMC');
+  return { symbol: 'BTC-USD', price: btc.price };
 }

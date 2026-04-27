@@ -695,6 +695,32 @@ app.post('/api/crypto/positions/:id/close', requireAuth, (req, res) => {
   res.json({ ok: true });
 });
 
+// ── Data-source health check ─────────────────────────────────────────────────
+// GET /api/health/quotes  — tests Yahoo Finance + CMC connectivity
+// No auth required so it can be called from Render health checks.
+
+app.get('/api/health/quotes', async (_req, res) => {
+  const { testYahooFinance } = await import('./yahoo-feed.js');
+  const { testCoinMarketCap } = await import('./crypto-feed.js');
+  const results: Record<string, unknown> = {};
+
+  try {
+    results['yahooFinance'] = await testYahooFinance();
+  } catch (err: unknown) {
+    results['yahooFinance'] = { error: err instanceof Error ? err.message : String(err) };
+  }
+
+  try {
+    const cmc = await testCoinMarketCap();
+    results['coinMarketCap'] = cmc ?? { skipped: 'CMC_API_KEY not set' };
+  } catch (err: unknown) {
+    results['coinMarketCap'] = { error: err instanceof Error ? err.message : String(err) };
+  }
+
+  const allOk = Object.values(results).every(v => v && typeof v === 'object' && !('error' in (v as object)));
+  res.status(allOk ? 200 : 502).json({ ok: allOk, results, ts: new Date().toISOString() });
+});
+
 // ── WebSocket ────────────────────────────────────────────────────────────────
 
 const httpServer = createServer(app);
