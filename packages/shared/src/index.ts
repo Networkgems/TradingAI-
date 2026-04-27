@@ -71,6 +71,9 @@ export interface AccountSettings {
   dailyTradesLimit: number;
   managedAccountRatio: number;
   riskPerTrade: number;
+  // Auto-trading persistence — survives server restarts
+  stocksAutoTradingEnabled: boolean;
+  cryptoAutoTradingEnabled: boolean;
   // Live mode settings
   liveBrokerageType?: BrokerageType;
   liveTradeMode?: LiveTradeMode;
@@ -86,6 +89,8 @@ export const DEFAULT_ACCOUNT_SETTINGS: AccountSettings = {
   dailyTradesLimit: 10,
   managedAccountRatio: 0.5,
   riskPerTrade: 0.01,
+  stocksAutoTradingEnabled: true,
+  cryptoAutoTradingEnabled: true,
   liveBrokerageType: 'webull',
   liveTradeMode: 'ai_in_brokerage',
   liveApiKey: '',

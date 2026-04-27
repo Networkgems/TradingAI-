@@ -119,6 +119,12 @@ const savedStocks = getStocksWatchlistData();
 for (const sym of savedStocks.hidden) engine.removeSymbol(sym);
 for (const sym of savedStocks.added) engine.addSymbol(sym);
 
+// Restore persisted auto-trading state (default true when field missing from old settings)
+engine.setAutoTrading(initialSettings.stocksAutoTradingEnabled ?? true);
+cryptoEngine.setAutoTrading(initialSettings.cryptoAutoTradingEnabled ?? true);
+console.log(`[startup] stocks auto-trading: ${initialSettings.stocksAutoTradingEnabled ?? true}`);
+console.log(`[startup] crypto auto-trading: ${initialSettings.cryptoAutoTradingEnabled ?? true}`);
+
 // ── EOD Report generation ────────────────────────────────────────────────────
 
 async function generateAndSaveReport(): Promise<void> {
@@ -524,14 +530,18 @@ app.post('/api/account/reset-demo', requireAuth, async (_req, res) => {
 
 // ── Trading controls ──────────────────────────────────────────────────────────
 
-app.post('/api/trading/start', requireAuth, (_req, res) => {
+app.post('/api/trading/start', requireAuth, async (_req, res) => {
   engine.setAutoTrading(true);
+  const s = getSettings();
+  await saveSettings({ ...s, stocksAutoTradingEnabled: true });
   broadcastEngineState();
   res.json({ ok: true, autoTradingEnabled: true });
 });
 
-app.post('/api/trading/stop', requireAuth, (_req, res) => {
+app.post('/api/trading/stop', requireAuth, async (_req, res) => {
   engine.setAutoTrading(false);
+  const s = getSettings();
+  await saveSettings({ ...s, stocksAutoTradingEnabled: false });
   broadcastEngineState();
   res.json({ ok: true, autoTradingEnabled: false });
 });
@@ -562,14 +572,18 @@ app.post('/api/options/:id/close', requireAuth, (req, res) => {
   res.json({ ok: true });
 });
 
-app.post('/api/crypto/trading/start', requireAuth, (_req, res) => {
+app.post('/api/crypto/trading/start', requireAuth, async (_req, res) => {
   cryptoEngine.setAutoTrading(true);
+  const s = getSettings();
+  await saveSettings({ ...s, cryptoAutoTradingEnabled: true });
   broadcastCryptoState();
   res.json({ ok: true, autoTradingEnabled: true });
 });
 
-app.post('/api/crypto/trading/stop', requireAuth, (_req, res) => {
+app.post('/api/crypto/trading/stop', requireAuth, async (_req, res) => {
   cryptoEngine.setAutoTrading(false);
+  const s = getSettings();
+  await saveSettings({ ...s, cryptoAutoTradingEnabled: false });
   broadcastCryptoState();
   res.json({ ok: true, autoTradingEnabled: false });
 });
@@ -767,9 +781,13 @@ httpServer.listen(PORT, () => {
   console.log(`Reports directory: ${REPORTS_DIR}`);
 });
 
-process.on('SIGINT', () => {
+function gracefulShutdown(signal: string): void {
+  console.log(`[shutdown] received ${signal} — stopping engines`);
   engine.stop();
   cryptoEngine.stop();
   scheduler.stop();
   process.exit(0);
-});
+}
+
+process.on('SIGINT', () => gracefulShutdown('SIGINT'));
+process.on('SIGTERM', () => gracefulShutdown('SIGTERM'));

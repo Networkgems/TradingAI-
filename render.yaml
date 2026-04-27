@@ -5,6 +5,7 @@ services:
     plan: starter
     buildCommand: pnpm install --frozen-lockfile && pnpm run web:build
     startCommand: node packages/server/dist/index.js
+    healthCheckPath: /api/health
     disk:
       name: tradingai-data
       mountPath: /data
