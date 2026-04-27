@@ -35,6 +35,11 @@ export class PaperAccount {
     this.dailyPnl = 0;
   }
 
+  updateConfig(config: PaperAccountConfig): void {
+    if (config.managedAccountRatio !== undefined) this.managedAccountRatio = config.managedAccountRatio;
+    if (config.riskPerTrade !== undefined) this.riskPerTrade = config.riskPerTrade;
+  }
+
   getState(): AccountState {
     return {
       totalEquity: this.equity,

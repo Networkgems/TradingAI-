@@ -68,6 +68,11 @@ export class PaperOptionsAccount {
     this.currentDayKey = toDateKey(Date.now());
   }
 
+  updateConfig(config: OptionsAccountConfig): void {
+    if (config.managedAccountRatio !== undefined) this.managedAccountRatio = config.managedAccountRatio;
+    if (config.dailyTradesLimit !== undefined) this.dailyTradesLimit = config.dailyTradesLimit;
+  }
+
   getState(): OptionsAccountState {
     return {
       openOptions: Array.from(this.openOptions.values()),

@@ -132,15 +132,28 @@ export class SignalEngine {
     });
   }
 
-  /** Apply new demo account settings and reset both accounts. */
+  /** Update demo account config parameters without resetting equity or positions. */
   applySettings(settings: AccountSettings): void {
+    this.account.updateConfig({
+      managedAccountRatio: settings.managedAccountRatio,
+      riskPerTrade: settings.riskPerTrade,
+    });
+    this.optionsAccount.updateConfig({
+      managedAccountRatio: settings.managedAccountRatio,
+      dailyTradesLimit: settings.dailyTradesLimit,
+    });
+  }
+
+  /** Explicit full reset — clears positions and resets equity to saved or configured value. */
+  forceReset(settings: AccountSettings): void {
+    const equity = this.tracker?.getSavedEquity() ?? settings.demoEquity;
     this.account.reset({
-      initialEquity: settings.demoEquity,
+      initialEquity: equity,
       managedAccountRatio: settings.managedAccountRatio,
       riskPerTrade: settings.riskPerTrade,
     });
     this.optionsAccount.reset({
-      initialEquity: settings.demoEquity,
+      initialEquity: equity,
       managedAccountRatio: settings.managedAccountRatio,
       dailyTradesLimit: settings.dailyTradesLimit,
     });

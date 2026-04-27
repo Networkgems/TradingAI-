@@ -9,11 +9,26 @@ export class CryptoPaperAccount {
   private cash: number;
   private positions: Map<string, Position> = new Map();
   private openingEquityToday: number;
+  private initialEquity: number;
 
   constructor(savedEquity = INITIAL_EQUITY, openingEquityToday = savedEquity) {
+    this.initialEquity = savedEquity;
     this.equity = savedEquity;
     this.cash = savedEquity;
     this.openingEquityToday = openingEquityToday;
+  }
+
+  reset(savedEquity?: number): void {
+    const eq = savedEquity ?? this.initialEquity;
+    this.initialEquity = eq;
+    this.equity = eq;
+    this.cash = eq;
+    this.openingEquityToday = eq;
+    this.positions.clear();
+  }
+
+  getInitialEquity(): number {
+    return this.initialEquity;
   }
 
   getState(): Omit<AccountState, 'weeklyPnl' | 'monthlyPnl' | 'yearlyPnl' | 'allTimePnl'> {

@@ -95,8 +95,9 @@ function requireAdmin(req: express.Request, res: express.Response, next: express
 
 const initialSettings = await loadSettings();
 const tracker = new PnlTracker(DATA_DIR, initialSettings.demoEquity);
+const cryptoTracker = new PnlTracker(join(DATA_DIR, 'crypto'), initialSettings.demoEquity);
 const engine = new SignalEngine(initialSettings, tracker);
-const cryptoEngine = new CryptoSignalEngine();
+const cryptoEngine = new CryptoSignalEngine(cryptoTracker);
 const scheduler = new MarketScheduler();
 
 // ── EOD Report generation ────────────────────────────────────────────────────
@@ -470,7 +471,7 @@ app.put('/api/account/settings', requireAuth, async (req, res) => {
 
 app.post('/api/account/reset-demo', requireAuth, async (_req, res) => {
   const settings = getSettings();
-  engine.applySettings(settings);
+  engine.forceReset(settings);
   broadcastEngineState();
   res.json({ ok: true });
 });
