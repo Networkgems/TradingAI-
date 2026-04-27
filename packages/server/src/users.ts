@@ -9,6 +9,9 @@ const scryptAsync = promisify(scrypt);
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const DATA_DIR = process.env.DATA_DIR ?? join(__dirname, '..', 'data');
 const USERS_FILE = join(DATA_DIR, 'users.json');
+// Tracks which ADMIN_PASSWORD value has already been applied so restarts don't
+// overwrite a password the admin deliberately changed via the UI.
+const ADMIN_RESET_MARKER = join(DATA_DIR, 'admin-reset-applied.json');
 
 export interface User {
   username: string;
@@ -76,15 +79,29 @@ export async function loadUsers(): Promise<void> {
     users = [];
   }
 
-  // If ADMIN_PASSWORD env var is set, force-update the admin account password.
-  // This lets operators reset a forgotten/unknown admin password via Render env vars.
+  // If ADMIN_PASSWORD env var is set, force-update the admin account password —
+  // but only once per unique value. A marker file records a fingerprint of the
+  // last-applied value so that server restarts don't overwrite a password the
+  // admin has since changed via the UI.
   const forcePassword = process.env.ADMIN_PASSWORD;
   if (forcePassword) {
     const adminIdx = users.findIndex(u => u.username === 'admin');
     if (adminIdx !== -1) {
-      users[adminIdx].passwordHash = await hashPassword(forcePassword);
-      await persistUsers();
-      console.log('[TradingAI] Admin password updated from ADMIN_PASSWORD env var.');
+      const fingerprint = ((await scryptAsync(forcePassword, 'admin-reset-marker', 32)) as Buffer).toString('hex');
+      let lastApplied: string | null = null;
+      try {
+        if (existsSync(ADMIN_RESET_MARKER)) {
+          const raw = await readFile(ADMIN_RESET_MARKER, 'utf-8');
+          lastApplied = (JSON.parse(raw) as { fingerprint: string }).fingerprint ?? null;
+        }
+      } catch { /* treat as not applied */ }
+
+      if (lastApplied !== fingerprint) {
+        users[adminIdx].passwordHash = await hashPassword(forcePassword);
+        await persistUsers();
+        await writeFile(ADMIN_RESET_MARKER, JSON.stringify({ fingerprint }), 'utf-8');
+        console.log('[TradingAI] Admin password updated from ADMIN_PASSWORD env var.');
+      }
     }
   }
 }
