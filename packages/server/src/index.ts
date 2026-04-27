@@ -105,8 +105,8 @@ function requireAdmin(req: express.Request, res: express.Response, next: express
 // ── Engines ───────────────────────────────────────────────────────────────────
 
 const initialSettings = await loadSettings();
-const tracker = new PnlTracker(DATA_DIR, initialSettings.demoEquity);
-const cryptoTracker = new PnlTracker(join(DATA_DIR, 'crypto'), initialSettings.demoEquity);
+const tracker = new PnlTracker(DATA_DIR, initialSettings.demoEquityStocks ?? initialSettings.demoEquity);
+const cryptoTracker = new PnlTracker(join(DATA_DIR, 'crypto'), initialSettings.demoEquityCrypto ?? initialSettings.demoEquity);
 const engine = new SignalEngine(initialSettings, tracker);
 const cryptoEngine = new CryptoSignalEngine(cryptoTracker);
 const scheduler = new MarketScheduler();

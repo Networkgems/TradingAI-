@@ -152,7 +152,7 @@ export class SignalEngine {
 
   /** Explicit full reset — clears positions and resets equity to saved or configured value. */
   forceReset(settings: AccountSettings): void {
-    const equity = this.tracker?.getSavedEquity() ?? settings.demoEquity;
+    const equity = this.tracker?.getSavedEquity() ?? settings.demoEquityStocks ?? settings.demoEquity;
     this.account.reset({
       initialEquity: equity,
       managedAccountRatio: settings.managedAccountRatio,
