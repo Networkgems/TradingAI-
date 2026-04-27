@@ -3,6 +3,7 @@ import { CRYPTO_WATCHLIST } from '@trading-app/shared';
 import type { TradeSignal, Candle, AccountState, Position, CryptoEngineState, NewsItem, AccountSettings } from '@trading-app/shared';
 import { fetchCryptoMinuteBars, fetchCryptoDailyBars, fetchCryptoQuotes, fetchCryptoNews } from './crypto-feed.js';
 import { CryptoPaperAccount } from './crypto-account.js';
+import type { PnlTracker } from './pnl-tracker.js';
 
 export type CryptoEngineEventHandler = (state: CryptoEngineState) => void;
 
@@ -21,7 +22,7 @@ export class CryptoSignalEngine {
   private readonly scalping = new ScalpingStrategy({ enforceTimeFilter: false });
   private readonly swing = new SwingStrategy();
   private readonly account: CryptoPaperAccount;
-  private initialEquity: number;
+  private readonly tracker: PnlTracker | undefined;
 
   private symbolState: Map<string, CryptoEngineState['symbols'][number]> = new Map();
   private candleCache: Map<string, Candle[]> = new Map();
@@ -39,15 +40,19 @@ export class CryptoSignalEngine {
   private handlers: CryptoEngineEventHandler[] = [];
   private autoTradingEnabled = true;
 
-  constructor(settings?: AccountSettings) {
-    const equity = settings?.mode === 'demo' ? (settings.demoEquityCrypto ?? settings.demoEquity ?? 25_000) : 0;
-    this.initialEquity = equity;
-    this.account = new CryptoPaperAccount(equity);
+  constructor(tracker?: PnlTracker) {
+    this.tracker = tracker;
+    const savedEquity = tracker?.getSavedEquity();
+    this.account = new CryptoPaperAccount(savedEquity);
   }
 
-  applySettings(settings: AccountSettings): void {
-    const equity = settings.mode === 'demo' ? (settings.demoEquityCrypto ?? settings.demoEquity) : 0;
-    this.initialEquity = equity;
+  applySettings(_settings: AccountSettings): void {
+    // Crypto equity is managed via the tracker; settings changes do not reset positions.
+  }
+
+  /** Full reset — clears positions and resets equity to saved/configured value. */
+  forceReset(initialEquity?: number): void {
+    const equity = initialEquity ?? this.tracker?.getSavedEquity() ?? this.account.getInitialEquity();
     this.account.reset(equity);
     this.recentSignals = [];
     this.allClosedPositions = [];
@@ -130,6 +135,7 @@ export class CryptoSignalEngine {
     const closed = this.account.checkExits(prices);
     if (closed.length > 0) {
       this.allClosedPositions.push(...closed);
+      this.tracker?.saveEquity(this.account.getEquity(), 0);
     }
 
     // Fetch candles in parallel batches to avoid 60-100s sequential delay for 50 symbols
@@ -204,7 +210,7 @@ export class CryptoSignalEngine {
       weeklyPnl: 0,
       monthlyPnl: 0,
       yearlyPnl: 0,
-      allTimePnl: accountBase.totalEquity - this.initialEquity,
+      allTimePnl: accountBase.totalEquity - this.account.getInitialEquity(),
     };
 
     return {
@@ -224,7 +230,10 @@ export class CryptoSignalEngine {
 
   manualClosePosition(positionId: string, currentPrice: number): Position | null {
     const closed = this.account.closePosition(positionId, currentPrice);
-    if (closed) this.allClosedPositions.push(closed);
+    if (closed) {
+      this.allClosedPositions.push(closed);
+      this.tracker?.saveEquity(this.account.getEquity(), 0);
+    }
     return closed;
   }
 

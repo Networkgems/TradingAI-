@@ -106,8 +106,9 @@ function requireAdmin(req: express.Request, res: express.Response, next: express
 
 const initialSettings = await loadSettings();
 const tracker = new PnlTracker(DATA_DIR, initialSettings.demoEquity);
+const cryptoTracker = new PnlTracker(join(DATA_DIR, 'crypto'), initialSettings.demoEquity);
 const engine = new SignalEngine(initialSettings, tracker);
-const cryptoEngine = new CryptoSignalEngine(initialSettings);
+const cryptoEngine = new CryptoSignalEngine(cryptoTracker);
 const scheduler = new MarketScheduler();
 
 // Restore persisted watchlist overrides into engines
@@ -521,8 +522,9 @@ app.put('/api/account/settings', requireAuth, async (req, res) => {
 
 app.post('/api/account/reset-demo', requireAuth, async (_req, res) => {
   const settings = getSettings();
-  engine.applySettings(settings);
-  cryptoEngine.applySettings(settings);
+  engine.forceReset(settings);
+  const cryptoEquity = settings.demoEquityCrypto ?? settings.demoEquity;
+  cryptoEngine.forceReset(cryptoEquity);
   broadcastEngineState();
   broadcastCryptoState();
   res.json({ ok: true });

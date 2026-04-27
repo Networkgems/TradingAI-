@@ -136,9 +136,21 @@ export class SignalEngine {
     });
   }
 
-  /** Apply account settings and reset both accounts. Uses 0 equity for live mode (no connected brokerage). */
+  /** Update demo account config parameters without resetting equity or positions. */
   applySettings(settings: AccountSettings): void {
-    const equity = settings.mode === 'live' ? 0 : (settings.demoEquityStocks ?? settings.demoEquity);
+    this.account.updateConfig({
+      managedAccountRatio: settings.managedAccountRatio,
+      riskPerTrade: settings.riskPerTrade,
+    });
+    this.optionsAccount.updateConfig({
+      managedAccountRatio: settings.managedAccountRatio,
+      dailyTradesLimit: settings.dailyTradesLimit,
+    });
+  }
+
+  /** Explicit full reset — clears positions and resets equity to saved or configured value. */
+  forceReset(settings: AccountSettings): void {
+    const equity = this.tracker?.getSavedEquity() ?? settings.demoEquity;
     this.account.reset({
       initialEquity: equity,
       managedAccountRatio: settings.managedAccountRatio,
