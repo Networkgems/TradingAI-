@@ -125,7 +125,7 @@ function ProfileMenu({ onChangePassword, onUserManagement, onLogout, isAdmin }: 
   );
 }
 
-function CryptoDashboard({ token, onBack, onLogout }: { token: string; onBack: () => void; onLogout: () => void }) {
+function CryptoDashboard({ token, onBack, onLogout, onActivity }: { token: string; onBack: () => void; onLogout: () => void; onActivity?: () => void }) {
   const [state, setState] = useState<CryptoEngineState | null>(null);
   const [news, setNews] = useState<NewsItem[]>([]);
   const [connected, setConnected] = useState(false);
@@ -155,6 +155,7 @@ function CryptoDashboard({ token, onBack, onLogout }: { token: string; onBack: (
         try {
           const msg = JSON.parse(e.data as string);
           if (msg.type === 'crypto_state') { setState(msg.payload as CryptoEngineState); setEverConnected(true); }
+          onActivity?.();
         } catch { /* ignore */ }
       };
     }
@@ -625,7 +626,7 @@ function signalLabel(type: string) {
   }
 }
 
-function Dashboard({ token, onLogout, onGoHome }: { token: string; onLogout: () => void; onGoHome: () => void }) {
+function Dashboard({ token, onLogout, onGoHome, onActivity }: { token: string; onLogout: () => void; onGoHome: () => void; onActivity?: () => void }) {
   const [state, setState] = useState<AppState | null>(null);
   const [eodReport, setEodReport] = useState<EodReport | null>(null);
   const [eodCollapsed, setEodCollapsed] = useState(false);
@@ -661,6 +662,7 @@ function Dashboard({ token, onLogout, onGoHome }: { token: string; onLogout: () 
           const msg = JSON.parse(e.data as string);
           if (msg.type === 'state') setState(msg.payload as AppState);
           if (msg.type === 'eod_report') setEodReport(msg.payload as EodReport);
+          onActivity?.();
         } catch { /* ignore malformed */ }
       };
     }
@@ -1456,8 +1458,8 @@ export default function App() {
   const mainContent = appMode === null
     ? <DashboardSelector onSelect={selectMode} onLogout={handleLogout} />
     : appMode === 'crypto'
-      ? <CryptoDashboard token={token} onBack={goHome} onLogout={handleLogout} />
-      : <Dashboard token={token} onLogout={handleLogout} onGoHome={goHome} />;
+      ? <CryptoDashboard token={token} onBack={goHome} onLogout={handleLogout} onActivity={() => resetIdleTimerRef.current()} />
+      : <Dashboard token={token} onLogout={handleLogout} onGoHome={goHome} onActivity={() => resetIdleTimerRef.current()} />;
 
   return (
     <>
