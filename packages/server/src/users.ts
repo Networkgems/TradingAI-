@@ -75,6 +75,18 @@ export async function loadUsers(): Promise<void> {
   } catch {
     users = [];
   }
+
+  // If ADMIN_PASSWORD env var is set, force-update the admin account password.
+  // This lets operators reset a forgotten/unknown admin password via Render env vars.
+  const forcePassword = process.env.ADMIN_PASSWORD;
+  if (forcePassword) {
+    const adminIdx = users.findIndex(u => u.username === 'admin');
+    if (adminIdx !== -1) {
+      users[adminIdx].passwordHash = await hashPassword(forcePassword);
+      await persistUsers();
+      console.log('[TradingAI] Admin password updated from ADMIN_PASSWORD env var.');
+    }
+  }
 }
 
 export function getUser(username: string): User | undefined {

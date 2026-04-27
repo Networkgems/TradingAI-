@@ -20,6 +20,8 @@ services:
         value: /data
       - key: APP_URL
         sync: false
+      - key: ADMIN_PASSWORD
+        sync: false
       - key: SMTP_HOST
         sync: false
       - key: SMTP_PORT
