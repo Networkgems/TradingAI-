@@ -1,5 +1,6 @@
 import YahooFinance from 'yahoo-finance2';
 import type { Candle, NewsItem } from '@trading-app/shared';
+import { fetchStooqQuote } from './stooq-feed.js';
 
 const yf = new YahooFinance({
   suppressNotices: ['yahooSurvey'],
@@ -70,19 +71,31 @@ export async function fetchMinuteBars(symbol: string, count = 60): Promise<Candl
     .slice(-count);
 }
 
-/** Fetch the current quote for a symbol. */
+/**
+ * Fetch the current quote for a symbol.
+ *
+ * Tries Yahoo Finance first; falls back to Stooq on failure (TRA-136).
+ * Stooq is delayed ~15 min and the change% is derived from the intraday
+ * open rather than previous close, but it keeps the EOD report from
+ * showing all-zero quotes when Yahoo is unavailable.
+ */
 export async function fetchQuote(symbol: string): Promise<{ price: number; volume: number; change: number; changePct: number } | null> {
   const q = await withRetry(() => yf.quote(symbol), `quote(${symbol})`);
-  if (!q || q.regularMarketPrice == null) {
-    if (q) console.warn(`[yahoo-feed] quote(${symbol}) returned no regularMarketPrice`);
-    return null;
+  if (q && q.regularMarketPrice != null) {
+    return {
+      price: q.regularMarketPrice,
+      volume: q.regularMarketVolume ?? 0,
+      change: q.regularMarketChange ?? 0,
+      changePct: q.regularMarketChangePercent ?? 0,
+    };
   }
-  return {
-    price: q.regularMarketPrice,
-    volume: q.regularMarketVolume ?? 0,
-    change: q.regularMarketChange ?? 0,
-    changePct: q.regularMarketChangePercent ?? 0,
-  };
+  if (q) console.warn(`[yahoo-feed] quote(${symbol}) returned no regularMarketPrice — falling back to Stooq`);
+  const stooq = await fetchStooqQuote(symbol);
+  if (stooq) {
+    console.info(`[yahoo-feed] ${symbol}: served from Stooq fallback`);
+    return stooq;
+  }
+  return null;
 }
 
 /**

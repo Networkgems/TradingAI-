@@ -59,7 +59,11 @@ function toTradeEntry(pos: Position, signalType: SignalType): EodTradeEntry {
 }
 
 function top5Movers(symbols: SymbolState[]): EodMover[] {
+  // TRA-136: drop symbols that were never successfully fetched (lastUpdated === 0)
+  // so the report shows "_No data._" rather than five rows of 0.00% when the feed
+  // is failing on cold start.
   return [...symbols]
+    .filter(s => s.lastUpdated > 0 && s.price > 0)
     .sort((a, b) => Math.abs(b.changePct) - Math.abs(a.changePct))
     .slice(0, 5)
     .map(s => ({ symbol: s.symbol, price: s.price, changePct: s.changePct }));

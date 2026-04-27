@@ -204,6 +204,27 @@ describe('generateEodReport', () => {
     expect(report.realizedPnl).toBe(0);
   });
 
+  it('omits never-fetched symbols (lastUpdated=0) from top movers (TRA-136)', () => {
+    const stateNoQuotes = makeEngineState({
+      symbols: [
+        { symbol: 'AAPL',  price: 0, volume: 0, change: 0, changePct: 0, lastUpdated: 0 },
+        { symbol: 'MSFT',  price: 0, volume: 0, change: 0, changePct: 0, lastUpdated: 0 },
+        { symbol: 'NVDA',  price: 0, volume: 0, change: 0, changePct: 0, lastUpdated: 0 },
+        { symbol: 'GOOGL', price: 0, volume: 0, change: 0, changePct: 0, lastUpdated: 0 },
+        { symbol: 'AMZN',  price: 0, volume: 0, change: 0, changePct: 0, lastUpdated: 0 },
+      ],
+    });
+    const report = generateEodReport({
+      state: stateNoQuotes,
+      allClosedPositions: [],
+      dailySignals: [],
+      signalTypeMap: new Map(),
+    });
+
+    expect(report.top5Movers).toHaveLength(0);
+    expect(report.markdown).toContain('_No data._');
+  });
+
   it('calculates unrealized P&L from open positions vs current prices', () => {
     const openPos = makePosition({
       id: 'open-pos',
