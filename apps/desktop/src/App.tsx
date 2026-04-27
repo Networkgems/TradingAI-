@@ -138,8 +138,10 @@ function CryptoDashboard({ token, onBack, onLogout, onActivity }: { token: strin
   const [watchlistInput, setWatchlistInput] = useState('');
   const [watchlistError, setWatchlistError] = useState('');
   const [scanning, setScanning] = useState(false);
+  const [scanStatus, setScanStatus] = useState('');
   const wsRef = useRef<WebSocket | null>(null);
   const reconnectTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const scanStatusTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
 
   useEffect(() => {
     function connect() {
@@ -264,10 +266,18 @@ function CryptoDashboard({ token, onBack, onLogout, onActivity }: { token: strin
   async function scanCryptoMarket() {
     setScanning(true);
     try {
-      await fetch(`${HTTP_URL}/api/watchlist/crypto/scan`, {
+      const r = await fetch(`${HTTP_URL}/api/watchlist/crypto/scan`, {
         method: 'POST',
         headers: { Authorization: `Bearer ${token}` },
       });
+      if (r.ok) {
+        const data = await r.json() as { added?: string[] };
+        const count = data.added?.length ?? 0;
+        const msg = count > 0 ? `${count} new symbol(s) added` : 'Scan complete — no new symbols found';
+        setScanStatus(msg);
+        if (scanStatusTimer.current) clearTimeout(scanStatusTimer.current);
+        scanStatusTimer.current = setTimeout(() => setScanStatus(''), 5000);
+      }
     } catch { /* ignore */ } finally {
       setScanning(false);
     }
@@ -419,6 +429,7 @@ function CryptoDashboard({ token, onBack, onLogout, onActivity }: { token: strin
               </button>
             </div>
             {watchlistError && <div className="watchlist-error">{watchlistError}</div>}
+            {scanStatus && <div className="watchlist-scan-status">{scanStatus}</div>}
             <table>
               <thead>
                 <tr>
@@ -427,13 +438,13 @@ function CryptoDashboard({ token, onBack, onLogout, onActivity }: { token: strin
               </thead>
               <tbody>
                 {symbols.sort((a, b) => Math.abs(b.changePct) - Math.abs(a.changePct)).map(s => (
-                  <tr key={s.symbol} className={s.change >= 0 ? 'up' : 'down'}>
+                  <tr key={s.symbol} className={s.lastUpdated === 0 ? '' : s.change >= 0 ? 'up' : 'down'}>
                     <td className="symbol">{s.symbol}</td>
-                    <td className="price">${fmt(s.price)}</td>
-                    <td className={s.change >= 0 ? 'green' : 'red'}>{fmtDollar(s.change)}</td>
-                    <td className={s.changePct >= 0 ? 'green' : 'red'}>{fmtPct(s.changePct)}</td>
-                    <td>{(s.volume / 1_000_000).toFixed(1)}M</td>
-                    <td className="muted">{timeAgo(s.lastUpdated)}</td>
+                    <td className="price">{s.lastUpdated === 0 ? '—' : `$${fmt(s.price)}`}</td>
+                    <td className={s.lastUpdated === 0 ? 'muted' : s.change >= 0 ? 'green' : 'red'}>{s.lastUpdated === 0 ? '—' : fmtDollar(s.change)}</td>
+                    <td className={s.lastUpdated === 0 ? 'muted' : s.changePct >= 0 ? 'green' : 'red'}>{s.lastUpdated === 0 ? '—' : fmtPct(s.changePct)}</td>
+                    <td>{s.lastUpdated === 0 ? '—' : (s.volume / 1_000_000).toFixed(1) + 'M'}</td>
+                    <td className="muted">{s.lastUpdated === 0 ? 'Loading…' : timeAgo(s.lastUpdated)}</td>
                     <td><button className="watchlist-remove-btn" onClick={() => removeFromWatchlist(s.symbol)} title="Remove">&#xd7;</button></td>
                   </tr>
                 ))}
@@ -445,7 +456,7 @@ function CryptoDashboard({ token, onBack, onLogout, onActivity }: { token: strin
         {state && tab === 'signals' && (
           <div className="signals-panel">
             {signals.length === 0 ? (
-              <div className="empty">No signals yet — engine is scanning {symbols.length} symbols…</div>
+              <div className="empty">No signals yet — engine is scanning {symbols.filter(s => s.lastUpdated > 0).length} symbols…</div>
             ) : (
               <div className="signal-list">
                 {signals.map(sig => (
@@ -651,8 +662,10 @@ function Dashboard({ token, onLogout, onGoHome, onActivity }: { token: string; o
   const [watchlistInput, setWatchlistInput] = useState('');
   const [watchlistError, setWatchlistError] = useState('');
   const [scanning, setScanning] = useState(false);
+  const [scanStatus, setScanStatus] = useState('');
   const wsRef = useRef<WebSocket | null>(null);
   const reconnectTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const scanStatusTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
 
   useEffect(() => {
     function connect() {
@@ -794,10 +807,18 @@ function Dashboard({ token, onLogout, onGoHome, onActivity }: { token: string; o
   async function scanStocksMarket() {
     setScanning(true);
     try {
-      await fetch(`${HTTP_URL}/api/watchlist/stocks/scan`, {
+      const r = await fetch(`${HTTP_URL}/api/watchlist/stocks/scan`, {
         method: 'POST',
         headers: { Authorization: `Bearer ${token}` },
       });
+      if (r.ok) {
+        const data = await r.json() as { added?: string[] };
+        const count = data.added?.length ?? 0;
+        const msg = count > 0 ? `${count} new symbol(s) added` : 'Scan complete — no new symbols found';
+        setScanStatus(msg);
+        if (scanStatusTimer.current) clearTimeout(scanStatusTimer.current);
+        scanStatusTimer.current = setTimeout(() => setScanStatus(''), 5000);
+      }
     } catch { /* ignore */ } finally {
       setScanning(false);
     }
@@ -963,6 +984,7 @@ function Dashboard({ token, onLogout, onGoHome, onActivity }: { token: string; o
               </button>
             </div>
             {watchlistError && <div className="watchlist-error">{watchlistError}</div>}
+            {scanStatus && <div className="watchlist-scan-status">{scanStatus}</div>}
             <table>
               <thead>
                 <tr>
@@ -979,13 +1001,13 @@ function Dashboard({ token, onLogout, onGoHome, onActivity }: { token: string; o
                 {symbols
                   .sort((a, b) => Math.abs(b.changePct) - Math.abs(a.changePct))
                   .map(s => (
-                  <tr key={s.symbol} className={s.change >= 0 ? 'up' : 'down'}>
+                  <tr key={s.symbol} className={s.lastUpdated === 0 ? '' : s.change >= 0 ? 'up' : 'down'}>
                     <td className="symbol">{s.symbol}</td>
-                    <td className="price">${fmt(s.price)}</td>
-                    <td className={s.change >= 0 ? 'green' : 'red'}>{fmtDollar(s.change)}</td>
-                    <td className={s.changePct >= 0 ? 'green' : 'red'}>{fmtPct(s.changePct)}</td>
-                    <td>{(s.volume / 1_000_000).toFixed(1)}M</td>
-                    <td className="muted">{timeAgo(s.lastUpdated)}</td>
+                    <td className="price">{s.lastUpdated === 0 ? '—' : `$${fmt(s.price)}`}</td>
+                    <td className={s.lastUpdated === 0 ? 'muted' : s.change >= 0 ? 'green' : 'red'}>{s.lastUpdated === 0 ? '—' : fmtDollar(s.change)}</td>
+                    <td className={s.lastUpdated === 0 ? 'muted' : s.changePct >= 0 ? 'green' : 'red'}>{s.lastUpdated === 0 ? '—' : fmtPct(s.changePct)}</td>
+                    <td>{s.lastUpdated === 0 ? '—' : (s.volume / 1_000_000).toFixed(1) + 'M'}</td>
+                    <td className="muted">{s.lastUpdated === 0 ? 'Loading…' : timeAgo(s.lastUpdated)}</td>
                     <td><button className="watchlist-remove-btn" onClick={() => removeFromStocksWatchlist(s.symbol)} title="Remove">&#xd7;</button></td>
                   </tr>
                 ))}
@@ -997,7 +1019,7 @@ function Dashboard({ token, onLogout, onGoHome, onActivity }: { token: string; o
         {state && tab === 'signals' && (
           <div className="signals-panel">
             {signals.length === 0 ? (
-              <div className="empty">No signals yet — engine is scanning {symbols.length} symbols…</div>
+              <div className="empty">No signals yet — engine is scanning {symbols.filter(s => s.lastUpdated > 0).length} symbols…</div>
             ) : (
               <div className="signal-list">
                 {signals.map(sig => (

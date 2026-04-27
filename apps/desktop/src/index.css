@@ -1406,3 +1406,10 @@ tr:hover td { background: #1c2128; }
   padding: 0.25rem 0.75rem 0.4rem;
   background: var(--surface);
 }
+
+.watchlist-scan-status {
+  font-size: 0.75rem;
+  color: var(--green);
+  padding: 0.25rem 0.75rem 0.4rem;
+  background: var(--surface);
+}

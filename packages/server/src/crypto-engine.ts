@@ -63,6 +63,13 @@ export class CryptoSignalEngine {
   }
 
   start(): void {
+    // Pre-seed symbolState so clients that connect before the first tick see all expected symbols.
+    // Entries with lastUpdated=0 signal "loading" to the UI.
+    for (const sym of this.getActiveSymbols()) {
+      if (!this.symbolState.has(sym)) {
+        this.symbolState.set(sym, { symbol: sym, price: 0, volume: 0, change: 0, changePct: 0, lastUpdated: 0 });
+      }
+    }
     this.tick();
     this.tickTimer = setInterval(() => this.tick(), 60_000);
   }
