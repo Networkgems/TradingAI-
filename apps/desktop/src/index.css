@@ -829,6 +829,24 @@ tr:hover td { background: #1c2128; }
   max-width: 380px;
 }
 
+/* When a settings section is embedded inside a modal, strip the card chrome
+   and collapse the grid to a single column so it fits the narrow modal width. */
+.modal-card .settings-section {
+  background: none;
+  border: none;
+  border-radius: 0;
+  padding: 0;
+  margin-bottom: 0;
+}
+
+.modal-card .settings-section-title {
+  display: none;
+}
+
+.modal-card .settings-grid {
+  grid-template-columns: 1fr;
+}
+
 /* ── Calendar Tab ─────────────────────────────────────────────────────────── */
 
 .cal-panel {
