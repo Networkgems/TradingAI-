@@ -136,6 +136,7 @@ function CryptoDashboard({ token, onBack, onLogout, onActivity }: { token: strin
   const [tradingToggling, setTradingToggling] = useState(false);
   const [accountMode, setAccountMode] = useState<'demo' | 'live'>('demo');
   const [watchlistInput, setWatchlistInput] = useState('');
+  const [watchlistError, setWatchlistError] = useState('');
   const [scanning, setScanning] = useState(false);
   const wsRef = useRef<WebSocket | null>(null);
   const reconnectTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
@@ -236,6 +237,15 @@ function CryptoDashboard({ token, onBack, onLogout, onActivity }: { token: strin
   async function addToWatchlist() {
     const sym = watchlistInput.trim().toUpperCase();
     if (!sym) return;
+    if (!/^[A-Z]{2,10}-USD$/.test(sym)) {
+      setWatchlistError('Invalid symbol. Use format XXX-USD (e.g. ETH-USD)');
+      return;
+    }
+    if (symbols.some(s => s.symbol === sym)) {
+      setWatchlistError('Symbol already in watchlist');
+      return;
+    }
+    setWatchlistError('');
     setWatchlistInput('');
     await fetch(`${HTTP_URL}/api/watchlist/crypto`, {
       method: 'POST',
@@ -400,7 +410,7 @@ function CryptoDashboard({ token, onBack, onLogout, onActivity }: { token: strin
                 className="watchlist-add-input"
                 placeholder="Add symbol (e.g. ETH-USD)"
                 value={watchlistInput}
-                onChange={e => setWatchlistInput(e.target.value)}
+                onChange={e => { setWatchlistInput(e.target.value); setWatchlistError(''); }}
                 onKeyDown={e => e.key === 'Enter' && addToWatchlist()}
               />
               <button className="btn-secondary btn-sm" onClick={addToWatchlist} disabled={!watchlistInput.trim()}>Add</button>
@@ -408,6 +418,7 @@ function CryptoDashboard({ token, onBack, onLogout, onActivity }: { token: strin
                 {scanning ? 'Scanning…' : '⚡ Scan Market'}
               </button>
             </div>
+            {watchlistError && <div className="watchlist-error">{watchlistError}</div>}
             <table>
               <thead>
                 <tr>
@@ -638,6 +649,7 @@ function Dashboard({ token, onLogout, onGoHome, onActivity }: { token: string; o
   const [isAdmin, setIsAdmin] = useState(false);
   const [accountMode, setAccountMode] = useState<'demo' | 'live'>('demo');
   const [watchlistInput, setWatchlistInput] = useState('');
+  const [watchlistError, setWatchlistError] = useState('');
   const [scanning, setScanning] = useState(false);
   const wsRef = useRef<WebSocket | null>(null);
   const reconnectTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
@@ -755,6 +767,15 @@ function Dashboard({ token, onLogout, onGoHome, onActivity }: { token: string; o
   async function addToStocksWatchlist() {
     const sym = watchlistInput.trim().toUpperCase();
     if (!sym) return;
+    if (!/^[A-Z]{1,5}$/.test(sym)) {
+      setWatchlistError('Invalid symbol. Use 1–5 letters (e.g. NVDA)');
+      return;
+    }
+    if (symbols.some(s => s.symbol === sym)) {
+      setWatchlistError('Symbol already in watchlist');
+      return;
+    }
+    setWatchlistError('');
     setWatchlistInput('');
     await fetch(`${HTTP_URL}/api/watchlist/stocks`, {
       method: 'POST',
@@ -933,7 +954,7 @@ function Dashboard({ token, onLogout, onGoHome, onActivity }: { token: string; o
                 className="watchlist-add-input"
                 placeholder="Add symbol (e.g. NVDA)"
                 value={watchlistInput}
-                onChange={e => setWatchlistInput(e.target.value)}
+                onChange={e => { setWatchlistInput(e.target.value); setWatchlistError(''); }}
                 onKeyDown={e => e.key === 'Enter' && addToStocksWatchlist()}
               />
               <button className="btn-secondary btn-sm" onClick={addToStocksWatchlist} disabled={!watchlistInput.trim()}>Add</button>
@@ -941,6 +962,7 @@ function Dashboard({ token, onLogout, onGoHome, onActivity }: { token: string; o
                 {scanning ? 'Scanning…' : '⚡ Scan Market'}
               </button>
             </div>
+            {watchlistError && <div className="watchlist-error">{watchlistError}</div>}
             <table>
               <thead>
                 <tr>

@@ -587,6 +587,10 @@ app.post('/api/watchlist/crypto', requireAuth, async (req, res) => {
     return;
   }
   const sym = symbol.trim().toUpperCase();
+  if (!/^[A-Z]{2,10}-USD$/.test(sym)) {
+    res.status(400).json({ error: 'Invalid symbol format. Expected XXX-USD (e.g. ETH-USD)' });
+    return;
+  }
   await addCryptoSymbol(sym);
   cryptoEngine.addSymbol(sym);
   cryptoEngine.refresh();
@@ -628,6 +632,10 @@ app.post('/api/watchlist/stocks', requireAuth, async (req, res) => {
     return;
   }
   const sym = symbol.trim().toUpperCase();
+  if (!/^[A-Z]{1,5}$/.test(sym)) {
+    res.status(400).json({ error: 'Invalid symbol format. Expected 1–5 letters (e.g. NVDA)' });
+    return;
+  }
   await addStocksSymbol(sym);
   engine.addSymbol(sym);
   engine.refresh();

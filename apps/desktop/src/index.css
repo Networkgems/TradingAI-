@@ -1381,3 +1381,10 @@ tr:hover td { background: #1c2128; }
   color: var(--red);
   background: rgba(248, 81, 73, 0.1);
 }
+
+.watchlist-error {
+  font-size: 0.75rem;
+  color: var(--red);
+  padding: 0.25rem 0.75rem 0.4rem;
+  background: var(--surface);
+}
