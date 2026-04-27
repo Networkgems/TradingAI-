@@ -8,10 +8,25 @@ const yf = new YahooFinance({
 
 const sleep = (ms: number) => new Promise(resolve => setTimeout(resolve, ms));
 
+// Per-call timeout. Yahoo Finance occasionally hangs without responding, which
+// previously blocked the 30-second tick indefinitely (no quotes → watchlist stuck
+// "Loading…", and signals couldn't open positions because price was unavailable).
+const YF_CALL_TIMEOUT_MS = 8_000;
+
+function withTimeout<T>(p: Promise<T>, ms: number, label: string): Promise<T> {
+  return new Promise<T>((resolve, reject) => {
+    const timer = setTimeout(() => reject(new Error(`${label} timed out after ${ms}ms`)), ms);
+    p.then(
+      v => { clearTimeout(timer); resolve(v); },
+      e => { clearTimeout(timer); reject(e); },
+    );
+  });
+}
+
 async function withRetry<T>(fn: () => Promise<T>, label: string, retries = 2): Promise<T | null> {
   for (let attempt = 0; attempt <= retries; attempt++) {
     try {
-      return await fn();
+      return await withTimeout(fn(), YF_CALL_TIMEOUT_MS, label);
     } catch (err: unknown) {
       const msg = err instanceof Error ? err.message : String(err);
       if (attempt < retries) {
@@ -70,18 +85,24 @@ export async function fetchQuote(symbol: string): Promise<{ price: number; volum
   };
 }
 
-/** Fetch quotes for all symbols serially with a delay to stay under rate limits. */
+/**
+ * Fetch quotes for all symbols in parallel batches.
+ * Serial fetching previously made tick latency O(N) and let one slow Yahoo response
+ * stall the entire watchlist update; batched parallel calls keep total wall time
+ * close to the per-call timeout while staying under Yahoo's rate limits.
+ */
 export async function fetchQuotes(symbols: readonly string[]): Promise<Map<string, { price: number; volume: number; change: number; changePct: number }>> {
   const results = new Map<string, { price: number; volume: number; change: number; changePct: number }>();
+  const QUOTE_BATCH = 5;
   let failures = 0;
-  for (const sym of symbols) {
-    const q = await fetchQuote(sym);
-    if (q) {
-      results.set(sym, q);
-    } else {
-      failures++;
+  for (let i = 0; i < symbols.length; i += QUOTE_BATCH) {
+    const slice = symbols.slice(i, i + QUOTE_BATCH);
+    const settled = await Promise.all(slice.map(sym => fetchQuote(sym).then(q => [sym, q] as const)));
+    for (const [sym, q] of settled) {
+      if (q) results.set(sym, q);
+      else failures++;
     }
-    await sleep(200); // 200 ms gap — ~5 s for 25 symbols, well under Yahoo Finance rate limits
+    if (i + QUOTE_BATCH < symbols.length) await sleep(200);
   }
   if (failures > 0) {
     console.warn(`[yahoo-feed] fetchQuotes: ${failures}/${symbols.length} symbols failed`);
@@ -105,7 +126,7 @@ export async function fetchStocksNews(): Promise<NewsItem[]> {
 
 /** Test Yahoo Finance connectivity — returns a quote or throws. */
 export async function testYahooFinance(): Promise<{ symbol: string; price: number }> {
-  const q = await yf.quote('AAPL');
+  const q = await withTimeout(yf.quote('AAPL'), YF_CALL_TIMEOUT_MS, 'quote(AAPL) health-check');
   if (q.regularMarketPrice == null) throw new Error('regularMarketPrice is null');
   return { symbol: 'AAPL', price: q.regularMarketPrice };
 }

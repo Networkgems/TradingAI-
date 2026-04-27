@@ -62,15 +62,24 @@ export class CryptoPaperAccount {
 
   openPosition(signal: TradeSignal, currentPrice: number): Position | null {
     let qty = this.sizeFromStop(signal.entryPrice, signal.stopLoss);
-    if (qty <= 0) return null;
+    if (qty <= 0) {
+      console.warn(`[crypto-account] skip ${signal.symbol} ${signal.type}: qty=0 (entry=${signal.entryPrice} stop=${signal.stopLoss} maxRisk=${this.maxRiskPerTrade().toFixed(2)})`);
+      return null;
+    }
     // Cap qty so cost never exceeds managed equity — same rationale as PaperAccount:
     // tight stops yield large fractional quantities whose cost exceeds cash.
     const maxQtyForManagedEquity = this.managedEquity() / currentPrice;
     qty = Math.min(qty, maxQtyForManagedEquity);
     qty = Math.round(qty * 1_000_000) / 1_000_000;
-    if (qty <= 0) return null;
+    if (qty <= 0) {
+      console.warn(`[crypto-account] skip ${signal.symbol} ${signal.type}: managedEquity=${this.managedEquity().toFixed(2)} too small for price=${currentPrice}`);
+      return null;
+    }
     const cost = currentPrice * qty;
-    if (cost > this.cash) return null;
+    if (cost > this.cash) {
+      console.warn(`[crypto-account] skip ${signal.symbol} ${signal.type}: cost=${cost.toFixed(2)} > cash=${this.cash.toFixed(2)} (existing positions consuming cash)`);
+      return null;
+    }
 
     this.cash -= cost;
     const position: Position = {

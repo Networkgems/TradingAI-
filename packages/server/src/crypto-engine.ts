@@ -197,11 +197,18 @@ export class CryptoSignalEngine {
           );
           if (recent) continue;
 
+          // TRA-134: Defer dedup until we know a quote is available so a missing
+          // quote doesn't block the signal from retrying for 5 minutes.
+          const price = prices.get(sym);
+          if (!price) {
+            console.warn(`[crypto-engine] ${sym} ${signal.type}: no quote in cache — skipping (will retry next tick)`);
+            continue;
+          }
+
           this.recentSignals.unshift(signal);
           if (this.recentSignals.length > MAX_SIGNALS) this.recentSignals.pop();
 
-          const price = prices.get(sym);
-          if (price) this.account.openPosition(signal, price);
+          this.account.openPosition(signal, price);
         }
       }
       if (symbolsSkipped > 0) {

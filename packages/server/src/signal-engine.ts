@@ -314,17 +314,24 @@ export class SignalEngine {
           );
           if (recent) continue;
 
+          // TRA-134: Don't dedup the signal until we know whether a quote was available.
+          // Without a quote we can't open a position; previously the signal was added to
+          // `recentSignals` anyway, then the 5-minute dedup blocked any retry, so the user
+          // saw the same signal fire every 5 minutes for hours with zero positions opened.
+          const price = prices.get(sym);
+          if (!price) {
+            console.warn(`[signal-engine] ${sym} ${signal.type}: no quote in cache — skipping (will retry next tick)`);
+            continue;
+          }
+
           this.recentSignals.unshift(signal);
           if (this.recentSignals.length > MAX_SIGNALS) this.recentSignals.pop();
 
-          const price = prices.get(sym);
-          if (price) {
-            // Auto-open equity paper position
-            const pos = this.account.openPosition(signal, price);
-            if (pos) this.positionSignalType.set(pos.id, signal.type);
-            // Auto-open options paper position (call for buy, put for sell)
-            this.optionsAccount.openOption(signal, price);
-          }
+          // Auto-open equity paper position
+          const pos = this.account.openPosition(signal, price);
+          if (pos) this.positionSignalType.set(pos.id, signal.type);
+          // Auto-open options paper position (call for buy, put for sell)
+          this.optionsAccount.openOption(signal, price);
 
           // Record signal for daily accuracy tracking
           this.dailySignals.push({

@@ -7,6 +7,20 @@ const yf = new YahooFinance({
 });
 const sleep = (ms: number) => new Promise(resolve => setTimeout(resolve, ms));
 
+// Per-call timeout. Yahoo and CMC occasionally hang; without a timeout the 60-second
+// crypto tick blocks indefinitely, leaving the watchlist stuck "Loading…".
+const FEED_CALL_TIMEOUT_MS = 8_000;
+
+function withTimeout<T>(p: Promise<T>, ms: number, label: string): Promise<T> {
+  return new Promise<T>((resolve, reject) => {
+    const timer = setTimeout(() => reject(new Error(`${label} timed out after ${ms}ms`)), ms);
+    p.then(
+      v => { clearTimeout(timer); resolve(v); },
+      e => { clearTimeout(timer); reject(e); },
+    );
+  });
+}
+
 const CMC_API_KEY = process.env.CMC_API_KEY ?? '';
 const CMC_BASE = 'https://pro-api.coinmarketcap.com';
 
@@ -25,9 +39,13 @@ async function fetchCMCBatchQuotes(
   if (!CMC_API_KEY || symbols.length === 0) return new Map();
   const cmcSymbolList = [...new Set(symbols.map(toCMCSymbol))].join(',');
   try {
-    const resp = await fetch(
-      `${CMC_BASE}/v1/cryptocurrency/quotes/latest?symbol=${cmcSymbolList}&convert=USD`,
-      { headers: { 'X-CMC_PRO_API_KEY': CMC_API_KEY, Accept: 'application/json' } },
+    const resp = await withTimeout(
+      fetch(
+        `${CMC_BASE}/v1/cryptocurrency/quotes/latest?symbol=${cmcSymbolList}&convert=USD`,
+        { headers: { 'X-CMC_PRO_API_KEY': CMC_API_KEY, Accept: 'application/json' } },
+      ),
+      FEED_CALL_TIMEOUT_MS,
+      `CMC quotes(${cmcSymbolList})`,
     );
     if (!resp.ok) {
       console.error(`[crypto-feed] CMC quotes/latest HTTP ${resp.status} for ${cmcSymbolList}`);
@@ -58,7 +76,11 @@ export async function fetchCryptoDailyBars(symbol: string, count = 260): Promise
   try {
     const now = new Date();
     const from = new Date(now.getTime() - count * 24 * 60 * 60 * 1000 * 1.5); // fetch with buffer
-    const result = await yf.chart(symbol, { period1: from, period2: now, interval: '1d' });
+    const result = await withTimeout(
+      yf.chart(symbol, { period1: from, period2: now, interval: '1d' }),
+      FEED_CALL_TIMEOUT_MS,
+      `chart-1d(${symbol})`,
+    );
     const quotes = result.quotes ?? [];
     return quotes
       .filter(q => q.open != null && q.high != null && q.low != null && q.close != null && q.volume != null)
@@ -86,7 +108,11 @@ export async function fetchCryptoMinuteBars(symbol: string, count = 60): Promise
     // Request one extra bar so we always have `count` completed bars after dropping
     // the in-progress current-minute candle (which Yahoo Finance includes with partial
     // data and near-zero volume, causing volume-confirmation to always fail).
-    const result = await yf.chart(symbol, { period1: from, period2: now, interval: '1m' });
+    const result = await withTimeout(
+      yf.chart(symbol, { period1: from, period2: now, interval: '1m' }),
+      FEED_CALL_TIMEOUT_MS,
+      `chart-1m(${symbol})`,
+    );
     const currentMinuteStart = Math.floor(now.getTime() / 60_000) * 60_000;
     const quotes = result.quotes ?? [];
     return quotes
@@ -113,7 +139,7 @@ export async function fetchCryptoQuote(
   symbol: string,
 ): Promise<{ price: number; volume: number; change: number; changePct: number } | null> {
   try {
-    const q = await yf.quote(symbol);
+    const q = await withTimeout(yf.quote(symbol), FEED_CALL_TIMEOUT_MS, `quote(${symbol})`);
     if (q.regularMarketPrice != null) {
       return {
         price: q.regularMarketPrice,
@@ -136,25 +162,33 @@ export async function fetchCryptoQuotes(
   const results = new Map<string, { price: number; volume: number; change: number; changePct: number }>();
   const failed: string[] = [];
 
-  for (const sym of symbols) {
-    try {
-      const q = await yf.quote(sym);
-      if (q.regularMarketPrice != null) {
-        results.set(sym, {
-          price: q.regularMarketPrice,
-          volume: q.regularMarketVolume ?? 0,
-          change: q.regularMarketChange ?? 0,
-          changePct: q.regularMarketChangePercent ?? 0,
-        });
-      } else {
+  // Fetch in parallel batches so one slow Yahoo response doesn't stall the whole tick.
+  const QUOTE_BATCH = 5;
+  for (let i = 0; i < symbols.length; i += QUOTE_BATCH) {
+    const slice = symbols.slice(i, i + QUOTE_BATCH);
+    const settled = await Promise.all(slice.map(async sym => {
+      try {
+        const q = await withTimeout(yf.quote(sym), FEED_CALL_TIMEOUT_MS, `quote(${sym})`);
+        if (q.regularMarketPrice != null) {
+          return [sym, {
+            price: q.regularMarketPrice,
+            volume: q.regularMarketVolume ?? 0,
+            change: q.regularMarketChange ?? 0,
+            changePct: q.regularMarketChangePercent ?? 0,
+          }] as const;
+        }
         console.warn(`[crypto-feed] quote(${sym}) no regularMarketPrice — queuing CMC fallback`);
-        failed.push(sym);
+        return [sym, null] as const;
+      } catch (err: unknown) {
+        console.warn(`[crypto-feed] quote(${sym}) YF error: ${err instanceof Error ? err.message : String(err)} — queuing CMC fallback`);
+        return [sym, null] as const;
       }
-    } catch (err: unknown) {
-      console.warn(`[crypto-feed] quote(${sym}) YF error: ${err instanceof Error ? err.message : String(err)} — queuing CMC fallback`);
-      failed.push(sym);
+    }));
+    for (const [sym, q] of settled) {
+      if (q) results.set(sym, q);
+      else failed.push(sym);
     }
-    await sleep(200);
+    if (i + QUOTE_BATCH < symbols.length) await sleep(200);
   }
 
   if (failed.length > 0) {
@@ -174,7 +208,11 @@ export async function fetchCryptoQuotes(
 
 export async function fetchCryptoNews(): Promise<NewsItem[]> {
   try {
-    const results = await yf.search('crypto bitcoin ethereum', { newsCount: 10, quotesCount: 0 });
+    const results = await withTimeout(
+      yf.search('crypto bitcoin ethereum', { newsCount: 10, quotesCount: 0 }),
+      FEED_CALL_TIMEOUT_MS,
+      'search(crypto news)',
+    );
     return (results.news ?? []).map(n => ({
       title: n.title,
       url: n.link,
