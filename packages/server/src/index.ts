@@ -40,9 +40,9 @@ import { DEFAULT_ACCOUNT_SETTINGS } from '@trading-app/shared';
 
 const PORT = Number(process.env.PORT ?? 4242);
 const __dirname = dirname(fileURLToPath(import.meta.url));
-const REPORTS_DIR = join(__dirname, '..', 'reports');
-const CRYPTO_REPORTS_DIR = join(__dirname, '..', 'crypto-reports');
-const DATA_DIR = join(__dirname, '..', 'data');
+const DATA_DIR = process.env.DATA_DIR ?? join(__dirname, '..', 'data');
+const REPORTS_DIR = join(DATA_DIR, 'reports');
+const CRYPTO_REPORTS_DIR = join(DATA_DIR, 'crypto-reports');
 
 if (!existsSync(REPORTS_DIR)) {
   await mkdir(REPORTS_DIR, { recursive: true });

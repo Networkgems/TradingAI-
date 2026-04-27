@@ -5,7 +5,7 @@ import { fileURLToPath } from 'url';
 import { WATCHLIST, CRYPTO_WATCHLIST } from '@trading-app/shared';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
-const DATA_DIR = join(__dirname, '..', 'data');
+const DATA_DIR = process.env.DATA_DIR ?? join(__dirname, '..', 'data');
 const WATCHLIST_FILE = join(DATA_DIR, 'watchlist.json');
 
 interface WatchlistData {

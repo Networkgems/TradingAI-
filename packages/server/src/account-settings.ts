@@ -6,7 +6,7 @@ import type { AccountSettings } from '@trading-app/shared';
 import { DEFAULT_ACCOUNT_SETTINGS } from '@trading-app/shared';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
-const DATA_DIR = join(__dirname, '..', 'data');
+const DATA_DIR = process.env.DATA_DIR ?? join(__dirname, '..', 'data');
 const SETTINGS_FILE = join(DATA_DIR, 'account-settings.json');
 
 let cached: AccountSettings | null = null;
