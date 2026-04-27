@@ -1,5 +1,5 @@
 import { OrbStrategy, ReversalStrategy, MacdBollingerStrategy, IchimokuStrategy } from '@trading-app/engine';
-import { WATCHLIST, MANAGED_ACCOUNT_RATIO, MAX_CONSECUTIVE_LOSSES, DAILY_DRAWDOWN_HALT_PCT } from '@trading-app/shared';
+import { WATCHLIST, MANAGED_ACCOUNT_RATIO, MAX_CONSECUTIVE_LOSSES, DAILY_DRAWDOWN_HALT_PCT, isStockMarketOpen } from '@trading-app/shared';
 import type { TradeSignal, Candle, OptionsAccountState, SignalType, Position, AccountSettings, NewsItem } from '@trading-app/shared';
 import { fetchMinuteBars, fetchQuotes, fetchStocksNews } from './yahoo-feed.js';
 import { PaperAccount } from './paper-account.js';
@@ -27,6 +27,8 @@ export interface EngineState {
   tradingHalted: boolean;
   haltReason: string | null;
   autoTradingEnabled: boolean;
+  /** True when US stock market is currently open (weekdays 9:30 AM–4 PM ET). */
+  marketOpen: boolean;
 }
 
 export type EngineEventHandler = (state: EngineState) => void;
@@ -184,7 +186,9 @@ export class SignalEngine {
   }
 
   refresh(): void {
-    this.tick().catch(() => {});
+    this.tick().catch((err: unknown) => {
+      console.error('[signal-engine] refresh tick error:', err instanceof Error ? err.message : String(err));
+    });
   }
 
   private async tick(): Promise<void> {
@@ -192,6 +196,8 @@ export class SignalEngine {
     this.tickRunning = true;
     try {
       await this.doTick();
+    } catch (err: unknown) {
+      console.error('[signal-engine] tick error:', err instanceof Error ? err.message : String(err));
     } finally {
       this.tickRunning = false;
     }
@@ -232,6 +238,7 @@ export class SignalEngine {
         tradingHalted: this.riskGovernor.isHalted(),
         haltReason: this.riskGovernor.getHaltReason(),
         autoTradingEnabled: this.autoTradingEnabled,
+        marketOpen: isStockMarketOpen(),
       };
       for (const h of this.handlers) h(earlyState);
     }
@@ -278,10 +285,12 @@ export class SignalEngine {
 
     // If auto trading is disabled or daily risk circuit-breaker is active, skip new entries
     if (this.autoTradingEnabled && !this.riskGovernor.isHalted()) {
+      let symbolsWithData = 0;
       // Run strategies and collect new signals
       for (const sym of activeSymbols) {
         const candles = this.candleCache.get(sym) ?? [];
         if (candles.length < 15) continue;
+        symbolsWithData++;
 
         const orbSignal = this.orb.evaluate(sym, candles);
         const reversalSignal = this.reversal.evaluate(sym, candles);
@@ -319,6 +328,9 @@ export class SignalEngine {
           });
         }
       }
+      if (symbolsWithData === 0 && activeSymbols.length > 0) {
+        console.warn('[signal-engine] tick: no symbols had sufficient candle data (market closed or data unavailable)');
+      }
     }
 
     const state: EngineState = {
@@ -331,6 +343,7 @@ export class SignalEngine {
       tradingHalted: this.riskGovernor.isHalted(),
       haltReason: this.riskGovernor.getHaltReason(),
       autoTradingEnabled: this.autoTradingEnabled,
+      marketOpen: isStockMarketOpen(),
     };
 
     for (const h of this.handlers) h(state);
@@ -401,6 +414,7 @@ export class SignalEngine {
       tradingHalted: this.riskGovernor.isHalted(),
       haltReason: this.riskGovernor.getHaltReason(),
       autoTradingEnabled: this.autoTradingEnabled,
+      marketOpen: isStockMarketOpen(),
     };
   }
 

@@ -75,7 +75,9 @@ export class CryptoSignalEngine {
   }
 
   refresh(): void {
-    this.tick().catch(() => {});
+    this.tick().catch((err: unknown) => {
+      console.error('[crypto-engine] refresh tick error:', err instanceof Error ? err.message : String(err));
+    });
   }
 
   getActiveSymbols(): string[] {
@@ -99,11 +101,18 @@ export class CryptoSignalEngine {
     this.symbolState.delete(symbol);
   }
 
+  // Minimum bars each strategy needs (used to gate evaluation per-symbol).
+  private static readonly MIN_BARS_REVERSAL = 20;   // rsiPeriod(14) + lookback(5) + 1
+  private static readonly MIN_BARS_MACD = 35;       // slowPeriod(26) + signalPeriod(9)
+  private static readonly MIN_BARS_SCALPING = 23;   // max(slowEma(21)+2, volumeLookback(10)+1, rsiPeriod(9)+2)
+
   private async tick(): Promise<void> {
     if (this.tickRunning) return;
     this.tickRunning = true;
     try {
       await this.doTick();
+    } catch (err: unknown) {
+      console.error('[crypto-engine] tick error:', err instanceof Error ? err.message : String(err));
     } finally {
       this.tickRunning = false;
     }
@@ -149,30 +158,47 @@ export class CryptoSignalEngine {
       );
     }
 
-    if (this.autoTradingEnabled) for (const sym of activeSymbols) {
-      const candles = this.candleCache.get(sym) ?? [];
-      const dailyCandles = this.dailyCandleCache.get(sym) ?? [];
+    if (this.autoTradingEnabled) {
+      let symbolsEvaluated = 0;
+      let symbolsSkipped = 0;
+      for (const sym of activeSymbols) {
+        const candles = this.candleCache.get(sym) ?? [];
+        const dailyCandles = this.dailyCandleCache.get(sym) ?? [];
 
-      if (candles.length < 35) continue; // MacdBollinger needs 35 bars minimum
+        // Evaluate each strategy independently with its own minimum bar requirement.
+        // Previously a blanket 35-bar gate blocked Reversal (needs 20) and Scalping (needs 23).
+        const reversalSignal = candles.length >= CryptoSignalEngine.MIN_BARS_REVERSAL
+          ? this.reversal.evaluate(sym, candles) : null;
+        const macdSignal = candles.length >= CryptoSignalEngine.MIN_BARS_MACD
+          ? this.macdBollinger.evaluate(sym, candles) : null;
+        const scalpingSignal = candles.length >= CryptoSignalEngine.MIN_BARS_SCALPING
+          ? this.scalping.evaluate(sym, candles) : null;
+        const swingSignal = dailyCandles.length >= 205
+          ? this.swing.evaluate(sym, dailyCandles) : null;
 
-      const reversalSignal = this.reversal.evaluate(sym, candles);
-      const macdSignal = this.macdBollinger.evaluate(sym, candles);
-      const scalpingSignal = this.scalping.evaluate(sym, candles);
-      const swingSignal = dailyCandles.length >= 205 ? this.swing.evaluate(sym, dailyCandles) : null;
+        if (candles.length === 0) {
+          symbolsSkipped++;
+        } else {
+          symbolsEvaluated++;
+        }
 
-      for (const signal of [reversalSignal, macdSignal, scalpingSignal, swingSignal]) {
-        if (!signal) continue;
-        if (this.account.hasOpenPositionForSignalType(sym, signal.type)) continue;
-        const recent = this.recentSignals.find(
-          s => s.symbol === signal.symbol && s.type === signal.type && Date.now() - s.timestamp < 5 * 60_000,
-        );
-        if (recent) continue;
+        for (const signal of [reversalSignal, macdSignal, scalpingSignal, swingSignal]) {
+          if (!signal) continue;
+          if (this.account.hasOpenPositionForSignalType(sym, signal.type)) continue;
+          const recent = this.recentSignals.find(
+            s => s.symbol === signal.symbol && s.type === signal.type && Date.now() - s.timestamp < 5 * 60_000,
+          );
+          if (recent) continue;
 
-        this.recentSignals.unshift(signal);
-        if (this.recentSignals.length > MAX_SIGNALS) this.recentSignals.pop();
+          this.recentSignals.unshift(signal);
+          if (this.recentSignals.length > MAX_SIGNALS) this.recentSignals.pop();
 
-        const price = prices.get(sym);
-        if (price) this.account.openPosition(signal, price);
+          const price = prices.get(sym);
+          if (price) this.account.openPosition(signal, price);
+        }
+      }
+      if (symbolsSkipped > 0) {
+        console.warn(`[crypto-engine] tick: ${symbolsEvaluated} symbols evaluated, ${symbolsSkipped} skipped (no candle data)`);
       }
     }
 
@@ -221,6 +247,7 @@ export class CryptoSignalEngine {
       news: [...this.newsCache],
       lastTick: Date.now(),
       autoTradingEnabled: this.autoTradingEnabled,
+      marketOpen: true as const,
     };
   }
 

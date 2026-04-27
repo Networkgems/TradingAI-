@@ -121,12 +121,46 @@ export const TRADING_WINDOWS: readonly [number, number][] = [
   [13 * 60 + 30, 15 * 60 + 30],  // 1:30–3:30 PM ET (afternoon session)
 ] as const;
 
+/**
+ * Returns the US Eastern Time UTC offset in hours for a given UTC timestamp.
+ * EDT (UTC-4) from second Sunday in March through first Sunday in November;
+ * EST (UTC-5) the rest of the year.
+ */
+export function getEasternUtcOffset(utcMs: number): -4 | -5 {
+  const d = new Date(utcMs);
+  const year = d.getUTCFullYear();
+
+  // Second Sunday in March (DST starts at 2 AM local, approximated as UTC midnight)
+  const march1Day = new Date(Date.UTC(year, 2, 1)).getUTCDay(); // 0=Sun
+  const dstStart = new Date(Date.UTC(year, 2, 1 + ((7 - march1Day) % 7) + 7));
+
+  // First Sunday in November (DST ends)
+  const nov1Day = new Date(Date.UTC(year, 10, 1)).getUTCDay();
+  const dstEnd = new Date(Date.UTC(year, 10, 1 + ((7 - nov1Day) % 7)));
+
+  return utcMs >= dstStart.getTime() && utcMs < dstEnd.getTime() ? -4 : -5;
+}
+
 /** Returns true when the UTC timestamp falls inside a valid ET trading window. */
 export function isValidTradingWindow(utcMs: number): boolean {
-  // Approximate ET as UTC-4 (EDT); adjust to UTC-5 (EST) in winter if needed
-  const etMs = utcMs - 4 * 60 * 60 * 1000;
+  const offsetHours = getEasternUtcOffset(utcMs);
+  const etMs = utcMs + offsetHours * 60 * 60 * 1000;
   const etMinutes = Math.floor(etMs / 60_000) % (24 * 60);
   return TRADING_WINDOWS.some(([start, end]) => etMinutes >= start && etMinutes <= end);
+}
+
+/**
+ * Returns true when US stock markets are currently open (weekdays 9:30 AM–4:00 PM ET,
+ * excluding weekends). Does not account for market holidays.
+ */
+export function isStockMarketOpen(utcMs: number = Date.now()): boolean {
+  const offsetHours = getEasternUtcOffset(utcMs);
+  const etMs = utcMs + offsetHours * 60 * 60 * 1000;
+  const etDate = new Date(etMs);
+  const dayOfWeek = etDate.getUTCDay(); // 0=Sun, 6=Sat
+  if (dayOfWeek === 0 || dayOfWeek === 6) return false;
+  const etMinutes = etDate.getUTCHours() * 60 + etDate.getUTCMinutes();
+  return etMinutes >= 9 * 60 + 30 && etMinutes < 16 * 60;
 }
 
 // Crypto trading windows (UTC minutes) — skip dead zone 04:00–07:59
@@ -226,6 +260,8 @@ export interface CryptoEngineState {
   news: NewsItem[];
   lastTick: number;
   autoTradingEnabled: boolean;
+  /** Always true — crypto trades 24/7 */
+  marketOpen: true;
 }
 
 export interface MarketBar {

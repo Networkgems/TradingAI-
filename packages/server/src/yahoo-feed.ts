@@ -29,6 +29,8 @@ async function withRetry<T>(fn: () => Promise<T>, label: string, retries = 2): P
 export async function fetchMinuteBars(symbol: string, count = 60): Promise<Candle[]> {
   const now = new Date();
   const from = new Date(now.getTime() - count * 60 * 1000 * 2); // 2× window to guarantee enough bars
+  // Drop the in-progress current-minute bar (partial volume skews volume-climax checks).
+  const currentMinuteStart = Math.floor(now.getTime() / 60_000) * 60_000;
 
   const result = await withRetry(
     () => yf.chart(symbol, { period1: from, period2: now, interval: '1m' }),
@@ -39,6 +41,8 @@ export async function fetchMinuteBars(symbol: string, count = 60): Promise<Candl
   const quotes = result.quotes ?? [];
   return quotes
     .filter(q => q.open != null && q.high != null && q.low != null && q.close != null && q.volume != null)
+    .filter(q => (q.volume ?? 0) > 0)                                // drop 0-volume gaps
+    .filter(q => new Date(q.date).getTime() < currentMinuteStart)   // drop in-progress bar
     .map(q => ({
       symbol,
       timestamp: new Date(q.date).getTime(),
