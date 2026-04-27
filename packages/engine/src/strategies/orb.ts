@@ -1,4 +1,4 @@
-import { Candle, MarketQuote, TradeSignal, Side, ADX_RANGING_THRESHOLD, isValidTradingWindow } from '@trading-app/shared';
+import { Candle, MarketQuote, TradeSignal, Side, ADX_RANGING_THRESHOLD, isValidTradingWindow, getEasternUtcOffset } from '@trading-app/shared';
 import { randomUUID } from 'crypto';
 import { adx } from '../indicators/adx.js';
 import type { AlpacaOrderClient } from '../alpaca/index.js';
@@ -50,9 +50,19 @@ export class OrbStrategy {
     // Time filter: only trade during high-volume windows
     if (!this.timeFilter(latest.timestamp)) return null;
 
-    const openTime = candles[0].timestamp;
+    // Find the first candle at or after 9:30 AM ET to anchor the opening range.
+    // Previously used candles[0] which is always 80 min ago — correct at 10:50 AM but
+    // wrong during afternoon sessions where 80-min-ago is noon, not market open.
+    const MARKET_OPEN_ET_MINUTE = 9 * 60 + 30;
+    const sessionStart = candles.find(c => {
+      const offset = getEasternUtcOffset(c.timestamp);
+      const etMinutes = Math.floor((c.timestamp + offset * 3_600_000) / 60_000) % (24 * 60);
+      return etMinutes >= MARKET_OPEN_ET_MINUTE;
+    });
+    if (!sessionStart) return null;
+    const openTime = sessionStart.timestamp;
     const rangeCutoff = openTime + this.rangeMinutes * 60 * 1000;
-    const rangeCandles = candles.filter(c => c.timestamp <= rangeCutoff);
+    const rangeCandles = candles.filter(c => c.timestamp >= openTime && c.timestamp <= rangeCutoff);
     if (rangeCandles.length === 0) return null;
 
     // Volume filter: total volume in range must exceed threshold

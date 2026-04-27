@@ -644,6 +644,8 @@ function signalLabel(type: string) {
     case 'reversal': return 'Reversal';
     case 'macd_cross': return 'MACD';
     case 'ichimoku': return 'Ichimoku';
+    case 'scalping': return 'Scalping';
+    case 'swing_trade': return 'Swing';
     default: return type;
   }
 }

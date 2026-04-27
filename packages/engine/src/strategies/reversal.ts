@@ -1,7 +1,6 @@
 import { Candle, TradeSignal, Side, ADX_TRENDING_THRESHOLD, isValidTradingWindow } from '@trading-app/shared';
 import { randomUUID } from 'crypto';
 import { rsi, rsiDivergence } from '../indicators/rsi.js';
-import { VwapTracker } from '../indicators/vwap.js';
 import { detectPattern, isBullishPattern, isBearishPattern } from '../indicators/patterns.js';
 import { macdCross } from '../indicators/macd.js';
 import { adx } from '../indicators/adx.js';
@@ -31,7 +30,6 @@ export class ReversalStrategy {
   private readonly rsiOversold: number;
   private readonly lookback: number;
   private readonly enforceTimeFilter: boolean;
-  private readonly vwap = new VwapTracker();
 
   constructor(opts: ReversalOptions = {}) {
     this.rsiPeriod = opts.rsiPeriod ?? 14;
@@ -49,12 +47,6 @@ export class ReversalStrategy {
     // Time filter: avoid midday chop and after-hours noise (equity only; disabled for crypto)
     if (this.enforceTimeFilter && !isValidTradingWindow(latest.timestamp)) return null;
 
-    // Recompute VWAP fresh from the current candle window each evaluation
-    // to avoid accumulation drift when the same candles are fed repeatedly.
-    this.vwap.reset();
-    let vwapState = { vwap: 0, stdDev: 0, upperBand: 0, lowerBand: 0 };
-    for (const c of candles) vwapState = this.vwap.update(c);
-
     // ADX regime filter: reversals only work in ranging markets
     // Skip if ADX > 25 (strong trend makes mean reversion risky)
     const adxResult = adx(candles);
@@ -66,34 +58,35 @@ export class ReversalStrategy {
 
     const divergence = rsiDivergence(closes, this.rsiPeriod, this.lookback);
     const pattern = detectPattern(candles.slice(-2));
-    const vwapExtension = this.vwap.isExtended(latest.close, vwapState);
 
-    // Volume climax: current volume > 2× average of lookback window
+    // Volume climax: current volume > 1.5× average of lookback window.
+    // Threshold lowered from 2× to 1.5× — 2× was too rare on 1-min bars and
+    // blocked most valid reversals; 1.5× still confirms genuine surge interest.
     const window = candles.slice(-this.lookback - 1, -1);
     const avgVolume = window.reduce((s, c) => s + c.volume, 0) / window.length;
-    const volumeClimax = latest.volume > avgVolume * 2;
+    const volumeClimax = latest.volume > avgVolume * 1.5;
 
     // MACD confluence: direction of MACD cross must confirm the reversal
     const cross = macdCross(closes);
 
     let side: Side | null = null;
 
-    // Sell reversal: RSI overbought + (pattern OR divergence) + extended above VWAP + volume + MACD confirming
+    // Sell reversal: RSI overbought + (pattern OR divergence) + volume spike + MACD confirming.
+    // VWAP extension removed — it compounded too strictly with RSI extreme + volume climax,
+    // making real signals extremely rare on 1-min charts while adding little extra edge.
     if (
       currentRsi > this.rsiOverbought &&
       (isBearishPattern(pattern) || divergence === 'bearish') &&
-      vwapExtension === 'above' &&
       volumeClimax &&
       (cross === 'bearish' || cross === null) // allow null cross but block bullish cross
     ) {
       side = 'sell';
     }
 
-    // Buy reversal: RSI oversold + (pattern OR divergence) + extended below VWAP + volume + MACD confirming
+    // Buy reversal: RSI oversold + (pattern OR divergence) + volume spike + MACD confirming
     if (
       currentRsi < this.rsiOversold &&
       (isBullishPattern(pattern) || divergence === 'bullish') &&
-      vwapExtension === 'below' &&
       volumeClimax &&
       (cross === 'bullish' || cross === null)
     ) {

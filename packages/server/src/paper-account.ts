@@ -64,8 +64,15 @@ export class PaperAccount {
   }
 
   openPosition(signal: TradeSignal, currentPrice: number): Position | null {
-    const qty = this.sizeFromStop(signal.entryPrice, signal.stopLoss);
+    let qty = this.sizeFromStop(signal.entryPrice, signal.stopLoss);
     if (qty <= 0) return null;
+    // Cap qty so the position cost never exceeds managed equity.
+    // Risk-sized quantity can be very large with tight stops on high-priced stocks,
+    // causing cost to exceed available cash. Capping to managedEquity / price ensures
+    // the position always fits while still deploying a meaningful allocation.
+    const maxQtyForManagedEquity = Math.floor(this.managedEquity() / currentPrice);
+    if (maxQtyForManagedEquity <= 0) return null;
+    qty = Math.min(qty, maxQtyForManagedEquity);
     const cost = currentPrice * qty;
     if (cost > this.cash) return null;
 
