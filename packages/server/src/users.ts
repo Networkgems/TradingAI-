@@ -50,16 +50,23 @@ async function persistUsers(): Promise<void> {
 
 export async function loadUsers(): Promise<void> {
   if (!existsSync(USERS_FILE)) {
-    // Seed default admin user
+    const envPassword = process.env.ADMIN_PASSWORD;
+    const initialPassword = envPassword ?? randomBytes(16).toString('hex');
     const defaultUser: User = {
       username: 'admin',
       email: '',
-      passwordHash: await hashPassword('1234'),
+      passwordHash: await hashPassword(initialPassword),
       role: 'admin',
       createdAt: new Date().toISOString(),
     };
     users = [defaultUser];
     await persistUsers();
+    if (!envPassword) {
+      console.log('\n[TradingAI] First-run admin account created.');
+      console.log('[TradingAI] Username: admin');
+      console.log(`[TradingAI] Password: ${initialPassword}`);
+      console.log('[TradingAI] Change this password immediately after logging in.\n');
+    }
     return;
   }
   try {
