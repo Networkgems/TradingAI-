@@ -601,7 +601,7 @@ export default function SettingsPage({ token, httpUrl, context, onModeChange }: 
           <section className="settings-section">
             <h2 className="settings-section-title">Demo Account Settings</h2>
             <p className="settings-hint">
-              Changes take effect immediately and reset the demo account. Save first, then use "Reset Demo Account" to apply.
+              Saving applies changes immediately while preserving open positions and today's P&amp;L. Use "Reset Demo Account" only when you want to wipe trades and start fresh from the configured starting balance.
             </p>
 
             <div className="settings-grid">

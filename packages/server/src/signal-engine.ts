@@ -1,6 +1,6 @@
 import { OrbStrategy, ReversalStrategy, MacdBollingerStrategy, IchimokuStrategy } from '@trading-app/engine';
 import { WATCHLIST, MANAGED_ACCOUNT_RATIO, MAX_CONSECUTIVE_LOSSES, DAILY_DRAWDOWN_HALT_PCT, isStockMarketOpen } from '@trading-app/shared';
-import type { TradeSignal, Candle, OptionsAccountState, SignalType, Position, AccountSettings, NewsItem } from '@trading-app/shared';
+import type { TradeSignal, Candle, OptionsAccountState, SignalType, Position, AccountSettings, AccountState, NewsItem } from '@trading-app/shared';
 import { fetchMinuteBars, fetchQuotes, fetchStocksNews } from './yahoo-feed.js';
 import { PaperAccount } from './paper-account.js';
 import { PaperOptionsAccount } from './options-account.js';
@@ -19,7 +19,7 @@ export interface SymbolState {
 export interface EngineState {
   symbols: SymbolState[];
   signals: TradeSignal[];
-  account: ReturnType<PaperAccount['getState']>;
+  account: AccountState;
   closedPositions: ReturnType<PaperAccount['checkExits']>;
   options: OptionsAccountState;
   lastTick: number;
@@ -121,25 +121,52 @@ export class SignalEngine {
 
   constructor(settings?: AccountSettings, tracker?: PnlTracker) {
     this.tracker = tracker;
-    const savedEquity = tracker?.getSavedEquity();
+    const hasSaved = tracker?.hasSavedState() ?? false;
     const stocksEquity = settings ? (settings.demoEquityStocks ?? settings.demoEquity) : undefined;
-    const config = settings
-      ? {
-          initialEquity: savedEquity ?? stocksEquity,
-          managedAccountRatio: settings.managedAccountRatio,
-          riskPerTrade: settings.riskPerTrade,
-        }
-      : { initialEquity: savedEquity };
-    this.account = new PaperAccount(config);
+    // Live mode always shows 0 equity (no broker connection).
+    const isLive = settings?.mode === 'live';
+    const initialEquity = isLive ? 0 : (stocksEquity ?? 25_000);
+    // Restore current equity from prior session if a saved state file exists,
+    // so realized progress is preserved across server restarts.
+    const currentEquity = isLive ? 0 : (hasSaved ? tracker!.getSavedEquity() : initialEquity);
+    // Seed today's P&L from openingEquity so a mid-day restart doesn't reset it.
+    const dailyPnl = hasSaved && !isLive ? currentEquity - tracker!.getOpeningEquity() : 0;
+    this.account = new PaperAccount({
+      initialEquity,
+      currentEquity,
+      dailyPnl,
+      managedAccountRatio: settings?.managedAccountRatio,
+      riskPerTrade: settings?.riskPerTrade,
+    });
     this.optionsAccount = new PaperOptionsAccount({
-      initialEquity: savedEquity ?? stocksEquity,
+      initialEquity: currentEquity,
       managedAccountRatio: settings?.managedAccountRatio,
       dailyTradesLimit: settings?.dailyTradesLimit,
     });
   }
 
-  /** Update demo account config parameters without resetting equity or positions. */
+  /**
+   * Apply settings WITHOUT wiping today's trades, signals, or P&L.
+   *
+   * - Demo equity changes rebase cash/equity by the delta so the new starting
+   *   balance takes effect immediately while preserving open positions and
+   *   dailyPnl. The new equity is persisted via the tracker so it survives
+   *   a server restart.
+   * - Switching to live mode forces equity to 0 (no broker connected).
+   * - Risk parameters (managedAccountRatio, riskPerTrade, dailyTradesLimit)
+   *   update live without touching positions.
+   *
+   * Use {@link forceReset} for the explicit "Reset Demo Account" hard reset.
+   */
   applySettings(settings: AccountSettings): void {
+    if (settings.mode === 'live') {
+      this.account.setEquity(0);
+      this.optionsAccount.setEquity(0);
+    } else {
+      const targetEquity = settings.demoEquityStocks ?? settings.demoEquity;
+      this.account.applyEquity(targetEquity);
+      this.optionsAccount.applyEquity(targetEquity);
+    }
     this.account.updateConfig({
       managedAccountRatio: settings.managedAccountRatio,
       riskPerTrade: settings.riskPerTrade,
@@ -148,11 +175,23 @@ export class SignalEngine {
       managedAccountRatio: settings.managedAccountRatio,
       dailyTradesLimit: settings.dailyTradesLimit,
     });
+    if (this.tracker) {
+      const newInitial = settings.mode === 'live' ? 0 : (settings.demoEquityStocks ?? settings.demoEquity);
+      this.tracker.setInitialEquity(newInitial);
+      this.tracker.saveEquity(
+        this.account.getState().totalEquity,
+        this.optionsAccount.getState().optionsPnl,
+      );
+    }
   }
 
-  /** Explicit full reset — clears positions and resets equity to saved or configured value. */
+  /**
+   * Explicit full reset — clears positions, signals, and dailyPnl, and resets
+   * equity to the configured starting balance (NOT the persisted equity).
+   * This is what "Reset Demo Account" should do: wipe everything and start fresh.
+   */
   forceReset(settings: AccountSettings): void {
-    const equity = this.tracker?.getSavedEquity() ?? settings.demoEquityStocks ?? settings.demoEquity;
+    const equity = settings.mode === 'live' ? 0 : (settings.demoEquityStocks ?? settings.demoEquity);
     this.account.reset({
       initialEquity: equity,
       managedAccountRatio: settings.managedAccountRatio,
@@ -167,6 +206,10 @@ export class SignalEngine {
     this.recentSignals = [];
     this.dailySignals = [];
     this.positionSignalType.clear();
+    if (this.tracker) {
+      this.tracker.setInitialEquity(equity);
+      this.tracker.saveEquity(equity, this.optionsAccount.getState().optionsPnl);
+    }
   }
 
   onTick(handler: EngineEventHandler): void {
@@ -238,7 +281,7 @@ export class SignalEngine {
       const earlyState: EngineState = {
         symbols: Array.from(this.symbolState.values()),
         signals: [...this.recentSignals],
-        account: this.account.getState(),
+        account: this.buildAccountState(),
         closedPositions: [...this.allClosedPositions].slice(-20),
         options: this.optionsAccount.getState(),
         lastTick: Date.now(),
@@ -347,20 +390,21 @@ export class SignalEngine {
       }
     }
 
-    const state: EngineState = {
-      symbols: Array.from(this.symbolState.values()).filter(s => !this.hiddenSymbols.has(s.symbol)),
-      signals: [...this.recentSignals],
-      account: this.account.getState(),
-      closedPositions: [...this.allClosedPositions].slice(-20),
-      options: this.optionsAccount.getState(),
-      lastTick: Date.now(),
-      tradingHalted: this.riskGovernor.isHalted(),
-      haltReason: this.riskGovernor.getHaltReason(),
-      autoTradingEnabled: this.autoTradingEnabled,
-      marketOpen: isStockMarketOpen(),
-    };
+    for (const h of this.handlers) h(this.getState());
+  }
 
-    for (const h of this.handlers) h(state);
+  /** Build account state augmented with cumulative P&L pulled from the tracker. */
+  private buildAccountState(): AccountState {
+    const base = this.account.getState();
+    if (!this.tracker) return base;
+    const stats = this.tracker.getCumulativeStats(base.totalEquity);
+    return {
+      ...base,
+      weeklyPnl: stats.weeklyPnl,
+      monthlyPnl: stats.monthlyPnl,
+      yearlyPnl: stats.yearlyPnl,
+      allTimePnl: stats.allTimePnl,
+    };
   }
 
   private async refreshCandles(symbol: string): Promise<void> {
@@ -421,7 +465,7 @@ export class SignalEngine {
     return {
       symbols: Array.from(this.symbolState.values()).filter(s => !this.hiddenSymbols.has(s.symbol)),
       signals: [...this.recentSignals],
-      account: this.account.getState(),
+      account: this.buildAccountState(),
       closedPositions: [...this.allClosedPositions].slice(-20),
       options: this.optionsAccount.getState(),
       lastTick: Date.now(),

@@ -40,22 +40,53 @@ export class CryptoSignalEngine {
   private handlers: CryptoEngineEventHandler[] = [];
   private autoTradingEnabled = true;
 
-  constructor(tracker?: PnlTracker) {
+  constructor(tracker?: PnlTracker, settings?: AccountSettings) {
     this.tracker = tracker;
-    const savedEquity = tracker?.getSavedEquity();
-    this.account = new CryptoPaperAccount(savedEquity);
+    const hasSaved = tracker?.hasSavedState() ?? false;
+    const isLive = settings?.mode === 'live';
+    const cryptoStart = settings ? (settings.demoEquityCrypto ?? settings.demoEquity ?? 25_000) : 25_000;
+    const initialEquity = isLive ? 0 : cryptoStart;
+    // Restore current equity from saved state when available so realized progress survives restarts.
+    const currentEquity = isLive ? 0 : (hasSaved ? tracker!.getSavedEquity() : initialEquity);
+    // Seed today's opening from the persisted opening so dailyPnl persists across restarts.
+    const openingEquityToday = hasSaved && !isLive ? tracker!.getOpeningEquity() : currentEquity;
+    this.account = new CryptoPaperAccount(currentEquity, openingEquityToday);
+    // Set the canonical initialEquity baseline so allTimePnl reflects the user's setting.
+    this.account.applyEquity(initialEquity);
   }
 
-  applySettings(_settings: AccountSettings): void {
-    // Crypto equity is managed via the tracker; settings changes do not reset positions.
+  /**
+   * Apply settings WITHOUT wiping today's trades or positions.
+   * Demo equity changes rebase by the delta; switching to live mode forces equity to 0.
+   * The new equity is persisted via the tracker so it survives a server restart.
+   */
+  applySettings(settings: AccountSettings): void {
+    if (settings.mode === 'live') {
+      this.account.setEquity(0);
+    } else {
+      const targetEquity = settings.demoEquityCrypto ?? settings.demoEquity;
+      this.account.applyEquity(targetEquity);
+    }
+    if (this.tracker) {
+      const newInitial = settings.mode === 'live' ? 0 : (settings.demoEquityCrypto ?? settings.demoEquity);
+      this.tracker.setInitialEquity(newInitial);
+      this.tracker.saveEquity(this.account.getEquity(), 0);
+    }
   }
 
-  /** Full reset — clears positions and resets equity to saved/configured value. */
+  /**
+   * Full reset — clears positions, signals, and resets equity to the configured
+   * starting balance (NOT the persisted equity). Used by "Reset Demo Account".
+   */
   forceReset(initialEquity?: number): void {
-    const equity = initialEquity ?? this.tracker?.getSavedEquity() ?? this.account.getInitialEquity();
+    const equity = initialEquity ?? this.account.getInitialEquity();
     this.account.reset(equity);
     this.recentSignals = [];
     this.allClosedPositions = [];
+    if (this.tracker) {
+      this.tracker.setInitialEquity(equity);
+      this.tracker.saveEquity(equity, 0);
+    }
   }
 
   onTick(handler: CryptoEngineEventHandler): void {
@@ -245,12 +276,13 @@ export class CryptoSignalEngine {
 
   private buildState(): CryptoEngineState {
     const accountBase = this.account.getState();
+    const stats = this.tracker?.getCumulativeStats(accountBase.totalEquity);
     const account: AccountState = {
       ...accountBase,
-      weeklyPnl: 0,
-      monthlyPnl: 0,
-      yearlyPnl: 0,
-      allTimePnl: accountBase.totalEquity - this.account.getInitialEquity(),
+      weeklyPnl: stats?.weeklyPnl ?? 0,
+      monthlyPnl: stats?.monthlyPnl ?? 0,
+      yearlyPnl: stats?.yearlyPnl ?? 0,
+      allTimePnl: stats?.allTimePnl ?? (accountBase.totalEquity - this.account.getInitialEquity()),
     };
 
     return {

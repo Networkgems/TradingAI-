@@ -73,6 +73,22 @@ export class PaperOptionsAccount {
     if (config.dailyTradesLimit !== undefined) this.dailyTradesLimit = config.dailyTradesLimit;
   }
 
+  /** Rebase starting equity by the delta, preserving optionsPnl and open/closed positions. */
+  applyEquity(newInitialEquity: number): void {
+    const delta = newInitialEquity - this.initialEquity;
+    if (delta === 0) return;
+    this.initialEquity = newInitialEquity;
+    this.equity += delta;
+    this.cash += delta;
+  }
+
+  /** Force equity/cash to a specific value (used for live-mode 0 display). */
+  setEquity(value: number): void {
+    this.initialEquity = value;
+    this.equity = value;
+    this.cash = value;
+  }
+
   getState(): OptionsAccountState {
     return {
       openOptions: Array.from(this.openOptions.values()),

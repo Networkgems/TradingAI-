@@ -105,10 +105,16 @@ function requireAdmin(req: express.Request, res: express.Response, next: express
 // ── Engines ───────────────────────────────────────────────────────────────────
 
 const initialSettings = await loadSettings();
-const tracker = new PnlTracker(DATA_DIR, initialSettings.demoEquityStocks ?? initialSettings.demoEquity);
-const cryptoTracker = new PnlTracker(join(DATA_DIR, 'crypto'), initialSettings.demoEquityCrypto ?? initialSettings.demoEquity);
+const tracker = new PnlTracker(
+  DATA_DIR,
+  initialSettings.mode === 'live' ? 0 : (initialSettings.demoEquityStocks ?? initialSettings.demoEquity),
+);
+const cryptoTracker = new PnlTracker(
+  join(DATA_DIR, 'crypto'),
+  initialSettings.mode === 'live' ? 0 : (initialSettings.demoEquityCrypto ?? initialSettings.demoEquity),
+);
 const engine = new SignalEngine(initialSettings, tracker);
-const cryptoEngine = new CryptoSignalEngine(cryptoTracker);
+const cryptoEngine = new CryptoSignalEngine(cryptoTracker, initialSettings);
 const scheduler = new MarketScheduler();
 
 // Restore persisted watchlist overrides into engines

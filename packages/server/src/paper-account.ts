@@ -6,6 +6,10 @@ interface PaperAccountConfig {
   initialEquity?: number;
   managedAccountRatio?: number;
   riskPerTrade?: number;
+  /** Optional override of current equity (when restoring from persisted state). */
+  currentEquity?: number;
+  /** Optional restore of today's accumulated P&L across server restarts. */
+  dailyPnl?: number;
 }
 
 export class PaperAccount {
@@ -21,8 +25,9 @@ export class PaperAccount {
     this.initialEquity = config.initialEquity ?? DEFAULT_ACCOUNT_SETTINGS.demoEquity;
     this.managedAccountRatio = config.managedAccountRatio ?? DEFAULT_ACCOUNT_SETTINGS.managedAccountRatio;
     this.riskPerTrade = config.riskPerTrade ?? DEFAULT_ACCOUNT_SETTINGS.riskPerTrade;
-    this.equity = this.initialEquity;
-    this.cash = this.initialEquity;
+    this.equity = config.currentEquity ?? this.initialEquity;
+    this.cash = this.equity;
+    if (config.dailyPnl !== undefined) this.dailyPnl = config.dailyPnl;
   }
 
   reset(config: PaperAccountConfig = {}): void {
@@ -38,6 +43,26 @@ export class PaperAccount {
   updateConfig(config: PaperAccountConfig): void {
     if (config.managedAccountRatio !== undefined) this.managedAccountRatio = config.managedAccountRatio;
     if (config.riskPerTrade !== undefined) this.riskPerTrade = config.riskPerTrade;
+  }
+
+  /**
+   * Rebase starting equity to a new value, preserving open positions, dailyPnl,
+   * and realized progress. Equity and cash are shifted by the delta so a
+   * settings save reflects the new starting balance immediately.
+   */
+  applyEquity(newInitialEquity: number): void {
+    const delta = newInitialEquity - this.initialEquity;
+    if (delta === 0) return;
+    this.initialEquity = newInitialEquity;
+    this.equity += delta;
+    this.cash += delta;
+  }
+
+  /** Force equity/cash/initialEquity to a specific value (used for live-mode 0 display). */
+  setEquity(value: number): void {
+    this.initialEquity = value;
+    this.equity = value;
+    this.cash = value;
   }
 
   getState(): AccountState {

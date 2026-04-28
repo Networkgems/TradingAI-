@@ -27,6 +27,28 @@ export class CryptoPaperAccount {
     this.positions.clear();
   }
 
+  /**
+   * Rebase starting equity by the delta, preserving open positions and today's
+   * P&L (the openingEquityToday baseline shifts by the same delta so dailyPnl
+   * stays the same).
+   */
+  applyEquity(newInitialEquity: number): void {
+    const delta = newInitialEquity - this.initialEquity;
+    if (delta === 0) return;
+    this.initialEquity = newInitialEquity;
+    this.equity += delta;
+    this.cash += delta;
+    this.openingEquityToday += delta;
+  }
+
+  /** Force equity/cash to a specific value (used for live-mode 0 display). */
+  setEquity(value: number): void {
+    this.initialEquity = value;
+    this.equity = value;
+    this.cash = value;
+    this.openingEquityToday = value;
+  }
+
   getInitialEquity(): number {
     return this.initialEquity;
   }

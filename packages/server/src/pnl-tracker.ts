@@ -44,7 +44,8 @@ function startOfWeek(): string {
 export class PnlTracker {
   private readonly stateFile: string;
   private readonly snapshotsFile: string;
-  private readonly initialEquity: number;
+  private initialEquity: number;
+  private hadSavedState: boolean;
   private state: PersistedState;
   private snapshots: DailySnapshot[] = [];
 
@@ -53,9 +54,20 @@ export class PnlTracker {
     this.initialEquity = initialEquity;
     this.stateFile = join(dataDir, 'equity-state.json');
     this.snapshotsFile = join(dataDir, 'daily-snapshots.json');
+    this.hadSavedState = existsSync(this.stateFile);
     this.state = this.loadState();
     this.snapshots = this.loadSnapshots();
     this.advanceDayIfNeeded();
+  }
+
+  /** True when equity-state.json existed at construction (i.e. a prior session ran). */
+  hasSavedState(): boolean {
+    return this.hadSavedState;
+  }
+
+  /** Update the configured starting balance baseline (used by allTimePnl). */
+  setInitialEquity(value: number): void {
+    this.initialEquity = value;
   }
 
   private loadState(): PersistedState {
