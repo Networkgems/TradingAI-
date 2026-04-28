@@ -809,7 +809,7 @@ app.post('/api/crypto/positions/:id/close', requireAuth, async (req, res) => {
 // ── Data-source health check ─────────────────────────────────────────────────
 
 app.get('/api/health/quotes', async (_req, res) => {
-  const { testYahooFinance, testFinnhub, testTiingo, isYahooBreakerOpen, fetchMinuteBarsWithSource } = await import('./yahoo-feed.js');
+  const { testYahooFinance, testFinnhub, testTiingo, isYahooBreakerOpen, isTiingoBreakerOpen, fetchMinuteBarsWithSource } = await import('./yahoo-feed.js');
   const { testCoinMarketCap } = await import('./crypto-feed.js');
   const results: Record<string, unknown> = {};
 
@@ -871,6 +871,7 @@ app.get('/api/health/quotes', async (_req, res) => {
     stocksOk,
     cryptoOk,
     yahooBreakerOpen: isYahooBreakerOpen(),
+    tiingoBreakerOpen: isTiingoBreakerOpen(),
     results,
     ts: new Date().toISOString(),
   });

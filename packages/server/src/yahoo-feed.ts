@@ -255,7 +255,7 @@ interface TiingoIexBar {
 }
 
 export interface TiingoCandleDiag {
-  reason: 'no_key' | 'http_error' | 'no_data' | 'parse_error' | 'fetch_error' | 'ok';
+  reason: 'no_key' | 'http_error' | 'no_data' | 'parse_error' | 'fetch_error' | 'ok' | 'cache' | 'rate_limited';
   httpStatus?: number;
   rawLen?: number;
   filteredLen?: number;
@@ -263,11 +263,37 @@ export interface TiingoCandleDiag {
   errorMsg?: string;
 }
 
+// TRA-155 follow-up: Tiingo's free tier is 50 req/hr. The signal engine ticks
+// every 30s and may fan out across the watchlist, which would exhaust the
+// quota in minutes. Two guards keep us under the limit:
+//   1. Per-symbol bar cache with a TTL roughly equal to a minute bar's
+//      resolution — repeated calls for the same symbol within 60s are served
+//      from cache, so worst-case we spend 1 req/symbol/minute.
+//   2. 429 breaker — once Tiingo says we're over the hourly allocation, stop
+//      hammering the endpoint for the rest of the hour and surface the rate-
+//      limited state in diag so QA can see it without grepping logs.
+const TIINGO_BAR_CACHE_TTL_MS = 60_000;
+const TIINGO_RATE_LIMIT_COOLDOWN_MS = 60 * 60 * 1000; // 1 hour
+let tiingoRateLimitedUntil = 0;
+function isTiingoRateLimited(): boolean {
+  return Date.now() < tiingoRateLimitedUntil;
+}
+const tiingoBarCache = new Map<string, { at: number; bars: Candle[]; diag: TiingoCandleDiag }>();
+
 async function fetchTiingoMinuteBars(
   symbol: string,
   count: number,
 ): Promise<{ bars: Candle[]; diag: TiingoCandleDiag }> {
   if (!TIINGO_API_KEY) return { bars: [], diag: { reason: 'no_key' } };
+  const cached = tiingoBarCache.get(symbol);
+  if (cached && Date.now() - cached.at < TIINGO_BAR_CACHE_TTL_MS) {
+    // Tag as 'cache' so /api/health/quotes can show whether we're serving
+    // from cache vs hitting Tiingo on every probe.
+    return { bars: cached.bars, diag: { ...cached.diag, reason: 'cache' } };
+  }
+  if (isTiingoRateLimited()) {
+    return { bars: [], diag: { reason: 'rate_limited', httpStatus: 429 } };
+  }
   // 2× window to absorb off-hours / illiquid gaps, matching the Yahoo branch.
   const fromMs = Date.now() - count * 60 * 1000 * 2;
   const startDate = new Date(fromMs).toISOString();
@@ -277,6 +303,10 @@ async function fetchTiingoMinuteBars(
     if (!resp.ok) {
       const errorBody = await resp.text().catch(() => '');
       console.warn(`[yahoo-feed] tiingo candle(${symbol}) HTTP ${resp.status}: ${errorBody.slice(0, 200)}`);
+      if (resp.status === 429) {
+        tiingoRateLimitedUntil = Date.now() + TIINGO_RATE_LIMIT_COOLDOWN_MS;
+        console.warn(`[yahoo-feed] tiingo breaker tripped for ${TIINGO_RATE_LIMIT_COOLDOWN_MS / 60_000}m — quota exhausted`);
+      }
       return { bars: [], diag: { reason: 'http_error', httpStatus: resp.status, errorBody: errorBody.slice(0, 200) } };
     }
     const json = (await resp.json()) as TiingoIexBar[] | { detail?: string };
@@ -300,10 +330,11 @@ async function fetchTiingoMinuteBars(
     }
     candles.sort((a, b) => a.timestamp - b.timestamp);
     const sliced = candles.slice(-count);
-    return {
-      bars: sliced,
-      diag: { reason: sliced.length > 0 ? 'ok' : 'no_data', httpStatus: resp.status, rawLen: json.length, filteredLen: sliced.length },
-    };
+    const diag: TiingoCandleDiag = { reason: sliced.length > 0 ? 'ok' : 'no_data', httpStatus: resp.status, rawLen: json.length, filteredLen: sliced.length };
+    if (sliced.length > 0) {
+      tiingoBarCache.set(symbol, { at: Date.now(), bars: sliced, diag });
+    }
+    return { bars: sliced, diag };
   } catch (err: unknown) {
     const msg = err instanceof Error ? err.message : String(err);
     console.warn(`[yahoo-feed] tiingo candle(${symbol}) error: ${msg}`);
@@ -484,4 +515,9 @@ export async function testTiingo(): Promise<{ symbol: string; bars: number } | n
 /** Whether the Yahoo rate-limit circuit breaker is currently open. */
 export function isYahooBreakerOpen(): boolean {
   return isRateLimited();
+}
+
+/** Whether the Tiingo hourly-quota circuit breaker is currently open. */
+export function isTiingoBreakerOpen(): boolean {
+  return isTiingoRateLimited();
 }
