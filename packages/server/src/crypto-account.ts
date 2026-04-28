@@ -41,14 +41,6 @@ export class CryptoPaperAccount {
     this.openingEquityToday += delta;
   }
 
-  /** Force equity/cash to a specific value (used for live-mode 0 display). */
-  setEquity(value: number): void {
-    this.initialEquity = value;
-    this.equity = value;
-    this.cash = value;
-    this.openingEquityToday = value;
-  }
-
   getInitialEquity(): number {
     return this.initialEquity;
   }

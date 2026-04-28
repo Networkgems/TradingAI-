@@ -40,17 +40,19 @@ export class CryptoSignalEngine {
   private tickRunning = false;
   private handlers: CryptoEngineEventHandler[] = [];
   private autoTradingEnabled = true;
+  private mode: 'demo' | 'live' = 'demo';
 
   constructor(tracker?: PnlTracker, settings?: AccountSettings) {
     this.tracker = tracker;
+    this.mode = settings?.mode === 'live' ? 'live' : 'demo';
+    // Demo state is always loaded internally so a live → demo switch can
+    // restore equity, positions, and dailyPnl without rebasing to the default
+    // starting balance. Live mode masks this state via getState().
     const hasSaved = tracker?.hasSavedState() ?? false;
-    const isLive = settings?.mode === 'live';
     const cryptoStart = settings ? (settings.demoEquityCrypto ?? settings.demoEquity ?? 25_000) : 25_000;
-    const initialEquity = isLive ? 0 : cryptoStart;
-    // Restore current equity from saved state when available so realized progress survives restarts.
-    const currentEquity = isLive ? 0 : (hasSaved ? tracker!.getSavedEquity() : initialEquity);
-    // Seed today's opening from the persisted opening so dailyPnl persists across restarts.
-    const openingEquityToday = hasSaved && !isLive ? tracker!.getOpeningEquity() : currentEquity;
+    const initialEquity = cryptoStart;
+    const currentEquity = hasSaved ? tracker!.getSavedEquity() : initialEquity;
+    const openingEquityToday = hasSaved ? tracker!.getOpeningEquity() : currentEquity;
     this.account = new CryptoPaperAccount(currentEquity, openingEquityToday);
     // Set the canonical initialEquity baseline so allTimePnl reflects the user's setting.
     this.account.applyEquity(initialEquity);
@@ -58,19 +60,22 @@ export class CryptoSignalEngine {
 
   /**
    * Apply settings WITHOUT wiping today's trades or positions.
-   * Demo equity changes rebase by the delta; switching to live mode forces equity to 0.
+   * Demo equity changes rebase by the delta. Switching to live mode preserves
+   * the demo state internally and masks it to zero via getState() — so a later
+   * switch back to demo restores equity, positions, and dailyPnl untouched.
    * The new equity is persisted via the tracker so it survives a server restart.
    */
   applySettings(settings: AccountSettings): void {
-    if (settings.mode === 'live') {
-      this.account.setEquity(0);
-    } else {
-      const targetEquity = settings.demoEquityCrypto ?? settings.demoEquity;
-      this.account.applyEquity(targetEquity);
+    this.mode = settings.mode === 'live' ? 'live' : 'demo';
+    if (this.mode === 'live') {
+      // Live mode: leave account/tracker untouched so the demo state is
+      // preserved for a later switch back.
+      return;
     }
+    const targetEquity = settings.demoEquityCrypto ?? settings.demoEquity;
+    this.account.applyEquity(targetEquity);
     if (this.tracker) {
-      const newInitial = settings.mode === 'live' ? 0 : (settings.demoEquityCrypto ?? settings.demoEquity);
-      this.tracker.setInitialEquity(newInitial);
+      this.tracker.setInitialEquity(targetEquity);
       const accountState = this.account.getState();
       this.tracker.saveEquity(accountState.totalEquity, 0);
       // Realign persisted openingEquity so a server restart doesn't synthesize
@@ -204,6 +209,14 @@ export class CryptoSignalEngine {
       for (const h of this.handlers) h(earlyState);
     }
 
+    // Live mode: keep market data flowing so the UI shows live quotes, but
+    // freeze the demo account — no new positions, no exits. This way the demo
+    // state the user left is exactly what they see when they switch back.
+    if (this.mode === 'live') {
+      for (const h of this.handlers) h(this.buildState());
+      return;
+    }
+
     const closed = this.account.checkExits(prices);
     if (closed.length > 0) {
       this.allClosedPositions.push(...closed);
@@ -300,6 +313,32 @@ export class CryptoSignalEngine {
   }
 
   private buildState(): CryptoEngineState {
+    const symbols = Array.from(this.symbolState.values()).filter(s => !this.hiddenSymbols.has(s.symbol));
+    if (this.mode === 'live') {
+      // Live mode: no broker is connected, so account and positions display
+      // as zero/empty. The internal demo state stays preserved for a later
+      // switch back to demo.
+      const account: AccountState = {
+        totalEquity: 0,
+        availableCash: 0,
+        openPositions: [],
+        dailyPnl: 0,
+        weeklyPnl: 0,
+        monthlyPnl: 0,
+        yearlyPnl: 0,
+        allTimePnl: 0,
+      };
+      return {
+        symbols,
+        signals: [...this.recentSignals],
+        account,
+        closedPositions: [],
+        news: [...this.newsCache],
+        lastTick: Date.now(),
+        autoTradingEnabled: this.autoTradingEnabled,
+        marketOpen: true as const,
+      };
+    }
     const accountBase = this.account.getState();
     const stats = this.tracker?.getCumulativeStats(accountBase.totalEquity);
     const account: AccountState = {
@@ -311,7 +350,7 @@ export class CryptoSignalEngine {
     };
 
     return {
-      symbols: Array.from(this.symbolState.values()).filter(s => !this.hiddenSymbols.has(s.symbol)),
+      symbols,
       signals: [...this.recentSignals],
       account,
       closedPositions: [...this.allClosedPositions].slice(-20),

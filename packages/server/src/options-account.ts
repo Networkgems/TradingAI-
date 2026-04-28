@@ -82,13 +82,6 @@ export class PaperOptionsAccount {
     this.cash += delta;
   }
 
-  /** Force equity/cash to a specific value (used for live-mode 0 display). */
-  setEquity(value: number): void {
-    this.initialEquity = value;
-    this.equity = value;
-    this.cash = value;
-  }
-
   getState(): OptionsAccountState {
     return {
       openOptions: Array.from(this.openOptions.values()),

@@ -124,19 +124,19 @@ export class SignalEngine {
   private tickRunning = false;
   private handlers: EngineEventHandler[] = [];
   private autoTradingEnabled = true;
+  private mode: 'demo' | 'live' = 'demo';
 
   constructor(settings?: AccountSettings, tracker?: PnlTracker) {
     this.tracker = tracker;
+    this.mode = settings?.mode === 'live' ? 'live' : 'demo';
+    // Demo state is always loaded internally so a live → demo switch can
+    // restore positions, equity, and dailyPnl without rebasing to the default
+    // starting balance. Live mode masks this state via getState().
     const hasSaved = tracker?.hasSavedState() ?? false;
     const stocksEquity = settings ? (settings.demoEquityStocks ?? settings.demoEquity) : undefined;
-    // Live mode always shows 0 equity (no broker connection).
-    const isLive = settings?.mode === 'live';
-    const initialEquity = isLive ? 0 : (stocksEquity ?? 25_000);
-    // Restore current equity from prior session if a saved state file exists,
-    // so realized progress is preserved across server restarts.
-    const currentEquity = isLive ? 0 : (hasSaved ? tracker!.getSavedEquity() : initialEquity);
-    // Seed today's P&L from openingEquity so a mid-day restart doesn't reset it.
-    const dailyPnl = hasSaved && !isLive ? currentEquity - tracker!.getOpeningEquity() : 0;
+    const initialEquity = stocksEquity ?? 25_000;
+    const currentEquity = hasSaved ? tracker!.getSavedEquity() : initialEquity;
+    const dailyPnl = hasSaved ? currentEquity - tracker!.getOpeningEquity() : 0;
     this.account = new PaperAccount({
       initialEquity,
       currentEquity,
@@ -158,21 +158,16 @@ export class SignalEngine {
    *   balance takes effect immediately while preserving open positions and
    *   dailyPnl. The new equity is persisted via the tracker so it survives
    *   a server restart.
-   * - Switching to live mode forces equity to 0 (no broker connected).
+   * - Switching to live mode preserves the demo state internally and masks it
+   *   to zero via getState() (no broker connected). Switching back to demo
+   *   restores positions, equity, and dailyPnl untouched.
    * - Risk parameters (managedAccountRatio, riskPerTrade, dailyTradesLimit)
    *   update live without touching positions.
    *
    * Use {@link forceReset} for the explicit "Reset Demo Account" hard reset.
    */
   applySettings(settings: AccountSettings): void {
-    if (settings.mode === 'live') {
-      this.account.setEquity(0);
-      this.optionsAccount.setEquity(0);
-    } else {
-      const targetEquity = settings.demoEquityStocks ?? settings.demoEquity;
-      this.account.applyEquity(targetEquity);
-      this.optionsAccount.applyEquity(targetEquity);
-    }
+    this.mode = settings.mode === 'live' ? 'live' : 'demo';
     this.account.updateConfig({
       managedAccountRatio: settings.managedAccountRatio,
       riskPerTrade: settings.riskPerTrade,
@@ -181,9 +176,16 @@ export class SignalEngine {
       managedAccountRatio: settings.managedAccountRatio,
       dailyTradesLimit: settings.dailyTradesLimit,
     });
+    if (this.mode === 'live') {
+      // Live mode: leave account/options/tracker untouched so the demo state
+      // (equity, positions, dailyPnl) is preserved for a later switch back.
+      return;
+    }
+    const targetEquity = settings.demoEquityStocks ?? settings.demoEquity;
+    this.account.applyEquity(targetEquity);
+    this.optionsAccount.applyEquity(targetEquity);
     if (this.tracker) {
-      const newInitial = settings.mode === 'live' ? 0 : (settings.demoEquityStocks ?? settings.demoEquity);
-      this.tracker.setInitialEquity(newInitial);
+      this.tracker.setInitialEquity(targetEquity);
       const accountState = this.account.getState();
       this.tracker.saveEquity(
         accountState.totalEquity,
@@ -308,19 +310,16 @@ export class SignalEngine {
 
     // Broadcast watchlist state early so the UI populates without waiting for candles
     if (this.symbolState.size > 0) {
-      const earlyState: EngineState = {
-        symbols: Array.from(this.symbolState.values()),
-        signals: [...this.recentSignals],
-        account: this.buildAccountState(),
-        closedPositions: [...this.allClosedPositions].slice(-20),
-        options: this.optionsAccount.getState(),
-        lastTick: Date.now(),
-        tradingHalted: this.riskGovernor.isHalted(),
-        haltReason: this.riskGovernor.getHaltReason(),
-        autoTradingEnabled: this.autoTradingEnabled,
-        marketOpen: isStockMarketOpen(),
-      };
+      const earlyState = this.getState();
       for (const h of this.handlers) h(earlyState);
+    }
+
+    // Live mode: keep market data flowing so the UI shows live quotes, but
+    // freeze the demo account — no new positions, no exits. This way the demo
+    // state the user left is exactly what they see when they switch back.
+    if (this.mode === 'live') {
+      for (const h of this.handlers) h(this.getState());
+      return;
     }
 
     const closed = this.account.checkExits(prices);
@@ -492,8 +491,26 @@ export class SignalEngine {
   }
 
   getState(): EngineState {
+    const symbols = Array.from(this.symbolState.values()).filter(s => !this.hiddenSymbols.has(s.symbol));
+    if (this.mode === 'live') {
+      // Live mode: no broker is connected, so account, positions, and options
+      // display as zero/empty. The internal demo state stays preserved for a
+      // later switch back to demo.
+      return {
+        symbols,
+        signals: [...this.recentSignals],
+        account: { totalEquity: 0, availableCash: 0, openPositions: [], dailyPnl: 0 },
+        closedPositions: [],
+        options: { openOptions: [], closedOptions: [], optionsPnl: 0, optionsCash: 0, dailyOptionsCount: 0 },
+        lastTick: Date.now(),
+        tradingHalted: false,
+        haltReason: null,
+        autoTradingEnabled: this.autoTradingEnabled,
+        marketOpen: isStockMarketOpen(),
+      };
+    }
     return {
-      symbols: Array.from(this.symbolState.values()).filter(s => !this.hiddenSymbols.has(s.symbol)),
+      symbols,
       signals: [...this.recentSignals],
       account: this.buildAccountState(),
       closedPositions: [...this.allClosedPositions].slice(-20),

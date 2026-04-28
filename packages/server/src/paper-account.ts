@@ -58,13 +58,6 @@ export class PaperAccount {
     this.cash += delta;
   }
 
-  /** Force equity/cash/initialEquity to a specific value (used for live-mode 0 display). */
-  setEquity(value: number): void {
-    this.initialEquity = value;
-    this.equity = value;
-    this.cash = value;
-  }
-
   getState(): AccountState {
     return {
       totalEquity: this.equity,
