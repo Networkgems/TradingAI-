@@ -482,9 +482,18 @@ tr:hover td { background: #1c2128; }
   border: 1px solid var(--border);
   border-radius: 6px;
   min-width: 190px;
-  z-index: 10000;
+  z-index: 10001;
   box-shadow: 0 4px 16px rgba(0,0,0,0.45);
   overflow: hidden;
+}
+
+/* Transparent backdrop layered just under the dropdown to capture outside taps
+   on mobile without racing with document-level click listeners. */
+.profile-dropdown-backdrop {
+  position: fixed;
+  inset: 0;
+  z-index: 10000;
+  background: transparent;
 }
 
 .profile-dropdown-item {
@@ -1171,7 +1180,13 @@ tr:hover td { background: #1c2128; }
     max-width: calc(100vw - 2rem);
   }
 
-  /* Profile dropdown renders via portal into body; no override needed */
+  /* Profile dropdown items: 44px touch target per Apple HIG */
+  .profile-dropdown { min-width: 220px; }
+  .profile-dropdown-item { padding: 0.85rem 1rem; font-size: 0.9rem; }
+
+  /* Watchlist toolbar: wrap controls so input + buttons all fit on narrow screens */
+  .watchlist-toolbar { flex-wrap: wrap; }
+  .watchlist-add-input { max-width: none; min-width: 140px; }
 }
 
 @media (max-width: 480px) {
