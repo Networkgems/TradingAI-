@@ -33,6 +33,8 @@ import {
 } from './users.js';
 import { sendPasswordResetEmail } from './email.js';
 import { rotateBackups, checkDataDirHealth } from './trade-store.js';
+import { TradierOtmMispricingService } from './options-scanner.js';
+import { fetchQuotes } from './yahoo-feed.js';
 import {
   runFirstBootMigration,
   initAllUserContexts,
@@ -189,10 +191,52 @@ async function generateAllUserEodReports(): Promise<void> {
   }
 }
 
+// TRA-158 — server-side OTM mispricing scanner. Disabled (no_credentials) until
+// TRADIER_API_TOKEN + TRADIER_ACCOUNT_ID are configured. Uses Yahoo's existing
+// quote pipeline as the spot source so we don't pay for Tradier quotes too.
+const otmMispricingService = new TradierOtmMispricingService({
+  tradierApiToken: process.env['TRADIER_API_TOKEN'],
+  tradierAccountId: process.env['TRADIER_ACCOUNT_ID'],
+  tradierEnv: (process.env['TRADIER_ENV'] as 'sandbox' | 'production') ?? 'sandbox',
+  fetchSpot: async (symbol) => {
+    const quotes = await fetchQuotes([symbol]);
+    const q = quotes.get(symbol);
+    return q && q.price > 0 ? q.price : null;
+  },
+});
+
 // ── REST endpoints ───────────────────────────────────────────────────────────
 
 app.get('/api/health', (_req, res) => {
   res.json({ ok: true, time: new Date().toISOString() });
+});
+
+// TRA-158 — surface live OTM mispricing scan output. Read-only, gated by auth.
+// Returns up to `limit` ranked candidates and the diagnostics block so QA can
+// see whether the breaker is open / cache is warm without needing server logs.
+app.get('/api/options/otm-mispricing', requireAuth, async (req, res) => {
+  const symbol = typeof req.query['symbol'] === 'string' ? req.query['symbol'] : '';
+  if (!symbol) {
+    res.status(400).json({ error: 'symbol query parameter is required' });
+    return;
+  }
+  const limit = Math.max(1, Math.min(50, Number(req.query['limit'] ?? 10)));
+  const minMispricing = req.query['minMispricing'] != null
+    ? Number(req.query['minMispricing'])
+    : undefined;
+
+  const result = await otmMispricingService.scan(symbol, {
+    mispricingThresholdPct: Number.isFinite(minMispricing) ? Number(minMispricing) : undefined,
+  });
+  res.json({
+    ...result,
+    candidates: result.candidates.slice(0, limit),
+    diagnostics: otmMispricingService.diagnostics(),
+  });
+});
+
+app.get('/api/health/options-mispricing', (_req, res) => {
+  res.json(otmMispricingService.diagnostics());
 });
 
 // TRA-141 — storage diagnostic so QA can verify from outside the box that the
