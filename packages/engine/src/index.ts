@@ -16,5 +16,15 @@ export { AlpacaOrderClient } from './alpaca/index.js';
 export type { BracketOrderParams, AlpacaOrderResponse } from './alpaca/index.js';
 export { AlpacaOptionsClient } from './alpaca/index.js';
 export type { AlpacaOptionsContract, AlpacaOptionOrderResponse } from './alpaca/index.js';
+export { TradierFeed } from './feed/index.js';
+export type { TradierFeedEvents } from './feed/index.js';
+export { TradierOrderClient, TradierOptionsClient, tradierBaseUrl, underlyingFromOcc } from './tradier/index.js';
+export type {
+  TradierEnv,
+  TradierBracketOrderParams,
+  TradierOrderResponse,
+  TradierOptionsContract,
+  TradierOptionQuote,
+} from './tradier/index.js';
 export { rsi, rsiDivergence, VwapTracker, detectPattern, isBullishPattern, isBearishPattern, adx, ema, emaCross } from './indicators/index.js';
 export type { VwapState, CandlePattern, AdxResult } from './indicators/index.js';
