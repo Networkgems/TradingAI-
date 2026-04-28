@@ -80,6 +80,36 @@ A scripted version of this lives in the PR description for [TRA-151].
 - Introduce a `BrokerOrderClient` interface once both Alpaca and Tradier are
   running side-by-side in production.
 
+## OTM mispricing scanner (TRA-158)
+
+Pure-function scanner that flags out-of-the-money contracts whose market mark
+deviates from a Black-Scholes theoretical price. Built off Tradier's smoothed
+IV (`smv_vol`) when available, falling back to neighbour-strike `mid_iv`
+smoothing.
+
+```ts
+import {
+  TradierOptionsClient,
+  findMispricedOtmContracts,
+} from '@trading-app/engine';
+
+const client = new TradierOptionsClient(token, accountId, 'sandbox');
+const chain = await client.getChainSnapshot('AAPL', '2026-05-15'); // greeks=true
+const candidates = findMispricedOtmContracts(chain, /* spot */ 187.50, {
+  mispricingThresholdPct: 0.20, // |mark/theo - 1| > 20% → flagged
+  maxSpreadPct: 0.20,           // reject (ask-bid)/mid > 20%
+  minOpenInterest: 50,
+});
+// → ranked OtmMispricingCandidate[] with classification: 'expensive' | 'cheap' | 'fair'
+```
+
+Server-side wrapper with caching/breaker:
+[`packages/server/src/options-scanner.ts`](../server/src/options-scanner.ts)
+exposes `GET /api/options/otm-mispricing?symbol=...` and a sibling
+`GET /api/health/options-mispricing` diagnostics endpoint. Disabled
+(`reason: 'no_credentials'`) until `TRADIER_API_TOKEN` and
+`TRADIER_ACCOUNT_ID` are set.
+
 ## Tests
 
 ```bash
