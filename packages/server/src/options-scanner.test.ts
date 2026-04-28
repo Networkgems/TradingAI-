@@ -157,4 +157,42 @@ describe('TradierOtmMispricingService', () => {
     const result = await svc.scan('TEST', { mispricingThresholdPct: 0.5 });
     expect(result.reason).toBe('ok');
   });
+
+  it('getOptionMark returns the (bid+ask)/2 mid for a known OCC contract', async () => {
+    const { svc, client } = makeService();
+    client.getExpirations.mockResolvedValue(['2024-02-15']);
+    client.getChainSnapshot.mockResolvedValue([row(110, 'call', 1.40)]);
+
+    // Warm the chain cache by running a scan.
+    await svc.scan('TEST');
+    expect(client.getChainSnapshot).toHaveBeenCalledTimes(1);
+
+    const mark = await svc.getOptionMark('TEST', '2024-02-15', 'TEST110CALL');
+    // bid = 1.4 - 0.028 = 1.372, ask = 1.4 + 0.028 = 1.428 → mid = 1.40
+    expect(mark).toBeCloseTo(1.40, 4);
+    // Cache hit — no extra Tradier round-trip.
+    expect(client.getChainSnapshot).toHaveBeenCalledTimes(1);
+  });
+
+  it('getOptionMark returns null for an OCC not in the chain', async () => {
+    const { svc, client } = makeService();
+    client.getExpirations.mockResolvedValue(['2024-02-15']);
+    client.getChainSnapshot.mockResolvedValue([row(110, 'call', 1.40)]);
+    await svc.scan('TEST');
+
+    const mark = await svc.getOptionMark('TEST', '2024-02-15', 'TEST999CALL');
+    expect(mark).toBeNull();
+  });
+
+  it('getOptionMark short-circuits to null when the breaker is open', async () => {
+    const { svc, client } = makeService();
+    client.getExpirations.mockRejectedValueOnce(new Error('429'));
+    await svc.scan('TEST'); // trips the breaker
+
+    const before = client.getChainSnapshot.mock.calls.length;
+    const mark = await svc.getOptionMark('TEST', '2024-02-15', 'TEST110CALL');
+    expect(mark).toBeNull();
+    // Did not attempt to fetch a chain while the breaker was open.
+    expect(client.getChainSnapshot).toHaveBeenCalledTimes(before);
+  });
 });

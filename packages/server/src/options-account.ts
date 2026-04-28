@@ -1,5 +1,5 @@
 import { randomUUID } from 'crypto';
-import type { TradeSignal, OptionPosition, OptionsAccountState } from '@trading-app/shared';
+import type { TradeSignal, OptionPosition, OptionsAccountState, OtmMispricingSignal } from '@trading-app/shared';
 import {
   DEFAULT_ACCOUNT_SETTINGS,
   OPTIONS_BUDGET_RATIO,
@@ -104,6 +104,78 @@ export class PaperOptionsAccount {
     }
   }
 
+  /**
+   * Open an OTM contract from a scanner candidate (TRA-159, long-only path).
+   *
+   * Differs from {@link openOption} in two ways:
+   *   • Per-contract entry premium = `signal.mark * 100` (the actual chain mid)
+   *     rather than the 2%-of-spot ATM heuristic.
+   *   • The position is stickered with the OCC `optionSymbol`, `strike`, and
+   *     `expiration` so the engine's mark-refresh path can look the contract
+   *     up in the cached chain snapshot instead of extrapolating off the
+   *     underlying.
+   *
+   * Returns `null` and consumes nothing when sized contracts ≤ 0, when the
+   * trading window or daily limit blocks entry, or when an open position for
+   * the same `optionSymbol` already exists.
+   */
+  openOptionFromCandidate(signal: OtmMispricingSignal): OptionPosition | null {
+    this.resetDayIfNeeded();
+
+    if (!isValidTradingWindow(Date.now())) return null;
+    if (this.dailyCount >= OPTIONS_DAILY_LIMIT) return null;
+
+    // Dedup by OCC symbol — one open contract at a time per strike/expiration.
+    const existing = Array.from(this.openOptions.values()).find(
+      o => o.optionSymbol === signal.optionSymbol,
+    );
+    if (existing) return null;
+
+    const premiumPaid = signal.mark;
+    if (!Number.isFinite(premiumPaid) || premiumPaid <= 0) return null;
+
+    const budget = this.budgetPerTrade();
+    const costPerContract = premiumPaid * 100;
+    const contracts = Math.floor(budget / costPerContract);
+    if (contracts <= 0) return null;
+
+    const totalCost = contracts * costPerContract;
+    if (totalCost > this.cash) return null;
+
+    this.cash -= totalCost;
+    this.dailyCount += 1;
+
+    const tp1Premium = premiumPaid * (1 + OPTIONS_TP1_PCT);
+    const stopLossPremium = premiumPaid * (1 - OPTIONS_SL_PCT);
+    const trailActivatePremium = premiumPaid * (1 + OPTIONS_TRAIL_ACTIVATE_PCT);
+
+    const position: OptionPosition = {
+      id: randomUUID(),
+      symbol: signal.symbol,
+      optionSymbol: signal.optionSymbol,
+      optionType: signal.optionType,
+      strike: signal.strike,
+      expiration: signal.expiration,
+      contracts,
+      contractsRemaining: contracts,
+      premiumPaid,
+      currentPremium: premiumPaid,
+      tp1Premium,
+      tp1Hit: false,
+      stopLossPremium,
+      peakPremium: premiumPaid,
+      trailingActive: false,
+      trailingStopPremium: trailActivatePremium,
+      underlyingEntryPrice: signal.entryPrice,
+      openedAt: Date.now(),
+      signalId: signal.id,
+      signalType: 'otm_mispricing',
+    };
+
+    this.openOptions.set(position.id, position);
+    return position;
+  }
+
   openOption(signal: TradeSignal, underlyingPrice: number): OptionPosition | null {
     this.resetDayIfNeeded();
 
@@ -167,17 +239,39 @@ export class PaperOptionsAccount {
    *   1. Partial exit (50% contracts) when premium hits TP1 (+25%)
    *   2. Trailing stop activates at +20% gain; trails 12% below peak
    *   3. Full exit when hard SL (−25%) or trailing stop is breached
+   *
+   * `optionMarks` (TRA-159) supplies live per-share marks keyed by OCC symbol
+   * — when present for a position with `optionSymbol`, that mark is used
+   * directly instead of extrapolating off the underlying with a fixed delta.
+   * Positions opened from the OTM scanner (`signalType === 'otm_mispricing'`)
+   * REQUIRE a fresh mark to evaluate exits; if the chain wasn't fetched this
+   * tick the position is skipped (next tick gets it). ATM positions opened
+   * from `openOption` keep the existing delta-extrapolation fallback.
    */
-  checkExits(underlyingPrices: Map<string, number>): OptionPosition[] {
+  checkExits(
+    underlyingPrices: Map<string, number>,
+    optionMarks?: Map<string, number>,
+  ): OptionPosition[] {
     const closed: OptionPosition[] = [];
 
     for (const [id, opt] of this.openOptions) {
-      const currentUnderlying = underlyingPrices.get(opt.symbol);
-      if (currentUnderlying == null) continue;
+      const liveMark = opt.optionSymbol ? optionMarks?.get(opt.optionSymbol) : undefined;
+      let mark: number;
+      if (typeof liveMark === 'number' && liveMark > 0) {
+        mark = liveMark;
+      } else if (opt.signalType === 'otm_mispricing') {
+        // OTM positions are mark-driven. Without a fresh chain snapshot we'd
+        // have no honest way to update them, so wait for the next tick rather
+        // than synthesise a fake mark off the underlying delta.
+        continue;
+      } else {
+        const currentUnderlying = underlyingPrices.get(opt.symbol);
+        if (currentUnderlying == null) continue;
+        const underlyingMove = currentUnderlying - opt.underlyingEntryPrice;
+        const premiumMove = underlyingMove * ATM_DELTA * (opt.optionType === 'call' ? 1 : -1);
+        mark = Math.max(0.01, opt.premiumPaid + premiumMove);
+      }
 
-      const underlyingMove = currentUnderlying - opt.underlyingEntryPrice;
-      const premiumMove = underlyingMove * ATM_DELTA * (opt.optionType === 'call' ? 1 : -1);
-      const mark = Math.max(0.01, opt.premiumPaid + premiumMove);
       opt.currentPremium = mark;
 
       if (mark > opt.peakPremium) opt.peakPremium = mark;

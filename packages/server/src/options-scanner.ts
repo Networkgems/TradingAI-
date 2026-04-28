@@ -21,6 +21,19 @@ interface CacheEntry<T> {
 
 export interface OtmMispricingService {
   scan(symbol: string, opts?: OtmScannerOptions): Promise<OtmMispricingScanResult>;
+  /**
+   * Look up the current mid (per-share mark) for an option contract belonging
+   * to `symbol`'s `expiration` chain. Reads from the same 60s-cached chain
+   * snapshot used by `scan()` so a refresh on a symbol with an open OTM
+   * position costs zero extra Tradier calls when the cache is warm.
+   * Returns `null` when the contract is not in the cached snapshot or the
+   * chain row has no usable bid/ask.
+   */
+  getOptionMark(
+    symbol: string,
+    expiration: string,
+    optionSymbol: string,
+  ): Promise<number | null>;
   diagnostics(): OtmMispricingDiagnostics;
 }
 
@@ -163,6 +176,30 @@ export class TradierOtmMispricingService implements OtmMispricingService {
 
     const candidates = findMispricedOtmContracts(chain, spot, { now: this.now(), ...opts });
     return { symbol: upper, spot, expiration, candidates, reason: 'ok' };
+  }
+
+  async getOptionMark(
+    symbol: string,
+    expiration: string,
+    optionSymbol: string,
+  ): Promise<number | null> {
+    if (!this.client) return null;
+    if (this.isBreakerOpen()) return null;
+    const upper = symbol.trim().toUpperCase();
+    let chain: OptionChainRow[];
+    try {
+      chain = await this.fetchChain(upper, expiration);
+    } catch (err) {
+      this.tripBreaker(`getChainSnapshot(${upper},${expiration}) failed`, err);
+      return null;
+    }
+    const row = chain.find((r) => r.optionSymbol === optionSymbol);
+    if (!row) return null;
+    const bid = row.bid ?? 0;
+    const ask = row.ask ?? 0;
+    if (bid > 0 && ask > 0 && ask >= bid) return (bid + ask) / 2;
+    if (typeof row.last === 'number' && row.last > 0) return row.last;
+    return null;
   }
 
   private isBreakerOpen(): boolean {

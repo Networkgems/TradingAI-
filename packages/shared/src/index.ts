@@ -2,7 +2,7 @@
 
 export type Side = 'buy' | 'sell';
 export type OrderStatus = 'pending' | 'filled' | 'cancelled' | 'rejected';
-export type SignalType = 'orb_breakout' | 'reversal' | 'macd_cross' | 'ichimoku' | 'scalping' | 'swing_trade';
+export type SignalType = 'orb_breakout' | 'reversal' | 'macd_cross' | 'ichimoku' | 'scalping' | 'swing_trade' | 'otm_mispricing';
 export type OptionType = 'call' | 'put';
 
 export interface Candle {
@@ -25,6 +25,31 @@ export interface TradeSignal {
   takeProfit: number;
   riskRewardRatio: number;
   timestamp: number;
+}
+
+/**
+ * Signal emitted by the OTM mispricing scanner (TRA-159) for cheap OTM contracts
+ * — long-only path. `entryPrice` is the per-share option mark so the existing
+ * watchlist UI can render it without special-casing; option-specific fields ride
+ * along on the same record so `PaperOptionsAccount.openOptionFromCandidate` can
+ * sticker the position with the OCC symbol, strike, and theo without a second
+ * lookup.
+ */
+export interface OtmMispricingSignal extends TradeSignal {
+  type: 'otm_mispricing';
+  side: 'buy';
+  optionSymbol: string;
+  optionType: OptionType;
+  strike: number;
+  expiration: string;
+  /** Per-share mark used as the entry premium. */
+  mark: number;
+  /** Black-Scholes theoretical price for the contract at scan time. */
+  theo: number;
+  /** (mark − theo) / theo. Negative for `cheap` candidates. */
+  mispricingPct: number;
+  /** Sign-adjusted Black-Scholes delta from the scanner. */
+  delta: number;
 }
 
 export interface Position {

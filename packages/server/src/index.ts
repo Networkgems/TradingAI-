@@ -45,6 +45,7 @@ import {
   tryGetUserContext,
   persistStocksNow,
   persistCryptoNow,
+  setOtmScanner,
   type UserContext,
 } from './user-context.js';
 import type { AccountSettings } from '@trading-app/shared';
@@ -59,6 +60,24 @@ await checkDataDirHealth();
 // Load users and reset tokens from persistent storage.
 await loadUsers();
 initResetTokenStore(DATA_DIR);
+
+// TRA-158/TRA-159 — server-side OTM mispricing scanner. Disabled
+// (no_credentials) until TRADIER_API_TOKEN + TRADIER_ACCOUNT_ID are
+// configured. Wired into user-context BEFORE any contexts are constructed so
+// every per-user SignalEngine sees the same scanner instance and shares the
+// 60s chain cache + 1h breaker. Uses Yahoo's existing quote pipeline as the
+// spot source so we don't pay for Tradier quotes too.
+const otmMispricingService = new TradierOtmMispricingService({
+  tradierApiToken: process.env['TRADIER_API_TOKEN'],
+  tradierAccountId: process.env['TRADIER_ACCOUNT_ID'],
+  tradierEnv: (process.env['TRADIER_ENV'] as 'sandbox' | 'production') ?? 'sandbox',
+  fetchSpot: async (symbol) => {
+    const quotes = await fetchQuotes([symbol]);
+    const q = quotes.get(symbol);
+    return q && q.price > 0 ? q.price : null;
+  },
+});
+setOtmScanner(otmMispricingService.diagnostics().configured ? otmMispricingService : undefined);
 
 // TRA-142 — migrate legacy global files into the admin namespace exactly once,
 // then bootstrap per-user contexts (engines, trackers, persistence timers) for
@@ -190,20 +209,6 @@ async function generateAllUserEodReports(): Promise<void> {
     }
   }
 }
-
-// TRA-158 — server-side OTM mispricing scanner. Disabled (no_credentials) until
-// TRADIER_API_TOKEN + TRADIER_ACCOUNT_ID are configured. Uses Yahoo's existing
-// quote pipeline as the spot source so we don't pay for Tradier quotes too.
-const otmMispricingService = new TradierOtmMispricingService({
-  tradierApiToken: process.env['TRADIER_API_TOKEN'],
-  tradierAccountId: process.env['TRADIER_ACCOUNT_ID'],
-  tradierEnv: (process.env['TRADIER_ENV'] as 'sandbox' | 'production') ?? 'sandbox',
-  fetchSpot: async (symbol) => {
-    const quotes = await fetchQuotes([symbol]);
-    const q = quotes.get(symbol);
-    return q && q.price > 0 ? q.price : null;
-  },
-});
 
 // ── REST endpoints ───────────────────────────────────────────────────────────
 

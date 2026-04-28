@@ -6,6 +6,7 @@ import { fileURLToPath } from 'url';
 import { SignalEngine } from './signal-engine.js';
 import { CryptoSignalEngine } from './crypto-engine.js';
 import { PnlTracker } from './pnl-tracker.js';
+import type { OtmMispricingService } from './options-scanner.js';
 import {
   loadSettings,
   clearSettingsCache,
@@ -59,6 +60,16 @@ export interface UserContext {
 }
 
 const contexts = new Map<string, UserContext>();
+
+// TRA-159 — server-wide OTM scanner instance shared across all per-user
+// SignalEngines. Set once at server boot via `setOtmScanner` before any
+// contexts are constructed; left undefined when Tradier creds are missing,
+// in which case the engines run without OTM scanning.
+let sharedOtmScanner: OtmMispricingService | undefined;
+
+export function setOtmScanner(svc: OtmMispricingService | undefined): void {
+  sharedOtmScanner = svc;
+}
 
 export function getAllUserContexts(): UserContext[] {
   return Array.from(contexts.values());
@@ -179,7 +190,7 @@ async function createUserContext(username: string): Promise<UserContext> {
     settings.mode === 'live' ? 0 : (settings.demoEquityCrypto ?? settings.demoEquity),
   );
 
-  const engine = new SignalEngine(settings, tracker);
+  const engine = new SignalEngine(settings, tracker, sharedOtmScanner);
   const cryptoEngine = new CryptoSignalEngine(cryptoTracker, settings);
 
   // Restore trade history (TRA-140)
