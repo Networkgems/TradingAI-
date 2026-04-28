@@ -8,23 +8,30 @@ import type { DailySignalRecord } from './reports/eod-report.js';
 
 // ─────────────────────────────────────────────────────────────────────────────
 // TRA-140 — durable trade-history store with automatic backups.
-//
-// Trade history (open positions, closed positions, signals, options activity)
-// used to live ONLY in RAM. Every server restart on Render erased everything,
-// even though the persistent disk was mounted. This module writes that state
-// to JSON files under DATA_DIR after every meaningful change, rotates backup
-// snapshots so a corrupt write can be recovered, and auto-restores from the
-// most recent backup if the primary file is missing or unparseable.
+// TRA-142 — extended to scope every persisted file by username so per-user
+// trade history, settings, watchlist, and equity state never collide. Each
+// user's data lives under DATA_DIR/users/<username>/ and the global files
+// (users.json, reset-tokens.json) stay at the root.
 // ─────────────────────────────────────────────────────────────────────────────
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const DATA_DIR = process.env.DATA_DIR ?? join(__dirname, '..', 'data');
 const BACKUP_DIR = join(DATA_DIR, 'backups');
-const STOCKS_TRADES_FILE = join(DATA_DIR, 'trades-stocks.json');
-const CRYPTO_TRADES_FILE = join(DATA_DIR, 'trades-crypto.json');
 
 /** Maximum number of timestamped backup folders to keep. */
 const MAX_BACKUPS = 24; // 12 hours of 30-min snapshots
+
+function userDir(username: string): string {
+  return join(DATA_DIR, 'users', username);
+}
+
+function stocksTradesFile(username: string): string {
+  return join(userDir(username), 'trades-stocks.json');
+}
+
+function cryptoTradesFile(username: string): string {
+  return join(userDir(username), 'trades-crypto.json');
+}
 
 export interface StocksTradeSnapshot {
   version: 1;
@@ -80,8 +87,6 @@ async function atomicWriteJson(file: string, value: unknown): Promise<void> {
   const tmp = `${file}.tmp`;
   const json = JSON.stringify(value, null, 2);
   await writeFile(tmp, json, 'utf-8');
-  // Node's fs/promises.rename is atomic on POSIX and atomic-enough on Windows
-  // (replace dest if exists). On EXDEV / cross-device errors fall back to copy.
   const { rename } = await import('fs/promises');
   try {
     await rename(tmp, file);
@@ -110,24 +115,28 @@ async function findLatestBackupDir(): Promise<string | null> {
     const entries = await readdir(BACKUP_DIR);
     const sorted = entries
       .filter(name => /^\d{4}-\d{2}-\d{2}T/.test(name))
-      .sort(); // ISO strings sort lexicographically
+      .sort();
     return sorted.length > 0 ? join(BACKUP_DIR, sorted[sorted.length - 1]) : null;
   } catch {
     return null;
   }
 }
 
-async function tryRestoreFromBackup<T>(file: string): Promise<T | null> {
+/**
+ * Try to restore a per-user file from the latest backup. Backups mirror the
+ * user-namespaced layout (backups/<ts>/users/<username>/<file>).
+ */
+async function tryRestoreFromBackup<T>(targetFile: string, username: string, fileName: string): Promise<T | null> {
   const latestBackup = await findLatestBackupDir();
   if (!latestBackup) return null;
-  const backupFile = join(latestBackup, file.split(/[\\/]/).pop() ?? '');
+  const backupFile = join(latestBackup, 'users', username, fileName);
   if (!existsSync(backupFile)) return null;
   try {
     const raw = await readFile(backupFile, 'utf-8');
     const parsed = JSON.parse(raw) as T;
-    console.warn(`[trade-store] ⚠ Restored ${file} from backup ${backupFile}`);
-    // Promote backup to primary so subsequent reads succeed.
-    await writeFile(file, raw, 'utf-8');
+    console.warn(`[trade-store] ⚠ Restored ${targetFile} from backup ${backupFile}`);
+    await ensureDir(dirname(targetFile));
+    await writeFile(targetFile, raw, 'utf-8');
     return parsed;
   } catch (err: unknown) {
     console.warn(`[trade-store] Backup at ${backupFile} also unparseable: ${err instanceof Error ? err.message : String(err)}`);
@@ -137,35 +146,35 @@ async function tryRestoreFromBackup<T>(file: string): Promise<T | null> {
 
 // ── Public API ──────────────────────────────────────────────────────────────
 
-export async function loadStocksTradeSnapshot(): Promise<StocksTradeSnapshot | null> {
-  const primary = await readJsonOrNull<StocksTradeSnapshot>(STOCKS_TRADES_FILE);
+export async function loadStocksTradeSnapshot(username: string): Promise<StocksTradeSnapshot | null> {
+  const file = stocksTradesFile(username);
+  const primary = await readJsonOrNull<StocksTradeSnapshot>(file);
   if (primary) return primary;
-  return tryRestoreFromBackup<StocksTradeSnapshot>(STOCKS_TRADES_FILE);
+  return tryRestoreFromBackup<StocksTradeSnapshot>(file, username, 'trades-stocks.json');
 }
 
-export async function loadCryptoTradeSnapshot(): Promise<CryptoTradeSnapshot | null> {
-  const primary = await readJsonOrNull<CryptoTradeSnapshot>(CRYPTO_TRADES_FILE);
+export async function loadCryptoTradeSnapshot(username: string): Promise<CryptoTradeSnapshot | null> {
+  const file = cryptoTradesFile(username);
+  const primary = await readJsonOrNull<CryptoTradeSnapshot>(file);
   if (primary) return primary;
-  return tryRestoreFromBackup<CryptoTradeSnapshot>(CRYPTO_TRADES_FILE);
+  return tryRestoreFromBackup<CryptoTradeSnapshot>(file, username, 'trades-crypto.json');
 }
 
-export async function saveStocksTradeSnapshot(snap: StocksTradeSnapshot): Promise<void> {
-  await atomicWriteJson(STOCKS_TRADES_FILE, { ...snap, savedAt: new Date().toISOString() });
+export async function saveStocksTradeSnapshot(username: string, snap: StocksTradeSnapshot): Promise<void> {
+  await atomicWriteJson(stocksTradesFile(username), { ...snap, savedAt: new Date().toISOString() });
 }
 
-export async function saveCryptoTradeSnapshot(snap: CryptoTradeSnapshot): Promise<void> {
-  await atomicWriteJson(CRYPTO_TRADES_FILE, { ...snap, savedAt: new Date().toISOString() });
+export async function saveCryptoTradeSnapshot(username: string, snap: CryptoTradeSnapshot): Promise<void> {
+  await atomicWriteJson(cryptoTradesFile(username), { ...snap, savedAt: new Date().toISOString() });
 }
 
 /**
  * Snapshot every persisted file under DATA_DIR into a timestamped backup folder
- * and prune old folders. Files snapshotted: trades-stocks.json,
- * trades-crypto.json, account-settings.json, users.json, watchlist.json,
- * equity-state.json, daily-snapshots.json (and their crypto counterparts).
+ * and prune old folders. Backs up global files (users.json) at the root and
+ * mirrors per-user trees under backups/<ts>/users/<username>/.
  *
- * The backup is the user's "cannot be overwritten or wiped" safety net — if a
- * bad write or disk hiccup ever clears a primary file, the next startup
- * automatically restores from the most recent backup.
+ * If a primary file is wiped or corrupted, the next startup automatically
+ * restores from the most recent backup.
  */
 export async function rotateBackups(): Promise<void> {
   await ensureDir(BACKUP_DIR);
@@ -173,16 +182,9 @@ export async function rotateBackups(): Promise<void> {
   const target = join(BACKUP_DIR, stamp);
   await ensureDir(target);
 
-  const filesToBackup = [
-    'trades-stocks.json',
-    'trades-crypto.json',
-    'account-settings.json',
-    'users.json',
-    'watchlist.json',
-    'equity-state.json',
-    'daily-snapshots.json',
-  ];
-  for (const name of filesToBackup) {
+  // Global files at the data-dir root.
+  const globalFiles = ['users.json', 'admin-reset-applied.json'];
+  for (const name of globalFiles) {
     const src = join(DATA_DIR, name);
     if (!existsSync(src)) continue;
     try {
@@ -191,21 +193,56 @@ export async function rotateBackups(): Promise<void> {
       console.warn(`[trade-store] backup copy failed for ${name}: ${err instanceof Error ? err.message : String(err)}`);
     }
   }
-  // Crypto subdir state files
-  const cryptoDir = join(DATA_DIR, 'crypto');
-  if (existsSync(cryptoDir)) {
-    const cryptoTarget = join(target, 'crypto');
-    await ensureDir(cryptoTarget);
-    for (const name of ['equity-state.json', 'daily-snapshots.json']) {
-      const src = join(cryptoDir, name);
-      if (!existsSync(src)) continue;
+
+  // Per-user trees: walk DATA_DIR/users/* and mirror each user's files.
+  const usersRoot = join(DATA_DIR, 'users');
+  if (existsSync(usersRoot)) {
+    const userFiles = [
+      'trades-stocks.json',
+      'trades-crypto.json',
+      'account-settings.json',
+      'watchlist.json',
+      'equity-state.json',
+      'daily-snapshots.json',
+    ];
+    let entries: string[] = [];
+    try {
+      entries = await readdir(usersRoot);
+    } catch { /* ignore */ }
+    for (const username of entries) {
+      const srcDir = join(usersRoot, username);
       try {
-        await copyFile(src, join(cryptoTarget, name));
-      } catch { /* ignore */ }
+        const st = await stat(srcDir);
+        if (!st.isDirectory()) continue;
+      } catch { continue; }
+      const dstDir = join(target, 'users', username);
+      await ensureDir(dstDir);
+      for (const name of userFiles) {
+        const src = join(srcDir, name);
+        if (!existsSync(src)) continue;
+        try {
+          await copyFile(src, join(dstDir, name));
+        } catch (err: unknown) {
+          console.warn(`[trade-store] backup copy failed for ${username}/${name}: ${err instanceof Error ? err.message : String(err)}`);
+        }
+      }
+      // Crypto subdir for tracker state files.
+      const cryptoSrc = join(srcDir, 'crypto');
+      if (existsSync(cryptoSrc)) {
+        const cryptoDst = join(dstDir, 'crypto');
+        await ensureDir(cryptoDst);
+        for (const name of ['equity-state.json', 'daily-snapshots.json']) {
+          const src = join(cryptoSrc, name);
+          if (!existsSync(src)) continue;
+          try {
+            await copyFile(src, join(cryptoDst, name));
+          } catch { /* ignore */ }
+        }
+      }
     }
   }
 
-  // Prune old backups
+  // Prune old backups.
   try {
     const entries = (await readdir(BACKUP_DIR))
       .filter(n => /^\d{4}-\d{2}-\d{2}T/.test(n))
@@ -221,10 +258,7 @@ export async function rotateBackups(): Promise<void> {
 
 /**
  * Logs a clear warning when DATA_DIR is ephemeral (i.e. inside the package
- * bundle). On Render, DATA_DIR should point to the mounted persistent disk
- * (typically /data). If the env var is unset or points inside the build
- * artifact, every restart wipes the entire app state — exactly the symptom
- * TRA-140 is reporting.
+ * bundle). On Render, DATA_DIR should point to the mounted persistent disk.
  */
 export async function checkDataDirHealth(): Promise<void> {
   const isEphemeral =
@@ -238,7 +272,6 @@ export async function checkDataDirHealth(): Promise<void> {
     console.warn('[startup] ⚠⚠⚠ On Render this means trades, settings, and users will be ERASED on every redeploy.');
     console.warn('[startup] ⚠⚠⚠ Set DATA_DIR=/data and mount the tradingai-data persistent disk.');
   }
-  // Sanity write/read to confirm the dir is writable.
   try {
     await ensureDir(DATA_DIR);
     const probe = join(DATA_DIR, '.write-probe');
@@ -248,8 +281,6 @@ export async function checkDataDirHealth(): Promise<void> {
   } catch (err: unknown) {
     console.error(`[startup] ✗ DATA_DIR is not writable: ${err instanceof Error ? err.message : String(err)}`);
   }
-  // Report freshness of any existing backup so operators can see the durable
-  // safety net is in place.
   const latest = await findLatestBackupDir();
   if (latest) {
     try {

@@ -1,17 +1,15 @@
 import express from 'express';
 import { createServer } from 'http';
 import { WebSocketServer, WebSocket } from 'ws';
-import { writeFile, readFile, readdir, mkdir, stat } from 'fs/promises';
+import { writeFile, readFile, readdir, stat } from 'fs/promises';
 import { existsSync } from 'fs';
 import { join, dirname } from 'path';
 import { fileURLToPath } from 'url';
-import { SignalEngine } from './signal-engine.js';
-import { CryptoSignalEngine } from './crypto-engine.js';
 import { MarketScheduler } from './scheduler.js';
 import { generateEodReport } from './reports/eod-report.js';
 import { generateCryptoEodReport } from './reports/crypto-eod-report.js';
 import { createToken, verifyToken, generateResetToken, consumeResetToken, initResetTokenStore } from './auth.js';
-import { loadSettings, getSettings, saveSettings } from './account-settings.js';
+import { getSettings, saveSettings } from './account-settings.js';
 import {
   initWatchlistStore,
   getCryptoWatchlistData,
@@ -22,7 +20,6 @@ import {
   removeStocksSymbol,
 } from './watchlist-store.js';
 import { scanStocksMarket, scanCryptoMarket } from './market-scanner.js';
-import { PnlTracker } from './pnl-tracker.js';
 import {
   loadUsers,
   validateUserCredentials,
@@ -35,38 +32,37 @@ import {
   deleteUser,
 } from './users.js';
 import { sendPasswordResetEmail } from './email.js';
+import { rotateBackups, checkDataDirHealth } from './trade-store.js';
 import {
-  loadStocksTradeSnapshot,
-  loadCryptoTradeSnapshot,
-  saveStocksTradeSnapshot,
-  saveCryptoTradeSnapshot,
-  rotateBackups,
-  checkDataDirHealth,
-} from './trade-store.js';
+  runFirstBootMigration,
+  initAllUserContexts,
+  initUserContext,
+  ensureUserContext,
+  destroyUserContext,
+  getAllUserContexts,
+  tryGetUserContext,
+  persistStocksNow,
+  persistCryptoNow,
+  type UserContext,
+} from './user-context.js';
 import type { AccountSettings } from '@trading-app/shared';
-import { DEFAULT_ACCOUNT_SETTINGS } from '@trading-app/shared';
 
 const PORT = Number(process.env.PORT ?? 4242);
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const DATA_DIR = process.env.DATA_DIR ?? join(__dirname, '..', 'data');
-const REPORTS_DIR = join(DATA_DIR, 'reports');
-const CRYPTO_REPORTS_DIR = join(DATA_DIR, 'crypto-reports');
 
-if (!existsSync(REPORTS_DIR)) {
-  await mkdir(REPORTS_DIR, { recursive: true });
-}
-if (!existsSync(CRYPTO_REPORTS_DIR)) {
-  await mkdir(CRYPTO_REPORTS_DIR, { recursive: true });
-}
-
-// TRA-140 — log DATA_DIR and warn loudly if it's ephemeral, so a misconfigured
-// Render deploy without a mounted persistent disk is obvious in logs instead of
-// silently wiping users/trades/settings on every restart.
+// TRA-140 — log DATA_DIR and warn loudly if it's ephemeral.
 await checkDataDirHealth();
 
-// Load users and reset tokens from persistent storage
+// Load users and reset tokens from persistent storage.
 await loadUsers();
 initResetTokenStore(DATA_DIR);
+
+// TRA-142 — migrate legacy global files into the admin namespace exactly once,
+// then bootstrap per-user contexts (engines, trackers, persistence timers) for
+// every known user. New signups get their context created on demand.
+await runFirstBootMigration('admin');
+await initAllUserContexts();
 
 const app = express();
 
@@ -115,99 +111,30 @@ function requireAdmin(req: express.Request, res: express.Response, next: express
   next();
 }
 
-// ── Engines ───────────────────────────────────────────────────────────────────
-
-const initialSettings = await loadSettings();
-const tracker = new PnlTracker(
-  DATA_DIR,
-  initialSettings.mode === 'live' ? 0 : (initialSettings.demoEquityStocks ?? initialSettings.demoEquity),
-);
-const cryptoTracker = new PnlTracker(
-  join(DATA_DIR, 'crypto'),
-  initialSettings.mode === 'live' ? 0 : (initialSettings.demoEquityCrypto ?? initialSettings.demoEquity),
-);
-const engine = new SignalEngine(initialSettings, tracker);
-const cryptoEngine = new CryptoSignalEngine(cryptoTracker, initialSettings);
-const scheduler = new MarketScheduler();
-
-// TRA-140 — restore saved trade history (open positions, closed positions,
-// signals, options) so a server restart no longer wipes everything.
-{
-  const stocksSnap = await loadStocksTradeSnapshot();
-  if (stocksSnap) {
-    try {
-      engine.importTradeSnapshot({
-        closedPositions: stocksSnap.closedPositions ?? [],
-        recentSignals: stocksSnap.recentSignals ?? [],
-        dailySignals: stocksSnap.dailySignals ?? [],
-        positionSignalType: stocksSnap.positionSignalType ?? [],
-        account: {
-          cash: stocksSnap.account.cash,
-          equity: stocksSnap.account.equity,
-          initialEquity: stocksSnap.account.initialEquity,
-          dailyPnl: stocksSnap.account.dailyPnl,
-          openPositions: stocksSnap.openPositions ?? [],
-        },
-        options: {
-          openOptions: stocksSnap.options.openOptions ?? [],
-          closedOptions: stocksSnap.options.closedOptions ?? [],
-          optionsPnl: stocksSnap.options.optionsPnl ?? 0,
-          dailyCount: stocksSnap.options.dailyCount ?? 0,
-          currentDayKey: stocksSnap.options.currentDayKey ?? new Date().toISOString().slice(0, 10),
-          cash: stocksSnap.options.cash ?? stocksSnap.account.cash,
-          equity: stocksSnap.options.equity ?? stocksSnap.account.equity,
-        },
-      });
-      console.log(`[startup] Restored stocks trade history: ${stocksSnap.openPositions?.length ?? 0} open, ${stocksSnap.closedPositions?.length ?? 0} closed, ${stocksSnap.options.openOptions?.length ?? 0} open options.`);
-    } catch (err: unknown) {
-      console.warn(`[startup] Failed to restore stocks trade history: ${err instanceof Error ? err.message : String(err)}`);
-    }
-  }
-  const cryptoSnap = await loadCryptoTradeSnapshot();
-  if (cryptoSnap) {
-    try {
-      cryptoEngine.importTradeSnapshot({
-        closedPositions: cryptoSnap.closedPositions ?? [],
-        recentSignals: cryptoSnap.recentSignals ?? [],
-        account: {
-          cash: cryptoSnap.account.cash,
-          equity: cryptoSnap.account.equity,
-          initialEquity: cryptoSnap.account.initialEquity,
-          openingEquityToday: cryptoSnap.account.openingEquityToday,
-          openPositions: cryptoSnap.openPositions ?? [],
-        },
-      });
-      console.log(`[startup] Restored crypto trade history: ${cryptoSnap.openPositions?.length ?? 0} open, ${cryptoSnap.closedPositions?.length ?? 0} closed.`);
-    } catch (err: unknown) {
-      console.warn(`[startup] Failed to restore crypto trade history: ${err instanceof Error ? err.message : String(err)}`);
-    }
-  }
+/**
+ * Resolve the per-user context for the authenticated user. Falls back to
+ * lazily creating one if it isn't present (defensive — initAllUserContexts
+ * should have built it at boot, and signup builds it on creation). When a
+ * brand-new context is built here, also attach WS broadcast handlers so the
+ * user's clients receive engine ticks.
+ */
+async function userCtx(res: express.Response): Promise<UserContext> {
+  const username = res.locals['authUser'] as string;
+  const wasNew = !tryGetUserContext(username);
+  const ctx = await ensureUserContext(username);
+  if (wasNew) attachBroadcastHandlers(ctx);
+  return ctx;
 }
-
-// Restore persisted watchlist overrides into engines
-await initWatchlistStore();
-const savedCrypto = getCryptoWatchlistData();
-for (const sym of savedCrypto.hidden) cryptoEngine.removeSymbol(sym);
-for (const sym of savedCrypto.added) cryptoEngine.addSymbol(sym);
-const savedStocks = getStocksWatchlistData();
-for (const sym of savedStocks.hidden) engine.removeSymbol(sym);
-for (const sym of savedStocks.added) engine.addSymbol(sym);
-
-// Restore persisted auto-trading state (default true when field missing from old settings)
-engine.setAutoTrading(initialSettings.stocksAutoTradingEnabled ?? true);
-cryptoEngine.setAutoTrading(initialSettings.cryptoAutoTradingEnabled ?? true);
-console.log(`[startup] stocks auto-trading: ${initialSettings.stocksAutoTradingEnabled ?? true}`);
-console.log(`[startup] crypto auto-trading: ${initialSettings.cryptoAutoTradingEnabled ?? true}`);
 
 // ── EOD Report generation ────────────────────────────────────────────────────
 
-async function generateAndSaveReport(): Promise<void> {
-  const snapshot = engine.getReportSnapshot();
+async function generateAndSaveReport(ctx: UserContext): Promise<void> {
+  const snapshot = ctx.engine.getReportSnapshot();
   const report = generateEodReport(snapshot);
-  const datePath = join(REPORTS_DIR, `${report.date}.json`);
-  const mdPath = join(REPORTS_DIR, `${report.date}.md`);
-  const latestJsonPath = join(REPORTS_DIR, 'latest.json');
-  const latestMdPath = join(REPORTS_DIR, 'latest.md');
+  const datePath = join(ctx.reportsDir, `${report.date}.json`);
+  const mdPath = join(ctx.reportsDir, `${report.date}.md`);
+  const latestJsonPath = join(ctx.reportsDir, 'latest.json');
+  const latestMdPath = join(ctx.reportsDir, 'latest.md');
 
   await Promise.all([
     writeFile(datePath, JSON.stringify(report, null, 2), 'utf-8'),
@@ -216,33 +143,31 @@ async function generateAndSaveReport(): Promise<void> {
     writeFile(latestMdPath, report.markdown, 'utf-8'),
   ]);
 
-  // Persist daily equity snapshot for cumulative tracking
-  const equitySnap = engine.getEquitySnapshot();
-  tracker.saveSnapshot({
+  // Persist daily equity snapshot for cumulative tracking.
+  const equitySnap = ctx.engine.getEquitySnapshot();
+  ctx.tracker.saveSnapshot({
     date: report.date,
-    openingEquity: tracker.getOpeningEquity(),
+    openingEquity: ctx.tracker.getOpeningEquity(),
     closingEquity: equitySnap.equity,
-    dailyPnl: equitySnap.equity - tracker.getOpeningEquity(),
+    dailyPnl: equitySnap.equity - ctx.tracker.getOpeningEquity(),
     optionsPnl: equitySnap.optionsPnl,
-    combinedPnl: (equitySnap.equity - tracker.getOpeningEquity()) + equitySnap.optionsPnl,
+    combinedPnl: (equitySnap.equity - ctx.tracker.getOpeningEquity()) + equitySnap.optionsPnl,
     trades: snapshot.allClosedPositions.length,
   });
 
-  console.log(`[reports] EOD report saved → ${datePath}`);
+  console.log(`[reports:${ctx.username}] EOD report saved → ${datePath}`);
 
   const msg = JSON.stringify({ type: 'eod_report', payload: report });
-  for (const client of wss.clients) {
-    if (client.readyState === WebSocket.OPEN) client.send(msg);
-  }
+  broadcastToUser(ctx.username, msg);
 }
 
-async function generateAndSaveCryptoReport(): Promise<void> {
-  const snapshot = cryptoEngine.getReportSnapshot();
+async function generateAndSaveCryptoReport(ctx: UserContext): Promise<void> {
+  const snapshot = ctx.cryptoEngine.getReportSnapshot();
   const report = generateCryptoEodReport(snapshot);
-  const datePath = join(CRYPTO_REPORTS_DIR, `${report.date}.json`);
-  const mdPath = join(CRYPTO_REPORTS_DIR, `${report.date}.md`);
-  const latestJsonPath = join(CRYPTO_REPORTS_DIR, 'latest.json');
-  const latestMdPath = join(CRYPTO_REPORTS_DIR, 'latest.md');
+  const datePath = join(ctx.cryptoReportsDir, `${report.date}.json`);
+  const mdPath = join(ctx.cryptoReportsDir, `${report.date}.md`);
+  const latestJsonPath = join(ctx.cryptoReportsDir, 'latest.json');
+  const latestMdPath = join(ctx.cryptoReportsDir, 'latest.md');
 
   await Promise.all([
     writeFile(datePath, JSON.stringify(report, null, 2), 'utf-8'),
@@ -251,7 +176,17 @@ async function generateAndSaveCryptoReport(): Promise<void> {
     writeFile(latestMdPath, report.markdown, 'utf-8'),
   ]);
 
-  console.log(`[crypto-reports] EOD report saved → ${datePath}`);
+  console.log(`[crypto-reports:${ctx.username}] EOD report saved → ${datePath}`);
+}
+
+async function generateAllUserEodReports(): Promise<void> {
+  for (const ctx of getAllUserContexts()) {
+    try {
+      await generateAndSaveReport(ctx);
+    } catch (err) {
+      console.error(`[reports:${ctx.username}] EOD report failed:`, err);
+    }
+  }
 }
 
 // ── REST endpoints ───────────────────────────────────────────────────────────
@@ -273,10 +208,19 @@ app.get('/api/health/storage', async (_req, res) => {
     }
   }
   const usersFile = join(DATA_DIR, 'users.json');
-  const settingsFile = join(DATA_DIR, 'account-settings.json');
-  const tradesStocksFile = join(DATA_DIR, 'trades-stocks.json');
-  const tradesCryptoFile = join(DATA_DIR, 'trades-crypto.json');
   const backupsDir = join(DATA_DIR, 'backups');
+  // TRA-142 — per-user files now live under DATA_DIR/users/<username>/. The
+  // legacy DATA_DIR/account-settings.json etc. are migrated into the admin
+  // namespace on first boot, so we report admin's path so QA sees the
+  // post-migration location while the legacy fields show migration ran.
+  const legacySettingsFile = join(DATA_DIR, 'account-settings.json');
+  const legacyTradesStocksFile = join(DATA_DIR, 'trades-stocks.json');
+  const legacyTradesCryptoFile = join(DATA_DIR, 'trades-crypto.json');
+  const adminDir = join(DATA_DIR, 'users', 'admin');
+  const adminSettingsFile = join(adminDir, 'account-settings.json');
+  const adminTradesStocksFile = join(adminDir, 'trades-stocks.json');
+  const adminTradesCryptoFile = join(adminDir, 'trades-crypto.json');
+  const migrationMarker = join(DATA_DIR, '.tra-142-migrated');
   let backupsCount = 0;
   try {
     backupsCount = (await readdir(backupsDir)).length;
@@ -288,12 +232,17 @@ app.get('/api/health/storage', async (_req, res) => {
     dataDirEnv: process.env['DATA_DIR'] ?? null,
     dataDir_exists: existsSync(DATA_DIR),
     usersFile: await statFile(usersFile),
-    settingsFile: await statFile(settingsFile),
-    tradesStocksFile: await statFile(tradesStocksFile),
-    tradesCryptoFile: await statFile(tradesCryptoFile),
+    settingsFile: await statFile(legacySettingsFile),
+    tradesStocksFile: await statFile(legacyTradesStocksFile),
+    tradesCryptoFile: await statFile(legacyTradesCryptoFile),
+    adminSettingsFile: await statFile(adminSettingsFile),
+    adminTradesStocksFile: await statFile(adminTradesStocksFile),
+    adminTradesCryptoFile: await statFile(adminTradesCryptoFile),
+    tra142Migrated: existsSync(migrationMarker),
     backupsDir_exists: existsSync(backupsDir),
     backupsCount,
     userCount: getAllUsers().length,
+    userContextCount: getAllUserContexts().length,
     processStart: new Date(Date.now() - process.uptime() * 1000).toISOString(),
   });
 });
@@ -332,6 +281,9 @@ app.post('/api/auth/signup', async (req, res) => {
     res.status(409).json({ error: result.error });
     return;
   }
+  // TRA-142 — spin up the new user's per-user context (fresh equity, empty
+  // trade history, default settings) so their engine starts ticking right away.
+  await provisionUser(username.trim());
   res.json({ token: createToken(username.trim()) });
 });
 
@@ -342,7 +294,6 @@ app.post('/api/auth/forgot-password', async (req, res) => {
     return;
   }
   const user = getUserByEmail(email);
-  // Always return success to prevent email enumeration
   if (user) {
     const code = generateResetToken(user.username);
     try {
@@ -438,6 +389,8 @@ app.post('/api/admin/users', requireAuth, requireAdmin, async (req, res) => {
     res.status(409).json({ error: result.error });
     return;
   }
+  // TRA-142 — admin-created users also get an isolated context.
+  await provisionUser(username);
   res.status(201).json({ ok: true, user: result.user });
 });
 
@@ -464,29 +417,38 @@ app.delete('/api/admin/users/:username', requireAuth, requireAdmin, async (req, 
     res.status(404).json({ error: 'User not found' });
     return;
   }
+  // TRA-142 — stop the deleted user's engines and forget their caches. Their
+  // on-disk state is left intact under DATA_DIR/users/<username>/ so an admin
+  // can restore them if needed.
+  destroyUserContext(username);
   res.json({ ok: true });
 });
 
 // ── State ─────────────────────────────────────────────────────────────────────
 
-app.get('/api/state', requireAuth, (_req, res) => {
-  res.json(engine.getState());
+app.get('/api/state', requireAuth, async (_req, res) => {
+  const ctx = await userCtx(res);
+  res.json(ctx.engine.getState());
 });
 
-app.get('/api/crypto/state', requireAuth, (_req, res) => {
-  res.json(cryptoEngine.getState());
+app.get('/api/crypto/state', requireAuth, async (_req, res) => {
+  const ctx = await userCtx(res);
+  res.json(ctx.cryptoEngine.getState());
 });
 
-app.get('/api/crypto/news', requireAuth, (_req, res) => {
-  res.json(cryptoEngine.getNews());
+app.get('/api/crypto/news', requireAuth, async (_req, res) => {
+  const ctx = await userCtx(res);
+  res.json(ctx.cryptoEngine.getNews());
 });
 
-app.get('/api/news', requireAuth, (_req, res) => {
-  res.json(engine.getNews());
+app.get('/api/news', requireAuth, async (_req, res) => {
+  const ctx = await userCtx(res);
+  res.json(ctx.engine.getNews());
 });
 
 app.get('/api/reports/latest', requireAuth, async (_req, res) => {
-  const latestPath = join(REPORTS_DIR, 'latest.json');
+  const ctx = await userCtx(res);
+  const latestPath = join(ctx.reportsDir, 'latest.json');
   if (!existsSync(latestPath)) {
     res.status(404).json({ error: 'No report generated yet' });
     return;
@@ -500,8 +462,9 @@ app.get('/api/reports/latest', requireAuth, async (_req, res) => {
 });
 
 app.get('/api/reports', requireAuth, async (_req, res) => {
+  const ctx = await userCtx(res);
   try {
-    const files = await readdir(REPORTS_DIR);
+    const files = await readdir(ctx.reportsDir);
     const dates = files
       .filter(f => /^\d{4}-\d{2}-\d{2}\.json$/.test(f))
       .map(f => f.replace('.json', ''))
@@ -514,12 +477,13 @@ app.get('/api/reports', requireAuth, async (_req, res) => {
 });
 
 app.get('/api/reports/:date', requireAuth, async (req, res) => {
+  const ctx = await userCtx(res);
   const { date } = req.params as Record<string, string>;
   if (!/^\d{4}-\d{2}-\d{2}$/.test(date)) {
     res.status(400).json({ error: 'Invalid date format. Use YYYY-MM-DD.' });
     return;
   }
-  const filePath = join(REPORTS_DIR, `${date}.json`);
+  const filePath = join(ctx.reportsDir, `${date}.json`);
   if (!existsSync(filePath)) {
     res.status(404).json({ error: `No report for ${date}` });
     return;
@@ -534,7 +498,8 @@ app.get('/api/reports/:date', requireAuth, async (req, res) => {
 
 app.post('/api/reports/generate', requireAuth, async (_req, res) => {
   try {
-    await generateAndSaveReport();
+    const ctx = await userCtx(res);
+    await generateAndSaveReport(ctx);
     res.json({ ok: true, message: 'EOD report generated successfully' });
   } catch (err) {
     res.status(500).json({ error: String(err) });
@@ -544,7 +509,8 @@ app.post('/api/reports/generate', requireAuth, async (_req, res) => {
 // ── Crypto Reports ────────────────────────────────────────────────────────────
 
 app.get('/api/crypto/reports/latest', requireAuth, async (_req, res) => {
-  const latestPath = join(CRYPTO_REPORTS_DIR, 'latest.json');
+  const ctx = await userCtx(res);
+  const latestPath = join(ctx.cryptoReportsDir, 'latest.json');
   if (!existsSync(latestPath)) {
     res.status(404).json({ error: 'No crypto report generated yet' });
     return;
@@ -558,8 +524,9 @@ app.get('/api/crypto/reports/latest', requireAuth, async (_req, res) => {
 });
 
 app.get('/api/crypto/reports', requireAuth, async (_req, res) => {
+  const ctx = await userCtx(res);
   try {
-    const files = await readdir(CRYPTO_REPORTS_DIR);
+    const files = await readdir(ctx.cryptoReportsDir);
     const dates = files
       .filter(f => /^\d{4}-\d{2}-\d{2}\.json$/.test(f))
       .map(f => f.replace('.json', ''))
@@ -572,12 +539,13 @@ app.get('/api/crypto/reports', requireAuth, async (_req, res) => {
 });
 
 app.get('/api/crypto/reports/:date', requireAuth, async (req, res) => {
+  const ctx = await userCtx(res);
   const { date } = req.params as Record<string, string>;
   if (!/^\d{4}-\d{2}-\d{2}$/.test(date)) {
     res.status(400).json({ error: 'Invalid date format. Use YYYY-MM-DD.' });
     return;
   }
-  const filePath = join(CRYPTO_REPORTS_DIR, `${date}.json`);
+  const filePath = join(ctx.cryptoReportsDir, `${date}.json`);
   if (!existsSync(filePath)) {
     res.status(404).json({ error: `No crypto report for ${date}` });
     return;
@@ -592,26 +560,31 @@ app.get('/api/crypto/reports/:date', requireAuth, async (req, res) => {
 
 app.post('/api/crypto/reports/generate', requireAuth, async (_req, res) => {
   try {
-    await generateAndSaveCryptoReport();
+    const ctx = await userCtx(res);
+    await generateAndSaveCryptoReport(ctx);
     res.json({ ok: true, message: 'Crypto EOD report generated successfully' });
   } catch (err) {
     res.status(500).json({ error: String(err) });
   }
 });
 
-app.get('/api/snapshots', requireAuth, (_req, res) => {
-  res.json(tracker.getSnapshots());
+app.get('/api/snapshots', requireAuth, async (_req, res) => {
+  const ctx = await userCtx(res);
+  res.json(ctx.tracker.getSnapshots());
 });
 
 // ── Account Settings ─────────────────────────────────────────────────────────
 
 app.get('/api/account/settings', requireAuth, (_req, res) => {
-  res.json(getSettings());
+  const username = res.locals['authUser'] as string;
+  res.json(getSettings(username));
 });
 
 app.put('/api/account/settings', requireAuth, async (req, res) => {
+  const username = res.locals['authUser'] as string;
+  const ctx = await userCtx(res);
   const body = req.body as Partial<AccountSettings>;
-  const current = getSettings();
+  const current = getSettings(username);
   const clampEquity = (v: number) => Math.max(1_000, Math.min(10_000_000, Number(v)));
   const updated: AccountSettings = {
     ...current,
@@ -623,45 +596,50 @@ app.put('/api/account/settings', requireAuth, async (req, res) => {
     managedAccountRatio: Math.max(0.01, Math.min(1, Number(body.managedAccountRatio ?? current.managedAccountRatio))),
     riskPerTrade: Math.max(0.001, Math.min(0.5, Number(body.riskPerTrade ?? current.riskPerTrade))),
   };
-  await saveSettings(updated);
-  engine.applySettings(updated);
-  broadcastEngineState();
-  cryptoEngine.applySettings(updated);
-  broadcastCryptoState();
+  await saveSettings(username, updated);
+  ctx.engine.applySettings(updated);
+  broadcastEngineState(ctx);
+  ctx.cryptoEngine.applySettings(updated);
+  broadcastCryptoState(ctx);
   res.json({ ok: true, settings: updated });
 });
 
 app.post('/api/account/reset-demo', requireAuth, async (_req, res) => {
-  const settings = getSettings();
-  engine.forceReset(settings);
+  const username = res.locals['authUser'] as string;
+  const ctx = await userCtx(res);
+  const settings = getSettings(username);
+  ctx.engine.forceReset(settings);
   const cryptoEquity = settings.demoEquityCrypto ?? settings.demoEquity;
-  cryptoEngine.forceReset(cryptoEquity);
-  broadcastEngineState();
-  broadcastCryptoState();
+  ctx.cryptoEngine.forceReset(cryptoEquity);
+  broadcastEngineState(ctx);
+  broadcastCryptoState(ctx);
   res.json({ ok: true });
 });
 
 // ── Trading controls ──────────────────────────────────────────────────────────
 
 app.post('/api/trading/start', requireAuth, async (_req, res) => {
-  engine.setAutoTrading(true);
-  const s = getSettings();
-  await saveSettings({ ...s, stocksAutoTradingEnabled: true });
-  broadcastEngineState();
+  const username = res.locals['authUser'] as string;
+  const ctx = await userCtx(res);
+  ctx.engine.setAutoTrading(true);
+  await saveSettings(username, { ...getSettings(username), stocksAutoTradingEnabled: true });
+  broadcastEngineState(ctx);
   res.json({ ok: true, autoTradingEnabled: true });
 });
 
 app.post('/api/trading/stop', requireAuth, async (_req, res) => {
-  engine.setAutoTrading(false);
-  const s = getSettings();
-  await saveSettings({ ...s, stocksAutoTradingEnabled: false });
-  broadcastEngineState();
+  const username = res.locals['authUser'] as string;
+  const ctx = await userCtx(res);
+  ctx.engine.setAutoTrading(false);
+  await saveSettings(username, { ...getSettings(username), stocksAutoTradingEnabled: false });
+  broadcastEngineState(ctx);
   res.json({ ok: true, autoTradingEnabled: false });
 });
 
-app.post('/api/positions/:id/close', requireAuth, (req, res) => {
+app.post('/api/positions/:id/close', requireAuth, async (req, res) => {
+  const ctx = await userCtx(res);
   const { id } = req.params as Record<string, string>;
-  const state = engine.getState();
+  const state = ctx.engine.getState();
   const pos = state.account.openPositions.find(p => p.id === id);
   if (!pos) {
     res.status(404).json({ error: 'Position not found' });
@@ -669,45 +647,52 @@ app.post('/api/positions/:id/close', requireAuth, (req, res) => {
   }
   const sym = state.symbols.find(s => s.symbol === pos.symbol);
   const price = sym?.price ?? pos.entryPrice;
-  engine.manualClosePosition(id, price);
-  broadcastEngineState();
+  ctx.engine.manualClosePosition(id, price);
+  broadcastEngineState(ctx);
   res.json({ ok: true });
 });
 
-app.post('/api/options/:id/close', requireAuth, (req, res) => {
+app.post('/api/options/:id/close', requireAuth, async (req, res) => {
+  const ctx = await userCtx(res);
   const { id } = req.params as Record<string, string>;
-  const closed = engine.manualCloseOption(id);
+  const closed = ctx.engine.manualCloseOption(id);
   if (!closed) {
     res.status(404).json({ error: 'Option position not found' });
     return;
   }
-  broadcastEngineState();
+  broadcastEngineState(ctx);
   res.json({ ok: true });
 });
 
 app.post('/api/crypto/trading/start', requireAuth, async (_req, res) => {
-  cryptoEngine.setAutoTrading(true);
-  const s = getSettings();
-  await saveSettings({ ...s, cryptoAutoTradingEnabled: true });
-  broadcastCryptoState();
+  const username = res.locals['authUser'] as string;
+  const ctx = await userCtx(res);
+  ctx.cryptoEngine.setAutoTrading(true);
+  await saveSettings(username, { ...getSettings(username), cryptoAutoTradingEnabled: true });
+  broadcastCryptoState(ctx);
   res.json({ ok: true, autoTradingEnabled: true });
 });
 
 app.post('/api/crypto/trading/stop', requireAuth, async (_req, res) => {
-  cryptoEngine.setAutoTrading(false);
-  const s = getSettings();
-  await saveSettings({ ...s, cryptoAutoTradingEnabled: false });
-  broadcastCryptoState();
+  const username = res.locals['authUser'] as string;
+  const ctx = await userCtx(res);
+  ctx.cryptoEngine.setAutoTrading(false);
+  await saveSettings(username, { ...getSettings(username), cryptoAutoTradingEnabled: false });
+  broadcastCryptoState(ctx);
   res.json({ ok: true, autoTradingEnabled: false });
 });
 
 // ── Watchlist management ──────────────────────────────────────────────────────
 
-app.get('/api/watchlist/crypto', requireAuth, (_req, res) => {
-  res.json(getCryptoWatchlistData());
+app.get('/api/watchlist/crypto', requireAuth, async (_req, res) => {
+  const username = res.locals['authUser'] as string;
+  await initWatchlistStore(username);
+  res.json(getCryptoWatchlistData(username));
 });
 
 app.post('/api/watchlist/crypto', requireAuth, async (req, res) => {
+  const username = res.locals['authUser'] as string;
+  const ctx = await userCtx(res);
   const { symbol } = req.body as { symbol?: string };
   if (typeof symbol !== 'string' || !symbol.trim()) {
     res.status(400).json({ error: 'symbol is required' });
@@ -718,41 +703,49 @@ app.post('/api/watchlist/crypto', requireAuth, async (req, res) => {
     res.status(400).json({ error: 'Invalid symbol format. Expected XXX-USD (e.g. ETH-USD)' });
     return;
   }
-  await addCryptoSymbol(sym);
-  cryptoEngine.addSymbol(sym);
-  cryptoEngine.refresh();
+  await addCryptoSymbol(username, sym);
+  ctx.cryptoEngine.addSymbol(sym);
+  ctx.cryptoEngine.refresh();
   res.json({ ok: true, symbol: sym });
 });
 
 app.delete('/api/watchlist/crypto/:symbol', requireAuth, async (req, res) => {
+  const username = res.locals['authUser'] as string;
+  const ctx = await userCtx(res);
   const raw = req.params['symbol'];
   const sym = (Array.isArray(raw) ? raw[0] : raw ?? '').toUpperCase();
   if (!sym) { res.status(400).json({ error: 'symbol is required' }); return; }
-  await removeCryptoSymbol(sym);
-  cryptoEngine.removeSymbol(sym);
-  broadcastCryptoState();
+  await removeCryptoSymbol(username, sym);
+  ctx.cryptoEngine.removeSymbol(sym);
+  broadcastCryptoState(ctx);
   res.json({ ok: true });
 });
 
 app.post('/api/watchlist/crypto/scan', requireAuth, async (_req, res) => {
+  const username = res.locals['authUser'] as string;
+  const ctx = await userCtx(res);
   try {
     const results = await scanCryptoMarket();
     for (const r of results) {
-      await addCryptoSymbol(r.symbol);
-      cryptoEngine.addSymbol(r.symbol);
+      await addCryptoSymbol(username, r.symbol);
+      ctx.cryptoEngine.addSymbol(r.symbol);
     }
-    cryptoEngine.refresh();
+    ctx.cryptoEngine.refresh();
     res.json({ ok: true, added: results.map(r => r.symbol) });
   } catch (err) {
     res.status(500).json({ error: String(err) });
   }
 });
 
-app.get('/api/watchlist/stocks', requireAuth, (_req, res) => {
-  res.json(getStocksWatchlistData());
+app.get('/api/watchlist/stocks', requireAuth, async (_req, res) => {
+  const username = res.locals['authUser'] as string;
+  await initWatchlistStore(username);
+  res.json(getStocksWatchlistData(username));
 });
 
 app.post('/api/watchlist/stocks', requireAuth, async (req, res) => {
+  const username = res.locals['authUser'] as string;
+  const ctx = await userCtx(res);
   const { symbol } = req.body as { symbol?: string };
   if (typeof symbol !== 'string' || !symbol.trim()) {
     res.status(400).json({ error: 'symbol is required' });
@@ -763,39 +756,44 @@ app.post('/api/watchlist/stocks', requireAuth, async (req, res) => {
     res.status(400).json({ error: 'Invalid symbol format. Expected 1–5 letters (e.g. NVDA)' });
     return;
   }
-  await addStocksSymbol(sym);
-  engine.addSymbol(sym);
-  engine.refresh();
+  await addStocksSymbol(username, sym);
+  ctx.engine.addSymbol(sym);
+  ctx.engine.refresh();
   res.json({ ok: true, symbol: sym });
 });
 
 app.delete('/api/watchlist/stocks/:symbol', requireAuth, async (req, res) => {
+  const username = res.locals['authUser'] as string;
+  const ctx = await userCtx(res);
   const raw = req.params['symbol'];
   const sym = (Array.isArray(raw) ? raw[0] : raw ?? '').toUpperCase();
   if (!sym) { res.status(400).json({ error: 'symbol is required' }); return; }
-  await removeStocksSymbol(sym);
-  engine.removeSymbol(sym);
-  broadcastEngineState();
+  await removeStocksSymbol(username, sym);
+  ctx.engine.removeSymbol(sym);
+  broadcastEngineState(ctx);
   res.json({ ok: true });
 });
 
 app.post('/api/watchlist/stocks/scan', requireAuth, async (_req, res) => {
+  const username = res.locals['authUser'] as string;
+  const ctx = await userCtx(res);
   try {
     const results = await scanStocksMarket();
     for (const r of results) {
-      await addStocksSymbol(r.symbol);
-      engine.addSymbol(r.symbol);
+      await addStocksSymbol(username, r.symbol);
+      ctx.engine.addSymbol(r.symbol);
     }
-    engine.refresh();
+    ctx.engine.refresh();
     res.json({ ok: true, added: results.map(r => r.symbol) });
   } catch (err) {
     res.status(500).json({ error: String(err) });
   }
 });
 
-app.post('/api/crypto/positions/:id/close', requireAuth, (req, res) => {
+app.post('/api/crypto/positions/:id/close', requireAuth, async (req, res) => {
+  const ctx = await userCtx(res);
   const { id } = req.params as Record<string, string>;
-  const state = cryptoEngine.getState();
+  const state = ctx.cryptoEngine.getState();
   const pos = state.account.openPositions.find(p => p.id === id);
   if (!pos) {
     res.status(404).json({ error: 'Position not found' });
@@ -803,14 +801,12 @@ app.post('/api/crypto/positions/:id/close', requireAuth, (req, res) => {
   }
   const sym = state.symbols.find(s => s.symbol === pos.symbol);
   const price = sym?.price ?? pos.entryPrice;
-  cryptoEngine.manualClosePosition(id, price);
-  broadcastCryptoState();
+  ctx.cryptoEngine.manualClosePosition(id, price);
+  broadcastCryptoState(ctx);
   res.json({ ok: true });
 });
 
 // ── Data-source health check ─────────────────────────────────────────────────
-// GET /api/health/quotes  — tests Yahoo Finance + CMC connectivity
-// No auth required so it can be called from Render health checks.
 
 app.get('/api/health/quotes', async (_req, res) => {
   const { testYahooFinance, testFinnhub, isYahooBreakerOpen } = await import('./yahoo-feed.js');
@@ -837,7 +833,6 @@ app.get('/api/health/quotes', async (_req, res) => {
     results['coinMarketCap'] = { error: err instanceof Error ? err.message : String(err) };
   }
 
-  // Healthy when at least one stock provider AND at least one crypto provider can serve quotes.
   const ok = (key: string) => {
     const v = results[key];
     return v && typeof v === 'object' && !('error' in (v as object)) && !('skipped' in (v as object));
@@ -860,39 +855,50 @@ app.get('/api/health/quotes', async (_req, res) => {
 const httpServer = createServer(app);
 const wss = new WebSocketServer({ noServer: true });
 
-function broadcastEngineState() {
-  const msg = JSON.stringify({ type: 'state', payload: engine.getState() });
+// TRA-142 — every WS client is tagged with the authenticated username so
+// state and EOD broadcasts only go to that user's clients.
+type AuthedSocket = WebSocket & { username?: string };
+
+function broadcastToUser(username: string, msg: string): void {
   for (const client of wss.clients) {
-    if (client.readyState === WebSocket.OPEN) client.send(msg);
+    const c = client as AuthedSocket;
+    if (c.readyState === WebSocket.OPEN && c.username === username) c.send(msg);
   }
 }
 
-function broadcastCryptoState() {
-  const msg = JSON.stringify({ type: 'crypto_state', payload: cryptoEngine.getState() });
-  for (const client of wss.clients) {
-    if (client.readyState === WebSocket.OPEN) client.send(msg);
-  }
+function broadcastEngineState(ctx: UserContext): void {
+  broadcastToUser(ctx.username, JSON.stringify({ type: 'state', payload: ctx.engine.getState() }));
+}
+
+function broadcastCryptoState(ctx: UserContext): void {
+  broadcastToUser(ctx.username, JSON.stringify({ type: 'crypto_state', payload: ctx.cryptoEngine.getState() }));
 }
 
 httpServer.on('upgrade', (req, socket, head) => {
   const url = new URL(req.url ?? '/', `http://${firstHeader(req.headers.host) ?? 'localhost'}`);
   const token = url.searchParams.get('token') ?? '';
-  const user = verifyToken(token);
-  if (!user) {
+  const username = verifyToken(token);
+  if (!username) {
     socket.write('HTTP/1.1 401 Unauthorized\r\n\r\n');
     socket.destroy();
     return;
   }
   wss.handleUpgrade(req, socket, head, (ws) => {
+    (ws as AuthedSocket).username = username;
     wss.emit('connection', ws, req);
   });
 });
 
 wss.on('connection', async (ws) => {
-  ws.send(JSON.stringify({ type: 'state', payload: engine.getState() }));
-  ws.send(JSON.stringify({ type: 'crypto_state', payload: cryptoEngine.getState() }));
+  const c = ws as AuthedSocket;
+  const username = c.username;
+  if (!username) { ws.close(); return; }
+  const ctx = await ensureUserContext(username);
 
-  const latestPath = join(REPORTS_DIR, 'latest.json');
+  ws.send(JSON.stringify({ type: 'state', payload: ctx.engine.getState() }));
+  ws.send(JSON.stringify({ type: 'crypto_state', payload: ctx.cryptoEngine.getState() }));
+
+  const latestPath = join(ctx.reportsDir, 'latest.json');
   if (existsSync(latestPath)) {
     try {
       const raw = await readFile(latestPath, 'utf-8');
@@ -901,105 +907,40 @@ wss.on('connection', async (ws) => {
   }
 });
 
-engine.onTick((state) => {
-  const msg = JSON.stringify({ type: 'state', payload: state });
-  for (const client of wss.clients) {
-    if (client.readyState === WebSocket.OPEN) {
-      client.send(msg);
-    }
-  }
-});
-
-cryptoEngine.onTick((state) => {
-  const msg = JSON.stringify({ type: 'crypto_state', payload: state });
-  for (const client of wss.clients) {
-    if (client.readyState === WebSocket.OPEN) client.send(msg);
-  }
-});
-
-// TRA-140 — debounced trade-history persistence. The engines fire onTick after
-// every state change (position open/close, options exit, signals); we coalesce
-// those into one disk write per tick window so we're not saving multiple times
-// per second under burst load. The actual writes are atomic (tmp + rename).
-let stocksPersistTimer: ReturnType<typeof setTimeout> | null = null;
-let cryptoPersistTimer: ReturnType<typeof setTimeout> | null = null;
-const PERSIST_DEBOUNCE_MS = 1000;
-
-function scheduleStocksPersist(): void {
-  if (stocksPersistTimer) return;
-  stocksPersistTimer = setTimeout(() => {
-    stocksPersistTimer = null;
-    void persistStocksNow();
-  }, PERSIST_DEBOUNCE_MS);
+// Wire up per-user engine onTick → user-scoped WS broadcasts.
+function attachBroadcastHandlers(ctx: UserContext): void {
+  ctx.engine.onTick((state) => {
+    broadcastToUser(ctx.username, JSON.stringify({ type: 'state', payload: state }));
+  });
+  ctx.cryptoEngine.onTick((state) => {
+    broadcastToUser(ctx.username, JSON.stringify({ type: 'crypto_state', payload: state }));
+  });
 }
 
-function scheduleCryptoPersist(): void {
-  if (cryptoPersistTimer) return;
-  cryptoPersistTimer = setTimeout(() => {
-    cryptoPersistTimer = null;
-    void persistCryptoNow();
-  }, PERSIST_DEBOUNCE_MS);
+for (const ctx of getAllUserContexts()) {
+  attachBroadcastHandlers(ctx);
 }
 
-async function persistStocksNow(): Promise<void> {
+/**
+ * Provision a brand-new user: build their context and wire WS broadcast
+ * handlers. Used by signup and admin-create. Failures are logged but do not
+ * break the calling request — the user is created and their context can be
+ * lazily rebuilt on first auth.
+ */
+async function provisionUser(username: string): Promise<void> {
   try {
-    const snap = engine.exportTradeSnapshot();
-    await saveStocksTradeSnapshot({
-      version: 1,
-      savedAt: new Date().toISOString(),
-      openPositions: snap.account.openPositions,
-      closedPositions: snap.closedPositions,
-      recentSignals: snap.recentSignals,
-      dailySignals: snap.dailySignals,
-      positionSignalType: snap.positionSignalType,
-      options: snap.options,
-      account: {
-        cash: snap.account.cash,
-        equity: snap.account.equity,
-        initialEquity: snap.account.initialEquity,
-        dailyPnl: snap.account.dailyPnl,
-      },
-    });
+    const ctx = await initUserContext(username);
+    attachBroadcastHandlers(ctx);
   } catch (err: unknown) {
-    console.warn(`[trade-store] stocks persist failed: ${err instanceof Error ? err.message : String(err)}`);
+    console.warn(`[provisionUser] failed for ${username}: ${err instanceof Error ? err.message : String(err)}`);
   }
 }
 
-async function persistCryptoNow(): Promise<void> {
-  try {
-    const snap = cryptoEngine.exportTradeSnapshot();
-    await saveCryptoTradeSnapshot({
-      version: 1,
-      savedAt: new Date().toISOString(),
-      openPositions: snap.account.openPositions,
-      closedPositions: snap.closedPositions,
-      recentSignals: snap.recentSignals,
-      account: {
-        cash: snap.account.cash,
-        equity: snap.account.equity,
-        initialEquity: snap.account.initialEquity,
-        openingEquityToday: snap.account.openingEquityToday,
-      },
-    });
-  } catch (err: unknown) {
-    console.warn(`[trade-store] crypto persist failed: ${err instanceof Error ? err.message : String(err)}`);
-  }
-}
-
-engine.onTick(() => scheduleStocksPersist());
-cryptoEngine.onTick(() => scheduleCryptoPersist());
-
-// Run an initial persist + backup so the very first start writes a snapshot
-// even before any trades happen — that way the backup safety net is in place
-// from second one.
-void persistStocksNow();
-void persistCryptoNow();
+// Periodic backup snapshots (TRA-140) — every 30 minutes the persisted JSON
+// files are copied into a timestamped folder under DATA_DIR/backups/. Old
+// folders are pruned (last 24 kept = ~12 hours). On startup, missing/corrupt
+// primary files auto-restore from the latest backup.
 void rotateBackups().catch(err => console.warn(`[trade-store] initial backup failed: ${err instanceof Error ? err.message : String(err)}`));
-
-// Periodic backup snapshots — every 30 minutes the persisted JSON files are
-// copied into a timestamped folder under DATA_DIR/backups/. Old folders are
-// pruned (last 24 kept = ~12 hours). If a primary file ever becomes corrupt or
-// missing, the next startup automatically restores from the latest backup.
 const BACKUP_INTERVAL_MS = 30 * 60_000;
 const backupTimer = setInterval(() => {
   void rotateBackups().catch(err => console.warn(`[trade-store] backup failed: ${err instanceof Error ? err.message : String(err)}`));
@@ -1007,12 +948,9 @@ const backupTimer = setInterval(() => {
 backupTimer.unref?.();
 
 // ── Static frontend (production web) ────────────────────────────────────────
-// When the Vite build exists alongside this server, serve it so the web PWA
-// and the API share the same origin (avoids CORS and makes WS auth simpler).
 const DIST_DIR = join(__dirname, '..', '..', '..', 'apps', 'desktop', 'dist');
 if (existsSync(DIST_DIR)) {
   app.use(express.static(DIST_DIR));
-  // SPA fallback: all non-API paths → index.html (supports React client-side routing)
   app.get(/^(?!\/api\/).*/, (_req, res) => {
     res.sendFile(join(DIST_DIR, 'index.html'));
   });
@@ -1020,28 +958,27 @@ if (existsSync(DIST_DIR)) {
 
 // ── Start ────────────────────────────────────────────────────────────────────
 
-engine.start();
-cryptoEngine.start();
-scheduler.start(generateAndSaveReport);
+const scheduler = new MarketScheduler();
+scheduler.start(generateAllUserEodReports);
 
 httpServer.listen(PORT, () => {
   console.log(`Trading server running on http://localhost:${PORT}`);
   console.log(`WebSocket endpoint: ws://localhost:${PORT}`);
-  console.log(`Reports directory: ${REPORTS_DIR}`);
 });
 
 async function gracefulShutdown(signal: string): Promise<void> {
   console.log(`[shutdown] received ${signal} — stopping engines and flushing trade history`);
-  engine.stop();
-  cryptoEngine.stop();
   scheduler.stop();
-  // TRA-140 — flush any pending trade-history writes synchronously before exit
-  // so positions/signals from the last tick aren't lost between SIGTERM and
-  // process exit (Render sends SIGTERM ~10 s before killing the process).
-  if (stocksPersistTimer) clearTimeout(stocksPersistTimer);
-  if (cryptoPersistTimer) clearTimeout(cryptoPersistTimer);
+  const all = getAllUserContexts();
+  for (const ctx of all) {
+    ctx.engine.stop();
+    ctx.cryptoEngine.stop();
+    if (ctx.stocksPersistTimer) clearTimeout(ctx.stocksPersistTimer);
+    if (ctx.cryptoPersistTimer) clearTimeout(ctx.cryptoPersistTimer);
+  }
+  // Flush every user's pending trade-history writes synchronously before exit.
   try {
-    await Promise.all([persistStocksNow(), persistCryptoNow()]);
+    await Promise.all(all.flatMap(ctx => [persistStocksNow(ctx), persistCryptoNow(ctx)]));
   } catch (err: unknown) {
     console.warn(`[shutdown] persist failed: ${err instanceof Error ? err.message : String(err)}`);
   }
