@@ -536,6 +536,35 @@ export class SignalEngine {
     };
   }
 
+  /** Snapshot trade history + accounts for durable storage (TRA-140). */
+  exportTradeSnapshot(): {
+    closedPositions: Position[];
+    recentSignals: TradeSignal[];
+    dailySignals: DailySignalRecord[];
+    positionSignalType: Array<[string, SignalType]>;
+    account: ReturnType<PaperAccount['exportSnapshot']>;
+    options: ReturnType<PaperOptionsAccount['exportSnapshot']>;
+  } {
+    return {
+      closedPositions: [...this.allClosedPositions],
+      recentSignals: [...this.recentSignals],
+      dailySignals: [...this.dailySignals],
+      positionSignalType: Array.from(this.positionSignalType.entries()),
+      account: this.account.exportSnapshot(),
+      options: this.optionsAccount.exportSnapshot(),
+    };
+  }
+
+  /** Restore trade history + accounts from durable storage (TRA-140). */
+  importTradeSnapshot(snap: ReturnType<SignalEngine['exportTradeSnapshot']>): void {
+    this.allClosedPositions = [...snap.closedPositions];
+    this.recentSignals = [...snap.recentSignals];
+    this.dailySignals = [...snap.dailySignals];
+    this.positionSignalType = new Map(snap.positionSignalType);
+    this.account.importSnapshot(snap.account);
+    this.optionsAccount.importSnapshot(snap.options);
+  }
+
   getEquitySnapshot() {
     return {
       equity: this.account.getState().totalEquity,

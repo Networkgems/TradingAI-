@@ -259,4 +259,45 @@ export class PaperOptionsAccount {
   hasOpenOption(symbol: string): boolean {
     return Array.from(this.openOptions.values()).some(o => o.symbol === symbol);
   }
+
+  /** Serialize current state for durable storage (TRA-140). */
+  exportSnapshot(): {
+    openOptions: OptionPosition[];
+    closedOptions: OptionPosition[];
+    optionsPnl: number;
+    dailyCount: number;
+    currentDayKey: string;
+    cash: number;
+    equity: number;
+  } {
+    return {
+      openOptions: Array.from(this.openOptions.values()),
+      closedOptions: [...this.closedOptions],
+      optionsPnl: this.optionsPnl,
+      dailyCount: this.dailyCount,
+      currentDayKey: this.currentDayKey,
+      cash: this.cash,
+      equity: this.equity,
+    };
+  }
+
+  /** Restore state previously serialized via exportSnapshot (TRA-140). */
+  importSnapshot(snap: {
+    openOptions: OptionPosition[];
+    closedOptions: OptionPosition[];
+    optionsPnl: number;
+    dailyCount: number;
+    currentDayKey: string;
+    cash: number;
+    equity: number;
+  }): void {
+    this.openOptions.clear();
+    for (const o of snap.openOptions) this.openOptions.set(o.id, o);
+    this.closedOptions = [...snap.closedOptions];
+    this.optionsPnl = snap.optionsPnl;
+    this.dailyCount = snap.dailyCount;
+    this.currentDayKey = snap.currentDayKey;
+    this.cash = snap.cash;
+    this.equity = snap.equity;
+  }
 }

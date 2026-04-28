@@ -166,4 +166,36 @@ export class CryptoPaperAccount {
     );
   }
 
+  /** Serialize current state for durable storage (TRA-140). */
+  exportSnapshot(): {
+    cash: number;
+    equity: number;
+    initialEquity: number;
+    openingEquityToday: number;
+    openPositions: Position[];
+  } {
+    return {
+      cash: this.cash,
+      equity: this.equity,
+      initialEquity: this.initialEquity,
+      openingEquityToday: this.openingEquityToday,
+      openPositions: Array.from(this.positions.values()),
+    };
+  }
+
+  /** Restore state previously serialized via exportSnapshot (TRA-140). */
+  importSnapshot(snap: {
+    cash: number;
+    equity: number;
+    initialEquity: number;
+    openingEquityToday: number;
+    openPositions: Position[];
+  }): void {
+    this.cash = snap.cash;
+    this.equity = snap.equity;
+    this.initialEquity = snap.initialEquity;
+    this.openingEquityToday = snap.openingEquityToday;
+    this.positions.clear();
+    for (const p of snap.openPositions) this.positions.set(p.id, p);
+  }
 }

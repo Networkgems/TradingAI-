@@ -35,6 +35,14 @@ import {
   deleteUser,
 } from './users.js';
 import { sendPasswordResetEmail } from './email.js';
+import {
+  loadStocksTradeSnapshot,
+  loadCryptoTradeSnapshot,
+  saveStocksTradeSnapshot,
+  saveCryptoTradeSnapshot,
+  rotateBackups,
+  checkDataDirHealth,
+} from './trade-store.js';
 import type { AccountSettings } from '@trading-app/shared';
 import { DEFAULT_ACCOUNT_SETTINGS } from '@trading-app/shared';
 
@@ -50,6 +58,11 @@ if (!existsSync(REPORTS_DIR)) {
 if (!existsSync(CRYPTO_REPORTS_DIR)) {
   await mkdir(CRYPTO_REPORTS_DIR, { recursive: true });
 }
+
+// TRA-140 — log DATA_DIR and warn loudly if it's ephemeral, so a misconfigured
+// Render deploy without a mounted persistent disk is obvious in logs instead of
+// silently wiping users/trades/settings on every restart.
+await checkDataDirHealth();
 
 // Load users and reset tokens from persistent storage
 await loadUsers();
@@ -116,6 +129,60 @@ const cryptoTracker = new PnlTracker(
 const engine = new SignalEngine(initialSettings, tracker);
 const cryptoEngine = new CryptoSignalEngine(cryptoTracker, initialSettings);
 const scheduler = new MarketScheduler();
+
+// TRA-140 — restore saved trade history (open positions, closed positions,
+// signals, options) so a server restart no longer wipes everything.
+{
+  const stocksSnap = await loadStocksTradeSnapshot();
+  if (stocksSnap) {
+    try {
+      engine.importTradeSnapshot({
+        closedPositions: stocksSnap.closedPositions ?? [],
+        recentSignals: stocksSnap.recentSignals ?? [],
+        dailySignals: stocksSnap.dailySignals ?? [],
+        positionSignalType: stocksSnap.positionSignalType ?? [],
+        account: {
+          cash: stocksSnap.account.cash,
+          equity: stocksSnap.account.equity,
+          initialEquity: stocksSnap.account.initialEquity,
+          dailyPnl: stocksSnap.account.dailyPnl,
+          openPositions: stocksSnap.openPositions ?? [],
+        },
+        options: {
+          openOptions: stocksSnap.options.openOptions ?? [],
+          closedOptions: stocksSnap.options.closedOptions ?? [],
+          optionsPnl: stocksSnap.options.optionsPnl ?? 0,
+          dailyCount: stocksSnap.options.dailyCount ?? 0,
+          currentDayKey: stocksSnap.options.currentDayKey ?? new Date().toISOString().slice(0, 10),
+          cash: stocksSnap.options.cash ?? stocksSnap.account.cash,
+          equity: stocksSnap.options.equity ?? stocksSnap.account.equity,
+        },
+      });
+      console.log(`[startup] Restored stocks trade history: ${stocksSnap.openPositions?.length ?? 0} open, ${stocksSnap.closedPositions?.length ?? 0} closed, ${stocksSnap.options.openOptions?.length ?? 0} open options.`);
+    } catch (err: unknown) {
+      console.warn(`[startup] Failed to restore stocks trade history: ${err instanceof Error ? err.message : String(err)}`);
+    }
+  }
+  const cryptoSnap = await loadCryptoTradeSnapshot();
+  if (cryptoSnap) {
+    try {
+      cryptoEngine.importTradeSnapshot({
+        closedPositions: cryptoSnap.closedPositions ?? [],
+        recentSignals: cryptoSnap.recentSignals ?? [],
+        account: {
+          cash: cryptoSnap.account.cash,
+          equity: cryptoSnap.account.equity,
+          initialEquity: cryptoSnap.account.initialEquity,
+          openingEquityToday: cryptoSnap.account.openingEquityToday,
+          openPositions: cryptoSnap.openPositions ?? [],
+        },
+      });
+      console.log(`[startup] Restored crypto trade history: ${cryptoSnap.openPositions?.length ?? 0} open, ${cryptoSnap.closedPositions?.length ?? 0} closed.`);
+    } catch (err: unknown) {
+      console.warn(`[startup] Failed to restore crypto trade history: ${err instanceof Error ? err.message : String(err)}`);
+    }
+  }
+}
 
 // Restore persisted watchlist overrides into engines
 await initWatchlistStore();
@@ -812,6 +879,95 @@ cryptoEngine.onTick((state) => {
   }
 });
 
+// TRA-140 — debounced trade-history persistence. The engines fire onTick after
+// every state change (position open/close, options exit, signals); we coalesce
+// those into one disk write per tick window so we're not saving multiple times
+// per second under burst load. The actual writes are atomic (tmp + rename).
+let stocksPersistTimer: ReturnType<typeof setTimeout> | null = null;
+let cryptoPersistTimer: ReturnType<typeof setTimeout> | null = null;
+const PERSIST_DEBOUNCE_MS = 1000;
+
+function scheduleStocksPersist(): void {
+  if (stocksPersistTimer) return;
+  stocksPersistTimer = setTimeout(() => {
+    stocksPersistTimer = null;
+    void persistStocksNow();
+  }, PERSIST_DEBOUNCE_MS);
+}
+
+function scheduleCryptoPersist(): void {
+  if (cryptoPersistTimer) return;
+  cryptoPersistTimer = setTimeout(() => {
+    cryptoPersistTimer = null;
+    void persistCryptoNow();
+  }, PERSIST_DEBOUNCE_MS);
+}
+
+async function persistStocksNow(): Promise<void> {
+  try {
+    const snap = engine.exportTradeSnapshot();
+    await saveStocksTradeSnapshot({
+      version: 1,
+      savedAt: new Date().toISOString(),
+      openPositions: snap.account.openPositions,
+      closedPositions: snap.closedPositions,
+      recentSignals: snap.recentSignals,
+      dailySignals: snap.dailySignals,
+      positionSignalType: snap.positionSignalType,
+      options: snap.options,
+      account: {
+        cash: snap.account.cash,
+        equity: snap.account.equity,
+        initialEquity: snap.account.initialEquity,
+        dailyPnl: snap.account.dailyPnl,
+      },
+    });
+  } catch (err: unknown) {
+    console.warn(`[trade-store] stocks persist failed: ${err instanceof Error ? err.message : String(err)}`);
+  }
+}
+
+async function persistCryptoNow(): Promise<void> {
+  try {
+    const snap = cryptoEngine.exportTradeSnapshot();
+    await saveCryptoTradeSnapshot({
+      version: 1,
+      savedAt: new Date().toISOString(),
+      openPositions: snap.account.openPositions,
+      closedPositions: snap.closedPositions,
+      recentSignals: snap.recentSignals,
+      account: {
+        cash: snap.account.cash,
+        equity: snap.account.equity,
+        initialEquity: snap.account.initialEquity,
+        openingEquityToday: snap.account.openingEquityToday,
+      },
+    });
+  } catch (err: unknown) {
+    console.warn(`[trade-store] crypto persist failed: ${err instanceof Error ? err.message : String(err)}`);
+  }
+}
+
+engine.onTick(() => scheduleStocksPersist());
+cryptoEngine.onTick(() => scheduleCryptoPersist());
+
+// Run an initial persist + backup so the very first start writes a snapshot
+// even before any trades happen — that way the backup safety net is in place
+// from second one.
+void persistStocksNow();
+void persistCryptoNow();
+void rotateBackups().catch(err => console.warn(`[trade-store] initial backup failed: ${err instanceof Error ? err.message : String(err)}`));
+
+// Periodic backup snapshots — every 30 minutes the persisted JSON files are
+// copied into a timestamped folder under DATA_DIR/backups/. Old folders are
+// pruned (last 24 kept = ~12 hours). If a primary file ever becomes corrupt or
+// missing, the next startup automatically restores from the latest backup.
+const BACKUP_INTERVAL_MS = 30 * 60_000;
+const backupTimer = setInterval(() => {
+  void rotateBackups().catch(err => console.warn(`[trade-store] backup failed: ${err instanceof Error ? err.message : String(err)}`));
+}, BACKUP_INTERVAL_MS);
+backupTimer.unref?.();
+
 // ── Static frontend (production web) ────────────────────────────────────────
 // When the Vite build exists alongside this server, serve it so the web PWA
 // and the API share the same origin (avoids CORS and makes WS auth simpler).
@@ -836,13 +992,23 @@ httpServer.listen(PORT, () => {
   console.log(`Reports directory: ${REPORTS_DIR}`);
 });
 
-function gracefulShutdown(signal: string): void {
-  console.log(`[shutdown] received ${signal} — stopping engines`);
+async function gracefulShutdown(signal: string): Promise<void> {
+  console.log(`[shutdown] received ${signal} — stopping engines and flushing trade history`);
   engine.stop();
   cryptoEngine.stop();
   scheduler.stop();
+  // TRA-140 — flush any pending trade-history writes synchronously before exit
+  // so positions/signals from the last tick aren't lost between SIGTERM and
+  // process exit (Render sends SIGTERM ~10 s before killing the process).
+  if (stocksPersistTimer) clearTimeout(stocksPersistTimer);
+  if (cryptoPersistTimer) clearTimeout(cryptoPersistTimer);
+  try {
+    await Promise.all([persistStocksNow(), persistCryptoNow()]);
+  } catch (err: unknown) {
+    console.warn(`[shutdown] persist failed: ${err instanceof Error ? err.message : String(err)}`);
+  }
   process.exit(0);
 }
 
-process.on('SIGINT', () => gracefulShutdown('SIGINT'));
-process.on('SIGTERM', () => gracefulShutdown('SIGTERM'));
+process.on('SIGINT', () => { void gracefulShutdown('SIGINT'); });
+process.on('SIGTERM', () => { void gracefulShutdown('SIGTERM'); });

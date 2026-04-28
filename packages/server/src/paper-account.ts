@@ -178,4 +178,39 @@ export class PaperAccount {
       p => p.symbol === symbol && p.signalType === signalType,
     );
   }
+
+  /** Serialize current state for durable storage (TRA-140). */
+  exportSnapshot(): {
+    cash: number;
+    equity: number;
+    initialEquity: number;
+    dailyPnl: number;
+    openPositions: Position[];
+  } {
+    return {
+      cash: this.cash,
+      equity: this.equity,
+      initialEquity: this.initialEquity,
+      dailyPnl: this.dailyPnl,
+      openPositions: Array.from(this.positions.values()),
+    };
+  }
+
+  /** Restore state previously serialized via exportSnapshot (TRA-140). */
+  importSnapshot(snap: {
+    cash: number;
+    equity: number;
+    initialEquity: number;
+    dailyPnl: number;
+    openPositions: Position[];
+  }): void {
+    this.cash = snap.cash;
+    this.equity = snap.equity;
+    this.initialEquity = snap.initialEquity;
+    this.dailyPnl = snap.dailyPnl;
+    this.positions.clear();
+    for (const p of snap.openPositions) {
+      this.positions.set(p.id, p);
+    }
+  }
 }

@@ -389,4 +389,24 @@ export class CryptoSignalEngine {
       symbols: Array.from(this.symbolState.values()),
     };
   }
+
+  /** Snapshot trade history + account for durable storage (TRA-140). */
+  exportTradeSnapshot(): {
+    closedPositions: Position[];
+    recentSignals: TradeSignal[];
+    account: ReturnType<CryptoPaperAccount['exportSnapshot']>;
+  } {
+    return {
+      closedPositions: [...this.allClosedPositions],
+      recentSignals: [...this.recentSignals],
+      account: this.account.exportSnapshot(),
+    };
+  }
+
+  /** Restore trade history + account from durable storage (TRA-140). */
+  importTradeSnapshot(snap: ReturnType<CryptoSignalEngine['exportTradeSnapshot']>): void {
+    this.allClosedPositions = [...snap.closedPositions];
+    this.recentSignals = [...snap.recentSignals];
+    this.account.importSnapshot(snap.account);
+  }
 }
