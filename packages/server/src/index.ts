@@ -809,7 +809,16 @@ app.post('/api/crypto/positions/:id/close', requireAuth, async (req, res) => {
 // ── Data-source health check ─────────────────────────────────────────────────
 
 app.get('/api/health/quotes', async (_req, res) => {
-  const { testYahooFinance, testFinnhub, testTiingo, isYahooBreakerOpen, isTiingoBreakerOpen, fetchMinuteBarsWithSource } = await import('./yahoo-feed.js');
+  const {
+    testYahooFinance,
+    testFinnhub,
+    testTwelveData,
+    testTiingo,
+    isYahooBreakerOpen,
+    isTiingoBreakerOpen,
+    fetchMinuteBarsWithSource,
+    getFallbackRequestCounts,
+  } = await import('./yahoo-feed.js');
   const { testCoinMarketCap } = await import('./crypto-feed.js');
   const results: Record<string, unknown> = {};
 
@@ -827,6 +836,13 @@ app.get('/api/health/quotes', async (_req, res) => {
   }
 
   try {
+    const td = await testTwelveData();
+    results['twelveData'] = td ?? { skipped: 'TWELVE_DATA_API_KEY not set' };
+  } catch (err: unknown) {
+    results['twelveData'] = { error: err instanceof Error ? err.message : String(err) };
+  }
+
+  try {
     const tiingo = await testTiingo();
     results['tiingo'] = tiingo ?? { skipped: 'TIINGO_API_KEY not set' };
   } catch (err: unknown) {
@@ -840,11 +856,11 @@ app.get('/api/health/quotes', async (_req, res) => {
     results['coinMarketCap'] = { error: err instanceof Error ? err.message : String(err) };
   }
 
-  // TRA-148/TRA-155: probe the actual minute-bar path the signal engine uses,
-  // so QA can confirm the fallback engages while yahooBreakerOpen=true without
-  // grepping logs. Both finnhubDiag and tiingoDiag are surfaced so QA can see
-  // *why* a given tier returned nothing (plan-rejection 403, no_data, http
-  // error, etc.) without redeploying with extra logging.
+  // TRA-148/TRA-154/TRA-155: probe the actual minute-bar path the signal engine
+  // uses, so QA can confirm the fallback chain engages while yahooBreakerOpen=true
+  // without grepping logs. All provider diags are surfaced so QA can see *why* a
+  // given tier returned nothing (plan-rejection 403, no_data, http error, etc.)
+  // without redeploying with extra logging.
   try {
     const probe = await fetchMinuteBarsWithSource('AAPL', 60);
     results['chartFallback'] = {
@@ -852,12 +868,19 @@ app.get('/api/health/quotes', async (_req, res) => {
       bars: probe.bars.length,
       source: probe.source,
       yahooSkipped: probe.yahooSkipped,
+      cached: probe.cached ?? false,
       finnhubDiag: probe.finnhubDiag ?? null,
+      twelveDataDiag: probe.twelveDataDiag ?? null,
       tiingoDiag: probe.tiingoDiag ?? null,
     };
   } catch (err: unknown) {
     results['chartFallback'] = { error: err instanceof Error ? err.message : String(err) };
   }
+
+  // TRA-154: surface daily fallback request counts so QA can see whether we're
+  // approaching the free-tier caps (Twelve Data 800/day, Tiingo 1,000/day) before
+  // the engine stalls. Resets at UTC midnight.
+  results['fallbackRequestsToday'] = getFallbackRequestCounts();
 
   const ok = (key: string) => {
     const v = results[key];

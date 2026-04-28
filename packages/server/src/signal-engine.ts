@@ -1,7 +1,7 @@
 import { OrbStrategy, ReversalStrategy, MacdBollingerStrategy, IchimokuStrategy } from '@trading-app/engine';
 import { WATCHLIST, MANAGED_ACCOUNT_RATIO, MAX_CONSECUTIVE_LOSSES, DAILY_DRAWDOWN_HALT_PCT, isStockMarketOpen } from '@trading-app/shared';
 import type { TradeSignal, Candle, OptionsAccountState, SignalType, Position, AccountSettings, AccountState, NewsItem } from '@trading-app/shared';
-import { fetchMinuteBars, fetchQuotes, fetchStocksNews, isYahooBreakerOpen } from './yahoo-feed.js';
+import { fetchMinuteBars, fetchQuotes, fetchStocksNews, isYahooBreakerOpen, setActiveInterestSymbols } from './yahoo-feed.js';
 import { PaperAccount } from './paper-account.js';
 import { PaperOptionsAccount } from './options-account.js';
 import type { DailySignalRecord } from './reports/eod-report.js';
@@ -353,6 +353,20 @@ export class SignalEngine {
         this.optionsAccount.getState().optionsPnl,
       );
     }
+
+    // TRA-154: tag symbols that have an open position or a recent signal as
+    // "active interest". The Twelve Data candle fallback (800/day cap) is gated
+    // to this set so we don't burn the daily budget on watchlist-wide refreshes.
+    // Other symbols still get Tiingo (1,000/day) — sufficient for indicator math
+    // even though IEX-only volume is partial.
+    const ACTIVE_SIGNAL_WINDOW_MS = 30 * 60_000;
+    const recentSignalCutoff = Date.now() - ACTIVE_SIGNAL_WINDOW_MS;
+    const activeInterest = new Set<string>();
+    for (const p of this.account.getState().openPositions) activeInterest.add(p.symbol);
+    for (const s of this.recentSignals) {
+      if (s.timestamp >= recentSignalCutoff) activeInterest.add(s.symbol);
+    }
+    setActiveInterestSymbols(activeInterest);
 
     // Fetch candles in parallel batches to avoid 25+ second sequential delay for 25 symbols
     const CANDLE_BATCH = 5;

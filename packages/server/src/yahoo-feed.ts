@@ -65,6 +65,82 @@ async function withRetry<T>(fn: () => Promise<T>, label: string, retries = 2): P
   return null;
 }
 
+// ── Active-interest set (TRA-154) ─────────────────────────────────────────────
+// signal-engine populates this each tick with symbols that have open positions
+// or recent signals. The Twelve Data candle fallback is gated to this set so we
+// stay inside its 800/day free-tier budget instead of burning credits on every
+// watchlist symbol on every tick.
+
+let activeInterestSymbols: ReadonlySet<string> = new Set<string>();
+
+export function setActiveInterestSymbols(symbols: Iterable<string>): void {
+  activeInterestSymbols = new Set(symbols);
+}
+
+function isActiveInterest(symbol: string): boolean {
+  return activeInterestSymbols.has(symbol);
+}
+
+// ── Daily fallback request counters (TRA-154) ────────────────────────────────
+// Tracks how many minute-bar requests we send per provider per UTC day so the
+// /api/health/quotes endpoint can show whether we're approaching free-tier caps
+// (Twelve Data 800/day, Tiingo 1,000/day). Resets on UTC midnight rollover.
+
+type FallbackProvider = 'finnhubCandle' | 'twelveData' | 'tiingo';
+const fallbackCounters: Record<FallbackProvider, number> = {
+  finnhubCandle: 0,
+  twelveData: 0,
+  tiingo: 0,
+};
+let fallbackCountersDay = utcDayKey();
+
+function utcDayKey(): string {
+  return new Date().toISOString().slice(0, 10);
+}
+
+function rollFallbackCountersIfNeeded(): void {
+  const today = utcDayKey();
+  if (today !== fallbackCountersDay) {
+    fallbackCounters.finnhubCandle = 0;
+    fallbackCounters.twelveData = 0;
+    fallbackCounters.tiingo = 0;
+    fallbackCountersDay = today;
+  }
+}
+
+function bumpFallbackCounter(provider: FallbackProvider): void {
+  rollFallbackCountersIfNeeded();
+  fallbackCounters[provider] += 1;
+}
+
+export function getFallbackRequestCounts(): { day: string; finnhubCandle: number; twelveData: number; tiingo: number } {
+  rollFallbackCountersIfNeeded();
+  return {
+    day: fallbackCountersDay,
+    finnhubCandle: fallbackCounters.finnhubCandle,
+    twelveData: fallbackCounters.twelveData,
+    tiingo: fallbackCounters.tiingo,
+  };
+}
+
+// ── Per-symbol minute-bar cache (TRA-154) ────────────────────────────────────
+// fetchMinuteBarsWithSource is called once per active symbol per 30-second
+// signal-engine tick. Bars only refresh on the minute boundary, so two ticks
+// inside the same minute produce identical work. The cache lets back-to-back
+// ticks reuse the most recent successful provider response — keeping us inside
+// Twelve Data's 8 req/min and Tiingo's 50/hr limits when Yahoo's breaker is
+// open. Cached entries expire at the next minute boundary (worst case ~60s).
+type MinuteBarCacheEntry = {
+  bars: Candle[];
+  source: 'yahoo' | 'finnhub' | 'twelvedata' | 'tiingo';
+  expiresAt: number;
+};
+const minuteBarCache = new Map<string, MinuteBarCacheEntry>();
+function nextMinuteBoundary(): number {
+  const now = Date.now();
+  return Math.floor(now / 60_000) * 60_000 + 60_000;
+}
+
 // ── Finnhub fallback for stocks ───────────────────────────────────────────────
 // Activated when FINNHUB_API_KEY is set. Free tier covers US equities at 60 req/min.
 
@@ -192,6 +268,7 @@ async function fetchFinnhubMinuteBars(
   // 2× window to absorb gaps from off-hours / illiquid minutes, matching Yahoo's branch.
   const fromSec = nowSec - count * 60 * 2;
   try {
+    bumpFallbackCounter('finnhubCandle');
     const url = `${FINNHUB_BASE}/stock/candle?symbol=${encodeURIComponent(symbol)}&resolution=1&from=${fromSec}&to=${nowSec}&token=${FINNHUB_API_KEY}`;
     const resp = await withTimeout(fetch(url), YF_CALL_TIMEOUT_MS, `finnhub candle(${symbol})`);
     if (!resp.ok) {
@@ -226,6 +303,120 @@ async function fetchFinnhubMinuteBars(
   } catch (err: unknown) {
     const msg = err instanceof Error ? err.message : String(err);
     console.warn(`[yahoo-feed] finnhub candle(${symbol}) error: ${msg}`);
+    return { bars: [], diag: { reason: 'fetch_error', errorMsg: msg } };
+  }
+}
+
+// ── Twelve Data fallback for stock minute bars ───────────────────────────────
+// TRA-154: Tiingo IEX (added in TRA-155) only sees ~2% of US trade volume, so
+// volume-based signals (volume climax, breakout-with-volume) get a degraded read
+// when Yahoo's breaker is open. Twelve Data gives consolidated 1-minute bars on
+// the free tier (800 req/day, 8 req/min). Budget is too tight for the full
+// watchlist, so this branch only fires for "active interest" symbols — those
+// with open positions or recent signals — and falls through to Tiingo otherwise.
+
+const TWELVE_DATA_API_KEY = process.env.TWELVE_DATA_API_KEY ?? '';
+const TWELVE_DATA_BASE = 'https://api.twelvedata.com';
+
+if (!TWELVE_DATA_API_KEY) {
+  console.warn('[yahoo-feed] TWELVE_DATA_API_KEY is not set — Twelve Data minute-bar fallback disabled');
+}
+
+interface TwelveDataValue {
+  datetime?: string;
+  open?: string;
+  high?: string;
+  low?: string;
+  close?: string;
+  volume?: string;
+}
+interface TwelveDataResponse {
+  values?: TwelveDataValue[];
+  status?: string;
+  code?: number;
+  message?: string;
+}
+
+export interface TwelveDataCandleDiag {
+  reason: 'no_key' | 'not_active_interest' | 'http_error' | 'no_data' | 'parse_error' | 'fetch_error' | 'rate_limited' | 'ok';
+  httpStatus?: number;
+  rawLen?: number;
+  filteredLen?: number;
+  errorBody?: string;
+  errorMsg?: string;
+}
+
+// Twelve Data parses datetime as US/Eastern by default for US equities. Pass
+// a Z-less ISO and let the API return rows; we parse them as Eastern below
+// only if needed. In practice the API echoes "YYYY-MM-DD HH:MM:SS" without TZ
+// and treats it as exchange local time; comparing with UTC currentMinuteStart
+// works because we just need monotonic ordering and to drop the in-progress bar.
+function parseTwelveDataTs(s: string): number {
+  // Accept "YYYY-MM-DD HH:MM:SS" — interpret as UTC for ordering. A small TZ
+  // skew vs. Yahoo bars doesn't affect indicator math because each branch
+  // produces its own self-consistent series; we never mix providers within
+  // one indicator window.
+  const norm = s.includes('T') ? s : s.replace(' ', 'T') + 'Z';
+  const ms = new Date(norm).getTime();
+  return Number.isFinite(ms) ? ms : NaN;
+}
+
+async function fetchTwelveDataMinuteBars(
+  symbol: string,
+  count: number,
+  isActiveInterest: boolean,
+): Promise<{ bars: Candle[]; diag: TwelveDataCandleDiag }> {
+  if (!TWELVE_DATA_API_KEY) return { bars: [], diag: { reason: 'no_key' } };
+  if (!isActiveInterest) return { bars: [], diag: { reason: 'not_active_interest' } };
+  // 2× window to absorb off-hours / illiquid gaps, matching the Yahoo branch.
+  const outputsize = Math.min(Math.max(count * 2, 30), 500);
+  try {
+    bumpFallbackCounter('twelveData');
+    const url = `${TWELVE_DATA_BASE}/time_series?symbol=${encodeURIComponent(symbol)}&interval=1min&outputsize=${outputsize}&apikey=${TWELVE_DATA_API_KEY}`;
+    const resp = await withTimeout(fetch(url), YF_CALL_TIMEOUT_MS, `twelvedata candle(${symbol})`);
+    if (!resp.ok) {
+      const errorBody = await resp.text().catch(() => '');
+      console.warn(`[yahoo-feed] twelvedata candle(${symbol}) HTTP ${resp.status}: ${errorBody.slice(0, 200)}`);
+      return { bars: [], diag: { reason: 'http_error', httpStatus: resp.status, errorBody: errorBody.slice(0, 200) } };
+    }
+    const json = (await resp.json()) as TwelveDataResponse;
+    // Twelve Data returns 200 OK with status:"error" + code 429 when rate-limited
+    // (8 req/min) or 400/401 with a message when the daily 800/day cap is hit.
+    if (json && json.status === 'error') {
+      const msg = json.message ?? 'unknown error';
+      const code = json.code ?? 0;
+      if (code === 429 || /\b(rate|limit|credits|daily)\b/i.test(msg)) {
+        return { bars: [], diag: { reason: 'rate_limited', httpStatus: resp.status, errorBody: msg.slice(0, 200) } };
+      }
+      return { bars: [], diag: { reason: 'http_error', httpStatus: resp.status, errorBody: msg.slice(0, 200) } };
+    }
+    if (!json || !Array.isArray(json.values)) {
+      return { bars: [], diag: { reason: 'parse_error', httpStatus: resp.status, errorBody: JSON.stringify(json ?? {}).slice(0, 200) } };
+    }
+    const currentMinuteStart = Math.floor(Date.now() / 60_000) * 60_000;
+    const candles: Candle[] = [];
+    for (const row of json.values) {
+      if (!row.datetime) continue;
+      const ts = parseTwelveDataTs(row.datetime);
+      if (!Number.isFinite(ts)) continue;
+      if (ts >= currentMinuteStart) continue;
+      const o = row.open != null ? Number(row.open) : NaN;
+      const h = row.high != null ? Number(row.high) : NaN;
+      const l = row.low != null ? Number(row.low) : NaN;
+      const c = row.close != null ? Number(row.close) : NaN;
+      const v = row.volume != null ? Number(row.volume) : 0;
+      if (!Number.isFinite(o) || !Number.isFinite(h) || !Number.isFinite(l) || !Number.isFinite(c)) continue;
+      candles.push({ symbol, timestamp: ts, open: o, high: h, low: l, close: c, volume: Number.isFinite(v) ? v : 0 });
+    }
+    candles.sort((a, b) => a.timestamp - b.timestamp);
+    const sliced = candles.slice(-count);
+    return {
+      bars: sliced,
+      diag: { reason: sliced.length > 0 ? 'ok' : 'no_data', httpStatus: resp.status, rawLen: json.values.length, filteredLen: sliced.length },
+    };
+  } catch (err: unknown) {
+    const msg = err instanceof Error ? err.message : String(err);
+    console.warn(`[yahoo-feed] twelvedata candle(${symbol}) error: ${msg}`);
     return { bars: [], diag: { reason: 'fetch_error', errorMsg: msg } };
   }
 }
@@ -298,6 +489,7 @@ async function fetchTiingoMinuteBars(
   const fromMs = Date.now() - count * 60 * 1000 * 2;
   const startDate = new Date(fromMs).toISOString();
   try {
+    bumpFallbackCounter('tiingo');
     const url = `${TIINGO_BASE}/iex/${encodeURIComponent(symbol)}/prices?startDate=${encodeURIComponent(startDate)}&resampleFreq=1min&token=${TIINGO_API_KEY}`;
     const resp = await withTimeout(fetch(url), YF_CALL_TIMEOUT_MS, `tiingo candle(${symbol})`);
     if (!resp.ok) {
@@ -346,9 +538,9 @@ async function fetchTiingoMinuteBars(
  * Fetch the last N 1-minute candles for a symbol.
  *
  * Yahoo Finance is the primary source. When the breaker is open (recent 429s) or
- * Yahoo returns no usable bars, cascade through Finnhub then Tiingo IEX. Without
- * this fallback the signal engine starves on indicator math whenever Yahoo
- * rate-limits Render's egress IP and stops opening new stock auto-trades.
+ * Yahoo returns no usable bars, cascade through Finnhub → Twelve Data → Tiingo.
+ * Without this fallback the signal engine starves on indicator math whenever
+ * Yahoo rate-limits Render's egress IP and stops opening new stock auto-trades.
  */
 export async function fetchMinuteBars(symbol: string, count = 60): Promise<Candle[]> {
   const { bars } = await fetchMinuteBarsWithSource(symbol, count);
@@ -365,9 +557,11 @@ export async function fetchMinuteBarsWithSource(
   count = 60,
 ): Promise<{
   bars: Candle[];
-  source: 'yahoo' | 'finnhub' | 'tiingo' | 'none';
+  source: 'yahoo' | 'finnhub' | 'twelvedata' | 'tiingo' | 'none';
   yahooSkipped: boolean;
+  cached?: boolean;
   finnhubDiag?: FinnhubCandleDiag;
+  twelveDataDiag?: TwelveDataCandleDiag;
   tiingoDiag?: TiingoCandleDiag;
 }> {
   const now = new Date();
@@ -398,19 +592,61 @@ export async function fetchMinuteBarsWithSource(
         .slice(-count)
     : [];
 
-  if (yahooBars.length > 0) return { bars: yahooBars, source: 'yahoo', yahooSkipped };
+  if (yahooBars.length > 0) {
+    minuteBarCache.set(symbol, { bars: yahooBars, source: 'yahoo', expiresAt: nextMinuteBoundary() });
+    return { bars: yahooBars, source: 'yahoo', yahooSkipped };
+  }
+
+  // Yahoo returned nothing. If we already served a fallback for this symbol in
+  // the current minute, reuse it instead of re-hitting providers — bars don't
+  // change inside a minute and 30s ticks would otherwise double our daily spend.
+  const cached = minuteBarCache.get(symbol);
+  if (cached && cached.expiresAt > Date.now() && cached.source !== 'yahoo') {
+    return { bars: cached.bars, source: cached.source, yahooSkipped, cached: true };
+  }
 
   const finnhub = await fetchFinnhubMinuteBars(symbol, count);
   if (finnhub.bars.length > 0) {
     console.info(`[yahoo-feed] chart(${symbol}): served ${finnhub.bars.length} bars from Finnhub fallback`);
+    minuteBarCache.set(symbol, { bars: finnhub.bars, source: 'finnhub', expiresAt: nextMinuteBoundary() });
     return { bars: finnhub.bars, source: 'finnhub', yahooSkipped, finnhubDiag: finnhub.diag };
+  }
+  // Twelve Data: gated to active-interest symbols (open positions or recent
+  // signals) so we fit inside the 800/day free-tier cap. For everything else,
+  // fall through to Tiingo whose 1,000/day cap is closer to watchlist-wide use.
+  const twelveData = await fetchTwelveDataMinuteBars(symbol, count, isActiveInterest(symbol));
+  if (twelveData.bars.length > 0) {
+    console.info(`[yahoo-feed] chart(${symbol}): served ${twelveData.bars.length} bars from Twelve Data fallback`);
+    minuteBarCache.set(symbol, { bars: twelveData.bars, source: 'twelvedata', expiresAt: nextMinuteBoundary() });
+    return {
+      bars: twelveData.bars,
+      source: 'twelvedata',
+      yahooSkipped,
+      finnhubDiag: finnhub.diag,
+      twelveDataDiag: twelveData.diag,
+    };
   }
   const tiingo = await fetchTiingoMinuteBars(symbol, count);
   if (tiingo.bars.length > 0) {
     console.info(`[yahoo-feed] chart(${symbol}): served ${tiingo.bars.length} bars from Tiingo fallback`);
-    return { bars: tiingo.bars, source: 'tiingo', yahooSkipped, finnhubDiag: finnhub.diag, tiingoDiag: tiingo.diag };
+    minuteBarCache.set(symbol, { bars: tiingo.bars, source: 'tiingo', expiresAt: nextMinuteBoundary() });
+    return {
+      bars: tiingo.bars,
+      source: 'tiingo',
+      yahooSkipped,
+      finnhubDiag: finnhub.diag,
+      twelveDataDiag: twelveData.diag,
+      tiingoDiag: tiingo.diag,
+    };
   }
-  return { bars: [], source: 'none', yahooSkipped, finnhubDiag: finnhub.diag, tiingoDiag: tiingo.diag };
+  return {
+    bars: [],
+    source: 'none',
+    yahooSkipped,
+    finnhubDiag: finnhub.diag,
+    twelveDataDiag: twelveData.diag,
+    tiingoDiag: tiingo.diag,
+  };
 }
 
 /**
@@ -500,6 +736,18 @@ export async function testFinnhub(): Promise<{ symbol: string; price: number } |
   const q = await fetchFinnhubQuote('AAPL');
   if (!q) throw new Error('Finnhub returned no quote for AAPL');
   return { symbol: 'AAPL', price: q.price };
+}
+
+/** Test Twelve Data connectivity — returns bar count or throws / returns null when unconfigured. */
+export async function testTwelveData(): Promise<{ symbol: string; bars: number } | null> {
+  if (!TWELVE_DATA_API_KEY) return null;
+  // Force-allow the probe regardless of active-interest gating; QA needs to see
+  // the provider works without first opening a position.
+  const { bars, diag } = await fetchTwelveDataMinuteBars('AAPL', 60, true);
+  if (bars.length === 0) {
+    throw new Error(`Twelve Data returned no bars for AAPL (reason=${diag.reason}${diag.httpStatus ? ` http=${diag.httpStatus}` : ''}${diag.errorBody ? ` body=${diag.errorBody}` : ''})`);
+  }
+  return { symbol: 'AAPL', bars: bars.length };
 }
 
 /** Test Tiingo IEX connectivity — returns bar count or throws / returns null when unconfigured. */
