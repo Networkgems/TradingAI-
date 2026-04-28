@@ -170,11 +170,24 @@ export interface FinnhubCandleDiag {
   errorMsg?: string;
 }
 
+// TRA-155: Finnhub moved /stock/candle behind a paid plan in 2024 and the
+// production key is on the free tier, so every candle call returns 403. Once we
+// see that, open a long-running breaker so we don't spam Finnhub with calls we
+// already know will fail — fall through to the next provider immediately.
+const FINNHUB_CANDLE_403_COOLDOWN_MS = 60 * 60 * 1000; // 1 hour
+let finnhubCandlePlanBlockedUntil = 0;
+function isFinnhubCandlePlanBlocked(): boolean {
+  return Date.now() < finnhubCandlePlanBlockedUntil;
+}
+
 async function fetchFinnhubMinuteBars(
   symbol: string,
   count: number,
 ): Promise<{ bars: Candle[]; diag: FinnhubCandleDiag }> {
   if (!FINNHUB_API_KEY) return { bars: [], diag: { reason: 'no_key' } };
+  if (isFinnhubCandlePlanBlocked()) {
+    return { bars: [], diag: { reason: 'http_error', httpStatus: 403, errorBody: 'plan_blocked_breaker_open' } };
+  }
   const nowSec = Math.floor(Date.now() / 1000);
   // 2× window to absorb gaps from off-hours / illiquid minutes, matching Yahoo's branch.
   const fromSec = nowSec - count * 60 * 2;
@@ -184,6 +197,9 @@ async function fetchFinnhubMinuteBars(
     if (!resp.ok) {
       const errorBody = await resp.text().catch(() => '');
       console.warn(`[yahoo-feed] finnhub candle(${symbol}) HTTP ${resp.status}: ${errorBody.slice(0, 200)}`);
+      if (resp.status === 403) {
+        finnhubCandlePlanBlockedUntil = Date.now() + FINNHUB_CANDLE_403_COOLDOWN_MS;
+      }
       return { bars: [], diag: { reason: 'http_error', httpStatus: resp.status, errorBody: errorBody.slice(0, 200) } };
     }
     const json = (await resp.json()) as FinnhubCandleResponse;
@@ -214,11 +230,92 @@ async function fetchFinnhubMinuteBars(
   }
 }
 
+// ── Tiingo IEX fallback for stock minute bars ────────────────────────────────
+// TRA-155: Finnhub /stock/candle requires a paid plan; Tiingo's IEX intraday
+// endpoint covers 1-minute bars on the free tier (1,000 req/day, 50/hr) which
+// is more than enough for the rare windows when Yahoo's breaker is open. IEX
+// volume only reflects IEX's share of trading (~2%), so we keep the bars even
+// when volume is 0/missing rather than filtering them out — partial bars beat
+// no bars for indicator math.
+
+const TIINGO_API_KEY = process.env.TIINGO_API_KEY ?? '';
+const TIINGO_BASE = 'https://api.tiingo.com';
+
+if (!TIINGO_API_KEY) {
+  console.warn('[yahoo-feed] TIINGO_API_KEY is not set — Tiingo minute-bar fallback disabled');
+}
+
+interface TiingoIexBar {
+  date?: string;
+  open?: number;
+  high?: number;
+  low?: number;
+  close?: number;
+  volume?: number;
+}
+
+export interface TiingoCandleDiag {
+  reason: 'no_key' | 'http_error' | 'no_data' | 'parse_error' | 'fetch_error' | 'ok';
+  httpStatus?: number;
+  rawLen?: number;
+  filteredLen?: number;
+  errorBody?: string;
+  errorMsg?: string;
+}
+
+async function fetchTiingoMinuteBars(
+  symbol: string,
+  count: number,
+): Promise<{ bars: Candle[]; diag: TiingoCandleDiag }> {
+  if (!TIINGO_API_KEY) return { bars: [], diag: { reason: 'no_key' } };
+  // 2× window to absorb off-hours / illiquid gaps, matching the Yahoo branch.
+  const fromMs = Date.now() - count * 60 * 1000 * 2;
+  const startDate = new Date(fromMs).toISOString();
+  try {
+    const url = `${TIINGO_BASE}/iex/${encodeURIComponent(symbol)}/prices?startDate=${encodeURIComponent(startDate)}&resampleFreq=1min&token=${TIINGO_API_KEY}`;
+    const resp = await withTimeout(fetch(url), YF_CALL_TIMEOUT_MS, `tiingo candle(${symbol})`);
+    if (!resp.ok) {
+      const errorBody = await resp.text().catch(() => '');
+      console.warn(`[yahoo-feed] tiingo candle(${symbol}) HTTP ${resp.status}: ${errorBody.slice(0, 200)}`);
+      return { bars: [], diag: { reason: 'http_error', httpStatus: resp.status, errorBody: errorBody.slice(0, 200) } };
+    }
+    const json = (await resp.json()) as TiingoIexBar[] | { detail?: string };
+    if (!Array.isArray(json)) {
+      return { bars: [], diag: { reason: 'parse_error', httpStatus: resp.status, errorBody: JSON.stringify(json).slice(0, 200) } };
+    }
+    const currentMinuteStart = Math.floor(Date.now() / 60_000) * 60_000;
+    const candles: Candle[] = [];
+    for (const row of json) {
+      const ts = row.date ? new Date(row.date).getTime() : NaN;
+      if (!Number.isFinite(ts)) continue;
+      if (ts >= currentMinuteStart) continue; // drop in-progress bar
+      const o = row.open;
+      const h = row.high;
+      const l = row.low;
+      const c = row.close;
+      if (o == null || h == null || l == null || c == null) continue;
+      // Tiingo IEX bars often legitimately have 0 volume (off-hours, low IEX
+      // share). Don't filter on volume here — see comment at section header.
+      candles.push({ symbol, timestamp: ts, open: o, high: h, low: l, close: c, volume: row.volume ?? 0 });
+    }
+    candles.sort((a, b) => a.timestamp - b.timestamp);
+    const sliced = candles.slice(-count);
+    return {
+      bars: sliced,
+      diag: { reason: sliced.length > 0 ? 'ok' : 'no_data', httpStatus: resp.status, rawLen: json.length, filteredLen: sliced.length },
+    };
+  } catch (err: unknown) {
+    const msg = err instanceof Error ? err.message : String(err);
+    console.warn(`[yahoo-feed] tiingo candle(${symbol}) error: ${msg}`);
+    return { bars: [], diag: { reason: 'fetch_error', errorMsg: msg } };
+  }
+}
+
 /**
  * Fetch the last N 1-minute candles for a symbol.
  *
  * Yahoo Finance is the primary source. When the breaker is open (recent 429s) or
- * Yahoo returns no usable bars, fall back to Finnhub's `/stock/candle`. Without
+ * Yahoo returns no usable bars, cascade through Finnhub then Tiingo IEX. Without
  * this fallback the signal engine starves on indicator math whenever Yahoo
  * rate-limits Render's egress IP and stops opening new stock auto-trades.
  */
@@ -229,13 +326,19 @@ export async function fetchMinuteBars(symbol: string, count = 60): Promise<Candl
 
 /**
  * Diagnostic variant of {@link fetchMinuteBars} that also reports which provider
- * served the bars. Used by `/api/health/quotes` so QA can verify the Finnhub
- * fallback is actually engaging when Yahoo's breaker is open.
+ * served the bars. Used by `/api/health/quotes` so QA can verify the fallback
+ * chain is actually engaging when Yahoo's breaker is open.
  */
 export async function fetchMinuteBarsWithSource(
   symbol: string,
   count = 60,
-): Promise<{ bars: Candle[]; source: 'yahoo' | 'finnhub' | 'none'; yahooSkipped: boolean; finnhubDiag?: FinnhubCandleDiag }> {
+): Promise<{
+  bars: Candle[];
+  source: 'yahoo' | 'finnhub' | 'tiingo' | 'none';
+  yahooSkipped: boolean;
+  finnhubDiag?: FinnhubCandleDiag;
+  tiingoDiag?: TiingoCandleDiag;
+}> {
   const now = new Date();
   const from = new Date(now.getTime() - count * 60 * 1000 * 2); // 2× window to guarantee enough bars
   // Drop the in-progress current-minute bar (partial volume skews volume-climax checks).
@@ -271,7 +374,12 @@ export async function fetchMinuteBarsWithSource(
     console.info(`[yahoo-feed] chart(${symbol}): served ${finnhub.bars.length} bars from Finnhub fallback`);
     return { bars: finnhub.bars, source: 'finnhub', yahooSkipped, finnhubDiag: finnhub.diag };
   }
-  return { bars: [], source: 'none', yahooSkipped, finnhubDiag: finnhub.diag };
+  const tiingo = await fetchTiingoMinuteBars(symbol, count);
+  if (tiingo.bars.length > 0) {
+    console.info(`[yahoo-feed] chart(${symbol}): served ${tiingo.bars.length} bars from Tiingo fallback`);
+    return { bars: tiingo.bars, source: 'tiingo', yahooSkipped, finnhubDiag: finnhub.diag, tiingoDiag: tiingo.diag };
+  }
+  return { bars: [], source: 'none', yahooSkipped, finnhubDiag: finnhub.diag, tiingoDiag: tiingo.diag };
 }
 
 /**
@@ -361,6 +469,16 @@ export async function testFinnhub(): Promise<{ symbol: string; price: number } |
   const q = await fetchFinnhubQuote('AAPL');
   if (!q) throw new Error('Finnhub returned no quote for AAPL');
   return { symbol: 'AAPL', price: q.price };
+}
+
+/** Test Tiingo IEX connectivity — returns bar count or throws / returns null when unconfigured. */
+export async function testTiingo(): Promise<{ symbol: string; bars: number } | null> {
+  if (!TIINGO_API_KEY) return null;
+  const { bars, diag } = await fetchTiingoMinuteBars('AAPL', 60);
+  if (bars.length === 0) {
+    throw new Error(`Tiingo returned no bars for AAPL (reason=${diag.reason}${diag.httpStatus ? ` http=${diag.httpStatus}` : ''})`);
+  }
+  return { symbol: 'AAPL', bars: bars.length };
 }
 
 /** Whether the Yahoo rate-limit circuit breaker is currently open. */
