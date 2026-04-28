@@ -75,8 +75,40 @@ if (!FINNHUB_API_KEY) {
   console.warn('[yahoo-feed] FINNHUB_API_KEY is not set — Finnhub stock fallback disabled');
 }
 
-async function fetchFinnhubQuote(symbol: string): Promise<{ price: number; volume: number; change: number; changePct: number } | null> {
+// TRA-149: throttle diagnostic logs for c=0 / non-OK Finnhub /quote responses
+// to once per minute per (symbol, kind) so a stuck-throttled key during a Yahoo
+// outage doesn't spam logs every 30s tick × N watchlist symbols.
+const FINNHUB_LOG_THROTTLE_MS = 60_000;
+const finnhubLogThrottle = new Map<string, number>();
+function shouldLogFinnhub(symbol: string, kind: 'http' | 'c0'): boolean {
+  const key = `${kind}:${symbol}`;
+  const now = Date.now();
+  const last = finnhubLogThrottle.get(key) ?? 0;
+  if (now - last < FINNHUB_LOG_THROTTLE_MS) return false;
+  finnhubLogThrottle.set(key, now);
+  return true;
+}
+
+// TRA-149: tiny per-symbol cache in front of /quote so concurrent callers (and
+// closely-spaced ticks) don't double-fire Finnhub during Yahoo outages, when
+// Finnhub becomes the load-bearing source. 5s is short enough to keep the
+// watchlist live and long enough to coalesce a single tick's parallel fan-out.
+const FINNHUB_QUOTE_TTL_MS = 5_000;
+type FinnhubQuoteResult = { price: number; volume: number; change: number; changePct: number };
+const finnhubQuoteCache = new Map<string, { at: number; value: FinnhubQuoteResult | null }>();
+
+async function fetchFinnhubQuote(symbol: string): Promise<FinnhubQuoteResult | null> {
   if (!FINNHUB_API_KEY) return null;
+  const cached = finnhubQuoteCache.get(symbol);
+  if (cached && Date.now() - cached.at < FINNHUB_QUOTE_TTL_MS) {
+    return cached.value;
+  }
+  const value = await fetchFinnhubQuoteUncached(symbol);
+  finnhubQuoteCache.set(symbol, { at: Date.now(), value });
+  return value;
+}
+
+async function fetchFinnhubQuoteUncached(symbol: string): Promise<FinnhubQuoteResult | null> {
   try {
     const resp = await withTimeout(
       fetch(`${FINNHUB_BASE}/quote?symbol=${encodeURIComponent(symbol)}&token=${FINNHUB_API_KEY}`),
@@ -84,12 +116,24 @@ async function fetchFinnhubQuote(symbol: string): Promise<{ price: number; volum
       `finnhub quote(${symbol})`,
     );
     if (!resp.ok) {
-      console.warn(`[yahoo-feed] finnhub quote(${symbol}) HTTP ${resp.status}`);
+      // Pull a body sample so we can tell rate-limit (429) from auth-rejection
+      // (401/403 with JSON error) from upstream-flake (5xx). Throttled per symbol.
+      if (shouldLogFinnhub(symbol, 'http')) {
+        const body = await resp.text().catch(() => '');
+        console.warn(`[yahoo-feed] finnhub quote(${symbol}) HTTP ${resp.status} ${resp.statusText} body=${body.slice(0, 200)}`);
+      } else {
+        console.warn(`[yahoo-feed] finnhub quote(${symbol}) HTTP ${resp.status}`);
+      }
       return null;
     }
     const json = (await resp.json()) as { c?: number; d?: number; dp?: number; pc?: number };
     if (!json || typeof json.c !== 'number' || json.c === 0) {
-      // Finnhub returns c=0 for invalid symbols / off-hours blanks.
+      // Finnhub returns c=0 for invalid symbols, off-hours blanks, AND silently
+      // throttled keys. Log the full payload (throttled) so we can distinguish
+      // these in production — see TRA-149.
+      if (shouldLogFinnhub(symbol, 'c0')) {
+        console.warn(`[yahoo-feed] finnhub quote(${symbol}) c=0 body=${JSON.stringify(json)}`);
+      }
       return null;
     }
     return {
