@@ -1,9 +1,10 @@
-import { ReversalStrategy, MacdBollingerStrategy, ScalpingStrategy, SwingStrategy } from '@trading-app/engine';
+import { ReversalStrategy, MacdBollingerStrategy, ScalpingStrategy, SwingStrategy, CoinbaseOrderClient } from '@trading-app/engine';
 import { CRYPTO_WATCHLIST } from '@trading-app/shared';
 import type { TradeSignal, Candle, AccountState, Position, CryptoEngineState, NewsItem, AccountSettings } from '@trading-app/shared';
 import { fetchCryptoMinuteBars, fetchCryptoDailyBars, fetchCryptoQuotes, fetchCryptoNews } from './crypto-feed.js';
 import { isYahooBreakerOpen } from './yahoo-feed.js';
 import { CryptoPaperAccount } from './crypto-account.js';
+import { CryptoLiveAccount } from './crypto-live-account.js';
 import type { PnlTracker } from './pnl-tracker.js';
 
 export type CryptoEngineEventHandler = (state: CryptoEngineState) => void;
@@ -41,9 +42,14 @@ export class CryptoSignalEngine {
   private handlers: CryptoEngineEventHandler[] = [];
   private autoTradingEnabled = true;
   private mode: 'demo' | 'live' = 'demo';
+  /** Live broker (Coinbase) — initialised when live mode is active and creds are configured. */
+  private liveAccount: CryptoLiveAccount | null = null;
+  /** Last settings snapshot — kept so applySettings can re-evaluate live broker creds. */
+  private currentSettings: AccountSettings | undefined;
 
   constructor(tracker?: PnlTracker, settings?: AccountSettings) {
     this.tracker = tracker;
+    this.currentSettings = settings;
     this.mode = settings?.mode === 'live' ? 'live' : 'demo';
     // Demo state is always loaded internally so a live → demo switch can
     // restore equity, positions, and dailyPnl without rebasing to the default
@@ -56,6 +62,44 @@ export class CryptoSignalEngine {
     this.account = new CryptoPaperAccount(currentEquity, openingEquityToday);
     // Set the canonical initialEquity baseline so allTimePnl reflects the user's setting.
     this.account.applyEquity(initialEquity);
+    if (this.mode === 'live') this.tryInitLiveBroker();
+  }
+
+  /**
+   * Build a CryptoLiveAccount from settings/env credentials. Returns null if
+   * Coinbase isn't selected or credentials are missing — callers should fall
+   * back to the (frozen) demo account view.
+   *
+   * Credential precedence: per-user settings > env vars. Env vars exist so
+   * operators can configure a single shared broker (single-user installs) or
+   * inject secrets without persisting them in settings.json.
+   */
+  private buildLiveBroker(): CryptoLiveAccount | null {
+    const s = this.currentSettings;
+    if (s && s.liveBrokerageType && s.liveBrokerageType !== 'coinbase') return null;
+    const apiKey = (s?.liveApiKey?.trim() || process.env.COINBASE_API_KEY || '').trim();
+    const apiSecret = (s?.liveApiSecret?.trim() || process.env.COINBASE_API_SECRET || '').trim();
+    if (!apiKey || !apiSecret) return null;
+    try {
+      const client = new CoinbaseOrderClient({ apiKey, apiSecret });
+      return new CryptoLiveAccount(client);
+    } catch (err: unknown) {
+      console.warn('[crypto-engine] Coinbase init failed:', err instanceof Error ? err.message : String(err));
+      return null;
+    }
+  }
+
+  private tryInitLiveBroker(): void {
+    if (this.liveAccount) return;
+    const broker = this.buildLiveBroker();
+    if (broker) {
+      this.liveAccount = broker;
+      console.log('[crypto-engine] Coinbase live broker initialised — live trading active.');
+      // Kick off an initial balance refresh so the first tick has cash data.
+      void broker.refreshBalance();
+    } else {
+      console.warn('[crypto-engine] live mode active but Coinbase credentials not configured — orders will not be sent.');
+    }
   }
 
   /**
@@ -66,12 +110,19 @@ export class CryptoSignalEngine {
    * The new equity is persisted via the tracker so it survives a server restart.
    */
   applySettings(settings: AccountSettings): void {
+    this.currentSettings = settings;
     this.mode = settings.mode === 'live' ? 'live' : 'demo';
     if (this.mode === 'live') {
-      // Live mode: leave account/tracker untouched so the demo state is
-      // preserved for a later switch back.
+      // Live mode: leave the demo account/tracker untouched so the demo state
+      // is preserved for a later switch back. Re-initialise the live broker so
+      // newly entered Coinbase credentials take effect without a server restart.
+      this.liveAccount = null;
+      this.tryInitLiveBroker();
       return;
     }
+    // Switching back to demo — drop the live broker so we don't keep refreshing
+    // Coinbase balances in the background.
+    this.liveAccount = null;
     const targetEquity = settings.demoEquityCrypto ?? settings.demoEquity;
     this.account.applyEquity(targetEquity);
     if (this.tracker) {
@@ -209,10 +260,14 @@ export class CryptoSignalEngine {
       for (const h of this.handlers) h(earlyState);
     }
 
-    // Live mode: keep market data flowing so the UI shows live quotes, but
-    // freeze the demo account — no new positions, no exits. This way the demo
-    // state the user left is exactly what they see when they switch back.
+    // Live mode: keep market data flowing so the UI shows live quotes. If a
+    // Coinbase live broker is configured, route signals/exits through it. If
+    // not, freeze in place — the demo state the user left is exactly what they
+    // see when they switch back.
     if (this.mode === 'live') {
+      if (this.liveAccount) {
+        await this.runLiveTick(prices, activeSymbols);
+      }
       for (const h of this.handlers) h(this.buildState());
       return;
     }
@@ -295,6 +350,77 @@ export class CryptoSignalEngine {
     for (const h of this.handlers) h(state);
   }
 
+  /**
+   * Live-mode tick: refresh Coinbase balance if stale, exit positions whose
+   * TP/SL was hit, then evaluate strategies and open new positions on
+   * Coinbase. Mirrors the demo-mode flow but every order hits the broker.
+   */
+  private async runLiveTick(prices: Map<string, number>, activeSymbols: string[]): Promise<void> {
+    const live = this.liveAccount;
+    if (!live) return;
+
+    if (live.isStale()) {
+      await live.refreshBalance();
+    }
+
+    try {
+      const closed = await live.checkExits(prices);
+      if (closed.length > 0) {
+        this.allClosedPositions.push(...closed);
+      }
+    } catch (err: unknown) {
+      console.warn('[crypto-engine] live exits error:', err instanceof Error ? err.message : String(err));
+    }
+
+    if (!this.autoTradingEnabled) return;
+
+    // Refresh candle caches so live mode evaluates strategies on fresh bars.
+    const CANDLE_BATCH = 5;
+    for (let i = 0; i < activeSymbols.length; i += CANDLE_BATCH) {
+      await Promise.all(
+        activeSymbols.slice(i, i + CANDLE_BATCH).map(sym => this.refreshCandles(sym)),
+      );
+      await Promise.all(
+        activeSymbols.slice(i, i + CANDLE_BATCH).map(sym => this.refreshDailyCandles(sym)),
+      );
+    }
+
+    for (const sym of activeSymbols) {
+      const candles = this.candleCache.get(sym) ?? [];
+      const dailyCandles = this.dailyCandleCache.get(sym) ?? [];
+
+      const reversalSignal = candles.length >= CryptoSignalEngine.MIN_BARS_REVERSAL
+        ? this.reversal.evaluate(sym, candles) : null;
+      const macdSignal = candles.length >= CryptoSignalEngine.MIN_BARS_MACD
+        ? this.macdBollinger.evaluate(sym, candles) : null;
+      const scalpingSignal = candles.length >= CryptoSignalEngine.MIN_BARS_SCALPING
+        ? this.scalping.evaluate(sym, candles) : null;
+      const swingSignal = dailyCandles.length >= 205
+        ? this.swing.evaluate(sym, dailyCandles) : null;
+
+      for (const signal of [reversalSignal, macdSignal, scalpingSignal, swingSignal]) {
+        if (!signal) continue;
+        if (live.hasOpenPositionForSignalType(sym, signal.type)) continue;
+        const recent = this.recentSignals.find(
+          s => s.symbol === signal.symbol && s.type === signal.type && Date.now() - s.timestamp < 5 * 60_000,
+        );
+        if (recent) continue;
+
+        const price = prices.get(sym);
+        if (!price) continue;
+
+        this.recentSignals.unshift(signal);
+        if (this.recentSignals.length > MAX_SIGNALS) this.recentSignals.pop();
+
+        try {
+          await live.openPosition(signal, price);
+        } catch (err: unknown) {
+          console.warn(`[crypto-engine] live open failed for ${sym}: ${err instanceof Error ? err.message : String(err)}`);
+        }
+      }
+    }
+  }
+
   private async refreshCandles(symbol: string): Promise<void> {
     const bars = await fetchCryptoMinuteBars(symbol, 80);
     if (bars.length > 0) this.candleCache.set(symbol, bars);
@@ -315,9 +441,32 @@ export class CryptoSignalEngine {
   private buildState(): CryptoEngineState {
     const symbols = Array.from(this.symbolState.values()).filter(s => !this.hiddenSymbols.has(s.symbol));
     if (this.mode === 'live') {
-      // Live mode: no broker is connected, so account and positions display
-      // as zero/empty. The internal demo state stays preserved for a later
-      // switch back to demo.
+      // Live mode: if a Coinbase broker is configured, surface its USD-equivalent
+      // cash plus the positions we've opened in this session. Otherwise show a
+      // zero/empty account; the internal demo state stays preserved.
+      if (this.liveAccount) {
+        const ls = this.liveAccount.getState();
+        const account: AccountState = {
+          totalEquity: ls.totalEquity,
+          availableCash: ls.availableCash,
+          openPositions: ls.openPositions,
+          dailyPnl: ls.dailyPnl,
+          weeklyPnl: 0,
+          monthlyPnl: 0,
+          yearlyPnl: 0,
+          allTimePnl: 0,
+        };
+        return {
+          symbols,
+          signals: [...this.recentSignals],
+          account,
+          closedPositions: [...this.allClosedPositions].slice(-20),
+          news: [...this.newsCache],
+          lastTick: Date.now(),
+          autoTradingEnabled: this.autoTradingEnabled,
+          marketOpen: true as const,
+        };
+      }
       const account: AccountState = {
         totalEquity: 0,
         availableCash: 0,
@@ -366,6 +515,20 @@ export class CryptoSignalEngine {
   }
 
   manualClosePosition(positionId: string, currentPrice: number): Position | null {
+    if (this.mode === 'live' && this.liveAccount) {
+      // Route the close through Coinbase. We resolve synchronously from the
+      // existing API contract, but the actual order is fired-and-forgotten;
+      // failures are surfaced via console + persist into the next tick view.
+      const live = this.liveAccount;
+      void live.closePosition(positionId, currentPrice).then(closed => {
+        if (closed) this.allClosedPositions.push(closed);
+      }).catch(err => {
+        console.warn(`[crypto-engine] manualClose live failed: ${err instanceof Error ? err.message : String(err)}`);
+      });
+      // Synchronous response: optimistic close — the live broker will reconcile.
+      const snapshot = live.getState().openPositions.find(p => p.id === positionId) ?? null;
+      return snapshot ? { ...snapshot, exitPrice: currentPrice, closedAt: Date.now() } : null;
+    }
     const closed = this.account.closePosition(positionId, currentPrice);
     if (closed) {
       this.allClosedPositions.push(closed);

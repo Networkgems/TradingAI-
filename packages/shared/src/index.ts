@@ -78,6 +78,12 @@ export interface AccountSettings {
   liveBrokerageType?: BrokerageType;
   liveTradeMode?: LiveTradeMode;
   liveApiKey?: string;
+  /**
+   * API secret paired with `liveApiKey` (e.g. Coinbase Advanced Trade HMAC secret).
+   * Stored per-user; if blank, the server falls back to env vars
+   * (COINBASE_API_KEY / COINBASE_API_SECRET) when initialising the live broker.
+   */
+  liveApiSecret?: string;
   liveAccountId?: string;
 }
 
@@ -94,6 +100,7 @@ export const DEFAULT_ACCOUNT_SETTINGS: AccountSettings = {
   liveBrokerageType: 'webull',
   liveTradeMode: 'ai_in_brokerage',
   liveApiKey: '',
+  liveApiSecret: '',
   liveAccountId: '',
 };
 export const WATCHLIST_SIZE = 25;

@@ -723,6 +723,18 @@ export default function SettingsPage({ token, httpUrl, context, onModeChange }: 
                 />
               </div>
 
+              {context === 'crypto' && (
+                <div className="settings-field">
+                  <label>API Secret</label>
+                  <PasswordInput
+                    value={settings.liveApiSecret ?? ''}
+                    onChange={v => set('liveApiSecret', v)}
+                    placeholder="Enter your Coinbase API secret"
+                    autoComplete="off"
+                  />
+                </div>
+              )}
+
               <div className="settings-field">
                 <label>Account ID</label>
                 <input
@@ -767,7 +779,15 @@ export default function SettingsPage({ token, httpUrl, context, onModeChange }: 
             </div>
 
             <div className="live-notice">
-              <strong>Live trading is not yet active.</strong> Connect your brokerage credentials above and save — the integration will be enabled in a future update.
+              {context === 'crypto' ? (
+                <>
+                  <strong>Live Coinbase trading is enabled.</strong> Once you save valid API credentials and switch the account to <em>Live</em>, the engine routes new signals to Coinbase using market orders. Make sure the API key has trade permissions on your Coinbase Advanced Trade account.
+                </>
+              ) : (
+                <>
+                  <strong>Live trading is not yet active.</strong> Connect your brokerage credentials above and save — the integration will be enabled in a future update.
+                </>
+              )}
             </div>
           </section>
         )}

@@ -26,5 +26,13 @@ export type {
   TradierOptionsContract,
   TradierOptionQuote,
 } from './tradier/index.js';
+export { CoinbaseOrderClient } from './coinbase/index.js';
+export type {
+  CoinbaseOrderClientOptions,
+  CoinbaseAccountBalance,
+  CoinbaseOrderSuccessResponse,
+  MarketOrderParams as CoinbaseMarketOrderParams,
+  LimitOrderParams as CoinbaseLimitOrderParams,
+} from './coinbase/index.js';
 export { rsi, rsiDivergence, VwapTracker, detectPattern, isBullishPattern, isBearishPattern, adx, ema, emaCross } from './indicators/index.js';
 export type { VwapState, CandlePattern, AdxResult } from './indicators/index.js';
