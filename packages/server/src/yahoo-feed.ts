@@ -116,8 +116,21 @@ interface FinnhubCandleResponse {
   t?: number[];
 }
 
-async function fetchFinnhubMinuteBars(symbol: string, count: number): Promise<Candle[]> {
-  if (!FINNHUB_API_KEY) return [];
+export interface FinnhubCandleDiag {
+  reason: 'no_key' | 'http_error' | 'no_data' | 'parse_error' | 'fetch_error' | 'ok';
+  httpStatus?: number;
+  s?: string;
+  rawLen?: number;
+  filteredLen?: number;
+  errorBody?: string;
+  errorMsg?: string;
+}
+
+async function fetchFinnhubMinuteBars(
+  symbol: string,
+  count: number,
+): Promise<{ bars: Candle[]; diag: FinnhubCandleDiag }> {
+  if (!FINNHUB_API_KEY) return { bars: [], diag: { reason: 'no_key' } };
   const nowSec = Math.floor(Date.now() / 1000);
   // 2× window to absorb gaps from off-hours / illiquid minutes, matching Yahoo's branch.
   const fromSec = nowSec - count * 60 * 2;
@@ -125,12 +138,13 @@ async function fetchFinnhubMinuteBars(symbol: string, count: number): Promise<Ca
     const url = `${FINNHUB_BASE}/stock/candle?symbol=${encodeURIComponent(symbol)}&resolution=1&from=${fromSec}&to=${nowSec}&token=${FINNHUB_API_KEY}`;
     const resp = await withTimeout(fetch(url), YF_CALL_TIMEOUT_MS, `finnhub candle(${symbol})`);
     if (!resp.ok) {
-      console.warn(`[yahoo-feed] finnhub candle(${symbol}) HTTP ${resp.status}`);
-      return [];
+      const errorBody = await resp.text().catch(() => '');
+      console.warn(`[yahoo-feed] finnhub candle(${symbol}) HTTP ${resp.status}: ${errorBody.slice(0, 200)}`);
+      return { bars: [], diag: { reason: 'http_error', httpStatus: resp.status, errorBody: errorBody.slice(0, 200) } };
     }
     const json = (await resp.json()) as FinnhubCandleResponse;
     if (!json || json.s !== 'ok' || !json.t || !json.o || !json.h || !json.l || !json.c || !json.v) {
-      return [];
+      return { bars: [], diag: { reason: 'no_data', httpStatus: resp.status, s: json?.s, rawLen: json?.t?.length ?? 0 } };
     }
     const len = json.t.length;
     const currentMinuteStart = Math.floor(Date.now() / 60_000) * 60_000;
@@ -147,10 +161,12 @@ async function fetchFinnhubMinuteBars(symbol: string, count: number): Promise<Ca
       if (ts >= currentMinuteStart) continue; // drop in-progress bar, like Yahoo branch
       candles.push({ symbol, timestamp: ts, open: o, high: h, low: l, close: c, volume: v });
     }
-    return candles.slice(-count);
+    const sliced = candles.slice(-count);
+    return { bars: sliced, diag: { reason: 'ok', httpStatus: resp.status, s: json.s, rawLen: len, filteredLen: sliced.length } };
   } catch (err: unknown) {
-    console.warn(`[yahoo-feed] finnhub candle(${symbol}) error: ${err instanceof Error ? err.message : String(err)}`);
-    return [];
+    const msg = err instanceof Error ? err.message : String(err);
+    console.warn(`[yahoo-feed] finnhub candle(${symbol}) error: ${msg}`);
+    return { bars: [], diag: { reason: 'fetch_error', errorMsg: msg } };
   }
 }
 
@@ -175,12 +191,13 @@ export async function fetchMinuteBars(symbol: string, count = 60): Promise<Candl
 export async function fetchMinuteBarsWithSource(
   symbol: string,
   count = 60,
-): Promise<{ bars: Candle[]; source: 'yahoo' | 'finnhub' | 'none' }> {
+): Promise<{ bars: Candle[]; source: 'yahoo' | 'finnhub' | 'none'; yahooSkipped: boolean; finnhubDiag?: FinnhubCandleDiag }> {
   const now = new Date();
   const from = new Date(now.getTime() - count * 60 * 1000 * 2); // 2× window to guarantee enough bars
   // Drop the in-progress current-minute bar (partial volume skews volume-climax checks).
   const currentMinuteStart = Math.floor(now.getTime() / 60_000) * 60_000;
 
+  const yahooSkipped = isRateLimited();
   // withRetry returns null when the breaker is open, so Yahoo is skipped fast.
   const result = await withRetry(
     () => yf.chart(symbol, { period1: from, period2: now, interval: '1m' }),
@@ -203,14 +220,14 @@ export async function fetchMinuteBarsWithSource(
         .slice(-count)
     : [];
 
-  if (yahooBars.length > 0) return { bars: yahooBars, source: 'yahoo' };
+  if (yahooBars.length > 0) return { bars: yahooBars, source: 'yahoo', yahooSkipped };
 
-  const finnhubBars = await fetchFinnhubMinuteBars(symbol, count);
-  if (finnhubBars.length > 0) {
-    console.info(`[yahoo-feed] chart(${symbol}): served ${finnhubBars.length} bars from Finnhub fallback`);
-    return { bars: finnhubBars, source: 'finnhub' };
+  const finnhub = await fetchFinnhubMinuteBars(symbol, count);
+  if (finnhub.bars.length > 0) {
+    console.info(`[yahoo-feed] chart(${symbol}): served ${finnhub.bars.length} bars from Finnhub fallback`);
+    return { bars: finnhub.bars, source: 'finnhub', yahooSkipped, finnhubDiag: finnhub.diag };
   }
-  return { bars: [], source: 'none' };
+  return { bars: [], source: 'none', yahooSkipped, finnhubDiag: finnhub.diag };
 }
 
 /**

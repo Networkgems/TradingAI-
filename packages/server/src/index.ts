@@ -835,10 +835,18 @@ app.get('/api/health/quotes', async (_req, res) => {
 
   // TRA-148: probe the actual minute-bar path the signal engine uses, so QA can
   // confirm the Finnhub fallback engages while yahooBreakerOpen=true without
-  // grepping logs.
+  // grepping logs. TRA-147 follow-up: include yahooSkipped + finnhubDiag so QA
+  // can see *why* the fallback returned nothing (free-tier no-data, http error,
+  // etc.) without redeploying with extra logging.
   try {
     const probe = await fetchMinuteBarsWithSource('AAPL', 60);
-    results['chartFallback'] = { symbol: 'AAPL', bars: probe.bars.length, source: probe.source };
+    results['chartFallback'] = {
+      symbol: 'AAPL',
+      bars: probe.bars.length,
+      source: probe.source,
+      yahooSkipped: probe.yahooSkipped,
+      finnhubDiag: probe.finnhubDiag ?? null,
+    };
   } catch (err: unknown) {
     results['chartFallback'] = { error: err instanceof Error ? err.message : String(err) };
   }
