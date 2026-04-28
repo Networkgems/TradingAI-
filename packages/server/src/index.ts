@@ -1,7 +1,7 @@
 import express from 'express';
 import { createServer } from 'http';
 import { WebSocketServer, WebSocket } from 'ws';
-import { writeFile, readFile, readdir, mkdir } from 'fs/promises';
+import { writeFile, readFile, readdir, mkdir, stat } from 'fs/promises';
 import { existsSync } from 'fs';
 import { join, dirname } from 'path';
 import { fileURLToPath } from 'url';
@@ -258,6 +258,31 @@ async function generateAndSaveCryptoReport(): Promise<void> {
 
 app.get('/api/health', (_req, res) => {
   res.json({ ok: true, time: new Date().toISOString() });
+});
+
+// TRA-141 — production storage diagnostic. Confirms whether the persistent
+// disk is actually mounted at DATA_DIR and whether users.json /
+// account-settings.json survive container restarts. No PII is exposed.
+app.get('/api/health/storage', async (_req, res) => {
+  const usersFile = join(DATA_DIR, 'users.json');
+  const settingsFile = join(DATA_DIR, 'account-settings.json');
+  async function statFile(p: string) {
+    try {
+      const s = await stat(p);
+      return { exists: true, size: s.size, mtime: s.mtime.toISOString() };
+    } catch {
+      return { exists: false };
+    }
+  }
+  res.json({
+    dataDir: DATA_DIR,
+    dataDirEnv: process.env.DATA_DIR ?? null,
+    dataDir_exists: existsSync(DATA_DIR),
+    usersFile: await statFile(usersFile),
+    settingsFile: await statFile(settingsFile),
+    userCount: getAllUsers().length,
+    processStart: new Date(Date.now() - process.uptime() * 1000).toISOString(),
+  });
 });
 
 // ── Auth endpoints ────────────────────────────────────────────────────────────
