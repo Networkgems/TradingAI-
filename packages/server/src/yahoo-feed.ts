@@ -104,34 +104,113 @@ async function fetchFinnhubQuote(symbol: string): Promise<{ price: number; volum
   }
 }
 
-/** Fetch the last N 1-minute candles for a symbol from Yahoo Finance. */
+// Finnhub /stock/candle response: parallel arrays keyed by status `s`.
+// `s: 'ok'` with non-empty o/h/l/c/v/t arrays of equal length, `s: 'no_data'` otherwise.
+interface FinnhubCandleResponse {
+  s?: string;
+  o?: number[];
+  h?: number[];
+  l?: number[];
+  c?: number[];
+  v?: number[];
+  t?: number[];
+}
+
+async function fetchFinnhubMinuteBars(symbol: string, count: number): Promise<Candle[]> {
+  if (!FINNHUB_API_KEY) return [];
+  const nowSec = Math.floor(Date.now() / 1000);
+  // 2× window to absorb gaps from off-hours / illiquid minutes, matching Yahoo's branch.
+  const fromSec = nowSec - count * 60 * 2;
+  try {
+    const url = `${FINNHUB_BASE}/stock/candle?symbol=${encodeURIComponent(symbol)}&resolution=1&from=${fromSec}&to=${nowSec}&token=${FINNHUB_API_KEY}`;
+    const resp = await withTimeout(fetch(url), YF_CALL_TIMEOUT_MS, `finnhub candle(${symbol})`);
+    if (!resp.ok) {
+      console.warn(`[yahoo-feed] finnhub candle(${symbol}) HTTP ${resp.status}`);
+      return [];
+    }
+    const json = (await resp.json()) as FinnhubCandleResponse;
+    if (!json || json.s !== 'ok' || !json.t || !json.o || !json.h || !json.l || !json.c || !json.v) {
+      return [];
+    }
+    const len = json.t.length;
+    const currentMinuteStart = Math.floor(Date.now() / 60_000) * 60_000;
+    const candles: Candle[] = [];
+    for (let i = 0; i < len; i++) {
+      const ts = (json.t[i] ?? 0) * 1000;
+      const v = json.v[i] ?? 0;
+      const o = json.o[i];
+      const h = json.h[i];
+      const l = json.l[i];
+      const c = json.c[i];
+      if (o == null || h == null || l == null || c == null) continue;
+      if (v <= 0) continue;
+      if (ts >= currentMinuteStart) continue; // drop in-progress bar, like Yahoo branch
+      candles.push({ symbol, timestamp: ts, open: o, high: h, low: l, close: c, volume: v });
+    }
+    return candles.slice(-count);
+  } catch (err: unknown) {
+    console.warn(`[yahoo-feed] finnhub candle(${symbol}) error: ${err instanceof Error ? err.message : String(err)}`);
+    return [];
+  }
+}
+
+/**
+ * Fetch the last N 1-minute candles for a symbol.
+ *
+ * Yahoo Finance is the primary source. When the breaker is open (recent 429s) or
+ * Yahoo returns no usable bars, fall back to Finnhub's `/stock/candle`. Without
+ * this fallback the signal engine starves on indicator math whenever Yahoo
+ * rate-limits Render's egress IP and stops opening new stock auto-trades.
+ */
 export async function fetchMinuteBars(symbol: string, count = 60): Promise<Candle[]> {
+  const { bars } = await fetchMinuteBarsWithSource(symbol, count);
+  return bars;
+}
+
+/**
+ * Diagnostic variant of {@link fetchMinuteBars} that also reports which provider
+ * served the bars. Used by `/api/health/quotes` so QA can verify the Finnhub
+ * fallback is actually engaging when Yahoo's breaker is open.
+ */
+export async function fetchMinuteBarsWithSource(
+  symbol: string,
+  count = 60,
+): Promise<{ bars: Candle[]; source: 'yahoo' | 'finnhub' | 'none' }> {
   const now = new Date();
   const from = new Date(now.getTime() - count * 60 * 1000 * 2); // 2× window to guarantee enough bars
   // Drop the in-progress current-minute bar (partial volume skews volume-climax checks).
   const currentMinuteStart = Math.floor(now.getTime() / 60_000) * 60_000;
 
+  // withRetry returns null when the breaker is open, so Yahoo is skipped fast.
   const result = await withRetry(
     () => yf.chart(symbol, { period1: from, period2: now, interval: '1m' }),
     `chart(${symbol})`,
   );
-  if (!result) return [];
+  const yahooBars: Candle[] = result
+    ? (result.quotes ?? [])
+        .filter(q => q.open != null && q.high != null && q.low != null && q.close != null && q.volume != null)
+        .filter(q => (q.volume ?? 0) > 0)
+        .filter(q => new Date(q.date).getTime() < currentMinuteStart)
+        .map(q => ({
+          symbol,
+          timestamp: new Date(q.date).getTime(),
+          open: q.open!,
+          high: q.high!,
+          low: q.low!,
+          close: q.close!,
+          volume: q.volume!,
+        }))
+        .slice(-count)
+    : [];
 
-  const quotes = result.quotes ?? [];
-  return quotes
-    .filter(q => q.open != null && q.high != null && q.low != null && q.close != null && q.volume != null)
-    .filter(q => (q.volume ?? 0) > 0)                                // drop 0-volume gaps
-    .filter(q => new Date(q.date).getTime() < currentMinuteStart)   // drop in-progress bar
-    .map(q => ({
-      symbol,
-      timestamp: new Date(q.date).getTime(),
-      open: q.open!,
-      high: q.high!,
-      low: q.low!,
-      close: q.close!,
-      volume: q.volume!,
-    }))
-    .slice(-count);
+  if (yahooBars.length > 0) return { bars: yahooBars, source: 'yahoo' };
+
+  const finnhubBars = await fetchFinnhubMinuteBars(symbol, count);
+  if (finnhubBars.length > 0) {
+    console.info(`[yahoo-feed] chart(${symbol}): served ${finnhubBars.length} bars from Finnhub fallback`);
+    return { bars: finnhubBars, source: 'finnhub' };
+  }
+  return { bars: [], source: 'none' };
 }
 
 /**

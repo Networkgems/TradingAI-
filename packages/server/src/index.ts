@@ -809,7 +809,7 @@ app.post('/api/crypto/positions/:id/close', requireAuth, async (req, res) => {
 // ── Data-source health check ─────────────────────────────────────────────────
 
 app.get('/api/health/quotes', async (_req, res) => {
-  const { testYahooFinance, testFinnhub, isYahooBreakerOpen } = await import('./yahoo-feed.js');
+  const { testYahooFinance, testFinnhub, isYahooBreakerOpen, fetchMinuteBarsWithSource } = await import('./yahoo-feed.js');
   const { testCoinMarketCap } = await import('./crypto-feed.js');
   const results: Record<string, unknown> = {};
 
@@ -831,6 +831,16 @@ app.get('/api/health/quotes', async (_req, res) => {
     results['coinMarketCap'] = cmc ?? { skipped: 'CMC_API_KEY not set' };
   } catch (err: unknown) {
     results['coinMarketCap'] = { error: err instanceof Error ? err.message : String(err) };
+  }
+
+  // TRA-148: probe the actual minute-bar path the signal engine uses, so QA can
+  // confirm the Finnhub fallback engages while yahooBreakerOpen=true without
+  // grepping logs.
+  try {
+    const probe = await fetchMinuteBarsWithSource('AAPL', 60);
+    results['chartFallback'] = { symbol: 'AAPL', bars: probe.bars.length, source: probe.source };
+  } catch (err: unknown) {
+    results['chartFallback'] = { error: err instanceof Error ? err.message : String(err) };
   }
 
   const ok = (key: string) => {
