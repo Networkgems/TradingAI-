@@ -1,5 +1,6 @@
 import YahooFinance from 'yahoo-finance2';
 import type { Candle, NewsItem } from '@trading-app/shared';
+import { isYahooBreakerOpen } from './yahoo-feed.js';
 
 const yf = new YahooFinance({
   suppressNotices: ['yahooSurvey'],
@@ -19,6 +20,13 @@ function withTimeout<T>(p: Promise<T>, ms: number, label: string): Promise<T> {
       e => { clearTimeout(timer); reject(e); },
     );
   });
+}
+
+// Yahoo and crypto-feed share the same outbound IP, so a 429 on stock quotes also
+// applies to crypto quotes. Skip YF for crypto while the shared breaker is open and
+// fall straight through to CMC, instead of burning 8s per symbol on a doomed call.
+function shouldSkipYahoo(): boolean {
+  return isYahooBreakerOpen();
 }
 
 const CMC_API_KEY = process.env.CMC_API_KEY ?? '';
@@ -138,19 +146,21 @@ export async function fetchCryptoMinuteBars(symbol: string, count = 60): Promise
 export async function fetchCryptoQuote(
   symbol: string,
 ): Promise<{ price: number; volume: number; change: number; changePct: number } | null> {
-  try {
-    const q = await withTimeout(yf.quote(symbol), FEED_CALL_TIMEOUT_MS, `quote(${symbol})`);
-    if (q.regularMarketPrice != null) {
-      return {
-        price: q.regularMarketPrice,
-        volume: q.regularMarketVolume ?? 0,
-        change: q.regularMarketChange ?? 0,
-        changePct: q.regularMarketChangePercent ?? 0,
-      };
+  if (!shouldSkipYahoo()) {
+    try {
+      const q = await withTimeout(yf.quote(symbol), FEED_CALL_TIMEOUT_MS, `quote(${symbol})`);
+      if (q.regularMarketPrice != null) {
+        return {
+          price: q.regularMarketPrice,
+          volume: q.regularMarketVolume ?? 0,
+          change: q.regularMarketChange ?? 0,
+          changePct: q.regularMarketChangePercent ?? 0,
+        };
+      }
+      console.warn(`[crypto-feed] quote(${symbol}) returned no regularMarketPrice — trying CMC`);
+    } catch (err: unknown) {
+      console.warn(`[crypto-feed] quote(${symbol}) YF error: ${err instanceof Error ? err.message : String(err)} — trying CMC`);
     }
-    console.warn(`[crypto-feed] quote(${symbol}) returned no regularMarketPrice — trying CMC`);
-  } catch (err: unknown) {
-    console.warn(`[crypto-feed] quote(${symbol}) YF error: ${err instanceof Error ? err.message : String(err)} — trying CMC`);
   }
   const cmcResults = await fetchCMCBatchQuotes([symbol]);
   return cmcResults.get(symbol) ?? null;
@@ -162,33 +172,38 @@ export async function fetchCryptoQuotes(
   const results = new Map<string, { price: number; volume: number; change: number; changePct: number }>();
   const failed: string[] = [];
 
-  // Fetch in parallel batches so one slow Yahoo response doesn't stall the whole tick.
-  const QUOTE_BATCH = 5;
-  for (let i = 0; i < symbols.length; i += QUOTE_BATCH) {
-    const slice = symbols.slice(i, i + QUOTE_BATCH);
-    const settled = await Promise.all(slice.map(async sym => {
-      try {
-        const q = await withTimeout(yf.quote(sym), FEED_CALL_TIMEOUT_MS, `quote(${sym})`);
-        if (q.regularMarketPrice != null) {
-          return [sym, {
-            price: q.regularMarketPrice,
-            volume: q.regularMarketVolume ?? 0,
-            change: q.regularMarketChange ?? 0,
-            changePct: q.regularMarketChangePercent ?? 0,
-          }] as const;
+  if (shouldSkipYahoo()) {
+    // Yahoo breaker is open — every symbol goes straight to CMC fallback.
+    failed.push(...symbols);
+  } else {
+    // Fetch in parallel batches so one slow Yahoo response doesn't stall the whole tick.
+    const QUOTE_BATCH = 5;
+    for (let i = 0; i < symbols.length; i += QUOTE_BATCH) {
+      const slice = symbols.slice(i, i + QUOTE_BATCH);
+      const settled = await Promise.all(slice.map(async sym => {
+        try {
+          const q = await withTimeout(yf.quote(sym), FEED_CALL_TIMEOUT_MS, `quote(${sym})`);
+          if (q.regularMarketPrice != null) {
+            return [sym, {
+              price: q.regularMarketPrice,
+              volume: q.regularMarketVolume ?? 0,
+              change: q.regularMarketChange ?? 0,
+              changePct: q.regularMarketChangePercent ?? 0,
+            }] as const;
+          }
+          console.warn(`[crypto-feed] quote(${sym}) no regularMarketPrice — queuing CMC fallback`);
+          return [sym, null] as const;
+        } catch (err: unknown) {
+          console.warn(`[crypto-feed] quote(${sym}) YF error: ${err instanceof Error ? err.message : String(err)} — queuing CMC fallback`);
+          return [sym, null] as const;
         }
-        console.warn(`[crypto-feed] quote(${sym}) no regularMarketPrice — queuing CMC fallback`);
-        return [sym, null] as const;
-      } catch (err: unknown) {
-        console.warn(`[crypto-feed] quote(${sym}) YF error: ${err instanceof Error ? err.message : String(err)} — queuing CMC fallback`);
-        return [sym, null] as const;
+      }));
+      for (const [sym, q] of settled) {
+        if (q) results.set(sym, q);
+        else failed.push(sym);
       }
-    }));
-    for (const [sym, q] of settled) {
-      if (q) results.set(sym, q);
-      else failed.push(sym);
+      if (i + QUOTE_BATCH < symbols.length) await sleep(200);
     }
-    if (i + QUOTE_BATCH < symbols.length) await sleep(200);
   }
 
   if (failed.length > 0) {

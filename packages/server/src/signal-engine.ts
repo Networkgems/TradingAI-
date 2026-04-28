@@ -1,7 +1,7 @@
 import { OrbStrategy, ReversalStrategy, MacdBollingerStrategy, IchimokuStrategy } from '@trading-app/engine';
 import { WATCHLIST, MANAGED_ACCOUNT_RATIO, MAX_CONSECUTIVE_LOSSES, DAILY_DRAWDOWN_HALT_PCT, isStockMarketOpen } from '@trading-app/shared';
 import type { TradeSignal, Candle, OptionsAccountState, SignalType, Position, AccountSettings, AccountState, NewsItem } from '@trading-app/shared';
-import { fetchMinuteBars, fetchQuotes, fetchStocksNews } from './yahoo-feed.js';
+import { fetchMinuteBars, fetchQuotes, fetchStocksNews, isYahooBreakerOpen } from './yahoo-feed.js';
 import { PaperAccount } from './paper-account.js';
 import { PaperOptionsAccount } from './options-account.js';
 import type { DailySignalRecord } from './reports/eod-report.js';
@@ -14,6 +14,12 @@ export interface SymbolState {
   change: number;
   changePct: number;
   lastUpdated: number;
+  /**
+   * Why this symbol's quote is missing/stale. The watchlist UI uses this to render
+   * a useful state ("Quote unavailable — provider rate-limited") instead of a
+   * permanent "Loading…" spinner when upstream providers are down.
+   */
+  quoteStatus?: 'ok' | 'rate_limited' | 'unavailable';
 }
 
 export interface EngineState {
@@ -280,6 +286,23 @@ export class SignalEngine {
         change: q.change,
         changePct: q.changePct,
         lastUpdated: Date.now(),
+        quoteStatus: 'ok',
+      });
+    }
+    // For symbols we attempted but couldn't quote, surface a status so the watchlist
+    // UI can show "Quote unavailable" instead of a permanent "Loading…" spinner.
+    const breakerOpen = isYahooBreakerOpen();
+    for (const sym of activeSymbols) {
+      if (quotes.has(sym)) continue;
+      const prev = this.symbolState.get(sym);
+      this.symbolState.set(sym, {
+        symbol: sym,
+        price: prev?.price ?? 0,
+        volume: prev?.volume ?? 0,
+        change: prev?.change ?? 0,
+        changePct: prev?.changePct ?? 0,
+        lastUpdated: prev?.lastUpdated ?? 0,
+        quoteStatus: breakerOpen ? 'rate_limited' : 'unavailable',
       });
     }
 

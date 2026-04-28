@@ -708,7 +708,7 @@ app.post('/api/crypto/positions/:id/close', requireAuth, (req, res) => {
 // No auth required so it can be called from Render health checks.
 
 app.get('/api/health/quotes', async (_req, res) => {
-  const { testYahooFinance } = await import('./yahoo-feed.js');
+  const { testYahooFinance, testFinnhub, isYahooBreakerOpen } = await import('./yahoo-feed.js');
   const { testCoinMarketCap } = await import('./crypto-feed.js');
   const results: Record<string, unknown> = {};
 
@@ -719,14 +719,35 @@ app.get('/api/health/quotes', async (_req, res) => {
   }
 
   try {
+    const fh = await testFinnhub();
+    results['finnhub'] = fh ?? { skipped: 'FINNHUB_API_KEY not set' };
+  } catch (err: unknown) {
+    results['finnhub'] = { error: err instanceof Error ? err.message : String(err) };
+  }
+
+  try {
     const cmc = await testCoinMarketCap();
     results['coinMarketCap'] = cmc ?? { skipped: 'CMC_API_KEY not set' };
   } catch (err: unknown) {
     results['coinMarketCap'] = { error: err instanceof Error ? err.message : String(err) };
   }
 
-  const allOk = Object.values(results).every(v => v && typeof v === 'object' && !('error' in (v as object)));
-  res.status(allOk ? 200 : 502).json({ ok: allOk, results, ts: new Date().toISOString() });
+  // Healthy when at least one stock provider AND at least one crypto provider can serve quotes.
+  const ok = (key: string) => {
+    const v = results[key];
+    return v && typeof v === 'object' && !('error' in (v as object)) && !('skipped' in (v as object));
+  };
+  const stocksOk = ok('yahooFinance') || ok('finnhub');
+  const cryptoOk = ok('yahooFinance') || ok('coinMarketCap');
+  const allOk = stocksOk && cryptoOk;
+  res.status(allOk ? 200 : 502).json({
+    ok: allOk,
+    stocksOk,
+    cryptoOk,
+    yahooBreakerOpen: isYahooBreakerOpen(),
+    results,
+    ts: new Date().toISOString(),
+  });
 });
 
 // ── WebSocket ────────────────────────────────────────────────────────────────

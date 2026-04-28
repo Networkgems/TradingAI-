@@ -2,6 +2,7 @@ import { ReversalStrategy, MacdBollingerStrategy, ScalpingStrategy, SwingStrateg
 import { CRYPTO_WATCHLIST } from '@trading-app/shared';
 import type { TradeSignal, Candle, AccountState, Position, CryptoEngineState, NewsItem, AccountSettings } from '@trading-app/shared';
 import { fetchCryptoMinuteBars, fetchCryptoDailyBars, fetchCryptoQuotes, fetchCryptoNews } from './crypto-feed.js';
+import { isYahooBreakerOpen } from './yahoo-feed.js';
 import { CryptoPaperAccount } from './crypto-account.js';
 import type { PnlTracker } from './pnl-tracker.js';
 
@@ -177,6 +178,23 @@ export class CryptoSignalEngine {
         change: q.change,
         changePct: q.changePct,
         lastUpdated: Date.now(),
+        quoteStatus: 'ok',
+      });
+    }
+    // Symbols we attempted but couldn't quote → mark unavailable so the UI shows
+    // "Quote unavailable" instead of a permanent "Loading…" spinner.
+    const breakerOpen = isYahooBreakerOpen();
+    for (const sym of activeSymbols) {
+      if (quotes.has(sym)) continue;
+      const prev = this.symbolState.get(sym);
+      this.symbolState.set(sym, {
+        symbol: sym,
+        price: prev?.price ?? 0,
+        volume: prev?.volume ?? 0,
+        change: prev?.change ?? 0,
+        changePct: prev?.changePct ?? 0,
+        lastUpdated: prev?.lastUpdated ?? 0,
+        quoteStatus: breakerOpen ? 'rate_limited' : 'unavailable',
       });
     }
 

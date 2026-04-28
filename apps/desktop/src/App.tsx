@@ -444,7 +444,7 @@ function CryptoDashboard({ token, onBack, onLogout, onActivity }: { token: strin
                     <td className={s.lastUpdated === 0 ? 'muted' : s.change >= 0 ? 'green' : 'red'}>{s.lastUpdated === 0 ? '—' : fmtDollar(s.change)}</td>
                     <td className={s.lastUpdated === 0 ? 'muted' : s.changePct >= 0 ? 'green' : 'red'}>{s.lastUpdated === 0 ? '—' : fmtPct(s.changePct)}</td>
                     <td>{s.lastUpdated === 0 ? '—' : (s.volume / 1_000_000).toFixed(1) + 'M'}</td>
-                    <td className="muted">{s.lastUpdated === 0 ? 'Loading…' : timeAgo(s.lastUpdated)}</td>
+                    <td className="muted">{quoteStatusLabel(s)}</td>
                     <td><button className="watchlist-remove-btn" onClick={() => removeFromWatchlist(s.symbol)} title="Remove">&#xd7;</button></td>
                   </tr>
                 ))}
@@ -632,6 +632,18 @@ function timeAgo(ts: number) {
   if (secs < 60) return `${secs}s ago`;
   if (secs < 3600) return `${Math.floor(secs / 60)}m ago`;
   return `${Math.floor(secs / 3600)}h ago`;
+}
+
+/**
+ * Human-readable label for the watchlist "Updated" column. Surfaces upstream
+ * provider state so a rate-limited or down quote source shows actionable text
+ * instead of a perpetual "Loading…" spinner.
+ */
+function quoteStatusLabel(s: { lastUpdated: number; quoteStatus?: 'ok' | 'rate_limited' | 'unavailable' }): string {
+  if (s.quoteStatus === 'rate_limited') return 'Quote unavailable — provider rate-limited';
+  if (s.quoteStatus === 'unavailable') return 'Quote unavailable';
+  if (s.lastUpdated === 0) return 'Loading…';
+  return timeAgo(s.lastUpdated);
 }
 
 function formatTime(ts: number) {
@@ -1009,7 +1021,7 @@ function Dashboard({ token, onLogout, onGoHome, onActivity }: { token: string; o
                     <td className={s.lastUpdated === 0 ? 'muted' : s.change >= 0 ? 'green' : 'red'}>{s.lastUpdated === 0 ? '—' : fmtDollar(s.change)}</td>
                     <td className={s.lastUpdated === 0 ? 'muted' : s.changePct >= 0 ? 'green' : 'red'}>{s.lastUpdated === 0 ? '—' : fmtPct(s.changePct)}</td>
                     <td>{s.lastUpdated === 0 ? '—' : (s.volume / 1_000_000).toFixed(1) + 'M'}</td>
-                    <td className="muted">{s.lastUpdated === 0 ? 'Loading…' : timeAgo(s.lastUpdated)}</td>
+                    <td className="muted">{quoteStatusLabel(s)}</td>
                     <td><button className="watchlist-remove-btn" onClick={() => removeFromStocksWatchlist(s.symbol)} title="Remove">&#xd7;</button></td>
                   </tr>
                 ))}

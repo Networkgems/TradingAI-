@@ -33,3 +33,11 @@ services:
         sync: false
       - key: SMTP_FROM
         value: noreply@tradingai.app
+      # Crypto quote fallback — when set, CoinMarketCap serves quotes whenever the
+      # Yahoo Finance crypto path is rate-limited or returns no data.
+      - key: CMC_API_KEY
+        sync: false
+      # Stocks quote fallback — when set, Finnhub serves equity quotes whenever the
+      # Yahoo Finance crumb fetch hits 429s. Free tier (60 req/min) is sufficient.
+      - key: FINNHUB_API_KEY
+        sync: false

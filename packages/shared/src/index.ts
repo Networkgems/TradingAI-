@@ -250,6 +250,12 @@ export interface CryptoSymbolState {
   change: number;
   changePct: number;
   lastUpdated: number;
+  /**
+   * Why this symbol's quote is missing/stale. The watchlist UI uses this to render
+   * a useful state ("Quote unavailable — provider rate-limited") instead of a
+   * permanent "Loading…" spinner when upstream providers are down.
+   */
+  quoteStatus?: 'ok' | 'rate_limited' | 'unavailable';
 }
 
 export interface CryptoEngineState {
