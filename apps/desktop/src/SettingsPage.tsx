@@ -702,7 +702,12 @@ export default function SettingsPage({ token, httpUrl, context, onModeChange }: 
               <div className="settings-field">
                 <label>Brokerage</label>
                 <select
-                  value={settings.liveBrokerageType ?? (context === 'crypto' ? 'coinbase' : 'webull')}
+                  // Force the per-context broker so a legacy `liveBrokerageType`
+                  // (defaulted to 'webull' for older accounts) doesn't leave the
+                  // dropdown displaying the wrong broker for crypto. The single
+                  // shared field is fundamentally per-asset-class; the UI picks
+                  // the right one and onChange writes it back.
+                  value={context === 'crypto' ? 'coinbase' : 'webull'}
                   onChange={e => set('liveBrokerageType', e.target.value as BrokerageType)}
                 >
                   {context === 'crypto' ? (

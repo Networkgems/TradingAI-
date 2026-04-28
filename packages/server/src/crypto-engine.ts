@@ -66,9 +66,15 @@ export class CryptoSignalEngine {
   }
 
   /**
-   * Build a CryptoLiveAccount from settings/env credentials. Returns null if
-   * Coinbase isn't selected or credentials are missing — callers should fall
-   * back to the (frozen) demo account view.
+   * Build a CryptoLiveAccount from settings/env credentials. Returns null
+   * when credentials are absent — callers fall back to the frozen demo view.
+   *
+   * Coinbase is the only crypto broker this engine knows how to drive, so we
+   * intentionally do NOT gate on `settings.liveBrokerageType` here — that
+   * field is shared with the stocks engine (where it carries 'webull') and
+   * defaulted to 'webull' for legacy users (DEFAULT_ACCOUNT_SETTINGS), which
+   * would silently disable live crypto trading even with valid creds. The
+   * presence of Coinbase creds is the actual go-live signal.
    *
    * Credential precedence: per-user settings > env vars. Env vars exist so
    * operators can configure a single shared broker (single-user installs) or
@@ -76,7 +82,6 @@ export class CryptoSignalEngine {
    */
   private buildLiveBroker(): CryptoLiveAccount | null {
     const s = this.currentSettings;
-    if (s && s.liveBrokerageType && s.liveBrokerageType !== 'coinbase') return null;
     const apiKey = (s?.liveApiKey?.trim() || process.env.COINBASE_API_KEY || '').trim();
     const apiSecret = (s?.liveApiSecret?.trim() || process.env.COINBASE_API_SECRET || '').trim();
     if (!apiKey || !apiSecret) return null;
