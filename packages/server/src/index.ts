@@ -260,13 +260,11 @@ app.get('/api/health', (_req, res) => {
   res.json({ ok: true, time: new Date().toISOString() });
 });
 
-// TRA-141 — production storage diagnostic. Confirms whether the persistent
-// disk is actually mounted at DATA_DIR and whether users.json /
-// account-settings.json survive container restarts. No PII is exposed.
+// TRA-141 — storage diagnostic so QA can verify from outside the box that the
+// Render persistent disk is actually mounted and that user/settings/trade files
+// are surviving redeploys. No PII is exposed (only paths, sizes, mtimes, count).
 app.get('/api/health/storage', async (_req, res) => {
-  const usersFile = join(DATA_DIR, 'users.json');
-  const settingsFile = join(DATA_DIR, 'account-settings.json');
-  async function statFile(p: string) {
+  async function statFile(p: string): Promise<{ exists: boolean; size?: number; mtime?: string }> {
     try {
       const s = await stat(p);
       return { exists: true, size: s.size, mtime: s.mtime.toISOString() };
@@ -274,12 +272,27 @@ app.get('/api/health/storage', async (_req, res) => {
       return { exists: false };
     }
   }
+  const usersFile = join(DATA_DIR, 'users.json');
+  const settingsFile = join(DATA_DIR, 'account-settings.json');
+  const tradesStocksFile = join(DATA_DIR, 'trades-stocks.json');
+  const tradesCryptoFile = join(DATA_DIR, 'trades-crypto.json');
+  const backupsDir = join(DATA_DIR, 'backups');
+  let backupsCount = 0;
+  try {
+    backupsCount = (await readdir(backupsDir)).length;
+  } catch {
+    backupsCount = 0;
+  }
   res.json({
     dataDir: DATA_DIR,
-    dataDirEnv: process.env.DATA_DIR ?? null,
+    dataDirEnv: process.env['DATA_DIR'] ?? null,
     dataDir_exists: existsSync(DATA_DIR),
     usersFile: await statFile(usersFile),
     settingsFile: await statFile(settingsFile),
+    tradesStocksFile: await statFile(tradesStocksFile),
+    tradesCryptoFile: await statFile(tradesCryptoFile),
+    backupsDir_exists: existsSync(backupsDir),
+    backupsCount,
     userCount: getAllUsers().length,
     processStart: new Date(Date.now() - process.uptime() * 1000).toISOString(),
   });
