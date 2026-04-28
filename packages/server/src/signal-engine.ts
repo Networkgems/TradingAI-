@@ -178,10 +178,14 @@ export class SignalEngine {
     if (this.tracker) {
       const newInitial = settings.mode === 'live' ? 0 : (settings.demoEquityStocks ?? settings.demoEquity);
       this.tracker.setInitialEquity(newInitial);
+      const accountState = this.account.getState();
       this.tracker.saveEquity(
-        this.account.getState().totalEquity,
+        accountState.totalEquity,
         this.optionsAccount.getState().optionsPnl,
       );
+      // Realign persisted openingEquity so a server restart doesn't synthesize
+      // phantom dailyPnl from the equity rebase (TRA-138 follow-up).
+      this.tracker.syncOpeningEquity(accountState.totalEquity, accountState.dailyPnl);
     }
   }
 
@@ -209,6 +213,9 @@ export class SignalEngine {
     if (this.tracker) {
       this.tracker.setInitialEquity(equity);
       this.tracker.saveEquity(equity, this.optionsAccount.getState().optionsPnl);
+      // Hard-reset openingEquity to the new starting balance so a post-reset
+      // restart reports dailyPnl = 0 (TRA-138 follow-up).
+      this.tracker.syncOpeningEquity(equity, 0);
     }
   }
 

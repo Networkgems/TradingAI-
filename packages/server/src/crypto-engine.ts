@@ -70,7 +70,11 @@ export class CryptoSignalEngine {
     if (this.tracker) {
       const newInitial = settings.mode === 'live' ? 0 : (settings.demoEquityCrypto ?? settings.demoEquity);
       this.tracker.setInitialEquity(newInitial);
-      this.tracker.saveEquity(this.account.getEquity(), 0);
+      const accountState = this.account.getState();
+      this.tracker.saveEquity(accountState.totalEquity, 0);
+      // Realign persisted openingEquity so a server restart doesn't synthesize
+      // phantom dailyPnl from the equity rebase (TRA-138 follow-up).
+      this.tracker.syncOpeningEquity(accountState.totalEquity, accountState.dailyPnl);
     }
   }
 
@@ -86,6 +90,9 @@ export class CryptoSignalEngine {
     if (this.tracker) {
       this.tracker.setInitialEquity(equity);
       this.tracker.saveEquity(equity, 0);
+      // Hard-reset openingEquity to the new starting balance so a post-reset
+      // restart reports dailyPnl = 0 (TRA-138 follow-up).
+      this.tracker.syncOpeningEquity(equity, 0);
     }
   }
 

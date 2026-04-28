@@ -129,6 +129,19 @@ export class PnlTracker {
     this.persistState();
   }
 
+  /**
+   * Realign persisted openingEquity to match the in-memory state after an
+   * equity rebase (settings save, mode switch, or forceReset). On the next
+   * restart, dailyPnl is reseeded as `equity - openingEquity`; without this
+   * sync, a stale openingEquity makes the equity rebase show up as phantom
+   * daily P&L. Pass the current totalEquity and dailyPnl from the in-memory
+   * account; openingEquity is set to their difference.
+   */
+  syncOpeningEquity(currentEquity: number, dailyPnl: number): void {
+    this.state.openingEquity = currentEquity - dailyPnl;
+    this.persistState();
+  }
+
   saveSnapshot(snapshot: DailySnapshot): void {
     this.snapshots = this.snapshots.filter(s => s.date !== snapshot.date);
     this.snapshots.push(snapshot);
