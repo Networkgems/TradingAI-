@@ -1,4 +1,5 @@
 import type { OptionType } from '@trading-app/shared';
+import type { OptionChainRow } from '../options/otm-mispricing.js';
 import { TradierOrderClient, type TradierEnv, type TradierOrderResponse } from './order-client.js';
 
 export interface TradierOptionsContract {
@@ -41,6 +42,24 @@ interface TradierRawOption {
   strike: number;
   expiration_date: string;
   expiration_type?: string;
+  bid?: number;
+  ask?: number;
+  last?: number;
+  volume?: number;
+  open_interest?: number;
+  greeks?: TradierRawGreeks | null;
+}
+
+interface TradierRawGreeks {
+  delta?: number;
+  gamma?: number;
+  theta?: number;
+  vega?: number;
+  rho?: number;
+  bid_iv?: number;
+  mid_iv?: number;
+  ask_iv?: number;
+  smv_vol?: number;
 }
 
 interface TradierRawQuote {
@@ -101,6 +120,38 @@ export class TradierOptionsClient extends TradierOrderClient {
       strike: o.strike,
       expiration_date: o.expiration_date,
       expiration_type: o.expiration_type,
+    }));
+  }
+
+  /**
+   * Fetch the chain with greeks/quotes and project it into the shape the OTM
+   * mispricing scanner expects (TRA-158). Forces `greeks=true` so `mid_iv`
+   * and `smv_vol` are populated when available.
+   */
+  async getChainSnapshot(
+    underlyingSymbol: string,
+    expiration: string,
+  ): Promise<OptionChainRow[]> {
+    const params = new URLSearchParams({
+      symbol: underlyingSymbol,
+      expiration,
+      greeks: 'true',
+    });
+    const data = await this.getJson<TradierChainEnvelope>(`/markets/options/chains?${params}`);
+    if (!data || typeof data.options !== 'object' || data.options == null) return [];
+    return asArray(data.options.option).map((o) => ({
+      optionSymbol: o.symbol,
+      underlying: o.underlying,
+      optionType: o.option_type,
+      strike: o.strike,
+      expiration: o.expiration_date,
+      bid: typeof o.bid === 'number' ? o.bid : undefined,
+      ask: typeof o.ask === 'number' ? o.ask : undefined,
+      last: typeof o.last === 'number' ? o.last : undefined,
+      volume: typeof o.volume === 'number' ? o.volume : undefined,
+      openInterest: typeof o.open_interest === 'number' ? o.open_interest : undefined,
+      midIv: o.greeks?.mid_iv && o.greeks.mid_iv > 0 ? o.greeks.mid_iv : undefined,
+      smvVol: o.greeks?.smv_vol && o.greeks.smv_vol > 0 ? o.greeks.smv_vol : undefined,
     }));
   }
 

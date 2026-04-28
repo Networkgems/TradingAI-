@@ -228,6 +228,73 @@ describe('TradierOptionsClient.findATMContract', () => {
   });
 });
 
+describe('TradierOptionsClient.getChainSnapshot', () => {
+  it('forces greeks=true and projects rows into OptionChainRow shape', async () => {
+    fetchMock.mockResolvedValueOnce(
+      jsonResponse({
+        options: {
+          option: [
+            {
+              symbol: 'AAPL260515C00150000',
+              underlying: 'AAPL',
+              description: 'd',
+              option_type: 'call',
+              strike: 150,
+              expiration_date: '2026-05-15',
+              bid: 1.20,
+              ask: 1.30,
+              last: 1.25,
+              volume: 12,
+              open_interest: 345,
+              greeks: { mid_iv: 0.28, smv_vol: 0.27 },
+            },
+            {
+              symbol: 'AAPL260515P00150000',
+              underlying: 'AAPL',
+              description: 'd',
+              option_type: 'put',
+              strike: 150,
+              expiration_date: '2026-05-15',
+              bid: 0,
+              ask: 0,
+              greeks: null,
+            },
+          ],
+        },
+      }),
+    );
+
+    const client = new TradierOptionsClient('tok', 'A1');
+    const rows = await client.getChainSnapshot('AAPL', '2026-05-15');
+
+    expect(callUrl(0)).toContain('greeks=true');
+    expect(callUrl(0)).toContain('expiration=2026-05-15');
+    expect(rows).toHaveLength(2);
+
+    expect(rows[0]).toMatchObject({
+      optionSymbol: 'AAPL260515C00150000',
+      optionType: 'call',
+      strike: 150,
+      expiration: '2026-05-15',
+      bid: 1.20,
+      ask: 1.30,
+      openInterest: 345,
+      midIv: 0.28,
+      smvVol: 0.27,
+    });
+
+    // Missing greeks → midIv/smvVol omitted, not zeroed.
+    expect(rows[1].midIv).toBeUndefined();
+    expect(rows[1].smvVol).toBeUndefined();
+  });
+
+  it('returns an empty array when chain payload is empty', async () => {
+    fetchMock.mockResolvedValueOnce(jsonResponse({ options: null }));
+    const client = new TradierOptionsClient('tok', 'A1');
+    expect(await client.getChainSnapshot('AAPL', '2026-05-15')).toEqual([]);
+  });
+});
+
 describe('TradierOptionsClient.getOptionMid', () => {
   it('returns mid of bid and ask', async () => {
     fetchMock.mockResolvedValueOnce(

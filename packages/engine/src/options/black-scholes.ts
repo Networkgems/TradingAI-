@@ -1,0 +1,88 @@
+import type { OptionType } from '@trading-app/shared';
+
+export interface BlackScholesInputs {
+  spot: number;             // S — underlying price
+  strike: number;           // K — strike
+  timeToExpiryYears: number;// T — years (e.g. 21/365)
+  riskFreeRate: number;     // r — annualized (e.g. 0.045)
+  volatility: number;       // σ — annualized IV (e.g. 0.30)
+  optionType: OptionType;
+  /** Continuous dividend yield (default 0). */
+  dividendYield?: number;
+}
+
+const SQRT_2 = Math.SQRT2;
+
+/**
+ * Abramowitz & Stegun 7.1.26 — max error ≈ 1.5e-7. Sufficient for option pricing.
+ */
+function erf(x: number): number {
+  const sign = x < 0 ? -1 : 1;
+  const ax = Math.abs(x);
+  const t = 1 / (1 + 0.3275911 * ax);
+  const y =
+    1 -
+    ((((1.061405429 * t - 1.453152027) * t + 1.421413741) * t - 0.284496736) * t + 0.254829592) *
+      t *
+      Math.exp(-ax * ax);
+  return sign * y;
+}
+
+function normCdf(x: number): number {
+  return 0.5 * (1 + erf(x / SQRT_2));
+}
+
+/**
+ * Black-Scholes-Merton fair price for a European option (with continuous dividend yield).
+ *
+ * For T ≤ 0 returns intrinsic value. For σ ≤ 0 returns the discounted forward intrinsic.
+ * Caller is responsible for converting calendar days to years (T = days / 365).
+ */
+export function blackScholesPrice(inputs: BlackScholesInputs): number {
+  const { spot, strike, timeToExpiryYears: T, riskFreeRate: r, volatility: sigma, optionType } = inputs;
+  const q = inputs.dividendYield ?? 0;
+
+  if (spot <= 0 || strike <= 0) return 0;
+
+  if (T <= 0) {
+    return optionType === 'call' ? Math.max(spot - strike, 0) : Math.max(strike - spot, 0);
+  }
+
+  if (sigma <= 0) {
+    const forward = spot * Math.exp((r - q) * T);
+    const intrinsic =
+      optionType === 'call' ? Math.max(forward - strike, 0) : Math.max(strike - forward, 0);
+    return intrinsic * Math.exp(-r * T);
+  }
+
+  const sqrtT = Math.sqrt(T);
+  const d1 = (Math.log(spot / strike) + (r - q + 0.5 * sigma * sigma) * T) / (sigma * sqrtT);
+  const d2 = d1 - sigma * sqrtT;
+
+  if (optionType === 'call') {
+    return spot * Math.exp(-q * T) * normCdf(d1) - strike * Math.exp(-r * T) * normCdf(d2);
+  }
+  return strike * Math.exp(-r * T) * normCdf(-d2) - spot * Math.exp(-q * T) * normCdf(-d1);
+}
+
+/** Black-Scholes delta (sensitivity of price to spot). */
+export function blackScholesDelta(inputs: BlackScholesInputs): number {
+  const { spot, strike, timeToExpiryYears: T, riskFreeRate: r, volatility: sigma, optionType } = inputs;
+  const q = inputs.dividendYield ?? 0;
+  if (spot <= 0 || strike <= 0 || T <= 0 || sigma <= 0) {
+    if (optionType === 'call') return spot > strike ? 1 : 0;
+    return spot < strike ? -1 : 0;
+  }
+  const sqrtT = Math.sqrt(T);
+  const d1 = (Math.log(spot / strike) + (r - q + 0.5 * sigma * sigma) * T) / (sigma * sqrtT);
+  return optionType === 'call'
+    ? Math.exp(-q * T) * normCdf(d1)
+    : Math.exp(-q * T) * (normCdf(d1) - 1);
+}
+
+/** Calendar days between an ISO `YYYY-MM-DD` expiry and `now` (defaults to current ms). */
+export function daysToExpiration(expirationIsoDate: string, nowMs = Date.now()): number {
+  const expMs = Date.parse(`${expirationIsoDate}T16:00:00-04:00`); // ~US market close ET
+  if (!Number.isFinite(expMs)) return 0;
+  return Math.max(0, (expMs - nowMs) / (24 * 60 * 60 * 1000));
+}
