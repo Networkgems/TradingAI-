@@ -1,4 +1,4 @@
-import { createHmac } from 'crypto';
+import { createHmac, createVerify, generateKeyPairSync } from 'crypto';
 import { describe, it, expect, beforeEach, vi } from 'vitest';
 
 import { CoinbaseOrderClient } from './order-client.js';
@@ -150,5 +150,122 @@ describe('CoinbaseOrderClient', () => {
       limit_price: '30000',
       post_only: true,
     });
+  });
+
+  it('reports the HMAC scheme when given a printable shared secret', () => {
+    expect(makeClient().getAuthScheme()).toBe('hmac');
+  });
+});
+
+// --- CDP / JWT auth path (TRA-157) ---------------------------------------
+
+const CDP_KID = 'organizations/abc/apiKeys/def';
+
+/** Generate a fresh P-256 EC keypair for each test run so we exercise the real crypto path. */
+function generateCdpKeypair(): { privatePem: string; publicPem: string } {
+  const { privateKey, publicKey } = generateKeyPairSync('ec', { namedCurve: 'P-256' });
+  return {
+    privatePem: privateKey.export({ type: 'pkcs8', format: 'pem' }) as string,
+    publicPem: publicKey.export({ type: 'spki', format: 'pem' }) as string,
+  };
+}
+
+function decodeJwtParts(jwt: string): { header: Record<string, unknown>; payload: Record<string, unknown>; signingInput: string; signature: Buffer } {
+  const [headerB64, payloadB64, sigB64] = jwt.split('.');
+  const fromB64Url = (s: string) => Buffer.from(s.replace(/-/g, '+').replace(/_/g, '/'), 'base64');
+  return {
+    header: JSON.parse(fromB64Url(headerB64).toString('utf8')),
+    payload: JSON.parse(fromB64Url(payloadB64).toString('utf8')),
+    signingInput: `${headerB64}.${payloadB64}`,
+    signature: fromB64Url(sigB64),
+  };
+}
+
+describe('CoinbaseOrderClient (CDP/JWT auth)', () => {
+  it('detects CDP credentials when the secret is a PEM private key', () => {
+    const { privatePem } = generateCdpKeypair();
+    const client = new CoinbaseOrderClient({ apiKey: CDP_KID, apiSecret: privatePem });
+    expect(client.getAuthScheme()).toBe('cdp');
+  });
+
+  it('rejects malformed PEM private keys at construction', () => {
+    const broken = '-----BEGIN EC PRIVATE KEY-----\nnot-real-key-bytes\n-----END EC PRIVATE KEY-----';
+    expect(() => new CoinbaseOrderClient({ apiKey: CDP_KID, apiSecret: broken })).toThrow(/CDP private key/);
+  });
+
+  it('builds a JWT with ES256 alg, the api key as kid, and a ~2 minute expiry', () => {
+    const { privatePem } = generateCdpKeypair();
+    const client = new CoinbaseOrderClient({
+      apiKey: CDP_KID,
+      apiSecret: privatePem,
+      now: () => TS,
+      nonce: () => 'deadbeef',
+    });
+
+    const jwt = client.buildCdpJwt('GET', '/api/v3/brokerage/accounts');
+    const { header, payload } = decodeJwtParts(jwt);
+
+    expect(header).toMatchObject({ alg: 'ES256', typ: 'JWT', kid: CDP_KID, nonce: 'deadbeef' });
+    expect(payload).toMatchObject({
+      sub: CDP_KID,
+      iss: 'cdp',
+      nbf: TS,
+      exp: TS + 120,
+      uri: 'GET api.coinbase.com/api/v3/brokerage/accounts',
+    });
+  });
+
+  it('produces a JWT signature that verifies against the public key (raw r||s form)', () => {
+    const { privatePem, publicPem } = generateCdpKeypair();
+    const client = new CoinbaseOrderClient({ apiKey: CDP_KID, apiSecret: privatePem, now: () => TS });
+
+    const jwt = client.buildCdpJwt('POST', '/api/v3/brokerage/orders');
+    const { signingInput, signature } = decodeJwtParts(jwt);
+
+    expect(signature).toHaveLength(64); // P-256 r||s = 32 + 32 bytes; DER would be ~70+
+    const ok = createVerify('SHA256')
+      .update(signingInput)
+      .verify({ key: publicPem, dsaEncoding: 'ieee-p1363' }, signature);
+    expect(ok).toBe(true);
+  });
+
+  it('places a market order with Authorization: Bearer <jwt> instead of CB-ACCESS-* headers', async () => {
+    const { privatePem, publicPem } = generateCdpKeypair();
+    const client = new CoinbaseOrderClient({
+      apiKey: CDP_KID,
+      apiSecret: privatePem,
+      fetchImpl: fetchMock as unknown as typeof fetch,
+      now: () => TS,
+      nonce: () => 'nonce-xyz',
+    });
+
+    await client.placeMarketOrder({
+      productId: 'BTC-USD',
+      side: 'buy',
+      quoteSize: 25,
+      clientOrderId: 'cli-jwt',
+    });
+
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+    const [url, init] = fetchMock.mock.calls[0];
+    expect(String(url)).toBe('https://api.coinbase.com/api/v3/brokerage/orders');
+    const headers = (init as RequestInit).headers as Record<string, string>;
+    expect(headers['CB-ACCESS-KEY']).toBeUndefined();
+    expect(headers['CB-ACCESS-SIGN']).toBeUndefined();
+    expect(headers['CB-ACCESS-TIMESTAMP']).toBeUndefined();
+    expect(headers.Authorization).toMatch(/^Bearer [A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+$/);
+
+    const jwt = headers.Authorization.slice('Bearer '.length);
+    const { payload, signingInput, signature } = decodeJwtParts(jwt);
+    expect(payload.uri).toBe('POST api.coinbase.com/api/v3/brokerage/orders');
+    const ok = createVerify('SHA256')
+      .update(signingInput)
+      .verify({ key: publicPem, dsaEncoding: 'ieee-p1363' }, signature);
+    expect(ok).toBe(true);
+  });
+
+  it('throws if buildCdpJwt is called on an HMAC client', () => {
+    const client = makeClient();
+    expect(() => client.buildCdpJwt('GET', '/api/v3/brokerage/accounts')).toThrow(/non-CDP/);
   });
 });

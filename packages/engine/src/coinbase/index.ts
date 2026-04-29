@@ -5,4 +5,5 @@ export type {
   CoinbaseOrderSuccessResponse,
   MarketOrderParams,
   LimitOrderParams,
+  CoinbaseAuthScheme,
 } from './order-client.js';

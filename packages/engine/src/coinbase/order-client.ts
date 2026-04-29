@@ -1,16 +1,20 @@
-import { createHmac, randomUUID } from 'crypto';
+import { createHmac, createPrivateKey, createSign, randomBytes, randomUUID } from 'crypto';
+import type { KeyObject } from 'crypto';
 
 import type { Side } from '@trading-app/shared';
 
 const DEFAULT_BASE_URL = 'https://api.coinbase.com';
+const CDP_JWT_TTL_SECONDS = 120;
 
 export interface CoinbaseOrderClientOptions {
   apiKey: string;
   apiSecret: string;
   baseUrl?: string;
   fetchImpl?: typeof fetch;
-  /** Override clock — handy for tests so HMAC signatures are deterministic. */
+  /** Override clock — handy for tests so HMAC/JWT signatures are deterministic. */
   now?: () => number;
+  /** Override JWT nonce — handy for tests so JWT headers are deterministic. */
+  nonce?: () => string;
 }
 
 export interface CoinbaseAccountBalance {
@@ -57,24 +61,40 @@ export interface LimitOrderParams {
   clientOrderId?: string;
 }
 
+export type CoinbaseAuthScheme = 'hmac' | 'cdp';
+
 /**
  * Coinbase Advanced Trade REST client.
  *
- * Auth uses the HMAC method (CB-ACCESS-KEY / CB-ACCESS-TIMESTAMP / CB-ACCESS-SIGN
- * over `timestamp + method + requestPath + body`). Cloud trading keys (ECDSA JWT)
- * are out of scope for this client — operators using cloud keys should provision
- * a legacy HMAC trading key.
+ * Supports both auth flavours Coinbase exposes today:
  *
- * The base/quote sizes are stringified with toFixed(8) before signing so the body
- * sent over the wire matches the body fed into the HMAC, and so we don't lose
- * precision on small fractional crypto amounts.
+ * - **HMAC** (legacy): apiSecret is a printable shared secret. Each request is
+ *   signed with `CB-ACCESS-KEY` / `CB-ACCESS-TIMESTAMP` / `CB-ACCESS-SIGN`,
+ *   where the signature is HMAC-SHA256 of `timestamp + method + path + body`.
+ * - **CDP / JWT** (current): apiKey is the key name (e.g.
+ *   `organizations/.../apiKeys/...`) and apiSecret is a PEM-encoded EC private
+ *   key. Each request is authenticated with a short-lived ES256 JWT in the
+ *   `Authorization: Bearer ...` header, claiming `uri = METHOD host+path` and
+ *   expiring after {@link CDP_JWT_TTL_SECONDS}.
+ *
+ * The scheme is detected at construction by sniffing the secret for a PEM
+ * `-----BEGIN` marker, so callers (e.g. `CryptoLiveAccount`) don't need to know
+ * which credential type the operator provisioned.
+ *
+ * The base/quote sizes are stringified with toFixed(8) before signing so the
+ * body sent over the wire matches the body fed into the signer, and so we
+ * don't lose precision on small fractional crypto amounts.
  */
 export class CoinbaseOrderClient {
   private readonly apiKey: string;
   private readonly apiSecret: string;
   private readonly baseUrl: string;
+  private readonly host: string;
   private readonly fetchImpl: typeof fetch;
   private readonly now: () => number;
+  private readonly nonce: () => string;
+  private readonly authScheme: CoinbaseAuthScheme;
+  private readonly cdpPrivateKey: KeyObject | null;
 
   constructor(opts: CoinbaseOrderClientOptions) {
     if (!opts.apiKey || !opts.apiSecret) {
@@ -83,15 +103,69 @@ export class CoinbaseOrderClient {
     this.apiKey = opts.apiKey;
     this.apiSecret = opts.apiSecret;
     this.baseUrl = opts.baseUrl ?? DEFAULT_BASE_URL;
+    this.host = new URL(this.baseUrl).host;
     this.fetchImpl = opts.fetchImpl ?? fetch;
     this.now = opts.now ?? (() => Math.floor(Date.now() / 1000));
+    this.nonce = opts.nonce ?? (() => randomBytes(16).toString('hex'));
+
+    if (looksLikePem(opts.apiSecret)) {
+      this.authScheme = 'cdp';
+      try {
+        this.cdpPrivateKey = createPrivateKey({ key: opts.apiSecret, format: 'pem' });
+      } catch (err: unknown) {
+        const msg = err instanceof Error ? err.message : String(err);
+        throw new Error(`CoinbaseOrderClient: failed to parse CDP private key: ${msg}`);
+      }
+    } else {
+      this.authScheme = 'hmac';
+      this.cdpPrivateKey = null;
+    }
   }
 
-  /** Compute the CB-ACCESS-SIGN header for a given request. Exposed for testing. */
+  /** Returns the auth scheme detected from the supplied credentials. Exposed for diagnostics. */
+  getAuthScheme(): CoinbaseAuthScheme {
+    return this.authScheme;
+  }
+
+  /** Compute the CB-ACCESS-SIGN header for a given request (HMAC scheme only). Exposed for testing. */
   signRequest(timestamp: string, method: string, requestPath: string, body: string): string {
     return createHmac('sha256', this.apiSecret)
       .update(timestamp + method.toUpperCase() + requestPath + body)
       .digest('hex');
+  }
+
+  /**
+   * Build a short-lived ES256 JWT for the given request (CDP scheme only).
+   * Throws if the client was constructed with HMAC credentials. Exposed for testing.
+   */
+  buildCdpJwt(method: string, requestPath: string): string {
+    if (!this.cdpPrivateKey) {
+      throw new Error('buildCdpJwt called on a non-CDP client');
+    }
+    const nowSec = this.now();
+    const header = {
+      alg: 'ES256',
+      kid: this.apiKey,
+      typ: 'JWT',
+      nonce: this.nonce(),
+    };
+    const payload = {
+      sub: this.apiKey,
+      iss: 'cdp',
+      nbf: nowSec,
+      exp: nowSec + CDP_JWT_TTL_SECONDS,
+      // Coinbase verifies this claim against the actual request — METHOD + space + host + path, no scheme.
+      uri: `${method.toUpperCase()} ${this.host}${requestPath}`,
+    };
+    const headerB64 = base64UrlEncode(Buffer.from(JSON.stringify(header)));
+    const payloadB64 = base64UrlEncode(Buffer.from(JSON.stringify(payload)));
+    const signingInput = `${headerB64}.${payloadB64}`;
+    // dsaEncoding: 'ieee-p1363' yields the raw R||S 64-byte signature JWS expects;
+    // without it Node returns a DER-encoded blob and Coinbase rejects with `Invalid signature`.
+    const sig = createSign('SHA256')
+      .update(signingInput)
+      .sign({ key: this.cdpPrivateKey, dsaEncoding: 'ieee-p1363' });
+    return `${signingInput}.${base64UrlEncode(sig)}`;
   }
 
   /** GET /api/v3/brokerage/accounts — returns balances by currency. */
@@ -160,19 +234,12 @@ export class CoinbaseOrderClient {
   }
 
   private async request<T>(method: string, path: string, body: unknown): Promise<T> {
-    const timestamp = String(this.now());
     const bodyString = body === '' || body == null ? '' : JSON.stringify(body);
-    const sign = this.signRequest(timestamp, method, path, bodyString);
+    const headers = this.buildAuthHeaders(method, path, bodyString);
 
     const resp = await this.fetchImpl(`${this.baseUrl}${path}`, {
       method,
-      headers: {
-        'CB-ACCESS-KEY': this.apiKey,
-        'CB-ACCESS-TIMESTAMP': timestamp,
-        'CB-ACCESS-SIGN': sign,
-        'Content-Type': 'application/json',
-        Accept: 'application/json',
-      },
+      headers,
       body: method === 'GET' || bodyString === '' ? undefined : bodyString,
     });
 
@@ -183,10 +250,34 @@ export class CoinbaseOrderClient {
 
     return resp.json() as Promise<T>;
   }
+
+  private buildAuthHeaders(method: string, path: string, bodyString: string): Record<string, string> {
+    const base: Record<string, string> = {
+      'Content-Type': 'application/json',
+      Accept: 'application/json',
+    };
+    if (this.authScheme === 'cdp') {
+      base.Authorization = `Bearer ${this.buildCdpJwt(method, path)}`;
+      return base;
+    }
+    const timestamp = String(this.now());
+    base['CB-ACCESS-KEY'] = this.apiKey;
+    base['CB-ACCESS-TIMESTAMP'] = timestamp;
+    base['CB-ACCESS-SIGN'] = this.signRequest(timestamp, method, path, bodyString);
+    return base;
+  }
 }
 
 /** Format a size/price for Coinbase. Coinbase accepts up to 8 decimal places. */
 function formatSize(n: number): string {
   if (!Number.isFinite(n)) throw new Error(`invalid size: ${n}`);
   return n.toFixed(8).replace(/\.?0+$/, '') || '0';
+}
+
+function looksLikePem(s: string): boolean {
+  return s.includes('-----BEGIN') && s.includes('-----END');
+}
+
+function base64UrlEncode(buf: Buffer): string {
+  return buf.toString('base64').replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
 }
