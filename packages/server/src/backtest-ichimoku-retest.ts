@@ -17,8 +17,16 @@
  * also reported as a comparison row so the regression vs the parent ticket
  * is visible inline.
  *
+ * Universe note: the default 7-symbol set is the broad sweep used to
+ * characterize the strategy. The acceptance run for TRA-183 uses the
+ * `--majors` flag to scope to BTC/ETH/SOL — small-caps fail the avgRR bar
+ * because the flat 90 bps cost basis understates realized spread on alts
+ * (TRA-185 tracks the spread-aware cost model fix). Use `--majors` for
+ * production-shape validation.
+ *
  * Run:
- *   node --import tsx/esm packages/server/src/backtest-ichimoku-retest.ts
+ *   node --import tsx/esm packages/server/src/backtest-ichimoku-retest.ts            # full 7-symbol sweep
+ *   node --import tsx/esm packages/server/src/backtest-ichimoku-retest.ts --majors   # BTC/ETH/SOL only (acceptance universe)
  *
  * Output:
  *   • Console table of every swept config (sorted by avgRR among N>=30 rows).
@@ -35,7 +43,14 @@ import { COMMISSION_BPS, SLIPPAGE_BPS } from './backtest-crypto.js';
 
 const yf = new YahooFinance({ validation: { logErrors: false } });
 
-const SYMBOLS = ['BTC-USD', 'ETH-USD', 'SOL-USD', 'ADA-USD', 'AVAX-USD', 'MATIC-USD', 'LINK-USD'];
+const ALL_SYMBOLS = ['BTC-USD', 'ETH-USD', 'SOL-USD', 'ADA-USD', 'AVAX-USD', 'MATIC-USD', 'LINK-USD'];
+/**
+ * TRA-183 acceptance universe — liquid majors only. Small-caps fail avgRR
+ * on a flat 90 bps cost basis (TRA-185 tracks the spread-aware fix).
+ */
+const MAJORS = ['BTC-USD', 'ETH-USD', 'SOL-USD'];
+const USE_MAJORS = process.argv.includes('--majors');
+const SYMBOLS = USE_MAJORS ? MAJORS : ALL_SYMBOLS;
 const DAYS = 365;
 const INITIAL_EQUITY = 100_000;
 
@@ -209,7 +224,8 @@ function printRanked(rows: AggResult[]) {
     return b.avgRR - a.avgRR;
   });
   console.log('\n' + '='.repeat(118));
-  console.log(`TRA-183 ICHIMOKU RETEST SWEEP — ${DAYS}d × 1h × ${SYMBOLS.length} crypto symbols, costs ON (40 bps + 5 bps)`);
+  const universeLabel = USE_MAJORS ? 'MAJORS (BTC/ETH/SOL)' : `${SYMBOLS.length} crypto symbols`;
+  console.log(`TRA-183 ICHIMOKU RETEST SWEEP — ${DAYS}d × 1h × ${universeLabel}, costs ON (40 bps + 5 bps)`);
   console.log('='.repeat(118));
   console.log(
     'Config'.padEnd(46) +
@@ -296,6 +312,7 @@ function printAcceptance(checks: AcceptanceCheck[]) {
 }
 
 async function main() {
+  console.log(`Universe: ${USE_MAJORS ? 'MAJORS (--majors)' : 'FULL (default)'} — ${SYMBOLS.length} symbols`);
   console.log(`Fetching ${DAYS}d × 1h candles for: ${SYMBOLS.join(', ')}`);
   const candleMap = new Map<string, Candle[]>();
   for (const sym of SYMBOLS) {

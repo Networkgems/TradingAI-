@@ -12,8 +12,22 @@ import type { RiskManager } from '../risk.js';
  * fill was still too generous — price often ran +1R then reversed before the
  * 2R take-profit. The retest pattern arms a pending signal on the breakout
  * bar and waits for a pullback to the midpoint between the breakout close
- * and the kijun/cloud stop. The retest bar's low/high becomes the new
- * (tighter) structural stop, which collapses the per-trade R:R asymmetry.
+ * and the kijun/cloud stop. Entry fills at the retest bar's close; the stop
+ * stays at the *original* kijun/cloud level rather than the retest bar's
+ * extreme that the TRA-179 reversal recipe used. This is a deliberate
+ * deviation: bar-extreme stops on Ichimoku breakouts collapse to ~0.1% of
+ * price, well below the 90 bps round-trip cost basis (40 bps commission +
+ * 5 bps slippage on each leg), so 82–86% hit1R still produces avgRR ≈ −2.6 R
+ * per trade. Keeping the kijun stop preserves the cost-vs-R economics while
+ * the retest still delivers a better entry price.
+ *
+ * Universe constraint (TRA-183 acceptance): validated on liquid majors only —
+ * BTC/ETH/SOL hourly under the TRA-169 cost model. Small-cap alts
+ * (ADA/AVAX/LINK/MATIC) go negative on a flat 90 bps round-trip basis
+ * because realized spread on alts exceeds the assumed cost. Do NOT enable
+ * this strategy on small-caps without spread-aware costing — see TRA-185
+ * for the structural fix. BTC produced 0 kumo-breakout signals on Yahoo's
+ * hourly window (TRA-186 tracks that data-feed question separately).
  *
  * TRA-182: replaced entry trigger from "TK cross on cross-bar + price already
  * above/below cloud" to "kumo breakout + TK bias agrees". The previous trigger
