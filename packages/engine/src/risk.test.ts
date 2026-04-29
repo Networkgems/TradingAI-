@@ -106,4 +106,42 @@ describe('RiskManager', () => {
     // 0.25 × 1% × 45k = $112.50 → floor(112.5) = 112 shares.
     expect(throttled).toBe(112);
   });
+
+  // TRA-178: the no-cap bug surfaced by TRA-168 round-2 backtests where a tiny
+  // ATR-derived stop sized BTC positions to ~60× managed equity ($3.6M on a
+  // $100k account) and produced -30,000% return rows that were leverage
+  // blow-ups, not strategy P&L.
+  it('caps size by notional when stop distance is tiny relative to entry (default ratio = 1.0)', () => {
+    const account = makeAccount(100_000); // managed = 50_000
+    const risk = new RiskManager(account);
+    // stop distance = entry × 0.0001 → risk budget would size to 50_000 shares.
+    // Notional cap @ 1.0 × managedEquity / entry = 500 shares. The cap wins.
+    const qty = risk.sizeFromStop(100, 100 - 100 * 0.0001);
+    expect(qty).toBe(500);
+    expect(qty * 100).toBeLessThanOrEqual(50_000); // notional ≤ managed equity
+  });
+
+  it('keeps risk-budget sizing when the stop is wide enough that notional is not the binding limit', () => {
+    const account = makeAccount(100_000);
+    const risk = new RiskManager(account);
+    // $1 stop on $100 entry → risk budget = 500 shares ($50k notional);
+    // notional cap = 500 shares. Both equal 500, so behavior is unchanged.
+    expect(risk.sizeFromStop(100, 99)).toBe(500);
+  });
+
+  it('honours a custom maxNotionalRatio (e.g. 0.5 caps at half managed equity)', () => {
+    const account = makeAccount(100_000); // managed = 50_000
+    const risk = new RiskManager(account, { maxNotionalRatio: 0.5 });
+    // 0.5 × 50_000 / 100 = 250 shares; risk budget would still allow 50_000.
+    expect(risk.sizeFromStop(100, 100 - 100 * 0.0001)).toBe(250);
+  });
+
+  it('allows sizing past managed equity when maxNotionalRatio > 1 (explicit margin opt-in)', () => {
+    const account = makeAccount(100_000);
+    const risk = new RiskManager(account, { maxNotionalRatio: 2.0 });
+    // 2.0 × 50_000 / 100 = 1000 share cap; risk budget binds at 500 here.
+    expect(risk.sizeFromStop(100, 99)).toBe(500);
+    // …but a tight stop now lets sizing grow up to the wider 1000-share cap.
+    expect(risk.sizeFromStop(100, 100 - 100 * 0.0001)).toBe(1000);
+  });
 });

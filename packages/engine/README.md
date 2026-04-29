@@ -158,6 +158,41 @@ node --import tsx packages/backtest/src/run-otm-sweep.ts
 (or `tsx` from any workspace `node_modules/.bin/` once `@trading-app/shared`
 is built — the sweep only depends on `OTM_RISK_PARAMS` from shared).
 
+## Risk sizing notional cap (TRA-178)
+
+`RiskManager.sizeFromStop(entryPrice, stopPrice)` returns the smaller of two
+limits:
+
+1. **Risk-budget sizing** — `maxRiskPerTrade() / stopDistance`, the classic
+   "fixed-% per-trade risk over the stop distance" formula.
+2. **Notional cap** — `maxNotionalRatio × managedEquity / entryPrice`, capping
+   the position's notional exposure at a fraction of current managed equity
+   (default `1.0` — i.e. no leverage past the managed slice).
+
+Why the cap exists: a tight ATR/BB-derived stop (e.g. 5–10 bps of price)
+drives the risk-budget formula toward unbounded notional. The TRA-168 round-2
+backtest produced -30,000% MACD-BB rows on BTC because a $500 risk budget
+over a 5 bps stop sized to ~60 BTC ≈ $3.6M on a $100k account — round-trip
+commission alone exceeded the supposed risk budget by 60×. In live trading
+the broker would reject the order, but the engine itself enforced nothing, so
+backtest equity curves were effectively unbounded. The cap makes the engine
+authoritative for sizing instead of relying on broker buying-power as the
+only safety net.
+
+```ts
+import { RiskManager } from '@trading-app/engine';
+
+// Default behavior: notional capped at 1.0 × managed equity.
+const risk = new RiskManager(account);
+
+// Opt-in margin headroom (broker-rejected if not authorized live).
+const leveredRisk = new RiskManager(account, { maxNotionalRatio: 2.0 });
+```
+
+The cap interacts cleanly with the drawdown brake — both shrink size in
+parallel; sizing is always `min(risk-budget, notional-cap)`. See
+`packages/engine/src/risk.ts` and the `risk.test.ts` cases tagged TRA-178.
+
 ## Tests
 
 ```bash
