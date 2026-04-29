@@ -723,9 +723,15 @@ export default function SettingsPage({ token, httpUrl, context, onModeChange }: 
                 <PasswordInput
                   value={settings.liveApiKey ?? ''}
                   onChange={v => set('liveApiKey', v)}
-                  placeholder={context === 'crypto' ? 'Enter your Coinbase API key' : 'Enter your Webull API key'}
+                  placeholder={context === 'crypto' ? 'organizations/{org-id}/apiKeys/{key-id}' : 'Enter your Webull API key'}
                   autoComplete="off"
                 />
+                {context === 'crypto' && (
+                  <p className="field-hint">
+                    Paste the full <strong>API key name</strong> Coinbase shows when you create a CDP key
+                    (looks like <code>organizations/.../apiKeys/...</code>). Legacy HMAC API keys also work.
+                  </p>
+                )}
               </div>
 
               {context === 'crypto' && (
@@ -734,21 +740,28 @@ export default function SettingsPage({ token, httpUrl, context, onModeChange }: 
                   <PasswordInput
                     value={settings.liveApiSecret ?? ''}
                     onChange={v => set('liveApiSecret', v)}
-                    placeholder="Enter your Coinbase API secret"
+                    placeholder={'-----BEGIN EC PRIVATE KEY----- ... -----END EC PRIVATE KEY-----'}
                     autoComplete="off"
                   />
+                  <p className="field-hint">
+                    For CDP keys, paste the entire private key including the
+                    <code> -----BEGIN </code> and <code> -----END </code> lines. For legacy HMAC keys,
+                    paste the shared secret.
+                  </p>
                 </div>
               )}
 
-              <div className="settings-field">
-                <label>Account ID</label>
-                <input
-                  type="text"
-                  placeholder={context === 'crypto' ? 'Enter your Coinbase account ID' : 'Enter your Webull account ID'}
-                  value={settings.liveAccountId ?? ''}
-                  onChange={e => set('liveAccountId', e.target.value)}
-                />
-              </div>
+              {context !== 'crypto' && (
+                <div className="settings-field">
+                  <label>Account ID</label>
+                  <input
+                    type="text"
+                    placeholder="Enter your Webull account ID"
+                    value={settings.liveAccountId ?? ''}
+                    onChange={e => set('liveAccountId', e.target.value)}
+                  />
+                </div>
+              )}
             </div>
 
             <div className="settings-field" style={{ marginTop: '1.25rem' }}>

@@ -87,6 +87,10 @@ export class CryptoSignalEngine {
     if (!apiKey || !apiSecret) return null;
     try {
       const client = new CoinbaseOrderClient({ apiKey, apiSecret });
+      // Surface the auth scheme so an operator pasting a PEM private key into
+      // the API Secret field can confirm it parsed as CDP (rather than silently
+      // falling back to HMAC and 401-ing on every order).
+      console.log(`[crypto-engine] Coinbase client built (auth=${client.getAuthScheme()}).`);
       return new CryptoLiveAccount(client);
     } catch (err: unknown) {
       console.warn('[crypto-engine] Coinbase init failed:', err instanceof Error ? err.message : String(err));
