@@ -19,6 +19,49 @@ function userSettingsFile(username: string): string {
 
 const cache: Map<string, AccountSettings> = new Map();
 
+// TRA-165 — pre-split installs stored a single set of credentials in
+// `liveApiKey` / `liveApiSecret` / `liveAccountId`. After the per-market split
+// the form reads `scoped ?? legacy`, which leaks (e.g.) Coinbase keys into the
+// Webull form on the Stocks tab. Route the legacy values to the correct
+// per-market field based on `liveBrokerageType`, then clear them so the leak
+// is impossible.
+export function migrateLegacyLiveCredentials(input: AccountSettings): {
+  settings: AccountSettings;
+  migrated: boolean;
+} {
+  const hasLegacy =
+    (input.liveApiKey ?? '') !== '' ||
+    (input.liveApiSecret ?? '') !== '' ||
+    (input.liveAccountId ?? '') !== '';
+  if (!hasLegacy) return { settings: input, migrated: false };
+
+  const next: AccountSettings = { ...input };
+  // `liveBrokerageType` defaults to 'webull' in DEFAULT_ACCOUNT_SETTINGS, which
+  // matches what the original single-market form would have shown when the
+  // field was unset, so an undefined value routes to stocks.
+  const brokerage = input.liveBrokerageType ?? 'webull';
+  if (brokerage === 'coinbase') {
+    if (!next.liveApiKeyCrypto) next.liveApiKeyCrypto = input.liveApiKey ?? '';
+    if (!next.liveApiSecretCrypto) next.liveApiSecretCrypto = input.liveApiSecret ?? '';
+  } else {
+    if (!next.liveApiKeyStocks) next.liveApiKeyStocks = input.liveApiKey ?? '';
+    if (!next.liveAccountIdStocks) next.liveAccountIdStocks = input.liveAccountId ?? '';
+  }
+
+  next.liveApiKey = '';
+  next.liveApiSecret = '';
+  next.liveAccountId = '';
+  return { settings: next, migrated: true };
+}
+
+async function persistMigrated(username: string, settings: AccountSettings): Promise<void> {
+  const dir = dirname(userSettingsFile(username));
+  if (!existsSync(dir)) {
+    await mkdir(dir, { recursive: true });
+  }
+  await writeFile(userSettingsFile(username), JSON.stringify(settings, null, 2), 'utf-8');
+}
+
 export async function loadSettings(username: string): Promise<AccountSettings> {
   const cached = cache.get(username);
   if (cached) return cached;
@@ -31,8 +74,21 @@ export async function loadSettings(username: string): Promise<AccountSettings> {
   try {
     const raw = await readFile(file, 'utf-8');
     const merged = { ...DEFAULT_ACCOUNT_SETTINGS, ...JSON.parse(raw) } as AccountSettings;
-    cache.set(username, merged);
-    return merged;
+    const { settings, migrated } = migrateLegacyLiveCredentials(merged);
+    if (migrated) {
+      try {
+        await persistMigrated(username, settings);
+        console.log(`[migration TRA-165] cleared legacy live creds for ${username}`);
+      } catch (err: unknown) {
+        console.warn(
+          `[migration TRA-165] failed to persist migrated settings for ${username}: ${
+            err instanceof Error ? err.message : String(err)
+          }`,
+        );
+      }
+    }
+    cache.set(username, settings);
+    return settings;
   } catch {
     const fresh = { ...DEFAULT_ACCOUNT_SETTINGS };
     cache.set(username, fresh);
