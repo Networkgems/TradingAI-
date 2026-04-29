@@ -1,4 +1,4 @@
-import { OrbStrategy, ReversalStrategy, MacdBollingerStrategy, IchimokuStrategy } from '@trading-app/engine';
+import { OrbStrategy, ReversalStrategy, MacdTrendStrategy, BbFadeStrategy, IchimokuStrategy } from '@trading-app/engine';
 import { WATCHLIST, MANAGED_ACCOUNT_RATIO, MAX_CONSECUTIVE_LOSSES, DAILY_DRAWDOWN_HALT_PCT, isStockMarketOpen } from '@trading-app/shared';
 import type { TradeSignal, OtmMispricingSignal, Candle, OptionsAccountState, SignalType, Position, AccountSettings, AccountState, NewsItem } from '@trading-app/shared';
 import { fetchMinuteBars, fetchQuotes, fetchStocksNews, isYahooBreakerOpen, setActiveInterestSymbols } from './yahoo-feed.js';
@@ -108,7 +108,9 @@ class DailyRiskGovernor {
 export class SignalEngine {
   private readonly orb = new OrbStrategy({ rangeMinutes: 30, minVolume: 5_000 });
   private readonly reversal = new ReversalStrategy();
-  private readonly macdBollinger = new MacdBollingerStrategy();
+  // TRA-170: split MACD-Bollinger into trend half + range/mean-revert half.
+  private readonly macdTrend = new MacdTrendStrategy();
+  private readonly bbFade = new BbFadeStrategy();
   private readonly ichimoku = new IchimokuStrategy();
   private account: PaperAccount;
   private optionsAccount: PaperOptionsAccount;
@@ -405,10 +407,11 @@ export class SignalEngine {
 
         const orbSignal = this.orb.evaluate(sym, candles);
         const reversalSignal = this.reversal.evaluate(sym, candles);
-        const macdSignal = this.macdBollinger.evaluate(sym, candles);
+        const macdTrendSignal = this.macdTrend.evaluate(sym, candles);
+        const bbFadeSignal = this.bbFade.evaluate(sym, candles);
         const ichimokuSignal = this.ichimoku.evaluate(sym, candles);
 
-        for (const signal of [orbSignal, reversalSignal, macdSignal, ichimokuSignal]) {
+        for (const signal of [orbSignal, reversalSignal, macdTrendSignal, bbFadeSignal, ichimokuSignal]) {
           if (!signal) continue;
           // Skip if an equity position for this symbol+strategy type is already open
           if (this.account.hasOpenPositionForSignalType(sym, signal.type)) continue;

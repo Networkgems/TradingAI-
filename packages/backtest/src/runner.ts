@@ -2,7 +2,8 @@ import { Candle } from '@trading-app/shared';
 import {
   OrbStrategy,
   ReversalStrategy,
-  MacdBollingerStrategy,
+  MacdTrendStrategy,
+  BbFadeStrategy,
   IchimokuStrategy,
   RiskManager,
   PositionManager,
@@ -21,8 +22,16 @@ export class BacktestRunner {
     const risk = new RiskManager(account);
     const positions = new PositionManager();
     const orb = new OrbStrategy();
-    const reversal = new ReversalStrategy();
-    const macd = new MacdBollingerStrategy();
+    const reversal = new ReversalStrategy(config.reversalOpts);
+    // TRA-170: split MACD-Bollinger into trend half + mean-reversion half. The
+    // legacy `'macd' | 'macd_bollinger'` strategyType triggers both so callers
+    // upgrading from the old single class get the same coverage out of the box.
+    const macdTrend = new MacdTrendStrategy(config.macdBollingerOpts);
+    const bbFade = new BbFadeStrategy({
+      bbPeriod: config.macdBollingerOpts?.bbPeriod,
+      bbMultiplier: config.macdBollingerOpts?.bbMultiplier,
+      enforceTimeFilter: config.macdBollingerOpts?.enforceTimeFilter,
+    });
     const ichimoku = new IchimokuStrategy();
 
     const filtered = candles.filter(
@@ -49,8 +58,10 @@ export class BacktestRunner {
         if (s) signals.push(s);
       }
       if (config.strategyType === 'macd' || config.strategyType === 'macd_bollinger' || config.strategyType === 'combined') {
-        const s = macd.evaluate(config.symbol, window);
-        if (s) signals.push(s);
+        const t = macdTrend.evaluate(config.symbol, window);
+        if (t) signals.push(t);
+        const f = bbFade.evaluate(config.symbol, window);
+        if (f) signals.push(f);
       }
       if (config.strategyType === 'ichimoku' || config.strategyType === 'combined') {
         const s = ichimoku.evaluate(config.symbol, window);

@@ -33,6 +33,20 @@ function todayET(): string {
     .replace(/(\d{4})-(\d{2})-(\d{2})/, '$1-$3-$2');
 }
 
+function strategyLabel(t: SignalType): EodTradeEntry['strategy'] {
+  switch (t) {
+    case 'orb_breakout': return 'ORB';
+    case 'reversal': return 'Reversal';
+    case 'macd_cross': return 'MACD';        // legacy positions still on disk
+    case 'macd_trend': return 'MACD Trend';
+    case 'bb_fade': return 'BB Fade';
+    case 'ichimoku': return 'Ichimoku';
+    case 'scalping': return 'Scalping';
+    case 'swing_trade': return 'Swing';
+    case 'otm_mispricing': return 'OTM';
+  }
+}
+
 function calcRR(pos: Position): number {
   if (!pos.closedAt || pos.pnl == null) return 0;
   const risk = Math.abs(pos.entryPrice - pos.stopLoss) * pos.quantity;
@@ -46,7 +60,7 @@ function toTradeEntry(pos: Position, signalType: SignalType): EodTradeEntry {
   return {
     id: pos.id,
     symbol: pos.symbol,
-    strategy: signalType === 'orb_breakout' ? 'ORB' : signalType === 'reversal' ? 'Reversal' : signalType === 'macd_cross' ? 'MACD' : 'Ichimoku',
+    strategy: strategyLabel(signalType),
     side: pos.side,
     entryPrice: pos.entryPrice,
     exitPrice: pos.closedAt ? exitPrice : pos.entryPrice,

@@ -2,7 +2,16 @@
 
 export type Side = 'buy' | 'sell';
 export type OrderStatus = 'pending' | 'filled' | 'cancelled' | 'rejected';
-export type SignalType = 'orb_breakout' | 'reversal' | 'macd_cross' | 'ichimoku' | 'scalping' | 'swing_trade' | 'otm_mispricing';
+export type SignalType =
+  | 'orb_breakout'
+  | 'reversal'
+  | 'macd_cross'   // legacy MacdBollingerStrategy — kept so historical positions/snapshots still type-check
+  | 'macd_trend'   // TRA-170: trend-continuation half of the split MACD-Bollinger
+  | 'bb_fade'      // TRA-170: pure mean-reversion half
+  | 'ichimoku'
+  | 'scalping'
+  | 'swing_trade'
+  | 'otm_mispricing';
 export type OptionType = 'call' | 'put';
 
 export interface Candle {

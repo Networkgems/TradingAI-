@@ -1,4 +1,5 @@
-import type { EodReport, EodTradeEntry, EodMover, EodSignalAccuracy, Position } from '@trading-app/shared';
+import type { EodReport, EodTradeEntry, EodMover, EodSignalAccuracy, Position, SignalType } from '@trading-app/shared';
+type StrategyLabel = EodTradeEntry['strategy'];
 import { MANAGED_ACCOUNT_RATIO } from '@trading-app/shared';
 
 function dateString(ts: number): string {
@@ -12,9 +13,23 @@ function calcRR(pos: Position): number {
   return Math.round((pos.pnl / risk) * 10) / 10;
 }
 
+function strategyLabel(t: SignalType): StrategyLabel {
+  switch (t) {
+    case 'reversal': return 'Reversal';
+    case 'macd_cross': return 'MACD';        // legacy positions still on disk
+    case 'macd_trend': return 'MACD Trend';
+    case 'bb_fade': return 'BB Fade';
+    case 'scalping': return 'Scalping';
+    case 'swing_trade': return 'Swing';
+    case 'ichimoku': return 'Ichimoku';
+    case 'orb_breakout': return 'ORB';
+    case 'otm_mispricing': return 'OTM';
+  }
+}
+
 function toTradeEntry(pos: Position): EodTradeEntry {
   const exitPrice = pos.exitPrice ?? (pos.side === 'buy' ? pos.takeProfit : pos.stopLoss);
-  const strategy = pos.signalType === 'reversal' ? 'Reversal' : pos.signalType === 'macd_cross' ? 'MACD' : 'Reversal';
+  const strategy = strategyLabel(pos.signalType);
   return {
     id: pos.id,
     symbol: pos.symbol,

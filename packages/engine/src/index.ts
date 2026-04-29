@@ -1,14 +1,20 @@
 // Trading engine sidecar — signal generation, order management, position tracking
 
 export { OrbStrategy } from './strategies/orb.js';
+export type { OrbOptions } from './strategies/orb.js';
 export { ReversalStrategy } from './strategies/reversal.js';
-export { MacdBollingerStrategy } from './strategies/macd-bollinger.js';
+export type { ReversalOptions } from './strategies/reversal.js';
+export { MacdTrendStrategy } from './strategies/macd-trend.js';
+export type { MacdTrendOptions } from './strategies/macd-trend.js';
+export { BbFadeStrategy } from './strategies/bb-fade.js';
+export type { BbFadeOptions } from './strategies/bb-fade.js';
 export { IchimokuStrategy } from './strategies/ichimoku-strategy.js';
 export { ScalpingStrategy } from './strategies/scalping-strategy.js';
 export type { ScalpingOptions } from './strategies/scalping-strategy.js';
 export { SwingStrategy } from './strategies/swing-strategy.js';
 export type { SwingOptions } from './strategies/swing-strategy.js';
 export { RiskManager } from './risk.js';
+export type { RiskManagerOptions } from './risk.js';
 export { PositionManager } from './positions.js';
 export { AlpacaFeed } from './feed/index.js';
 export type { AlpacaFeedEvents } from './feed/index.js';
@@ -35,7 +41,7 @@ export type {
   MarketOrderParams as CoinbaseMarketOrderParams,
   LimitOrderParams as CoinbaseLimitOrderParams,
 } from './coinbase/index.js';
-export { rsi, rsiDivergence, VwapTracker, detectPattern, isBullishPattern, isBearishPattern, adx, ema, emaCross } from './indicators/index.js';
+export { rsi, rsiDivergence, VwapTracker, detectPattern, isBullishPattern, isBearishPattern, adx, ema, emaCross, atr, atrPct } from './indicators/index.js';
 export type { VwapState, CandlePattern, AdxResult } from './indicators/index.js';
 export { blackScholesPrice, blackScholesDelta, daysToExpiration } from './options/black-scholes.js';
 export type { BlackScholesInputs } from './options/black-scholes.js';

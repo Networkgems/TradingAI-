@@ -4,6 +4,7 @@ import { rsi, rsiDivergence } from '../indicators/rsi.js';
 import { detectPattern, isBullishPattern, isBearishPattern } from '../indicators/patterns.js';
 import { macdCross } from '../indicators/macd.js';
 import { adx } from '../indicators/adx.js';
+import { atr } from '../indicators/atr.js';
 import type { AlpacaOrderClient } from '../alpaca/index.js';
 import type { RiskManager } from '../risk.js';
 
@@ -16,13 +17,33 @@ export interface ReversalOptions {
   lookback?: number;
   /** Set false for 24/7 markets like crypto (default: true). */
   enforceTimeFilter?: boolean;
+  /** ATR lookback period (default: 14). */
+  atrPeriod?: number;
+  /**
+   * If set, stop distance is `atrStopMultiplier × ATR` instead of the
+   * structural window high/low. Default undefined → keep structural stops.
+   */
+  atrStopMultiplier?: number;
+  /**
+   * If set, take-profit distance is `atrTpMultiplier × ATR`. Defaults to
+   * undefined → fall back to the strategy's 3× R:R.
+   */
+  atrTpMultiplier?: number;
+  /**
+   * Dead-tape filter: skip signals when ATR / price is below this fraction.
+   * Default 0.003 (0.3%). Set 0 to disable.
+   */
+  volatilityFloorPct?: number;
 }
 
 /**
- * RSI reversal strategy — improved with:
- *   1. ADX regime filter: skip when ADX > 25 (trending market → reversals fail more often)
- *   2. MACD confluence: MACD direction must agree with the reversal signal
- *   3. Time filter: only fires in valid ET trading windows
+ * RSI reversal strategy.
+ *
+ * TRA-170: filters were too tight on real market data — 0 fires across 90d×1h
+ * BTC/ETH/SOL. Loosened so a confirmed RSI extreme + (pattern OR divergence)
+ * + volume spike can produce a signal even when MACD is flat. The MACD cross
+ * direction is now a *tiebreaker* (it can veto the opposite-direction cross,
+ * but a missing/neutral cross no longer blocks the entry).
  */
 export class ReversalStrategy {
   private readonly rsiPeriod: number;
@@ -30,6 +51,10 @@ export class ReversalStrategy {
   private readonly rsiOversold: number;
   private readonly lookback: number;
   private readonly enforceTimeFilter: boolean;
+  private readonly atrPeriod: number;
+  private readonly atrStopMultiplier: number | null;
+  private readonly atrTpMultiplier: number | null;
+  private readonly volatilityFloorPct: number;
 
   constructor(opts: ReversalOptions = {}) {
     this.rsiPeriod = opts.rsiPeriod ?? 14;
@@ -37,6 +62,10 @@ export class ReversalStrategy {
     this.rsiOversold = opts.rsiOversold ?? 30;
     this.lookback = opts.lookback ?? 5;
     this.enforceTimeFilter = opts.enforceTimeFilter ?? true;
+    this.atrPeriod = opts.atrPeriod ?? 14;
+    this.atrStopMultiplier = opts.atrStopMultiplier ?? null;
+    this.atrTpMultiplier = opts.atrTpMultiplier ?? null;
+    this.volatilityFloorPct = opts.volatilityFloorPct ?? 0.003;
   }
 
   evaluate(symbol: string, candles: Candle[]): TradeSignal | null {
@@ -59,52 +88,73 @@ export class ReversalStrategy {
     const divergence = rsiDivergence(closes, this.rsiPeriod, this.lookback);
     const pattern = detectPattern(candles.slice(-2));
 
-    // Volume climax: current volume > 1.5× average of lookback window.
-    // Threshold lowered from 2× to 1.5× — 2× was too rare on 1-min bars and
-    // blocked most valid reversals; 1.5× still confirms genuine surge interest.
+    // Volume climax: current volume > 1.3× average of lookback window.
+    // TRA-170: lowered from 1.5× → 1.3× because the previous threshold blocked
+    // most genuine reversals on 1h crypto bars (where volume spikes are smaller
+    // than on equity 1-min bars). 1.3× still rejects flat-volume "drifts".
     const window = candles.slice(-this.lookback - 1, -1);
     const avgVolume = window.reduce((s, c) => s + c.volume, 0) / window.length;
-    const volumeClimax = latest.volume > avgVolume * 1.5;
+    const volumeClimax = latest.volume > avgVolume * 1.3;
 
-    // MACD confluence: direction of MACD cross must confirm the reversal
+    // MACD direction is a *tiebreaker* (TRA-170): a contradictory cross vetoes
+    // the entry, but a missing or neutral cross no longer blocks it.
     const cross = macdCross(closes);
 
     let side: Side | null = null;
 
-    // Sell reversal: RSI overbought + (pattern OR divergence) + volume spike + MACD confirming.
-    // VWAP extension removed — it compounded too strictly with RSI extreme + volume climax,
-    // making real signals extremely rare on 1-min charts while adding little extra edge.
+    // Sell reversal: RSI overbought + (pattern OR divergence) + volume spike,
+    // with no contradictory MACD bullish cross.
     if (
       currentRsi > this.rsiOverbought &&
       (isBearishPattern(pattern) || divergence === 'bearish') &&
       volumeClimax &&
-      (cross === 'bearish' || cross === null) // allow null cross but block bullish cross
+      cross !== 'bullish'
     ) {
       side = 'sell';
     }
 
-    // Buy reversal: RSI oversold + (pattern OR divergence) + volume spike + MACD confirming
+    // Buy reversal: RSI oversold + (pattern OR divergence) + volume spike,
+    // with no contradictory MACD bearish cross.
     if (
       currentRsi < this.rsiOversold &&
       (isBullishPattern(pattern) || divergence === 'bullish') &&
       volumeClimax &&
-      (cross === 'bullish' || cross === null)
+      cross !== 'bearish'
     ) {
       side = 'buy';
     }
 
     if (!side) return null;
 
-    const windowHigh = Math.max(...window.map(c => c.high));
-    const windowLow = Math.min(...window.map(c => c.low));
     const entryPrice = latest.close;
-    const stopLoss = side === 'buy' ? windowLow : windowHigh;
-    const stopDistance = Math.abs(entryPrice - stopLoss);
-    if (stopDistance === 0) return null;
 
-    const takeProfit = side === 'buy'
-      ? entryPrice + stopDistance * 3
-      : entryPrice - stopDistance * 3;
+    // Volatility regime gate: skip dead tape where stops barely cover spread.
+    const atrValue = atr(candles, this.atrPeriod);
+    if (atrValue !== null && this.volatilityFloorPct > 0) {
+      const atrFraction = entryPrice > 0 ? atrValue / entryPrice : 0;
+      if (atrFraction < this.volatilityFloorPct) return null;
+    }
+
+    // Stop: ATR-based when the multiplier is set and ATR computes,
+    // otherwise the structural window high/low (the original behavior).
+    const useAtrStop = atrValue !== null && this.atrStopMultiplier !== null && this.atrStopMultiplier > 0;
+    let stopDistance: number;
+    if (useAtrStop) {
+      stopDistance = (this.atrStopMultiplier as number) * atrValue;
+    } else {
+      const windowHigh = Math.max(...window.map(c => c.high));
+      const windowLow = Math.min(...window.map(c => c.low));
+      const structuralStop = side === 'buy' ? windowLow : windowHigh;
+      stopDistance = Math.abs(entryPrice - structuralStop);
+    }
+    if (stopDistance <= 0) return null;
+
+    const tpDistance = useAtrStop && this.atrTpMultiplier !== null
+      ? this.atrTpMultiplier * (atrValue as number)
+      : stopDistance * 3;
+
+    const stopLoss = side === 'buy' ? entryPrice - stopDistance : entryPrice + stopDistance;
+    const takeProfit = side === 'buy' ? entryPrice + tpDistance : entryPrice - tpDistance;
 
     return {
       id: randomUUID(),
@@ -114,7 +164,7 @@ export class ReversalStrategy {
       entryPrice,
       stopLoss,
       takeProfit,
-      riskRewardRatio: 3,
+      riskRewardRatio: tpDistance / stopDistance,
       timestamp: latest.timestamp,
     };
   }

@@ -1,4 +1,11 @@
-import { ReversalStrategy, MacdBollingerStrategy, ScalpingStrategy, SwingStrategy, CoinbaseOrderClient } from '@trading-app/engine';
+import {
+  ReversalStrategy,
+  MacdTrendStrategy,
+  BbFadeStrategy,
+  ScalpingStrategy,
+  SwingStrategy,
+  CoinbaseOrderClient,
+} from '@trading-app/engine';
 import { CRYPTO_WATCHLIST } from '@trading-app/shared';
 import type { TradeSignal, Candle, AccountState, Position, CryptoEngineState, NewsItem, AccountSettings } from '@trading-app/shared';
 import { fetchCryptoMinuteBars, fetchCryptoDailyBars, fetchCryptoQuotes, fetchCryptoNews } from './crypto-feed.js';
@@ -15,12 +22,17 @@ const NEWS_REFRESH_MS = 5 * 60_000;
 export class CryptoSignalEngine {
   // TRA-52: ORB disabled (24/7 incompatible, -55% avg return around the clock).
   // TRA-70: Re-enabled with session-aware filter — reverted by TRA-106 (no true open range for crypto).
-  // TRA-75: enforceTimeFilter: false on Reversal/MACD-Bollinger — crypto trades 24/7.
-  // MACD-Bollinger: crypto-tuned params (41.7% win rate, +1.73% avg return).
-  // Reversal: stock RSI 70/30 thresholds (outperforms 60/40 for crypto).
+  // TRA-75: enforceTimeFilter: false on Reversal/MACD strategies — crypto trades 24/7.
   // TRA-107: Scalping (1-min, 9/21 EMA + VWAP + RSI(9) + volume) and Swing (daily, 50/200 EMA + RSI(14) + MACD).
-  private readonly reversal = new ReversalStrategy({ enforceTimeFilter: false });
-  private readonly macdBollinger = new MacdBollingerStrategy({ bbPeriod: 14, bbMultiplier: 2.5, volumeMultiplier: 1.2, enforceTimeFilter: false });
+  // TRA-170: split MACD-Bollinger into MacdTrend (continuation) + BbFade (mean-reversion);
+  //         Reversal RSI thresholds widened to 65/35 for crypto (1h bars rarely sustain 70/30).
+  private readonly reversal = new ReversalStrategy({
+    enforceTimeFilter: false,
+    rsiOverbought: 65,
+    rsiOversold: 35,
+  });
+  private readonly macdTrend = new MacdTrendStrategy({ enforceTimeFilter: false });
+  private readonly bbFade = new BbFadeStrategy({ enforceTimeFilter: false });
   private readonly scalping = new ScalpingStrategy({ enforceTimeFilter: false });
   private readonly swing = new SwingStrategy();
   private readonly account: CryptoPaperAccount;
@@ -228,7 +240,8 @@ export class CryptoSignalEngine {
 
   // Minimum bars each strategy needs (used to gate evaluation per-symbol).
   private static readonly MIN_BARS_REVERSAL = 20;   // rsiPeriod(14) + lookback(5) + 1
-  private static readonly MIN_BARS_MACD = 35;       // slowPeriod(26) + signalPeriod(9)
+  private static readonly MIN_BARS_MACD_TREND = 35; // slowPeriod(26) + signalPeriod(9)
+  private static readonly MIN_BARS_BB_FADE = 28;    // bbPeriod(20) + adx warm-up
   private static readonly MIN_BARS_SCALPING = 23;   // max(slowEma(21)+2, volumeLookback(10)+1, rsiPeriod(9)+2)
 
   private async tick(): Promise<void> {
@@ -323,8 +336,10 @@ export class CryptoSignalEngine {
         // Previously a blanket 35-bar gate blocked Reversal (needs 20) and Scalping (needs 23).
         const reversalSignal = candles.length >= CryptoSignalEngine.MIN_BARS_REVERSAL
           ? this.reversal.evaluate(sym, candles) : null;
-        const macdSignal = candles.length >= CryptoSignalEngine.MIN_BARS_MACD
-          ? this.macdBollinger.evaluate(sym, candles) : null;
+        const macdTrendSignal = candles.length >= CryptoSignalEngine.MIN_BARS_MACD_TREND
+          ? this.macdTrend.evaluate(sym, candles) : null;
+        const bbFadeSignal = candles.length >= CryptoSignalEngine.MIN_BARS_BB_FADE
+          ? this.bbFade.evaluate(sym, candles) : null;
         const scalpingSignal = candles.length >= CryptoSignalEngine.MIN_BARS_SCALPING
           ? this.scalping.evaluate(sym, candles) : null;
         const swingSignal = dailyCandles.length >= 205
@@ -336,7 +351,7 @@ export class CryptoSignalEngine {
           symbolsEvaluated++;
         }
 
-        for (const signal of [reversalSignal, macdSignal, scalpingSignal, swingSignal]) {
+        for (const signal of [reversalSignal, macdTrendSignal, bbFadeSignal, scalpingSignal, swingSignal]) {
           if (!signal) continue;
           if (this.account.hasOpenPositionForSignalType(sym, signal.type)) continue;
           const recent = this.recentSignals.find(
@@ -414,14 +429,16 @@ export class CryptoSignalEngine {
 
       const reversalSignal = candles.length >= CryptoSignalEngine.MIN_BARS_REVERSAL
         ? this.reversal.evaluate(sym, candles) : null;
-      const macdSignal = candles.length >= CryptoSignalEngine.MIN_BARS_MACD
-        ? this.macdBollinger.evaluate(sym, candles) : null;
+      const macdTrendSignal = candles.length >= CryptoSignalEngine.MIN_BARS_MACD_TREND
+        ? this.macdTrend.evaluate(sym, candles) : null;
+      const bbFadeSignal = candles.length >= CryptoSignalEngine.MIN_BARS_BB_FADE
+        ? this.bbFade.evaluate(sym, candles) : null;
       const scalpingSignal = candles.length >= CryptoSignalEngine.MIN_BARS_SCALPING
         ? this.scalping.evaluate(sym, candles) : null;
       const swingSignal = dailyCandles.length >= 205
         ? this.swing.evaluate(sym, dailyCandles) : null;
 
-      for (const signal of [reversalSignal, macdSignal, scalpingSignal, swingSignal]) {
+      for (const signal of [reversalSignal, macdTrendSignal, bbFadeSignal, scalpingSignal, swingSignal]) {
         if (!signal) continue;
         if (live.hasOpenPositionForSignalType(sym, signal.type)) continue;
         const recent = this.recentSignals.find(

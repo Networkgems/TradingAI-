@@ -1,22 +1,26 @@
-import { Candle, TradeSignal, Side, ADX_TRENDING_THRESHOLD, isValidTradingWindow } from '@trading-app/shared';
+import { Candle, TradeSignal, Side, isValidTradingWindow } from '@trading-app/shared';
 import { randomUUID } from 'crypto';
 import { ichimoku, tkCross } from '../indicators/ichimoku.js';
-import { adx } from '../indicators/adx.js';
 import type { AlpacaOrderClient } from '../alpaca/index.js';
 import type { RiskManager } from '../risk.js';
 
 /**
- * Ichimoku Cloud strategy — improved with:
- *   1. ADX trending confirmation: require ADX ≥ 25 (cloud signals are trend-following)
- *   2. Explicit cloud thickness check: price must be fully outside the cloud, not inside
- *   3. Time filter: only fires in valid ET trading windows
+ * Ichimoku Cloud strategy.
  *
- * Buy:  Bullish TK cross + price above cloud top + chikou confirms + ADX trending
- * Sell: Bearish TK cross + price below cloud bottom + chikou confirms + ADX trending
+ * TRA-170: dropped the ADX ≥ 25 gate — Ichimoku already encodes trend through
+ * the TK cross + price-vs-cloud structure, so layering ADX on top was redundant
+ * and choked signal frequency to 3 fires across 90d×1h BTC/ETH/SOL. The
+ * regime check is now `(cloudTop − cloudBottom) / price ≥ 0.005`, i.e. the
+ * cloud must express a meaningful trend on its own terms.
+ *
+ * Buy:  Bullish TK cross + price above cloud top + chikou confirms + thick cloud
+ * Sell: Bearish TK cross + price below cloud bottom + chikou confirms + thick cloud
  *
  * Stop loss at kijun-sen (base line); take-profit at 2:1 R:R.
  * Requires ≥ 79 candles (78 for ichimoku + 1 for TK cross comparison).
  */
+const MIN_KUMO_THICKNESS_PCT = 0.005; // 0.5% of price
+
 export class IchimokuStrategy {
   evaluate(symbol: string, candles: Candle[]): TradeSignal | null {
     if (candles.length < 79) return null;
@@ -32,11 +36,13 @@ export class IchimokuStrategy {
     const cross = tkCross(candles);
     if (!cross) return null;
 
-    // ADX regime filter: Ichimoku is a trend-following system
-    const adxResult = adx(candles);
-    if (adxResult && adxResult.adx < ADX_TRENDING_THRESHOLD) return null;
-
     const price = latest.close;
+
+    // Kumo-thickness regime check (TRA-170): cloud must express a real trend.
+    // Replaces the previous ADX ≥ 25 gate.
+    if (price <= 0) return null;
+    const cloudThicknessPct = (cloud.cloudTop - cloud.cloudBottom) / price;
+    if (cloudThicknessPct < MIN_KUMO_THICKNESS_PCT) return null;
 
     let side: Side | null = null;
 

@@ -681,7 +681,9 @@ function signalLabel(type: string) {
   switch (type) {
     case 'orb_breakout': return 'ORB';
     case 'reversal': return 'Reversal';
-    case 'macd_cross': return 'MACD';
+    case 'macd_cross': return 'MACD';      // legacy positions still on disk
+    case 'macd_trend': return 'MACD Trend';
+    case 'bb_fade': return 'BB Fade';
     case 'ichimoku': return 'Ichimoku';
     case 'scalping': return 'Scalping';
     case 'swing_trade': return 'Swing';
