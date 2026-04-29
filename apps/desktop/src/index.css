@@ -743,6 +743,7 @@ tr:hover td { background: #1c2128; }
 .btn-danger:hover:not(:disabled) { opacity: 0.75; }
 
 .save-error { color: var(--red); font-size: 0.8rem; }
+.save-success { color: var(--green); font-size: 0.8rem; }
 
 /* ── Forgot password link ─────────────────────────────────────────────────── */
 

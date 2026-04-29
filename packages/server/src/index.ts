@@ -34,6 +34,7 @@ import {
 import { sendPasswordResetEmail } from './email.js';
 import { rotateBackups, checkDataDirHealth } from './trade-store.js';
 import { TradierOtmMispricingService } from './options-scanner.js';
+import { CoinbaseOrderClient } from '@trading-app/engine';
 import { fetchQuotes } from './yahoo-feed.js';
 import {
   runFirstBootMigration,
@@ -711,6 +712,44 @@ app.post('/api/options/:id/close', requireAuth, async (req, res) => {
   }
   broadcastEngineState(ctx);
   res.json({ ok: true });
+});
+
+/**
+ * Smoke-test Coinbase live credentials without placing any orders.
+ *
+ * Pulls the user's saved API key/secret (env-var fallback identical to
+ * crypto-engine.buildLiveBroker), instantiates a CoinbaseOrderClient, then
+ * issues a single authenticated GET against /api/v3/brokerage/accounts.
+ *
+ * The response always returns 200 with an `ok` flag; the UI only needs to
+ * inspect the body. `authScheme` lets the user confirm a PEM secret was
+ * recognised as CDP rather than silently treated as HMAC.
+ */
+app.post('/api/crypto/coinbase/test-connection', requireAuth, async (_req, res) => {
+  const username = res.locals['authUser'] as string;
+  const settings = getSettings(username);
+  const apiKey = (settings.liveApiKey?.trim() || process.env['COINBASE_API_KEY'] || '').trim();
+  const apiSecret = (settings.liveApiSecret?.trim() || process.env['COINBASE_API_SECRET'] || '').trim();
+  if (!apiKey || !apiSecret) {
+    res.json({ ok: false, error: 'Coinbase API key and secret are not configured. Save them in Settings before testing.' });
+    return;
+  }
+  let client: CoinbaseOrderClient;
+  try {
+    client = new CoinbaseOrderClient({ apiKey, apiSecret });
+  } catch (err: unknown) {
+    res.json({ ok: false, error: err instanceof Error ? err.message : String(err) });
+    return;
+  }
+  const authScheme = client.getAuthScheme();
+  try {
+    const accounts = await client.listAccounts();
+    const currencies = Array.from(new Set(accounts.map(a => a.currency))).sort();
+    res.json({ ok: true, authScheme, accountCount: accounts.length, currencies });
+  } catch (err: unknown) {
+    const message = err instanceof Error ? err.message : String(err);
+    res.json({ ok: false, authScheme, error: message });
+  }
 });
 
 app.post('/api/crypto/trading/start', requireAuth, async (_req, res) => {

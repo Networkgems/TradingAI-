@@ -494,6 +494,12 @@ export default function SettingsPage({ token, httpUrl, context, onModeChange }: 
   const [saveStatus, setSaveStatus] = useState<SaveStatus>('idle');
   const [resetPending, setResetPending] = useState(false);
   const [isAdmin, setIsAdmin] = useState(false);
+  const [coinbaseTestStatus, setCoinbaseTestStatus] = useState<'idle' | 'testing'>('idle');
+  const [coinbaseTestResult, setCoinbaseTestResult] = useState<
+    | null
+    | { ok: true; authScheme: 'hmac' | 'cdp'; accountCount: number; currencies: string[] }
+    | { ok: false; authScheme?: 'hmac' | 'cdp'; error: string }
+  >(null);
 
   useEffect(() => {
     fetch(`${httpUrl}/api/account/settings`, {
@@ -533,6 +539,23 @@ export default function SettingsPage({ token, httpUrl, context, onModeChange }: 
       }
     } catch {
       setSaveStatus('error');
+    }
+  }
+
+  async function handleTestCoinbase() {
+    setCoinbaseTestStatus('testing');
+    setCoinbaseTestResult(null);
+    try {
+      const r = await fetch(`${httpUrl}/api/crypto/coinbase/test-connection`, {
+        method: 'POST',
+        headers: { Authorization: `Bearer ${token}` },
+      });
+      const data = await r.json();
+      setCoinbaseTestResult(data);
+    } catch (err) {
+      setCoinbaseTestResult({ ok: false, error: err instanceof Error ? err.message : String(err) });
+    } finally {
+      setCoinbaseTestStatus('idle');
     }
   }
 
@@ -795,6 +818,39 @@ export default function SettingsPage({ token, httpUrl, context, onModeChange }: 
                 </label>
               </div>
             </div>
+
+            {context === 'crypto' && (
+              <div className="settings-field" style={{ marginTop: '1rem' }}>
+                <button
+                  type="button"
+                  className="btn-secondary"
+                  onClick={handleTestCoinbase}
+                  disabled={coinbaseTestStatus === 'testing'}
+                >
+                  {coinbaseTestStatus === 'testing' ? 'Testing…' : 'Test Coinbase Connection'}
+                </button>
+                <p className="field-hint">
+                  Reads your account balances from Coinbase to verify the saved credentials. No orders are placed.
+                  Save the form first if you just edited the API key or secret.
+                </p>
+                {coinbaseTestResult && (
+                  coinbaseTestResult.ok ? (
+                    <div className="save-success" style={{ marginTop: '0.5rem' }}>
+                      ✓ Connected (auth={coinbaseTestResult.authScheme}). Coinbase returned {coinbaseTestResult.accountCount} account
+                      {coinbaseTestResult.accountCount === 1 ? '' : 's'}
+                      {coinbaseTestResult.currencies.length > 0 && (
+                        <> across {coinbaseTestResult.currencies.slice(0, 6).join(', ')}{coinbaseTestResult.currencies.length > 6 ? `, +${coinbaseTestResult.currencies.length - 6} more` : ''}</>
+                      )}
+                      .
+                    </div>
+                  ) : (
+                    <div className="save-error" style={{ marginTop: '0.5rem' }}>
+                      ✗ {coinbaseTestResult.authScheme ? `auth=${coinbaseTestResult.authScheme} — ` : ''}{coinbaseTestResult.error}
+                    </div>
+                  )
+                )}
+              </div>
+            )}
 
             <div className="live-notice">
               {context === 'crypto' ? (
