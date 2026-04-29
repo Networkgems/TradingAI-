@@ -39,28 +39,43 @@ afterEach(() => {
 });
 
 describe('PaperOptionsAccount.openOptionFromCandidate', () => {
-  it('opens a position sized off mark*100 (not the ATM 2% heuristic)', () => {
+  it('opens a position sized off mark*100 using the OTM budget ratio (TRA-160)', () => {
     const acct = new PaperOptionsAccount({ initialEquity: 50_000, managedAccountRatio: 0.5 });
     const sig = buildSignal({ mark: 1.0 });
-    // budget = 50_000 * 0.5 * 0.05 = 1_250 → 12 contracts at $100 each
+    // OTM budget = 50_000 * 0.5 * 0.025 = $625 → 6 contracts at $100 each.
     const pos = acct.openOptionFromCandidate(sig);
     expect(pos).not.toBeNull();
-    expect(pos!.contracts).toBe(12);
+    expect(pos!.contracts).toBe(6);
     expect(pos!.premiumPaid).toBe(1.0);
     expect(pos!.signalType).toBe('otm_mispricing');
     expect(pos!.optionSymbol).toBe('AAPL240705C00200000');
     expect(pos!.strike).toBe(200);
     expect(pos!.expiration).toBe('2024-07-05');
+    // SL/TP must follow the OTM overrides, not the ATM defaults.
+    expect(pos!.stopLossPremium).toBeCloseTo(0.80, 5);    // 1 − 0.20 SL
+    expect(pos!.tp1Premium).toBeCloseTo(1.50, 5);          // 1 + 0.50 TP1
   });
 
-  it('returns null when contracts size to zero (mark too rich for the budget)', () => {
+  it('returns null when contracts size to zero (mark too rich for the OTM budget)', () => {
     const acct = new PaperOptionsAccount({ initialEquity: 1_000, managedAccountRatio: 0.5 });
-    // budget = 1_000 * 0.5 * 0.05 = $25; one contract at mark=$1 costs $100 → 0 contracts
+    // OTM budget = 1_000 * 0.5 * 0.025 = $12.50; one contract at mark=$1 costs $100 → 0 contracts.
     const sig = buildSignal({ mark: 1.0 });
     expect(acct.openOptionFromCandidate(sig)).toBeNull();
     // Cash untouched.
     expect(acct.getState().optionsCash).toBe(1_000);
     expect(acct.getState().dailyOptionsCount).toBe(0);
+  });
+
+  it('caps OTM entries at OTM_OPTIONS_DAILY_LIMIT independent of the ATM cap', () => {
+    const acct = new PaperOptionsAccount({ initialEquity: 200_000, managedAccountRatio: 0.5 });
+    // OTM cap defaults to 2 — third candidate must be refused.
+    const a = acct.openOptionFromCandidate(buildSignal({ optionSymbol: 'AAA', strike: 200 }));
+    const b = acct.openOptionFromCandidate(buildSignal({ id: 's2', optionSymbol: 'BBB', strike: 210 }));
+    const c = acct.openOptionFromCandidate(buildSignal({ id: 's3', optionSymbol: 'CCC', strike: 220 }));
+    expect(a).not.toBeNull();
+    expect(b).not.toBeNull();
+    expect(c).toBeNull();
+    expect(acct.getState().openOptions).toHaveLength(2);
   });
 
   it('dedups by OCC symbol — second call with same optionSymbol is a no-op', () => {
@@ -91,20 +106,20 @@ describe('PaperOptionsAccount.openOptionFromCandidate', () => {
 });
 
 describe('PaperOptionsAccount.checkExits — chain-driven OTM marks', () => {
-  it('uses the option mark from the chain map for OTM positions and exits on hard SL', () => {
+  it('uses the option mark from the chain map for OTM positions and exits on the tighter OTM SL', () => {
     const acct = new PaperOptionsAccount({ initialEquity: 50_000, managedAccountRatio: 0.5 });
     const pos = acct.openOptionFromCandidate(buildSignal({ mark: 1.0 }));
     expect(pos).not.toBeNull();
 
-    // Mark drops 30% — past the −25% stop-loss → full exit.
-    const marks = new Map<string, number>([[pos!.optionSymbol!, 0.70]]);
+    // Mark drops 25% — past the OTM −20% stop-loss → full exit at the SL level.
+    const marks = new Map<string, number>([[pos!.optionSymbol!, 0.75]]);
     const closed = acct.checkExits(new Map(), marks);
 
     expect(closed).toHaveLength(1);
     expect(closed[0].closedAt).toBeDefined();
     expect(closed[0].pnl).toBeLessThan(0);
-    // Realized loss = (0.75 - 1.0) * 12 contracts * 100 = -$300
-    expect(closed[0].pnl).toBeCloseTo(-300, 0);
+    // Realized loss = (0.80 - 1.0) * 6 contracts * 100 = -$120
+    expect(closed[0].pnl).toBeCloseTo(-120, 0);
   });
 
   it('skips OTM positions when no chain mark is supplied (waits for next tick)', () => {

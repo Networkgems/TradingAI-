@@ -162,6 +162,55 @@ export const OPTIONS_TRAIL_ACTIVATE_PCT = 0.20; // activate trailing stop once p
 export const OPTIONS_TRAIL_OFFSET_PCT = 0.12; // trail 12% below peak (tighter than previous 15%)
 export const OPTIONS_PARTIAL_EXIT_RATIO = 0.5; // exit 50% of contracts at TP1; trail the rest
 
+// ── OTM long-premium risk overrides (TRA-160) ───────────────────────────────
+//
+// Far-OTM long premium has a fundamentally different payoff distribution from
+// the ATM directional plays the OPTIONS_* constants above are tuned for:
+//
+//   • most contracts expire worthless → faster theta decay, especially short-DTE
+//   • winners are right-tail-heavy (2x–5x is common, 10x is not unheard of)
+//   • gamma is higher per dollar of premium → bigger %-moves on same spot move
+//
+// The risk profile we want is therefore "small budget per ticket, cut losers
+// fast, let winners run further". The values below were chosen by sweeping
+// SL ∈ {0.18, 0.20, 0.25}, TP1 ∈ {0.40, 0.50, 0.60}, budget ∈ {0.02, 0.025,
+// 0.03} on the Geometric-Brownian-Motion premium-path simulator in
+// `@trading-app/backtest` (`run-otm-sweep.ts`) and picking the combo with the
+// best aggregate P&L ÷ max-drawdown across the trending and choppy regimes.
+//
+// Daily limit is split out so OTM tickets don't crowd out ATM directional
+// signals when both fire on the same day — the engine compares the daily
+// count for each kind against its own cap.
+export const OTM_OPTIONS_BUDGET_RATIO = 0.025;       // 2.5% of managed equity per OTM ticket
+export const OTM_OPTIONS_SL_PCT = 0.20;              // tighter SL — OTM theta bites quickly
+export const OTM_OPTIONS_TP1_PCT = 0.50;             // wider TP1 — capture the asymmetric upside
+export const OTM_OPTIONS_TP2_PCT = 1.00;             // wider TP2 (informational; trailing handles tail)
+export const OTM_OPTIONS_TRAIL_ACTIVATE_PCT = 0.30;  // wait for +30% before engaging trailing
+export const OTM_OPTIONS_TRAIL_OFFSET_PCT = 0.20;    // wider trail — OTM marks are noisier
+export const OTM_OPTIONS_PARTIAL_EXIT_RATIO = 0.4;   // exit only 40% at TP1; trail more for the right tail
+export const OTM_OPTIONS_DAILY_LIMIT = 2;            // separate cap so OTM ≠ competing for ATM slots
+
+/** Risk-parameter bundle handed to the options account for OTM tickets. */
+export interface OtmRiskParams {
+  budgetRatio: number;
+  slPct: number;
+  tp1Pct: number;
+  trailActivatePct: number;
+  trailOffsetPct: number;
+  partialExitRatio: number;
+  dailyLimit: number;
+}
+
+export const OTM_RISK_PARAMS: OtmRiskParams = {
+  budgetRatio: OTM_OPTIONS_BUDGET_RATIO,
+  slPct: OTM_OPTIONS_SL_PCT,
+  tp1Pct: OTM_OPTIONS_TP1_PCT,
+  trailActivatePct: OTM_OPTIONS_TRAIL_ACTIVATE_PCT,
+  trailOffsetPct: OTM_OPTIONS_TRAIL_OFFSET_PCT,
+  partialExitRatio: OTM_OPTIONS_PARTIAL_EXIT_RATIO,
+  dailyLimit: OTM_OPTIONS_DAILY_LIMIT,
+};
+
 // Market regime thresholds (ADX-based)
 export const ADX_TRENDING_THRESHOLD = 25;   // ADX > 25 → trending → favor ORB/MACD/Ichimoku
 export const ADX_RANGING_THRESHOLD = 20;    // ADX < 20 → ranging → favor reversal; avoid ORB
@@ -361,7 +410,16 @@ export interface MarketQuote {
 export interface EodTradeEntry {
   id: string;
   symbol: string;
-  strategy: 'ORB' | 'Reversal' | 'MACD' | 'Ichimoku' | 'Scalping' | 'Swing';
+  strategy:
+    | 'ORB'
+    | 'Reversal'
+    | 'MACD'
+    | 'MACD Trend'   // TRA-170 split
+    | 'BB Fade'      // TRA-170 split
+    | 'Ichimoku'
+    | 'Scalping'
+    | 'Swing'
+    | 'OTM';
   side: Side;
   entryPrice: number;
   exitPrice: number;

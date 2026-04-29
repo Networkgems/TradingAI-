@@ -110,6 +110,54 @@ exposes `GET /api/options/otm-mispricing?symbol=...` and a sibling
 (`reason: 'no_credentials'`) until `TRADIER_API_TOKEN` and
 `TRADIER_ACCOUNT_ID` are set.
 
+## OTM risk parameters (TRA-160)
+
+OTM long-premium tickets opened via `PaperOptionsAccount.openOptionFromCandidate`
+follow a different risk schedule than ATM directional plays — defined as the
+`OTM_RISK_PARAMS` bundle in `@trading-app/shared`. Defaults:
+
+| Param                | OTM (TRA-160) | ATM defaults | Why the OTM value differs                             |
+| -------------------- | ------------- | ------------ | ----------------------------------------------------- |
+| `budgetRatio`        | **0.025**     | 0.05         | Smaller per-ticket exposure — most far-OTM expire 0.  |
+| `slPct`              | **0.20**      | 0.25         | Tighter — theta on short-DTE OTM erodes premium fast. |
+| `tp1Pct`             | **0.50**      | 0.25         | Wider — capture the asymmetric upside on winners.     |
+| `partialExitRatio`   | **0.40**      | 0.50         | Lower — keep more contracts running for the right tail. |
+| `trailActivatePct`   | **0.30**      | 0.20         | Wait longer before engaging trailing.                 |
+| `trailOffsetPct`     | **0.20**      | 0.12         | Wider — OTM marks are noisier per dollar of premium.  |
+| `dailyLimit`         | **2**         | 4 (ATM cap)  | Separate cap so OTM doesn't crowd out ATM signals.    |
+
+Daily limits are tracked independently — the OTM cap (`dailyLimit` above)
+bounds OTM entries while `OPTIONS_DAILY_LIMIT` continues to bound the legacy
+ATM `openOption` path. `dailyOptionsCount` exposed via `getState()` reports
+the combined total for UI compatibility.
+
+These values were chosen via the parameter sweep in
+[`packages/backtest/src/run-otm-sweep.ts`](../backtest/src/run-otm-sweep.ts),
+which replays 3,000 synthetic premium paths (1,000 each across trending,
+choppy, and crashy/theta-dominant regimes) through the same partial/SL/trail
+machinery used in `PaperOptionsAccount.checkExits`. Headline result vs. the
+ATM-default baseline on the same paths:
+
+| Metric            | ATM baseline | OTM proposed |  Δ          |
+| ----------------- | ------------ | ------------ | ----------- |
+| Total P&L         | $202,905     | $275,692     | **+$72,788** |
+| Expectancy/trade  | $67.6        | $91.9        | +$24.3      |
+| Max drawdown      | $198,541     | $95,617      | **−$102,924** |
+| Hard-stop %       | 48.7%        | 58.7%        | +10.0 pp    |
+| Win rate          | 50.6%        | 40.8%        | −9.8 pp     |
+
+The drop in win rate is intentional — the tighter SL hits more often on
+adverse moves, but the asymmetric TP1 + wider trailing compensates and cuts
+peak-to-trough drawdown roughly in half. Run the sweep yourself with:
+
+```bash
+pnpm --filter @trading-app/shared build
+node --import tsx packages/backtest/src/run-otm-sweep.ts
+```
+
+(or `tsx` from any workspace `node_modules/.bin/` once `@trading-app/shared`
+is built — the sweep only depends on `OTM_RISK_PARAMS` from shared).
+
 ## Tests
 
 ```bash

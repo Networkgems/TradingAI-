@@ -1,5 +1,5 @@
 import { randomUUID } from 'crypto';
-import type { TradeSignal, OptionPosition, OptionsAccountState, OtmMispricingSignal } from '@trading-app/shared';
+import type { TradeSignal, OptionPosition, OptionsAccountState, OtmMispricingSignal, OtmRiskParams } from '@trading-app/shared';
 import {
   DEFAULT_ACCOUNT_SETTINGS,
   OPTIONS_BUDGET_RATIO,
@@ -10,6 +10,7 @@ import {
   OPTIONS_TRAIL_ACTIVATE_PCT,
   OPTIONS_TRAIL_OFFSET_PCT,
   OPTIONS_PARTIAL_EXIT_RATIO,
+  OTM_RISK_PARAMS,
   isValidTradingWindow,
 } from '@trading-app/shared';
 
@@ -23,6 +24,12 @@ interface OptionsAccountConfig {
   initialEquity?: number;
   managedAccountRatio?: number;
   dailyTradesLimit?: number;
+  /**
+   * OTM-specific risk overrides (TRA-160). When omitted, the account uses
+   * `OTM_RISK_PARAMS` from `@trading-app/shared`. Tests pass a tweaked bundle
+   * to lock in deterministic behaviour without touching the global constants.
+   */
+  otmRiskParams?: OtmRiskParams;
 }
 
 /**
@@ -39,18 +46,26 @@ export class PaperOptionsAccount {
   private initialEquity: number;
   private managedAccountRatio: number;
   private dailyTradesLimit: number;
+  private otmRiskParams: OtmRiskParams;
   private equity: number;
   private cash: number;
   private openOptions: Map<string, OptionPosition> = new Map();
   private closedOptions: OptionPosition[] = [];
   private optionsPnl = 0;
   private dailyCount = 0;
+  /**
+   * OTM tickets are counted separately so OTM and ATM don't compete for the
+   * same daily slot pool (TRA-160). `dailyCount` keeps tracking ATM entries
+   * for backward-compat with the `OPTIONS_DAILY_LIMIT` cap.
+   */
+  private dailyOtmCount = 0;
   private currentDayKey = toDateKey(Date.now());
 
   constructor(config: OptionsAccountConfig = {}) {
     this.initialEquity = config.initialEquity ?? DEFAULT_ACCOUNT_SETTINGS.demoEquity;
     this.managedAccountRatio = config.managedAccountRatio ?? DEFAULT_ACCOUNT_SETTINGS.managedAccountRatio;
     this.dailyTradesLimit = config.dailyTradesLimit ?? DEFAULT_ACCOUNT_SETTINGS.dailyTradesLimit;
+    this.otmRiskParams = config.otmRiskParams ?? OTM_RISK_PARAMS;
     this.equity = this.initialEquity;
     this.cash = this.initialEquity;
   }
@@ -59,18 +74,21 @@ export class PaperOptionsAccount {
     if (config.initialEquity !== undefined) this.initialEquity = config.initialEquity;
     if (config.managedAccountRatio !== undefined) this.managedAccountRatio = config.managedAccountRatio;
     if (config.dailyTradesLimit !== undefined) this.dailyTradesLimit = config.dailyTradesLimit;
+    if (config.otmRiskParams !== undefined) this.otmRiskParams = config.otmRiskParams;
     this.equity = this.initialEquity;
     this.cash = this.initialEquity;
     this.openOptions.clear();
     this.closedOptions = [];
     this.optionsPnl = 0;
     this.dailyCount = 0;
+    this.dailyOtmCount = 0;
     this.currentDayKey = toDateKey(Date.now());
   }
 
   updateConfig(config: OptionsAccountConfig): void {
     if (config.managedAccountRatio !== undefined) this.managedAccountRatio = config.managedAccountRatio;
     if (config.dailyTradesLimit !== undefined) this.dailyTradesLimit = config.dailyTradesLimit;
+    if (config.otmRiskParams !== undefined) this.otmRiskParams = config.otmRiskParams;
   }
 
   /** Rebase starting equity by the delta, preserving optionsPnl and open/closed positions. */
@@ -88,7 +106,7 @@ export class PaperOptionsAccount {
       closedOptions: [...this.closedOptions].slice(-20),
       optionsPnl: this.optionsPnl,
       optionsCash: this.cash,
-      dailyOptionsCount: this.dailyCount,
+      dailyOptionsCount: this.dailyCount + this.dailyOtmCount,
     };
   }
 
@@ -96,10 +114,15 @@ export class PaperOptionsAccount {
     return this.equity * this.managedAccountRatio * OPTIONS_BUDGET_RATIO;
   }
 
+  private otmBudgetPerTrade(): number {
+    return this.equity * this.managedAccountRatio * this.otmRiskParams.budgetRatio;
+  }
+
   private resetDayIfNeeded(): void {
     const today = toDateKey(Date.now());
     if (today !== this.currentDayKey) {
       this.dailyCount = 0;
+      this.dailyOtmCount = 0;
       this.currentDayKey = today;
     }
   }
@@ -123,7 +146,7 @@ export class PaperOptionsAccount {
     this.resetDayIfNeeded();
 
     if (!isValidTradingWindow(Date.now())) return null;
-    if (this.dailyCount >= OPTIONS_DAILY_LIMIT) return null;
+    if (this.dailyOtmCount >= this.otmRiskParams.dailyLimit) return null;
 
     // Dedup by OCC symbol — one open contract at a time per strike/expiration.
     const existing = Array.from(this.openOptions.values()).find(
@@ -134,7 +157,7 @@ export class PaperOptionsAccount {
     const premiumPaid = signal.mark;
     if (!Number.isFinite(premiumPaid) || premiumPaid <= 0) return null;
 
-    const budget = this.budgetPerTrade();
+    const budget = this.otmBudgetPerTrade();
     const costPerContract = premiumPaid * 100;
     const contracts = Math.floor(budget / costPerContract);
     if (contracts <= 0) return null;
@@ -143,11 +166,11 @@ export class PaperOptionsAccount {
     if (totalCost > this.cash) return null;
 
     this.cash -= totalCost;
-    this.dailyCount += 1;
+    this.dailyOtmCount += 1;
 
-    const tp1Premium = premiumPaid * (1 + OPTIONS_TP1_PCT);
-    const stopLossPremium = premiumPaid * (1 - OPTIONS_SL_PCT);
-    const trailActivatePremium = premiumPaid * (1 + OPTIONS_TRAIL_ACTIVATE_PCT);
+    const tp1Premium = premiumPaid * (1 + this.otmRiskParams.tp1Pct);
+    const stopLossPremium = premiumPaid * (1 - this.otmRiskParams.slPct);
+    const trailActivatePremium = premiumPaid * (1 + this.otmRiskParams.trailActivatePct);
 
     const position: OptionPosition = {
       id: randomUUID(),
@@ -272,24 +295,31 @@ export class PaperOptionsAccount {
         mark = Math.max(0.01, opt.premiumPaid + premiumMove);
       }
 
+      // OTM positions follow the OTM_RISK_PARAMS trail/partial schedule;
+      // ATM legacy paths stay on OPTIONS_* constants so existing behaviour
+      // is unchanged for non-OTM tickets.
+      const isOtm = opt.signalType === 'otm_mispricing';
+      const trailActivatePct = isOtm ? this.otmRiskParams.trailActivatePct : OPTIONS_TRAIL_ACTIVATE_PCT;
+      const trailOffsetPct = isOtm ? this.otmRiskParams.trailOffsetPct : OPTIONS_TRAIL_OFFSET_PCT;
+      const partialExitRatio = isOtm ? this.otmRiskParams.partialExitRatio : OPTIONS_PARTIAL_EXIT_RATIO;
+
       opt.currentPremium = mark;
 
       if (mark > opt.peakPremium) opt.peakPremium = mark;
 
-      // Activate trailing once position reaches +20% gain
-      if (!opt.trailingActive && mark >= opt.premiumPaid * (1 + OPTIONS_TRAIL_ACTIVATE_PCT)) {
+      // Activate trailing once position reaches the per-strategy threshold.
+      if (!opt.trailingActive && mark >= opt.premiumPaid * (1 + trailActivatePct)) {
         opt.trailingActive = true;
-        opt.trailingStopPremium = opt.peakPremium * (1 - OPTIONS_TRAIL_OFFSET_PCT);
+        opt.trailingStopPremium = opt.peakPremium * (1 - trailOffsetPct);
       }
 
-      // Keep trailing stop updated at 12% below peak while active
       if (opt.trailingActive) {
-        opt.trailingStopPremium = opt.peakPremium * (1 - OPTIONS_TRAIL_OFFSET_PCT);
+        opt.trailingStopPremium = opt.peakPremium * (1 - trailOffsetPct);
       }
 
-      // Partial exit at TP1 (+25%): sell half the contracts, trail the rest
+      // Partial exit at TP1: sell `partialExitRatio` of contracts, trail the rest
       if (!opt.tp1Hit && mark >= opt.tp1Premium && opt.contractsRemaining > 1) {
-        const exitContracts = Math.floor(opt.contractsRemaining * OPTIONS_PARTIAL_EXIT_RATIO);
+        const exitContracts = Math.floor(opt.contractsRemaining * partialExitRatio);
         if (exitContracts > 0) {
           const partialPnl = (mark - opt.premiumPaid) * exitContracts * 100;
           this.cash += mark * exitContracts * 100;
@@ -299,7 +329,7 @@ export class PaperOptionsAccount {
           opt.tp1Hit = true;
           // After partial exit, trailing is engaged on the remainder
           opt.trailingActive = true;
-          opt.trailingStopPremium = opt.peakPremium * (1 - OPTIONS_TRAIL_OFFSET_PCT);
+          opt.trailingStopPremium = opt.peakPremium * (1 - trailOffsetPct);
         }
       }
 
@@ -360,6 +390,7 @@ export class PaperOptionsAccount {
     closedOptions: OptionPosition[];
     optionsPnl: number;
     dailyCount: number;
+    dailyOtmCount?: number;
     currentDayKey: string;
     cash: number;
     equity: number;
@@ -369,6 +400,7 @@ export class PaperOptionsAccount {
       closedOptions: [...this.closedOptions],
       optionsPnl: this.optionsPnl,
       dailyCount: this.dailyCount,
+      dailyOtmCount: this.dailyOtmCount,
       currentDayKey: this.currentDayKey,
       cash: this.cash,
       equity: this.equity,
@@ -381,6 +413,8 @@ export class PaperOptionsAccount {
     closedOptions: OptionPosition[];
     optionsPnl: number;
     dailyCount: number;
+    /** Added in TRA-160 — older snapshots don't have it; default to 0. */
+    dailyOtmCount?: number;
     currentDayKey: string;
     cash: number;
     equity: number;
@@ -390,6 +424,7 @@ export class PaperOptionsAccount {
     this.closedOptions = [...snap.closedOptions];
     this.optionsPnl = snap.optionsPnl;
     this.dailyCount = snap.dailyCount;
+    this.dailyOtmCount = snap.dailyOtmCount ?? 0;
     this.currentDayKey = snap.currentDayKey;
     this.cash = snap.cash;
     this.equity = snap.equity;
