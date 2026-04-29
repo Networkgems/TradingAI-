@@ -18,11 +18,12 @@
     "test": "vitest run --passWithNoTests"
   },
   "dependencies": {
-    "@trading-app/shared": "workspace:*",
-    "@trading-app/engine": "workspace:*"
+    "@trading-app/engine": "workspace:*",
+    "@trading-app/shared": "workspace:*"
   },
   "devDependencies": {
     "@types/node": "^22.0.0",
+    "tsx": "^4.21.0",
     "typescript": "^5.4.5",
     "vitest": "^2.0.0"
   }

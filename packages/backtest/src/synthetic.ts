@@ -142,6 +142,58 @@ export function rangingCandles(
 }
 
 /**
+ * Generates a multi-day synthetic crypto dataset for walk-forward and
+ * Monte Carlo runs (TRA-172).
+ *
+ * Crypto trades 24/7 so we space candles by `barIntervalMinutes` (default 60 →
+ * hourly bars) without skipping nights/weekends, and stitch together rotating
+ * regime segments so the dataset contains both trending and ranging stretches.
+ * The result is large enough (90 days × 24 bars ≈ 2,160 bars by default) for a
+ * 60/30 train/test rolling window split to produce multiple folds.
+ */
+export function syntheticCryptoSeries(
+  days: number,
+  symbol: string,
+  startPrice = 30_000,
+  barIntervalMinutes = 60,
+  seed = 31,
+): Candle[] {
+  const barsPerDay = Math.floor((24 * 60) / barIntervalMinutes);
+  const totalBars = days * barsPerDay;
+  // Cycle through 4 regimes of ~7 days each: up-trend, range, down-trend, range.
+  const regimeLen = Math.max(barsPerDay * 7, 50);
+  const regimes: Array<'up' | 'down' | 'range'> = ['up', 'range', 'down', 'range'];
+
+  const candles: Candle[] = [];
+  let price = startPrice;
+  let cursor = new Date('2026-01-01T00:00:00.000Z').getTime();
+  let regimeIdx = 0;
+
+  while (candles.length < totalBars) {
+    const remaining = totalBars - candles.length;
+    const segLen = Math.min(regimeLen, remaining);
+    const regime = regimes[regimeIdx % regimes.length];
+    const segSeed = seed + regimeIdx * 17;
+
+    const seg = regime === 'range'
+      ? rangingCandles(segLen, symbol, price, Math.max(1, price * 0.01), 8, segSeed)
+      : trendingCandles(segLen, symbol, regime === 'up' ? 'up' : 'down', price, segSeed);
+
+    // Re-stamp timestamps so the segment continues from `cursor` at the
+    // configured interval (the per-segment generators all start at 9:35 ET).
+    const stepMs = barIntervalMinutes * 60_000;
+    for (let i = 0; i < seg.length; i++) {
+      candles.push({ ...seg[i], timestamp: cursor + i * stepMs });
+    }
+    cursor += seg.length * stepMs;
+    price = seg[seg.length - 1].close;
+    regimeIdx += 1;
+  }
+
+  return candles;
+}
+
+/**
  * Mixed regime: first half trending, second half ranging.
  * Useful for testing combined strategies.
  */
