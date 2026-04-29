@@ -21,6 +21,8 @@ import {
   STRATEGY_PLAN,
   buildBacktestConfig,
   effectiveCostBps,
+  resolveCostMode,
+  resolvedFillFor,
   COMMISSION_BPS,
   SLIPPAGE_BPS,
   cryptoSessionAnchor,
@@ -97,6 +99,46 @@ describe('backtest-crypto cost mode (TRA-180)', () => {
       expect(config.slippageBps).toBe(5);
       expect(config.strategyType).toBe(run.strategyType);
     }
+  });
+});
+
+describe('backtest-crypto TRA-185 tiered cost mode', () => {
+  it('resolveCostMode("tiered") attaches a CostModel and resolves majors below small-caps', () => {
+    const tiered = resolveCostMode('tiered');
+    expect(tiered.costModel).toBeDefined();
+    const major = resolvedFillFor('BTC-USD', tiered);
+    const small = resolvedFillFor('ADA-USD', tiered);
+    expect(major.commissionBps + major.slippageBps).toBeLessThan(
+      small.commissionBps + small.slippageBps,
+    );
+  });
+
+  it('resolveCostMode("flat") leaves costModel undefined so the runner uses flat bps', () => {
+    const flat = resolveCostMode('flat');
+    expect(flat.costModel).toBeUndefined();
+    expect(flat.commissionBps).toBe(40);
+    expect(flat.slippageBps).toBe(5);
+    expect(resolvedFillFor('BTC-USD', flat)).toEqual({ commissionBps: 40, slippageBps: 5 });
+    expect(resolvedFillFor('ADA-USD', flat)).toEqual({ commissionBps: 40, slippageBps: 5 });
+  });
+
+  it('resolveCostMode("none") zeroes both fields and uses no costModel', () => {
+    const none = resolveCostMode('none');
+    expect(none).toEqual({
+      commissionBps: 0,
+      slippageBps: 0,
+      label: 'cost-free baseline (--no-cost)',
+    });
+  });
+
+  it('buildBacktestConfig threads costModel through to the BacktestConfig', () => {
+    const candles: Candle[] = [
+      { symbol: 'BTC-USD', timestamp: 1, open: 1, high: 1, low: 1, close: 1, volume: 1 },
+      { symbol: 'BTC-USD', timestamp: 2, open: 1, high: 1, low: 1, close: 1, volume: 1 },
+    ];
+    const tiered = resolveCostMode('tiered');
+    const config = buildBacktestConfig('BTC-USD', candles, STRATEGY_PLAN[0], tiered);
+    expect(config.costModel).toBe(tiered.costModel);
   });
 });
 

@@ -53,3 +53,17 @@ export type {
   OtmScannerOptions,
   Mispricing,
 } from './options/otm-mispricing.js';
+export {
+  cryptoTieredCostModel,
+  flatCostModel,
+  cryptoTierOf,
+  CRYPTO_TIER_FILLS,
+  DEFAULT_CRYPTO_TIERS,
+} from './cost/index.js';
+export type {
+  FillCost,
+  CostModel,
+  CryptoSpreadTier,
+  CryptoTierEntry,
+  CryptoTieredCostModelOptions,
+} from './cost/index.js';

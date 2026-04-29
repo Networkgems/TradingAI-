@@ -5,13 +5,16 @@
  * give a statistically meaningful sample).
  *
  * Usage:
- *   node --import tsx/esm packages/server/src/backtest-crypto.ts            # default: with costs
- *   node --import tsx/esm packages/server/src/backtest-crypto.ts --no-cost  # zero out commission/slippage for A/B sanity
+ *   node --import tsx/esm packages/server/src/backtest-crypto.ts             # default: TRA-185 tiered cost model
+ *   node --import tsx/esm packages/server/src/backtest-crypto.ts --no-cost   # zero costs for A/B sanity
+ *   node --import tsx/esm packages/server/src/backtest-crypto.ts --flat-cost # legacy 40 bps + 5 bps flat
  *
- * Cost model (TRA-169):
- *   - commissionBps = 40 → Coinbase Advanced Trade taker fees (~0.4% per fill, ~0.8% round-trip).
- *   - slippageBps   = 5  → conservative for top-tier coins on 1h bars.
- *   `--no-cost` disables both, mirroring the pre-TRA-169 behaviour for direct comparison.
+ * Cost model (TRA-185, supersedes TRA-169 flat default):
+ *   - Default: spread-aware tiered model — majors charge ~12 bps round-trip,
+ *     small-caps ~100 bps. See docs/cost-model.md for tier sourcing.
+ *   - --flat-cost reverts to the pre-TRA-185 flat 40 + 5 bps for A/B comparison.
+ *   - --no-cost disables both, mirroring the pre-TRA-169 behaviour for direct
+ *     comparison against signal-edge (cost-free) hit-rates.
  *
  * Crypto-aware ORB anchor (TRA-180):
  *   - timeFilter = isValidCryptoTradingWindow (24/7) — without this the equity-session
@@ -28,8 +31,8 @@
 
 import YahooFinance from 'yahoo-finance2';
 import { isValidCryptoTradingWindow, type Candle } from '@trading-app/shared';
-import { BacktestRunner } from '@trading-app/backtest';
-import type { BacktestConfig } from '@trading-app/backtest';
+import { BacktestRunner, cryptoTieredCostModel, cryptoTierOf, CRYPTO_TIER_FILLS } from '@trading-app/backtest';
+import type { BacktestConfig, CostModel, FillCost } from '@trading-app/backtest';
 
 const yf = new YahooFinance({ validation: { logErrors: false } });
 
@@ -114,16 +117,59 @@ export const STRATEGY_PLAN: readonly StrategyRun[] = [
   { strategyType: 'swing', label: 'Swing', opts: {} },
 ] as const;
 
-/** Bps applied per fill, before/after `--no-cost` adjustment. */
+/**
+ * Bps applied per fill (legacy flat path) plus an optional TRA-185
+ * spread-aware {@link CostModel}. When `costModel` is set the runner uses
+ * its per-symbol fill cost and ignores the flat fields.
+ */
 export interface CostMode {
   commissionBps: number;
   slippageBps: number;
+  /**
+   * TRA-185 tiered cost model, or `undefined` to fall back to the flat
+   * `commissionBps`/`slippageBps` above (legacy `--flat-cost` / `--no-cost`).
+   */
+  costModel?: CostModel;
+  /** Diagnostic label for harness output. */
+  label?: string;
 }
 
+/** Three CLI modes the harness supports. */
+export type CostFlag = 'tiered' | 'flat' | 'none';
+
+/**
+ * Legacy back-compat helper preserved for the smoke test (and any other
+ * caller that only knows the `noCost` boolean). Returns the strict
+ * `{ commissionBps, slippageBps }` shape — no `costModel`, no label —
+ * because some smoke tests assert deep equality against this shape.
+ *
+ * New callers should prefer {@link resolveCostMode}, which exposes the
+ * TRA-185 tiered default and the explicit `--flat-cost` opt-out.
+ */
 export function effectiveCostBps(noCost: boolean): CostMode {
   return noCost
     ? { commissionBps: 0, slippageBps: 0 }
     : { commissionBps: COMMISSION_BPS, slippageBps: SLIPPAGE_BPS };
+}
+
+export function resolveCostMode(flag: CostFlag): CostMode {
+  switch (flag) {
+    case 'none':
+      return { commissionBps: 0, slippageBps: 0, label: 'cost-free baseline (--no-cost)' };
+    case 'flat':
+      return {
+        commissionBps: COMMISSION_BPS,
+        slippageBps: SLIPPAGE_BPS,
+        label: `legacy flat ${COMMISSION_BPS} bps + ${SLIPPAGE_BPS} bps (--flat-cost)`,
+      };
+    case 'tiered':
+      return {
+        commissionBps: COMMISSION_BPS,
+        slippageBps: SLIPPAGE_BPS,
+        costModel: cryptoTieredCostModel(),
+        label: 'TRA-185 spread-aware tiered cost model',
+      };
+  }
 }
 
 /**
@@ -145,8 +191,19 @@ export function buildBacktestConfig(
     strategyType: run.strategyType,
     commissionBps: cost.commissionBps,
     slippageBps: cost.slippageBps,
+    costModel: cost.costModel,
     ...run.opts,
   };
+}
+
+/**
+ * Resolve the per-fill cost the runner will actually charge for `symbol`
+ * given a {@link CostMode}. Used by the harness output to print per-symbol
+ * cost lines so reviewers can see the spread of charges across the universe.
+ */
+export function resolvedFillFor(symbol: string, cost: CostMode): FillCost {
+  if (cost.costModel) return cost.costModel.resolve(symbol);
+  return { commissionBps: cost.commissionBps, slippageBps: cost.slippageBps };
 }
 
 async function fetchHistoricalCandles(symbol: string, days: number): Promise<Candle[]> {
@@ -258,13 +315,47 @@ function printTable(results: StrategyResult[]) {
   console.log('='.repeat(100));
 }
 
-async function main() {
-  // Pass `--no-cost` to zero out commission/slippage for an A/B sanity check
-  // against the pre-TRA-169 behaviour. Defaults to false (costs ON).
-  const noCost = process.argv.includes('--no-cost');
-  const cost = effectiveCostBps(noCost);
+function parseCostFlag(): CostFlag {
+  if (process.argv.includes('--no-cost')) return 'none';
+  if (process.argv.includes('--flat-cost')) return 'flat';
+  return 'tiered';
+}
 
-  console.log(`Fetching ${DAYS}-day 1h historical data for: ${SYMBOLS.join(', ')}...`);
+function printCostMatrix(symbols: readonly string[], cost: CostMode): void {
+  console.log(`\nCost mode: ${cost.label ?? 'unspecified'}`);
+  if (!cost.costModel) {
+    const rt = (cost.commissionBps + cost.slippageBps) * 2;
+    console.log(`  flat per-fill: commission=${cost.commissionBps} bps, slippage=${cost.slippageBps} bps  →  ${rt} bps round-trip`);
+    return;
+  }
+  console.log('  Per-symbol fills (commission + slippage, bps per fill / round-trip):');
+  for (const sym of symbols) {
+    const fillCost = cost.costModel.resolve(sym);
+    const rt = (fillCost.commissionBps + fillCost.slippageBps) * 2;
+    const tier = cryptoTierOf(sym);
+    console.log(
+      `    ${sym.padEnd(10)} tier=${tier.padEnd(8)}  ` +
+      `commission=${String(fillCost.commissionBps).padStart(2)} bps  ` +
+      `slippage=${String(fillCost.slippageBps).padStart(2)} bps  →  ${String(rt).padStart(3)} bps round-trip`,
+    );
+  }
+  console.log('  Tier table:');
+  for (const tier of Object.keys(CRYPTO_TIER_FILLS) as Array<keyof typeof CRYPTO_TIER_FILLS>) {
+    const f = CRYPTO_TIER_FILLS[tier];
+    const rt = (f.commissionBps + f.slippageBps) * 2;
+    console.log(`    ${tier.padEnd(10)} commission=${f.commissionBps} bps  slippage=${f.slippageBps} bps  →  ${rt} bps round-trip`);
+  }
+}
+
+async function main() {
+  // Default cost mode is the TRA-185 spread-aware tiered model. Flags:
+  //   --no-cost   → zero commission/slippage (signal-edge baseline)
+  //   --flat-cost → legacy flat 40 + 5 bps (TRA-169 reference)
+  const flag = parseCostFlag();
+  const cost = resolveCostMode(flag);
+
+  printCostMatrix(SYMBOLS, cost);
+  console.log(`\nFetching ${DAYS}-day 1h historical data for: ${SYMBOLS.join(', ')}...`);
 
   const candleMap = new Map<string, Candle[]>();
   for (const sym of SYMBOLS) {
@@ -286,10 +377,7 @@ async function main() {
 
   // Summary by strategy (average across all symbols)
   const strategies = [...new Set(results.map(r => r.strategy))];
-  const costLabel = noCost
-    ? 'cost-free baseline (--no-cost)'
-    : `net of ${COMMISSION_BPS} bps commission + ${SLIPPAGE_BPS} bps slippage`;
-  console.log(`\nAGGREGATE BY STRATEGY (avg across BTC/ETH/SOL — ${costLabel})`);
+  console.log(`\nAGGREGATE BY STRATEGY (avg across BTC/ETH/SOL — ${cost.label ?? 'flat costs'})`);
   console.log('-'.repeat(110));
   for (const strat of strategies) {
     const group = results.filter(r => r.strategy === strat);

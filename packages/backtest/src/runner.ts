@@ -104,11 +104,16 @@ export class BacktestRunner {
     const scalping = new ScalpingStrategy(config.scalpingOpts);
     const swing = new SwingStrategy(config.swingOpts);
 
-    // TRA-169: per-fill cost model. Commission charged on entry+exit notional,
-    // slippage applied adversely to fill prices. Bps are converted once up
-    // front so the per-fill hot path is just a multiply.
-    const commissionRate = (config.commissionBps ?? 0) / 10_000;
-    const slipRate = (config.slippageBps ?? 0) / 10_000;
+    // TRA-169 / TRA-185: per-fill cost model. Commission charged on entry+exit
+    // notional, slippage applied adversely to fill prices. When `costModel` is
+    // set it takes precedence over the flat `commissionBps`/`slippageBps` —
+    // each `BacktestConfig` runs against a single symbol so we resolve the
+    // per-fill cost once and reuse it for every fill in this run.
+    const fill = config.costModel
+      ? config.costModel.resolve(config.symbol)
+      : { commissionBps: config.commissionBps ?? 0, slippageBps: config.slippageBps ?? 0 };
+    const commissionRate = fill.commissionBps / 10_000;
+    const slipRate = fill.slippageBps / 10_000;
     const applyEntrySlippage = (signal: TradeSignal): number =>
       signal.side === 'buy'
         ? signal.entryPrice * (1 + slipRate)

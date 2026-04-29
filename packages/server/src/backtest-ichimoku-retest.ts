@@ -3,7 +3,7 @@
  *
  * Goal: confirm that stacking the TRA-179 retest pattern on top of the
  * TRA-182 kumo-breakout entry closes the round-2 acceptance bars on
- * 90 d × 1 h BTC/ETH/SOL with 40 bps + 5 bps costs:
+ * 365 d × 1 h × 7 crypto symbols under the TRA-185 spread-aware cost model:
  *
  *   • N ≥ 30 trades on the combined sample
  *   • hit1R ≥ 40%
@@ -17,42 +17,86 @@
  * also reported as a comparison row so the regression vs the parent ticket
  * is visible inline.
  *
- * Universe note: the default 7-symbol set is the broad sweep used to
- * characterize the strategy. The acceptance run for TRA-183 uses the
- * `--majors` flag to scope to BTC/ETH/SOL — small-caps fail the avgRR bar
- * because the flat 90 bps cost basis understates realized spread on alts
- * (TRA-185 tracks the spread-aware cost model fix). Use `--majors` for
- * production-shape validation.
+ * Universe & cost model:
+ *   • Default universe is 7 crypto symbols (broad characterization). The
+ *     TRA-183 round-1 review used `--majors` to scope to BTC/ETH/SOL because
+ *     small-caps failed the avgRR bar under the legacy flat 90 bps cost
+ *     basis. With TRA-185 the per-symbol cost is now tiered, so the full
+ *     universe is the default acceptance shape.
+ *   • `--flat-cost` flips back to the legacy flat 40 + 5 bps so reviewers
+ *     can A/B the spread-aware model against the round-1 numbers.
  *
  * Run:
- *   node --import tsx/esm packages/server/src/backtest-ichimoku-retest.ts            # full 7-symbol sweep
- *   node --import tsx/esm packages/server/src/backtest-ichimoku-retest.ts --majors   # BTC/ETH/SOL only (acceptance universe)
+ *   node --import tsx/esm packages/server/src/backtest-ichimoku-retest.ts              # tiered (default)
+ *   node --import tsx/esm packages/server/src/backtest-ichimoku-retest.ts --flat-cost  # legacy flat 40+5 bps
+ *   node --import tsx/esm packages/server/src/backtest-ichimoku-retest.ts --majors     # BTC/ETH/SOL only
  *
  * Output:
  *   • Console table of every swept config (sorted by avgRR among N>=30 rows).
- *   • Per-symbol breakdown for the best config that clears all bars.
- *   • Acceptance summary across the four bars listed above.
+ *   • Per-symbol breakdown annotated with each symbol's tier and round-trip cost.
+ *   • Acceptance summary across the five bars listed above.
  *   • JSON tail bracketed by JSON_RESULTS_START / JSON_RESULTS_END.
  */
 
+import { existsSync, readFileSync, writeFileSync, mkdirSync } from 'node:fs';
+import { resolve, dirname } from 'node:path';
+import { fileURLToPath } from 'node:url';
 import YahooFinance from 'yahoo-finance2';
 import type { Candle, Position } from '@trading-app/shared';
-import { BacktestRunner } from '@trading-app/backtest';
-import type { BacktestConfig, BacktestIchimokuOpts } from '@trading-app/backtest';
+import { BacktestRunner, cryptoTieredCostModel, cryptoTierOf } from '@trading-app/backtest';
+import type { BacktestConfig, BacktestIchimokuOpts, CostModel, FillCost } from '@trading-app/backtest';
 import { COMMISSION_BPS, SLIPPAGE_BPS } from './backtest-crypto.js';
 
 const yf = new YahooFinance({ validation: { logErrors: false } });
 
+// TRA-185: shared candle cache with backtest-retest-sweep so re-runs of the
+// validation sweep don't hammer Yahoo. Same format / TTL as that script.
+const CACHE_DIR = resolve(dirname(fileURLToPath(import.meta.url)), '..', '.cache');
+const CACHE_TTL_MS = 24 * 60 * 60 * 1000;
+function cachePath(symbol: string, days: number): string {
+  return resolve(CACHE_DIR, `${symbol}-${days}d-1h.json`);
+}
+function readCache(symbol: string, days: number): Candle[] | null {
+  const p = cachePath(symbol, days);
+  if (!existsSync(p)) return null;
+  try {
+    const raw = JSON.parse(readFileSync(p, 'utf8')) as { fetchedAt: number; candles: Candle[] };
+    if (Date.now() - raw.fetchedAt > CACHE_TTL_MS) return null;
+    return raw.candles;
+  } catch { return null; }
+}
+function writeCache(symbol: string, days: number, candles: Candle[]): void {
+  if (!existsSync(CACHE_DIR)) mkdirSync(CACHE_DIR, { recursive: true });
+  writeFileSync(cachePath(symbol, days), JSON.stringify({ fetchedAt: Date.now(), candles }));
+}
+
 const ALL_SYMBOLS = ['BTC-USD', 'ETH-USD', 'SOL-USD', 'ADA-USD', 'AVAX-USD', 'MATIC-USD', 'LINK-USD'];
 /**
- * TRA-183 acceptance universe — liquid majors only. Small-caps fail avgRR
- * on a flat 90 bps cost basis (TRA-185 tracks the spread-aware fix).
+ * Round-1 acceptance universe — liquid majors only. Retained for
+ * reproducibility of the original TRA-183 numbers. With TRA-185 the
+ * default sweep covers the full 7-symbol universe again because each
+ * symbol is now charged its own tiered round-trip cost.
  */
 const MAJORS = ['BTC-USD', 'ETH-USD', 'SOL-USD'];
 const USE_MAJORS = process.argv.includes('--majors');
 const SYMBOLS = USE_MAJORS ? MAJORS : ALL_SYMBOLS;
 const DAYS = 365;
 const INITIAL_EQUITY = 100_000;
+
+// TRA-185 cost model selection: default to spread-aware tiered, opt out
+// to legacy flat with --flat-cost for direct A/B comparison against the
+// round-1 numbers.
+const USE_FLAT_COST = process.argv.includes('--flat-cost');
+const COST_MODEL: CostModel | undefined = USE_FLAT_COST ? undefined : cryptoTieredCostModel();
+const COST_LABEL = USE_FLAT_COST
+  ? `legacy flat ${COMMISSION_BPS} bps + ${SLIPPAGE_BPS} bps (--flat-cost)`
+  : 'TRA-185 spread-aware tiered cost model';
+
+function fillFor(symbol: string): FillCost {
+  return COST_MODEL
+    ? COST_MODEL.resolve(symbol)
+    : { commissionBps: COMMISSION_BPS, slippageBps: SLIPPAGE_BPS };
+}
 
 const BASELINE: Required<Pick<BacktestIchimokuOpts,
   'retestRewardMultiple' | 'retestTolerancePct' | 'retestExpiryBars' | 'kumoThicknessFloor'
@@ -137,12 +181,14 @@ interface AggResult {
 }
 
 async function fetchCandles(symbol: string, days: number): Promise<Candle[]> {
+  const cached = readCache(symbol, days);
+  if (cached) return cached;
   const now = new Date();
   const from = new Date(now.getTime() - days * 24 * 60 * 60 * 1000);
   try {
     const result = await yf.chart(symbol, { period1: from, period2: now, interval: '1h' });
     const quotes = result.quotes ?? [];
-    return quotes
+    const candles = quotes
       .filter(q => q.open != null && q.high != null && q.low != null && q.close != null && q.volume != null)
       .map(q => ({
         symbol,
@@ -153,6 +199,8 @@ async function fetchCandles(symbol: string, days: number): Promise<Candle[]> {
         close: q.close!,
         volume: q.volume!,
       }));
+    if (candles.length > 0) writeCache(symbol, days, candles);
+    return candles;
   } catch (err) {
     console.error(`Failed to fetch ${symbol}:`, err);
     return [];
@@ -188,6 +236,7 @@ async function runConfigOnSymbols(
       ichimokuOpts: configToOpts(cfg),
       commissionBps: COMMISSION_BPS,
       slippageBps: SLIPPAGE_BPS,
+      costModel: COST_MODEL,
     };
     const r = await runner.run(config, candles);
     allTrades.push(...r.trades);
@@ -225,7 +274,7 @@ function printRanked(rows: AggResult[]) {
   });
   console.log('\n' + '='.repeat(118));
   const universeLabel = USE_MAJORS ? 'MAJORS (BTC/ETH/SOL)' : `${SYMBOLS.length} crypto symbols`;
-  console.log(`TRA-183 ICHIMOKU RETEST SWEEP — ${DAYS}d × 1h × ${universeLabel}, costs ON (40 bps + 5 bps)`);
+  console.log(`TRA-183 ICHIMOKU RETEST SWEEP — ${DAYS}d × 1h × ${universeLabel}, costs: ${COST_LABEL}`);
   console.log('='.repeat(118));
   console.log(
     'Config'.padEnd(46) +
@@ -254,10 +303,27 @@ function printRanked(rows: AggResult[]) {
 
 function printPerSymbol(r: AggResult) {
   console.log(`\nPer-symbol breakdown for [${r.label}]:`);
-  console.log('-'.repeat(60));
-  console.log('Symbol'.padEnd(12) + 'Trades'.padStart(8) + 'AvgRR'.padStart(10) + 'PnL'.padStart(14));
+  console.log('-'.repeat(86));
+  console.log(
+    'Symbol'.padEnd(12) +
+    'Trades'.padStart(8) +
+    'AvgRR'.padStart(10) +
+    'PnL'.padStart(14) +
+    'Tier'.padStart(10) +
+    'CostRT'.padStart(10),
+  );
   for (const [sym, s] of r.perSymbol) {
-    console.log(sym.padEnd(12) + s.trades.toString().padStart(8) + s.avgRR.toFixed(3).padStart(10) + ('$' + s.pnl.toFixed(0)).padStart(14));
+    const fc = fillFor(sym);
+    const rt = (fc.commissionBps + fc.slippageBps) * 2;
+    const tier = COST_MODEL ? cryptoTierOf(sym) : 'flat';
+    console.log(
+      sym.padEnd(12) +
+      s.trades.toString().padStart(8) +
+      s.avgRR.toFixed(3).padStart(10) +
+      ('$' + s.pnl.toFixed(0)).padStart(14) +
+      tier.padStart(10) +
+      `${rt}bps`.padStart(10),
+    );
   }
 }
 

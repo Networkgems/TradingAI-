@@ -1,5 +1,6 @@
 import { describe, it, expect } from 'vitest';
 import type { Candle, TradeSignal } from '@trading-app/shared';
+import { cryptoTieredCostModel, flatCostModel, cryptoTierOf, CRYPTO_TIER_FILLS } from '@trading-app/engine';
 import { admitsUnderPortfolioCap, defaultSectorOf, reachedOneR, BacktestRunner } from './runner.js';
 import type { BacktestConfig } from './types.js';
 
@@ -159,6 +160,68 @@ describe('BacktestRunner cost model + ambiguous fills (TRA-169)', () => {
     expect(result.ambiguousTrades).toBe(0);
     expect(result.worstCaseTotalPnl).toBe(0);
     expect(result.totalPnl).toBe(0);
+  });
+
+  it('treats costModel as taking precedence over flat commission/slippage when both are set', async () => {
+    const candles: Candle[] = [];
+    const anchor = Date.UTC(2024, 0, 8, 14, 31, 0);
+    for (let i = 0; i < 60; i++) {
+      candles.push({
+        symbol: 'AAPL',
+        timestamp: anchor + i * 60_000,
+        open: 100 + i * 0.05,
+        high: 100.4 + i * 0.05,
+        low: 99.6 + i * 0.05,
+        close: 100.1 + i * 0.05,
+        volume: 50_000,
+      });
+    }
+
+    const flatOnly = await new BacktestRunner().run(
+      baseConfig({ commissionBps: 0, slippageBps: 0 }),
+      candles,
+    );
+    const tieredOverride = await new BacktestRunner().run(
+      baseConfig({
+        commissionBps: 0,
+        slippageBps: 0,
+        costModel: flatCostModel({ commissionBps: 50, slippageBps: 50 }),
+      }),
+      candles,
+    );
+
+    if (flatOnly.totalTrades > 0 || tieredOverride.totalTrades > 0) {
+      expect(tieredOverride.totalPnl).toBeLessThan(flatOnly.totalPnl);
+    }
+  });
+
+  it('cryptoTieredCostModel charges majors less than small-caps', () => {
+    const model = cryptoTieredCostModel();
+    const major = model.resolve('BTC-USD');
+    const small = model.resolve('ADA-USD');
+    expect(major.commissionBps + major.slippageBps).toBeLessThan(
+      small.commissionBps + small.slippageBps,
+    );
+  });
+
+  it('cryptoTieredCostModel falls back to small-cap costs for unknown symbols', () => {
+    const model = cryptoTieredCostModel();
+    expect(model.resolve('UNKNOWN-USD')).toEqual(CRYPTO_TIER_FILLS.small);
+  });
+
+  it('cryptoTierOf reports the bucket for a known major', () => {
+    expect(cryptoTierOf('BTC-USD')).toBe('major');
+    expect(cryptoTierOf('LINK-USD')).toBe('mid');
+    expect(cryptoTierOf('ADA-USD')).toBe('small');
+  });
+
+  it('cryptoTieredCostModel options merge custom tier overrides on top of defaults', () => {
+    const model = cryptoTieredCostModel({
+      tiers: new Map([['DOGE-USD', 'mid']]),
+      fills: { mid: { commissionBps: 99, slippageBps: 1 } },
+    });
+    expect(model.resolve('DOGE-USD')).toEqual({ commissionBps: 99, slippageBps: 1 });
+    expect(model.resolve('BTC-USD')).toEqual(CRYPTO_TIER_FILLS.major);
   });
 
   it('reduces PnL when commissionBps and slippageBps are set vs the zero-cost baseline', async () => {

@@ -1,5 +1,5 @@
 import { Position } from '@trading-app/shared';
-import type { IchimokuOptions, OrbOptions, ScalpingOptions, SwingOptions } from '@trading-app/engine';
+import type { CostModel, IchimokuOptions, OrbOptions, ScalpingOptions, SwingOptions } from '@trading-app/engine';
 
 export interface BacktestReversalOpts {
   rsiPeriod?: number;
@@ -108,15 +108,26 @@ export interface BacktestConfig {
   /**
    * Per-fill commission charged on entry and exit, in basis points of notional
    * (1 bp = 0.01% = 0.0001). Defaults to 0 for backwards compat. Pass 40 for
-   * Coinbase taker fees, ~5 bps for low-cost equity brokers, etc.
+   * Coinbase taker fees, ~5 bps for low-cost equity brokers, etc. Ignored
+   * when {@link costModel} is also provided.
    */
   commissionBps?: number;
   /**
    * Per-fill slippage applied adversely to fill prices, in basis points. Buys
    * fill at `price * (1 + slip)`, sells at `price * (1 - slip)`. Defaults to 0.
    * Typical: 5 bps for liquid US equities, 10–20 bps for thinner names.
+   * Ignored when {@link costModel} is also provided.
    */
   slippageBps?: number;
+  /**
+   * TRA-185: spread-aware cost model. When set, overrides
+   * {@link commissionBps}/{@link slippageBps} — the runner resolves
+   * `costModel.resolve(symbol)` once per backtest and uses the per-fill cost
+   * it returns for every fill. Use `cryptoTieredCostModel()` from
+   * `@trading-app/engine` for the default crypto tier table. Existing flat-cost
+   * callers can leave this unset and behavior is unchanged.
+   */
+  costModel?: CostModel;
   /**
    * TRA-186: opt into fractional-quantity sizing. Defaults to true for `*-USD`
    * symbols (crypto) and false otherwise — without it, RiskManager.sizeFromStop
