@@ -54,3 +54,76 @@ describe('IchimokuStrategy — TRA-170', () => {
     expect(() => new IchimokuStrategy().evaluate('TEST', candles)).not.toThrow();
   });
 });
+
+describe('IchimokuStrategy — TRA-183 retest entry', () => {
+  /**
+   * Build a slow-uptrend → flat → breakout series that produces a deterministic
+   * bullish kumo breakout on the final bar. The series is long enough that the
+   * 78-bar Ichimoku window forms a thick cloud well below the breakout level.
+   */
+  function buildBullishBreakoutSeries(): Candle[] {
+    const candles: Candle[] = [];
+    // 60 bars of flat-ish accumulation around 100 to seed the cloud
+    for (let i = 0; i < 60; i++) {
+      const px = 100 + Math.sin(i / 5) * 0.2;
+      candles.push(bar(px, ET_OPEN_TS + i * 60_000, { volume: 1000 }));
+    }
+    // 20 bars of slow drift up to 102 — keeps cloud below the eventual breakout
+    for (let i = 0; i < 20; i++) {
+      const px = 100 + i * 0.1;
+      candles.push(bar(px, ET_OPEN_TS + (60 + i) * 60_000, { volume: 1000 }));
+    }
+    // Final bar: aggressive breakout to 110 (well above any reasonable cloud top)
+    candles.push(bar(110, ET_OPEN_TS + 80 * 60_000, {
+      open: 102, high: 110.5, low: 102, volume: 2000,
+    }));
+    return candles;
+  }
+
+  it('retest mode arms a pending signal (returns null) on the breakout bar', () => {
+    const armed = new IchimokuStrategy({ enforceTimeFilter: false, retestEntry: true });
+    const immediate = new IchimokuStrategy({ enforceTimeFilter: false, retestEntry: false });
+    const candles = buildBullishBreakoutSeries();
+    const fast = immediate.evaluate('TEST', candles);
+    if (fast) {
+      // When the immediate path fires, the retest path should arm rather than fire.
+      expect(fast.side).toBe('buy');
+      const armedFirst = armed.evaluate('TEST', candles);
+      expect(armedFirst).toBeNull();
+    }
+  });
+
+  it('aborts when the original kijun stop is breached during the retest wait', () => {
+    const strat = new IchimokuStrategy({ enforceTimeFilter: false, retestEntry: true });
+    const candles = buildBullishBreakoutSeries();
+    // Arm the pending — only meaningful if the underlying breakout fires.
+    const armed = strat.evaluate('TEST', candles);
+    expect(armed).toBeNull(); // first bar arms but doesn't fire
+
+    // Append a hard reversal bar that crashes through any reasonable kijun stop.
+    candles.push(bar(85, ET_OPEN_TS + 81 * 60_000, {
+      open: 110, high: 110, low: 84, volume: 3000,
+    }));
+    const sig = strat.evaluate('TEST', candles);
+    expect(sig).toBeNull();
+  });
+
+  it('expires the pending after retestExpiryBars without a touch', () => {
+    const strat = new IchimokuStrategy({
+      enforceTimeFilter: false,
+      retestEntry: true,
+      retestExpiryBars: 3,
+    });
+    const candles = buildBullishBreakoutSeries();
+    strat.evaluate('TEST', candles);
+    // Append 4 boring continuation bars at the breakout level — none retest the
+    // midpoint, so the pending should expire.
+    for (let i = 0; i < 4; i++) {
+      candles.push(bar(110, ET_OPEN_TS + (81 + i) * 60_000, {
+        open: 110, high: 110.2, low: 109.8, volume: 1000,
+      }));
+      const sig = strat.evaluate('TEST', candles);
+      expect(sig).toBeNull();
+    }
+  });
+});

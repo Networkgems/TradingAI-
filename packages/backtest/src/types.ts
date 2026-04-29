@@ -1,5 +1,5 @@
 import { Position } from '@trading-app/shared';
-import type { OrbOptions, ScalpingOptions, SwingOptions } from '@trading-app/engine';
+import type { IchimokuOptions, OrbOptions, ScalpingOptions, SwingOptions } from '@trading-app/engine';
 
 export interface BacktestReversalOpts {
   rsiPeriod?: number;
@@ -28,12 +28,12 @@ export interface BacktestReversalOpts {
   retestRequireVolumeIncrease?: boolean;
 }
 
-export interface BacktestIchimokuOpts {
-  /** TRA-177: minimum cloud thickness (cloudTop − cloudBottom) / price. */
-  kumoThicknessFloor?: number;
-  /** Pass-through to the engine strategy; set false for 24/7 crypto datasets. */
-  enforceTimeFilter?: boolean;
-}
+/**
+ * Pass-through to `IchimokuStrategy`. Aliased directly to the engine type so
+ * new knobs (e.g. TRA-183 retest-entry options) flow through automatically
+ * without a duplicate definition that drifts.
+ */
+export type BacktestIchimokuOpts = IchimokuOptions;
 
 export interface BacktestMacdBollingerOpts {
   bbPeriod?: number;

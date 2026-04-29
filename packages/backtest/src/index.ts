@@ -10,6 +10,7 @@ export type {
   BacktestResult,
   BacktestConfig,
   BacktestReversalOpts,
+  BacktestIchimokuOpts,
   BacktestMacdBollingerOpts,
   PortfolioOpts,
   SignalEdgeOpts,
