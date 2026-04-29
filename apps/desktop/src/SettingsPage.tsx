@@ -1,6 +1,31 @@
 import { useEffect, useState } from 'react';
-import type { AccountSettings, BrokerageType } from '@trading-app/shared';
+import type { AccountSettings, BrokerageType, LiveTradeMode } from '@trading-app/shared';
 import { DEFAULT_ACCOUNT_SETTINGS } from '@trading-app/shared';
+
+type Market = 'crypto' | 'stocks';
+
+// Live credentials are stored per-market (TRA-165) so a Coinbase key entered
+// on the Crypto dashboard never appears on the Stock dashboard. Read-time
+// helpers fall back to the legacy un-suffixed fields for users that saved
+// before this split — new writes go straight to the scoped fields.
+function readLiveBrokerageType(s: AccountSettings, m: Market): BrokerageType {
+  const scoped = m === 'crypto' ? s.liveBrokerageTypeCrypto : s.liveBrokerageTypeStocks;
+  return scoped ?? s.liveBrokerageType ?? (m === 'crypto' ? 'coinbase' : 'webull');
+}
+function readLiveTradeMode(s: AccountSettings, m: Market): LiveTradeMode {
+  const scoped = m === 'crypto' ? s.liveTradeModeCrypto : s.liveTradeModeStocks;
+  return scoped ?? s.liveTradeMode ?? 'ai_in_brokerage';
+}
+function readLiveApiKey(s: AccountSettings, m: Market): string {
+  const scoped = m === 'crypto' ? s.liveApiKeyCrypto : s.liveApiKeyStocks;
+  return scoped ?? s.liveApiKey ?? '';
+}
+function readLiveApiSecretCrypto(s: AccountSettings): string {
+  return s.liveApiSecretCrypto ?? s.liveApiSecret ?? '';
+}
+function readLiveAccountIdStocks(s: AccountSettings): string {
+  return s.liveAccountIdStocks ?? s.liveAccountId ?? '';
+}
 
 function PasswordInput({
   value,
@@ -717,107 +742,164 @@ export default function SettingsPage({ token, httpUrl, context, onModeChange }: 
         )}
 
         {/* ── Live settings ─────────────────────────────────────────────── */}
+        {/*
+          Live credentials are stored per-market (TRA-165). When `context` is
+          set we render a single market's form scoped to its own fields; when
+          undefined (admin view) we render both Crypto and Stocks sections so
+          they can be configured side by side without bleeding into each other.
+        */}
         {settings.mode === 'live' && (
           <section className="settings-section">
             <h2 className="settings-section-title">Live Brokerage Connection</h2>
 
-            <div className="settings-grid">
-              <div className="settings-field">
-                <label>Brokerage</label>
-                <select
-                  // Force the per-context broker so a legacy `liveBrokerageType`
-                  // (defaulted to 'webull' for older accounts) doesn't leave the
-                  // dropdown displaying the wrong broker for crypto. The single
-                  // shared field is fundamentally per-asset-class; the UI picks
-                  // the right one and onChange writes it back.
-                  value={context === 'crypto' ? 'coinbase' : 'webull'}
-                  onChange={e => set('liveBrokerageType', e.target.value as BrokerageType)}
-                >
-                  {context === 'crypto' ? (
-                    <option value="coinbase">Coinbase</option>
-                  ) : (
-                    <option value="webull">Webull</option>
-                  )}
-                </select>
-              </div>
+            {(!context || context === 'crypto') && (
+              <div className="live-brokerage-block" style={{ marginBottom: !context ? '1.5rem' : 0 }}>
+                {!context && <h3 className="settings-subheading">Crypto (Coinbase)</h3>}
 
-              <div className="settings-field">
-                <label>API Key</label>
-                <PasswordInput
-                  value={settings.liveApiKey ?? ''}
-                  onChange={v => set('liveApiKey', v)}
-                  placeholder={context === 'crypto' ? 'organizations/{org-id}/apiKeys/{key-id}' : 'Enter your Webull API key'}
-                  autoComplete="off"
-                />
-                {context === 'crypto' && (
-                  <p className="field-hint">
-                    Paste the full <strong>API key name</strong> Coinbase shows when you create a CDP key
-                    (looks like <code>organizations/.../apiKeys/...</code>). Legacy HMAC API keys also work.
-                  </p>
-                )}
-              </div>
-
-              {context === 'crypto' && (
-                <div className="settings-field">
-                  <label>API Secret</label>
-                  <PasswordInput
-                    value={settings.liveApiSecret ?? ''}
-                    onChange={v => set('liveApiSecret', v)}
-                    placeholder={'-----BEGIN EC PRIVATE KEY----- ... -----END EC PRIVATE KEY-----'}
-                    autoComplete="off"
-                  />
-                  <p className="field-hint">
-                    For CDP keys, paste the entire private key including the
-                    <code> -----BEGIN </code> and <code> -----END </code> lines. For legacy HMAC keys,
-                    paste the shared secret.
-                  </p>
-                </div>
-              )}
-
-              {context !== 'crypto' && (
-                <div className="settings-field">
-                  <label>Account ID</label>
-                  <input
-                    type="text"
-                    placeholder="Enter your Webull account ID"
-                    value={settings.liveAccountId ?? ''}
-                    onChange={e => set('liveAccountId', e.target.value)}
-                  />
-                </div>
-              )}
-            </div>
-
-            <div className="settings-field" style={{ marginTop: '1.25rem' }}>
-              <label>Trading Mode</label>
-              <div className="radio-group">
-                <label className="radio-option">
-                  <input
-                    type="radio"
-                    name="liveTradeMode"
-                    value="ai_in_brokerage"
-                    checked={(settings.liveTradeMode ?? 'ai_in_brokerage') === 'ai_in_brokerage'}
-                    onChange={() => set('liveTradeMode', 'ai_in_brokerage')}
-                  />
-                  <div>
-                    <strong>AI trades in {context === 'crypto' ? 'Coinbase' : 'Webull'}</strong>
-                    <p className="field-hint">AI controls your {context === 'crypto' ? 'Coinbase' : 'Webull'} account directly. Trades execute inside {context === 'crypto' ? 'Coinbase' : 'Webull'} using your balance.</p>
+                <div className="settings-grid">
+                  <div className="settings-field">
+                    <label>Brokerage</label>
+                    <select
+                      value={readLiveBrokerageType(settings, 'crypto')}
+                      onChange={e => set('liveBrokerageTypeCrypto', e.target.value as BrokerageType)}
+                    >
+                      <option value="coinbase">Coinbase</option>
+                    </select>
                   </div>
-                </label>
-                <label className="radio-option">
-                  <input
-                    type="radio"
-                    name="liveTradeMode"
-                    value="transfer_to_platform"
-                    checked={settings.liveTradeMode === 'transfer_to_platform'}
-                    onChange={() => set('liveTradeMode', 'transfer_to_platform')}
-                  />
-                  <div>
-                    <strong>Transfer funds to platform</strong>
-                    <p className="field-hint">Funds transfer from {context === 'crypto' ? 'Coinbase' : 'Webull'} into TradingAI, trades execute here, then profits transfer back.</p>
+
+                  <div className="settings-field">
+                    <label>API Key</label>
+                    <PasswordInput
+                      value={readLiveApiKey(settings, 'crypto')}
+                      onChange={v => set('liveApiKeyCrypto', v)}
+                      placeholder={'organizations/{org-id}/apiKeys/{key-id}'}
+                      autoComplete="off"
+                    />
+                    <p className="field-hint">
+                      Paste the full <strong>API key name</strong> Coinbase shows when you create a CDP key
+                      (looks like <code>organizations/.../apiKeys/...</code>). Legacy HMAC API keys also work.
+                    </p>
                   </div>
-                </label>
+
+                  <div className="settings-field">
+                    <label>API Secret</label>
+                    <PasswordInput
+                      value={readLiveApiSecretCrypto(settings)}
+                      onChange={v => set('liveApiSecretCrypto', v)}
+                      placeholder={'-----BEGIN EC PRIVATE KEY----- ... -----END EC PRIVATE KEY-----'}
+                      autoComplete="off"
+                    />
+                    <p className="field-hint">
+                      For CDP keys, paste the entire private key including the
+                      <code> -----BEGIN </code> and <code> -----END </code> lines. For legacy HMAC keys,
+                      paste the shared secret.
+                    </p>
+                  </div>
+                </div>
+
+                <div className="settings-field" style={{ marginTop: '1.25rem' }}>
+                  <label>Trading Mode</label>
+                  <div className="radio-group">
+                    <label className="radio-option">
+                      <input
+                        type="radio"
+                        name="liveTradeMode-crypto"
+                        value="ai_in_brokerage"
+                        checked={readLiveTradeMode(settings, 'crypto') === 'ai_in_brokerage'}
+                        onChange={() => set('liveTradeModeCrypto', 'ai_in_brokerage')}
+                      />
+                      <div>
+                        <strong>AI trades in Coinbase</strong>
+                        <p className="field-hint">AI controls your Coinbase account directly. Trades execute inside Coinbase using your balance.</p>
+                      </div>
+                    </label>
+                    <label className="radio-option">
+                      <input
+                        type="radio"
+                        name="liveTradeMode-crypto"
+                        value="transfer_to_platform"
+                        checked={readLiveTradeMode(settings, 'crypto') === 'transfer_to_platform'}
+                        onChange={() => set('liveTradeModeCrypto', 'transfer_to_platform')}
+                      />
+                      <div>
+                        <strong>Transfer funds to platform</strong>
+                        <p className="field-hint">Funds transfer from Coinbase into TradingAI, trades execute here, then profits transfer back.</p>
+                      </div>
+                    </label>
+                  </div>
+                </div>
               </div>
-            </div>
+            )}
+
+            {(!context || context === 'stocks') && (
+              <div className="live-brokerage-block">
+                {!context && <h3 className="settings-subheading">Stocks (Webull)</h3>}
+
+                <div className="settings-grid">
+                  <div className="settings-field">
+                    <label>Brokerage</label>
+                    <select
+                      value={readLiveBrokerageType(settings, 'stocks')}
+                      onChange={e => set('liveBrokerageTypeStocks', e.target.value as BrokerageType)}
+                    >
+                      <option value="webull">Webull</option>
+                    </select>
+                  </div>
+
+                  <div className="settings-field">
+                    <label>API Key</label>
+                    <PasswordInput
+                      value={readLiveApiKey(settings, 'stocks')}
+                      onChange={v => set('liveApiKeyStocks', v)}
+                      placeholder={'Enter your Webull API key'}
+                      autoComplete="off"
+                    />
+                  </div>
+
+                  <div className="settings-field">
+                    <label>Account ID</label>
+                    <input
+                      type="text"
+                      placeholder="Enter your Webull account ID"
+                      value={readLiveAccountIdStocks(settings)}
+                      onChange={e => set('liveAccountIdStocks', e.target.value)}
+                    />
+                  </div>
+                </div>
+
+                <div className="settings-field" style={{ marginTop: '1.25rem' }}>
+                  <label>Trading Mode</label>
+                  <div className="radio-group">
+                    <label className="radio-option">
+                      <input
+                        type="radio"
+                        name="liveTradeMode-stocks"
+                        value="ai_in_brokerage"
+                        checked={readLiveTradeMode(settings, 'stocks') === 'ai_in_brokerage'}
+                        onChange={() => set('liveTradeModeStocks', 'ai_in_brokerage')}
+                      />
+                      <div>
+                        <strong>AI trades in Webull</strong>
+                        <p className="field-hint">AI controls your Webull account directly. Trades execute inside Webull using your balance.</p>
+                      </div>
+                    </label>
+                    <label className="radio-option">
+                      <input
+                        type="radio"
+                        name="liveTradeMode-stocks"
+                        value="transfer_to_platform"
+                        checked={readLiveTradeMode(settings, 'stocks') === 'transfer_to_platform'}
+                        onChange={() => set('liveTradeModeStocks', 'transfer_to_platform')}
+                      />
+                      <div>
+                        <strong>Transfer funds to platform</strong>
+                        <p className="field-hint">Funds transfer from Webull into TradingAI, trades execute here, then profits transfer back.</p>
+                      </div>
+                    </label>
+                  </div>
+                </div>
+              </div>
+            )}
 
             {context === 'crypto' && (
               <div className="settings-field" style={{ marginTop: '1rem' }}>

@@ -82,8 +82,22 @@ export class CryptoSignalEngine {
    */
   private buildLiveBroker(): CryptoLiveAccount | null {
     const s = this.currentSettings;
-    const apiKey = (s?.liveApiKey?.trim() || process.env.COINBASE_API_KEY || '').trim();
-    const apiSecret = (s?.liveApiSecret?.trim() || process.env.COINBASE_API_SECRET || '').trim();
+    // Prefer the per-market crypto credentials (TRA-165) so a Webull key
+    // entered on the Stocks dashboard never accidentally drives Coinbase.
+    // Fall back to the legacy un-suffixed fields for users that saved before
+    // the crypto/stocks split, then to env vars for single-user installs.
+    const apiKey = (
+      s?.liveApiKeyCrypto?.trim()
+      || s?.liveApiKey?.trim()
+      || process.env.COINBASE_API_KEY
+      || ''
+    ).trim();
+    const apiSecret = (
+      s?.liveApiSecretCrypto?.trim()
+      || s?.liveApiSecret?.trim()
+      || process.env.COINBASE_API_SECRET
+      || ''
+    ).trim();
     if (!apiKey || !apiSecret) return null;
     try {
       const client = new CoinbaseOrderClient({ apiKey, apiSecret });

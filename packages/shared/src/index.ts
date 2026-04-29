@@ -99,7 +99,10 @@ export interface AccountSettings {
   // Auto-trading persistence — survives server restarts
   stocksAutoTradingEnabled: boolean;
   cryptoAutoTradingEnabled: boolean;
-  // Live mode settings
+  // Live mode settings — legacy un-suffixed fields. Kept as a read-time
+  // fallback so existing saved settings still surface in the UI; new writes
+  // land on the per-market fields below so Coinbase (crypto) and Webull
+  // (stocks) credentials never bleed across dashboards (TRA-165).
   liveBrokerageType?: BrokerageType;
   liveTradeMode?: LiveTradeMode;
   liveApiKey?: string;
@@ -110,6 +113,18 @@ export interface AccountSettings {
    */
   liveApiSecret?: string;
   liveAccountId?: string;
+  // Live mode settings — Crypto (Coinbase). API Secret holds the HMAC secret
+  // or full PEM private key; Coinbase has no concept of an Account ID here.
+  liveBrokerageTypeCrypto?: BrokerageType;
+  liveTradeModeCrypto?: LiveTradeMode;
+  liveApiKeyCrypto?: string;
+  liveApiSecretCrypto?: string;
+  // Live mode settings — Stocks (Webull). Webull uses Account ID for routing
+  // and (today) does not require a separate API secret.
+  liveBrokerageTypeStocks?: BrokerageType;
+  liveTradeModeStocks?: LiveTradeMode;
+  liveApiKeyStocks?: string;
+  liveAccountIdStocks?: string;
 }
 
 export const DEFAULT_ACCOUNT_SETTINGS: AccountSettings = {
@@ -127,6 +142,14 @@ export const DEFAULT_ACCOUNT_SETTINGS: AccountSettings = {
   liveApiKey: '',
   liveApiSecret: '',
   liveAccountId: '',
+  liveBrokerageTypeCrypto: 'coinbase',
+  liveTradeModeCrypto: 'ai_in_brokerage',
+  liveApiKeyCrypto: '',
+  liveApiSecretCrypto: '',
+  liveBrokerageTypeStocks: 'webull',
+  liveTradeModeStocks: 'ai_in_brokerage',
+  liveApiKeyStocks: '',
+  liveAccountIdStocks: '',
 };
 export const WATCHLIST_SIZE = 25;
 export const OPTIONS_BUDGET_RATIO = 0.05;   // 5% of managed equity per options trade
