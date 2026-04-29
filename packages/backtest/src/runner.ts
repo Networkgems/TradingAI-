@@ -81,7 +81,12 @@ export class BacktestRunner {
       dailyPnl: 0,
     };
 
-    const risk = new RiskManager(account);
+    // TRA-186: crypto symbols default to fractional-quantity sizing — without
+    // it BTC trades silently never size at typical 1% risk budgets because
+    // sizeFromStop floors a 0.31-BTC budget to 0.
+    const fractionalQuantity = config.fractionalQuantity
+      ?? (defaultSectorOf(config.symbol) === 'crypto');
+    const risk = new RiskManager(account, { fractionalQuantity });
     const positions = new PositionManager();
     const orb = new OrbStrategy(config.orbOpts);
     const reversal = new ReversalStrategy(config.reversalOpts);

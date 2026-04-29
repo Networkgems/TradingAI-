@@ -144,4 +144,30 @@ describe('RiskManager', () => {
     // …but a tight stop now lets sizing grow up to the wider 1000-share cap.
     expect(risk.sizeFromStop(100, 100 - 100 * 0.0001)).toBe(1000);
   });
+
+  it('TRA-186: fractionalQuantity preserves sub-unit sizing for high-priced assets', () => {
+    // Without the flag: $100k account, $80k entry, 2% stop ($1600). Risk budget
+    // = $500. riskBased = 500/1600 = 0.3125 → Math.floor → 0 (silent skip).
+    const account = makeAccount(100_000);
+    const integerSizing = new RiskManager(account);
+    expect(integerSizing.sizeFromStop(80_000, 80_000 * 0.98)).toBe(0);
+
+    // With the flag: same inputs return ~0.3125, capped by notional (50k/80k=0.625).
+    // Risk-based binds first at 0.3125 BTC.
+    const fractionalSizing = new RiskManager(account, { fractionalQuantity: true });
+    const qty = fractionalSizing.sizeFromStop(80_000, 80_000 * 0.98);
+    expect(qty).toBeCloseTo(0.3125, 4);
+    // Sized notional ($25k) stays under the $50k managed-equity cap.
+    expect(qty * 80_000).toBeLessThanOrEqual(50_000);
+  });
+
+  it('TRA-186: fractionalQuantity rounds down to 8dp to keep float noise out of PnL', () => {
+    // Construct an entry/stop combo that makes risk-based sizing irrational.
+    // Risk budget $500 / stop $0.7 = 714.2857142857142… A naive return would
+    // carry float scraps; we expect truncation to exactly 8 dp.
+    const risk = new RiskManager(makeAccount(100_000), { fractionalQuantity: true, maxNotionalRatio: 1000 });
+    const qty = risk.sizeFromStop(0.5, 0.5 - 0.7); // stop distance = 0.7 (ignore sign)
+    // 500 / 0.7 = 714.28571428571… → floor at 1e8 → 714.28571428
+    expect(qty).toBe(714.28571428);
+  });
 });

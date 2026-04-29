@@ -117,6 +117,15 @@ export interface BacktestConfig {
    * Typical: 5 bps for liquid US equities, 10–20 bps for thinner names.
    */
   slippageBps?: number;
+  /**
+   * TRA-186: opt into fractional-quantity sizing. Defaults to true for `*-USD`
+   * symbols (crypto) and false otherwise — without it, RiskManager.sizeFromStop
+   * floors to whole units, which silently zeros out high-priced fractional
+   * assets like BTC: at $80k spot with a 2% stop on a $100k account, the risk
+   * budget sizes to 0.31 BTC and the integer floor reports 0. Set explicitly
+   * to override the heuristic.
+   */
+  fractionalQuantity?: boolean;
 }
 
 /**

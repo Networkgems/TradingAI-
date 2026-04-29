@@ -24,6 +24,16 @@ export interface RiskManagerOptions {
    * the silent-broker-rejection risk in live trading.
    */
   maxNotionalRatio?: number;
+  /**
+   * TRA-186: when true, returned quantities are not floored to whole units —
+   * essential for high-priced fractional assets (a $100k account at 1% risk
+   * has a $500 budget; a $80k BTC with a 2% stop floors a 0.31 BTC sized
+   * position to 0 and the BacktestRunner skips the trade entirely while
+   * still logging the signal). Quantities are rounded down to 8 decimal
+   * places (Coinbase's BTC precision) to keep float noise out of PnL math.
+   * Default false preserves equity-share semantics for stock callers.
+   */
+  fractionalQuantity?: boolean;
 }
 
 /**
@@ -49,6 +59,7 @@ export class RiskManager {
   private readonly drawdownBrakeThreshold: number;
   private readonly drawdownBrakeMultiplier: number;
   private readonly maxNotionalRatio: number;
+  private readonly fractionalQuantity: boolean;
   private peakManagedEquity: number;
 
   constructor(account: AccountState, opts: RiskManagerOptions = {}) {
@@ -56,6 +67,7 @@ export class RiskManager {
     this.drawdownBrakeThreshold = opts.drawdownBrakeThreshold ?? 0.10;
     this.drawdownBrakeMultiplier = opts.drawdownBrakeMultiplier ?? 0.5;
     this.maxNotionalRatio = opts.maxNotionalRatio ?? 1.0;
+    this.fractionalQuantity = opts.fractionalQuantity ?? false;
     this.peakManagedEquity = this.currentManagedEquity();
   }
 
@@ -97,9 +109,14 @@ export class RiskManager {
   sizeFromStop(entryPrice: number, stopPrice: number): number {
     const stopDistance = Math.abs(entryPrice - stopPrice);
     if (stopDistance === 0) return 0;
-    const riskBased = Math.floor(this.maxRiskPerTrade() / stopDistance);
+    const truncate = (n: number): number => this.fractionalQuantity
+      // Round down to 8 dp — Coinbase's BTC precision; keeps float noise
+      // (1e-15 scraps) out of qty × price PnL math without shaving real size.
+      ? Math.floor(n * 1e8) / 1e8
+      : Math.floor(n);
+    const riskBased = truncate(this.maxRiskPerTrade() / stopDistance);
     if (entryPrice <= 0) return Math.max(0, riskBased);
-    const notionalCap = Math.floor((this.managedEquity() * this.maxNotionalRatio) / entryPrice);
+    const notionalCap = truncate((this.managedEquity() * this.maxNotionalRatio) / entryPrice);
     return Math.max(0, Math.min(riskBased, notionalCap));
   }
 }
