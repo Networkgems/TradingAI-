@@ -152,11 +152,19 @@ async function main() {
         results.push({ variant, result });
       }
       const [fixed, atr] = results;
-      const winner = score(atr.result) >= score(fixed.result) ? 'ATR' : 'fixed-pct';
+      // Don't pick a "winner" when neither variant fired — claiming ATR wins
+      // on a 0-vs-0 row is misleading and obscures the real signal.
+      const bothZero = fixed.result.totalTrades === 0 && atr.result.totalTrades === 0;
+      const winner: 'ATR' | 'fixed-pct' | null = bothZero
+        ? null
+        : score(atr.result) >= score(fixed.result) ? 'ATR' : 'fixed-pct';
 
       for (const { variant, result } of results) {
         const star = variant.name === winner ? '★' : ' ';
         const noTrades = result.totalTrades === 0;
+        const verdict = winner === null
+          ? (variant.name === 'fixed-pct' ? 'no fires (smoke test only)' : '')
+          : variant.name === winner ? `wins on ${asset.symbol}` : '';
         console.log(
           `  ${star} ${pad(strategy.toUpperCase(), 11)} ` +
           pad(variant.name, 12) +
@@ -166,7 +174,7 @@ async function main() {
           pad(noTrades ? '—' : fmt(result.avgRiskReward), 9) +
           pad(noTrades ? '—' : `$${fmt(result.totalPnl)}`, 12) +
           pad(noTrades ? '—' : pct(result.maxDrawdown), 8) +
-          (variant.name === winner ? `wins on ${asset.symbol}` : ''),
+          verdict,
         );
       }
     }
