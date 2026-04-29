@@ -1,37 +1,41 @@
 import { Candle, TradeSignal, Side, isValidTradingWindow } from '@trading-app/shared';
 import { randomUUID } from 'crypto';
-import { ichimoku, tkCross } from '../indicators/ichimoku.js';
+import { ichimoku } from '../indicators/ichimoku.js';
 import type { AlpacaOrderClient } from '../alpaca/index.js';
 import type { RiskManager } from '../risk.js';
 
 /**
  * Ichimoku Cloud strategy.
  *
+ * TRA-182: replaced entry trigger from "TK cross on cross-bar + price already
+ * above/below cloud" to "kumo breakout + TK bias agrees". The previous trigger
+ * was doubly restrictive (tight timing) yet late-stage (price had already
+ * extended past the cloud), producing 17 signals / 4.8% winRate / 17.6% hit1R
+ * across 90d×1h BTC/ETH/SOL. The breakout entry fires on the bar where price
+ * actually closes through the cloud edge, with the TK line bias confirming the
+ * direction. The chikou span and kumo-thickness gates are retained.
+ *
  * TRA-170: dropped the ADX ≥ 25 gate — Ichimoku already encodes trend through
- * the TK cross + price-vs-cloud structure, so layering ADX on top was redundant
- * and choked signal frequency to 3 fires across 90d×1h BTC/ETH/SOL. The
- * regime check is `(cloudTop − cloudBottom) / price ≥ kumoThicknessFloor`,
- * i.e. the cloud must express a meaningful trend on its own terms.
+ * the kumo structure, so layering ADX on top was redundant and choked signal
+ * frequency. The regime check is `(cloudTop − cloudBottom) / price ≥
+ * kumoThicknessFloor`, i.e. the cloud must express a meaningful trend on its
+ * own terms.
  *
- * Buy:  Bullish TK cross + price above cloud top + chikou confirms + thick cloud
- * Sell: Bearish TK cross + price below cloud bottom + chikou confirms + thick cloud
+ * Buy:  prev close ≤ prev cloudTop AND curr close > curr cloudTop (breakout)
+ *       + tenkan > kijun (TK bias bullish) + chikou confirms + thick cloud
+ * Sell: prev close ≥ prev cloudBottom AND curr close < curr cloudBottom
+ *       + tenkan < kijun + chikou confirms + thick cloud
  *
- * Stop loss at kijun-sen (base line); take-profit at 2:1 R:R.
- * Requires ≥ 79 candles (78 for ichimoku + 1 for TK cross comparison).
+ * Stop loss at kijun / opposite cloud edge; take-profit at 2:1 R:R.
+ * Requires ≥ 79 candles (78 for ichimoku + 1 for the prev-bar comparison).
  */
-// TRA-179: tightened back to 0.5%. The TRA-170 follow-up dropped the floor to
-// 0.3% to recover signal frequency, but the round-2 cost-aware backtest
-// (40 bps + 5 bps slippage) showed only a 16% 1R hit-rate at that floor —
-// effectively no edge. 0.5% kumo thickness restores the regime test to the
-// level where ichimoku has historically performed.
 const DEFAULT_KUMO_THICKNESS_PCT = 0.005;
 
 export interface IchimokuOptions {
   /**
    * Minimum cloud thickness (cloudTop − cloudBottom) / price required to
-   * accept a signal. Default 0.005 (0.5%, restored by TRA-179 after the
-   * round-2 cost-aware backtest showed 0.3% had no edge). Exposed so
-   * walk-forward (TRA-177) can sweep it.
+   * accept a signal. Default 0.005 (0.5%). Exposed so walk-forward (TRA-177)
+   * can sweep it.
    */
   kumoThicknessFloor?: number;
   /** Set false for 24/7 markets like crypto (default: true). */
@@ -57,32 +61,36 @@ export class IchimokuStrategy {
     if (this.enforceTimeFilter && !isValidTradingWindow(latest.timestamp)) return null;
 
     const cloud = ichimoku(candles);
-    if (!cloud) return null;
-
-    const cross = tkCross(candles);
-    if (!cross) return null;
+    const prevCloud = ichimoku(candles.slice(0, -1));
+    if (!cloud || !prevCloud) return null;
 
     const price = latest.close;
+    const prevClose = candles[candles.length - 2].close;
 
     // Kumo-thickness regime check (TRA-170): cloud must express a real trend.
-    // Replaces the previous ADX ≥ 25 gate.
     if (price <= 0) return null;
     const cloudThicknessPct = (cloud.cloudTop - cloud.cloudBottom) / price;
     if (cloudThicknessPct < this.kumoThicknessFloor) return null;
 
     let side: Side | null = null;
 
+    // Bull kumo breakout: prev close at-or-below the cloud top, curr close
+    // through it. TK bias must agree (tenkan > kijun) and chikou confirms.
     if (
-      cross === 'bullish' &&
-      price > cloud.cloudTop &&   // price fully above cloud (not inside it)
+      prevClose <= prevCloud.cloudTop &&
+      price > cloud.cloudTop &&
+      cloud.tenkan > cloud.kijun &&
       cloud.chikouAbove
     ) {
       side = 'buy';
     }
 
+    // Bear kumo breakout: prev close at-or-above the cloud bottom, curr close
+    // through it. TK bias must agree (tenkan < kijun) and chikou confirms.
     if (
-      cross === 'bearish' &&
-      price < cloud.cloudBottom && // price fully below cloud (not inside it)
+      prevClose >= prevCloud.cloudBottom &&
+      price < cloud.cloudBottom &&
+      cloud.tenkan < cloud.kijun &&
       !cloud.chikouAbove
     ) {
       side = 'sell';
