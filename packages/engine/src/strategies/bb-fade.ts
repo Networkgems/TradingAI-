@@ -14,7 +14,13 @@ export interface BbFadeOptions {
   bbMultiplier?: number;
   /** RSI period (default: 14) */
   rsiPeriod?: number;
-  /** RSI long-entry threshold (default: 30) */
+  /**
+   * RSI long-entry threshold (default: 35).
+   *
+   * TRA-170 follow-up: raised from 30 → 35 after the real-Coinbase acceptance
+   * run showed RSI<30 fires on only ~5% of 1h crypto bars; <35 catches roughly
+   * 13% and still rejects shallow pullbacks that aren't oversold.
+   */
   rsiOversold?: number;
   /** Set false for 24/7 markets like crypto (default: true). */
   enforceTimeFilter?: boolean;
@@ -31,7 +37,7 @@ export interface BbFadeOptions {
 /**
  * Bollinger-band mean-reversion fade (TRA-170 split — long-only).
  *
- * Buy: ADX ≤ 20 (ranging regime) + price at/below the lower band + RSI < 30.
+ * Buy: ADX ≤ 20 (ranging regime) + price at/below the lower band + RSI < 35.
  *
  * Stop  = min(latest.low, lower band) − 1¢ (recent low, bounded away from
  *         entry so a flat lower-band sweep doesn't yield a zero-width stop).
@@ -54,7 +60,7 @@ export class BbFadeStrategy {
     this.bbPeriod = opts.bbPeriod ?? 20;
     this.bbMultiplier = opts.bbMultiplier ?? 2;
     this.rsiPeriod = opts.rsiPeriod ?? 14;
-    this.rsiOversold = opts.rsiOversold ?? 30;
+    this.rsiOversold = opts.rsiOversold ?? 35;
     this.enforceTimeFilter = opts.enforceTimeFilter ?? true;
     this.atrPeriod = opts.atrPeriod ?? 14;
     this.volatilityFloorPct = opts.volatilityFloorPct ?? 0.003;

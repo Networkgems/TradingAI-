@@ -13,7 +13,14 @@ export interface MacdTrendOptions {
   bbPeriod?: number;
   /** BB multiplier (default: 2) */
   bbMultiplier?: number;
-  /** Volume multiplier to confirm signal (default: 1.5x average) */
+  /**
+   * Volume multiplier to confirm signal (default: 1.2× average).
+   *
+   * TRA-170 follow-up: lowered from 1.5× → 1.2× after the real-Coinbase
+   * acceptance run showed the cross+ADX+volume intersection capped frequency
+   * at 0–12 trades/asset/90d. 1.2× still rejects flat-volume drift while
+   * letting genuine continuation breakouts through.
+   */
   volumeMultiplier?: number;
   /** Bars to average for volume baseline (default: 20) */
   volumeLookback?: number;
@@ -65,7 +72,7 @@ export class MacdTrendStrategy {
   constructor(opts: MacdTrendOptions = {}) {
     this.bbPeriod = opts.bbPeriod ?? 20;
     this.bbMultiplier = opts.bbMultiplier ?? 2;
-    this.volumeMultiplier = opts.volumeMultiplier ?? 1.5;
+    this.volumeMultiplier = opts.volumeMultiplier ?? 1.2;
     this.volumeLookback = opts.volumeLookback ?? 20;
     this.enforceTimeFilter = opts.enforceTimeFilter ?? true;
     this.atrPeriod = opts.atrPeriod ?? 14;

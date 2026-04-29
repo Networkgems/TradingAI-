@@ -19,7 +19,10 @@ import type { RiskManager } from '../risk.js';
  * Stop loss at kijun-sen (base line); take-profit at 2:1 R:R.
  * Requires ≥ 79 candles (78 for ichimoku + 1 for TK cross comparison).
  */
-const MIN_KUMO_THICKNESS_PCT = 0.005; // 0.5% of price
+// TRA-170 follow-up: lowered from 0.5% → 0.3%. Real Coinbase 1h bars only
+// produced 0–6 ichimoku fires/asset/90d at 0.5%; 0.3% still requires a
+// meaningful cloud while letting more genuine breakouts through.
+const MIN_KUMO_THICKNESS_PCT = 0.003;
 
 export class IchimokuStrategy {
   evaluate(symbol: string, candles: Candle[]): TradeSignal | null {
