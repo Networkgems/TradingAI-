@@ -34,6 +34,12 @@ export interface ReversalOptions {
    * Default 0.003 (0.3%). Set 0 to disable.
    */
   volatilityFloorPct?: number;
+  /**
+   * Volume-climax multiplier vs. the trailing average over `lookback` bars.
+   * Default 1.3 (matches the post-TRA-170 hardcode). Exposed so walk-forward
+   * (TRA-172/177) can sweep it as a knob.
+   */
+  volumeMultiplier?: number;
 }
 
 /**
@@ -55,6 +61,7 @@ export class ReversalStrategy {
   private readonly atrStopMultiplier: number | null;
   private readonly atrTpMultiplier: number | null;
   private readonly volatilityFloorPct: number;
+  private readonly volumeMultiplier: number;
 
   constructor(opts: ReversalOptions = {}) {
     this.rsiPeriod = opts.rsiPeriod ?? 14;
@@ -66,6 +73,7 @@ export class ReversalStrategy {
     this.atrStopMultiplier = opts.atrStopMultiplier ?? null;
     this.atrTpMultiplier = opts.atrTpMultiplier ?? null;
     this.volatilityFloorPct = opts.volatilityFloorPct ?? 0.003;
+    this.volumeMultiplier = opts.volumeMultiplier ?? 1.3;
   }
 
   evaluate(symbol: string, candles: Candle[]): TradeSignal | null {
@@ -88,13 +96,14 @@ export class ReversalStrategy {
     const divergence = rsiDivergence(closes, this.rsiPeriod, this.lookback);
     const pattern = detectPattern(candles.slice(-2));
 
-    // Volume climax: current volume > 1.3× average of lookback window.
-    // TRA-170: lowered from 1.5× → 1.3× because the previous threshold blocked
-    // most genuine reversals on 1h crypto bars (where volume spikes are smaller
-    // than on equity 1-min bars). 1.3× still rejects flat-volume "drifts".
+    // Volume climax: current volume > volumeMultiplier × average of lookback
+    // window. TRA-170 lowered the default from 1.5× → 1.3× because the previous
+    // threshold blocked most genuine reversals on 1h crypto bars (where volume
+    // spikes are smaller than on equity 1-min bars). The multiplier is exposed
+    // (TRA-177) so walk-forward can sweep it.
     const window = candles.slice(-this.lookback - 1, -1);
     const avgVolume = window.reduce((s, c) => s + c.volume, 0) / window.length;
-    const volumeClimax = latest.volume > avgVolume * 1.3;
+    const volumeClimax = latest.volume > avgVolume * this.volumeMultiplier;
 
     // MACD direction is a *tiebreaker* (TRA-170): a contradictory cross vetoes
     // the entry, but a missing or neutral cross no longer blocks it.

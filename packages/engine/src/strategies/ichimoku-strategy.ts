@@ -22,16 +22,36 @@ import type { RiskManager } from '../risk.js';
 // TRA-170 follow-up: lowered from 0.5% → 0.3%. Real Coinbase 1h bars only
 // produced 0–6 ichimoku fires/asset/90d at 0.5%; 0.3% still requires a
 // meaningful cloud while letting more genuine breakouts through.
-const MIN_KUMO_THICKNESS_PCT = 0.003;
+const DEFAULT_KUMO_THICKNESS_PCT = 0.003;
+
+export interface IchimokuOptions {
+  /**
+   * Minimum cloud thickness (cloudTop − cloudBottom) / price required to
+   * accept a signal. Default 0.003 (0.3%, post-TRA-170). Exposed (TRA-177) so
+   * walk-forward can sweep it.
+   */
+  kumoThicknessFloor?: number;
+  /** Set false for 24/7 markets like crypto (default: true). */
+  enforceTimeFilter?: boolean;
+}
 
 export class IchimokuStrategy {
+  private readonly kumoThicknessFloor: number;
+  private readonly enforceTimeFilter: boolean;
+
+  constructor(opts: IchimokuOptions = {}) {
+    this.kumoThicknessFloor = opts.kumoThicknessFloor ?? DEFAULT_KUMO_THICKNESS_PCT;
+    this.enforceTimeFilter = opts.enforceTimeFilter ?? true;
+  }
+
   evaluate(symbol: string, candles: Candle[]): TradeSignal | null {
     if (candles.length < 79) return null;
 
     const latest = candles[candles.length - 1];
 
-    // Time filter: only trade during high-volume windows
-    if (!isValidTradingWindow(latest.timestamp)) return null;
+    // Time filter: only trade during high-volume windows (equity only;
+    // disabled for 24/7 crypto datasets via enforceTimeFilter=false).
+    if (this.enforceTimeFilter && !isValidTradingWindow(latest.timestamp)) return null;
 
     const cloud = ichimoku(candles);
     if (!cloud) return null;
@@ -45,7 +65,7 @@ export class IchimokuStrategy {
     // Replaces the previous ADX ≥ 25 gate.
     if (price <= 0) return null;
     const cloudThicknessPct = (cloud.cloudTop - cloud.cloudBottom) / price;
-    if (cloudThicknessPct < MIN_KUMO_THICKNESS_PCT) return null;
+    if (cloudThicknessPct < this.kumoThicknessFloor) return null;
 
     let side: Side | null = null;
 

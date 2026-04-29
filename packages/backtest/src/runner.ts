@@ -95,7 +95,7 @@ export class BacktestRunner {
       enforceTimeFilter: config.macdBollingerOpts?.enforceTimeFilter,
       volatilityFloorPct: config.macdBollingerOpts?.volatilityFloorPct,
     });
-    const ichimoku = new IchimokuStrategy();
+    const ichimoku = new IchimokuStrategy(config.ichimokuOpts);
     const scalping = new ScalpingStrategy(config.scalpingOpts);
     const swing = new SwingStrategy(config.swingOpts);
 

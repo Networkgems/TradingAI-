@@ -12,6 +12,15 @@ export interface BacktestReversalOpts {
   atrStopMultiplier?: number;
   /** TRA-171: skip signals when realized volatility (ATR/price) is below this floor. */
   volatilityFloorPct?: number;
+  /** TRA-177: volume-climax multiplier vs. lookback average (default 1.3). */
+  volumeMultiplier?: number;
+}
+
+export interface BacktestIchimokuOpts {
+  /** TRA-177: minimum cloud thickness (cloudTop − cloudBottom) / price. */
+  kumoThicknessFloor?: number;
+  /** Pass-through to the engine strategy; set false for 24/7 crypto datasets. */
+  enforceTimeFilter?: boolean;
 }
 
 export interface BacktestMacdBollingerOpts {
@@ -71,6 +80,7 @@ export interface BacktestConfig {
     | 'swing';
   reversalOpts?: BacktestReversalOpts;
   macdBollingerOpts?: BacktestMacdBollingerOpts;
+  ichimokuOpts?: BacktestIchimokuOpts;
   /**
    * Pass-through to OrbStrategy. Use this to inject `timeFilter:
    * isValidCryptoTradingWindow` and a `sessionAnchorTimestampOf` callback for

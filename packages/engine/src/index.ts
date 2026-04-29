@@ -9,6 +9,7 @@ export type { MacdTrendOptions } from './strategies/macd-trend.js';
 export { BbFadeStrategy } from './strategies/bb-fade.js';
 export type { BbFadeOptions } from './strategies/bb-fade.js';
 export { IchimokuStrategy } from './strategies/ichimoku-strategy.js';
+export type { IchimokuOptions } from './strategies/ichimoku-strategy.js';
 export { ScalpingStrategy } from './strategies/scalping-strategy.js';
 export type { ScalpingOptions } from './strategies/scalping-strategy.js';
 export { SwingStrategy } from './strategies/swing-strategy.js';
