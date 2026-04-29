@@ -20,6 +20,12 @@ export interface BacktestReversalOpts {
   retestExpiryBars?: number;
   /** TRA-179: take-profit multiple applied to the retest stop distance. */
   retestRewardMultiple?: number;
+  /** TRA-181: tolerance band around the midpoint, as a fraction of |entry-stop|. 0 = strict. */
+  retestTolerancePct?: number;
+  /** TRA-181: structural-stop buffer fraction applied to the retest bar's low/high. Default 0.25. */
+  retestStopBufferFrac?: number;
+  /** TRA-181: when true, the retest bar must clear the signal-bar volume to fire. */
+  retestRequireVolumeIncrease?: boolean;
 }
 
 export interface BacktestIchimokuOpts {

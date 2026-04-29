@@ -65,6 +65,27 @@ export interface ReversalOptions {
    * catastrophic per-trade RR in the round-2 backtest.
    */
   retestRewardMultiple?: number;
+  /**
+   * TRA-181: tolerance band around the midpoint retest level, expressed as a
+   * fraction of `|originalEntry − originalStop|`. 0 (default) = strict midpoint
+   * touch (legacy TRA-179 behaviour). 0.10 = the retest fires anywhere within
+   * ±10% of the entry/stop distance around the midpoint, i.e. shallower
+   * pullbacks count as a touch.
+   */
+  retestTolerancePct?: number;
+  /**
+   * TRA-181: structural-stop buffer applied to the retest bar's low/high,
+   * expressed as a fraction of the bar's structural distance. Default 0.25
+   * matches the original TRA-179 hardcode. Smaller values tighten the stop
+   * (better R:R but more whipsaw); larger values give more slack.
+   */
+  retestStopBufferFrac?: number;
+  /**
+   * TRA-181: when true, the retest only fires if the retest bar's volume is
+   * at least the signal bar's volume. Default false. Acts as a confirmation
+   * filter — a retest accompanied by participation rather than fade.
+   */
+  retestRequireVolumeIncrease?: boolean;
 }
 
 interface PendingRetest {
@@ -79,6 +100,8 @@ interface PendingRetest {
   retestLevel: number;
   /** Original signal-bar stop — used as a hard invalidation: if price runs past it, scrap the pending. */
   originalStop: number;
+  /** Signal-bar volume captured at arm time so the optional retest-volume gate has something to compare to. */
+  signalBarVolume: number;
 }
 
 /**
@@ -113,6 +136,9 @@ export class ReversalStrategy {
   private readonly retestEntry: boolean;
   private readonly retestExpiryBars: number;
   private readonly retestRewardMultiple: number;
+  private readonly retestTolerancePct: number;
+  private readonly retestStopBufferFrac: number;
+  private readonly retestRequireVolumeIncrease: boolean;
 
   /** Pending retest state, keyed by symbol so live multi-symbol callers stay isolated. */
   private readonly pending: Map<string, PendingRetest> = new Map();
@@ -131,6 +157,9 @@ export class ReversalStrategy {
     this.retestEntry = opts.retestEntry ?? true;
     this.retestExpiryBars = opts.retestExpiryBars ?? 16;
     this.retestRewardMultiple = opts.retestRewardMultiple ?? 3;
+    this.retestTolerancePct = opts.retestTolerancePct ?? 0;
+    this.retestStopBufferFrac = opts.retestStopBufferFrac ?? 0.25;
+    this.retestRequireVolumeIncrease = opts.retestRequireVolumeIncrease ?? false;
   }
 
   evaluate(symbol: string, candles: Candle[]): TradeSignal | null {
@@ -244,6 +273,7 @@ export class ReversalStrategy {
         originalEntry: entryPrice,
         retestLevel: (entryPrice + stopLoss) / 2,
         originalStop: stopLoss,
+        signalBarVolume: latest.volume,
       });
       return null;
     }
@@ -296,10 +326,25 @@ export class ReversalStrategy {
       return null;
     }
 
+    // TRA-181: optional tolerance band — `retestTolerancePct` of the
+    // entry/stop distance is added to the touch level so a shallow pullback
+    // counts as a retest. Default 0 reproduces the strict TRA-179 midpoint.
+    const tolDistance = this.retestTolerancePct > 0
+      ? Math.abs(pending.originalEntry - pending.originalStop) * this.retestTolerancePct
+      : 0;
+    const buyTouchLevel = pending.retestLevel + tolDistance;
+    const sellTouchLevel = pending.retestLevel - tolDistance;
     const touched = pending.side === 'buy'
-      ? latest.low <= pending.retestLevel
-      : latest.high >= pending.retestLevel;
+      ? latest.low <= buyTouchLevel
+      : latest.high >= sellTouchLevel;
     if (!touched) return null;
+
+    // TRA-181: optional volume confirmation — the retest bar must clear the
+    // signal bar's volume. Filters out fade pullbacks where price drifts back
+    // to the level on no participation.
+    if (this.retestRequireVolumeIncrease && latest.volume < pending.signalBarVolume) {
+      return null;
+    }
 
     // Confirmation guard: a contradictory MACD cross during the wait
     // (momentum flipped) or a fully-reversed RSI extreme (price has
@@ -319,12 +364,10 @@ export class ReversalStrategy {
 
     // Entry at the retest bar's close (a stronger fill than the retest level
     // itself when the bar pulled in and rejected). Stop is the bar's
-    // low/high *with a 25% buffer* so the runner's `bar.low <= stop` check
-    // doesn't trivially fire on the entry bar — the buffer guarantees the
-    // stop sits strictly below the bar's structural low and only fires on a
-    // genuine break. The buffer is sized as a fraction of the structural
-    // distance so it scales with the asset's volatility.
-    const STRUCTURAL_STOP_BUFFER_FRAC = 0.25;
+    // low/high *with a configurable buffer* (TRA-181, was a hardcoded 25% in
+    // TRA-179) so the runner's `bar.low <= stop` check doesn't trivially fire
+    // on the entry bar — the buffer guarantees the stop sits strictly below
+    // the bar's structural low and only fires on a genuine break.
     const entryPrice = latest.close;
     const structuralLevel = pending.side === 'buy' ? latest.low : latest.high;
     const rawStopDistance = Math.abs(entryPrice - structuralLevel);
@@ -332,7 +375,7 @@ export class ReversalStrategy {
       this.pending.delete(symbol);
       return null;
     }
-    const stopDistance = rawStopDistance * (1 + STRUCTURAL_STOP_BUFFER_FRAC);
+    const stopDistance = rawStopDistance * (1 + this.retestStopBufferFrac);
     const stopLoss = pending.side === 'buy'
       ? entryPrice - stopDistance
       : entryPrice + stopDistance;
