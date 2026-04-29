@@ -93,6 +93,7 @@ export class BacktestRunner {
       bbPeriod: config.macdBollingerOpts?.bbPeriod,
       bbMultiplier: config.macdBollingerOpts?.bbMultiplier,
       enforceTimeFilter: config.macdBollingerOpts?.enforceTimeFilter,
+      volatilityFloorPct: config.macdBollingerOpts?.volatilityFloorPct,
     });
     const ichimoku = new IchimokuStrategy();
     const scalping = new ScalpingStrategy(config.scalpingOpts);
