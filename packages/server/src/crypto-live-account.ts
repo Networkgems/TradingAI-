@@ -3,6 +3,7 @@ import { MANAGED_ACCOUNT_RATIO, DEFAULT_RISK_PER_TRADE } from '@trading-app/shar
 import type {
   CoinbaseOrderClient,
   CoinbaseAccountBalance,
+  CoinbaseOrderDetails,
   CoinbaseOrderSuccessResponse,
 } from '@trading-app/engine';
 import { randomUUID } from 'crypto';
@@ -11,11 +12,33 @@ import { randomUUID } from 'crypto';
 const CASH_CURRENCIES = new Set(['USD', 'USDC', 'USDT']);
 const BALANCE_REFRESH_MS = 30_000;
 
+/**
+ * Backoff schedule (ms) for polling `GET /orders/historical/{id}` after a
+ * market IOC order succeeds. Coinbase usually fills these within tens of ms,
+ * but the historical endpoint can briefly report PENDING; budget ~5s total
+ * before treating the order as suspect (TRA-156).
+ */
+const FILL_POLL_DELAYS_MS = [0, 200, 400, 800, 1500, 2000];
+
+const TERMINAL_FAILURE_STATUSES = new Set(['CANCELLED', 'EXPIRED', 'FAILED']);
+
 export interface CryptoLiveAccountState {
   totalEquity: number;
   availableCash: number;
   openPositions: Position[];
   dailyPnl: number;
+}
+
+export interface CryptoLiveAccountOptions {
+  /** Override sleep so tests can advance time without real timers. */
+  sleep?: (ms: number) => Promise<void>;
+}
+
+interface ReconciledFill {
+  /** Volume-weighted average fill price across all partial fills. */
+  price: number;
+  /** Total base size actually filled. */
+  size: number;
 }
 
 /**
@@ -36,14 +59,16 @@ export interface CryptoLiveAccountState {
  */
 export class CryptoLiveAccount {
   private readonly coinbase: CoinbaseOrderClient;
+  private readonly sleep: (ms: number) => Promise<void>;
   private readonly positions: Map<string, Position> = new Map();
   private cashUsd = 0;
   private equityUsd = 0;
   private realizedPnlToday = 0;
   private lastBalanceRefresh = 0;
 
-  constructor(coinbase: CoinbaseOrderClient) {
+  constructor(coinbase: CoinbaseOrderClient, opts: CryptoLiveAccountOptions = {}) {
     this.coinbase = coinbase;
+    this.sleep = opts.sleep ?? ((ms) => new Promise(r => setTimeout(r, ms)));
   }
 
   /** Refresh USD-equivalent cash from Coinbase. Should be called periodically. */
@@ -151,21 +176,29 @@ export class CryptoLiveAccount {
       throw err;
     }
 
+    // Reconcile against the real fill so the local mirror reflects what Coinbase
+    // actually executed (TRA-156). Falls back to the quote price/requested qty
+    // if the API hasn't caught up — refreshBalance() will smooth out any drift.
+    const fill = await this.awaitFill(resp.order_id, signal.symbol);
+    const entryPrice = fill?.price ?? currentPrice;
+    const filledQty = fill?.size ?? qty;
+
     const position: Position = {
       id: randomUUID(),
       symbol: signal.symbol,
       side: signal.side,
       signalType: signal.type,
-      entryPrice: currentPrice,
-      quantity: qty,
+      entryPrice,
+      quantity: filledQty,
       stopLoss: signal.stopLoss,
       takeProfit: signal.takeProfit,
       openedAt: Date.now(),
     };
     this.positions.set(position.id, position);
     // Optimistic cash debit; refreshBalance() will reconcile from Coinbase.
-    this.cashUsd -= cost;
-    console.log(`[crypto-live] OPEN ${signal.side.toUpperCase()} ${qty} ${signal.symbol} @ ~${currentPrice.toFixed(2)} (coinbase order=${resp.order_id})`);
+    this.cashUsd -= entryPrice * filledQty;
+    const reconciled = fill ? `@ ${entryPrice.toFixed(2)} (filled ${filledQty})` : `@ ~${currentPrice.toFixed(2)} (unreconciled)`;
+    console.log(`[crypto-live] OPEN ${signal.side.toUpperCase()} ${signal.symbol} ${reconciled} (coinbase order=${resp.order_id})`);
     return position;
   }
 
@@ -190,8 +223,9 @@ export class CryptoLiveAccount {
       if (!hit) continue;
 
       const exitSide: 'buy' | 'sell' = pos.side === 'buy' ? 'sell' : 'buy';
+      let exitOrder: CoinbaseOrderSuccessResponse;
       try {
-        await this.coinbase.placeMarketOrder({
+        exitOrder = await this.coinbase.placeMarketOrder({
           productId: pos.symbol,
           side: exitSide,
           baseSize: pos.quantity,
@@ -201,18 +235,25 @@ export class CryptoLiveAccount {
         continue;
       }
 
-      const exitPrice = hit === 'tp' ? pos.takeProfit : pos.stopLoss;
+      // Prefer the real fill VWAP from Coinbase over our TP/SL trigger price so
+      // realized P&L matches the Coinbase statement (TRA-156). Fall back to the
+      // trigger price if the historical-orders endpoint doesn't settle in time.
+      const exitFill = await this.awaitFill(exitOrder.order_id, pos.symbol);
+      const triggerPrice = hit === 'tp' ? pos.takeProfit : pos.stopLoss;
+      const exitPrice = exitFill?.price ?? triggerPrice;
+      const exitQty = exitFill?.size ?? pos.quantity;
       const multiplier = pos.side === 'buy' ? 1 : -1;
-      const pnl = (exitPrice - pos.entryPrice) * pos.quantity * multiplier;
+      const pnl = (exitPrice - pos.entryPrice) * exitQty * multiplier;
       pos.pnl = pnl;
       pos.closedAt = Date.now();
       pos.exitPrice = exitPrice;
+      pos.quantity = exitQty;
       this.realizedPnlToday += pnl;
-      this.cashUsd += exitPrice * pos.quantity;
+      this.cashUsd += exitPrice * exitQty;
       this.equityUsd += pnl;
       this.positions.delete(id);
       closed.push({ ...pos });
-      console.log(`[crypto-live] CLOSE ${pos.symbol} ${hit.toUpperCase()} pnl=${pnl.toFixed(2)}`);
+      console.log(`[crypto-live] CLOSE ${pos.symbol} ${hit.toUpperCase()} @ ${exitPrice.toFixed(2)} pnl=${pnl.toFixed(2)}`);
     }
     return closed;
   }
@@ -222,18 +263,22 @@ export class CryptoLiveAccount {
     const pos = this.positions.get(positionId);
     if (!pos) return null;
     const exitSide: 'buy' | 'sell' = pos.side === 'buy' ? 'sell' : 'buy';
-    await this.coinbase.placeMarketOrder({
+    const exitOrder = await this.coinbase.placeMarketOrder({
       productId: pos.symbol,
       side: exitSide,
       baseSize: pos.quantity,
     });
+    const exitFill = await this.awaitFill(exitOrder.order_id, pos.symbol);
+    const exitPrice = exitFill?.price ?? currentPrice;
+    const exitQty = exitFill?.size ?? pos.quantity;
     const multiplier = pos.side === 'buy' ? 1 : -1;
-    const pnl = (currentPrice - pos.entryPrice) * pos.quantity * multiplier;
+    const pnl = (exitPrice - pos.entryPrice) * exitQty * multiplier;
     pos.pnl = pnl;
-    pos.exitPrice = currentPrice;
+    pos.exitPrice = exitPrice;
+    pos.quantity = exitQty;
     pos.closedAt = Date.now();
     this.realizedPnlToday += pnl;
-    this.cashUsd += currentPrice * pos.quantity;
+    this.cashUsd += exitPrice * exitQty;
     this.equityUsd += pnl;
     this.positions.delete(positionId);
     return { ...pos };
@@ -242,5 +287,51 @@ export class CryptoLiveAccount {
   /** Reset realized P&L tracker — called on UTC day rollover by the engine. */
   rolloverDay(): void {
     this.realizedPnlToday = 0;
+  }
+
+  /**
+   * Poll `GET /orders/historical/{order_id}` until the order reports FILLED,
+   * or until the backoff schedule is exhausted. Returns the VWAP price + total
+   * filled size. Returns null on:
+   *
+   * - terminal failure statuses (CANCELLED / EXPIRED / FAILED) — caller should
+   *   keep its requested values; refreshBalance will rebalance cash next tick;
+   * - timeout (Coinbase still reports OPEN/PENDING after ~5s);
+   * - repeated lookup errors.
+   *
+   * Throwing here would invert the API contract — `placeMarketOrder` already
+   * succeeded, so we'd lose the position record entirely. A warning + null
+   * keeps us aligned with the legacy "use quote price" behaviour.
+   */
+  private async awaitFill(orderId: string, symbol: string): Promise<ReconciledFill | null> {
+    let lastStatus = 'unknown';
+    for (let i = 0; i < FILL_POLL_DELAYS_MS.length; i++) {
+      const delay = FILL_POLL_DELAYS_MS[i];
+      if (delay > 0) await this.sleep(delay);
+      let order: CoinbaseOrderDetails;
+      try {
+        order = await this.coinbase.getOrder(orderId);
+      } catch (err: unknown) {
+        console.warn(`[crypto-live] fill lookup ${orderId} (${symbol}) attempt ${i + 1} failed: ${err instanceof Error ? err.message : String(err)}`);
+        continue;
+      }
+      lastStatus = (order.status ?? 'unknown').toUpperCase();
+      if (lastStatus === 'FILLED') {
+        const price = parseFloat(order.average_filled_price);
+        const size = parseFloat(order.filled_size);
+        if (Number.isFinite(price) && Number.isFinite(size) && price > 0 && size > 0) {
+          return { price, size };
+        }
+        console.warn(`[crypto-live] fill ${orderId} (${symbol}) FILLED with bad numbers price=${order.average_filled_price} size=${order.filled_size}`);
+        return null;
+      }
+      if (TERMINAL_FAILURE_STATUSES.has(lastStatus)) {
+        console.warn(`[crypto-live] fill ${orderId} (${symbol}) terminal status=${lastStatus}; cannot reconcile`);
+        return null;
+      }
+      // OPEN / PENDING — keep polling.
+    }
+    console.warn(`[crypto-live] fill ${orderId} (${symbol}) did not settle within ${FILL_POLL_DELAYS_MS.length} attempts (last status=${lastStatus})`);
+    return null;
   }
 }

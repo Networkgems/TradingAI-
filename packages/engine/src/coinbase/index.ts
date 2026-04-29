@@ -3,6 +3,7 @@ export type {
   CoinbaseOrderClientOptions,
   CoinbaseAccountBalance,
   CoinbaseOrderSuccessResponse,
+  CoinbaseOrderDetails,
   MarketOrderParams,
   LimitOrderParams,
   CoinbaseAuthScheme,

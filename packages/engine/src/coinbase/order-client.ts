@@ -42,6 +42,27 @@ interface CreateOrderResponse {
   error_response?: { error?: string; message?: string; error_details?: string };
 }
 
+/**
+ * Subset of `GET /api/v3/brokerage/orders/historical/{order_id}` that we use
+ * to reconcile an executed market order to its actual fill price (TRA-156).
+ * Coinbase returns more fields; we only model the ones we read.
+ */
+export interface CoinbaseOrderDetails {
+  order_id: string;
+  product_id: string;
+  side: 'BUY' | 'SELL';
+  /** OPEN, FILLED, CANCELLED, EXPIRED, FAILED, PENDING — string-typed to tolerate forward additions. */
+  status: string;
+  /** VWAP of all fills so far. "0" while pending. */
+  average_filled_price: string;
+  /** Total base size filled across all partial fills. */
+  filled_size: string;
+}
+
+interface GetOrderResponse {
+  order: CoinbaseOrderDetails;
+}
+
 export interface MarketOrderParams {
   productId: string;
   side: Side;
@@ -173,6 +194,17 @@ export class CoinbaseOrderClient {
     const path = '/api/v3/brokerage/accounts';
     const data = await this.request<ListAccountsResponse>('GET', path, '');
     return data.accounts ?? [];
+  }
+
+  /**
+   * GET /api/v3/brokerage/orders/historical/{order_id} — fetch the canonical
+   * order record so callers can reconcile a market order to its actual fill
+   * price and filled size (TRA-156).
+   */
+  async getOrder(orderId: string): Promise<CoinbaseOrderDetails> {
+    const path = `/api/v3/brokerage/orders/historical/${encodeURIComponent(orderId)}`;
+    const data = await this.request<GetOrderResponse>('GET', path, '');
+    return data.order;
   }
 
   /**
