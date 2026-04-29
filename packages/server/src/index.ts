@@ -728,8 +728,20 @@ app.post('/api/options/:id/close', requireAuth, async (req, res) => {
 app.post('/api/crypto/coinbase/test-connection', requireAuth, async (_req, res) => {
   const username = res.locals['authUser'] as string;
   const settings = getSettings(username);
-  const apiKey = (settings.liveApiKey?.trim() || process.env['COINBASE_API_KEY'] || '').trim();
-  const apiSecret = (settings.liveApiSecret?.trim() || process.env['COINBASE_API_SECRET'] || '').trim();
+  // Same precedence as crypto-engine.buildLiveBroker: per-market crypto
+  // credentials (TRA-165) → legacy un-suffixed fields → env vars.
+  const apiKey = (
+    settings.liveApiKeyCrypto?.trim()
+    || settings.liveApiKey?.trim()
+    || process.env['COINBASE_API_KEY']
+    || ''
+  ).trim();
+  const apiSecret = (
+    settings.liveApiSecretCrypto?.trim()
+    || settings.liveApiSecret?.trim()
+    || process.env['COINBASE_API_SECRET']
+    || ''
+  ).trim();
   if (!apiKey || !apiSecret) {
     res.json({ ok: false, error: 'Coinbase API key and secret are not configured. Save them in Settings before testing.' });
     return;
