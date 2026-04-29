@@ -3,6 +3,7 @@ import { randomUUID } from 'crypto';
 import { ema, emaCross } from '../indicators/ema.js';
 import { rsi } from '../indicators/rsi.js';
 import { VwapTracker } from '../indicators/vwap.js';
+import { atr } from '../indicators/atr.js';
 import type { AlpacaOrderClient } from '../alpaca/index.js';
 import type { RiskManager } from '../risk.js';
 
@@ -31,6 +32,27 @@ export interface ScalpingOptions {
   rrRatio?: number;
   /** Set false for 24/7 crypto markets (default: false) */
   enforceTimeFilter?: boolean;
+  /**
+   * ATR lookback period (default: 14). Used for both the ATR-based stop and
+   * the dead-tape volatility regime gate.
+   */
+  atrPeriod?: number;
+  /**
+   * If set and ATR can be computed, stop distance is `atrStopMultiplier × ATR`
+   * instead of `stopPct × entry`. Default 1.5 for scalping (per TRA-171).
+   * Set to 0 to force the fixed-pct path even when ATR is available.
+   */
+  atrStopMultiplier?: number;
+  /**
+   * If set, take-profit distance is `atrTpMultiplier × ATR` instead of
+   * `rrRatio × stopDistance`. Defaults to undefined → fall back to rrRatio.
+   */
+  atrTpMultiplier?: number;
+  /**
+   * Dead-tape filter: skip signals when ATR / price is below this fraction.
+   * Default 0.003 (0.3%). Set 0 to disable.
+   */
+  volatilityFloorPct?: number;
 }
 
 /**
@@ -54,6 +76,10 @@ export class ScalpingStrategy {
   private readonly stopPct: number;
   private readonly rrRatio: number;
   private readonly enforceTimeFilter: boolean;
+  private readonly atrPeriod: number;
+  private readonly atrStopMultiplier: number;
+  private readonly atrTpMultiplier: number | null;
+  private readonly volatilityFloorPct: number;
   private readonly vwap = new VwapTracker();
 
   constructor(opts: ScalpingOptions = {}) {
@@ -69,6 +95,10 @@ export class ScalpingStrategy {
     this.stopPct = opts.stopPct ?? 0.0075;
     this.rrRatio = opts.rrRatio ?? 2;
     this.enforceTimeFilter = opts.enforceTimeFilter ?? false;
+    this.atrPeriod = opts.atrPeriod ?? 14;
+    this.atrStopMultiplier = opts.atrStopMultiplier ?? 1.5;
+    this.atrTpMultiplier = opts.atrTpMultiplier ?? null;
+    this.volatilityFloorPct = opts.volatilityFloorPct ?? 0.003;
   }
 
   evaluate(symbol: string, candles: Candle[]): TradeSignal | null {
@@ -126,14 +156,28 @@ export class ScalpingStrategy {
 
     if (!side) return null;
 
+    // Volatility regime gate + ATR-based stop sizing.
+    // ATR is computed once and reused both for the dead-tape gate (skip
+    // when stops would barely cover spread + commissions) and for sizing
+    // an adaptive stop instead of a fixed percentage.
     const entryPrice = latest.close;
-    const stopLoss = side === 'buy'
-      ? entryPrice * (1 - this.stopPct)
-      : entryPrice * (1 + this.stopPct);
-    const stopDistance = Math.abs(entryPrice - stopLoss);
-    const takeProfit = side === 'buy'
-      ? entryPrice + stopDistance * this.rrRatio
-      : entryPrice - stopDistance * this.rrRatio;
+    const atrValue = atr(candles, this.atrPeriod);
+    if (atrValue !== null && this.volatilityFloorPct > 0) {
+      const atrFraction = entryPrice > 0 ? atrValue / entryPrice : 0;
+      if (atrFraction < this.volatilityFloorPct) return null;
+    }
+
+    const useAtrStop = atrValue !== null && this.atrStopMultiplier > 0;
+    const fixedDistance = entryPrice * this.stopPct;
+    const stopDistance = useAtrStop ? this.atrStopMultiplier * atrValue : fixedDistance;
+    if (stopDistance <= 0) return null;
+
+    const tpDistance = useAtrStop && this.atrTpMultiplier !== null
+      ? this.atrTpMultiplier * atrValue
+      : stopDistance * this.rrRatio;
+
+    const stopLoss = side === 'buy' ? entryPrice - stopDistance : entryPrice + stopDistance;
+    const takeProfit = side === 'buy' ? entryPrice + tpDistance : entryPrice - tpDistance;
 
     return {
       id: randomUUID(),
@@ -143,7 +187,7 @@ export class ScalpingStrategy {
       entryPrice,
       stopLoss,
       takeProfit,
-      riskRewardRatio: this.rrRatio,
+      riskRewardRatio: tpDistance / stopDistance,
       timestamp: latest.timestamp,
     };
   }

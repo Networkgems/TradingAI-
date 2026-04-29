@@ -4,6 +4,7 @@ import { ema } from '../indicators/ema.js';
 import { rsi } from '../indicators/rsi.js';
 import { macd } from '../indicators/macd.js';
 import { adx } from '../indicators/adx.js';
+import { atr } from '../indicators/atr.js';
 import type { AlpacaOrderClient } from '../alpaca/index.js';
 import type { RiskManager } from '../risk.js';
 
@@ -30,6 +31,24 @@ export interface SwingOptions {
   rrRatio?: number;
   /** Require ADX ≥ 25 before taking signals (default: true) */
   requireAdxTrend?: boolean;
+  /** ATR lookback period (default: 14). */
+  atrPeriod?: number;
+  /**
+   * If set and ATR computes, stop distance is `atrStopMultiplier × ATR`
+   * instead of `stopPct × entry`. Default 2 for swing (per TRA-171).
+   * Set to 0 to force the fixed-pct path.
+   */
+  atrStopMultiplier?: number;
+  /**
+   * If set, take-profit distance is `atrTpMultiplier × ATR` instead of
+   * `rrRatio × stopDistance`. Defaults to undefined → fall back to rrRatio.
+   */
+  atrTpMultiplier?: number;
+  /**
+   * Dead-tape filter: skip signals when ATR / price is below this fraction.
+   * Default 0.003 (0.3%). Set 0 to disable.
+   */
+  volatilityFloorPct?: number;
 }
 
 /**
@@ -56,6 +75,10 @@ export class SwingStrategy {
   private readonly stopPct: number;
   private readonly rrRatio: number;
   private readonly requireAdxTrend: boolean;
+  private readonly atrPeriod: number;
+  private readonly atrStopMultiplier: number;
+  private readonly atrTpMultiplier: number | null;
+  private readonly volatilityFloorPct: number;
 
   constructor(opts: SwingOptions = {}) {
     this.fastEmaPeriod = opts.fastEmaPeriod ?? 50;
@@ -69,6 +92,10 @@ export class SwingStrategy {
     this.stopPct = opts.stopPct ?? 0.05;
     this.rrRatio = opts.rrRatio ?? 2;
     this.requireAdxTrend = opts.requireAdxTrend ?? true;
+    this.atrPeriod = opts.atrPeriod ?? 14;
+    this.atrStopMultiplier = opts.atrStopMultiplier ?? 2;
+    this.atrTpMultiplier = opts.atrTpMultiplier ?? null;
+    this.volatilityFloorPct = opts.volatilityFloorPct ?? 0.003;
   }
 
   evaluate(symbol: string, candles: Candle[]): TradeSignal | null {
@@ -129,14 +156,25 @@ export class SwingStrategy {
 
     if (!side) return null;
 
+    // Volatility regime gate + ATR-adaptive stop sizing.
     const entryPrice = latest.close;
-    const stopLoss = side === 'buy'
-      ? entryPrice * (1 - this.stopPct)
-      : entryPrice * (1 + this.stopPct);
-    const stopDistance = Math.abs(entryPrice - stopLoss);
-    const takeProfit = side === 'buy'
-      ? entryPrice + stopDistance * this.rrRatio
-      : entryPrice - stopDistance * this.rrRatio;
+    const atrValue = atr(candles, this.atrPeriod);
+    if (atrValue !== null && this.volatilityFloorPct > 0) {
+      const atrFraction = entryPrice > 0 ? atrValue / entryPrice : 0;
+      if (atrFraction < this.volatilityFloorPct) return null;
+    }
+
+    const useAtrStop = atrValue !== null && this.atrStopMultiplier > 0;
+    const fixedDistance = entryPrice * this.stopPct;
+    const stopDistance = useAtrStop ? this.atrStopMultiplier * atrValue : fixedDistance;
+    if (stopDistance <= 0) return null;
+
+    const tpDistance = useAtrStop && this.atrTpMultiplier !== null
+      ? this.atrTpMultiplier * atrValue
+      : stopDistance * this.rrRatio;
+
+    const stopLoss = side === 'buy' ? entryPrice - stopDistance : entryPrice + stopDistance;
+    const takeProfit = side === 'buy' ? entryPrice + tpDistance : entryPrice - tpDistance;
 
     return {
       id: randomUUID(),
@@ -146,7 +184,7 @@ export class SwingStrategy {
       entryPrice,
       stopLoss,
       takeProfit,
-      riskRewardRatio: this.rrRatio,
+      riskRewardRatio: tpDistance / stopDistance,
       timestamp: latest.timestamp,
     };
   }
