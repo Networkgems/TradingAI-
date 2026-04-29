@@ -14,6 +14,12 @@ export interface BacktestReversalOpts {
   volatilityFloorPct?: number;
   /** TRA-177: volume-climax multiplier vs. lookback average (default 1.3). */
   volumeMultiplier?: number;
+  /** TRA-179: arm a pending retest on the first match instead of firing immediately. */
+  retestEntry?: boolean;
+  /** TRA-179: bars to wait for a retest before discarding the pending. */
+  retestExpiryBars?: number;
+  /** TRA-179: take-profit multiple applied to the retest stop distance. */
+  retestRewardMultiple?: number;
 }
 
 export interface BacktestIchimokuOpts {

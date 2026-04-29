@@ -40,6 +40,45 @@ export interface ReversalOptions {
    * (TRA-172/177) can sweep it as a knob.
    */
   volumeMultiplier?: number;
+  /**
+   * TRA-179: when true (default) the first bar that satisfies all entry
+   * conditions arms a "pending" signal whose entry only fires once a later
+   * bar pulls back to the midpoint between the original entry and stop. The
+   * retest bar's low/high becomes the new structural stop, which is typically
+   * tighter than the original signal-bar window extreme. Set false to fall
+   * back to immediate entry on the signal bar (legacy behavior).
+   */
+  retestEntry?: boolean;
+  /**
+   * TRA-179: maximum bars to wait for a retest before discarding a pending
+   * signal. Default 16 — tuned on the round-2 crypto sample to give the
+   * pullback enough time to print without dragging the entry into a regime
+   * change.
+   */
+  retestExpiryBars?: number;
+  /**
+   * TRA-179: take-profit multiple applied to the *retest* stop distance, i.e.
+   * `tp = retestEntry + retestRewardMultiple × |retestEntry − retestStop|`
+   * (sign-flipped for shorts). Default 3 keeps the strategy's longstanding
+   * 3:1 R:R, but expressed against the *new* tighter stop instead of the
+   * legacy signal-bar window stop — that mismatch was what produced the
+   * catastrophic per-trade RR in the round-2 backtest.
+   */
+  retestRewardMultiple?: number;
+}
+
+interface PendingRetest {
+  side: Side;
+  /** Bar count (`candles.length`) at the moment the pending was armed. */
+  armedAtBars: number;
+  /** Discard once `candles.length` exceeds this. */
+  expiresAtBars: number;
+  /** Original signal-bar entry price (used for retest level + sanity). */
+  originalEntry: number;
+  /** Midpoint(originalEntry, originalStop). Retest fires when price touches this level. */
+  retestLevel: number;
+  /** Original signal-bar stop — used as a hard invalidation: if price runs past it, scrap the pending. */
+  originalStop: number;
 }
 
 /**
@@ -50,6 +89,15 @@ export interface ReversalOptions {
  * + volume spike can produce a signal even when MACD is flat. The MACD cross
  * direction is now a *tiebreaker* (it can veto the opposite-direction cross,
  * but a missing/neutral cross no longer blocks the entry).
+ *
+ * TRA-179: retest entry. The post-TRA-170 backtest showed an 88% 1R hit rate
+ * on raw signals but a -3.47R per-trade outcome — stops were getting hit
+ * before the take-profit because the signal bar itself is a high-volatility
+ * inflection point. Now the strategy arms a pending signal on the first
+ * match and only enters on a subsequent pullback to the midpoint between
+ * the original entry and stop. The retest bar's low/high becomes the
+ * structural stop (tighter than the original window extreme), which collapses
+ * the per-trade R:R asymmetry in the backtest.
  */
 export class ReversalStrategy {
   private readonly rsiPeriod: number;
@@ -62,6 +110,12 @@ export class ReversalStrategy {
   private readonly atrTpMultiplier: number | null;
   private readonly volatilityFloorPct: number;
   private readonly volumeMultiplier: number;
+  private readonly retestEntry: boolean;
+  private readonly retestExpiryBars: number;
+  private readonly retestRewardMultiple: number;
+
+  /** Pending retest state, keyed by symbol so live multi-symbol callers stay isolated. */
+  private readonly pending: Map<string, PendingRetest> = new Map();
 
   constructor(opts: ReversalOptions = {}) {
     this.rsiPeriod = opts.rsiPeriod ?? 14;
@@ -74,6 +128,9 @@ export class ReversalStrategy {
     this.atrTpMultiplier = opts.atrTpMultiplier ?? null;
     this.volatilityFloorPct = opts.volatilityFloorPct ?? 0.003;
     this.volumeMultiplier = opts.volumeMultiplier ?? 1.3;
+    this.retestEntry = opts.retestEntry ?? true;
+    this.retestExpiryBars = opts.retestExpiryBars ?? 16;
+    this.retestRewardMultiple = opts.retestRewardMultiple ?? 3;
   }
 
   evaluate(symbol: string, candles: Candle[]): TradeSignal | null {
@@ -83,6 +140,15 @@ export class ReversalStrategy {
 
     // Time filter: avoid midday chop and after-hours noise (equity only; disabled for crypto)
     if (this.enforceTimeFilter && !isValidTradingWindow(latest.timestamp)) return null;
+
+    // First, see whether an already-armed pending retest fires on this bar.
+    // We do this before the ADX/RSI gates so a transient regime hiccup on the
+    // retest bar doesn't kill an otherwise-valid setup; the per-bar
+    // "still-confirming" check below is the safeguard.
+    if (this.retestEntry) {
+      const retestSignal = this.tryFireRetest(symbol, candles);
+      if (retestSignal) return retestSignal;
+    }
 
     // ADX regime filter: reversals only work in ranging markets
     // Skip if ADX > 25 (strong trend makes mean reversion risky)
@@ -165,11 +231,128 @@ export class ReversalStrategy {
     const stopLoss = side === 'buy' ? entryPrice - stopDistance : entryPrice + stopDistance;
     const takeProfit = side === 'buy' ? entryPrice + tpDistance : entryPrice - tpDistance;
 
+    if (this.retestEntry) {
+      // Arm a pending retest instead of firing immediately. Retest level is
+      // the midpoint between entry and stop; that's deep enough into the
+      // signal bar's body to reset the structural stop to a level that has
+      // already been respected, but shallow enough that most genuine
+      // reversals revisit it within a handful of bars.
+      this.pending.set(symbol, {
+        side,
+        armedAtBars: candles.length,
+        expiresAtBars: candles.length + this.retestExpiryBars,
+        originalEntry: entryPrice,
+        retestLevel: (entryPrice + stopLoss) / 2,
+        originalStop: stopLoss,
+      });
+      return null;
+    }
+
     return {
       id: randomUUID(),
       symbol,
       type: 'reversal',
       side,
+      entryPrice,
+      stopLoss,
+      takeProfit,
+      riskRewardRatio: tpDistance / stopDistance,
+      timestamp: latest.timestamp,
+    };
+  }
+
+  /**
+   * Returns a TradeSignal when the current bar touches the armed retest
+   * level *and* still confirms the original direction. Otherwise either
+   * leaves the pending in place (no touch yet) or clears it (expiry,
+   * stop-breach during wait, or contradictory momentum on the retest bar).
+   *
+   * Same-bar entry uses the bar's close as the fill price and a structural
+   * stop slightly below the bar's low (long) / above the bar's high (short).
+   * The 25% buffer keeps the runner's `bar.low <= stop` comparator from
+   * trivially firing on the entry bar — without it, the retest bar's own
+   * low/high is *exactly* the stop and the position gets closed instantly.
+   */
+  private tryFireRetest(symbol: string, candles: Candle[]): TradeSignal | null {
+    const pending = this.pending.get(symbol);
+    if (!pending) return null;
+
+    const latest = candles[candles.length - 1];
+
+    // Hard invalidation: original signal-bar stop was breached at any point
+    // during the wait. The pullback toward midpoint is fine, but blowing
+    // through the original structural stop means the regime broke; entering
+    // here would be averaging into a continuation move dressed up as a retest.
+    const breached = pending.side === 'buy'
+      ? latest.low <= pending.originalStop
+      : latest.high >= pending.originalStop;
+    if (breached) {
+      this.pending.delete(symbol);
+      return null;
+    }
+
+    if (candles.length > pending.expiresAtBars) {
+      this.pending.delete(symbol);
+      return null;
+    }
+
+    const touched = pending.side === 'buy'
+      ? latest.low <= pending.retestLevel
+      : latest.high >= pending.retestLevel;
+    if (!touched) return null;
+
+    // Confirmation guard: a contradictory MACD cross during the wait
+    // (momentum flipped) or a fully-reversed RSI extreme (price has
+    // already mean-reverted past neutral) invalidates the setup.
+    const closes = candles.map(c => c.close);
+    const currentRsi = rsi(closes, this.rsiPeriod);
+    if (isNaN(currentRsi)) return null;
+    const cross = macdCross(closes);
+
+    if (pending.side === 'buy') {
+      if (cross === 'bearish') { this.pending.delete(symbol); return null; }
+      if (currentRsi >= this.rsiOverbought) { this.pending.delete(symbol); return null; }
+    } else {
+      if (cross === 'bullish') { this.pending.delete(symbol); return null; }
+      if (currentRsi <= this.rsiOversold) { this.pending.delete(symbol); return null; }
+    }
+
+    // Entry at the retest bar's close (a stronger fill than the retest level
+    // itself when the bar pulled in and rejected). Stop is the bar's
+    // low/high *with a 25% buffer* so the runner's `bar.low <= stop` check
+    // doesn't trivially fire on the entry bar — the buffer guarantees the
+    // stop sits strictly below the bar's structural low and only fires on a
+    // genuine break. The buffer is sized as a fraction of the structural
+    // distance so it scales with the asset's volatility.
+    const STRUCTURAL_STOP_BUFFER_FRAC = 0.25;
+    const entryPrice = latest.close;
+    const structuralLevel = pending.side === 'buy' ? latest.low : latest.high;
+    const rawStopDistance = Math.abs(entryPrice - structuralLevel);
+    if (rawStopDistance <= 0) {
+      this.pending.delete(symbol);
+      return null;
+    }
+    const stopDistance = rawStopDistance * (1 + STRUCTURAL_STOP_BUFFER_FRAC);
+    const stopLoss = pending.side === 'buy'
+      ? entryPrice - stopDistance
+      : entryPrice + stopDistance;
+
+    // Take-profit is `retestRewardMultiple × new_stopDistance` from the
+    // retest entry. Carrying the legacy 3R reward (built off the much-wider
+    // signal-bar stop) translated into TPs that almost never hit once the
+    // retest stop tightened — the round-2 backtest's 100% 1R hit-rate at
+    // -2.84 avgRR was the smoking gun.
+    const tpDistance = stopDistance * this.retestRewardMultiple;
+    const takeProfit = pending.side === 'buy'
+      ? entryPrice + tpDistance
+      : entryPrice - tpDistance;
+
+    this.pending.delete(symbol);
+    return {
+      id: randomUUID(),
+      symbol,
+      type: 'reversal',
+      side: pending.side,
       entryPrice,
       stopLoss,
       takeProfit,

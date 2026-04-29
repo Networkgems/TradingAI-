@@ -195,7 +195,9 @@ describe('ReversalStrategy — TRA-170', () => {
   }
 
   it('volume 1.4× crosses the loosened 1.3× threshold (signal eligible)', () => {
-    const strat = new ReversalStrategy({ enforceTimeFilter: false });
+    // retestEntry: false so we observe the immediate-entry path the volume
+    // gate originally guarded; TRA-179 covers the retest path separately.
+    const strat = new ReversalStrategy({ enforceTimeFilter: false, retestEntry: false });
     const candles = buildOversoldHammerSeries();
     // The signal *may* fire (depends on MACD on this synthetic series) — the
     // contract under test is that the volume gate alone no longer rejects it.
@@ -206,11 +208,172 @@ describe('ReversalStrategy — TRA-170', () => {
   });
 
   it('volume below 1.3× still blocks the signal (regression)', () => {
-    const strat = new ReversalStrategy({ enforceTimeFilter: false });
+    const strat = new ReversalStrategy({ enforceTimeFilter: false, retestEntry: false });
     const candles = buildOversoldHammerSeries();
     // Drop the last bar's volume to 1.1× — should reject.
     candles[candles.length - 1] = { ...candles[candles.length - 1], volume: 1100 };
     const sig = strat.evaluate('TEST', candles);
     expect(sig).toBeNull();
+  });
+});
+
+// ─── Reversal — TRA-179 retest entry ──────────────────────────────────────────
+
+describe('ReversalStrategy — TRA-179 retest entry', () => {
+  /**
+   * Build a synthetic series that triggers the immediate-entry path so we
+   * can compare its output against the retest-entry path one bar at a time.
+   */
+  function buildOversoldHammer(): Candle[] {
+    const candles: Candle[] = [];
+    for (let i = 0; i < 25; i++) {
+      const px = 100 - i * 0.4;
+      candles.push({
+        symbol: 'TEST', timestamp: i * 60_000,
+        open: px, high: px * 1.001, low: px * 0.999, close: px, volume: 1000,
+      });
+    }
+    // Hammer that closes well above the prior-window low so the midpoint
+    // between (close, windowLow) sits comfortably above the original stop —
+    // synthetic data with a tighter spread runs into the breach guard before
+    // the retest can fire.
+    const last = candles[candles.length - 1];
+    candles.push({
+      symbol: 'TEST', timestamp: 25 * 60_000,
+      open: last.close * 0.97,
+      high: last.close * 1.012,
+      low: last.close * 0.95,
+      close: last.close * 1.01,
+      volume: 1400,
+    });
+    return candles;
+  }
+
+  it('retest mode arms a pending signal (returns null) on the first match', () => {
+    const armed = new ReversalStrategy({ enforceTimeFilter: false });
+    const immediate = new ReversalStrategy({ enforceTimeFilter: false, retestEntry: false });
+    const candles = buildOversoldHammer();
+    // The legacy path would produce a buy here on this synthetic series; the
+    // retest path should instead return null because no pullback has happened.
+    const fast = immediate.evaluate('TEST', candles);
+    if (fast) {
+      expect(fast.side).toBe('buy');
+      const armedFirst = armed.evaluate('TEST', candles);
+      expect(armedFirst).toBeNull();
+    }
+  });
+
+  /**
+   * Re-derive the retest level the way the strategy does: midpoint of the
+   * signal-bar close and the prior 5-bar window low. This avoids hard-coding
+   * private state and keeps the test honest.
+   */
+  function deriveRetestLevel(candles: Candle[]) {
+    const armBar = candles[candles.length - 1];
+    const window = candles.slice(-6, -1);
+    const windowLow = Math.min(...window.map(c => c.low));
+    return {
+      entry: armBar.close,
+      stop: windowLow,
+      retestLevel: (armBar.close + windowLow) / 2,
+    };
+  }
+
+  it('fires a long retest entry on the bar that touches the retest level', () => {
+    const strat = new ReversalStrategy({ enforceTimeFilter: false });
+    const candles = buildOversoldHammer();
+    const { stop: originalStop, retestLevel } = deriveRetestLevel(candles);
+
+    strat.evaluate('TEST', candles);
+
+    // Retest bar — pulls back to (just under) the retest level but stays
+    // above the original window-low stop, then closes above the retest level
+    // (a healthy "wick-and-reject" pullback). Entry should fire on this bar
+    // with a stop placed below the bar's low (with a small structural buffer).
+    const retestBarLow = retestLevel * 0.999;
+    const retestBarClose = retestLevel * 1.001;
+    expect(retestBarLow).toBeGreaterThan(originalStop);
+    candles.push({
+      symbol: 'TEST', timestamp: 26 * 60_000,
+      open: retestLevel * 1.0005,
+      high: retestLevel * 1.0012,
+      low: retestBarLow,
+      close: retestBarClose,
+      volume: 1200,
+    });
+    const sig = strat.evaluate('TEST', candles);
+    expect(sig).not.toBeNull();
+    if (sig) {
+      expect(sig.side).toBe('buy');
+      expect(sig.entryPrice).toBeCloseTo(retestBarClose, 6);
+      // Stop sits below the bar's low (because of the 25% structural buffer)
+      // but above the original signal-bar window low.
+      expect(sig.stopLoss).toBeLessThan(retestBarLow);
+      expect(sig.stopLoss).toBeGreaterThan(originalStop);
+      // Risk-reward should reflect the configured retestRewardMultiple (default 3).
+      expect(sig.riskRewardRatio).toBeCloseTo(3, 4);
+    }
+  });
+
+  it('aborts when the original signal-bar stop is breached during the wait', () => {
+    const strat = new ReversalStrategy({ enforceTimeFilter: false });
+    const candles = buildOversoldHammer();
+    const { stop: originalStop } = deriveRetestLevel(candles);
+    strat.evaluate('TEST', candles);
+
+    // Bar that crashes through the original window-low stop — pending must
+    // be discarded and no signal can fire on this bar.
+    candles.push({
+      symbol: 'TEST', timestamp: 26 * 60_000,
+      open: originalStop * 1.001,
+      high: originalStop * 1.002,
+      low: originalStop * 0.97,
+      close: originalStop * 0.98,
+      volume: 1500,
+    });
+    expect(strat.evaluate('TEST', candles)).toBeNull();
+  });
+
+  it('clears the pending when the original stop is breached', () => {
+    const strat = new ReversalStrategy({ enforceTimeFilter: false });
+    const candles = buildOversoldHammer();
+    const armBar = candles[candles.length - 1];
+    strat.evaluate('TEST', candles);
+
+    // Slam through the original stop (the signal bar's low). The pending must
+    // be discarded and no signal can fire on this bar.
+    candles.push({
+      symbol: 'TEST', timestamp: 26 * 60_000,
+      open: armBar.close,
+      high: armBar.close,
+      low: armBar.low * 0.95, // well below original stop
+      close: armBar.low * 0.96,
+      volume: 1500,
+    });
+
+    const sig = strat.evaluate('TEST', candles);
+    expect(sig).toBeNull();
+  });
+
+  it('expires the pending after retestExpiryBars', () => {
+    const strat = new ReversalStrategy({
+      enforceTimeFilter: false,
+      retestExpiryBars: 2,
+    });
+    const candles = buildOversoldHammer();
+    strat.evaluate('TEST', candles);
+
+    // Append 3 boring flat bars — none retest the level, so the pending
+    // should expire and the strategy should return null on every call.
+    const last = candles[candles.length - 1];
+    for (let i = 0; i < 3; i++) {
+      candles.push({
+        symbol: 'TEST', timestamp: (26 + i) * 60_000,
+        open: last.close, high: last.close * 1.0001, low: last.close * 0.9999,
+        close: last.close, volume: 1000,
+      });
+      const sig = strat.evaluate('TEST', candles);
+      expect(sig).toBeNull();
+    }
   });
 });
