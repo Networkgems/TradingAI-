@@ -8,6 +8,10 @@ export interface BacktestReversalOpts {
   lookback?: number;
   /** Pass-through to the engine strategy; set false for 24/7 crypto datasets. */
   enforceTimeFilter?: boolean;
+  /** TRA-171: ATR-based stop multiplier; 0 forces the fixed-pct / structural stop path. */
+  atrStopMultiplier?: number;
+  /** TRA-171: skip signals when realized volatility (ATR/price) is below this floor. */
+  volatilityFloorPct?: number;
 }
 
 export interface BacktestMacdBollingerOpts {
@@ -16,6 +20,10 @@ export interface BacktestMacdBollingerOpts {
   volumeMultiplier?: number;
   volumeLookback?: number;
   enforceTimeFilter?: boolean;
+  /** TRA-171: ATR-based stop multiplier; 0 forces the fixed-pct / structural stop path. */
+  atrStopMultiplier?: number;
+  /** TRA-171: skip signals when realized volatility (ATR/price) is below this floor. */
+  volatilityFloorPct?: number;
 }
 
 /**
@@ -54,6 +62,8 @@ export interface BacktestConfig {
     | 'orb'
     | 'reversal'
     | 'macd'
+    | 'macd_trend'
+    | 'bb_fade'
     | 'ichimoku'
     | 'combined'
     | 'macd_bollinger'

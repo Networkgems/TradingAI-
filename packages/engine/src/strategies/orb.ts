@@ -15,6 +15,14 @@ export interface OrbOptions {
   volumeSpikeMultiplier?: number;
   /** Custom time filter. Defaults to ET stock windows. Pass isValidCryptoTradingWindow for crypto. */
   timeFilter?: (timestampMs: number) => boolean;
+  /**
+   * Custom session-anchor finder. Returns the UTC ms timestamp that opens the
+   * session containing `latest`. Defaults to "first candle at or after 9:30 AM ET"
+   * (US equity session). For 24/7 crypto markets, pass a callback that returns
+   * the start of the UTC day, e.g.
+   *   `(latest) => Math.floor(latest.timestamp / 86_400_000) * 86_400_000`.
+   */
+  sessionAnchorTimestampOf?: (latest: Candle) => number | null;
 }
 
 /**
@@ -29,6 +37,7 @@ export class OrbStrategy {
   private readonly maxSpreadPct: number;
   private readonly volumeSpikeMultiplier: number;
   private readonly timeFilter: (timestampMs: number) => boolean;
+  private readonly sessionAnchorTimestampOf?: (latest: Candle) => number | null;
 
   constructor(opts: OrbOptions = {}) {
     this.rangeMinutes = opts.rangeMinutes ?? 30;
@@ -36,6 +45,7 @@ export class OrbStrategy {
     this.maxSpreadPct = opts.maxSpreadPct ?? 0.0005;
     this.volumeSpikeMultiplier = opts.volumeSpikeMultiplier ?? 1.5;
     this.timeFilter = opts.timeFilter ?? isValidTradingWindow;
+    this.sessionAnchorTimestampOf = opts.sessionAnchorTimestampOf;
   }
 
   evaluate(
@@ -50,17 +60,25 @@ export class OrbStrategy {
     // Time filter: only trade during high-volume windows
     if (!this.timeFilter(latest.timestamp)) return null;
 
-    // Find the first candle at or after 9:30 AM ET to anchor the opening range.
-    // Previously used candles[0] which is always 80 min ago — correct at 10:50 AM but
-    // wrong during afternoon sessions where 80-min-ago is noon, not market open.
-    const MARKET_OPEN_ET_MINUTE = 9 * 60 + 30;
-    const sessionStart = candles.find(c => {
-      const offset = getEasternUtcOffset(c.timestamp);
-      const etMinutes = Math.floor((c.timestamp + offset * 3_600_000) / 60_000) % (24 * 60);
-      return etMinutes >= MARKET_OPEN_ET_MINUTE;
-    });
-    if (!sessionStart) return null;
-    const openTime = sessionStart.timestamp;
+    // Locate the session-opening timestamp. For ET equities (default), find
+    // the first candle at or after 9:30 AM ET. For 24/7 crypto markets, callers
+    // inject `sessionAnchorTimestampOf` to anchor on UTC day boundaries
+    // (00:00 UTC) or any other custom session schedule.
+    let openTime: number;
+    if (this.sessionAnchorTimestampOf) {
+      const anchor = this.sessionAnchorTimestampOf(latest);
+      if (anchor == null) return null;
+      openTime = anchor;
+    } else {
+      const MARKET_OPEN_ET_MINUTE = 9 * 60 + 30;
+      const sessionStart = candles.find(c => {
+        const offset = getEasternUtcOffset(c.timestamp);
+        const etMinutes = Math.floor((c.timestamp + offset * 3_600_000) / 60_000) % (24 * 60);
+        return etMinutes >= MARKET_OPEN_ET_MINUTE;
+      });
+      if (!sessionStart) return null;
+      openTime = sessionStart.timestamp;
+    }
     const rangeCutoff = openTime + this.rangeMinutes * 60 * 1000;
     const rangeCandles = candles.filter(c => c.timestamp >= openTime && c.timestamp <= rangeCutoff);
     if (rangeCandles.length === 0) return null;

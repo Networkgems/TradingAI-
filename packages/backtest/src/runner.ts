@@ -152,14 +152,24 @@ export class BacktestRunner {
         const s = reversal.evaluate(config.symbol, window);
         if (s) signals.push(s);
       }
-      if (config.strategyType === 'macd' || config.strategyType === 'macd_bollinger' || config.strategyType === 'combined') {
+      if (config.strategyType === 'macd' || config.strategyType === 'macd_trend' || config.strategyType === 'macd_bollinger' || config.strategyType === 'combined') {
         const t = macdTrend.evaluate(config.symbol, window);
         if (t) signals.push(t);
+      }
+      if (config.strategyType === 'bb_fade' || config.strategyType === 'macd_bollinger' || config.strategyType === 'combined') {
         const f = bbFade.evaluate(config.symbol, window);
         if (f) signals.push(f);
       }
       if (config.strategyType === 'ichimoku' || config.strategyType === 'combined') {
         const s = ichimoku.evaluate(config.symbol, window);
+        if (s) signals.push(s);
+      }
+      if (config.strategyType === 'scalping' || config.strategyType === 'combined') {
+        const s = scalping.evaluate(config.symbol, window);
+        if (s) signals.push(s);
+      }
+      if (config.strategyType === 'swing' || config.strategyType === 'combined') {
+        const s = swing.evaluate(config.symbol, window);
         if (s) signals.push(s);
       }
 
@@ -186,29 +196,54 @@ export class BacktestRunner {
         }
 
         const qty = risk.sizeFromStop(signal.entryPrice, signal.stopLoss);
-        if (qty > 0) positions.open(signal, qty);
+        if (qty > 0) {
+          const opened = positions.open(signal, qty);
+          entryFills.set(opened.id, applyEntrySlippage(signal));
+        }
       }
 
       for (const pos of positions.getOpen()) {
         const latest = filtered[i - 1];
-        let exitPrice: number | null = null;
+        const hitsStop = pos.side === 'buy'
+          ? latest.low <= pos.stopLoss
+          : latest.high >= pos.stopLoss;
+        const hitsTarget = pos.side === 'buy'
+          ? latest.high >= pos.takeProfit
+          : latest.low <= pos.takeProfit;
+        if (!hitsStop && !hitsTarget) continue;
 
-        if (pos.side === 'buy') {
-          if (latest.low <= pos.stopLoss) exitPrice = pos.stopLoss;
-          else if (latest.high >= pos.takeProfit) exitPrice = pos.takeProfit;
+        // OHLC bars don't say which level fired first when the candle range
+        // covers both. Resolve optimistically (TP) for the headline metrics
+        // and record the pessimistic (SL) PnL alongside via worstCaseTotalPnl.
+        const ambiguous = hitsStop && hitsTarget;
+        const optimisticExitRaw = hitsTarget ? pos.takeProfit : pos.stopLoss;
+        const pessimisticExitRaw = hitsStop ? pos.stopLoss : pos.takeProfit;
+        const entryFill = entryFills.get(pos.id) ?? pos.entryPrice;
+        const optimisticFill = applyExitSlippage(pos.side, optimisticExitRaw);
+        const optimisticPnl = computePnl(pos.side, entryFill, optimisticFill, pos.quantity);
+
+        const closed = positions.close(pos.id, optimisticExitRaw);
+        // Overwrite the manager's naive PnL with the cost-adjusted version and
+        // persist the slippage-adjusted entry/exit so downstream consumers see
+        // realistic fill economics on every trade.
+        closed.entryPrice = entryFill;
+        closed.exitPrice = optimisticFill;
+        closed.pnl = optimisticPnl;
+        entryFills.delete(pos.id);
+        closedTrades.push(closed);
+
+        if (ambiguous) {
+          ambiguousTrades += 1;
+          const pessimisticFill = applyExitSlippage(pos.side, pessimisticExitRaw);
+          worstCaseTotalPnl += computePnl(pos.side, entryFill, pessimisticFill, pos.quantity);
         } else {
-          if (latest.high >= pos.stopLoss) exitPrice = pos.stopLoss;
-          else if (latest.low <= pos.takeProfit) exitPrice = pos.takeProfit;
+          worstCaseTotalPnl += optimisticPnl;
         }
 
-        if (exitPrice !== null) {
-          const closed = positions.close(pos.id, exitPrice);
-          closedTrades.push(closed);
-          runningEquity += closed.pnl ?? 0;
-          peakEquity = Math.max(peakEquity, runningEquity);
-          const drawdown = (peakEquity - runningEquity) / peakEquity;
-          maxDrawdown = Math.max(maxDrawdown, drawdown);
-        }
+        runningEquity += optimisticPnl;
+        peakEquity = Math.max(peakEquity, runningEquity);
+        const drawdown = (peakEquity - runningEquity) / peakEquity;
+        maxDrawdown = Math.max(maxDrawdown, drawdown);
       }
     }
 
@@ -262,11 +297,8 @@ export class BacktestRunner {
       profitFactor,
       skippedConcentration,
       signalEdge,
-      // Cost-model / ambiguous-bar bookkeeping is owned by TRA-167 (in flight on
-      // a parallel branch). Until that lands, the runner reports zero
-      // ambiguous trades and equates worst-case PnL to realised PnL.
-      ambiguousTrades: 0,
-      worstCaseTotalPnl: totalPnl,
+      ambiguousTrades,
+      worstCaseTotalPnl,
     };
   }
 }
