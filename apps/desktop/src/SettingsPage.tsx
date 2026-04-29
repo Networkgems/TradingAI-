@@ -100,6 +100,119 @@ interface Props {
   onModeChange?: (mode: 'demo' | 'live') => void;
 }
 
+interface StrategyEntry {
+  name: string;
+  summary: string;
+  indicators: string[];
+}
+
+// Strategies and indicators reflect the engines actually wired up in the server:
+// SignalEngine (stocks/options) in packages/server/src/signal-engine.ts and
+// CryptoSignalEngine in packages/server/src/crypto-engine.ts. Update this list
+// when strategies are added/removed there so the settings page stays accurate.
+const STOCK_STRATEGIES: StrategyEntry[] = [
+  {
+    name: 'Opening Range Breakout (ORB)',
+    summary: 'Breakout of the first 30-minute range with volume confirmation, gated to high-volume ET sessions.',
+    indicators: ['30-min opening range', 'ADX (≥ 20 trend filter)', 'Volume spike (1.5× range avg)', 'Bid-ask spread guard'],
+  },
+  {
+    name: 'RSI Reversal',
+    summary: 'Mean-reversion entries at RSI extremes with MACD direction confluence; skipped in strong trends.',
+    indicators: ['RSI(14) 70/30', 'RSI bullish/bearish divergence', 'MACD cross', 'ADX (≤ 25 ranging filter)', 'Candle patterns (engulfing / pin bar)'],
+  },
+  {
+    name: 'MACD-Bollinger Confluence',
+    summary: 'Trend pullback entries when MACD crosses near the BB midline with VWAP and volume confirmation.',
+    indicators: ['MACD cross', 'Bollinger Bands (20, 2σ)', 'VWAP directional filter', 'ADX (≥ 25 trending bias)', 'Volume (≥ 1.5× avg)'],
+  },
+  {
+    name: 'Ichimoku Cloud',
+    summary: 'Trend-following breakout above/below the cloud confirmed by Tenkan-Kijun cross and Chikou span.',
+    indicators: ['Tenkan-sen / Kijun-sen cross', 'Senkou A/B (cloud)', 'Chikou span', 'ADX (≥ 25 trending confirmation)'],
+  },
+];
+
+const OPTIONS_STRATEGIES: StrategyEntry[] = [
+  {
+    name: 'OTM Mispricing Scanner',
+    summary: 'Scans Tradier option chains every 5 minutes for out-of-the-money calls/puts trading below Black-Scholes fair value.',
+    indicators: ['Black-Scholes pricing', 'Implied volatility (Theo IV / smvVol)', 'Delta filter', 'Days-to-expiration', 'Bid/ask & open-interest liquidity'],
+  },
+];
+
+const CRYPTO_STRATEGIES: StrategyEntry[] = [
+  {
+    name: 'RSI Reversal (24/7)',
+    summary: 'Reversal entries at RSI extremes — same 70/30 thresholds as stocks, with the ET time filter disabled for 24/7 markets.',
+    indicators: ['RSI(14) 70/30', 'RSI divergence', 'MACD cross', 'ADX (≤ 25 ranging filter)', 'Candle patterns'],
+  },
+  {
+    name: 'MACD-Bollinger (Crypto-tuned)',
+    summary: 'Crypto-tuned MACD + Bollinger confluence with wider bands and a lower volume threshold for thinner crypto liquidity.',
+    indicators: ['MACD cross', 'Bollinger Bands (14, 2.5σ)', 'VWAP directional filter', 'ADX (≥ 25 trending bias)', 'Volume (≥ 1.2× avg)'],
+  },
+  {
+    name: 'Scalping (1-min)',
+    summary: 'Short-timeframe pullback scalp using a 9/21 EMA cross with VWAP and RSI(9) confirmation. Stop ~0.75%, R:R 2:1.',
+    indicators: ['EMA(9) / EMA(21) cross', 'VWAP', 'RSI(9) pullback zones (40-55 / 45-60)', 'Volume spike (≥ 1.5× avg)'],
+  },
+  {
+    name: 'Swing (Daily)',
+    summary: 'Macro-trend swing entries on daily candles — pullback to the 50 EMA inside a 50/200 EMA trend with momentum confirmation.',
+    indicators: ['EMA(50) / EMA(200) macro trend', 'RSI(14) pullback zones (40-50 / 50-60)', 'MACD histogram', 'ADX (≥ 25)'],
+  },
+];
+
+function StrategyList({ items }: { items: StrategyEntry[] }) {
+  return (
+    <ul className="strategy-list">
+      {items.map(s => (
+        <li key={s.name} className="strategy-item">
+          <div className="strategy-name">{s.name}</div>
+          <div className="strategy-summary">{s.summary}</div>
+          <div className="strategy-indicators">
+            {s.indicators.map(ind => (
+              <span key={ind} className="strategy-indicator-tag">{ind}</span>
+            ))}
+          </div>
+        </li>
+      ))}
+    </ul>
+  );
+}
+
+function TradingStrategiesSection({ context }: { context?: 'crypto' | 'stocks' }) {
+  const showStocks = !context || context === 'stocks';
+  const showCrypto = !context || context === 'crypto';
+
+  return (
+    <section className="settings-section">
+      <h2 className="settings-section-title">Trading Strategies &amp; Indicators</h2>
+      <p className="settings-hint">
+        Reference list of the AI strategies and technical indicators the engine currently uses to generate signals on this dashboard. These run automatically — no configuration is needed here.
+      </p>
+
+      {showStocks && (
+        <div className="live-brokerage-block" style={{ marginBottom: showCrypto ? '1.5rem' : 0 }}>
+          {!context && <h3 className="settings-subheading">Stocks</h3>}
+          <StrategyList items={STOCK_STRATEGIES} />
+
+          <h3 className="settings-subheading" style={{ marginTop: '1.25rem' }}>Options</h3>
+          <StrategyList items={OPTIONS_STRATEGIES} />
+        </div>
+      )}
+
+      {showCrypto && (
+        <div className="live-brokerage-block">
+          {!context && <h3 className="settings-subheading">Crypto</h3>}
+          <StrategyList items={CRYPTO_STRATEGIES} />
+        </div>
+      )}
+    </section>
+  );
+}
+
 type SaveStatus = 'idle' | 'saving' | 'saved' | 'error';
 type PwStatus = 'idle' | 'saving' | 'saved' | 'error';
 
@@ -643,6 +756,9 @@ export default function SettingsPage({ token, httpUrl, context, onModeChange }: 
             </label>
           </div>
         </section>
+
+        {/* ── Trading strategies & indicators (TRA-167) ────────────────── */}
+        <TradingStrategiesSection context={context} />
 
         {/* ── Demo settings ─────────────────────────────────────────────── */}
         {settings.mode === 'demo' && (
