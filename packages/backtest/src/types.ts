@@ -137,6 +137,22 @@ export interface BacktestConfig {
    * to override the heuristic.
    */
   fractionalQuantity?: boolean;
+  /**
+   * TRA-203: per-fill maker/taker fees, in basis points of notional. When set,
+   * the runner picks `maker` for resting entries (`executionMode: 'limit'`)
+   * and `taker` for market hits — exits always pay `taker` since stop-loss /
+   * take-profit fire as market orders. Pass a number to charge it on every
+   * fill regardless of side. Ignored when {@link costModel} is also provided;
+   * `commissionBps` remains the legacy back-compat path.
+   */
+  feeBps?: number | { maker: number; taker: number };
+  /**
+   * TRA-203: order type for entries. `'market'` pays the taker fee on entry;
+   * `'limit'` posts the entry as a resting maker order. Exits (stop / target)
+   * always count as taker fills. Defaults to `'market'` so flat-cost callers
+   * see no behavior change. Only consulted when {@link feeBps} is supplied.
+   */
+  executionMode?: 'market' | 'limit';
 }
 
 /**
@@ -206,4 +222,21 @@ export interface BacktestResult {
    * equals {@link totalPnl}. Always net of commissions and slippage.
    */
   worstCaseTotalPnl: number;
+  /**
+   * TRA-203: per-trade R multiples — `(exitPrice - entryPrice) / stopDistance`
+   * signed by side. Drives {@link expectancy} and feeds the annualized
+   * {@link sharpeRatio} when bar-frequency inference fails.
+   */
+  tradeRs: number[];
+  /**
+   * TRA-203: average R per trade. Negative on losing systems, > 0.2R is
+   * usually the floor for a system worth deploying.
+   */
+  expectancy: number;
+  /**
+   * TRA-203: bar interval in milliseconds inferred from candle timestamps,
+   * used to annualize Sharpe. `null` when fewer than 2 candles were supplied
+   * (Sharpe falls back to per-trade-return annualization).
+   */
+  barIntervalMs: number | null;
 }

@@ -25,8 +25,8 @@ export {
 } from './synthetic.js';
 export { bootstrapEquityCurves } from './bootstrap.js';
 export type { BootstrapOptions } from './bootstrap.js';
-export { buildWindows } from './walk-forward.js';
-export type { WindowSpec } from './walk-forward.js';
+export { buildWindows, walkForward } from './walk-forward.js';
+export type { WindowSpec, WalkForwardOptions, WalkForwardReport } from './walk-forward.js';
 // Re-export the TRA-185 cost model surface so harness scripts can pick up
 // the spread-aware tiers without needing to also pin @trading-app/engine.
 export {

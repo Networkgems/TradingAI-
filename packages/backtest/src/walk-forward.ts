@@ -64,6 +64,85 @@ export function buildWindows(
   return windows;
 }
 
+/**
+ * TRA-203 walk-forward harness. Runs `config` on each rolling test slice and
+ * returns one {@link BacktestResult} per window plus an aggregate that
+ * concatenates the per-window trade lists and recomputes headline metrics.
+ *
+ * The aggregate exposes the *out-of-sample* picture you'd report when
+ * pitching the strategy: train slices are intentionally not run here because
+ * walk-forward cares about OOS performance — parameter sweeps live in the
+ * harness script (see {@link main} below).
+ */
+export interface WalkForwardOptions {
+  trainBars: number;
+  testBars: number;
+  /** Window advance per step. Defaults to `testBars` (non-overlapping tests). */
+  stepBars?: number;
+}
+
+export interface WalkForwardReport {
+  windows: BacktestResult[];
+  /**
+   * Concatenated trades across every test window with metrics recomputed.
+   * `config.startDate`/`endDate` are clamped to the first window's start and
+   * the last window's end so downstream consumers see the OOS span as a
+   * single contiguous run. The bar series passed to the runner is the union
+   * of test slices, so per-bar Sharpe annualization stays valid.
+   */
+  aggregate: BacktestResult;
+}
+
+export async function walkForward(
+  config: BacktestConfig,
+  candles: Candle[],
+  opts: WalkForwardOptions,
+): Promise<WalkForwardReport> {
+  const stepBars = opts.stepBars ?? opts.testBars;
+  const windows = buildWindows(candles.length, opts.trainBars, opts.testBars, stepBars);
+  const runner = new BacktestRunner();
+
+  const windowResults: BacktestResult[] = [];
+  const aggregateCandles: Candle[] = [];
+  for (const win of windows) {
+    const slice = candles.slice(win.testStart, win.testEnd);
+    if (slice.length === 0) continue;
+    const result = await runner.run(
+      {
+        ...config,
+        startDate: slice[0].timestamp,
+        endDate: slice[slice.length - 1].timestamp,
+      },
+      slice,
+    );
+    windowResults.push(result);
+    aggregateCandles.push(...slice);
+  }
+
+  if (windowResults.length === 0) {
+    // No valid windows — return an empty aggregate so callers don't have to
+    // special-case `undefined`. Matches the shape a single empty run would
+    // produce, with the original config echoed back for traceability.
+    const empty = await runner.run(config, []);
+    return { windows: [], aggregate: empty };
+  }
+
+  // Aggregate: rerun the config across the union of test slices. This is
+  // cheaper than stitching per-window stats and keeps Sharpe/MDD computed by
+  // the same code path used elsewhere — drift would silently bias headline
+  // numbers.
+  const aggregate = await runner.run(
+    {
+      ...config,
+      startDate: aggregateCandles[0].timestamp,
+      endDate: aggregateCandles[aggregateCandles.length - 1].timestamp,
+    },
+    aggregateCandles,
+  );
+
+  return { windows: windowResults, aggregate };
+}
+
 interface ParamPoint {
   label: string;
   reversalOpts?: BacktestConfig['reversalOpts'];
@@ -200,5 +279,8 @@ async function main() {
   console.log(`\nWrote ${rows.length - 1} rows to ${outPath}`);
 }
 
-const invoked = process.argv[1] && /walk-forward\.(ts|js)$/.test(process.argv[1]);
+// Anchor to a path separator so files like `run-tra203-walk-forward.ts` don't
+// also trigger this main() — without the separator, `walk-forward.ts` is a
+// suffix match and both scripts execute on a single tsx invocation.
+const invoked = process.argv[1] && /[\\/]walk-forward\.(ts|js)$/.test(process.argv[1]);
 if (invoked) main().catch(err => { console.error(err); process.exit(1); });

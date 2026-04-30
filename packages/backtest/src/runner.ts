@@ -15,6 +15,64 @@ import { BacktestConfig, BacktestResult, PortfolioOpts, SignalEdge } from './typ
 const DEFAULT_MAX_OPEN = 3;
 const DEFAULT_MAX_SECTOR = 3;
 const DEFAULT_LOOKAHEAD_BARS = 24;
+const MS_PER_YEAR = 365.25 * 24 * 60 * 60 * 1_000;
+
+/**
+ * TRA-203: normalize the {@link BacktestConfig.feeBps} field into per-fill
+ * maker/taker rates. Returns `null` when `feeBps` isn't set so the runner can
+ * fall through to the legacy `commissionBps` path. A scalar applies to both
+ * sides — `executionMode` is the only thing that splits maker vs. taker.
+ */
+function resolveFeeRates(
+  config: BacktestConfig,
+): { maker: number; taker: number } | null {
+  if (config.feeBps === undefined) return null;
+  if (typeof config.feeBps === 'number') {
+    const r = config.feeBps / 10_000;
+    return { maker: r, taker: r };
+  }
+  return {
+    maker: config.feeBps.maker / 10_000,
+    taker: config.feeBps.taker / 10_000,
+  };
+}
+
+/**
+ * TRA-203: estimate the candle bar interval (ms) by taking the modal gap
+ * between consecutive timestamps. Modal — not mean — because daylight-saving
+ * jumps and weekend halts in equity series would skew an average. Returns
+ * `null` for fewer than two candles.
+ */
+function inferBarIntervalMs(candles: ReadonlyArray<Candle>): number | null {
+  if (candles.length < 2) return null;
+  const counts = new Map<number, number>();
+  for (let i = 1; i < candles.length; i++) {
+    const dt = candles[i].timestamp - candles[i - 1].timestamp;
+    if (dt > 0) counts.set(dt, (counts.get(dt) ?? 0) + 1);
+  }
+  let bestDt = 0;
+  let bestCount = 0;
+  for (const [dt, c] of counts) {
+    if (c > bestCount) { bestCount = c; bestDt = dt; }
+  }
+  return bestDt > 0 ? bestDt : null;
+}
+
+/**
+ * TRA-203: per-trade R multiple, signed by side. R = 1 means the trade
+ * collected one stop-distance of profit; R = -1 means it lost the stop.
+ */
+function tradeR(
+  side: 'buy' | 'sell',
+  entryPrice: number,
+  exitPrice: number,
+  stopLoss: number,
+): number {
+  const stopDistance = Math.abs(entryPrice - stopLoss);
+  if (stopDistance === 0) return 0;
+  const dir = side === 'buy' ? 1 : -1;
+  return ((exitPrice - entryPrice) * dir) / stopDistance;
+}
 
 /**
  * Default sector resolver — `*-USD` tickers fall into the `crypto` bucket so
@@ -104,16 +162,34 @@ export class BacktestRunner {
     const scalping = new ScalpingStrategy(config.scalpingOpts);
     const swing = new SwingStrategy(config.swingOpts);
 
-    // TRA-169 / TRA-185: per-fill cost model. Commission charged on entry+exit
-    // notional, slippage applied adversely to fill prices. When `costModel` is
-    // set it takes precedence over the flat `commissionBps`/`slippageBps` —
-    // each `BacktestConfig` runs against a single symbol so we resolve the
-    // per-fill cost once and reuse it for every fill in this run.
+    // TRA-169 / TRA-185 / TRA-203: per-fill cost model. Commission charged on
+    // entry+exit notional, slippage applied adversely to fill prices. The
+    // resolution order is `costModel` > `feeBps` (with maker/taker split if
+    // executionMode = 'limit') > legacy flat `commissionBps`. Each
+    // `BacktestConfig` runs against a single symbol so we resolve once.
+    const executionMode = config.executionMode ?? 'market';
+    const feeRates = resolveFeeRates(config);
     const fill = config.costModel
       ? config.costModel.resolve(config.symbol)
-      : { commissionBps: config.commissionBps ?? 0, slippageBps: config.slippageBps ?? 0 };
-    const commissionRate = fill.commissionBps / 10_000;
+      : {
+          // Per-side commission falls back to legacy flat `commissionBps` when
+          // `feeBps` isn't set, otherwise leaves it 0 here and lets
+          // `commissionRateFor` pick maker/taker per fill.
+          commissionBps: feeRates ? 0 : (config.commissionBps ?? 0),
+          slippageBps: config.slippageBps ?? 0,
+        };
     const slipRate = fill.slippageBps / 10_000;
+    const fallbackCommissionRate = fill.commissionBps / 10_000;
+    /**
+     * Per-fill commission rate. With `feeBps`, entries are maker-priced when
+     * `executionMode = 'limit'` and taker-priced otherwise; exits are always
+     * taker-priced because stop-loss / take-profit fire as market hits.
+     */
+    const commissionRateFor = (leg: 'entry' | 'exit'): number => {
+      if (!feeRates) return fallbackCommissionRate;
+      if (leg === 'exit') return feeRates.taker;
+      return executionMode === 'limit' ? feeRates.maker : feeRates.taker;
+    };
     const applyEntrySlippage = (signal: TradeSignal): number =>
       signal.side === 'buy'
         ? signal.entryPrice * (1 + slipRate)
@@ -128,7 +204,9 @@ export class BacktestRunner {
     ): number => {
       const dir = side === 'buy' ? 1 : -1;
       const gross = (exitFill - entryFill) * qty * dir;
-      const commission = (entryFill + exitFill) * qty * commissionRate;
+      const commission =
+        entryFill * qty * commissionRateFor('entry') +
+        exitFill * qty * commissionRateFor('exit');
       return gross - commission;
     };
 
@@ -137,6 +215,7 @@ export class BacktestRunner {
     );
 
     const closedTrades: Position[] = [];
+    const tradeRs: number[] = [];
     let ambiguousTrades = 0;
     let worstCaseTotalPnl = 0;
     /** Slippage-adjusted entry fill price keyed by position id. */
@@ -145,6 +224,13 @@ export class BacktestRunner {
     let peakEquity = config.initialEquity;
     let runningEquity = config.initialEquity;
     let maxDrawdown = 0;
+    // TRA-203: per-bar mark-to-market equity series. Drives the annualized
+    // Sharpe (per-bar returns are more stable than per-trade returns when the
+    // sample is small) and lets `maxDrawdown` capture intra-trade drawdowns
+    // — the realized-only series would miss a 30% paper loss that recovered
+    // before the position closed.
+    const barReturns: number[] = [];
+    let prevMtmEquity = config.initialEquity;
 
     let skippedConcentration = 0;
     const lookahead = config.signalEdgeOpts?.lookaheadBars ?? DEFAULT_LOOKAHEAD_BARS;
@@ -242,6 +328,7 @@ export class BacktestRunner {
         closed.pnl = optimisticPnl;
         entryFills.delete(pos.id);
         closedTrades.push(closed);
+        tradeRs.push(tradeR(pos.side, entryFill, optimisticFill, pos.stopLoss));
 
         if (ambiguous) {
           ambiguousTrades += 1;
@@ -252,10 +339,30 @@ export class BacktestRunner {
         }
 
         runningEquity += optimisticPnl;
-        peakEquity = Math.max(peakEquity, runningEquity);
-        const drawdown = (peakEquity - runningEquity) / peakEquity;
-        maxDrawdown = Math.max(maxDrawdown, drawdown);
       }
+
+      // TRA-203: bar-level mark-to-market. After processing entries and
+      // exits, value remaining open positions at this bar's close so peak
+      // equity / drawdown / per-bar returns capture unrealized PnL too.
+      const closePx = filtered[i - 1].close;
+      let unrealized = 0;
+      for (const pos of positions.getOpen()) {
+        const entryFill = entryFills.get(pos.id) ?? pos.entryPrice;
+        const dir = pos.side === 'buy' ? 1 : -1;
+        unrealized += (closePx - entryFill) * pos.quantity * dir;
+      }
+      const mtmEquity = runningEquity + unrealized;
+      peakEquity = Math.max(peakEquity, mtmEquity);
+      if (peakEquity > 0) {
+        const drawdown = (peakEquity - mtmEquity) / peakEquity;
+        if (drawdown > maxDrawdown) maxDrawdown = drawdown;
+      }
+      if (prevMtmEquity > 0) {
+        barReturns.push((mtmEquity - prevMtmEquity) / prevMtmEquity);
+      } else {
+        barReturns.push(0);
+      }
+      prevMtmEquity = mtmEquity;
     }
 
     const winners = closedTrades.filter(t => (t.pnl ?? 0) > 0);
@@ -267,13 +374,30 @@ export class BacktestRunner {
     const grossLoss = Math.abs(losers.reduce((s, t) => s + (t.pnl ?? 0), 0));
     const profitFactor = grossLoss > 0 ? grossProfit / grossLoss : grossProfit > 0 ? Infinity : 0;
 
-    const pnls = closedTrades.map(t => t.pnl ?? 0);
-    const meanPnl = pnls.length > 0 ? totalPnl / pnls.length : 0;
-    const variance = pnls.length > 1
-      ? pnls.reduce((s, p) => s + (p - meanPnl) ** 2, 0) / (pnls.length - 1)
+    // TRA-203: annualized Sharpe from per-bar mark-to-market returns. Falls
+    // back to per-trade R returns when the bar series is too short (e.g.
+    // pure trade-list replay without candles) — both are zero-rf-rate Sharpes
+    // for cleanliness; subtract a risk-free term here if/when one matters.
+    const barIntervalMs = inferBarIntervalMs(filtered);
+    const barsPerYear = barIntervalMs ? MS_PER_YEAR / barIntervalMs : 252;
+    let sharpeRatio = 0;
+    if (barReturns.length > 1) {
+      const meanRet = barReturns.reduce((s, r) => s + r, 0) / barReturns.length;
+      const variance = barReturns.reduce((s, r) => s + (r - meanRet) ** 2, 0) / (barReturns.length - 1);
+      const stdRet = Math.sqrt(variance);
+      sharpeRatio = stdRet > 0 ? (meanRet / stdRet) * Math.sqrt(barsPerYear) : 0;
+    } else if (tradeRs.length > 1) {
+      const meanR = tradeRs.reduce((s, r) => s + r, 0) / tradeRs.length;
+      const varR = tradeRs.reduce((s, r) => s + (r - meanR) ** 2, 0) / (tradeRs.length - 1);
+      const stdR = Math.sqrt(varR);
+      sharpeRatio = stdR > 0 ? meanR / stdR : 0;
+    }
+
+    // TRA-203: expectancy = average R per trade. Industry rule of thumb is
+    // > 0.2R per trade after costs is the floor for a deployable system.
+    const expectancy = tradeRs.length > 0
+      ? tradeRs.reduce((s, r) => s + r, 0) / tradeRs.length
       : 0;
-    const stdDev = Math.sqrt(variance);
-    const sharpeRatio = stdDev > 0 ? meanPnl / stdDev : 0;
 
     const avgRiskReward = closedTrades.length > 0
       ? closedTrades.reduce((s, t) => {
@@ -310,6 +434,9 @@ export class BacktestRunner {
       signalEdge,
       ambiguousTrades,
       worstCaseTotalPnl,
+      tradeRs,
+      expectancy,
+      barIntervalMs,
     };
   }
 }
