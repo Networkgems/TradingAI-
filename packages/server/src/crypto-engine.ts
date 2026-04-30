@@ -379,7 +379,7 @@ export class CryptoSignalEngine {
     }
 
     if (Date.now() - this.lastNewsRefresh > NEWS_REFRESH_MS) {
-      const news = await fetchCryptoNews();
+      const news = await fetchCryptoNews(this.getActiveSymbols());
       if (news.length > 0) this.newsCache = news;
       this.lastNewsRefresh = Date.now();
     }

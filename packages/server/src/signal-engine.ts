@@ -292,7 +292,7 @@ export class SignalEngine {
 
   private async doTick(): Promise<void> {
     if (Date.now() - this.lastNewsRefresh > NEWS_REFRESH_MS) {
-      const news = await fetchStocksNews();
+      const news = await fetchStocksNews(this.getActiveSymbols());
       if (news.length > 0) this.newsCache = news;
       this.lastNewsRefresh = Date.now();
     }

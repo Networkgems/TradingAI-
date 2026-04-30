@@ -1,6 +1,6 @@
 import YahooFinance from 'yahoo-finance2';
 import type { Candle, NewsItem } from '@trading-app/shared';
-import { isYahooBreakerOpen } from './yahoo-feed.js';
+import { isYahooBreakerOpen, toIsoTime } from './yahoo-feed.js';
 
 const yf = new YahooFinance({
   suppressNotices: ['yahooSurvey'],
@@ -221,23 +221,67 @@ export async function fetchCryptoQuotes(
   return results;
 }
 
-export async function fetchCryptoNews(): Promise<NewsItem[]> {
-  try {
-    const results = await withTimeout(
-      yf.search('crypto bitcoin ethereum', { newsCount: 10, quotesCount: 0 }),
-      FEED_CALL_TIMEOUT_MS,
-      'search(crypto news)',
-    );
-    return (results.news ?? []).map(n => ({
-      title: n.title,
-      url: n.link,
-      source: n.publisher ?? 'Yahoo Finance',
-      publishedAt: new Date(Number(n.providerPublishTime ?? 0) * 1000).toISOString(),
-    }));
-  } catch (err: unknown) {
-    console.error('[crypto-feed] fetchCryptoNews error:', err instanceof Error ? err.message : String(err));
-    return [];
+// TRA-196 — per-symbol crypto news aggregation.
+//
+// The previous broad query ('crypto bitcoin ethereum') hit Yahoo's search
+// cache with the same key on every refresh, so users saw the same news items
+// indefinitely. Fanning out per-symbol queries gives Yahoo distinct keys and
+// produces fresh content as different coins generate news at different times.
+export async function fetchCryptoNews(symbols: readonly string[]): Promise<NewsItem[]> {
+  const NEWS_QUERY_LIMIT = 8;
+  const NEWS_BATCH = 3;
+  const PER_SYMBOL_NEWS = 5;
+  const RESULT_CAP = 20;
+
+  const querySymbols = symbols.slice(0, NEWS_QUERY_LIMIT);
+  const items: NewsItem[] = [];
+  const seen = new Set<string>();
+
+  type RawNews = { title?: string; link?: string; publisher?: string; providerPublishTime?: Date | number | string };
+
+  const collect = (newsArr: ReadonlyArray<RawNews>): void => {
+    for (const n of newsArr) {
+      if (!n?.link || !n?.title || seen.has(n.link)) continue;
+      seen.add(n.link);
+      items.push({
+        title: n.title,
+        url: n.link,
+        source: n.publisher ?? 'Yahoo Finance',
+        publishedAt: toIsoTime(n.providerPublishTime),
+      });
+    }
+  };
+
+  const safeSearch = async (q: string, label: string): Promise<{ news?: ReadonlyArray<RawNews> } | null> => {
+    if (shouldSkipYahoo()) return null;
+    try {
+      return await withTimeout(
+        yf.search(q, { newsCount: PER_SYMBOL_NEWS, quotesCount: 0 }) as unknown as Promise<{ news?: ReadonlyArray<RawNews> }>,
+        FEED_CALL_TIMEOUT_MS,
+        label,
+      );
+    } catch (err: unknown) {
+      console.error(`[crypto-feed] ${label} error:`, err instanceof Error ? err.message : String(err));
+      return null;
+    }
+  };
+
+  for (let i = 0; i < querySymbols.length; i += NEWS_BATCH) {
+    const slice = querySymbols.slice(i, i + NEWS_BATCH);
+    const settled = await Promise.all(slice.map(sym => safeSearch(sym, `search(crypto news ${sym})`)));
+    for (const r of settled) {
+      if (r) collect(r.news ?? []);
+    }
+    if (i + NEWS_BATCH < querySymbols.length) await sleep(200);
   }
+
+  if (items.length < RESULT_CAP) {
+    const fallback = await safeSearch('cryptocurrency', 'search(crypto news fallback)');
+    if (fallback) collect(fallback.news ?? []);
+  }
+
+  items.sort((a, b) => b.publishedAt.localeCompare(a.publishedAt));
+  return items.slice(0, RESULT_CAP);
 }
 
 /** Test CoinMarketCap connectivity — returns top coin or throws. */

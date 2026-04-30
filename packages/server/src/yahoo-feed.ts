@@ -30,6 +30,21 @@ function isRateLimitError(msg: string): boolean {
   return /\b429\b|Too Many Requests|crumb/i.test(msg);
 }
 
+// yahoo-finance2 v3 types `providerPublishTime` as Date (validation-converted),
+// but the raw API returns a unix-seconds number. Accept either so we render
+// real publish times instead of garbage when validation is bypassed.
+export function toIsoTime(t: Date | number | string | undefined | null): string {
+  if (t instanceof Date) return t.toISOString();
+  if (typeof t === 'number') return new Date(t * 1000).toISOString();
+  if (typeof t === 'string') {
+    const asNum = Number(t);
+    if (Number.isFinite(asNum)) return new Date(asNum * 1000).toISOString();
+    const parsed = Date.parse(t);
+    if (Number.isFinite(parsed)) return new Date(parsed).toISOString();
+  }
+  return new Date(0).toISOString();
+}
+
 function withTimeout<T>(p: Promise<T>, ms: number, label: string): Promise<T> {
   return new Promise<T>((resolve, reject) => {
     const timer = setTimeout(() => reject(new Error(`${label} timed out after ${ms}ms`)), ms);
@@ -709,18 +724,69 @@ export async function fetchQuotes(symbols: readonly string[]): Promise<Map<strin
   return results;
 }
 
-export async function fetchStocksNews(): Promise<NewsItem[]> {
-  const results = await withRetry(
-    () => yf.search('stocks market NYSE trading', { newsCount: 10, quotesCount: 0 }),
-    'search(stocks news)',
-  );
-  if (!results) return [];
-  return (results.news ?? []).map(n => ({
-    title: n.title,
-    url: n.link,
-    source: n.publisher ?? 'Yahoo Finance',
-    publishedAt: new Date(Number(n.providerPublishTime ?? 0) * 1000).toISOString(),
-  }));
+// TRA-196 — per-symbol news aggregation.
+//
+// The previous broad query ('stocks market NYSE trading') frequently returned
+// no `news` items from Yahoo's search endpoint, so the stocks News tab showed
+// up empty. Yahoo also caches identical-query results aggressively, which made
+// the rare non-empty response stick around unchanged. We now fan out per-symbol
+// searches across the watchlist and aggregate fresh, varied results.
+export async function fetchStocksNews(symbols: readonly string[]): Promise<NewsItem[]> {
+  // Cap the number of symbols we query so news refresh stays bounded; rotate
+  // the cap symbols based on the active watchlist so cache buster is implicit.
+  const NEWS_QUERY_LIMIT = 8;
+  const NEWS_BATCH = 3;
+  const PER_SYMBOL_NEWS = 5;
+  const RESULT_CAP = 20;
+
+  const querySymbols = symbols.slice(0, NEWS_QUERY_LIMIT);
+  const items: NewsItem[] = [];
+  const seen = new Set<string>();
+
+  const collect = (newsArr: ReadonlyArray<{ title?: string; link?: string; publisher?: string; providerPublishTime?: Date | number | string }>): void => {
+    for (const n of newsArr) {
+      if (!n?.link || !n?.title || seen.has(n.link)) continue;
+      seen.add(n.link);
+      items.push({
+        title: n.title,
+        url: n.link,
+        source: n.publisher ?? 'Yahoo Finance',
+        publishedAt: toIsoTime(n.providerPublishTime),
+      });
+    }
+  };
+
+  // Per-symbol fan-out (parallel batches so total wall time stays close to one timeout).
+  for (let i = 0; i < querySymbols.length; i += NEWS_BATCH) {
+    const slice = querySymbols.slice(i, i + NEWS_BATCH);
+    const settled = await Promise.all(
+      slice.map(sym =>
+        withRetry(
+          () => yf.search(sym, { newsCount: PER_SYMBOL_NEWS, quotesCount: 0 }),
+          `search(news ${sym})`,
+        ),
+      ),
+    );
+    for (const r of settled) {
+      if (!r) continue;
+      collect(r.news ?? []);
+    }
+    if (i + NEWS_BATCH < querySymbols.length) await sleep(200);
+  }
+
+  // Generic top-up: if per-symbol returned nothing (e.g. breaker open or empty
+  // watchlist), fall back to a broad query so the tab is never empty when news
+  // is reachable. Otherwise this still adds general market headlines.
+  if (items.length < RESULT_CAP) {
+    const fallback = await withRetry(
+      () => yf.search('stocks market trading', { newsCount: 10, quotesCount: 0 }),
+      'search(stocks news fallback)',
+    );
+    if (fallback) collect(fallback.news ?? []);
+  }
+
+  items.sort((a, b) => b.publishedAt.localeCompare(a.publishedAt));
+  return items.slice(0, RESULT_CAP);
 }
 
 /** Test Yahoo Finance connectivity — returns a quote or throws. */
