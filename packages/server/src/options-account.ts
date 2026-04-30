@@ -14,7 +14,6 @@ import {
   OPTIONS_TP1_PCT,
   OPTIONS_SL_PCT,
   OPTIONS_ATM_PREMIUM_RATIO,
-  OPTIONS_DAILY_LIMIT,
   OPTIONS_TRAIL_ACTIVATE_PCT,
   OPTIONS_TRAIL_OFFSET_PCT,
   OPTIONS_PARTIAL_EXIT_RATIO,
@@ -32,7 +31,12 @@ function toDateKey(ts: number): string {
 interface OptionsAccountConfig {
   initialEquity?: number;
   managedAccountRatio?: number;
-  dailyTradesLimit?: number;
+  /**
+   * Max ATM options entries per day (TRA-195). Replaces the previously
+   * hardcoded `OPTIONS_DAILY_LIMIT` so the cap is user-configurable from the
+   * Settings page.
+   */
+  optionsDailyTradesLimit?: number;
   /**
    * OTM-specific risk overrides (TRA-160). When omitted, the account uses
    * `OTM_RISK_PARAMS` from `@trading-app/shared`. Tests pass a tweaked bundle
@@ -59,7 +63,7 @@ interface OptionsAccountConfig {
 export class PaperOptionsAccount {
   private initialEquity: number;
   private managedAccountRatio: number;
-  private dailyTradesLimit: number;
+  private optionsDailyTradesLimit: number;
   private otmRiskParams: OtmRiskParams;
   private equity: number;
   private cash: number;
@@ -69,8 +73,8 @@ export class PaperOptionsAccount {
   private dailyCount = 0;
   /**
    * OTM tickets are counted separately so OTM and ATM don't compete for the
-   * same daily slot pool (TRA-160). `dailyCount` keeps tracking ATM entries
-   * for backward-compat with the `OPTIONS_DAILY_LIMIT` cap.
+   * same daily slot pool (TRA-160). `dailyCount` tracks ATM entries against
+   * the user-configurable `optionsDailyTradesLimit` cap (TRA-195).
    */
   private dailyOtmCount = 0;
   /** TRA-191 — relative-value scanner tickets are counted separately. */
@@ -81,7 +85,7 @@ export class PaperOptionsAccount {
   constructor(config: OptionsAccountConfig = {}) {
     this.initialEquity = config.initialEquity ?? DEFAULT_ACCOUNT_SETTINGS.demoEquity;
     this.managedAccountRatio = config.managedAccountRatio ?? DEFAULT_ACCOUNT_SETTINGS.managedAccountRatio;
-    this.dailyTradesLimit = config.dailyTradesLimit ?? DEFAULT_ACCOUNT_SETTINGS.dailyTradesLimit;
+    this.optionsDailyTradesLimit = config.optionsDailyTradesLimit ?? DEFAULT_ACCOUNT_SETTINGS.optionsDailyTradesLimit;
     this.otmRiskParams = config.otmRiskParams ?? OTM_RISK_PARAMS;
     this.rvRiskParams = config.rvRiskParams ?? RV_RISK_PARAMS;
     this.equity = this.initialEquity;
@@ -91,7 +95,7 @@ export class PaperOptionsAccount {
   reset(config: OptionsAccountConfig = {}): void {
     if (config.initialEquity !== undefined) this.initialEquity = config.initialEquity;
     if (config.managedAccountRatio !== undefined) this.managedAccountRatio = config.managedAccountRatio;
-    if (config.dailyTradesLimit !== undefined) this.dailyTradesLimit = config.dailyTradesLimit;
+    if (config.optionsDailyTradesLimit !== undefined) this.optionsDailyTradesLimit = config.optionsDailyTradesLimit;
     if (config.otmRiskParams !== undefined) this.otmRiskParams = config.otmRiskParams;
     if (config.rvRiskParams !== undefined) this.rvRiskParams = config.rvRiskParams;
     this.equity = this.initialEquity;
@@ -107,9 +111,14 @@ export class PaperOptionsAccount {
 
   updateConfig(config: OptionsAccountConfig): void {
     if (config.managedAccountRatio !== undefined) this.managedAccountRatio = config.managedAccountRatio;
-    if (config.dailyTradesLimit !== undefined) this.dailyTradesLimit = config.dailyTradesLimit;
+    if (config.optionsDailyTradesLimit !== undefined) this.optionsDailyTradesLimit = config.optionsDailyTradesLimit;
     if (config.otmRiskParams !== undefined) this.otmRiskParams = config.otmRiskParams;
     if (config.rvRiskParams !== undefined) this.rvRiskParams = config.rvRiskParams;
+  }
+
+  /** Current ATM options daily cap — exposed so the UI can render a count badge. */
+  getOptionsDailyTradesLimit(): number {
+    return this.optionsDailyTradesLimit;
   }
 
   /** Rebase starting equity by the delta, preserving optionsPnl and open/closed positions. */
@@ -299,7 +308,7 @@ export class PaperOptionsAccount {
     // Time filter: only open options during high-volume trading windows
     if (!isValidTradingWindow(Date.now())) return null;
 
-    if (this.dailyCount >= OPTIONS_DAILY_LIMIT) return null;
+    if (this.dailyCount >= this.optionsDailyTradesLimit) return null;
 
     const existing = Array.from(this.openOptions.values()).find(
       o => o.symbol === signal.symbol && o.signalType === signal.type,

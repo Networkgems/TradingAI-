@@ -1,7 +1,7 @@
 import { useEffect, useLayoutEffect, useRef, useState } from 'react';
 import { createPortal } from 'react-dom';
 import type { TradeSignal, Position, AccountState, OptionPosition, OptionsAccountState, EodReport, CryptoEngineState, NewsItem } from '@trading-app/shared';
-import { OPTIONS_DAILY_LIMIT } from '@trading-app/shared';
+import { DEFAULT_ACCOUNT_SETTINGS } from '@trading-app/shared';
 import LoginPage from './LoginPage.tsx';
 import ForgotPasswordPage from './ForgotPasswordPage.tsx';
 import SignUpPage from './SignUpPage.tsx';
@@ -702,6 +702,7 @@ function Dashboard({ token, onLogout, onGoHome, onActivity }: { token: string; o
   const [profileModal, setProfileModal] = useState<null | 'change-password' | 'user-management'>(null);
   const [isAdmin, setIsAdmin] = useState(false);
   const [accountMode, setAccountMode] = useState<'demo' | 'live'>('demo');
+  const [optionsDailyLimit, setOptionsDailyLimit] = useState<number>(DEFAULT_ACCOUNT_SETTINGS.optionsDailyTradesLimit);
   const [watchlistInput, setWatchlistInput] = useState('');
   const [watchlistError, setWatchlistError] = useState('');
   const [scanning, setScanning] = useState(false);
@@ -780,7 +781,10 @@ function Dashboard({ token, onLogout, onGoHome, onActivity }: { token: string; o
   useEffect(() => {
     fetch(`${HTTP_URL}/api/account/settings`, { headers: { Authorization: `Bearer ${token}` } })
       .then(r => r.ok ? r.json() : null)
-      .then((s: { mode?: 'demo' | 'live' } | null) => { if (s?.mode) setAccountMode(s.mode); })
+      .then((s: { mode?: 'demo' | 'live'; optionsDailyTradesLimit?: number } | null) => {
+        if (s?.mode) setAccountMode(s.mode);
+        if (typeof s?.optionsDailyTradesLimit === 'number') setOptionsDailyLimit(s.optionsDailyTradesLimit);
+      })
       .catch(() => {});
   }, [tab, token]);
 
@@ -914,8 +918,8 @@ function Dashboard({ token, onLogout, onGoHome, onActivity }: { token: string; o
                     </div>
                     <div className="stat">
                       <span className="stat-label">Daily Trades</span>
-                      <span className={`stat-value ${optionsState.dailyOptionsCount >= OPTIONS_DAILY_LIMIT ? 'red' : ''}`}>
-                        {optionsState.dailyOptionsCount}/{OPTIONS_DAILY_LIMIT}
+                      <span className={`stat-value ${optionsState.dailyOptionsCount >= optionsDailyLimit ? 'red' : ''}`}>
+                        {optionsState.dailyOptionsCount}/{optionsDailyLimit}
                       </span>
                     </div>
                   </div>
@@ -1287,7 +1291,7 @@ function Dashboard({ token, onLogout, onGoHome, onActivity }: { token: string; o
               <div style={{ marginTop: '1.5rem', display: 'flex', gap: '2rem', fontSize: '0.85rem', color: 'var(--muted)' }}>
                 <span>Options Cash: <strong>${fmt(optionsState.optionsCash)}</strong></span>
                 <span>Total Options P&amp;L: <strong className={optionsState.optionsPnl >= 0 ? 'green' : 'red'}>{fmtDollar(optionsState.optionsPnl)}</strong></span>
-                <span>Daily Trades: <strong className={optionsState.dailyOptionsCount >= OPTIONS_DAILY_LIMIT ? 'red' : ''}>{optionsState.dailyOptionsCount}/{OPTIONS_DAILY_LIMIT}</strong></span>
+                <span>Daily Trades: <strong className={optionsState.dailyOptionsCount >= optionsDailyLimit ? 'red' : ''}>{optionsState.dailyOptionsCount}/{optionsDailyLimit}</strong></span>
               </div>
             )}
           </div>

@@ -764,9 +764,6 @@ export default function SettingsPage({ token, httpUrl, context, onModeChange }: 
           </div>
         </section>
 
-        {/* ── Trading strategies & indicators (TRA-167) ────────────────── */}
-        <TradingStrategiesSection context={context} />
-
         {/* ── Demo settings ─────────────────────────────────────────────── */}
         {settings.mode === 'demo' && (
           <section className="settings-section">
@@ -807,7 +804,7 @@ export default function SettingsPage({ token, httpUrl, context, onModeChange }: 
               )}
 
               <div className="settings-field">
-                <label>Daily Trades Limit</label>
+                <label>Stock Daily Trades Limit</label>
                 <input
                   type="number"
                   min={1}
@@ -815,7 +812,19 @@ export default function SettingsPage({ token, httpUrl, context, onModeChange }: 
                   value={settings.dailyTradesLimit}
                   onChange={e => set('dailyTradesLimit', Number(e.target.value))}
                 />
-                <span className="field-hint">Max options trades per day (default: 10)</span>
+                <span className="field-hint">Max stock trades per day (default: 10)</span>
+              </div>
+
+              <div className="settings-field">
+                <label>Options Daily Trades Limit</label>
+                <input
+                  type="number"
+                  min={1}
+                  max={100}
+                  value={settings.optionsDailyTradesLimit}
+                  onChange={e => set('optionsDailyTradesLimit', Number(e.target.value))}
+                />
+                <span className="field-hint">Max options trades per day (default: 4)</span>
               </div>
 
               <div className="settings-field">
@@ -854,6 +863,7 @@ export default function SettingsPage({ token, httpUrl, context, onModeChange }: 
                   demoEquityStocks: DEFAULT_ACCOUNT_SETTINGS.demoEquityStocks,
                   demoEquityCrypto: DEFAULT_ACCOUNT_SETTINGS.demoEquityCrypto,
                   dailyTradesLimit: DEFAULT_ACCOUNT_SETTINGS.dailyTradesLimit,
+                  optionsDailyTradesLimit: DEFAULT_ACCOUNT_SETTINGS.optionsDailyTradesLimit,
                   managedAccountRatio: DEFAULT_ACCOUNT_SETTINGS.managedAccountRatio,
                   riskPerTrade: DEFAULT_ACCOUNT_SETTINGS.riskPerTrade,
                 }))}
@@ -1070,6 +1080,9 @@ export default function SettingsPage({ token, httpUrl, context, onModeChange }: 
             </div>
           </section>
         )}
+
+        {/* ── Trading strategies & indicators (TRA-167) — anchored at the bottom (TRA-195) */}
+        <TradingStrategiesSection context={context} />
 
         {/* ── Save + Reset row ──────────────────────────────────────────── */}
         <div className="settings-footer">

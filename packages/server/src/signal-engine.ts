@@ -169,7 +169,7 @@ export class SignalEngine {
     this.optionsAccount = new PaperOptionsAccount({
       initialEquity: currentEquity,
       managedAccountRatio: settings?.managedAccountRatio,
-      dailyTradesLimit: settings?.dailyTradesLimit,
+      optionsDailyTradesLimit: settings?.optionsDailyTradesLimit,
     });
   }
 
@@ -183,7 +183,7 @@ export class SignalEngine {
    * - Switching to live mode preserves the demo state internally and masks it
    *   to zero via getState() (no broker connected). Switching back to demo
    *   restores positions, equity, and dailyPnl untouched.
-   * - Risk parameters (managedAccountRatio, riskPerTrade, dailyTradesLimit)
+   * - Risk parameters (managedAccountRatio, riskPerTrade, optionsDailyTradesLimit)
    *   update live without touching positions.
    *
    * Use {@link forceReset} for the explicit "Reset Demo Account" hard reset.
@@ -196,7 +196,7 @@ export class SignalEngine {
     });
     this.optionsAccount.updateConfig({
       managedAccountRatio: settings.managedAccountRatio,
-      dailyTradesLimit: settings.dailyTradesLimit,
+      optionsDailyTradesLimit: settings.optionsDailyTradesLimit,
     });
     if (this.mode === 'live') {
       // Live mode: leave account/options/tracker untouched so the demo state
@@ -234,7 +234,7 @@ export class SignalEngine {
     this.optionsAccount.reset({
       initialEquity: equity,
       managedAccountRatio: settings.managedAccountRatio,
-      dailyTradesLimit: settings.dailyTradesLimit,
+      optionsDailyTradesLimit: settings.optionsDailyTradesLimit,
     });
     this.allClosedPositions = [];
     this.recentSignals = [];
