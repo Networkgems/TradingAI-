@@ -59,33 +59,52 @@ function nowET(): { hour: number; minute: number; date: Date } {
 
 export type EodTriggerCallback = () => void | Promise<void>;
 
+export interface ScheduleCallbacks {
+  /** Fires at 4:05 PM ET on stock-market trading days (Mon–Fri, non-holiday). */
+  onMarketClose?: EodTriggerCallback;
+  /** Fires at 4:05 PM ET every calendar day — for 24/7 markets like crypto. */
+  onDaily?: EodTriggerCallback;
+}
+
 export class MarketScheduler {
   private timer: ReturnType<typeof setInterval> | null = null;
-  private lastFiredDate = '';
+  private lastMarketCloseDate = '';
+  private lastDailyDate = '';
 
   /**
-   * Start polling. The callback fires once per trading day at 4:05 PM ET.
-   * @param onEod Async callback invoked at market close.
+   * Start polling. Accepts either a single market-close callback (legacy form)
+   * or an object with separate `onMarketClose` and `onDaily` callbacks. Both fire
+   * at 4:05 PM ET; `onMarketClose` only on trading days, `onDaily` every day.
    */
-  start(onEod: EodTriggerCallback): void {
+  start(callbacks: EodTriggerCallback | ScheduleCallbacks): void {
     if (this.timer) return;
+    const cfg: ScheduleCallbacks =
+      typeof callbacks === 'function' ? { onMarketClose: callbacks } : callbacks;
 
     // Check every 60 seconds
     this.timer = setInterval(() => {
       const { hour, minute, date } = nowET();
-      if (hour === 16 && minute === 5 && isMarketDay(date)) {
-        const todayKey = date.toLocaleDateString('en-CA', { timeZone: 'America/New_York' });
-        if (this.lastFiredDate !== todayKey) {
-          this.lastFiredDate = todayKey;
-          console.log(`[scheduler] EOD trigger fired for ${todayKey}`);
-          Promise.resolve(onEod()).catch(err =>
-            console.error('[scheduler] EOD callback error:', err)
-          );
-        }
+      if (hour !== 16 || minute !== 5) return;
+      const todayKey = date.toLocaleDateString('en-CA', { timeZone: 'America/New_York' });
+
+      if (cfg.onMarketClose && isMarketDay(date) && this.lastMarketCloseDate !== todayKey) {
+        this.lastMarketCloseDate = todayKey;
+        console.log(`[scheduler] market-close EOD trigger fired for ${todayKey}`);
+        Promise.resolve(cfg.onMarketClose()).catch(err =>
+          console.error('[scheduler] market-close EOD callback error:', err),
+        );
+      }
+
+      if (cfg.onDaily && this.lastDailyDate !== todayKey) {
+        this.lastDailyDate = todayKey;
+        console.log(`[scheduler] daily EOD trigger fired for ${todayKey}`);
+        Promise.resolve(cfg.onDaily()).catch(err =>
+          console.error('[scheduler] daily EOD callback error:', err),
+        );
       }
     }, 60_000);
 
-    console.log('[scheduler] Market-day EOD scheduler started (fires at 4:05 PM ET on trading days)');
+    console.log('[scheduler] EOD scheduler started (4:05 PM ET — market-day for stocks, every day for crypto)');
   }
 
   stop(): void {

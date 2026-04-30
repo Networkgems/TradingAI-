@@ -198,7 +198,24 @@ async function generateAndSaveCryptoReport(ctx: UserContext): Promise<void> {
     writeFile(latestMdPath, report.markdown, 'utf-8'),
   ]);
 
+  // TRA-193 — persist the day's equity snapshot so the crypto P&L calendar and
+  // cumulative stats see this row, mirroring the stocks flow above.
+  const closingEquity = snapshot.accountState.totalEquity;
+  const openingEquity = ctx.cryptoTracker.getOpeningEquity();
+  ctx.cryptoTracker.saveSnapshot({
+    date: report.date,
+    openingEquity,
+    closingEquity,
+    dailyPnl: closingEquity - openingEquity,
+    optionsPnl: 0,
+    combinedPnl: closingEquity - openingEquity,
+    trades: snapshot.allClosedPositions.length,
+  });
+
   console.log(`[crypto-reports:${ctx.username}] EOD report saved → ${datePath}`);
+
+  const msg = JSON.stringify({ type: 'crypto_eod_report', payload: report });
+  broadcastToUser(ctx.username, msg);
 }
 
 async function generateAllUserEodReports(): Promise<void> {
@@ -207,6 +224,19 @@ async function generateAllUserEodReports(): Promise<void> {
       await generateAndSaveReport(ctx);
     } catch (err) {
       console.error(`[reports:${ctx.username}] EOD report failed:`, err);
+    }
+  }
+}
+
+// TRA-193 — crypto markets are 24/7, so the calendar needs a daily P&L row
+// every calendar day (including weekends and holidays). Iterates every user
+// context so each tenant's `crypto-reports/<date>.json` is written.
+async function generateAllUserCryptoEodReports(): Promise<void> {
+  for (const ctx of getAllUserContexts()) {
+    try {
+      await generateAndSaveCryptoReport(ctx);
+    } catch (err) {
+      console.error(`[crypto-reports:${ctx.username}] EOD report failed:`, err);
     }
   }
 }
@@ -1123,7 +1153,12 @@ if (existsSync(DIST_DIR)) {
 // ── Start ────────────────────────────────────────────────────────────────────
 
 const scheduler = new MarketScheduler();
-scheduler.start(generateAllUserEodReports);
+scheduler.start({
+  onMarketClose: generateAllUserEodReports,
+  // TRA-193 — crypto runs 24/7, so save the daily P&L every calendar day
+  // (weekends and holidays included) — otherwise the calendar shows no rows.
+  onDaily: generateAllUserCryptoEodReports,
+});
 
 httpServer.listen(PORT, () => {
   console.log(`Trading server running on http://localhost:${PORT}`);
