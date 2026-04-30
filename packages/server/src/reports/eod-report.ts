@@ -40,6 +40,8 @@ function strategyLabel(t: SignalType): EodTradeEntry['strategy'] {
     case 'macd_cross': return 'MACD';        // legacy positions still on disk
     case 'macd_trend': return 'MACD Trend';
     case 'bb_fade': return 'BB Fade';
+    case 'momentum': return 'Momentum';
+    case 'mean_reversion': return 'Mean Reversion';
     case 'ichimoku': return 'Ichimoku';
     case 'scalping': return 'Scalping';
     case 'swing_trade': return 'Swing';

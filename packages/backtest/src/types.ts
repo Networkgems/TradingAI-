@@ -1,5 +1,5 @@
 import { Position } from '@trading-app/shared';
-import type { CostModel, IchimokuOptions, OrbOptions, ScalpingOptions, SwingOptions } from '@trading-app/engine';
+import type { CostModel, IchimokuOptions, MomentumOptions, OrbOptions, RegimeDetectorOptions, ScalpingOptions, SwingOptions } from '@trading-app/engine';
 
 export interface BacktestReversalOpts {
   rsiPeriod?: number;
@@ -85,6 +85,7 @@ export interface BacktestConfig {
     | 'macd'
     | 'macd_trend'
     | 'bb_fade'
+    | 'momentum'
     | 'ichimoku'
     | 'combined'
     | 'macd_bollinger'
@@ -93,6 +94,13 @@ export interface BacktestConfig {
   reversalOpts?: BacktestReversalOpts;
   macdBollingerOpts?: BacktestMacdBollingerOpts;
   ichimokuOpts?: BacktestIchimokuOpts;
+  /** TRA-205: pass-through to MomentumStrategy. */
+  momentumOpts?: MomentumOptions;
+  /**
+   * TRA-205: regime-detector knobs forwarded to the detector that gates
+   * momentum (and any future regime-aware strategy). Omit to use defaults.
+   */
+  regimeOpts?: RegimeDetectorOptions;
   /**
    * Pass-through to OrbStrategy. Use this to inject `timeFilter:
    * isValidCryptoTradingWindow` and a `sessionAnchorTimestampOf` callback for

@@ -14,3 +14,5 @@ export type { AdxResult } from './adx.js';
 export { ema, emaCross } from './ema.js';
 export { emaSeries, maSlope } from './ma.js';
 export { atr, atrPct } from './atr.js';
+export { donchian } from './donchian.js';
+export type { DonchianChannel } from './donchian.js';

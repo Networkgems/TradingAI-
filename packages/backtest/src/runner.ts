@@ -4,9 +4,11 @@ import {
   ReversalStrategy,
   MacdTrendStrategy,
   BbFadeStrategy,
+  MomentumStrategy,
   IchimokuStrategy,
   ScalpingStrategy,
   SwingStrategy,
+  RegimeDetector,
   RiskManager,
   PositionManager,
 } from '@trading-app/engine';
@@ -161,6 +163,11 @@ export class BacktestRunner {
     const ichimoku = new IchimokuStrategy(config.ichimokuOpts);
     const scalping = new ScalpingStrategy(config.scalpingOpts);
     const swing = new SwingStrategy(config.swingOpts);
+    // TRA-205: momentum is regime-gated; the detector is owned by the runner
+    // and re-fed each bar so its hysteresis state matches what the strategy
+    // sees during live trading.
+    const regimeDetector = new RegimeDetector(config.regimeOpts);
+    const momentum = new MomentumStrategy(regimeDetector, config.momentumOpts);
 
     // TRA-169 / TRA-185 / TRA-203: per-fill cost model. Commission charged on
     // entry+exit notional, slippage applied adversely to fill prices. The
@@ -256,6 +263,10 @@ export class BacktestRunner {
       if (config.strategyType === 'bb_fade' || config.strategyType === 'macd_bollinger' || config.strategyType === 'combined') {
         const f = bbFade.evaluate(config.symbol, window);
         if (f) signals.push(f);
+      }
+      if (config.strategyType === 'momentum' || config.strategyType === 'combined') {
+        const m = momentum.evaluate(config.symbol, window);
+        if (m) signals.push(m);
       }
       if (config.strategyType === 'ichimoku' || config.strategyType === 'combined') {
         const s = ichimoku.evaluate(config.symbol, window);

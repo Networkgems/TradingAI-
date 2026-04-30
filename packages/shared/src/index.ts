@@ -8,6 +8,7 @@ export type SignalType =
   | 'macd_cross'   // legacy MacdBollingerStrategy — kept so historical positions/snapshots still type-check
   | 'macd_trend'   // TRA-170: trend-continuation half of the split MACD-Bollinger
   | 'bb_fade'      // TRA-170: pure mean-reversion half
+  | 'momentum'     // TRA-205: MA-cross + Donchian breakout, gated to trend regimes
   | 'mean_reversion' // TRA-206: regime-gated RSI+BB mean reversion (range-only, long+short)
   | 'ichimoku'
   | 'scalping'
@@ -530,6 +531,8 @@ export interface EodTradeEntry {
     | 'MACD'
     | 'MACD Trend'   // TRA-170 split
     | 'BB Fade'      // TRA-170 split
+    | 'Momentum'     // TRA-205
+    | 'Mean Reversion' // TRA-206
     | 'Ichimoku'
     | 'Scalping'
     | 'Swing'

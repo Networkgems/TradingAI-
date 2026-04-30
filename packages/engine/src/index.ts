@@ -8,6 +8,8 @@ export { MacdTrendStrategy } from './strategies/macd-trend.js';
 export type { MacdTrendOptions } from './strategies/macd-trend.js';
 export { BbFadeStrategy } from './strategies/bb-fade.js';
 export type { BbFadeOptions } from './strategies/bb-fade.js';
+export { MomentumStrategy } from './strategies/momentum.js';
+export type { MomentumOptions } from './strategies/momentum.js';
 export { MeanReversionCryptoStrategy } from './strategies/mean-reversion-crypto.js';
 export type { MeanReversionCryptoOptions } from './strategies/mean-reversion-crypto.js';
 export { IchimokuStrategy } from './strategies/ichimoku-strategy.js';
@@ -47,8 +49,8 @@ export type {
   MarketOrderParams as CoinbaseMarketOrderParams,
   LimitOrderParams as CoinbaseLimitOrderParams,
 } from './coinbase/index.js';
-export { rsi, rsiDivergence, VwapTracker, detectPattern, isBullishPattern, isBearishPattern, adx, ema, emaCross, emaSeries, maSlope, atr, atrPct, ichimoku, tkCross } from './indicators/index.js';
-export type { VwapState, CandlePattern, AdxResult, IchimokuState } from './indicators/index.js';
+export { rsi, rsiDivergence, VwapTracker, detectPattern, isBullishPattern, isBearishPattern, adx, ema, emaCross, emaSeries, maSlope, atr, atrPct, donchian, ichimoku, tkCross } from './indicators/index.js';
+export type { VwapState, CandlePattern, AdxResult, DonchianChannel, IchimokuState } from './indicators/index.js';
 export { RegimeDetector, classifyRegime } from './regime.js';
 export type { Regime, RegimeDetectorOptions } from './regime.js';
 export { blackScholesPrice, blackScholesDelta, bsImpliedVolatility, daysToExpiration } from './options/black-scholes.js';
