@@ -8,6 +8,7 @@ export type SignalType =
   | 'macd_cross'   // legacy MacdBollingerStrategy — kept so historical positions/snapshots still type-check
   | 'macd_trend'   // TRA-170: trend-continuation half of the split MACD-Bollinger
   | 'bb_fade'      // TRA-170: pure mean-reversion half
+  | 'mean_reversion' // TRA-206: regime-gated RSI+BB mean reversion (range-only, long+short)
   | 'ichimoku'
   | 'scalping'
   | 'swing_trade'

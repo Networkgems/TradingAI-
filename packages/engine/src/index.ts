@@ -8,6 +8,8 @@ export { MacdTrendStrategy } from './strategies/macd-trend.js';
 export type { MacdTrendOptions } from './strategies/macd-trend.js';
 export { BbFadeStrategy } from './strategies/bb-fade.js';
 export type { BbFadeOptions } from './strategies/bb-fade.js';
+export { MeanReversionCryptoStrategy } from './strategies/mean-reversion-crypto.js';
+export type { MeanReversionCryptoOptions } from './strategies/mean-reversion-crypto.js';
 export { IchimokuStrategy } from './strategies/ichimoku-strategy.js';
 export type { IchimokuOptions } from './strategies/ichimoku-strategy.js';
 export { ScalpingStrategy } from './strategies/scalping-strategy.js';
