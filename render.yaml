@@ -55,11 +55,20 @@ services:
       # Tradier API credentials (TRA-191) — required for the options-chain
       # relative-value scanner to fetch live chains. With these unset the
       # scanner reports `no_credentials` and the engine simply skips options
-      # scanning (equity / share trading is unaffected). Both must be set in
-      # the Render dashboard; we never commit the values to source.
+      # scanning (equity / share trading is unaffected). All values are set
+      # in the Render dashboard; we never commit them to source.
+      #
+      # Production credentials. Used when TRADIER_ENV=production.
       - key: TRADIER_API_TOKEN
         sync: false
       - key: TRADIER_ACCOUNT_ID
+        sync: false
+      # Sandbox / paper-trading credentials. Used when TRADIER_ENV=sandbox
+      # (the default). Falls back to the unprefixed pair above when these
+      # are unset so legacy single-pair setups still work.
+      - key: TRADIER_SANDBOX_API_TOKEN
+        sync: false
+      - key: TRADIER_SANDBOX_ACCOUNT_ID
         sync: false
       # `sandbox` (default) or `production`. Use `sandbox` for paper testing
       # and `production` only when the trading account is confirmed and you

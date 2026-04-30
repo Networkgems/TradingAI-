@@ -64,16 +64,31 @@ initResetTokenStore(DATA_DIR);
 
 // TRA-191 — server-side relative-value scanner. The only options strategy
 // active for stock options in this iteration; OTM mispricing and per-equity
-// ATM auto-open are disabled. Disabled (no_credentials) until
-// TRADIER_API_TOKEN + TRADIER_ACCOUNT_ID are configured. Wired into
-// user-context BEFORE any contexts are constructed so every per-user
-// SignalEngine sees the same scanner instance and shares the 60s chain
-// cache + 1h breaker. Uses Yahoo's existing quote pipeline as the spot
-// source so we don't pay for Tradier quotes too.
+// ATM auto-open are disabled. Wired into user-context BEFORE any contexts
+// are constructed so every per-user SignalEngine sees the same scanner
+// instance and shares the 60s chain cache + 1h breaker. Uses Yahoo's
+// existing quote pipeline as the spot source so we don't pay for Tradier
+// quotes too.
+//
+// Credentials resolution by `TRADIER_ENV`:
+//   • `production` → TRADIER_API_TOKEN + TRADIER_ACCOUNT_ID
+//   • `sandbox` (default) → TRADIER_SANDBOX_API_TOKEN + TRADIER_SANDBOX_ACCOUNT_ID,
+//     falling back to the unprefixed pair when the sandbox-specific ones
+//     are missing (so legacy single-pair setups still work).
+// Reports `no_credentials` when the resolved pair is empty — the engine
+// then simply skips options scanning, equity trading is unaffected.
+const tradierEnv = (process.env['TRADIER_ENV'] as 'sandbox' | 'production') ?? 'sandbox';
+const tradierApiToken = tradierEnv === 'production'
+  ? process.env['TRADIER_API_TOKEN']
+  : (process.env['TRADIER_SANDBOX_API_TOKEN'] ?? process.env['TRADIER_API_TOKEN']);
+const tradierAccountId = tradierEnv === 'production'
+  ? process.env['TRADIER_ACCOUNT_ID']
+  : (process.env['TRADIER_SANDBOX_ACCOUNT_ID'] ?? process.env['TRADIER_ACCOUNT_ID']);
+
 const relativeValueScannerService = new TradierRelativeValueScannerService({
-  tradierApiToken: process.env['TRADIER_API_TOKEN'],
-  tradierAccountId: process.env['TRADIER_ACCOUNT_ID'],
-  tradierEnv: (process.env['TRADIER_ENV'] as 'sandbox' | 'production') ?? 'sandbox',
+  tradierApiToken,
+  tradierAccountId,
+  tradierEnv,
   fetchSpot: async (symbol) => {
     const quotes = await fetchQuotes([symbol]);
     const q = quotes.get(symbol);
@@ -82,6 +97,9 @@ const relativeValueScannerService = new TradierRelativeValueScannerService({
 });
 setRvScanner(
   relativeValueScannerService.diagnostics().configured ? relativeValueScannerService : undefined,
+);
+console.log(
+  `[rv-scanner] env=${tradierEnv} configured=${relativeValueScannerService.diagnostics().configured}`,
 );
 
 // TRA-142 — migrate legacy global files into the admin namespace exactly once,
