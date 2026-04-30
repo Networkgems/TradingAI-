@@ -1,0 +1,158 @@
+import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
+import { TradierStocksClient } from './stocks-client.js';
+
+let fetchMock: ReturnType<typeof vi.fn>;
+
+function jsonResponse(body: unknown, status = 200): Response {
+  return new Response(JSON.stringify(body), { status, headers: { 'Content-Type': 'application/json' } });
+}
+
+function textResponse(body: string, status: number): Response {
+  return new Response(body, { status });
+}
+
+beforeEach(() => {
+  fetchMock = vi.fn(async () => jsonResponse({}));
+  globalThis.fetch = fetchMock as unknown as typeof fetch;
+});
+
+afterEach(() => {
+  vi.restoreAllMocks();
+});
+
+describe('TradierStocksClient.getQuotes', () => {
+  it('returns an empty map when given no symbols (no HTTP call)', async () => {
+    const client = new TradierStocksClient('tok');
+    const out = await client.getQuotes([]);
+    expect(out.size).toBe(0);
+    expect(fetchMock).not.toHaveBeenCalled();
+  });
+
+  it('parses a multi-symbol Tradier quotes envelope', async () => {
+    fetchMock.mockResolvedValueOnce(jsonResponse({
+      quotes: {
+        quote: [
+          { symbol: 'AAPL', last: 195.25, change: 1.10, change_percentage: 0.57, volume: 50_123_456 },
+          { symbol: 'MSFT', last: 422.80, change: -3.20, change_percentage: -0.75, volume: 22_345_678 },
+        ],
+      },
+    }));
+    const client = new TradierStocksClient('tok');
+    const out = await client.getQuotes(['AAPL', 'MSFT']);
+    expect(out.size).toBe(2);
+    expect(out.get('AAPL')).toMatchObject({ price: 195.25, change: 1.10, changePct: 0.57, volume: 50_123_456 });
+    expect(out.get('MSFT')).toMatchObject({ price: 422.80, change: -3.20, changePct: -0.75 });
+    // Single round-trip with comma-separated symbols.
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+    const url = String(fetchMock.mock.calls[0][0]);
+    expect(url).toContain('symbols=AAPL%2CMSFT');
+  });
+
+  it('handles single-symbol response (Tradier collapses array to object)', async () => {
+    fetchMock.mockResolvedValueOnce(jsonResponse({
+      quotes: { quote: { symbol: 'AAPL', last: 195.25, change: 0, change_percentage: 0, volume: 1 } },
+    }));
+    const client = new TradierStocksClient('tok');
+    const out = await client.getQuotes(['AAPL']);
+    expect(out.size).toBe(1);
+    expect(out.get('AAPL')!.price).toBe(195.25);
+  });
+
+  it('skips rows without a positive `last` price', async () => {
+    fetchMock.mockResolvedValueOnce(jsonResponse({
+      quotes: {
+        quote: [
+          { symbol: 'AAPL', last: 0 },
+          { symbol: 'MSFT', last: 422 },
+        ],
+      },
+    }));
+    const client = new TradierStocksClient('tok');
+    const out = await client.getQuotes(['AAPL', 'MSFT']);
+    expect(out.has('AAPL')).toBe(false);
+    expect(out.has('MSFT')).toBe(true);
+  });
+
+  it('throws on non-2xx responses so the caller can fall back to a backup feed', async () => {
+    fetchMock.mockResolvedValueOnce(textResponse('rate limit', 429));
+    const client = new TradierStocksClient('tok');
+    await expect(client.getQuotes(['AAPL'])).rejects.toThrow(/HTTP 429/);
+  });
+
+  it('routes through the production base when env=production', async () => {
+    fetchMock.mockResolvedValueOnce(jsonResponse({ quotes: { quote: [] } }));
+    const client = new TradierStocksClient('tok', 'production');
+    await client.getQuotes(['AAPL']);
+    expect(String(fetchMock.mock.calls[0][0])).toMatch(/^https:\/\/api\.tradier\.com\/v1\/markets\/quotes/);
+  });
+});
+
+describe('TradierStocksClient.getMinuteBars', () => {
+  it('parses a timesales series into Candle objects, dropping in-progress and zero-volume rows', async () => {
+    const now = Date.now();
+    const minute = (offsetMin: number): number => Math.floor((now - offsetMin * 60_000) / 1000);
+    fetchMock.mockResolvedValueOnce(jsonResponse({
+      series: {
+        data: [
+          // Three valid past-minute bars.
+          { timestamp: minute(3), open: 100, high: 101, low: 99.5, close: 100.5, volume: 1234 },
+          { timestamp: minute(2), open: 100.5, high: 101.2, low: 100.4, close: 101.1, volume: 2345 },
+          { timestamp: minute(1), open: 101.1, high: 101.5, low: 100.9, close: 101.3, volume: 3456 },
+          // In-progress bar (current minute) — should be dropped.
+          { timestamp: minute(0), open: 101.3, high: 101.4, low: 101.2, close: 101.35, volume: 100 },
+          // Zero-volume bar — dropped.
+          { timestamp: minute(4), open: 99, high: 99, low: 99, close: 99, volume: 0 },
+          // Missing OHLC — dropped.
+          { timestamp: minute(5), open: 98, high: 98, close: 98, volume: 1 },
+        ],
+      },
+    }));
+    const client = new TradierStocksClient('tok');
+    const bars = await client.getMinuteBars('AAPL', 60);
+    expect(bars.length).toBe(3);
+    // Sorted ascending by timestamp.
+    expect(bars[0].timestamp).toBeLessThan(bars[1].timestamp);
+    expect(bars[1].timestamp).toBeLessThan(bars[2].timestamp);
+    expect(bars[bars.length - 1].close).toBe(101.3);
+    expect(bars.every((b) => b.symbol === 'AAPL' && b.volume > 0)).toBe(true);
+  });
+
+  it('returns an empty list when the series is empty', async () => {
+    fetchMock.mockResolvedValueOnce(jsonResponse({ series: '' }));
+    const client = new TradierStocksClient('tok');
+    expect(await client.getMinuteBars('AAPL', 30)).toEqual([]);
+  });
+
+  it('takes only the trailing `count` bars when the response is larger', async () => {
+    const now = Date.now();
+    const rows = Array.from({ length: 50 }, (_, i) => ({
+      timestamp: Math.floor((now - (i + 1) * 60_000) / 1000),
+      open: 100 + i,
+      high: 100 + i + 0.5,
+      low: 100 + i - 0.5,
+      close: 100 + i,
+      volume: 100 + i,
+    }));
+    fetchMock.mockResolvedValueOnce(jsonResponse({ series: { data: rows } }));
+    const client = new TradierStocksClient('tok');
+    const bars = await client.getMinuteBars('AAPL', 10);
+    expect(bars.length).toBe(10);
+  });
+
+  it('throws on non-2xx responses', async () => {
+    fetchMock.mockResolvedValueOnce(textResponse('not authorised', 401));
+    const client = new TradierStocksClient('tok');
+    await expect(client.getMinuteBars('AAPL', 30)).rejects.toThrow(/HTTP 401/);
+  });
+
+  it('hits /markets/timesales with interval=1min and session_filter=open', async () => {
+    fetchMock.mockResolvedValueOnce(jsonResponse({ series: { data: [] } }));
+    const client = new TradierStocksClient('tok');
+    await client.getMinuteBars('AAPL', 30);
+    const url = String(fetchMock.mock.calls[0][0]);
+    expect(url).toContain('/markets/timesales');
+    expect(url).toContain('symbol=AAPL');
+    expect(url).toContain('interval=1min');
+    expect(url).toContain('session_filter=open');
+  });
+});

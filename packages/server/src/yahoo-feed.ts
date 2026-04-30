@@ -1,4 +1,5 @@
 import YahooFinance from 'yahoo-finance2';
+import { TradierStocksClient, type TradierEnv } from '@trading-app/engine';
 import type { Candle, NewsItem } from '@trading-app/shared';
 import { fetchStooqQuote } from './stooq-feed.js';
 
@@ -14,9 +15,9 @@ const sleep = (ms: number) => new Promise(resolve => setTimeout(resolve, ms));
 // "Loading…", and signals couldn't open positions because price was unavailable).
 const YF_CALL_TIMEOUT_MS = 8_000;
 
-// 429 circuit breaker. When Yahoo rate-limits us, retrying every tick burns the
-// retry budget for nothing and risks extending the lock-out. Open the breaker for
-// a cool-down window after a 429 so we fall through to fallback providers fast.
+// 429 circuit breaker for Yahoo. When Yahoo rate-limits us, retrying every tick
+// burns the retry budget for nothing and risks extending the lock-out. Open the
+// breaker for a cool-down window so we fall through to Stooq fast.
 const RATE_LIMIT_COOLDOWN_MS = 90_000;
 let rateLimitedUntil = 0;
 function isRateLimited(): boolean {
@@ -57,7 +58,6 @@ function withTimeout<T>(p: Promise<T>, ms: number, label: string): Promise<T> {
 
 async function withRetry<T>(fn: () => Promise<T>, label: string, retries = 2): Promise<T | null> {
   if (isRateLimited()) {
-    // Skip outright while breaker is open — caller falls back to alternate provider.
     return null;
   }
   for (let attempt = 0; attempt <= retries; attempt++) {
@@ -96,16 +96,47 @@ function isActiveInterest(symbol: string): boolean {
   return activeInterestSymbols.has(symbol);
 }
 
-// ── Daily fallback request counters (TRA-154) ────────────────────────────────
-// Tracks how many minute-bar requests we send per provider per UTC day so the
-// /api/health/quotes endpoint can show whether we're approaching free-tier caps
-// (Twelve Data 800/day, Tiingo 1,000/day). Resets on UTC midnight rollover.
+// ── Tradier primary feed (TRA-191 follow-up) ──────────────────────────────────
+// Once the Tradier broker creds are configured, Tradier is the primary source
+// for both quotes and 1-minute bars. Yahoo / Twelve Data / Stooq remain as
+// successive fallbacks so the engine still returns *something* when Tradier
+// 429s or the env vars are missing.
 
-type FallbackProvider = 'finnhubCandle' | 'twelveData' | 'tiingo';
+const TRADIER_ENV = (process.env['TRADIER_ENV'] as TradierEnv) ?? 'sandbox';
+const TRADIER_API_TOKEN = TRADIER_ENV === 'production'
+  ? (process.env['TRADIER_API_TOKEN'] ?? '')
+  : (process.env['TRADIER_SANDBOX_API_TOKEN'] ?? process.env['TRADIER_API_TOKEN'] ?? '');
+
+const tradierStocksClient: TradierStocksClient | null =
+  TRADIER_API_TOKEN ? new TradierStocksClient(TRADIER_API_TOKEN, TRADIER_ENV) : null;
+
+if (!tradierStocksClient) {
+  console.warn('[yahoo-feed] Tradier stocks feed disabled (no TRADIER_*_API_TOKEN) — using Yahoo as primary');
+}
+
+const TRADIER_BREAKER_COOLDOWN_MS = 90_000;
+let tradierBlockedUntil = 0;
+function isTradierBlocked(): boolean {
+  return Date.now() < tradierBlockedUntil;
+}
+function tripTradierBreaker(label: string, msg: string): void {
+  tradierBlockedUntil = Date.now() + TRADIER_BREAKER_COOLDOWN_MS;
+  console.warn(`[yahoo-feed] Tradier breaker tripped for ${TRADIER_BREAKER_COOLDOWN_MS / 1000}s after ${label}: ${msg}`);
+}
+
+export function isTradierStocksConfigured(): boolean {
+  return tradierStocksClient !== null;
+}
+
+// ── Daily fallback request counters ──────────────────────────────────────────
+// Tracks how many fallback minute-bar requests we send per provider per UTC day
+// so the /api/health/quotes endpoint can show whether we're approaching free-
+// tier caps. Resets on UTC midnight rollover.
+
+type FallbackProvider = 'tradier' | 'twelveData';
 const fallbackCounters: Record<FallbackProvider, number> = {
-  finnhubCandle: 0,
+  tradier: 0,
   twelveData: 0,
-  tiingo: 0,
 };
 let fallbackCountersDay = utcDayKey();
 
@@ -116,9 +147,8 @@ function utcDayKey(): string {
 function rollFallbackCountersIfNeeded(): void {
   const today = utcDayKey();
   if (today !== fallbackCountersDay) {
-    fallbackCounters.finnhubCandle = 0;
+    fallbackCounters.tradier = 0;
     fallbackCounters.twelveData = 0;
-    fallbackCounters.tiingo = 0;
     fallbackCountersDay = today;
   }
 }
@@ -128,26 +158,25 @@ function bumpFallbackCounter(provider: FallbackProvider): void {
   fallbackCounters[provider] += 1;
 }
 
-export function getFallbackRequestCounts(): { day: string; finnhubCandle: number; twelveData: number; tiingo: number } {
+export function getFallbackRequestCounts(): { day: string; tradier: number; twelveData: number } {
   rollFallbackCountersIfNeeded();
   return {
     day: fallbackCountersDay,
-    finnhubCandle: fallbackCounters.finnhubCandle,
+    tradier: fallbackCounters.tradier,
     twelveData: fallbackCounters.twelveData,
-    tiingo: fallbackCounters.tiingo,
   };
 }
 
-// ── Per-symbol minute-bar cache (TRA-154) ────────────────────────────────────
+// ── Per-symbol minute-bar cache ──────────────────────────────────────────────
 // fetchMinuteBarsWithSource is called once per active symbol per 30-second
 // signal-engine tick. Bars only refresh on the minute boundary, so two ticks
 // inside the same minute produce identical work. The cache lets back-to-back
-// ticks reuse the most recent successful provider response — keeping us inside
-// Twelve Data's 8 req/min and Tiingo's 50/hr limits when Yahoo's breaker is
-// open. Cached entries expire at the next minute boundary (worst case ~60s).
+// ticks reuse the most recent successful provider response.
+
+type MinuteBarSource = 'tradier' | 'yahoo' | 'twelvedata' | 'none';
 type MinuteBarCacheEntry = {
   bars: Candle[];
-  source: 'yahoo' | 'finnhub' | 'twelvedata' | 'tiingo';
+  source: Exclude<MinuteBarSource, 'none'>;
   expiresAt: number;
 };
 const minuteBarCache = new Map<string, MinuteBarCacheEntry>();
@@ -156,179 +185,11 @@ function nextMinuteBoundary(): number {
   return Math.floor(now / 60_000) * 60_000 + 60_000;
 }
 
-// ── Finnhub fallback for stocks ───────────────────────────────────────────────
-// Activated when FINNHUB_API_KEY is set. Free tier covers US equities at 60 req/min.
-
-const FINNHUB_API_KEY = process.env.FINNHUB_API_KEY ?? '';
-const FINNHUB_BASE = 'https://finnhub.io/api/v1';
-
-if (!FINNHUB_API_KEY) {
-  console.warn('[yahoo-feed] FINNHUB_API_KEY is not set — Finnhub stock fallback disabled');
-}
-
-// TRA-149: throttle diagnostic logs for c=0 / non-OK Finnhub /quote responses
-// to once per minute per (symbol, kind) so a stuck-throttled key during a Yahoo
-// outage doesn't spam logs every 30s tick × N watchlist symbols.
-const FINNHUB_LOG_THROTTLE_MS = 60_000;
-const finnhubLogThrottle = new Map<string, number>();
-function shouldLogFinnhub(symbol: string, kind: 'http' | 'c0'): boolean {
-  const key = `${kind}:${symbol}`;
-  const now = Date.now();
-  const last = finnhubLogThrottle.get(key) ?? 0;
-  if (now - last < FINNHUB_LOG_THROTTLE_MS) return false;
-  finnhubLogThrottle.set(key, now);
-  return true;
-}
-
-// TRA-149: tiny per-symbol cache in front of /quote so concurrent callers (and
-// closely-spaced ticks) don't double-fire Finnhub during Yahoo outages, when
-// Finnhub becomes the load-bearing source. 5s is short enough to keep the
-// watchlist live and long enough to coalesce a single tick's parallel fan-out.
-const FINNHUB_QUOTE_TTL_MS = 5_000;
-type FinnhubQuoteResult = { price: number; volume: number; change: number; changePct: number };
-const finnhubQuoteCache = new Map<string, { at: number; value: FinnhubQuoteResult | null }>();
-
-async function fetchFinnhubQuote(symbol: string): Promise<FinnhubQuoteResult | null> {
-  if (!FINNHUB_API_KEY) return null;
-  const cached = finnhubQuoteCache.get(symbol);
-  if (cached && Date.now() - cached.at < FINNHUB_QUOTE_TTL_MS) {
-    return cached.value;
-  }
-  const value = await fetchFinnhubQuoteUncached(symbol);
-  finnhubQuoteCache.set(symbol, { at: Date.now(), value });
-  return value;
-}
-
-async function fetchFinnhubQuoteUncached(symbol: string): Promise<FinnhubQuoteResult | null> {
-  try {
-    const resp = await withTimeout(
-      fetch(`${FINNHUB_BASE}/quote?symbol=${encodeURIComponent(symbol)}&token=${FINNHUB_API_KEY}`),
-      YF_CALL_TIMEOUT_MS,
-      `finnhub quote(${symbol})`,
-    );
-    if (!resp.ok) {
-      // Pull a body sample so we can tell rate-limit (429) from auth-rejection
-      // (401/403 with JSON error) from upstream-flake (5xx). Throttled per symbol.
-      if (shouldLogFinnhub(symbol, 'http')) {
-        const body = await resp.text().catch(() => '');
-        console.warn(`[yahoo-feed] finnhub quote(${symbol}) HTTP ${resp.status} ${resp.statusText} body=${body.slice(0, 200)}`);
-      } else {
-        console.warn(`[yahoo-feed] finnhub quote(${symbol}) HTTP ${resp.status}`);
-      }
-      return null;
-    }
-    const json = (await resp.json()) as { c?: number; d?: number; dp?: number; pc?: number };
-    if (!json || typeof json.c !== 'number' || json.c === 0) {
-      // Finnhub returns c=0 for invalid symbols, off-hours blanks, AND silently
-      // throttled keys. Log the full payload (throttled) so we can distinguish
-      // these in production — see TRA-149.
-      if (shouldLogFinnhub(symbol, 'c0')) {
-        console.warn(`[yahoo-feed] finnhub quote(${symbol}) c=0 body=${JSON.stringify(json)}`);
-      }
-      return null;
-    }
-    return {
-      price: json.c,
-      volume: 0, // Finnhub /quote does not include volume; the watchlist tolerates 0.
-      change: json.d ?? 0,
-      changePct: json.dp ?? 0,
-    };
-  } catch (err: unknown) {
-    console.warn(`[yahoo-feed] finnhub quote(${symbol}) error: ${err instanceof Error ? err.message : String(err)}`);
-    return null;
-  }
-}
-
-// Finnhub /stock/candle response: parallel arrays keyed by status `s`.
-// `s: 'ok'` with non-empty o/h/l/c/v/t arrays of equal length, `s: 'no_data'` otherwise.
-interface FinnhubCandleResponse {
-  s?: string;
-  o?: number[];
-  h?: number[];
-  l?: number[];
-  c?: number[];
-  v?: number[];
-  t?: number[];
-}
-
-export interface FinnhubCandleDiag {
-  reason: 'no_key' | 'http_error' | 'no_data' | 'parse_error' | 'fetch_error' | 'ok';
-  httpStatus?: number;
-  s?: string;
-  rawLen?: number;
-  filteredLen?: number;
-  errorBody?: string;
-  errorMsg?: string;
-}
-
-// TRA-155: Finnhub moved /stock/candle behind a paid plan in 2024 and the
-// production key is on the free tier, so every candle call returns 403. Once we
-// see that, open a long-running breaker so we don't spam Finnhub with calls we
-// already know will fail — fall through to the next provider immediately.
-const FINNHUB_CANDLE_403_COOLDOWN_MS = 60 * 60 * 1000; // 1 hour
-let finnhubCandlePlanBlockedUntil = 0;
-function isFinnhubCandlePlanBlocked(): boolean {
-  return Date.now() < finnhubCandlePlanBlockedUntil;
-}
-
-async function fetchFinnhubMinuteBars(
-  symbol: string,
-  count: number,
-): Promise<{ bars: Candle[]; diag: FinnhubCandleDiag }> {
-  if (!FINNHUB_API_KEY) return { bars: [], diag: { reason: 'no_key' } };
-  if (isFinnhubCandlePlanBlocked()) {
-    return { bars: [], diag: { reason: 'http_error', httpStatus: 403, errorBody: 'plan_blocked_breaker_open' } };
-  }
-  const nowSec = Math.floor(Date.now() / 1000);
-  // 2× window to absorb gaps from off-hours / illiquid minutes, matching Yahoo's branch.
-  const fromSec = nowSec - count * 60 * 2;
-  try {
-    bumpFallbackCounter('finnhubCandle');
-    const url = `${FINNHUB_BASE}/stock/candle?symbol=${encodeURIComponent(symbol)}&resolution=1&from=${fromSec}&to=${nowSec}&token=${FINNHUB_API_KEY}`;
-    const resp = await withTimeout(fetch(url), YF_CALL_TIMEOUT_MS, `finnhub candle(${symbol})`);
-    if (!resp.ok) {
-      const errorBody = await resp.text().catch(() => '');
-      console.warn(`[yahoo-feed] finnhub candle(${symbol}) HTTP ${resp.status}: ${errorBody.slice(0, 200)}`);
-      if (resp.status === 403) {
-        finnhubCandlePlanBlockedUntil = Date.now() + FINNHUB_CANDLE_403_COOLDOWN_MS;
-      }
-      return { bars: [], diag: { reason: 'http_error', httpStatus: resp.status, errorBody: errorBody.slice(0, 200) } };
-    }
-    const json = (await resp.json()) as FinnhubCandleResponse;
-    if (!json || json.s !== 'ok' || !json.t || !json.o || !json.h || !json.l || !json.c || !json.v) {
-      return { bars: [], diag: { reason: 'no_data', httpStatus: resp.status, s: json?.s, rawLen: json?.t?.length ?? 0 } };
-    }
-    const len = json.t.length;
-    const currentMinuteStart = Math.floor(Date.now() / 60_000) * 60_000;
-    const candles: Candle[] = [];
-    for (let i = 0; i < len; i++) {
-      const ts = (json.t[i] ?? 0) * 1000;
-      const v = json.v[i] ?? 0;
-      const o = json.o[i];
-      const h = json.h[i];
-      const l = json.l[i];
-      const c = json.c[i];
-      if (o == null || h == null || l == null || c == null) continue;
-      if (v <= 0) continue;
-      if (ts >= currentMinuteStart) continue; // drop in-progress bar, like Yahoo branch
-      candles.push({ symbol, timestamp: ts, open: o, high: h, low: l, close: c, volume: v });
-    }
-    const sliced = candles.slice(-count);
-    return { bars: sliced, diag: { reason: 'ok', httpStatus: resp.status, s: json.s, rawLen: len, filteredLen: sliced.length } };
-  } catch (err: unknown) {
-    const msg = err instanceof Error ? err.message : String(err);
-    console.warn(`[yahoo-feed] finnhub candle(${symbol}) error: ${msg}`);
-    return { bars: [], diag: { reason: 'fetch_error', errorMsg: msg } };
-  }
-}
-
 // ── Twelve Data fallback for stock minute bars ───────────────────────────────
-// TRA-154: Tiingo IEX (added in TRA-155) only sees ~2% of US trade volume, so
-// volume-based signals (volume climax, breakout-with-volume) get a degraded read
-// when Yahoo's breaker is open. Twelve Data gives consolidated 1-minute bars on
-// the free tier (800 req/day, 8 req/min). Budget is too tight for the full
-// watchlist, so this branch only fires for "active interest" symbols — those
-// with open positions or recent signals — and falls through to Tiingo otherwise.
+// Twelve Data gives consolidated 1-minute bars on the free tier (800 req/day,
+// 8 req/min). Budget is too tight for the full watchlist, so this branch only
+// fires for "active interest" symbols — those with open positions or recent
+// signals.
 
 const TWELVE_DATA_API_KEY = process.env.TWELVE_DATA_API_KEY ?? '';
 const TWELVE_DATA_BASE = 'https://api.twelvedata.com';
@@ -361,16 +222,7 @@ export interface TwelveDataCandleDiag {
   errorMsg?: string;
 }
 
-// Twelve Data parses datetime as US/Eastern by default for US equities. Pass
-// a Z-less ISO and let the API return rows; we parse them as Eastern below
-// only if needed. In practice the API echoes "YYYY-MM-DD HH:MM:SS" without TZ
-// and treats it as exchange local time; comparing with UTC currentMinuteStart
-// works because we just need monotonic ordering and to drop the in-progress bar.
 function parseTwelveDataTs(s: string): number {
-  // Accept "YYYY-MM-DD HH:MM:SS" — interpret as UTC for ordering. A small TZ
-  // skew vs. Yahoo bars doesn't affect indicator math because each branch
-  // produces its own self-consistent series; we never mix providers within
-  // one indicator window.
   const norm = s.includes('T') ? s : s.replace(' ', 'T') + 'Z';
   const ms = new Date(norm).getTime();
   return Number.isFinite(ms) ? ms : NaN;
@@ -379,11 +231,10 @@ function parseTwelveDataTs(s: string): number {
 async function fetchTwelveDataMinuteBars(
   symbol: string,
   count: number,
-  isActiveInterest: boolean,
+  isActive: boolean,
 ): Promise<{ bars: Candle[]; diag: TwelveDataCandleDiag }> {
   if (!TWELVE_DATA_API_KEY) return { bars: [], diag: { reason: 'no_key' } };
-  if (!isActiveInterest) return { bars: [], diag: { reason: 'not_active_interest' } };
-  // 2× window to absorb off-hours / illiquid gaps, matching the Yahoo branch.
+  if (!isActive) return { bars: [], diag: { reason: 'not_active_interest' } };
   const outputsize = Math.min(Math.max(count * 2, 30), 500);
   try {
     bumpFallbackCounter('twelveData');
@@ -395,8 +246,6 @@ async function fetchTwelveDataMinuteBars(
       return { bars: [], diag: { reason: 'http_error', httpStatus: resp.status, errorBody: errorBody.slice(0, 200) } };
     }
     const json = (await resp.json()) as TwelveDataResponse;
-    // Twelve Data returns 200 OK with status:"error" + code 429 when rate-limited
-    // (8 req/min) or 400/401 with a message when the daily 800/day cap is hit.
     if (json && json.status === 'error') {
       const msg = json.message ?? 'unknown error';
       const code = json.code ?? 0;
@@ -436,156 +285,74 @@ async function fetchTwelveDataMinuteBars(
   }
 }
 
-// ── Tiingo IEX fallback for stock minute bars ────────────────────────────────
-// TRA-155: Finnhub /stock/candle requires a paid plan; Tiingo's IEX intraday
-// endpoint covers 1-minute bars on the free tier (1,000 req/day, 50/hr) which
-// is more than enough for the rare windows when Yahoo's breaker is open. IEX
-// volume only reflects IEX's share of trading (~2%), so we keep the bars even
-// when volume is 0/missing rather than filtering them out — partial bars beat
-// no bars for indicator math.
-
-const TIINGO_API_KEY = process.env.TIINGO_API_KEY ?? '';
-const TIINGO_BASE = 'https://api.tiingo.com';
-
-if (!TIINGO_API_KEY) {
-  console.warn('[yahoo-feed] TIINGO_API_KEY is not set — Tiingo minute-bar fallback disabled');
-}
-
-interface TiingoIexBar {
-  date?: string;
-  open?: number;
-  high?: number;
-  low?: number;
-  close?: number;
-  volume?: number;
-}
-
-export interface TiingoCandleDiag {
-  reason: 'no_key' | 'http_error' | 'no_data' | 'parse_error' | 'fetch_error' | 'ok' | 'cache' | 'rate_limited';
-  httpStatus?: number;
-  rawLen?: number;
-  filteredLen?: number;
-  errorBody?: string;
-  errorMsg?: string;
-}
-
-// TRA-155 follow-up: Tiingo's free tier is 50 req/hr. The signal engine ticks
-// every 30s and may fan out across the watchlist, which would exhaust the
-// quota in minutes. Two guards keep us under the limit:
-//   1. Per-symbol bar cache with a TTL roughly equal to a minute bar's
-//      resolution — repeated calls for the same symbol within 60s are served
-//      from cache, so worst-case we spend 1 req/symbol/minute.
-//   2. 429 breaker — once Tiingo says we're over the hourly allocation, stop
-//      hammering the endpoint for the rest of the hour and surface the rate-
-//      limited state in diag so QA can see it without grepping logs.
-const TIINGO_BAR_CACHE_TTL_MS = 60_000;
-const TIINGO_RATE_LIMIT_COOLDOWN_MS = 60 * 60 * 1000; // 1 hour
-let tiingoRateLimitedUntil = 0;
-function isTiingoRateLimited(): boolean {
-  return Date.now() < tiingoRateLimitedUntil;
-}
-const tiingoBarCache = new Map<string, { at: number; bars: Candle[]; diag: TiingoCandleDiag }>();
-
-async function fetchTiingoMinuteBars(
-  symbol: string,
-  count: number,
-): Promise<{ bars: Candle[]; diag: TiingoCandleDiag }> {
-  if (!TIINGO_API_KEY) return { bars: [], diag: { reason: 'no_key' } };
-  const cached = tiingoBarCache.get(symbol);
-  if (cached && Date.now() - cached.at < TIINGO_BAR_CACHE_TTL_MS) {
-    // Tag as 'cache' so /api/health/quotes can show whether we're serving
-    // from cache vs hitting Tiingo on every probe.
-    return { bars: cached.bars, diag: { ...cached.diag, reason: 'cache' } };
-  }
-  if (isTiingoRateLimited()) {
-    return { bars: [], diag: { reason: 'rate_limited', httpStatus: 429 } };
-  }
-  // 2× window to absorb off-hours / illiquid gaps, matching the Yahoo branch.
-  const fromMs = Date.now() - count * 60 * 1000 * 2;
-  const startDate = new Date(fromMs).toISOString();
-  try {
-    bumpFallbackCounter('tiingo');
-    const url = `${TIINGO_BASE}/iex/${encodeURIComponent(symbol)}/prices?startDate=${encodeURIComponent(startDate)}&resampleFreq=1min&token=${TIINGO_API_KEY}`;
-    const resp = await withTimeout(fetch(url), YF_CALL_TIMEOUT_MS, `tiingo candle(${symbol})`);
-    if (!resp.ok) {
-      const errorBody = await resp.text().catch(() => '');
-      console.warn(`[yahoo-feed] tiingo candle(${symbol}) HTTP ${resp.status}: ${errorBody.slice(0, 200)}`);
-      if (resp.status === 429) {
-        tiingoRateLimitedUntil = Date.now() + TIINGO_RATE_LIMIT_COOLDOWN_MS;
-        console.warn(`[yahoo-feed] tiingo breaker tripped for ${TIINGO_RATE_LIMIT_COOLDOWN_MS / 60_000}m — quota exhausted`);
-      }
-      return { bars: [], diag: { reason: 'http_error', httpStatus: resp.status, errorBody: errorBody.slice(0, 200) } };
-    }
-    const json = (await resp.json()) as TiingoIexBar[] | { detail?: string };
-    if (!Array.isArray(json)) {
-      return { bars: [], diag: { reason: 'parse_error', httpStatus: resp.status, errorBody: JSON.stringify(json).slice(0, 200) } };
-    }
-    const currentMinuteStart = Math.floor(Date.now() / 60_000) * 60_000;
-    const candles: Candle[] = [];
-    for (const row of json) {
-      const ts = row.date ? new Date(row.date).getTime() : NaN;
-      if (!Number.isFinite(ts)) continue;
-      if (ts >= currentMinuteStart) continue; // drop in-progress bar
-      const o = row.open;
-      const h = row.high;
-      const l = row.low;
-      const c = row.close;
-      if (o == null || h == null || l == null || c == null) continue;
-      // Tiingo IEX bars often legitimately have 0 volume (off-hours, low IEX
-      // share). Don't filter on volume here — see comment at section header.
-      candles.push({ symbol, timestamp: ts, open: o, high: h, low: l, close: c, volume: row.volume ?? 0 });
-    }
-    candles.sort((a, b) => a.timestamp - b.timestamp);
-    const sliced = candles.slice(-count);
-    const diag: TiingoCandleDiag = { reason: sliced.length > 0 ? 'ok' : 'no_data', httpStatus: resp.status, rawLen: json.length, filteredLen: sliced.length };
-    if (sliced.length > 0) {
-      tiingoBarCache.set(symbol, { at: Date.now(), bars: sliced, diag });
-    }
-    return { bars: sliced, diag };
-  } catch (err: unknown) {
-    const msg = err instanceof Error ? err.message : String(err);
-    console.warn(`[yahoo-feed] tiingo candle(${symbol}) error: ${msg}`);
-    return { bars: [], diag: { reason: 'fetch_error', errorMsg: msg } };
-  }
-}
-
 /**
  * Fetch the last N 1-minute candles for a symbol.
  *
- * Yahoo Finance is the primary source. When the breaker is open (recent 429s) or
- * Yahoo returns no usable bars, cascade through Finnhub → Twelve Data → Tiingo.
- * Without this fallback the signal engine starves on indicator math whenever
- * Yahoo rate-limits Render's egress IP and stops opening new stock auto-trades.
+ * Tradier is the primary source. When its breaker is open or it returns no
+ * usable bars, we cascade through Yahoo → Twelve Data. Stooq is intentionally
+ * not in the chart fallback chain — it's EOD-ish and would corrupt indicator
+ * math built off intraday minute bars.
  */
 export async function fetchMinuteBars(symbol: string, count = 60): Promise<Candle[]> {
   const { bars } = await fetchMinuteBarsWithSource(symbol, count);
   return bars;
 }
 
+export interface TradierCandleDiag {
+  reason: 'no_credentials' | 'breaker_open' | 'http_error' | 'no_data' | 'fetch_error' | 'ok';
+  httpStatus?: number;
+  rawLen?: number;
+  filteredLen?: number;
+  errorMsg?: string;
+}
+
+async function fetchTradierMinuteBars(
+  symbol: string,
+  count: number,
+): Promise<{ bars: Candle[]; diag: TradierCandleDiag }> {
+  if (!tradierStocksClient) return { bars: [], diag: { reason: 'no_credentials' } };
+  if (isTradierBlocked()) return { bars: [], diag: { reason: 'breaker_open' } };
+  try {
+    bumpFallbackCounter('tradier');
+    const bars = await tradierStocksClient.getMinuteBars(symbol, count);
+    return { bars, diag: { reason: bars.length > 0 ? 'ok' : 'no_data', filteredLen: bars.length } };
+  } catch (err: unknown) {
+    const msg = err instanceof Error ? err.message : String(err);
+    if (/HTTP\s+(429|5\d\d)/.test(msg)) tripTradierBreaker(`timesales(${symbol})`, msg);
+    return { bars: [], diag: { reason: 'fetch_error', errorMsg: msg } };
+  }
+}
+
 /**
  * Diagnostic variant of {@link fetchMinuteBars} that also reports which provider
  * served the bars. Used by `/api/health/quotes` so QA can verify the fallback
- * chain is actually engaging when Yahoo's breaker is open.
+ * chain is engaging when Tradier or Yahoo's breaker is open.
  */
 export async function fetchMinuteBarsWithSource(
   symbol: string,
   count = 60,
 ): Promise<{
   bars: Candle[];
-  source: 'yahoo' | 'finnhub' | 'twelvedata' | 'tiingo' | 'none';
+  source: MinuteBarSource;
   yahooSkipped: boolean;
   cached?: boolean;
-  finnhubDiag?: FinnhubCandleDiag;
+  tradierDiag?: TradierCandleDiag;
   twelveDataDiag?: TwelveDataCandleDiag;
-  tiingoDiag?: TiingoCandleDiag;
 }> {
+  const yahooSkipped = isRateLimited();
+
+  // Primary: Tradier intraday timesales.
+  const tradier = await fetchTradierMinuteBars(symbol, count);
+  if (tradier.bars.length > 0) {
+    minuteBarCache.set(symbol, { bars: tradier.bars, source: 'tradier', expiresAt: nextMinuteBoundary() });
+    return { bars: tradier.bars, source: 'tradier', yahooSkipped, tradierDiag: tradier.diag };
+  }
+
   const now = new Date();
-  const from = new Date(now.getTime() - count * 60 * 1000 * 2); // 2× window to guarantee enough bars
-  // Drop the in-progress current-minute bar (partial volume skews volume-climax checks).
+  const from = new Date(now.getTime() - count * 60 * 1000 * 2);
   const currentMinuteStart = Math.floor(now.getTime() / 60_000) * 60_000;
 
-  const yahooSkipped = isRateLimited();
-  // withRetry returns null when the breaker is open, so Yahoo is skipped fast.
+  // Fallback 1: Yahoo Finance.
   const result = await withRetry(
     () => yf.chart(symbol, { period1: from, period2: now, interval: '1m' }),
     `chart(${symbol})`,
@@ -609,26 +376,16 @@ export async function fetchMinuteBarsWithSource(
 
   if (yahooBars.length > 0) {
     minuteBarCache.set(symbol, { bars: yahooBars, source: 'yahoo', expiresAt: nextMinuteBoundary() });
-    return { bars: yahooBars, source: 'yahoo', yahooSkipped };
+    return { bars: yahooBars, source: 'yahoo', yahooSkipped, tradierDiag: tradier.diag };
   }
 
-  // Yahoo returned nothing. If we already served a fallback for this symbol in
-  // the current minute, reuse it instead of re-hitting providers — bars don't
-  // change inside a minute and 30s ticks would otherwise double our daily spend.
+  // Reuse a recent fallback response within the same minute rather than re-firing providers.
   const cached = minuteBarCache.get(symbol);
   if (cached && cached.expiresAt > Date.now() && cached.source !== 'yahoo') {
-    return { bars: cached.bars, source: cached.source, yahooSkipped, cached: true };
+    return { bars: cached.bars, source: cached.source, yahooSkipped, cached: true, tradierDiag: tradier.diag };
   }
 
-  const finnhub = await fetchFinnhubMinuteBars(symbol, count);
-  if (finnhub.bars.length > 0) {
-    console.info(`[yahoo-feed] chart(${symbol}): served ${finnhub.bars.length} bars from Finnhub fallback`);
-    minuteBarCache.set(symbol, { bars: finnhub.bars, source: 'finnhub', expiresAt: nextMinuteBoundary() });
-    return { bars: finnhub.bars, source: 'finnhub', yahooSkipped, finnhubDiag: finnhub.diag };
-  }
-  // Twelve Data: gated to active-interest symbols (open positions or recent
-  // signals) so we fit inside the 800/day free-tier cap. For everything else,
-  // fall through to Tiingo whose 1,000/day cap is closer to watchlist-wide use.
+  // Fallback 2: Twelve Data (gated to active-interest symbols to fit free-tier 800/day cap).
   const twelveData = await fetchTwelveDataMinuteBars(symbol, count, isActiveInterest(symbol));
   if (twelveData.bars.length > 0) {
     console.info(`[yahoo-feed] chart(${symbol}): served ${twelveData.bars.length} bars from Twelve Data fallback`);
@@ -637,44 +394,48 @@ export async function fetchMinuteBarsWithSource(
       bars: twelveData.bars,
       source: 'twelvedata',
       yahooSkipped,
-      finnhubDiag: finnhub.diag,
+      tradierDiag: tradier.diag,
       twelveDataDiag: twelveData.diag,
     };
   }
-  const tiingo = await fetchTiingoMinuteBars(symbol, count);
-  if (tiingo.bars.length > 0) {
-    console.info(`[yahoo-feed] chart(${symbol}): served ${tiingo.bars.length} bars from Tiingo fallback`);
-    minuteBarCache.set(symbol, { bars: tiingo.bars, source: 'tiingo', expiresAt: nextMinuteBoundary() });
-    return {
-      bars: tiingo.bars,
-      source: 'tiingo',
-      yahooSkipped,
-      finnhubDiag: finnhub.diag,
-      twelveDataDiag: twelveData.diag,
-      tiingoDiag: tiingo.diag,
-    };
-  }
+
   return {
     bars: [],
     source: 'none',
     yahooSkipped,
-    finnhubDiag: finnhub.diag,
+    tradierDiag: tradier.diag,
     twelveDataDiag: twelveData.diag,
-    tiingoDiag: tiingo.diag,
   };
 }
 
+type QuoteResult = { price: number; volume: number; change: number; changePct: number };
+
 /**
- * Fetch the current quote for a symbol.
+ * Fetch the current quote for a single symbol.
  *
- * Yahoo Finance is the primary source. When it is rate-limited (breaker open) or
- * returns no `regularMarketPrice`, we cascade through fallbacks:
- *   1. Finnhub (real-time, 60 req/min on free tier — needs FINNHUB_API_KEY)
- *   2. Stooq (no key required, but ~15 min delayed and change% is intraday-open-based)
- * Stooq stays as the last resort so the watchlist always has *something* to show
- * even when no API keys are configured.
+ * Tradier is the primary source. When its breaker is open or it returns no
+ * quote, cascade through Yahoo → Stooq. Stooq stays last-resort so the
+ * watchlist always has *something* to render even when both primary and Yahoo
+ * are unreachable.
  */
-export async function fetchQuote(symbol: string): Promise<{ price: number; volume: number; change: number; changePct: number } | null> {
+export async function fetchQuote(symbol: string): Promise<QuoteResult | null> {
+  // Primary: Tradier. (Single-symbol path — `fetchQuotes` uses the multi-symbol
+  // endpoint to save round-trips for the watchlist refresh.)
+  if (tradierStocksClient && !isTradierBlocked()) {
+    try {
+      const map = await tradierStocksClient.getQuotes([symbol]);
+      const q = map.get(symbol);
+      if (q) {
+        return { price: q.price, volume: q.volume, change: q.change, changePct: q.changePct };
+      }
+    } catch (err: unknown) {
+      const msg = err instanceof Error ? err.message : String(err);
+      if (/HTTP\s+(429|5\d\d)/.test(msg)) tripTradierBreaker(`quote(${symbol})`, msg);
+      else console.warn(`[yahoo-feed] tradier quote(${symbol}) error: ${msg}`);
+    }
+  }
+
+  // Fallback 1: Yahoo Finance.
   const q = await withRetry(() => yf.quote(symbol), `quote(${symbol})`);
   if (q && q.regularMarketPrice != null) {
     return {
@@ -684,13 +445,9 @@ export async function fetchQuote(symbol: string): Promise<{ price: number; volum
       changePct: q.regularMarketChangePercent ?? 0,
     };
   }
-  if (q) console.warn(`[yahoo-feed] quote(${symbol}) returned no regularMarketPrice — trying fallbacks`);
+  if (q) console.warn(`[yahoo-feed] quote(${symbol}) returned no regularMarketPrice — trying Stooq fallback`);
 
-  const finnhub = await fetchFinnhubQuote(symbol);
-  if (finnhub) {
-    console.info(`[yahoo-feed] ${symbol}: served from Finnhub fallback`);
-    return finnhub;
-  }
+  // Fallback 2: Stooq (delayed but free, no API key).
   const stooq = await fetchStooqQuote(symbol);
   if (stooq) {
     console.info(`[yahoo-feed] ${symbol}: served from Stooq fallback (delayed)`);
@@ -700,28 +457,71 @@ export async function fetchQuote(symbol: string): Promise<{ price: number; volum
 }
 
 /**
- * Fetch quotes for all symbols in parallel batches.
- * Serial fetching previously made tick latency O(N) and let one slow Yahoo response
- * stall the entire watchlist update; batched parallel calls keep total wall time
- * close to the per-call timeout while staying under Yahoo's rate limits.
+ * Fetch quotes for all symbols.
+ *
+ * When Tradier is configured we try a single multi-symbol round-trip first —
+ * Tradier accepts a comma-separated `symbols=` parameter, so the entire
+ * watchlist refreshes in one HTTP call. Symbols Tradier doesn't return fall
+ * through to the per-symbol Yahoo / Stooq cascade.
  */
-export async function fetchQuotes(symbols: readonly string[]): Promise<Map<string, { price: number; volume: number; change: number; changePct: number }>> {
-  const results = new Map<string, { price: number; volume: number; change: number; changePct: number }>();
+export async function fetchQuotes(symbols: readonly string[]): Promise<Map<string, QuoteResult>> {
+  const results = new Map<string, QuoteResult>();
+  if (symbols.length === 0) return results;
+
+  // Primary: one Tradier call for the whole list.
+  if (tradierStocksClient && !isTradierBlocked()) {
+    try {
+      bumpFallbackCounter('tradier');
+      const tradier = await tradierStocksClient.getQuotes(symbols);
+      for (const [sym, q] of tradier) {
+        results.set(sym, { price: q.price, volume: q.volume, change: q.change, changePct: q.changePct });
+      }
+    } catch (err: unknown) {
+      const msg = err instanceof Error ? err.message : String(err);
+      if (/HTTP\s+(429|5\d\d)/.test(msg)) tripTradierBreaker('quotes(batch)', msg);
+      else console.warn(`[yahoo-feed] tradier quotes(batch) error: ${msg}`);
+    }
+  }
+
+  // Fan out the leftovers to the secondary chain in parallel batches.
+  const remaining = symbols.filter((s) => !results.has(s));
+  if (remaining.length === 0) return results;
+
   const QUOTE_BATCH = 5;
   let failures = 0;
-  for (let i = 0; i < symbols.length; i += QUOTE_BATCH) {
-    const slice = symbols.slice(i, i + QUOTE_BATCH);
-    const settled = await Promise.all(slice.map(sym => fetchQuote(sym).then(q => [sym, q] as const)));
+  for (let i = 0; i < remaining.length; i += QUOTE_BATCH) {
+    const slice = remaining.slice(i, i + QUOTE_BATCH);
+    const settled = await Promise.all(slice.map(sym => fetchSecondaryQuote(sym).then(q => [sym, q] as const)));
     for (const [sym, q] of settled) {
       if (q) results.set(sym, q);
       else failures++;
     }
-    if (i + QUOTE_BATCH < symbols.length) await sleep(200);
+    if (i + QUOTE_BATCH < remaining.length) await sleep(200);
   }
   if (failures > 0) {
     console.warn(`[yahoo-feed] fetchQuotes: ${failures}/${symbols.length} symbols failed${isRateLimited() ? ' (Yahoo breaker open)' : ''}`);
   }
   return results;
+}
+
+/**
+ * Yahoo → Stooq path used by {@link fetchQuotes} for symbols Tradier didn't
+ * return. Kept distinct from {@link fetchQuote} so the multi-symbol path
+ * doesn't double-call Tradier per leftover (the batch already consulted it).
+ */
+async function fetchSecondaryQuote(symbol: string): Promise<QuoteResult | null> {
+  const q = await withRetry(() => yf.quote(symbol), `quote(${symbol})`);
+  if (q && q.regularMarketPrice != null) {
+    return {
+      price: q.regularMarketPrice,
+      volume: q.regularMarketVolume ?? 0,
+      change: q.regularMarketChange ?? 0,
+      changePct: q.regularMarketChangePercent ?? 0,
+    };
+  }
+  const stooq = await fetchStooqQuote(symbol);
+  if (stooq) return stooq;
+  return null;
 }
 
 // TRA-196 — per-symbol news aggregation.
@@ -732,8 +532,6 @@ export async function fetchQuotes(symbols: readonly string[]): Promise<Map<strin
 // the rare non-empty response stick around unchanged. We now fan out per-symbol
 // searches across the watchlist and aggregate fresh, varied results.
 export async function fetchStocksNews(symbols: readonly string[]): Promise<NewsItem[]> {
-  // Cap the number of symbols we query so news refresh stays bounded; rotate
-  // the cap symbols based on the active watchlist so cache buster is implicit.
   const NEWS_QUERY_LIMIT = 8;
   const NEWS_BATCH = 3;
   const PER_SYMBOL_NEWS = 5;
@@ -756,7 +554,6 @@ export async function fetchStocksNews(symbols: readonly string[]): Promise<NewsI
     }
   };
 
-  // Per-symbol fan-out (parallel batches so total wall time stays close to one timeout).
   for (let i = 0; i < querySymbols.length; i += NEWS_BATCH) {
     const slice = querySymbols.slice(i, i + NEWS_BATCH);
     const settled = await Promise.all(
@@ -774,9 +571,6 @@ export async function fetchStocksNews(symbols: readonly string[]): Promise<NewsI
     if (i + NEWS_BATCH < querySymbols.length) await sleep(200);
   }
 
-  // Generic top-up: if per-symbol returned nothing (e.g. breaker open or empty
-  // watchlist), fall back to a broad query so the tab is never empty when news
-  // is reachable. Otherwise this still adds general market headlines.
   if (items.length < RESULT_CAP) {
     const fallback = await withRetry(
       () => yf.search('stocks market trading', { newsCount: 10, quotesCount: 0 }),
@@ -796,32 +590,21 @@ export async function testYahooFinance(): Promise<{ symbol: string; price: numbe
   return { symbol: 'AAPL', price: q.regularMarketPrice };
 }
 
-/** Test Finnhub connectivity — returns a quote or throws / returns null when unconfigured. */
-export async function testFinnhub(): Promise<{ symbol: string; price: number } | null> {
-  if (!FINNHUB_API_KEY) return null;
-  const q = await fetchFinnhubQuote('AAPL');
-  if (!q) throw new Error('Finnhub returned no quote for AAPL');
+/** Test Tradier connectivity — returns a quote or throws / returns null when unconfigured. */
+export async function testTradier(): Promise<{ symbol: string; price: number } | null> {
+  if (!tradierStocksClient) return null;
+  const map = await tradierStocksClient.getQuotes(['AAPL']);
+  const q = map.get('AAPL');
+  if (!q) throw new Error('Tradier returned no quote for AAPL');
   return { symbol: 'AAPL', price: q.price };
 }
 
 /** Test Twelve Data connectivity — returns bar count or throws / returns null when unconfigured. */
 export async function testTwelveData(): Promise<{ symbol: string; bars: number } | null> {
   if (!TWELVE_DATA_API_KEY) return null;
-  // Force-allow the probe regardless of active-interest gating; QA needs to see
-  // the provider works without first opening a position.
   const { bars, diag } = await fetchTwelveDataMinuteBars('AAPL', 60, true);
   if (bars.length === 0) {
     throw new Error(`Twelve Data returned no bars for AAPL (reason=${diag.reason}${diag.httpStatus ? ` http=${diag.httpStatus}` : ''}${diag.errorBody ? ` body=${diag.errorBody}` : ''})`);
-  }
-  return { symbol: 'AAPL', bars: bars.length };
-}
-
-/** Test Tiingo IEX connectivity — returns bar count or throws / returns null when unconfigured. */
-export async function testTiingo(): Promise<{ symbol: string; bars: number } | null> {
-  if (!TIINGO_API_KEY) return null;
-  const { bars, diag } = await fetchTiingoMinuteBars('AAPL', 60);
-  if (bars.length === 0) {
-    throw new Error(`Tiingo returned no bars for AAPL (reason=${diag.reason}${diag.httpStatus ? ` http=${diag.httpStatus}` : ''})`);
   }
   return { symbol: 'AAPL', bars: bars.length };
 }
@@ -831,7 +614,7 @@ export function isYahooBreakerOpen(): boolean {
   return isRateLimited();
 }
 
-/** Whether the Tiingo hourly-quota circuit breaker is currently open. */
-export function isTiingoBreakerOpen(): boolean {
-  return isTiingoRateLimited();
+/** Whether the Tradier circuit breaker is currently open. */
+export function isTradierBreakerOpen(): boolean {
+  return isTradierBlocked();
 }

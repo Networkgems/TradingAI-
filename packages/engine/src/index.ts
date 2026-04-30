@@ -25,13 +25,14 @@ export { AlpacaOptionsClient } from './alpaca/index.js';
 export type { AlpacaOptionsContract, AlpacaOptionOrderResponse } from './alpaca/index.js';
 export { TradierFeed } from './feed/index.js';
 export type { TradierFeedEvents } from './feed/index.js';
-export { TradierOrderClient, TradierOptionsClient, tradierBaseUrl, underlyingFromOcc } from './tradier/index.js';
+export { TradierOrderClient, TradierOptionsClient, TradierStocksClient, tradierBaseUrl, underlyingFromOcc } from './tradier/index.js';
 export type {
   TradierEnv,
   TradierBracketOrderParams,
   TradierOrderResponse,
   TradierOptionsContract,
   TradierOptionQuote,
+  TradierEquityQuote,
 } from './tradier/index.js';
 export { CoinbaseOrderClient } from './coinbase/index.js';
 export type {

@@ -9,3 +9,5 @@ export type {
   TradierOptionsContract,
   TradierOptionQuote,
 } from './options-client.js';
+export { TradierStocksClient } from './stocks-client.js';
+export type { TradierEquityQuote } from './stocks-client.js';

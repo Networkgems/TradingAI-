@@ -37,20 +37,13 @@ services:
       # Yahoo Finance crypto path is rate-limited or returns no data.
       - key: CMC_API_KEY
         sync: false
-      # Stocks quote fallback — when set, Finnhub serves equity quotes whenever the
-      # Yahoo Finance crumb fetch hits 429s. Free tier (60 req/min) is sufficient.
-      - key: FINNHUB_API_KEY
-        sync: false
       # Stocks minute-bar fallback (TRA-154) — when set, Twelve Data serves
-      # consolidated 1-minute candles whenever Yahoo's breaker is open and the
-      # symbol is "active interest" (open position or recent signal). Free tier
-      # is 800 req/day, 8 req/min — gating + per-minute caching keep us inside.
+      # consolidated 1-minute candles whenever Tradier (primary) and Yahoo
+      # both miss for an "active interest" symbol (open position or recent
+      # signal). Free tier is 800 req/day, 8 req/min — gating + per-minute
+      # caching keep us inside. Also used by `backtest-equity` for historical
+      # data pulls.
       - key: TWELVE_DATA_API_KEY
-        sync: false
-      # Stocks minute-bar fallback (TRA-155) — when set, Tiingo IEX serves
-      # 1-minute candles whenever Yahoo's breaker is open and Twelve Data didn't
-      # cover the symbol. Free tier is 1,000 req/day, 50/hr.
-      - key: TIINGO_API_KEY
         sync: false
       # Tradier API credentials (TRA-191) — required for the options-chain
       # relative-value scanner to fetch live chains. With these unset the

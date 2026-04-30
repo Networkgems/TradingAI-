@@ -977,11 +977,11 @@ app.post('/api/crypto/positions/:id/close', requireAuth, async (req, res) => {
 app.get('/api/health/quotes', async (_req, res) => {
   const {
     testYahooFinance,
-    testFinnhub,
+    testTradier,
     testTwelveData,
-    testTiingo,
     isYahooBreakerOpen,
-    isTiingoBreakerOpen,
+    isTradierBreakerOpen,
+    isTradierStocksConfigured,
     fetchMinuteBarsWithSource,
     getFallbackRequestCounts,
   } = await import('./yahoo-feed.js');
@@ -989,16 +989,16 @@ app.get('/api/health/quotes', async (_req, res) => {
   const results: Record<string, unknown> = {};
 
   try {
-    results['yahooFinance'] = await testYahooFinance();
+    const tradier = await testTradier();
+    results['tradier'] = tradier ?? { skipped: 'TRADIER_*_API_TOKEN not set' };
   } catch (err: unknown) {
-    results['yahooFinance'] = { error: err instanceof Error ? err.message : String(err) };
+    results['tradier'] = { error: err instanceof Error ? err.message : String(err) };
   }
 
   try {
-    const fh = await testFinnhub();
-    results['finnhub'] = fh ?? { skipped: 'FINNHUB_API_KEY not set' };
+    results['yahooFinance'] = await testYahooFinance();
   } catch (err: unknown) {
-    results['finnhub'] = { error: err instanceof Error ? err.message : String(err) };
+    results['yahooFinance'] = { error: err instanceof Error ? err.message : String(err) };
   }
 
   try {
@@ -1009,24 +1009,16 @@ app.get('/api/health/quotes', async (_req, res) => {
   }
 
   try {
-    const tiingo = await testTiingo();
-    results['tiingo'] = tiingo ?? { skipped: 'TIINGO_API_KEY not set' };
-  } catch (err: unknown) {
-    results['tiingo'] = { error: err instanceof Error ? err.message : String(err) };
-  }
-
-  try {
     const cmc = await testCoinMarketCap();
     results['coinMarketCap'] = cmc ?? { skipped: 'CMC_API_KEY not set' };
   } catch (err: unknown) {
     results['coinMarketCap'] = { error: err instanceof Error ? err.message : String(err) };
   }
 
-  // TRA-148/TRA-154/TRA-155: probe the actual minute-bar path the signal engine
-  // uses, so QA can confirm the fallback chain engages while yahooBreakerOpen=true
-  // without grepping logs. All provider diags are surfaced so QA can see *why* a
-  // given tier returned nothing (plan-rejection 403, no_data, http error, etc.)
-  // without redeploying with extra logging.
+  // TRA-191 follow-up: probe the actual minute-bar path the signal engine uses,
+  // so QA can confirm Tradier (primary) is serving and the fallback chain
+  // engages when its breaker is open. All provider diags are surfaced so QA
+  // can see *why* a given tier returned nothing (no_data, http_error, etc.).
   try {
     const probe = await fetchMinuteBarsWithSource('AAPL', 60);
     results['chartFallback'] = {
@@ -1035,32 +1027,30 @@ app.get('/api/health/quotes', async (_req, res) => {
       source: probe.source,
       yahooSkipped: probe.yahooSkipped,
       cached: probe.cached ?? false,
-      finnhubDiag: probe.finnhubDiag ?? null,
+      tradierDiag: probe.tradierDiag ?? null,
       twelveDataDiag: probe.twelveDataDiag ?? null,
-      tiingoDiag: probe.tiingoDiag ?? null,
     };
   } catch (err: unknown) {
     results['chartFallback'] = { error: err instanceof Error ? err.message : String(err) };
   }
 
-  // TRA-154: surface daily fallback request counts so QA can see whether we're
-  // approaching the free-tier caps (Twelve Data 800/day, Tiingo 1,000/day) before
-  // the engine stalls. Resets at UTC midnight.
+  // Daily request counters per provider. Resets at UTC midnight.
   results['fallbackRequestsToday'] = getFallbackRequestCounts();
 
   const ok = (key: string) => {
     const v = results[key];
     return v && typeof v === 'object' && !('error' in (v as object)) && !('skipped' in (v as object));
   };
-  const stocksOk = ok('yahooFinance') || ok('finnhub');
+  const stocksOk = ok('tradier') || ok('yahooFinance');
   const cryptoOk = ok('yahooFinance') || ok('coinMarketCap');
   const allOk = stocksOk && cryptoOk;
   res.status(allOk ? 200 : 502).json({
     ok: allOk,
     stocksOk,
     cryptoOk,
+    tradierConfigured: isTradierStocksConfigured(),
+    tradierBreakerOpen: isTradierBreakerOpen(),
     yahooBreakerOpen: isYahooBreakerOpen(),
-    tiingoBreakerOpen: isTiingoBreakerOpen(),
     results,
     ts: new Date().toISOString(),
   });
