@@ -85,10 +85,18 @@ export class RiskManager {
   /**
    * Maximum dollar risk for one trade. Compounds with current equity, and
    * is halved when running equity is `drawdownBrakeThreshold` below its peak.
+   *
+   * @param riskPct optional per-call override (TRA-211) — used by per-strategy
+   *   risk budgets such as mean reversion's 0.75% (spec §3). Falls back to the
+   *   global `DEFAULT_RISK_PER_TRADE` (1%) when omitted. The drawdown brake
+   *   still applies to the overridden risk budget.
    */
-  maxRiskPerTrade(): number {
+  maxRiskPerTrade(riskPct?: number): number {
     const equity = this.managedEquity();
-    let perTrade = equity * DEFAULT_RISK_PER_TRADE;
+    const fraction = riskPct !== undefined && Number.isFinite(riskPct) && riskPct > 0
+      ? riskPct
+      : DEFAULT_RISK_PER_TRADE;
+    let perTrade = equity * fraction;
     if (this.peakManagedEquity > 0) {
       const drawdown = (this.peakManagedEquity - equity) / this.peakManagedEquity;
       if (drawdown >= this.drawdownBrakeThreshold) perTrade *= this.drawdownBrakeMultiplier;
@@ -105,8 +113,12 @@ export class RiskManager {
    *
    * The notional cap protects against tiny ATR/BB-derived stops sizing into
    * leverage that the engine itself never authorized.
+   *
+   * Pass `opts.riskPct` to override the global 1% per-trade budget — used by
+   * mean reversion's 0.75% spec value (TRA-211 / spec §3) without changing
+   * sizing for momentum/breakout trades that share the same RiskManager.
    */
-  sizeFromStop(entryPrice: number, stopPrice: number): number {
+  sizeFromStop(entryPrice: number, stopPrice: number, opts: { riskPct?: number } = {}): number {
     const stopDistance = Math.abs(entryPrice - stopPrice);
     if (stopDistance === 0) return 0;
     const truncate = (n: number): number => this.fractionalQuantity
@@ -114,7 +126,7 @@ export class RiskManager {
       // (1e-15 scraps) out of qty × price PnL math without shaving real size.
       ? Math.floor(n * 1e8) / 1e8
       : Math.floor(n);
-    const riskBased = truncate(this.maxRiskPerTrade() / stopDistance);
+    const riskBased = truncate(this.maxRiskPerTrade(opts.riskPct) / stopDistance);
     if (entryPrice <= 0) return Math.max(0, riskBased);
     const notionalCap = truncate((this.managedEquity() * this.maxNotionalRatio) / entryPrice);
     return Math.max(0, Math.min(riskBased, notionalCap));

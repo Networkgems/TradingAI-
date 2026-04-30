@@ -103,6 +103,13 @@ export interface BacktestConfig {
   /** TRA-206: pass-through to MeanReversionCryptoStrategy. */
   meanReversionOpts?: MeanReversionCryptoOptions;
   /**
+   * TRA-211: per-strategy risk-budget override for mean-reversion entries —
+   * spec §3 sizes mean reversion at 0.75% of equity (vs. the 1% default that
+   * momentum/breakout share). Defaults to 0.0075 when omitted; set explicitly
+   * to override (e.g. 0.01 to flatten back to the global default).
+   */
+  meanReversionRiskPct?: number;
+  /**
    * TRA-205: regime-detector knobs forwarded to the detector that gates
    * momentum (and any future regime-aware strategy). Omit to use defaults.
    */

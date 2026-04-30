@@ -55,6 +55,16 @@ export { rsi, rsiDivergence, VwapTracker, detectPattern, isBullishPattern, isBea
 export type { VwapState, CandlePattern, AdxResult, DonchianChannel, IchimokuState } from './indicators/index.js';
 export { RegimeDetector, classifyRegime } from './regime.js';
 export type { Regime, RegimeDetectorOptions } from './regime.js';
+export {
+  TIME_STOP_BARS,
+  initLifecycleState,
+  advanceExtreme,
+  momentumTrailStop,
+  breakoutTrailStop,
+  meanReversionRsiAltExitTriggered,
+  timeStopBarsFor,
+} from './lifecycle.js';
+export type { LifecycleState, BreakoutTrailOptions } from './lifecycle.js';
 export { blackScholesPrice, blackScholesDelta, bsImpliedVolatility, daysToExpiration } from './options/black-scholes.js';
 export type { BlackScholesInputs, ImpliedVolInputs } from './options/black-scholes.js';
 export { findMispricedOtmContracts } from './options/otm-mispricing.js';

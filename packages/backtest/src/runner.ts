@@ -1,4 +1,4 @@
-import { Candle, Position, TradeSignal } from '@trading-app/shared';
+import { Candle, ExitReason, Position, TradeSignal } from '@trading-app/shared';
 import {
   OrbStrategy,
   ReversalStrategy,
@@ -13,6 +13,12 @@ import {
   RegimeDetector,
   RiskManager,
   PositionManager,
+  initLifecycleState,
+  advanceExtreme,
+  momentumTrailStop,
+  breakoutTrailStop,
+  meanReversionRsiAltExitTriggered,
+  timeStopBarsFor,
 } from '@trading-app/engine';
 import { BacktestConfig, BacktestResult, PortfolioOpts, SignalEdge } from './types.js';
 
@@ -20,6 +26,13 @@ const DEFAULT_MAX_OPEN = 3;
 const DEFAULT_MAX_SECTOR = 3;
 const DEFAULT_LOOKAHEAD_BARS = 24;
 const MS_PER_YEAR = 365.25 * 24 * 60 * 60 * 1_000;
+
+/**
+ * TRA-211: spec §3 mean-reversion sizes at 0.75% of equity, smaller than the
+ * 1% default that momentum / breakout share. Falls back to the global default
+ * if `meanReversionRiskPct` is not provided on the config.
+ */
+const DEFAULT_MEAN_REVERSION_RISK_PCT = 0.0075;
 
 /**
  * TRA-203: normalize the {@link BacktestConfig.feeBps} field into per-fill
@@ -331,34 +344,152 @@ export class BacktestRunner {
           continue;
         }
 
-        const qty = risk.sizeFromStop(signal.entryPrice, signal.stopLoss);
+        // TRA-211 spec §3: mean reversion sizes at 0.75% of equity (vs. the
+        // 1% default that momentum/breakout share). The override applies only
+        // to `mean_reversion` signals — other types use whatever
+        // `RiskManager` defaults to.
+        const riskPct = signal.type === 'mean_reversion'
+          ? (config.meanReversionRiskPct ?? DEFAULT_MEAN_REVERSION_RISK_PCT)
+          : undefined;
+        const qty = risk.sizeFromStop(signal.entryPrice, signal.stopLoss, { riskPct });
         if (qty > 0) {
           const opened = positions.open(signal, qty);
           entryFills.set(opened.id, applyEntrySlippage(signal));
+          // TRA-211: seed the per-position lifecycle state at entry so the
+          // RSI-50 alt-exit can compare against the entry-bar RSI and the
+          // breakout BE trigger uses the entry-bar ATR (immune to subsequent
+          // ATR collapse from the breakout bar's wide range distorting the
+          // smoothed value).
+          positions.setLifecycle(opened.id, initLifecycleState(opened, window));
         }
       }
 
+      // ── Per-bar lifecycle: time stops, trailing-stop ratchets, RSI alt
+      // exit (TRA-211). Runs BEFORE the hard-stop / take-profit check so a
+      // tightened trail can fire on the same bar it was raised, and
+      // time-stop / RSI-alt exits beat a slower bracket exit when both
+      // would resolve on the same bar.
+      const latest = filtered[i - 1];
       for (const pos of positions.getOpen()) {
-        const latest = filtered[i - 1];
+        const ls = positions.getLifecycle(pos.id);
+        if (!ls) continue;
+        ls.barsHeld += 1;
+        advanceExtreme(ls, pos, latest);
+
+        // ── Trailing-stop update (mutates pos.stopLoss in place via the
+        // PositionManager helper). Runs before the SL/TP hit check so a new
+        // tighter level can trigger on the bar that raised it.
+        if (pos.signalType === 'momentum') {
+          const donchianPeriod = config.momentumOpts?.donchianPeriod ?? 20;
+          const newStop = momentumTrailStop(pos, window, donchianPeriod);
+          if (newStop !== null) {
+            positions.updateStop(pos.id, newStop);
+            ls.trailed = true;
+          }
+        } else if (pos.signalType === 'breakout_vol') {
+          const beTriggerMultiplier = config.breakoutVolOpts?.atrStopMultiplier ?? 2.0;
+          const trailMultiplier = config.breakoutVolOpts?.atrStopMultiplier ?? 2.0;
+          const atrPeriod = config.breakoutVolOpts?.atrPeriod ?? 14;
+          const newStop = breakoutTrailStop(pos, window, ls, {
+            beTriggerMultiplier,
+            trailMultiplier,
+            atrPeriod,
+          });
+          if (newStop !== null) {
+            positions.updateStop(pos.id, newStop);
+            ls.trailed = true;
+          }
+        }
+      }
+
+      const exitsThisBar: Array<{
+        pos: Position;
+        rawExit: number;
+        reason: ExitReason;
+        ambiguous: boolean;
+        pessimisticRawExit?: number;
+      }> = [];
+
+      for (const pos of positions.getOpen()) {
+        const ls = positions.getLifecycle(pos.id);
         const hitsStop = pos.side === 'buy'
           ? latest.low <= pos.stopLoss
           : latest.high >= pos.stopLoss;
         const hitsTarget = pos.side === 'buy'
           ? latest.high >= pos.takeProfit
           : latest.low <= pos.takeProfit;
-        if (!hitsStop && !hitsTarget) continue;
 
-        // OHLC bars don't say which level fired first when the candle range
-        // covers both. Resolve optimistically (TP) for the headline metrics
-        // and record the pessimistic (SL) PnL alongside via worstCaseTotalPnl.
-        const ambiguous = hitsStop && hitsTarget;
-        const optimisticExitRaw = hitsTarget ? pos.takeProfit : pos.stopLoss;
-        const pessimisticExitRaw = hitsStop ? pos.stopLoss : pos.takeProfit;
+        // 1) Mean-reversion alt exit (RSI re-cross 50). Spec §3 says it
+        //    competes with the BB-middle target — first to fire wins. We
+        //    prefer the alt exit when it's the only thing firing AND it has
+        //    triggered; if a hard stop also hits this bar, the stop wins.
+        if (
+          ls
+          && pos.signalType === 'mean_reversion'
+          && !hitsStop
+          && !hitsTarget
+          && meanReversionRsiAltExitTriggered(
+            pos,
+            window,
+            config.meanReversionOpts?.rsiPeriod ?? 14,
+            ls,
+          )
+        ) {
+          exitsThisBar.push({
+            pos,
+            rawExit: latest.close,
+            reason: 'rsi_alt_exit',
+            ambiguous: false,
+          });
+          continue;
+        }
+
+        // 2) Hard stop / take-profit bracket. Same OHLC ambiguity handling
+        //    as before, plus exit-reason classification: a stop hit after a
+        //    trailing ratchet records as `trailing` instead of `stop`.
+        if (hitsStop || hitsTarget) {
+          const ambiguous = hitsStop && hitsTarget;
+          const optimisticExitRaw = hitsTarget ? pos.takeProfit : pos.stopLoss;
+          const pessimisticExitRaw = hitsStop ? pos.stopLoss : pos.takeProfit;
+          let reason: ExitReason;
+          if (hitsTarget && !ambiguous) reason = 'target';
+          else if (ls?.trailed && hitsStop && !ambiguous) reason = 'trailing';
+          else reason = hitsStop ? 'stop' : 'target';
+          exitsThisBar.push({
+            pos,
+            rawExit: optimisticExitRaw,
+            reason,
+            ambiguous,
+            pessimisticRawExit: pessimisticExitRaw,
+          });
+          continue;
+        }
+
+        // 3) Time stop. Per spec §3/§4 the position closes "at market" once
+        //    the bar cap is reached; we use the bar's close. Only fires when
+        //    neither the bracket nor the alt-exit closed the trade.
+        const cap = timeStopBarsFor(pos.signalType);
+        if (ls && cap !== null && ls.barsHeld >= cap) {
+          exitsThisBar.push({
+            pos,
+            rawExit: latest.close,
+            reason: 'time_stop',
+            ambiguous: false,
+          });
+        }
+      }
+
+      for (const ex of exitsThisBar) {
+        const { pos, rawExit, reason, ambiguous, pessimisticRawExit } = ex;
         const entryFill = entryFills.get(pos.id) ?? pos.entryPrice;
-        const optimisticFill = applyExitSlippage(pos.side, optimisticExitRaw);
+        // TRA-211: R-multiple uses the entry-bar stop, not the (possibly
+        // trailed) live stop, so a trailing ratchet doesn't shrink the
+        // denominator and inflate reported R.
+        const stopForR = positions.getLifecycle(pos.id)?.initialStopLoss ?? pos.stopLoss;
+        const optimisticFill = applyExitSlippage(pos.side, rawExit);
         const optimisticPnl = computePnl(pos.side, entryFill, optimisticFill, pos.quantity);
 
-        const closed = positions.close(pos.id, optimisticExitRaw);
+        const closed = positions.close(pos.id, rawExit, reason);
         // Overwrite the manager's naive PnL with the cost-adjusted version and
         // persist the slippage-adjusted entry/exit so downstream consumers see
         // realistic fill economics on every trade.
@@ -367,11 +498,11 @@ export class BacktestRunner {
         closed.pnl = optimisticPnl;
         entryFills.delete(pos.id);
         closedTrades.push(closed);
-        tradeRs.push(tradeR(pos.side, entryFill, optimisticFill, pos.stopLoss));
+        tradeRs.push(tradeR(pos.side, entryFill, optimisticFill, stopForR));
 
-        if (ambiguous) {
+        if (ambiguous && pessimisticRawExit !== undefined) {
           ambiguousTrades += 1;
-          const pessimisticFill = applyExitSlippage(pos.side, pessimisticExitRaw);
+          const pessimisticFill = applyExitSlippage(pos.side, pessimisticRawExit);
           worstCaseTotalPnl += computePnl(pos.side, entryFill, pessimisticFill, pos.quantity);
         } else {
           worstCaseTotalPnl += optimisticPnl;

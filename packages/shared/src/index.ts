@@ -99,6 +99,23 @@ export interface RelativeValueSignal extends TradeSignal {
   reason: string;
 }
 
+/**
+ * Why a closed position exited. Surfaced in `Position.exitReason` so backtest
+ * trade logs can break PnL down by lifecycle path:
+ *   - `stop`         hard stop hit at `stopLoss`
+ *   - `target`       initial take-profit hit at `takeProfit`
+ *   - `time_stop`    per-strategy bar-count cap reached without stop/target
+ *   - `trailing`     trailing-stop ratchet exited (incl. break-even after +Nx ATR)
+ *   - `rsi_alt_exit` mean-reversion alternate exit (RSI re-crossed 50 from
+ *                    the entry-side extreme, beating the BB-middle target)
+ */
+export type ExitReason =
+  | 'stop'
+  | 'target'
+  | 'time_stop'
+  | 'trailing'
+  | 'rsi_alt_exit';
+
 export interface Position {
   id: string;
   symbol: string;
@@ -112,6 +129,17 @@ export interface Position {
   closedAt?: number;
   exitPrice?: number;
   pnl?: number;
+  /**
+   * TRA-211: which lifecycle path closed the position. Optional so legacy
+   * call-sites that only stamp `pnl` keep type-checking; the backtest runner
+   * always sets it.
+   */
+  exitReason?: ExitReason;
+  /**
+   * TRA-211: bars the position was held for, set on close. Drives per-strategy
+   * time-stop diagnostics in the trade log.
+   */
+  barsHeld?: number;
 }
 
 export interface AccountState {
