@@ -10,6 +10,7 @@ export type SignalType =
   | 'bb_fade'      // TRA-170: pure mean-reversion half
   | 'momentum'     // TRA-205: MA-cross + Donchian breakout, gated to trend regimes
   | 'mean_reversion' // TRA-206: regime-gated RSI+BB mean reversion (range-only, long+short)
+  | 'breakout_vol' // TRA-207: consolidation + volume-confirmed breakout, high-vol regime
   | 'ichimoku'
   | 'scalping'
   | 'swing_trade'
@@ -533,6 +534,7 @@ export interface EodTradeEntry {
     | 'BB Fade'      // TRA-170 split
     | 'Momentum'     // TRA-205
     | 'Mean Reversion' // TRA-206
+    | 'Breakout'     // TRA-207
     | 'Ichimoku'
     | 'Scalping'
     | 'Swing'

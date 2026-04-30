@@ -5,6 +5,7 @@ import {
   MacdTrendStrategy,
   BbFadeStrategy,
   MomentumStrategy,
+  BreakoutVolStrategy,
   IchimokuStrategy,
   ScalpingStrategy,
   SwingStrategy,
@@ -168,6 +169,15 @@ export class BacktestRunner {
     // sees during live trading.
     const regimeDetector = new RegimeDetector(config.regimeOpts);
     const momentum = new MomentumStrategy(regimeDetector, config.momentumOpts);
+    // TRA-207: breakout strategy classifies its own regime when called without
+    // a label. The runner could share `regimeDetector` here but that would
+    // double-tick the hysteresis state per bar; passing `regimeOpts` through
+    // the strategy's `regimeOptions` keeps both classifications using the
+    // same configuration without coupling state.
+    const breakoutVol = new BreakoutVolStrategy({
+      ...config.breakoutVolOpts,
+      regimeOptions: config.breakoutVolOpts?.regimeOptions ?? config.regimeOpts,
+    });
 
     // TRA-169 / TRA-185 / TRA-203: per-fill cost model. Commission charged on
     // entry+exit notional, slippage applied adversely to fill prices. The
@@ -267,6 +277,10 @@ export class BacktestRunner {
       if (config.strategyType === 'momentum' || config.strategyType === 'combined') {
         const m = momentum.evaluate(config.symbol, window);
         if (m) signals.push(m);
+      }
+      if (config.strategyType === 'breakout_vol' || config.strategyType === 'combined') {
+        const b = breakoutVol.evaluate(config.symbol, window);
+        if (b) signals.push(b);
       }
       if (config.strategyType === 'ichimoku' || config.strategyType === 'combined') {
         const s = ichimoku.evaluate(config.symbol, window);

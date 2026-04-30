@@ -12,6 +12,8 @@ export { MomentumStrategy } from './strategies/momentum.js';
 export type { MomentumOptions } from './strategies/momentum.js';
 export { MeanReversionCryptoStrategy } from './strategies/mean-reversion-crypto.js';
 export type { MeanReversionCryptoOptions } from './strategies/mean-reversion-crypto.js';
+export { BreakoutVolStrategy } from './strategies/breakout-vol.js';
+export type { BreakoutVolOptions } from './strategies/breakout-vol.js';
 export { IchimokuStrategy } from './strategies/ichimoku-strategy.js';
 export type { IchimokuOptions } from './strategies/ichimoku-strategy.js';
 export { ScalpingStrategy } from './strategies/scalping-strategy.js';

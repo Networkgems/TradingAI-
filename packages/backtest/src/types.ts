@@ -1,5 +1,5 @@
 import { Position } from '@trading-app/shared';
-import type { CostModel, IchimokuOptions, MomentumOptions, OrbOptions, RegimeDetectorOptions, ScalpingOptions, SwingOptions } from '@trading-app/engine';
+import type { BreakoutVolOptions, CostModel, IchimokuOptions, MomentumOptions, OrbOptions, RegimeDetectorOptions, ScalpingOptions, SwingOptions } from '@trading-app/engine';
 
 export interface BacktestReversalOpts {
   rsiPeriod?: number;
@@ -90,12 +90,15 @@ export interface BacktestConfig {
     | 'combined'
     | 'macd_bollinger'
     | 'scalping'
-    | 'swing';
+    | 'swing'
+    | 'breakout_vol';
   reversalOpts?: BacktestReversalOpts;
   macdBollingerOpts?: BacktestMacdBollingerOpts;
   ichimokuOpts?: BacktestIchimokuOpts;
   /** TRA-205: pass-through to MomentumStrategy. */
   momentumOpts?: MomentumOptions;
+  /** TRA-207: pass-through to BreakoutVolStrategy. */
+  breakoutVolOpts?: BreakoutVolOptions;
   /**
    * TRA-205: regime-detector knobs forwarded to the detector that gates
    * momentum (and any future regime-aware strategy). Omit to use defaults.

@@ -42,6 +42,7 @@ function strategyLabel(t: SignalType): EodTradeEntry['strategy'] {
     case 'bb_fade': return 'BB Fade';
     case 'momentum': return 'Momentum';
     case 'mean_reversion': return 'Mean Reversion';
+    case 'breakout_vol': return 'Breakout';
     case 'ichimoku': return 'Ichimoku';
     case 'scalping': return 'Scalping';
     case 'swing_trade': return 'Swing';
