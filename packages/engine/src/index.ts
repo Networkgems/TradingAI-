@@ -45,8 +45,10 @@ export type {
   MarketOrderParams as CoinbaseMarketOrderParams,
   LimitOrderParams as CoinbaseLimitOrderParams,
 } from './coinbase/index.js';
-export { rsi, rsiDivergence, VwapTracker, detectPattern, isBullishPattern, isBearishPattern, adx, ema, emaCross, atr, atrPct, ichimoku, tkCross } from './indicators/index.js';
+export { rsi, rsiDivergence, VwapTracker, detectPattern, isBullishPattern, isBearishPattern, adx, ema, emaCross, emaSeries, maSlope, atr, atrPct, ichimoku, tkCross } from './indicators/index.js';
 export type { VwapState, CandlePattern, AdxResult, IchimokuState } from './indicators/index.js';
+export { RegimeDetector, classifyRegime } from './regime.js';
+export type { Regime, RegimeDetectorOptions } from './regime.js';
 export { blackScholesPrice, blackScholesDelta, bsImpliedVolatility, daysToExpiration } from './options/black-scholes.js';
 export type { BlackScholesInputs, ImpliedVolInputs } from './options/black-scholes.js';
 export { findMispricedOtmContracts } from './options/otm-mispricing.js';
