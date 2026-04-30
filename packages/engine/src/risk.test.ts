@@ -171,3 +171,84 @@ describe('RiskManager', () => {
     expect(qty).toBe(714.28571428);
   });
 });
+
+describe('RiskManager.sizeFromAtr', () => {
+  it('returns 0 for non-positive atr or multiplier (callers can short-circuit)', () => {
+    const risk = new RiskManager(makeAccount(100_000), { fractionalQuantity: true });
+    expect(risk.sizeFromAtr(60_000, 0, 2)).toBe(0);
+    expect(risk.sizeFromAtr(60_000, -100, 2)).toBe(0);
+    expect(risk.sizeFromAtr(60_000, 1500, 0)).toBe(0);
+    expect(risk.sizeFromAtr(60_000, 1500, -1)).toBe(0);
+    expect(risk.sizeFromAtr(60_000, Number.NaN, 2)).toBe(0);
+  });
+
+  it('TRA-202: sizes BTC at $60k with ATR $1.5k × 2 so per-trade $-risk equals the budget', () => {
+    // $100k account → managed $50k → risk budget $500.
+    // Stop distance = 1500 × 2 = $3000 → qty = 500/3000 = 0.16666666… BTC.
+    const risk = new RiskManager(makeAccount(100_000), { fractionalQuantity: true });
+    const qty = risk.sizeFromAtr(60_000, 1500, 2);
+    expect(qty).toBeCloseTo(0.16666666, 6);
+    // Achieved $-risk = qty × stopDistance ≈ budget.
+    expect(qty * 3000).toBeCloseTo(500, 1);
+  });
+
+  it('TRA-202: BTC sizing scales linearly with the per-trade risk budget (0.5% / 1% / 2% slices)', () => {
+    // Budget = totalEquity × MANAGED_ACCOUNT_RATIO × DEFAULT_RISK_PER_TRADE
+    //        = totalEquity × 0.5 × 0.01 = 0.005 × totalEquity.
+    // 50k → $250 (0.5% of $50k); 100k → $500 (0.5% of $100k = 1% of managed);
+    // 200k → $1000. Stop distance is constant at $3000.
+    const small = new RiskManager(makeAccount(50_000), { fractionalQuantity: true });
+    const mid = new RiskManager(makeAccount(100_000), { fractionalQuantity: true });
+    const big = new RiskManager(makeAccount(200_000), { fractionalQuantity: true });
+
+    const a = small.sizeFromAtr(60_000, 1500, 2);
+    const b = mid.sizeFromAtr(60_000, 1500, 2);
+    const c = big.sizeFromAtr(60_000, 1500, 2);
+
+    expect(a).toBeCloseTo(250 / 3000, 6);
+    expect(b).toBeCloseTo(500 / 3000, 6);
+    expect(c).toBeCloseTo(1000 / 3000, 6);
+    expect(b / a).toBeCloseTo(2, 6);
+    expect(c / a).toBeCloseTo(4, 6);
+  });
+
+  it('rounds down to an explicit lotSize (e.g. 1e-6 for 6dp BTC precision)', () => {
+    const risk = new RiskManager(makeAccount(100_000), { fractionalQuantity: true });
+    // 0.16666666… → floor to 1e-6 → 0.166666.
+    const qty = risk.sizeFromAtr(60_000, 1500, 2, 1e-6);
+    expect(qty).toBeCloseTo(0.166666, 6);
+    // A coarser 1e-3 step floors the same input to 0.166.
+    expect(risk.sizeFromAtr(60_000, 1500, 2, 1e-3)).toBeCloseTo(0.166, 6);
+  });
+
+  it('falls back to whole-unit sizing when neither lotSize nor fractionalQuantity is set', () => {
+    // $100 entry, ATR $1, multiplier 1 → $1 stop. Budget $500 → 500 shares.
+    const risk = new RiskManager(makeAccount(100_000));
+    expect(risk.sizeFromAtr(100, 1, 1)).toBe(500);
+  });
+
+  it('caps notional when an ATR-derived stop is tiny relative to entry (TRA-178 protection)', () => {
+    // ATR $0.001, mult 1 → stop $0.001 → risk-based = 500_000 shares.
+    // Notional cap @ 1.0 × $50k / $100 = 500. The cap binds.
+    const risk = new RiskManager(makeAccount(100_000));
+    expect(risk.sizeFromAtr(100, 0.001, 1)).toBe(500);
+  });
+
+  it('engages the drawdown brake (per-trade halved past 10% drawdown)', () => {
+    const account = makeAccount(100_000);
+    const risk = new RiskManager(account, { fractionalQuantity: true });
+    risk.sizeFromAtr(60_000, 1500, 2); // record peak
+
+    account.totalEquity = 80_000; // managed 40k → 20% drawdown engages brake
+    const throttled = risk.sizeFromAtr(60_000, 1500, 2);
+    // 0.5 × 1% × 40_000 = $200 budget; stop $3000 → 200/3000 = 0.0666666…
+    expect(throttled).toBeCloseTo(200 / 3000, 6);
+  });
+
+  it('honours a custom maxNotionalRatio (e.g. 0.5 caps at half managed equity)', () => {
+    // ATR tight enough that the risk budget would normally exceed the cap.
+    const risk = new RiskManager(makeAccount(100_000), { maxNotionalRatio: 0.5 });
+    // 0.5 × $50k / $100 = 250 shares; risk-based would be 50_000.
+    expect(risk.sizeFromAtr(100, 0.001, 1)).toBe(250);
+  });
+});

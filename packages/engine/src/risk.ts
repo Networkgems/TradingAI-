@@ -119,4 +119,34 @@ export class RiskManager {
     const notionalCap = truncate((this.managedEquity() * this.maxNotionalRatio) / entryPrice);
     return Math.max(0, Math.min(riskBased, notionalCap));
   }
+
+  /**
+   * Volatility-adaptive sizing: stop distance is `atr × atrMultiplier`
+   * instead of a fixed price offset, so the achieved $-risk-per-trade
+   * stays at `maxRiskPerTrade()` across vol regimes (a 2× ATR stop in a
+   * calm tape is small; in a volatile tape it widens automatically).
+   *
+   * Quantity is the smaller of the risk-budget size and the notional cap
+   * (same protections as `sizeFromStop`). Rounding granularity:
+   *   - explicit `lotSize` (e.g. 1e-6 for 6dp BTC, 0.01 for fractional
+   *     equity, 1 for whole shares) rounds the quantity DOWN to that step;
+   *   - omitted, falls back to the RiskManager's `fractionalQuantity`
+   *     setting (8dp truncation when true, whole-unit floor otherwise).
+   *
+   * Returns 0 when the inputs cannot produce a finite stop distance, so
+   * callers can short-circuit signals where ATR is unavailable.
+   */
+  sizeFromAtr(entryPrice: number, atr: number, atrMultiplier: number, lotSize?: number): number {
+    if (!Number.isFinite(atr) || atr <= 0) return 0;
+    if (!Number.isFinite(atrMultiplier) || atrMultiplier <= 0) return 0;
+    const stopDistance = atr * atrMultiplier;
+    const truncate = (n: number): number => {
+      if (lotSize !== undefined && lotSize > 0) return Math.floor(n / lotSize) * lotSize;
+      return this.fractionalQuantity ? Math.floor(n * 1e8) / 1e8 : Math.floor(n);
+    };
+    const riskBased = truncate(this.maxRiskPerTrade() / stopDistance);
+    if (entryPrice <= 0) return Math.max(0, riskBased);
+    const notionalCap = truncate((this.managedEquity() * this.maxNotionalRatio) / entryPrice);
+    return Math.max(0, Math.min(riskBased, notionalCap));
+  }
 }
