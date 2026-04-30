@@ -619,6 +619,31 @@ export interface EodReport {
   totalTrades: number;
   winners: number;
   losers: number;
+  /**
+   * TRA-208: average per-trade R multiple across today's closed trades. R is
+   * `(exitPrice − entryPrice) / |entry − stop|` signed by side, so >0 means
+   * the average trade collected more than zero stop-distances of profit.
+   * Mirrors `BacktestResult.expectancy` so live perf and backtest expectancy
+   * are computed the same way. Industry rule of thumb: > 0.2R after costs is
+   * the floor for a deployable system.
+   */
+  expectancy: number;
+  /**
+   * TRA-208: peak-to-trough drawdown of the cumulative-PnL equity curve
+   * through today's closed trades, expressed as a fraction in [0,1] of the
+   * peak. Computed against `realizedPnl` only — open positions don't move
+   * this metric, matching `BacktestResult.maxDrawdown`'s realized-equity
+   * intent for daily reporting.
+   */
+  maxDrawdown: number;
+  /**
+   * TRA-208: trade-R Sharpe = mean(R) / stdev(R). NOT annualized — the
+   * sample is one trading session, so an annualization factor would be
+   * misleading. Mirrors the `BacktestResult.sharpeRatio` per-trade fallback
+   * path (the backtest annualizes from per-bar MTM when bars are available;
+   * for live EOD we only have per-trade Rs).
+   */
+  sharpeRatio: number;
 
   // Market
   top5Movers: EodMover[];

@@ -68,6 +68,10 @@ describe('generateEodReport', () => {
     expect(report.totalTrades).toBe(0);
     expect(report.realizedPnl).toBe(0);
     expect(report.winRate).toBe(0);
+    // TRA-208: backtest-parity metrics — all zero when no trades closed.
+    expect(report.expectancy).toBe(0);
+    expect(report.maxDrawdown).toBe(0);
+    expect(report.sharpeRatio).toBe(0);
     expect(typeof report.markdown).toBe('string');
     expect(report.markdown).toContain('# Daily EOD Report');
   });
@@ -223,6 +227,53 @@ describe('generateEodReport', () => {
 
     expect(report.top5Movers).toHaveLength(0);
     expect(report.markdown).toContain('_No data._');
+  });
+
+  it('reports TRA-208 backtest-parity metrics (expectancy, max drawdown, Sharpe)', () => {
+    // Three trades: one +1R, one −1R, one +2R. Expectancy = (+1 −1 +2) / 3
+    // = 0.667R. Per-trade Sharpe = mean(R) / stdev(R) = 0.667 / 1.528 ≈ 0.436.
+    // Max drawdown = the −1R loss against the running peak after trade #1.
+    const today = new Date().toLocaleDateString('en-CA', { timeZone: 'America/New_York' });
+    const todayTs = new Date(`${today}T15:00:00`).getTime();
+    // Hand-pick risk geometry so each trade's R is exactly the integer above.
+    // R = pnl / (|entry−stop| × qty). With entry=100, stop=98, qty=10 → risk=20,
+    // so pnl=+20 → +1R, pnl=−20 → −1R, pnl=+40 → +2R.
+    const trades = [
+      makePosition({
+        id: 't1', pnl: 20, entryPrice: 100, stopLoss: 98, quantity: 10,
+        openedAt: todayTs - 3600_000, closedAt: todayTs,
+      }),
+      makePosition({
+        id: 't2', pnl: -20, entryPrice: 100, stopLoss: 98, quantity: 10,
+        openedAt: todayTs - 2400_000, closedAt: todayTs + 60_000,
+      }),
+      makePosition({
+        id: 't3', pnl: 40, entryPrice: 100, stopLoss: 98, quantity: 10,
+        openedAt: todayTs - 1200_000, closedAt: todayTs + 120_000,
+      }),
+    ];
+    const report = generateEodReport({
+      state: makeEngineState(),
+      allClosedPositions: trades,
+      dailySignals: [],
+      signalTypeMap: new Map(),
+    });
+
+    expect(report.expectancy).toBeCloseTo(2 / 3, 3);
+    // Sample stdev of [1,−1,2] = sqrt(((1−2/3)² + (−1−2/3)² + (2−2/3)²)/2)
+    // = sqrt((1/9 + 25/9 + 16/9) / 2) = sqrt(42/18) = sqrt(7/3) ≈ 1.528.
+    // Sharpe = (2/3) / 1.528 ≈ 0.4364.
+    expect(report.sharpeRatio).toBeCloseTo(0.4364, 3);
+    // Equity curve (anchored at session-open equity = 25,000 − 40 = 24,960):
+    //   start = 24,960
+    //   after t1 (+20)  = 24,980 (peak)
+    //   after t2 (−20)  = 24,960 (drawdown 20 / 24,980 ≈ 0.0008)
+    //   after t3 (+40)  = 25,000 (new peak)
+    // Max DD ≈ 20 / 24,980 ≈ 8e-4.
+    expect(report.maxDrawdown).toBeCloseTo(20 / 24_980, 5);
+    expect(report.markdown).toContain('Expectancy');
+    expect(report.markdown).toContain('Max Drawdown');
+    expect(report.markdown).toContain('Sharpe');
   });
 
   it('calculates unrealized P&L from open positions vs current prices', () => {

@@ -13,6 +13,49 @@ function calcRR(pos: Position): number {
   return Math.round((pos.pnl / risk) * 10) / 10;
 }
 
+/**
+ * TRA-208: backtest-parity helpers — see eod-report.ts for the rationale on
+ * why these definitions match `BacktestResult.expectancy / maxDrawdown /
+ * sharpeRatio` (per-trade R, realized-equity peak-trough, non-annualized
+ * trade-R Sharpe). Duplicated here to avoid making the equities report
+ * import from the crypto report or vice versa — the two reports run in
+ * different processes and a shared module would couple their lifecycles.
+ */
+function tradeR(pos: Position): number {
+  if (pos.pnl == null) return 0;
+  const risk = Math.abs(pos.entryPrice - pos.stopLoss) * pos.quantity;
+  if (risk === 0) return 0;
+  return pos.pnl / risk;
+}
+
+function computeMaxDrawdown(
+  trades: ReadonlyArray<Position>,
+  initialEquity: number,
+): number {
+  if (trades.length === 0 || initialEquity <= 0) return 0;
+  const ordered = [...trades].sort((a, b) => (a.closedAt ?? 0) - (b.closedAt ?? 0));
+  let equity = initialEquity;
+  let peak = initialEquity;
+  let maxDd = 0;
+  for (const t of ordered) {
+    equity += t.pnl ?? 0;
+    if (equity > peak) peak = equity;
+    if (peak > 0) {
+      const dd = (peak - equity) / peak;
+      if (dd > maxDd) maxDd = dd;
+    }
+  }
+  return maxDd;
+}
+
+function computeTradeSharpe(rs: ReadonlyArray<number>): number {
+  if (rs.length < 2) return 0;
+  const mean = rs.reduce((s, r) => s + r, 0) / rs.length;
+  const variance = rs.reduce((s, r) => s + (r - mean) ** 2, 0) / (rs.length - 1);
+  const std = Math.sqrt(variance);
+  return std > 0 ? mean / std : 0;
+}
+
 function strategyLabel(t: SignalType): StrategyLabel {
   switch (t) {
     case 'reversal': return 'Reversal';
@@ -54,6 +97,7 @@ function buildMarkdown(report: Omit<EodReport, 'markdown'>): string {
           totalEquity, managedEquity, availableCash,
           trades, openPositionCount,
           winRate, avgRR, totalTrades, winners, losers,
+          expectancy, maxDrawdown, sharpeRatio,
           top5Movers: movers, signalAccuracy } = report;
 
   const pnlSign = (n: number) => (n >= 0 ? '+' : '') + n.toFixed(2);
@@ -89,6 +133,9 @@ function buildMarkdown(report: Omit<EodReport, 'markdown'>): string {
 | Losers | ${losers} |
 | Win Rate | ${pct(winRate)} |
 | Avg R:R Achieved | 1:${avgRR.toFixed(2)} |
+| Expectancy (avg R / trade) | ${expectancy.toFixed(2)}R |
+| Max Drawdown | ${pct(maxDrawdown)} |
+| Sharpe (per-trade) | ${sharpeRatio.toFixed(2)} |
 
 ## Trade Log
 ${tradeRows.length > 0
@@ -145,6 +192,17 @@ export function generateCryptoEodReport(snapshot: CryptoReportSnapshot): EodRepo
   const winRate = totalTrades > 0 ? winners / totalTrades : 0;
   const avgRR = totalTrades > 0 ? trades.reduce((sum, t) => sum + Math.abs(t.rr), 0) / totalTrades : 0;
 
+  // TRA-208: backtest-parity metrics. Anchors the equity curve at session-
+  // open equity (close-of-day equity minus today's realized PnL) so a single
+  // losing trade against a small book registers as a measurable drawdown.
+  const tradeRs = todayClosed.map(tradeR);
+  const expectancy = tradeRs.length > 0
+    ? tradeRs.reduce((s, r) => s + r, 0) / tradeRs.length
+    : 0;
+  const sharpeRatio = computeTradeSharpe(tradeRs);
+  const sessionOpenEquity = totalEquity - realizedPnl;
+  const maxDrawdown = computeMaxDrawdown(todayClosed, Math.max(sessionOpenEquity, 1));
+
   const top5Movers: EodMover[] = [...snapshot.symbols]
     .sort((a, b) => Math.abs(b.changePct) - Math.abs(a.changePct))
     .slice(0, 5)
@@ -175,6 +233,9 @@ export function generateCryptoEodReport(snapshot: CryptoReportSnapshot): EodRepo
     totalTrades,
     winners,
     losers,
+    expectancy,
+    maxDrawdown,
+    sharpeRatio,
     top5Movers,
     signalAccuracy,
   };

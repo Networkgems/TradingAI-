@@ -55,6 +55,12 @@ export { rsi, rsiDivergence, VwapTracker, detectPattern, isBullishPattern, isBea
 export type { VwapState, CandlePattern, AdxResult, DonchianChannel, IchimokuState } from './indicators/index.js';
 export { RegimeDetector, classifyRegime } from './regime.js';
 export type { Regime, RegimeDetectorOptions } from './regime.js';
+export { StrategyRouter, DEFAULT_ROUTER_PRIORITY } from './router.js';
+export type {
+  StrategyRouterOptions,
+  RouterEvaluation,
+  RouterPriority,
+} from './router.js';
 export {
   TIME_STOP_BARS,
   initLifecycleState,

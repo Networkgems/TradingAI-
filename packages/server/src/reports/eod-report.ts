@@ -58,6 +58,62 @@ function calcRR(pos: Position): number {
   return Math.round((pos.pnl / risk) * 10) / 10;
 }
 
+/**
+ * TRA-208: per-trade R = pnl / (|entry − stop| × qty). Same definition the
+ * backtest uses (`tradeR()` in packages/backtest/src/runner.ts) so live
+ * expectancy and backtest expectancy are directly comparable.
+ */
+function tradeR(pos: Position): number {
+  if (pos.pnl == null) return 0;
+  const risk = Math.abs(pos.entryPrice - pos.stopLoss) * pos.quantity;
+  if (risk === 0) return 0;
+  return pos.pnl / risk;
+}
+
+/**
+ * TRA-208: peak-to-trough drawdown over the cumulative-PnL series of `trades`
+ * in close-time order. Returned as a fraction of the running peak equity in
+ * [0,1]. Mirrors `BacktestResult.maxDrawdown` semantics for daily reporting,
+ * but computed off the realized equity curve (open MTM excluded — daily
+ * reports run after the close so MTM is a sideshow).
+ *
+ * `initialEquity` anchors the curve so a single losing trade against a small
+ * book registers as a drawdown rather than a zero-base divide-by-zero.
+ */
+function computeMaxDrawdown(
+  trades: ReadonlyArray<Position>,
+  initialEquity: number,
+): number {
+  if (trades.length === 0 || initialEquity <= 0) return 0;
+  const ordered = [...trades].sort((a, b) => (a.closedAt ?? 0) - (b.closedAt ?? 0));
+  let equity = initialEquity;
+  let peak = initialEquity;
+  let maxDd = 0;
+  for (const t of ordered) {
+    equity += t.pnl ?? 0;
+    if (equity > peak) peak = equity;
+    if (peak > 0) {
+      const dd = (peak - equity) / peak;
+      if (dd > maxDd) maxDd = dd;
+    }
+  }
+  return maxDd;
+}
+
+/**
+ * TRA-208: trade-R Sharpe (NOT annualized). Matches the per-trade-R fallback
+ * path of `BacktestResult.sharpeRatio` — a daily report typically has < 20
+ * trades, so a √N annualization factor would massively overstate noise as
+ * skill. Use `expectancy` (mean R) for systems-level signal-to-noise.
+ */
+function computeTradeSharpe(rs: ReadonlyArray<number>): number {
+  if (rs.length < 2) return 0;
+  const mean = rs.reduce((s, r) => s + r, 0) / rs.length;
+  const variance = rs.reduce((s, r) => s + (r - mean) ** 2, 0) / (rs.length - 1);
+  const std = Math.sqrt(variance);
+  return std > 0 ? mean / std : 0;
+}
+
 function toTradeEntry(pos: Position, signalType: SignalType): EodTradeEntry {
   const exitPrice = pos.side === 'buy' ? pos.takeProfit : pos.stopLoss;
   const rr = calcRR(pos);
@@ -92,6 +148,7 @@ function buildMarkdown(report: Omit<EodReport, 'markdown'>): string {
           totalEquity, managedEquity, availableCash,
           trades, openPositionCount,
           winRate, avgRR, totalTrades, winners, losers,
+          expectancy, maxDrawdown, sharpeRatio,
           top5Movers: movers, signalAccuracy } = report;
 
   const pnlSign = (n: number) => (n >= 0 ? '+' : '') + n.toFixed(2);
@@ -128,6 +185,9 @@ function buildMarkdown(report: Omit<EodReport, 'markdown'>): string {
 | Losers | ${losers} |
 | Win Rate | ${pct(winRate)} |
 | Avg R:R Achieved | 1:${avgRR.toFixed(2)} |
+| Expectancy (avg R / trade) | ${expectancy.toFixed(2)}R |
+| Max Drawdown | ${pct(maxDrawdown)} |
+| Sharpe (per-trade) | ${sharpeRatio.toFixed(2)} |
 
 ## Trade Log
 ${tradeRows.length > 0
@@ -201,6 +261,17 @@ export function generateEodReport(input: ReportInput): EodReport {
   const winRate = totalTrades > 0 ? winners / totalTrades : 0;
   const avgRR = totalTrades > 0 ? trades.reduce((sum, t) => sum + Math.abs(t.rr), 0) / totalTrades : 0;
 
+  // TRA-208: backtest-parity metrics. Anchor the equity curve at the close-of-
+  // day equity *minus* today's realized PnL — that's the equity at session
+  // open, which is the right baseline for an intra-day drawdown measurement.
+  const tradeRs = todayClosed.map(tradeR);
+  const expectancy = tradeRs.length > 0
+    ? tradeRs.reduce((s, r) => s + r, 0) / tradeRs.length
+    : 0;
+  const sharpeRatio = computeTradeSharpe(tradeRs);
+  const sessionOpenEquity = state.account.totalEquity - realizedPnl;
+  const maxDrawdown = computeMaxDrawdown(todayClosed, Math.max(sessionOpenEquity, 1));
+
   // Top 5 movers
   const movers = top5Movers(state.symbols);
 
@@ -234,6 +305,9 @@ export function generateEodReport(input: ReportInput): EodReport {
     totalTrades,
     winners,
     losers,
+    expectancy,
+    maxDrawdown,
+    sharpeRatio,
     top5Movers: movers,
     signalAccuracy,
   };

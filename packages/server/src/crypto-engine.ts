@@ -5,6 +5,11 @@ import {
   ScalpingStrategy,
   SwingStrategy,
   CoinbaseOrderClient,
+  RegimeDetector,
+  MomentumStrategy,
+  MeanReversionCryptoStrategy,
+  BreakoutVolStrategy,
+  StrategyRouter,
 } from '@trading-app/engine';
 import { CRYPTO_WATCHLIST } from '@trading-app/shared';
 import type { TradeSignal, Candle, AccountState, Position, CryptoEngineState, NewsItem, AccountSettings } from '@trading-app/shared';
@@ -35,6 +40,15 @@ export class CryptoSignalEngine {
   private readonly bbFade = new BbFadeStrategy({ enforceTimeFilter: false });
   private readonly scalping = new ScalpingStrategy({ enforceTimeFilter: false });
   private readonly swing = new SwingStrategy();
+  /**
+   * TRA-208: per-symbol regime-aware routers for the new strategy roster
+   * (momentum / mean-reversion / breakout). Each router owns its own
+   * RegimeDetector — sharing across symbols would pollute the hysteresis
+   * label across uncorrelated tapes (BTC trending up while ETH ranges).
+   * Lazily created on first sight of each symbol so adding a coin to the
+   * watchlist mid-session doesn't require a restart.
+   */
+  private readonly routers = new Map<string, StrategyRouter>();
   private readonly account: CryptoPaperAccount;
   private readonly tracker: PnlTracker | undefined;
 
@@ -243,6 +257,32 @@ export class CryptoSignalEngine {
   private static readonly MIN_BARS_MACD_TREND = 35; // slowPeriod(26) + signalPeriod(9)
   private static readonly MIN_BARS_BB_FADE = 28;    // bbPeriod(20) + adx warm-up
   private static readonly MIN_BARS_SCALPING = 23;   // max(slowEma(21)+2, volumeLookback(10)+1, rsiPeriod(9)+2)
+  // TRA-208 router floor: momentum needs slowMaPeriod(50)+1, breakout needs
+  // 50 bars to seed the regime classifier's MA, mean-reversion gates on a
+  // 50-bar EMA. 50 covers all three.
+  private static readonly MIN_BARS_ROUTER = 50;
+
+  /**
+   * Lazily build a per-symbol regime-aware router (TRA-208). One router per
+   * symbol keeps each ticker's RegimeDetector hysteresis state isolated from
+   * the others. Strategies inside the router are also per-router because
+   * MomentumStrategy carries `lastFireTs` state that would otherwise be
+   * shared across symbols and rate-limit cross-asset signals incorrectly.
+   */
+  private getRouter(symbol: string): StrategyRouter {
+    let r = this.routers.get(symbol);
+    if (!r) {
+      const regime = new RegimeDetector();
+      r = new StrategyRouter({
+        regime,
+        momentum: new MomentumStrategy(regime),
+        meanReversion: new MeanReversionCryptoStrategy(),
+        breakout: new BreakoutVolStrategy(),
+      });
+      this.routers.set(symbol, r);
+    }
+    return r;
+  }
 
   private async tick(): Promise<void> {
     if (this.tickRunning) return;
@@ -344,6 +384,12 @@ export class CryptoSignalEngine {
           ? this.scalping.evaluate(sym, candles) : null;
         const swingSignal = dailyCandles.length >= 205
           ? this.swing.evaluate(sym, dailyCandles) : null;
+        // TRA-208: regime-aware router emits at most one momentum / breakout
+        // / mean-reversion signal per tick. Routed alongside the legacy roster
+        // above; the dedup-by-recent-signal logic below handles cross-strategy
+        // overlap (e.g. router momentum + legacy macdTrend on the same bar).
+        const routerSignal = candles.length >= CryptoSignalEngine.MIN_BARS_ROUTER
+          ? this.getRouter(sym).evaluate(sym, candles) : null;
 
         if (candles.length === 0) {
           symbolsSkipped++;
@@ -351,7 +397,7 @@ export class CryptoSignalEngine {
           symbolsEvaluated++;
         }
 
-        for (const signal of [reversalSignal, macdTrendSignal, bbFadeSignal, scalpingSignal, swingSignal]) {
+        for (const signal of [reversalSignal, macdTrendSignal, bbFadeSignal, scalpingSignal, swingSignal, routerSignal]) {
           if (!signal) continue;
           if (this.account.hasOpenPositionForSignalType(sym, signal.type)) continue;
           const recent = this.recentSignals.find(
@@ -437,8 +483,12 @@ export class CryptoSignalEngine {
         ? this.scalping.evaluate(sym, candles) : null;
       const swingSignal = dailyCandles.length >= 205
         ? this.swing.evaluate(sym, dailyCandles) : null;
+      // TRA-208: same router pipeline as the demo path so live and paper
+      // produce identical regime-aware entries from the same regime state.
+      const routerSignal = candles.length >= CryptoSignalEngine.MIN_BARS_ROUTER
+        ? this.getRouter(sym).evaluate(sym, candles) : null;
 
-      for (const signal of [reversalSignal, macdTrendSignal, bbFadeSignal, scalpingSignal, swingSignal]) {
+      for (const signal of [reversalSignal, macdTrendSignal, bbFadeSignal, scalpingSignal, swingSignal, routerSignal]) {
         if (!signal) continue;
         if (live.hasOpenPositionForSignalType(sym, signal.type)) continue;
         const recent = this.recentSignals.find(

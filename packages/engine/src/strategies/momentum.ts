@@ -117,7 +117,17 @@ export class MomentumStrategy {
     };
   }
 
-  evaluate(symbol: string, candles: Candle[]): TradeSignal | null {
+  /**
+   * Evaluate the latest bar and return a momentum entry signal if rules fire.
+   *
+   * The router (TRA-208) drives a stateful `RegimeDetector` once per tick and
+   * passes the active label as `regime` so multiple regime-gated strategies
+   * can share a single hysteresis state. Without a passed-in label this falls
+   * back to the standalone path: the constructor-supplied detector is updated
+   * here and used for the gate — preserving the pre-router contract used by
+   * tests, the backtest runner, and ad-hoc callers.
+   */
+  evaluate(symbol: string, candles: Candle[], regime?: Regime): TradeSignal | null {
     const minBars = Math.max(
       this.opt.slowMaPeriod + 1,
       this.opt.donchianPeriod + 2,
@@ -126,9 +136,11 @@ export class MomentumStrategy {
     if (candles.length < minBars) return null;
 
     // Regime gate is the first thing we check — momentum has no business
-    // firing in range/high_vol/flat tape, and `update` is cheap.
-    const regime: Regime = this.regime.update(candles);
-    if (regime !== 'trend_up' && regime !== 'trend_down') return null;
+    // firing in range/high_vol/flat tape. When the router supplies the label
+    // we skip the internal `regime.update` so a shared detector isn't double-
+    // ticked; standalone callers still get the in-place hysteresis update.
+    const effectiveRegime: Regime = regime ?? this.regime.update(candles);
+    if (effectiveRegime !== 'trend_up' && effectiveRegime !== 'trend_down') return null;
 
     const closes = candles.map((c) => c.close);
     const fastSeries = emaSeries(closes, this.opt.fastMaPeriod);
@@ -138,8 +150,8 @@ export class MomentumStrategy {
     if (!Number.isFinite(fastNow) || !Number.isFinite(slowNow)) return null;
 
     let side: Side | null = null;
-    if (regime === 'trend_up' && fastNow > slowNow) side = 'buy';
-    if (regime === 'trend_down' && fastNow < slowNow) side = 'sell';
+    if (effectiveRegime === 'trend_up' && fastNow > slowNow) side = 'buy';
+    if (effectiveRegime === 'trend_down' && fastNow < slowNow) side = 'sell';
     if (side === null) return null;
 
     // Donchian breakout — channel is computed from the prior N bars (current
