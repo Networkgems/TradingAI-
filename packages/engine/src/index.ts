@@ -44,8 +44,8 @@ export type {
 } from './coinbase/index.js';
 export { rsi, rsiDivergence, VwapTracker, detectPattern, isBullishPattern, isBearishPattern, adx, ema, emaCross, atr, atrPct, ichimoku, tkCross } from './indicators/index.js';
 export type { VwapState, CandlePattern, AdxResult, IchimokuState } from './indicators/index.js';
-export { blackScholesPrice, blackScholesDelta, daysToExpiration } from './options/black-scholes.js';
-export type { BlackScholesInputs } from './options/black-scholes.js';
+export { blackScholesPrice, blackScholesDelta, bsImpliedVolatility, daysToExpiration } from './options/black-scholes.js';
+export type { BlackScholesInputs, ImpliedVolInputs } from './options/black-scholes.js';
 export { findMispricedOtmContracts } from './options/otm-mispricing.js';
 export type {
   OptionChainRow,
@@ -53,6 +53,12 @@ export type {
   OtmScannerOptions,
   Mispricing,
 } from './options/otm-mispricing.js';
+export { findRelativeValueOpportunities } from './options/relative-value.js';
+export type {
+  RelativeValueCandidate,
+  RelativeValueScannerOptions,
+  RelativeValueClassification,
+} from './options/relative-value.js';
 export {
   cryptoTieredCostModel,
   flatCostModel,

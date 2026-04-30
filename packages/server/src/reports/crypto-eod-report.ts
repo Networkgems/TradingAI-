@@ -24,6 +24,7 @@ function strategyLabel(t: SignalType): StrategyLabel {
     case 'ichimoku': return 'Ichimoku';
     case 'orb_breakout': return 'ORB';
     case 'otm_mispricing': return 'OTM';
+    case 'relative_value': return 'RV';
   }
 }
 

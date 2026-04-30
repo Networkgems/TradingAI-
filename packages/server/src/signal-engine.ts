@@ -1,10 +1,10 @@
 import { OrbStrategy, ReversalStrategy, MacdTrendStrategy, BbFadeStrategy, IchimokuStrategy } from '@trading-app/engine';
 import { WATCHLIST, MANAGED_ACCOUNT_RATIO, MAX_CONSECUTIVE_LOSSES, DAILY_DRAWDOWN_HALT_PCT, isStockMarketOpen } from '@trading-app/shared';
-import type { TradeSignal, OtmMispricingSignal, Candle, OptionsAccountState, SignalType, Position, AccountSettings, AccountState, NewsItem } from '@trading-app/shared';
+import type { TradeSignal, RelativeValueSignal, Candle, OptionsAccountState, SignalType, Position, AccountSettings, AccountState, NewsItem } from '@trading-app/shared';
 import { fetchMinuteBars, fetchQuotes, fetchStocksNews, isYahooBreakerOpen, setActiveInterestSymbols } from './yahoo-feed.js';
 import { PaperAccount } from './paper-account.js';
 import { PaperOptionsAccount } from './options-account.js';
-import type { OtmMispricingService } from './options-scanner.js';
+import type { RelativeValueScannerService } from './relative-value-scanner.js';
 import type { DailySignalRecord } from './reports/eod-report.js';
 import type { PnlTracker } from './pnl-tracker.js';
 import { randomUUID } from 'crypto';
@@ -44,11 +44,13 @@ export type EngineEventHandler = (state: EngineState) => void;
 const MAX_SIGNALS = 50;
 const NEWS_REFRESH_MS = 5 * 60_000;
 
-// TRA-159 — periodic OTM scanner cadence. Tradier's free-tier limit is 60
-// req/min (sandbox) or 120/min (production). With ~25 active-interest symbols
-// and 2 calls per scan (expirations + chain), a 5-minute cadence stays well
-// under that ceiling and respects the scanner's 60s chain cache.
-const OTM_SCAN_INTERVAL_MS = 5 * 60_000;
+// TRA-191 — periodic relative-value scanner cadence. Tradier's free-tier
+// limit is 60 req/min (sandbox) or 120/min (production). With ~25 active-
+// interest symbols and 2 calls per scan (expirations + chain), a 5-minute
+// cadence stays well under that ceiling and respects the scanner's 60s
+// chain cache. RV is the *only* options strategy enabled for stock options
+// (TRA-191 directive); ATM auto-open and OTM scans are disabled below.
+const RV_SCAN_INTERVAL_MS = 5 * 60_000;
 
 /**
  * Tracks daily consecutive losses and cumulative P&L to enforce circuit-breakers:
@@ -116,9 +118,15 @@ export class SignalEngine {
   private optionsAccount: PaperOptionsAccount;
   private readonly riskGovernor = new DailyRiskGovernor();
   private readonly tracker: PnlTracker | undefined;
-  private readonly otmScanner: OtmMispricingService | undefined;
-  /** Last successful OTM scan timestamp — gates the 5-minute cadence. */
-  private lastOtmScanAt = 0;
+  /**
+   * TRA-191 — only enabled options scanner for stock options. ATM-per-equity-
+   * signal auto-open and the OTM mispricing path are disabled in this
+   * iteration; the scanner the engine routes through is the relative-value
+   * scanner (IV skew fit + monotonic / no-arb checks).
+   */
+  private readonly rvScanner: RelativeValueScannerService | undefined;
+  /** Last successful RV scan timestamp — gates the 5-minute cadence. */
+  private lastRvScanAt = 0;
 
   private symbolState: Map<string, SymbolState> = new Map();
   private candleCache: Map<string, Candle[]> = new Map();
@@ -139,9 +147,9 @@ export class SignalEngine {
   private autoTradingEnabled = true;
   private mode: 'demo' | 'live' = 'demo';
 
-  constructor(settings?: AccountSettings, tracker?: PnlTracker, otmScanner?: OtmMispricingService) {
+  constructor(settings?: AccountSettings, tracker?: PnlTracker, rvScanner?: RelativeValueScannerService) {
     this.tracker = tracker;
-    this.otmScanner = otmScanner;
+    this.rvScanner = rvScanner;
     this.mode = settings?.mode === 'live' ? 'live' : 'demo';
     // Demo state is always loaded internally so a live → demo switch can
     // restore positions, equity, and dailyPnl without rebasing to the default
@@ -434,11 +442,13 @@ export class SignalEngine {
           this.recentSignals.unshift(signal);
           if (this.recentSignals.length > MAX_SIGNALS) this.recentSignals.pop();
 
-          // Auto-open equity paper position
+          // Auto-open equity paper position. Stock options for the same equity
+          // signal are NOT auto-opened anymore (TRA-191): the only enabled
+          // stock-options strategy is the relative-value scanner, which runs
+          // on its own 5-minute cadence below. Equity / share trading still
+          // fires off the established ORB/Reversal/MACD/BB/Ichimoku signals.
           const pos = this.account.openPosition(signal, price);
           if (pos) this.positionSignalType.set(pos.id, signal.type);
-          // Auto-open options paper position (call for buy, put for sell)
-          this.optionsAccount.openOption(signal, price);
 
           // Record signal for daily accuracy tracking
           this.dailySignals.push({
@@ -454,13 +464,14 @@ export class SignalEngine {
       }
     }
 
-    // TRA-159: periodic OTM mispricing scan (long-only `cheap` candidates).
-    // Gated to market hours and the scanner-configured cadence so we never
-    // burn the Tradier rate-limit on after-hours noise.
-    if (this.autoTradingEnabled && !this.riskGovernor.isHalted() && this.otmScanner && isStockMarketOpen()) {
-      if (Date.now() - this.lastOtmScanAt >= OTM_SCAN_INTERVAL_MS) {
-        this.lastOtmScanAt = Date.now();
-        await this.runOtmScan(activeSymbols);
+    // TRA-191: relative-value scanner — the sole stock-options strategy in
+    // this iteration. Routes the highest-scoring `cheap` candidate per symbol
+    // into the options account as a long premium ticket. Gated to market
+    // hours so we don't burn the Tradier rate-limit on after-hours noise.
+    if (this.autoTradingEnabled && !this.riskGovernor.isHalted() && this.rvScanner && isStockMarketOpen()) {
+      if (Date.now() - this.lastRvScanAt >= RV_SCAN_INTERVAL_MS) {
+        this.lastRvScanAt = Date.now();
+        await this.runRelativeValueScan(activeSymbols);
       }
     }
 
@@ -468,23 +479,27 @@ export class SignalEngine {
   }
 
   /**
-   * Look up live marks for every open OTM position via the scanner's cached
-   * chain snapshot. Returns an empty map when no scanner is wired or there
-   * are no OTM positions, so callers can pass it through unconditionally.
+   * Look up live marks for every open RV / OTM position via the scanner's
+   * cached chain snapshot (TRA-191). Returns an empty map when no scanner is
+   * wired or there are no eligible positions, so callers can pass it through
+   * unconditionally to `checkExits`.
    */
   private async refreshOptionMarks(): Promise<Map<string, number>> {
     const marks = new Map<string, number>();
-    if (!this.otmScanner) return marks;
+    if (!this.rvScanner) return marks;
 
     const open = this.optionsAccount.getState().openOptions.filter(
-      (o) => o.signalType === 'otm_mispricing' && o.optionSymbol && o.expiration,
+      (o) =>
+        (o.signalType === 'relative_value' || o.signalType === 'otm_mispricing') &&
+        o.optionSymbol &&
+        o.expiration,
     );
     if (open.length === 0) return marks;
 
     await Promise.all(
       open.map(async (o) => {
         try {
-          const mark = await this.otmScanner!.getOptionMark(o.symbol, o.expiration!, o.optionSymbol!);
+          const mark = await this.rvScanner!.getOptionMark(o.symbol, o.expiration!, o.optionSymbol!);
           if (mark != null && mark > 0) marks.set(o.optionSymbol!, mark);
         } catch (err: unknown) {
           console.warn(`[signal-engine] getOptionMark(${o.optionSymbol}) failed: ${err instanceof Error ? err.message : String(err)}`);
@@ -495,33 +510,37 @@ export class SignalEngine {
   }
 
   /**
-   * Scan each active-interest symbol for cheap OTM candidates and route the
-   * highest-conviction one per symbol into the options account as an
-   * `otm_mispricing` signal. Long-only — `expensive` candidates are ignored
-   * (they need a multi-leg short model that's deliberately out of scope).
-   * Errors per-symbol are swallowed so a single Tradier hiccup doesn't take
-   * down the whole tick.
+   * Scan each active-interest symbol for relative-value mispricings and route
+   * the highest-scoring `cheap` candidate per symbol into the options account
+   * as a long-premium `relative_value` ticket. Expensive candidates are
+   * ignored — short legs require a defined-risk-spread model that's
+   * deliberately out of scope for this iteration. Errors per-symbol are
+   * swallowed so one Tradier hiccup doesn't take down the whole tick.
    */
-  private async runOtmScan(activeSymbols: string[]): Promise<void> {
-    if (!this.otmScanner) return;
+  private async runRelativeValueScan(activeSymbols: string[]): Promise<void> {
+    if (!this.rvScanner) return;
 
     for (const sym of activeSymbols) {
       try {
-        const result = await this.otmScanner.scan(sym);
+        const result = await this.rvScanner.scan(sym);
         if (result.reason !== 'ok' || result.candidates.length === 0) continue;
 
-        // Route only the most-mispriced cheap candidate per symbol per scan.
-        // The scanner already sorts by |mispricingPct| so the first cheap one
-        // is the strongest read.
-        const cheap = result.candidates.find((c) => c.classification === 'cheap');
+        // The scanner already ranks by composite score — pick the strongest
+        // long-only opportunity. We accept `cheap` IV outliers and
+        // `below_intrinsic` no-arb errors (also a cheap-vs-fair signal). We
+        // skip `expensive` and `monotonic_violation` here since taking the
+        // short leg requires a defined-risk spread.
+        const cheap = result.candidates.find(
+          (c) => c.classification === 'cheap' || c.classification === 'below_intrinsic',
+        );
         if (!cheap) continue;
 
         const stopLoss = cheap.mark * 0.75;
         const takeProfit = cheap.mark * 1.5;
-        const signal: OtmMispricingSignal = {
+        const signal: RelativeValueSignal = {
           id: randomUUID(),
           symbol: sym,
-          type: 'otm_mispricing',
+          type: 'relative_value',
           side: 'buy',
           entryPrice: cheap.mark,
           stopLoss,
@@ -533,21 +552,25 @@ export class SignalEngine {
           strike: cheap.strike,
           expiration: cheap.expiration,
           mark: cheap.mark,
-          theo: cheap.theo,
+          fairPrice: cheap.fairPrice,
           mispricingPct: cheap.mispricingPct,
+          zScore: cheap.zScore,
+          ivFitted: cheap.ivFitted,
+          ivUsed: cheap.ivUsed,
           delta: cheap.delta,
+          reason: cheap.reason,
         };
 
-        // Dedup: same OCC fired in the last hour — avoid re-spamming the
-        // signal feed when the chain stays cheap across multiple scans.
+        // Dedup: same OCC fired in the last hour — avoid re-spamming the feed
+        // when the chain stays cheap across multiple scans.
         const recentDup = this.recentSignals.find(
-          (s) => s.type === 'otm_mispricing'
-            && (s as OtmMispricingSignal).optionSymbol === cheap.optionSymbol
+          (s) => s.type === 'relative_value'
+            && (s as RelativeValueSignal).optionSymbol === cheap.optionSymbol
             && Date.now() - s.timestamp < 60 * 60_000,
         );
         if (recentDup) continue;
 
-        const opened = this.optionsAccount.openOptionFromCandidate(signal);
+        const opened = this.optionsAccount.openOptionFromRvCandidate(signal);
         if (!opened) continue;
 
         this.recentSignals.unshift(signal);
@@ -555,11 +578,11 @@ export class SignalEngine {
         this.dailySignals.push({
           id: signal.id,
           symbol: signal.symbol,
-          type: 'otm_mispricing',
+          type: 'relative_value',
           firedAt: signal.timestamp,
         });
       } catch (err: unknown) {
-        console.warn(`[signal-engine] OTM scan(${sym}) failed: ${err instanceof Error ? err.message : String(err)}`);
+        console.warn(`[signal-engine] RV scan(${sym}) failed: ${err instanceof Error ? err.message : String(err)}`);
       }
     }
   }

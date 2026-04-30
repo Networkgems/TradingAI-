@@ -11,7 +11,8 @@ export type SignalType =
   | 'ichimoku'
   | 'scalping'
   | 'swing_trade'
-  | 'otm_mispricing';
+  | 'otm_mispricing'
+  | 'relative_value'; // TRA-191: options chain relative-value scanner (IV skew + monotonic + no-arb)
 export type OptionType = 'call' | 'put';
 
 export interface Candle {
@@ -59,6 +60,40 @@ export interface OtmMispricingSignal extends TradeSignal {
   mispricingPct: number;
   /** Sign-adjusted Black-Scholes delta from the scanner. */
   delta: number;
+}
+
+/**
+ * Signal emitted by the options chain relative-value scanner (TRA-191).
+ * Long-only entry when a contract trades cheap relative to its same-expiration
+ * IV skew — short legs are deferred to a future defined-risk-spread iteration.
+ *
+ * `entryPrice` is the per-share mark; the option-specific fields ride along on
+ * the same record so `PaperOptionsAccount.openOptionFromRvCandidate` can
+ * sticker the position with the OCC symbol, strike, and fair-value reference.
+ */
+export interface RelativeValueSignal extends TradeSignal {
+  type: 'relative_value';
+  side: 'buy';
+  optionSymbol: string;
+  optionType: OptionType;
+  strike: number;
+  expiration: string;
+  /** Per-share mid (entry premium). */
+  mark: number;
+  /** Black-Scholes price built from the fitted skew IV. */
+  fairPrice: number;
+  /** (mark − fairPrice) / fairPrice. Negative for cheap candidates. */
+  mispricingPct: number;
+  /** IV residual versus fitted skew, in standard deviations. */
+  zScore: number;
+  /** σ predicted by the fitted skew at this strike. */
+  ivFitted: number;
+  /** σ used for this row (Tradier mid IV / smvVol / BS-implied fallback). */
+  ivUsed: number;
+  /** Sign-adjusted Black-Scholes delta at the fitted IV. */
+  delta: number;
+  /** Free-text reason mirrored from the scanner — surfaces in the UI feed. */
+  reason: string;
 }
 
 export interface Position {
@@ -218,6 +253,46 @@ export const OTM_RISK_PARAMS: OtmRiskParams = {
   trailOffsetPct: OTM_OPTIONS_TRAIL_OFFSET_PCT,
   partialExitRatio: OTM_OPTIONS_PARTIAL_EXIT_RATIO,
   dailyLimit: OTM_OPTIONS_DAILY_LIMIT,
+};
+
+// ── Relative-value scanner risk overrides (TRA-191) ─────────────────────────
+//
+// Long-only RV entries: pay a cheap mid premium against the fitted skew, exit
+// when the residual collapses (target) or runs further away (stop). Cheap-vs-
+// curve trades have a different distribution from far-OTM lottery tickets:
+//   • most candidates land at moderate moneyness, not deep-OTM tails
+//   • theo edge ≈ |(mark − fair)| dollars per share is the expected payoff
+//   • winners tend to be 30–80% gains, not 10x lottery wins
+//
+// We size smaller than ATM directional plays (richer alpha density per ticket)
+// and run a tighter stop than OTM far-tail tickets. Daily limit is split out
+// so RV doesn't compete with ATM directional or OTM tail slots.
+export const RV_OPTIONS_BUDGET_RATIO = 0.03;        // 3% of managed equity per RV ticket
+export const RV_OPTIONS_SL_PCT = 0.25;              // tighter than OTM, looser than ATM
+export const RV_OPTIONS_TP1_PCT = 0.40;             // partial-take when residual half-collapses
+export const RV_OPTIONS_TRAIL_ACTIVATE_PCT = 0.25;  // engage trailing at +25%
+export const RV_OPTIONS_TRAIL_OFFSET_PCT = 0.15;
+export const RV_OPTIONS_PARTIAL_EXIT_RATIO = 0.5;
+export const RV_OPTIONS_DAILY_LIMIT = 4;
+
+export interface RvRiskParams {
+  budgetRatio: number;
+  slPct: number;
+  tp1Pct: number;
+  trailActivatePct: number;
+  trailOffsetPct: number;
+  partialExitRatio: number;
+  dailyLimit: number;
+}
+
+export const RV_RISK_PARAMS: RvRiskParams = {
+  budgetRatio: RV_OPTIONS_BUDGET_RATIO,
+  slPct: RV_OPTIONS_SL_PCT,
+  tp1Pct: RV_OPTIONS_TP1_PCT,
+  trailActivatePct: RV_OPTIONS_TRAIL_ACTIVATE_PCT,
+  trailOffsetPct: RV_OPTIONS_TRAIL_OFFSET_PCT,
+  partialExitRatio: RV_OPTIONS_PARTIAL_EXIT_RATIO,
+  dailyLimit: RV_OPTIONS_DAILY_LIMIT,
 };
 
 // Market regime thresholds (ADX-based)
@@ -428,7 +503,8 @@ export interface EodTradeEntry {
     | 'Ichimoku'
     | 'Scalping'
     | 'Swing'
-    | 'OTM';
+    | 'OTM'
+    | 'RV';          // TRA-191 — relative-value scanner
   side: Side;
   entryPrice: number;
   exitPrice: number;

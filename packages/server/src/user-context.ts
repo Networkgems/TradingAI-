@@ -6,7 +6,7 @@ import { fileURLToPath } from 'url';
 import { SignalEngine } from './signal-engine.js';
 import { CryptoSignalEngine } from './crypto-engine.js';
 import { PnlTracker } from './pnl-tracker.js';
-import type { OtmMispricingService } from './options-scanner.js';
+import type { RelativeValueScannerService } from './relative-value-scanner.js';
 import {
   loadSettings,
   clearSettingsCache,
@@ -61,14 +61,14 @@ export interface UserContext {
 
 const contexts = new Map<string, UserContext>();
 
-// TRA-159 — server-wide OTM scanner instance shared across all per-user
-// SignalEngines. Set once at server boot via `setOtmScanner` before any
-// contexts are constructed; left undefined when Tradier creds are missing,
-// in which case the engines run without OTM scanning.
-let sharedOtmScanner: OtmMispricingService | undefined;
+// TRA-191 — server-wide relative-value scanner instance shared across all
+// per-user SignalEngines. Set once at server boot via `setRvScanner` before
+// any contexts are constructed; left undefined when Tradier creds are
+// missing, in which case the engines run without options scanning.
+let sharedRvScanner: RelativeValueScannerService | undefined;
 
-export function setOtmScanner(svc: OtmMispricingService | undefined): void {
-  sharedOtmScanner = svc;
+export function setRvScanner(svc: RelativeValueScannerService | undefined): void {
+  sharedRvScanner = svc;
 }
 
 export function getAllUserContexts(): UserContext[] {
@@ -190,7 +190,7 @@ async function createUserContext(username: string): Promise<UserContext> {
     settings.mode === 'live' ? 0 : (settings.demoEquityCrypto ?? settings.demoEquity),
   );
 
-  const engine = new SignalEngine(settings, tracker, sharedOtmScanner);
+  const engine = new SignalEngine(settings, tracker, sharedRvScanner);
   const cryptoEngine = new CryptoSignalEngine(cryptoTracker, settings);
 
   // Restore trade history (TRA-140)

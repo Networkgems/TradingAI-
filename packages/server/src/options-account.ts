@@ -1,5 +1,13 @@
 import { randomUUID } from 'crypto';
-import type { TradeSignal, OptionPosition, OptionsAccountState, OtmMispricingSignal, OtmRiskParams } from '@trading-app/shared';
+import type {
+  TradeSignal,
+  OptionPosition,
+  OptionsAccountState,
+  OtmMispricingSignal,
+  OtmRiskParams,
+  RelativeValueSignal,
+  RvRiskParams,
+} from '@trading-app/shared';
 import {
   DEFAULT_ACCOUNT_SETTINGS,
   OPTIONS_BUDGET_RATIO,
@@ -11,6 +19,7 @@ import {
   OPTIONS_TRAIL_OFFSET_PCT,
   OPTIONS_PARTIAL_EXIT_RATIO,
   OTM_RISK_PARAMS,
+  RV_RISK_PARAMS,
   isValidTradingWindow,
 } from '@trading-app/shared';
 
@@ -30,6 +39,11 @@ interface OptionsAccountConfig {
    * to lock in deterministic behaviour without touching the global constants.
    */
   otmRiskParams?: OtmRiskParams;
+  /**
+   * Relative-value scanner risk overrides (TRA-191). When omitted, the account
+   * uses `RV_RISK_PARAMS` from `@trading-app/shared`.
+   */
+  rvRiskParams?: RvRiskParams;
 }
 
 /**
@@ -59,6 +73,9 @@ export class PaperOptionsAccount {
    * for backward-compat with the `OPTIONS_DAILY_LIMIT` cap.
    */
   private dailyOtmCount = 0;
+  /** TRA-191 — relative-value scanner tickets are counted separately. */
+  private dailyRvCount = 0;
+  private rvRiskParams: RvRiskParams;
   private currentDayKey = toDateKey(Date.now());
 
   constructor(config: OptionsAccountConfig = {}) {
@@ -66,6 +83,7 @@ export class PaperOptionsAccount {
     this.managedAccountRatio = config.managedAccountRatio ?? DEFAULT_ACCOUNT_SETTINGS.managedAccountRatio;
     this.dailyTradesLimit = config.dailyTradesLimit ?? DEFAULT_ACCOUNT_SETTINGS.dailyTradesLimit;
     this.otmRiskParams = config.otmRiskParams ?? OTM_RISK_PARAMS;
+    this.rvRiskParams = config.rvRiskParams ?? RV_RISK_PARAMS;
     this.equity = this.initialEquity;
     this.cash = this.initialEquity;
   }
@@ -75,6 +93,7 @@ export class PaperOptionsAccount {
     if (config.managedAccountRatio !== undefined) this.managedAccountRatio = config.managedAccountRatio;
     if (config.dailyTradesLimit !== undefined) this.dailyTradesLimit = config.dailyTradesLimit;
     if (config.otmRiskParams !== undefined) this.otmRiskParams = config.otmRiskParams;
+    if (config.rvRiskParams !== undefined) this.rvRiskParams = config.rvRiskParams;
     this.equity = this.initialEquity;
     this.cash = this.initialEquity;
     this.openOptions.clear();
@@ -82,6 +101,7 @@ export class PaperOptionsAccount {
     this.optionsPnl = 0;
     this.dailyCount = 0;
     this.dailyOtmCount = 0;
+    this.dailyRvCount = 0;
     this.currentDayKey = toDateKey(Date.now());
   }
 
@@ -89,6 +109,7 @@ export class PaperOptionsAccount {
     if (config.managedAccountRatio !== undefined) this.managedAccountRatio = config.managedAccountRatio;
     if (config.dailyTradesLimit !== undefined) this.dailyTradesLimit = config.dailyTradesLimit;
     if (config.otmRiskParams !== undefined) this.otmRiskParams = config.otmRiskParams;
+    if (config.rvRiskParams !== undefined) this.rvRiskParams = config.rvRiskParams;
   }
 
   /** Rebase starting equity by the delta, preserving optionsPnl and open/closed positions. */
@@ -106,7 +127,7 @@ export class PaperOptionsAccount {
       closedOptions: [...this.closedOptions].slice(-20),
       optionsPnl: this.optionsPnl,
       optionsCash: this.cash,
-      dailyOptionsCount: this.dailyCount + this.dailyOtmCount,
+      dailyOptionsCount: this.dailyCount + this.dailyOtmCount + this.dailyRvCount,
     };
   }
 
@@ -118,11 +139,16 @@ export class PaperOptionsAccount {
     return this.equity * this.managedAccountRatio * this.otmRiskParams.budgetRatio;
   }
 
+  private rvBudgetPerTrade(): number {
+    return this.equity * this.managedAccountRatio * this.rvRiskParams.budgetRatio;
+  }
+
   private resetDayIfNeeded(): void {
     const today = toDateKey(Date.now());
     if (today !== this.currentDayKey) {
       this.dailyCount = 0;
       this.dailyOtmCount = 0;
+      this.dailyRvCount = 0;
       this.currentDayKey = today;
     }
   }
@@ -193,6 +219,74 @@ export class PaperOptionsAccount {
       openedAt: Date.now(),
       signalId: signal.id,
       signalType: 'otm_mispricing',
+    };
+
+    this.openOptions.set(position.id, position);
+    return position;
+  }
+
+  /**
+   * Open a long contract from a relative-value scanner candidate (TRA-191).
+   * Mirrors {@link openOptionFromCandidate} but uses the RV-specific risk
+   * bundle (`rvRiskParams`) so cheap-vs-curve tickets get their own SL/TP/
+   * trail schedule and don't fight OTM tail trades for daily slots.
+   *
+   * Returns `null` and consumes nothing when:
+   *   • outside a valid trading window
+   *   • daily RV cap reached
+   *   • a position already exists for the same OCC symbol
+   *   • sized contracts ≤ 0 or budget exceeded
+   */
+  openOptionFromRvCandidate(signal: RelativeValueSignal): OptionPosition | null {
+    this.resetDayIfNeeded();
+
+    if (!isValidTradingWindow(Date.now())) return null;
+    if (this.dailyRvCount >= this.rvRiskParams.dailyLimit) return null;
+
+    const existing = Array.from(this.openOptions.values()).find(
+      o => o.optionSymbol === signal.optionSymbol,
+    );
+    if (existing) return null;
+
+    const premiumPaid = signal.mark;
+    if (!Number.isFinite(premiumPaid) || premiumPaid <= 0) return null;
+
+    const budget = this.rvBudgetPerTrade();
+    const costPerContract = premiumPaid * 100;
+    const contracts = Math.floor(budget / costPerContract);
+    if (contracts <= 0) return null;
+
+    const totalCost = contracts * costPerContract;
+    if (totalCost > this.cash) return null;
+
+    this.cash -= totalCost;
+    this.dailyRvCount += 1;
+
+    const tp1Premium = premiumPaid * (1 + this.rvRiskParams.tp1Pct);
+    const stopLossPremium = premiumPaid * (1 - this.rvRiskParams.slPct);
+    const trailActivatePremium = premiumPaid * (1 + this.rvRiskParams.trailActivatePct);
+
+    const position: OptionPosition = {
+      id: randomUUID(),
+      symbol: signal.symbol,
+      optionSymbol: signal.optionSymbol,
+      optionType: signal.optionType,
+      strike: signal.strike,
+      expiration: signal.expiration,
+      contracts,
+      contractsRemaining: contracts,
+      premiumPaid,
+      currentPremium: premiumPaid,
+      tp1Premium,
+      tp1Hit: false,
+      stopLossPremium,
+      peakPremium: premiumPaid,
+      trailingActive: false,
+      trailingStopPremium: trailActivatePremium,
+      underlyingEntryPrice: signal.entryPrice,
+      openedAt: Date.now(),
+      signalId: signal.id,
+      signalType: 'relative_value',
     };
 
     this.openOptions.set(position.id, position);
@@ -282,10 +376,10 @@ export class PaperOptionsAccount {
       let mark: number;
       if (typeof liveMark === 'number' && liveMark > 0) {
         mark = liveMark;
-      } else if (opt.signalType === 'otm_mispricing') {
-        // OTM positions are mark-driven. Without a fresh chain snapshot we'd
-        // have no honest way to update them, so wait for the next tick rather
-        // than synthesise a fake mark off the underlying delta.
+      } else if (opt.signalType === 'otm_mispricing' || opt.signalType === 'relative_value') {
+        // OTM and RV positions are mark-driven. Without a fresh chain snapshot
+        // we'd have no honest way to update them, so wait for the next tick
+        // rather than synthesise a fake mark off the underlying delta.
         continue;
       } else {
         const currentUnderlying = underlyingPrices.get(opt.symbol);
@@ -296,12 +390,24 @@ export class PaperOptionsAccount {
       }
 
       // OTM positions follow the OTM_RISK_PARAMS trail/partial schedule;
-      // ATM legacy paths stay on OPTIONS_* constants so existing behaviour
-      // is unchanged for non-OTM tickets.
-      const isOtm = opt.signalType === 'otm_mispricing';
-      const trailActivatePct = isOtm ? this.otmRiskParams.trailActivatePct : OPTIONS_TRAIL_ACTIVATE_PCT;
-      const trailOffsetPct = isOtm ? this.otmRiskParams.trailOffsetPct : OPTIONS_TRAIL_OFFSET_PCT;
-      const partialExitRatio = isOtm ? this.otmRiskParams.partialExitRatio : OPTIONS_PARTIAL_EXIT_RATIO;
+      // RV positions follow RV_RISK_PARAMS (TRA-191); ATM legacy paths stay on
+      // OPTIONS_* constants so existing behaviour is unchanged for those tickets.
+      let trailActivatePct: number;
+      let trailOffsetPct: number;
+      let partialExitRatio: number;
+      if (opt.signalType === 'otm_mispricing') {
+        trailActivatePct = this.otmRiskParams.trailActivatePct;
+        trailOffsetPct = this.otmRiskParams.trailOffsetPct;
+        partialExitRatio = this.otmRiskParams.partialExitRatio;
+      } else if (opt.signalType === 'relative_value') {
+        trailActivatePct = this.rvRiskParams.trailActivatePct;
+        trailOffsetPct = this.rvRiskParams.trailOffsetPct;
+        partialExitRatio = this.rvRiskParams.partialExitRatio;
+      } else {
+        trailActivatePct = OPTIONS_TRAIL_ACTIVATE_PCT;
+        trailOffsetPct = OPTIONS_TRAIL_OFFSET_PCT;
+        partialExitRatio = OPTIONS_PARTIAL_EXIT_RATIO;
+      }
 
       opt.currentPremium = mark;
 
@@ -391,6 +497,7 @@ export class PaperOptionsAccount {
     optionsPnl: number;
     dailyCount: number;
     dailyOtmCount?: number;
+    dailyRvCount?: number;
     currentDayKey: string;
     cash: number;
     equity: number;
@@ -401,6 +508,7 @@ export class PaperOptionsAccount {
       optionsPnl: this.optionsPnl,
       dailyCount: this.dailyCount,
       dailyOtmCount: this.dailyOtmCount,
+      dailyRvCount: this.dailyRvCount,
       currentDayKey: this.currentDayKey,
       cash: this.cash,
       equity: this.equity,
@@ -415,6 +523,8 @@ export class PaperOptionsAccount {
     dailyCount: number;
     /** Added in TRA-160 — older snapshots don't have it; default to 0. */
     dailyOtmCount?: number;
+    /** Added in TRA-191 — older snapshots don't have it; default to 0. */
+    dailyRvCount?: number;
     currentDayKey: string;
     cash: number;
     equity: number;
@@ -425,6 +535,7 @@ export class PaperOptionsAccount {
     this.optionsPnl = snap.optionsPnl;
     this.dailyCount = snap.dailyCount;
     this.dailyOtmCount = snap.dailyOtmCount ?? 0;
+    this.dailyRvCount = snap.dailyRvCount ?? 0;
     this.currentDayKey = snap.currentDayKey;
     this.cash = snap.cash;
     this.equity = snap.equity;

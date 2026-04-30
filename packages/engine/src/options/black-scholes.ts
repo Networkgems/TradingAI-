@@ -86,3 +86,59 @@ export function daysToExpiration(expirationIsoDate: string, nowMs = Date.now()):
   if (!Number.isFinite(expMs)) return 0;
   return Math.max(0, (expMs - nowMs) / (24 * 60 * 60 * 1000));
 }
+
+export interface ImpliedVolInputs extends Omit<BlackScholesInputs, 'volatility'> {
+  /** Observed market price (per-share premium). */
+  marketPrice: number;
+  /** Initial guess for σ (default 0.30). */
+  initialGuess?: number;
+  /** Stop when |bsPrice − marketPrice| < tolerance (default 1e-5). */
+  tolerance?: number;
+  /** Max Newton iterations before giving up (default 50). */
+  maxIterations?: number;
+}
+
+/**
+ * Solve for σ such that `blackScholesPrice(... σ)` ≈ `marketPrice` using
+ * Newton-Raphson on vega. Returns `null` when the price is below intrinsic
+ * (no real σ exists), when iteration diverges, or when the input is degenerate.
+ *
+ * Used by the relative-value scanner as a fallback when Tradier omits both
+ * `mid_iv` and `smv_vol` for a row but we still have a usable bid/ask.
+ */
+export function bsImpliedVolatility(inputs: ImpliedVolInputs): number | null {
+  const { spot, strike, timeToExpiryYears: T, riskFreeRate: r, optionType, marketPrice } = inputs;
+  const q = inputs.dividendYield ?? 0;
+
+  if (!Number.isFinite(marketPrice) || marketPrice <= 0) return null;
+  if (spot <= 0 || strike <= 0 || T <= 0) return null;
+
+  // Below-intrinsic prices have no real implied vol — let the caller flag it.
+  const intrinsic =
+    optionType === 'call'
+      ? Math.max(0, spot * Math.exp(-q * T) - strike * Math.exp(-r * T))
+      : Math.max(0, strike * Math.exp(-r * T) - spot * Math.exp(-q * T));
+  if (marketPrice < intrinsic - 1e-6) return null;
+
+  const tol = inputs.tolerance ?? 1e-5;
+  const maxIter = inputs.maxIterations ?? 50;
+  let sigma = inputs.initialGuess ?? 0.3;
+
+  for (let i = 0; i < maxIter; i += 1) {
+    const price = blackScholesPrice({ ...inputs, volatility: sigma });
+    const diff = price - marketPrice;
+    if (Math.abs(diff) < tol) {
+      return sigma > 0 ? sigma : null;
+    }
+    // Vega = S * exp(-qT) * φ(d1) * sqrt(T). Closed-form, derivative of price wrt σ.
+    const sqrtT = Math.sqrt(T);
+    const d1 = (Math.log(spot / strike) + (r - q + 0.5 * sigma * sigma) * T) / (sigma * sqrtT);
+    const phi = Math.exp(-0.5 * d1 * d1) / Math.sqrt(2 * Math.PI);
+    const vega = spot * Math.exp(-q * T) * phi * sqrtT;
+    if (!Number.isFinite(vega) || vega < 1e-8) return null;
+    sigma -= diff / vega;
+    if (!Number.isFinite(sigma) || sigma <= 0) return null;
+    if (sigma > 5) sigma = 5; // clamp to avoid runaway during early iterations
+  }
+  return null;
+}

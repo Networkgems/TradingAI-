@@ -44,6 +44,7 @@ function strategyLabel(t: SignalType): EodTradeEntry['strategy'] {
     case 'scalping': return 'Scalping';
     case 'swing_trade': return 'Swing';
     case 'otm_mispricing': return 'OTM';
+    case 'relative_value': return 'RV';
   }
 }
 

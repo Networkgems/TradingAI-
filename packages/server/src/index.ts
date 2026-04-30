@@ -33,7 +33,7 @@ import {
 } from './users.js';
 import { sendPasswordResetEmail } from './email.js';
 import { rotateBackups, checkDataDirHealth } from './trade-store.js';
-import { TradierOtmMispricingService } from './options-scanner.js';
+import { TradierRelativeValueScannerService } from './relative-value-scanner.js';
 import { CoinbaseOrderClient } from '@trading-app/engine';
 import { fetchQuotes } from './yahoo-feed.js';
 import {
@@ -46,7 +46,7 @@ import {
   tryGetUserContext,
   persistStocksNow,
   persistCryptoNow,
-  setOtmScanner,
+  setRvScanner,
   type UserContext,
 } from './user-context.js';
 import type { AccountSettings } from '@trading-app/shared';
@@ -62,13 +62,15 @@ await checkDataDirHealth();
 await loadUsers();
 initResetTokenStore(DATA_DIR);
 
-// TRA-158/TRA-159 — server-side OTM mispricing scanner. Disabled
-// (no_credentials) until TRADIER_API_TOKEN + TRADIER_ACCOUNT_ID are
-// configured. Wired into user-context BEFORE any contexts are constructed so
-// every per-user SignalEngine sees the same scanner instance and shares the
-// 60s chain cache + 1h breaker. Uses Yahoo's existing quote pipeline as the
-// spot source so we don't pay for Tradier quotes too.
-const otmMispricingService = new TradierOtmMispricingService({
+// TRA-191 — server-side relative-value scanner. The only options strategy
+// active for stock options in this iteration; OTM mispricing and per-equity
+// ATM auto-open are disabled. Disabled (no_credentials) until
+// TRADIER_API_TOKEN + TRADIER_ACCOUNT_ID are configured. Wired into
+// user-context BEFORE any contexts are constructed so every per-user
+// SignalEngine sees the same scanner instance and shares the 60s chain
+// cache + 1h breaker. Uses Yahoo's existing quote pipeline as the spot
+// source so we don't pay for Tradier quotes too.
+const relativeValueScannerService = new TradierRelativeValueScannerService({
   tradierApiToken: process.env['TRADIER_API_TOKEN'],
   tradierAccountId: process.env['TRADIER_ACCOUNT_ID'],
   tradierEnv: (process.env['TRADIER_ENV'] as 'sandbox' | 'production') ?? 'sandbox',
@@ -78,7 +80,9 @@ const otmMispricingService = new TradierOtmMispricingService({
     return q && q.price > 0 ? q.price : null;
   },
 });
-setOtmScanner(otmMispricingService.diagnostics().configured ? otmMispricingService : undefined);
+setRvScanner(
+  relativeValueScannerService.diagnostics().configured ? relativeValueScannerService : undefined,
+);
 
 // TRA-142 — migrate legacy global files into the admin namespace exactly once,
 // then bootstrap per-user contexts (engines, trackers, persistence timers) for
@@ -247,32 +251,31 @@ app.get('/api/health', (_req, res) => {
   res.json({ ok: true, time: new Date().toISOString() });
 });
 
-// TRA-158 — surface live OTM mispricing scan output. Read-only, gated by auth.
+// TRA-191 — surface live relative-value scan output. Read-only, gated by auth.
 // Returns up to `limit` ranked candidates and the diagnostics block so QA can
 // see whether the breaker is open / cache is warm without needing server logs.
-app.get('/api/options/otm-mispricing', requireAuth, async (req, res) => {
+app.get('/api/options/relative-value', requireAuth, async (req, res) => {
   const symbol = typeof req.query['symbol'] === 'string' ? req.query['symbol'] : '';
   if (!symbol) {
     res.status(400).json({ error: 'symbol query parameter is required' });
     return;
   }
   const limit = Math.max(1, Math.min(50, Number(req.query['limit'] ?? 10)));
-  const minMispricing = req.query['minMispricing'] != null
-    ? Number(req.query['minMispricing'])
-    : undefined;
+  const zRaw = req.query['minZ'];
+  const minZ = typeof zRaw === 'string' && zRaw.length > 0 ? Number(zRaw) : undefined;
 
-  const result = await otmMispricingService.scan(symbol, {
-    mispricingThresholdPct: Number.isFinite(minMispricing) ? Number(minMispricing) : undefined,
+  const result = await relativeValueScannerService.scan(symbol, {
+    zScoreThreshold: Number.isFinite(minZ) ? Number(minZ) : undefined,
   });
   res.json({
     ...result,
     candidates: result.candidates.slice(0, limit),
-    diagnostics: otmMispricingService.diagnostics(),
+    diagnostics: relativeValueScannerService.diagnostics(),
   });
 });
 
 app.get('/api/health/options-mispricing', (_req, res) => {
-  res.json(otmMispricingService.diagnostics());
+  res.json(relativeValueScannerService.diagnostics());
 });
 
 // TRA-141 — storage diagnostic so QA can verify from outside the box that the
