@@ -700,9 +700,16 @@ export default function SettingsPage({ token, httpUrl, context, onModeChange }: 
   async function handleResetDemo() {
     setResetPending(true);
     try {
+      // Scope the reset to the dashboard the user is viewing (TRA-192) so
+      // resetting Stocks does not wipe Crypto and vice versa. The global
+      // settings page (context undefined) still resets both engines.
       await fetch(`${httpUrl}/api/account/reset-demo`, {
         method: 'POST',
-        headers: { Authorization: `Bearer ${token}` },
+        headers: {
+          Authorization: `Bearer ${token}`,
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify(context ? { market: context } : {}),
       });
     } finally {
       setResetPending(false);

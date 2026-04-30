@@ -654,16 +654,30 @@ app.put('/api/account/settings', requireAuth, async (req, res) => {
   res.json({ ok: true, settings: updated });
 });
 
-app.post('/api/account/reset-demo', requireAuth, async (_req, res) => {
+// Per-market scope (TRA-192): Stockdashboard and Cryptodashboard each have
+// their own "Reset Demo Account" button, and resetting one must not wipe the
+// other. The optional `market` body field selects which engine to reset.
+// Omitting it preserves the legacy "reset both" behavior used by the global
+// settings page where no market context is active.
+app.post('/api/account/reset-demo', requireAuth, async (req, res) => {
   const username = res.locals['authUser'] as string;
   const ctx = await userCtx(res);
   const settings = getSettings(username);
-  ctx.engine.forceReset(settings);
-  const cryptoEquity = settings.demoEquityCrypto ?? settings.demoEquity;
-  ctx.cryptoEngine.forceReset(cryptoEquity);
-  broadcastEngineState(ctx);
-  broadcastCryptoState(ctx);
-  res.json({ ok: true });
+  const market = (req.body as { market?: string } | undefined)?.market;
+  if (market !== undefined && market !== 'stocks' && market !== 'crypto') {
+    res.status(400).json({ error: "market must be 'stocks', 'crypto', or omitted" });
+    return;
+  }
+  if (market === undefined || market === 'stocks') {
+    ctx.engine.forceReset(settings);
+    broadcastEngineState(ctx);
+  }
+  if (market === undefined || market === 'crypto') {
+    const cryptoEquity = settings.demoEquityCrypto ?? settings.demoEquity;
+    ctx.cryptoEngine.forceReset(cryptoEquity);
+    broadcastCryptoState(ctx);
+  }
+  res.json({ ok: true, market: market ?? 'both' });
 });
 
 // ── Trading controls ──────────────────────────────────────────────────────────
