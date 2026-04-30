@@ -414,9 +414,25 @@ export const WATCHLIST: readonly string[] = [
   'AAPL', 'MSFT', 'NVDA', 'GOOGL', 'AMZN',
   'META',  'TSLA', 'AMD',  'NFLX',  'ORCL',
   'INTC',  'QCOM', 'AVGO', 'CRM',   'ADBE',
-  'PYPL',  'SQ',   'SHOP', 'COIN',  'MSTR',
+  // Block Inc. renamed `SQ` → `XYZ` on 2025-01-13; the old ticker is delisted
+  // and Stooq / Tradier 404 on it. Users with `SQ` in a persisted watchlist
+  // are migrated by `aliasWatchlistSymbol` at read time.
+  'PYPL',  'XYZ',  'SHOP', 'COIN',  'MSTR',
   'SPY',   'QQQ',  'IWM',  'DIA',   'XLF',
 ] as const;
+
+/**
+ * Map known stale tickers to their renamed equivalents at read time so users
+ * with the old symbol persisted in their watchlist see live data without
+ * having to manually edit the list.
+ */
+const STOCK_TICKER_ALIASES: Readonly<Record<string, string>> = {
+  SQ: 'XYZ', // Block Inc. ticker change effective 2025-01-13.
+};
+
+export function aliasWatchlistSymbol(symbol: string): string {
+  return STOCK_TICKER_ALIASES[symbol.toUpperCase()] ?? symbol;
+}
 
 export const CRYPTO_WATCHLIST: readonly string[] = [
   'BTC-USD',   'ETH-USD',   'BNB-USD',   'SOL-USD',   'ADA-USD',

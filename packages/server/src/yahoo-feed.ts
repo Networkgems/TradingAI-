@@ -614,6 +614,16 @@ export function isYahooBreakerOpen(): boolean {
   return isRateLimited();
 }
 
+/**
+ * Trip the shared Yahoo rate-limit breaker from another module (e.g. the
+ * crypto feed). Yahoo's 429 is per-IP, so a 429 on crypto quotes means the
+ * stocks branch is also about to get rate-limited; tripping the shared
+ * breaker stops both feeds from hammering YF until the cooldown elapses.
+ */
+export function tripYahooBreakerFromExternal(label: string, msg: string): void {
+  tripBreaker(label, msg);
+}
+
 /** Whether the Tradier circuit breaker is currently open. */
 export function isTradierBreakerOpen(): boolean {
   return isTradierBlocked();

@@ -1,6 +1,6 @@
 import YahooFinance from 'yahoo-finance2';
 import type { Candle, NewsItem } from '@trading-app/shared';
-import { isYahooBreakerOpen, toIsoTime } from './yahoo-feed.js';
+import { isYahooBreakerOpen, toIsoTime, tripYahooBreakerFromExternal } from './yahoo-feed.js';
 
 const yf = new YahooFinance({
   suppressNotices: ['yahooSurvey'],
@@ -27,6 +27,10 @@ function withTimeout<T>(p: Promise<T>, ms: number, label: string): Promise<T> {
 // fall straight through to CMC, instead of burning 8s per symbol on a doomed call.
 function shouldSkipYahoo(): boolean {
   return isYahooBreakerOpen();
+}
+
+function isYahooRateLimitError(msg: string): boolean {
+  return /\b429\b|Too Many Requests|crumb/i.test(msg);
 }
 
 const CMC_API_KEY = process.env.CMC_API_KEY ?? '';
@@ -159,7 +163,15 @@ export async function fetchCryptoQuote(
       }
       console.warn(`[crypto-feed] quote(${symbol}) returned no regularMarketPrice — trying CMC`);
     } catch (err: unknown) {
-      console.warn(`[crypto-feed] quote(${symbol}) YF error: ${err instanceof Error ? err.message : String(err)} — trying CMC`);
+      const msg = err instanceof Error ? err.message : String(err);
+      if (isYahooRateLimitError(msg)) {
+        // 429 is per-IP and applies to the stocks branch too — trip the
+        // shared breaker so subsequent calls (crypto or stocks) skip Yahoo
+        // for the cooldown window instead of hammering it.
+        tripYahooBreakerFromExternal(`crypto quote(${symbol})`, msg);
+      } else {
+        console.warn(`[crypto-feed] quote(${symbol}) YF error: ${msg} — trying CMC`);
+      }
     }
   }
   const cmcResults = await fetchCMCBatchQuotes([symbol]);
@@ -177,8 +189,21 @@ export async function fetchCryptoQuotes(
     failed.push(...symbols);
   } else {
     // Fetch in parallel batches so one slow Yahoo response doesn't stall the whole tick.
+    // First-429 short-circuit: as soon as Yahoo rate-limits us, trip the shared
+    // breaker and route every remaining symbol straight to CMC instead of
+    // burning 8s per call on doomed requests. Per-symbol warns are collapsed
+    // into a single aggregate line so the deploy log doesn't get flooded.
     const QUOTE_BATCH = 5;
+    let yahooBreakerJustTripped = false;
+    let yahooQuoteErrors = 0;
+    let yahooMissingPrice = 0;
+    let firstYahooError: string | null = null;
+
     for (let i = 0; i < symbols.length; i += QUOTE_BATCH) {
+      if (shouldSkipYahoo() || yahooBreakerJustTripped) {
+        for (let j = i; j < symbols.length; j += 1) failed.push(symbols[j]);
+        break;
+      }
       const slice = symbols.slice(i, i + QUOTE_BATCH);
       const settled = await Promise.all(slice.map(async sym => {
         try {
@@ -191,10 +216,16 @@ export async function fetchCryptoQuotes(
               changePct: q.regularMarketChangePercent ?? 0,
             }] as const;
           }
-          console.warn(`[crypto-feed] quote(${sym}) no regularMarketPrice — queuing CMC fallback`);
+          yahooMissingPrice += 1;
           return [sym, null] as const;
         } catch (err: unknown) {
-          console.warn(`[crypto-feed] quote(${sym}) YF error: ${err instanceof Error ? err.message : String(err)} — queuing CMC fallback`);
+          const msg = err instanceof Error ? err.message : String(err);
+          if (isYahooRateLimitError(msg) && !yahooBreakerJustTripped) {
+            yahooBreakerJustTripped = true;
+            tripYahooBreakerFromExternal(`crypto quote(${sym})`, msg);
+          }
+          yahooQuoteErrors += 1;
+          if (!firstYahooError) firstYahooError = msg;
           return [sym, null] as const;
         }
       }));
@@ -204,17 +235,32 @@ export async function fetchCryptoQuotes(
       }
       if (i + QUOTE_BATCH < symbols.length) await sleep(200);
     }
+
+    if (yahooQuoteErrors > 0 || yahooMissingPrice > 0) {
+      const reasons: string[] = [];
+      // Cast: closures in the parallel batch can mutate `firstYahooError`
+      // to a string, but TS's flow analysis can't see across the await
+      // boundary so it keeps the variable narrowed to its initial `null`.
+      const errVal = firstYahooError as string | null;
+      const firstSnippet = errVal != null ? errVal.slice(0, 120) : '';
+      if (yahooQuoteErrors > 0) reasons.push(`${yahooQuoteErrors} errors${firstSnippet ? ` (first: ${firstSnippet})` : ''}`);
+      if (yahooMissingPrice > 0) reasons.push(`${yahooMissingPrice} missing regularMarketPrice`);
+      console.warn(`[crypto-feed] YF quote batch: ${reasons.join(', ')} — routing to CMC`);
+    }
   }
 
   if (failed.length > 0) {
-    console.log(`[crypto-feed] CMC fallback for ${failed.length} symbols: ${failed.join(', ')}`);
+    console.log(`[crypto-feed] CMC fallback for ${failed.length} symbols`);
     const cmcResults = await fetchCMCBatchQuotes(failed);
     for (const [sym, quote] of cmcResults) {
       results.set(sym, quote);
     }
     const stillFailed = failed.filter(s => !cmcResults.has(s));
     if (stillFailed.length > 0) {
-      console.error(`[crypto-feed] fetchCryptoQuotes: ${stillFailed.length} symbols had no data from YF or CMC: ${stillFailed.join(', ')}`);
+      const list = stillFailed.length <= 10
+        ? stillFailed.join(', ')
+        : `${stillFailed.slice(0, 10).join(', ')}, …+${stillFailed.length - 10} more`;
+      console.error(`[crypto-feed] fetchCryptoQuotes: ${stillFailed.length} symbols had no data from YF or CMC: ${list}`);
     }
   }
 

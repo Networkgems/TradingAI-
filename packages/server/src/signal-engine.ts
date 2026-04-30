@@ -1,5 +1,5 @@
 import { OrbStrategy, ReversalStrategy, MacdTrendStrategy, BbFadeStrategy, IchimokuStrategy } from '@trading-app/engine';
-import { WATCHLIST, MANAGED_ACCOUNT_RATIO, MAX_CONSECUTIVE_LOSSES, DAILY_DRAWDOWN_HALT_PCT, isStockMarketOpen } from '@trading-app/shared';
+import { WATCHLIST, MANAGED_ACCOUNT_RATIO, MAX_CONSECUTIVE_LOSSES, DAILY_DRAWDOWN_HALT_PCT, aliasWatchlistSymbol, isStockMarketOpen } from '@trading-app/shared';
 import type { TradeSignal, RelativeValueSignal, Candle, OptionsAccountState, SignalType, Position, AccountSettings, AccountState, NewsItem } from '@trading-app/shared';
 import { fetchMinuteBars, fetchQuotes, fetchStocksNews, isYahooBreakerOpen, setActiveInterestSymbols } from './yahoo-feed.js';
 import { PaperAccount } from './paper-account.js';
@@ -607,23 +607,35 @@ export class SignalEngine {
   }
 
   getActiveSymbols(): string[] {
-    const base = (WATCHLIST as readonly string[]).filter(s => !this.hiddenSymbols.has(s));
-    return [...base, ...Array.from(this.dynamicSymbols).filter(s => !base.includes(s))];
+    // Apply ticker aliases before deduping so persisted user watchlists with
+    // delisted symbols (e.g. SQ → XYZ on 2025-01-13) get live data without
+    // requiring a manual UI edit.
+    const base = (WATCHLIST as readonly string[])
+      .map(aliasWatchlistSymbol)
+      .filter(s => !this.hiddenSymbols.has(s));
+    const dynamic = Array.from(this.dynamicSymbols).map(aliasWatchlistSymbol);
+    return [...base, ...dynamic.filter(s => !base.includes(s))];
   }
 
   addSymbol(symbol: string): void {
-    this.hiddenSymbols.delete(symbol);
-    if (!(WATCHLIST as readonly string[]).includes(symbol)) {
-      this.dynamicSymbols.add(symbol);
+    const aliased = aliasWatchlistSymbol(symbol);
+    this.hiddenSymbols.delete(aliased);
+    if (!(WATCHLIST as readonly string[]).map(aliasWatchlistSymbol).includes(aliased)) {
+      this.dynamicSymbols.add(aliased);
     }
   }
 
   removeSymbol(symbol: string): void {
-    if ((WATCHLIST as readonly string[]).includes(symbol)) {
-      this.hiddenSymbols.add(symbol);
+    const aliased = aliasWatchlistSymbol(symbol);
+    if ((WATCHLIST as readonly string[]).map(aliasWatchlistSymbol).includes(aliased)) {
+      this.hiddenSymbols.add(aliased);
     } else {
+      this.dynamicSymbols.delete(aliased);
+      // Remove the legacy form too so a downstream re-add of the original
+      // symbol doesn't resurrect a stale entry.
       this.dynamicSymbols.delete(symbol);
     }
+    this.symbolState.delete(aliased);
     this.symbolState.delete(symbol);
   }
 
