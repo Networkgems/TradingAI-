@@ -52,3 +52,17 @@ services:
       # cover the symbol. Free tier is 1,000 req/day, 50/hr.
       - key: TIINGO_API_KEY
         sync: false
+      # Tradier API credentials (TRA-191) — required for the options-chain
+      # relative-value scanner to fetch live chains. With these unset the
+      # scanner reports `no_credentials` and the engine simply skips options
+      # scanning (equity / share trading is unaffected). Both must be set in
+      # the Render dashboard; we never commit the values to source.
+      - key: TRADIER_API_TOKEN
+        sync: false
+      - key: TRADIER_ACCOUNT_ID
+        sync: false
+      # `sandbox` (default) or `production`. Use `sandbox` for paper testing
+      # and `production` only when the trading account is confirmed and you
+      # actually want to route real orders.
+      - key: TRADIER_ENV
+        sync: false
