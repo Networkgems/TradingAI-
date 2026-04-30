@@ -6,6 +6,7 @@ import {
   BbFadeStrategy,
   MomentumStrategy,
   BreakoutVolStrategy,
+  MeanReversionCryptoStrategy,
   IchimokuStrategy,
   ScalpingStrategy,
   SwingStrategy,
@@ -178,6 +179,15 @@ export class BacktestRunner {
       ...config.breakoutVolOpts,
       regimeOptions: config.breakoutVolOpts?.regimeOptions ?? config.regimeOpts,
     });
+    // TRA-206: mean-reversion is regime-gated to `range` only. Same wiring
+    // shape as breakoutVol — pass `regimeOpts` through so the strategy's
+    // self-classification uses the same hysteresis/threshold config as the
+    // rest of the runner. The router (TRA-208) will eventually drive a shared
+    // detector; until then this keeps configuration consistent.
+    const meanReversion = new MeanReversionCryptoStrategy({
+      ...config.meanReversionOpts,
+      regimeOptions: config.meanReversionOpts?.regimeOptions ?? config.regimeOpts,
+    });
 
     // TRA-169 / TRA-185 / TRA-203: per-fill cost model. Commission charged on
     // entry+exit notional, slippage applied adversely to fill prices. The
@@ -281,6 +291,10 @@ export class BacktestRunner {
       if (config.strategyType === 'breakout_vol' || config.strategyType === 'combined') {
         const b = breakoutVol.evaluate(config.symbol, window);
         if (b) signals.push(b);
+      }
+      if (config.strategyType === 'mean_reversion' || config.strategyType === 'combined') {
+        const m = meanReversion.evaluate(config.symbol, window);
+        if (m) signals.push(m);
       }
       if (config.strategyType === 'ichimoku' || config.strategyType === 'combined') {
         const s = ichimoku.evaluate(config.symbol, window);
