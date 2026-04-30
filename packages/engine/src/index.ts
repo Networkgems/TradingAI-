@@ -19,6 +19,8 @@ export type { RiskManagerOptions } from './risk.js';
 export { PositionManager } from './positions.js';
 export { AlpacaFeed } from './feed/index.js';
 export type { AlpacaFeedEvents } from './feed/index.js';
+export { CoinbaseFeed } from './feed/index.js';
+export type { CoinbaseFeedEvents, CoinbaseFeedOptions } from './feed/index.js';
 export { AlpacaOrderClient } from './alpaca/index.js';
 export type { BracketOrderParams, AlpacaOrderResponse } from './alpaca/index.js';
 export { AlpacaOptionsClient } from './alpaca/index.js';

@@ -7,6 +7,7 @@ Currently supported brokers:
 
 - **Alpaca** (equities + options) — REST orders + WebSocket data feed.
 - **Tradier** (equities + options) — REST orders + polling data feed (Phase 1).
+- **Coinbase** (crypto) — REST orders + Advanced Trade WebSocket data feed.
 
 ## Tradier integration
 
@@ -193,10 +194,56 @@ The cap interacts cleanly with the drawdown brake — both shrink size in
 parallel; sizing is always `min(risk-budget, notional-cap)`. See
 `packages/engine/src/risk.ts` and the `risk.test.ts` cases tagged TRA-178.
 
+## Coinbase integration (TRA-201)
+
+Coinbase Advanced Trade is the crypto broker integration. `CoinbaseFeed`
+mirrors `AlpacaFeed`'s public surface (`bar` / `trade` / `quote` events;
+`start` / `stop` methods) so a strategy can swap data sources without
+changing handlers.
+
+### Environment variables
+
+| Var                    | Required | Notes                                                                        |
+| ---------------------- | -------- | ---------------------------------------------------------------------------- |
+| `COINBASE_API_KEY`     | no       | CDP key name (`organizations/.../apiKeys/...`). When **absent**, the feed runs in public/anonymous mode — market-data channels (`ticker`, `market_trades`, `candles`) work without authentication. |
+| `COINBASE_API_SECRET`  | no       | PEM-encoded EC private key paired with the CDP key. Required only if `COINBASE_API_KEY` is set. HMAC legacy keys are not accepted on the WS endpoint. |
+
+`CoinbaseOrderClient` (REST orders, used by `CryptoLiveAccount`) requires
+both vars and additionally accepts HMAC-flavoured legacy keys; that is
+covered separately by [TRA-153].
+
+### Usage
+
+```ts
+import { CoinbaseFeed } from '@trading-app/engine';
+import { CRYPTO_WATCHLIST } from '@trading-app/shared';
+
+// Public mode — no creds required.
+const feed = new CoinbaseFeed({ symbols: CRYPTO_WATCHLIST });
+
+feed.on('bar', (b) => console.log(b));
+feed.on('trade', (t) => console.log(t));
+feed.on('quote', (q) => console.log(q));
+feed.start();
+```
+
+### Smoke test
+
+```bash
+pnpm --filter @trading-app/engine build
+tsx scripts/crypto-feed-smoke.ts
+```
+
+Subscribes to BTC-USD on the public Advanced Trade WS for 30 seconds and
+prints bars / quotes / trades. Set `COINBASE_API_KEY` / `COINBASE_API_SECRET`
+to exercise the authenticated path.
+
 ## Tests
 
 ```bash
 pnpm --filter @trading-app/engine test
 ```
 
-Network is mocked via `globalThis.fetch = vi.fn()` — no live API calls are made.
+Network is mocked via `globalThis.fetch = vi.fn()` for REST clients; the
+Coinbase WS feed is exercised against an injected `FakeWebSocket` that
+replays canned ticker / trade / candle frames. No live API calls are made.

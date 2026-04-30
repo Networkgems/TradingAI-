@@ -421,6 +421,11 @@ export const WATCHLIST: readonly string[] = [
   'SPY',   'QQQ',  'IWM',  'DIA',   'XLF',
 ] as const;
 
+// TRA-201: explicit alias so callers that need the equities-only set don't have
+// to know that `WATCHLIST` is historically equities. Existing imports of
+// `WATCHLIST` keep working — additive only.
+export const EQUITIES_WATCHLIST = WATCHLIST;
+
 /**
  * Map known stale tickers to their renamed equivalents at read time so users
  * with the old symbol persisted in their watchlist see live data without
