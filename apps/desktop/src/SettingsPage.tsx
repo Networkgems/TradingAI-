@@ -108,6 +108,8 @@ interface SafeUser {
   email: string;
   role: 'admin' | 'user';
   createdAt: string;
+  // TRA-217 — admin lock toggle. Optional for back-compat with old payloads.
+  locked?: boolean;
 }
 
 function ProfileSection({ token, httpUrl }: { token: string; httpUrl: string }) {
@@ -277,6 +279,16 @@ export function UserManagementSection({ token, httpUrl }: { token: string; httpU
   const [editUsernameVal, setEditUsernameVal] = useState('');
   const [editError, setEditError] = useState('');
   const [editing, setEditing] = useState(false);
+  // TRA-217 — admin password set + reset email + lock toggle, scoped to the
+  // user being edited. Each action has its own status string so the UI can
+  // give targeted feedback without one button blocking the others.
+  const [editNewPassword, setEditNewPassword] = useState('');
+  const [pwSetting, setPwSetting] = useState(false);
+  const [pwMessage, setPwMessage] = useState<{ kind: 'ok' | 'err'; text: string } | null>(null);
+  const [resetSending, setResetSending] = useState(false);
+  const [resetMessage, setResetMessage] = useState<{ kind: 'ok' | 'err'; text: string } | null>(null);
+  const [lockBusy, setLockBusy] = useState(false);
+  const [lockMessage, setLockMessage] = useState<{ kind: 'ok' | 'err'; text: string } | null>(null);
 
   async function loadUsers() {
     try {
@@ -338,6 +350,86 @@ export function UserManagementSection({ token, httpUrl }: { token: string; httpU
     setEditEmail(user.email);
     setEditUsernameVal(user.username);
     setEditError('');
+    setEditNewPassword('');
+    setPwMessage(null);
+    setResetMessage(null);
+    setLockMessage(null);
+  }
+
+  async function handleSetPassword() {
+    if (!editUser) return;
+    if (editNewPassword.length < 6) {
+      setPwMessage({ kind: 'err', text: 'Password must be at least 6 characters' });
+      return;
+    }
+    setPwSetting(true);
+    setPwMessage(null);
+    try {
+      const r = await fetch(`${httpUrl}/api/admin/users/${encodeURIComponent(editUser.username)}/password`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${token}` },
+        body: JSON.stringify({ newPassword: editNewPassword }),
+      });
+      const data = await r.json() as { ok?: boolean; error?: string };
+      if (r.ok && data.ok) {
+        setPwMessage({ kind: 'ok', text: 'Password updated' });
+        setEditNewPassword('');
+      } else {
+        setPwMessage({ kind: 'err', text: data.error ?? 'Failed to set password' });
+      }
+    } catch {
+      setPwMessage({ kind: 'err', text: 'Cannot reach server' });
+    } finally {
+      setPwSetting(false);
+    }
+  }
+
+  async function handleSendReset() {
+    if (!editUser) return;
+    setResetSending(true);
+    setResetMessage(null);
+    try {
+      const r = await fetch(`${httpUrl}/api/admin/users/${encodeURIComponent(editUser.username)}/reset-password`, {
+        method: 'POST',
+        headers: { Authorization: `Bearer ${token}` },
+      });
+      const data = await r.json() as { ok?: boolean; message?: string; error?: string };
+      if (r.ok && data.ok) {
+        setResetMessage({ kind: 'ok', text: data.message ?? 'Reset code emailed' });
+      } else {
+        setResetMessage({ kind: 'err', text: data.error ?? 'Failed to send reset email' });
+      }
+    } catch {
+      setResetMessage({ kind: 'err', text: 'Cannot reach server' });
+    } finally {
+      setResetSending(false);
+    }
+  }
+
+  async function handleToggleLock() {
+    if (!editUser) return;
+    const next = !(editUser.locked ?? false);
+    setLockBusy(true);
+    setLockMessage(null);
+    try {
+      const r = await fetch(`${httpUrl}/api/admin/users/${encodeURIComponent(editUser.username)}/lock`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${token}` },
+        body: JSON.stringify({ locked: next }),
+      });
+      const data = await r.json() as { ok?: boolean; locked?: boolean; error?: string };
+      if (r.ok && data.ok) {
+        setEditUser({ ...editUser, locked: data.locked ?? next });
+        setLockMessage({ kind: 'ok', text: next ? 'Account locked' : 'Account unlocked' });
+        await loadUsers();
+      } else {
+        setLockMessage({ kind: 'err', text: data.error ?? 'Failed to update lock state' });
+      }
+    } catch {
+      setLockMessage({ kind: 'err', text: 'Cannot reach server' });
+    } finally {
+      setLockBusy(false);
+    }
   }
 
   async function handleEdit(e: React.FormEvent) {
@@ -382,6 +474,7 @@ export function UserManagementSection({ token, httpUrl }: { token: string; httpU
               <th>Username</th>
               <th>Email</th>
               <th>Role</th>
+              <th>Status</th>
               <th>Created</th>
               <th>Actions</th>
             </tr>
@@ -393,6 +486,11 @@ export function UserManagementSection({ token, httpUrl }: { token: string; httpU
                 <td className="muted">{u.email || '—'}</td>
                 <td>
                   <span className={`role-badge ${u.role}`}>{u.role}</span>
+                </td>
+                <td>
+                  {u.locked
+                    ? <span style={{ color: 'var(--red, #f85149)', fontWeight: 600 }}>Locked</span>
+                    : <span style={{ color: 'var(--green, #3fb950)' }}>Active</span>}
                 </td>
                 <td className="muted">{new Date(u.createdAt).toLocaleDateString()}</td>
                 <td>
@@ -440,6 +538,79 @@ export function UserManagementSection({ token, httpUrl }: { token: string; httpU
                 </button>
               </div>
             </form>
+
+            {/* TRA-217 — admin password actions. Stored passwords are scrypt-hashed
+                and cannot be displayed, but admins can set a new one (with a
+                show/hide toggle) or trigger a self-service reset PIN by email. */}
+            <div style={{ marginTop: '1.5rem', paddingTop: '1rem', borderTop: '1px solid var(--border, #30363d)' }}>
+              <h4 style={{ fontSize: '0.95rem', fontWeight: 600, margin: '0 0 0.5rem' }}>Password</h4>
+              <p className="settings-hint" style={{ margin: '0 0 0.75rem' }}>
+                Stored passwords are hashed and cannot be revealed. Set a new password directly,
+                or email a one-time reset code so the user can pick their own.
+              </p>
+              <div className="settings-field">
+                <label>New password</label>
+                <PasswordInput
+                  value={editNewPassword}
+                  onChange={setEditNewPassword}
+                  autoComplete="new-password"
+                  minLength={6}
+                  disabled={pwSetting}
+                />
+                <span className="field-hint">Minimum 6 characters</span>
+              </div>
+              {pwMessage && (
+                <p style={{ marginTop: '0.5rem', color: pwMessage.kind === 'ok' ? 'var(--green, #3fb950)' : 'var(--red, #f85149)' }}>
+                  {pwMessage.text}
+                </p>
+              )}
+              <div style={{ display: 'flex', gap: '0.5rem', marginTop: '0.75rem', flexWrap: 'wrap' }}>
+                <button
+                  type="button"
+                  className="btn-primary btn-sm"
+                  onClick={handleSetPassword}
+                  disabled={pwSetting || editNewPassword.length < 6}
+                >
+                  {pwSetting ? 'Saving…' : 'Set Password'}
+                </button>
+                <button
+                  type="button"
+                  className="btn-secondary btn-sm"
+                  onClick={handleSendReset}
+                  disabled={resetSending || !editUser.email}
+                  title={editUser.email ? 'Email an 8-digit reset code to this user' : 'User has no email address on file'}
+                >
+                  {resetSending ? 'Sending…' : 'Email Reset Code'}
+                </button>
+              </div>
+              {resetMessage && (
+                <p style={{ marginTop: '0.5rem', color: resetMessage.kind === 'ok' ? 'var(--green, #3fb950)' : 'var(--red, #f85149)' }}>
+                  {resetMessage.text}
+                </p>
+              )}
+            </div>
+
+            <div style={{ marginTop: '1rem', paddingTop: '1rem', borderTop: '1px solid var(--border, #30363d)' }}>
+              <h4 style={{ fontSize: '0.95rem', fontWeight: 600, margin: '0 0 0.5rem' }}>
+                Account status: {editUser.locked ? 'Locked' : 'Active'}
+              </h4>
+              <p className="settings-hint" style={{ margin: '0 0 0.75rem' }}>
+                Locked accounts cannot log in until an admin unlocks them.
+              </p>
+              <button
+                type="button"
+                className={editUser.locked ? 'btn-primary btn-sm' : 'btn-danger btn-sm'}
+                onClick={handleToggleLock}
+                disabled={lockBusy}
+              >
+                {lockBusy ? 'Working…' : editUser.locked ? 'Unlock Account' : 'Lock Account'}
+              </button>
+              {lockMessage && (
+                <p style={{ marginTop: '0.5rem', color: lockMessage.kind === 'ok' ? 'var(--green, #3fb950)' : 'var(--red, #f85149)' }}>
+                  {lockMessage.text}
+                </p>
+              )}
+            </div>
           </div>
         </div>
       )}

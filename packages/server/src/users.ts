@@ -19,6 +19,9 @@ export interface User {
   passwordHash: string;
   role: 'admin' | 'user';
   createdAt: string;
+  // TRA-217 — admins can lock an account; locked users cannot log in until unlocked.
+  // Older users.json files predate this field, so it's optional and defaults to false.
+  locked?: boolean;
 }
 
 export type SafeUser = Omit<User, 'passwordHash'>;
@@ -115,13 +118,26 @@ export function getUserByEmail(email: string): User | undefined {
 }
 
 export function getAllUsers(): SafeUser[] {
-  return users.map(({ passwordHash: _ph, ...safe }) => safe);
+  return users.map(({ passwordHash: _ph, ...safe }) => ({ ...safe, locked: safe.locked ?? false }));
+}
+
+export function isUserLocked(username: string): boolean {
+  const user = getUser(username);
+  return !!user?.locked;
 }
 
 export async function validateUserCredentials(username: string, password: string): Promise<boolean> {
   const user = getUser(username);
   if (!user) return false;
   return verifyPassword(password, user.passwordHash);
+}
+
+export async function setUserLocked(username: string, locked: boolean): Promise<boolean> {
+  const idx = users.findIndex(u => u.username === username);
+  if (idx === -1) return false;
+  users[idx].locked = locked;
+  await persistUsers();
+  return true;
 }
 
 export async function changeUserPassword(username: string, newPassword: string): Promise<boolean> {

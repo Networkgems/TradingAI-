@@ -30,6 +30,8 @@ import {
   createUser,
   updateUser,
   deleteUser,
+  isUserLocked,
+  setUserLocked,
 } from './users.js';
 import { sendPasswordResetEmail } from './email.js';
 import { rotateBackups, checkDataDirHealth } from './trade-store.js';
@@ -360,6 +362,12 @@ app.post('/api/auth/login', async (req, res) => {
     res.status(401).json({ error: 'Invalid username or password' });
     return;
   }
+  // TRA-217 — locked accounts cannot log in even with correct credentials.
+  // Check after credential validation so we don't leak which usernames exist.
+  if (isUserLocked(username)) {
+    res.status(423).json({ error: 'Account is locked. Contact an administrator.' });
+    return;
+  }
   res.json({ token: createToken(username) });
 });
 
@@ -523,6 +531,69 @@ app.delete('/api/admin/users/:username', requireAuth, requireAdmin, async (req, 
   // can restore them if needed.
   destroyUserContext(username);
   res.json({ ok: true });
+});
+
+// TRA-217 — admin sets a user's password directly (no current-password check).
+app.post('/api/admin/users/:username/password', requireAuth, requireAdmin, async (req, res) => {
+  const { username } = req.params as Record<string, string>;
+  const { newPassword } = req.body as { newPassword?: string };
+  if (typeof newPassword !== 'string' || newPassword.length < 6) {
+    res.status(400).json({ error: 'newPassword must be at least 6 characters' });
+    return;
+  }
+  if (!getUser(username)) {
+    res.status(404).json({ error: 'User not found' });
+    return;
+  }
+  await changeUserPassword(username, newPassword);
+  res.json({ ok: true });
+});
+
+// TRA-217 — admin locks/unlocks a user. Locked accounts cannot log in.
+app.post('/api/admin/users/:username/lock', requireAuth, requireAdmin, async (req, res) => {
+  const { username } = req.params as Record<string, string>;
+  const { locked } = req.body as { locked?: boolean };
+  if (typeof locked !== 'boolean') {
+    res.status(400).json({ error: 'locked (boolean) is required' });
+    return;
+  }
+  const authUser = res.locals['authUser'] as string;
+  // Prevent admins from locking themselves out of the system.
+  if (locked && username === authUser) {
+    res.status(400).json({ error: 'Cannot lock your own account' });
+    return;
+  }
+  const ok = await setUserLocked(username, locked);
+  if (!ok) {
+    res.status(404).json({ error: 'User not found' });
+    return;
+  }
+  res.json({ ok: true, locked });
+});
+
+// TRA-217 — admin triggers a password-reset email for any user. Reuses the
+// same generator + email template the public forgot-password flow uses, so
+// the user resets their own password by entering the PIN.
+app.post('/api/admin/users/:username/reset-password', requireAuth, requireAdmin, async (req, res) => {
+  const { username } = req.params as Record<string, string>;
+  const user = getUser(username);
+  if (!user) {
+    res.status(404).json({ error: 'User not found' });
+    return;
+  }
+  if (!user.email) {
+    res.status(400).json({ error: 'User has no email address on file' });
+    return;
+  }
+  const code = generateResetToken(user.username);
+  try {
+    await sendPasswordResetEmail(user.email, user.username, code);
+  } catch (err) {
+    console.error('[admin] Failed to send reset email:', err);
+    res.status(502).json({ error: 'Failed to send reset email' });
+    return;
+  }
+  res.json({ ok: true, message: `Reset code emailed to ${user.email}` });
 });
 
 // ── State ─────────────────────────────────────────────────────────────────────
