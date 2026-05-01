@@ -729,6 +729,23 @@ export default function SettingsPage({ token, httpUrl, context, onModeChange }: 
     | { ok: true; env: TradierEnv; accountNumber?: string; status?: string; classification?: string }
     | { ok: false; error: string }
   >(null);
+  // TRA-222 — one-shot $1 BTC-USD market BUY to verify the live order path
+  // before flipping auto-trading on. The server caps quoteSize at $5.
+  const [coinbaseOrderStatus, setCoinbaseOrderStatus] = useState<'idle' | 'placing'>('idle');
+  const [coinbaseOrderResult, setCoinbaseOrderResult] = useState<
+    | null
+    | {
+        ok: true;
+        authScheme?: 'hmac' | 'cdp';
+        orderId: string;
+        productId: string;
+        quoteSize: number;
+        status: string;
+        fillPrice?: number;
+        fillSize?: number;
+      }
+    | { ok: false; authScheme?: 'hmac' | 'cdp'; error: string }
+  >(null);
 
   useEffect(() => {
     fetch(`${httpUrl}/api/account/settings`, {
@@ -785,6 +802,31 @@ export default function SettingsPage({ token, httpUrl, context, onModeChange }: 
       setCoinbaseTestResult({ ok: false, error: err instanceof Error ? err.message : String(err) });
     } finally {
       setCoinbaseTestStatus('idle');
+    }
+  }
+
+  async function handlePlaceCoinbaseTestOrder() {
+    if (!window.confirm(
+      'Place a real $1 USD market buy of BTC-USD against your live Coinbase account?\n\n'
+      + 'This is intended as a one-shot smoke test to confirm orders clear before enabling auto-trading. '
+      + 'The BTC will sit in your Coinbase wallet — manage it in the Coinbase app.',
+    )) {
+      return;
+    }
+    setCoinbaseOrderStatus('placing');
+    setCoinbaseOrderResult(null);
+    try {
+      const r = await fetch(`${httpUrl}/api/crypto/coinbase/place-test-order`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${token}` },
+        body: JSON.stringify({ productId: 'BTC-USD', quoteSize: 1 }),
+      });
+      const data = await r.json();
+      setCoinbaseOrderResult(data);
+    } catch (err) {
+      setCoinbaseOrderResult({ ok: false, error: err instanceof Error ? err.message : String(err) });
+    } finally {
+      setCoinbaseOrderStatus('idle');
     }
   }
 
@@ -1258,6 +1300,43 @@ export default function SettingsPage({ token, httpUrl, context, onModeChange }: 
                   ) : (
                     <div className="save-error" style={{ marginTop: '0.5rem' }}>
                       ✗ {coinbaseTestResult.authScheme ? `auth=${coinbaseTestResult.authScheme} — ` : ''}{coinbaseTestResult.error}
+                    </div>
+                  )
+                )}
+              </div>
+            )}
+
+            {/* TRA-222 — one-shot $1 test order. Only shown in Live mode so a
+                misclick in demo can't burn real money on a user who hasn't
+                explicitly switched over yet. */}
+            {context === 'crypto' && settings.mode === 'live' && (
+              <div className="settings-field" style={{ marginTop: '1rem' }}>
+                <button
+                  type="button"
+                  className="btn-secondary"
+                  onClick={handlePlaceCoinbaseTestOrder}
+                  disabled={coinbaseOrderStatus === 'placing'}
+                >
+                  {coinbaseOrderStatus === 'placing' ? 'Placing $1 order…' : 'Place $1 BTC-USD test order'}
+                </button>
+                <p className="field-hint">
+                  Places a real $1 USD market buy of BTC against your live Coinbase account so you can confirm
+                  the order path works end-to-end before enabling auto-trading. The BTC stays in your Coinbase
+                  wallet until you sell it (manage in the Coinbase app).
+                </p>
+                {coinbaseOrderResult && (
+                  coinbaseOrderResult.ok ? (
+                    <div className="save-success" style={{ marginTop: '0.5rem' }}>
+                      ✓ Placed order {coinbaseOrderResult.orderId} ({coinbaseOrderResult.productId},
+                      ${coinbaseOrderResult.quoteSize}, status={coinbaseOrderResult.status})
+                      {coinbaseOrderResult.fillPrice != null && coinbaseOrderResult.fillSize != null && (
+                        <> — filled {coinbaseOrderResult.fillSize} @ ${coinbaseOrderResult.fillPrice.toFixed(2)}</>
+                      )}
+                      .
+                    </div>
+                  ) : (
+                    <div className="save-error" style={{ marginTop: '0.5rem' }}>
+                      ✗ {coinbaseOrderResult.authScheme ? `auth=${coinbaseOrderResult.authScheme} — ` : ''}{coinbaseOrderResult.error}
                     </div>
                   )
                 )}

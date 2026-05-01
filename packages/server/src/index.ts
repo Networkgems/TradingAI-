@@ -923,6 +923,108 @@ app.post('/api/crypto/coinbase/test-connection', requireAuth, async (_req, res) 
 });
 
 /**
+ * Place a deliberately tiny market BUY against Coinbase Advanced Trade so the
+ * user can verify their funded live account end-to-end (TRA-222) before
+ * flipping auto-trading on. Reuses the same credential precedence as
+ * /test-connection. The order is NOT registered with the engine — it's a
+ * one-shot smoke test, the resulting crypto sits in the user's Coinbase
+ * wallet exactly like a manual buy.
+ *
+ * Hard caps: $5 USD max quote size and BUY only. We refuse to do this in demo
+ * mode so a misclick can't waste real money on a user who hasn't switched
+ * over yet.
+ */
+app.post('/api/crypto/coinbase/place-test-order', requireAuth, async (req, res) => {
+  const username = res.locals['authUser'] as string;
+  const settings = getSettings(username);
+  if (settings.mode !== 'live') {
+    res.json({ ok: false, error: 'Account is in demo mode. Switch to Live before placing a test order.' });
+    return;
+  }
+  const body = (req.body ?? {}) as { productId?: string; quoteSize?: number };
+  const productId = (body.productId ?? 'BTC-USD').trim().toUpperCase();
+  if (!/^[A-Z0-9]{2,10}-USD[CT]?$/.test(productId)) {
+    res.json({ ok: false, error: `Invalid productId "${productId}". Expected e.g. BTC-USD.` });
+    return;
+  }
+  const quoteSize = Number(body.quoteSize ?? 1);
+  if (!Number.isFinite(quoteSize) || quoteSize <= 0) {
+    res.json({ ok: false, error: 'quoteSize must be a positive number (USD).' });
+    return;
+  }
+  if (quoteSize > 5) {
+    res.json({ ok: false, error: 'Test order capped at $5 USD. Reduce quoteSize.' });
+    return;
+  }
+  const apiKey = (
+    settings.liveApiKeyCrypto?.trim()
+    || settings.liveApiKey?.trim()
+    || process.env['COINBASE_API_KEY']
+    || ''
+  ).trim();
+  const apiSecret = (
+    settings.liveApiSecretCrypto?.trim()
+    || settings.liveApiSecret?.trim()
+    || process.env['COINBASE_API_SECRET']
+    || ''
+  ).trim();
+  if (!apiKey || !apiSecret) {
+    res.json({ ok: false, error: 'Coinbase API key and secret are not configured. Save them in Settings before testing.' });
+    return;
+  }
+  let client: CoinbaseOrderClient;
+  try {
+    client = new CoinbaseOrderClient({ apiKey, apiSecret });
+  } catch (err: unknown) {
+    res.json({ ok: false, error: err instanceof Error ? err.message : String(err) });
+    return;
+  }
+  const authScheme = client.getAuthScheme();
+  let orderId: string;
+  try {
+    const placed = await client.placeMarketOrder({ productId, side: 'buy', quoteSize });
+    orderId = placed.order_id;
+  } catch (err: unknown) {
+    res.json({ ok: false, authScheme, error: err instanceof Error ? err.message : String(err) });
+    return;
+  }
+  // Best-effort fill reconciliation — same backoff schedule as
+  // CryptoLiveAccount.awaitFill so a typical fill returns rich detail without
+  // dragging the request out indefinitely.
+  const delays = [200, 400, 800, 1500, 2000];
+  let fillPrice: number | undefined;
+  let fillSize: number | undefined;
+  let status = 'unknown';
+  for (const d of delays) {
+    await new Promise(r => setTimeout(r, d));
+    try {
+      const order = await client.getOrder(orderId);
+      status = (order.status ?? 'unknown').toUpperCase();
+      if (status === 'FILLED') {
+        const p = parseFloat(order.average_filled_price);
+        const s = parseFloat(order.filled_size);
+        if (Number.isFinite(p) && p > 0) fillPrice = p;
+        if (Number.isFinite(s) && s > 0) fillSize = s;
+        break;
+      }
+      if (status === 'CANCELLED' || status === 'EXPIRED' || status === 'FAILED') break;
+    } catch {
+      // Order was already accepted by Coinbase — keep polling.
+    }
+  }
+  res.json({
+    ok: true,
+    authScheme,
+    orderId,
+    productId,
+    quoteSize,
+    status,
+    fillPrice,
+    fillSize,
+  });
+});
+
+/**
  * Smoke-test Tradier live credentials without placing any orders (TRA-221).
  *
  * Reads the user's saved options API token, account ID, and environment from
