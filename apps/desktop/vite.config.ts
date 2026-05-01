@@ -28,6 +28,14 @@ export default defineConfig({
         // Cache app shell and static assets; skip API and WebSocket routes
         navigateFallback: 'index.html',
         navigateFallbackDenylist: [/^\/api\//],
+        // Take over immediately when a new SW is installed, instead of
+        // waiting for every PWA tab to close. Without this, mobile users who
+        // keep the app open never see new releases — TRA-198 was reported
+        // as "still present" because the previous SW kept serving the stale
+        // bundle even after the offending section was removed in source.
+        skipWaiting: true,
+        clientsClaim: true,
+        cleanupOutdatedCaches: true,
         runtimeCaching: [
           {
             urlPattern: /^https:\/\/fonts\.(googleapis|gstatic)\.com\/.*/i,
