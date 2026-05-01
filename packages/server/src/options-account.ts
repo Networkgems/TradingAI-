@@ -32,9 +32,11 @@ interface OptionsAccountConfig {
   initialEquity?: number;
   managedAccountRatio?: number;
   /**
-   * Max ATM options entries per day (TRA-195). Replaces the previously
-   * hardcoded `OPTIONS_DAILY_LIMIT` so the cap is user-configurable from the
-   * Settings page.
+   * Max options entries per day across ALL sources — ATM, OTM, and RV
+   * combined (TRA-195). Replaces the previously hardcoded `OPTIONS_DAILY_LIMIT`
+   * /`OTM_RISK_PARAMS.dailyLimit` / `RV_RISK_PARAMS.dailyLimit` per-source
+   * caps so the Settings-page knob is the single source of truth and matches
+   * the unified `n/N` badge in the UI.
    */
   optionsDailyTradesLimit?: number;
   /**
@@ -72,12 +74,13 @@ export class PaperOptionsAccount {
   private optionsPnl = 0;
   private dailyCount = 0;
   /**
-   * OTM tickets are counted separately so OTM and ATM don't compete for the
-   * same daily slot pool (TRA-160). `dailyCount` tracks ATM entries against
-   * the user-configurable `optionsDailyTradesLimit` cap (TRA-195).
+   * Per-source counters retained so the badge `n/N` display can attribute
+   * today's entries to ATM / OTM / RV. Since TRA-195 the *gate* is unified —
+   * every source path checks the SUM (`dailyOptionsTotal`) against the
+   * user-configurable `optionsDailyTradesLimit` rather than its own constant.
    */
   private dailyOtmCount = 0;
-  /** TRA-191 — relative-value scanner tickets are counted separately. */
+  /** TRA-191 — relative-value scanner tickets, counted into the total. */
   private dailyRvCount = 0;
   private rvRiskParams: RvRiskParams;
   private currentDayKey = toDateKey(Date.now());
@@ -116,9 +119,24 @@ export class PaperOptionsAccount {
     if (config.rvRiskParams !== undefined) this.rvRiskParams = config.rvRiskParams;
   }
 
-  /** Current ATM options daily cap — exposed so the UI can render a count badge. */
+  /** Current options daily cap — exposed so the UI can render a count badge. */
   getOptionsDailyTradesLimit(): number {
     return this.optionsDailyTradesLimit;
+  }
+
+  /**
+   * TRA-195 — unified total options-trades cap. The previous design gated each
+   * source (ATM `dailyCount`, OTM `dailyOtmCount`, RV `dailyRvCount`) against a
+   * separate constant, which meant changing the user-facing setting only moved
+   * the ATM cap while OTM/RV stayed pinned to `OTM_RISK_PARAMS.dailyLimit` /
+   * `RV_RISK_PARAMS.dailyLimit`. The active stock-options scanner is RV
+   * (TRA-191), so users editing the setting saw no effect. Gating every entry
+   * path against the *sum* of the three source counters makes the setting the
+   * single source of truth — matches the badge `n/N` display, which already
+   * sums those counters.
+   */
+  private dailyOptionsTotal(): number {
+    return this.dailyCount + this.dailyOtmCount + this.dailyRvCount;
   }
 
   /** Rebase starting equity by the delta, preserving optionsPnl and open/closed positions. */
@@ -181,7 +199,7 @@ export class PaperOptionsAccount {
     this.resetDayIfNeeded();
 
     if (!isValidTradingWindow(Date.now())) return null;
-    if (this.dailyOtmCount >= this.otmRiskParams.dailyLimit) return null;
+    if (this.dailyOptionsTotal() >= this.optionsDailyTradesLimit) return null;
 
     // Dedup by OCC symbol — one open contract at a time per strike/expiration.
     const existing = Array.from(this.openOptions.values()).find(
@@ -250,7 +268,7 @@ export class PaperOptionsAccount {
     this.resetDayIfNeeded();
 
     if (!isValidTradingWindow(Date.now())) return null;
-    if (this.dailyRvCount >= this.rvRiskParams.dailyLimit) return null;
+    if (this.dailyOptionsTotal() >= this.optionsDailyTradesLimit) return null;
 
     const existing = Array.from(this.openOptions.values()).find(
       o => o.optionSymbol === signal.optionSymbol,
@@ -308,7 +326,7 @@ export class PaperOptionsAccount {
     // Time filter: only open options during high-volume trading windows
     if (!isValidTradingWindow(Date.now())) return null;
 
-    if (this.dailyCount >= this.optionsDailyTradesLimit) return null;
+    if (this.dailyOptionsTotal() >= this.optionsDailyTradesLimit) return null;
 
     const existing = Array.from(this.openOptions.values()).find(
       o => o.symbol === signal.symbol && o.signalType === signal.type,

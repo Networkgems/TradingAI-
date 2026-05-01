@@ -170,10 +170,11 @@ export interface AccountSettings {
   demoEquityCrypto: number;
   dailyTradesLimit: number;
   /**
-   * Max options trades per day (TRA-195). Replaces the previously hardcoded
-   * `OPTIONS_DAILY_LIMIT` so users can tune the cap from the Settings page.
-   * Stored separately from `dailyTradesLimit` (stocks) so the two markets
-   * don't share a slot pool.
+   * Max options trades per day — applies across ATM, OTM, and RV scanners
+   * combined (TRA-195). Replaces the previously hardcoded per-source caps so
+   * users can tune the unified cap from the Settings page. Stored separately
+   * from `dailyTradesLimit` (stocks) so the two markets don't share a slot
+   * pool.
    */
   optionsDailyTradesLimit: number;
   managedAccountRatio: number;
@@ -215,7 +216,7 @@ export const DEFAULT_ACCOUNT_SETTINGS: AccountSettings = {
   demoEquityStocks: 25_000,
   demoEquityCrypto: 25_000,
   dailyTradesLimit: 10,
-  optionsDailyTradesLimit: 4,
+  optionsDailyTradesLimit: 10,
   managedAccountRatio: 0.5,
   riskPerTrade: 0.01,
   stocksAutoTradingEnabled: true,

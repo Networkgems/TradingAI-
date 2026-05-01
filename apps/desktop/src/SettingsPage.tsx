@@ -711,7 +711,7 @@ export default function SettingsPage({ token, httpUrl, context, onModeChange }: 
                   value={settings.optionsDailyTradesLimit}
                   onChange={e => set('optionsDailyTradesLimit', Number(e.target.value))}
                 />
-                <span className="field-hint">Max options trades per day (default: 4)</span>
+                <span className="field-hint">Max options trades per day across all scanners (default: 10)</span>
               </div>
 
               <div className="settings-field">

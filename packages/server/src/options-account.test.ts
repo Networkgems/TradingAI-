@@ -66,9 +66,15 @@ describe('PaperOptionsAccount.openOptionFromCandidate', () => {
     expect(acct.getState().dailyOptionsCount).toBe(0);
   });
 
-  it('caps OTM entries at OTM_OPTIONS_DAILY_LIMIT independent of the ATM cap', () => {
-    const acct = new PaperOptionsAccount({ initialEquity: 200_000, managedAccountRatio: 0.5 });
-    // OTM cap defaults to 2 — third candidate must be refused.
+  it('caps OTM entries against the user-configurable optionsDailyTradesLimit (TRA-195)', () => {
+    // Unified cap = 2 → third OTM candidate must be refused regardless of which scanner
+    // path it came from. Pre-TRA-195 this was a per-source OTM cap; the wake comment on
+    // TRA-195 confirmed users want one knob that governs the total daily options count.
+    const acct = new PaperOptionsAccount({
+      initialEquity: 200_000,
+      managedAccountRatio: 0.5,
+      optionsDailyTradesLimit: 2,
+    });
     const a = acct.openOptionFromCandidate(buildSignal({ optionSymbol: 'AAA', strike: 200 }));
     const b = acct.openOptionFromCandidate(buildSignal({ id: 's2', optionSymbol: 'BBB', strike: 210 }));
     const c = acct.openOptionFromCandidate(buildSignal({ id: 's3', optionSymbol: 'CCC', strike: 220 }));
