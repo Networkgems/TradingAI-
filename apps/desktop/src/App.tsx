@@ -514,7 +514,7 @@ function CryptoDashboard({ token, onBack, onLogout, onActivity }: { token: strin
                 <table>
                   <thead>
                     <tr>
-                      <th>Symbol</th><th>Side</th><th>Qty</th><th>Entry</th><th>Current</th>
+                      <th>Symbol</th><th>Side</th><th>Qty</th><th>Entry</th><th>Cost</th><th>Current</th>
                       <th>P&amp;L %</th><th>P&amp;L $</th><th>Stop</th><th>Target</th><th>Opened</th><th></th>
                     </tr>
                   </thead>
@@ -525,12 +525,14 @@ function CryptoDashboard({ token, onBack, onLogout, onActivity }: { token: strin
                       const multiplier = p.side === 'buy' ? 1 : -1;
                       const pnlPct = ((currentPrice - p.entryPrice) / p.entryPrice) * 100 * multiplier;
                       const pnlDollar = (currentPrice - p.entryPrice) * p.quantity * multiplier;
+                      const totalCost = p.entryPrice * p.quantity;
                       return (
                         <tr key={p.id}>
                           <td className="symbol">{p.symbol}</td>
                           <td className={p.side === 'buy' ? 'green' : 'red'}>{p.side.toUpperCase()}</td>
                           <td>{p.quantity}</td>
                           <td>${fmt(p.entryPrice)}</td>
+                          <td>${fmt(totalCost)}</td>
                           <td>${fmt(currentPrice)}</td>
                           <td className={pnlPct >= 0 ? 'green' : 'red'}>{fmtPct(pnlPct)}</td>
                           <td className={pnlDollar >= 0 ? 'green' : 'red'}>{fmtDollar(pnlDollar)}</td>
@@ -1091,6 +1093,7 @@ function Dashboard({ token, onLogout, onGoHome, onActivity }: { token: string; o
                       <th>Side</th>
                       <th>Qty</th>
                       <th>Entry</th>
+                      <th>Cost</th>
                       <th>Current</th>
                       <th>P&amp;L %</th>
                       <th>P&amp;L $</th>
@@ -1107,12 +1110,14 @@ function Dashboard({ token, onLogout, onGoHome, onActivity }: { token: string; o
                       const multiplier = p.side === 'buy' ? 1 : -1;
                       const pnlPct = ((currentPrice - p.entryPrice) / p.entryPrice) * 100 * multiplier;
                       const pnlDollar = (currentPrice - p.entryPrice) * p.quantity * multiplier;
+                      const totalCost = p.entryPrice * p.quantity;
                       return (
                         <tr key={p.id}>
                           <td className="symbol">{p.symbol}</td>
                           <td className={p.side === 'buy' ? 'green' : 'red'}>{p.side.toUpperCase()}</td>
                           <td>{p.quantity}</td>
                           <td>${fmt(p.entryPrice)}</td>
+                          <td>${fmt(totalCost)}</td>
                           <td>${fmt(currentPrice)}</td>
                           <td className={pnlPct >= 0 ? 'green' : 'red'}>{fmtPct(pnlPct)}</td>
                           <td className={pnlDollar >= 0 ? 'green' : 'red'}>{fmtDollar(pnlDollar)}</td>
