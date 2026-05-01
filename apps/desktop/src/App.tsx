@@ -1116,6 +1116,7 @@ function Dashboard({ token, onLogout, onGoHome, onActivity }: { token: string; o
                       <th>Entry</th>
                       <th>Current</th>
                       <th>P&amp;L %</th>
+                      <th>P&amp;L $</th>
                       <th>Stop</th>
                       <th>Target</th>
                       <th>Opened</th>
@@ -1128,6 +1129,7 @@ function Dashboard({ token, onLogout, onGoHome, onActivity }: { token: string; o
                       const currentPrice = sym?.price ?? p.entryPrice;
                       const multiplier = p.side === 'buy' ? 1 : -1;
                       const pnlPct = ((currentPrice - p.entryPrice) / p.entryPrice) * 100 * multiplier;
+                      const pnlDollar = (currentPrice - p.entryPrice) * p.quantity * multiplier;
                       return (
                         <tr key={p.id}>
                           <td className="symbol">{p.symbol}</td>
@@ -1136,6 +1138,7 @@ function Dashboard({ token, onLogout, onGoHome, onActivity }: { token: string; o
                           <td>${fmt(p.entryPrice)}</td>
                           <td>${fmt(currentPrice)}</td>
                           <td className={pnlPct >= 0 ? 'green' : 'red'}>{fmtPct(pnlPct)}</td>
+                          <td className={pnlDollar >= 0 ? 'green' : 'red'}>{fmtDollar(pnlDollar)}</td>
                           <td className="red">${fmt(p.stopLoss)}</td>
                           <td className="green">${fmt(p.takeProfit)}</td>
                           <td className="muted">{formatTime(p.openedAt)}</td>
@@ -1199,6 +1202,7 @@ function Dashboard({ token, onLogout, onGoHome, onActivity }: { token: string; o
                       <th>Contracts</th>
                       <th>Premium Paid</th>
                       <th>Current Mark</th>
+                      <th>P&amp;L $</th>
                       <th>Status</th>
                       <th>Trail / SL</th>
                       <th>Signal</th>
@@ -1209,6 +1213,8 @@ function Dashboard({ token, onLogout, onGoHome, onActivity }: { token: string; o
                   <tbody>
                     {openOptions.map(o => {
                       const pnlPct = ((o.currentPremium - o.premiumPaid) / o.premiumPaid) * 100;
+                      const unrealized = (o.currentPremium - o.premiumPaid) * o.contractsRemaining * 100;
+                      const pnlDollar = unrealized + (o.pnl ?? 0);
                       return (
                         <tr key={o.id}>
                           <td className="symbol">{o.symbol}</td>
@@ -1220,6 +1226,7 @@ function Dashboard({ token, onLogout, onGoHome, onActivity }: { token: string; o
                           <td className={pnlPct >= 0 ? 'green' : 'red'}>
                             ${fmt(o.currentPremium)} ({fmtPct(pnlPct)})
                           </td>
+                          <td className={pnlDollar >= 0 ? 'green' : 'red'}>{fmtDollar(pnlDollar)}</td>
                           <td className={o.trailingActive ? 'green' : 'muted'}>
                             {o.trailingActive ? 'TRAILING' : 'OPEN'}
                           </td>
