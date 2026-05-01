@@ -505,9 +505,21 @@ export function UserManagementSection({ token, httpUrl }: { token: string; httpU
       </div>
 
       {editUser && (
-        <div className="modal-backdrop">
-          <div className="modal-card">
-            <h3 style={{ marginBottom: '1rem' }}>Edit User: {editUser.username}</h3>
+        // TRA-217 — backdrop-click closes the modal (matches the parent
+        // Account Management modal in App.tsx); inner stopPropagation keeps
+        // clicks inside from leaking through.
+        <div className="modal-backdrop" onClick={() => setEditUser(null)}>
+          <div className="modal-card" onClick={e => e.stopPropagation()}>
+            <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '1rem' }}>
+              <h3 style={{ margin: 0 }}>Edit User: {editUser.username}</h3>
+              <button
+                type="button"
+                className="btn-secondary btn-sm"
+                onClick={() => setEditUser(null)}
+                aria-label="Close"
+                title="Close"
+              >&#x2715;</button>
+            </div>
             <form onSubmit={handleEdit}>
               <div className="settings-field">
                 <label>Username</label>
