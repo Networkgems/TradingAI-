@@ -265,6 +265,27 @@ async function generateAllUserCryptoEodReports(): Promise<void> {
   }
 }
 
+// TRA-219 — daily 9 PM ET archive of the in-memory closed-trade lists. After
+// the archive runs, the Positions/Options pages show no rows under "Recent
+// Closed" until new trades close; the per-day reports persisted to disk feed
+// the Calendar tab's date-detail view so historical fills stay queryable.
+async function archiveAllUserClosedTrades(): Promise<void> {
+  for (const ctx of getAllUserContexts()) {
+    try {
+      const stocks = ctx.engine.archiveClosedTrades();
+      const crypto = ctx.cryptoEngine.archiveClosedTrades();
+      await Promise.all([persistStocksNow(ctx), persistCryptoNow(ctx)]);
+      broadcastEngineState(ctx);
+      broadcastCryptoState(ctx);
+      console.log(
+        `[archive:${ctx.username}] archived ${stocks.positions} closed positions, ${stocks.options} closed options, ${crypto} closed crypto positions`,
+      );
+    } catch (err) {
+      console.error(`[archive:${ctx.username}] archive failed:`, err);
+    }
+  }
+}
+
 // ── REST endpoints ───────────────────────────────────────────────────────────
 
 app.get('/api/health', (_req, res) => {
@@ -1241,6 +1262,10 @@ scheduler.start({
   // TRA-193 — crypto runs 24/7, so save the daily P&L every calendar day
   // (weekends and holidays included) — otherwise the calendar shows no rows.
   onDaily: generateAllUserCryptoEodReports,
+  // TRA-219 — clear the rolling "Recent Closed" lists at 9 PM ET so the
+  // Positions/Options tabs reset for the next session. EOD reports already
+  // saved to disk feed the Calendar tab's per-date detail view.
+  onArchive: archiveAllUserClosedTrades,
 });
 
 httpServer.listen(PORT, () => {

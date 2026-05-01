@@ -17,6 +17,15 @@ function fmtCompact(value: number): string {
   return `${sign}$${abs.toFixed(2)}`;
 }
 
+function fmt(n: number, decimals = 2) {
+  return n.toLocaleString('en-US', { minimumFractionDigits: decimals, maximumFractionDigits: decimals });
+}
+
+function fmtDollar(n: number) {
+  const sign = n >= 0 ? '+' : '';
+  return `${sign}$${fmt(Math.abs(n))}`;
+}
+
 function isoDate(year: number, month: number, day: number): string {
   return `${year}-${String(month + 1).padStart(2, '0')}-${String(day).padStart(2, '0')}`;
 }
@@ -44,8 +53,9 @@ function buildMonthWeeks(year: number, month: number): (number | null)[][] {
 
 // ── Month grid ──────────────────────────────────────────────────────────────
 
-function MonthGrid({ year, month, reports }: {
+function MonthGrid({ year, month, reports, onSelectDate }: {
   year: number; month: number; reports: Record<string, EodReport>;
+  onSelectDate: (date: string) => void;
 }) {
   const today  = new Date();
   const weeks  = buildMonthWeeks(year, month);
@@ -61,16 +71,25 @@ function MonthGrid({ year, month, reports }: {
           {week.map((dayNum, col) => {
             if (dayNum === null) return <div key={col} className="cal-cell cal-cell--empty" />;
 
-            const report  = reports[isoDate(year, month, dayNum)];
+            const date    = isoDate(year, month, dayNum);
+            const report  = reports[date];
             const isToday = isCurr && today.getDate() === dayNum;
+            const clickable = !!report;
 
             let cls = 'cal-cell';
             if (isToday)                               cls += ' cal-cell--today';
             if (report && report.combinedPnl >= 0)     cls += ' cal-cell--win';
             if (report && report.combinedPnl < 0)      cls += ' cal-cell--loss';
+            if (clickable)                             cls += ' cal-cell--clickable';
 
             return (
-              <div key={col} className={cls}>
+              <div
+                key={col}
+                className={cls}
+                onClick={clickable ? () => onSelectDate(date) : undefined}
+                role={clickable ? 'button' : undefined}
+                title={clickable ? 'View EOD report' : undefined}
+              >
                 <span className="cal-day-num">{isToday ? 'Today' : dayNum}</span>
                 {report
                   ? <span className="cal-pnl">{fmtCompact(report.combinedPnl)}</span>
@@ -192,6 +211,132 @@ function YearView({ year, reports, onMonthClick }: {
   );
 }
 
+// ── Per-date EOD report detail ───────────────────────────────────────────────
+//
+// TRA-219 — surfaces the full EOD report (P&L summary, trade log, top movers,
+// signal accuracy) for a single archived day. Used by the Calendar tab so the
+// "Recent Closed" data removed from the Positions/Options pages is still
+// reachable by selecting the date.
+
+function EodReportDetail({ report, onBack }: { report: EodReport; onBack: () => void }) {
+  return (
+    <section className="eod-panel">
+      <div className="eod-header" style={{ cursor: 'default' }}>
+        <button className="cal-back-btn" onClick={onBack} title="Back to calendar">&#8592; Back</button>
+        <span className="eod-title" style={{ flex: 1 }}>EOD Report — {report.date}</span>
+        <span className="eod-summary">
+          <span className={report.combinedPnl >= 0 ? 'green' : 'red'}>
+            {fmtDollar(report.combinedPnl)}
+          </span>
+          &nbsp;·&nbsp;Win rate {(report.winRate * 100).toFixed(0)}%
+          &nbsp;·&nbsp;{report.totalTrades} trades
+        </span>
+      </div>
+
+      <div className="eod-body">
+        <div className="eod-stats-row">
+          <div className="eod-stat">
+            <span className="eod-stat-label">Realized P&amp;L</span>
+            <span className={`eod-stat-value ${report.realizedPnl >= 0 ? 'green' : 'red'}`}>
+              {fmtDollar(report.realizedPnl)}
+            </span>
+          </div>
+          <div className="eod-stat">
+            <span className="eod-stat-label">Unrealized P&amp;L</span>
+            <span className={`eod-stat-value ${report.unrealizedPnl >= 0 ? 'green' : 'red'}`}>
+              {fmtDollar(report.unrealizedPnl)}
+            </span>
+          </div>
+          <div className="eod-stat">
+            <span className="eod-stat-label">Options P&amp;L</span>
+            <span className={`eod-stat-value ${report.optionsPnl >= 0 ? 'green' : 'red'}`}>
+              {fmtDollar(report.optionsPnl)}
+            </span>
+          </div>
+          <div className="eod-stat">
+            <span className="eod-stat-label">Combined P&amp;L</span>
+            <span className={`eod-stat-value ${report.combinedPnl >= 0 ? 'green' : 'red'}`}>
+              {fmtDollar(report.combinedPnl)}
+            </span>
+          </div>
+          <div className="eod-stat">
+            <span className="eod-stat-label">Win Rate</span>
+            <span className="eod-stat-value">{(report.winRate * 100).toFixed(1)}%</span>
+          </div>
+          <div className="eod-stat">
+            <span className="eod-stat-label">Avg R:R</span>
+            <span className="eod-stat-value">1:{report.avgRR.toFixed(2)}</span>
+          </div>
+          <div className="eod-stat">
+            <span className="eod-stat-label">Signals Fired</span>
+            <span className="eod-stat-value">{report.signalAccuracy.totalSignals}</span>
+          </div>
+          <div className="eod-stat">
+            <span className="eod-stat-label">Signal Win %</span>
+            <span className="eod-stat-value">
+              {(report.signalAccuracy.winRate * 100).toFixed(1)}%
+            </span>
+          </div>
+        </div>
+
+        {report.top5Movers.length > 0 && (
+          <div className="eod-movers">
+            <span className="eod-section-label">Top 5 Movers:</span>
+            {report.top5Movers.map(m => (
+              <span key={m.symbol} className="eod-mover">
+                <strong>{m.symbol}</strong>
+                <span className={m.changePct >= 0 ? 'green' : 'red'}>
+                  &nbsp;{m.changePct >= 0 ? '+' : ''}{m.changePct.toFixed(2)}%
+                </span>
+              </span>
+            ))}
+          </div>
+        )}
+
+        <div className="eod-trades">
+          <span className="eod-section-label">Closed Trades ({report.trades.length})</span>
+          {report.trades.length > 0 ? (
+            <table>
+              <thead>
+                <tr>
+                  <th>Symbol</th>
+                  <th>Strategy</th>
+                  <th>Side</th>
+                  <th>Qty</th>
+                  <th>Entry</th>
+                  <th>Exit</th>
+                  <th>P&amp;L</th>
+                  <th>R:R</th>
+                </tr>
+              </thead>
+              <tbody>
+                {report.trades.map(t => (
+                  <tr key={t.id}>
+                    <td className="symbol">{t.symbol}</td>
+                    <td>{t.strategy}</td>
+                    <td className={t.side === 'buy' ? 'green' : 'red'}>{t.side.toUpperCase()}</td>
+                    <td>{t.quantity}</td>
+                    <td>${fmt(t.entryPrice)}</td>
+                    <td>${fmt(t.exitPrice)}</td>
+                    <td className={t.pnl >= 0 ? 'green' : 'red'}>{fmtDollar(t.pnl)}</td>
+                    <td>1:{t.rr}</td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          ) : (
+            <div className="empty">No trades closed on this date.</div>
+          )}
+        </div>
+
+        <div className="eod-generated">
+          Generated at {new Date(report.generatedAt).toLocaleString()}
+        </div>
+      </div>
+    </section>
+  );
+}
+
 // ── Main CalendarTab export ──────────────────────────────────────────────────
 
 export function CalendarTab({ token, httpUrl, reportsPath = '/api/reports' }: { token: string; httpUrl: string; reportsPath?: string }) {
@@ -200,6 +345,9 @@ export function CalendarTab({ token, httpUrl, reportsPath = '/api/reports' }: { 
   const [month,   setMonth]   = useState(new Date().getMonth()); // 0-indexed
   const [reports, setReports] = useState<Record<string, EodReport>>({});
   const [loading, setLoading] = useState(false);
+  // TRA-219 — date selected for the per-day EOD report detail view.
+  const [selectedDate, setSelectedDate] = useState<string | null>(null);
+  const [detailLoading, setDetailLoading] = useState(false);
 
   useEffect(() => {
     let cancelled = false;
@@ -229,7 +377,30 @@ export function CalendarTab({ token, httpUrl, reportsPath = '/api/reports' }: { 
     }
     load();
     return () => { cancelled = true; };
-  }, [token, httpUrl]);
+  }, [token, httpUrl, reportsPath]);
+
+  // TRA-219 — fetch a fresh copy of the selected day's report so the detail
+  // view picks up trades that closed after the initial month load.
+  useEffect(() => {
+    if (!selectedDate) return;
+    if (reports[selectedDate]) return;
+    let cancelled = false;
+    async function loadDetail() {
+      setDetailLoading(true);
+      try {
+        const r = await fetch(`${httpUrl}${reportsPath}/${selectedDate}`, {
+          headers: { Authorization: `Bearer ${token}` },
+        });
+        if (!r.ok || cancelled) return;
+        const rep = (await r.json()) as EodReport;
+        setReports(prev => ({ ...prev, [rep.date]: rep }));
+      } finally {
+        if (!cancelled) setDetailLoading(false);
+      }
+    }
+    loadDetail();
+    return () => { cancelled = true; };
+  }, [selectedDate, token, httpUrl, reportsPath, reports]);
 
   function prevPeriod() {
     if (view === 'year') { setYear(y => y - 1); return; }
@@ -242,6 +413,11 @@ export function CalendarTab({ token, httpUrl, reportsPath = '/api/reports' }: { 
 
   const periodLabel = view === 'month' ? `${MONTH_NAMES[month]} ${year}` : String(year);
 
+  // Sorted list of all dates with reports — feeds the "filter by date" picker
+  // so users can jump straight to a day without paging through months.
+  const availableDates = Object.keys(reports).sort().reverse();
+  const selectedReport = selectedDate ? reports[selectedDate] : null;
+
   return (
     <div className="cal-panel">
       <div className="cal-header">
@@ -250,13 +426,22 @@ export function CalendarTab({ token, httpUrl, reportsPath = '/api/reports' }: { 
           <div className="cal-view-toggle">
             <button
               className={`cal-toggle-btn${view === 'month' ? ' active' : ''}`}
-              onClick={() => setView('month')}
+              onClick={() => { setView('month'); setSelectedDate(null); }}
             >Month</button>
             <button
               className={`cal-toggle-btn${view === 'year' ? ' active' : ''}`}
-              onClick={() => setView('year')}
+              onClick={() => { setView('year'); setSelectedDate(null); }}
             >Year</button>
           </div>
+          <select
+            className="cal-date-filter"
+            value={selectedDate ?? ''}
+            onChange={e => setSelectedDate(e.target.value || null)}
+            title="Jump to a specific date's EOD report"
+          >
+            <option value="">Filter by date…</option>
+            {availableDates.map(d => <option key={d} value={d}>{d}</option>)}
+          </select>
           <div className="cal-nav">
             <button className="cal-nav-btn" onClick={prevPeriod}>&#8249;</button>
             <span className="cal-period-label">{periodLabel}</span>
@@ -265,15 +450,30 @@ export function CalendarTab({ token, httpUrl, reportsPath = '/api/reports' }: { 
         </div>
       </div>
 
-      {loading && <div className="cal-loading">Loading reports…</div>}
+      {selectedDate && (
+        selectedReport ? (
+          <EodReportDetail report={selectedReport} onBack={() => setSelectedDate(null)} />
+        ) : detailLoading ? (
+          <div className="cal-loading">Loading {selectedDate} report…</div>
+        ) : (
+          <div className="cal-loading">No EOD report saved for {selectedDate}.</div>
+        )
+      )}
 
-      {!loading && view === 'month' && (
+      {!selectedDate && loading && <div className="cal-loading">Loading reports…</div>}
+
+      {!selectedDate && !loading && view === 'month' && (
         <>
-          <MonthGrid year={year} month={month} reports={reports} />
+          <MonthGrid
+            year={year}
+            month={month}
+            reports={reports}
+            onSelectDate={setSelectedDate}
+          />
           <MonthSummary year={year} month={month} reports={reports} />
         </>
       )}
-      {!loading && view === 'year' && (
+      {!selectedDate && !loading && view === 'year' && (
         <YearView
           year={year}
           reports={reports}

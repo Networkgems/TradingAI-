@@ -1,7 +1,8 @@
 /**
  * Market-day scheduler.
  *
- * Fires a callback at 4:05 PM ET on trading days (Mon–Fri, non-holiday).
+ * Fires the EOD callback at 4:05 PM ET on trading days (Mon–Fri, non-holiday)
+ * and the archive callback at 9:00 PM ET every calendar day.
  * Uses a 1-minute polling loop so no external cron dependency is needed.
  *
  * US market holidays are pre-computed for 2025–2026 and checked on each fire.
@@ -64,17 +65,26 @@ export interface ScheduleCallbacks {
   onMarketClose?: EodTriggerCallback;
   /** Fires at 4:05 PM ET every calendar day — for 24/7 markets like crypto. */
   onDaily?: EodTriggerCallback;
+  /**
+   * TRA-219 — fires at 9:00 PM ET every calendar day. Used to archive the
+   * "Recent Closed" trade history so the Positions/Options pages start each
+   * new session clean; the EOD reports already saved to disk preserve the
+   * trades for the Calendar tab's per-date view.
+   */
+  onArchive?: EodTriggerCallback;
 }
 
 export class MarketScheduler {
   private timer: ReturnType<typeof setInterval> | null = null;
   private lastMarketCloseDate = '';
   private lastDailyDate = '';
+  private lastArchiveDate = '';
 
   /**
    * Start polling. Accepts either a single market-close callback (legacy form)
-   * or an object with separate `onMarketClose` and `onDaily` callbacks. Both fire
-   * at 4:05 PM ET; `onMarketClose` only on trading days, `onDaily` every day.
+   * or an object with separate `onMarketClose`, `onDaily`, and `onArchive`
+   * callbacks. The first two fire at 4:05 PM ET; `onArchive` fires at 9:00 PM
+   * ET every calendar day.
    */
   start(callbacks: EodTriggerCallback | ScheduleCallbacks): void {
     if (this.timer) return;
@@ -84,27 +94,38 @@ export class MarketScheduler {
     // Check every 60 seconds
     this.timer = setInterval(() => {
       const { hour, minute, date } = nowET();
-      if (hour !== 16 || minute !== 5) return;
       const todayKey = date.toLocaleDateString('en-CA', { timeZone: 'America/New_York' });
 
-      if (cfg.onMarketClose && isMarketDay(date) && this.lastMarketCloseDate !== todayKey) {
-        this.lastMarketCloseDate = todayKey;
-        console.log(`[scheduler] market-close EOD trigger fired for ${todayKey}`);
-        Promise.resolve(cfg.onMarketClose()).catch(err =>
-          console.error('[scheduler] market-close EOD callback error:', err),
-        );
+      if (hour === 16 && minute === 5) {
+        if (cfg.onMarketClose && isMarketDay(date) && this.lastMarketCloseDate !== todayKey) {
+          this.lastMarketCloseDate = todayKey;
+          console.log(`[scheduler] market-close EOD trigger fired for ${todayKey}`);
+          Promise.resolve(cfg.onMarketClose()).catch(err =>
+            console.error('[scheduler] market-close EOD callback error:', err),
+          );
+        }
+
+        if (cfg.onDaily && this.lastDailyDate !== todayKey) {
+          this.lastDailyDate = todayKey;
+          console.log(`[scheduler] daily EOD trigger fired for ${todayKey}`);
+          Promise.resolve(cfg.onDaily()).catch(err =>
+            console.error('[scheduler] daily EOD callback error:', err),
+          );
+        }
       }
 
-      if (cfg.onDaily && this.lastDailyDate !== todayKey) {
-        this.lastDailyDate = todayKey;
-        console.log(`[scheduler] daily EOD trigger fired for ${todayKey}`);
-        Promise.resolve(cfg.onDaily()).catch(err =>
-          console.error('[scheduler] daily EOD callback error:', err),
-        );
+      if (hour === 21 && minute === 0) {
+        if (cfg.onArchive && this.lastArchiveDate !== todayKey) {
+          this.lastArchiveDate = todayKey;
+          console.log(`[scheduler] archive trigger fired for ${todayKey}`);
+          Promise.resolve(cfg.onArchive()).catch(err =>
+            console.error('[scheduler] archive callback error:', err),
+          );
+        }
       }
     }, 60_000);
 
-    console.log('[scheduler] EOD scheduler started (4:05 PM ET — market-day for stocks, every day for crypto)');
+    console.log('[scheduler] EOD scheduler started (4:05 PM ET reports, 9:00 PM ET archive)');
   }
 
   stop(): void {

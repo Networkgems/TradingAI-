@@ -748,4 +748,20 @@ export class SignalEngine {
       optionsPnl: this.optionsAccount.getState().optionsPnl,
     };
   }
+
+  /**
+   * TRA-219 — daily 9 PM ET archive of the in-memory closed trade history.
+   * Clears the rolling closed-position list (and the per-position signal-type
+   * map keyed by those ids) plus the closed-options list so the Positions and
+   * Options pages start the next session blank. EOD reports persisted under
+   * `reports/<date>.json` still hold the trades for the Calendar tab to load.
+   */
+  archiveClosedTrades(): { positions: number; options: number } {
+    const positions = this.allClosedPositions.length;
+    const closedIds = new Set(this.allClosedPositions.map(p => p.id));
+    this.allClosedPositions = [];
+    for (const id of closedIds) this.positionSignalType.delete(id);
+    const options = this.optionsAccount.archiveClosedOptions();
+    return { positions, options };
+  }
 }

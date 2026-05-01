@@ -662,4 +662,16 @@ export class CryptoSignalEngine {
     this.recentSignals = [...snap.recentSignals];
     this.account.importSnapshot(snap.account);
   }
+
+  /**
+   * TRA-219 — daily 9 PM ET archive of the in-memory closed trade history.
+   * Mirror of `SignalEngine.archiveClosedTrades` for the crypto dashboard.
+   * EOD reports under `crypto-reports/<date>.json` still preserve each day's
+   * closed trades for the Calendar tab.
+   */
+  archiveClosedTrades(): number {
+    const dropped = this.allClosedPositions.length;
+    this.allClosedPositions = [];
+    return dropped;
+  }
 }

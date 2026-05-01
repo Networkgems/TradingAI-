@@ -517,6 +517,19 @@ export class PaperOptionsAccount {
     return Array.from(this.openOptions.values()).some(o => o.symbol === symbol);
   }
 
+  /**
+   * TRA-219 — drop the in-memory closed-options history. The Options page's
+   * "Recent Closed Options" table reads from this list, and we want it cleared
+   * after the daily 9 PM ET archive tick. EOD reports already saved to disk
+   * still contain each day's closed contracts and feed the Calendar tab's
+   * per-date detail view.
+   */
+  archiveClosedOptions(): number {
+    const dropped = this.closedOptions.length;
+    this.closedOptions = [];
+    return dropped;
+  }
+
   /** Serialize current state for durable storage (TRA-140). */
   exportSnapshot(): {
     openOptions: OptionPosition[];

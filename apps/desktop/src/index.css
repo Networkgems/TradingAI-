@@ -999,6 +999,32 @@ tr:hover td { background: #1c2128; }
 .cal-cell--loss { background: rgba(248, 81, 73, 0.07); }
 .cal-cell--today { outline: 1px solid var(--blue); outline-offset: -2px; }
 .cal-cell--empty { background: transparent; }
+.cal-cell--clickable { cursor: pointer; transition: background 0.15s; }
+.cal-cell--clickable:hover { background: rgba(56, 139, 253, 0.12); }
+
+.cal-date-filter {
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  color: var(--text);
+  font-size: 0.78rem;
+  padding: 0.2rem 0.5rem;
+  cursor: pointer;
+}
+
+.cal-back-btn {
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  color: var(--text);
+  font-size: 0.78rem;
+  font-weight: 600;
+  padding: 0.2rem 0.6rem;
+  cursor: pointer;
+  margin-right: 0.6rem;
+}
+
+.cal-back-btn:hover { border-color: var(--blue); color: var(--blue); }
 
 .cal-day-num {
   font-size: 0.78rem;

@@ -1,6 +1,6 @@
 import { useEffect, useLayoutEffect, useRef, useState } from 'react';
 import { createPortal } from 'react-dom';
-import type { TradeSignal, Position, AccountState, OptionPosition, OptionsAccountState, EodReport, CryptoEngineState, NewsItem } from '@trading-app/shared';
+import type { TradeSignal, Position, AccountState, OptionPosition, OptionsAccountState, CryptoEngineState, NewsItem } from '@trading-app/shared';
 import { DEFAULT_ACCOUNT_SETTINGS } from '@trading-app/shared';
 import LoginPage from './LoginPage.tsx';
 import ForgotPasswordPage from './ForgotPasswordPage.tsx';
@@ -241,7 +241,6 @@ function CryptoDashboard({ token, onBack, onLogout, onActivity }: { token: strin
   const signals = state?.signals ?? [];
   const symbols = state?.symbols ?? [];
   const openPositions = account?.openPositions ?? [];
-  const closedPositions = state?.closedPositions ?? [];
   const autoTradingEnabled = state?.autoTradingEnabled ?? true;
 
   async function toggleAutoTrading() {
@@ -546,31 +545,12 @@ function CryptoDashboard({ token, onBack, onLogout, onActivity }: { token: strin
                 </table>
               </>
             )}
-            {closedPositions.length > 0 && (
-              <>
-                <h3 style={{ marginTop: '1.5rem' }}>Recent Closed</h3>
-                <table>
-                  <thead>
-                    <tr><th>Symbol</th><th>Side</th><th>Qty</th><th>Entry</th><th>Exit</th><th>P&amp;L</th><th>Closed</th></tr>
-                  </thead>
-                  <tbody>
-                    {closedPositions.map(p => (
-                      <tr key={p.id}>
-                        <td className="symbol">{p.symbol}</td>
-                        <td className={p.side === 'buy' ? 'green' : 'red'}>{p.side.toUpperCase()}</td>
-                        <td>{p.quantity}</td>
-                        <td>${fmt(p.entryPrice)}</td>
-                        <td>${fmt(p.side === 'buy' ? p.takeProfit : p.stopLoss)}</td>
-                        <td className={(p.pnl ?? 0) >= 0 ? 'green' : 'red'}>{fmtDollar(p.pnl ?? 0)}</td>
-                        <td className="muted">{p.closedAt ? formatTime(p.closedAt) : '—'}</td>
-                      </tr>
-                    ))}
-                  </tbody>
-                </table>
-              </>
-            )}
-            {openPositions.length === 0 && closedPositions.length === 0 && (
-              <div className="empty">No positions yet. Signals will auto-open paper positions.</div>
+            {openPositions.length === 0 && (
+              <div className="empty">
+                No open positions. Signals will auto-open paper positions.
+                <br /><br />
+                <span className="muted">Closed trades archive nightly at 9:00 PM ET — view per-day history under the <strong>Calendar</strong> tab.</span>
+              </div>
             )}
           </div>
         )}
@@ -693,8 +673,6 @@ function signalLabel(type: string) {
 
 function Dashboard({ token, onLogout, onGoHome, onActivity }: { token: string; onLogout: () => void; onGoHome: () => void; onActivity?: () => void }) {
   const [state, setState] = useState<AppState | null>(null);
-  const [eodReport, setEodReport] = useState<EodReport | null>(null);
-  const [eodCollapsed, setEodCollapsed] = useState(false);
   const [connected, setConnected] = useState(false);
   const [tab, setTab] = useState<'watchlist' | 'signals' | 'positions' | 'options' | 'news' | 'settings' | 'calendar'>('watchlist');
   const [news, setNews] = useState<NewsItem[]>([]);
@@ -730,7 +708,8 @@ function Dashboard({ token, onLogout, onGoHome, onActivity }: { token: string; o
         try {
           const msg = JSON.parse(e.data as string);
           if (msg.type === 'state') setState(msg.payload as AppState);
-          if (msg.type === 'eod_report') setEodReport(msg.payload as EodReport);
+          // EOD report payloads are now consumed by the Calendar tab via the
+          // `/api/reports/:date` REST endpoint, not pushed into the dashboard.
           onActivity?.();
         } catch { /* ignore malformed */ }
       };
@@ -792,10 +771,8 @@ function Dashboard({ token, onLogout, onGoHome, onActivity }: { token: string; o
   const signals = state?.signals ?? [];
   const symbols = state?.symbols ?? [];
   const openPositions = account?.openPositions ?? [];
-  const closedPositions = state?.closedPositions ?? [];
   const optionsState = state?.options;
   const openOptions: OptionPosition[] = optionsState?.openOptions ?? [];
-  const closedOptions: OptionPosition[] = optionsState?.closedOptions ?? [];
   const autoTradingEnabled = state?.autoTradingEnabled ?? true;
 
   async function toggleAutoTrading() {
@@ -1151,40 +1128,12 @@ function Dashboard({ token, onLogout, onGoHome, onActivity }: { token: string; o
               </>
             )}
 
-            {closedPositions.length > 0 && (
-              <>
-                <h3 style={{ marginTop: '1.5rem' }}>Recent Closed</h3>
-                <table>
-                  <thead>
-                    <tr>
-                      <th>Symbol</th>
-                      <th>Side</th>
-                      <th>Qty</th>
-                      <th>Entry</th>
-                      <th>Exit</th>
-                      <th>P&amp;L</th>
-                      <th>Closed</th>
-                    </tr>
-                  </thead>
-                  <tbody>
-                    {closedPositions.map(p => (
-                      <tr key={p.id}>
-                        <td className="symbol">{p.symbol}</td>
-                        <td className={p.side === 'buy' ? 'green' : 'red'}>{p.side.toUpperCase()}</td>
-                        <td>{p.quantity}</td>
-                        <td>${fmt(p.entryPrice)}</td>
-                        <td>${fmt(p.side === 'buy' ? p.takeProfit : p.stopLoss)}</td>
-                        <td className={(p.pnl ?? 0) >= 0 ? 'green' : 'red'}>{fmtDollar(p.pnl ?? 0)}</td>
-                        <td className="muted">{p.closedAt ? formatTime(p.closedAt) : '—'}</td>
-                      </tr>
-                    ))}
-                  </tbody>
-                </table>
-              </>
-            )}
-
-            {openPositions.length === 0 && closedPositions.length === 0 && (
-              <div className="empty">No positions yet. Signals will auto-open paper positions.</div>
+            {openPositions.length === 0 && (
+              <div className="empty">
+                No open positions. Signals will auto-open paper positions.
+                <br /><br />
+                <span className="muted">Closed trades archive nightly at 9:00 PM ET — view per-day history under the <strong>Calendar</strong> tab.</span>
+              </div>
             )}
           </div>
         )}
@@ -1246,51 +1195,14 @@ function Dashboard({ token, onLogout, onGoHome, onActivity }: { token: string; o
               </>
             )}
 
-            {closedOptions.length > 0 && (
-              <>
-                <h3 style={{ marginTop: '1.5rem' }}>Recent Closed Options</h3>
-                <table>
-                  <thead>
-                    <tr>
-                      <th>Symbol</th>
-                      <th>Type</th>
-                      <th>Contracts</th>
-                      <th>Entry Premium</th>
-                      <th>Exit Premium</th>
-                      <th>P&amp;L</th>
-                      <th>Signal</th>
-                      <th>Closed</th>
-                    </tr>
-                  </thead>
-                  <tbody>
-                    {closedOptions.map(o => {
-                      const exitPremium = o.closedAt ? o.currentPremium : 0;
-                      return (
-                        <tr key={o.id}>
-                          <td className="symbol">{o.symbol}</td>
-                          <td className={o.optionType === 'call' ? 'green' : 'red'}>
-                            {o.optionType.toUpperCase()}
-                          </td>
-                          <td>{o.contracts}</td>
-                          <td>${fmt(o.premiumPaid)}</td>
-                          <td>${fmt(exitPremium)}</td>
-                          <td className={(o.pnl ?? 0) >= 0 ? 'green' : 'red'}>{fmtDollar(o.pnl ?? 0)}</td>
-                          <td>{signalLabel(o.signalType)}</td>
-                          <td className="muted">{o.closedAt ? formatTime(o.closedAt) : '—'}</td>
-                        </tr>
-                      );
-                    })}
-                  </tbody>
-                </table>
-              </>
-            )}
-
-            {openOptions.length === 0 && closedOptions.length === 0 && (
+            {openOptions.length === 0 && (
               <div className="empty">
-                No option positions yet. Options (calls/puts) are auto-opened when any signal triggers (ORB, Reversal, MACD, or Ichimoku).
+                No open option positions. Options (calls/puts) are auto-opened when any signal triggers (ORB, Reversal, MACD, or Ichimoku).
                 <br /><br />
                 <strong>Strategy:</strong> Bullish signals → buy CALL · Bearish signals → buy PUT<br />
                 <strong>Take profit:</strong> +25% → activates trailing stop (15% below peak) · <strong>Stop loss:</strong> −35% · <strong>Max:</strong> 5 trades/day
+                <br /><br />
+                <span className="muted">Closed contracts archive nightly at 9:00 PM ET — view per-day history under the <strong>Calendar</strong> tab.</span>
               </div>
             )}
 
@@ -1338,124 +1250,6 @@ function Dashboard({ token, onLogout, onGoHome, onActivity }: { token: string; o
           <CalendarTab token={token} httpUrl={HTTP_URL} />
         )}
       </main>
-
-      {/* ── EOD Report Panel ─────────────────────────────────────────────── */}
-      {eodReport && (
-        <section className="eod-panel">
-          <div className="eod-header" onClick={() => setEodCollapsed(c => !c)}>
-            <span className="eod-title">EOD Report — {eodReport.date}</span>
-            <span className="eod-summary">
-              <span className={eodReport.combinedPnl >= 0 ? 'green' : 'red'}>
-                {fmtDollar(eodReport.combinedPnl)}
-              </span>
-              &nbsp;·&nbsp;Win rate {(eodReport.winRate * 100).toFixed(0)}%
-              &nbsp;·&nbsp;{eodReport.totalTrades} trades
-            </span>
-            <span className="eod-toggle">{eodCollapsed ? '▲ Show' : '▼ Hide'}</span>
-          </div>
-
-          {!eodCollapsed && (
-            <div className="eod-body">
-              <div className="eod-stats-row">
-                <div className="eod-stat">
-                  <span className="eod-stat-label">Realized P&amp;L</span>
-                  <span className={`eod-stat-value ${eodReport.realizedPnl >= 0 ? 'green' : 'red'}`}>
-                    {fmtDollar(eodReport.realizedPnl)}
-                  </span>
-                </div>
-                <div className="eod-stat">
-                  <span className="eod-stat-label">Unrealized P&amp;L</span>
-                  <span className={`eod-stat-value ${eodReport.unrealizedPnl >= 0 ? 'green' : 'red'}`}>
-                    {fmtDollar(eodReport.unrealizedPnl)}
-                  </span>
-                </div>
-                <div className="eod-stat">
-                  <span className="eod-stat-label">Options P&amp;L</span>
-                  <span className={`eod-stat-value ${eodReport.optionsPnl >= 0 ? 'green' : 'red'}`}>
-                    {fmtDollar(eodReport.optionsPnl)}
-                  </span>
-                </div>
-                <div className="eod-stat">
-                  <span className="eod-stat-label">Combined P&amp;L</span>
-                  <span className={`eod-stat-value ${eodReport.combinedPnl >= 0 ? 'green' : 'red'}`}>
-                    {fmtDollar(eodReport.combinedPnl)}
-                  </span>
-                </div>
-                <div className="eod-stat">
-                  <span className="eod-stat-label">Win Rate</span>
-                  <span className="eod-stat-value">{(eodReport.winRate * 100).toFixed(1)}%</span>
-                </div>
-                <div className="eod-stat">
-                  <span className="eod-stat-label">Avg R:R</span>
-                  <span className="eod-stat-value">1:{eodReport.avgRR.toFixed(2)}</span>
-                </div>
-                <div className="eod-stat">
-                  <span className="eod-stat-label">Signals Fired</span>
-                  <span className="eod-stat-value">{eodReport.signalAccuracy.totalSignals}</span>
-                </div>
-                <div className="eod-stat">
-                  <span className="eod-stat-label">Signal Win %</span>
-                  <span className="eod-stat-value">
-                    {(eodReport.signalAccuracy.winRate * 100).toFixed(1)}%
-                  </span>
-                </div>
-              </div>
-
-              {eodReport.top5Movers.length > 0 && (
-                <div className="eod-movers">
-                  <span className="eod-section-label">Top 5 Movers:</span>
-                  {eodReport.top5Movers.map(m => (
-                    <span key={m.symbol} className="eod-mover">
-                      <strong>{m.symbol}</strong>
-                      <span className={m.changePct >= 0 ? 'green' : 'red'}>
-                        &nbsp;{m.changePct >= 0 ? '+' : ''}{m.changePct.toFixed(2)}%
-                      </span>
-                    </span>
-                  ))}
-                </div>
-              )}
-
-              {eodReport.trades.length > 0 && (
-                <div className="eod-trades">
-                  <span className="eod-section-label">Trade Log ({eodReport.trades.length})</span>
-                  <table>
-                    <thead>
-                      <tr>
-                        <th>Symbol</th>
-                        <th>Strategy</th>
-                        <th>Side</th>
-                        <th>Qty</th>
-                        <th>Entry</th>
-                        <th>Exit</th>
-                        <th>P&amp;L</th>
-                        <th>R:R</th>
-                      </tr>
-                    </thead>
-                    <tbody>
-                      {eodReport.trades.map(t => (
-                        <tr key={t.id}>
-                          <td className="symbol">{t.symbol}</td>
-                          <td>{t.strategy}</td>
-                          <td className={t.side === 'buy' ? 'green' : 'red'}>{t.side.toUpperCase()}</td>
-                          <td>{t.quantity}</td>
-                          <td>${fmt(t.entryPrice)}</td>
-                          <td>${fmt(t.exitPrice)}</td>
-                          <td className={t.pnl >= 0 ? 'green' : 'red'}>{fmtDollar(t.pnl)}</td>
-                          <td>1:{t.rr}</td>
-                        </tr>
-                      ))}
-                    </tbody>
-                  </table>
-                </div>
-              )}
-
-              <div className="eod-generated">
-                Generated at {new Date(eodReport.generatedAt).toLocaleTimeString()}
-              </div>
-            </div>
-          )}
-        </section>
-      )}
     </div>
   );
 }
