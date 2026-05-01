@@ -1,4 +1,4 @@
-import { OrbStrategy, ReversalStrategy, MacdTrendStrategy, BbFadeStrategy, IchimokuStrategy } from '@trading-app/engine';
+import { OrbStrategy, ReversalStrategy, MacdTrendStrategy, BbFadeStrategy, IchimokuStrategy, TradierOptionsClient } from '@trading-app/engine';
 import { WATCHLIST, MANAGED_ACCOUNT_RATIO, MAX_CONSECUTIVE_LOSSES, DAILY_DRAWDOWN_HALT_PCT, aliasWatchlistSymbol, isStockMarketOpen } from '@trading-app/shared';
 import type { TradeSignal, RelativeValueSignal, Candle, OptionsAccountState, SignalType, Position, AccountSettings, AccountState, NewsItem } from '@trading-app/shared';
 import { fetchMinuteBars, fetchQuotes, fetchStocksNews, isYahooBreakerOpen, setActiveInterestSymbols } from './yahoo-feed.js';
@@ -146,6 +146,14 @@ export class SignalEngine {
   private handlers: EngineEventHandler[] = [];
   private autoTradingEnabled = true;
   private mode: 'demo' | 'live' = 'demo';
+  /**
+   * TRA-221 — Tradier live options client. Built from per-options
+   * AccountSettings (apiToken/accountId/env) when mode flips to 'live' AND the
+   * user has saved credentials. When set, the RV-scan opening path and the
+   * options-exit path mirror their paper actions to Tradier as real
+   * `buy_to_open` / `sell_to_close` market orders.
+   */
+  private tradierLiveClient: TradierOptionsClient | null = null;
 
   constructor(settings?: AccountSettings, tracker?: PnlTracker, rvScanner?: RelativeValueScannerService) {
     this.tracker = tracker;
@@ -171,6 +179,7 @@ export class SignalEngine {
       managedAccountRatio: settings?.managedAccountRatio,
       optionsDailyTradesLimit: settings?.optionsDailyTradesLimit,
     });
+    if (settings) this.tradierLiveClient = buildTradierLiveClient(settings);
   }
 
   /**
@@ -198,6 +207,10 @@ export class SignalEngine {
       managedAccountRatio: settings.managedAccountRatio,
       optionsDailyTradesLimit: settings.optionsDailyTradesLimit,
     });
+    // TRA-221 — re-resolve the Tradier live client whenever settings change
+    // so toggling Live mode or editing the API token takes effect on the
+    // next tick without requiring a server restart.
+    this.tradierLiveClient = buildTradierLiveClient(settings);
     if (this.mode === 'live') {
       // Live mode: leave account/options/tracker untouched so the demo state
       // (equity, positions, dailyPnl) is preserved for a later switch back.
@@ -341,11 +354,12 @@ export class SignalEngine {
     //     traded (no entries, no exits) so the paper options account stays
     //     idle until the user switches to live. Existing open options remain
     //     visible via getState() but are frozen.
-    //   • Live mode: options trading runs (currently still routed through the
-    //     paper options account until a real broker is wired). Stock trading
-    //     is skipped because the live equity broker (Webull) hasn't been
-    //     integrated yet — the stock account stays masked to zero in
-    //     getState() so the UI doesn't display a stale demo balance.
+    //   • Live mode: options trading runs through the paper options account
+    //     for accounting/UI, and TRA-221 mirrors each RV open as a real
+    //     Tradier `buy_to_open` market order when creds are configured.
+    //     Stock trading is skipped because the live equity broker (Webull)
+    //     hasn't been integrated yet — the stock account stays masked to
+    //     zero in getState() so the UI doesn't display a stale demo balance.
 
     if (this.mode === 'demo') {
       const closed = this.account.checkExits(prices);
@@ -381,6 +395,12 @@ export class SignalEngine {
       const optionMarks = await this.refreshOptionMarks();
       const optsClosed = this.optionsAccount.checkExits(prices, optionMarks);
       if (optsClosed.length > 0) {
+        // TRA-221 follow-up: mirror paper exits as Tradier `sell_to_close`
+        // orders. Skipped in this iteration because the closed-position
+        // snapshot zeros `contractsRemaining` and the partial exit at TP1
+        // needs its own sell that fires from inside `checkExits`. Tracked
+        // for follow-up; for now live opens fire on Tradier and the user
+        // manages closes via the Tradier dashboard or `/api/options/:id/close`.
         // Persist equity after options positions close
         this.tracker?.saveEquity(
           this.account.getState().totalEquity,
@@ -403,12 +423,17 @@ export class SignalEngine {
     }
     setActiveInterestSymbols(activeInterest);
 
-    // Fetch candles in parallel batches to avoid 25+ second sequential delay for 25 symbols
-    const CANDLE_BATCH = 5;
-    for (let i = 0; i < activeSymbols.length; i += CANDLE_BATCH) {
-      await Promise.all(
-        activeSymbols.slice(i, i + CANDLE_BATCH).map(sym => this.refreshCandles(sym)),
-      );
+    // Fetch candles in parallel batches to avoid 25+ second sequential delay for 25 symbols.
+    // TRA-221: candles power the equity strategies which only run in demo mode
+    // (TRA-220), so skip the fetch in live to avoid burning Yahoo / Twelve Data
+    // quota — the RV options scanner below uses Tradier chains, not candles.
+    if (this.mode === 'demo') {
+      const CANDLE_BATCH = 5;
+      for (let i = 0; i < activeSymbols.length; i += CANDLE_BATCH) {
+        await Promise.all(
+          activeSymbols.slice(i, i + CANDLE_BATCH).map(sym => this.refreshCandles(sym)),
+        );
+      }
     }
 
     // If auto trading is disabled or daily risk circuit-breaker is active, skip new entries.
@@ -582,6 +607,25 @@ export class SignalEngine {
 
         const opened = this.optionsAccount.openOptionFromRvCandidate(signal);
         if (!opened) continue;
+
+        // TRA-221 — when running live with Tradier configured, mirror the
+        // paper open by submitting a real `buy_to_open` market order. The
+        // paper position remains the canonical record for the engine's
+        // internal state (PnL, exits, daily counters); Tradier execution
+        // happens in the background and a failure is logged but does NOT
+        // roll back the paper open.
+        if (this.mode === 'live' && this.tradierLiveClient && opened.optionSymbol && opened.contracts > 0) {
+          try {
+            const resp = await this.tradierLiveClient.buyContracts(opened.optionSymbol, opened.contracts);
+            console.log(
+              `[signal-engine] tradier live buy_to_open ${opened.optionSymbol} qty=${opened.contracts} order=${resp.id} status=${resp.status}`,
+            );
+          } catch (err: unknown) {
+            console.error(
+              `[signal-engine] tradier live buy failed ${opened.optionSymbol}: ${err instanceof Error ? err.message : String(err)}`,
+            );
+          }
+        }
 
         this.recentSignals.unshift(signal);
         if (this.recentSignals.length > MAX_SIGNALS) this.recentSignals.pop();
@@ -775,4 +819,36 @@ export class SignalEngine {
     const options = this.optionsAccount.archiveClosedOptions();
     return { positions, options };
   }
+}
+
+/**
+ * Build the Tradier options client used to mirror live RV opens (TRA-221).
+ *
+ * Returns `null` whenever the engine should NOT mirror to Tradier:
+ *   • the account is in demo mode, or
+ *   • neither user-saved per-options creds nor env-var fallbacks are present.
+ *
+ * Credential precedence — per-options settings → env vars (matches
+ * relative-value-scanner.ts so a working RV scanner pair also enables live
+ * order placement without re-entering creds).
+ */
+function buildTradierLiveClient(settings: AccountSettings): TradierOptionsClient | null {
+  if (settings.mode !== 'live') return null;
+  const env = (settings.liveTradierEnvOptions ?? 'sandbox') as 'sandbox' | 'production';
+  const apiToken = (
+    settings.liveApiKeyOptions?.trim()
+    || (env === 'production'
+      ? process.env['TRADIER_API_TOKEN']
+      : (process.env['TRADIER_SANDBOX_API_TOKEN'] ?? process.env['TRADIER_API_TOKEN']))
+    || ''
+  ).trim();
+  const accountId = (
+    settings.liveAccountIdOptions?.trim()
+    || (env === 'production'
+      ? process.env['TRADIER_ACCOUNT_ID']
+      : (process.env['TRADIER_SANDBOX_ACCOUNT_ID'] ?? process.env['TRADIER_ACCOUNT_ID']))
+    || ''
+  ).trim();
+  if (!apiToken || !accountId) return null;
+  return new TradierOptionsClient(apiToken, accountId, env);
 }

@@ -1,5 +1,5 @@
 import { useEffect, useState } from 'react';
-import type { AccountSettings, BrokerageType, LiveTradeMode } from '@trading-app/shared';
+import type { AccountSettings, BrokerageType, LiveTradeMode, TradierEnv } from '@trading-app/shared';
 import { DEFAULT_ACCOUNT_SETTINGS } from '@trading-app/shared';
 
 type Market = 'crypto' | 'stocks';
@@ -25,6 +25,21 @@ function readLiveApiSecretCrypto(s: AccountSettings): string {
 }
 function readLiveAccountIdStocks(s: AccountSettings): string {
   return s.liveAccountIdStocks ?? s.liveAccountId ?? '';
+}
+// TRA-221 — Tradier (Options) live credentials. Stored on a dedicated set of
+// fields so options auto-trading can be configured without affecting the
+// stocks (Webull) flow above.
+function readLiveBrokerageTypeOptions(s: AccountSettings): BrokerageType {
+  return s.liveBrokerageTypeOptions ?? 'tradier';
+}
+function readLiveApiKeyOptions(s: AccountSettings): string {
+  return s.liveApiKeyOptions ?? '';
+}
+function readLiveAccountIdOptions(s: AccountSettings): string {
+  return s.liveAccountIdOptions ?? '';
+}
+function readLiveTradierEnvOptions(s: AccountSettings): TradierEnv {
+  return s.liveTradierEnvOptions ?? 'sandbox';
 }
 
 function PasswordInput({
@@ -708,6 +723,12 @@ export default function SettingsPage({ token, httpUrl, context, onModeChange }: 
     | { ok: true; authScheme: 'hmac' | 'cdp'; accountCount: number; currencies: string[] }
     | { ok: false; authScheme?: 'hmac' | 'cdp'; error: string }
   >(null);
+  const [tradierTestStatus, setTradierTestStatus] = useState<'idle' | 'testing'>('idle');
+  const [tradierTestResult, setTradierTestResult] = useState<
+    | null
+    | { ok: true; env: TradierEnv; accountNumber?: string; status?: string; classification?: string }
+    | { ok: false; error: string }
+  >(null);
 
   useEffect(() => {
     fetch(`${httpUrl}/api/account/settings`, {
@@ -764,6 +785,23 @@ export default function SettingsPage({ token, httpUrl, context, onModeChange }: 
       setCoinbaseTestResult({ ok: false, error: err instanceof Error ? err.message : String(err) });
     } finally {
       setCoinbaseTestStatus('idle');
+    }
+  }
+
+  async function handleTestTradier() {
+    setTradierTestStatus('testing');
+    setTradierTestResult(null);
+    try {
+      const r = await fetch(`${httpUrl}/api/options/tradier/test-connection`, {
+        method: 'POST',
+        headers: { Authorization: `Bearer ${token}` },
+      });
+      const data = await r.json();
+      setTradierTestResult(data);
+    } catch (err) {
+      setTradierTestResult({ ok: false, error: err instanceof Error ? err.message : String(err) });
+    } finally {
+      setTradierTestStatus('idle');
     }
   }
 
@@ -1104,6 +1142,95 @@ export default function SettingsPage({ token, httpUrl, context, onModeChange }: 
               </div>
             )}
 
+            {/* TRA-221 — Options live trading via Tradier. Rendered in the
+                admin (no-context) and stocks-dashboard views, since options
+                run on the same equity engine path. */}
+            {(!context || context === 'stocks') && (
+              <div className="live-brokerage-block" style={{ marginTop: '1.5rem' }}>
+                {!context && <h3 className="settings-subheading">Options (Tradier)</h3>}
+
+                <div className="settings-grid">
+                  <div className="settings-field">
+                    <label>Brokerage</label>
+                    <select
+                      value={readLiveBrokerageTypeOptions(settings)}
+                      onChange={e => set('liveBrokerageTypeOptions', e.target.value as BrokerageType)}
+                    >
+                      <option value="tradier">Tradier</option>
+                    </select>
+                  </div>
+
+                  <div className="settings-field">
+                    <label>Environment</label>
+                    <select
+                      value={readLiveTradierEnvOptions(settings)}
+                      onChange={e => set('liveTradierEnvOptions', e.target.value as TradierEnv)}
+                    >
+                      <option value="sandbox">Sandbox (paper)</option>
+                      <option value="production">Production (live)</option>
+                    </select>
+                    <p className="field-hint">
+                      Sandbox uses simulated fills with real chains — safe for first connection.
+                      Switch to Production once you've verified the credentials work.
+                    </p>
+                  </div>
+
+                  <div className="settings-field">
+                    <label>API Token</label>
+                    <PasswordInput
+                      value={readLiveApiKeyOptions(settings)}
+                      onChange={v => set('liveApiKeyOptions', v)}
+                      placeholder={'Tradier OAuth token (e.g. abc123XYZ…)'}
+                      autoComplete="off"
+                    />
+                    <p className="field-hint">
+                      Generate from Tradier dashboard → API Access. Production tokens are separate
+                      from sandbox tokens — make sure the token matches the Environment selected above.
+                    </p>
+                  </div>
+
+                  <div className="settings-field">
+                    <label>Account ID</label>
+                    <input
+                      type="text"
+                      placeholder="Tradier account number (e.g. VA1234567)"
+                      value={readLiveAccountIdOptions(settings)}
+                      onChange={e => set('liveAccountIdOptions', e.target.value)}
+                    />
+                  </div>
+                </div>
+
+                <div className="settings-field" style={{ marginTop: '1rem' }}>
+                  <button
+                    type="button"
+                    className="btn-secondary"
+                    onClick={handleTestTradier}
+                    disabled={tradierTestStatus === 'testing'}
+                  >
+                    {tradierTestStatus === 'testing' ? 'Testing…' : 'Test Tradier Connection'}
+                  </button>
+                  <p className="field-hint">
+                    Reads your account profile from Tradier to verify the saved credentials. No orders are placed.
+                    Save the form first if you just edited the API token.
+                  </p>
+                  {tradierTestResult && (
+                    tradierTestResult.ok ? (
+                      <div className="save-success" style={{ marginTop: '0.5rem' }}>
+                        ✓ Connected (env={tradierTestResult.env}). Tradier account
+                        {tradierTestResult.accountNumber ? ` ${tradierTestResult.accountNumber}` : ''}
+                        {tradierTestResult.status ? `, status=${tradierTestResult.status}` : ''}
+                        {tradierTestResult.classification ? `, ${tradierTestResult.classification}` : ''}.
+                      </div>
+                    ) : (
+                      <div className="save-error" style={{ marginTop: '0.5rem' }}>
+                        ✗ {tradierTestResult.error}
+                      </div>
+                    )
+                  )}
+                </div>
+              </div>
+            )}
+
             {context === 'crypto' && (
               <div className="settings-field" style={{ marginTop: '1rem' }}>
                 <button
@@ -1144,7 +1271,7 @@ export default function SettingsPage({ token, httpUrl, context, onModeChange }: 
                 </>
               ) : (
                 <>
-                  <strong>Live trading is not yet active.</strong> Connect your brokerage credentials above and save — the integration will be enabled in a future update.
+                  <strong>Live options trading via Tradier is enabled.</strong> Once you save a valid Tradier API token and Account ID and switch the account to <em>Live</em>, the relative-value scanner routes new options signals to Tradier as <code>buy_to_open</code> market orders. Stock-share live trading via Webull is not yet active — Webull credentials are stored for a future update.
                 </>
               )}
             </div>

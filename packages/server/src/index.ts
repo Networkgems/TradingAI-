@@ -36,7 +36,7 @@ import {
 import { sendPasswordResetEmail } from './email.js';
 import { rotateBackups, checkDataDirHealth } from './trade-store.js';
 import { TradierRelativeValueScannerService } from './relative-value-scanner.js';
-import { CoinbaseOrderClient } from '@trading-app/engine';
+import { CoinbaseOrderClient, tradierBaseUrl } from '@trading-app/engine';
 import { fetchQuotes } from './yahoo-feed.js';
 import {
   runFirstBootMigration,
@@ -919,6 +919,77 @@ app.post('/api/crypto/coinbase/test-connection', requireAuth, async (_req, res) 
   } catch (err: unknown) {
     const message = err instanceof Error ? err.message : String(err);
     res.json({ ok: false, authScheme, error: message });
+  }
+});
+
+/**
+ * Smoke-test Tradier live credentials without placing any orders (TRA-221).
+ *
+ * Reads the user's saved options API token, account ID, and environment from
+ * AccountSettings and issues an authenticated GET against
+ * `/v1/user/profile`. Tradier returns the account list scoped to the token,
+ * so we can confirm the supplied accountId is reachable. Falls back to env
+ * vars only if the user explicitly left the per-options fields blank — a hint
+ * that the saved RV-scanner creds should also work for live trading.
+ */
+app.post('/api/options/tradier/test-connection', requireAuth, async (_req, res) => {
+  const username = res.locals['authUser'] as string;
+  const settings = getSettings(username);
+  const env = (settings.liveTradierEnvOptions ?? 'sandbox') as 'sandbox' | 'production';
+  const apiToken = (
+    settings.liveApiKeyOptions?.trim()
+    || (env === 'production'
+      ? process.env['TRADIER_API_TOKEN']
+      : (process.env['TRADIER_SANDBOX_API_TOKEN'] ?? process.env['TRADIER_API_TOKEN']))
+    || ''
+  ).trim();
+  const accountId = (
+    settings.liveAccountIdOptions?.trim()
+    || (env === 'production'
+      ? process.env['TRADIER_ACCOUNT_ID']
+      : (process.env['TRADIER_SANDBOX_ACCOUNT_ID'] ?? process.env['TRADIER_ACCOUNT_ID']))
+    || ''
+  ).trim();
+  if (!apiToken || !accountId) {
+    res.json({ ok: false, error: 'Tradier API token and Account ID are not configured. Save them in Settings before testing.' });
+    return;
+  }
+  try {
+    const profileResp = await fetch(`${tradierBaseUrl(env)}/user/profile`, {
+      headers: { Authorization: `Bearer ${apiToken}`, Accept: 'application/json' },
+    });
+    if (!profileResp.ok) {
+      const text = await profileResp.text().catch(() => '');
+      res.json({ ok: false, error: `Tradier ${profileResp.status} — ${text || profileResp.statusText}` });
+      return;
+    }
+    const data = (await profileResp.json()) as {
+      profile?: {
+        account?:
+          | { account_number?: string; status?: string; classification?: string; type?: string }
+          | { account_number?: string; status?: string; classification?: string; type?: string }[];
+      };
+    };
+    const accountsRaw = data.profile?.account;
+    const accounts = Array.isArray(accountsRaw) ? accountsRaw : accountsRaw ? [accountsRaw] : [];
+    const matched = accounts.find(a => a.account_number === accountId);
+    if (!matched) {
+      const known = accounts.map(a => a.account_number).filter(Boolean).join(', ') || 'none';
+      res.json({
+        ok: false,
+        error: `Token authenticated but Account ID ${accountId} not found on this Tradier profile (known: ${known}).`,
+      });
+      return;
+    }
+    res.json({
+      ok: true,
+      env,
+      accountNumber: matched.account_number,
+      status: matched.status,
+      classification: matched.classification,
+    });
+  } catch (err: unknown) {
+    res.json({ ok: false, error: err instanceof Error ? err.message : String(err) });
   }
 });
 

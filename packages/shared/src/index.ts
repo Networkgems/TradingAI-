@@ -159,8 +159,15 @@ export const MANAGED_ACCOUNT_RATIO = 0.5;   // 50% of total account auto-managed
 // ── Account Modes ─────────────────────────────────────────────────────────────
 
 export type AccountMode = 'demo' | 'live';
-export type BrokerageType = 'webull' | 'coinbase';
+export type BrokerageType = 'webull' | 'coinbase' | 'tradier';
 export type LiveTradeMode = 'ai_in_brokerage' | 'transfer_to_platform';
+/**
+ * Tradier exposes two parallel API hosts (TRA-221). `sandbox` is the paper
+ * environment with simulated fills and free real-time options data; `production`
+ * is the live brokerage where orders execute against real money. Stored on
+ * AccountSettings so users can flip between them without re-entering creds.
+ */
+export type TradierEnv = 'sandbox' | 'production';
 
 export interface AccountSettings {
   mode: AccountMode;
@@ -208,6 +215,15 @@ export interface AccountSettings {
   liveTradeModeStocks?: LiveTradeMode;
   liveApiKeyStocks?: string;
   liveAccountIdStocks?: string;
+  // Live mode settings — Options (Tradier, TRA-221). Options auto-trading runs
+  // through Tradier's REST API (`/markets/options/*` + `/accounts/{id}/orders`).
+  // Stored separately from Webull stocks creds so users can opt into options-
+  // only auto-trading without configuring an equity broker.
+  liveBrokerageTypeOptions?: BrokerageType;
+  liveApiKeyOptions?: string;
+  liveAccountIdOptions?: string;
+  /** Sandbox (default) or production. Sandbox uses simulated fills + real chains. */
+  liveTradierEnvOptions?: TradierEnv;
 }
 
 export const DEFAULT_ACCOUNT_SETTINGS: AccountSettings = {
@@ -234,6 +250,10 @@ export const DEFAULT_ACCOUNT_SETTINGS: AccountSettings = {
   liveTradeModeStocks: 'ai_in_brokerage',
   liveApiKeyStocks: '',
   liveAccountIdStocks: '',
+  liveBrokerageTypeOptions: 'tradier',
+  liveApiKeyOptions: '',
+  liveAccountIdOptions: '',
+  liveTradierEnvOptions: 'sandbox',
 };
 export const WATCHLIST_SIZE = 25;
 export const OPTIONS_BUDGET_RATIO = 0.05;   // 5% of managed equity per options trade
