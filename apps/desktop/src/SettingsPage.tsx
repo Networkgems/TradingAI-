@@ -50,6 +50,10 @@ function PasswordInput({
   disabled,
   required,
   minLength,
+  // TRA-222 — set for the Coinbase CDP private key field so newlines survive
+  // the paste. Single-line inputs strip newlines, breaking PEM parsing.
+  multiline,
+  rows,
 }: {
   value: string;
   onChange: (v: string) => void;
@@ -58,21 +62,58 @@ function PasswordInput({
   disabled?: boolean;
   required?: boolean;
   minLength?: number;
+  multiline?: boolean;
+  rows?: number;
 }) {
   const [show, setShow] = useState(false);
+  // `-webkit-text-security: disc` is the only way to mask a textarea in
+  // Chromium/Electron. Falls back to plain text on browsers that don't
+  // support it, which is acceptable on a local desktop app.
+  const maskedTextareaStyle: React.CSSProperties = show
+    ? {}
+    : { WebkitTextSecurity: 'disc' } as React.CSSProperties;
   return (
-    <div style={{ position: 'relative', display: 'flex', alignItems: 'center' }}>
-      <input
-        type={show ? 'text' : 'password'}
-        value={value}
-        onChange={e => onChange(e.target.value)}
-        autoComplete={autoComplete}
-        placeholder={placeholder}
-        disabled={disabled}
-        required={required}
-        minLength={minLength}
-        style={{ paddingRight: '2.5rem', width: '100%', boxSizing: 'border-box' }}
-      />
+    <div
+      style={{
+        position: 'relative',
+        display: 'flex',
+        alignItems: multiline ? 'flex-start' : 'center',
+      }}
+    >
+      {multiline ? (
+        <textarea
+          value={value}
+          onChange={e => onChange(e.target.value)}
+          autoComplete={autoComplete}
+          placeholder={placeholder}
+          disabled={disabled}
+          required={required}
+          minLength={minLength}
+          rows={rows ?? 6}
+          spellCheck={false}
+          style={{
+            paddingRight: '2.5rem',
+            width: '100%',
+            boxSizing: 'border-box',
+            fontFamily: 'monospace',
+            fontSize: '0.85rem',
+            resize: 'vertical',
+            ...maskedTextareaStyle,
+          }}
+        />
+      ) : (
+        <input
+          type={show ? 'text' : 'password'}
+          value={value}
+          onChange={e => onChange(e.target.value)}
+          autoComplete={autoComplete}
+          placeholder={placeholder}
+          disabled={disabled}
+          required={required}
+          minLength={minLength}
+          style={{ paddingRight: '2.5rem', width: '100%', boxSizing: 'border-box' }}
+        />
+      )}
       <button
         type="button"
         onClick={() => setShow(s => !s)}
@@ -1069,13 +1110,16 @@ export default function SettingsPage({ token, httpUrl, context, onModeChange }: 
                     <PasswordInput
                       value={readLiveApiSecretCrypto(settings)}
                       onChange={v => set('liveApiSecretCrypto', v)}
-                      placeholder={'-----BEGIN EC PRIVATE KEY----- ... -----END EC PRIVATE KEY-----'}
+                      placeholder={'-----BEGIN EC PRIVATE KEY-----\n...\n-----END EC PRIVATE KEY-----'}
                       autoComplete="off"
+                      multiline
+                      rows={6}
                     />
                     <p className="field-hint">
-                      For CDP keys, paste the entire private key including the
-                      <code> -----BEGIN </code> and <code> -----END </code> lines. For legacy HMAC keys,
-                      paste the shared secret.
+                      For CDP keys, paste the entire private key — including the
+                      <code> -----BEGIN </code> and <code> -----END </code> lines and all the
+                      lines in between. The full JSON file Coinbase gives you on download
+                      also works. For legacy HMAC keys, paste the shared secret on a single line.
                     </p>
                   </div>
                 </div>

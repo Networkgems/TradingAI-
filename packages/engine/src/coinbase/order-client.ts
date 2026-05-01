@@ -129,13 +129,17 @@ export class CoinbaseOrderClient {
     this.now = opts.now ?? (() => Math.floor(Date.now() / 1000));
     this.nonce = opts.nonce ?? (() => randomBytes(16).toString('hex'));
 
-    if (looksLikePem(opts.apiSecret)) {
+    const normalized = normalizeCdpSecret(opts.apiSecret);
+    if (looksLikePem(normalized)) {
       this.authScheme = 'cdp';
       try {
-        this.cdpPrivateKey = createPrivateKey({ key: opts.apiSecret, format: 'pem' });
+        this.cdpPrivateKey = createPrivateKey({ key: normalized, format: 'pem' });
       } catch (err: unknown) {
         const msg = err instanceof Error ? err.message : String(err);
-        throw new Error(`CoinbaseOrderClient: failed to parse CDP private key: ${msg}`);
+        throw new Error(
+          `CoinbaseOrderClient: failed to parse CDP private key: ${msg}. ` +
+            `Make sure you pasted the entire key including the -----BEGIN/-----END lines.`,
+        );
       }
     } else {
       this.authScheme = 'hmac';
@@ -308,6 +312,66 @@ function formatSize(n: number): string {
 
 function looksLikePem(s: string): boolean {
   return s.includes('-----BEGIN') && s.includes('-----END');
+}
+
+/**
+ * Coerce whatever the user pasted into the API Secret field into a PEM string
+ * Node's `createPrivateKey` will accept (TRA-222).
+ *
+ * The Settings UI stores this value in a single-line `<input type="password">`,
+ * which strips the real newlines out of a pasted multi-line PEM. JSON-flavoured
+ * downloads from the Coinbase CDP console come with literal "\n" escape
+ * sequences instead of real newlines. Either form fails OpenSSL with
+ * `DECODER routines::unsupported`. Recover by:
+ *
+ *   1. trimming whitespace and any wrapping quote characters,
+ *   2. unwrapping a `{ "name": ..., "privateKey": "..." }` blob if present,
+ *   3. converting literal "\n" / "\r\n" sequences to real newlines,
+ *   4. re-flowing the body into 64-char base64 lines if everything ended up on
+ *      a single line (the no-newline paste case).
+ *
+ * The result is only used to parse the key — the original `apiSecret` is kept
+ * verbatim for the HMAC path so legacy printable-secret callers are unaffected.
+ */
+export function normalizeCdpSecret(raw: string): string {
+  let s = raw.trim();
+  // Strip a single layer of wrapping quotes (users sometimes paste with the
+  // surrounding "..." from a JSON snippet or shell variable).
+  if ((s.startsWith('"') && s.endsWith('"')) || (s.startsWith("'") && s.endsWith("'"))) {
+    s = s.slice(1, -1).trim();
+  }
+  // Coinbase's CDP key download is a JSON blob with `name` + `privateKey`. If
+  // the user pasted the whole file, extract the private key field.
+  if (s.startsWith('{')) {
+    try {
+      const parsed = JSON.parse(s) as { privateKey?: unknown };
+      if (typeof parsed.privateKey === 'string') {
+        s = parsed.privateKey.trim();
+      }
+    } catch {
+      // Fall through — not JSON, treat as raw text.
+    }
+  }
+  // JSON-escaped or single-line-input pastes contain literal "\n" / "\r\n"
+  // escape sequences. Real PEM needs real newlines.
+  s = s.replace(/\\r\\n/g, '\n').replace(/\\n/g, '\n').replace(/\\r/g, '\n');
+  // If the input still has BEGIN/END markers but no real newline anywhere
+  // (the single-line `<input>` strip case), rebuild a proper PEM by
+  // re-wrapping the base64 body at 64 chars.
+  if (!s.includes('\n') && /-----BEGIN [^-]+-----/.test(s) && /-----END [^-]+-----/.test(s)) {
+    const beginMatch = s.match(/-----BEGIN [^-]+-----/);
+    const endMatch = s.match(/-----END [^-]+-----/);
+    if (beginMatch && endMatch) {
+      const begin = beginMatch[0];
+      const end = endMatch[0];
+      const bodyStart = (beginMatch.index ?? 0) + begin.length;
+      const bodyEnd = endMatch.index ?? s.length;
+      const body = s.slice(bodyStart, bodyEnd).replace(/\s+/g, '');
+      const wrapped = body.match(/.{1,64}/g)?.join('\n') ?? body;
+      s = `${begin}\n${wrapped}\n${end}\n`;
+    }
+  }
+  return s;
 }
 
 function base64UrlEncode(buf: Buffer): string {

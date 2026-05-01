@@ -268,4 +268,49 @@ describe('CoinbaseOrderClient (CDP/JWT auth)', () => {
     const client = makeClient();
     expect(() => client.buildCdpJwt('GET', '/api/v3/brokerage/accounts')).toThrow(/non-CDP/);
   });
+
+  // TRA-222 — the Settings UI stores the API Secret in a single-line
+  // <input type="password">, which strips real newlines from pasted PEMs.
+  // CoinbaseOrderClient must still accept the mangled forms users actually
+  // paste. Without this, every order fails before it leaves the process with
+  // OpenSSL `error:1E08010C:DECODER routines::unsupported`.
+  describe('forgiving CDP private key parsing', () => {
+    it('accepts a key whose newlines have been replaced with literal \\n', () => {
+      const { privatePem } = generateCdpKeypair();
+      const escaped = privatePem.replace(/\n/g, '\\n');
+      expect(escaped).not.toBe(privatePem);
+      const client = new CoinbaseOrderClient({ apiKey: CDP_KID, apiSecret: escaped });
+      expect(client.getAuthScheme()).toBe('cdp');
+    });
+
+    it('accepts a key flattened to a single line (no newlines at all)', () => {
+      const { privatePem } = generateCdpKeypair();
+      // Single-line <input> paste: real newlines turn into spaces or vanish.
+      const flattened = privatePem.replace(/\n/g, '');
+      const client = new CoinbaseOrderClient({ apiKey: CDP_KID, apiSecret: flattened });
+      expect(client.getAuthScheme()).toBe('cdp');
+    });
+
+    it('accepts the full JSON download Coinbase produces (extracts privateKey)', () => {
+      const { privatePem } = generateCdpKeypair();
+      const blob = JSON.stringify({
+        name: CDP_KID,
+        privateKey: privatePem,
+      });
+      const client = new CoinbaseOrderClient({ apiKey: CDP_KID, apiSecret: blob });
+      expect(client.getAuthScheme()).toBe('cdp');
+    });
+
+    it('strips wrapping quotes from a copy-pasted JSON value', () => {
+      const { privatePem } = generateCdpKeypair();
+      const quoted = `"${privatePem.replace(/\n/g, '\\n')}"`;
+      const client = new CoinbaseOrderClient({ apiKey: CDP_KID, apiSecret: quoted });
+      expect(client.getAuthScheme()).toBe('cdp');
+    });
+
+    it('still rejects PEMs with garbage between the markers', () => {
+      const broken = '-----BEGIN EC PRIVATE KEY----- not-real-bytes -----END EC PRIVATE KEY-----';
+      expect(() => new CoinbaseOrderClient({ apiKey: CDP_KID, apiSecret: broken })).toThrow(/CDP private key/);
+    });
+  });
 });
