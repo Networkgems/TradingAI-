@@ -336,50 +336,57 @@ export class SignalEngine {
       for (const h of this.handlers) h(earlyState);
     }
 
-    // Live mode: keep market data flowing so the UI shows live quotes, but
-    // freeze the demo account — no new positions, no exits. This way the demo
-    // state the user left is exactly what they see when they switch back.
-    if (this.mode === 'live') {
-      for (const h of this.handlers) h(this.getState());
-      return;
-    }
+    // TRA-220 — split trading paths by account mode:
+    //   • Demo mode: stock paper trading runs as before. Options are NOT
+    //     traded (no entries, no exits) so the paper options account stays
+    //     idle until the user switches to live. Existing open options remain
+    //     visible via getState() but are frozen.
+    //   • Live mode: options trading runs (currently still routed through the
+    //     paper options account until a real broker is wired). Stock trading
+    //     is skipped because the live equity broker (Webull) hasn't been
+    //     integrated yet — the stock account stays masked to zero in
+    //     getState() so the UI doesn't display a stale demo balance.
 
-    const closed = this.account.checkExits(prices);
-    if (closed.length > 0) {
-      this.allClosedPositions.push(...closed);
-      const accountState = this.account.getState();
-      const managedEquity = accountState.totalEquity * MANAGED_ACCOUNT_RATIO;
-      // Annotate daily signal records with outcomes and feed risk governor
-      for (const pos of closed) {
-        const sigType = this.positionSignalType.get(pos.id);
-        const rec = this.dailySignals.find(s => s.symbol === pos.symbol && s.type === sigType);
-        if (rec && rec.outcome == null) {
-          rec.outcome = (pos.pnl ?? 0) > 0 ? 'win' : 'loss';
-          const risk = Math.abs(pos.entryPrice - pos.stopLoss) * pos.quantity;
-          rec.rr = risk > 0 ? Math.abs(pos.pnl ?? 0) / risk : 0;
+    if (this.mode === 'demo') {
+      const closed = this.account.checkExits(prices);
+      if (closed.length > 0) {
+        this.allClosedPositions.push(...closed);
+        const accountState = this.account.getState();
+        const managedEquity = accountState.totalEquity * MANAGED_ACCOUNT_RATIO;
+        // Annotate daily signal records with outcomes and feed risk governor
+        for (const pos of closed) {
+          const sigType = this.positionSignalType.get(pos.id);
+          const rec = this.dailySignals.find(s => s.symbol === pos.symbol && s.type === sigType);
+          if (rec && rec.outcome == null) {
+            rec.outcome = (pos.pnl ?? 0) > 0 ? 'win' : 'loss';
+            const risk = Math.abs(pos.entryPrice - pos.stopLoss) * pos.quantity;
+            rec.rr = risk > 0 ? Math.abs(pos.pnl ?? 0) / risk : 0;
+          }
+          // Feed daily risk governor with the closed trade's P&L
+          this.riskGovernor.recordTrade(pos.pnl ?? 0, managedEquity);
         }
-        // Feed daily risk governor with the closed trade's P&L
-        this.riskGovernor.recordTrade(pos.pnl ?? 0, managedEquity);
+        // Persist equity after equity positions close
+        this.tracker?.saveEquity(
+          this.account.getState().totalEquity,
+          this.optionsAccount.getState().optionsPnl,
+        );
       }
-      // Persist equity after equity positions close
-      this.tracker?.saveEquity(
-        this.account.getState().totalEquity,
-        this.optionsAccount.getState().optionsPnl,
-      );
     }
-    // TRA-159: refresh option marks from the cached chain snapshot for any
-    // open OTM positions. Each lookup hits the scanner's 60s chain cache so
-    // a 30s tick rarely costs a real Tradier round-trip. Positions whose
-    // mark we couldn't refresh are skipped this tick by `checkExits`.
-    const optionMarks = await this.refreshOptionMarks();
 
-    const optsClosed = this.optionsAccount.checkExits(prices, optionMarks);
-    if (optsClosed.length > 0) {
-      // Persist equity after options positions close
-      this.tracker?.saveEquity(
-        this.account.getState().totalEquity,
-        this.optionsAccount.getState().optionsPnl,
-      );
+    if (this.mode === 'live') {
+      // TRA-159: refresh option marks from the cached chain snapshot for any
+      // open OTM/RV positions. Each lookup hits the scanner's 60s chain cache
+      // so a 30s tick rarely costs a real Tradier round-trip. Positions whose
+      // mark we couldn't refresh are skipped this tick by `checkExits`.
+      const optionMarks = await this.refreshOptionMarks();
+      const optsClosed = this.optionsAccount.checkExits(prices, optionMarks);
+      if (optsClosed.length > 0) {
+        // Persist equity after options positions close
+        this.tracker?.saveEquity(
+          this.account.getState().totalEquity,
+          this.optionsAccount.getState().optionsPnl,
+        );
+      }
     }
 
     // TRA-154: tag symbols that have an open position or a recent signal as
@@ -404,8 +411,10 @@ export class SignalEngine {
       );
     }
 
-    // If auto trading is disabled or daily risk circuit-breaker is active, skip new entries
-    if (this.autoTradingEnabled && !this.riskGovernor.isHalted()) {
+    // If auto trading is disabled or daily risk circuit-breaker is active, skip new entries.
+    // TRA-220: stock entries only fire in demo mode — live mode trades options only
+    // until a live equity broker (Webull) is wired up.
+    if (this.mode === 'demo' && this.autoTradingEnabled && !this.riskGovernor.isHalted()) {
       let symbolsWithData = 0;
       // Run strategies and collect new signals
       for (const sym of activeSymbols) {
@@ -468,7 +477,8 @@ export class SignalEngine {
     // this iteration. Routes the highest-scoring `cheap` candidate per symbol
     // into the options account as a long premium ticket. Gated to market
     // hours so we don't burn the Tradier rate-limit on after-hours noise.
-    if (this.autoTradingEnabled && !this.riskGovernor.isHalted() && this.rvScanner && isStockMarketOpen()) {
+    // TRA-220: only runs in live mode — options are not traded in demo.
+    if (this.mode === 'live' && this.autoTradingEnabled && !this.riskGovernor.isHalted() && this.rvScanner && isStockMarketOpen()) {
       if (Date.now() - this.lastRvScanAt >= RV_SCAN_INTERVAL_MS) {
         this.lastRvScanAt = Date.now();
         await this.runRelativeValueScan(activeSymbols);
@@ -670,18 +680,19 @@ export class SignalEngine {
   getState(): EngineState {
     const symbols = Array.from(this.symbolState.values()).filter(s => !this.hiddenSymbols.has(s.symbol));
     if (this.mode === 'live') {
-      // Live mode: no broker is connected, so account, positions, and options
-      // display as zero/empty. The internal demo state stays preserved for a
-      // later switch back to demo.
+      // Live mode (TRA-220): the live equity broker isn't wired up yet, so the
+      // stock account is masked to zero. The options paper account is the
+      // active trading surface in live and surfaces real positions / P&L so
+      // the UI can render them.
       return {
         symbols,
         signals: [...this.recentSignals],
         account: { totalEquity: 0, availableCash: 0, openPositions: [], dailyPnl: 0 },
         closedPositions: [],
-        options: { openOptions: [], closedOptions: [], optionsPnl: 0, optionsCash: 0, dailyOptionsCount: 0 },
+        options: this.optionsAccount.getState(),
         lastTick: Date.now(),
-        tradingHalted: false,
-        haltReason: null,
+        tradingHalted: this.riskGovernor.isHalted(),
+        haltReason: this.riskGovernor.getHaltReason(),
         autoTradingEnabled: this.autoTradingEnabled,
         marketOpen: isStockMarketOpen(),
       };
