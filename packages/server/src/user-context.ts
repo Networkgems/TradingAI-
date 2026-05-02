@@ -429,6 +429,10 @@ async function createUserContext(username: string): Promise<UserContext> {
         openOptions: b?.openOptions ?? [],
         closedOptions: b?.closedOptions ?? [],
         optionsPnl: b?.optionsPnl ?? 0,
+        // TRA-246 — pass per-mode buckets through when present so the demo
+        // dashboard's options P&L survives a server restart without leaking
+        // the live total.
+        optionsPnlByMode: b?.optionsPnlByMode,
         dailyCount: b?.dailyCount ?? 0,
         dailyOtmCount: b?.dailyOtmCount ?? 0,
         dailyRvCount: b?.dailyRvCount ?? 0,

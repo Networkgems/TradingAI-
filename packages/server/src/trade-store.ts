@@ -3,7 +3,7 @@ import { existsSync } from 'fs';
 import { constants as FS } from 'fs';
 import { join, dirname } from 'path';
 import { fileURLToPath } from 'url';
-import type { Position, TradeSignal, OptionPosition, SignalType, TradierEnv } from '@trading-app/shared';
+import type { AccountMode, Position, TradeSignal, OptionPosition, SignalType, TradierEnv } from '@trading-app/shared';
 import type { DailySignalRecord } from './reports/eod-report.js';
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -42,6 +42,12 @@ export interface OptionsBucketSnapshot {
   openOptions: OptionPosition[];
   closedOptions: OptionPosition[];
   optionsPnl: number;
+  /**
+   * TRA-246 — per-mode realized P&L. When absent (legacy snapshot), the
+   * importer attributes the bucket-wide `optionsPnl` total to the live
+   * bucket (demo cannot open options under TRA-220).
+   */
+  optionsPnlByMode?: Partial<Record<AccountMode, number>>;
   dailyCount: number;
   /** Added in TRA-160 — older snapshots may be missing it. */
   dailyOtmCount?: number;

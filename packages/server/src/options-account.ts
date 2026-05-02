@@ -81,7 +81,18 @@ export class PaperOptionsAccount {
   private cash: number;
   private openOptions: Map<string, OptionPosition> = new Map();
   private closedOptions: OptionPosition[] = [];
-  private optionsPnl = 0;
+  /**
+   * TRA-246 — realized options P&L split per account mode. Replaces the
+   * single bucket-wide `optionsPnl` so `getStateForMode('demo')` no longer
+   * surfaces P&L accrued by live-mode trades on the Demo dashboard. Every
+   * exit path (`checkExits` partial + full close, `closeOption`) attributes
+   * its realized P&L to the position's `mode` stamp; positions without a
+   * stamp default to 'demo' (mirrors `getStateForMode`'s pre-TRA-231 routing
+   * for legacy positions). The total is exposed via `getState().optionsPnl`
+   * for consumers (EOD report, PnlTracker) that still need the cross-mode
+   * aggregate.
+   */
+  private optionsPnlByMode: Record<AccountMode, number> = { demo: 0, live: 0 };
   private dailyCount = 0;
   /**
    * Per-source counters retained so the badge `n/N` display can attribute
@@ -123,7 +134,7 @@ export class PaperOptionsAccount {
     this.cash = this.initialEquity;
     this.openOptions.clear();
     this.closedOptions = [];
-    this.optionsPnl = 0;
+    this.optionsPnlByMode = { demo: 0, live: 0 };
     this.dailyCount = 0;
     this.dailyOtmCount = 0;
     this.dailyRvCount = 0;
@@ -166,11 +177,16 @@ export class PaperOptionsAccount {
     this.cash += delta;
   }
 
+  /** TRA-246 — total realized options P&L across both modes. */
+  private totalOptionsPnl(): number {
+    return this.optionsPnlByMode.demo + this.optionsPnlByMode.live;
+  }
+
   getState(): OptionsAccountState {
     return {
       openOptions: Array.from(this.openOptions.values()),
       closedOptions: [...this.closedOptions].slice(-20),
-      optionsPnl: this.optionsPnl,
+      optionsPnl: this.totalOptionsPnl(),
       optionsCash: this.cash,
       dailyOptionsCount: this.dailyCount + this.dailyOtmCount + this.dailyRvCount,
     };
@@ -184,20 +200,22 @@ export class PaperOptionsAccount {
    *
    * Legacy positions persisted before TRA-231 have no `mode` stamp; we route
    * them to `demo` because pre-TRA-220 (when paper options first started
-   * persisting) the engine only opened paper options in demo. `optionsPnl`
-   * and `optionsCash` are NOT filtered: they are bucket-wide totals accrued
-   * across both modes and can't be split without a per-mode P&L tracker,
-   * which is out of scope for this ticket. Per-mode dashboards still see
-   * their own open/closed slates, which is the visibility leak this issue
-   * was opened to fix.
+   * persisting) the engine only opened paper options in demo.
+   *
+   * TRA-246 — `optionsPnl` is now also mode-scoped via `optionsPnlByMode`
+   * (updated at every exit path). `optionsCash` is forced to 0 in the demo
+   * branch because TRA-220 forbids demo from ever opening options, so the
+   * bucket-wide cash always equals the live-side cash; surfacing it on the
+   * Demo dashboard would mislead a user who flipped Live → Demo into
+   * thinking the demo Options account had drawn down its cash.
    */
   getStateForMode(mode: AccountMode): OptionsAccountState {
     const matches = (p: OptionPosition): boolean => (p.mode ?? 'demo') === mode;
     return {
       openOptions: Array.from(this.openOptions.values()).filter(matches),
       closedOptions: this.closedOptions.filter(matches).slice(-20),
-      optionsPnl: this.optionsPnl,
-      optionsCash: this.cash,
+      optionsPnl: this.optionsPnlByMode[mode],
+      optionsCash: mode === 'demo' ? 0 : this.cash,
       dailyOptionsCount: this.dailyCount + this.dailyOtmCount + this.dailyRvCount,
     };
   }
@@ -525,7 +543,9 @@ export class PaperOptionsAccount {
           const partialPnl = (mark - opt.premiumPaid) * exitContracts * 100;
           this.cash += mark * exitContracts * 100;
           this.equity += partialPnl;
-          this.optionsPnl += partialPnl;
+          // TRA-246 — attribute realized P&L to the position's mode bucket so
+          // the Demo / Live dashboards can show their own running totals.
+          this.optionsPnlByMode[opt.mode ?? 'demo'] += partialPnl;
           opt.contractsRemaining -= exitContracts;
           opt.tp1Hit = true;
           // After partial exit, trailing is engaged on the remainder
@@ -553,7 +573,8 @@ export class PaperOptionsAccount {
 
         this.cash += exitPremium * remainingContracts * 100;
         this.equity += pnl;
-        this.optionsPnl += pnl;
+        // TRA-246 — see partial-exit comment above; same per-mode attribution.
+        this.optionsPnlByMode[opt.mode ?? 'demo'] += pnl;
 
         this.openOptions.delete(id);
         this.closedOptions.push({ ...opt });
@@ -575,7 +596,8 @@ export class PaperOptionsAccount {
     opt.contractsRemaining = 0;
     this.cash += mark * remainingContracts * 100;
     this.equity += pnl;
-    this.optionsPnl += pnl;
+    // TRA-246 — same per-mode attribution as the auto-exit paths above.
+    this.optionsPnlByMode[opt.mode ?? 'demo'] += pnl;
     this.openOptions.delete(optionId);
     this.closedOptions.push({ ...opt });
     return { ...opt };
@@ -603,6 +625,13 @@ export class PaperOptionsAccount {
     openOptions: OptionPosition[];
     closedOptions: OptionPosition[];
     optionsPnl: number;
+    /**
+     * TRA-246 — per-mode realized P&L. Total equals demo + live and matches
+     * `optionsPnl`. Typed `Partial` so the snapshot shape matches the
+     * `importSnapshot` parameter (which has to tolerate legacy snapshots
+     * missing one or both keys).
+     */
+    optionsPnlByMode?: Partial<Record<AccountMode, number>>;
     dailyCount: number;
     dailyOtmCount?: number;
     dailyRvCount?: number;
@@ -615,7 +644,8 @@ export class PaperOptionsAccount {
     return {
       openOptions: Array.from(this.openOptions.values()),
       closedOptions: [...this.closedOptions],
-      optionsPnl: this.optionsPnl,
+      optionsPnl: this.totalOptionsPnl(),
+      optionsPnlByMode: { ...this.optionsPnlByMode },
       dailyCount: this.dailyCount,
       dailyOtmCount: this.dailyOtmCount,
       dailyRvCount: this.dailyRvCount,
@@ -631,6 +661,14 @@ export class PaperOptionsAccount {
     openOptions: OptionPosition[];
     closedOptions: OptionPosition[];
     optionsPnl: number;
+    /**
+     * TRA-246 — per-mode P&L bucket. Older snapshots only carry the bucket-
+     * wide `optionsPnl`; we attribute the legacy total to the `live` bucket
+     * because TRA-220 has gated demo from opening options since well before
+     * any persisted snapshot would have built up P&L (the post-TRA-237
+     * one-shot reset already wiped pre-fix state).
+     */
+    optionsPnlByMode?: Partial<Record<AccountMode, number>>;
     dailyCount: number;
     /** Added in TRA-160 — older snapshots don't have it; default to 0. */
     dailyOtmCount?: number;
@@ -643,7 +681,14 @@ export class PaperOptionsAccount {
     this.openOptions.clear();
     for (const o of snap.openOptions) this.openOptions.set(o.id, o);
     this.closedOptions = [...snap.closedOptions];
-    this.optionsPnl = snap.optionsPnl;
+    if (snap.optionsPnlByMode) {
+      this.optionsPnlByMode = {
+        demo: snap.optionsPnlByMode.demo ?? 0,
+        live: snap.optionsPnlByMode.live ?? 0,
+      };
+    } else {
+      this.optionsPnlByMode = { demo: 0, live: snap.optionsPnl };
+    }
     this.dailyCount = snap.dailyCount;
     this.dailyOtmCount = snap.dailyOtmCount ?? 0;
     this.dailyRvCount = snap.dailyRvCount ?? 0;

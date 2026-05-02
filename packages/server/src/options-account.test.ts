@@ -167,3 +167,89 @@ describe('PaperOptionsAccount.checkExits — chain-driven OTM marks', () => {
     expect(entryPremium).toBe(2.0);
   });
 });
+
+describe('PaperOptionsAccount.getStateForMode — per-mode P&L (TRA-246)', () => {
+  it('attributes a live-mode auto-exit to the live bucket only (demo dashboard stays $0)', () => {
+    const acct = new PaperOptionsAccount({ initialEquity: 50_000, managedAccountRatio: 0.5 });
+    // Open as live so the position is mode-stamped 'live'.
+    const pos = acct.openOptionFromCandidate(buildSignal({ mark: 1.0 }), 'live');
+    expect(pos).not.toBeNull();
+
+    // Mark drops past the OTM −20% SL → full exit at the SL level → realized loss.
+    const marks = new Map<string, number>([[pos!.optionSymbol!, 0.75]]);
+    const closed = acct.checkExits(new Map(), marks, 'live');
+    expect(closed).toHaveLength(1);
+    expect(closed[0].pnl).toBeLessThan(0);
+
+    const live = acct.getStateForMode('live');
+    const demo = acct.getStateForMode('demo');
+    // Live bucket holds the realized loss; demo bucket is untouched at $0
+    // even though both views read from the same PaperOptionsAccount instance.
+    expect(live.optionsPnl).toBeCloseTo(closed[0].pnl ?? 0, 5);
+    expect(demo.optionsPnl).toBe(0);
+    // Demo never opens options under TRA-220, so its visible cash is forced
+    // to 0 to avoid surfacing the live-side cash on the Demo dashboard.
+    expect(demo.optionsCash).toBe(0);
+    // Live cash mirrors the underlying account cash (proceeds returned at exit).
+    expect(live.optionsCash).toBeGreaterThan(0);
+    // Bucket-wide getState() still exposes the cross-mode total for the EOD
+    // report / PnlTracker consumers.
+    expect(acct.getState().optionsPnl).toBeCloseTo(closed[0].pnl ?? 0, 5);
+  });
+
+  it('attributes a live manual closeOption to the live bucket only', () => {
+    const acct = new PaperOptionsAccount({ initialEquity: 50_000, managedAccountRatio: 0.5 });
+    const pos = acct.openOptionFromCandidate(buildSignal({ mark: 1.0 }), 'live');
+    expect(pos).not.toBeNull();
+
+    // Bump the current premium so a manual close realizes a $+ P&L.
+    const opened = acct.getState().openOptions[0];
+    opened.currentPremium = 1.50;
+
+    const closed = acct.closeOption(opened.id);
+    expect(closed).not.toBeNull();
+    expect(closed!.pnl).toBeGreaterThan(0);
+
+    expect(acct.getStateForMode('demo').optionsPnl).toBe(0);
+    expect(acct.getStateForMode('live').optionsPnl).toBeCloseTo(closed!.pnl ?? 0, 5);
+  });
+
+  it('legacy snapshot without optionsPnlByMode attributes the bucket-wide total to the live bucket', () => {
+    const acct = new PaperOptionsAccount({ initialEquity: 50_000, managedAccountRatio: 0.5 });
+    // Pre-TRA-246 snapshot — only the bucket-wide optionsPnl is persisted.
+    acct.importSnapshot({
+      openOptions: [],
+      closedOptions: [],
+      optionsPnl: 524.50,
+      dailyCount: 10,
+      currentDayKey: '2026-04-28',
+      cash: 25_000,
+      equity: 25_524.50,
+    });
+    // TRA-220 forbids demo from opening options, so a legacy total can only
+    // have come from live trades; route it to the live bucket on import.
+    expect(acct.getStateForMode('live').optionsPnl).toBe(524.50);
+    expect(acct.getStateForMode('demo').optionsPnl).toBe(0);
+    // Total still equals the legacy field for back-compat consumers.
+    expect(acct.getState().optionsPnl).toBe(524.50);
+  });
+
+  it('round-trips per-mode P&L via export/import', () => {
+    const a = new PaperOptionsAccount({ initialEquity: 50_000, managedAccountRatio: 0.5 });
+    const pos = a.openOptionFromCandidate(buildSignal({ mark: 1.0 }), 'live');
+    expect(pos).not.toBeNull();
+    a.checkExits(new Map(), new Map([[pos!.optionSymbol!, 0.75]]), 'live');
+    const livePnl = a.getStateForMode('live').optionsPnl;
+    expect(livePnl).toBeLessThan(0);
+
+    const snap = a.exportSnapshot();
+    expect(snap.optionsPnlByMode).toBeDefined();
+    expect(snap.optionsPnlByMode!.live).toBeCloseTo(livePnl, 5);
+    expect(snap.optionsPnlByMode!.demo).toBe(0);
+
+    const b = new PaperOptionsAccount({ initialEquity: 50_000, managedAccountRatio: 0.5 });
+    b.importSnapshot(snap);
+    expect(b.getStateForMode('live').optionsPnl).toBeCloseTo(livePnl, 5);
+    expect(b.getStateForMode('demo').optionsPnl).toBe(0);
+  });
+});
