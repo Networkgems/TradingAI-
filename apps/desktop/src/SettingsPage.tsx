@@ -1243,7 +1243,6 @@ export default function SettingsPage({ token, httpUrl, context, onModeChange }: 
               </div>
             )}
 
-
             {context === 'crypto' && (
               <div className="settings-field" style={{ marginTop: '1rem' }}>
                 <button
