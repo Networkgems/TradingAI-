@@ -23,6 +23,13 @@ export type CryptoEngineEventHandler = (state: CryptoEngineState) => void;
 
 const MAX_SIGNALS = 50;
 const NEWS_REFRESH_MS = 5 * 60_000;
+/**
+ * TRA-230 — drop signals from the displayed list once they're no longer
+ * actionable. A signal becomes invalid when it ages past this window or when
+ * the current quote crosses its stop or take-profit. 30 minutes is short
+ * enough to keep the panel relevant on the 1m/5m bars crypto strategies trade.
+ */
+const SIGNAL_VALID_MS = 30 * 60_000;
 
 export class CryptoSignalEngine {
   // TRA-52: ORB disabled (24/7 incompatible, -55% avg return around the clock).
@@ -224,6 +231,14 @@ export class CryptoSignalEngine {
     }
   }
 
+  /**
+   * Clear the displayed signal list without touching positions or equity.
+   * Wired to the "Reset Signals" button (TRA-230).
+   */
+  clearSignals(): void {
+    this.recentSignals = [];
+  }
+
   onTick(handler: CryptoEngineEventHandler): void {
     this.handlers.push(handler);
   }
@@ -351,6 +366,10 @@ export class CryptoSignalEngine {
         quoteStatus: breakerOpen ? 'rate_limited' : 'unavailable',
       });
     }
+
+    // TRA-230: drop stale or stop/target-crossed signals so the Signals tab
+    // only shows entries that are still actionable.
+    this.pruneInvalidSignals(prices);
 
     // Broadcast watchlist state early so the UI populates without waiting for candles
     if (this.symbolState.size > 0) {
@@ -536,6 +555,28 @@ export class CryptoSignalEngine {
   private async refreshCandles(symbol: string): Promise<void> {
     const bars = await fetchCryptoMinuteBars(symbol, 80);
     if (bars.length > 0) this.candleCache.set(symbol, bars);
+  }
+
+  /**
+   * Drop signals that are no longer actionable (TRA-230). Crypto signals are
+   * always tied to the spot pair, so we can always check stop/target against
+   * the current quote (no options-style premium edge case here).
+   */
+  private pruneInvalidSignals(prices: Map<string, number>): void {
+    const cutoff = Date.now() - SIGNAL_VALID_MS;
+    this.recentSignals = this.recentSignals.filter(sig => {
+      if (sig.timestamp < cutoff) return false;
+      const price = prices.get(sig.symbol);
+      if (!price) return true;
+      if (sig.side === 'buy') {
+        if (price <= sig.stopLoss) return false;
+        if (price >= sig.takeProfit) return false;
+      } else {
+        if (price >= sig.stopLoss) return false;
+        if (price <= sig.takeProfit) return false;
+      }
+      return true;
+    });
   }
 
   private async refreshDailyCandles(symbol: string): Promise<void> {

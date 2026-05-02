@@ -309,6 +309,13 @@ function CryptoDashboard({ token, onBack, onLogout, onActivity }: { token: strin
     }
   }
 
+  async function resetSignals() {
+    await fetch(`${HTTP_URL}/api/crypto/signals/reset`, {
+      method: 'POST',
+      headers: { Authorization: `Bearer ${token}` },
+    }).catch(() => {});
+  }
+
   return (
     <div className="app">
       <header className="header">
@@ -481,6 +488,16 @@ function CryptoDashboard({ token, onBack, onLogout, onActivity }: { token: strin
 
         {state && tab === 'signals' && (
           <div className="signals-panel">
+            <div className="signals-toolbar">
+              <button
+                className="btn-secondary btn-sm"
+                onClick={resetSignals}
+                disabled={signals.length === 0}
+                title="Clear the signal list"
+              >
+                Reset Signals
+              </button>
+            </div>
             {signals.length === 0 ? (
               <div className="empty">No signals yet — engine is scanning {symbols.filter(s => s.lastUpdated > 0).length} symbols…</div>
             ) : (
@@ -912,6 +929,13 @@ function Dashboard({ token, onLogout, onGoHome, onActivity }: { token: string; o
     }
   }
 
+  async function resetSignals() {
+    await fetch(`${HTTP_URL}/api/signals/reset`, {
+      method: 'POST',
+      headers: { Authorization: `Bearer ${token}` },
+    }).catch(() => {});
+  }
+
   return (
     <div className="app">
       <header className="header">
@@ -1106,6 +1130,16 @@ function Dashboard({ token, onLogout, onGoHome, onActivity }: { token: string; o
 
         {state && tab === 'signals' && (
           <div className="signals-panel">
+            <div className="signals-toolbar">
+              <button
+                className="btn-secondary btn-sm"
+                onClick={resetSignals}
+                disabled={signals.length === 0}
+                title="Clear the signal list"
+              >
+                Reset Signals
+              </button>
+            </div>
             {signals.length === 0 ? (
               <div className="empty">No signals yet — engine is scanning {symbols.filter(s => s.lastUpdated > 0).length} symbols…</div>
             ) : (

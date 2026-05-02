@@ -1470,6 +1470,15 @@ tr:hover td { background: #1c2128; }
   background: var(--surface);
 }
 
+.signals-toolbar {
+  display: flex;
+  justify-content: flex-end;
+  gap: 0.5rem;
+  padding: 0.6rem 0.75rem;
+  border-bottom: 1px solid var(--border);
+  background: var(--surface);
+}
+
 .watchlist-add-input {
   flex: 1;
   max-width: 220px;

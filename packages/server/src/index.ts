@@ -971,6 +971,14 @@ app.post('/api/trading/stop', requireAuth, async (req, res) => {
   res.json({ ok: true, mode, autoTradingEnabled: false });
 });
 
+// TRA-230: clear the displayed signal list without resetting positions or equity.
+app.post('/api/signals/reset', requireAuth, async (_req, res) => {
+  const ctx = await userCtx(res);
+  ctx.engine.clearSignals();
+  broadcastEngineState(ctx);
+  res.json({ ok: true });
+});
+
 app.post('/api/positions/:id/close', requireAuth, async (req, res) => {
   const ctx = await userCtx(res);
   const { id } = req.params as Record<string, string>;
@@ -1371,6 +1379,14 @@ app.post('/api/watchlist/stocks/scan', requireAuth, async (_req, res) => {
   } catch (err) {
     res.status(500).json({ error: String(err) });
   }
+});
+
+// TRA-230: clear the displayed crypto signal list without resetting positions or equity.
+app.post('/api/crypto/signals/reset', requireAuth, async (_req, res) => {
+  const ctx = await userCtx(res);
+  ctx.cryptoEngine.clearSignals();
+  broadcastCryptoState(ctx);
+  res.json({ ok: true });
 });
 
 app.post('/api/crypto/positions/:id/close', requireAuth, async (req, res) => {

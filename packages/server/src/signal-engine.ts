@@ -49,6 +49,14 @@ const NEWS_REFRESH_MS = 5 * 60_000;
 // equity does not need second-level freshness — order fills come through
 // the trade path, not the balance poll.
 const TRADIER_BALANCE_REFRESH_MS = 2 * 60_000;
+/**
+ * TRA-230 — drop signals from the displayed list once they're no longer
+ * actionable. A signal becomes invalid when it ages past this window or, for
+ * equity strategies, when the current quote crosses its stop or take-profit.
+ * 30 minutes matches the existing "active interest" window so a symbol's
+ * Twelve Data candle access stays in sync with what's still on the board.
+ */
+const SIGNAL_VALID_MS = 30 * 60_000;
 
 // TRA-191 — periodic relative-value scanner cadence. Tradier's free-tier
 // limit is 60 req/min (sandbox) or 120/min (production). With ~25 active-
@@ -300,6 +308,14 @@ export class SignalEngine {
     }
   }
 
+  /**
+   * Clear the displayed signal list without touching positions, equity, or
+   * daily accuracy records. Wired to the "Reset Signals" button (TRA-230).
+   */
+  clearSignals(): void {
+    this.recentSignals = [];
+  }
+
   onTick(handler: EngineEventHandler): void {
     this.handlers.push(handler);
   }
@@ -393,6 +409,10 @@ export class SignalEngine {
         quoteStatus: breakerOpen ? 'rate_limited' : 'unavailable',
       });
     }
+
+    // TRA-230: drop stale or stop/target-crossed signals so the Signals tab
+    // only shows entries that are still actionable.
+    this.pruneInvalidSignals(prices);
 
     // Broadcast watchlist state early so the UI populates without waiting for candles
     if (this.symbolState.size > 0) {
@@ -711,6 +731,30 @@ export class SignalEngine {
   private async refreshCandles(symbol: string): Promise<void> {
     const bars = await fetchMinuteBars(symbol, 80);
     if (bars.length > 0) this.candleCache.set(symbol, bars);
+  }
+
+  /**
+   * Drop signals that are no longer actionable (TRA-230). For equity strategies
+   * we use the symbol's last quote to check stop/target; option-premium signals
+   * (otm_mispricing, relative_value) carry per-share option marks that can't be
+   * compared to the underlying quote, so we only age those out.
+   */
+  private pruneInvalidSignals(prices: Map<string, number>): void {
+    const cutoff = Date.now() - SIGNAL_VALID_MS;
+    this.recentSignals = this.recentSignals.filter(sig => {
+      if (sig.timestamp < cutoff) return false;
+      if (sig.type === 'otm_mispricing' || sig.type === 'relative_value') return true;
+      const price = prices.get(sig.symbol);
+      if (!price) return true;
+      if (sig.side === 'buy') {
+        if (price <= sig.stopLoss) return false;
+        if (price >= sig.takeProfit) return false;
+      } else {
+        if (price >= sig.stopLoss) return false;
+        if (price <= sig.takeProfit) return false;
+      }
+      return true;
+    });
   }
 
   getActiveSymbols(): string[] {
