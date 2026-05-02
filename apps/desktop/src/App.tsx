@@ -705,6 +705,8 @@ function signalLabel(type: string) {
     case 'ichimoku': return 'Ichimoku';
     case 'scalping': return 'Scalping';
     case 'swing_trade': return 'Swing';
+    case 'relative_value': return 'Relative Value';
+    case 'otm_mispricing': return 'OTM Mispricing';
     default: return type;
   }
 }
@@ -1434,10 +1436,10 @@ function Dashboard({ token, onLogout, onGoHome, onActivity }: { token: string; o
 
             {openOptions.length === 0 && closedOptions.length === 0 && (
               <div className="empty">
-                No open option positions. Options (calls/puts) are auto-opened when any signal triggers (ORB, Reversal, MACD, or Ichimoku).
+                No open option positions. Stock options are opened by the <strong>Relative Value</strong> scanner — it pulls each ticker's full chain, fits the IV skew across nearby strikes, and buys long premium on contracts that are statistically cheap vs. the local curve / monotonic price / no-arb checks.
                 <br /><br />
-                <strong>Strategy:</strong> Bullish signals → buy CALL · Bearish signals → buy PUT<br />
-                <strong>Take profit:</strong> +25% → activates trailing stop (15% below peak) · <strong>Stop loss:</strong> −35% · <strong>Max:</strong> 5 trades/day
+                <strong>Strategy:</strong> long premium only · cheap call → buy CALL · cheap put → buy PUT · no naked short legs<br />
+                <strong>Take profit:</strong> +40% partial exit (50%) → trailing stop activates at +25%, trails 15% below peak · <strong>Stop loss:</strong> −25% · <strong>Cap:</strong> {optionsDailyLimit} option trades/day per env
                 <br /><br />
                 <span className="muted">Closed contracts stay listed here until the 9:00 PM ET archive — full per-day history is under the <strong>Calendar</strong> tab.</span>
               </div>
