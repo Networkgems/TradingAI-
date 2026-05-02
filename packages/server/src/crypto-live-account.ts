@@ -13,6 +13,22 @@ const CASH_CURRENCIES = new Set(['USD', 'USDC', 'USDT']);
 const BALANCE_REFRESH_MS = 30_000;
 
 /**
+ * Headroom against Coinbase Advanced Trade taker fees so a market BUY that
+ * spends our entire reported `available_balance` doesn't get rejected for
+ * insufficient funds at fill time. Non-stable taker is up to 0.6% — 0.5%
+ * buffer absorbs that and small price drift between quote and fill (TRA-243).
+ */
+const CASH_FEE_BUFFER = 0.995;
+
+/**
+ * Coinbase Advanced Trade enforces a per-product minimum on the quote size of
+ * a market order; for the major USD pairs this is $1. Below this we skip up
+ * front rather than fire a guaranteed-reject — the SettingsPage `$1 BTC-USD`
+ * smoke test uses the same floor (TRA-243).
+ */
+const MIN_NOTIONAL_USD = 1;
+
+/**
  * Backoff schedule (ms) for polling `GET /orders/historical/{id}` after a
  * market IOC order succeeds. Coinbase usually fills these within tens of ms,
  * but the historical endpoint can briefly report PENDING; budget ~5s total
@@ -193,19 +209,28 @@ export class CryptoLiveAccount {
   async openPosition(signal: TradeSignal, currentPrice: number): Promise<Position | null> {
     let qty = this.sizeFromStop(signal.entryPrice, signal.stopLoss);
     if (qty <= 0) {
-      console.warn(`[crypto-live] skip ${signal.symbol} ${signal.type}: qty=0`);
+      console.warn(`[crypto-live] skip ${signal.symbol} ${signal.type}: qty=0 (entry=${signal.entryPrice} stop=${signal.stopLoss} maxRisk=${this.maxRiskPerTrade().toFixed(2)})`);
       return null;
     }
+    // Cap by managed equity: never spend more than the user has authorised
+    // the engine to trade with (managedAccountRatio × total equity).
     const maxQtyForManagedEquity = this.managedEquity() / currentPrice;
     qty = Math.min(qty, maxQtyForManagedEquity);
+    // TRA-243 — Cap by available USD cash so accounts whose equity is mostly
+    // held in crypto (or whose user-configured risk targets a bigger fund) can
+    // still trade. Without this the engine would skip every signal for a
+    // small-cash account on `cost > cash`. Risk-per-trade remains an upper
+    // bound; capping here only ever sizes positions DOWN.
+    const maxQtyForCash = (this.cashUsd * CASH_FEE_BUFFER) / currentPrice;
+    qty = Math.min(qty, maxQtyForCash);
     qty = Math.round(qty * 1_000_000) / 1_000_000;
     if (qty <= 0) {
-      console.warn(`[crypto-live] skip ${signal.symbol} ${signal.type}: managed equity too small`);
+      console.warn(`[crypto-live] skip ${signal.symbol} ${signal.type}: no spendable size (cash=${this.cashUsd.toFixed(2)} managedEquity=${this.managedEquity().toFixed(2)} price=${currentPrice})`);
       return null;
     }
     const cost = currentPrice * qty;
-    if (cost > this.cashUsd) {
-      console.warn(`[crypto-live] skip ${signal.symbol} ${signal.type}: cost=${cost.toFixed(2)} > cash=${this.cashUsd.toFixed(2)}`);
+    if (cost < MIN_NOTIONAL_USD) {
+      console.warn(`[crypto-live] skip ${signal.symbol} ${signal.type}: cost=${cost.toFixed(2)} < $${MIN_NOTIONAL_USD} Coinbase minimum (cash=${this.cashUsd.toFixed(2)} maxRisk=${this.maxRiskPerTrade().toFixed(2)})`);
       return null;
     }
 

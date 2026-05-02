@@ -303,3 +303,75 @@ describe('CryptoLiveAccount fill reconciliation (TRA-156)', () => {
     expect(coinbase.getOrder).toHaveBeenCalledTimes(1); // terminal — no retry
   });
 });
+
+describe('CryptoLiveAccount small-fund sizing (TRA-243)', () => {
+  it('caps qty by available cash so a small-cash account still trades', async () => {
+    // $20 USD cash + sizeable BTC holdings. Default risk knobs (0.5 / 0.01)
+    // would request ~$2,500 of BTC at this stop distance — pre-TRA-243 this
+    // skipped on `cost > cash`. Now we cap by cash and ship the order.
+    const coinbase = new FakeCoinbaseClient();
+    coinbase.listAccounts.mockResolvedValue([
+      {
+        uuid: 'usd', name: 'USD', currency: 'USD',
+        available_balance: { value: '20', currency: 'USD' },
+        hold: { value: '0', currency: 'USD' },
+      },
+      {
+        uuid: 'btc', name: 'BTC', currency: 'BTC',
+        available_balance: { value: '0.1', currency: 'BTC' },
+        hold: { value: '0', currency: 'BTC' },
+      },
+    ]);
+    coinbase.getProductPrices.mockResolvedValue(new Map([['BTC-USD', 30_000]]));
+    const account = new CryptoLiveAccount(asClient(coinbase), { sleep: async () => {} });
+    await account.refreshBalance();
+
+    coinbase.placeMarketOrder.mockResolvedValueOnce(orderSuccess('o-small'));
+    coinbase.getOrder.mockResolvedValueOnce(
+      orderDetails({ order_id: 'o-small', status: 'FILLED', average_filled_price: '30000', filled_size: '0.000663' }),
+    );
+
+    const pos = await account.openPosition(buildSignal(), 30_000);
+
+    expect(pos).not.toBeNull();
+    expect(coinbase.placeMarketOrder).toHaveBeenCalledTimes(1);
+    const calls = coinbase.placeMarketOrder.mock.calls as unknown as Array<[{ baseSize: number }]>;
+    const call = calls[0]![0];
+    // qty capped by cash with the 0.5% fee buffer: 20 × 0.995 / 30_000 = 0.000663…
+    expect(call.baseSize).toBeLessThanOrEqual(0.000664);
+    // And it stayed strictly below available cash so Coinbase won't reject for fees.
+    expect(call.baseSize * 30_000).toBeLessThanOrEqual(20);
+  });
+
+  it('skips when even the cash-capped size produces sub-minimum notional', async () => {
+    // 50¢ cash → max notional ~$0.50, below Coinbase's $1 minimum. We refuse
+    // to fire a guaranteed-reject and log the reason so the user can act
+    // (fund the wallet or sell some crypto into USD).
+    const { account, coinbase } = buyAccount(0.5);
+    await account.refreshBalance();
+
+    const pos = await account.openPosition(buildSignal(), 30_000);
+
+    expect(pos).toBeNull();
+    expect(coinbase.placeMarketOrder).not.toHaveBeenCalled();
+  });
+
+  it('skips when there is zero spendable cash even with crypto-only equity', async () => {
+    const coinbase = new FakeCoinbaseClient();
+    coinbase.listAccounts.mockResolvedValue([
+      {
+        uuid: 'btc', name: 'BTC', currency: 'BTC',
+        available_balance: { value: '1', currency: 'BTC' },
+        hold: { value: '0', currency: 'BTC' },
+      },
+    ]);
+    coinbase.getProductPrices.mockResolvedValue(new Map([['BTC-USD', 30_000]]));
+    const account = new CryptoLiveAccount(asClient(coinbase), { sleep: async () => {} });
+    await account.refreshBalance();
+
+    const pos = await account.openPosition(buildSignal(), 30_000);
+
+    expect(pos).toBeNull();
+    expect(coinbase.placeMarketOrder).not.toHaveBeenCalled();
+  });
+});
