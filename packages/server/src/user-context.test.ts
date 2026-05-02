@@ -1,0 +1,160 @@
+import { describe, it, expect, beforeAll, beforeEach } from 'vitest';
+import { mkdtempSync, rmSync, existsSync, writeFileSync, mkdirSync } from 'fs';
+import { tmpdir } from 'os';
+import { join } from 'path';
+
+// trade-store + user-context capture DATA_DIR at module evaluation time, so
+// process.env.DATA_DIR must be set BEFORE either module is imported.
+const TMP_ROOT = mkdtempSync(join(tmpdir(), 'user-context-test-'));
+process.env.DATA_DIR = TMP_ROOT;
+
+type TradeStoreModule = typeof import('./trade-store.js');
+type UserContextModule = typeof import('./user-context.js');
+type UsersModule = typeof import('./users.js');
+
+let saveStocksTradeSnapshot: TradeStoreModule['saveStocksTradeSnapshot'];
+let loadStocksTradeSnapshot: TradeStoreModule['loadStocksTradeSnapshot'];
+let runTra237OptionsReset: UserContextModule['runTra237OptionsReset'];
+
+beforeAll(async () => {
+  // Seed a users.json so getAllUsers() returns the test user. users.ts reads a
+  // plain array; only `username` is required by the migration's read path.
+  writeFileSync(
+    join(TMP_ROOT, 'users.json'),
+    JSON.stringify([
+      { username: 'alice', email: '', passwordHash: 'x', role: 'user', createdAt: '2026-05-02T00:00:00.000Z' },
+    ]),
+    'utf-8',
+  );
+  const tradeStore = await import('./trade-store.js');
+  saveStocksTradeSnapshot = tradeStore.saveStocksTradeSnapshot;
+  loadStocksTradeSnapshot = tradeStore.loadStocksTradeSnapshot;
+  const userCtx = await import('./user-context.js');
+  runTra237OptionsReset = userCtx.runTra237OptionsReset;
+  // Populate the in-memory users cache from the seeded users.json.
+  const users = (await import('./users.js')) as UsersModule;
+  await users.loadUsers();
+});
+
+beforeEach(() => {
+  // Wipe the marker file + any lingering user trade snapshots between tests so
+  // each test runs against a deterministic starting state.
+  rmSync(join(TMP_ROOT, '.tra-237-options-reset'), { force: true });
+  rmSync(join(TMP_ROOT, 'users', 'alice'), { recursive: true, force: true });
+  mkdirSync(join(TMP_ROOT, 'users', 'alice'), { recursive: true });
+});
+
+function makeCorruptedSnapshot() {
+  // Mimic the bug shape the user reported: production bucket holds non-zero
+  // OPTS P&L and 10 open contracts that should have lived in sandbox.
+  return {
+    version: 1 as const,
+    savedAt: '',
+    openPositions: [],
+    closedPositions: [],
+    recentSignals: [],
+    dailySignals: [],
+    positionSignalType: [] as Array<[string, 'orb_breakout']>,
+    options: {
+      openOptions: [],
+      closedOptions: [],
+      optionsPnl: 524.50,
+      dailyCount: 10,
+      currentDayKey: '2026-04-28',
+      cash: 100,
+      equity: 624.50,
+    },
+    optionsByEnv: {
+      sandbox: {
+        openOptions: [],
+        closedOptions: [],
+        optionsPnl: 0,
+        dailyCount: 0,
+        currentDayKey: '2026-04-28',
+        cash: 300,
+        equity: 300,
+        tradierEnv: 'sandbox' as const,
+      },
+      production: {
+        openOptions: [
+          // Stand-in for the 10 leaked positions — only count is asserted.
+          {
+            id: 'leak-1',
+            symbol: 'AAPL',
+            optionType: 'call' as const,
+            contracts: 1,
+            contractsRemaining: 1,
+            premiumPaid: 1.0,
+            currentPremium: 1.0,
+            tp1Premium: 1.25,
+            tp1Hit: false,
+            stopLossPremium: 0.75,
+            peakPremium: 1.0,
+            trailingActive: false,
+            trailingStopPremium: 1.2,
+            underlyingEntryPrice: 180,
+            openedAt: 1700000000000,
+            signalId: 's-1',
+            signalType: 'relative_value' as const,
+          },
+        ],
+        closedOptions: [],
+        optionsPnl: 524.50,
+        dailyCount: 10,
+        currentDayKey: '2026-04-28',
+        cash: 100,
+        equity: 624.50,
+        tradierEnv: 'production' as const,
+      },
+    },
+    account: {
+      cash: 300,
+      equity: 300,
+      initialEquity: 25_000,
+      dailyPnl: 0,
+    },
+  };
+}
+
+describe('runTra237OptionsReset — one-shot options bucket cleanup', () => {
+  it('clears optionsByEnv (both buckets) and resets the legacy options blob', async () => {
+    await saveStocksTradeSnapshot('alice', makeCorruptedSnapshot());
+
+    await runTra237OptionsReset();
+
+    const after = await loadStocksTradeSnapshot('alice');
+    expect(after).not.toBeNull();
+    expect(after!.optionsByEnv).toBeDefined();
+    expect(after!.optionsByEnv!.sandbox.openOptions).toEqual([]);
+    expect(after!.optionsByEnv!.sandbox.optionsPnl).toBe(0);
+    expect(after!.optionsByEnv!.sandbox.dailyCount).toBe(0);
+    expect(after!.optionsByEnv!.production.openOptions).toEqual([]);
+    expect(after!.optionsByEnv!.production.optionsPnl).toBe(0);
+    expect(after!.optionsByEnv!.production.dailyCount).toBe(0);
+    expect(after!.options.optionsPnl).toBe(0);
+    expect(after!.options.openOptions).toEqual([]);
+    // Account equity / cash must NOT be touched — only the options state is reset.
+    expect(after!.account.equity).toBe(300);
+    expect(after!.account.cash).toBe(300);
+    // Marker is written so the migration is idempotent.
+    expect(existsSync(join(TMP_ROOT, '.tra-237-options-reset'))).toBe(true);
+  });
+
+  it('is idempotent — second run is a no-op once the marker exists', async () => {
+    await saveStocksTradeSnapshot('alice', makeCorruptedSnapshot());
+    await runTra237OptionsReset();
+    // Re-introduce dirty state and confirm a second run does NOT touch it
+    // (marker short-circuits the migration).
+    await saveStocksTradeSnapshot('alice', makeCorruptedSnapshot());
+    await runTra237OptionsReset();
+    const after = await loadStocksTradeSnapshot('alice');
+    expect(after!.optionsByEnv!.production.optionsPnl).toBe(524.50);
+    expect(after!.optionsByEnv!.production.openOptions).toHaveLength(1);
+  });
+
+  it('handles users with no trade snapshot gracefully (no throw, marker still written)', async () => {
+    expect(existsSync(join(TMP_ROOT, '.tra-237-options-reset'))).toBe(false);
+    await runTra237OptionsReset();
+    expect(existsSync(join(TMP_ROOT, '.tra-237-options-reset'))).toBe(true);
+  });
+});

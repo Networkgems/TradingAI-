@@ -40,6 +40,7 @@ import { CoinbaseOrderClient, tradierBaseUrl } from '@trading-app/engine';
 import { fetchQuotes } from './yahoo-feed.js';
 import {
   runFirstBootMigration,
+  runTra237OptionsReset,
   initAllUserContexts,
   initUserContext,
   ensureUserContext,
@@ -115,6 +116,10 @@ console.log(
 // then bootstrap per-user contexts (engines, trackers, persistence timers) for
 // every known user. New signups get their context created on demand.
 await runFirstBootMigration('admin');
+// TRA-237 — one-shot cleanup of options buckets corrupted by the pre-fix
+// importTradeSnapshot() routing. Runs before context bootstrap so engines
+// load from the cleared snapshot. Idempotent via marker file.
+await runTra237OptionsReset();
 await initAllUserContexts();
 
 // TRA-227 — drop a placeholder QuantTrader research report so the Stocks

@@ -23,6 +23,8 @@ import {
   saveStocksTradeSnapshot,
   saveCryptoTradeSnapshot,
 } from './trade-store.js';
+import type { OptionsBucketSnapshot } from './trade-store.js';
+import type { TradierEnv } from '@trading-app/shared';
 import { getAllUsers } from './users.js';
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -171,6 +173,69 @@ export async function runFirstBootMigration(adminUsername = 'admin'): Promise<vo
   console.log(migratedAny
     ? '[migration TRA-142] complete — admin namespace populated.'
     : '[migration TRA-142] no legacy files to migrate (fresh install).');
+}
+
+/**
+ * TRA-237 — one-shot options reset.
+ *
+ * The TRA-220-era paper-options state was attributed into the wrong env bucket
+ * by the pre-fix `importTradeSnapshot()` (defaulted to the engine's *current*
+ * `tradierEnv` when migrating legacy snapshots, so users who had switched to
+ * production saw their old sandbox P&L surface in the Live Production header).
+ * The routing fix only prevents *new* mis-routings; users whose snapshot was
+ * already corrupted keep the leaked positions in their persisted production
+ * bucket.
+ *
+ * This migration runs once on boot, walks every known user's stocks-trade
+ * snapshot, and clears BOTH options env buckets back to a fresh state so the
+ * dashboard starts clean. Equity stays untouched; cash for each empty bucket
+ * is reseeded from the user's account equity. Idempotent via marker file at
+ * `DATA_DIR/.tra-237-options-reset`.
+ */
+function makeEmptyOptionsBucket(env: TradierEnv | null, equity: number, today: string): OptionsBucketSnapshot {
+  return {
+    openOptions: [],
+    closedOptions: [],
+    optionsPnl: 0,
+    dailyCount: 0,
+    dailyOtmCount: 0,
+    dailyRvCount: 0,
+    currentDayKey: today,
+    cash: equity,
+    equity,
+    tradierEnv: env,
+  };
+}
+
+export async function runTra237OptionsReset(): Promise<void> {
+  const markerFile = join(DATA_DIR, '.tra-237-options-reset');
+  if (existsSync(markerFile)) return;
+
+  const today = new Date().toISOString().slice(0, 10);
+  let resetCount = 0;
+
+  for (const u of getAllUsers()) {
+    try {
+      const snap = await loadStocksTradeSnapshot(u.username);
+      if (!snap) continue;
+      const equity = snap.account?.equity ?? 0;
+      await saveStocksTradeSnapshot(u.username, {
+        ...snap,
+        options: makeEmptyOptionsBucket(null, equity, today),
+        optionsByEnv: {
+          sandbox: makeEmptyOptionsBucket('sandbox', equity, today),
+          production: makeEmptyOptionsBucket('production', equity, today),
+        },
+      });
+      resetCount += 1;
+      console.log(`[migration TRA-237] reset options buckets for ${u.username}`);
+    } catch (err: unknown) {
+      console.warn(`[migration TRA-237] reset failed for ${u.username}: ${err instanceof Error ? err.message : String(err)}`);
+    }
+  }
+
+  await writeFile(markerFile, new Date().toISOString(), 'utf-8');
+  console.log(`[migration TRA-237] complete — cleared options state for ${resetCount} user(s).`);
 }
 
 async function createUserContext(username: string): Promise<UserContext> {
