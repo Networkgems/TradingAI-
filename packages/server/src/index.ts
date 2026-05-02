@@ -41,6 +41,7 @@ import { fetchQuotes } from './yahoo-feed.js';
 import {
   runFirstBootMigration,
   runTra237OptionsReset,
+  runTra241CalendarReset,
   initAllUserContexts,
   initUserContext,
   ensureUserContext,
@@ -120,6 +121,11 @@ await runFirstBootMigration('admin');
 // importTradeSnapshot() routing. Runs before context bootstrap so engines
 // load from the cleared snapshot. Idempotent via marker file.
 await runTra237OptionsReset();
+// TRA-241 — paired with the 9 PM dailyPnl reset fix: the board asked for a
+// fresh P&L calendar across every account so the historical view starts
+// clean. Wipes per-user EOD reports + daily-snapshots before PnlTracker
+// reads them on first construction. Idempotent via marker file.
+await runTra241CalendarReset();
 await initAllUserContexts();
 
 // TRA-227 — drop a placeholder QuantTrader research report so the Stocks

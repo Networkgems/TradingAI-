@@ -1,4 +1,4 @@
-import { mkdir, rename, copyFile, rm, writeFile } from 'fs/promises';
+import { mkdir, rename, copyFile, rm, writeFile, readdir, unlink } from 'fs/promises';
 import { existsSync } from 'fs';
 import { join, dirname } from 'path';
 import { fileURLToPath } from 'url';
@@ -236,6 +236,81 @@ export async function runTra237OptionsReset(): Promise<void> {
 
   await writeFile(markerFile, new Date().toISOString(), 'utf-8');
   console.log(`[migration TRA-237] complete — cleared options state for ${resetCount} user(s).`);
+}
+
+/**
+ * TRA-241 — one-shot P&L calendar wipe across every user.
+ *
+ * Companion to the daily-reset fix (commit `bf8d54e`): the dashboard now
+ * resets `dailyPnl` correctly at the 9 PM ET archive, but the calendar grid
+ * and cumulative stats card still carry the pre-fix EOD reports / daily
+ * snapshots. The board asked us to "clear P&L calendars for all accounts —
+ * we're starting fresh," so this migration removes the file-backed history
+ * that feeds CalendarTab + PnlTracker.getCumulativeStats:
+ *
+ *   - `<userDir>/reports/*.{json,md}`           (stocks Calendar tab)
+ *   - `<userDir>/crypto-reports/*.{json,md}`    (crypto Calendar tab)
+ *   - `<userDir>/daily-snapshots.json`          (weekly/monthly/yearly P&L)
+ *   - `<userDir>/crypto/daily-snapshots.json`   (crypto cumulative P&L)
+ *
+ * Today's calendar is shared across demo / live / sandbox views; per-account
+ * scoping moves to TRA-244, so a single wipe per user covers every dashboard
+ * view at this point. Idempotent via marker `.tra-241-calendar-cleared`.
+ */
+async function clearReportsDir(dir: string): Promise<number> {
+  if (!existsSync(dir)) return 0;
+  let removed = 0;
+  let entries: string[];
+  try {
+    entries = await readdir(dir);
+  } catch {
+    return 0;
+  }
+  for (const name of entries) {
+    if (!name.endsWith('.json') && !name.endsWith('.md')) continue;
+    try {
+      await unlink(join(dir, name));
+      removed += 1;
+    } catch {
+      // file vanished mid-iteration; ignore
+    }
+  }
+  return removed;
+}
+
+export async function runTra241CalendarReset(): Promise<void> {
+  const markerFile = join(DATA_DIR, '.tra-241-calendar-cleared');
+  if (existsSync(markerFile)) return;
+
+  let userCount = 0;
+  let fileCount = 0;
+
+  for (const u of getAllUsers()) {
+    const dir = userDataDir(u.username);
+    if (!existsSync(dir)) continue;
+    try {
+      fileCount += await clearReportsDir(join(dir, 'reports'));
+      fileCount += await clearReportsDir(join(dir, 'crypto-reports'));
+      for (const snapPath of [
+        join(dir, 'daily-snapshots.json'),
+        join(dir, 'crypto', 'daily-snapshots.json'),
+      ]) {
+        if (!existsSync(snapPath)) continue;
+        try {
+          await unlink(snapPath);
+          fileCount += 1;
+        } catch (err: unknown) {
+          console.warn(`[migration TRA-241] could not remove ${snapPath}: ${err instanceof Error ? err.message : String(err)}`);
+        }
+      }
+      userCount += 1;
+    } catch (err: unknown) {
+      console.warn(`[migration TRA-241] reset failed for ${u.username}: ${err instanceof Error ? err.message : String(err)}`);
+    }
+  }
+
+  await writeFile(markerFile, new Date().toISOString(), 'utf-8');
+  console.log(`[migration TRA-241] complete — cleared ${fileCount} calendar file(s) for ${userCount} user(s).`);
 }
 
 async function createUserContext(username: string): Promise<UserContext> {
