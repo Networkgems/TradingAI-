@@ -478,16 +478,17 @@ export class SignalEngine {
     }
 
     // TRA-220 — split trading paths by account mode:
-    //   • Demo mode: stock paper trading runs as before. Options are NOT
-    //     traded (no entries, no exits) so the paper options account stays
-    //     idle until the user switches to live. Existing open options remain
-    //     visible via getState() but are frozen.
-    //   • Live mode: options trading runs through the paper options account
-    //     for accounting/UI, and TRA-221 mirrors each RV open as a real
-    //     Tradier `buy_to_open` market order when creds are configured.
-    //     Stock trading is skipped because the live equity broker (Webull)
-    //     hasn't been integrated yet — the stock account stays masked to
-    //     zero in getState() so the UI doesn't display a stale demo balance.
+    //   • Demo mode: BOTH stocks AND options trade. Stock paper trading runs
+    //     against PaperAccount and the RV options scanner runs against
+    //     PaperOptionsAccount. Nothing is mirrored to a real broker.
+    //   • Tradier Live (production) and Tradier Sandbox (both selected via
+    //     `mode === 'live'` with `liveTradierEnvOptions = production|sandbox`):
+    //     ONLY options trade. Stock entries/exits are skipped because the live
+    //     equity broker (Webull) isn't integrated yet — the stock account is
+    //     masked to zero in getState(). Options trading runs through
+    //     PaperOptionsAccount for accounting/UI, and TRA-221 mirrors each RV
+    //     open as a real Tradier `buy_to_open` market order when creds are
+    //     configured.
 
     if (this.mode === 'demo') {
       const closed = this.account.checkExits(prices);
@@ -515,30 +516,29 @@ export class SignalEngine {
       }
     }
 
-    if (this.mode === 'live') {
-      // TRA-159: refresh option marks from the cached chain snapshot for any
-      // open OTM/RV positions. Each lookup hits the scanner's 60s chain cache
-      // so a 30s tick rarely costs a real Tradier round-trip. Positions whose
-      // mark we couldn't refresh are skipped this tick by `checkExits`.
-      const optionMarks = await this.refreshOptionMarks();
-      // TRA-231 — restrict the live exit pass to live-mode positions so a
-      // demo paper option still sitting in the same env bucket (e.g. legacy
-      // pre-TRA-220 sandbox state) is not silently closed under the user's
-      // feet when they switch into live mode.
-      const optsClosed = this.optionsAccount.checkExits(prices, optionMarks, 'live');
-      if (optsClosed.length > 0) {
-        // TRA-221 follow-up: mirror paper exits as Tradier `sell_to_close`
-        // orders. Skipped in this iteration because the closed-position
-        // snapshot zeros `contractsRemaining` and the partial exit at TP1
-        // needs its own sell that fires from inside `checkExits`. Tracked
-        // for follow-up; for now live opens fire on Tradier and the user
-        // manages closes via the Tradier dashboard or `/api/options/:id/close`.
-        // Persist equity after options positions close
-        this.tracker?.saveEquity(
-          this.account.getState().totalEquity,
-          this.optionsAccount.getState().optionsPnl,
-        );
-      }
+    // TRA-220 fix: options exits run in BOTH demo and live so the demo paper
+    // options account also unwinds at SL/TP. TRA-159 — refresh option marks
+    // from the cached chain snapshot for any open OTM/RV positions; each
+    // lookup hits the scanner's 60s chain cache so a 30s tick rarely costs a
+    // real Tradier round-trip. Positions whose mark we couldn't refresh are
+    // skipped this tick by `checkExits`. TRA-231 — pass `this.mode` so each
+    // tick only closes positions opened under the current mode (demo or
+    // live), preventing the inactive bucket from being silently unwound when
+    // the user switches modes.
+    const optionMarks = await this.refreshOptionMarks();
+    const optsClosed = this.optionsAccount.checkExits(prices, optionMarks, this.mode);
+    if (optsClosed.length > 0) {
+      // TRA-221 follow-up: mirror paper exits as Tradier `sell_to_close`
+      // orders in live mode. Skipped in this iteration because the closed-
+      // position snapshot zeros `contractsRemaining` and the partial exit at
+      // TP1 needs its own sell that fires from inside `checkExits`. Tracked
+      // for follow-up; for now live opens fire on Tradier and the user
+      // manages closes via the Tradier dashboard or `/api/options/:id/close`.
+      // Persist equity after options positions close
+      this.tracker?.saveEquity(
+        this.account.getState().totalEquity,
+        this.optionsAccount.getState().optionsPnl,
+      );
     }
 
     // TRA-154: tag symbols that have an open position or a recent signal as
@@ -556,9 +556,11 @@ export class SignalEngine {
     setActiveInterestSymbols(activeInterest);
 
     // Fetch candles in parallel batches to avoid 25+ second sequential delay for 25 symbols.
-    // TRA-221: candles power the equity strategies which only run in demo mode
-    // (TRA-220), so skip the fetch in live to avoid burning Yahoo / Twelve Data
-    // quota — the RV options scanner below uses Tradier chains, not candles.
+    // TRA-220/221: candles power only the equity strategies (ORB, Reversal,
+    // MACD, BB-fade, Ichimoku) which run in demo mode. Live mode trades
+    // options only via the RV scanner, which pulls Tradier chains directly
+    // and doesn't need candles — skip the fetch in live to avoid burning
+    // Yahoo / Twelve Data quota.
     if (this.mode === 'demo') {
       const CANDLE_BATCH = 5;
       for (let i = 0; i < activeSymbols.length; i += CANDLE_BATCH) {
@@ -569,8 +571,8 @@ export class SignalEngine {
     }
 
     // If auto trading is disabled or daily risk circuit-breaker is active, skip new entries.
-    // TRA-220: stock entries only fire in demo mode — live mode trades options only
-    // until a live equity broker (Webull) is wired up.
+    // TRA-220: stock entries only fire in demo mode. Tradier Live and Sandbox
+    // trade options only — the live equity broker (Webull) isn't wired up yet.
     // TRA-229: isAutoTradingEnabled() resolves the per-mode flag.
     if (this.mode === 'demo' && this.isAutoTradingEnabled() && !this.riskGovernor.isHalted()) {
       let symbolsWithData = 0;
@@ -643,9 +645,12 @@ export class SignalEngine {
     // this iteration. Routes the highest-scoring `cheap` candidate per symbol
     // into the options account as a long premium ticket. Gated to market
     // hours so we don't burn the Tradier rate-limit on after-hours noise.
-    // TRA-220: only runs in live mode — options are not traded in demo.
+    // TRA-220: runs in BOTH demo and live. In demo it opens paper options
+    // alongside the paper stock account (positions stamped `mode: 'demo'`); in
+    // live it also mirrors each open to Tradier (production or sandbox) as a
+    // real `buy_to_open` market order when creds are configured.
     // TRA-229: isAutoTradingEnabled() resolves the per-mode flag.
-    if (this.mode === 'live' && this.isAutoTradingEnabled() && !this.riskGovernor.isHalted() && this.rvScanner && isStockMarketOpen()) {
+    if (this.isAutoTradingEnabled() && !this.riskGovernor.isHalted() && this.rvScanner && isStockMarketOpen()) {
       if (Date.now() - this.lastRvScanAt >= RV_SCAN_INTERVAL_MS) {
         this.lastRvScanAt = Date.now();
         await this.runRelativeValueScan(activeSymbols);
@@ -771,8 +776,8 @@ export class SignalEngine {
           }
         }
 
-        // TRA-231 — RV scanner runs in live mode only (TRA-220), but stamp the
-        // mode explicitly so the Signals panel scopes correctly when filtered.
+        // TRA-231 — stamp the active mode so the Signals panel scopes the
+        // entry per-mode. RV runs in both demo and live (TRA-220 fix).
         signal.mode = this.mode;
         this.recentSignals.unshift(signal);
         if (this.recentSignals.length > MAX_SIGNALS) this.recentSignals.pop();
