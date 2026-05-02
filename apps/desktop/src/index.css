@@ -1,17 +1,122 @@
 *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
 
-:root {
+/*
+ * Theme tokens — TradingAI uses a class-based theme system.
+ *
+ * Light mode is the default and is modelled on Tradier's web client
+ * (web.tradier.com): white card surfaces against a soft gray page bg,
+ * GitHub-style neutral borders, muted navy text, conservative trading
+ * green/red, and a Tradier-feel blue accent.
+ *
+ * Dark mode preserves the original launch palette behind `.theme-dark`.
+ */
+:root,
+.theme-light {
+  color-scheme: light;
+
+  /* Surfaces */
+  --bg: #f6f8fa;
+  --surface: #ffffff;
+  --surface2: #f6f8fa;
+  --surface-raised: #ffffff;
+  --bg-hover: #f3f4f6;
+  --bg-elevated: #fafbfc;
+
+  /* Borders */
+  --border: #d0d7de;
+  --border-subtle: #eaeef2;
+  --border-strong: #afb8c1;
+
+  /* Text */
+  --text: #1f2328;
+  --muted: #57606a;
+  --text-subtle: #8b949e;
+
+  /* Brand & semantic colors */
+  --green: #1a7f37;
+  --green-strong: #116329;
+  --red: #cf222e;
+  --red-strong: #a40e26;
+  --blue: #0969da;
+  --blue-strong: #0550ae;
+  --orange: #bc4c00;
+  --accent-on: #ffffff;
+
+  /* Tinted backgrounds (used for badges, signal cards, calendar cells) */
+  --buy: #dafbe1;
+  --sell: #ffebe9;
+  --green-soft: #dafbe1;
+  --red-soft: #ffebe9;
+  --blue-soft: #ddf4ff;
+  --orange-soft: #fff1e5;
+  --green-tint: rgba(26, 127, 55, 0.07);
+  --red-tint: rgba(207, 34, 46, 0.07);
+
+  /* Notice / banner */
+  --notice-bg: #ddf4ff;
+  --notice-border: #54aeff;
+
+  /* Effects */
+  --shadow-sm: 0 1px 2px rgba(31, 35, 40, 0.06);
+  --shadow: 0 1px 3px rgba(31, 35, 40, 0.08), 0 1px 2px rgba(31, 35, 40, 0.04);
+  --shadow-modal: 0 8px 32px rgba(31, 35, 40, 0.18);
+  --shadow-dropdown: 0 4px 16px rgba(140, 149, 159, 0.25);
+  --modal-backdrop: rgba(31, 35, 40, 0.45);
+  --status-glow: 0 0 0 3px rgba(26, 127, 55, 0.2);
+}
+
+.theme-dark {
+  color-scheme: dark;
+
+  /* Surfaces — original launch palette */
   --bg: #0d1117;
   --surface: #161b22;
+  --surface2: #1c2128;
+  --surface-raised: #1c2128;
+  --bg-hover: #1c2128;
+  --bg-elevated: #1c2128;
+
+  /* Borders */
   --border: #30363d;
+  --border-subtle: #1c2128;
+  --border-strong: #444c56;
+
+  /* Text */
   --text: #e6edf3;
   --muted: #8b949e;
+  --text-subtle: #6e7681;
+
+  /* Brand & semantic colors */
   --green: #3fb950;
+  --green-strong: #56d364;
   --red: #f85149;
+  --red-strong: #ff6b6b;
   --blue: #58a6ff;
+  --blue-strong: #79b8ff;
   --orange: #f0883e;
+  --accent-on: #0d1117;
+
+  /* Tinted backgrounds */
   --buy: #1c3829;
   --sell: #3b1a1a;
+  --green-soft: rgba(63, 185, 80, 0.18);
+  --red-soft: rgba(248, 81, 73, 0.18);
+  --blue-soft: rgba(88, 166, 255, 0.15);
+  --orange-soft: rgba(247, 147, 26, 0.18);
+  --green-tint: rgba(63, 185, 80, 0.07);
+  --red-tint: rgba(248, 81, 73, 0.07);
+
+  /* Notice / banner */
+  --notice-bg: #1c2333;
+  --notice-border: #344266;
+
+  /* Effects */
+  --shadow-sm: 0 1px 2px rgba(0, 0, 0, 0.4);
+  --shadow: 0 4px 12px rgba(0, 0, 0, 0.5);
+  --shadow-modal: 0 8px 32px rgba(0, 0, 0, 0.6);
+  --shadow-dropdown: 0 4px 16px rgba(0, 0, 0, 0.45);
+  --modal-backdrop: rgba(0, 0, 0, 0.55);
+  --status-glow: 0 0 6px var(--green);
 }
 
 body {
@@ -23,6 +128,7 @@ body {
   height: 100vh;
   height: 100dvh;
   overflow: hidden;
+  transition: background-color 150ms ease, color 150ms ease;
 }
 
 .app {
@@ -109,7 +215,7 @@ body {
   border-radius: 50%;
   flex-shrink: 0;
 }
-.status-dot.live { background: var(--green); box-shadow: 0 0 6px var(--green); animation: pulse 2s infinite; }
+.status-dot.live { background: var(--green); box-shadow: var(--status-glow); animation: pulse 2s infinite; }
 .status-dot.offline { background: var(--muted); }
 
 @keyframes pulse {
@@ -189,11 +295,11 @@ th {
 
 td {
   padding: 0.45rem 0.6rem;
-  border-bottom: 1px solid #1c2128;
+  border-bottom: 1px solid var(--border-subtle);
   font-size: 0.82rem;
 }
 
-tr:hover td { background: #1c2128; }
+tr:hover td { background: var(--bg-hover); }
 
 .symbol { font-weight: 700; }
 .price { font-weight: 600; }
@@ -234,13 +340,13 @@ tr:hover td { background: #1c2128; }
   letter-spacing: 0.08em;
 }
 
-.signal-side.buy { background: rgba(63, 185, 80, 0.2); color: var(--green); }
-.signal-side.sell { background: rgba(248, 81, 73, 0.2); color: var(--red); }
+.signal-side.buy { background: var(--green-soft); color: var(--green); }
+.signal-side.sell { background: var(--red-soft); color: var(--red); }
 
 .signal-type {
   font-size: 0.65rem;
   color: var(--blue);
-  background: rgba(88, 166, 255, 0.1);
+  background: var(--blue-soft);
   padding: 0.15em 0.4em;
   border-radius: 3px;
 }
@@ -306,7 +412,7 @@ tr:hover td { background: #1c2128; }
   border-bottom: 1px solid var(--border);
 }
 
-.eod-header:hover { background: #1c2128; }
+.eod-header:hover { background: var(--bg-hover); }
 
 .eod-title {
   font-size: 0.78rem;
@@ -375,7 +481,7 @@ tr:hover td { background: #1c2128; }
 }
 
 .eod-mover {
-  background: var(--bg);
+  background: var(--bg-elevated);
   border: 1px solid var(--border);
   border-radius: 4px;
   padding: 0.15em 0.5em;
@@ -468,7 +574,7 @@ tr:hover td { background: #1c2128; }
   background: var(--blue);
   border: none;
   border-radius: 4px;
-  color: #0d1117;
+  color: var(--accent-on);
   cursor: pointer;
   font-family: inherit;
   font-size: 0.85rem;
@@ -493,7 +599,7 @@ tr:hover td { background: #1c2128; }
   border-radius: 6px;
   min-width: 190px;
   z-index: 10001;
-  box-shadow: 0 4px 16px rgba(0,0,0,0.45);
+  box-shadow: var(--shadow-dropdown);
   overflow: hidden;
 }
 
@@ -520,7 +626,7 @@ tr:hover td { background: #1c2128; }
   transition: background 0.1s;
 }
 
-.profile-dropdown-item:hover { background: #1c2128; }
+.profile-dropdown-item:hover { background: var(--bg-hover); }
 .profile-dropdown-item.danger { color: var(--red); }
 
 .profile-dropdown-divider {
@@ -546,9 +652,9 @@ tr:hover td { background: #1c2128; }
 .logout-btn:hover { color: var(--text); border-color: var(--text); }
 .logout-btn.active { color: var(--blue); border-color: var(--blue); }
 .logout-btn.trading-active { color: var(--red); border-color: var(--red); }
-.logout-btn.trading-active:hover { color: #ff6b6b; border-color: #ff6b6b; }
+.logout-btn.trading-active:hover { color: var(--red-strong); border-color: var(--red-strong); }
 .logout-btn.trading-stopped { color: var(--green); border-color: var(--green); }
-.logout-btn.trading-stopped:hover { color: #5bff76; border-color: #5bff76; }
+.logout-btn.trading-stopped:hover { color: var(--green-strong); border-color: var(--green-strong); }
 .logout-btn:disabled { opacity: 0.5; cursor: not-allowed; }
 
 .btn-close-pos {
@@ -562,7 +668,7 @@ tr:hover td { background: #1c2128; }
   padding: 0.15rem 0.4rem;
   transition: background 0.15s, color 0.15s;
 }
-.btn-close-pos:hover { background: var(--red); color: #fff; }
+.btn-close-pos:hover { background: var(--red); color: #ffffff; }
 
 /* ── Settings Page ────────────────────────────────────────────────────────── */
 
@@ -617,7 +723,7 @@ tr:hover td { background: #1c2128; }
 
 .settings-field input,
 .settings-field select {
-  background: var(--bg);
+  background: var(--surface);
   border: 1px solid var(--border);
   border-radius: 4px;
   color: var(--text);
@@ -683,8 +789,8 @@ tr:hover td { background: #1c2128; }
 .radio-option input[type="radio"] { margin-top: 3px; flex-shrink: 0; }
 
 .live-notice {
-  background: #1c2333;
-  border: 1px solid #344;
+  background: var(--notice-bg);
+  border: 1px solid var(--notice-border);
   border-radius: 5px;
   color: var(--muted);
   font-size: 0.8rem;
@@ -711,7 +817,7 @@ tr:hover td { background: #1c2128; }
   background: var(--blue);
   border: none;
   border-radius: 5px;
-  color: #000;
+  color: var(--accent-on);
   cursor: pointer;
   font-family: inherit;
   font-size: 0.85rem;
@@ -810,7 +916,7 @@ tr:hover td { background: #1c2128; }
   letter-spacing: 0.04em;
 }
 
-.role-badge.admin { background: rgba(74, 144, 226, 0.15); color: var(--blue); }
+.role-badge.admin { background: var(--blue-soft); color: var(--blue); }
 .role-badge.user { background: var(--surface2); color: var(--muted); }
 
 .btn-sm {
@@ -833,7 +939,7 @@ tr:hover td { background: #1c2128; }
 .modal-backdrop {
   position: fixed;
   inset: 0;
-  background: rgba(0, 0, 0, 0.55);
+  background: var(--modal-backdrop);
   display: flex;
   align-items: center;
   justify-content: center;
@@ -847,6 +953,7 @@ tr:hover td { background: #1c2128; }
   padding: 1.5rem;
   width: 100%;
   max-width: 380px;
+  box-shadow: var(--shadow-modal);
 }
 
 /* When a settings section is embedded inside a modal, strip the card chrome
@@ -917,7 +1024,7 @@ tr:hover td { background: #1c2128; }
   transition: color 0.15s, background 0.15s;
 }
 
-.cal-toggle-btn.active { background: var(--blue); color: #0d1117; }
+.cal-toggle-btn.active { background: var(--blue); color: var(--accent-on); }
 .cal-toggle-btn:not(.active):hover { color: var(--text); }
 
 /* Prev / Next nav */
@@ -1005,12 +1112,12 @@ tr:hover td { background: #1c2128; }
 }
 
 .cal-cell:last-child { border-right: none; }
-.cal-cell--win  { background: rgba(63, 185, 80, 0.07); }
-.cal-cell--loss { background: rgba(248, 81, 73, 0.07); }
+.cal-cell--win  { background: var(--green-tint); }
+.cal-cell--loss { background: var(--red-tint); }
 .cal-cell--today { outline: 1px solid var(--blue); outline-offset: -2px; }
 .cal-cell--empty { background: transparent; }
 .cal-cell--clickable { cursor: pointer; transition: background 0.15s; }
-.cal-cell--clickable:hover { background: rgba(56, 139, 253, 0.12); }
+.cal-cell--clickable:hover { background: var(--blue-soft); }
 
 .cal-date-filter {
   background: var(--surface);
@@ -1116,6 +1223,42 @@ tr:hover td { background: #1c2128; }
 }
 
 .cal-year-wl { font-size: 0.65rem; }
+
+/* ── Theme toggle ──────────────────────────────────────────────────────────── */
+
+.theme-toggle {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.4rem;
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  color: var(--muted);
+  cursor: pointer;
+  font-family: inherit;
+  font-size: 0.7rem;
+  padding: 0.25rem 0.6rem;
+  transition: color 0.15s, border-color 0.15s, background 0.15s;
+  line-height: 1;
+}
+
+.theme-toggle:hover {
+  color: var(--text);
+  border-color: var(--border-strong);
+  background: var(--bg-hover);
+}
+
+.theme-toggle-label {
+  font-weight: 600;
+  letter-spacing: 0.04em;
+}
+
+.theme-toggle-floating {
+  position: fixed;
+  top: 0.75rem;
+  right: 0.75rem;
+  z-index: 150;
+}
 
 /* ── Mobile responsive styles (TRA-44) ──────────────────────────────────────── */
 
@@ -1302,12 +1445,13 @@ tr:hover td { background: #1c2128; }
 }
 
 .selector-card:hover {
-  background: #1c2128;
+  background: var(--bg-hover);
   transform: translateY(-3px);
+  box-shadow: var(--shadow);
 }
 
 .selector-card.stocks:hover { border-color: var(--green); }
-.selector-card.crypto:hover { border-color: #f7931a; }
+.selector-card.crypto:hover { border-color: var(--orange); }
 
 .selector-card-icon { display: flex; align-items: center; justify-content: center; }
 .selector-card-title { font-size: 1rem; font-weight: 700; letter-spacing: 0.04em; }
@@ -1339,8 +1483,8 @@ tr:hover td { background: #1c2128; }
   margin-left: 0.35rem;
 }
 
-.mode-badge.stocks { background: rgba(63,185,80,0.15); color: var(--green); }
-.mode-badge.crypto { background: rgba(247,147,26,0.15); color: #f7931a; }
+.mode-badge.stocks { background: var(--green-soft); color: var(--green); }
+.mode-badge.crypto { background: var(--orange-soft); color: var(--orange); }
 
 .account-mode-badge {
   font-size: 0.62rem;
@@ -1352,8 +1496,8 @@ tr:hover td { background: #1c2128; }
   margin-left: 0.4rem;
   vertical-align: middle;
 }
-.account-mode-badge.demo { background: rgba(88,166,255,0.12); color: var(--blue); }
-.account-mode-badge.live { background: rgba(63,185,80,0.12); color: var(--green); }
+.account-mode-badge.demo { background: var(--blue-soft); color: var(--blue); }
+.account-mode-badge.live { background: var(--green-soft); color: var(--green); }
 
 /* TRA-247 — quick Demo/Live account switcher in the dashboard header.
    Segmented control: both options always visible, the active one is filled
@@ -1386,8 +1530,8 @@ tr:hover td { background: #1c2128; }
 .account-mode-option:disabled { cursor: progress; }
 .account-mode-option + .account-mode-option { border-left: 1px solid var(--border); }
 .account-mode-option:hover:not(:disabled):not(.active) { color: var(--text); }
-.account-mode-option.demo.active { background: rgba(88,166,255,0.18); color: var(--blue); }
-.account-mode-option.live.active { background: rgba(63,185,80,0.18); color: var(--green); }
+.account-mode-option.demo.active { background: var(--blue-soft); color: var(--blue); }
+.account-mode-option.live.active { background: var(--green-soft); color: var(--green); }
 
 /* ── Crypto dashboard: orange accent ─────────────────────────────────────────── */
 
