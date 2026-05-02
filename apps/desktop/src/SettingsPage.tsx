@@ -28,14 +28,32 @@ function readLiveApiSecretCrypto(s: AccountSettings): string {
 function readLiveBrokerageTypeOptions(s: AccountSettings): BrokerageType {
   return s.liveBrokerageTypeOptions ?? 'tradier';
 }
-function readLiveApiKeyOptions(s: AccountSettings): string {
-  return s.liveApiKeyOptions ?? '';
-}
-function readLiveAccountIdOptions(s: AccountSettings): string {
-  return s.liveAccountIdOptions ?? '';
-}
 function readLiveTradierEnvOptions(s: AccountSettings): TradierEnv {
   return s.liveTradierEnvOptions ?? 'sandbox';
+}
+// TRA-226 — Sandbox and Production credentials are stored on separate fields
+// so flipping the Environment dropdown no longer clobbers the other env's API
+// token / account number. The reader returns whichever pair matches the
+// currently selected env. Sandbox falls back to the legacy un-suffixed fields
+// for users who saved before the split (production never does — production
+// creds must be entered explicitly to avoid leaking sandbox tokens).
+function readLiveApiKeyOptions(s: AccountSettings, env: TradierEnv): string {
+  if (env === 'production') return s.liveApiKeyOptionsProduction ?? '';
+  return s.liveApiKeyOptionsSandbox ?? s.liveApiKeyOptions ?? '';
+}
+function readLiveAccountIdOptions(s: AccountSettings, env: TradierEnv): string {
+  if (env === 'production') return s.liveAccountIdOptionsProduction ?? '';
+  return s.liveAccountIdOptionsSandbox ?? s.liveAccountIdOptions ?? '';
+}
+function liveApiKeyOptionsField(
+  env: TradierEnv,
+): 'liveApiKeyOptionsSandbox' | 'liveApiKeyOptionsProduction' {
+  return env === 'production' ? 'liveApiKeyOptionsProduction' : 'liveApiKeyOptionsSandbox';
+}
+function liveAccountIdOptionsField(
+  env: TradierEnv,
+): 'liveAccountIdOptionsSandbox' | 'liveAccountIdOptionsProduction' {
+  return env === 'production' ? 'liveAccountIdOptionsProduction' : 'liveAccountIdOptionsSandbox';
 }
 
 function PasswordInput({
@@ -1183,31 +1201,37 @@ export default function SettingsPage({ token, httpUrl, context, onModeChange }: 
                     </select>
                     <p className="field-hint">
                       Sandbox uses simulated fills with real chains — safe for first connection.
-                      Switch to Production once you've verified the credentials work.
+                      Switch to Production once you've verified the credentials work. The API
+                      Token and Account ID below are stored separately per environment, so
+                      flipping between Sandbox and Production keeps each set of credentials.
                     </p>
                   </div>
 
                   <div className="settings-field">
-                    <label>API Token</label>
+                    <label>
+                      API Token ({readLiveTradierEnvOptions(settings) === 'production' ? 'Production' : 'Sandbox'})
+                    </label>
                     <PasswordInput
-                      value={readLiveApiKeyOptions(settings)}
-                      onChange={v => set('liveApiKeyOptions', v)}
+                      value={readLiveApiKeyOptions(settings, readLiveTradierEnvOptions(settings))}
+                      onChange={v => set(liveApiKeyOptionsField(readLiveTradierEnvOptions(settings)), v)}
                       placeholder={'Tradier OAuth token (e.g. abc123XYZ…)'}
                       autoComplete="off"
                     />
                     <p className="field-hint">
                       Generate from Tradier dashboard → API Access. Production tokens are separate
-                      from sandbox tokens — make sure the token matches the Environment selected above.
+                      from sandbox tokens — this field saves only to the selected environment above.
                     </p>
                   </div>
 
                   <div className="settings-field">
-                    <label>Account ID</label>
+                    <label>
+                      Account ID ({readLiveTradierEnvOptions(settings) === 'production' ? 'Production' : 'Sandbox'})
+                    </label>
                     <input
                       type="text"
                       placeholder="Tradier account number (e.g. VA1234567)"
-                      value={readLiveAccountIdOptions(settings)}
-                      onChange={e => set('liveAccountIdOptions', e.target.value)}
+                      value={readLiveAccountIdOptions(settings, readLiveTradierEnvOptions(settings))}
+                      onChange={e => set(liveAccountIdOptionsField(readLiveTradierEnvOptions(settings)), e.target.value)}
                     />
                   </div>
                 </div>

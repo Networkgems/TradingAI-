@@ -220,8 +220,19 @@ export interface AccountSettings {
   // Stored separately from Webull stocks creds so users can opt into options-
   // only auto-trading without configuring an equity broker.
   liveBrokerageTypeOptions?: BrokerageType;
+  // Legacy un-suffixed Tradier creds. Kept as a read-time fallback for users
+  // who saved before TRA-226 split sandbox/production storage. Treated as
+  // sandbox creds on read since `liveTradierEnvOptions` defaulted to sandbox.
   liveApiKeyOptions?: string;
   liveAccountIdOptions?: string;
+  // TRA-226 — sandbox vs production credentials are persisted on separate
+  // fields so flipping `liveTradierEnvOptions` no longer overwrites the other
+  // env's API token / Account ID. The UI shows the pair matching the selected
+  // environment; the server resolves credentials by env at use time.
+  liveApiKeyOptionsSandbox?: string;
+  liveAccountIdOptionsSandbox?: string;
+  liveApiKeyOptionsProduction?: string;
+  liveAccountIdOptionsProduction?: string;
   /** Sandbox (default) or production. Sandbox uses simulated fills + real chains. */
   liveTradierEnvOptions?: TradierEnv;
 }
@@ -253,8 +264,39 @@ export const DEFAULT_ACCOUNT_SETTINGS: AccountSettings = {
   liveBrokerageTypeOptions: 'tradier',
   liveApiKeyOptions: '',
   liveAccountIdOptions: '',
+  liveApiKeyOptionsSandbox: '',
+  liveAccountIdOptionsSandbox: '',
+  liveApiKeyOptionsProduction: '',
+  liveAccountIdOptionsProduction: '',
   liveTradierEnvOptions: 'sandbox',
 };
+
+/**
+ * Resolve the Tradier API token + account id for the env currently selected on
+ * AccountSettings (TRA-226). Sandbox and production credentials live on
+ * separate fields so flipping the environment does not clobber the other env's
+ * token / account number. The legacy un-suffixed fields fall back as sandbox
+ * creds — that was the only env stored before TRA-226.
+ *
+ * Returns trimmed values (or empty strings if nothing is saved). Callers layer
+ * env-var fallbacks on top when the saved fields are empty.
+ */
+export function resolveTradierOptionsCreds(s: AccountSettings): {
+  env: TradierEnv;
+  apiToken: string;
+  accountId: string;
+} {
+  const env: TradierEnv = s.liveTradierEnvOptions ?? 'sandbox';
+  const apiToken = (env === 'production'
+    ? (s.liveApiKeyOptionsProduction ?? '')
+    : (s.liveApiKeyOptionsSandbox ?? s.liveApiKeyOptions ?? '')
+  ).trim();
+  const accountId = (env === 'production'
+    ? (s.liveAccountIdOptionsProduction ?? '')
+    : (s.liveAccountIdOptionsSandbox ?? s.liveAccountIdOptions ?? '')
+  ).trim();
+  return { env, apiToken, accountId };
+}
 export const WATCHLIST_SIZE = 25;
 export const OPTIONS_BUDGET_RATIO = 0.05;   // 5% of managed equity per options trade
 export const OPTIONS_TP1_PCT = 0.25;         // take partial profit (50%) at +25% premium gain

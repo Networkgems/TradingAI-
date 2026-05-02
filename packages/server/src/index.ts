@@ -51,7 +51,7 @@ import {
   setRvScanner,
   type UserContext,
 } from './user-context.js';
-import type { AccountSettings } from '@trading-app/shared';
+import { resolveTradierOptionsCreds, type AccountSettings } from '@trading-app/shared';
 
 const PORT = Number(process.env.PORT ?? 4242);
 const __dirname = dirname(fileURLToPath(import.meta.url));
@@ -1040,23 +1040,32 @@ app.post('/api/crypto/coinbase/place-test-order', requireAuth, async (req, res) 
 app.post('/api/options/tradier/test-connection', requireAuth, async (_req, res) => {
   const username = res.locals['authUser'] as string;
   const settings = getSettings(username);
-  const env = (settings.liveTradierEnvOptions ?? 'sandbox') as 'sandbox' | 'production';
+  // TRA-226 — sandbox/production credentials are stored on separate fields so
+  // the resolver only returns the pair matching the currently selected env.
+  // Env-var fallback is layered on top here so a deployment that bootstrapped
+  // creds via env (TRADIER_*) still works without forcing every user to retype
+  // them in Settings.
+  const resolved = resolveTradierOptionsCreds(settings);
+  const env = resolved.env;
   const apiToken = (
-    settings.liveApiKeyOptions?.trim()
+    resolved.apiToken
     || (env === 'production'
       ? process.env['TRADIER_API_TOKEN']
       : (process.env['TRADIER_SANDBOX_API_TOKEN'] ?? process.env['TRADIER_API_TOKEN']))
     || ''
   ).trim();
   const accountId = (
-    settings.liveAccountIdOptions?.trim()
+    resolved.accountId
     || (env === 'production'
       ? process.env['TRADIER_ACCOUNT_ID']
       : (process.env['TRADIER_SANDBOX_ACCOUNT_ID'] ?? process.env['TRADIER_ACCOUNT_ID']))
     || ''
   ).trim();
   if (!apiToken || !accountId) {
-    res.json({ ok: false, error: 'Tradier API token and Account ID are not configured. Save them in Settings before testing.' });
+    res.json({
+      ok: false,
+      error: `Tradier ${env} API token and Account ID are not configured. Save them in Settings before testing.`,
+    });
     return;
   }
   try {

@@ -1,5 +1,5 @@
 import { OrbStrategy, ReversalStrategy, MacdTrendStrategy, BbFadeStrategy, IchimokuStrategy, TradierOptionsClient } from '@trading-app/engine';
-import { WATCHLIST, MANAGED_ACCOUNT_RATIO, MAX_CONSECUTIVE_LOSSES, DAILY_DRAWDOWN_HALT_PCT, aliasWatchlistSymbol, isStockMarketOpen } from '@trading-app/shared';
+import { WATCHLIST, MANAGED_ACCOUNT_RATIO, MAX_CONSECUTIVE_LOSSES, DAILY_DRAWDOWN_HALT_PCT, aliasWatchlistSymbol, isStockMarketOpen, resolveTradierOptionsCreds } from '@trading-app/shared';
 import type { TradeSignal, RelativeValueSignal, Candle, OptionsAccountState, SignalType, Position, AccountSettings, AccountState, NewsItem } from '@trading-app/shared';
 import { fetchMinuteBars, fetchQuotes, fetchStocksNews, isYahooBreakerOpen, setActiveInterestSymbols } from './yahoo-feed.js';
 import { PaperAccount } from './paper-account.js';
@@ -834,16 +834,21 @@ export class SignalEngine {
  */
 function buildTradierLiveClient(settings: AccountSettings): TradierOptionsClient | null {
   if (settings.mode !== 'live') return null;
-  const env = (settings.liveTradierEnvOptions ?? 'sandbox') as 'sandbox' | 'production';
+  // TRA-226 — sandbox/production credentials live on separate fields. The
+  // shared resolver returns the pair matching the currently selected env; we
+  // layer env-var fallbacks here for deployments that bootstrapped Tradier
+  // creds via env (TRADIER_*).
+  const resolved = resolveTradierOptionsCreds(settings);
+  const env = resolved.env;
   const apiToken = (
-    settings.liveApiKeyOptions?.trim()
+    resolved.apiToken
     || (env === 'production'
       ? process.env['TRADIER_API_TOKEN']
       : (process.env['TRADIER_SANDBOX_API_TOKEN'] ?? process.env['TRADIER_API_TOKEN']))
     || ''
   ).trim();
   const accountId = (
-    settings.liveAccountIdOptions?.trim()
+    resolved.accountId
     || (env === 'production'
       ? process.env['TRADIER_ACCOUNT_ID']
       : (process.env['TRADIER_SANDBOX_ACCOUNT_ID'] ?? process.env['TRADIER_ACCOUNT_ID']))
