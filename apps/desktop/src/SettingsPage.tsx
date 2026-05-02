@@ -23,12 +23,8 @@ function readLiveApiKey(s: AccountSettings, m: Market): string {
 function readLiveApiSecretCrypto(s: AccountSettings): string {
   return s.liveApiSecretCrypto ?? s.liveApiSecret ?? '';
 }
-function readLiveAccountIdStocks(s: AccountSettings): string {
-  return s.liveAccountIdStocks ?? s.liveAccountId ?? '';
-}
 // TRA-221 — Tradier (Options) live credentials. Stored on a dedicated set of
-// fields so options auto-trading can be configured without affecting the
-// stocks (Webull) flow above.
+// fields so options auto-trading is independent from the crypto flow.
 function readLiveBrokerageTypeOptions(s: AccountSettings): BrokerageType {
   return s.liveBrokerageTypeOptions ?? 'tradier';
 }
@@ -948,7 +944,7 @@ export default function SettingsPage({ token, httpUrl, context, onModeChange }: 
               <div className="mode-card-inner">
                 <span className="mode-card-title">Live Account</span>
                 <span className="mode-card-desc">
-                  Connect a brokerage (e.g. Webull) to trade with real money.
+                  Connect a brokerage to trade with real money.
                 </span>
               </div>
             </label>
@@ -1067,17 +1063,17 @@ export default function SettingsPage({ token, httpUrl, context, onModeChange }: 
 
         {/* ── Live settings ─────────────────────────────────────────────── */}
         {/*
-          Live credentials are stored per-market (TRA-165). When `context` is
-          set we render a single market's form scoped to its own fields; when
-          undefined (admin view) we render both Crypto and Stocks sections so
-          they can be configured side by side without bleeding into each other.
+          Live crypto credentials are stored per-market (TRA-165) so a Coinbase
+          key on the Crypto dashboard never bleeds into the Stocks dashboard.
+          The Webull credential UI was removed in TRA-225; the Stocks dashboard
+          now exposes only the Tradier (Options) live-trading credentials.
         */}
         {settings.mode === 'live' && (
           <section className="settings-section">
             <h2 className="settings-section-title">Live Brokerage Connection</h2>
 
             {(!context || context === 'crypto') && (
-              <div className="live-brokerage-block" style={{ marginBottom: !context ? '1.5rem' : 0 }}>
+              <div className="live-brokerage-block">
                 {!context && <h3 className="settings-subheading">Crypto (Coinbase)</h3>}
 
                 <div className="settings-grid">
@@ -1158,81 +1154,11 @@ export default function SettingsPage({ token, httpUrl, context, onModeChange }: 
               </div>
             )}
 
-            {(!context || context === 'stocks') && (
-              <div className="live-brokerage-block">
-                {!context && <h3 className="settings-subheading">Stocks (Webull)</h3>}
-
-                <div className="settings-grid">
-                  <div className="settings-field">
-                    <label>Brokerage</label>
-                    <select
-                      value={readLiveBrokerageType(settings, 'stocks')}
-                      onChange={e => set('liveBrokerageTypeStocks', e.target.value as BrokerageType)}
-                    >
-                      <option value="webull">Webull</option>
-                    </select>
-                  </div>
-
-                  <div className="settings-field">
-                    <label>API Key</label>
-                    <PasswordInput
-                      value={readLiveApiKey(settings, 'stocks')}
-                      onChange={v => set('liveApiKeyStocks', v)}
-                      placeholder={'Enter your Webull API key'}
-                      autoComplete="off"
-                    />
-                  </div>
-
-                  <div className="settings-field">
-                    <label>Account ID</label>
-                    <input
-                      type="text"
-                      placeholder="Enter your Webull account ID"
-                      value={readLiveAccountIdStocks(settings)}
-                      onChange={e => set('liveAccountIdStocks', e.target.value)}
-                    />
-                  </div>
-                </div>
-
-                <div className="settings-field" style={{ marginTop: '1.25rem' }}>
-                  <label>Trading Mode</label>
-                  <div className="radio-group">
-                    <label className="radio-option">
-                      <input
-                        type="radio"
-                        name="liveTradeMode-stocks"
-                        value="ai_in_brokerage"
-                        checked={readLiveTradeMode(settings, 'stocks') === 'ai_in_brokerage'}
-                        onChange={() => set('liveTradeModeStocks', 'ai_in_brokerage')}
-                      />
-                      <div>
-                        <strong>AI trades in Webull</strong>
-                        <p className="field-hint">AI controls your Webull account directly. Trades execute inside Webull using your balance.</p>
-                      </div>
-                    </label>
-                    <label className="radio-option">
-                      <input
-                        type="radio"
-                        name="liveTradeMode-stocks"
-                        value="transfer_to_platform"
-                        checked={readLiveTradeMode(settings, 'stocks') === 'transfer_to_platform'}
-                        onChange={() => set('liveTradeModeStocks', 'transfer_to_platform')}
-                      />
-                      <div>
-                        <strong>Transfer funds to platform</strong>
-                        <p className="field-hint">Funds transfer from Webull into TradingAI, trades execute here, then profits transfer back.</p>
-                      </div>
-                    </label>
-                  </div>
-                </div>
-              </div>
-            )}
-
             {/* TRA-221 — Options live trading via Tradier. Rendered in the
                 admin (no-context) and stocks-dashboard views, since options
                 run on the same equity engine path. */}
             {(!context || context === 'stocks') && (
-              <div className="live-brokerage-block" style={{ marginTop: '1.5rem' }}>
+              <div className="live-brokerage-block" style={{ marginTop: !context ? '1.5rem' : 0 }}>
                 {!context && <h3 className="settings-subheading">Options (Tradier)</h3>}
 
                 <div className="settings-grid">
@@ -1317,6 +1243,7 @@ export default function SettingsPage({ token, httpUrl, context, onModeChange }: 
               </div>
             )}
 
+
             {context === 'crypto' && (
               <div className="settings-field" style={{ marginTop: '1rem' }}>
                 <button
@@ -1394,7 +1321,7 @@ export default function SettingsPage({ token, httpUrl, context, onModeChange }: 
                 </>
               ) : (
                 <>
-                  <strong>Live options trading via Tradier is enabled.</strong> Once you save a valid Tradier API token and Account ID and switch the account to <em>Live</em>, the relative-value scanner routes new options signals to Tradier as <code>buy_to_open</code> market orders. Stock-share live trading via Webull is not yet active — Webull credentials are stored for a future update.
+                  <strong>Live options trading via Tradier is enabled.</strong> Once you save a valid Tradier API token and Account ID and switch the account to <em>Live</em>, the relative-value scanner routes new options signals to Tradier as <code>buy_to_open</code> market orders. Stock-share live trading is not yet wired up — the Tradier credentials above cover options only.
                 </>
               )}
             </div>
