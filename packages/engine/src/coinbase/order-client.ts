@@ -189,13 +189,22 @@ export class CoinbaseOrderClient {
       typ: 'JWT',
       nonce: this.nonce(),
     };
+    // Coinbase's CDP authenticator strips the query string before validating
+    // the `uri` claim (their official SDK builds the claim from
+    // `urlparse(url).path` only). Including the query here makes
+    // GET /api/v3/brokerage/products?product_ids=... 401 with `Unauthorized`,
+    // which silently broke the TRA-224 spot-price lookup. Strip it here so
+    // the claim matches what Coinbase computes server-side, while the actual
+    // fetch URL still carries the full query string (TRA-224 follow-up).
+    const queryIdx = requestPath.indexOf('?');
+    const pathOnly = queryIdx >= 0 ? requestPath.slice(0, queryIdx) : requestPath;
     const payload = {
       sub: this.apiKey,
       iss: 'cdp',
       nbf: nowSec,
       exp: nowSec + CDP_JWT_TTL_SECONDS,
-      // Coinbase verifies this claim against the actual request — METHOD + space + host + path, no scheme.
-      uri: `${method.toUpperCase()} ${this.host}${requestPath}`,
+      // Coinbase verifies this claim against the actual request — METHOD + space + host + path, no query, no scheme.
+      uri: `${method.toUpperCase()} ${this.host}${pathOnly}`,
     };
     const headerB64 = base64UrlEncode(Buffer.from(JSON.stringify(header)));
     const payloadB64 = base64UrlEncode(Buffer.from(JSON.stringify(payload)));

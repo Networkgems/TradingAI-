@@ -320,6 +320,38 @@ describe('CoinbaseOrderClient (CDP/JWT auth)', () => {
     expect(() => client.buildCdpJwt('GET', '/api/v3/brokerage/accounts')).toThrow(/non-CDP/);
   });
 
+  // TRA-224 follow-up — Coinbase's CDP authenticator strips the query string
+  // from the URL before validating the JWT `uri` claim (matching their
+  // official Python SDK which builds the claim from `urlparse(url).path`
+  // only). If we leave the query in our claim, GET /products?product_ids=…
+  // 401s and the live dashboard silently falls back to cash-only equity.
+  it('strips the query string from the URI claim so /products lookups authenticate', async () => {
+    const { privatePem } = generateCdpKeypair();
+    const client = new CoinbaseOrderClient({
+      apiKey: CDP_KID,
+      apiSecret: privatePem,
+      fetchImpl: fetchMock as unknown as typeof fetch,
+      now: () => TS,
+      nonce: () => 'nonce-pp',
+    });
+    fetchMock.mockResolvedValueOnce(jsonResponse({
+      products: [{ product_id: 'BTC-USD', price: '60000' }],
+    }));
+
+    await client.getProductPrices(['BTC-USD', 'ETH-USD']);
+
+    const [url, init] = fetchMock.mock.calls[0];
+    // The actual fetch URL must keep the query string so Coinbase filters by product.
+    expect(String(url)).toBe(
+      'https://api.coinbase.com/api/v3/brokerage/products?product_ids=BTC-USD&product_ids=ETH-USD',
+    );
+    const headers = (init as RequestInit).headers as Record<string, string>;
+    const jwt = headers.Authorization.slice('Bearer '.length);
+    const { payload } = decodeJwtParts(jwt);
+    // …but the JWT's URI claim must NOT include the query string.
+    expect(payload.uri).toBe('GET api.coinbase.com/api/v3/brokerage/products');
+  });
+
   // TRA-222 — the Settings UI stores the API Secret in a single-line
   // <input type="password">, which strips real newlines from pasted PEMs.
   // CoinbaseOrderClient must still accept the mangled forms users actually
