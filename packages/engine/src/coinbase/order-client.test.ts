@@ -165,6 +165,38 @@ describe('CoinbaseOrderClient', () => {
     ).rejects.toThrow(/not enough USD/);
   });
 
+  it('falls through empty error_details to message/error so the user never sees a bare "rejected:"', async () => {
+    // TRA-243 — Coinbase occasionally returns `{ error_details: "" }` (empty
+    // string, not absent). The previous `??` chain short-circuited there
+    // and produced `Coinbase order rejected:` with no body. `||` keeps
+    // walking until it finds non-empty text.
+    const client = makeClient();
+    fetchMock.mockResolvedValueOnce(
+      jsonResponse({
+        success: false,
+        error_response: { error_details: '', message: 'Invalid product_id', error: '' },
+      }),
+    );
+
+    await expect(
+      client.placeMarketOrder({ productId: 'BAD-USD', side: 'buy', quoteSize: 1 }),
+    ).rejects.toThrow(/Invalid product_id/);
+  });
+
+  it('reports "unknown error" when every error field is empty rather than dropping the diagnosis text', async () => {
+    const client = makeClient();
+    fetchMock.mockResolvedValueOnce(
+      jsonResponse({
+        success: false,
+        error_response: { error_details: '', message: '', error: '' },
+      }),
+    );
+
+    await expect(
+      client.placeMarketOrder({ productId: 'BTC-USD', side: 'buy', quoteSize: 1 }),
+    ).rejects.toThrow(/unknown error/);
+  });
+
   it('surfaces non-2xx HTTP errors with status + body text', async () => {
     const client = makeClient();
     fetchMock.mockResolvedValueOnce(

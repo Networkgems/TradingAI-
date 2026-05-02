@@ -347,7 +347,12 @@ export class CoinbaseOrderClient {
     const resp = await this.request<CreateOrderResponse>('POST', path, body);
     if (!resp.success || !resp.success_response) {
       const err = resp.error_response;
-      const detail = err?.error_details ?? err?.message ?? err?.error ?? 'unknown error';
+      // TRA-243 — `||` not `??`: Coinbase sometimes returns an error_response
+      // shaped like `{ error_details: "" }` (empty strings, not nulls), and
+      // `??` would short-circuit on the empty string and emit "Coinbase order
+      // rejected:" with no diagnosis text. `||` falls through empty fields
+      // to the next non-empty one, ending at "unknown error" if all blank.
+      const detail = err?.error_details || err?.message || err?.error || 'unknown error';
       throw new Error(`Coinbase order rejected: ${detail}`);
     }
     return resp.success_response;

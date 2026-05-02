@@ -453,3 +453,82 @@ describe('CryptoLiveAccount skip-reason annotation (TRA-243)', () => {
     expect(signal.liveSkipReason).toBeUndefined();
   });
 });
+
+describe('CryptoLiveAccount tradable-product validation (TRA-243)', () => {
+  it('skips signals for symbols Coinbase does not list', async () => {
+    // Watchlist has BTC, ETH, MATIC. Coinbase /products returns prices for
+    // BTC + ETH only — MATIC was renamed to POL Sept 2024 and silently dropped.
+    // Without this guard a MATIC-USD market order returns a 400
+    // INVALID_ARGUMENT that the user sees as a confusing "Coinbase rejected
+    // order: Invalid product_id".
+    const { account, coinbase } = buyAccount(50_000);
+    await account.refreshBalance();
+    coinbase.getProductPrices.mockResolvedValueOnce(
+      new Map([['BTC-USD', 30_000], ['ETH-USD', 2_000]]),
+    );
+    await account.refreshTradableProducts(['BTC-USD', 'ETH-USD', 'MATIC-USD']);
+
+    const signal = buildSignal({ symbol: 'MATIC-USD', entryPrice: 0.5, stopLoss: 0.49 });
+    const pos = await account.openPosition(signal, 0.5);
+
+    expect(pos).toBeNull();
+    expect(coinbase.placeMarketOrder).not.toHaveBeenCalled();
+    expect(signal.liveSkipReason).toMatch(/not listed on Coinbase/i);
+    expect(signal.liveSkipReason).toMatch(/MATIC-USD/);
+  });
+
+  it('still trades symbols Coinbase confirmed are listed', async () => {
+    const { account, coinbase } = buyAccount(50_000);
+    await account.refreshBalance();
+    coinbase.getProductPrices.mockResolvedValueOnce(
+      new Map([['BTC-USD', 30_000], ['ETH-USD', 2_000]]),
+    );
+    await account.refreshTradableProducts(['BTC-USD', 'ETH-USD']);
+
+    coinbase.placeMarketOrder.mockResolvedValueOnce(orderSuccess('o-ok'));
+    coinbase.getOrder.mockResolvedValueOnce(
+      orderDetails({ order_id: 'o-ok', status: 'FILLED', average_filled_price: '30000', filled_size: '0.001' }),
+    );
+
+    const signal = buildSignal();
+    const pos = await account.openPosition(signal, 30_000);
+
+    expect(pos).not.toBeNull();
+    expect(signal.liveSkipReason).toBeUndefined();
+  });
+
+  it('falls through to existing checks when /products lookup never succeeded', async () => {
+    // Cache stays null — must not block trading on a Coinbase outage.
+    const { account, coinbase } = buyAccount(50_000);
+    await account.refreshBalance();
+    coinbase.getProductPrices.mockRejectedValueOnce(new Error('coinbase 503'));
+    await account.refreshTradableProducts(['BTC-USD']);
+    // Refresh swallowed the error; tradableProducts is still null.
+
+    coinbase.placeMarketOrder.mockResolvedValueOnce(orderSuccess('o-ok'));
+    coinbase.getOrder.mockResolvedValueOnce(
+      orderDetails({ order_id: 'o-ok', status: 'FILLED', average_filled_price: '30000', filled_size: '0.001' }),
+    );
+
+    const signal = buildSignal();
+    const pos = await account.openPosition(signal, 30_000);
+
+    expect(pos).not.toBeNull();
+    expect(signal.liveSkipReason).toBeUndefined();
+  });
+
+  it('reports stale once past the 6h TTL', async () => {
+    const { account, coinbase } = buyAccount(50_000);
+    coinbase.getProductPrices.mockResolvedValueOnce(new Map([['BTC-USD', 30_000]]));
+    await account.refreshTradableProducts(['BTC-USD']);
+    expect(account.isTradableProductsStale()).toBe(false);
+
+    // Travel forward >6h. vi.useFakeTimers would need a constructor-time hook
+    // we don't have; instead reach into Date.now via a spy.
+    const realNow = Date.now;
+    const sevenHoursLater = realNow() + 7 * 60 * 60 * 1000;
+    vi.spyOn(Date, 'now').mockImplementation(() => sevenHoursLater);
+    expect(account.isTradableProductsStale()).toBe(true);
+    (Date.now as ReturnType<typeof vi.fn>).mockRestore();
+  });
+});

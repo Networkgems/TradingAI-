@@ -192,6 +192,11 @@ export class CryptoSignalEngine {
     this.liveAccount = broker;
     console.log('[crypto-engine] Coinbase live broker initialised — live trading active.');
     await broker.refreshBalance();
+    // TRA-243 — pre-load the set of Coinbase-tradable product_ids for the
+    // active watchlist so the very first live tick can skip delisted/renamed
+    // tickers (e.g. MATIC after the POL rename) with a clear reason instead
+    // of eating a 400 INVALID_ARGUMENT on the order endpoint.
+    await broker.refreshTradableProducts(this.getActiveSymbols());
   }
 
   /**
@@ -529,6 +534,12 @@ export class CryptoSignalEngine {
 
     if (live.isStale()) {
       await live.refreshBalance();
+    }
+    // TRA-243 — periodic refresh (default 6h) so a Coinbase delisting or
+    // ticker rename that happens mid-session doesn't keep us firing rejected
+    // orders on the stale symbol.
+    if (live.isTradableProductsStale()) {
+      await live.refreshTradableProducts(activeSymbols);
     }
 
     try {

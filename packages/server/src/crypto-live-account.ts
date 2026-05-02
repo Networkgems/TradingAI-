@@ -13,6 +13,16 @@ const CASH_CURRENCIES = new Set(['USD', 'USDC', 'USDT']);
 const BALANCE_REFRESH_MS = 30_000;
 
 /**
+ * How long a cached set of Coinbase-tradable product_ids stays fresh before we
+ * re-query Coinbase. Six hours is the right scale: Coinbase delistings/renames
+ * (MATIC→POL, FTM→Sonic, etc.) happen on day-or-longer timelines, but we don't
+ * want a stale snapshot to keep us trading a delisted ticker for weeks if the
+ * server is long-lived. Refresh is cheap (one /products call) and tolerant —
+ * a failure leaves the previous set in place rather than zeroing it (TRA-243).
+ */
+const TRADABLE_PRODUCTS_TTL_MS = 6 * 60 * 60 * 1000;
+
+/**
  * Headroom against Coinbase Advanced Trade taker fees so a market BUY that
  * spends our entire reported `available_balance` doesn't get rejected for
  * insufficient funds at fill time. Non-stable taker is up to 0.6% — 0.5%
@@ -81,6 +91,18 @@ export class CryptoLiveAccount {
   private equityUsd = 0;
   private realizedPnlToday = 0;
   private lastBalanceRefresh = 0;
+  /**
+   * TRA-243 — set of `{BASE}-{QUOTE}` product_ids Coinbase Advanced Trade
+   * actually lists right now. The dashboard watchlist drifts out of sync with
+   * Coinbase as tickers get renamed (MATIC→POL Sept 2024) or delisted, and
+   * sending a stale id to /orders returns a 400 INVALID_ARGUMENT that the
+   * user used to see as a generic "Coinbase rejected order". Populated on
+   * live broker init via `refreshTradableProducts`; null = unverified, in
+   * which case openPosition falls through to the cash/min-notional checks
+   * (degrade open rather than block valid trades when /products is down).
+   */
+  private tradableProducts: Set<string> | null = null;
+  private lastTradableProductsRefresh = 0;
   // TRA-232 — risk knobs come from per-user AccountSettings instead of the
   // hardcoded MANAGED_ACCOUNT_RATIO / DEFAULT_RISK_PER_TRADE constants. The
   // engine pushes fresh values via updateRiskConfig on every settings save so
@@ -175,6 +197,35 @@ export class CryptoLiveAccount {
     return Date.now() - this.lastBalanceRefresh > BALANCE_REFRESH_MS;
   }
 
+  /**
+   * TRA-243 — pre-validate watchlist symbols against Coinbase's live product
+   * catalogue so signals on delisted/renamed tickers (e.g. MATIC after the
+   * POL rename) are skipped with a clear reason BEFORE we POST /orders and
+   * eat a 400 INVALID_ARGUMENT. We piggyback on `getProductPrices` because
+   * Coinbase silently drops unknown product_ids from that response — the
+   * returned Map's keys are exactly the tradable subset of what we asked for.
+   *
+   * Best-effort: a failed lookup leaves the previous cache in place rather
+   * than nulling it, so a transient /products outage can't false-positive
+   * every signal as "delisted".
+   */
+  async refreshTradableProducts(productIds: readonly string[]): Promise<void> {
+    if (productIds.length === 0) return;
+    let prices: Map<string, number>;
+    try {
+      prices = await this.coinbase.getProductPrices(Array.from(productIds));
+    } catch (err: unknown) {
+      console.warn('[crypto-live] tradable products refresh failed:', err instanceof Error ? err.message : String(err));
+      return;
+    }
+    this.tradableProducts = new Set(prices.keys());
+    this.lastTradableProductsRefresh = Date.now();
+  }
+
+  isTradableProductsStale(): boolean {
+    return Date.now() - this.lastTradableProductsRefresh > TRADABLE_PRODUCTS_TTL_MS;
+  }
+
   managedEquity(): number {
     return this.equityUsd * this.managedAccountRatio;
   }
@@ -221,6 +272,22 @@ export class CryptoLiveAccount {
     // clear reason instead of a silent log-only skip.
     if (signal.side === 'sell') {
       const reason = 'spot account cannot open shorts (Coinbase Advanced Trade is spot-only)';
+      signal.liveSkipReason = reason;
+      console.warn(`[crypto-live] skip ${signal.symbol} ${signal.type}: ${reason}`);
+      return null;
+    }
+
+    // TRA-243 — refuse to fire orders against tickers Coinbase doesn't list
+    // (renamed or delisted from the watchlist — e.g. MATIC after the POL
+    // rename, FTM after Sonic). Without this check Coinbase rejects with
+    // `INVALID_ARGUMENT: Invalid product_id` after we've already debited
+    // sizing slots, and the user sees a confusing 400 in the UI. We only
+    // enforce when we have a verified product list — a null cache means we
+    // never successfully fetched /products, in which case fall through to
+    // the existing cash/min-notional gate so a /products outage doesn't
+    // freeze trading entirely.
+    if (this.tradableProducts && !this.tradableProducts.has(signal.symbol)) {
+      const reason = `${signal.symbol} not listed on Coinbase Advanced Trade — likely delisted or renamed (e.g. MATIC→POL); remove it from the watchlist`;
       signal.liveSkipReason = reason;
       console.warn(`[crypto-live] skip ${signal.symbol} ${signal.type}: ${reason}`);
       return null;
