@@ -7,6 +7,7 @@ import ForgotPasswordPage from './ForgotPasswordPage.tsx';
 import SignUpPage from './SignUpPage.tsx';
 import SettingsPage, { ChangePasswordSection, UserManagementSection } from './SettingsPage.tsx';
 import { CalendarTab } from './CalendarTab.tsx';
+import { SERVER_URL, HTTP_URL } from './server-url';
 import './index.css';
 
 function CandlestickIcon() {
@@ -595,12 +596,6 @@ function CryptoDashboard({ token, onBack, onLogout, onActivity }: { token: strin
     </div>
   );
 }
-
-const SERVER_URL: string = import.meta.env.VITE_SERVER_URL ??
-  (typeof window !== 'undefined' && window.location.hostname !== 'localhost' && window.location.hostname !== '127.0.0.1'
-    ? `${window.location.protocol === 'https:' ? 'wss' : 'ws'}://${window.location.host}`
-    : 'ws://localhost:4242');
-const HTTP_URL = SERVER_URL.replace(/^ws/, 'http');
 
 interface SymbolState {
   symbol: string;

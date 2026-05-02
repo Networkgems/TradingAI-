@@ -1,6 +1,5 @@
 import { useState } from 'react';
-
-const HTTP_URL = (import.meta.env.VITE_SERVER_URL ?? 'ws://localhost:4242').replace(/^ws/, 'http');
+import { HTTP_URL } from './server-url';
 
 function getUrlResetCode(): string {
   const params = new URLSearchParams(window.location.search);
