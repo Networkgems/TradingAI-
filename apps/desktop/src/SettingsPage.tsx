@@ -1008,30 +1008,41 @@ export default function SettingsPage({ token, httpUrl, context, onModeChange }: 
                 </div>
               )}
 
-              <div className="settings-field">
-                <label>Stock Daily Trades Limit</label>
-                <input
-                  type="number"
-                  min={1}
-                  max={100}
-                  value={settings.dailyTradesLimit}
-                  onChange={e => set('dailyTradesLimit', Number(e.target.value))}
-                />
-                <span className="field-hint">Max stock trades per day (default: 10)</span>
-              </div>
+              {/* TRA-232 — Daily trade limits are stocks/options only today.
+                  The crypto engine doesn't enforce a per-day cap, so on the
+                  Crypto dashboard we hide both rows to stop showing irrelevant
+                  stock settings on a crypto page. */}
+              {(!context || context === 'stocks') && (
+                <div className="settings-field">
+                  <label>Stock Daily Trades Limit</label>
+                  <input
+                    type="number"
+                    min={1}
+                    max={100}
+                    value={settings.dailyTradesLimit}
+                    onChange={e => set('dailyTradesLimit', Number(e.target.value))}
+                  />
+                  <span className="field-hint">Max stock trades per day (default: 10)</span>
+                </div>
+              )}
 
-              <div className="settings-field">
-                <label>Options Daily Trades Limit</label>
-                <input
-                  type="number"
-                  min={1}
-                  max={100}
-                  value={settings.optionsDailyTradesLimit}
-                  onChange={e => set('optionsDailyTradesLimit', Number(e.target.value))}
-                />
-                <span className="field-hint">Max options trades per day across all scanners (default: 10)</span>
-              </div>
+              {(!context || context === 'stocks') && (
+                <div className="settings-field">
+                  <label>Options Daily Trades Limit</label>
+                  <input
+                    type="number"
+                    min={1}
+                    max={100}
+                    value={settings.optionsDailyTradesLimit}
+                    onChange={e => set('optionsDailyTradesLimit', Number(e.target.value))}
+                  />
+                  <span className="field-hint">Max options trades per day across all scanners (default: 10)</span>
+                </div>
+              )}
 
+              {/* TRA-232 — Managed Account Ratio + Risk Per Trade apply to all
+                  three engines (stocks, options, crypto demo + live), so they
+                  stay visible in every context. */}
               <div className="settings-field">
                 <label>Managed Account Ratio (%)</label>
                 <input
@@ -1089,6 +1100,73 @@ export default function SettingsPage({ token, httpUrl, context, onModeChange }: 
         {settings.mode === 'live' && (
           <section className="settings-section">
             <h2 className="settings-section-title">Live Brokerage Connection</h2>
+
+            {/* TRA-232 — surface the risk knobs in Live mode too. Previously
+                they were only editable in Demo, which left users unable to
+                tell whether Live trading honored Managed Account Ratio,
+                Risk Per Trade, or the daily trade limits (it does — the
+                same engine code path drives sizing for stocks, options,
+                and crypto). Daily trade limits are stocks/options only,
+                so they're hidden under the Crypto context. */}
+            <div className="live-brokerage-block">
+              <h3 className="settings-subheading">Live Trading Risk</h3>
+              <div className="settings-grid">
+                <div className="settings-field">
+                  <label>Managed Account Ratio (%)</label>
+                  <input
+                    type="number"
+                    min={1}
+                    max={100}
+                    value={Math.round(settings.managedAccountRatio * 100)}
+                    onChange={e => set('managedAccountRatio', Number(e.target.value) / 100)}
+                  />
+                  <span className="field-hint">
+                    Portion of equity auto-traded (default: 50%). Applies to live
+                    {context === 'crypto' ? ' Coinbase' : context === 'stocks' ? ' Tradier (options)' : ' brokerage'} orders.
+                  </span>
+                </div>
+                <div className="settings-field">
+                  <label>Risk Per Trade (%)</label>
+                  <input
+                    type="number"
+                    min={0.1}
+                    max={50}
+                    step={0.1}
+                    value={+(settings.riskPerTrade * 100).toFixed(2)}
+                    onChange={e => set('riskPerTrade', Number(e.target.value) / 100)}
+                  />
+                  <span className="field-hint">
+                    Max equity risked per live trade (default: 1%). Applied to position sizing on every order.
+                  </span>
+                </div>
+                {(!context || context === 'stocks') && (
+                  <div className="settings-field">
+                    <label>Stock Daily Trades Limit</label>
+                    <input
+                      type="number"
+                      min={1}
+                      max={100}
+                      value={settings.dailyTradesLimit}
+                      onChange={e => set('dailyTradesLimit', Number(e.target.value))}
+                    />
+                    <span className="field-hint">Max stock trades per day (default: 10)</span>
+                  </div>
+                )}
+                {(!context || context === 'stocks') && (
+                  <div className="settings-field">
+                    <label>Options Daily Trades Limit</label>
+                    <input
+                      type="number"
+                      min={1}
+                      max={100}
+                      value={settings.optionsDailyTradesLimit}
+                      onChange={e => set('optionsDailyTradesLimit', Number(e.target.value))}
+                    />
+                    <span className="field-hint">Max options trades per day across all scanners (default: 10)</span>
+                  </div>
+                )}
+              </div>
+            </div>
 
             {(!context || context === 'crypto') && (
               <div className="live-brokerage-block">

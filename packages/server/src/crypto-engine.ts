@@ -98,6 +98,15 @@ export class CryptoSignalEngine {
     this.account = new CryptoPaperAccount(currentEquity, openingEquityToday);
     // Set the canonical initialEquity baseline so allTimePnl reflects the user's setting.
     this.account.applyEquity(initialEquity);
+    // TRA-232 — push the user's risk knobs into the demo account so position
+    // sizing matches the Settings page values instead of falling back to the
+    // shared defaults.
+    if (settings) {
+      this.account.updateRiskConfig({
+        managedAccountRatio: settings.managedAccountRatio,
+        riskPerTrade: settings.riskPerTrade,
+      });
+    }
     // Constructor can't await — kick off broker init + balance refresh in the
     // background. The first tick will broadcast equity once it lands.
     if (this.mode === 'live') void this.tryInitLiveBroker();
@@ -143,7 +152,17 @@ export class CryptoSignalEngine {
       // the API Secret field can confirm it parsed as CDP (rather than silently
       // falling back to HMAC and 401-ing on every order).
       console.log(`[crypto-engine] Coinbase client built (auth=${client.getAuthScheme()}).`);
-      return new CryptoLiveAccount(client);
+      const live = new CryptoLiveAccount(client);
+      // TRA-232 — sync the live account to the user's risk knobs immediately
+      // so the first order placed after a live-mode flip uses the right
+      // managedAccountRatio / riskPerTrade.
+      if (s) {
+        live.updateRiskConfig({
+          managedAccountRatio: s.managedAccountRatio,
+          riskPerTrade: s.riskPerTrade,
+        });
+      }
+      return live;
     } catch (err: unknown) {
       console.warn('[crypto-engine] Coinbase init failed:', err instanceof Error ? err.message : String(err));
       return null;
@@ -190,6 +209,13 @@ export class CryptoSignalEngine {
     // start/stop UI state for either mode) keeps the engine in sync.
     this.autoTradingEnabledDemo = settings.cryptoAutoTradingEnabledDemo ?? true;
     this.autoTradingEnabledLive = settings.cryptoAutoTradingEnabledLive ?? true;
+    // TRA-232 — push fresh risk knobs into the demo account on every settings
+    // save. The live account is rebuilt below (or via tryInitLiveBroker) and
+    // picks up the same values when buildLiveBroker reads currentSettings.
+    this.account.updateRiskConfig({
+      managedAccountRatio: settings.managedAccountRatio,
+      riskPerTrade: settings.riskPerTrade,
+    });
     if (this.mode === 'live') {
       // Live mode: leave the demo account/tracker untouched so the demo state
       // is preserved for a later switch back. Re-initialise the live broker so

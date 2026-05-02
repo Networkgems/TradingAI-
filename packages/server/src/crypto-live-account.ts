@@ -1,5 +1,5 @@
 import type { Position, TradeSignal, SignalType } from '@trading-app/shared';
-import { MANAGED_ACCOUNT_RATIO, DEFAULT_RISK_PER_TRADE } from '@trading-app/shared';
+import { DEFAULT_ACCOUNT_SETTINGS } from '@trading-app/shared';
 import type {
   CoinbaseOrderClient,
   CoinbaseAccountBalance,
@@ -65,10 +65,26 @@ export class CryptoLiveAccount {
   private equityUsd = 0;
   private realizedPnlToday = 0;
   private lastBalanceRefresh = 0;
+  // TRA-232 — risk knobs come from per-user AccountSettings instead of the
+  // hardcoded MANAGED_ACCOUNT_RATIO / DEFAULT_RISK_PER_TRADE constants. The
+  // engine pushes fresh values via updateRiskConfig on every settings save so
+  // the Crypto dashboard honors what the user enters in Settings.
+  private managedAccountRatio: number = DEFAULT_ACCOUNT_SETTINGS.managedAccountRatio;
+  private riskPerTrade: number = DEFAULT_ACCOUNT_SETTINGS.riskPerTrade;
 
   constructor(coinbase: CoinbaseOrderClient, opts: CryptoLiveAccountOptions = {}) {
     this.coinbase = coinbase;
     this.sleep = opts.sleep ?? ((ms) => new Promise(r => setTimeout(r, ms)));
+  }
+
+  /**
+   * Apply per-user risk settings (managedAccountRatio, riskPerTrade) so live
+   * crypto orders sized through Coinbase honor the values entered on the
+   * Settings page. Called by the engine on init and on every settings save.
+   */
+  updateRiskConfig(config: { managedAccountRatio?: number; riskPerTrade?: number }): void {
+    if (config.managedAccountRatio !== undefined) this.managedAccountRatio = config.managedAccountRatio;
+    if (config.riskPerTrade !== undefined) this.riskPerTrade = config.riskPerTrade;
   }
 
   /**
@@ -144,11 +160,11 @@ export class CryptoLiveAccount {
   }
 
   managedEquity(): number {
-    return this.equityUsd * MANAGED_ACCOUNT_RATIO;
+    return this.equityUsd * this.managedAccountRatio;
   }
 
   maxRiskPerTrade(): number {
-    return this.managedEquity() * DEFAULT_RISK_PER_TRADE;
+    return this.managedEquity() * this.riskPerTrade;
   }
 
   /** Same fractional sizing as the paper account — 6 decimal places. */

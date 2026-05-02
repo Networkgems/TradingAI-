@@ -1,5 +1,5 @@
 import type { AccountState, Position, TradeSignal, SignalType } from '@trading-app/shared';
-import { MANAGED_ACCOUNT_RATIO, DEFAULT_RISK_PER_TRADE } from '@trading-app/shared';
+import { DEFAULT_ACCOUNT_SETTINGS } from '@trading-app/shared';
 import { randomUUID } from 'crypto';
 
 const INITIAL_EQUITY = 25_000;
@@ -10,12 +10,28 @@ export class CryptoPaperAccount {
   private positions: Map<string, Position> = new Map();
   private openingEquityToday: number;
   private initialEquity: number;
+  // TRA-232 — risk knobs come from per-user AccountSettings instead of the
+  // hardcoded MANAGED_ACCOUNT_RATIO / DEFAULT_RISK_PER_TRADE constants. The
+  // engine pushes fresh values via updateRiskConfig on every settings save so
+  // the Crypto dashboard honors what the user enters in Settings.
+  private managedAccountRatio: number = DEFAULT_ACCOUNT_SETTINGS.managedAccountRatio;
+  private riskPerTrade: number = DEFAULT_ACCOUNT_SETTINGS.riskPerTrade;
 
   constructor(savedEquity = INITIAL_EQUITY, openingEquityToday = savedEquity) {
     this.initialEquity = savedEquity;
     this.equity = savedEquity;
     this.cash = savedEquity;
     this.openingEquityToday = openingEquityToday;
+  }
+
+  /**
+   * Apply per-user risk settings (managedAccountRatio, riskPerTrade) so the
+   * crypto demo account sizes positions the same way the user expects from
+   * the Settings page. Called on construction and on every settings save.
+   */
+  updateRiskConfig(config: { managedAccountRatio?: number; riskPerTrade?: number }): void {
+    if (config.managedAccountRatio !== undefined) this.managedAccountRatio = config.managedAccountRatio;
+    if (config.riskPerTrade !== undefined) this.riskPerTrade = config.riskPerTrade;
   }
 
   reset(savedEquity?: number): void {
@@ -59,11 +75,11 @@ export class CryptoPaperAccount {
   }
 
   managedEquity(): number {
-    return this.equity * MANAGED_ACCOUNT_RATIO;
+    return this.equity * this.managedAccountRatio;
   }
 
   maxRiskPerTrade(): number {
-    return this.managedEquity() * DEFAULT_RISK_PER_TRADE;
+    return this.managedEquity() * this.riskPerTrade;
   }
 
   /** Fractional sizing for crypto (6 decimal places). */
