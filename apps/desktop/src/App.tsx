@@ -521,6 +521,11 @@ function CryptoDashboard({ token, onBack, onLogout, onActivity }: { token: strin
                       <div className="sig-stat"><span>Target</span><strong className="green">${fmt(sig.takeProfit)}</strong></div>
                       <div className="sig-stat"><span>R:R</span><strong>1:{sig.riskRewardRatio}</strong></div>
                     </div>
+                    {sig.liveSkipReason && (
+                      <div className="signal-skip-reason" title={sig.liveSkipReason}>
+                        Not opened: {sig.liveSkipReason}
+                      </div>
+                    )}
                   </div>
                 ))}
               </div>

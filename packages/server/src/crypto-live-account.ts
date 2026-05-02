@@ -204,12 +204,33 @@ export class CryptoLiveAccount {
   /**
    * Submit a market order to Coinbase and, on success, record the resulting
    * position locally. Returns null if the trade was skipped before order
-   * submission (qty too small, insufficient cash). Throws if Coinbase rejects.
+   * submission (qty too small, insufficient cash, short signal on spot).
+   * Throws if Coinbase rejects.
+   *
+   * TRA-243 — every skip path stamps `signal.liveSkipReason` so the dashboard
+   * Signals panel can surface why a signal didn't open a position. Without
+   * this, skips were `console.warn`-only and operators saw "8 signals, 0
+   * positions" with no way to self-diagnose.
    */
   async openPosition(signal: TradeSignal, currentPrice: number): Promise<Position | null> {
+    // TRA-243 — Coinbase Advanced Trade is a SPOT venue: there is no concept
+    // of "opening a short" — a sell-side strategy signal doesn't translate to
+    // an executable position. Closes happen via checkExits (TP/SL), not via
+    // sell signals from strategies. Strategies (Reversal/MACD/BbFade/
+    // MeanReversion) emit short-bias signals freely though, so surface a
+    // clear reason instead of a silent log-only skip.
+    if (signal.side === 'sell') {
+      const reason = 'spot account cannot open shorts (Coinbase Advanced Trade is spot-only)';
+      signal.liveSkipReason = reason;
+      console.warn(`[crypto-live] skip ${signal.symbol} ${signal.type}: ${reason}`);
+      return null;
+    }
+
     let qty = this.sizeFromStop(signal.entryPrice, signal.stopLoss);
     if (qty <= 0) {
-      console.warn(`[crypto-live] skip ${signal.symbol} ${signal.type}: qty=0 (entry=${signal.entryPrice} stop=${signal.stopLoss} maxRisk=${this.maxRiskPerTrade().toFixed(2)})`);
+      const reason = `entry==stop, no risk-derived size (entry=${signal.entryPrice} stop=${signal.stopLoss})`;
+      signal.liveSkipReason = reason;
+      console.warn(`[crypto-live] skip ${signal.symbol} ${signal.type}: ${reason} (maxRisk=${this.maxRiskPerTrade().toFixed(2)})`);
       return null;
     }
     // Cap by managed equity: never spend more than the user has authorised
@@ -225,12 +246,16 @@ export class CryptoLiveAccount {
     qty = Math.min(qty, maxQtyForCash);
     qty = Math.round(qty * 1_000_000) / 1_000_000;
     if (qty <= 0) {
-      console.warn(`[crypto-live] skip ${signal.symbol} ${signal.type}: no spendable size (cash=${this.cashUsd.toFixed(2)} managedEquity=${this.managedEquity().toFixed(2)} price=${currentPrice})`);
+      const reason = `no spendable cash (USD=${this.cashUsd.toFixed(2)}, managedEquity=${this.managedEquity().toFixed(2)} — fund the Coinbase USD wallet or sell crypto holdings to free cash)`;
+      signal.liveSkipReason = reason;
+      console.warn(`[crypto-live] skip ${signal.symbol} ${signal.type}: ${reason} price=${currentPrice}`);
       return null;
     }
     const cost = currentPrice * qty;
     if (cost < MIN_NOTIONAL_USD) {
-      console.warn(`[crypto-live] skip ${signal.symbol} ${signal.type}: cost=${cost.toFixed(2)} < $${MIN_NOTIONAL_USD} Coinbase minimum (cash=${this.cashUsd.toFixed(2)} maxRisk=${this.maxRiskPerTrade().toFixed(2)})`);
+      const reason = `cost $${cost.toFixed(2)} below Coinbase $${MIN_NOTIONAL_USD} minimum (USD=${this.cashUsd.toFixed(2)}, maxRisk=${this.maxRiskPerTrade().toFixed(2)})`;
+      signal.liveSkipReason = reason;
+      console.warn(`[crypto-live] skip ${signal.symbol} ${signal.type}: ${reason}`);
       return null;
     }
 
@@ -242,7 +267,13 @@ export class CryptoLiveAccount {
         baseSize: qty,
       });
     } catch (err: unknown) {
-      console.error(`[crypto-live] open failed for ${signal.symbol}: ${err instanceof Error ? err.message : String(err)}`);
+      // TRA-243 — bubble the Coinbase rejection text onto the signal so the
+      // user sees "Insufficient funds" / "Order size below minimum" in the
+      // UI, not just in stderr. We still rethrow so the engine's existing
+      // catch path logs at warn level.
+      const msg = err instanceof Error ? err.message : String(err);
+      signal.liveSkipReason = `Coinbase rejected order: ${msg}`;
+      console.error(`[crypto-live] open failed for ${signal.symbol}: ${msg}`);
       throw err;
     }
 

@@ -257,6 +257,16 @@ tr:hover td { background: #1c2128; }
 .sig-stat span { font-size: 0.6rem; color: var(--muted); text-transform: uppercase; }
 .sig-stat strong { font-size: 0.8rem; }
 
+.signal-skip-reason {
+  margin-top: 0.5rem;
+  padding: 0.3rem 0.5rem;
+  font-size: 0.7rem;
+  color: var(--red);
+  background: rgba(248, 81, 73, 0.08);
+  border-left: 2px solid var(--red);
+  border-radius: 2px;
+}
+
 .positions-panel h3 {
   font-size: 0.8rem;
   text-transform: uppercase;

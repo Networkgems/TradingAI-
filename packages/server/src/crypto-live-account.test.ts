@@ -375,3 +375,81 @@ describe('CryptoLiveAccount small-fund sizing (TRA-243)', () => {
     expect(coinbase.placeMarketOrder).not.toHaveBeenCalled();
   });
 });
+
+describe('CryptoLiveAccount skip-reason annotation (TRA-243)', () => {
+  it('rejects sell-side signals with a spot-only reason', async () => {
+    // Sell-side strategy signals on Coinbase spot are not shortable. We must
+    // not fire them — Coinbase would reject for insufficient base balance,
+    // and the user sees a silent skip with no explanation. Annotate the
+    // signal so the dashboard surfaces "cannot open shorts" instead.
+    const { account, coinbase } = buyAccount(50_000);
+    await account.refreshBalance();
+
+    const signal = buildSignal({ side: 'sell', stopLoss: 30_300, takeProfit: 29_100 });
+    const pos = await account.openPosition(signal, 30_000);
+
+    expect(pos).toBeNull();
+    expect(coinbase.placeMarketOrder).not.toHaveBeenCalled();
+    expect(signal.liveSkipReason).toMatch(/cannot open shorts/i);
+  });
+
+  it('annotates the signal when no spendable cash is available', async () => {
+    const coinbase = new FakeCoinbaseClient();
+    coinbase.listAccounts.mockResolvedValue([
+      {
+        uuid: 'btc', name: 'BTC', currency: 'BTC',
+        available_balance: { value: '1', currency: 'BTC' },
+        hold: { value: '0', currency: 'BTC' },
+      },
+    ]);
+    coinbase.getProductPrices.mockResolvedValue(new Map([['BTC-USD', 30_000]]));
+    const account = new CryptoLiveAccount(asClient(coinbase), { sleep: async () => {} });
+    await account.refreshBalance();
+
+    const signal = buildSignal();
+    const pos = await account.openPosition(signal, 30_000);
+
+    expect(pos).toBeNull();
+    expect(signal.liveSkipReason).toMatch(/no spendable cash/i);
+  });
+
+  it('annotates the signal when cash-capped notional is below $1', async () => {
+    const { account } = buyAccount(0.5);
+    await account.refreshBalance();
+
+    const signal = buildSignal();
+    const pos = await account.openPosition(signal, 30_000);
+
+    expect(pos).toBeNull();
+    expect(signal.liveSkipReason).toMatch(/below.*\$1.*minimum/i);
+  });
+
+  it('annotates the signal with the Coinbase rejection text on order failure', async () => {
+    const { account, coinbase } = buyAccount(50_000);
+    await account.refreshBalance();
+
+    coinbase.placeMarketOrder.mockRejectedValueOnce(
+      new Error('Coinbase order rejected: INSUFFICIENT_FUND'),
+    );
+
+    const signal = buildSignal();
+    await expect(account.openPosition(signal, 30_000)).rejects.toThrow(/INSUFFICIENT_FUND/);
+    expect(signal.liveSkipReason).toMatch(/INSUFFICIENT_FUND/);
+  });
+
+  it('does not annotate liveSkipReason on successful open', async () => {
+    const { account, coinbase } = buyAccount(50_000);
+    await account.refreshBalance();
+
+    coinbase.placeMarketOrder.mockResolvedValueOnce(orderSuccess('o-ok'));
+    coinbase.getOrder.mockResolvedValueOnce(
+      orderDetails({ order_id: 'o-ok', status: 'FILLED', average_filled_price: '30000', filled_size: '0.001' }),
+    );
+
+    const signal = buildSignal();
+    const pos = await account.openPosition(signal, 30_000);
+
+    expect(pos).not.toBeNull();
+    expect(signal.liveSkipReason).toBeUndefined();
+  });
+});

@@ -46,6 +46,15 @@ export interface TradeSignal {
    * existed; absent ↔ legacy demo (only mode that emitted signals pre-field).
    */
   mode?: AccountMode;
+  /**
+   * TRA-243 — short human-readable reason a live signal failed to open a
+   * position on Coinbase (e.g. "no spendable cash", "below $1 minimum",
+   * "spot account cannot open shorts", or the Coinbase REST error message).
+   * Surfaced on the dashboard signal card so the user can diagnose silent
+   * skips themselves instead of mining server logs. Absent on success and
+   * on demo-mode signals (demo never skips for liquidity reasons).
+   */
+  liveSkipReason?: string;
 }
 
 /**
