@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState } from 'react';
+import { useCallback, useEffect, useRef, useState } from 'react';
 import type { TradeSignal, Position, AccountState, OptionPosition, OptionsAccountState, EodReport, CryptoEngineState, NewsItem } from '@trading-app/shared';
 import { OPTIONS_DAILY_LIMIT } from '@trading-app/shared';
 import LoginPage from './LoginPage.tsx';
@@ -6,6 +6,50 @@ import ForgotPasswordPage from './ForgotPasswordPage.tsx';
 import SettingsPage, { ChangePasswordSection, UserManagementSection } from './SettingsPage.tsx';
 import { CalendarTab } from './CalendarTab.tsx';
 import './index.css';
+
+type Theme = 'light' | 'dark';
+const THEME_STORAGE_KEY = 'tradingai_theme';
+
+function readInitialTheme(): Theme {
+  try {
+    const stored = localStorage.getItem(THEME_STORAGE_KEY);
+    if (stored === 'dark' || stored === 'light') return stored;
+  } catch { /* ignore */ }
+  return 'light';
+}
+
+function useTheme(): { theme: Theme; toggleTheme: () => void } {
+  const [theme, setTheme] = useState<Theme>(() => readInitialTheme());
+
+  useEffect(() => {
+    const root = document.documentElement;
+    root.classList.remove('theme-light', 'theme-dark');
+    root.classList.add(theme === 'dark' ? 'theme-dark' : 'theme-light');
+    try { localStorage.setItem(THEME_STORAGE_KEY, theme); } catch { /* ignore */ }
+  }, [theme]);
+
+  const toggleTheme = useCallback(() => {
+    setTheme(t => t === 'light' ? 'dark' : 'light');
+  }, []);
+
+  return { theme, toggleTheme };
+}
+
+function ThemeToggle({ theme, onToggle }: { theme: Theme; onToggle: () => void }) {
+  const isDark = theme === 'dark';
+  return (
+    <button
+      type="button"
+      className="theme-toggle"
+      onClick={onToggle}
+      title={isDark ? 'Switch to light mode' : 'Switch to dark mode'}
+      aria-label="Toggle theme"
+    >
+      <span aria-hidden="true">{isDark ? '☾' : '☀'}</span>
+      <span className="theme-toggle-label">{isDark ? 'Dark' : 'Light'}</span>
+    </button>
+  );
+}
 
 function CandlestickIcon() {
   return (
@@ -55,7 +99,7 @@ function DashboardSelector({ onSelect }: { onSelect: (mode: 'stocks' | 'crypto')
   );
 }
 
-function CryptoDashboard({ token, onBack, onLogout }: { token: string; onBack: () => void; onLogout: () => void }) {
+function CryptoDashboard({ token, onBack, onLogout, theme, onToggleTheme }: { token: string; onBack: () => void; onLogout: () => void; theme: Theme; onToggleTheme: () => void }) {
   const [state, setState] = useState<CryptoEngineState | null>(null);
   const [news, setNews] = useState<NewsItem[]>([]);
   const [connected, setConnected] = useState(false);
@@ -227,6 +271,7 @@ function CryptoDashboard({ token, onBack, onLogout }: { token: string; onBack: (
             >
               {autoTradingEnabled ? '⏹ Stop Trading' : '▶ Start Trading'}
             </button>
+            <ThemeToggle theme={theme} onToggle={onToggleTheme} />
             <button
               className={`logout-btn${tab === 'settings' ? ' active' : ''}`}
               onClick={() => setTab(t => t === 'settings' ? 'watchlist' : 'settings')}
@@ -547,7 +592,7 @@ function signalLabel(type: string) {
   }
 }
 
-function Dashboard({ token, onLogout, onGoHome }: { token: string; onLogout: () => void; onGoHome: () => void }) {
+function Dashboard({ token, onLogout, onGoHome, theme, onToggleTheme }: { token: string; onLogout: () => void; onGoHome: () => void; theme: Theme; onToggleTheme: () => void }) {
   const [state, setState] = useState<AppState | null>(null);
   const [eodReport, setEodReport] = useState<EodReport | null>(null);
   const [eodCollapsed, setEodCollapsed] = useState(false);
@@ -754,6 +799,7 @@ function Dashboard({ token, onLogout, onGoHome }: { token: string; onLogout: () 
             >
               {autoTradingEnabled ? '⏹ Stop Trading' : '▶ Start Trading'}
             </button>
+            <ThemeToggle theme={theme} onToggle={onToggleTheme} />
             <button
               className={`logout-btn${tab === 'settings' ? ' active' : ''}`}
               onClick={() => setTab(t => t === 'settings' ? 'watchlist' : 'settings')}
@@ -1277,6 +1323,8 @@ function Dashboard({ token, onLogout, onGoHome }: { token: string; onLogout: () 
 type AuthScreen = 'login' | 'forgot';
 
 export default function App() {
+  const { theme, toggleTheme } = useTheme();
+
   const [token, setToken] = useState<string | null>(() => localStorage.getItem('auth_token'));
   const [authScreen, setAuthScreen] = useState<AuthScreen>('login');
   const [appMode, setAppMode] = useState<null | 'stocks' | 'crypto'>(() => {
@@ -1302,20 +1350,42 @@ export default function App() {
     setAppMode(null);
   }
 
+  // Floating toggle visible on auth/selector screens that don't have a header bar
+  const floatingToggle = (
+    <div className="theme-toggle-floating">
+      <ThemeToggle theme={theme} onToggle={toggleTheme} />
+    </div>
+  );
+
   if (!token) {
     if (authScreen === 'forgot') {
-      return <ForgotPasswordPage onBack={() => setAuthScreen('login')} />;
+      return (
+        <>
+          {floatingToggle}
+          <ForgotPasswordPage onBack={() => setAuthScreen('login')} />
+        </>
+      );
     }
-    return <LoginPage onLogin={setToken} onForgotPassword={() => setAuthScreen('forgot')} />;
+    return (
+      <>
+        {floatingToggle}
+        <LoginPage onLogin={setToken} onForgotPassword={() => setAuthScreen('forgot')} />
+      </>
+    );
   }
 
   if (appMode === null) {
-    return <DashboardSelector onSelect={selectMode} />;
+    return (
+      <>
+        {floatingToggle}
+        <DashboardSelector onSelect={selectMode} />
+      </>
+    );
   }
 
   if (appMode === 'crypto') {
-    return <CryptoDashboard token={token} onBack={goHome} onLogout={handleLogout} />;
+    return <CryptoDashboard token={token} onBack={goHome} onLogout={handleLogout} theme={theme} onToggleTheme={toggleTheme} />;
   }
 
-  return <Dashboard token={token} onLogout={handleLogout} onGoHome={goHome} />;
+  return <Dashboard token={token} onLogout={handleLogout} onGoHome={goHome} theme={theme} onToggleTheme={toggleTheme} />;
 }
