@@ -3,6 +3,7 @@ import { SignalEngine } from './signal-engine.js';
 import type { RelativeValueScannerService, RelativeValueScanResult } from './relative-value-scanner.js';
 import type { RelativeValueCandidate, TradierOptionsClient } from '@trading-app/engine';
 import { DEFAULT_ACCOUNT_SETTINGS } from '@trading-app/shared';
+import type { TradierEnv } from '@trading-app/shared';
 
 // Inside an ET trading window: 10:00 AM ET on a Tuesday → 14:00 UTC during EDT.
 const TRADING_TIME = Date.parse('2024-06-04T14:00:00Z');
@@ -185,5 +186,79 @@ describe('SignalEngine — Tradier live balance surfacing (TRA-226)', () => {
     await engine.applySettings({ ...DEFAULT_ACCOUNT_SETTINGS, mode: 'demo' });
     const internal = engine as unknown as { liveTradierBalance: unknown };
     expect(internal.liveTradierBalance).toBeNull();
+  });
+});
+
+describe('SignalEngine — legacy options snapshot routing (TRA-237)', () => {
+  it('legacy single-bucket options without a tradierEnv stamp restore into sandbox, not the engine\'s active env', () => {
+    // Engine created with the user already on production env (the broken
+    // pre-fix path attributed any pre-TRA-233 paper trades into the production
+    // bucket, surfacing demo P&L in the Live Production header even when no
+    // production order had ever been placed).
+    const engine = new SignalEngine(
+      { ...DEFAULT_ACCOUNT_SETTINGS, mode: 'live', liveTradierEnvOptions: 'production' },
+    );
+    expect((engine as unknown as { tradierEnv: TradierEnv }).tradierEnv).toBe('production');
+
+    engine.importTradeSnapshot({
+      closedPositions: [],
+      recentSignals: [],
+      dailySignals: [],
+      positionSignalType: [],
+      account: { cash: 25_000, equity: 25_000, initialEquity: 25_000, dailyPnl: 0, openPositions: [] },
+      // Legacy snapshot — no tradierEnv stamp, no optionsByEnv. These were the
+      // sandbox-era trades from TRA-220.
+      options: {
+        openOptions: [],
+        closedOptions: [],
+        optionsPnl: 524.50,
+        dailyCount: 10,
+        currentDayKey: '2026-05-02',
+        cash: 25_000,
+        equity: 25_524.50,
+      },
+    });
+
+    const accounts = (engine as unknown as { optionsAccounts: Record<TradierEnv, { getState: () => { optionsPnl: number; dailyOptionsCount: number } }> }).optionsAccounts;
+    expect(accounts.sandbox.getState().optionsPnl).toBe(524.50);
+    expect(accounts.sandbox.getState().dailyOptionsCount).toBe(10);
+    expect(accounts.production.getState().optionsPnl).toBe(0);
+    expect(accounts.production.getState().dailyOptionsCount).toBe(0);
+
+    // The Live Production header reads the active env's bucket — it should
+    // see the empty production bucket, not the legacy sandbox P&L.
+    const state = engine.getState();
+    expect(state.options.optionsPnl).toBe(0);
+    expect(state.options.dailyOptionsCount).toBe(0);
+    expect(state.options.openOptions).toEqual([]);
+  });
+
+  it('legacy snapshot WITH a tradierEnv stamp still routes to that env', () => {
+    const engine = new SignalEngine(
+      { ...DEFAULT_ACCOUNT_SETTINGS, mode: 'live', liveTradierEnvOptions: 'sandbox' },
+    );
+
+    engine.importTradeSnapshot({
+      closedPositions: [],
+      recentSignals: [],
+      dailySignals: [],
+      positionSignalType: [],
+      account: { cash: 25_000, equity: 25_000, initialEquity: 25_000, dailyPnl: 0, openPositions: [] },
+      options: {
+        openOptions: [],
+        closedOptions: [],
+        optionsPnl: 100,
+        dailyCount: 1,
+        currentDayKey: '2026-05-02',
+        cash: 25_000,
+        equity: 25_100,
+        // Stamp present — TRA-233 single-bucket persisted under the active env.
+        tradierEnv: 'production',
+      } as unknown as Parameters<typeof engine.importTradeSnapshot>[0]['options'],
+    });
+
+    const accounts = (engine as unknown as { optionsAccounts: Record<TradierEnv, { getState: () => { optionsPnl: number } }> }).optionsAccounts;
+    expect(accounts.production.getState().optionsPnl).toBe(100);
+    expect(accounts.sandbox.getState().optionsPnl).toBe(0);
   });
 });

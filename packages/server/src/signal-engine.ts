@@ -976,7 +976,16 @@ export class SignalEngine {
    *
    * `optionsByEnv` is optional so legacy snapshots written before TRA-233
    * (which only have the single `options` blob) still load — they get routed
-   * to the env tag stored on the bucket if any, else the engine's active env.
+   * to the env tag stored on the bucket if any, else 'sandbox'.
+   *
+   * TRA-237: legacy snapshots WITHOUT a `tradierEnv` stamp predate the env
+   * split entirely (TRA-220 era), and back then the only available paper
+   * options account was sandbox. Falling back to `this.tradierEnv` (the
+   * engine's *current* setting) instead of 'sandbox' was wrong — for a user
+   * who has since flipped `liveTradierEnvOptions` to 'production', it
+   * re-attributed every pre-existing paper position into the production
+   * bucket, surfacing demo/sandbox P&L under the Live Production header even
+   * though no Tradier production order had ever been placed.
    */
   importTradeSnapshot(snap: Omit<ReturnType<SignalEngine['exportTradeSnapshot']>, 'optionsByEnv'> & {
     optionsByEnv?: Record<TradierEnv, ReturnType<PaperOptionsAccount['exportSnapshot']>>;
@@ -990,7 +999,7 @@ export class SignalEngine {
       this.optionsAccounts.sandbox.importSnapshot(snap.optionsByEnv.sandbox);
       this.optionsAccounts.production.importSnapshot(snap.optionsByEnv.production);
     } else if (snap.options) {
-      const legacyEnv = (snap.options as { tradierEnv?: TradierEnv | null }).tradierEnv ?? this.tradierEnv;
+      const legacyEnv = (snap.options as { tradierEnv?: TradierEnv | null }).tradierEnv ?? 'sandbox';
       this.optionsAccounts[legacyEnv].importSnapshot(snap.options);
     }
   }
