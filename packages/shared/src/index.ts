@@ -552,6 +552,32 @@ export interface NewsItem {
   source: string;
   publishedAt: string;
   summary?: string;
+  /**
+   * TRA-227 — set on items that originate from the research store (currently
+   * QuantTrader pre/post-market reviews). The UI uses this to render a
+   * "Research" badge and expand the inline markdown body instead of opening
+   * the link in a new tab.
+   */
+  id?: string;
+  kind?: ResearchReportKind;
+  bodyMarkdown?: string;
+}
+
+export type ResearchReportKind = 'premarket' | 'postmarket' | 'weekly_review';
+
+/**
+ * TRA-227 — editorial / research content surfaced in the Stocks News tab
+ * alongside Yahoo Finance headlines. Posted by the QuantTrader routine via
+ * `POST /api/research/reports`.
+ */
+export interface ResearchReport {
+  id: string;
+  kind: ResearchReportKind;
+  title: string;
+  bodyMarkdown: string;
+  publishedAt: string; // ISO
+  source: 'QuantTrader';
+  tickers?: string[];
 }
 
 export interface CryptoSymbolState {

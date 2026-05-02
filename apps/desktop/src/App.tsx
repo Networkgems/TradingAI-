@@ -564,23 +564,7 @@ function CryptoDashboard({ token, onBack, onLogout, onActivity }: { token: strin
             ) : (
               <div className="signal-list">
                 {news.slice(0, 10).map((item) => (
-                  <div key={item.url} className="news-card">
-                    <div className="signal-header">
-                      <span className="signal-symbol">{item.source}</span>
-                      <span className="signal-time muted">{timeAgo(new Date(item.publishedAt).getTime())}</span>
-                    </div>
-                    <div style={{ padding: '0.5rem 0' }}>
-                      <a href={item.url} target="_blank" rel="noopener noreferrer"
-                         style={{ color: 'var(--blue)', textDecoration: 'none', fontWeight: 500 }}>
-                        {item.title}
-                      </a>
-                      {item.summary && (
-                        <p style={{ marginTop: '0.3rem', color: 'var(--muted)', fontSize: '0.75rem', lineHeight: 1.5 }}>
-                          {item.summary}
-                        </p>
-                      )}
-                    </div>
-                  </div>
+                  <NewsCard key={item.id ?? item.url} item={item} />
                 ))}
               </div>
             )}
@@ -671,6 +655,84 @@ function signalLabel(type: string) {
     case 'swing_trade': return 'Swing';
     default: return type;
   }
+}
+
+function researchKindLabel(kind?: string) {
+  switch (kind) {
+    case 'premarket': return 'Pre-Market';
+    case 'postmarket': return 'Post-Market';
+    case 'weekly_review': return 'Weekly Review';
+    default: return null;
+  }
+}
+
+/**
+ * TRA-227 — News tab card. Yahoo headlines render as a plain external link;
+ * QuantTrader research items render with a "Research" badge and an
+ * expand/collapse button that reveals the inline markdown body. Identifiable
+ * via `bodyMarkdown` and the `kind` field set by the server.
+ */
+function NewsCard({ item }: { item: NewsItem }) {
+  const isResearch = !!item.bodyMarkdown && item.source === 'QuantTrader';
+  const [expanded, setExpanded] = useState(false);
+  if (!isResearch) {
+    return (
+      <div className="news-card">
+        <div className="signal-header">
+          <span className="signal-symbol">{item.source}</span>
+          <span className="signal-time muted">{timeAgo(new Date(item.publishedAt).getTime())}</span>
+        </div>
+        <div style={{ padding: '0.5rem 0' }}>
+          <a href={item.url} target="_blank" rel="noopener noreferrer"
+             style={{ color: 'var(--blue)', textDecoration: 'none', fontWeight: 500 }}>
+            {item.title}
+          </a>
+          {item.summary && (
+            <p style={{ marginTop: '0.3rem', color: 'var(--muted)', fontSize: '0.75rem', lineHeight: 1.5 }}>
+              {item.summary}
+            </p>
+          )}
+        </div>
+      </div>
+    );
+  }
+  const kindLabel = researchKindLabel(item.kind);
+  return (
+    <div className="news-card research">
+      <div className="signal-header">
+        <span className="signal-symbol">
+          <span className="research-badge">Research</span>
+          {item.source}
+          {kindLabel && <span className="research-kind">{kindLabel}</span>}
+        </span>
+        <span className="signal-time muted">{timeAgo(new Date(item.publishedAt).getTime())}</span>
+      </div>
+      <div style={{ padding: '0.5rem 0' }}>
+        <button
+          type="button"
+          onClick={() => setExpanded(e => !e)}
+          style={{
+            background: 'none', border: 'none', padding: 0, cursor: 'pointer',
+            color: 'var(--blue)', textDecoration: 'none', fontWeight: 500,
+            fontSize: 'inherit', textAlign: 'left',
+          }}
+        >
+          {item.title}
+        </button>
+        <div>
+          <button
+            type="button"
+            className="research-toggle"
+            onClick={() => setExpanded(e => !e)}
+            aria-expanded={expanded}
+          >
+            {expanded ? 'Hide report' : 'Read report'}
+          </button>
+        </div>
+        {expanded && <div className="research-body">{item.bodyMarkdown}</div>}
+      </div>
+    </div>
+  );
 }
 
 function Dashboard({ token, onLogout, onGoHome, onActivity }: { token: string; onLogout: () => void; onGoHome: () => void; onActivity?: () => void }) {
@@ -1228,23 +1290,7 @@ function Dashboard({ token, onLogout, onGoHome, onActivity }: { token: string; o
             ) : (
               <div className="signal-list">
                 {news.slice(0, 10).map((item) => (
-                  <div key={item.url} className="news-card">
-                    <div className="signal-header">
-                      <span className="signal-symbol">{item.source}</span>
-                      <span className="signal-time muted">{timeAgo(new Date(item.publishedAt).getTime())}</span>
-                    </div>
-                    <div style={{ padding: '0.5rem 0' }}>
-                      <a href={item.url} target="_blank" rel="noopener noreferrer"
-                         style={{ color: 'var(--blue)', textDecoration: 'none', fontWeight: 500 }}>
-                        {item.title}
-                      </a>
-                      {item.summary && (
-                        <p style={{ marginTop: '0.3rem', color: 'var(--muted)', fontSize: '0.75rem', lineHeight: 1.5 }}>
-                          {item.summary}
-                        </p>
-                      )}
-                    </div>
-                  </div>
+                  <NewsCard key={item.id ?? item.url} item={item} />
                 ))}
               </div>
             )}

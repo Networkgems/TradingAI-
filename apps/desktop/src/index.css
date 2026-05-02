@@ -1358,6 +1358,67 @@ tr:hover td { background: #1c2128; }
   margin-bottom: 0.5rem;
 }
 
+/* TRA-227 — research-report news card (QuantTrader). Distinct accent border
+   and "Research" badge so editorial content stands out from third-party
+   headlines. Body markdown renders in a pre-wrapped block when expanded. */
+.news-card.research {
+  border-left: 3px solid var(--blue);
+  background: rgba(88, 166, 255, 0.04);
+}
+
+.research-badge {
+  display: inline-block;
+  padding: 0.05rem 0.45rem;
+  border-radius: 4px;
+  font-size: 0.6rem;
+  font-weight: 700;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+  background: rgba(88, 166, 255, 0.16);
+  color: var(--blue);
+  margin-right: 0.5rem;
+  vertical-align: middle;
+}
+
+.research-kind {
+  font-size: 0.6rem;
+  color: var(--muted);
+  margin-left: 0.4rem;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+}
+
+.research-toggle {
+  background: none;
+  border: 1px solid var(--border);
+  border-radius: 5px;
+  padding: 0.25rem 0.6rem;
+  color: var(--muted);
+  font-size: 0.7rem;
+  cursor: pointer;
+  margin-top: 0.4rem;
+}
+
+.research-toggle:hover {
+  color: var(--blue);
+  border-color: var(--blue);
+}
+
+.research-body {
+  margin-top: 0.5rem;
+  padding: 0.6rem 0.8rem;
+  background: var(--bg);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  white-space: pre-wrap;
+  font-size: 0.78rem;
+  line-height: 1.5;
+  color: var(--fg);
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  max-height: 480px;
+  overflow-y: auto;
+}
+
 /* ── Idle Warning Banner ─────────────────────────────────────────────────── */
 
 .idle-warning-banner {

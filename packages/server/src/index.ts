@@ -51,7 +51,13 @@ import {
   setRvScanner,
   type UserContext,
 } from './user-context.js';
-import { resolveTradierOptionsCreds, type AccountSettings } from '@trading-app/shared';
+import { resolveTradierOptionsCreds, type AccountSettings, type NewsItem, type ResearchReport } from '@trading-app/shared';
+import {
+  saveResearchReport,
+  listResearchReports,
+  getResearchReport,
+  ResearchValidationError,
+} from './research-store.js';
 
 const PORT = Number(process.env.PORT ?? 4242);
 const __dirname = dirname(fileURLToPath(import.meta.url));
@@ -617,6 +623,48 @@ app.post('/api/admin/users/:username/reset-password', requireAuth, requireAdmin,
   res.json({ ok: true, message: `Reset code emailed to ${user.email}` });
 });
 
+// ── News + research merge (TRA-227) ──────────────────────────────────────────
+//
+// Maps a research report into a NewsItem for the News tab and merges with the
+// Yahoo headline list. Reports newer than 24h are pinned to the top in
+// publishedAt order; older reports interleave with Yahoo by time. The
+// front-end recognises research items by `kind`/`bodyMarkdown` and renders an
+// expandable card with a "Research" badge.
+
+const RESEARCH_PIN_WINDOW_MS = 24 * 60 * 60 * 1000;
+
+function researchToNewsItem(r: ResearchReport): NewsItem {
+  return {
+    id: r.id,
+    title: r.title,
+    url: `/research/${r.id}`,
+    source: r.source,
+    publishedAt: r.publishedAt,
+    kind: r.kind,
+    bodyMarkdown: r.bodyMarkdown,
+  };
+}
+
+async function mergeResearchAndNews(yahoo: NewsItem[]): Promise<NewsItem[]> {
+  const reports = await listResearchReports();
+  if (reports.length === 0) return yahoo;
+  const now = Date.now();
+  const pinned: NewsItem[] = [];
+  const rest: NewsItem[] = [...yahoo];
+  for (const r of reports) {
+    const item = researchToNewsItem(r);
+    const ts = Date.parse(r.publishedAt);
+    if (Number.isFinite(ts) && now - ts <= RESEARCH_PIN_WINDOW_MS) {
+      pinned.push(item);
+    } else {
+      rest.push(item);
+    }
+  }
+  pinned.sort((a, b) => b.publishedAt.localeCompare(a.publishedAt));
+  rest.sort((a, b) => b.publishedAt.localeCompare(a.publishedAt));
+  return [...pinned, ...rest];
+}
+
 // ── State ─────────────────────────────────────────────────────────────────────
 
 app.get('/api/state', requireAuth, async (_req, res) => {
@@ -636,7 +684,42 @@ app.get('/api/crypto/news', requireAuth, async (_req, res) => {
 
 app.get('/api/news', requireAuth, async (_req, res) => {
   const ctx = await userCtx(res);
-  res.json(ctx.engine.getNews());
+  const yahoo = ctx.engine.getNews();
+  const merged = await mergeResearchAndNews(yahoo);
+  res.json(merged);
+});
+
+// TRA-227 — research-report ingestion + listing.
+//
+// `POST /api/research/reports` is admin-only: the QuantTrader routine runs
+// internally and uses an admin token. The endpoint is idempotent on `id` —
+// repeating with the same id updates the saved record rather than duplicating.
+app.post('/api/research/reports', requireAuth, requireAdmin, async (req, res) => {
+  try {
+    const saved = await saveResearchReport(req.body);
+    res.status(201).json(saved);
+  } catch (err) {
+    if (err instanceof ResearchValidationError) {
+      res.status(400).json({ error: err.message });
+      return;
+    }
+    console.error('[research] save failed:', err instanceof Error ? err.message : String(err));
+    res.status(500).json({ error: 'Failed to save research report' });
+  }
+});
+
+app.get('/api/research/reports', requireAuth, async (_req, res) => {
+  res.json(await listResearchReports());
+});
+
+app.get('/api/research/reports/:id', requireAuth, async (req, res) => {
+  const id = (req.params as Record<string, string>)['id'];
+  const report = await getResearchReport(id);
+  if (!report) {
+    res.status(404).json({ error: 'Report not found' });
+    return;
+  }
+  res.json(report);
 });
 
 app.get('/api/reports/latest', requireAuth, async (_req, res) => {
