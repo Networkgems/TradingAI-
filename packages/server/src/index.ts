@@ -793,7 +793,10 @@ app.put('/api/account/settings', requireAuth, async (req, res) => {
   await saveSettings(username, updated);
   ctx.engine.applySettings(updated);
   broadcastEngineState(ctx);
-  ctx.cryptoEngine.applySettings(updated);
+  // Await the crypto engine: switching into live mode does an initial Coinbase
+  // balance fetch, and the broadcast that follows must reflect that equity
+  // instead of a transient $0 the user sees until the next 60s tick (TRA-224).
+  await ctx.cryptoEngine.applySettings(updated);
   broadcastCryptoState(ctx);
   res.json({ ok: true, settings: updated });
 });

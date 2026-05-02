@@ -88,7 +88,9 @@ export class CryptoSignalEngine {
     this.account = new CryptoPaperAccount(currentEquity, openingEquityToday);
     // Set the canonical initialEquity baseline so allTimePnl reflects the user's setting.
     this.account.applyEquity(initialEquity);
-    if (this.mode === 'live') this.tryInitLiveBroker();
+    // Constructor can't await — kick off broker init + balance refresh in the
+    // background. The first tick will broadcast equity once it lands.
+    if (this.mode === 'live') void this.tryInitLiveBroker();
   }
 
   /**
@@ -138,17 +140,25 @@ export class CryptoSignalEngine {
     }
   }
 
-  private tryInitLiveBroker(): void {
+  /**
+   * Build the live broker (if creds are configured) and AWAIT the first
+   * Coinbase balance refresh so callers that broadcast immediately after this
+   * resolves carry the real equity instead of a transient $0 (TRA-224).
+   *
+   * Returns even when creds are missing or refresh fails — equity stays at 0
+   * and the next tick will retry. Exceptions never propagate; refreshBalance
+   * already swallows network/auth errors and just logs.
+   */
+  private async tryInitLiveBroker(): Promise<void> {
     if (this.liveAccount) return;
     const broker = this.buildLiveBroker();
-    if (broker) {
-      this.liveAccount = broker;
-      console.log('[crypto-engine] Coinbase live broker initialised — live trading active.');
-      // Kick off an initial balance refresh so the first tick has cash data.
-      void broker.refreshBalance();
-    } else {
+    if (!broker) {
       console.warn('[crypto-engine] live mode active but Coinbase credentials not configured — orders will not be sent.');
+      return;
     }
+    this.liveAccount = broker;
+    console.log('[crypto-engine] Coinbase live broker initialised — live trading active.');
+    await broker.refreshBalance();
   }
 
   /**
@@ -157,8 +167,13 @@ export class CryptoSignalEngine {
    * the demo state internally and masks it to zero via getState() — so a later
    * switch back to demo restores equity, positions, and dailyPnl untouched.
    * The new equity is persisted via the tracker so it survives a server restart.
+   *
+   * Async because the live-mode branch awaits the initial Coinbase balance
+   * refresh — the PUT /api/account/settings handler broadcasts state right
+   * after this resolves, and that broadcast must carry real equity instead of
+   * a transient $0 that lingers until the 60s tick (TRA-224).
    */
-  applySettings(settings: AccountSettings): void {
+  async applySettings(settings: AccountSettings): Promise<void> {
     this.currentSettings = settings;
     this.mode = settings.mode === 'live' ? 'live' : 'demo';
     if (this.mode === 'live') {
@@ -166,7 +181,7 @@ export class CryptoSignalEngine {
       // is preserved for a later switch back. Re-initialise the live broker so
       // newly entered Coinbase credentials take effect without a server restart.
       this.liveAccount = null;
-      this.tryInitLiveBroker();
+      await this.tryInitLiveBroker();
       return;
     }
     // Switching back to demo — drop the live broker so we don't keep refreshing

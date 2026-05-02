@@ -139,7 +139,7 @@ function runStocksEquityChange() {
   }
 }
 
-function runCryptoScenario() {
+async function runCryptoScenario() {
   console.log('\n── Crypto: demo → live → demo preserves equity/positions/signals/symbols ──');
   const dataDir = mkdtempSync(join(tmpdir(), 'tra138-crypto-'));
   try {
@@ -173,14 +173,14 @@ function runCryptoScenario() {
 
     check('crypto baseline equity reflects gain (>$25K)', baselineEquity > 25_000, baselineEquity);
 
-    engine.applySettings(makeSettings({ mode: 'live', demoEquityCrypto: 25_000 }));
+    await engine.applySettings(makeSettings({ mode: 'live', demoEquityCrypto: 25_000 }));
     const live = engine.getState();
     check('crypto live mode shows 0 equity', live.account.totalEquity === 0, live.account.totalEquity);
     check('crypto live mode shows no positions', live.account.openPositions.length === 0, live.account.openPositions.length);
     check('crypto live mode keeps watchlist visible', live.symbols.length === baselineSymbols);
     check('crypto live mode keeps signals visible', live.signals.length === baselineSignals);
 
-    engine.applySettings(makeSettings({ mode: 'demo', demoEquityCrypto: 25_000 }));
+    await engine.applySettings(makeSettings({ mode: 'demo', demoEquityCrypto: 25_000 }));
     const restored = engine.getState();
     console.log(`  restored demo: equity=${restored.account.totalEquity}, positions=${restored.account.openPositions.length}, signals=${restored.signals.length}, symbols=${restored.symbols.length}`);
 
@@ -233,14 +233,18 @@ function runStocksRestartInLiveMode() {
   }
 }
 
-runStocksScenario();
-runStocksEquityChange();
-runCryptoScenario();
-runStocksRestartInLiveMode();
+async function main() {
+  runStocksScenario();
+  runStocksEquityChange();
+  await runCryptoScenario();
+  runStocksRestartInLiveMode();
 
-if (failures > 0) {
-  console.error(`\n❌ ${failures} check(s) failed`);
-  process.exit(1);
-} else {
-  console.log('\n✅ All checks passed');
+  if (failures > 0) {
+    console.error(`\n❌ ${failures} check(s) failed`);
+    process.exit(1);
+  } else {
+    console.log('\n✅ All checks passed');
+  }
 }
+
+void main();
