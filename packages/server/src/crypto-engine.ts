@@ -423,6 +423,10 @@ export class CryptoSignalEngine {
 
     const closed = this.account.checkExits(prices);
     if (closed.length > 0) {
+      // TRA-231 — stamp `mode` for downstream UI metadata; the dashboard's
+      // closed-positions visibility is enforced by TRA-242's per-mode
+      // history lists so this stamp is informational only.
+      for (const pos of closed) pos.mode = 'demo';
       this.demoClosedPositions.push(...closed);
       this.tracker?.saveEquity(this.account.getEquity(), 0);
     }
@@ -486,10 +490,17 @@ export class CryptoSignalEngine {
             continue;
           }
 
+          // TRA-231 — stamp the active mode so the dashboard scopes Signals
+          // and Open Positions per-mode. Stamping the in-flight signal record
+          // also propagates to the position the demo account opens off it
+          // (`account.openPosition` does not copy `mode`, so we stamp the
+          // returned position too).
+          signal.mode = 'demo';
           this.recentSignals.unshift(signal);
           if (this.recentSignals.length > MAX_SIGNALS) this.recentSignals.pop();
 
-          this.account.openPosition(signal, price);
+          const opened = this.account.openPosition(signal, price);
+          if (opened) opened.mode = 'demo';
         }
       }
       if (symbolsSkipped > 0) {
@@ -525,6 +536,8 @@ export class CryptoSignalEngine {
       if (closed.length > 0) {
         // TRA-242 — Live exits go on the Live history list so the Live
         // dashboard surfaces only Coinbase fills, not Demo paper trades.
+        // TRA-231 — informational mode stamp on each record.
+        for (const pos of closed) pos.mode = 'live';
         this.liveClosedPositions.push(...closed);
       }
     } catch (err: unknown) {
@@ -574,6 +587,10 @@ export class CryptoSignalEngine {
         const price = prices.get(sym);
         if (!price) continue;
 
+        // TRA-231 — stamp live so the Signals panel scopes correctly on a
+        // mode flip back to demo. The live broker's openPosition adds the
+        // resulting position to its own state which we don't surface in demo.
+        signal.mode = 'live';
         this.recentSignals.unshift(signal);
         if (this.recentSignals.length > MAX_SIGNALS) this.recentSignals.pop();
 
@@ -627,12 +644,25 @@ export class CryptoSignalEngine {
 
   private buildState(): CryptoEngineState {
     const symbols = Array.from(this.symbolState.values()).filter(s => !this.hiddenSymbols.has(s.symbol));
+    // TRA-231 — scope signals to the active mode so the dashboard's Demo view
+    // doesn't surface live signals (and vice versa). Closed-positions split is
+    // handled by TRA-242's `demoClosedPositions` / `liveClosedPositions` lists
+    // which the per-branch returns below read from directly. Legacy persisted
+    // signal records have no `mode` stamp; route them to 'demo' since pre-field
+    // paths only ran in demo (live broker integration came later).
+    const isMode = (m: 'demo' | 'live' | undefined): boolean => (m ?? 'demo') === this.mode;
+    const scopedSignals = this.recentSignals.filter(s => isMode(s.mode));
     if (this.mode === 'live') {
       // Live mode: if a Coinbase broker is configured, surface its USD-equivalent
       // cash plus the positions we've opened in this session. Otherwise show a
       // zero/empty account; the internal demo state stays preserved.
       if (this.liveAccount) {
         const ls = this.liveAccount.getState();
+        // TRA-231 — stamp the rendered openPositions so the UI can attribute
+        // them to the live mode. Mutating the underlying records is safe: the
+        // CryptoLiveAccount returns its own array each call, and re-stamping
+        // the same value is idempotent.
+        for (const p of ls.openPositions) p.mode = 'live';
         const account: AccountState = {
           totalEquity: ls.totalEquity,
           availableCash: ls.availableCash,
@@ -645,7 +675,7 @@ export class CryptoSignalEngine {
         };
         return {
           symbols,
-          signals: [...this.recentSignals],
+          signals: scopedSignals,
           account,
           // TRA-242 — Live dashboard reads only Live closed positions; the
           // Demo history stays in `demoClosedPositions` for a later switch back.
@@ -668,7 +698,7 @@ export class CryptoSignalEngine {
       };
       return {
         symbols,
-        signals: [...this.recentSignals],
+        signals: scopedSignals,
         account,
         closedPositions: [],
         news: [...this.newsCache],
@@ -679,6 +709,9 @@ export class CryptoSignalEngine {
     }
     const accountBase = this.account.getState();
     const stats = this.tracker?.getCumulativeStats(accountBase.totalEquity);
+    // TRA-231 — same idempotent stamp as the live branch above so demo open
+    // positions carry an explicit mode tag through to the UI.
+    for (const p of accountBase.openPositions) p.mode = 'demo';
     const account: AccountState = {
       ...accountBase,
       weeklyPnl: stats?.weeklyPnl ?? 0,
@@ -689,7 +722,7 @@ export class CryptoSignalEngine {
 
     return {
       symbols,
-      signals: [...this.recentSignals],
+      signals: scopedSignals,
       account,
       // TRA-242 — Demo dashboard reads only Demo closed positions.
       closedPositions: [...this.demoClosedPositions].slice(-20),
@@ -723,17 +756,23 @@ export class CryptoSignalEngine {
       const live = this.liveAccount;
       void live.closePosition(positionId, currentPrice).then(closed => {
         // TRA-242 — manual closes from Live route to the Live history list.
-        if (closed) this.liveClosedPositions.push(closed);
+        // TRA-231 — informational mode stamp.
+        if (closed) {
+          closed.mode = 'live';
+          this.liveClosedPositions.push(closed);
+        }
       }).catch(err => {
         console.warn(`[crypto-engine] manualClose live failed: ${err instanceof Error ? err.message : String(err)}`);
       });
       // Synchronous response: optimistic close — the live broker will reconcile.
       const snapshot = live.getState().openPositions.find(p => p.id === positionId) ?? null;
-      return snapshot ? { ...snapshot, exitPrice: currentPrice, closedAt: Date.now() } : null;
+      return snapshot ? { ...snapshot, exitPrice: currentPrice, closedAt: Date.now(), mode: 'live' } : null;
     }
     const closed = this.account.closePosition(positionId, currentPrice);
     if (closed) {
       // TRA-242 — manual closes from Demo route to the Demo history list.
+      // TRA-231 — informational mode stamp.
+      closed.mode = 'demo';
       this.demoClosedPositions.push(closed);
       this.tracker?.saveEquity(this.account.getEquity(), 0);
     }

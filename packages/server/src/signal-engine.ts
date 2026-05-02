@@ -521,7 +521,11 @@ export class SignalEngine {
       // so a 30s tick rarely costs a real Tradier round-trip. Positions whose
       // mark we couldn't refresh are skipped this tick by `checkExits`.
       const optionMarks = await this.refreshOptionMarks();
-      const optsClosed = this.optionsAccount.checkExits(prices, optionMarks);
+      // TRA-231 — restrict the live exit pass to live-mode positions so a
+      // demo paper option still sitting in the same env bucket (e.g. legacy
+      // pre-TRA-220 sandbox state) is not silently closed under the user's
+      // feet when they switch into live mode.
+      const optsClosed = this.optionsAccount.checkExits(prices, optionMarks, 'live');
       if (optsClosed.length > 0) {
         // TRA-221 follow-up: mirror paper exits as Tradier `sell_to_close`
         // orders. Skipped in this iteration because the closed-position
@@ -602,6 +606,9 @@ export class SignalEngine {
             continue;
           }
 
+          // TRA-231 — stamp the active mode so the dashboard's Signals panel
+          // can scope this entry to the demo (or live) mode it fired under.
+          signal.mode = this.mode;
           this.recentSignals.unshift(signal);
           if (this.recentSignals.length > MAX_SIGNALS) this.recentSignals.pop();
 
@@ -611,7 +618,12 @@ export class SignalEngine {
           // on its own 5-minute cadence below. Equity / share trading still
           // fires off the established ORB/Reversal/MACD/BB/Ichimoku signals.
           const pos = this.account.openPosition(signal, price);
-          if (pos) this.positionSignalType.set(pos.id, signal.type);
+          if (pos) {
+            // TRA-231 — same rationale as the signal stamp above; the closed-
+            // positions list is filtered per-mode in getState().
+            pos.mode = this.mode;
+            this.positionSignalType.set(pos.id, signal.type);
+          }
 
           // Record signal for daily accuracy tracking
           this.dailySignals.push({
@@ -735,7 +747,9 @@ export class SignalEngine {
         );
         if (recentDup) continue;
 
-        const opened = this.optionsAccount.openOptionFromRvCandidate(signal);
+        // TRA-231 — pass `this.mode` so the position is stamped at open time;
+        // the dashboard scopes Open / Recent Closed Options per-mode.
+        const opened = this.optionsAccount.openOptionFromRvCandidate(signal, this.mode);
         if (!opened) continue;
 
         // TRA-221 — when running live with Tradier configured, mirror the
@@ -757,6 +771,9 @@ export class SignalEngine {
           }
         }
 
+        // TRA-231 — RV scanner runs in live mode only (TRA-220), but stamp the
+        // mode explicitly so the Signals panel scopes correctly when filtered.
+        signal.mode = this.mode;
         this.recentSignals.unshift(signal);
         if (this.recentSignals.length > MAX_SIGNALS) this.recentSignals.pop();
         this.dailySignals.push({
@@ -896,6 +913,13 @@ export class SignalEngine {
 
   getState(): EngineState {
     const symbols = Array.from(this.symbolState.values()).filter(s => !this.hiddenSymbols.has(s.symbol));
+    // TRA-231 — scope signals + closed positions to the active mode so a flip
+    // between Demo and Live shows each side's history independently. Legacy
+    // entries persisted before TRA-231 have no `mode` stamp; route them to
+    // 'demo' since pre-field opens only fired from the demo path (live equity
+    // wasn't wired and the live RV scanner only emerged in TRA-191/TRA-220).
+    const isMode = (m: 'demo' | 'live' | undefined): boolean => (m ?? 'demo') === this.mode;
+    const scopedSignals = this.recentSignals.filter(s => isMode(s.mode));
     if (this.mode === 'live') {
       // Live mode (TRA-220): the live equity broker isn't wired up yet, so the
       // stock account is masked to zero. The options paper account is the
@@ -917,10 +941,10 @@ export class SignalEngine {
         : { totalEquity: 0, availableCash: 0, openPositions: [], dailyPnl: 0 };
       return {
         symbols,
-        signals: [...this.recentSignals],
+        signals: scopedSignals,
         account: liveAccount,
         closedPositions: [],
-        options: this.optionsAccount.getState(),
+        options: this.optionsAccount.getStateForMode('live'),
         lastTick: Date.now(),
         tradingHalted: this.riskGovernor.isHalted(),
         haltReason: this.riskGovernor.getHaltReason(),
@@ -930,10 +954,10 @@ export class SignalEngine {
     }
     return {
       symbols,
-      signals: [...this.recentSignals],
+      signals: scopedSignals,
       account: this.buildAccountState(),
-      closedPositions: [...this.allClosedPositions].slice(-20),
-      options: this.optionsAccount.getState(),
+      closedPositions: this.allClosedPositions.filter(p => isMode(p.mode)).slice(-20),
+      options: this.optionsAccount.getStateForMode('demo'),
       lastTick: Date.now(),
       tradingHalted: this.riskGovernor.isHalted(),
       haltReason: this.riskGovernor.getHaltReason(),

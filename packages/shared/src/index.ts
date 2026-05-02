@@ -38,6 +38,14 @@ export interface TradeSignal {
   takeProfit: number;
   riskRewardRatio: number;
   timestamp: number;
+  /**
+   * TRA-231 — account mode the signal fired under. The dashboard's Signals
+   * panel filters to entries matching the currently active mode so a flip
+   * between Demo and Live shows each side's history independently. Optional
+   * for back-compat with persisted snapshots written before the field
+   * existed; absent ↔ legacy demo (only mode that emitted signals pre-field).
+   */
+  mode?: AccountMode;
 }
 
 /**
@@ -140,6 +148,14 @@ export interface Position {
    * time-stop diagnostics in the trade log.
    */
   barsHeld?: number;
+  /**
+   * TRA-231 — account mode the position was opened under. The dashboard's
+   * Open Positions / Closed Positions tabs filter to entries matching the
+   * currently active mode so flipping Demo ↔ Live shows each side's history
+   * independently. Optional for back-compat with snapshots persisted before
+   * the field existed; absent ↔ legacy demo (live equity wasn't wired yet).
+   */
+  mode?: AccountMode;
 }
 
 export interface AccountState {
@@ -514,6 +530,17 @@ export interface OptionPosition {
    * persisted before this field existed; absent ↔ legacy sandbox bucket.
    */
   tradierEnv?: TradierEnv;
+  /**
+   * TRA-231 — account mode the option was opened under. Sandbox + production
+   * already split persistence into per-env buckets, but a single env bucket
+   * could still accumulate both demo and live opens (e.g. a demo paper open
+   * pre-TRA-220 sitting in the sandbox bucket while live mode also targets
+   * sandbox). Filtering Open / Recent Closed Options by `mode` keeps each
+   * mode's history independent. Optional for back-compat with snapshots
+   * persisted before this field existed; absent positions are routed to demo
+   * since pre-TRA-220 only the demo path opened paper options.
+   */
+  mode?: AccountMode;
 }
 
 export interface OptionsAccountState {

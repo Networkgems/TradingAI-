@@ -189,6 +189,63 @@ describe('SignalEngine — Tradier live balance surfacing (TRA-226)', () => {
   });
 });
 
+describe('SignalEngine — mode-scoped dashboard state (TRA-231)', () => {
+  it('hides demo-mode options from the live dashboard view and vice versa', () => {
+    const engine = new SignalEngine(
+      { ...DEFAULT_ACCOUNT_SETTINGS, mode: 'demo', liveTradierEnvOptions: 'sandbox' },
+    );
+    const accounts = (engine as unknown as {
+      optionsAccounts: Record<TradierEnv, {
+        getState: () => { openOptions: Array<{ mode?: string }> };
+        getStateForMode: (m: 'demo' | 'live') => { openOptions: Array<{ mode?: string }>; closedOptions: Array<{ mode?: string }> };
+      }>;
+    }).optionsAccounts;
+
+    // Pre-seed both demo and live opens in the SAME (sandbox) bucket — this
+    // is the exact leak path TRA-231 fixes: a single env bucket holding both
+    // mode's positions before the `mode` stamp existed.
+    const demoOpt: { id: string; symbol: string; optionType: 'call'; contracts: number; contractsRemaining: number; premiumPaid: number; currentPremium: number; tp1Premium: number; tp1Hit: boolean; stopLossPremium: number; peakPremium: number; trailingActive: boolean; trailingStopPremium: number; underlyingEntryPrice: number; openedAt: number; signalId: string; signalType: 'relative_value'; mode: 'demo' | 'live' } = {
+      id: 'demo-1', symbol: 'AAPL', optionType: 'call', contracts: 1, contractsRemaining: 1,
+      premiumPaid: 1, currentPremium: 1, tp1Premium: 1.25, tp1Hit: false, stopLossPremium: 0.75,
+      peakPremium: 1, trailingActive: false, trailingStopPremium: 1.2, underlyingEntryPrice: 195,
+      openedAt: Date.now(), signalId: 'sig-d', signalType: 'relative_value', mode: 'demo',
+    };
+    const liveOpt: typeof demoOpt = { ...demoOpt, id: 'live-1', signalId: 'sig-l', mode: 'live' };
+    const sandboxState = (accounts.sandbox as unknown as { openOptions: Map<string, typeof demoOpt> });
+    sandboxState.openOptions.set('demo-1', demoOpt);
+    sandboxState.openOptions.set('live-1', liveOpt);
+
+    // In demo mode, only the demo-stamped option surfaces.
+    const demoState = engine.getState();
+    expect(demoState.options.openOptions.map(o => o.id)).toEqual(['demo-1']);
+
+    // Flip into live; only the live-stamped option surfaces.
+    (engine as unknown as { mode: 'demo' | 'live' }).mode = 'live';
+    const liveState = engine.getState();
+    expect(liveState.options.openOptions.map(o => o.id)).toEqual(['live-1']);
+  });
+
+  it('scopes recentSignals to the active mode so a flip back to demo hides live signals', () => {
+    const engine = new SignalEngine(
+      { ...DEFAULT_ACCOUNT_SETTINGS, mode: 'demo' },
+    );
+    // Reach into the engine to seed both demo and live signals — exercising
+    // the read path is sufficient; the doTick-time stamp is covered by the
+    // RV scanner test below it.
+    const internal = engine as unknown as { recentSignals: Array<{ id: string; mode?: 'demo' | 'live'; symbol: string; type: string; side: string; entryPrice: number; stopLoss: number; takeProfit: number; riskRewardRatio: number; timestamp: number }> };
+    internal.recentSignals = [
+      { id: 's-d', mode: 'demo', symbol: 'AAPL', type: 'orb', side: 'buy', entryPrice: 195, stopLoss: 190, takeProfit: 205, riskRewardRatio: 2, timestamp: Date.now() },
+      { id: 's-l', mode: 'live', symbol: 'AAPL', type: 'relative_value', side: 'buy', entryPrice: 1.2, stopLoss: 0.9, takeProfit: 1.8, riskRewardRatio: 2, timestamp: Date.now() },
+      { id: 's-legacy', symbol: 'AAPL', type: 'orb', side: 'buy', entryPrice: 195, stopLoss: 190, takeProfit: 205, riskRewardRatio: 2, timestamp: Date.now() },
+    ];
+
+    expect(engine.getState().signals.map(s => s.id).sort()).toEqual(['s-d', 's-legacy']);
+
+    (engine as unknown as { mode: 'demo' | 'live' }).mode = 'live';
+    expect(engine.getState().signals.map(s => s.id)).toEqual(['s-l']);
+  });
+});
+
 describe('SignalEngine — legacy options snapshot routing (TRA-237)', () => {
   it('legacy single-bucket options without a tradierEnv stamp restore into sandbox, not the engine\'s active env', () => {
     // Engine created with the user already on production env (the broken

@@ -1,5 +1,6 @@
 import { randomUUID } from 'crypto';
 import type {
+  AccountMode,
   TradeSignal,
   OptionPosition,
   OptionsAccountState,
@@ -175,6 +176,32 @@ export class PaperOptionsAccount {
     };
   }
 
+  /**
+   * TRA-231 — mode-scoped state. Filters open and closed options to those
+   * stamped with the requested mode so the dashboard's Options panel can show
+   * only positions opened under the active mode while the bucket internally
+   * keeps both halves around (so a flip back restores the other side intact).
+   *
+   * Legacy positions persisted before TRA-231 have no `mode` stamp; we route
+   * them to `demo` because pre-TRA-220 (when paper options first started
+   * persisting) the engine only opened paper options in demo. `optionsPnl`
+   * and `optionsCash` are NOT filtered: they are bucket-wide totals accrued
+   * across both modes and can't be split without a per-mode P&L tracker,
+   * which is out of scope for this ticket. Per-mode dashboards still see
+   * their own open/closed slates, which is the visibility leak this issue
+   * was opened to fix.
+   */
+  getStateForMode(mode: AccountMode): OptionsAccountState {
+    const matches = (p: OptionPosition): boolean => (p.mode ?? 'demo') === mode;
+    return {
+      openOptions: Array.from(this.openOptions.values()).filter(matches),
+      closedOptions: this.closedOptions.filter(matches).slice(-20),
+      optionsPnl: this.optionsPnl,
+      optionsCash: this.cash,
+      dailyOptionsCount: this.dailyCount + this.dailyOtmCount + this.dailyRvCount,
+    };
+  }
+
   private budgetPerTrade(): number {
     return this.equity * this.managedAccountRatio * OPTIONS_BUDGET_RATIO;
   }
@@ -212,7 +239,14 @@ export class PaperOptionsAccount {
    * trading window or daily limit blocks entry, or when an open position for
    * the same `optionSymbol` already exists.
    */
-  openOptionFromCandidate(signal: OtmMispricingSignal): OptionPosition | null {
+  /**
+   * TRA-231 — `mode` stamps the opened position with the account mode that
+   * fired the trade so the engine can scope the dashboard's Open Positions /
+   * Recent Closed Options views per-mode. Optional with a 'demo' default so
+   * tests / back-compat callers that don't care about the demo↔live split
+   * still compile.
+   */
+  openOptionFromCandidate(signal: OtmMispricingSignal, mode: AccountMode = 'demo'): OptionPosition | null {
     this.resetDayIfNeeded();
 
     if (!isValidTradingWindow(Date.now())) return null;
@@ -263,6 +297,7 @@ export class PaperOptionsAccount {
       openedAt: Date.now(),
       signalId: signal.id,
       signalType: 'otm_mispricing',
+      mode,
       ...(this.tradierEnv ? { tradierEnv: this.tradierEnv } : {}),
     };
 
@@ -282,7 +317,8 @@ export class PaperOptionsAccount {
    *   • a position already exists for the same OCC symbol
    *   • sized contracts ≤ 0 or budget exceeded
    */
-  openOptionFromRvCandidate(signal: RelativeValueSignal): OptionPosition | null {
+  /** TRA-231 — see {@link openOptionFromCandidate} for the `mode` stamp rationale. */
+  openOptionFromRvCandidate(signal: RelativeValueSignal, mode: AccountMode = 'demo'): OptionPosition | null {
     this.resetDayIfNeeded();
 
     if (!isValidTradingWindow(Date.now())) return null;
@@ -332,6 +368,7 @@ export class PaperOptionsAccount {
       openedAt: Date.now(),
       signalId: signal.id,
       signalType: 'relative_value',
+      mode,
       ...(this.tradierEnv ? { tradierEnv: this.tradierEnv } : {}),
     };
 
@@ -339,7 +376,8 @@ export class PaperOptionsAccount {
     return position;
   }
 
-  openOption(signal: TradeSignal, underlyingPrice: number): OptionPosition | null {
+  /** TRA-231 — see {@link openOptionFromCandidate} for the `mode` stamp rationale. */
+  openOption(signal: TradeSignal, underlyingPrice: number, mode: AccountMode = 'demo'): OptionPosition | null {
     this.resetDayIfNeeded();
 
     // Time filter: only open options during high-volume trading windows
@@ -391,6 +429,7 @@ export class PaperOptionsAccount {
       openedAt: Date.now(),
       signalId: signal.id,
       signalType: signal.type,
+      mode,
       ...(this.tradierEnv ? { tradierEnv: this.tradierEnv } : {}),
     };
 
@@ -415,10 +454,19 @@ export class PaperOptionsAccount {
   checkExits(
     underlyingPrices: Map<string, number>,
     optionMarks?: Map<string, number>,
+    /**
+     * TRA-231 — when supplied, skip positions whose `mode` doesn't match. The
+     * dashboard hides the inactive mode's positions; we don't want a tick to
+     * silently close them out from under the user. Absent stamps default to
+     * 'demo' (the only pre-field opener) so legacy snapshots still get the
+     * right comparison.
+     */
+    mode?: AccountMode,
   ): OptionPosition[] {
     const closed: OptionPosition[] = [];
 
     for (const [id, opt] of this.openOptions) {
+      if (mode !== undefined && (opt.mode ?? 'demo') !== mode) continue;
       const liveMark = opt.optionSymbol ? optionMarks?.get(opt.optionSymbol) : undefined;
       let mark: number;
       if (typeof liveMark === 'number' && liveMark > 0) {
