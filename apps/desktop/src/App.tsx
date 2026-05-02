@@ -630,7 +630,12 @@ function CryptoDashboard({ token, onBack, onLogout, onActivity }: { token: strin
         )}
 
         {tab === 'calendar' && (
-          <CalendarTab token={token} httpUrl={HTTP_URL} reportsPath="/api/crypto/reports" />
+          <CalendarTab
+            token={token}
+            httpUrl={HTTP_URL}
+            reportsPath="/api/crypto/reports"
+            mode={accountMode}
+          />
         )}
       </main>
     </div>
@@ -809,6 +814,10 @@ function Dashboard({ token, onLogout, onGoHome, onActivity }: { token: string; o
   const [profileModal, setProfileModal] = useState<null | 'change-password' | 'user-management'>(null);
   const [isAdmin, setIsAdmin] = useState(false);
   const [accountMode, setAccountMode] = useState<'demo' | 'live'>('demo');
+  // TRA-244 — drives the Calendar tab's per-account bucket. The stocks
+  // calendar shows demo, live (Tradier production), or sandbox history based
+  // on the active account so flipping `liveTradierEnvOptions` swaps the rows.
+  const [tradierEnv, setTradierEnv] = useState<'sandbox' | 'production'>('sandbox');
   const [optionsDailyLimit, setOptionsDailyLimit] = useState<number>(DEFAULT_ACCOUNT_SETTINGS.optionsDailyTradesLimit);
   const [watchlistInput, setWatchlistInput] = useState('');
   const [watchlistError, setWatchlistError] = useState('');
@@ -889,9 +898,15 @@ function Dashboard({ token, onLogout, onGoHome, onActivity }: { token: string; o
   useEffect(() => {
     fetch(`${HTTP_URL}/api/account/settings`, { headers: { Authorization: `Bearer ${token}` } })
       .then(r => r.ok ? r.json() : null)
-      .then((s: { mode?: 'demo' | 'live'; optionsDailyTradesLimit?: number } | null) => {
+      .then((s: { mode?: 'demo' | 'live'; optionsDailyTradesLimit?: number; liveTradierEnvOptions?: 'sandbox' | 'production' } | null) => {
         if (s?.mode) setAccountMode(s.mode);
         if (typeof s?.optionsDailyTradesLimit === 'number') setOptionsDailyLimit(s.optionsDailyTradesLimit);
+        // TRA-244 — keep the Calendar tab in sync with whichever Tradier
+        // environment is selected on the Settings page; sandbox is the
+        // default if nothing was saved (matches the server-side fallback).
+        if (s?.liveTradierEnvOptions === 'sandbox' || s?.liveTradierEnvOptions === 'production') {
+          setTradierEnv(s.liveTradierEnvOptions);
+        }
       })
       .catch(() => {});
   }, [tab, token]);
@@ -1470,7 +1485,15 @@ function Dashboard({ token, onLogout, onGoHome, onActivity }: { token: string; o
         )}
 
         {tab === 'calendar' && (
-          <CalendarTab token={token} httpUrl={HTTP_URL} />
+          <CalendarTab
+            token={token}
+            httpUrl={HTTP_URL}
+            mode={
+              accountMode === 'demo'
+                ? 'demo'
+                : tradierEnv === 'production' ? 'live' : 'sandbox'
+            }
+          />
         )}
       </main>
     </div>

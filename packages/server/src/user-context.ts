@@ -11,6 +11,7 @@ import {
   loadSettings,
   clearSettingsCache,
 } from './account-settings.js';
+import type { AccountSettings } from '@trading-app/shared';
 import {
   initWatchlistStore,
   getCryptoWatchlistData,
@@ -313,6 +314,92 @@ export async function runTra241CalendarReset(): Promise<void> {
   console.log(`[migration TRA-241] complete — cleared ${fileCount} calendar file(s) for ${userCount} user(s).`);
 }
 
+// ─────────────────────────────────────────────────────────────────────────────
+// TRA-244 — per-account calendar buckets.
+//
+// The Calendar tab used to share a single `<userDir>/reports/` and
+// `<userDir>/crypto-reports/` regardless of which account the user was viewing
+// (demo, live, sandbox). Users explicitly asked for per-mode history so the
+// calendar shows only the rows that belong to the active account. Reports now
+// live under `reports/{demo,live,sandbox}/...` (stocks) and
+// `crypto-reports/{demo,live}/...` (crypto).
+// ─────────────────────────────────────────────────────────────────────────────
+
+export type StockModeKey = 'demo' | 'live' | 'sandbox';
+export type CryptoModeKey = 'demo' | 'live';
+
+/**
+ * Resolve the active stocks mode for a user from saved settings. In demo mode
+ * the bucket is always `demo`. In live mode the bucket follows
+ * `liveTradierEnvOptions` so the sandbox header (paper Tradier fills) and the
+ * production header (real Tradier orders) keep separate calendar histories.
+ */
+export function stockModeKey(settings: AccountSettings): StockModeKey {
+  if (settings.mode !== 'live') return 'demo';
+  return settings.liveTradierEnvOptions === 'production' ? 'live' : 'sandbox';
+}
+
+/** Crypto only has demo (paper) vs live (Coinbase). */
+export function cryptoModeKey(settings: AccountSettings): CryptoModeKey {
+  return settings.mode === 'live' ? 'live' : 'demo';
+}
+
+export function stockReportsDirFor(ctx: UserContext, mode: StockModeKey): string {
+  return join(ctx.reportsDir, mode);
+}
+
+export function cryptoReportsDirFor(ctx: UserContext, mode: CryptoModeKey): string {
+  return join(ctx.cryptoReportsDir, mode);
+}
+
+/**
+ * One-shot per-user move of pre-TRA-244 calendar files into the `demo/`
+ * subfolder. Demo was the only account the calendar ever wrote to under the
+ * old layout, so legacy `reports/*.json|*.md` and `crypto-reports/*.json|*.md`
+ * files (including `latest.json` / `latest.md`) all belong in the demo bucket.
+ *
+ * Idempotent: a marker file `<userDir>/.tra-244-reports-migrated` short-
+ * circuits a second run. Per-context (rather than a global migration) so
+ * brand-new signups skip the work cleanly.
+ */
+async function migrateLegacyReports(reportsRoot: string, markerFile: string): Promise<number> {
+  if (!existsSync(reportsRoot)) return 0;
+  let entries: string[];
+  try {
+    entries = await readdir(reportsRoot);
+  } catch {
+    return 0;
+  }
+  const demoDir = join(reportsRoot, 'demo');
+  let moved = 0;
+  for (const name of entries) {
+    if (!name.endsWith('.json') && !name.endsWith('.md')) continue;
+    const src = join(reportsRoot, name);
+    const dst = join(demoDir, name);
+    if (existsSync(dst)) {
+      // Already-migrated copy wins; drop the legacy file so future readdir
+      // calls don't see both.
+      try { await unlink(src); } catch { /* ignore */ }
+      continue;
+    }
+    if (!existsSync(demoDir)) await mkdir(demoDir, { recursive: true });
+    try {
+      await rename(src, dst);
+      moved += 1;
+    } catch {
+      try {
+        await copyFile(src, dst);
+        await rm(src, { force: true });
+        moved += 1;
+      } catch {
+        // ignore — leaving the legacy file in place is safe; next boot retries.
+      }
+    }
+  }
+  await writeFile(markerFile, new Date().toISOString(), 'utf-8');
+  return moved;
+}
+
 async function createUserContext(username: string): Promise<UserContext> {
   const dataDir = userDataDir(username);
   if (!existsSync(dataDir)) await mkdir(dataDir, { recursive: true });
@@ -438,6 +525,30 @@ async function createUserContext(username: string): Promise<UserContext> {
 
   if (!existsSync(ctx.reportsDir)) await mkdir(ctx.reportsDir, { recursive: true });
   if (!existsSync(ctx.cryptoReportsDir)) await mkdir(ctx.cryptoReportsDir, { recursive: true });
+
+  // TRA-244 — migrate legacy top-level report files into the demo/ subfolder
+  // before the per-mode dirs are seeded. Idempotent via a per-user marker.
+  const reportsMarker = join(dataDir, '.tra-244-reports-migrated');
+  if (!existsSync(reportsMarker)) {
+    try {
+      const stockMoved = await migrateLegacyReports(ctx.reportsDir, reportsMarker);
+      const cryptoMoved = await migrateLegacyReports(ctx.cryptoReportsDir, reportsMarker);
+      if (stockMoved + cryptoMoved > 0) {
+        console.log(`[migration TRA-244:${username}] moved ${stockMoved} stock and ${cryptoMoved} crypto report file(s) into demo/`);
+      }
+    } catch (err: unknown) {
+      console.warn(`[migration TRA-244:${username}] failed: ${err instanceof Error ? err.message : String(err)}`);
+    }
+  }
+  // Pre-create the per-mode subfolders so writers/readers don't need to mkdir.
+  for (const mode of ['demo', 'live', 'sandbox'] as const) {
+    const dir = join(ctx.reportsDir, mode);
+    if (!existsSync(dir)) await mkdir(dir, { recursive: true });
+  }
+  for (const mode of ['demo', 'live'] as const) {
+    const dir = join(ctx.cryptoReportsDir, mode);
+    if (!existsSync(dir)) await mkdir(dir, { recursive: true });
+  }
 
   // Wire up debounced trade-history persistence (TRA-140) per user.
   engine.onTick(() => scheduleStocksPersist(ctx));

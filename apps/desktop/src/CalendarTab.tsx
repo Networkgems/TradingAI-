@@ -339,7 +339,17 @@ function EodReportDetail({ report, onBack }: { report: EodReport; onBack: () => 
 
 // ── Main CalendarTab export ──────────────────────────────────────────────────
 
-export function CalendarTab({ token, httpUrl, reportsPath = '/api/reports' }: { token: string; httpUrl: string; reportsPath?: string }) {
+export type CalendarMode = 'demo' | 'live' | 'sandbox';
+
+export function CalendarTab({ token, httpUrl, reportsPath = '/api/reports', mode }: {
+  token: string;
+  httpUrl: string;
+  reportsPath?: string;
+  // TRA-244 — picks which per-account bucket the calendar reads from. Stocks
+  // can be demo/live/sandbox; crypto is demo/live. Omitting falls back to the
+  // server's default (active settings) for legacy callers.
+  mode?: CalendarMode;
+}) {
   const [view,    setView]    = useState<'month' | 'year'>('month');
   const [year,    setYear]    = useState(new Date().getFullYear());
   const [month,   setMonth]   = useState(new Date().getMonth()); // 0-indexed
@@ -349,12 +359,23 @@ export function CalendarTab({ token, httpUrl, reportsPath = '/api/reports' }: { 
   const [selectedDate, setSelectedDate] = useState<string | null>(null);
   const [detailLoading, setDetailLoading] = useState(false);
 
+  // TRA-244 — append `?mode=<bucket>` so server reads from the matching
+  // per-account folder (or omit when no mode is supplied).
+  const modeQuery = mode ? `?mode=${mode}` : '';
+
+  // TRA-244 — flipping accounts must clear the cached month state so a brief
+  // render of the previous bucket's rows can't leak through.
+  useEffect(() => {
+    setReports({});
+    setSelectedDate(null);
+  }, [mode, reportsPath]);
+
   useEffect(() => {
     let cancelled = false;
     async function load() {
       setLoading(true);
       try {
-        const r = await fetch(`${httpUrl}${reportsPath}`, {
+        const r = await fetch(`${httpUrl}${reportsPath}${modeQuery}`, {
           headers: { Authorization: `Bearer ${token}` },
         });
         if (!r.ok || cancelled) return;
@@ -362,7 +383,7 @@ export function CalendarTab({ token, httpUrl, reportsPath = '/api/reports' }: { 
 
         const results = await Promise.all(
           dates.map(d =>
-            fetch(`${httpUrl}${reportsPath}/${d}`, { headers: { Authorization: `Bearer ${token}` } })
+            fetch(`${httpUrl}${reportsPath}/${d}${modeQuery}`, { headers: { Authorization: `Bearer ${token}` } })
               .then(res => (res.ok ? (res.json() as Promise<EodReport>) : null))
               .catch(() => null),
           ),
@@ -377,7 +398,7 @@ export function CalendarTab({ token, httpUrl, reportsPath = '/api/reports' }: { 
     }
     load();
     return () => { cancelled = true; };
-  }, [token, httpUrl, reportsPath]);
+  }, [token, httpUrl, reportsPath, modeQuery]);
 
   // TRA-219 — fetch a fresh copy of the selected day's report so the detail
   // view picks up trades that closed after the initial month load.
@@ -388,7 +409,7 @@ export function CalendarTab({ token, httpUrl, reportsPath = '/api/reports' }: { 
     async function loadDetail() {
       setDetailLoading(true);
       try {
-        const r = await fetch(`${httpUrl}${reportsPath}/${selectedDate}`, {
+        const r = await fetch(`${httpUrl}${reportsPath}/${selectedDate}${modeQuery}`, {
           headers: { Authorization: `Bearer ${token}` },
         });
         if (!r.ok || cancelled) return;
@@ -400,7 +421,7 @@ export function CalendarTab({ token, httpUrl, reportsPath = '/api/reports' }: { 
     }
     loadDetail();
     return () => { cancelled = true; };
-  }, [selectedDate, token, httpUrl, reportsPath, reports]);
+  }, [selectedDate, token, httpUrl, reportsPath, modeQuery, reports]);
 
   function prevPeriod() {
     if (view === 'year') { setYear(y => y - 1); return; }

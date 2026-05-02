@@ -5,7 +5,7 @@ import { writeFile, readFile, readdir, stat } from 'fs/promises';
 import { existsSync } from 'fs';
 import { join, dirname } from 'path';
 import { fileURLToPath } from 'url';
-import { MarketScheduler } from './scheduler.js';
+import { MarketScheduler, isMarketDay } from './scheduler.js';
 import { generateEodReport } from './reports/eod-report.js';
 import { generateCryptoEodReport } from './reports/crypto-eod-report.js';
 import { createToken, verifyToken, generateResetToken, consumeResetToken, initResetTokenStore } from './auth.js';
@@ -51,6 +51,12 @@ import {
   persistStocksNow,
   persistCryptoNow,
   setRvScanner,
+  stockModeKey,
+  cryptoModeKey,
+  stockReportsDirFor,
+  cryptoReportsDirFor,
+  type StockModeKey,
+  type CryptoModeKey,
   type UserContext,
 } from './user-context.js';
 import { resolveTradierOptionsCreds, type AccountSettings, type NewsItem, type ResearchReport } from '@trading-app/shared';
@@ -201,10 +207,14 @@ async function userCtx(res: express.Response): Promise<UserContext> {
 async function generateAndSaveReport(ctx: UserContext): Promise<void> {
   const snapshot = ctx.engine.getReportSnapshot();
   const report = generateEodReport(snapshot);
-  const datePath = join(ctx.reportsDir, `${report.date}.json`);
-  const mdPath = join(ctx.reportsDir, `${report.date}.md`);
-  const latestJsonPath = join(ctx.reportsDir, 'latest.json');
-  const latestMdPath = join(ctx.reportsDir, 'latest.md');
+  // TRA-244 — write under the active stocks bucket (demo / live / sandbox)
+  // so the per-account calendar shows only the rows that belong to it.
+  const mode = stockModeKey(getSettings(ctx.username));
+  const targetDir = stockReportsDirFor(ctx, mode);
+  const datePath = join(targetDir, `${report.date}.json`);
+  const mdPath = join(targetDir, `${report.date}.md`);
+  const latestJsonPath = join(targetDir, 'latest.json');
+  const latestMdPath = join(targetDir, 'latest.md');
 
   await Promise.all([
     writeFile(datePath, JSON.stringify(report, null, 2), 'utf-8'),
@@ -234,10 +244,14 @@ async function generateAndSaveReport(ctx: UserContext): Promise<void> {
 async function generateAndSaveCryptoReport(ctx: UserContext): Promise<void> {
   const snapshot = ctx.cryptoEngine.getReportSnapshot();
   const report = generateCryptoEodReport(snapshot);
-  const datePath = join(ctx.cryptoReportsDir, `${report.date}.json`);
-  const mdPath = join(ctx.cryptoReportsDir, `${report.date}.md`);
-  const latestJsonPath = join(ctx.cryptoReportsDir, 'latest.json');
-  const latestMdPath = join(ctx.cryptoReportsDir, 'latest.md');
+  // TRA-244 — same per-mode bucketing as the stocks generator above; crypto
+  // only has demo vs live (no sandbox) since Coinbase has no paper sandbox.
+  const mode = cryptoModeKey(getSettings(ctx.username));
+  const targetDir = cryptoReportsDirFor(ctx, mode);
+  const datePath = join(targetDir, `${report.date}.json`);
+  const mdPath = join(targetDir, `${report.date}.md`);
+  const latestJsonPath = join(targetDir, 'latest.json');
+  const latestMdPath = join(targetDir, 'latest.md');
 
   await Promise.all([
     writeFile(datePath, JSON.stringify(report, null, 2), 'utf-8'),
@@ -266,48 +280,45 @@ async function generateAndSaveCryptoReport(ctx: UserContext): Promise<void> {
   broadcastToUser(ctx.username, msg);
 }
 
-async function generateAllUserEodReports(): Promise<void> {
-  for (const ctx of getAllUserContexts()) {
-    try {
-      await generateAndSaveReport(ctx);
-    } catch (err) {
-      console.error(`[reports:${ctx.username}] EOD report failed:`, err);
-    }
-  }
-}
-
-// TRA-193 — crypto markets are 24/7, so the calendar needs a daily P&L row
-// every calendar day (including weekends and holidays). Iterates every user
-// context so each tenant's `crypto-reports/<date>.json` is written.
-async function generateAllUserCryptoEodReports(): Promise<void> {
-  for (const ctx of getAllUserContexts()) {
-    try {
-      await generateAndSaveCryptoReport(ctx);
-    } catch (err) {
-      console.error(`[crypto-reports:${ctx.username}] EOD report failed:`, err);
-    }
-  }
-}
-
-// TRA-219 + TRA-241 — daily 9 PM ET close-out for every user. Order is load-
-// bearing:
-//   1. Reset the in-memory `dailyPnl` baseline on both engines so the next
+// TRA-244 — Single 9 PM ET close-out for every user. Order is load-bearing:
+//   1. Generate today's EOD reports + persist the equity snapshot for the
+//      Calendar. We do this BEFORE resetting dailyPnl so the report's combined
+//      P&L still reflects the day. Stocks only on market days; crypto every
+//      day (24/7).
+//   2. Reset the in-memory `dailyPnl` baseline on both engines so the next
 //      tick broadcasts a fresh 0 for the new trading day. The persisted
 //      tracker.openingEquity is realigned in lock-step.
-//   2. Archive the rolling "Recent Closed" lists so the Positions/Options
+//   3. Archive the rolling "Recent Closed" lists so the Positions/Options
 //      tabs start the next session blank.
-//   3. Persist + broadcast so connected clients see the reset immediately.
-// The 4:05 PM EOD reports continue to feed the Calendar tab via
-// `generateAllUserEodReports` / `generateAllUserCryptoEodReports`.
-async function archiveAllUserClosedTrades(): Promise<void> {
+//   4. Persist + broadcast so connected clients see the reset immediately.
+async function runDailyCloseForAllUsers(): Promise<void> {
+  const stocksMarketDay = isMarketDay();
   for (const ctx of getAllUserContexts()) {
     try {
-      // TRA-241 — reset dashboard daily-P&L baselines for the new trading day.
+      // 1a. Stocks EOD — only on trading days (Mon–Fri, non-holiday).
+      if (stocksMarketDay) {
+        try {
+          await generateAndSaveReport(ctx);
+        } catch (err) {
+          console.error(`[reports:${ctx.username}] EOD report failed:`, err);
+        }
+      }
+      // 1b. Crypto EOD — every calendar day (24/7 market).
+      try {
+        await generateAndSaveCryptoReport(ctx);
+      } catch (err) {
+        console.error(`[crypto-reports:${ctx.username}] EOD report failed:`, err);
+      }
+
+      // 2. Reset dashboard daily-P&L baselines for the new trading day.
       ctx.engine.resetDailyPnl();
       ctx.cryptoEngine.resetDailyPnl();
 
+      // 3. Archive closed trades.
       const stocks = ctx.engine.archiveClosedTrades();
       const crypto = ctx.cryptoEngine.archiveClosedTrades();
+
+      // 4. Persist + broadcast.
       await Promise.all([persistStocksNow(ctx), persistCryptoNow(ctx)]);
       broadcastEngineState(ctx);
       broadcastCryptoState(ctx);
@@ -750,9 +761,25 @@ app.get('/api/research/reports/:id', requireAuth, async (req, res) => {
   res.json(report);
 });
 
-app.get('/api/reports/latest', requireAuth, async (_req, res) => {
+// TRA-244 — `?mode=` lets the client pick which calendar bucket to read.
+// Defaults follow the user's saved settings so callers without the query
+// (legacy clients, scripts) keep their current behavior.
+function resolveStockReportMode(req: express.Request, username: string): StockModeKey {
+  const q = (req.query['mode'] as string | undefined)?.trim();
+  if (q === 'demo' || q === 'live' || q === 'sandbox') return q;
+  return stockModeKey(getSettings(username));
+}
+
+function resolveCryptoReportMode(req: express.Request, username: string): CryptoModeKey {
+  const q = (req.query['mode'] as string | undefined)?.trim();
+  if (q === 'demo' || q === 'live') return q;
+  return cryptoModeKey(getSettings(username));
+}
+
+app.get('/api/reports/latest', requireAuth, async (req, res) => {
   const ctx = await userCtx(res);
-  const latestPath = join(ctx.reportsDir, 'latest.json');
+  const mode = resolveStockReportMode(req, ctx.username);
+  const latestPath = join(stockReportsDirFor(ctx, mode), 'latest.json');
   if (!existsSync(latestPath)) {
     res.status(404).json({ error: 'No report generated yet' });
     return;
@@ -765,10 +792,11 @@ app.get('/api/reports/latest', requireAuth, async (_req, res) => {
   }
 });
 
-app.get('/api/reports', requireAuth, async (_req, res) => {
+app.get('/api/reports', requireAuth, async (req, res) => {
   const ctx = await userCtx(res);
+  const mode = resolveStockReportMode(req, ctx.username);
   try {
-    const files = await readdir(ctx.reportsDir);
+    const files = await readdir(stockReportsDirFor(ctx, mode));
     const dates = files
       .filter(f => /^\d{4}-\d{2}-\d{2}\.json$/.test(f))
       .map(f => f.replace('.json', ''))
@@ -787,7 +815,8 @@ app.get('/api/reports/:date', requireAuth, async (req, res) => {
     res.status(400).json({ error: 'Invalid date format. Use YYYY-MM-DD.' });
     return;
   }
-  const filePath = join(ctx.reportsDir, `${date}.json`);
+  const mode = resolveStockReportMode(req, ctx.username);
+  const filePath = join(stockReportsDirFor(ctx, mode), `${date}.json`);
   if (!existsSync(filePath)) {
     res.status(404).json({ error: `No report for ${date}` });
     return;
@@ -812,9 +841,10 @@ app.post('/api/reports/generate', requireAuth, async (_req, res) => {
 
 // ── Crypto Reports ────────────────────────────────────────────────────────────
 
-app.get('/api/crypto/reports/latest', requireAuth, async (_req, res) => {
+app.get('/api/crypto/reports/latest', requireAuth, async (req, res) => {
   const ctx = await userCtx(res);
-  const latestPath = join(ctx.cryptoReportsDir, 'latest.json');
+  const mode = resolveCryptoReportMode(req, ctx.username);
+  const latestPath = join(cryptoReportsDirFor(ctx, mode), 'latest.json');
   if (!existsSync(latestPath)) {
     res.status(404).json({ error: 'No crypto report generated yet' });
     return;
@@ -827,10 +857,11 @@ app.get('/api/crypto/reports/latest', requireAuth, async (_req, res) => {
   }
 });
 
-app.get('/api/crypto/reports', requireAuth, async (_req, res) => {
+app.get('/api/crypto/reports', requireAuth, async (req, res) => {
   const ctx = await userCtx(res);
+  const mode = resolveCryptoReportMode(req, ctx.username);
   try {
-    const files = await readdir(ctx.cryptoReportsDir);
+    const files = await readdir(cryptoReportsDirFor(ctx, mode));
     const dates = files
       .filter(f => /^\d{4}-\d{2}-\d{2}\.json$/.test(f))
       .map(f => f.replace('.json', ''))
@@ -849,7 +880,8 @@ app.get('/api/crypto/reports/:date', requireAuth, async (req, res) => {
     res.status(400).json({ error: 'Invalid date format. Use YYYY-MM-DD.' });
     return;
   }
-  const filePath = join(ctx.cryptoReportsDir, `${date}.json`);
+  const mode = resolveCryptoReportMode(req, ctx.username);
+  const filePath = join(cryptoReportsDirFor(ctx, mode), `${date}.json`);
   if (!existsSync(filePath)) {
     res.status(404).json({ error: `No crypto report for ${date}` });
     return;
@@ -1558,7 +1590,10 @@ wss.on('connection', async (ws) => {
   ws.send(JSON.stringify({ type: 'state', payload: ctx.engine.getState() }));
   ws.send(JSON.stringify({ type: 'crypto_state', payload: ctx.cryptoEngine.getState() }));
 
-  const latestPath = join(ctx.reportsDir, 'latest.json');
+  // TRA-244 — read latest.json from the active stocks bucket so the WS
+  // handshake matches whatever the Calendar tab is showing for this account.
+  const stocksMode = stockModeKey(getSettings(ctx.username));
+  const latestPath = join(stockReportsDirFor(ctx, stocksMode), 'latest.json');
   if (existsSync(latestPath)) {
     try {
       const raw = await readFile(latestPath, 'utf-8');
@@ -1620,14 +1655,12 @@ if (existsSync(DIST_DIR)) {
 
 const scheduler = new MarketScheduler();
 scheduler.start({
-  onMarketClose: generateAllUserEodReports,
-  // TRA-193 — crypto runs 24/7, so save the daily P&L every calendar day
-  // (weekends and holidays included) — otherwise the calendar shows no rows.
-  onDaily: generateAllUserCryptoEodReports,
-  // TRA-219 — clear the rolling "Recent Closed" lists at 9 PM ET so the
-  // Positions/Options tabs reset for the next session. EOD reports already
-  // saved to disk feed the Calendar tab's per-date detail view.
-  onArchive: archiveAllUserClosedTrades,
+  // TRA-244 — collapsed onto the 9 PM ET archive hook so the Calendar row
+  // appears AFTER the dashboard's dailyPnl reset (the previous 4:05 PM hooks
+  // ran before the reset, leaving the row visible at 4:05 but the dashboard
+  // still showing the stale total until 9). Stocks generation is gated on
+  // market days inside the callback; crypto fires every day (24/7).
+  onArchive: runDailyCloseForAllUsers,
 });
 
 httpServer.listen(PORT, () => {

@@ -15,6 +15,8 @@ type UsersModule = typeof import('./users.js');
 let saveStocksTradeSnapshot: TradeStoreModule['saveStocksTradeSnapshot'];
 let loadStocksTradeSnapshot: TradeStoreModule['loadStocksTradeSnapshot'];
 let runTra237OptionsReset: UserContextModule['runTra237OptionsReset'];
+let stockModeKey: UserContextModule['stockModeKey'];
+let cryptoModeKey: UserContextModule['cryptoModeKey'];
 
 beforeAll(async () => {
   // Seed a users.json so getAllUsers() returns the test user. users.ts reads a
@@ -31,6 +33,8 @@ beforeAll(async () => {
   loadStocksTradeSnapshot = tradeStore.loadStocksTradeSnapshot;
   const userCtx = await import('./user-context.js');
   runTra237OptionsReset = userCtx.runTra237OptionsReset;
+  stockModeKey = userCtx.stockModeKey;
+  cryptoModeKey = userCtx.cryptoModeKey;
   // Populate the in-memory users cache from the seeded users.json.
   const users = (await import('./users.js')) as UsersModule;
   await users.loadUsers();
@@ -156,5 +160,44 @@ describe('runTra237OptionsReset — one-shot options bucket cleanup', () => {
     expect(existsSync(join(TMP_ROOT, '.tra-237-options-reset'))).toBe(false);
     await runTra237OptionsReset();
     expect(existsSync(join(TMP_ROOT, '.tra-237-options-reset'))).toBe(true);
+  });
+});
+
+// TRA-244 — per-account calendar bucket helpers.
+// `mode === 'demo'` always picks the demo bucket regardless of any leftover
+// Tradier env. `mode === 'live'` flips to sandbox/live based on
+// `liveTradierEnvOptions` so demo / sandbox / production each keep their own
+// calendar history.
+describe('stockModeKey / cryptoModeKey — TRA-244 per-account calendar buckets', () => {
+  type Settings = Parameters<typeof stockModeKey>[0];
+  function settings(overrides: Partial<Settings> = {}): Settings {
+    return { mode: 'demo', ...overrides } as Settings;
+  }
+
+  it('demo mode always returns "demo" regardless of liveTradierEnvOptions', () => {
+    expect(stockModeKey(settings({ mode: 'demo', liveTradierEnvOptions: 'production' })))
+      .toBe('demo');
+    expect(stockModeKey(settings({ mode: 'demo', liveTradierEnvOptions: 'sandbox' })))
+      .toBe('demo');
+    expect(cryptoModeKey(settings({ mode: 'demo' }))).toBe('demo');
+  });
+
+  it('live + production Tradier env returns "live"', () => {
+    expect(stockModeKey(settings({ mode: 'live', liveTradierEnvOptions: 'production' })))
+      .toBe('live');
+  });
+
+  it('live + sandbox Tradier env returns "sandbox"', () => {
+    expect(stockModeKey(settings({ mode: 'live', liveTradierEnvOptions: 'sandbox' })))
+      .toBe('sandbox');
+  });
+
+  it('live with missing liveTradierEnvOptions defaults to "sandbox" (matches resolveTradierOptionsCreds)', () => {
+    expect(stockModeKey(settings({ mode: 'live' }))).toBe('sandbox');
+  });
+
+  it('cryptoModeKey is binary: live → live, anything else → demo', () => {
+    expect(cryptoModeKey(settings({ mode: 'live' }))).toBe('live');
+    expect(cryptoModeKey(settings({ mode: 'demo' }))).toBe('demo');
   });
 });

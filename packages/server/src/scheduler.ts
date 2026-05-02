@@ -36,7 +36,7 @@ const MARKET_HOLIDAYS = new Set<string>([
   '2026-12-25', // Christmas
 ]);
 
-function isMarketDay(date: Date): boolean {
+export function isMarketDay(date: Date = new Date()): boolean {
   const dayOfWeek = date.getDay(); // 0=Sun, 6=Sat
   if (dayOfWeek === 0 || dayOfWeek === 6) return false;
   const dateStr = date.toLocaleDateString('en-CA', { timeZone: 'America/New_York' });
