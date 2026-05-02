@@ -242,6 +242,10 @@ function CryptoDashboard({ token, onBack, onLogout, onActivity }: { token: strin
   const signals = state?.signals ?? [];
   const symbols = state?.symbols ?? [];
   const openPositions = account?.openPositions ?? [];
+  // TRA-238 — surface closed crypto trades in the Positions tab until the 9 PM
+  // ET archive sweep clears them; per-day history then lives under the
+  // P&L Calendar tab.
+  const closedPositions = state?.closedPositions ?? [];
   const autoTradingEnabled = state?.autoTradingEnabled ?? true;
 
   async function toggleAutoTrading() {
@@ -565,11 +569,47 @@ function CryptoDashboard({ token, onBack, onLogout, onActivity }: { token: strin
                 </table>
               </>
             )}
-            {openPositions.length === 0 && (
+            {closedPositions.length > 0 && (
+              <>
+                <h3 style={{ marginTop: openPositions.length > 0 ? '1.5rem' : 0 }}>
+                  Closed Today ({closedPositions.length})
+                </h3>
+                <table>
+                  <thead>
+                    <tr>
+                      <th>Symbol</th><th>Side</th><th>Qty</th><th>Entry</th><th>Exit</th>
+                      <th>P&amp;L %</th><th>P&amp;L $</th><th>Reason</th><th>Closed</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {[...closedPositions].sort((a, b) => (b.closedAt ?? 0) - (a.closedAt ?? 0)).map(p => {
+                      const exit = p.exitPrice ?? p.entryPrice;
+                      const multiplier = p.side === 'buy' ? 1 : -1;
+                      const pnlPct = ((exit - p.entryPrice) / p.entryPrice) * 100 * multiplier;
+                      const pnlDollar = p.pnl ?? (exit - p.entryPrice) * p.quantity * multiplier;
+                      return (
+                        <tr key={p.id}>
+                          <td className="symbol">{p.symbol}</td>
+                          <td className={p.side === 'buy' ? 'green' : 'red'}>{p.side.toUpperCase()}</td>
+                          <td>{p.quantity}</td>
+                          <td>${fmt(p.entryPrice)}</td>
+                          <td>${fmt(exit)}</td>
+                          <td className={pnlPct >= 0 ? 'green' : 'red'}>{fmtPct(pnlPct)}</td>
+                          <td className={pnlDollar >= 0 ? 'green' : 'red'}>{fmtDollar(pnlDollar)}</td>
+                          <td className="muted">{exitReasonLabel(p.exitReason)}</td>
+                          <td className="muted">{p.closedAt ? formatTime(p.closedAt) : '—'}</td>
+                        </tr>
+                      );
+                    })}
+                  </tbody>
+                </table>
+              </>
+            )}
+            {openPositions.length === 0 && closedPositions.length === 0 && (
               <div className="empty">
                 No open positions. Signals will auto-open paper positions.
                 <br /><br />
-                <span className="muted">Closed trades archive nightly at 9:00 PM ET — view per-day history under the <strong>Calendar</strong> tab.</span>
+                <span className="muted">Closed trades stay listed here until the 9:00 PM ET archive — full per-day history is under the <strong>P&amp;L Calendar</strong> tab.</span>
               </div>
             )}
           </div>
@@ -666,6 +706,17 @@ function signalLabel(type: string) {
     case 'scalping': return 'Scalping';
     case 'swing_trade': return 'Swing';
     default: return type;
+  }
+}
+
+function exitReasonLabel(reason?: string) {
+  switch (reason) {
+    case 'stop': return 'Stop';
+    case 'target': return 'Target';
+    case 'time_stop': return 'Time';
+    case 'trailing': return 'Trail';
+    case 'rsi_alt_exit': return 'RSI exit';
+    default: return reason ?? '—';
   }
 }
 
@@ -847,8 +898,13 @@ function Dashboard({ token, onLogout, onGoHome, onActivity }: { token: string; o
   const signals = state?.signals ?? [];
   const symbols = state?.symbols ?? [];
   const openPositions = account?.openPositions ?? [];
+  // TRA-238 — closed trades stay visible in the Positions/Options tabs until
+  // the 9:00 PM ET archive sweep clears them server-side; per-day history then
+  // lives under the Calendar tab.
+  const closedPositions = state?.closedPositions ?? [];
   const optionsState = state?.options;
   const openOptions: OptionPosition[] = optionsState?.openOptions ?? [];
+  const closedOptions: OptionPosition[] = optionsState?.closedOptions ?? [];
   const autoTradingEnabled = state?.autoTradingEnabled ?? true;
 
   async function toggleAutoTrading() {
@@ -1224,11 +1280,55 @@ function Dashboard({ token, onLogout, onGoHome, onActivity }: { token: string; o
               </>
             )}
 
-            {openPositions.length === 0 && (
+            {closedPositions.length > 0 && (
+              <>
+                <h3 style={{ marginTop: openPositions.length > 0 ? '1.5rem' : 0 }}>
+                  Closed Today ({closedPositions.length})
+                </h3>
+                <table>
+                  <thead>
+                    <tr>
+                      <th>Symbol</th>
+                      <th>Side</th>
+                      <th>Qty</th>
+                      <th>Entry</th>
+                      <th>Exit</th>
+                      <th>P&amp;L %</th>
+                      <th>P&amp;L $</th>
+                      <th>Reason</th>
+                      <th>Closed</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {[...closedPositions].sort((a, b) => (b.closedAt ?? 0) - (a.closedAt ?? 0)).map(p => {
+                      const exit = p.exitPrice ?? p.entryPrice;
+                      const multiplier = p.side === 'buy' ? 1 : -1;
+                      const pnlPct = ((exit - p.entryPrice) / p.entryPrice) * 100 * multiplier;
+                      const pnlDollar = p.pnl ?? (exit - p.entryPrice) * p.quantity * multiplier;
+                      return (
+                        <tr key={p.id}>
+                          <td className="symbol">{p.symbol}</td>
+                          <td className={p.side === 'buy' ? 'green' : 'red'}>{p.side.toUpperCase()}</td>
+                          <td>{p.quantity}</td>
+                          <td>${fmt(p.entryPrice)}</td>
+                          <td>${fmt(exit)}</td>
+                          <td className={pnlPct >= 0 ? 'green' : 'red'}>{fmtPct(pnlPct)}</td>
+                          <td className={pnlDollar >= 0 ? 'green' : 'red'}>{fmtDollar(pnlDollar)}</td>
+                          <td className="muted">{exitReasonLabel(p.exitReason)}</td>
+                          <td className="muted">{p.closedAt ? formatTime(p.closedAt) : '—'}</td>
+                        </tr>
+                      );
+                    })}
+                  </tbody>
+                </table>
+              </>
+            )}
+
+            {openPositions.length === 0 && closedPositions.length === 0 && (
               <div className="empty">
                 No open positions. Signals will auto-open paper positions.
                 <br /><br />
-                <span className="muted">Closed trades archive nightly at 9:00 PM ET — view per-day history under the <strong>Calendar</strong> tab.</span>
+                <span className="muted">Closed trades stay listed here until the 9:00 PM ET archive — full per-day history is under the <strong>Calendar</strong> tab.</span>
               </div>
             )}
           </div>
@@ -1291,14 +1391,55 @@ function Dashboard({ token, onLogout, onGoHome, onActivity }: { token: string; o
               </>
             )}
 
-            {openOptions.length === 0 && (
+            {closedOptions.length > 0 && (
+              <>
+                <h3 style={{ marginTop: openOptions.length > 0 ? '1.5rem' : 0 }}>
+                  Closed Today ({closedOptions.length})
+                </h3>
+                <table>
+                  <thead>
+                    <tr>
+                      <th>Symbol</th>
+                      <th>Type</th>
+                      <th>Contracts</th>
+                      <th>Premium Paid</th>
+                      <th>Exit Premium</th>
+                      <th>P&amp;L $</th>
+                      <th>Signal</th>
+                      <th>Closed</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {[...closedOptions].sort((a, b) => (b.closedAt ?? 0) - (a.closedAt ?? 0)).map(o => {
+                      const pnlDollar = o.pnl ?? 0;
+                      return (
+                        <tr key={o.id}>
+                          <td className="symbol">{o.symbol}</td>
+                          <td className={o.optionType === 'call' ? 'green' : 'red'}>
+                            {o.optionType.toUpperCase()}
+                          </td>
+                          <td>{o.contracts}</td>
+                          <td>${fmt(o.premiumPaid)}</td>
+                          <td>${fmt(o.currentPremium)}</td>
+                          <td className={pnlDollar >= 0 ? 'green' : 'red'}>{fmtDollar(pnlDollar)}</td>
+                          <td>{signalLabel(o.signalType)}</td>
+                          <td className="muted">{o.closedAt ? formatTime(o.closedAt) : '—'}</td>
+                        </tr>
+                      );
+                    })}
+                  </tbody>
+                </table>
+              </>
+            )}
+
+            {openOptions.length === 0 && closedOptions.length === 0 && (
               <div className="empty">
                 No open option positions. Options (calls/puts) are auto-opened when any signal triggers (ORB, Reversal, MACD, or Ichimoku).
                 <br /><br />
                 <strong>Strategy:</strong> Bullish signals → buy CALL · Bearish signals → buy PUT<br />
                 <strong>Take profit:</strong> +25% → activates trailing stop (15% below peak) · <strong>Stop loss:</strong> −35% · <strong>Max:</strong> 5 trades/day
                 <br /><br />
-                <span className="muted">Closed contracts archive nightly at 9:00 PM ET — view per-day history under the <strong>Calendar</strong> tab.</span>
+                <span className="muted">Closed contracts stay listed here until the 9:00 PM ET archive — full per-day history is under the <strong>Calendar</strong> tab.</span>
               </div>
             )}
 
