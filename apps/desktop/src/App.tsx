@@ -153,6 +153,68 @@ function ProfileMenu({ onChangePassword, onUserManagement, onLogout, isAdmin }: 
   );
 }
 
+function AccountModeSwitcher({
+  mode,
+  onChange,
+  market,
+  token,
+}: {
+  mode: 'demo' | 'live';
+  onChange: (mode: 'demo' | 'live') => void;
+  market: 'stocks' | 'crypto';
+  token: string;
+}) {
+  const [busy, setBusy] = useState(false);
+
+  async function switchTo(next: 'demo' | 'live') {
+    if (next === mode || busy) return;
+    if (next === 'live') {
+      const ok = window.confirm(
+        `Switch ${market === 'crypto' ? 'Crypto' : 'Stocks'} dashboard to LIVE account?\n\n` +
+        'Live mode places real orders against your configured brokerage. ' +
+        'Make sure your live credentials are set up in Settings.',
+      );
+      if (!ok) return;
+    }
+    setBusy(true);
+    try {
+      const r = await fetch(`${HTTP_URL}/api/account/settings`, {
+        method: 'PUT',
+        headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' },
+        body: JSON.stringify({ mode: next }),
+      });
+      if (r.ok) onChange(next);
+    } catch { /* ignore */ } finally {
+      setBusy(false);
+    }
+  }
+
+  return (
+    <div className={`account-mode-switch${busy ? ' busy' : ''}`} role="group" aria-label="Account mode">
+      <button
+        type="button"
+        className={`account-mode-option demo${mode === 'demo' ? ' active' : ''}`}
+        onClick={() => switchTo('demo')}
+        disabled={busy}
+        aria-pressed={mode === 'demo'}
+        title="Use the demo (paper) account"
+      >
+        Demo
+      </button>
+      <button
+        type="button"
+        className={`account-mode-option live${mode === 'live' ? ' active' : ''}`}
+        onClick={() => switchTo('live')}
+        disabled={busy}
+        aria-pressed={mode === 'live'}
+        title="Use the live brokerage account"
+      >
+        Live
+      </button>
+    </div>
+  );
+}
+
 function CryptoDashboard({ token, onBack, onLogout, onActivity }: { token: string; onBack: () => void; onLogout: () => void; onActivity?: () => void }) {
   const [state, setState] = useState<CryptoEngineState | null>(null);
   const [news, setNews] = useState<NewsItem[]>([]);
@@ -327,7 +389,7 @@ function CryptoDashboard({ token, onBack, onLogout, onActivity }: { token: strin
         <div className="header-left">
           <button className="back-btn" onClick={onBack} title="Back to dashboard selector">&#8592; Home</button>
           <h1>TradingAI <span className="mode-badge crypto">Crypto</span></h1>
-          <span className={`account-mode-badge ${accountMode}`}>{accountMode === 'demo' ? 'Demo Account' : 'Live Account'}</span>
+          <AccountModeSwitcher mode={accountMode} onChange={setAccountMode} market="crypto" token={token} />
         </div>
         <div className="header-right">
           {account && (
@@ -1015,7 +1077,7 @@ function Dashboard({ token, onLogout, onGoHome, onActivity }: { token: string; o
         <div className="header-left">
           <button className="back-btn" onClick={onGoHome} title="Back to dashboard selector">&#8592; Home</button>
           <h1>TradingAI <span className="mode-badge stocks">Stocks</span></h1>
-          <span className={`account-mode-badge ${accountMode}`}>{accountMode === 'demo' ? 'Demo Account' : 'Live Account'}</span>
+          <AccountModeSwitcher mode={accountMode} onChange={setAccountMode} market="stocks" token={token} />
         </div>
         <div className="header-right">
           {account && (

@@ -1146,6 +1146,7 @@ tr:hover td { background: #1c2128; }
   .header-left h1 { display: flex; align-items: center; gap: 0.35rem; }
   /* account-mode-badge: reset margin since flex gap handles spacing */
   .account-mode-badge { margin-left: 0; }
+  .account-mode-switch { margin-left: 0; }
   /* back-btn: adequate touch target */
   .back-btn { min-height: 36px; }
   .last-tick { display: none; }
@@ -1353,6 +1354,40 @@ tr:hover td { background: #1c2128; }
 }
 .account-mode-badge.demo { background: rgba(88,166,255,0.12); color: var(--blue); }
 .account-mode-badge.live { background: rgba(63,185,80,0.12); color: var(--green); }
+
+/* TRA-247 — quick Demo/Live account switcher in the dashboard header.
+   Segmented control: both options always visible, the active one is filled
+   with its mode color (blue=demo, green=live) so a glance tells you which
+   account you're trading against. Click the inactive side to flip. */
+.account-mode-switch {
+  display: inline-flex;
+  align-items: stretch;
+  margin-left: 0.4rem;
+  vertical-align: middle;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  overflow: hidden;
+  background: var(--surface);
+}
+.account-mode-switch.busy { opacity: 0.6; }
+.account-mode-option {
+  appearance: none;
+  background: transparent;
+  border: none;
+  color: var(--muted);
+  font-size: 0.62rem;
+  font-weight: 700;
+  letter-spacing: 0.05em;
+  text-transform: uppercase;
+  padding: 0.25em 0.7em;
+  cursor: pointer;
+  transition: background 120ms ease, color 120ms ease;
+}
+.account-mode-option:disabled { cursor: progress; }
+.account-mode-option + .account-mode-option { border-left: 1px solid var(--border); }
+.account-mode-option:hover:not(:disabled):not(.active) { color: var(--text); }
+.account-mode-option.demo.active { background: rgba(88,166,255,0.18); color: var(--blue); }
+.account-mode-option.live.active { background: rgba(63,185,80,0.18); color: var(--green); }
 
 /* ── Crypto dashboard: orange accent ─────────────────────────────────────────── */
 
