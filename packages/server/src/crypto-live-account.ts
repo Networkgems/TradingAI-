@@ -71,7 +71,24 @@ export class CryptoLiveAccount {
     this.sleep = opts.sleep ?? ((ms) => new Promise(r => setTimeout(r, ms)));
   }
 
-  /** Refresh USD-equivalent cash from Coinbase. Should be called periodically. */
+  /**
+   * Refresh USD-equivalent cash and equity from Coinbase.
+   *
+   * Cash is summed across stable currencies (USD, USDC, USDT). Non-cash
+   * holdings (BTC, ETH, SOL, …) are valued at the current Coinbase spot
+   * price for `{currency}-USD` so the dashboard reflects the user's full
+   * portfolio rather than just the stable-cash slice (TRA-224 — users with
+   * pre-existing crypto on Coinbase were seeing equity = $0).
+   *
+   * Spot-pricing is best-effort: a failed `getProductPrices` call leaves
+   * crypto holdings unvalued (logged as a warning) rather than blowing up
+   * the whole refresh. Currencies without a USD pair on Coinbase are simply
+   * skipped — the absent price drops out of the Map.
+   *
+   * Coinbase's `available_balance` already reflects fills from orders we've
+   * placed, so we no longer add a separate "open-position notional" term —
+   * doing so would double-count the local mirror against the real wallet.
+   */
   async refreshBalance(): Promise<void> {
     let accounts: CoinbaseAccountBalance[];
     try {
@@ -81,24 +98,36 @@ export class CryptoLiveAccount {
       return;
     }
     let cash = 0;
+    const cryptoBalances = new Map<string, number>();
     for (const a of accounts) {
-      if (CASH_CURRENCIES.has(a.currency.toUpperCase())) {
-        const v = parseFloat(a.available_balance.value);
-        if (Number.isFinite(v)) cash += v;
+      const currency = a.currency.toUpperCase();
+      const v = parseFloat(a.available_balance.value);
+      if (!Number.isFinite(v) || v === 0) continue;
+      if (CASH_CURRENCIES.has(currency)) {
+        cash += v;
+      } else {
+        cryptoBalances.set(`${currency}-USD`, v);
       }
     }
-    this.cashUsd = cash;
-    this.equityUsd = cash + this.estimateOpenPositionValue();
-    this.lastBalanceRefresh = Date.now();
-  }
 
-  /** Equity at last refresh, plus open-position notional at last seen price. */
-  private estimateOpenPositionValue(): number {
-    let total = 0;
-    for (const pos of this.positions.values()) {
-      total += pos.entryPrice * pos.quantity;
+    let cryptoValue = 0;
+    if (cryptoBalances.size > 0) {
+      let prices: Map<string, number>;
+      try {
+        prices = await this.coinbase.getProductPrices(Array.from(cryptoBalances.keys()));
+      } catch (err: unknown) {
+        console.warn('[crypto-live] product price lookup failed:', err instanceof Error ? err.message : String(err));
+        prices = new Map();
+      }
+      for (const [productId, balance] of cryptoBalances) {
+        const price = prices.get(productId);
+        if (price != null) cryptoValue += balance * price;
+      }
     }
-    return total;
+
+    this.cashUsd = cash;
+    this.equityUsd = cash + cryptoValue;
+    this.lastBalanceRefresh = Date.now();
   }
 
   getState(): CryptoLiveAccountState {

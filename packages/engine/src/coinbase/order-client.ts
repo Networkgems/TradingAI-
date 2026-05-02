@@ -63,6 +63,21 @@ interface GetOrderResponse {
   order: CoinbaseOrderDetails;
 }
 
+/**
+ * Subset of `GET /api/v3/brokerage/products` we read for valuing non-USD
+ * holdings on the account screen (TRA-224). Coinbase returns more fields per
+ * product; we only consume the spot price.
+ */
+interface CoinbaseProduct {
+  product_id: string;
+  /** Last trade price, stringified — "0" or empty for inactive products. */
+  price?: string;
+}
+
+interface ListProductsResponse {
+  products?: CoinbaseProduct[];
+}
+
 export interface MarketOrderParams {
   productId: string;
   side: Side;
@@ -198,6 +213,29 @@ export class CoinbaseOrderClient {
     const path = '/api/v3/brokerage/accounts';
     const data = await this.request<ListAccountsResponse>('GET', path, '');
     return data.accounts ?? [];
+  }
+
+  /**
+   * GET /api/v3/brokerage/products?product_ids=... — return spot prices for
+   * the requested products (TRA-224). Used to convert non-USD account
+   * balances into USD-equivalent equity for the live dashboard so users with
+   * pre-existing BTC/ETH on Coinbase see their full portfolio value, not
+   * just the stable-cash portion. Returns a Map keyed by product_id; missing
+   * or unparseable prices are dropped silently so the caller can degrade
+   * gracefully (skip valuing that holding) without blowing up the refresh.
+   */
+  async getProductPrices(productIds: string[]): Promise<Map<string, number>> {
+    const out = new Map<string, number>();
+    if (productIds.length === 0) return out;
+    const params = new URLSearchParams();
+    for (const id of productIds) params.append('product_ids', id);
+    const path = `/api/v3/brokerage/products?${params.toString()}`;
+    const data = await this.request<ListProductsResponse>('GET', path, '');
+    for (const p of data.products ?? []) {
+      const v = parseFloat(p.price ?? '');
+      if (Number.isFinite(v) && v > 0) out.set(p.product_id, v);
+    }
+    return out;
   }
 
   /**

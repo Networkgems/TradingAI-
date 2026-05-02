@@ -155,6 +155,57 @@ describe('CoinbaseOrderClient', () => {
   it('reports the HMAC scheme when given a printable shared secret', () => {
     expect(makeClient().getAuthScheme()).toBe('hmac');
   });
+
+  // TRA-224 — non-USD account balances need spot pricing so the live
+  // dashboard equity reflects pre-existing crypto holdings, not just stable
+  // cash.
+  describe('getProductPrices (TRA-224)', () => {
+    it('issues a single GET with the requested product_ids and returns a price map', async () => {
+      const client = makeClient();
+      fetchMock.mockResolvedValueOnce(jsonResponse({
+        products: [
+          { product_id: 'BTC-USD', price: '60000.5' },
+          { product_id: 'ETH-USD', price: '3000' },
+        ],
+      }));
+
+      const prices = await client.getProductPrices(['BTC-USD', 'ETH-USD']);
+
+      expect(prices.get('BTC-USD')).toBe(60_000.5);
+      expect(prices.get('ETH-USD')).toBe(3_000);
+      expect(fetchMock).toHaveBeenCalledTimes(1);
+      const [url] = fetchMock.mock.calls[0];
+      expect(String(url)).toBe(
+        'https://api.coinbase.com/api/v3/brokerage/products?product_ids=BTC-USD&product_ids=ETH-USD',
+      );
+    });
+
+    it('drops products with missing or non-numeric prices instead of returning NaN entries', async () => {
+      const client = makeClient();
+      fetchMock.mockResolvedValueOnce(jsonResponse({
+        products: [
+          { product_id: 'BTC-USD', price: '60000' },
+          { product_id: 'OBS-USD', price: '' },
+          { product_id: 'BAD-USD', price: 'not-a-number' },
+          { product_id: 'ZERO-USD', price: '0' }, // suspended/inactive
+        ],
+      }));
+
+      const prices = await client.getProductPrices(['BTC-USD', 'OBS-USD', 'BAD-USD', 'ZERO-USD']);
+
+      expect(prices.size).toBe(1);
+      expect(prices.get('BTC-USD')).toBe(60_000);
+    });
+
+    it('short-circuits to an empty map without hitting the network when given no product ids', async () => {
+      const client = makeClient();
+
+      const prices = await client.getProductPrices([]);
+
+      expect(prices.size).toBe(0);
+      expect(fetchMock).not.toHaveBeenCalled();
+    });
+  });
 });
 
 // --- CDP / JWT auth path (TRA-157) ---------------------------------------

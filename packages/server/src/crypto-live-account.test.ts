@@ -17,6 +17,11 @@ class FakeCoinbaseClient {
   listAccounts = vi.fn<() => Promise<CoinbaseAccountBalance[]>>();
   placeMarketOrder = vi.fn<() => Promise<CoinbaseOrderSuccessResponse>>();
   getOrder = vi.fn<(orderId: string) => Promise<CoinbaseOrderDetails>>();
+  // Default empty map: tests with only USD/USDC/USDT holdings never hit this
+  // path. Tests that seed crypto holdings override the resolved value.
+  getProductPrices = vi.fn<(productIds: string[]) => Promise<Map<string, number>>>(
+    async () => new Map(),
+  );
 }
 
 function asClient(fake: FakeCoinbaseClient): CoinbaseOrderClient {
@@ -74,6 +79,120 @@ beforeEach(() => {
   // Suppress the open/close/fill-warning chatter so vitest output stays clean.
   vi.spyOn(console, 'log').mockImplementation(() => {});
   vi.spyOn(console, 'warn').mockImplementation(() => {});
+});
+
+describe('CryptoLiveAccount equity rollup (TRA-224)', () => {
+  it('values pre-existing non-USD holdings at current Coinbase spot price', async () => {
+    const coinbase = new FakeCoinbaseClient();
+    coinbase.listAccounts.mockResolvedValue([
+      {
+        uuid: 'usd', name: 'USD Wallet', currency: 'USD',
+        available_balance: { value: '1000', currency: 'USD' },
+        hold: { value: '0', currency: 'USD' },
+      },
+      {
+        uuid: 'btc', name: 'BTC Wallet', currency: 'BTC',
+        available_balance: { value: '0.5', currency: 'BTC' },
+        hold: { value: '0', currency: 'BTC' },
+      },
+      {
+        uuid: 'eth', name: 'ETH Wallet', currency: 'ETH',
+        available_balance: { value: '2', currency: 'ETH' },
+        hold: { value: '0', currency: 'ETH' },
+      },
+    ]);
+    coinbase.getProductPrices.mockResolvedValue(new Map([
+      ['BTC-USD', 60_000],
+      ['ETH-USD', 3_000],
+    ]));
+    const account = new CryptoLiveAccount(asClient(coinbase), { sleep: async () => {} });
+
+    await account.refreshBalance();
+
+    // 1000 USD + 0.5 * 60_000 + 2 * 3_000 = 1000 + 30_000 + 6_000 = 37_000.
+    expect(account.getState().totalEquity).toBe(37_000);
+    expect(account.getState().availableCash).toBe(1_000);
+    expect(coinbase.getProductPrices).toHaveBeenCalledWith(
+      expect.arrayContaining(['BTC-USD', 'ETH-USD']),
+    );
+  });
+
+  it('sums stable currencies (USD + USDC + USDT) into cash', async () => {
+    const coinbase = new FakeCoinbaseClient();
+    coinbase.listAccounts.mockResolvedValue([
+      {
+        uuid: 'usd', name: 'USD', currency: 'USD',
+        available_balance: { value: '100', currency: 'USD' },
+        hold: { value: '0', currency: 'USD' },
+      },
+      {
+        uuid: 'usdc', name: 'USDC', currency: 'USDC',
+        available_balance: { value: '200', currency: 'USDC' },
+        hold: { value: '0', currency: 'USDC' },
+      },
+      {
+        uuid: 'usdt', name: 'USDT', currency: 'USDT',
+        available_balance: { value: '50', currency: 'USDT' },
+        hold: { value: '0', currency: 'USDT' },
+      },
+    ]);
+    const account = new CryptoLiveAccount(asClient(coinbase), { sleep: async () => {} });
+
+    await account.refreshBalance();
+
+    expect(account.getState().availableCash).toBe(350);
+    expect(account.getState().totalEquity).toBe(350);
+    // No non-cash holdings → no price lookup.
+    expect(coinbase.getProductPrices).not.toHaveBeenCalled();
+  });
+
+  it('skips currencies whose USD pair Coinbase did not return a price for', async () => {
+    const coinbase = new FakeCoinbaseClient();
+    coinbase.listAccounts.mockResolvedValue([
+      {
+        uuid: 'btc', name: 'BTC', currency: 'BTC',
+        available_balance: { value: '1', currency: 'BTC' },
+        hold: { value: '0', currency: 'BTC' },
+      },
+      {
+        uuid: 'obscure', name: 'OBS', currency: 'OBS',
+        available_balance: { value: '500', currency: 'OBS' },
+        hold: { value: '0', currency: 'OBS' },
+      },
+    ]);
+    // Only BTC priced — OBS-USD pair didn't come back. Equity = BTC value
+    // alone; the obscure holding silently drops out of the rollup.
+    coinbase.getProductPrices.mockResolvedValue(new Map([['BTC-USD', 60_000]]));
+    const account = new CryptoLiveAccount(asClient(coinbase), { sleep: async () => {} });
+
+    await account.refreshBalance();
+
+    expect(account.getState().totalEquity).toBe(60_000);
+    expect(account.getState().availableCash).toBe(0);
+  });
+
+  it('falls back to cash-only equity when product price lookup fails', async () => {
+    const coinbase = new FakeCoinbaseClient();
+    coinbase.listAccounts.mockResolvedValue([
+      {
+        uuid: 'usd', name: 'USD', currency: 'USD',
+        available_balance: { value: '500', currency: 'USD' },
+        hold: { value: '0', currency: 'USD' },
+      },
+      {
+        uuid: 'btc', name: 'BTC', currency: 'BTC',
+        available_balance: { value: '0.1', currency: 'BTC' },
+        hold: { value: '0', currency: 'BTC' },
+      },
+    ]);
+    coinbase.getProductPrices.mockRejectedValue(new Error('coinbase down'));
+    const account = new CryptoLiveAccount(asClient(coinbase), { sleep: async () => {} });
+
+    // Should not throw; equity degrades to just cash.
+    await account.refreshBalance();
+    expect(account.getState().totalEquity).toBe(500);
+    expect(account.getState().availableCash).toBe(500);
+  });
 });
 
 describe('CryptoLiveAccount fill reconciliation (TRA-156)', () => {
