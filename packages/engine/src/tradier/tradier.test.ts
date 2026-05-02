@@ -319,6 +319,43 @@ describe('TradierOptionsClient.getOptionMid', () => {
   });
 });
 
+describe('TradierOptionsClient.getAccountBalance (TRA-226)', () => {
+  it('parses total_equity / total_cash from /accounts/{id}/balances', async () => {
+    fetchMock.mockResolvedValueOnce(
+      jsonResponse({ balances: { total_equity: 12345.67, total_cash: 5000, account_number: 'A1' } }),
+    );
+    const client = new TradierOptionsClient('tok', 'A1');
+    const balance = await client.getAccountBalance();
+    expect(balance).toEqual({ totalEquity: 12345.67, totalCash: 5000 });
+    expect(callUrl(0)).toBe('https://sandbox.tradier.com/v1/accounts/A1/balances');
+    const headers = callInit(0).headers as Record<string, string>;
+    expect(headers.Authorization).toBe('Bearer tok');
+  });
+
+  it('hits the production base URL when env=production', async () => {
+    fetchMock.mockResolvedValueOnce(
+      jsonResponse({ balances: { total_equity: 1, total_cash: 1 } }),
+    );
+    const client = new TradierOptionsClient('tok', 'VA9', 'production');
+    await client.getAccountBalance();
+    expect(callUrl(0)).toBe('https://api.tradier.com/v1/accounts/VA9/balances');
+  });
+
+  it('returns null when the balances envelope is missing', async () => {
+    fetchMock.mockResolvedValueOnce(jsonResponse({ balances: null }));
+    const client = new TradierOptionsClient('tok', 'A1');
+    expect(await client.getAccountBalance()).toBeNull();
+  });
+
+  it('returns null when fields are not finite numbers', async () => {
+    fetchMock.mockResolvedValueOnce(
+      jsonResponse({ balances: { total_equity: 'oops', total_cash: 100 } }),
+    );
+    const client = new TradierOptionsClient('tok', 'A1');
+    expect(await client.getAccountBalance()).toBeNull();
+  });
+});
+
 describe('TradierOptionsClient.buyContracts / sellContracts', () => {
   it('posts a buy_to_open option order with derived underlying', async () => {
     fetchMock.mockResolvedValueOnce(jsonResponse({ order: { id: 7, status: 'ok' } }));

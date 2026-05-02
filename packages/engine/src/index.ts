@@ -41,6 +41,7 @@ export type {
   TradierOptionsContract,
   TradierOptionQuote,
   TradierEquityQuote,
+  TradierAccountBalance,
 } from './tradier/index.js';
 export { CoinbaseOrderClient } from './coinbase/index.js';
 export type {

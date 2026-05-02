@@ -1,4 +1,5 @@
 import { OrbStrategy, ReversalStrategy, MacdTrendStrategy, BbFadeStrategy, IchimokuStrategy, TradierOptionsClient } from '@trading-app/engine';
+import type { TradierAccountBalance } from '@trading-app/engine';
 import { WATCHLIST, MANAGED_ACCOUNT_RATIO, MAX_CONSECUTIVE_LOSSES, DAILY_DRAWDOWN_HALT_PCT, aliasWatchlistSymbol, isStockMarketOpen, resolveTradierOptionsCreds } from '@trading-app/shared';
 import type { TradeSignal, RelativeValueSignal, Candle, OptionsAccountState, SignalType, Position, AccountSettings, AccountState, NewsItem } from '@trading-app/shared';
 import { fetchMinuteBars, fetchQuotes, fetchStocksNews, isYahooBreakerOpen, setActiveInterestSymbols } from './yahoo-feed.js';
@@ -43,6 +44,11 @@ export type EngineEventHandler = (state: EngineState) => void;
 
 const MAX_SIGNALS = 50;
 const NEWS_REFRESH_MS = 5 * 60_000;
+// TRA-226 — refresh the Tradier `/accounts/{id}/balances` snapshot at most
+// every 2 minutes. Tradier rate-limits balance reads, and the dashboard
+// equity does not need second-level freshness — order fills come through
+// the trade path, not the balance poll.
+const TRADIER_BALANCE_REFRESH_MS = 2 * 60_000;
 
 // TRA-191 — periodic relative-value scanner cadence. Tradier's free-tier
 // limit is 60 req/min (sandbox) or 120/min (production). With ~25 active-
@@ -154,6 +160,15 @@ export class SignalEngine {
    * `buy_to_open` / `sell_to_close` market orders.
    */
   private tradierLiveClient: TradierOptionsClient | null = null;
+  /**
+   * TRA-226 — last successful Tradier `/accounts/{id}/balances` snapshot.
+   * Used in live mode so the dashboard reflects the user's actual Tradier
+   * equity/cash instead of the hardcoded 0 the engine used before the live
+   * broker was wired up. Cleared when creds disappear or fall out of live
+   * mode so a stale figure doesn't outlive the connection.
+   */
+  private liveTradierBalance: TradierAccountBalance | null = null;
+  private lastTradierBalanceFetchAt = 0;
 
   constructor(settings?: AccountSettings, tracker?: PnlTracker, rvScanner?: RelativeValueScannerService) {
     this.tracker = tracker;
@@ -197,7 +212,7 @@ export class SignalEngine {
    *
    * Use {@link forceReset} for the explicit "Reset Demo Account" hard reset.
    */
-  applySettings(settings: AccountSettings): void {
+  async applySettings(settings: AccountSettings): Promise<void> {
     this.mode = settings.mode === 'live' ? 'live' : 'demo';
     this.account.updateConfig({
       managedAccountRatio: settings.managedAccountRatio,
@@ -212,10 +227,26 @@ export class SignalEngine {
     // next tick without requiring a server restart.
     this.tradierLiveClient = buildTradierLiveClient(settings);
     if (this.mode === 'live') {
+      // TRA-226 — fetch the Tradier balance immediately so the broadcast that
+      // follows in the PUT /api/account/settings handler reflects the user's
+      // real equity instead of a transient $0 the user sees until the next
+      // 30s tick refreshes it (mirrors the Coinbase pattern from TRA-224).
+      // No client / failed fetch leaves liveTradierBalance null and the UI
+      // shows 0 until the next successful refresh.
+      if (this.tradierLiveClient) {
+        await this.refreshTradierBalance();
+      } else {
+        this.liveTradierBalance = null;
+        this.lastTradierBalanceFetchAt = 0;
+      }
       // Live mode: leave account/options/tracker untouched so the demo state
       // (equity, positions, dailyPnl) is preserved for a later switch back.
       return;
     }
+    // TRA-226 — drop any stored live balance when leaving live mode so a
+    // future re-entry can't surface a stale figure.
+    this.liveTradierBalance = null;
+    this.lastTradierBalanceFetchAt = 0;
     const targetEquity = settings.demoEquityStocks ?? settings.demoEquity;
     this.account.applyEquity(targetEquity);
     this.optionsAccount.applyEquity(targetEquity);
@@ -308,6 +339,19 @@ export class SignalEngine {
       const news = await fetchStocksNews(this.getActiveSymbols());
       if (news.length > 0) this.newsCache = news;
       this.lastNewsRefresh = Date.now();
+    }
+
+    // TRA-226 — keep the live Tradier equity figure fresh while in live mode.
+    // applySettings does an immediate fetch when creds change so the user
+    // doesn't see $0 right after saving; this tick handles ongoing refreshes
+    // (deposits, options fills moving cash, etc.) without blocking the rest
+    // of doTick.
+    if (
+      this.mode === 'live'
+      && this.tradierLiveClient
+      && Date.now() - this.lastTradierBalanceFetchAt > TRADIER_BALANCE_REFRESH_MS
+    ) {
+      await this.refreshTradierBalance();
     }
 
     const activeSymbols = this.getActiveSymbols();
@@ -728,10 +772,24 @@ export class SignalEngine {
       // stock account is masked to zero. The options paper account is the
       // active trading surface in live and surfaces real positions / P&L so
       // the UI can render them.
+      // TRA-226 — when Tradier creds are configured the cached account balance
+      // (read-only, refreshed on settings save + on the periodic tick below)
+      // surfaces here so the dashboard reflects the user's real equity / cash
+      // for the selected env (sandbox or production). With no creds saved or
+      // before the first successful fetch, fall back to zero so the UI stays
+      // explicit instead of leaking demo numbers.
+      const liveAccount: AccountState = this.liveTradierBalance
+        ? {
+          totalEquity: this.liveTradierBalance.totalEquity,
+          availableCash: this.liveTradierBalance.totalCash,
+          openPositions: [],
+          dailyPnl: 0,
+        }
+        : { totalEquity: 0, availableCash: 0, openPositions: [], dailyPnl: 0 };
       return {
         symbols,
         signals: [...this.recentSignals],
-        account: { totalEquity: 0, availableCash: 0, openPositions: [], dailyPnl: 0 },
+        account: liveAccount,
         closedPositions: [],
         options: this.optionsAccount.getState(),
         lastTick: Date.now(),
@@ -802,6 +860,31 @@ export class SignalEngine {
       equity: this.account.getState().totalEquity,
       optionsPnl: this.optionsAccount.getState().optionsPnl,
     };
+  }
+
+  /**
+   * TRA-226 — read-only Tradier balance fetch. Updates the cached
+   * `liveTradierBalance` snapshot so the next `getState()` broadcast surfaces
+   * the user's real Tradier equity / cash. A failed fetch keeps the previous
+   * snapshot rather than zeroing it so a transient network blip doesn't make
+   * the dashboard equity flicker. Caller is responsible for only invoking
+   * this when `tradierLiveClient` is set.
+   */
+  private async refreshTradierBalance(): Promise<void> {
+    if (!this.tradierLiveClient) return;
+    try {
+      const balance = await this.tradierLiveClient.getAccountBalance();
+      if (balance) {
+        this.liveTradierBalance = balance;
+      }
+    } catch (err: unknown) {
+      console.error(
+        '[signal-engine] Tradier balance refresh failed:',
+        err instanceof Error ? err.message : String(err),
+      );
+    } finally {
+      this.lastTradierBalanceFetchAt = Date.now();
+    }
   }
 
   /**

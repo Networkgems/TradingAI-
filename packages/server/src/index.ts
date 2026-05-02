@@ -874,7 +874,11 @@ app.put('/api/account/settings', requireAuth, async (req, res) => {
     riskPerTrade: Math.max(0.001, Math.min(0.5, Number(body.riskPerTrade ?? current.riskPerTrade))),
   };
   await saveSettings(username, updated);
-  ctx.engine.applySettings(updated);
+  // Await the stocks engine: TRA-226 makes applySettings async so a flip into
+  // live mode can refresh the Tradier balance once before the broadcast,
+  // matching the Coinbase pattern from TRA-224 — without this the dashboard
+  // would show $0 equity for up to 30s until the next tick.
+  await ctx.engine.applySettings(updated);
   broadcastEngineState(ctx);
   // Await the crypto engine: switching into live mode does an initial Coinbase
   // balance fetch, and the broadcast that follows must reflect that equity

@@ -69,6 +69,22 @@ interface TradierRawQuote {
   last?: number;
 }
 
+interface TradierBalancesEnvelope {
+  balances?: {
+    account_number?: string;
+    account_type?: string;
+    total_equity?: number;
+    total_cash?: number;
+    open_pl?: number;
+  } | null;
+}
+
+/** TRA-226 — read-only Tradier account balance snapshot. */
+export interface TradierAccountBalance {
+  totalEquity: number;
+  totalCash: number;
+}
+
 /** Tradier returns `T | T[]` depending on result count; sometimes `null`/empty string when none. */
 function asArray<T>(value: T | T[] | undefined | null | string): T[] {
   if (value == null || value === '') return [];
@@ -200,6 +216,25 @@ export class TradierOptionsClient extends TradierOrderClient {
       return (quote.bid + quote.ask) / 2;
     }
     return typeof quote.last === 'number' && quote.last > 0 ? quote.last : null;
+  }
+
+  /**
+   * TRA-226 — Read-only account balance for the configured Tradier account.
+   * Used to reflect the user's Tradier equity/cash in the dashboard while in
+   * live mode. Returns `null` when Tradier doesn't return a balances payload
+   * (auth failure, network error, etc.) — the caller should keep the previous
+   * snapshot rather than zeroing the display.
+   */
+  async getAccountBalance(): Promise<TradierAccountBalance | null> {
+    const data = await this.getJson<TradierBalancesEnvelope>(
+      `/accounts/${encodeURIComponent(this.accountId)}/balances`,
+    );
+    const b = data?.balances;
+    if (!b) return null;
+    const totalEquity = typeof b.total_equity === 'number' ? b.total_equity : NaN;
+    const totalCash = typeof b.total_cash === 'number' ? b.total_cash : NaN;
+    if (!Number.isFinite(totalEquity) || !Number.isFinite(totalCash)) return null;
+    return { totalEquity, totalCash };
   }
 
   /** Submit a market order to buy option contracts (open). */

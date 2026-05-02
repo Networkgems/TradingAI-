@@ -39,7 +39,7 @@ function fakeSignal(symbol: string, type: TradeSignal['type'], side: TradeSignal
   } as TradeSignal;
 }
 
-function runStocksScenario() {
+async function runStocksScenario() {
   console.log('\n── Stocks: demo($25K start, +$25K profits) → live → demo round-trip ──');
   const dataDir = mkdtempSync(join(tmpdir(), 'tra138-stocks-'));
   try {
@@ -80,7 +80,7 @@ function runStocksScenario() {
     check('baseline equity reflects $25K profit (>$25K)', baselineEquity > 25_000, baselineEquity);
 
     // Switch to LIVE.
-    engine.applySettings(makeSettings({ mode: 'live', demoEquityStocks: 25_000 }));
+    await engine.applySettings(makeSettings({ mode: 'live', demoEquityStocks: 25_000 }));
     const liveState = engine.getState();
     check('live mode shows 0 equity', liveState.account.totalEquity === 0, liveState.account.totalEquity);
     check('live mode shows 0 cash', liveState.account.availableCash === 0, liveState.account.availableCash);
@@ -90,7 +90,7 @@ function runStocksScenario() {
     check('live mode keeps signals visible', liveState.signals.length === baselineSignals, liveState.signals.length);
 
     // Switch back to DEMO with default $25K demoEquityStocks.
-    engine.applySettings(makeSettings({ mode: 'demo', demoEquityStocks: 25_000 }));
+    await engine.applySettings(makeSettings({ mode: 'demo', demoEquityStocks: 25_000 }));
     const restored = engine.getState();
     console.log(`  restored demo: equity=${restored.account.totalEquity}, positions=${restored.account.openPositions.length}, signals=${restored.signals.length}, symbols=${restored.symbols.length}`);
 
@@ -104,7 +104,7 @@ function runStocksScenario() {
   }
 }
 
-function runStocksEquityChange() {
+async function runStocksEquityChange() {
   console.log('\n── Stocks: changing demoEquityStocks 25K→50K preserves positions/signals ──');
   const dataDir = mkdtempSync(join(tmpdir(), 'tra138-stocks-eq-'));
   try {
@@ -126,7 +126,7 @@ function runStocksEquityChange() {
     const beforePositions = account.getState().openPositions.length;
 
     // Bump demoEquityStocks to 50K.
-    engine.applySettings(makeSettings({ mode: 'demo', demoEquityStocks: 50_000 }));
+    await engine.applySettings(makeSettings({ mode: 'demo', demoEquityStocks: 50_000 }));
     const after = engine.getState();
     console.log(`  before: equity=${beforeEquity}, positions=${beforePositions}; after: equity=${after.account.totalEquity}, positions=${after.account.openPositions.length}`);
 
@@ -194,7 +194,7 @@ async function runCryptoScenario() {
   }
 }
 
-function runStocksRestartInLiveMode() {
+async function runStocksRestartInLiveMode() {
   console.log('\n── Stocks: server restart in live mode → switch to demo restores demo equity ──');
   const dataDir = mkdtempSync(join(tmpdir(), 'tra138-stocks-restart-'));
   try {
@@ -212,7 +212,7 @@ function runStocksRestartInLiveMode() {
       tracker.saveEquity(account.getState().totalEquity, 0);
       tracker.syncOpeningEquity(account.getState().totalEquity, account.getState().dailyPnl);
       // Switch to live and persist tracker state should remain intact.
-      engine.applySettings(makeSettings({ mode: 'live', demoEquityStocks: 25_000 }));
+      await engine.applySettings(makeSettings({ mode: 'live', demoEquityStocks: 25_000 }));
     }
 
     // Simulate server restart in live mode.
@@ -223,7 +223,7 @@ function runStocksRestartInLiveMode() {
       const liveState = engine.getState();
       check('post-restart live: account shown as 0', liveState.account.totalEquity === 0, liveState.account.totalEquity);
 
-      engine.applySettings(makeSettings({ mode: 'demo', demoEquityStocks: 25_000 }));
+      await engine.applySettings(makeSettings({ mode: 'demo', demoEquityStocks: 25_000 }));
       const demoState = engine.getState();
       console.log(`  post-restart demo: equity=${demoState.account.totalEquity}`);
       check('post-restart demo: equity preserved (>$25K)', demoState.account.totalEquity > 25_000, demoState.account.totalEquity);
@@ -234,10 +234,10 @@ function runStocksRestartInLiveMode() {
 }
 
 async function main() {
-  runStocksScenario();
-  runStocksEquityChange();
+  await runStocksScenario();
+  await runStocksEquityChange();
   await runCryptoScenario();
-  runStocksRestartInLiveMode();
+  await runStocksRestartInLiveMode();
 
   if (failures > 0) {
     console.error(`\n❌ ${failures} check(s) failed`);

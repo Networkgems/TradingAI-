@@ -1,7 +1,8 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import { SignalEngine } from './signal-engine.js';
 import type { RelativeValueScannerService, RelativeValueScanResult } from './relative-value-scanner.js';
-import type { RelativeValueCandidate } from '@trading-app/engine';
+import type { RelativeValueCandidate, TradierOptionsClient } from '@trading-app/engine';
+import { DEFAULT_ACCOUNT_SETTINGS } from '@trading-app/shared';
 
 // Inside an ET trading window: 10:00 AM ET on a Tuesday → 14:00 UTC during EDT.
 const TRADING_TIME = Date.parse('2024-06-04T14:00:00Z');
@@ -144,5 +145,45 @@ describe('SignalEngine — relative-value scanner bridge', () => {
     await (engine as unknown as { runRelativeValueScan: (s: string[]) => Promise<void> }).runRelativeValueScan(['AAPL']);
     expect(engine.getState().signals).toHaveLength(1);
     expect(engine.getState().options.openOptions).toHaveLength(1);
+  });
+});
+
+describe('SignalEngine — Tradier live balance surfacing (TRA-226)', () => {
+  it('surfaces total_equity / total_cash from the cached Tradier balance in live mode', async () => {
+    const engine = new SignalEngine(undefined, undefined, undefined);
+    // Stub out the Tradier client and prime the cache so applySettings doesn't
+    // need a real fetch. The internal field naming matches the source.
+    const fakeClient = {
+      getAccountBalance: vi.fn().mockResolvedValue({ totalEquity: 1234.56, totalCash: 200 }),
+    } as unknown as TradierOptionsClient;
+    (engine as unknown as { tradierLiveClient: TradierOptionsClient | null }).tradierLiveClient = fakeClient;
+    (engine as unknown as { mode: 'demo' | 'live' }).mode = 'live';
+    await (engine as unknown as { refreshTradierBalance: () => Promise<void> }).refreshTradierBalance();
+
+    const state = engine.getState();
+    expect(state.account.totalEquity).toBeCloseTo(1234.56);
+    expect(state.account.availableCash).toBe(200);
+    expect(state.account.openPositions).toEqual([]);
+  });
+
+  it('falls back to 0 in live mode when no Tradier balance has been fetched', () => {
+    const engine = new SignalEngine(undefined, undefined, undefined);
+    (engine as unknown as { mode: 'demo' | 'live' }).mode = 'live';
+
+    const state = engine.getState();
+    expect(state.account.totalEquity).toBe(0);
+    expect(state.account.availableCash).toBe(0);
+  });
+
+  it('clears the cached balance when leaving live mode', async () => {
+    const engine = new SignalEngine(undefined, undefined, undefined);
+    (engine as unknown as { liveTradierBalance: { totalEquity: number; totalCash: number } | null }).liveTradierBalance = {
+      totalEquity: 999,
+      totalCash: 100,
+    };
+
+    await engine.applySettings({ ...DEFAULT_ACCOUNT_SETTINGS, mode: 'demo' });
+    const internal = engine as unknown as { liveTradierBalance: unknown };
+    expect(internal.liveTradierBalance).toBeNull();
   });
 });
