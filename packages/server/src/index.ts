@@ -56,6 +56,7 @@ import {
   saveResearchReport,
   listResearchReports,
   getResearchReport,
+  seedSampleResearchReportIfEmpty,
   ResearchValidationError,
 } from './research-store.js';
 
@@ -115,6 +116,12 @@ console.log(
 // every known user. New signups get their context created on demand.
 await runFirstBootMigration('admin');
 await initAllUserContexts();
+
+// TRA-227 — drop a placeholder QuantTrader research report so the Stocks
+// News tab has visible "Research" content the first time the server boots.
+// No-op once the store has at least one report, so real reports posted via
+// `/api/research/reports` aren't shadowed.
+await seedSampleResearchReportIfEmpty();
 
 const app = express();
 

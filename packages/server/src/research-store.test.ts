@@ -6,6 +6,7 @@ import {
   saveResearchReport,
   listResearchReports,
   getResearchReport,
+  seedSampleResearchReportIfEmpty,
   ResearchValidationError,
   __resetResearchStoreForTests,
 } from './research-store.js';
@@ -108,5 +109,46 @@ describe('research-store', () => {
     expect(found?.title).toBe('Hello');
     const missing = await getResearchReport('nope');
     expect(missing).toBeUndefined();
+  });
+
+  it('seedSampleResearchReportIfEmpty seeds once, then no-ops', async () => {
+    const first = await seedSampleResearchReportIfEmpty();
+    expect(first?.id).toBe('sample-premarket');
+    expect(first?.source).toBe('QuantTrader');
+
+    const list1 = await listResearchReports();
+    expect(list1).toHaveLength(1);
+
+    const second = await seedSampleResearchReportIfEmpty();
+    expect(second).toBeNull();
+    const list2 = await listResearchReports();
+    expect(list2).toHaveLength(1);
+  });
+
+  it('seed is skipped when SEED_SAMPLE_RESEARCH=0', async () => {
+    const prev = process.env['SEED_SAMPLE_RESEARCH'];
+    process.env['SEED_SAMPLE_RESEARCH'] = '0';
+    try {
+      const result = await seedSampleResearchReportIfEmpty();
+      expect(result).toBeNull();
+      const list = await listResearchReports();
+      expect(list).toHaveLength(0);
+    } finally {
+      if (prev === undefined) delete process.env['SEED_SAMPLE_RESEARCH'];
+      else process.env['SEED_SAMPLE_RESEARCH'] = prev;
+    }
+  });
+
+  it('seed does not overwrite existing reports', async () => {
+    await saveResearchReport({
+      kind: 'postmarket',
+      title: 'Real report',
+      bodyMarkdown: 'real',
+    });
+    const result = await seedSampleResearchReportIfEmpty();
+    expect(result).toBeNull();
+    const list = await listResearchReports();
+    expect(list).toHaveLength(1);
+    expect(list[0].title).toBe('Real report');
   });
 });

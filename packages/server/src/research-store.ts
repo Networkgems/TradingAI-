@@ -157,6 +157,55 @@ export async function saveResearchReport(input: unknown): Promise<ResearchReport
   return report;
 }
 
+/**
+ * TRA-227 — first-boot seed. Drops a single placeholder QuantTrader report
+ * the first time the server starts with no research-reports.json on disk so
+ * the Stocks News tab has visible "Research" content out of the box. Once
+ * the QuantTrader routine on TRA-223 starts POSTing real reports they push
+ * the placeholder down naturally; the seeded id (`sample-premarket`) means
+ * the routine can also overwrite it via an idempotent POST.
+ *
+ * Idempotent: only seeds when the store is empty. Set
+ * `SEED_SAMPLE_RESEARCH=0` to skip seeding (e.g. for clean prod deploys).
+ */
+export async function seedSampleResearchReportIfEmpty(): Promise<ResearchReport | null> {
+  if (process.env['SEED_SAMPLE_RESEARCH'] === '0') return null;
+  const all = await ensureLoaded();
+  if (all.length > 0) return null;
+  const today = new Date();
+  const dateLabel = today.toISOString().slice(0, 10);
+  const sample: ResearchReport = {
+    id: 'sample-premarket',
+    kind: 'premarket',
+    title: `Pre-Market Review — ${dateLabel} (sample)`,
+    publishedAt: today.toISOString(),
+    source: 'QuantTrader',
+    tickers: ['AMD', 'PLTR', 'NVDA'],
+    bodyMarkdown: [
+      `# Pre-Market Review — ${dateLabel}`,
+      '',
+      '> Sample report — gets replaced once the QuantTrader routine (TRA-223)',
+      '> POSTs its first real review to `/api/research/reports`.',
+      '',
+      '## Headline drivers',
+      '- Fed minutes and rate-cut path remain the dominant tape driver.',
+      '- Semis: AMD MI400 ramp commentary, PLTR earnings on deck.',
+      '',
+      '## Watchlist',
+      '- **AMD** — long bias above 162.50, target 168, stop 159.',
+      '- **PLTR** — fade strength into 28; ER is the catalyst, no swing risk pre-print.',
+      '- **NVDA** — neutral, range 880–905.',
+      '',
+      '## Risk',
+      '- Position size cut to 0.75x normal until post-FOMC.',
+    ].join('\n'),
+  };
+  cache = [sample];
+  await persist();
+  console.log('[research-store] seeded sample QuantTrader report (id=sample-premarket)');
+  return sample;
+}
+
 /** Test-only helper: reset in-memory cache and (optionally) override the on-disk path. */
 export function __resetResearchStoreForTests(overridePath?: string | null): void {
   cache = null;
