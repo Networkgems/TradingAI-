@@ -41,21 +41,65 @@ describe('CoinbaseOrderClient', () => {
     expect(() => new CoinbaseOrderClient({ apiKey: 'k', apiSecret: '' })).toThrow();
   });
 
-  it('signs GET /accounts with empty body', async () => {
+  it('signs GET /accounts with empty body and an explicit limit', async () => {
     const client = makeClient();
-    fetchMock.mockResolvedValueOnce(jsonResponse({ accounts: [{ uuid: 'a', name: 'USD', currency: 'USD', available_balance: { value: '100', currency: 'USD' }, hold: { value: '0', currency: 'USD' } }] }));
+    fetchMock.mockResolvedValueOnce(jsonResponse({ accounts: [{ uuid: 'a', name: 'USD', currency: 'USD', available_balance: { value: '100', currency: 'USD' }, hold: { value: '0', currency: 'USD' } }], has_next: false }));
 
     const accounts = await client.listAccounts();
 
     expect(accounts).toHaveLength(1);
     expect(fetchMock).toHaveBeenCalledTimes(1);
     const [url, init] = fetchMock.mock.calls[0];
-    expect(String(url)).toBe('https://api.coinbase.com/api/v3/brokerage/accounts');
+    expect(String(url)).toBe('https://api.coinbase.com/api/v3/brokerage/accounts?limit=250');
     const headers = (init as RequestInit).headers as Record<string, string>;
     expect(headers['CB-ACCESS-KEY']).toBe(KEY);
     expect(headers['CB-ACCESS-TIMESTAMP']).toBe(String(TS));
-    expect(headers['CB-ACCESS-SIGN']).toBe(expectedSign('GET', '/api/v3/brokerage/accounts', ''));
+    expect(headers['CB-ACCESS-SIGN']).toBe(expectedSign('GET', '/api/v3/brokerage/accounts?limit=250', ''));
     expect((init as RequestInit).body).toBeUndefined();
+  });
+
+  // TRA-224 follow-up — Coinbase paginates GET /accounts (default 49, max
+  // 250). Coinbase also auto-creates an account per supported currency, so a
+  // user's primary USD wallet can easily land past page 1. Without
+  // pagination, refreshBalance sees only a slice of the user's accounts and
+  // reports a fraction of true equity (the symptom the user reported: $0.14
+  // shown vs $199.02 actually held).
+  it('paginates listAccounts via cursor until has_next is false', async () => {
+    const client = makeClient();
+    fetchMock.mockResolvedValueOnce(jsonResponse({
+      accounts: [{ uuid: 'a1', name: 'BTC', currency: 'BTC', available_balance: { value: '0.001', currency: 'BTC' }, hold: { value: '0', currency: 'BTC' } }],
+      has_next: true,
+      cursor: 'page2',
+    }));
+    fetchMock.mockResolvedValueOnce(jsonResponse({
+      accounts: [{ uuid: 'a2', name: 'USD', currency: 'USD', available_balance: { value: '199.02', currency: 'USD' }, hold: { value: '0', currency: 'USD' } }],
+      has_next: false,
+    }));
+
+    const accounts = await client.listAccounts();
+
+    expect(accounts).toHaveLength(2);
+    expect(accounts.map(a => a.currency)).toEqual(['BTC', 'USD']);
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+    expect(String(fetchMock.mock.calls[0][0])).toBe('https://api.coinbase.com/api/v3/brokerage/accounts?limit=250');
+    expect(String(fetchMock.mock.calls[1][0])).toBe('https://api.coinbase.com/api/v3/brokerage/accounts?limit=250&cursor=page2');
+  });
+
+  it('stops paginating when the response is missing a cursor even if has_next is true', async () => {
+    const client = makeClient();
+    // Defensive: Coinbase shouldn't return has_next=true without a cursor,
+    // but if it ever does, looping forever with cursor=undefined would spam
+    // the same page. Bail on the first absent cursor instead.
+    fetchMock.mockResolvedValueOnce(jsonResponse({
+      accounts: [{ uuid: 'a1', name: 'USD', currency: 'USD', available_balance: { value: '10', currency: 'USD' }, hold: { value: '0', currency: 'USD' } }],
+      has_next: true,
+      cursor: undefined,
+    }));
+
+    const accounts = await client.listAccounts();
+
+    expect(accounts).toHaveLength(1);
+    expect(fetchMock).toHaveBeenCalledTimes(1);
   });
 
   it('places a market BUY using quoteSize and signs the exact body that was sent', async () => {

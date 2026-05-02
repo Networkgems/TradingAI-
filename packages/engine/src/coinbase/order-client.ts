@@ -27,7 +27,21 @@ export interface CoinbaseAccountBalance {
 
 interface ListAccountsResponse {
   accounts?: CoinbaseAccountBalance[];
+  has_next?: boolean;
+  cursor?: string;
+  size?: number;
 }
+
+/**
+ * Coinbase caps `GET /accounts` at 250 results per page (default 49). We page
+ * with the max so a user with many auto-created currency accounts gets the
+ * USD/USDC/etc. wallets in as few round-trips as possible (TRA-224 follow-up —
+ * users with 50+ accounts had their actual USD wallet on page 2 and saw $0
+ * equity).
+ */
+const ACCOUNTS_PAGE_SIZE = 250;
+/** Hard ceiling on pages followed; protects against runaway pagination loops. */
+const ACCOUNTS_MAX_PAGES = 50;
 
 export interface CoinbaseOrderSuccessResponse {
   order_id: string;
@@ -217,11 +231,34 @@ export class CoinbaseOrderClient {
     return `${signingInput}.${base64UrlEncode(sig)}`;
   }
 
-  /** GET /api/v3/brokerage/accounts — returns balances by currency. */
+  /**
+   * GET /api/v3/brokerage/accounts — returns balances by currency.
+   *
+   * Coinbase auto-creates an account for every supported currency the user
+   * has interacted with, and the endpoint paginates (default 49, max 250).
+   * We follow `cursor` while `has_next` is true so the primary USD/USDC
+   * wallet is included even when it lands past page 1 — without this,
+   * `refreshBalance` saw only a slice of the user's accounts and reported
+   * a fraction of true equity (TRA-224 follow-up).
+   */
   async listAccounts(): Promise<CoinbaseAccountBalance[]> {
-    const path = '/api/v3/brokerage/accounts';
-    const data = await this.request<ListAccountsResponse>('GET', path, '');
-    return data.accounts ?? [];
+    const all: CoinbaseAccountBalance[] = [];
+    let cursor: string | undefined;
+    for (let page = 0; page < ACCOUNTS_MAX_PAGES; page++) {
+      const params = new URLSearchParams();
+      params.set('limit', String(ACCOUNTS_PAGE_SIZE));
+      if (cursor) params.set('cursor', cursor);
+      const path = `/api/v3/brokerage/accounts?${params.toString()}`;
+      const data = await this.request<ListAccountsResponse>('GET', path, '');
+      if (data.accounts) all.push(...data.accounts);
+      if (!data.has_next || !data.cursor) return all;
+      cursor = data.cursor;
+    }
+    console.warn(
+      `[coinbase] listAccounts hit page cap (${ACCOUNTS_MAX_PAGES}); returning ${all.length} accounts. ` +
+        `Some balances may be missing.`,
+    );
+    return all;
   }
 
   /**
