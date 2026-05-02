@@ -1,7 +1,7 @@
 import { OrbStrategy, ReversalStrategy, MacdTrendStrategy, BbFadeStrategy, IchimokuStrategy, TradierOptionsClient } from '@trading-app/engine';
 import type { TradierAccountBalance } from '@trading-app/engine';
 import { WATCHLIST, MANAGED_ACCOUNT_RATIO, MAX_CONSECUTIVE_LOSSES, DAILY_DRAWDOWN_HALT_PCT, aliasWatchlistSymbol, isStockMarketOpen, resolveTradierOptionsCreds } from '@trading-app/shared';
-import type { TradeSignal, RelativeValueSignal, Candle, OptionsAccountState, SignalType, Position, AccountSettings, AccountState, NewsItem } from '@trading-app/shared';
+import type { TradeSignal, RelativeValueSignal, Candle, OptionsAccountState, SignalType, Position, AccountSettings, AccountState, NewsItem, TradierEnv } from '@trading-app/shared';
 import { fetchMinuteBars, fetchQuotes, fetchStocksNews, isYahooBreakerOpen, setActiveInterestSymbols } from './yahoo-feed.js';
 import { PaperAccount } from './paper-account.js';
 import { PaperOptionsAccount } from './options-account.js';
@@ -129,7 +129,16 @@ export class SignalEngine {
   private readonly bbFade = new BbFadeStrategy();
   private readonly ichimoku = new IchimokuStrategy();
   private account: PaperAccount;
-  private optionsAccount: PaperOptionsAccount;
+  /**
+   * TRA-233 — per-env paper options accounts. Sandbox and production each
+   * track their own open positions, daily counters, and options P&L so
+   * flipping `liveTradierEnvOptions` doesn't blend state across envs in the
+   * dashboard / Open Positions view. The active account is whichever matches
+   * the current `tradierEnv`; both accounts apply equity rebases together so
+   * the inactive bucket stays in sync for the next switch.
+   */
+  private optionsAccounts: Record<TradierEnv, PaperOptionsAccount>;
+  private tradierEnv: TradierEnv = 'sandbox';
   private readonly riskGovernor = new DailyRiskGovernor();
   private readonly tracker: PnlTracker | undefined;
   /**
@@ -200,12 +209,32 @@ export class SignalEngine {
       managedAccountRatio: settings?.managedAccountRatio,
       riskPerTrade: settings?.riskPerTrade,
     });
-    this.optionsAccount = new PaperOptionsAccount({
-      initialEquity: currentEquity,
-      managedAccountRatio: settings?.managedAccountRatio,
-      optionsDailyTradesLimit: settings?.optionsDailyTradesLimit,
-    });
+    this.tradierEnv = settings?.liveTradierEnvOptions ?? 'sandbox';
+    this.optionsAccounts = {
+      sandbox: new PaperOptionsAccount({
+        initialEquity: currentEquity,
+        managedAccountRatio: settings?.managedAccountRatio,
+        optionsDailyTradesLimit: settings?.optionsDailyTradesLimit,
+        tradierEnv: 'sandbox',
+      }),
+      production: new PaperOptionsAccount({
+        initialEquity: currentEquity,
+        managedAccountRatio: settings?.managedAccountRatio,
+        optionsDailyTradesLimit: settings?.optionsDailyTradesLimit,
+        tradierEnv: 'production',
+      }),
+    };
     if (settings) this.tradierLiveClient = buildTradierLiveClient(settings);
+  }
+
+  /** TRA-233 — paper options account for the currently selected Tradier env. */
+  private get optionsAccount(): PaperOptionsAccount {
+    return this.optionsAccounts[this.tradierEnv];
+  }
+
+  /** TRA-233 — iterate over both env buckets when the action applies to all. */
+  private allOptionsAccounts(): PaperOptionsAccount[] {
+    return [this.optionsAccounts.sandbox, this.optionsAccounts.production];
   }
 
   /**
@@ -225,6 +254,10 @@ export class SignalEngine {
    */
   async applySettings(settings: AccountSettings): Promise<void> {
     this.mode = settings.mode === 'live' ? 'live' : 'demo';
+    // TRA-233 — point at the env-specific options account before any state is
+    // read off of it. Settings updates fired before the user has saved a value
+    // for `liveTradierEnvOptions` keep the previous selection (default sandbox).
+    this.tradierEnv = settings.liveTradierEnvOptions ?? this.tradierEnv;
     // Re-read both per-mode flags so a settings PUT (which may include the
     // start/stop UI state for either mode) keeps the engine in sync.
     this.autoTradingEnabledDemo = settings.stocksAutoTradingEnabledDemo ?? true;
@@ -233,10 +266,12 @@ export class SignalEngine {
       managedAccountRatio: settings.managedAccountRatio,
       riskPerTrade: settings.riskPerTrade,
     });
-    this.optionsAccount.updateConfig({
-      managedAccountRatio: settings.managedAccountRatio,
-      optionsDailyTradesLimit: settings.optionsDailyTradesLimit,
-    });
+    for (const acct of this.allOptionsAccounts()) {
+      acct.updateConfig({
+        managedAccountRatio: settings.managedAccountRatio,
+        optionsDailyTradesLimit: settings.optionsDailyTradesLimit,
+      });
+    }
     // TRA-221 — re-resolve the Tradier live client whenever settings change
     // so toggling Live mode or editing the API token takes effect on the
     // next tick without requiring a server restart.
@@ -264,7 +299,10 @@ export class SignalEngine {
     this.lastTradierBalanceFetchAt = 0;
     const targetEquity = settings.demoEquityStocks ?? settings.demoEquity;
     this.account.applyEquity(targetEquity);
-    this.optionsAccount.applyEquity(targetEquity);
+    // TRA-233 — keep both env buckets equity-aligned so a later switch into
+    // live picks up the same starting balance regardless of which Tradier env
+    // the user lands on.
+    for (const acct of this.allOptionsAccounts()) acct.applyEquity(targetEquity);
     if (this.tracker) {
       this.tracker.setInitialEquity(targetEquity);
       const accountState = this.account.getState();
@@ -290,11 +328,16 @@ export class SignalEngine {
       managedAccountRatio: settings.managedAccountRatio,
       riskPerTrade: settings.riskPerTrade,
     });
-    this.optionsAccount.reset({
-      initialEquity: equity,
-      managedAccountRatio: settings.managedAccountRatio,
-      optionsDailyTradesLimit: settings.optionsDailyTradesLimit,
-    });
+    // TRA-233 — wipe both env buckets so "Reset Demo Account" leaves no stale
+    // sandbox/production positions or P&L behind regardless of which env the
+    // user is currently viewing.
+    for (const acct of this.allOptionsAccounts()) {
+      acct.reset({
+        initialEquity: equity,
+        managedAccountRatio: settings.managedAccountRatio,
+        optionsDailyTradesLimit: settings.optionsDailyTradesLimit,
+      });
+    }
     this.allClosedPositions = [];
     this.recentSignals = [];
     this.dailySignals = [];
@@ -819,7 +862,15 @@ export class SignalEngine {
   }
 
   manualCloseOption(optionId: string): import('@trading-app/shared').OptionPosition | null {
-    const closed = this.optionsAccount.closeOption(optionId);
+    // TRA-233 — the UI sends the position id without an env hint. Look it up
+    // across both env buckets so a user reviewing "Open Positions" while
+    // toggled to one env can still close a position that lives in the other
+    // bucket (e.g. left over from before an env switch).
+    let closed: import('@trading-app/shared').OptionPosition | null = null;
+    for (const acct of this.allOptionsAccounts()) {
+      closed = acct.closeOption(optionId);
+      if (closed) break;
+    }
     if (closed) {
       this.tracker?.saveEquity(
         this.account.getState().totalEquity,
@@ -897,7 +948,14 @@ export class SignalEngine {
     dailySignals: DailySignalRecord[];
     positionSignalType: Array<[string, SignalType]>;
     account: ReturnType<PaperAccount['exportSnapshot']>;
+    /**
+     * Snapshot of the active env's options bucket. Kept for back-compat with
+     * persisted snapshots written before TRA-233 — current readers should
+     * prefer `optionsByEnv` so both sandbox and production survive a restart.
+     */
     options: ReturnType<PaperOptionsAccount['exportSnapshot']>;
+    /** TRA-233 — per-env options snapshots (sandbox + production). */
+    optionsByEnv: Record<TradierEnv, ReturnType<PaperOptionsAccount['exportSnapshot']>>;
   } {
     return {
       closedPositions: [...this.allClosedPositions],
@@ -906,17 +964,35 @@ export class SignalEngine {
       positionSignalType: Array.from(this.positionSignalType.entries()),
       account: this.account.exportSnapshot(),
       options: this.optionsAccount.exportSnapshot(),
+      optionsByEnv: {
+        sandbox: this.optionsAccounts.sandbox.exportSnapshot(),
+        production: this.optionsAccounts.production.exportSnapshot(),
+      },
     };
   }
 
-  /** Restore trade history + accounts from durable storage (TRA-140). */
-  importTradeSnapshot(snap: ReturnType<SignalEngine['exportTradeSnapshot']>): void {
+  /**
+   * Restore trade history + accounts from durable storage (TRA-140).
+   *
+   * `optionsByEnv` is optional so legacy snapshots written before TRA-233
+   * (which only have the single `options` blob) still load — they get routed
+   * to the env tag stored on the bucket if any, else the engine's active env.
+   */
+  importTradeSnapshot(snap: Omit<ReturnType<SignalEngine['exportTradeSnapshot']>, 'optionsByEnv'> & {
+    optionsByEnv?: Record<TradierEnv, ReturnType<PaperOptionsAccount['exportSnapshot']>>;
+  }): void {
     this.allClosedPositions = [...snap.closedPositions];
     this.recentSignals = [...snap.recentSignals];
     this.dailySignals = [...snap.dailySignals];
     this.positionSignalType = new Map(snap.positionSignalType);
     this.account.importSnapshot(snap.account);
-    this.optionsAccount.importSnapshot(snap.options);
+    if (snap.optionsByEnv) {
+      this.optionsAccounts.sandbox.importSnapshot(snap.optionsByEnv.sandbox);
+      this.optionsAccounts.production.importSnapshot(snap.optionsByEnv.production);
+    } else if (snap.options) {
+      const legacyEnv = (snap.options as { tradierEnv?: TradierEnv | null }).tradierEnv ?? this.tradierEnv;
+      this.optionsAccounts[legacyEnv].importSnapshot(snap.options);
+    }
   }
 
   getEquitySnapshot() {
@@ -963,7 +1039,11 @@ export class SignalEngine {
     const closedIds = new Set(this.allClosedPositions.map(p => p.id));
     this.allClosedPositions = [];
     for (const id of closedIds) this.positionSignalType.delete(id);
-    const options = this.optionsAccount.archiveClosedOptions();
+    // TRA-233 — clear closed options across both env buckets so the next
+    // session opens with a blank "Recent Closed Options" view regardless of
+    // which Tradier env the user is on at archive time.
+    let options = 0;
+    for (const acct of this.allOptionsAccounts()) options += acct.archiveClosedOptions();
     return { positions, options };
   }
 }

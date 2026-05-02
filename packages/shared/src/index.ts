@@ -506,6 +506,14 @@ export interface OptionPosition {
   pnl?: number;
   signalId: string;
   signalType: SignalType;
+  /**
+   * TRA-233 — Tradier environment the position was opened against. Set when
+   * the engine routed the open to Tradier so the dashboard / Open Positions
+   * view can segregate sandbox vs production state when the user flips
+   * `liveTradierEnvOptions`. Optional for backwards compat with snapshots
+   * persisted before this field existed; absent ↔ legacy sandbox bucket.
+   */
+  tradierEnv?: TradierEnv;
 }
 
 export interface OptionsAccountState {

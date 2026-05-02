@@ -197,6 +197,19 @@ async function createUserContext(username: string): Promise<UserContext> {
   try {
     const stocksSnap = await loadStocksTradeSnapshot(username);
     if (stocksSnap) {
+      const today = new Date().toISOString().slice(0, 10);
+      const fallbackBucket = (b: typeof stocksSnap.options | undefined) => ({
+        openOptions: b?.openOptions ?? [],
+        closedOptions: b?.closedOptions ?? [],
+        optionsPnl: b?.optionsPnl ?? 0,
+        dailyCount: b?.dailyCount ?? 0,
+        dailyOtmCount: b?.dailyOtmCount ?? 0,
+        dailyRvCount: b?.dailyRvCount ?? 0,
+        currentDayKey: b?.currentDayKey ?? today,
+        cash: b?.cash ?? stocksSnap.account.cash,
+        equity: b?.equity ?? stocksSnap.account.equity,
+        tradierEnv: b?.tradierEnv,
+      });
       engine.importTradeSnapshot({
         closedPositions: stocksSnap.closedPositions ?? [],
         recentSignals: stocksSnap.recentSignals ?? [],
@@ -209,15 +222,18 @@ async function createUserContext(username: string): Promise<UserContext> {
           dailyPnl: stocksSnap.account.dailyPnl,
           openPositions: stocksSnap.openPositions ?? [],
         },
-        options: {
-          openOptions: stocksSnap.options.openOptions ?? [],
-          closedOptions: stocksSnap.options.closedOptions ?? [],
-          optionsPnl: stocksSnap.options.optionsPnl ?? 0,
-          dailyCount: stocksSnap.options.dailyCount ?? 0,
-          currentDayKey: stocksSnap.options.currentDayKey ?? new Date().toISOString().slice(0, 10),
-          cash: stocksSnap.options.cash ?? stocksSnap.account.cash,
-          equity: stocksSnap.options.equity ?? stocksSnap.account.equity,
-        },
+        // TRA-233 — `options` stays for back-compat (legacy single-bucket
+        // snapshots route through it). New snapshots include `optionsByEnv`
+        // so both Tradier envs survive a restart.
+        options: fallbackBucket(stocksSnap.options),
+        ...(stocksSnap.optionsByEnv
+          ? {
+            optionsByEnv: {
+              sandbox: fallbackBucket(stocksSnap.optionsByEnv.sandbox),
+              production: fallbackBucket(stocksSnap.optionsByEnv.production),
+            },
+          }
+          : {}),
       });
       console.log(`[user-context:${username}] Restored stocks trade history: ${stocksSnap.openPositions?.length ?? 0} open, ${stocksSnap.closedPositions?.length ?? 0} closed.`);
     }
@@ -342,6 +358,10 @@ export async function persistStocksNow(ctx: UserContext): Promise<void> {
       dailySignals: snap.dailySignals,
       positionSignalType: snap.positionSignalType,
       options: snap.options,
+      // TRA-233 — persist both Tradier env buckets so a restart restores
+      // sandbox and production state independently. The legacy single
+      // `options` field remains so older readers can still parse the file.
+      optionsByEnv: snap.optionsByEnv,
       account: {
         cash: snap.account.cash,
         equity: snap.account.equity,

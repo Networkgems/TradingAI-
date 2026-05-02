@@ -7,6 +7,7 @@ import type {
   OtmRiskParams,
   RelativeValueSignal,
   RvRiskParams,
+  TradierEnv,
 } from '@trading-app/shared';
 import {
   DEFAULT_ACCOUNT_SETTINGS,
@@ -31,6 +32,14 @@ function toDateKey(ts: number): string {
 interface OptionsAccountConfig {
   initialEquity?: number;
   managedAccountRatio?: number;
+  /**
+   * TRA-233 — Tradier env this paper account belongs to. Stamped onto every
+   * opened position so the dashboard / Open Positions view can segregate
+   * sandbox vs production state when the user flips `liveTradierEnvOptions`.
+   * Optional so existing tests / call sites that don't care about env still
+   * compile; absent ↔ legacy sandbox bucket.
+   */
+  tradierEnv?: TradierEnv;
   /**
    * Max options entries per day across ALL sources — ATM, OTM, and RV
    * combined (TRA-195). Replaces the previously hardcoded `OPTIONS_DAILY_LIMIT`
@@ -83,6 +92,7 @@ export class PaperOptionsAccount {
   /** TRA-191 — relative-value scanner tickets, counted into the total. */
   private dailyRvCount = 0;
   private rvRiskParams: RvRiskParams;
+  private tradierEnv: TradierEnv | null;
   private currentDayKey = toDateKey(Date.now());
 
   constructor(config: OptionsAccountConfig = {}) {
@@ -91,8 +101,14 @@ export class PaperOptionsAccount {
     this.optionsDailyTradesLimit = config.optionsDailyTradesLimit ?? DEFAULT_ACCOUNT_SETTINGS.optionsDailyTradesLimit;
     this.otmRiskParams = config.otmRiskParams ?? OTM_RISK_PARAMS;
     this.rvRiskParams = config.rvRiskParams ?? RV_RISK_PARAMS;
+    this.tradierEnv = config.tradierEnv ?? null;
     this.equity = this.initialEquity;
     this.cash = this.initialEquity;
+  }
+
+  /** TRA-233 — env this paper account stamps onto opened positions. */
+  getTradierEnv(): TradierEnv | null {
+    return this.tradierEnv;
   }
 
   reset(config: OptionsAccountConfig = {}): void {
@@ -101,6 +117,7 @@ export class PaperOptionsAccount {
     if (config.optionsDailyTradesLimit !== undefined) this.optionsDailyTradesLimit = config.optionsDailyTradesLimit;
     if (config.otmRiskParams !== undefined) this.otmRiskParams = config.otmRiskParams;
     if (config.rvRiskParams !== undefined) this.rvRiskParams = config.rvRiskParams;
+    if (config.tradierEnv !== undefined) this.tradierEnv = config.tradierEnv;
     this.equity = this.initialEquity;
     this.cash = this.initialEquity;
     this.openOptions.clear();
@@ -246,6 +263,7 @@ export class PaperOptionsAccount {
       openedAt: Date.now(),
       signalId: signal.id,
       signalType: 'otm_mispricing',
+      ...(this.tradierEnv ? { tradierEnv: this.tradierEnv } : {}),
     };
 
     this.openOptions.set(position.id, position);
@@ -314,6 +332,7 @@ export class PaperOptionsAccount {
       openedAt: Date.now(),
       signalId: signal.id,
       signalType: 'relative_value',
+      ...(this.tradierEnv ? { tradierEnv: this.tradierEnv } : {}),
     };
 
     this.openOptions.set(position.id, position);
@@ -372,6 +391,7 @@ export class PaperOptionsAccount {
       openedAt: Date.now(),
       signalId: signal.id,
       signalType: signal.type,
+      ...(this.tradierEnv ? { tradierEnv: this.tradierEnv } : {}),
     };
 
     this.openOptions.set(position.id, position);
@@ -541,6 +561,8 @@ export class PaperOptionsAccount {
     currentDayKey: string;
     cash: number;
     equity: number;
+    /** TRA-233 — env this snapshot belongs to (null for the demo bucket). */
+    tradierEnv?: TradierEnv | null;
   } {
     return {
       openOptions: Array.from(this.openOptions.values()),
@@ -552,6 +574,7 @@ export class PaperOptionsAccount {
       currentDayKey: this.currentDayKey,
       cash: this.cash,
       equity: this.equity,
+      tradierEnv: this.tradierEnv,
     };
   }
 

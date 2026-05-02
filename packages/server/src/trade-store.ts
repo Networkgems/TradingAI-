@@ -3,7 +3,7 @@ import { existsSync } from 'fs';
 import { constants as FS } from 'fs';
 import { join, dirname } from 'path';
 import { fileURLToPath } from 'url';
-import type { Position, TradeSignal, OptionPosition, SignalType } from '@trading-app/shared';
+import type { Position, TradeSignal, OptionPosition, SignalType, TradierEnv } from '@trading-app/shared';
 import type { DailySignalRecord } from './reports/eod-report.js';
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -33,6 +33,27 @@ function cryptoTradesFile(username: string): string {
   return join(userDir(username), 'trades-crypto.json');
 }
 
+/**
+ * TRA-233 — single env's options bucket as serialized to disk. Existed
+ * inline before; pulled out so the per-env snapshot map can reuse the same
+ * shape.
+ */
+export interface OptionsBucketSnapshot {
+  openOptions: OptionPosition[];
+  closedOptions: OptionPosition[];
+  optionsPnl: number;
+  dailyCount: number;
+  /** Added in TRA-160 — older snapshots may be missing it. */
+  dailyOtmCount?: number;
+  /** Added in TRA-191 — older snapshots may be missing it. */
+  dailyRvCount?: number;
+  currentDayKey: string;
+  cash: number;
+  equity: number;
+  /** TRA-233 — env this bucket belongs to. */
+  tradierEnv?: TradierEnv | null;
+}
+
 export interface StocksTradeSnapshot {
   version: 1;
   savedAt: string;
@@ -41,15 +62,14 @@ export interface StocksTradeSnapshot {
   recentSignals: TradeSignal[];
   dailySignals: DailySignalRecord[];
   positionSignalType: Array<[string, SignalType]>; // serialized Map
-  options: {
-    openOptions: OptionPosition[];
-    closedOptions: OptionPosition[];
-    optionsPnl: number;
-    dailyCount: number;
-    currentDayKey: string;
-    cash: number;
-    equity: number;
-  };
+  /**
+   * Active env's options bucket. Kept for back-compat with snapshots written
+   * before TRA-233 — current readers should prefer `optionsByEnv` so both
+   * sandbox and production survive a server restart.
+   */
+  options: OptionsBucketSnapshot;
+  /** TRA-233 — per-env options buckets (sandbox + production). */
+  optionsByEnv?: Record<TradierEnv, OptionsBucketSnapshot>;
   account: {
     cash: number;
     equity: number;
