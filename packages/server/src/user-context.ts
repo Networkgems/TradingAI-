@@ -254,9 +254,11 @@ async function createUserContext(username: string): Promise<UserContext> {
   for (const sym of savedStocks.hidden) engine.removeSymbol(sym);
   for (const sym of savedStocks.added) engine.addSymbol(sym);
 
-  // Restore auto-trading state
-  engine.setAutoTrading(settings.stocksAutoTradingEnabled ?? true);
-  cryptoEngine.setAutoTrading(settings.cryptoAutoTradingEnabled ?? true);
+  // Restore auto-trading state — TRA-229 split per dashboard × per mode.
+  engine.setAutoTrading(settings.stocksAutoTradingEnabledDemo ?? true, 'demo');
+  engine.setAutoTrading(settings.stocksAutoTradingEnabledLive ?? true, 'live');
+  cryptoEngine.setAutoTrading(settings.cryptoAutoTradingEnabledDemo ?? true, 'demo');
+  cryptoEngine.setAutoTrading(settings.cryptoAutoTradingEnabledLive ?? true, 'live');
 
   const ctx: UserContext = {
     username,

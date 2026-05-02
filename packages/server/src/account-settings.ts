@@ -25,6 +25,35 @@ const cache: Map<string, AccountSettings> = new Map();
 // Webull form on the Stocks tab. Route the legacy values to the correct
 // per-market field based on `liveBrokerageType`, then clear them so the leak
 // is impossible.
+// TRA-229 — pre-split installs stored a single auto-trading flag per market
+// (`stocksAutoTradingEnabled`, `cryptoAutoTradingEnabled`) that applied to both
+// demo and live. After the per-mode split each market has independent demo/live
+// flags. Copy the legacy value into BOTH new fields once so users keep their
+// previous on/off state, then clear the legacy field.
+export function migrateLegacyAutoTradingFlags(input: AccountSettings): {
+  settings: AccountSettings;
+  migrated: boolean;
+} {
+  const hasLegacyStocks = typeof input.stocksAutoTradingEnabled === 'boolean';
+  const hasLegacyCrypto = typeof input.cryptoAutoTradingEnabled === 'boolean';
+  if (!hasLegacyStocks && !hasLegacyCrypto) return { settings: input, migrated: false };
+
+  const next: AccountSettings = { ...input };
+  if (hasLegacyStocks) {
+    const v = input.stocksAutoTradingEnabled ?? true;
+    if (typeof next.stocksAutoTradingEnabledDemo !== 'boolean') next.stocksAutoTradingEnabledDemo = v;
+    if (typeof next.stocksAutoTradingEnabledLive !== 'boolean') next.stocksAutoTradingEnabledLive = v;
+    delete next.stocksAutoTradingEnabled;
+  }
+  if (hasLegacyCrypto) {
+    const v = input.cryptoAutoTradingEnabled ?? true;
+    if (typeof next.cryptoAutoTradingEnabledDemo !== 'boolean') next.cryptoAutoTradingEnabledDemo = v;
+    if (typeof next.cryptoAutoTradingEnabledLive !== 'boolean') next.cryptoAutoTradingEnabledLive = v;
+    delete next.cryptoAutoTradingEnabled;
+  }
+  return { settings: next, migrated: true };
+}
+
 export function migrateLegacyLiveCredentials(input: AccountSettings): {
   settings: AccountSettings;
   migrated: boolean;
@@ -74,14 +103,18 @@ export async function loadSettings(username: string): Promise<AccountSettings> {
   try {
     const raw = await readFile(file, 'utf-8');
     const merged = { ...DEFAULT_ACCOUNT_SETTINGS, ...JSON.parse(raw) } as AccountSettings;
-    const { settings, migrated } = migrateLegacyLiveCredentials(merged);
+    const credsResult = migrateLegacyLiveCredentials(merged);
+    const flagsResult = migrateLegacyAutoTradingFlags(credsResult.settings);
+    const settings = flagsResult.settings;
+    const migrated = credsResult.migrated || flagsResult.migrated;
     if (migrated) {
       try {
         await persistMigrated(username, settings);
-        console.log(`[migration TRA-165] cleared legacy live creds for ${username}`);
+        if (credsResult.migrated) console.log(`[migration TRA-165] cleared legacy live creds for ${username}`);
+        if (flagsResult.migrated) console.log(`[migration TRA-229] split auto-trading flags by mode for ${username}`);
       } catch (err: unknown) {
         console.warn(
-          `[migration TRA-165] failed to persist migrated settings for ${username}: ${
+          `[migration] failed to persist migrated settings for ${username}: ${
             err instanceof Error ? err.message : String(err)
           }`,
         );

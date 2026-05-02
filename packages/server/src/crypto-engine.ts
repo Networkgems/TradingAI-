@@ -66,7 +66,10 @@ export class CryptoSignalEngine {
   private tickTimer: ReturnType<typeof setInterval> | null = null;
   private tickRunning = false;
   private handlers: CryptoEngineEventHandler[] = [];
-  private autoTradingEnabled = true;
+  // TRA-229 — per-mode auto-trading flags. The active flag (consulted on each
+  // tick and surfaced in getState()) is whichever one matches `this.mode`.
+  private autoTradingEnabledDemo = true;
+  private autoTradingEnabledLive = true;
   private mode: 'demo' | 'live' = 'demo';
   /** Live broker (Coinbase) — initialised when live mode is active and creds are configured. */
   private liveAccount: CryptoLiveAccount | null = null;
@@ -176,6 +179,10 @@ export class CryptoSignalEngine {
   async applySettings(settings: AccountSettings): Promise<void> {
     this.currentSettings = settings;
     this.mode = settings.mode === 'live' ? 'live' : 'demo';
+    // Re-read both per-mode flags so a settings PUT (which may include the
+    // start/stop UI state for either mode) keeps the engine in sync.
+    this.autoTradingEnabledDemo = settings.cryptoAutoTradingEnabledDemo ?? true;
+    this.autoTradingEnabledLive = settings.cryptoAutoTradingEnabledLive ?? true;
     if (this.mode === 'live') {
       // Live mode: leave the demo account/tracker untouched so the demo state
       // is preserved for a later switch back. Re-initialise the live broker so
@@ -380,7 +387,7 @@ export class CryptoSignalEngine {
       );
     }
 
-    if (this.autoTradingEnabled) {
+    if (this.isAutoTradingEnabled()) {
       let symbolsEvaluated = 0;
       let symbolsSkipped = 0;
       for (const sym of activeSymbols) {
@@ -471,7 +478,7 @@ export class CryptoSignalEngine {
       console.warn('[crypto-engine] live exits error:', err instanceof Error ? err.message : String(err));
     }
 
-    if (!this.autoTradingEnabled) return;
+    if (!this.isAutoTradingEnabled()) return;
 
     // Refresh candle caches so live mode evaluates strategies on fresh bars.
     const CANDLE_BATCH = 5;
@@ -568,7 +575,7 @@ export class CryptoSignalEngine {
           closedPositions: [...this.allClosedPositions].slice(-20),
           news: [...this.newsCache],
           lastTick: Date.now(),
-          autoTradingEnabled: this.autoTradingEnabled,
+          autoTradingEnabled: this.isAutoTradingEnabled(),
           marketOpen: true as const,
         };
       }
@@ -589,7 +596,7 @@ export class CryptoSignalEngine {
         closedPositions: [],
         news: [...this.newsCache],
         lastTick: Date.now(),
-        autoTradingEnabled: this.autoTradingEnabled,
+        autoTradingEnabled: this.isAutoTradingEnabled(),
         marketOpen: true as const,
       };
     }
@@ -610,13 +617,24 @@ export class CryptoSignalEngine {
       closedPositions: [...this.allClosedPositions].slice(-20),
       news: [...this.newsCache],
       lastTick: Date.now(),
-      autoTradingEnabled: this.autoTradingEnabled,
+      autoTradingEnabled: this.isAutoTradingEnabled(),
       marketOpen: true as const,
     };
   }
 
-  setAutoTrading(enabled: boolean): void {
-    this.autoTradingEnabled = enabled;
+  /**
+   * Toggle auto-trading. When `mode` is omitted the engine's current mode is
+   * updated; pass an explicit mode to update the inactive-mode preference
+   * (e.g. so the live-trading flag persists while the user is on demo).
+   */
+  setAutoTrading(enabled: boolean, mode?: 'demo' | 'live'): void {
+    const target = mode ?? this.mode;
+    if (target === 'live') this.autoTradingEnabledLive = enabled;
+    else this.autoTradingEnabledDemo = enabled;
+  }
+
+  isAutoTradingEnabled(): boolean {
+    return this.mode === 'live' ? this.autoTradingEnabledLive : this.autoTradingEnabledDemo;
   }
 
   manualClosePosition(positionId: string, currentPrice: number): Position | null {

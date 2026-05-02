@@ -186,9 +186,19 @@ export interface AccountSettings {
   optionsDailyTradesLimit: number;
   managedAccountRatio: number;
   riskPerTrade: number;
-  // Auto-trading persistence — survives server restarts
-  stocksAutoTradingEnabled: boolean;
-  cryptoAutoTradingEnabled: boolean;
+  // Auto-trading persistence — survives server restarts. Split per dashboard
+  // (stocks vs crypto) AND per account mode (demo vs live) so a user can stop
+  // demo trading while leaving live trading running, or vice versa (TRA-229).
+  // Legacy un-suffixed fields remain as a read-time fallback during migration;
+  // new writes always land on the per-mode fields below.
+  stocksAutoTradingEnabledDemo: boolean;
+  stocksAutoTradingEnabledLive: boolean;
+  cryptoAutoTradingEnabledDemo: boolean;
+  cryptoAutoTradingEnabledLive: boolean;
+  /** @deprecated TRA-229 — superseded by stocksAutoTradingEnabled{Demo,Live}. */
+  stocksAutoTradingEnabled?: boolean;
+  /** @deprecated TRA-229 — superseded by cryptoAutoTradingEnabled{Demo,Live}. */
+  cryptoAutoTradingEnabled?: boolean;
   // Live mode settings — legacy un-suffixed fields. Kept as a read-time
   // fallback so existing saved settings still surface in the UI; new writes
   // land on the per-market fields below so Coinbase (crypto) and Webull
@@ -246,8 +256,10 @@ export const DEFAULT_ACCOUNT_SETTINGS: AccountSettings = {
   optionsDailyTradesLimit: 10,
   managedAccountRatio: 0.5,
   riskPerTrade: 0.01,
-  stocksAutoTradingEnabled: true,
-  cryptoAutoTradingEnabled: true,
+  stocksAutoTradingEnabledDemo: true,
+  stocksAutoTradingEnabledLive: true,
+  cryptoAutoTradingEnabledDemo: true,
+  cryptoAutoTradingEnabledLive: true,
   liveBrokerageType: 'webull',
   liveTradeMode: 'ai_in_brokerage',
   liveApiKey: '',

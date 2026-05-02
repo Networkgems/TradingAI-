@@ -923,22 +923,52 @@ app.post('/api/account/reset-demo', requireAuth, async (req, res) => {
 
 // ── Trading controls ──────────────────────────────────────────────────────────
 
-app.post('/api/trading/start', requireAuth, async (_req, res) => {
+// TRA-229 — start/stop are scoped to the dashboard's current account mode
+// (demo or live) so a user can run live trading while leaving demo paused, or
+// vice versa. The mode is taken from saved settings; clients can also pass an
+// explicit `{ "mode": "demo" | "live" }` body to set the inactive-mode flag
+// without switching modes.
+function resolveTradingMode(
+  body: unknown,
+  current: 'demo' | 'live',
+): 'demo' | 'live' {
+  const requested = (body as { mode?: unknown } | undefined)?.mode;
+  if (requested === 'demo' || requested === 'live') return requested;
+  return current;
+}
+
+app.post('/api/trading/start', requireAuth, async (req, res) => {
   const username = res.locals['authUser'] as string;
   const ctx = await userCtx(res);
-  ctx.engine.setAutoTrading(true);
-  await saveSettings(username, { ...getSettings(username), stocksAutoTradingEnabled: true });
+  const settings = getSettings(username);
+  const mode = resolveTradingMode(req.body, settings.mode);
+  ctx.engine.setAutoTrading(true, mode);
+  const updated: AccountSettings = {
+    ...settings,
+    ...(mode === 'live'
+      ? { stocksAutoTradingEnabledLive: true }
+      : { stocksAutoTradingEnabledDemo: true }),
+  };
+  await saveSettings(username, updated);
   broadcastEngineState(ctx);
-  res.json({ ok: true, autoTradingEnabled: true });
+  res.json({ ok: true, mode, autoTradingEnabled: true });
 });
 
-app.post('/api/trading/stop', requireAuth, async (_req, res) => {
+app.post('/api/trading/stop', requireAuth, async (req, res) => {
   const username = res.locals['authUser'] as string;
   const ctx = await userCtx(res);
-  ctx.engine.setAutoTrading(false);
-  await saveSettings(username, { ...getSettings(username), stocksAutoTradingEnabled: false });
+  const settings = getSettings(username);
+  const mode = resolveTradingMode(req.body, settings.mode);
+  ctx.engine.setAutoTrading(false, mode);
+  const updated: AccountSettings = {
+    ...settings,
+    ...(mode === 'live'
+      ? { stocksAutoTradingEnabledLive: false }
+      : { stocksAutoTradingEnabledDemo: false }),
+  };
+  await saveSettings(username, updated);
   broadcastEngineState(ctx);
-  res.json({ ok: true, autoTradingEnabled: false });
+  res.json({ ok: true, mode, autoTradingEnabled: false });
 });
 
 app.post('/api/positions/:id/close', requireAuth, async (req, res) => {
@@ -1201,22 +1231,38 @@ app.post('/api/options/tradier/test-connection', requireAuth, async (_req, res) 
   }
 });
 
-app.post('/api/crypto/trading/start', requireAuth, async (_req, res) => {
+app.post('/api/crypto/trading/start', requireAuth, async (req, res) => {
   const username = res.locals['authUser'] as string;
   const ctx = await userCtx(res);
-  ctx.cryptoEngine.setAutoTrading(true);
-  await saveSettings(username, { ...getSettings(username), cryptoAutoTradingEnabled: true });
+  const settings = getSettings(username);
+  const mode = resolveTradingMode(req.body, settings.mode);
+  ctx.cryptoEngine.setAutoTrading(true, mode);
+  const updated: AccountSettings = {
+    ...settings,
+    ...(mode === 'live'
+      ? { cryptoAutoTradingEnabledLive: true }
+      : { cryptoAutoTradingEnabledDemo: true }),
+  };
+  await saveSettings(username, updated);
   broadcastCryptoState(ctx);
-  res.json({ ok: true, autoTradingEnabled: true });
+  res.json({ ok: true, mode, autoTradingEnabled: true });
 });
 
-app.post('/api/crypto/trading/stop', requireAuth, async (_req, res) => {
+app.post('/api/crypto/trading/stop', requireAuth, async (req, res) => {
   const username = res.locals['authUser'] as string;
   const ctx = await userCtx(res);
-  ctx.cryptoEngine.setAutoTrading(false);
-  await saveSettings(username, { ...getSettings(username), cryptoAutoTradingEnabled: false });
+  const settings = getSettings(username);
+  const mode = resolveTradingMode(req.body, settings.mode);
+  ctx.cryptoEngine.setAutoTrading(false, mode);
+  const updated: AccountSettings = {
+    ...settings,
+    ...(mode === 'live'
+      ? { cryptoAutoTradingEnabledLive: false }
+      : { cryptoAutoTradingEnabledDemo: false }),
+  };
+  await saveSettings(username, updated);
   broadcastCryptoState(ctx);
-  res.json({ ok: true, autoTradingEnabled: false });
+  res.json({ ok: true, mode, autoTradingEnabled: false });
 });
 
 // ── Watchlist management ──────────────────────────────────────────────────────

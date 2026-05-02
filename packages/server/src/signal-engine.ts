@@ -150,7 +150,10 @@ export class SignalEngine {
   private tickTimer: ReturnType<typeof setInterval> | null = null;
   private tickRunning = false;
   private handlers: EngineEventHandler[] = [];
-  private autoTradingEnabled = true;
+  // TRA-229 — per-mode auto-trading flags. The active flag (consulted on each
+  // tick and surfaced in getState()) is whichever one matches `this.mode`.
+  private autoTradingEnabledDemo = true;
+  private autoTradingEnabledLive = true;
   private mode: 'demo' | 'live' = 'demo';
   /**
    * TRA-221 — Tradier live options client. Built from per-options
@@ -214,6 +217,10 @@ export class SignalEngine {
    */
   async applySettings(settings: AccountSettings): Promise<void> {
     this.mode = settings.mode === 'live' ? 'live' : 'demo';
+    // Re-read both per-mode flags so a settings PUT (which may include the
+    // start/stop UI state for either mode) keeps the engine in sync.
+    this.autoTradingEnabledDemo = settings.stocksAutoTradingEnabledDemo ?? true;
+    this.autoTradingEnabledLive = settings.stocksAutoTradingEnabledLive ?? true;
     this.account.updateConfig({
       managedAccountRatio: settings.managedAccountRatio,
       riskPerTrade: settings.riskPerTrade,
@@ -483,7 +490,8 @@ export class SignalEngine {
     // If auto trading is disabled or daily risk circuit-breaker is active, skip new entries.
     // TRA-220: stock entries only fire in demo mode — live mode trades options only
     // until a live equity broker (Webull) is wired up.
-    if (this.mode === 'demo' && this.autoTradingEnabled && !this.riskGovernor.isHalted()) {
+    // TRA-229: isAutoTradingEnabled() resolves the per-mode flag.
+    if (this.mode === 'demo' && this.isAutoTradingEnabled() && !this.riskGovernor.isHalted()) {
       let symbolsWithData = 0;
       // Run strategies and collect new signals
       for (const sym of activeSymbols) {
@@ -547,7 +555,8 @@ export class SignalEngine {
     // into the options account as a long premium ticket. Gated to market
     // hours so we don't burn the Tradier rate-limit on after-hours noise.
     // TRA-220: only runs in live mode — options are not traded in demo.
-    if (this.mode === 'live' && this.autoTradingEnabled && !this.riskGovernor.isHalted() && this.rvScanner && isStockMarketOpen()) {
+    // TRA-229: isAutoTradingEnabled() resolves the per-mode flag.
+    if (this.mode === 'live' && this.isAutoTradingEnabled() && !this.riskGovernor.isHalted() && this.rvScanner && isStockMarketOpen()) {
       if (Date.now() - this.lastRvScanAt >= RV_SCAN_INTERVAL_MS) {
         this.lastRvScanAt = Date.now();
         await this.runRelativeValueScan(activeSymbols);
@@ -737,8 +746,19 @@ export class SignalEngine {
     this.symbolState.delete(symbol);
   }
 
-  setAutoTrading(enabled: boolean): void {
-    this.autoTradingEnabled = enabled;
+  /**
+   * Toggle auto-trading. When `mode` is omitted the engine's current mode is
+   * updated; pass an explicit mode to update the inactive-mode preference
+   * (e.g. so the live-trading flag persists while the user is on demo).
+   */
+  setAutoTrading(enabled: boolean, mode?: 'demo' | 'live'): void {
+    const target = mode ?? this.mode;
+    if (target === 'live') this.autoTradingEnabledLive = enabled;
+    else this.autoTradingEnabledDemo = enabled;
+  }
+
+  isAutoTradingEnabled(): boolean {
+    return this.mode === 'live' ? this.autoTradingEnabledLive : this.autoTradingEnabledDemo;
   }
 
   manualClosePosition(positionId: string, currentPrice: number): Position | null {
@@ -795,7 +815,7 @@ export class SignalEngine {
         lastTick: Date.now(),
         tradingHalted: this.riskGovernor.isHalted(),
         haltReason: this.riskGovernor.getHaltReason(),
-        autoTradingEnabled: this.autoTradingEnabled,
+        autoTradingEnabled: this.isAutoTradingEnabled(),
         marketOpen: isStockMarketOpen(),
       };
     }
@@ -808,7 +828,7 @@ export class SignalEngine {
       lastTick: Date.now(),
       tradingHalted: this.riskGovernor.isHalted(),
       haltReason: this.riskGovernor.getHaltReason(),
-      autoTradingEnabled: this.autoTradingEnabled,
+      autoTradingEnabled: this.isAutoTradingEnabled(),
       marketOpen: isStockMarketOpen(),
     };
   }
