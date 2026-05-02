@@ -310,7 +310,12 @@ async function createUserContext(username: string): Promise<UserContext> {
     const cryptoSnap = await loadCryptoTradeSnapshot(username);
     if (cryptoSnap) {
       cryptoEngine.importTradeSnapshot({
+        // TRA-242 — prefer the split lists; fall back to the pre-TRA-242
+        // merged `closedPositions` (treated as demo, since live history is
+        // broker-owned and was effectively unavailable before this fix).
         closedPositions: cryptoSnap.closedPositions ?? [],
+        demoClosedPositions: cryptoSnap.demoClosedPositions,
+        liveClosedPositions: cryptoSnap.liveClosedPositions,
         recentSignals: cryptoSnap.recentSignals ?? [],
         account: {
           cash: cryptoSnap.account.cash,
@@ -320,7 +325,9 @@ async function createUserContext(username: string): Promise<UserContext> {
           openPositions: cryptoSnap.openPositions ?? [],
         },
       });
-      console.log(`[user-context:${username}] Restored crypto trade history: ${cryptoSnap.openPositions?.length ?? 0} open, ${cryptoSnap.closedPositions?.length ?? 0} closed.`);
+      const demoCount = cryptoSnap.demoClosedPositions?.length ?? cryptoSnap.closedPositions?.length ?? 0;
+      const liveCount = cryptoSnap.liveClosedPositions?.length ?? 0;
+      console.log(`[user-context:${username}] Restored crypto trade history: ${cryptoSnap.openPositions?.length ?? 0} open, ${demoCount} demo closed, ${liveCount} live closed.`);
     }
   } catch (err: unknown) {
     console.warn(`[user-context:${username}] Failed to restore crypto history: ${err instanceof Error ? err.message : String(err)}`);
@@ -446,7 +453,12 @@ export async function persistCryptoNow(ctx: UserContext): Promise<void> {
       version: 1,
       savedAt: new Date().toISOString(),
       openPositions: snap.account.openPositions,
-      closedPositions: snap.closedPositions,
+      // TRA-242 — keep the legacy `closedPositions` field populated with
+      // the demo list so old readers see the same view they always have,
+      // and persist the split lists alongside it for the new UI separation.
+      closedPositions: snap.demoClosedPositions,
+      demoClosedPositions: snap.demoClosedPositions,
+      liveClosedPositions: snap.liveClosedPositions,
       recentSignals: snap.recentSignals,
       account: {
         cash: snap.account.cash,

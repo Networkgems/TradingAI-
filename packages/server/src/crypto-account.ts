@@ -44,6 +44,15 @@ export class CryptoPaperAccount {
   }
 
   /**
+   * TRA-241 — re-anchor the daily-P&L baseline to current equity. Called from
+   * the engine at the 9 PM ET daily close so `dailyPnl` shows 0 for the new
+   * trading day. Open positions and equity are untouched.
+   */
+  resetDay(): void {
+    this.openingEquityToday = this.equity;
+  }
+
+  /**
    * Rebase starting equity by the delta, preserving open positions and today's
    * P&L (the openingEquityToday baseline shifts by the same delta so dailyPnl
    * stays the same).

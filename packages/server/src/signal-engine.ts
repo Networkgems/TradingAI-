@@ -317,6 +317,20 @@ export class SignalEngine {
   }
 
   /**
+   * TRA-241 — re-anchor the daily-P&L baseline at the 9 PM ET daily close so
+   * the dashboard shows 0 for the new trading day. Open positions and total
+   * equity are untouched. The persisted `openingEquity` in the tracker is
+   * realigned in lock-step so a server restart after the reset doesn't
+   * synthesize phantom dailyPnl.
+   */
+  resetDailyPnl(): void {
+    this.account.resetDay();
+    if (this.tracker) {
+      this.tracker.syncOpeningEquity(this.account.getState().totalEquity, 0);
+    }
+  }
+
+  /**
    * Explicit full reset — clears positions, signals, and dailyPnl, and resets
    * equity to the configured starting balance (NOT the persisted equity).
    * This is what "Reset Demo Account" should do: wipe everything and start fresh.

@@ -82,7 +82,24 @@ export interface CryptoTradeSnapshot {
   version: 1;
   savedAt: string;
   openPositions: Position[];
+  /**
+   * Pre-TRA-242 merged closed list. Always equal to `demoClosedPositions`
+   * on fresh saves so older callers / pre-split backups round-trip safely.
+   * New code should consume the split lists below.
+   */
   closedPositions: Position[];
+  /**
+   * TRA-242 — Demo (paper) closed positions only. Persisted separately
+   * from the live broker history so the Live dashboard never surfaces
+   * Demo trades.
+   */
+  demoClosedPositions?: Position[];
+  /**
+   * TRA-242 — Live closed positions mirrored from the Coinbase broker
+   * view. Optional because pre-TRA-242 snapshots don't have it; the engine
+   * treats absence as "no live history yet".
+   */
+  liveClosedPositions?: Position[];
   recentSignals: TradeSignal[];
   account: {
     cash: number;

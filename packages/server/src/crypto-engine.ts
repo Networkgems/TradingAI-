@@ -63,7 +63,11 @@ export class CryptoSignalEngine {
   private candleCache: Map<string, Candle[]> = new Map();
   private dailyCandleCache: Map<string, Candle[]> = new Map();
   private recentSignals: TradeSignal[] = [];
-  private allClosedPositions: Position[] = [];
+  // TRA-242 — split closed-positions history by account mode so the Live
+  // dashboard never surfaces Demo trades and vice versa. Before this fix the
+  // single shared list mixed both accounts' trade activity in `buildState`.
+  private demoClosedPositions: Position[] = [];
+  private liveClosedPositions: Position[] = [];
   private newsCache: NewsItem[] = [];
   private lastNewsRefresh = 0;
 
@@ -247,7 +251,9 @@ export class CryptoSignalEngine {
     const equity = initialEquity ?? this.account.getInitialEquity();
     this.account.reset(equity);
     this.recentSignals = [];
-    this.allClosedPositions = [];
+    // TRA-242 — "Reset Demo Account" only clears the Demo trade history; the
+    // Live broker mirror is independent and gets its history from Coinbase.
+    this.demoClosedPositions = [];
     if (this.tracker) {
       this.tracker.setInitialEquity(equity);
       this.tracker.saveEquity(equity, 0);
@@ -417,7 +423,7 @@ export class CryptoSignalEngine {
 
     const closed = this.account.checkExits(prices);
     if (closed.length > 0) {
-      this.allClosedPositions.push(...closed);
+      this.demoClosedPositions.push(...closed);
       this.tracker?.saveEquity(this.account.getEquity(), 0);
     }
 
@@ -517,7 +523,9 @@ export class CryptoSignalEngine {
     try {
       const closed = await live.checkExits(prices);
       if (closed.length > 0) {
-        this.allClosedPositions.push(...closed);
+        // TRA-242 — Live exits go on the Live history list so the Live
+        // dashboard surfaces only Coinbase fills, not Demo paper trades.
+        this.liveClosedPositions.push(...closed);
       }
     } catch (err: unknown) {
       console.warn('[crypto-engine] live exits error:', err instanceof Error ? err.message : String(err));
@@ -639,7 +647,9 @@ export class CryptoSignalEngine {
           symbols,
           signals: [...this.recentSignals],
           account,
-          closedPositions: [...this.allClosedPositions].slice(-20),
+          // TRA-242 — Live dashboard reads only Live closed positions; the
+          // Demo history stays in `demoClosedPositions` for a later switch back.
+          closedPositions: [...this.liveClosedPositions].slice(-20),
           news: [...this.newsCache],
           lastTick: Date.now(),
           autoTradingEnabled: this.isAutoTradingEnabled(),
@@ -681,7 +691,8 @@ export class CryptoSignalEngine {
       symbols,
       signals: [...this.recentSignals],
       account,
-      closedPositions: [...this.allClosedPositions].slice(-20),
+      // TRA-242 — Demo dashboard reads only Demo closed positions.
+      closedPositions: [...this.demoClosedPositions].slice(-20),
       news: [...this.newsCache],
       lastTick: Date.now(),
       autoTradingEnabled: this.isAutoTradingEnabled(),
@@ -711,7 +722,8 @@ export class CryptoSignalEngine {
       // failures are surfaced via console + persist into the next tick view.
       const live = this.liveAccount;
       void live.closePosition(positionId, currentPrice).then(closed => {
-        if (closed) this.allClosedPositions.push(closed);
+        // TRA-242 — manual closes from Live route to the Live history list.
+        if (closed) this.liveClosedPositions.push(closed);
       }).catch(err => {
         console.warn(`[crypto-engine] manualClose live failed: ${err instanceof Error ? err.message : String(err)}`);
       });
@@ -721,7 +733,8 @@ export class CryptoSignalEngine {
     }
     const closed = this.account.closePosition(positionId, currentPrice);
     if (closed) {
-      this.allClosedPositions.push(closed);
+      // TRA-242 — manual closes from Demo route to the Demo history list.
+      this.demoClosedPositions.push(closed);
       this.tracker?.saveEquity(this.account.getEquity(), 0);
     }
     return closed;
@@ -736,29 +749,57 @@ export class CryptoSignalEngine {
   }
 
   getReportSnapshot() {
+    // TRA-242 — EOD reports run against the Demo book (Live history is
+    // owned by Coinbase, not by this engine). Pre-split this returned the
+    // merged list, which mixed Live trades into the EOD report on days the
+    // user toggled to live and back.
     return {
-      allClosedPositions: [...this.allClosedPositions],
+      allClosedPositions: [...this.demoClosedPositions],
       accountState: this.account.getState(),
       symbols: Array.from(this.symbolState.values()),
     };
   }
 
-  /** Snapshot trade history + account for durable storage (TRA-140). */
+  /**
+   * Snapshot trade history + account for durable storage (TRA-140).
+   * TRA-242 — persists Demo and Live closed-position lists separately so
+   * the dashboard separation survives a server restart. The legacy
+   * `closedPositions` field stays on the type for callers that haven't
+   * moved yet (and for snapshot rotation backups), but it always equals
+   * the Demo list — Live history is broker-owned.
+   */
   exportTradeSnapshot(): {
     closedPositions: Position[];
+    demoClosedPositions: Position[];
+    liveClosedPositions: Position[];
     recentSignals: TradeSignal[];
     account: ReturnType<CryptoPaperAccount['exportSnapshot']>;
   } {
     return {
-      closedPositions: [...this.allClosedPositions],
+      closedPositions: [...this.demoClosedPositions],
+      demoClosedPositions: [...this.demoClosedPositions],
+      liveClosedPositions: [...this.liveClosedPositions],
       recentSignals: [...this.recentSignals],
       account: this.account.exportSnapshot(),
     };
   }
 
-  /** Restore trade history + account from durable storage (TRA-140). */
-  importTradeSnapshot(snap: ReturnType<CryptoSignalEngine['exportTradeSnapshot']>): void {
-    this.allClosedPositions = [...snap.closedPositions];
+  /**
+   * Restore trade history + account from durable storage (TRA-140).
+   * TRA-242 — accepts both the new split lists and pre-split snapshots;
+   * the latter are treated as Demo-only since Live history is broker-owned.
+   */
+  importTradeSnapshot(snap: {
+    closedPositions?: Position[];
+    demoClosedPositions?: Position[];
+    liveClosedPositions?: Position[];
+    recentSignals: TradeSignal[];
+    account: ReturnType<CryptoPaperAccount['exportSnapshot']>;
+  }): void {
+    this.demoClosedPositions = [
+      ...(snap.demoClosedPositions ?? snap.closedPositions ?? []),
+    ];
+    this.liveClosedPositions = [...(snap.liveClosedPositions ?? [])];
     this.recentSignals = [...snap.recentSignals];
     this.account.importSnapshot(snap.account);
   }
@@ -770,8 +811,26 @@ export class CryptoSignalEngine {
    * closed trades for the Calendar tab.
    */
   archiveClosedTrades(): number {
-    const dropped = this.allClosedPositions.length;
-    this.allClosedPositions = [];
+    // TRA-242 — clear both Demo and Live so neither dashboard carries
+    // yesterday's trades into the new session.
+    const dropped = this.demoClosedPositions.length + this.liveClosedPositions.length;
+    this.demoClosedPositions = [];
+    this.liveClosedPositions = [];
     return dropped;
+  }
+
+  /**
+   * TRA-241 — re-anchor the daily-P&L baseline at the 9 PM ET daily close so
+   * the dashboard shows 0 for the new trading day. Both the demo paper account
+   * and the Coinbase live account roll their own baseline, and the persisted
+   * tracker openingEquity is realigned in lock-step so a server restart after
+   * the reset doesn't synthesize phantom dailyPnl.
+   */
+  resetDailyPnl(): void {
+    this.account.resetDay();
+    this.liveAccount?.rolloverDay();
+    if (this.tracker) {
+      this.tracker.syncOpeningEquity(this.account.getState().totalEquity, 0);
+    }
   }
 }

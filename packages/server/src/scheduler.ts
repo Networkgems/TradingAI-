@@ -70,6 +70,10 @@ export interface ScheduleCallbacks {
    * "Recent Closed" trade history so the Positions/Options pages start each
    * new session clean; the EOD reports already saved to disk preserve the
    * trades for the Calendar tab's per-date view.
+   *
+   * TRA-241 — also drives the dashboard's daily-P&L reset (see
+   * `runDailyCloseForAllUsers` in index.ts) so the new trading day starts at 0
+   * and the day's row lands in the Calendar at the same moment.
    */
   onArchive?: EodTriggerCallback;
 }

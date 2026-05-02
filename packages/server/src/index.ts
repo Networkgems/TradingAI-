@@ -283,20 +283,30 @@ async function generateAllUserCryptoEodReports(): Promise<void> {
   }
 }
 
-// TRA-219 — daily 9 PM ET archive of the in-memory closed-trade lists. After
-// the archive runs, the Positions/Options pages show no rows under "Recent
-// Closed" until new trades close; the per-day reports persisted to disk feed
-// the Calendar tab's date-detail view so historical fills stay queryable.
+// TRA-219 + TRA-241 — daily 9 PM ET close-out for every user. Order is load-
+// bearing:
+//   1. Reset the in-memory `dailyPnl` baseline on both engines so the next
+//      tick broadcasts a fresh 0 for the new trading day. The persisted
+//      tracker.openingEquity is realigned in lock-step.
+//   2. Archive the rolling "Recent Closed" lists so the Positions/Options
+//      tabs start the next session blank.
+//   3. Persist + broadcast so connected clients see the reset immediately.
+// The 4:05 PM EOD reports continue to feed the Calendar tab via
+// `generateAllUserEodReports` / `generateAllUserCryptoEodReports`.
 async function archiveAllUserClosedTrades(): Promise<void> {
   for (const ctx of getAllUserContexts()) {
     try {
+      // TRA-241 — reset dashboard daily-P&L baselines for the new trading day.
+      ctx.engine.resetDailyPnl();
+      ctx.cryptoEngine.resetDailyPnl();
+
       const stocks = ctx.engine.archiveClosedTrades();
       const crypto = ctx.cryptoEngine.archiveClosedTrades();
       await Promise.all([persistStocksNow(ctx), persistCryptoNow(ctx)]);
       broadcastEngineState(ctx);
       broadcastCryptoState(ctx);
       console.log(
-        `[archive:${ctx.username}] archived ${stocks.positions} closed positions, ${stocks.options} closed options, ${crypto} closed crypto positions`,
+        `[archive:${ctx.username}] reset dailyPnl, archived ${stocks.positions} closed positions, ${stocks.options} closed options, ${crypto} closed crypto positions`,
       );
     } catch (err) {
       console.error(`[archive:${ctx.username}] archive failed:`, err);
