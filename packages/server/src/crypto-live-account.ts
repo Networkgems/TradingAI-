@@ -1,4 +1,4 @@
-import type { Position, TradeSignal, SignalType } from '@trading-app/shared';
+import type { LiveSkip, Position, TradeSignal, SignalType } from '@trading-app/shared';
 import { DEFAULT_ACCOUNT_SETTINGS } from '@trading-app/shared';
 import type {
   CoinbaseOrderClient,
@@ -88,11 +88,26 @@ const FILL_POLL_DELAYS_MS = [0, 200, 400, 800, 1500, 2000];
 
 const TERMINAL_FAILURE_STATUSES = new Set(['CANCELLED', 'EXPIRED', 'FAILED']);
 
+/**
+ * TRA-249-B — cap on the in-memory `LiveSkip` ring buffer. 50 entries is
+ * enough to span a few minutes of strategy ticks across the watchlist (worst
+ * case: every signal skips for a transient reason like cash cap) so the
+ * dashboard can render a meaningful "last skips" panel without leaking
+ * unbounded memory on a long-running server.
+ */
+const RECENT_SKIPS_CAP = 50;
+
 export interface CryptoLiveAccountState {
   totalEquity: number;
   availableCash: number;
   openPositions: Position[];
   dailyPnl: number;
+  /**
+   * TRA-249-B — most recent 50 live-broker skip events, oldest first. See
+   * `LiveSkip` in `@trading-app/shared`. Surfaced via the engine state so
+   * operators can diagnose silent skips without mining server logs.
+   */
+  recentSkips: LiveSkip[];
 }
 
 export interface CryptoLiveAccountOptions {
@@ -152,6 +167,15 @@ export class CryptoLiveAccount {
    */
   private tradableProducts: Map<string, CoinbaseProductInfo> | null = null;
   private lastTradableProductsRefresh = 0;
+  /**
+   * TRA-249-B — ring buffer of the most recent 50 live-broker skip events,
+   * oldest first. Pushed to by `recordSkip` (every early-return path in
+   * `openPosition`); read by `getState` so the engine can surface them to
+   * the dashboard. Plain array + shift-when-full is fine at cap=50 — the
+   * O(n) shift cost is dwarfed by the order-placement work that did NOT
+   * happen on the skip path.
+   */
+  private recentSkips: LiveSkip[] = [];
   // TRA-232 — risk knobs come from per-user AccountSettings instead of the
   // hardcoded MANAGED_ACCOUNT_RATIO / DEFAULT_RISK_PER_TRADE constants. The
   // engine pushes fresh values via updateRiskConfig on every settings save so
@@ -239,7 +263,45 @@ export class CryptoLiveAccount {
       availableCash: this.cashUsd,
       openPositions: Array.from(this.positions.values()),
       dailyPnl: this.realizedPnlToday,
+      // Defensive copy so a caller mutating the array (e.g. the engine
+      // re-stamping `mode` on positions) can't corrupt the ring buffer.
+      recentSkips: this.recentSkips.slice(),
     };
+  }
+
+  /**
+   * TRA-249-B — record a structured skip event and stamp the originating
+   * signal so the dashboard's existing per-signal skip-reason channel still
+   * lights up. Three things happen on every skip:
+   *
+   *   1. `signal.liveSkipReason = reason` — the per-signal annotation the
+   *      Signals panel reads (TRA-243).
+   *   2. push onto the recent-skips ring buffer (cap 50, oldest dropped) —
+   *      the aggregate channel surfaced via `getState`.
+   *   3. `console.warn(...)` — keeps the server log line a human operator
+   *      grepping logs has relied on since TRA-243.
+   *
+   * Centralising these three writes here keeps the call sites in
+   * `openPosition` to a single line and guarantees they don't drift.
+   */
+  private recordSkip(signal: TradeSignal, reason: string): null {
+    signal.liveSkipReason = reason;
+    this.recentSkips.push({
+      symbol: signal.symbol,
+      side: signal.side,
+      reason,
+      at: Date.now(),
+    });
+    if (this.recentSkips.length > RECENT_SKIPS_CAP) {
+      this.recentSkips.splice(0, this.recentSkips.length - RECENT_SKIPS_CAP);
+    }
+    console.warn(`[crypto-live] skip ${signal.symbol} ${signal.type} ${signal.side}: ${reason}`);
+    return null;
+  }
+
+  /** TRA-249-B — defensive snapshot of the recent-skips ring buffer. */
+  getRecentSkips(): LiveSkip[] {
+    return this.recentSkips.slice();
   }
 
   isStale(): boolean {
@@ -304,26 +366,24 @@ export class CryptoLiveAccount {
   /**
    * Submit a market order to Coinbase and, on success, record the resulting
    * position locally. Returns null if the trade was skipped before order
-   * submission (qty too small, insufficient cash, short signal on spot).
-   * Throws if Coinbase rejects.
+   * submission (qty too small, insufficient cash, spot-only SELL). Throws if
+   * Coinbase rejects.
    *
-   * TRA-243 — every skip path stamps `signal.liveSkipReason` so the dashboard
-   * Signals panel can surface why a signal didn't open a position. Without
-   * this, skips were `console.warn`-only and operators saw "8 signals, 0
-   * positions" with no way to self-diagnose.
+   * TRA-243 / TRA-249-B — every skip path stamps `signal.liveSkipReason` AND
+   * pushes a structured `LiveSkip` onto the recent-skips ring buffer (via
+   * `recordSkip`). Without this, skips were `console.warn`-only and operators
+   * saw "8 signals, 0 positions" with no way to self-diagnose.
    */
   async openPosition(signal: TradeSignal, currentPrice: number): Promise<Position | null> {
-    // TRA-243 — Coinbase Advanced Trade is a SPOT venue: there is no concept
-    // of "opening a short" — a sell-side strategy signal doesn't translate to
-    // an executable position. Closes happen via checkExits (TP/SL), not via
-    // sell signals from strategies. Strategies (Reversal/MACD/BbFade/
-    // MeanReversion) emit short-bias signals freely though, so surface a
-    // clear reason instead of a silent log-only skip.
+    // TRA-249-B — Coinbase Advanced Trade is a SPOT venue: a sell-side
+    // strategy signal can't open a short. Closes happen via `checkExits`
+    // (TP/SL), not via SELLs from strategies. Critically, sending a SELL
+    // here would partially fill against the user's pre-existing BTC/ETH —
+    // the same balance now valued in equity (TRA-224) — silently nibbling
+    // at user holdings. Pre-perp this is the entire SELL path; once C lands
+    // it becomes the fallback for symbols not in the perp catalog.
     if (signal.side === 'sell') {
-      const reason = 'spot account cannot open shorts (Coinbase Advanced Trade is spot-only)';
-      signal.liveSkipReason = reason;
-      console.warn(`[crypto-live] skip ${signal.symbol} ${signal.type}: ${reason}`);
-      return null;
+      return this.recordSkip(signal, `spot only — no perp listed for ${signal.symbol}`);
     }
 
     // TRA-243 — refuse to fire orders against tickers Coinbase doesn't list
@@ -336,18 +396,30 @@ export class CryptoLiveAccount {
     // the existing cash/min-notional gate so a /products outage doesn't
     // freeze trading entirely.
     if (this.tradableProducts && !this.tradableProducts.has(signal.symbol)) {
-      const reason = `${signal.symbol} not listed on Coinbase Advanced Trade — likely delisted or renamed (e.g. MATIC→POL); remove it from the watchlist`;
-      signal.liveSkipReason = reason;
-      console.warn(`[crypto-live] skip ${signal.symbol} ${signal.type}: ${reason}`);
-      return null;
+      return this.recordSkip(
+        signal,
+        `${signal.symbol} not listed on Coinbase Advanced Trade — likely delisted or renamed (e.g. MATIC→POL); remove it from the watchlist`,
+      );
     }
 
+    // TRA-249-B — explicit guard for managed-equity-too-small BEFORE sizing.
+    // `sizeFromStop` derives qty from `maxRiskPerTrade() = managedEquity() ×
+    // riskPerTrade`, so a zero-equity or zero-ratio account would otherwise
+    // trip the qty<=0 path with a generic "qty too small" reason — checking
+    // here gives the user the actually-actionable diagnosis (fund the
+    // account / raise managedAccountRatio).
+    if (this.managedEquity() <= 0) {
+      return this.recordSkip(
+        signal,
+        `managed equity too small (equity=${this.equityUsd.toFixed(2)}, managedRatio=${this.managedAccountRatio})`,
+      );
+    }
     let qty = this.sizeFromStop(signal.entryPrice, signal.stopLoss);
     if (qty <= 0) {
-      const reason = `entry==stop, no risk-derived size (entry=${signal.entryPrice} stop=${signal.stopLoss})`;
-      signal.liveSkipReason = reason;
-      console.warn(`[crypto-live] skip ${signal.symbol} ${signal.type}: ${reason} (maxRisk=${this.maxRiskPerTrade().toFixed(2)})`);
-      return null;
+      return this.recordSkip(
+        signal,
+        `qty too small after sizing (entry=${signal.entryPrice} stop=${signal.stopLoss}, maxRisk=${this.maxRiskPerTrade().toFixed(2)})`,
+      );
     }
     // Cap by managed equity: never spend more than the user has authorised
     // the engine to trade with (managedAccountRatio × total equity).
@@ -371,17 +443,17 @@ export class CryptoLiveAccount {
       ? quantizeBaseSize(qty, productInfo.baseIncrement)
       : Math.round(qty * 1_000_000) / 1_000_000;
     if (qty <= 0) {
-      const reason = `no spendable cash (USD=${this.cashUsd.toFixed(2)}, managedEquity=${this.managedEquity().toFixed(2)} — fund the Coinbase USD wallet or sell crypto holdings to free cash)`;
-      signal.liveSkipReason = reason;
-      console.warn(`[crypto-live] skip ${signal.symbol} ${signal.type}: ${reason} price=${currentPrice}`);
-      return null;
+      return this.recordSkip(
+        signal,
+        `no spendable cash (USD=${this.cashUsd.toFixed(2)}, managedEquity=${this.managedEquity().toFixed(2)} — fund the Coinbase USD wallet or sell crypto holdings to free cash)`,
+      );
     }
     const cost = currentPrice * qty;
     if (cost < MIN_NOTIONAL_USD) {
-      const reason = `cost $${cost.toFixed(2)} below Coinbase $${MIN_NOTIONAL_USD} minimum (USD=${this.cashUsd.toFixed(2)}, maxRisk=${this.maxRiskPerTrade().toFixed(2)})`;
-      signal.liveSkipReason = reason;
-      console.warn(`[crypto-live] skip ${signal.symbol} ${signal.type}: ${reason}`);
-      return null;
+      return this.recordSkip(
+        signal,
+        `cost $${cost.toFixed(2)} below Coinbase $${MIN_NOTIONAL_USD} minimum (USD=${this.cashUsd.toFixed(2)}, maxRisk=${this.maxRiskPerTrade().toFixed(2)})`,
+      );
     }
 
     let resp: CoinbaseOrderSuccessResponse;
@@ -395,9 +467,10 @@ export class CryptoLiveAccount {
       // TRA-243 — bubble the Coinbase rejection text onto the signal so the
       // user sees "Insufficient funds" / "Order size below minimum" in the
       // UI, not just in stderr. We still rethrow so the engine's existing
-      // catch path logs at warn level.
+      // catch path logs at warn level. Routed through recordSkip so the
+      // rejection lands in the aggregate skip channel too.
       const msg = err instanceof Error ? err.message : String(err);
-      signal.liveSkipReason = `Coinbase rejected order: ${msg}`;
+      this.recordSkip(signal, `Coinbase rejected order: ${msg}`);
       console.error(`[crypto-live] open failed for ${signal.symbol}: ${msg}`);
       throw err;
     }

@@ -661,6 +661,39 @@ export interface CryptoEngineState {
   autoTradingEnabled: boolean;
   /** Always true — crypto trades 24/7 */
   marketOpen: true;
+  /**
+   * TRA-249-B — recent live-broker skip events (most recent 50, newest last).
+   * Aggregate channel separate from per-`signal.liveSkipReason`: that one
+   * stamps the originating signal so the Signals panel can render an inline
+   * "not opened" tag, but a Coinbase outage / repeated cash-cap miss leaves
+   * no trace once those signals roll off the recent list. The aggregate
+   * preserves a structured timeline (symbol, side, reason, at) that survives
+   * signal turnover and gives operators a single place to diagnose silent
+   * skips. Populated only on the live branch — undefined on demo, where the
+   * paper account never skips for liquidity reasons.
+   *
+   * TODO(TRA-249-E): wire a dashboard surface for this aggregate. Until E
+   * lands the field flows through the API but is not yet rendered; the
+   * existing per-signal `liveSkipReason` channel keeps the user informed.
+   */
+  liveSkips?: LiveSkip[];
+}
+
+/**
+ * TRA-249-B — structured live-broker skip event. Recorded each time
+ * `CryptoLiveAccount.openPosition` declines to submit an order (qty too
+ * small, managed equity too small, cost > cash, spot-only SELL, etc.) so
+ * the dashboard can surface a timeline of why signals didn't translate to
+ * fills. This is the aggregate counterpart to `TradeSignal.liveSkipReason`,
+ * which annotates the originating signal in place. Pre-perp (TRA-249-C)
+ * the spot-only SELL branch is the entire SELL path; once C lands it
+ * becomes the fallback for symbols not in the perp catalog.
+ */
+export interface LiveSkip {
+  symbol: string;
+  side: Side;
+  reason: string;
+  at: number;
 }
 
 export interface MarketBar {

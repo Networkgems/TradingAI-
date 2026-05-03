@@ -381,11 +381,13 @@ describe('CryptoLiveAccount small-fund sizing (TRA-243)', () => {
 });
 
 describe('CryptoLiveAccount skip-reason annotation (TRA-243)', () => {
-  it('rejects sell-side signals with a spot-only reason', async () => {
-    // Sell-side strategy signals on Coinbase spot are not shortable. We must
-    // not fire them — Coinbase would reject for insufficient base balance,
-    // and the user sees a silent skip with no explanation. Annotate the
-    // signal so the dashboard surfaces "cannot open shorts" instead.
+  it('rejects sell-side signals with a spot-only reason (TRA-249-B)', async () => {
+    // Pre-perp, every sell-side strategy signal lands on a spot Coinbase
+    // account — and pre-TRA-249-B, the order client happily submitted a SELL
+    // that partially filled against the user's pre-existing BTC/ETH (silent
+    // nibble at user holdings now valued in equity per TRA-224). The guard
+    // must hold. Once TRA-249-C lands, this branch becomes the fallback for
+    // symbols not in the perp catalog; the wording reflects that.
     const { account, coinbase } = buyAccount(50_000);
     await account.refreshBalance();
 
@@ -394,7 +396,7 @@ describe('CryptoLiveAccount skip-reason annotation (TRA-243)', () => {
 
     expect(pos).toBeNull();
     expect(coinbase.placeMarketOrder).not.toHaveBeenCalled();
-    expect(signal.liveSkipReason).toMatch(/cannot open shorts/i);
+    expect(signal.liveSkipReason).toMatch(/spot only — no perp listed for BTC-USD/);
   });
 
   it('annotates the signal when no spendable cash is available', async () => {
@@ -455,6 +457,156 @@ describe('CryptoLiveAccount skip-reason annotation (TRA-243)', () => {
 
     expect(pos).not.toBeNull();
     expect(signal.liveSkipReason).toBeUndefined();
+  });
+});
+
+describe('CryptoLiveAccount structured LiveSkip channel (TRA-249-B)', () => {
+  it('emits a structured LiveSkip on the spot-only SELL guard and never reaches placeMarketOrder', async () => {
+    const { account, coinbase } = buyAccount(50_000);
+    await account.refreshBalance();
+
+    const signal = buildSignal({ side: 'sell', stopLoss: 30_300, takeProfit: 29_100 });
+    const before = Date.now();
+    const pos = await account.openPosition(signal, 30_000);
+
+    expect(pos).toBeNull();
+    expect(coinbase.placeMarketOrder).not.toHaveBeenCalled();
+    const skips = account.getRecentSkips();
+    expect(skips).toHaveLength(1);
+    expect(skips[0]).toMatchObject({
+      symbol: 'BTC-USD',
+      side: 'sell',
+      reason: 'spot only — no perp listed for BTC-USD',
+    });
+    expect(skips[0].at).toBeGreaterThanOrEqual(before);
+    // Aggregate channel surfaces via getState too, with a defensive copy.
+    expect(account.getState().recentSkips).toEqual(skips);
+    expect(account.getState().recentSkips).not.toBe(account.getRecentSkips());
+  });
+
+  it('still routes BUY signals to placeMarketOrder (regression — guard is SELL-only)', async () => {
+    const { account, coinbase } = buyAccount(50_000);
+    await account.refreshBalance();
+
+    coinbase.placeMarketOrder.mockResolvedValueOnce(orderSuccess('o-buy'));
+    coinbase.getOrder.mockResolvedValueOnce(
+      orderDetails({ order_id: 'o-buy', status: 'FILLED', average_filled_price: '30000', filled_size: '0.001' }),
+    );
+
+    const signal = buildSignal();
+    const pos = await account.openPosition(signal, 30_000);
+
+    expect(pos).not.toBeNull();
+    expect(coinbase.placeMarketOrder).toHaveBeenCalledTimes(1);
+    const calls = coinbase.placeMarketOrder.mock.calls as unknown as Array<[{ side: 'buy' | 'sell' }]>;
+    expect(calls[0]![0]).toMatchObject({ side: 'buy' });
+    // Successful open must not pollute the skip channel.
+    expect(account.getRecentSkips()).toHaveLength(0);
+    expect(signal.liveSkipReason).toBeUndefined();
+  });
+
+  it('emits "qty too small after sizing" when entry==stop produces zero risk-derived size', async () => {
+    const { account, coinbase } = buyAccount(50_000);
+    await account.refreshBalance();
+
+    // entry==stop → sizeFromStop returns 0 → "qty too small after sizing".
+    const signal = buildSignal({ entryPrice: 30_000, stopLoss: 30_000 });
+    const pos = await account.openPosition(signal, 30_000);
+
+    expect(pos).toBeNull();
+    expect(coinbase.placeMarketOrder).not.toHaveBeenCalled();
+    expect(signal.liveSkipReason).toMatch(/qty too small after sizing/);
+    const skips = account.getRecentSkips();
+    expect(skips).toHaveLength(1);
+    expect(skips[0]).toMatchObject({ symbol: 'BTC-USD', side: 'buy' });
+    expect(skips[0].reason).toMatch(/qty too small after sizing/);
+  });
+
+  it('emits "managed equity too small" when managedAccountRatio × equity collapses to zero', async () => {
+    // Zero-equity account but a non-zero stop distance — the qty<=0 sizing
+    // gate would trip first only if managedEquity is 0. Override risk knobs
+    // so managedEquity()=0 is the explicit reason rather than the cash-cap
+    // path's "no spendable cash".
+    const coinbase = new FakeCoinbaseClient();
+    coinbase.listAccounts.mockResolvedValue([]);
+    const account = new CryptoLiveAccount(asClient(coinbase), { sleep: async () => {} });
+    await account.refreshBalance();
+    account.updateRiskConfig({ managedAccountRatio: 0, riskPerTrade: 0.01 });
+
+    const signal = buildSignal();
+    const pos = await account.openPosition(signal, 30_000);
+
+    expect(pos).toBeNull();
+    expect(coinbase.placeMarketOrder).not.toHaveBeenCalled();
+    expect(signal.liveSkipReason).toMatch(/managed equity too small/);
+    const skips = account.getRecentSkips();
+    expect(skips).toHaveLength(1);
+    expect(skips[0].reason).toMatch(/managed equity too small/);
+  });
+
+  it('emits "no spendable cash" when cash-cap collapses qty to zero', async () => {
+    // Crypto-only equity → managedEquity > 0, but cashUsd = 0 → cash cap
+    // zeroes qty post-quantization → "no spendable cash". This is the
+    // post-TRA-243 form of the legacy "cost > cashUsd" skip.
+    const coinbase = new FakeCoinbaseClient();
+    coinbase.listAccounts.mockResolvedValue([
+      {
+        uuid: 'btc', name: 'BTC', currency: 'BTC',
+        available_balance: { value: '1', currency: 'BTC' },
+        hold: { value: '0', currency: 'BTC' },
+      },
+    ]);
+    coinbase.getProductPrices.mockResolvedValue(new Map([['BTC-USD', 30_000]]));
+    const account = new CryptoLiveAccount(asClient(coinbase), { sleep: async () => {} });
+    await account.refreshBalance();
+
+    const signal = buildSignal();
+    const pos = await account.openPosition(signal, 30_000);
+
+    expect(pos).toBeNull();
+    expect(coinbase.placeMarketOrder).not.toHaveBeenCalled();
+    expect(signal.liveSkipReason).toMatch(/no spendable cash/);
+    const skips = account.getRecentSkips();
+    expect(skips).toHaveLength(1);
+    expect(skips[0].reason).toMatch(/no spendable cash/);
+  });
+
+  it('caps the recent-skips ring buffer at 50 entries (oldest dropped)', async () => {
+    const { account, coinbase } = buyAccount(50_000);
+    await account.refreshBalance();
+
+    // 60 distinct sell signals — each emits a structured skip. After the
+    // 51st, the oldest must drop. We tag the symbol with an index so we can
+    // assert exactly which entries survived.
+    for (let i = 0; i < 60; i++) {
+      await account.openPosition(
+        buildSignal({ id: `sig-${i}`, symbol: `SYM${i}-USD`, side: 'sell', stopLoss: 30_300, takeProfit: 29_100 }),
+        30_000,
+      );
+    }
+    expect(coinbase.placeMarketOrder).not.toHaveBeenCalled();
+
+    const skips = account.getRecentSkips();
+    expect(skips).toHaveLength(50);
+    // Newest last — last entry is sig 59. Oldest is sig 10 (sig 0–9 dropped).
+    expect(skips[0].symbol).toBe('SYM10-USD');
+    expect(skips[skips.length - 1].symbol).toBe('SYM59-USD');
+  });
+
+  it('records the Coinbase rejection text on the aggregate skip channel and rethrows', async () => {
+    const { account, coinbase } = buyAccount(50_000);
+    await account.refreshBalance();
+    coinbase.placeMarketOrder.mockRejectedValueOnce(
+      new Error('Coinbase order rejected: INSUFFICIENT_FUND'),
+    );
+
+    const signal = buildSignal();
+    await expect(account.openPosition(signal, 30_000)).rejects.toThrow(/INSUFFICIENT_FUND/);
+    const skips = account.getRecentSkips();
+    expect(skips).toHaveLength(1);
+    expect(skips[0].reason).toMatch(/INSUFFICIENT_FUND/);
+    expect(skips[0].symbol).toBe('BTC-USD');
+    expect(skips[0].side).toBe('buy');
   });
 });
 

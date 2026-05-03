@@ -695,6 +695,10 @@ export class CryptoSignalEngine {
           lastTick: Date.now(),
           autoTradingEnabled: this.isAutoTradingEnabled(),
           marketOpen: true as const,
+          // TRA-249-B — surface the live broker's recent-skips ring buffer.
+          // `getRecentSkips` returns a defensive copy so consumers can't
+          // mutate the underlying buffer.
+          liveSkips: ls.recentSkips,
         };
       }
       const account: AccountState = {
