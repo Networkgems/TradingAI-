@@ -1,8 +1,16 @@
-import type { LiveSkip, Position, TradeSignal, SignalType } from '@trading-app/shared';
+import type {
+  LiveSkip,
+  LiveTradeRoutingCrypto,
+  Position,
+  SignalType,
+  TradeSignal,
+} from '@trading-app/shared';
 import { DEFAULT_ACCOUNT_SETTINGS } from '@trading-app/shared';
 import type {
   CoinbaseOrderClient,
   CoinbaseAccountBalance,
+  CoinbaseFuturesPosition,
+  CoinbaseListedProduct,
   CoinbaseOrderDetails,
   CoinbaseOrderSuccessResponse,
   CoinbaseProductInfo,
@@ -120,6 +128,130 @@ const TERMINAL_FAILURE_STATUSES = new Set(['CANCELLED', 'EXPIRED', 'FAILED']);
  */
 const RECENT_SKIPS_CAP = 50;
 
+/**
+ * TRA-249-C — perp-catalog refresh cadence. Coinbase listings/delistings on
+ * the INTX perp venue happen on day-or-longer timelines, so 1 hour is far
+ * faster than the venue actually changes; the budget is dominated by the
+ * single `/products?product_type=FUTURE` call. We refresh hourly rather than
+ * piggybacking on the spot 6h TTL so a newly-listed perp (e.g. a fresh
+ * altcoin perp launching mid-session) becomes routable within the hour
+ * without waiting on a server restart.
+ */
+const PERP_CATALOG_TTL_MS = 60 * 60_000;
+
+/**
+ * TRA-249-C — minimum gap between INTX perp-position reconciliations triggered
+ * from `refreshBalance`. 5 minutes is short enough to surface a position the
+ * user opened in the Coinbase UI within one strategy-tick cycle, and long
+ * enough that the every-30s balance refresh doesn't fan out into 2 extra
+ * Coinbase round-trips on every call. Resolving the INTX portfolio uuid is
+ * cached separately so the first hit is `listPortfolios` + `listFuturesPositions`
+ * and subsequent hits are `listFuturesPositions` only.
+ */
+const PERP_RECONCILE_TTL_MS = 5 * 60_000;
+
+/**
+ * TRA-249-C — derive the spot symbol's base currency. Coinbase products
+ * canonically use a `BASE-QUOTE` form (`BTC-USD`, `ETH-USDC`); Advanced Trade
+ * perp products are `BASE-PERP-INTX` (`BTC-PERP-INTX`). The first token
+ * before the first `-` is the base in both cases. Returns null on malformed
+ * input so callers can route to a "no perp listed" skip rather than crash.
+ */
+function baseCurrency(productId: string): string | null {
+  const idx = productId.indexOf('-');
+  if (idx <= 0) return null;
+  return productId.slice(0, idx).toUpperCase();
+}
+
+/**
+ * TRA-249-C — recognise the Advanced Trade perp form `{BASE}-PERP-INTX`.
+ * The `-PERP-` segment is the canonical marker on the Coinbase INTX venue;
+ * spot products never carry it. Anchored on `-PERP-` rather than the
+ * `-INTX` suffix so the catalog still picks up products if Coinbase ever
+ * adds a second perp suffix in the future.
+ */
+function isPerpProductId(productId: string): boolean {
+  return productId.includes('-PERP-');
+}
+
+/**
+ * TRA-249-C — spot↔perp routing catalog. Owns the periodic
+ * `listProducts('FUTURE')` refresh and exposes a flat
+ * `getPerpFor(spotSymbol)` lookup so the SELL routing fork can resolve the
+ * actual Coinbase INTX product_id (`BTC-PERP-INTX`) instead of submitting
+ * the spot symbol (`BTC-USD`) to the perp endpoint and eating a 400.
+ *
+ * Built as a sibling of the existing tradable-products cache (TRA-243)
+ * rather than fused with it on purpose: the spot cache enforces "is this
+ * watchlist symbol still tradable?" via the `getProducts(productIds)` query
+ * shape (silent drop for unknown ids), whereas the perp catalog needs the
+ * full FUTURE catalogue listing — different endpoints, different freshness
+ * needs (1h vs 6h), different failure modes.
+ *
+ * **Failure semantics:** a refresh that throws leaves the previous map and
+ * `ready` flag intact, so a transient `/products` outage downgrades us to
+ * "use stale catalog" rather than "spot-only forever". `isReady()` returns
+ * `false` until the first successful refresh — first-tick callers should
+ * treat the symbol as spot-only-skip if the catalog hasn't loaded yet.
+ */
+export class PerpCatalog {
+  private perpBySpot: Map<string, string> = new Map();
+  private ready = false;
+  private lastRefreshAt = 0;
+
+  /**
+   * Pull the live FUTURE product catalogue from Coinbase and rebuild the
+   * spot→perp map keyed by base currency. Inactive perps are already filtered
+   * by the order client's `listProducts` so the catalog never points the
+   * router at a halted product. Multiple perps on the same base are unlikely
+   * today; the first match wins so the map stays deterministic if Coinbase
+   * ever lists e.g. dated futures alongside the perpetual.
+   */
+  async refresh(coinbase: CoinbaseOrderClient, spotSymbols: readonly string[]): Promise<void> {
+    let products: CoinbaseListedProduct[];
+    try {
+      products = await coinbase.listProducts('FUTURE');
+    } catch (err: unknown) {
+      console.warn('[crypto-live] perp catalog refresh failed:', err instanceof Error ? err.message : String(err));
+      return;
+    }
+    const perpByBase = new Map<string, string>();
+    for (const p of products) {
+      if (!isPerpProductId(p.product_id)) continue;
+      const base = baseCurrency(p.product_id);
+      if (!base) continue;
+      if (!perpByBase.has(base)) perpByBase.set(base, p.product_id);
+    }
+    const next = new Map<string, string>();
+    for (const sym of spotSymbols) {
+      const base = baseCurrency(sym);
+      if (!base) continue;
+      const perp = perpByBase.get(base);
+      if (perp) next.set(sym, perp);
+    }
+    this.perpBySpot = next;
+    this.ready = true;
+    this.lastRefreshAt = Date.now();
+  }
+
+  getPerpFor(spotSymbol: string): string | null {
+    return this.perpBySpot.get(spotSymbol) ?? null;
+  }
+
+  isReady(): boolean {
+    return this.ready;
+  }
+
+  isStale(): boolean {
+    return !this.ready || Date.now() - this.lastRefreshAt > PERP_CATALOG_TTL_MS;
+  }
+
+  /** Defensive snapshot of the underlying spot→perp map. Tests + diagnostics. */
+  snapshot(): Map<string, string> {
+    return new Map(this.perpBySpot);
+  }
+}
+
 export interface CryptoLiveAccountState {
   totalEquity: number;
   availableCash: number;
@@ -136,6 +268,20 @@ export interface CryptoLiveAccountState {
 export interface CryptoLiveAccountOptions {
   /** Override sleep so tests can advance time without real timers. */
   sleep?: (ms: number) => Promise<void>;
+  /**
+   * TRA-249-C — initial routing mode for SELL-side strategy signals. Defaults
+   * to `'hybrid'`. The engine reapplies via {@link CryptoLiveAccount.setRoutingMode}
+   * on every settings save, so the field's only purpose here is to seed
+   * pre-init construction. Pass `'spot_only'` from tests to force the skip
+   * branch.
+   */
+  routingMode?: LiveTradeRoutingCrypto;
+  /**
+   * TRA-249-C — inject a custom perp catalog (handy for tests that want to
+   * pre-seed the spot→perp map without round-tripping through `listProducts`).
+   * Production callers leave this off and let the account own its own catalog.
+   */
+  perpCatalog?: PerpCatalog;
 }
 
 interface ReconciledFill {
@@ -220,10 +366,45 @@ export class CryptoLiveAccount {
   // the Crypto dashboard honors what the user enters in Settings.
   private managedAccountRatio: number = DEFAULT_ACCOUNT_SETTINGS.managedAccountRatio;
   private riskPerTrade: number = DEFAULT_ACCOUNT_SETTINGS.riskPerTrade;
+  /**
+   * TRA-249-C — routing mode for SELL-side strategy signals. `'hybrid'`
+   * routes to a listed Coinbase perp when one exists AND the strategy
+   * universe gate passes; `'spot_only'` forces the spot-only-skip branch
+   * even when both checks would otherwise route. Default `'hybrid'` matches
+   * {@link DEFAULT_ACCOUNT_SETTINGS.liveTradeRoutingCrypto} so an operator
+   * that pre-dates TRA-249-E (settings UI) gets perp routing without a
+   * settings save.
+   */
+  private routingMode: LiveTradeRoutingCrypto = 'hybrid';
+  /** TRA-249-C — spot↔perp catalog. Lazily refreshed by the engine; pre-load via {@link refreshPerpCatalog}. */
+  private readonly perpCatalog: PerpCatalog;
+  /**
+   * TRA-249-C — perp Coinbase product_id we routed each perp position
+   * through, keyed by `Position.id`. Kept out of the shared `Position` shape
+   * so the dashboard's per-position serializer stays Coinbase-agnostic;
+   * `checkExits` and `closePosition` look up the productId here when
+   * `productType === 'perp'` (and fall back to `pos.symbol` for legacy
+   * perp records that pre-date this map). Cleared on close.
+   */
+  private perpProductByPositionId: Map<string, string> = new Map();
+  /**
+   * TRA-249-C — cached uuid of the user's INTX (perpetuals) portfolio.
+   * Resolved lazily on the first reconcile via `listPortfolios('INTX')` and
+   * reused for subsequent `listFuturesPositions` calls so the every-30s
+   * balance refresh doesn't issue 2 round-trips per call. Reset to null on
+   * auth failure so a later refresh re-resolves; intentionally not
+   * invalidated by the catalog TTL because the portfolio uuid itself is
+   * stable for the life of the user.
+   */
+  private intxPortfolioUuid: string | null = null;
+  /** TRA-249-C — last successful reconcile against `listFuturesPositions`. Drives `PERP_RECONCILE_TTL_MS` rate-limit. */
+  private lastPerpReconcileAt = 0;
 
   constructor(coinbase: CoinbaseOrderClient, opts: CryptoLiveAccountOptions = {}) {
     this.coinbase = coinbase;
     this.sleep = opts.sleep ?? ((ms) => new Promise(r => setTimeout(r, ms)));
+    this.routingMode = opts.routingMode ?? 'hybrid';
+    this.perpCatalog = opts.perpCatalog ?? new PerpCatalog();
   }
 
   /**
@@ -293,6 +474,16 @@ export class CryptoLiveAccount {
     this.cashUsd = cash;
     this.equityUsd = cash + cryptoValue;
     this.lastBalanceRefresh = Date.now();
+
+    // TRA-249-C — opportunistic INTX position reconciliation so a perp the
+    // user opened in the Coinbase UI (or that survived a server restart) is
+    // surfaced in the local mirror without re-firing an open. Rate-limited so
+    // the every-30s balance refresh doesn't fan out into 2 extra round-trips
+    // per call. Failure is logged inside the helper and never poisons the
+    // balance refresh.
+    if (Date.now() - this.lastPerpReconcileAt > PERP_RECONCILE_TTL_MS) {
+      await this.reconcilePerpPositions();
+    }
   }
 
   getState(): CryptoLiveAccountState {
@@ -398,6 +589,158 @@ export class CryptoLiveAccount {
     return Date.now() - this.lastTradableProductsRefresh > TRADABLE_PRODUCTS_TTL_MS;
   }
 
+  /**
+   * TRA-249-C — refresh the spot↔perp routing catalog from Coinbase's live
+   * FUTURE product listing. Mirrors the spot {@link refreshTradableProducts}
+   * shape: best-effort, swallows the network error and keeps the previous
+   * map in place so a transient `/products` outage downgrades the router to
+   * "use stale catalog" rather than "spot-only forever".
+   *
+   * The engine pre-loads on init alongside `refreshTradableProducts` and
+   * refreshes hourly from `runLiveTick` via {@link isPerpCatalogStale}.
+   */
+  async refreshPerpCatalog(spotSymbols: readonly string[]): Promise<void> {
+    if (spotSymbols.length === 0) return;
+    await this.perpCatalog.refresh(this.coinbase, spotSymbols);
+  }
+
+  isPerpCatalogStale(): boolean {
+    return this.perpCatalog.isStale();
+  }
+
+  /** TRA-249-C — exposed for diagnostics + tests; the routing fork uses the catalog directly. */
+  getPerpCatalog(): PerpCatalog {
+    return this.perpCatalog;
+  }
+
+  /**
+   * TRA-249-C — switch the routing mode for SELL-side strategy signals. The
+   * engine calls this on every settings save so a user toggling
+   * `liveTradeRoutingCrypto` between `'hybrid'` and `'spot_only'` takes effect
+   * on the very next tick without a server restart. Idempotent.
+   */
+  setRoutingMode(mode: LiveTradeRoutingCrypto): void {
+    this.routingMode = mode;
+  }
+
+  getRoutingMode(): LiveTradeRoutingCrypto {
+    return this.routingMode;
+  }
+
+  /**
+   * TRA-249-C — merge any open INTX perp positions into the local mirror so a
+   * position the user opened in the Coinbase UI (or that survived a server
+   * restart) is visible to `checkExits` / `hasOpenPosition` instead of
+   * getting silently re-opened by the next strategy signal.
+   *
+   * Two-phase lookup:
+   *   1. Resolve the INTX portfolio uuid via `listPortfolios('INTX')` and
+   *      cache it. Coinbase splits a user's account across DEFAULT (spot) and
+   *      INTX (perps) portfolios; the positions endpoint is portfolio-scoped.
+   *   2. List the current open positions via `listFuturesPositions(uuid)` and
+   *      add anything we don't already track.
+   *
+   * Best-effort: a failure on either call is logged and skipped — we never
+   * want broken reconciliation to abort the host `refreshBalance`. A user
+   * without an INTX portfolio (no perps enabled) yields a no-op after the
+   * first `listPortfolios` call returns empty; the cached
+   * `intxPortfolioUuid` stays null and we keep retrying on the rate-limit
+   * cadence.
+   */
+  async reconcilePerpPositions(): Promise<void> {
+    const uuid = await this.resolveIntxPortfolioUuid();
+    if (!uuid) {
+      // No INTX portfolio (perps not enabled, or list call failed). Mark as
+      // "tried" so the rate-limit doesn't hammer Coinbase from every
+      // refreshBalance call.
+      this.lastPerpReconcileAt = Date.now();
+      return;
+    }
+    let openPerps: CoinbaseFuturesPosition[];
+    try {
+      openPerps = await this.coinbase.listFuturesPositions(uuid);
+    } catch (err: unknown) {
+      console.warn('[crypto-live] perp position reconcile failed:', err instanceof Error ? err.message : String(err));
+      return;
+    }
+    this.mergePerpPositions(openPerps);
+    this.lastPerpReconcileAt = Date.now();
+  }
+
+  private async resolveIntxPortfolioUuid(): Promise<string | null> {
+    if (this.intxPortfolioUuid) return this.intxPortfolioUuid;
+    try {
+      const portfolios = await this.coinbase.listPortfolios('INTX');
+      // Coinbase returns one INTX portfolio per user; the first non-deleted
+      // entry is the canonical one. listPortfolios already filters tombstones.
+      const intx = portfolios.find((p) => (p.type ?? '').toUpperCase() === 'INTX') ?? portfolios[0];
+      if (!intx) return null;
+      this.intxPortfolioUuid = intx.uuid;
+      return this.intxPortfolioUuid;
+    } catch (err: unknown) {
+      console.warn('[crypto-live] INTX portfolio lookup failed:', err instanceof Error ? err.message : String(err));
+      return null;
+    }
+  }
+
+  /**
+   * Merge a snapshot of Coinbase-reported perp positions into the local
+   * mirror. A position that we already track (matched by perp product_id) is
+   * left untouched — re-opening it would double-count notional and corrupt
+   * the local accounting. Anything new is added with `productType: 'perp'`
+   * and the spot symbol the perp routes for so the existing price-keyed
+   * `checkExits` path keeps working without special-casing.
+   *
+   * `signalType` and TP/SL are unknown for UI-opened positions: `'reversal'`
+   * stamps a benign default and sentinel TP/SL values keep `checkExits` from
+   * tripping. The user closes manually via the dashboard; the §6 notional
+   * caps in `openPerpShort` already factor open shorts into per-symbol /
+   * total caps via `sumOpenShortNotional`, so the reconciled position
+   * counts toward those caps automatically.
+   */
+  private mergePerpPositions(openPerps: readonly CoinbaseFuturesPosition[]): void {
+    const knownPerpIds = new Set(this.perpProductByPositionId.values());
+    for (const p of openPerps) {
+      if (knownPerpIds.has(p.product_id)) continue;
+      const size = parseFloat(p.net_size);
+      if (!Number.isFinite(size) || size <= 0) continue;
+      const base = baseCurrency(p.product_id);
+      if (!base) continue;
+      const spotSymbol = `${base}-USD`;
+      const entryPrice = parseFloat(p.vwap ?? p.mark_price ?? '0');
+      const leverageNum = parseFloat(p.leverage ?? String(PERP_SHORT_LEVERAGE));
+      const leverage = Number.isFinite(leverageNum) && leverageNum > 0 ? leverageNum : PERP_SHORT_LEVERAGE;
+      const liquidationPrice = parseFloat(p.liquidation_price ?? '0');
+      const side: 'buy' | 'sell' = p.position_side === 'LONG' ? 'buy' : 'sell';
+      const positionId = randomUUID();
+      const position: Position = {
+        id: positionId,
+        symbol: spotSymbol,
+        side,
+        signalType: 'reversal',
+        entryPrice,
+        quantity: size,
+        // UI-opened positions have no engine-defined TP/SL. Use ±Infinity
+        // sentinels so `checkExits` never trips them; manual close via the
+        // dashboard is the only exit path until the user takes ownership.
+        stopLoss: side === 'buy' ? 0 : Number.POSITIVE_INFINITY,
+        takeProfit: side === 'buy' ? Number.POSITIVE_INFINITY : 0,
+        openedAt: Date.now(),
+        productType: 'perp',
+        leverage,
+        marginUsd: Number.isFinite(entryPrice) && entryPrice > 0
+          ? (entryPrice * size) / leverage
+          : 0,
+        liquidationPrice: Number.isFinite(liquidationPrice) && liquidationPrice > 0 ? liquidationPrice : undefined,
+      };
+      this.positions.set(positionId, position);
+      this.perpProductByPositionId.set(positionId, p.product_id);
+      console.log(
+        `[crypto-live] reconcile imported perp ${p.product_id} ${p.position_side} size=${size} (no engine TP/SL — manual close only)`,
+      );
+    }
+  }
+
   managedEquity(): number {
     return this.equityUsd * this.managedAccountRatio;
   }
@@ -474,6 +817,15 @@ export class CryptoLiveAccount {
     // the TRA-249-B spot-only guard so a stray SELL on a non-perp watchlist
     // symbol can't nibble at the user's pre-existing spot holdings (TRA-224).
     if (signal.side === 'sell') {
+      // TRA-249-C — `'spot_only'` routing mode is the operator-facing safety
+      // hatch (Settings: liveTradeRoutingCrypto = 'spot_only'). Forces every
+      // SELL through the spot-only-skip branch even when the strategy
+      // universe gate would otherwise route to perp. Same skip wording as
+      // the universe-gate miss so the dashboard's per-signal reason format
+      // doesn't shift between the two modes.
+      if (this.routingMode === 'spot_only') {
+        return this.recordSkip(signal, `spot only — no perp listed for ${signal.symbol}`);
+      }
       if (!isPerpShortSymbol(signal.symbol)) {
         return this.recordSkip(signal, `spot only — no perp listed for ${signal.symbol}`);
       }
@@ -703,10 +1055,22 @@ export class CryptoLiveAccount {
       return this.recordStrategySkip(signal, capReason);
     }
 
+    // TRA-249-C — resolve the actual Coinbase INTX product_id (e.g.
+    // `BTC-PERP-INTX`) for this spot symbol via the perp catalog.
+    // Pre-TRA-249-C the order body submitted `signal.symbol` directly, which
+    // is the spot pair (`BTC-USD`) — Coinbase's perp endpoint would reject
+    // that with INVALID_ARGUMENT. The catalog is a no-op when not loaded
+    // (returns null) and we fall back to `signal.symbol` so existing tests
+    // that don't pre-load the catalog keep behaving as they did under
+    // TRA-264. In production the engine pre-loads the catalog at broker
+    // init alongside refreshTradableProducts so first-tick callers always
+    // see a populated map.
+    const perpProductId = this.perpCatalog.getPerpFor(signal.symbol) ?? signal.symbol;
+
     let resp: CoinbaseOrderSuccessResponse;
     try {
       resp = await this.coinbase.placeMarketOrder({
-        productId: signal.symbol,
+        productId: perpProductId,
         side: 'sell',
         baseSize: qty,
         leverage: PERP_SHORT_LEVERAGE,
@@ -720,12 +1084,18 @@ export class CryptoLiveAccount {
       throw err;
     }
 
-    const fill = await this.awaitFill(resp.order_id, signal.symbol);
+    const fill = await this.awaitFill(resp.order_id, perpProductId);
     const entryPrice = fill?.price ?? currentPrice;
     const filledQty = fill?.size ?? qty;
 
+    const positionId = randomUUID();
     const position: Position = {
-      id: randomUUID(),
+      id: positionId,
+      // Keep `symbol` as the spot pair so the dashboard's price-keyed
+      // `checkExits` lookup, the watchlist UI, and the §6-cap aggregation
+      // (which keys on `pos.symbol`) all keep working without special-casing
+      // `BTC-PERP-INTX` strings. The actual perp product_id is stashed in
+      // `perpProductByPositionId` for the exit-side close.
       symbol: signal.symbol,
       side: 'sell',
       signalType: signal.type,
@@ -734,15 +1104,26 @@ export class CryptoLiveAccount {
       stopLoss: signal.stopLoss,
       takeProfit: signal.takeProfit,
       openedAt: Date.now(),
+      productType: 'perp',
+      leverage: PERP_SHORT_LEVERAGE,
+      // marginUsd ≈ entry × qty / leverage. At 1× the margin equals the
+      // notional — TRA-249 follow-ups will revisit when leverage > 1.
+      marginUsd: (entryPrice * filledQty) / PERP_SHORT_LEVERAGE,
+      // Informational liquidation price: at 1× isolated, a SHORT liquidates
+      // when the underlying doubles (margin = entry × qty exhausted at 2×
+      // entry). Coinbase recomputes against funding + mark price as the
+      // position moves; we surface the open-time approximation only.
+      liquidationPrice: entryPrice * 2,
     };
-    this.positions.set(position.id, position);
+    this.positions.set(positionId, position);
+    this.perpProductByPositionId.set(positionId, perpProductId);
     // Intentionally no cashUsd debit: ISOLATED perp margin lives in the INTX
     // portfolio, separate from the spot USD wallet `refreshBalance` reads.
     const reconciled = fill
       ? `@ ${entryPrice.toFixed(2)} (filled ${filledQty})`
       : `@ ~${currentPrice.toFixed(2)} (unreconciled)`;
     console.log(
-      `[crypto-live] OPEN SHORT ${signal.symbol} ${reconciled} (perp ${PERP_SHORT_LEVERAGE}× ${PERP_SHORT_MARGIN_TYPE}, coinbase order=${resp.order_id})`,
+      `[crypto-live] OPEN SHORT ${signal.symbol} ${reconciled} (perp ${perpProductId} ${PERP_SHORT_LEVERAGE}× ${PERP_SHORT_MARGIN_TYPE}, coinbase order=${resp.order_id})`,
     );
     return position;
   }
@@ -788,6 +1169,13 @@ export class CryptoLiveAccount {
         openShortsUnrealised -= (pos.entryPrice - price) * pos.quantity;
       }
 
+      // TRA-249-C — resolve the actual perp product_id for the close. Falls
+      // back to `pos.symbol` so positions opened pre-catalog (or in tests
+      // that don't seed the map) still close cleanly.
+      const perpProductId = pos.side === 'sell'
+        ? this.perpProductByPositionId.get(id) ?? pos.symbol
+        : pos.symbol;
+
       let exitOrder: CoinbaseOrderSuccessResponse;
       try {
         if (pos.side === 'sell') {
@@ -796,7 +1184,7 @@ export class CryptoLiveAccount {
           // (the trade `side` flips to BUY internally). Same leverage / margin
           // mode the open used so Coinbase doesn't re-quote margin.
           exitOrder = await this.coinbase.closeFuturesPosition({
-            productId: pos.symbol,
+            productId: perpProductId,
             positionSide: PERP_SHORT_POSITION_SIDE,
             baseSize: pos.quantity,
             leverage: PERP_SHORT_LEVERAGE,
@@ -821,7 +1209,7 @@ export class CryptoLiveAccount {
       // Prefer the real fill VWAP from Coinbase over our TP/SL trigger price so
       // realized P&L matches the Coinbase statement (TRA-156). Fall back to the
       // trigger price if the historical-orders endpoint doesn't settle in time.
-      const exitFill = await this.awaitFill(exitOrder.order_id, pos.symbol);
+      const exitFill = await this.awaitFill(exitOrder.order_id, perpProductId);
       const triggerPrice = hit === 'tp' ? pos.takeProfit : pos.stopLoss;
       const exitPrice = exitFill?.price ?? triggerPrice;
       const exitQty = exitFill?.size ?? pos.quantity;
@@ -839,6 +1227,9 @@ export class CryptoLiveAccount {
         // cashUsd alone. Equity still advances by realised pnl so the
         // dashboard daily P&L stays correct.
         this.equityUsd += pnl;
+        // TRA-249-C — drop the perp product_id mapping for this position
+        // now that the close has settled.
+        this.perpProductByPositionId.delete(id);
       } else {
         this.cashUsd += exitPrice * exitQty;
         this.equityUsd += pnl;
@@ -859,10 +1250,15 @@ export class CryptoLiveAccount {
   async closePosition(positionId: string, currentPrice: number): Promise<Position | null> {
     const pos = this.positions.get(positionId);
     if (!pos) return null;
+    // TRA-249-C — perp closes route to the actual INTX product_id resolved
+    // via the catalog at open time; spot closes keep using the spot symbol.
+    const perpProductId = pos.side === 'sell'
+      ? this.perpProductByPositionId.get(positionId) ?? pos.symbol
+      : pos.symbol;
     let exitOrder: CoinbaseOrderSuccessResponse;
     if (pos.side === 'sell') {
       exitOrder = await this.coinbase.closeFuturesPosition({
-        productId: pos.symbol,
+        productId: perpProductId,
         positionSide: PERP_SHORT_POSITION_SIDE,
         baseSize: pos.quantity,
         leverage: PERP_SHORT_LEVERAGE,
@@ -875,7 +1271,7 @@ export class CryptoLiveAccount {
         baseSize: pos.quantity,
       });
     }
-    const exitFill = await this.awaitFill(exitOrder.order_id, pos.symbol);
+    const exitFill = await this.awaitFill(exitOrder.order_id, perpProductId);
     const exitPrice = exitFill?.price ?? currentPrice;
     const exitQty = exitFill?.size ?? pos.quantity;
     const multiplier = pos.side === 'buy' ? 1 : -1;
@@ -888,6 +1284,7 @@ export class CryptoLiveAccount {
     if (pos.side === 'sell') {
       this.realizedShortPnlToday += pnl;
       this.equityUsd += pnl;
+      this.perpProductByPositionId.delete(positionId);
     } else {
       this.cashUsd += exitPrice * exitQty;
       this.equityUsd += pnl;

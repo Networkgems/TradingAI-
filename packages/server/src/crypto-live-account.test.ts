@@ -1,6 +1,8 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest';
 import type {
   CoinbaseAccountBalance,
+  CoinbaseFuturesPosition,
+  CoinbaseListedProduct,
   CoinbaseOrderClient,
   CoinbaseOrderDetails,
   CoinbaseOrderSuccessResponse,
@@ -8,7 +10,7 @@ import type {
 } from '@trading-app/engine';
 import type { TradeSignal } from '@trading-app/shared';
 
-import { CryptoLiveAccount, quantizeBaseSize } from './crypto-live-account.js';
+import { CryptoLiveAccount, PerpCatalog, quantizeBaseSize } from './crypto-live-account.js';
 
 // We exercise CryptoLiveAccount through a hand-rolled stand-in for
 // CoinbaseOrderClient — only the methods this account actually invokes are
@@ -28,6 +30,18 @@ class FakeCoinbaseClient {
   );
   getProducts = vi.fn<(productIds: string[]) => Promise<Map<string, CoinbaseProductInfo>>>(
     async () => new Map(),
+  );
+  // TRA-249-C — perp catalog discovery and INTX reconciliation surface.
+  // Defaults are empty so existing tests that don't pre-load these endpoints
+  // see the legacy spot-only behaviour.
+  listProducts = vi.fn<(productType: 'SPOT' | 'FUTURE') => Promise<CoinbaseListedProduct[]>>(
+    async () => [],
+  );
+  listPortfolios = vi.fn<() => Promise<Array<{ uuid: string; type?: string }>>>(
+    async () => [],
+  );
+  listFuturesPositions = vi.fn<(uuid: string) => Promise<CoinbaseFuturesPosition[]>>(
+    async () => [],
   );
 }
 
@@ -1141,5 +1155,341 @@ describe('CryptoLiveAccount perp short routing (TRA-264)', () => {
     const pos = await account.openPosition(fresh, 30_000);
     expect(pos).not.toBeNull();
     expect(fresh.signalSkipReason).toBeUndefined();
+  });
+});
+
+// ── TRA-249-C: hybrid routing fork (catalog, position model, reconciliation) ──
+
+function listedPerp(productId: string): CoinbaseListedProduct {
+  return { product_id: productId, product_type: 'FUTURE', price: '30000', status: 'online' };
+}
+
+function listedSpot(productId: string): CoinbaseListedProduct {
+  return { product_id: productId, product_type: 'SPOT', price: '30000', status: 'online' };
+}
+
+describe('PerpCatalog (TRA-249-C)', () => {
+  it('starts not-ready and reports stale until first refresh succeeds', () => {
+    const catalog = new PerpCatalog();
+    expect(catalog.isReady()).toBe(false);
+    expect(catalog.isStale()).toBe(true);
+    expect(catalog.getPerpFor('BTC-USD')).toBeNull();
+  });
+
+  it('builds the spot→perp map from listProducts(FUTURE) by base currency', async () => {
+    const coinbase = new FakeCoinbaseClient();
+    coinbase.listProducts.mockResolvedValueOnce([
+      listedPerp('BTC-PERP-INTX'),
+      listedPerp('ETH-PERP-INTX'),
+      listedSpot('SOL-USD'), // Should be filtered out — not a perp.
+    ]);
+    const catalog = new PerpCatalog();
+    await catalog.refresh(asClient(coinbase), ['BTC-USD', 'ETH-USD', 'SOL-USD', 'DOGE-USD']);
+
+    expect(catalog.isReady()).toBe(true);
+    expect(catalog.isStale()).toBe(false);
+    expect(catalog.getPerpFor('BTC-USD')).toBe('BTC-PERP-INTX');
+    expect(catalog.getPerpFor('ETH-USD')).toBe('ETH-PERP-INTX');
+    expect(catalog.getPerpFor('SOL-USD')).toBeNull();
+    expect(catalog.getPerpFor('DOGE-USD')).toBeNull();
+  });
+
+  it('keeps the previous map when refresh throws (transient outage = use stale catalog)', async () => {
+    const coinbase = new FakeCoinbaseClient();
+    coinbase.listProducts.mockResolvedValueOnce([listedPerp('BTC-PERP-INTX')]);
+    const catalog = new PerpCatalog();
+    await catalog.refresh(asClient(coinbase), ['BTC-USD']);
+    expect(catalog.getPerpFor('BTC-USD')).toBe('BTC-PERP-INTX');
+
+    coinbase.listProducts.mockRejectedValueOnce(new Error('coinbase 503'));
+    await catalog.refresh(asClient(coinbase), ['BTC-USD']);
+    // Map untouched on failure — readiness flag stays true.
+    expect(catalog.isReady()).toBe(true);
+    expect(catalog.getPerpFor('BTC-USD')).toBe('BTC-PERP-INTX');
+  });
+
+  it('reports stale once past the 1h TTL', async () => {
+    const coinbase = new FakeCoinbaseClient();
+    coinbase.listProducts.mockResolvedValueOnce([listedPerp('BTC-PERP-INTX')]);
+    const catalog = new PerpCatalog();
+    await catalog.refresh(asClient(coinbase), ['BTC-USD']);
+    expect(catalog.isStale()).toBe(false);
+
+    const sixtyOneMinutes = Date.now() + 61 * 60_000;
+    vi.spyOn(Date, 'now').mockImplementation(() => sixtyOneMinutes);
+    expect(catalog.isStale()).toBe(true);
+    (Date.now as ReturnType<typeof vi.fn>).mockRestore();
+  });
+
+  it('matches by base currency only — quote-asset variations route to the same perp', async () => {
+    // Watchlist might carry BTC-USDC alongside BTC-USD; both share base BTC,
+    // so both should route to BTC-PERP-INTX. Future-proofs the matcher
+    // against multi-quote watchlists.
+    const coinbase = new FakeCoinbaseClient();
+    coinbase.listProducts.mockResolvedValueOnce([listedPerp('BTC-PERP-INTX')]);
+    const catalog = new PerpCatalog();
+    await catalog.refresh(asClient(coinbase), ['BTC-USD', 'BTC-USDC']);
+
+    expect(catalog.getPerpFor('BTC-USD')).toBe('BTC-PERP-INTX');
+    expect(catalog.getPerpFor('BTC-USDC')).toBe('BTC-PERP-INTX');
+  });
+});
+
+describe('CryptoLiveAccount routing fork — perp product_id resolution (TRA-249-C)', () => {
+  it('submits the catalog-resolved INTX product_id (BTC-PERP-INTX), not the spot symbol', async () => {
+    const { account, coinbase } = buyAccount(50_000);
+    await account.refreshBalance();
+    coinbase.listProducts.mockResolvedValueOnce([listedPerp('BTC-PERP-INTX')]);
+    await account.refreshPerpCatalog(['BTC-USD']);
+
+    coinbase.placeMarketOrder.mockResolvedValueOnce(orderSuccess('o-perp', 'SELL'));
+    coinbase.getOrder.mockResolvedValueOnce(
+      orderDetails({ order_id: 'o-perp', side: 'SELL', status: 'FILLED', average_filled_price: '30050', filled_size: '0.001' }),
+    );
+
+    const signal = buildShortSignal();
+    const pos = await account.openPosition(signal, 30_000);
+
+    expect(pos).not.toBeNull();
+    expect(coinbase.placeMarketOrder).toHaveBeenCalledTimes(1);
+    const calls = coinbase.placeMarketOrder.mock.calls as unknown as Array<[Record<string, unknown>]>;
+    const call = calls[0]![0];
+    // The actual Coinbase INTX product_id, not the spot symbol — fixes the
+    // pre-TRA-249-C bug where `BTC-USD` was sent to the perp endpoint.
+    expect(call.productId).toBe('BTC-PERP-INTX');
+    expect(call).toMatchObject({
+      side: 'sell',
+      leverage: 1,
+      marginType: 'ISOLATED',
+      positionSide: 'SHORT',
+    });
+    // pos.symbol stays the spot pair so price-keyed `checkExits` and the
+    // dashboard symbol display keep working.
+    expect(pos!.symbol).toBe('BTC-USD');
+  });
+
+  it('falls back to the spot symbol when the catalog has not been loaded (graceful degrade)', async () => {
+    // Catalog never refreshed → getPerpFor returns null → openPerpShort
+    // falls back to signal.symbol so existing TRA-264 behaviour is preserved
+    // when the catalog isn't yet available (e.g. a transient /products
+    // outage at startup).
+    const { account, coinbase } = buyAccount(50_000);
+    await account.refreshBalance();
+
+    coinbase.placeMarketOrder.mockResolvedValueOnce(orderSuccess('o-fallback', 'SELL'));
+    coinbase.getOrder.mockResolvedValueOnce(
+      orderDetails({ order_id: 'o-fallback', side: 'SELL', status: 'FILLED', average_filled_price: '30000', filled_size: '0.001' }),
+    );
+
+    const pos = await account.openPosition(buildShortSignal(), 30_000);
+
+    expect(pos).not.toBeNull();
+    const calls = coinbase.placeMarketOrder.mock.calls as unknown as Array<[Record<string, unknown>]>;
+    expect(calls[0]![0].productId).toBe('BTC-USD');
+  });
+});
+
+describe('CryptoLiveAccount routing fork — spot_only override (TRA-249-C)', () => {
+  it('forces the spot-only-skip path when routingMode is set to spot_only even with a listed perp + universe-symbol', async () => {
+    const { account, coinbase } = buyAccount(50_000);
+    await account.refreshBalance();
+    coinbase.listProducts.mockResolvedValueOnce([listedPerp('BTC-PERP-INTX')]);
+    await account.refreshPerpCatalog(['BTC-USD']);
+    account.setRoutingMode('spot_only');
+
+    const signal = buildShortSignal();
+    const pos = await account.openPosition(signal, 30_000);
+
+    expect(pos).toBeNull();
+    expect(coinbase.placeMarketOrder).not.toHaveBeenCalled();
+    expect(signal.liveSkipReason).toMatch(/spot only — no perp listed for BTC-USD/);
+    expect(account.getRoutingMode()).toBe('spot_only');
+  });
+
+  it('seeds routingMode from constructor opts so the very first tick respects the operator setting', async () => {
+    const coinbase = new FakeCoinbaseClient();
+    coinbase.listAccounts.mockResolvedValue([
+      { uuid: 'usd', name: 'USD', currency: 'USD', available_balance: { value: '50000', currency: 'USD' }, hold: { value: '0', currency: 'USD' } },
+    ]);
+    const account = new CryptoLiveAccount(asClient(coinbase), { sleep: async () => {}, routingMode: 'spot_only' });
+    await account.refreshBalance();
+
+    const signal = buildShortSignal();
+    const pos = await account.openPosition(signal, 30_000);
+
+    expect(pos).toBeNull();
+    expect(coinbase.placeMarketOrder).not.toHaveBeenCalled();
+    expect(signal.liveSkipReason).toMatch(/spot only/);
+  });
+
+  it('default routingMode is hybrid', () => {
+    const coinbase = new FakeCoinbaseClient();
+    const account = new CryptoLiveAccount(asClient(coinbase), { sleep: async () => {} });
+    expect(account.getRoutingMode()).toBe('hybrid');
+  });
+});
+
+describe('CryptoLiveAccount perp position model (TRA-249-C)', () => {
+  it('stamps productType / leverage / marginUsd / liquidationPrice on perp shorts', async () => {
+    const { account, coinbase } = buyAccount(50_000);
+    await account.refreshBalance();
+    coinbase.listProducts.mockResolvedValueOnce([listedPerp('BTC-PERP-INTX')]);
+    await account.refreshPerpCatalog(['BTC-USD']);
+
+    coinbase.placeMarketOrder.mockResolvedValueOnce(orderSuccess('o-perp', 'SELL'));
+    coinbase.getOrder.mockResolvedValueOnce(
+      orderDetails({ order_id: 'o-perp', side: 'SELL', status: 'FILLED', average_filled_price: '30050', filled_size: '0.002' }),
+    );
+
+    const pos = await account.openPosition(buildShortSignal(), 30_000);
+
+    expect(pos).not.toBeNull();
+    expect(pos!.productType).toBe('perp');
+    expect(pos!.leverage).toBe(1);
+    expect(pos!.marginUsd).toBeCloseTo(30_050 * 0.002, 6);
+    expect(pos!.liquidationPrice).toBeCloseTo(30_050 * 2, 6);
+  });
+
+  it('spot positions never gain perp fields (regression — productType absent on serialize)', async () => {
+    const { account, coinbase } = buyAccount(50_000);
+    await account.refreshBalance();
+
+    coinbase.placeMarketOrder.mockResolvedValueOnce(orderSuccess('o-spot'));
+    coinbase.getOrder.mockResolvedValueOnce(
+      orderDetails({ order_id: 'o-spot', status: 'FILLED', average_filled_price: '30000', filled_size: '0.001' }),
+    );
+    const pos = await account.openPosition(buildSignal(), 30_000);
+
+    expect(pos).not.toBeNull();
+    expect(pos!.productType).toBeUndefined();
+    expect(pos!.leverage).toBeUndefined();
+    expect(pos!.marginUsd).toBeUndefined();
+    expect(pos!.liquidationPrice).toBeUndefined();
+  });
+});
+
+describe('CryptoLiveAccount checkExits — perp close uses catalog product_id (TRA-249-C)', () => {
+  it('closes a perp position via closeFuturesPosition with the catalog-resolved product_id', async () => {
+    const { account, coinbase } = buyAccount(50_000);
+    await account.refreshBalance();
+    coinbase.listProducts.mockResolvedValueOnce([listedPerp('BTC-PERP-INTX')]);
+    await account.refreshPerpCatalog(['BTC-USD']);
+
+    // Open a perp short.
+    coinbase.placeMarketOrder.mockResolvedValueOnce(orderSuccess('o-perp-open', 'SELL'));
+    coinbase.getOrder.mockResolvedValueOnce(
+      orderDetails({ order_id: 'o-perp-open', side: 'SELL', status: 'FILLED', average_filled_price: '30000', filled_size: '0.001' }),
+    );
+    // takeProfit = 28_500 by default — so trigger needs price <= 28_500.
+    const opened = await account.openPosition(buildShortSignal(), 30_000);
+    expect(opened).not.toBeNull();
+    coinbase.placeMarketOrder.mockClear();
+
+    // Trigger TP at 28_400 (price <= takeProfit on a SHORT).
+    coinbase.closeFuturesPosition.mockResolvedValueOnce(orderSuccess('o-perp-close', 'BUY'));
+    coinbase.getOrder.mockResolvedValueOnce(
+      orderDetails({ order_id: 'o-perp-close', side: 'BUY', status: 'FILLED', average_filled_price: '28400', filled_size: '0.001' }),
+    );
+    const closed = await account.checkExits(new Map([['BTC-USD', 28_400]]));
+
+    expect(closed).toHaveLength(1);
+    expect(coinbase.closeFuturesPosition).toHaveBeenCalledTimes(1);
+    const closeCalls = coinbase.closeFuturesPosition.mock.calls as unknown as Array<[Record<string, unknown>]>;
+    expect(closeCalls[0]![0]).toMatchObject({
+      // Critical: routes to the actual INTX perp product_id, not the spot symbol.
+      productId: 'BTC-PERP-INTX',
+      positionSide: 'SHORT',
+      baseSize: 0.001,
+      leverage: 1,
+      marginType: 'ISOLATED',
+    });
+  });
+});
+
+describe('CryptoLiveAccount startup reconciliation (TRA-249-C)', () => {
+  it('imports an open INTX perp position on refreshBalance without re-opening it', async () => {
+    const { account, coinbase } = buyAccount(50_000);
+    coinbase.listPortfolios.mockResolvedValue([{ uuid: 'intx-uuid', type: 'INTX' }]);
+    coinbase.listFuturesPositions.mockResolvedValueOnce([
+      {
+        product_id: 'BTC-PERP-INTX',
+        position_side: 'SHORT',
+        net_size: '0.0025',
+        vwap: '30200',
+        mark_price: '30100',
+        liquidation_price: '60400',
+        leverage: '1',
+        margin_type: 'ISOLATED',
+      },
+    ]);
+
+    // Balance refresh triggers the reconcile path.
+    await account.refreshBalance();
+
+    const positions = account.getState().openPositions;
+    expect(positions).toHaveLength(1);
+    expect(positions[0]).toMatchObject({
+      symbol: 'BTC-USD',
+      side: 'sell',
+      productType: 'perp',
+      quantity: 0.0025,
+      entryPrice: 30_200,
+      leverage: 1,
+      liquidationPrice: 60_400,
+    });
+    // Critical: no order was submitted. Reconciliation is read-only.
+    expect(coinbase.placeMarketOrder).not.toHaveBeenCalled();
+    expect(coinbase.closeFuturesPosition).not.toHaveBeenCalled();
+    expect(coinbase.listPortfolios).toHaveBeenCalledWith('INTX');
+    expect(coinbase.listFuturesPositions).toHaveBeenCalledWith('intx-uuid');
+  });
+
+  it('does not duplicate a UI-opened perp on a subsequent reconcile', async () => {
+    const { account, coinbase } = buyAccount(50_000);
+    coinbase.listPortfolios.mockResolvedValue([{ uuid: 'intx-uuid', type: 'INTX' }]);
+    coinbase.listFuturesPositions.mockResolvedValue([
+      {
+        product_id: 'BTC-PERP-INTX',
+        position_side: 'SHORT',
+        net_size: '0.0025',
+        vwap: '30200',
+        leverage: '1',
+        margin_type: 'ISOLATED',
+      },
+    ]);
+
+    await account.refreshBalance();
+    expect(account.getState().openPositions).toHaveLength(1);
+
+    // Travel past the rate-limit so the next refreshBalance retries reconcile.
+    // Same Coinbase position returned — must NOT be re-imported.
+    const sixMinutesLater = Date.now() + 6 * 60_000;
+    vi.spyOn(Date, 'now').mockImplementation(() => sixMinutesLater);
+    await account.refreshBalance();
+    (Date.now as ReturnType<typeof vi.fn>).mockRestore();
+
+    expect(account.getState().openPositions).toHaveLength(1);
+  });
+
+  it('rate-limits the reconcile so the every-30s balance refresh does not refetch INTX positions', async () => {
+    const { account, coinbase } = buyAccount(50_000);
+    coinbase.listPortfolios.mockResolvedValue([{ uuid: 'intx-uuid', type: 'INTX' }]);
+    coinbase.listFuturesPositions.mockResolvedValue([]);
+
+    await account.refreshBalance();
+    await account.refreshBalance();
+    await account.refreshBalance();
+
+    expect(coinbase.listFuturesPositions).toHaveBeenCalledTimes(1);
+    expect(coinbase.listPortfolios).toHaveBeenCalledTimes(1);
+  });
+
+  it('survives a missing INTX portfolio (perps not enabled) without throwing', async () => {
+    const { account, coinbase } = buyAccount(50_000);
+    coinbase.listPortfolios.mockResolvedValue([]); // No INTX portfolio.
+
+    await expect(account.refreshBalance()).resolves.toBeUndefined();
+    expect(account.getState().openPositions).toHaveLength(0);
+    expect(coinbase.listFuturesPositions).not.toHaveBeenCalled();
   });
 });

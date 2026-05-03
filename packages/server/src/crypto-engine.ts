@@ -160,7 +160,12 @@ export class CryptoSignalEngine {
       // the API Secret field can confirm it parsed as CDP (rather than silently
       // falling back to HMAC and 401-ing on every order).
       console.log(`[crypto-engine] Coinbase client built (auth=${client.getAuthScheme()}).`);
-      const live = new CryptoLiveAccount(client);
+      // TRA-249-C — seed routing mode from settings so the very first tick
+      // respects spot_only when the user opted out. Default 'hybrid' matches
+      // DEFAULT_ACCOUNT_SETTINGS for users that pre-date TRA-249-E.
+      const live = new CryptoLiveAccount(client, {
+        routingMode: s?.liveTradeRoutingCrypto ?? 'hybrid',
+      });
       // TRA-232 — sync the live account to the user's risk knobs immediately
       // so the first order placed after a live-mode flip uses the right
       // managedAccountRatio / riskPerTrade.
@@ -201,6 +206,11 @@ export class CryptoSignalEngine {
     // tickers (e.g. MATIC after the POL rename) with a clear reason instead
     // of eating a 400 INVALID_ARGUMENT on the order endpoint.
     await broker.refreshTradableProducts(this.getActiveSymbols());
+    // TRA-249-C — pre-load the spot↔perp catalog so the first tick that
+    // routes a SELL signal can resolve `BTC-USD` → `BTC-PERP-INTX` (the
+    // actual Coinbase INTX product_id) instead of submitting the spot
+    // symbol directly to the perp endpoint.
+    await broker.refreshPerpCatalog(this.getActiveSymbols());
   }
 
   /**
@@ -596,6 +606,12 @@ export class CryptoSignalEngine {
     // orders on the stale symbol.
     if (live.isTradableProductsStale()) {
       await live.refreshTradableProducts(activeSymbols);
+    }
+    // TRA-249-C — perp catalog runs on a tighter (1h) cadence so a
+    // newly-listed INTX perp becomes routable mid-session without waiting
+    // on a server restart.
+    if (live.isPerpCatalogStale()) {
+      await live.refreshPerpCatalog(activeSymbols);
     }
 
     try {

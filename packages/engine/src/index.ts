@@ -50,6 +50,10 @@ export type {
   CoinbaseOrderSuccessResponse,
   CoinbaseOrderDetails,
   CoinbaseProductInfo,
+  CoinbaseListedProduct,
+  CoinbaseFuturesPosition,
+  CoinbaseMarginType,
+  CoinbasePositionSide,
   MarketOrderParams as CoinbaseMarketOrderParams,
   LimitOrderParams as CoinbaseLimitOrderParams,
 } from './coinbase/index.js';
