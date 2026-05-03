@@ -26,11 +26,13 @@
 import { existsSync, mkdirSync, readFileSync, statSync, writeFileSync } from 'node:fs';
 import { dirname, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { inflateRawSync } from 'node:zlib';
 
 const HERE = dirname(fileURLToPath(import.meta.url));
 const DATA_DIR = resolve(HERE, '..', 'data');
 const CACHE_TTL_MS = 12 * 60 * 60 * 1000;
 const BINANCE_BASE = 'https://fapi.binance.com';
+const BINANCE_VISION_BASE = 'https://data.binance.vision';
 const PAGE_LIMIT = 1000;
 const REQUEST_GAP_MS = 200;
 const FUNDING_INTERVAL_HOURS = 8;
@@ -97,30 +99,140 @@ async function fetchBinanceFunding(
   // Each PAGE_LIMIT page covers ≈ 1000 × 8h = 333d, so we step in 300d windows
   // to keep each request comfortably under the page cap with margin for gaps.
   const stepMs = 300 * ONE_DAY_MS;
+  let visionFallback = false;
   while (cursor < toMs) {
     const winEnd = Math.min(cursor + stepMs, toMs);
-    const url = new URL(`${BINANCE_BASE}/fapi/v1/fundingRate`);
-    url.searchParams.set('symbol', binanceSymbol);
-    url.searchParams.set('startTime', String(cursor));
-    url.searchParams.set('endTime', String(winEnd));
-    url.searchParams.set('limit', String(PAGE_LIMIT));
-    const res = await fetch(url.toString(), { headers: { 'User-Agent': 'TRA-287/1.0' } });
-    if (!res.ok) {
-      const body = (await res.text()).slice(0, 200);
-      throw new Error(`Binance ${res.status} for ${binanceSymbol} fundingRate: ${body}`);
+    if (!visionFallback) {
+      const url = new URL(`${BINANCE_BASE}/fapi/v1/fundingRate`);
+      url.searchParams.set('symbol', binanceSymbol);
+      url.searchParams.set('startTime', String(cursor));
+      url.searchParams.set('endTime', String(winEnd));
+      url.searchParams.set('limit', String(PAGE_LIMIT));
+      const res = await fetch(url.toString(), { headers: { 'User-Agent': 'TRA-287/1.0' } });
+      const body = await res.text();
+      // fapi.binance.com returns 200 with `{"code":0,"msg":"Service unavailable from a restricted location ..."}`
+      // for IP-blocked regions (e.g. CI/dev hosts in the US). Detect both the
+      // HTTP-error path and the JSON-encoded geo-block, then fall back to the
+      // public Binance Vision monthly CSV dumps for the remainder of the span.
+      const geoBlocked = body.includes('restricted location');
+      if (!res.ok || geoBlocked) {
+        if (geoBlocked || res.status === 451 || res.status === 403) {
+          console.warn(`[funding-feed] fapi geo-blocked for ${binanceSymbol} — falling back to Binance Vision CSV dumps for the rest of this fetch.`);
+          visionFallback = true;
+        } else {
+          throw new Error(`Binance ${res.status} for ${binanceSymbol} fundingRate: ${body.slice(0, 200)}`);
+        }
+      } else {
+        const rows = JSON.parse(body) as BinanceFundingRow[];
+        for (const r of rows) {
+          const rate = parseFloat(r.fundingRate);
+          if (Number.isFinite(rate)) out.push({ ts: r.fundingTime, ratePerInterval: rate });
+        }
+        cursor = winEnd;
+        if (cursor < toMs) await sleep(REQUEST_GAP_MS);
+        continue;
+      }
     }
-    const rows = (await res.json()) as BinanceFundingRow[];
-    for (const r of rows) {
-      const rate = parseFloat(r.fundingRate);
-      if (Number.isFinite(rate)) out.push({ ts: r.fundingTime, ratePerInterval: rate });
+    if (visionFallback) {
+      const monthRows = await fetchBinanceVisionFundingMonth(binanceSymbol, cursor);
+      for (const r of monthRows) {
+        if (r.ts >= fromMs && r.ts <= toMs) out.push(r);
+      }
+      // Step to the first day of the next calendar month so we visit each
+      // monthly Vision archive exactly once.
+      cursor = nextMonthStartMs(cursor);
+      if (cursor < toMs) await sleep(REQUEST_GAP_MS);
     }
-    cursor = winEnd;
-    if (cursor < toMs) await sleep(REQUEST_GAP_MS);
   }
   out.sort((a, b) => a.ts - b.ts);
   // Dedup on funding settlement timestamp.
   const seen = new Set<number>();
   return out.filter((p) => (seen.has(p.ts) ? false : (seen.add(p.ts), true)));
+}
+
+function nextMonthStartMs(ts: number): number {
+  const d = new Date(ts);
+  return Date.UTC(d.getUTCFullYear(), d.getUTCMonth() + 1, 1);
+}
+
+function monthKey(ts: number): { year: number; month: number } {
+  const d = new Date(ts);
+  return { year: d.getUTCFullYear(), month: d.getUTCMonth() + 1 };
+}
+
+/**
+ * Pull one month of funding rates from Binance Vision's public monthly archives
+ * (`data.binance.vision/.../monthly/fundingRate/<SYM>/<SYM>-fundingRate-YYYY-MM.zip`).
+ *
+ * Each zip holds a single CSV with `calc_time,funding_interval_hours,last_funding_rate`.
+ * We use `node:zlib.inflateRawSync` to deflate the zip's only entry — keeps the
+ * dep surface at zero (no `unzipper` / `adm-zip` install) and works the same on
+ * Windows + Linux. Returns ascending-by-ts; caller dedups across months.
+ */
+async function fetchBinanceVisionFundingMonth(
+  binanceSymbol: string,
+  ts: number,
+): Promise<Array<{ ts: number; ratePerInterval: number }>> {
+  const { year, month } = monthKey(ts);
+  const monthStr = String(month).padStart(2, '0');
+  const url = `${BINANCE_VISION_BASE}/data/futures/um/monthly/fundingRate/${binanceSymbol}/${binanceSymbol}-fundingRate-${year}-${monthStr}.zip`;
+  const res = await fetch(url, { headers: { 'User-Agent': 'TRA-287/1.0' } });
+  if (res.status === 404) {
+    // Vision publishes monthly archives shortly after month-end; the current
+    // month is missing until then. Caller can stitch live snapshots if needed.
+    return [];
+  }
+  if (!res.ok) {
+    throw new Error(`Binance Vision ${res.status} for ${binanceSymbol} ${year}-${monthStr}`);
+  }
+  const buf = Buffer.from(await res.arrayBuffer());
+  const csv = unzipSingleEntry(buf);
+  return parseFundingCsv(csv);
+}
+
+/**
+ * Minimal single-entry ZIP reader. The Binance Vision archives we consume are
+ * always one CSV file deflate-compressed. We read the first local file header,
+ * inflateRawSync the payload, and return UTF-8 text. Throws on multi-entry
+ * archives or unsupported compression methods so an upstream format change
+ * surfaces immediately rather than corrupting the funding cache.
+ */
+function unzipSingleEntry(buf: Buffer): string {
+  const sig = buf.readUInt32LE(0);
+  if (sig !== 0x04034b50) throw new Error(`unzipSingleEntry: bad local header signature 0x${sig.toString(16)}`);
+  const compMethod = buf.readUInt16LE(8);
+  const compSize = buf.readUInt32LE(18);
+  const nameLen = buf.readUInt16LE(26);
+  const extraLen = buf.readUInt16LE(28);
+  const dataStart = 30 + nameLen + extraLen;
+  const compressed = buf.subarray(dataStart, dataStart + compSize);
+  let payload: Buffer;
+  if (compMethod === 0) {
+    payload = compressed;
+  } else if (compMethod === 8) {
+    payload = inflateRawSync(compressed);
+  } else {
+    throw new Error(`unzipSingleEntry: unsupported compression method ${compMethod}`);
+  }
+  return payload.toString('utf-8');
+}
+
+function parseFundingCsv(csv: string): Array<{ ts: number; ratePerInterval: number }> {
+  const out: Array<{ ts: number; ratePerInterval: number }> = [];
+  const lines = csv.split(/\r?\n/);
+  // Header: calc_time,funding_interval_hours,last_funding_rate
+  // First line may also be header for some archives; detect by parsing failure.
+  for (const line of lines) {
+    const trimmed = line.trim();
+    if (trimmed === '') continue;
+    const parts = trimmed.split(',');
+    if (parts.length < 3) continue;
+    const ts = Number(parts[0]);
+    const rate = Number(parts[2]);
+    if (!Number.isFinite(ts) || !Number.isFinite(rate)) continue;
+    out.push({ ts, ratePerInterval: rate });
+  }
+  return out;
 }
 
 /**

@@ -1,0 +1,407 @@
+{
+  "generatedAt": "2026-05-03T21:18:33.112Z",
+  "granularity": "4h",
+  "universe": [
+    "SOL-USD",
+    "DOGE-USD"
+  ],
+  "initialEquityUsd": 25000,
+  "feeBps": 40,
+  "slippageBps": 5,
+  "trainBars": 1080,
+  "testBars": 540,
+  "triggerSpec": {
+    "fundingThresholdPerHour": 0.0005,
+    "intervalCount": 6,
+    "atrStopMultiplier": 2,
+    "rrTarget": 2,
+    "atrTrailMultiplier": 1.5,
+    "timeStopBars": 24,
+    "carryBrokenPerHour": 0,
+    "carryBrokenIntervalCount": 2,
+    "riskFraction": 0.01
+  },
+  "perWindow": [
+    {
+      "index": 0,
+      "testStart": "2024-01-09",
+      "testEnd": "2024-04-07",
+      "metrics": {
+        "trades": 0,
+        "winners": 0,
+        "hitRatePct": 0,
+        "expectancyR": 0,
+        "totalPnlUsd": 0,
+        "rollingMaxDrawdownPct": 0,
+        "passes": false,
+        "reasons": [
+          "only 0 trade(s) in window < 4",
+          "expectancy 0.000R < 0.10R",
+          "hit rate 0.0% < 35%"
+        ]
+      },
+      "perSymbol": [
+        {
+          "symbol": "SOL-USD",
+          "trades": 0,
+          "winners": 0,
+          "hitRatePct": 0,
+          "expectancyR": 0,
+          "totalPnlUsd": 0
+        },
+        {
+          "symbol": "DOGE-USD",
+          "trades": 0,
+          "winners": 0,
+          "hitRatePct": 0,
+          "expectancyR": 0,
+          "totalPnlUsd": 0
+        }
+      ],
+      "triggerFireCount": 0,
+      "triggerToTradeCount": 0,
+      "carryBrokenExitCount": 0,
+      "skipReasons": {}
+    },
+    {
+      "index": 1,
+      "testStart": "2024-04-08",
+      "testEnd": "2024-07-06",
+      "metrics": {
+        "trades": 0,
+        "winners": 0,
+        "hitRatePct": 0,
+        "expectancyR": 0,
+        "totalPnlUsd": 0,
+        "rollingMaxDrawdownPct": 0,
+        "passes": false,
+        "reasons": [
+          "only 0 trade(s) in window < 4",
+          "expectancy 0.000R < 0.10R",
+          "hit rate 0.0% < 35%"
+        ]
+      },
+      "perSymbol": [
+        {
+          "symbol": "SOL-USD",
+          "trades": 0,
+          "winners": 0,
+          "hitRatePct": 0,
+          "expectancyR": 0,
+          "totalPnlUsd": 0
+        },
+        {
+          "symbol": "DOGE-USD",
+          "trades": 0,
+          "winners": 0,
+          "hitRatePct": 0,
+          "expectancyR": 0,
+          "totalPnlUsd": 0
+        }
+      ],
+      "triggerFireCount": 0,
+      "triggerToTradeCount": 0,
+      "carryBrokenExitCount": 0,
+      "skipReasons": {}
+    },
+    {
+      "index": 2,
+      "testStart": "2024-07-07",
+      "testEnd": "2024-10-04",
+      "metrics": {
+        "trades": 0,
+        "winners": 0,
+        "hitRatePct": 0,
+        "expectancyR": 0,
+        "totalPnlUsd": 0,
+        "rollingMaxDrawdownPct": 0,
+        "passes": false,
+        "reasons": [
+          "only 0 trade(s) in window < 4",
+          "expectancy 0.000R < 0.10R",
+          "hit rate 0.0% < 35%"
+        ]
+      },
+      "perSymbol": [
+        {
+          "symbol": "SOL-USD",
+          "trades": 0,
+          "winners": 0,
+          "hitRatePct": 0,
+          "expectancyR": 0,
+          "totalPnlUsd": 0
+        },
+        {
+          "symbol": "DOGE-USD",
+          "trades": 0,
+          "winners": 0,
+          "hitRatePct": 0,
+          "expectancyR": 0,
+          "totalPnlUsd": 0
+        }
+      ],
+      "triggerFireCount": 0,
+      "triggerToTradeCount": 0,
+      "carryBrokenExitCount": 0,
+      "skipReasons": {}
+    },
+    {
+      "index": 3,
+      "testStart": "2024-10-05",
+      "testEnd": "2025-01-02",
+      "metrics": {
+        "trades": 0,
+        "winners": 0,
+        "hitRatePct": 0,
+        "expectancyR": 0,
+        "totalPnlUsd": 0,
+        "rollingMaxDrawdownPct": 0,
+        "passes": false,
+        "reasons": [
+          "only 0 trade(s) in window < 4",
+          "expectancy 0.000R < 0.10R",
+          "hit rate 0.0% < 35%"
+        ]
+      },
+      "perSymbol": [
+        {
+          "symbol": "SOL-USD",
+          "trades": 0,
+          "winners": 0,
+          "hitRatePct": 0,
+          "expectancyR": 0,
+          "totalPnlUsd": 0
+        },
+        {
+          "symbol": "DOGE-USD",
+          "trades": 0,
+          "winners": 0,
+          "hitRatePct": 0,
+          "expectancyR": 0,
+          "totalPnlUsd": 0
+        }
+      ],
+      "triggerFireCount": 0,
+      "triggerToTradeCount": 0,
+      "carryBrokenExitCount": 0,
+      "skipReasons": {}
+    },
+    {
+      "index": 4,
+      "testStart": "2025-01-03",
+      "testEnd": "2025-04-02",
+      "metrics": {
+        "trades": 0,
+        "winners": 0,
+        "hitRatePct": 0,
+        "expectancyR": 0,
+        "totalPnlUsd": 0,
+        "rollingMaxDrawdownPct": 0,
+        "passes": false,
+        "reasons": [
+          "only 0 trade(s) in window < 4",
+          "expectancy 0.000R < 0.10R",
+          "hit rate 0.0% < 35%"
+        ]
+      },
+      "perSymbol": [
+        {
+          "symbol": "SOL-USD",
+          "trades": 0,
+          "winners": 0,
+          "hitRatePct": 0,
+          "expectancyR": 0,
+          "totalPnlUsd": 0
+        },
+        {
+          "symbol": "DOGE-USD",
+          "trades": 0,
+          "winners": 0,
+          "hitRatePct": 0,
+          "expectancyR": 0,
+          "totalPnlUsd": 0
+        }
+      ],
+      "triggerFireCount": 0,
+      "triggerToTradeCount": 0,
+      "carryBrokenExitCount": 0,
+      "skipReasons": {}
+    },
+    {
+      "index": 5,
+      "testStart": "2025-04-03",
+      "testEnd": "2025-07-01",
+      "metrics": {
+        "trades": 0,
+        "winners": 0,
+        "hitRatePct": 0,
+        "expectancyR": 0,
+        "totalPnlUsd": 0,
+        "rollingMaxDrawdownPct": 0,
+        "passes": false,
+        "reasons": [
+          "only 0 trade(s) in window < 4",
+          "expectancy 0.000R < 0.10R",
+          "hit rate 0.0% < 35%"
+        ]
+      },
+      "perSymbol": [
+        {
+          "symbol": "SOL-USD",
+          "trades": 0,
+          "winners": 0,
+          "hitRatePct": 0,
+          "expectancyR": 0,
+          "totalPnlUsd": 0
+        },
+        {
+          "symbol": "DOGE-USD",
+          "trades": 0,
+          "winners": 0,
+          "hitRatePct": 0,
+          "expectancyR": 0,
+          "totalPnlUsd": 0
+        }
+      ],
+      "triggerFireCount": 0,
+      "triggerToTradeCount": 0,
+      "carryBrokenExitCount": 0,
+      "skipReasons": {}
+    },
+    {
+      "index": 6,
+      "testStart": "2025-07-02",
+      "testEnd": "2025-09-29",
+      "metrics": {
+        "trades": 0,
+        "winners": 0,
+        "hitRatePct": 0,
+        "expectancyR": 0,
+        "totalPnlUsd": 0,
+        "rollingMaxDrawdownPct": 0,
+        "passes": false,
+        "reasons": [
+          "only 0 trade(s) in window < 4",
+          "expectancy 0.000R < 0.10R",
+          "hit rate 0.0% < 35%"
+        ]
+      },
+      "perSymbol": [
+        {
+          "symbol": "SOL-USD",
+          "trades": 0,
+          "winners": 0,
+          "hitRatePct": 0,
+          "expectancyR": 0,
+          "totalPnlUsd": 0
+        },
+        {
+          "symbol": "DOGE-USD",
+          "trades": 0,
+          "winners": 0,
+          "hitRatePct": 0,
+          "expectancyR": 0,
+          "totalPnlUsd": 0
+        }
+      ],
+      "triggerFireCount": 0,
+      "triggerToTradeCount": 0,
+      "carryBrokenExitCount": 0,
+      "skipReasons": {}
+    },
+    {
+      "index": 7,
+      "testStart": "2025-09-30",
+      "testEnd": "2025-12-29",
+      "metrics": {
+        "trades": 0,
+        "winners": 0,
+        "hitRatePct": 0,
+        "expectancyR": 0,
+        "totalPnlUsd": 0,
+        "rollingMaxDrawdownPct": 0,
+        "passes": false,
+        "reasons": [
+          "only 0 trade(s) in window < 4",
+          "expectancy 0.000R < 0.10R",
+          "hit rate 0.0% < 35%"
+        ]
+      },
+      "perSymbol": [
+        {
+          "symbol": "SOL-USD",
+          "trades": 0,
+          "winners": 0,
+          "hitRatePct": 0,
+          "expectancyR": 0,
+          "totalPnlUsd": 0
+        },
+        {
+          "symbol": "DOGE-USD",
+          "trades": 0,
+          "winners": 0,
+          "hitRatePct": 0,
+          "expectancyR": 0,
+          "totalPnlUsd": 0
+        }
+      ],
+      "triggerFireCount": 0,
+      "triggerToTradeCount": 0,
+      "carryBrokenExitCount": 0,
+      "skipReasons": {}
+    },
+    {
+      "index": 8,
+      "testStart": "2025-12-29",
+      "testEnd": "2026-03-29",
+      "metrics": {
+        "trades": 0,
+        "winners": 0,
+        "hitRatePct": 0,
+        "expectancyR": 0,
+        "totalPnlUsd": 0,
+        "rollingMaxDrawdownPct": 0,
+        "passes": false,
+        "reasons": [
+          "only 0 trade(s) in window < 4",
+          "expectancy 0.000R < 0.10R",
+          "hit rate 0.0% < 35%"
+        ]
+      },
+      "perSymbol": [
+        {
+          "symbol": "SOL-USD",
+          "trades": 0,
+          "winners": 0,
+          "hitRatePct": 0,
+          "expectancyR": 0,
+          "totalPnlUsd": 0
+        },
+        {
+          "symbol": "DOGE-USD",
+          "trades": 0,
+          "winners": 0,
+          "hitRatePct": 0,
+          "expectancyR": 0,
+          "totalPnlUsd": 0
+        }
+      ],
+      "triggerFireCount": 0,
+      "triggerToTradeCount": 0,
+      "carryBrokenExitCount": 0,
+      "skipReasons": {}
+    }
+  ],
+  "aggregate": {
+    "trades": 0,
+    "winners": 0,
+    "hitRatePct": 0,
+    "expectancyR": 0,
+    "totalPnlUsd": 0,
+    "rollingMaxDrawdownPct": 0,
+    "triggerFires": 0,
+    "triggerToTrades": 0,
+    "carryBrokenExits": 0,
+    "passingWindows": 0
+  }
+}
