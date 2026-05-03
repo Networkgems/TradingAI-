@@ -42,6 +42,16 @@
   --orange: #bc4c00;
   --accent-on: #ffffff;
 
+  /* TRA-276 — Tradier-style blue banner for the top header in light mode.
+     A saturated navy background with white text, while the rest of the page
+     keeps the existing soft-gray Tradier-feel surfaces. Dark mode keeps its
+     original neutral header by mapping these tokens to surface/text below. */
+  --header-bg: #0a4d8c;
+  --header-text: #ffffff;
+  --header-text-muted: rgba(255, 255, 255, 0.72);
+  --header-border: #083f72;
+  --header-divider: rgba(255, 255, 255, 0.18);
+
   /* Tinted backgrounds (used for badges, signal cards, calendar cells) */
   --buy: #dafbe1;
   --sell: #ffebe9;
@@ -96,6 +106,13 @@
   --orange: #f0883e;
   --accent-on: #0d1117;
 
+  /* Header tokens — keep dark mode's existing neutral header look. */
+  --header-bg: var(--surface);
+  --header-text: var(--text);
+  --header-text-muted: var(--muted);
+  --header-border: var(--border);
+  --header-divider: var(--border);
+
   /* Tinted backgrounds */
   --buy: #1c3829;
   --sell: #3b1a1a;
@@ -143,15 +160,16 @@ body {
   align-items: center;
   justify-content: space-between;
   padding: calc(0.6rem + env(safe-area-inset-top)) calc(1.2rem + env(safe-area-inset-right)) 0.6rem calc(1.2rem + env(safe-area-inset-left));
-  background: var(--surface);
-  border-bottom: 1px solid var(--border);
+  background: var(--header-bg);
+  color: var(--header-text);
+  border-bottom: 1px solid var(--header-border);
   flex-shrink: 0;
 }
 
 .header-left h1 {
   font-size: 1.1rem;
   font-weight: 700;
-  color: var(--blue);
+  color: var(--header-text);
   letter-spacing: 0.05em;
   display: inline;
 }
@@ -166,6 +184,22 @@ body {
   display: flex;
   align-items: center;
   gap: 0;
+}
+
+/* TRA-276 — Header descendants need light text in light mode (blue banner)
+   while staying dark in dark mode (neutral surface). The --header-* tokens
+   resolve correctly per theme, so we just point header-scoped overrides at
+   them. .green/.red value classes still win via direct-target specificity. */
+.header .subtitle,
+.header .stat-label,
+.header .last-tick {
+  color: var(--header-text-muted);
+}
+.header .status-label {
+  color: var(--header-text);
+}
+.header .stat-divider {
+  background: var(--header-divider);
 }
 
 /* Logical stat clusters — account / options / status */
@@ -1519,20 +1553,28 @@ tr:hover td { background: var(--bg-hover); }
 
 /* ── Back button & mode badge ────────────────────────────────────────────────── */
 
+/* TRA-276 — Home button styled as a red "exit" affordance: filled red with
+   white text so it reads as a strong return-to-selector action against the
+   blue banner in light mode (and still pops in dark mode). */
 .back-btn {
-  background: none;
-  border: 1px solid var(--border);
+  background: var(--red);
+  border: 1px solid var(--red);
   border-radius: 6px;
-  color: var(--muted);
+  color: #ffffff;
   cursor: pointer;
   font-size: 0.72rem;
+  font-weight: 600;
   font-family: inherit;
   padding: 0.25rem 0.6rem;
   margin-right: 0.5rem;
-  transition: color 0.15s, border-color 0.15s;
+  transition: background 0.15s, border-color 0.15s;
 }
 
-.back-btn:hover { color: var(--text); border-color: var(--text); }
+.back-btn:hover {
+  background: var(--red-strong);
+  border-color: var(--red-strong);
+  color: #ffffff;
+}
 
 .mode-badge {
   font-size: 0.6rem;
