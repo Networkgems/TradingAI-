@@ -114,6 +114,7 @@ export {
   SKIP_CONSECUTIVE_LOSSES,
   SKIP_MAX_CONCURRENT_SHORTS,
   SKIP_PARKED_1D_DAILY,
+  SKIP_PARKED_4H_LAYER12,
   isPerpShortSymbol,
   isTier2PerpShort,
   perpShortRiskFraction,

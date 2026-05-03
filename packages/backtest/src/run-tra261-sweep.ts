@@ -120,6 +120,16 @@ const SLIPPAGE_BPS = 5;
 const FROM_MS = Date.UTC(2022, 0, 1);
 
 /**
+ * TRA-275 / TRA-255 §4.4 r6 — harness-only diagnostic skip buckets. Not
+ * exported from `@trading-app/engine` because they're walk-forward sweep
+ * diagnostics, not production gate strings (the dashboard never sees them).
+ * The values are deliberately verbose so the §8 report's pre-route skip
+ * histogram reads naturally without a legend.
+ */
+const SKIP_DIAGNOSTIC_NULL_EMISSION = 'diagnostic — router emitted no signal';
+const SKIP_DIAGNOSTIC_LONG_EMISSION = 'diagnostic — router emitted a long signal (dropped pre-short-gate)';
+
+/**
  * Spec values for §4 short overrides. These mirror `crypto-engine.getRouter`
  * exactly — the harness reads from this single record so a sensitivity
  * perturbation can override one knob without forking the router config.
@@ -131,27 +141,47 @@ interface ShortSpec {
     slowMaSlopeBars: number;
     volumeMultiplier: number;
     volumeSmaPeriod: number;
+    /**
+     * TRA-275 / TRA-255 §4.4 r6 — when set, activates the Momentum 4H
+     * cascade-leg short trigger via `byTimeframe['4h']`. The cascade trigger
+     * REPLACES the §4.1 EMA-cross / Donchian / volume stack on 4H short
+     * emissions; non-4H short paths (none in this harness — every run is
+     * 1D parked or 4H) and long paths stay byte-identical.
+     */
+    cascadeLeg4h?: boolean;
   };
   breakout: {
     volumeMultiplier: number;
     atrStopMultiplier: number;
     atrTpMultiplier: number;
+    /**
+     * TRA-275 / TRA-255 §4.4 r6 — 4H-native consolidation window relaxation.
+     * Defaults to undefined (keeps the strategy's 20-bar default for back-
+     * compat with prior r4/r5 sweeps); the r6 BASELINE_SPEC sets `10`.
+     */
+    consolidationBars?: number;
   };
   regime?: RegimeDetectorOptions;
 }
 
-// TRA-255 §4.4 r5 (2026-05-03) — Phase-1.1 4H entry-trigger overrides
-// (Layer 1 + Layer 2 promoted in the same heartbeat per QuantTrader pre-auth).
+// TRA-275 / TRA-255 §4.4 r6 (2026-05-03) — Phase-1.1 4H Layer 3 structural
+// rewrite. Layer 1 (r4) and Layer 2 (r5) both produced 0 / 9 windows with
+// empty pre-route skip-reason histograms, which is the §4.4 escalation
+// criterion ("if Layer 1 + Layer 2 together still miss the §8 acceptance
+// bars, the 4H short layer needs a structural rewrite").
 //
-// Layer 1: `Momentum.slowMaSlopeBars 10 → 5`, `Momentum.volumeMultiplier
-//          1.25 → 1.10`, `Breakout.volumeMultiplier 2.5 → 1.75`.
-// Layer 2: regime hysteresis `flipBars 3 → 2` (12h → 8h on 4H), BTC
-//          alt-overlay softening (only block alts when BTC `trend_up` AND
-//          daily MA200 slope is positive over 5 daily bars — applied at
-//          the harness's `evaluateShortFilters` call site).
-//
-// ATR multipliers stay at r3 values per the §8 sensitivity-sweep evidence
-// (±20% produced 0 trades at every point — they are not the binding gate).
+// Momentum-short on 4H: `byTimeframe['4h']` activates the cascade-leg trigger
+//   (drop-bar 1.5×ATR + close-in-lower-33% + 1.5× volume + 0.95× recent-high
+//   anchor + softer regime gate `!== 'trend_up'`). The §4.1 EMA-cross /
+//   Donchian / slope / 1.10× volume stack is *replaced*, not stacked.
+// Breakout-short on 4H: knob relaxation only — `consolidationBars 20 → 10`
+//   (40h ≈ 1.7 days, 4H-native), `volumeMultiplier 1.75 → 1.50` (matches
+//   the cascade-volume floor). `atrStopMultiplier 1.75`, `atrTpMultiplier
+//   3.0` unchanged.
+// Layer 1 / Layer 2 / regime hysteresis: kept active (slope, 1.10× volume,
+//   `flipBars 2`, BTC alt-overlay softening) — they're idempotent under the
+//   cascade trigger (which doesn't read them) and stay byte-correct for any
+//   future non-4H short path that might re-enable.
 const BASELINE_SPEC: ShortSpec = {
   momentum: {
     atrStopMultiplier: 2.0,
@@ -159,11 +189,13 @@ const BASELINE_SPEC: ShortSpec = {
     slowMaSlopeBars: 5,
     volumeMultiplier: 1.10,
     volumeSmaPeriod: 20,
+    cascadeLeg4h: true,
   },
   breakout: {
-    volumeMultiplier: 1.75,
+    volumeMultiplier: 1.5,
     atrStopMultiplier: 1.75,
     atrTpMultiplier: 3.0,
+    consolidationBars: 10,
   },
   regime: {
     flipBars: 2,
@@ -178,10 +210,18 @@ const BASELINE_SPEC: ShortSpec = {
  */
 function buildShortRouter(spec: ShortSpec): StrategyRouter {
   const regime = new RegimeDetector(spec.regime);
+  // Strip harness-only flags that don't map directly onto the strategy
+  // option types — `cascadeLeg4h` translates into `byTimeframe['4h']` and
+  // `consolidationBars` flows through to BreakoutVolOptions on its own.
+  const { cascadeLeg4h, ...momentumFlat } = spec.momentum;
   return new StrategyRouter({
     regime,
     momentum: new MomentumStrategy(regime, {
-      paramsByDirection: { short: { ...spec.momentum } },
+      paramsByDirection: {
+        short: cascadeLeg4h
+          ? { ...momentumFlat, byTimeframe: { '4h': {} } }
+          : { ...momentumFlat },
+      },
     }),
     meanReversion: new MeanReversionCryptoStrategy(),
     breakout: new BreakoutVolStrategy({
@@ -410,10 +450,22 @@ function runShortSim(input: SimInput): SimReport {
       // The router is per-symbol so re-evaluating BTC here is the same call.
       const router = routers.get(sym)!;
       const signal = router.evaluate(sym, window);
-      if (!signal) continue;
 
-      // Long-side: drop.
-      if (signal.side !== 'sell') continue;
+      // TRA-275 / TRA-255 §4.4 r6 — diagnostic counters. Distinguishes
+      // "the router never produced a signal at all on this bar" from "the
+      // router produced a long emission that the short-only harness drops".
+      // Bumped pre-route, per universe symbol per bar. Surfaces as two
+      // dedicated histogram rows in the §8 sweep report so a Layer 3
+      // density-bar miss can be diagnosed at the entry-trigger level
+      // without re-instrumenting the harness.
+      if (!signal) {
+        bumpSkip(SKIP_DIAGNOSTIC_NULL_EMISSION);
+        continue;
+      }
+      if (signal.side !== 'sell') {
+        bumpSkip(SKIP_DIAGNOSTIC_LONG_EMISSION);
+        continue;
+      }
 
       // Universe gate (defensive — every sim symbol is in the universe).
       if (!isPerpShortSymbol(signal.symbol)) {
@@ -1015,7 +1067,7 @@ function buildReport(
   const lines: string[] = [];
   const titleSuffix = granularity === '1d'
     ? ' (1D parked baseline — TRA-255 r3 §8.1)'
-    : ' (4H Phase-1.1 — TRA-255 r3 §12)';
+    : ' (4H Phase-1.1 — TRA-255 r6 §4.4 Layer 3)';
   lines.push(`# TRA-266 — §8 Walk-Forward Sweep Report${titleSuffix}\n`);
   lines.push(`Generated: ${new Date().toISOString()}\n`);
   lines.push(`Granularity: ${granularity}`);
@@ -1176,7 +1228,24 @@ async function main() {
   const lengths = [...fullByPair.values()].map((c) => c.length);
   const allEqual = lengths.every((l) => l === lengths[0]);
   if (!allEqual) {
-    console.warn(`[run-tra261-sweep] symbol bar counts differ: ${[...fullByPair.entries()].map(([s, c]) => `${s}=${c.length}`).join(', ')} — sim will intersect timestamps`);
+    console.warn(`[run-tra261-sweep] symbol bar counts differ: ${[...fullByPair.entries()].map(([s, c]) => `${s}=${c.length}`).join(', ')} — aligning to common start timestamp`);
+    // TRA-275 / TRA-255 §4.4 r6 — align all symbols to the latest first-bar
+    // timestamp before windowing. The 4H walk-forward harness uses index-
+    // based slicing across the universe; without alignment, a symbol that
+    // starts later (e.g. XRP perp listed mid-2023 while BTC has bars from
+    // 2022) shifts every window's timestamp range out of sync with the
+    // others, and the per-tick `baseTimestamps` intersection collapses to
+    // empty. The earlier r4 / r5 sweeps reporting 0 trades were a victim
+    // of this misalignment, not (only) the entry-trigger gate stack —
+    // r6 lifts the alignment so the cascade-leg trigger can actually be
+    // observed firing across the universe.
+    const latestStart = Math.max(...[...fullByPair.values()].map((c) => c[0]?.timestamp ?? 0));
+    for (const [sym, bars] of fullByPair) {
+      const trimmed = bars.filter((c) => c.timestamp >= latestStart);
+      fullByPair.set(sym, trimmed);
+    }
+    const newLengths = [...fullByPair.entries()].map(([s, c]) => `${s}=${c.length}`).join(', ');
+    console.log(`[run-tra261-sweep] aligned to ${new Date(latestStart).toISOString()}: ${newLengths}`);
   }
 
   const symbols = [...PERP_SHORTS_UNIVERSE];

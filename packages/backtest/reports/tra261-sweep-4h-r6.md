@@ -1,6 +1,28 @@
+# TRA-261 — §8 4H Walk-Forward Sweep Report (r6 sidecar — TRA-255 §4.4 Layer 3)
+
+> **r6 sidecar — preserves the r3 → r4 → r5 → r6 audit trail.** Snapshot of the
+> [TRA-255](/TRA/issues/TRA-255#document-strategy) §4.4 r6 4H sweep run on 2026-05-03.
+> r4 (Layer 1) and r5 (Layer 2) sidecars stayed at 0 / 9 trades, which matched
+> the in-flight harness behaviour described in those revisions but masked any
+> real entry-trigger evidence: a pre-existing harness bug had XRP (listed
+> mid-2023 on Coinbase Exchange) shift index-based walk-forward windowing out
+> of sync with BTC / ETH / SOL / DOGE, so the per-window `baseTimestamps`
+> intersection across the 5-symbol universe was empty for every window. r6
+> lands the cascade-leg trigger ([TRA-275](/TRA/issues/TRA-275)), the
+> Breakout-short 4H knob relaxations, and the universe-alignment fix.
+>
+> With alignment fixed, the cascade-leg trigger fires across every walk-forward
+> window: 67 trades total across 9 windows, **density bar (≥ 6 of 9 with > 0
+> trades) MET** (9 / 9 fire), §8 acceptance bars met in 3 / 9 windows
+> (1, 7, 8). Rolling-90d short-book DD comfortably under the 8% bar at 3.47%.
+> Reassigned to QuantTrader for cascade-trigger parameter revision per §4.4
+> r6 branch ("Density bar met BUT §8 bars miss").
+
+---
+
 # TRA-266 — §8 Walk-Forward Sweep Report (4H Phase-1.1 — TRA-255 r6 §4.4 Layer 3)
 
-Generated: 2026-05-03T14:03:35.076Z
+Generated: 2026-05-03T13:53:30.099Z
 
 Granularity: 4h
 Universe: BTC-USD, ETH-USD, SOL-USD, XRP-USD, DOGE-USD

@@ -30,6 +30,7 @@ import {
   SKIP_CONSECUTIVE_LOSSES,
   SKIP_MAX_CONCURRENT_SHORTS,
   SKIP_PARKED_1D_DAILY,
+  SKIP_PARKED_4H_LAYER12,
   isPerpShortSymbol,
   isTier2PerpShort,
   perpShortRiskFraction,
@@ -83,6 +84,8 @@ describe('perp shorts spec wiring (TRA-261)', () => {
       expect(SKIP_MAX_CONCURRENT_SHORTS).toBe('max 3 concurrent shorts');
       // TRA-255 §8.1 r3 — Phase-1 1D timeframe parked after the TRA-266 sweep.
       expect(SKIP_PARKED_1D_DAILY).toBe('parked — failed §8 daily');
+      // TRA-255 §4.4 r6 — 4H Layer 1+2 parked pending Layer 3 cascade-leg trigger.
+      expect(SKIP_PARKED_4H_LAYER12).toBe('parked — failed §8 4H Layer 1+2');
     });
   });
 

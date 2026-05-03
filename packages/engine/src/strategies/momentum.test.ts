@@ -232,6 +232,216 @@ describe('MomentumStrategy', () => {
     });
   });
 
+  describe('TRA-275 / TRA-255 §4.4 r6 — 4H cascade-leg short trigger', () => {
+    const FOUR_HOUR_MS = 4 * 60 * 60 * 1000;
+
+    /**
+     * Build a synthetic series of 4H bars: a steady rally up to a recent peak,
+     * then a single drop bar. The drop bar is parameterised so individual
+     * tests can violate exactly one gate (drop magnitude / close-in-range /
+     * volume / recent-high anchor / regime). Default: every gate passes.
+     */
+    function cascadeSeries(opts: {
+      preLen?: number;
+      perBar?: number;
+      dropBarOpen?: number;
+      dropBarClose?: number;
+      dropBarHigh?: number;
+      dropBarLow?: number;
+      dropBarVolume?: number;
+      preBarVolume?: number;
+    } = {}): Candle[] {
+      const preLen = opts.preLen ?? 250;
+      const perBar = opts.perBar ?? 0.005;
+      const out: Candle[] = [];
+      // Build a long rally so the regime detector lands on `trend_up` and the
+      // recent-high anchor sees a meaningful peak. The cascade gate only
+      // checks `regime !== 'trend_up'` though; test cases override the regime
+      // by passing in a `regime` arg to evaluate().
+      let prev = 100;
+      for (let i = 0; i < preLen; i++) {
+        const next = prev * (1 + perBar);
+        const high = Math.max(prev, next) + 0.4;
+        const low = Math.min(prev, next) - 0.4;
+        out.push({
+          symbol: 'TEST',
+          timestamp: i * FOUR_HOUR_MS,
+          open: prev,
+          high,
+          low,
+          close: next,
+          volume: opts.preBarVolume ?? 1_000,
+        });
+        prev = next;
+      }
+      // The recent-high cascade gate uses a 20-bar lookback — the cascade
+      // bar's high must be ≥ 95% of the highest high among the 20 prior bars.
+      // We control that by sizing the drop bar's high relative to `prev`.
+      const ts = preLen * FOUR_HOUR_MS;
+      const open = opts.dropBarOpen ?? prev;
+      const close = opts.dropBarClose ?? (open - 5); // strong drop
+      const low = opts.dropBarLow ?? (close - 0.1);
+      const high = opts.dropBarHigh ?? (open + 0.1);
+      out.push({
+        symbol: 'TEST',
+        timestamp: ts,
+        open,
+        high,
+        low,
+        close,
+        volume: opts.dropBarVolume ?? 5_000,
+      });
+      return out;
+    }
+
+    /**
+     * Run a cascade series through MomentumStrategy with `byTimeframe['4h']`
+     * configured. The supplied regime label overrides the detector — the
+     * router supplies it in production via `evaluate(symbol, candles, regime)`.
+     */
+    function evalCascade(
+      candles: Candle[],
+      regime: 'trend_up' | 'trend_down' | 'range' | 'high_vol' | 'flat',
+    ) {
+      const detector = new RegimeDetector();
+      const strat = new MomentumStrategy(detector, {
+        fastMaPeriod: 50,
+        slowMaPeriod: 200,
+        donchianPeriod: 20,
+        paramsByDirection: {
+          short: {
+            atrStopMultiplier: 2.0,
+            rearmBars: 8,
+            slowMaSlopeBars: 10,
+            volumeMultiplier: 1.10,
+            volumeSmaPeriod: 20,
+            byTimeframe: { '4h': {} },
+          },
+        },
+      });
+      return strat.evaluate('TEST', candles, regime);
+    }
+
+    it('fires a short on a clean drop-bar against a recent peak under range regime', () => {
+      const candles = cascadeSeries();
+      const sig = evalCascade(candles, 'range');
+      expect(sig).not.toBeNull();
+      expect(sig?.side).toBe('sell');
+      expect(sig?.type).toBe('momentum');
+      expect(sig?.stopLoss).toBeGreaterThan(sig!.entryPrice);
+      expect(sig?.takeProfit).toBeLessThan(sig!.entryPrice);
+    });
+
+    it('softer regime gate: fires under high_vol and flat, blocks under trend_up', () => {
+      expect(evalCascade(cascadeSeries(), 'high_vol')?.side).toBe('sell');
+      expect(evalCascade(cascadeSeries(), 'flat')?.side).toBe('sell');
+      expect(evalCascade(cascadeSeries(), 'trend_up')).toBeNull();
+    });
+
+    it('drop-bar magnitude gate: blocks when (open-close) is below 1.5× ATR', () => {
+      // Shrink the drop magnitude by raising close near open. ATR on the
+      // pre-rally is ≈ open*perBar + 0.8 ≈ 1.5; require drop ≥ 1.5×ATR ≈ 2.25.
+      // Setting close = open - 0.5 fails the gate.
+      const last = 100 * Math.pow(1.005, 250);
+      const candles = cascadeSeries({ dropBarOpen: last, dropBarClose: last - 0.5 });
+      expect(evalCascade(candles, 'range')).toBeNull();
+    });
+
+    it('drop-bar close-in-lower-range gate: blocks when close lands above the lower 33%', () => {
+      // Force a wide range with the close in the upper half — magnitude still
+      // satisfies but close-in-lower-range fraction does not.
+      const last = 100 * Math.pow(1.005, 250);
+      const open = last;
+      const close = last - 5;
+      const high = open + 1;
+      // Range ≈ 21; close - low should be > 0.33 × 21 = 6.93. Set low = close - 12.
+      const low = close - 12;
+      const candles = cascadeSeries({
+        dropBarOpen: open, dropBarClose: close, dropBarHigh: high, dropBarLow: low,
+      });
+      expect(evalCascade(candles, 'range')).toBeNull();
+    });
+
+    it('volume gate: blocks when cascade-bar volume is below 1.5× SMA(volume,20)', () => {
+      // Pre-bars at 1_000, drop bar at 1_400 (< 1_500 = 1.5×). Should block.
+      const candles = cascadeSeries({ dropBarVolume: 1_400 });
+      expect(evalCascade(candles, 'range')).toBeNull();
+      // Same series, drop bar at 1_500 → should fire (≥ 1.5×).
+      const passing = cascadeSeries({ dropBarVolume: 1_500 });
+      expect(evalCascade(passing, 'range')?.side).toBe('sell');
+    });
+
+    it('recent-high anchor gate: blocks when the cascade-bar high is below 0.95× recent peak', () => {
+      // Cascade bar's high needs to be ≥ 0.95 × max(high) over the prior 20 bars.
+      // Force the drop bar's high well below the recent peak.
+      const last = 100 * Math.pow(1.005, 250);
+      const candles = cascadeSeries({
+        dropBarOpen: last,
+        dropBarClose: last - 5,
+        dropBarHigh: last * 0.5, // half of the recent peak
+        dropBarLow: last * 0.5 - 5,
+      });
+      expect(evalCascade(candles, 'range')).toBeNull();
+    });
+
+    it('non-4H bars do not activate cascade — falls back to §4.1 path', () => {
+      // Re-stamp the cascade series timestamps onto a 1m grid. The cascade
+      // gates would all otherwise pass, but `isFourHourBars` flips false and
+      // the §4.1 strict regime gate (`trend_down` only) takes over. The
+      // `range` regime then blocks the §4.1 path → null.
+      const candles = cascadeSeries().map((c, i) => ({
+        ...c,
+        timestamp: i * 60_000,
+      }));
+      expect(evalCascade(candles, 'range')).toBeNull();
+    });
+
+    it('cascade mode suppresses the §4.1 short emission on a trend_down 4H bar without cascade conditions', () => {
+      // Build a steady downtrend on 4H bars. Without cascade overrides, the
+      // §4.1 path would fire on Donchian breakdowns. With cascade active,
+      // the §4.1 short is replaced — and since the series has no drop-bar
+      // cascade, no short fires at all.
+      const detector = new RegimeDetector();
+      const stratWithCascade = new MomentumStrategy(detector, {
+        fastMaPeriod: 50, slowMaPeriod: 200, donchianPeriod: 20,
+        paramsByDirection: {
+          short: {
+            atrStopMultiplier: 2.0,
+            rearmBars: 8,
+            slowMaSlopeBars: 10,
+            volumeMultiplier: 1.10,
+            volumeSmaPeriod: 20,
+            byTimeframe: { '4h': {} },
+          },
+        },
+      });
+      // Synthetic 4H downtrend without a single-bar cascade flush.
+      const candles: Candle[] = [];
+      let prev = 100;
+      for (let i = 0; i < 250; i++) {
+        const next = prev * (1 - 0.002);
+        candles.push({
+          symbol: 'TEST',
+          timestamp: i * FOUR_HOUR_MS,
+          open: prev,
+          high: Math.max(prev, next) + 0.2,
+          low: Math.min(prev, next) - 0.2,
+          close: next,
+          volume: 1_000,
+        });
+        prev = next;
+      }
+      let fired = false;
+      for (let i = 60; i <= candles.length; i++) {
+        if (stratWithCascade.evaluate('TEST', candles.slice(0, i), 'trend_down')) {
+          fired = true;
+          break;
+        }
+      }
+      expect(fired).toBe(false);
+    });
+  });
+
   it('cooldown spaces re-fires roughly one Donchian window apart', () => {
     // A sustained trend prints fresh Donchian highs on every bar, so without
     // the `rearmBars` cooldown the strategy would emit one signal per bar.

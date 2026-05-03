@@ -418,12 +418,21 @@ export class CryptoSignalEngine {
               rearmBars: 8,
               // §4.1 — EMA(200) slope must be negative over the last 10 bars
               // for a short. Long-side leaves this undefined (no slope check),
-              // preserving byte-identical long behaviour.
+              // preserving byte-identical long behaviour. On 4H bars the
+              // cascade-leg trigger below replaces the §4.1 short stack
+              // outright, so this gate only ever applies to non-4H short paths.
               slowMaSlopeBars: 10,
               // §4.1 — breakout-bar volume ≥ 1.25 × SMA(volume, 20). Mirrors
               // BreakoutVolStrategy's volume guard but only applies to shorts.
               volumeMultiplier: 1.25,
               volumeSmaPeriod: 20,
+              // TRA-275 / TRA-255 §4.4 r6 — cascade-leg short trigger for 4H
+              // bars (Layer 3 structural rewrite). Activates only when the
+              // strategy detects 4H bar intervals; non-4H short paths fall
+              // through to the §4.1 stack above. Empty config = spec defaults
+              // (drop-bar 1.5× ATR, close-in-lower 33%, vol 1.5×, recent-high
+              // anchor 95% over 20-bar lookback).
+              byTimeframe: { '4h': {} },
             },
           },
         }),
@@ -431,8 +440,19 @@ export class CryptoSignalEngine {
         breakout: new BreakoutVolStrategy({
           paramsByDirection: {
             short: {
-              // §4.2 — ≥ 2.5 × SMA(volume, 20) volume confirmation.
-              volumeMultiplier: 2.5,
+              // §4.2 — ≥ 2.5 × SMA(volume, 20) volume confirmation. Phase-1.1
+              // 4H Breakout-short relaxes this to 1.50 × per the §4.4 r6
+              // knob-relaxation patch (matches the cascade-volume floor).
+              // The router can't dispatch on bar interval, so we run the 4H
+              // numbers across the live engine — the cascade-leg pre-route
+              // park (§4.4 r6) suppresses any non-4H Breakout short emission
+              // that would otherwise fire under the relaxed 1.50× gate.
+              volumeMultiplier: 1.5,
+              // §4.4 r6 — 4H-native consolidation window (10 bars × 4h ≈ 1.7
+              // days) replacing the 1D-derived 20-bar default. Same
+              // motivation as the volume relaxation: the long-side default
+              // is calibrated to daily bars and oversaturates on 4H.
+              consolidationBars: 10,
               // §4.2 — entry + 1.75 × ATR(14) hard stop.
               atrStopMultiplier: 1.75,
               // §4.2 — entry − 3.0 × ATR(14) take profit (R:R ≈ 1.7:1).

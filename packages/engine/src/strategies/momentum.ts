@@ -73,11 +73,72 @@ export interface MomentumOptions {
    * faster trailing cadence, and a volume-confirmation bump without
    * conditional drift in the long path. Omit either field to keep that
    * direction's values at the long-side baseline.
+   *
+   * TRA-275 / TRA-255 §4.4 r6 — `short.byTimeframe['4h']` activates the
+   * cascade-leg trigger (Layer 3 structural rewrite) when the strategy is
+   * evaluated against 4H bars and would emit a short. The cascade trigger
+   * replaces the §4.1 EMA-cross / slope / Donchian / volume stack with a
+   * bespoke drop-bar + volume + recent-high-anchor + softened-regime gate
+   * stack designed for the cascade flush. Long-side and non-4H short paths
+   * remain byte-identical to pre-r6.
    */
   paramsByDirection?: {
     long?: Partial<Omit<MomentumOptions, 'paramsByDirection'>>;
-    short?: Partial<Omit<MomentumOptions, 'paramsByDirection'>>;
+    short?: Partial<Omit<MomentumOptions, 'paramsByDirection' | 'byTimeframe'>> & {
+      byTimeframe?: MomentumByTimeframeOverrides;
+    };
   };
+}
+
+/**
+ * TRA-255 §4.4 r6 — per-timeframe short overrides. Today only the 4H entry
+ * exists (Phase-1.1 Layer 3); the type is keyed on the interval string so a
+ * future 1H or 30m extension drops in without a structural change.
+ */
+export interface MomentumByTimeframeOverrides {
+  '4h'?: MomentumCascadeLegOverride;
+}
+
+/**
+ * TRA-255 §4.4 r6 — Layer 3 cascade-leg short trigger config. When enabled
+ * and the bars passed to {@link MomentumStrategy.evaluate} are 4H, the §4.1
+ * entry trigger (EMA cross + EMA200 slope + Donchian breakdown + 1.10×
+ * volume) is replaced by the cascade-leg trigger:
+ *
+ *   1. Drop-bar:        (open − close) ≥ {@link dropBarAtrMultiplier} × ATR(14)
+ *                       AND close ≤ low + {@link dropBarRangeRatio} × (high − low)
+ *   2. Volume:          volume ≥ {@link cascadeVolumeMultiplier} × SMA(volume, 20)
+ *   3. Recent-high:     high ≥ {@link recentHighAnchorRatio}
+ *                       × max(high) over the prior {@link recentHighLookback} bars
+ *                       (current bar included so a clean cascade off the local
+ *                       high still anchors).
+ *   4. Daily-regime:    regime label `!== 'trend_up'`. Softer than the §4.1
+ *                       `=== 'trend_down'` bar — explicitly accepts `range`,
+ *                       `high_vol`, `flat`, `trend_down` so the cascade trigger
+ *                       fires inside choppier regimes that historically host
+ *                       liquidation cascades. The router supplies whatever
+ *                       regime label the caller computed for these bars; for
+ *                       the macro-overlay split (4H entries gated by the daily
+ *                       regime) the harness/engine is responsible for feeding
+ *                       in the daily label rather than the 4H one.
+ *
+ * Stop / TP / trail / time-stop / re-arm: all §4.1 short values (resolved on
+ * the same `ResolvedOptions` object) are unchanged — `atrStopMultiplier 2.0`,
+ * `atrTpMultiplier 4.0`, time stop 20 bars (= 80h on 4H), trail
+ * `Donchian_high(10)`, `rearmBars 8`. The cascade trigger is an *entry-rule*
+ * rewrite, not a risk-control rewrite.
+ */
+export interface MomentumCascadeLegOverride {
+  /** Drop-bar ATR multiplier (default 1.5 per spec). */
+  dropBarAtrMultiplier?: number;
+  /** Drop-bar close-in-lower-range fraction (default 0.33 per spec). */
+  dropBarRangeRatio?: number;
+  /** Volume multiplier vs SMA(volume, 20) (default 1.5 per spec). */
+  cascadeVolumeMultiplier?: number;
+  /** Recent-high lookback in bars (default 20 per spec). */
+  recentHighLookback?: number;
+  /** Recent-high anchor ratio (default 0.95 per spec — current high ≥ 95% of recent high). */
+  recentHighAnchorRatio?: number;
 }
 
 interface ResolvedOptions {
@@ -103,7 +164,38 @@ interface ResolvedOptions {
   /** Window for the SMA(volume) used by the volume gate. */
   volumeSmaPeriod: number;
   lotSize: number | undefined;
+  /**
+   * TRA-275 / TRA-255 §4.4 r6 — resolved cascade-leg config for 4H short.
+   * `undefined` = cascade trigger disabled (the §4.1 EMA-cross / Donchian
+   * stack is authoritative). Defined ⇒ when this side resolves to short AND
+   * the bar interval is detected as 4H, the §4.1 trigger is replaced by the
+   * cascade-leg trigger described on {@link MomentumCascadeLegOverride}.
+   */
+  cascadeLeg4h: ResolvedCascadeLeg | undefined;
 }
+
+interface ResolvedCascadeLeg {
+  dropBarAtrMultiplier: number;
+  dropBarRangeRatio: number;
+  cascadeVolumeMultiplier: number;
+  recentHighLookback: number;
+  recentHighAnchorRatio: number;
+}
+
+const CASCADE_LEG_DEFAULTS: ResolvedCascadeLeg = {
+  dropBarAtrMultiplier: 1.5,
+  dropBarRangeRatio: 0.33,
+  cascadeVolumeMultiplier: 1.5,
+  recentHighLookback: 20,
+  recentHighAnchorRatio: 0.95,
+};
+
+/** Tolerance window (ms) around a 4H bar interval — covers Coinbase exchange
+ * jitter (typically <1s) and the very rare clock-skew artifacts. Wider than
+ * needed but still tight enough to reject 1H bars (3.6e6) and 1D bars (8.64e7).
+ */
+const FOUR_HOUR_INTERVAL_MIN_MS = 3.5 * 60 * 60 * 1000;
+const FOUR_HOUR_INTERVAL_MAX_MS = 4.5 * 60 * 60 * 1000;
 
 const DEFAULTS: Omit<ResolvedOptions, 'rearmBars'> = {
   fastMaPeriod: 50,
@@ -119,6 +211,7 @@ const DEFAULTS: Omit<ResolvedOptions, 'rearmBars'> = {
   // `volumeMultiplier` is set.
   volumeSmaPeriod: 20,
   lotSize: undefined,
+  cascadeLeg4h: undefined,
 };
 
 /**
@@ -196,11 +289,24 @@ export class MomentumStrategy {
    * not the long-side rearm.
    */
   private resolveDirectionalOverrides(
-    raw: Partial<Omit<MomentumOptions, 'paramsByDirection'>>,
+    raw: Partial<Omit<MomentumOptions, 'paramsByDirection'>> & {
+      byTimeframe?: MomentumByTimeframeOverrides;
+    },
   ): Partial<ResolvedOptions> {
-    const out: Partial<ResolvedOptions> = { ...raw };
+    const { byTimeframe, ...flat } = raw;
+    const out: Partial<ResolvedOptions> = { ...flat };
     if (raw.donchianPeriod !== undefined && raw.rearmBars === undefined) {
       out.rearmBars = raw.donchianPeriod;
+    }
+    const cascade4h = byTimeframe?.['4h'];
+    if (cascade4h !== undefined) {
+      out.cascadeLeg4h = {
+        dropBarAtrMultiplier: cascade4h.dropBarAtrMultiplier ?? CASCADE_LEG_DEFAULTS.dropBarAtrMultiplier,
+        dropBarRangeRatio: cascade4h.dropBarRangeRatio ?? CASCADE_LEG_DEFAULTS.dropBarRangeRatio,
+        cascadeVolumeMultiplier: cascade4h.cascadeVolumeMultiplier ?? CASCADE_LEG_DEFAULTS.cascadeVolumeMultiplier,
+        recentHighLookback: cascade4h.recentHighLookback ?? CASCADE_LEG_DEFAULTS.recentHighLookback,
+        recentHighAnchorRatio: cascade4h.recentHighAnchorRatio ?? CASCADE_LEG_DEFAULTS.recentHighAnchorRatio,
+      };
     }
     return out;
   }
@@ -239,6 +345,25 @@ export class MomentumStrategy {
     // we skip the internal `regime.update` so a shared detector isn't double-
     // ticked; standalone callers still get the in-place hysteresis update.
     const effectiveRegime: Regime = regime ?? this.regime.update(candles);
+
+    // TRA-275 / TRA-255 §4.4 r6 — cascade-leg short trigger replaces §4.1 on 4H.
+    // Resolved short overrides + 4H bar interval activates the cascade trigger
+    // (which has its own softer regime gate); fired here BEFORE the strict
+    // §4.1 regime gate so a `range` / `high_vol` / `flat` 4H tape can still
+    // surface a cascade short. Long-side and non-4H short paths fall through
+    // to the unchanged §4.1 stack below.
+    const cascadeShortActive =
+      this.shortOverrides !== null
+      && (this.shortOverrides as Partial<ResolvedOptions>).cascadeLeg4h !== undefined
+      && this.isFourHourBars(candles);
+    if (cascadeShortActive) {
+      const cascadeSig = this.tryCascadeShort(symbol, candles, effectiveRegime);
+      if (cascadeSig) return cascadeSig;
+      // Cascade didn't fire. Fall through so a 4H *long* signal can still
+      // come from the §4.1 path; a 4H short from §4.1 is explicitly replaced
+      // by the cascade trigger and is suppressed below.
+    }
+
     if (effectiveRegime !== 'trend_up' && effectiveRegime !== 'trend_down') return null;
 
     const closes = candles.map((c) => c.close);
@@ -252,6 +377,13 @@ export class MomentumStrategy {
     if (effectiveRegime === 'trend_up' && fastNow > slowNow) side = 'buy';
     if (effectiveRegime === 'trend_down' && fastNow < slowNow) side = 'sell';
     if (side === null) return null;
+
+    // TRA-275 / TRA-255 §4.4 r6 — when the cascade trigger is the active 4H
+    // short path, the §4.1 short stack is *replaced*, not stacked. A trend_down
+    // 4H bar that would have fired §4.1 short here is suppressed; the only
+    // 4H short path is the cascade trigger that ran above. Long-side path
+    // proceeds unchanged.
+    if (cascadeShortActive && side === 'sell') return null;
 
     // TRA-261 — once we know the side, resolve the active option set so
     // short-side overrides (TRA-255 §4) flow through the rest of the
@@ -341,6 +473,130 @@ export class MomentumStrategy {
       riskRewardRatio: tpDistance / stopDistance,
       timestamp: latest.timestamp,
     };
+  }
+
+  /**
+   * TRA-275 / TRA-255 §4.4 r6 — cascade-leg short trigger entry path.
+   *
+   * Activation: caller has wired `paramsByDirection.short.byTimeframe['4h']`
+   * AND `evaluate()` detected the bar interval as 4H AND a short would be
+   * the candidate side. Replaces the §4.1 EMA-cross / Donchian / volume
+   * stack with a structural cascade-leg detector tuned to 4H Phase-1 majors:
+   * the cascade flush prints a single bar with a heavy ATR-relative drop,
+   * close compressed against the lows, abnormal volume, anchored against a
+   * recent local peak. Entry-rule rewrite only; post-fire risk knobs
+   * (atrStopMultiplier, atrTpMultiplier, rearmBars, time stop, trail)
+   * still come from `optFor('sell')`.
+   */
+  private tryCascadeShort(symbol: string, candles: Candle[], effectiveRegime: Regime): TradeSignal | null {
+    const opt = this.optFor('sell');
+    const cascade = opt.cascadeLeg4h;
+    if (!cascade) return null;
+
+    // Daily-regime gate (softened from §4.1's strict `=== 'trend_down'`).
+    // The router/harness is responsible for feeding in the daily macro
+    // overlay regime when the §3 split is active; in standalone use the
+    // detector's own label on these bars is the best available proxy.
+    if (effectiveRegime === 'trend_up') return null;
+
+    const lookback = Math.max(
+      opt.atrPeriod + 1,
+      opt.volumeSmaPeriod + 1,
+      cascade.recentHighLookback + 1,
+    );
+    if (candles.length < lookback) return null;
+
+    const latest = candles[candles.length - 1];
+
+    // 1) Drop-bar gate — heavy ATR-relative open-to-close drop with the close
+    //    compressed against the lows. Both halves must hold; either alone
+    //    catches false positives (a bar that closes mid-range despite a big
+    //    drop tends to be a single-bar reversal candidate, not a cascade).
+    const atrValue = atr(candles, opt.atrPeriod);
+    if (atrValue === null || atrValue <= 0) return null;
+    const dropMagnitude = latest.open - latest.close;
+    if (dropMagnitude < cascade.dropBarAtrMultiplier * atrValue) return null;
+    const range = latest.high - latest.low;
+    if (range <= 0) return null;
+    const closeFromLow = (latest.close - latest.low) / range;
+    if (closeFromLow > cascade.dropBarRangeRatio) return null;
+
+    // 2) Volume gate — current bar's volume vs the 20-bar SMA over the
+    //    *prior* bars (current excluded, mirroring §4.1's volume gate
+    //    semantics so the SMA isn't biased by the cascade bar's own spike).
+    const volStart = candles.length - 1 - opt.volumeSmaPeriod;
+    if (volStart < 0) return null;
+    let volSum = 0;
+    for (let i = volStart; i < candles.length - 1; i++) volSum += candles[i].volume;
+    const volSma = volSum / opt.volumeSmaPeriod;
+    if (!(volSma > 0)) return null;
+    if (latest.volume < cascade.cascadeVolumeMultiplier * volSma) return null;
+
+    // 3) Recent-high anchor — cascade's high must be within the anchor ratio
+    //    of the highest high over the prior `recentHighLookback` bars
+    //    (current excluded). Without this gate the trigger fires on
+    //    long-tail down-grind bars that aren't actually flushing off a peak.
+    const rhStart = candles.length - 1 - cascade.recentHighLookback;
+    if (rhStart < 0) return null;
+    let recentHigh = -Infinity;
+    for (let i = rhStart; i < candles.length - 1; i++) {
+      if (candles[i].high > recentHigh) recentHigh = candles[i].high;
+    }
+    if (!Number.isFinite(recentHigh) || recentHigh <= 0) return null;
+    if (latest.high < cascade.recentHighAnchorRatio * recentHigh) return null;
+
+    // 4) Cooldown — same `rearmBars` as §4.1 short (8 bars on 4H ≈ 32h).
+    if (this.lastFireTs !== null && candles.length >= 2) {
+      const barInterval = latest.timestamp - candles[candles.length - 2].timestamp;
+      if (barInterval > 0
+        && latest.timestamp - this.lastFireTs < opt.rearmBars * barInterval) {
+        return null;
+      }
+    }
+
+    // Risk: §4.1 short values unchanged (atrStopMultiplier 2.0, atrTpMultiplier 4.0).
+    const stopDistance = opt.atrStopMultiplier * atrValue;
+    const tpDistance = opt.atrTpMultiplier * atrValue;
+    if (stopDistance <= 0 || tpDistance <= 0) return null;
+
+    const entryPrice = latest.close;
+    const stopLoss = entryPrice + stopDistance;
+    const takeProfit = entryPrice - tpDistance;
+
+    this.lastFireTs = latest.timestamp;
+    return {
+      id: randomUUID(),
+      symbol,
+      type: 'momentum',
+      side: 'sell',
+      entryPrice,
+      stopLoss,
+      takeProfit,
+      riskRewardRatio: tpDistance / stopDistance,
+      timestamp: latest.timestamp,
+    };
+  }
+
+  /**
+   * TRA-275 — detect whether the supplied candles look like 4H bars by
+   * inspecting the median bar interval over the recent tail. Used to gate
+   * the cascade-leg trigger so callers that wire `byTimeframe['4h']` on a
+   * router shared across 1m / 1D feeds (e.g. the live engine's per-symbol
+   * router that also serves spot 1m signals) only activate cascade on
+   * actual 4H bars. Returns false on too-short bar arrays (no signal source
+   * exists below the cascade lookback anyway).
+   */
+  private isFourHourBars(candles: Candle[]): boolean {
+    if (candles.length < 3) return false;
+    const tailLen = Math.min(5, candles.length - 1);
+    const intervals: number[] = [];
+    for (let i = candles.length - tailLen; i < candles.length; i++) {
+      intervals.push(candles[i].timestamp - candles[i - 1].timestamp);
+    }
+    if (intervals.length === 0) return false;
+    intervals.sort((a, b) => a - b);
+    const med = intervals[Math.floor(intervals.length / 2)];
+    return med >= FOUR_HOUR_INTERVAL_MIN_MS && med <= FOUR_HOUR_INTERVAL_MAX_MS;
   }
 
   async evaluateAndOrder(

@@ -103,6 +103,22 @@ export const SKIP_MAX_CONCURRENT_SHORTS = 'max 3 concurrent shorts';
  * the symbol.
  */
 export const SKIP_PARKED_1D_DAILY = 'parked — failed §8 daily';
+/**
+ * TRA-255 §4.4 r6 — Phase-1.1 4H Layer 1+2 parked pending Layer 3 cascade-leg
+ * trigger. The Layer 1 (r4) and Layer 2 (r5) 4H sweeps both produced
+ * 0 / 9 windows with empty pre-route skip-reason histograms, confirming the
+ * §4.1 / §4.2 entry triggers themselves were the binding constraint on 4H —
+ * not the §3 / §5 / §6 gate stack and not the parameter values.
+ *
+ * While Layer 3 is in flight, every 4H short emission that is NOT routed
+ * through the new cascade-leg trigger (Momentum-short on 4H) or the relaxed
+ * Breakout-short knobs is suppressed pre-route with this reason so the
+ * dashboard surfaces the park instead of silently dropping the signal.
+ * Once Layer 3 lands and §8 4H passes, the park lifts (analogous to how 1D
+ * parked baseline works today). Until then, no Mean Reversion short or
+ * other off-spec 4H emission reaches sizing.
+ */
+export const SKIP_PARKED_4H_LAYER12 = 'parked — failed §8 4H Layer 1+2';
 
 // ── Filter thresholds (TRA-255 §5) ─────────────────────────────────────────
 
