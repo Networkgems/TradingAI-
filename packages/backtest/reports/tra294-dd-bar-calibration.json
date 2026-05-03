@@ -1,0 +1,339 @@
+{
+  "generatedAt": "2026-05-03T21:41:40.330Z",
+  "granularity": "4h",
+  "universe": [
+    "SOL-USD",
+    "DOGE-USD"
+  ],
+  "alignedStartTs": 1689278400000,
+  "trainBars": 1080,
+  "testBars": 540,
+  "stepBars": 540,
+  "rollingDdBars": 540,
+  "syntheticParams": {
+    "perTradeRisk": 0.01,
+    "hitRate": 0.3,
+    "rewardR": 2,
+    "riskR": 1,
+    "tradesPerWindow": 38,
+    "paths": 1000,
+    "seed": 8044922
+  },
+  "buyHoldByWindow": [
+    {
+      "index": 0,
+      "testStartTs": 1704830400000,
+      "testEndTs": 1712592000000,
+      "rollingMaxDdPct": 22.451299668584053,
+      "totalDdPct": 22.451299668584053,
+      "finalEquityUsd": 54306.654308191246,
+      "bars": 540
+    },
+    {
+      "index": 1,
+      "testStartTs": 1712606400000,
+      "testEndTs": 1720368000000,
+      "rollingMaxDdPct": 42.546732646982996,
+      "totalDdPct": 42.546732646982996,
+      "finalEquityUsd": 16137.71658550699,
+      "bars": 540
+    },
+    {
+      "index": 2,
+      "testStartTs": 1720382400000,
+      "testEndTs": 1728144000000,
+      "rollingMaxDdPct": 38.527583538552314,
+      "totalDdPct": 38.527583538552314,
+      "finalEquityUsd": 26476.134899880162,
+      "bars": 540
+    },
+    {
+      "index": 3,
+      "testStartTs": 1728158400000,
+      "testEndTs": 1735920000000,
+      "rollingMaxDdPct": 39.896354087558606,
+      "totalDdPct": 39.896354087558606,
+      "finalEquityUsd": 62371.41394576062,
+      "bars": 540
+    },
+    {
+      "index": 4,
+      "testStartTs": 1735934400000,
+      "testEndTs": 1743696000000,
+      "rollingMaxDdPct": 58.71422585663556,
+      "totalDdPct": 58.71422585663556,
+      "finalEquityUsd": 11840.388016743082,
+      "bars": 540
+    },
+    {
+      "index": 5,
+      "testStartTs": 1743710400000,
+      "testEndTs": 1751472000000,
+      "rollingMaxDdPct": 36.06523711603647,
+      "totalDdPct": 36.06523711603647,
+      "finalEquityUsd": 29517.867968375052,
+      "bars": 540
+    },
+    {
+      "index": 6,
+      "testStartTs": 1751486400000,
+      "testEndTs": 1759248000000,
+      "rollingMaxDdPct": 26.78246837310072,
+      "totalDdPct": 26.78246837310072,
+      "finalEquityUsd": 34376.11778691153,
+      "bars": 540
+    },
+    {
+      "index": 7,
+      "testStartTs": 1759262400000,
+      "testEndTs": 1767052800000,
+      "rollingMaxDdPct": 52.708120324718955,
+      "totalDdPct": 52.708120324718955,
+      "finalEquityUsd": 14022.321657269315,
+      "bars": 540
+    },
+    {
+      "index": 8,
+      "testStartTs": 1767067200000,
+      "testEndTs": 1774828800000,
+      "rollingMaxDdPct": 43.77849012217166,
+      "totalDdPct": 43.77849012217166,
+      "finalEquityUsd": 17749.82007839618,
+      "bars": 540
+    }
+  ],
+  "buyHoldAggregate": {
+    "maxRollingDdPctAcrossWindows": 58.71422585663556,
+    "medianRollingDdPctAcrossWindows": 39.896354087558606
+  },
+  "syntheticByWindow": [
+    {
+      "index": 0,
+      "mc": {
+        "paths": 1000,
+        "trades": 38,
+        "hitRate": 0.3,
+        "rewardR": 2,
+        "riskR": 1,
+        "perTradeRisk": 0.01,
+        "ddPercentiles": {
+          "p50": 9.777172444089466,
+          "p75": 13.254784724088287,
+          "p90": 16.575978475009986,
+          "p95": 18.332318628796514,
+          "p99": 22.21832757254189,
+          "max": 26.074042234590735
+        },
+        "meanDdPct": 10.548516839379046
+      }
+    },
+    {
+      "index": 1,
+      "mc": {
+        "paths": 1000,
+        "trades": 38,
+        "hitRate": 0.3,
+        "rewardR": 2,
+        "riskR": 1,
+        "perTradeRisk": 0.01,
+        "ddPercentiles": {
+          "p50": 9.696465139479711,
+          "p75": 13.22892694431773,
+          "p90": 16.6232071550253,
+          "p95": 18.355439093887625,
+          "p99": 20.756749708773302,
+          "max": 24.595523079282533
+        },
+        "meanDdPct": 10.480373261391547
+      }
+    },
+    {
+      "index": 2,
+      "mc": {
+        "paths": 1000,
+        "trades": 38,
+        "hitRate": 0.3,
+        "rewardR": 2,
+        "riskR": 1,
+        "perTradeRisk": 0.01,
+        "ddPercentiles": {
+          "p50": 9.723375592868162,
+          "p75": 13.228926944317731,
+          "p90": 16.62320715502531,
+          "p95": 18.355439093887604,
+          "p99": 20.764440180677187,
+          "max": 27.52357081822621
+        },
+        "meanDdPct": 10.490516945897442
+      }
+    },
+    {
+      "index": 3,
+      "mc": {
+        "paths": 1000,
+        "trades": 38,
+        "hitRate": 0.3,
+        "rewardR": 2,
+        "riskR": 1,
+        "perTradeRisk": 0.01,
+        "ddPercentiles": {
+          "p50": 9.750278026941476,
+          "p75": 13.280634798240529,
+          "p90": 16.648053439293072,
+          "p95": 18.355439093887615,
+          "p99": 21.53318108322732,
+          "max": 23.83386169624502
+        },
+        "meanDdPct": 10.59144392925434
+      }
+    },
+    {
+      "index": 4,
+      "mc": {
+        "paths": 1000,
+        "trades": 38,
+        "hitRate": 0.3,
+        "rewardR": 2,
+        "riskR": 1,
+        "perTradeRisk": 0.01,
+        "ddPercentiles": {
+          "p50": 9.777172444089448,
+          "p75": 13.280634798240532,
+          "p90": 15.881361490672107,
+          "p95": 18.28240533264027,
+          "p99": 20.756749708773302,
+          "max": 27.545168794122365
+        },
+        "meanDdPct": 10.610224076570091
+      }
+    },
+    {
+      "index": 5,
+      "mc": {
+        "paths": 1000,
+        "trades": 38,
+        "hitRate": 0.3,
+        "rewardR": 2,
+        "riskR": 1,
+        "perTradeRisk": 0.01,
+        "ddPercentiles": {
+          "p50": 9.696465139479736,
+          "p75": 13.332311838874277,
+          "p90": 16.551110706000397,
+          "p95": 18.234898185187298,
+          "p99": 22.29492249541065,
+          "max": 25.349567848489706
+        },
+        "meanDdPct": 10.58148452113493
+      }
+    },
+    {
+      "index": 6,
+      "mc": {
+        "paths": 1000,
+        "trades": 38,
+        "hitRate": 0.3,
+        "rewardR": 2,
+        "riskR": 1,
+        "perTradeRisk": 0.01,
+        "ddPercentiles": {
+          "p50": 9.777172444089484,
+          "p75": 13.306477169070675,
+          "p90": 16.57597847500998,
+          "p95": 18.306757175851175,
+          "p99": 20.6631666249619,
+          "max": 25.34956784848972
+        },
+        "meanDdPct": 10.654486646728715
+      }
+    },
+    {
+      "index": 7,
+      "mc": {
+        "paths": 1000,
+        "trades": 38,
+        "hitRate": 0.3,
+        "rewardR": 2,
+        "riskR": 1,
+        "perTradeRisk": 0.01,
+        "ddPercentiles": {
+          "p50": 9.763725235515473,
+          "p75": 13.22892694431771,
+          "p90": 17.41021869025992,
+          "p95": 19.123689604092643,
+          "p99": 23.09489782242198,
+          "max": 28.24833511004395
+        },
+        "meanDdPct": 10.698052259084513
+      }
+    },
+    {
+      "index": 8,
+      "mc": {
+        "paths": 1000,
+        "trades": 38,
+        "hitRate": 0.3,
+        "rewardR": 2,
+        "riskR": 1,
+        "perTradeRisk": 0.01,
+        "ddPercentiles": {
+          "p50": 9.777172444089487,
+          "p75": 13.254784724088312,
+          "p90": 16.67289231936819,
+          "p95": 18.355439093887625,
+          "p99": 21.456301105587052,
+          "max": 25.34956784848973
+        },
+        "meanDdPct": 10.527494522371976
+      }
+    }
+  ],
+  "syntheticAggregate": {
+    "paths": 9000,
+    "p50": 9.75027802694148,
+    "p75": 13.254784724088331,
+    "p90": 16.623207155025298,
+    "p95": 18.355439093887615,
+    "p99": 21.532717570770924,
+    "max": 28.24833511004395,
+    "mean": 10.57584366686795
+  },
+  "realizedVol": {
+    "perAsset": {
+      "SOL-USD": {
+        "annualizedVol": 0.832166075780051,
+        "daysPerYear": 365,
+        "granularity": "4h→1d"
+      },
+      "DOGE-USD": {
+        "annualizedVol": 0.9633882812936821,
+        "daysPerYear": 365,
+        "granularity": "4h→1d"
+      }
+    },
+    "portfolio_SOL_DOGE_50_50": {
+      "annualizedVol": 0.8530487460879254
+    }
+  },
+  "spy": {
+    "fromMs": 1704205800000,
+    "toMs": 1777642200000,
+    "bars": 585,
+    "annualizedVol": 0.1599304486083818,
+    "bhRollingDdPct63": 18.998904129504908,
+    "bhTotalDdPct": 18.998904129504908,
+    "syntheticMcSameAsCrypto": true
+  },
+  "proposal": {
+    "baselineBarPct": 8,
+    "baselineSigmaSpy": 0.1599304486083818,
+    "universePortfolioSigma": 0.8530487460879254,
+    "ratioUniverseToSpy": 5.333873277481809,
+    "proposedBarPct": 42.67098621985447,
+    "pctileOnSyntheticMC": 1
+  },
+  "recommendation": {
+    "proposedBarPct": 25,
+    "rationale": "Naive vol-scaled formula gives 42.67% (8% × σ_universe / σ_SPY = 8% × 5.33) — at p100 of the synthetic MC DD distribution and ≈ at the passive 50/50 SOL+DOGE B&H median (39.9%). That bar is too loose: a no-alpha strategy would pass it. Risk-normalized position sizing (ATR-stops at fixed per-trade-risk) absorbs most of the σ-scaling, so the dominant DD components are sequence-of-trades randomness (synthetic MC, universe-agnostic) + a small intra-trade DD contribution. Recommended 25% = ceil-to-5%(synthetic MC p99 21.53% + 1.5% intra-trade buffer). Lands at p100 of synthetic MC, well below the median passive B&H DD floor (39.9%) — so meaningful active alpha is required, but pure sequence-of-trades randomness rarely fails it."
+  }
+}
