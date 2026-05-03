@@ -83,7 +83,7 @@ import {
   type ShortFilterContext,
 } from '@trading-app/engine';
 import type { Candle, ExitReason, Position, TradeSignal } from '@trading-app/shared';
-import { loadOrFetchDailyBars } from './fetch-tra266-data.js';
+import { loadOrFetch4hBars, loadOrFetchDailyBars } from './fetch-tra266-data.js';
 
 const HERE = dirname(fileURLToPath(import.meta.url));
 const REPORT_DIR = resolve(HERE, '..', 'reports');
@@ -1059,15 +1059,15 @@ async function main() {
       console.log(`  ${sym}: ${bars.length} bars`);
     }
   } else {
-    // 4H bar fetcher lives behind TRA-267 (Coinbase public candles,
-    // granularity=14400). The fetcher will land in `fetch-tra266-data.ts`
-    // alongside the daily one; until then surface a precise pointer so the
-    // operator knows which child ticket is gating the run.
-    throw new Error(
-      '--granularity=4h needs the 4H bar fetcher landed by TRA-267 '
-      + '(Expose Coinbase 4H crypto candles for Phase-1 perp shorts universe). '
-      + 'Currently only --granularity=1d is wired (parked baseline).',
-    );
+    // 4H bars come from Coinbase Exchange (1H paginated → aggregated to 4H on
+    // UTC 00/04/08/12/16/20 boundaries — see `coinbase-feed.ts`). Cache file
+    // is `<symbol>.4h.json`, parallel to the daily one, with a 12h TTL.
+    console.log(`[run-tra261-sweep] Loading 4H bars ${formatWindowDate(fromMs)} → ${formatWindowDate(toMs)}`);
+    for (const sym of PERP_SHORTS_UNIVERSE) {
+      const bars = await loadOrFetch4hBars(sym, fromMs, toMs);
+      fullByPair.set(sym, bars);
+      console.log(`  ${sym}: ${bars.length} bars`);
+    }
   }
 
   // Bar series sanity check — Yahoo gives a comparable calendar across symbols on 1D.
