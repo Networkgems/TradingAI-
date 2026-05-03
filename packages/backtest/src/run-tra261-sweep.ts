@@ -140,18 +140,33 @@ interface ShortSpec {
   regime?: RegimeDetectorOptions;
 }
 
+// TRA-255 §4.4 r5 (2026-05-03) — Phase-1.1 4H entry-trigger overrides
+// (Layer 1 + Layer 2 promoted in the same heartbeat per QuantTrader pre-auth).
+//
+// Layer 1: `Momentum.slowMaSlopeBars 10 → 5`, `Momentum.volumeMultiplier
+//          1.25 → 1.10`, `Breakout.volumeMultiplier 2.5 → 1.75`.
+// Layer 2: regime hysteresis `flipBars 3 → 2` (12h → 8h on 4H), BTC
+//          alt-overlay softening (only block alts when BTC `trend_up` AND
+//          daily MA200 slope is positive over 5 daily bars — applied at
+//          the harness's `evaluateShortFilters` call site).
+//
+// ATR multipliers stay at r3 values per the §8 sensitivity-sweep evidence
+// (±20% produced 0 trades at every point — they are not the binding gate).
 const BASELINE_SPEC: ShortSpec = {
   momentum: {
     atrStopMultiplier: 2.0,
     rearmBars: 8,
-    slowMaSlopeBars: 10,
-    volumeMultiplier: 1.25,
+    slowMaSlopeBars: 5,
+    volumeMultiplier: 1.10,
     volumeSmaPeriod: 20,
   },
   breakout: {
-    volumeMultiplier: 2.5,
+    volumeMultiplier: 1.75,
     atrStopMultiplier: 1.75,
     atrTpMultiplier: 3.0,
+  },
+  regime: {
+    flipBars: 2,
   },
 };
 
@@ -310,6 +325,15 @@ function runShortSim(input: SimInput): SimReport {
   const btcRouter = routers.get('BTC-USD');
   if (!btcRouter) throw new Error('BTC-USD must be in the simulation universe (regime overlay).');
 
+  // TRA-255 §4.4 r5 Layer 2 — pre-compute BTC's daily-bar MA200 series so the
+  // alt-overlay softening gate can ask "is the daily MA200 slope positive
+  // over 5 daily bars?" at each 4H tick. On 1D the harness already runs in
+  // parked mode so the slope diagnostic is irrelevant; we only build the
+  // series for the 4H path.
+  const btcDailyMa200 = input.granularity === '4h'
+    ? buildBtcDailyMa200Series(input.candlesBySymbol.get('BTC-USD')!)
+    : null;
+
   // Build a unified day index — every symbol shares the same Yahoo daily
   // calendar (no weekends/holidays gaps for crypto), but be defensive: take
   // the *intersection* of timestamps so the simulation only steps days where
@@ -411,7 +435,18 @@ function runShortSim(input: SimInput): SimReport {
       // §5 multiplicative filters. Only BTC regime is wired; funding / spread /
       // OI feeds aren't yet plumbed for the harness (TRA-255 §5 explicitly
       // allows skipping with TODOs).
-      const ctx: ShortFilterContext = { btcRegime };
+      //
+      // §4.4 r5 Layer 2 — compute BTC's daily MA200 5-bar slope flag from the
+      // pre-computed daily series so the BTC alt-overlay gate is "real
+      // uptrend" only, not a regime-detector hiccup. Undefined on 1D (parked)
+      // and on the early calendar slice (insufficient daily history).
+      const btcDailyMa200SlopePositive = btcDailyMa200
+        ? btcDailyMa200SlopePositiveOver5DailyBarsAt(btcDailyMa200, ts)
+        : undefined;
+      const ctx: ShortFilterContext = {
+        btcRegime,
+        btcDailyMa200SlopePositiveOver5DailyBars: btcDailyMa200SlopePositive,
+      };
       const filterReason = evaluateShortFilters(signal, ctx);
       if (filterReason) {
         bumpSkip(filterReason);
@@ -579,6 +614,73 @@ function runShortSim(input: SimInput): SimReport {
   }
 
   return { closedShorts, equityCurve, skipReasons };
+}
+
+// ── BTC daily MA200 slope helpers (TRA-255 §4.4 r5 Layer 2) ────────────────
+
+/**
+ * Daily MA200 series derived from BTC's 4H bars by aggregating each UTC date's
+ * last 4H close as the daily close. Used by the BTC alt-overlay softening
+ * gate to distinguish a "real" uptrend (positive MA200 slope over 5 daily
+ * bars) from a regime-detector hiccup label.
+ *
+ *  - `dailyTs[i]`: the UTC end-of-day timestamp for the day's close (the
+ *    last 4H bar of that UTC date). Strictly monotonic.
+ *  - `ma200[i]`:  SMA of the most recent 200 daily closes ending at
+ *    `dailyTs[i]`. `null` for the first 199 days (insufficient history).
+ */
+interface BtcDailyMa200Series {
+  dailyTs: number[];
+  ma200: Array<number | null>;
+}
+
+function buildBtcDailyMa200Series(btc4hBars: Candle[]): BtcDailyMa200Series {
+  // Group 4H bars by UTC date; keep each date's *last* (latest-timestamp) close
+  // as the canonical daily close.
+  const byDate = new Map<string, { lastTs: number; close: number }>();
+  for (const bar of btc4hBars) {
+    const date = new Date(bar.timestamp).toISOString().slice(0, 10);
+    const existing = byDate.get(date);
+    if (!existing || bar.timestamp > existing.lastTs) {
+      byDate.set(date, { lastTs: bar.timestamp, close: bar.close });
+    }
+  }
+  const sorted = [...byDate.values()].sort((a, b) => a.lastTs - b.lastTs);
+  const dailyTs = sorted.map((d) => d.lastTs);
+  const closes = sorted.map((d) => d.close);
+  const ma200: Array<number | null> = closes.map((_, i) => {
+    if (i < 199) return null;
+    let sum = 0;
+    for (let k = i - 199; k <= i; k++) sum += closes[k];
+    return sum / 200;
+  });
+  return { dailyTs, ma200 };
+}
+
+/**
+ * `true` iff BTC's daily MA200 strictly increased between the most-recent
+ * completed daily close at-or-before `asOfTs` and 5 daily bars before that.
+ * Returns `undefined` when fewer than `199 + 5` daily closes are available
+ * — the gate is then skipped (preserves r1-r4 default-block behaviour).
+ */
+function btcDailyMa200SlopePositiveOver5DailyBarsAt(
+  series: BtcDailyMa200Series,
+  asOfTs: number,
+): boolean | undefined {
+  // Find the latest dailyTs <= asOfTs. The daily array is small (≈ 1500 entries
+  // for our 4y window) so a linear scan from the tail is cheap.
+  let i = -1;
+  for (let k = series.dailyTs.length - 1; k >= 0; k--) {
+    if (series.dailyTs[k] <= asOfTs) {
+      i = k;
+      break;
+    }
+  }
+  if (i < 5) return undefined;
+  const cur = series.ma200[i];
+  const prev = series.ma200[i - 5];
+  if (cur === null || prev === null) return undefined;
+  return cur > prev;
 }
 
 function openShortNotionalForSymbol(

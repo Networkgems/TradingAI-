@@ -246,6 +246,21 @@ export interface ShortFilterContext {
    */
   btcRegime?: Regime;
   /**
+   * TRA-255 §4.4 r5 (2026-05-03) Layer 2 — BTC alt-overlay softening.
+   *
+   * `true` = BTC's daily MA200 slope is positive over the last 5 daily bars
+   *          (i.e. a "real" uptrend). The alt-overlay block stays in effect.
+   * `false` = the regime is labelled `trend_up` but the daily MA200 slope is
+   *           **not** positive over 5 daily bars (a regime-detector hiccup,
+   *           not a sustained uptrend). The alt-overlay block is **skipped**.
+   * `undefined` = caller did not supply the slope diagnostic. The alt-overlay
+   *               block applies whenever `btcRegime === 'trend_up'` (original
+   *               r1-r4 behaviour). Backwards-compatible default.
+   *
+   * Skip-reason string is unchanged on a failing gate per spec.
+   */
+  btcDailyMa200SlopePositiveOver5DailyBars?: boolean;
+  /**
    * Live order-book spread as a fraction of mid: `(ask - bid) / mid`. The
    * spot-spread guard (TRA-243) feeds the same value with a different
    * threshold; perp routing retunes to 10 bps per spec §5.
@@ -297,6 +312,10 @@ export function evaluateShortFilters(
   if (
     isAltSymbol(signal.symbol)
     && ctx.btcRegime === 'trend_up'
+    // §4.4 r5 Layer 2 softening: a `trend_up` label without a positive daily
+    // MA200 slope over 5 daily bars is a regime-detector hiccup, not a real
+    // uptrend — let the alt short through. Undefined preserves r1-r4 behaviour.
+    && ctx.btcDailyMa200SlopePositiveOver5DailyBars !== false
   ) {
     return SKIP_BTC_TREND_UP;
   }
