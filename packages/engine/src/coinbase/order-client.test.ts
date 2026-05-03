@@ -578,6 +578,150 @@ describe('CoinbaseOrderClient', () => {
         const [url] = fetchMock.mock.calls[0];
         expect(String(url)).toBe('https://api.coinbase.com/api/v3/brokerage/products?product_type=SPOT');
       });
+
+      // TRA-262 — perp products carry funding_rate + open_interest under
+      // future_product_details.perpetual_details. listProducts must surface
+      // these on `perp` so the §5 short filters can read them; spot products
+      // (no perpetual_details block) must omit `perp` entirely.
+      it('surfaces perp metrics (funding/OI) and converts open_interest to USD', async () => {
+        const client = makeClient();
+        fetchMock.mockResolvedValueOnce(jsonResponse({
+          products: [
+            {
+              product_id: 'BTC-PERP-INTX',
+              product_type: 'FUTURE',
+              status: 'online',
+              price: '60000',
+              future_product_details: {
+                perpetual_details: {
+                  funding_rate: '-0.0001',
+                  funding_time: '2026-05-02T16:00:00Z',
+                  open_interest: '1500',
+                },
+              },
+            },
+            {
+              // Perp without OI — funding still rides through.
+              product_id: 'ETH-PERP-INTX',
+              product_type: 'FUTURE',
+              status: 'online',
+              price: '3000',
+              future_product_details: { perpetual_details: { funding_rate: '0.00005' } },
+            },
+            {
+              // Perp with OI but no price — OI must degrade to undefined,
+              // not produce a NaN that silently bypasses the OI gate.
+              product_id: 'NEW-PERP-INTX',
+              product_type: 'FUTURE',
+              status: 'online',
+              future_product_details: { perpetual_details: { open_interest: '50000' } },
+            },
+            // Spot — no perpetual_details, `perp` omitted entirely.
+            { product_id: 'BTC-USD', product_type: 'SPOT', status: 'online', price: '60000' },
+          ],
+        }));
+
+        const products = await client.listProducts('FUTURE');
+        const byId = new Map(products.map((p) => [p.product_id, p]));
+
+        expect(byId.get('BTC-PERP-INTX')?.perp).toEqual({
+          fundingRatePerHour: -0.0001,
+          nextFundingTimeMs: Date.parse('2026-05-02T16:00:00Z'),
+          openInterestUsd: 1500 * 60000,
+        });
+        expect(byId.get('ETH-PERP-INTX')?.perp).toEqual({ fundingRatePerHour: 0.00005 });
+        expect(byId.get('NEW-PERP-INTX')?.perp).toBeUndefined();
+        expect(byId.get('BTC-USD')?.perp).toBeUndefined();
+      });
+
+      it('drops a perp funding_rate that is unparseable rather than emitting NaN', async () => {
+        const client = makeClient();
+        fetchMock.mockResolvedValueOnce(jsonResponse({
+          products: [
+            {
+              product_id: 'BAD-PERP-INTX',
+              product_type: 'FUTURE',
+              status: 'online',
+              price: '100',
+              future_product_details: {
+                perpetual_details: { funding_rate: 'not-a-number', open_interest: '10' },
+              },
+            },
+          ],
+        }));
+
+        const [bad] = await client.listProducts('FUTURE');
+        // funding_rate parse failed, OI still resolves → only OI is set.
+        expect(bad.perp?.fundingRatePerHour).toBeUndefined();
+        expect(bad.perp?.openInterestUsd).toBe(10 * 100);
+      });
+    });
+
+    // TRA-262 — live order-book snapshot for the §5 spread gate. The endpoint
+    // is greenfield (no spot variant existed pre-TRA-262); these tests pin
+    // the URL shape, the mid/spread math, and the degraded-input semantics
+    // (one-sided book, crossed book, missing pricebook).
+    describe('getProductBook', () => {
+      it('fetches /product_book?product_id=...&limit=1 and computes mid + spread', async () => {
+        const client = makeClient();
+        fetchMock.mockResolvedValueOnce(jsonResponse({
+          pricebook: {
+            product_id: 'BTC-PERP-INTX',
+            bids: [{ price: '60000', size: '0.5' }],
+            asks: [{ price: '60030', size: '0.5' }],
+            time: '2026-05-02T16:00:00Z',
+          },
+        }));
+
+        const book = await client.getProductBook('BTC-PERP-INTX');
+
+        expect(book.bestBid).toBe(60000);
+        expect(book.bestAsk).toBe(60030);
+        expect(book.midPrice).toBe(60015);
+        // 30 / 60015 ≈ 0.0004999 — well above the 10 bps gate.
+        expect(book.spreadFraction).toBeCloseTo(30 / 60015, 12);
+        const [url] = fetchMock.mock.calls[0];
+        expect(String(url)).toBe('https://api.coinbase.com/api/v3/brokerage/product_book?product_id=BTC-PERP-INTX&limit=1');
+      });
+
+      it('drops spread when the book is one-sided so the gate skips instead of reading a synthetic value', async () => {
+        const client = makeClient();
+        fetchMock.mockResolvedValueOnce(jsonResponse({
+          pricebook: { product_id: 'BTC-PERP-INTX', bids: [{ price: '60000', size: '0.5' }], asks: [], time: '...' },
+        }));
+
+        const book = await client.getProductBook('BTC-PERP-INTX');
+
+        expect(book.bestBid).toBe(60000);
+        expect(book.bestAsk).toBeUndefined();
+        expect(book.midPrice).toBeUndefined();
+        expect(book.spreadFraction).toBeUndefined();
+      });
+
+      it('drops spread on a crossed/inverted book (best ask < best bid) rather than emitting a negative fraction', async () => {
+        const client = makeClient();
+        fetchMock.mockResolvedValueOnce(jsonResponse({
+          pricebook: {
+            product_id: 'THIN-PERP-INTX',
+            bids: [{ price: '100.10', size: '1' }],
+            asks: [{ price: '100.05', size: '1' }],
+            time: '...',
+          },
+        }));
+
+        const book = await client.getProductBook('THIN-PERP-INTX');
+
+        expect(book.bestBid).toBe(100.10);
+        expect(book.bestAsk).toBe(100.05);
+        expect(book.midPrice).toBeUndefined();
+        expect(book.spreadFraction).toBeUndefined();
+      });
+
+      it('throws when called with an empty productId (caller forgot to resolve the perp product_id)', async () => {
+        const client = makeClient();
+        await expect(client.getProductBook('')).rejects.toThrow(/productId/);
+        expect(fetchMock).not.toHaveBeenCalled();
+      });
     });
 
     describe('listPortfolios + listFuturesPositions', () => {

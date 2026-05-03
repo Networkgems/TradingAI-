@@ -223,11 +223,18 @@ export class CryptoSignalEngine {
     // tickers (e.g. MATIC after the POL rename) with a clear reason instead
     // of eating a 400 INVALID_ARGUMENT on the order endpoint.
     await broker.refreshTradableProducts(this.getActiveSymbols());
-    // TRA-249-C — pre-load the spot↔perp catalog so the first tick that
-    // routes a SELL signal can resolve `BTC-USD` → `BTC-PERP-INTX` (the
-    // actual Coinbase INTX product_id) instead of submitting the spot
-    // symbol directly to the perp endpoint.
+    // TRA-249-C / TRA-262 — pre-load the spot↔perp catalog AND the per-perp
+    // funding/OI cache so the first tick that routes a SELL signal can
+    // resolve `BTC-USD` → `BTC-PERP-INTX` AND evaluate the §5 funding/OI
+    // gates against real Coinbase telemetry. The two concerns share one
+    // `/products?product_type=FUTURE` round-trip.
     await broker.refreshPerpCatalog(this.getActiveSymbols());
+    // TRA-262 — pre-load order-book spreads for the perp universe so the
+    // first short signal evaluated post-init reads a real (ask - bid) / mid
+    // fraction instead of skipping the §5 spread gate. Best-effort: a
+    // failure here is logged per-product and the per-tick refresh in
+    // `runLiveTick` retries on the next iteration.
+    await broker.refreshPerpOrderBookSpreads(this.getActiveSymbols());
   }
 
   /**
@@ -442,10 +449,18 @@ export class CryptoSignalEngine {
    *   - BTC regime: read live from the per-symbol router's RegimeDetector for
    *     `BTC-USD`. Lazily creates the BTC router on first call so we don't
    *     have to wait for BTC's own tick to ingest the gate.
-   *   - Funding rate / spread / OI: data feed not yet exposed (TRA-261
-   *     follow-up). Inputs left undefined → corresponding gate is skipped per
-   *     `evaluateShortFilters`'s "best effort" contract; the universe gate
-   *     and BTC regime gate still apply.
+   *   - Funding rate / OI: hourly perp catalog refresh on the live broker
+   *     (TRA-262). One `/products?product_type=FUTURE` round-trip populates
+   *     the catalog AND the metrics cache, so adding the inputs costs zero
+   *     extra Coinbase API budget vs the pre-TRA-262 path.
+   *   - Spread: live order-book snapshot refreshed once per live tick across
+   *     the perp universe (TRA-262). A per-signal fetch would multiply the
+   *     API budget on a tick that emits multiple short candidates.
+   *
+   * Demo-mode short signals: the live broker may be uninitialised, in which
+   * case funding/OI/spread are left undefined and the corresponding gates
+   * skip per the strategy layer's best-effort contract. Universe and BTC
+   * regime gates always apply regardless of mode.
    */
   private applyShortGates(signal: TradeSignal): void {
     if (signal.side !== 'sell') return;
@@ -459,13 +474,10 @@ export class CryptoSignalEngine {
     // BTC-USD owns BTC's regime detector; querying its current label gives
     // us the post-hysteresis regime without re-ticking the detector.
     const btcRouter = this.routers.get('BTC-USD');
+    const liveCtx = this.liveAccount?.getPerpShortFilterContext(signal.symbol) ?? {};
     const ctx: ShortFilterContext = {
+      ...liveCtx,
       btcRegime: btcRouter ? btcRouter.currentRegime() : undefined,
-      // TODO(TRA-261): wire funding rate, perp order-book spread, and 24h OI
-      // from the Coinbase perp data feed. Until those land, these gates are
-      // skipped per the spec's explicit "skip OI guard with a TODO" allowance
-      // (TRA-255 §5). The universe and BTC regime gates carry the load until
-      // the data feeds are wired.
     };
 
     const reason = evaluateShortFilters(signal, ctx);
@@ -725,12 +737,21 @@ export class CryptoSignalEngine {
     if (live.isTradableProductsStale()) {
       await live.refreshTradableProducts(activeSymbols);
     }
-    // TRA-249-C — perp catalog runs on a tighter (1h) cadence so a
+    // TRA-249-C / TRA-262 — perp catalog runs on a tighter (1h) cadence so a
     // newly-listed INTX perp becomes routable mid-session without waiting
-    // on a server restart.
+    // on a server restart. The same call also refreshes the per-perp
+    // funding-rate + OI cache (TRA-262) so the §5 short filters never read
+    // stale telemetry past the published ~8h Coinbase funding window.
     if (live.isPerpCatalogStale()) {
       await live.refreshPerpCatalog(activeSymbols);
     }
+    // TRA-262 — pull a fresh order-book spread snapshot per perp universe
+    // symbol once per tick. Done before signal evaluation so `applyShortGates`
+    // reads near-real-time spread fractions without a per-signal Coinbase
+    // round-trip. Best-effort: a per-product failure clears that one entry
+    // (the gate degrades to "skipped" for that symbol) without blocking
+    // the rest of the universe.
+    await live.refreshPerpOrderBookSpreads(activeSymbols);
 
     try {
       const closed = await live.checkExits(prices);

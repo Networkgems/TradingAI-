@@ -128,6 +128,13 @@ interface CoinbaseProduct {
       funding_rate?: string;
       /** ISO-8601 timestamp of the next funding settlement window. */
       funding_time?: string;
+      /**
+       * TRA-262 — total open interest on this perp, expressed in BASE units
+       * (e.g. `"1234.5"` BTC). Multiply by `price` to derive a USD figure for
+       * the §5 OI gate. Optional because Coinbase pre-perp fixtures don't
+       * carry the field and a freshly-listed perp may publish it later.
+       */
+      open_interest?: string;
     };
   };
 }
@@ -184,6 +191,69 @@ export interface CoinbaseListedProduct {
   product_type?: string;
   price?: string;
   status?: string;
+  /**
+   * TRA-262 — perp-only telemetry parsed off `future_product_details.perpetual_details`.
+   * Spot products and perps with no published values omit the field entirely so
+   * callers can `if (p.perp)` to gate perp-specific code paths without
+   * defensive null checks at every read site.
+   */
+  perp?: CoinbasePerpMetrics;
+}
+
+/**
+ * TRA-262 — per-perp metrics needed by the strategy-layer §5 short filters.
+ *
+ * Funding rate is the hourly fraction Coinbase publishes; the funding gate
+ * trips at ≤ -0.05%/h (TRA-261 spec). `openInterestUsd` is precomputed at
+ * fetch time (`open_interest × mark/last price`) so the live broker doesn't
+ * have to redo the conversion on every gate evaluation, and so a missing
+ * price (perp without a last trade) cleanly degrades the field to undefined
+ * instead of producing a `NaN` that would silently bypass the OI gate.
+ *
+ * All fields are optional: a perp that publishes funding but not OI yet
+ * (or vice versa) still routes the available field through and skips the
+ * gate that's missing input.
+ */
+export interface CoinbasePerpMetrics {
+  /** Hourly funding rate as a decimal (positive = longs pay shorts). */
+  fundingRatePerHour?: number;
+  /** Optional next funding settlement time, ms epoch. Informational. */
+  nextFundingTimeMs?: number;
+  /** 24h open interest in USD: `open_interest (base units) × price`. */
+  openInterestUsd?: number;
+}
+
+/**
+ * TRA-262 — top-of-book snapshot for one Coinbase product, used by the §5
+ * spread gate to suppress perp shorts when round-trip cost on the book would
+ * exceed 10 bps of mid. Keeps numeric vs. string parsing centralised in
+ * {@link CoinbaseOrderClient.getProductBook} so the live broker reads
+ * already-validated floats.
+ *
+ * `spreadFraction = (bestAsk - bestBid) / mid`, with `mid = (bestBid + bestAsk) / 2`.
+ * Undefined when either side is missing or when both sides are zero (a halted
+ * book) — the spread gate degrades to "skipped" rather than being fed a
+ * synthetic value that would silently pass.
+ */
+export interface CoinbaseProductBook {
+  bestBid?: number;
+  bestAsk?: number;
+  midPrice?: number;
+  spreadFraction?: number;
+}
+
+interface ProductBookEntry {
+  price?: string;
+  size?: string;
+}
+
+interface ProductBookResponse {
+  pricebook?: {
+    product_id?: string;
+    bids?: ProductBookEntry[];
+    asks?: ProductBookEntry[];
+    time?: string;
+  };
 }
 
 /**
@@ -509,6 +579,14 @@ export class CoinbaseOrderClient {
    * entries (`trading_disabled`, `is_disabled`, or `cancel_only`) are dropped
    * here so callers don't need to redo that filter. Coinbase exposes a few
    * orthogonal lifecycle flags; we treat any of them being true as inactive.
+   *
+   * TRA-262 — for `productType === 'FUTURE'` we additionally surface the
+   * perp telemetry needed by the §5 short filters (funding rate per-hour,
+   * next funding time, 24h open interest in USD). Fields are optional on the
+   * returned shape: a perp that publishes funding but not OI yet (or vice
+   * versa) routes the partial set through, and the strategy layer's gate
+   * pipeline skips any filter whose input is undefined per its "best effort"
+   * contract.
    */
   async listProducts(productType: 'SPOT' | 'FUTURE'): Promise<CoinbaseListedProduct[]> {
     const params = new URLSearchParams();
@@ -523,9 +601,55 @@ export class CoinbaseOrderClient {
         product_type: p.product_type,
         price: p.price,
         status: p.status,
+        perp: parsePerpMetrics(p),
       });
     }
     return out;
+  }
+
+  /**
+   * GET /api/v3/brokerage/product_book?product_id=...&limit=1 — fetch the top
+   * of book for one product so callers can derive the live `(ask - bid) / mid`
+   * spread (TRA-262).
+   *
+   * Coinbase's Advanced Trade product_book endpoint returns the L2 book at
+   * the requested depth; `limit=1` is the cheapest call and is sufficient for
+   * the §5 spread gate, which only inspects the best bid/ask pair. Numeric
+   * parsing is centralised here so the live broker can read already-validated
+   * floats — a missing or non-finite side degrades the whole snapshot to
+   * undefined fields rather than emitting a synthetic spread that would
+   * silently pass the gate.
+   *
+   * Best-effort: a non-2xx response throws (so transient outages are loud,
+   * not silent), but a stale or one-sided book yields an object with the
+   * bidside / askside left undefined. The 10 bps gate inside
+   * `evaluateShortFilters` skips when its `spreadFraction` input is undefined.
+   */
+  async getProductBook(productId: string): Promise<CoinbaseProductBook> {
+    if (!productId) throw new Error('getProductBook requires productId');
+    const params = new URLSearchParams();
+    params.set('product_id', productId);
+    params.set('limit', '1');
+    const path = `/api/v3/brokerage/product_book?${params.toString()}`;
+    const data = await this.request<ProductBookResponse>('GET', path, '');
+    const bidStr = data.pricebook?.bids?.[0]?.price;
+    const askStr = data.pricebook?.asks?.[0]?.price;
+    const bid = bidStr != null ? parseFloat(bidStr) : NaN;
+    const ask = askStr != null ? parseFloat(askStr) : NaN;
+    const bestBid = Number.isFinite(bid) && bid > 0 ? bid : undefined;
+    const bestAsk = Number.isFinite(ask) && ask > 0 ? ask : undefined;
+    if (bestBid == null || bestAsk == null) return { bestBid, bestAsk };
+    if (bestAsk < bestBid) {
+      // Crossed/inverted book — Coinbase shouldn't return this on a live
+      // product but we've seen one-tick crosses on illiquid alts. Drop the
+      // spread rather than emitting a negative fraction the gate would
+      // misread as "tight".
+      return { bestBid, bestAsk };
+    }
+    const midPrice = (bestBid + bestAsk) / 2;
+    if (!(midPrice > 0)) return { bestBid, bestAsk };
+    const spreadFraction = (bestAsk - bestBid) / midPrice;
+    return { bestBid, bestAsk, midPrice, spreadFraction };
   }
 
   /**
@@ -721,6 +845,45 @@ export class CoinbaseOrderClient {
 function formatSize(n: number): string {
   if (!Number.isFinite(n)) throw new Error(`invalid size: ${n}`);
   return n.toFixed(8).replace(/\.?0+$/, '') || '0';
+}
+
+/**
+ * TRA-262 — extract {@link CoinbasePerpMetrics} from one raw `/products`
+ * entry. Returns `undefined` for spot products (no `future_product_details`
+ * block) and for perps that publish neither funding nor OI yet, so the
+ * caller's `if (p.perp)` check stays meaningful. OI is converted to USD here
+ * (`open_interest × price`) because the §5 OI gate takes USD; doing the
+ * conversion at parse time avoids redoing it on every gate evaluation and
+ * cleanly degrades a missing price to "OI undefined" instead of producing
+ * a NaN that would silently bypass the gate.
+ */
+function parsePerpMetrics(p: CoinbaseProduct): CoinbasePerpMetrics | undefined {
+  const perp = p.future_product_details?.perpetual_details;
+  if (!perp) return undefined;
+  const out: CoinbasePerpMetrics = {};
+  if (perp.funding_rate != null) {
+    const r = parseFloat(perp.funding_rate);
+    if (Number.isFinite(r)) out.fundingRatePerHour = r;
+  }
+  if (perp.funding_time) {
+    const ms = Date.parse(perp.funding_time);
+    if (Number.isFinite(ms)) out.nextFundingTimeMs = ms;
+  }
+  if (perp.open_interest != null) {
+    const oiBase = parseFloat(perp.open_interest);
+    const px = parseFloat(p.price ?? '');
+    if (Number.isFinite(oiBase) && oiBase >= 0 && Number.isFinite(px) && px > 0) {
+      out.openInterestUsd = oiBase * px;
+    }
+  }
+  if (
+    out.fundingRatePerHour === undefined
+    && out.nextFundingTimeMs === undefined
+    && out.openInterestUsd === undefined
+  ) {
+    return undefined;
+  }
+  return out;
 }
 
 function looksLikePem(s: string): boolean {

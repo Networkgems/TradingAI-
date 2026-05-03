@@ -13,4 +13,6 @@ export type {
   CoinbaseListedProduct,
   CoinbaseFuturesPosition,
   CoinbaseFundingRate,
+  CoinbasePerpMetrics,
+  CoinbaseProductBook,
 } from './order-client.js';

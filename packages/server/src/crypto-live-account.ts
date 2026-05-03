@@ -13,7 +13,9 @@ import type {
   CoinbaseListedProduct,
   CoinbaseOrderDetails,
   CoinbaseOrderSuccessResponse,
+  CoinbasePerpMetrics,
   CoinbaseProductInfo,
+  ShortFilterContext,
 } from '@trading-app/engine';
 import {
   isPerpShortSymbol,
@@ -215,6 +217,17 @@ export class PerpCatalog {
       console.warn('[crypto-live] perp catalog refresh failed:', err instanceof Error ? err.message : String(err));
       return;
     }
+    this.applyProducts(products, spotSymbols);
+  }
+
+  /**
+   * TRA-262 — rebuild the spot→perp map from a pre-fetched products list.
+   * Factored out of {@link refresh} so a sibling caller (the live account's
+   * perp-metrics refresh) can issue ONE `listProducts('FUTURE')` round-trip
+   * and feed both this map and its own per-perp metrics cache without
+   * doubling the Coinbase API budget.
+   */
+  applyProducts(products: readonly CoinbaseListedProduct[], spotSymbols: readonly string[]): void {
     const perpByBase = new Map<string, string>();
     for (const p of products) {
       if (!isPerpProductId(p.product_id)) continue;
@@ -399,6 +412,26 @@ export class CryptoLiveAccount {
   private intxPortfolioUuid: string | null = null;
   /** TRA-249-C — last successful reconcile against `listFuturesPositions`. Drives `PERP_RECONCILE_TTL_MS` rate-limit. */
   private lastPerpReconcileAt = 0;
+  /**
+   * TRA-262 — funding rate + 24h OI per perp product_id (e.g. `BTC-PERP-INTX`).
+   * Sourced from the same `listProducts('FUTURE')` round-trip the perp catalog
+   * already issues, so the metrics cache costs zero extra Coinbase calls.
+   * Fields default to undefined when Coinbase hasn't published a value yet —
+   * `getPerpShortFilterContext` propagates undefined to {@link ShortFilterContext}
+   * and the §5 gate skips the corresponding filter per its best-effort contract.
+   */
+  private perpMetricsByPerpProduct: Map<string, CoinbasePerpMetrics> = new Map();
+  /**
+   * TRA-262 — last live order-book spread per perp product_id, as a fraction
+   * of mid (`(ask - bid) / mid`). Refreshed at the top of each live tick
+   * across the perp universe so the §5 spread gate reads a near-real-time
+   * value without firing a per-signal Coinbase call (would 4-5× the API
+   * budget on a tick that emits multiple short candidates). Per-product
+   * undefined entries are kept (signalled by the absence in the map) — a
+   * fetch failure or one-sided book leaves the entry unset and the gate
+   * skips that signal until the next refresh succeeds.
+   */
+  private perpSpreadByPerpProduct: Map<string, number> = new Map();
 
   constructor(coinbase: CoinbaseOrderClient, opts: CryptoLiveAccountOptions = {}) {
     this.coinbase = coinbase;
@@ -671,18 +704,36 @@ export class CryptoLiveAccount {
   }
 
   /**
-   * TRA-249-C — refresh the spot↔perp routing catalog from Coinbase's live
-   * FUTURE product listing. Mirrors the spot {@link refreshTradableProducts}
-   * shape: best-effort, swallows the network error and keeps the previous
-   * map in place so a transient `/products` outage downgrades the router to
-   * "use stale catalog" rather than "spot-only forever".
+   * TRA-249-C / TRA-262 — refresh the spot↔perp routing catalog AND the
+   * per-perp metrics cache (funding rate + 24h OI) from one Coinbase
+   * `/products?product_type=FUTURE` round-trip.
+   *
+   * The two concerns share the same network call so adding metrics costs
+   * zero extra API budget vs. the pre-TRA-262 catalog-only refresh. Failure
+   * is best-effort: an exception leaves both the catalog map AND the metrics
+   * map intact (transient outage degrades to stale data, never to "spot-only
+   * forever" or "all gates skipped forever").
    *
    * The engine pre-loads on init alongside `refreshTradableProducts` and
-   * refreshes hourly from `runLiveTick` via {@link isPerpCatalogStale}.
+   * refreshes hourly from `runLiveTick` via {@link isPerpCatalogStale}. The
+   * 1h cadence is well under Coinbase's published ~8h funding settlement
+   * window so an operator never sees a stale funding rate at gate time.
    */
   async refreshPerpCatalog(spotSymbols: readonly string[]): Promise<void> {
     if (spotSymbols.length === 0) return;
-    await this.perpCatalog.refresh(this.coinbase, spotSymbols);
+    let products: CoinbaseListedProduct[];
+    try {
+      products = await this.coinbase.listProducts('FUTURE');
+    } catch (err: unknown) {
+      console.warn('[crypto-live] perp catalog refresh failed:', err instanceof Error ? err.message : String(err));
+      return;
+    }
+    this.perpCatalog.applyProducts(products, spotSymbols);
+    const nextMetrics = new Map<string, CoinbasePerpMetrics>();
+    for (const p of products) {
+      if (p.perp) nextMetrics.set(p.product_id, p.perp);
+    }
+    this.perpMetricsByPerpProduct = nextMetrics;
   }
 
   isPerpCatalogStale(): boolean {
@@ -692,6 +743,82 @@ export class CryptoLiveAccount {
   /** TRA-249-C — exposed for diagnostics + tests; the routing fork uses the catalog directly. */
   getPerpCatalog(): PerpCatalog {
     return this.perpCatalog;
+  }
+
+  /**
+   * TRA-262 — refresh live order-book spread per perp product across the
+   * supplied spot symbols. One `getProductBook` call per perp the catalog
+   * resolves; runs at the top of each live tick so the §5 spread gate sees
+   * a near-real-time fraction without per-signal network I/O. Failures are
+   * absorbed per-product (a single thin alt going one-sided does not poison
+   * the rest of the universe), and the previous spread for that product is
+   * cleared so the gate degrades to "skipped" rather than acting on a stale
+   * fraction that may now be wildly off.
+   *
+   * Costs are bounded by the perp universe size (5 symbols today per
+   * {@link PERP_SHORTS_UNIVERSE}); a routine maintenance pass is acceptable
+   * even on every tick. Spot symbols without a resolved perp are silently
+   * skipped — the catalog refresh owns the "is this perp listed?" decision
+   * and we don't want to second-guess it here.
+   */
+  async refreshPerpOrderBookSpreads(spotSymbols: readonly string[]): Promise<void> {
+    if (spotSymbols.length === 0) return;
+    const perpIds: string[] = [];
+    for (const sym of spotSymbols) {
+      const perpId = this.perpCatalog.getPerpFor(sym);
+      if (perpId) perpIds.push(perpId);
+    }
+    if (perpIds.length === 0) return;
+    const next = new Map<string, number>(this.perpSpreadByPerpProduct);
+    await Promise.all(
+      perpIds.map(async (perpId) => {
+        try {
+          const book = await this.coinbase.getProductBook(perpId);
+          if (book.spreadFraction != null && Number.isFinite(book.spreadFraction)) {
+            next.set(perpId, book.spreadFraction);
+          } else {
+            // A one-sided / inverted book or a missing top-of-book — drop the
+            // stale value so the gate skips this signal until a valid book
+            // shows up next tick. Better to skip than to act on a fraction
+            // that may have moved several bps since the cached read.
+            next.delete(perpId);
+          }
+        } catch (err: unknown) {
+          console.warn(
+            `[crypto-live] product_book ${perpId} failed:`,
+            err instanceof Error ? err.message : String(err),
+          );
+          next.delete(perpId);
+        }
+      }),
+    );
+    this.perpSpreadByPerpProduct = next;
+  }
+
+  /**
+   * TRA-262 — assemble the data-feed inputs for {@link evaluateShortFilters}
+   * for one spot symbol. Each field comes from a separate cache:
+   *
+   *   - funding rate + OI: hourly perp catalog refresh (`refreshPerpCatalog`)
+   *   - spread: per-tick order-book refresh (`refreshPerpOrderBookSpreads`)
+   *
+   * Returns an object with whatever subset of fields the caches currently
+   * carry; missing fields stay undefined so the strategy gate skips them per
+   * its best-effort contract instead of reading a synthetic zero. Symbols
+   * without a resolved perp catalog entry get an empty object — the universe
+   * gate higher in the pipeline already suppresses non-perp shorts, so this
+   * helper only needs to be safe (not authoritative) on those symbols.
+   */
+  getPerpShortFilterContext(spotSymbol: string): ShortFilterContext {
+    const perpId = this.perpCatalog.getPerpFor(spotSymbol);
+    if (!perpId) return {};
+    const metrics = this.perpMetricsByPerpProduct.get(perpId);
+    const spread = this.perpSpreadByPerpProduct.get(perpId);
+    const ctx: ShortFilterContext = {};
+    if (metrics?.fundingRatePerHour !== undefined) ctx.fundingRatePerHour = metrics.fundingRatePerHour;
+    if (metrics?.openInterestUsd !== undefined) ctx.openInterestUsd = metrics.openInterestUsd;
+    if (spread !== undefined) ctx.spreadFraction = spread;
+    return ctx;
   }
 
   /**

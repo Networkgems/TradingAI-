@@ -6,6 +6,7 @@ import type {
   CoinbaseOrderClient,
   CoinbaseOrderDetails,
   CoinbaseOrderSuccessResponse,
+  CoinbaseProductBook,
   CoinbaseProductInfo,
 } from '@trading-app/engine';
 import type { Position, TradeSignal } from '@trading-app/shared';
@@ -42,6 +43,12 @@ class FakeCoinbaseClient {
   );
   listFuturesPositions = vi.fn<(uuid: string) => Promise<CoinbaseFuturesPosition[]>>(
     async () => [],
+  );
+  // TRA-262 — live order-book spread snapshot for the §5 spread gate.
+  // Default returns an empty book so tests that don't pre-load this endpoint
+  // see "spread unavailable → gate skipped" rather than a synthetic value.
+  getProductBook = vi.fn<(productId: string) => Promise<CoinbaseProductBook>>(
+    async () => ({}),
   );
 }
 
@@ -1730,5 +1737,146 @@ describe('CryptoLiveAccount funding-rate accrual (TRA-249-D)', () => {
   it('exposes the underlying Coinbase client so the funding tracker can share auth', async () => {
     const { account, coinbase } = buyAccount(50_000);
     expect(account.getCoinbaseClient()).toBe(asClient(coinbase));
+  });
+});
+
+// TRA-262 — perp data-feed wiring for the §5 short filters. The live broker
+// owns three caches: per-perp metrics (funding + OI from the same listProducts
+// call the catalog already makes) and per-perp order-book spread (refreshed
+// at the top of each live tick). `getPerpShortFilterContext` merges them into
+// the ShortFilterContext that the engine's applyShortGates passes to
+// `evaluateShortFilters`.
+describe('CryptoLiveAccount perp data-feed wiring (TRA-262)', () => {
+  function listedPerpWith(productId: string, perp: { funding_rate?: string; funding_time?: string; open_interest?: string }, price = '60000'): CoinbaseListedProduct {
+    return {
+      product_id: productId,
+      product_type: 'FUTURE',
+      price,
+      status: 'online',
+      perp: {
+        fundingRatePerHour: perp.funding_rate != null ? parseFloat(perp.funding_rate) : undefined,
+        nextFundingTimeMs: perp.funding_time ? Date.parse(perp.funding_time) : undefined,
+        openInterestUsd:
+          perp.open_interest != null
+            ? parseFloat(perp.open_interest) * parseFloat(price)
+            : undefined,
+      },
+    };
+  }
+
+  it('refreshPerpCatalog folds funding + OI into the metrics cache from one listProducts call', async () => {
+    const { account, coinbase } = buyAccount(50_000);
+    coinbase.listProducts.mockResolvedValueOnce([
+      listedPerpWith('BTC-PERP-INTX', { funding_rate: '0.0001', open_interest: '1500' }, '60000'),
+      listedPerpWith('ETH-PERP-INTX', { funding_rate: '-0.00005' }, '3000'),
+    ]);
+
+    await account.refreshPerpCatalog(['BTC-USD', 'ETH-USD']);
+
+    // listProducts was hit once — catalog and metrics share the round-trip.
+    expect(coinbase.listProducts).toHaveBeenCalledTimes(1);
+    const ctxBtc = account.getPerpShortFilterContext('BTC-USD');
+    expect(ctxBtc.fundingRatePerHour).toBe(0.0001);
+    expect(ctxBtc.openInterestUsd).toBe(1500 * 60000);
+    // ETH publishes funding only; OI stays undefined (gate degrades to skipped).
+    const ctxEth = account.getPerpShortFilterContext('ETH-USD');
+    expect(ctxEth.fundingRatePerHour).toBe(-0.00005);
+    expect(ctxEth.openInterestUsd).toBeUndefined();
+  });
+
+  it('returns an empty context for a symbol the perp catalog does not resolve', async () => {
+    const { account, coinbase } = buyAccount(50_000);
+    coinbase.listProducts.mockResolvedValueOnce([
+      listedPerpWith('BTC-PERP-INTX', { funding_rate: '0.0001', open_interest: '1500' }),
+    ]);
+    await account.refreshPerpCatalog(['BTC-USD']);
+
+    expect(account.getPerpShortFilterContext('FOO-USD')).toEqual({});
+  });
+
+  it('refreshPerpOrderBookSpreads pulls one product_book per resolved perp and exposes the fraction', async () => {
+    const { account, coinbase } = buyAccount(50_000);
+    coinbase.listProducts.mockResolvedValueOnce([
+      listedPerpWith('BTC-PERP-INTX', { funding_rate: '0.0001' }),
+      listedPerpWith('ETH-PERP-INTX', { funding_rate: '0.0001' }, '3000'),
+    ]);
+    await account.refreshPerpCatalog(['BTC-USD', 'ETH-USD']);
+
+    coinbase.getProductBook.mockImplementation(async (productId: string) => {
+      if (productId === 'BTC-PERP-INTX') {
+        return { bestBid: 60000, bestAsk: 60030, midPrice: 60015, spreadFraction: 30 / 60015 };
+      }
+      if (productId === 'ETH-PERP-INTX') {
+        return { bestBid: 3000, bestAsk: 3009, midPrice: 3004.5, spreadFraction: 9 / 3004.5 };
+      }
+      return {};
+    });
+
+    await account.refreshPerpOrderBookSpreads(['BTC-USD', 'ETH-USD']);
+
+    expect(coinbase.getProductBook).toHaveBeenCalledTimes(2);
+    expect(account.getPerpShortFilterContext('BTC-USD').spreadFraction).toBeCloseTo(30 / 60015, 12);
+    expect(account.getPerpShortFilterContext('ETH-USD').spreadFraction).toBeCloseTo(9 / 3004.5, 12);
+  });
+
+  it('clears a stale spread when product_book throws so the gate skips instead of acting on cached data', async () => {
+    const { account, coinbase } = buyAccount(50_000);
+    coinbase.listProducts.mockResolvedValueOnce([
+      listedPerpWith('BTC-PERP-INTX', { funding_rate: '0.0001' }),
+    ]);
+    await account.refreshPerpCatalog(['BTC-USD']);
+
+    coinbase.getProductBook.mockResolvedValueOnce({
+      bestBid: 60000, bestAsk: 60030, midPrice: 60015, spreadFraction: 30 / 60015,
+    });
+    await account.refreshPerpOrderBookSpreads(['BTC-USD']);
+    expect(account.getPerpShortFilterContext('BTC-USD').spreadFraction).toBeDefined();
+
+    // Next tick: Coinbase 503s. Spread must be cleared so the gate skips
+    // rather than continuing to act on the now-stale value.
+    coinbase.getProductBook.mockRejectedValueOnce(new Error('coinbase 503'));
+    await account.refreshPerpOrderBookSpreads(['BTC-USD']);
+    expect(account.getPerpShortFilterContext('BTC-USD').spreadFraction).toBeUndefined();
+  });
+
+  it('clears a stale spread when product_book returns a one-sided / inverted book', async () => {
+    const { account, coinbase } = buyAccount(50_000);
+    coinbase.listProducts.mockResolvedValueOnce([
+      listedPerpWith('BTC-PERP-INTX', { funding_rate: '0.0001' }),
+    ]);
+    await account.refreshPerpCatalog(['BTC-USD']);
+
+    coinbase.getProductBook.mockResolvedValueOnce({
+      bestBid: 60000, bestAsk: 60030, midPrice: 60015, spreadFraction: 30 / 60015,
+    });
+    await account.refreshPerpOrderBookSpreads(['BTC-USD']);
+    expect(account.getPerpShortFilterContext('BTC-USD').spreadFraction).toBeDefined();
+
+    // One-sided book (no asks) — getProductBook returns spreadFraction undefined.
+    coinbase.getProductBook.mockResolvedValueOnce({ bestBid: 60000 });
+    await account.refreshPerpOrderBookSpreads(['BTC-USD']);
+    expect(account.getPerpShortFilterContext('BTC-USD').spreadFraction).toBeUndefined();
+  });
+
+  it('preserves catalog + metrics caches when refreshPerpCatalog throws (transient outage = stale data, not zeroed gates)', async () => {
+    const { account, coinbase } = buyAccount(50_000);
+    coinbase.listProducts.mockResolvedValueOnce([
+      listedPerpWith('BTC-PERP-INTX', { funding_rate: '0.0001', open_interest: '1500' }),
+    ]);
+    await account.refreshPerpCatalog(['BTC-USD']);
+    expect(account.getPerpShortFilterContext('BTC-USD').fundingRatePerHour).toBe(0.0001);
+
+    coinbase.listProducts.mockRejectedValueOnce(new Error('coinbase 503'));
+    await account.refreshPerpCatalog(['BTC-USD']);
+
+    // Funding still readable from cache — gate keeps firing on the previous
+    // value rather than degrading to "skipped" on a transient outage.
+    expect(account.getPerpShortFilterContext('BTC-USD').fundingRatePerHour).toBe(0.0001);
+  });
+
+  it('skips the network entirely when called with no symbols (idle pure-spot operator)', async () => {
+    const { account, coinbase } = buyAccount(50_000);
+    await account.refreshPerpOrderBookSpreads([]);
+    expect(coinbase.getProductBook).not.toHaveBeenCalled();
   });
 });

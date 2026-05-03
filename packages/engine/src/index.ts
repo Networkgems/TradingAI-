@@ -53,6 +53,8 @@ export type {
   CoinbaseListedProduct,
   CoinbaseFuturesPosition,
   CoinbaseFundingRate,
+  CoinbasePerpMetrics,
+  CoinbaseProductBook,
   CoinbaseMarginType,
   CoinbasePositionSide,
   MarketOrderParams as CoinbaseMarketOrderParams,
