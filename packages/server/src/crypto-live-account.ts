@@ -47,6 +47,18 @@ const CASH_CURRENCIES = new Set(['USD', 'USDC', 'USDT']);
 const BALANCE_REFRESH_MS = 30_000;
 
 /**
+ * TRA-285 — how fresh the Coinbase cash balance must be before we send a live
+ * order. The dashboard refresh runs every 30s, but Coinbase can rebalance
+ * `available_balance` mid-window (a separate Coinbase app fill, a hold from
+ * another order, an internal funding move). When we relied on the 30s cache
+ * we'd occasionally size a buy against cash that no longer existed and eat
+ * `INSUFFICIENT_FUND` from Coinbase. 5s is short enough to catch fast-moving
+ * holds while letting back-to-back signals in the same tick reuse the read
+ * (≤30 watchlist symbols × 1 GET each would otherwise hammer /accounts).
+ */
+const BALANCE_PREFLIGHT_MAX_AGE_MS = 5_000;
+
+/**
  * How long a cached set of Coinbase-tradable product_ids stays fresh before we
  * re-query Coinbase. Six hours is the right scale: Coinbase delistings/renames
  * (MATIC→POL, FTM→Sonic, etc.) happen on day-or-longer timelines, but we don't
@@ -1056,6 +1068,18 @@ export class CryptoLiveAccount {
       );
     }
 
+    // TRA-285 — refresh `available_balance` from Coinbase right before sizing
+    // so a hold/withdrawal that happened since the last 30s dashboard refresh
+    // doesn't have us submit a buy that's guaranteed to fail with
+    // `INSUFFICIENT_FUND`. We coalesce within BALANCE_PREFLIGHT_MAX_AGE_MS so
+    // a tick that opens multiple signals doesn't spam /accounts. Doing the
+    // refresh BEFORE the managed-equity guard means an account that just got
+    // funded sees the new equity on the very next tick rather than the next
+    // 30s dashboard refresh.
+    if (Date.now() - this.lastBalanceRefresh > BALANCE_PREFLIGHT_MAX_AGE_MS) {
+      await this.refreshBalance();
+    }
+
     // TRA-249-B — explicit guard for managed-equity-too-small BEFORE sizing.
     // `sizeFromStop` derives qty from `maxRiskPerTrade() = managedEquity() ×
     // riskPerTrade`, so a zero-equity or zero-ratio account would otherwise
@@ -1084,7 +1108,8 @@ export class CryptoLiveAccount {
     // still trade. Without this the engine would skip every signal for a
     // small-cash account on `cost > cash`. Risk-per-trade remains an upper
     // bound; capping here only ever sizes positions DOWN.
-    const maxQtyForCash = (this.cashUsd * CASH_FEE_BUFFER) / currentPrice;
+    const maxCashSpend = this.cashUsd * CASH_FEE_BUFFER;
+    const maxQtyForCash = maxCashSpend / currentPrice;
     qty = Math.min(qty, maxQtyForCash);
     // TRA-243 — Coinbase enforces a per-product `base_increment` (e.g.
     // `0.00000001` for BTC, `1` for SHIB). Sending finer-grained sizes
@@ -1107,6 +1132,20 @@ export class CryptoLiveAccount {
       return this.recordSkip(
         signal,
         `cost $${cost.toFixed(2)} below Coinbase $${MIN_NOTIONAL_USD} minimum (USD=${this.cashUsd.toFixed(2)}, maxRisk=${this.maxRiskPerTrade().toFixed(2)})`,
+      );
+    }
+    // TRA-285 — final pre-flight: re-verify the resulting cost fits inside
+    // available cash with the fee buffer before we hit the wire. Without this
+    // any sizing path that bypassed `maxQtyForCash` (e.g. risk-derived qty
+    // when cash isn't the binding constraint and the fee buffer becomes the
+    // binding one, or a future quantizer change that doesn't strictly floor)
+    // could still ship an order Coinbase rejects for INSUFFICIENT_FUND. Skip
+    // through `recordSkip` so the dashboard surfaces actionable text and the
+    // user can fund the wallet instead of seeing a Coinbase error.
+    if (cost > maxCashSpend) {
+      return this.recordSkip(
+        signal,
+        `cost $${cost.toFixed(2)} exceeds available cash $${this.cashUsd.toFixed(2)} (with ${((1 - CASH_FEE_BUFFER) * 100).toFixed(1)}% fee headroom — fund the Coinbase USD wallet or sell crypto holdings to free cash)`,
       );
     }
 

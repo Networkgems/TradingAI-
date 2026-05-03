@@ -404,6 +404,113 @@ describe('CryptoLiveAccount small-fund sizing (TRA-243)', () => {
   });
 });
 
+describe('CryptoLiveAccount balance pre-flight (TRA-285)', () => {
+  it('refreshes Coinbase balance before sizing when the cached read is stale', async () => {
+    // Seed with $50k, then push the cache to "stale" by spying out Date.now.
+    // openPosition must re-poll /accounts so a hold/withdrawal that landed
+    // mid-window doesn't have us size against cash that no longer exists.
+    const { account, coinbase } = buyAccount(50_000);
+    await account.refreshBalance();
+    expect(coinbase.listAccounts).toHaveBeenCalledTimes(1);
+
+    // Simulate a Coinbase-side debit between dashboard refreshes: the next
+    // /accounts call returns a balance far too small to clear the $1
+    // notional minimum even with the full managed-equity slice.
+    coinbase.listAccounts.mockResolvedValueOnce([
+      {
+        uuid: 'usd', name: 'USD Wallet', currency: 'USD',
+        available_balance: { value: '0.5', currency: 'USD' },
+        hold: { value: '0', currency: 'USD' },
+      },
+    ]);
+
+    // Push wall-clock past the 5s pre-flight window so openPosition treats
+    // the cache as stale.
+    const realNow = Date.now();
+    vi.spyOn(Date, 'now').mockImplementation(() => realNow + 10_000);
+
+    const signal = buildSignal();
+    const pos = await account.openPosition(signal, 30_000);
+
+    // After the refresh, $0.50 cash → notional below $1 minimum → skip.
+    expect(pos).toBeNull();
+    expect(coinbase.listAccounts).toHaveBeenCalledTimes(2);
+    expect(coinbase.placeMarketOrder).not.toHaveBeenCalled();
+
+    (Date.now as ReturnType<typeof vi.fn>).mockRestore();
+  });
+
+  it('reuses the freshly-cached balance for back-to-back signals in the same tick', async () => {
+    // Two signals fired within 5s of the original refresh must NOT each
+    // re-poll /accounts; the dashboard refresh already seeded a fresh read
+    // and we don't want a 30-symbol watchlist to spam Coinbase.
+    const { account, coinbase } = buyAccount(50_000);
+    await account.refreshBalance();
+    expect(coinbase.listAccounts).toHaveBeenCalledTimes(1);
+
+    coinbase.placeMarketOrder
+      .mockResolvedValueOnce(orderSuccess('o1'))
+      .mockResolvedValueOnce(orderSuccess('o2', 'BUY'));
+    coinbase.getOrder
+      .mockResolvedValueOnce(orderDetails({ order_id: 'o1', status: 'FILLED', average_filled_price: '30000', filled_size: '0.001' }))
+      .mockResolvedValueOnce(orderDetails({ order_id: 'o2', status: 'FILLED', average_filled_price: '2000', filled_size: '0.01' }));
+
+    await account.openPosition(buildSignal(), 30_000);
+    await account.openPosition(buildSignal({ symbol: 'ETH-USD', entryPrice: 2_000, stopLoss: 1_980, takeProfit: 2_060 }), 2_000);
+
+    // Still just the one initial /accounts call — the pre-flight window
+    // coalesced both opens onto the same fresh read.
+    expect(coinbase.listAccounts).toHaveBeenCalledTimes(1);
+    expect(coinbase.placeMarketOrder).toHaveBeenCalledTimes(2);
+  });
+
+  it('skips with a clear reason when the freshly-refreshed balance is insufficient', async () => {
+    // Originally seeded with $50k, but the next /accounts call (triggered by
+    // the stale-cache pre-flight) reports $0.50 — below Coinbase's $1
+    // minimum notional. We must surface that on the signal instead of
+    // shipping an order Coinbase will reject for INSUFFICIENT_FUND.
+    const { account, coinbase } = buyAccount(50_000);
+    await account.refreshBalance();
+    coinbase.listAccounts.mockResolvedValueOnce([
+      {
+        uuid: 'usd', name: 'USD Wallet', currency: 'USD',
+        available_balance: { value: '0.5', currency: 'USD' },
+        hold: { value: '0', currency: 'USD' },
+      },
+    ]);
+
+    const realNow = Date.now();
+    vi.spyOn(Date, 'now').mockImplementation(() => realNow + 10_000);
+
+    const signal = buildSignal();
+    const pos = await account.openPosition(signal, 30_000);
+
+    expect(pos).toBeNull();
+    expect(coinbase.placeMarketOrder).not.toHaveBeenCalled();
+    expect(signal.liveSkipReason).toMatch(/below.*\$1.*minimum|no spendable cash|exceeds available cash/i);
+
+    (Date.now as ReturnType<typeof vi.fn>).mockRestore();
+  });
+
+  it('still surfaces "Insufficient balance" on the signal when Coinbase rejects despite the pre-flight refresh', async () => {
+    // The pre-flight refresh narrows but cannot eliminate the race: a hold
+    // can land between our /accounts read and /orders POST. When that
+    // happens, the rejection text must still reach `liveSkipReason` so the
+    // dashboard surfaces "Insufficient balance" instead of a silent
+    // open-failed.
+    const { account, coinbase } = buyAccount(50_000);
+    await account.refreshBalance();
+
+    coinbase.placeMarketOrder.mockRejectedValueOnce(
+      new Error('Coinbase order rejected: Insufficient balance in source account'),
+    );
+
+    const signal = buildSignal();
+    await expect(account.openPosition(signal, 30_000)).rejects.toThrow(/Insufficient balance/);
+    expect(signal.liveSkipReason).toMatch(/Insufficient balance/);
+  });
+});
+
 describe('CryptoLiveAccount skip-reason annotation (TRA-243)', () => {
   it('rejects sell-side signals on non-perp symbols with a spot-only reason (TRA-249-B / TRA-264)', async () => {
     // Pre-perp, every sell-side strategy signal lands on a spot Coinbase
