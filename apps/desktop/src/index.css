@@ -990,7 +990,7 @@ tr:hover td { background: var(--bg-hover); }
 .modal-close-corner {
   position: absolute;
   top: 0.5rem;
-  left: 0.5rem;
+  right: 0.5rem;
   z-index: 1;
   width: 28px;
   height: 28px;
