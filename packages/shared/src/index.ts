@@ -677,10 +677,11 @@ export const CRYPTO_WATCHLIST: readonly string[] = [
  * what a user has saved in their per-user watchlist or what the market
  * scanner surfaces. Compared case-insensitively.
  *
- * TRA-283: TERMINUS-USD blacklisted — operator decision.
+ * TRA-283: TERMINUS-USD and RUNE-USD blacklisted — operator decision.
  */
 export const CRYPTO_DENYLIST: readonly string[] = [
   'TERMINUS-USD',
+  'RUNE-USD',
 ] as const;
 
 const CRYPTO_DENYLIST_SET: ReadonlySet<string> = new Set(
