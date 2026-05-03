@@ -1,0 +1,325 @@
+{
+  "generatedAt": "2026-05-03T21:02:05.760Z",
+  "granularity": "4h",
+  "direction": "long",
+  "universe": [
+    "SOL-USD",
+    "DOGE-USD"
+  ],
+  "initialEquityUsd": 25000,
+  "feeBps": 40,
+  "slippageBps": 5,
+  "riskFraction": 0.01,
+  "atrKStop": 2,
+  "atrKTrail": 2,
+  "rrMin": 2,
+  "trailArmR": 1,
+  "trainBars": 1080,
+  "testBars": 540,
+  "stepBars": 540,
+  "alignedStartTs": 1689278400000,
+  "perWindow": [
+    {
+      "index": 0,
+      "trades": 43,
+      "winners": 13,
+      "hitRatePct": 30.23255813953488,
+      "expectancyR": -0.20577829401977518,
+      "totalPnlUsd": -2479.0378113010484,
+      "rollingMaxDrawdownPct": 15.701049151574994,
+      "passes": false,
+      "reasons": [
+        "expectancy -0.206R < 0.10R",
+        "hit rate 30.2% < 35%",
+        "rolling-90d DD 15.70% > 8%"
+      ],
+      "perSymbol": [
+        {
+          "symbol": "SOL-USD",
+          "trades": 22,
+          "winners": 7,
+          "hitRatePct": 31.818181818181817,
+          "expectancyR": -0.223816664068738,
+          "totalPnlUsd": -1242.1886055379216
+        },
+        {
+          "symbol": "DOGE-USD",
+          "trades": 21,
+          "winners": 6,
+          "hitRatePct": 28.57142857142857,
+          "expectancyR": -0.18688095396848095,
+          "totalPnlUsd": -1236.8492057631256
+        }
+      ]
+    },
+    {
+      "index": 1,
+      "trades": 19,
+      "winners": 7,
+      "hitRatePct": 36.84210526315789,
+      "expectancyR": -0.4177914228528668,
+      "totalPnlUsd": -1689.4586692291068,
+      "rollingMaxDrawdownPct": 13.255200250962378,
+      "passes": false,
+      "reasons": [
+        "expectancy -0.418R < 0.10R",
+        "rolling-90d DD 13.26% > 8%"
+      ],
+      "perSymbol": [
+        {
+          "symbol": "SOL-USD",
+          "trades": 12,
+          "winners": 5,
+          "hitRatePct": 41.66666666666667,
+          "expectancyR": -0.4379258255875667,
+          "totalPnlUsd": -1117.9400524697098
+        },
+        {
+          "symbol": "DOGE-USD",
+          "trades": 7,
+          "winners": 2,
+          "hitRatePct": 28.57142857142857,
+          "expectancyR": -0.38327530387909564,
+          "totalPnlUsd": -571.5186167593972
+        }
+      ]
+    },
+    {
+      "index": 2,
+      "trades": 48,
+      "winners": 15,
+      "hitRatePct": 31.25,
+      "expectancyR": -0.16576311754681172,
+      "totalPnlUsd": -2946.37604111667,
+      "rollingMaxDrawdownPct": 21.09021117209951,
+      "passes": false,
+      "reasons": [
+        "expectancy -0.166R < 0.10R",
+        "hit rate 31.3% < 35%",
+        "rolling-90d DD 21.09% > 8%"
+      ],
+      "perSymbol": [
+        {
+          "symbol": "SOL-USD",
+          "trades": 24,
+          "winners": 7,
+          "hitRatePct": 29.166666666666668,
+          "expectancyR": -0.23426704538402976,
+          "totalPnlUsd": -1757.8077870631666
+        },
+        {
+          "symbol": "DOGE-USD",
+          "trades": 24,
+          "winners": 8,
+          "hitRatePct": 33.33333333333333,
+          "expectancyR": -0.09725918970959378,
+          "totalPnlUsd": -1188.5682540535045
+        }
+      ]
+    },
+    {
+      "index": 3,
+      "trades": 44,
+      "winners": 15,
+      "hitRatePct": 34.090909090909086,
+      "expectancyR": -0.14911075718642486,
+      "totalPnlUsd": -2413.599195970415,
+      "rollingMaxDrawdownPct": 13.259829381858482,
+      "passes": false,
+      "reasons": [
+        "expectancy -0.149R < 0.10R",
+        "hit rate 34.1% < 35%",
+        "rolling-90d DD 13.26% > 8%"
+      ],
+      "perSymbol": [
+        {
+          "symbol": "SOL-USD",
+          "trades": 16,
+          "winners": 1,
+          "hitRatePct": 6.25,
+          "expectancyR": -0.9186064307928048,
+          "totalPnlUsd": -3192.6997169989
+        },
+        {
+          "symbol": "DOGE-USD",
+          "trades": 28,
+          "winners": 14,
+          "hitRatePct": 50,
+          "expectancyR": 0.29060105630293503,
+          "totalPnlUsd": 779.1005210284848
+        }
+      ]
+    },
+    {
+      "index": 4,
+      "trades": 36,
+      "winners": 7,
+      "hitRatePct": 19.444444444444446,
+      "expectancyR": -0.4205555470252125,
+      "totalPnlUsd": -3565.509405618642,
+      "rollingMaxDrawdownPct": 22.496211876563436,
+      "passes": false,
+      "reasons": [
+        "expectancy -0.421R < 0.10R",
+        "hit rate 19.4% < 35%",
+        "rolling-90d DD 22.50% > 8%"
+      ],
+      "perSymbol": [
+        {
+          "symbol": "SOL-USD",
+          "trades": 19,
+          "winners": 3,
+          "hitRatePct": 15.789473684210526,
+          "expectancyR": -0.48412077778997187,
+          "totalPnlUsd": -2042.284537836941
+        },
+        {
+          "symbol": "DOGE-USD",
+          "trades": 17,
+          "winners": 4,
+          "hitRatePct": 23.52941176470588,
+          "expectancyR": -0.34951205381754,
+          "totalPnlUsd": -1523.224867781702
+        }
+      ]
+    },
+    {
+      "index": 5,
+      "trades": 34,
+      "winners": 10,
+      "hitRatePct": 29.411764705882355,
+      "expectancyR": -0.18272597289568712,
+      "totalPnlUsd": -2160.681595470561,
+      "rollingMaxDrawdownPct": 14.56173254542558,
+      "passes": false,
+      "reasons": [
+        "expectancy -0.183R < 0.10R",
+        "hit rate 29.4% < 35%",
+        "rolling-90d DD 14.56% > 8%"
+      ],
+      "perSymbol": [
+        {
+          "symbol": "SOL-USD",
+          "trades": 17,
+          "winners": 7,
+          "hitRatePct": 41.17647058823529,
+          "expectancyR": 0.14543277313426875,
+          "totalPnlUsd": -102.22661196198945
+        },
+        {
+          "symbol": "DOGE-USD",
+          "trades": 17,
+          "winners": 3,
+          "hitRatePct": 17.647058823529413,
+          "expectancyR": -0.510884718925643,
+          "totalPnlUsd": -2058.454983508572
+        }
+      ]
+    },
+    {
+      "index": 6,
+      "trades": 48,
+      "winners": 17,
+      "hitRatePct": 35.41666666666667,
+      "expectancyR": 0.045753877564658874,
+      "totalPnlUsd": -1308.4114733840775,
+      "rollingMaxDrawdownPct": 17.940747321574175,
+      "passes": false,
+      "reasons": [
+        "expectancy 0.046R < 0.10R",
+        "rolling-90d DD 17.94% > 8%"
+      ],
+      "perSymbol": [
+        {
+          "symbol": "SOL-USD",
+          "trades": 21,
+          "winners": 5,
+          "hitRatePct": 23.809523809523807,
+          "expectancyR": -0.21814787563989202,
+          "totalPnlUsd": -1563.900970854936
+        },
+        {
+          "symbol": "DOGE-USD",
+          "trades": 27,
+          "winners": 12,
+          "hitRatePct": 44.44444444444444,
+          "expectancyR": 0.25101079672375404,
+          "totalPnlUsd": 255.48949747085774
+        }
+      ]
+    },
+    {
+      "index": 7,
+      "trades": 30,
+      "winners": 6,
+      "hitRatePct": 20,
+      "expectancyR": -0.5344328652195093,
+      "totalPnlUsd": -4060.1438846208557,
+      "rollingMaxDrawdownPct": 26.465537475679884,
+      "passes": false,
+      "reasons": [
+        "expectancy -0.534R < 0.10R",
+        "hit rate 20.0% < 35%",
+        "rolling-90d DD 26.47% > 8%"
+      ],
+      "perSymbol": [
+        {
+          "symbol": "SOL-USD",
+          "trades": 12,
+          "winners": 3,
+          "hitRatePct": 25,
+          "expectancyR": -0.5310546242523344,
+          "totalPnlUsd": -1616.2005180742983
+        },
+        {
+          "symbol": "DOGE-USD",
+          "trades": 18,
+          "winners": 3,
+          "hitRatePct": 16.666666666666664,
+          "expectancyR": -0.5366850258642927,
+          "totalPnlUsd": -2443.943366546557
+        }
+      ]
+    },
+    {
+      "index": 8,
+      "trades": 37,
+      "winners": 10,
+      "hitRatePct": 27.027027027027028,
+      "expectancyR": -0.37986141538047524,
+      "totalPnlUsd": -3700.019793242078,
+      "rollingMaxDrawdownPct": 22.938827283363747,
+      "passes": false,
+      "reasons": [
+        "expectancy -0.380R < 0.10R",
+        "hit rate 27.0% < 35%",
+        "rolling-90d DD 22.94% > 8%"
+      ],
+      "perSymbol": [
+        {
+          "symbol": "SOL-USD",
+          "trades": 14,
+          "winners": 4,
+          "hitRatePct": 28.57142857142857,
+          "expectancyR": -0.3014094352118336,
+          "totalPnlUsd": -1270.8863944837237
+        },
+        {
+          "symbol": "DOGE-USD",
+          "trades": 23,
+          "winners": 6,
+          "hitRatePct": 26.08695652173913,
+          "expectancyR": -0.42761479461356133,
+          "totalPnlUsd": -2429.1333987583535
+        }
+      ]
+    }
+  ],
+  "skipReasons": {
+    "no trigger emitted": 28120,
+    "§5.1 funding gate (no-op for longs)": 1040
+  },
+  "decision": "FAIL",
+  "passingWindows": 0,
+  "requiredPassing": 5
+}
