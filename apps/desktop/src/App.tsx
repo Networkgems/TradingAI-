@@ -968,9 +968,104 @@ function researchKindLabel(kind?: string) {
 }
 
 /**
+ * TRA-227 — minimal markdown→HTML renderer for the QuantTrader research-body
+ * surface. Handles the syntax the routine actually produces: ATX headings,
+ * blockquotes, ordered/unordered lists, paragraphs, and inline `**bold**`
+ * `*italic*` `` `code` `` and `[text](url)` links. HTML entities are escaped
+ * BEFORE markdown transforms apply so any user-influenced content can't inject
+ * raw HTML; only the markdown-derived tags reach the DOM. Anchor URLs are
+ * scheme-validated (http/https/relative) so a malicious `javascript:` link in
+ * a payload can't ride into an `href`.
+ *
+ * Kept inline rather than pulling react-markdown / marked because the surface
+ * is small and the risk of bringing a sizable parser into the desktop bundle
+ * outweighs the savings.
+ */
+function renderResearchMarkdown(md: string): string {
+  const escaped = md
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;')
+    .replace(/'/g, '&#39;');
+
+  const inline = (s: string): string => s
+    .replace(/`([^`]+)`/g, '<code>$1</code>')
+    .replace(/\*\*([^*\n]+)\*\*/g, '<strong>$1</strong>')
+    .replace(/(^|[^*])\*([^*\n]+)\*(?!\*)/g, '$1<em>$2</em>')
+    .replace(/\[([^\]]+)\]\(([^)\s]+)\)/g, (_m, text, href) => {
+      const safe = /^(https?:\/\/|\/)/i.test(href) ? href : '#';
+      return `<a href="${safe}" target="_blank" rel="noopener noreferrer">${text}</a>`;
+    });
+
+  // Re-decode `&gt;` at line start so blockquote/heading parsers see the
+  // original markdown markers without re-introducing HTML elsewhere.
+  const lines = escaped.replace(/^&gt;/gm, '>').split(/\r?\n/);
+  const out: string[] = [];
+  let i = 0;
+  const isHeading = (l: string) => /^#{1,6}\s+/.test(l);
+  const isBlockquote = (l: string) => /^>\s?/.test(l);
+  const isUnordered = (l: string) => /^[-*]\s+/.test(l);
+  const isOrdered = (l: string) => /^\d+\.\s+/.test(l);
+  const isBlockStart = (l: string) =>
+    isHeading(l) || isBlockquote(l) || isUnordered(l) || isOrdered(l);
+
+  while (i < lines.length) {
+    const line = lines[i];
+
+    const h = line.match(/^(#{1,6})\s+(.*)$/);
+    if (h) {
+      const level = Math.min(h[1].length, 6);
+      out.push(`<h${level}>${inline(h[2])}</h${level}>`);
+      i++; continue;
+    }
+
+    if (isBlockquote(line)) {
+      const buf: string[] = [];
+      while (i < lines.length && isBlockquote(lines[i])) {
+        buf.push(lines[i].replace(/^>\s?/, ''));
+        i++;
+      }
+      out.push(`<blockquote>${inline(buf.join(' '))}</blockquote>`);
+      continue;
+    }
+
+    if (isUnordered(line)) {
+      const buf: string[] = [];
+      while (i < lines.length && isUnordered(lines[i])) {
+        buf.push(`<li>${inline(lines[i].replace(/^[-*]\s+/, ''))}</li>`);
+        i++;
+      }
+      out.push(`<ul>${buf.join('')}</ul>`);
+      continue;
+    }
+
+    if (isOrdered(line)) {
+      const buf: string[] = [];
+      while (i < lines.length && isOrdered(lines[i])) {
+        buf.push(`<li>${inline(lines[i].replace(/^\d+\.\s+/, ''))}</li>`);
+        i++;
+      }
+      out.push(`<ol>${buf.join('')}</ol>`);
+      continue;
+    }
+
+    if (line.trim() === '') { i++; continue; }
+
+    const buf: string[] = [];
+    while (i < lines.length && lines[i].trim() !== '' && !isBlockStart(lines[i])) {
+      buf.push(lines[i]);
+      i++;
+    }
+    out.push(`<p>${inline(buf.join(' '))}</p>`);
+  }
+  return out.join('');
+}
+
+/**
  * TRA-227 — News tab card. Yahoo headlines render as a plain external link;
  * QuantTrader research items render with a "Research" badge and an
- * expand/collapse button that reveals the inline markdown body. Identifiable
+ * expand/collapse button that reveals the formatted markdown body. Identifiable
  * via `bodyMarkdown` and the `kind` field set by the server.
  */
 function NewsCard({ item }: { item: NewsItem }) {
@@ -1030,7 +1125,12 @@ function NewsCard({ item }: { item: NewsItem }) {
             {expanded ? 'Hide report' : 'Read report'}
           </button>
         </div>
-        {expanded && <div className="research-body">{item.bodyMarkdown}</div>}
+        {expanded && (
+          <div
+            className="research-body"
+            dangerouslySetInnerHTML={{ __html: renderResearchMarkdown(item.bodyMarkdown ?? '') }}
+          />
+        )}
       </div>
     </div>
   );
