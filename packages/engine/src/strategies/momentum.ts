@@ -41,6 +41,19 @@ export interface MomentumOptions {
    * over a $1k stop sizes to 0.5 BTC instead of being floored to 0.
    */
   lotSize?: number;
+  /**
+   * TRA-261 — per-side parameter overrides. Long-side fields stay byte-
+   * identical to the TRA-200 spec values; short-side fields layer on top of
+   * the resolved options ONLY when emitting a short. Used by the crypto
+   * perp shorts spec (TRA-255 §4) so short entries pull tighter stops, a
+   * faster trailing cadence, and a volume-confirmation bump without
+   * conditional drift in the long path. Omit either field to keep that
+   * direction's values at the long-side baseline.
+   */
+  paramsByDirection?: {
+    long?: Partial<Omit<MomentumOptions, 'paramsByDirection'>>;
+    short?: Partial<Omit<MomentumOptions, 'paramsByDirection'>>;
+  };
 }
 
 interface ResolvedOptions {
@@ -94,6 +107,7 @@ const DEFAULTS: Omit<ResolvedOptions, 'rearmBars'> = {
  */
 export class MomentumStrategy {
   private readonly opt: ResolvedOptions;
+  private readonly shortOverrides: Partial<ResolvedOptions> | null;
   private readonly regime: RegimeDetector;
   /**
    * Bar timestamp of the most recent fire. The strategy stays in cooldown
@@ -106,15 +120,56 @@ export class MomentumStrategy {
 
   constructor(regime: RegimeDetector, opts: MomentumOptions = {}) {
     this.regime = regime;
-    const donchianPeriod = opts.donchianPeriod ?? DEFAULTS.donchianPeriod;
+    // TRA-261 — long overrides fold into the base resolved options so the
+    // long-side numbers stay byte-identical to the TRA-200 spec. Short-side
+    // overrides are stashed and applied lazily when a short fires; this
+    // keeps the long path one fewer branch and rules out per-tick conditional
+    // drift for downstream callers reading `opt`.
+    const longOverrides = opts.paramsByDirection?.long ?? {};
+    const baseOpts: Omit<MomentumOptions, 'paramsByDirection'> = { ...opts, ...longOverrides };
+    delete (baseOpts as { paramsByDirection?: unknown }).paramsByDirection;
+    const donchianPeriod = baseOpts.donchianPeriod ?? DEFAULTS.donchianPeriod;
     this.opt = {
       ...DEFAULTS,
-      ...opts,
+      ...baseOpts,
       // Default rearm = donchianPeriod so a steady trend produces ~one signal
       // per Donchian-window worth of bars, not one per bar.
-      rearmBars: opts.rearmBars ?? donchianPeriod,
+      rearmBars: baseOpts.rearmBars ?? donchianPeriod,
       donchianPeriod,
     };
+    const shortOverridesRaw = opts.paramsByDirection?.short;
+    this.shortOverrides = shortOverridesRaw
+      ? this.resolveDirectionalOverrides(shortOverridesRaw)
+      : null;
+  }
+
+  /**
+   * Fold a per-side override partial onto the resolved base options so the
+   * caller can read `optFor(side)` and get a fully-typed `ResolvedOptions`
+   * without re-doing the `??` defaults dance. `rearmBars` falls back to the
+   * override's `donchianPeriod` first (matching the constructor's behaviour)
+   * so a short override of `{ donchianPeriod: 10 }` produces a 10-bar rearm,
+   * not the long-side rearm.
+   */
+  private resolveDirectionalOverrides(
+    raw: Partial<Omit<MomentumOptions, 'paramsByDirection'>>,
+  ): Partial<ResolvedOptions> {
+    const out: Partial<ResolvedOptions> = { ...raw };
+    if (raw.donchianPeriod !== undefined && raw.rearmBars === undefined) {
+      out.rearmBars = raw.donchianPeriod;
+    }
+    return out;
+  }
+
+  /**
+   * Resolve the active option set for `side`. Long-side returns the base
+   * options unchanged (long path is byte-identical to pre-TRA-261). Short-
+   * side overlays the configured short overrides. Used internally during
+   * `evaluate` once the side has been decided.
+   */
+  private optFor(side: Side): ResolvedOptions {
+    if (side === 'buy' || !this.shortOverrides) return this.opt;
+    return { ...this.opt, ...this.shortOverrides };
   }
 
   /**
@@ -154,9 +209,15 @@ export class MomentumStrategy {
     if (effectiveRegime === 'trend_down' && fastNow < slowNow) side = 'sell';
     if (side === null) return null;
 
+    // TRA-261 — once we know the side, resolve the active option set so
+    // short-side overrides (TRA-255 §4) flow through the rest of the
+    // function. Long-side reads identical to pre-TRA-261 because shortOverrides
+    // is null in that branch.
+    const opt = this.optFor(side);
+
     // Donchian breakout — channel is computed from the prior N bars (current
     // bar excluded) so a close *beyond* the channel is unambiguously a breakout.
-    const ch = donchian(candles, this.opt.donchianPeriod, true);
+    const ch = donchian(candles, opt.donchianPeriod, true);
     if (!ch) return null;
 
     const latest = candles[candles.length - 1];
@@ -173,16 +234,16 @@ export class MomentumStrategy {
     if (this.lastFireTs !== null && candles.length >= 2) {
       const barInterval = latest.timestamp - candles[candles.length - 2].timestamp;
       if (barInterval > 0
-        && latest.timestamp - this.lastFireTs < this.opt.rearmBars * barInterval) {
+        && latest.timestamp - this.lastFireTs < opt.rearmBars * barInterval) {
         return null;
       }
     }
 
-    const atrValue = atr(candles, this.opt.atrPeriod);
+    const atrValue = atr(candles, opt.atrPeriod);
     if (atrValue === null || atrValue <= 0) return null;
 
-    const stopDistance = this.opt.atrStopMultiplier * atrValue;
-    const tpDistance = this.opt.atrTpMultiplier * atrValue;
+    const stopDistance = opt.atrStopMultiplier * atrValue;
+    const tpDistance = opt.atrTpMultiplier * atrValue;
     if (stopDistance <= 0 || tpDistance <= 0) return null;
 
     const entryPrice = latest.close;
@@ -212,14 +273,15 @@ export class MomentumStrategy {
     const signal = this.evaluate(symbol, candles);
     if (!signal) return null;
 
-    const atrValue = atr(candles, this.opt.atrPeriod);
+    const opt = this.optFor(signal.side);
+    const atrValue = atr(candles, opt.atrPeriod);
     if (atrValue === null) return null;
 
     const qty = riskManager.sizeFromAtr(
       signal.entryPrice,
       atrValue,
-      this.opt.atrStopMultiplier,
-      this.opt.lotSize,
+      opt.atrStopMultiplier,
+      opt.lotSize,
     );
     if (qty <= 0) return null;
 

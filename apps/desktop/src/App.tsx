@@ -633,6 +633,16 @@ function CryptoDashboard({ token, onBack, onLogout, onActivity, theme, onToggleT
                       <div className="sig-stat"><span>Target</span><strong className="green">${fmt(sig.takeProfit)}</strong></div>
                       <div className="sig-stat"><span>R:R</span><strong>1:{sig.riskRewardRatio}</strong></div>
                     </div>
+                    {sig.signalSkipReason && (
+                      // TRA-261 — pre-route suppression (universe gate, §5
+                      // short filters, MR-shorts off-strategy). Distinct from
+                      // liveSkipReason which is a broker-side skip; the
+                      // strategy fired and the engine deliberately blocked
+                      // routing it, surfaced verbatim from the spec strings.
+                      <div className="signal-skip-reason" title={sig.signalSkipReason}>
+                        <span>Suppressed: {sig.signalSkipReason}</span>
+                      </div>
+                    )}
                     {sig.liveSkipReason && (
                       <div className="signal-skip-reason" title={sig.liveSkipReason}>
                         <span>Not opened: {sig.liveSkipReason}</span>

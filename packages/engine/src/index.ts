@@ -73,6 +73,40 @@ export {
   timeStopBarsFor,
 } from './lifecycle.js';
 export type { LifecycleState, BreakoutTrailOptions } from './lifecycle.js';
+export {
+  PERP_SHORTS_UNIVERSE,
+  PERP_SHORTS_TIER2,
+  PERP_SHORT_RISK_TIER1,
+  PERP_SHORT_RISK_TIER2,
+  PERP_SHORT_SINGLE_SYMBOL_CAP,
+  PERP_SHORT_CROSS_STRATEGY_CAP,
+  PERP_SHORT_TOTAL_NOTIONAL_CAP,
+  FUNDING_GATE_THRESHOLD_PER_HOUR,
+  FUNDING_FLIP_INTERVALS,
+  SPREAD_GATE_FRACTION,
+  OI_GATE_USD,
+  VOL_EXPANSION_ATR_RATIO,
+  VOL_EXPANSION_BAR_LOOKBACK,
+  DAILY_SHORT_CIRCUIT_BREAKER_PCT,
+  SKIP_NOT_IN_UNIVERSE,
+  SKIP_MR_OFF_STRATEGY,
+  SKIP_FUNDING_TOO_NEGATIVE,
+  SKIP_BTC_TREND_UP,
+  SKIP_SPREAD_TOO_WIDE,
+  SKIP_OI_UNDER_MIN,
+  SKIP_TOTAL_SHORT_NOTIONAL,
+  SKIP_SINGLE_SYMBOL_CAP,
+  SKIP_CROSS_STRATEGY_CAP,
+  isPerpShortSymbol,
+  isTier2PerpShort,
+  perpShortRiskFraction,
+  evaluateShortFilters,
+  evaluateShortNotionalCaps,
+  fundingFlipStopTriggered,
+  adverseVolExpansionShortExitTriggered,
+  dailyShortCircuitBreakerTripped,
+} from './perp-shorts.js';
+export type { ShortFilterContext, ShortNotionalCapInputs } from './perp-shorts.js';
 export { blackScholesPrice, blackScholesDelta, bsImpliedVolatility, daysToExpiration } from './options/black-scholes.js';
 export type { BlackScholesInputs, ImpliedVolInputs } from './options/black-scholes.js';
 export { findMispricedOtmContracts } from './options/otm-mispricing.js';

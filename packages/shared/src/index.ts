@@ -55,6 +55,16 @@ export interface TradeSignal {
    * on demo-mode signals (demo never skips for liquidity reasons).
    */
   liveSkipReason?: string;
+  /**
+   * TRA-261 — strategy / pre-route suppression reason: stamped when a signal
+   * fired but a strategy-level gate blocked the engine from routing it (e.g.
+   * MR shorts off-strategy, perp universe gate, funding/regime/spread/OI
+   * short filters). Distinct from `liveSkipReason` (broker-side reject); a
+   * signal carrying `signalSkipReason` is a deliberately-suppressed signal,
+   * shown on the dashboard so the user knows the strategy fired and why we
+   * declined to route it. Absent on signals that proceed normally.
+   */
+  signalSkipReason?: string;
 }
 
 /**

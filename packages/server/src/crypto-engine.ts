@@ -10,6 +10,10 @@ import {
   MeanReversionCryptoStrategy,
   BreakoutVolStrategy,
   StrategyRouter,
+  evaluateShortFilters,
+  isPerpShortSymbol,
+  SKIP_NOT_IN_UNIVERSE,
+  type ShortFilterContext,
 } from '@trading-app/engine';
 import { CRYPTO_WATCHLIST } from '@trading-app/shared';
 import type { TradeSignal, Candle, AccountState, Position, CryptoEngineState, NewsItem, AccountSettings } from '@trading-app/shared';
@@ -358,6 +362,47 @@ export class CryptoSignalEngine {
     return r;
   }
 
+  /**
+   * TRA-261 — apply the perp shorts universe constraint and the §5
+   * multiplicative short filters in priority order. Mutates the signal in
+   * place by stamping `signalSkipReason` when a gate fails and returns the
+   * resulting reason string (or null on a clean pass). Long signals are a
+   * no-op — the function only inspects `side === 'sell'`.
+   *
+   * Funding rate, BTC regime, spread, and OI inputs are sourced opportunistically:
+   *   - BTC regime: read live from the per-symbol router's RegimeDetector for
+   *     `BTC-USD`. Lazily creates the BTC router on first call so we don't
+   *     have to wait for BTC's own tick to ingest the gate.
+   *   - Funding rate / spread / OI: data feed not yet exposed (TRA-261
+   *     follow-up). Inputs left undefined → corresponding gate is skipped per
+   *     `evaluateShortFilters`'s "best effort" contract; the universe gate
+   *     and BTC regime gate still apply.
+   */
+  private applyShortGates(signal: TradeSignal): void {
+    if (signal.side !== 'sell') return;
+
+    if (!isPerpShortSymbol(signal.symbol)) {
+      signal.signalSkipReason = SKIP_NOT_IN_UNIVERSE;
+      return;
+    }
+
+    // BTC regime overlay (filter 2 — alts only). The per-symbol router for
+    // BTC-USD owns BTC's regime detector; querying its current label gives
+    // us the post-hysteresis regime without re-ticking the detector.
+    const btcRouter = this.routers.get('BTC-USD');
+    const ctx: ShortFilterContext = {
+      btcRegime: btcRouter ? btcRouter.currentRegime() : undefined,
+      // TODO(TRA-261): wire funding rate, perp order-book spread, and 24h OI
+      // from the Coinbase perp data feed. Until those land, these gates are
+      // skipped per the spec's explicit "skip OI guard with a TODO" allowance
+      // (TRA-255 §5). The universe and BTC regime gates carry the load until
+      // the data feeds are wired.
+    };
+
+    const reason = evaluateShortFilters(signal, ctx);
+    if (reason) signal.signalSkipReason = reason;
+  }
+
   private async tick(): Promise<void> {
     if (this.tickRunning) return;
     this.tickRunning = true;
@@ -481,6 +526,11 @@ export class CryptoSignalEngine {
 
         for (const signal of [reversalSignal, macdTrendSignal, bbFadeSignal, scalpingSignal, swingSignal, routerSignal]) {
           if (!signal) continue;
+          // TRA-261 — apply the perp shorts gates BEFORE the open-position /
+          // recent-signal dedup. A suppressed signal still surfaces on the
+          // dashboard with `signalSkipReason`, so the user knows the strategy
+          // fired and was deliberately blocked.
+          this.applyShortGates(signal);
           if (this.account.hasOpenPositionForSignalType(sym, signal.type)) continue;
           const recent = this.recentSignals.find(
             s => s.symbol === signal.symbol && s.type === signal.type && Date.now() - s.timestamp < 5 * 60_000,
@@ -503,6 +553,12 @@ export class CryptoSignalEngine {
           signal.mode = 'demo';
           this.recentSignals.unshift(signal);
           if (this.recentSignals.length > MAX_SIGNALS) this.recentSignals.pop();
+
+          // TRA-261 — suppressed signals still display on the dashboard but
+          // do not open a position. Pre-routing skip strings are set by
+          // `applyShortGates` (universe gate + multiplicative §5 filters) and
+          // by `MeanReversionCryptoStrategy` (off-strategy MR shorts).
+          if (signal.signalSkipReason) continue;
 
           const opened = this.account.openPosition(signal, price);
           if (opened) opened.mode = 'demo';
@@ -589,6 +645,10 @@ export class CryptoSignalEngine {
 
       for (const signal of [reversalSignal, macdTrendSignal, bbFadeSignal, scalpingSignal, swingSignal, routerSignal]) {
         if (!signal) continue;
+        // TRA-261 — apply the perp shorts gates BEFORE dedup so suppressed
+        // signals still flow to the dashboard's Signals panel with the
+        // pre-route reason instead of being silently dropped.
+        this.applyShortGates(signal);
         if (live.hasOpenPositionForSignalType(sym, signal.type)) continue;
         const recent = this.recentSignals.find(
           s => s.symbol === signal.symbol && s.type === signal.type && Date.now() - s.timestamp < 5 * 60_000,
@@ -604,6 +664,11 @@ export class CryptoSignalEngine {
         signal.mode = 'live';
         this.recentSignals.unshift(signal);
         if (this.recentSignals.length > MAX_SIGNALS) this.recentSignals.pop();
+
+        // TRA-261 — pre-route skip means the strategy/filter layer rejected
+        // the signal; do not submit anything to Coinbase. The signal is
+        // already on the recent-signals list with the reason stamped.
+        if (signal.signalSkipReason) continue;
 
         try {
           await live.openPosition(signal, price);

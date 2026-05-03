@@ -32,6 +32,19 @@ export interface BreakoutVolOptions {
    * supplies the active label and ignores this.
    */
   regimeOptions?: RegimeDetectorOptions;
+  /**
+   * TRA-261 — per-side parameter overrides. Long-side fields stay byte-
+   * identical to the TRA-207 spec values; short-side fields layer on top of
+   * the resolved options ONLY when emitting a short. Used by the crypto
+   * perp shorts spec (TRA-255 §4) so short entries pull a tighter stop ATR
+   * multiplier and a volume-confirmation bump without conditional drift in
+   * the long path. Omit either field to keep that direction's values at the
+   * long-side baseline.
+   */
+  paramsByDirection?: {
+    long?: Partial<Omit<BreakoutVolOptions, 'paramsByDirection'>>;
+    short?: Partial<Omit<BreakoutVolOptions, 'paramsByDirection'>>;
+  };
 }
 
 /**
@@ -68,30 +81,84 @@ export interface BreakoutVolOptions {
  *     same split-of-concerns used by `MomentumStrategy` and
  *     `MeanReversionCryptoStrategy`. `evaluate()` only emits the entry.
  */
+interface ResolvedBreakoutOptions {
+  consolidationBars: number;
+  maxRangeFraction: number;
+  volumeMultiplier: number;
+  atrPeriod: number;
+  atrStopMultiplier: number;
+  atrTpMultiplier: number;
+}
+
+const BREAKOUT_DEFAULTS: ResolvedBreakoutOptions = {
+  consolidationBars: 20,
+  maxRangeFraction: 0.06,
+  volumeMultiplier: 2.0,
+  atrPeriod: 14,
+  atrStopMultiplier: 2.0,
+  atrTpMultiplier: 4.0,
+};
+
 export class BreakoutVolStrategy {
-  private readonly consolidationBars: number;
-  private readonly maxRangeFraction: number;
-  private readonly volumeMultiplier: number;
-  private readonly atrPeriod: number;
-  private readonly atrStopMultiplier: number;
-  private readonly atrTpMultiplier: number;
+  private readonly opt: ResolvedBreakoutOptions;
+  private readonly shortOverrides: Partial<ResolvedBreakoutOptions> | null;
   private readonly regimeOptions?: RegimeDetectorOptions;
 
   constructor(opts: BreakoutVolOptions = {}) {
-    this.consolidationBars = opts.consolidationBars ?? 20;
-    this.maxRangeFraction = opts.maxRangeFraction ?? 0.06;
-    this.volumeMultiplier = opts.volumeMultiplier ?? 2.0;
-    this.atrPeriod = opts.atrPeriod ?? 14;
-    this.atrStopMultiplier = opts.atrStopMultiplier ?? 2.0;
-    this.atrTpMultiplier = opts.atrTpMultiplier ?? 4.0;
+    // TRA-261 — long overrides fold into the base resolved options so the
+    // long-side numbers stay byte-identical to the TRA-207 spec. Short-side
+    // overrides are stashed and applied lazily once a short fires; this keeps
+    // the long path a straight read and rules out per-tick conditional drift
+    // for callers reading `opt`.
+    const longOverrides = opts.paramsByDirection?.long ?? {};
+    const baseOpts = { ...opts, ...longOverrides };
+    this.opt = {
+      consolidationBars: baseOpts.consolidationBars ?? BREAKOUT_DEFAULTS.consolidationBars,
+      maxRangeFraction: baseOpts.maxRangeFraction ?? BREAKOUT_DEFAULTS.maxRangeFraction,
+      volumeMultiplier: baseOpts.volumeMultiplier ?? BREAKOUT_DEFAULTS.volumeMultiplier,
+      atrPeriod: baseOpts.atrPeriod ?? BREAKOUT_DEFAULTS.atrPeriod,
+      atrStopMultiplier: baseOpts.atrStopMultiplier ?? BREAKOUT_DEFAULTS.atrStopMultiplier,
+      atrTpMultiplier: baseOpts.atrTpMultiplier ?? BREAKOUT_DEFAULTS.atrTpMultiplier,
+    };
+    const shortOverridesRaw = opts.paramsByDirection?.short;
+    this.shortOverrides = shortOverridesRaw
+      ? this.resolveDirectionalOverrides(shortOverridesRaw)
+      : null;
     this.regimeOptions = opts.regimeOptions;
+  }
+
+  /**
+   * Fold a per-side override partial into a `Partial<ResolvedBreakoutOptions>`
+   * so the caller can splat it onto the base options at fire time.
+   */
+  private resolveDirectionalOverrides(
+    raw: Partial<Omit<BreakoutVolOptions, 'paramsByDirection' | 'regimeOptions'>>,
+  ): Partial<ResolvedBreakoutOptions> {
+    const out: Partial<ResolvedBreakoutOptions> = {};
+    if (raw.consolidationBars !== undefined) out.consolidationBars = raw.consolidationBars;
+    if (raw.maxRangeFraction !== undefined) out.maxRangeFraction = raw.maxRangeFraction;
+    if (raw.volumeMultiplier !== undefined) out.volumeMultiplier = raw.volumeMultiplier;
+    if (raw.atrPeriod !== undefined) out.atrPeriod = raw.atrPeriod;
+    if (raw.atrStopMultiplier !== undefined) out.atrStopMultiplier = raw.atrStopMultiplier;
+    if (raw.atrTpMultiplier !== undefined) out.atrTpMultiplier = raw.atrTpMultiplier;
+    return out;
+  }
+
+  /**
+   * Resolve the active option set for `side`. Long-side returns the base
+   * options unchanged (long path is byte-identical to pre-TRA-261). Short-side
+   * overlays the configured short overrides.
+   */
+  private optFor(side: 'buy' | 'sell'): ResolvedBreakoutOptions {
+    if (side === 'buy' || !this.shortOverrides) return this.opt;
+    return { ...this.opt, ...this.shortOverrides };
   }
 
   evaluate(symbol: string, candles: Candle[], regime?: Regime): TradeSignal | null {
     const minBars = Math.max(
       // Need the consolidation window prior to the entry bar, plus the entry bar itself.
-      this.consolidationBars + 1,
-      this.atrPeriod + 1,
+      this.opt.consolidationBars + 1,
+      this.opt.atrPeriod + 1,
       // classifyRegime walks a 50-bar EMA, so the auto-classify path needs ≥50 bars.
       50,
     );
@@ -104,7 +171,11 @@ export class BreakoutVolStrategy {
     if (effectiveRegime !== 'high_vol' && effectiveRegime !== 'flat') return null;
 
     const latest = candles[candles.length - 1];
-    const windowStart = candles.length - 1 - this.consolidationBars;
+    // Use the long-side window/range gates for the channel scan — the short
+    // overrides only affect post-fire risk knobs (stop/TP/volume mult). We
+    // detect the side first using the long-baseline channel, then resolve
+    // the directional opt to apply ATR/volume/TP knobs.
+    const windowStart = candles.length - 1 - this.opt.consolidationBars;
     const window = candles.slice(windowStart, candles.length - 1);
 
     let consolidationHigh = -Infinity;
@@ -123,27 +194,31 @@ export class BreakoutVolStrategy {
     // Consolidation tightness gate. A wide "range" isn't actually a coil —
     // it's mid-trend noise, and the breakout edge degrades sharply.
     const rangeFraction = (consolidationHigh - consolidationLow) / close;
-    if (!Number.isFinite(rangeFraction) || rangeFraction >= this.maxRangeFraction) return null;
-
-    const volumeSma = volumeSum / window.length;
-    // Zero-volume windows can come from sparse/missing data — refuse rather
-    // than dividing through and emitting a phantom signal.
-    if (!(volumeSma > 0)) return null;
-    const volumeOk = latest.volume >= this.volumeMultiplier * volumeSma;
-    if (!volumeOk) return null;
-
-    const atrValue = atr(candles, this.atrPeriod);
-    if (atrValue === null || atrValue <= 0) return null;
-
-    const stopDistance = this.atrStopMultiplier * atrValue;
-    const tpDistance = this.atrTpMultiplier * atrValue;
-    if (stopDistance <= 0 || tpDistance <= 0) return null;
+    if (!Number.isFinite(rangeFraction) || rangeFraction >= this.opt.maxRangeFraction) return null;
 
     const breakoutLong = close > consolidationHigh;
     const breakoutShort = close < consolidationLow;
     if (!breakoutLong && !breakoutShort) return null;
 
-    const side = breakoutLong ? 'buy' : 'sell';
+    const side: 'buy' | 'sell' = breakoutLong ? 'buy' : 'sell';
+    // TRA-261 — once we know the side, resolve the directional option set
+    // so short-side overrides (TRA-255 §4: tighter stop ATR mult, volume
+    // confirmation bump) flow through the rest of the function.
+    const opt = this.optFor(side);
+
+    const volumeSma = volumeSum / window.length;
+    // Zero-volume windows can come from sparse/missing data — refuse rather
+    // than dividing through and emitting a phantom signal.
+    if (!(volumeSma > 0)) return null;
+    const volumeOk = latest.volume >= opt.volumeMultiplier * volumeSma;
+    if (!volumeOk) return null;
+
+    const atrValue = atr(candles, opt.atrPeriod);
+    if (atrValue === null || atrValue <= 0) return null;
+
+    const stopDistance = opt.atrStopMultiplier * atrValue;
+    const tpDistance = opt.atrTpMultiplier * atrValue;
+    if (stopDistance <= 0 || tpDistance <= 0) return null;
     const stopLoss = side === 'buy' ? close - stopDistance : close + stopDistance;
     const takeProfit = side === 'buy' ? close + tpDistance : close - tpDistance;
 

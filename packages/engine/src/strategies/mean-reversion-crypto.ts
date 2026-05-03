@@ -4,6 +4,7 @@ import { bollinger } from '../indicators/bollinger.js';
 import { rsi } from '../indicators/rsi.js';
 import { atr } from '../indicators/atr.js';
 import { classifyRegime, type Regime, type RegimeDetectorOptions } from '../regime.js';
+import { SKIP_MR_OFF_STRATEGY } from '../perp-shorts.js';
 
 export interface MeanReversionCryptoOptions {
   /** Bollinger Band period. Spec §3 default: 20. */
@@ -131,6 +132,15 @@ export class MeanReversionCryptoStrategy {
     }
 
     // Short: overbought AND price closed above the upper band.
+    //
+    // TRA-261 — mean-reversion shorts are off-strategy for the Phase-1 perp
+    // rollout (see TRA-255 §4 — MR shorts are deferred until the long path
+    // produces clean walk-forward results). The signal is still emitted but
+    // stamped with `signalSkipReason = SKIP_MR_OFF_STRATEGY` so the dashboard
+    // shows that the strategy fired and was deliberately suppressed; the
+    // engine pipeline reads the field and refuses to route the signal. Once
+    // the deferred MR-shorts ticket lands, drop the signalSkipReason stamp
+    // (and unblock the path here) — the rest of the body is unchanged.
     if (currentRsi > this.rsiOverbought && entryPrice > bands.upper) {
       const stopLoss = entryPrice + stopDistance;
       const takeProfit = bands.middle;
@@ -146,6 +156,7 @@ export class MeanReversionCryptoStrategy {
         takeProfit,
         riskRewardRatio: reward / stopDistance,
         timestamp: latest.timestamp,
+        signalSkipReason: SKIP_MR_OFF_STRATEGY,
       };
     }
 
