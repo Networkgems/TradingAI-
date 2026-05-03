@@ -69,12 +69,16 @@ export type {
 } from './router.js';
 export {
   TIME_STOP_BARS,
+  MOMENTUM_TRAIL_PERIOD_BY_SIDE,
+  BREAKOUT_TRAIL_OPTIONS_BY_SIDE,
   initLifecycleState,
   advanceExtreme,
   momentumTrailStop,
   breakoutTrailStop,
   meanReversionRsiAltExitTriggered,
   timeStopBarsFor,
+  momentumTrailPeriodFor,
+  breakoutTrailOptionsFor,
 } from './lifecycle.js';
 export type { LifecycleState, BreakoutTrailOptions } from './lifecycle.js';
 export {
@@ -92,6 +96,9 @@ export {
   VOL_EXPANSION_ATR_RATIO,
   VOL_EXPANSION_BAR_LOOKBACK,
   DAILY_SHORT_CIRCUIT_BREAKER_PCT,
+  MAX_CONCURRENT_SHORTS,
+  CONSECUTIVE_LOSS_THRESHOLD,
+  CONSECUTIVE_LOSS_COOLDOWN_MS,
   SKIP_NOT_IN_UNIVERSE,
   SKIP_MR_OFF_STRATEGY,
   SKIP_FUNDING_TOO_NEGATIVE,
@@ -101,16 +108,25 @@ export {
   SKIP_TOTAL_SHORT_NOTIONAL,
   SKIP_SINGLE_SYMBOL_CAP,
   SKIP_CROSS_STRATEGY_CAP,
+  SKIP_CONSECUTIVE_LOSSES,
+  SKIP_MAX_CONCURRENT_SHORTS,
   isPerpShortSymbol,
   isTier2PerpShort,
   perpShortRiskFraction,
   evaluateShortFilters,
   evaluateShortNotionalCaps,
+  evaluateShortBookCaps,
+  symbolShortCooldownActive,
   fundingFlipStopTriggered,
   adverseVolExpansionShortExitTriggered,
   dailyShortCircuitBreakerTripped,
 } from './perp-shorts.js';
-export type { ShortFilterContext, ShortNotionalCapInputs } from './perp-shorts.js';
+export type {
+  ShortFilterContext,
+  ShortNotionalCapInputs,
+  ShortBookCapInputs,
+  ClosedShortTrade,
+} from './perp-shorts.js';
 export { blackScholesPrice, blackScholesDelta, bsImpliedVolatility, daysToExpiration } from './options/black-scholes.js';
 export type { BlackScholesInputs, ImpliedVolInputs } from './options/black-scholes.js';
 export { findMispricedOtmContracts } from './options/otm-mispricing.js';

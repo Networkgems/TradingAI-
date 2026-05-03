@@ -76,6 +76,21 @@ export const SKIP_OI_UNDER_MIN = 'perp OI under min';
 export const SKIP_TOTAL_SHORT_NOTIONAL = 'total short notional cap';
 export const SKIP_SINGLE_SYMBOL_CAP = 'single-symbol short cap';
 export const SKIP_CROSS_STRATEGY_CAP = 'cross-strategy per-symbol short cap';
+/**
+ * TRA-255 §3.1 — per-symbol cooldown after three consecutive losing shorts.
+ * Suppresses new short entries on that symbol for 48h wall-clock; other
+ * symbols are unaffected and held positions are NOT auto-flatted. Threshold
+ * and window are first-pass (revisit after Phase-1 walk-forward).
+ */
+export const SKIP_CONSECUTIVE_LOSSES = '3 consecutive short losses — symbol cooldown';
+/**
+ * TRA-255 §6 — book-wide cap on the number of OPEN short positions across
+ * all strategies. Hard limit of 3 concurrent shorts; checked before order
+ * submit alongside the existing notional caps so a fresh signal that would
+ * push us past the count is dropped with this reason rather than silently
+ * stacked.
+ */
+export const SKIP_MAX_CONCURRENT_SHORTS = 'max 3 concurrent shorts';
 
 // ── Filter thresholds (TRA-255 §5) ─────────────────────────────────────────
 
@@ -167,6 +182,31 @@ export const VOL_EXPANSION_BAR_LOOKBACK = 5;
  * Held shorts are NOT auto-flatted (spec §7).
  */
 export const DAILY_SHORT_CIRCUIT_BREAKER_PCT = -0.02;
+
+// ── Book caps & cooldown (TRA-255 §3.1 / §6) ──────────────────────────────
+
+/**
+ * Maximum number of open short positions across all strategies and symbols.
+ * Spec §6 final row. Checked before order submit by `evaluateShortBookCaps`;
+ * the user sees the candidate signal on the dashboard with `signalSkipReason`
+ * stamped to `SKIP_MAX_CONCURRENT_SHORTS` when this trips.
+ */
+export const MAX_CONCURRENT_SHORTS = 3;
+
+/**
+ * Per-symbol consecutive-loss threshold before the cooldown engages. Three
+ * back-to-back closed-at-loss shorts on the same symbol → cooldown for
+ * `CONSECUTIVE_LOSS_COOLDOWN_MS`. Resets on the first non-loss close. Spec
+ * §3.1 — first-pass values, revisit after Phase-1 walk-forward.
+ */
+export const CONSECUTIVE_LOSS_THRESHOLD = 3;
+
+/**
+ * Per-symbol cooldown window after the consecutive-loss threshold trips.
+ * 48h wall-clock per spec §3.1. Other symbols are unaffected; held positions
+ * are not auto-flatted.
+ */
+export const CONSECUTIVE_LOSS_COOLDOWN_MS = 48 * 60 * 60 * 1000;
 
 // ── Filter pipeline ────────────────────────────────────────────────────────
 
@@ -331,6 +371,116 @@ export function evaluateShortNotionalCaps(inputs: ShortNotionalCapInputs): strin
   }
 
   return null;
+}
+
+// ── Book caps & cooldown gates (TRA-255 §3.1 / §6) ────────────────────────
+
+/**
+ * Inputs to {@link evaluateShortBookCaps}. The two book-wide pre-route gates
+ * that aren't tied to a candidate's notional:
+ *   1. Per-symbol consecutive-loss cooldown (§3.1).
+ *   2. Whole-book max-concurrent-shorts count (§6).
+ *
+ * The caller (engine) owns the bookkeeping for both — this helper just
+ * inspects the supplied state. Keeping the gates state-free here means the
+ * same helper drives both the live-broker path and the demo path without
+ * either side having to grow new dependencies.
+ */
+export interface ShortBookCapInputs {
+  /**
+   * Number of currently-open short positions across all strategies and
+   * symbols. Counted right before order submit.
+   */
+  openShortCount: number;
+  /**
+   * `true` iff this signal's symbol is currently inside the §3.1 cooldown
+   * window (3 consecutive closed-at-loss shorts on this symbol within the
+   * last `CONSECUTIVE_LOSS_COOLDOWN_MS`). Caller resolves this from its
+   * own per-symbol short-loss bookkeeping; the helper deliberately does
+   * not own that state because closed-position history lives in the demo
+   * paper account / live broker reconciler, not the strategy layer.
+   */
+  symbolCooldownActive: boolean;
+}
+
+/**
+ * Run the book-wide pre-route caps from TRA-255 §3.1 / §6. Returns the
+ * first failing skip reason, or `null` when both gates pass. Order:
+ *
+ *   1. Per-symbol cooldown — diagnoses the more specific suppression first.
+ *      A symbol-cooldown skip is recoverable on the next signal once the
+ *      cooldown elapses; the count cap is a book-state issue that affects
+ *      every fresh signal until something closes.
+ *   2. Max-concurrent-shorts count.
+ *
+ * Live signals carrying `side !== 'sell'` short-circuit to null so the
+ * helper can be called unconditionally on every candidate without leaking
+ * cap logic into long routing.
+ */
+export function evaluateShortBookCaps(
+  signal: TradeSignal,
+  inputs: ShortBookCapInputs,
+): string | null {
+  if (signal.side !== 'sell') return null;
+  if (inputs.symbolCooldownActive) return SKIP_CONSECUTIVE_LOSSES;
+  if (inputs.openShortCount >= MAX_CONCURRENT_SHORTS) return SKIP_MAX_CONCURRENT_SHORTS;
+  return null;
+}
+
+/**
+ * Closed-short trade record fed to {@link symbolShortCooldownActive}. The
+ * caller passes whatever subset of its closed-position history it has —
+ * we only inspect entries on the matching symbol and only the `side === 'sell'`
+ * ones, so passing the full closed-positions list is fine (a long close is
+ * silently ignored).
+ */
+export interface ClosedShortTrade {
+  symbol: string;
+  /** P&L in USD on the close. Negative = loss. */
+  pnlUsd: number;
+  /** Wall-clock close time (ms since epoch). */
+  closedAt: number;
+  /** Trade side. Long entries are skipped by the cooldown logic. */
+  side: 'buy' | 'sell';
+}
+
+/**
+ * Determine whether `symbol` is currently inside the §3.1 short cooldown:
+ * the last `CONSECUTIVE_LOSS_THRESHOLD` consecutive closed shorts on that
+ * symbol were all losses, AND the most recent of those losses is within
+ * `CONSECUTIVE_LOSS_COOLDOWN_MS` of `nowMs`.
+ *
+ * A non-loss close (any short with `pnlUsd >= 0`) breaks the streak — the
+ * symbol exits the cooldown immediately even if there was an earlier
+ * 3-loss run, mirroring the spec's "consecutive" wording. Long closes on
+ * the same symbol are ignored entirely (the cooldown is short-specific).
+ */
+export function symbolShortCooldownActive(
+  symbol: string,
+  closedTrades: readonly ClosedShortTrade[],
+  nowMs: number,
+): boolean {
+  // Walk most-recent-first so the consecutive-loss streak is read from the
+  // present back into history.
+  const ordered = [...closedTrades].sort((a, b) => b.closedAt - a.closedAt);
+  let consecutiveLosses = 0;
+  let mostRecentLossAt: number | null = null;
+  for (const t of ordered) {
+    if (t.symbol !== symbol) continue;
+    if (t.side !== 'sell') continue;
+    if (t.pnlUsd < 0) {
+      consecutiveLosses++;
+      if (mostRecentLossAt === null) mostRecentLossAt = t.closedAt;
+      if (consecutiveLosses >= CONSECUTIVE_LOSS_THRESHOLD) {
+        if (mostRecentLossAt === null) return false;
+        return nowMs - mostRecentLossAt <= CONSECUTIVE_LOSS_COOLDOWN_MS;
+      }
+    } else {
+      // Non-loss close breaks the streak per the spec's "consecutive" rule.
+      return false;
+    }
+  }
+  return false;
 }
 
 // ── Lifecycle helpers (TRA-255 §7) ────────────────────────────────────────

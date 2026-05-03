@@ -11,9 +11,12 @@ import {
   BreakoutVolStrategy,
   StrategyRouter,
   evaluateShortFilters,
+  evaluateShortBookCaps,
+  symbolShortCooldownActive,
   isPerpShortSymbol,
   SKIP_NOT_IN_UNIVERSE,
   type ShortFilterContext,
+  type ClosedShortTrade,
 } from '@trading-app/engine';
 import { CRYPTO_WATCHLIST } from '@trading-app/shared';
 import type { TradeSignal, Candle, AccountState, Position, CryptoEngineState, NewsItem, AccountSettings } from '@trading-app/shared';
@@ -363,9 +366,44 @@ export class CryptoSignalEngine {
       const regime = new RegimeDetector();
       r = new StrategyRouter({
         regime,
-        momentum: new MomentumStrategy(regime),
+        // TRA-261 — short overrides come straight from TRA-255 §4.1 / §4.2.
+        // Long-side fields are deliberately omitted so the long path stays
+        // byte-identical to the TRA-200 / TRA-207 spec values.
+        momentum: new MomentumStrategy(regime, {
+          paramsByDirection: {
+            short: {
+              // §4.1 — entry + 2.0 × ATR(14). Defensive lock in case the
+              // long-side default drifts later (TRA-200 says long should be
+              // 2.5 — separate ticket).
+              atrStopMultiplier: 2.0,
+              // §4.1 — 8-bar rearm overrides the donchianPeriod-derived default
+              // so short re-entry stays slower than long during clustered
+              // down moves.
+              rearmBars: 8,
+              // §4.1 — EMA(200) slope must be negative over the last 10 bars
+              // for a short. Long-side leaves this undefined (no slope check),
+              // preserving byte-identical long behaviour.
+              slowMaSlopeBars: 10,
+              // §4.1 — breakout-bar volume ≥ 1.25 × SMA(volume, 20). Mirrors
+              // BreakoutVolStrategy's volume guard but only applies to shorts.
+              volumeMultiplier: 1.25,
+              volumeSmaPeriod: 20,
+            },
+          },
+        }),
         meanReversion: new MeanReversionCryptoStrategy(),
-        breakout: new BreakoutVolStrategy(),
+        breakout: new BreakoutVolStrategy({
+          paramsByDirection: {
+            short: {
+              // §4.2 — ≥ 2.5 × SMA(volume, 20) volume confirmation.
+              volumeMultiplier: 2.5,
+              // §4.2 — entry + 1.75 × ATR(14) hard stop.
+              atrStopMultiplier: 1.75,
+              // §4.2 — entry − 3.0 × ATR(14) take profit (R:R ≈ 1.7:1).
+              atrTpMultiplier: 3.0,
+            },
+          },
+        }),
       });
       this.routers.set(symbol, r);
     }
@@ -410,7 +448,66 @@ export class CryptoSignalEngine {
     };
 
     const reason = evaluateShortFilters(signal, ctx);
-    if (reason) signal.signalSkipReason = reason;
+    if (reason) {
+      signal.signalSkipReason = reason;
+      return;
+    }
+
+    // TRA-261 / TRA-255 §3.1 + §6 — book-wide pre-route caps. Counted across
+    // both the demo paper account and the live broker (only one is active per
+    // tick, but the helper accepts whichever is the source of truth) so the
+    // signal carries the right cap reason regardless of mode. The cooldown
+    // input pulls from the closed-positions list scoped to the active mode.
+    const bookReason = evaluateShortBookCaps(signal, {
+      openShortCount: this.countOpenShorts(),
+      symbolCooldownActive: symbolShortCooldownActive(
+        signal.symbol,
+        this.recentClosedShorts(),
+        Date.now(),
+      ),
+    });
+    if (bookReason) signal.signalSkipReason = bookReason;
+  }
+
+  /**
+   * Count open short positions across the active book. In demo we walk the
+   * paper account; in live we walk the broker mirror. Held shorts on a
+   * fall-through (live broker not yet initialised) count as zero — the
+   * routing path bails on the live mode early in that case so this is a
+   * defensive default rather than an observable code path.
+   */
+  private countOpenShorts(): number {
+    const positions = this.mode === 'live' && this.liveAccount
+      ? this.liveAccount.getState().openPositions
+      : this.account.getState().openPositions;
+    let n = 0;
+    for (const p of positions) if (p.side === 'sell') n++;
+    return n;
+  }
+
+  /**
+   * Closed-shorts feed for the §3.1 cooldown helper. Reads the closed-position
+   * list scoped to the active mode (the same lists the dashboard reads), so
+   * a Demo session that just took 3 SOL losses doesn't suppress Live shorts
+   * on the same ticker — and vice versa. Pre-TRA-242 snapshots without a
+   * `closedAt` are filtered out (we can't bound them to the cooldown window).
+   */
+  private recentClosedShorts(): ClosedShortTrade[] {
+    const list = this.mode === 'live' ? this.liveClosedPositions : this.demoClosedPositions;
+    const cutoff = Date.now() - 30 * 24 * 60 * 60 * 1000; // 30d window covers the 48h cooldown plus headroom for streak-walking
+    const out: ClosedShortTrade[] = [];
+    for (const p of list) {
+      if (p.side !== 'sell') continue;
+      if (typeof p.closedAt !== 'number') continue;
+      if (p.closedAt < cutoff) continue;
+      out.push({
+        symbol: p.symbol,
+        pnlUsd: p.pnl ?? 0,
+        closedAt: p.closedAt,
+        side: p.side,
+      });
+    }
+    return out;
   }
 
   private async tick(): Promise<void> {

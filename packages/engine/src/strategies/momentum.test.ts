@@ -163,6 +163,75 @@ describe('MomentumStrategy', () => {
     expect(fired).toBe(false);
   });
 
+  describe('TRA-261 / TRA-255 §4.1 — short-only entry gates', () => {
+    /**
+     * Build a `flat → downtrend` series and run the strategy with the
+     * supplied per-side overrides. Returns the first short signal emitted
+     * (or null if the gates suppress every fire). Shared helper because the
+     * slope and volume tests use the same series shape.
+     */
+    function firstShort(
+      shortOverrides: NonNullable<
+        ConstructorParameters<typeof MomentumStrategy>[1]
+      >['paramsByDirection'] extends infer P
+        ? P extends { short?: infer S } ? S : never
+        : never,
+    ) {
+      const detector = new RegimeDetector();
+      const strat = new MomentumStrategy(detector, {
+        fastMaPeriod: 10,
+        slowMaPeriod: 50,
+        donchianPeriod: 15,
+        paramsByDirection: { short: shortOverrides },
+      });
+      const candles = transitionSeries(80, 120, 'down');
+      for (let i = 60; i <= candles.length; i++) {
+        const s = strat.evaluate('TEST', candles.slice(0, i));
+        if (s) return s;
+      }
+      return null;
+    }
+
+    it('slope gate: short fires when slow EMA is sloping down (matches the trend)', () => {
+      const sig = firstShort({ slowMaSlopeBars: 10 });
+      expect(sig).not.toBeNull();
+      expect(sig?.side).toBe('sell');
+    });
+
+    it('slope gate: long path stays byte-identical when no override is set', () => {
+      // No short override = no slope gate; behaviour should equal the
+      // pre-TRA-261 long path (covered above by the existing buy test).
+      const detector = new RegimeDetector();
+      const strat = new MomentumStrategy(detector, {
+        fastMaPeriod: 10, slowMaPeriod: 50, donchianPeriod: 15,
+      });
+      const candles = transitionSeries(80, 120, 'up');
+      let signal = null;
+      for (let i = 60; i <= candles.length; i++) {
+        const s = strat.evaluate('TEST', candles.slice(0, i));
+        if (s) { signal = s; break; }
+      }
+      expect(signal?.side).toBe('buy');
+    });
+
+    it('volume gate: short fires when entry-bar volume meets the multiplier', () => {
+      // Default volumes in transitionSeries are 1_000 each bar → SMA = 1_000;
+      // setting volumeMultiplier=1.0 means current-bar volume must be ≥ SMA,
+      // which it always is. Gate is effectively a pass-through but exercises
+      // the wired volume calculation.
+      const sig = firstShort({ volumeMultiplier: 1.0, volumeSmaPeriod: 20 });
+      expect(sig).not.toBeNull();
+      expect(sig?.side).toBe('sell');
+    });
+
+    it('volume gate: short is suppressed when entry volume is below the multiplier', () => {
+      // 2.0× the SMA is unattainable when every bar has identical volume —
+      // entry volume == SMA, so 2.0 × SMA is strictly greater than entry.
+      const sig = firstShort({ volumeMultiplier: 2.0, volumeSmaPeriod: 20 });
+      expect(sig).toBeNull();
+    });
+  });
+
   it('cooldown spaces re-fires roughly one Donchian window apart', () => {
     // A sustained trend prints fresh Donchian highs on every bar, so without
     // the `rearmBars` cooldown the strategy would emit one signal per bar.

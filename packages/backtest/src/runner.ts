@@ -19,6 +19,8 @@ import {
   breakoutTrailStop,
   meanReversionRsiAltExitTriggered,
   timeStopBarsFor,
+  momentumTrailPeriodFor,
+  breakoutTrailOptionsFor,
 } from '@trading-app/engine';
 import { BacktestConfig, BacktestResult, PortfolioOpts, SignalEdge } from './types.js';
 
@@ -380,16 +382,37 @@ export class BacktestRunner {
         // PositionManager helper). Runs before the SL/TP hit check so a new
         // tighter level can trigger on the bar that raised it.
         if (pos.signalType === 'momentum') {
-          const donchianPeriod = config.momentumOpts?.donchianPeriod ?? 20;
+          // TRA-261 / TRA-255 §4.1 — Momentum-shorts trail at Donchian_high(10),
+          // Momentum-longs at Donchian_low(20). The per-side period map is the
+          // single source of truth; backtest config can still override the
+          // long-side period explicitly for sweeps.
+          const donchianPeriod = pos.side === 'sell'
+            ? momentumTrailPeriodFor('sell')
+            : config.momentumOpts?.donchianPeriod ?? momentumTrailPeriodFor('buy');
           const newStop = momentumTrailStop(pos, window, donchianPeriod);
           if (newStop !== null) {
             positions.updateStop(pos.id, newStop);
             ls.trailed = true;
           }
         } else if (pos.signalType === 'breakout_vol') {
-          const beTriggerMultiplier = config.breakoutVolOpts?.atrStopMultiplier ?? 2.0;
-          const trailMultiplier = config.breakoutVolOpts?.atrStopMultiplier ?? 2.0;
-          const atrPeriod = config.breakoutVolOpts?.atrPeriod ?? 14;
+          // TRA-261 / TRA-255 §4.2 — Breakout-shorts engage BE at +1.5×ATR
+          // and trail at 1.25×ATR; longs keep the spec §4 default 2×ATR/2×ATR.
+          // Long-side honours the backtest-config override (legacy sweep
+          // surface); shorts always use the spec values from the per-side map.
+          const sideOpts = breakoutTrailOptionsFor(pos.side);
+          // NOTE: prior code accidentally used `atrStopMultiplier` for both
+          // beTriggerMultiplier AND trailMultiplier — that's a long-side bug
+          // (those should be independent BE-trigger and trail-width knobs).
+          // Preserving the legacy behaviour to keep this commit "byte-identical
+          // long path" per the TRA-261 contract; a follow-up ticket can split
+          // them.
+          const beTriggerMultiplier = pos.side === 'sell'
+            ? sideOpts.beTriggerMultiplier
+            : config.breakoutVolOpts?.atrStopMultiplier ?? sideOpts.beTriggerMultiplier;
+          const trailMultiplier = pos.side === 'sell'
+            ? sideOpts.trailMultiplier
+            : config.breakoutVolOpts?.atrStopMultiplier ?? sideOpts.trailMultiplier;
+          const atrPeriod = config.breakoutVolOpts?.atrPeriod ?? sideOpts.atrPeriod ?? 14;
           const newStop = breakoutTrailStop(pos, window, ls, {
             beTriggerMultiplier,
             trailMultiplier,
@@ -467,8 +490,10 @@ export class BacktestRunner {
 
         // 3) Time stop. Per spec §3/§4 the position closes "at market" once
         //    the bar cap is reached; we use the bar's close. Only fires when
-        //    neither the bracket nor the alt-exit closed the trade.
-        const cap = timeStopBarsFor(pos.signalType);
+        //    neither the bracket nor the alt-exit closed the trade. TRA-261 —
+        //    pass `pos.side` so Momentum-shorts get the §4.1 20-bar cap and
+        //    Breakout-shorts get the §4.2 10-bar cap (vs. 15 long).
+        const cap = timeStopBarsFor(pos.signalType, pos.side);
         if (ls && cap !== null && ls.barsHeld >= cap) {
           exitsThisBar.push({
             pos,

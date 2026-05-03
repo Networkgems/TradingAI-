@@ -1,4 +1,4 @@
-import type { Candle, Position } from '@trading-app/shared';
+import type { Candle, Position, Side, SignalType } from '@trading-app/shared';
 import { atr } from './indicators/atr.js';
 import { donchian } from './indicators/donchian.js';
 import { rsi } from './indicators/rsi.js';
@@ -22,13 +22,60 @@ import { rsi } from './indicators/rsi.js';
 
 /**
  * Per-strategy time-stop caps from TRA-197 spec §3 (mean reversion) and §4
- * (breakout). Momentum has no time stop — trend rides until the trail or hard
- * stop hits.
+ * (breakout). TRA-261 / TRA-255 §4 — re-keyed by `(signalType, side)` so the
+ * crypto perp shorts spec can layer in tighter time-stop caps for Momentum
+ * and Breakout shorts without disturbing the long path. Momentum-long has no
+ * time stop (trends ride to a structural exit); the missing entry there is
+ * intentional and `timeStopBarsFor('momentum', 'buy')` returns null.
+ *
+ * Concrete shape (TRA-255 §4):
+ *   - mean_reversion long+short: 10 bars (long path unchanged)
+ *   - breakout_vol long: 15 bars (unchanged); short: 10 bars (§4.2)
+ *   - momentum long: none; short: 20 bars (§4.1)
  */
-export const TIME_STOP_BARS: Readonly<Record<string, number>> = {
-  mean_reversion: 10,
-  breakout_vol: 15,
+export const TIME_STOP_BARS: Readonly<Record<string, Readonly<Partial<Record<Side, number>>>>> = {
+  mean_reversion: { buy: 10, sell: 10 },
+  breakout_vol: { buy: 15, sell: 10 },
+  momentum: { sell: 20 },
 };
+
+/**
+ * TRA-261 / TRA-255 §4.1 — per-side Donchian period for the Momentum trailing
+ * stop. Long path keeps the spec's 20-bar Donchian-low trail; short path
+ * tightens to 10 bars so the trail snaps closer in the down-leg's faster
+ * tape.  Consumed by the runner: it reads `MOMENTUM_TRAIL_PERIOD_BY_SIDE[side]`
+ * (or `momentumTrailPeriodFor(side)`) and forwards the period to the existing
+ * `momentumTrailStop(position, candles, donchianPeriod)`. No change to the
+ * helper itself.
+ */
+export const MOMENTUM_TRAIL_PERIOD_BY_SIDE: Readonly<Record<Side, number>> = {
+  buy: 20,
+  sell: 10,
+};
+
+export function momentumTrailPeriodFor(side: Side): number {
+  return MOMENTUM_TRAIL_PERIOD_BY_SIDE[side];
+}
+
+/**
+ * TRA-261 / TRA-255 §4.2 — per-side breakout-trail options. Long path is the
+ * spec §4 default (BE at +2·ATR, then 2·ATR trail); short path tightens to
+ * BE at +1.5·ATR, then 1.25·ATR trail to reflect the faster mean-reversion
+ * dynamics on Momentum-style down-legs. Consumed by the runner via
+ * `breakoutTrailOptionsFor(side)` and forwarded to the existing
+ * `breakoutTrailStop(position, candles, state, opts)` helper.
+ *
+ * `atrPeriod` stays at 14 for both sides — only the trigger and trail width
+ * differ per the spec table.
+ */
+export const BREAKOUT_TRAIL_OPTIONS_BY_SIDE: Readonly<Record<Side, BreakoutTrailOptions>> = {
+  buy: { beTriggerMultiplier: 2.0, trailMultiplier: 2.0, atrPeriod: 14 },
+  sell: { beTriggerMultiplier: 1.5, trailMultiplier: 1.25, atrPeriod: 14 },
+};
+
+export function breakoutTrailOptionsFor(side: Side): BreakoutTrailOptions {
+  return BREAKOUT_TRAIL_OPTIONS_BY_SIDE[side];
+}
 
 /**
  * Per-position lifecycle state owned by the caller (runner or future live
@@ -212,10 +259,32 @@ export function meanReversionRsiAltExitTriggered(
 }
 
 /**
- * Returns the per-strategy time-stop bar cap, or `null` when the strategy has
- * no time stop (momentum rides trends to a structural exit).
+ * Returns the per-(strategy, side) time-stop bar cap, or `null` when no cap
+ * applies. TRA-261 / TRA-255 §4 re-keyed the table by `(signalType, side)`
+ * so Momentum-long can stay capless (trend rides) while Momentum-short pulls
+ * the spec's 20-bar cap, and Breakout-short pulls a 10-bar cap (vs. 15 long).
+ *
+ * For back-compat with callers that don't yet know the position's side
+ * (legacy backtest paths from before TRA-261), `side` is optional — when
+ * omitted we walk both side entries and take the smaller cap, which is the
+ * tightest contract the runner could enforce given an unknown side. Pass
+ * `position.side` explicitly when you have it.
  */
-export function timeStopBarsFor(signalType: string): number | null {
-  const cap = TIME_STOP_BARS[signalType];
-  return cap === undefined ? null : cap;
+export function timeStopBarsFor(signalType: SignalType | string, side?: Side): number | null {
+  const entry = TIME_STOP_BARS[signalType];
+  if (!entry) return null;
+  if (side !== undefined) {
+    const cap = entry[side];
+    return cap === undefined ? null : cap;
+  }
+  // No side supplied — return the tightest of the configured caps so the
+  // runner enforces the conservative contract. (Legacy callers that only
+  // had `signalType` get the same cap as the long-only world for
+  // mean_reversion / breakout_vol; momentum returns 20 because the only
+  // populated entry is the short cap.)
+  const caps: number[] = [];
+  if (entry.buy !== undefined) caps.push(entry.buy);
+  if (entry.sell !== undefined) caps.push(entry.sell);
+  if (caps.length === 0) return null;
+  return Math.min(...caps);
 }

@@ -15,6 +15,9 @@ import {
   VOL_EXPANSION_ATR_RATIO,
   VOL_EXPANSION_BAR_LOOKBACK,
   DAILY_SHORT_CIRCUIT_BREAKER_PCT,
+  MAX_CONCURRENT_SHORTS,
+  CONSECUTIVE_LOSS_THRESHOLD,
+  CONSECUTIVE_LOSS_COOLDOWN_MS,
   SKIP_NOT_IN_UNIVERSE,
   SKIP_MR_OFF_STRATEGY,
   SKIP_FUNDING_TOO_NEGATIVE,
@@ -24,14 +27,19 @@ import {
   SKIP_TOTAL_SHORT_NOTIONAL,
   SKIP_SINGLE_SYMBOL_CAP,
   SKIP_CROSS_STRATEGY_CAP,
+  SKIP_CONSECUTIVE_LOSSES,
+  SKIP_MAX_CONCURRENT_SHORTS,
   isPerpShortSymbol,
   isTier2PerpShort,
   perpShortRiskFraction,
   evaluateShortFilters,
   evaluateShortNotionalCaps,
+  evaluateShortBookCaps,
+  symbolShortCooldownActive,
   fundingFlipStopTriggered,
   adverseVolExpansionShortExitTriggered,
   dailyShortCircuitBreakerTripped,
+  type ClosedShortTrade,
 } from './perp-shorts.js';
 
 /**
@@ -67,6 +75,11 @@ describe('perp shorts spec wiring (TRA-261)', () => {
       expect(SKIP_SPREAD_TOO_WIDE).toBe('spread too wide for perp short');
       expect(SKIP_OI_UNDER_MIN).toBe('perp OI under min');
       expect(SKIP_TOTAL_SHORT_NOTIONAL).toBe('total short notional cap');
+      expect(SKIP_SINGLE_SYMBOL_CAP).toBe('single-symbol short cap');
+      expect(SKIP_CROSS_STRATEGY_CAP).toBe('cross-strategy per-symbol short cap');
+      // TRA-261 / TRA-255 §3.1 / §6 — the two book-wide pre-route gates.
+      expect(SKIP_CONSECUTIVE_LOSSES).toBe('3 consecutive short losses — symbol cooldown');
+      expect(SKIP_MAX_CONCURRENT_SHORTS).toBe('max 3 concurrent shorts');
     });
   });
 
@@ -383,6 +396,133 @@ describe('perp shorts spec wiring (TRA-261)', () => {
 
     it('threshold matches spec §7: -2%', () => {
       expect(DAILY_SHORT_CIRCUIT_BREAKER_PCT).toBeCloseTo(-0.02, 6);
+    });
+  });
+
+  describe('evaluateShortBookCaps (TRA-255 §3.1 / §6)', () => {
+    it('thresholds match spec §3.1 / §6', () => {
+      expect(MAX_CONCURRENT_SHORTS).toBe(3);
+      expect(CONSECUTIVE_LOSS_THRESHOLD).toBe(3);
+      expect(CONSECUTIVE_LOSS_COOLDOWN_MS).toBe(48 * 60 * 60 * 1000);
+    });
+
+    it('returns null on a clean short', () => {
+      const sig = shortSignal('BTC-USD');
+      expect(evaluateShortBookCaps(sig, {
+        openShortCount: 0,
+        symbolCooldownActive: false,
+      })).toBeNull();
+    });
+
+    it('returns null for a long signal regardless of caps', () => {
+      const longSig = shortSignal('BTC-USD', { side: 'buy' });
+      expect(evaluateShortBookCaps(longSig, {
+        openShortCount: 100,
+        symbolCooldownActive: true,
+      })).toBeNull();
+    });
+
+    it('emits SKIP_CONSECUTIVE_LOSSES when the symbol cooldown is active', () => {
+      const sig = shortSignal('SOL-USD');
+      expect(evaluateShortBookCaps(sig, {
+        openShortCount: 0,
+        symbolCooldownActive: true,
+      })).toBe(SKIP_CONSECUTIVE_LOSSES);
+    });
+
+    it('emits SKIP_MAX_CONCURRENT_SHORTS when openShortCount ≥ 3', () => {
+      const sig = shortSignal('BTC-USD');
+      expect(evaluateShortBookCaps(sig, {
+        openShortCount: MAX_CONCURRENT_SHORTS,
+        symbolCooldownActive: false,
+      })).toBe(SKIP_MAX_CONCURRENT_SHORTS);
+      // Strictly above also trips.
+      expect(evaluateShortBookCaps(sig, {
+        openShortCount: MAX_CONCURRENT_SHORTS + 5,
+        symbolCooldownActive: false,
+      })).toBe(SKIP_MAX_CONCURRENT_SHORTS);
+    });
+
+    it('cooldown beats count cap when both would trip', () => {
+      // The cooldown is the more specific diagnosis (the user can recover by
+      // waiting 48h or by switching ticker), so we surface it first.
+      const sig = shortSignal('SOL-USD');
+      expect(evaluateShortBookCaps(sig, {
+        openShortCount: 10,
+        symbolCooldownActive: true,
+      })).toBe(SKIP_CONSECUTIVE_LOSSES);
+    });
+  });
+
+  describe('symbolShortCooldownActive (TRA-255 §3.1)', () => {
+    const NOW = 2_000_000_000_000;
+    function loss(symbol: string, closedAt: number, pnl = -10): ClosedShortTrade {
+      return { symbol, closedAt, pnlUsd: pnl, side: 'sell' };
+    }
+    function win(symbol: string, closedAt: number, pnl = 10): ClosedShortTrade {
+      return { symbol, closedAt, pnlUsd: pnl, side: 'sell' };
+    }
+
+    it('returns false on an empty history', () => {
+      expect(symbolShortCooldownActive('BTC-USD', [], NOW)).toBe(false);
+    });
+
+    it('returns false when fewer than 3 consecutive losses on the symbol', () => {
+      const trades = [loss('BTC-USD', NOW - 1_000), loss('BTC-USD', NOW - 2_000)];
+      expect(symbolShortCooldownActive('BTC-USD', trades, NOW)).toBe(false);
+    });
+
+    it('returns true on exactly 3 consecutive losses inside the cooldown window', () => {
+      const trades = [
+        loss('BTC-USD', NOW - 1_000),
+        loss('BTC-USD', NOW - 2_000),
+        loss('BTC-USD', NOW - 3_000),
+      ];
+      expect(symbolShortCooldownActive('BTC-USD', trades, NOW)).toBe(true);
+    });
+
+    it('returns false when the most recent loss is older than the cooldown window', () => {
+      const old = NOW - CONSECUTIVE_LOSS_COOLDOWN_MS - 60_000;
+      const trades = [
+        loss('BTC-USD', old),
+        loss('BTC-USD', old - 1_000),
+        loss('BTC-USD', old - 2_000),
+      ];
+      expect(symbolShortCooldownActive('BTC-USD', trades, NOW)).toBe(false);
+    });
+
+    it('a non-loss close BREAKS the streak (consecutive rule)', () => {
+      const trades = [
+        loss('BTC-USD', NOW - 1_000),
+        win('BTC-USD', NOW - 2_000),
+        loss('BTC-USD', NOW - 3_000),
+        loss('BTC-USD', NOW - 4_000),
+      ];
+      expect(symbolShortCooldownActive('BTC-USD', trades, NOW)).toBe(false);
+    });
+
+    it('only counts shorts on the matching symbol', () => {
+      // Three losses on ETH-USD do not put BTC-USD in cooldown.
+      const trades = [
+        loss('ETH-USD', NOW - 1_000),
+        loss('ETH-USD', NOW - 2_000),
+        loss('ETH-USD', NOW - 3_000),
+      ];
+      expect(symbolShortCooldownActive('BTC-USD', trades, NOW)).toBe(false);
+      expect(symbolShortCooldownActive('ETH-USD', trades, NOW)).toBe(true);
+    });
+
+    it('long closes on the symbol are ignored', () => {
+      // Two losing longs interleaved with shorts must not count toward the
+      // short streak — the cooldown is short-specific.
+      const trades: ClosedShortTrade[] = [
+        loss('BTC-USD', NOW - 1_000),
+        { symbol: 'BTC-USD', closedAt: NOW - 2_000, pnlUsd: -50, side: 'buy' },
+        loss('BTC-USD', NOW - 3_000),
+        { symbol: 'BTC-USD', closedAt: NOW - 4_000, pnlUsd: -50, side: 'buy' },
+        loss('BTC-USD', NOW - 5_000),
+      ];
+      expect(symbolShortCooldownActive('BTC-USD', trades, NOW)).toBe(true);
     });
   });
 });

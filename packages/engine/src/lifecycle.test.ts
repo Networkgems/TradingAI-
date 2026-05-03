@@ -38,19 +38,38 @@ function mkPosition(over: Partial<Position> = {}): Position {
 }
 
 describe('TIME_STOP_BARS / timeStopBarsFor', () => {
-  it('encodes the spec §3 / §4 caps', () => {
-    expect(TIME_STOP_BARS.mean_reversion).toBe(10);
-    expect(TIME_STOP_BARS.breakout_vol).toBe(15);
+  it('encodes the spec §3 / §4 caps re-keyed by (signalType, side)', () => {
+    // TRA-255 §3 — mean reversion: 10 bars both sides.
+    expect(TIME_STOP_BARS.mean_reversion).toEqual({ buy: 10, sell: 10 });
+    // TRA-255 §4.2 — breakout: 15 bars long, 10 bars short.
+    expect(TIME_STOP_BARS.breakout_vol).toEqual({ buy: 15, sell: 10 });
+    // TRA-255 §4.1 — momentum: no long cap (trend ride), 20 bars short.
+    expect(TIME_STOP_BARS.momentum).toEqual({ sell: 20 });
   });
 
-  it('returns null for strategies with no time stop (momentum rides trends)', () => {
-    expect(timeStopBarsFor('momentum')).toBeNull();
+  it('returns null for strategies with no time stop on the supplied side', () => {
+    // Momentum-long has no time stop (trend rides to a structural exit).
+    expect(timeStopBarsFor('momentum', 'buy')).toBeNull();
+    // Unknown signal types return null both with and without a side.
     expect(timeStopBarsFor('orb_breakout')).toBeNull();
+    expect(timeStopBarsFor('orb_breakout', 'buy')).toBeNull();
   });
 
-  it('returns the correct cap for the gated strategies', () => {
+  it('returns the per-side cap when side is supplied', () => {
+    expect(timeStopBarsFor('mean_reversion', 'buy')).toBe(10);
+    expect(timeStopBarsFor('mean_reversion', 'sell')).toBe(10);
+    expect(timeStopBarsFor('breakout_vol', 'buy')).toBe(15);
+    expect(timeStopBarsFor('breakout_vol', 'sell')).toBe(10);
+    expect(timeStopBarsFor('momentum', 'sell')).toBe(20);
+  });
+
+  it('returns the tightest cap when side is omitted (legacy callers)', () => {
+    // mean_reversion: same on both sides → 10.
     expect(timeStopBarsFor('mean_reversion')).toBe(10);
-    expect(timeStopBarsFor('breakout_vol')).toBe(15);
+    // breakout_vol: 15 long vs 10 short → tightest is 10.
+    expect(timeStopBarsFor('breakout_vol')).toBe(10);
+    // momentum: only sell populated → that's the cap that applies.
+    expect(timeStopBarsFor('momentum')).toBe(20);
   });
 });
 

@@ -36,6 +36,30 @@ export interface MomentumOptions {
    */
   rearmBars?: number;
   /**
+   * TRA-261 / TRA-255 §4.1 — slope-of-slow-EMA gate. When set, the slow EMA
+   * must move in the trade's favour over the last `slowMaSlopeBars` bars
+   * (negative for shorts, positive for longs); otherwise the candidate is
+   * suppressed even if every other gate passes. Defaults to `undefined` so
+   * the long path is byte-identical to pre-TRA-261; the short override sets
+   * `10` for the spec's "EMA200 slope negative over last 10 bars" rule. The
+   * slope is computed as a raw level delta, not a percentage — for the
+   * spec rule we only care about the sign.
+   */
+  slowMaSlopeBars?: number;
+  /**
+   * TRA-261 / TRA-255 §4.1 — breakout-bar volume confirmation. When set,
+   * current-bar volume must be ≥ `volumeMultiplier × SMA(volume, volumeSmaPeriod)`.
+   * Defaults to `undefined` so the long path stays byte-identical; the short
+   * override sets `1.25` to mirror the spec's "≥ 1.25 × SMA(volume, 20)".
+   */
+  volumeMultiplier?: number;
+  /**
+   * Window for the volume SMA used by the volume-confirmation gate. Default
+   * `20` so a short override that only sets `volumeMultiplier` picks up the
+   * spec's "SMA(volume, 20)" baseline without restating it.
+   */
+  volumeSmaPeriod?: number;
+  /**
    * Lot-size for ATR-based sizing. Forwarded to `RiskManager.sizeFromAtr`;
    * crypto callers typically use 1e-6 (Coinbase BTC) so a $500 risk budget
    * over a $1k stop sizes to 0.5 BTC instead of being floored to 0.
@@ -64,6 +88,20 @@ interface ResolvedOptions {
   atrStopMultiplier: number;
   atrTpMultiplier: number;
   rearmBars: number;
+  /**
+   * Slope-of-slow-MA gate window. `undefined` = gate disabled (long-side
+   * default); positive integer = require the slow EMA to move in the trade's
+   * favour over that many bars. Resolved per-side so a short override of
+   * `10` doesn't reach into the long path.
+   */
+  slowMaSlopeBars: number | undefined;
+  /**
+   * Volume-confirmation multiplier on the breakout bar. `undefined` = gate
+   * disabled (long-side default).
+   */
+  volumeMultiplier: number | undefined;
+  /** Window for the SMA(volume) used by the volume gate. */
+  volumeSmaPeriod: number;
   lotSize: number | undefined;
 }
 
@@ -74,6 +112,12 @@ const DEFAULTS: Omit<ResolvedOptions, 'rearmBars'> = {
   atrPeriod: 14,
   atrStopMultiplier: 2,
   atrTpMultiplier: 4,
+  slowMaSlopeBars: undefined,
+  volumeMultiplier: undefined,
+  // 20-bar SMA(volume) baseline matches BreakoutVolStrategy and the TRA-255
+  // §4.1 spec wording ("SMA(volume, 20)"). Only consulted when
+  // `volumeMultiplier` is set.
+  volumeSmaPeriod: 20,
   lotSize: undefined,
 };
 
@@ -215,6 +259,24 @@ export class MomentumStrategy {
     // is null in that branch.
     const opt = this.optFor(side);
 
+    // TRA-261 / TRA-255 §4.1 — slow-MA slope gate. The spec requires the
+    // EMA(200) to slope against the trend (negative for shorts) over the
+    // last `slowMaSlopeBars` bars before we're willing to fire. Long-side
+    // leaves `slowMaSlopeBars` undefined → gate is a no-op, preserving
+    // byte-identical long behaviour. We compare the latest slow EMA to the
+    // value `slowMaSlopeBars` bars ago using level deltas — the spec only
+    // cares about the sign, so a percentage normalization would just add
+    // numerical noise without changing decisions.
+    if (opt.slowMaSlopeBars !== undefined && opt.slowMaSlopeBars > 0) {
+      const idx = slowSeries.length - 1 - opt.slowMaSlopeBars;
+      if (idx < 0) return null;
+      const slowThen = slowSeries[idx];
+      if (!Number.isFinite(slowThen)) return null;
+      const slope = slowNow - slowThen;
+      if (side === 'sell' && slope >= 0) return null;
+      if (side === 'buy' && slope <= 0) return null;
+    }
+
     // Donchian breakout — channel is computed from the prior N bars (current
     // bar excluded) so a close *beyond* the channel is unambiguously a breakout.
     const ch = donchian(candles, opt.donchianPeriod, true);
@@ -225,6 +287,23 @@ export class MomentumStrategy {
     const breakoutLong = side === 'buy' && latest.close > ch.upper;
     const breakoutShort = side === 'sell' && latest.close < ch.lower;
     if (!breakoutLong && !breakoutShort) return null;
+
+    // TRA-261 / TRA-255 §4.1 — breakout-bar volume confirmation. Long-side
+    // leaves `volumeMultiplier` undefined → gate is a no-op. Shorts require
+    // the entry bar's volume to be ≥ `volumeMultiplier × SMA(volume, N)`.
+    // Mirrors BreakoutVolStrategy's volume guard, with the gating constant
+    // (1.25× by spec) tuned looser since Momentum already has the regime +
+    // EMA-cross + breakout filters in front of it.
+    if (opt.volumeMultiplier !== undefined && opt.volumeMultiplier > 0) {
+      const window = opt.volumeSmaPeriod;
+      if (candles.length < window + 1) return null;
+      const baselineStart = candles.length - 1 - window;
+      let volumeSum = 0;
+      for (let i = baselineStart; i < candles.length - 1; i++) volumeSum += candles[i].volume;
+      const volumeSma = volumeSum / window;
+      if (!(volumeSma > 0)) return null;
+      if (latest.volume < opt.volumeMultiplier * volumeSma) return null;
+    }
 
     // Cooldown: a sustained trend prints fresh Donchian highs every bar, so
     // without a re-arm window the strategy would emit one signal per bar.
