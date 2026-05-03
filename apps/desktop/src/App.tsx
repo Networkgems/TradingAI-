@@ -213,12 +213,17 @@ function AccountModeSwitcher({
   async function switchTo(next: 'demo' | 'live') {
     if (next === mode || busy) return;
     if (next === 'live') {
-      const ok = window.confirm(
-        `Switch ${market === 'crypto' ? 'Crypto' : 'Stocks'} dashboard to LIVE account?\n\n` +
-        'Live mode places real orders against your configured brokerage. ' +
-        'Make sure your live credentials are set up in Settings.',
-      );
-      if (!ok) return;
+      const ackKey = `liveModeAcknowledged_${market}`;
+      const alreadyAcknowledged = localStorage.getItem(ackKey) === 'true';
+      if (!alreadyAcknowledged) {
+        const ok = window.confirm(
+          `Switch ${market === 'crypto' ? 'Crypto' : 'Stocks'} dashboard to LIVE account?\n\n` +
+          'Live mode places real orders against your configured brokerage. ' +
+          'Make sure your live credentials are set up in Settings.',
+        );
+        if (!ok) return;
+        localStorage.setItem(ackKey, 'true');
+      }
     }
     setBusy(true);
     try {
