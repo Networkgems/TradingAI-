@@ -164,20 +164,27 @@ interface ShortSpec {
   regime?: RegimeDetectorOptions;
 }
 
-// TRA-275 / TRA-255 §4.4 r6 (2026-05-03) — Phase-1.1 4H Layer 3 structural
-// rewrite. Layer 1 (r4) and Layer 2 (r5) both produced 0 / 9 windows with
-// empty pre-route skip-reason histograms, which is the §4.4 escalation
-// criterion ("if Layer 1 + Layer 2 together still miss the §8 acceptance
-// bars, the 4H short layer needs a structural rewrite").
+// TRA-278 / TRA-255 §4.4 r7 (2026-05-03) — Phase-1.1 4H Layer 3 cascade-trigger
+// parameter revision. r6 cleared the density bar (9/9 windows, 67 trades) but
+// missed §8 acceptance in 6/9 windows on the universe rollup (BTC fired 0
+// trades across all 9 windows). r7 retunes the three numeric primitives in
+// the §4.4 r6 branch menu: drop-bar 1.5 → 1.25× ATR, recent-high anchor
+// 0.95 → 0.97 × max(high, 20), volume 1.5 → 1.75× SMA(volume, 20). The three
+// retuned constants live in `CASCADE_LEG_DEFAULTS` inside
+// `packages/engine/src/strategies/momentum.ts`; this harness still wires the
+// cascade trigger via `byTimeframe['4h']: {}` (empty params → fall through to
+// the engine defaults).
 //
-// Momentum-short on 4H: `byTimeframe['4h']` activates the cascade-leg trigger
-//   (drop-bar 1.5×ATR + close-in-lower-33% + 1.5× volume + 0.95× recent-high
-//   anchor + softer regime gate `!== 'trend_up'`). The §4.1 EMA-cross /
-//   Donchian / slope / 1.10× volume stack is *replaced*, not stacked.
-// Breakout-short on 4H: knob relaxation only — `consolidationBars 20 → 10`
-//   (40h ≈ 1.7 days, 4H-native), `volumeMultiplier 1.75 → 1.50` (matches
-//   the cascade-volume floor). `atrStopMultiplier 1.75`, `atrTpMultiplier
-//   3.0` unchanged.
+// Momentum-short on 4H: `byTimeframe['4h']` activates the r7 cascade-leg
+//   trigger (drop-bar 1.25×ATR + close-in-lower-33% + 1.75× volume + 0.97×
+//   recent-high anchor + softer regime gate `!== 'trend_up'`). The §4.1
+//   EMA-cross / Donchian / slope / 1.10× volume stack is *replaced*, not
+//   stacked. Trigger structure byte-unchanged from r6; only the three numeric
+//   primitives in the §4.4 r6 branch menu move.
+// Breakout-short on 4H: byte-unchanged from r6 — `consolidationBars 10`
+//   (40h ≈ 1.7 days, 4H-native), `volumeMultiplier 1.50` (matches the
+//   cascade-volume floor of r6, not the new 1.75 cascade-volume). `atrStop
+//   Multiplier 1.75`, `atrTpMultiplier 3.0` unchanged.
 // Layer 1 / Layer 2 / regime hysteresis: kept active (slope, 1.10× volume,
 //   `flipBars 2`, BTC alt-overlay softening) — they're idempotent under the
 //   cascade trigger (which doesn't read them) and stay byte-correct for any
@@ -1067,7 +1074,7 @@ function buildReport(
   const lines: string[] = [];
   const titleSuffix = granularity === '1d'
     ? ' (1D parked baseline — TRA-255 r3 §8.1)'
-    : ' (4H Phase-1.1 — TRA-255 r6 §4.4 Layer 3)';
+    : ' (4H Phase-1.1 — TRA-255 r7 §4.4 Layer 3)';
   lines.push(`# TRA-266 — §8 Walk-Forward Sweep Report${titleSuffix}\n`);
   lines.push(`Generated: ${new Date().toISOString()}\n`);
   lines.push(`Granularity: ${granularity}`);

@@ -1,3 +1,60 @@
+# TRA-261 — §8 4H Walk-Forward Sweep Report (r7 sidecar — TRA-255 §4.4 Layer 3 cascade-trigger parameter revision)
+
+> **r7 sidecar — preserves the r3 → r4 → r5 → r6 → r7 audit trail.** Snapshot
+> of the [TRA-255](/TRA/issues/TRA-255#document-strategy) §4.4 Layer 3 r7 4H
+> sweep run on 2026-05-03. r7 retunes three numeric primitives inside the r6
+> cascade-leg trigger per the §4.4 r6 "density met but §8 misses" branch:
+> drop-bar `1.5× → 1.25× ATR(14)`, recent-high anchor `0.95 → 0.97 ×
+> max(high, 20)`, volume `1.5× → 1.75× SMA(volume, 20)`. Trigger structure
+> (drop-bar AND lower-33% close AND volume AND recent-high anchor AND
+> softened daily-regime gate `!== 'trend_up'`) byte-unchanged from r6.
+> Breakout-short 4H knobs, §3 / §5 / §6 / §7 risk controls, and §4.1 stop /
+> TP / trail / time-stop / re-arm stay byte-unchanged.
+>
+> **Result:**
+>
+> * **Density bar:** **MET** — 9 / 9 windows fire, 61 trades total (r6:
+>   67). Density is approximately neutral relative to r6 (the magnitude
+>   relaxation pulls more candidate bars in; the tighter recent-high anchor
+>   and 1.75× volume floor filter a comparable number out).
+> * **§8 acceptance:** **4 / 9 windows pass** (windows 1, 2, 7, 8). r6 passed
+>   3 / 9 (1, 7, 8) — window 2 flipped from FAIL to PASS under r7. Failing
+>   windows: 0, 3, 4, 5, 6.
+> * **§8 universe-rollup totals:** -$598 PnL (r6: -$1,244 — 52% improvement),
+>   rolling-90d short-book DD 3.45% (r6: 3.47%, both inside the 8% bar).
+> * **BTC density check:** **0 / 9 windows fired any BTC trade** — the
+>   smoking-gun diagnostic from r6 *did not unblock* under the drop-bar
+>   relaxation. The volume retune (1.5 → 1.75×) appears to be the new
+>   binding gate on BTC: its 4H cascade flushes don't reliably print at
+>   1.75× the trailing 20-bar volume SMA on Coinbase Phase-1 history.
+> * **Per-symbol streaks (§8 PARK threshold ≥ 4):** BTC PARK (streak 9 —
+>   never fired), ETH PARK (streak 4 — improved from r6 streak 7), XRP
+>   PARK (streak 5 — improved from r6 streak 6), SOL OK (streak 3), DOGE
+>   OK (streak 2 — improved from r6 streak 3).
+>
+> **Decision:** **FAIL** — three numeric retunes within the §4.4 r6 branch
+> menu have been exhausted. Per the §4.4 r7 spec branch ("Density bar met
+> BUT ≤ 4 / 9 windows pass §8"), reassigning to QuantTrader for **Layer 3
+> structural revision (v2 strategy ticket per §4.4)**. The BTC 0 / 9
+> persistence is the structural-evidence flag — the cascade-leg trigger
+> (drop-bar + close-in-lower-33% + volume + recent-high anchor + softened
+> daily-regime) does not match BTC's Coinbase 4H distribution at any of the
+> r6/r7 parameter points, suggesting the BTC short layer needs a different
+> trigger family (e.g. liquidation-impulse driven, OI-delta driven, or a
+> mean-reversion/RSI-extreme bracket distinct from the alt cluster's cascade
+> flush profile). r8+ retunes within the r6/r7 numeric envelope are
+> unlikely to recover BTC density.
+>
+> Sensitivity sweep r7 confirms the §4.1 stop multiplier still has
+> meaningful headroom: `Momentum.atrStopMultiplier 1.20×` cuts the
+> universe-rollup loss from -$598 → -$85 (86% improvement, vs r6 sweep's
+> 0.80× factor at -$1,244 → -$405). Direction flipped vs r6 — under r7's
+> tighter cascade gate the longer-tailed stop now adds expectancy by
+> outliving the immediate post-entry bounces. Captured here for the future
+> §4.1 review prompt; out of scope for r7 / r8.
+
+---
+
 # TRA-266 — §8 Walk-Forward Sweep Report (4H Phase-1.1 — TRA-255 r7 §4.4 Layer 3)
 
 Generated: 2026-05-03T15:08:33.149Z

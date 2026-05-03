@@ -2,6 +2,7 @@ import { describe, it, expect } from 'vitest';
 import type { Candle } from '@trading-app/shared';
 import { MomentumStrategy } from './momentum.js';
 import { RegimeDetector } from '../regime.js';
+import { atr } from '../indicators/atr.js';
 
 /**
  * Sideways base with comparable bar-range to the subsequent trend phase.
@@ -232,7 +233,7 @@ describe('MomentumStrategy', () => {
     });
   });
 
-  describe('TRA-275 / TRA-255 §4.4 r6 — 4H cascade-leg short trigger', () => {
+  describe('TRA-278 / TRA-255 §4.4 r7 — 4H cascade-leg short trigger', () => {
     const FOUR_HOUR_MS = 4 * 60 * 60 * 1000;
 
     /**
@@ -338,13 +339,84 @@ describe('MomentumStrategy', () => {
       expect(evalCascade(cascadeSeries(), 'trend_up')).toBeNull();
     });
 
-    it('drop-bar magnitude gate: blocks when (open-close) is below 1.5× ATR', () => {
+    it('drop-bar magnitude gate: blocks when (open-close) is below 1.25× ATR (r7 retune from 1.5×)', () => {
       // Shrink the drop magnitude by raising close near open. ATR on the
-      // pre-rally is ≈ open*perBar + 0.8 ≈ 1.5; require drop ≥ 1.5×ATR ≈ 2.25.
-      // Setting close = open - 0.5 fails the gate.
+      // pre-rally is ≈ open*perBar + 0.8 ≈ 2.5; require drop ≥ 1.25×ATR ≈ 3.13.
+      // Setting close = open - 0.5 (magnitude 0.5) fails the gate at any
+      // threshold ≥ 0.2×ATR — well below either the r6 1.5× or r7 1.25× bar.
       const last = 100 * Math.pow(1.005, 250);
       const candles = cascadeSeries({ dropBarOpen: last, dropBarClose: last - 0.5 });
       expect(evalCascade(candles, 'range')).toBeNull();
+    });
+
+    it('drop-bar 1.30× ATR fixture fires under r7 but would not have fired under r6', () => {
+      // r7 retune unblocks the BTC density miss diagnosed in the r6 sweep
+      // (BTC fired 0/9 windows). A 1.30×ATR drop-bar magnitude sits between
+      // the r7 1.25× threshold and the r6 1.5× threshold — under r7 it
+      // fires, under r6 it would have been skipped by the magnitude gate.
+      // Volume and recent-high anchor are set heavy enough to clear both
+      // r6 and r7 floors so the drop-bar gate is the only thing differing.
+
+      // Build the pre-series first and compute the actual ATR-on-prev-bar
+      // so the drop magnitude lands exactly at 1.30× empirically (rather
+      // than relying on an analytical estimate that drifts with Wilder
+      // smoothing). The drop bar is then appended at 1.30 × that ATR.
+      const preSeries = cascadeSeries().slice(0, -1); // strip default drop bar
+      const preAtr = atr(preSeries, 14);
+      expect(preAtr).not.toBeNull();
+      const last = preSeries[preSeries.length - 1].close;
+      const open = last;
+      // Drop magnitude target = 1.30 × ATR. After Wilder smoothing on the
+      // drop bar the in-strategy ATR shifts ≈ ±5% from preAtr — pick the
+      // midpoint so the magnitude stays inside the (1.25×, 1.5×) band even
+      // after the smoothing kicks in.
+      const dropMagnitude = 1.30 * (preAtr as number);
+      const close = open - dropMagnitude;
+      // Tight high/low around open/close so the close-in-lower-33% gate
+      // passes with headroom (range ≈ dropMagnitude + 0.2; close - low = 0.1
+      // is well inside the 33% bar).
+      const low = close - 0.1;
+      const high = open + 0.1;
+      const r7Candles = cascadeSeries({
+        dropBarOpen: open,
+        dropBarClose: close,
+        dropBarHigh: high,
+        dropBarLow: low,
+        // 1.75× SMA on a 1_000 baseline = 1_750; supply 2_000 for headroom
+        // against rounding so the volume gate is unambiguously cleared.
+        dropBarVolume: 2_000,
+      });
+      const r7Sig = evalCascade(r7Candles, 'range');
+      expect(r7Sig).not.toBeNull();
+      expect(r7Sig?.side).toBe('sell');
+
+      // Counterfactual: rebuild the same fixture against an r6-shaped
+      // strategy (drop-bar 1.5×, recent-high 0.95×, volume 1.5×) and confirm
+      // the magnitude gate would have blocked. Volume stays high so the r6
+      // simulation isolates the drop-bar relaxation as the BTC unblock knob.
+      const detectorR6 = new RegimeDetector();
+      const stratR6 = new MomentumStrategy(detectorR6, {
+        fastMaPeriod: 50,
+        slowMaPeriod: 200,
+        donchianPeriod: 20,
+        paramsByDirection: {
+          short: {
+            atrStopMultiplier: 2.0,
+            rearmBars: 8,
+            slowMaSlopeBars: 10,
+            volumeMultiplier: 1.10,
+            volumeSmaPeriod: 20,
+            byTimeframe: {
+              '4h': {
+                dropBarAtrMultiplier: 1.5,
+                recentHighAnchorRatio: 0.95,
+                cascadeVolumeMultiplier: 1.5,
+              },
+            },
+          },
+        },
+      });
+      expect(stratR6.evaluate('TEST', r7Candles, 'range')).toBeNull();
     });
 
     it('drop-bar close-in-lower-range gate: blocks when close lands above the lower 33%', () => {
@@ -362,26 +434,47 @@ describe('MomentumStrategy', () => {
       expect(evalCascade(candles, 'range')).toBeNull();
     });
 
-    it('volume gate: blocks when cascade-bar volume is below 1.5× SMA(volume,20)', () => {
-      // Pre-bars at 1_000, drop bar at 1_400 (< 1_500 = 1.5×). Should block.
-      const candles = cascadeSeries({ dropBarVolume: 1_400 });
-      expect(evalCascade(candles, 'range')).toBeNull();
-      // Same series, drop bar at 1_500 → should fire (≥ 1.5×).
-      const passing = cascadeSeries({ dropBarVolume: 1_500 });
+    it('volume gate: blocks when cascade-bar volume is below 1.75× SMA(volume,20) (r7 retune from 1.5×)', () => {
+      // Pre-bars at 1_000 → SMA(volume, 20) = 1_000. r7 floor = 1_750.
+      // Drop bar at 1_700 (< 1_750) should block; drop bar at 1_750 (≥ 1.75×)
+      // should fire. The 1_500 fixture (which fired under r6's 1.5× gate)
+      // now sits in the [r6, r7) band and should block under r7 — keeps the
+      // r6→r7 retune intent locked in.
+      expect(evalCascade(cascadeSeries({ dropBarVolume: 1_500 }), 'range')).toBeNull();
+      expect(evalCascade(cascadeSeries({ dropBarVolume: 1_700 }), 'range')).toBeNull();
+      const passing = cascadeSeries({ dropBarVolume: 1_750 });
       expect(evalCascade(passing, 'range')?.side).toBe('sell');
     });
 
-    it('recent-high anchor gate: blocks when the cascade-bar high is below 0.95× recent peak', () => {
-      // Cascade bar's high needs to be ≥ 0.95 × max(high) over the prior 20 bars.
-      // Force the drop bar's high well below the recent peak.
+    it('recent-high anchor gate: blocks when the cascade-bar high is below 0.97× recent peak (r7 retune from 0.95×)', () => {
+      // Cascade bar's high needs to be ≥ 0.97 × max(high) over the prior 20
+      // bars under r7 (was 0.95 under r6). The 0.5× fixture is well below
+      // either threshold and isolates the gate. The 0.96× fixture sits in
+      // the [r6, r7) band — would have fired under r6, must block under r7.
       const last = 100 * Math.pow(1.005, 250);
-      const candles = cascadeSeries({
+      const farBelow = cascadeSeries({
         dropBarOpen: last,
         dropBarClose: last - 5,
-        dropBarHigh: last * 0.5, // half of the recent peak
+        dropBarHigh: last * 0.5,
         dropBarLow: last * 0.5 - 5,
       });
-      expect(evalCascade(candles, 'range')).toBeNull();
+      expect(evalCascade(farBelow, 'range')).toBeNull();
+
+      // The recent-high lookback is `recentHighLookback + 1 = 21` bars
+      // including the drop bar; the rallying pre-series produces the
+      // recent peak at the bar immediately before the drop. Force the drop
+      // bar's high to ~0.96 of that peak so the gate would pass under r6
+      // (≥ 0.95) but block under r7 (< 0.97).
+      const peak = last + 0.4; // pre-series high formula: prev + range/2
+      const dropHigh96 = peak * 0.96;
+      const inBand = cascadeSeries({
+        dropBarOpen: dropHigh96 - 0.1,
+        dropBarClose: dropHigh96 - 5,
+        dropBarHigh: dropHigh96,
+        dropBarLow: dropHigh96 - 5.1,
+        dropBarVolume: 2_000,
+      });
+      expect(evalCascade(inBand, 'range')).toBeNull();
     });
 
     it('non-4H bars do not activate cascade — falls back to §4.1 path', () => {

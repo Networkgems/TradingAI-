@@ -106,10 +106,13 @@ export interface MomentumByTimeframeOverrides {
  * volume) is replaced by the cascade-leg trigger:
  *
  *   1. Drop-bar:        (open − close) ≥ {@link dropBarAtrMultiplier} × ATR(14)
+ *                       (default 1.25 under §4.4 r7 — was 1.5 under r6)
  *                       AND close ≤ low + {@link dropBarRangeRatio} × (high − low)
  *   2. Volume:          volume ≥ {@link cascadeVolumeMultiplier} × SMA(volume, 20)
+ *                       (default 1.75 under §4.4 r7 — was 1.5 under r6)
  *   3. Recent-high:     high ≥ {@link recentHighAnchorRatio}
  *                       × max(high) over the prior {@link recentHighLookback} bars
+ *                       (default 0.97 under §4.4 r7 — was 0.95 under r6)
  *                       (current bar included so a clean cascade off the local
  *                       high still anchors).
  *   4. Daily-regime:    regime label `!== 'trend_up'`. Softer than the §4.1
@@ -129,15 +132,15 @@ export interface MomentumByTimeframeOverrides {
  * rewrite, not a risk-control rewrite.
  */
 export interface MomentumCascadeLegOverride {
-  /** Drop-bar ATR multiplier (default 1.5 per spec). */
+  /** Drop-bar ATR multiplier (default 1.25 per §4.4 r7 — was 1.5 in r6). */
   dropBarAtrMultiplier?: number;
   /** Drop-bar close-in-lower-range fraction (default 0.33 per spec). */
   dropBarRangeRatio?: number;
-  /** Volume multiplier vs SMA(volume, 20) (default 1.5 per spec). */
+  /** Volume multiplier vs SMA(volume, 20) (default 1.75 per §4.4 r7 — was 1.5 in r6). */
   cascadeVolumeMultiplier?: number;
   /** Recent-high lookback in bars (default 20 per spec). */
   recentHighLookback?: number;
-  /** Recent-high anchor ratio (default 0.95 per spec — current high ≥ 95% of recent high). */
+  /** Recent-high anchor ratio (default 0.97 per §4.4 r7 — was 0.95 in r6). */
   recentHighAnchorRatio?: number;
 }
 
@@ -182,12 +185,20 @@ interface ResolvedCascadeLeg {
   recentHighAnchorRatio: number;
 }
 
+// TRA-278 / TRA-255 §4.4 r7 — three-knob retune of the §4.4 r6 branch menu.
+// Drop-bar 1.5 → 1.25× ATR (r6 BTC fired 0/9 windows; relaxing the magnitude
+// gate is the only density-additive knob in the r6 branch menu). Recent-high
+// anchor 0.95 → 0.97 (tighten so the magnitude relaxation doesn't drag
+// late-trend long-tail down-grind bars in alongside genuine cascade flushes).
+// Volume 1.5 → 1.75 (compensate the relaxed magnitude bar by requiring a
+// heavier confirmation pulse). Drop-bar close-in-lower-33% gate, lookback,
+// and §4.1 stop / TP / trail / time-stop / re-arm stay byte-unchanged from r6.
 const CASCADE_LEG_DEFAULTS: ResolvedCascadeLeg = {
-  dropBarAtrMultiplier: 1.5,
+  dropBarAtrMultiplier: 1.25,
   dropBarRangeRatio: 0.33,
-  cascadeVolumeMultiplier: 1.5,
+  cascadeVolumeMultiplier: 1.75,
   recentHighLookback: 20,
-  recentHighAnchorRatio: 0.95,
+  recentHighAnchorRatio: 0.97,
 };
 
 /** Tolerance window (ms) around a 4H bar interval — covers Coinbase exchange
