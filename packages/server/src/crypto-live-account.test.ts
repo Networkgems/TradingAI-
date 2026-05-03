@@ -4,10 +4,11 @@ import type {
   CoinbaseOrderClient,
   CoinbaseOrderDetails,
   CoinbaseOrderSuccessResponse,
+  CoinbaseProductInfo,
 } from '@trading-app/engine';
 import type { TradeSignal } from '@trading-app/shared';
 
-import { CryptoLiveAccount } from './crypto-live-account.js';
+import { CryptoLiveAccount, quantizeBaseSize } from './crypto-live-account.js';
 
 // We exercise CryptoLiveAccount through a hand-rolled stand-in for
 // CoinbaseOrderClient — only the methods this account actually invokes are
@@ -20,6 +21,9 @@ class FakeCoinbaseClient {
   // Default empty map: tests with only USD/USDC/USDT holdings never hit this
   // path. Tests that seed crypto holdings override the resolved value.
   getProductPrices = vi.fn<(productIds: string[]) => Promise<Map<string, number>>>(
+    async () => new Map(),
+  );
+  getProducts = vi.fn<(productIds: string[]) => Promise<Map<string, CoinbaseProductInfo>>>(
     async () => new Map(),
   );
 }
@@ -454,17 +458,24 @@ describe('CryptoLiveAccount skip-reason annotation (TRA-243)', () => {
   });
 });
 
+function productInfo(price: number, baseIncrement: string): CoinbaseProductInfo {
+  return { price, baseIncrement };
+}
+
 describe('CryptoLiveAccount tradable-product validation (TRA-243)', () => {
   it('skips signals for symbols Coinbase does not list', async () => {
-    // Watchlist has BTC, ETH, MATIC. Coinbase /products returns prices for
-    // BTC + ETH only — MATIC was renamed to POL Sept 2024 and silently dropped.
+    // Watchlist has BTC, ETH, MATIC. Coinbase /products returns BTC + ETH
+    // only — MATIC was renamed to POL Sept 2024 and silently dropped.
     // Without this guard a MATIC-USD market order returns a 400
     // INVALID_ARGUMENT that the user sees as a confusing "Coinbase rejected
     // order: Invalid product_id".
     const { account, coinbase } = buyAccount(50_000);
     await account.refreshBalance();
-    coinbase.getProductPrices.mockResolvedValueOnce(
-      new Map([['BTC-USD', 30_000], ['ETH-USD', 2_000]]),
+    coinbase.getProducts.mockResolvedValueOnce(
+      new Map([
+        ['BTC-USD', productInfo(30_000, '0.00000001')],
+        ['ETH-USD', productInfo(2_000, '0.00000001')],
+      ]),
     );
     await account.refreshTradableProducts(['BTC-USD', 'ETH-USD', 'MATIC-USD']);
 
@@ -480,8 +491,11 @@ describe('CryptoLiveAccount tradable-product validation (TRA-243)', () => {
   it('still trades symbols Coinbase confirmed are listed', async () => {
     const { account, coinbase } = buyAccount(50_000);
     await account.refreshBalance();
-    coinbase.getProductPrices.mockResolvedValueOnce(
-      new Map([['BTC-USD', 30_000], ['ETH-USD', 2_000]]),
+    coinbase.getProducts.mockResolvedValueOnce(
+      new Map([
+        ['BTC-USD', productInfo(30_000, '0.00000001')],
+        ['ETH-USD', productInfo(2_000, '0.00000001')],
+      ]),
     );
     await account.refreshTradableProducts(['BTC-USD', 'ETH-USD']);
 
@@ -501,7 +515,7 @@ describe('CryptoLiveAccount tradable-product validation (TRA-243)', () => {
     // Cache stays null — must not block trading on a Coinbase outage.
     const { account, coinbase } = buyAccount(50_000);
     await account.refreshBalance();
-    coinbase.getProductPrices.mockRejectedValueOnce(new Error('coinbase 503'));
+    coinbase.getProducts.mockRejectedValueOnce(new Error('coinbase 503'));
     await account.refreshTradableProducts(['BTC-USD']);
     // Refresh swallowed the error; tradableProducts is still null.
 
@@ -519,7 +533,9 @@ describe('CryptoLiveAccount tradable-product validation (TRA-243)', () => {
 
   it('reports stale once past the 6h TTL', async () => {
     const { account, coinbase } = buyAccount(50_000);
-    coinbase.getProductPrices.mockResolvedValueOnce(new Map([['BTC-USD', 30_000]]));
+    coinbase.getProducts.mockResolvedValueOnce(
+      new Map([['BTC-USD', productInfo(30_000, '0.00000001')]]),
+    );
     await account.refreshTradableProducts(['BTC-USD']);
     expect(account.isTradableProductsStale()).toBe(false);
 
@@ -530,5 +546,104 @@ describe('CryptoLiveAccount tradable-product validation (TRA-243)', () => {
     vi.spyOn(Date, 'now').mockImplementation(() => sevenHoursLater);
     expect(account.isTradableProductsStale()).toBe(true);
     (Date.now as ReturnType<typeof vi.fn>).mockRestore();
+  });
+});
+
+describe('quantizeBaseSize (TRA-243)', () => {
+  it('floors to a multiple of the increment and never rounds up', () => {
+    expect(quantizeBaseSize(0.123456789, '0.00000001')).toBe(0.12345678);
+    expect(quantizeBaseSize(0.99999999, '0.0001')).toBe(0.9999);
+    expect(quantizeBaseSize(35_714, '1')).toBe(35_714);
+    expect(quantizeBaseSize(35_714.6, '1')).toBe(35_714);
+  });
+
+  it('returns 0 when qty is below a single step (caller treats as no spendable size)', () => {
+    expect(quantizeBaseSize(0.5, '1')).toBe(0);
+    expect(quantizeBaseSize(5e-9, '0.00000001')).toBe(0);
+  });
+
+  it('handles padded-zero increment strings ("0.10000000" reads as 1 decimal)', () => {
+    expect(quantizeBaseSize(12.7, '0.10000000')).toBe(12.7);
+    expect(quantizeBaseSize(12.78, '0.10000000')).toBe(12.7);
+  });
+
+  it('returns 0 for invalid / zero / negative inputs rather than NaN', () => {
+    expect(quantizeBaseSize(NaN, '0.0001')).toBe(0);
+    expect(quantizeBaseSize(-1, '0.0001')).toBe(0);
+    expect(quantizeBaseSize(1, '')).toBe(0);
+    expect(quantizeBaseSize(1, '0')).toBe(0);
+  });
+});
+
+describe('CryptoLiveAccount qty quantization end-to-end (TRA-243)', () => {
+  it('quantizes qty to BTC step (8 decimals) before sending the market order', async () => {
+    const { account, coinbase } = buyAccount(50_000);
+    await account.refreshBalance();
+    coinbase.getProducts.mockResolvedValueOnce(
+      new Map([['BTC-USD', productInfo(30_000, '0.00000001')]]),
+    );
+    await account.refreshTradableProducts(['BTC-USD']);
+
+    coinbase.placeMarketOrder.mockResolvedValueOnce(orderSuccess('o-btc'));
+    coinbase.getOrder.mockResolvedValueOnce(
+      orderDetails({ order_id: 'o-btc', status: 'FILLED', average_filled_price: '30000', filled_size: '0.001' }),
+    );
+    await account.openPosition(buildSignal(), 30_000);
+
+    const calls = coinbase.placeMarketOrder.mock.calls as unknown as Array<[{ baseSize: number }]>;
+    const sent = calls[0]![0].baseSize;
+    // Whatever the caller computed, it survives toFixed(8) without growing
+    // longer than 8 decimals — the canary the user reported ("Too many
+    // decimals in order amount") would have us at 6+ decimals from the legacy
+    // Math.round(qty * 1e6) / 1e6 path on a product with a 4-decimal step.
+    expect(sent.toFixed(8).replace(/\.?0+$/, '').split('.')[1]?.length ?? 0).toBeLessThanOrEqual(8);
+  });
+
+  it('quantizes qty to a coarse step (1 base unit) so SHIB-like products stop hitting "Too many decimals"', async () => {
+    // Seed enough USD that final notional clears the $1 minimum after
+    // quantization to step=1 — at $0.000028 spot, $10 cash sizes a few
+    // hundred thousand SHIB. The legacy 6-decimal rounding would still emit
+    // decimals (e.g. 35714.285714) and Coinbase rejects.
+    const { account, coinbase } = buyAccount(10);
+    await account.refreshBalance();
+    coinbase.getProducts.mockResolvedValueOnce(
+      new Map([['SHIB-USD', productInfo(0.000028, '1')]]),
+    );
+    await account.refreshTradableProducts(['SHIB-USD']);
+
+    coinbase.placeMarketOrder.mockResolvedValueOnce(orderSuccess('o-shib'));
+    coinbase.getOrder.mockResolvedValueOnce(
+      orderDetails({ order_id: 'o-shib', status: 'FILLED', average_filled_price: '0.000028', filled_size: '166666' }),
+    );
+    await account.openPosition(
+      buildSignal({ symbol: 'SHIB-USD', entryPrice: 0.000028, stopLoss: 0.0000277 }),
+      0.000028,
+    );
+
+    const calls = coinbase.placeMarketOrder.mock.calls as unknown as Array<[{ baseSize: number; productId: string }]>;
+    const call = calls[0]![0];
+    expect(call.productId).toBe('SHIB-USD');
+    // Integer step → baseSize must be a whole number.
+    expect(Number.isInteger(call.baseSize)).toBe(true);
+    expect(call.baseSize).toBeGreaterThan(0);
+  });
+
+  it('falls back to 6-decimal rounding when no product cache is available (Coinbase /products outage)', async () => {
+    const { account, coinbase } = buyAccount(50_000);
+    await account.refreshBalance();
+    // Skip refreshTradableProducts so cache stays null.
+
+    coinbase.placeMarketOrder.mockResolvedValueOnce(orderSuccess('o-fallback'));
+    coinbase.getOrder.mockResolvedValueOnce(
+      orderDetails({ order_id: 'o-fallback', status: 'FILLED', average_filled_price: '30000', filled_size: '0.001' }),
+    );
+    const pos = await account.openPosition(buildSignal(), 30_000);
+
+    expect(pos).not.toBeNull();
+    const calls = coinbase.placeMarketOrder.mock.calls as unknown as Array<[{ baseSize: number }]>;
+    const sent = calls[0]![0].baseSize;
+    // Legacy fallback path: Math.round(qty * 1e6) / 1e6 — never more than 6 decimals.
+    const decimals = sent.toString().split('.')[1]?.length ?? 0;
+    expect(decimals).toBeLessThanOrEqual(6);
   });
 });

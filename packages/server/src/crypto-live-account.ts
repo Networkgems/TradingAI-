@@ -5,6 +5,7 @@ import type {
   CoinbaseAccountBalance,
   CoinbaseOrderDetails,
   CoinbaseOrderSuccessResponse,
+  CoinbaseProductInfo,
 } from '@trading-app/engine';
 import { randomUUID } from 'crypto';
 
@@ -21,6 +22,45 @@ const BALANCE_REFRESH_MS = 30_000;
  * a failure leaves the previous set in place rather than zeroing it (TRA-243).
  */
 const TRADABLE_PRODUCTS_TTL_MS = 6 * 60 * 60 * 1000;
+
+/**
+ * Floor `qty` to a multiple of Coinbase's per-product `base_increment` so the
+ * resulting number, once stringified, never carries more decimals than Coinbase
+ * accepts. Always rounds DOWN so the cash cap the caller already enforced is
+ * never violated. Returns 0 when qty is smaller than a single step, which the
+ * caller's `qty <= 0` skip path treats as "no spendable size".
+ *
+ * `incrementStr` is the canonical `base_increment` string straight from
+ * `/products` (e.g. `"0.00000001"`, `"0.0001"`, `"1"`). We parse it twice:
+ * once as a float to do the math, and once as a string to derive the exact
+ * decimal count — `log10`-based decimal-count would mishandle padded forms
+ * like `"0.10000000"` that JSON-decode to `0.1`.
+ *
+ * Implementation note: we work in integer-scaled space so that classic float
+ * artefacts (`12.7 / 0.1 === 126.99999999999999`) don't cause us to floor a
+ * value down by one increment. The 1e-9 epsilon absorbs precision loss on
+ * `qty * scale` without ever rounding qty up past its true value (Coinbase
+ * increments bottom out at 1e-8, so 1e-9 is safely below user-visible scale).
+ *
+ * Exported for unit tests; tied to TRA-243 ("Too many decimals in order amount").
+ */
+export function quantizeBaseSize(qty: number, incrementStr: string): number {
+  if (!Number.isFinite(qty) || qty <= 0) return 0;
+  const inc = parseFloat(incrementStr);
+  if (!Number.isFinite(inc) || inc <= 0) return 0;
+  const trimmed = incrementStr.replace(/0+$/, '').replace(/\.$/, '');
+  const dot = trimmed.indexOf('.');
+  const decimals = dot === -1 ? 0 : trimmed.length - dot - 1;
+  const scale = Math.pow(10, decimals);
+  const scaledQty = qty * scale;
+  const scaledInc = inc * scale;
+  // Round scaledInc to nearest integer to absorb float artefacts on integer
+  // increments (e.g. inc=1 with decimals=0 → scale=1 → scaledInc≈1).
+  const intInc = Math.round(scaledInc);
+  if (intInc <= 0) return 0;
+  const stepped = Math.floor((scaledQty + 1e-9) / intInc) * intInc;
+  return Math.round(stepped) / scale;
+}
 
 /**
  * Headroom against Coinbase Advanced Trade taker fees so a market BUY that
@@ -92,16 +132,25 @@ export class CryptoLiveAccount {
   private realizedPnlToday = 0;
   private lastBalanceRefresh = 0;
   /**
-   * TRA-243 — set of `{BASE}-{QUOTE}` product_ids Coinbase Advanced Trade
-   * actually lists right now. The dashboard watchlist drifts out of sync with
-   * Coinbase as tickers get renamed (MATIC→POL Sept 2024) or delisted, and
-   * sending a stale id to /orders returns a 400 INVALID_ARGUMENT that the
-   * user used to see as a generic "Coinbase rejected order". Populated on
-   * live broker init via `refreshTradableProducts`; null = unverified, in
-   * which case openPosition falls through to the cash/min-notional checks
-   * (degrade open rather than block valid trades when /products is down).
+   * TRA-243 — per-product metadata Coinbase Advanced Trade currently exposes
+   * (price + base_increment), keyed by product_id. Two responsibilities:
+   *
+   * 1. **Tradable validation** — the keyset is the set of products Coinbase
+   *    actually lists. Watchlist symbols absent from this map are stale
+   *    (renamed/delisted, e.g. MATIC→POL Sept 2024) and `openPosition` skips
+   *    them with a "not listed" reason instead of eating a 400.
+   * 2. **Order quantization** — `base_increment` (e.g. `0.00000001` for BTC,
+   *    `1` for SHIB) tells us the minimum size step Coinbase enforces.
+   *    Sending a finer-grained `base_size` returns "Too many decimals in
+   *    order amount" (TRA-243 follow-up); we floor qty to the step before
+   *    submitting.
+   *
+   * Populated on live broker init via `refreshTradableProducts`. `null` means
+   * the lookup never succeeded (e.g. /products was down at startup), in which
+   * case `openPosition` falls through to the legacy 6-decimal rounding so a
+   * Coinbase outage doesn't freeze trading on otherwise-fine symbols.
    */
-  private tradableProducts: Set<string> | null = null;
+  private tradableProducts: Map<string, CoinbaseProductInfo> | null = null;
   private lastTradableProductsRefresh = 0;
   // TRA-232 — risk knobs come from per-user AccountSettings instead of the
   // hardcoded MANAGED_ACCOUNT_RATIO / DEFAULT_RISK_PER_TRADE constants. The
@@ -211,14 +260,14 @@ export class CryptoLiveAccount {
    */
   async refreshTradableProducts(productIds: readonly string[]): Promise<void> {
     if (productIds.length === 0) return;
-    let prices: Map<string, number>;
+    let products: Map<string, CoinbaseProductInfo>;
     try {
-      prices = await this.coinbase.getProductPrices(Array.from(productIds));
+      products = await this.coinbase.getProducts(Array.from(productIds));
     } catch (err: unknown) {
       console.warn('[crypto-live] tradable products refresh failed:', err instanceof Error ? err.message : String(err));
       return;
     }
-    this.tradableProducts = new Set(prices.keys());
+    this.tradableProducts = products;
     this.lastTradableProductsRefresh = Date.now();
   }
 
@@ -311,7 +360,16 @@ export class CryptoLiveAccount {
     // bound; capping here only ever sizes positions DOWN.
     const maxQtyForCash = (this.cashUsd * CASH_FEE_BUFFER) / currentPrice;
     qty = Math.min(qty, maxQtyForCash);
-    qty = Math.round(qty * 1_000_000) / 1_000_000;
+    // TRA-243 — Coinbase enforces a per-product `base_increment` (e.g.
+    // `0.00000001` for BTC, `1` for SHIB). Sending finer-grained sizes
+    // returns "Too many decimals in order amount". Quantize here using the
+    // cached increment when we have one; fall back to legacy 6-decimal
+    // rounding when the /products lookup never succeeded so a Coinbase
+    // outage doesn't freeze trading.
+    const productInfo = this.tradableProducts?.get(signal.symbol);
+    qty = productInfo
+      ? quantizeBaseSize(qty, productInfo.baseIncrement)
+      : Math.round(qty * 1_000_000) / 1_000_000;
     if (qty <= 0) {
       const reason = `no spendable cash (USD=${this.cashUsd.toFixed(2)}, managedEquity=${this.managedEquity().toFixed(2)} — fund the Coinbase USD wallet or sell crypto holdings to free cash)`;
       signal.liveSkipReason = reason;

@@ -79,17 +79,34 @@ interface GetOrderResponse {
 
 /**
  * Subset of `GET /api/v3/brokerage/products` we read for valuing non-USD
- * holdings on the account screen (TRA-224). Coinbase returns more fields per
- * product; we only consume the spot price.
+ * holdings on the account screen (TRA-224) and quantizing order sizes to the
+ * per-product `base_increment` Coinbase enforces (TRA-243).
  */
 interface CoinbaseProduct {
   product_id: string;
   /** Last trade price, stringified — "0" or empty for inactive products. */
   price?: string;
+  /**
+   * Minimum size step for the base asset, stringified (e.g. `"0.00000001"`
+   * for BTC, `"1"` for SHIB). Order amounts must be a multiple of this; sending
+   * a finer-grained size yields `Too many decimals in order amount` (TRA-243).
+   */
+  base_increment?: string;
 }
 
 interface ListProductsResponse {
   products?: CoinbaseProduct[];
+}
+
+/**
+ * Per-product market metadata read off `/products` (TRA-243). `price` is the
+ * last spot trade and `baseIncrement` is the canonical `base_increment` string
+ * preserved verbatim from Coinbase so callers can derive both the numeric
+ * step and its exact decimal count without floating-point drift.
+ */
+export interface CoinbaseProductInfo {
+  price: number;
+  baseIncrement: string;
 }
 
 export interface MarketOrderParams {
@@ -262,13 +279,41 @@ export class CoinbaseOrderClient {
   }
 
   /**
-   * GET /api/v3/brokerage/products?product_ids=... — return spot prices for
-   * the requested products (TRA-224). Used to convert non-USD account
-   * balances into USD-equivalent equity for the live dashboard so users with
-   * pre-existing BTC/ETH on Coinbase see their full portfolio value, not
-   * just the stable-cash portion. Returns a Map keyed by product_id; missing
-   * or unparseable prices are dropped silently so the caller can degrade
-   * gracefully (skip valuing that holding) without blowing up the refresh.
+   * GET /api/v3/brokerage/products?product_ids=... — return spot prices and
+   * sizing increments for the requested products (TRA-224, TRA-243).
+   *
+   * Used both to value non-USD holdings into USD equity (price) and to quantize
+   * market-order base sizes to Coinbase's per-product step (baseIncrement). The
+   * returned Map's keys double as the "tradable" set: a product Coinbase no
+   * longer lists is silently absent rather than an error, which matches how
+   * `CryptoLiveAccount.refreshTradableProducts` uses this to skip stale tickers
+   * (TRA-243). Products with an unparseable price OR increment are dropped —
+   * sending an order without a known step is the more harmful failure mode.
+   */
+  async getProducts(productIds: string[]): Promise<Map<string, CoinbaseProductInfo>> {
+    const out = new Map<string, CoinbaseProductInfo>();
+    if (productIds.length === 0) return out;
+    const params = new URLSearchParams();
+    for (const id of productIds) params.append('product_ids', id);
+    const path = `/api/v3/brokerage/products?${params.toString()}`;
+    const data = await this.request<ListProductsResponse>('GET', path, '');
+    for (const p of data.products ?? []) {
+      const price = parseFloat(p.price ?? '');
+      if (!Number.isFinite(price) || price <= 0) continue;
+      const incrementStr = (p.base_increment ?? '').trim();
+      const incrementNum = parseFloat(incrementStr);
+      if (!Number.isFinite(incrementNum) || incrementNum <= 0) continue;
+      out.set(p.product_id, { price, baseIncrement: incrementStr });
+    }
+    return out;
+  }
+
+  /**
+   * Spot-price-only lookup for valuation paths (TRA-224). Used for sizing
+   * non-USD account balances on the live dashboard equity. Looser filtering
+   * than {@link getProducts}: a product with a price but no `base_increment`
+   * still values into equity rather than being dropped, since a missing
+   * increment only blocks order placement (not display).
    */
   async getProductPrices(productIds: string[]): Promise<Map<string, number>> {
     const out = new Map<string, number>();

@@ -49,6 +49,7 @@ export type {
   CoinbaseAccountBalance,
   CoinbaseOrderSuccessResponse,
   CoinbaseOrderDetails,
+  CoinbaseProductInfo,
   MarketOrderParams as CoinbaseMarketOrderParams,
   LimitOrderParams as CoinbaseLimitOrderParams,
 } from './coinbase/index.js';

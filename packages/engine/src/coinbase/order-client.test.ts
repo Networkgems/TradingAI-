@@ -282,6 +282,73 @@ describe('CoinbaseOrderClient', () => {
       expect(fetchMock).not.toHaveBeenCalled();
     });
   });
+
+  // TRA-243 — Coinbase enforces a per-product `base_increment` step on order
+  // sizing. Submitting a finer-grained `base_size` returns "Too many decimals
+  // in order amount". `getProducts` exposes both spot price and increment so
+  // CryptoLiveAccount can quantize order size to the product's actual step.
+  describe('getProducts (TRA-243)', () => {
+    it('returns price and base_increment for each listable product', async () => {
+      const client = makeClient();
+      fetchMock.mockResolvedValueOnce(jsonResponse({
+        products: [
+          { product_id: 'BTC-USD', price: '60000', base_increment: '0.00000001' },
+          { product_id: 'SHIB-USD', price: '0.000028', base_increment: '1' },
+          { product_id: 'DOGE-USD', price: '0.12', base_increment: '0.1' },
+        ],
+      }));
+
+      const products = await client.getProducts(['BTC-USD', 'SHIB-USD', 'DOGE-USD']);
+
+      expect(products.get('BTC-USD')).toEqual({ price: 60_000, baseIncrement: '0.00000001' });
+      expect(products.get('SHIB-USD')).toEqual({ price: 0.000028, baseIncrement: '1' });
+      expect(products.get('DOGE-USD')).toEqual({ price: 0.12, baseIncrement: '0.1' });
+    });
+
+    it('drops products whose base_increment is missing or unparseable', async () => {
+      // Sending an order without a known step is the more dangerous failure
+      // mode (Coinbase rejects with "Too many decimals"). Better to skip the
+      // ticker entirely so downstream sees it as "not listed".
+      const client = makeClient();
+      fetchMock.mockResolvedValueOnce(jsonResponse({
+        products: [
+          { product_id: 'BTC-USD', price: '60000', base_increment: '0.00000001' },
+          { product_id: 'NOINC-USD', price: '5' },
+          { product_id: 'BADINC-USD', price: '5', base_increment: 'not-a-number' },
+          { product_id: 'ZEROINC-USD', price: '5', base_increment: '0' },
+        ],
+      }));
+
+      const products = await client.getProducts(['BTC-USD', 'NOINC-USD', 'BADINC-USD', 'ZEROINC-USD']);
+
+      expect(products.size).toBe(1);
+      expect(products.get('BTC-USD')).toBeDefined();
+    });
+
+    it('preserves padded-zero increment strings verbatim so callers can derive exact decimal counts', async () => {
+      const client = makeClient();
+      fetchMock.mockResolvedValueOnce(jsonResponse({
+        products: [
+          { product_id: 'X-USD', price: '1', base_increment: '0.10000000' },
+        ],
+      }));
+
+      const products = await client.getProducts(['X-USD']);
+
+      // Verbatim — caller (CryptoLiveAccount.quantizeBaseSize) trims trailing
+      // zeros to compute the canonical decimal count.
+      expect(products.get('X-USD')?.baseIncrement).toBe('0.10000000');
+    });
+
+    it('short-circuits to an empty map without hitting the network when given no product ids', async () => {
+      const client = makeClient();
+
+      const products = await client.getProducts([]);
+
+      expect(products.size).toBe(0);
+      expect(fetchMock).not.toHaveBeenCalled();
+    });
+  });
 });
 
 // --- CDP / JWT auth path (TRA-157) ---------------------------------------

@@ -4,6 +4,7 @@ export type {
   CoinbaseAccountBalance,
   CoinbaseOrderSuccessResponse,
   CoinbaseOrderDetails,
+  CoinbaseProductInfo,
   MarketOrderParams,
   LimitOrderParams,
   CoinbaseAuthScheme,
