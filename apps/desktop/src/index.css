@@ -371,6 +371,18 @@ tr:hover td { background: var(--bg-hover); }
   background: rgba(248, 81, 73, 0.08);
   border-left: 2px solid var(--red);
   border-radius: 2px;
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+  flex-wrap: wrap;
+}
+
+.signal-skip-reason > span { flex: 1; min-width: 0; }
+
+.signal-skip-action {
+  flex-shrink: 0;
+  font-size: 0.65rem;
+  padding: 0.2rem 0.5rem;
 }
 
 .positions-panel h3 {

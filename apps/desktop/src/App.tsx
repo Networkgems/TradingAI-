@@ -630,7 +630,22 @@ function CryptoDashboard({ token, onBack, onLogout, onActivity, theme, onToggleT
                     </div>
                     {sig.liveSkipReason && (
                       <div className="signal-skip-reason" title={sig.liveSkipReason}>
-                        Not opened: {sig.liveSkipReason}
+                        <span>Not opened: {sig.liveSkipReason}</span>
+                        {sig.liveSkipReason.includes('not listed on Coinbase') && (
+                          // TRA-243 — one-click watchlist prune for symbols Coinbase
+                          // doesn't list (LUNC, MATIC after the POL rename, etc.) so
+                          // the user doesn't have to open the watchlist tab and
+                          // hunt for the row on every dead ticker. removeFromWatchlist
+                          // routes through DELETE /api/watchlist/crypto/:symbol which
+                          // hides curated symbols and drops dynamic ones outright.
+                          <button
+                            className="btn-secondary btn-sm signal-skip-action"
+                            onClick={() => removeFromWatchlist(sig.symbol)}
+                            title={`Remove ${sig.symbol} from the crypto watchlist`}
+                          >
+                            Remove {sig.symbol}
+                          </button>
+                        )}
                       </div>
                     )}
                   </div>
