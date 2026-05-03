@@ -19,7 +19,8 @@
   },
   "dependencies": {
     "@trading-app/engine": "workspace:*",
-    "@trading-app/shared": "workspace:*"
+    "@trading-app/shared": "workspace:*",
+    "yahoo-finance2": "^3.14.0"
   },
   "devDependencies": {
     "@types/node": "^22.0.0",
