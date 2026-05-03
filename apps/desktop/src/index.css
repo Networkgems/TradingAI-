@@ -51,6 +51,10 @@
   --header-text-muted: rgba(255, 255, 255, 0.72);
   --header-border: #083f72;
   --header-divider: rgba(255, 255, 255, 0.18);
+  /* TRA-277 — lighter green for header-scoped P&L values and the
+     Start Trading button so they read against the navy banner. */
+  --header-green: #56d364;
+  --header-green-strong: #7ee787;
 
   /* Tinted backgrounds (used for badges, signal cards, calendar cells) */
   --buy: #dafbe1;
@@ -112,6 +116,10 @@
   --header-text-muted: var(--muted);
   --header-border: var(--border);
   --header-divider: var(--border);
+  /* TRA-277 — lighter green in the header so P&L values and the
+     Start Trading button stay legible (matches light-mode treatment). */
+  --header-green: #56d364;
+  --header-green-strong: #7ee787;
 
   /* Tinted backgrounds */
   --buy: #1c3829;
@@ -200,6 +208,33 @@ body {
 }
 .header .stat-divider {
   background: var(--header-divider);
+}
+
+/* TRA-277 — Promote header-scoped greens to a lighter shade so P&L
+   values and the Start Trading button read clearly on the navy banner
+   (light mode) and stay consistent in dark mode. */
+.header .green {
+  color: var(--header-green);
+}
+.header .logout-btn.trading-stopped {
+  color: var(--header-green);
+  border-color: var(--header-green);
+}
+.header .logout-btn.trading-stopped:hover {
+  color: var(--header-green-strong);
+  border-color: var(--header-green-strong);
+}
+
+/* TRA-277 — Profile button must read white in both themes. The default
+   .logout-btn color (var(--muted)) blends into the navy header in light
+   mode and looks dim in dark mode; force the header text token instead. */
+.header .profile-wrap .logout-btn {
+  color: var(--header-text);
+  border-color: var(--header-divider);
+}
+.header .profile-wrap .logout-btn:hover {
+  color: var(--header-text);
+  border-color: var(--header-text);
 }
 
 /* Logical stat clusters — account / options / status */
