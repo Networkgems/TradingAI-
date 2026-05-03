@@ -1205,7 +1205,7 @@ tr:hover td { background: var(--bg-hover); }
 
 .cal-day-headers {
   display: grid;
-  grid-template-columns: repeat(5, 1fr);
+  grid-template-columns: repeat(7, 1fr);
   background: var(--surface);
   border-bottom: 1px solid var(--border);
 }
@@ -1222,7 +1222,7 @@ tr:hover td { background: var(--bg-hover); }
 
 .cal-week {
   display: grid;
-  grid-template-columns: repeat(5, 1fr);
+  grid-template-columns: repeat(7, 1fr);
   border-bottom: 1px solid var(--border);
 }
 

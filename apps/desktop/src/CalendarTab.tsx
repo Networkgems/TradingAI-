@@ -6,7 +6,7 @@ const MONTH_NAMES = [
   'July', 'August', 'September', 'October', 'November', 'December',
 ];
 const MONTH_SHORT = ['Jan','Feb','Mar','Apr','May','Jun','Jul','Aug','Sep','Oct','Nov','Dec'];
-const DAY_LABELS  = ['MON', 'TUE', 'WED', 'THU', 'FRI'];
+const DAY_LABELS  = ['MON', 'TUE', 'WED', 'THU', 'FRI', 'SAT', 'SUN'];
 
 // Compact P&L format matching the Webull reference: +$1.00K, -$234.56, --
 function fmtCompact(value: number): string {
@@ -30,21 +30,23 @@ function isoDate(year: number, month: number, day: number): string {
   return `${year}-${String(month + 1).padStart(2, '0')}-${String(day).padStart(2, '0')}`;
 }
 
-// Build an array of weeks for the given month. Each week is a 5-element array
-// (Mon–Fri) of day numbers or null for out-of-month / padding.
+// Build an array of weeks for the given month. Each week is a 7-element array
+// (Mon–Sun) of day numbers or null for out-of-month / padding.
+// TRA-286 — crypto trades 24/7 and stock P&L can post on weekends (settlement,
+// adjustments), so the calendar now includes Saturday and Sunday columns.
 function buildMonthWeeks(year: number, month: number): (number | null)[][] {
   const weeks: (number | null)[][] = [];
   const lastDayNum = new Date(year, month + 1, 0).getDate();
-  let week: (number | null)[] = [null, null, null, null, null];
+  const emptyWeek = (): (number | null)[] => [null, null, null, null, null, null, null];
+  let week = emptyWeek();
 
   for (let d = 1; d <= lastDayNum; d++) {
     const dow = new Date(year, month, d).getDay(); // 0=Sun … 6=Sat
-    if (dow === 0 || dow === 6) continue;          // skip weekends
-    const col = dow - 1;                           // Mon=0 … Fri=4
+    const col = dow === 0 ? 6 : dow - 1;           // Mon=0 … Sun=6
     week[col] = d;
-    if (dow === 5 || d === lastDayNum) {           // end of trading week or month
+    if (dow === 0 || d === lastDayNum) {           // end of week (Sun) or month
       weeks.push(week);
-      week = [null, null, null, null, null];
+      week = emptyWeek();
     }
   }
 
