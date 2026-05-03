@@ -349,6 +349,257 @@ describe('CoinbaseOrderClient', () => {
       expect(fetchMock).not.toHaveBeenCalled();
     });
   });
+
+  // TRA-249 — perp-trading surface added to the order client. These tests
+  // pin (a) that the spot order body is byte-identical to pre-change when no
+  // perp fields are passed, and (b) that perp fields land at the documented
+  // top-level keys (`leverage`, `margin_type`, `position_side`) in the JSON.
+  describe('perp surface (TRA-249)', () => {
+    it('keeps the spot market-order body byte-identical when no perp fields are present', async () => {
+      const client = makeClient();
+
+      await client.placeMarketOrder({
+        productId: 'BTC-USD',
+        side: 'buy',
+        quoteSize: 25,
+        clientOrderId: 'cli-spot',
+      });
+
+      const body = JSON.parse((fetchMock.mock.calls[0][1] as RequestInit).body as string);
+      // Whitelist-style assertion: any extra top-level key would be a
+      // regression for the spot path (and would change the HMAC signature).
+      expect(Object.keys(body).sort()).toEqual([
+        'client_order_id',
+        'order_configuration',
+        'product_id',
+        'side',
+      ]);
+      expect(body).not.toHaveProperty('leverage');
+      expect(body).not.toHaveProperty('margin_type');
+      expect(body).not.toHaveProperty('position_side');
+    });
+
+    it('places a perp SHORT-open with leverage / margin_type / position_side at the top level', async () => {
+      const client = makeClient();
+
+      await client.placeMarketOrder({
+        productId: 'BTC-PERP-INTX',
+        side: 'sell',
+        baseSize: 0.001,
+        leverage: 1,
+        marginType: 'ISOLATED',
+        positionSide: 'SHORT',
+        clientOrderId: 'cli-perp-open',
+      });
+
+      const init = fetchMock.mock.calls[0][1] as RequestInit;
+      const body = init.body as string;
+      const parsed = JSON.parse(body);
+      expect(parsed.product_id).toBe('BTC-PERP-INTX');
+      expect(parsed.side).toBe('SELL');
+      expect(parsed.leverage).toBe('1');
+      expect(parsed.margin_type).toBe('ISOLATED');
+      expect(parsed.position_side).toBe('SHORT');
+      expect(parsed.order_configuration.market_market_ioc.base_size).toBe('0.001');
+
+      // The signature must be over the bytes that actually went out — perp
+      // params included — or Coinbase will 401 us.
+      const headers = init.headers as Record<string, string>;
+      expect(headers['CB-ACCESS-SIGN']).toBe(
+        expectedSign('POST', '/api/v3/brokerage/orders', body),
+      );
+    });
+
+    it('distinguishes BUY vs SELL via position_side on perp orders', async () => {
+      const client = makeClient();
+
+      await client.placeMarketOrder({
+        productId: 'BTC-PERP-INTX',
+        side: 'buy',
+        baseSize: 0.001,
+        leverage: 1,
+        marginType: 'ISOLATED',
+        positionSide: 'LONG',
+      });
+
+      const buyBody = JSON.parse((fetchMock.mock.calls[0][1] as RequestInit).body as string);
+      expect(buyBody.side).toBe('BUY');
+      expect(buyBody.position_side).toBe('LONG');
+
+      await client.placeMarketOrder({
+        productId: 'BTC-PERP-INTX',
+        side: 'sell',
+        baseSize: 0.001,
+        leverage: 1,
+        marginType: 'ISOLATED',
+        positionSide: 'SHORT',
+      });
+
+      const sellBody = JSON.parse((fetchMock.mock.calls[1][1] as RequestInit).body as string);
+      expect(sellBody.side).toBe('SELL');
+      expect(sellBody.position_side).toBe('SHORT');
+    });
+
+    it('rejects CROSS margin so a typo cannot quietly enable an unsupported mode', async () => {
+      const client = makeClient();
+
+      await expect(
+        client.placeMarketOrder({
+          productId: 'BTC-PERP-INTX',
+          side: 'sell',
+          baseSize: 0.001,
+          leverage: 1,
+          marginType: 'CROSS',
+          positionSide: 'SHORT',
+        }),
+      ).rejects.toThrow(/CROSS/);
+      expect(fetchMock).not.toHaveBeenCalled();
+    });
+
+    it('serialises leverage as a string (Coinbase rejects numeric leverage)', async () => {
+      const client = makeClient();
+
+      await client.placeMarketOrder({
+        productId: 'BTC-PERP-INTX',
+        side: 'sell',
+        baseSize: 0.001,
+        leverage: 5,
+        marginType: 'ISOLATED',
+        positionSide: 'SHORT',
+      });
+
+      const body = JSON.parse((fetchMock.mock.calls[0][1] as RequestInit).body as string);
+      expect(body.leverage).toBe('5');
+      expect(typeof body.leverage).toBe('string');
+    });
+
+    describe('listProducts', () => {
+      it('passes product_type and filters out inactive entries', async () => {
+        const client = makeClient();
+        fetchMock.mockResolvedValueOnce(jsonResponse({
+          products: [
+            { product_id: 'BTC-PERP-INTX', product_type: 'FUTURE', status: 'online', price: '60000' },
+            { product_id: 'PAUSED-PERP-INTX', product_type: 'FUTURE', trading_disabled: true, price: '0' },
+            { product_id: 'DEAD-PERP-INTX', product_type: 'FUTURE', is_disabled: true, price: '0' },
+            { product_id: 'CANCEL-ONLY-INTX', product_type: 'FUTURE', cancel_only: true, price: '1' },
+            { product_id: 'ETH-PERP-INTX', product_type: 'FUTURE', status: 'online', price: '3000' },
+          ],
+        }));
+
+        const products = await client.listProducts('FUTURE');
+
+        expect(products.map((p) => p.product_id)).toEqual(['BTC-PERP-INTX', 'ETH-PERP-INTX']);
+        const [url] = fetchMock.mock.calls[0];
+        expect(String(url)).toBe('https://api.coinbase.com/api/v3/brokerage/products?product_type=FUTURE');
+      });
+
+      it('also works for SPOT (used as a sanity check by callers building a spot→perp map)', async () => {
+        const client = makeClient();
+        fetchMock.mockResolvedValueOnce(jsonResponse({
+          products: [{ product_id: 'BTC-USD', product_type: 'SPOT', status: 'online', price: '60000' }],
+        }));
+
+        const products = await client.listProducts('SPOT');
+
+        expect(products).toHaveLength(1);
+        expect(products[0].product_id).toBe('BTC-USD');
+        const [url] = fetchMock.mock.calls[0];
+        expect(String(url)).toBe('https://api.coinbase.com/api/v3/brokerage/products?product_type=SPOT');
+      });
+    });
+
+    describe('listPortfolios + listFuturesPositions', () => {
+      it('listPortfolios passes portfolio_type and filters out deleted entries', async () => {
+        const client = makeClient();
+        fetchMock.mockResolvedValueOnce(jsonResponse({
+          portfolios: [
+            { uuid: 'intx-1', name: 'Perpetuals', type: 'INTX' },
+            { uuid: 'intx-old', name: 'Old INTX', type: 'INTX', deleted: true },
+          ],
+        }));
+
+        const portfolios = await client.listPortfolios('INTX');
+
+        expect(portfolios.map((p) => p.uuid)).toEqual(['intx-1']);
+        const [url] = fetchMock.mock.calls[0];
+        expect(String(url)).toBe('https://api.coinbase.com/api/v3/brokerage/portfolios?portfolio_type=INTX');
+      });
+
+      it('listFuturesPositions hits the INTX positions endpoint scoped to the supplied uuid', async () => {
+        const client = makeClient();
+        fetchMock.mockResolvedValueOnce(jsonResponse({
+          positions: [
+            {
+              product_id: 'BTC-PERP-INTX',
+              position_side: 'SHORT',
+              net_size: '0.001',
+              vwap: '60000',
+              mark_price: '60500',
+              liquidation_price: '120000',
+              leverage: '1',
+              margin_type: 'ISOLATED',
+            },
+          ],
+        }));
+
+        const positions = await client.listFuturesPositions('intx-1');
+
+        expect(positions).toHaveLength(1);
+        expect(positions[0]).toMatchObject({
+          product_id: 'BTC-PERP-INTX',
+          position_side: 'SHORT',
+          net_size: '0.001',
+        });
+        const [url] = fetchMock.mock.calls[0];
+        expect(String(url)).toBe('https://api.coinbase.com/api/v3/brokerage/intx/positions/intx-1');
+      });
+
+      it('listFuturesPositions throws when called with an empty uuid (caller forgot to resolve the portfolio)', async () => {
+        const client = makeClient();
+        await expect(client.listFuturesPositions('')).rejects.toThrow(/portfolio/);
+        expect(fetchMock).not.toHaveBeenCalled();
+      });
+    });
+
+    describe('closeFuturesPosition', () => {
+      it('flattens a SHORT by submitting a BUY market order with position_side=SHORT preserved', async () => {
+        const client = makeClient();
+
+        await client.closeFuturesPosition({
+          productId: 'BTC-PERP-INTX',
+          positionSide: 'SHORT',
+          baseSize: 0.002,
+          leverage: 1,
+          marginType: 'ISOLATED',
+          clientOrderId: 'cli-close-short',
+        });
+
+        const body = JSON.parse((fetchMock.mock.calls[0][1] as RequestInit).body as string);
+        expect(body.side).toBe('BUY');
+        expect(body.position_side).toBe('SHORT');
+        expect(body.leverage).toBe('1');
+        expect(body.margin_type).toBe('ISOLATED');
+        expect(body.order_configuration.market_market_ioc.base_size).toBe('0.002');
+        expect(body.client_order_id).toBe('cli-close-short');
+      });
+
+      it('flattens a LONG by submitting a SELL market order with position_side=LONG preserved', async () => {
+        const client = makeClient();
+
+        await client.closeFuturesPosition({
+          productId: 'ETH-PERP-INTX',
+          positionSide: 'LONG',
+          baseSize: 0.5,
+          leverage: 1,
+          marginType: 'ISOLATED',
+        });
+
+        const body = JSON.parse((fetchMock.mock.calls[0][1] as RequestInit).body as string);
+        expect(body.side).toBe('SELL');
+        expect(body.position_side).toBe('LONG');
+      });
+    });
+  });
 });
 
 // --- CDP / JWT auth path (TRA-157) ---------------------------------------
@@ -461,6 +712,48 @@ describe('CoinbaseOrderClient (CDP/JWT auth)', () => {
   it('throws if buildCdpJwt is called on an HMAC client', () => {
     const client = makeClient();
     expect(() => client.buildCdpJwt('GET', '/api/v3/brokerage/accounts')).toThrow(/non-CDP/);
+  });
+
+  // TRA-249 — perp orders carry extra top-level body keys (leverage,
+  // margin_type, position_side). Re-run the CDP signing path with those
+  // params present to confirm the JWT is valid for the perp body too.
+  // The body change doesn't affect the JWT (the URI claim is method+host+path
+  // only) — this is a regression guard to make sure we didn't accidentally
+  // start hashing the body into the claim while wiring perps.
+  it('signs a perp order with a valid JWT that does not include the body in the URI claim', async () => {
+    const { privatePem, publicPem } = generateCdpKeypair();
+    const client = new CoinbaseOrderClient({
+      apiKey: CDP_KID,
+      apiSecret: privatePem,
+      fetchImpl: fetchMock as unknown as typeof fetch,
+      now: () => TS,
+      nonce: () => 'nonce-perp',
+    });
+
+    await client.placeMarketOrder({
+      productId: 'BTC-PERP-INTX',
+      side: 'sell',
+      baseSize: 0.001,
+      leverage: 1,
+      marginType: 'ISOLATED',
+      positionSide: 'SHORT',
+      clientOrderId: 'cli-perp-jwt',
+    });
+
+    const init = fetchMock.mock.calls[0][1] as RequestInit;
+    const sentBody = JSON.parse(init.body as string);
+    expect(sentBody.leverage).toBe('1');
+    expect(sentBody.margin_type).toBe('ISOLATED');
+    expect(sentBody.position_side).toBe('SHORT');
+
+    const headers = init.headers as Record<string, string>;
+    const jwt = headers.Authorization.slice('Bearer '.length);
+    const { payload, signingInput, signature } = decodeJwtParts(jwt);
+    expect(payload.uri).toBe('POST api.coinbase.com/api/v3/brokerage/orders');
+    const ok = createVerify('SHA256')
+      .update(signingInput)
+      .verify({ key: publicPem, dsaEncoding: 'ieee-p1363' }, signature);
+    expect(ok).toBe(true);
   });
 
   // TRA-224 follow-up — Coinbase's CDP authenticator strips the query string

@@ -78,12 +78,25 @@ interface GetOrderResponse {
 }
 
 /**
- * Subset of `GET /api/v3/brokerage/products` we read for valuing non-USD
- * holdings on the account screen (TRA-224) and quantizing order sizes to the
- * per-product `base_increment` Coinbase enforces (TRA-243).
+ * Subset of `GET /api/v3/brokerage/products` we read for three things:
+ *
+ * - valuing non-USD holdings on the account screen (TRA-224),
+ * - quantizing order sizes to the per-product `base_increment` Coinbase
+ *   enforces (TRA-243),
+ * - discovering the perp catalogue at startup (TRA-249).
+ *
+ * Coinbase returns many more fields per product; we only model what callers
+ * consume.
  */
 interface CoinbaseProduct {
   product_id: string;
+  /**
+   * `'SPOT'` or `'FUTURE'` (perpetuals are returned under FUTURE on the
+   * Advanced Trade API). Optional because TRA-224's spot-price lookup ran
+   * before this field was modelled and we don't want existing fixtures to
+   * break.
+   */
+  product_type?: string;
   /** Last trade price, stringified — "0" or empty for inactive products. */
   price?: string;
   /**
@@ -92,6 +105,16 @@ interface CoinbaseProduct {
    * a finer-grained size yields `Too many decimals in order amount` (TRA-243).
    */
   base_increment?: string;
+  /**
+   * Coinbase exposes a few orthogonal "is this product currently usable"
+   * flags. We treat any of them being true as "inactive" when the catalogue
+   * is queried for the perp routing map (TRA-249).
+   */
+  trading_disabled?: boolean;
+  is_disabled?: boolean;
+  cancel_only?: boolean;
+  /** Free-form lifecycle string, e.g. `online`, `offline`. */
+  status?: string;
 }
 
 interface ListProductsResponse {
@@ -109,6 +132,66 @@ export interface CoinbaseProductInfo {
   baseIncrement: string;
 }
 
+/**
+ * Coinbase perp-only margin mode. Cross is intentionally out of scope for the
+ * TRA-249 epic (smaller blast radius, simpler liquidation math); the order
+ * client rejects {@link CoinbaseMarginType} `'CROSS'` at submit time so future
+ * callers don't accidentally enable it before the engine is ready for it.
+ */
+export type CoinbaseMarginType = 'ISOLATED' | 'CROSS';
+
+/** Direction of the perp position the order opens or manages. */
+export type CoinbasePositionSide = 'LONG' | 'SHORT';
+
+/** Public subset of a Coinbase product entry exposed by {@link CoinbaseOrderClient.listProducts}. */
+export interface CoinbaseListedProduct {
+  product_id: string;
+  product_type?: string;
+  price?: string;
+  status?: string;
+}
+
+/**
+ * Subset of `GET /api/v3/brokerage/portfolios` we read to resolve the INTX
+ * (perpetuals) portfolio uuid before fetching positions. Coinbase splits a
+ * user's account across multiple portfolios — DEFAULT for spot, INTX for
+ * perpetual futures — and the positions endpoint is portfolio-scoped.
+ */
+interface CoinbasePortfolio {
+  uuid: string;
+  name?: string;
+  type?: string;
+  deleted?: boolean;
+}
+
+interface ListPortfoliosResponse {
+  portfolios?: CoinbasePortfolio[];
+}
+
+/**
+ * Subset of a Coinbase INTX position entry. Coinbase returns more telemetry
+ * (margin contributions, mark price decay, etc.) but the live account only
+ * needs enough to reconcile open size, direction, and P&L on startup
+ * (TRA-249).
+ */
+export interface CoinbaseFuturesPosition {
+  product_id: string;
+  position_side: CoinbasePositionSide;
+  /** Open size in the base asset, stringified. Always non-negative; direction is conveyed by `position_side`. */
+  net_size: string;
+  /** Volume-weighted average entry price across all fills that built this position. */
+  vwap?: string;
+  mark_price?: string;
+  liquidation_price?: string;
+  unrealized_pnl?: string;
+  leverage?: string;
+  margin_type?: CoinbaseMarginType;
+}
+
+interface ListIntxPositionsResponse {
+  positions?: CoinbaseFuturesPosition[];
+}
+
 export interface MarketOrderParams {
   productId: string;
   side: Side;
@@ -117,6 +200,22 @@ export interface MarketOrderParams {
   /** Amount of the quote asset to spend (e.g. 25 USD). Used for BUYs when sizing in dollars. */
   quoteSize?: number;
   clientOrderId?: string;
+  /**
+   * Perp leverage multiplier (TRA-249). Omit for spot — when present and
+   * combined with {@link MarketOrderParams.positionSide}, the order client
+   * adds the `leverage` / `margin_type` / `position_side` fields Coinbase's
+   * INTX perp endpoint expects. The first epic pass caps at 1x.
+   */
+  leverage?: number;
+  /** Perp margin mode (TRA-249). Only `'ISOLATED'` is in scope; `'CROSS'` is rejected at submit time. */
+  marginType?: CoinbaseMarginType;
+  /**
+   * Direction of the underlying perp position (TRA-249). Required for perp
+   * orders so that BUY/SELL refers to the trade and `position_side` carries
+   * the directional intent: opening a SHORT is `side: 'sell', positionSide:
+   * 'SHORT'`; closing it is `side: 'buy', positionSide: 'SHORT'`.
+   */
+  positionSide?: CoinbasePositionSide;
 }
 
 export interface LimitOrderParams {
@@ -330,6 +429,102 @@ export class CoinbaseOrderClient {
   }
 
   /**
+   * GET /api/v3/brokerage/products?product_type=... — list the active product
+   * catalogue for one Coinbase product family (TRA-249).
+   *
+   * Used by the live account to discover the perp catalogue at startup so the
+   * spot→perp routing map is data-driven instead of hard-coded. Inactive
+   * entries (`trading_disabled`, `is_disabled`, or `cancel_only`) are dropped
+   * here so callers don't need to redo that filter. Coinbase exposes a few
+   * orthogonal lifecycle flags; we treat any of them being true as inactive.
+   */
+  async listProducts(productType: 'SPOT' | 'FUTURE'): Promise<CoinbaseListedProduct[]> {
+    const params = new URLSearchParams();
+    params.set('product_type', productType);
+    const path = `/api/v3/brokerage/products?${params.toString()}`;
+    const data = await this.request<ListProductsResponse>('GET', path, '');
+    const out: CoinbaseListedProduct[] = [];
+    for (const p of data.products ?? []) {
+      if (p.trading_disabled || p.is_disabled || p.cancel_only) continue;
+      out.push({
+        product_id: p.product_id,
+        product_type: p.product_type,
+        price: p.price,
+        status: p.status,
+      });
+    }
+    return out;
+  }
+
+  /**
+   * GET /api/v3/brokerage/portfolios — return the user's portfolios, optionally
+   * filtered by type. Coinbase splits an account across multiple portfolios
+   * (`DEFAULT` for spot, `INTX` for perpetual futures); the perp positions
+   * endpoint is portfolio-scoped, so we expose this so the live account can
+   * resolve the INTX uuid at startup before reconciling open perp positions
+   * (TRA-249). Deleted portfolios are filtered out so callers never reconcile
+   * against a tombstoned account.
+   */
+  async listPortfolios(portfolioType?: 'DEFAULT' | 'INTX' | 'CONSUMER' | 'CFM'): Promise<CoinbasePortfolio[]> {
+    const params = new URLSearchParams();
+    if (portfolioType) params.set('portfolio_type', portfolioType);
+    const qs = params.toString();
+    const path = `/api/v3/brokerage/portfolios${qs ? `?${qs}` : ''}`;
+    const data = await this.request<ListPortfoliosResponse>('GET', path, '');
+    return (data.portfolios ?? []).filter((p) => !p.deleted);
+  }
+
+  /**
+   * GET /api/v3/brokerage/intx/positions/{portfolio_uuid} — list open perp
+   * positions for one INTX portfolio (TRA-249).
+   *
+   * Used by the live account on startup to reconcile any positions opened
+   * directly in the Coinbase UI before the engine took over. The portfolio
+   * uuid is caller-supplied so the order client stays single-purpose; pair
+   * with {@link CoinbaseOrderClient.listPortfolios} on the caller side to
+   * resolve the INTX uuid first.
+   */
+  async listFuturesPositions(portfolioUuid: string): Promise<CoinbaseFuturesPosition[]> {
+    if (!portfolioUuid) {
+      throw new Error('listFuturesPositions requires a portfolio uuid');
+    }
+    const path = `/api/v3/brokerage/intx/positions/${encodeURIComponent(portfolioUuid)}`;
+    const data = await this.request<ListIntxPositionsResponse>('GET', path, '');
+    return data.positions ?? [];
+  }
+
+  /**
+   * Convenience wrapper that flattens an open perp position via a market
+   * order (TRA-249).
+   *
+   * For an open `SHORT`, closing means buying back the base asset, so the
+   * trade `side` flips to BUY while `position_side` stays `SHORT` — Coinbase
+   * uses `position_side` to identify *which* directional position the order
+   * is touching, not which way the trade goes. Symmetric for `LONG`.
+   * `leverage` and `marginType` should match the open position so the close
+   * order doesn't accidentally inflate the margin requirement.
+   */
+  async closeFuturesPosition(params: {
+    productId: string;
+    positionSide: CoinbasePositionSide;
+    baseSize: number;
+    leverage?: number;
+    marginType?: CoinbaseMarginType;
+    clientOrderId?: string;
+  }): Promise<CoinbaseOrderSuccessResponse> {
+    const closeSide: Side = params.positionSide === 'LONG' ? 'sell' : 'buy';
+    return this.placeMarketOrder({
+      productId: params.productId,
+      side: closeSide,
+      baseSize: params.baseSize,
+      leverage: params.leverage,
+      marginType: params.marginType,
+      positionSide: params.positionSide,
+      clientOrderId: params.clientOrderId,
+    });
+  }
+
+  /**
    * GET /api/v3/brokerage/orders/historical/{order_id} — fetch the canonical
    * order record so callers can reconcile a market order to its actual fill
    * price and filled size (TRA-156).
@@ -350,17 +545,29 @@ export class CoinbaseOrderClient {
     if (!params.baseSize && !params.quoteSize) {
       throw new Error('placeMarketOrder requires baseSize or quoteSize');
     }
+    // CROSS margin is intentionally out of scope for the TRA-249 perp epic.
+    // Reject here so a typo in a downstream caller can't quietly route a CROSS
+    // order through to Coinbase before the engine knows how to manage one.
+    if (params.marginType === 'CROSS') {
+      throw new Error('placeMarketOrder: CROSS margin is not supported (TRA-249 scope: ISOLATED only)');
+    }
 
     const market: Record<string, string> = {};
     if (params.baseSize != null) market.base_size = formatSize(params.baseSize);
     if (params.quoteSize != null) market.quote_size = formatSize(params.quoteSize);
 
-    const body = {
+    // Body construction is intentionally additive: when no perp fields are
+    // supplied, the resulting JSON is byte-identical to the pre-TRA-249 spot
+    // body so existing spot callers see no behavioural change.
+    const body: Record<string, unknown> = {
       client_order_id: params.clientOrderId ?? randomUUID(),
       product_id: params.productId,
       side: params.side.toUpperCase(),
       order_configuration: { market_market_ioc: market },
     };
+    if (params.leverage != null) body.leverage = String(params.leverage);
+    if (params.marginType != null) body.margin_type = params.marginType;
+    if (params.positionSide != null) body.position_side = params.positionSide;
 
     return this.submitOrder(body);
   }

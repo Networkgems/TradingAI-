@@ -8,4 +8,8 @@ export type {
   MarketOrderParams,
   LimitOrderParams,
   CoinbaseAuthScheme,
+  CoinbaseMarginType,
+  CoinbasePositionSide,
+  CoinbaseListedProduct,
+  CoinbaseFuturesPosition,
 } from './order-client.js';
