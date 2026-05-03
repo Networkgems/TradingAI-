@@ -7,7 +7,30 @@ import type {
   CoinbaseOrderSuccessResponse,
   CoinbaseProductInfo,
 } from '@trading-app/engine';
+import {
+  isPerpShortSymbol,
+  perpShortRiskFraction,
+  evaluateShortNotionalCaps,
+  dailyShortCircuitBreakerTripped,
+} from '@trading-app/engine';
 import { randomUUID } from 'crypto';
+
+/**
+ * TRA-264 — leverage and margin mode for perp shorts opened by the engine.
+ * Phase-1 caps leverage at 1× isolated so liquidation risk on a 1% adverse move
+ * is essentially zero while the integration is shaken out (TRA-249 epic plan).
+ */
+const PERP_SHORT_LEVERAGE = 1;
+const PERP_SHORT_MARGIN_TYPE = 'ISOLATED' as const;
+const PERP_SHORT_POSITION_SIDE = 'SHORT' as const;
+
+/**
+ * TRA-264 — skip reason emitted when the §7 daily-short circuit breaker has
+ * tripped. Distinct from the §6 cap strings so the dashboard can group them
+ * separately. Stamped on `signal.signalSkipReason` (strategy-side gate, not a
+ * broker reject).
+ */
+const SKIP_DAILY_SHORT_CIRCUIT_BREAKER = 'daily short circuit breaker tripped';
 
 /** Stable currencies treated 1:1 with USD when computing equity. */
 const CASH_CURRENCIES = new Set(['USD', 'USDC', 'USDT']);
@@ -145,6 +168,21 @@ export class CryptoLiveAccount {
   private cashUsd = 0;
   private equityUsd = 0;
   private realizedPnlToday = 0;
+  /**
+   * TRA-264 — realised short P&L accumulated today. Feeds the §7 daily short
+   * circuit breaker so a streak of stopped-out shorts halts new short entries
+   * before the loss compounds into a full-account drawdown. Reset on UTC day
+   * rollover via `rolloverDay`.
+   */
+  private realizedShortPnlToday = 0;
+  /**
+   * TRA-264 — last computed unrealised P&L summed across all open shorts, in
+   * USD. Refreshed on every `checkExits` tick (the only call site with a full
+   * `prices` map for every open symbol). Used by `openPosition` to feed the
+   * §7 daily short circuit breaker without forcing every caller to plumb a
+   * prices map. Stale by at most one tick — the realised side stays exact.
+   */
+  private openShortsUnrealisedPnlUsd = 0;
   private lastBalanceRefresh = 0;
   /**
    * TRA-243 — per-product metadata Coinbase Advanced Trade currently exposes
@@ -304,6 +342,29 @@ export class CryptoLiveAccount {
     return this.recentSkips.slice();
   }
 
+  /**
+   * TRA-264 — strategy-spec skip channel for §6 notional caps and §7 daily
+   * circuit breaker. Mirrors `recordSkip` but stamps `signalSkipReason`
+   * (strategy-side gate) instead of `liveSkipReason` (broker reject). The
+   * dashboard surfaces both channels via the same per-signal skip badge, so
+   * pushing onto the aggregate `recentSkips` ring buffer keeps a single place
+   * for operators to scan recent skip activity.
+   */
+  private recordStrategySkip(signal: TradeSignal, reason: string): null {
+    signal.signalSkipReason = reason;
+    this.recentSkips.push({
+      symbol: signal.symbol,
+      side: signal.side,
+      reason,
+      at: Date.now(),
+    });
+    if (this.recentSkips.length > RECENT_SKIPS_CAP) {
+      this.recentSkips.splice(0, this.recentSkips.length - RECENT_SKIPS_CAP);
+    }
+    console.warn(`[crypto-live] strategy-skip ${signal.symbol} ${signal.type} ${signal.side}: ${reason}`);
+    return null;
+  }
+
   isStale(): boolean {
     return Date.now() - this.lastBalanceRefresh > BALANCE_REFRESH_MS;
   }
@@ -353,6 +414,38 @@ export class CryptoLiveAccount {
     return Math.round(rawQty * 1_000_000) / 1_000_000;
   }
 
+  /**
+   * TRA-264 — risk-fraction-aware sizing for perp shorts. Tier-1 majors size
+   * at 0.50% of managed equity; Tier-2 (DOGE) at 0.30% per `perpShortRiskFraction`.
+   * The long-side `sizeFromStop` keeps using `riskPerTrade` (1% baseline) so
+   * BUY behaviour is byte-identical.
+   */
+  sizeShortFromStop(symbol: string, entryPrice: number, stopPrice: number): number {
+    const dist = Math.abs(entryPrice - stopPrice);
+    if (dist === 0) return 0;
+    const riskFrac = perpShortRiskFraction(symbol);
+    const maxRiskUsd = this.managedEquity() * riskFrac;
+    const rawQty = maxRiskUsd / dist;
+    return Math.round(rawQty * 1_000_000) / 1_000_000;
+  }
+
+  /**
+   * TRA-264 — sum open-short notional (entryPrice × quantity) across positions
+   * matching `predicate`. Used to feed `evaluateShortNotionalCaps` with the
+   * §6 inputs (this strategy + this symbol, all strategies + this symbol,
+   * total). Notional is computed off the entry price rather than current
+   * mark, matching the spec wording "sum of open short notional".
+   */
+  private sumOpenShortNotional(predicate: (pos: Position) => boolean = () => true): number {
+    let total = 0;
+    for (const pos of this.positions.values()) {
+      if (pos.side !== 'sell') continue;
+      if (!predicate(pos)) continue;
+      total += pos.entryPrice * pos.quantity;
+    }
+    return total;
+  }
+
   hasOpenPosition(symbol: string): boolean {
     return Array.from(this.positions.values()).some(p => p.symbol === symbol);
   }
@@ -375,15 +468,16 @@ export class CryptoLiveAccount {
    * saw "8 signals, 0 positions" with no way to self-diagnose.
    */
   async openPosition(signal: TradeSignal, currentPrice: number): Promise<Position | null> {
-    // TRA-249-B — Coinbase Advanced Trade is a SPOT venue: a sell-side
-    // strategy signal can't open a short. Closes happen via `checkExits`
-    // (TP/SL), not via SELLs from strategies. Critically, sending a SELL
-    // here would partially fill against the user's pre-existing BTC/ETH —
-    // the same balance now valued in equity (TRA-224) — silently nibbling
-    // at user holdings. Pre-perp this is the entire SELL path; once C lands
-    // it becomes the fallback for symbols not in the perp catalog.
+    // TRA-264 — SELL-side fork. Symbols inside the Phase-1 perp shorts
+    // universe (TRA-261 / TRA-255 §2: BTC, ETH, SOL, XRP, DOGE) route to
+    // Coinbase INTX as 1× isolated perp shorts. Anything else falls back to
+    // the TRA-249-B spot-only guard so a stray SELL on a non-perp watchlist
+    // symbol can't nibble at the user's pre-existing spot holdings (TRA-224).
     if (signal.side === 'sell') {
-      return this.recordSkip(signal, `spot only — no perp listed for ${signal.symbol}`);
+      if (!isPerpShortSymbol(signal.symbol)) {
+        return this.recordSkip(signal, `spot only — no perp listed for ${signal.symbol}`);
+      }
+      return this.openPerpShort(signal, currentPrice);
     }
 
     // TRA-243 — refuse to fire orders against tickers Coinbase doesn't list
@@ -502,14 +596,181 @@ export class CryptoLiveAccount {
   }
 
   /**
+   * TRA-264 — open a 1× isolated perp SHORT on Coinbase INTX. Caller has
+   * already established that `signal.symbol` is in the Phase-1 perp universe.
+   *
+   * Order of guards before order submit:
+   *   1. Daily short circuit breaker (TRA-255 §7) — realised + unrealised
+   *      short P&L for the day ≤ -2% equity halts new shorts until UTC day
+   *      rollover.
+   *   2. Tradable-product validation (TRA-243) — never fire against a symbol
+   *      Coinbase no longer lists.
+   *   3. Managed-equity / sizing / quantization gates — same shape as the
+   *      BUY path, but per-trade risk comes from `perpShortRiskFraction`
+   *      (Tier-1 0.50%, Tier-2 0.30%) so shorts size at half the long-side
+   *      budget per spec §6.
+   *   4. §6 notional caps (single-symbol / cross-strategy / total) via
+   *      `evaluateShortNotionalCaps` — fire as `signalSkipReason` so the
+   *      dashboard groups them with the other strategy gates.
+   *
+   * Cash bookkeeping: ISOLATED perp margin sits in the Coinbase INTX
+   * portfolio, not the spot USD wallet — this method intentionally does NOT
+   * debit `cashUsd`. Realised P&L on close still flows through
+   * `realizedPnlToday` so the dashboard's daily P&L matches reality, with a
+   * parallel `realizedShortPnlToday` tally feeding the §7 circuit breaker.
+   */
+  private async openPerpShort(signal: TradeSignal, currentPrice: number): Promise<Position | null> {
+    if (
+      dailyShortCircuitBreakerTripped({
+        shortPnlTodayUsd: this.realizedShortPnlToday + this.openShortsUnrealisedPnlUsd,
+        totalEquityUsd: this.equityUsd,
+      })
+    ) {
+      return this.recordStrategySkip(signal, SKIP_DAILY_SHORT_CIRCUIT_BREAKER);
+    }
+
+    // TRA-243 — refuse to fire against tickers Coinbase doesn't list. The
+    // tradable-products cache covers spot SKUs today; once perp catalogue
+    // discovery lands we'll either share the same cache or split — for now
+    // we treat a missing entry the same way the BUY path does.
+    if (this.tradableProducts && !this.tradableProducts.has(signal.symbol)) {
+      return this.recordSkip(
+        signal,
+        `${signal.symbol} not listed on Coinbase Advanced Trade — likely delisted or renamed (e.g. MATIC→POL); remove it from the watchlist`,
+      );
+    }
+
+    if (this.managedEquity() <= 0) {
+      return this.recordSkip(
+        signal,
+        `managed equity too small (equity=${this.equityUsd.toFixed(2)}, managedRatio=${this.managedAccountRatio})`,
+      );
+    }
+
+    let qty = this.sizeShortFromStop(signal.symbol, signal.entryPrice, signal.stopLoss);
+    if (qty <= 0) {
+      return this.recordSkip(
+        signal,
+        `qty too small after sizing (entry=${signal.entryPrice} stop=${signal.stopLoss}, riskFrac=${perpShortRiskFraction(signal.symbol)})`,
+      );
+    }
+    // Cap by managed equity at 1× leverage — never short more notional than
+    // the user has authorised the engine to risk. Higher leverage would
+    // soften this; we explicitly do not multiply here so a future leverage
+    // bump is a deliberate edit, not an accidental capacity expansion.
+    const maxQtyForManagedEquity = (this.managedEquity() * PERP_SHORT_LEVERAGE) / currentPrice;
+    qty = Math.min(qty, maxQtyForManagedEquity);
+
+    const productInfo = this.tradableProducts?.get(signal.symbol);
+    qty = productInfo
+      ? quantizeBaseSize(qty, productInfo.baseIncrement)
+      : Math.round(qty * 1_000_000) / 1_000_000;
+    if (qty <= 0) {
+      return this.recordSkip(
+        signal,
+        `qty too small after quantization (entry=${signal.entryPrice} stop=${signal.stopLoss}, riskFrac=${perpShortRiskFraction(signal.symbol)})`,
+      );
+    }
+
+    const candidateNotional = currentPrice * qty;
+    if (candidateNotional < MIN_NOTIONAL_USD) {
+      return this.recordSkip(
+        signal,
+        `cost $${candidateNotional.toFixed(2)} below Coinbase $${MIN_NOTIONAL_USD} minimum (managedEquity=${this.managedEquity().toFixed(2)}, riskFrac=${perpShortRiskFraction(signal.symbol)})`,
+      );
+    }
+
+    // §6 notional caps — single-symbol (per-strategy 15% strategy equity),
+    // cross-strategy per-symbol (20% total equity), total short notional
+    // ceiling (30% total equity). Strategy slice is the same managed-equity
+    // ratio used everywhere else; engine doesn't carry a per-strategy split
+    // through to live so each strategy is allowed up to the full slice for
+    // its single-symbol budget. Cross-strategy / total caps are global and
+    // do the heavy lifting.
+    const capReason = evaluateShortNotionalCaps({
+      totalEquityUsd: this.equityUsd,
+      strategyEquityUsd: this.managedEquity(),
+      candidateShortNotionalUsd: candidateNotional,
+      openShortsThisStrategyThisSymbolUsd: this.sumOpenShortNotional(
+        (p) => p.signalType === signal.type && p.symbol === signal.symbol,
+      ),
+      openShortsAllStrategiesThisSymbolUsd: this.sumOpenShortNotional(
+        (p) => p.symbol === signal.symbol,
+      ),
+      openShortsTotalUsd: this.sumOpenShortNotional(),
+    });
+    if (capReason) {
+      return this.recordStrategySkip(signal, capReason);
+    }
+
+    let resp: CoinbaseOrderSuccessResponse;
+    try {
+      resp = await this.coinbase.placeMarketOrder({
+        productId: signal.symbol,
+        side: 'sell',
+        baseSize: qty,
+        leverage: PERP_SHORT_LEVERAGE,
+        marginType: PERP_SHORT_MARGIN_TYPE,
+        positionSide: PERP_SHORT_POSITION_SIDE,
+      });
+    } catch (err: unknown) {
+      const msg = err instanceof Error ? err.message : String(err);
+      this.recordSkip(signal, `Coinbase rejected order: ${msg}`);
+      console.error(`[crypto-live] perp short open failed for ${signal.symbol}: ${msg}`);
+      throw err;
+    }
+
+    const fill = await this.awaitFill(resp.order_id, signal.symbol);
+    const entryPrice = fill?.price ?? currentPrice;
+    const filledQty = fill?.size ?? qty;
+
+    const position: Position = {
+      id: randomUUID(),
+      symbol: signal.symbol,
+      side: 'sell',
+      signalType: signal.type,
+      entryPrice,
+      quantity: filledQty,
+      stopLoss: signal.stopLoss,
+      takeProfit: signal.takeProfit,
+      openedAt: Date.now(),
+    };
+    this.positions.set(position.id, position);
+    // Intentionally no cashUsd debit: ISOLATED perp margin lives in the INTX
+    // portfolio, separate from the spot USD wallet `refreshBalance` reads.
+    const reconciled = fill
+      ? `@ ${entryPrice.toFixed(2)} (filled ${filledQty})`
+      : `@ ~${currentPrice.toFixed(2)} (unreconciled)`;
+    console.log(
+      `[crypto-live] OPEN SHORT ${signal.symbol} ${reconciled} (perp ${PERP_SHORT_LEVERAGE}× ${PERP_SHORT_MARGIN_TYPE}, coinbase order=${resp.order_id})`,
+    );
+    return position;
+  }
+
+  /**
    * For each open position whose current price has hit TP or SL, send a
    * market order to flatten and record realized P&L locally.
+   *
+   * TRA-264 — every tick also re-tallies the unrealised P&L of all open
+   * shorts and stores it on `openShortsUnrealisedPnlUsd`. This is the only
+   * call site with a full prices map, so we hijack it as the refresh point
+   * for the §7 daily short circuit breaker's mark-to-market input. Symbols
+   * missing from `prices` contribute nothing — the realised side stays
+   * exact, the unrealised tally is best-effort.
    */
   async checkExits(prices: Map<string, number>): Promise<Position[]> {
     const closed: Position[] = [];
+    let openShortsUnrealised = 0;
     for (const [id, pos] of Array.from(this.positions.entries())) {
       const price = prices.get(pos.symbol);
       if (price == null) continue;
+
+      // Tally unrealised P&L for any open short BEFORE we evaluate exit
+      // conditions; if the position closes on this tick we exclude it from
+      // the cache (it's about to land in `realizedShortPnlToday` instead).
+      if (pos.side === 'sell') {
+        openShortsUnrealised += (pos.entryPrice - price) * pos.quantity;
+      }
 
       let hit: 'tp' | 'sl' | null = null;
       if (pos.side === 'buy') {
@@ -521,16 +782,39 @@ export class CryptoLiveAccount {
       }
       if (!hit) continue;
 
-      const exitSide: 'buy' | 'sell' = pos.side === 'buy' ? 'sell' : 'buy';
+      // Closing this short — back its mark-to-market contribution out of the
+      // tally so realised + cached unrealised don't double-count it.
+      if (pos.side === 'sell') {
+        openShortsUnrealised -= (pos.entryPrice - price) * pos.quantity;
+      }
+
       let exitOrder: CoinbaseOrderSuccessResponse;
       try {
-        exitOrder = await this.coinbase.placeMarketOrder({
-          productId: pos.symbol,
-          side: exitSide,
-          baseSize: pos.quantity,
-        });
+        if (pos.side === 'sell') {
+          // TRA-264 — perp short close: route through `closeFuturesPosition`
+          // so Coinbase identifies the right INTX position via `position_side`
+          // (the trade `side` flips to BUY internally). Same leverage / margin
+          // mode the open used so Coinbase doesn't re-quote margin.
+          exitOrder = await this.coinbase.closeFuturesPosition({
+            productId: pos.symbol,
+            positionSide: PERP_SHORT_POSITION_SIDE,
+            baseSize: pos.quantity,
+            leverage: PERP_SHORT_LEVERAGE,
+            marginType: PERP_SHORT_MARGIN_TYPE,
+          });
+        } else {
+          exitOrder = await this.coinbase.placeMarketOrder({
+            productId: pos.symbol,
+            side: 'sell',
+            baseSize: pos.quantity,
+          });
+        }
       } catch (err: unknown) {
         console.error(`[crypto-live] exit failed for ${pos.symbol}: ${err instanceof Error ? err.message : String(err)} — leaving position open, will retry next tick`);
+        // Re-add the unrealised contribution since we did not actually close.
+        if (pos.side === 'sell') {
+          openShortsUnrealised += (pos.entryPrice - price) * pos.quantity;
+        }
         continue;
       }
 
@@ -548,25 +832,49 @@ export class CryptoLiveAccount {
       pos.exitPrice = exitPrice;
       pos.quantity = exitQty;
       this.realizedPnlToday += pnl;
-      this.cashUsd += exitPrice * exitQty;
-      this.equityUsd += pnl;
+      if (pos.side === 'sell') {
+        // TRA-264 — feed the §7 circuit breaker's realised side.
+        this.realizedShortPnlToday += pnl;
+        // Perp short cash settles in INTX, not the spot wallet — leave
+        // cashUsd alone. Equity still advances by realised pnl so the
+        // dashboard daily P&L stays correct.
+        this.equityUsd += pnl;
+      } else {
+        this.cashUsd += exitPrice * exitQty;
+        this.equityUsd += pnl;
+      }
       this.positions.delete(id);
       closed.push({ ...pos });
       console.log(`[crypto-live] CLOSE ${pos.symbol} ${hit.toUpperCase()} @ ${exitPrice.toFixed(2)} pnl=${pnl.toFixed(2)}`);
     }
+    this.openShortsUnrealisedPnlUsd = openShortsUnrealised;
     return closed;
   }
 
-  /** Manual close — flatten via market order at current price. */
+  /**
+   * Manual close — flatten via market order at current price. TRA-264 routes
+   * perp shorts through `closeFuturesPosition` so Coinbase keys the close to
+   * the right INTX position via `position_side`.
+   */
   async closePosition(positionId: string, currentPrice: number): Promise<Position | null> {
     const pos = this.positions.get(positionId);
     if (!pos) return null;
-    const exitSide: 'buy' | 'sell' = pos.side === 'buy' ? 'sell' : 'buy';
-    const exitOrder = await this.coinbase.placeMarketOrder({
-      productId: pos.symbol,
-      side: exitSide,
-      baseSize: pos.quantity,
-    });
+    let exitOrder: CoinbaseOrderSuccessResponse;
+    if (pos.side === 'sell') {
+      exitOrder = await this.coinbase.closeFuturesPosition({
+        productId: pos.symbol,
+        positionSide: PERP_SHORT_POSITION_SIDE,
+        baseSize: pos.quantity,
+        leverage: PERP_SHORT_LEVERAGE,
+        marginType: PERP_SHORT_MARGIN_TYPE,
+      });
+    } else {
+      exitOrder = await this.coinbase.placeMarketOrder({
+        productId: pos.symbol,
+        side: 'sell',
+        baseSize: pos.quantity,
+      });
+    }
     const exitFill = await this.awaitFill(exitOrder.order_id, pos.symbol);
     const exitPrice = exitFill?.price ?? currentPrice;
     const exitQty = exitFill?.size ?? pos.quantity;
@@ -577,15 +885,26 @@ export class CryptoLiveAccount {
     pos.quantity = exitQty;
     pos.closedAt = Date.now();
     this.realizedPnlToday += pnl;
-    this.cashUsd += exitPrice * exitQty;
-    this.equityUsd += pnl;
+    if (pos.side === 'sell') {
+      this.realizedShortPnlToday += pnl;
+      this.equityUsd += pnl;
+    } else {
+      this.cashUsd += exitPrice * exitQty;
+      this.equityUsd += pnl;
+    }
     this.positions.delete(positionId);
     return { ...pos };
   }
 
-  /** Reset realized P&L tracker — called on UTC day rollover by the engine. */
+  /**
+   * Reset realized P&L trackers — called on UTC day rollover by the engine.
+   * TRA-264 also resets the short-side tally so the §7 circuit breaker
+   * starts each new UTC day with a clean slate (per spec: held shorts are
+   * NOT auto-flatted, but the day-bound limit resets).
+   */
   rolloverDay(): void {
     this.realizedPnlToday = 0;
+    this.realizedShortPnlToday = 0;
   }
 
   /**

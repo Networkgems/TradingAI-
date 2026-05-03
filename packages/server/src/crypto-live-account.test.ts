@@ -17,6 +17,9 @@ import { CryptoLiveAccount, quantizeBaseSize } from './crypto-live-account.js';
 class FakeCoinbaseClient {
   listAccounts = vi.fn<() => Promise<CoinbaseAccountBalance[]>>();
   placeMarketOrder = vi.fn<() => Promise<CoinbaseOrderSuccessResponse>>();
+  // TRA-264 — perp short close goes through closeFuturesPosition so Coinbase
+  // identifies the right INTX position via `position_side`.
+  closeFuturesPosition = vi.fn<() => Promise<CoinbaseOrderSuccessResponse>>();
   getOrder = vi.fn<(orderId: string) => Promise<CoinbaseOrderDetails>>();
   // Default empty map: tests with only USD/USDC/USDT holdings never hit this
   // path. Tests that seed crypto holdings override the resolved value.
@@ -381,22 +384,22 @@ describe('CryptoLiveAccount small-fund sizing (TRA-243)', () => {
 });
 
 describe('CryptoLiveAccount skip-reason annotation (TRA-243)', () => {
-  it('rejects sell-side signals with a spot-only reason (TRA-249-B)', async () => {
+  it('rejects sell-side signals on non-perp symbols with a spot-only reason (TRA-249-B / TRA-264)', async () => {
     // Pre-perp, every sell-side strategy signal lands on a spot Coinbase
     // account — and pre-TRA-249-B, the order client happily submitted a SELL
     // that partially filled against the user's pre-existing BTC/ETH (silent
     // nibble at user holdings now valued in equity per TRA-224). The guard
-    // must hold. Once TRA-249-C lands, this branch becomes the fallback for
-    // symbols not in the perp catalog; the wording reflects that.
+    // must hold for symbols not in the TRA-261 perp universe. ADA-USD is a
+    // watchlist member that is intentionally NOT in the Phase-1 universe.
     const { account, coinbase } = buyAccount(50_000);
     await account.refreshBalance();
 
-    const signal = buildSignal({ side: 'sell', stopLoss: 30_300, takeProfit: 29_100 });
+    const signal = buildSignal({ symbol: 'ADA-USD', side: 'sell', stopLoss: 30_300, takeProfit: 29_100 });
     const pos = await account.openPosition(signal, 30_000);
 
     expect(pos).toBeNull();
     expect(coinbase.placeMarketOrder).not.toHaveBeenCalled();
-    expect(signal.liveSkipReason).toMatch(/spot only — no perp listed for BTC-USD/);
+    expect(signal.liveSkipReason).toMatch(/spot only — no perp listed for ADA-USD/);
   });
 
   it('annotates the signal when no spendable cash is available', async () => {
@@ -461,11 +464,13 @@ describe('CryptoLiveAccount skip-reason annotation (TRA-243)', () => {
 });
 
 describe('CryptoLiveAccount structured LiveSkip channel (TRA-249-B)', () => {
-  it('emits a structured LiveSkip on the spot-only SELL guard and never reaches placeMarketOrder', async () => {
+  it('emits a structured LiveSkip on the spot-only SELL guard for non-perp symbols and never reaches placeMarketOrder', async () => {
     const { account, coinbase } = buyAccount(50_000);
     await account.refreshBalance();
 
-    const signal = buildSignal({ side: 'sell', stopLoss: 30_300, takeProfit: 29_100 });
+    // ADA-USD is intentionally NOT in PERP_SHORTS_UNIVERSE so the SELL falls
+    // through to the spot-only skip rather than the TRA-264 perp short path.
+    const signal = buildSignal({ symbol: 'ADA-USD', side: 'sell', stopLoss: 30_300, takeProfit: 29_100 });
     const before = Date.now();
     const pos = await account.openPosition(signal, 30_000);
 
@@ -474,9 +479,9 @@ describe('CryptoLiveAccount structured LiveSkip channel (TRA-249-B)', () => {
     const skips = account.getRecentSkips();
     expect(skips).toHaveLength(1);
     expect(skips[0]).toMatchObject({
-      symbol: 'BTC-USD',
+      symbol: 'ADA-USD',
       side: 'sell',
-      reason: 'spot only — no perp listed for BTC-USD',
+      reason: 'spot only — no perp listed for ADA-USD',
     });
     expect(skips[0].at).toBeGreaterThanOrEqual(before);
     // Aggregate channel surfaces via getState too, with a defensive copy.
@@ -797,5 +802,344 @@ describe('CryptoLiveAccount qty quantization end-to-end (TRA-243)', () => {
     // Legacy fallback path: Math.round(qty * 1e6) / 1e6 — never more than 6 decimals.
     const decimals = sent.toString().split('.')[1]?.length ?? 0;
     expect(decimals).toBeLessThanOrEqual(6);
+  });
+});
+
+// TRA-264 — perp short routing through CryptoLiveAccount. Strategy-side
+// gates (universe / §5 filters) live in `crypto-engine.applyShortGates` and
+// stamp `signalSkipReason` BEFORE openPosition is called; openPosition's
+// SELL fork takes over from there to size, cap-check, and submit the perp
+// order. These tests pin the contract end-to-end at the live-account layer.
+function buildShortSignal(overrides: Partial<TradeSignal> = {}): TradeSignal {
+  // Short setup: stop above entry (5%), take-profit below. The 5% stop
+  // matches the spec ATR-band realism — tighter test stops would trip the
+  // §6 single-symbol cap before any other gate, swamping every assertion
+  // about the perp short path with a generic cap-skip.
+  return buildSignal({
+    symbol: 'BTC-USD',
+    side: 'sell',
+    entryPrice: 30_000,
+    stopLoss: 31_500,
+    takeProfit: 28_500,
+    ...overrides,
+  });
+}
+
+describe('CryptoLiveAccount perp short routing (TRA-264)', () => {
+  it('routes a non-suppressed BTC-USD short through placeMarketOrder with leverage/marginType/positionSide', async () => {
+    const { account, coinbase } = buyAccount(50_000);
+    await account.refreshBalance();
+
+    coinbase.placeMarketOrder.mockResolvedValueOnce(orderSuccess('o-perp', 'SELL'));
+    coinbase.getOrder.mockResolvedValueOnce(
+      orderDetails({ order_id: 'o-perp', side: 'SELL', status: 'FILLED', average_filled_price: '30000', filled_size: '0.0005' }),
+    );
+
+    const signal = buildShortSignal();
+    const pos = await account.openPosition(signal, 30_000);
+
+    expect(pos).not.toBeNull();
+    expect(pos!.side).toBe('sell');
+    expect(pos!.symbol).toBe('BTC-USD');
+    expect(coinbase.placeMarketOrder).toHaveBeenCalledTimes(1);
+    const calls = coinbase.placeMarketOrder.mock.calls as unknown as Array<[{
+      productId: string;
+      side: 'buy' | 'sell';
+      baseSize: number;
+      leverage?: number;
+      marginType?: 'ISOLATED' | 'CROSS';
+      positionSide?: 'LONG' | 'SHORT';
+    }]>;
+    expect(calls[0]![0]).toMatchObject({
+      productId: 'BTC-USD',
+      side: 'sell',
+      leverage: 1,
+      marginType: 'ISOLATED',
+      positionSide: 'SHORT',
+    });
+    expect(signal.liveSkipReason).toBeUndefined();
+    expect(signal.signalSkipReason).toBeUndefined();
+  });
+
+  it('uses the Tier-2 risk fraction (0.30%) for DOGE-USD shorts', async () => {
+    // Tier-1 (BTC) sizes at 0.50% of managed equity; Tier-2 (DOGE) at 0.30%.
+    // Same equity + stop distance ratio → Tier-2 quantity is 0.30/0.50 = 0.6×
+    // Tier-1's. The risk knob also collapses to 1% of total equity for the
+    // long-side baseline; we pin the actual Tier-2 result to make sure the
+    // override is in effect (regression: any future drift to long-side risk
+    // would silently size DOGE shorts up by 67%).
+    const { account, coinbase } = buyAccount(100_000);
+    await account.refreshBalance();
+
+    coinbase.placeMarketOrder.mockResolvedValueOnce(orderSuccess('o-doge', 'SELL'));
+    coinbase.getOrder.mockResolvedValueOnce(
+      orderDetails({ order_id: 'o-doge', side: 'SELL', status: 'FILLED', average_filled_price: '0.10', filled_size: '15000' }),
+    );
+
+    const signal = buildShortSignal({ symbol: 'DOGE-USD', entryPrice: 0.10, stopLoss: 0.105, takeProfit: 0.09 });
+    await account.openPosition(signal, 0.10);
+
+    const calls = coinbase.placeMarketOrder.mock.calls as unknown as Array<[{ baseSize: number; positionSide?: 'LONG' | 'SHORT' }]>;
+    const sent = calls[0]![0];
+    // Risk per trade for Tier-2 = managedEquity × 0.003 = 50_000 × 0.003 = 150
+    // Stop distance = 0.005 → qty = 150 / 0.005 = 30_000. Cap by managedEquity
+    // at 1× leverage: 50_000 / 0.10 = 500_000 (no cap). Tier-1 would have been
+    // 50_000 × 0.005 / 0.005 = 50_000 (vs 30_000 here).
+    expect(sent.baseSize).toBeCloseTo(30_000, 0);
+    expect(sent.positionSide).toBe('SHORT');
+  });
+
+  it('routes a non-perp-universe sell through the spot-only skip (regression on perp gating)', async () => {
+    // ETH is in the universe, but ADA-USD is not. The TRA-249-B fallback
+    // must hold for non-perp symbols even after TRA-264 wires the perp path.
+    const { account, coinbase } = buyAccount(50_000);
+    await account.refreshBalance();
+
+    const signal = buildShortSignal({ symbol: 'ADA-USD', entryPrice: 1, stopLoss: 1.05, takeProfit: 0.9 });
+    const pos = await account.openPosition(signal, 1);
+
+    expect(pos).toBeNull();
+    expect(coinbase.placeMarketOrder).not.toHaveBeenCalled();
+    expect(signal.liveSkipReason).toMatch(/spot only — no perp listed for ADA-USD/);
+    // Spot-only fallback uses liveSkipReason (broker-side guard), not signalSkipReason.
+    expect(signal.signalSkipReason).toBeUndefined();
+  });
+
+  it('emits "total short notional cap" via signalSkipReason when the candidate breaches the 30% ceiling', async () => {
+    // Seed enough open shorts that the candidate would push total short
+    // notional past 30% of equity. We hand-craft positions via the BUY path
+    // and then submit a short; CryptoLiveAccount sums any side==='sell'
+    // entries in the positions map regardless of how they were created.
+    const { account, coinbase } = buyAccount(10_000);
+    await account.refreshBalance();
+    // Open a fake spot LONG just to confirm it is NOT counted in the
+    // short-notional sum (a regression guard would have us count both
+    // sides).
+    coinbase.placeMarketOrder.mockResolvedValueOnce(orderSuccess('o-long'));
+    coinbase.getOrder.mockResolvedValueOnce(
+      orderDetails({ order_id: 'o-long', status: 'FILLED', average_filled_price: '30000', filled_size: '0.05' }),
+    );
+    await account.openPosition(buildSignal({ symbol: 'BTC-USD' }), 30_000);
+
+    // Open three perp shorts on different symbols at $1_000 notional each so
+    // total open-short notional is $3_000 (30% of $10k equity). Now the cap
+    // is at the boundary; the next candidate's notional pushes us over.
+    const seedShortsAt = async (symbol: string, orderId: string) => {
+      coinbase.placeMarketOrder.mockResolvedValueOnce(orderSuccess(orderId, 'SELL'));
+      coinbase.getOrder.mockResolvedValueOnce(
+        orderDetails({ order_id: orderId, side: 'SELL', status: 'FILLED', average_filled_price: '100', filled_size: '10' }),
+      );
+      await account.openPosition(
+        buildShortSignal({ id: orderId, symbol, entryPrice: 100, stopLoss: 105, takeProfit: 90 }),
+        100,
+      );
+    };
+    await seedShortsAt('ETH-USD', 'o-eth');
+    await seedShortsAt('SOL-USD', 'o-sol');
+    await seedShortsAt('XRP-USD', 'o-xrp');
+
+    coinbase.placeMarketOrder.mockClear();
+    coinbase.getOrder.mockClear();
+
+    const signal = buildShortSignal({ id: 'sig-cap', symbol: 'BTC-USD', entryPrice: 100, stopLoss: 105, takeProfit: 90 });
+    const pos = await account.openPosition(signal, 100);
+
+    expect(pos).toBeNull();
+    expect(coinbase.placeMarketOrder).not.toHaveBeenCalled();
+    expect(signal.signalSkipReason).toBe('total short notional cap');
+    const skips = account.getRecentSkips();
+    expect(skips[skips.length - 1]).toMatchObject({
+      symbol: 'BTC-USD',
+      side: 'sell',
+      reason: 'total short notional cap',
+    });
+  });
+
+  it('emits "single-symbol short cap" before the cross-strategy or total caps fire', async () => {
+    // Single-symbol cap is per-strategy at 15% of strategy equity. Build a
+    // ~$30k equity account so 15% = $4_500. Open one $5_000 BTC short on
+    // strategy A, then submit a second BTC short on the same strategy (same
+    // signalType → same strategy proxy in the live account's accounting).
+    // managedEquity = totalEquity × 0.5 (default ratio) = 15_000, single-
+    // symbol limit = 15_000 × 0.15 = 2_250. Even one $5_000 short already
+    // breaches; we pin the order specifically.
+    const { account, coinbase } = buyAccount(30_000);
+    await account.refreshBalance();
+
+    // First short establishes the strategy×symbol open notional.
+    coinbase.placeMarketOrder.mockResolvedValueOnce(orderSuccess('o-1', 'SELL'));
+    coinbase.getOrder.mockResolvedValueOnce(
+      orderDetails({ order_id: 'o-1', side: 'SELL', status: 'FILLED', average_filled_price: '500', filled_size: '10' }),
+    );
+    // entryPrice 500 × qty 10 = $5_000 notional.
+    await account.openPosition(
+      buildShortSignal({ id: 'sig-1', type: 'momentum', entryPrice: 500, stopLoss: 525, takeProfit: 450 }),
+      500,
+    );
+
+    coinbase.placeMarketOrder.mockClear();
+
+    // Second momentum BTC short — same strategy, same symbol → single-symbol
+    // cap fires before cross-strategy (still under 20% × 30k = 6_000) and
+    // total (still under 30% × 30k = 9_000) caps would.
+    const signal = buildShortSignal({ id: 'sig-2', type: 'momentum', entryPrice: 500, stopLoss: 525, takeProfit: 450 });
+    const pos = await account.openPosition(signal, 500);
+
+    expect(pos).toBeNull();
+    expect(coinbase.placeMarketOrder).not.toHaveBeenCalled();
+    expect(signal.signalSkipReason).toBe('single-symbol short cap');
+  });
+
+  it('flags BTC-USD shorts via daily short circuit breaker when realised short P&L crosses -2% equity', async () => {
+    // Stand up an account, manually drive realisedShortPnlToday past the
+    // -2% × equity threshold by closing a losing short via checkExits, then
+    // confirm the next short is suppressed.
+    const { account, coinbase } = buyAccount(100_000);
+    await account.refreshBalance();
+
+    // Open a short.
+    coinbase.placeMarketOrder.mockResolvedValueOnce(orderSuccess('o-open', 'SELL'));
+    coinbase.getOrder.mockResolvedValueOnce(
+      orderDetails({ order_id: 'o-open', side: 'SELL', status: 'FILLED', average_filled_price: '30000', filled_size: '0.1' }),
+    );
+    await account.openPosition(buildShortSignal(), 30_000);
+
+    // Force the short to stop out at price 30_500 → loss of (30_500-30_000)×0.1 = $50
+    // negated for sell side → -$50. Not enough to trip alone, but we'll repeat.
+    // Instead, close at a price that maps to a -$2_500 loss (>2% × 100k).
+    // pnl = (exitPrice - entry) × qty × (-1) for sell side.
+    // Want pnl <= -2_000 → exitPrice >= entry + 2_000/qty = 30_000 + 20_000 = 50_000.
+    coinbase.closeFuturesPosition.mockResolvedValueOnce(orderSuccess('o-close', 'BUY'));
+    coinbase.getOrder.mockResolvedValueOnce(
+      orderDetails({ order_id: 'o-close', side: 'BUY', status: 'FILLED', average_filled_price: '50000', filled_size: '0.1' }),
+    );
+    const closed = await account.checkExits(new Map([['BTC-USD', 50_000]]));
+    expect(closed).toHaveLength(1);
+    expect(closed[0].pnl).toBeCloseTo(-2_000, 6);
+
+    coinbase.placeMarketOrder.mockClear();
+
+    // Next short — daily circuit breaker should trip (-2_000 / 100_000 = -2%
+    // is exactly the threshold; spec wording is "≤ -2%" which includes the
+    // boundary). The signal carries signalSkipReason and order is NOT placed.
+    const signal = buildShortSignal({ id: 'sig-cb', symbol: 'ETH-USD', entryPrice: 2_000, stopLoss: 2_020, takeProfit: 1_900 });
+    const pos = await account.openPosition(signal, 2_000);
+
+    expect(pos).toBeNull();
+    expect(coinbase.placeMarketOrder).not.toHaveBeenCalled();
+    expect(signal.signalSkipReason).toBe('daily short circuit breaker tripped');
+  });
+
+  it('routes short exits through closeFuturesPosition with positionSide=SHORT (not placeMarketOrder)', async () => {
+    const { account, coinbase } = buyAccount(50_000);
+    await account.refreshBalance();
+
+    coinbase.placeMarketOrder.mockResolvedValueOnce(orderSuccess('o-open', 'SELL'));
+    coinbase.getOrder.mockResolvedValueOnce(
+      orderDetails({ order_id: 'o-open', side: 'SELL', status: 'FILLED', average_filled_price: '30000', filled_size: '0.001' }),
+    );
+    await account.openPosition(buildShortSignal({ takeProfit: 29_000 }), 30_000);
+
+    coinbase.placeMarketOrder.mockClear();
+    coinbase.closeFuturesPosition.mockResolvedValueOnce(orderSuccess('o-close', 'BUY'));
+    coinbase.getOrder.mockResolvedValueOnce(
+      orderDetails({ order_id: 'o-close', side: 'BUY', status: 'FILLED', average_filled_price: '28950', filled_size: '0.001' }),
+    );
+
+    // Hits TP at 28_500 (price < TP → triggers tp).
+    const closed = await account.checkExits(new Map([['BTC-USD', 28_500]]));
+    expect(closed).toHaveLength(1);
+    // Realized pnl = (entry - exit) × qty for short = (30_000 - 28_950) × 0.001 = 1.05
+    expect(closed[0].pnl).toBeCloseTo(1.05, 6);
+
+    // closeFuturesPosition got the call, NOT placeMarketOrder.
+    expect(coinbase.closeFuturesPosition).toHaveBeenCalledTimes(1);
+    expect(coinbase.placeMarketOrder).not.toHaveBeenCalled();
+    const calls = coinbase.closeFuturesPosition.mock.calls as unknown as Array<[{
+      productId: string;
+      positionSide: 'LONG' | 'SHORT';
+      baseSize: number;
+      leverage?: number;
+      marginType?: 'ISOLATED' | 'CROSS';
+    }]>;
+    expect(calls[0]![0]).toMatchObject({
+      productId: 'BTC-USD',
+      positionSide: 'SHORT',
+      leverage: 1,
+      marginType: 'ISOLATED',
+    });
+  });
+
+  it('does not debit cashUsd on perp short open (margin lives in INTX, not the spot wallet)', async () => {
+    const { account, coinbase } = buyAccount(50_000);
+    await account.refreshBalance();
+    const cashBefore = account.getState().availableCash;
+
+    coinbase.placeMarketOrder.mockResolvedValueOnce(orderSuccess('o-perp', 'SELL'));
+    coinbase.getOrder.mockResolvedValueOnce(
+      orderDetails({ order_id: 'o-perp', side: 'SELL', status: 'FILLED', average_filled_price: '30000', filled_size: '0.001' }),
+    );
+
+    await account.openPosition(buildShortSignal(), 30_000);
+
+    // Spot USD wallet untouched — refreshBalance() will reconcile both spot
+    // and (via separate plumbing in TRA-262) the INTX margin slice.
+    expect(account.getState().availableCash).toBe(cashBefore);
+  });
+
+  it('keeps the BUY path byte-identical (regression: order body unchanged for spot longs)', async () => {
+    const { account, coinbase } = buyAccount(50_000);
+    await account.refreshBalance();
+
+    coinbase.placeMarketOrder.mockResolvedValueOnce(orderSuccess('o-buy'));
+    coinbase.getOrder.mockResolvedValueOnce(
+      orderDetails({ order_id: 'o-buy', status: 'FILLED', average_filled_price: '30000', filled_size: '0.001' }),
+    );
+
+    const signal = buildSignal();
+    await account.openPosition(signal, 30_000);
+
+    const calls = coinbase.placeMarketOrder.mock.calls as unknown as Array<[Record<string, unknown>]>;
+    const params = calls[0]![0];
+    // Pre-TRA-264 fields only — no leverage / marginType / positionSide.
+    expect(params).toMatchObject({ productId: 'BTC-USD', side: 'buy' });
+    expect(params).not.toHaveProperty('leverage');
+    expect(params).not.toHaveProperty('marginType');
+    expect(params).not.toHaveProperty('positionSide');
+  });
+
+  it('rolloverDay clears realizedShortPnlToday so the §7 circuit breaker resets at UTC day boundary', async () => {
+    const { account, coinbase } = buyAccount(100_000);
+    await account.refreshBalance();
+
+    // Open + close a losing short to seed realizedShortPnlToday with -$2_500.
+    coinbase.placeMarketOrder.mockResolvedValueOnce(orderSuccess('o-open', 'SELL'));
+    coinbase.getOrder.mockResolvedValueOnce(
+      orderDetails({ order_id: 'o-open', side: 'SELL', status: 'FILLED', average_filled_price: '30000', filled_size: '0.1' }),
+    );
+    await account.openPosition(buildShortSignal(), 30_000);
+    coinbase.closeFuturesPosition.mockResolvedValueOnce(orderSuccess('o-close', 'BUY'));
+    coinbase.getOrder.mockResolvedValueOnce(
+      orderDetails({ order_id: 'o-close', side: 'BUY', status: 'FILLED', average_filled_price: '55000', filled_size: '0.1' }),
+    );
+    await account.checkExits(new Map([['BTC-USD', 55_000]]));
+
+    // Pre-rollover: a fresh short should be blocked.
+    const blocked = buildShortSignal({ id: 'b' });
+    expect(await account.openPosition(blocked, 30_000)).toBeNull();
+    expect(blocked.signalSkipReason).toBe('daily short circuit breaker tripped');
+
+    account.rolloverDay();
+
+    // Post-rollover: same parameters → not blocked. Mock the order so the
+    // open succeeds.
+    coinbase.placeMarketOrder.mockResolvedValueOnce(orderSuccess('o-fresh', 'SELL'));
+    coinbase.getOrder.mockResolvedValueOnce(
+      orderDetails({ order_id: 'o-fresh', side: 'SELL', status: 'FILLED', average_filled_price: '30000', filled_size: '0.001' }),
+    );
+    const fresh = buildShortSignal({ id: 'f' });
+    const pos = await account.openPosition(fresh, 30_000);
+    expect(pos).not.toBeNull();
+    expect(fresh.signalSkipReason).toBeUndefined();
   });
 });
