@@ -119,6 +119,17 @@ export const SKIP_PARKED_1D_DAILY = 'parked — failed §8 daily';
  * other off-spec 4H emission reaches sizing.
  */
 export const SKIP_PARKED_4H_LAYER12 = 'parked — failed §8 4H Layer 1+2';
+/**
+ * TRA-255 r9 §4.4 Layer 3 v3 / §8.3 — Phase-1.1 4H universe is reduced to
+ * `['SOL-USD','DOGE-USD']` after the v2 §8 4H sweep failed three of five
+ * acceptance bars. BTC-USD / ETH-USD / XRP-USD are parked on 4H and any short
+ * signal generated against 4H bars on those symbols is suppressed with this
+ * reason so the §8 sidecar surfaces the explicit park instead of a generic
+ * not-in-universe drop. Re-enablement protocol per §8.3 clause 1: a future
+ * funding-active sweep that moves a parked symbol out of the §8 PARK streak
+ * triggers spec amendment to re-include the symbol.
+ */
+export const SKIP_PARKED_4H_R9 = 'parked — failed §8 4H r9';
 
 // ── Filter thresholds (TRA-255 §5) ─────────────────────────────────────────
 

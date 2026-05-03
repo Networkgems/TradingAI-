@@ -125,6 +125,7 @@ export {
   SKIP_MAX_CONCURRENT_SHORTS,
   SKIP_PARKED_1D_DAILY,
   SKIP_PARKED_4H_LAYER12,
+  SKIP_PARKED_4H_R9,
   isPerpShortSymbol,
   isTier2PerpShort,
   perpShortRiskFraction,

@@ -18,12 +18,17 @@
  * The pre-route gate stack mirrors `crypto-engine.applyShortGates`:
  *
  *   1. Universe (all 5 symbols are members → always passes; kept for parity)
- *   2. BTC regime overlay via `evaluateShortFilters` (BTC's own router supplies
- *      the post-hysteresis label; funding/spread/OI undefined since the data
- *      feed isn't wired — TRA-255 §5 explicitly allows skipping)
- *   3. `evaluateShortBookCaps` (per-symbol cooldown + book-wide
+ *   2. r9 4H park gate (TRA-287): on `--granularity=4h`, signals on symbols
+ *      outside `byTimeframe['4h'].universe` (BTC/ETH/XRP under r9) are
+ *      suppressed with `SKIP_PARKED_4H_R9` before §5 — the more specific
+ *      diagnosis dominates a coincident funding/regime fail.
+ *   3. BTC regime + funding gate via `evaluateShortFilters` (BTC's own router
+ *      supplies the post-hysteresis label; funding-rate per-hour now sourced
+ *      from Binance USD-M futures funding history via `funding-feed.ts`;
+ *      spread/OI remain undefined per TRA-255 §5 best-effort).
+ *   4. `evaluateShortBookCaps` (per-symbol cooldown + book-wide
  *      MAX_CONCURRENT_SHORTS)
- *   4. `evaluateShortNotionalCaps` (single-symbol / cross-strategy / total)
+ *   5. `evaluateShortNotionalCaps` (single-symbol / cross-strategy / total)
  *
  * Position lifecycle uses the same per-side trail / time-stop helpers the
  * runner already calls in `runner.ts` (TRA-261 wiring): `momentumTrailStop`
@@ -35,14 +40,17 @@
  * here are *not* used for parameter selection — they're a sanity ground for
  * the rolling cadence (per-window metrics are reported on the test slice).
  *
- * Sensitivity sweep: ±20% on FUNDING_GATE_THRESHOLD_PER_HOUR (annotated as a
- * no-op until the funding feed lands), regime hysteresis flipBars, and every
- * ATR multiplier in `paramsByDirection.short` (Momentum stop 2.0×, Breakout
- * stop 1.75×, Breakout TP 3.0×). Acceptance bars (§8):
+ * Sensitivity sweep: ±20% on FUNDING_GATE_THRESHOLD_PER_HOUR (annotated as
+ * lives-on-engine-constant; the gate itself is wired and active under
+ * TRA-287), regime hysteresis flipBars, and every ATR multiplier in
+ * `paramsByDirection.short` (Momentum stop 2.0×, Breakout stop 1.75×,
+ * Breakout TP 3.0×). Acceptance bars (§8 r9):
  *
- *   - per-window expectancy ≥ +0.10 R/trade (universe rollup)
- *   - per-window hit rate ≥ 35% (universe rollup)
+ *   - per-window expectancy ≥ +0.10 R/trade (SOL+DOGE rollup)
+ *   - per-window hit rate ≥ 35% (SOL+DOGE rollup)
  *   - rolling-90d short-book max DD ≤ 8%
+ *   - ≥ 4 trades per window
+ *   - ≥ 6 / 9 windows pass the above on the rollup (TRA-287)
  *
  * Run:
  *   pnpm --filter @trading-app/backtest exec tsx src/run-tra261-sweep.ts
@@ -63,6 +71,7 @@ import {
   PERP_SHORTS_UNIVERSE,
   RegimeDetector,
   SKIP_PARKED_1D_DAILY,
+  SKIP_PARKED_4H_R9,
   StrategyRouter,
   advanceExtreme,
   breakoutTrailOptionsFor,
@@ -84,6 +93,7 @@ import {
 } from '@trading-app/engine';
 import type { Candle, ExitReason, Position, TradeSignal } from '@trading-app/shared';
 import { loadOrFetch4hBars, loadOrFetchDailyBars } from './fetch-tra266-data.js';
+import { loadOrFetchFunding, lookupFundingPerHour, type FundingPoint } from './funding-feed.js';
 
 const HERE = dirname(fileURLToPath(import.meta.url));
 const REPORT_DIR = resolve(HERE, '..', 'reports');
@@ -147,6 +157,13 @@ const DIAGNOSTIC_BTC_RSI_BRACKET_EMITTED = 'diagnostic — btc-rsi-bracket emitt
  * Spec values for §4 short overrides. These mirror `crypto-engine.getRouter`
  * exactly — the harness reads from this single record so a sensitivity
  * perturbation can override one knob without forking the router config.
+ *
+ * TRA-287 / TRA-255 r9 §4.4 Layer 3 v3 / §8.3 — `byTimeframe['4h']` carries
+ * the timeframe-scoped universe and the cascade-density flag list. The 4H
+ * harness routes only `byTimeframe['4h'].universe` symbols through the
+ * cascade-leg trigger; everything else in `PERP_SHORTS_UNIVERSE` is parked
+ * with `SKIP_PARKED_4H_R9`. The 1D and long-side paths do not consult
+ * `byTimeframe` (regression: `byTimeframe` is a strict additive field).
  */
 interface ShortSpec {
   momentum: {
@@ -183,6 +200,19 @@ interface ShortSpec {
     consolidationBars?: number;
   };
   regime?: RegimeDetectorOptions;
+  byTimeframe?: {
+    '4h'?: {
+      /** Symbols cleared to route through the 4H cascade-leg trigger (r9). */
+      universe: readonly string[];
+      /**
+       * Symbols whose cascade-density input is below the §4.4 floor; the r7
+       * cascade trigger deweights them. Empty under r9 — the v2 list was
+       * vacated when the universe contracted to SOL+DOGE (§8.3 Phase-1.1
+       * decision).
+       */
+      lowCascadeDensitySymbols: readonly string[];
+    };
+  };
 }
 
 // TRA-278 / TRA-255 §4.4 r7 (2026-05-03) — Phase-1.1 4H Layer 3 cascade-trigger
@@ -231,6 +261,12 @@ const BASELINE_SPEC: ShortSpec = {
   },
   regime: {
     flipBars: 2,
+  },
+  byTimeframe: {
+    '4h': {
+      universe: ['SOL-USD', 'DOGE-USD'],
+      lowCascadeDensitySymbols: [],
+    },
   },
 };
 
@@ -380,6 +416,13 @@ interface SimInput {
    * 4H — same code path, different operator-facing meaning).
    */
   granularity: Granularity;
+  /**
+   * Per-symbol historical funding-rate series. Empty map = funding feed not
+   * loaded (gate stays best-effort skipped). Built once per sweep by `main`
+   * via `loadOrFetchFunding` and reused across every walk-forward window so
+   * 4-year history is fetched once, not 9 × 11 = 99 times.
+   */
+  fundingBySymbol: Map<string, FundingPoint[]>;
 }
 
 /**
@@ -542,9 +585,27 @@ function runShortSim(input: SimInput): SimReport {
         continue;
       }
 
-      // §5 multiplicative filters. Only BTC regime is wired; funding / spread /
-      // OI feeds aren't yet plumbed for the harness (TRA-255 §5 explicitly
-      // allows skipping with TODOs).
+      // TRA-287 / TRA-255 r9 §4.4 v3 — Phase-1.1 4H is reduced to SOL+DOGE
+      // after the v2 §8 4H sweep failed three of five acceptance bars on
+      // BTC/ETH/XRP. Same precedence rule as the 1D park: emit the more
+      // specific park diagnosis before §5 filters so a parked symbol with
+      // also-failing funding still tallies as parked. Runs before the Layer 2
+      // MA200 lookup since a r9-parked symbol shouldn't pay that compute.
+      if (input.granularity === '4h') {
+        const r9Universe = input.spec.byTimeframe?.['4h']?.universe;
+        if (r9Universe && !r9Universe.includes(signal.symbol)) {
+          bumpSkip(SKIP_PARKED_4H_R9);
+          continue;
+        }
+      }
+
+      // §5 multiplicative filters. BTC regime + funding rate + Layer 2 BTC
+      // MA200 slope flag are wired; spread and OI feeds remain unwired for
+      // the harness (TRA-255 §5 explicitly allows skipping with TODOs —
+      // those feeds are auth-only via TRA-262 and have no historical public
+      // source). Funding is sourced from Binance USD-M futures (see
+      // `funding-feed.ts`); empty history → lookup returns undefined →
+      // gate stays best-effort skipped per spec §5.
       //
       // §4.4 r5 Layer 2 — compute BTC's daily MA200 5-bar slope flag from the
       // pre-computed daily series so the BTC alt-overlay gate is "real
@@ -553,9 +614,12 @@ function runShortSim(input: SimInput): SimReport {
       const btcDailyMa200SlopePositive = btcDailyMa200
         ? btcDailyMa200SlopePositiveOver5DailyBarsAt(btcDailyMa200, ts)
         : undefined;
+      const fundingHistory = input.fundingBySymbol.get(signal.symbol) ?? [];
+      const fundingRatePerHour = lookupFundingPerHour(fundingHistory, ts);
       const ctx: ShortFilterContext = {
         btcRegime,
         btcDailyMa200SlopePositiveOver5DailyBars: btcDailyMa200SlopePositive,
+        fundingRatePerHour,
       };
       const filterReason = evaluateShortFilters(signal, ctx);
       if (filterReason) {
@@ -857,6 +921,7 @@ function sliceCandles(
 interface WalkForwardInput {
   spec: ShortSpec;
   fullByPair: Map<string, Candle[]>;
+  fundingBySymbol: Map<string, FundingPoint[]>;
   trainBars: number;
   testBars: number;
   stepBars: number;
@@ -893,7 +958,7 @@ function runWalkForward(input: WalkForwardInput): WalkForwardOutput {
       // opened inside the test window. Filter trades on close timestamp below.
       sliceMap.set(sym, sliceCandles(all, win.trainStart, win.testEnd));
     }
-    const sim = runShortSim({ spec: input.spec, candlesBySymbol: sliceMap, granularity: input.granularity });
+    const sim = runShortSim({ spec: input.spec, candlesBySymbol: sliceMap, granularity: input.granularity, fundingBySymbol: input.fundingBySymbol });
 
     // Test slice timestamps for filtering trades + equity.
     const sampleSym = symbols[0];
@@ -957,6 +1022,10 @@ function universeMetrics(
 
   const reasons: string[] = [];
   if (trades.length === 0) reasons.push('no trades in window');
+  // TRA-287 / TRA-255 r9 §4.4 — ≥4 trades per window is a §8 acceptance bar
+  // on the SOL+DOGE rollup; thinly-populated windows mask either pass or
+  // fail under sample noise so we treat <4 trades as a per-window fail.
+  if (trades.length > 0 && trades.length < 4) reasons.push(`only ${trades.length} trade(s) in window < 4`);
   if (expectancy < 0.10) reasons.push(`expectancy ${expectancy.toFixed(3)}R < 0.10R`);
   if (hitRatePct < 35) reasons.push(`hit rate ${hitRatePct.toFixed(1)}% < 35%`);
   if (rollingDD > 8) reasons.push(`rolling-90d DD ${rollingDD.toFixed(2)}% > 8%`);
@@ -1027,9 +1096,15 @@ function clone(spec: ShortSpec): ShortSpec {
 
 const SWEEP_KNOBS: SweepKnob[] = [
   {
+    // TRA-287 — funding feed is wired (see `funding-feed.ts`). The threshold
+    // itself lives on `FUNDING_GATE_THRESHOLD_PER_HOUR` in `@trading-app/engine`,
+    // not on `ShortSpec`, so a per-spec perturbation here would have no
+    // effect — the harness keeps a no-op apply but drops the no-op note since
+    // the gate is now active. Threshold sensitivity is exercised by editing
+    // the engine constant if QuantTrader needs to walk it.
     label: 'FUNDING_GATE_THRESHOLD_PER_HOUR',
-    noopReason: 'funding feed unwired in TRA-266 harness — gate is skipped per TRA-255 §5',
-    apply: (spec) => clone(spec), // no-op while funding feed is undefined
+    noopReason: 'threshold lives on engine constant, not ShortSpec — gate itself is active via Binance funding feed (TRA-287)',
+    apply: (spec) => clone(spec),
   },
   {
     label: 'regime hysteresis flipBars',
@@ -1119,13 +1194,15 @@ function buildReport(
   symbols: string[],
   fullByPair: Map<string, Candle[]>,
   granularity: Granularity,
+  fundingBySymbol: Map<string, FundingPoint[]>,
 ): string {
   const sizing = WINDOW_SIZING[granularity];
   const barLabel = granularity === '1d' ? 'd' : granularity;
   const lines: string[] = [];
+  const fundingActive = [...fundingBySymbol.values()].some((h) => h.length > 0);
   const titleSuffix = granularity === '1d'
     ? ' (1D parked baseline — TRA-255 r3 §8.1)'
-    : ' (4H Phase-1.1 — TRA-255 r7 §4.4 Layer 3)';
+    : ` (4H Phase-1.1 r9 — TRA-255 r9 §4.4 v3 / §8.3, funding gate ${fundingActive ? 'active' : 'wired but data unavailable'})`;
   lines.push(`# TRA-266 — §8 Walk-Forward Sweep Report${titleSuffix}\n`);
   lines.push(`Generated: ${new Date().toISOString()}\n`);
   lines.push(`Granularity: ${granularity}`);
@@ -1135,6 +1212,14 @@ function buildReport(
   lines.push(`Walk-forward: train=${sizing.trainBars}${barLabel}, test=${sizing.testBars}${barLabel}, step=${sizing.testBars}${barLabel}, windows=${baselineWf.windows.length}\n`);
   if (granularity === '1d') {
     lines.push('> **Parked baseline.** Per TRA-255 r3 §8.1 every 1D short emission is suppressed with `parked — failed §8 daily` before sizing. Trade counts here are expected to be 0; the report exists so the parked decision is auditable.\n');
+  } else {
+    const r9 = baselineWf.windows.length > 0 ? BASELINE_SPEC.byTimeframe?.['4h'] : undefined;
+    if (r9) {
+      const fundingNote = fundingActive
+        ? 'The §5.1 funding gate is wired against the Binance USD-M futures funding history (cached locally, ~8h resolution / ÷ 8 → per-hour) — see `packages/backtest/src/funding-feed.ts` for the Coinbase INTX vs Binance basis rationale.'
+        : '**Funding gate skipped on this run** — the public Binance USD-M `fundingRate` endpoint returns HTTP 451 from US-based IPs (geoblocked per Binance ToS §b). The harness handles this gracefully (empty history → `lookupFundingPerHour` returns undefined → `evaluateShortFilters` treats the gate as best-effort skipped per TRA-255 §5). Skip-reason histogram tells the truth: zero funding-gate skips. Use the OKX-sourced funding feed (TRA-287 follow-up) when the funding-active acceptance bar matters.';
+      lines.push(`> **r9 universe (TRA-287).** 4H routing reduced to \`${r9.universe.join(', ')}\` per TRA-255 r9 §4.4 Layer 3 v3. BTC-USD / ETH-USD / XRP-USD are parked with \`parked — failed §8 4H r9\`. ${fundingNote}\n`);
+    }
   }
 
   // ── Baseline acceptance summary ──────────────────────────────────────
@@ -1219,14 +1304,20 @@ function buildReport(
   }
 
   // ── Decision ─────────────────────────────────────────────────────────
-  const passAll = baselineWf.perWindow.every((w) => w.metrics.passes);
+  const passingCount = baselineWf.perWindow.filter((w) => w.metrics.passes).length;
+  const totalWindows = baselineWf.perWindow.length;
+  // TRA-287 / TRA-255 r9 §4.4 — ≥6/9 windows must pass on the SOL+DOGE
+  // rollup. The 9-window denominator assumes the standard 4y span; the
+  // expression generalises: ⌈2/3⌉ of available windows.
+  const r9PassQuorum = Math.ceil((2 / 3) * totalWindows);
+  const passQuorumMet = passingCount >= r9PassQuorum;
   lines.push('## Decision\n');
   if (granularity === '1d') {
     lines.push('**PARKED** — TRA-255 r3 §8.1 baseline. Phase-1 daily is parked by design (zero opens by `SKIP_PARKED_1D_DAILY`); the failing-window count above is expected and reflects "no trades in window" only. The live evaluation track is the 4H run gated on TRA-267.');
-  } else if (passAll) {
-    lines.push('**PASS** — All §8 bars met across every walk-forward window. TRA-261 ready to ship.');
+  } else if (passQuorumMet) {
+    lines.push(`**PASS** — ${passingCount} / ${totalWindows} windows met §8 acceptance bars (quorum ${r9PassQuorum}). TRA-287 → reassign TRA-255 for QuantTrader sign-off + Phase-1.1 4H ship lift.`);
   } else {
-    lines.push('**FAIL** — One or more windows missed §8 acceptance bars. TRA-261 reassigned to QuantTrader for parameter revision per spec §8 protocol.');
+    lines.push(`**FAIL** — only ${passingCount} / ${totalWindows} windows met §8 acceptance bars (quorum ${r9PassQuorum}). r9 is the smallest spec-compliant universe; per TRA-287 routing, reassign TRA-255 to QuantTrader for Phase-1.2 timeframe / strategy-family escalation.`);
   }
   return lines.join('\n');
 }
@@ -1282,28 +1373,44 @@ async function main() {
     }
   }
 
-  // Bar series sanity check — Yahoo gives a comparable calendar across symbols on 1D.
+  // TRA-287 — load historical funding so the §5.1 gate is active in the 4H
+  // sweep. Loaded for every Phase-1 symbol (not just r9 universe) so the
+  // skip-reason histogram still tells us how often funding *would* have
+  // suppressed entries on parked symbols if r9 were widened.
+  const fundingBySymbol = new Map<string, FundingPoint[]>();
+  if (granularity === '4h') {
+    console.log(`[run-tra261-sweep] Loading historical funding ${formatWindowDate(fromMs)} → ${formatWindowDate(toMs)}…`);
+    for (const sym of PERP_SHORTS_UNIVERSE) {
+      try {
+        const points = await loadOrFetchFunding(sym, fromMs, toMs);
+        fundingBySymbol.set(sym, points);
+        console.log(`  ${sym}: ${points.length} funding intervals`);
+      } catch (err) {
+        console.warn(`  ${sym}: funding fetch FAILED — gate will be skipped (${err instanceof Error ? err.message : String(err)})`);
+        fundingBySymbol.set(sym, []);
+      }
+    }
+  }
+
+  // TRA-287 fix — XRP-USD's Coinbase 4H history starts 2023-07, not 2022-01,
+  // so unaligned positional slices in `runWalkForward` caused the prior 4H
+  // sweep to silently emit zero trades: each window's intersection across
+  // symbols was empty because BTC's slice [0, 1620) and XRP's slice [0, 1620)
+  // covered disjoint calendar dates. Truncate every symbol to the latest
+  // common start timestamp so positional indices map to the same dates across
+  // all symbols. The 1D path is unaffected (Yahoo serves a synchronised daily
+  // calendar) but we run the alignment unconditionally for consistency.
+  const startTs = Math.max(...[...fullByPair.values()].map((c) => c[0].timestamp));
+  for (const sym of fullByPair.keys()) {
+    const aligned = fullByPair.get(sym)!.filter((c) => c.timestamp >= startTs);
+    fullByPair.set(sym, aligned);
+  }
   const lengths = [...fullByPair.values()].map((c) => c.length);
   const allEqual = lengths.every((l) => l === lengths[0]);
   if (!allEqual) {
-    console.warn(`[run-tra261-sweep] symbol bar counts differ: ${[...fullByPair.entries()].map(([s, c]) => `${s}=${c.length}`).join(', ')} — aligning to common start timestamp`);
-    // TRA-275 / TRA-255 §4.4 r6 — align all symbols to the latest first-bar
-    // timestamp before windowing. The 4H walk-forward harness uses index-
-    // based slicing across the universe; without alignment, a symbol that
-    // starts later (e.g. XRP perp listed mid-2023 while BTC has bars from
-    // 2022) shifts every window's timestamp range out of sync with the
-    // others, and the per-tick `baseTimestamps` intersection collapses to
-    // empty. The earlier r4 / r5 sweeps reporting 0 trades were a victim
-    // of this misalignment, not (only) the entry-trigger gate stack —
-    // r6 lifts the alignment so the cascade-leg trigger can actually be
-    // observed firing across the universe.
-    const latestStart = Math.max(...[...fullByPair.values()].map((c) => c[0]?.timestamp ?? 0));
-    for (const [sym, bars] of fullByPair) {
-      const trimmed = bars.filter((c) => c.timestamp >= latestStart);
-      fullByPair.set(sym, trimmed);
-    }
-    const newLengths = [...fullByPair.entries()].map(([s, c]) => `${s}=${c.length}`).join(', ');
-    console.log(`[run-tra261-sweep] aligned to ${new Date(latestStart).toISOString()}: ${newLengths}`);
+    console.warn(`[run-tra261-sweep] post-alignment bar counts differ: ${[...fullByPair.entries()].map(([s, c]) => `${s}=${c.length}`).join(', ')} — investigate before trusting sweep output`);
+  } else {
+    console.log(`[run-tra261-sweep] aligned ${lengths[0]} bars per symbol from ${formatWindowDate(startTs)}`);
   }
 
   const symbols = [...PERP_SHORTS_UNIVERSE];
@@ -1313,6 +1420,7 @@ async function main() {
   const baselineWf = runWalkForward({
     spec: BASELINE_SPEC,
     fullByPair,
+    fundingBySymbol,
     trainBars: sizing.trainBars,
     testBars: sizing.testBars,
     stepBars: sizing.testBars,
@@ -1323,50 +1431,76 @@ async function main() {
   const sweep = summariseSweep({
     spec: BASELINE_SPEC,
     fullByPair,
+    fundingBySymbol,
     trainBars: sizing.trainBars,
     testBars: sizing.testBars,
     stepBars: sizing.testBars,
     granularity,
   }, baselineWf);
 
-  const report = buildReport(baselineWf, sweep, symbols, fullByPair, granularity);
+  const report = buildReport(baselineWf, sweep, symbols, fullByPair, granularity, fundingBySymbol);
   mkdirSync(REPORT_DIR, { recursive: true });
-  const reportName = granularity === '1d' ? 'tra266-sweep.md' : 'tra266-sweep-4h.md';
+  // TRA-287 — 4H sidecar uses the `tra261-sweep-4h-r9` filename per the
+  // ticket; the v2 file (`tra266-sweep-4h.md`) stays on disk as the historical
+  // failed-baseline record so QuantTrader can diff r9 against it.
+  const reportName = granularity === '1d'
+    ? 'tra266-sweep.md'
+    : 'tra261-sweep-4h-r9.md';
   const outPath = resolve(REPORT_DIR, reportName);
   writeFileSync(outPath, report);
   console.log(`\n[run-tra261-sweep] Report written: ${outPath}`);
 
   // Print acceptance summary to stdout for the harness operator.
-  const passAll = baselineWf.perWindow.every((w) => w.metrics.passes);
-  const failingCount = baselineWf.perWindow.filter((w) => !w.metrics.passes).length;
+  const passingCount = baselineWf.perWindow.filter((w) => w.metrics.passes).length;
+  const totalWindows = baselineWf.perWindow.length;
+  const r9PassQuorum = Math.ceil((2 / 3) * totalWindows);
+  const passAll = granularity === '4h'
+    ? passingCount >= r9PassQuorum
+    : baselineWf.perWindow.every((w) => w.metrics.passes);
   console.log(`\n=== TRA-266 §8 Acceptance (${granularity}) ===`);
   if (granularity === '1d') {
     console.log('Parked baseline run: every short suppressed with SKIP_PARKED_1D_DAILY. §8 numbers reflect zero opens — see TRA-255 r3 §8.1.');
+  } else {
+    const r9Universe = BASELINE_SPEC.byTimeframe?.['4h']?.universe ?? [];
+    console.log(`r9 routing universe: ${r9Universe.join(', ')} (BTC/ETH/XRP parked with SKIP_PARKED_4H_R9).`);
   }
-  console.log(`Windows passing all bars: ${baselineWf.perWindow.length - failingCount} / ${baselineWf.perWindow.length}`);
+  console.log(`Windows passing all bars: ${passingCount} / ${totalWindows}${granularity === '4h' ? ` (r9 quorum ${r9PassQuorum})` : ''}`);
   if (granularity === '1d') {
     console.log('Decision: PARKED — TRA-255 r3 §8.1 baseline. The 4H run (TRA-267) is the live evaluation track.');
   } else {
-    console.log(`Decision: ${passAll ? 'PASS — TRA-261 ready to ship' : 'FAIL — TRA-261 → QuantTrader'}`);
+    console.log(`Decision: ${passAll ? 'PASS — TRA-287 → TRA-255 (QuantTrader sign-off)' : 'FAIL — TRA-287 → TRA-255 (Phase-1.2 escalation)'}`);
   }
 
   // Emit a JSON sidecar for downstream automation (TRA-261 update, etc.).
-  const sidecarName = granularity === '1d' ? 'tra266-sweep.json' : 'tra266-sweep-4h.json';
+  const sidecarName = granularity === '1d'
+    ? 'tra266-sweep.json'
+    : 'tra261-sweep-4h-r9.json';
   const sidecarPath = resolve(REPORT_DIR, sidecarName);
+  // Aggregate skip-reason histogram (TRA-287: surfaces funding-gate impact).
+  const totalSkips: Record<string, number> = {};
+  for (const w of baselineWf.windows) {
+    for (const [k, v] of w.skipReasons) totalSkips[k] = (totalSkips[k] ?? 0) + v;
+  }
+  const r9Universe = BASELINE_SPEC.byTimeframe?.['4h']?.universe ?? null;
   writeFileSync(sidecarPath, JSON.stringify({
     generatedAt: new Date().toISOString(),
     granularity,
     universe: symbols,
+    routingUniverse: granularity === '4h' ? r9Universe : symbols,
     initialEquityUsd: INITIAL_EQUITY_USD,
     feeBps: FEE_BPS,
     slippageBps: SLIPPAGE_BPS,
     trainBars: sizing.trainBars,
     testBars: sizing.testBars,
+    fundingGate: granularity === '4h'
+      ? { source: 'binance-fapi-fundingRate', perHourFromInterval: '8h', wired: true }
+      : { wired: false, reason: 'parked baseline — gate not consulted' },
     perWindow: baselineWf.perWindow.map((w) => ({
       index: w.index,
       ...w.metrics,
       perSymbol: w.perSymbol,
     })),
+    skipReasonsTotals: totalSkips,
     sweep,
     decision: passAll ? 'PASS' : 'FAIL',
   }, null, 2));

@@ -1,0 +1,899 @@
+{
+  "generatedAt": "2026-05-03T20:43:06.381Z",
+  "granularity": "4h",
+  "universe": [
+    "BTC-USD",
+    "ETH-USD",
+    "SOL-USD",
+    "XRP-USD",
+    "DOGE-USD"
+  ],
+  "routingUniverse": [
+    "SOL-USD",
+    "DOGE-USD"
+  ],
+  "initialEquityUsd": 25000,
+  "feeBps": 40,
+  "slippageBps": 5,
+  "trainBars": 1080,
+  "testBars": 540,
+  "fundingGate": {
+    "source": "binance-fapi-fundingRate",
+    "perHourFromInterval": "8h",
+    "wired": true
+  },
+  "perWindow": [
+    {
+      "index": 0,
+      "trades": 3,
+      "winners": 0,
+      "hitRatePct": 0,
+      "expectancyR": -1.0121680522770395,
+      "totalPnlUsd": -379.6509024843483,
+      "rollingMaxDrawdownPct": 1.5499877614528943,
+      "passes": false,
+      "reasons": [
+        "only 3 trade(s) in window < 4",
+        "expectancy -1.012R < 0.10R",
+        "hit rate 0.0% < 35%"
+      ],
+      "perSymbol": [
+        {
+          "symbol": "BTC-USD",
+          "trades": 0,
+          "winners": 0,
+          "hitRatePct": 0,
+          "expectancyR": 0,
+          "totalPnlUsd": 0,
+          "maxDrawdownPct": 0
+        },
+        {
+          "symbol": "ETH-USD",
+          "trades": 0,
+          "winners": 0,
+          "hitRatePct": 0,
+          "expectancyR": 0,
+          "totalPnlUsd": 0,
+          "maxDrawdownPct": 0
+        },
+        {
+          "symbol": "SOL-USD",
+          "trades": 2,
+          "winners": 0,
+          "hitRatePct": 0,
+          "expectancyR": -1.0088047412225487,
+          "totalPnlUsd": -281.5948443816245,
+          "maxDrawdownPct": 0
+        },
+        {
+          "symbol": "XRP-USD",
+          "trades": 0,
+          "winners": 0,
+          "hitRatePct": 0,
+          "expectancyR": 0,
+          "totalPnlUsd": 0,
+          "maxDrawdownPct": 0
+        },
+        {
+          "symbol": "DOGE-USD",
+          "trades": 1,
+          "winners": 0,
+          "hitRatePct": 0,
+          "expectancyR": -1.0188946743860212,
+          "totalPnlUsd": -98.05605810272378,
+          "maxDrawdownPct": 0
+        }
+      ]
+    },
+    {
+      "index": 1,
+      "trades": 13,
+      "winners": 3,
+      "hitRatePct": 23.076923076923077,
+      "expectancyR": -0.24564493999016004,
+      "totalPnlUsd": -653.7239642563411,
+      "rollingMaxDrawdownPct": 3.5141857600600632,
+      "passes": false,
+      "reasons": [
+        "expectancy -0.246R < 0.10R",
+        "hit rate 23.1% < 35%"
+      ],
+      "perSymbol": [
+        {
+          "symbol": "BTC-USD",
+          "trades": 0,
+          "winners": 0,
+          "hitRatePct": 0,
+          "expectancyR": 0,
+          "totalPnlUsd": 0,
+          "maxDrawdownPct": 0
+        },
+        {
+          "symbol": "ETH-USD",
+          "trades": 0,
+          "winners": 0,
+          "hitRatePct": 0,
+          "expectancyR": 0,
+          "totalPnlUsd": 0,
+          "maxDrawdownPct": 0
+        },
+        {
+          "symbol": "SOL-USD",
+          "trades": 7,
+          "winners": 1,
+          "hitRatePct": 14.285714285714285,
+          "expectancyR": -0.6438081815733341,
+          "totalPnlUsd": -678.7395289672052,
+          "maxDrawdownPct": 0
+        },
+        {
+          "symbol": "XRP-USD",
+          "trades": 0,
+          "winners": 0,
+          "hitRatePct": 0,
+          "expectancyR": 0,
+          "totalPnlUsd": 0,
+          "maxDrawdownPct": 0
+        },
+        {
+          "symbol": "DOGE-USD",
+          "trades": 6,
+          "winners": 2,
+          "hitRatePct": 33.33333333333333,
+          "expectancyR": 0.21887884185687642,
+          "totalPnlUsd": 25.015564710864112,
+          "maxDrawdownPct": 0
+        }
+      ]
+    },
+    {
+      "index": 2,
+      "trades": 7,
+      "winners": 2,
+      "hitRatePct": 28.57142857142857,
+      "expectancyR": -0.2620147460102835,
+      "totalPnlUsd": -204.45585054317547,
+      "rollingMaxDrawdownPct": 1.9792649330127075,
+      "passes": false,
+      "reasons": [
+        "expectancy -0.262R < 0.10R",
+        "hit rate 28.6% < 35%"
+      ],
+      "perSymbol": [
+        {
+          "symbol": "BTC-USD",
+          "trades": 0,
+          "winners": 0,
+          "hitRatePct": 0,
+          "expectancyR": 0,
+          "totalPnlUsd": 0,
+          "maxDrawdownPct": 0
+        },
+        {
+          "symbol": "ETH-USD",
+          "trades": 0,
+          "winners": 0,
+          "hitRatePct": 0,
+          "expectancyR": 0,
+          "totalPnlUsd": 0,
+          "maxDrawdownPct": 0
+        },
+        {
+          "symbol": "SOL-USD",
+          "trades": 2,
+          "winners": 1,
+          "hitRatePct": 50,
+          "expectancyR": 0.11764998369361279,
+          "totalPnlUsd": 2.48495046947005,
+          "maxDrawdownPct": 0
+        },
+        {
+          "symbol": "XRP-USD",
+          "trades": 0,
+          "winners": 0,
+          "hitRatePct": 0,
+          "expectancyR": 0,
+          "totalPnlUsd": 0,
+          "maxDrawdownPct": 0
+        },
+        {
+          "symbol": "DOGE-USD",
+          "trades": 5,
+          "winners": 1,
+          "hitRatePct": 20,
+          "expectancyR": -0.4138806378918421,
+          "totalPnlUsd": -206.94080101264552,
+          "maxDrawdownPct": 0
+        }
+      ]
+    },
+    {
+      "index": 3,
+      "trades": 3,
+      "winners": 0,
+      "hitRatePct": 0,
+      "expectancyR": -1.0096808181981052,
+      "totalPnlUsd": -307.09936866378706,
+      "rollingMaxDrawdownPct": 1.2699916018862067,
+      "passes": false,
+      "reasons": [
+        "only 3 trade(s) in window < 4",
+        "expectancy -1.010R < 0.10R",
+        "hit rate 0.0% < 35%"
+      ],
+      "perSymbol": [
+        {
+          "symbol": "BTC-USD",
+          "trades": 0,
+          "winners": 0,
+          "hitRatePct": 0,
+          "expectancyR": 0,
+          "totalPnlUsd": 0,
+          "maxDrawdownPct": 0
+        },
+        {
+          "symbol": "ETH-USD",
+          "trades": 0,
+          "winners": 0,
+          "hitRatePct": 0,
+          "expectancyR": 0,
+          "totalPnlUsd": 0,
+          "maxDrawdownPct": 0
+        },
+        {
+          "symbol": "SOL-USD",
+          "trades": 1,
+          "winners": 0,
+          "hitRatePct": 0,
+          "expectancyR": -1.005805440725594,
+          "totalPnlUsd": -132.10110528348935,
+          "maxDrawdownPct": 0
+        },
+        {
+          "symbol": "XRP-USD",
+          "trades": 0,
+          "winners": 0,
+          "hitRatePct": 0,
+          "expectancyR": 0,
+          "totalPnlUsd": 0,
+          "maxDrawdownPct": 0
+        },
+        {
+          "symbol": "DOGE-USD",
+          "trades": 2,
+          "winners": 0,
+          "hitRatePct": 0,
+          "expectancyR": -1.0116185069343608,
+          "totalPnlUsd": -174.99826338029771,
+          "maxDrawdownPct": 0
+        }
+      ]
+    },
+    {
+      "index": 4,
+      "trades": 13,
+      "winners": 3,
+      "hitRatePct": 23.076923076923077,
+      "expectancyR": -0.29046389365322767,
+      "totalPnlUsd": -640.3451364692985,
+      "rollingMaxDrawdownPct": 2.6083381794518847,
+      "passes": false,
+      "reasons": [
+        "expectancy -0.290R < 0.10R",
+        "hit rate 23.1% < 35%"
+      ],
+      "perSymbol": [
+        {
+          "symbol": "BTC-USD",
+          "trades": 0,
+          "winners": 0,
+          "hitRatePct": 0,
+          "expectancyR": 0,
+          "totalPnlUsd": 0,
+          "maxDrawdownPct": 0
+        },
+        {
+          "symbol": "ETH-USD",
+          "trades": 0,
+          "winners": 0,
+          "hitRatePct": 0,
+          "expectancyR": 0,
+          "totalPnlUsd": 0,
+          "maxDrawdownPct": 0
+        },
+        {
+          "symbol": "SOL-USD",
+          "trades": 7,
+          "winners": 1,
+          "hitRatePct": 14.285714285714285,
+          "expectancyR": -0.5720317083898611,
+          "totalPnlUsd": -592.6589294531655,
+          "maxDrawdownPct": 0
+        },
+        {
+          "symbol": "XRP-USD",
+          "trades": 0,
+          "winners": 0,
+          "hitRatePct": 0,
+          "expectancyR": 0,
+          "totalPnlUsd": 0,
+          "maxDrawdownPct": 0
+        },
+        {
+          "symbol": "DOGE-USD",
+          "trades": 6,
+          "winners": 2,
+          "hitRatePct": 33.33333333333333,
+          "expectancyR": 0.038031890206177886,
+          "totalPnlUsd": -47.68620701613304,
+          "maxDrawdownPct": 0
+        }
+      ]
+    },
+    {
+      "index": 5,
+      "trades": 6,
+      "winners": 2,
+      "hitRatePct": 33.33333333333333,
+      "expectancyR": -0.014031888272422263,
+      "totalPnlUsd": -95.52371155257491,
+      "rollingMaxDrawdownPct": 1.8666039255226914,
+      "passes": false,
+      "reasons": [
+        "expectancy -0.014R < 0.10R",
+        "hit rate 33.3% < 35%"
+      ],
+      "perSymbol": [
+        {
+          "symbol": "BTC-USD",
+          "trades": 0,
+          "winners": 0,
+          "hitRatePct": 0,
+          "expectancyR": 0,
+          "totalPnlUsd": 0,
+          "maxDrawdownPct": 0
+        },
+        {
+          "symbol": "ETH-USD",
+          "trades": 0,
+          "winners": 0,
+          "hitRatePct": 0,
+          "expectancyR": 0,
+          "totalPnlUsd": 0,
+          "maxDrawdownPct": 0
+        },
+        {
+          "symbol": "SOL-USD",
+          "trades": 3,
+          "winners": 1,
+          "hitRatePct": 33.33333333333333,
+          "expectancyR": -0.008943441082509477,
+          "totalPnlUsd": -59.128010902752806,
+          "maxDrawdownPct": 0
+        },
+        {
+          "symbol": "XRP-USD",
+          "trades": 0,
+          "winners": 0,
+          "hitRatePct": 0,
+          "expectancyR": 0,
+          "totalPnlUsd": 0,
+          "maxDrawdownPct": 0
+        },
+        {
+          "symbol": "DOGE-USD",
+          "trades": 3,
+          "winners": 1,
+          "hitRatePct": 33.33333333333333,
+          "expectancyR": -0.019120335462335047,
+          "totalPnlUsd": -36.39570064982212,
+          "maxDrawdownPct": 0
+        }
+      ]
+    },
+    {
+      "index": 6,
+      "trades": 1,
+      "winners": 0,
+      "hitRatePct": 0,
+      "expectancyR": -1.0187967906346318,
+      "totalPnlUsd": -98.79143967093982,
+      "rollingMaxDrawdownPct": 0.484289511322406,
+      "passes": false,
+      "reasons": [
+        "only 1 trade(s) in window < 4",
+        "expectancy -1.019R < 0.10R",
+        "hit rate 0.0% < 35%"
+      ],
+      "perSymbol": [
+        {
+          "symbol": "BTC-USD",
+          "trades": 0,
+          "winners": 0,
+          "hitRatePct": 0,
+          "expectancyR": 0,
+          "totalPnlUsd": 0,
+          "maxDrawdownPct": 0
+        },
+        {
+          "symbol": "ETH-USD",
+          "trades": 0,
+          "winners": 0,
+          "hitRatePct": 0,
+          "expectancyR": 0,
+          "totalPnlUsd": 0,
+          "maxDrawdownPct": 0
+        },
+        {
+          "symbol": "SOL-USD",
+          "trades": 0,
+          "winners": 0,
+          "hitRatePct": 0,
+          "expectancyR": 0,
+          "totalPnlUsd": 0,
+          "maxDrawdownPct": 0
+        },
+        {
+          "symbol": "XRP-USD",
+          "trades": 0,
+          "winners": 0,
+          "hitRatePct": 0,
+          "expectancyR": 0,
+          "totalPnlUsd": 0,
+          "maxDrawdownPct": 0
+        },
+        {
+          "symbol": "DOGE-USD",
+          "trades": 1,
+          "winners": 0,
+          "hitRatePct": 0,
+          "expectancyR": -1.0187967906346318,
+          "totalPnlUsd": -98.79143967093982,
+          "maxDrawdownPct": 0
+        }
+      ]
+    },
+    {
+      "index": 7,
+      "trades": 8,
+      "winners": 1,
+      "hitRatePct": 12.5,
+      "expectancyR": -0.3020934975845915,
+      "totalPnlUsd": -241.22612889767584,
+      "rollingMaxDrawdownPct": 1.513081152915399,
+      "passes": false,
+      "reasons": [
+        "expectancy -0.302R < 0.10R",
+        "hit rate 12.5% < 35%"
+      ],
+      "perSymbol": [
+        {
+          "symbol": "BTC-USD",
+          "trades": 0,
+          "winners": 0,
+          "hitRatePct": 0,
+          "expectancyR": 0,
+          "totalPnlUsd": 0,
+          "maxDrawdownPct": 0
+        },
+        {
+          "symbol": "ETH-USD",
+          "trades": 0,
+          "winners": 0,
+          "hitRatePct": 0,
+          "expectancyR": 0,
+          "totalPnlUsd": 0,
+          "maxDrawdownPct": 0
+        },
+        {
+          "symbol": "SOL-USD",
+          "trades": 3,
+          "winners": 1,
+          "hitRatePct": 33.33333333333333,
+          "expectancyR": 0.2098503139663633,
+          "totalPnlUsd": 33.13566257192888,
+          "maxDrawdownPct": 0
+        },
+        {
+          "symbol": "XRP-USD",
+          "trades": 0,
+          "winners": 0,
+          "hitRatePct": 0,
+          "expectancyR": 0,
+          "totalPnlUsd": 0,
+          "maxDrawdownPct": 0
+        },
+        {
+          "symbol": "DOGE-USD",
+          "trades": 5,
+          "winners": 0,
+          "hitRatePct": 0,
+          "expectancyR": -0.6092597845151643,
+          "totalPnlUsd": -274.3617914696047,
+          "maxDrawdownPct": 0
+        }
+      ]
+    },
+    {
+      "index": 8,
+      "trades": 17,
+      "winners": 5,
+      "hitRatePct": 29.411764705882355,
+      "expectancyR": -0.12710119870788764,
+      "totalPnlUsd": -438.03366747050234,
+      "rollingMaxDrawdownPct": 3.3373956974602375,
+      "passes": false,
+      "reasons": [
+        "expectancy -0.127R < 0.10R",
+        "hit rate 29.4% < 35%"
+      ],
+      "perSymbol": [
+        {
+          "symbol": "BTC-USD",
+          "trades": 0,
+          "winners": 0,
+          "hitRatePct": 0,
+          "expectancyR": 0,
+          "totalPnlUsd": 0,
+          "maxDrawdownPct": 0
+        },
+        {
+          "symbol": "ETH-USD",
+          "trades": 0,
+          "winners": 0,
+          "hitRatePct": 0,
+          "expectancyR": 0,
+          "totalPnlUsd": 0,
+          "maxDrawdownPct": 0
+        },
+        {
+          "symbol": "SOL-USD",
+          "trades": 8,
+          "winners": 3,
+          "hitRatePct": 37.5,
+          "expectancyR": 0.022325369419337965,
+          "totalPnlUsd": -139.85592350907163,
+          "maxDrawdownPct": 0
+        },
+        {
+          "symbol": "XRP-USD",
+          "trades": 0,
+          "winners": 0,
+          "hitRatePct": 0,
+          "expectancyR": 0,
+          "totalPnlUsd": 0,
+          "maxDrawdownPct": 0
+        },
+        {
+          "symbol": "DOGE-USD",
+          "trades": 9,
+          "winners": 2,
+          "hitRatePct": 22.22222222222222,
+          "expectancyR": -0.25992481482097707,
+          "totalPnlUsd": -298.1777439614307,
+          "maxDrawdownPct": 0
+        }
+      ]
+    }
+  ],
+  "skipReasonsTotals": {
+    "parked — failed §8 4H r9": 341,
+    "single-symbol short cap": 39,
+    "BTC trend up — alt short blocked": 56,
+    "3 consecutive short losses — symbol cooldown": 9,
+    "cross-strategy per-symbol short cap": 1
+  },
+  "sweep": [
+    {
+      "knob": "baseline",
+      "factor": 1,
+      "totalPnl": -3058.8501700086435,
+      "perWindowExpectancy": [
+        -1.0121680522770395,
+        -0.24564493999016004,
+        -0.2620147460102835,
+        -1.0096808181981052,
+        -0.29046389365322767,
+        -0.014031888272422263,
+        -1.0187967906346318,
+        -0.3020934975845915,
+        -0.12710119870788764
+      ],
+      "perWindowHitRate": [
+        0,
+        23.076923076923077,
+        28.57142857142857,
+        0,
+        23.076923076923077,
+        33.33333333333333,
+        0,
+        12.5,
+        29.411764705882355
+      ],
+      "rollingDDPct": 3.5141857600600632
+    },
+    {
+      "knob": "FUNDING_GATE_THRESHOLD_PER_HOUR",
+      "factor": 0.8,
+      "totalPnl": -4262.909357971475,
+      "perWindowExpectancy": [
+        -0.9490247131862066,
+        -0.11423923967443521,
+        -0.2043838209890161,
+        -0.9337733075826923,
+        -0.20162654575045397,
+        0.007476825307843586,
+        -0.17774385928943537,
+        -0.1396871552095698,
+        0.06913143033097563
+      ],
+      "perWindowHitRate": [
+        0,
+        26.31578947368421,
+        25,
+        0,
+        27.27272727272727,
+        33.33333333333333,
+        25,
+        25,
+        40
+      ],
+      "rollingDDPct": 5.251995282827157,
+      "noopReason": "threshold lives on engine constant, not ShortSpec — gate itself is active via Binance funding feed (TRA-287)"
+    },
+    {
+      "knob": "FUNDING_GATE_THRESHOLD_PER_HOUR",
+      "factor": 1.2,
+      "totalPnl": -4262.909357971475,
+      "perWindowExpectancy": [
+        -0.9490247131862066,
+        -0.11423923967443521,
+        -0.2043838209890161,
+        -0.9337733075826923,
+        -0.20162654575045397,
+        0.007476825307843586,
+        -0.17774385928943537,
+        -0.1396871552095698,
+        0.06913143033097563
+      ],
+      "perWindowHitRate": [
+        0,
+        26.31578947368421,
+        25,
+        0,
+        27.27272727272727,
+        33.33333333333333,
+        25,
+        25,
+        40
+      ],
+      "rollingDDPct": 5.251995282827157,
+      "noopReason": "threshold lives on engine constant, not ShortSpec — gate itself is active via Binance funding feed (TRA-287)"
+    },
+    {
+      "knob": "regime hysteresis flipBars",
+      "factor": 0.8,
+      "totalPnl": -3367.129852978407,
+      "perWindowExpectancy": [
+        -0.9490247131862066,
+        -0.08951869606695323,
+        -0.13068209619538085,
+        -0.876274301552219,
+        -0.10129012221065,
+        -0.12342034723436761,
+        -0.17774385928943537,
+        -0.1396871552095698,
+        0.25998443217393963
+      ],
+      "perWindowHitRate": [
+        0,
+        27.77777777777778,
+        27.27272727272727,
+        0,
+        29.166666666666668,
+        30,
+        25,
+        25,
+        47.05882352941176
+      ],
+      "rollingDDPct": 4.463804374496888
+    },
+    {
+      "knob": "regime hysteresis flipBars",
+      "factor": 1.2,
+      "totalPnl": -3599.540052707863,
+      "perWindowExpectancy": [
+        -0.9490247131862066,
+        -0.06575635246571804,
+        -0.26673307460348367,
+        -0.6777001914842623,
+        -0.21912687319363816,
+        0.007476825307843586,
+        -0.17774385928943537,
+        0.008907847603383283,
+        0.1884223285987988
+      ],
+      "perWindowHitRate": [
+        0,
+        27.77777777777778,
+        23.076923076923077,
+        12.5,
+        25,
+        33.33333333333333,
+        25,
+        29.411764705882355,
+        42.857142857142854
+      ],
+      "rollingDDPct": 5.145030092138617
+    },
+    {
+      "knob": "Momentum atrStopMultiplier",
+      "factor": 0.8,
+      "totalPnl": -3219.486149790625,
+      "perWindowExpectancy": [
+        -1.012717566629705,
+        -0.4900377859817572,
+        0.010431252914196642,
+        -1.0096097397207753,
+        -0.24672143701933125,
+        0.2845676229925431,
+        -0.23362336493355293,
+        -0.07894683248398619,
+        0.35888428768783903
+      ],
+      "perWindowHitRate": [
+        0,
+        11.76470588235294,
+        30,
+        0,
+        22.727272727272727,
+        37.5,
+        33.33333333333333,
+        21.428571428571427,
+        41.17647058823529
+      ],
+      "rollingDDPct": 6.143093367348975
+    },
+    {
+      "knob": "Momentum atrStopMultiplier",
+      "factor": 1.2,
+      "totalPnl": -4436.865655241912,
+      "perWindowExpectancy": [
+        -0.799135638699956,
+        -0.19541871981087652,
+        -0.00610536366568529,
+        -0.8754712976865784,
+        -0.2516143129937651,
+        -0.1578432581558425,
+        -0.15451050042198394,
+        0.09768327875683416,
+        -0.07362382514874138
+      ],
+      "perWindowHitRate": [
+        0,
+        28.57142857142857,
+        36.36363636363637,
+        0,
+        26.08695652173913,
+        30,
+        25,
+        37.5,
+        36.36363636363637
+      ],
+      "rollingDDPct": 5.83565704566124
+    },
+    {
+      "knob": "Breakout atrStopMultiplier",
+      "factor": 0.8,
+      "totalPnl": -4302.770383675387,
+      "perWindowExpectancy": [
+        -0.9490247131862066,
+        -0.11423923967443521,
+        -0.2043838209890161,
+        -0.9337733075826923,
+        -0.20162654575045397,
+        0.007476825307843586,
+        -0.17774385928943537,
+        -0.1396871552095698,
+        0.04455179829855153
+      ],
+      "perWindowHitRate": [
+        0,
+        26.31578947368421,
+        25,
+        0,
+        27.27272727272727,
+        33.33333333333333,
+        25,
+        25,
+        36.84210526315789
+      ],
+      "rollingDDPct": 5.251995282827157
+    },
+    {
+      "knob": "Breakout atrStopMultiplier",
+      "factor": 1.2,
+      "totalPnl": -4388.680190086123,
+      "perWindowExpectancy": [
+        -0.7050729298178764,
+        -0.08962630770743592,
+        -0.048597861910106795,
+        -0.9337733075826923,
+        -0.23686909790338878,
+        0.007476825307843586,
+        -0.17774385928943537,
+        -0.1396871552095698,
+        0.013423152268435759
+      ],
+      "perWindowHitRate": [
+        20,
+        30,
+        35.714285714285715,
+        0,
+        26.08695652173913,
+        33.33333333333333,
+        25,
+        25,
+        38.095238095238095
+      ],
+      "rollingDDPct": 5.834317106242763
+    },
+    {
+      "knob": "Breakout atrTpMultiplier",
+      "factor": 0.8,
+      "totalPnl": -4164.550075210333,
+      "perWindowExpectancy": [
+        -0.9490247131862066,
+        -0.11423923967443521,
+        -0.2043838209890161,
+        -0.9337733075826923,
+        -0.20162654575045397,
+        0.007476825307843586,
+        -0.17774385928943537,
+        -0.1396871552095698,
+        0.10888662249531458
+      ],
+      "perWindowHitRate": [
+        0,
+        26.31578947368421,
+        25,
+        0,
+        27.27272727272727,
+        33.33333333333333,
+        25,
+        25,
+        40
+      ],
+      "rollingDDPct": 5.251995282827157
+    },
+    {
+      "knob": "Breakout atrTpMultiplier",
+      "factor": 1.2,
+      "totalPnl": -4262.909357971475,
+      "perWindowExpectancy": [
+        -0.9490247131862066,
+        -0.11423923967443521,
+        -0.2043838209890161,
+        -0.9337733075826923,
+        -0.20162654575045397,
+        0.007476825307843586,
+        -0.17774385928943537,
+        -0.1396871552095698,
+        0.06913143033097563
+      ],
+      "perWindowHitRate": [
+        0,
+        26.31578947368421,
+        25,
+        0,
+        27.27272727272727,
+        33.33333333333333,
+        25,
+        25,
+        40
+      ],
+      "rollingDDPct": 5.251995282827157
+    }
+  ],
+  "decision": "FAIL"
+}
