@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useLayoutEffect, useRef, useState } from 'react';
 import { createPortal } from 'react-dom';
-import type { TradeSignal, Position, AccountState, OptionPosition, OptionsAccountState, CryptoEngineState, NewsItem } from '@trading-app/shared';
+import type { TradeSignal, Position, AccountState, OptionPosition, OptionsAccountState, CryptoEngineState, LiveSkip, NewsItem } from '@trading-app/shared';
 import { DEFAULT_ACCOUNT_SETTINGS } from '@trading-app/shared';
 import LoginPage from './LoginPage.tsx';
 import ForgotPasswordPage from './ForgotPasswordPage.tsx';
@@ -675,40 +675,62 @@ function CryptoDashboard({ token, onBack, onLogout, onActivity, theme, onToggleT
             {openPositions.length > 0 && (
               <>
                 <h3>Open Positions</h3>
-                <table>
-                  <thead>
-                    <tr>
-                      <th>Symbol</th><th>Side</th><th>Qty</th><th>Entry</th><th>Cost</th><th>Current</th>
-                      <th>P&amp;L %</th><th>P&amp;L $</th><th>Stop</th><th>Target</th><th>Opened</th><th></th>
-                    </tr>
-                  </thead>
-                  <tbody>
-                    {openPositions.map(p => {
-                      const sym = symbols.find(s => s.symbol === p.symbol);
-                      const currentPrice = sym?.price ?? p.entryPrice;
-                      const multiplier = p.side === 'buy' ? 1 : -1;
-                      const pnlPct = ((currentPrice - p.entryPrice) / p.entryPrice) * 100 * multiplier;
-                      const pnlDollar = (currentPrice - p.entryPrice) * p.quantity * multiplier;
-                      const totalCost = p.entryPrice * p.quantity;
-                      return (
-                        <tr key={p.id}>
-                          <td className="symbol">{p.symbol}</td>
-                          <td className={p.side === 'buy' ? 'green' : 'red'}>{p.side.toUpperCase()}</td>
-                          <td>{p.quantity}</td>
-                          <td>${fmt(p.entryPrice)}</td>
-                          <td>${fmt(totalCost)}</td>
-                          <td>${fmt(currentPrice)}</td>
-                          <td className={pnlPct >= 0 ? 'green' : 'red'}>{fmtPct(pnlPct)}</td>
-                          <td className={pnlDollar >= 0 ? 'green' : 'red'}>{fmtDollar(pnlDollar)}</td>
-                          <td className="red">${fmt(p.stopLoss)}</td>
-                          <td className="green">${fmt(p.takeProfit)}</td>
-                          <td className="muted">{formatTime(p.openedAt)}</td>
-                          <td><button className="btn-close-pos" onClick={() => closePosition(p.id)}>Close</button></td>
+                {/* TRA-249-E — Leverage / Liquidation columns are rendered only
+                    when at least one open row is a perp. Spot-only sessions
+                    keep the previous header layout byte-identical. */}
+                {(() => {
+                  const showPerpCols = openPositions.some(p => p.productType === 'perp');
+                  return (
+                    <table>
+                      <thead>
+                        <tr>
+                          <th>Symbol</th><th>Side</th><th>Qty</th><th>Entry</th><th>Cost</th><th>Current</th>
+                          <th>P&amp;L %</th><th>P&amp;L $</th><th>Stop</th><th>Target</th>
+                          {showPerpCols && <th>Leverage</th>}
+                          {showPerpCols && <th>Liquidation</th>}
+                          <th>Opened</th><th></th>
                         </tr>
-                      );
-                    })}
-                  </tbody>
-                </table>
+                      </thead>
+                      <tbody>
+                        {openPositions.map(p => {
+                          const sym = symbols.find(s => s.symbol === p.symbol);
+                          const currentPrice = sym?.price ?? p.entryPrice;
+                          const multiplier = p.side === 'buy' ? 1 : -1;
+                          const pnlPct = ((currentPrice - p.entryPrice) / p.entryPrice) * 100 * multiplier;
+                          const pnlDollar = (currentPrice - p.entryPrice) * p.quantity * multiplier;
+                          const totalCost = p.entryPrice * p.quantity;
+                          const isPerp = p.productType === 'perp';
+                          return (
+                            <tr key={p.id}>
+                              <td className="symbol">{p.symbol}</td>
+                              <td className={p.side === 'buy' ? 'green' : 'red'}>{p.side.toUpperCase()}</td>
+                              <td>{p.quantity}</td>
+                              <td>${fmt(p.entryPrice)}</td>
+                              <td>${fmt(totalCost)}</td>
+                              <td>${fmt(currentPrice)}</td>
+                              <td className={pnlPct >= 0 ? 'green' : 'red'}>{fmtPct(pnlPct)}</td>
+                              <td className={pnlDollar >= 0 ? 'green' : 'red'}>{fmtDollar(pnlDollar)}</td>
+                              <td className="red">${fmt(p.stopLoss)}</td>
+                              <td className="green">${fmt(p.takeProfit)}</td>
+                              {showPerpCols && (
+                                <td className={isPerp ? '' : 'muted'}>
+                                  {isPerp && p.leverage != null ? `${p.leverage}×` : '—'}
+                                </td>
+                              )}
+                              {showPerpCols && (
+                                <td className={isPerp ? '' : 'muted'}>
+                                  {isPerp && p.liquidationPrice != null ? `$${fmt(p.liquidationPrice)}` : '—'}
+                                </td>
+                              )}
+                              <td className="muted">{formatTime(p.openedAt)}</td>
+                              <td><button className="btn-close-pos" onClick={() => closePosition(p.id)}>Close</button></td>
+                            </tr>
+                          );
+                        })}
+                      </tbody>
+                    </table>
+                  );
+                })()}
               </>
             )}
             {closedPositions.length > 0 && (
@@ -754,6 +776,10 @@ function CryptoDashboard({ token, onBack, onLogout, onActivity, theme, onToggleT
                 <span className="muted">Closed trades stay listed here until the 9:00 PM ET archive — full per-day history is under the <strong>P&amp;L Calendar</strong> tab.</span>
               </div>
             )}
+            {/* TRA-249-E — collapsible aggregate of recent live-broker skip
+                events. Hidden when the buffer is empty, which means demo
+                runs and pristine live runs see no extra panel. */}
+            <SkippedSignalsPanel skips={state.liveSkips ?? []} />
           </div>
         )}
 
@@ -867,6 +893,54 @@ function exitReasonLabel(reason?: string) {
     case 'rsi_alt_exit': return 'RSI exit';
     default: return reason ?? '—';
   }
+}
+
+/**
+ * TRA-249-E — collapsible "Recent skipped signals" panel rendered under the
+ * crypto Positions table. Reads `liveSkips` off `CryptoEngineState` (the
+ * aggregate ring buffer populated by `CryptoLiveAccount.recordSkip`). Hidden
+ * entirely on demo and on live runs that have not skipped anything yet, so
+ * the panel doesn't add visual noise to the spot-only experience. Newest
+ * skips are shown first.
+ */
+export function SkippedSignalsPanel({ skips }: { skips: LiveSkip[] }) {
+  const [expanded, setExpanded] = useState(false);
+  if (skips.length === 0) return null;
+  const ordered = [...skips].sort((a, b) => b.at - a.at);
+  return (
+    <div className="skipped-signals-panel" style={{ marginTop: '1.5rem' }}>
+      <button
+        type="button"
+        className="btn-secondary btn-sm"
+        onClick={() => setExpanded(v => !v)}
+        aria-expanded={expanded}
+      >
+        {expanded ? '▾' : '▸'} Recent skipped signals ({ordered.length})
+      </button>
+      {expanded && (
+        <table style={{ marginTop: '0.5rem' }}>
+          <thead>
+            <tr>
+              <th>Symbol</th>
+              <th>Side</th>
+              <th>Reason</th>
+              <th>When</th>
+            </tr>
+          </thead>
+          <tbody>
+            {ordered.map((s, i) => (
+              <tr key={`${s.at}-${s.symbol}-${i}`}>
+                <td className="symbol">{s.symbol}</td>
+                <td className={s.side === 'buy' ? 'green' : 'red'}>{s.side.toUpperCase()}</td>
+                <td className="muted" title={s.reason}>{s.reason}</td>
+                <td className="muted">{timeAgo(s.at)}</td>
+              </tr>
+            ))}
+          </tbody>
+        </table>
+      )}
+    </div>
+  );
 }
 
 function researchKindLabel(kind?: string) {

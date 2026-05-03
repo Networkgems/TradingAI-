@@ -873,6 +873,14 @@ describe('CryptoLiveAccount perp short routing (TRA-264)', () => {
     });
     expect(signal.liveSkipReason).toBeUndefined();
     expect(signal.signalSkipReason).toBeUndefined();
+    // TRA-249-E — perp metadata is stamped on the position so the desktop
+    // Positions table can render Leverage / Liquidation columns. Phase-1
+    // engine pins leverage at 1× and liquidationPrice is the textbook
+    // entry × 2 reference for a 1× isolated short.
+    expect(pos!.productType).toBe('perp');
+    expect(pos!.leverage).toBe(1);
+    expect(pos!.marginUsd).toBeCloseTo(30_000 * 0.0005, 6);
+    expect(pos!.liquidationPrice).toBe(60_000);
   });
 
   it('uses the Tier-2 risk fraction (0.30%) for DOGE-USD shorts', async () => {

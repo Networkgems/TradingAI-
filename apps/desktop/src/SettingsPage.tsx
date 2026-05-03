@@ -1247,6 +1247,72 @@ export default function SettingsPage({ token, httpUrl, context, onModeChange }: 
                     </label>
                   </div>
                 </div>
+
+                {/* TRA-249-E — Live trading routing (spot / hybrid / perp-only)
+                    and operator-facing leverage cap. The leverage cap is
+                    surfaced even though the engine pins at 1× today so raising
+                    the ceiling later doesn't require a settings migration. */}
+                <div className="settings-field" style={{ marginTop: '1.25rem' }}>
+                  <label>Live trading mode</label>
+                  <div className="radio-group">
+                    <label className="radio-option">
+                      <input
+                        type="radio"
+                        name="liveTradeRouting-crypto"
+                        value="spot_only"
+                        checked={(settings.liveTradeRoutingCrypto ?? 'hybrid') === 'spot_only'}
+                        onChange={() => set('liveTradeRoutingCrypto', 'spot_only')}
+                      />
+                      <div>
+                        <strong>Spot only</strong>
+                        <p className="field-hint">Only spot Coinbase orders. SELL signals on long-only spot accounts are skipped.</p>
+                      </div>
+                    </label>
+                    <label className="radio-option">
+                      <input
+                        type="radio"
+                        name="liveTradeRouting-crypto"
+                        value="hybrid"
+                        checked={(settings.liveTradeRoutingCrypto ?? 'hybrid') === 'hybrid'}
+                        onChange={() => set('liveTradeRoutingCrypto', 'hybrid')}
+                      />
+                      <div>
+                        <strong>Hybrid (recommended)</strong>
+                        <p className="field-hint">BUY → spot, SELL → perp short when the symbol has a Coinbase INTX listing, else skipped.</p>
+                      </div>
+                    </label>
+                    <label className="radio-option">
+                      <input
+                        type="radio"
+                        name="liveTradeRouting-crypto"
+                        value="perp_only"
+                        checked={(settings.liveTradeRoutingCrypto ?? 'hybrid') === 'perp_only'}
+                        onChange={() => set('liveTradeRoutingCrypto', 'perp_only')}
+                      />
+                      <div>
+                        <strong>Perp only</strong>
+                        <p className="field-hint">Both legs route to Coinbase INTX perpetual futures.</p>
+                      </div>
+                    </label>
+                  </div>
+                </div>
+
+                <div className="settings-field" style={{ marginTop: '1.25rem' }}>
+                  <label>Max leverage</label>
+                  <input
+                    type="number"
+                    min={1}
+                    max={5}
+                    step={1}
+                    value={settings.liveMaxLeverageCrypto ?? 1}
+                    onChange={e => set('liveMaxLeverageCrypto', Math.max(1, Math.min(5, Math.round(Number(e.target.value)))))}
+                  />
+                  <span className="field-hint">
+                    Leverage ceiling for crypto perp positions (1–5). Phase-1 the engine pins leverage at 1× —
+                    raising this above 1 has no effect today, but the setting is surfaced so future ramps don't
+                    require a migration.
+                  </span>
+                </div>
               </div>
             )}
 

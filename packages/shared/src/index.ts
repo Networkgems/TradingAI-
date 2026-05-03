@@ -213,17 +213,19 @@ export type AccountMode = 'demo' | 'live';
 export type BrokerageType = 'webull' | 'coinbase' | 'tradier';
 export type LiveTradeMode = 'ai_in_brokerage' | 'transfer_to_platform';
 /**
- * TRA-249-C — how the live crypto account routes SELL-side strategy signals.
- * `'hybrid'` (default) sends shorts to Coinbase INTX perpetuals when a perp
- * is listed for the spot symbol AND the strategy universe gate passes, and
- * falls back to the spot-only skip when not. `'spot_only'` forces every SELL
- * through the spot-only skip path even when perps would otherwise route —
- * the safety hatch for users that haven't enabled INTX or want to keep live
- * trading purely directional-long. The Settings UI exposing this knob lands
- * in TRA-249-E; until then operators that omit the field implicitly run
- * `'hybrid'` via {@link DEFAULT_ACCOUNT_SETTINGS}.
+ * TRA-249-C / TRA-249-E — how the live crypto account routes strategy signals.
+ *   - `'hybrid'`    (default) sends SELL signals to Coinbase INTX perpetuals
+ *     when a perp is listed for the spot symbol AND the strategy universe gate
+ *     passes; falls back to the spot-only skip otherwise. BUY signals always
+ *     route to spot.
+ *   - `'spot_only'` forces every SELL through the spot-only skip path even
+ *     when perps would otherwise route — the safety hatch for users that
+ *     haven't enabled INTX or want to keep live trading directional-long.
+ *   - `'perp_only'` (TRA-249-E) routes both legs through the INTX perp
+ *     catalog. Surfaced in the Settings UI; the engine treats unknown values
+ *     as `'hybrid'` until the routing fork explicitly handles `'perp_only'`.
  */
-export type LiveTradeRoutingCrypto = 'hybrid' | 'spot_only';
+export type LiveTradeRoutingCrypto = 'hybrid' | 'spot_only' | 'perp_only';
 /**
  * Tradier exposes two parallel API hosts (TRA-221). `sandbox` is the paper
  * environment with simulated fills and free real-time options data; `production`
@@ -283,14 +285,22 @@ export interface AccountSettings {
   liveApiKeyCrypto?: string;
   liveApiSecretCrypto?: string;
   /**
-   * TRA-249-C — routing fork for SELL-side crypto strategy signals. `'hybrid'`
-   * (default) routes shorts to a listed Coinbase perp when the strategy
-   * universe gate passes; `'spot_only'` forces the spot-only skip even when
-   * a perp exists. Optional so saved settings pre-TRA-249 still type-check;
-   * absent ↔ `'hybrid'` per {@link DEFAULT_ACCOUNT_SETTINGS}. Settings-page
-   * surface lands in subtask E (TRA-249-E).
+   * TRA-249-C — routing fork for crypto strategy signals. `'hybrid'` (default)
+   * routes SELL shorts to a listed Coinbase perp when the strategy universe
+   * gate passes; `'spot_only'` forces the spot-only skip even when a perp
+   * exists; `'perp_only'` (TRA-249-E) routes both legs through the INTX perp
+   * catalog. Optional so saved settings pre-TRA-249 still type-check; absent
+   * ↔ `'hybrid'` per {@link DEFAULT_ACCOUNT_SETTINGS}.
    */
   liveTradeRoutingCrypto?: LiveTradeRoutingCrypto;
+  /**
+   * TRA-249-E — operator-facing leverage cap for crypto perp positions
+   * (1 → 5, integer). Phase-1 the live engine hard-caps leverage at 1×, but
+   * surfacing the field now means raising the cap later doesn't require a
+   * settings migration. The value the engine actually applies is
+   * `min(liveMaxLeverageCrypto, ENGINE_HARD_CAP)`.
+   */
+  liveMaxLeverageCrypto?: number;
   // Live mode settings — Stocks (Webull). Webull uses Account ID for routing
   // and (today) does not require a separate API secret.
   liveBrokerageTypeStocks?: BrokerageType;
@@ -342,6 +352,7 @@ export const DEFAULT_ACCOUNT_SETTINGS: AccountSettings = {
   liveApiKeyCrypto: '',
   liveApiSecretCrypto: '',
   liveTradeRoutingCrypto: 'hybrid',
+  liveMaxLeverageCrypto: 1,
   liveBrokerageTypeStocks: 'webull',
   liveTradeModeStocks: 'ai_in_brokerage',
   liveApiKeyStocks: '',

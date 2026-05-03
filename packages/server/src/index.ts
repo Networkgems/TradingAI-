@@ -932,6 +932,14 @@ app.put('/api/account/settings', requireAuth, async (req, res) => {
     optionsDailyTradesLimit: Math.max(1, Math.min(100, Number(body.optionsDailyTradesLimit ?? current.optionsDailyTradesLimit))),
     managedAccountRatio: Math.max(0.01, Math.min(1, Number(body.managedAccountRatio ?? current.managedAccountRatio))),
     riskPerTrade: Math.max(0.001, Math.min(0.5, Number(body.riskPerTrade ?? current.riskPerTrade))),
+    // TRA-249-E — clamp the operator-facing leverage cap to [1, 5] integer.
+    // The live engine still hard-caps at 1× (PERP_SHORT_LEVERAGE) so a
+    // misconfigured value can't bypass the §6 caps; clamping here keeps the
+    // stored payload sane regardless of what the UI sends.
+    liveMaxLeverageCrypto: Math.max(
+      1,
+      Math.min(5, Math.round(Number(body.liveMaxLeverageCrypto ?? current.liveMaxLeverageCrypto ?? 1))),
+    ),
   };
   await saveSettings(username, updated);
   // Await the stocks engine: TRA-226 makes applySettings async so a flip into

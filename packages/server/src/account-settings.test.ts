@@ -12,12 +12,14 @@ process.env.DATA_DIR = TMP_ROOT;
 
 type AccountSettingsModule = typeof import('./account-settings.js');
 let loadSettings: AccountSettingsModule['loadSettings'];
+let saveSettings: AccountSettingsModule['saveSettings'];
 let clearSettingsCache: AccountSettingsModule['clearSettingsCache'];
 let migrateLegacyLiveCredentials: AccountSettingsModule['migrateLegacyLiveCredentials'];
 
 beforeAll(async () => {
   const mod = await import('./account-settings.js');
   loadSettings = mod.loadSettings;
+  saveSettings = mod.saveSettings;
   clearSettingsCache = mod.clearSettingsCache;
   migrateLegacyLiveCredentials = mod.migrateLegacyLiveCredentials;
 });
@@ -145,5 +147,45 @@ describe('loadSettings persistence (TRA-165)', () => {
     const second = await loadSettings(USER);
     expect(second.liveApiKey).toBe('');
     expect(second.liveApiKeyCrypto).toBe('coinbase-key');
+  });
+});
+
+describe('liveTradeRoutingCrypto / liveMaxLeverageCrypto round-trip (TRA-249-E)', () => {
+  it('persists hybrid routing + leverage cap and re-reads them on next load', async () => {
+    const stored: AccountSettings = {
+      ...DEFAULT_ACCOUNT_SETTINGS,
+      liveTradeRoutingCrypto: 'hybrid',
+      liveMaxLeverageCrypto: 3,
+    };
+    await saveSettings(USER, stored);
+    clearSettingsCache(USER);
+    const reloaded = await loadSettings(USER);
+    expect(reloaded.liveTradeRoutingCrypto).toBe('hybrid');
+    expect(reloaded.liveMaxLeverageCrypto).toBe(3);
+  });
+
+  it('round-trips perp_only and spot_only without dropping the value', async () => {
+    for (const routing of ['perp_only', 'spot_only'] as const) {
+      const stored: AccountSettings = {
+        ...DEFAULT_ACCOUNT_SETTINGS,
+        liveTradeRoutingCrypto: routing,
+        liveMaxLeverageCrypto: 1,
+      };
+      await saveSettings(USER, stored);
+      clearSettingsCache(USER);
+      const reloaded = await loadSettings(USER);
+      expect(reloaded.liveTradeRoutingCrypto).toBe(routing);
+    }
+  });
+
+  it('falls back to hybrid + 1× when the saved file pre-dates TRA-249-E', async () => {
+    // Pre-E payload — neither field present on disk. The DEFAULT_ACCOUNT_SETTINGS
+    // merge in `loadSettings` should inject the defaults so `useSettings` reads
+    // sane values without forcing a server-side migration.
+    writeUserSettingsFile({ mode: 'live' });
+    clearSettingsCache(USER);
+    const reloaded = await loadSettings(USER);
+    expect(reloaded.liveTradeRoutingCrypto).toBe('hybrid');
+    expect(reloaded.liveMaxLeverageCrypto).toBe(1);
   });
 });
