@@ -79,10 +79,11 @@ function BitcoinIcon() {
   );
 }
 
-function DashboardSelector({ onSelect, onLogout }: { onSelect: (mode: 'stocks' | 'crypto') => void; onLogout: () => void }) {
+function DashboardSelector({ onSelect, onLogout, theme, onToggleTheme }: { onSelect: (mode: 'stocks' | 'crypto') => void; onLogout: () => void; theme: Theme; onToggleTheme: () => void }) {
   return (
     <div className="selector-screen">
       <div className="selector-topbar">
+        <ThemeToggle theme={theme} onToggle={onToggleTheme} />
         <button className="logout-btn" onClick={onLogout}>Sign Out</button>
       </div>
       <div className="selector-header">
@@ -1835,12 +1836,7 @@ export default function App() {
   if (!tokenChecked) return null;
 
   const mainContent = appMode === null
-    ? (
-        <>
-          {floatingToggle}
-          <DashboardSelector onSelect={selectMode} onLogout={handleLogout} />
-        </>
-      )
+    ? <DashboardSelector onSelect={selectMode} onLogout={handleLogout} theme={theme} onToggleTheme={toggleTheme} />
     : appMode === 'crypto'
       ? <CryptoDashboard token={token} onBack={goHome} onLogout={handleLogout} onActivity={() => resetIdleTimerRef.current()} theme={theme} onToggleTheme={toggleTheme} />
       : <Dashboard token={token} onLogout={handleLogout} onGoHome={goHome} onActivity={() => resetIdleTimerRef.current()} theme={theme} onToggleTheme={toggleTheme} />;

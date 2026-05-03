@@ -1419,6 +1419,9 @@ tr:hover td { background: var(--bg-hover); }
   position: absolute;
   top: calc(1rem + env(safe-area-inset-top));
   right: 1.5rem;
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
 }
 
 .selector-header { text-align: center; }
