@@ -139,12 +139,15 @@ import { dirname, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import type { Candle } from '@trading-app/shared';
 import { atr, ema, rsi } from '@trading-app/engine';
-import { loadOrFetch4hBars, loadOrFetchDailyBars } from './fetch-tra266-data.js';
+import { loadOrFetch4hBars } from './fetch-tra266-data.js';
+import {
+  BTC_DOMINANCE_BASKET as BASKET,
+  type DominanceSeries,
+  loadSyntheticBtcDominanceDaily,
+} from './btc-dominance-synthetic.js';
 
 const HERE = dirname(fileURLToPath(import.meta.url));
 const REPORT_DIR = resolve(HERE, '..', 'reports');
-const DATA_DIR = resolve(HERE, '..', 'data');
-const DOMINANCE_CACHE = resolve(DATA_DIR, 'btc-dominance-synthetic.json');
 
 // ── Spec constants (task TRA-296) ─────────────────────────────────────────
 
@@ -176,15 +179,6 @@ const ATR_PB_RSI_MAX = 40;       // NEW — oversold confirm RSI(14)[i-1] < 40
 
 // BTC-dominance regime gate — task §2
 const BTC_D_SMA_PERIOD = 50;     // daily 50-period SMA on dominance series
-
-// Synthetic basket (mid-period 2024 circulating-supply constants).
-const BASKET = [
-  { symbol: 'BTC-USD',  supply: 19_500_000        },
-  { symbol: 'ETH-USD',  supply: 120_000_000       },
-  { symbol: 'SOL-USD',  supply: 400_000_000       },
-  { symbol: 'DOGE-USD', supply: 144_000_000_000   },
-  { symbol: 'XRP-USD',  supply: 55_000_000_000    },
-] as const;
 
 // Walk-forward — UNCHANGED from TRA-287 / TRA-292 / TRA-294 / TRA-295
 const TRAIN_BARS = 180 * 6;      // 1080 × 4H ≈ 6 months
@@ -417,112 +411,10 @@ function preCompute(bars: Candle[]): PreCompute {
 }
 
 // ── Synthetic BTC-dominance series ────────────────────────────────────────
-
-interface DominancePoint {
-  ts: number;          // start-of-day ts (daily bar timestamp)
-  dominance: number;   // BTC_mcap / Σ basket_mcaps
-  sma50: number | null;
-}
-
-interface DominanceSeries {
-  points: DominancePoint[];
-  /** Returns the most-recent-completed daily dominance bar at 4H ts `t`,
-   *  or null if warm-up insufficient (no daily close ≥ SMA period prior). */
-  lookup: (ts4h: number) => DominancePoint | null;
-}
-
-async function loadSyntheticBtcDominanceDaily(fromMs: number, toMs: number): Promise<DominanceSeries> {
-  // Try cache first.
-  let points: DominancePoint[] | null = null;
-  if (existsSync(DOMINANCE_CACHE)) {
-    try {
-      const raw = JSON.parse(readFileSync(DOMINANCE_CACHE, 'utf-8'));
-      if (
-        Array.isArray(raw.points) &&
-        raw.points.length > 0 &&
-        raw.basketSig === basketSignature() &&
-        raw.points[0].ts <= fromMs &&
-        raw.points[raw.points.length - 1].ts >= toMs - 24 * 60 * 60 * 1000
-      ) {
-        points = raw.points;
-      }
-    } catch { /* fall through to recompute */ }
-  }
-
-  if (!points) {
-    const series = new Map<string, Candle[]>();
-    for (const c of BASKET) {
-      series.set(c.symbol, await loadOrFetchDailyBars(c.symbol, fromMs, toMs));
-    }
-
-    // Intersect timestamps across all 5 daily series.
-    const all = BASKET.map((c) => series.get(c.symbol)!);
-    const tsSets = all.map((arr) => new Set(arr.map((b) => b.timestamp)));
-    const baseTs = all[0].map((b) => b.timestamp).filter((ts) => tsSets.every((s) => s.has(ts)));
-
-    // Per-symbol close lookup.
-    const closeMaps = new Map<string, Map<number, number>>();
-    for (const c of BASKET) {
-      const m = new Map<number, number>();
-      for (const b of series.get(c.symbol)!) m.set(b.timestamp, b.close);
-      closeMaps.set(c.symbol, m);
-    }
-
-    const raw: { ts: number; dominance: number }[] = [];
-    for (const ts of baseTs) {
-      let total = 0;
-      let btc = 0;
-      for (const c of BASKET) {
-        const close = closeMaps.get(c.symbol)!.get(ts)!;
-        const mcap = close * c.supply;
-        total += mcap;
-        if (c.symbol === 'BTC-USD') btc = mcap;
-      }
-      if (total > 0) raw.push({ ts, dominance: btc / total });
-    }
-
-    // Compute SMA(50) over the dominance series in-place.
-    points = raw.map((p, i) => {
-      if (i + 1 < BTC_D_SMA_PERIOD) return { ...p, sma50: null };
-      let sum = 0;
-      for (let k = i + 1 - BTC_D_SMA_PERIOD; k <= i; k++) sum += raw[k].dominance;
-      return { ...p, sma50: sum / BTC_D_SMA_PERIOD };
-    });
-
-    if (!existsSync(DATA_DIR)) mkdirSync(DATA_DIR, { recursive: true });
-    writeFileSync(DOMINANCE_CACHE, JSON.stringify({
-      generatedAt: new Date().toISOString(),
-      basketSig: basketSignature(),
-      basket: BASKET,
-      smaPeriod: BTC_D_SMA_PERIOD,
-      points,
-    }, null, 2));
-  }
-
-  // Build O(log n) lookup keyed by "most-recent-completed daily" semantics.
-  const sorted = [...points].sort((a, b) => a.ts - b.ts);
-  const lookup = (ts4h: number): DominancePoint | null => {
-    // Most-recent-completed daily means: a daily bar whose close happened
-    // strictly before bar i's open. A daily bar at timestamp `D_ts`
-    // covers [D_ts, D_ts + 24h] and closes at D_ts + 24h. So we want the
-    // largest `D_ts` with `D_ts + 24h ≤ ts4h`.
-    const cutoff = ts4h - 24 * 60 * 60 * 1000;
-    let lo = 0;
-    let hi = sorted.length - 1;
-    let found = -1;
-    while (lo <= hi) {
-      const mid = (lo + hi) >> 1;
-      if (sorted[mid].ts <= cutoff) { found = mid; lo = mid + 1; } else { hi = mid - 1; }
-    }
-    return found >= 0 ? sorted[found] : null;
-  };
-
-  return { points: sorted, lookup };
-}
-
-function basketSignature(): string {
-  return BASKET.map((c) => `${c.symbol}=${c.supply}`).join('|') + `;sma=${BTC_D_SMA_PERIOD}`;
-}
+//
+// Loader extracted to `./btc-dominance-synthetic.ts` so subsequent
+// regime-gated harnesses (TRA-298 onward) reuse the same source. See
+// that module's header for the source-choice rationale.
 
 // ── Trigger evaluation ────────────────────────────────────────────────────
 
@@ -680,15 +572,15 @@ function runLongSim(input: SimInput): SimReport {
       // independently auditable. The trigger that becomes the actual
       // entry candidate (BB precedence over ATR) flows through below.
       const dom = input.dominance.lookup(bars[idx].timestamp);
-      const altFavorable = dom !== null && dom.sma50 !== null && dom.dominance < dom.sma50;
+      const altFavorable = dom !== null && dom.sma !== null && dom.dominance < dom.sma;
 
       if (bbSig) {
-        if (dom === null || dom.sma50 === null) bumpSkip(SKIP_BTCD_WARMUP);
+        if (dom === null || dom.sma === null) bumpSkip(SKIP_BTCD_WARMUP);
         else if (altFavorable) bumpSkip(POST_GATE_BB);
         else bumpSkip(GATED_BB_BTCD);
       }
       if (atrSig) {
-        if (dom === null || dom.sma50 === null) bumpSkip(SKIP_BTCD_WARMUP);
+        if (dom === null || dom.sma === null) bumpSkip(SKIP_BTCD_WARMUP);
         else if (altFavorable) bumpSkip(POST_GATE_ATR);
         else bumpSkip(GATED_ATR_BTCD);
       }
@@ -937,14 +829,14 @@ function recomputeTestWindowSkipHistogram(
       if (bbSig) bump(FIRED_PRE_GATE_BB);
       if (atrSig) bump(FIRED_PRE_GATE_ATR);
       const dom = dominance.lookup(ts);
-      const altFavorable = dom !== null && dom.sma50 !== null && dom.dominance < dom.sma50;
+      const altFavorable = dom !== null && dom.sma !== null && dom.dominance < dom.sma;
       if (bbSig) {
-        if (dom === null || dom.sma50 === null) bump(SKIP_BTCD_WARMUP);
+        if (dom === null || dom.sma === null) bump(SKIP_BTCD_WARMUP);
         else if (altFavorable) bump(POST_GATE_BB);
         else bump(GATED_BB_BTCD);
       }
       if (atrSig) {
-        if (dom === null || dom.sma50 === null) bump(SKIP_BTCD_WARMUP);
+        if (dom === null || dom.sma === null) bump(SKIP_BTCD_WARMUP);
         else if (altFavorable) bump(POST_GATE_ATR);
         else bump(GATED_ATR_BTCD);
       }
@@ -1240,11 +1132,11 @@ async function main() {
   console.log(`[run-tra296] Aligned to ${new Date(ALIGNED_START_TS).toISOString()}: ${aligned}`);
 
   console.log('[run-tra296] Building synthetic BTC.D daily series (5-coin basket)…');
-  const dominance = await loadSyntheticBtcDominanceDaily(fromMs, toMs);
+  const dominance = await loadSyntheticBtcDominanceDaily(fromMs, toMs, BTC_D_SMA_PERIOD);
   const minDom = dominance.points[0];
   const maxDom = dominance.points[dominance.points.length - 1];
   console.log(`[run-tra296] BTC.D series: ${dominance.points.length} points, ${fmtDate(minDom.ts)} → ${fmtDate(maxDom.ts)}`);
-  console.log(`[run-tra296] BTC.D snapshot @ aligned start ${fmtDate(ALIGNED_START_TS)}: dominance=${dominance.lookup(ALIGNED_START_TS)?.dominance.toFixed(3) ?? 'n/a'}, sma50=${dominance.lookup(ALIGNED_START_TS)?.sma50?.toFixed(3) ?? 'n/a'}`);
+  console.log(`[run-tra296] BTC.D snapshot @ aligned start ${fmtDate(ALIGNED_START_TS)}: dominance=${dominance.lookup(ALIGNED_START_TS)?.dominance.toFixed(3) ?? 'n/a'}, sma=${dominance.lookup(ALIGNED_START_TS)?.sma?.toFixed(3) ?? 'n/a'}`);
 
   console.log('[run-tra296] Running regime-gated mean-reversion-long walk-forward…');
   const wf = runWalkForward(fullByPair, dominance);

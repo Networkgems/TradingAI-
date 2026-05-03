@@ -1,0 +1,398 @@
+{
+  "generatedAt": "2026-05-03T23:02:28.924Z",
+  "granularity": "4h",
+  "direction": "long",
+  "triggerFamily": "mean-reversion (regime-gated, BB-only)",
+  "triggers": [
+    "bb_reentry_long"
+  ],
+  "universe": [
+    "SOL-USD",
+    "DOGE-USD"
+  ],
+  "initialEquityUsd": 25000,
+  "feeBps": 40,
+  "slippageBps": 5,
+  "riskFraction": 0.01,
+  "atrKStop": 2,
+  "atrKTrail": 2,
+  "rrMin": 2,
+  "trailArmR": 1,
+  "bbPeriod": 20,
+  "bbMult": 2,
+  "btcdSmaPeriod": 20,
+  "btcdSource": "synthetic-5coin-basket",
+  "btcdBasket": [
+    {
+      "symbol": "BTC-USD",
+      "supply": 19500000
+    },
+    {
+      "symbol": "ETH-USD",
+      "supply": 120000000
+    },
+    {
+      "symbol": "SOL-USD",
+      "supply": 400000000
+    },
+    {
+      "symbol": "DOGE-USD",
+      "supply": 144000000000
+    },
+    {
+      "symbol": "XRP-USD",
+      "supply": 55000000000
+    }
+  ],
+  "trainBars": 1080,
+  "testBars": 540,
+  "stepBars": 540,
+  "alignedStartTs": 1689278400000,
+  "ddBarPct": 25,
+  "perWindow": [
+    {
+      "index": 0,
+      "trades": 3,
+      "winners": 1,
+      "hitRatePct": 33.33333333333333,
+      "expectancyR": -0.012517407034797978,
+      "totalPnlUsd": -88.44690345617568,
+      "rollingMaxDrawdownPct": 1.486687179499127,
+      "passes": false,
+      "reasons": [
+        "trades 3 < 4",
+        "expectancy -0.013R < 0.10R",
+        "hit rate 33.3% < 35%"
+      ],
+      "passesDdBar": true,
+      "perSymbol": [
+        {
+          "symbol": "SOL-USD",
+          "trades": 2,
+          "winners": 1,
+          "hitRatePct": 50,
+          "expectancyR": 0.48294181183581153,
+          "totalPnlUsd": 179.7157230876865
+        },
+        {
+          "symbol": "DOGE-USD",
+          "trades": 1,
+          "winners": 0,
+          "hitRatePct": 0,
+          "expectancyR": -1.003435844776017,
+          "totalPnlUsd": -268.1626265438622
+        }
+      ],
+      "preGateBb": 4,
+      "postGateBb": 3,
+      "gatedBb": 1,
+      "btcdWarmupMissing": 0
+    },
+    {
+      "index": 1,
+      "trades": 5,
+      "winners": 4,
+      "hitRatePct": 80,
+      "expectancyR": 1.1197109099190508,
+      "totalPnlUsd": 1240.9245459818842,
+      "rollingMaxDrawdownPct": 2.041288607206245,
+      "passes": true,
+      "reasons": [],
+      "passesDdBar": true,
+      "perSymbol": [
+        {
+          "symbol": "SOL-USD",
+          "trades": 2,
+          "winners": 2,
+          "hitRatePct": 100,
+          "expectancyR": 1.3299405335618089,
+          "totalPnlUsd": 599.6093574965819
+        },
+        {
+          "symbol": "DOGE-USD",
+          "trades": 3,
+          "winners": 2,
+          "hitRatePct": 66.66666666666666,
+          "expectancyR": 0.9795578274905452,
+          "totalPnlUsd": 641.3151884853023
+        }
+      ],
+      "preGateBb": 15,
+      "postGateBb": 5,
+      "gatedBb": 10,
+      "btcdWarmupMissing": 0
+    },
+    {
+      "index": 2,
+      "trades": 0,
+      "winners": 0,
+      "hitRatePct": 0,
+      "expectancyR": 0,
+      "totalPnlUsd": 0,
+      "rollingMaxDrawdownPct": 0.8706807347685674,
+      "passes": false,
+      "reasons": [
+        "trades 0 < 4",
+        "expectancy 0.000R < 0.10R",
+        "hit rate 0.0% < 35%"
+      ],
+      "passesDdBar": true,
+      "perSymbol": [
+        {
+          "symbol": "SOL-USD",
+          "trades": 0,
+          "winners": 0,
+          "hitRatePct": 0,
+          "expectancyR": 0,
+          "totalPnlUsd": 0
+        },
+        {
+          "symbol": "DOGE-USD",
+          "trades": 0,
+          "winners": 0,
+          "hitRatePct": 0,
+          "expectancyR": 0,
+          "totalPnlUsd": 0
+        }
+      ],
+      "preGateBb": 14,
+      "postGateBb": 1,
+      "gatedBb": 13,
+      "btcdWarmupMissing": 0
+    },
+    {
+      "index": 3,
+      "trades": 3,
+      "winners": 1,
+      "hitRatePct": 33.33333333333333,
+      "expectancyR": -0.5851657620825271,
+      "totalPnlUsd": -540.360282932824,
+      "rollingMaxDrawdownPct": 4.823621519021855,
+      "passes": false,
+      "reasons": [
+        "trades 3 < 4",
+        "expectancy -0.585R < 0.10R",
+        "hit rate 33.3% < 35%"
+      ],
+      "passesDdBar": true,
+      "perSymbol": [
+        {
+          "symbol": "SOL-USD",
+          "trades": 2,
+          "winners": 1,
+          "hitRatePct": 50,
+          "expectancyR": -0.3757628227470715,
+          "totalPnlUsd": -258.8880686420962
+        },
+        {
+          "symbol": "DOGE-USD",
+          "trades": 1,
+          "winners": 0,
+          "hitRatePct": 0,
+          "expectancyR": -1.0039716407534385,
+          "totalPnlUsd": -281.47221429072783
+        }
+      ],
+      "preGateBb": 7,
+      "postGateBb": 3,
+      "gatedBb": 4,
+      "btcdWarmupMissing": 0
+    },
+    {
+      "index": 4,
+      "trades": 1,
+      "winners": 0,
+      "hitRatePct": 0,
+      "expectancyR": -1.0096689806198131,
+      "totalPnlUsd": -289.0477435985001,
+      "rollingMaxDrawdownPct": 1.1803307568243757,
+      "passes": false,
+      "reasons": [
+        "trades 1 < 4",
+        "expectancy -1.010R < 0.10R",
+        "hit rate 0.0% < 35%"
+      ],
+      "passesDdBar": true,
+      "perSymbol": [
+        {
+          "symbol": "SOL-USD",
+          "trades": 0,
+          "winners": 0,
+          "hitRatePct": 0,
+          "expectancyR": 0,
+          "totalPnlUsd": 0
+        },
+        {
+          "symbol": "DOGE-USD",
+          "trades": 1,
+          "winners": 0,
+          "hitRatePct": 0,
+          "expectancyR": -1.0096689806198131,
+          "totalPnlUsd": -289.0477435985001
+        }
+      ],
+      "preGateBb": 14,
+      "postGateBb": 1,
+      "gatedBb": 13,
+      "btcdWarmupMissing": 0
+    },
+    {
+      "index": 5,
+      "trades": 1,
+      "winners": 1,
+      "hitRatePct": 100,
+      "expectancyR": 0.47946679453497326,
+      "totalPnlUsd": 82.12777700698679,
+      "rollingMaxDrawdownPct": 1.1364873146209726,
+      "passes": false,
+      "reasons": [
+        "trades 1 < 4"
+      ],
+      "passesDdBar": true,
+      "perSymbol": [
+        {
+          "symbol": "SOL-USD",
+          "trades": 1,
+          "winners": 1,
+          "hitRatePct": 100,
+          "expectancyR": 0.47946679453497326,
+          "totalPnlUsd": 82.12777700698679
+        },
+        {
+          "symbol": "DOGE-USD",
+          "trades": 0,
+          "winners": 0,
+          "hitRatePct": 0,
+          "expectancyR": 0,
+          "totalPnlUsd": 0
+        }
+      ],
+      "preGateBb": 11,
+      "postGateBb": 1,
+      "gatedBb": 10,
+      "btcdWarmupMissing": 0
+    },
+    {
+      "index": 6,
+      "trades": 1,
+      "winners": 0,
+      "hitRatePct": 0,
+      "expectancyR": -1.00696619085823,
+      "totalPnlUsd": -280.32039928450115,
+      "rollingMaxDrawdownPct": 1.2765599431949208,
+      "passes": false,
+      "reasons": [
+        "trades 1 < 4",
+        "expectancy -1.007R < 0.10R",
+        "hit rate 0.0% < 35%"
+      ],
+      "passesDdBar": true,
+      "perSymbol": [
+        {
+          "symbol": "SOL-USD",
+          "trades": 0,
+          "winners": 0,
+          "hitRatePct": 0,
+          "expectancyR": 0,
+          "totalPnlUsd": 0
+        },
+        {
+          "symbol": "DOGE-USD",
+          "trades": 1,
+          "winners": 0,
+          "hitRatePct": 0,
+          "expectancyR": -1.00696619085823,
+          "totalPnlUsd": -280.32039928450115
+        }
+      ],
+      "preGateBb": 7,
+      "postGateBb": 1,
+      "gatedBb": 6,
+      "btcdWarmupMissing": 0
+    },
+    {
+      "index": 7,
+      "trades": 2,
+      "winners": 0,
+      "hitRatePct": 0,
+      "expectancyR": -1.0082631989082547,
+      "totalPnlUsd": -572.6557457464884,
+      "rollingMaxDrawdownPct": 3.0819311060638266,
+      "passes": false,
+      "reasons": [
+        "trades 2 < 4",
+        "expectancy -1.008R < 0.10R",
+        "hit rate 0.0% < 35%"
+      ],
+      "passesDdBar": true,
+      "perSymbol": [
+        {
+          "symbol": "SOL-USD",
+          "trades": 1,
+          "winners": 0,
+          "hitRatePct": 0,
+          "expectancyR": -1.0081614229828704,
+          "totalPnlUsd": -285.8809246675051
+        },
+        {
+          "symbol": "DOGE-USD",
+          "trades": 1,
+          "winners": 0,
+          "hitRatePct": 0,
+          "expectancyR": -1.008364974833639,
+          "totalPnlUsd": -286.7748210789833
+        }
+      ],
+      "preGateBb": 13,
+      "postGateBb": 2,
+      "gatedBb": 11,
+      "btcdWarmupMissing": 0
+    },
+    {
+      "index": 8,
+      "trades": 0,
+      "winners": 0,
+      "hitRatePct": 0,
+      "expectancyR": 0,
+      "totalPnlUsd": 0,
+      "rollingMaxDrawdownPct": 0,
+      "passes": false,
+      "reasons": [
+        "trades 0 < 4",
+        "expectancy 0.000R < 0.10R",
+        "hit rate 0.0% < 35%"
+      ],
+      "passesDdBar": true,
+      "perSymbol": [
+        {
+          "symbol": "SOL-USD",
+          "trades": 0,
+          "winners": 0,
+          "hitRatePct": 0,
+          "expectancyR": 0,
+          "totalPnlUsd": 0
+        },
+        {
+          "symbol": "DOGE-USD",
+          "trades": 0,
+          "winners": 0,
+          "hitRatePct": 0,
+          "expectancyR": 0,
+          "totalPnlUsd": 0
+        }
+      ],
+      "preGateBb": 15,
+      "postGateBb": 0,
+      "gatedBb": 15,
+      "btcdWarmupMissing": 0
+    }
+  ],
+  "skipReasonsAggregate": {
+    "fired_pre_gate: bb_reentry_long": 100,
+    "post_gate_tradeable: bb_reentry_long": 17,
+    "§2 gated_by_btcd: bb_reentry_long": 83
+  },
+  "decision": "FAIL",
+  "passingWindowsBinding": 1,
+  "requiredPassing": 5
+}
