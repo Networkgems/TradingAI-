@@ -672,6 +672,25 @@ export const CRYPTO_WATCHLIST: readonly string[] = [
   'SNX-USD',   'APE-USD',   'COMP-USD',  'CHZ-USD',   'ZEC-USD',
 ] as const;
 
+/**
+ * Symbols that must never be watched, signalled, or traded — regardless of
+ * what a user has saved in their per-user watchlist or what the market
+ * scanner surfaces. Compared case-insensitively.
+ *
+ * TRA-283: TERMINUS-USD blacklisted — operator decision.
+ */
+export const CRYPTO_DENYLIST: readonly string[] = [
+  'TERMINUS-USD',
+] as const;
+
+const CRYPTO_DENYLIST_SET: ReadonlySet<string> = new Set(
+  CRYPTO_DENYLIST.map(s => s.toUpperCase()),
+);
+
+export function isCryptoSymbolBlocked(symbol: string): boolean {
+  return CRYPTO_DENYLIST_SET.has(symbol.toUpperCase());
+}
+
 export interface NewsItem {
   title: string;
   url: string;

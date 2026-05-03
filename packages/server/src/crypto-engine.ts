@@ -18,7 +18,7 @@ import {
   type ShortFilterContext,
   type ClosedShortTrade,
 } from '@trading-app/engine';
-import { CRYPTO_WATCHLIST } from '@trading-app/shared';
+import { CRYPTO_WATCHLIST, isCryptoSymbolBlocked } from '@trading-app/shared';
 import type { TradeSignal, Candle, AccountState, Position, CryptoEngineState, NewsItem, AccountSettings } from '@trading-app/shared';
 import { fetchCryptoMinuteBars, fetchCryptoDailyBars, fetchCrypto4hBars, fetchCryptoQuotes, fetchCryptoNews } from './crypto-feed.js';
 import { isYahooBreakerOpen } from './yahoo-feed.js';
@@ -359,11 +359,17 @@ export class CryptoSignalEngine {
   }
 
   getActiveSymbols(): string[] {
-    const base = (CRYPTO_WATCHLIST as readonly string[]).filter(s => !this.hiddenSymbols.has(s));
-    return [...base, ...Array.from(this.dynamicSymbols).filter(s => !base.includes(s))];
+    // TRA-283: filter denylisted symbols so they never receive quotes, signals,
+    // or new positions even if a stale client added them previously.
+    const base = (CRYPTO_WATCHLIST as readonly string[])
+      .filter(s => !this.hiddenSymbols.has(s) && !isCryptoSymbolBlocked(s));
+    const dyn = Array.from(this.dynamicSymbols)
+      .filter(s => !base.includes(s) && !isCryptoSymbolBlocked(s));
+    return [...base, ...dyn];
   }
 
   addSymbol(symbol: string): void {
+    if (isCryptoSymbolBlocked(symbol)) return;
     this.hiddenSymbols.delete(symbol);
     if (!(CRYPTO_WATCHLIST as readonly string[]).includes(symbol)) {
       this.dynamicSymbols.add(symbol);

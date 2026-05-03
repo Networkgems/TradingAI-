@@ -1,5 +1,5 @@
 import YahooFinance from 'yahoo-finance2';
-import { WATCHLIST, CRYPTO_WATCHLIST } from '@trading-app/shared';
+import { WATCHLIST, CRYPTO_WATCHLIST, isCryptoSymbolBlocked } from '@trading-app/shared';
 
 const yf = new YahooFinance({ suppressNotices: ['yahooSurvey'], validation: { logErrors: true } });
 
@@ -133,5 +133,8 @@ export async function scanCryptoMarket(): Promise<ScanResult[]> {
     console.warn('[market-scanner] trendingSymbols(crypto):', err instanceof Error ? err.message : String(err));
   }
 
-  return filterNew(dedup(collected), CRYPTO_WATCHLIST);
+  // TRA-283: drop denylisted tickers from scanner suggestions so they can't be
+  // re-added via the "Scan Market" UI flow.
+  const blocked = collected.filter(r => !isCryptoSymbolBlocked(r.symbol));
+  return filterNew(dedup(blocked), CRYPTO_WATCHLIST);
 }

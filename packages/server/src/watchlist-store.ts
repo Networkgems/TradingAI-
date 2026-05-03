@@ -2,7 +2,7 @@ import { readFile, writeFile, mkdir } from 'fs/promises';
 import { existsSync } from 'fs';
 import { join, dirname } from 'path';
 import { fileURLToPath } from 'url';
-import { WATCHLIST, CRYPTO_WATCHLIST } from '@trading-app/shared';
+import { WATCHLIST, CRYPTO_WATCHLIST, isCryptoSymbolBlocked } from '@trading-app/shared';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const DATA_DIR = process.env.DATA_DIR ?? join(__dirname, '..', 'data');
@@ -65,8 +65,10 @@ async function persist(username: string): Promise<void> {
 export function getCryptoWatchlistData(username: string): { all: string[]; added: string[]; hidden: string[] } {
   const { added, hidden } = getCache(username).crypto;
   const hiddenSet = new Set(hidden);
-  const base = (CRYPTO_WATCHLIST as readonly string[]).filter(s => !hiddenSet.has(s));
-  const addedNotInBase = added.filter(s => !base.includes(s));
+  // TRA-283: filter denylisted symbols out of every view so blocked tickers
+  // can't surface even if they were persisted before the denylist landed.
+  const base = (CRYPTO_WATCHLIST as readonly string[]).filter(s => !hiddenSet.has(s) && !isCryptoSymbolBlocked(s));
+  const addedNotInBase = added.filter(s => !base.includes(s) && !isCryptoSymbolBlocked(s));
   return { all: [...base, ...addedNotInBase], added, hidden };
 }
 
@@ -79,6 +81,9 @@ export function getStocksWatchlistData(username: string): { all: string[]; added
 }
 
 export async function addCryptoSymbol(username: string, symbol: string): Promise<void> {
+  // TRA-283: silently ignore denylisted symbols so an old client / scanner
+  // suggestion can't re-introduce a banned ticker.
+  if (isCryptoSymbolBlocked(symbol)) return;
   const d = getCache(username);
   d.crypto.hidden = d.crypto.hidden.filter(s => s !== symbol);
   if (!(CRYPTO_WATCHLIST as readonly string[]).includes(symbol) && !d.crypto.added.includes(symbol)) {
