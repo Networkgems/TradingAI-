@@ -5,8 +5,17 @@
  * (BTC/ETH/SOL/XRP/DOGE) we run an in-process StrategyRouter mirroring
  * `crypto-engine.getRouter` — same `paramsByDirection.short` blocks for Momentum
  * and Breakout, same long-side defaults. Long signals are dropped; only
- * `side === 'sell'` survives. The pre-route gate stack mirrors
- * `crypto-engine.applyShortGates`:
+ * `side === 'sell'` survives.
+ *
+ * **TRA-255 r3 / §8.1 timeframe contract:** the harness takes a
+ * `--granularity` flag (default `1d`). The 1D run is the *parked baseline*
+ * after the TRA-266 sweep park decision — every short signal is suppressed
+ * with `SKIP_PARKED_1D_DAILY` so the run still produces the §8 numbers for
+ * the doc but no trade is opened. The 4H run is the live evaluation track
+ * (Phase-1.1) and depends on TRA-267 (Coinbase 4H bar fetcher); until that
+ * lands the 4H mode bails with a clear error pointing at the blocker.
+ *
+ * The pre-route gate stack mirrors `crypto-engine.applyShortGates`:
  *
  *   1. Universe (all 5 symbols are members → always passes; kept for parity)
  *   2. BTC regime overlay via `evaluateShortFilters` (BTC's own router supplies
@@ -37,9 +46,11 @@
  *
  * Run:
  *   pnpm --filter @trading-app/backtest exec tsx src/run-tra261-sweep.ts
+ *   pnpm --filter @trading-app/backtest exec tsx src/run-tra261-sweep.ts --granularity=4h
  *
- * Outputs `reports/tra266-sweep.md` with the full per-window / per-symbol
- * grid and the sensitivity rollup.
+ * Outputs `reports/tra266-sweep.md` (1D parked baseline) or
+ * `reports/tra266-sweep-4h.md` (4H Phase-1.1) with the full per-window /
+ * per-symbol grid and the sensitivity rollup.
  */
 
 import { mkdirSync, writeFileSync } from 'node:fs';
@@ -51,6 +62,7 @@ import {
   MomentumStrategy,
   PERP_SHORTS_UNIVERSE,
   RegimeDetector,
+  SKIP_PARKED_1D_DAILY,
   StrategyRouter,
   advanceExtreme,
   breakoutTrailOptionsFor,
@@ -76,11 +88,33 @@ import { loadOrFetchDailyBars } from './fetch-tra266-data.js';
 const HERE = dirname(fileURLToPath(import.meta.url));
 const REPORT_DIR = resolve(HERE, '..', 'reports');
 
+/**
+ * Bar timeframes supported by the harness.
+ *  - `1d`: TRA-255 r3 §8.1 parked baseline. Every short emission is stamped
+ *          with `SKIP_PARKED_1D_DAILY` and dropped before sizing — the report
+ *          surfaces zero trades and the parked-skip histogram so QuantTrader
+ *          and the dashboard share the same audit trail.
+ *  - `4h`: TRA-255 r3 §12 (Phase-1.1 short-only) live evaluation. Same
+ *          `paramsByDirection.short` parameter values as 1D; the only thing
+ *          that changes is the bar interval the strategies read. Blocked on
+ *          [TRA-267](Coinbase 4H bar fetcher) — when 4H bars aren't yet
+ *          plumbed in `fetch-tra266-data.ts`, `--granularity=4h` errors with
+ *          a pointer to the blocker.
+ */
+type Granularity = '1d' | '4h';
+
 const INITIAL_EQUITY_USD = 25_000;
-const TRAIN_BARS_DEFAULT = 180; // 6 months of daily bars
-const TEST_BARS_DEFAULT = 90;   // 3 months of daily bars
-const STEP_BARS_DEFAULT = TEST_BARS_DEFAULT;
-const ROLLING_DD_BARS = 90;
+/**
+ * Walk-forward window sizing per granularity. The 1D defaults match the
+ * pre-r3 baseline (TRA-266 sweep). The 4H values keep the *wall-clock*
+ * train+test horizon roughly comparable so QuantTrader can read both
+ * reports against the same calendar slice — 6× the bar density gets 6× the
+ * train/test bar counts and the rolling-DD window gets the same scaling.
+ */
+const WINDOW_SIZING: Record<Granularity, { trainBars: number; testBars: number; rollingDdBars: number; barsPerDay: number }> = {
+  '1d': { trainBars: 180, testBars: 90, rollingDdBars: 90, barsPerDay: 1 },
+  '4h': { trainBars: 180 * 6, testBars: 90 * 6, rollingDdBars: 90 * 6, barsPerDay: 6 },
+};
 const FEE_BPS = 40;             // Coinbase Advanced Trade taker
 const SLIPPAGE_BPS = 5;
 const FROM_MS = Date.UTC(2022, 0, 1);
@@ -242,8 +276,15 @@ function rMultiple(side: 'buy' | 'sell', entryFill: number, exitFill: number, in
 
 interface SimInput {
   spec: ShortSpec;
-  /** symbol → daily candle slice for the window. Caller restricts the date span. */
+  /** symbol → bar slice for the window. Caller restricts the date span. */
   candlesBySymbol: Map<string, Candle[]>;
+  /**
+   * Bar granularity these candles were sampled at. Drives the §8.1 park
+   * gate (1D shorts get suppressed before sizing) and the report's lifecycle
+   * narration (`time stop 20 bars` reads as "20 days" on 1D, "80 hours" on
+   * 4H — same code path, different operator-facing meaning).
+   */
+  granularity: Granularity;
 }
 
 /**
@@ -353,6 +394,17 @@ function runShortSim(input: SimInput): SimReport {
       // Universe gate (defensive — every sim symbol is in the universe).
       if (!isPerpShortSymbol(signal.symbol)) {
         bumpSkip('not_in_universe');
+        continue;
+      }
+
+      // TRA-255 r3 §8.1 — Phase-1 1D timeframe is parked. Every short
+      // emission off 1D bars is suppressed before any sizing or filter work
+      // so the report surfaces "parked" instead of fake §8 numbers from a
+      // structurally hostile sample. The gate runs *before* §5 filters so
+      // a parked 1D symbol with also-failing funding/regime context still
+      // shows up as parked (the more specific diagnosis dominates).
+      if (input.granularity === '1d') {
+        bumpSkip(SKIP_PARKED_1D_DAILY);
         continue;
       }
 
@@ -596,6 +648,7 @@ interface WalkForwardInput {
   trainBars: number;
   testBars: number;
   stepBars: number;
+  granularity: Granularity;
 }
 
 interface WalkForwardOutput {
@@ -628,7 +681,7 @@ function runWalkForward(input: WalkForwardInput): WalkForwardOutput {
       // opened inside the test window. Filter trades on close timestamp below.
       sliceMap.set(sym, sliceCandles(all, win.trainStart, win.testEnd));
     }
-    const sim = runShortSim({ spec: input.spec, candlesBySymbol: sliceMap });
+    const sim = runShortSim({ spec: input.spec, candlesBySymbol: sliceMap, granularity: input.granularity });
 
     // Test slice timestamps for filtering trades + equity.
     const sampleSym = symbols[0];
@@ -654,7 +707,7 @@ function runWalkForward(input: WalkForwardInput): WalkForwardOutput {
     out.equityCurve.push(...testEquity);
 
     const perSymbol = perSymbolMetrics(testTrades, symbols);
-    const universe = universeMetrics(testTrades, testEquity);
+    const universe = universeMetrics(testTrades, testEquity, WINDOW_SIZING[input.granularity].rollingDdBars);
     out.perWindow.push({ index: i, metrics: universe, perSymbol });
   }
 
@@ -679,12 +732,16 @@ function perSymbolMetrics(trades: ClosedShort[], symbols: string[]): PerSymbolMe
   });
 }
 
-function universeMetrics(trades: ClosedShort[], equity: Array<{ ts: number; equity: number }>): UniverseMetrics {
+function universeMetrics(
+  trades: ClosedShort[],
+  equity: Array<{ ts: number; equity: number }>,
+  rollingDdBars: number,
+): UniverseMetrics {
   const winners = trades.filter((t) => t.pnlUsd > 0);
   const expectancy = trades.length > 0 ? trades.reduce((s, t) => s + t.rMultiple, 0) / trades.length : 0;
   const hitRatePct = trades.length > 0 ? (winners.length / trades.length) * 100 : 0;
   const totalPnl = trades.reduce((s, t) => s + t.pnlUsd, 0);
-  const rollingDD = rollingMaxDrawdownPct(equity, ROLLING_DD_BARS);
+  const rollingDD = rollingMaxDrawdownPct(equity, rollingDdBars);
 
   const reasons: string[] = [];
   if (trades.length === 0) reasons.push('no trades in window');
@@ -808,6 +865,7 @@ interface SweepRow {
 }
 
 function summariseSweep(input: WalkForwardInput, baselineWf: WalkForwardOutput): SweepRow[] {
+  const rollingDdBars = WINDOW_SIZING[input.granularity].rollingDdBars;
   const rows: SweepRow[] = [];
   // Baseline first.
   rows.push({
@@ -816,7 +874,7 @@ function summariseSweep(input: WalkForwardInput, baselineWf: WalkForwardOutput):
     totalPnl: baselineWf.windows.reduce((s, w) => s + w.closedShorts.reduce((ss, t) => ss + t.pnlUsd, 0), 0),
     perWindowExpectancy: baselineWf.perWindow.map((w) => w.metrics.expectancyR),
     perWindowHitRate: baselineWf.perWindow.map((w) => w.metrics.hitRatePct),
-    rollingDDPct: rollingMaxDrawdownPct(baselineWf.equityCurve, ROLLING_DD_BARS),
+    rollingDDPct: rollingMaxDrawdownPct(baselineWf.equityCurve, rollingDdBars),
   });
 
   for (const knob of SWEEP_KNOBS) {
@@ -829,7 +887,7 @@ function summariseSweep(input: WalkForwardInput, baselineWf: WalkForwardOutput):
         totalPnl: wf.windows.reduce((s, w) => s + w.closedShorts.reduce((ss, t) => ss + t.pnlUsd, 0), 0),
         perWindowExpectancy: wf.perWindow.map((w) => w.metrics.expectancyR),
         perWindowHitRate: wf.perWindow.map((w) => w.metrics.hitRatePct),
-        rollingDDPct: rollingMaxDrawdownPct(wf.equityCurve, ROLLING_DD_BARS),
+        rollingDDPct: rollingMaxDrawdownPct(wf.equityCurve, rollingDdBars),
         noopReason: knob.noopReason,
       });
     }
@@ -848,14 +906,24 @@ function buildReport(
   sweep: SweepRow[],
   symbols: string[],
   fullByPair: Map<string, Candle[]>,
+  granularity: Granularity,
 ): string {
+  const sizing = WINDOW_SIZING[granularity];
+  const barLabel = granularity === '1d' ? 'd' : granularity;
   const lines: string[] = [];
-  lines.push('# TRA-266 — §8 Walk-Forward Sweep Report\n');
+  const titleSuffix = granularity === '1d'
+    ? ' (1D parked baseline — TRA-255 r3 §8.1)'
+    : ' (4H Phase-1.1 — TRA-255 r3 §12)';
+  lines.push(`# TRA-266 — §8 Walk-Forward Sweep Report${titleSuffix}\n`);
   lines.push(`Generated: ${new Date().toISOString()}\n`);
+  lines.push(`Granularity: ${granularity}`);
   lines.push(`Universe: ${symbols.join(', ')}`);
   lines.push(`Date span: ${formatWindowDate(fullByPair.get(symbols[0])![0].timestamp)} → ${formatWindowDate(fullByPair.get(symbols[0])![fullByPair.get(symbols[0])!.length - 1].timestamp)}`);
   lines.push(`Initial equity: $${INITIAL_EQUITY_USD.toLocaleString()}, fees ${FEE_BPS} bps taker, slippage ${SLIPPAGE_BPS} bps`);
-  lines.push(`Walk-forward: train=${TRAIN_BARS_DEFAULT}d, test=${TEST_BARS_DEFAULT}d, step=${STEP_BARS_DEFAULT}d, windows=${baselineWf.windows.length}\n`);
+  lines.push(`Walk-forward: train=${sizing.trainBars}${barLabel}, test=${sizing.testBars}${barLabel}, step=${sizing.testBars}${barLabel}, windows=${baselineWf.windows.length}\n`);
+  if (granularity === '1d') {
+    lines.push('> **Parked baseline.** Per TRA-255 r3 §8.1 every 1D short emission is suppressed with `parked — failed §8 daily` before sizing. Trade counts here are expected to be 0; the report exists so the parked decision is auditable.\n');
+  }
 
   // ── Baseline acceptance summary ──────────────────────────────────────
   lines.push('## §8 Acceptance bars\n');
@@ -941,7 +1009,9 @@ function buildReport(
   // ── Decision ─────────────────────────────────────────────────────────
   const passAll = baselineWf.perWindow.every((w) => w.metrics.passes);
   lines.push('## Decision\n');
-  if (passAll) {
+  if (granularity === '1d') {
+    lines.push('**PARKED** — TRA-255 r3 §8.1 baseline. Phase-1 daily is parked by design (zero opens by `SKIP_PARKED_1D_DAILY`); the failing-window count above is expected and reflects "no trades in window" only. The live evaluation track is the 4H run gated on TRA-267.');
+  } else if (passAll) {
     lines.push('**PASS** — All §8 bars met across every walk-forward window. TRA-261 ready to ship.');
   } else {
     lines.push('**FAIL** — One or more windows missed §8 acceptance bars. TRA-261 reassigned to QuantTrader for parameter revision per spec §8 protocol.');
@@ -951,18 +1021,56 @@ function buildReport(
 
 // ── Main ───────────────────────────────────────────────────────────────
 
+/**
+ * Parse `--granularity=1d` / `--granularity=4h` (or `--granularity 4h`)
+ * out of the CLI argv. Defaults to `1d` (the parked baseline). Anything
+ * else is rejected with a hard error so a typo doesn't silently fall back
+ * to the daily run and confuse QuantTrader's audit trail.
+ */
+function parseGranularityFlag(argv: readonly string[]): Granularity {
+  const out: Granularity = '1d';
+  for (let i = 0; i < argv.length; i++) {
+    const arg = argv[i];
+    let raw: string | undefined;
+    if (arg.startsWith('--granularity=')) raw = arg.slice('--granularity='.length);
+    else if (arg === '--granularity') raw = argv[i + 1];
+    if (raw === undefined) continue;
+    const v = raw.trim().toLowerCase();
+    if (v === '1d' || v === 'daily') return '1d';
+    if (v === '4h' || v === '4hr') return '4h';
+    throw new Error(`Unsupported --granularity value: "${raw}". Use 1d or 4h.`);
+  }
+  return out;
+}
+
 async function main() {
+  const granularity = parseGranularityFlag(process.argv.slice(2));
   const fromMs = FROM_MS;
   const toMs = Date.now();
-  console.log(`[run-tra261-sweep] Loading daily bars ${formatWindowDate(fromMs)} → ${formatWindowDate(toMs)}`);
+
+  console.log(`[run-tra261-sweep] Granularity: ${granularity}`);
   const fullByPair = new Map<string, Candle[]>();
-  for (const sym of PERP_SHORTS_UNIVERSE) {
-    const bars = await loadOrFetchDailyBars(sym, fromMs, toMs);
-    fullByPair.set(sym, bars);
-    console.log(`  ${sym}: ${bars.length} bars`);
+
+  if (granularity === '1d') {
+    console.log(`[run-tra261-sweep] Loading daily bars ${formatWindowDate(fromMs)} → ${formatWindowDate(toMs)}`);
+    for (const sym of PERP_SHORTS_UNIVERSE) {
+      const bars = await loadOrFetchDailyBars(sym, fromMs, toMs);
+      fullByPair.set(sym, bars);
+      console.log(`  ${sym}: ${bars.length} bars`);
+    }
+  } else {
+    // 4H bar fetcher lives behind TRA-267 (Coinbase public candles,
+    // granularity=14400). The fetcher will land in `fetch-tra266-data.ts`
+    // alongside the daily one; until then surface a precise pointer so the
+    // operator knows which child ticket is gating the run.
+    throw new Error(
+      '--granularity=4h needs the 4H bar fetcher landed by TRA-267 '
+      + '(Expose Coinbase 4H crypto candles for Phase-1 perp shorts universe). '
+      + 'Currently only --granularity=1d is wired (parked baseline).',
+    );
   }
 
-  // Daily bar series — verify Yahoo gave us a comparable calendar.
+  // Bar series sanity check — Yahoo gives a comparable calendar across symbols on 1D.
   const lengths = [...fullByPair.values()].map((c) => c.length);
   const allEqual = lengths.every((l) => l === lengths[0]);
   if (!allEqual) {
@@ -970,48 +1078,61 @@ async function main() {
   }
 
   const symbols = [...PERP_SHORTS_UNIVERSE];
+  const sizing = WINDOW_SIZING[granularity];
 
   console.log('[run-tra261-sweep] Running baseline walk-forward…');
   const baselineWf = runWalkForward({
     spec: BASELINE_SPEC,
     fullByPair,
-    trainBars: TRAIN_BARS_DEFAULT,
-    testBars: TEST_BARS_DEFAULT,
-    stepBars: STEP_BARS_DEFAULT,
+    trainBars: sizing.trainBars,
+    testBars: sizing.testBars,
+    stepBars: sizing.testBars,
+    granularity,
   });
 
   console.log(`[run-tra261-sweep] ${baselineWf.windows.length} windows produced, running sensitivity sweep…`);
   const sweep = summariseSweep({
     spec: BASELINE_SPEC,
     fullByPair,
-    trainBars: TRAIN_BARS_DEFAULT,
-    testBars: TEST_BARS_DEFAULT,
-    stepBars: STEP_BARS_DEFAULT,
+    trainBars: sizing.trainBars,
+    testBars: sizing.testBars,
+    stepBars: sizing.testBars,
+    granularity,
   }, baselineWf);
 
-  const report = buildReport(baselineWf, sweep, symbols, fullByPair);
+  const report = buildReport(baselineWf, sweep, symbols, fullByPair, granularity);
   mkdirSync(REPORT_DIR, { recursive: true });
-  const outPath = resolve(REPORT_DIR, 'tra266-sweep.md');
+  const reportName = granularity === '1d' ? 'tra266-sweep.md' : 'tra266-sweep-4h.md';
+  const outPath = resolve(REPORT_DIR, reportName);
   writeFileSync(outPath, report);
   console.log(`\n[run-tra261-sweep] Report written: ${outPath}`);
 
   // Print acceptance summary to stdout for the harness operator.
   const passAll = baselineWf.perWindow.every((w) => w.metrics.passes);
   const failingCount = baselineWf.perWindow.filter((w) => !w.metrics.passes).length;
-  console.log(`\n=== TRA-266 §8 Acceptance ===`);
+  console.log(`\n=== TRA-266 §8 Acceptance (${granularity}) ===`);
+  if (granularity === '1d') {
+    console.log('Parked baseline run: every short suppressed with SKIP_PARKED_1D_DAILY. §8 numbers reflect zero opens — see TRA-255 r3 §8.1.');
+  }
   console.log(`Windows passing all bars: ${baselineWf.perWindow.length - failingCount} / ${baselineWf.perWindow.length}`);
-  console.log(`Decision: ${passAll ? 'PASS — TRA-261 ready to ship' : 'FAIL — TRA-261 → QuantTrader'}`);
+  if (granularity === '1d') {
+    console.log('Decision: PARKED — TRA-255 r3 §8.1 baseline. The 4H run (TRA-267) is the live evaluation track.');
+  } else {
+    console.log(`Decision: ${passAll ? 'PASS — TRA-261 ready to ship' : 'FAIL — TRA-261 → QuantTrader'}`);
+  }
 
   // Emit a JSON sidecar for downstream automation (TRA-261 update, etc.).
-  const sidecarPath = resolve(REPORT_DIR, 'tra266-sweep.json');
+  const sidecarName = granularity === '1d' ? 'tra266-sweep.json' : 'tra266-sweep-4h.json';
+  const sidecarPath = resolve(REPORT_DIR, sidecarName);
   writeFileSync(sidecarPath, JSON.stringify({
     generatedAt: new Date().toISOString(),
+    granularity,
     universe: symbols,
     initialEquityUsd: INITIAL_EQUITY_USD,
     feeBps: FEE_BPS,
     slippageBps: SLIPPAGE_BPS,
-    trainBars: TRAIN_BARS_DEFAULT,
-    testBars: TEST_BARS_DEFAULT,
+    trainBars: sizing.trainBars,
+    testBars: sizing.testBars,
     perWindow: baselineWf.perWindow.map((w) => ({
       index: w.index,
       ...w.metrics,

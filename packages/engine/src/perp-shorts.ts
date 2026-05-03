@@ -91,6 +91,18 @@ export const SKIP_CONSECUTIVE_LOSSES = '3 consecutive short losses — symbol co
  * stacked.
  */
 export const SKIP_MAX_CONCURRENT_SHORTS = 'max 3 concurrent shorts';
+/**
+ * TRA-255 §8.1 — Phase-1 1D timeframe is parked for all 5 universe symbols.
+ * The TRA-266 §8 walk-forward sweep on daily bars hit the §8 PARK threshold
+ * (consecutive failure streaks 10–15 vs the 4-window bar) on every symbol;
+ * QuantTrader's r3 call was a timeframe pivot to 4H, not parameter cycling.
+ * Any short signal generated against 1D bars is suppressed with this reason
+ * so the dashboard surfaces the park instead of silently dropping the
+ * signal. The 4H short-timeframe layer (§12 r3, Phase-1.1) is not parked —
+ * the gate keys on the timeframe of the bars the strategy evaluated, not
+ * the symbol.
+ */
+export const SKIP_PARKED_1D_DAILY = 'parked — failed §8 daily';
 
 // ── Filter thresholds (TRA-255 §5) ─────────────────────────────────────────
 

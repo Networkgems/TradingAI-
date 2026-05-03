@@ -113,6 +113,7 @@ export {
   SKIP_CROSS_STRATEGY_CAP,
   SKIP_CONSECUTIVE_LOSSES,
   SKIP_MAX_CONCURRENT_SHORTS,
+  SKIP_PARKED_1D_DAILY,
   isPerpShortSymbol,
   isTier2PerpShort,
   perpShortRiskFraction,
