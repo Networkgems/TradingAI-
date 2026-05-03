@@ -10,6 +10,16 @@ export { BbFadeStrategy } from './strategies/bb-fade.js';
 export type { BbFadeOptions } from './strategies/bb-fade.js';
 export { MomentumStrategy } from './strategies/momentum.js';
 export type { MomentumOptions } from './strategies/momentum.js';
+export {
+  BTC_RSI_BRACKET_DEFAULTS,
+  resolveBtcRsiBracket,
+  tryBtcRsiBracketShort,
+} from './strategies/btc-rsi-bracket.js';
+export type {
+  BtcRsiBracketOverride,
+  ResolvedBtcRsiBracket,
+  BtcRsiBracketEvalArgs,
+} from './strategies/btc-rsi-bracket.js';
 export { MeanReversionCryptoStrategy } from './strategies/mean-reversion-crypto.js';
 export type { MeanReversionCryptoOptions } from './strategies/mean-reversion-crypto.js';
 export { BreakoutVolStrategy } from './strategies/breakout-vol.js';

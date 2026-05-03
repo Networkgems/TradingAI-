@@ -439,6 +439,15 @@ export class CryptoSignalEngine {
               // (drop-bar 1.5× ATR, close-in-lower 33%, vol 1.5×, recent-high
               // anchor 95% over 20-bar lookback).
               byTimeframe: { '4h': {} },
+              // TRA-284 / TRA-255 §4.4 v2 — BTC RSI-extreme bracket trigger.
+              // Routes BTC-USD shorts through the bracket (RSI(14) ≥ 70 +
+              // 0.98 × max(high, 20) anchor + bearish-rejection close in
+              // lower-half range + softened daily-regime gate) instead of
+              // the cascade-leg trigger. Alts (ETH / SOL / XRP / DOGE) keep
+              // the cascade-leg trigger byte-unchanged. Bracket numerics
+              // resolve to the spec defaults; override knobs live on
+              // `btcRsiBracket` if needed in a future retune.
+              lowCascadeDensitySymbols: ['BTC-USD'],
             },
           },
         }),

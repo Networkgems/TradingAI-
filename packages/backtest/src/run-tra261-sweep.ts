@@ -128,6 +128,20 @@ const FROM_MS = Date.UTC(2022, 0, 1);
  */
 const SKIP_DIAGNOSTIC_NULL_EMISSION = 'diagnostic — router emitted no signal';
 const SKIP_DIAGNOSTIC_LONG_EMISSION = 'diagnostic — router emitted a long signal (dropped pre-short-gate)';
+/**
+ * TRA-284 / TRA-255 §4.4 v2 — bracket emission counter. Bumped every time
+ * `MomentumStrategy` emits a short on a 4H bar for a symbol routed to the
+ * BTC RSI-extreme bracket trigger (i.e. `signal.symbol ∈
+ * spec.momentum.lowCascadeDensitySymbols`). Surfaced as a row in the §8
+ * sweep report's skip-reason histogram so BTC-side bracket density is
+ * inspectable independent of the alt-cluster cascade-leg density. The
+ * cascade-leg trigger fires for non-listed alt symbols and is reflected by
+ * the existing per-symbol trade counts; the bracket needs its own counter
+ * because BTC's pre-r8 baseline was 0 / 9 windows and the v2 §8 acceptance
+ * bar specifically requires "≥ 1 BTC trade in ≥ 3 of 9 windows" (TRA-255
+ * §4.4 v2 acceptance).
+ */
+const DIAGNOSTIC_BTC_RSI_BRACKET_EMITTED = 'diagnostic — btc-rsi-bracket emitted';
 
 /**
  * Spec values for §4 short overrides. These mirror `crypto-engine.getRouter`
@@ -149,6 +163,13 @@ interface ShortSpec {
      * 1D parked or 4H) and long paths stay byte-identical.
      */
     cascadeLeg4h?: boolean;
+    /**
+     * TRA-284 / TRA-255 §4.4 v2 — symbols routed to the BTC RSI-extreme
+     * bracket trigger instead of the cascade-leg trigger when the cascade
+     * family is active on 4H. Empty / undefined = cascade-leg fires for
+     * every symbol (pre-v2 routing). Spec r8 ships `['BTC-USD']`.
+     */
+    lowCascadeDensitySymbols?: readonly string[];
   };
   breakout: {
     volumeMultiplier: number;
@@ -197,6 +218,10 @@ const BASELINE_SPEC: ShortSpec = {
     volumeMultiplier: 1.10,
     volumeSmaPeriod: 20,
     cascadeLeg4h: true,
+    // TRA-284 / TRA-255 §4.4 v2 — route BTC-USD shorts to the RSI-extreme
+    // bracket trigger; alts (ETH / SOL / XRP / DOGE) keep the cascade-leg
+    // trigger unchanged. r8 spec `lowCascadeDensitySymbols: ['BTC-USD']`.
+    lowCascadeDensitySymbols: ['BTC-USD'],
   },
   breakout: {
     volumeMultiplier: 1.5,
@@ -220,13 +245,21 @@ function buildShortRouter(spec: ShortSpec): StrategyRouter {
   // Strip harness-only flags that don't map directly onto the strategy
   // option types — `cascadeLeg4h` translates into `byTimeframe['4h']` and
   // `consolidationBars` flows through to BreakoutVolOptions on its own.
-  const { cascadeLeg4h, ...momentumFlat } = spec.momentum;
+  // TRA-284 / TRA-255 §4.4 v2 — `lowCascadeDensitySymbols` likewise lifts
+  // off the harness spec into the strategy short overrides directly.
+  const { cascadeLeg4h, lowCascadeDensitySymbols, ...momentumFlat } = spec.momentum;
   return new StrategyRouter({
     regime,
     momentum: new MomentumStrategy(regime, {
       paramsByDirection: {
         short: cascadeLeg4h
-          ? { ...momentumFlat, byTimeframe: { '4h': {} } }
+          ? {
+              ...momentumFlat,
+              byTimeframe: { '4h': {} },
+              ...(lowCascadeDensitySymbols !== undefined
+                ? { lowCascadeDensitySymbols }
+                : {}),
+            }
           : { ...momentumFlat },
       },
     }),
@@ -478,6 +511,24 @@ function runShortSim(input: SimInput): SimReport {
       if (!isPerpShortSymbol(signal.symbol)) {
         bumpSkip('not_in_universe');
         continue;
+      }
+
+      // TRA-284 / TRA-255 §4.4 v2 — bracket emission counter. Bumped on the
+      // signal-emission boundary (post-universe, pre-§5 / §6 / caps gates)
+      // so the counter reflects raw trigger activity, not post-gate fills.
+      // Routing predicate matches `MomentumStrategy` exactly: 4H bars,
+      // momentum signal type, and symbol matched by the spec's
+      // `lowCascadeDensitySymbols`. The cascade-leg trigger never fires for
+      // a routed-to-bracket symbol (engine-side routing is exclusive on
+      // symbol), so this counter unambiguously isolates bracket emissions
+      // from the alt-cluster cascade-leg counts already visible via the
+      // per-symbol trade rollup.
+      if (
+        input.granularity === '4h'
+        && signal.type === 'momentum'
+        && (input.spec.momentum.lowCascadeDensitySymbols ?? []).includes(signal.symbol)
+      ) {
+        bumpSkip(DIAGNOSTIC_BTC_RSI_BRACKET_EMITTED);
       }
 
       // TRA-255 r3 §8.1 — Phase-1 1D timeframe is parked. Every short

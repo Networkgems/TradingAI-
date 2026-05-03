@@ -6,6 +6,12 @@ import { atr } from '../indicators/atr.js';
 import type { AlpacaOrderClient } from '../alpaca/index.js';
 import type { RiskManager } from '../risk.js';
 import type { RegimeDetector, Regime } from '../regime.js';
+import {
+  BtcRsiBracketOverride,
+  ResolvedBtcRsiBracket,
+  resolveBtcRsiBracket,
+  tryBtcRsiBracketShort,
+} from './btc-rsi-bracket.js';
 
 export interface MomentumOptions {
   /** Fast EMA period for the trend filter (default: 50). */
@@ -86,6 +92,21 @@ export interface MomentumOptions {
     long?: Partial<Omit<MomentumOptions, 'paramsByDirection'>>;
     short?: Partial<Omit<MomentumOptions, 'paramsByDirection' | 'byTimeframe'>> & {
       byTimeframe?: MomentumByTimeframeOverrides;
+      /**
+       * TRA-284 / TRA-255 §4.4 v2 — symbols routed to the BTC RSI-extreme
+       * bracket trigger instead of the cascade-leg trigger when
+       * `byTimeframe['4h']` is active. Default empty (cascade-leg fires for
+       * every symbol). Spec r8 ships `['BTC-USD']`. The list is
+       * intentionally generalisable so a future "smooth-distribution major"
+       * can be added without touching trigger code.
+       */
+      lowCascadeDensitySymbols?: readonly string[];
+      /**
+       * TRA-284 / TRA-255 §4.4 v2 — overrides for the BTC RSI-extreme
+       * bracket numeric primitives. Defaults to the spec values
+       * (`RSI(14) ≥ 70`, `0.98 × max(high, 20)`, lower-half close).
+       */
+      btcRsiBracket?: BtcRsiBracketOverride;
     };
   };
 }
@@ -175,6 +196,19 @@ interface ResolvedOptions {
    * cascade-leg trigger described on {@link MomentumCascadeLegOverride}.
    */
   cascadeLeg4h: ResolvedCascadeLeg | undefined;
+  /**
+   * TRA-284 / TRA-255 §4.4 v2 — resolved BTC RSI-extreme bracket config.
+   * Fixed-defaults so callers that wire the routing predicate via
+   * `lowCascadeDensitySymbols` get the spec numerics for free; only
+   * populated on the short overrides resolved set.
+   */
+  btcRsiBracket: ResolvedBtcRsiBracket;
+  /**
+   * TRA-284 / TRA-255 §4.4 v2 — symbols routed to the bracket trigger.
+   * Always defined (defaults to an empty Set so the cascade-leg path keeps
+   * its byte-identical behaviour for callers that haven't opted into v2).
+   */
+  lowCascadeDensitySymbols: ReadonlySet<string>;
 }
 
 interface ResolvedCascadeLeg {
@@ -208,6 +242,8 @@ const CASCADE_LEG_DEFAULTS: ResolvedCascadeLeg = {
 const FOUR_HOUR_INTERVAL_MIN_MS = 3.5 * 60 * 60 * 1000;
 const FOUR_HOUR_INTERVAL_MAX_MS = 4.5 * 60 * 60 * 1000;
 
+const EMPTY_LOW_CASCADE_DENSITY_SYMBOLS: ReadonlySet<string> = new Set<string>();
+
 const DEFAULTS: Omit<ResolvedOptions, 'rearmBars'> = {
   fastMaPeriod: 50,
   slowMaPeriod: 200,
@@ -223,6 +259,18 @@ const DEFAULTS: Omit<ResolvedOptions, 'rearmBars'> = {
   volumeSmaPeriod: 20,
   lotSize: undefined,
   cascadeLeg4h: undefined,
+  // TRA-284 / TRA-255 §4.4 v2 — bracket defaults are filled in even on the
+  // long-side resolved set so reading `opt.btcRsiBracket` is always type-
+  // safe; the bracket trigger only ever runs on the short side under
+  // `cascadeShortActive` AND `lowCascadeDensitySymbols.has(symbol)`.
+  btcRsiBracket: {
+    rsiPeriod: 14,
+    rsiOverboughtThreshold: 70,
+    recentHighLookback: 20,
+    recentHighAnchorRatio: 0.98,
+    bearishRejectionRangeRatio: 0.50,
+  },
+  lowCascadeDensitySymbols: EMPTY_LOW_CASCADE_DENSITY_SYMBOLS,
 };
 
 /**
@@ -302,9 +350,11 @@ export class MomentumStrategy {
   private resolveDirectionalOverrides(
     raw: Partial<Omit<MomentumOptions, 'paramsByDirection'>> & {
       byTimeframe?: MomentumByTimeframeOverrides;
+      lowCascadeDensitySymbols?: readonly string[];
+      btcRsiBracket?: BtcRsiBracketOverride;
     },
   ): Partial<ResolvedOptions> {
-    const { byTimeframe, ...flat } = raw;
+    const { byTimeframe, lowCascadeDensitySymbols, btcRsiBracket, ...flat } = raw;
     const out: Partial<ResolvedOptions> = { ...flat };
     if (raw.donchianPeriod !== undefined && raw.rearmBars === undefined) {
       out.rearmBars = raw.donchianPeriod;
@@ -318,6 +368,18 @@ export class MomentumStrategy {
         recentHighLookback: cascade4h.recentHighLookback ?? CASCADE_LEG_DEFAULTS.recentHighLookback,
         recentHighAnchorRatio: cascade4h.recentHighAnchorRatio ?? CASCADE_LEG_DEFAULTS.recentHighAnchorRatio,
       };
+    }
+    // TRA-284 / TRA-255 §4.4 v2 — bracket override + routing-symbol set.
+    // Always overlay the bracket defaults so the resolved shortOverrides
+    // carries the spec numerics even when the caller only wires the
+    // symbol list. The cascade-leg vs bracket routing is decided per-evaluate
+    // by `optFor('sell').lowCascadeDensitySymbols.has(symbol)` so the
+    // resolution itself is symbol-agnostic.
+    if (btcRsiBracket !== undefined) {
+      out.btcRsiBracket = resolveBtcRsiBracket(btcRsiBracket);
+    }
+    if (lowCascadeDensitySymbols !== undefined) {
+      out.lowCascadeDensitySymbols = new Set(lowCascadeDensitySymbols);
     }
     return out;
   }
@@ -358,21 +420,42 @@ export class MomentumStrategy {
     const effectiveRegime: Regime = regime ?? this.regime.update(candles);
 
     // TRA-275 / TRA-255 §4.4 r6 — cascade-leg short trigger replaces §4.1 on 4H.
-    // Resolved short overrides + 4H bar interval activates the cascade trigger
+    // TRA-284 / TRA-255 §4.4 v2 — for symbols in `lowCascadeDensitySymbols`
+    // the BTC RSI-extreme bracket trigger replaces the cascade-leg trigger;
+    // routing is exclusive on `symbol` so a single bar cannot fire both.
+    // Resolved short overrides + 4H bar interval activates the cascade family
     // (which has its own softer regime gate); fired here BEFORE the strict
     // §4.1 regime gate so a `range` / `high_vol` / `flat` 4H tape can still
-    // surface a cascade short. Long-side and non-4H short paths fall through
+    // surface a short. Long-side and non-4H short paths fall through
     // to the unchanged §4.1 stack below.
     const cascadeShortActive =
       this.shortOverrides !== null
       && (this.shortOverrides as Partial<ResolvedOptions>).cascadeLeg4h !== undefined
       && this.isFourHourBars(candles);
     if (cascadeShortActive) {
-      const cascadeSig = this.tryCascadeShort(symbol, candles, effectiveRegime);
-      if (cascadeSig) return cascadeSig;
-      // Cascade didn't fire. Fall through so a 4H *long* signal can still
-      // come from the §4.1 path; a 4H short from §4.1 is explicitly replaced
-      // by the cascade trigger and is suppressed below.
+      const shortOpt = this.optFor('sell');
+      const useBracket = shortOpt.lowCascadeDensitySymbols.has(symbol);
+      const sig = useBracket
+        ? tryBtcRsiBracketShort({
+            symbol,
+            candles,
+            regime: effectiveRegime,
+            bracket: shortOpt.btcRsiBracket,
+            atrPeriod: shortOpt.atrPeriod,
+            atrStopMultiplier: shortOpt.atrStopMultiplier,
+            atrTpMultiplier: shortOpt.atrTpMultiplier,
+            rearmBars: shortOpt.rearmBars,
+            lastFireTs: this.lastFireTs,
+          })
+        : this.tryCascadeShort(symbol, candles, effectiveRegime);
+      if (sig) {
+        this.lastFireTs = sig.timestamp;
+        return sig;
+      }
+      // Neither bracket nor cascade fired. Fall through so a 4H *long*
+      // signal can still come from the §4.1 path; a 4H short from §4.1 is
+      // explicitly replaced by the active cascade-family trigger and is
+      // suppressed below.
     }
 
     if (effectiveRegime !== 'trend_up' && effectiveRegime !== 'trend_down') return null;

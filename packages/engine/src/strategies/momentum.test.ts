@@ -535,6 +535,291 @@ describe('MomentumStrategy', () => {
     });
   });
 
+  describe('TRA-284 / TRA-255 §4.4 v2 — BTC RSI-extreme bracket short trigger', () => {
+    const FOUR_HOUR_MS = 4 * 60 * 60 * 1000;
+
+    /**
+     * Build a synthetic 250-bar 4H rally that drives RSI(14) into the
+     * overbought bracket (≥ 70) by the end, then prints a parameterised
+     * bracket bar. The bracket bar's open / high / low / close knobs let
+     * each test isolate one of the four §4.4 v2 gates.
+     *
+     * Defaults set every gate to pass:
+     *   - high ≈ recent peak (anchor passes at 0.98 ratio).
+     *   - close < open (bearish), close in lower 25 % of range
+     *     (well inside the lower-half rejection bar).
+     *   - RSI saturates near 100 from the rally so the gate clears with
+     *     headroom even after a single bearish bar.
+     */
+    function bracketSeries(opts: {
+      preLen?: number;
+      perBar?: number;
+      bracketOpen?: number;
+      bracketHigh?: number;
+      bracketLow?: number;
+      bracketClose?: number;
+    } = {}): Candle[] {
+      const preLen = opts.preLen ?? 250;
+      const perBar = opts.perBar ?? 0.005;
+      const out: Candle[] = [];
+      let prev = 100;
+      for (let i = 0; i < preLen; i++) {
+        const next = prev * (1 + perBar);
+        out.push({
+          symbol: 'BTC-USD',
+          timestamp: i * FOUR_HOUR_MS,
+          open: prev,
+          high: Math.max(prev, next) + 0.4,
+          low: Math.min(prev, next) - 0.4,
+          close: next,
+          volume: 1_000,
+        });
+        prev = next;
+      }
+      // Default bracket bar: open at last close, spike to the recent peak,
+      // close clearly below open inside the lower 25 % of the bar's range.
+      const peak = prev + 0.4;
+      const open = opts.bracketOpen ?? prev;
+      const high = opts.bracketHigh ?? peak;
+      // Pull close to ~prev - 1 (small bearish move). This is enough delta
+      // to make `close < open` cleanly without crashing RSI below 70 — the
+      // 250-bar rally has saturated avgGain, so a single down-bar still
+      // leaves RSI ≈ 90+.
+      const close = opts.bracketClose ?? (open - 1.0);
+      // Range spans peak → low; placing the low at ~close - 0.2 puts the
+      // close 0.2 above the low while range is ~ peak - close + 0.2.
+      // Default range ≈ 1.2 → close-from-low ≈ 0.17 (well under 0.50).
+      const low = opts.bracketLow ?? (close - 0.2);
+      out.push({
+        symbol: 'BTC-USD',
+        timestamp: preLen * FOUR_HOUR_MS,
+        open,
+        high,
+        low,
+        close,
+        volume: 1_000,
+      });
+      return out;
+    }
+
+    /**
+     * Run the bracket fixture through MomentumStrategy with the v2 wiring
+     * (cascade-family activated via `byTimeframe['4h']`, BTC-USD routed to
+     * the bracket trigger via `lowCascadeDensitySymbols`).
+     */
+    function evalBracket(
+      candles: Candle[],
+      regime: 'trend_up' | 'trend_down' | 'range' | 'high_vol' | 'flat',
+      symbol = 'BTC-USD',
+    ) {
+      const detector = new RegimeDetector();
+      const strat = new MomentumStrategy(detector, {
+        fastMaPeriod: 50,
+        slowMaPeriod: 200,
+        donchianPeriod: 20,
+        paramsByDirection: {
+          short: {
+            atrStopMultiplier: 2.0,
+            rearmBars: 8,
+            slowMaSlopeBars: 10,
+            volumeMultiplier: 1.10,
+            volumeSmaPeriod: 20,
+            byTimeframe: { '4h': {} },
+            lowCascadeDensitySymbols: ['BTC-USD'],
+          },
+        },
+      });
+      return strat.evaluate(symbol, candles, regime);
+    }
+
+    it('fires a short on a clean RSI≥70 bearish-rejection bar against a recent peak under range regime', () => {
+      const sig = evalBracket(bracketSeries(), 'range');
+      expect(sig).not.toBeNull();
+      expect(sig?.side).toBe('sell');
+      expect(sig?.type).toBe('momentum');
+      expect(sig?.stopLoss).toBeGreaterThan(sig!.entryPrice);
+      expect(sig?.takeProfit).toBeLessThan(sig!.entryPrice);
+    });
+
+    it('softer regime gate: fires under high_vol and flat, blocks under trend_up', () => {
+      expect(evalBracket(bracketSeries(), 'high_vol')?.side).toBe('sell');
+      expect(evalBracket(bracketSeries(), 'flat')?.side).toBe('sell');
+      expect(evalBracket(bracketSeries(), 'trend_up')).toBeNull();
+    });
+
+    it('RSI extreme gate: blocks when RSI(14) is below the overbought threshold', () => {
+      // Flat pre-series → RSI ≈ 50, well under 70.
+      const candles: Candle[] = [];
+      let prev = 100;
+      for (let i = 0; i < 250; i++) {
+        const next = prev + (i % 2 === 0 ? 0.05 : -0.05); // tiny oscillation
+        candles.push({
+          symbol: 'BTC-USD',
+          timestamp: i * FOUR_HOUR_MS,
+          open: prev, high: Math.max(prev, next) + 0.4, low: Math.min(prev, next) - 0.4,
+          close: next, volume: 1_000,
+        });
+        prev = next;
+      }
+      // Bracket bar that satisfies anchor + bearish rejection but should
+      // be vetoed by the RSI gate alone.
+      const peak = Math.max(...candles.map((c) => c.high));
+      const open = prev;
+      const high = peak;
+      const close = open - 0.5;
+      const low = close - 0.1;
+      candles.push({
+        symbol: 'BTC-USD', timestamp: 250 * FOUR_HOUR_MS,
+        open, high, low, close, volume: 1_000,
+      });
+      const detector = new RegimeDetector();
+      const strat = new MomentumStrategy(detector, {
+        fastMaPeriod: 50, slowMaPeriod: 200, donchianPeriod: 20,
+        paramsByDirection: {
+          short: {
+            atrStopMultiplier: 2.0, rearmBars: 8, slowMaSlopeBars: 10,
+            volumeMultiplier: 1.10, volumeSmaPeriod: 20,
+            byTimeframe: { '4h': {} },
+            lowCascadeDensitySymbols: ['BTC-USD'],
+          },
+        },
+      });
+      expect(strat.evaluate('BTC-USD', candles, 'range')).toBeNull();
+    });
+
+    it('recent-high anchor gate: blocks when the bracket bar high is below 0.98× the prior 20-bar peak', () => {
+      // Default fixture peak is ~prev + 0.4 ≈ 348.7. Force the bracket bar's
+      // high well below that — even at 0.97× it should block (default ratio
+      // is 0.98 in spec).
+      const last = 100 * Math.pow(1.005, 250);
+      const peak = last + 0.4;
+      const lowAnchorHigh = peak * 0.95; // 5 % below peak — clearly under 0.98
+      const sig = evalBracket(bracketSeries({
+        bracketOpen: lowAnchorHigh,
+        bracketHigh: lowAnchorHigh,
+        bracketClose: lowAnchorHigh - 1.0,
+        bracketLow: lowAnchorHigh - 1.2,
+      }), 'range');
+      expect(sig).toBeNull();
+    });
+
+    it('bearish-rejection gate: blocks when close >= open (not bearish)', () => {
+      const last = 100 * Math.pow(1.005, 250);
+      const peak = last + 0.4;
+      // Close at or above open kills the bearish-rejection gate.
+      const sig = evalBracket(bracketSeries({
+        bracketOpen: last,
+        bracketHigh: peak,
+        bracketClose: last + 0.1, // bullish, NOT bearish
+        bracketLow: last - 0.5,
+      }), 'range');
+      expect(sig).toBeNull();
+    });
+
+    it('bearish-rejection gate: blocks when close lands in the upper half of the bar range', () => {
+      const last = 100 * Math.pow(1.005, 250);
+      const peak = last + 0.4;
+      // close < open (bearish) but close > low + 0.50 × range (upper half).
+      // Range = peak - low = peak - (peak - 5) = 5. close - low must be > 2.5.
+      // Set close at low + 4 → close-from-low = 4/5 = 0.80 → fails.
+      const low = peak - 5;
+      const close = low + 4;
+      const sig = evalBracket(bracketSeries({
+        bracketOpen: last,
+        bracketHigh: peak,
+        bracketClose: close,
+        bracketLow: low,
+      }), 'range');
+      expect(sig).toBeNull();
+    });
+
+    it('routing: cascade-leg still fires on non-listed symbols (alt cluster regression guard)', () => {
+      // Same MomentumStrategy with `lowCascadeDensitySymbols: ['BTC-USD']`.
+      // On 'ETH-USD' the routing predicate falls through to the cascade-leg
+      // trigger — the bracket fixture isn't a cascade flush so this should
+      // produce null, not a bracket fire under the wrong symbol.
+      const sig = evalBracket(bracketSeries(), 'range', 'ETH-USD');
+      expect(sig).toBeNull();
+    });
+
+    it('routing: an explicit cascade-flush series still fires for an alt symbol when bracket is wired for BTC only', () => {
+      // Build a cascade-flush series (mirrors the cascade-leg test fixture)
+      // and confirm it still fires on ETH-USD via the cascade-leg trigger
+      // even though `lowCascadeDensitySymbols: ['BTC-USD']` is wired.
+      const out: Candle[] = [];
+      let prev = 100;
+      const preLen = 250;
+      for (let i = 0; i < preLen; i++) {
+        const next = prev * (1 + 0.005);
+        out.push({
+          symbol: 'ETH-USD',
+          timestamp: i * FOUR_HOUR_MS,
+          open: prev,
+          high: Math.max(prev, next) + 0.4,
+          low: Math.min(prev, next) - 0.4,
+          close: next,
+          volume: 1_000,
+        });
+        prev = next;
+      }
+      // Cascade flush: heavy drop bar with high at the recent peak, close
+      // crushed against the lows, volume well above 1.75× the SMA.
+      const last = prev;
+      const open = last;
+      const close = open - 5;
+      out.push({
+        symbol: 'ETH-USD',
+        timestamp: preLen * FOUR_HOUR_MS,
+        open,
+        high: open + 0.1,
+        low: close - 0.1,
+        close,
+        volume: 5_000,
+      });
+      const detector = new RegimeDetector();
+      const strat = new MomentumStrategy(detector, {
+        fastMaPeriod: 50, slowMaPeriod: 200, donchianPeriod: 20,
+        paramsByDirection: {
+          short: {
+            atrStopMultiplier: 2.0, rearmBars: 8, slowMaSlopeBars: 10,
+            volumeMultiplier: 1.10, volumeSmaPeriod: 20,
+            byTimeframe: { '4h': {} },
+            lowCascadeDensitySymbols: ['BTC-USD'],
+          },
+        },
+      });
+      const sig = strat.evaluate('ETH-USD', out, 'range');
+      expect(sig?.side).toBe('sell');
+    });
+
+    it('long-side regression: a flat → uptrend transition still fires a long even with v2 short overrides wired', () => {
+      // The bracket and cascade-leg routing live entirely under
+      // `paramsByDirection.short`. A long-side series must still fire a buy
+      // through the unchanged §4.1 path.
+      const detector = new RegimeDetector();
+      const strat = new MomentumStrategy(detector, {
+        fastMaPeriod: 10,
+        slowMaPeriod: 50,
+        donchianPeriod: 15,
+        paramsByDirection: {
+          short: {
+            atrStopMultiplier: 2.0, rearmBars: 8, slowMaSlopeBars: 10,
+            volumeMultiplier: 1.10, volumeSmaPeriod: 20,
+            byTimeframe: { '4h': {} },
+            lowCascadeDensitySymbols: ['BTC-USD'],
+          },
+        },
+      });
+      const candles = transitionSeries(80, 120, 'up');
+      let signal = null;
+      for (let i = 60; i <= candles.length; i++) {
+        const s = strat.evaluate('BTC-USD', candles.slice(0, i));
+        if (s) { signal = s; break; }
+      }
+      expect(signal?.side).toBe('buy');
+    });
+  });
+
   it('cooldown spaces re-fires roughly one Donchian window apart', () => {
     // A sustained trend prints fresh Donchian highs on every bar, so without
     // the `rearmBars` cooldown the strategy would emit one signal per bar.
