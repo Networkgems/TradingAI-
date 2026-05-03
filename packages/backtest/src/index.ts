@@ -42,3 +42,18 @@ export type {
   CryptoSpreadTier,
   CryptoTieredCostModelOptions,
 } from '@trading-app/engine';
+// TRA-267 — Coinbase 4H bar fetch + on-disk cache for the Phase-1 perp shorts
+// universe. The server's `crypto-feed.ts` re-exports `fetchCoinbase4hBars` so
+// engine consumers don't need to depend on @trading-app/backtest directly.
+export {
+  fetchCoinbaseHourlyBars,
+  fetchCoinbase4hBars,
+  aggregate1hTo4h,
+} from './coinbase-feed.js';
+export {
+  cachePathFor,
+  cachePathFor4h,
+  loadOrFetchDailyBars,
+  loadOrFetch4hBars,
+} from './fetch-tra266-data.js';
+export type { CacheEntry } from './fetch-tra266-data.js';

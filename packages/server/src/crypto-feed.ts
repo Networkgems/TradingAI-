@@ -1,5 +1,6 @@
 import YahooFinance from 'yahoo-finance2';
 import type { Candle, NewsItem } from '@trading-app/shared';
+import { fetchCoinbase4hBars } from '@trading-app/backtest';
 import { isYahooBreakerOpen, toIsoTime, tripYahooBreakerFromExternal } from './yahoo-feed.js';
 
 const yf = new YahooFinance({
@@ -109,6 +110,32 @@ export async function fetchCryptoDailyBars(symbol: string, count = 260): Promise
       .slice(-count);
   } catch (err: unknown) {
     console.error(`[crypto-feed] fetchCryptoDailyBars(${symbol}):`, err instanceof Error ? err.message : String(err));
+    return [];
+  }
+}
+
+/**
+ * TRA-267 — fetch the trailing `count` 4H bars for `symbol` from Coinbase.
+ * Mirrors {@link fetchCryptoDailyBars} ergonomics: returns `Candle[]` keyed
+ * by symbol with timestamps in ms epoch UTC. Source is Coinbase Exchange
+ * 1H bars aggregated to 4H locally (see `@trading-app/backtest` /
+ * `coinbase-feed.ts` for the rationale).
+ *
+ * Failure-mode parity with the daily fetcher: any error short-circuits to
+ * an empty array with a single warn line, so the live engine's tick loop
+ * never crashes on a transient Coinbase blip.
+ */
+export async function fetchCrypto4hBars(symbol: string, count = 260): Promise<Candle[]> {
+  try {
+    const now = Date.now();
+    // Pad the request window so a fresh-cache miss still lands `count` bars
+    // even if Coinbase drops a few 1H constituents (aggregation is strict —
+    // see `aggregate1hTo4h`'s contiguity guard).
+    const fromMs = now - count * 4 * 60 * 60 * 1000 * 1.25;
+    const bars = await fetchCoinbase4hBars(symbol, fromMs, now);
+    return bars.slice(-count);
+  } catch (err: unknown) {
+    console.error(`[crypto-feed] fetchCrypto4hBars(${symbol}):`, err instanceof Error ? err.message : String(err));
     return [];
   }
 }

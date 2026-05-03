@@ -20,7 +20,7 @@ import {
 } from '@trading-app/engine';
 import { CRYPTO_WATCHLIST } from '@trading-app/shared';
 import type { TradeSignal, Candle, AccountState, Position, CryptoEngineState, NewsItem, AccountSettings } from '@trading-app/shared';
-import { fetchCryptoMinuteBars, fetchCryptoDailyBars, fetchCryptoQuotes, fetchCryptoNews } from './crypto-feed.js';
+import { fetchCryptoMinuteBars, fetchCryptoDailyBars, fetchCrypto4hBars, fetchCryptoQuotes, fetchCryptoNews } from './crypto-feed.js';
 import { isYahooBreakerOpen } from './yahoo-feed.js';
 import { CryptoPaperAccount } from './crypto-account.js';
 import { CryptoLiveAccount } from './crypto-live-account.js';
@@ -70,6 +70,14 @@ export class CryptoSignalEngine {
   private symbolState: Map<string, CryptoEngineState['symbols'][number]> = new Map();
   private candleCache: Map<string, Candle[]> = new Map();
   private dailyCandleCache: Map<string, Candle[]> = new Map();
+  /**
+   * TRA-267 — 4H candle cache for the Phase-1 perp-shorts universe (BTC, ETH,
+   * SOL, XRP, DOGE). Populated alongside `dailyCandleCache` by
+   * {@link refresh4hCandles}; consumed by TRA-261's short-side strategy
+   * layer once that ticket lands the consumer wiring. The long-side router
+   * never reads this map — the long path stays byte-identical to pre-267.
+   */
+  private _4hCandleCache: Map<string, Candle[]> = new Map();
   private recentSignals: TradeSignal[] = [];
   // TRA-242 — split closed-positions history by account mode so the Live
   // dashboard never surfaces Demo trades and vice versa. Before this fix the
@@ -630,6 +638,13 @@ export class CryptoSignalEngine {
       await Promise.all(
         activeSymbols.slice(i, i + CANDLE_BATCH).map(sym => this.refreshDailyCandles(sym)),
       );
+      // TRA-267 — 4H refresh runs alongside daily but `refresh4hCandles`
+      // early-exits on non-perp-short symbols, so only the 5-symbol Phase-1
+      // shorts universe actually hits Coinbase. No long-side consumer reads
+      // from `_4hCandleCache`, so the long path stays byte-identical.
+      await Promise.all(
+        activeSymbols.slice(i, i + CANDLE_BATCH).map(sym => this.refresh4hCandles(sym)),
+      );
     }
 
     if (this.isAutoTradingEnabled()) {
@@ -777,6 +792,10 @@ export class CryptoSignalEngine {
       await Promise.all(
         activeSymbols.slice(i, i + CANDLE_BATCH).map(sym => this.refreshDailyCandles(sym)),
       );
+      // TRA-267 — see demo-path equivalent above.
+      await Promise.all(
+        activeSymbols.slice(i, i + CANDLE_BATCH).map(sym => this.refresh4hCandles(sym)),
+      );
     }
 
     for (const sym of activeSymbols) {
@@ -871,6 +890,25 @@ export class CryptoSignalEngine {
     }
     const bars = await fetchCryptoDailyBars(symbol, 260);
     if (bars.length > 0) this.dailyCandleCache.set(symbol, bars);
+  }
+
+  /**
+   * TRA-267 — refresh the 4H bar cache for `symbol`. Scoped to the perp
+   * shorts universe (`isPerpShortSymbol`); other symbols early-exit so we
+   * don't hit Coinbase Exchange for symbols that won't ever route a short
+   * signal off the 4H layer. Hourly cadence matches the daily refresh — 4H
+   * bars only roll every 4h so an hourly check is generous.
+   */
+  private async refresh4hCandles(symbol: string): Promise<void> {
+    if (!isPerpShortSymbol(symbol)) return;
+    const cached = this._4hCandleCache.get(symbol);
+    if (cached && cached.length > 0) {
+      const lastBar = cached[cached.length - 1];
+      const hourMs = 60 * 60 * 1000;
+      if (Date.now() - lastBar.timestamp < hourMs) return;
+    }
+    const bars = await fetchCrypto4hBars(symbol, 260);
+    if (bars.length > 0) this._4hCandleCache.set(symbol, bars);
   }
 
   private buildState(): CryptoEngineState {
