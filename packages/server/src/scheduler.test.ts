@@ -263,3 +263,94 @@ describe('MarketScheduler — TRA-193 onDaily / onMarketClose / onArchive', () =
     expect(cb).toHaveBeenCalledTimes(1);
   });
 });
+
+describe('MarketScheduler — TRA-249-D onHourly funding hook', () => {
+  let scheduler: MarketScheduler;
+
+  // Top-of-hour 16:00 ET (EDT, UTC-4) → 20:00 UTC; back off 60 s for the
+  // first interval tick.
+  const at1600EDT = (yyyy: number, mm: number, dd: number) =>
+    new Date(Date.UTC(yyyy, mm - 1, dd, 19, 59, 0));
+  // Next hour boundary: 17:00 EDT → 21:00 UTC.
+  const at1700EDT = (yyyy: number, mm: number, dd: number) =>
+    new Date(Date.UTC(yyyy, mm - 1, dd, 20, 59, 0));
+
+  beforeEach(() => {
+    vi.useFakeTimers();
+    scheduler = new MarketScheduler();
+  });
+
+  afterEach(() => {
+    scheduler.stop();
+    vi.useRealTimers();
+  });
+
+  it('fires onHourly exactly once at minute=0 on a normal weekday', () => {
+    vi.setSystemTime(at1600EDT(2026, 4, 30));
+    const onHourly = vi.fn();
+    scheduler.start({ onHourly });
+
+    vi.advanceTimersByTime(60_000);
+    expect(onHourly).toHaveBeenCalledTimes(1);
+  });
+
+  it('does not double-fire onHourly within the same ET hour (jitter / clock-wedge)', () => {
+    vi.setSystemTime(at1600EDT(2026, 4, 30));
+    const onHourly = vi.fn();
+    scheduler.start({ onHourly });
+
+    vi.advanceTimersByTime(60_000);
+    expect(onHourly).toHaveBeenCalledTimes(1);
+
+    // Wall clock parks at 16:00:30 — the next polling tick is still inside
+    // the same ET hour-and-minute window. Must NOT re-fire.
+    vi.advanceTimersByTime(30_000);
+    expect(onHourly).toHaveBeenCalledTimes(1);
+  });
+
+  it('fires again at the top of the next ET hour', () => {
+    vi.setSystemTime(at1600EDT(2026, 4, 30));
+    const onHourly = vi.fn();
+    scheduler.start({ onHourly });
+
+    vi.advanceTimersByTime(60_000);
+    expect(onHourly).toHaveBeenCalledTimes(1);
+
+    // Jump to 17:00 ET — distinct hour bucket; must fire again.
+    vi.setSystemTime(at1700EDT(2026, 4, 30));
+    vi.advanceTimersByTime(60_000);
+    expect(onHourly).toHaveBeenCalledTimes(2);
+  });
+
+  it('catches async errors thrown by onHourly and keeps subsequent hours firing', async () => {
+    vi.setSystemTime(at1600EDT(2026, 4, 30));
+    const onHourly = vi.fn().mockRejectedValueOnce(new Error('boom')).mockResolvedValue(undefined);
+    const errSpy = vi.spyOn(console, 'error').mockImplementation(() => {});
+    scheduler.start({ onHourly });
+
+    vi.advanceTimersByTime(60_000);
+    await vi.advanceTimersByTimeAsync(0);
+
+    expect(onHourly).toHaveBeenCalledTimes(1);
+    expect(errSpy).toHaveBeenCalledWith('[scheduler] hourly callback error:', expect.any(Error));
+
+    vi.setSystemTime(at1700EDT(2026, 4, 30));
+    vi.advanceTimersByTime(60_000);
+    expect(onHourly).toHaveBeenCalledTimes(2);
+
+    errSpy.mockRestore();
+  });
+
+  it('does not affect onArchive / onDaily when only onHourly is registered', () => {
+    vi.setSystemTime(at1600EDT(2026, 4, 30));
+    const onHourly = vi.fn();
+    const onArchive = vi.fn();
+    const onDaily = vi.fn();
+    scheduler.start({ onHourly });
+
+    vi.advanceTimersByTime(60_000);
+    expect(onHourly).toHaveBeenCalledTimes(1);
+    expect(onArchive).not.toHaveBeenCalled();
+    expect(onDaily).not.toHaveBeenCalled();
+  });
+});

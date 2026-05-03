@@ -408,6 +408,17 @@ export class CryptoLiveAccount {
   }
 
   /**
+   * TRA-249-D — expose the underlying Coinbase order client so sibling
+   * services (e.g. {@link FundingRateTracker}) can issue independent
+   * Coinbase calls without piping the credentials through twice. Read-only
+   * — callers must not mutate or retain a reference for write operations
+   * outside the live-account contract.
+   */
+  getCoinbaseClient(): CoinbaseOrderClient {
+    return this.coinbase;
+  }
+
+  /**
    * Apply per-user risk settings (managedAccountRatio, riskPerTrade) so live
    * crypto orders sized through Coinbase honor the values entered on the
    * Settings page. Called by the engine on init and on every settings save.
@@ -531,6 +542,76 @@ export class CryptoLiveAccount {
   /** TRA-249-B — defensive snapshot of the recent-skips ring buffer. */
   getRecentSkips(): LiveSkip[] {
     return this.recentSkips.slice();
+  }
+
+  /**
+   * TRA-249-D — open perp positions only. The {@link FundingRateTracker}
+   * iterates this list once per hourly tick to charge/credit each position
+   * its `fundingRate × notional` accrual. Returns a defensive shallow copy
+   * so callers can iterate while the tracker mutates `fundingPnl` via
+   * {@link applyFundingAccrual}.
+   */
+  getOpenPerpPositions(): Position[] {
+    const out: Position[] = [];
+    for (const pos of this.positions.values()) {
+      if (pos.productType === 'perp') out.push(pos);
+    }
+    return out;
+  }
+
+  /**
+   * TRA-249-D — Coinbase INTX product_id (`BTC-PERP-INTX`) the given perp
+   * position was routed through. Used by the funding tracker to batch-fetch
+   * funding rates by perp product rather than by spot symbol. Returns null
+   * for spot positions and for legacy perp records that pre-date
+   * {@link perpProductByPositionId} (the funding tracker treats null as
+   * "skip — no rate to apply").
+   */
+  getPerpProductId(positionId: string): string | null {
+    return this.perpProductByPositionId.get(positionId) ?? null;
+  }
+
+  /**
+   * TRA-249-D — apply one hourly funding accrual to an open perp position.
+   *
+   * Bookkeeping invariants the funding tracker relies on:
+   *
+   * 1. `pos.fundingPnl` accumulates monotonically across hourly ticks. The
+   *    closed-positions API surfaces the final value via `pos.pnl` once
+   *    the position closes (see `checkExits` / `closePosition`).
+   * 2. `realizedPnlToday` increases by the same amount, so the dashboard's
+   *    daily P&L reflects funding within the hour it was charged — not only
+   *    at close. This is the spec's primary "Done when" target: funding
+   *    shows up in `dailyPnl` within an hour of opening a perp short.
+   * 3. `equityUsd` advances by the same amount because INTX margin settles
+   *    funding hourly (the realised side of the §7 circuit breaker already
+   *    advances equity on close — funding is the same flow at smaller
+   *    cadence).
+   * 4. Short funding feeds `realizedShortPnlToday` so the §7 daily short
+   *    circuit breaker (TRA-264) sees the cost in real time and doesn't
+   *    blow through the 2% daily-loss budget after a long funding-heavy
+   *    open.
+   *
+   * Idempotency: the caller (FundingRateTracker) is responsible for
+   * scheduling exactly one accrual per hour. This method does not attempt
+   * to dedupe within the hour; it just applies the delta and stamps
+   * `lastFundingAccrualAt` for diagnostics.
+   *
+   * No-op for unknown positions, non-perp positions, and non-finite amounts.
+   * Spot positions don't carry funding on Coinbase, so an accidental call
+   * for a spot symbol must not poison the day's P&L.
+   */
+  applyFundingAccrual(positionId: string, amountUsd: number): void {
+    if (!Number.isFinite(amountUsd)) return;
+    const pos = this.positions.get(positionId);
+    if (!pos || pos.productType !== 'perp') return;
+    pos.fundingPnl = (pos.fundingPnl ?? 0) + amountUsd;
+    pos.lastFundingAccrualAt = Date.now();
+    this.realizedPnlToday += amountUsd;
+    if (pos.side === 'sell') {
+      this.realizedShortPnlToday += amountUsd;
+    }
+    this.equityUsd += amountUsd;
   }
 
   /**
@@ -1214,29 +1295,37 @@ export class CryptoLiveAccount {
       const exitPrice = exitFill?.price ?? triggerPrice;
       const exitQty = exitFill?.size ?? pos.quantity;
       const multiplier = pos.side === 'buy' ? 1 : -1;
-      const pnl = (exitPrice - pos.entryPrice) * exitQty * multiplier;
-      pos.pnl = pnl;
+      const pricePnl = (exitPrice - pos.entryPrice) * exitQty * multiplier;
+      // TRA-249-D — settle accumulated funding into the closed-position
+      // record so realized P&L on the closed-positions API matches the
+      // Coinbase statement. Funding already flowed into `realizedPnlToday`
+      // hourly via `applyFundingAccrual`; only the price-side P&L is
+      // accumulated here, otherwise the day's funding would double-count.
+      const fundingPnl = pos.fundingPnl ?? 0;
+      pos.pnl = pricePnl + fundingPnl;
       pos.closedAt = Date.now();
       pos.exitPrice = exitPrice;
       pos.quantity = exitQty;
-      this.realizedPnlToday += pnl;
+      this.realizedPnlToday += pricePnl;
       if (pos.side === 'sell') {
-        // TRA-264 — feed the §7 circuit breaker's realised side.
-        this.realizedShortPnlToday += pnl;
+        // TRA-264 — feed the §7 circuit breaker's realised side. Funding has
+        // already been counted on each hourly accrual, so only the price
+        // side flows in here.
+        this.realizedShortPnlToday += pricePnl;
         // Perp short cash settles in INTX, not the spot wallet — leave
         // cashUsd alone. Equity still advances by realised pnl so the
         // dashboard daily P&L stays correct.
-        this.equityUsd += pnl;
+        this.equityUsd += pricePnl;
         // TRA-249-C — drop the perp product_id mapping for this position
         // now that the close has settled.
         this.perpProductByPositionId.delete(id);
       } else {
         this.cashUsd += exitPrice * exitQty;
-        this.equityUsd += pnl;
+        this.equityUsd += pricePnl;
       }
       this.positions.delete(id);
       closed.push({ ...pos });
-      console.log(`[crypto-live] CLOSE ${pos.symbol} ${hit.toUpperCase()} @ ${exitPrice.toFixed(2)} pnl=${pnl.toFixed(2)}`);
+      console.log(`[crypto-live] CLOSE ${pos.symbol} ${hit.toUpperCase()} @ ${exitPrice.toFixed(2)} pnl=${pos.pnl.toFixed(2)}${fundingPnl !== 0 ? ` (price=${pricePnl.toFixed(2)} funding=${fundingPnl.toFixed(2)})` : ''}`);
     }
     this.openShortsUnrealisedPnlUsd = openShortsUnrealised;
     return closed;
@@ -1275,19 +1364,23 @@ export class CryptoLiveAccount {
     const exitPrice = exitFill?.price ?? currentPrice;
     const exitQty = exitFill?.size ?? pos.quantity;
     const multiplier = pos.side === 'buy' ? 1 : -1;
-    const pnl = (exitPrice - pos.entryPrice) * exitQty * multiplier;
-    pos.pnl = pnl;
+    const pricePnl = (exitPrice - pos.entryPrice) * exitQty * multiplier;
+    // TRA-249-D — same settlement model as `checkExits`: funding was already
+    // accrued into `realizedPnlToday` hourly, so only price P&L flows in
+    // here. The closed-position record carries the total (price + funding).
+    const fundingPnl = pos.fundingPnl ?? 0;
+    pos.pnl = pricePnl + fundingPnl;
     pos.exitPrice = exitPrice;
     pos.quantity = exitQty;
     pos.closedAt = Date.now();
-    this.realizedPnlToday += pnl;
+    this.realizedPnlToday += pricePnl;
     if (pos.side === 'sell') {
-      this.realizedShortPnlToday += pnl;
-      this.equityUsd += pnl;
+      this.realizedShortPnlToday += pricePnl;
+      this.equityUsd += pricePnl;
       this.perpProductByPositionId.delete(positionId);
     } else {
       this.cashUsd += exitPrice * exitQty;
-      this.equityUsd += pnl;
+      this.equityUsd += pricePnl;
     }
     this.positions.delete(positionId);
     return { ...pos };

@@ -76,6 +76,15 @@ export interface ScheduleCallbacks {
    * and the day's row lands in the Calendar at the same moment.
    */
   onArchive?: EodTriggerCallback;
+  /**
+   * TRA-249-D — fires once per hour, on the ET minute=0 boundary. Used to
+   * accrue Coinbase INTX perp funding into the day's P&L so a multi-hour
+   * open position's running cost shows up in the dashboard within the hour
+   * (rather than only at close). Idempotent within the same ET hour: the
+   * 60s polling loop checks back at minute=0 each tick but the dedupe key
+   * (`YYYY-MM-DD-HH`) keeps the callback to one fire per hour.
+   */
+  onHourly?: EodTriggerCallback;
 }
 
 export class MarketScheduler {
@@ -83,6 +92,8 @@ export class MarketScheduler {
   private lastMarketCloseDate = '';
   private lastDailyDate = '';
   private lastArchiveDate = '';
+  /** TRA-249-D — `YYYY-MM-DD-HH` ET key of the last `onHourly` fire. Dedupes within an hour. */
+  private lastHourlyKey = '';
 
   /**
    * Start polling. Accepts either a single market-close callback (legacy form)
@@ -124,6 +135,21 @@ export class MarketScheduler {
           console.log(`[scheduler] archive trigger fired for ${todayKey}`);
           Promise.resolve(cfg.onArchive()).catch(err =>
             console.error('[scheduler] archive callback error:', err),
+          );
+        }
+      }
+
+      // TRA-249-D — top-of-hour funding-rate accrual hook. Fires once per ET
+      // hour; the dedupe key includes the hour so the every-60s polling loop
+      // can't double-fire when wall-clock jitter parks us at minute=0 across
+      // two ticks.
+      if (cfg.onHourly && minute === 0) {
+        const hourlyKey = `${todayKey}-${String(hour).padStart(2, '0')}`;
+        if (this.lastHourlyKey !== hourlyKey) {
+          this.lastHourlyKey = hourlyKey;
+          console.log(`[scheduler] hourly trigger fired for ${hourlyKey}`);
+          Promise.resolve(cfg.onHourly()).catch(err =>
+            console.error('[scheduler] hourly callback error:', err),
           );
         }
       }

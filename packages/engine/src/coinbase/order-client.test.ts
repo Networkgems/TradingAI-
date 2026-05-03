@@ -350,6 +350,78 @@ describe('CoinbaseOrderClient', () => {
     });
   });
 
+  // TRA-249-D — funding-rate accrual on open Coinbase INTX perp positions.
+  // Coinbase nests funding under `future_product_details.perpetual_details`.
+  // These tests pin the parse contract so a server-side schema drift surfaces
+  // here rather than at runtime as silent zero-charge entries.
+  describe('getFundingRates (TRA-249-D)', () => {
+    it('parses funding_rate + funding_time off perp products and ignores non-perps', async () => {
+      const client = makeClient();
+      fetchMock.mockResolvedValueOnce(jsonResponse({
+        products: [
+          {
+            product_id: 'BTC-PERP-INTX',
+            future_product_details: {
+              perpetual_details: {
+                funding_rate: '0.0001',
+                funding_time: '2026-05-02T16:00:00Z',
+              },
+            },
+          },
+          {
+            product_id: 'ETH-PERP-INTX',
+            future_product_details: {
+              perpetual_details: { funding_rate: '-0.00005' },
+            },
+          },
+          // Spot product — no future_product_details, dropped.
+          { product_id: 'BTC-USD', price: '60000', base_increment: '0.00000001' },
+        ],
+      }));
+
+      const rates = await client.getFundingRates(['BTC-PERP-INTX', 'ETH-PERP-INTX', 'BTC-USD']);
+
+      expect(rates.size).toBe(2);
+      expect(rates.get('BTC-PERP-INTX')).toEqual({
+        rate: 0.0001,
+        nextFundingTimeMs: Date.parse('2026-05-02T16:00:00Z'),
+      });
+      // Negative funding (shorts pay longs) round-trips with sign intact.
+      expect(rates.get('ETH-PERP-INTX')).toEqual({ rate: -0.00005, nextFundingTimeMs: undefined });
+      expect(rates.get('BTC-USD')).toBeUndefined();
+    });
+
+    it('drops entries whose funding_rate is unparseable so a phantom 0 charge cannot mask outage', async () => {
+      const client = makeClient();
+      fetchMock.mockResolvedValueOnce(jsonResponse({
+        products: [
+          {
+            product_id: 'BTC-PERP-INTX',
+            future_product_details: { perpetual_details: { funding_rate: 'not-a-number' } },
+          },
+          {
+            product_id: 'ETH-PERP-INTX',
+            future_product_details: { perpetual_details: { funding_rate: '0.0002' } },
+          },
+        ],
+      }));
+
+      const rates = await client.getFundingRates(['BTC-PERP-INTX', 'ETH-PERP-INTX']);
+
+      expect(rates.size).toBe(1);
+      expect(rates.get('ETH-PERP-INTX')?.rate).toBe(0.0002);
+    });
+
+    it('short-circuits to an empty map without hitting the network when given no product ids', async () => {
+      const client = makeClient();
+
+      const rates = await client.getFundingRates([]);
+
+      expect(rates.size).toBe(0);
+      expect(fetchMock).not.toHaveBeenCalled();
+    });
+  });
+
   // TRA-249 — perp-trading surface added to the order client. These tests
   // pin (a) that the spot order body is byte-identical to pre-change when no
   // perp fields are passed, and (b) that perp fields land at the documented

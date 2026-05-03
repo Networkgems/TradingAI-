@@ -12,4 +12,5 @@ export type {
   CoinbasePositionSide,
   CoinbaseListedProduct,
   CoinbaseFuturesPosition,
+  CoinbaseFundingRate,
 } from './order-client.js';

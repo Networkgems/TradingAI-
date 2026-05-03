@@ -8,7 +8,7 @@ import type {
   CoinbaseOrderSuccessResponse,
   CoinbaseProductInfo,
 } from '@trading-app/engine';
-import type { TradeSignal } from '@trading-app/shared';
+import type { Position, TradeSignal } from '@trading-app/shared';
 
 import { CryptoLiveAccount, PerpCatalog, quantizeBaseSize } from './crypto-live-account.js';
 
@@ -1499,5 +1499,236 @@ describe('CryptoLiveAccount startup reconciliation (TRA-249-C)', () => {
     await expect(account.refreshBalance()).resolves.toBeUndefined();
     expect(account.getState().openPositions).toHaveLength(0);
     expect(coinbase.listFuturesPositions).not.toHaveBeenCalled();
+  });
+});
+
+// ── TRA-249-D: funding-rate accrual on perp positions ─────────────────────
+
+/**
+ * Open a perp short via the routing fork using the shared helper plumbing
+ * so the tests below start from a real `productType: 'perp'` position with
+ * a populated `perpProductByPositionId` mapping. Returns the freshly opened
+ * position so callers can assert against its mutating fields.
+ */
+async function openPerpShortFor(
+  account: CryptoLiveAccount,
+  coinbase: FakeCoinbaseClient,
+  signal: TradeSignal,
+  spotPrice: number,
+  filled: { price: string; size: string; orderId: string },
+): Promise<Position> {
+  coinbase.placeMarketOrder.mockResolvedValueOnce(orderSuccess(filled.orderId, 'SELL'));
+  coinbase.getOrder.mockResolvedValueOnce(
+    orderDetails({
+      order_id: filled.orderId,
+      side: 'SELL',
+      status: 'FILLED',
+      average_filled_price: filled.price,
+      filled_size: filled.size,
+    }),
+  );
+  const pos = await account.openPosition(signal, spotPrice);
+  if (!pos) throw new Error('expected perp short to open in test setup');
+  return pos;
+}
+
+describe('CryptoLiveAccount funding-rate accrual (TRA-249-D)', () => {
+  it('getOpenPerpPositions returns only perp positions, never spot', async () => {
+    const { account, coinbase } = buyAccount(100_000);
+    await account.refreshBalance();
+    coinbase.listProducts.mockResolvedValueOnce([listedPerp('BTC-PERP-INTX')]);
+    await account.refreshPerpCatalog(['BTC-USD']);
+
+    // Open a spot long (BTC-USD buy) and a perp short (BTC-PERP-INTX sell).
+    coinbase.placeMarketOrder.mockResolvedValueOnce(orderSuccess('o-spot'));
+    coinbase.getOrder.mockResolvedValueOnce(
+      orderDetails({ order_id: 'o-spot', status: 'FILLED', average_filled_price: '30000', filled_size: '0.001' }),
+    );
+    await account.openPosition(buildSignal(), 30_000);
+
+    await openPerpShortFor(
+      account,
+      coinbase,
+      buildShortSignal({ id: 'sig-perp' }),
+      30_000,
+      { price: '30000', size: '0.001', orderId: 'o-perp' },
+    );
+
+    const perps = account.getOpenPerpPositions();
+    expect(perps).toHaveLength(1);
+    expect(perps[0]!.productType).toBe('perp');
+    expect(perps[0]!.side).toBe('sell');
+    // Sanity: total open positions still 2 (spot + perp).
+    expect(account.getState().openPositions).toHaveLength(2);
+  });
+
+  it('applyFundingAccrual stamps fundingPnl and bumps dailyPnl by the same amount', async () => {
+    const { account, coinbase } = buyAccount(100_000);
+    await account.refreshBalance();
+    coinbase.listProducts.mockResolvedValueOnce([listedPerp('BTC-PERP-INTX')]);
+    await account.refreshPerpCatalog(['BTC-USD']);
+
+    const opened = await openPerpShortFor(
+      account,
+      coinbase,
+      buildShortSignal(),
+      30_000,
+      { price: '30000', size: '0.001', orderId: 'o-perp-open' },
+    );
+    expect(opened.fundingPnl).toBeUndefined();
+    const dailyBefore = account.getState().dailyPnl;
+
+    account.applyFundingAccrual(opened.id, 0.42);
+
+    // Position record carries the cumulative funding.
+    const liveSnapshot = account.getState().openPositions.find(p => p.id === opened.id);
+    expect(liveSnapshot?.fundingPnl).toBeCloseTo(0.42, 9);
+    // dailyPnl includes the funding charge — spec's primary "Done when".
+    expect(account.getState().dailyPnl).toBeCloseTo(dailyBefore + 0.42, 9);
+  });
+
+  it('multiple accruals on the same position accumulate monotonically into fundingPnl + dailyPnl', async () => {
+    const { account, coinbase } = buyAccount(100_000);
+    await account.refreshBalance();
+    coinbase.listProducts.mockResolvedValueOnce([listedPerp('BTC-PERP-INTX')]);
+    await account.refreshPerpCatalog(['BTC-USD']);
+
+    const pos = await openPerpShortFor(
+      account,
+      coinbase,
+      buildShortSignal(),
+      30_000,
+      { price: '30000', size: '0.001', orderId: 'o-acc' },
+    );
+    const dailyBefore = account.getState().dailyPnl;
+
+    account.applyFundingAccrual(pos.id, 0.10);
+    account.applyFundingAccrual(pos.id, 0.15);
+    account.applyFundingAccrual(pos.id, 0.20);
+
+    const live = account.getState().openPositions.find(p => p.id === pos.id);
+    expect(live?.fundingPnl).toBeCloseTo(0.45, 9);
+    expect(account.getState().dailyPnl).toBeCloseTo(dailyBefore + 0.45, 9);
+  });
+
+  it('mid-hour close settles realized P&L = price P&L + accumulated funding', async () => {
+    const { account, coinbase } = buyAccount(100_000);
+    await account.refreshBalance();
+    coinbase.listProducts.mockResolvedValueOnce([listedPerp('BTC-PERP-INTX')]);
+    await account.refreshPerpCatalog(['BTC-USD']);
+
+    // Open a 0.001 BTC short at 30_000 → notional $30. Take-profit 28_500.
+    const pos = await openPerpShortFor(
+      account,
+      coinbase,
+      buildShortSignal(),
+      30_000,
+      { price: '30000', size: '0.001', orderId: 'o-mid-open' },
+    );
+
+    // Two hourly funding ticks before close: -0.05 + -0.03 = -0.08 (paid).
+    account.applyFundingAccrual(pos.id, -0.05);
+    account.applyFundingAccrual(pos.id, -0.03);
+
+    // Trip the TP via checkExits at 28_400. Price P&L for a 0.001 short =
+    // (30_000 - 28_400) * 0.001 = +1.60. Total realized = 1.60 + (-0.08) = 1.52.
+    coinbase.closeFuturesPosition.mockResolvedValueOnce(orderSuccess('o-mid-close', 'BUY'));
+    coinbase.getOrder.mockResolvedValueOnce(
+      orderDetails({ order_id: 'o-mid-close', side: 'BUY', status: 'FILLED', average_filled_price: '28400', filled_size: '0.001' }),
+    );
+    const closed = await account.checkExits(new Map([['BTC-USD', 28_400]]));
+
+    expect(closed).toHaveLength(1);
+    expect(closed[0]!.fundingPnl).toBeCloseTo(-0.08, 9);
+    expect(closed[0]!.pnl).toBeCloseTo(1.52, 6);
+  });
+
+  it('manual closePosition also folds funding into the closed-position pnl', async () => {
+    const { account, coinbase } = buyAccount(100_000);
+    await account.refreshBalance();
+    coinbase.listProducts.mockResolvedValueOnce([listedPerp('BTC-PERP-INTX')]);
+    await account.refreshPerpCatalog(['BTC-USD']);
+
+    const pos = await openPerpShortFor(
+      account,
+      coinbase,
+      buildShortSignal(),
+      30_000,
+      { price: '30000', size: '0.001', orderId: 'o-man-open' },
+    );
+    account.applyFundingAccrual(pos.id, -0.12);
+
+    coinbase.closeFuturesPosition.mockResolvedValueOnce(orderSuccess('o-man-close', 'BUY'));
+    coinbase.getOrder.mockResolvedValueOnce(
+      orderDetails({ order_id: 'o-man-close', side: 'BUY', status: 'FILLED', average_filled_price: '29500', filled_size: '0.001' }),
+    );
+    const closed = await account.closePosition(pos.id, 29_500);
+
+    // Price P&L: (30_000 - 29_500) * 0.001 = 0.50. + funding -0.12 = 0.38.
+    expect(closed!.pnl).toBeCloseTo(0.38, 6);
+    expect(closed!.fundingPnl).toBeCloseTo(-0.12, 9);
+  });
+
+  it('does not double-count funding in dailyPnl when the position later closes', async () => {
+    // Funding flows into realizedPnlToday on each hourly accrual; the close
+    // path should add ONLY the price-side P&L. Otherwise the day's funding
+    // would show up twice in `dailyPnl`.
+    const { account, coinbase } = buyAccount(100_000);
+    await account.refreshBalance();
+    coinbase.listProducts.mockResolvedValueOnce([listedPerp('BTC-PERP-INTX')]);
+    await account.refreshPerpCatalog(['BTC-USD']);
+
+    const pos = await openPerpShortFor(
+      account,
+      coinbase,
+      buildShortSignal(),
+      30_000,
+      { price: '30000', size: '0.001', orderId: 'o-dbl-open' },
+    );
+    const dailyBefore = account.getState().dailyPnl;
+
+    account.applyFundingAccrual(pos.id, -0.10);
+    expect(account.getState().dailyPnl).toBeCloseTo(dailyBefore - 0.10, 9);
+
+    // TP at 28_500 (short). Trigger at 28_400 → price P&L = 30_000 - 28_400
+    // = 1_600 per BTC × 0.001 = +1.60. Expected dailyPnl after close =
+    // dailyBefore - 0.10 (funding) + 1.60 (price) = +1.50. If funding
+    // double-counted on close we'd see dailyBefore - 0.20 + 1.60 = +1.40.
+    coinbase.closeFuturesPosition.mockResolvedValueOnce(orderSuccess('o-dbl-close', 'BUY'));
+    coinbase.getOrder.mockResolvedValueOnce(
+      orderDetails({ order_id: 'o-dbl-close', side: 'BUY', status: 'FILLED', average_filled_price: '28400', filled_size: '0.001' }),
+    );
+    const closed = await account.checkExits(new Map([['BTC-USD', 28_400]]));
+    expect(closed).toHaveLength(1);
+
+    expect(account.getState().dailyPnl).toBeCloseTo(dailyBefore - 0.10 + 1.60, 6);
+  });
+
+  it('ignores accruals on unknown positions and on spot positions', async () => {
+    const { account, coinbase } = buyAccount(100_000);
+    await account.refreshBalance();
+    coinbase.placeMarketOrder.mockResolvedValueOnce(orderSuccess('o-spot'));
+    coinbase.getOrder.mockResolvedValueOnce(
+      orderDetails({ order_id: 'o-spot', status: 'FILLED', average_filled_price: '30000', filled_size: '0.001' }),
+    );
+    const spot = await account.openPosition(buildSignal(), 30_000);
+    expect(spot).not.toBeNull();
+    const dailyBefore = account.getState().dailyPnl;
+
+    // Unknown id — no-op.
+    account.applyFundingAccrual('nope', 1);
+    // Spot id — no-op (funding only applies to perps).
+    account.applyFundingAccrual(spot!.id, 1);
+    // Non-finite — no-op.
+    account.applyFundingAccrual(spot!.id, Number.NaN);
+
+    expect(account.getState().dailyPnl).toBe(dailyBefore);
+    const live = account.getState().openPositions.find(p => p.id === spot!.id);
+    expect(live?.fundingPnl).toBeUndefined();
+  });
+
+  it('exposes the underlying Coinbase client so the funding tracker can share auth', async () => {
+    const { account, coinbase } = buyAccount(50_000);
+    expect(account.getCoinbaseClient()).toBe(asClient(coinbase));
   });
 });

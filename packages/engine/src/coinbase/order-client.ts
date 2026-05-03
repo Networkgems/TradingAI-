@@ -115,6 +115,21 @@ interface CoinbaseProduct {
   cancel_only?: boolean;
   /** Free-form lifecycle string, e.g. `online`, `offline`. */
   status?: string;
+  /**
+   * TRA-249-D — Coinbase nests INTX perpetual telemetry under
+   * `future_product_details.perpetual_details`. We only model the funding
+   * subset here; the full shape carries open interest, max leverage, etc.
+   * Optional throughout because spot products and pre-perp fixtures don't
+   * carry the field.
+   */
+  future_product_details?: {
+    perpetual_details?: {
+      /** Hourly funding rate as a decimal, stringified (e.g. `"0.0001"` = 0.01% / hour). */
+      funding_rate?: string;
+      /** ISO-8601 timestamp of the next funding settlement window. */
+      funding_time?: string;
+    };
+  };
 }
 
 interface ListProductsResponse {
@@ -130,6 +145,26 @@ interface ListProductsResponse {
 export interface CoinbaseProductInfo {
   price: number;
   baseIncrement: string;
+}
+
+/**
+ * TRA-249-D — current funding telemetry for one Coinbase INTX perp product.
+ *
+ * Coinbase publishes the funding rate as an hourly fraction (e.g. `0.0001`
+ * = 0.01% per hour). The {@link FundingRateTracker} multiplies this by
+ * position notional once per hourly tick to charge longs / credit shorts;
+ * the magnitude is small but compounds over a multi-hour open and is the
+ * difference between matching a Coinbase statement and silently drifting.
+ *
+ * `nextFundingTimeMs` is informational — useful for diagnostics but not on
+ * the accrual hot path; we charge once per local hourly tick rather than
+ * trying to align with Coinbase's settlement clock.
+ */
+export interface CoinbaseFundingRate {
+  /** Hourly rate as a decimal. Positive: longs pay shorts. Negative: shorts pay longs. */
+  rate: number;
+  /** Optional next funding settlement time, ms epoch. */
+  nextFundingTimeMs?: number;
 }
 
 /**
@@ -424,6 +459,43 @@ export class CoinbaseOrderClient {
     for (const p of data.products ?? []) {
       const v = parseFloat(p.price ?? '');
       if (Number.isFinite(v) && v > 0) out.set(p.product_id, v);
+    }
+    return out;
+  }
+
+  /**
+   * GET /api/v3/brokerage/products?product_ids=... — pull the per-product
+   * funding rate for one or more INTX perp products (TRA-249-D).
+   *
+   * Coinbase nests funding under `future_product_details.perpetual_details`;
+   * a product without that block (spot, or a perp with no published rate)
+   * is silently absent from the returned map so callers can iterate without
+   * special-casing missing entries. Same `?product_ids=...` shape as
+   * {@link getProducts} so a single round-trip covers every open perp the
+   * funding tracker is accruing.
+   *
+   * Best-effort: a non-finite or unparseable rate is dropped rather than
+   * coerced to 0 — a phantom 0 charge would silently mask a real Coinbase
+   * outage.
+   */
+  async getFundingRates(productIds: string[]): Promise<Map<string, CoinbaseFundingRate>> {
+    const out = new Map<string, CoinbaseFundingRate>();
+    if (productIds.length === 0) return out;
+    const params = new URLSearchParams();
+    for (const id of productIds) params.append('product_ids', id);
+    const path = `/api/v3/brokerage/products?${params.toString()}`;
+    const data = await this.request<ListProductsResponse>('GET', path, '');
+    for (const p of data.products ?? []) {
+      const rateStr = p.future_product_details?.perpetual_details?.funding_rate;
+      if (rateStr == null) continue;
+      const rate = parseFloat(rateStr);
+      if (!Number.isFinite(rate)) continue;
+      const fundingTimeStr = p.future_product_details?.perpetual_details?.funding_time;
+      const nextFundingMs = fundingTimeStr ? Date.parse(fundingTimeStr) : NaN;
+      out.set(p.product_id, {
+        rate,
+        nextFundingTimeMs: Number.isFinite(nextFundingMs) ? nextFundingMs : undefined,
+      });
     }
     return out;
   }

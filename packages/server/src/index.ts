@@ -291,6 +291,21 @@ async function generateAndSaveCryptoReport(ctx: UserContext): Promise<void> {
 //   3. Archive the rolling "Recent Closed" lists so the Positions/Options
 //      tabs start the next session blank.
 //   4. Persist + broadcast so connected clients see the reset immediately.
+// TRA-249-D — top-of-hour fan-out: every active user's crypto engine gets
+// one funding-accrual pass per ET hour. Demo and uninitialised-broker
+// engines short-circuit inside `tickFundingHourly`, so this is essentially
+// free unless the user is running live perps. Failures per-user are
+// isolated so one user's outage can't starve the rest of the fleet.
+async function runHourlyFundingForAllUsers(): Promise<void> {
+  for (const ctx of getAllUserContexts()) {
+    try {
+      await ctx.cryptoEngine.tickFundingHourly();
+    } catch (err) {
+      console.error(`[funding:${ctx.username}] hourly tick failed:`, err);
+    }
+  }
+}
+
 async function runDailyCloseForAllUsers(): Promise<void> {
   const stocksMarketDay = isMarketDay();
   for (const ctx of getAllUserContexts()) {
@@ -1669,6 +1684,10 @@ scheduler.start({
   // still showing the stale total until 9). Stocks generation is gated on
   // market days inside the callback; crypto fires every day (24/7).
   onArchive: runDailyCloseForAllUsers,
+  // TRA-249-D — hourly funding accrual on open Coinbase INTX perps. Fires
+  // at minute=0 every ET hour; per-user trackers no-op when no perps are
+  // open or the user is in demo mode.
+  onHourly: runHourlyFundingForAllUsers,
 });
 
 httpServer.listen(PORT, () => {

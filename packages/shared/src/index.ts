@@ -191,6 +191,17 @@ export interface Position {
   marginUsd?: number;
   /** TRA-249-C — informational liquidation price for a perp position. Approximate at open; the exchange recomputes as the position moves. */
   liquidationPrice?: number;
+  /**
+   * TRA-249-D — cumulative funding paid (negative) or received (positive) on
+   * an open perp position, in USD. Each hourly accrual adds `fundingRate ×
+   * notional × sideMultiplier`; on close the value is folded into `pos.pnl`
+   * so the closed-positions API surfaces total realized P&L matching the
+   * Coinbase statement. Absent on spot positions and on perps that have not
+   * yet seen a funding tick.
+   */
+  fundingPnl?: number;
+  /** TRA-249-D — wall-clock ms of the last funding accrual on this position. Diagnostics + idempotency. */
+  lastFundingAccrualAt?: number;
 }
 
 export interface AccountState {

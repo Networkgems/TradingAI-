@@ -24,6 +24,7 @@ import { fetchCryptoMinuteBars, fetchCryptoDailyBars, fetchCryptoQuotes, fetchCr
 import { isYahooBreakerOpen } from './yahoo-feed.js';
 import { CryptoPaperAccount } from './crypto-account.js';
 import { CryptoLiveAccount } from './crypto-live-account.js';
+import { FundingRateTracker } from './funding-rate-tracker.js';
 import type { PnlTracker } from './pnl-tracker.js';
 
 export type CryptoEngineEventHandler = (state: CryptoEngineState) => void;
@@ -91,6 +92,15 @@ export class CryptoSignalEngine {
   private mode: 'demo' | 'live' = 'demo';
   /** Live broker (Coinbase) — initialised when live mode is active and creds are configured. */
   private liveAccount: CryptoLiveAccount | null = null;
+  /**
+   * TRA-249-D — hourly funding-rate accrual for open Coinbase INTX perp
+   * positions. Constructed alongside the live broker; rebuilt on every
+   * `tryInitLiveBroker` so a re-init after a settings save (new Coinbase
+   * creds) carries a fresh tracker bound to the new client. Null when
+   * live mode is inactive or creds are missing — in that case the hourly
+   * scheduler tick is a no-op for this engine.
+   */
+  private fundingTracker: FundingRateTracker | null = null;
   /** Last settings snapshot — kept so applySettings can re-evaluate live broker creds. */
   private currentSettings: AccountSettings | undefined;
 
@@ -202,6 +212,10 @@ export class CryptoSignalEngine {
       return;
     }
     this.liveAccount = broker;
+    // TRA-249-D — bind the funding tracker to the new live broker so the
+    // next hourly scheduler tick accrues against the freshly-initialised
+    // account (including any positions reconciled from Coinbase below).
+    this.fundingTracker = new FundingRateTracker(broker, broker.getCoinbaseClient());
     console.log('[crypto-engine] Coinbase live broker initialised — live trading active.');
     await broker.refreshBalance();
     // TRA-243 — pre-load the set of Coinbase-tradable product_ids for the
@@ -247,12 +261,19 @@ export class CryptoSignalEngine {
       // is preserved for a later switch back. Re-initialise the live broker so
       // newly entered Coinbase credentials take effect without a server restart.
       this.liveAccount = null;
+      // TRA-249-D — drop the funding tracker too; tryInitLiveBroker rebuilds
+      // it bound to the new live account so funding accrues against the
+      // refreshed credentials, not the old ones.
+      this.fundingTracker = null;
       await this.tryInitLiveBroker();
       return;
     }
     // Switching back to demo — drop the live broker so we don't keep refreshing
     // Coinbase balances in the background.
     this.liveAccount = null;
+    // TRA-249-D — funding accrual only applies to live perps; clear the
+    // tracker so the hourly scheduler tick stays a no-op in demo.
+    this.fundingTracker = null;
     const targetEquity = settings.demoEquityCrypto ?? settings.demoEquity;
     this.account.applyEquity(targetEquity);
     if (this.tracker) {
@@ -939,6 +960,24 @@ export class CryptoSignalEngine {
 
   isAutoTradingEnabled(): boolean {
     return this.mode === 'live' ? this.autoTradingEnabledLive : this.autoTradingEnabledDemo;
+  }
+
+  /**
+   * TRA-249-D — top-of-hour funding accrual hook. Wired into the global
+   * MarketScheduler `onHourly` callback so every active live engine gets
+   * exactly one accrual pass per ET hour. No-ops in demo mode and when
+   * the live broker has not been initialised (no creds, etc.) — the
+   * tracker itself further short-circuits when zero perp positions are
+   * open, so a pure-spot live operator pays no overhead.
+   */
+  async tickFundingHourly(): Promise<void> {
+    const tracker = this.fundingTracker;
+    if (!tracker || this.mode !== 'live') return;
+    try {
+      await tracker.tick();
+    } catch (err: unknown) {
+      console.warn('[crypto-engine] funding hourly tick failed:', err instanceof Error ? err.message : String(err));
+    }
   }
 
   manualClosePosition(positionId: string, currentPrice: number): Position | null {
