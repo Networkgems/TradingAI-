@@ -106,7 +106,8 @@ function DashboardSelector({ onSelect, onLogout, theme, onToggleTheme }: { onSel
   );
 }
 
-function ProfileMenu({ onChangePassword, onUserManagement, onLogout, isAdmin }: {
+function ProfileMenu({ onSettings, onChangePassword, onUserManagement, onLogout, isAdmin }: {
+  onSettings: () => void;
   onChangePassword: () => void;
   onUserManagement: () => void;
   onLogout: () => void;
@@ -166,6 +167,13 @@ function ProfileMenu({ onChangePassword, onUserManagement, onLogout, isAdmin }: 
             role="menu"
             style={{ position: 'fixed', top: pos.top, right: pos.right }}
           >
+            <button
+              className="profile-dropdown-item"
+              role="menuitem"
+              onClick={() => { onSettings(); setOpen(false); }}
+            >
+              Settings
+            </button>
             <button
               className="profile-dropdown-item"
               role="menuitem"
@@ -270,8 +278,8 @@ function CryptoDashboard({ token, onBack, onLogout, onActivity, theme, onToggleT
   const [news, setNews] = useState<NewsItem[]>([]);
   const [connected, setConnected] = useState(false);
   const [everConnected, setEverConnected] = useState(false);
-  const [tab, setTab] = useState<'watchlist' | 'signals' | 'positions' | 'news' | 'calendar' | 'settings'>('watchlist');
-  const [profileModal, setProfileModal] = useState<null | 'change-password' | 'user-management'>(null);
+  const [tab, setTab] = useState<'watchlist' | 'signals' | 'positions' | 'news' | 'calendar'>('watchlist');
+  const [profileModal, setProfileModal] = useState<null | 'settings' | 'change-password' | 'user-management'>(null);
   const [isAdmin, setIsAdmin] = useState(false);
   const [tradingToggling, setTradingToggling] = useState(false);
   const [accountMode, setAccountMode] = useState<'demo' | 'live'>('demo');
@@ -491,14 +499,8 @@ function CryptoDashboard({ token, onBack, onLogout, onActivity, theme, onToggleT
               {autoTradingEnabled ? '⏹ Stop Trading' : '▶ Start Trading'}
             </button>
             <ThemeToggle theme={theme} onToggle={onToggleTheme} />
-            <button
-              className={`logout-btn${tab === 'settings' ? ' active' : ''}`}
-              onClick={() => setTab(t => t === 'settings' ? 'watchlist' : 'settings')}
-              title="Account settings"
-            >
-              ⚙ Settings
-            </button>
             <ProfileMenu
+              onSettings={() => setProfileModal('settings')}
               onChangePassword={() => setProfileModal('change-password')}
               onUserManagement={() => setProfileModal('user-management')}
               onLogout={onLogout}
@@ -522,8 +524,20 @@ function CryptoDashboard({ token, onBack, onLogout, onActivity, theme, onToggleT
         </button>
       </nav>
 
-      {tab === 'settings' && (
-        <SettingsPage token={token} httpUrl={HTTP_URL} context="crypto" onModeChange={setAccountMode} />
+      {profileModal === 'settings' && (
+        <div className="modal-backdrop" onClick={() => setProfileModal(null)}>
+          <div className="modal-card modal-card-settings" onClick={e => e.stopPropagation()}>
+            <button
+              className="modal-close-corner"
+              onClick={() => setProfileModal(null)}
+              aria-label="Close settings"
+              title="Close"
+            >
+              &#x2715;
+            </button>
+            <SettingsPage token={token} httpUrl={HTTP_URL} context="crypto" onModeChange={setAccountMode} />
+          </div>
+        </div>
       )}
 
       {profileModal === 'change-password' && (
@@ -550,7 +564,7 @@ function CryptoDashboard({ token, onBack, onLogout, onActivity, theme, onToggleT
         </div>
       )}
 
-      <main className="content" style={tab === 'settings' ? { display: 'none' } : undefined}>
+      <main className="content">
         {!state && !everConnected && (
           <div className="loading">
             <div className="spinner" />
@@ -1025,10 +1039,10 @@ function NewsCard({ item }: { item: NewsItem }) {
 function Dashboard({ token, onLogout, onGoHome, onActivity, theme, onToggleTheme }: { token: string; onLogout: () => void; onGoHome: () => void; onActivity?: () => void; theme: Theme; onToggleTheme: () => void }) {
   const [state, setState] = useState<AppState | null>(null);
   const [connected, setConnected] = useState(false);
-  const [tab, setTab] = useState<'watchlist' | 'signals' | 'positions' | 'options' | 'news' | 'settings' | 'calendar'>('watchlist');
+  const [tab, setTab] = useState<'watchlist' | 'signals' | 'positions' | 'options' | 'news' | 'calendar'>('watchlist');
   const [news, setNews] = useState<NewsItem[]>([]);
   const [tradingToggling, setTradingToggling] = useState(false);
-  const [profileModal, setProfileModal] = useState<null | 'change-password' | 'user-management'>(null);
+  const [profileModal, setProfileModal] = useState<null | 'settings' | 'change-password' | 'user-management'>(null);
   const [isAdmin, setIsAdmin] = useState(false);
   const [accountMode, setAccountMode] = useState<'demo' | 'live'>('demo');
   // TRA-244 — drives the Calendar tab's per-account bucket. The stocks
@@ -1296,14 +1310,8 @@ function Dashboard({ token, onLogout, onGoHome, onActivity, theme, onToggleTheme
               {autoTradingEnabled ? '⏹ Stop Trading' : '▶ Start Trading'}
             </button>
             <ThemeToggle theme={theme} onToggle={onToggleTheme} />
-            <button
-              className={`logout-btn${tab === 'settings' ? ' active' : ''}`}
-              onClick={() => setTab(t => t === 'settings' ? 'watchlist' : 'settings')}
-              title="Account settings"
-            >
-              ⚙ Settings
-            </button>
             <ProfileMenu
+              onSettings={() => setProfileModal('settings')}
               onChangePassword={() => setProfileModal('change-password')}
               onUserManagement={() => setProfileModal('user-management')}
               onLogout={onLogout}
@@ -1312,6 +1320,22 @@ function Dashboard({ token, onLogout, onGoHome, onActivity, theme, onToggleTheme
           </div>
         </div>
       </header>
+
+      {profileModal === 'settings' && (
+        <div className="modal-backdrop" onClick={() => setProfileModal(null)}>
+          <div className="modal-card modal-card-settings" onClick={e => e.stopPropagation()}>
+            <button
+              className="modal-close-corner"
+              onClick={() => setProfileModal(null)}
+              aria-label="Close settings"
+              title="Close"
+            >
+              &#x2715;
+            </button>
+            <SettingsPage token={token} httpUrl={HTTP_URL} context="stocks" onModeChange={setAccountMode} />
+          </div>
+        </div>
+      )}
 
       {profileModal === 'change-password' && (
         <div className="modal-backdrop" onClick={() => setProfileModal(null)}>
@@ -1354,12 +1378,8 @@ function Dashboard({ token, onLogout, onGoHome, onActivity, theme, onToggleTheme
         </button>
       </nav>
 
-      {tab === 'settings' && (
-        <SettingsPage token={token} httpUrl={HTTP_URL} context="stocks" onModeChange={setAccountMode} />
-      )}
-
       <main className="content">
-        {tab !== 'settings' && !state && (
+        {!state && (
           <div className="loading">
             <div className="spinner" />
             <p>Connecting to trading engine…</p>
