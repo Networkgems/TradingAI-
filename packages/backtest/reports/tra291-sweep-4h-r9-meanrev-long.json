@@ -1,0 +1,487 @@
+{
+  "generatedAt": "2026-05-03T21:59:04.257Z",
+  "granularity": "4h",
+  "direction": "long",
+  "triggerFamily": "mean-reversion (real)",
+  "triggers": [
+    "bb_reentry_long",
+    "atr_pullback_long"
+  ],
+  "universe": [
+    "SOL-USD",
+    "DOGE-USD"
+  ],
+  "initialEquityUsd": 25000,
+  "feeBps": 40,
+  "slippageBps": 5,
+  "riskFraction": 0.01,
+  "atrKStop": 2,
+  "atrKTrail": 2,
+  "rrMin": 2,
+  "trailArmR": 1,
+  "bbPeriod": 20,
+  "bbMult": 2,
+  "atrPullbackEmaPeriod": 50,
+  "atrPullbackDepthAtr": 2,
+  "atrPullbackVolMult": 1.2,
+  "trainBars": 1080,
+  "testBars": 540,
+  "stepBars": 540,
+  "alignedStartTs": 1689278400000,
+  "ddBarExistingPct": 8,
+  "ddBarRecalibratedPct": 25,
+  "perWindow": [
+    {
+      "index": 0,
+      "trades": 16,
+      "winners": 9,
+      "hitRatePct": 56.25,
+      "expectancyR": 0.3183020687066086,
+      "totalPnlUsd": 681.6361941688888,
+      "rollingMaxDrawdownPct": 5.323118395041069,
+      "passes": true,
+      "reasons": [],
+      "passesExistingDdBar": true,
+      "passesRecalDdBar": true,
+      "perSymbol": [
+        {
+          "symbol": "SOL-USD",
+          "trades": 7,
+          "winners": 4,
+          "hitRatePct": 57.14285714285714,
+          "expectancyR": 0.4606012181033455,
+          "totalPnlUsd": 493.78002515515954
+        },
+        {
+          "symbol": "DOGE-USD",
+          "trades": 9,
+          "winners": 5,
+          "hitRatePct": 55.55555555555556,
+          "expectancyR": 0.20762495250914656,
+          "totalPnlUsd": 187.8561690137292
+        }
+      ],
+      "perTrigger": [
+        {
+          "trigger": "bb_reentry_long",
+          "trades": 4,
+          "winners": 2,
+          "hitRatePct": 50,
+          "expectancyR": 0.19407792825427217
+        },
+        {
+          "trigger": "atr_pullback_long",
+          "trades": 12,
+          "winners": 7,
+          "hitRatePct": 58.333333333333336,
+          "expectancyR": 0.3597101155240541
+        }
+      ]
+    },
+    {
+      "index": 1,
+      "trades": 52,
+      "winners": 21,
+      "hitRatePct": 40.38461538461539,
+      "expectancyR": -0.11091248689676851,
+      "totalPnlUsd": -3419.2432112336187,
+      "rollingMaxDrawdownPct": 18.833165249885717,
+      "passes": false,
+      "reasons": [
+        "expectancy -0.111R < 0.10R"
+      ],
+      "passesExistingDdBar": false,
+      "passesRecalDdBar": true,
+      "perSymbol": [
+        {
+          "symbol": "SOL-USD",
+          "trades": 24,
+          "winners": 10,
+          "hitRatePct": 41.66666666666667,
+          "expectancyR": -0.013044603594529034,
+          "totalPnlUsd": -1079.3401984469826
+        },
+        {
+          "symbol": "DOGE-USD",
+          "trades": 28,
+          "winners": 11,
+          "hitRatePct": 39.285714285714285,
+          "expectancyR": -0.19479924401297385,
+          "totalPnlUsd": -2339.9030127866363
+        }
+      ],
+      "perTrigger": [
+        {
+          "trigger": "bb_reentry_long",
+          "trades": 14,
+          "winners": 9,
+          "hitRatePct": 64.28571428571429,
+          "expectancyR": 0.4150852487443358
+        },
+        {
+          "trigger": "atr_pullback_long",
+          "trades": 38,
+          "winners": 12,
+          "hitRatePct": 31.57894736842105,
+          "expectancyR": -0.30470112634349117
+        }
+      ]
+    },
+    {
+      "index": 2,
+      "trades": 23,
+      "winners": 4,
+      "hitRatePct": 17.391304347826086,
+      "expectancyR": -0.5253282432644917,
+      "totalPnlUsd": -3243.3777645657965,
+      "rollingMaxDrawdownPct": 17.73945448315214,
+      "passes": false,
+      "reasons": [
+        "expectancy -0.525R < 0.10R",
+        "hit rate 17.4% < 35%"
+      ],
+      "passesExistingDdBar": false,
+      "passesRecalDdBar": true,
+      "perSymbol": [
+        {
+          "symbol": "SOL-USD",
+          "trades": 12,
+          "winners": 2,
+          "hitRatePct": 16.666666666666664,
+          "expectancyR": -0.6621632734108017,
+          "totalPnlUsd": -2003.7596855864354
+        },
+        {
+          "symbol": "DOGE-USD",
+          "trades": 11,
+          "winners": 2,
+          "hitRatePct": 18.181818181818183,
+          "expectancyR": -0.3760536649230625,
+          "totalPnlUsd": -1239.6180789793607
+        }
+      ],
+      "perTrigger": [
+        {
+          "trigger": "bb_reentry_long",
+          "trades": 13,
+          "winners": 1,
+          "hitRatePct": 7.6923076923076925,
+          "expectancyR": -0.7785754479713126
+        },
+        {
+          "trigger": "atr_pullback_long",
+          "trades": 10,
+          "winners": 3,
+          "hitRatePct": 30,
+          "expectancyR": -0.1961068771456242
+        }
+      ]
+    },
+    {
+      "index": 3,
+      "trades": 17,
+      "winners": 3,
+      "hitRatePct": 17.647058823529413,
+      "expectancyR": -0.5621609827123354,
+      "totalPnlUsd": -2415.623817264305,
+      "rollingMaxDrawdownPct": 13.86535670247957,
+      "passes": false,
+      "reasons": [
+        "expectancy -0.562R < 0.10R",
+        "hit rate 17.6% < 35%"
+      ],
+      "passesExistingDdBar": false,
+      "passesRecalDdBar": true,
+      "perSymbol": [
+        {
+          "symbol": "SOL-USD",
+          "trades": 13,
+          "winners": 3,
+          "hitRatePct": 23.076923076923077,
+          "expectancyR": -0.42594253745249505,
+          "totalPnlUsd": -1533.1030663160416
+        },
+        {
+          "symbol": "DOGE-USD",
+          "trades": 4,
+          "winners": 0,
+          "hitRatePct": 0,
+          "expectancyR": -1.0048709298068164,
+          "totalPnlUsd": -882.5207509482639
+        }
+      ],
+      "perTrigger": [
+        {
+          "trigger": "bb_reentry_long",
+          "trades": 5,
+          "winners": 1,
+          "hitRatePct": 20,
+          "expectancyR": -0.7531873225083194
+        },
+        {
+          "trigger": "atr_pullback_long",
+          "trades": 12,
+          "winners": 2,
+          "hitRatePct": 16.666666666666664,
+          "expectancyR": -0.48256667446400864
+        }
+      ]
+    },
+    {
+      "index": 4,
+      "trades": 43,
+      "winners": 12,
+      "hitRatePct": 27.906976744186046,
+      "expectancyR": -0.3101220405928294,
+      "totalPnlUsd": -3566.7281981812766,
+      "rollingMaxDrawdownPct": 24.66896992925177,
+      "passes": false,
+      "reasons": [
+        "expectancy -0.310R < 0.10R",
+        "hit rate 27.9% < 35%"
+      ],
+      "passesExistingDdBar": false,
+      "passesRecalDdBar": true,
+      "perSymbol": [
+        {
+          "symbol": "SOL-USD",
+          "trades": 24,
+          "winners": 7,
+          "hitRatePct": 29.166666666666668,
+          "expectancyR": -0.38042677495065663,
+          "totalPnlUsd": -2379.2222600810865
+        },
+        {
+          "symbol": "DOGE-USD",
+          "trades": 19,
+          "winners": 5,
+          "hitRatePct": 26.31578947368421,
+          "expectancyR": -0.22131606035136356,
+          "totalPnlUsd": -1187.5059381001915
+        }
+      ],
+      "perTrigger": [
+        {
+          "trigger": "bb_reentry_long",
+          "trades": 14,
+          "winners": 2,
+          "hitRatePct": 14.285714285714285,
+          "expectancyR": -0.580714338116559
+        },
+        {
+          "trigger": "atr_pullback_long",
+          "trades": 29,
+          "winners": 10,
+          "hitRatePct": 34.48275862068966,
+          "expectancyR": -0.17949127627102904
+        }
+      ]
+    },
+    {
+      "index": 5,
+      "trades": 26,
+      "winners": 16,
+      "hitRatePct": 61.53846153846154,
+      "expectancyR": 0.22861452260290707,
+      "totalPnlUsd": 402.0012673482963,
+      "rollingMaxDrawdownPct": 5.722478293870386,
+      "passes": true,
+      "reasons": [],
+      "passesExistingDdBar": true,
+      "passesRecalDdBar": true,
+      "perSymbol": [
+        {
+          "symbol": "SOL-USD",
+          "trades": 12,
+          "winners": 7,
+          "hitRatePct": 58.333333333333336,
+          "expectancyR": 0.1416543676672101,
+          "totalPnlUsd": -9.640431842323522
+        },
+        {
+          "symbol": "DOGE-USD",
+          "trades": 14,
+          "winners": 9,
+          "hitRatePct": 64.28571428571429,
+          "expectancyR": 0.30315179826207583,
+          "totalPnlUsd": 411.6416991906199
+        }
+      ],
+      "perTrigger": [
+        {
+          "trigger": "bb_reentry_long",
+          "trades": 11,
+          "winners": 8,
+          "hitRatePct": 72.72727272727273,
+          "expectancyR": 0.4888029966569157
+        },
+        {
+          "trigger": "atr_pullback_long",
+          "trades": 15,
+          "winners": 8,
+          "hitRatePct": 53.333333333333336,
+          "expectancyR": 0.037809641629967375
+        }
+      ]
+    },
+    {
+      "index": 6,
+      "trades": 14,
+      "winners": 4,
+      "hitRatePct": 28.57142857142857,
+      "expectancyR": -0.0837506126108474,
+      "totalPnlUsd": -738.4995220564601,
+      "rollingMaxDrawdownPct": 7.843098341995954,
+      "passes": false,
+      "reasons": [
+        "expectancy -0.084R < 0.10R",
+        "hit rate 28.6% < 35%"
+      ],
+      "passesExistingDdBar": true,
+      "passesRecalDdBar": true,
+      "perSymbol": [
+        {
+          "symbol": "SOL-USD",
+          "trades": 5,
+          "winners": 2,
+          "hitRatePct": 40,
+          "expectancyR": 0.17675596711711156,
+          "totalPnlUsd": -38.193413621377374
+        },
+        {
+          "symbol": "DOGE-USD",
+          "trades": 9,
+          "winners": 2,
+          "hitRatePct": 22.22222222222222,
+          "expectancyR": -0.22847649023749128,
+          "totalPnlUsd": -700.3061084350827
+        }
+      ],
+      "perTrigger": [
+        {
+          "trigger": "bb_reentry_long",
+          "trades": 5,
+          "winners": 2,
+          "hitRatePct": 40,
+          "expectancyR": 0.1812433830579955
+        },
+        {
+          "trigger": "atr_pullback_long",
+          "trades": 9,
+          "winners": 2,
+          "hitRatePct": 22.22222222222222,
+          "expectancyR": -0.23096949909353792
+        }
+      ]
+    },
+    {
+      "index": 7,
+      "trades": 59,
+      "winners": 26,
+      "hitRatePct": 44.06779661016949,
+      "expectancyR": -0.22575060776024847,
+      "totalPnlUsd": -5487.279290167113,
+      "rollingMaxDrawdownPct": 24.621986517032177,
+      "passes": false,
+      "reasons": [
+        "expectancy -0.226R < 0.10R"
+      ],
+      "passesExistingDdBar": false,
+      "passesRecalDdBar": true,
+      "perSymbol": [
+        {
+          "symbol": "SOL-USD",
+          "trades": 25,
+          "winners": 11,
+          "hitRatePct": 44,
+          "expectancyR": -0.1446507999819113,
+          "totalPnlUsd": -1704.425893817337
+        },
+        {
+          "symbol": "DOGE-USD",
+          "trades": 34,
+          "winners": 15,
+          "hitRatePct": 44.11764705882353,
+          "expectancyR": -0.2853828193619671,
+          "totalPnlUsd": -3782.853396349773
+        }
+      ],
+      "perTrigger": [
+        {
+          "trigger": "bb_reentry_long",
+          "trades": 13,
+          "winners": 6,
+          "hitRatePct": 46.15384615384615,
+          "expectancyR": -0.08088367175134649
+        },
+        {
+          "trigger": "atr_pullback_long",
+          "trades": 46,
+          "winners": 20,
+          "hitRatePct": 43.47826086956522,
+          "expectancyR": -0.2666912635888512
+        }
+      ]
+    },
+    {
+      "index": 8,
+      "trades": 52,
+      "winners": 21,
+      "hitRatePct": 40.38461538461539,
+      "expectancyR": 0.0502878408469378,
+      "totalPnlUsd": -1626.3148774176045,
+      "rollingMaxDrawdownPct": 24.50652113123431,
+      "passes": false,
+      "reasons": [
+        "expectancy 0.050R < 0.10R"
+      ],
+      "passesExistingDdBar": false,
+      "passesRecalDdBar": true,
+      "perSymbol": [
+        {
+          "symbol": "SOL-USD",
+          "trades": 24,
+          "winners": 9,
+          "hitRatePct": 37.5,
+          "expectancyR": -0.19748304721618112,
+          "totalPnlUsd": -1955.9943838898698
+        },
+        {
+          "symbol": "DOGE-USD",
+          "trades": 28,
+          "winners": 12,
+          "hitRatePct": 42.857142857142854,
+          "expectancyR": 0.26266288775818275,
+          "totalPnlUsd": 329.6795064722659
+        }
+      ],
+      "perTrigger": [
+        {
+          "trigger": "bb_reentry_long",
+          "trades": 15,
+          "winners": 5,
+          "hitRatePct": 33.33333333333333,
+          "expectancyR": -0.34591930599475873
+        },
+        {
+          "trigger": "atr_pullback_long",
+          "trades": 37,
+          "winners": 16,
+          "hitRatePct": 43.24324324324324,
+          "expectancyR": 0.21091235983681483
+        }
+      ]
+    }
+  ],
+  "skipReasons": {
+    "no trigger emitted": 28319,
+    "fired: atr-pullback-long": 738,
+    "§5.1 funding gate (no-op for longs)": 841,
+    "fired: bb-reentry-long": 276
+  },
+  "decision": "FAIL",
+  "passingWindowsBinding": 2,
+  "passingWindowsRecalDdBar": 9,
+  "passingWindowsExistingDdBar": 3,
+  "requiredPassing": 5
+}
