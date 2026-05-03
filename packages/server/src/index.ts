@@ -242,11 +242,14 @@ async function generateAndSaveReport(ctx: UserContext): Promise<void> {
 }
 
 async function generateAndSaveCryptoReport(ctx: UserContext): Promise<void> {
-  const snapshot = ctx.cryptoEngine.getReportSnapshot();
-  const report = generateCryptoEodReport(snapshot);
   // TRA-244 — same per-mode bucketing as the stocks generator above; crypto
   // only has demo vs live (no sandbox) since Coinbase has no paper sandbox.
+  // TRA-245 — pass the mode into getReportSnapshot so the Live folder gets
+  // Live (Coinbase) data and the Demo folder gets Demo paper-account data;
+  // pre-fix the snapshot was always Demo even when written under live/.
   const mode = cryptoModeKey(getSettings(ctx.username));
+  const snapshot = ctx.cryptoEngine.getReportSnapshot(mode);
+  const report = generateCryptoEodReport(snapshot);
   const targetDir = cryptoReportsDirFor(ctx, mode);
   const datePath = join(targetDir, `${report.date}.json`);
   const mdPath = join(targetDir, `${report.date}.md`);
@@ -262,17 +265,26 @@ async function generateAndSaveCryptoReport(ctx: UserContext): Promise<void> {
 
   // TRA-193 — persist the day's equity snapshot so the crypto P&L calendar and
   // cumulative stats see this row, mirroring the stocks flow above.
-  const closingEquity = snapshot.accountState.totalEquity;
-  const openingEquity = ctx.cryptoTracker.getOpeningEquity();
-  ctx.cryptoTracker.saveSnapshot({
-    date: report.date,
-    openingEquity,
-    closingEquity,
-    dailyPnl: closingEquity - openingEquity,
-    optionsPnl: 0,
-    combinedPnl: closingEquity - openingEquity,
-    trades: snapshot.allClosedPositions.length,
-  });
+  // TRA-245 — only write to cryptoTracker in demo mode. The tracker is shared
+  // across both crypto modes, and saveSnapshot rebases the demo dashboard's
+  // openingEquity to the snapshot's closingEquity. Writing a live-equity row
+  // here would corrupt that baseline (e.g. a $0 live equity from missing
+  // Coinbase creds would make the demo dashboard report a phantom -$25k
+  // dailyPnl after a restart). Live equity history lives in the per-mode
+  // crypto-reports/live/ files and longer-term in Coinbase's account history.
+  if (mode === 'demo') {
+    const closingEquity = snapshot.accountState.totalEquity;
+    const openingEquity = ctx.cryptoTracker.getOpeningEquity();
+    ctx.cryptoTracker.saveSnapshot({
+      date: report.date,
+      openingEquity,
+      closingEquity,
+      dailyPnl: closingEquity - openingEquity,
+      optionsPnl: 0,
+      combinedPnl: closingEquity - openingEquity,
+      trades: snapshot.allClosedPositions.length,
+    });
+  }
 
   console.log(`[crypto-reports:${ctx.username}] EOD report saved → ${datePath}`);
 

@@ -1104,15 +1104,40 @@ export class CryptoSignalEngine {
     return [...this.newsCache];
   }
 
-  getReportSnapshot() {
-    // TRA-242 — EOD reports run against the Demo book (Live history is
-    // owned by Coinbase, not by this engine). Pre-split this returned the
-    // merged list, which mixed Live trades into the EOD report on days the
-    // user toggled to live and back.
+  getReportSnapshot(mode: 'demo' | 'live' = 'demo') {
+    // TRA-245 — return the per-mode book so EOD reports written under
+    // crypto-reports/{mode}/ contain the matching account's data. Pre-fix
+    // this always returned the Demo book even when the caller wrote into
+    // crypto-reports/live/, so the Live folder + calendar surfaced demo
+    // paper-account state for users running with mode='live'.
+    const symbols = Array.from(this.symbolState.values());
+    if (mode === 'live') {
+      if (this.liveAccount) {
+        const ls = this.liveAccount.getState();
+        return {
+          allClosedPositions: [...this.liveClosedPositions],
+          accountState: {
+            totalEquity: ls.totalEquity,
+            availableCash: ls.availableCash,
+            openPositions: ls.openPositions,
+            dailyPnl: ls.dailyPnl,
+          },
+          symbols,
+        };
+      }
+      // Live mode without configured Coinbase creds — emit an empty
+      // snapshot so the Live calendar row exists but doesn't borrow from
+      // the demo book.
+      return {
+        allClosedPositions: [],
+        accountState: { totalEquity: 0, availableCash: 0, openPositions: [], dailyPnl: 0 },
+        symbols,
+      };
+    }
     return {
       allClosedPositions: [...this.demoClosedPositions],
       accountState: this.account.getState(),
-      symbols: Array.from(this.symbolState.values()),
+      symbols,
     };
   }
 
