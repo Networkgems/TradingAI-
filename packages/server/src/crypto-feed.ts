@@ -46,6 +46,58 @@ function toCMCSymbol(yahooSymbol: string): string {
   return yahooSymbol.replace(/-USD$/, '').replace(/-USDT$/, '');
 }
 
+/**
+ * TRA-300 — Coinbase Exchange public stats endpoint as a third-tier quote
+ * fallback. Used when both Yahoo Finance and CoinMarketCap miss (e.g. Yahoo
+ * IP-blocking the Render egress and CMC quota / key issues), so the watchlist
+ * keeps showing live crypto prices instead of "Quote unavailable" indefinitely.
+ *
+ * Public endpoint, no auth required. Per-product call to
+ * `/products/{id}/stats` returns `{ open, high, low, last, volume, … }` —
+ * `last` is the spot price, `volume` is 24h base-currency volume, and
+ * change% is computed from `(last - open) / open * 100`. We fan out in
+ * concurrency-5 batches with a 150ms gap between batches to stay well inside
+ * Coinbase's public-data 10 req/s limit.
+ */
+const COINBASE_BASE = 'https://api.exchange.coinbase.com';
+async function fetchCoinbaseStatsQuotes(
+  symbols: readonly string[],
+): Promise<Map<string, { price: number; volume: number; change: number; changePct: number }>> {
+  const results = new Map<string, { price: number; volume: number; change: number; changePct: number }>();
+  if (symbols.length === 0) return results;
+  const BATCH = 5;
+  for (let i = 0; i < symbols.length; i += BATCH) {
+    const slice = symbols.slice(i, i + BATCH);
+    const settled = await Promise.all(slice.map(async sym => {
+      try {
+        const resp = await withTimeout(
+          fetch(`${COINBASE_BASE}/products/${encodeURIComponent(sym)}/stats`, {
+            headers: { 'User-Agent': 'TRA-300/1.0', Accept: 'application/json' },
+          }),
+          FEED_CALL_TIMEOUT_MS,
+          `Coinbase stats(${sym})`,
+        );
+        if (!resp.ok) return [sym, null] as const;
+        const json = (await resp.json()) as { open?: string; last?: string; volume?: string };
+        const price = Number(json.last);
+        const open = Number(json.open);
+        const volume = Number(json.volume ?? 0);
+        if (!Number.isFinite(price) || price <= 0) return [sym, null] as const;
+        const changePct = Number.isFinite(open) && open > 0 ? ((price - open) / open) * 100 : 0;
+        const change = price - (Number.isFinite(open) ? open : price);
+        return [sym, { price, volume, change, changePct }] as const;
+      } catch {
+        return [sym, null] as const;
+      }
+    }));
+    for (const [sym, q] of settled) {
+      if (q) results.set(sym, q);
+    }
+    if (i + BATCH < symbols.length) await sleep(150);
+  }
+  return results;
+}
+
 async function fetchCMCBatchQuotes(
   symbols: readonly string[],
 ): Promise<Map<string, { price: number; volume: number; change: number; changePct: number }>> {
@@ -202,7 +254,11 @@ export async function fetchCryptoQuote(
     }
   }
   const cmcResults = await fetchCMCBatchQuotes([symbol]);
-  return cmcResults.get(symbol) ?? null;
+  if (cmcResults.has(symbol)) return cmcResults.get(symbol) ?? null;
+  // TRA-300 — Coinbase Exchange public stats fallback (no API key) so a
+  // single-symbol UI lookup still resolves when YF and CMC both miss.
+  const cbResults = await fetchCoinbaseStatsQuotes([symbol]);
+  return cbResults.get(symbol) ?? null;
 }
 
 export async function fetchCryptoQuotes(
@@ -282,12 +338,24 @@ export async function fetchCryptoQuotes(
     for (const [sym, quote] of cmcResults) {
       results.set(sym, quote);
     }
-    const stillFailed = failed.filter(s => !cmcResults.has(s));
+    let stillFailed = failed.filter(s => !cmcResults.has(s));
+    // TRA-300 — Coinbase Exchange public stats covers the major USD spot
+    // pairs and works without an API key, so we use it to rescue symbols
+    // that Yahoo (rate-limit / IP-block) and CMC (quota / no key) both
+    // missed before flagging them "Quote unavailable" on the watchlist.
+    if (stillFailed.length > 0) {
+      console.log(`[crypto-feed] Coinbase fallback for ${stillFailed.length} symbols`);
+      const cbResults = await fetchCoinbaseStatsQuotes(stillFailed);
+      for (const [sym, quote] of cbResults) {
+        results.set(sym, quote);
+      }
+      stillFailed = stillFailed.filter(s => !cbResults.has(s));
+    }
     if (stillFailed.length > 0) {
       const list = stillFailed.length <= 10
         ? stillFailed.join(', ')
         : `${stillFailed.slice(0, 10).join(', ')}, …+${stillFailed.length - 10} more`;
-      console.error(`[crypto-feed] fetchCryptoQuotes: ${stillFailed.length} symbols had no data from YF or CMC: ${list}`);
+      console.error(`[crypto-feed] fetchCryptoQuotes: ${stillFailed.length} symbols had no data from YF, CMC, or Coinbase: ${list}`);
     }
   }
 
