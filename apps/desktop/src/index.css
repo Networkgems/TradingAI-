@@ -225,16 +225,18 @@ body {
   border-color: var(--header-green-strong);
 }
 
-/* TRA-277 — Profile button must read white in both themes. The default
-   .logout-btn color (var(--muted)) blends into the navy header in light
-   mode and looks dim in dark mode; force the header text token instead. */
+/* TRA-277 — Profile button must read pure white in both themes. The
+   default .logout-btn color (var(--muted)) blends into the navy header
+   in light mode and looks dim in dark mode. Board chose strict #ffffff
+   over the design-system text token (which resolves to #e6edf3 in dark
+   mode) so the label is unambiguously white in either theme. */
 .header .profile-wrap .logout-btn {
-  color: var(--header-text);
+  color: #ffffff;
   border-color: var(--header-divider);
 }
 .header .profile-wrap .logout-btn:hover {
-  color: var(--header-text);
-  border-color: var(--header-text);
+  color: #ffffff;
+  border-color: #ffffff;
 }
 
 /* Logical stat clusters — account / options / status */
