@@ -603,6 +603,38 @@ export class PaperOptionsAccount {
     return { ...opt };
   }
 
+  /**
+   * TRA-319 — undo a freshly opened position when the upstream broker rejected
+   * or canceled the mirrored order before any fill. Differs from `closeOption`
+   * in that it leaves NO trace: no realized P&L, no closed-options row, no
+   * counter usage. The cash, the daily counter, and the open-position record
+   * are reverted as if the open never happened.
+   *
+   * Returns `false` when the position is unknown so the caller can no-op.
+   */
+  voidOpenOption(optionId: string): boolean {
+    const opt = this.openOptions.get(optionId);
+    if (!opt) return false;
+    // Refund the premium that was deducted in the open path. Use
+    // `contractsRemaining` so a position that already had a partial fill /
+    // partial exit isn't double-credited (in practice the caller voids
+    // immediately after open, so remaining === contracts; the Math.max guard
+    // is defensive).
+    const refund = opt.premiumPaid * Math.max(opt.contractsRemaining, 0) * 100;
+    this.cash += refund;
+    // Roll back the per-source daily counter so the user doesn't lose a slot
+    // to a trade that never happened on the broker side.
+    if (opt.signalType === 'relative_value') {
+      this.dailyRvCount = Math.max(0, this.dailyRvCount - 1);
+    } else if (opt.signalType === 'otm_mispricing') {
+      this.dailyOtmCount = Math.max(0, this.dailyOtmCount - 1);
+    } else {
+      this.dailyCount = Math.max(0, this.dailyCount - 1);
+    }
+    this.openOptions.delete(optionId);
+    return true;
+  }
+
   hasOpenOption(symbol: string): boolean {
     return Array.from(this.openOptions.values()).some(o => o.symbol === symbol);
   }

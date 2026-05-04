@@ -17,8 +17,41 @@ export interface TradierOrderResponse {
   partner_id?: string;
 }
 
+/**
+ * TRA-319 — full order detail returned by `/accounts/{id}/orders/{order_id}`.
+ * `status` transitions through `open`/`pending` and lands on a terminal state
+ * (`filled`, `canceled`, `rejected`, `expired`, `error`). `reason_description`
+ * is populated by Tradier when the order is rejected/canceled (e.g. the
+ * "insufficient buying power" string the user sees in their dashboard).
+ */
+export interface TradierOrderDetail {
+  id: number;
+  status: string;
+  reason_description?: string;
+  exec_quantity?: number;
+  remaining_quantity?: number;
+  avg_fill_price?: number;
+}
+
+/** TRA-319 — terminal Tradier order states (no further transitions expected). */
+export const TRADIER_TERMINAL_STATUSES = new Set<string>([
+  'filled',
+  'canceled',
+  'rejected',
+  'expired',
+  'error',
+]);
+
+/** TRA-319 — terminal states that mean the order did NOT result in a fill. */
+export const TRADIER_REJECTED_STATUSES = new Set<string>([
+  'canceled',
+  'rejected',
+  'expired',
+  'error',
+]);
+
 interface TradierOrderEnvelope {
-  order?: TradierOrderResponse & { errors?: { error: string | string[] } };
+  order?: (TradierOrderResponse & TradierOrderDetail) & { errors?: { error: string | string[] } };
   errors?: { error: string | string[] };
 }
 
@@ -83,6 +116,66 @@ export class TradierOrderClient {
     if (!resp.ok && resp.status !== 422 && resp.status !== 404) {
       throw new Error(`Tradier cancel failed (${resp.status})`);
     }
+  }
+
+  /**
+   * TRA-319 — fetch the current state of an order so callers can detect
+   * post-acceptance cancellations (e.g. "insufficient buying power"). Returns
+   * `null` when Tradier returns a non-2xx or an envelope without an `order`
+   * payload so the caller can decide whether to retry or treat the order as
+   * still pending.
+   */
+  async getOrderStatus(orderId: string | number): Promise<TradierOrderDetail | null> {
+    const resp = await fetch(
+      `${this.baseUrl}/accounts/${encodeURIComponent(this.accountId)}/orders/${encodeURIComponent(String(orderId))}`,
+      { method: 'GET', headers: { Authorization: this.headers.Authorization, Accept: 'application/json' } },
+    );
+    if (!resp.ok) return null;
+    const data = (await resp.json()) as TradierOrderEnvelope;
+    if (!data.order) return null;
+    const o = data.order;
+    return {
+      id: o.id,
+      status: typeof o.status === 'string' ? o.status.toLowerCase() : '',
+      reason_description: o.reason_description,
+      exec_quantity: typeof o.exec_quantity === 'number' ? o.exec_quantity : undefined,
+      remaining_quantity: typeof o.remaining_quantity === 'number' ? o.remaining_quantity : undefined,
+      avg_fill_price: typeof o.avg_fill_price === 'number' ? o.avg_fill_price : undefined,
+    };
+  }
+
+  /**
+   * TRA-319 — poll `getOrderStatus` until the order reaches a terminal state
+   * or the timeout elapses. Used to detect Tradier post-acceptance cancels
+   * (insufficient buying power, account flags, etc.) before the engine
+   * commits a paper-side "open" record. Returns the final `TradierOrderDetail`
+   * (still pending if it didn't terminate within the window) or `null` when
+   * every poll attempt failed.
+   *
+   * The poll cadence is tuned for the "place order then check fill"
+   * synchronous flow — short enough to keep the engine's tick responsive but
+   * long enough that Tradier's risk-check pipeline (typically <2s) can run.
+   */
+  async waitForOrderTerminalStatus(
+    orderId: string | number,
+    options: { timeoutMs?: number; intervalMs?: number; sleep?: (ms: number) => Promise<void> } = {},
+  ): Promise<TradierOrderDetail | null> {
+    const timeoutMs = options.timeoutMs ?? 6000;
+    const intervalMs = options.intervalMs ?? 750;
+    const sleep = options.sleep ?? ((ms) => new Promise<void>((r) => setTimeout(r, ms)));
+    const deadline = Date.now() + timeoutMs;
+    let last: TradierOrderDetail | null = null;
+    while (Date.now() < deadline) {
+      const detail = await this.getOrderStatus(orderId);
+      if (detail) {
+        last = detail;
+        if (TRADIER_TERMINAL_STATUSES.has(detail.status)) return detail;
+      }
+      const remaining = deadline - Date.now();
+      if (remaining <= 0) break;
+      await sleep(Math.min(intervalMs, remaining));
+    }
+    return last;
   }
 
   protected async postOrder(body: URLSearchParams): Promise<TradierOrderResponse> {

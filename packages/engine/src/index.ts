@@ -43,11 +43,20 @@ export { AlpacaOptionsClient } from './alpaca/index.js';
 export type { AlpacaOptionsContract, AlpacaOptionOrderResponse } from './alpaca/index.js';
 export { TradierFeed } from './feed/index.js';
 export type { TradierFeedEvents } from './feed/index.js';
-export { TradierOrderClient, TradierOptionsClient, TradierStocksClient, tradierBaseUrl, underlyingFromOcc } from './tradier/index.js';
+export {
+  TradierOrderClient,
+  TradierOptionsClient,
+  TradierStocksClient,
+  tradierBaseUrl,
+  underlyingFromOcc,
+  TRADIER_TERMINAL_STATUSES,
+  TRADIER_REJECTED_STATUSES,
+} from './tradier/index.js';
 export type {
   TradierEnv,
   TradierBracketOrderParams,
   TradierOrderResponse,
+  TradierOrderDetail,
   TradierOptionsContract,
   TradierOptionQuote,
   TradierEquityQuote,

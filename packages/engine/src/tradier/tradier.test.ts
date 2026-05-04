@@ -326,7 +326,7 @@ describe('TradierOptionsClient.getAccountBalance (TRA-226)', () => {
     );
     const client = new TradierOptionsClient('tok', 'A1');
     const balance = await client.getAccountBalance();
-    expect(balance).toEqual({ totalEquity: 12345.67, totalCash: 5000 });
+    expect(balance).toEqual({ totalEquity: 12345.67, totalCash: 5000, optionBuyingPower: null });
     expect(callUrl(0)).toBe('https://sandbox.tradier.com/v1/accounts/A1/balances');
     const headers = callInit(0).headers as Record<string, string>;
     expect(headers.Authorization).toBe('Bearer tok');
@@ -353,6 +353,51 @@ describe('TradierOptionsClient.getAccountBalance (TRA-226)', () => {
     );
     const client = new TradierOptionsClient('tok', 'A1');
     expect(await client.getAccountBalance()).toBeNull();
+  });
+
+  // TRA-319 — option buying power surfaces from the per-account-type subobject
+  // (`margin`, `pdt`, or `cash`) so the engine can pre-check before placing an
+  // order Tradier would just cancel for insufficient funds.
+  it('extracts option_buying_power from a margin balance', async () => {
+    fetchMock.mockResolvedValueOnce(
+      jsonResponse({
+        balances: {
+          total_equity: 1000,
+          total_cash: 300,
+          account_type: 'margin',
+          margin: { option_buying_power: 250, stock_buying_power: 600 },
+        },
+      }),
+    );
+    const client = new TradierOptionsClient('tok', 'A1');
+    expect(await client.getAccountBalance()).toEqual({
+      totalEquity: 1000,
+      totalCash: 300,
+      optionBuyingPower: 250,
+    });
+  });
+
+  it('falls back to cash.cash_available for cash accounts', async () => {
+    fetchMock.mockResolvedValueOnce(
+      jsonResponse({
+        balances: {
+          total_equity: 500,
+          total_cash: 500,
+          account_type: 'cash',
+          cash: { cash_available: 480 },
+        },
+      }),
+    );
+    const client = new TradierOptionsClient('tok', 'A1');
+    expect((await client.getAccountBalance())?.optionBuyingPower).toBe(480);
+  });
+
+  it('returns optionBuyingPower=null when no buying-power subobject is present', async () => {
+    fetchMock.mockResolvedValueOnce(
+      jsonResponse({ balances: { total_equity: 1, total_cash: 1 } }),
+    );
+    const client = new TradierOptionsClient('tok', 'A1');
+    expect((await client.getAccountBalance())?.optionBuyingPower).toBeNull();
   });
 });
 
@@ -387,5 +432,101 @@ describe('TradierOptionsClient.buyContracts / sellContracts', () => {
     fetchMock.mockResolvedValueOnce(textResponse('rate limit', 429));
     const client = new TradierOptionsClient('tok', 'A1');
     await expect(client.buyContracts('AAPL260515C00150000', 1)).rejects.toThrow(/429/);
+  });
+});
+
+// ─── TRA-319 — order status reconciliation ──────────────────────────────────
+
+describe('TradierOrderClient.getOrderStatus', () => {
+  it('parses the order envelope and lowercases status', async () => {
+    fetchMock.mockResolvedValueOnce(
+      jsonResponse({
+        order: {
+          id: 42,
+          status: 'CANCELED',
+          reason_description: 'insufficient buying power',
+          exec_quantity: 0,
+          remaining_quantity: 1,
+        },
+      }),
+    );
+    const client = new TradierOrderClient('tok', 'A1');
+    const detail = await client.getOrderStatus(42);
+    expect(detail).toEqual({
+      id: 42,
+      status: 'canceled',
+      reason_description: 'insufficient buying power',
+      exec_quantity: 0,
+      remaining_quantity: 1,
+      avg_fill_price: undefined,
+    });
+    expect(callUrl(0)).toBe('https://sandbox.tradier.com/v1/accounts/A1/orders/42');
+    expect(callInit(0).method).toBe('GET');
+  });
+
+  it('returns null on a non-2xx response', async () => {
+    fetchMock.mockResolvedValueOnce(textResponse('nope', 404));
+    const client = new TradierOrderClient('tok', 'A1');
+    expect(await client.getOrderStatus(7)).toBeNull();
+  });
+});
+
+describe('TradierOrderClient.waitForOrderTerminalStatus', () => {
+  it('returns immediately when the first poll is already terminal', async () => {
+    fetchMock.mockResolvedValueOnce(
+      jsonResponse({ order: { id: 1, status: 'filled', exec_quantity: 1 } }),
+    );
+    const client = new TradierOrderClient('tok', 'A1');
+    const sleep = vi.fn(async () => {});
+    const detail = await client.waitForOrderTerminalStatus(1, { timeoutMs: 1000, sleep });
+    expect(detail?.status).toBe('filled');
+    expect(sleep).not.toHaveBeenCalled();
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+  });
+
+  it('polls until a terminal state is reached', async () => {
+    fetchMock
+      .mockResolvedValueOnce(jsonResponse({ order: { id: 2, status: 'pending' } }))
+      .mockResolvedValueOnce(jsonResponse({ order: { id: 2, status: 'open' } }))
+      .mockResolvedValueOnce(
+        jsonResponse({
+          order: { id: 2, status: 'rejected', reason_description: 'insufficient buying power' },
+        }),
+      );
+    const client = new TradierOrderClient('tok', 'A1');
+    const sleep = vi.fn(async () => {});
+    const detail = await client.waitForOrderTerminalStatus(2, {
+      timeoutMs: 5000,
+      intervalMs: 10,
+      sleep,
+    });
+    expect(detail?.status).toBe('rejected');
+    expect(detail?.reason_description).toBe('insufficient buying power');
+    expect(fetchMock).toHaveBeenCalledTimes(3);
+    expect(sleep).toHaveBeenCalledTimes(2);
+  });
+
+  it('returns the latest non-terminal detail when the timeout elapses', async () => {
+    // `mockResolvedValue` would reuse the same Response instance — Response.json()
+    // can only be read once, so use a factory that builds a fresh body per call.
+    fetchMock.mockImplementation(async () =>
+      jsonResponse({ order: { id: 3, status: 'pending' } }),
+    );
+    const client = new TradierOrderClient('tok', 'A1');
+    let virtualNow = 0;
+    const dateSpy = vi.spyOn(Date, 'now').mockImplementation(() => virtualNow);
+    const sleep = vi.fn(async (ms: number) => {
+      virtualNow += ms;
+    });
+    try {
+      const detail = await client.waitForOrderTerminalStatus(3, {
+        timeoutMs: 100,
+        intervalMs: 40,
+        sleep,
+      });
+      expect(detail?.status).toBe('pending');
+    } finally {
+      dateSpy.mockRestore();
+    }
   });
 });

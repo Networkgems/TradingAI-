@@ -76,6 +76,20 @@ interface TradierBalancesEnvelope {
     total_equity?: number;
     total_cash?: number;
     open_pl?: number;
+    /** TRA-319 — margin accounts surface option buying power under `margin`. */
+    margin?: {
+      option_buying_power?: number;
+      stock_buying_power?: number;
+    } | null;
+    /** TRA-319 — pattern-day-trader accounts surface it under `pdt`. */
+    pdt?: {
+      option_buying_power?: number;
+      stock_buying_power?: number;
+    } | null;
+    /** TRA-319 — cash accounts only have `cash.cash_available`. */
+    cash?: {
+      cash_available?: number;
+    } | null;
   } | null;
 }
 
@@ -83,6 +97,14 @@ interface TradierBalancesEnvelope {
 export interface TradierAccountBalance {
   totalEquity: number;
   totalCash: number;
+  /**
+   * TRA-319 — option buying power for the account. Margin accounts use
+   * `balances.margin.option_buying_power`; PDT accounts use `balances.pdt.*`;
+   * cash accounts only have `balances.cash.cash_available`. `null` when the
+   * payload didn't include any of those — callers should fall back to
+   * `totalCash` and accept that the pre-check might be permissive.
+   */
+  optionBuyingPower: number | null;
 }
 
 /** Tradier returns `T | T[]` depending on result count; sometimes `null`/empty string when none. */
@@ -234,7 +256,18 @@ export class TradierOptionsClient extends TradierOrderClient {
     const totalEquity = typeof b.total_equity === 'number' ? b.total_equity : NaN;
     const totalCash = typeof b.total_cash === 'number' ? b.total_cash : NaN;
     if (!Number.isFinite(totalEquity) || !Number.isFinite(totalCash)) return null;
-    return { totalEquity, totalCash };
+    // TRA-319 — read option buying power from whichever sub-envelope the
+    // account type uses. Margin / PDT accounts expose it directly; cash
+    // accounts only have `cash.cash_available`. We prefer the explicit
+    // option_buying_power when present, fall back to cash_available, and
+    // signal `null` when nothing is available so the caller knows to skip
+    // the pre-check rather than gate on a stale value.
+    const obpRaw =
+      b.margin?.option_buying_power
+      ?? b.pdt?.option_buying_power
+      ?? b.cash?.cash_available;
+    const optionBuyingPower = typeof obpRaw === 'number' && Number.isFinite(obpRaw) ? obpRaw : null;
+    return { totalEquity, totalCash, optionBuyingPower };
   }
 
   /** Submit a market order to buy option contracts (open). */

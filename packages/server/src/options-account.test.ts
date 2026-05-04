@@ -1,6 +1,6 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import { PaperOptionsAccount } from './options-account.js';
-import type { OtmMispricingSignal } from '@trading-app/shared';
+import type { OtmMispricingSignal, RelativeValueSignal } from '@trading-app/shared';
 
 // Inside an ET trading window: 10:00 AM ET = 14:00 UTC during EDT (UTC-4).
 // Pin to a Tuesday so the weekday/window predicate passes.
@@ -165,6 +165,80 @@ describe('PaperOptionsAccount.checkExits — chain-driven OTM marks', () => {
     expect(closed).toHaveLength(1);
     expect(closed[0].pnl).toBeLessThan(0);
     expect(entryPremium).toBe(2.0);
+  });
+});
+
+describe('PaperOptionsAccount.voidOpenOption (TRA-319)', () => {
+  function buildRvSignal(overrides: Partial<RelativeValueSignal> = {}): RelativeValueSignal {
+    return {
+      id: 'rv-1',
+      symbol: 'AAPL',
+      type: 'relative_value',
+      side: 'buy',
+      entryPrice: 1.0,
+      stopLoss: 0.75,
+      takeProfit: 1.5,
+      riskRewardRatio: 2,
+      timestamp: TRADING_TIME,
+      optionSymbol: 'AAPL240705C00200000',
+      optionType: 'call',
+      strike: 200,
+      expiration: '2024-07-05',
+      mark: 1.0,
+      fairPrice: 1.30,
+      mispricingPct: -0.23,
+      zScore: -2.1,
+      ivFitted: 0.32,
+      ivUsed: 0.28,
+      delta: 0.18,
+      reason: 'cheap-vs-curve',
+      ...overrides,
+    };
+  }
+
+  it('refunds cash and reverts the daily counter when an RV open is voided', () => {
+    const acct = new PaperOptionsAccount({ initialEquity: 50_000, managedAccountRatio: 0.5 });
+    const startCash = acct.getState().optionsCash;
+    const pos = acct.openOptionFromRvCandidate(buildRvSignal({ mark: 1.0 }), 'live');
+    expect(pos).not.toBeNull();
+    // RV budget = 50_000 * 0.5 * 0.05 = $1,250 → 12 contracts at $100 each.
+    const cashAfterOpen = acct.getState().optionsCash;
+    expect(cashAfterOpen).toBeLessThan(startCash);
+    expect(acct.getState().dailyOptionsCount).toBe(1);
+
+    expect(acct.voidOpenOption(pos!.id)).toBe(true);
+
+    // Cash fully restored, position gone from open list, daily counter reverted.
+    expect(acct.getState().optionsCash).toBeCloseTo(startCash, 5);
+    expect(acct.getState().openOptions).toHaveLength(0);
+    expect(acct.getState().dailyOptionsCount).toBe(0);
+    // Voided opens leave NO trace in closed-options (vs. closeOption).
+    expect(acct.getState().closedOptions).toHaveLength(0);
+    // No realized P&L attributed.
+    expect(acct.getState().optionsPnl).toBe(0);
+  });
+
+  it('returns false for an unknown id', () => {
+    const acct = new PaperOptionsAccount({ initialEquity: 50_000, managedAccountRatio: 0.5 });
+    expect(acct.voidOpenOption('does-not-exist')).toBe(false);
+  });
+
+  it('frees the daily slot so a new RV open can take its place after a void', () => {
+    const acct = new PaperOptionsAccount({
+      initialEquity: 50_000,
+      managedAccountRatio: 0.5,
+      optionsDailyTradesLimit: 1,
+    });
+    const a = acct.openOptionFromRvCandidate(buildRvSignal({ optionSymbol: 'AAA' }), 'live');
+    expect(a).not.toBeNull();
+    expect(acct.voidOpenOption(a!.id)).toBe(true);
+    // Slot must be reusable since the broker rejected the original — the user
+    // shouldn't lose a daily entry to a trade that never happened.
+    const b = acct.openOptionFromRvCandidate(
+      buildRvSignal({ id: 'rv-2', optionSymbol: 'BBB', strike: 210 }),
+      'live',
+    );
+    expect(b).not.toBeNull();
   });
 });
 

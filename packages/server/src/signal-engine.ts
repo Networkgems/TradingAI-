@@ -1,4 +1,4 @@
-import { OrbStrategy, BbFadeStrategy, IchimokuStrategy, TradierOptionsClient } from '@trading-app/engine';
+import { OrbStrategy, BbFadeStrategy, IchimokuStrategy, TradierOptionsClient, TRADIER_REJECTED_STATUSES } from '@trading-app/engine';
 import type { TradierAccountBalance } from '@trading-app/engine';
 import { WATCHLIST, MANAGED_ACCOUNT_RATIO, MAX_CONSECUTIVE_LOSSES, DAILY_DRAWDOWN_HALT_PCT, aliasWatchlistSymbol, isStockMarketOpen, resolveTradierOptionsCreds } from '@trading-app/shared';
 import type { TradeSignal, RelativeValueSignal, Candle, OptionsAccountState, SignalType, Position, AccountSettings, AccountState, NewsItem, TradierEnv } from '@trading-app/shared';
@@ -755,22 +755,68 @@ export class SignalEngine {
         if (!opened) continue;
 
         // TRA-221 — when running live with Tradier configured, mirror the
-        // paper open by submitting a real `buy_to_open` market order. The
-        // paper position remains the canonical record for the engine's
-        // internal state (PnL, exits, daily counters); Tradier execution
-        // happens in the background and a failure is logged but does NOT
-        // roll back the paper open.
+        // paper open by submitting a real `buy_to_open` market order.
+        // TRA-319 — Tradier sometimes accepts the order synchronously (200 OK)
+        // and only later cancels it for "insufficient buying power" / margin
+        // limits. Previously the paper open stuck around as a phantom fill.
+        // Now we (a) pre-check Tradier's option buying power against the
+        // notional cost and skip the mirror with a paper-side rollback if
+        // it's insufficient, (b) wait briefly after submit for the order to
+        // reach a terminal state, and (c) void the paper position when
+        // Tradier rejects/cancels/expires the order so the dashboard never
+        // shows an "open" trade that doesn't exist on the broker.
         if (this.mode === 'live' && this.tradierLiveClient && opened.optionSymbol && opened.contracts > 0) {
+          const notionalCost = opened.premiumPaid * opened.contracts * 100;
+          const tradierVoid = (reason: string): void => {
+            console.warn(
+              `[signal-engine] voiding paper open ${opened.id} (${opened.optionSymbol}) — ${reason}`,
+            );
+            this.optionsAccount.voidOpenOption(opened.id);
+          };
+
+          // Pre-check: refresh the Tradier balance if we have a non-stale
+          // snapshot, then bail before submitting an order we know will be
+          // rejected. `optionBuyingPower` is `null` for cash accounts on a
+          // raw payload — fall through to the post-submit reconciliation in
+          // that case rather than blocking trades.
+          const obp = this.liveTradierBalance?.optionBuyingPower;
+          if (typeof obp === 'number' && Number.isFinite(obp) && obp < notionalCost) {
+            tradierVoid(
+              `Tradier option buying power $${obp.toFixed(2)} < required $${notionalCost.toFixed(2)}`,
+            );
+            continue;
+          }
+
+          let mirrored = false;
           try {
             const resp = await this.tradierLiveClient.buyContracts(opened.optionSymbol, opened.contracts);
             console.log(
               `[signal-engine] tradier live buy_to_open ${opened.optionSymbol} qty=${opened.contracts} order=${resp.id} status=${resp.status}`,
             );
+            // Wait briefly for Tradier to flip the order to a terminal state.
+            // If it's still pending after the window we accept it as live
+            // (the periodic balance refresh will surface a downstream cancel
+            // through the user's Tradier dashboard).
+            const detail = await this.tradierLiveClient.waitForOrderTerminalStatus(resp.id);
+            if (detail && TRADIER_REJECTED_STATUSES.has(detail.status)) {
+              const reasonSuffix = detail.reason_description ? `: ${detail.reason_description}` : '';
+              tradierVoid(
+                `Tradier order ${resp.id} ended ${detail.status}${reasonSuffix}`,
+              );
+              // Refresh the cached balance so the dashboard immediately
+              // reflects the (unchanged) buying power instead of waiting up
+              // to two minutes for the periodic poll.
+              this.refreshTradierBalance().catch(() => {});
+              continue;
+            }
+            mirrored = true;
           } catch (err: unknown) {
-            console.error(
-              `[signal-engine] tradier live buy failed ${opened.optionSymbol}: ${err instanceof Error ? err.message : String(err)}`,
+            tradierVoid(
+              `Tradier live buy threw ${err instanceof Error ? err.message : String(err)}`,
             );
+            continue;
           }
+          if (!mirrored) continue;
         }
 
         // TRA-231 — stamp the active mode so the Signals panel scopes the
