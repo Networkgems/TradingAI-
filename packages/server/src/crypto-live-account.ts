@@ -606,8 +606,11 @@ export class CryptoLiveAccount {
         // Sentinel TP/SL — `checkExits` reads from `this.positions` (not
         // this map) so these are advisory; if a future call site iterates
         // imported positions, the sentinels guarantee no auto-exit fires.
+        // We use `Number.MAX_VALUE` instead of `Infinity` because the latter
+        // serializes to `null` through JSON.stringify, which then crashes
+        // the dashboard formatters (TRA-318 follow-up).
         stopLoss: 0,
-        takeProfit: Number.POSITIVE_INFINITY,
+        takeProfit: Number.MAX_VALUE,
         openedAt: Date.now(),
         productType: 'spot',
       });

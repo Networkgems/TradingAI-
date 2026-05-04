@@ -2034,9 +2034,15 @@ describe('CryptoLiveAccount spot wallet reconciliation (TRA-318)', () => {
       entryPrice: 3_000,
       productType: 'spot',
     });
-    // Sentinel TP/SL: imported holdings never auto-exit.
-    expect(btc!.takeProfit).toBe(Number.POSITIVE_INFINITY);
+    // Sentinel TP/SL: imported holdings never auto-exit. Must stay JSON-safe
+    // (Infinity → null on the wire crashed the dashboard formatters; see the
+    // TRA-318 follow-up).
+    expect(btc!.takeProfit).toBe(Number.MAX_VALUE);
     expect(btc!.stopLoss).toBe(0);
+    expect(Number.isFinite(btc!.takeProfit)).toBe(true);
+    const wire = JSON.parse(JSON.stringify(btc));
+    expect(wire.takeProfit).toBe(Number.MAX_VALUE);
+    expect(wire.stopLoss).toBe(0);
   });
 
   it('nets engine-opened spot quantity out of the imported holding so we do not double-count', async () => {

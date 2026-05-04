@@ -771,8 +771,8 @@ function CryptoDashboard({ token, onBack, onLogout, onActivity, theme, onToggleT
                           <td className="symbol">{p.symbol}</td>
                           <td className={p.side === 'buy' ? 'green' : 'red'}>{p.side.toUpperCase()}</td>
                           <td>{p.quantity}</td>
-                          <td>${fmt(p.entryPrice)}</td>
-                          <td>${fmt(exit)}</td>
+                          <td>{fmtPrice(p.entryPrice)}</td>
+                          <td>{fmtPrice(exit)}</td>
                           <td className={pnlPct >= 0 ? 'green' : 'red'}>{fmtPct(pnlPct)}</td>
                           <td className={pnlDollar >= 0 ? 'green' : 'red'}>{fmtDollar(pnlDollar)}</td>
                           <td className="muted">{exitReasonLabel(p.exitReason)}</td>
@@ -846,18 +846,33 @@ interface AppState {
   autoTradingEnabled: boolean;
 }
 
-function fmt(n: number, decimals = 2) {
+// TRA-318 follow-up: defend against null/undefined/NaN/non-finite numeric
+// fields arriving from the API (e.g. `Number.POSITIVE_INFINITY` reconciled
+// from a Coinbase wallet holding gets serialized to `null` over the wire).
+// Without this guard the formatters threw and crashed the Positions tab to
+// a white screen.
+function fmt(n: number | null | undefined, decimals = 2) {
+  if (n == null || !Number.isFinite(n) || Math.abs(n) >= 1e15) return '—';
   return n.toLocaleString('en-US', { minimumFractionDigits: decimals, maximumFractionDigits: decimals });
 }
 
-function fmtDollar(n: number) {
+function fmtDollar(n: number | null | undefined) {
+  if (n == null || !Number.isFinite(n) || Math.abs(n) >= 1e15) return '—';
   const sign = n >= 0 ? '+' : '';
   return `${sign}$${fmt(Math.abs(n))}`;
 }
 
-function fmtPct(n: number) {
+function fmtPct(n: number | null | undefined) {
+  if (n == null || !Number.isFinite(n) || Math.abs(n) >= 1e15) return '—';
   const sign = n >= 0 ? '+' : '';
   return `${sign}${fmt(n, 2)}%`;
+}
+
+// Dollar-prefixed price for un-signed columns (entry, stop, target, cost).
+// Returns "—" alone (no leading "$") when the value is missing/sentinel.
+function fmtPrice(n: number | null | undefined, decimals = 2) {
+  if (n == null || !Number.isFinite(n) || Math.abs(n) >= 1e15) return '—';
+  return `$${fmt(n, decimals)}`;
 }
 
 function timeAgo(ts: number) {
@@ -1618,13 +1633,13 @@ function Dashboard({ token, onLogout, onGoHome, onActivity, theme, onToggleTheme
                           <td className="symbol">{p.symbol}</td>
                           <td className={p.side === 'buy' ? 'green' : 'red'}>{p.side.toUpperCase()}</td>
                           <td>{p.quantity}</td>
-                          <td>${fmt(p.entryPrice)}</td>
-                          <td>${fmt(totalCost)}</td>
-                          <td>${fmt(currentPrice)}</td>
+                          <td>{fmtPrice(p.entryPrice)}</td>
+                          <td>{fmtPrice(totalCost)}</td>
+                          <td>{fmtPrice(currentPrice)}</td>
                           <td className={pnlPct >= 0 ? 'green' : 'red'}>{fmtPct(pnlPct)}</td>
                           <td className={pnlDollar >= 0 ? 'green' : 'red'}>{fmtDollar(pnlDollar)}</td>
-                          <td className="red">${fmt(p.stopLoss)}</td>
-                          <td className="green">${fmt(p.takeProfit)}</td>
+                          <td className="red">{fmtPrice(p.stopLoss)}</td>
+                          <td className="green">{fmtPrice(p.takeProfit)}</td>
                           <td className="muted">{formatTime(p.openedAt)}</td>
                           <td><button className="btn-close-pos" onClick={() => closePosition(p.id)}>Close</button></td>
                         </tr>
@@ -1665,8 +1680,8 @@ function Dashboard({ token, onLogout, onGoHome, onActivity, theme, onToggleTheme
                           <td className="symbol">{p.symbol}</td>
                           <td className={p.side === 'buy' ? 'green' : 'red'}>{p.side.toUpperCase()}</td>
                           <td>{p.quantity}</td>
-                          <td>${fmt(p.entryPrice)}</td>
-                          <td>${fmt(exit)}</td>
+                          <td>{fmtPrice(p.entryPrice)}</td>
+                          <td>{fmtPrice(exit)}</td>
                           <td className={pnlPct >= 0 ? 'green' : 'red'}>{fmtPct(pnlPct)}</td>
                           <td className={pnlDollar >= 0 ? 'green' : 'red'}>{fmtDollar(pnlDollar)}</td>
                           <td className="muted">{exitReasonLabel(p.exitReason)}</td>
