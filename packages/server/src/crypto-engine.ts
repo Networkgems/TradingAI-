@@ -770,6 +770,16 @@ export class CryptoSignalEngine {
     if (live.isPerpCatalogStale()) {
       await live.refreshPerpCatalog(activeSymbols);
     }
+    // TRA-318 — when Stop Trading is engaged in live mode the bot must NOT send
+    // any further orders to Coinbase. We still refresh balances + reconcile
+    // wallet holdings above so the dashboard stays accurate, but exit + open
+    // order placement are both gated. The user takes manual ownership of any
+    // open positions (close via the dashboard or directly on Coinbase) until
+    // they re-enable auto-trading.
+    if (!this.isAutoTradingEnabled()) {
+      return;
+    }
+
     // TRA-262 — pull a fresh order-book spread snapshot per perp universe
     // symbol once per tick. Done before signal evaluation so `applyShortGates`
     // reads near-real-time spread fractions without a per-signal Coinbase
@@ -790,8 +800,6 @@ export class CryptoSignalEngine {
     } catch (err: unknown) {
       console.warn('[crypto-engine] live exits error:', err instanceof Error ? err.message : String(err));
     }
-
-    if (!this.isAutoTradingEnabled()) return;
 
     // Refresh candle caches so live mode evaluates strategies on fresh bars.
     const CANDLE_BATCH = 5;

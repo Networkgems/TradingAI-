@@ -1987,3 +1987,185 @@ describe('CryptoLiveAccount perp data-feed wiring (TRA-262)', () => {
     expect(coinbase.getProductBook).not.toHaveBeenCalled();
   });
 });
+
+// ── TRA-318 — wallet holdings reconciled into open positions ─────────────────
+
+describe('CryptoLiveAccount spot wallet reconciliation (TRA-318)', () => {
+  it('surfaces wallet crypto holdings as imported spot positions on refreshBalance', async () => {
+    const coinbase = new FakeCoinbaseClient();
+    coinbase.listAccounts.mockResolvedValue([
+      {
+        uuid: 'usd', name: 'USD', currency: 'USD',
+        available_balance: { value: '500', currency: 'USD' },
+        hold: { value: '0', currency: 'USD' },
+      },
+      {
+        uuid: 'btc', name: 'BTC', currency: 'BTC',
+        available_balance: { value: '0.25', currency: 'BTC' },
+        hold: { value: '0', currency: 'BTC' },
+      },
+      {
+        uuid: 'eth', name: 'ETH', currency: 'ETH',
+        available_balance: { value: '1.5', currency: 'ETH' },
+        hold: { value: '0', currency: 'ETH' },
+      },
+    ]);
+    coinbase.getProductPrices.mockResolvedValue(new Map([
+      ['BTC-USD', 60_000],
+      ['ETH-USD', 3_000],
+    ]));
+    const account = new CryptoLiveAccount(asClient(coinbase), { sleep: async () => {} });
+
+    await account.refreshBalance();
+    const positions = account.getState().openPositions;
+    const btc = positions.find(p => p.symbol === 'BTC-USD');
+    const eth = positions.find(p => p.symbol === 'ETH-USD');
+    expect(btc).toMatchObject({
+      symbol: 'BTC-USD',
+      side: 'buy',
+      quantity: 0.25,
+      entryPrice: 60_000,
+      productType: 'spot',
+    });
+    expect(eth).toMatchObject({
+      symbol: 'ETH-USD',
+      side: 'buy',
+      quantity: 1.5,
+      entryPrice: 3_000,
+      productType: 'spot',
+    });
+    // Sentinel TP/SL: imported holdings never auto-exit.
+    expect(btc!.takeProfit).toBe(Number.POSITIVE_INFINITY);
+    expect(btc!.stopLoss).toBe(0);
+  });
+
+  it('nets engine-opened spot quantity out of the imported holding so we do not double-count', async () => {
+    const coinbase = new FakeCoinbaseClient();
+    coinbase.listAccounts
+      .mockResolvedValueOnce([
+        // Initial: pure USD wallet so the engine open below has cash to spend.
+        {
+          uuid: 'usd', name: 'USD', currency: 'USD',
+          available_balance: { value: '50000', currency: 'USD' },
+          hold: { value: '0', currency: 'USD' },
+        },
+      ])
+      .mockResolvedValue([
+        // Post-open: USD wallet drained by the buy + 0.5 BTC sitting in spot.
+        {
+          uuid: 'usd', name: 'USD', currency: 'USD',
+          available_balance: { value: '20000', currency: 'USD' },
+          hold: { value: '0', currency: 'USD' },
+        },
+        {
+          uuid: 'btc', name: 'BTC', currency: 'BTC',
+          available_balance: { value: '0.5', currency: 'BTC' },
+          hold: { value: '0', currency: 'BTC' },
+        },
+      ]);
+    coinbase.getProductPrices.mockResolvedValue(new Map([['BTC-USD', 60_000]]));
+    const account = new CryptoLiveAccount(asClient(coinbase), { sleep: async () => {} });
+    await account.refreshBalance();
+
+    // Engine opens 0.5 BTC at 60k.
+    coinbase.placeMarketOrder.mockResolvedValueOnce(orderSuccess('o-buy'));
+    coinbase.getOrder.mockResolvedValueOnce(
+      orderDetails({ order_id: 'o-buy', status: 'FILLED', average_filled_price: '60000', filled_size: '0.5' }),
+    );
+    const opened = await account.openPosition(buildSignal({ entryPrice: 60_000, stopLoss: 59_400 }), 60_000);
+    expect(opened).not.toBeNull();
+    expect(opened!.quantity).toBe(0.5);
+
+    // Refresh: wallet now reports 0.5 BTC. The engine already tracks 0.5 BTC,
+    // so the imported holding should net to zero (no duplicate entry).
+    await account.refreshBalance();
+    const positions = account.getState().openPositions;
+    const engineOpens = positions.filter(p => p.id === opened!.id);
+    const importedOpens = positions.filter(p => p.id.startsWith('imported-spot-'));
+    expect(engineOpens).toHaveLength(1);
+    expect(importedOpens).toHaveLength(0);
+  });
+
+  it('imports only the excess wallet quantity beyond what the engine tracks', async () => {
+    const coinbase = new FakeCoinbaseClient();
+    coinbase.listAccounts
+      .mockResolvedValueOnce([
+        {
+          uuid: 'usd', name: 'USD', currency: 'USD',
+          available_balance: { value: '50000', currency: 'USD' },
+          hold: { value: '0', currency: 'USD' },
+        },
+      ])
+      .mockResolvedValue([
+        {
+          uuid: 'usd', name: 'USD', currency: 'USD',
+          available_balance: { value: '20000', currency: 'USD' },
+          hold: { value: '0', currency: 'USD' },
+        },
+        {
+          uuid: 'btc', name: 'BTC', currency: 'BTC',
+          // Wallet holds more BTC than the engine opened (e.g. user bought
+          // some manually on Coinbase).
+          available_balance: { value: '1.2', currency: 'BTC' },
+          hold: { value: '0', currency: 'BTC' },
+        },
+      ]);
+    coinbase.getProductPrices.mockResolvedValue(new Map([['BTC-USD', 60_000]]));
+    const account = new CryptoLiveAccount(asClient(coinbase), { sleep: async () => {} });
+    await account.refreshBalance();
+
+    coinbase.placeMarketOrder.mockResolvedValueOnce(orderSuccess('o-buy'));
+    coinbase.getOrder.mockResolvedValueOnce(
+      orderDetails({ order_id: 'o-buy', status: 'FILLED', average_filled_price: '60000', filled_size: '0.5' }),
+    );
+    await account.openPosition(buildSignal({ entryPrice: 60_000, stopLoss: 59_400 }), 60_000);
+
+    await account.refreshBalance();
+    const imported = account.getState().openPositions.find(p => p.id.startsWith('imported-spot-'));
+    expect(imported).toBeDefined();
+    // Excess = wallet 1.2 - engine 0.5 = 0.7.
+    expect(imported!.quantity).toBeCloseTo(0.7, 9);
+    expect(imported!.symbol).toBe('BTC-USD');
+  });
+
+  it('manual close on an imported holding fires a spot SELL for the full reconciled qty', async () => {
+    const coinbase = new FakeCoinbaseClient();
+    coinbase.listAccounts.mockResolvedValue([
+      {
+        uuid: 'usd', name: 'USD', currency: 'USD',
+        available_balance: { value: '500', currency: 'USD' },
+        hold: { value: '0', currency: 'USD' },
+      },
+      {
+        uuid: 'btc', name: 'BTC', currency: 'BTC',
+        available_balance: { value: '0.25', currency: 'BTC' },
+        hold: { value: '0', currency: 'BTC' },
+      },
+    ]);
+    coinbase.getProductPrices.mockResolvedValue(new Map([['BTC-USD', 60_000]]));
+    const account = new CryptoLiveAccount(asClient(coinbase), { sleep: async () => {} });
+    await account.refreshBalance();
+
+    coinbase.placeMarketOrder.mockResolvedValueOnce(orderSuccess('o-sell', 'SELL'));
+    coinbase.getOrder.mockResolvedValueOnce(
+      orderDetails({
+        order_id: 'o-sell',
+        side: 'SELL',
+        status: 'FILLED',
+        average_filled_price: '60500',
+        filled_size: '0.25',
+      }),
+    );
+
+    const closed = await account.closePosition('imported-spot-BTC-USD', 60_000);
+    expect(closed).not.toBeNull();
+    expect(coinbase.placeMarketOrder).toHaveBeenCalledWith({
+      productId: 'BTC-USD',
+      side: 'sell',
+      baseSize: 0.25,
+    });
+    // Imported holding should be gone from the dashboard view.
+    const remaining = account.getState().openPositions.filter(p => p.id.startsWith('imported-spot-'));
+    expect(remaining).toHaveLength(0);
+  });
+});

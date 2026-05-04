@@ -444,6 +444,19 @@ export class CryptoLiveAccount {
    * skips that signal until the next refresh succeeds.
    */
   private perpSpreadByPerpProduct: Map<string, number> = new Map();
+  /**
+   * TRA-318 — synthetic spot positions imported from the Coinbase wallet.
+   * Keyed by `{currency}-USD` (e.g. `BTC-USD`). These represent the slice of
+   * the user's wallet balance that the engine did NOT open in the current
+   * session — pre-existing holdings, manual buys via Coinbase Advanced, fills
+   * from a previous server run, etc. Surfaced in {@link getState} so the
+   * crypto dashboard shows everything the user actually owns on Coinbase
+   * instead of only positions the bot opened. Excluded from `checkExits` and
+   * `hasOpenPositionForSignalType` — the engine has no TP/SL for these so it
+   * has no business auto-managing them; the user closes manually via the
+   * dashboard or directly on Coinbase. Refreshed on every `refreshBalance`.
+   */
+  private importedSpotPositions: Map<string, Position> = new Map();
 
   constructor(coinbase: CoinbaseOrderClient, opts: CryptoLiveAccountOptions = {}) {
     this.coinbase = coinbase;
@@ -513,8 +526,8 @@ export class CryptoLiveAccount {
     }
 
     let cryptoValue = 0;
+    let prices: Map<string, number> = new Map();
     if (cryptoBalances.size > 0) {
-      let prices: Map<string, number>;
       try {
         prices = await this.coinbase.getProductPrices(Array.from(cryptoBalances.keys()));
       } catch (err: unknown) {
@@ -531,6 +544,14 @@ export class CryptoLiveAccount {
     this.equityUsd = cash + cryptoValue;
     this.lastBalanceRefresh = Date.now();
 
+    // TRA-318 — surface every Coinbase wallet holding as a visible spot
+    // position so the dashboard shows what the user actually owns on
+    // Coinbase, not just positions the bot opened in this session. The
+    // engine-tracked qty for each symbol is netted out below so we never
+    // double-count an in-session open against the wallet balance it
+    // produced.
+    this.reconcileSpotHoldings(cryptoBalances, prices);
+
     // TRA-249-C — opportunistic INTX position reconciliation so a perp the
     // user opened in the Coinbase UI (or that survived a server restart) is
     // surfaced in the local mirror without re-firing an open. Rate-limited so
@@ -542,11 +563,73 @@ export class CryptoLiveAccount {
     }
   }
 
+  /**
+   * TRA-318 — rebuild {@link importedSpotPositions} from the latest wallet
+   * snapshot. For each non-zero non-cash currency we compute the qty already
+   * tracked by an engine-opened spot BUY and import the excess as a synthetic
+   * position. Imported positions carry sentinel TP=+Inf / SL=0 so a stray
+   * `checkExits` call never fires against them, and they live in their own
+   * map so `hasOpenPositionForSignalType` doesn't block strategies from
+   * opening their own engine-managed positions on the same symbol.
+   *
+   * Tolerance is the larger of 1e-8 (Coinbase's smallest base_increment) or
+   * 0.01% of the wallet balance — small enough to surface a 0.0001 BTC
+   * holding, large enough to absorb the float drift between the engine's
+   * recorded qty and Coinbase's `available_balance` after fees.
+   */
+  private reconcileSpotHoldings(
+    walletBalances: ReadonlyMap<string, number>,
+    prices: ReadonlyMap<string, number>,
+  ): void {
+    const next = new Map<string, Position>();
+    for (const [productId, walletQty] of walletBalances) {
+      const price = prices.get(productId);
+      if (price == null || !Number.isFinite(price) || price <= 0) continue;
+      let engineSpotQty = 0;
+      for (const pos of this.positions.values()) {
+        if (pos.symbol !== productId) continue;
+        if (pos.productType === 'perp') continue;
+        if (pos.side !== 'buy') continue;
+        engineSpotQty += pos.quantity;
+      }
+      const excess = walletQty - engineSpotQty;
+      const tolerance = Math.max(1e-8, walletQty * 1e-4);
+      if (excess <= tolerance) continue;
+      next.set(productId, {
+        // Stable id so re-renders keyed on `position.id` don't churn.
+        id: `imported-spot-${productId}`,
+        symbol: productId,
+        side: 'buy',
+        signalType: 'reversal',
+        entryPrice: price,
+        quantity: excess,
+        // Sentinel TP/SL — `checkExits` reads from `this.positions` (not
+        // this map) so these are advisory; if a future call site iterates
+        // imported positions, the sentinels guarantee no auto-exit fires.
+        stopLoss: 0,
+        takeProfit: Number.POSITIVE_INFINITY,
+        openedAt: Date.now(),
+        productType: 'spot',
+      });
+    }
+    this.importedSpotPositions = next;
+  }
+
   getState(): CryptoLiveAccountState {
+    // TRA-318 — merge engine-tracked positions with the imported wallet
+    // holdings. Engine-tracked entries take precedence implicitly: their qty
+    // is already netted out of the imported entry inside `reconcileSpotHoldings`,
+    // so a position the bot opened this session shows once (with TP/SL) and
+    // any extra wallet balance shows separately as an imported holding (no
+    // TP/SL).
+    const openPositions: Position[] = [
+      ...this.positions.values(),
+      ...this.importedSpotPositions.values(),
+    ];
     return {
       totalEquity: this.equityUsd,
       availableCash: this.cashUsd,
-      openPositions: Array.from(this.positions.values()),
+      openPositions,
       dailyPnl: this.realizedPnlToday,
       // Defensive copy so a caller mutating the array (e.g. the engine
       // re-stamping `mode` on positions) can't corrupt the ring buffer.
@@ -1500,9 +1583,15 @@ export class CryptoLiveAccount {
   /**
    * Manual close — flatten via market order at current price. TRA-264 routes
    * perp shorts through `closeFuturesPosition` so Coinbase keys the close to
-   * the right INTX position via `position_side`.
+   * the right INTX position via `position_side`. TRA-318 also accepts
+   * imported wallet-holding positions: closing one fires a spot SELL for the
+   * full reconciled qty, identical to flattening an engine-opened spot BUY.
    */
   async closePosition(positionId: string, currentPrice: number): Promise<Position | null> {
+    const imported = this.importedSpotPositions.get(this.importedKeyFromId(positionId) ?? '');
+    if (imported) {
+      return this.closeImportedSpot(imported, currentPrice);
+    }
     const pos = this.positions.get(positionId);
     if (!pos) return null;
     // TRA-249-C — perp closes route to the actual INTX product_id resolved
@@ -1550,6 +1639,64 @@ export class CryptoLiveAccount {
     }
     this.positions.delete(positionId);
     return { ...pos };
+  }
+
+  /**
+   * TRA-318 — extract the product_id ({CCY}-USD) from an imported-spot
+   * position id of the form `imported-spot-{CCY}-USD`. Returns null for any
+   * other id shape so callers can distinguish engine vs imported lookups.
+   */
+  private importedKeyFromId(positionId: string): string | null {
+    const prefix = 'imported-spot-';
+    if (!positionId.startsWith(prefix)) return null;
+    return positionId.slice(prefix.length);
+  }
+
+  /**
+   * TRA-318 — flatten an imported wallet holding via spot SELL. Mirrors the
+   * spot branch of {@link closePosition} but skips the `this.positions` map
+   * (imported positions live in their own map) and drops the entry from
+   * `importedSpotPositions` on success. The next `refreshBalance` will
+   * rebuild from the post-sell wallet snapshot.
+   */
+  private async closeImportedSpot(pos: Position, currentPrice: number): Promise<Position> {
+    let baseSize = pos.quantity;
+    const productInfo = this.tradableProducts?.get(pos.symbol);
+    if (productInfo) {
+      baseSize = quantizeBaseSize(baseSize, productInfo.baseIncrement);
+    }
+    if (!Number.isFinite(baseSize) || baseSize <= 0) {
+      throw new Error(
+        `imported spot ${pos.symbol} qty ${pos.quantity} below Coinbase base_increment — cannot place SELL`,
+      );
+    }
+    const exitOrder = await this.coinbase.placeMarketOrder({
+      productId: pos.symbol,
+      side: 'sell',
+      baseSize,
+    });
+    const exitFill = await this.awaitFill(exitOrder.order_id, pos.symbol);
+    const exitPrice = exitFill?.price ?? currentPrice;
+    const exitQty = exitFill?.size ?? baseSize;
+    // Imported positions have synthetic entry price (current spot at the
+    // last refresh), so realised P&L here is at best a rough mark-to-mark
+    // delta. Fold it into the dashboard's daily P&L so the user can see the
+    // sale impact, but tag the closed record so reports can ignore it if
+    // they care about strictly engine-attributed P&L.
+    const pricePnl = (exitPrice - pos.entryPrice) * exitQty;
+    const closed: Position = {
+      ...pos,
+      pnl: pricePnl,
+      exitPrice,
+      quantity: exitQty,
+      closedAt: Date.now(),
+    };
+    this.realizedPnlToday += pricePnl;
+    this.cashUsd += exitPrice * exitQty;
+    this.equityUsd += pricePnl;
+    this.importedSpotPositions.delete(pos.symbol);
+    console.log(`[crypto-live] CLOSE imported spot ${pos.symbol} @ ${exitPrice.toFixed(2)} pnl=${pricePnl.toFixed(2)}`);
+    return closed;
   }
 
   /**
