@@ -42,6 +42,7 @@ import {
   runFirstBootMigration,
   runTra237OptionsReset,
   runTra241CalendarReset,
+  runTra301DemoFreshStart,
   initAllUserContexts,
   initUserContext,
   ensureUserContext,
@@ -132,6 +133,12 @@ await runTra237OptionsReset();
 // clean. Wipes per-user EOD reports + daily-snapshots before PnlTracker
 // reads them on first construction. Idempotent via marker file.
 await runTra241CalendarReset();
+// TRA-301 — full demo fresh-start: with the new strategy generation rolling
+// out for both Stocks and Crypto, the board asked to wipe every user's
+// persisted demo P&L, equity baselines, trade history, and calendar reports
+// so the dashboards open clean on the new strategies. Runs before context
+// bootstrap so engines load empty. Idempotent via marker file.
+await runTra301DemoFreshStart();
 await initAllUserContexts();
 
 // TRA-227 — drop a placeholder QuantTrader research report so the Stocks

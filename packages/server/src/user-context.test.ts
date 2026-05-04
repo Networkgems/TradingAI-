@@ -15,6 +15,7 @@ type UsersModule = typeof import('./users.js');
 let saveStocksTradeSnapshot: TradeStoreModule['saveStocksTradeSnapshot'];
 let loadStocksTradeSnapshot: TradeStoreModule['loadStocksTradeSnapshot'];
 let runTra237OptionsReset: UserContextModule['runTra237OptionsReset'];
+let runTra301DemoFreshStart: UserContextModule['runTra301DemoFreshStart'];
 let stockModeKey: UserContextModule['stockModeKey'];
 let cryptoModeKey: UserContextModule['cryptoModeKey'];
 
@@ -33,6 +34,7 @@ beforeAll(async () => {
   loadStocksTradeSnapshot = tradeStore.loadStocksTradeSnapshot;
   const userCtx = await import('./user-context.js');
   runTra237OptionsReset = userCtx.runTra237OptionsReset;
+  runTra301DemoFreshStart = userCtx.runTra301DemoFreshStart;
   stockModeKey = userCtx.stockModeKey;
   cryptoModeKey = userCtx.cryptoModeKey;
   // Populate the in-memory users cache from the seeded users.json.
@@ -44,6 +46,7 @@ beforeEach(() => {
   // Wipe the marker file + any lingering user trade snapshots between tests so
   // each test runs against a deterministic starting state.
   rmSync(join(TMP_ROOT, '.tra-237-options-reset'), { force: true });
+  rmSync(join(TMP_ROOT, '.tra-301-demo-fresh-start'), { force: true });
   rmSync(join(TMP_ROOT, 'users', 'alice'), { recursive: true, force: true });
   mkdirSync(join(TMP_ROOT, 'users', 'alice'), { recursive: true });
 });
@@ -199,5 +202,83 @@ describe('stockModeKey / cryptoModeKey — TRA-244 per-account calendar buckets'
   it('cryptoModeKey is binary: live → live, anything else → demo', () => {
     expect(cryptoModeKey(settings({ mode: 'live' }))).toBe('live');
     expect(cryptoModeKey(settings({ mode: 'demo' }))).toBe('demo');
+  });
+});
+
+describe('runTra301DemoFreshStart — full demo fresh-start wipe', () => {
+  function seedAliceData(): {
+    files: string[];
+    reportSubdirFiles: string[];
+  } {
+    const userDir = join(TMP_ROOT, 'users', 'alice');
+    const cryptoDir = join(userDir, 'crypto');
+    mkdirSync(cryptoDir, { recursive: true });
+    const files = [
+      join(userDir, 'daily-snapshots.json'),
+      join(userDir, 'equity-state.json'),
+      join(userDir, 'trades-stocks.json'),
+      join(userDir, 'trades-crypto.json'),
+      join(cryptoDir, 'daily-snapshots.json'),
+      join(cryptoDir, 'equity-state.json'),
+    ];
+    for (const f of files) writeFileSync(f, '{}', 'utf-8');
+    // Drop both legacy unscoped files and TRA-244 per-mode subdir files so
+    // the recursive cleanup is exercised end-to-end.
+    const reportsDemo = join(userDir, 'reports', 'demo');
+    const reportsLive = join(userDir, 'reports', 'live');
+    const cryptoReportsDemo = join(userDir, 'crypto-reports', 'demo');
+    mkdirSync(reportsDemo, { recursive: true });
+    mkdirSync(reportsLive, { recursive: true });
+    mkdirSync(cryptoReportsDemo, { recursive: true });
+    const reportSubdirFiles = [
+      join(userDir, 'reports', 'legacy.json'),
+      join(reportsDemo, '2026-04-30.json'),
+      join(reportsDemo, '2026-04-30.md'),
+      join(reportsLive, '2026-04-30.json'),
+      join(cryptoReportsDemo, '2026-05-01.json'),
+    ];
+    for (const f of reportSubdirFiles) writeFileSync(f, 'placeholder', 'utf-8');
+    // A non-{json,md} file must be left alone — the cleanup is conservative
+    // about what it deletes, mirroring TRA-241's `clearReportsDir` policy.
+    const keepFile = join(reportsDemo, 'README.txt');
+    writeFileSync(keepFile, 'keep me', 'utf-8');
+    return {
+      files,
+      reportSubdirFiles: [...reportSubdirFiles, keepFile],
+    };
+  }
+
+  it('wipes daily-snapshots, equity-state, trade history, and reports trees', async () => {
+    const { files, reportSubdirFiles } = seedAliceData();
+
+    await runTra301DemoFreshStart();
+
+    for (const f of files) {
+      expect(existsSync(f)).toBe(false);
+    }
+    // All report-tree json/md files removed; non-json file preserved.
+    for (const f of reportSubdirFiles) {
+      const isReportData = f.endsWith('.json') || f.endsWith('.md');
+      expect(existsSync(f)).toBe(!isReportData);
+    }
+    expect(existsSync(join(TMP_ROOT, '.tra-301-demo-fresh-start'))).toBe(true);
+  });
+
+  it('is idempotent — second run is a no-op once the marker exists', async () => {
+    seedAliceData();
+    await runTra301DemoFreshStart();
+
+    // Re-seed and confirm the marker prevents a second wipe.
+    const dailySnap = join(TMP_ROOT, 'users', 'alice', 'daily-snapshots.json');
+    writeFileSync(dailySnap, '{}', 'utf-8');
+    await runTra301DemoFreshStart();
+    expect(existsSync(dailySnap)).toBe(true);
+  });
+
+  it('handles users with no demo data gracefully (no throw, marker still written)', async () => {
+    // alice's user dir is recreated empty in beforeEach.
+    expect(existsSync(join(TMP_ROOT, '.tra-301-demo-fresh-start'))).toBe(false);
+    await runTra301DemoFreshStart();
+    expect(existsSync(join(TMP_ROOT, '.tra-301-demo-fresh-start'))).toBe(true);
   });
 });

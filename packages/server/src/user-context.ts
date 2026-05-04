@@ -1,4 +1,4 @@
-import { mkdir, rename, copyFile, rm, writeFile, readdir, unlink } from 'fs/promises';
+import { mkdir, rename, copyFile, rm, writeFile, readdir, unlink, stat } from 'fs/promises';
 import { existsSync } from 'fs';
 import { join, dirname } from 'path';
 import { fileURLToPath } from 'url';
@@ -312,6 +312,97 @@ export async function runTra241CalendarReset(): Promise<void> {
 
   await writeFile(markerFile, new Date().toISOString(), 'utf-8');
   console.log(`[migration TRA-241] complete — cleared ${fileCount} calendar file(s) for ${userCount} user(s).`);
+}
+
+/**
+ * TRA-301 — full demo fresh-start across every user. The board is rolling out
+ * a new generation of stock and crypto strategies, so every user's persisted
+ * demo P&L, trade history, and calendar history must be wiped before the
+ * engines boot.
+ *
+ * Wider than TRA-241: that migration only touched daily-snapshots and the
+ * (now legacy) unscoped `reports/` files. TRA-301 also clears
+ *   - `equity-state.json` (stocks + crypto), so PnlTracker reseeds from the
+ *     configured demoEquity instead of carrying yesterday's equity baseline,
+ *   - `trades-{stocks,crypto}.json`, so engines start with no open/closed
+ *     positions or recent signals,
+ *   - `reports/` and `crypto-reports/` recursively, covering the TRA-244
+ *     per-mode subfolders (`{demo,live,sandbox}/`) as well as legacy files.
+ *
+ * Crypto's live broker mirror is sourced from Coinbase on each sync, so the
+ * `liveClosedPositions` array dropped here repopulates from the broker API
+ * — wiping it carries no canonical-data loss. Idempotent via marker
+ * `.tra-301-demo-fresh-start`.
+ */
+async function clearReportsTree(dir: string): Promise<number> {
+  if (!existsSync(dir)) return 0;
+  let removed = 0;
+  let entries: string[];
+  try {
+    entries = await readdir(dir);
+  } catch {
+    return 0;
+  }
+  for (const name of entries) {
+    const path = join(dir, name);
+    let isDir = false;
+    try {
+      isDir = (await stat(path)).isDirectory();
+    } catch {
+      continue;
+    }
+    if (isDir) {
+      removed += await clearReportsTree(path);
+      continue;
+    }
+    if (!name.endsWith('.json') && !name.endsWith('.md')) continue;
+    try {
+      await unlink(path);
+      removed += 1;
+    } catch {
+      // file vanished mid-iteration; ignore
+    }
+  }
+  return removed;
+}
+
+export async function runTra301DemoFreshStart(): Promise<void> {
+  const markerFile = join(DATA_DIR, '.tra-301-demo-fresh-start');
+  if (existsSync(markerFile)) return;
+
+  let userCount = 0;
+  let fileCount = 0;
+
+  for (const u of getAllUsers()) {
+    const dir = userDataDir(u.username);
+    if (!existsSync(dir)) continue;
+    try {
+      for (const filePath of [
+        join(dir, 'daily-snapshots.json'),
+        join(dir, 'equity-state.json'),
+        join(dir, 'crypto', 'daily-snapshots.json'),
+        join(dir, 'crypto', 'equity-state.json'),
+        join(dir, 'trades-stocks.json'),
+        join(dir, 'trades-crypto.json'),
+      ]) {
+        if (!existsSync(filePath)) continue;
+        try {
+          await unlink(filePath);
+          fileCount += 1;
+        } catch (err: unknown) {
+          console.warn(`[migration TRA-301] could not remove ${filePath}: ${err instanceof Error ? err.message : String(err)}`);
+        }
+      }
+      fileCount += await clearReportsTree(join(dir, 'reports'));
+      fileCount += await clearReportsTree(join(dir, 'crypto-reports'));
+      userCount += 1;
+    } catch (err: unknown) {
+      console.warn(`[migration TRA-301] reset failed for ${u.username}: ${err instanceof Error ? err.message : String(err)}`);
+    }
+  }
+
+  await writeFile(markerFile, new Date().toISOString(), 'utf-8');
+  console.log(`[migration TRA-301] complete — wiped ${fileCount} demo-history file(s) for ${userCount} user(s).`);
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
