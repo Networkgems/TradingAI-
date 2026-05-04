@@ -287,6 +287,9 @@ function CryptoDashboard({ token, onBack, onLogout, onActivity, theme, onToggleT
   const [watchlistError, setWatchlistError] = useState('');
   const [scanning, setScanning] = useState(false);
   const [scanStatus, setScanStatus] = useState('');
+  // TRA-320 — surface Coinbase reject reasons on a manual close so the user
+  // knows the position stayed open instead of silently disappearing.
+  const [closeError, setCloseError] = useState('');
   const wsRef = useRef<WebSocket | null>(null);
   const reconnectTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
   const scanStatusTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
@@ -381,10 +384,23 @@ function CryptoDashboard({ token, onBack, onLogout, onActivity, theme, onToggleT
   }
 
   async function closePosition(positionId: string) {
-    await fetch(`${HTTP_URL}/api/crypto/positions/${positionId}/close`, {
-      method: 'POST',
-      headers: { Authorization: `Bearer ${token}` },
-    }).catch(() => {});
+    setCloseError('');
+    try {
+      const r = await fetch(`${HTTP_URL}/api/crypto/positions/${positionId}/close`, {
+        method: 'POST',
+        headers: { Authorization: `Bearer ${token}` },
+      });
+      if (!r.ok) {
+        // TRA-320 — server returns 502 + { error, reason } when Coinbase
+        // rejects the close. Show the reason so the user knows the position
+        // is still open at the broker (the next state broadcast will keep
+        // surfacing it instead of optimistically removing it).
+        const body = await r.json().catch(() => ({})) as { error?: string; reason?: string };
+        setCloseError(body.reason || body.error || `Close failed (HTTP ${r.status})`);
+      }
+    } catch (err) {
+      setCloseError(err instanceof Error ? err.message : 'Close failed');
+    }
   }
 
   async function addToWatchlist() {
@@ -687,6 +703,21 @@ function CryptoDashboard({ token, onBack, onLogout, onActivity, theme, onToggleT
 
         {state && tab === 'positions' && (
           <div className="positions-panel">
+            {closeError && (
+              // TRA-320 — Coinbase rejected the manual close. The position is
+              // still open in the broker; this banner tells the user why so
+              // they can act (top up cash, retry, etc.) instead of believing
+              // the silent fire-and-forget worked.
+              <div className="signal-skip-reason" role="alert" style={{ marginBottom: '0.75rem' }}>
+                <span>Close rejected: {closeError}</span>
+                <button
+                  className="btn-secondary btn-sm signal-skip-action"
+                  onClick={() => setCloseError('')}
+                >
+                  Dismiss
+                </button>
+              </div>
+            )}
             {openPositions.length > 0 && (
               <>
                 <h3>Open Positions</h3>

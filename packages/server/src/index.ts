@@ -1495,7 +1495,21 @@ app.post('/api/crypto/positions/:id/close', requireAuth, async (req, res) => {
   }
   const sym = state.symbols.find(s => s.symbol === pos.symbol);
   const price = sym?.price ?? pos.entryPrice;
-  ctx.cryptoEngine.manualClosePosition(id, price);
+  // TRA-320 — await the broker close so a Coinbase reject (auth,
+  // INSUFFICIENT_FUND, product not tradable) surfaces back to the dashboard
+  // instead of being swallowed by a fire-and-forget. On failure the position
+  // stays open in the broker mirror and the dashboard's next state tick will
+  // continue to show it; we just need to tell the user *why* the close did
+  // not go through.
+  try {
+    await ctx.cryptoEngine.manualClosePosition(id, price);
+  } catch (err: unknown) {
+    const reason = err instanceof Error ? err.message : String(err);
+    console.warn(`[crypto-engine] manualClose live failed: ${reason}`);
+    broadcastCryptoState(ctx);
+    res.status(502).json({ error: 'Coinbase rejected close', reason });
+    return;
+  }
   broadcastCryptoState(ctx);
   res.json({ ok: true });
 });

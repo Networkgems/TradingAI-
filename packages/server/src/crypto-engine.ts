@@ -1051,25 +1051,27 @@ export class CryptoSignalEngine {
     }
   }
 
-  manualClosePosition(positionId: string, currentPrice: number): Position | null {
+  /**
+   * TRA-320 — await the broker close in live mode and let errors propagate so
+   * the route can surface a 502 + reason to the dashboard. Pre-fix this fired
+   * `liveAccount.closePosition` and immediately returned an optimistic snapshot
+   * with `closedAt` stamped; on a Coinbase reject (auth, INSUFFICIENT_FUND,
+   * product not tradable) the user saw the position vanish and reappear on the
+   * next broadcast with no signal that anything failed. Now the route can stay
+   * synchronous with the broker — on success we record the live close, on
+   * failure the position stays open in the broker mirror and the dashboard
+   * receives a structured error.
+   */
+  async manualClosePosition(positionId: string, currentPrice: number): Promise<Position | null> {
     if (this.mode === 'live' && this.liveAccount) {
-      // Route the close through Coinbase. We resolve synchronously from the
-      // existing API contract, but the actual order is fired-and-forgotten;
-      // failures are surfaced via console + persist into the next tick view.
-      const live = this.liveAccount;
-      void live.closePosition(positionId, currentPrice).then(closed => {
+      const closed = await this.liveAccount.closePosition(positionId, currentPrice);
+      if (closed) {
         // TRA-242 — manual closes from Live route to the Live history list.
         // TRA-231 — informational mode stamp.
-        if (closed) {
-          closed.mode = 'live';
-          this.liveClosedPositions.push(closed);
-        }
-      }).catch(err => {
-        console.warn(`[crypto-engine] manualClose live failed: ${err instanceof Error ? err.message : String(err)}`);
-      });
-      // Synchronous response: optimistic close — the live broker will reconcile.
-      const snapshot = live.getState().openPositions.find(p => p.id === positionId) ?? null;
-      return snapshot ? { ...snapshot, exitPrice: currentPrice, closedAt: Date.now(), mode: 'live' } : null;
+        closed.mode = 'live';
+        this.liveClosedPositions.push(closed);
+      }
+      return closed;
     }
     const closed = this.account.closePosition(positionId, currentPrice);
     if (closed) {
