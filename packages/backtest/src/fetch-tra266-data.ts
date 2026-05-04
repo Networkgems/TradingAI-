@@ -17,7 +17,7 @@ import { fileURLToPath } from 'node:url';
 import YahooFinance from 'yahoo-finance2';
 import { PERP_SHORTS_UNIVERSE } from '@trading-app/engine';
 import type { Candle } from '@trading-app/shared';
-import { fetchCoinbase4hBars } from './coinbase-feed.js';
+import { fetchCoinbase1mBars, fetchCoinbase4hBars } from './coinbase-feed.js';
 
 const yf = new YahooFinance({
   suppressNotices: ['yahooSurvey'],
@@ -42,6 +42,18 @@ export function cachePathFor(symbol: string): string {
 
 export function cachePathFor4h(symbol: string): string {
   return resolve(DATA_DIR, `${symbol.toLowerCase()}.4h.json`);
+}
+
+/**
+ * TRA-307 — 1m cache key includes the date range so a 30-day scalping cache
+ * doesn't collide with any future longer fetches and vice-versa.
+ */
+function ymd(ms: number): string {
+  return new Date(ms).toISOString().slice(0, 10).replace(/-/g, '');
+}
+
+export function cachePathFor1m(symbol: string, fromMs: number, toMs: number): string {
+  return resolve(DATA_DIR, `${symbol.toLowerCase()}.1m_${ymd(fromMs)}_${ymd(toMs)}.json`);
 }
 
 function isFresh(path: string): boolean {
@@ -142,6 +154,44 @@ export async function loadOrFetch4hBars(
   };
   writeFileSync(path, JSON.stringify(entry));
   console.log(`[fetch-tra266-data] ${symbol} 4H: ${candles.length} bars cached (${new Date(entry.start).toISOString().slice(0, 10)} → ${new Date(entry.end).toISOString().slice(0, 10)})`);
+  return candles.filter((c) => c.timestamp >= fromMs && c.timestamp <= toMs);
+}
+
+/**
+ * TRA-307 — 1m bar cache for the scalping sweep cell. Single-window 30-day
+ * pulls only; the cache filename embeds the date range so re-running with a
+ * different window writes to a separate file rather than poisoning the prior
+ * fetch.
+ */
+export async function loadOrFetch1mBars(
+  symbol: string,
+  fromMs: number,
+  toMs: number,
+): Promise<Candle[]> {
+  if (!existsSync(DATA_DIR)) mkdirSync(DATA_DIR, { recursive: true });
+  const path = cachePathFor1m(symbol, fromMs, toMs);
+
+  if (isFresh(path)) {
+    const raw = JSON.parse(readFileSync(path, 'utf-8')) as CacheEntry;
+    if (raw.start <= fromMs && raw.end >= toMs - 60 * 1000) {
+      return raw.candles.filter((c) => c.timestamp >= fromMs && c.timestamp <= toMs);
+    }
+  }
+
+  console.log(`[fetch-tra266-data] Fetching ${symbol} 1m from Coinbase (${new Date(fromMs).toISOString().slice(0, 10)} → ${new Date(toMs).toISOString().slice(0, 10)})…`);
+  const candles = await fetchCoinbase1mBars(symbol, fromMs, toMs);
+  if (candles.length === 0) {
+    throw new Error(`Coinbase returned 0 1m bars for ${symbol} in [${new Date(fromMs).toISOString()}, ${new Date(toMs).toISOString()}]`);
+  }
+  const entry: CacheEntry = {
+    symbol,
+    fetchedAt: Date.now(),
+    start: candles[0].timestamp,
+    end: candles[candles.length - 1].timestamp,
+    candles,
+  };
+  writeFileSync(path, JSON.stringify(entry));
+  console.log(`[fetch-tra266-data] ${symbol} 1m: ${candles.length} bars cached (${new Date(entry.start).toISOString().slice(0, 16)} → ${new Date(entry.end).toISOString().slice(0, 16)})`);
   return candles.filter((c) => c.timestamp >= fromMs && c.timestamp <= toMs);
 }
 
