@@ -17,7 +17,7 @@ import { fileURLToPath } from 'node:url';
 import YahooFinance from 'yahoo-finance2';
 import { PERP_SHORTS_UNIVERSE } from '@trading-app/engine';
 import type { Candle } from '@trading-app/shared';
-import { fetchCoinbase1mBars, fetchCoinbase4hBars } from './coinbase-feed.js';
+import { fetchCoinbase4hBars, fetchCoinbaseMinuteBars } from './coinbase-feed.js';
 
 const yf = new YahooFinance({
   suppressNotices: ['yahooSurvey'],
@@ -179,7 +179,7 @@ export async function loadOrFetch1mBars(
   }
 
   console.log(`[fetch-tra266-data] Fetching ${symbol} 1m from Coinbase (${new Date(fromMs).toISOString().slice(0, 10)} → ${new Date(toMs).toISOString().slice(0, 10)})…`);
-  const candles = await fetchCoinbase1mBars(symbol, fromMs, toMs);
+  const candles = await fetchCoinbaseMinuteBars(symbol, fromMs, toMs);
   if (candles.length === 0) {
     throw new Error(`Coinbase returned 0 1m bars for ${symbol} in [${new Date(fromMs).toISOString()}, ${new Date(toMs).toISOString()}]`);
   }
