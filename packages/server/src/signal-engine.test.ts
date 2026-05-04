@@ -319,3 +319,161 @@ describe('SignalEngine — legacy options snapshot routing (TRA-237)', () => {
     expect(accounts.sandbox.getState().optionsPnl).toBe(0);
   });
 });
+
+// ─── TRA-319 — live RV mirror reconciles Tradier rejections ─────────────────
+// The unit tests cover voidOpenOption / waitForOrderTerminalStatus / the new
+// optionBuyingPower extraction in isolation. These tests close the loop on
+// the signal-engine wiring itself: when Tradier rejects the mirrored order,
+// the dashboard must NOT show a phantom open and the daily slot must NOT be
+// consumed. This is the integration substitute for the Tradier sandbox
+// verification on a low-buying-power account.
+describe('SignalEngine — TRA-319 live RV mirror reconciliation', () => {
+  type WaitOpts = { timeoutMs?: number; intervalMs?: number; sleep?: (ms: number) => Promise<void> };
+  interface TradierLiveStub {
+    getAccountBalance: ReturnType<typeof vi.fn>;
+    buyContracts: ReturnType<typeof vi.fn>;
+    waitForOrderTerminalStatus: ReturnType<typeof vi.fn>;
+    sellContracts?: ReturnType<typeof vi.fn>;
+  }
+
+  function setupLiveEngine(stub: TradierLiveStub, scanner: StubScanner) {
+    const engine = new SignalEngine(undefined, undefined, scanner);
+    (engine as unknown as { tradierLiveClient: unknown }).tradierLiveClient = stub;
+    (engine as unknown as { mode: 'demo' | 'live' }).mode = 'live';
+    return engine;
+  }
+
+  function freshScanner(): StubScanner {
+    const scanner = new StubScanner();
+    scanner.scan.mockResolvedValue({
+      symbol: 'AAPL',
+      spot: 195,
+      expiration: '2024-07-05',
+      candidates: [makeCandidate({ mark: 1.20 })],
+      reason: 'ok',
+    });
+    return scanner;
+  }
+
+  it('voids the paper open, hides the signal, and frees the slot when Tradier ends in canceled', async () => {
+    const stub: TradierLiveStub = {
+      getAccountBalance: vi.fn().mockResolvedValue({
+        totalEquity: 1000, totalCash: 300, optionBuyingPower: 999_999,
+      }),
+      buyContracts: vi.fn().mockResolvedValue({ id: 7, status: 'ok' }),
+      waitForOrderTerminalStatus: vi.fn(async (_id: number, _opts?: WaitOpts) => ({
+        id: 7, status: 'canceled', reason_description: 'insufficient buying power',
+      })),
+    };
+    const engine = setupLiveEngine(stub, freshScanner());
+    await (engine as unknown as { runRelativeValueScan: (s: string[]) => Promise<void> }).runRelativeValueScan(['AAPL']);
+
+    // The mirror DID submit (we only know it's bad after Tradier reconciles).
+    expect(stub.buyContracts).toHaveBeenCalledTimes(1);
+    expect(stub.waitForOrderTerminalStatus).toHaveBeenCalledTimes(1);
+
+    const state = engine.getState();
+    // No phantom row in the live-mode dashboard.
+    expect(state.options.openOptions).toHaveLength(0);
+    // Slot was reverted (this is the user-visible bug — losing daily slots
+    // to trades the broker never accepted).
+    expect(state.options.dailyOptionsCount).toBe(0);
+    // No closed-options leak — voidOpenOption is NOT closeOption.
+    expect(state.options.closedOptions).toHaveLength(0);
+    expect(state.options.optionsPnl).toBe(0);
+    // The Signals panel must not record an entry the user can't actually act
+    // on — recentSignals is appended only after the live mirror succeeds.
+    expect(state.signals).toHaveLength(0);
+  });
+
+  it('skips the order entirely when cached optionBuyingPower is below notional cost', async () => {
+    const stub: TradierLiveStub = {
+      getAccountBalance: vi.fn(),
+      buyContracts: vi.fn(),
+      waitForOrderTerminalStatus: vi.fn(),
+    };
+    const engine = setupLiveEngine(stub, freshScanner());
+    // Prime an under-funded balance snapshot. RV budget on a 25k default
+    // account easily exceeds $50, so the pre-check should refuse to submit.
+    (engine as unknown as { liveTradierBalance: { totalEquity: number; totalCash: number; optionBuyingPower: number } | null }).liveTradierBalance = {
+      totalEquity: 100, totalCash: 50, optionBuyingPower: 50,
+    };
+
+    await (engine as unknown as { runRelativeValueScan: (s: string[]) => Promise<void> }).runRelativeValueScan(['AAPL']);
+
+    // Pre-check fired — we never bothered the broker.
+    expect(stub.buyContracts).not.toHaveBeenCalled();
+    expect(stub.waitForOrderTerminalStatus).not.toHaveBeenCalled();
+
+    const state = engine.getState();
+    expect(state.options.openOptions).toHaveLength(0);
+    expect(state.options.dailyOptionsCount).toBe(0);
+    expect(state.signals).toHaveLength(0);
+  });
+
+  it('voids the paper open when the buyContracts call itself throws (network/auth failure)', async () => {
+    const stub: TradierLiveStub = {
+      getAccountBalance: vi.fn(),
+      buyContracts: vi.fn().mockRejectedValue(new Error('Tradier 401 unauthorized')),
+      waitForOrderTerminalStatus: vi.fn(),
+    };
+    const engine = setupLiveEngine(stub, freshScanner());
+
+    await (engine as unknown as { runRelativeValueScan: (s: string[]) => Promise<void> }).runRelativeValueScan(['AAPL']);
+
+    const state = engine.getState();
+    expect(state.options.openOptions).toHaveLength(0);
+    expect(state.options.dailyOptionsCount).toBe(0);
+    expect(state.signals).toHaveLength(0);
+    // We never reached the polling step.
+    expect(stub.waitForOrderTerminalStatus).not.toHaveBeenCalled();
+  });
+
+  it('keeps the paper open and records the signal on the happy path (Tradier filled)', async () => {
+    const stub: TradierLiveStub = {
+      getAccountBalance: vi.fn().mockResolvedValue({
+        totalEquity: 25_000, totalCash: 25_000, optionBuyingPower: 25_000,
+      }),
+      buyContracts: vi.fn().mockResolvedValue({ id: 11, status: 'ok' }),
+      waitForOrderTerminalStatus: vi.fn(async (_id: number, _opts?: WaitOpts) => ({
+        id: 11, status: 'filled', exec_quantity: 1, avg_fill_price: 1.20,
+      })),
+    };
+    const engine = setupLiveEngine(stub, freshScanner());
+    await (engine as unknown as { runRelativeValueScan: (s: string[]) => Promise<void> }).runRelativeValueScan(['AAPL']);
+
+    expect(stub.buyContracts).toHaveBeenCalledTimes(1);
+    expect(stub.waitForOrderTerminalStatus).toHaveBeenCalledTimes(1);
+
+    const state = engine.getState();
+    // No-regression check on the happy path: the position survives, the
+    // daily slot is consumed, and the Signals panel surfaces the entry.
+    expect(state.options.openOptions).toHaveLength(1);
+    expect(state.options.openOptions[0].optionSymbol).toBe('AAPL240705C00200000');
+    expect(state.options.dailyOptionsCount).toBe(1);
+    expect(state.signals).toHaveLength(1);
+    expect(state.signals[0].type).toBe('relative_value');
+  });
+
+  it('keeps the paper open when Tradier never reaches a terminal state within the wait window (treats as live, lets the periodic balance poll catch any drift)', async () => {
+    const stub: TradierLiveStub = {
+      getAccountBalance: vi.fn().mockResolvedValue({
+        totalEquity: 25_000, totalCash: 25_000, optionBuyingPower: 25_000,
+      }),
+      buyContracts: vi.fn().mockResolvedValue({ id: 13, status: 'ok' }),
+      // Returns a non-terminal final detail (waitFor… exhausted its window).
+      waitForOrderTerminalStatus: vi.fn(async (_id: number, _opts?: WaitOpts) => ({
+        id: 13, status: 'pending',
+      })),
+    };
+    const engine = setupLiveEngine(stub, freshScanner());
+    await (engine as unknown as { runRelativeValueScan: (s: string[]) => Promise<void> }).runRelativeValueScan(['AAPL']);
+
+    const state = engine.getState();
+    // Pending is NOT in the rejected set — we conservatively keep the paper
+    // open and let the next periodic Tradier balance poll surface drift.
+    expect(state.options.openOptions).toHaveLength(1);
+    expect(state.options.dailyOptionsCount).toBe(1);
+    expect(state.signals).toHaveLength(1);
+  });
+});
