@@ -1,4 +1,4 @@
-import { OrbStrategy, ReversalStrategy, MacdTrendStrategy, BbFadeStrategy, IchimokuStrategy, TradierOptionsClient } from '@trading-app/engine';
+import { OrbStrategy, BbFadeStrategy, IchimokuStrategy, TradierOptionsClient } from '@trading-app/engine';
 import type { TradierAccountBalance } from '@trading-app/engine';
 import { WATCHLIST, MANAGED_ACCOUNT_RATIO, MAX_CONSECUTIVE_LOSSES, DAILY_DRAWDOWN_HALT_PCT, aliasWatchlistSymbol, isStockMarketOpen, resolveTradierOptionsCreds } from '@trading-app/shared';
 import type { TradeSignal, RelativeValueSignal, Candle, OptionsAccountState, SignalType, Position, AccountSettings, AccountState, NewsItem, TradierEnv } from '@trading-app/shared';
@@ -123,9 +123,8 @@ class DailyRiskGovernor {
 
 export class SignalEngine {
   private readonly orb = new OrbStrategy({ rangeMinutes: 30, minVolume: 5_000 });
-  private readonly reversal = new ReversalStrategy();
-  // TRA-170: split MACD-Bollinger into trend half + range/mean-revert half.
-  private readonly macdTrend = new MacdTrendStrategy();
+  // TRA-313: dropped reversal / macdTrend per board pick on TRA-305 (cleanup
+  // mirrors the live crypto-engine roster).
   private readonly bbFade = new BbFadeStrategy();
   private readonly ichimoku = new IchimokuStrategy();
   private account: PaperAccount;
@@ -556,8 +555,8 @@ export class SignalEngine {
     setActiveInterestSymbols(activeInterest);
 
     // Fetch candles in parallel batches to avoid 25+ second sequential delay for 25 symbols.
-    // TRA-220/221: candles power only the equity strategies (ORB, Reversal,
-    // MACD, BB-fade, Ichimoku) which run in demo mode. Live mode trades
+    // TRA-220/221: candles power only the equity strategies (ORB, BB-fade,
+    // Ichimoku) which run in demo mode. Live mode trades
     // options only via the RV scanner, which pulls Tradier chains directly
     // and doesn't need candles — skip the fetch in live to avoid burning
     // Yahoo / Twelve Data quota.
@@ -583,12 +582,10 @@ export class SignalEngine {
         symbolsWithData++;
 
         const orbSignal = this.orb.evaluate(sym, candles);
-        const reversalSignal = this.reversal.evaluate(sym, candles);
-        const macdTrendSignal = this.macdTrend.evaluate(sym, candles);
         const bbFadeSignal = this.bbFade.evaluate(sym, candles);
         const ichimokuSignal = this.ichimoku.evaluate(sym, candles);
 
-        for (const signal of [orbSignal, reversalSignal, macdTrendSignal, bbFadeSignal, ichimokuSignal]) {
+        for (const signal of [orbSignal, bbFadeSignal, ichimokuSignal]) {
           if (!signal) continue;
           // Skip if an equity position for this symbol+strategy type is already open
           if (this.account.hasOpenPositionForSignalType(sym, signal.type)) continue;
@@ -618,7 +615,7 @@ export class SignalEngine {
           // signal are NOT auto-opened anymore (TRA-191): the only enabled
           // stock-options strategy is the relative-value scanner, which runs
           // on its own 5-minute cadence below. Equity / share trading still
-          // fires off the established ORB/Reversal/MACD/BB/Ichimoku signals.
+          // fires off the established ORB/BB/Ichimoku signals.
           const pos = this.account.openPosition(signal, price);
           if (pos) {
             // TRA-231 — same rationale as the signal stamp above; the closed-

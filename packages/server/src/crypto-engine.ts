@@ -1,8 +1,5 @@
 import {
-  ReversalStrategy,
-  MacdTrendStrategy,
   BbFadeStrategy,
-  ScalpingStrategy,
   SwingStrategy,
   CoinbaseOrderClient,
   RegimeDetector,
@@ -40,20 +37,10 @@ const NEWS_REFRESH_MS = 5 * 60_000;
 const SIGNAL_VALID_MS = 30 * 60_000;
 
 export class CryptoSignalEngine {
-  // TRA-52: ORB disabled (24/7 incompatible, -55% avg return around the clock).
-  // TRA-70: Re-enabled with session-aware filter — reverted by TRA-106 (no true open range for crypto).
-  // TRA-75: enforceTimeFilter: false on Reversal/MACD strategies — crypto trades 24/7.
-  // TRA-107: Scalping (1-min, 9/21 EMA + VWAP + RSI(9) + volume) and Swing (daily, 50/200 EMA + RSI(14) + MACD).
-  // TRA-170: split MACD-Bollinger into MacdTrend (continuation) + BbFade (mean-reversion);
-  //         Reversal RSI thresholds widened to 65/35 for crypto (1h bars rarely sustain 70/30).
-  private readonly reversal = new ReversalStrategy({
-    enforceTimeFilter: false,
-    rsiOverbought: 65,
-    rsiOversold: 35,
-  });
-  private readonly macdTrend = new MacdTrendStrategy({ enforceTimeFilter: false });
+  // TRA-313: dropped reversal / macdTrend / scalping per board pick on TRA-305.
+  //          BbFade and Swing remain as direct (non-router) strategies; the
+  //          router below owns momentum / breakout_vol / mean_reversion.
   private readonly bbFade = new BbFadeStrategy({ enforceTimeFilter: false });
-  private readonly scalping = new ScalpingStrategy({ enforceTimeFilter: false });
   private readonly swing = new SwingStrategy();
   /**
    * TRA-208: per-symbol regime-aware routers for the new strategy roster
@@ -386,10 +373,7 @@ export class CryptoSignalEngine {
   }
 
   // Minimum bars each strategy needs (used to gate evaluation per-symbol).
-  private static readonly MIN_BARS_REVERSAL = 20;   // rsiPeriod(14) + lookback(5) + 1
-  private static readonly MIN_BARS_MACD_TREND = 35; // slowPeriod(26) + signalPeriod(9)
   private static readonly MIN_BARS_BB_FADE = 28;    // bbPeriod(20) + adx warm-up
-  private static readonly MIN_BARS_SCALPING = 23;   // max(slowEma(21)+2, volumeLookback(10)+1, rsiPeriod(9)+2)
   // TRA-208 router floor: momentum needs slowMaPeriod(50)+1, breakout needs
   // 50 bars to seed the regime classifier's MA, mean-reversion gates on a
   // 50-bar EMA. 50 covers all three.
@@ -690,21 +674,12 @@ export class CryptoSignalEngine {
         const dailyCandles = this.dailyCandleCache.get(sym) ?? [];
 
         // Evaluate each strategy independently with its own minimum bar requirement.
-        // Previously a blanket 35-bar gate blocked Reversal (needs 20) and Scalping (needs 23).
-        const reversalSignal = candles.length >= CryptoSignalEngine.MIN_BARS_REVERSAL
-          ? this.reversal.evaluate(sym, candles) : null;
-        const macdTrendSignal = candles.length >= CryptoSignalEngine.MIN_BARS_MACD_TREND
-          ? this.macdTrend.evaluate(sym, candles) : null;
         const bbFadeSignal = candles.length >= CryptoSignalEngine.MIN_BARS_BB_FADE
           ? this.bbFade.evaluate(sym, candles) : null;
-        const scalpingSignal = candles.length >= CryptoSignalEngine.MIN_BARS_SCALPING
-          ? this.scalping.evaluate(sym, candles) : null;
         const swingSignal = dailyCandles.length >= 205
           ? this.swing.evaluate(sym, dailyCandles) : null;
         // TRA-208: regime-aware router emits at most one momentum / breakout
-        // / mean-reversion signal per tick. Routed alongside the legacy roster
-        // above; the dedup-by-recent-signal logic below handles cross-strategy
-        // overlap (e.g. router momentum + legacy macdTrend on the same bar).
+        // / mean-reversion signal per tick.
         const routerSignal = candles.length >= CryptoSignalEngine.MIN_BARS_ROUTER
           ? this.getRouter(sym).evaluate(sym, candles) : null;
 
@@ -714,7 +689,7 @@ export class CryptoSignalEngine {
           symbolsEvaluated++;
         }
 
-        for (const signal of [reversalSignal, macdTrendSignal, bbFadeSignal, scalpingSignal, swingSignal, routerSignal]) {
+        for (const signal of [bbFadeSignal, swingSignal, routerSignal]) {
           if (!signal) continue;
           // TRA-261 — apply the perp shorts gates BEFORE the open-position /
           // recent-signal dedup. A suppressed signal still surfaces on the
@@ -837,14 +812,8 @@ export class CryptoSignalEngine {
       const candles = this.candleCache.get(sym) ?? [];
       const dailyCandles = this.dailyCandleCache.get(sym) ?? [];
 
-      const reversalSignal = candles.length >= CryptoSignalEngine.MIN_BARS_REVERSAL
-        ? this.reversal.evaluate(sym, candles) : null;
-      const macdTrendSignal = candles.length >= CryptoSignalEngine.MIN_BARS_MACD_TREND
-        ? this.macdTrend.evaluate(sym, candles) : null;
       const bbFadeSignal = candles.length >= CryptoSignalEngine.MIN_BARS_BB_FADE
         ? this.bbFade.evaluate(sym, candles) : null;
-      const scalpingSignal = candles.length >= CryptoSignalEngine.MIN_BARS_SCALPING
-        ? this.scalping.evaluate(sym, candles) : null;
       const swingSignal = dailyCandles.length >= 205
         ? this.swing.evaluate(sym, dailyCandles) : null;
       // TRA-208: same router pipeline as the demo path so live and paper
@@ -852,7 +821,7 @@ export class CryptoSignalEngine {
       const routerSignal = candles.length >= CryptoSignalEngine.MIN_BARS_ROUTER
         ? this.getRouter(sym).evaluate(sym, candles) : null;
 
-      for (const signal of [reversalSignal, macdTrendSignal, bbFadeSignal, scalpingSignal, swingSignal, routerSignal]) {
+      for (const signal of [bbFadeSignal, swingSignal, routerSignal]) {
         if (!signal) continue;
         // TRA-261 — apply the perp shorts gates BEFORE dedup so suppressed
         // signals still flow to the dashboard's Signals panel with the
