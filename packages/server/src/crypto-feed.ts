@@ -1,6 +1,11 @@
 import YahooFinance from 'yahoo-finance2';
 import type { Candle, NewsItem } from '@trading-app/shared';
-import { fetchCoinbase4hBars } from '@trading-app/backtest';
+import {
+  fetchCoinbase4hBars,
+  fetchCoinbaseDailyBars,
+  fetchCoinbaseMinuteBars,
+  paceCoinbaseFetch,
+} from '@trading-app/backtest';
 import { isYahooBreakerOpen, toIsoTime, tripYahooBreakerFromExternal } from './yahoo-feed.js';
 
 const yf = new YahooFinance({
@@ -69,35 +74,35 @@ async function fetchCoinbaseStatsQuotes(
 ): Promise<Map<string, { price: number; volume: number; change: number; changePct: number }>> {
   const results = new Map<string, { price: number; volume: number; change: number; changePct: number }>();
   if (symbols.length === 0) return results;
-  const BATCH = 5;
-  for (let i = 0; i < symbols.length; i += BATCH) {
-    const slice = symbols.slice(i, i + BATCH);
-    const settled = await Promise.all(slice.map(async sym => {
-      try {
-        const resp = await withTimeout(
-          fetch(`${COINBASE_BASE}/products/${encodeURIComponent(sym)}/stats`, {
-            headers: { 'User-Agent': 'TRA-300/1.0', Accept: 'application/json' },
-          }),
-          FEED_CALL_TIMEOUT_MS,
-          `Coinbase stats(${sym})`,
-        );
-        if (!resp.ok) return [sym, null] as const;
-        const json = (await resp.json()) as { open?: string; last?: string; volume?: string };
-        const price = Number(json.last);
-        const open = Number(json.open);
-        const volume = Number(json.volume ?? 0);
-        if (!Number.isFinite(price) || price <= 0) return [sym, null] as const;
-        const changePct = Number.isFinite(open) && open > 0 ? ((price - open) / open) * 100 : 0;
-        const change = price - (Number.isFinite(open) ? open : price);
-        return [sym, { price, volume, change, changePct }] as const;
-      } catch {
-        return [sym, null] as const;
-      }
-    }));
-    for (const [sym, q] of settled) {
-      if (q) results.set(sym, q);
+  // All requests route through `paceCoinbaseFetch` so they share the same
+  // 10 req/s/IP budget as the candle fetchers (TRA-300 — see scheduler doc
+  // in `coinbase-feed.ts`). Promise.all on the full list is safe because
+  // the scheduler serialises with a 120 ms min gap; inflating concurrency
+  // here just queues, it never bursts.
+  const settled = await Promise.all(symbols.map(async sym => {
+    try {
+      const resp = await withTimeout(
+        paceCoinbaseFetch(`${COINBASE_BASE}/products/${encodeURIComponent(sym)}/stats`, {
+          headers: { 'User-Agent': 'TRA-300/1.0', Accept: 'application/json' },
+        }),
+        FEED_CALL_TIMEOUT_MS,
+        `Coinbase stats(${sym})`,
+      );
+      if (!resp.ok) return [sym, null] as const;
+      const json = (await resp.json()) as { open?: string; last?: string; volume?: string };
+      const price = Number(json.last);
+      const open = Number(json.open);
+      const volume = Number(json.volume ?? 0);
+      if (!Number.isFinite(price) || price <= 0) return [sym, null] as const;
+      const changePct = Number.isFinite(open) && open > 0 ? ((price - open) / open) * 100 : 0;
+      const change = price - (Number.isFinite(open) ? open : price);
+      return [sym, { price, volume, change, changePct }] as const;
+    } catch {
+      return [sym, null] as const;
     }
-    if (i + BATCH < symbols.length) await sleep(150);
+  }));
+  for (const [sym, q] of settled) {
+    if (q) results.set(sym, q);
   }
   return results;
 }
@@ -141,12 +146,45 @@ async function fetchCMCBatchQuotes(
   }
 }
 
+/**
+ * TRA-300 — daily bars from Coinbase Exchange (granularity=86400) with Yahoo
+ * fallback for symbols Coinbase doesn't list. Same venue alignment as the
+ * quote and 4H paths so signal/exit math matches execution prices.
+ *
+ * Behaviour matches the legacy YF-only path: bars with `volume <= 0` are
+ * dropped (so 0-volume gaps don't pollute indicator math), and the
+ * in-progress current UTC day is retained if it has non-zero volume — the
+ * engine has always seen the partial-today bar and strategies are
+ * calibrated to that input shape.
+ */
 export async function fetchCryptoDailyBars(symbol: string, count = 260): Promise<Candle[]> {
+  const now = Date.now();
+  const fromMs = now - count * 86_400_000 * 1.5; // buffer for Coinbase listing date / Yahoo gaps
+
+  // Primary: Coinbase Exchange.
   try {
-    const now = new Date();
-    const from = new Date(now.getTime() - count * 24 * 60 * 60 * 1000 * 1.5); // fetch with buffer
+    const bars = await withTimeout(
+      fetchCoinbaseDailyBars(symbol, fromMs, now),
+      FEED_CALL_TIMEOUT_MS,
+      `coinbase-1d(${symbol})`,
+    );
+    const usable = bars.filter(b => b.volume > 0);
+    if (usable.length > 0) return usable.slice(-count);
+  } catch (err: unknown) {
+    const msg = err instanceof Error ? err.message : String(err);
+    // 404 = symbol not listed on Coinbase Exchange. Anything else (5xx,
+    // network) → still try YF; both paths can recover independently.
+    if (!/Coinbase 404/.test(msg)) {
+      console.warn(`[crypto-feed] fetchCryptoDailyBars(${symbol}) Coinbase: ${msg} — falling back to Yahoo`);
+    }
+  }
+
+  // Fallback: Yahoo Finance.
+  try {
+    const fromDate = new Date(fromMs);
+    const nowDate = new Date(now);
     const result = await withTimeout(
-      yf.chart(symbol, { period1: from, period2: now, interval: '1d' }),
+      yf.chart(symbol, { period1: fromDate, period2: nowDate, interval: '1d' }),
       FEED_CALL_TIMEOUT_MS,
       `chart-1d(${symbol})`,
     );
@@ -196,19 +234,47 @@ export async function fetchCrypto4hBars(symbol: string, count = 260): Promise<Ca
   }
 }
 
+/**
+ * TRA-300 — minute bars from Coinbase Exchange (granularity=60) with Yahoo
+ * fallback for symbols Coinbase doesn't list.
+ *
+ * Behaviour parity with the legacy YF-only path: drop the in-progress
+ * current minute (Coinbase, like Yahoo, includes it with partial data and
+ * near-zero volume — leaving it in would misfire volume-confirmation
+ * gates) and drop any 0-volume gap bars.
+ */
 export async function fetchCryptoMinuteBars(symbol: string, count = 60): Promise<Candle[]> {
+  const now = Date.now();
+  const currentMinuteStart = Math.floor(now / 60_000) * 60_000;
+  const fromMs = now - count * 60 * 1000 * 2; // buffer for occasional missing minutes
+
+  // Primary: Coinbase Exchange.
   try {
-    const now = new Date();
-    const from = new Date(now.getTime() - count * 60 * 1000 * 2);
-    // Request one extra bar so we always have `count` completed bars after dropping
-    // the in-progress current-minute candle (which Yahoo Finance includes with partial
-    // data and near-zero volume, causing volume-confirmation to always fail).
+    const bars = await withTimeout(
+      fetchCoinbaseMinuteBars(symbol, fromMs, now),
+      FEED_CALL_TIMEOUT_MS,
+      `coinbase-1m(${symbol})`,
+    );
+    const completed = bars
+      .filter(b => b.timestamp < currentMinuteStart)
+      .filter(b => b.volume > 0);
+    if (completed.length > 0) return completed.slice(-count);
+  } catch (err: unknown) {
+    const msg = err instanceof Error ? err.message : String(err);
+    if (!/Coinbase 404/.test(msg)) {
+      console.warn(`[crypto-feed] fetchCryptoMinuteBars(${symbol}) Coinbase: ${msg} — falling back to Yahoo`);
+    }
+  }
+
+  // Fallback: Yahoo Finance.
+  try {
+    const fromDate = new Date(fromMs);
+    const nowDate = new Date(now);
     const result = await withTimeout(
-      yf.chart(symbol, { period1: from, period2: now, interval: '1m' }),
+      yf.chart(symbol, { period1: fromDate, period2: nowDate, interval: '1m' }),
       FEED_CALL_TIMEOUT_MS,
       `chart-1m(${symbol})`,
     );
-    const currentMinuteStart = Math.floor(now.getTime() / 60_000) * 60_000;
     const quotes = result.quotes ?? [];
     return quotes
       .filter(q => q.open != null && q.high != null && q.low != null && q.close != null && q.volume != null)

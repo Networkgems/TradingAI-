@@ -48,7 +48,10 @@ export type {
 export {
   fetchCoinbaseHourlyBars,
   fetchCoinbase4hBars,
+  fetchCoinbaseMinuteBars,
+  fetchCoinbaseDailyBars,
   aggregate1hTo4h,
+  paceCoinbaseFetch,
 } from './coinbase-feed.js';
 export {
   cachePathFor,
