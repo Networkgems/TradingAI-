@@ -52,6 +52,7 @@ export {
   fetchCoinbaseDailyBars,
   aggregate1hTo4h,
   paceCoinbaseFetch,
+  isCoinbaseBreakerOpen,
 } from './coinbase-feed.js';
 export {
   cachePathFor,

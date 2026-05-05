@@ -4,8 +4,11 @@ import {
   fetchCoinbase4hBars,
   fetchCoinbaseDailyBars,
   fetchCoinbaseMinuteBars,
+  isCoinbaseBreakerOpen,
   paceCoinbaseFetch,
 } from '@trading-app/backtest';
+
+export { isCoinbaseBreakerOpen };
 import { isYahooBreakerOpen, toIsoTime, tripYahooBreakerFromExternal } from './yahoo-feed.js';
 
 const yf = new YahooFinance({
@@ -500,5 +503,19 @@ export async function testCoinMarketCap(): Promise<{ symbol: string; price: numb
   const results = await fetchCMCBatchQuotes(['BTC-USD']);
   const btc = results.get('BTC-USD');
   if (!btc) throw new Error('No BTC-USD data from CMC');
+  return { symbol: 'BTC-USD', price: btc.price };
+}
+
+/**
+ * TRA-331 — probe Coinbase Exchange (the live engine's primary crypto quote
+ * source) so `/api/health/quotes` reflects the path the engine actually uses.
+ * Without this, the endpoint only tested the *fallbacks* (YF/TwelveData/CMC),
+ * and a degraded fallback chain made it impossible to tell whether crypto
+ * quotes were flowing into the live engine.
+ */
+export async function testCoinbase(): Promise<{ symbol: string; price: number }> {
+  const stats = await fetchCoinbaseStatsQuotes(['BTC-USD']);
+  const btc = stats.get('BTC-USD');
+  if (!btc) throw new Error('No BTC-USD data from Coinbase Exchange');
   return { symbol: 'BTC-USD', price: btc.price };
 }

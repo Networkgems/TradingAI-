@@ -1702,7 +1702,7 @@ app.get('/api/health/quotes', async (_req, res) => {
     fetchMinuteBarsWithSource,
     getFallbackRequestCounts,
   } = await import('./yahoo-feed.js');
-  const { testCoinMarketCap } = await import('./crypto-feed.js');
+  const { testCoinMarketCap, testCoinbase, isCoinbaseBreakerOpen } = await import('./crypto-feed.js');
   const results: Record<string, unknown> = {};
 
   try {
@@ -1710,6 +1710,17 @@ app.get('/api/health/quotes', async (_req, res) => {
     results['tradier'] = tradier ?? { skipped: 'TRADIER_*_API_TOKEN not set' };
   } catch (err: unknown) {
     results['tradier'] = { error: err instanceof Error ? err.message : String(err) };
+  }
+
+  // TRA-331 — Coinbase Exchange is the LIVE crypto engine's primary quote
+  // source. Probing it here makes the health response reflect the path the
+  // engine actually uses; without this the endpoint only saw fallbacks and
+  // reported `cryptoOk: false` whenever Yahoo/Twelve/CMC were degraded even
+  // though crypto was flowing through Coinbase fine.
+  try {
+    results['coinbase'] = await testCoinbase();
+  } catch (err: unknown) {
+    results['coinbase'] = { error: err instanceof Error ? err.message : String(err) };
   }
 
   try {
@@ -1759,7 +1770,8 @@ app.get('/api/health/quotes', async (_req, res) => {
     return v && typeof v === 'object' && !('error' in (v as object)) && !('skipped' in (v as object));
   };
   const stocksOk = ok('tradier') || ok('yahooFinance');
-  const cryptoOk = ok('yahooFinance') || ok('coinMarketCap');
+  // TRA-331 — Coinbase is primary for crypto; YF/CMC are fallbacks only.
+  const cryptoOk = ok('coinbase') || ok('yahooFinance') || ok('coinMarketCap');
   const allOk = stocksOk && cryptoOk;
   res.status(allOk ? 200 : 502).json({
     ok: allOk,
@@ -1768,6 +1780,7 @@ app.get('/api/health/quotes', async (_req, res) => {
     tradierConfigured: isTradierStocksConfigured(),
     tradierBreakerOpen: isTradierBreakerOpen(),
     yahooBreakerOpen: isYahooBreakerOpen(),
+    coinbaseBreakerOpen: isCoinbaseBreakerOpen(),
     results,
     ts: new Date().toISOString(),
   });
