@@ -355,6 +355,19 @@ export interface AccountSettings {
    * pool.
    */
   optionsDailyTradesLimit: number;
+  /**
+   * TRA-327 — live-mode counterparts of `dailyTradesLimit` and
+   * `optionsDailyTradesLimit`. Editing the demo cap left the live cap pinned
+   * to the same number, so users tuning their paper limits inadvertently
+   * widened or tightened live trading too. The live engine now reads these
+   * fields when `settings.mode === 'live'`, falling back to the un-suffixed
+   * demo fields for back-compat with saved settings written before TRA-327.
+   * Both live limits are surfaced in the "Live Trading Risk" block of the
+   * Settings page; the demo section continues to bind the un-suffixed
+   * fields so the two modes stay independent.
+   */
+  dailyTradesLimitLive?: number;
+  optionsDailyTradesLimitLive?: number;
   managedAccountRatio: number;
   riskPerTrade: number;
   // Auto-trading persistence — survives server restarts. Split per dashboard
@@ -454,6 +467,8 @@ export const DEFAULT_ACCOUNT_SETTINGS: AccountSettings = {
   demoEquityCrypto: 25_000,
   dailyTradesLimit: 10,
   optionsDailyTradesLimit: 10,
+  dailyTradesLimitLive: 10,
+  optionsDailyTradesLimitLive: 10,
   managedAccountRatio: 0.5,
   riskPerTrade: 0.01,
   stocksAutoTradingEnabledDemo: true,

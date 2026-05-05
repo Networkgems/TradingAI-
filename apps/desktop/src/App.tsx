@@ -1,7 +1,20 @@
 import { useCallback, useEffect, useLayoutEffect, useRef, useState } from 'react';
 import { createPortal } from 'react-dom';
-import type { TradeSignal, Position, AccountState, OptionPosition, OptionsAccountState, CryptoEngineState, LiveSkip, NewsItem } from '@trading-app/shared';
+import type { TradeSignal, Position, AccountState, OptionPosition, OptionsAccountState, CryptoEngineState, LiveSkip, NewsItem, AccountSettings } from '@trading-app/shared';
 import { DEFAULT_ACCOUNT_SETTINGS } from '@trading-app/shared';
+
+// TRA-327 — surface the options-daily cap that matches the active mode.
+// Live and Demo each store an independent limit; the Live field falls back
+// to the legacy un-suffixed demo field for settings saved before TRA-327.
+function pickOptionsDailyLimit(s: Partial<AccountSettings> | null | undefined): number | undefined {
+  if (!s) return undefined;
+  if (s.mode === 'live') {
+    return typeof s.optionsDailyTradesLimitLive === 'number'
+      ? s.optionsDailyTradesLimitLive
+      : s.optionsDailyTradesLimit;
+  }
+  return s.optionsDailyTradesLimit;
+}
 import LoginPage from './LoginPage.tsx';
 import ForgotPasswordPage from './ForgotPasswordPage.tsx';
 import SignUpPage from './SignUpPage.tsx';
@@ -354,12 +367,21 @@ function CryptoDashboard({ token, onBack, onLogout, onActivity, theme, onToggleT
       .catch(() => {});
   }, [token]);
 
+  // TRA-327 — apply a fresh AccountSettings snapshot after the initial fetch
+  // and after the SettingsPage `onSettingsSaved` callback fires so a save
+  // takes effect without a hard refresh. Crypto only cares about `mode`
+  // today; other fields are harmlessly ignored.
+  const applyAccountSettings = useCallback((s: Partial<AccountSettings> | null | undefined) => {
+    if (!s) return;
+    if (s.mode === 'demo' || s.mode === 'live') setAccountMode(s.mode);
+  }, []);
+
   useEffect(() => {
     fetch(`${HTTP_URL}/api/account/settings`, { headers: { Authorization: `Bearer ${token}` } })
       .then(r => r.ok ? r.json() : null)
-      .then((s: { mode?: 'demo' | 'live' } | null) => { if (s?.mode) setAccountMode(s.mode); })
+      .then((s: Partial<AccountSettings> | null) => applyAccountSettings(s))
       .catch(() => {});
-  }, [tab, token]);
+  }, [tab, token, applyAccountSettings]);
 
   const account = state?.account;
   const signals = state?.signals ?? [];
@@ -551,7 +573,7 @@ function CryptoDashboard({ token, onBack, onLogout, onActivity, theme, onToggleT
             >
               &#x2715;
             </button>
-            <SettingsPage token={token} httpUrl={HTTP_URL} context="crypto" onModeChange={setAccountMode} />
+            <SettingsPage token={token} httpUrl={HTTP_URL} context="crypto" onModeChange={setAccountMode} onSettingsSaved={applyAccountSettings} />
           </div>
         </div>
       )}
@@ -1279,21 +1301,26 @@ function Dashboard({ token, onLogout, onGoHome, onActivity, theme, onToggleTheme
       .catch(() => {});
   }, [token]);
 
+  // TRA-327 — apply a fresh AccountSettings snapshot to the dashboard's
+  // cached fields (account mode, daily-options badge, Tradier env). Used by
+  // both the initial fetch below and the SettingsPage `onSettingsSaved`
+  // callback so saves take effect without a hard page refresh.
+  const applyAccountSettings = useCallback((s: Partial<AccountSettings> | null | undefined) => {
+    if (!s) return;
+    if (s.mode === 'demo' || s.mode === 'live') setAccountMode(s.mode);
+    const limit = pickOptionsDailyLimit(s);
+    if (typeof limit === 'number') setOptionsDailyLimit(limit);
+    if (s.liveTradierEnvOptions === 'sandbox' || s.liveTradierEnvOptions === 'production') {
+      setTradierEnv(s.liveTradierEnvOptions);
+    }
+  }, []);
+
   useEffect(() => {
     fetch(`${HTTP_URL}/api/account/settings`, { headers: { Authorization: `Bearer ${token}` } })
       .then(r => r.ok ? r.json() : null)
-      .then((s: { mode?: 'demo' | 'live'; optionsDailyTradesLimit?: number; liveTradierEnvOptions?: 'sandbox' | 'production' } | null) => {
-        if (s?.mode) setAccountMode(s.mode);
-        if (typeof s?.optionsDailyTradesLimit === 'number') setOptionsDailyLimit(s.optionsDailyTradesLimit);
-        // TRA-244 — keep the Calendar tab in sync with whichever Tradier
-        // environment is selected on the Settings page; sandbox is the
-        // default if nothing was saved (matches the server-side fallback).
-        if (s?.liveTradierEnvOptions === 'sandbox' || s?.liveTradierEnvOptions === 'production') {
-          setTradierEnv(s.liveTradierEnvOptions);
-        }
-      })
+      .then((s: Partial<AccountSettings> | null) => applyAccountSettings(s))
       .catch(() => {});
-  }, [tab, token]);
+  }, [tab, token, applyAccountSettings]);
 
   const account = state?.account;
   const signals = state?.signals ?? [];
@@ -1544,7 +1571,7 @@ function Dashboard({ token, onLogout, onGoHome, onActivity, theme, onToggleTheme
             >
               &#x2715;
             </button>
-            <SettingsPage token={token} httpUrl={HTTP_URL} context="stocks" onModeChange={setAccountMode} />
+            <SettingsPage token={token} httpUrl={HTTP_URL} context="stocks" onModeChange={setAccountMode} onSettingsSaved={applyAccountSettings} />
           </div>
         </div>
       )}

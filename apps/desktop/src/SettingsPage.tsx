@@ -178,6 +178,10 @@ interface Props {
   httpUrl: string;
   context?: 'crypto' | 'stocks';
   onModeChange?: (mode: 'demo' | 'live') => void;
+  // TRA-327 — fired after a successful PUT /api/account/settings so the
+  // hosting dashboard can refetch /api/account/settings and refresh any
+  // cached fields (e.g. the daily-options badge) without a hard reload.
+  onSettingsSaved?: (settings: AccountSettings) => void;
 }
 
 type SaveStatus = 'idle' | 'saving' | 'saved' | 'error';
@@ -849,7 +853,7 @@ function StrategyPresetSection({
   );
 }
 
-export default function SettingsPage({ token, httpUrl, context, onModeChange }: Props) {
+export default function SettingsPage({ token, httpUrl, context, onModeChange, onSettingsSaved }: Props) {
   const [settings, setSettings] = useState<AccountSettings>(DEFAULT_ACCOUNT_SETTINGS);
   const [loading, setLoading] = useState(true);
   const [saveStatus, setSaveStatus] = useState<SaveStatus>('idle');
@@ -915,9 +919,16 @@ export default function SettingsPage({ token, httpUrl, context, onModeChange }: 
         body: JSON.stringify(settings),
       });
       if (r.ok) {
+        // TRA-327 — read the server-clamped settings back from the response so
+        // the local form state and the parent dashboard reflect the values the
+        // server actually persisted (no hard refresh required).
+        const data = await r.json().catch(() => null) as { ok?: boolean; settings?: AccountSettings } | null;
+        const persisted = data?.settings ?? settings;
+        setSettings(prev => ({ ...prev, ...persisted }));
         setSaveStatus('saved');
         setTimeout(() => setSaveStatus('idle'), 2000);
-        onModeChange?.(settings.mode);
+        onModeChange?.(persisted.mode);
+        onSettingsSaved?.(persisted);
       } else {
         setSaveStatus('error');
       }
@@ -1222,6 +1233,11 @@ export default function SettingsPage({ token, httpUrl, context, onModeChange }: 
                     Max equity risked per live trade (default: 1%). Applied to position sizing on every order.
                   </span>
                 </div>
+                {/* TRA-327 — Live limits bind to dailyTradesLimitLive /
+                    optionsDailyTradesLimitLive so editing the Demo cap on
+                    another visit never drags the Live cap with it. Falls back
+                    to the legacy un-suffixed field when the user hasn't yet
+                    saved a live-only value. */}
                 {(!context || context === 'stocks') && (
                   <div className="settings-field">
                     <label>Stock Daily Trades Limit</label>
@@ -1229,10 +1245,10 @@ export default function SettingsPage({ token, httpUrl, context, onModeChange }: 
                       type="number"
                       min={1}
                       max={100}
-                      value={settings.dailyTradesLimit}
-                      onChange={e => set('dailyTradesLimit', Number(e.target.value))}
+                      value={settings.dailyTradesLimitLive ?? settings.dailyTradesLimit}
+                      onChange={e => set('dailyTradesLimitLive', Number(e.target.value))}
                     />
-                    <span className="field-hint">Max stock trades per day (default: 10)</span>
+                    <span className="field-hint">Max stock trades per day in Live mode (default: 10)</span>
                   </div>
                 )}
                 {(!context || context === 'stocks') && (
@@ -1242,10 +1258,10 @@ export default function SettingsPage({ token, httpUrl, context, onModeChange }: 
                       type="number"
                       min={1}
                       max={100}
-                      value={settings.optionsDailyTradesLimit}
-                      onChange={e => set('optionsDailyTradesLimit', Number(e.target.value))}
+                      value={settings.optionsDailyTradesLimitLive ?? settings.optionsDailyTradesLimit}
+                      onChange={e => set('optionsDailyTradesLimitLive', Number(e.target.value))}
                     />
-                    <span className="field-hint">Max options trades per day across all scanners (default: 10)</span>
+                    <span className="field-hint">Max options trades per day across all scanners in Live mode (default: 10)</span>
                   </div>
                 )}
               </div>

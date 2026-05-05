@@ -58,6 +58,21 @@ const TRADIER_BALANCE_REFRESH_MS = 2 * 60_000;
  */
 const SIGNAL_VALID_MS = 30 * 60_000;
 
+/**
+ * TRA-327 — pick the options-daily-trades cap that matches the active mode.
+ * Demo and Live each store an independent value (`optionsDailyTradesLimit` vs
+ * `optionsDailyTradesLimitLive`); editing one used to drag the other along.
+ * Live falls back to the demo field when the live counterpart is absent so
+ * settings saved before TRA-327 still surface a cap instead of `undefined`.
+ */
+function activeOptionsDailyLimit(settings?: AccountSettings): number | undefined {
+  if (!settings) return undefined;
+  if (settings.mode === 'live') {
+    return settings.optionsDailyTradesLimitLive ?? settings.optionsDailyTradesLimit;
+  }
+  return settings.optionsDailyTradesLimit;
+}
+
 // TRA-191 — periodic relative-value scanner cadence. Tradier's free-tier
 // limit is 60 req/min (sandbox) or 120/min (production). With ~25 active-
 // interest symbols and 2 calls per scan (expirations + chain), a 5-minute
@@ -213,13 +228,13 @@ export class SignalEngine {
       sandbox: new PaperOptionsAccount({
         initialEquity: currentEquity,
         managedAccountRatio: settings?.managedAccountRatio,
-        optionsDailyTradesLimit: settings?.optionsDailyTradesLimit,
+        optionsDailyTradesLimit: activeOptionsDailyLimit(settings),
         tradierEnv: 'sandbox',
       }),
       production: new PaperOptionsAccount({
         initialEquity: currentEquity,
         managedAccountRatio: settings?.managedAccountRatio,
-        optionsDailyTradesLimit: settings?.optionsDailyTradesLimit,
+        optionsDailyTradesLimit: activeOptionsDailyLimit(settings),
         tradierEnv: 'production',
       }),
     };
@@ -268,7 +283,7 @@ export class SignalEngine {
     for (const acct of this.allOptionsAccounts()) {
       acct.updateConfig({
         managedAccountRatio: settings.managedAccountRatio,
-        optionsDailyTradesLimit: settings.optionsDailyTradesLimit,
+        optionsDailyTradesLimit: activeOptionsDailyLimit(settings),
       });
     }
     // TRA-221 — re-resolve the Tradier live client whenever settings change
@@ -348,7 +363,7 @@ export class SignalEngine {
       acct.reset({
         initialEquity: equity,
         managedAccountRatio: settings.managedAccountRatio,
-        optionsDailyTradesLimit: settings.optionsDailyTradesLimit,
+        optionsDailyTradesLimit: activeOptionsDailyLimit(settings),
       });
     }
     this.allClosedPositions = [];

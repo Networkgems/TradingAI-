@@ -973,6 +973,27 @@ app.put('/api/account/settings', requireAuth, async (req, res) => {
     demoEquityCrypto: clampEquity(body.demoEquityCrypto ?? current.demoEquityCrypto ?? current.demoEquity),
     dailyTradesLimit: Math.max(1, Math.min(100, Number(body.dailyTradesLimit ?? current.dailyTradesLimit))),
     optionsDailyTradesLimit: Math.max(1, Math.min(100, Number(body.optionsDailyTradesLimit ?? current.optionsDailyTradesLimit))),
+    // TRA-327 — clamp the live-only counterparts independently so a Demo edit
+    // never pulls the Live cap with it. Falls back to the un-suffixed demo
+    // value for back-compat with saved settings written before TRA-327.
+    dailyTradesLimitLive: Math.max(
+      1,
+      Math.min(
+        100,
+        Number(body.dailyTradesLimitLive ?? current.dailyTradesLimitLive ?? current.dailyTradesLimit),
+      ),
+    ),
+    optionsDailyTradesLimitLive: Math.max(
+      1,
+      Math.min(
+        100,
+        Number(
+          body.optionsDailyTradesLimitLive
+            ?? current.optionsDailyTradesLimitLive
+            ?? current.optionsDailyTradesLimit,
+        ),
+      ),
+    ),
     managedAccountRatio: Math.max(0.01, Math.min(1, Number(body.managedAccountRatio ?? current.managedAccountRatio))),
     riskPerTrade: Math.max(0.001, Math.min(0.5, Number(body.riskPerTrade ?? current.riskPerTrade))),
     // TRA-249-E — clamp the operator-facing leverage cap to [1, 5] integer.
