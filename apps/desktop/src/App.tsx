@@ -1300,6 +1300,19 @@ function Dashboard({ token, onLogout, onGoHome, onActivity, theme, onToggleTheme
   const openOptions: OptionPosition[] = optionsState?.openOptions ?? [];
   const closedOptions: OptionPosition[] = optionsState?.closedOptions ?? [];
   const autoTradingEnabled = state?.autoTradingEnabled ?? true;
+  // TRA-326 — Stocks dashboard scoping per account/env:
+  //   • Demo                              → Positions + Options
+  //   • Live + Tradier sandbox            → Positions + Options
+  //   • Live + Tradier production (margin)→ Options only (no equity positions
+  //     panel — production is an options-only margin account).
+  const showPositionsTab = !(accountMode === 'live' && tradierEnv === 'production');
+
+  // If the user is on the Positions tab and flips to Live+Production (where
+  // Positions is hidden), bounce them to Options so the content area doesn't
+  // go blank.
+  useEffect(() => {
+    if (!showPositionsTab && tab === 'positions') setTab('options');
+  }, [showPositionsTab, tab]);
 
   async function toggleAutoTrading() {
     setTradingToggling(true);
@@ -1508,7 +1521,8 @@ function Dashboard({ token, onLogout, onGoHome, onActivity, theme, onToggleTheme
       )}
 
       <nav className="tabs">
-        {(['watchlist', 'signals', 'positions', 'options'] as const).map(t => (
+        {/* TRA-326 — drop the Positions tab in Live+Production (margin / options-only). */}
+        {((['watchlist', 'signals', 'positions', 'options'] as const).filter(t => t !== 'positions' || showPositionsTab)).map(t => (
           <button key={t} className={`tab ${tab === t ? 'active' : ''}`} onClick={() => setTab(t)}>
             {t === 'watchlist' ? `Watchlist (${symbols.length})` :
              t === 'signals' ? `Signals (${signals.length})` :
@@ -1629,7 +1643,7 @@ function Dashboard({ token, onLogout, onGoHome, onActivity, theme, onToggleTheme
           </div>
         )}
 
-        {state && tab === 'positions' && (
+        {state && tab === 'positions' && showPositionsTab && (
           <div className="positions-panel">
             {openPositions.length > 0 && (
               <>
