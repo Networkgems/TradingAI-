@@ -174,7 +174,9 @@ export async function fetchCryptoDailyBars(symbol: string, count = 260): Promise
     const msg = err instanceof Error ? err.message : String(err);
     // 404 = symbol not listed on Coinbase Exchange. Anything else (5xx,
     // network) → still try YF; both paths can recover independently.
-    if (!/Coinbase 404/.test(msg)) {
+    // TRA-329 — when the Coinbase breaker is open we expect to fall back;
+    // the breaker logs a single trip line, so skip the per-symbol warn.
+    if (!/Coinbase 404|Coinbase breaker open/.test(msg)) {
       console.warn(`[crypto-feed] fetchCryptoDailyBars(${symbol}) Coinbase: ${msg} — falling back to Yahoo`);
     }
   }
@@ -261,7 +263,9 @@ export async function fetchCryptoMinuteBars(symbol: string, count = 60): Promise
     if (completed.length > 0) return completed.slice(-count);
   } catch (err: unknown) {
     const msg = err instanceof Error ? err.message : String(err);
-    if (!/Coinbase 404/.test(msg)) {
+    // TRA-329 — see fetchCryptoDailyBars: suppress the per-symbol warn while
+    // the breaker is open; the breaker logs a single trip line.
+    if (!/Coinbase 404|Coinbase breaker open/.test(msg)) {
       console.warn(`[crypto-feed] fetchCryptoMinuteBars(${symbol}) Coinbase: ${msg} — falling back to Yahoo`);
     }
   }

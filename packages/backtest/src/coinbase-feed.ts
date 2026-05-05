@@ -41,14 +41,73 @@ type CoinbaseCandleRow = [number, number, number, number, number, number];
  * `fetchCoinbaseStatsQuotes` in `packages/server/src/crypto-feed.ts` —
  * route through {@link paceCoinbaseFetch} so the limit is enforced
  * regardless of which file kicked off the request.
+ *
+ * TRA-329 — added a per-fetch `AbortController` and a circuit breaker.
+ * The TRA-300 design only had an *outer* `withTimeout` wrapper around each
+ * call (in `crypto-feed.ts`); when a single fetch hung longer than the
+ * budget the outer wrapper rejected, but the underlying socket was still
+ * waiting on Coinbase. The hung fetch held the rate-limiter chain link
+ * open, and every subsequent enqueue piled up behind it — each timing out
+ * at the outer 8 s wrapper too. One genuinely slow Coinbase response
+ * therefore cascaded into "every call timed out, falling back to Yahoo"
+ * for the remainder of the tick (TRA-329 prod symptom). The
+ * `AbortController` here actually cancels the hung fetch so the chain
+ * advances; the breaker stops us from burning the 8 s outer budget on
+ * every symbol once we know Coinbase is unhealthy.
  */
 const COINBASE_MIN_GAP_MS = 120;
+const COINBASE_FETCH_TIMEOUT_MS = 7_000;
+const COINBASE_BREAKER_FAILURE_THRESHOLD = 5;
+const COINBASE_BREAKER_FAILURE_WINDOW_MS = 30_000;
+const COINBASE_BREAKER_COOLDOWN_MS = 60_000;
+
 let coinbaseChain: Promise<unknown> = Promise.resolve();
 let coinbaseLastRequestAt = 0;
+let recentCoinbaseFailures: number[] = [];
+let coinbaseBreakerOpenUntil = 0;
+
+export function isCoinbaseBreakerOpen(): boolean {
+  return Date.now() < coinbaseBreakerOpenUntil;
+}
+
+/** Test seam — reset all breaker / chain state between unit tests. */
+export function _resetCoinbaseBreakerForTests(): void {
+  recentCoinbaseFailures = [];
+  coinbaseBreakerOpenUntil = 0;
+  coinbaseChain = Promise.resolve();
+  coinbaseLastRequestAt = 0;
+}
+
+function recordCoinbaseFailure(): void {
+  const now = Date.now();
+  recentCoinbaseFailures.push(now);
+  while (recentCoinbaseFailures.length > 0 && recentCoinbaseFailures[0] < now - COINBASE_BREAKER_FAILURE_WINDOW_MS) {
+    recentCoinbaseFailures.shift();
+  }
+  if (recentCoinbaseFailures.length >= COINBASE_BREAKER_FAILURE_THRESHOLD) {
+    coinbaseBreakerOpenUntil = now + COINBASE_BREAKER_COOLDOWN_MS;
+    recentCoinbaseFailures = [];
+    console.warn(
+      `[coinbase-feed] circuit breaker tripped — skipping Coinbase for ${COINBASE_BREAKER_COOLDOWN_MS / 1000}s after ${COINBASE_BREAKER_FAILURE_THRESHOLD} consecutive transport failures`,
+    );
+  }
+}
+
+function recordCoinbaseSuccess(): void {
+  recentCoinbaseFailures = [];
+}
+
 export async function paceCoinbaseFetch(
   url: string,
   init?: { headers?: Record<string, string> },
+  options: { timeoutMs?: number } = {},
 ): Promise<Response> {
+  // TRA-329 — fast-fail when the breaker is open so callers fall through to
+  // Yahoo immediately instead of paying the outer 8 s budget per symbol.
+  if (isCoinbaseBreakerOpen()) {
+    throw new Error('Coinbase breaker open');
+  }
+  const timeoutMs = options.timeoutMs ?? COINBASE_FETCH_TIMEOUT_MS;
   const next = coinbaseChain.then(async () => {
     // Skip the wait when the gap is already exceeded *or* when `Date.now()`
     // appears to go backwards (vitest's fake timers reset the clock between
@@ -59,7 +118,25 @@ export async function paceCoinbaseFetch(
       await sleep(COINBASE_MIN_GAP_MS - elapsed);
     }
     coinbaseLastRequestAt = Date.now();
-    return fetch(url, init);
+
+    // TRA-329 — the AbortController is the load-bearing piece. Without it,
+    // a slow fetch would leave the chain link open even after the outer
+    // `withTimeout` rejected, blocking every subsequent enqueue.
+    const controller = new AbortController();
+    const abortTimer = setTimeout(() => controller.abort(), timeoutMs);
+    try {
+      const resp = await fetch(url, { ...init, signal: controller.signal });
+      recordCoinbaseSuccess();
+      return resp;
+    } catch (err) {
+      recordCoinbaseFailure();
+      if (controller.signal.aborted) {
+        throw new Error(`Coinbase fetch timed out after ${timeoutMs}ms`);
+      }
+      throw err;
+    } finally {
+      clearTimeout(abortTimer);
+    }
   });
   // Keep the chain alive even if a call rejects, so a single failed request
   // doesn't poison every subsequent enqueue.

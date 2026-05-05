@@ -13,7 +13,14 @@
 
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import type { Candle } from '@trading-app/shared';
-import { aggregate1hTo4h, fetchCoinbaseHourlyBars, fetchCoinbase4hBars } from './coinbase-feed.js';
+import {
+  _resetCoinbaseBreakerForTests,
+  aggregate1hTo4h,
+  fetchCoinbaseHourlyBars,
+  fetchCoinbase4hBars,
+  isCoinbaseBreakerOpen,
+  paceCoinbaseFetch,
+} from './coinbase-feed.js';
 
 const ONE_HOUR_MS = 60 * 60 * 1000;
 const FOUR_HOURS_MS = 4 * ONE_HOUR_MS;
@@ -95,10 +102,12 @@ describe('aggregate1hTo4h', () => {
 describe('fetchCoinbaseHourlyBars', () => {
   beforeEach(() => {
     vi.useFakeTimers();
+    _resetCoinbaseBreakerForTests();
   });
   afterEach(() => {
     vi.useRealTimers();
     vi.unstubAllGlobals();
+    _resetCoinbaseBreakerForTests();
   });
 
   it('paginates the request window and merges results in ascending order', async () => {
@@ -196,10 +205,12 @@ describe('fetchCoinbaseHourlyBars', () => {
 describe('fetchCoinbase4hBars', () => {
   beforeEach(() => {
     vi.useFakeTimers();
+    _resetCoinbaseBreakerForTests();
   });
   afterEach(() => {
     vi.useRealTimers();
     vi.unstubAllGlobals();
+    _resetCoinbaseBreakerForTests();
   });
 
   it('fetches 1H bars and aggregates to 4H end-to-end', async () => {
@@ -224,5 +235,143 @@ describe('fetchCoinbase4hBars', () => {
     expect(bars[0].timestamp).toBe(start);
     expect(bars[5].timestamp).toBe(start + 5 * FOUR_HOURS_MS);
     expect(bars[0].volume).toBe(200); // 4 × 50
+  });
+});
+
+describe('paceCoinbaseFetch (TRA-329)', () => {
+  beforeEach(() => {
+    vi.useFakeTimers();
+    _resetCoinbaseBreakerForTests();
+  });
+  afterEach(() => {
+    vi.useRealTimers();
+    vi.unstubAllGlobals();
+    _resetCoinbaseBreakerForTests();
+  });
+
+  it('aborts a hung fetch via AbortController so the chain is not poisoned', async () => {
+    // First call: never-resolving fetch. Second call: would hang behind the
+    // first if the AbortController did not actually cancel the underlying
+    // request. With the abort, the chain link rejects and the second call
+    // proceeds to run a successful fetch.
+    let abortedSignal: AbortSignal | null = null;
+    const responses: Array<(req: { signal?: AbortSignal | null }) => Promise<Response>> = [
+      // Hang until aborted; reject with the signal's reason when aborted.
+      (req) => new Promise<Response>((_resolve, reject) => {
+        const sig = req.signal ?? null;
+        abortedSignal = sig;
+        if (!sig) return; // never resolves
+        const onAbort = () => {
+          const reason = (sig as AbortSignal & { reason?: unknown }).reason;
+          reject(reason instanceof Error ? reason : new DOMException('Aborted', 'AbortError'));
+        };
+        if (sig.aborted) onAbort();
+        else sig.addEventListener('abort', onAbort);
+      }),
+      // Fast success.
+      async () => new Response(JSON.stringify({ ok: true }), { status: 200 }),
+    ];
+    let callIdx = 0;
+    vi.stubGlobal('fetch', vi.fn(async (_url: string | URL, init?: RequestInit) => {
+      const handler = responses[callIdx++];
+      return handler({ signal: init?.signal ?? null });
+    }));
+
+    // Attach .catch eagerly so the rejection is observed during
+    // `runAllTimersAsync`; otherwise vitest reports an unhandled rejection.
+    const first = paceCoinbaseFetch('https://api.exchange.coinbase.com/products/BTC-USD/stats', {}, { timeoutMs: 500 })
+      .catch((e) => e);
+    // Second call — enqueued behind the first. Without the abort fix it
+    // would never fire because the chain link is held open.
+    const second = paceCoinbaseFetch('https://api.exchange.coinbase.com/products/ETH-USD/stats', {}, { timeoutMs: 500 });
+
+    await vi.runAllTimersAsync();
+    const firstErr = await first;
+    expect(firstErr).toBeInstanceOf(Error);
+    expect((firstErr as Error).message).toMatch(/timed out after 500ms/);
+    const resp = await second;
+    expect(resp.ok).toBe(true);
+    expect(abortedSignal).not.toBeNull();
+    expect(abortedSignal!.aborted).toBe(true);
+  });
+
+  it('trips the breaker after 5 transport failures and fast-fails subsequent calls', async () => {
+    // Five hung fetches in a row should trip the breaker. The 6th call must
+    // reject immediately with "Coinbase breaker open" without waiting for
+    // any setTimeout/fetch budget.
+    vi.stubGlobal('fetch', vi.fn(async (_url: string | URL, init?: RequestInit) => {
+      const sig = init?.signal ?? null;
+      return new Promise<Response>((_resolve, reject) => {
+        if (!sig) return;
+        const onAbort = () => reject(new DOMException('Aborted', 'AbortError'));
+        if (sig.aborted) onAbort();
+        else sig.addEventListener('abort', onAbort);
+      });
+    }));
+
+    expect(isCoinbaseBreakerOpen()).toBe(false);
+
+    const failures: Promise<unknown>[] = [];
+    for (let i = 0; i < 5; i++) {
+      failures.push(
+        paceCoinbaseFetch(`https://api.exchange.coinbase.com/products/SYM${i}/stats`, {}, { timeoutMs: 100 })
+          .catch((e) => e),
+      );
+    }
+    await vi.runAllTimersAsync();
+    await Promise.all(failures);
+
+    expect(isCoinbaseBreakerOpen()).toBe(true);
+
+    // Subsequent call: synchronous-ish fast-fail. The fetch mock is never invoked.
+    const fetchMock = globalThis.fetch as unknown as ReturnType<typeof vi.fn>;
+    const before = fetchMock.mock.calls.length;
+    await expect(
+      paceCoinbaseFetch('https://api.exchange.coinbase.com/products/BTC-USD/stats', {}, { timeoutMs: 5_000 }),
+    ).rejects.toThrow(/Coinbase breaker open/);
+    expect(fetchMock.mock.calls.length).toBe(before);
+  });
+
+  it('resets the failure counter on a successful fetch', async () => {
+    // Pattern: fail, fail, fail, fail, success — counter must reset so the
+    // next 4 failures don't trip the breaker (threshold is 5).
+    let nextShouldHang = true;
+    let callsBeforeBreakerExpected = 0;
+    vi.stubGlobal('fetch', vi.fn(async (_url: string | URL, init?: RequestInit) => {
+      callsBeforeBreakerExpected += 1;
+      if (nextShouldHang) {
+        const sig = init?.signal ?? null;
+        return new Promise<Response>((_resolve, reject) => {
+          if (!sig) return;
+          const onAbort = () => reject(new DOMException('Aborted', 'AbortError'));
+          if (sig.aborted) onAbort();
+          else sig.addEventListener('abort', onAbort);
+        });
+      }
+      return new Response(JSON.stringify({}), { status: 200 });
+    }));
+
+    for (let i = 0; i < 4; i++) {
+      const p = paceCoinbaseFetch(`https://x/${i}`, {}, { timeoutMs: 50 }).catch((e) => e);
+      await vi.runAllTimersAsync();
+      await p;
+    }
+    // Now a success.
+    nextShouldHang = false;
+    const okPromise = paceCoinbaseFetch('https://x/ok', {}, { timeoutMs: 50 });
+    await vi.runAllTimersAsync();
+    const ok = await okPromise;
+    expect(ok.ok).toBe(true);
+
+    // 4 more failures: should NOT trip the breaker because the counter reset.
+    nextShouldHang = true;
+    for (let i = 0; i < 4; i++) {
+      const p = paceCoinbaseFetch(`https://x/post${i}`, {}, { timeoutMs: 50 }).catch((e) => e);
+      await vi.runAllTimersAsync();
+      await p;
+    }
+
+    expect(isCoinbaseBreakerOpen()).toBe(false);
+    expect(callsBeforeBreakerExpected).toBe(4 + 1 + 4);
   });
 });
