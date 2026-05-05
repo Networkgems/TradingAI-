@@ -15,8 +15,18 @@ import {
   type ShortFilterContext,
   type ClosedShortTrade,
 } from '@trading-app/engine';
-import { CRYPTO_WATCHLIST, isCryptoSymbolBlocked } from '@trading-app/shared';
-import type { TradeSignal, Candle, AccountState, Position, CryptoEngineState, NewsItem, AccountSettings } from '@trading-app/shared';
+import { CRYPTO_WATCHLIST, isCryptoSymbolBlocked, resolveStrategyPreset } from '@trading-app/shared';
+import type {
+  TradeSignal,
+  Candle,
+  AccountState,
+  Position,
+  CryptoEngineState,
+  NewsItem,
+  AccountSettings,
+  CryptoStrategyType,
+  StrategyPreset,
+} from '@trading-app/shared';
 import { fetchCryptoMinuteBars, fetchCryptoDailyBars, fetchCrypto4hBars, fetchCryptoQuotes, fetchCryptoNews } from './crypto-feed.js';
 import { isYahooBreakerOpen } from './yahoo-feed.js';
 import { CryptoPaperAccount } from './crypto-account.js';
@@ -30,18 +40,17 @@ const MAX_SIGNALS = 50;
 const NEWS_REFRESH_MS = 5 * 60_000;
 
 /**
- * TRA-324 — board-mandated live preset for the $180 real-money test (board
- * decision on TRA-305, target 2026-05-06). When the
- * `LIVE_STRATEGY_PRESET=bb_fade_sol_doge_only` env var is set:
- *   • bb_fade only fires on SOL-USD + DOGE-USD
- *   • swing, momentum, breakout_vol, mean_reversion are gated off everywhere
- *
- * Default (env unset) preserves the full 5-strategy roster so backtests/dev
- * stay byte-identical to pre-324. Revert path = unset the env var (no code
- * change) or revert this commit.
+ * TRA-325 — process-wide forced strategy preset override. When set in the
+ * environment (Render dashboard, ops shell, etc.) every engine instance pins
+ * to this preset regardless of the user's saved `activeStrategyPreset`. This
+ * subsumes TRA-324's `LIVE_STRATEGY_PRESET=bb_fade_sol_doge_only` env-flag
+ * behaviour and keeps it as an ops-level kill-switch for the live $180 test:
+ * dropping the env var on Render frees per-user settings to drive the engine
+ * without a code change. The legacy value `'bb_fade_sol_doge_only'` is still
+ * accepted (mapped via {@link resolveStrategyPreset}) so a render.yaml that
+ * predates this commit keeps working.
  */
-const BB_FADE_ONLY_PRESET = process.env.LIVE_STRATEGY_PRESET === 'bb_fade_sol_doge_only';
-const BB_FADE_LIVE_SYMBOLS = new Set<string>(['SOL-USD', 'DOGE-USD']);
+const FORCED_PRESET_ENV = (process.env.LIVE_STRATEGY_PRESET ?? '').trim();
 /**
  * TRA-230 — drop signals from the displayed list once they're no longer
  * actionable. A signal becomes invalid when it ages past this window or when
@@ -244,6 +253,19 @@ export class CryptoSignalEngine {
     // failure here is logged per-product and the per-tick refresh in
     // `runLiveTick` retries on the next iteration.
     await broker.refreshPerpOrderBookSpreads(this.getActiveSymbols());
+  }
+
+  /**
+   * TRA-325 — resolve the strategy preset that should drive this tick. The
+   * `LIVE_STRATEGY_PRESET` env var, when set, wins over per-user settings so
+   * Render can pin every engine to one preset (the live-test override path
+   * inherited from TRA-324). Otherwise we honour the user's saved
+   * `activeStrategyPreset`, defaulting to `legacy_5` for snapshots persisted
+   * before this field existed.
+   */
+  private resolvePreset(): StrategyPreset {
+    if (FORCED_PRESET_ENV) return resolveStrategyPreset(FORCED_PRESET_ENV);
+    return resolveStrategyPreset(this.currentSettings?.activeStrategyPreset);
   }
 
   /**
@@ -681,6 +703,13 @@ export class CryptoSignalEngine {
     }
 
     if (this.isAutoTradingEnabled()) {
+      // TRA-325 — resolve the active preset once per tick. Strategies outside
+      // the preset short-circuit to null without running indicators; symbols
+      // outside the preset's whitelist (when set) skip every strategy.
+      const preset = this.resolvePreset();
+      const symbolAllowed = (sym: string) =>
+        preset.symbolFilter === null || preset.symbolFilter.includes(sym);
+      const strategyEnabled = (s: CryptoStrategyType) => preset.enabledStrategies.includes(s);
       let symbolsEvaluated = 0;
       let symbolsSkipped = 0;
       for (const sym of activeSymbols) {
@@ -688,18 +717,29 @@ export class CryptoSignalEngine {
         const dailyCandles = this.dailyCandleCache.get(sym) ?? [];
 
         // Evaluate each strategy independently with its own minimum bar requirement.
-        // TRA-324 — bb_fade-only preset: skip bb_fade for symbols outside
-        // SOL/DOGE, and skip swing + the regime router entirely. Default
-        // (env unset) preserves full 5-strategy behaviour.
         const bbFadeSignal = candles.length >= CryptoSignalEngine.MIN_BARS_BB_FADE
-          && (!BB_FADE_ONLY_PRESET || BB_FADE_LIVE_SYMBOLS.has(sym))
+          && strategyEnabled('bb_fade') && symbolAllowed(sym)
           ? this.bbFade.evaluate(sym, candles) : null;
-        const swingSignal = !BB_FADE_ONLY_PRESET && dailyCandles.length >= 205
+        const swingSignal = strategyEnabled('swing_trade') && symbolAllowed(sym)
+          && dailyCandles.length >= 205
           ? this.swing.evaluate(sym, dailyCandles) : null;
         // TRA-208: regime-aware router emits at most one momentum / breakout
-        // / mean-reversion signal per tick.
-        const routerSignal = !BB_FADE_ONLY_PRESET && candles.length >= CryptoSignalEngine.MIN_BARS_ROUTER
+        // / mean-reversion signal per tick. The router runs whenever any of
+        // its three strategies are enabled by the preset; the post-router
+        // filter below drops emissions for strategies outside the preset.
+        const routerEnabled = strategyEnabled('momentum')
+          || strategyEnabled('mean_reversion')
+          || strategyEnabled('breakout_vol');
+        const rawRouterSignal = routerEnabled && symbolAllowed(sym)
+          && candles.length >= CryptoSignalEngine.MIN_BARS_ROUTER
           ? this.getRouter(sym).evaluate(sym, candles) : null;
+        const routerSignal = rawRouterSignal
+          && (rawRouterSignal.type === 'momentum'
+            || rawRouterSignal.type === 'mean_reversion'
+            || rawRouterSignal.type === 'breakout_vol')
+          && strategyEnabled(rawRouterSignal.type)
+          ? rawRouterSignal
+          : null;
 
         if (candles.length === 0) {
           symbolsSkipped++;
@@ -834,23 +874,39 @@ export class CryptoSignalEngine {
       );
     }
 
+    // TRA-325 — resolve the active preset once per live tick. Same semantics
+    // as the demo path so verification on demo before flipping to live is
+    // meaningful.
+    const preset = this.resolvePreset();
+    const symbolAllowed = (sym: string) =>
+      preset.symbolFilter === null || preset.symbolFilter.includes(sym);
+    const strategyEnabled = (s: CryptoStrategyType) => preset.enabledStrategies.includes(s);
+
     for (const sym of activeSymbols) {
       const candles = this.candleCache.get(sym) ?? [];
       const dailyCandles = this.dailyCandleCache.get(sym) ?? [];
 
-      // TRA-324 — same bb_fade-only preset gate as the demo path. Live mode
-      // is the explicit target of the board's $180 test, so the preset
-      // *must* hold here; demo gets it too so verification on demo before
-      // flipping to live is meaningful.
       const bbFadeSignal = candles.length >= CryptoSignalEngine.MIN_BARS_BB_FADE
-        && (!BB_FADE_ONLY_PRESET || BB_FADE_LIVE_SYMBOLS.has(sym))
+        && strategyEnabled('bb_fade') && symbolAllowed(sym)
         ? this.bbFade.evaluate(sym, candles) : null;
-      const swingSignal = !BB_FADE_ONLY_PRESET && dailyCandles.length >= 205
+      const swingSignal = strategyEnabled('swing_trade') && symbolAllowed(sym)
+        && dailyCandles.length >= 205
         ? this.swing.evaluate(sym, dailyCandles) : null;
       // TRA-208: same router pipeline as the demo path so live and paper
       // produce identical regime-aware entries from the same regime state.
-      const routerSignal = !BB_FADE_ONLY_PRESET && candles.length >= CryptoSignalEngine.MIN_BARS_ROUTER
+      const routerEnabled = strategyEnabled('momentum')
+        || strategyEnabled('mean_reversion')
+        || strategyEnabled('breakout_vol');
+      const rawRouterSignal = routerEnabled && symbolAllowed(sym)
+        && candles.length >= CryptoSignalEngine.MIN_BARS_ROUTER
         ? this.getRouter(sym).evaluate(sym, candles) : null;
+      const routerSignal = rawRouterSignal
+        && (rawRouterSignal.type === 'momentum'
+          || rawRouterSignal.type === 'mean_reversion'
+          || rawRouterSignal.type === 'breakout_vol')
+        && strategyEnabled(rawRouterSignal.type)
+        ? rawRouterSignal
+        : null;
 
       for (const signal of [bbFadeSignal, swingSignal, routerSignal]) {
         if (!signal) continue;

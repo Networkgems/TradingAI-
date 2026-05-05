@@ -1,6 +1,16 @@
 import { useEffect, useState } from 'react';
-import type { AccountSettings, BrokerageType, LiveTradeMode, TradierEnv } from '@trading-app/shared';
-import { DEFAULT_ACCOUNT_SETTINGS } from '@trading-app/shared';
+import type {
+  AccountSettings,
+  BrokerageType,
+  LiveTradeMode,
+  StrategyPresetId,
+  TradierEnv,
+} from '@trading-app/shared';
+import {
+  DEFAULT_ACCOUNT_SETTINGS,
+  DEFAULT_STRATEGY_PRESET_ID,
+  STRATEGY_PRESETS,
+} from '@trading-app/shared';
 
 type Market = 'crypto' | 'stocks';
 
@@ -766,6 +776,79 @@ export function UserManagementSection({ token, httpUrl }: { token: string; httpU
   );
 }
 
+/**
+ * TRA-325 — strategy preset selector. Lists every preset from
+ * `STRATEGY_PRESETS` as a radio card, expanded to show enabled strategies
+ * and the symbol-filter (or "all watchlist symbols" when null). The active
+ * id lives on `AccountSettings.activeStrategyPreset` so it saves on the
+ * existing form submit alongside the other account settings.
+ */
+function StrategyPresetSection({
+  active,
+  onChange,
+}: {
+  active: StrategyPresetId;
+  onChange: (id: StrategyPresetId) => void;
+}) {
+  const presets = Object.values(STRATEGY_PRESETS);
+  return (
+    <section className="settings-section">
+      <h2 className="settings-section-title">Crypto Strategy Preset</h2>
+      <p className="settings-hint">
+        Choose which crypto strategies fire and on which symbols. Presets are read-only —
+        adding a new preset requires a code change. Switching takes effect on the next
+        engine tick (no restart required).
+      </p>
+      <div className="strategy-preset-list" style={{ display: 'flex', flexDirection: 'column', gap: '0.75rem', marginTop: '0.75rem' }}>
+        {presets.map(preset => {
+          const isActive = preset.id === active;
+          return (
+            <label
+              key={preset.id}
+              className={`mode-card ${isActive ? 'active' : ''}`}
+              style={{ alignItems: 'flex-start' }}
+            >
+              <input
+                type="radio"
+                name="activeStrategyPreset"
+                value={preset.id}
+                checked={isActive}
+                onChange={() => onChange(preset.id)}
+              />
+              <div className="mode-card-inner" style={{ width: '100%' }}>
+                <span className="mode-card-title">{preset.displayName}</span>
+                <span className="mode-card-desc" style={{ marginBottom: '0.5rem' }}>
+                  {preset.description}
+                </span>
+                <div style={{ fontSize: '0.85rem', color: 'var(--muted, #8b949e)', display: 'grid', gap: '0.25rem' }}>
+                  <div>
+                    <strong>Strategies:</strong>{' '}
+                    {preset.enabledStrategies.length > 0
+                      ? preset.enabledStrategies.join(', ')
+                      : 'none (engine idle)'}
+                  </div>
+                  <div>
+                    <strong>Symbols:</strong>{' '}
+                    {preset.symbolFilter === null
+                      ? 'entire crypto watchlist'
+                      : preset.symbolFilter.join(', ')}
+                  </div>
+                </div>
+              </div>
+            </label>
+          );
+        })}
+      </div>
+      <p className="settings-hint" style={{ marginTop: '0.75rem' }}>
+        Note: the <code>LIVE_STRATEGY_PRESET</code> environment variable on the server
+        (when set) overrides this selection process-wide. Used by ops to pin a preset
+        across all users for live tests; drop the env var to release control back to
+        per-user settings.
+      </p>
+    </section>
+  );
+}
+
 export default function SettingsPage({ token, httpUrl, context, onModeChange }: Props) {
   const [settings, setSettings] = useState<AccountSettings>(DEFAULT_ACCOUNT_SETTINGS);
   const [loading, setLoading] = useState(true);
@@ -1493,6 +1576,17 @@ export default function SettingsPage({ token, httpUrl, context, onModeChange }: 
               )}
             </div>
           </section>
+        )}
+
+        {/* TRA-325 — Crypto strategy preset selector. Visible in admin (no-
+            context) and crypto-dashboard views since the preset only affects
+            CryptoSignalEngine today; hidden on the Stocks dashboard to avoid
+            implying it gates equity trading. */}
+        {(!context || context === 'crypto') && (
+          <StrategyPresetSection
+            active={settings.activeStrategyPreset ?? DEFAULT_STRATEGY_PRESET_ID}
+            onChange={id => set('activeStrategyPreset', id)}
+          />
         )}
 
         {/* ── Save + Reset row ──────────────────────────────────────────── */}

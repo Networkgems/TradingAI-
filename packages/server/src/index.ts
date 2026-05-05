@@ -60,7 +60,15 @@ import {
   type CryptoModeKey,
   type UserContext,
 } from './user-context.js';
-import { resolveTradierOptionsCreds, type AccountSettings, type NewsItem, type ResearchReport } from '@trading-app/shared';
+import {
+  resolveTradierOptionsCreds,
+  STRATEGY_PRESETS,
+  DEFAULT_STRATEGY_PRESET_ID,
+  type AccountSettings,
+  type NewsItem,
+  type ResearchReport,
+  type StrategyPresetId,
+} from '@trading-app/shared';
 import {
   saveResearchReport,
   listResearchReports,
@@ -974,6 +982,15 @@ app.put('/api/account/settings', requireAuth, async (req, res) => {
       1,
       Math.min(5, Math.round(Number(body.liveMaxLeverageCrypto ?? current.liveMaxLeverageCrypto ?? 1))),
     ),
+    // TRA-325 — clamp to a known preset id so a malformed request can't park
+    // the engine on an unknown preset (which would degrade-fall to legacy_5
+    // anyway via resolveStrategyPreset, but persisting a junk id would
+    // surface as a confusing UI selection on next load).
+    activeStrategyPreset: ((): StrategyPresetId => {
+      const requested = body.activeStrategyPreset ?? current.activeStrategyPreset;
+      if (requested && requested in STRATEGY_PRESETS) return requested as StrategyPresetId;
+      return DEFAULT_STRATEGY_PRESET_ID;
+    })(),
   };
   await saveSettings(username, updated);
   // Await the stocks engine: TRA-226 makes applySettings async so a flip into

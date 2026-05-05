@@ -1,4 +1,9 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest';
+import {
+  DEFAULT_STRATEGY_PRESET_ID,
+  STRATEGY_PRESETS,
+  resolveStrategyPreset,
+} from '@trading-app/shared';
 import type {
   CoinbaseAccountBalance,
   CoinbaseFuturesPosition,
@@ -220,5 +225,47 @@ describe('CryptoSignalEngine.manualClosePosition — live mode wiring (TRA-320)'
     expect(
       account.getState().openPositions.find(p => p.id.startsWith('imported-spot-')),
     ).toBeUndefined();
+  });
+});
+
+describe('Strategy presets — TRA-325', () => {
+  // The preset library is the load-bearing contract for the Settings UI and
+  // the live $180 board test. These tests pin the resolver behavior + the
+  // shape of the two v1 presets so a future refactor can't silently shift
+  // the deployed configuration.
+
+  it('resolves an undefined / null id to the default legacy_5 preset', () => {
+    expect(resolveStrategyPreset(undefined).id).toBe(DEFAULT_STRATEGY_PRESET_ID);
+    expect(resolveStrategyPreset(null).id).toBe('legacy_5');
+  });
+
+  it('resolves a known id to the matching preset', () => {
+    expect(resolveStrategyPreset('legacy_5').id).toBe('legacy_5');
+    expect(resolveStrategyPreset('bb_fade_sol_doge').id).toBe('bb_fade_sol_doge');
+  });
+
+  it('falls back to legacy_5 on an unknown id (defensive against junk in stored settings)', () => {
+    expect(resolveStrategyPreset('not_a_real_preset').id).toBe('legacy_5');
+    expect(resolveStrategyPreset('').id).toBe('legacy_5');
+  });
+
+  it('maps the legacy TRA-324 env value bb_fade_sol_doge_only → bb_fade_sol_doge', () => {
+    // render.yaml shipped this value with TRA-324; until ops pushes the new
+    // preset id this fallback keeps the live test config pinned.
+    expect(resolveStrategyPreset('bb_fade_sol_doge_only').id).toBe('bb_fade_sol_doge');
+  });
+
+  it('legacy_5 enables every crypto strategy with no symbol filter', () => {
+    const p = STRATEGY_PRESETS.legacy_5;
+    expect(p.symbolFilter).toBeNull();
+    expect([...p.enabledStrategies].sort()).toEqual(
+      ['bb_fade', 'breakout_vol', 'mean_reversion', 'momentum', 'swing_trade'],
+    );
+  });
+
+  it('bb_fade_sol_doge enables only bb_fade and scopes to SOL+DOGE', () => {
+    const p = STRATEGY_PRESETS.bb_fade_sol_doge;
+    expect(p.enabledStrategies).toEqual(['bb_fade']);
+    expect(p.symbolFilter).toEqual(['SOL-USD', 'DOGE-USD']);
   });
 });

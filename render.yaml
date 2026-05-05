@@ -68,11 +68,14 @@ services:
       # actually want to route real orders.
       - key: TRADIER_ENV
         sync: false
-      # TRA-324 — board-mandated live preset for the $180 real-money test
-      # (board decision on TRA-305, target 2026-05-06). Setting this gates
-      # all crypto strategies except bb_fade and restricts bb_fade to
-      # SOL-USD + DOGE-USD on both demo and live ticks. Unset (or set to a
-      # different value) reverts to the full 5-strategy roster — no code
-      # change required.
+      # TRA-324 / TRA-325 — process-wide forced strategy preset override.
+      # When set, every CryptoSignalEngine instance pins to this preset
+      # regardless of the user's saved `activeStrategyPreset` selection in
+      # the Settings UI. This is the ops-level kill-switch that pinned the
+      # $180 board test (board decision on TRA-305, target 2026-05-06) to
+      # bb_fade-only on SOL+DOGE. Drop the env var to release control back
+      # to per-user settings (default `legacy_5` = pre-324 5-strategy
+      # roster). The legacy value `bb_fade_sol_doge_only` from TRA-324 is
+      # still accepted (mapped to `bb_fade_sol_doge`) for revert safety.
       - key: LIVE_STRATEGY_PRESET
-        value: bb_fade_sol_doge_only
+        value: bb_fade_sol_doge

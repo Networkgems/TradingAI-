@@ -218,6 +218,100 @@ export interface AccountState {
 export const DEFAULT_RISK_PER_TRADE = 0.01; // 1% of account equity
 export const MANAGED_ACCOUNT_RATIO = 0.5;   // 50% of total account auto-managed
 
+// ── Strategy Presets (TRA-325) ────────────────────────────────────────────────
+//
+// Named, read-only library of crypto-strategy configurations the Settings UI
+// can switch between without a code change. Each preset declares which crypto
+// strategies are enabled and an optional symbol whitelist that scopes signal
+// emission to a subset of the watchlist.
+//
+// Adding a preset is a code change (no UI editor in v1, by design). The active
+// preset id lives on `AccountSettings.activeStrategyPreset`; the engine reads
+// it on every tick so a switch takes effect on the next 60s evaluation
+// (no restart required). The legacy `LIVE_STRATEGY_PRESET` env var continues
+// to act as a process-wide forced override — set on Render, it pins every
+// user/engine to the named preset regardless of saved settings.
+
+/** Canonical preset identifiers — the literal union doubles as runtime validation. */
+export type StrategyPresetId = 'legacy_5' | 'bb_fade_sol_doge';
+
+/** Crypto-strategy SignalTypes routable by the engine. Subset of {@link SignalType}. */
+export type CryptoStrategyType =
+  | 'bb_fade'
+  | 'swing_trade'
+  | 'momentum'
+  | 'mean_reversion'
+  | 'breakout_vol';
+
+export interface StrategyPreset {
+  id: StrategyPresetId;
+  /** Human-readable label rendered in the Settings UI. */
+  displayName: string;
+  /** One-line summary shown alongside the preset card. */
+  description: string;
+  /**
+   * Strategies allowed to emit signals while this preset is active. Strategies
+   * outside this set are evaluated as no-ops (engine returns null without
+   * running indicators), keeping CPU off the hot path.
+   */
+  enabledStrategies: readonly CryptoStrategyType[];
+  /**
+   * Optional whitelist scoping signal emission to these symbols. Compared
+   * case-sensitively against the engine's product ids (e.g. 'SOL-USD').
+   * `null` means no preset-level filter — the existing per-strategy gates
+   * (long universe, perp-shorts universe, denylist) apply unchanged.
+   */
+  symbolFilter: readonly string[] | null;
+}
+
+/**
+ * Read-only preset library. v1 ships two presets per board ask:
+ *   • `legacy_5`         — pre-TRA-325 status quo: all 5 crypto strategies on
+ *                          all 51 long symbols, perp shorts on PERP_SHORTS_UNIVERSE.
+ *   • `bb_fade_sol_doge` — bb_fade only, scoped to SOL-USD + DOGE-USD. This
+ *                          captures the live test config that shipped via
+ *                          TRA-324's env-var hardcoding.
+ *
+ * Future presets are added here without code changes elsewhere — the engine
+ * resolves by id, the UI lists `Object.values(STRATEGY_PRESETS)`.
+ */
+export const STRATEGY_PRESETS: Readonly<Record<StrategyPresetId, StrategyPreset>> = {
+  legacy_5: {
+    id: 'legacy_5',
+    displayName: 'Legacy 5-strategy roster',
+    description:
+      'All five crypto strategies (bb_fade, mean_reversion, momentum, breakout_vol, swing_trade) firing across the full 51-symbol watchlist. Perp shorts respect PERP_SHORTS_UNIVERSE.',
+    enabledStrategies: ['bb_fade', 'swing_trade', 'momentum', 'mean_reversion', 'breakout_vol'] as const,
+    symbolFilter: null,
+  },
+  bb_fade_sol_doge: {
+    id: 'bb_fade_sol_doge',
+    displayName: 'bb_fade only — SOL + DOGE',
+    description:
+      'bb_fade scoped to SOL-USD and DOGE-USD. Captures the TRA-324 live-test config: only bb_fade fires, only on the two symbols.',
+    enabledStrategies: ['bb_fade'] as const,
+    symbolFilter: ['SOL-USD', 'DOGE-USD'] as const,
+  },
+};
+
+export const DEFAULT_STRATEGY_PRESET_ID: StrategyPresetId = 'legacy_5';
+
+/**
+ * Resolve a preset id (possibly undefined or invalid from a stored settings
+ * snapshot) to its definition. Falls back to `legacy_5` so a settings file
+ * predating TRA-325 keeps the byte-identical pre-325 behaviour.
+ *
+ * Also accepts the legacy env-var value `'bb_fade_sol_doge_only'` from
+ * TRA-324's `LIVE_STRATEGY_PRESET` for back-compat — the urgent-ticket
+ * deployment shipped that value in render.yaml and should keep resolving
+ * even if a render.yaml update lands after this commit.
+ */
+export function resolveStrategyPreset(id: string | undefined | null): StrategyPreset {
+  if (!id) return STRATEGY_PRESETS[DEFAULT_STRATEGY_PRESET_ID];
+  if (id === 'bb_fade_sol_doge_only') return STRATEGY_PRESETS.bb_fade_sol_doge;
+  return STRATEGY_PRESETS[id as StrategyPresetId] ?? STRATEGY_PRESETS[DEFAULT_STRATEGY_PRESET_ID];
+}
+
 // ── Account Modes ─────────────────────────────────────────────────────────────
 
 export type AccountMode = 'demo' | 'live';
@@ -338,6 +432,18 @@ export interface AccountSettings {
   liveAccountIdOptionsProduction?: string;
   /** Sandbox (default) or production. Sandbox uses simulated fills + real chains. */
   liveTradierEnvOptions?: TradierEnv;
+  /**
+   * TRA-325 — active crypto-strategy preset id (see {@link STRATEGY_PRESETS}).
+   * The engine reads this on every tick so a switch takes effect on the next
+   * evaluation; no restart required. Optional for back-compat with snapshots
+   * persisted before TRA-325 — absent ↔ {@link DEFAULT_STRATEGY_PRESET_ID}
+   * (`'legacy_5'`), the pre-325 5-strategy roster.
+   *
+   * Render's `LIVE_STRATEGY_PRESET` env var, when set, acts as a process-wide
+   * forced override that wins over this field, so the live $180 test config
+   * stays pinned regardless of per-user saves until ops drops the env var.
+   */
+  activeStrategyPreset?: StrategyPresetId;
 }
 
 export const DEFAULT_ACCOUNT_SETTINGS: AccountSettings = {
@@ -376,6 +482,7 @@ export const DEFAULT_ACCOUNT_SETTINGS: AccountSettings = {
   liveApiKeyOptionsProduction: '',
   liveAccountIdOptionsProduction: '',
   liveTradierEnvOptions: 'sandbox',
+  activeStrategyPreset: DEFAULT_STRATEGY_PRESET_ID,
 };
 
 /**
