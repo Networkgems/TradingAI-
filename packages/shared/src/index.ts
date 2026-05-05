@@ -15,7 +15,8 @@ export type SignalType =
   | 'scalping'
   | 'swing_trade'
   | 'otm_mispricing'
-  | 'relative_value'; // TRA-191: options chain relative-value scanner (IV skew + monotonic + no-arb)
+  | 'relative_value' // TRA-191: options chain relative-value scanner (IV skew + monotonic + no-arb)
+  | 'tradier_import'; // TRA-323: position imported from Tradier (opened directly on the broker, synced into TradeAI to be closed here)
 export type OptionType = 'call' | 'put';
 
 export interface Candle {
@@ -727,6 +728,14 @@ export interface OptionPosition {
    * since pre-TRA-220 only the demo path opened paper options.
    */
   mode?: AccountMode;
+  /**
+   * TRA-323 — true when this position was imported from Tradier rather than
+   * opened by the local engine. Imported positions are surfaced in the same
+   * Open Options view so the user can close them from TradeAI; closing one
+   * routes a real `sell_to_close` order to Tradier instead of touching the
+   * paper cash bucket. Absent ↔ legacy or engine-opened position.
+   */
+  importedFromTradier?: boolean;
 }
 
 export interface OptionsAccountState {
@@ -942,7 +951,8 @@ export interface EodTradeEntry {
     | 'Scalping'
     | 'Swing'
     | 'OTM'
-    | 'RV';          // TRA-191 — relative-value scanner
+    | 'RV'           // TRA-191 — relative-value scanner
+    | 'Tradier';     // TRA-323 — imported from Tradier (never actually written to disk: imports don't trade through the EOD exporter)
   side: Side;
   entryPrice: number;
   exitPrice: number;

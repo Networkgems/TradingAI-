@@ -959,6 +959,56 @@ export class SignalEngine {
     return closed;
   }
 
+  /**
+   * TRA-323 — locate a Tradier-imported open option position across env
+   * buckets. Returns the position alongside the env it lives in (so the
+   * close handler can build a Tradier client targeting the right base
+   * URL with the right credentials). `null` when no imported row matches
+   * the id — callers fall back to {@link manualCloseOption} for engine-
+   * opened positions.
+   */
+  findImportedOption(
+    optionId: string,
+  ): { position: import('@trading-app/shared').OptionPosition; env: TradierEnv } | null {
+    for (const env of ['sandbox', 'production'] as const) {
+      const pos = this.optionsAccounts[env]
+        .getState()
+        .openOptions
+        .find(o => o.id === optionId && o.importedFromTradier);
+      if (pos) return { position: pos, env };
+    }
+    return null;
+  }
+
+  /**
+   * TRA-323 — drop a Tradier-imported position from the local store after
+   * the broker confirmed the close. Returns true when a row was removed.
+   * Cash, P&L, and closed-options history are all left untouched because
+   * the imported position never lived on the paper bucket's books.
+   */
+  dropImportedOption(optionId: string): boolean {
+    for (const acct of this.allOptionsAccounts()) {
+      const dropped = acct.dropImportedPosition(optionId);
+      if (dropped) return true;
+    }
+    return false;
+  }
+
+  /**
+   * TRA-323 — sync open option positions held in Tradier into the matching
+   * env bucket so the user can manage them from TradeAI's Open Options
+   * view. Reconcile rules live in {@link PaperOptionsAccount.reconcileTradierPositions};
+   * this method just forwards to the right bucket. The engine's own
+   * `tradierEnv` selection is unaffected — sync is per-env explicit.
+   */
+  reconcileTradierPositions(
+    env: TradierEnv,
+    positions: readonly import('@trading-app/engine').TradierOpenOptionPosition[],
+    mode: 'demo' | 'live' = 'live',
+  ): { added: number; updated: number; removed: number; total: number } {
+    return this.optionsAccounts[env].reconcileTradierPositions(positions, mode);
+  }
+
   getState(): EngineState {
     const symbols = Array.from(this.symbolState.values()).filter(s => !this.hiddenSymbols.has(s.symbol));
     // TRA-231 — scope signals + closed positions to the active mode so a flip

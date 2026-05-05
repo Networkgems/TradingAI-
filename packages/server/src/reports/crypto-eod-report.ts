@@ -71,6 +71,10 @@ function strategyLabel(t: SignalType): StrategyLabel {
     case 'orb_breakout': return 'ORB';
     case 'otm_mispricing': return 'OTM';
     case 'relative_value': return 'RV';
+    // TRA-323 — imported Tradier positions are stocks-options only and
+    // never reach the crypto EOD exporter. Mapped here only to keep the
+    // switch exhaustive for the shared `SignalType` enum.
+    case 'tradier_import': return 'Tradier';
   }
 }
 

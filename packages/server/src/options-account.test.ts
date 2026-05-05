@@ -1,6 +1,7 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import { PaperOptionsAccount } from './options-account.js';
 import type { OtmMispricingSignal, RelativeValueSignal } from '@trading-app/shared';
+import type { TradierOpenOptionPosition } from '@trading-app/engine';
 
 // Inside an ET trading window: 10:00 AM ET = 14:00 UTC during EDT (UTC-4).
 // Pin to a Tuesday so the weekday/window predicate passes.
@@ -325,5 +326,139 @@ describe('PaperOptionsAccount.getStateForMode — per-mode P&L (TRA-246)', () =>
     b.importSnapshot(snap);
     expect(b.getStateForMode('live').optionsPnl).toBeCloseTo(livePnl, 5);
     expect(b.getStateForMode('demo').optionsPnl).toBe(0);
+  });
+});
+
+// ─── TRA-323: Tradier-positions sync ─────────────────────────────────────────
+
+function buildTradierPosition(overrides: Partial<TradierOpenOptionPosition> = {}): TradierOpenOptionPosition {
+  return {
+    optionSymbol: 'SPY260515C00450000',
+    underlying: 'SPY',
+    optionType: 'call',
+    strike: 450,
+    expiration: '2026-05-15',
+    contracts: 2,
+    premiumPaid: 1.6,
+    acquiredAt: TRADING_TIME,
+    ...overrides,
+  };
+}
+
+describe('PaperOptionsAccount.reconcileTradierPositions', () => {
+  it('imports unknown Tradier positions without touching cash or daily counters', () => {
+    const acct = new PaperOptionsAccount({ initialEquity: 25_000, tradierEnv: 'sandbox' });
+    const before = acct.getState();
+
+    const summary = acct.reconcileTradierPositions([buildTradierPosition()]);
+
+    expect(summary).toEqual({ added: 1, updated: 0, removed: 0, total: 1 });
+    const state = acct.getState();
+    expect(state.openOptions).toHaveLength(1);
+    const imported = state.openOptions[0];
+    expect(imported.importedFromTradier).toBe(true);
+    expect(imported.signalType).toBe('tradier_import');
+    expect(imported.symbol).toBe('SPY');
+    expect(imported.optionSymbol).toBe('SPY260515C00450000');
+    expect(imported.tradierEnv).toBe('sandbox');
+    // Imported positions never touch cash or the daily counter — they live
+    // on Tradier's books, not the local paper bucket.
+    expect(state.optionsCash).toBe(before.optionsCash);
+    expect(state.dailyOptionsCount).toBe(0);
+  });
+
+  it('updates an existing imported row when contracts or premium change', () => {
+    const acct = new PaperOptionsAccount({ initialEquity: 25_000, tradierEnv: 'sandbox' });
+    acct.reconcileTradierPositions([buildTradierPosition({ contracts: 2, premiumPaid: 1.6 })]);
+    const summary = acct.reconcileTradierPositions([
+      buildTradierPosition({ contracts: 3, premiumPaid: 1.7 }),
+    ]);
+    expect(summary).toEqual({ added: 0, updated: 1, removed: 0, total: 1 });
+    const opt = acct.getState().openOptions[0];
+    expect(opt.contracts).toBe(3);
+    expect(opt.contractsRemaining).toBe(3);
+    expect(opt.premiumPaid).toBeCloseTo(1.7, 5);
+  });
+
+  it('drops imported rows that disappear from Tradier (closed elsewhere)', () => {
+    const acct = new PaperOptionsAccount({ initialEquity: 25_000, tradierEnv: 'sandbox' });
+    acct.reconcileTradierPositions([
+      buildTradierPosition({ optionSymbol: 'SPY260515C00450000' }),
+      buildTradierPosition({
+        optionSymbol: 'AAPL260920P00187500',
+        underlying: 'AAPL',
+        optionType: 'put',
+        strike: 187.5,
+        expiration: '2026-09-20',
+      }),
+    ]);
+    expect(acct.getState().openOptions).toHaveLength(2);
+
+    const summary = acct.reconcileTradierPositions([
+      buildTradierPosition({ optionSymbol: 'SPY260515C00450000' }),
+    ]);
+    expect(summary).toEqual({ added: 0, updated: 0, removed: 1, total: 1 });
+    const open = acct.getState().openOptions;
+    expect(open).toHaveLength(1);
+    expect(open[0].optionSymbol).toBe('SPY260515C00450000');
+  });
+
+  it('leaves engine-opened positions untouched even when Tradier reports the same OCC', () => {
+    const acct = new PaperOptionsAccount({
+      initialEquity: 50_000,
+      managedAccountRatio: 0.5,
+      tradierEnv: 'sandbox',
+    });
+    const sig = buildSignal({ optionSymbol: 'AAPL240705C00200000' });
+    const opened = acct.openOptionFromCandidate(sig, 'live');
+    expect(opened).not.toBeNull();
+    const beforeContracts = opened!.contracts;
+    const beforePremium = opened!.premiumPaid;
+
+    const summary = acct.reconcileTradierPositions([
+      buildTradierPosition({
+        optionSymbol: 'AAPL240705C00200000',
+        underlying: 'AAPL',
+        optionType: 'call',
+        strike: 200,
+        expiration: '2024-07-05',
+        contracts: 99,
+        premiumPaid: 9.99,
+      }),
+    ]);
+    // Engine-opened row covers this OCC; reconcile leaves it alone.
+    expect(summary).toEqual({ added: 0, updated: 0, removed: 0, total: 1 });
+    const survivor = acct.getState().openOptions.find(o => o.optionSymbol === 'AAPL240705C00200000');
+    expect(survivor?.importedFromTradier).toBeFalsy();
+    expect(survivor?.contracts).toBe(beforeContracts);
+    expect(survivor?.premiumPaid).toBe(beforePremium);
+  });
+
+  it('checkExits skips imported positions so they are never auto-closed', () => {
+    const acct = new PaperOptionsAccount({ initialEquity: 25_000, tradierEnv: 'sandbox' });
+    acct.reconcileTradierPositions([buildTradierPosition({ premiumPaid: 1.6 })]);
+    const open = acct.getState().openOptions[0];
+
+    // Even with a mark that would normally trigger SL, imported rows must
+    // be left alone — the user closes them manually via Tradier.
+    const closed = acct.checkExits(new Map(), new Map([[open.optionSymbol!, 0.01]]), 'live');
+    expect(closed).toEqual([]);
+    expect(acct.getState().openOptions).toHaveLength(1);
+  });
+
+  it('closeOption refuses imported positions; dropImportedPosition removes them cleanly', () => {
+    const acct = new PaperOptionsAccount({ initialEquity: 25_000, tradierEnv: 'sandbox' });
+    acct.reconcileTradierPositions([buildTradierPosition()]);
+    const id = acct.getState().openOptions[0].id;
+    const cashBefore = acct.getState().optionsCash;
+
+    expect(acct.closeOption(id)).toBeNull(); // refuses — would double-count
+    expect(acct.getState().openOptions).toHaveLength(1);
+
+    const dropped = acct.dropImportedPosition(id);
+    expect(dropped?.id).toBe(id);
+    expect(acct.getState().openOptions).toHaveLength(0);
+    // Cash untouched — imported positions never lived on the paper bucket.
+    expect(acct.getState().optionsCash).toBe(cashBefore);
   });
 });

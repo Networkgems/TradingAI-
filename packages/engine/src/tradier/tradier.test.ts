@@ -1,6 +1,11 @@
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import { TradierOrderClient, tradierBaseUrl } from './order-client.js';
-import { TradierOptionsClient, underlyingFromOcc } from './options-client.js';
+import {
+  TradierOptionsClient,
+  underlyingFromOcc,
+  parseOccSymbol,
+  parseTradierPositions,
+} from './options-client.js';
 
 let fetchMock: ReturnType<typeof vi.fn>;
 
@@ -528,5 +533,135 @@ describe('TradierOrderClient.waitForOrderTerminalStatus', () => {
     } finally {
       dateSpy.mockRestore();
     }
+  });
+});
+
+// ─── TRA-323: position imports ──────────────────────────────────────────────
+
+describe('parseOccSymbol', () => {
+  it('decodes a 2026 SPY call', () => {
+    expect(parseOccSymbol('SPY260515C00450000')).toEqual({
+      underlying: 'SPY',
+      optionType: 'call',
+      strike: 450,
+      expiration: '2026-05-15',
+    });
+  });
+
+  it('decodes a 2026 AAPL put with cents in the strike', () => {
+    expect(parseOccSymbol('AAPL260920P00187500')).toEqual({
+      underlying: 'AAPL',
+      optionType: 'put',
+      strike: 187.5,
+      expiration: '2026-09-20',
+    });
+  });
+
+  it('returns null for an equity ticker (no OCC suffix)', () => {
+    expect(parseOccSymbol('AAPL')).toBeNull();
+    expect(parseOccSymbol('SPY')).toBeNull();
+  });
+
+  it('pivots the 2-digit year correctly: 70+ → 1900s, <70 → 2000s', () => {
+    expect(parseOccSymbol('AAPL690101C00100000')?.expiration).toBe('2069-01-01');
+    expect(parseOccSymbol('AAPL700101C00100000')?.expiration).toBe('1970-01-01');
+  });
+});
+
+describe('parseTradierPositions', () => {
+  it('parses a single long option position into the imported shape', () => {
+    const out = parseTradierPositions({
+      positions: {
+        position: {
+          symbol: 'SPY260515C00450000',
+          quantity: 2,
+          cost_basis: 320,
+          date_acquired: '2026-05-01T15:30:00.000Z',
+          id: 12345,
+        },
+      },
+    });
+    expect(out).toHaveLength(1);
+    expect(out[0]).toMatchObject({
+      optionSymbol: 'SPY260515C00450000',
+      underlying: 'SPY',
+      optionType: 'call',
+      strike: 450,
+      expiration: '2026-05-15',
+      contracts: 2,
+      premiumPaid: 1.6, // 320 / 2 / 100
+      tradierPositionId: 12345,
+    });
+  });
+
+  it('handles array of positions and drops equities + short legs', () => {
+    const out = parseTradierPositions({
+      positions: {
+        position: [
+          { symbol: 'AAPL', quantity: 100, cost_basis: 15000, date_acquired: '2026-04-01' }, // equity
+          { symbol: 'SPY260515C00450000', quantity: 1, cost_basis: 200, date_acquired: '2026-05-01' },
+          { symbol: 'AAPL260515P00187500', quantity: -1, cost_basis: 300, date_acquired: '2026-05-01' }, // short leg
+          { symbol: 'AAPL260515P00187500', quantity: 0, cost_basis: 0, date_acquired: '2026-05-01' },   // closed row
+        ],
+      },
+    });
+    expect(out).toHaveLength(1);
+    expect(out[0].optionSymbol).toBe('SPY260515C00450000');
+  });
+
+  it('returns [] when Tradier reports no open positions', () => {
+    expect(parseTradierPositions({ positions: 'null' })).toEqual([]);
+    expect(parseTradierPositions({ positions: null })).toEqual([]);
+    expect(parseTradierPositions(null)).toEqual([]);
+  });
+
+  it('drops rows with missing or non-finite cost basis', () => {
+    const out = parseTradierPositions({
+      positions: {
+        position: [
+          { symbol: 'SPY260515C00450000', quantity: 1, cost_basis: 0, date_acquired: '2026-05-01' },
+          { symbol: 'AAPL260920P00187500', quantity: 1, cost_basis: 250, date_acquired: '2026-05-01' },
+        ],
+      },
+    });
+    expect(out).toHaveLength(1);
+    expect(out[0].underlying).toBe('AAPL');
+  });
+});
+
+describe('TradierOptionsClient.listOpenOptionPositions', () => {
+  it('hits /accounts/{id}/positions and returns the parsed list', async () => {
+    fetchMock.mockResolvedValueOnce(
+      jsonResponse({
+        positions: {
+          position: {
+            symbol: 'SPY260515C00450000',
+            quantity: 2,
+            cost_basis: 320,
+            date_acquired: '2026-05-01T15:30:00.000Z',
+          },
+        },
+      }),
+    );
+    const client = new TradierOptionsClient('tok', 'ACCT9', 'sandbox');
+    const positions = await client.listOpenOptionPositions();
+    expect(positions).toHaveLength(1);
+    expect(positions[0].optionSymbol).toBe('SPY260515C00450000');
+    expect(callUrl(0)).toBe('https://sandbox.tradier.com/v1/accounts/ACCT9/positions');
+    const headers = callInit(0).headers as Record<string, string>;
+    expect(headers.Authorization).toBe('Bearer tok');
+  });
+
+  it('targets the production base URL when env=production', async () => {
+    fetchMock.mockResolvedValueOnce(jsonResponse({ positions: 'null' }));
+    const client = new TradierOptionsClient('tok', 'ACCT9', 'production');
+    expect(await client.listOpenOptionPositions()).toEqual([]);
+    expect(callUrl(0).startsWith('https://api.tradier.com/v1')).toBe(true);
+  });
+
+  it('returns [] on a non-2xx response', async () => {
+    fetchMock.mockResolvedValueOnce(textResponse('boom', 500));
+    const client = new TradierOptionsClient('tok', 'A1');
+    expect(await client.listOpenOptionPositions()).toEqual([]);
   });
 });

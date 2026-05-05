@@ -36,7 +36,8 @@ import {
 import { sendPasswordResetEmail } from './email.js';
 import { rotateBackups, checkDataDirHealth } from './trade-store.js';
 import { TradierRelativeValueScannerService } from './relative-value-scanner.js';
-import { CoinbaseOrderClient, tradierBaseUrl } from '@trading-app/engine';
+import { CoinbaseOrderClient, tradierBaseUrl, TradierOptionsClient } from '@trading-app/engine';
+import type { TradierEnv } from '@trading-app/shared';
 import { fetchQuotes } from './yahoo-feed.js';
 import {
   runFirstBootMigration,
@@ -1035,6 +1036,41 @@ app.post('/api/account/reset-demo', requireAuth, async (req, res) => {
 
 // ── Trading controls ──────────────────────────────────────────────────────────
 
+/**
+ * TRA-323 — build a Tradier options client targeting a specific env regardless
+ * of the user's current `liveTradierEnvOptions` selection. Used by the
+ * "Sync Tradier positions" flow so a user can pull sandbox state in even
+ * while the engine is configured for production (or vice versa). Returns
+ * `null` when neither saved per-options creds nor env-var fallbacks are
+ * present for the requested env; the caller should respond with a clear
+ * 409 rather than silently no-op.
+ */
+function buildTradierOptionsClientForEnv(
+  settings: AccountSettings,
+  env: TradierEnv,
+): TradierOptionsClient | null {
+  const apiToken = (
+    (env === 'production'
+      ? settings.liveApiKeyOptionsProduction
+      : (settings.liveApiKeyOptionsSandbox ?? settings.liveApiKeyOptions))
+    ?? (env === 'production'
+      ? process.env['TRADIER_API_TOKEN']
+      : (process.env['TRADIER_SANDBOX_API_TOKEN'] ?? process.env['TRADIER_API_TOKEN']))
+    ?? ''
+  ).trim();
+  const accountId = (
+    (env === 'production'
+      ? settings.liveAccountIdOptionsProduction
+      : (settings.liveAccountIdOptionsSandbox ?? settings.liveAccountIdOptions))
+    ?? (env === 'production'
+      ? process.env['TRADIER_ACCOUNT_ID']
+      : (process.env['TRADIER_SANDBOX_ACCOUNT_ID'] ?? process.env['TRADIER_ACCOUNT_ID']))
+    ?? ''
+  ).trim();
+  if (!apiToken || !accountId) return null;
+  return new TradierOptionsClient(apiToken, accountId, env);
+}
+
 // TRA-229 — start/stop are scoped to the dashboard's current account mode
 // (demo or live) so a user can run live trading while leaving demo paused, or
 // vice versa. The mode is taken from saved settings; clients can also pass an
@@ -1108,8 +1144,52 @@ app.post('/api/positions/:id/close', requireAuth, async (req, res) => {
 });
 
 app.post('/api/options/:id/close', requireAuth, async (req, res) => {
+  const username = res.locals['authUser'] as string;
   const ctx = await userCtx(res);
   const { id } = req.params as Record<string, string>;
+
+  // TRA-323 — imported Tradier positions don't share the local paper-cash
+  // bucket; closing them through `manualCloseOption` would no-op (the
+  // method explicitly skips `importedFromTradier` rows). Detect that case
+  // first, submit a real `sell_to_close` order to Tradier in the
+  // position's env, and only drop the local row once the broker accepted
+  // the order. Failures bubble back as a 502 so the UI can surface the
+  // reason instead of silently leaving a stuck row.
+  const imported = ctx.engine.findImportedOption(id);
+  if (imported) {
+    const settings = getSettings(username);
+    const client = buildTradierOptionsClientForEnv(settings, imported.env);
+    if (!client) {
+      res.status(409).json({
+        error: `No Tradier credentials saved for ${imported.env} — set them in Settings before closing imported positions.`,
+      });
+      return;
+    }
+    const optionSymbol = imported.position.optionSymbol;
+    const contracts = imported.position.contractsRemaining;
+    if (!optionSymbol || contracts <= 0) {
+      res.status(409).json({ error: 'Imported position is missing OCC symbol or contracts' });
+      return;
+    }
+    try {
+      const order = await client.sellContracts(optionSymbol, contracts);
+      console.log(
+        `[tradier-import] sell_to_close ${optionSymbol} qty=${contracts} env=${imported.env} order=${order.id} status=${order.status}`,
+      );
+    } catch (err: unknown) {
+      const message = err instanceof Error ? err.message : String(err);
+      console.error(
+        `[tradier-import] sell_to_close failed for ${optionSymbol} (${imported.env}): ${message}`,
+      );
+      res.status(502).json({ error: `Tradier rejected the close order: ${message}` });
+      return;
+    }
+    ctx.engine.dropImportedOption(id);
+    broadcastEngineState(ctx);
+    res.json({ ok: true, imported: true });
+    return;
+  }
+
   const closed = ctx.engine.manualCloseOption(id);
   if (!closed) {
     res.status(404).json({ error: 'Option position not found' });
@@ -1117,6 +1197,57 @@ app.post('/api/options/:id/close', requireAuth, async (req, res) => {
   }
   broadcastEngineState(ctx);
   res.json({ ok: true });
+});
+
+/**
+ * TRA-323 — sync open option positions from Tradier into the local options
+ * store so the user can manage them from TradeAI's Open Options view. Used
+ * primarily for Sandbox (where the user opens positions on Tradier's web UI
+ * and wants to close them through TradeAI), but the same flow works in
+ * production. The env defaults to whichever the user has selected for
+ * options live mode (`liveTradierEnvOptions`); a `?env=...` query param
+ * lets the UI override it explicitly.
+ *
+ * Returns a count summary so the caller can render "synced N positions"
+ * feedback. Failures pre-empt with a clear error rather than silently
+ * leaving an empty list — the UI distinguishes "no creds" from "broker
+ * returned no positions" from "we hit a network error".
+ */
+app.post('/api/tradier/positions/sync', requireAuth, async (req, res) => {
+  const username = res.locals['authUser'] as string;
+  const ctx = await userCtx(res);
+  const settings = getSettings(username);
+  const envParam = typeof req.query['env'] === 'string' ? req.query['env'] : undefined;
+  const env: TradierEnv =
+    envParam === 'production' || envParam === 'sandbox'
+      ? envParam
+      : (settings.liveTradierEnvOptions ?? 'sandbox');
+
+  const client = buildTradierOptionsClientForEnv(settings, env);
+  if (!client) {
+    res.status(409).json({
+      error: `No Tradier credentials saved for ${env} — set them in Settings before syncing.`,
+    });
+    return;
+  }
+
+  let positions;
+  try {
+    positions = await client.listOpenOptionPositions();
+  } catch (err: unknown) {
+    const message = err instanceof Error ? err.message : String(err);
+    console.error(`[tradier-import] list positions failed (${env}): ${message}`);
+    res.status(502).json({ error: `Tradier list-positions failed: ${message}` });
+    return;
+  }
+
+  // TRA-323 — imported rows are stamped with the position's mode so the
+  // dashboard's mode-scoped views can find them. We attribute them to
+  // 'live' since that's where Tradier-mirrored activity belongs; the demo
+  // dashboard never owns Tradier positions.
+  const summary = ctx.engine.reconcileTradierPositions(env, positions, 'live');
+  broadcastEngineState(ctx);
+  res.json({ ok: true, env, ...summary });
 });
 
 /**

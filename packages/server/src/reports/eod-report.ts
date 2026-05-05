@@ -48,6 +48,11 @@ function strategyLabel(t: SignalType): EodTradeEntry['strategy'] {
     case 'swing_trade': return 'Swing';
     case 'otm_mispricing': return 'OTM';
     case 'relative_value': return 'RV';
+    // TRA-323 — imported Tradier positions don't trade through the local
+    // engine, so they never reach the EOD trade exporter. Map to a label
+    // for completeness (and to keep the switch exhaustive); this label is
+    // never emitted to disk in practice.
+    case 'tradier_import': return 'Tradier';
   }
 }
 

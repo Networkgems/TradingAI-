@@ -1,4 +1,5 @@
 import { randomUUID } from 'crypto';
+import type { TradierOpenOptionPosition } from '@trading-app/engine';
 import type {
   AccountMode,
   TradeSignal,
@@ -485,6 +486,11 @@ export class PaperOptionsAccount {
 
     for (const [id, opt] of this.openOptions) {
       if (mode !== undefined && (opt.mode ?? 'demo') !== mode) continue;
+      // TRA-323 — imported Tradier positions are user-closed only. The local
+      // engine doesn't own their entry premium, TP/SL schedule, or the cash
+      // bucket; auto-exiting them would create phantom realized P&L on the
+      // paper account while the position is still open on Tradier's books.
+      if (opt.importedFromTradier) continue;
       const liveMark = opt.optionSymbol ? optionMarks?.get(opt.optionSymbol) : undefined;
       let mark: number;
       if (typeof liveMark === 'number' && liveMark > 0) {
@@ -585,9 +591,137 @@ export class PaperOptionsAccount {
     return closed;
   }
 
+  /**
+   * TRA-323 — sync open option positions held in Tradier into this paper
+   * account so the user can see and close them from TradeAI's Open Options
+   * view. Used when a position was opened directly on Tradier (e.g. on the
+   * broker's Sandbox web UI) and the engine has no local record of it.
+   *
+   * Reconciliation rules:
+   *   • Match against existing imported positions by `optionSymbol`. If
+   *     the contract count or per-share premium changed (partial fill /
+   *     adjustment), update the in-place row rather than orphaning the
+   *     old one.
+   *   • Engine-opened positions (not flagged `importedFromTradier`) are
+   *     left untouched even when they share an OCC symbol with a Tradier
+   *     row — the engine's mirror path already tracks those, and we don't
+   *     want to double-count.
+   *   • Imported positions whose OCC symbol no longer appears in Tradier's
+   *     payload are dropped (the user closed them on Tradier — there's
+   *     nothing left for TradeAI to close locally).
+   *   • No cash is debited / credited: the imported position lives on
+   *     Tradier's books, not the local paper bucket. The daily counter is
+   *     not bumped either — imports aren't "today's trades".
+   *
+   * Returns a summary of what changed so the caller can log / surface it.
+   */
+  reconcileTradierPositions(
+    positions: readonly TradierOpenOptionPosition[],
+    mode: AccountMode = 'live',
+  ): { added: number; updated: number; removed: number; total: number } {
+    const tradierBySymbol = new Map<string, TradierOpenOptionPosition>();
+    for (const p of positions) tradierBySymbol.set(p.optionSymbol, p);
+
+    let added = 0;
+    let updated = 0;
+    let removed = 0;
+
+    // Drop imported positions Tradier no longer reports (closed elsewhere).
+    for (const [id, opt] of this.openOptions) {
+      if (!opt.importedFromTradier) continue;
+      if (!opt.optionSymbol) continue;
+      if (!tradierBySymbol.has(opt.optionSymbol)) {
+        this.openOptions.delete(id);
+        removed += 1;
+      }
+    }
+
+    for (const incoming of positions) {
+      const existing = Array.from(this.openOptions.values()).find(
+        o => o.optionSymbol === incoming.optionSymbol,
+      );
+      if (existing) {
+        if (!existing.importedFromTradier) {
+          // Engine-opened position covers this OCC symbol — skip so we
+          // don't conflict with the engine's own bookkeeping.
+          continue;
+        }
+        const contractsChanged = existing.contracts !== incoming.contracts;
+        const premiumChanged = Math.abs(existing.premiumPaid - incoming.premiumPaid) > 1e-6;
+        if (contractsChanged || premiumChanged) {
+          existing.contracts = incoming.contracts;
+          existing.contractsRemaining = incoming.contracts;
+          existing.premiumPaid = incoming.premiumPaid;
+          // Mark current premium as the entry premium until a fresh quote
+          // refreshes it — better than zero or stale data.
+          existing.currentPremium = incoming.premiumPaid;
+          existing.peakPremium = Math.max(existing.peakPremium, incoming.premiumPaid);
+          updated += 1;
+        }
+        continue;
+      }
+
+      const position: OptionPosition = {
+        id: randomUUID(),
+        symbol: incoming.underlying,
+        optionSymbol: incoming.optionSymbol,
+        optionType: incoming.optionType,
+        strike: incoming.strike,
+        expiration: incoming.expiration,
+        contracts: incoming.contracts,
+        contractsRemaining: incoming.contracts,
+        premiumPaid: incoming.premiumPaid,
+        currentPremium: incoming.premiumPaid,
+        // Sentinels chosen so `checkExits()` never auto-fires on imported
+        // positions — the user closes them manually. tp1 above any plausible
+        // mark, SL at 0 (a contract can't trade below zero), trailing stop
+        // also at 0 even if it ever activated.
+        tp1Premium: Number.POSITIVE_INFINITY,
+        tp1Hit: false,
+        stopLossPremium: 0,
+        peakPremium: incoming.premiumPaid,
+        trailingActive: false,
+        trailingStopPremium: 0,
+        underlyingEntryPrice: 0,
+        openedAt: incoming.acquiredAt,
+        signalId: `tradier-import-${incoming.optionSymbol}`,
+        signalType: 'tradier_import',
+        mode,
+        importedFromTradier: true,
+        ...(this.tradierEnv ? { tradierEnv: this.tradierEnv } : {}),
+      };
+      this.openOptions.set(position.id, position);
+      added += 1;
+    }
+
+    return { added, updated, removed, total: positions.length };
+  }
+
+  /**
+   * TRA-323 — drop a Tradier-imported position from the local store
+   * without touching cash, P&L, or closed-history. Used after a successful
+   * `sell_to_close` was placed on Tradier so the row disappears from the
+   * Open Options view immediately rather than waiting for the next
+   * reconcile sweep. Returns the dropped position (or `null` when the id
+   * didn't match an imported row), so the caller can log the close.
+   */
+  dropImportedPosition(optionId: string): OptionPosition | null {
+    const opt = this.openOptions.get(optionId);
+    if (!opt) return null;
+    if (!opt.importedFromTradier) return null;
+    this.openOptions.delete(optionId);
+    return { ...opt };
+  }
+
   closeOption(optionId: string): OptionPosition | null {
     const opt = this.openOptions.get(optionId);
     if (!opt) return null;
+    // TRA-323 — imported Tradier positions don't share the paper cash
+    // bucket, so closing them through this path would double-count the
+    // proceeds. The server-level close handler routes those through
+    // `dropImportedPosition` after submitting a real `sell_to_close`
+    // order to Tradier; refusing here is a defensive guard.
+    if (opt.importedFromTradier) return null;
     const mark = opt.currentPremium;
     const remainingContracts = opt.contractsRemaining;
     const pnl = (mark - opt.premiumPaid) * remainingContracts * 100;

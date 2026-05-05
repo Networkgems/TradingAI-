@@ -69,6 +69,59 @@ interface TradierRawQuote {
   last?: number;
 }
 
+/**
+ * TRA-323 — Tradier `/accounts/{id}/positions` envelope. Tradier returns
+ * `positions: 'null'` (the literal string) when the account has no open
+ * positions, a single `position` object when there's one, or an array when
+ * there are several. We normalize all three via {@link asArray}.
+ */
+interface TradierPositionsEnvelope {
+  positions?: { position?: TradierRawPosition | TradierRawPosition[] } | string | null;
+}
+
+/**
+ * TRA-323 — raw shape of a single Tradier position. `symbol` is the OCC
+ * option symbol (e.g. `SPY240315P00500000`) for option contracts and the
+ * underlying ticker for equities. `quantity` is in contracts for options
+ * and shares for equities; Tradier surfaces it as a positive number for
+ * long positions and negative for shorts. `cost_basis` is the total cost
+ * of the position (per-share × qty × 100 for options) — we divide by the
+ * contract multiplier to recover the per-share premium paid.
+ */
+interface TradierRawPosition {
+  symbol: string;
+  quantity: number;
+  cost_basis: number;
+  date_acquired: string;
+  id?: number;
+}
+
+/**
+ * TRA-323 — open option position imported from Tradier. Holds the
+ * minimum information the local store needs to display the position and
+ * later submit a `sell_to_close` order. Equity positions are skipped at
+ * the parser layer because the engine only supports closing options
+ * through this code path.
+ */
+export interface TradierOpenOptionPosition {
+  /** OCC option symbol — `[A-Z]{1-6}YYMMDD[CP]\d{8}`. */
+  optionSymbol: string;
+  /** Underlying ticker parsed from the OCC symbol. */
+  underlying: string;
+  optionType: 'call' | 'put';
+  strike: number;
+  /** ISO `YYYY-MM-DD` expiration date parsed from the OCC symbol. */
+  expiration: string;
+  /** Number of contracts open. Always positive — short legs are skipped. */
+  contracts: number;
+  /** Per-share premium paid (cost basis ÷ contracts ÷ 100). */
+  premiumPaid: number;
+  /** When Tradier acquired the position (ms epoch); falls back to `Date.now()`. */
+  acquiredAt: number;
+  /** Tradier's numeric position id, when the API surfaces one. */
+  tradierPositionId?: number;
+}
+
 interface TradierBalancesEnvelope {
   balances?: {
     account_number?: string;
@@ -270,6 +323,27 @@ export class TradierOptionsClient extends TradierOrderClient {
     return { totalEquity, totalCash, optionBuyingPower };
   }
 
+  /**
+   * TRA-323 — list open option positions held in the configured Tradier
+   * account. Used by the server-side reconcile path to import positions
+   * that were opened directly on Tradier (e.g. on the broker's web UI in
+   * Sandbox) into the local TradeAI options store so the user can close
+   * them from TradeAI's own Open Options view. Returns `[]` when Tradier
+   * has no positions or when the request fails — we'd rather show "no
+   * synced positions" than poison the local store with a stale list.
+   *
+   * Equity positions held in the same account are dropped at the parser
+   * because the existing close path only routes options orders through
+   * `sell_to_close`. A future ticket can extend this to equities if the
+   * Sandbox account ever holds stocks.
+   */
+  async listOpenOptionPositions(): Promise<TradierOpenOptionPosition[]> {
+    const data = await this.getJson<TradierPositionsEnvelope>(
+      `/accounts/${encodeURIComponent(this.accountId)}/positions`,
+    );
+    return parseTradierPositions(data);
+  }
+
   /** Submit a market order to buy option contracts (open). */
   async buyContracts(optionSymbol: string, qty: number): Promise<TradierOrderResponse> {
     return this.postOrder(this.optionOrderBody(optionSymbol, qty, 'buy_to_open'));
@@ -305,4 +379,79 @@ export class TradierOptionsClient extends TradierOrderClient {
 export function underlyingFromOcc(occ: string): string {
   const match = /^([A-Z]+)/.exec(occ);
   return match ? match[1] : occ;
+}
+
+/**
+ * TRA-323 — decode an OCC option symbol into its components, or return
+ * `null` when the symbol isn't an OCC option (i.e. an equity ticker on
+ * the same Tradier account, which we drop at the parser).
+ */
+export function parseOccSymbol(occ: string): {
+  underlying: string;
+  optionType: 'call' | 'put';
+  strike: number;
+  expiration: string;
+} | null {
+  // OCC: ROOT (1-6 chars) + YYMMDD + C/P + 8 digit strike (in thousandths of $).
+  const match = /^([A-Z]{1,6})(\d{2})(\d{2})(\d{2})([CP])(\d{8})$/.exec(occ);
+  if (!match) return null;
+  const [, underlying, yy, mm, dd, cp, strikeRaw] = match;
+  const yearNum = Number(yy);
+  if (!Number.isFinite(yearNum)) return null;
+  // OCC year is 2-digit. Tradier symbols generated post-2000 — pivoting on
+  // 1970 keeps it future-proof for ~50 years.
+  const year = yearNum >= 70 ? 1900 + yearNum : 2000 + yearNum;
+  const expiration = `${year.toString().padStart(4, '0')}-${mm}-${dd}`;
+  const strike = Number(strikeRaw) / 1000;
+  if (!Number.isFinite(strike) || strike <= 0) return null;
+  return {
+    underlying,
+    optionType: cp === 'C' ? 'call' : 'put',
+    strike,
+    expiration,
+  };
+}
+
+/**
+ * TRA-323 — normalise the Tradier `/accounts/{id}/positions` envelope into
+ * a list of open option positions. Exported so unit tests can exercise the
+ * parser without mocking `fetch`. Drops equity positions, short option
+ * legs, and any row whose OCC symbol or quantity / cost basis can't be
+ * parsed — we'd rather omit a row than display garbage in the UI.
+ */
+export function parseTradierPositions(
+  envelope: TradierPositionsEnvelope | null,
+): TradierOpenOptionPosition[] {
+  if (!envelope || typeof envelope.positions !== 'object' || envelope.positions == null) {
+    return [];
+  }
+  const out: TradierOpenOptionPosition[] = [];
+  for (const raw of asArray(envelope.positions.position)) {
+    if (typeof raw.symbol !== 'string') continue;
+    if (typeof raw.quantity !== 'number' || !Number.isFinite(raw.quantity) || raw.quantity <= 0) {
+      // Drop short legs (negative quantity) and zero rows. The existing
+      // close path only supports `sell_to_close` for long options.
+      continue;
+    }
+    const occ = parseOccSymbol(raw.symbol);
+    if (!occ) continue;
+    if (typeof raw.cost_basis !== 'number' || !Number.isFinite(raw.cost_basis) || raw.cost_basis <= 0) {
+      continue;
+    }
+    const premiumPaid = raw.cost_basis / raw.quantity / 100;
+    if (!Number.isFinite(premiumPaid) || premiumPaid <= 0) continue;
+    const acquiredMs = Date.parse(`${raw.date_acquired}`);
+    out.push({
+      optionSymbol: raw.symbol,
+      underlying: occ.underlying,
+      optionType: occ.optionType,
+      strike: occ.strike,
+      expiration: occ.expiration,
+      contracts: raw.quantity,
+      premiumPaid,
+      acquiredAt: Number.isFinite(acquiredMs) ? acquiredMs : Date.now(),
+      ...(typeof raw.id === 'number' ? { tradierPositionId: raw.id } : {}),
+    });
+  }
+  return out;
 }
