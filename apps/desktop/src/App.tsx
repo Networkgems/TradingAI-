@@ -941,7 +941,6 @@ function signalLabel(type: string) {
     case 'swing_trade': return 'Swing';
     case 'relative_value': return 'Relative Value';
     case 'otm_mispricing': return 'OTM Mispricing';
-    case 'tradier_import': return 'Tradier Import';
     default: return type;
   }
 }
@@ -1201,12 +1200,6 @@ function Dashboard({ token, onLogout, onGoHome, onActivity, theme, onToggleTheme
   const [watchlistError, setWatchlistError] = useState('');
   const [scanning, setScanning] = useState(false);
   const [scanStatus, setScanStatus] = useState('');
-  // TRA-323 — Tradier-positions sync state. Drives the "Sync Tradier
-  // positions" button label, disabled state, and the toast that confirms
-  // how many rows changed on the last sync.
-  const [tradierSyncing, setTradierSyncing] = useState(false);
-  const [tradierSyncStatus, setTradierSyncStatus] = useState('');
-  const tradierSyncStatusTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
   const wsRef = useRef<WebSocket | null>(null);
   const reconnectTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
   const scanStatusTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
@@ -1328,56 +1321,10 @@ function Dashboard({ token, onLogout, onGoHome, onActivity, theme, onToggleTheme
   }
 
   async function closeOption(optionId: string) {
-    const r = await fetch(`${HTTP_URL}/api/options/${optionId}/close`, {
+    await fetch(`${HTTP_URL}/api/options/${optionId}/close`, {
       method: 'POST',
       headers: { Authorization: `Bearer ${token}` },
-    }).catch(() => null);
-    // TRA-323 — surface broker-side rejection (sell_to_close failed) instead
-    // of silently leaving the row stuck on the board. Successful closes
-    // already vanish from the WS state broadcast on the next tick.
-    if (r && !r.ok) {
-      const data = await r.json().catch(() => ({} as { error?: string }));
-      const message = data?.error ?? `Close failed (${r.status})`;
-      setTradierSyncStatus(`Close failed: ${message}`);
-      if (tradierSyncStatusTimer.current) clearTimeout(tradierSyncStatusTimer.current);
-      tradierSyncStatusTimer.current = setTimeout(() => setTradierSyncStatus(''), 6000);
-    }
-  }
-
-  // TRA-323 — pull open option positions from Tradier into TradeAI so the
-  // user can close them from here. Defaults to whichever Tradier env is
-  // currently selected (sandbox / production); the server-side handler
-  // routes the import into the matching env bucket.
-  async function syncTradierPositions() {
-    setTradierSyncing(true);
-    try {
-      const r = await fetch(
-        `${HTTP_URL}/api/tradier/positions/sync?env=${encodeURIComponent(tradierEnv)}`,
-        { method: 'POST', headers: { Authorization: `Bearer ${token}` } },
-      );
-      const data = await r.json().catch(() => ({} as { error?: string; added?: number; updated?: number; removed?: number; total?: number }));
-      if (!r.ok) {
-        setTradierSyncStatus(data?.error ?? `Sync failed (${r.status})`);
-      } else {
-        const added = data.added ?? 0;
-        const updated = data.updated ?? 0;
-        const removed = data.removed ?? 0;
-        const total = data.total ?? 0;
-        if (total === 0) {
-          setTradierSyncStatus(`Tradier ${tradierEnv}: no open positions`);
-        } else {
-          setTradierSyncStatus(
-            `Synced ${total} Tradier ${tradierEnv} position(s): +${added} new, ~${updated} updated, −${removed} closed`,
-          );
-        }
-      }
-    } catch (err) {
-      setTradierSyncStatus(`Sync error: ${err instanceof Error ? err.message : String(err)}`);
-    } finally {
-      setTradierSyncing(false);
-      if (tradierSyncStatusTimer.current) clearTimeout(tradierSyncStatusTimer.current);
-      tradierSyncStatusTimer.current = setTimeout(() => setTradierSyncStatus(''), 6000);
-    }
+    }).catch(() => {});
   }
 
   async function addToStocksWatchlist() {
@@ -1790,23 +1737,6 @@ function Dashboard({ token, onLogout, onGoHome, onActivity, theme, onToggleTheme
 
         {state && tab === 'options' && (
           <div className="positions-panel">
-            {/* TRA-323 — let the user pull open option positions from Tradier
-                into TradeAI so they can be closed from here. The button targets
-                the Tradier env currently selected in Settings (sandbox or
-                production); the toast that follows reports the count summary. */}
-            <div style={{ display: 'flex', alignItems: 'center', gap: '0.75rem', marginBottom: '0.75rem', flexWrap: 'wrap' }}>
-              <button
-                className="btn-secondary"
-                onClick={syncTradierPositions}
-                disabled={tradierSyncing}
-                title={`Pull open option positions from Tradier ${tradierEnv} into TradeAI`}
-              >
-                {tradierSyncing ? 'Syncing…' : `Sync Tradier ${tradierEnv} positions`}
-              </button>
-              {tradierSyncStatus && (
-                <span className="muted" style={{ fontSize: '0.85rem' }}>{tradierSyncStatus}</span>
-              )}
-            </div>
             {openOptions.length > 0 && (
               <>
                 <h3>Open Option Positions</h3>
@@ -1831,46 +1761,25 @@ function Dashboard({ token, onLogout, onGoHome, onActivity, theme, onToggleTheme
                       const pnlPct = ((o.currentPremium - o.premiumPaid) / o.premiumPaid) * 100;
                       const unrealized = (o.currentPremium - o.premiumPaid) * o.contractsRemaining * 100;
                       const pnlDollar = unrealized + (o.pnl ?? 0);
-                      // TRA-323 — imported Tradier positions don't have a
-                      // local TP/SL schedule (`tp1Premium = +Inf`, `SL = 0`)
-                      // and no live mark refresh wired up yet, so the P&L
-                      // and Trail/SL columns would render `Infinity`/garbage.
-                      // Render a clean "—" / "Tradier" treatment instead.
-                      const isImported = !!o.importedFromTradier;
                       return (
                         <tr key={o.id}>
-                          <td className="symbol">
-                            {o.symbol}
-                            {isImported && (
-                              <span
-                                className="muted"
-                                title="Imported from Tradier — closing here will submit a sell-to-close order on Tradier"
-                                style={{ marginLeft: '0.4rem', fontSize: '0.75rem' }}
-                              >
-                                (Tradier)
-                              </span>
-                            )}
-                          </td>
+                          <td className="symbol">{o.symbol}</td>
                           <td className={o.optionType === 'call' ? 'green' : 'red'}>
                             {o.optionType.toUpperCase()}
                           </td>
                           <td>{o.contracts}</td>
                           <td>${fmt(o.premiumPaid)}</td>
-                          <td className={isImported ? 'muted' : (pnlPct >= 0 ? 'green' : 'red')}>
-                            {isImported ? '—' : `$${fmt(o.currentPremium)} (${fmtPct(pnlPct)})`}
+                          <td className={pnlPct >= 0 ? 'green' : 'red'}>
+                            ${fmt(o.currentPremium)} ({fmtPct(pnlPct)})
                           </td>
-                          <td className={isImported ? 'muted' : (pnlDollar >= 0 ? 'green' : 'red')}>
-                            {isImported ? '—' : fmtDollar(pnlDollar)}
+                          <td className={pnlDollar >= 0 ? 'green' : 'red'}>{fmtDollar(pnlDollar)}</td>
+                          <td className={o.trailingActive ? 'green' : 'muted'}>
+                            {o.trailingActive ? 'TRAILING' : 'OPEN'}
                           </td>
-                          <td className={isImported ? 'muted' : (o.trailingActive ? 'green' : 'muted')}>
-                            {isImported ? 'TRADIER' : (o.trailingActive ? 'TRAILING' : 'OPEN')}
-                          </td>
-                          <td className={isImported ? 'muted' : 'red'}>
-                            {isImported
-                              ? '—'
-                              : o.trailingActive
-                                ? `$${fmt(o.trailingStopPremium)} (trail)`
-                                : `$${fmt(o.stopLossPremium)} (SL)`}
+                          <td className="red">
+                            {o.trailingActive
+                              ? `$${fmt(o.trailingStopPremium)} (trail)`
+                              : `$${fmt(o.stopLossPremium)} (SL)`}
                           </td>
                           <td>{signalLabel(o.signalType)}</td>
                           <td className="muted">{formatTime(o.openedAt)}</td>
