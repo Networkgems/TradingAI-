@@ -4,6 +4,16 @@ import { randomUUID } from 'crypto';
 
 const INITIAL_EQUITY = 25_000;
 
+/**
+ * TRA-330 — runaway-equity tripwire. The user-facing demo equity is hard-capped
+ * to $10M by `clampEquity` in `index.ts`; 10x that ceiling is the cheapest
+ * canary value that distinguishes "user typed a big number" from "internal
+ * accounting blew up". When `enforceEquityInvariant` sees equity OR cash beyond
+ * this on either side it rebases the account to the configured demo equity and
+ * logs the breach so the offending path leaves a paper trail.
+ */
+export const CRYPTO_MAX_EQUITY = 100_000_000;
+
 export class CryptoPaperAccount {
   private equity: number;
   private cash: number;
@@ -115,12 +125,26 @@ export class CryptoPaperAccount {
       return null;
     }
     const cost = currentPrice * qty;
-    if (cost > this.cash) {
+    // TRA-330 — shorts collateralise against equity, not spot cash: opening a
+    // short receives `cost` as proceeds rather than spending it, so the spot
+    // `cost > cash` gate never applied to them. Pre-fix the gate ran for shorts
+    // anyway (they took the same `cash -= cost` path as longs), which let cash
+    // and equity drift apart on every short cycle and eventually inflated demo
+    // equity into the billions. Longs keep the spot gate; shorts use the
+    // managedEquity sizing cap above as their margin floor.
+    if (signal.side === 'buy' && cost > this.cash) {
       console.warn(`[crypto-account] skip ${signal.symbol} ${signal.type}: cost=${cost.toFixed(2)} > cash=${this.cash.toFixed(2)} (existing positions consuming cash)`);
       return null;
     }
 
-    this.cash -= cost;
+    if (signal.side === 'buy') {
+      this.cash -= cost;
+    } else {
+      // Short proceeds land in cash; the buyback at close subtracts the exit
+      // notional. Net cash change over open+close = (entry − exit) × qty,
+      // which is exactly the short's PnL, keeping cash and equity in lock-step.
+      this.cash += cost;
+    }
     const position: Position = {
       id: randomUUID(),
       symbol: signal.symbol,
@@ -158,7 +182,10 @@ export class CryptoPaperAccount {
         pos.pnl = pnl;
         pos.closedAt = Date.now();
         pos.exitPrice = exitPrice;
-        this.cash += exitPrice * pos.quantity;
+        // TRA-330 — symmetric short fix: longs sell on close (cash += notional),
+        // shorts buy back on close (cash -= notional).
+        if (pos.side === 'buy') this.cash += exitPrice * pos.quantity;
+        else this.cash -= exitPrice * pos.quantity;
         this.equity += pnl;
         this.positions.delete(id);
         closed.push({ ...pos });
@@ -175,7 +202,9 @@ export class CryptoPaperAccount {
     pos.pnl = pnl;
     pos.exitPrice = currentPrice;
     pos.closedAt = Date.now();
-    this.cash += currentPrice * pos.quantity;
+    // TRA-330 — match the short cash flow fix in checkExits.
+    if (pos.side === 'buy') this.cash += currentPrice * pos.quantity;
+    else this.cash -= currentPrice * pos.quantity;
     this.equity += pnl;
     this.positions.delete(positionId);
     return { ...pos };
@@ -189,6 +218,37 @@ export class CryptoPaperAccount {
     return Array.from(this.positions.values()).some(
       p => p.symbol === symbol && p.signalType === signalType,
     );
+  }
+
+  /**
+   * TRA-330 — runtime tripwire against the runaway-equity drift seen in prod
+   * (cash $2.5B, equity ~$6.8B on a $25k demo account). When the in-memory
+   * equity OR cash exits the [-CRYPTO_MAX_EQUITY, CRYPTO_MAX_EQUITY] envelope
+   * we log loudly with the breach values, clear open positions, and rebase
+   * equity/cash/openingEquityToday/initialEquity to `rebaseTarget`. Returns
+   * true when a rebase happened so callers can persist the corrected state
+   * (and skip downstream work that would re-corrupt the snapshot).
+   *
+   * Cheap: O(1), called once per tick. The threshold (10x the user-facing
+   * `clampEquity` ceiling of $10M) is wide enough to never trip on legitimate
+   * settings but tight enough to catch the $2.5B class of drift before it
+   * suppresses every signal via `cost > cash`.
+   */
+  enforceEquityInvariant(rebaseTarget: number): boolean {
+    const equityBreach = Math.abs(this.equity) > CRYPTO_MAX_EQUITY;
+    const cashBreach = Math.abs(this.cash) > CRYPTO_MAX_EQUITY;
+    if (!equityBreach && !cashBreach) return false;
+    console.warn(
+      `[crypto-account] INVARIANT BREACH equity=${this.equity.toFixed(2)} cash=${this.cash.toFixed(2)} `
+      + `positions=${this.positions.size} initialEquity=${this.initialEquity.toFixed(2)} `
+      + `(>${CRYPTO_MAX_EQUITY}); rebasing to ${rebaseTarget}`,
+    );
+    this.initialEquity = rebaseTarget;
+    this.equity = rebaseTarget;
+    this.cash = rebaseTarget;
+    this.openingEquityToday = rebaseTarget;
+    this.positions.clear();
+    return true;
   }
 
   /** Serialize current state for durable storage (TRA-140). */

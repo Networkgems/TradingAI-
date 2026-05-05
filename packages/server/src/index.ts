@@ -44,6 +44,7 @@ import {
   runTra237OptionsReset,
   runTra241CalendarReset,
   runTra301DemoFreshStart,
+  runTra330CryptoEquityReset,
   initAllUserContexts,
   initUserContext,
   ensureUserContext,
@@ -148,6 +149,11 @@ await runTra241CalendarReset();
 // so the dashboards open clean on the new strategies. Runs before context
 // bootstrap so engines load empty. Idempotent via marker file.
 await runTra301DemoFreshStart();
+// TRA-330 — one-shot crypto equity reset: prod demo crypto accounts drifted
+// into the billions because of a short cash-flow accounting bug. The bug
+// itself is fixed in crypto-account.ts; this migration clears the persisted
+// snapshots that already loaded the bad state. Crypto-only, idempotent.
+await runTra330CryptoEquityReset();
 await initAllUserContexts();
 
 // TRA-227 — drop a placeholder QuantTrader research report so the Stocks

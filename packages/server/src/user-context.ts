@@ -366,6 +366,53 @@ async function clearReportsTree(dir: string): Promise<number> {
   return removed;
 }
 
+/**
+ * TRA-330 — one-shot crypto-only equity reset. The demo crypto account drifted
+ * into the billions in prod (cash $2.52B, sized cost $3.44B on a $25k-capped
+ * account) because the short cash-flow path mis-tracked sells. The runtime
+ * invariant in `crypto-account.ts` will catch any future drift, but the
+ * already-corrupt persisted snapshots need to be cleared once so the engines
+ * don't import the bad state on the next boot.
+ *
+ * Narrower than TRA-301: only crypto state (`crypto/equity-state.json`,
+ * `crypto/daily-snapshots.json`, `trades-crypto.json`, `crypto-reports/`).
+ * Stocks state is untouched. Idempotent via marker `.tra-330-crypto-reset`.
+ */
+export async function runTra330CryptoEquityReset(): Promise<void> {
+  const markerFile = join(DATA_DIR, '.tra-330-crypto-reset');
+  if (existsSync(markerFile)) return;
+
+  let userCount = 0;
+  let fileCount = 0;
+
+  for (const u of getAllUsers()) {
+    const dir = userDataDir(u.username);
+    if (!existsSync(dir)) continue;
+    try {
+      for (const filePath of [
+        join(dir, 'crypto', 'equity-state.json'),
+        join(dir, 'crypto', 'daily-snapshots.json'),
+        join(dir, 'trades-crypto.json'),
+      ]) {
+        if (!existsSync(filePath)) continue;
+        try {
+          await unlink(filePath);
+          fileCount += 1;
+        } catch (err: unknown) {
+          console.warn(`[migration TRA-330] could not remove ${filePath}: ${err instanceof Error ? err.message : String(err)}`);
+        }
+      }
+      fileCount += await clearReportsTree(join(dir, 'crypto-reports'));
+      userCount += 1;
+    } catch (err: unknown) {
+      console.warn(`[migration TRA-330] reset failed for ${u.username}: ${err instanceof Error ? err.message : String(err)}`);
+    }
+  }
+
+  await writeFile(markerFile, new Date().toISOString(), 'utf-8');
+  console.log(`[migration TRA-330] complete — wiped ${fileCount} crypto-state file(s) for ${userCount} user(s).`);
+}
+
 export async function runTra301DemoFreshStart(): Promise<void> {
   const markerFile = join(DATA_DIR, '.tra-301-demo-fresh-start');
   if (existsSync(markerFile)) return;

@@ -325,6 +325,17 @@ export class CryptoSignalEngine {
   }
 
   /**
+   * TRA-330 — resolve the configured demo crypto starting equity, falling back
+   * to the legacy combined `demoEquity` and finally to the hardcoded $25k
+   * (matches the precedence in the constructor). Used by the runtime invariant
+   * to choose a rebase target without re-deriving it inline at every callsite.
+   */
+  private demoEquityTarget(): number {
+    const s = this.currentSettings;
+    return s ? (s.demoEquityCrypto ?? s.demoEquity ?? 25_000) : 25_000;
+  }
+
+  /**
    * Full reset — clears positions, signals, and resets equity to the configured
    * starting balance (NOT the persisted equity). Used by "Reset Demo Account".
    */
@@ -672,6 +683,19 @@ export class CryptoSignalEngine {
       }
       for (const h of this.handlers) h(this.buildState());
       return;
+    }
+
+    // TRA-330 — runtime tripwire. Runs before checkExits so a corrupt account
+    // can't keep emitting skipped signals or absurd PnL on the same tick that
+    // detects the breach. On rebase we also realign the persisted tracker so
+    // a restart doesn't read back the corrupted equity-state.json.
+    if (this.account.enforceEquityInvariant(this.demoEquityTarget())) {
+      if (this.tracker) {
+        const equity = this.account.getEquity();
+        this.tracker.setInitialEquity(equity);
+        this.tracker.saveEquity(equity, 0);
+        this.tracker.syncOpeningEquity(equity, 0);
+      }
     }
 
     const closed = this.account.checkExits(prices);
