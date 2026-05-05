@@ -68,3 +68,11 @@ services:
       # actually want to route real orders.
       - key: TRADIER_ENV
         sync: false
+      # TRA-324 — board-mandated live preset for the $180 real-money test
+      # (board decision on TRA-305, target 2026-05-06). Setting this gates
+      # all crypto strategies except bb_fade and restricts bb_fade to
+      # SOL-USD + DOGE-USD on both demo and live ticks. Unset (or set to a
+      # different value) reverts to the full 5-strategy roster — no code
+      # change required.
+      - key: LIVE_STRATEGY_PRESET
+        value: bb_fade_sol_doge_only

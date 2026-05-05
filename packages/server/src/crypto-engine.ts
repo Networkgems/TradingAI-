@@ -28,6 +28,20 @@ export type CryptoEngineEventHandler = (state: CryptoEngineState) => void;
 
 const MAX_SIGNALS = 50;
 const NEWS_REFRESH_MS = 5 * 60_000;
+
+/**
+ * TRA-324 — board-mandated live preset for the $180 real-money test (board
+ * decision on TRA-305, target 2026-05-06). When the
+ * `LIVE_STRATEGY_PRESET=bb_fade_sol_doge_only` env var is set:
+ *   • bb_fade only fires on SOL-USD + DOGE-USD
+ *   • swing, momentum, breakout_vol, mean_reversion are gated off everywhere
+ *
+ * Default (env unset) preserves the full 5-strategy roster so backtests/dev
+ * stay byte-identical to pre-324. Revert path = unset the env var (no code
+ * change) or revert this commit.
+ */
+const BB_FADE_ONLY_PRESET = process.env.LIVE_STRATEGY_PRESET === 'bb_fade_sol_doge_only';
+const BB_FADE_LIVE_SYMBOLS = new Set<string>(['SOL-USD', 'DOGE-USD']);
 /**
  * TRA-230 — drop signals from the displayed list once they're no longer
  * actionable. A signal becomes invalid when it ages past this window or when
@@ -674,13 +688,17 @@ export class CryptoSignalEngine {
         const dailyCandles = this.dailyCandleCache.get(sym) ?? [];
 
         // Evaluate each strategy independently with its own minimum bar requirement.
+        // TRA-324 — bb_fade-only preset: skip bb_fade for symbols outside
+        // SOL/DOGE, and skip swing + the regime router entirely. Default
+        // (env unset) preserves full 5-strategy behaviour.
         const bbFadeSignal = candles.length >= CryptoSignalEngine.MIN_BARS_BB_FADE
+          && (!BB_FADE_ONLY_PRESET || BB_FADE_LIVE_SYMBOLS.has(sym))
           ? this.bbFade.evaluate(sym, candles) : null;
-        const swingSignal = dailyCandles.length >= 205
+        const swingSignal = !BB_FADE_ONLY_PRESET && dailyCandles.length >= 205
           ? this.swing.evaluate(sym, dailyCandles) : null;
         // TRA-208: regime-aware router emits at most one momentum / breakout
         // / mean-reversion signal per tick.
-        const routerSignal = candles.length >= CryptoSignalEngine.MIN_BARS_ROUTER
+        const routerSignal = !BB_FADE_ONLY_PRESET && candles.length >= CryptoSignalEngine.MIN_BARS_ROUTER
           ? this.getRouter(sym).evaluate(sym, candles) : null;
 
         if (candles.length === 0) {
@@ -820,13 +838,18 @@ export class CryptoSignalEngine {
       const candles = this.candleCache.get(sym) ?? [];
       const dailyCandles = this.dailyCandleCache.get(sym) ?? [];
 
+      // TRA-324 — same bb_fade-only preset gate as the demo path. Live mode
+      // is the explicit target of the board's $180 test, so the preset
+      // *must* hold here; demo gets it too so verification on demo before
+      // flipping to live is meaningful.
       const bbFadeSignal = candles.length >= CryptoSignalEngine.MIN_BARS_BB_FADE
+        && (!BB_FADE_ONLY_PRESET || BB_FADE_LIVE_SYMBOLS.has(sym))
         ? this.bbFade.evaluate(sym, candles) : null;
-      const swingSignal = dailyCandles.length >= 205
+      const swingSignal = !BB_FADE_ONLY_PRESET && dailyCandles.length >= 205
         ? this.swing.evaluate(sym, dailyCandles) : null;
       // TRA-208: same router pipeline as the demo path so live and paper
       // produce identical regime-aware entries from the same regime state.
-      const routerSignal = candles.length >= CryptoSignalEngine.MIN_BARS_ROUTER
+      const routerSignal = !BB_FADE_ONLY_PRESET && candles.length >= CryptoSignalEngine.MIN_BARS_ROUTER
         ? this.getRouter(sym).evaluate(sym, candles) : null;
 
       for (const signal of [bbFadeSignal, swingSignal, routerSignal]) {
