@@ -221,16 +221,31 @@ export class PaperOptionsAccount {
     };
   }
 
-  private budgetPerTrade(): number {
-    return this.equity * this.managedAccountRatio * OPTIONS_BUDGET_RATIO;
+  private budgetPerTrade(equityOverride?: number): number {
+    const equity = equityOverride ?? this.equity;
+    return equity * this.managedAccountRatio * OPTIONS_BUDGET_RATIO;
   }
 
-  private otmBudgetPerTrade(): number {
-    return this.equity * this.managedAccountRatio * this.otmRiskParams.budgetRatio;
+  private otmBudgetPerTrade(equityOverride?: number): number {
+    const equity = equityOverride ?? this.equity;
+    return equity * this.managedAccountRatio * this.otmRiskParams.budgetRatio;
   }
 
-  private rvBudgetPerTrade(): number {
-    return this.equity * this.managedAccountRatio * this.rvRiskParams.budgetRatio;
+  private rvBudgetPerTrade(equityOverride?: number): number {
+    const equity = equityOverride ?? this.equity;
+    return equity * this.managedAccountRatio * this.rvRiskParams.budgetRatio;
+  }
+
+  /**
+   * TRA-332 — exposed so the signal engine can check whether a live-mode
+   * candidate would size to ≥1 contract before calling the open path. The
+   * paper account never sees the user's real Tradier equity (it's seeded from
+   * demo equity and not rebased on a live flip), so live sizing has to pass
+   * the live `optionBuyingPower` / `totalEquity` through here. Returns the
+   * dollar budget for an RV ticket given a hypothetical equity figure.
+   */
+  getRvBudgetForEquity(equity: number): number {
+    return equity * this.managedAccountRatio * this.rvRiskParams.budgetRatio;
   }
 
   private resetDayIfNeeded(): void {
@@ -265,7 +280,19 @@ export class PaperOptionsAccount {
    * tests / back-compat callers that don't care about the demo↔live split
    * still compile.
    */
-  openOptionFromCandidate(signal: OtmMispricingSignal, mode: AccountMode = 'demo'): OptionPosition | null {
+  openOptionFromCandidate(
+    signal: OtmMispricingSignal,
+    mode: AccountMode = 'demo',
+    /**
+     * TRA-332 — when supplied (live mode), size the position off this equity
+     * figure (the user's real Tradier `optionBuyingPower` / `totalEquity`)
+     * instead of `this.equity`, which is the paper account's stale demo
+     * equity. The paper-cash check is also skipped under an override since
+     * paper cash is bookkeeping only — the real buying-power constraint is
+     * enforced by the live mirror's pre-check in signal-engine.ts.
+     */
+    equityOverride?: number,
+  ): OptionPosition | null {
     this.resetDayIfNeeded();
 
     if (!isValidTradingWindow(Date.now())) return null;
@@ -280,13 +307,13 @@ export class PaperOptionsAccount {
     const premiumPaid = signal.mark;
     if (!Number.isFinite(premiumPaid) || premiumPaid <= 0) return null;
 
-    const budget = this.otmBudgetPerTrade();
+    const budget = this.otmBudgetPerTrade(equityOverride);
     const costPerContract = premiumPaid * 100;
     const contracts = Math.floor(budget / costPerContract);
     if (contracts <= 0) return null;
 
     const totalCost = contracts * costPerContract;
-    if (totalCost > this.cash) return null;
+    if (equityOverride === undefined && totalCost > this.cash) return null;
 
     this.cash -= totalCost;
     this.dailyOtmCount += 1;
@@ -337,7 +364,12 @@ export class PaperOptionsAccount {
    *   • sized contracts ≤ 0 or budget exceeded
    */
   /** TRA-231 — see {@link openOptionFromCandidate} for the `mode` stamp rationale. */
-  openOptionFromRvCandidate(signal: RelativeValueSignal, mode: AccountMode = 'demo'): OptionPosition | null {
+  openOptionFromRvCandidate(
+    signal: RelativeValueSignal,
+    mode: AccountMode = 'demo',
+    /** TRA-332 — see {@link openOptionFromCandidate} for the live-equity rationale. */
+    equityOverride?: number,
+  ): OptionPosition | null {
     this.resetDayIfNeeded();
 
     if (!isValidTradingWindow(Date.now())) return null;
@@ -351,13 +383,13 @@ export class PaperOptionsAccount {
     const premiumPaid = signal.mark;
     if (!Number.isFinite(premiumPaid) || premiumPaid <= 0) return null;
 
-    const budget = this.rvBudgetPerTrade();
+    const budget = this.rvBudgetPerTrade(equityOverride);
     const costPerContract = premiumPaid * 100;
     const contracts = Math.floor(budget / costPerContract);
     if (contracts <= 0) return null;
 
     const totalCost = contracts * costPerContract;
-    if (totalCost > this.cash) return null;
+    if (equityOverride === undefined && totalCost > this.cash) return null;
 
     this.cash -= totalCost;
     this.dailyRvCount += 1;

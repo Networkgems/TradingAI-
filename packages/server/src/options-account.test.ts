@@ -243,6 +243,79 @@ describe('PaperOptionsAccount.voidOpenOption (TRA-319)', () => {
   });
 });
 
+describe('PaperOptionsAccount — TRA-332 live equity override sizing', () => {
+  function buildRvSignal(overrides: Partial<RelativeValueSignal> = {}): RelativeValueSignal {
+    return {
+      id: 'rv-1',
+      symbol: 'AAPL',
+      type: 'relative_value',
+      side: 'buy',
+      entryPrice: 1.0,
+      stopLoss: 0.75,
+      takeProfit: 1.5,
+      riskRewardRatio: 2,
+      timestamp: TRADING_TIME,
+      optionSymbol: 'AAPL240705C00200000',
+      optionType: 'call',
+      strike: 200,
+      expiration: '2024-07-05',
+      mark: 1.0,
+      fairPrice: 1.30,
+      mispricingPct: -0.23,
+      zScore: -2.1,
+      ivFitted: 0.32,
+      ivUsed: 0.28,
+      delta: 0.18,
+      reason: 'cheap-vs-curve',
+      ...overrides,
+    };
+  }
+
+  it('sizes against equityOverride instead of paper equity in live mode', () => {
+    // Paper account seeded at $50 K (matches the demo equity that survives
+    // a live flip). Without the override, RV budget = $750 → 7 contracts at
+    // $100 each. With override = $2,000 → budget = $30 → 0 contracts.
+    const acct = new PaperOptionsAccount({ initialEquity: 50_000, managedAccountRatio: 0.5 });
+    const sig = buildRvSignal({ mark: 1.0 });
+
+    const pos = acct.openOptionFromRvCandidate(sig, 'live', 2000);
+    // 0 contracts → returns null. The fix is that this returns null on the
+    // LIVE figure, not the paper figure — preventing the engine from sizing
+    // a too-large position that TRA-319 would silently void downstream.
+    expect(pos).toBeNull();
+    expect(acct.getState().dailyOptionsCount).toBe(0);
+  });
+
+  it('opens positions sized off the override when the live equity supports it', () => {
+    const acct = new PaperOptionsAccount({ initialEquity: 50_000, managedAccountRatio: 0.5 });
+    // Override = $20 K → RV budget = 20_000 * 0.5 * 0.03 = $300 → 3 contracts.
+    const pos = acct.openOptionFromRvCandidate(buildRvSignal({ mark: 1.0 }), 'live', 20_000);
+    expect(pos).not.toBeNull();
+    expect(pos!.contracts).toBe(3);
+    expect(pos!.mode).toBe('live');
+  });
+
+  it('skips the paper-cash check under an override (paper cash is bookkeeping in live mode)', () => {
+    // initialEquity = $100 paper cash so the unconstrained sizing would
+    // overflow the paper account. The override should bypass that check —
+    // the real buying-power constraint is enforced upstream against
+    // Tradier's optionBuyingPower, not paper cash.
+    const acct = new PaperOptionsAccount({ initialEquity: 100, managedAccountRatio: 0.5 });
+    const pos = acct.openOptionFromRvCandidate(buildRvSignal({ mark: 1.0 }), 'live', 50_000);
+    expect(pos).not.toBeNull();
+    expect(pos!.contracts).toBeGreaterThan(0);
+  });
+
+  it('getRvBudgetForEquity reflects the configured managedRatio and budget ratio', () => {
+    const acct = new PaperOptionsAccount({ initialEquity: 50_000, managedAccountRatio: 0.5 });
+    // 300 * 0.5 * 0.03 = $4.50 (the original TRA-332 user's budget).
+    expect(acct.getRvBudgetForEquity(300)).toBeCloseTo(4.5, 5);
+    // Doubling managedRatio doubles the budget.
+    acct.updateConfig({ managedAccountRatio: 1.0 });
+    expect(acct.getRvBudgetForEquity(300)).toBeCloseTo(9, 5);
+  });
+});
+
 describe('PaperOptionsAccount.getStateForMode — per-mode P&L (TRA-246)', () => {
   it('attributes a live-mode auto-exit to the live bucket only (demo dashboard stays $0)', () => {
     const acct = new PaperOptionsAccount({ initialEquity: 50_000, managedAccountRatio: 0.5 });

@@ -764,9 +764,63 @@ export class SignalEngine {
         );
         if (recentDup) continue;
 
+        // TRA-332 — surface a signal whose live mirror was suppressed instead
+        // of skipping silently. Reuses the `liveSkipReason` field (TRA-243)
+        // already rendered by the dashboard signal card. Keeps the engine in
+        // its silent-skip behaviour for demo (no `liveSkipReason` plumbing).
+        const surfaceLiveSkip = (reason: string): void => {
+          signal.mode = 'live';
+          signal.liveSkipReason = reason;
+          this.recentSignals.unshift(signal);
+          if (this.recentSignals.length > MAX_SIGNALS) this.recentSignals.pop();
+          this.dailySignals.push({
+            id: signal.id,
+            symbol: signal.symbol,
+            type: 'relative_value',
+            firedAt: signal.timestamp,
+          });
+          console.warn(`[signal-engine] live RV signal suppressed (${cheap.optionSymbol}) — ${reason}`);
+        };
+
+        // TRA-332 — in live mode, size the position off the user's REAL
+        // Tradier equity. The paper options account is seeded from demo
+        // equity and never rebased on a live flip, so without this override
+        // the engine would size for $25 K paper equity and produce contracts
+        // a $300 cash account can never afford — TRA-319's pre-check then
+        // voids every signal silently. Prefer `optionBuyingPower` (the
+        // tightest constraint) and fall back to `totalEquity` when the
+        // payload omits it (cash accounts don't carry option_buying_power
+        // explicitly). If we don't have a balance snapshot at all we skip
+        // the override and let the previous behaviour stand.
+        let liveEquity: number | undefined;
+        if (this.mode === 'live' && this.liveTradierBalance) {
+          const obp = this.liveTradierBalance.optionBuyingPower;
+          const total = this.liveTradierBalance.totalEquity;
+          liveEquity = typeof obp === 'number' && Number.isFinite(obp)
+            ? obp
+            : (Number.isFinite(total) ? total : undefined);
+        }
+
+        // Pre-check: under live equity, can a single contract even fit the
+        // RV-strategy budget? If not, surface a clear skip reason instead of
+        // returning null silently — the user needs to see why no trade fired.
+        if (this.mode === 'live' && typeof liveEquity === 'number') {
+          const liveBudget = this.optionsAccount.getRvBudgetForEquity(liveEquity);
+          const costPerContract = cheap.mark * 100;
+          if (liveBudget < costPerContract) {
+            surfaceLiveSkip(
+              `RV budget $${liveBudget.toFixed(2)} < $${costPerContract.toFixed(2)}/contract `
+                + `(equity $${liveEquity.toFixed(2)}) — increase managed ratio or deposit more capital`,
+            );
+            continue;
+          }
+        }
+
         // TRA-231 — pass `this.mode` so the position is stamped at open time;
         // the dashboard scopes Open / Recent Closed Options per-mode.
-        const opened = this.optionsAccount.openOptionFromRvCandidate(signal, this.mode);
+        // TRA-332 — pass `liveEquity` so live sizing uses the real Tradier
+        // figure instead of stale paper-account equity.
+        const opened = this.optionsAccount.openOptionFromRvCandidate(signal, this.mode, liveEquity);
         if (!opened) continue;
 
         // TRA-221 — when running live with Tradier configured, mirror the
@@ -782,11 +836,14 @@ export class SignalEngine {
         // shows an "open" trade that doesn't exist on the broker.
         if (this.mode === 'live' && this.tradierLiveClient && opened.optionSymbol && opened.contracts > 0) {
           const notionalCost = opened.premiumPaid * opened.contracts * 100;
+          // TRA-332 — also surface the void reason on the dashboard so the
+          // user sees why no trade opened, not just a silent log line.
           const tradierVoid = (reason: string): void => {
             console.warn(
               `[signal-engine] voiding paper open ${opened.id} (${opened.optionSymbol}) — ${reason}`,
             );
             this.optionsAccount.voidOpenOption(opened.id);
+            surfaceLiveSkip(reason);
           };
 
           // Pre-check: refresh the Tradier balance if we have a non-stale
