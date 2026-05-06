@@ -109,6 +109,7 @@ export class PaperAccount {
       symbol: signal.symbol,
       side: signal.side,
       signalType: signal.type,
+      signalId: signal.id,
       entryPrice: currentPrice,
       quantity: qty,
       stopLoss: signal.stopLoss,

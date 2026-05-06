@@ -756,6 +756,7 @@ function CryptoDashboard({ token, onBack, onLogout, onActivity, theme, onToggleT
                           <th>P&amp;L %</th><th>P&amp;L $</th><th>Stop</th><th>Target</th>
                           {showPerpCols && <th>Leverage</th>}
                           {showPerpCols && <th>Liquidation</th>}
+                          <th>Signal</th>
                           <th>Opened</th><th></th>
                         </tr>
                       </thead>
@@ -790,6 +791,7 @@ function CryptoDashboard({ token, onBack, onLogout, onActivity, theme, onToggleT
                                   {isPerp && p.liquidationPrice != null ? `$${fmt(p.liquidationPrice)}` : '—'}
                                 </td>
                               )}
+                              <td title={p.signalId ?? ''}>{positionSignalCell(p)}</td>
                               <td className="muted">{formatTime(p.openedAt)}</td>
                               <td><button className="btn-close-pos" onClick={() => closePosition(p.id)}>Close</button></td>
                             </tr>
@@ -810,7 +812,7 @@ function CryptoDashboard({ token, onBack, onLogout, onActivity, theme, onToggleT
                   <thead>
                     <tr>
                       <th>Symbol</th><th>Side</th><th>Qty</th><th>Entry</th><th>Exit</th>
-                      <th>P&amp;L %</th><th>P&amp;L $</th><th>Reason</th><th>Closed</th>
+                      <th>P&amp;L %</th><th>P&amp;L $</th><th>Reason</th><th>Signal</th><th>Closed</th>
                     </tr>
                   </thead>
                   <tbody>
@@ -829,6 +831,7 @@ function CryptoDashboard({ token, onBack, onLogout, onActivity, theme, onToggleT
                           <td className={pnlPct >= 0 ? 'green' : 'red'}>{fmtPct(pnlPct)}</td>
                           <td className={pnlDollar >= 0 ? 'green' : 'red'}>{fmtDollar(pnlDollar)}</td>
                           <td className="muted">{exitReasonLabel(p.exitReason)}</td>
+                          <td title={p.signalId ?? ''}>{positionSignalCell(p)}</td>
                           <td className="muted">{p.closedAt ? formatTime(p.closedAt) : '—'}</td>
                         </tr>
                       );
@@ -966,6 +969,20 @@ function signalLabel(type: string) {
     case 'tradier_import': return 'Tradier Import';
     default: return type;
   }
+}
+
+// TRA-333 — render the Signal column for an equity/crypto position. Positions
+// opened from a TradeSignal carry `signalId` (stamped by the open paths in
+// paper-account / crypto-account / crypto-live-account); imported wallet
+// holdings (TRA-318) reach the dashboard with no signalId and a synthetic
+// `id` prefix of `imported-spot-` — surface those as "Imported" so the user
+// can tell signal-driven entries apart from balance-mirrored ones at a glance.
+function positionSignalCell(p: Position) {
+  if (!p.signalId) {
+    if (p.id.startsWith('imported-spot-')) return <span className="muted">Imported</span>;
+    return <span className="muted">—</span>;
+  }
+  return signalLabel(p.signalType);
 }
 
 function exitReasonLabel(reason?: string) {
@@ -1741,6 +1758,7 @@ function Dashboard({ token, onLogout, onGoHome, onActivity, theme, onToggleTheme
                       <th>P&amp;L $</th>
                       <th>Stop</th>
                       <th>Target</th>
+                      <th>Signal</th>
                       <th>Opened</th>
                       <th></th>
                     </tr>
@@ -1765,6 +1783,7 @@ function Dashboard({ token, onLogout, onGoHome, onActivity, theme, onToggleTheme
                           <td className={pnlDollar >= 0 ? 'green' : 'red'}>{fmtDollar(pnlDollar)}</td>
                           <td className="red">{fmtPrice(p.stopLoss)}</td>
                           <td className="green">{fmtPrice(p.takeProfit)}</td>
+                          <td title={p.signalId ?? ''}>{positionSignalCell(p)}</td>
                           <td className="muted">{formatTime(p.openedAt)}</td>
                           <td><button className="btn-close-pos" onClick={() => closePosition(p.id)}>Close</button></td>
                         </tr>
@@ -1791,6 +1810,7 @@ function Dashboard({ token, onLogout, onGoHome, onActivity, theme, onToggleTheme
                       <th>P&amp;L %</th>
                       <th>P&amp;L $</th>
                       <th>Reason</th>
+                      <th>Signal</th>
                       <th>Closed</th>
                     </tr>
                   </thead>
@@ -1810,6 +1830,7 @@ function Dashboard({ token, onLogout, onGoHome, onActivity, theme, onToggleTheme
                           <td className={pnlPct >= 0 ? 'green' : 'red'}>{fmtPct(pnlPct)}</td>
                           <td className={pnlDollar >= 0 ? 'green' : 'red'}>{fmtDollar(pnlDollar)}</td>
                           <td className="muted">{exitReasonLabel(p.exitReason)}</td>
+                          <td title={p.signalId ?? ''}>{positionSignalCell(p)}</td>
                           <td className="muted">{p.closedAt ? formatTime(p.closedAt) : '—'}</td>
                         </tr>
                       );

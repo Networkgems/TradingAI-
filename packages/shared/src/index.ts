@@ -149,6 +149,15 @@ export interface Position {
   symbol: string;
   side: Side;
   signalType: SignalType;
+  /**
+   * TRA-333 — id of the TradeSignal that opened this position. Optional so
+   * (a) snapshots persisted before the field existed still rehydrate, and
+   * (b) non-signal entries (imported wallet holdings — see TRA-318) can
+   * coexist without a synthesized id. Every signal-driven open path stamps
+   * this from `signal.id`; the dashboard uses presence to distinguish
+   * signal-sourced positions from imported ones.
+   */
+  signalId?: string;
   entryPrice: number;
   quantity: number;
   stopLoss: number;
