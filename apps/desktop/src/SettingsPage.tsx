@@ -1515,6 +1515,30 @@ export default function SettingsPage({ token, httpUrl, context, onModeChange, on
                   </div>
                 </div>
 
+                {/* TRA-335 — opt-in toggle for Tradier Live equity (stock-share)
+                    trading. When on, BB-fade / ORB / Ichimoku entries fire as
+                    OTOCO bracket orders against the same Tradier account that
+                    powers options. Default off so deployments that haven't
+                    opted in keep the TRA-220 options-only behaviour. */}
+                <div className="settings-field" style={{ marginTop: '1rem' }}>
+                  <label className="checkbox-option">
+                    <input
+                      type="checkbox"
+                      checked={settings.liveTradeEquitiesTradier === true}
+                      onChange={e => set('liveTradeEquitiesTradier', e.target.checked)}
+                    />
+                    <span>
+                      <strong>Tradier Live trades equities</strong>
+                      <p className="field-hint">
+                        Mirror BB-fade / ORB / Ichimoku entries to Tradier as OTOCO bracket orders
+                        (limit entry + OCO take-profit / stop-loss). Requires Tradier production
+                        buying power. Off by default — leave off if you only want the relative-value
+                        options scanner to trade live.
+                      </p>
+                    </span>
+                  </label>
+                </div>
+
                 <div className="settings-field" style={{ marginTop: '1rem' }}>
                   <button
                     type="button"
@@ -1623,7 +1647,7 @@ export default function SettingsPage({ token, httpUrl, context, onModeChange, on
                 </>
               ) : (
                 <>
-                  <strong>Live Tradier trading is enabled.</strong> Once you save a valid Tradier API token and Account ID and switch the account to <em>Live</em>, the engine routes signals based on the <em>Trade</em> selector above. <em>Options only</em> (default, TRA-220) sends the relative-value scanner to Tradier as <code>buy_to_open</code> market orders. <em>Positions (equity)</em> and <em>Both</em> activate stock-share routing — wired by TRA-335; until that ships, those modes only suppress the options mirror.
+                  <strong>Live Tradier trading is enabled.</strong> Once you save a valid Tradier API token and Account ID and switch the account to <em>Live</em>, the engine routes signals based on the <em>Trade</em> selector above. <em>Options only</em> (default, TRA-220) sends the relative-value scanner to Tradier as <code>buy_to_open</code> market orders. <em>Positions (equity)</em> and <em>Both</em> activate stock-share routing — BB-fade / ORB / Ichimoku entries fire as Tradier OTOCO bracket orders when the &quot;Tradier Live trades equities&quot; toggle is also on (TRA-335).
                 </>
               )}
             </div>

@@ -1,14 +1,14 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
-import { SignalEngine } from './signal-engine.js';
+import { SignalEngine, sizeLiveEquityFromStop } from './signal-engine.js';
 import type { RelativeValueScannerService, RelativeValueScanResult } from './relative-value-scanner.js';
-import type { RelativeValueCandidate, TradierOptionsClient } from '@trading-app/engine';
+import type { RelativeValueCandidate, TradierAccountBalance, TradierOptionsClient, TradierOrderClient } from '@trading-app/engine';
 import {
   DEFAULT_ACCOUNT_SETTINGS,
   isLiveTradierEquityEnabled,
   isLiveTradierOptionsEnabled,
   resolveLiveTradierMarkets,
 } from '@trading-app/shared';
-import type { AccountSettings, TradierEnv } from '@trading-app/shared';
+import type { AccountSettings, TradeSignal, TradierEnv } from '@trading-app/shared';
 
 // Inside an ET trading window: 10:00 AM ET on a Tuesday → 14:00 UTC during EDT.
 const TRADING_TIME = Date.parse('2024-06-04T14:00:00Z');
@@ -650,7 +650,7 @@ describe('SignalEngine — TRA-332 live sizing uses real Tradier equity', () => 
 // TRA-336 — `liveTradierMarkets` is the user-facing tri-state for "what
 // should Tradier Live trade" (Options / Positions / Both). Default
 // 'options' preserves the TRA-220 options-only behaviour; 'equity' opts out
-// of the options mirror entirely (and TRA-335 will light up share routing).
+// of the options mirror entirely (and TRA-335 lights up share routing).
 describe('shared/AccountSettings — TRA-336 liveTradierMarkets resolvers', () => {
   function withMarkets(markets: AccountSettings['liveTradierMarkets']): AccountSettings {
     return { ...DEFAULT_ACCOUNT_SETTINGS, liveTradierMarkets: markets };
@@ -747,5 +747,295 @@ describe('SignalEngine — TRA-336 markets-selector gate', () => {
       liveTradierMarkets: 'equity',
     };
     expect(skip(demoEquityOnly)).toBe(false);
+  });
+});
+
+// ─── TRA-335 — Tradier Live equity bracket trading ─────────────────────────
+// Reverses TRA-220 for equities: when liveTradeEquitiesTradier is on AND
+// Tradier creds are saved AND mode === 'live', BB-fade / ORB / Ichimoku
+// entries fire as Tradier OTOCO bracket orders against the same Tradier
+// account that powers options. These tests cover the placement + sizing +
+// manual-close paths in isolation; the runTick wiring is exercised
+// indirectly via the live equity gate in the open-loop dedup test.
+describe('sizeLiveEquityFromStop (TRA-335)', () => {
+  function balance(overrides: Partial<TradierAccountBalance> = {}): TradierAccountBalance {
+    return {
+      totalEquity: 25_000,
+      totalCash: 10_000,
+      optionBuyingPower: 10_000,
+      stockBuyingPower: 20_000,
+      longMarketValue: 15_000,
+      ...overrides,
+    };
+  }
+
+  it('sizes off (cash + LMV) × ratio × risk and floors to whole shares', () => {
+    const qty = sizeLiveEquityFromStop({
+      balance: balance(),
+      managedAccountRatio: 0.5,
+      riskPerTrade: 0.01,
+      entryPrice: 100,
+      stopPrice: 95,
+      currentPrice: 100,
+    });
+    // managedEquity = 25000 * 0.5 = 12500. maxRisk = 12500 * 0.01 = 125.
+    // dist = 5 → riskQty = floor(125/5) = 25.
+    // equityCap = floor(12500/100) = 125. stockBP cap = floor(20000/100) = 200.
+    // min(25, 125, 200) = 25.
+    expect(qty).toBe(25);
+  });
+
+  it('caps qty by stockBuyingPower when cash + LMV would otherwise allow more', () => {
+    const qty = sizeLiveEquityFromStop({
+      balance: balance({ stockBuyingPower: 500 }),
+      managedAccountRatio: 0.5,
+      riskPerTrade: 0.10,
+      entryPrice: 50,
+      stopPrice: 49,
+      currentPrice: 50,
+    });
+    // managedEquity = 12500. maxRisk = 1250. dist = 1 → riskQty = 1250.
+    // equityCap = 250. stockBP cap = floor(500/50) = 10. min = 10.
+    expect(qty).toBe(10);
+  });
+
+  it('returns 0 when stop equals entry (zero risk distance)', () => {
+    expect(sizeLiveEquityFromStop({
+      balance: balance(),
+      managedAccountRatio: 0.5,
+      riskPerTrade: 0.01,
+      entryPrice: 100,
+      stopPrice: 100,
+      currentPrice: 100,
+    })).toBe(0);
+  });
+
+  it('returns 0 when totalCash + LMV is non-positive', () => {
+    expect(sizeLiveEquityFromStop({
+      balance: balance({ totalCash: 0, longMarketValue: 0 }),
+      managedAccountRatio: 0.5,
+      riskPerTrade: 0.01,
+      entryPrice: 100,
+      stopPrice: 95,
+      currentPrice: 100,
+    })).toBe(0);
+  });
+
+  it('falls back to totalCash alone when longMarketValue is null', () => {
+    const qty = sizeLiveEquityFromStop({
+      balance: balance({ longMarketValue: null }),
+      managedAccountRatio: 0.5,
+      riskPerTrade: 0.01,
+      entryPrice: 100,
+      stopPrice: 95,
+      currentPrice: 100,
+    });
+    // managedEquity = 10000 * 0.5 = 5000. maxRisk = 50. riskQty = floor(50/5) = 10.
+    expect(qty).toBe(10);
+  });
+
+  it('skips the buying-power cap when stockBuyingPower is null (cash account fallback)', () => {
+    const qty = sizeLiveEquityFromStop({
+      balance: balance({ stockBuyingPower: null, totalCash: 5_000, longMarketValue: 0 }),
+      managedAccountRatio: 1.0,
+      riskPerTrade: 0.05,
+      entryPrice: 50,
+      stopPrice: 45,
+      currentPrice: 50,
+    });
+    // managedEquity = 5000. maxRisk = 250. riskQty = floor(250/5) = 50.
+    // equityCap = floor(5000/50) = 100. min = 50. No SBP cap applied.
+    expect(qty).toBe(50);
+  });
+});
+
+describe('SignalEngine — TRA-335 live equity bracket placement', () => {
+  type WaitOpts = { timeoutMs?: number; intervalMs?: number; sleep?: (ms: number) => Promise<void> };
+  interface TradierEquityStub {
+    submitBracketOrder: ReturnType<typeof vi.fn>;
+    waitForOrderTerminalStatus: ReturnType<typeof vi.fn>;
+    cancelOrder?: ReturnType<typeof vi.fn>;
+  }
+
+  function bbSignal(overrides: Partial<TradeSignal> = {}): TradeSignal {
+    return {
+      id: 'sig-1',
+      symbol: 'AAPL',
+      type: 'bb_fade',
+      side: 'buy',
+      entryPrice: 100,
+      stopLoss: 95,
+      takeProfit: 110,
+      riskRewardRatio: 2,
+      timestamp: Date.now(),
+      ...overrides,
+    };
+  }
+
+  function setupLiveEquityEngine(stub: TradierEquityStub) {
+    const engine = new SignalEngine({
+      ...DEFAULT_ACCOUNT_SETTINGS,
+      mode: 'live',
+      liveTradeEquitiesTradier: true,
+      managedAccountRatio: 0.5,
+      riskPerTrade: 0.01,
+    });
+    (engine as unknown as { tradierLiveEquityClient: unknown }).tradierLiveEquityClient = stub;
+    (engine as unknown as { liveTradierBalance: TradierAccountBalance }).liveTradierBalance = {
+      totalEquity: 25_000,
+      totalCash: 10_000,
+      optionBuyingPower: 10_000,
+      stockBuyingPower: 20_000,
+      longMarketValue: 15_000,
+    };
+    return engine;
+  }
+
+  it('placeTradierEquityBracket submits an OTOCO with the sized qty + entry/TP/SL legs and returns ok on a non-rejected Tradier response', async () => {
+    const stub: TradierEquityStub = {
+      submitBracketOrder: vi.fn().mockResolvedValue({ id: 42, status: 'ok' }),
+      waitForOrderTerminalStatus: vi.fn(async (_id: number, _o?: WaitOpts) => ({
+        id: 42, status: 'filled', exec_quantity: 25, avg_fill_price: 100,
+      })),
+    };
+    const engine = setupLiveEquityEngine(stub);
+
+    const result = await (engine as unknown as {
+      placeTradierEquityBracket: (s: TradeSignal, p: number) => Promise<{ ok: boolean; orderId?: number | string; reason?: string }>
+    }).placeTradierEquityBracket(bbSignal(), 100);
+
+    expect(result.ok).toBe(true);
+    expect(result.orderId).toBe(42);
+    expect(stub.submitBracketOrder).toHaveBeenCalledTimes(1);
+    expect(stub.submitBracketOrder).toHaveBeenCalledWith({
+      symbol: 'AAPL', qty: 25, side: 'buy',
+      limitPrice: 100, takeProfitPrice: 110, stopLossPrice: 95,
+    });
+  });
+
+  it('returns ok:false with a reason when Tradier ends in canceled (e.g. insufficient buying power)', async () => {
+    const stub: TradierEquityStub = {
+      submitBracketOrder: vi.fn().mockResolvedValue({ id: 99, status: 'ok' }),
+      waitForOrderTerminalStatus: vi.fn(async () => ({
+        id: 99, status: 'canceled', reason_description: 'insufficient buying power',
+      })),
+    };
+    const engine = setupLiveEquityEngine(stub);
+
+    const result = await (engine as unknown as {
+      placeTradierEquityBracket: (s: TradeSignal, p: number) => Promise<{ ok: boolean; orderId?: number; reason?: string }>
+    }).placeTradierEquityBracket(bbSignal(), 100);
+
+    expect(result.ok).toBe(false);
+    expect(result.reason).toContain('canceled');
+    expect(result.reason).toContain('insufficient buying power');
+  });
+
+  it('returns ok:false when the broker call throws (network/auth failure) — never opens a phantom position', async () => {
+    const stub: TradierEquityStub = {
+      submitBracketOrder: vi.fn().mockRejectedValue(new Error('Tradier 401 unauthorized')),
+      waitForOrderTerminalStatus: vi.fn(),
+    };
+    const engine = setupLiveEquityEngine(stub);
+
+    const result = await (engine as unknown as {
+      placeTradierEquityBracket: (s: TradeSignal, p: number) => Promise<{ ok: boolean; reason?: string }>
+    }).placeTradierEquityBracket(bbSignal(), 100);
+
+    expect(result.ok).toBe(false);
+    expect(result.reason).toContain('Tradier 401 unauthorized');
+    expect(stub.waitForOrderTerminalStatus).not.toHaveBeenCalled();
+  });
+
+  it('returns ok:false when the cached Tradier balance is missing (engine refuses to size against an unknown balance)', async () => {
+    const stub: TradierEquityStub = {
+      submitBracketOrder: vi.fn(),
+      waitForOrderTerminalStatus: vi.fn(),
+    };
+    const engine = setupLiveEquityEngine(stub);
+    (engine as unknown as { liveTradierBalance: TradierAccountBalance | null }).liveTradierBalance = null;
+
+    const result = await (engine as unknown as {
+      placeTradierEquityBracket: (s: TradeSignal, p: number) => Promise<{ ok: boolean; reason?: string }>
+    }).placeTradierEquityBracket(bbSignal(), 100);
+
+    expect(result.ok).toBe(false);
+    expect(result.reason).toContain('balance');
+    expect(stub.submitBracketOrder).not.toHaveBeenCalled();
+  });
+
+  it('manualClosePosition on a live equity position drops the position locally, marks pnl, and kicks off the Tradier OCO cancel for the entry order', async () => {
+    const stub: TradierEquityStub = {
+      submitBracketOrder: vi.fn(),
+      waitForOrderTerminalStatus: vi.fn(),
+      cancelOrder: vi.fn().mockResolvedValue(undefined),
+    };
+    const engine = setupLiveEquityEngine(stub);
+
+    // Seed a live equity open by calling the mirror helper.
+    const sig = bbSignal();
+    const pos = (engine as unknown as {
+      openLiveEquityMirror: (s: TradeSignal, p: number, oid: number | string) => { id: string } | null;
+    }).openLiveEquityMirror(sig, 100, 42);
+    expect(pos).not.toBeNull();
+    expect(engine.getState().account.openPositions).toHaveLength(1);
+
+    const closed = engine.manualClosePosition(pos!.id, 105);
+    expect(closed).not.toBeNull();
+    expect(closed!.exitPrice).toBe(105);
+    // pnl = (105 - 100) × 25 × 1 = 125 for a 25-share BUY.
+    expect(closed!.pnl).toBe(125);
+    // The live store no longer holds the position even before the
+    // fire-and-forget broker close completes — the dashboard reflects
+    // the close immediately.
+    expect(engine.getState().account.openPositions).toHaveLength(0);
+
+    // Flush microtasks queued by the fire-and-forget close path
+    // (closeTradierEquityPosition awaits cancelOrder before issuing the
+    // market-sell HTTP call). Awaiting a Promise.resolve cycle lets
+    // cancelOrder's mock be invoked before the assertion below.
+    await Promise.resolve();
+    await Promise.resolve();
+    expect(stub.cancelOrder).toHaveBeenCalledWith(42);
+  });
+});
+
+describe('buildTradierLiveEquityClient gating (TRA-335)', () => {
+  it('returns null when liveTradeEquitiesTradier is false even with full live creds', () => {
+    const engine = new SignalEngine({
+      ...DEFAULT_ACCOUNT_SETTINGS,
+      mode: 'live',
+      liveTradeEquitiesTradier: false,
+      liveApiKeyOptionsSandbox: 'tok',
+      liveAccountIdOptionsSandbox: 'A1',
+      liveTradierEnvOptions: 'sandbox',
+    });
+    const client = (engine as unknown as { tradierLiveEquityClient: TradierOrderClient | null }).tradierLiveEquityClient;
+    expect(client).toBeNull();
+  });
+
+  it('returns a client when toggle is on AND creds are saved', () => {
+    const engine = new SignalEngine({
+      ...DEFAULT_ACCOUNT_SETTINGS,
+      mode: 'live',
+      liveTradeEquitiesTradier: true,
+      liveApiKeyOptionsSandbox: 'tok',
+      liveAccountIdOptionsSandbox: 'A1',
+      liveTradierEnvOptions: 'sandbox',
+    });
+    const client = (engine as unknown as { tradierLiveEquityClient: TradierOrderClient | null }).tradierLiveEquityClient;
+    expect(client).not.toBeNull();
+  });
+
+  it('returns null in demo mode regardless of toggle', () => {
+    const engine = new SignalEngine({
+      ...DEFAULT_ACCOUNT_SETTINGS,
+      mode: 'demo',
+      liveTradeEquitiesTradier: true,
+      liveApiKeyOptionsSandbox: 'tok',
+      liveAccountIdOptionsSandbox: 'A1',
+    });
+    const client = (engine as unknown as { tradierLiveEquityClient: TradierOrderClient | null }).tradierLiveEquityClient;
+    expect(client).toBeNull();
   });
 });

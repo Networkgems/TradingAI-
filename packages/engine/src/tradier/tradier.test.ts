@@ -331,7 +331,13 @@ describe('TradierOptionsClient.getAccountBalance (TRA-226)', () => {
     );
     const client = new TradierOptionsClient('tok', 'A1');
     const balance = await client.getAccountBalance();
-    expect(balance).toEqual({ totalEquity: 12345.67, totalCash: 5000, optionBuyingPower: null });
+    expect(balance).toEqual({
+      totalEquity: 12345.67,
+      totalCash: 5000,
+      optionBuyingPower: null,
+      stockBuyingPower: null,
+      longMarketValue: null,
+    });
     expect(callUrl(0)).toBe('https://sandbox.tradier.com/v1/accounts/A1/balances');
     const headers = callInit(0).headers as Record<string, string>;
     expect(headers.Authorization).toBe('Bearer tok');
@@ -379,6 +385,8 @@ describe('TradierOptionsClient.getAccountBalance (TRA-226)', () => {
       totalEquity: 1000,
       totalCash: 300,
       optionBuyingPower: 250,
+      stockBuyingPower: 600,
+      longMarketValue: null,
     });
   });
 

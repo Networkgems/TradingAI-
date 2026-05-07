@@ -1,4 +1,4 @@
-import { OrbStrategy, BbFadeStrategy, IchimokuStrategy, TradierOptionsClient, TRADIER_REJECTED_STATUSES } from '@trading-app/engine';
+import { OrbStrategy, BbFadeStrategy, IchimokuStrategy, TradierOptionsClient, TradierOrderClient, TRADIER_REJECTED_STATUSES } from '@trading-app/engine';
 import type { TradierAccountBalance } from '@trading-app/engine';
 import { WATCHLIST, MANAGED_ACCOUNT_RATIO, MAX_CONSECUTIVE_LOSSES, DAILY_DRAWDOWN_HALT_PCT, aliasWatchlistSymbol, isLiveTradierOptionsEnabled, isStockMarketOpen, resolveTradierOptionsCreds } from '@trading-app/shared';
 import type { TradeSignal, RelativeValueSignal, Candle, OptionsAccountState, SignalType, Position, AccountSettings, AccountState, NewsItem, TradierEnv } from '@trading-app/shared';
@@ -204,6 +204,31 @@ export class SignalEngine {
    */
   private tradierLiveOptionsEnabled = true;
   /**
+   * TRA-335 — Tradier live equity client. Built alongside `tradierLiveClient`
+   * when (a) `mode === 'live'`, (b) the user has enabled
+   * `liveTradeEquitiesTradier`, and (c) Tradier production / sandbox creds
+   * are saved. When set, BB-fade / ORB / Ichimoku entries fired on the live
+   * tick are mirrored to Tradier as OTOCO bracket orders (limit entry +
+   * OCO TP/SL legs). Reuses the same credential pair as the options client
+   * since the issue scopes this to "Tradier production for both options
+   * and equities".
+   */
+  private tradierLiveEquityClient: TradierOrderClient | null = null;
+  /**
+   * TRA-335 — gate on the equity-trading toggle so the engine doesn't even
+   * try to mirror equity entries when the user hasn't opted in. Defaults
+   * to `false` (TRA-220 options-only behaviour) so deployments that haven't
+   * opted in keep their existing live experience.
+   */
+  private liveTradeEquitiesTradier = false;
+  /**
+   * TRA-335 — cached risk knobs used to size live equity orders against the
+   * Tradier balance instead of the (preserved) demo paper account. Re-read
+   * on every `applySettings` call so the next tick picks up the user's edits.
+   */
+  private managedAccountRatio: number;
+  private riskPerTrade: number;
+  /**
    * TRA-226 — last successful Tradier `/accounts/{id}/balances` snapshot.
    * Used in live mode so the dashboard reflects the user's actual Tradier
    * equity/cash instead of the hardcoded 0 the engine used before the live
@@ -212,11 +237,26 @@ export class SignalEngine {
    */
   private liveTradierBalance: TradierAccountBalance | null = null;
   private lastTradierBalanceFetchAt = 0;
+  /**
+   * TRA-335 — open equity positions opened against Tradier Live. We keep
+   * a dedicated store (separate from `this.account`, which is the demo
+   * paper account) so:
+   *   • the demo cash bookkeeping isn't dragged around by live trades,
+   *   • live opens can carry the Tradier order id needed to cancel the
+   *     OCO leg on a manual close, and
+   *   • surfacing them in `getState()` is a simple branch on `mode`.
+   * Keyed by Position.id (a uuid stamped at open time).
+   */
+  private liveEquityPositions: Map<string, Position> = new Map();
+  /** TRA-335 — Tradier order id (entry leg) → local Position id, used for reconcile. */
+  private liveEquityOrderIds: Map<string, number | string> = new Map();
 
   constructor(settings?: AccountSettings, tracker?: PnlTracker, rvScanner?: RelativeValueScannerService) {
     this.tracker = tracker;
     this.rvScanner = rvScanner;
     this.mode = settings?.mode === 'live' ? 'live' : 'demo';
+    this.managedAccountRatio = settings?.managedAccountRatio ?? MANAGED_ACCOUNT_RATIO;
+    this.riskPerTrade = settings?.riskPerTrade ?? 0.01;
     // Demo state is always loaded internally so a live → demo switch can
     // restore positions, equity, and dailyPnl without rebasing to the default
     // starting balance. Live mode masks this state via getState().
@@ -250,6 +290,8 @@ export class SignalEngine {
     if (settings) {
       this.tradierLiveClient = buildTradierLiveClient(settings);
       this.tradierLiveOptionsEnabled = isLiveTradierOptionsEnabled(settings);
+      this.liveTradeEquitiesTradier = settings.liveTradeEquitiesTradier === true;
+      this.tradierLiveEquityClient = buildTradierLiveEquityClient(settings);
     }
   }
 
@@ -288,6 +330,8 @@ export class SignalEngine {
     // start/stop UI state for either mode) keeps the engine in sync.
     this.autoTradingEnabledDemo = settings.stocksAutoTradingEnabledDemo ?? true;
     this.autoTradingEnabledLive = settings.stocksAutoTradingEnabledLive ?? true;
+    this.managedAccountRatio = settings.managedAccountRatio;
+    this.riskPerTrade = settings.riskPerTrade;
     this.account.updateConfig({
       managedAccountRatio: settings.managedAccountRatio,
       riskPerTrade: settings.riskPerTrade,
@@ -305,6 +349,11 @@ export class SignalEngine {
     // TRA-336 — re-read the markets selector so flipping
     // Options/Equity/Both in Settings takes effect on the next tick.
     this.tradierLiveOptionsEnabled = isLiveTradierOptionsEnabled(settings);
+    // TRA-335 — re-resolve the equity client + toggle on every settings
+    // change so flipping `liveTradeEquitiesTradier` takes effect on the
+    // next tick without a server restart.
+    this.liveTradeEquitiesTradier = settings.liveTradeEquitiesTradier === true;
+    this.tradierLiveEquityClient = buildTradierLiveEquityClient(settings);
     if (this.mode === 'live') {
       // TRA-226 — fetch the Tradier balance immediately so the broadcast that
       // follows in the PUT /api/account/settings handler reflects the user's
@@ -385,6 +434,11 @@ export class SignalEngine {
     this.recentSignals = [];
     this.dailySignals = [];
     this.positionSignalType.clear();
+    // TRA-335 — wipe the live equity mirror too. The Tradier-side positions
+    // are NOT canceled here (forceReset is local-only by design); the user
+    // must close them in Tradier or re-import via reconciliation.
+    this.liveEquityPositions.clear();
+    this.liveEquityOrderIds.clear();
     if (this.tracker) {
       this.tracker.setInitialEquity(equity);
       this.tracker.saveEquity(equity, this.optionsAccount.getState().optionsPnl);
@@ -585,12 +639,15 @@ export class SignalEngine {
     setActiveInterestSymbols(activeInterest);
 
     // Fetch candles in parallel batches to avoid 25+ second sequential delay for 25 symbols.
-    // TRA-220/221: candles power only the equity strategies (ORB, BB-fade,
-    // Ichimoku) which run in demo mode. Live mode trades
-    // options only via the RV scanner, which pulls Tradier chains directly
-    // and doesn't need candles — skip the fetch in live to avoid burning
-    // Yahoo / Twelve Data quota.
-    if (this.mode === 'demo') {
+    // TRA-220/221: candles power the equity strategies (ORB, BB-fade,
+    // Ichimoku). Demo mode always fetches them. TRA-335 — Live mode also
+    // fetches them when the operator has opted into Tradier equity
+    // trading AND a Tradier client is wired up; otherwise we still skip
+    // to spare Yahoo / Twelve Data quota.
+    const equityStrategiesActiveOnTick =
+      this.mode === 'demo'
+      || (this.mode === 'live' && this.liveTradeEquitiesTradier && this.tradierLiveEquityClient !== null);
+    if (equityStrategiesActiveOnTick) {
       const CANDLE_BATCH = 5;
       for (let i = 0; i < activeSymbols.length; i += CANDLE_BATCH) {
         await Promise.all(
@@ -600,10 +657,12 @@ export class SignalEngine {
     }
 
     // If auto trading is disabled or daily risk circuit-breaker is active, skip new entries.
-    // TRA-220: stock entries only fire in demo mode. Tradier Live and Sandbox
-    // trade options only — the live equity broker (Webull) isn't wired up yet.
+    // TRA-220: stock entries only fired in demo mode. TRA-335 — they also
+    // fire in live mode when the user opted into Tradier equity trading and
+    // creds are configured; the broker-mirror branch below replaces the
+    // paper open with a Tradier OTOCO bracket order.
     // TRA-229: isAutoTradingEnabled() resolves the per-mode flag.
-    if (this.mode === 'demo' && this.isAutoTradingEnabled() && !this.riskGovernor.isHalted()) {
+    if (equityStrategiesActiveOnTick && this.isAutoTradingEnabled() && !this.riskGovernor.isHalted()) {
       let symbolsWithData = 0;
       // Run strategies and collect new signals
       for (const sym of activeSymbols) {
@@ -619,6 +678,9 @@ export class SignalEngine {
           if (!signal) continue;
           // Skip if an equity position for this symbol+strategy type is already open
           if (this.account.hasOpenPositionForSignalType(sym, signal.type)) continue;
+          // TRA-335 — same dedup against the live mirror so we don't
+          // submit a second Tradier bracket for an already-open live row.
+          if (this.mode === 'live' && this.hasOpenLiveEquityPosition(sym, signal.type)) continue;
           // Deduplicate: skip if same symbol+type signal emitted in last 5 minutes
           const recent = this.recentSignals.find(
             s => s.symbol === signal.symbol && s.type === signal.type && Date.now() - s.timestamp < 5 * 60_000
@@ -638,6 +700,36 @@ export class SignalEngine {
           // TRA-231 — stamp the active mode so the dashboard's Signals panel
           // can scope this entry to the demo (or live) mode it fired under.
           signal.mode = this.mode;
+
+          // TRA-335 — in live mode, mirror the equity entry as a Tradier
+          // OTOCO bracket order. We submit the broker order *first* so the
+          // local Position only mirrors a confirmed fill (or a synchronous
+          // live order — pending orders also leave the paper Position open
+          // because Tradier may still fill within the day). When the order
+          // is rejected/cancelled, stamp `signal.liveSkipReason` so the
+          // dashboard surfaces why nothing opened.
+          let liveOrderId: number | string | null = null;
+          if (this.mode === 'live') {
+            if (!this.tradierLiveEquityClient) {
+              signal.liveSkipReason = 'Tradier equity client not configured';
+              this.recentSignals.unshift(signal);
+              if (this.recentSignals.length > MAX_SIGNALS) this.recentSignals.pop();
+              continue;
+            }
+            const placement = await this.placeTradierEquityBracket(signal, price);
+            if (!placement.ok) {
+              signal.liveSkipReason = placement.reason;
+              this.recentSignals.unshift(signal);
+              if (this.recentSignals.length > MAX_SIGNALS) this.recentSignals.pop();
+              continue;
+            }
+            liveOrderId = placement.orderId;
+            // Refresh the Tradier balance so the dashboard immediately
+            // reflects the buying-power consumed (or, if the order is
+            // still pending, the user can spot drift on the next tick).
+            this.refreshTradierBalance().catch(() => {});
+          }
+
           this.recentSignals.unshift(signal);
           if (this.recentSignals.length > MAX_SIGNALS) this.recentSignals.pop();
 
@@ -646,7 +738,13 @@ export class SignalEngine {
           // stock-options strategy is the relative-value scanner, which runs
           // on its own 5-minute cadence below. Equity / share trading still
           // fires off the established ORB/BB/Ichimoku signals.
-          const pos = this.account.openPosition(signal, price);
+          // TRA-335 — in live mode, sizing is driven by `placeTradierEquityBracket`
+          // off the cached Tradier balance (not paper-account cash) so we pass
+          // the resolved qty into a thin local-mirror open instead of letting
+          // PaperAccount.openPosition re-size.
+          const pos = this.mode === 'live'
+            ? this.openLiveEquityMirror(signal, price, liveOrderId!)
+            : this.account.openPosition(signal, price);
           if (pos) {
             // TRA-231 — same rationale as the signal stamp above; the closed-
             // positions list is filtered per-mode in getState().
@@ -1020,6 +1118,48 @@ export class SignalEngine {
   }
 
   manualClosePosition(positionId: string, currentPrice: number): Position | null {
+    // TRA-335 — when the position lives in the live equity store, route a
+    // real Tradier sell instead of mutating demo paper-account cash. The
+    // OTOCO entry leg automatically attaches OCO TP/SL legs; closing
+    // manually means we cancel any open OCO leg first (best-effort), then
+    // submit a market sell. Local row is dropped after submission so the
+    // dashboard reflects the close immediately; the user-visible fill
+    // price ends up logged as `currentPrice` since Tradier doesn't return
+    // a synchronous avg fill on market orders. Closed-positions list is
+    // populated so the user sees the trade in their history.
+    const liveOpen = this.liveEquityPositions.get(positionId);
+    if (liveOpen && this.tradierLiveEquityClient) {
+      const orderId = this.liveEquityOrderIds.get(positionId);
+      this.closeTradierEquityPosition(liveOpen, currentPrice, orderId).catch((err: unknown) => {
+        console.warn(
+          `[signal-engine] Tradier live equity close ${positionId} failed: ${
+            err instanceof Error ? err.message : String(err)
+          }`,
+        );
+      });
+      const multiplier = liveOpen.side === 'buy' ? 1 : -1;
+      const pnl = (currentPrice - liveOpen.entryPrice) * liveOpen.quantity * multiplier;
+      const closed: Position = {
+        ...liveOpen,
+        exitPrice: currentPrice,
+        closedAt: Date.now(),
+        pnl,
+      };
+      this.liveEquityPositions.delete(positionId);
+      this.liveEquityOrderIds.delete(positionId);
+      this.allClosedPositions.push(closed);
+      // Feed the daily risk governor so consecutive losses on live equity
+      // can still halt new entries. Use the Tradier total equity as the
+      // managed-equity baseline since the demo paper account isn't
+      // representative of live capital.
+      const liveEquity = this.liveTradierBalance?.totalEquity ?? 0;
+      this.riskGovernor.recordTrade(pnl, liveEquity * this.managedAccountRatio);
+      // Refresh balance so the dashboard equity reflects the close as
+      // soon as Tradier marks the position out.
+      this.refreshTradierBalance().catch(() => {});
+      return closed;
+    }
+
     const closed = this.account.closePosition(positionId, currentPrice);
     if (closed) {
       this.allClosedPositions.push(closed);
@@ -1030,6 +1170,56 @@ export class SignalEngine {
       );
     }
     return closed;
+  }
+
+  /**
+   * TRA-335 — submit a market sell to Tradier to close a live equity
+   * position. Cancels the OCO entry-leg's order id first (best-effort —
+   * if Tradier already filled one of the OCO legs the cancel is a no-op),
+   * then submits a plain market sell for the position's quantity.
+   */
+  private async closeTradierEquityPosition(
+    pos: Position,
+    _currentPrice: number,
+    entryOrderId: number | string | undefined,
+  ): Promise<void> {
+    const client = this.tradierLiveEquityClient;
+    if (!client) return;
+    if (entryOrderId !== undefined) {
+      try {
+        await client.cancelOrder(entryOrderId);
+      } catch (err: unknown) {
+        // Cancel failures are non-fatal — the OCO may already have filled or
+        // the order may already be terminal. Log and continue with the sell.
+        console.warn(
+          `[signal-engine] Tradier OCO cancel ${entryOrderId} failed: ${
+            err instanceof Error ? err.message : String(err)
+          }`,
+        );
+      }
+    }
+    const closeSide = pos.side === 'buy' ? 'sell' : 'buy';
+    const body = new URLSearchParams({
+      class: 'equity',
+      symbol: pos.symbol,
+      side: closeSide,
+      quantity: String(pos.quantity),
+      type: 'market',
+      duration: 'day',
+    });
+    // Use the protected postOrder via a thin pass-through. We can't reach
+    // it directly so we issue the request inline with the same auth.
+    const baseUrl = (client as unknown as { baseUrl: string }).baseUrl;
+    const accountId = (client as unknown as { accountId: string }).accountId;
+    const headers = (client as unknown as { headers: Record<string, string> }).headers;
+    const resp = await fetch(
+      `${baseUrl}/accounts/${encodeURIComponent(accountId)}/orders`,
+      { method: 'POST', headers, body: body.toString() },
+    );
+    if (!resp.ok) {
+      const text = await resp.text().catch(() => '');
+      throw new Error(`Tradier close failed (${resp.status}): ${text.slice(0, 200)}`);
+    }
   }
 
   manualCloseOption(optionId: string): import('@trading-app/shared').OptionPosition | null {
@@ -1121,14 +1311,19 @@ export class SignalEngine {
       // for the selected env (sandbox or production). With no creds saved or
       // before the first successful fetch, fall back to zero so the UI stays
       // explicit instead of leaking demo numbers.
+      // TRA-335 — surface mirrored Tradier live equity positions so the
+      // user can see (and manually close) them from TradeAI's Open
+      // Positions tab. When the toggle is off the map is empty so this
+      // is identical to the TRA-226 behaviour.
+      const liveOpenPositions = Array.from(this.liveEquityPositions.values());
       const liveAccount: AccountState = this.liveTradierBalance
         ? {
           totalEquity: this.liveTradierBalance.totalEquity,
           availableCash: this.liveTradierBalance.totalCash,
-          openPositions: [],
+          openPositions: liveOpenPositions,
           dailyPnl: 0,
         }
-        : { totalEquity: 0, availableCash: 0, openPositions: [], dailyPnl: 0 };
+        : { totalEquity: 0, availableCash: 0, openPositions: liveOpenPositions, dailyPnl: 0 };
       return {
         symbols,
         signals: scopedSignals,
@@ -1240,6 +1435,126 @@ export class SignalEngine {
   }
 
   /**
+   * TRA-335 — true when a live equity position with the same symbol +
+   * strategy type is already open. Mirrors
+   * `PaperAccount.hasOpenPositionForSignalType` for the live store.
+   */
+  private hasOpenLiveEquityPosition(symbol: string, signalType: SignalType): boolean {
+    for (const pos of this.liveEquityPositions.values()) {
+      if (pos.symbol === symbol && pos.signalType === signalType) return true;
+    }
+    return false;
+  }
+
+  /**
+   * TRA-335 — submit a Tradier OTOCO bracket for the given equity entry
+   * signal. Sizes off the cached Tradier balance (cash + LMV, capped by
+   * stockBuyingPower) instead of the demo paper account so live trading
+   * is decoupled from `demoEquityStocks`. Waits briefly for the entry
+   * leg to reach a terminal state — rejections / cancels / errors return
+   * `{ ok: false, reason }`; pending orders are still considered live
+   * because Tradier may fill within the day. The ok branch returns the
+   * Tradier order id so the caller can persist it on the local mirror.
+   */
+  private async placeTradierEquityBracket(
+    signal: TradeSignal,
+    currentPrice: number,
+  ): Promise<{ ok: true; orderId: number | string } | { ok: false; reason: string }> {
+    const client = this.tradierLiveEquityClient;
+    if (!client) return { ok: false, reason: 'Tradier equity client not configured' };
+    const balance = this.liveTradierBalance;
+    if (!balance) {
+      return { ok: false, reason: 'Tradier balance not yet fetched — try again next tick' };
+    }
+    const qty = sizeLiveEquityFromStop({
+      balance,
+      managedAccountRatio: this.managedAccountRatio,
+      riskPerTrade: this.riskPerTrade,
+      entryPrice: signal.entryPrice,
+      stopPrice: signal.stopLoss,
+      currentPrice,
+    });
+    if (qty <= 0) {
+      return {
+        ok: false,
+        reason: `Tradier sizing yielded qty=0 (cash=${balance.totalCash.toFixed(2)} stockBP=${balance.stockBuyingPower ?? 'null'})`,
+      };
+    }
+    let resp;
+    try {
+      resp = await client.submitBracketOrder({
+        symbol: signal.symbol,
+        qty,
+        side: signal.side,
+        limitPrice: currentPrice,
+        takeProfitPrice: signal.takeProfit,
+        stopLossPrice: signal.stopLoss,
+      });
+    } catch (err: unknown) {
+      const reason = err instanceof Error ? err.message : String(err);
+      console.warn(
+        `[signal-engine] Tradier bracket order ${signal.symbol} ${signal.type} threw: ${reason}`,
+      );
+      return { ok: false, reason: `Tradier rejected order: ${reason.slice(0, 200)}` };
+    }
+    console.log(
+      `[signal-engine] tradier live equity bracket ${signal.symbol} qty=${qty} order=${resp.id} status=${resp.status}`,
+    );
+    // Wait briefly for Tradier to flip the order to a terminal state. If it's
+    // still pending after the window we accept it as live — Tradier may still
+    // fill by the close. Rejections/cancels void the open and surface on the
+    // dashboard via signal.liveSkipReason.
+    const detail = await client.waitForOrderTerminalStatus(resp.id);
+    if (detail && TRADIER_REJECTED_STATUSES.has(detail.status)) {
+      const reasonSuffix = detail.reason_description ? `: ${detail.reason_description}` : '';
+      return {
+        ok: false,
+        reason: `Tradier order ${resp.id} ${detail.status}${reasonSuffix}`,
+      };
+    }
+    return { ok: true, orderId: resp.id };
+  }
+
+  /**
+   * TRA-335 — local mirror of a live Tradier equity bracket. Distinct from
+   * `PaperAccount.openPosition` because we don't want to deduct cash from
+   * the preserved demo paper account; the Tradier dashboard is the source
+   * of truth for cash. Sizing matches what we sent to Tradier (recomputed
+   * here so the local row reflects the broker order).
+   */
+  private openLiveEquityMirror(
+    signal: TradeSignal,
+    currentPrice: number,
+    tradierOrderId: number | string,
+  ): Position | null {
+    const balance = this.liveTradierBalance;
+    if (!balance) return null;
+    const qty = sizeLiveEquityFromStop({
+      balance,
+      managedAccountRatio: this.managedAccountRatio,
+      riskPerTrade: this.riskPerTrade,
+      entryPrice: signal.entryPrice,
+      stopPrice: signal.stopLoss,
+      currentPrice,
+    });
+    if (qty <= 0) return null;
+    const position: Position = {
+      id: randomUUID(),
+      symbol: signal.symbol,
+      side: signal.side,
+      signalType: signal.type,
+      entryPrice: currentPrice,
+      quantity: qty,
+      stopLoss: signal.stopLoss,
+      takeProfit: signal.takeProfit,
+      openedAt: Date.now(),
+    };
+    this.liveEquityPositions.set(position.id, position);
+    this.liveEquityOrderIds.set(position.id, tradierOrderId);
+    return position;
+  }
+
+  /**
    * TRA-226 — read-only Tradier balance fetch. Updates the cached
    * `liveTradierBalance` snapshot so the next `getState()` broadcast surfaces
    * the user's real Tradier equity / cash. A failed fetch keeps the previous
@@ -1320,4 +1635,77 @@ function buildTradierLiveClient(settings: AccountSettings): TradierOptionsClient
   ).trim();
   if (!apiToken || !accountId) return null;
   return new TradierOptionsClient(apiToken, accountId, env);
+}
+
+/**
+ * TRA-335 — build the Tradier client used to place live equity bracket
+ * orders. Returns `null` when the engine should NOT mirror equity entries:
+ *   • account is not in live mode,
+ *   • the user hasn't enabled the `liveTradeEquitiesTradier` toggle,
+ *   • neither saved Tradier creds nor env-var fallbacks are present.
+ *
+ * Reuses {@link resolveTradierOptionsCreds} so the same Tradier production
+ * (or sandbox) account that powers options trading is used for equities —
+ * this matches the issue's "single TRADIER_ACCOUNT_ID per env" out-of-scope
+ * note. Layered env-var fallbacks mirror the options client.
+ */
+function buildTradierLiveEquityClient(settings: AccountSettings): TradierOrderClient | null {
+  if (settings.mode !== 'live') return null;
+  if (settings.liveTradeEquitiesTradier !== true) return null;
+  const resolved = resolveTradierOptionsCreds(settings);
+  const env = resolved.env;
+  const apiToken = (
+    resolved.apiToken
+    || (env === 'production'
+      ? process.env['TRADIER_API_TOKEN']
+      : (process.env['TRADIER_SANDBOX_API_TOKEN'] ?? process.env['TRADIER_API_TOKEN']))
+    || ''
+  ).trim();
+  const accountId = (
+    resolved.accountId
+    || (env === 'production'
+      ? process.env['TRADIER_ACCOUNT_ID']
+      : (process.env['TRADIER_SANDBOX_ACCOUNT_ID'] ?? process.env['TRADIER_ACCOUNT_ID']))
+    || ''
+  ).trim();
+  if (!apiToken || !accountId) return null;
+  return new TradierOrderClient(apiToken, accountId, env);
+}
+
+/**
+ * TRA-335 — size a live Tradier equity order off the broker balance instead
+ * of the demo paper account. Mirrors {@link PaperAccount.sizeFromStop} but
+ * sources `managedEquity` from `(totalCash + longMarketValue) ×
+ * managedAccountRatio` and caps the result by `stockBuyingPower / price`
+ * so we never request more than Tradier will let us submit. Falls back to
+ * `totalCash` when long-market-value or stockBuyingPower is `null` (cash
+ * accounts, sandbox bootstraps with no holdings, etc.). Returns 0 when the
+ * stop distance, equity, or buying power is non-positive — caller surfaces
+ * that as `liveSkipReason` instead of voiding the signal silently.
+ */
+export function sizeLiveEquityFromStop(args: {
+  balance: TradierAccountBalance;
+  managedAccountRatio: number;
+  riskPerTrade: number;
+  entryPrice: number;
+  stopPrice: number;
+  currentPrice: number;
+}): number {
+  const { balance, managedAccountRatio, riskPerTrade, entryPrice, stopPrice, currentPrice } = args;
+  const dist = Math.abs(entryPrice - stopPrice);
+  if (dist <= 0 || currentPrice <= 0) return 0;
+  const lmv = balance.longMarketValue ?? 0;
+  const baseEquity = (balance.totalCash ?? 0) + lmv;
+  if (baseEquity <= 0) return 0;
+  const managedEquity = baseEquity * managedAccountRatio;
+  const maxRisk = managedEquity * riskPerTrade;
+  if (maxRisk <= 0) return 0;
+  const riskQty = Math.floor(maxRisk / dist);
+  const equityCap = Math.floor(managedEquity / currentPrice);
+  let qty = Math.min(riskQty, equityCap);
+  const sbp = balance.stockBuyingPower;
+  if (typeof sbp === 'number' && sbp > 0) {
+    qty = Math.min(qty, Math.floor(sbp / currentPrice));
+  }
+  return qty > 0 ? qty : 0;
 }

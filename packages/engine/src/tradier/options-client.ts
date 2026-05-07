@@ -129,6 +129,8 @@ interface TradierBalancesEnvelope {
     total_equity?: number;
     total_cash?: number;
     open_pl?: number;
+    /** TRA-335 — total long market value, used for live equity sizing. */
+    long_market_value?: number;
     /** TRA-319 — margin accounts surface option buying power under `margin`. */
     margin?: {
       option_buying_power?: number;
@@ -158,6 +160,20 @@ export interface TradierAccountBalance {
    * `totalCash` and accept that the pre-check might be permissive.
    */
   optionBuyingPower: number | null;
+  /**
+   * TRA-335 — stock (equity) buying power. Margin / PDT accounts surface
+   * `stock_buying_power`; cash accounts only have `cash.cash_available` so
+   * we fall back to that. `null` when the payload didn't include any of
+   * those, in which case live equity sizing should fall back to `totalCash`.
+   */
+  stockBuyingPower: number | null;
+  /**
+   * TRA-335 — long market value (the dollar value of currently held longs).
+   * The live equity engine sizes against `(totalCash + longMarketValue) ×
+   * managedAccountRatio × riskPerTrade`, so this is needed alongside cash
+   * for sizing. `null` when Tradier didn't return the field.
+   */
+  longMarketValue: number | null;
 }
 
 /** Tradier returns `T | T[]` depending on result count; sometimes `null`/empty string when none. */
@@ -320,7 +336,18 @@ export class TradierOptionsClient extends TradierOrderClient {
       ?? b.pdt?.option_buying_power
       ?? b.cash?.cash_available;
     const optionBuyingPower = typeof obpRaw === 'number' && Number.isFinite(obpRaw) ? obpRaw : null;
-    return { totalEquity, totalCash, optionBuyingPower };
+    // TRA-335 — same precedence for stock buying power so live equity sizing
+    // can cap against the broker's actual buying power instead of assuming
+    // cash-only accounts. Cash accounts share `cash_available` between
+    // option and stock buying power.
+    const sbpRaw =
+      b.margin?.stock_buying_power
+      ?? b.pdt?.stock_buying_power
+      ?? b.cash?.cash_available;
+    const stockBuyingPower = typeof sbpRaw === 'number' && Number.isFinite(sbpRaw) ? sbpRaw : null;
+    const lmvRaw = b.long_market_value;
+    const longMarketValue = typeof lmvRaw === 'number' && Number.isFinite(lmvRaw) ? lmvRaw : null;
+    return { totalEquity, totalCash, optionBuyingPower, stockBuyingPower, longMarketValue };
   }
 
   /**

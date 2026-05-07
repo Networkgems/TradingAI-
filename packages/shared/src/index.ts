@@ -478,6 +478,15 @@ export interface AccountSettings {
    */
   liveTradierMarkets?: LiveTradierMarkets;
   /**
+   * TRA-335 — opt-in toggle that flips Tradier Live equity (stock-share)
+   * trading on. When `true` AND `mode === 'live'` AND Tradier credentials
+   * are saved, the engine mirrors BB-fade / ORB / Ichimoku entries as
+   * Tradier OTOCO bracket orders against the same Tradier account that
+   * powers options trading. Default `false` preserves the TRA-220
+   * options-only live behaviour for deployments that haven't opted in.
+   */
+  liveTradeEquitiesTradier?: boolean;
+  /**
    * TRA-325 — active crypto-strategy preset id (see {@link STRATEGY_PRESETS}).
    * The engine reads this on every tick so a switch takes effect on the next
    * evaluation; no restart required. Optional for back-compat with snapshots
@@ -530,6 +539,7 @@ export const DEFAULT_ACCOUNT_SETTINGS: AccountSettings = {
   liveAccountIdOptionsProduction: '',
   liveTradierEnvOptions: 'sandbox',
   liveTradierMarkets: 'options',
+  liveTradeEquitiesTradier: false,
   activeStrategyPreset: DEFAULT_STRATEGY_PRESET_ID,
 };
 
