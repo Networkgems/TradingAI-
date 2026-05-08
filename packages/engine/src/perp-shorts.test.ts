@@ -91,30 +91,45 @@ describe('perp shorts spec wiring (TRA-261)', () => {
     });
   });
 
-  describe('universe (TRA-255 §2)', () => {
-    it('contains exactly the Phase-1 perp universe', () => {
+  describe('universe (TRA-255 §2 / TRA-343)', () => {
+    it('contains the Phase-1 majors plus the TRA-343 Coinbase perp expansion', () => {
       expect(PERP_SHORTS_UNIVERSE).toEqual([
-        'BTC-USD', 'ETH-USD', 'SOL-USD', 'XRP-USD', 'DOGE-USD',
+        // Phase-1 Tier-1
+        'BTC-USD', 'ETH-USD', 'SOL-USD', 'XRP-USD',
+        // Phase-1 Tier-2
+        'DOGE-USD',
+        // TRA-343 Tier-2 expansion (rest of the Coinbase perp catalog)
+        'AVAX-USD', 'LINK-USD', 'BCH-USD', 'LTC-USD', 'DOT-USD',
+        'SHIB-USD', 'SUI-USD', 'XLM-USD',
       ]);
     });
 
-    it('isPerpShortSymbol matches each universe member and rejects others', () => {
+    it('isPerpShortSymbol matches each universe member and rejects non-perp watchlist symbols', () => {
       for (const sym of PERP_SHORTS_UNIVERSE) expect(isPerpShortSymbol(sym)).toBe(true);
-      expect(isPerpShortSymbol('LINK-USD')).toBe(false);
-      expect(isPerpShortSymbol('SHIB-USD')).toBe(false);
+      // APT-USD is a watchlist symbol but Coinbase has no APT-PERP listing —
+      // shorts on it must still trip SKIP_NOT_IN_UNIVERSE.
+      expect(isPerpShortSymbol('APT-USD')).toBe(false);
+      expect(isPerpShortSymbol('ADA-USD')).toBe(false);
     });
 
-    it('Tier-2 contains DOGE-USD; Tier-1 majors are not Tier-2', () => {
+    it('Tier-2 covers DOGE plus the TRA-343 expansion; Tier-1 majors are not Tier-2', () => {
       expect(PERP_SHORTS_TIER2).toContain('DOGE-USD');
       expect(isTier2PerpShort('DOGE-USD')).toBe(true);
+      // TRA-343 — ship the new perps at conservative Tier-2 sizing.
+      for (const sym of ['AVAX-USD', 'LINK-USD', 'BCH-USD', 'LTC-USD', 'DOT-USD', 'SHIB-USD', 'SUI-USD', 'XLM-USD']) {
+        expect(isTier2PerpShort(sym)).toBe(true);
+      }
       expect(isTier2PerpShort('BTC-USD')).toBe(false);
       expect(isTier2PerpShort('ETH-USD')).toBe(false);
+      expect(isTier2PerpShort('SOL-USD')).toBe(false);
+      expect(isTier2PerpShort('XRP-USD')).toBe(false);
     });
 
     it('per-trade risk fraction is halved on Tier-2 vs Tier-1', () => {
       expect(perpShortRiskFraction('BTC-USD')).toBe(PERP_SHORT_RISK_TIER1);
       expect(perpShortRiskFraction('ETH-USD')).toBe(PERP_SHORT_RISK_TIER1);
       expect(perpShortRiskFraction('DOGE-USD')).toBe(PERP_SHORT_RISK_TIER2);
+      expect(perpShortRiskFraction('LINK-USD')).toBe(PERP_SHORT_RISK_TIER2);
       expect(PERP_SHORT_RISK_TIER1).toBeCloseTo(0.005, 6);
       expect(PERP_SHORT_RISK_TIER2).toBeCloseTo(0.003, 6);
     });

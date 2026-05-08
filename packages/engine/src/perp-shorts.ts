@@ -20,27 +20,63 @@ import type { Regime } from './regime.js';
 // ── Universe (TRA-255 §2) ──────────────────────────────────────────────────
 
 /**
- * Phase-1 perp shorts universe. Shorts on any other watchlist symbol are
- * suppressed with `signalSkipReason = SKIP_NOT_IN_UNIVERSE`. Adding a symbol
- * here is an explicit decision pending walk-forward results — keep it
- * conservative until §8 acceptance bars are met for the new addition.
+ * Perp shorts universe. Shorts on any other watchlist symbol are suppressed
+ * with `signalSkipReason = SKIP_NOT_IN_UNIVERSE`.
+ *
+ * Membership reflects what Coinbase actually lists as a USD-margined perp on
+ * INTX. The PerpCatalog (`crypto-live-account.ts`) resolves each spot key
+ * here (e.g. `BTC-USD`) to its perp product_id (e.g. `BTC-PERP-INTX`) at
+ * route time, so the universe is keyed by spot symbol intentionally.
+ *
+ * TRA-343 (operator decision, 2026-05-07) — expanded from the Phase-1 5
+ * symbols (BTC/ETH/SOL/XRP/DOGE) to the full set of 13 Coinbase perps
+ * because operators were seeing breakout-vol shorts on universe-perp
+ * symbols (LINK, AVAX, etc.) skipped with `SKIP_NOT_IN_UNIVERSE` despite
+ * the broker supporting them. The 8 new entries (AVAX, LINK, BCH, LTC,
+ * DOT, SHIB, SUI, XLM) ship at Tier-2 risk (0.30%/trade) — they did NOT go
+ * through a §8 acceptance sweep, so the conservative DOGE-equivalent sizing
+ * applies until a future walk-forward promotes them. The §8 1D PARK and the
+ * 4H r9 SOL+DOGE-only universe still apply on those timeframes.
  */
 export const PERP_SHORTS_UNIVERSE: readonly string[] = [
+  // Phase-1 Tier-1 (TRA-255 §2 / §6).
   'BTC-USD',
   'ETH-USD',
   'SOL-USD',
   'XRP-USD',
+  // Phase-1 Tier-2 (TRA-255 §6 — DOGE).
   'DOGE-USD',
+  // TRA-343 — expansion to the rest of the Coinbase perp catalog. Tier-2.
+  'AVAX-USD',
+  'LINK-USD',
+  'BCH-USD',
+  'LTC-USD',
+  'DOT-USD',
+  'SHIB-USD',
+  'SUI-USD',
+  'XLM-USD',
 ];
 
 const PERP_SHORTS_UNIVERSE_SET: ReadonlySet<string> = new Set(PERP_SHORTS_UNIVERSE);
 
 /**
  * Tier-2 symbols inside the universe (TRA-255 §6). DOGE is the canonical
- * member — Tier-2 caps per-trade short risk at 0.30% equity instead of the
- * 0.50% Tier-1 default to compensate for thinner book depth.
+ * Phase-1 member; TRA-343 added AVAX / LINK / BCH / LTC / DOT / SHIB / SUI /
+ * XLM at Tier-2 to ship the universe expansion without §8 walk-forward
+ * evidence — the 0.30% per-trade cap (vs 0.50% for Tier-1) is the
+ * conservative default until a future sweep promotes individual symbols.
  */
-export const PERP_SHORTS_TIER2: readonly string[] = ['DOGE-USD'];
+export const PERP_SHORTS_TIER2: readonly string[] = [
+  'DOGE-USD',
+  'AVAX-USD',
+  'LINK-USD',
+  'BCH-USD',
+  'LTC-USD',
+  'DOT-USD',
+  'SHIB-USD',
+  'SUI-USD',
+  'XLM-USD',
+];
 
 const PERP_SHORTS_TIER2_SET: ReadonlySet<string> = new Set(PERP_SHORTS_TIER2);
 
