@@ -1091,6 +1091,71 @@ describe('CryptoLiveAccount perp short routing (TRA-264)', () => {
     });
   });
 
+  it('relaxes the single-symbol cap when liveSingleSymbolShortCap override is set (TRA-341)', async () => {
+    // Same $30k account as the default-cap test below — managedEquity = $15k,
+    // default single-symbol cap = 15_000 × 0.15 = $2_250. Open one $5_000 BTC
+    // short on momentum, then re-evaluate the cap with the override raised to
+    // 0.50 (= $7_500). The second short, which would normally trip
+    // SKIP_SINGLE_SYMBOL_CAP, must now fall through to whichever gate fires
+    // first downstream — here the cross-strategy cap (20% × 30k = $6_000),
+    // proving the override only widens the per-strategy gate without disabling
+    // the global ceilings.
+    const { account, coinbase } = buyAccount(30_000);
+    await account.refreshBalance();
+
+    coinbase.placeMarketOrder.mockResolvedValueOnce(orderSuccess('o-1', 'SELL'));
+    coinbase.getOrder.mockResolvedValueOnce(
+      orderDetails({ order_id: 'o-1', side: 'SELL', status: 'FILLED', average_filled_price: '500', filled_size: '10' }),
+    );
+    await account.openPosition(
+      buildShortSignal({ id: 'sig-1', type: 'momentum', entryPrice: 500, stopLoss: 525, takeProfit: 450 }),
+      500,
+    );
+
+    coinbase.placeMarketOrder.mockClear();
+
+    // Operator dials the single-symbol cap up to 50% of strategy equity.
+    account.updateRiskConfig({ singleSymbolShortCap: 0.50 });
+
+    const signal = buildShortSignal({ id: 'sig-2', type: 'momentum', entryPrice: 500, stopLoss: 525, takeProfit: 450 });
+    const pos = await account.openPosition(signal, 500);
+
+    expect(pos).toBeNull();
+    expect(coinbase.placeMarketOrder).not.toHaveBeenCalled();
+    // The single-symbol cap no longer trips — the cross-strategy 20% ceiling does.
+    expect(signal.signalSkipReason).toBe('cross-strategy per-symbol short cap');
+  });
+
+  it('updateRiskConfig({ singleSymbolShortCap: null }) clears a previously-set override (TRA-341)', async () => {
+    // Set override → clear it → verify the engine falls back to the spec
+    // default. We assert at the cap-string level: with the override cleared,
+    // the second short trips SKIP_SINGLE_SYMBOL_CAP exactly as it would have
+    // before TRA-341.
+    const { account, coinbase } = buyAccount(30_000);
+    await account.refreshBalance();
+
+    account.updateRiskConfig({ singleSymbolShortCap: 0.50 });
+    account.updateRiskConfig({ singleSymbolShortCap: null });
+
+    coinbase.placeMarketOrder.mockResolvedValueOnce(orderSuccess('o-1', 'SELL'));
+    coinbase.getOrder.mockResolvedValueOnce(
+      orderDetails({ order_id: 'o-1', side: 'SELL', status: 'FILLED', average_filled_price: '500', filled_size: '10' }),
+    );
+    await account.openPosition(
+      buildShortSignal({ id: 'sig-1', type: 'momentum', entryPrice: 500, stopLoss: 525, takeProfit: 450 }),
+      500,
+    );
+
+    coinbase.placeMarketOrder.mockClear();
+
+    const signal = buildShortSignal({ id: 'sig-2', type: 'momentum', entryPrice: 500, stopLoss: 525, takeProfit: 450 });
+    const pos = await account.openPosition(signal, 500);
+
+    expect(pos).toBeNull();
+    expect(coinbase.placeMarketOrder).not.toHaveBeenCalled();
+    expect(signal.signalSkipReason).toBe('single-symbol short cap');
+  });
+
   it('emits "single-symbol short cap" before the cross-strategy or total caps fire', async () => {
     // Single-symbol cap is per-strategy at 15% of strategy equity. Build a
     // ~$30k equity account so 15% = $4_500. Open one $5_000 BTC short on

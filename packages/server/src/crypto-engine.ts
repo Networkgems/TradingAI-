@@ -209,10 +209,15 @@ export class CryptoSignalEngine {
       // TRA-232 — sync the live account to the user's risk knobs immediately
       // so the first order placed after a live-mode flip uses the right
       // managedAccountRatio / riskPerTrade.
+      // TRA-341 — also seed the operator-tunable single-symbol short cap so
+      // the very first short candidate after a live flip honours the saved
+      // override. `null` clears any previously-set cap; `undefined` (the
+      // default for unsaved settings) leaves the engine default of 0.15.
       if (s) {
         live.updateRiskConfig({
           managedAccountRatio: s.managedAccountRatio,
           riskPerTrade: s.riskPerTrade,
+          singleSymbolShortCap: s.liveSingleSymbolShortCap ?? null,
         });
       }
       return live;

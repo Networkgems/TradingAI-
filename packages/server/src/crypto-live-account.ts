@@ -393,6 +393,15 @@ export class CryptoLiveAccount {
   private managedAccountRatio: number = DEFAULT_ACCOUNT_SETTINGS.managedAccountRatio;
   private riskPerTrade: number = DEFAULT_ACCOUNT_SETTINGS.riskPerTrade;
   /**
+   * TRA-341 — operator override for the §6 single-symbol short cap, expressed
+   * as a fraction of strategy equity. Undefined ↔ engine default (0.15) per
+   * spec. Pushed in via `updateRiskConfig` whenever settings save so a knob
+   * change takes effect on the next signal evaluation; the engine-side
+   * `resolveSingleSymbolShortCap` clamps unsafe values back into range so we
+   * don't replicate that bound here.
+   */
+  private singleSymbolShortCap: number | undefined = undefined;
+  /**
    * TRA-249-C — routing mode for SELL-side strategy signals. `'hybrid'`
    * routes to a listed Coinbase perp when one exists AND the strategy
    * universe gate passes; `'spot_only'` forces the spot-only-skip branch
@@ -478,13 +487,30 @@ export class CryptoLiveAccount {
   }
 
   /**
-   * Apply per-user risk settings (managedAccountRatio, riskPerTrade) so live
-   * crypto orders sized through Coinbase honor the values entered on the
-   * Settings page. Called by the engine on init and on every settings save.
+   * Apply per-user risk settings so live crypto orders sized through Coinbase
+   * honor the values entered on the Settings page. Called by the engine on
+   * init and on every settings save.
+   *
+   * Fields:
+   *   - managedAccountRatio / riskPerTrade — TRA-232 sizing knobs.
+   *   - singleSymbolShortCap — TRA-341 operator override for the §6
+   *     single-symbol short cap (fraction of strategy equity). `null` clears
+   *     a previously-set override back to the engine default; `undefined`
+   *     leaves the existing value untouched (so partial-config callers like
+   *     a managedAccountRatio-only update don't accidentally reset it).
    */
-  updateRiskConfig(config: { managedAccountRatio?: number; riskPerTrade?: number }): void {
+  updateRiskConfig(config: {
+    managedAccountRatio?: number;
+    riskPerTrade?: number;
+    singleSymbolShortCap?: number | null;
+  }): void {
     if (config.managedAccountRatio !== undefined) this.managedAccountRatio = config.managedAccountRatio;
     if (config.riskPerTrade !== undefined) this.riskPerTrade = config.riskPerTrade;
+    if (config.singleSymbolShortCap === null) {
+      this.singleSymbolShortCap = undefined;
+    } else if (config.singleSymbolShortCap !== undefined) {
+      this.singleSymbolShortCap = config.singleSymbolShortCap;
+    }
   }
 
   /**
@@ -1392,6 +1418,8 @@ export class CryptoLiveAccount {
         (p) => p.symbol === signal.symbol,
       ),
       openShortsTotalUsd: this.sumOpenShortNotional(),
+      // TRA-341 — operator override. Undefined here ↔ engine default (0.15).
+      singleSymbolCapOverride: this.singleSymbolShortCap,
     });
     if (capReason) {
       return this.recordStrategySkip(signal, capReason);

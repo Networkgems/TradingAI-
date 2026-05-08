@@ -180,8 +180,34 @@ export function perpShortRiskFraction(symbol: string): number {
  * Single-symbol cap on shorts opened by ONE strategy: 15% of that strategy's
  * managed equity. Prevents a single-symbol short from dominating a single
  * strategy's risk budget even when the per-trade sizing comes in light.
+ *
+ * Default only — the live preset can override this per-user via
+ * `AccountSettings.liveSingleSymbolShortCap`. {@link resolveSingleSymbolShortCap}
+ * clamps the override to a sane band before the cap is applied.
  */
 export const PERP_SHORT_SINGLE_SYMBOL_CAP = 0.15;
+
+/**
+ * Upper bound for the operator-tunable single-symbol cap (TRA-341). 1.0 ↔
+ * "single-symbol shorts may consume the entire strategy slice" — anything
+ * above that is meaningless under 1× isolated leverage and would let the gate
+ * silently no-op. The cross-strategy and total caps still apply downstream so
+ * a 1.0 setting doesn't mean "unlimited shorts on one symbol".
+ */
+export const PERP_SHORT_SINGLE_SYMBOL_CAP_MAX = 1.0;
+
+/**
+ * Resolve the active single-symbol cap from an optional operator override.
+ * Returns the spec default when the override is undefined, ≤ 0, or non-finite,
+ * and clamps positive values to {@link PERP_SHORT_SINGLE_SYMBOL_CAP_MAX} so a
+ * fat-finger entry can't disable the gate by accident.
+ */
+export function resolveSingleSymbolShortCap(override: number | undefined): number {
+  if (override === undefined || !Number.isFinite(override) || override <= 0) {
+    return PERP_SHORT_SINGLE_SYMBOL_CAP;
+  }
+  return Math.min(override, PERP_SHORT_SINGLE_SYMBOL_CAP_MAX);
+}
 
 /**
  * Cross-strategy cap on shorts opened across all strategies on the SAME
@@ -386,6 +412,27 @@ export interface ShortNotionalCapInputs {
   openShortsAllStrategiesThisSymbolUsd: number;
   /** Sum of open short notional across the whole book (all strategies + symbols). */
   openShortsTotalUsd: number;
+  /**
+   * TRA-341 — operator-tunable override for the §6 single-symbol cap. Expressed
+   * as a fraction of strategy equity (e.g. `0.25` ↔ 25%). Undefined ↔ use the
+   * spec default {@link PERP_SHORT_SINGLE_SYMBOL_CAP} (0.15). The cross-strategy
+   * (§6 row 2) and total-book (§6 row 3) caps are intentionally NOT overridable
+   * here — they're whole-book risk ceilings, not per-strategy budgets, and
+   * relaxing them is a code-and-spec change rather than an operator knob.
+   *
+   * Why a knob: on small live accounts (e.g. the TRA-324 $180 board) the
+   * default 15% cap maps to a $27 per-symbol budget, which is below
+   * MIN_NOTIONAL_USD on most pairs after the engine's own sizing — every
+   * candidate fires `SKIP_SINGLE_SYMBOL_CAP` before the order ever reaches
+   * Coinbase. Letting the user dial this up on the live preset unblocks the
+   * test rig without loosening the global ceilings.
+   *
+   * Bounds: clamped to (0, 1] at use-time. A value ≤ 0 falls back to the
+   * default rather than disabling shorts entirely; > 1 would let a single
+   * short exceed strategy equity which 1× isolated leverage already prevents
+   * upstream, but we still bound to 1.0 so the gate doesn't no-op silently.
+   */
+  singleSymbolCapOverride?: number;
 }
 
 /**
@@ -395,7 +442,8 @@ export interface ShortNotionalCapInputs {
  * and skips order submit.
  *
  * Order matches the spec table:
- *   1. Single-symbol cap (per-strategy, 15% strategy equity)
+ *   1. Single-symbol cap (per-strategy, 15% strategy equity by default;
+ *      operator-overridable via `inputs.singleSymbolCapOverride`).
  *   2. Cross-strategy per-symbol cap (20% total equity)
  *   3. Total short notional ceiling (30% total equity)
  */
@@ -407,10 +455,12 @@ export function evaluateShortNotionalCaps(inputs: ShortNotionalCapInputs): strin
     openShortsThisStrategyThisSymbolUsd,
     openShortsAllStrategiesThisSymbolUsd,
     openShortsTotalUsd,
+    singleSymbolCapOverride,
   } = inputs;
 
   if (strategyEquityUsd > 0) {
-    const singleSymbolLimit = strategyEquityUsd * PERP_SHORT_SINGLE_SYMBOL_CAP;
+    const singleSymbolCap = resolveSingleSymbolShortCap(singleSymbolCapOverride);
+    const singleSymbolLimit = strategyEquityUsd * singleSymbolCap;
     if (openShortsThisStrategyThisSymbolUsd + candidateShortNotionalUsd > singleSymbolLimit) {
       return SKIP_SINGLE_SYMBOL_CAP;
     }

@@ -467,6 +467,24 @@ export interface AccountSettings {
    * `min(liveMaxLeverageCrypto, ENGINE_HARD_CAP)`.
    */
   liveMaxLeverageCrypto?: number;
+  /**
+   * TRA-341 — operator-tunable override for the §6 single-symbol short cap on
+   * the LIVE crypto preset, expressed as a fraction of strategy equity (0–1).
+   * Default 0.15 (PERP_SHORT_SINGLE_SYMBOL_CAP in @trading-app/engine) per spec; the
+   * Live test board ($180 managed) saturates that cap below MIN_NOTIONAL_USD
+   * on most pairs and every short signal trips `SKIP_SINGLE_SYMBOL_CAP` before
+   * the order ever reaches Coinbase. Raising this knob loosens the per-strategy
+   * single-symbol budget without touching the cross-strategy (20%) or total
+   * (30%) ceilings, which still enforce whole-book risk.
+   *
+   * Engine-side resolver (`resolveSingleSymbolShortCap`) clamps the value to
+   * (0, 1] and falls back to the spec default for unset / non-finite / ≤ 0
+   * inputs, so a fat-finger save can't accidentally disable the gate.
+   *
+   * Optional for back-compat with snapshots persisted before TRA-341 — absent
+   * ↔ spec default.
+   */
+  liveSingleSymbolShortCap?: number;
   // Live mode settings — Stocks (Webull). Webull uses Account ID for routing
   // and (today) does not require a separate API secret.
   liveBrokerageTypeStocks?: BrokerageType;

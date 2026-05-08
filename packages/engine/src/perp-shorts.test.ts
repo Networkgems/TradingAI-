@@ -6,6 +6,8 @@ import {
   PERP_SHORT_RISK_TIER1,
   PERP_SHORT_RISK_TIER2,
   PERP_SHORT_SINGLE_SYMBOL_CAP,
+  PERP_SHORT_SINGLE_SYMBOL_CAP_MAX,
+  resolveSingleSymbolShortCap,
   PERP_SHORT_CROSS_STRATEGY_CAP,
   PERP_SHORT_TOTAL_NOTIONAL_CAP,
   FUNDING_GATE_THRESHOLD_PER_HOUR,
@@ -299,6 +301,89 @@ describe('perp shorts spec wiring (TRA-261)', () => {
       expect(PERP_SHORT_SINGLE_SYMBOL_CAP).toBeCloseTo(0.15, 6);
       expect(PERP_SHORT_CROSS_STRATEGY_CAP).toBeCloseTo(0.20, 6);
       expect(PERP_SHORT_TOTAL_NOTIONAL_CAP).toBeCloseTo(0.30, 6);
+    });
+
+    // TRA-341 — operator-tunable single-symbol cap. The override widens the
+    // per-strategy budget without touching the cross-strategy / total caps.
+    describe('singleSymbolCapOverride (TRA-341)', () => {
+      it('relaxes the single-symbol gate when override is wider than the default', () => {
+        // 50k strategy * 0.15 = $7,500 default — would trip with $7,000 + $1,000.
+        // Override at 0.25 → $12,500 limit, so the same candidate passes.
+        const reason = evaluateShortNotionalCaps({
+          ...baseInputs,
+          openShortsThisStrategyThisSymbolUsd: 7_000,
+          candidateShortNotionalUsd: 1_000,
+          singleSymbolCapOverride: 0.25,
+        });
+        expect(reason).toBeNull();
+      });
+
+      it('still trips when the override is wider but the cross-strategy cap is breached', () => {
+        // Override at 1.0 lets single-symbol pass freely, but the cross-strategy
+        // cap (20% total = $20,000) still bites at $19,500 + $1,000.
+        const reason = evaluateShortNotionalCaps({
+          ...baseInputs,
+          openShortsAllStrategiesThisSymbolUsd: 19_500,
+          candidateShortNotionalUsd: 1_000,
+          singleSymbolCapOverride: 1.0,
+        });
+        expect(reason).toBe(SKIP_CROSS_STRATEGY_CAP);
+      });
+
+      it('falls back to spec default when override is undefined / non-finite / ≤ 0', () => {
+        const baseTrip = {
+          ...baseInputs,
+          openShortsThisStrategyThisSymbolUsd: 7_000,
+          candidateShortNotionalUsd: 1_000,
+        };
+        // No override → default 0.15 → trips.
+        expect(evaluateShortNotionalCaps(baseTrip)).toBe(SKIP_SINGLE_SYMBOL_CAP);
+        expect(
+          evaluateShortNotionalCaps({ ...baseTrip, singleSymbolCapOverride: NaN }),
+        ).toBe(SKIP_SINGLE_SYMBOL_CAP);
+        expect(
+          evaluateShortNotionalCaps({ ...baseTrip, singleSymbolCapOverride: 0 }),
+        ).toBe(SKIP_SINGLE_SYMBOL_CAP);
+        expect(
+          evaluateShortNotionalCaps({ ...baseTrip, singleSymbolCapOverride: -0.5 }),
+        ).toBe(SKIP_SINGLE_SYMBOL_CAP);
+      });
+
+      it('clamps override above PERP_SHORT_SINGLE_SYMBOL_CAP_MAX so the gate never silently no-ops', () => {
+        // strategyEquity = $50k. Cap clamped to 1.0 → $50k limit. A candidate
+        // that would breach $50k still trips, even when the override is 5.0.
+        const reason = evaluateShortNotionalCaps({
+          ...baseInputs,
+          openShortsThisStrategyThisSymbolUsd: 50_000,
+          candidateShortNotionalUsd: 1,
+          singleSymbolCapOverride: 5.0,
+        });
+        expect(reason).toBe(SKIP_SINGLE_SYMBOL_CAP);
+      });
+    });
+  });
+
+  describe('resolveSingleSymbolShortCap (TRA-341)', () => {
+    it('returns the spec default for unset / non-finite / non-positive inputs', () => {
+      expect(resolveSingleSymbolShortCap(undefined)).toBeCloseTo(PERP_SHORT_SINGLE_SYMBOL_CAP, 6);
+      expect(resolveSingleSymbolShortCap(NaN)).toBeCloseTo(PERP_SHORT_SINGLE_SYMBOL_CAP, 6);
+      expect(resolveSingleSymbolShortCap(Number.POSITIVE_INFINITY)).toBeCloseTo(PERP_SHORT_SINGLE_SYMBOL_CAP, 6);
+      expect(resolveSingleSymbolShortCap(0)).toBeCloseTo(PERP_SHORT_SINGLE_SYMBOL_CAP, 6);
+      expect(resolveSingleSymbolShortCap(-0.5)).toBeCloseTo(PERP_SHORT_SINGLE_SYMBOL_CAP, 6);
+    });
+
+    it('passes through valid in-band overrides untouched', () => {
+      expect(resolveSingleSymbolShortCap(0.05)).toBeCloseTo(0.05, 6);
+      expect(resolveSingleSymbolShortCap(0.5)).toBeCloseTo(0.5, 6);
+      expect(resolveSingleSymbolShortCap(PERP_SHORT_SINGLE_SYMBOL_CAP_MAX)).toBeCloseTo(
+        PERP_SHORT_SINGLE_SYMBOL_CAP_MAX,
+        6,
+      );
+    });
+
+    it('clamps overrides above the max so a fat-finger save can never disable the gate', () => {
+      expect(resolveSingleSymbolShortCap(2)).toBeCloseTo(PERP_SHORT_SINGLE_SYMBOL_CAP_MAX, 6);
+      expect(resolveSingleSymbolShortCap(99)).toBeCloseTo(PERP_SHORT_SINGLE_SYMBOL_CAP_MAX, 6);
     });
   });
 
