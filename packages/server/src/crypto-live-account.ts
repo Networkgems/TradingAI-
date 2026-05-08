@@ -2,6 +2,7 @@ import type {
   LiveSkip,
   LiveTradeRoutingCrypto,
   Position,
+  PositionQuoteSource,
   SignalType,
   TradeSignal,
 } from '@trading-app/shared';
@@ -1038,6 +1039,8 @@ export class CryptoLiveAccount {
           ? (entryPrice * size) / leverage
           : 0,
         liquidationPrice: Number.isFinite(liquidationPrice) && liquidationPrice > 0 ? liquidationPrice : undefined,
+        // TRA-338 — Coinbase reconciliation, so the entry came from Coinbase.
+        quoteSource: 'coinbase',
       };
       this.positions.set(positionId, position);
       this.perpProductByPositionId.set(positionId, p.product_id);
@@ -1116,7 +1119,7 @@ export class CryptoLiveAccount {
    * `recordSkip`). Without this, skips were `console.warn`-only and operators
    * saw "8 signals, 0 positions" with no way to self-diagnose.
    */
-  async openPosition(signal: TradeSignal, currentPrice: number): Promise<Position | null> {
+  async openPosition(signal: TradeSignal, currentPrice: number, quoteSource?: PositionQuoteSource): Promise<Position | null> {
     // TRA-264 — SELL-side fork. Symbols inside the Phase-1 perp shorts
     // universe (TRA-261 / TRA-255 §2: BTC, ETH, SOL, XRP, DOGE) route to
     // Coinbase INTX as 1× isolated perp shorts. Anything else falls back to
@@ -1135,7 +1138,7 @@ export class CryptoLiveAccount {
       if (!isPerpShortSymbol(signal.symbol)) {
         return this.recordSkip(signal, `spot only — no perp listed for ${signal.symbol}`);
       }
-      return this.openPerpShort(signal, currentPrice);
+      return this.openPerpShort(signal, currentPrice, quoteSource);
     }
 
     // TRA-243 — refuse to fire orders against tickers Coinbase doesn't list
@@ -1272,6 +1275,11 @@ export class CryptoLiveAccount {
       stopLoss: signal.stopLoss,
       takeProfit: signal.takeProfit,
       openedAt: Date.now(),
+      // TRA-338 — record provenance. The engine only routes Coinbase-priced
+      // signals here, but `currentPrice` is also reconciled against the
+      // actual Coinbase fill (`fill?.price`); either way this stamp is
+      // 'coinbase' on the live path.
+      quoteSource: quoteSource ?? 'coinbase',
     };
     this.positions.set(position.id, position);
     // Optimistic cash debit; refreshBalance() will reconcile from Coinbase.
@@ -1305,7 +1313,7 @@ export class CryptoLiveAccount {
    * `realizedPnlToday` so the dashboard's daily P&L matches reality, with a
    * parallel `realizedShortPnlToday` tally feeding the §7 circuit breaker.
    */
-  private async openPerpShort(signal: TradeSignal, currentPrice: number): Promise<Position | null> {
+  private async openPerpShort(signal: TradeSignal, currentPrice: number, quoteSource?: PositionQuoteSource): Promise<Position | null> {
     if (
       dailyShortCircuitBreakerTripped({
         shortPnlTodayUsd: this.realizedShortPnlToday + this.openShortsUnrealisedPnlUsd,
@@ -1449,6 +1457,11 @@ export class CryptoLiveAccount {
       // entry). Coinbase recomputes against funding + mark price as the
       // position moves; we surface the open-time approximation only.
       liquidationPrice: entryPrice * 2,
+      // TRA-338 — perp shorts trade off Coinbase INTX, so the entry price
+      // necessarily came from Coinbase telemetry; threading the engine's
+      // tick-supplied source through keeps the audit trail honest if a
+      // future caller (e.g. a manual operator open) supplies something else.
+      quoteSource: quoteSource ?? 'coinbase',
     };
     this.positions.set(positionId, position);
     this.perpProductByPositionId.set(positionId, perpProductId);

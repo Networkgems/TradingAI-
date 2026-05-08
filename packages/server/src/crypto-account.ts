@@ -1,4 +1,4 @@
-import type { AccountState, Position, TradeSignal, SignalType } from '@trading-app/shared';
+import type { AccountState, Position, PositionQuoteSource, TradeSignal, SignalType } from '@trading-app/shared';
 import { DEFAULT_ACCOUNT_SETTINGS } from '@trading-app/shared';
 import { randomUUID } from 'crypto';
 
@@ -109,7 +109,22 @@ export class CryptoPaperAccount {
     return Math.round(rawQty * 1_000_000) / 1_000_000;
   }
 
-  openPosition(signal: TradeSignal, currentPrice: number): Position | null {
+  /**
+   * @param signal       Strategy signal that fired the entry.
+   * @param currentPrice Live quote used to size + record the entry. Must be
+   *                     sourced from the venue we trade on (Coinbase) per
+   *                     TRA-338 — the engine enforces this before calling.
+   * @param quoteSource  TRA-338 — provider that supplied `currentPrice`. The
+   *                     engine only routes Coinbase-priced signals to the
+   *                     paper account, so in practice this is `'coinbase'`;
+   *                     the parameter exists so the audit trail on
+   *                     `Position.quoteSource` is correct on the rare
+   *                     manual-entry path (admin tooling). Optional with no
+   *                     default so an accidental missing argument lights up
+   *                     in code review rather than silently writing
+   *                     `'unknown'` onto a fresh entry.
+   */
+  openPosition(signal: TradeSignal, currentPrice: number, quoteSource?: PositionQuoteSource): Position | null {
     let qty = this.sizeFromStop(signal.entryPrice, signal.stopLoss);
     if (qty <= 0) {
       console.warn(`[crypto-account] skip ${signal.symbol} ${signal.type}: qty=0 (entry=${signal.entryPrice} stop=${signal.stopLoss} maxRisk=${this.maxRiskPerTrade().toFixed(2)})`);
@@ -156,6 +171,7 @@ export class CryptoPaperAccount {
       stopLoss: signal.stopLoss,
       takeProfit: signal.takeProfit,
       openedAt: Date.now(),
+      quoteSource,
     };
     this.positions.set(position.id, position);
     return position;
@@ -282,6 +298,12 @@ export class CryptoPaperAccount {
     this.initialEquity = snap.initialEquity;
     this.openingEquityToday = snap.openingEquityToday;
     this.positions.clear();
-    for (const p of snap.openPositions) this.positions.set(p.id, p);
+    for (const p of snap.openPositions) {
+      // TRA-338 — backfill quoteSource on legacy positions persisted before
+      // the field existed so the API surface always answers a non-undefined
+      // value. New entries write 'coinbase' explicitly via openPosition;
+      // anything else on disk is from a pre-fix snapshot and is untraceable.
+      this.positions.set(p.id, p.quoteSource ? p : { ...p, quoteSource: 'unknown' });
+    }
   }
 }

@@ -1,5 +1,5 @@
 import YahooFinance from 'yahoo-finance2';
-import type { Candle, NewsItem } from '@trading-app/shared';
+import type { Candle, NewsItem, PositionQuoteSource } from '@trading-app/shared';
 import {
   fetchCoinbase4hBars,
   fetchCoinbaseDailyBars,
@@ -49,6 +49,119 @@ if (!CMC_API_KEY) {
   console.warn('[crypto-feed] CMC_API_KEY is not set — CoinMarketCap fallback disabled');
 }
 
+/**
+ * TRA-338 — typed crypto quote with provenance. Same numeric shape the cascade
+ * has always emitted, plus a `source` tag that records which provider supplied
+ * the price. The crypto engine threads this onto every new position so a
+ * future incident (cf. TRA-337's MEGA-USD phantom $4.05 entry from a Yahoo
+ * ghost ticker) can be triaged from the trades API rather than from the logs.
+ */
+export interface CryptoQuote {
+  price: number;
+  volume: number;
+  change: number;
+  changePct: number;
+  source: PositionQuoteSource; // 'coinbase' | 'yahoo' | 'cmc' (never 'manual'/'unknown' from this path)
+}
+
+/**
+ * TRA-338 — Coinbase Exchange product allowlist. Populated lazily by
+ * `refreshCoinbaseProductCatalog()`; kept module-level so every per-user
+ * crypto engine shares one catalog (the data is venue-wide). A symbol is
+ * "tradable on Coinbase" iff it appears in the catalog AND its product entry
+ * has `status === 'online' && trading_disabled === false`.
+ *
+ * The catalog is the gate the engine uses to decide whether to even consider
+ * routing a strategy signal: if Coinbase doesn't list the symbol we don't
+ * open a position, full stop. Yahoo / CMC stay on the path for *display*
+ * refreshes only.
+ */
+let coinbaseProductCatalog: Map<string, { online: boolean; tradingDisabled: boolean }> | null = null;
+let coinbaseCatalogLastRefreshed = 0;
+/** Refresh cadence — catalog rarely changes intraday, so 1h is plenty. */
+const COINBASE_CATALOG_TTL_MS = 60 * 60_000;
+
+/**
+ * TRA-338 — fetch (or refresh, when stale) the Coinbase Exchange product
+ * catalog and populate the module-level allowlist. Best-effort: a network
+ * blip leaves the prior catalog in place rather than nuking it (we'd rather
+ * skip a possibly-listed symbol once than open a Yahoo-priced ghost).
+ *
+ * Behaviour:
+ *  - First call after boot fans out one `GET /products` (returns ~600
+ *    products; cheap and cached upstream). Subsequent calls inside the TTL
+ *    window are no-ops.
+ *  - On a successful refresh the catalog is replaced atomically; on failure
+ *    the prior catalog (if any) is preserved.
+ *  - The status fields on each entry are derived from Coinbase's per-product
+ *    `status` and `trading_disabled` flags so `isCoinbaseListed` can answer
+ *    "online + tradable" without a per-call /products lookup.
+ */
+export async function refreshCoinbaseProductCatalog(): Promise<void> {
+  const now = Date.now();
+  if (coinbaseProductCatalog && now - coinbaseCatalogLastRefreshed < COINBASE_CATALOG_TTL_MS) return;
+  try {
+    const resp = await withTimeout(
+      paceCoinbaseFetch(`${COINBASE_BASE}/products`, {
+        headers: { 'User-Agent': 'TRA-338/1.0', Accept: 'application/json' },
+      }),
+      FEED_CALL_TIMEOUT_MS,
+      'Coinbase /products',
+    );
+    if (!resp.ok) {
+      console.warn(`[crypto-feed] Coinbase /products HTTP ${resp.status} — catalog not refreshed`);
+      return;
+    }
+    const json = (await resp.json()) as Array<{
+      id?: string;
+      status?: string;
+      trading_disabled?: boolean;
+    }>;
+    const next = new Map<string, { online: boolean; tradingDisabled: boolean }>();
+    for (const p of json) {
+      if (!p?.id) continue;
+      next.set(p.id, {
+        online: p.status === 'online',
+        tradingDisabled: p.trading_disabled === true,
+      });
+    }
+    coinbaseProductCatalog = next;
+    coinbaseCatalogLastRefreshed = now;
+  } catch (err: unknown) {
+    console.warn(`[crypto-feed] refreshCoinbaseProductCatalog: ${err instanceof Error ? err.message : String(err)}`);
+  }
+}
+
+/**
+ * TRA-338 — `true` iff `symbol` is listed on Coinbase Exchange AND the
+ * product is online and not trading-disabled. Returns `null` when the
+ * catalog has never been successfully fetched, so callers can choose
+ * fail-closed semantics (skip the signal until we know) instead of
+ * fail-open (the failure mode that produced TRA-337).
+ */
+export function isCoinbaseListed(symbol: string): boolean | null {
+  if (!coinbaseProductCatalog) return null;
+  const entry = coinbaseProductCatalog.get(symbol);
+  if (!entry) return false;
+  return entry.online && !entry.tradingDisabled;
+}
+
+/** Test hook: clear the catalog so tests can simulate cold-start states. */
+export function _resetCoinbaseProductCatalogForTests(): void {
+  coinbaseProductCatalog = null;
+  coinbaseCatalogLastRefreshed = 0;
+}
+
+/** Test hook: seed an in-memory catalog (instead of hitting Coinbase). */
+export function _seedCoinbaseProductCatalogForTests(
+  entries: ReadonlyArray<{ id: string; online: boolean; tradingDisabled: boolean }>,
+): void {
+  const next = new Map<string, { online: boolean; tradingDisabled: boolean }>();
+  for (const e of entries) next.set(e.id, { online: e.online, tradingDisabled: e.tradingDisabled });
+  coinbaseProductCatalog = next;
+  coinbaseCatalogLastRefreshed = Date.now();
+}
+
 // Convert Yahoo Finance crypto symbol format to CMC symbol (BTC-USD -> BTC)
 function toCMCSymbol(yahooSymbol: string): string {
   return yahooSymbol.replace(/-USD$/, '').replace(/-USDT$/, '');
@@ -74,8 +187,8 @@ function toCMCSymbol(yahooSymbol: string): string {
 const COINBASE_BASE = 'https://api.exchange.coinbase.com';
 async function fetchCoinbaseStatsQuotes(
   symbols: readonly string[],
-): Promise<Map<string, { price: number; volume: number; change: number; changePct: number }>> {
-  const results = new Map<string, { price: number; volume: number; change: number; changePct: number }>();
+): Promise<Map<string, CryptoQuote>> {
+  const results = new Map<string, CryptoQuote>();
   if (symbols.length === 0) return results;
   // All requests route through `paceCoinbaseFetch` so they share the same
   // 10 req/s/IP budget as the candle fetchers (TRA-300 — see scheduler doc
@@ -99,7 +212,7 @@ async function fetchCoinbaseStatsQuotes(
       if (!Number.isFinite(price) || price <= 0) return [sym, null] as const;
       const changePct = Number.isFinite(open) && open > 0 ? ((price - open) / open) * 100 : 0;
       const change = price - (Number.isFinite(open) ? open : price);
-      return [sym, { price, volume, change, changePct }] as const;
+      return [sym, { price, volume, change, changePct, source: 'coinbase' as const }] as const;
     } catch {
       return [sym, null] as const;
     }
@@ -112,7 +225,7 @@ async function fetchCoinbaseStatsQuotes(
 
 async function fetchCMCBatchQuotes(
   symbols: readonly string[],
-): Promise<Map<string, { price: number; volume: number; change: number; changePct: number }>> {
+): Promise<Map<string, CryptoQuote>> {
   if (!CMC_API_KEY || symbols.length === 0) return new Map();
   const cmcSymbolList = [...new Set(symbols.map(toCMCSymbol))].join(',');
   try {
@@ -129,7 +242,7 @@ async function fetchCMCBatchQuotes(
       return new Map();
     }
     const json = (await resp.json()) as any;
-    const results = new Map<string, { price: number; volume: number; change: number; changePct: number }>();
+    const results = new Map<string, CryptoQuote>();
     for (const sym of symbols) {
       const data = json?.data?.[toCMCSymbol(sym)]?.quote?.USD;
       if (data?.price == null) continue;
@@ -140,6 +253,7 @@ async function fetchCMCBatchQuotes(
         volume: (data.volume_24h as number) ?? 0,
         change: price * (changePct / 100),
         changePct,
+        source: 'cmc',
       });
     }
     return results;
@@ -303,9 +417,7 @@ export async function fetchCryptoMinuteBars(symbol: string, count = 60): Promise
   }
 }
 
-export async function fetchCryptoQuote(
-  symbol: string,
-): Promise<{ price: number; volume: number; change: number; changePct: number } | null> {
+export async function fetchCryptoQuote(symbol: string): Promise<CryptoQuote | null> {
   // TRA-300 — same primary-Coinbase, YF-then-CMC-fallback ordering as
   // `fetchCryptoQuotes`. Coinbase Exchange public stats first because the
   // live trade account routes to the same venue, so quote ↔ execution
@@ -322,6 +434,7 @@ export async function fetchCryptoQuote(
           volume: q.regularMarketVolume ?? 0,
           change: q.regularMarketChange ?? 0,
           changePct: q.regularMarketChangePercent ?? 0,
+          source: 'yahoo',
         };
       }
       console.warn(`[crypto-feed] quote(${symbol}) returned no regularMarketPrice — trying CMC`);
@@ -343,8 +456,8 @@ export async function fetchCryptoQuote(
 
 export async function fetchCryptoQuotes(
   symbols: readonly string[],
-): Promise<Map<string, { price: number; volume: number; change: number; changePct: number }>> {
-  const results = new Map<string, { price: number; volume: number; change: number; changePct: number }>();
+): Promise<Map<string, CryptoQuote>> {
+  const results = new Map<string, CryptoQuote>();
   if (symbols.length === 0) return results;
 
   // TRA-300 — Coinbase Exchange is the primary quote source for crypto. Same
@@ -380,6 +493,7 @@ export async function fetchCryptoQuotes(
               volume: q.regularMarketVolume ?? 0,
               change: q.regularMarketChange ?? 0,
               changePct: q.regularMarketChangePercent ?? 0,
+              source: 'yahoo' as const,
             }] as const;
           }
           yahooMissingPrice += 1;

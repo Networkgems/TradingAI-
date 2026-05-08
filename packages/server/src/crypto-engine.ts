@@ -21,13 +21,22 @@ import type {
   Candle,
   AccountState,
   Position,
+  PositionQuoteSource,
   CryptoEngineState,
   NewsItem,
   AccountSettings,
   CryptoStrategyType,
   StrategyPreset,
 } from '@trading-app/shared';
-import { fetchCryptoMinuteBars, fetchCryptoDailyBars, fetchCrypto4hBars, fetchCryptoQuotes, fetchCryptoNews } from './crypto-feed.js';
+import {
+  fetchCryptoMinuteBars,
+  fetchCryptoDailyBars,
+  fetchCrypto4hBars,
+  fetchCryptoQuotes,
+  fetchCryptoNews,
+  refreshCoinbaseProductCatalog,
+  isCoinbaseListed,
+} from './crypto-feed.js';
 import { isYahooBreakerOpen } from './yahoo-feed.js';
 import { CryptoPaperAccount } from './crypto-account.js';
 import { CryptoLiveAccount } from './crypto-live-account.js';
@@ -631,11 +640,24 @@ export class CryptoSignalEngine {
 
   private async doTick(): Promise<void> {
     const activeSymbols = this.getActiveSymbols();
+    // TRA-338 — keep the Coinbase product allowlist warm. Cheap (one /products
+    // call gated by a 1h TTL) and idempotent across per-user engines because
+    // the catalog is venue-wide. Done before quote fan-out so the engine
+    // already knows which symbols are tradable on Coinbase before the entry
+    // gate runs below.
+    await refreshCoinbaseProductCatalog();
     const quotes = await fetchCryptoQuotes(activeSymbols);
 
     const prices = new Map<string, number>();
+    // TRA-338 — parallel map keyed by symbol of which provider supplied the
+    // quote we're about to feed `openPosition` with. Threaded straight through
+    // to the paper account so `Position.quoteSource` reflects reality on every
+    // entry instead of the prior "trust the cascade" behaviour that produced
+    // TRA-337's MEGA-USD ghost.
+    const quoteSources = new Map<string, PositionQuoteSource>();
     for (const [sym, q] of quotes) {
       prices.set(sym, q.price);
+      quoteSources.set(sym, q.source);
       this.symbolState.set(sym, {
         symbol: sym,
         price: q.price,
@@ -679,7 +701,7 @@ export class CryptoSignalEngine {
     // see when they switch back.
     if (this.mode === 'live') {
       if (this.liveAccount) {
-        await this.runLiveTick(prices, activeSymbols);
+        await this.runLiveTick(prices, activeSymbols, quoteSources);
       }
       for (const h of this.handlers) h(this.buildState());
       return;
@@ -807,7 +829,37 @@ export class CryptoSignalEngine {
           // by `MeanReversionCryptoStrategy` (off-strategy MR shorts).
           if (signal.signalSkipReason) continue;
 
-          const opened = this.account.openPosition(signal, price);
+          // TRA-338 — Coinbase-strict entry gate. We trade what Coinbase
+          // trades; if the symbol isn't listed there (e.g. Yahoo's MEGA-USD
+          // pointing at a 2022-delisted "MegaCryptoPolis" token, which gave
+          // TRA-337 a frozen $4.05 entry), we don't open. And even when the
+          // product *is* listed, the entry price MUST come from Coinbase —
+          // otherwise we'd mark the entry off a YF/CMC ghost and watch the
+          // P&L diverge against Coinbase's actual current price the moment
+          // the next refresh lands.
+          const cbListed = isCoinbaseListed(sym);
+          if (cbListed === false) {
+            signal.signalSkipReason = `${sym} not listed on Coinbase Exchange — skipping entry (we only trade what Coinbase trades)`;
+            console.warn(`[crypto-engine] ${sym} ${signal.type}: ${signal.signalSkipReason}`);
+            continue;
+          }
+          const source = quoteSources.get(sym);
+          if (cbListed === true && source !== 'coinbase') {
+            signal.signalSkipReason = `${sym} listed on Coinbase but no Coinbase quote this tick (got ${source ?? 'no quote'}) — refusing fallback-priced entry`;
+            console.warn(`[crypto-engine] ${sym} ${signal.type}: ${signal.signalSkipReason}`);
+            continue;
+          }
+          // cbListed === null → catalog never refreshed successfully. Fall
+          // through to the existing source-based gate; we still refuse non-
+          // Coinbase prices for entries because the cascade may have routed
+          // through Yahoo's ghost ticker. This is the fail-closed branch.
+          if (cbListed === null && source !== 'coinbase') {
+            signal.signalSkipReason = `${sym} no Coinbase quote and Coinbase product catalog unavailable — refusing fallback-priced entry`;
+            console.warn(`[crypto-engine] ${sym} ${signal.type}: ${signal.signalSkipReason}`);
+            continue;
+          }
+
+          const opened = this.account.openPosition(signal, price, source);
           if (opened) opened.mode = 'demo';
         }
       }
@@ -831,7 +883,7 @@ export class CryptoSignalEngine {
    * TP/SL was hit, then evaluate strategies and open new positions on
    * Coinbase. Mirrors the demo-mode flow but every order hits the broker.
    */
-  private async runLiveTick(prices: Map<string, number>, activeSymbols: string[]): Promise<void> {
+  private async runLiveTick(prices: Map<string, number>, activeSymbols: string[], quoteSources: Map<string, PositionQuoteSource>): Promise<void> {
     const live = this.liveAccount;
     if (!live) return;
 
@@ -959,8 +1011,32 @@ export class CryptoSignalEngine {
         // already on the recent-signals list with the reason stamped.
         if (signal.signalSkipReason) continue;
 
+        // TRA-338 — Coinbase-strict entry gate. Live mode already had a
+        // tradable-product check inside `CryptoLiveAccount.openPosition`
+        // (TRA-243), but it ran AFTER quote-derived sizing — meaning a
+        // YF/CMC-priced signal could still be sized off a phantom price
+        // before being rejected at the broker. Apply the same gate the demo
+        // path uses so quote provenance is checked alongside listing.
+        const cbListed = isCoinbaseListed(sym);
+        if (cbListed === false) {
+          signal.signalSkipReason = `${sym} not listed on Coinbase Exchange — skipping entry (we only trade what Coinbase trades)`;
+          console.warn(`[crypto-engine] ${sym} ${signal.type}: ${signal.signalSkipReason}`);
+          continue;
+        }
+        const source = quoteSources.get(sym);
+        if (cbListed === true && source !== 'coinbase') {
+          signal.signalSkipReason = `${sym} listed on Coinbase but no Coinbase quote this tick (got ${source ?? 'no quote'}) — refusing fallback-priced entry`;
+          console.warn(`[crypto-engine] ${sym} ${signal.type}: ${signal.signalSkipReason}`);
+          continue;
+        }
+        if (cbListed === null && source !== 'coinbase') {
+          signal.signalSkipReason = `${sym} no Coinbase quote and Coinbase product catalog unavailable — refusing fallback-priced entry`;
+          console.warn(`[crypto-engine] ${sym} ${signal.type}: ${signal.signalSkipReason}`);
+          continue;
+        }
+
         try {
-          await live.openPosition(signal, price);
+          await live.openPosition(signal, price, source);
         } catch (err: unknown) {
           console.warn(`[crypto-engine] live open failed for ${sym}: ${err instanceof Error ? err.message : String(err)}`);
         }
@@ -1268,10 +1344,13 @@ export class CryptoSignalEngine {
     recentSignals: TradeSignal[];
     account: ReturnType<CryptoPaperAccount['exportSnapshot']>;
   }): void {
-    this.demoClosedPositions = [
-      ...(snap.demoClosedPositions ?? snap.closedPositions ?? []),
-    ];
-    this.liveClosedPositions = [...(snap.liveClosedPositions ?? [])];
+    // TRA-338 — backfill `quoteSource: 'unknown'` on closed positions written
+    // before the field existed so the API surface answers a stable value.
+    // The paper account does the same backfill on `importSnapshot` for open
+    // positions; closed history is final-form so we do it inline here.
+    const backfill = (p: Position): Position => (p.quoteSource ? p : { ...p, quoteSource: 'unknown' });
+    this.demoClosedPositions = (snap.demoClosedPositions ?? snap.closedPositions ?? []).map(backfill);
+    this.liveClosedPositions = (snap.liveClosedPositions ?? []).map(backfill);
     this.recentSignals = [...snap.recentSignals];
     this.account.importSnapshot(snap.account);
   }

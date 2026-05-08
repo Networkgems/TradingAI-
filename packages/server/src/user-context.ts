@@ -413,6 +413,99 @@ export async function runTra330CryptoEquityReset(): Promise<void> {
   console.log(`[migration TRA-330] complete — wiped ${fileCount} crypto-state file(s) for ${userCount} user(s).`);
 }
 
+/**
+ * TRA-338 — surgical one-shot cleanup for the MEGA-USD phantom position
+ * documented in TRA-337. Yahoo's `MEGA-USD` ticker resolves to a different
+ * (delisted-2022) token and returned a frozen $4.05 quote that opened a paper
+ * position whose true Coinbase price is around $0.12. Rather than realising
+ * the bogus ~97% loss into trade history, we expunge the open position and
+ * refund the recorded `entryPrice * quantity` to the paper cash balance, so
+ * the next snapshot reflects a clean book.
+ *
+ * Behaviour:
+ *  - Scans every user's `trades-crypto.json` for OPEN positions with
+ *    `symbol === 'MEGA-USD'`. Closed positions are left alone (closing the
+ *    record after the fact would only obscure the audit trail).
+ *  - Per-user: refunds `entryPrice * quantity` to `account.cash` (the
+ *    persisted USD balance), drops the position from `openPositions`, and
+ *    writes the snapshot back atomically. `account.equity` is intentionally
+ *    NOT recomputed here — the engine's next tick reconciles equity from
+ *    cash + open-position MTM, so a one-shot adjustment of cash is enough
+ *    and we avoid double-counting if another path also touches equity on
+ *    boot.
+ *  - Skips users with no open MEGA-USD entry, with a missing snapshot, or
+ *    with a snapshot the JSON parser couldn't read.
+ *  - Idempotent via marker file `.tra-338-mega-usd-cleanup`.
+ *
+ * Runs BEFORE `initAllUserContexts` so engines load the cleaned snapshot.
+ * Sequenced AFTER `runTra330CryptoEquityReset` (which may wipe
+ * `trades-crypto.json` outright) so a one-time stale-snapshot reset can't
+ * undo this cleanup mid-flight.
+ */
+export async function runTra338MegaUsdCleanup(): Promise<void> {
+  const markerFile = join(DATA_DIR, '.tra-338-mega-usd-cleanup');
+  if (existsSync(markerFile)) return;
+
+  const { readFile } = await import('fs/promises');
+  let usersTouched = 0;
+  let positionsRemoved = 0;
+  let cashRefunded = 0;
+
+  for (const u of getAllUsers()) {
+    const file = join(userDataDir(u.username), 'trades-crypto.json');
+    if (!existsSync(file)) continue;
+    let snap: import('./trade-store.js').CryptoTradeSnapshot | null = null;
+    try {
+      const raw = await readFile(file, 'utf-8');
+      if (!raw.trim()) continue;
+      snap = JSON.parse(raw) as import('./trade-store.js').CryptoTradeSnapshot;
+    } catch (err: unknown) {
+      console.warn(`[migration TRA-338] could not parse ${file}: ${err instanceof Error ? err.message : String(err)}`);
+      continue;
+    }
+    if (!snap || !Array.isArray(snap.openPositions)) continue;
+
+    const ghosts = snap.openPositions.filter(p => p.symbol === 'MEGA-USD');
+    if (ghosts.length === 0) continue;
+
+    let userRefund = 0;
+    for (const p of ghosts) {
+      const refund = (p.entryPrice ?? 0) * (p.quantity ?? 0);
+      if (Number.isFinite(refund) && refund > 0) {
+        userRefund += refund;
+      }
+      console.log(
+        `[migration TRA-338:${u.username}] expunging phantom MEGA-USD ${p.id} qty=${p.quantity} entry=${p.entryPrice} → refund $${refund.toFixed(2)}`,
+      );
+    }
+
+    const nextOpen = snap.openPositions.filter(p => p.symbol !== 'MEGA-USD');
+    const nextCash = (snap.account?.cash ?? 0) + userRefund;
+    const nextSnap: import('./trade-store.js').CryptoTradeSnapshot = {
+      ...snap,
+      savedAt: new Date().toISOString(),
+      openPositions: nextOpen,
+      account: {
+        ...snap.account,
+        cash: nextCash,
+      },
+    };
+    try {
+      await saveCryptoTradeSnapshot(u.username, nextSnap);
+      usersTouched += 1;
+      positionsRemoved += ghosts.length;
+      cashRefunded += userRefund;
+    } catch (err: unknown) {
+      console.warn(`[migration TRA-338:${u.username}] persist failed: ${err instanceof Error ? err.message : String(err)}`);
+    }
+  }
+
+  await writeFile(markerFile, new Date().toISOString(), 'utf-8');
+  console.log(
+    `[migration TRA-338] complete — removed ${positionsRemoved} phantom MEGA-USD position(s) across ${usersTouched} user(s), refunded $${cashRefunded.toFixed(2)} cash.`,
+  );
+}
+
 export async function runTra301DemoFreshStart(): Promise<void> {
   const markerFile = join(DATA_DIR, '.tra-301-demo-fresh-start');
   if (existsSync(markerFile)) return;

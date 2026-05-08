@@ -212,7 +212,31 @@ export interface Position {
   fundingPnl?: number;
   /** TRA-249-D — wall-clock ms of the last funding accrual on this position. Diagnostics + idempotency. */
   lastFundingAccrualAt?: number;
+  /**
+   * TRA-338 — provider that supplied the entry price stamped on this position.
+   * Crypto entries must come from Coinbase Exchange (the same venue we trade
+   * on); this audit field records that fact on the persisted snapshot so a
+   * future incident can be triaged from the trades API in seconds rather than
+   * by reconstructing the cascade order from the logs.
+   *
+   * Background: TRA-337 found that a Yahoo-fallback ghost MEGA-USD quote
+   * ($4.05, frozen 2022) opened a paper position whose current Coinbase price
+   * was $0.12 — a 97% phantom loss with no audit trail. From TRA-338 forward
+   * `'coinbase'` is the only legal value on a crypto entry; `'yahoo'` /
+   * `'cmc'` may appear on legacy snapshots for pre-fix positions, and
+   * `'unknown'` is the back-fill for positions persisted before the field
+   * existed. Stocks / options paths do not stamp this today.
+   */
+  quoteSource?: PositionQuoteSource;
 }
+
+/**
+ * TRA-338 — provenance label for the entry price written onto a Position.
+ * Mirrors the providers in `crypto-feed.ts`'s cascade plus a `'manual'` slot
+ * for human-driven opens (admin tooling, reconciliation imports) and an
+ * `'unknown'` back-fill for pre-TRA-338 snapshots.
+ */
+export type PositionQuoteSource = 'coinbase' | 'yahoo' | 'cmc' | 'manual' | 'unknown';
 
 export interface AccountState {
   totalEquity: number;

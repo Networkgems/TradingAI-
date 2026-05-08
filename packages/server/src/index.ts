@@ -45,6 +45,7 @@ import {
   runTra241CalendarReset,
   runTra301DemoFreshStart,
   runTra330CryptoEquityReset,
+  runTra338MegaUsdCleanup,
   initAllUserContexts,
   initUserContext,
   ensureUserContext,
@@ -154,6 +155,13 @@ await runTra301DemoFreshStart();
 // itself is fixed in crypto-account.ts; this migration clears the persisted
 // snapshots that already loaded the bad state. Crypto-only, idempotent.
 await runTra330CryptoEquityReset();
+// TRA-338 — surgical removal of the phantom MEGA-USD paper position opened
+// off Yahoo's frozen $4.05 ghost ticker (root cause in TRA-337). Refunds the
+// recorded cost basis to cash and drops the position before the engine boots
+// off the cleaned snapshot. Runs after TRA-330 so the equity reset (which
+// may itself wipe trades-crypto.json) doesn't undo the cleanup mid-flight.
+// Idempotent via marker file.
+await runTra338MegaUsdCleanup();
 await initAllUserContexts();
 
 // TRA-227 — drop a placeholder QuantTrader research report so the Stocks
