@@ -16,7 +16,7 @@ import type {
 } from '@trading-app/engine';
 import type { TradeSignal } from '@trading-app/shared';
 
-import { CryptoSignalEngine } from './crypto-engine.js';
+import { CryptoSignalEngine, resolveLiveSingleSymbolShortCap } from './crypto-engine.js';
 import { CryptoLiveAccount } from './crypto-live-account.js';
 import {
   CryptoPaperAccount,
@@ -381,5 +381,46 @@ describe('CryptoPaperAccount fee + slippage modeling — TRA-342', () => {
 
     // But the round-trip fee still bites — naive P&L overstates the realized.
     expect(closed!.pnl!).toBeLessThan(grossPnl);
+  });
+});
+
+// TRA-341 — env-var fallback for the §6 single-symbol short cap. The per-user
+// `liveSingleSymbolShortCap` knob still wins; this just gives ops a process-
+// wide knob (Render env) so the cap can move without per-user saves.
+describe('resolveLiveSingleSymbolShortCap (TRA-341)', () => {
+  it('returns the per-user value when both knobs are set (user wins over env)', () => {
+    expect(resolveLiveSingleSymbolShortCap(0.4, '0.8')).toBe(0.4);
+  });
+
+  it('falls through to the env value when the per-user knob is unset', () => {
+    expect(resolveLiveSingleSymbolShortCap(undefined, '0.5')).toBe(0.5);
+  });
+
+  it('returns null (engine default) when neither knob is set', () => {
+    expect(resolveLiveSingleSymbolShortCap(undefined, undefined)).toBeNull();
+  });
+
+  it('rejects non-finite / non-positive user values and falls through to env', () => {
+    expect(resolveLiveSingleSymbolShortCap(0, '0.5')).toBe(0.5);
+    expect(resolveLiveSingleSymbolShortCap(-0.2, '0.5')).toBe(0.5);
+    expect(resolveLiveSingleSymbolShortCap(Number.NaN, '0.5')).toBe(0.5);
+    expect(resolveLiveSingleSymbolShortCap(Number.POSITIVE_INFINITY, '0.5')).toBe(0.5);
+  });
+
+  it('rejects non-numeric / non-positive env values and returns null when user is unset', () => {
+    expect(resolveLiveSingleSymbolShortCap(undefined, '')).toBeNull();
+    expect(resolveLiveSingleSymbolShortCap(undefined, 'oops')).toBeNull();
+    expect(resolveLiveSingleSymbolShortCap(undefined, '0')).toBeNull();
+    expect(resolveLiveSingleSymbolShortCap(undefined, '-0.3')).toBeNull();
+    expect(resolveLiveSingleSymbolShortCap(undefined, 'NaN')).toBeNull();
+  });
+
+  it('passes the raw user value through without clamping (engine resolver clamps downstream)', () => {
+    // Engine-side resolveSingleSymbolShortCap clamps to (0, 1] — the env-aware
+    // helper must not pre-clamp because tests on the engine resolver exercise
+    // that path independently. A 2.0 input arriving here should pass through;
+    // the engine then clamps to PERP_SHORT_SINGLE_SYMBOL_CAP_MAX = 1.0.
+    expect(resolveLiveSingleSymbolShortCap(2.0, undefined)).toBe(2.0);
+    expect(resolveLiveSingleSymbolShortCap(undefined, '2.0')).toBe(2.0);
   });
 });

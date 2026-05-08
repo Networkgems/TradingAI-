@@ -60,6 +60,32 @@ const NEWS_REFRESH_MS = 5 * 60_000;
  * predates this commit keeps working.
  */
 const FORCED_PRESET_ENV = (process.env.LIVE_STRATEGY_PRESET ?? '').trim();
+
+/**
+ * TRA-341 — process-wide override for the §6 single-symbol short cap on the
+ * live preset, mirroring the per-user `AccountSettings.liveSingleSymbolShortCap`
+ * knob but without requiring a settings save. Resolved as a fraction of
+ * strategy equity (e.g. `0.5` ↔ 50%). Per-user wins; this env value only fills
+ * in when the user setting is absent. Engine-side `resolveSingleSymbolShortCap`
+ * still clamps the final value to (0, 1] and falls back to the spec default
+ * for non-finite / ≤ 0 inputs, so a malformed env value can't disable the gate.
+ *
+ * Exported as a pure helper so unit tests can exercise the precedence ladder
+ * without mucking with `process.env`.
+ */
+export function resolveLiveSingleSymbolShortCap(
+  userValue: number | undefined,
+  envValue: string | undefined,
+): number | null {
+  if (userValue !== undefined && Number.isFinite(userValue) && userValue > 0) {
+    return userValue;
+  }
+  if (envValue !== undefined) {
+    const parsed = Number.parseFloat(envValue);
+    if (Number.isFinite(parsed) && parsed > 0) return parsed;
+  }
+  return null;
+}
 /**
  * TRA-230 — drop signals from the displayed list once they're no longer
  * actionable. A signal becomes invalid when it ages past this window or when
@@ -211,14 +237,27 @@ export class CryptoSignalEngine {
       // managedAccountRatio / riskPerTrade.
       // TRA-341 — also seed the operator-tunable single-symbol short cap so
       // the very first short candidate after a live flip honours the saved
-      // override. `null` clears any previously-set cap; `undefined` (the
-      // default for unsaved settings) leaves the engine default of 0.15.
+      // override. Precedence: per-user `liveSingleSymbolShortCap` > env var
+      // `LIVE_SINGLE_SYMBOL_SHORT_CAP` > engine default (0.15). Resolver
+      // returns `null` when neither knob is set, which clears any previously
+      // applied cap and falls through to the engine default downstream.
       if (s) {
         live.updateRiskConfig({
           managedAccountRatio: s.managedAccountRatio,
           riskPerTrade: s.riskPerTrade,
-          singleSymbolShortCap: s.liveSingleSymbolShortCap ?? null,
+          singleSymbolShortCap: resolveLiveSingleSymbolShortCap(
+            s.liveSingleSymbolShortCap,
+            process.env.LIVE_SINGLE_SYMBOL_SHORT_CAP,
+          ),
         });
+      } else {
+        // No saved settings yet (first-boot, fresh install). The env var still
+        // applies as a process-wide default so an operator can pin the cap
+        // before any user has visited Settings.
+        const envCap = resolveLiveSingleSymbolShortCap(undefined, process.env.LIVE_SINGLE_SYMBOL_SHORT_CAP);
+        if (envCap !== null) {
+          live.updateRiskConfig({ singleSymbolShortCap: envCap });
+        }
       }
       return live;
     } catch (err: unknown) {

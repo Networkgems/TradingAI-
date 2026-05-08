@@ -79,3 +79,14 @@ services:
       # still accepted (mapped to `bb_fade_sol_doge`) for revert safety.
       - key: LIVE_STRATEGY_PRESET
         value: bb_fade_sol_doge
+      # TRA-341 — process-wide override for the §6 single-symbol short cap on
+      # the live perp router (fraction of strategy equity, e.g. `0.5` ↔ 50%).
+      # Per-user `liveSingleSymbolShortCap` (Settings → Live Trading Risk)
+      # wins; this env value only fills in when the per-user knob is unset.
+      # Engine clamps the final value to (0, 1] and falls back to the spec
+      # default 0.15 for non-finite / ≤ 0 inputs, so a malformed value can't
+      # disable the gate. The cross-strategy 20% and total-book 30% caps are
+      # NOT overridable — they're whole-book risk ceilings, not per-strategy
+      # budgets. Leave unset to inherit the spec default.
+      - key: LIVE_SINGLE_SYMBOL_SHORT_CAP
+        sync: false

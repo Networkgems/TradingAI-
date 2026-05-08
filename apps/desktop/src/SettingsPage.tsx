@@ -1240,6 +1240,40 @@ export default function SettingsPage({ token, httpUrl, context, onModeChange, on
                     Max equity risked per live trade (default: 1%). Applied to position sizing on every order.
                   </span>
                 </div>
+                {/* TRA-341 — operator override for the §6 single-symbol short
+                    cap on the live perp router (default 15% of strategy equity).
+                    Crypto-only; the cross-strategy (20%) and total-book (30%)
+                    ceilings still apply downstream. Blank = spec default. The
+                    server also reads `LIVE_SINGLE_SYMBOL_SHORT_CAP` as a
+                    process-wide fallback when this knob is unset, so an
+                    operator can move the floor without per-user saves. */}
+                {(!context || context === 'crypto') && (
+                  <div className="settings-field">
+                    <label>Single-Symbol Short Cap (%)</label>
+                    <input
+                      type="number"
+                      min={0}
+                      max={100}
+                      step={1}
+                      value={
+                        settings.liveSingleSymbolShortCap === undefined
+                          ? ''
+                          : Math.round(settings.liveSingleSymbolShortCap * 100)
+                      }
+                      onChange={e => {
+                        const raw = e.target.value;
+                        if (raw === '') {
+                          set('liveSingleSymbolShortCap', undefined);
+                        } else {
+                          set('liveSingleSymbolShortCap', Number(raw) / 100);
+                        }
+                      }}
+                    />
+                    <span className="field-hint">
+                      Live perp shorts only. Max single-symbol notional per strategy as % of strategy equity (default: 15%). Blank → spec default. Cross-strategy (20%) and total-book (30%) ceilings still apply.
+                    </span>
+                  </div>
+                )}
                 {/* TRA-327 — Live limits bind to dailyTradesLimitLive /
                     optionsDailyTradesLimitLive so editing the Demo cap on
                     another visit never drags the Live cap with it. Falls back
