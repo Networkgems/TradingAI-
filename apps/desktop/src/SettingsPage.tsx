@@ -3,6 +3,7 @@ import type {
   AccountSettings,
   BrokerageType,
   LiveTradeMode,
+  LiveTradierMarkets,
   StrategyPresetId,
   TradierEnv,
 } from '@trading-app/shared';
@@ -64,6 +65,12 @@ function liveAccountIdOptionsField(
   env: TradierEnv,
 ): 'liveAccountIdOptionsSandbox' | 'liveAccountIdOptionsProduction' {
   return env === 'production' ? 'liveAccountIdOptionsProduction' : 'liveAccountIdOptionsSandbox';
+}
+// TRA-336 — markets selector for Tradier Live. Default ('options') preserves
+// the TRA-220 options-only behaviour for users who saved before the field
+// existed.
+function readLiveTradierMarkets(s: AccountSettings): LiveTradierMarkets {
+  return s.liveTradierMarkets ?? 'options';
 }
 
 function PasswordInput({
@@ -1450,6 +1457,35 @@ export default function SettingsPage({ token, httpUrl, context, onModeChange, on
                     </p>
                   </div>
 
+                  {/* TRA-336 — markets selector. Decides whether the live engine
+                      routes options trades, equity (share) trades, or both
+                      through Tradier. Default 'options' preserves the TRA-220
+                      options-only behaviour for existing deployments. The
+                      equity routing itself is wired by TRA-335; until that
+                      lands, picking 'equity' or 'both' simply suppresses the
+                      options mirror. */}
+                  <div className="settings-field">
+                    <label>Trade</label>
+                    <select
+                      value={readLiveTradierMarkets(settings)}
+                      onChange={e => set('liveTradierMarkets', e.target.value as LiveTradierMarkets)}
+                    >
+                      <option value="options">Options only</option>
+                      <option value="equity">Positions (equity) only</option>
+                      <option value="both">Both options and positions</option>
+                    </select>
+                    <p className="field-hint">
+                      Controls which Tradier markets the engine routes signals into when running live.
+                      <em> Options only</em> mirrors the relative-value scanner to Tradier as
+                      <code> buy_to_open</code> tickets (TRA-220 default).
+                      <em> Positions (equity) only</em> routes ORB / BB-fade / Ichimoku stock-share signals
+                      to Tradier as bracket orders and disables the options mirror. <em>Both</em> enables
+                      both paths. Equity routing is delivered by TRA-335 — until it ships, picking
+                      <em> equity</em> or <em> both</em> turns the options mirror off without yet
+                      placing share orders.
+                    </p>
+                  </div>
+
                   <div className="settings-field">
                     <label>
                       API Token ({readLiveTradierEnvOptions(settings) === 'production' ? 'Production' : 'Sandbox'})
@@ -1587,7 +1623,7 @@ export default function SettingsPage({ token, httpUrl, context, onModeChange, on
                 </>
               ) : (
                 <>
-                  <strong>Live options trading via Tradier is enabled.</strong> Once you save a valid Tradier API token and Account ID and switch the account to <em>Live</em>, the relative-value scanner routes new options signals to Tradier as <code>buy_to_open</code> market orders. Stock-share live trading is not yet wired up — the Tradier credentials above cover options only.
+                  <strong>Live Tradier trading is enabled.</strong> Once you save a valid Tradier API token and Account ID and switch the account to <em>Live</em>, the engine routes signals based on the <em>Trade</em> selector above. <em>Options only</em> (default, TRA-220) sends the relative-value scanner to Tradier as <code>buy_to_open</code> market orders. <em>Positions (equity)</em> and <em>Both</em> activate stock-share routing — wired by TRA-335; until that ships, those modes only suppress the options mirror.
                 </>
               )}
             </div>

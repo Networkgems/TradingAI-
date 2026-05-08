@@ -2,8 +2,13 @@ import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import { SignalEngine } from './signal-engine.js';
 import type { RelativeValueScannerService, RelativeValueScanResult } from './relative-value-scanner.js';
 import type { RelativeValueCandidate, TradierOptionsClient } from '@trading-app/engine';
-import { DEFAULT_ACCOUNT_SETTINGS } from '@trading-app/shared';
-import type { TradierEnv } from '@trading-app/shared';
+import {
+  DEFAULT_ACCOUNT_SETTINGS,
+  isLiveTradierEquityEnabled,
+  isLiveTradierOptionsEnabled,
+  resolveLiveTradierMarkets,
+} from '@trading-app/shared';
+import type { AccountSettings, TradierEnv } from '@trading-app/shared';
 
 // Inside an ET trading window: 10:00 AM ET on a Tuesday → 14:00 UTC during EDT.
 const TRADING_TIME = Date.parse('2024-06-04T14:00:00Z');
@@ -639,5 +644,108 @@ describe('SignalEngine — TRA-332 live sizing uses real Tradier equity', () => 
     const state = engine.getState();
     expect(state.signals).toHaveLength(1);
     expect(state.signals[0].liveSkipReason).toContain('equity $200.00');
+  });
+});
+
+// TRA-336 — `liveTradierMarkets` is the user-facing tri-state for "what
+// should Tradier Live trade" (Options / Positions / Both). Default
+// 'options' preserves the TRA-220 options-only behaviour; 'equity' opts out
+// of the options mirror entirely (and TRA-335 will light up share routing).
+describe('shared/AccountSettings — TRA-336 liveTradierMarkets resolvers', () => {
+  function withMarkets(markets: AccountSettings['liveTradierMarkets']): AccountSettings {
+    return { ...DEFAULT_ACCOUNT_SETTINGS, liveTradierMarkets: markets };
+  }
+
+  it("defaults to 'options' so saved settings without the field keep TRA-220 behaviour", () => {
+    const s: AccountSettings = { ...DEFAULT_ACCOUNT_SETTINGS };
+    delete s.liveTradierMarkets;
+    expect(resolveLiveTradierMarkets(s)).toBe('options');
+    expect(isLiveTradierOptionsEnabled(s)).toBe(true);
+    expect(isLiveTradierEquityEnabled(s)).toBe(false);
+  });
+
+  it("'options' enables only the options mirror", () => {
+    const s = withMarkets('options');
+    expect(isLiveTradierOptionsEnabled(s)).toBe(true);
+    expect(isLiveTradierEquityEnabled(s)).toBe(false);
+  });
+
+  it("'equity' enables only the equity path (suppresses options mirror)", () => {
+    const s = withMarkets('equity');
+    expect(isLiveTradierOptionsEnabled(s)).toBe(false);
+    expect(isLiveTradierEquityEnabled(s)).toBe(true);
+  });
+
+  it("'both' enables options mirror AND equity path", () => {
+    const s = withMarkets('both');
+    expect(isLiveTradierOptionsEnabled(s)).toBe(true);
+    expect(isLiveTradierEquityEnabled(s)).toBe(true);
+  });
+});
+
+describe('SignalEngine — TRA-336 markets-selector gate', () => {
+  // The flag the doTick gate consults. Confirms the engine reflects the
+  // user's selection at construction and after applySettings — flipping
+  // the tri-state must take effect on the next tick without a restart.
+  it("constructs with tradierLiveOptionsEnabled === true under the default ('options')", () => {
+    const engine = new SignalEngine({ ...DEFAULT_ACCOUNT_SETTINGS, mode: 'live' });
+    expect(
+      (engine as unknown as { tradierLiveOptionsEnabled: boolean }).tradierLiveOptionsEnabled,
+    ).toBe(true);
+  });
+
+  it("constructs with tradierLiveOptionsEnabled === false under 'equity'", () => {
+    const engine = new SignalEngine({
+      ...DEFAULT_ACCOUNT_SETTINGS,
+      mode: 'live',
+      liveTradierMarkets: 'equity',
+    });
+    expect(
+      (engine as unknown as { tradierLiveOptionsEnabled: boolean }).tradierLiveOptionsEnabled,
+    ).toBe(false);
+  });
+
+  it("applySettings flips tradierLiveOptionsEnabled when the user changes 'options' → 'equity' → 'both'", async () => {
+    const engine = new SignalEngine({ ...DEFAULT_ACCOUNT_SETTINGS, mode: 'live' });
+    const flag = () =>
+      (engine as unknown as { tradierLiveOptionsEnabled: boolean }).tradierLiveOptionsEnabled;
+    expect(flag()).toBe(true);
+
+    await engine.applySettings({
+      ...DEFAULT_ACCOUNT_SETTINGS,
+      mode: 'live',
+      liveTradierMarkets: 'equity',
+    });
+    expect(flag()).toBe(false);
+
+    await engine.applySettings({
+      ...DEFAULT_ACCOUNT_SETTINGS,
+      mode: 'live',
+      liveTradierMarkets: 'both',
+    });
+    expect(flag()).toBe(true);
+  });
+
+  // The actual doTick gate skips the RV scan in live mode when the markets
+  // selector excludes options. We exercise the same condition the gate
+  // checks rather than spinning up the full doTick (which needs Yahoo
+  // fetchQuotes / news mocks to run).
+  it('the live equity-only condition (mode=live ∧ !optionsEnabled) is true under equity-only and false otherwise', () => {
+    const settings = (markets: AccountSettings['liveTradierMarkets']): AccountSettings => ({
+      ...DEFAULT_ACCOUNT_SETTINGS, mode: 'live', liveTradierMarkets: markets,
+    });
+    const skip = (s: AccountSettings) => s.mode === 'live' && !isLiveTradierOptionsEnabled(s);
+
+    expect(skip(settings('options'))).toBe(false);
+    expect(skip(settings('equity'))).toBe(true);
+    expect(skip(settings('both'))).toBe(false);
+
+    // Demo mode is unaffected — `liveTradierMarkets` is a live-only switch.
+    const demoEquityOnly: AccountSettings = {
+      ...DEFAULT_ACCOUNT_SETTINGS,
+      mode: 'demo',
+      liveTradierMarkets: 'equity',
+    };
+    expect(skip(demoEquityOnly)).toBe(false);
   });
 });

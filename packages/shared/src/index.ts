@@ -349,6 +349,20 @@ export type LiveTradeRoutingCrypto = 'hybrid' | 'spot_only' | 'perp_only';
  */
 export type TradierEnv = 'sandbox' | 'production';
 
+/**
+ * TRA-336 — which Tradier Live markets the engine routes signals into.
+ *   • `'options'` — only options trades fire (TRA-220 default; preserves the
+ *     options-only behaviour that shipped before the equity path was wired).
+ *   • `'equity'` — only equity (stock-share) trades fire. Wiring lives in
+ *     TRA-335; until that lands, this disables the options mirror without
+ *     yet enabling equity orders.
+ *   • `'both'` — options + equity trades both fire.
+ *
+ * The setting only applies when `mode === 'live'` and Tradier credentials are
+ * configured. Demo mode and crypto are unaffected.
+ */
+export type LiveTradierMarkets = 'options' | 'equity' | 'both';
+
 export interface AccountSettings {
   mode: AccountMode;
   // Demo mode settings
@@ -456,6 +470,14 @@ export interface AccountSettings {
   /** Sandbox (default) or production. Sandbox uses simulated fills + real chains. */
   liveTradierEnvOptions?: TradierEnv;
   /**
+   * TRA-336 — which Tradier markets the engine trades when running live.
+   * Defaults to `'options'` to preserve the TRA-220 options-only behaviour
+   * for deployments that haven't opted into equity routing. Read via
+   * {@link isLiveTradierOptionsEnabled} / {@link isLiveTradierEquityEnabled}
+   * so engine + UI stay in sync.
+   */
+  liveTradierMarkets?: LiveTradierMarkets;
+  /**
    * TRA-325 — active crypto-strategy preset id (see {@link STRATEGY_PRESETS}).
    * The engine reads this on every tick so a switch takes effect on the next
    * evaluation; no restart required. Optional for back-compat with snapshots
@@ -507,6 +529,7 @@ export const DEFAULT_ACCOUNT_SETTINGS: AccountSettings = {
   liveApiKeyOptionsProduction: '',
   liveAccountIdOptionsProduction: '',
   liveTradierEnvOptions: 'sandbox',
+  liveTradierMarkets: 'options',
   activeStrategyPreset: DEFAULT_STRATEGY_PRESET_ID,
 };
 
@@ -536,6 +559,29 @@ export function resolveTradierOptionsCreds(s: AccountSettings): {
   ).trim();
   return { env, apiToken, accountId };
 }
+
+/**
+ * TRA-336 — resolve which Tradier markets the engine should route into when
+ * running live. Defaults to `'options'` (TRA-220 behaviour) when the field is
+ * absent so saved settings written before TRA-336 keep the options-only
+ * routing they had previously.
+ */
+export function resolveLiveTradierMarkets(s: AccountSettings): LiveTradierMarkets {
+  return s.liveTradierMarkets ?? 'options';
+}
+
+/** TRA-336 — true when Tradier Live should route options signals. */
+export function isLiveTradierOptionsEnabled(s: AccountSettings): boolean {
+  const markets = resolveLiveTradierMarkets(s);
+  return markets === 'options' || markets === 'both';
+}
+
+/** TRA-336 — true when Tradier Live should route equity (share) signals. */
+export function isLiveTradierEquityEnabled(s: AccountSettings): boolean {
+  const markets = resolveLiveTradierMarkets(s);
+  return markets === 'equity' || markets === 'both';
+}
+
 export const WATCHLIST_SIZE = 25;
 export const OPTIONS_BUDGET_RATIO = 0.05;   // 5% of managed equity per options trade
 export const OPTIONS_TP1_PCT = 0.25;         // take partial profit (50%) at +25% premium gain

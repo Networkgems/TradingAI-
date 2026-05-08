@@ -1,6 +1,6 @@
 import { OrbStrategy, BbFadeStrategy, IchimokuStrategy, TradierOptionsClient, TRADIER_REJECTED_STATUSES } from '@trading-app/engine';
 import type { TradierAccountBalance } from '@trading-app/engine';
-import { WATCHLIST, MANAGED_ACCOUNT_RATIO, MAX_CONSECUTIVE_LOSSES, DAILY_DRAWDOWN_HALT_PCT, aliasWatchlistSymbol, isStockMarketOpen, resolveTradierOptionsCreds } from '@trading-app/shared';
+import { WATCHLIST, MANAGED_ACCOUNT_RATIO, MAX_CONSECUTIVE_LOSSES, DAILY_DRAWDOWN_HALT_PCT, aliasWatchlistSymbol, isLiveTradierOptionsEnabled, isStockMarketOpen, resolveTradierOptionsCreds } from '@trading-app/shared';
 import type { TradeSignal, RelativeValueSignal, Candle, OptionsAccountState, SignalType, Position, AccountSettings, AccountState, NewsItem, TradierEnv } from '@trading-app/shared';
 import { fetchMinuteBars, fetchQuotes, fetchStocksNews, isYahooBreakerOpen, setActiveInterestSymbols } from './yahoo-feed.js';
 import { PaperAccount } from './paper-account.js';
@@ -195,6 +195,15 @@ export class SignalEngine {
    */
   private tradierLiveClient: TradierOptionsClient | null = null;
   /**
+   * TRA-336 — whether Tradier Live is currently configured to route options
+   * signals. Sourced from {@link isLiveTradierOptionsEnabled}. The Tradier
+   * client itself is still built when creds are present (so balance refresh
+   * keeps powering equity sizing per TRA-332); this flag gates only the
+   * options mirror so users on `liveTradierMarkets === 'equity'` don't fire
+   * options orders.
+   */
+  private tradierLiveOptionsEnabled = true;
+  /**
    * TRA-226 — last successful Tradier `/accounts/{id}/balances` snapshot.
    * Used in live mode so the dashboard reflects the user's actual Tradier
    * equity/cash instead of the hardcoded 0 the engine used before the live
@@ -238,7 +247,10 @@ export class SignalEngine {
         tradierEnv: 'production',
       }),
     };
-    if (settings) this.tradierLiveClient = buildTradierLiveClient(settings);
+    if (settings) {
+      this.tradierLiveClient = buildTradierLiveClient(settings);
+      this.tradierLiveOptionsEnabled = isLiveTradierOptionsEnabled(settings);
+    }
   }
 
   /** TRA-233 — paper options account for the currently selected Tradier env. */
@@ -290,6 +302,9 @@ export class SignalEngine {
     // so toggling Live mode or editing the API token takes effect on the
     // next tick without requiring a server restart.
     this.tradierLiveClient = buildTradierLiveClient(settings);
+    // TRA-336 — re-read the markets selector so flipping
+    // Options/Equity/Both in Settings takes effect on the next tick.
+    this.tradierLiveOptionsEnabled = isLiveTradierOptionsEnabled(settings);
     if (this.mode === 'live') {
       // TRA-226 — fetch the Tradier balance immediately so the broadcast that
       // follows in the PUT /api/account/settings handler reflects the user's
@@ -662,7 +677,12 @@ export class SignalEngine {
     // live it also mirrors each open to Tradier (production or sandbox) as a
     // real `buy_to_open` market order when creds are configured.
     // TRA-229: isAutoTradingEnabled() resolves the per-mode flag.
-    if (this.isAutoTradingEnabled() && !this.riskGovernor.isHalted() && this.rvScanner && isStockMarketOpen()) {
+    // TRA-336: when running live with `liveTradierMarkets === 'equity'` the
+    // user has opted out of options auto-trading — skip the scan entirely so
+    // no paper opens (and no Tradier orders) fire. Demo mode is unaffected;
+    // existing live option positions still get marks via refreshOptionMarks().
+    const skipOptionsForLiveEquityOnly = this.mode === 'live' && !this.tradierLiveOptionsEnabled;
+    if (this.isAutoTradingEnabled() && !this.riskGovernor.isHalted() && this.rvScanner && isStockMarketOpen() && !skipOptionsForLiveEquityOnly) {
       if (Date.now() - this.lastRvScanAt >= RV_SCAN_INTERVAL_MS) {
         this.lastRvScanAt = Date.now();
         await this.runRelativeValueScan(activeSymbols);
