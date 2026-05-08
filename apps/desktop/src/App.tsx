@@ -1070,6 +1070,7 @@ interface SymbolState {
   change: number;
   changePct: number;
   lastUpdated: number;
+  quoteStatus?: 'ok' | 'rate_limited' | 'unavailable';
 }
 
 interface AppState {
