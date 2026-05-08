@@ -906,9 +906,28 @@ export const CRYPTO_WATCHLIST: readonly string[] = [
   'XLM-USD',   'ETC-USD',   'TRX-USD',   'FIL-USD',   'VET-USD',
   'THETA-USD', 'HBAR-USD',  'ICP-USD',   'FLOW-USD',  'GRT-USD',
   'ARB-USD',   'OP-USD',    'APT-USD',   'SUI-USD',   'INJ-USD',
-  'RUNE-USD',  'RNDR-USD',  'IMX-USD',   'EGLD-USD',  'LDO-USD',
+  // TRA-344 — RNDR rebranded to RENDER on Coinbase (2024-04-23). The old
+  // RNDR-USD product is delisted; Yahoo/CMC also dropped the legacy ticker,
+  // so the watchlist tracks RENDER-USD now. Legacy positions still keyed by
+  // RNDR-USD are aliased through `aliasCryptoSymbol` so quotes still resolve.
+  'RUNE-USD',  'RENDER-USD','IMX-USD',   'EGLD-USD',  'LDO-USD',
   'SNX-USD',   'APE-USD',   'COMP-USD',  'CHZ-USD',   'ZEC-USD',
 ] as const;
+
+/**
+ * Map known stale crypto tickers to their renamed equivalents at read time so
+ * positions/watchlists persisted under the old symbol still resolve a price
+ * upstream without manual migration. Mirrors {@link STOCK_TICKER_ALIASES}.
+ *
+ * TRA-344 — RNDR-USD → RENDER-USD (Coinbase rebrand 2024-04-23).
+ */
+const CRYPTO_TICKER_ALIASES: Readonly<Record<string, string>> = {
+  'RNDR-USD': 'RENDER-USD',
+};
+
+export function aliasCryptoSymbol(symbol: string): string {
+  return CRYPTO_TICKER_ALIASES[symbol.toUpperCase()] ?? symbol;
+}
 
 /**
  * Symbols that must never be watched, signalled, or traded — regardless of

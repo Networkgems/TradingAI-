@@ -15,7 +15,7 @@ import {
   type ShortFilterContext,
   type ClosedShortTrade,
 } from '@trading-app/engine';
-import { CRYPTO_WATCHLIST, isCryptoSymbolBlocked, resolveStrategyPreset } from '@trading-app/shared';
+import { CRYPTO_WATCHLIST, isCryptoSymbolBlocked, aliasCryptoSymbol, resolveStrategyPreset } from '@trading-app/shared';
 import type {
   TradeSignal,
   Candle,
@@ -689,11 +689,75 @@ export class CryptoSignalEngine {
         quoteStatus: 'ok',
       });
     }
+
+    // TRA-344 — Coinbase fallback for symbols Yahoo+CMC don't carry. PLUME-USD
+    // is only listed on Coinbase Advanced Trade; previously its price column
+    // showed $0.00 (-100% P&L) because the watchlist feeders had no source.
+    // We also patch in any open-position symbols outside the watchlist so an
+    // imported holding always renders a real Current price. RNDR-USD post-rebrand
+    // still won't resolve here (Coinbase product is now RENDER-USD) — that case
+    // is handled by the symbol alias map elsewhere.
+    if (this.liveAccount) {
+      const positionSymbols = new Set<string>();
+      for (const p of this.liveAccount.getState().openPositions) positionSymbols.add(p.symbol);
+      for (const p of this.account.getState().openPositions) positionSymbols.add(p.symbol);
+      const fallbackTargets = new Set<string>();
+      for (const sym of activeSymbols) {
+        if (!quotes.has(sym)) fallbackTargets.add(sym);
+      }
+      for (const sym of positionSymbols) {
+        if (!quotes.has(sym)) fallbackTargets.add(sym);
+      }
+      if (fallbackTargets.size > 0) {
+        try {
+          const cbPrices = await this.liveAccount
+            .getCoinbaseClient()
+            .getProductPrices(Array.from(fallbackTargets));
+          for (const [sym, price] of cbPrices) {
+            if (!Number.isFinite(price) || price <= 0) continue;
+            prices.set(sym, price);
+            const prev = this.symbolState.get(sym);
+            this.symbolState.set(sym, {
+              symbol: sym,
+              price,
+              volume: prev?.volume ?? 0,
+              change: prev?.change ?? 0,
+              changePct: prev?.changePct ?? 0,
+              lastUpdated: Date.now(),
+              quoteStatus: 'ok',
+            });
+          }
+        } catch (err: unknown) {
+          console.warn(
+            '[crypto-engine] Coinbase fallback price lookup failed:',
+            err instanceof Error ? err.message : String(err),
+          );
+        }
+      }
+    }
+
+    // TRA-344 — mirror the canonical quote into legacy alias keys so positions
+    // persisted under a renamed ticker (e.g. RNDR-USD post-rebrand → RENDER-USD)
+    // still resolve a price without a destructive on-disk migration.
+    const aliasMirrorTargets = new Set<string>();
+    for (const p of this.account.getState().openPositions) aliasMirrorTargets.add(p.symbol);
+    if (this.liveAccount) {
+      for (const p of this.liveAccount.getState().openPositions) aliasMirrorTargets.add(p.symbol);
+    }
+    for (const legacySym of aliasMirrorTargets) {
+      const canonical = aliasCryptoSymbol(legacySym);
+      if (canonical === legacySym) continue;
+      const canonicalState = this.symbolState.get(canonical);
+      if (!canonicalState || canonicalState.quoteStatus !== 'ok') continue;
+      prices.set(legacySym, canonicalState.price);
+      this.symbolState.set(legacySym, { ...canonicalState, symbol: legacySym });
+    }
+
     // Symbols we attempted but couldn't quote → mark unavailable so the UI shows
     // "Quote unavailable" instead of a permanent "Loading…" spinner.
     const breakerOpen = isYahooBreakerOpen();
     for (const sym of activeSymbols) {
-      if (quotes.has(sym)) continue;
+      if (this.symbolState.get(sym)?.quoteStatus === 'ok') continue;
       const prev = this.symbolState.get(sym);
       this.symbolState.set(sym, {
         symbol: sym,

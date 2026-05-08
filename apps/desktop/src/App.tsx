@@ -918,12 +918,25 @@ function CryptoDashboard({ token, onBack, onLogout, onActivity, theme, onToggleT
                       <tbody>
                         {sortedOpen.map(p => {
                           const sym = symbols.find(s => s.symbol === p.symbol);
-                          const currentPrice = sym?.price ?? p.entryPrice;
+                          // TRA-344 — treat price=0 / quoteStatus≠ok as "no live quote"
+                          // so a delisted/unmapped ticker (e.g. RNDR-USD post-rebrand,
+                          // PLUME-USD only on Coinbase) doesn't render -100% P&L.
+                          const hasLiveQuote = !!sym
+                            && sym.price > 0
+                            && sym.lastUpdated > 0
+                            && sym.quoteStatus !== 'unavailable'
+                            && sym.quoteStatus !== 'rate_limited';
+                          const currentPrice = hasLiveQuote ? sym!.price : p.entryPrice;
                           const multiplier = p.side === 'buy' ? 1 : -1;
-                          const pnlPct = ((currentPrice - p.entryPrice) / p.entryPrice) * 100 * multiplier;
-                          const pnlDollar = (currentPrice - p.entryPrice) * p.quantity * multiplier;
+                          const pnlPct = hasLiveQuote
+                            ? ((currentPrice - p.entryPrice) / p.entryPrice) * 100 * multiplier
+                            : 0;
+                          const pnlDollar = hasLiveQuote
+                            ? (currentPrice - p.entryPrice) * p.quantity * multiplier
+                            : 0;
                           const totalCost = p.entryPrice * p.quantity;
                           const isPerp = p.productType === 'perp';
+                          const quoteTitle = hasLiveQuote ? undefined : quoteStatusLabel(sym ?? { lastUpdated: 0 });
                           return (
                             <tr key={p.id}>
                               <td className="symbol">{p.symbol}</td>
@@ -931,9 +944,15 @@ function CryptoDashboard({ token, onBack, onLogout, onActivity, theme, onToggleT
                               <td>{p.quantity}</td>
                               <td>${fmt(p.entryPrice)}</td>
                               <td>${fmt(totalCost)}</td>
-                              <td>${fmt(currentPrice)}</td>
-                              <td className={pnlPct >= 0 ? 'green' : 'red'}>{fmtPct(pnlPct)}</td>
-                              <td className={pnlDollar >= 0 ? 'green' : 'red'}>{fmtDollar(pnlDollar)}</td>
+                              <td className={hasLiveQuote ? '' : 'muted'} title={quoteTitle}>
+                                {hasLiveQuote ? `$${fmt(currentPrice)}` : '—'}
+                              </td>
+                              <td className={!hasLiveQuote ? 'muted' : pnlPct >= 0 ? 'green' : 'red'} title={quoteTitle}>
+                                {hasLiveQuote ? fmtPct(pnlPct) : '—'}
+                              </td>
+                              <td className={!hasLiveQuote ? 'muted' : pnlDollar >= 0 ? 'green' : 'red'} title={quoteTitle}>
+                                {hasLiveQuote ? fmtDollar(pnlDollar) : '—'}
+                              </td>
                               <td className="red">${fmt(p.stopLoss)}</td>
                               <td className="green">${fmt(p.takeProfit)}</td>
                               {showPerpCols && (
@@ -2014,11 +2033,22 @@ function Dashboard({ token, onLogout, onGoHome, onActivity, theme, onToggleTheme
                   <tbody>
                     {sortRows(openPositions, openPosSort.sort, (p, k) => getStockOpenPosSortValue(p, k, symbols)).map(p => {
                       const sym = symbols.find(s => s.symbol === p.symbol);
-                      const currentPrice = sym?.price ?? p.entryPrice;
+                      // TRA-344 — see notes on the other Open Positions table above.
+                      const hasLiveQuote = !!sym
+                        && sym.price > 0
+                        && sym.lastUpdated > 0
+                        && sym.quoteStatus !== 'unavailable'
+                        && sym.quoteStatus !== 'rate_limited';
+                      const currentPrice = hasLiveQuote ? sym!.price : p.entryPrice;
                       const multiplier = p.side === 'buy' ? 1 : -1;
-                      const pnlPct = ((currentPrice - p.entryPrice) / p.entryPrice) * 100 * multiplier;
-                      const pnlDollar = (currentPrice - p.entryPrice) * p.quantity * multiplier;
+                      const pnlPct = hasLiveQuote
+                        ? ((currentPrice - p.entryPrice) / p.entryPrice) * 100 * multiplier
+                        : 0;
+                      const pnlDollar = hasLiveQuote
+                        ? (currentPrice - p.entryPrice) * p.quantity * multiplier
+                        : 0;
                       const totalCost = p.entryPrice * p.quantity;
+                      const quoteTitle = hasLiveQuote ? undefined : quoteStatusLabel(sym ?? { lastUpdated: 0 });
                       return (
                         <tr key={p.id}>
                           <td className="symbol">{p.symbol}</td>
@@ -2026,9 +2056,15 @@ function Dashboard({ token, onLogout, onGoHome, onActivity, theme, onToggleTheme
                           <td>{p.quantity}</td>
                           <td>{fmtPrice(p.entryPrice)}</td>
                           <td>{fmtPrice(totalCost)}</td>
-                          <td>{fmtPrice(currentPrice)}</td>
-                          <td className={pnlPct >= 0 ? 'green' : 'red'}>{fmtPct(pnlPct)}</td>
-                          <td className={pnlDollar >= 0 ? 'green' : 'red'}>{fmtDollar(pnlDollar)}</td>
+                          <td className={hasLiveQuote ? '' : 'muted'} title={quoteTitle}>
+                            {hasLiveQuote ? fmtPrice(currentPrice) : '—'}
+                          </td>
+                          <td className={!hasLiveQuote ? 'muted' : pnlPct >= 0 ? 'green' : 'red'} title={quoteTitle}>
+                            {hasLiveQuote ? fmtPct(pnlPct) : '—'}
+                          </td>
+                          <td className={!hasLiveQuote ? 'muted' : pnlDollar >= 0 ? 'green' : 'red'} title={quoteTitle}>
+                            {hasLiveQuote ? fmtDollar(pnlDollar) : '—'}
+                          </td>
                           <td className="red">{fmtPrice(p.stopLoss)}</td>
                           <td className="green">{fmtPrice(p.takeProfit)}</td>
                           <td title={p.signalId ?? ''}>{positionSignalCell(p)}</td>
