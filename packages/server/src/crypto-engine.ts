@@ -382,6 +382,22 @@ export class CryptoSignalEngine {
   }
 
   start(): void {
+    // TRA-345 — one-shot startup observability for the pinned strategy preset.
+    // Prints the resolved preset id, enabled strategies, symbol filter, and the
+    // raw `LIVE_STRATEGY_PRESET` env value the process actually saw. This is
+    // the deploy gate: if the env var is unset on Render or has a typo,
+    // `resolveStrategyPreset` silently falls back to `legacy_5` and the live
+    // engine runs the unrestricted roster — exactly the regression that
+    // produced the 13 wrong-symbol/strategy trades on 2026-05-05→05-07. Logging
+    // this once at boot means the next time someone questions whether the
+    // preset is active, the server logs answer it directly.
+    const startupPreset = this.resolvePreset();
+    const filterStr = startupPreset.symbolFilter
+      ? `[${startupPreset.symbolFilter.join(',')}]`
+      : '(no filter — all watchlist symbols)';
+    console.log(
+      `[crypto-engine] startup preset: id=${startupPreset.id} env="${FORCED_PRESET_ENV}" strategies=[${startupPreset.enabledStrategies.join(',')}] symbolFilter=${filterStr}`,
+    );
     // Pre-seed symbolState so clients that connect before the first tick see all expected symbols.
     // Entries with lastUpdated=0 signal "loading" to the UI.
     for (const sym of this.getActiveSymbols()) {
