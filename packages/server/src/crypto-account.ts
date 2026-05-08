@@ -14,6 +14,18 @@ const INITIAL_EQUITY = 25_000;
  */
 export const CRYPTO_MAX_EQUITY = 100_000_000;
 
+// TRA-342 — Coinbase Advanced Trade taker fee (~40 bps) and modeled slippage
+// on TP/SL fills (~5 bps). Mirror the values used in
+// packages/backtest/src/run-tra306-sweep.ts so demo, the sweep harness, and
+// what live actually pays all share a single cost model. Without these the
+// demo paper account exits at the exact trigger and bb_fade in particular
+// looks ~3–8× more profitable than what live can capture, since its risk
+// distance is 10–25 bps and a round-trip fee alone is ~80 bps.
+export const CRYPTO_FEE_BPS = 40;
+export const CRYPTO_SLIPPAGE_BPS = 5;
+const FEE_RATE = CRYPTO_FEE_BPS / 10_000;
+const SLIPPAGE_RATE = CRYPTO_SLIPPAGE_BPS / 10_000;
+
 export class CryptoPaperAccount {
   private equity: number;
   private cash: number;
@@ -139,14 +151,16 @@ export class CryptoPaperAccount {
       console.warn(`[crypto-account] skip ${signal.symbol} ${signal.type}: managedEquity=${this.managedEquity().toFixed(2)} too small for price=${currentPrice}`);
       return null;
     }
-    const cost = currentPrice * qty;
+    // TRA-342 — apply Coinbase taker fee on the entry leg so demo cash flow
+    // mirrors live. The matching exit fee is taken on the close in
+    // checkExits / closePosition.
     // TRA-330 — shorts collateralise against equity, not spot cash: opening a
-    // short receives `cost` as proceeds rather than spending it, so the spot
-    // `cost > cash` gate never applied to them. Pre-fix the gate ran for shorts
-    // anyway (they took the same `cash -= cost` path as longs), which let cash
-    // and equity drift apart on every short cycle and eventually inflated demo
-    // equity into the billions. Longs keep the spot gate; shorts use the
+    // short receives proceeds rather than spending them, so the `cost > cash`
+    // gate never applied to them. Longs keep the spot gate; shorts use the
     // managedEquity sizing cap above as their margin floor.
+    const notional = currentPrice * qty;
+    const entryFee = notional * FEE_RATE;
+    const cost = notional + entryFee;
     if (signal.side === 'buy' && cost > this.cash) {
       console.warn(`[crypto-account] skip ${signal.symbol} ${signal.type}: cost=${cost.toFixed(2)} > cash=${this.cash.toFixed(2)} (existing positions consuming cash)`);
       return null;
@@ -155,10 +169,11 @@ export class CryptoPaperAccount {
     if (signal.side === 'buy') {
       this.cash -= cost;
     } else {
-      // Short proceeds land in cash; the buyback at close subtracts the exit
-      // notional. Net cash change over open+close = (entry − exit) × qty,
-      // which is exactly the short's PnL, keeping cash and equity in lock-step.
-      this.cash += cost;
+      // Short proceeds land in cash net of the entry fee; the buyback at close
+      // subtracts the exit notional plus the exit fee. Net cash change over
+      // open+close = (entry − exit) × qty − round-trip fee, which is the
+      // short's fee-aware PnL, keeping cash and equity in lock-step.
+      this.cash += notional - entryFee;
     }
     const position: Position = {
       id: randomUUID(),
@@ -193,16 +208,28 @@ export class CryptoPaperAccount {
       }
 
       if (hit) {
-        const exitPrice = hit === 'tp' ? pos.takeProfit : pos.stopLoss;
+        // TRA-342 — paper instant-fill at the exact trigger is unrealistic;
+        // model a small slippage so the fill is always *worse* than the
+        // trigger (longs fill below, shorts fill above), then book P&L net
+        // of round-trip fees. Manual closes via closePosition still use the
+        // quote price since they represent an explicit user click.
+        const trigger = hit === 'tp' ? pos.takeProfit : pos.stopLoss;
+        const slipDir = pos.side === 'buy' ? -1 : 1;
+        const exitPrice = trigger * (1 + slipDir * SLIPPAGE_RATE);
         const multiplier = pos.side === 'buy' ? 1 : -1;
-        const pnl = (exitPrice - pos.entryPrice) * pos.quantity * multiplier;
+        const grossPnl = (exitPrice - pos.entryPrice) * pos.quantity * multiplier;
+        const totalFee = (pos.entryPrice + exitPrice) * pos.quantity * FEE_RATE;
+        const pnl = grossPnl - totalFee;
         pos.pnl = pnl;
         pos.closedAt = Date.now();
         pos.exitPrice = exitPrice;
-        // TRA-330 — symmetric short fix: longs sell on close (cash += notional),
-        // shorts buy back on close (cash -= notional).
-        if (pos.side === 'buy') this.cash += exitPrice * pos.quantity;
-        else this.cash -= exitPrice * pos.quantity;
+        // TRA-330 + TRA-342 — symmetric short cash flow with the exit fee
+        // baked in: longs sell on close and receive proceeds net of fee,
+        // shorts buy back on close and pay notional plus fee.
+        const exitNotional = exitPrice * pos.quantity;
+        const exitFee = exitNotional * FEE_RATE;
+        if (pos.side === 'buy') this.cash += exitNotional - exitFee;
+        else this.cash -= exitNotional + exitFee;
         this.equity += pnl;
         this.positions.delete(id);
         closed.push({ ...pos });
@@ -214,14 +241,23 @@ export class CryptoPaperAccount {
   closePosition(positionId: string, currentPrice: number): Position | null {
     const pos = this.positions.get(positionId);
     if (!pos) return null;
+    // TRA-342 — manual close still pays the round-trip fee (the user clicked
+    // close at the live quote, but Coinbase still takes its taker cut on the
+    // exit leg). Skip the slippage modeling — the user picked this price
+    // explicitly, no spread crossing to model on top.
     const multiplier = pos.side === 'buy' ? 1 : -1;
-    const pnl = (currentPrice - pos.entryPrice) * pos.quantity * multiplier;
+    const grossPnl = (currentPrice - pos.entryPrice) * pos.quantity * multiplier;
+    const totalFee = (pos.entryPrice + currentPrice) * pos.quantity * FEE_RATE;
+    const pnl = grossPnl - totalFee;
     pos.pnl = pnl;
     pos.exitPrice = currentPrice;
     pos.closedAt = Date.now();
-    // TRA-330 — match the short cash flow fix in checkExits.
-    if (pos.side === 'buy') this.cash += currentPrice * pos.quantity;
-    else this.cash -= currentPrice * pos.quantity;
+    // TRA-330 + TRA-342 — long sells with proceeds net of exit fee,
+    // short buys back paying notional + exit fee.
+    const exitNotional = currentPrice * pos.quantity;
+    const exitFee = exitNotional * FEE_RATE;
+    if (pos.side === 'buy') this.cash += exitNotional - exitFee;
+    else this.cash -= exitNotional + exitFee;
     this.equity += pnl;
     this.positions.delete(positionId);
     return { ...pos };

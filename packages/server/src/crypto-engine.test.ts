@@ -18,6 +18,11 @@ import type { TradeSignal } from '@trading-app/shared';
 
 import { CryptoSignalEngine } from './crypto-engine.js';
 import { CryptoLiveAccount } from './crypto-live-account.js';
+import {
+  CryptoPaperAccount,
+  CRYPTO_FEE_BPS,
+  CRYPTO_SLIPPAGE_BPS,
+} from './crypto-account.js';
 
 // TRA-320 — exercise the CryptoSignalEngine.manualClosePosition wiring against
 // a live account backed by a stubbed Coinbase client. This is the path the
@@ -267,5 +272,114 @@ describe('Strategy presets — TRA-325', () => {
     const p = STRATEGY_PRESETS.bb_fade_sol_doge;
     expect(p.enabledStrategies).toEqual(['bb_fade']);
     expect(p.symbolFilter).toEqual(['SOL-USD', 'DOGE-USD']);
+  });
+});
+
+describe('CryptoPaperAccount fee + slippage modeling — TRA-342', () => {
+  // Demo paper account previously exited at the exact TP/SL trigger with no
+  // fee or slip, which made bb_fade in particular look ~3–8× more profitable
+  // than what live can capture (its risk distance is 10–25 bps and a
+  // round-trip fee alone is ~80 bps). These tests pin the fee/slip math so
+  // a future refactor can't silently restore the optimistic exit pricing.
+
+  const FEE_RATE = CRYPTO_FEE_BPS / 10_000;
+  const SLIPPAGE_RATE = CRYPTO_SLIPPAGE_BPS / 10_000;
+
+  function buildBuySignal(): TradeSignal {
+    return {
+      id: 'sig-fee-1',
+      symbol: 'SOL-USD',
+      type: 'reversal',
+      side: 'buy',
+      entryPrice: 100,
+      stopLoss: 99,
+      takeProfit: 102,
+      riskRewardRatio: 2,
+      timestamp: Date.now(),
+    };
+  }
+
+  it('exposes the fee + slippage constants used by the sweep harness', () => {
+    // Ground truth: these match packages/backtest/src/run-tra306-sweep.ts so
+    // demo, live and the sweep all share a single cost model. Don't drop the
+    // values without coordinating with that file.
+    expect(CRYPTO_FEE_BPS).toBe(40);
+    expect(CRYPTO_SLIPPAGE_BPS).toBe(5);
+  });
+
+  it('debits cash by entry notional × (1 + fee) when opening', () => {
+    const account = new CryptoPaperAccount(25_000, 25_000);
+    const before = account.getState();
+    const opened = account.openPosition(buildBuySignal(), 100);
+    expect(opened).not.toBeNull();
+    const after = account.getState();
+    const qty = opened!.quantity;
+    const expectedCost = 100 * qty * (1 + FEE_RATE);
+    expect(before.availableCash - after.availableCash).toBeCloseTo(expectedCost, 6);
+  });
+
+  it('books a long TP exit at trigger × (1 − slip) net of round-trip fees', () => {
+    const account = new CryptoPaperAccount(25_000, 25_000);
+    const opened = account.openPosition(buildBuySignal(), 100);
+    expect(opened).not.toBeNull();
+    const qty = opened!.quantity;
+
+    // Price gaps through TP — checkExits should fill at tp × (1 − slip).
+    const closed = account.checkExits(new Map([['SOL-USD', 102.5]]));
+    expect(closed).toHaveLength(1);
+    const exit = closed[0]!;
+
+    const expectedExitPrice = 102 * (1 - SLIPPAGE_RATE);
+    expect(exit.exitPrice).toBeCloseTo(expectedExitPrice, 6);
+
+    const grossPnl = (expectedExitPrice - 100) * qty;
+    const fee = (100 + expectedExitPrice) * qty * FEE_RATE;
+    const expectedPnl = grossPnl - fee;
+    expect(exit.pnl).toBeCloseTo(expectedPnl, 6);
+
+    // The realized P&L must be strictly less than the naive (tp − entry) × qty
+    // by the modeled fee + slip — this is the regression guard.
+    const naivePnl = (102 - 100) * qty;
+    expect(exit.pnl!).toBeLessThan(naivePnl);
+    expect(naivePnl - exit.pnl!).toBeCloseTo(naivePnl - expectedPnl, 6);
+  });
+
+  it('books a long SL exit at trigger × (1 − slip) — slip widens the loss', () => {
+    // Long stop-loss: the trigger is below entry. Slip pushes the fill *lower*
+    // (worse for the long), so the realized loss is larger than (entry − sl) × qty.
+    const account = new CryptoPaperAccount(25_000, 25_000);
+    const opened = account.openPosition(buildBuySignal(), 100);
+    expect(opened).not.toBeNull();
+    const qty = opened!.quantity;
+
+    const closed = account.checkExits(new Map([['SOL-USD', 98.5]]));
+    expect(closed).toHaveLength(1);
+    const exit = closed[0]!;
+
+    const expectedExitPrice = 99 * (1 - SLIPPAGE_RATE);
+    expect(exit.exitPrice).toBeCloseTo(expectedExitPrice, 6);
+
+    const naiveLoss = (99 - 100) * qty; // negative
+    expect(exit.pnl!).toBeLessThan(naiveLoss); // larger loss than the naive
+  });
+
+  it('manual closePosition keeps the quote price but still charges round-trip fees', () => {
+    const account = new CryptoPaperAccount(25_000, 25_000);
+    const opened = account.openPosition(buildBuySignal(), 100);
+    expect(opened).not.toBeNull();
+    const qty = opened!.quantity;
+
+    const closed = account.closePosition(opened!.id, 101);
+    expect(closed).not.toBeNull();
+
+    // No slippage on a manual close — the user clicked at this exact price.
+    expect(closed!.exitPrice).toBe(101);
+
+    const grossPnl = (101 - 100) * qty;
+    const fee = (100 + 101) * qty * FEE_RATE;
+    expect(closed!.pnl).toBeCloseTo(grossPnl - fee, 6);
+
+    // But the round-trip fee still bites — naive P&L overstates the realized.
+    expect(closed!.pnl!).toBeLessThan(grossPnl);
   });
 });
