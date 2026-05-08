@@ -23,6 +23,78 @@ import { CalendarTab } from './CalendarTab.tsx';
 import { SERVER_URL, HTTP_URL } from './server-url';
 import './index.css';
 
+// TRA-339 — generic per-table sort. Each dashboard table picks a column
+// type (a string-literal union of its sortable keys), wires its header
+// cells through SortableTH, and resolves sort values via getSortValue
+// keyed by that union. Default direction is desc so monetary/quantity
+// columns lead with the largest first; clicking the active key toggles.
+type SortDir = 'asc' | 'desc';
+type SortState<K extends string> = { key: K; dir: SortDir };
+
+function useTableSort<K extends string>(defaultKey: K, defaultDir: SortDir = 'desc') {
+  const [state, setState] = useState<SortState<K>>({ key: defaultKey, dir: defaultDir });
+  const onSort = useCallback((next: K) => {
+    setState(prev => prev.key === next
+      ? { key: next, dir: prev.dir === 'asc' ? 'desc' : 'asc' }
+      : { key: next, dir: 'desc' });
+  }, []);
+  return { sort: state, onSort };
+}
+
+function compareSortValues(a: unknown, b: unknown, dir: SortDir): number {
+  // null / undefined / NaN sort to the bottom regardless of direction so
+  // unpriced or "—" rows don't pollute the top of either order.
+  const aMissing = a == null || (typeof a === 'number' && Number.isNaN(a));
+  const bMissing = b == null || (typeof b === 'number' && Number.isNaN(b));
+  if (aMissing && bMissing) return 0;
+  if (aMissing) return 1;
+  if (bMissing) return -1;
+  let cmp: number;
+  if (typeof a === 'number' && typeof b === 'number') {
+    cmp = a - b;
+  } else {
+    cmp = String(a).localeCompare(String(b), undefined, { numeric: true, sensitivity: 'base' });
+  }
+  return dir === 'asc' ? cmp : -cmp;
+}
+
+function sortRows<T, K extends string>(
+  rows: readonly T[],
+  state: SortState<K>,
+  getValue: (row: T, key: K) => unknown,
+): T[] {
+  return [...rows].sort((a, b) => compareSortValues(getValue(a, state.key), getValue(b, state.key), state.dir));
+}
+
+function SortableTH<K extends string>({ label, sortKey, sort, onSort }: {
+  label: React.ReactNode;
+  sortKey: K;
+  sort: SortState<K>;
+  onSort: (k: K) => void;
+}) {
+  const active = sort.key === sortKey;
+  const arrow = active ? (sort.dir === 'asc' ? '▲' : '▼') : '↕';
+  const titleLabel = typeof label === 'string' ? label : sortKey;
+  return (
+    <th
+      className={`th-sortable${active ? ' is-active' : ''}`}
+      onClick={() => onSort(sortKey)}
+      role="button"
+      tabIndex={0}
+      onKeyDown={(e) => {
+        if (e.key === 'Enter' || e.key === ' ') {
+          e.preventDefault();
+          onSort(sortKey);
+        }
+      }}
+      title={`Sort by ${titleLabel}`}
+    >
+      <span className="th-sortable-label">{label}</span>
+      <span className={`th-sortable-arrow${active ? '' : ' th-sortable-arrow-idle'}`} aria-hidden="true">{arrow}</span>
+    </th>
+  );
+}
+
 type Theme = 'light' | 'dark';
 const THEME_STORAGE_KEY = 'tradingai_theme';
 
@@ -286,6 +358,69 @@ function AccountModeSwitcher({
   );
 }
 
+// TRA-339 — sortable column keys per Crypto dashboard table. Kept narrow
+// (string-literal unions) so the SortableTH component and the value
+// resolver below stay in sync; adding a column means adding a key here
+// and a branch in getCryptoWatchSortValue / getCryptoOpenPosSortValue /
+// getCryptoClosedPosSortValue.
+type CryptoWatchSortKey = 'symbol' | 'price' | 'change' | 'changePct' | 'volume' | 'updated';
+type CryptoOpenPosSortKey =
+  | 'symbol' | 'side' | 'qty' | 'entry' | 'cost' | 'current'
+  | 'pnlPct' | 'pnlDollar' | 'stop' | 'target'
+  | 'leverage' | 'liquidation' | 'opened';
+type CryptoClosedPosSortKey =
+  | 'symbol' | 'side' | 'qty' | 'entry' | 'exit'
+  | 'pnlPct' | 'pnlDollar' | 'reason' | 'closed';
+
+function getCryptoWatchSortValue(s: SymbolState, key: CryptoWatchSortKey): unknown {
+  if (s.lastUpdated === 0 && key !== 'symbol' && key !== 'updated') return null;
+  switch (key) {
+    case 'symbol': return s.symbol;
+    case 'price': return s.price;
+    case 'change': return s.change;
+    case 'changePct': return s.changePct;
+    case 'volume': return s.volume;
+    case 'updated': return s.lastUpdated;
+  }
+}
+
+function getCryptoOpenPosSortValue(p: Position, key: CryptoOpenPosSortKey, symbols: readonly SymbolState[]): unknown {
+  const sym = symbols.find(s => s.symbol === p.symbol);
+  const currentPrice = sym?.price ?? p.entryPrice;
+  const multiplier = p.side === 'buy' ? 1 : -1;
+  switch (key) {
+    case 'symbol': return p.symbol;
+    case 'side': return p.side;
+    case 'qty': return p.quantity;
+    case 'entry': return p.entryPrice;
+    case 'cost': return p.entryPrice * p.quantity;
+    case 'current': return currentPrice;
+    case 'pnlPct': return ((currentPrice - p.entryPrice) / p.entryPrice) * 100 * multiplier;
+    case 'pnlDollar': return (currentPrice - p.entryPrice) * p.quantity * multiplier;
+    case 'stop': return p.stopLoss;
+    case 'target': return p.takeProfit;
+    case 'leverage': return p.productType === 'perp' ? p.leverage ?? null : null;
+    case 'liquidation': return p.productType === 'perp' ? p.liquidationPrice ?? null : null;
+    case 'opened': return p.openedAt;
+  }
+}
+
+function getCryptoClosedPosSortValue(p: Position, key: CryptoClosedPosSortKey): unknown {
+  const exit = p.exitPrice ?? p.entryPrice;
+  const multiplier = p.side === 'buy' ? 1 : -1;
+  switch (key) {
+    case 'symbol': return p.symbol;
+    case 'side': return p.side;
+    case 'qty': return p.quantity;
+    case 'entry': return p.entryPrice;
+    case 'exit': return exit;
+    case 'pnlPct': return ((exit - p.entryPrice) / p.entryPrice) * 100 * multiplier;
+    case 'pnlDollar': return p.pnl ?? (exit - p.entryPrice) * p.quantity * multiplier;
+    case 'reason': return p.exitReason ?? '';
+    case 'closed': return p.closedAt ?? 0;
+  }
+}
+
 function CryptoDashboard({ token, onBack, onLogout, onActivity, theme, onToggleTheme }: { token: string; onBack: () => void; onLogout: () => void; onActivity?: () => void; theme: Theme; onToggleTheme: () => void }) {
   const [state, setState] = useState<CryptoEngineState | null>(null);
   const [news, setNews] = useState<NewsItem[]>([]);
@@ -303,6 +438,10 @@ function CryptoDashboard({ token, onBack, onLogout, onActivity, theme, onToggleT
   // TRA-320 — surface Coinbase reject reasons on a manual close so the user
   // knows the position stayed open instead of silently disappearing.
   const [closeError, setCloseError] = useState('');
+  // TRA-339 — per-table sort state for the Crypto dashboard.
+  const watchlistSort = useTableSort<CryptoWatchSortKey>('changePct', 'desc');
+  const openPosSort = useTableSort<CryptoOpenPosSortKey>('opened', 'desc');
+  const closedPosSort = useTableSort<CryptoClosedPosSortKey>('closed', 'desc');
   const wsRef = useRef<WebSocket | null>(null);
   const reconnectTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
   const scanStatusTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
@@ -636,11 +775,17 @@ function CryptoDashboard({ token, onBack, onLogout, onActivity, theme, onToggleT
             <table>
               <thead>
                 <tr>
-                  <th>Symbol</th><th>Price</th><th>Change</th><th>Change %</th><th>Volume</th><th>Updated</th><th></th>
+                  <SortableTH label="Symbol" sortKey="symbol" sort={watchlistSort.sort} onSort={watchlistSort.onSort} />
+                  <SortableTH label="Price" sortKey="price" sort={watchlistSort.sort} onSort={watchlistSort.onSort} />
+                  <SortableTH label="Change" sortKey="change" sort={watchlistSort.sort} onSort={watchlistSort.onSort} />
+                  <SortableTH label="Change %" sortKey="changePct" sort={watchlistSort.sort} onSort={watchlistSort.onSort} />
+                  <SortableTH label="Volume" sortKey="volume" sort={watchlistSort.sort} onSort={watchlistSort.onSort} />
+                  <SortableTH label="Updated" sortKey="updated" sort={watchlistSort.sort} onSort={watchlistSort.onSort} />
+                  <th></th>
                 </tr>
               </thead>
               <tbody>
-                {symbols.sort((a, b) => Math.abs(b.changePct) - Math.abs(a.changePct)).map(s => (
+                {sortRows(symbols, watchlistSort.sort, getCryptoWatchSortValue).map(s => (
                   <tr key={s.symbol} className={s.lastUpdated === 0 ? '' : s.change >= 0 ? 'up' : 'down'}>
                     <td className="symbol">{s.symbol}</td>
                     <td className="price">{s.lastUpdated === 0 ? '—' : `$${fmt(s.price)}`}</td>
@@ -748,20 +893,30 @@ function CryptoDashboard({ token, onBack, onLogout, onActivity, theme, onToggleT
                     keep the previous header layout byte-identical. */}
                 {(() => {
                   const showPerpCols = openPositions.some(p => p.productType === 'perp');
+                  const sortedOpen = sortRows(openPositions, openPosSort.sort, (p, k) => getCryptoOpenPosSortValue(p, k, symbols));
                   return (
                     <table>
                       <thead>
                         <tr>
-                          <th>Symbol</th><th>Side</th><th>Qty</th><th>Entry</th><th>Cost</th><th>Current</th>
-                          <th>P&amp;L %</th><th>P&amp;L $</th><th>Stop</th><th>Target</th>
-                          {showPerpCols && <th>Leverage</th>}
-                          {showPerpCols && <th>Liquidation</th>}
+                          <SortableTH label="Symbol" sortKey="symbol" sort={openPosSort.sort} onSort={openPosSort.onSort} />
+                          <SortableTH label="Side" sortKey="side" sort={openPosSort.sort} onSort={openPosSort.onSort} />
+                          <SortableTH label="Qty" sortKey="qty" sort={openPosSort.sort} onSort={openPosSort.onSort} />
+                          <SortableTH label="Entry" sortKey="entry" sort={openPosSort.sort} onSort={openPosSort.onSort} />
+                          <SortableTH label="Cost" sortKey="cost" sort={openPosSort.sort} onSort={openPosSort.onSort} />
+                          <SortableTH label="Current" sortKey="current" sort={openPosSort.sort} onSort={openPosSort.onSort} />
+                          <SortableTH label={<>P&amp;L %</>} sortKey="pnlPct" sort={openPosSort.sort} onSort={openPosSort.onSort} />
+                          <SortableTH label={<>P&amp;L $</>} sortKey="pnlDollar" sort={openPosSort.sort} onSort={openPosSort.onSort} />
+                          <SortableTH label="Stop" sortKey="stop" sort={openPosSort.sort} onSort={openPosSort.onSort} />
+                          <SortableTH label="Target" sortKey="target" sort={openPosSort.sort} onSort={openPosSort.onSort} />
+                          {showPerpCols && <SortableTH label="Leverage" sortKey="leverage" sort={openPosSort.sort} onSort={openPosSort.onSort} />}
+                          {showPerpCols && <SortableTH label="Liquidation" sortKey="liquidation" sort={openPosSort.sort} onSort={openPosSort.onSort} />}
                           <th>Signal</th>
-                          <th>Opened</th><th></th>
+                          <SortableTH label="Opened" sortKey="opened" sort={openPosSort.sort} onSort={openPosSort.onSort} />
+                          <th></th>
                         </tr>
                       </thead>
                       <tbody>
-                        {openPositions.map(p => {
+                        {sortedOpen.map(p => {
                           const sym = symbols.find(s => s.symbol === p.symbol);
                           const currentPrice = sym?.price ?? p.entryPrice;
                           const multiplier = p.side === 'buy' ? 1 : -1;
@@ -811,12 +966,20 @@ function CryptoDashboard({ token, onBack, onLogout, onActivity, theme, onToggleT
                 <table>
                   <thead>
                     <tr>
-                      <th>Symbol</th><th>Side</th><th>Qty</th><th>Entry</th><th>Exit</th>
-                      <th>P&amp;L %</th><th>P&amp;L $</th><th>Reason</th><th>Signal</th><th>Closed</th>
+                      <SortableTH label="Symbol" sortKey="symbol" sort={closedPosSort.sort} onSort={closedPosSort.onSort} />
+                      <SortableTH label="Side" sortKey="side" sort={closedPosSort.sort} onSort={closedPosSort.onSort} />
+                      <SortableTH label="Qty" sortKey="qty" sort={closedPosSort.sort} onSort={closedPosSort.onSort} />
+                      <SortableTH label="Entry" sortKey="entry" sort={closedPosSort.sort} onSort={closedPosSort.onSort} />
+                      <SortableTH label="Exit" sortKey="exit" sort={closedPosSort.sort} onSort={closedPosSort.onSort} />
+                      <SortableTH label={<>P&amp;L %</>} sortKey="pnlPct" sort={closedPosSort.sort} onSort={closedPosSort.onSort} />
+                      <SortableTH label={<>P&amp;L $</>} sortKey="pnlDollar" sort={closedPosSort.sort} onSort={closedPosSort.onSort} />
+                      <SortableTH label="Reason" sortKey="reason" sort={closedPosSort.sort} onSort={closedPosSort.onSort} />
+                      <th>Signal</th>
+                      <SortableTH label="Closed" sortKey="closed" sort={closedPosSort.sort} onSort={closedPosSort.onSort} />
                     </tr>
                   </thead>
                   <tbody>
-                    {[...closedPositions].sort((a, b) => (b.closedAt ?? 0) - (a.closedAt ?? 0)).map(p => {
+                    {sortRows(closedPositions, closedPosSort.sort, getCryptoClosedPosSortValue).map(p => {
                       const exit = p.exitPrice ?? p.entryPrice;
                       const multiplier = p.side === 'buy' ? 1 : -1;
                       const pnlPct = ((exit - p.entryPrice) / p.entryPrice) * 100 * multiplier;
@@ -1222,6 +1385,87 @@ function NewsCard({ item }: { item: NewsItem }) {
   );
 }
 
+// TRA-339 — Stock-dashboard sort keys mirror the Crypto set, minus the
+// perp-only leverage / liquidation columns (Stocks have no perps), and
+// add Open / Closed Options tables.
+type StockOpenPosSortKey =
+  | 'symbol' | 'side' | 'qty' | 'entry' | 'cost' | 'current'
+  | 'pnlPct' | 'pnlDollar' | 'stop' | 'target' | 'opened';
+type StockClosedPosSortKey =
+  | 'symbol' | 'side' | 'qty' | 'entry' | 'exit'
+  | 'pnlPct' | 'pnlDollar' | 'reason' | 'closed';
+type OptionOpenSortKey =
+  | 'symbol' | 'type' | 'contracts' | 'premiumPaid'
+  | 'currentMark' | 'pnlDollar' | 'status' | 'opened';
+type OptionClosedSortKey =
+  | 'symbol' | 'type' | 'contracts' | 'premiumPaid'
+  | 'exitPremium' | 'pnlDollar' | 'closed';
+
+function getStockOpenPosSortValue(p: Position, key: StockOpenPosSortKey, symbols: readonly SymbolState[]): unknown {
+  const sym = symbols.find(s => s.symbol === p.symbol);
+  const currentPrice = sym?.price ?? p.entryPrice;
+  const multiplier = p.side === 'buy' ? 1 : -1;
+  switch (key) {
+    case 'symbol': return p.symbol;
+    case 'side': return p.side;
+    case 'qty': return p.quantity;
+    case 'entry': return p.entryPrice;
+    case 'cost': return p.entryPrice * p.quantity;
+    case 'current': return currentPrice;
+    case 'pnlPct': return ((currentPrice - p.entryPrice) / p.entryPrice) * 100 * multiplier;
+    case 'pnlDollar': return (currentPrice - p.entryPrice) * p.quantity * multiplier;
+    case 'stop': return p.stopLoss;
+    case 'target': return p.takeProfit;
+    case 'opened': return p.openedAt;
+  }
+}
+
+function getStockClosedPosSortValue(p: Position, key: StockClosedPosSortKey): unknown {
+  const exit = p.exitPrice ?? p.entryPrice;
+  const multiplier = p.side === 'buy' ? 1 : -1;
+  switch (key) {
+    case 'symbol': return p.symbol;
+    case 'side': return p.side;
+    case 'qty': return p.quantity;
+    case 'entry': return p.entryPrice;
+    case 'exit': return exit;
+    case 'pnlPct': return ((exit - p.entryPrice) / p.entryPrice) * 100 * multiplier;
+    case 'pnlDollar': return p.pnl ?? (exit - p.entryPrice) * p.quantity * multiplier;
+    case 'reason': return p.exitReason ?? '';
+    case 'closed': return p.closedAt ?? 0;
+  }
+}
+
+function getOptionOpenSortValue(o: OptionPosition, key: OptionOpenSortKey): unknown {
+  const isImported = !!o.importedFromTradier;
+  switch (key) {
+    case 'symbol': return o.symbol;
+    case 'type': return o.optionType;
+    case 'contracts': return o.contracts;
+    case 'premiumPaid': return o.premiumPaid;
+    case 'currentMark': return isImported ? null : o.currentPremium;
+    case 'pnlDollar': {
+      if (isImported) return null;
+      const unrealized = (o.currentPremium - o.premiumPaid) * o.contractsRemaining * 100;
+      return unrealized + (o.pnl ?? 0);
+    }
+    case 'status': return isImported ? 'tradier' : (o.trailingActive ? 'trailing' : 'open');
+    case 'opened': return o.openedAt;
+  }
+}
+
+function getOptionClosedSortValue(o: OptionPosition, key: OptionClosedSortKey): unknown {
+  switch (key) {
+    case 'symbol': return o.symbol;
+    case 'type': return o.optionType;
+    case 'contracts': return o.contracts;
+    case 'premiumPaid': return o.premiumPaid;
+    case 'exitPremium': return o.currentPremium;
+    case 'pnlDollar': return o.pnl ?? 0;
+    case 'closed': return o.closedAt ?? 0;
+  }
+}
+
 function Dashboard({ token, onLogout, onGoHome, onActivity, theme, onToggleTheme }: { token: string; onLogout: () => void; onGoHome: () => void; onActivity?: () => void; theme: Theme; onToggleTheme: () => void }) {
   const [state, setState] = useState<AppState | null>(null);
   const [connected, setConnected] = useState(false);
@@ -1246,6 +1490,12 @@ function Dashboard({ token, onLogout, onGoHome, onActivity, theme, onToggleTheme
   const [tradierSyncing, setTradierSyncing] = useState(false);
   const [tradierSyncStatus, setTradierSyncStatus] = useState('');
   const tradierSyncStatusTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
+  // TRA-339 — per-table sort state for the Stocks dashboard.
+  const watchlistSort = useTableSort<CryptoWatchSortKey>('changePct', 'desc');
+  const openPosSort = useTableSort<StockOpenPosSortKey>('opened', 'desc');
+  const closedPosSort = useTableSort<StockClosedPosSortKey>('closed', 'desc');
+  const openOptSort = useTableSort<OptionOpenSortKey>('opened', 'desc');
+  const closedOptSort = useTableSort<OptionClosedSortKey>('closed', 'desc');
   const wsRef = useRef<WebSocket | null>(null);
   const reconnectTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
   const scanStatusTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
@@ -1663,19 +1913,17 @@ function Dashboard({ token, onLogout, onGoHome, onActivity, theme, onToggleTheme
             <table>
               <thead>
                 <tr>
-                  <th>Symbol</th>
-                  <th>Price</th>
-                  <th>Change</th>
-                  <th>Change %</th>
-                  <th>Volume</th>
-                  <th>Updated</th>
+                  <SortableTH label="Symbol" sortKey="symbol" sort={watchlistSort.sort} onSort={watchlistSort.onSort} />
+                  <SortableTH label="Price" sortKey="price" sort={watchlistSort.sort} onSort={watchlistSort.onSort} />
+                  <SortableTH label="Change" sortKey="change" sort={watchlistSort.sort} onSort={watchlistSort.onSort} />
+                  <SortableTH label="Change %" sortKey="changePct" sort={watchlistSort.sort} onSort={watchlistSort.onSort} />
+                  <SortableTH label="Volume" sortKey="volume" sort={watchlistSort.sort} onSort={watchlistSort.onSort} />
+                  <SortableTH label="Updated" sortKey="updated" sort={watchlistSort.sort} onSort={watchlistSort.onSort} />
                   <th></th>
                 </tr>
               </thead>
               <tbody>
-                {symbols
-                  .sort((a, b) => Math.abs(b.changePct) - Math.abs(a.changePct))
-                  .map(s => (
+                {sortRows(symbols, watchlistSort.sort, getCryptoWatchSortValue).map(s => (
                   <tr key={s.symbol} className={s.lastUpdated === 0 ? '' : s.change >= 0 ? 'up' : 'down'}>
                     <td className="symbol">{s.symbol}</td>
                     <td className="price">{s.lastUpdated === 0 ? '—' : `$${fmt(s.price)}`}</td>
@@ -1748,23 +1996,23 @@ function Dashboard({ token, onLogout, onGoHome, onActivity, theme, onToggleTheme
                 <table>
                   <thead>
                     <tr>
-                      <th>Symbol</th>
-                      <th>Side</th>
-                      <th>Qty</th>
-                      <th>Entry</th>
-                      <th>Cost</th>
-                      <th>Current</th>
-                      <th>P&amp;L %</th>
-                      <th>P&amp;L $</th>
-                      <th>Stop</th>
-                      <th>Target</th>
+                      <SortableTH label="Symbol" sortKey="symbol" sort={openPosSort.sort} onSort={openPosSort.onSort} />
+                      <SortableTH label="Side" sortKey="side" sort={openPosSort.sort} onSort={openPosSort.onSort} />
+                      <SortableTH label="Qty" sortKey="qty" sort={openPosSort.sort} onSort={openPosSort.onSort} />
+                      <SortableTH label="Entry" sortKey="entry" sort={openPosSort.sort} onSort={openPosSort.onSort} />
+                      <SortableTH label="Cost" sortKey="cost" sort={openPosSort.sort} onSort={openPosSort.onSort} />
+                      <SortableTH label="Current" sortKey="current" sort={openPosSort.sort} onSort={openPosSort.onSort} />
+                      <SortableTH label={<>P&amp;L %</>} sortKey="pnlPct" sort={openPosSort.sort} onSort={openPosSort.onSort} />
+                      <SortableTH label={<>P&amp;L $</>} sortKey="pnlDollar" sort={openPosSort.sort} onSort={openPosSort.onSort} />
+                      <SortableTH label="Stop" sortKey="stop" sort={openPosSort.sort} onSort={openPosSort.onSort} />
+                      <SortableTH label="Target" sortKey="target" sort={openPosSort.sort} onSort={openPosSort.onSort} />
                       <th>Signal</th>
-                      <th>Opened</th>
+                      <SortableTH label="Opened" sortKey="opened" sort={openPosSort.sort} onSort={openPosSort.onSort} />
                       <th></th>
                     </tr>
                   </thead>
                   <tbody>
-                    {openPositions.map(p => {
+                    {sortRows(openPositions, openPosSort.sort, (p, k) => getStockOpenPosSortValue(p, k, symbols)).map(p => {
                       const sym = symbols.find(s => s.symbol === p.symbol);
                       const currentPrice = sym?.price ?? p.entryPrice;
                       const multiplier = p.side === 'buy' ? 1 : -1;
@@ -1802,20 +2050,20 @@ function Dashboard({ token, onLogout, onGoHome, onActivity, theme, onToggleTheme
                 <table>
                   <thead>
                     <tr>
-                      <th>Symbol</th>
-                      <th>Side</th>
-                      <th>Qty</th>
-                      <th>Entry</th>
-                      <th>Exit</th>
-                      <th>P&amp;L %</th>
-                      <th>P&amp;L $</th>
-                      <th>Reason</th>
+                      <SortableTH label="Symbol" sortKey="symbol" sort={closedPosSort.sort} onSort={closedPosSort.onSort} />
+                      <SortableTH label="Side" sortKey="side" sort={closedPosSort.sort} onSort={closedPosSort.onSort} />
+                      <SortableTH label="Qty" sortKey="qty" sort={closedPosSort.sort} onSort={closedPosSort.onSort} />
+                      <SortableTH label="Entry" sortKey="entry" sort={closedPosSort.sort} onSort={closedPosSort.onSort} />
+                      <SortableTH label="Exit" sortKey="exit" sort={closedPosSort.sort} onSort={closedPosSort.onSort} />
+                      <SortableTH label={<>P&amp;L %</>} sortKey="pnlPct" sort={closedPosSort.sort} onSort={closedPosSort.onSort} />
+                      <SortableTH label={<>P&amp;L $</>} sortKey="pnlDollar" sort={closedPosSort.sort} onSort={closedPosSort.onSort} />
+                      <SortableTH label="Reason" sortKey="reason" sort={closedPosSort.sort} onSort={closedPosSort.onSort} />
                       <th>Signal</th>
-                      <th>Closed</th>
+                      <SortableTH label="Closed" sortKey="closed" sort={closedPosSort.sort} onSort={closedPosSort.onSort} />
                     </tr>
                   </thead>
                   <tbody>
-                    {[...closedPositions].sort((a, b) => (b.closedAt ?? 0) - (a.closedAt ?? 0)).map(p => {
+                    {sortRows(closedPositions, closedPosSort.sort, getStockClosedPosSortValue).map(p => {
                       const exit = p.exitPrice ?? p.entryPrice;
                       const multiplier = p.side === 'buy' ? 1 : -1;
                       const pnlPct = ((exit - p.entryPrice) / p.entryPrice) * 100 * multiplier;
@@ -1875,21 +2123,21 @@ function Dashboard({ token, onLogout, onGoHome, onActivity, theme, onToggleTheme
                 <table>
                   <thead>
                     <tr>
-                      <th>Symbol</th>
-                      <th>Type</th>
-                      <th>Contracts</th>
-                      <th>Premium Paid</th>
-                      <th>Current Mark</th>
-                      <th>P&amp;L $</th>
-                      <th>Status</th>
+                      <SortableTH label="Symbol" sortKey="symbol" sort={openOptSort.sort} onSort={openOptSort.onSort} />
+                      <SortableTH label="Type" sortKey="type" sort={openOptSort.sort} onSort={openOptSort.onSort} />
+                      <SortableTH label="Contracts" sortKey="contracts" sort={openOptSort.sort} onSort={openOptSort.onSort} />
+                      <SortableTH label="Premium Paid" sortKey="premiumPaid" sort={openOptSort.sort} onSort={openOptSort.onSort} />
+                      <SortableTH label="Current Mark" sortKey="currentMark" sort={openOptSort.sort} onSort={openOptSort.onSort} />
+                      <SortableTH label={<>P&amp;L $</>} sortKey="pnlDollar" sort={openOptSort.sort} onSort={openOptSort.onSort} />
+                      <SortableTH label="Status" sortKey="status" sort={openOptSort.sort} onSort={openOptSort.onSort} />
                       <th>Trail / SL</th>
                       <th>Signal</th>
-                      <th>Opened</th>
+                      <SortableTH label="Opened" sortKey="opened" sort={openOptSort.sort} onSort={openOptSort.onSort} />
                       <th></th>
                     </tr>
                   </thead>
                   <tbody>
-                    {openOptions.map(o => {
+                    {sortRows(openOptions, openOptSort.sort, getOptionOpenSortValue).map(o => {
                       const pnlPct = ((o.currentPremium - o.premiumPaid) / o.premiumPaid) * 100;
                       const unrealized = (o.currentPremium - o.premiumPaid) * o.contractsRemaining * 100;
                       const pnlDollar = unrealized + (o.pnl ?? 0);
@@ -1953,18 +2201,18 @@ function Dashboard({ token, onLogout, onGoHome, onActivity, theme, onToggleTheme
                 <table>
                   <thead>
                     <tr>
-                      <th>Symbol</th>
-                      <th>Type</th>
-                      <th>Contracts</th>
-                      <th>Premium Paid</th>
-                      <th>Exit Premium</th>
-                      <th>P&amp;L $</th>
+                      <SortableTH label="Symbol" sortKey="symbol" sort={closedOptSort.sort} onSort={closedOptSort.onSort} />
+                      <SortableTH label="Type" sortKey="type" sort={closedOptSort.sort} onSort={closedOptSort.onSort} />
+                      <SortableTH label="Contracts" sortKey="contracts" sort={closedOptSort.sort} onSort={closedOptSort.onSort} />
+                      <SortableTH label="Premium Paid" sortKey="premiumPaid" sort={closedOptSort.sort} onSort={closedOptSort.onSort} />
+                      <SortableTH label="Exit Premium" sortKey="exitPremium" sort={closedOptSort.sort} onSort={closedOptSort.onSort} />
+                      <SortableTH label={<>P&amp;L $</>} sortKey="pnlDollar" sort={closedOptSort.sort} onSort={closedOptSort.onSort} />
                       <th>Signal</th>
-                      <th>Closed</th>
+                      <SortableTH label="Closed" sortKey="closed" sort={closedOptSort.sort} onSort={closedOptSort.onSort} />
                     </tr>
                   </thead>
                   <tbody>
-                    {[...closedOptions].sort((a, b) => (b.closedAt ?? 0) - (a.closedAt ?? 0)).map(o => {
+                    {sortRows(closedOptions, closedOptSort.sort, getOptionClosedSortValue).map(o => {
                       const pnlDollar = o.pnl ?? 0;
                       return (
                         <tr key={o.id}>

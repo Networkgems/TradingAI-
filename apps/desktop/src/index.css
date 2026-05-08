@@ -364,6 +364,25 @@ th {
   background: var(--bg);
 }
 
+/* TRA-339 — sortable column headers (clickable, with active arrow). */
+th.th-sortable {
+  cursor: pointer;
+  user-select: none;
+  white-space: nowrap;
+}
+th.th-sortable:hover { color: var(--text); }
+th.th-sortable:focus-visible {
+  outline: 2px solid var(--blue);
+  outline-offset: -2px;
+}
+th.th-sortable.is-active { color: var(--blue); }
+.th-sortable-arrow {
+  margin-left: 0.3em;
+  font-size: 0.7em;
+  display: inline-block;
+}
+.th-sortable-arrow-idle { opacity: 0.3; }
+
 td {
   padding: 0.45rem 0.6rem;
   border-bottom: 1px solid var(--border-subtle);
