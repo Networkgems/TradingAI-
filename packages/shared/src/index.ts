@@ -415,8 +415,31 @@ export interface AccountSettings {
    */
   dailyTradesLimitLive?: number;
   optionsDailyTradesLimitLive?: number;
+  /**
+   * @deprecated TRA-346 — kept only as a read-time fallback for users who
+   * saved before settings were scoped per (mode × market). New writes land on
+   * `managedAccountRatio{Demo,Live}{Stocks,Crypto}`; resolve via
+   * {@link resolveManagedAccountRatio}.
+   */
   managedAccountRatio: number;
+  /**
+   * @deprecated TRA-346 — see `managedAccountRatio`. Resolve via
+   * {@link resolveRiskPerTrade}.
+   */
   riskPerTrade: number;
+  // TRA-346 — Managed Account Ratio + Risk Per Trade are stored per
+  // (account mode × dashboard) so changes in Demo never bleed into Live and
+  // changes in Crypto never bleed into Stocks. Optional: undefined ↔ "fall
+  // back to the legacy un-suffixed field" so existing saved settings keep
+  // working until the user touches each bucket.
+  managedAccountRatioDemoStocks?: number;
+  managedAccountRatioLiveStocks?: number;
+  managedAccountRatioDemoCrypto?: number;
+  managedAccountRatioLiveCrypto?: number;
+  riskPerTradeDemoStocks?: number;
+  riskPerTradeLiveStocks?: number;
+  riskPerTradeDemoCrypto?: number;
+  riskPerTradeLiveCrypto?: number;
   // Auto-trading persistence — survives server restarts. Split per dashboard
   // (stocks vs crypto) AND per account mode (demo vs live) so a user can stop
   // demo trading while leaving live trading running, or vice versa (TRA-229).
@@ -632,6 +655,79 @@ export function isLiveTradierOptionsEnabled(s: AccountSettings): boolean {
 export function isLiveTradierEquityEnabled(s: AccountSettings): boolean {
   const markets = resolveLiveTradierMarkets(s);
   return markets === 'equity' || markets === 'both';
+}
+
+/**
+ * TRA-346 — pick the Managed Account Ratio scoped to the dashboard the caller
+ * cares about (Crypto vs Stocks) and the user's current account mode (Demo vs
+ * Live). Falls back to the legacy un-suffixed `managedAccountRatio` when the
+ * scoped field is undefined so existing saved settings keep sizing positions
+ * the same way until the user touches each bucket.
+ *
+ * Use everywhere the engine sizes positions or surfaces the value to the UI;
+ * never read `s.managedAccountRatio` directly.
+ */
+export function resolveManagedAccountRatio(
+  s: AccountSettings,
+  market: 'crypto' | 'stocks',
+  mode: AccountMode,
+): number {
+  const scoped = market === 'crypto'
+    ? (mode === 'live' ? s.managedAccountRatioLiveCrypto : s.managedAccountRatioDemoCrypto)
+    : (mode === 'live' ? s.managedAccountRatioLiveStocks : s.managedAccountRatioDemoStocks);
+  return scoped ?? s.managedAccountRatio;
+}
+
+/**
+ * TRA-346 — paired resolver for Risk Per Trade. See
+ * {@link resolveManagedAccountRatio} for the scoping rationale.
+ */
+export function resolveRiskPerTrade(
+  s: AccountSettings,
+  market: 'crypto' | 'stocks',
+  mode: AccountMode,
+): number {
+  const scoped = market === 'crypto'
+    ? (mode === 'live' ? s.riskPerTradeLiveCrypto : s.riskPerTradeDemoCrypto)
+    : (mode === 'live' ? s.riskPerTradeLiveStocks : s.riskPerTradeDemoStocks);
+  return scoped ?? s.riskPerTrade;
+}
+
+/**
+ * TRA-346 — return the AccountSettings field name that stores Managed Account
+ * Ratio for the given (market, mode). Used by the Settings UI to write to the
+ * scoped field directly so saving on the Crypto dashboard never overwrites the
+ * Stocks bucket.
+ */
+export function managedAccountRatioField(
+  market: 'crypto' | 'stocks',
+  mode: AccountMode,
+):
+  | 'managedAccountRatioDemoStocks'
+  | 'managedAccountRatioLiveStocks'
+  | 'managedAccountRatioDemoCrypto'
+  | 'managedAccountRatioLiveCrypto' {
+  if (market === 'crypto') {
+    return mode === 'live' ? 'managedAccountRatioLiveCrypto' : 'managedAccountRatioDemoCrypto';
+  }
+  return mode === 'live' ? 'managedAccountRatioLiveStocks' : 'managedAccountRatioDemoStocks';
+}
+
+/**
+ * TRA-346 — paired field-name resolver for Risk Per Trade.
+ */
+export function riskPerTradeField(
+  market: 'crypto' | 'stocks',
+  mode: AccountMode,
+):
+  | 'riskPerTradeDemoStocks'
+  | 'riskPerTradeLiveStocks'
+  | 'riskPerTradeDemoCrypto'
+  | 'riskPerTradeLiveCrypto' {
+  if (market === 'crypto') {
+    return mode === 'live' ? 'riskPerTradeLiveCrypto' : 'riskPerTradeDemoCrypto';
+  }
+  return mode === 'live' ? 'riskPerTradeLiveStocks' : 'riskPerTradeDemoStocks';
 }
 
 export const WATCHLIST_SIZE = 25;

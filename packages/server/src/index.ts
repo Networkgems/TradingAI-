@@ -979,6 +979,20 @@ app.put('/api/account/settings', requireAuth, async (req, res) => {
   const body = req.body as Partial<AccountSettings>;
   const current = getSettings(username);
   const clampEquity = (v: number) => Math.max(1_000, Math.min(10_000_000, Number(v)));
+  // TRA-346 — clamp helpers for scoped ratio/risk fields. `undefined`
+  // (neither the request nor the saved snapshot wrote this bucket) is
+  // preserved so the resolver keeps falling back to the legacy field instead
+  // of pinning every bucket to default the moment any setting is saved.
+  const clampScopedRatio = (incoming?: number, saved?: number): number | undefined => {
+    const raw = incoming ?? saved;
+    if (raw === undefined || raw === null || Number.isNaN(Number(raw))) return saved;
+    return Math.max(0.01, Math.min(1, Number(raw)));
+  };
+  const clampScopedRisk = (incoming?: number, saved?: number): number | undefined => {
+    const raw = incoming ?? saved;
+    if (raw === undefined || raw === null || Number.isNaN(Number(raw))) return saved;
+    return Math.max(0.001, Math.min(0.5, Number(raw)));
+  };
   const updated: AccountSettings = {
     ...current,
     ...body,
@@ -1010,6 +1024,19 @@ app.put('/api/account/settings', requireAuth, async (req, res) => {
     ),
     managedAccountRatio: Math.max(0.01, Math.min(1, Number(body.managedAccountRatio ?? current.managedAccountRatio))),
     riskPerTrade: Math.max(0.001, Math.min(0.5, Number(body.riskPerTrade ?? current.riskPerTrade))),
+    // TRA-346 — scoped Managed Account Ratio + Risk Per Trade. Clamp each
+    // bucket independently and only when the body or saved settings actually
+    // hold a value (`undefined` keeps the resolver fallback to the legacy
+    // un-suffixed field, so untouched buckets don't get pinned to 0.5/0.01
+    // the moment any other setting is saved).
+    managedAccountRatioDemoStocks: clampScopedRatio(body.managedAccountRatioDemoStocks, current.managedAccountRatioDemoStocks),
+    managedAccountRatioLiveStocks: clampScopedRatio(body.managedAccountRatioLiveStocks, current.managedAccountRatioLiveStocks),
+    managedAccountRatioDemoCrypto: clampScopedRatio(body.managedAccountRatioDemoCrypto, current.managedAccountRatioDemoCrypto),
+    managedAccountRatioLiveCrypto: clampScopedRatio(body.managedAccountRatioLiveCrypto, current.managedAccountRatioLiveCrypto),
+    riskPerTradeDemoStocks: clampScopedRisk(body.riskPerTradeDemoStocks, current.riskPerTradeDemoStocks),
+    riskPerTradeLiveStocks: clampScopedRisk(body.riskPerTradeLiveStocks, current.riskPerTradeLiveStocks),
+    riskPerTradeDemoCrypto: clampScopedRisk(body.riskPerTradeDemoCrypto, current.riskPerTradeDemoCrypto),
+    riskPerTradeLiveCrypto: clampScopedRisk(body.riskPerTradeLiveCrypto, current.riskPerTradeLiveCrypto),
     // TRA-249-E — clamp the operator-facing leverage cap to [1, 5] integer.
     // The live engine still hard-caps at 1× (PERP_SHORT_LEVERAGE) so a
     // misconfigured value can't bypass the §6 caps; clamping here keeps the

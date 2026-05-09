@@ -1,6 +1,6 @@
 import { OrbStrategy, BbFadeStrategy, IchimokuStrategy, TradierOptionsClient, TradierOrderClient, TRADIER_REJECTED_STATUSES } from '@trading-app/engine';
 import type { TradierAccountBalance } from '@trading-app/engine';
-import { WATCHLIST, MANAGED_ACCOUNT_RATIO, MAX_CONSECUTIVE_LOSSES, DAILY_DRAWDOWN_HALT_PCT, aliasWatchlistSymbol, isLiveTradierOptionsEnabled, isStockMarketOpen, resolveTradierOptionsCreds } from '@trading-app/shared';
+import { WATCHLIST, MANAGED_ACCOUNT_RATIO, MAX_CONSECUTIVE_LOSSES, DAILY_DRAWDOWN_HALT_PCT, aliasWatchlistSymbol, isLiveTradierOptionsEnabled, isStockMarketOpen, resolveManagedAccountRatio, resolveRiskPerTrade, resolveTradierOptionsCreds } from '@trading-app/shared';
 import type { TradeSignal, RelativeValueSignal, Candle, OptionsAccountState, SignalType, Position, AccountSettings, AccountState, NewsItem, TradierEnv } from '@trading-app/shared';
 import { fetchMinuteBars, fetchQuotes, fetchStocksNews, isYahooBreakerOpen, setActiveInterestSymbols } from './yahoo-feed.js';
 import { PaperAccount } from './paper-account.js';
@@ -255,8 +255,6 @@ export class SignalEngine {
     this.tracker = tracker;
     this.rvScanner = rvScanner;
     this.mode = settings?.mode === 'live' ? 'live' : 'demo';
-    this.managedAccountRatio = settings?.managedAccountRatio ?? MANAGED_ACCOUNT_RATIO;
-    this.riskPerTrade = settings?.riskPerTrade ?? 0.01;
     // Demo state is always loaded internally so a live → demo switch can
     // restore positions, equity, and dailyPnl without rebasing to the default
     // starting balance. Live mode masks this state via getState().
@@ -265,24 +263,39 @@ export class SignalEngine {
     const initialEquity = stocksEquity ?? 25_000;
     const currentEquity = hasSaved ? tracker!.getSavedEquity() : initialEquity;
     const dailyPnl = hasSaved ? currentEquity - tracker!.getOpeningEquity() : 0;
+    // TRA-346 — every sub-account is mode-locked: the stocks paper account is
+    // always demo, the sandbox options bucket sizes paper trades (demo), and
+    // the production options bucket drives real Tradier orders (live). Each
+    // reads from its own (mode, 'stocks') bucket so a Live edit never bleeds
+    // into Demo sizing and vice versa. The engine-level
+    // `managedAccountRatio`/`riskPerTrade` fields drive live equity sizing
+    // (TRA-335 Tradier bracket orders) so they always pin to the (live,
+    // 'stocks') bucket. Resolver falls through to the legacy un-suffixed
+    // field for users who saved before TRA-346.
+    const demoStocksRatio = settings ? resolveManagedAccountRatio(settings, 'stocks', 'demo') : undefined;
+    const demoStocksRisk = settings ? resolveRiskPerTrade(settings, 'stocks', 'demo') : undefined;
+    const liveStocksRatio = settings ? resolveManagedAccountRatio(settings, 'stocks', 'live') : undefined;
+    const liveStocksRisk = settings ? resolveRiskPerTrade(settings, 'stocks', 'live') : undefined;
+    this.managedAccountRatio = liveStocksRatio ?? MANAGED_ACCOUNT_RATIO;
+    this.riskPerTrade = liveStocksRisk ?? 0.01;
     this.account = new PaperAccount({
       initialEquity,
       currentEquity,
       dailyPnl,
-      managedAccountRatio: settings?.managedAccountRatio,
-      riskPerTrade: settings?.riskPerTrade,
+      managedAccountRatio: demoStocksRatio,
+      riskPerTrade: demoStocksRisk,
     });
     this.tradierEnv = settings?.liveTradierEnvOptions ?? 'sandbox';
     this.optionsAccounts = {
       sandbox: new PaperOptionsAccount({
         initialEquity: currentEquity,
-        managedAccountRatio: settings?.managedAccountRatio,
+        managedAccountRatio: demoStocksRatio,
         optionsDailyTradesLimit: activeOptionsDailyLimit(settings),
         tradierEnv: 'sandbox',
       }),
       production: new PaperOptionsAccount({
         initialEquity: currentEquity,
-        managedAccountRatio: settings?.managedAccountRatio,
+        managedAccountRatio: liveStocksRatio,
         optionsDailyTradesLimit: activeOptionsDailyLimit(settings),
         tradierEnv: 'production',
       }),
@@ -330,18 +343,28 @@ export class SignalEngine {
     // start/stop UI state for either mode) keeps the engine in sync.
     this.autoTradingEnabledDemo = settings.stocksAutoTradingEnabledDemo ?? true;
     this.autoTradingEnabledLive = settings.stocksAutoTradingEnabledLive ?? true;
-    this.managedAccountRatio = settings.managedAccountRatio;
-    this.riskPerTrade = settings.riskPerTrade;
+    // TRA-346 — each sub-account reads from its own mode-locked bucket so a
+    // Demo-side edit doesn't leak into Live sizing (and vice versa). The
+    // engine-level fields drive live equity sizing (TRA-335) so they always
+    // pin to the (live, 'stocks') bucket regardless of the active mode.
+    const demoStocksRatio = resolveManagedAccountRatio(settings, 'stocks', 'demo');
+    const demoStocksRisk = resolveRiskPerTrade(settings, 'stocks', 'demo');
+    const liveStocksRatio = resolveManagedAccountRatio(settings, 'stocks', 'live');
+    const liveStocksRisk = resolveRiskPerTrade(settings, 'stocks', 'live');
+    this.managedAccountRatio = liveStocksRatio;
+    this.riskPerTrade = liveStocksRisk;
     this.account.updateConfig({
-      managedAccountRatio: settings.managedAccountRatio,
-      riskPerTrade: settings.riskPerTrade,
+      managedAccountRatio: demoStocksRatio,
+      riskPerTrade: demoStocksRisk,
     });
-    for (const acct of this.allOptionsAccounts()) {
-      acct.updateConfig({
-        managedAccountRatio: settings.managedAccountRatio,
-        optionsDailyTradesLimit: activeOptionsDailyLimit(settings),
-      });
-    }
+    this.optionsAccounts.sandbox.updateConfig({
+      managedAccountRatio: demoStocksRatio,
+      optionsDailyTradesLimit: activeOptionsDailyLimit(settings),
+    });
+    this.optionsAccounts.production.updateConfig({
+      managedAccountRatio: liveStocksRatio,
+      optionsDailyTradesLimit: activeOptionsDailyLimit(settings),
+    });
     // TRA-221 — re-resolve the Tradier live client whenever settings change
     // so toggling Live mode or editing the API token takes effect on the
     // next tick without requiring a server restart.
@@ -415,21 +438,29 @@ export class SignalEngine {
    */
   forceReset(settings: AccountSettings): void {
     const equity = settings.mode === 'live' ? 0 : (settings.demoEquityStocks ?? settings.demoEquity);
+    // TRA-346 — each rebuilt sub-account reseats its own mode-locked bucket
+    // so the reset can't accidentally cross-pollinate Demo and Live sizing.
+    const demoStocksRatio = resolveManagedAccountRatio(settings, 'stocks', 'demo');
+    const demoStocksRisk = resolveRiskPerTrade(settings, 'stocks', 'demo');
+    const liveStocksRatio = resolveManagedAccountRatio(settings, 'stocks', 'live');
     this.account.reset({
       initialEquity: equity,
-      managedAccountRatio: settings.managedAccountRatio,
-      riskPerTrade: settings.riskPerTrade,
+      managedAccountRatio: demoStocksRatio,
+      riskPerTrade: demoStocksRisk,
     });
     // TRA-233 — wipe both env buckets so "Reset Demo Account" leaves no stale
     // sandbox/production positions or P&L behind regardless of which env the
     // user is currently viewing.
-    for (const acct of this.allOptionsAccounts()) {
-      acct.reset({
-        initialEquity: equity,
-        managedAccountRatio: settings.managedAccountRatio,
-        optionsDailyTradesLimit: activeOptionsDailyLimit(settings),
-      });
-    }
+    this.optionsAccounts.sandbox.reset({
+      initialEquity: equity,
+      managedAccountRatio: demoStocksRatio,
+      optionsDailyTradesLimit: activeOptionsDailyLimit(settings),
+    });
+    this.optionsAccounts.production.reset({
+      initialEquity: equity,
+      managedAccountRatio: liveStocksRatio,
+      optionsDailyTradesLimit: activeOptionsDailyLimit(settings),
+    });
     this.allClosedPositions = [];
     this.recentSignals = [];
     this.dailySignals = [];

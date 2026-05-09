@@ -1,5 +1,6 @@
 import { useEffect, useState } from 'react';
 import type {
+  AccountMode,
   AccountSettings,
   BrokerageType,
   LiveTradeMode,
@@ -11,6 +12,10 @@ import {
   DEFAULT_ACCOUNT_SETTINGS,
   DEFAULT_STRATEGY_PRESET_ID,
   STRATEGY_PRESETS,
+  managedAccountRatioField,
+  resolveManagedAccountRatio,
+  resolveRiskPerTrade,
+  riskPerTradeField,
 } from '@trading-app/shared';
 
 type Market = 'crypto' | 'stocks';
@@ -1141,49 +1146,92 @@ export default function SettingsPage({ token, httpUrl, context, onModeChange, on
                 </div>
               )}
 
-              {/* TRA-232 — Managed Account Ratio + Risk Per Trade apply to all
-                  three engines (stocks, options, crypto demo + live), so they
-                  stay visible in every context. */}
-              <div className="settings-field">
-                <label>Managed Account Ratio (%)</label>
-                <input
-                  type="number"
-                  min={1}
-                  max={100}
-                  value={Math.round(settings.managedAccountRatio * 100)}
-                  onChange={e => set('managedAccountRatio', Number(e.target.value) / 100)}
-                />
-                <span className="field-hint">Portion of equity auto-traded (default: 50%)</span>
-              </div>
-
-              <div className="settings-field">
-                <label>Risk Per Trade (%)</label>
-                <input
-                  type="number"
-                  min={0.1}
-                  max={50}
-                  step={0.1}
-                  value={+(settings.riskPerTrade * 100).toFixed(2)}
-                  onChange={e => set('riskPerTrade', Number(e.target.value) / 100)}
-                />
-                <span className="field-hint">Max equity risked per trade (default: 1%)</span>
-              </div>
+              {/* TRA-346 — Managed Account Ratio + Risk Per Trade are stored
+                  per (mode × dashboard) so the Crypto and Stocks dashboards
+                  no longer share a slot, and Demo edits don't bleed into
+                  Live. The standalone settings page (no `context`) writes to
+                  the Stocks bucket by default to preserve the historical
+                  behaviour where these inputs surfaced once globally. */}
+              {(() => {
+                const market: Market = context ?? 'stocks';
+                const mode: AccountMode = 'demo';
+                const ratioKey = managedAccountRatioField(market, mode);
+                const riskKey = riskPerTradeField(market, mode);
+                const ratio = resolveManagedAccountRatio(settings, market, mode);
+                const risk = resolveRiskPerTrade(settings, market, mode);
+                const labelSuffix = context === 'crypto'
+                  ? ' (Demo Crypto)'
+                  : context === 'stocks' ? ' (Demo Stocks)' : '';
+                return (
+                  <>
+                    <div className="settings-field">
+                      <label>{`Managed Account Ratio (%)${labelSuffix}`}</label>
+                      <input
+                        type="number"
+                        min={1}
+                        max={100}
+                        value={Math.round(ratio * 100)}
+                        onChange={e => setSettings(prev => ({
+                          ...prev,
+                          [ratioKey]: Number(e.target.value) / 100,
+                        }))}
+                      />
+                      <span className="field-hint">
+                        Portion of equity auto-traded (default: 50%). Only affects
+                        {context === 'crypto' ? ' demo crypto' : context === 'stocks' ? ' demo stocks/options' : ' demo'}.
+                      </span>
+                    </div>
+                    <div className="settings-field">
+                      <label>{`Risk Per Trade (%)${labelSuffix}`}</label>
+                      <input
+                        type="number"
+                        min={0.1}
+                        max={50}
+                        step={0.1}
+                        value={+(risk * 100).toFixed(2)}
+                        onChange={e => setSettings(prev => ({
+                          ...prev,
+                          [riskKey]: Number(e.target.value) / 100,
+                        }))}
+                      />
+                      <span className="field-hint">
+                        Max equity risked per trade (default: 1%). Only affects
+                        {context === 'crypto' ? ' demo crypto' : context === 'stocks' ? ' demo stocks/options' : ' demo'}.
+                      </span>
+                    </div>
+                  </>
+                );
+              })()}
             </div>
 
             <div className="settings-actions-row">
               <button
                 type="button"
                 className="btn-secondary"
-                onClick={() => setSettings(s => ({
-                  ...s,
-                  demoEquity: DEFAULT_ACCOUNT_SETTINGS.demoEquity,
-                  demoEquityStocks: DEFAULT_ACCOUNT_SETTINGS.demoEquityStocks,
-                  demoEquityCrypto: DEFAULT_ACCOUNT_SETTINGS.demoEquityCrypto,
-                  dailyTradesLimit: DEFAULT_ACCOUNT_SETTINGS.dailyTradesLimit,
-                  optionsDailyTradesLimit: DEFAULT_ACCOUNT_SETTINGS.optionsDailyTradesLimit,
-                  managedAccountRatio: DEFAULT_ACCOUNT_SETTINGS.managedAccountRatio,
-                  riskPerTrade: DEFAULT_ACCOUNT_SETTINGS.riskPerTrade,
-                }))}
+                onClick={() => setSettings(s => {
+                  // TRA-346 — only revert the demo bucket for the dashboard the
+                  // user is on; the Live bucket and the *other* dashboard's
+                  // values stay untouched. With no context we revert both demo
+                  // buckets to keep parity with the pre-346 global page.
+                  const market: Market | undefined = context;
+                  const next: AccountSettings = {
+                    ...s,
+                    demoEquity: DEFAULT_ACCOUNT_SETTINGS.demoEquity,
+                    demoEquityStocks: DEFAULT_ACCOUNT_SETTINGS.demoEquityStocks,
+                    demoEquityCrypto: DEFAULT_ACCOUNT_SETTINGS.demoEquityCrypto,
+                    dailyTradesLimit: DEFAULT_ACCOUNT_SETTINGS.dailyTradesLimit,
+                    optionsDailyTradesLimit: DEFAULT_ACCOUNT_SETTINGS.optionsDailyTradesLimit,
+                  };
+                  if (!market || market === 'stocks') {
+                    next.managedAccountRatioDemoStocks = DEFAULT_ACCOUNT_SETTINGS.managedAccountRatio;
+                    next.riskPerTradeDemoStocks = DEFAULT_ACCOUNT_SETTINGS.riskPerTrade;
+                  }
+                  if (!market || market === 'crypto') {
+                    next.managedAccountRatioDemoCrypto = DEFAULT_ACCOUNT_SETTINGS.managedAccountRatio;
+                    next.riskPerTradeDemoCrypto = DEFAULT_ACCOUNT_SETTINGS.riskPerTrade;
+                  }
+                  return next;
+                })}
               >
                 Revert to Defaults
               </button>
@@ -1212,34 +1260,57 @@ export default function SettingsPage({ token, httpUrl, context, onModeChange, on
             <div className="live-brokerage-block">
               <h3 className="settings-subheading">Live Trading Risk</h3>
               <div className="settings-grid">
-                <div className="settings-field">
-                  <label>Managed Account Ratio (%)</label>
-                  <input
-                    type="number"
-                    min={1}
-                    max={100}
-                    value={Math.round(settings.managedAccountRatio * 100)}
-                    onChange={e => set('managedAccountRatio', Number(e.target.value) / 100)}
-                  />
-                  <span className="field-hint">
-                    Portion of equity auto-traded (default: 50%). Applies to live
-                    {context === 'crypto' ? ' Coinbase' : context === 'stocks' ? ' Tradier (options)' : ' brokerage'} orders.
-                  </span>
-                </div>
-                <div className="settings-field">
-                  <label>Risk Per Trade (%)</label>
-                  <input
-                    type="number"
-                    min={0.1}
-                    max={50}
-                    step={0.1}
-                    value={+(settings.riskPerTrade * 100).toFixed(2)}
-                    onChange={e => set('riskPerTrade', Number(e.target.value) / 100)}
-                  />
-                  <span className="field-hint">
-                    Max equity risked per live trade (default: 1%). Applied to position sizing on every order.
-                  </span>
-                </div>
+                {/* TRA-346 — scoped to (live × context) so Crypto and Stocks
+                    track separate live values, and saving here never alters
+                    the Demo bucket. */}
+                {(() => {
+                  const market: Market = context ?? 'stocks';
+                  const mode: AccountMode = 'live';
+                  const ratioKey = managedAccountRatioField(market, mode);
+                  const riskKey = riskPerTradeField(market, mode);
+                  const ratio = resolveManagedAccountRatio(settings, market, mode);
+                  const risk = resolveRiskPerTrade(settings, market, mode);
+                  const liveBrokerLabel = context === 'crypto'
+                    ? 'live Coinbase'
+                    : context === 'stocks' ? 'live Tradier (options)' : 'live brokerage';
+                  return (
+                    <>
+                      <div className="settings-field">
+                        <label>Managed Account Ratio (%)</label>
+                        <input
+                          type="number"
+                          min={1}
+                          max={100}
+                          value={Math.round(ratio * 100)}
+                          onChange={e => setSettings(prev => ({
+                            ...prev,
+                            [ratioKey]: Number(e.target.value) / 100,
+                          }))}
+                        />
+                        <span className="field-hint">
+                          Portion of equity auto-traded (default: 50%). Only affects {liveBrokerLabel} orders.
+                        </span>
+                      </div>
+                      <div className="settings-field">
+                        <label>Risk Per Trade (%)</label>
+                        <input
+                          type="number"
+                          min={0.1}
+                          max={50}
+                          step={0.1}
+                          value={+(risk * 100).toFixed(2)}
+                          onChange={e => setSettings(prev => ({
+                            ...prev,
+                            [riskKey]: Number(e.target.value) / 100,
+                          }))}
+                        />
+                        <span className="field-hint">
+                          Max equity risked per live trade (default: 1%). Only affects {liveBrokerLabel} sizing.
+                        </span>
+                      </div>
+                    </>
+                  );
+                })()}
                 {/* TRA-341 — operator override for the §6 single-symbol short
                     cap on the live perp router (default 15% of strategy equity).
                     Crypto-only; the cross-strategy (20%) and total-book (30%)

@@ -15,7 +15,7 @@ import {
   type ShortFilterContext,
   type ClosedShortTrade,
 } from '@trading-app/engine';
-import { CRYPTO_WATCHLIST, isCryptoSymbolBlocked, aliasCryptoSymbol, resolveStrategyPreset } from '@trading-app/shared';
+import { CRYPTO_WATCHLIST, isCryptoSymbolBlocked, aliasCryptoSymbol, resolveManagedAccountRatio, resolveRiskPerTrade, resolveStrategyPreset } from '@trading-app/shared';
 import type {
   TradeSignal,
   Candle,
@@ -175,10 +175,13 @@ export class CryptoSignalEngine {
     // TRA-232 — push the user's risk knobs into the demo account so position
     // sizing matches the Settings page values instead of falling back to the
     // shared defaults.
+    // TRA-346 — pull from the (mode, 'crypto') bucket so a Live edit on the
+    // Crypto dashboard never mutates Demo crypto sizing (and a Stocks edit
+    // never mutates Crypto at all).
     if (settings) {
       this.account.updateRiskConfig({
-        managedAccountRatio: settings.managedAccountRatio,
-        riskPerTrade: settings.riskPerTrade,
+        managedAccountRatio: resolveManagedAccountRatio(settings, 'crypto', settings.mode),
+        riskPerTrade: resolveRiskPerTrade(settings, 'crypto', settings.mode),
       });
     }
     // Constructor can't await — kick off broker init + balance refresh in the
@@ -241,10 +244,13 @@ export class CryptoSignalEngine {
       // `LIVE_SINGLE_SYMBOL_SHORT_CAP` > engine default (0.15). Resolver
       // returns `null` when neither knob is set, which clears any previously
       // applied cap and falls through to the engine default downstream.
+      // TRA-346 — read from the (live, 'crypto') bucket explicitly: the
+      // broker is by definition the live account, regardless of where the
+      // user happens to be in `s.mode` mid-save.
       if (s) {
         live.updateRiskConfig({
-          managedAccountRatio: s.managedAccountRatio,
-          riskPerTrade: s.riskPerTrade,
+          managedAccountRatio: resolveManagedAccountRatio(s, 'crypto', 'live'),
+          riskPerTrade: resolveRiskPerTrade(s, 'crypto', 'live'),
           singleSymbolShortCap: resolveLiveSingleSymbolShortCap(
             s.liveSingleSymbolShortCap,
             process.env.LIVE_SINGLE_SYMBOL_SHORT_CAP,
@@ -343,9 +349,13 @@ export class CryptoSignalEngine {
     // TRA-232 — push fresh risk knobs into the demo account on every settings
     // save. The live account is rebuilt below (or via tryInitLiveBroker) and
     // picks up the same values when buildLiveBroker reads currentSettings.
+    // TRA-346 — the demo paper account always sizes off the (demo, crypto)
+    // bucket regardless of `settings.mode`; live sizing flows through the
+    // live broker which reads its own (live, crypto) bucket. This keeps Demo
+    // crypto isolated from Live crypto edits.
     this.account.updateRiskConfig({
-      managedAccountRatio: settings.managedAccountRatio,
-      riskPerTrade: settings.riskPerTrade,
+      managedAccountRatio: resolveManagedAccountRatio(settings, 'crypto', 'demo'),
+      riskPerTrade: resolveRiskPerTrade(settings, 'crypto', 'demo'),
     });
     if (this.mode === 'live') {
       // Live mode: leave the demo account/tracker untouched so the demo state
