@@ -145,3 +145,69 @@ export async function saveSettings(username: string, settings: AccountSettings):
 export function clearSettingsCache(username: string): void {
   cache.delete(username);
 }
+
+/**
+ * TRA-346 — clamp the Managed Account Ratio for one of the four scoped
+ * (mode × dashboard) buckets. The route handler invokes this once per bucket
+ * with the request body's value and the saved snapshot's value.
+ *
+ * `undefined` is preserved (instead of being coerced to a default) so the
+ * resolver's legacy-fallback chain — `scoped ?? s.managedAccountRatio` —
+ * keeps working for users who saved before the four-bucket split. Pinning an
+ * untouched bucket to `0.5` the moment any other setting is saved would
+ * silently disable the fallback and "split" sizing for users who never edited
+ * the per-mode knob.
+ */
+export function clampScopedRatio(incoming?: number, saved?: number): number | undefined {
+  const raw = incoming ?? saved;
+  if (raw === undefined || raw === null || Number.isNaN(Number(raw))) return saved;
+  return Math.max(0.01, Math.min(1, Number(raw)));
+}
+
+/**
+ * TRA-346 — paired clamp for Risk Per Trade. See {@link clampScopedRatio} for
+ * the `undefined` preservation rationale. Bounds match the spec
+ * (`risk ∈ [0.001, 0.5]`) and mirror the legacy `riskPerTrade` route clamp.
+ */
+export function clampScopedRisk(incoming?: number, saved?: number): number | undefined {
+  const raw = incoming ?? saved;
+  if (raw === undefined || raw === null || Number.isNaN(Number(raw))) return saved;
+  return Math.max(0.001, Math.min(0.5, Number(raw)));
+}
+
+/**
+ * TRA-346 — return a partial AccountSettings holding only the eight scoped
+ * Managed Account Ratio + Risk Per Trade fields, each clamped against the
+ * matching bucket from `body` (request) falling back to `current` (saved).
+ *
+ * Extracted so the unit tests can lock in the four-bucket isolation contract
+ * without spinning up the full Express route. Each bucket is clamped
+ * independently — touching `managedAccountRatioDemoCrypto` must NOT pin the
+ * other seven scoped fields to anything, otherwise the resolver's legacy
+ * fallback breaks for users who saved before TRA-346.
+ */
+export function mergeScopedRiskSettings(
+  current: AccountSettings,
+  body: Partial<AccountSettings>,
+): Pick<
+  AccountSettings,
+  | 'managedAccountRatioDemoStocks'
+  | 'managedAccountRatioLiveStocks'
+  | 'managedAccountRatioDemoCrypto'
+  | 'managedAccountRatioLiveCrypto'
+  | 'riskPerTradeDemoStocks'
+  | 'riskPerTradeLiveStocks'
+  | 'riskPerTradeDemoCrypto'
+  | 'riskPerTradeLiveCrypto'
+> {
+  return {
+    managedAccountRatioDemoStocks: clampScopedRatio(body.managedAccountRatioDemoStocks, current.managedAccountRatioDemoStocks),
+    managedAccountRatioLiveStocks: clampScopedRatio(body.managedAccountRatioLiveStocks, current.managedAccountRatioLiveStocks),
+    managedAccountRatioDemoCrypto: clampScopedRatio(body.managedAccountRatioDemoCrypto, current.managedAccountRatioDemoCrypto),
+    managedAccountRatioLiveCrypto: clampScopedRatio(body.managedAccountRatioLiveCrypto, current.managedAccountRatioLiveCrypto),
+    riskPerTradeDemoStocks: clampScopedRisk(body.riskPerTradeDemoStocks, current.riskPerTradeDemoStocks),
+    riskPerTradeLiveStocks: clampScopedRisk(body.riskPerTradeLiveStocks, current.riskPerTradeLiveStocks),
+    riskPerTradeDemoCrypto: clampScopedRisk(body.riskPerTradeDemoCrypto, current.riskPerTradeDemoCrypto),
+    riskPerTradeLiveCrypto: clampScopedRisk(body.riskPerTradeLiveCrypto, current.riskPerTradeLiveCrypto),
+  };
+}

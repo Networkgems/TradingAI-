@@ -1039,3 +1039,146 @@ describe('buildTradierLiveEquityClient gating (TRA-335)', () => {
     expect(client).toBeNull();
   });
 });
+
+// TRA-349 — regression-lock the (mode × dashboard) sub-account wiring shipped
+// in TRA-346. SignalEngine owns three stocks-side sub-accounts plus an
+// engine-level pair of fields:
+//
+//   * `account` (PaperAccount, demo paper)         → (demo, stocks)
+//   * `optionsAccounts.sandbox` (PaperOptionsAccount, demo paper) → (demo, stocks)
+//   * `optionsAccounts.production` (PaperOptionsAccount, live)    → (live, stocks)
+//   * `managedAccountRatio` / `riskPerTrade` (drive Tradier live equity sizing
+//     via TRA-335)                                  → (live, stocks)
+//
+// These tests fail if any wire is rewired to read from the legacy un-suffixed
+// `managedAccountRatio` / `riskPerTrade` field, the wrong dashboard bucket, or
+// the wrong mode bucket. We use four distinct values across the four scoped
+// buckets so a swap never accidentally type-checks.
+
+interface PaperAccountInternals {
+  managedAccountRatio: number;
+  riskPerTrade: number;
+}
+interface OptionsAccountInternals {
+  managedAccountRatio: number;
+}
+interface SignalEngineInternals {
+  account: PaperAccountInternals;
+  optionsAccounts: { sandbox: OptionsAccountInternals; production: OptionsAccountInternals };
+  managedAccountRatio: number;
+  riskPerTrade: number;
+}
+
+function fourBucketSettings(overrides: Partial<AccountSettings> = {}): AccountSettings {
+  return {
+    ...DEFAULT_ACCOUNT_SETTINGS,
+    // Distinct values per (mode × market) so a wiring swap surfaces as a
+    // numerical mismatch instead of silently coinciding with another bucket.
+    managedAccountRatioDemoStocks: 0.10,
+    managedAccountRatioLiveStocks: 0.20,
+    managedAccountRatioDemoCrypto: 0.30,
+    managedAccountRatioLiveCrypto: 0.40,
+    riskPerTradeDemoStocks: 0.001,
+    riskPerTradeLiveStocks: 0.002,
+    riskPerTradeDemoCrypto: 0.005,
+    riskPerTradeLiveCrypto: 0.01,
+    // Sentinel values on the legacy un-suffixed fields — if any sub-account
+    // reads from these instead of its scoped bucket, the test fails because
+    // 0.99 / 0.49 don't match any scoped bucket above.
+    managedAccountRatio: 0.99,
+    riskPerTrade: 0.49,
+    ...overrides,
+  };
+}
+
+describe('SignalEngine — TRA-346 four-bucket sub-account wiring (TRA-349)', () => {
+  it('constructor wires each stocks sub-account to its mode-locked bucket', () => {
+    const engine = new SignalEngine(fourBucketSettings({ mode: 'demo' })) as unknown as SignalEngineInternals;
+    // Demo paper account → (demo, stocks).
+    expect(engine.account.managedAccountRatio).toBe(0.10);
+    expect(engine.account.riskPerTrade).toBe(0.001);
+    // Sandbox options account is paper-only → (demo, stocks).
+    expect(engine.optionsAccounts.sandbox.managedAccountRatio).toBe(0.10);
+    // Production options account is the live trading bucket → (live, stocks).
+    expect(engine.optionsAccounts.production.managedAccountRatio).toBe(0.20);
+    // Engine-level fields drive Tradier live equity sizing (TRA-335) →
+    // (live, stocks). Pinning here ensures Tradier orders honour the
+    // user's Live Risk slider regardless of which mode they're viewing.
+    expect(engine.managedAccountRatio).toBe(0.20);
+    expect(engine.riskPerTrade).toBe(0.002);
+  });
+
+  it('constructor still pins the live-side bucket to (live, stocks) when settings.mode is live', () => {
+    // The wiring is mode-locked, not mode-active: switching settings.mode to
+    // 'live' must NOT pull the demo paper account's ratio along — that
+    // regression is exactly the original TRA-346 bug.
+    const engine = new SignalEngine(fourBucketSettings({ mode: 'live' })) as unknown as SignalEngineInternals;
+    expect(engine.account.managedAccountRatio).toBe(0.10);
+    expect(engine.account.riskPerTrade).toBe(0.001);
+    expect(engine.optionsAccounts.sandbox.managedAccountRatio).toBe(0.10);
+    expect(engine.optionsAccounts.production.managedAccountRatio).toBe(0.20);
+    expect(engine.managedAccountRatio).toBe(0.20);
+    expect(engine.riskPerTrade).toBe(0.002);
+  });
+
+  it('applySettings re-pins each sub-account to its mode-locked bucket on every save', async () => {
+    // Start from defaults so the first applySettings exercises the fresh
+    // wiring path (no carryover from a previous settings snapshot).
+    const engine = new SignalEngine() as unknown as SignalEngineInternals & {
+      applySettings: (s: AccountSettings) => Promise<void>;
+    };
+    await engine.applySettings(fourBucketSettings({ mode: 'demo' }));
+
+    expect(engine.account.managedAccountRatio).toBe(0.10);
+    expect(engine.account.riskPerTrade).toBe(0.001);
+    expect(engine.optionsAccounts.sandbox.managedAccountRatio).toBe(0.10);
+    expect(engine.optionsAccounts.production.managedAccountRatio).toBe(0.20);
+    expect(engine.managedAccountRatio).toBe(0.20);
+    expect(engine.riskPerTrade).toBe(0.002);
+  });
+
+  it('applySettings: a Demo edit on stocks does NOT bleed into the production options bucket', async () => {
+    // Headline TRA-346 invariant. Start with a saved snapshot scoping all four
+    // stocks buckets, then save again with a Demo-only edit; the production
+    // bucket must keep its original (live, stocks) value.
+    const engine = new SignalEngine() as unknown as SignalEngineInternals & {
+      applySettings: (s: AccountSettings) => Promise<void>;
+    };
+    await engine.applySettings(fourBucketSettings({ mode: 'demo' }));
+    await engine.applySettings(fourBucketSettings({
+      mode: 'demo',
+      managedAccountRatioDemoStocks: 0.11,
+      riskPerTradeDemoStocks: 0.0011,
+    }));
+
+    expect(engine.account.managedAccountRatio).toBe(0.11);
+    expect(engine.account.riskPerTrade).toBe(0.0011);
+    expect(engine.optionsAccounts.sandbox.managedAccountRatio).toBe(0.11);
+    // Production stays put — the Demo edit must not pull live-mode sizing.
+    expect(engine.optionsAccounts.production.managedAccountRatio).toBe(0.20);
+    expect(engine.managedAccountRatio).toBe(0.20);
+    expect(engine.riskPerTrade).toBe(0.002);
+  });
+
+  it('falls back to the legacy un-suffixed managedAccountRatio when scoped buckets are absent', async () => {
+    // Saved-before-TRA-346 snapshot: only `managedAccountRatio`/`riskPerTrade`
+    // are set, all eight scoped fields undefined. Each sub-account must
+    // surface the legacy value via the resolver fallback chain.
+    const engine = new SignalEngine() as unknown as SignalEngineInternals & {
+      applySettings: (s: AccountSettings) => Promise<void>;
+    };
+    await engine.applySettings({
+      ...DEFAULT_ACCOUNT_SETTINGS,
+      mode: 'demo',
+      managedAccountRatio: 0.42,
+      riskPerTrade: 0.013,
+    });
+
+    expect(engine.account.managedAccountRatio).toBe(0.42);
+    expect(engine.account.riskPerTrade).toBe(0.013);
+    expect(engine.optionsAccounts.sandbox.managedAccountRatio).toBe(0.42);
+    expect(engine.optionsAccounts.production.managedAccountRatio).toBe(0.42);
+    expect(engine.managedAccountRatio).toBe(0.42);
+    expect(engine.riskPerTrade).toBe(0.013);
+  });
+});

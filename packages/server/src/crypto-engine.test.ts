@@ -1,9 +1,11 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest';
 import {
+  DEFAULT_ACCOUNT_SETTINGS,
   DEFAULT_STRATEGY_PRESET_ID,
   STRATEGY_PRESETS,
   resolveStrategyPreset,
 } from '@trading-app/shared';
+import type { AccountSettings } from '@trading-app/shared';
 import type {
   CoinbaseAccountBalance,
   CoinbaseFuturesPosition,
@@ -422,5 +424,139 @@ describe('resolveLiveSingleSymbolShortCap (TRA-341)', () => {
     // the engine then clamps to PERP_SHORT_SINGLE_SYMBOL_CAP_MAX = 1.0.
     expect(resolveLiveSingleSymbolShortCap(2.0, undefined)).toBe(2.0);
     expect(resolveLiveSingleSymbolShortCap(undefined, '2.0')).toBe(2.0);
+  });
+});
+
+// TRA-349 — regression-lock the (mode × dashboard) sub-account wiring shipped
+// in TRA-346 for the crypto side. The CryptoSignalEngine owns two sub-accounts
+// that translate user equity into actual order sizes:
+//
+//   * `account` (CryptoPaperAccount, demo paper) → (demo, crypto)
+//   * `liveAccount` (CryptoLiveAccount, Coinbase live broker) → (live, crypto)
+//
+// These tests fail if either wire is rewired to read from the legacy
+// un-suffixed `managedAccountRatio` / `riskPerTrade` field, the wrong
+// dashboard, or the wrong mode. Distinct values across all four buckets +
+// sentinel values on the legacy fields catch silent swaps.
+
+interface CryptoPaperAccountInternals {
+  managedAccountRatio: number;
+  riskPerTrade: number;
+}
+interface CryptoLiveAccountInternals {
+  managedAccountRatio: number;
+  riskPerTrade: number;
+}
+interface CryptoSignalEngineInternals {
+  account: CryptoPaperAccountInternals;
+  liveAccount: CryptoLiveAccountInternals | null;
+  buildLiveBroker: () => CryptoLiveAccountInternals | null;
+  applySettings: (s: AccountSettings) => Promise<void>;
+}
+
+function fourBucketCryptoSettings(overrides: Partial<AccountSettings> = {}): AccountSettings {
+  return {
+    ...DEFAULT_ACCOUNT_SETTINGS,
+    managedAccountRatioDemoStocks: 0.10,
+    managedAccountRatioLiveStocks: 0.20,
+    managedAccountRatioDemoCrypto: 0.30,
+    managedAccountRatioLiveCrypto: 0.40,
+    riskPerTradeDemoStocks: 0.001,
+    riskPerTradeLiveStocks: 0.002,
+    riskPerTradeDemoCrypto: 0.005,
+    riskPerTradeLiveCrypto: 0.01,
+    // Sentinel legacy values — if either sub-account reads from these the
+    // assertion fails (no scoped bucket holds 0.99 / 0.49).
+    managedAccountRatio: 0.99,
+    riskPerTrade: 0.49,
+    ...overrides,
+  };
+}
+
+describe('CryptoSignalEngine — TRA-346 four-bucket sub-account wiring (TRA-349)', () => {
+  beforeEach(() => {
+    vi.spyOn(console, 'log').mockImplementation(() => {});
+    vi.spyOn(console, 'warn').mockImplementation(() => {});
+  });
+
+  it('applySettings always pins the demo paper account to (demo, crypto), regardless of settings.mode', async () => {
+    // Headline TRA-346 invariant for crypto: Demo paper sizing must be
+    // mode-locked to (demo, crypto) so a Live edit never bleeds into the
+    // demo dashboard. Exercise both modes — the demo paper account ratio
+    // must be 0.30 / 0.005 in both cases.
+    const engine = new CryptoSignalEngine() as unknown as CryptoSignalEngineInternals;
+
+    await engine.applySettings(fourBucketCryptoSettings({ mode: 'demo' }));
+    expect(engine.account.managedAccountRatio).toBe(0.30);
+    expect(engine.account.riskPerTrade).toBe(0.005);
+
+    await engine.applySettings(fourBucketCryptoSettings({ mode: 'live' }));
+    expect(engine.account.managedAccountRatio).toBe(0.30);
+    expect(engine.account.riskPerTrade).toBe(0.005);
+  });
+
+  it('a Live-crypto edit does not bleed into the demo paper account', async () => {
+    const engine = new CryptoSignalEngine() as unknown as CryptoSignalEngineInternals;
+    await engine.applySettings(fourBucketCryptoSettings({ mode: 'demo' }));
+    // User goes to Live tab and tightens risk on (live, crypto). The demo
+    // paper account must keep its (demo, crypto) values untouched.
+    await engine.applySettings(fourBucketCryptoSettings({
+      mode: 'demo',
+      managedAccountRatioLiveCrypto: 0.05,
+      riskPerTradeLiveCrypto: 0.002,
+    }));
+    expect(engine.account.managedAccountRatio).toBe(0.30);
+    expect(engine.account.riskPerTrade).toBe(0.005);
+  });
+
+  it('falls back to the legacy un-suffixed fields when (demo, crypto) is undefined', async () => {
+    // Pre-TRA-346 saved snapshot — only managedAccountRatio / riskPerTrade
+    // are set. The demo paper account must surface them via the resolver
+    // fallback so existing users keep sizing the same way.
+    const engine = new CryptoSignalEngine() as unknown as CryptoSignalEngineInternals;
+    await engine.applySettings({
+      ...DEFAULT_ACCOUNT_SETTINGS,
+      mode: 'demo',
+      managedAccountRatio: 0.42,
+      riskPerTrade: 0.013,
+    });
+    expect(engine.account.managedAccountRatio).toBe(0.42);
+    expect(engine.account.riskPerTrade).toBe(0.013);
+  });
+
+  it('buildLiveBroker pins the Coinbase live account to (live, crypto), regardless of settings.mode', () => {
+    // The live broker is by definition the live account; its sizing must
+    // come from (live, crypto) even mid-save when settings.mode is still
+    // 'demo'. Bypass tryInitLiveBroker (which fires HTTP) by calling
+    // buildLiveBroker directly — same code path the live init runs through,
+    // minus the network refresh.
+    for (const mode of ['demo', 'live'] as const) {
+      const engine = new CryptoSignalEngine(undefined, fourBucketCryptoSettings({
+        mode,
+        // HMAC-flavoured creds — the constructor accepts the raw strings as
+        // an HMAC secret without making any network calls (no PEM parsing).
+        liveApiKeyCrypto: 'test-key',
+        liveApiSecretCrypto: 'test-secret',
+      })) as unknown as CryptoSignalEngineInternals;
+      const live = engine.buildLiveBroker();
+      expect(live).not.toBeNull();
+      expect(live!.managedAccountRatio).toBe(0.40);
+      expect(live!.riskPerTrade).toBe(0.01);
+    }
+  });
+
+  it('buildLiveBroker falls back to the legacy un-suffixed fields when (live, crypto) is undefined', () => {
+    const engine = new CryptoSignalEngine(undefined, {
+      ...DEFAULT_ACCOUNT_SETTINGS,
+      mode: 'live',
+      managedAccountRatio: 0.33,
+      riskPerTrade: 0.02,
+      liveApiKeyCrypto: 'test-key',
+      liveApiSecretCrypto: 'test-secret',
+    }) as unknown as CryptoSignalEngineInternals;
+    const live = engine.buildLiveBroker();
+    expect(live).not.toBeNull();
+    expect(live!.managedAccountRatio).toBe(0.33);
+    expect(live!.riskPerTrade).toBe(0.02);
   });
 });

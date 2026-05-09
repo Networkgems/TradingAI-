@@ -15,6 +15,15 @@ let loadSettings: AccountSettingsModule['loadSettings'];
 let saveSettings: AccountSettingsModule['saveSettings'];
 let clearSettingsCache: AccountSettingsModule['clearSettingsCache'];
 let migrateLegacyLiveCredentials: AccountSettingsModule['migrateLegacyLiveCredentials'];
+// TRA-349 — also bound through the same dynamic import so the helpers we test
+// belong to the same module instance whose DATA_DIR was captured against
+// TMP_ROOT. A static `import { ... } from './account-settings.js'` at the top
+// would force the module to load BEFORE `process.env.DATA_DIR = TMP_ROOT`,
+// and then loadSettings/saveSettings would silently target the real
+// `packages/server/data` directory.
+let clampScopedRatio: AccountSettingsModule['clampScopedRatio'];
+let clampScopedRisk: AccountSettingsModule['clampScopedRisk'];
+let mergeScopedRiskSettings: AccountSettingsModule['mergeScopedRiskSettings'];
 
 beforeAll(async () => {
   const mod = await import('./account-settings.js');
@@ -22,6 +31,9 @@ beforeAll(async () => {
   saveSettings = mod.saveSettings;
   clearSettingsCache = mod.clearSettingsCache;
   migrateLegacyLiveCredentials = mod.migrateLegacyLiveCredentials;
+  clampScopedRatio = mod.clampScopedRatio;
+  clampScopedRisk = mod.clampScopedRisk;
+  mergeScopedRiskSettings = mod.mergeScopedRiskSettings;
 });
 
 beforeEach(() => {
@@ -187,5 +199,167 @@ describe('liveTradeRoutingCrypto / liveMaxLeverageCrypto round-trip (TRA-249-E)'
     const reloaded = await loadSettings(USER);
     expect(reloaded.liveTradeRoutingCrypto).toBe('hybrid');
     expect(reloaded.liveMaxLeverageCrypto).toBe(1);
+  });
+});
+
+// TRA-349 — regression-lock the four-bucket clamp + merge contract that
+// PUT /api/account/settings runs (extracted into `mergeScopedRiskSettings`
+// so the route handler stays a thin spread on top of the helper).
+//
+// These tests fail if the route is ever rewired to fall back to the legacy
+// un-suffixed field, to clamp the wrong bucket, or to pin untouched buckets
+// to a non-undefined default — any of which would silently re-introduce the
+// Demo↔Live (or Stocks↔Crypto) sizing leak that TRA-346 fixed.
+describe('clampScopedRatio / clampScopedRisk bounds (TRA-346 / TRA-349)', () => {
+  it('clamps managedAccountRatio to [0.01, 1]', () => {
+    expect(clampScopedRatio(0)).toBe(0.01);
+    expect(clampScopedRatio(-2)).toBe(0.01);
+    expect(clampScopedRatio(0.005)).toBe(0.01);
+    expect(clampScopedRatio(0.5)).toBe(0.5);
+    expect(clampScopedRatio(1)).toBe(1);
+    expect(clampScopedRatio(2)).toBe(1);
+    expect(clampScopedRatio(Number.POSITIVE_INFINITY)).toBe(1);
+  });
+
+  it('clamps riskPerTrade to [0.001, 0.5]', () => {
+    expect(clampScopedRisk(0)).toBe(0.001);
+    expect(clampScopedRisk(-1)).toBe(0.001);
+    expect(clampScopedRisk(0.0005)).toBe(0.001);
+    expect(clampScopedRisk(0.01)).toBe(0.01);
+    expect(clampScopedRisk(0.5)).toBe(0.5);
+    expect(clampScopedRisk(0.9)).toBe(0.5);
+    expect(clampScopedRisk(Number.POSITIVE_INFINITY)).toBe(0.5);
+  });
+
+  it('preserves undefined when neither incoming nor saved holds a value', () => {
+    // Headline TRA-346 invariant: an untouched bucket must stay `undefined`
+    // so `resolveManagedAccountRatio` / `resolveRiskPerTrade` keep falling
+    // back to the legacy un-suffixed field. Coercing to a default here would
+    // silently break sizing for users who saved before the four-bucket split.
+    expect(clampScopedRatio(undefined, undefined)).toBeUndefined();
+    expect(clampScopedRisk(undefined, undefined)).toBeUndefined();
+  });
+
+  it('falls back to the saved value when incoming is undefined', () => {
+    // The route passes the body's value first, the saved snapshot's value
+    // second. A no-op save (body omits this bucket) must re-clamp the saved
+    // value rather than dropping it back to undefined.
+    expect(clampScopedRatio(undefined, 0.42)).toBe(0.42);
+    expect(clampScopedRisk(undefined, 0.04)).toBe(0.04);
+  });
+
+  it('treats NaN as "no value" so a malformed save never poisons a saved bucket', () => {
+    expect(clampScopedRatio(Number.NaN, 0.42)).toBe(0.42);
+    expect(clampScopedRisk(Number.NaN, 0.04)).toBe(0.04);
+    expect(clampScopedRatio(Number.NaN, undefined)).toBeUndefined();
+  });
+});
+
+describe('mergeScopedRiskSettings — bucket isolation (TRA-346 / TRA-349)', () => {
+  it('saving only managedAccountRatioDemoCrypto leaves the other 7 scoped fields undefined', () => {
+    // Models a fresh user with no saved scoped buckets. The PUT body sets
+    // exactly one bucket; the helper must not pin the other seven to a
+    // default — that would silently disable the legacy fallback chain for
+    // every other (mode × market) combo.
+    const merged = mergeScopedRiskSettings(
+      { ...DEFAULT_ACCOUNT_SETTINGS },
+      { managedAccountRatioDemoCrypto: 0.7 },
+    );
+    expect(merged.managedAccountRatioDemoCrypto).toBe(0.7);
+    expect(merged.managedAccountRatioDemoStocks).toBeUndefined();
+    expect(merged.managedAccountRatioLiveStocks).toBeUndefined();
+    expect(merged.managedAccountRatioLiveCrypto).toBeUndefined();
+    expect(merged.riskPerTradeDemoStocks).toBeUndefined();
+    expect(merged.riskPerTradeLiveStocks).toBeUndefined();
+    expect(merged.riskPerTradeDemoCrypto).toBeUndefined();
+    expect(merged.riskPerTradeLiveCrypto).toBeUndefined();
+  });
+
+  it('does not touch the legacy managedAccountRatio / riskPerTrade fields', () => {
+    // The merge helper owns the eight scoped fields only. Routes still clamp
+    // the legacy un-suffixed fields separately (so `Number.NaN` body input
+    // doesn't poison the snapshot); this test guards that the helper doesn't
+    // accidentally start emitting them.
+    const merged = mergeScopedRiskSettings(
+      { ...DEFAULT_ACCOUNT_SETTINGS, managedAccountRatio: 0.5, riskPerTrade: 0.01 },
+      { managedAccountRatioDemoCrypto: 0.7 },
+    );
+    expect(merged).not.toHaveProperty('managedAccountRatio');
+    expect(merged).not.toHaveProperty('riskPerTrade');
+  });
+
+  it('clamps each scoped bucket to its spec bounds independently', () => {
+    // Out-of-range values for every scoped field at once: every ratio bucket
+    // > 1 and every risk bucket > 0.5 must be clamped back to the spec max.
+    const merged = mergeScopedRiskSettings(
+      { ...DEFAULT_ACCOUNT_SETTINGS },
+      {
+        managedAccountRatioDemoStocks: 5,
+        managedAccountRatioLiveStocks: 5,
+        managedAccountRatioDemoCrypto: 5,
+        managedAccountRatioLiveCrypto: 5,
+        riskPerTradeDemoStocks: 5,
+        riskPerTradeLiveStocks: 5,
+        riskPerTradeDemoCrypto: 5,
+        riskPerTradeLiveCrypto: 5,
+      },
+    );
+    expect(merged.managedAccountRatioDemoStocks).toBe(1);
+    expect(merged.managedAccountRatioLiveStocks).toBe(1);
+    expect(merged.managedAccountRatioDemoCrypto).toBe(1);
+    expect(merged.managedAccountRatioLiveCrypto).toBe(1);
+    expect(merged.riskPerTradeDemoStocks).toBe(0.5);
+    expect(merged.riskPerTradeLiveStocks).toBe(0.5);
+    expect(merged.riskPerTradeDemoCrypto).toBe(0.5);
+    expect(merged.riskPerTradeLiveCrypto).toBe(0.5);
+  });
+
+  it('preserves saved buckets that the body omits — partial saves are non-destructive', () => {
+    // User has a previously saved live-crypto override; the next save touches
+    // demo-stocks only. Live-crypto must still round-trip its saved value so
+    // the legacy fallback chain keeps reporting the right size at order time.
+    const merged = mergeScopedRiskSettings(
+      {
+        ...DEFAULT_ACCOUNT_SETTINGS,
+        managedAccountRatioLiveCrypto: 0.9,
+        riskPerTradeLiveCrypto: 0.04,
+      },
+      { managedAccountRatioDemoStocks: 0.2 },
+    );
+    expect(merged.managedAccountRatioDemoStocks).toBe(0.2);
+    expect(merged.managedAccountRatioLiveCrypto).toBe(0.9);
+    expect(merged.riskPerTradeLiveCrypto).toBe(0.04);
+    // Buckets that have neither a body value nor a saved value stay undefined.
+    expect(merged.managedAccountRatioLiveStocks).toBeUndefined();
+    expect(merged.riskPerTradeDemoStocks).toBeUndefined();
+  });
+
+  it('round-trips a save that scopes all four crypto+stocks ratio buckets at once', () => {
+    // End-to-end shape of a power user who's filled in every scoped field —
+    // verifies each bucket lands on the bucket the resolver will read,
+    // independently clamped.
+    const merged = mergeScopedRiskSettings(
+      { ...DEFAULT_ACCOUNT_SETTINGS },
+      {
+        managedAccountRatioDemoStocks: 0.10,
+        managedAccountRatioLiveStocks: 0.20,
+        managedAccountRatioDemoCrypto: 0.30,
+        managedAccountRatioLiveCrypto: 0.40,
+        riskPerTradeDemoStocks: 0.001,
+        riskPerTradeLiveStocks: 0.002,
+        riskPerTradeDemoCrypto: 0.005,
+        riskPerTradeLiveCrypto: 0.01,
+      },
+    );
+    expect(merged).toEqual({
+      managedAccountRatioDemoStocks: 0.10,
+      managedAccountRatioLiveStocks: 0.20,
+      managedAccountRatioDemoCrypto: 0.30,
+      managedAccountRatioLiveCrypto: 0.40,
+      riskPerTradeDemoStocks: 0.001,
+      riskPerTradeLiveStocks: 0.002,
+      riskPerTradeDemoCrypto: 0.005,
+      riskPerTradeLiveCrypto: 0.01,
+    });
   });
 });

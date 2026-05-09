@@ -14,9 +14,11 @@
   "scripts": {
     "build": "tsc -b",
     "typecheck": "tsc --noEmit",
-    "dev": "tsc -b --watch"
+    "dev": "tsc -b --watch",
+    "test": "vitest run --passWithNoTests"
   },
   "devDependencies": {
-    "typescript": "^5.4.5"
+    "typescript": "^5.4.5",
+    "vitest": "^2.0.0"
   }
 }
