@@ -51,6 +51,7 @@ export {
   underlyingFromOcc,
   parseOccSymbol,
   parseTradierPositions,
+  parseTradierHistory,
   TRADIER_TERMINAL_STATUSES,
   TRADIER_REJECTED_STATUSES,
 } from './tradier/index.js';
@@ -64,6 +65,7 @@ export type {
   TradierEquityQuote,
   TradierAccountBalance,
   TradierOpenOptionPosition,
+  TradierTradeHistoryFill,
 } from './tradier/index.js';
 export { CoinbaseOrderClient } from './coinbase/index.js';
 export type {

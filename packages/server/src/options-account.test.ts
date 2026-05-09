@@ -535,3 +535,78 @@ describe('PaperOptionsAccount.reconcileTradierPositions', () => {
     expect(acct.getState().optionsCash).toBe(cashBefore);
   });
 });
+
+// ─── TRA-348: drop-on-fill, pendingCloseOrderId, reconciled P&L ──────────────
+
+describe('PaperOptionsAccount.recordImportedFill', () => {
+  it('records a closed-options entry and removes the open row without touching cash', () => {
+    const acct = new PaperOptionsAccount({ initialEquity: 25_000, tradierEnv: 'sandbox' });
+    acct.reconcileTradierPositions([buildTradierPosition({ contracts: 2, premiumPaid: 1.6 })]);
+    const id = acct.getState().openOptions[0].id;
+    const cashBefore = acct.getState().optionsCash;
+
+    const closed = acct.recordImportedFill(id, 1.85);
+    expect(closed).not.toBeNull();
+    expect(closed?.contractsRemaining).toBe(0);
+    // Realized = (1.85 − 1.60) × 2 × 100 = +50
+    expect(closed?.pnl).toBeCloseTo(50, 5);
+
+    const state = acct.getState();
+    expect(state.openOptions).toHaveLength(0);
+    expect(state.closedOptions.find(o => o.id === id)?.pnl).toBeCloseTo(50, 5);
+    // Imported close does NOT touch the paper cash — proceeds live on Tradier.
+    expect(state.optionsCash).toBe(cashBefore);
+  });
+
+  it('returns null when the row is engine-opened (not imported)', () => {
+    const acct = new PaperOptionsAccount({
+      initialEquity: 50_000,
+      managedAccountRatio: 0.5,
+      tradierEnv: 'sandbox',
+    });
+    const opened = acct.openOptionFromCandidate(buildSignal());
+    expect(opened).not.toBeNull();
+    expect(acct.recordImportedFill(opened!.id, 2.0)).toBeNull();
+  });
+});
+
+describe('PaperOptionsAccount.setPendingCloseOrderId', () => {
+  it('stamps pendingCloseOrderId on the imported row', () => {
+    const acct = new PaperOptionsAccount({ initialEquity: 25_000, tradierEnv: 'sandbox' });
+    acct.reconcileTradierPositions([buildTradierPosition()]);
+    const id = acct.getState().openOptions[0].id;
+
+    expect(acct.setPendingCloseOrderId(id, 99001)).toBe(true);
+    const after = acct.getState().openOptions.find(o => o.id === id);
+    expect(after?.pendingCloseOrderId).toBe(99001);
+  });
+
+  it('returns false for engine-opened rows', () => {
+    const acct = new PaperOptionsAccount({
+      initialEquity: 50_000,
+      managedAccountRatio: 0.5,
+      tradierEnv: 'sandbox',
+    });
+    const opened = acct.openOptionFromCandidate(buildSignal());
+    expect(acct.setPendingCloseOrderId(opened!.id, 1)).toBe(false);
+  });
+});
+
+describe('PaperOptionsAccount.addReconciledTradierPnl', () => {
+  it('bumps the live-mode realized P&L bucket without touching demo', () => {
+    const acct = new PaperOptionsAccount({ initialEquity: 25_000, tradierEnv: 'sandbox' });
+    expect(acct.getState().optionsPnl).toBe(0);
+    acct.addReconciledTradierPnl(123.45);
+    // Live-mode bucket-wide total is the sum of live + demo.
+    expect(acct.getState().optionsPnl).toBeCloseTo(123.45, 5);
+    expect(acct.getStateForMode('demo').optionsPnl).toBe(0);
+    expect(acct.getStateForMode('live').optionsPnl).toBeCloseTo(123.45, 5);
+  });
+
+  it('is idempotent for non-finite or zero amounts', () => {
+    const acct = new PaperOptionsAccount({ initialEquity: 25_000, tradierEnv: 'sandbox' });
+    acct.addReconciledTradierPnl(0);
+    acct.addReconciledTradierPnl(Number.NaN);
+    expect(acct.getState().optionsPnl).toBe(0);
+  });
+});

@@ -745,6 +745,49 @@ export class PaperOptionsAccount {
     return { ...opt };
   }
 
+  /**
+   * TRA-348 — record a closed-options entry for a Tradier-imported row that
+   * just filled on the broker side. Mirrors the `Recent Closed Options` row
+   * a paper close would produce so the user sees realized P&L in the UI,
+   * but does NOT touch the paper cash bucket — the proceeds live on
+   * Tradier. Returns the closed snapshot (or `null` when the id didn't
+   * match an imported open row).
+   *
+   * `avgFillPrice` is the per-share Tradier fill ($/contract divided by
+   * 100 elsewhere — caller passes the per-share number). P&L follows the
+   * same convention as `closeOption`: `(fill − premiumPaid) × contracts ×
+   * 100`.
+   */
+  recordImportedFill(optionId: string, avgFillPrice: number): OptionPosition | null {
+    const opt = this.openOptions.get(optionId);
+    if (!opt) return null;
+    if (!opt.importedFromTradier) return null;
+    const remainingContracts = opt.contractsRemaining;
+    const pnl = (avgFillPrice - opt.premiumPaid) * remainingContracts * 100;
+    opt.pnl = (opt.pnl ?? 0) + pnl;
+    opt.closedAt = Date.now();
+    opt.currentPremium = avgFillPrice;
+    opt.contractsRemaining = 0;
+    delete opt.pendingCloseOrderId;
+    this.openOptions.delete(optionId);
+    this.closedOptions.push({ ...opt });
+    return { ...opt };
+  }
+
+  /**
+   * TRA-348 — mark an imported position as having an in-flight Tradier
+   * close order so the dashboard renders "Pending #N" instead of the
+   * Close button. Returns true on success, false when the id doesn't
+   * match an imported open row.
+   */
+  setPendingCloseOrderId(optionId: string, orderId: number | string): boolean {
+    const opt = this.openOptions.get(optionId);
+    if (!opt) return false;
+    if (!opt.importedFromTradier) return false;
+    opt.pendingCloseOrderId = orderId;
+    return true;
+  }
+
   closeOption(optionId: string): OptionPosition | null {
     const opt = this.openOptions.get(optionId);
     if (!opt) return null;
@@ -803,6 +846,20 @@ export class PaperOptionsAccount {
 
   hasOpenOption(symbol: string): boolean {
     return Array.from(this.openOptions.values()).some(o => o.symbol === symbol);
+  }
+
+  /**
+   * TRA-348 — add reconciled Tradier-side realized P&L to the live mode
+   * bucket so the dashboard's "Total Options P&L" pill matches the live
+   * calendar (which now sums Tradier history closes alongside engine
+   * closes). Idempotency is the caller's responsibility — the EOD
+   * reconcile pass dedups Tradier transaction ids via a per-user cursor
+   * file before invoking this, so a double-call here would
+   * double-count.
+   */
+  addReconciledTradierPnl(amount: number): void {
+    if (!Number.isFinite(amount) || amount === 0) return;
+    this.optionsPnlByMode.live += amount;
   }
 
   /**

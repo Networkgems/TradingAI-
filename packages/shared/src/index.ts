@@ -954,6 +954,17 @@ export interface OptionPosition {
    * paper cash bucket. Absent ↔ legacy or engine-opened position.
    */
   importedFromTradier?: boolean;
+  /**
+   * TRA-348 — Tradier order id for an in-flight `sell_to_close` against an
+   * imported position. Set when the close order was accepted but did not
+   * reach a terminal `filled` state inside the wait window (after-hours,
+   * illiquid contract). The dashboard renders this row with a disabled
+   * "Pending #N" button instead of the Close button so the user doesn't
+   * fire a duplicate close. Cleared once the next reconcile sees Tradier
+   * drop the position from `/positions` (broker confirms flat) or once the
+   * engine learns the order terminated.
+   */
+  pendingCloseOrderId?: number | string;
 }
 
 export interface OptionsAccountState {

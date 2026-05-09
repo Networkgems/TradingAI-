@@ -5,6 +5,7 @@ import {
   underlyingFromOcc,
   parseOccSymbol,
   parseTradierPositions,
+  parseTradierHistory,
 } from './options-client.js';
 
 let fetchMock: ReturnType<typeof vi.fn>;
@@ -671,5 +672,165 @@ describe('TradierOptionsClient.listOpenOptionPositions', () => {
     fetchMock.mockResolvedValueOnce(textResponse('boom', 500));
     const client = new TradierOptionsClient('tok', 'A1');
     expect(await client.listOpenOptionPositions()).toEqual([]);
+  });
+});
+
+// ─── TRA-348: parseTradierHistory + listAccountHistory ──────────────────────
+
+describe('parseTradierHistory', () => {
+  it('parses a Sell-to-Close option trade event', () => {
+    const out = parseTradierHistory({
+      history: {
+        event: {
+          date: '2026-05-08T16:30:00.000Z',
+          amount: 370,
+          type: 'trade',
+          id: 'tx-42',
+          trade: {
+            commission: 0,
+            description: 'Sell to Close 2 SPY May 15 2026 $450 Call',
+            price: 1.85,
+            quantity: 2,
+            symbol: 'SPY260515C00450000',
+            trade_type: 'option',
+          },
+        },
+      },
+    });
+    expect(out).toHaveLength(1);
+    expect(out[0]).toMatchObject({
+      date: '2026-05-08',
+      symbol: 'SPY260515C00450000',
+      tradeType: 'option',
+      description: 'Sell to Close 2 SPY May 15 2026 $450 Call',
+      price: 1.85,
+      quantity: 2,
+      amount: 370,
+      transactionId: 'tx-42',
+    });
+  });
+
+  it('handles array of events and case-insensitive trade_type', () => {
+    const out = parseTradierHistory({
+      history: {
+        event: [
+          {
+            date: '2026-05-08',
+            amount: -300,
+            type: 'trade',
+            trade: {
+              description: 'Buy to Open 2 SPY ...',
+              price: 1.5,
+              quantity: 2,
+              symbol: 'SPY260515C00450000',
+              trade_type: 'Option',
+            },
+          },
+          {
+            date: '2026-05-08',
+            amount: 19000,
+            type: 'trade',
+            trade: {
+              description: 'Sell 100 AAPL',
+              price: 190,
+              quantity: 100,
+              symbol: 'AAPL',
+              trade_type: 'EQUITY',
+            },
+          },
+        ],
+      },
+    });
+    expect(out).toHaveLength(2);
+    expect(out[0].tradeType).toBe('option');
+    expect(out[1].tradeType).toBe('equity');
+  });
+
+  it('synthesizes a transactionId when Tradier omits id', () => {
+    const out = parseTradierHistory({
+      history: {
+        event: {
+          date: '2026-05-08',
+          type: 'trade',
+          trade: {
+            description: 'Sell to Close 2 SPY ...',
+            price: 1.85,
+            quantity: 2,
+            symbol: 'SPY260515C00450000',
+            trade_type: 'option',
+          },
+        },
+      },
+    });
+    expect(out[0].transactionId).toContain('2026-05-08');
+    expect(out[0].transactionId).toContain('SPY260515C00450000');
+  });
+
+  it('drops non-trade events (journal, dividend) and rows with bad fields', () => {
+    const out = parseTradierHistory({
+      history: {
+        event: [
+          { date: '2026-05-08', type: 'journal', amount: 100 },
+          {
+            date: '2026-05-08',
+            type: 'trade',
+            trade: { description: 'foo', price: 1, quantity: 0, symbol: 'X', trade_type: 'option' },
+          },
+          { date: '2026-05-08', type: 'trade' },
+        ],
+      },
+    });
+    expect(out).toEqual([]);
+  });
+
+  it('returns [] when history is null/empty', () => {
+    expect(parseTradierHistory({ history: 'null' })).toEqual([]);
+    expect(parseTradierHistory({ history: null })).toEqual([]);
+    expect(parseTradierHistory(null)).toEqual([]);
+  });
+});
+
+describe('TradierOptionsClient.listAccountHistory', () => {
+  it('hits /accounts/{id}/history with start, end, type, limit', async () => {
+    fetchMock.mockResolvedValueOnce(
+      jsonResponse({
+        history: {
+          event: {
+            date: '2026-05-08',
+            amount: 370,
+            type: 'trade',
+            id: 'tx-1',
+            trade: {
+              description: 'Sell to Close 2 SPY ...',
+              price: 1.85,
+              quantity: 2,
+              symbol: 'SPY260515C00450000',
+              trade_type: 'option',
+            },
+          },
+        },
+      }),
+    );
+    const client = new TradierOptionsClient('tok', 'ACCT9', 'production');
+    const fills = await client.listAccountHistory({
+      start: '2026-05-01',
+      end: '2026-05-08',
+      type: 'trade',
+      limit: 100,
+    });
+    expect(fills).toHaveLength(1);
+    expect(fills[0].symbol).toBe('SPY260515C00450000');
+    const url = callUrl(0);
+    expect(url).toContain('https://api.tradier.com/v1/accounts/ACCT9/history');
+    expect(url).toContain('start=2026-05-01');
+    expect(url).toContain('end=2026-05-08');
+    expect(url).toContain('type=trade');
+    expect(url).toContain('limit=100');
+  });
+
+  it('returns [] on a non-2xx response', async () => {
+    fetchMock.mockResolvedValueOnce(textResponse('boom', 500));
+    const client = new TradierOptionsClient('tok', 'A1');
+    expect(await client.listAccountHistory({ start: '2026-05-01', end: '2026-05-08' })).toEqual([]);
   });
 });

@@ -1659,11 +1659,20 @@ function Dashboard({ token, onLogout, onGoHome, onActivity, theme, onToggleTheme
       method: 'POST',
       headers: { Authorization: `Bearer ${token}` },
     }).catch(() => null);
-    // TRA-323 — surface broker-side rejection (sell_to_close failed) instead
-    // of silently leaving the row stuck on the board. Successful closes
-    // already vanish from the WS state broadcast on the next tick.
-    if (r && !r.ok) {
-      const data = await r.json().catch(() => ({} as { error?: string }));
+    // TRA-323 / TRA-348 — surface broker-side rejection (sell_to_close
+    // failed) so the row doesn't sit stuck. The 202 path (Tradier accepted
+    // but the order didn't reach a terminal state in 5s) leaves the row
+    // visible with a "Pending #N" indicator; surface a one-line note so
+    // the user knows the close is live on Tradier.
+    if (!r) return;
+    const data = await r.json().catch(() => ({} as { error?: string; status?: string; orderId?: number | string }));
+    if (r.status === 202 && data?.status === 'pending') {
+      setTradierSyncStatus(`Tradier close pending #${data.orderId ?? '?'} — row will drop once Tradier fills`);
+      if (tradierSyncStatusTimer.current) clearTimeout(tradierSyncStatusTimer.current);
+      tradierSyncStatusTimer.current = setTimeout(() => setTradierSyncStatus(''), 8000);
+      return;
+    }
+    if (!r.ok) {
       const message = data?.error ?? `Close failed (${r.status})`;
       setTradierSyncStatus(`Close failed: ${message}`);
       if (tradierSyncStatusTimer.current) clearTimeout(tradierSyncStatusTimer.current);
@@ -2221,7 +2230,27 @@ function Dashboard({ token, onLogout, onGoHome, onActivity, theme, onToggleTheme
                           </td>
                           <td>{signalLabel(o.signalType)}</td>
                           <td className="muted">{formatTime(o.openedAt)}</td>
-                          <td><button className="btn-close-pos" onClick={() => closeOption(o.id)}>Close</button></td>
+                          <td>
+                            {/* TRA-348 — once a sell_to_close has been
+                                accepted by Tradier but not yet filled, the
+                                Close button is replaced with a disabled
+                                "Pending #N" indicator so the user can see
+                                that the close is in flight without firing
+                                a duplicate order. The flag clears once
+                                Tradier drops the position from /positions
+                                (broker confirms flat). */}
+                            {o.pendingCloseOrderId != null ? (
+                              <button
+                                className="btn-close-pos"
+                                disabled
+                                title="Tradier sell_to_close accepted but not yet filled"
+                              >
+                                Pending #{o.pendingCloseOrderId}
+                              </button>
+                            ) : (
+                              <button className="btn-close-pos" onClick={() => closeOption(o.id)}>Close</button>
+                            )}
+                          </td>
                         </tr>
                       );
                     })}

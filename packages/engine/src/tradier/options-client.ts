@@ -183,6 +183,69 @@ function asArray<T>(value: T | T[] | undefined | null | string): T[] {
   return [value as T];
 }
 
+/**
+ * TRA-348 — `/accounts/{id}/history` envelope. Tradier returns
+ * `history: 'null'`/empty when the account has no events in the window,
+ * a single `event` object when there's one, or an array. We only consume
+ * `trade` events with their nested `trade` leg.
+ *
+ * Reference: https://documentation.tradier.com/brokerage-api/accounts/get-account-history
+ */
+interface TradierHistoryEnvelope {
+  history?: { event?: TradierRawHistoryEvent | TradierRawHistoryEvent[] } | string | null;
+}
+
+interface TradierRawHistoryEvent {
+  date?: string;
+  amount?: number;
+  type?: string;
+  /** Tradier surfaces a per-event id we can use as a dedup key across runs. */
+  id?: string | number;
+  trade?: {
+    commission?: number;
+    description?: string;
+    price?: number;
+    quantity?: number;
+    symbol?: string;
+    /** `option`/`Option` for option legs, `equity`/`Equity` for stock legs. */
+    trade_type?: string;
+  };
+}
+
+/**
+ * TRA-348 — normalised Tradier history trade event. Combines the top-level
+ * event metadata with the nested `trade` leg into one row the EOD
+ * reconcile pass can consume. Includes both opens (Buy to Open) and
+ * closes (Sell to Close); the reconcile pass filters by `description`.
+ */
+export interface TradierTradeHistoryFill {
+  /** `YYYY-MM-DD` event date as Tradier reports it (account TZ). */
+  date: string;
+  /** Underlying ticker for equities; OCC option symbol for option legs. */
+  symbol: string;
+  tradeType: 'option' | 'equity';
+  /** Raw `description` field — `"Sell to Close 2 SPY..."` etc. */
+  description: string;
+  /** Per-share / per-contract fill price. */
+  price: number;
+  /** Contracts (options) or shares (equities). Always positive. */
+  quantity: number;
+  /**
+   * Net cash impact of the fill (Tradier convention: negative for buys /
+   * opens, positive for sells / closes). Already includes commissions;
+   * we expose `commission` separately so callers can recompute gross.
+   */
+  amount: number;
+  commission: number;
+  /**
+   * Stable id Tradier emits per event. Used as the dedup key across
+   * runs so a re-fetch over the same window doesn't double-count.
+   * Falls back to a synthetic key (date+symbol+qty+price) when Tradier
+   * doesn't surface an id for the event type.
+   */
+  transactionId: string;
+}
+
 export class TradierOptionsClient extends TradierOrderClient {
   constructor(apiToken: string, accountId: string, env: TradierEnv = 'sandbox') {
     super(apiToken, accountId, env);
@@ -371,6 +434,40 @@ export class TradierOptionsClient extends TradierOrderClient {
     return parseTradierPositions(data);
   }
 
+  /**
+   * TRA-348 — list trade history events for the configured account between
+   * `start` and `end` (`YYYY-MM-DD`, inclusive). Returns the normalized
+   * trade-leg fills only — non-trade events (journal, dividend, ACH,
+   * adjustment) are dropped at the parser. The EOD reconcile pass uses
+   * this to merge real Tradier-side closes into `reports/live/<date>.json`
+   * even when the engine never processed the close (manual close on
+   * Tradier's web UI, or a `sell_to_close` that resolved after the
+   * 5-second wait window).
+   *
+   * Tradier's `/accounts/{id}/history` is paginated via `?limit` /
+   * `?page`, but the daily reconcile window is small enough (one calendar
+   * day per call) that the default page size is enough; callers asking
+   * for a wider window pass an explicit `limit`. Returns `[]` on auth /
+   * network failures so the caller can fall back to engine-only P&L
+   * rather than poison the daily report with a half-merged total.
+   */
+  async listAccountHistory(
+    options: { start: string; end: string; limit?: number; type?: string } = {
+      start: '',
+      end: '',
+    },
+  ): Promise<TradierTradeHistoryFill[]> {
+    const params = new URLSearchParams();
+    if (options.start) params.set('start', options.start);
+    if (options.end) params.set('end', options.end);
+    if (options.type) params.set('type', options.type);
+    params.set('limit', String(options.limit ?? 250));
+    const data = await this.getJson<TradierHistoryEnvelope>(
+      `/accounts/${encodeURIComponent(this.accountId)}/history?${params}`,
+    );
+    return parseTradierHistory(data);
+  }
+
   /** Submit a market order to buy option contracts (open). */
   async buyContracts(optionSymbol: string, qty: number): Promise<TradierOrderResponse> {
     return this.postOrder(this.optionOrderBody(optionSymbol, qty, 'buy_to_open'));
@@ -437,6 +534,61 @@ export function parseOccSymbol(occ: string): {
     strike,
     expiration,
   };
+}
+
+/**
+ * TRA-348 — normalise the Tradier `/accounts/{id}/history` envelope into
+ * a list of trade-leg fills. Exported so the EOD reconcile pass can be
+ * unit-tested without mocking `fetch`. Drops non-trade events (journal,
+ * dividend, ACH, adjustment) and rows whose required fields can't be
+ * coerced — we'd rather omit a row than corrupt the calendar with garbage.
+ */
+export function parseTradierHistory(
+  envelope: TradierHistoryEnvelope | null,
+): TradierTradeHistoryFill[] {
+  if (!envelope || typeof envelope.history !== 'object' || envelope.history == null) {
+    return [];
+  }
+  const out: TradierTradeHistoryFill[] = [];
+  for (const raw of asArray(envelope.history.event)) {
+    if (typeof raw.type !== 'string' || raw.type.toLowerCase() !== 'trade') continue;
+    const trade = raw.trade;
+    if (!trade) continue;
+    const tradeTypeRaw = typeof trade.trade_type === 'string' ? trade.trade_type.toLowerCase() : '';
+    const tradeType: 'option' | 'equity' | null =
+      tradeTypeRaw === 'option' ? 'option'
+      : tradeTypeRaw === 'equity' ? 'equity'
+      : null;
+    if (!tradeType) continue;
+    const date = typeof raw.date === 'string' ? raw.date.slice(0, 10) : '';
+    const symbol = typeof trade.symbol === 'string' ? trade.symbol : '';
+    if (!date || !symbol) continue;
+    const price = typeof trade.price === 'number' && Number.isFinite(trade.price) ? trade.price : NaN;
+    const quantity = typeof trade.quantity === 'number' && Number.isFinite(trade.quantity)
+      ? Math.abs(trade.quantity)
+      : NaN;
+    if (!Number.isFinite(price) || !Number.isFinite(quantity) || quantity <= 0) continue;
+    const amount = typeof raw.amount === 'number' && Number.isFinite(raw.amount) ? raw.amount : 0;
+    const commission = typeof trade.commission === 'number' && Number.isFinite(trade.commission)
+      ? trade.commission
+      : 0;
+    const description = typeof trade.description === 'string' ? trade.description : '';
+    const transactionId =
+      raw.id != null ? String(raw.id)
+      : `${date}|${symbol}|${tradeType}|${quantity}|${price}|${description}`;
+    out.push({
+      date,
+      symbol,
+      tradeType,
+      description,
+      price,
+      quantity,
+      amount,
+      commission,
+      transactionId,
+    });
+  }
+  return out;
 }
 
 /**

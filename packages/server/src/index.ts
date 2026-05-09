@@ -8,6 +8,7 @@ import { fileURLToPath } from 'url';
 import { MarketScheduler, isMarketDay } from './scheduler.js';
 import { generateEodReport } from './reports/eod-report.js';
 import { generateCryptoEodReport } from './reports/crypto-eod-report.js';
+import { aggregateRealizedOptionsPnl } from './reports/tradier-reconcile.js';
 import { createToken, verifyToken, generateResetToken, consumeResetToken, initResetTokenStore } from './auth.js';
 import { getSettings, mergeScopedRiskSettings, saveSettings } from './account-settings.js';
 import {
@@ -36,7 +37,7 @@ import {
 import { sendPasswordResetEmail } from './email.js';
 import { rotateBackups, checkDataDirHealth } from './trade-store.js';
 import { TradierRelativeValueScannerService } from './relative-value-scanner.js';
-import { CoinbaseOrderClient, tradierBaseUrl, TradierOptionsClient } from '@trading-app/engine';
+import { CoinbaseOrderClient, tradierBaseUrl, TradierOptionsClient, TRADIER_REJECTED_STATUSES } from '@trading-app/engine';
 import type { TradierEnv } from '@trading-app/shared';
 import { fetchQuotes } from './yahoo-feed.js';
 import {
@@ -239,37 +240,195 @@ async function generateAndSaveReport(ctx: UserContext): Promise<void> {
   const report = generateEodReport(snapshot);
   // TRA-244 — write under the active stocks bucket (demo / live / sandbox)
   // so the per-account calendar shows only the rows that belong to it.
-  const mode = stockModeKey(getSettings(ctx.username));
+  const settings = getSettings(ctx.username);
+  const mode = stockModeKey(settings);
   const targetDir = stockReportsDirFor(ctx, mode);
-  const datePath = join(targetDir, `${report.date}.json`);
-  const mdPath = join(targetDir, `${report.date}.md`);
+
+  // TRA-348 — when the user is in live mode, pull recent Tradier history
+  // and merge any closes the engine didn't process (manual closes on the
+  // broker UI, or `sell_to_close` orders that resolved after the 5s
+  // wait window) into the per-day reports for the active env. Failures
+  // here must not block the local report from being written.
+  if (settings.mode === 'live') {
+    try {
+      await reconcileTradierOptionsHistory(ctx, settings, mode);
+    } catch (err) {
+      console.warn(
+        `[tradier-reconcile:${ctx.username}] failed: ${err instanceof Error ? err.message : String(err)}`,
+      );
+    }
+  }
+
+  // Re-pull the snapshot AFTER reconcile so the report's `optionsPnl`
+  // reflects any Tradier-side closes we just merged (the dashboard pill
+  // reads the same aggregate).
+  const finalSnapshot = ctx.engine.getReportSnapshot();
+  const finalReport = generateEodReport(finalSnapshot);
+
+  const datePath = join(targetDir, `${finalReport.date}.json`);
+  const mdPath = join(targetDir, `${finalReport.date}.md`);
   const latestJsonPath = join(targetDir, 'latest.json');
   const latestMdPath = join(targetDir, 'latest.md');
 
   await Promise.all([
-    writeFile(datePath, JSON.stringify(report, null, 2), 'utf-8'),
-    writeFile(mdPath, report.markdown, 'utf-8'),
-    writeFile(latestJsonPath, JSON.stringify(report, null, 2), 'utf-8'),
-    writeFile(latestMdPath, report.markdown, 'utf-8'),
+    writeFile(datePath, JSON.stringify(finalReport, null, 2), 'utf-8'),
+    writeFile(mdPath, finalReport.markdown, 'utf-8'),
+    writeFile(latestJsonPath, JSON.stringify(finalReport, null, 2), 'utf-8'),
+    writeFile(latestMdPath, finalReport.markdown, 'utf-8'),
   ]);
 
   // Persist daily equity snapshot for cumulative tracking.
   const equitySnap = ctx.engine.getEquitySnapshot();
   ctx.tracker.saveSnapshot({
-    date: report.date,
+    date: finalReport.date,
     openingEquity: ctx.tracker.getOpeningEquity(),
     closingEquity: equitySnap.equity,
     dailyPnl: equitySnap.equity - ctx.tracker.getOpeningEquity(),
     optionsPnl: equitySnap.optionsPnl,
     combinedPnl: (equitySnap.equity - ctx.tracker.getOpeningEquity()) + equitySnap.optionsPnl,
-    trades: snapshot.allClosedPositions.length,
+    trades: finalSnapshot.allClosedPositions.length,
   });
 
   console.log(`[reports:${ctx.username}] EOD report saved → ${datePath}`);
 
-  const msg = JSON.stringify({ type: 'eod_report', payload: report });
+  const msg = JSON.stringify({ type: 'eod_report', payload: finalReport });
   broadcastToUser(ctx.username, msg);
 }
+
+// ── TRA-348: Tradier history reconcile ───────────────────────────────────────
+
+const TRADIER_RECONCILE_LOOKBACK_DAYS = 7;
+
+/**
+ * TRA-348 — pull Tradier history for the active live env over the last
+ * `LOOKBACK_DAYS` and merge realized options closes into the local
+ * per-day reports + the engine's live-mode `optionsPnl` counter.
+ *
+ * Dedup is enforced via a per-user / per-env cursor file under
+ * `<dataDir>/tradier-history-cursor.<env>.json` so a re-fetch over the
+ * same window doesn't double-count. The cursor stores the set of seen
+ * Tradier event ids; a future ticket can prune it once Tradier's own
+ * retention drops out of the lookback window.
+ */
+async function reconcileTradierOptionsHistory(
+  ctx: UserContext,
+  settings: AccountSettings,
+  mode: StockModeKey,
+): Promise<void> {
+  if (mode === 'demo') return;
+  const env: TradierEnv = mode === 'live' ? 'production' : 'sandbox';
+  const client = buildTradierOptionsClientForEnv(settings, env);
+  if (!client) return;
+
+  const today = new Date();
+  const end = today.toISOString().slice(0, 10);
+  const startMs = today.getTime() - TRADIER_RECONCILE_LOOKBACK_DAYS * 24 * 60 * 60 * 1000;
+  const start = new Date(startMs).toISOString().slice(0, 10);
+
+  let fills;
+  try {
+    fills = await client.listAccountHistory({ start, end, type: 'trade', limit: 1000 });
+  } catch (err) {
+    console.warn(
+      `[tradier-reconcile:${ctx.username}] history fetch failed env=${env}: ${err instanceof Error ? err.message : String(err)}`,
+    );
+    return;
+  }
+  if (fills.length === 0) return;
+
+  const cursor = await loadTradierHistoryCursor(ctx, env);
+  const knownIds = new Set(cursor.seenIds);
+  const totals = aggregateRealizedOptionsPnl(fills, knownIds);
+
+  if (totals.seenTransactionIds.size === 0) return;
+
+  // Bump the engine's live-mode P&L bucket by the sum of newly reconciled
+  // realized P&L across all dates in the window so the dashboard pill
+  // updates on the next state broadcast.
+  let added = 0;
+  for (const realized of totals.realizedByDate.values()) added += realized;
+  ctx.engine.addReconciledTradierOptionsPnl(env, added);
+
+  // Persist per-day totals onto a sidecar so `mergeReconciledDailyTotalsIntoReport`
+  // can sum across runs (the cursor file is the dedup source of truth;
+  // the daily totals sidecar is the merge target).
+  const dailyTotals = await loadTradierDailyTotals(ctx, env);
+  for (const [date, realized] of totals.realizedByDate) {
+    dailyTotals[date] = (dailyTotals[date] ?? 0) + realized;
+  }
+  await saveTradierDailyTotals(ctx, env, dailyTotals);
+
+  // Update cursor so subsequent runs skip these ids.
+  for (const id of totals.seenTransactionIds) cursor.seenIds.push(id);
+  await saveTradierHistoryCursor(ctx, env, cursor);
+
+  console.log(
+    `[tradier-reconcile:${ctx.username}] env=${env} merged ${totals.seenTransactionIds.size} new fills, +${added.toFixed(2)} realized across ${totals.realizedByDate.size} day(s)`,
+  );
+}
+
+interface TradierHistoryCursor {
+  seenIds: string[];
+}
+
+function tradierCursorPath(ctx: UserContext, env: TradierEnv): string {
+  return join(ctx.dataDir, `tradier-history-cursor.${env}.json`);
+}
+
+function tradierDailyTotalsPath(ctx: UserContext, env: TradierEnv): string {
+  return join(ctx.dataDir, `tradier-options-pnl.${env}.json`);
+}
+
+async function loadTradierHistoryCursor(
+  ctx: UserContext,
+  env: TradierEnv,
+): Promise<TradierHistoryCursor> {
+  const path = tradierCursorPath(ctx, env);
+  if (!existsSync(path)) return { seenIds: [] };
+  try {
+    const raw = await readFile(path, 'utf-8');
+    const parsed = JSON.parse(raw) as Partial<TradierHistoryCursor>;
+    return { seenIds: Array.isArray(parsed.seenIds) ? parsed.seenIds.filter(s => typeof s === 'string') : [] };
+  } catch {
+    return { seenIds: [] };
+  }
+}
+
+async function saveTradierHistoryCursor(
+  ctx: UserContext,
+  env: TradierEnv,
+  cursor: TradierHistoryCursor,
+): Promise<void> {
+  await writeFile(tradierCursorPath(ctx, env), JSON.stringify(cursor, null, 2), 'utf-8');
+}
+
+async function loadTradierDailyTotals(
+  ctx: UserContext,
+  env: TradierEnv,
+): Promise<Record<string, number>> {
+  const path = tradierDailyTotalsPath(ctx, env);
+  if (!existsSync(path)) return {};
+  try {
+    const raw = await readFile(path, 'utf-8');
+    const parsed = JSON.parse(raw) as Record<string, unknown>;
+    const out: Record<string, number> = {};
+    for (const [k, v] of Object.entries(parsed)) {
+      if (typeof v === 'number' && Number.isFinite(v)) out[k] = v;
+    }
+    return out;
+  } catch {
+    return {};
+  }
+}
+
+async function saveTradierDailyTotals(
+  ctx: UserContext,
+  env: TradierEnv,
+  totals: Record<string, number>,
+): Promise<void> {
+  await writeFile(tradierDailyTotalsPath(ctx, env), JSON.stringify(totals, null, 2), 'utf-8');
+}
+
 
 async function generateAndSaveCryptoReport(ctx: UserContext): Promise<void> {
   // TRA-244 — same per-mode bucketing as the stocks generator above; crypto
@@ -1194,13 +1353,21 @@ app.post('/api/options/:id/close', requireAuth, async (req, res) => {
   const ctx = await userCtx(res);
   const { id } = req.params as Record<string, string>;
 
-  // TRA-323 — imported Tradier positions don't share the local paper-cash
-  // bucket; closing them through `manualCloseOption` would no-op (the
-  // method explicitly skips `importedFromTradier` rows). Detect that case
-  // first, submit a real `sell_to_close` order to Tradier in the
-  // position's env, and only drop the local row once the broker accepted
-  // the order. Failures bubble back as a 502 so the UI can surface the
-  // reason instead of silently leaving a stuck row.
+  // TRA-323 / TRA-348 — imported Tradier positions don't share the paper
+  // cash bucket; closing them must route through Tradier and only drop the
+  // local row once the broker confirms `filled`. `sellContracts → postOrder`
+  // resolves on Tradier *acceptance* (status `ok`/`pending`), which after
+  // hours / on illiquid contracts can sit pending for hours. Pre-TRA-348
+  // we dropped the local row on acceptance, which created two bugs:
+  //   1. The next `/api/tradier/positions/sync` re-imported the position
+  //      because Tradier still had it open.
+  //   2. The closed-options history showed nothing because we never
+  //      actually saw the fill.
+  // Fix: poll `waitForOrderTerminalStatus` for up to 5s. On `filled`,
+  // record the realized P&L and drop the row. On `rejected`/`canceled`/
+  // `expired`/`error`, leave the row in place and surface the reason.
+  // On still-pending, leave the row + flag `pendingCloseOrderId` so the
+  // dashboard renders "Pending #N" instead of the Close button.
   const imported = ctx.engine.findImportedOption(id);
   if (imported) {
     const settings = getSettings(username);
@@ -1217,8 +1384,9 @@ app.post('/api/options/:id/close', requireAuth, async (req, res) => {
       res.status(409).json({ error: 'Imported position is missing OCC symbol or contracts' });
       return;
     }
+    let order;
     try {
-      const order = await client.sellContracts(optionSymbol, contracts);
+      order = await client.sellContracts(optionSymbol, contracts);
       console.log(
         `[tradier-import] sell_to_close ${optionSymbol} qty=${contracts} env=${imported.env} order=${order.id} status=${order.status}`,
       );
@@ -1230,9 +1398,32 @@ app.post('/api/options/:id/close', requireAuth, async (req, res) => {
       res.status(502).json({ error: `Tradier rejected the close order: ${message}` });
       return;
     }
-    ctx.engine.dropImportedOption(id);
+    // TRA-348 — wait for Tradier to take the order to a terminal state
+    // before deciding whether to drop the local row. The 5s window matches
+    // TRA-319's pattern for the engine-opened mirror flow.
+    const detail = await client.waitForOrderTerminalStatus(order.id, { timeoutMs: 5000 });
+    const status = detail?.status ?? '';
+    if (status === 'filled') {
+      const fillPrice = detail?.avg_fill_price ?? imported.position.currentPremium ?? imported.position.premiumPaid;
+      ctx.engine.recordImportedOptionFill(id, fillPrice);
+      broadcastEngineState(ctx);
+      res.json({ ok: true, imported: true, status: 'filled', orderId: order.id });
+      return;
+    }
+    if (TRADIER_REJECTED_STATUSES.has(status)) {
+      const reason = detail?.reason_description?.trim() || status;
+      console.warn(
+        `[tradier-import] sell_to_close ${optionSymbol} terminal=${status} reason=${reason}`,
+      );
+      res.status(502).json({ error: `Tradier rejected the close: ${reason}` });
+      return;
+    }
+    // Still pending after the wait window. Leave the row in place so the
+    // user sees the position until Tradier actually fills it; flag the
+    // open order id so the dashboard can render "Pending #N".
+    ctx.engine.setPendingCloseOrderId(id, order.id);
     broadcastEngineState(ctx);
-    res.json({ ok: true, imported: true });
+    res.status(202).json({ ok: true, imported: true, status: 'pending', orderId: order.id });
     return;
   }
 

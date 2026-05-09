@@ -15,12 +15,14 @@ export {
   underlyingFromOcc,
   parseOccSymbol,
   parseTradierPositions,
+  parseTradierHistory,
 } from './options-client.js';
 export type {
   TradierOptionsContract,
   TradierOptionQuote,
   TradierAccountBalance,
   TradierOpenOptionPosition,
+  TradierTradeHistoryFill,
 } from './options-client.js';
 export { TradierStocksClient } from './stocks-client.js';
 export type { TradierEquityQuote } from './stocks-client.js';

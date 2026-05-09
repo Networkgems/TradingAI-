@@ -1308,6 +1308,44 @@ export class SignalEngine {
   }
 
   /**
+   * TRA-348 — record a closed-options entry for an imported row that just
+   * filled on Tradier. Removes the open row and pushes a snapshot into the
+   * closed-options list with the avg fill price baked into P&L so the
+   * dashboard's Recent Closed Options table reflects the realized close.
+   * Cash is untouched (proceeds live on Tradier).
+   */
+  recordImportedOptionFill(
+    optionId: string,
+    avgFillPrice: number,
+  ): import('@trading-app/shared').OptionPosition | null {
+    for (const acct of this.allOptionsAccounts()) {
+      const closed = acct.recordImportedFill(optionId, avgFillPrice);
+      if (closed) return closed;
+    }
+    return null;
+  }
+
+  /**
+   * TRA-348 — flag an imported position as awaiting a terminal status from
+   * Tradier on its `sell_to_close`. Returns true when a row was matched.
+   */
+  setPendingCloseOrderId(optionId: string, orderId: number | string): boolean {
+    for (const acct of this.allOptionsAccounts()) {
+      if (acct.setPendingCloseOrderId(optionId, orderId)) return true;
+    }
+    return false;
+  }
+
+  /**
+   * TRA-348 — bump the live-mode options P&L bucket for a specific
+   * Tradier env from reconciled broker history. Caller (EOD reconcile)
+   * is responsible for dedup via the per-user cursor file.
+   */
+  addReconciledTradierOptionsPnl(env: TradierEnv, amount: number): void {
+    this.optionsAccounts[env].addReconciledTradierPnl(amount);
+  }
+
+  /**
    * TRA-323 — sync open option positions held in Tradier into the matching
    * env bucket so the user can manage them from TradeAI's Open Options
    * view. Reconcile rules live in {@link PaperOptionsAccount.reconcileTradierPositions};
