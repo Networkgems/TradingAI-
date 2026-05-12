@@ -640,6 +640,12 @@ export class SignalEngine {
     // live), preventing the inactive bucket from being silently unwound when
     // the user switches modes.
     const optionMarks = await this.refreshOptionMarks();
+    // TRA-351 — push the freshly-fetched marks onto imported rows BEFORE
+    // checkExits runs. checkExits skips imports (line 525 of options-account)
+    // so it won't touch them; this pass is purely for the dashboard's
+    // Current Mark / unrealized P&L display, which is what the user
+    // compares side-by-side with Tradier's web UI.
+    this.refreshImportedMarksAllAccounts(optionMarks);
     const optsClosed = this.optionsAccount.checkExits(prices, optionMarks, this.mode);
     if (optsClosed.length > 0) {
       // TRA-221 follow-up: mirror paper exits as Tradier `sell_to_close`
@@ -823,9 +829,17 @@ export class SignalEngine {
 
   /**
    * Look up live marks for every open RV / OTM position via the scanner's
-   * cached chain snapshot (TRA-191). Returns an empty map when no scanner is
-   * wired or there are no eligible positions, so callers can pass it through
-   * unconditionally to `checkExits`.
+   * cached chain snapshot (TRA-191). Also pulls marks for Tradier-imported
+   * positions (TRA-351) so the dashboard's "Current Mark" and unrealized
+   * P&L stay synced with the broker view — without this the imported rows
+   * stick at `currentPremium = premiumPaid` for the lifetime of the
+   * position (the import path seeds entry as current; `checkExits` skips
+   * imported rows; nothing else writes `currentPremium`).
+   *
+   * Returns an empty map when no scanner is wired or there are no eligible
+   * positions, so callers can pass it through unconditionally to both
+   * `checkExits` (engine-driven exits, RV/OTM only) and
+   * `refreshImportedMarks` (display-only, imports only).
    */
   private async refreshOptionMarks(): Promise<Map<string, number>> {
     const marks = new Map<string, number>();
@@ -833,7 +847,9 @@ export class SignalEngine {
 
     const open = this.optionsAccount.getState().openOptions.filter(
       (o) =>
-        (o.signalType === 'relative_value' || o.signalType === 'otm_mispricing') &&
+        (o.signalType === 'relative_value'
+          || o.signalType === 'otm_mispricing'
+          || o.signalType === 'tradier_import') &&
         o.optionSymbol &&
         o.expiration,
     );
@@ -850,6 +866,21 @@ export class SignalEngine {
       }),
     );
     return marks;
+  }
+
+  /**
+   * TRA-351 — fan the freshly-fetched mark map across every options bucket
+   * (demo, live-sandbox, live-production) so imported rows in whichever
+   * bucket holds them get their `currentPremium` bumped. `checkExits` runs
+   * only on the active engine-mode account, but imports can land in either
+   * the sandbox or production live bucket depending on which Tradier env
+   * the user pointed at when they synced — we refresh both each tick.
+   */
+  private refreshImportedMarksAllAccounts(marks: Map<string, number>): void {
+    if (marks.size === 0) return;
+    for (const acct of this.allOptionsAccounts()) {
+      acct.refreshImportedMarks(marks);
+    }
   }
 
   /**

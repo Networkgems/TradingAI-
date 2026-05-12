@@ -536,6 +536,48 @@ describe('PaperOptionsAccount.reconcileTradierPositions', () => {
   });
 });
 
+// ─── TRA-351: imported-position mark refresh ─────────────────────────────────
+
+describe('PaperOptionsAccount.refreshImportedMarks', () => {
+  it('updates currentPremium for imported rows when a mark is supplied', () => {
+    const acct = new PaperOptionsAccount({ initialEquity: 25_000, tradierEnv: 'sandbox' });
+    acct.reconcileTradierPositions([buildTradierPosition({ premiumPaid: 1.6 })]);
+    const symbol = acct.getState().openOptions[0].optionSymbol!;
+    // Seed mark — premium paid was 1.60, fresh mark is 2.10 (+50¢ × 100 ×
+    // 2 contracts = +$100 unrealized). Before this call the dashboard would
+    // show "Current Mark = 1.60" and "P&L = $0".
+    const updated = acct.refreshImportedMarks(new Map([[symbol, 2.10]]));
+    expect(updated).toBe(1);
+    const opt = acct.getState().openOptions[0];
+    expect(opt.currentPremium).toBeCloseTo(2.10, 5);
+  });
+
+  it('leaves engine-opened positions alone (paper-side mark schedule owns them)', () => {
+    const acct = new PaperOptionsAccount({
+      initialEquity: 50_000,
+      managedAccountRatio: 0.5,
+      tradierEnv: 'sandbox',
+    });
+    const opened = acct.openOptionFromCandidate(buildSignal({ optionSymbol: 'AAPL240705C00200000' }));
+    expect(opened).not.toBeNull();
+    const beforeMark = acct.getState().openOptions[0].currentPremium;
+    const updated = acct.refreshImportedMarks(new Map([['AAPL240705C00200000', 99.99]]));
+    expect(updated).toBe(0);
+    expect(acct.getState().openOptions[0].currentPremium).toBe(beforeMark);
+  });
+
+  it('ignores rows whose OCC isn\'t in the mark map and zero/negative marks', () => {
+    const acct = new PaperOptionsAccount({ initialEquity: 25_000, tradierEnv: 'sandbox' });
+    acct.reconcileTradierPositions([buildTradierPosition({ premiumPaid: 1.6 })]);
+    const symbol = acct.getState().openOptions[0].optionSymbol!;
+    expect(acct.refreshImportedMarks(new Map())).toBe(0);
+    expect(acct.refreshImportedMarks(new Map([[symbol, 0]]))).toBe(0);
+    expect(acct.refreshImportedMarks(new Map([[symbol, -1]]))).toBe(0);
+    // currentPremium should still be the seeded entry premium.
+    expect(acct.getState().openOptions[0].currentPremium).toBeCloseTo(1.6, 5);
+  });
+});
+
 // ─── TRA-348: drop-on-fill, pendingCloseOrderId, reconciled P&L ──────────────
 
 describe('PaperOptionsAccount.recordImportedFill', () => {

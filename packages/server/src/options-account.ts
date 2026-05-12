@@ -746,6 +746,32 @@ export class PaperOptionsAccount {
   }
 
   /**
+   * TRA-351 — refresh `currentPremium` for imported (Tradier-mirrored)
+   * positions from a freshly-fetched per-OCC mark map. Mirrors the mark
+   * write `checkExits` performs for engine-opened rows (line 563), but
+   * deliberately skips the trailing / SL / exit pipeline because imported
+   * positions are user-closed only (the guard at line 525 keeps `checkExits`
+   * from touching them). Without this pass, imported rows display "Current
+   * Mark = --" and "P&L = $0.00" forever because `reconcileTradierPositions`
+   * seeds `currentPremium = premiumPaid` and nothing else updates it.
+   * Returns the count of rows whose mark was actually refreshed (mark > 0
+   * present in the map) so the caller can log refresh activity.
+   */
+  refreshImportedMarks(marks: Map<string, number>): number {
+    let updated = 0;
+    for (const opt of this.openOptions.values()) {
+      if (!opt.importedFromTradier) continue;
+      if (!opt.optionSymbol) continue;
+      const mark = marks.get(opt.optionSymbol);
+      if (typeof mark !== 'number' || !(mark > 0)) continue;
+      opt.currentPremium = mark;
+      if (mark > opt.peakPremium) opt.peakPremium = mark;
+      updated += 1;
+    }
+    return updated;
+  }
+
+  /**
    * TRA-348 — record a closed-options entry for a Tradier-imported row that
    * just filled on the broker side. Mirrors the `Recent Closed Options` row
    * a paper close would produce so the user sees realized P&L in the UI,
