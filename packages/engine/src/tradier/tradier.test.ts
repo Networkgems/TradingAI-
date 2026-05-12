@@ -415,6 +415,35 @@ describe('TradierOptionsClient.getAccountBalance (TRA-226)', () => {
   });
 });
 
+// TRA-352 — getOptionQuote preserves bid/ask/last separately so the smart
+// sell-to-close path can compute a midpoint and fall back gracefully when
+// only one side of the quote is populated.
+describe('TradierOptionsClient.getOptionQuote', () => {
+  it('returns bid, ask, last when all three are present', async () => {
+    fetchMock.mockResolvedValueOnce(
+      jsonResponse({ quotes: { quote: { symbol: 'X', bid: 0.05, ask: 0.17, last: 0.11 } } }),
+    );
+    const client = new TradierOptionsClient('tok', 'A1');
+    const q = await client.getOptionQuote('X');
+    expect(q).toEqual({ symbol: 'X', bid: 0.05, ask: 0.17, last: 0.11 });
+  });
+
+  it('omits missing fields so callers can branch on undefined', async () => {
+    fetchMock.mockResolvedValueOnce(
+      jsonResponse({ quotes: { quote: { symbol: 'X', ask: 0.25 } } }),
+    );
+    const client = new TradierOptionsClient('tok', 'A1');
+    const q = await client.getOptionQuote('X');
+    expect(q).toEqual({ symbol: 'X', ask: 0.25 });
+  });
+
+  it('returns null when the quotes envelope is empty', async () => {
+    fetchMock.mockResolvedValueOnce(jsonResponse({ quotes: null }));
+    const client = new TradierOptionsClient('tok', 'A1');
+    expect(await client.getOptionQuote('X')).toBeNull();
+  });
+});
+
 describe('TradierOptionsClient.buyContracts / sellContracts', () => {
   it('posts a buy_to_open option order with derived underlying', async () => {
     fetchMock.mockResolvedValueOnce(jsonResponse({ order: { id: 7, status: 'ok' } }));
@@ -446,6 +475,24 @@ describe('TradierOptionsClient.buyContracts / sellContracts', () => {
     fetchMock.mockResolvedValueOnce(textResponse('rate limit', 429));
     const client = new TradierOptionsClient('tok', 'A1');
     await expect(client.buyContracts('AAPL260515C00150000', 1)).rejects.toThrow(/429/);
+  });
+
+  // TRA-352 — sellContractsLimit submits a limit `sell_to_close` so the
+  // close path can land on the midpoint instead of the bid. The market
+  // variant is kept around for non-close call sites (none today; legacy).
+  it('posts a sell_to_close LIMIT order with rounded cent price', async () => {
+    fetchMock.mockResolvedValueOnce(jsonResponse({ order: { id: 11, status: 'ok' } }));
+    const client = new TradierOptionsClient('tok', 'A1');
+    await client.sellContractsLimit('AAPL260515P00150000', 4, 0.1149);
+    const params = new URLSearchParams(callInit(0).body as string);
+    expect(params.get('class')).toBe('option');
+    expect(params.get('side')).toBe('sell_to_close');
+    expect(params.get('option_symbol')).toBe('AAPL260515P00150000');
+    expect(params.get('quantity')).toBe('4');
+    expect(params.get('type')).toBe('limit');
+    // 0.1149 → 0.11 (round to nearest cent).
+    expect(params.get('price')).toBe('0.11');
+    expect(params.get('duration')).toBe('day');
   });
 });
 

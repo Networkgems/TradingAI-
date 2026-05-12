@@ -38,6 +38,7 @@ import { sendPasswordResetEmail } from './email.js';
 import { rotateBackups, checkDataDirHealth } from './trade-store.js';
 import { TradierRelativeValueScannerService } from './relative-value-scanner.js';
 import { CoinbaseOrderClient, tradierBaseUrl, TradierOptionsClient, TRADIER_REJECTED_STATUSES } from '@trading-app/engine';
+import { submitSmartSellToClose } from './tradier-smart-close.js';
 import type { TradierEnv } from '@trading-app/shared';
 import { fetchQuotes } from './yahoo-feed.js';
 import {
@@ -1353,21 +1354,33 @@ app.post('/api/options/:id/close', requireAuth, async (req, res) => {
   const ctx = await userCtx(res);
   const { id } = req.params as Record<string, string>;
 
-  // TRA-323 / TRA-348 — imported Tradier positions don't share the paper
-  // cash bucket; closing them must route through Tradier and only drop the
-  // local row once the broker confirms `filled`. `sellContracts → postOrder`
-  // resolves on Tradier *acceptance* (status `ok`/`pending`), which after
-  // hours / on illiquid contracts can sit pending for hours. Pre-TRA-348
-  // we dropped the local row on acceptance, which created two bugs:
-  //   1. The next `/api/tradier/positions/sync` re-imported the position
-  //      because Tradier still had it open.
-  //   2. The closed-options history showed nothing because we never
-  //      actually saw the fill.
-  // Fix: poll `waitForOrderTerminalStatus` for up to 5s. On `filled`,
-  // record the realized P&L and drop the row. On `rejected`/`canceled`/
-  // `expired`/`error`, leave the row in place and surface the reason.
-  // On still-pending, leave the row + flag `pendingCloseOrderId` so the
-  // dashboard renders "Pending #N" instead of the Close button.
+  // TRA-323 / TRA-348 / TRA-352 — close path. There are three sub-paths,
+  // each routed by the position's origin:
+  //
+  //  1. Tradier-imported (TRA-323). The local row only exists for display;
+  //     the position lives on Tradier's books, not on the paper cash
+  //     bucket. Closing routes a real `sell_to_close` to Tradier; on fill
+  //     we record a closed-options row WITHOUT crediting paper cash. On
+  //     reject we leave the row and 502. On pending we tag
+  //     `pendingCloseOrderId` and 202.
+  //
+  //  2. Engine-opened live (TRA-221 + TRA-352). The engine opened a paper
+  //     row AND fired a real `buy_to_open` on Tradier (signal-engine.ts
+  //     ~line 1017). Before TRA-352, the close path here was paper-only —
+  //     the Tradier long leaked. Now we mirror the close to Tradier and
+  //     close the local row at the broker's actual avg fill price (so
+  //     paper cash + realized P&L match the broker reality, not the local
+  //     mark which can be stale on wide-spread OCCs).
+  //
+  //  3. Engine-opened demo (or live without Tradier creds). Pure paper —
+  //     no broker call, close at the local mark like before.
+  //
+  // Sub-paths 1 and 2 share the smart-pricing layer in
+  // `submitSmartSellToClose`: pull a fresh quote, submit limit at mid,
+  // walk a quarter-step toward the bid if the first attempt doesn't fill
+  // within 5s. This is the TRA-352 fix for "market sell fills at the
+  // bid on wide-spread contracts" — previously a 0.05/0.17 contract
+  // filled at 0.05 instead of ~0.11.
   const imported = ctx.engine.findImportedOption(id);
   if (imported) {
     const settings = getSettings(username);
@@ -1384,49 +1397,125 @@ app.post('/api/options/:id/close', requireAuth, async (req, res) => {
       res.status(409).json({ error: 'Imported position is missing OCC symbol or contracts' });
       return;
     }
-    let order;
-    try {
-      order = await client.sellContracts(optionSymbol, contracts);
-      console.log(
-        `[tradier-import] sell_to_close ${optionSymbol} qty=${contracts} env=${imported.env} order=${order.id} status=${order.status}`,
-      );
-    } catch (err: unknown) {
-      const message = err instanceof Error ? err.message : String(err);
-      console.error(
-        `[tradier-import] sell_to_close failed for ${optionSymbol} (${imported.env}): ${message}`,
-      );
-      res.status(502).json({ error: `Tradier rejected the close order: ${message}` });
-      return;
-    }
-    // TRA-348 — wait for Tradier to take the order to a terminal state
-    // before deciding whether to drop the local row. The 5s window matches
-    // TRA-319's pattern for the engine-opened mirror flow.
-    const detail = await client.waitForOrderTerminalStatus(order.id, { timeoutMs: 5000 });
-    const status = detail?.status ?? '';
-    if (status === 'filled') {
-      const fillPrice = detail?.avg_fill_price ?? imported.position.currentPremium ?? imported.position.premiumPaid;
-      ctx.engine.recordImportedOptionFill(id, fillPrice);
-      broadcastEngineState(ctx);
-      res.json({ ok: true, imported: true, status: 'filled', orderId: order.id });
-      return;
-    }
-    if (TRADIER_REJECTED_STATUSES.has(status)) {
-      const reason = detail?.reason_description?.trim() || status;
+    const outcome = await submitSmartSellToClose(client, optionSymbol, contracts);
+    if (outcome.status === 'no_quote') {
       console.warn(
-        `[tradier-import] sell_to_close ${optionSymbol} terminal=${status} reason=${reason}`,
+        `[tradier-import] sell_to_close ${optionSymbol} env=${imported.env} aborted: ${outcome.reason}`,
       );
-      res.status(502).json({ error: `Tradier rejected the close: ${reason}` });
+      res.status(409).json({ error: outcome.reason });
       return;
     }
-    // Still pending after the wait window. Leave the row in place so the
-    // user sees the position until Tradier actually fills it; flag the
-    // open order id so the dashboard can render "Pending #N".
-    ctx.engine.setPendingCloseOrderId(id, order.id);
+    if (outcome.status === 'rejected') {
+      console.warn(
+        `[tradier-import] sell_to_close ${optionSymbol} env=${imported.env} rejected: ${outcome.reason}`,
+      );
+      res.status(502).json({ error: `Tradier rejected the close: ${outcome.reason}` });
+      return;
+    }
+    if (outcome.status === 'filled') {
+      console.log(
+        `[tradier-import] sell_to_close ${optionSymbol} qty=${contracts} env=${imported.env} order=${outcome.orderId} filled@${outcome.avgFillPrice.toFixed(2)} (limit ${outcome.limitPrice.toFixed(2)})`,
+      );
+      ctx.engine.recordImportedOptionFill(id, outcome.avgFillPrice);
+      broadcastEngineState(ctx);
+      res.json({
+        ok: true,
+        imported: true,
+        status: 'filled',
+        orderId: outcome.orderId,
+        fillPrice: outcome.avgFillPrice,
+      });
+      return;
+    }
+    // outcome.status === 'pending'
+    console.log(
+      `[tradier-import] sell_to_close ${optionSymbol} qty=${contracts} env=${imported.env} order=${outcome.orderId} pending@${outcome.limitPrice.toFixed(2)}`,
+    );
+    ctx.engine.setPendingCloseOrderId(id, outcome.orderId);
     broadcastEngineState(ctx);
-    res.status(202).json({ ok: true, imported: true, status: 'pending', orderId: order.id });
+    res.status(202).json({ ok: true, imported: true, status: 'pending', orderId: outcome.orderId });
     return;
   }
 
+  // Engine-opened path. Look up the position so we can decide whether to
+  // mirror the close to Tradier (live + has creds) or stay paper-only
+  // (demo, or live without creds — a rare race after the user revoked
+  // their Tradier token mid-session).
+  const engineOpened = ctx.engine.findEngineOpenedOption(id);
+  if (!engineOpened) {
+    res.status(404).json({ error: 'Option position not found' });
+    return;
+  }
+  const liveMirror = engineOpened.position.mode === 'live';
+  if (liveMirror) {
+    const settings = getSettings(username);
+    const client = buildTradierOptionsClientForEnv(settings, engineOpened.env);
+    const optionSymbol = engineOpened.position.optionSymbol;
+    const contracts = engineOpened.position.contractsRemaining;
+    if (!client) {
+      // No Tradier creds for this env, but the position was opened in live
+      // mode (so a real long likely exists on Tradier). Refuse rather
+      // than close paper-only and leave the broker leg leaking — that's
+      // the exact failure mode TRA-352 was filed to prevent.
+      res.status(409).json({
+        error: `No Tradier credentials saved for ${engineOpened.env} — set them in Settings before closing live option positions.`,
+      });
+      return;
+    }
+    if (!optionSymbol || contracts <= 0) {
+      res.status(409).json({ error: 'Live option position is missing OCC symbol or contracts' });
+      return;
+    }
+    const outcome = await submitSmartSellToClose(client, optionSymbol, contracts);
+    if (outcome.status === 'no_quote') {
+      console.warn(
+        `[tradier-live] sell_to_close ${optionSymbol} env=${engineOpened.env} aborted: ${outcome.reason}`,
+      );
+      res.status(409).json({ error: outcome.reason });
+      return;
+    }
+    if (outcome.status === 'rejected') {
+      console.warn(
+        `[tradier-live] sell_to_close ${optionSymbol} env=${engineOpened.env} rejected: ${outcome.reason}`,
+      );
+      res.status(502).json({ error: `Tradier rejected the close: ${outcome.reason}` });
+      return;
+    }
+    if (outcome.status === 'filled') {
+      console.log(
+        `[tradier-live] sell_to_close ${optionSymbol} qty=${contracts} env=${engineOpened.env} order=${outcome.orderId} filled@${outcome.avgFillPrice.toFixed(2)} (limit ${outcome.limitPrice.toFixed(2)})`,
+      );
+      const closed = ctx.engine.manualCloseOption(id, outcome.avgFillPrice);
+      if (!closed) {
+        // Defensive — should never trip because we just looked up the row.
+        res.status(404).json({ error: 'Option position vanished mid-close' });
+        return;
+      }
+      broadcastEngineState(ctx);
+      res.json({
+        ok: true,
+        status: 'filled',
+        orderId: outcome.orderId,
+        fillPrice: outcome.avgFillPrice,
+      });
+      return;
+    }
+    // outcome.status === 'pending' — Tradier accepted the limit but didn't
+    // fill within the walk window. Leave the local row so the user sees
+    // the position still open and tag pendingCloseOrderId so the desktop
+    // disables the Close button until the next reconcile sees Tradier
+    // drop the long.
+    console.log(
+      `[tradier-live] sell_to_close ${optionSymbol} qty=${contracts} env=${engineOpened.env} order=${outcome.orderId} pending@${outcome.limitPrice.toFixed(2)}`,
+    );
+    ctx.engine.setPendingCloseOrderId(id, outcome.orderId);
+    broadcastEngineState(ctx);
+    res.status(202).json({ ok: true, status: 'pending', orderId: outcome.orderId });
+    return;
+  }
+
+  // Demo (or live-without-creds, which we already refused above for safety).
+  // Pure paper close — credit the paper bucket at the local mark.
   const closed = ctx.engine.manualCloseOption(id);
   if (!closed) {
     res.status(404).json({ error: 'Option position not found' });

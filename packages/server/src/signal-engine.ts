@@ -1284,14 +1284,24 @@ export class SignalEngine {
     }
   }
 
-  manualCloseOption(optionId: string): import('@trading-app/shared').OptionPosition | null {
+  manualCloseOption(
+    optionId: string,
+    /**
+     * TRA-352 — when the engine-opened live close path mirrored a
+     * `sell_to_close` to Tradier and saw it fill, the caller passes the
+     * broker's actual avg fill price here so paper cash + realized P&L
+     * track the broker rather than the (potentially stale) local mark.
+     * Demo / live-no-broker closes omit this and fall back to `currentPremium`.
+     */
+    overrideFillPrice?: number,
+  ): import('@trading-app/shared').OptionPosition | null {
     // TRA-233 — the UI sends the position id without an env hint. Look it up
     // across both env buckets so a user reviewing "Open Positions" while
     // toggled to one env can still close a position that lives in the other
     // bucket (e.g. left over from before an env switch).
     let closed: import('@trading-app/shared').OptionPosition | null = null;
     for (const acct of this.allOptionsAccounts()) {
-      closed = acct.closeOption(optionId);
+      closed = acct.closeOption(optionId, overrideFillPrice);
       if (closed) break;
     }
     if (closed) {
@@ -1301,6 +1311,27 @@ export class SignalEngine {
       );
     }
     return closed;
+  }
+
+  /**
+   * TRA-352 — locate an engine-opened open option position across env
+   * buckets. Returns the position with the env it lives in so the close
+   * handler can build a Tradier client for the right env. Excludes
+   * imported rows (those route through {@link findImportedOption}). Used
+   * by the `/api/options/:id/close` handler to decide whether to mirror
+   * the close to Tradier.
+   */
+  findEngineOpenedOption(
+    optionId: string,
+  ): { position: import('@trading-app/shared').OptionPosition; env: TradierEnv } | null {
+    for (const env of ['sandbox', 'production'] as const) {
+      const pos = this.optionsAccounts[env]
+        .getState()
+        .openOptions
+        .find(o => o.id === optionId && !o.importedFromTradier);
+      if (pos) return { position: pos, env };
+    }
+    return null;
   }
 
   /**

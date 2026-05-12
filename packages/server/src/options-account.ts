@@ -801,20 +801,30 @@ export class PaperOptionsAccount {
   }
 
   /**
-   * TRA-348 — mark an imported position as having an in-flight Tradier
+   * TRA-348 / TRA-352 — mark a position as having an in-flight Tradier
    * close order so the dashboard renders "Pending #N" instead of the
-   * Close button. Returns true on success, false when the id doesn't
-   * match an imported open row.
+   * Close button. Originally TRA-348 only allowed imported rows to be
+   * tagged (the engine-opened close path was paper-only). TRA-352 brought
+   * engine-opened live closes onto the broker too, so engine-opened rows
+   * with an open `sell_to_close` order against Tradier also need the
+   * pending marker. We allow any open row to be tagged; demo-mode engine
+   * rows never reach this path because the demo close handler doesn't talk
+   * to Tradier. Returns true on success, false only when the id doesn't
+   * match an open row.
    */
   setPendingCloseOrderId(optionId: string, orderId: number | string): boolean {
     const opt = this.openOptions.get(optionId);
     if (!opt) return false;
-    if (!opt.importedFromTradier) return false;
     opt.pendingCloseOrderId = orderId;
     return true;
   }
 
-  closeOption(optionId: string): OptionPosition | null {
+  /**
+   * Close an engine-opened paper option position. The local mark is used as
+   * the close price unless `overrideFillPrice` is provided — see
+   * {@link closeOption} for the optional argument's rationale (TRA-352).
+   */
+  closeOption(optionId: string, overrideFillPrice?: number): OptionPosition | null {
     const opt = this.openOptions.get(optionId);
     if (!opt) return null;
     // TRA-323 — imported Tradier positions don't share the paper cash
@@ -823,13 +833,24 @@ export class PaperOptionsAccount {
     // `dropImportedPosition` after submitting a real `sell_to_close`
     // order to Tradier; refusing here is a defensive guard.
     if (opt.importedFromTradier) return null;
-    const mark = opt.currentPremium;
+    // TRA-352 — engine-opened live closes pass the broker's actual avg fill
+    // price (from `waitForOrderTerminalStatus`) so the paper cash credit
+    // matches what Tradier actually deposited. Without the override we'd
+    // credit the (stale) local mark and the dashboard's realized P&L would
+    // diverge from the broker's reality. Demo / live-no-broker closes still
+    // omit the override and use the local mark; both paths land here.
+    const closePrice =
+      typeof overrideFillPrice === 'number' && Number.isFinite(overrideFillPrice) && overrideFillPrice >= 0
+        ? overrideFillPrice
+        : opt.currentPremium;
     const remainingContracts = opt.contractsRemaining;
-    const pnl = (mark - opt.premiumPaid) * remainingContracts * 100;
+    const pnl = (closePrice - opt.premiumPaid) * remainingContracts * 100;
     opt.pnl = (opt.pnl ?? 0) + pnl;
     opt.closedAt = Date.now();
+    opt.currentPremium = closePrice;
     opt.contractsRemaining = 0;
-    this.cash += mark * remainingContracts * 100;
+    delete opt.pendingCloseOrderId;
+    this.cash += closePrice * remainingContracts * 100;
     this.equity += pnl;
     // TRA-246 — same per-mode attribution as the auto-exit paths above.
     this.optionsPnlByMode[opt.mode ?? 'demo'] += pnl;

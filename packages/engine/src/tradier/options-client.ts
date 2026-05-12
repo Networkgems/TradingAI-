@@ -373,6 +373,28 @@ export class TradierOptionsClient extends TradierOrderClient {
   }
 
   /**
+   * TRA-352 — single-symbol quote with bid / ask / last preserved separately
+   * so callers can decide how to react when only one side is populated (e.g.
+   * dead OCC contracts with a stale `last` but no live bid). Distinct from
+   * {@link getOptionMid} (which collapses everything to a single price) so the
+   * smart sell-to-close path can compute a midpoint with a graceful fallback
+   * to `last` and a hard refusal when nothing usable is available.
+   */
+  async getOptionQuote(optionSymbol: string): Promise<TradierOptionQuote | null> {
+    const data = await this.getJson<TradierQuotesEnvelope>(
+      `/markets/quotes?symbols=${encodeURIComponent(optionSymbol)}`,
+    );
+    if (!data || typeof data.quotes !== 'object' || data.quotes == null) return null;
+    const [quote] = asArray(data.quotes.quote);
+    if (!quote) return null;
+    const result: TradierOptionQuote = { symbol: quote.symbol };
+    if (typeof quote.bid === 'number' && Number.isFinite(quote.bid)) result.bid = quote.bid;
+    if (typeof quote.ask === 'number' && Number.isFinite(quote.ask)) result.ask = quote.ask;
+    if (typeof quote.last === 'number' && Number.isFinite(quote.last)) result.last = quote.last;
+    return result;
+  }
+
+  /**
    * TRA-226 — Read-only account balance for the configured Tradier account.
    * Used to reflect the user's Tradier equity/cash in the dashboard while in
    * live mode. Returns `null` when Tradier doesn't return a balances payload
@@ -478,21 +500,61 @@ export class TradierOptionsClient extends TradierOrderClient {
     return this.postOrder(this.optionOrderBody(optionSymbol, qty, 'sell_to_close'));
   }
 
+  /**
+   * TRA-352 — submit a limit `sell_to_close` order. Used by the smart-close
+   * path that pulls a fresh bid/ask, computes a midpoint, and walks the price
+   * toward the bid if the first attempt doesn't fill. `limitPrice` is rounded
+   * to the nearest cent before submission because Tradier rejects sub-cent
+   * limit prices on equity options.
+   */
+  async sellContractsLimit(
+    optionSymbol: string,
+    qty: number,
+    limitPrice: number,
+  ): Promise<TradierOrderResponse> {
+    return this.postOrder(
+      this.optionOrderBody(optionSymbol, qty, 'sell_to_close', { type: 'limit', price: limitPrice }),
+    );
+  }
+
   private optionOrderBody(
     optionSymbol: string,
     qty: number,
     side: 'buy_to_open' | 'sell_to_close',
+    /**
+     * TRA-352 — when omitted, defaults to a `market` order (legacy behaviour
+     * for the buy_to_open mirror). When provided, submits a `limit` order
+     * with the rounded price. We keep market as the default so existing
+     * call-sites that don't care about smart pricing don't have to thread an
+     * extra parameter.
+     */
+    pricing?: { type: 'limit'; price: number },
   ): URLSearchParams {
-    return new URLSearchParams({
+    const params: Record<string, string> = {
       class: 'option',
       symbol: underlyingFromOcc(optionSymbol),
       option_symbol: optionSymbol,
       side,
       quantity: String(qty),
-      type: 'market',
       duration: 'day',
-    });
+    };
+    if (pricing?.type === 'limit') {
+      params['type'] = 'limit';
+      params['price'] = roundToCent(pricing.price).toFixed(2);
+    } else {
+      params['type'] = 'market';
+    }
+    return new URLSearchParams(params);
   }
+}
+
+/**
+ * TRA-352 — round to the nearest cent for Tradier limit-order prices. Tradier
+ * rejects sub-cent prices on equity options. Exported so the smart-close
+ * helper can match the on-wire price when reporting back to callers.
+ */
+export function roundToCent(value: number): number {
+  return Math.round(value * 100) / 100;
 }
 
 /**

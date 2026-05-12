@@ -16,6 +16,7 @@ export {
   parseOccSymbol,
   parseTradierPositions,
   parseTradierHistory,
+  roundToCent,
 } from './options-client.js';
 export type {
   TradierOptionsContract,

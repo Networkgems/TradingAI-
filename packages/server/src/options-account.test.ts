@@ -362,6 +362,44 @@ describe('PaperOptionsAccount.getStateForMode — per-mode P&L (TRA-246)', () =>
     expect(acct.getStateForMode('live').optionsPnl).toBeCloseTo(closed!.pnl ?? 0, 5);
   });
 
+  // TRA-352 — when the engine-opened live close path mirrored the
+  // `sell_to_close` to Tradier and saw it fill, the broker's avg fill price
+  // (not the local mark) drives realized P&L and the paper cash credit.
+  // Without this, a stale mark on a wide-spread OCC would diverge from the
+  // broker's actual fill and the user's "Recent Closed Options" pnl would
+  // not match the Tradier history calendar.
+  it('closeOption uses overrideFillPrice for cash + P&L when supplied', () => {
+    const acct = new PaperOptionsAccount({ initialEquity: 50_000, managedAccountRatio: 0.5 });
+    const pos = acct.openOptionFromCandidate(buildSignal({ mark: 1.0 }), 'live');
+    expect(pos).not.toBeNull();
+    const opened = acct.getState().openOptions[0];
+    // Stale local mark — 1.80 would have been used absent the override.
+    opened.currentPremium = 1.80;
+    const cashBefore = acct.getState().optionsCash;
+    const contracts = opened.contractsRemaining;
+    // Tradier filled at 1.50 — that's the price that should credit paper cash.
+    const closed = acct.closeOption(opened.id, 1.50);
+    expect(closed).not.toBeNull();
+    // Realized = (1.50 − 1.00) × contracts × 100
+    expect(closed!.pnl).toBeCloseTo(0.50 * contracts * 100, 5);
+    expect(closed!.currentPremium).toBe(1.50);
+    // Cash credit uses the broker fill, not the stale mark.
+    expect(acct.getState().optionsCash - cashBefore).toBeCloseTo(1.50 * contracts * 100, 5);
+    expect(acct.getStateForMode('live').optionsPnl).toBeCloseTo(closed!.pnl ?? 0, 5);
+  });
+
+  it('closeOption falls back to currentPremium when overrideFillPrice is non-finite', () => {
+    const acct = new PaperOptionsAccount({ initialEquity: 50_000, managedAccountRatio: 0.5 });
+    const pos = acct.openOptionFromCandidate(buildSignal({ mark: 1.0 }), 'live');
+    expect(pos).not.toBeNull();
+    const opened = acct.getState().openOptions[0];
+    opened.currentPremium = 1.20;
+    const closed = acct.closeOption(opened.id, Number.NaN);
+    expect(closed).not.toBeNull();
+    // Falls back to local mark: (1.20 − 1.00) × contracts × 100
+    expect(closed!.pnl).toBeCloseTo(0.20 * opened.contracts * 100, 5);
+  });
+
   it('legacy snapshot without optionsPnlByMode attributes the bucket-wide total to the live bucket', () => {
     const acct = new PaperOptionsAccount({ initialEquity: 50_000, managedAccountRatio: 0.5 });
     // Pre-TRA-246 snapshot — only the bucket-wide optionsPnl is persisted.
@@ -623,14 +661,31 @@ describe('PaperOptionsAccount.setPendingCloseOrderId', () => {
     expect(after?.pendingCloseOrderId).toBe(99001);
   });
 
-  it('returns false for engine-opened rows', () => {
+  // TRA-352 — engine-opened live closes also mirror to Tradier (signal-engine
+  // line 1017 fires a `buy_to_open`; the close path mirrors a `sell_to_close`),
+  // so engine-opened rows with an in-flight close order need the pending tag
+  // too. Prior to TRA-352 the close path was paper-only, so the helper
+  // refused engine rows defensively.
+  it('also stamps engine-opened rows so live closes can render "Pending #N"', () => {
     const acct = new PaperOptionsAccount({
       initialEquity: 50_000,
       managedAccountRatio: 0.5,
       tradierEnv: 'sandbox',
     });
     const opened = acct.openOptionFromCandidate(buildSignal());
-    expect(acct.setPendingCloseOrderId(opened!.id, 1)).toBe(false);
+    expect(opened).not.toBeNull();
+    expect(acct.setPendingCloseOrderId(opened!.id, 4242)).toBe(true);
+    const after = acct.getState().openOptions.find(o => o.id === opened!.id);
+    expect(after?.pendingCloseOrderId).toBe(4242);
+  });
+
+  it('returns false for unknown ids', () => {
+    const acct = new PaperOptionsAccount({
+      initialEquity: 50_000,
+      managedAccountRatio: 0.5,
+      tradierEnv: 'sandbox',
+    });
+    expect(acct.setPendingCloseOrderId('does-not-exist', 1)).toBe(false);
   });
 });
 

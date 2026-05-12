@@ -52,6 +52,7 @@ export {
   parseOccSymbol,
   parseTradierPositions,
   parseTradierHistory,
+  roundToCent,
   TRADIER_TERMINAL_STATUSES,
   TRADIER_REJECTED_STATUSES,
 } from './tradier/index.js';
