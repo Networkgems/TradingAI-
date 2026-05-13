@@ -687,14 +687,41 @@ export class SignalEngine {
     // Current Mark / unrealized P&L display, which is what the user
     // compares side-by-side with Tradier's web UI.
     this.refreshImportedMarksAllAccounts(optionMarks);
-    const optsClosed = this.optionsAccount.checkExits(prices, optionMarks, this.mode);
+
+    // TRA-354 — wait-and-hold exit policy for ENGINE-FIRED exits (distinct
+    // from the TRA-352 USER-initiated close reconciler that ran above).
+    // When live mode is routing options to Tradier, every engine trigger
+    // (TP1 partial / SL / trailing) must clear the broker before the paper
+    // book closes. Sequence per tick:
+    //   1. Poll any pendingExit positions and finalise (filled) / clear
+    //      (rejected/canceled/expired) based on the Tradier order status.
+    //   2. Run checkExits in waitAndHold mode so new triggers stage
+    //      pendingExit intents instead of mutating cash/P&L.
+    //   3. Submit Tradier sell_to_close LIMIT orders for the staged intents,
+    //      attach the resulting order ids, wait briefly for terminal state,
+    //      and finalise / clear synchronously when reached.
+    const liveOptionsMirroring =
+      this.mode === 'live'
+      && this.tradierLiveOptionsEnabled
+      && this.tradierLiveClient !== null;
+
+    if (liveOptionsMirroring) {
+      await this.resolvePendingOptionExits();
+    }
+    const optsClosed = this.optionsAccount.checkExits(
+      prices,
+      optionMarks,
+      this.mode,
+      { waitAndHold: liveOptionsMirroring },
+    );
+    if (liveOptionsMirroring && optsClosed.length > 0) {
+      // TRA-354 — submit the staged Tradier sell_to_close LIMIT orders.
+      // `checkExits` returned position snapshots already carrying the
+      // pendingExit intent; we attach the order id (or clear the intent
+      // on failure) inside this helper.
+      await this.submitStagedOptionExits(optsClosed);
+    }
     if (optsClosed.length > 0) {
-      // TRA-221 follow-up: mirror paper exits as Tradier `sell_to_close`
-      // orders in live mode. Skipped in this iteration because the closed-
-      // position snapshot zeros `contractsRemaining` and the partial exit at
-      // TP1 needs its own sell that fires from inside `checkExits`. Tracked
-      // for follow-up; for now live opens fire on Tradier and the user
-      // manages closes via the Tradier dashboard or `/api/options/:id/close`.
       // Persist equity after options positions close
       this.tracker?.saveEquity(
         this.account.getState().totalEquity,
@@ -921,6 +948,128 @@ export class SignalEngine {
     if (marks.size === 0) return;
     for (const acct of this.allOptionsAccounts()) {
       acct.refreshImportedMarks(marks);
+    }
+  }
+
+  /**
+   * TRA-354 — poll Tradier for any in-flight `sell_to_close` orders staged on
+   * open option positions by the engine's exit triggers. Each tick under
+   * live mirroring:
+   *   • `filled`                 → `finalizePendingExit(id, avg_fill_price)` so
+   *                                the paper book books realised P&L using
+   *                                Tradier's actual fill price (falls back to
+   *                                the staged limit price when the field is
+   *                                absent).
+   *   • rejected/canceled/expired → `clearPendingExit(id, reason)` so the
+   *                                position stays open at its current mark
+   *                                and the dashboard surfaces a notice.
+   *   • still open/partial       → leave pendingExit as-is; the next tick
+   *                                polls again.
+   * Walks every env's options bucket so a sandbox/production switch mid-tick
+   * doesn't leave orders orphaned. Distinct from `reconcilePendingCloses`
+   * (TRA-352), which handles USER-initiated closes on imported positions;
+   * this path handles ENGINE-fired auto-exits on engine-opened positions.
+   * Errors per-position are logged and swallowed so one Tradier hiccup
+   * doesn't take down the whole tick.
+   */
+  private async resolvePendingOptionExits(): Promise<void> {
+    if (!this.tradierLiveClient) return;
+    const buckets: { env: TradierEnv; acct: PaperOptionsAccount }[] = [
+      { env: 'sandbox', acct: this.optionsAccounts.sandbox },
+      { env: 'production', acct: this.optionsAccounts.production },
+    ];
+    for (const { acct } of buckets) {
+      const pending = acct.listPendingExits();
+      for (const opt of pending) {
+        const pendingExit = opt.pendingExit;
+        if (!pendingExit || pendingExit.tradierOrderId === '') continue;
+        try {
+          const detail = await this.tradierLiveClient.getOrderStatus(pendingExit.tradierOrderId);
+          if (!detail) continue;
+          const status = detail.status;
+          if (status === 'filled') {
+            const fill = typeof detail.avg_fill_price === 'number' && detail.avg_fill_price > 0
+              ? detail.avg_fill_price
+              : pendingExit.limitPrice;
+            acct.finalizePendingExit(opt.id, fill);
+            console.log(
+              `[signal-engine] tradier sell_to_close ${opt.optionSymbol} qty=${pendingExit.qty} `
+              + `filled @ $${fill.toFixed(2)} (order=${pendingExit.tradierOrderId}, kind=${pendingExit.kind})`,
+            );
+          } else if (TRADIER_REJECTED_STATUSES.has(status)) {
+            const reasonSuffix = detail.reason_description ? `: ${detail.reason_description}` : '';
+            const reason = `Tradier sell_to_close ${status}${reasonSuffix}`;
+            acct.clearPendingExit(opt.id, reason);
+            console.warn(
+              `[signal-engine] tradier sell_to_close ${opt.optionSymbol} (order=${pendingExit.tradierOrderId}) ${status}${reasonSuffix} — leaving paper position open`,
+            );
+          }
+        } catch (err: unknown) {
+          console.warn(
+            `[signal-engine] resolvePendingOptionExits(${opt.optionSymbol}) failed: ${err instanceof Error ? err.message : String(err)}`,
+          );
+        }
+      }
+    }
+  }
+
+  /**
+   * TRA-354 — submit Tradier `sell_to_close` LIMIT orders for every exit
+   * intent that `checkExits({ waitAndHold: true })` just staged. The
+   * staged `OptionPosition` snapshots carry `pendingExit.qty` and the
+   * trigger limit price; we POST the order, attach the resulting order
+   * id, and briefly wait for terminal status so an immediate fill /
+   * reject is reflected on this tick instead of the next one. On submit
+   * failure the position keeps `pendingExit` cleared and surfaces the
+   * reason so the dashboard can render it.
+   */
+  private async submitStagedOptionExits(staged: import('@trading-app/shared').OptionPosition[]): Promise<void> {
+    if (!this.tradierLiveClient) return;
+    const acct = this.optionsAccount;
+    for (const snapshot of staged) {
+      const intent = snapshot.pendingExit;
+      if (!intent || !snapshot.optionSymbol) continue;
+      let resp: import('@trading-app/engine').TradierOrderResponse;
+      try {
+        resp = await this.tradierLiveClient.sellContractsLimit(
+          snapshot.optionSymbol,
+          intent.qty,
+          intent.limitPrice,
+        );
+      } catch (err: unknown) {
+        const reason = `Tradier sell_to_close submit threw: ${err instanceof Error ? err.message : String(err)}`;
+        acct.clearPendingExit(snapshot.id, reason);
+        console.warn(`[signal-engine] ${reason} — ${snapshot.optionSymbol}`);
+        continue;
+      }
+
+      acct.attachPendingExit(snapshot.id, resp.id);
+      console.log(
+        `[signal-engine] tradier sell_to_close ${snapshot.optionSymbol} qty=${intent.qty} `
+        + `@ limit $${intent.limitPrice.toFixed(2)} order=${resp.id} status=${resp.status} kind=${intent.kind}`,
+      );
+
+      // Reach for terminal status synchronously — same pattern as TRA-319's
+      // buy-side reconciliation. If Tradier filled fast we book it on this
+      // tick; if it ends rejected/canceled we clear the intent and surface
+      // the reason without waiting for the next tick's poll.
+      try {
+        const detail = await this.tradierLiveClient.waitForOrderTerminalStatus(resp.id);
+        if (!detail) continue;
+        if (detail.status === 'filled') {
+          const fill = typeof detail.avg_fill_price === 'number' && detail.avg_fill_price > 0
+            ? detail.avg_fill_price
+            : intent.limitPrice;
+          acct.finalizePendingExit(snapshot.id, fill);
+        } else if (TRADIER_REJECTED_STATUSES.has(detail.status)) {
+          const reasonSuffix = detail.reason_description ? `: ${detail.reason_description}` : '';
+          acct.clearPendingExit(snapshot.id, `Tradier sell_to_close ${detail.status}${reasonSuffix}`);
+        }
+      } catch (err: unknown) {
+        console.warn(
+          `[signal-engine] waitForOrderTerminalStatus(${resp.id}) failed: ${err instanceof Error ? err.message : String(err)} — leaving pendingExit for next tick poll`,
+        );
+      }
     }
   }
 

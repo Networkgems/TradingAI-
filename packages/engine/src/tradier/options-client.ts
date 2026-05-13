@@ -506,6 +506,11 @@ export class TradierOptionsClient extends TradierOrderClient {
    * toward the bid if the first attempt doesn't fill. `limitPrice` is rounded
    * to the nearest cent before submission because Tradier rejects sub-cent
    * limit prices on equity options.
+   *
+   * TRA-354 — also used by the engine-fired exit mirror (TP1 partial / SL /
+   * trailing) to submit a wait-and-hold LIMIT at the trigger price; the
+   * paper book stays open until the resulting order id reaches `filled` on
+   * a subsequent tick.
    */
   async sellContractsLimit(
     optionSymbol: string,

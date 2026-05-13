@@ -494,6 +494,25 @@ describe('TradierOptionsClient.buyContracts / sellContracts', () => {
     expect(params.get('price')).toBe('0.11');
     expect(params.get('duration')).toBe('day');
   });
+
+  // TRA-354 — engine-fired exits also use sellContractsLimit. Verifies the
+  // body carries the derived underlying symbol alongside the rounded limit
+  // price so the wait-and-hold poll path can match the broker order id back
+  // to the staged pendingExit on the position.
+  it('posts a sell_to_close LIMIT order with the derived underlying symbol', async () => {
+    fetchMock.mockResolvedValueOnce(jsonResponse({ order: { id: 11, status: 'ok' } }));
+    const client = new TradierOptionsClient('tok', 'A1');
+    const r = await client.sellContractsLimit('AAPL260515C00150000', 2, 1.234);
+    expect(r.id).toBe(11);
+    const params = new URLSearchParams(callInit(0).body as string);
+    expect(params.get('symbol')).toBe('AAPL');
+    expect(params.get('option_symbol')).toBe('AAPL260515C00150000');
+    expect(params.get('side')).toBe('sell_to_close');
+    expect(params.get('quantity')).toBe('2');
+    expect(params.get('type')).toBe('limit');
+    // 1.234 → 1.23 (roundToCent matches Tradier's cent granularity).
+    expect(params.get('price')).toBe('1.23');
+  });
 });
 
 // ─── TRA-319 — order status reconciliation ──────────────────────────────────

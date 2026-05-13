@@ -771,3 +771,172 @@ describe('PaperOptionsAccount.addReconciledTradierPnl', () => {
     expect(acct.getState().optionsPnl).toBe(0);
   });
 });
+
+// ─── TRA-354 — wait-and-hold exit policy ────────────────────────────────────
+// Engine-fired exits (TP1 partial, SL, trailing) under live mirroring must
+// stage a pendingExit instead of mutating the paper book, leave the position
+// open until Tradier confirms, and surface a notice when the broker rejects
+// or cancels the sell_to_close.
+describe('PaperOptionsAccount — TRA-354 wait-and-hold exits', () => {
+  function buildRvSignal(overrides: Partial<RelativeValueSignal> = {}): RelativeValueSignal {
+    return {
+      id: 'rv-1',
+      symbol: 'AAPL',
+      type: 'relative_value',
+      side: 'buy',
+      entryPrice: 1.0,
+      stopLoss: 0.75,
+      takeProfit: 1.5,
+      riskRewardRatio: 2,
+      timestamp: TRADING_TIME,
+      optionSymbol: 'AAPL240705C00200000',
+      optionType: 'call',
+      strike: 200,
+      expiration: '2024-07-05',
+      mark: 1.0,
+      fairPrice: 1.30,
+      mispricingPct: -0.23,
+      zScore: -2.1,
+      ivFitted: 0.32,
+      ivUsed: 0.28,
+      delta: 0.18,
+      reason: 'cheap-vs-curve',
+      ...overrides,
+    };
+  }
+
+  it('SL trigger under waitAndHold stages a pendingExit without mutating cash or P&L', () => {
+    const acct = new PaperOptionsAccount({ initialEquity: 50_000, managedAccountRatio: 0.5 });
+    const pos = acct.openOptionFromRvCandidate(buildRvSignal({ mark: 1.0 }), 'live');
+    expect(pos).not.toBeNull();
+    const cashBefore = acct.getState().optionsCash;
+
+    // Mark drops past the RV SL (RV uses different params; 0.30 will be below
+    // any RV stopLossPremium for a $1 entry). Drives a full SL exit intent.
+    const marks = new Map<string, number>([[pos!.optionSymbol!, 0.30]]);
+    const staged = acct.checkExits(new Map(), marks, 'live', { waitAndHold: true });
+
+    expect(staged).toHaveLength(1);
+    expect(staged[0].pendingExit).toBeDefined();
+    expect(staged[0].pendingExit?.kind).toBe('sl');
+    expect(staged[0].pendingExit?.qty).toBe(pos!.contracts);
+    // Paper book untouched — position still open, cash unchanged, no P&L
+    // realised yet. The Tradier fill is what flips this.
+    expect(acct.getState().openOptions).toHaveLength(1);
+    expect(acct.getState().optionsCash).toBe(cashBefore);
+    expect(acct.getState().optionsPnl).toBe(0);
+    expect(acct.getState().closedOptions).toHaveLength(0);
+  });
+
+  it('subsequent checkExits ticks do not re-fire while pendingExit is set', () => {
+    const acct = new PaperOptionsAccount({ initialEquity: 50_000, managedAccountRatio: 0.5 });
+    const pos = acct.openOptionFromRvCandidate(buildRvSignal({ mark: 1.0 }), 'live');
+    const marks = new Map<string, number>([[pos!.optionSymbol!, 0.30]]);
+    const first = acct.checkExits(new Map(), marks, 'live', { waitAndHold: true });
+    expect(first).toHaveLength(1);
+
+    // Same mark, same trigger — second tick must NOT stage another exit; the
+    // engine is still waiting for the broker to fill or reject the first.
+    const second = acct.checkExits(new Map(), marks, 'live', { waitAndHold: true });
+    expect(second).toHaveLength(0);
+  });
+
+  it('finalizePendingExit on SL fill books P&L, closes the position, and clears pendingExit', () => {
+    const acct = new PaperOptionsAccount({ initialEquity: 50_000, managedAccountRatio: 0.5 });
+    const pos = acct.openOptionFromRvCandidate(buildRvSignal({ mark: 1.0 }), 'live');
+    const cashBefore = acct.getState().optionsCash;
+
+    const marks = new Map<string, number>([[pos!.optionSymbol!, 0.30]]);
+    const staged = acct.checkExits(new Map(), marks, 'live', { waitAndHold: true });
+    const intent = staged[0].pendingExit!;
+
+    // Tradier reports the fill at the staged limit price.
+    const finalised = acct.finalizePendingExit(pos!.id, intent.limitPrice);
+    expect(finalised).not.toBeNull();
+    // Position retired into closedOptions; openOptions empty.
+    expect(acct.getState().openOptions).toHaveLength(0);
+    expect(acct.getState().closedOptions).toHaveLength(1);
+    // P&L = (limit − entry) * qty * 100. Loss for an SL fill.
+    const expectedPnl = (intent.limitPrice - pos!.premiumPaid) * intent.qty * 100;
+    expect(acct.getState().optionsPnl).toBeCloseTo(expectedPnl, 5);
+    // Cash credited by the proceeds (limit * qty * 100).
+    expect(acct.getState().optionsCash).toBeCloseTo(
+      cashBefore + intent.limitPrice * intent.qty * 100,
+      5,
+    );
+    // Closed snapshot has pendingExit cleared.
+    expect(acct.getState().closedOptions[0].pendingExit).toBeUndefined();
+  });
+
+  it('TP1 trigger stages a partial pendingExit; finalize sells qty and leaves the remainder open with trailing engaged', () => {
+    const acct = new PaperOptionsAccount({ initialEquity: 50_000, managedAccountRatio: 0.5 });
+    const pos = acct.openOptionFromRvCandidate(buildRvSignal({ mark: 1.0 }), 'live');
+    expect(pos!.contracts).toBeGreaterThan(1);
+    // Mark crosses the RV TP1 trigger (RV tp1Pct = 0.50 for premium=1.0 → 1.50).
+    const marks = new Map<string, number>([[pos!.optionSymbol!, 1.60]]);
+
+    const staged = acct.checkExits(new Map(), marks, 'live', { waitAndHold: true });
+    expect(staged).toHaveLength(1);
+    expect(staged[0].pendingExit?.kind).toBe('tp1');
+    expect(staged[0].pendingExit!.qty).toBeLessThan(pos!.contracts);
+
+    const intent = staged[0].pendingExit!;
+    const finalised = acct.finalizePendingExit(pos!.id, intent.limitPrice);
+    expect(finalised).not.toBeNull();
+    // Position is still open with the remainder; pendingExit cleared.
+    const remaining = acct.getState().openOptions[0];
+    expect(remaining.id).toBe(pos!.id);
+    expect(remaining.contractsRemaining).toBe(pos!.contracts - intent.qty);
+    expect(remaining.tp1Hit).toBe(true);
+    expect(remaining.trailingActive).toBe(true);
+    expect(remaining.pendingExit).toBeUndefined();
+    // P&L = (limit − entry) * qty * 100 — positive for a TP1 partial fill.
+    const expectedPartialPnl = (intent.limitPrice - pos!.premiumPaid) * intent.qty * 100;
+    expect(acct.getState().optionsPnl).toBeCloseTo(expectedPartialPnl, 5);
+  });
+
+  it('clearPendingExit leaves the position open and stamps exitErrorReason on the open row', () => {
+    const acct = new PaperOptionsAccount({ initialEquity: 50_000, managedAccountRatio: 0.5 });
+    const pos = acct.openOptionFromRvCandidate(buildRvSignal({ mark: 1.0 }), 'live');
+    const cashBefore = acct.getState().optionsCash;
+
+    const marks = new Map<string, number>([[pos!.optionSymbol!, 0.30]]);
+    acct.checkExits(new Map(), marks, 'live', { waitAndHold: true });
+
+    expect(acct.clearPendingExit(pos!.id, 'Tradier sell_to_close canceled: insufficient buying power')).toBe(true);
+    const open = acct.getState().openOptions[0];
+    expect(open.id).toBe(pos!.id);
+    expect(open.pendingExit).toBeUndefined();
+    expect(open.exitErrorReason).toContain('canceled');
+    expect(open.exitErrorReason).toContain('insufficient buying power');
+    // Paper book untouched: cash, contracts, no closed-options entry.
+    expect(acct.getState().optionsCash).toBe(cashBefore);
+    expect(acct.getState().closedOptions).toHaveLength(0);
+    expect(open.contractsRemaining).toBe(pos!.contracts);
+  });
+
+  it('attachPendingExit stamps the Tradier order id; listPendingExits surfaces all in-flight rows', () => {
+    const acct = new PaperOptionsAccount({ initialEquity: 50_000, managedAccountRatio: 0.5 });
+    const pos = acct.openOptionFromRvCandidate(buildRvSignal({ mark: 1.0 }), 'live');
+    const marks = new Map<string, number>([[pos!.optionSymbol!, 0.30]]);
+    acct.checkExits(new Map(), marks, 'live', { waitAndHold: true });
+
+    expect(acct.listPendingExits()).toHaveLength(1);
+    expect(acct.listPendingExits()[0].pendingExit?.tradierOrderId).toBe('');
+    expect(acct.attachPendingExit(pos!.id, 4242)).toBe(true);
+    expect(acct.listPendingExits()[0].pendingExit?.tradierOrderId).toBe(4242);
+  });
+
+  it('without waitAndHold, the legacy demo path mutates the paper book immediately (regression check)', () => {
+    const acct = new PaperOptionsAccount({ initialEquity: 50_000, managedAccountRatio: 0.5 });
+    const pos = acct.openOptionFromRvCandidate(buildRvSignal({ mark: 1.0 }), 'demo');
+    const marks = new Map<string, number>([[pos!.optionSymbol!, 0.30]]);
+    const closed = acct.checkExits(new Map(), marks, 'demo');
+    expect(closed).toHaveLength(1);
+    // Demo path mutates immediately — no pendingExit ever surfaces.
+    expect(closed[0].pendingExit).toBeUndefined();
+    expect(acct.getState().openOptions).toHaveLength(0);
+    expect(acct.getState().closedOptions).toHaveLength(1);
+    expect(acct.getState().optionsPnl).toBeLessThan(0);
+  });
+});

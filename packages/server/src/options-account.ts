@@ -513,8 +513,20 @@ export class PaperOptionsAccount {
      * right comparison.
      */
     mode?: AccountMode,
+    /**
+     * TRA-354 — wait-and-hold exit policy. When `true`, engine-fired exits
+     * (TP1 partial / SL / trailing) stage a `pendingExit` intent on the
+     * position instead of mutating the paper book. The caller (signal-
+     * engine) submits a Tradier `sell_to_close` LIMIT order, attaches the
+     * resulting order id via {@link attachPendingExit}, and finalises on
+     * fill via {@link finalizePendingExit}. The "exited" array returned
+     * under this mode contains the staged intents, not closed positions —
+     * callers should not push these into `closedOptions`.
+     */
+    options: { waitAndHold?: boolean } = {},
   ): OptionPosition[] {
     const closed: OptionPosition[] = [];
+    const waitAndHold = options.waitAndHold === true;
 
     for (const [id, opt] of this.openOptions) {
       if (mode !== undefined && (opt.mode ?? 'demo') !== mode) continue;
@@ -523,6 +535,10 @@ export class PaperOptionsAccount {
       // bucket; auto-exiting them would create phantom realized P&L on the
       // paper account while the position is still open on Tradier's books.
       if (opt.importedFromTradier) continue;
+      // TRA-354 — a Tradier sell_to_close is already in flight; don't
+      // re-fire the same exit or mutate the paper book until the engine's
+      // poll path resolves the broker order.
+      if (opt.pendingExit) continue;
       const liveMark = opt.optionSymbol ? optionMarks?.get(opt.optionSymbol) : undefined;
       let mark: number;
       if (typeof liveMark === 'number' && liveMark > 0) {
@@ -578,6 +594,20 @@ export class PaperOptionsAccount {
       if (!opt.tp1Hit && mark >= opt.tp1Premium && opt.contractsRemaining > 1) {
         const exitContracts = Math.floor(opt.contractsRemaining * partialExitRatio);
         if (exitContracts > 0) {
+          if (waitAndHold) {
+            // TRA-354 — stage the partial exit at the TP1 trigger price; engine
+            // submits a Tradier limit sell_to_close and finalises on fill.
+            opt.pendingExit = {
+              tradierOrderId: '',
+              qty: exitContracts,
+              limitPrice: opt.tp1Premium,
+              submittedAt: Date.now(),
+              kind: 'tp1',
+            };
+            delete opt.exitErrorReason;
+            closed.push({ ...opt });
+            continue;
+          }
           const partialPnl = (mark - opt.premiumPaid) * exitContracts * 100;
           this.cash += mark * exitContracts * 100;
           this.equity += partialPnl;
@@ -594,14 +624,32 @@ export class PaperOptionsAccount {
 
       // Determine full exit: hard SL or trailing stop breach
       let exitPremium: number | null = null;
+      let exitKind: 'sl' | 'trail' | null = null;
 
       if (mark <= opt.stopLossPremium) {
         exitPremium = opt.stopLossPremium;
+        exitKind = 'sl';
       } else if (opt.trailingActive && mark <= opt.trailingStopPremium) {
         exitPremium = opt.trailingStopPremium;
+        exitKind = 'trail';
       }
 
-      if (exitPremium !== null) {
+      if (exitPremium !== null && exitKind !== null) {
+        if (waitAndHold) {
+          // TRA-354 — stage the full exit at the trigger (SL or trailing)
+          // price; engine submits a Tradier limit sell_to_close. The paper
+          // book stays open until the broker fill (or reject) lands.
+          opt.pendingExit = {
+            tradierOrderId: '',
+            qty: opt.contractsRemaining,
+            limitPrice: exitPremium,
+            submittedAt: Date.now(),
+            kind: exitKind,
+          };
+          delete opt.exitErrorReason;
+          closed.push({ ...opt });
+          continue;
+        }
         const remainingContracts = opt.contractsRemaining;
         const pnl = (exitPremium - opt.premiumPaid) * remainingContracts * 100;
         opt.pnl = (opt.pnl ?? 0) + pnl;
@@ -621,6 +669,105 @@ export class PaperOptionsAccount {
     }
 
     return closed;
+  }
+
+  /**
+   * TRA-354 — attach a Tradier order id to a staged pendingExit after the
+   * engine has submitted the `sell_to_close` LIMIT. Called immediately
+   * after `checkExits({ waitAndHold: true })` returns its staged intents.
+   * Returns false when the position is unknown or has no pendingExit so
+   * the caller can log / drop without throwing.
+   */
+  attachPendingExit(optionId: string, tradierOrderId: string | number): boolean {
+    const opt = this.openOptions.get(optionId);
+    if (!opt || !opt.pendingExit) return false;
+    opt.pendingExit.tradierOrderId = tradierOrderId;
+    return true;
+  }
+
+  /**
+   * TRA-354 — finalise a position whose Tradier sell_to_close has filled.
+   * For `kind === 'tp1'` this realises the partial exit (sells
+   * `pendingExit.qty`, decrements `contractsRemaining`, marks tp1Hit,
+   * engages trailing) and leaves the position open for the remainder.
+   * For `kind === 'sl' | 'trail'` this realises the full close, retires
+   * the position into `closedOptions`, and removes it from openOptions.
+   * Returns the position state at finalisation (snapshot) or `null` when
+   * the id is unknown / has no pendingExit.
+   *
+   * `fillPrice` is the per-share avg fill price from Tradier when
+   * available; falls back to the staged `limitPrice` so a fill without a
+   * surfaced price still books the trade at the trigger.
+   */
+  finalizePendingExit(
+    optionId: string,
+    fillPrice?: number,
+  ): OptionPosition | null {
+    const opt = this.openOptions.get(optionId);
+    if (!opt || !opt.pendingExit) return null;
+    const pending = opt.pendingExit;
+    const price = (typeof fillPrice === 'number' && Number.isFinite(fillPrice) && fillPrice > 0)
+      ? fillPrice
+      : pending.limitPrice;
+    const exitContracts = Math.min(pending.qty, opt.contractsRemaining);
+    if (exitContracts <= 0) {
+      // Defensive: the staged qty no longer fits; just clear the pending
+      // flag so the position isn't stuck in pendingExit forever.
+      delete opt.pendingExit;
+      return { ...opt };
+    }
+
+    const pnl = (price - opt.premiumPaid) * exitContracts * 100;
+    this.cash += price * exitContracts * 100;
+    this.equity += pnl;
+    this.optionsPnlByMode[opt.mode ?? 'demo'] += pnl;
+    opt.pnl = (opt.pnl ?? 0) + pnl;
+    opt.currentPremium = price;
+    opt.contractsRemaining -= exitContracts;
+
+    if (pending.kind === 'tp1' && opt.contractsRemaining > 0) {
+      // Partial fill — leave the remainder open with trailing engaged.
+      opt.tp1Hit = true;
+      opt.trailingActive = true;
+      // Trail offset is re-derived in checkExits next tick; keep the
+      // previously-stored trailingStopPremium so SL doesn't widen.
+      delete opt.pendingExit;
+      delete opt.exitErrorReason;
+      return { ...opt };
+    }
+
+    // Full close (SL / trail) — or a TP1 that sold the last contracts.
+    opt.closedAt = Date.now();
+    opt.contractsRemaining = 0;
+    delete opt.pendingExit;
+    delete opt.exitErrorReason;
+    this.openOptions.delete(optionId);
+    this.closedOptions.push({ ...opt });
+    return { ...opt };
+  }
+
+  /**
+   * TRA-354 — clear a pendingExit without crediting cash/P&L. Called when
+   * Tradier rejects, cancels, or expires the `sell_to_close` order, or
+   * the submit itself throws. The position remains open at its current
+   * mark; the surfaced `reason` is stamped on `exitErrorReason` so the
+   * dashboard can render a notice next to the row.
+   */
+  clearPendingExit(optionId: string, reason?: string): boolean {
+    const opt = this.openOptions.get(optionId);
+    if (!opt || !opt.pendingExit) return false;
+    delete opt.pendingExit;
+    if (reason) opt.exitErrorReason = reason;
+    return true;
+  }
+
+  /**
+   * TRA-354 — list every open position (across all modes) that has a
+   * Tradier `sell_to_close` in flight. The engine's poll path uses this
+   * each tick to check broker status and finalise / clear accordingly.
+   */
+  listPendingExits(): OptionPosition[] {
+    return Array.from(this.openOptions.values()).filter(o => o.pendingExit !== undefined);
   }
 
   /**

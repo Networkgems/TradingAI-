@@ -904,6 +904,28 @@ export function isValidCryptoTradingWindow(utcMs: number): boolean {
 // Backward-compat alias
 export const OPTIONS_TP_PCT = OPTIONS_TP1_PCT;
 
+/**
+ * TRA-354 — in-flight Tradier `sell_to_close` LIMIT order an engine-fired
+ * exit has staged on the live broker. The paper book transitions the
+ * position into this state instead of closing immediately; the next tick
+ * polls the Tradier order id and finalises (or clears) based on whether
+ * the broker filled or rejected. `kind` distinguishes the partial TP1
+ * exit (sells half, leaves the rest open) from the full SL/trail exit
+ * (sells whatever remains and retires the position).
+ */
+export interface OptionPendingExit {
+  /** Tradier order id returned by `sell_to_close` submit. */
+  tradierOrderId: string | number;
+  /** Contracts being sold on this exit leg. */
+  qty: number;
+  /** Per-share limit price submitted to Tradier (matches engine trigger). */
+  limitPrice: number;
+  /** ms epoch when the order was submitted. */
+  submittedAt: number;
+  /** Which engine trigger staged this exit — drives partial vs full finalise. */
+  kind: 'tp1' | 'sl' | 'trail';
+}
+
 export interface OptionPosition {
   id: string;
   symbol: string;
@@ -965,6 +987,25 @@ export interface OptionPosition {
    * engine learns the order terminated.
    */
   pendingCloseOrderId?: number | string;
+  /**
+   * TRA-354 — engine-fired exit (TP1 partial / SL / trailing) has submitted
+   * a Tradier `sell_to_close` LIMIT order and is waiting for the broker to
+   * confirm. While this is set, the paper book holds the position open;
+   * `checkExits` no longer re-fires triggers and the engine's poll path is
+   * responsible for finalising (on fill) or clearing (on reject/cancel).
+   * Distinct from {@link pendingCloseOrderId}: that one tracks USER-initiated
+   * closes against imported positions; this one tracks ENGINE-fired exits
+   * against engine-opened positions.
+   */
+  pendingExit?: OptionPendingExit;
+  /**
+   * TRA-354 — last reason a pendingExit was cleared without filling
+   * (Tradier rejected / canceled / expired the order, or the HTTP call
+   * threw). Surfaced on the dashboard's Open Options view so the user
+   * knows their exit didn't go through and the position is still live.
+   * Cleared once a fresh pendingExit is submitted on a later tick.
+   */
+  exitErrorReason?: string;
 }
 
 export interface OptionsAccountState {
