@@ -50,6 +50,12 @@ const NEWS_REFRESH_MS = 5 * 60_000;
 // equity does not need second-level freshness — order fills come through
 // the trade path, not the balance poll.
 const TRADIER_BALANCE_REFRESH_MS = 2 * 60_000;
+// TRA-356 — cadence for the periodic Tradier portfolio reconcile. The tick
+// loop runs every 30s, so this guard is currently a no-op floor; we keep
+// it as a constant so the cadence is named and easy to slow down (e.g.
+// during incident throttling) without re-deriving "every tick" from the
+// timer interval.
+const TRADIER_PORTFOLIO_RECONCILE_MS = 30_000;
 /**
  * TRA-230 — drop signals from the displayed list once they're no longer
  * actionable. A signal becomes invalid when it ages past this window or, for
@@ -254,6 +260,13 @@ export class SignalEngine {
    */
   private liveTradierBalance: TradierAccountBalance | null = null;
   private lastTradierBalanceFetchAt = 0;
+  /**
+   * TRA-356 — last successful (or attempted) Tradier portfolio reconcile.
+   * Compared against `TRADIER_PORTFOLIO_RECONCILE_MS` to gate the per-tick
+   * call so we never list positions more than once per cadence window even
+   * if the tick fires faster (e.g. from a test that calls `tick` manually).
+   */
+  private lastTradierPortfolioReconcileAt = 0;
   /**
    * TRA-335 — open equity positions opened against Tradier Live. We keep
    * a dedicated store (separate from `this.account`, which is the demo
@@ -677,6 +690,21 @@ export class SignalEngine {
     } catch (err: unknown) {
       console.warn(
         '[tradier-reconcile] sweep threw:',
+        err instanceof Error ? err.message : String(err),
+      );
+    }
+    // TRA-356 — portfolio-level reconcile so manual Tradier-side activity
+    // (opens, closes, partial fills) flows back into local state between
+    // ticks without the user pressing "Sync Tradier positions". Runs AFTER
+    // `reconcilePendingCloses` so an order that just filled this tick has
+    // already cleared its row before we cross-check broker state against
+    // local imports. Errors are caught inside the method so one bad sweep
+    // doesn't break the rest of the tick.
+    try {
+      await this.reconcileLivePortfolio();
+    } catch (err: unknown) {
+      console.warn(
+        '[tradier-portfolio-reconcile] sweep threw:',
         err instanceof Error ? err.message : String(err),
       );
     }
@@ -1713,6 +1741,85 @@ export class SignalEngine {
    */
   addReconciledTradierOptionsPnl(env: TradierEnv, amount: number): void {
     this.optionsAccounts[env].addReconciledTradierPnl(amount);
+  }
+
+  /**
+   * TRA-356 — periodic Tradier portfolio reconcile while live mode is the
+   * active surface. Once per cadence window the active env's open
+   * positions are pulled and routed through {@link PaperOptionsAccount.reconcileTradierPositions}
+   * so manual Tradier-side actions (opens, closes, partial fills on a
+   * working `sell_to_close`) flow back into local state without the user
+   * clicking the "Sync Tradier positions" button.
+   *
+   * Throttle: skip the network call when the active env has no open rows
+   * AND no in-flight exits / closes. The pending-close reconciler (TRA-352)
+   * already covers user-initiated closes, and the wait-and-hold poller
+   * (TRA-354) already covers engine-fired exits — so when both queues are
+   * empty there's nothing for a portfolio sweep to surface and a quiet
+   * Tradier account doesn't need to be polled. New positions opened on
+   * Tradier from a cold local state are still picked up via the existing
+   * `POST /api/tradier/positions/sync` endpoint (TRA-323).
+   *
+   * Dedupe relies on the existing rules in `reconcileTradierPositions`:
+   * engine-opened rows (importedFromTradier=false) sharing an OCC symbol
+   * with a Tradier row are skipped so the mirror path's own bookkeeping
+   * isn't double-counted. Imported rows are matched by `optionSymbol` and
+   * updated in-place when contracts / premium drift (partial-fill case).
+   *
+   * Returns a counter so the tick caller can log activity and decide
+   * whether to re-broadcast.
+   */
+  async reconcileLivePortfolio(): Promise<{
+    skipped: 'mode' | 'no-client' | 'cadence' | 'empty' | null;
+    added: number;
+    updated: number;
+    removed: number;
+    total: number;
+  }> {
+    const empty = { added: 0, updated: 0, removed: 0, total: 0 };
+    if (this.mode !== 'live') return { skipped: 'mode', ...empty };
+    const env = this.tradierEnv;
+    const client = this.tradierOptionsClientByEnv[env];
+    if (!client) return { skipped: 'no-client', ...empty };
+
+    const now = Date.now();
+    if (now - this.lastTradierPortfolioReconcileAt < TRADIER_PORTFOLIO_RECONCILE_MS) {
+      return { skipped: 'cadence', ...empty };
+    }
+
+    const acct = this.optionsAccounts[env];
+    const liveOpens = acct.getStateForMode('live').openOptions.length;
+    const pendingExits = acct.listPendingExits().length;
+    const pendingCloses = acct.listPendingCloses().length;
+    if (liveOpens === 0 && pendingExits === 0 && pendingCloses === 0) {
+      // Idle account: don't pay the network round-trip. Leave the timestamp
+      // unchanged so the next non-empty tick reconciles immediately rather
+      // than waiting out the cadence from the last empty check.
+      return { skipped: 'empty', ...empty };
+    }
+
+    let positions: readonly import('@trading-app/engine').TradierOpenOptionPosition[];
+    try {
+      positions = await client.listOpenOptionPositions();
+    } catch (err: unknown) {
+      console.warn(
+        `[tradier-portfolio-reconcile] list positions failed env=${env}: ${err instanceof Error ? err.message : String(err)}`,
+      );
+      // Still bump the timestamp so a Tradier outage doesn't burn the cadence
+      // budget with a tight retry loop; the next tick after the window will
+      // try again.
+      this.lastTradierPortfolioReconcileAt = now;
+      return { skipped: null, ...empty };
+    }
+
+    this.lastTradierPortfolioReconcileAt = now;
+    const summary = acct.reconcileTradierPositions(positions, 'live');
+    if (summary.added + summary.updated + summary.removed > 0) {
+      console.log(
+        `[tradier-portfolio-reconcile] env=${env} added=${summary.added} updated=${summary.updated} removed=${summary.removed} total=${summary.total}`,
+      );
+    }
+    return { skipped: null, ...summary };
   }
 
   /**

@@ -1280,6 +1280,231 @@ describe('SignalEngine — TRA-352 pending-close reconciler', () => {
   });
 });
 
+// TRA-356 — periodic portfolio reconcile while live mode is active. The
+// engine pulls Tradier's open positions on a cadence and feeds them
+// through the existing `reconcileTradierPositions` rules so manual
+// Tradier-side actions flow back into local state without a button press.
+// These tests drive `reconcileLivePortfolio` directly so we can assert
+// the skip / fetch / dedupe behaviours without standing up a full tick.
+describe('SignalEngine — TRA-356 periodic portfolio reconcile', () => {
+  interface ListPositionsStub {
+    listOpenOptionPositions: ReturnType<typeof vi.fn>;
+  }
+  type EngineInternals = {
+    tradierOptionsClientByEnv: Record<TradierEnv, unknown>;
+    optionsAccounts: Record<TradierEnv, {
+      openOptionFromCandidate(sig: unknown, mode: 'live'): { id: string } | null;
+      getStateForMode(mode: 'demo' | 'live'): { openOptions: Array<{ id: string }> };
+    }>;
+    mode: 'demo' | 'live';
+    tradierEnv: TradierEnv;
+    lastTradierPortfolioReconcileAt: number;
+  };
+
+  function asInternals(engine: SignalEngine): EngineInternals {
+    return engine as unknown as EngineInternals;
+  }
+
+  function setupEngine(opts: {
+    mode?: 'demo' | 'live';
+    env?: TradierEnv;
+    client?: ListPositionsStub | null;
+  } = {}) {
+    const engine = new SignalEngine();
+    const internals = asInternals(engine);
+    internals.mode = opts.mode ?? 'live';
+    const env = opts.env ?? 'sandbox';
+    internals.tradierEnv = env;
+    internals.tradierOptionsClientByEnv = {
+      sandbox: env === 'sandbox' ? (opts.client ?? null) : null,
+      production: env === 'production' ? (opts.client ?? null) : null,
+    };
+    return engine;
+  }
+
+  function openLiveEngineRow(
+    engine: SignalEngine,
+    env: TradierEnv,
+    overrides: { symbol?: string; optionSymbol?: string } = {},
+  ): { optionId: string } {
+    const acct = asInternals(engine).optionsAccounts[env];
+    const opened = acct.openOptionFromCandidate(
+      {
+        id: 'sig',
+        symbol: overrides.symbol ?? 'AAPL',
+        type: 'otm_mispricing',
+        side: 'buy',
+        entryPrice: 1.0,
+        stopLoss: 0.75,
+        takeProfit: 1.5,
+        riskRewardRatio: 2,
+        timestamp: TRADING_TIME,
+        optionSymbol: overrides.optionSymbol ?? 'AAPL240705C00200000',
+        optionType: 'call',
+        strike: 200,
+        expiration: '2024-07-05',
+        mark: 1.0,
+        theo: 1.3,
+        mispricingPct: -0.23,
+        delta: 0.18,
+      },
+      'live',
+    );
+    if (!opened) throw new Error('test setup: failed to open option');
+    return { optionId: opened.id };
+  }
+
+  it('skips the network call entirely in demo mode', async () => {
+    const stub: ListPositionsStub = { listOpenOptionPositions: vi.fn() };
+    const engine = setupEngine({ mode: 'demo', client: stub });
+
+    const summary = await engine.reconcileLivePortfolio();
+
+    expect(summary.skipped).toBe('mode');
+    expect(stub.listOpenOptionPositions).not.toHaveBeenCalled();
+  });
+
+  it('skips when no Tradier client is configured for the active env', async () => {
+    const engine = setupEngine({ mode: 'live', env: 'sandbox', client: null });
+
+    const summary = await engine.reconcileLivePortfolio();
+
+    expect(summary.skipped).toBe('no-client');
+  });
+
+  it('skips when the active env has no open rows, no pending exits, and no pending closes', async () => {
+    const stub: ListPositionsStub = { listOpenOptionPositions: vi.fn() };
+    const engine = setupEngine({ client: stub });
+
+    const summary = await engine.reconcileLivePortfolio();
+
+    expect(summary.skipped).toBe('empty');
+    expect(stub.listOpenOptionPositions).not.toHaveBeenCalled();
+  });
+
+  it('fetches Tradier positions and imports a new external open into the active env', async () => {
+    // Pre-seed an open row so the throttle gate lets us through, but use a
+    // different OCC symbol than the Tradier response so the import path
+    // adds the second row instead of just updating the seed.
+    const stub: ListPositionsStub = {
+      listOpenOptionPositions: vi.fn().mockResolvedValue([
+        {
+          optionSymbol: 'MSFT240705C00400000',
+          underlying: 'MSFT',
+          optionType: 'call',
+          strike: 400,
+          expiration: '2024-07-05',
+          contracts: 2,
+          premiumPaid: 1.10,
+          acquiredAt: TRADING_TIME,
+        },
+      ]),
+    };
+    const engine = setupEngine({ client: stub });
+    openLiveEngineRow(engine, 'sandbox');
+
+    const summary = await engine.reconcileLivePortfolio();
+
+    expect(summary.skipped).toBeNull();
+    expect(summary.added).toBe(1);
+    expect(stub.listOpenOptionPositions).toHaveBeenCalledTimes(1);
+    const liveRows = asInternals(engine).optionsAccounts.sandbox.getStateForMode('live').openOptions;
+    expect(liveRows.map(r => (r as unknown as { optionSymbol?: string }).optionSymbol).sort()).toEqual([
+      'AAPL240705C00200000',
+      'MSFT240705C00400000',
+    ]);
+  });
+
+  it('does not double-import an engine-opened row sharing the OCC symbol Tradier reports', async () => {
+    // Engine-opened (importedFromTradier=false) row with the same OCC symbol
+    // Tradier surfaces. Reconcile must skip it rather than mint a second copy.
+    const stub: ListPositionsStub = {
+      listOpenOptionPositions: vi.fn().mockResolvedValue([
+        {
+          optionSymbol: 'AAPL240705C00200000',
+          underlying: 'AAPL',
+          optionType: 'call',
+          strike: 200,
+          expiration: '2024-07-05',
+          contracts: 1,
+          premiumPaid: 1.0,
+          acquiredAt: TRADING_TIME,
+        },
+      ]),
+    };
+    const engine = setupEngine({ client: stub });
+    openLiveEngineRow(engine, 'sandbox');
+
+    const summary = await engine.reconcileLivePortfolio();
+
+    expect(summary.added).toBe(0);
+    expect(summary.updated).toBe(0);
+    const liveRows = asInternals(engine).optionsAccounts.sandbox.getStateForMode('live').openOptions;
+    expect(liveRows).toHaveLength(1);
+  });
+
+  it('enforces the cadence — a second call inside the window is short-circuited', async () => {
+    const stub: ListPositionsStub = {
+      listOpenOptionPositions: vi.fn().mockResolvedValue([]),
+    };
+    const engine = setupEngine({ client: stub });
+    openLiveEngineRow(engine, 'sandbox');
+
+    const first = await engine.reconcileLivePortfolio();
+    expect(first.skipped).toBeNull();
+
+    // Same fake-clock instant — second call must hit the cadence guard
+    // without listing positions again.
+    const second = await engine.reconcileLivePortfolio();
+    expect(second.skipped).toBe('cadence');
+    expect(stub.listOpenOptionPositions).toHaveBeenCalledTimes(1);
+
+    // Advance past the cadence window and the next call goes out again.
+    vi.setSystemTime(TRADING_TIME + 31_000);
+    const third = await engine.reconcileLivePortfolio();
+    expect(third.skipped).toBeNull();
+    expect(stub.listOpenOptionPositions).toHaveBeenCalledTimes(2);
+  });
+
+  it('keeps the cadence timestamp unchanged when the gate skips so the next non-empty tick reconciles immediately', async () => {
+    const stub: ListPositionsStub = {
+      listOpenOptionPositions: vi.fn().mockResolvedValue([]),
+    };
+    const engine = setupEngine({ client: stub });
+
+    const empty = await engine.reconcileLivePortfolio();
+    expect(empty.skipped).toBe('empty');
+    expect(asInternals(engine).lastTradierPortfolioReconcileAt).toBe(0);
+
+    // Now open a row; the very next call (no clock advance) should reconcile.
+    openLiveEngineRow(engine, 'sandbox');
+    const summary = await engine.reconcileLivePortfolio();
+    expect(summary.skipped).toBeNull();
+    expect(stub.listOpenOptionPositions).toHaveBeenCalledTimes(1);
+  });
+
+  it('swallows list-positions failures and bumps the cadence timestamp so we do not tight-loop on a Tradier outage', async () => {
+    const stub: ListPositionsStub = {
+      listOpenOptionPositions: vi.fn().mockRejectedValue(new Error('socket reset')),
+    };
+    const engine = setupEngine({ client: stub });
+    openLiveEngineRow(engine, 'sandbox');
+
+    const summary = await engine.reconcileLivePortfolio();
+
+    expect(summary.skipped).toBeNull();
+    expect(summary.added).toBe(0);
+    expect(summary.updated).toBe(0);
+    expect(summary.removed).toBe(0);
+    // Timestamp advanced so the next same-instant call hits the cadence
+    // guard instead of retrying the failed list call in a tight loop.
+    expect(asInternals(engine).lastTradierPortfolioReconcileAt).toBe(TRADING_TIME);
+    const second = await engine.reconcileLivePortfolio();
+    expect(second.skipped).toBe('cadence');
+    expect(stub.listOpenOptionPositions).toHaveBeenCalledTimes(1);
+  });
+});
+
 // TRA-349 — regression-lock the (mode × dashboard) sub-account wiring shipped
 // in TRA-346. SignalEngine owns three stocks-side sub-accounts plus an
 // engine-level pair of fields:
