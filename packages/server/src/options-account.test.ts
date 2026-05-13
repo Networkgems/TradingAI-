@@ -689,6 +689,70 @@ describe('PaperOptionsAccount.setPendingCloseOrderId', () => {
   });
 });
 
+// TRA-352 follow-up — the pending-close reconciler iterates these helpers to
+// drive the local row's pending state to match Tradier's terminal state.
+describe('PaperOptionsAccount.clearPendingCloseOrderId / listPendingCloses', () => {
+  it('lists open rows carrying a pendingCloseOrderId and excludes the rest', () => {
+    const acct = new PaperOptionsAccount({
+      initialEquity: 50_000,
+      managedAccountRatio: 0.5,
+      tradierEnv: 'sandbox',
+    });
+    const a = acct.openOptionFromCandidate(buildSignal({ symbol: 'AAPL' }));
+    // Distinct OCC so the dedup-by-optionSymbol guard in openOptionFromCandidate
+    // doesn't refuse the second open.
+    const b = acct.openOptionFromCandidate(
+      buildSignal({ symbol: 'MSFT', optionSymbol: 'MSFT240705C00400000' }),
+    );
+    expect(a).not.toBeNull();
+    expect(b).not.toBeNull();
+    acct.setPendingCloseOrderId(a!.id, 1234);
+    // b stays open without a pending tag and shouldn't show up.
+
+    const pending = acct.listPendingCloses();
+    expect(pending).toHaveLength(1);
+    expect(pending[0]?.optionId).toBe(a!.id);
+    expect(pending[0]?.pendingCloseOrderId).toBe(1234);
+    expect(pending[0]?.importedFromTradier).toBe(false);
+  });
+
+  it('marks imported rows so the reconciler routes the fill through recordImportedFill', () => {
+    const acct = new PaperOptionsAccount({ initialEquity: 25_000, tradierEnv: 'sandbox' });
+    acct.reconcileTradierPositions([buildTradierPosition()]);
+    const id = acct.getState().openOptions[0].id;
+    acct.setPendingCloseOrderId(id, 9999);
+
+    const pending = acct.listPendingCloses();
+    expect(pending).toHaveLength(1);
+    expect(pending[0]?.importedFromTradier).toBe(true);
+  });
+
+  it('clearPendingCloseOrderId removes the tag and reports true only on mutation', () => {
+    const acct = new PaperOptionsAccount({
+      initialEquity: 50_000,
+      managedAccountRatio: 0.5,
+      tradierEnv: 'sandbox',
+    });
+    const opened = acct.openOptionFromCandidate(buildSignal());
+    expect(opened).not.toBeNull();
+    acct.setPendingCloseOrderId(opened!.id, 7);
+    expect(acct.clearPendingCloseOrderId(opened!.id)).toBe(true);
+    // The second clear is a no-op (already cleared).
+    expect(acct.clearPendingCloseOrderId(opened!.id)).toBe(false);
+    const after = acct.getState().openOptions.find(o => o.id === opened!.id);
+    expect(after?.pendingCloseOrderId).toBeUndefined();
+  });
+
+  it('returns false when the option id is unknown so the caller can no-op', () => {
+    const acct = new PaperOptionsAccount({
+      initialEquity: 50_000,
+      managedAccountRatio: 0.5,
+      tradierEnv: 'sandbox',
+    });
+    expect(acct.clearPendingCloseOrderId('nope')).toBe(false);
+  });
+});
+
 describe('PaperOptionsAccount.addReconciledTradierPnl', () => {
   it('bumps the live-mode realized P&L bucket without touching demo', () => {
     const acct = new PaperOptionsAccount({ initialEquity: 25_000, tradierEnv: 'sandbox' });

@@ -3,6 +3,7 @@ import {
   type TradierOptionsClient,
   type TradierOrderDetail,
   TRADIER_REJECTED_STATUSES,
+  TRADIER_TERMINAL_STATUSES,
   roundToCent,
 } from '@trading-app/engine';
 
@@ -173,6 +174,90 @@ interface LastPath {
 
 interface NoPath {
   kind: 'none';
+}
+
+/**
+ * TRA-352 follow-up — outcome of {@link reconcilePendingCloseOrder}. Used by
+ * the engine's per-tick reconciler to resolve `pendingCloseOrderId` rows
+ * against the broker's actual terminal state:
+ *  - `filled` → broker filled the order; caller closes the local row at
+ *    `avgFillPrice` (paper bucket credited at the real fill, not the stale
+ *    mid we submitted at).
+ *  - `rejected` → broker drove the order to a terminal non-fill state
+ *    (cancel / reject / expire / error); caller clears
+ *    `pendingCloseOrderId` so the dashboard shows the row OPEN again and
+ *    the user can re-click Close.
+ *  - `pending` → still open / pending on Tradier; caller leaves the row as
+ *    "Pending #N".
+ *  - `unknown` → status lookup failed (transient HTTP / parse error or
+ *    Tradier dropped the order); caller leaves the row pending and tries
+ *    again on the next tick.
+ *
+ * This is the reconciliation layer that closes the loop the board flagged:
+ * the smart-close walk submits a limit, waits 10s, then returns `pending`
+ * if Tradier hasn't reached a terminal state yet. Without this reconciler,
+ * the local row sits "Pending #N" forever even after Tradier fills /
+ * cancels / expires the order, which is exactly the alignment problem in
+ * the board screenshots (TradeAI says Pending, Tradier says Filled or
+ * Cancelled). Engine ticks every 30s, so the staleness window shrinks
+ * from "until the user restarts the server" to <30s.
+ */
+export type ReconcileOutcome =
+  | { status: 'filled'; orderId: number | string; avgFillPrice: number; limitPrice?: number }
+  | { status: 'rejected'; orderId: number | string; reason: string }
+  | { status: 'pending'; orderId: number | string }
+  | { status: 'unknown'; orderId: number | string; reason: string };
+
+/**
+ * TRA-352 follow-up — look up a single Tradier close order by id and map its
+ * status into a {@link ReconcileOutcome}. The engine calls this every tick for
+ * each open row carrying a `pendingCloseOrderId`. Errors from the broker are
+ * swallowed into `unknown` (rather than thrown) so a transient 5xx on one
+ * row doesn't abort the reconciliation pass for the rest.
+ */
+export async function reconcilePendingCloseOrder(
+  client: Pick<TradierOptionsClient, 'getOrderStatus'>,
+  orderId: string | number,
+): Promise<ReconcileOutcome> {
+  let detail: TradierOrderDetail | null;
+  try {
+    detail = await client.getOrderStatus(orderId);
+  } catch (err: unknown) {
+    return {
+      status: 'unknown',
+      orderId,
+      reason: `getOrderStatus threw: ${err instanceof Error ? err.message : String(err)}`,
+    };
+  }
+  if (!detail) {
+    return { status: 'unknown', orderId, reason: 'Tradier returned no order envelope' };
+  }
+  const status = detail.status ?? '';
+  if (status === 'filled') {
+    const avgFill = typeof detail.avg_fill_price === 'number' && Number.isFinite(detail.avg_fill_price)
+      ? detail.avg_fill_price
+      : NaN;
+    if (!Number.isFinite(avgFill) || avgFill <= 0) {
+      // Tradier reported filled but no usable avg_fill_price. Treat as
+      // unknown so we retry next tick rather than closing locally at 0.
+      return { status: 'unknown', orderId, reason: 'filled but missing avg_fill_price' };
+    }
+    return { status: 'filled', orderId, avgFillPrice: avgFill };
+  }
+  if (TRADIER_REJECTED_STATUSES.has(status)) {
+    return {
+      status: 'rejected',
+      orderId,
+      reason: detail.reason_description?.trim() || status,
+    };
+  }
+  if (TRADIER_TERMINAL_STATUSES.has(status)) {
+    // Defensive — TRADIER_TERMINAL_STATUSES is filled + rejected family.
+    // Any other terminal state we haven't categorized: treat as rejected so
+    // the user can re-click Close instead of getting stuck.
+    return { status: 'rejected', orderId, reason: status };
+  }
+  return { status: 'pending', orderId };
 }
 
 /**

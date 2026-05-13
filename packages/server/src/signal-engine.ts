@@ -5,6 +5,7 @@ import type { TradeSignal, RelativeValueSignal, Candle, OptionsAccountState, Sig
 import { fetchMinuteBars, fetchQuotes, fetchStocksNews, isYahooBreakerOpen, setActiveInterestSymbols } from './yahoo-feed.js';
 import { PaperAccount } from './paper-account.js';
 import { PaperOptionsAccount } from './options-account.js';
+import { reconcilePendingCloseOrder } from './tradier-smart-close.js';
 import type { RelativeValueScannerService } from './relative-value-scanner.js';
 import type { DailySignalRecord } from './reports/eod-report.js';
 import type { PnlTracker } from './pnl-tracker.js';
@@ -195,6 +196,22 @@ export class SignalEngine {
    */
   private tradierLiveClient: TradierOptionsClient | null = null;
   /**
+   * TRA-352 follow-up — per-env Tradier options clients used by the pending-
+   * close reconciler. Built from saved settings whenever creds are present
+   * for that env (independent of `mode` and `liveTradierEnvOptions`), so the
+   * reconciler can resolve a sandbox pending close even while the user is
+   * viewing the production dashboard (and vice versa). Each row carries
+   * `tradierEnv` so we know which client to query — the active-env-only
+   * `tradierLiveClient` above is no longer enough once the user toggles
+   * between sandbox and production within the same session. Built /
+   * rebuilt by `applyTradierClientsByEnv` from `applySettings` and the
+   * constructor.
+   */
+  private tradierOptionsClientByEnv: Record<TradierEnv, TradierOptionsClient | null> = {
+    sandbox: null,
+    production: null,
+  };
+  /**
    * TRA-336 — whether Tradier Live is currently configured to route options
    * signals. Sourced from {@link isLiveTradierOptionsEnabled}. The Tradier
    * client itself is still built when creds are present (so balance refresh
@@ -305,6 +322,7 @@ export class SignalEngine {
       this.tradierLiveOptionsEnabled = isLiveTradierOptionsEnabled(settings);
       this.liveTradeEquitiesTradier = settings.liveTradeEquitiesTradier === true;
       this.tradierLiveEquityClient = buildTradierLiveEquityClient(settings);
+      this.tradierOptionsClientByEnv = buildTradierOptionsClientsByEnv(settings);
     }
   }
 
@@ -369,6 +387,10 @@ export class SignalEngine {
     // so toggling Live mode or editing the API token takes effect on the
     // next tick without requiring a server restart.
     this.tradierLiveClient = buildTradierLiveClient(settings);
+    // TRA-352 follow-up — same for the per-env clients used by the pending-
+    // close reconciler, so a fresh token saved mid-session is picked up on
+    // the next tick.
+    this.tradierOptionsClientByEnv = buildTradierOptionsClientsByEnv(settings);
     // TRA-336 — re-read the markets selector so flipping
     // Options/Equity/Both in Settings takes effect on the next tick.
     this.tradierLiveOptionsEnabled = isLiveTradierOptionsEnabled(settings);
@@ -639,6 +661,25 @@ export class SignalEngine {
     // tick only closes positions opened under the current mode (demo or
     // live), preventing the inactive bucket from being silently unwound when
     // the user switches modes.
+    // TRA-352 follow-up — reconcile any open row whose `sell_to_close`
+    // limit was still pending after the smart-close walk's 10s window.
+    // Runs BEFORE `checkExits` so a position that just got filled on
+    // Tradier doesn't bounce through a phantom auto-exit on the same tick.
+    // Errors are swallowed inside the reconciler so a single bad row
+    // can't take down the rest of the tick.
+    try {
+      const summary = await this.reconcilePendingCloses();
+      if (summary.filled + summary.cleared > 0) {
+        console.log(
+          `[tradier-reconcile] tick summary filled=${summary.filled} cleared=${summary.cleared} stillPending=${summary.stillPending} noClient=${summary.noClient}`,
+        );
+      }
+    } catch (err: unknown) {
+      console.warn(
+        '[tradier-reconcile] sweep threw:',
+        err instanceof Error ? err.message : String(err),
+      );
+    }
     const optionMarks = await this.refreshOptionMarks();
     // TRA-351 — push the freshly-fetched marks onto imported rows BEFORE
     // checkExits runs. checkExits skips imports (line 525 of options-account)
@@ -1399,6 +1440,106 @@ export class SignalEngine {
   }
 
   /**
+   * TRA-352 follow-up — drive every open row with a `pendingCloseOrderId`
+   * through one Tradier `getOrderStatus` lookup per tick and reconcile the
+   * local row to the broker's actual terminal state. This closes the
+   * alignment gap the board flagged in the May 12 comment: smart-close
+   * returns `pending` after a 10s walk, but the local row stays "Pending #N"
+   * forever even after Tradier eventually fills / cancels / expires the
+   * order. With the reconciler running every 30s tick the staleness window
+   * shrinks to <30s.
+   *
+   * Per-row outcomes:
+   *  - `filled` (avg_fill_price > 0) — engine-opened rows close via
+   *    `closeOption(id, avg)` (paper bucket credited at the broker fill);
+   *    imported rows close via `recordImportedFill(id, avg)` (no paper
+   *    cash touched — proceeds live on Tradier). Both record a closed-
+   *    options row so the dashboard's "Closed Today" reflects the real
+   *    realized P&L.
+   *  - terminal non-fill (`canceled` / `rejected` / `expired` / `error`)
+   *    — clear `pendingCloseOrderId` so the row re-renders the Close
+   *    button. The user can click Close again and the smart-close walk
+   *    will resubmit at the current mid.
+   *  - still pending / status fetch failed — no mutation; we try again
+   *    next tick.
+   *
+   * Iterates BOTH env buckets so a sandbox pending close still reconciles
+   * while the user is toggled into production (and vice versa); each
+   * position carries `tradierEnv` so we know which client to use. Returns
+   * a counter so the tick caller can decide whether to re-broadcast.
+   */
+  async reconcilePendingCloses(): Promise<{
+    filled: number;
+    cleared: number;
+    stillPending: number;
+    noClient: number;
+  }> {
+    let filled = 0;
+    let cleared = 0;
+    let stillPending = 0;
+    let noClient = 0;
+    for (const env of ['sandbox', 'production'] as const) {
+      const acct = this.optionsAccounts[env];
+      const pending = acct.listPendingCloses();
+      if (pending.length === 0) continue;
+      const client = this.tradierOptionsClientByEnv[env];
+      if (!client) {
+        // No creds saved for this env — leave the rows pending. They'll
+        // resolve once the user re-saves their token or restarts.
+        noClient += pending.length;
+        continue;
+      }
+      for (const row of pending) {
+        try {
+          const outcome = await reconcilePendingCloseOrder(client, row.pendingCloseOrderId);
+          if (outcome.status === 'filled') {
+            if (row.importedFromTradier) {
+              const closed = acct.recordImportedFill(row.optionId, outcome.avgFillPrice);
+              if (closed) {
+                filled += 1;
+                console.log(
+                  `[tradier-reconcile] sell_to_close ${row.optionSymbol} env=${env} imported order=${row.pendingCloseOrderId} filled@${outcome.avgFillPrice.toFixed(2)}`,
+                );
+              }
+            } else {
+              const closed = acct.closeOption(row.optionId, outcome.avgFillPrice);
+              if (closed) {
+                filled += 1;
+                console.log(
+                  `[tradier-reconcile] sell_to_close ${row.optionSymbol} env=${env} engine order=${row.pendingCloseOrderId} filled@${outcome.avgFillPrice.toFixed(2)}`,
+                );
+                this.tracker?.saveEquity(
+                  this.account.getState().totalEquity,
+                  this.optionsAccount.getState().optionsPnl,
+                );
+              }
+            }
+          } else if (outcome.status === 'rejected') {
+            if (acct.clearPendingCloseOrderId(row.optionId)) {
+              cleared += 1;
+              console.warn(
+                `[tradier-reconcile] sell_to_close ${row.optionSymbol} env=${env} order=${row.pendingCloseOrderId} terminal-no-fill (${outcome.reason}) — cleared pending so user can retry`,
+              );
+            }
+          } else {
+            // pending or unknown — still in flight, leave the row alone.
+            stillPending += 1;
+          }
+        } catch (err: unknown) {
+          // Defensive — reconcilePendingCloseOrder swallows its own errors,
+          // but if anything escapes we don't want one bad row to abort the
+          // sweep for the others.
+          console.warn(
+            `[tradier-reconcile] sell_to_close ${row.optionSymbol} env=${env} order=${row.pendingCloseOrderId} reconcile threw: ${err instanceof Error ? err.message : String(err)}`,
+          );
+          stillPending += 1;
+        }
+      }
+    }
+    return { filled, cleared, stillPending, noClient };
+  }
+
+  /**
    * TRA-348 — bump the live-mode options P&L bucket for a specific
    * Tradier env from reconciled broker history. Caller (EOD reconcile)
    * is responsible for dedup via the per-user cursor file.
@@ -1766,6 +1907,51 @@ function buildTradierLiveClient(settings: AccountSettings): TradierOptionsClient
   ).trim();
   if (!apiToken || !accountId) return null;
   return new TradierOptionsClient(apiToken, accountId, env);
+}
+
+/**
+ * TRA-352 follow-up — build a Tradier options client for a SPECIFIC env
+ * regardless of the user's current `liveTradierEnvOptions` selection. Used
+ * by the per-tick pending-close reconciler so a sandbox pending close can
+ * still be polled while the user toggles into production (and vice
+ * versa). Returns null when neither saved per-env creds nor env-var
+ * fallbacks are present for the requested env. Mirrors the credential
+ * precedence in {@link buildTradierLiveClient} so both code paths see the
+ * same auth.
+ */
+function buildTradierOptionsClientForEnv(
+  settings: AccountSettings,
+  env: TradierEnv,
+): TradierOptionsClient | null {
+  const apiToken = (
+    (env === 'production'
+      ? settings.liveApiKeyOptionsProduction
+      : (settings.liveApiKeyOptionsSandbox ?? settings.liveApiKeyOptions))
+    ?? (env === 'production'
+      ? process.env['TRADIER_API_TOKEN']
+      : (process.env['TRADIER_SANDBOX_API_TOKEN'] ?? process.env['TRADIER_API_TOKEN']))
+    ?? ''
+  ).trim();
+  const accountId = (
+    (env === 'production'
+      ? settings.liveAccountIdOptionsProduction
+      : (settings.liveAccountIdOptionsSandbox ?? settings.liveAccountIdOptions))
+    ?? (env === 'production'
+      ? process.env['TRADIER_ACCOUNT_ID']
+      : (process.env['TRADIER_SANDBOX_ACCOUNT_ID'] ?? process.env['TRADIER_ACCOUNT_ID']))
+    ?? ''
+  ).trim();
+  if (!apiToken || !accountId) return null;
+  return new TradierOptionsClient(apiToken, accountId, env);
+}
+
+function buildTradierOptionsClientsByEnv(
+  settings: AccountSettings,
+): Record<TradierEnv, TradierOptionsClient | null> {
+  return {
+    sandbox: buildTradierOptionsClientForEnv(settings, 'sandbox'),
+    production: buildTradierOptionsClientForEnv(settings, 'production'),
+  };
 }
 
 /**

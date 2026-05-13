@@ -1,5 +1,5 @@
 import { describe, it, expect, vi } from 'vitest';
-import { derivePricingPath, submitSmartSellToClose } from './tradier-smart-close.js';
+import { derivePricingPath, reconcilePendingCloseOrder, submitSmartSellToClose } from './tradier-smart-close.js';
 import type { TradierOptionQuote, TradierOptionsClient, TradierOrderDetail, TradierOrderResponse } from '@trading-app/engine';
 
 /**
@@ -206,5 +206,80 @@ describe('submitSmartSellToClose', () => {
 
     expect(outcome.status).toBe('filled');
     expect(sellSpy).toHaveBeenCalledWith('X', 1, 0.25);
+  });
+});
+
+/**
+ * TRA-352 follow-up — board flagged that "Pending #N" rows in TradeAI never
+ * sync with Tradier's actual terminal state. The reconciler closes that
+ * gap by polling each `pendingCloseOrderId` per tick. These tests cover
+ * every outcome the engine's tick handler branches on.
+ */
+describe('reconcilePendingCloseOrder', () => {
+  type ReconcileClient = Pick<TradierOptionsClient, 'getOrderStatus'>;
+  function buildStatusClient(detail: TradierOrderDetail | null): ReconcileClient {
+    return { getOrderStatus: vi.fn(async () => detail) };
+  }
+
+  it('reports filled with avg_fill_price when Tradier filled the order', async () => {
+    const client = buildStatusClient({
+      id: 42,
+      status: 'filled',
+      avg_fill_price: 0.09,
+    } as TradierOrderDetail);
+
+    const outcome = await reconcilePendingCloseOrder(client, 42);
+
+    expect(outcome).toEqual({ status: 'filled', orderId: 42, avgFillPrice: 0.09 });
+  });
+
+  it('reports rejected with the broker reason on canceled / rejected / expired / error', async () => {
+    for (const status of ['canceled', 'rejected', 'expired', 'error']) {
+      const client = buildStatusClient({
+        id: 1,
+        status,
+        reason_description: 'whatever Tradier said',
+      } as TradierOrderDetail);
+      const outcome = await reconcilePendingCloseOrder(client, 1);
+      expect(outcome.status).toBe('rejected');
+      expect((outcome as { reason: string }).reason).toBe('whatever Tradier said');
+    }
+  });
+
+  it('falls back to the raw status string when Tradier omits reason_description', async () => {
+    const client = buildStatusClient({ id: 2, status: 'expired' } as TradierOrderDetail);
+    const outcome = await reconcilePendingCloseOrder(client, 2);
+    expect(outcome).toEqual({ status: 'rejected', orderId: 2, reason: 'expired' });
+  });
+
+  it('reports pending when Tradier still shows the order as open / pending', async () => {
+    for (const status of ['open', 'pending', 'partially_filled']) {
+      const client = buildStatusClient({ id: 3, status } as TradierOrderDetail);
+      const outcome = await reconcilePendingCloseOrder(client, 3);
+      expect(outcome.status).toBe('pending');
+    }
+  });
+
+  it('reports unknown when getOrderStatus throws (so the caller retries next tick)', async () => {
+    const client: ReconcileClient = {
+      getOrderStatus: vi.fn(async () => {
+        throw new Error('socket reset');
+      }),
+    };
+    const outcome = await reconcilePendingCloseOrder(client, 4);
+    expect(outcome.status).toBe('unknown');
+    expect((outcome as { reason: string }).reason).toContain('socket reset');
+  });
+
+  it('reports unknown when getOrderStatus returns null (broker dropped the order envelope)', async () => {
+    const client = buildStatusClient(null);
+    const outcome = await reconcilePendingCloseOrder(client, 5);
+    expect(outcome.status).toBe('unknown');
+  });
+
+  it('treats filled-without-avg_fill_price as unknown so we retry instead of closing at $0', async () => {
+    const client = buildStatusClient({ id: 6, status: 'filled' } as TradierOrderDetail);
+    const outcome = await reconcilePendingCloseOrder(client, 6);
+    expect(outcome.status).toBe('unknown');
   });
 });

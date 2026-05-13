@@ -820,6 +820,55 @@ export class PaperOptionsAccount {
   }
 
   /**
+   * TRA-352 follow-up — clear the in-flight close-order marker so the
+   * dashboard re-renders the Close button. Called by the engine's per-tick
+   * reconciler when Tradier terminated the order without a fill (cancel /
+   * reject / expire / error). Returns true when a row was actually mutated
+   * — callers use this to gate the "broadcast state" + log lines.
+   */
+  clearPendingCloseOrderId(optionId: string): boolean {
+    const opt = this.openOptions.get(optionId);
+    if (!opt) return false;
+    if (opt.pendingCloseOrderId === undefined) return false;
+    delete opt.pendingCloseOrderId;
+    return true;
+  }
+
+  /**
+   * TRA-352 follow-up — snapshot every open row currently waiting on a
+   * Tradier `sell_to_close`. Used by the engine's per-tick reconciler to
+   * iterate pending closes without exposing the raw Map; returns shallow
+   * copies so the caller can't mutate internal state by accident. We
+   * include `importedFromTradier` so the reconciler knows whether a fill
+   * routes through `recordImportedFill` (no paper cash) vs `closeOption`
+   * (paper bucket credited).
+   */
+  listPendingCloses(): Array<{
+    optionId: string;
+    optionSymbol: string;
+    pendingCloseOrderId: number | string;
+    importedFromTradier: boolean;
+  }> {
+    const out: Array<{
+      optionId: string;
+      optionSymbol: string;
+      pendingCloseOrderId: number | string;
+      importedFromTradier: boolean;
+    }> = [];
+    for (const opt of this.openOptions.values()) {
+      if (opt.pendingCloseOrderId === undefined) continue;
+      if (!opt.optionSymbol) continue;
+      out.push({
+        optionId: opt.id,
+        optionSymbol: opt.optionSymbol,
+        pendingCloseOrderId: opt.pendingCloseOrderId,
+        importedFromTradier: opt.importedFromTradier === true,
+      });
+    }
+    return out;
+  }
+
+  /**
    * Close an engine-opened paper option position. The local mark is used as
    * the close price unless `overrideFillPrice` is provided — see
    * {@link closeOption} for the optional argument's rationale (TRA-352).

@@ -1040,6 +1040,212 @@ describe('buildTradierLiveEquityClient gating (TRA-335)', () => {
   });
 });
 
+// TRA-352 follow-up — end-to-end test of the pending-close reconciler the
+// board asked us to add. Drives the engine's `reconcilePendingCloses` against
+// stub Tradier clients for each env and asserts that the matching open row
+// is filled / cleared / left pending based on the broker's status.
+describe('SignalEngine — TRA-352 pending-close reconciler', () => {
+  interface OrderStatusStub {
+    getOrderStatus: ReturnType<typeof vi.fn>;
+  }
+  interface OptionsAcctStub {
+    openOptionFromCandidate(sig: unknown, mode: 'live'): { id: string } | null;
+    setPendingCloseOrderId(id: string, orderId: number): boolean;
+    getState(): {
+      openOptions: Array<{ id: string; pendingCloseOrderId?: number | string }>;
+      closedOptions: Array<{ id: string; currentPremium: number; pnl?: number }>;
+    };
+  }
+  type EngineInternals = {
+    tradierOptionsClientByEnv: Record<TradierEnv, unknown>;
+    optionsAccounts: Record<TradierEnv, OptionsAcctStub>;
+  };
+
+  function asInternals(engine: SignalEngine): EngineInternals {
+    return engine as unknown as EngineInternals;
+  }
+
+  function setupEngine(stubs: { sandbox?: OrderStatusStub; production?: OrderStatusStub }) {
+    const engine = new SignalEngine();
+    asInternals(engine).tradierOptionsClientByEnv = {
+      sandbox: stubs.sandbox ?? null,
+      production: stubs.production ?? null,
+    };
+    return engine;
+  }
+
+  function openLiveEngineRow(
+    engine: SignalEngine,
+    env: TradierEnv,
+    overrides: { symbol?: string; optionSymbol?: string } = {},
+  ): { optionId: string; orderId: number } {
+    const acct = asInternals(engine).optionsAccounts[env];
+    const opened = acct.openOptionFromCandidate(
+      {
+        id: 'sig',
+        symbol: overrides.symbol ?? 'AAPL',
+        type: 'otm_mispricing',
+        side: 'buy',
+        entryPrice: 1.0,
+        stopLoss: 0.75,
+        takeProfit: 1.5,
+        riskRewardRatio: 2,
+        timestamp: TRADING_TIME,
+        optionSymbol: overrides.optionSymbol ?? 'AAPL240705C00200000',
+        optionType: 'call',
+        strike: 200,
+        expiration: '2024-07-05',
+        mark: 1.0,
+        theo: 1.3,
+        mispricingPct: -0.23,
+        delta: 0.18,
+      },
+      'live',
+    );
+    if (!opened) throw new Error('test setup: failed to open option');
+    const orderId = Math.floor(Math.random() * 1_000_000) + 1;
+    acct.setPendingCloseOrderId(opened.id, orderId);
+    return { optionId: opened.id, orderId };
+  }
+
+  it('closes the engine-opened local row at the broker avg_fill_price when Tradier reports filled', async () => {
+    const stub: OrderStatusStub = {
+      getOrderStatus: vi.fn(async () => ({ id: 1, status: 'filled', avg_fill_price: 1.45 })),
+    };
+    const engine = setupEngine({ sandbox: stub });
+    const { optionId } = openLiveEngineRow(engine, 'sandbox');
+
+    const summary = await engine.reconcilePendingCloses();
+
+    expect(summary.filled).toBe(1);
+    expect(summary.cleared).toBe(0);
+    // Read directly off the per-env account so the live-vs-demo getState mode
+    // scoping doesn't hide the closed row. We're testing the reconciler's
+    // mutation, not the public dashboard mask.
+    const sandboxState = asInternals(engine).optionsAccounts.sandbox.getState();
+    expect(sandboxState.openOptions.find(o => o.id === optionId)).toBeUndefined();
+    const closed = sandboxState.closedOptions.find(o => o.id === optionId);
+    expect(closed).toBeDefined();
+    // Closed at the broker avg fill price, NOT the local mark.
+    expect(closed?.currentPremium).toBeCloseTo(1.45, 5);
+  });
+
+  it('clears pendingCloseOrderId on a terminal non-fill so the user can re-click Close', async () => {
+    const stub: OrderStatusStub = {
+      getOrderStatus: vi.fn(async () => ({
+        id: 1,
+        status: 'canceled',
+        reason_description: 'user cancelled on Tradier',
+      })),
+    };
+    const engine = setupEngine({ sandbox: stub });
+    const { optionId } = openLiveEngineRow(engine, 'sandbox');
+
+    const summary = await engine.reconcilePendingCloses();
+
+    expect(summary.cleared).toBe(1);
+    expect(summary.filled).toBe(0);
+    const stillOpen = asInternals(engine).optionsAccounts.sandbox
+      .getState()
+      .openOptions.find(o => o.id === optionId);
+    expect(stillOpen).toBeDefined();
+    expect(stillOpen?.pendingCloseOrderId).toBeUndefined();
+  });
+
+  it('leaves rows pending when the broker still reports open / pending', async () => {
+    const stub: OrderStatusStub = {
+      getOrderStatus: vi.fn(async () => ({ id: 1, status: 'open' })),
+    };
+    const engine = setupEngine({ sandbox: stub });
+    const { optionId, orderId } = openLiveEngineRow(engine, 'sandbox');
+
+    const summary = await engine.reconcilePendingCloses();
+
+    expect(summary.stillPending).toBe(1);
+    const stillOpen = asInternals(engine).optionsAccounts.sandbox
+      .getState()
+      .openOptions.find(o => o.id === optionId);
+    // pendingCloseOrderId survives so the dashboard still shows "Pending #N".
+    expect(stillOpen?.pendingCloseOrderId).toBe(orderId);
+  });
+
+  it('skips reconciliation for an env that has no Tradier client configured', async () => {
+    const sandboxStub: OrderStatusStub = {
+      getOrderStatus: vi.fn(async () => ({ id: 1, status: 'filled', avg_fill_price: 1.20 })),
+    };
+    // No production client — only sandbox creds saved.
+    const engine = setupEngine({ sandbox: sandboxStub });
+    const { optionId: sandboxId } = openLiveEngineRow(engine, 'sandbox');
+    const { optionId: prodId } = openLiveEngineRow(engine, 'production', {
+      optionSymbol: 'MSFT240705C00400000',
+    });
+
+    const summary = await engine.reconcilePendingCloses();
+
+    expect(summary.filled).toBe(1);
+    expect(summary.noClient).toBe(1);
+    const states = asInternals(engine).optionsAccounts;
+    // Sandbox row filled, production row still pending until creds are saved.
+    expect(states.sandbox.getState().openOptions.find(o => o.id === sandboxId)).toBeUndefined();
+    const prodRow = states.production.getState().openOptions.find(o => o.id === prodId);
+    expect(prodRow?.pendingCloseOrderId).toBeDefined();
+  });
+
+  it('reconciles BOTH envs in a single sweep so cross-env pending closes resolve together', async () => {
+    const sandboxStub: OrderStatusStub = {
+      getOrderStatus: vi.fn(async () => ({ id: 1, status: 'filled', avg_fill_price: 1.30 })),
+    };
+    const prodStub: OrderStatusStub = {
+      getOrderStatus: vi.fn(async () => ({
+        id: 2,
+        status: 'expired',
+        reason_description: 'EOD expiration',
+      })),
+    };
+    const engine = setupEngine({ sandbox: sandboxStub, production: prodStub });
+    const { optionId: sandboxId } = openLiveEngineRow(engine, 'sandbox');
+    const { optionId: prodId } = openLiveEngineRow(engine, 'production', {
+      optionSymbol: 'MSFT240705C00400000',
+    });
+
+    const summary = await engine.reconcilePendingCloses();
+
+    expect(summary.filled).toBe(1);
+    expect(summary.cleared).toBe(1);
+    // Sandbox closed via fill, production re-opened with cleared pending tag.
+    const states = asInternals(engine).optionsAccounts;
+    expect(states.sandbox.getState().openOptions.find(o => o.id === sandboxId)).toBeUndefined();
+    const prodRow = states.production.getState().openOptions.find(o => o.id === prodId);
+    expect(prodRow).toBeDefined();
+    expect(prodRow?.pendingCloseOrderId).toBeUndefined();
+  });
+
+  it('survives a getOrderStatus throw without aborting the rest of the sweep', async () => {
+    const sandboxStub: OrderStatusStub = {
+      // Throws on first call, succeeds on second — the helper swallows the
+      // throw into an `unknown` outcome so the second row still reconciles.
+      getOrderStatus: vi
+        .fn()
+        .mockRejectedValueOnce(new Error('socket reset'))
+        .mockResolvedValueOnce({ id: 99, status: 'filled', avg_fill_price: 1.10 }),
+    };
+    const engine = setupEngine({ sandbox: sandboxStub });
+    openLiveEngineRow(engine, 'sandbox');
+    const { optionId: secondId } = openLiveEngineRow(engine, 'sandbox', {
+      optionSymbol: 'AAPL240705C00250000',
+    });
+
+    const summary = await engine.reconcilePendingCloses();
+
+    // First row: unknown → stillPending. Second row: filled.
+    expect(summary.filled).toBe(1);
+    expect(summary.stillPending).toBe(1);
+    expect(
+      asInternals(engine).optionsAccounts.sandbox.getState().openOptions.find(o => o.id === secondId),
+    ).toBeUndefined();
+  });
+});
+
 // TRA-349 — regression-lock the (mode × dashboard) sub-account wiring shipped
 // in TRA-346. SignalEngine owns three stocks-side sub-accounts plus an
 // engine-level pair of fields:
