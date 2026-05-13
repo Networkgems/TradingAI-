@@ -622,6 +622,40 @@ describe('SignalEngine — TRA-332 live sizing uses real Tradier equity', () => 
     expect(state.signals[0].liveSkipReason).toBeUndefined();
   });
 
+  it('falls back to paper equity when tradierLiveOptionsEnabled is false (TRA-357 defense-in-depth gate)', async () => {
+    // Equity-only mode (liveTradierMarkets: 'equity'). The scan-level skip at
+    // line ~887 normally prevents the RV path from running; this test pokes
+    // `runRelativeValueScan` directly to lock in that the sizing path also
+    // ignores the live balance when options routing is disabled. Without the
+    // gate the engine would surface a budget-too-small skip for a $300
+    // balance even though the user opted out of options routing entirely.
+    const stub: TradierLiveStub = {
+      getAccountBalance: vi.fn(),
+      buyContracts: vi.fn(),
+      waitForOrderTerminalStatus: vi.fn(),
+    };
+    const engine = setupLiveEngine(stub, freshScanner(1.0));
+    (engine as unknown as { tradierLiveOptionsEnabled: boolean }).tradierLiveOptionsEnabled = false;
+    // Tiny live balance that WOULD trip the live-budget skip if honored.
+    // With the gate, sizing falls back to the $25 K paper equity instead.
+    (engine as unknown as { liveTradierBalance: { totalEquity: number; totalCash: number; optionBuyingPower: number } | null }).liveTradierBalance = {
+      totalEquity: 300, totalCash: 300, optionBuyingPower: 300,
+    };
+
+    await (engine as unknown as { runRelativeValueScan: (s: string[]) => Promise<void> }).runRelativeValueScan(['AAPL']);
+
+    // Paper equity sizing produces contracts (25000 * 0.5 * 0.03 = $375 budget
+    // → 3 contracts at $100 each). No live-budget skip surfaces. The buy
+    // mirror is also gated on `tradierLiveOptionsEnabled` (TRA-355) so the
+    // broker call never fires.
+    expect(stub.buyContracts).not.toHaveBeenCalled();
+    const state = engine.getState();
+    expect(state.options.openOptions).toHaveLength(1);
+    expect(state.options.openOptions[0].contracts).toBe(3);
+    expect(state.signals).toHaveLength(1);
+    expect(state.signals[0].liveSkipReason).toBeUndefined();
+  });
+
   it('falls back to optionBuyingPower over totalEquity when both are present (cash account semantics)', async () => {
     const stub: TradierLiveStub = {
       getAccountBalance: vi.fn(),

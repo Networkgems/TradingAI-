@@ -1161,9 +1161,15 @@ export class SignalEngine {
         // tightest constraint) and fall back to `totalEquity` when the
         // payload omits it (cash accounts don't carry option_buying_power
         // explicitly). If we don't have a balance snapshot at all we skip
-        // the override and let the previous behaviour stand.
+        // the override and let the previous behaviour stand (paper equity
+        // sizing inside `openOptionFromRvCandidate`).
+        // TRA-357 — defense-in-depth: also require `tradierLiveOptionsEnabled`
+        // so live-equity-only mode (`liveTradierMarkets: 'equity'`) keeps
+        // paper-equity sizing for any RV path that bypasses the scan-level
+        // skip at line ~887. Matches the gate TRA-355 applies to the
+        // `buy_to_open` mirror below.
         let liveEquity: number | undefined;
-        if (this.mode === 'live' && this.liveTradierBalance) {
+        if (this.mode === 'live' && this.tradierLiveOptionsEnabled && this.liveTradierBalance) {
           const obp = this.liveTradierBalance.optionBuyingPower;
           const total = this.liveTradierBalance.totalEquity;
           liveEquity = typeof obp === 'number' && Number.isFinite(obp)
