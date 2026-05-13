@@ -1204,7 +1204,19 @@ export class SignalEngine {
         // reach a terminal state, and (c) void the paper position when
         // Tradier rejects/cancels/expires the order so the dashboard never
         // shows an "open" trade that doesn't exist on the broker.
-        if (this.mode === 'live' && this.tradierLiveClient && opened.optionSymbol && opened.contracts > 0) {
+        // TRA-355 — defense-in-depth check on `tradierLiveOptionsEnabled`
+        // so a user on `liveTradierMarkets: 'equity'` never has `buy_to_open`
+        // hit Tradier even if the scan-level skip at line ~887 is ever
+        // bypassed by a future refactor. The client itself stays built when
+        // creds are present (TRA-332 balance refresh depends on it); only
+        // this entry mirror is gated by the flag.
+        if (
+          this.mode === 'live'
+          && this.tradierLiveOptionsEnabled
+          && this.tradierLiveClient
+          && opened.optionSymbol
+          && opened.contracts > 0
+        ) {
           const notionalCost = opened.premiumPaid * opened.contracts * 100;
           // TRA-332 — also surface the void reason on the dashboard so the
           // user sees why no trade opened, not just a silent log line.
