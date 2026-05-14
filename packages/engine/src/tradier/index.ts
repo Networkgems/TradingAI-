@@ -16,6 +16,7 @@ export {
   parseOccSymbol,
   parseTradierPositions,
   parseTradierHistory,
+  parseTradierCashEvents,
   roundToCent,
 } from './options-client.js';
 export type {
@@ -24,6 +25,7 @@ export type {
   TradierAccountBalance,
   TradierOpenOptionPosition,
   TradierTradeHistoryFill,
+  TradierCashEvent,
 } from './options-client.js';
 export { TradierStocksClient } from './stocks-client.js';
 export type { TradierEquityQuote } from './stocks-client.js';

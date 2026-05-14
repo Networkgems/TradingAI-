@@ -6,6 +6,7 @@ import {
   parseOccSymbol,
   parseTradierPositions,
   parseTradierHistory,
+  parseTradierCashEvents,
 } from './options-client.js';
 
 let fetchMock: ReturnType<typeof vi.fn>;
@@ -898,5 +899,157 @@ describe('TradierOptionsClient.listAccountHistory', () => {
     fetchMock.mockResolvedValueOnce(textResponse('boom', 500));
     const client = new TradierOptionsClient('tok', 'A1');
     expect(await client.listAccountHistory({ start: '2026-05-01', end: '2026-05-08' })).toEqual([]);
+  });
+});
+
+// ─── TRA-359: parseTradierCashEvents + listAccountCashEvents ────────────────
+
+describe('parseTradierCashEvents (TRA-359)', () => {
+  it('parses an ACH deposit event', () => {
+    const out = parseTradierCashEvents({
+      history: {
+        event: {
+          date: '2026-05-07T13:30:00.000Z',
+          amount: 500,
+          type: 'ach',
+          id: 'ach-42',
+        },
+      },
+    });
+    expect(out).toHaveLength(1);
+    expect(out[0]).toEqual({
+      date: '2026-05-07',
+      type: 'ach',
+      amount: 500,
+      transactionId: 'ach-42',
+    });
+  });
+
+  it('handles an array of mixed cash event types', () => {
+    const out = parseTradierCashEvents({
+      history: {
+        event: [
+          { date: '2026-05-01', type: 'ach', amount: 300, id: 'dep-1' },
+          { date: '2026-05-07', type: 'WIRE', amount: 500, id: 'wire-1' },
+          { date: '2026-05-10', type: 'dividend', amount: 1.23, id: 'div-1' },
+          { date: '2026-05-11', type: 'fee', amount: -2.5, id: 'fee-1' },
+          { date: '2026-05-12', type: 'withdrawal', amount: -100, id: 'wd-1' },
+        ],
+      },
+    });
+    expect(out).toHaveLength(5);
+    expect(out.map(e => e.type)).toEqual(['ach', 'wire', 'dividend', 'fee', 'withdrawal']);
+    expect(out[3].amount).toBe(-2.5);
+  });
+
+  it('drops trade events — those flow through parseTradierHistory', () => {
+    const out = parseTradierCashEvents({
+      history: {
+        event: [
+          {
+            date: '2026-05-08',
+            type: 'trade',
+            amount: 370,
+            trade: {
+              description: 'Sell to Close 2 SPY ...',
+              price: 1.85,
+              quantity: 2,
+              symbol: 'SPY260515C00450000',
+              trade_type: 'option',
+            },
+          },
+          { date: '2026-05-07', type: 'ach', amount: 500, id: 'dep-1' },
+        ],
+      },
+    });
+    expect(out).toHaveLength(1);
+    expect(out[0].type).toBe('ach');
+  });
+
+  it('synthesizes a transactionId when Tradier omits id', () => {
+    const out = parseTradierCashEvents({
+      history: {
+        event: {
+          date: '2026-05-07',
+          type: 'ach',
+          amount: 500,
+        },
+      },
+    });
+    expect(out).toHaveLength(1);
+    expect(out[0].transactionId).toContain('2026-05-07');
+    expect(out[0].transactionId).toContain('ach');
+    expect(out[0].transactionId).toContain('500');
+  });
+
+  it('drops events with non-finite amount', () => {
+    const out = parseTradierCashEvents({
+      history: {
+        event: [
+          { date: '2026-05-07', type: 'ach', amount: 'oops' as unknown as number, id: 'bad-1' },
+          { date: '2026-05-07', type: 'ach', amount: Number.NaN, id: 'bad-2' },
+          { date: '2026-05-07', type: 'ach', amount: 100, id: 'good' },
+        ],
+      },
+    });
+    expect(out).toHaveLength(1);
+    expect(out[0].transactionId).toBe('good');
+  });
+
+  it('returns [] when history is null / empty', () => {
+    expect(parseTradierCashEvents({ history: 'null' })).toEqual([]);
+    expect(parseTradierCashEvents({ history: null })).toEqual([]);
+    expect(parseTradierCashEvents(null)).toEqual([]);
+  });
+});
+
+describe('TradierOptionsClient.listAccountCashEvents (TRA-359)', () => {
+  it('hits /accounts/{id}/history without a type filter so all event kinds come through', async () => {
+    fetchMock.mockResolvedValueOnce(
+      jsonResponse({
+        history: {
+          event: [
+            { date: '2026-05-07', type: 'ach', amount: 500, id: 'dep-1' },
+            {
+              date: '2026-05-08',
+              type: 'trade',
+              amount: 370,
+              trade: {
+                description: 'Sell to Close 2 SPY ...',
+                price: 1.85,
+                quantity: 2,
+                symbol: 'SPY260515C00450000',
+                trade_type: 'option',
+              },
+            },
+          ],
+        },
+      }),
+    );
+    const client = new TradierOptionsClient('tok', 'ACCT9', 'production');
+    const events = await client.listAccountCashEvents({
+      start: '2026-05-01',
+      end: '2026-05-14',
+      limit: 500,
+    });
+    expect(events).toHaveLength(1);
+    expect(events[0]).toEqual({
+      date: '2026-05-07',
+      type: 'ach',
+      amount: 500,
+      transactionId: 'dep-1',
+    });
+    const url = callUrl(0);
+    expect(url).toContain('https://api.tradier.com/v1/accounts/ACCT9/history');
+    expect(url).toContain('start=2026-05-01');
+    expect(url).toContain('end=2026-05-14');
+    expect(url).toContain('limit=500');
+    expect(url).not.toContain('type=');
+  });
+
+  it('returns [] on a non-2xx response', async () => {
+    fetchMock.mockResolvedValueOnce(textResponse('boom', 500));
+    const client = new TradierOptionsClient('tok', 'A1');
+    expect(await client.listAccountCashEvents({ start: '2026-05-01', end: '2026-05-08' })).toEqual([]);
   });
 });

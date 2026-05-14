@@ -8,7 +8,12 @@ import { fileURLToPath } from 'url';
 import { MarketScheduler, isMarketDay } from './scheduler.js';
 import { generateEodReport } from './reports/eod-report.js';
 import { generateCryptoEodReport } from './reports/crypto-eod-report.js';
-import { aggregateRealizedOptionsPnl } from './reports/tradier-reconcile.js';
+import {
+  aggregateCashFlowByDate,
+  aggregateRealizedOptionsPnl,
+  computeBalanceDailyPnl,
+  findPreviousBalanceSnapshot,
+} from './reports/tradier-reconcile.js';
 import { createToken, verifyToken, generateResetToken, consumeResetToken, initResetTokenStore } from './auth.js';
 import { getSettings, mergeScopedRiskSettings, saveSettings } from './account-settings.js';
 import {
@@ -264,7 +269,32 @@ async function generateAndSaveReport(ctx: UserContext): Promise<void> {
   // reflects any Tradier-side closes we just merged (the dashboard pill
   // reads the same aggregate).
   const finalSnapshot = ctx.engine.getReportSnapshot();
-  const finalReport = generateEodReport(finalSnapshot);
+  let finalReport = generateEodReport(finalSnapshot);
+
+  // TRA-359 — in live mode, override the report's `combinedPnl` with the
+  // Tradier-truth daily delta (today.balance − prev.balance − netCashFlow)
+  // so the Live calendar mirrors what the user sees on the broker. The
+  // engine view of realized / unrealized / options is left intact for
+  // diagnostic context — a markdown header documents the override.
+  if (settings.mode === 'live') {
+    try {
+      const todayBalance = finalSnapshot.state.account.totalEquity;
+      const override = await reconcileTradierLiveCalendar(
+        ctx,
+        settings,
+        mode,
+        todayBalance,
+        finalReport.date,
+      );
+      if (override) {
+        finalReport = applyTradierBalanceOverride(finalReport, override, todayBalance);
+      }
+    } catch (err) {
+      console.warn(
+        `[tradier-live-calendar:${ctx.username}] override failed: ${err instanceof Error ? err.message : String(err)}`,
+      );
+    }
+  }
 
   const datePath = join(targetDir, `${finalReport.date}.json`);
   const mdPath = join(targetDir, `${finalReport.date}.md`);
@@ -428,6 +458,219 @@ async function saveTradierDailyTotals(
   totals: Record<string, number>,
 ): Promise<void> {
   await writeFile(tradierDailyTotalsPath(ctx, env), JSON.stringify(totals, null, 2), 'utf-8');
+}
+
+// ── TRA-359: Live calendar broker-truth reconcile ────────────────────────────
+//
+// The Live P&L calendar was historically computed from local engine state:
+// engine-tracked closed positions, paper-options P&L bucket, and reconciled
+// Tradier closes via `aggregateRealizedOptionsPnl`. For accounts with
+// imported positions whose opens lived outside the reconcile lookback
+// window, every Sell-to-Close booked gross proceeds as P&L (the open-cost
+// fallback in `aggregateRealizedOptionsPnl` is structurally wrong for that
+// case). The result: a Live calendar showing $200+ in green days while the
+// real Tradier balance was deep in the red.
+//
+// The reconcile path below sources daily P&L from the broker truth instead:
+//
+//   1. Snapshot Tradier `totalEquity` per env at EOD into
+//      `tradier-eod-balance.{env}.json`.
+//   2. Capture non-trade events (ACH / wire / journal / deposit /
+//      withdrawal / dividend / interest / fee / adjustment) from
+//      `/accounts/{id}/history` per day into `tradier-cash-flow.{env}.json`
+//      so deposits aren't booked as P&L.
+//   3. In `generateAndSaveReport` for live mode, override `combinedPnl
+//      = today.totalEquity − prev.totalEquity − today.netCashFlow`.
+//
+// Demo / sandbox paths continue to use the engine-computed P&L.
+
+const TRADIER_CASH_FLOW_LOOKBACK_DAYS = 14;
+
+interface TradierCashFlowState {
+  /** Per-day signed net cash flow (deposits − withdrawals + dividends − fees). */
+  netByDate: Record<string, number>;
+  /** Dedup cursor — Tradier transaction ids already merged into `netByDate`. */
+  seenIds: string[];
+}
+
+function tradierBalancePath(ctx: UserContext, env: TradierEnv): string {
+  return join(ctx.dataDir, `tradier-eod-balance.${env}.json`);
+}
+
+function tradierCashFlowPath(ctx: UserContext, env: TradierEnv): string {
+  return join(ctx.dataDir, `tradier-cash-flow.${env}.json`);
+}
+
+async function loadTradierBalanceSnapshots(
+  ctx: UserContext,
+  env: TradierEnv,
+): Promise<Record<string, number>> {
+  const path = tradierBalancePath(ctx, env);
+  if (!existsSync(path)) return {};
+  try {
+    const raw = await readFile(path, 'utf-8');
+    const parsed = JSON.parse(raw) as Record<string, unknown>;
+    const out: Record<string, number> = {};
+    for (const [k, v] of Object.entries(parsed)) {
+      if (typeof v === 'number' && Number.isFinite(v)) out[k] = v;
+    }
+    return out;
+  } catch {
+    return {};
+  }
+}
+
+async function saveTradierBalanceSnapshots(
+  ctx: UserContext,
+  env: TradierEnv,
+  snapshots: Record<string, number>,
+): Promise<void> {
+  await writeFile(tradierBalancePath(ctx, env), JSON.stringify(snapshots, null, 2), 'utf-8');
+}
+
+async function loadTradierCashFlow(
+  ctx: UserContext,
+  env: TradierEnv,
+): Promise<TradierCashFlowState> {
+  const path = tradierCashFlowPath(ctx, env);
+  if (!existsSync(path)) return { netByDate: {}, seenIds: [] };
+  try {
+    const raw = await readFile(path, 'utf-8');
+    const parsed = JSON.parse(raw) as Partial<TradierCashFlowState>;
+    const netByDate: Record<string, number> = {};
+    if (parsed.netByDate && typeof parsed.netByDate === 'object') {
+      for (const [k, v] of Object.entries(parsed.netByDate as Record<string, unknown>)) {
+        if (typeof v === 'number' && Number.isFinite(v)) netByDate[k] = v;
+      }
+    }
+    const seenIds = Array.isArray(parsed.seenIds)
+      ? parsed.seenIds.filter((s): s is string => typeof s === 'string')
+      : [];
+    return { netByDate, seenIds };
+  } catch {
+    return { netByDate: {}, seenIds: [] };
+  }
+}
+
+async function saveTradierCashFlow(
+  ctx: UserContext,
+  env: TradierEnv,
+  state: TradierCashFlowState,
+): Promise<void> {
+  await writeFile(tradierCashFlowPath(ctx, env), JSON.stringify(state, null, 2), 'utf-8');
+}
+
+/**
+ * TRA-359 — patch a generated `EodReport` so its `combinedPnl` reflects
+ * the Tradier-truth daily delta instead of the engine-imagined value.
+ * Adds a markdown header that documents the override so the report
+ * detail view doesn't surprise a reader who sees `combinedPnl` not
+ * matching the per-component breakdown.
+ *
+ * The engine-side breakdown fields (`realizedPnl`, `unrealizedPnl`,
+ * `optionsPnl`, `totalPnl`) are kept as-is — they're still useful for
+ * diagnostic context (was the day's miss driven by stock MTM or option
+ * closes?). The calendar UI reads only `combinedPnl`, so overriding
+ * that single field is enough to fix the bug.
+ */
+function applyTradierBalanceOverride(
+  report: ReturnType<typeof generateEodReport>,
+  override: { combinedPnl: number; prevDate: string; prevBalance: number; netCashFlow: number },
+  todayBalance: number,
+): ReturnType<typeof generateEodReport> {
+  const sign = (n: number) => (n >= 0 ? '+' : '') + n.toFixed(2);
+  const usd = (n: number) => '$' + Math.abs(n).toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+  const header = `> **Live P&L source: Tradier broker balance (TRA-359).** Combined P&L for ${report.date} = today's Tradier equity (${usd(todayBalance)}) − prev snapshot ${override.prevDate} (${usd(override.prevBalance)}) − net cash flow (${sign(override.netCashFlow)}) = **${sign(override.combinedPnl)}**. Engine-side realized / unrealized / options breakdown below is informational; the calendar uses the broker-truth value.`;
+  return {
+    ...report,
+    combinedPnl: override.combinedPnl,
+    totalEquity: todayBalance,
+    markdown: `${header}\n\n${report.markdown}`,
+  };
+}
+
+/**
+ * TRA-359 — pull recent Tradier cash events into the per-user / per-env
+ * cash flow cursor + persist today's `totalEquity` snapshot. Returns
+ * the override `combinedPnl` (broker-truth daily P&L) and metadata for
+ * the report markdown, or `null` when we don't have enough data yet to
+ * compute a meaningful daily delta (no Tradier creds, no prior balance
+ * snapshot, etc.). On error the caller should fall back to the
+ * engine-computed P&L rather than block the report write.
+ */
+async function reconcileTradierLiveCalendar(
+  ctx: UserContext,
+  settings: AccountSettings,
+  mode: StockModeKey,
+  todayBalance: number | null,
+  reportDate: string,
+): Promise<{
+  combinedPnl: number;
+  prevDate: string;
+  prevBalance: number;
+  netCashFlow: number;
+} | null> {
+  if (mode === 'demo') return null;
+  if (typeof todayBalance !== 'number' || !Number.isFinite(todayBalance) || todayBalance <= 0) {
+    return null;
+  }
+  const env: TradierEnv = mode === 'live' ? 'production' : 'sandbox';
+  const client = buildTradierOptionsClientForEnv(settings, env);
+
+  // Merge any new non-trade events into the cash-flow cursor. Failure here
+  // is non-fatal — we just won't subtract today's deposit and the user
+  // sees a one-day blip, which is still less wrong than the old behaviour.
+  const cashFlowState = await loadTradierCashFlow(ctx, env);
+  if (client) {
+    try {
+      const today = new Date();
+      const end = today.toISOString().slice(0, 10);
+      const startMs = today.getTime() - TRADIER_CASH_FLOW_LOOKBACK_DAYS * 24 * 60 * 60 * 1000;
+      const start = new Date(startMs).toISOString().slice(0, 10);
+      const cashEvents = await client.listAccountCashEvents({ start, end, limit: 1000 });
+      const knownIds = new Set(cashFlowState.seenIds);
+      const totals = aggregateCashFlowByDate(cashEvents, knownIds);
+      for (const [date, net] of totals.netByDate) {
+        cashFlowState.netByDate[date] = (cashFlowState.netByDate[date] ?? 0) + net;
+      }
+      for (const id of totals.seenTransactionIds) cashFlowState.seenIds.push(id);
+      await saveTradierCashFlow(ctx, env, cashFlowState);
+    } catch (err) {
+      console.warn(
+        `[tradier-live-calendar:${ctx.username}] cash event fetch failed env=${env}: ${err instanceof Error ? err.message : String(err)}`,
+      );
+    }
+  }
+
+  // Snapshot today's balance before we read prev, so a missing prior day
+  // still seeds the file for tomorrow's run.
+  const snapshots = await loadTradierBalanceSnapshots(ctx, env);
+  snapshots[reportDate] = todayBalance;
+  await saveTradierBalanceSnapshots(ctx, env, snapshots);
+
+  // Without a prior anchor we can't compute a daily delta. The file is
+  // seeded — the next EOD report run will have a valid prev to compare
+  // against.
+  const prev = findPreviousBalanceSnapshot(
+    // Exclude today from the prev lookup; we just wrote it above.
+    Object.fromEntries(Object.entries(snapshots).filter(([d]) => d !== reportDate)),
+    reportDate,
+  );
+  if (!prev) {
+    console.log(
+      `[tradier-live-calendar:${ctx.username}] env=${env} seeded balance ${reportDate}=$${todayBalance.toFixed(2)} (no prior anchor — overriding skipped this run)`,
+    );
+    return null;
+  }
+
+  const netCashFlow = cashFlowState.netByDate[reportDate] ?? 0;
+  const pnl = computeBalanceDailyPnl(todayBalance, prev.balance, netCashFlow);
+  if (pnl === null) return null;
+
+  console.log(
+    `[tradier-live-calendar:${ctx.username}] env=${env} ${reportDate}: balance $${todayBalance.toFixed(2)} − prev ${prev.date} $${prev.balance.toFixed(2)} − cashFlow $${netCashFlow.toFixed(2)} = $${pnl.toFixed(2)}`,
+  );
+  return { combinedPnl: pnl, prevDate: prev.date, prevBalance: prev.balance, netCashFlow };
 }
 
 

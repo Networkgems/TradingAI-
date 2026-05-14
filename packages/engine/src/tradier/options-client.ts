@@ -213,6 +213,31 @@ interface TradierRawHistoryEvent {
 }
 
 /**
+ * TRA-359 — non-trade Tradier history event (ACH / wire / journal /
+ * deposit / withdrawal / dividend / interest / adjustment). Used by the
+ * Live calendar reconcile pass to subtract real cash flow from the daily
+ * balance delta so deposits aren't booked as trading P&L.
+ */
+export interface TradierCashEvent {
+  /** `YYYY-MM-DD` event date as Tradier reports it (account TZ). */
+  date: string;
+  /** Lowercase event type (`ach`, `wire`, `journal`, `dividend`, etc.). */
+  type: string;
+  /**
+   * Signed cash flow into the account. Positive for deposits / credits,
+   * negative for withdrawals / debits. Tradier reports `amount` as the
+   * net change to the account balance.
+   */
+  amount: number;
+  /**
+   * Stable dedup id (Tradier `id` when surfaced, else a synthetic
+   * `date|type|amount` key). Used so a re-fetch over the same window
+   * doesn't double-count a deposit.
+   */
+  transactionId: string;
+}
+
+/**
  * TRA-348 — normalised Tradier history trade event. Combines the top-level
  * event metadata with the nested `trade` leg into one row the EOD
  * reconcile pass can consume. Includes both opens (Buy to Open) and
@@ -490,6 +515,32 @@ export class TradierOptionsClient extends TradierOrderClient {
     return parseTradierHistory(data);
   }
 
+  /**
+   * TRA-359 — list non-trade Tradier history events between `start` and
+   * `end` (inclusive). Returns deposits / withdrawals / journals /
+   * dividends / interest / adjustments — anything that moves the account
+   * balance independently of trading. Used by the Live calendar
+   * reconcile pass so today's net deposit isn't booked as P&L.
+   *
+   * Tradier's history endpoint does not accept multiple `type` filters
+   * in a single call, so we fetch the whole window (no `type` filter)
+   * and route trade vs. non-trade events through their respective
+   * parsers. Returns `[]` on auth / network failures rather than poison
+   * the calendar with a half-merged cash flow.
+   */
+  async listAccountCashEvents(
+    options: { start: string; end: string; limit?: number } = { start: '', end: '' },
+  ): Promise<TradierCashEvent[]> {
+    const params = new URLSearchParams();
+    if (options.start) params.set('start', options.start);
+    if (options.end) params.set('end', options.end);
+    params.set('limit', String(options.limit ?? 250));
+    const data = await this.getJson<TradierHistoryEnvelope>(
+      `/accounts/${encodeURIComponent(this.accountId)}/history?${params}`,
+    );
+    return parseTradierCashEvents(data);
+  }
+
   /** Submit a market order to buy option contracts (open). */
   async buyContracts(optionSymbol: string, qty: number): Promise<TradierOrderResponse> {
     return this.postOrder(this.optionOrderBody(optionSymbol, qty, 'buy_to_open'));
@@ -654,6 +705,59 @@ export function parseTradierHistory(
       commission,
       transactionId,
     });
+  }
+  return out;
+}
+
+/**
+ * TRA-359 — set of Tradier event types that move the account balance
+ * independently of trading. Used to discriminate cash flow from trade
+ * P&L when reconciling the Live calendar against the broker balance.
+ *
+ * Sourced from Tradier's documented event types
+ * (https://documentation.tradier.com/brokerage-api/accounts/get-account-history).
+ * Keep lowercase — `parseTradierCashEvents` compares case-insensitively.
+ */
+const TRADIER_CASH_EVENT_TYPES = new Set<string>([
+  'ach',
+  'wire',
+  'check',
+  'journal',
+  'dividend',
+  'interest',
+  'adjustment',
+  'fee',
+  'deposit',
+  'withdrawal',
+]);
+
+/**
+ * TRA-359 — normalise the Tradier `/accounts/{id}/history` envelope into
+ * a list of cash flow events (deposits, withdrawals, journals, dividends,
+ * interest, fees, adjustments). Drops `trade` rows (those go through
+ * {@link parseTradierHistory}) and any row whose `amount` isn't a finite
+ * number — we'd rather omit a row than corrupt the daily P&L override
+ * with a NaN.
+ */
+export function parseTradierCashEvents(
+  envelope: TradierHistoryEnvelope | null,
+): TradierCashEvent[] {
+  if (!envelope || typeof envelope.history !== 'object' || envelope.history == null) {
+    return [];
+  }
+  const out: TradierCashEvent[] = [];
+  for (const raw of asArray(envelope.history.event)) {
+    if (typeof raw.type !== 'string') continue;
+    const type = raw.type.toLowerCase();
+    if (!TRADIER_CASH_EVENT_TYPES.has(type)) continue;
+    const date = typeof raw.date === 'string' ? raw.date.slice(0, 10) : '';
+    if (!date) continue;
+    const amount = typeof raw.amount === 'number' && Number.isFinite(raw.amount) ? raw.amount : NaN;
+    if (!Number.isFinite(amount)) continue;
+    const transactionId =
+      raw.id != null ? String(raw.id)
+      : `${date}|${type}|${amount}`;
+    out.push({ date, type, amount, transactionId });
   }
   return out;
 }
