@@ -1,4 +1,4 @@
-import type { OptionType } from '@trading-app/shared';
+import type { OptionType, TradierOrderDuration } from '@trading-app/shared';
 import type { OptionChainRow } from '../options/otm-mispricing.js';
 import { TradierOrderClient, type TradierEnv, type TradierOrderResponse } from './order-client.js';
 
@@ -562,14 +562,19 @@ export class TradierOptionsClient extends TradierOrderClient {
    * trailing) to submit a wait-and-hold LIMIT at the trigger price; the
    * paper book stays open until the resulting order id reaches `filled` on
    * a subsequent tick.
+   *
+   * TRA-358 — `duration` lets the user-initiated close panel pick day/gtc/
+   * pre/post to mirror Tradier's web close form. Defaults to `day` so
+   * existing TRA-352 / TRA-354 call sites keep their old behaviour.
    */
   async sellContractsLimit(
     optionSymbol: string,
     qty: number,
     limitPrice: number,
+    duration: TradierOrderDuration = 'day',
   ): Promise<TradierOrderResponse> {
     return this.postOrder(
-      this.optionOrderBody(optionSymbol, qty, 'sell_to_close', { type: 'limit', price: limitPrice }),
+      this.optionOrderBody(optionSymbol, qty, 'sell_to_close', { type: 'limit', price: limitPrice, duration }),
     );
   }
 
@@ -583,8 +588,11 @@ export class TradierOptionsClient extends TradierOrderClient {
      * with the rounded price. We keep market as the default so existing
      * call-sites that don't care about smart pricing don't have to thread an
      * extra parameter.
+     *
+     * TRA-358 — `duration` overrides the default `day` time-in-force so the
+     * UI close panel can submit GTC / pre / post per the user's selection.
      */
-    pricing?: { type: 'limit'; price: number },
+    pricing?: { type: 'limit'; price: number; duration?: TradierOrderDuration },
   ): URLSearchParams {
     const params: Record<string, string> = {
       class: 'option',
@@ -592,7 +600,7 @@ export class TradierOptionsClient extends TradierOrderClient {
       option_symbol: optionSymbol,
       side,
       quantity: String(qty),
-      duration: 'day',
+      duration: pricing?.duration ?? 'day',
     };
     if (pricing?.type === 'limit') {
       params['type'] = 'limit';

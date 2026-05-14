@@ -850,13 +850,67 @@ export class PaperOptionsAccount {
       return { ...opt };
     }
 
-    // Full close (SL / trail) — or a TP1 that sold the last contracts.
+    if (pending.kind === 'manual' && opt.contractsRemaining > 0) {
+      // TRA-358 — user-initiated partial close. Unlike TP1 we do NOT engage
+      // trailing or set tp1Hit; the user is just trimming exposure on their
+      // own schedule and the engine's existing TP/SL/trail rules should keep
+      // running on the remainder unchanged.
+      delete opt.pendingExit;
+      delete opt.exitErrorReason;
+      return { ...opt };
+    }
+
+    // Full close (SL / trail / manual that sold the last contracts —
+    // or TP1 that sold the last contracts).
     opt.closedAt = Date.now();
     opt.contractsRemaining = 0;
     delete opt.pendingExit;
     delete opt.exitErrorReason;
     this.openOptions.delete(optionId);
     this.closedOptions.push({ ...opt });
+    return { ...opt };
+  }
+
+  /**
+   * TRA-358 — stage a user-initiated wait-and-hold close intent on an
+   * engine-opened position. Caller submits a Tradier `sell_to_close` LIMIT
+   * for `qty` contracts at `limitPrice` with the chosen `duration`, then
+   * attaches the resulting order id via {@link attachPendingExit}. The
+   * existing `resolvePendingOptionExits` poller drives the position to
+   * `finalizePendingExit` on fill / `clearPendingExit` on reject / cancel.
+   *
+   * Returns `null` when:
+   *  - the id doesn't match an open row
+   *  - the row is imported (those use the `pendingCloseOrderId` flow)
+   *  - the row already carries a `pendingExit` (avoid stomping an in-flight
+   *    engine exit; the user can cancel that one first if they want to
+   *    re-stage manually)
+   *  - `qty` is non-positive or > contractsRemaining
+   *  - `limitPrice` is non-positive / non-finite
+   *
+   * Returns the staged snapshot on success so the caller can log + submit.
+   */
+  stageManualPendingExit(
+    optionId: string,
+    qty: number,
+    limitPrice: number,
+    duration: import('@trading-app/shared').TradierOrderDuration = 'day',
+  ): OptionPosition | null {
+    const opt = this.openOptions.get(optionId);
+    if (!opt) return null;
+    if (opt.importedFromTradier) return null;
+    if (opt.pendingExit) return null;
+    if (!Number.isFinite(qty) || qty <= 0 || qty > opt.contractsRemaining) return null;
+    if (!Number.isFinite(limitPrice) || limitPrice <= 0) return null;
+    opt.pendingExit = {
+      tradierOrderId: '',
+      qty: Math.floor(qty),
+      limitPrice,
+      submittedAt: Date.now(),
+      kind: 'manual',
+      duration,
+    };
+    delete opt.exitErrorReason;
     return { ...opt };
   }
 

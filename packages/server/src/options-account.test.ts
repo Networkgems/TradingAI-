@@ -1125,3 +1125,116 @@ describe('PaperOptionsAccount — TRA-354 wait-and-hold exits', () => {
     expect(acct.getState().optionsPnl).toBeLessThan(0);
   });
 });
+
+// ─── TRA-358 — user-initiated manual close (engine-opened LIVE) ─────────────
+// The TradeAI Close drawer stages a `pendingExit` of kind 'manual' carrying
+// the user's chosen limit price + qty + duration. The existing TRA-354 poller
+// then finalises (on fill) or clears (on reject/cancel) the pending exit.
+describe('PaperOptionsAccount — TRA-358 stageManualPendingExit', () => {
+  function buildRvSignal(overrides: Partial<RelativeValueSignal> = {}): RelativeValueSignal {
+    return {
+      id: 'rv-1',
+      symbol: 'AAPL',
+      type: 'relative_value',
+      side: 'buy',
+      entryPrice: 1.0,
+      stopLoss: 0.75,
+      takeProfit: 1.5,
+      riskRewardRatio: 2,
+      timestamp: TRADING_TIME,
+      optionSymbol: 'AAPL240705C00200000',
+      optionType: 'call',
+      strike: 200,
+      expiration: '2024-07-05',
+      mark: 1.0,
+      fairPrice: 1.30,
+      mispricingPct: -0.23,
+      zScore: -2.1,
+      ivFitted: 0.32,
+      ivUsed: 0.28,
+      delta: 0.18,
+      reason: 'cheap-vs-curve',
+      ...overrides,
+    };
+  }
+
+  it('stages a pendingExit with kind="manual" and the chosen duration on a live engine-opened row', () => {
+    const acct = new PaperOptionsAccount({ initialEquity: 50_000, managedAccountRatio: 0.5 });
+    const pos = acct.openOptionFromRvCandidate(buildRvSignal({ mark: 1.0 }), 'live');
+    expect(pos).not.toBeNull();
+    const cashBefore = acct.getState().optionsCash;
+
+    const staged = acct.stageManualPendingExit(pos!.id, pos!.contractsRemaining, 1.42, 'gtc');
+    expect(staged).not.toBeNull();
+    expect(staged!.pendingExit?.kind).toBe('manual');
+    expect(staged!.pendingExit?.duration).toBe('gtc');
+    expect(staged!.pendingExit?.qty).toBe(pos!.contractsRemaining);
+    expect(staged!.pendingExit?.limitPrice).toBeCloseTo(1.42, 5);
+    // Paper book untouched until Tradier confirms the fill.
+    expect(acct.getState().optionsCash).toBe(cashBefore);
+    expect(acct.getState().openOptions).toHaveLength(1);
+  });
+
+  it('refuses to stage when a pendingExit is already in flight (engine or manual)', () => {
+    const acct = new PaperOptionsAccount({ initialEquity: 50_000, managedAccountRatio: 0.5 });
+    const pos = acct.openOptionFromRvCandidate(buildRvSignal({ mark: 1.0 }), 'live');
+    const first = acct.stageManualPendingExit(pos!.id, 1, 1.10, 'day');
+    expect(first).not.toBeNull();
+    const second = acct.stageManualPendingExit(pos!.id, 1, 1.20, 'day');
+    expect(second).toBeNull();
+  });
+
+  it('refuses to stage on imported rows, missing rows, and out-of-range qty / limit', () => {
+    const acct = new PaperOptionsAccount({ initialEquity: 50_000, managedAccountRatio: 0.5 });
+    const pos = acct.openOptionFromRvCandidate(buildRvSignal({ mark: 1.0 }), 'live');
+
+    expect(acct.stageManualPendingExit('nope', 1, 1.0, 'day')).toBeNull();
+    expect(acct.stageManualPendingExit(pos!.id, 0, 1.0, 'day')).toBeNull();
+    expect(acct.stageManualPendingExit(pos!.id, pos!.contractsRemaining + 1, 1.0, 'day')).toBeNull();
+    expect(acct.stageManualPendingExit(pos!.id, 1, 0, 'day')).toBeNull();
+    expect(acct.stageManualPendingExit(pos!.id, 1, Number.NaN, 'day')).toBeNull();
+  });
+
+  it('finalize on a partial manual close leaves the remainder open WITHOUT engaging trailing or tp1Hit', () => {
+    const acct = new PaperOptionsAccount({ initialEquity: 50_000, managedAccountRatio: 0.5 });
+    const pos = acct.openOptionFromRvCandidate(buildRvSignal({ mark: 1.0 }), 'live');
+    expect(pos!.contracts).toBeGreaterThan(1);
+    const initialContracts = pos!.contracts;
+    const partialQty = 1;
+    const limit = 1.25;
+
+    const staged = acct.stageManualPendingExit(pos!.id, partialQty, limit, 'day');
+    expect(staged).not.toBeNull();
+
+    const finalised = acct.finalizePendingExit(pos!.id, limit);
+    expect(finalised).not.toBeNull();
+    const remaining = acct.getState().openOptions[0];
+    expect(remaining.id).toBe(pos!.id);
+    expect(remaining.contractsRemaining).toBe(initialContracts - partialQty);
+    // Manual partial does NOT engage the engine's TP1 trailing rule — the
+    // user is just trimming exposure. The engine's TP/SL/trail keeps running
+    // on the remainder unchanged.
+    expect(remaining.tp1Hit).toBe(false);
+    expect(remaining.trailingActive).toBe(false);
+    expect(remaining.pendingExit).toBeUndefined();
+  });
+
+  it('finalize on a full manual close retires the position into closedOptions and credits cash at the fill', () => {
+    const acct = new PaperOptionsAccount({ initialEquity: 50_000, managedAccountRatio: 0.5 });
+    const pos = acct.openOptionFromRvCandidate(buildRvSignal({ mark: 1.0 }), 'live');
+    const cashBefore = acct.getState().optionsCash;
+    const initialContracts = pos!.contracts;
+    const limit = 1.50;
+
+    const staged = acct.stageManualPendingExit(pos!.id, initialContracts, limit, 'day');
+    expect(staged).not.toBeNull();
+
+    const finalised = acct.finalizePendingExit(pos!.id, limit);
+    expect(finalised).not.toBeNull();
+    expect(acct.getState().openOptions).toHaveLength(0);
+    expect(acct.getState().closedOptions).toHaveLength(1);
+    expect(acct.getState().optionsCash).toBeCloseTo(cashBefore + limit * initialContracts * 100, 5);
+    const expectedPnl = (limit - pos!.premiumPaid) * initialContracts * 100;
+    expect(acct.getState().optionsPnl).toBeCloseTo(expectedPnl, 5);
+  });
+});

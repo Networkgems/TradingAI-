@@ -1691,67 +1691,78 @@ app.post('/api/options/:id/close', requireAuth, async (req, res) => {
   }
   const liveMirror = engineOpened.position.mode === 'live';
   if (liveMirror) {
-    const settings = getSettings(username);
-    const client = buildTradierOptionsClientForEnv(settings, engineOpened.env);
-    const optionSymbol = engineOpened.position.optionSymbol;
-    const contracts = engineOpened.position.contractsRemaining;
-    if (!client) {
+    // TRA-358 — user-driven LIMIT close on engine-opened live positions.
+    // The body carries the price + qty + duration the user picked in the
+    // Close drawer (mirrors Tradier's web close panel). The smart-walk
+    // path (TRA-352) is intentionally retired for engine-opened live
+    // closes: the user is choosing the price themselves, and we don't
+    // want to overwrite that with a midpoint walk. Demo and imported
+    // paths are unaffected.
+    if (engineOpened.position.pendingExit) {
+      res.status(409).json({
+        error: 'A close order is already in flight for this position. Cancel it first if you want to re-stage.',
+      });
+      return;
+    }
+    const body = (req.body ?? {}) as {
+      limitPrice?: unknown;
+      qty?: unknown;
+      duration?: unknown;
+    };
+    const limitPrice = Number(body.limitPrice);
+    if (!Number.isFinite(limitPrice) || limitPrice <= 0) {
+      res.status(400).json({
+        error: 'limitPrice (per-share, > 0) is required for a live engine-opened close.',
+      });
+      return;
+    }
+    const requestedQty = body.qty === undefined ? engineOpened.position.contractsRemaining : Number(body.qty);
+    if (!Number.isFinite(requestedQty) || requestedQty <= 0 || requestedQty > engineOpened.position.contractsRemaining) {
+      res.status(400).json({
+        error: `qty must be between 1 and ${engineOpened.position.contractsRemaining}.`,
+      });
+      return;
+    }
+    const durationCandidate = typeof body.duration === 'string' ? body.duration : 'day';
+    const duration = (durationCandidate === 'day' || durationCandidate === 'gtc' || durationCandidate === 'pre' || durationCandidate === 'post')
+      ? durationCandidate
+      : 'day';
+
+    const outcome = await ctx.engine.submitManualOptionClose(id, requestedQty, limitPrice, duration);
+    if (outcome.status === 'no_client') {
       // No Tradier creds for this env, but the position was opened in live
       // mode (so a real long likely exists on Tradier). Refuse rather
       // than close paper-only and leave the broker leg leaking — that's
       // the exact failure mode TRA-352 was filed to prevent.
       res.status(409).json({
-        error: `No Tradier credentials saved for ${engineOpened.env} — set them in Settings before closing live option positions.`,
+        error: `No Tradier credentials saved for ${outcome.env} — set them in Settings before closing live option positions.`,
       });
       return;
     }
-    if (!optionSymbol || contracts <= 0) {
-      res.status(409).json({ error: 'Live option position is missing OCC symbol or contracts' });
-      return;
-    }
-    const outcome = await submitSmartSellToClose(client, optionSymbol, contracts);
-    if (outcome.status === 'no_quote') {
-      console.warn(
-        `[tradier-live] sell_to_close ${optionSymbol} env=${engineOpened.env} aborted: ${outcome.reason}`,
-      );
+    if (outcome.status === 'not_found') {
       res.status(409).json({ error: outcome.reason });
       return;
     }
     if (outcome.status === 'rejected') {
-      console.warn(
-        `[tradier-live] sell_to_close ${optionSymbol} env=${engineOpened.env} rejected: ${outcome.reason}`,
-      );
-      res.status(502).json({ error: `Tradier rejected the close: ${outcome.reason}` });
+      res.status(502).json({ error: `Tradier rejected the close: ${outcome.reason}`, ...(outcome.orderId !== undefined ? { orderId: outcome.orderId } : {}) });
+      broadcastEngineState(ctx);
       return;
     }
     if (outcome.status === 'filled') {
-      console.log(
-        `[tradier-live] sell_to_close ${optionSymbol} qty=${contracts} env=${engineOpened.env} order=${outcome.orderId} filled@${outcome.avgFillPrice.toFixed(2)} (limit ${outcome.limitPrice.toFixed(2)})`,
-      );
-      const closed = ctx.engine.manualCloseOption(id, outcome.avgFillPrice);
-      if (!closed) {
-        // Defensive — should never trip because we just looked up the row.
-        res.status(404).json({ error: 'Option position vanished mid-close' });
-        return;
-      }
       broadcastEngineState(ctx);
       res.json({
         ok: true,
         status: 'filled',
         orderId: outcome.orderId,
-        fillPrice: outcome.avgFillPrice,
+        fillPrice: outcome.fillPrice,
       });
       return;
     }
     // outcome.status === 'pending' — Tradier accepted the limit but didn't
-    // fill within the walk window. Leave the local row so the user sees
-    // the position still open and tag pendingCloseOrderId so the desktop
-    // disables the Close button until the next reconcile sees Tradier
-    // drop the long.
-    console.log(
-      `[tradier-live] sell_to_close ${optionSymbol} qty=${contracts} env=${engineOpened.env} order=${outcome.orderId} pending@${outcome.limitPrice.toFixed(2)}`,
-    );
-    ctx.engine.setPendingCloseOrderId(id, outcome.orderId);
+    // fill within the wait window. Leave the local row so the user sees
+    // the position still open with the pendingExit badge; the engine's
+    // per-tick `resolvePendingOptionExits` poller will finalise / clear
+    // when Tradier moves.
     broadcastEngineState(ctx);
     res.status(202).json({ ok: true, status: 'pending', orderId: outcome.orderId });
     return;
@@ -1766,6 +1777,40 @@ app.post('/api/options/:id/close', requireAuth, async (req, res) => {
   }
   broadcastEngineState(ctx);
   res.json({ ok: true });
+});
+
+/**
+ * TRA-358 — cancel an in-flight user-staged Tradier `sell_to_close` LIMIT.
+ * Hits Tradier's `cancelOrder` for the staged order id, then clears the
+ * paper book's `pendingExit` so the row re-renders the Close drawer. Only
+ * applies to engine-opened positions whose `pendingExit.kind === 'manual'`
+ * (or any pendingExit, since the user already sees a "Pending" badge for
+ * engine-fired exits and may want to cancel those too).
+ */
+app.post('/api/options/:id/cancel-pending-exit', requireAuth, async (req, res) => {
+  const ctx = await userCtx(res);
+  const { id } = req.params as Record<string, string>;
+  const outcome = await ctx.engine.cancelManualPendingExit(id);
+  if (outcome.status === 'cancelled') {
+    broadcastEngineState(ctx);
+    res.json({ ok: true, ...(outcome.orderId !== undefined ? { orderId: outcome.orderId } : {}) });
+    return;
+  }
+  if (outcome.status === 'not_pending') {
+    res.status(409).json({ error: 'No pending close to cancel for this position.' });
+    return;
+  }
+  if (outcome.status === 'not_found') {
+    res.status(404).json({ error: 'Option position not found.' });
+    return;
+  }
+  if (outcome.status === 'no_client') {
+    res.status(409).json({
+      error: `No Tradier credentials saved for ${outcome.env} — set them in Settings before cancelling.`,
+    });
+    return;
+  }
+  res.status(502).json({ error: `Tradier cancel failed: ${outcome.reason}`, ...(outcome.orderId !== undefined ? { orderId: outcome.orderId } : {}) });
 });
 
 /**

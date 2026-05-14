@@ -1652,6 +1652,173 @@ export class SignalEngine {
   }
 
   /**
+   * TRA-358 — submit a user-driven Tradier `sell_to_close` LIMIT for an
+   * engine-opened live option position, stage the matching `pendingExit`
+   * intent on the paper book, and synchronously reach for terminal status
+   * so an immediate fill / reject is reflected on this request rather than
+   * the next 30s tick (mirrors `submitStagedOptionExits` for engine-fired
+   * exits). Returns a discriminated outcome the HTTP handler can turn into
+   * the right status code:
+   *
+   *  - `filled` — Tradier filled inside the wait window. The paper book is
+   *    already finalised at the broker fill price; HTTP returns 200.
+   *  - `pending` — Tradier accepted the LIMIT but didn't reach a terminal
+   *    state in the wait window. The paper book carries `pendingExit` with
+   *    the order id attached; the per-tick `resolvePendingOptionExits`
+   *    poller will finalise / clear when the broker moves. HTTP returns 202.
+   *  - `rejected` — Tradier refused (or terminated non-fill inside the
+   *    wait window). The paper book has the pending intent cleared with
+   *    `exitErrorReason` set so the dashboard can surface the reason. HTTP
+   *    returns 502.
+   *  - `no_client` — no Tradier creds saved for the position's env. The
+   *    paper book is unchanged; HTTP returns 409 with a saving-credentials
+   *    hint.
+   *  - `not_found` — the id doesn't match an open engine-opened row, the
+   *    row already carries a pendingExit, or qty / limit are out of range.
+   *    HTTP returns 409 with a stale-state hint.
+   */
+  async submitManualOptionClose(
+    optionId: string,
+    qty: number,
+    limitPrice: number,
+    duration: import('@trading-app/shared').TradierOrderDuration = 'day',
+  ): Promise<
+    | { status: 'filled'; orderId: number; fillPrice: number }
+    | { status: 'pending'; orderId: number }
+    | { status: 'rejected'; reason: string; orderId?: number }
+    | { status: 'no_client'; env: TradierEnv }
+    | { status: 'not_found'; reason: string }
+  > {
+    const located = this.findEngineOpenedOption(optionId);
+    if (!located) {
+      return { status: 'not_found', reason: 'Engine-opened option position not found' };
+    }
+    const env = located.env;
+    const optionSymbol = located.position.optionSymbol;
+    if (!optionSymbol) {
+      return { status: 'not_found', reason: 'Live option position is missing OCC symbol' };
+    }
+    const client = this.tradierOptionsClientByEnv[env];
+    if (!client) {
+      return { status: 'no_client', env };
+    }
+    const acct = this.optionsAccounts[env];
+    const staged = acct.stageManualPendingExit(optionId, qty, limitPrice, duration);
+    if (!staged) {
+      return {
+        status: 'not_found',
+        reason: 'Could not stage close — position may already have a pending exit or qty/limit is out of range.',
+      };
+    }
+    const intent = staged.pendingExit!;
+
+    let resp: import('@trading-app/engine').TradierOrderResponse;
+    try {
+      resp = await client.sellContractsLimit(optionSymbol, intent.qty, intent.limitPrice, intent.duration ?? 'day');
+    } catch (err: unknown) {
+      const reason = `Tradier sell_to_close submit threw: ${err instanceof Error ? err.message : String(err)}`;
+      acct.clearPendingExit(optionId, reason);
+      console.warn(`[signal-engine] manual-close ${optionSymbol} env=${env} ${reason}`);
+      return { status: 'rejected', reason };
+    }
+
+    acct.attachPendingExit(optionId, resp.id);
+    console.log(
+      `[signal-engine] manual sell_to_close ${optionSymbol} env=${env} qty=${intent.qty} `
+      + `@ limit $${intent.limitPrice.toFixed(2)} duration=${intent.duration ?? 'day'} order=${resp.id} status=${resp.status}`,
+    );
+
+    try {
+      const detail = await client.waitForOrderTerminalStatus(resp.id);
+      if (detail) {
+        if (detail.status === 'filled') {
+          const fill = typeof detail.avg_fill_price === 'number' && detail.avg_fill_price > 0
+            ? detail.avg_fill_price
+            : intent.limitPrice;
+          acct.finalizePendingExit(optionId, fill);
+          this.tracker?.saveEquity(
+            this.account.getState().totalEquity,
+            this.optionsAccount.getState().optionsPnl,
+          );
+          return { status: 'filled', orderId: resp.id, fillPrice: fill };
+        }
+        if (TRADIER_REJECTED_STATUSES.has(detail.status)) {
+          const reasonSuffix = detail.reason_description ? `: ${detail.reason_description}` : '';
+          const reason = `Tradier sell_to_close ${detail.status}${reasonSuffix}`;
+          acct.clearPendingExit(optionId, reason);
+          return { status: 'rejected', reason, orderId: resp.id };
+        }
+      }
+    } catch (err: unknown) {
+      console.warn(
+        `[signal-engine] manual-close waitForOrderTerminalStatus(${resp.id}) failed: ${err instanceof Error ? err.message : String(err)} — leaving pendingExit for next tick poll`,
+      );
+    }
+    return { status: 'pending', orderId: resp.id };
+  }
+
+  /**
+   * TRA-358 — cancel an in-flight user-staged Tradier `sell_to_close` LIMIT.
+   * Looks the position up across env buckets, fires Tradier `cancelOrder`
+   * on the staged order id, and clears `pendingExit` only when the broker
+   * accepts the cancel (or when the order id is empty so nothing was ever
+   * submitted — the same race we tolerate in `attachPendingExit`).
+   *
+   * Outcomes:
+   *  - `cancelled` — broker accepted the cancel; paper book pendingExit
+   *    is cleared and the row re-renders the Close button.
+   *  - `not_pending` — no pendingExit on the row (already finalised /
+   *    cleared between request and cancel). HTTP returns 409.
+   *  - `not_found` — id doesn't match any row across env buckets.
+   *  - `no_client` — no Tradier creds for the position's env. We do NOT
+   *    clear pendingExit — the user needs to resolve creds before we can
+   *    confirm Tradier's view of the order.
+   *  - `error` — `cancelOrder` threw; pendingExit stays so the user can
+   *    retry once Tradier is reachable again. HTTP returns 502 with the
+   *    surfaced reason.
+   */
+  async cancelManualPendingExit(optionId: string): Promise<
+    | { status: 'cancelled'; orderId?: string | number }
+    | { status: 'not_pending' }
+    | { status: 'not_found' }
+    | { status: 'no_client'; env: TradierEnv }
+    | { status: 'error'; reason: string; orderId?: string | number }
+  > {
+    for (const env of ['sandbox', 'production'] as const) {
+      const acct = this.optionsAccounts[env];
+      const opt = acct
+        .getState()
+        .openOptions
+        .find(o => o.id === optionId);
+      if (!opt) continue;
+      if (!opt.pendingExit) {
+        return { status: 'not_pending' };
+      }
+      const orderId = opt.pendingExit.tradierOrderId;
+      if (orderId === '' || orderId === undefined) {
+        // Nothing on the broker yet — clear locally and report success.
+        acct.clearPendingExit(optionId, 'Cancelled before Tradier order id was attached.');
+        return { status: 'cancelled' };
+      }
+      const client = this.tradierOptionsClientByEnv[env];
+      if (!client) {
+        return { status: 'no_client', env };
+      }
+      try {
+        await client.cancelOrder(orderId);
+      } catch (err: unknown) {
+        const reason = err instanceof Error ? err.message : String(err);
+        console.warn(`[signal-engine] cancel sell_to_close order=${orderId} env=${env} failed: ${reason}`);
+        return { status: 'error', reason, orderId };
+      }
+      acct.clearPendingExit(optionId, 'User cancelled the close order.');
+      console.log(`[signal-engine] cancel sell_to_close order=${orderId} env=${env} accepted; pendingExit cleared`);
+      return { status: 'cancelled', orderId };
+    }
+    return { status: 'not_found' };
+  }
+
+  /**
    * TRA-352 follow-up — drive every open row with a `pendingCloseOrderId`
    * through one Tradier `getOrderStatus` lookup per tick and reconcile the
    * local row to the broker's actual terminal state. This closes the

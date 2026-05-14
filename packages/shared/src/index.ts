@@ -938,7 +938,24 @@ export const OPTIONS_TP_PCT = OPTIONS_TP1_PCT;
  * the broker filled or rejected. `kind` distinguishes the partial TP1
  * exit (sells half, leaves the rest open) from the full SL/trail exit
  * (sells whatever remains and retires the position).
+ *
+ * TRA-358 — `manual` extends this state machine to user-initiated closes
+ * from the TradeAI UI (engine-opened live positions). Same poller / cancel
+ * semantics as the engine-fired kinds; `qty` may be < contractsRemaining
+ * for a partial close, in which case finalize leaves the remainder open
+ * without engaging trailing (unlike `tp1`, which is the engine's own
+ * partial-take rule).
  */
+export type OptionPendingExitKind = 'tp1' | 'sl' | 'trail' | 'manual';
+
+/**
+ * TRA-358 — Tradier order duration for the staged `sell_to_close` LIMIT.
+ * Mirrors the duration dropdown the user sees on Tradier's web close panel;
+ * UI defaults to `day`. Stored on the pendingExit so the UI can echo back
+ * what was submitted while the order is working.
+ */
+export type TradierOrderDuration = 'day' | 'gtc' | 'pre' | 'post';
+
 export interface OptionPendingExit {
   /** Tradier order id returned by `sell_to_close` submit. */
   tradierOrderId: string | number;
@@ -949,7 +966,7 @@ export interface OptionPendingExit {
   /** ms epoch when the order was submitted. */
   submittedAt: number;
   /** Which engine trigger staged this exit — drives partial vs full finalise. */
-  kind: 'tp1' | 'sl' | 'trail';
+  kind: OptionPendingExitKind;
   /**
    * TRA-361 — order type the engine should submit to Tradier. Defaults to
    * `'limit'` (TRA-354 wait-and-hold behaviour). Set to `'market'` for the
@@ -957,6 +974,12 @@ export interface OptionPendingExit {
    * doesn't leave the position stuck open after SL trips.
    */
   pricing?: 'limit' | 'market';
+  /**
+   * TRA-358 — Tradier order duration submitted with the LIMIT. Optional for
+   * back-compat with TRA-354 records that pre-date the field; absent ↔ `day`
+   * (Tradier's default and the engine's previous hardcoded value).
+   */
+  duration?: TradierOrderDuration;
 }
 
 export interface OptionPosition {

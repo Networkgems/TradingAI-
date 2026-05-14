@@ -1510,6 +1510,30 @@ function Dashboard({ token, onLogout, onGoHome, onActivity, theme, onToggleTheme
   const [tradierSyncing, setTradierSyncing] = useState(false);
   const [tradierSyncStatus, setTradierSyncStatus] = useState('');
   const tradierSyncStatusTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
+  // TRA-358 — Tradier-style close drawer for engine-opened LIVE option
+  // positions. Mirrors the price/qty/duration form Tradier shows on its
+  // web close panel; submit posts a sell_to_close LIMIT and the row
+  // transitions into a "Pending #N" state with a Cancel button until
+  // Tradier fills (or rejects, surfacing exitErrorReason). Demo and
+  // imported positions skip the drawer and use the legacy direct close.
+  type CloseDrawerState = {
+    optionId: string;
+    symbol: string;
+    optionSymbol?: string | undefined;
+    optionType: 'call' | 'put';
+    contractsRemaining: number;
+    defaultPrice: number;
+    price: string;
+    qty: string;
+    duration: 'day' | 'gtc' | 'pre' | 'post';
+    submitting: boolean;
+    error?: string | undefined;
+  };
+  const [closeDrawer, setCloseDrawer] = useState<CloseDrawerState | null>(null);
+  // TRA-358 — Cancel button on a pending-exit row uses this to lock the
+  // button while the cancel POST is in flight; per-row state keyed by
+  // option id so multiple in-flight cancels don't fight for one boolean.
+  const [cancellingExits, setCancellingExits] = useState<Record<string, boolean>>({});
   // TRA-339 — per-table sort state for the Stocks dashboard.
   const watchlistSort = useTableSort<CryptoWatchSortKey>('changePct', 'desc');
   const openPosSort = useTableSort<StockOpenPosSortKey>('opened', 'desc');
@@ -1654,29 +1678,135 @@ function Dashboard({ token, onLogout, onGoHome, onActivity, theme, onToggleTheme
     }).catch(() => {});
   }
 
-  async function closeOption(optionId: string) {
+  // TRA-358 — direct close path used by the imported and demo branches
+  // (no user-facing limit form: imported runs through the smart-walk on
+  // the server, demo is paper-only). The engine-opened LIVE branch goes
+  // through `submitCloseDrawer` instead because the user is choosing
+  // price + qty + duration in a Tradier-style panel.
+  async function closeOption(optionId: string, body?: Record<string, unknown>) {
     const r = await fetch(`${HTTP_URL}/api/options/${optionId}/close`, {
       method: 'POST',
-      headers: { Authorization: `Bearer ${token}` },
+      headers: {
+        Authorization: `Bearer ${token}`,
+        ...(body ? { 'Content-Type': 'application/json' } : {}),
+      },
+      ...(body ? { body: JSON.stringify(body) } : {}),
     }).catch(() => null);
-    // TRA-323 / TRA-348 — surface broker-side rejection (sell_to_close
-    // failed) so the row doesn't sit stuck. The 202 path (Tradier accepted
-    // but the order didn't reach a terminal state in 5s) leaves the row
-    // visible with a "Pending #N" indicator; surface a one-line note so
-    // the user knows the close is live on Tradier.
-    if (!r) return;
-    const data = await r.json().catch(() => ({} as { error?: string; status?: string; orderId?: number | string }));
+    // TRA-323 / TRA-348 / TRA-358 — surface broker-side rejection
+    // (sell_to_close failed) so the row doesn't sit stuck. The 202 path
+    // (Tradier accepted but the order didn't reach a terminal state in
+    // the wait window) leaves the row visible with a Pending badge.
+    if (!r) return { ok: false as const, error: 'Network error' };
+    const data = await r.json().catch(() => ({} as { error?: string; status?: string; orderId?: number | string; fillPrice?: number }));
     if (r.status === 202 && data?.status === 'pending') {
       setTradierSyncStatus(`Tradier close pending #${data.orderId ?? '?'} — row will drop once Tradier fills`);
       if (tradierSyncStatusTimer.current) clearTimeout(tradierSyncStatusTimer.current);
       tradierSyncStatusTimer.current = setTimeout(() => setTradierSyncStatus(''), 8000);
-      return;
+      return { ok: true as const, status: 'pending' as const, orderId: data?.orderId };
     }
     if (!r.ok) {
       const message = data?.error ?? `Close failed (${r.status})`;
       setTradierSyncStatus(`Close failed: ${message}`);
       if (tradierSyncStatusTimer.current) clearTimeout(tradierSyncStatusTimer.current);
       tradierSyncStatusTimer.current = setTimeout(() => setTradierSyncStatus(''), 6000);
+      return { ok: false as const, error: message };
+    }
+    return { ok: true as const, status: data?.status ?? 'filled', orderId: data?.orderId, fillPrice: data?.fillPrice };
+  }
+
+  // TRA-358 — open the limit-close drawer for a position. The drawer
+  // mirrors Tradier's web close panel (price + qty + duration). Engine-
+  // opened live positions submit through this path; everything else
+  // (imported, engine-opened demo) skips the drawer and runs the direct
+  // close which keeps the existing TRA-352 / TRA-348 behaviour.
+  function openCloseDrawer(o: OptionPosition, isLiveEngineOpened: boolean) {
+    if (!isLiveEngineOpened) {
+      void closeOption(o.id);
+      return;
+    }
+    if (o.pendingExit) {
+      // Already pending — let the user cancel from the row's badge.
+      return;
+    }
+    const defaultPrice = Number.isFinite(o.currentPremium) && o.currentPremium > 0
+      ? o.currentPremium
+      : o.premiumPaid;
+    setCloseDrawer({
+      optionId: o.id,
+      symbol: o.symbol,
+      optionSymbol: o.optionSymbol,
+      optionType: o.optionType,
+      contractsRemaining: o.contractsRemaining,
+      defaultPrice,
+      price: defaultPrice.toFixed(2),
+      qty: String(o.contractsRemaining),
+      duration: 'day',
+      submitting: false,
+    });
+  }
+
+  function closeDrawerCancel() {
+    setCloseDrawer(prev => (prev?.submitting ? prev : null));
+  }
+
+  async function submitCloseDrawer() {
+    if (!closeDrawer || closeDrawer.submitting) return;
+    const limitPrice = Number(closeDrawer.price);
+    if (!Number.isFinite(limitPrice) || limitPrice <= 0) {
+      setCloseDrawer(prev => prev ? { ...prev, error: 'Limit price must be greater than 0.' } : prev);
+      return;
+    }
+    const qty = Math.floor(Number(closeDrawer.qty));
+    if (!Number.isFinite(qty) || qty <= 0 || qty > closeDrawer.contractsRemaining) {
+      setCloseDrawer(prev => prev ? {
+        ...prev,
+        error: `Qty must be between 1 and ${closeDrawer.contractsRemaining}.`,
+      } : prev);
+      return;
+    }
+    setCloseDrawer(prev => prev ? { ...prev, submitting: true, error: undefined } : prev);
+    const result = await closeOption(closeDrawer.optionId, {
+      limitPrice,
+      qty,
+      duration: closeDrawer.duration,
+    });
+    if (result.ok) {
+      setCloseDrawer(null);
+    } else {
+      setCloseDrawer(prev => prev ? {
+        ...prev,
+        submitting: false,
+        error: result.error ?? 'Close failed.',
+      } : prev);
+    }
+  }
+
+  // TRA-358 — fire the matching Tradier cancel for an in-flight pending
+  // exit. On success the server clears the position's pendingExit and
+  // the next state broadcast re-renders the Close button on the row.
+  async function cancelPendingExit(optionId: string) {
+    setCancellingExits(prev => ({ ...prev, [optionId]: true }));
+    try {
+      const r = await fetch(`${HTTP_URL}/api/options/${optionId}/cancel-pending-exit`, {
+        method: 'POST',
+        headers: { Authorization: `Bearer ${token}` },
+      }).catch(() => null);
+      if (!r) {
+        setTradierSyncStatus('Cancel failed: network error');
+      } else if (!r.ok) {
+        const data = await r.json().catch(() => ({} as { error?: string }));
+        setTradierSyncStatus(`Cancel failed: ${data?.error ?? r.status}`);
+      } else {
+        setTradierSyncStatus('Tradier cancel accepted');
+      }
+      if (tradierSyncStatusTimer.current) clearTimeout(tradierSyncStatusTimer.current);
+      tradierSyncStatusTimer.current = setTimeout(() => setTradierSyncStatus(''), 6000);
+    } finally {
+      setCancellingExits(prev => {
+        const next = { ...prev };
+        delete next[optionId];
+        return next;
+      });
     }
   }
 
@@ -2238,17 +2368,69 @@ function Dashboard({ token, onLogout, onGoHome, onActivity, theme, onToggleTheme
                                 that the close is in flight without firing
                                 a duplicate order. The flag clears once
                                 Tradier drops the position from /positions
-                                (broker confirms flat). */}
-                            {o.pendingCloseOrderId != null ? (
-                              <button
-                                className="btn-close-pos"
-                                disabled
-                                title="Tradier sell_to_close accepted but not yet filled"
-                              >
-                                Pending #{o.pendingCloseOrderId}
-                              </button>
-                            ) : (
-                              <button className="btn-close-pos" onClick={() => closeOption(o.id)}>Close</button>
+                                (broker confirms flat).
+                                TRA-358 — engine-opened LIVE rows now use
+                                `pendingExit` instead (carries the user's
+                                limit + qty + duration). The badge stays
+                                visible while Tradier works the order, and
+                                the Cancel button fires the matching
+                                Tradier cancel; reject reasons land on
+                                `exitErrorReason`. */}
+                            {(() => {
+                              const isLiveEngineOpened = !isImported && o.mode === 'live';
+                              if (o.pendingCloseOrderId != null) {
+                                return (
+                                  <button
+                                    className="btn-close-pos"
+                                    disabled
+                                    title="Tradier sell_to_close accepted but not yet filled"
+                                  >
+                                    Pending #{o.pendingCloseOrderId}
+                                  </button>
+                                );
+                              }
+                              if (o.pendingExit) {
+                                const orderRef = o.pendingExit.tradierOrderId === '' || o.pendingExit.tradierOrderId === undefined
+                                  ? '?'
+                                  : String(o.pendingExit.tradierOrderId);
+                                const cancelInFlight = cancellingExits[o.id] === true;
+                                return (
+                                  <span style={{ display: 'inline-flex', gap: '0.4rem', alignItems: 'center' }}>
+                                    <button
+                                      className="btn-close-pos"
+                                      disabled
+                                      title={`Tradier sell_to_close ${o.pendingExit.kind} qty=${o.pendingExit.qty} @ $${o.pendingExit.limitPrice.toFixed(2)} duration=${o.pendingExit.duration ?? 'day'}`}
+                                    >
+                                      Pending #{orderRef}
+                                    </button>
+                                    <button
+                                      className="btn-secondary"
+                                      style={{ padding: '0.2rem 0.5rem', fontSize: '0.75rem' }}
+                                      disabled={cancelInFlight}
+                                      onClick={() => cancelPendingExit(o.id)}
+                                      title="Cancel the working Tradier sell_to_close"
+                                    >
+                                      {cancelInFlight ? 'Cancelling…' : 'Cancel'}
+                                    </button>
+                                  </span>
+                                );
+                              }
+                              return (
+                                <button
+                                  className="btn-close-pos"
+                                  onClick={() => openCloseDrawer(o, isLiveEngineOpened)}
+                                  title={isLiveEngineOpened
+                                    ? 'Open the limit-close panel (mirrors Tradier price/qty/duration)'
+                                    : 'Close this position'}
+                                >
+                                  Close
+                                </button>
+                              );
+                            })()}
+                            {o.exitErrorReason && (
+                              <div className="muted" style={{ fontSize: '0.7rem', marginTop: '0.25rem', maxWidth: '12rem', whiteSpace: 'normal' }}>
+                                {o.exitErrorReason}
+                              </div>
                             )}
                           </td>
                         </tr>
@@ -2347,6 +2529,113 @@ function Dashboard({ token, onLogout, onGoHome, onActivity, theme, onToggleTheme
           />
         )}
       </main>
+      {/* TRA-358 — Tradier-style limit-close drawer for engine-opened LIVE
+          option positions. Mirrors the price/qty/duration form Tradier shows
+          on its web close panel. Submit posts a sell_to_close LIMIT and the
+          row transitions to a Pending #N badge with a Cancel button until
+          Tradier fills (or rejects, surfacing exitErrorReason). */}
+      {closeDrawer && createPortal(
+        <>
+          <div
+            className="profile-dropdown-backdrop"
+            onClick={closeDrawerCancel}
+            style={{ background: 'rgba(0,0,0,0.4)' }}
+          />
+          <div
+            className="profile-dropdown"
+            role="dialog"
+            aria-label="Close option position"
+            style={{
+              position: 'fixed',
+              top: '50%',
+              left: '50%',
+              transform: 'translate(-50%, -50%)',
+              width: 'min(28rem, 92vw)',
+              padding: '1rem',
+              maxHeight: '90vh',
+              overflowY: 'auto',
+            }}
+          >
+            <h3 style={{ marginTop: 0, marginBottom: '0.75rem' }}>
+              Close {closeDrawer.symbol} {closeDrawer.optionType.toUpperCase()}
+            </h3>
+            <div className="muted" style={{ fontSize: '0.8rem', marginBottom: '0.75rem' }}>
+              {closeDrawer.optionSymbol ? (<>OCC <code>{closeDrawer.optionSymbol}</code> · </>) : null}
+              Submits Tradier <code>sell_to_close</code> LIMIT.
+            </div>
+            <label style={{ display: 'block', marginBottom: '0.6rem' }}>
+              <span style={{ display: 'block', fontSize: '0.8rem', marginBottom: '0.2rem' }}>
+                Limit price (per share)
+              </span>
+              <input
+                type="number"
+                step="0.01"
+                min="0.01"
+                value={closeDrawer.price}
+                onChange={(e) => setCloseDrawer(prev => prev ? { ...prev, price: e.target.value, error: undefined } : prev)}
+                style={{ width: '100%', padding: '0.4rem' }}
+                disabled={closeDrawer.submitting}
+              />
+              <span className="muted" style={{ fontSize: '0.7rem' }}>
+                Default: current mark ${closeDrawer.defaultPrice.toFixed(2)}
+              </span>
+            </label>
+            <label style={{ display: 'block', marginBottom: '0.6rem' }}>
+              <span style={{ display: 'block', fontSize: '0.8rem', marginBottom: '0.2rem' }}>
+                Quantity (contracts, max {closeDrawer.contractsRemaining})
+              </span>
+              <input
+                type="number"
+                step="1"
+                min="1"
+                max={closeDrawer.contractsRemaining}
+                value={closeDrawer.qty}
+                onChange={(e) => setCloseDrawer(prev => prev ? { ...prev, qty: e.target.value, error: undefined } : prev)}
+                style={{ width: '100%', padding: '0.4rem' }}
+                disabled={closeDrawer.submitting}
+              />
+            </label>
+            <label style={{ display: 'block', marginBottom: '0.75rem' }}>
+              <span style={{ display: 'block', fontSize: '0.8rem', marginBottom: '0.2rem' }}>
+                Duration
+              </span>
+              <select
+                value={closeDrawer.duration}
+                onChange={(e) => setCloseDrawer(prev => prev ? { ...prev, duration: e.target.value as 'day' | 'gtc' | 'pre' | 'post', error: undefined } : prev)}
+                style={{ width: '100%', padding: '0.4rem' }}
+                disabled={closeDrawer.submitting}
+              >
+                <option value="day">Day</option>
+                <option value="gtc">GTC (Good Til Cancelled)</option>
+                <option value="pre">Pre-market</option>
+                <option value="post">Post-market</option>
+              </select>
+            </label>
+            {closeDrawer.error && (
+              <div className="red" style={{ fontSize: '0.8rem', marginBottom: '0.5rem' }}>
+                {closeDrawer.error}
+              </div>
+            )}
+            <div style={{ display: 'flex', gap: '0.5rem', justifyContent: 'flex-end' }}>
+              <button
+                className="btn-secondary"
+                onClick={closeDrawerCancel}
+                disabled={closeDrawer.submitting}
+              >
+                Cancel
+              </button>
+              <button
+                className="btn-close-pos"
+                onClick={submitCloseDrawer}
+                disabled={closeDrawer.submitting}
+              >
+                {closeDrawer.submitting ? 'Submitting…' : 'Submit sell_to_close'}
+              </button>
+            </div>
+          </div>
+        </>,
+        document.body,
+      )}
     </div>
   );
 }
