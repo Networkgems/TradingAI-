@@ -1647,3 +1647,84 @@ describe('SignalEngine — TRA-346 four-bucket sub-account wiring (TRA-349)', ()
     expect(engine.riskPerTrade).toBe(0.013);
   });
 });
+
+// ─── TRA-361 — submitStagedOptionExits honors MARKET vs LIMIT pricing ───────
+// The PaperOptionsAccount stages a pendingExit with `pricing: 'market'` for
+// deep-underwater imported positions (the LIMIT at the SL would never fill).
+// The engine's submit path must call `sellContracts` (market) for those and
+// `sellContractsLimit` (the TRA-354 default) for everything else.
+describe('SignalEngine — TRA-361 submitStagedOptionExits pricing', () => {
+  interface TradierExitStub {
+    sellContractsLimit: ReturnType<typeof vi.fn>;
+    sellContracts: ReturnType<typeof vi.fn>;
+    waitForOrderTerminalStatus: ReturnType<typeof vi.fn>;
+  }
+
+  function makeStub(): TradierExitStub {
+    return {
+      sellContractsLimit: vi.fn().mockResolvedValue({ id: 901, status: 'pending' }),
+      sellContracts: vi.fn().mockResolvedValue({ id: 902, status: 'pending' }),
+      // No terminal status — keep the pendingExit and let the next tick poll.
+      waitForOrderTerminalStatus: vi.fn().mockResolvedValue(null),
+    };
+  }
+
+  function setupEngine(stub: TradierExitStub) {
+    const engine = new SignalEngine();
+    (engine as unknown as { tradierLiveClient: unknown }).tradierLiveClient = stub;
+    return engine;
+  }
+
+  it('routes a LIMIT-pricing intent through sellContractsLimit', async () => {
+    const stub = makeStub();
+    const engine = setupEngine(stub);
+    const submit = (engine as unknown as {
+      submitStagedOptionExits: (s: import('@trading-app/shared').OptionPosition[]) => Promise<void>;
+    }).submitStagedOptionExits.bind(engine);
+
+    const snapshot = {
+      id: 'opt-1',
+      symbol: 'SPY',
+      optionSymbol: 'SPY260515C00450000',
+      pendingExit: {
+        tradierOrderId: '',
+        qty: 2,
+        limitPrice: 1.50,
+        submittedAt: Date.now(),
+        kind: 'sl',
+        pricing: 'limit',
+      },
+    } as unknown as import('@trading-app/shared').OptionPosition;
+    await submit([snapshot]);
+
+    expect(stub.sellContractsLimit).toHaveBeenCalledWith('SPY260515C00450000', 2, 1.50);
+    expect(stub.sellContracts).not.toHaveBeenCalled();
+  });
+
+  it('escalates a MARKET-pricing intent through sellContracts (deep-underwater fallback)', async () => {
+    const stub = makeStub();
+    const engine = setupEngine(stub);
+    const submit = (engine as unknown as {
+      submitStagedOptionExits: (s: import('@trading-app/shared').OptionPosition[]) => Promise<void>;
+    }).submitStagedOptionExits.bind(engine);
+
+    const snapshot = {
+      id: 'opt-2',
+      symbol: 'NFLX',
+      optionSymbol: 'NFLX260515P00400000',
+      importedFromTradier: true,
+      pendingExit: {
+        tradierOrderId: '',
+        qty: 1,
+        limitPrice: 7.50, // SL trigger price, ignored because pricing='market'
+        submittedAt: Date.now(),
+        kind: 'sl',
+        pricing: 'market',
+      },
+    } as unknown as import('@trading-app/shared').OptionPosition;
+    await submit([snapshot]);
+
+    expect(stub.sellContracts).toHaveBeenCalledWith('NFLX260515P00400000', 1);
+    expect(stub.sellContractsLimit).not.toHaveBeenCalled();
+  });
+});

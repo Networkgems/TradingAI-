@@ -31,6 +31,41 @@ function toDateKey(ts: number): string {
   return new Date(ts).toISOString().slice(0, 10);
 }
 
+/**
+ * TRA-361 — write SL/TP1/trailing thresholds onto an imported (Tradier) row
+ * based on the current auto-management policy. When auto-management is on we
+ * size SL/TP off the user's `premiumPaid` using the RV defaults; when off we
+ * restore the TRA-323 sentinels (`tp1 = +Infinity`, `sl/trail = 0`) so the
+ * `checkExits` skip path is the only thing that protects the row from a
+ * trigger.
+ *
+ * The trailing stop is seeded at `premiumPaid * (1 + trailActivatePct)` as a
+ * pre-activation sentinel — the per-tick pipeline rewrites it to the proper
+ * `peak * (1 - trailOffsetPct)` once the position runs in profit, but
+ * staging at the activation threshold lets a freshly-synced position skip
+ * straight into a trailing exit if it's already well into profit.
+ */
+function applyImportedRiskThresholds(
+  opt: OptionPosition,
+  rvRiskParams: RvRiskParams,
+  autoManage: boolean,
+): void {
+  if (!autoManage) {
+    opt.tp1Premium = Number.POSITIVE_INFINITY;
+    opt.tp1Hit = false;
+    opt.stopLossPremium = 0;
+    opt.trailingActive = false;
+    opt.trailingStopPremium = 0;
+    return;
+  }
+  opt.stopLossPremium = opt.premiumPaid * (1 - rvRiskParams.slPct);
+  opt.tp1Premium = opt.premiumPaid * (1 + rvRiskParams.tp1Pct);
+  // Pre-activation sentinel — `checkExits` re-derives the real trailing stop
+  // once `mark >= premium * (1 + trailActivatePct)` activates trailing.
+  opt.trailingStopPremium = opt.premiumPaid * (1 + rvRiskParams.trailActivatePct);
+  opt.trailingActive = false;
+}
+
 interface OptionsAccountConfig {
   initialEquity?: number;
   managedAccountRatio?: number;
@@ -61,6 +96,14 @@ interface OptionsAccountConfig {
    * uses `RV_RISK_PARAMS` from `@trading-app/shared`.
    */
   rvRiskParams?: RvRiskParams;
+  /**
+   * TRA-361 — auto-manage Tradier-imported option positions (run them through
+   * the engine SL / TP1-partial / trailing pipeline and mirror exits to
+   * Tradier as `sell_to_close` orders). Default `true` matches the new
+   * AccountSettings default. When `false`, imports keep sentinel thresholds
+   * and `checkExits` skips them (legacy TRA-323 behaviour).
+   */
+  autoManageImportedTradierOptions?: boolean;
 }
 
 /**
@@ -106,6 +149,15 @@ export class PaperOptionsAccount {
   private dailyRvCount = 0;
   private rvRiskParams: RvRiskParams;
   private tradierEnv: TradierEnv | null;
+  /**
+   * TRA-361 — when true, Tradier-imported positions run through the engine
+   * SL/TP1/trail pipeline; when false, they keep sentinel thresholds and
+   * `checkExits` skips them (legacy TRA-323 behaviour). Default matches the
+   * AccountSettings default (`true`). The flag is consumed by
+   * {@link reconcileTradierPositions} (initial-threshold installation) and
+   * {@link checkExits} (per-tick gate).
+   */
+  private autoManageImportedTradierOptions: boolean;
   private currentDayKey = toDateKey(Date.now());
 
   constructor(config: OptionsAccountConfig = {}) {
@@ -115,6 +167,7 @@ export class PaperOptionsAccount {
     this.otmRiskParams = config.otmRiskParams ?? OTM_RISK_PARAMS;
     this.rvRiskParams = config.rvRiskParams ?? RV_RISK_PARAMS;
     this.tradierEnv = config.tradierEnv ?? null;
+    this.autoManageImportedTradierOptions = config.autoManageImportedTradierOptions ?? true;
     this.equity = this.initialEquity;
     this.cash = this.initialEquity;
   }
@@ -124,6 +177,11 @@ export class PaperOptionsAccount {
     return this.tradierEnv;
   }
 
+  /** TRA-361 — read the auto-manage-imports flag (tests / introspection). */
+  isAutoManagingImportedTradierOptions(): boolean {
+    return this.autoManageImportedTradierOptions;
+  }
+
   reset(config: OptionsAccountConfig = {}): void {
     if (config.initialEquity !== undefined) this.initialEquity = config.initialEquity;
     if (config.managedAccountRatio !== undefined) this.managedAccountRatio = config.managedAccountRatio;
@@ -131,6 +189,9 @@ export class PaperOptionsAccount {
     if (config.otmRiskParams !== undefined) this.otmRiskParams = config.otmRiskParams;
     if (config.rvRiskParams !== undefined) this.rvRiskParams = config.rvRiskParams;
     if (config.tradierEnv !== undefined) this.tradierEnv = config.tradierEnv;
+    if (config.autoManageImportedTradierOptions !== undefined) {
+      this.autoManageImportedTradierOptions = config.autoManageImportedTradierOptions;
+    }
     this.equity = this.initialEquity;
     this.cash = this.initialEquity;
     this.openOptions.clear();
@@ -147,6 +208,23 @@ export class PaperOptionsAccount {
     if (config.optionsDailyTradesLimit !== undefined) this.optionsDailyTradesLimit = config.optionsDailyTradesLimit;
     if (config.otmRiskParams !== undefined) this.otmRiskParams = config.otmRiskParams;
     if (config.rvRiskParams !== undefined) this.rvRiskParams = config.rvRiskParams;
+    if (config.autoManageImportedTradierOptions !== undefined) {
+      const next = config.autoManageImportedTradierOptions;
+      const prev = this.autoManageImportedTradierOptions;
+      this.autoManageImportedTradierOptions = next;
+      // TRA-361 — when the toggle flips while imports already exist, rewrite
+      // their SL/TP thresholds so the next tick reflects the new mode. Off →
+      // sentinels (legacy skip would have re-protected them); on → RV defaults
+      // relative to the imported `premiumPaid` so the user doesn't have to
+      // wait for the next `reconcileTradierPositions` sweep to start
+      // auto-managing.
+      if (prev !== next) {
+        for (const opt of this.openOptions.values()) {
+          if (!opt.importedFromTradier) continue;
+          applyImportedRiskThresholds(opt, this.rvRiskParams, next);
+        }
+      }
+    }
   }
 
   /** Current options daily cap — exposed so the UI can render a count badge. */
@@ -530,11 +608,17 @@ export class PaperOptionsAccount {
 
     for (const [id, opt] of this.openOptions) {
       if (mode !== undefined && (opt.mode ?? 'demo') !== mode) continue;
-      // TRA-323 — imported Tradier positions are user-closed only. The local
-      // engine doesn't own their entry premium, TP/SL schedule, or the cash
-      // bucket; auto-exiting them would create phantom realized P&L on the
-      // paper account while the position is still open on Tradier's books.
-      if (opt.importedFromTradier) continue;
+      const isImported = opt.importedFromTradier === true;
+      if (isImported) {
+        // TRA-361 — imports flow through SL/TP1/trail when auto-management is
+        // on AND the caller is mirroring to Tradier (wait-and-hold). When
+        // auto-management is off, fall back to the legacy TRA-323 user-closed-
+        // only behaviour. When waitAndHold is off there's no broker mirror to
+        // route the exit through; mutating the paper book here would create
+        // phantom realized P&L on a position still open at Tradier, so we skip.
+        if (!this.autoManageImportedTradierOptions) continue;
+        if (!waitAndHold) continue;
+      }
       // TRA-354 — a Tradier sell_to_close is already in flight; don't
       // re-fire the same exit or mutate the paper book until the engine's
       // poll path resolves the broker order.
@@ -559,17 +643,19 @@ export class PaperOptionsAccount {
       // OTM positions follow the OTM_RISK_PARAMS trail/partial schedule;
       // RV positions follow RV_RISK_PARAMS (TRA-191); ATM legacy paths stay on
       // OPTIONS_* constants so existing behaviour is unchanged for those tickets.
+      // TRA-361 — Tradier-imported positions inherit the RV schedule because
+      // the issue specifies RV defaults for auto-managed imports.
       let trailActivatePct: number;
       let trailOffsetPct: number;
       let partialExitRatio: number;
-      if (opt.signalType === 'otm_mispricing') {
-        trailActivatePct = this.otmRiskParams.trailActivatePct;
-        trailOffsetPct = this.otmRiskParams.trailOffsetPct;
-        partialExitRatio = this.otmRiskParams.partialExitRatio;
-      } else if (opt.signalType === 'relative_value') {
+      if (isImported || opt.signalType === 'relative_value') {
         trailActivatePct = this.rvRiskParams.trailActivatePct;
         trailOffsetPct = this.rvRiskParams.trailOffsetPct;
         partialExitRatio = this.rvRiskParams.partialExitRatio;
+      } else if (opt.signalType === 'otm_mispricing') {
+        trailActivatePct = this.otmRiskParams.trailActivatePct;
+        trailOffsetPct = this.otmRiskParams.trailOffsetPct;
+        partialExitRatio = this.otmRiskParams.partialExitRatio;
       } else {
         trailActivatePct = OPTIONS_TRAIL_ACTIVATE_PCT;
         trailOffsetPct = OPTIONS_TRAIL_OFFSET_PCT;
@@ -597,12 +683,16 @@ export class PaperOptionsAccount {
           if (waitAndHold) {
             // TRA-354 — stage the partial exit at the TP1 trigger price; engine
             // submits a Tradier limit sell_to_close and finalises on fill.
+            // TRA-361 — imports always reach this branch (the `!waitAndHold`
+            // guard up-top short-circuits them otherwise); LIMIT is correct
+            // for TP1 since the position is well in profit by definition.
             opt.pendingExit = {
               tradierOrderId: '',
               qty: exitContracts,
               limitPrice: opt.tp1Premium,
               submittedAt: Date.now(),
               kind: 'tp1',
+              pricing: 'limit',
             };
             delete opt.exitErrorReason;
             closed.push({ ...opt });
@@ -639,11 +729,26 @@ export class PaperOptionsAccount {
           // TRA-354 — stage the full exit at the trigger (SL or trailing)
           // price; engine submits a Tradier limit sell_to_close. The paper
           // book stays open until the broker fill (or reject) lands.
+          // TRA-361 — for an imported row whose mark sits deep below the SL
+          // (e.g. user's NFLX at −96% from premium), a LIMIT at the SL would
+          // never fill because the contract is bid below the trigger.
+          // Escalate to MARKET so the position actually exits. Engine-opened
+          // positions stay on LIMIT to honor the TRA-354 policy. We re-derive
+          // `slPct` from the stored thresholds rather than threading
+          // `rvRiskParams.slPct` through the test surface since imports
+          // always have `stopLossPremium = premiumPaid * (1 - slPct)`.
+          const slPct = opt.premiumPaid > 0 ? 1 - opt.stopLossPremium / opt.premiumPaid : 0;
+          const deepUnderwaterSL =
+            isImported
+            && exitKind === 'sl'
+            && slPct > 0
+            && mark < opt.stopLossPremium * (1 - slPct / 2);
           opt.pendingExit = {
             tradierOrderId: '',
             qty: opt.contractsRemaining,
             limitPrice: exitPremium,
             submittedAt: Date.now(),
+            pricing: deepUnderwaterSL ? 'market' : 'limit',
             kind: exitKind,
           };
           delete opt.exitErrorReason;
@@ -718,9 +823,18 @@ export class PaperOptionsAccount {
     }
 
     const pnl = (price - opt.premiumPaid) * exitContracts * 100;
-    this.cash += price * exitContracts * 100;
-    this.equity += pnl;
-    this.optionsPnlByMode[opt.mode ?? 'demo'] += pnl;
+    // TRA-361 — imported positions never touch the paper cash bucket; their
+    // proceeds live on Tradier. The engine attaches P&L to the closed-options
+    // row only so the dashboard's "Recent Closed" view reflects realized
+    // P&L (mirrors the recordImportedFill semantics for user-initiated
+    // closes). The per-mode realised total (`optionsPnlByMode`) is also
+    // skipped — the broker-attributed reconcile path
+    // (`addReconciledTradierPnl`) owns Tradier P&L attribution.
+    if (!opt.importedFromTradier) {
+      this.cash += price * exitContracts * 100;
+      this.equity += pnl;
+      this.optionsPnlByMode[opt.mode ?? 'demo'] += pnl;
+    }
     opt.pnl = (opt.pnl ?? 0) + pnl;
     opt.currentPremium = price;
     opt.contractsRemaining -= exitContracts;
@@ -835,6 +949,12 @@ export class PaperOptionsAccount {
           // refreshes it — better than zero or stale data.
           existing.currentPremium = incoming.premiumPaid;
           existing.peakPremium = Math.max(existing.peakPremium, incoming.premiumPaid);
+          // TRA-361 — premium just shifted (partial-fill / adjustment), so
+          // re-derive SL/TP1/trailing thresholds off the new entry price.
+          // Without this the SL fires off a stale `premiumPaid` snapshot.
+          if (premiumChanged) {
+            applyImportedRiskThresholds(existing, this.rvRiskParams, this.autoManageImportedTradierOptions);
+          }
           updated += 1;
         }
         continue;
@@ -851,10 +971,9 @@ export class PaperOptionsAccount {
         contractsRemaining: incoming.contracts,
         premiumPaid: incoming.premiumPaid,
         currentPremium: incoming.premiumPaid,
-        // Sentinels chosen so `checkExits()` never auto-fires on imported
-        // positions — the user closes them manually. tp1 above any plausible
-        // mark, SL at 0 (a contract can't trade below zero), trailing stop
-        // also at 0 even if it ever activated.
+        // TRA-361 — thresholds installed by `applyImportedRiskThresholds`
+        // below so the auto-manage flag and the new RV-defaults logic share
+        // one code path with the toggle-flip case in `updateConfig`.
         tp1Premium: Number.POSITIVE_INFINITY,
         tp1Hit: false,
         stopLossPremium: 0,
@@ -869,6 +988,7 @@ export class PaperOptionsAccount {
         importedFromTradier: true,
         ...(this.tradierEnv ? { tradierEnv: this.tradierEnv } : {}),
       };
+      applyImportedRiskThresholds(position, this.rvRiskParams, this.autoManageImportedTradierOptions);
       this.openOptions.set(position.id, position);
       added += 1;
     }

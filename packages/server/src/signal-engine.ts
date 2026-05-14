@@ -1,6 +1,6 @@
 import { OrbStrategy, BbFadeStrategy, IchimokuStrategy, TradierOptionsClient, TradierOrderClient, TRADIER_REJECTED_STATUSES } from '@trading-app/engine';
 import type { TradierAccountBalance } from '@trading-app/engine';
-import { WATCHLIST, MANAGED_ACCOUNT_RATIO, MAX_CONSECUTIVE_LOSSES, DAILY_DRAWDOWN_HALT_PCT, aliasWatchlistSymbol, isLiveTradierOptionsEnabled, isStockMarketOpen, resolveManagedAccountRatio, resolveRiskPerTrade, resolveTradierOptionsCreds } from '@trading-app/shared';
+import { WATCHLIST, MANAGED_ACCOUNT_RATIO, MAX_CONSECUTIVE_LOSSES, DAILY_DRAWDOWN_HALT_PCT, aliasWatchlistSymbol, isLiveTradierOptionsEnabled, isStockMarketOpen, resolveAutoManageImportedTradierOptions, resolveManagedAccountRatio, resolveRiskPerTrade, resolveTradierOptionsCreds } from '@trading-app/shared';
 import type { TradeSignal, RelativeValueSignal, Candle, OptionsAccountState, SignalType, Position, AccountSettings, AccountState, NewsItem, TradierEnv } from '@trading-app/shared';
 import { fetchMinuteBars, fetchQuotes, fetchStocksNews, isYahooBreakerOpen, setActiveInterestSymbols } from './yahoo-feed.js';
 import { PaperAccount } from './paper-account.js';
@@ -316,18 +316,21 @@ export class SignalEngine {
       riskPerTrade: demoStocksRisk,
     });
     this.tradierEnv = settings?.liveTradierEnvOptions ?? 'sandbox';
+    const autoManageImports = settings ? resolveAutoManageImportedTradierOptions(settings) : true;
     this.optionsAccounts = {
       sandbox: new PaperOptionsAccount({
         initialEquity: currentEquity,
         managedAccountRatio: demoStocksRatio,
         optionsDailyTradesLimit: activeOptionsDailyLimit(settings),
         tradierEnv: 'sandbox',
+        autoManageImportedTradierOptions: autoManageImports,
       }),
       production: new PaperOptionsAccount({
         initialEquity: currentEquity,
         managedAccountRatio: liveStocksRatio,
         optionsDailyTradesLimit: activeOptionsDailyLimit(settings),
         tradierEnv: 'production',
+        autoManageImportedTradierOptions: autoManageImports,
       }),
     };
     if (settings) {
@@ -388,13 +391,16 @@ export class SignalEngine {
       managedAccountRatio: demoStocksRatio,
       riskPerTrade: demoStocksRisk,
     });
+    const autoManageImports = resolveAutoManageImportedTradierOptions(settings);
     this.optionsAccounts.sandbox.updateConfig({
       managedAccountRatio: demoStocksRatio,
       optionsDailyTradesLimit: activeOptionsDailyLimit(settings),
+      autoManageImportedTradierOptions: autoManageImports,
     });
     this.optionsAccounts.production.updateConfig({
       managedAccountRatio: liveStocksRatio,
       optionsDailyTradesLimit: activeOptionsDailyLimit(settings),
+      autoManageImportedTradierOptions: autoManageImports,
     });
     // TRA-221 — re-resolve the Tradier live client whenever settings change
     // so toggling Live mode or editing the API token takes effect on the
@@ -1058,12 +1064,19 @@ export class SignalEngine {
       const intent = snapshot.pendingExit;
       if (!intent || !snapshot.optionSymbol) continue;
       let resp: import('@trading-app/engine').TradierOrderResponse;
+      // TRA-361 — imports whose mark sits deep below SL escalate to MARKET so
+      // an unfillable limit doesn't leave the position stuck open. Engine-
+      // opened positions keep LIMIT (TRA-354 policy) — the staged intent
+      // already encodes the right pricing.
+      const isMarket = intent.pricing === 'market';
       try {
-        resp = await this.tradierLiveClient.sellContractsLimit(
-          snapshot.optionSymbol,
-          intent.qty,
-          intent.limitPrice,
-        );
+        resp = isMarket
+          ? await this.tradierLiveClient.sellContracts(snapshot.optionSymbol, intent.qty)
+          : await this.tradierLiveClient.sellContractsLimit(
+              snapshot.optionSymbol,
+              intent.qty,
+              intent.limitPrice,
+            );
       } catch (err: unknown) {
         const reason = `Tradier sell_to_close submit threw: ${err instanceof Error ? err.message : String(err)}`;
         acct.clearPendingExit(snapshot.id, reason);
@@ -1072,9 +1085,13 @@ export class SignalEngine {
       }
 
       acct.attachPendingExit(snapshot.id, resp.id);
+      const priceTag = isMarket
+        ? '@ market'
+        : `@ limit $${intent.limitPrice.toFixed(2)}`;
       console.log(
         `[signal-engine] tradier sell_to_close ${snapshot.optionSymbol} qty=${intent.qty} `
-        + `@ limit $${intent.limitPrice.toFixed(2)} order=${resp.id} status=${resp.status} kind=${intent.kind}`,
+        + `${priceTag} order=${resp.id} status=${resp.status} kind=${intent.kind}`
+        + (snapshot.importedFromTradier ? ' (imported)' : ''),
       );
 
       // Reach for terminal status synchronously — same pattern as TRA-319's

@@ -1644,6 +1644,31 @@ export default function SettingsPage({ token, httpUrl, context, onModeChange, on
                   </label>
                 </div>
 
+                {/* TRA-361 — auto-manage Tradier-imported option positions.
+                    When on, imports synced from Tradier flow through the
+                    engine SL / TP1-partial / trailing-stop pipeline and exits
+                    are mirrored back to Tradier as `sell_to_close` orders.
+                    Default on so the user's stated bug ("no options are being
+                    closed automatically") is fixed by default. */}
+                <div className="settings-field" style={{ marginTop: '1rem' }}>
+                  <label className="checkbox-option">
+                    <input
+                      type="checkbox"
+                      checked={settings.autoManageImportedTradierOptions !== false}
+                      onChange={e => set('autoManageImportedTradierOptions', e.target.checked)}
+                    />
+                    <span>
+                      <strong>Auto-manage imported Tradier option positions</strong>
+                      <p className="field-hint">
+                        Apply the engine's stop-loss, partial-take-profit, and trailing-stop rules to
+                        option positions imported from Tradier (synced or auto-reconciled). Exits are
+                        mirrored to Tradier as <code>sell_to_close</code> orders — the local paper
+                        cash bucket is never touched. Turn off to keep imports user-closed only.
+                      </p>
+                    </span>
+                  </label>
+                </div>
+
                 <div className="settings-field" style={{ marginTop: '1rem' }}>
                   <button
                     type="button"

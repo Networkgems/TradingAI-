@@ -552,6 +552,20 @@ export interface AccountSettings {
    */
   liveTradeEquitiesTradier?: boolean;
   /**
+   * TRA-361 — when `true`, Tradier-imported option positions (synced via
+   * TRA-323 or the TRA-356 periodic reconcile) flow through the same engine
+   * SL / TP1-partial / trailing-stop pipeline as engine-opened positions.
+   * Imported exits are mirrored to Tradier as `sell_to_close` orders and
+   * the paper cash bucket is NOT mutated (proceeds live on the broker).
+   * When `false`, imports keep the legacy TRA-323 "user-closed only"
+   * behaviour with sentinel SL/TP thresholds. Default `true` so the user's
+   * stated bug ("no options are being closed automatically") is fixed by
+   * default; users can opt out from the Settings page.
+   *
+   * Absent ↔ default true.
+   */
+  autoManageImportedTradierOptions?: boolean;
+  /**
    * TRA-325 — active crypto-strategy preset id (see {@link STRATEGY_PRESETS}).
    * The engine reads this on every tick so a switch takes effect on the next
    * evaluation; no restart required. Optional for back-compat with snapshots
@@ -605,6 +619,7 @@ export const DEFAULT_ACCOUNT_SETTINGS: AccountSettings = {
   liveTradierEnvOptions: 'sandbox',
   liveTradierMarkets: 'options',
   liveTradeEquitiesTradier: false,
+  autoManageImportedTradierOptions: true,
   activeStrategyPreset: DEFAULT_STRATEGY_PRESET_ID,
 };
 
@@ -655,6 +670,17 @@ export function isLiveTradierOptionsEnabled(s: AccountSettings): boolean {
 export function isLiveTradierEquityEnabled(s: AccountSettings): boolean {
   const markets = resolveLiveTradierMarkets(s);
   return markets === 'equity' || markets === 'both';
+}
+
+/**
+ * TRA-361 — resolve whether Tradier-imported option positions should flow
+ * through the engine SL/TP1/trailing pipeline. Defaults to `true` so the
+ * "imported positions sit unmanaged" bug is fixed by default; users can opt
+ * out from the Settings page (auto-management off ↔ legacy TRA-323
+ * user-closed-only behaviour with sentinel thresholds).
+ */
+export function resolveAutoManageImportedTradierOptions(s: AccountSettings): boolean {
+  return s.autoManageImportedTradierOptions !== false;
 }
 
 /**
@@ -924,6 +950,13 @@ export interface OptionPendingExit {
   submittedAt: number;
   /** Which engine trigger staged this exit — drives partial vs full finalise. */
   kind: 'tp1' | 'sl' | 'trail';
+  /**
+   * TRA-361 — order type the engine should submit to Tradier. Defaults to
+   * `'limit'` (TRA-354 wait-and-hold behaviour). Set to `'market'` for the
+   * deep-underwater imported-position escalation so an unfillable limit
+   * doesn't leave the position stuck open after SL trips.
+   */
+  pricing?: 'limit' | 'market';
 }
 
 export interface OptionPosition {

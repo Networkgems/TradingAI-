@@ -545,13 +545,16 @@ describe('PaperOptionsAccount.reconcileTradierPositions', () => {
     expect(survivor?.premiumPaid).toBe(beforePremium);
   });
 
-  it('checkExits skips imported positions so they are never auto-closed', () => {
+  it('checkExits skips imported positions without waitAndHold (no broker mirror available)', () => {
     const acct = new PaperOptionsAccount({ initialEquity: 25_000, tradierEnv: 'sandbox' });
     acct.reconcileTradierPositions([buildTradierPosition({ premiumPaid: 1.6 })]);
     const open = acct.getState().openOptions[0];
 
-    // Even with a mark that would normally trigger SL, imported rows must
-    // be left alone — the user closes them manually via Tradier.
+    // TRA-361 — even with auto-management on (default), the caller must run
+    // checkExits in waitAndHold mode for imports to fire. Without it there's
+    // no path to mirror the exit to Tradier, and mutating the paper book
+    // here would phantom-credit cash for a position still open at the
+    // broker. The signal-engine only enables waitAndHold under live mirroring.
     const closed = acct.checkExits(new Map(), new Map([[open.optionSymbol!, 0.01]]), 'live');
     expect(closed).toEqual([]);
     expect(acct.getState().openOptions).toHaveLength(1);
@@ -571,6 +574,188 @@ describe('PaperOptionsAccount.reconcileTradierPositions', () => {
     expect(acct.getState().openOptions).toHaveLength(0);
     // Cash untouched — imported positions never lived on the paper bucket.
     expect(acct.getState().optionsCash).toBe(cashBefore);
+  });
+});
+
+// ─── TRA-361: auto-manage imported Tradier positions ────────────────────────
+
+describe('PaperOptionsAccount auto-manage imported (TRA-361)', () => {
+  // Mirrors the RV defaults from @trading-app/shared at the time of writing.
+  // The test asserts a stable relationship (`SL = premiumPaid * (1 - slPct)`)
+  // rather than a hard-coded number so a future RV-default tweak keeps the
+  // contract intact.
+  const importedSL = (premium: number, slPct: number) => premium * (1 - slPct);
+  const importedTP1 = (premium: number, tp1Pct: number) => premium * (1 + tp1Pct);
+
+  it('reconcile installs RV-default SL/TP/trail thresholds when auto-manage is on', () => {
+    const acct = new PaperOptionsAccount({
+      initialEquity: 25_000,
+      tradierEnv: 'sandbox',
+      autoManageImportedTradierOptions: true,
+      rvRiskParams: {
+        budgetRatio: 0.025,
+        slPct: 0.25,
+        tp1Pct: 0.50,
+        trailActivatePct: 0.20,
+        trailOffsetPct: 0.12,
+        partialExitRatio: 0.50,
+        dailyLimit: 4,
+      },
+    });
+    acct.reconcileTradierPositions([buildTradierPosition({ premiumPaid: 2.0 })]);
+    const opt = acct.getState().openOptions[0];
+    expect(opt.stopLossPremium).toBeCloseTo(importedSL(2.0, 0.25), 5); // 1.50
+    expect(opt.tp1Premium).toBeCloseTo(importedTP1(2.0, 0.50), 5); // 3.00
+    // Pre-activation sentinel: trailing stop seeded at activation threshold.
+    expect(opt.trailingStopPremium).toBeCloseTo(2.0 * 1.20, 5); // 2.40
+    expect(opt.trailingActive).toBe(false);
+    expect(opt.tp1Hit).toBe(false);
+  });
+
+  it('reconcile keeps sentinel thresholds when auto-manage is off', () => {
+    const acct = new PaperOptionsAccount({
+      initialEquity: 25_000,
+      tradierEnv: 'sandbox',
+      autoManageImportedTradierOptions: false,
+    });
+    acct.reconcileTradierPositions([buildTradierPosition({ premiumPaid: 2.0 })]);
+    const opt = acct.getState().openOptions[0];
+    expect(opt.tp1Premium).toBe(Number.POSITIVE_INFINITY);
+    expect(opt.stopLossPremium).toBe(0);
+    expect(opt.trailingStopPremium).toBe(0);
+  });
+
+  it('flipping the toggle live (updateConfig) rewrites thresholds on existing imports', () => {
+    const acct = new PaperOptionsAccount({
+      initialEquity: 25_000,
+      tradierEnv: 'sandbox',
+      autoManageImportedTradierOptions: false,
+    });
+    acct.reconcileTradierPositions([buildTradierPosition({ premiumPaid: 2.0 })]);
+    expect(acct.getState().openOptions[0].stopLossPremium).toBe(0);
+
+    acct.updateConfig({ autoManageImportedTradierOptions: true });
+    const after = acct.getState().openOptions[0];
+    expect(after.stopLossPremium).toBeGreaterThan(0);
+    expect(after.tp1Premium).toBeLessThan(Number.POSITIVE_INFINITY);
+  });
+
+  it('checkExits stages a pendingExit LIMIT on imported SL trip without touching paper cash', () => {
+    const acct = new PaperOptionsAccount({
+      initialEquity: 25_000,
+      tradierEnv: 'sandbox',
+      autoManageImportedTradierOptions: true,
+    });
+    acct.reconcileTradierPositions([buildTradierPosition({ premiumPaid: 2.0 })]);
+    const open = acct.getState().openOptions[0];
+    const cashBefore = acct.getState().optionsCash;
+    const pnlBefore = acct.getState().optionsPnl;
+
+    // Mark just below SL but well above the deep-underwater threshold:
+    // SL = 1.50 (slPct=0.25 default); pick 1.45 which is inside the
+    // [SL*(1−slPct/2), SL] band = [1.3125, 1.50].
+    const staged = acct.checkExits(
+      new Map(),
+      new Map([[open.optionSymbol!, 1.45]]),
+      'live',
+      { waitAndHold: true },
+    );
+
+    expect(staged).toHaveLength(1);
+    const pending = staged[0].pendingExit;
+    expect(pending?.kind).toBe('sl');
+    expect(pending?.pricing).toBe('limit');
+    expect(pending?.qty).toBe(open.contracts);
+
+    // Position must still be open; pendingExit attached.
+    const state = acct.getState();
+    expect(state.openOptions).toHaveLength(1);
+    expect(state.openOptions[0].pendingExit).toBeDefined();
+    // Phantom-P&L guardrail: nothing hits paper cash or the per-mode bucket.
+    expect(state.optionsCash).toBe(cashBefore);
+    expect(state.optionsPnl).toBe(pnlBefore);
+  });
+
+  it('checkExits escalates to MARKET pricing when an imported row is deep-underwater', () => {
+    const acct = new PaperOptionsAccount({
+      initialEquity: 25_000,
+      tradierEnv: 'sandbox',
+      autoManageImportedTradierOptions: true,
+    });
+    acct.reconcileTradierPositions([buildTradierPosition({ premiumPaid: 10.0 })]);
+    const open = acct.getState().openOptions[0];
+
+    // Default slPct = 0.25; SL = 7.50. Deep threshold = SL * (1 − slPct/2)
+    // = 7.50 * 0.875 = 6.5625. NFLX-style "-96%" mark: 0.40 sits well below.
+    const staged = acct.checkExits(
+      new Map(),
+      new Map([[open.optionSymbol!, 0.40]]),
+      'live',
+      { waitAndHold: true },
+    );
+    expect(staged).toHaveLength(1);
+    expect(staged[0].pendingExit?.pricing).toBe('market');
+    expect(staged[0].pendingExit?.kind).toBe('sl');
+  });
+
+  it('checkExits leaves imports alone when auto-manage is off (legacy TRA-323 skip)', () => {
+    const acct = new PaperOptionsAccount({
+      initialEquity: 25_000,
+      tradierEnv: 'sandbox',
+      autoManageImportedTradierOptions: false,
+    });
+    acct.reconcileTradierPositions([buildTradierPosition({ premiumPaid: 1.6 })]);
+    const open = acct.getState().openOptions[0];
+
+    // Even in waitAndHold mode, a mark that would otherwise trip the SL must
+    // not stage a pending exit when the user has opted out.
+    const closed = acct.checkExits(
+      new Map(),
+      new Map([[open.optionSymbol!, 0.01]]),
+      'live',
+      { waitAndHold: true },
+    );
+    expect(closed).toEqual([]);
+    expect(acct.getState().openOptions[0].pendingExit).toBeUndefined();
+  });
+
+  it('finalizePendingExit on an imported full-close does NOT mutate paper cash/per-mode P&L', () => {
+    const acct = new PaperOptionsAccount({
+      initialEquity: 25_000,
+      tradierEnv: 'sandbox',
+      autoManageImportedTradierOptions: true,
+    });
+    acct.reconcileTradierPositions([buildTradierPosition({ contracts: 2, premiumPaid: 2.0 })]);
+    const open = acct.getState().openOptions[0];
+
+    // Trip SL → stage pendingExit
+    const staged = acct.checkExits(
+      new Map(),
+      new Map([[open.optionSymbol!, 1.45]]),
+      'live',
+      { waitAndHold: true },
+    );
+    expect(staged).toHaveLength(1);
+    acct.attachPendingExit(open.id, 'tradier-order-1');
+
+    const cashBefore = acct.getState().optionsCash;
+    const pnlBefore = acct.getState().optionsPnl;
+
+    // Pretend Tradier filled at $1.50 — paper cash must not be credited.
+    const finalised = acct.finalizePendingExit(open.id, 1.50);
+    expect(finalised).not.toBeNull();
+    expect(finalised?.contractsRemaining).toBe(0);
+    // P&L is attached to the position snapshot so the dashboard's closed-row
+    // shows realised loss — same convention as recordImportedFill — but the
+    // bucket-wide totals stay untouched (broker-attributed reconcile path
+    // owns Tradier P&L).
+    expect(finalised?.pnl).toBeCloseTo((1.50 - 2.0) * 2 * 100, 5); // -$100
+
+    const state = acct.getState();
+    expect(state.openOptions).toHaveLength(0);
+    expect(state.optionsCash).toBe(cashBefore);
+    expect(state.optionsPnl).toBe(pnlBefore);
+    expect(state.closedOptions.find(o => o.id === open.id)).toBeDefined();
   });
 });
 
