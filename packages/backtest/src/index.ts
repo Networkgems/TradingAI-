@@ -61,3 +61,29 @@ export {
   loadOrFetch4hBars,
 } from './fetch-tra266-data.js';
 export type { CacheEntry } from './fetch-tra266-data.js';
+// TRA-376 — historical option-chain replay backtest harness.
+export { loadChainDays, estimateSpotFromChain } from './options-chain-store.js';
+export type { ChainDay, OptionChainSnapshotFile } from './options-chain-store.js';
+export { OptionsReplayAccount } from './options-replay-account.js';
+export type {
+  ReplayPosition,
+  ReplaySignalType,
+  OpenOtmCandidate,
+  OpenRvCandidate,
+  OpenOutcome,
+  OptionsReplayAccountConfig,
+  EquitySample,
+} from './options-replay-account.js';
+export {
+  summarizeBucket,
+  maxDrawdown,
+  buildCsv,
+  buildMarkdown,
+} from './options-replay-report.js';
+export type { BucketResult, ClassificationStat } from './options-replay-report.js';
+export {
+  replayBucket,
+  runOptionsReplay,
+  DEFAULT_REPLAY_CONFIG,
+} from './run-options-replay.js';
+export type { ReplayConfig } from './run-options-replay.js';
