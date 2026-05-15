@@ -600,6 +600,17 @@ export interface AccountSettings {
   rvDteMin?: number;
   rvDteMax?: number;
   rvDteTarget?: number;
+  /**
+   * TRA-374 — demo-only execution cost model. Adds a fractional slippage
+   * haircut and a per-contract fee to demo option opens and closes so the
+   * demo book doesn't systematically overstate P&L vs. live (Tradier pays
+   * the real spread end-to-end). Defaults are `0.0` / `0.0` so the model
+   * is opt-in until QA flips it on — soft-launch per the issue spec.
+   * Live mode never applies these (real broker slippage and fees flow
+   * through the Tradier `buy_to_open` / `sell_to_close` paths).
+   */
+  demoSlippagePct?: number;
+  demoFeePerContract?: number;
 }
 
 export const DEFAULT_ACCOUNT_SETTINGS: AccountSettings = {
@@ -654,6 +665,9 @@ export const DEFAULT_ACCOUNT_SETTINGS: AccountSettings = {
   rvDteMin: 21,
   rvDteMax: 60,
   rvDteTarget: 35,
+  // TRA-374 — demo cost model defaults off until QA flips it on.
+  demoSlippagePct: 0,
+  demoFeePerContract: 0,
 };
 
 /**
@@ -724,6 +738,33 @@ export function resolveLiveTradeEquitiesTradier(s: AccountSettings): boolean {
  */
 export function resolveAutoManageImportedTradierOptions(s: AccountSettings): boolean {
   return s.autoManageImportedTradierOptions !== false;
+}
+
+export interface DemoCostModel {
+  /** Fractional slippage haircut applied to demo option open + close prices (≥ 0). */
+  slippagePct: number;
+  /** Per-contract fee debited from demo cash on each open and close (≥ 0). */
+  feePerContract: number;
+}
+
+/**
+ * TRA-374 — resolve the demo cost-model knobs. Defaults to 0 / 0 (haircut off)
+ * so the soft-launch behaviour is the legacy book-at-mid path until QA / the
+ * user opts in via Settings. Negative or non-finite saves are coerced to 0
+ * so a fat-finger entry can never credit P&L instead of debiting it.
+ */
+export function resolveDemoCostModel(s: AccountSettings): DemoCostModel {
+  const slippagePct =
+    typeof s.demoSlippagePct === 'number' && Number.isFinite(s.demoSlippagePct) && s.demoSlippagePct >= 0
+      ? s.demoSlippagePct
+      : 0;
+  const feePerContract =
+    typeof s.demoFeePerContract === 'number'
+    && Number.isFinite(s.demoFeePerContract)
+    && s.demoFeePerContract >= 0
+      ? s.demoFeePerContract
+      : 0;
+  return { slippagePct, feePerContract };
 }
 
 /** TRA-373 — spec defaults for the RV scanner DTE window. */
@@ -1147,6 +1188,19 @@ export interface OptionsAccountState {
   optionsPnl: number;
   optionsCash: number;
   dailyOptionsCount: number;  // number of options opened today (resets at market open)
+  /**
+   * TRA-374 — running cumulative cost of the demo slippage haircut applied
+   * by the demo cost model. Always 0 in `getStateForMode('live')` (live pays
+   * real Tradier slippage; modelling it locally would double-count).
+   * Optional for back-compat — older persisted state files don't carry it.
+   */
+  demoSlippageCost?: number;
+  /**
+   * TRA-374 — running cumulative cost of the demo per-contract fee debit
+   * applied by the demo cost model. Same back-compat caveat as
+   * {@link demoSlippageCost}.
+   */
+  demoFeeCost?: number;
 }
 
 export const WATCHLIST: readonly string[] = [

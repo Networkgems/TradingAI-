@@ -32,6 +32,16 @@ function toDateKey(ts: number): string {
 }
 
 /**
+ * TRA-374 — coerce a config knob to a finite, non-negative number. Used so
+ * a fat-finger AccountSettings save can't accidentally invert the demo cost
+ * model (negative slippage would credit P&L instead of debiting it).
+ */
+function normalizeNonNegative(value: number | undefined, fallback: number): number {
+  if (typeof value !== 'number' || !Number.isFinite(value) || value < 0) return fallback;
+  return value;
+}
+
+/**
  * TRA-361 — write SL/TP1/trailing thresholds onto an imported (Tradier) row
  * based on the current auto-management policy. When auto-management is on we
  * size SL/TP off the user's `premiumPaid` using the RV defaults; when off we
@@ -104,6 +114,24 @@ interface OptionsAccountConfig {
    * and `checkExits` skips them (legacy TRA-323 behaviour).
    */
   autoManageImportedTradierOptions?: boolean;
+  /**
+   * TRA-374 — demo-only slippage haircut applied to per-share premium at
+   * BOTH open and close paths so the demo book doesn't systematically over-
+   * state P&L vs. live (where Tradier pays the real spread). Entry bumps
+   * `premiumPaid` to `signal.mark × (1 + slippagePct)`; exit credits
+   * `exitPremium × (1 − slippagePct)`. Default `0.05` (5%) — the issue's
+   * spec figure derived from observed round-trip spread cost on the wide-
+   * spread RV universe. Set to `0.0` to disable the haircut (the soft-launch
+   * default the issue hints at). Live mode never applies this — Tradier
+   * already pays the real spread end-to-end.
+   */
+  demoSlippagePct?: number;
+  /**
+   * TRA-374 — per-contract fee debited from `cash` on BOTH open and close
+   * in demo mode only. Default `0.35` covers Tradier regulatory + assignment
+   * fees on equity options, rounded up. Set to `0.0` to disable.
+   */
+  demoFeePerContract?: number;
 }
 
 /**
@@ -171,6 +199,19 @@ export class PaperOptionsAccount {
    * {@link consumeRealtimeImportedPnl}.
    */
   private realtimeImportedPnlByDate: Map<string, number> = new Map();
+  /**
+   * TRA-374 — demo cost model knobs and running cumulative-cost accumulators.
+   * `demoSlippagePct` and `demoFeePerContract` are stored on the instance so
+   * {@link updateConfig} can flip them at runtime (so the user can roll the
+   * cost model out behind an account setting per the issue's soft-launch
+   * suggestion). `demoSlippageCost` / `demoFeeCost` accumulate across opens
+   * and closes so the dashboard's P&L breakdown can show how much drag the
+   * model has imposed; both reset on {@link reset}.
+   */
+  private demoSlippagePct: number;
+  private demoFeePerContract: number;
+  private demoSlippageCost = 0;
+  private demoFeeCost = 0;
   private currentDayKey = toDateKey(Date.now());
 
   constructor(config: OptionsAccountConfig = {}) {
@@ -181,6 +222,10 @@ export class PaperOptionsAccount {
     this.rvRiskParams = config.rvRiskParams ?? RV_RISK_PARAMS;
     this.tradierEnv = config.tradierEnv ?? null;
     this.autoManageImportedTradierOptions = config.autoManageImportedTradierOptions ?? true;
+    // TRA-374 — start at 0/0 by default so the cost model is opt-in until
+    // the user (or QA) deliberately flips it on via AccountSettings.
+    this.demoSlippagePct = normalizeNonNegative(config.demoSlippagePct, 0);
+    this.demoFeePerContract = normalizeNonNegative(config.demoFeePerContract, 0);
     this.equity = this.initialEquity;
     this.cash = this.initialEquity;
   }
@@ -205,6 +250,12 @@ export class PaperOptionsAccount {
     if (config.autoManageImportedTradierOptions !== undefined) {
       this.autoManageImportedTradierOptions = config.autoManageImportedTradierOptions;
     }
+    if (config.demoSlippagePct !== undefined) {
+      this.demoSlippagePct = normalizeNonNegative(config.demoSlippagePct, this.demoSlippagePct);
+    }
+    if (config.demoFeePerContract !== undefined) {
+      this.demoFeePerContract = normalizeNonNegative(config.demoFeePerContract, this.demoFeePerContract);
+    }
     this.equity = this.initialEquity;
     this.cash = this.initialEquity;
     this.openOptions.clear();
@@ -213,6 +264,8 @@ export class PaperOptionsAccount {
     this.dailyCount = 0;
     this.dailyOtmCount = 0;
     this.dailyRvCount = 0;
+    this.demoSlippageCost = 0;
+    this.demoFeeCost = 0;
     this.currentDayKey = toDateKey(Date.now());
   }
 
@@ -237,6 +290,12 @@ export class PaperOptionsAccount {
           applyImportedRiskThresholds(opt, this.rvRiskParams, next);
         }
       }
+    }
+    if (config.demoSlippagePct !== undefined) {
+      this.demoSlippagePct = normalizeNonNegative(config.demoSlippagePct, this.demoSlippagePct);
+    }
+    if (config.demoFeePerContract !== undefined) {
+      this.demoFeePerContract = normalizeNonNegative(config.demoFeePerContract, this.demoFeePerContract);
     }
   }
 
@@ -281,6 +340,11 @@ export class PaperOptionsAccount {
       optionsPnl: this.totalOptionsPnl(),
       optionsCash: this.cash,
       dailyOptionsCount: this.dailyCount + this.dailyOtmCount + this.dailyRvCount,
+      // TRA-374 — surface the cumulative demo cost-model drag so the dashboard
+      // P&L breakdown can show how much of the gap between gross and net was
+      // modelled rather than real.
+      demoSlippageCost: this.demoSlippageCost,
+      demoFeeCost: this.demoFeeCost,
     };
   }
 
@@ -309,6 +373,11 @@ export class PaperOptionsAccount {
       optionsPnl: this.optionsPnlByMode[mode],
       optionsCash: mode === 'demo' ? 0 : this.cash,
       dailyOptionsCount: this.dailyCount + this.dailyOtmCount + this.dailyRvCount,
+      // TRA-374 — the cost model is demo-only by construction; live mode
+      // pays real Tradier slippage so we surface 0 there to avoid implying
+      // a duplicate haircut on live trades.
+      demoSlippageCost: mode === 'demo' ? this.demoSlippageCost : 0,
+      demoFeeCost: mode === 'demo' ? this.demoFeeCost : 0,
     };
   }
 
@@ -395,8 +464,13 @@ export class PaperOptionsAccount {
     );
     if (existing) return null;
 
-    const premiumPaid = signal.mark;
-    if (!Number.isFinite(premiumPaid) || premiumPaid <= 0) return null;
+    // TRA-374 — in demo, bias `premiumPaid` up by `demoSlippagePct` so the
+    // demo book pays the modelled cost of crossing the spread instead of
+    // booking at the mid. Live mode keeps the raw mark — Tradier already
+    // charges the real spread end-to-end through the smart-open walk.
+    const rawMark = signal.mark;
+    if (!Number.isFinite(rawMark) || rawMark <= 0) return null;
+    const premiumPaid = mode === 'demo' ? rawMark * (1 + this.demoSlippagePct) : rawMark;
 
     const budget = this.otmBudgetPerTrade(equityOverride);
     const costPerContract = premiumPaid * 100;
@@ -404,10 +478,17 @@ export class PaperOptionsAccount {
     if (contracts <= 0) return null;
 
     const totalCost = contracts * costPerContract;
-    if (equityOverride === undefined && totalCost > this.cash) return null;
+    const demoFee = mode === 'demo' ? contracts * this.demoFeePerContract : 0;
+    if (equityOverride === undefined && totalCost + demoFee > this.cash) return null;
 
-    this.cash -= totalCost;
+    this.cash -= totalCost + demoFee;
     this.dailyOtmCount += 1;
+    if (mode === 'demo') {
+      // Accumulator runs in dollar terms so the dashboard can show the absolute
+      // drag the cost model imposed across the session.
+      this.demoSlippageCost += (premiumPaid - rawMark) * contracts * 100;
+      this.demoFeeCost += demoFee;
+    }
 
     const tp1Premium = premiumPaid * (1 + this.otmRiskParams.tp1Pct);
     const stopLossPremium = premiumPaid * (1 - this.otmRiskParams.slPct);
@@ -471,8 +552,10 @@ export class PaperOptionsAccount {
     );
     if (existing) return null;
 
-    const premiumPaid = signal.mark;
-    if (!Number.isFinite(premiumPaid) || premiumPaid <= 0) return null;
+    // TRA-374 — see `openOptionFromCandidate` for the demo cost-model rationale.
+    const rawMark = signal.mark;
+    if (!Number.isFinite(rawMark) || rawMark <= 0) return null;
+    const premiumPaid = mode === 'demo' ? rawMark * (1 + this.demoSlippagePct) : rawMark;
 
     const budget = this.rvBudgetPerTrade(equityOverride);
     const costPerContract = premiumPaid * 100;
@@ -480,10 +563,15 @@ export class PaperOptionsAccount {
     if (contracts <= 0) return null;
 
     const totalCost = contracts * costPerContract;
-    if (equityOverride === undefined && totalCost > this.cash) return null;
+    const demoFee = mode === 'demo' ? contracts * this.demoFeePerContract : 0;
+    if (equityOverride === undefined && totalCost + demoFee > this.cash) return null;
 
-    this.cash -= totalCost;
+    this.cash -= totalCost + demoFee;
     this.dailyRvCount += 1;
+    if (mode === 'demo') {
+      this.demoSlippageCost += (premiumPaid - rawMark) * contracts * 100;
+      this.demoFeeCost += demoFee;
+    }
 
     const tp1Premium = premiumPaid * (1 + this.rvRiskParams.tp1Pct);
     const stopLossPremium = premiumPaid * (1 - this.rvRiskParams.slPct);
@@ -711,12 +799,28 @@ export class PaperOptionsAccount {
             closed.push({ ...opt });
             continue;
           }
-          const partialPnl = (mark - opt.premiumPaid) * exitContracts * 100;
-          this.cash += mark * exitContracts * 100;
-          this.equity += partialPnl;
+          // TRA-374 — apply the demo cost model on exit (slippage haircut +
+          // per-contract fee) so the demo book pays the modelled round-trip
+          // cost of crossing the spread back out. Live closes go through the
+          // Tradier `sell_to_close` path so we'd be double-counting.
+          const positionMode = opt.mode ?? 'demo';
+          const effectiveExit =
+            positionMode === 'demo' ? mark * (1 - this.demoSlippagePct) : mark;
+          const exitFee =
+            positionMode === 'demo' ? exitContracts * this.demoFeePerContract : 0;
+          const partialPnl = (effectiveExit - opt.premiumPaid) * exitContracts * 100;
+          this.cash += effectiveExit * exitContracts * 100 - exitFee;
+          this.equity += partialPnl - exitFee;
           // TRA-246 — attribute realized P&L to the position's mode bucket so
           // the Demo / Live dashboards can show their own running totals.
-          this.optionsPnlByMode[opt.mode ?? 'demo'] += partialPnl;
+          // TRA-374 — fees are a cost, not a market outcome, so they reduce
+          // the P&L bucket too (otherwise dashboard P&L would diverge from
+          // cash drawdown).
+          this.optionsPnlByMode[positionMode] += partialPnl - exitFee;
+          if (positionMode === 'demo') {
+            this.demoSlippageCost += (mark - effectiveExit) * exitContracts * 100;
+            this.demoFeeCost += exitFee;
+          }
           opt.contractsRemaining -= exitContracts;
           opt.tp1Hit = true;
           // After partial exit, trailing is engaged on the remainder
@@ -769,16 +873,27 @@ export class PaperOptionsAccount {
           continue;
         }
         const remainingContracts = opt.contractsRemaining;
-        const pnl = (exitPremium - opt.premiumPaid) * remainingContracts * 100;
-        opt.pnl = (opt.pnl ?? 0) + pnl;
+        // TRA-374 — see partial-exit branch; same demo cost model on the full
+        // exit so SL / trailing closes pay the modelled round-trip cost.
+        const positionMode = opt.mode ?? 'demo';
+        const effectiveExit =
+          positionMode === 'demo' ? exitPremium * (1 - this.demoSlippagePct) : exitPremium;
+        const exitFee =
+          positionMode === 'demo' ? remainingContracts * this.demoFeePerContract : 0;
+        const pnl = (effectiveExit - opt.premiumPaid) * remainingContracts * 100;
+        opt.pnl = (opt.pnl ?? 0) + pnl - exitFee;
         opt.closedAt = Date.now();
-        opt.currentPremium = exitPremium;
+        opt.currentPremium = effectiveExit;
         opt.contractsRemaining = 0;
 
-        this.cash += exitPremium * remainingContracts * 100;
-        this.equity += pnl;
+        this.cash += effectiveExit * remainingContracts * 100 - exitFee;
+        this.equity += pnl - exitFee;
         // TRA-246 — see partial-exit comment above; same per-mode attribution.
-        this.optionsPnlByMode[opt.mode ?? 'demo'] += pnl;
+        this.optionsPnlByMode[positionMode] += pnl - exitFee;
+        if (positionMode === 'demo') {
+          this.demoSlippageCost += (exitPremium - effectiveExit) * remainingContracts * 100;
+          this.demoFeeCost += exitFee;
+        }
 
         this.openOptions.delete(id);
         this.closedOptions.push({ ...opt });
@@ -1266,16 +1381,29 @@ export class PaperOptionsAccount {
         ? overrideFillPrice
         : opt.currentPremium;
     const remainingContracts = opt.contractsRemaining;
-    const pnl = (closePrice - opt.premiumPaid) * remainingContracts * 100;
-    opt.pnl = (opt.pnl ?? 0) + pnl;
+    // TRA-374 — see `checkExits`: demo manual closes also pay the modelled
+    // round-trip cost. When the caller supplies `overrideFillPrice` (live
+    // path passes Tradier's avg fill) the close price is already net of
+    // real broker slippage, so we still skip the modelled haircut.
+    const positionMode = opt.mode ?? 'demo';
+    const effectiveExit =
+      positionMode === 'demo' ? closePrice * (1 - this.demoSlippagePct) : closePrice;
+    const exitFee =
+      positionMode === 'demo' ? remainingContracts * this.demoFeePerContract : 0;
+    const pnl = (effectiveExit - opt.premiumPaid) * remainingContracts * 100;
+    opt.pnl = (opt.pnl ?? 0) + pnl - exitFee;
     opt.closedAt = Date.now();
-    opt.currentPremium = closePrice;
+    opt.currentPremium = effectiveExit;
     opt.contractsRemaining = 0;
     delete opt.pendingCloseOrderId;
-    this.cash += closePrice * remainingContracts * 100;
-    this.equity += pnl;
+    this.cash += effectiveExit * remainingContracts * 100 - exitFee;
+    this.equity += pnl - exitFee;
     // TRA-246 — same per-mode attribution as the auto-exit paths above.
-    this.optionsPnlByMode[opt.mode ?? 'demo'] += pnl;
+    this.optionsPnlByMode[positionMode] += pnl - exitFee;
+    if (positionMode === 'demo') {
+      this.demoSlippageCost += (closePrice - effectiveExit) * remainingContracts * 100;
+      this.demoFeeCost += exitFee;
+    }
     this.openOptions.delete(optionId);
     this.closedOptions.push({ ...opt });
     return { ...opt };

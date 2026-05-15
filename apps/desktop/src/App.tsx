@@ -2656,6 +2656,22 @@ function Dashboard({ token, onLogout, onGoHome, onActivity, theme, onToggleTheme
                   )}
                   <span>Total Options P&amp;L: <strong className={optionsState.optionsPnl >= 0 ? 'green' : 'red'}>{fmtDollar(optionsState.optionsPnl)}</strong></span>
                   <span>Daily Trades: <strong className={optionsState.dailyOptionsCount >= optionsDailyLimit ? 'red' : ''}>{optionsState.dailyOptionsCount}/{optionsDailyLimit}</strong></span>
+                  {/* TRA-374 — surface the demo cost-model drag (slippage + per-contract fee)
+                      so the dashboard P&L breakdown is reconcilable. Hidden in live (the model
+                      is demo-only) and when both buckets are 0 so legacy demo accounts that
+                      never enabled the haircut don't see two empty pills. */}
+                  {accountMode === 'demo'
+                    && (typeof optionsState.demoSlippageCost === 'number' || typeof optionsState.demoFeeCost === 'number')
+                    && ((optionsState.demoSlippageCost ?? 0) > 0 || (optionsState.demoFeeCost ?? 0) > 0) ? (
+                    <>
+                      <span title="Demo-only modelled slippage haircut paid across opens + closes (TRA-374).">
+                        Demo Slippage: <strong className="red">−${fmt(optionsState.demoSlippageCost ?? 0)}</strong>
+                      </span>
+                      <span title="Demo-only modelled per-contract fee debited across opens + closes (TRA-374).">
+                        Demo Fees: <strong className="red">−${fmt(optionsState.demoFeeCost ?? 0)}</strong>
+                      </span>
+                    </>
+                  ) : null}
                 </div>
               );
             })()}

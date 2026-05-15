@@ -1,11 +1,12 @@
 import { OrbStrategy, BbFadeStrategy, IchimokuStrategy, TradierOptionsClient, TradierOrderClient, TRADIER_REJECTED_STATUSES } from '@trading-app/engine';
 import type { TradierAccountBalance } from '@trading-app/engine';
-import { WATCHLIST, MANAGED_ACCOUNT_RATIO, MAX_CONSECUTIVE_LOSSES, DAILY_DRAWDOWN_HALT_PCT, aliasWatchlistSymbol, isLiveTradierOptionsEnabled, isStockMarketOpen, resolveAutoManageImportedTradierOptions, resolveLiveTradeEquitiesTradier, resolveManagedAccountRatio, resolveRiskPerTrade, resolveRvDtePrefs, resolveTradierOptionsCreds, DEFAULT_RV_DTE_MIN, DEFAULT_RV_DTE_MAX, DEFAULT_RV_DTE_TARGET } from '@trading-app/shared';
+import { WATCHLIST, MANAGED_ACCOUNT_RATIO, MAX_CONSECUTIVE_LOSSES, DAILY_DRAWDOWN_HALT_PCT, aliasWatchlistSymbol, isLiveTradierOptionsEnabled, isStockMarketOpen, resolveAutoManageImportedTradierOptions, resolveDemoCostModel, resolveLiveTradeEquitiesTradier, resolveManagedAccountRatio, resolveRiskPerTrade, resolveRvDtePrefs, resolveTradierOptionsCreds, DEFAULT_RV_DTE_MIN, DEFAULT_RV_DTE_MAX, DEFAULT_RV_DTE_TARGET } from '@trading-app/shared';
 import type { TradeSignal, RelativeValueSignal, Candle, OptionsAccountState, SignalType, Position, AccountSettings, AccountState, NewsItem, TradierEnv } from '@trading-app/shared';
 import { fetchMinuteBars, fetchQuotes, fetchStocksNews, isYahooBreakerOpen, setActiveInterestSymbols } from './yahoo-feed.js';
 import { PaperAccount } from './paper-account.js';
 import { PaperOptionsAccount } from './options-account.js';
 import { reconcilePendingCloseOrder } from './tradier-smart-close.js';
+import { submitSmartBuyToOpen } from './tradier-smart-open.js';
 import type { RelativeValueScannerService } from './relative-value-scanner.js';
 import type { DailySignalRecord } from './reports/eod-report.js';
 import type { PnlTracker } from './pnl-tracker.js';
@@ -327,6 +328,8 @@ export class SignalEngine {
     });
     this.tradierEnv = settings?.liveTradierEnvOptions ?? 'sandbox';
     const autoManageImports = settings ? resolveAutoManageImportedTradierOptions(settings) : true;
+    // TRA-374 — demo cost model knobs (default 0 / 0 = off).
+    const demoCost = settings ? resolveDemoCostModel(settings) : { slippagePct: 0, feePerContract: 0 };
     this.optionsAccounts = {
       sandbox: new PaperOptionsAccount({
         initialEquity: currentEquity,
@@ -334,6 +337,8 @@ export class SignalEngine {
         optionsDailyTradesLimit: activeOptionsDailyLimit(settings),
         tradierEnv: 'sandbox',
         autoManageImportedTradierOptions: autoManageImports,
+        demoSlippagePct: demoCost.slippagePct,
+        demoFeePerContract: demoCost.feePerContract,
       }),
       production: new PaperOptionsAccount({
         initialEquity: currentEquity,
@@ -341,6 +346,8 @@ export class SignalEngine {
         optionsDailyTradesLimit: activeOptionsDailyLimit(settings),
         tradierEnv: 'production',
         autoManageImportedTradierOptions: autoManageImports,
+        demoSlippagePct: demoCost.slippagePct,
+        demoFeePerContract: demoCost.feePerContract,
       }),
     };
     if (settings) {
@@ -409,15 +416,22 @@ export class SignalEngine {
       riskPerTrade: demoStocksRisk,
     });
     const autoManageImports = resolveAutoManageImportedTradierOptions(settings);
+    // TRA-374 — flow demo cost model knobs through so a Settings edit takes
+    // effect on the next open / close without restarting the server.
+    const demoCost = resolveDemoCostModel(settings);
     this.optionsAccounts.sandbox.updateConfig({
       managedAccountRatio: demoStocksRatio,
       optionsDailyTradesLimit: activeOptionsDailyLimit(settings),
       autoManageImportedTradierOptions: autoManageImports,
+      demoSlippagePct: demoCost.slippagePct,
+      demoFeePerContract: demoCost.feePerContract,
     });
     this.optionsAccounts.production.updateConfig({
       managedAccountRatio: liveStocksRatio,
       optionsDailyTradesLimit: activeOptionsDailyLimit(settings),
       autoManageImportedTradierOptions: autoManageImports,
+      demoSlippagePct: demoCost.slippagePct,
+      demoFeePerContract: demoCost.feePerContract,
     });
     // TRA-221 — re-resolve the Tradier live client whenever settings change
     // so toggling Live mode or editing the API token takes effect on the
@@ -1320,29 +1334,42 @@ export class SignalEngine {
             continue;
           }
 
+          // TRA-374 — replace the legacy market `buy_to_open` with the
+          // smart-open limit walk so we no longer pay the ask by default on
+          // wide-spread RV contracts. The walk starts at `mid + 1¢` and
+          // steps 0.25/0.5/0.75/1.0 toward the ask if unfilled. If the walk
+          // exhausts (final attempt = ask, still unfilled) we void the
+          // paper open with a clear skip reason rather than crossing through
+          // with a market order at a worse price.
           let mirrored = false;
           try {
-            const resp = await this.tradierLiveClient.buyContracts(opened.optionSymbol, opened.contracts);
-            console.log(
-              `[signal-engine] tradier live buy_to_open ${opened.optionSymbol} qty=${opened.contracts} order=${resp.id} status=${resp.status}`,
+            const outcome = await submitSmartBuyToOpen(
+              this.tradierLiveClient,
+              opened.optionSymbol,
+              opened.contracts,
             );
-            // Wait briefly for Tradier to flip the order to a terminal state.
-            // If it's still pending after the window we accept it as live
-            // (the periodic balance refresh will surface a downstream cancel
-            // through the user's Tradier dashboard).
-            const detail = await this.tradierLiveClient.waitForOrderTerminalStatus(resp.id);
-            if (detail && TRADIER_REJECTED_STATUSES.has(detail.status)) {
-              const reasonSuffix = detail.reason_description ? `: ${detail.reason_description}` : '';
-              tradierVoid(
-                `Tradier order ${resp.id} ended ${detail.status}${reasonSuffix}`,
+            if (outcome.status === 'filled') {
+              const midStr = outcome.mid == null ? 'n/a' : `$${outcome.mid.toFixed(2)}`;
+              console.log(
+                `[smart-open] filled at $${outcome.avgFillPrice.toFixed(2)} `
+                  + `(mid ${midStr}, ask $${outcome.ask.toFixed(2)}, walk ${outcome.walk}) `
+                  + `${opened.optionSymbol} qty=${opened.contracts} order=${outcome.orderId}`,
               );
-              // Refresh the cached balance so the dashboard immediately
-              // reflects the (unchanged) buying power instead of waiting up
-              // to two minutes for the periodic poll.
+              mirrored = true;
+            } else if (outcome.status === 'rejected') {
+              const idSuffix = outcome.orderId !== undefined ? ` ${outcome.orderId}` : '';
+              tradierVoid(`Tradier order${idSuffix} rejected: ${outcome.reason}`);
               this.refreshTradierBalance().catch(() => {});
               continue;
+            } else if (outcome.status === 'walk_exhausted') {
+              tradierVoid(outcome.reason);
+              this.refreshTradierBalance().catch(() => {});
+              continue;
+            } else {
+              // no_quote
+              tradierVoid(outcome.reason);
+              continue;
             }
-            mirrored = true;
           } catch (err: unknown) {
             tradierVoid(
               `Tradier live buy threw ${err instanceof Error ? err.message : String(err)}`,

@@ -546,6 +546,24 @@ export class TradierOptionsClient extends TradierOrderClient {
     return this.postOrder(this.optionOrderBody(optionSymbol, qty, 'buy_to_open'));
   }
 
+  /**
+   * TRA-374 — submit a limit `buy_to_open` order. Counterpart to
+   * {@link sellContractsLimit} for the smart-open path that walks the entry
+   * limit price from `mid` toward the `ask` until it fills. `limitPrice` is
+   * rounded to the nearest cent before submission because Tradier rejects
+   * sub-cent limit prices on equity options.
+   */
+  async buyContractsLimit(
+    optionSymbol: string,
+    qty: number,
+    limitPrice: number,
+    duration: TradierOrderDuration = 'day',
+  ): Promise<TradierOrderResponse> {
+    return this.postOrder(
+      this.optionOrderBody(optionSymbol, qty, 'buy_to_open', { type: 'limit', price: limitPrice, duration }),
+    );
+  }
+
   /** Submit a market order to sell (close) option contracts. */
   async sellContracts(optionSymbol: string, qty: number): Promise<TradierOrderResponse> {
     return this.postOrder(this.optionOrderBody(optionSymbol, qty, 'sell_to_close'));

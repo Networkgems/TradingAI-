@@ -1265,3 +1265,160 @@ describe('PaperOptionsAccount — TRA-358 stageManualPendingExit', () => {
     expect(acct.getState().optionsPnl).toBeCloseTo(expectedPnl, 5);
   });
 });
+
+describe('PaperOptionsAccount — TRA-374 demo cost model', () => {
+  function buildRvSignal(overrides: Partial<RelativeValueSignal> = {}): RelativeValueSignal {
+    return {
+      id: 'rv-1',
+      symbol: 'AAPL',
+      type: 'relative_value',
+      side: 'buy',
+      entryPrice: 1.0,
+      stopLoss: 0.75,
+      takeProfit: 1.5,
+      riskRewardRatio: 2,
+      timestamp: TRADING_TIME,
+      optionSymbol: 'AAPL240705C00200000',
+      optionType: 'call',
+      strike: 200,
+      expiration: '2024-07-05',
+      mark: 1.0,
+      fairPrice: 1.30,
+      mispricingPct: -0.23,
+      zScore: -2.1,
+      ivFitted: 0.32,
+      ivUsed: 0.28,
+      delta: 0.18,
+      reason: 'cheap-vs-curve',
+      ...overrides,
+    };
+  }
+
+  it('bumps premiumPaid up by demoSlippagePct on a demo RV open', () => {
+    const acct = new PaperOptionsAccount({
+      initialEquity: 50_000,
+      managedAccountRatio: 0.5,
+      demoSlippagePct: 0.05,
+      demoFeePerContract: 0.35,
+    });
+    const pos = acct.openOptionFromRvCandidate(buildRvSignal({ mark: 1.0 }), 'demo');
+    expect(pos).not.toBeNull();
+    // premiumPaid = 1.00 * 1.05 = 1.05
+    expect(pos!.premiumPaid).toBeCloseTo(1.05, 5);
+    const state = acct.getState();
+    // demoSlippageCost = (1.05 − 1.00) × contracts × 100
+    expect(state.demoSlippageCost).toBeCloseTo(0.05 * pos!.contracts * 100, 5);
+    // demoFeeCost = contracts × 0.35
+    expect(state.demoFeeCost).toBeCloseTo(pos!.contracts * 0.35, 5);
+  });
+
+  it('does NOT bump premiumPaid in live mode (Tradier already pays the real spread)', () => {
+    const acct = new PaperOptionsAccount({
+      initialEquity: 50_000,
+      managedAccountRatio: 0.5,
+      demoSlippagePct: 0.05,
+      demoFeePerContract: 0.35,
+    });
+    const pos = acct.openOptionFromRvCandidate(buildRvSignal({ mark: 1.0 }), 'live', 50_000);
+    expect(pos).not.toBeNull();
+    expect(pos!.premiumPaid).toBe(1.0); // raw mark, no haircut
+    expect(acct.getState().demoSlippageCost).toBe(0);
+    expect(acct.getState().demoFeeCost).toBe(0);
+  });
+
+  it('applies haircut + fee on the full SL exit in demo (checkExits without waitAndHold)', () => {
+    const acct = new PaperOptionsAccount({
+      initialEquity: 50_000,
+      managedAccountRatio: 0.5,
+      demoSlippagePct: 0.05,
+      demoFeePerContract: 0.35,
+    });
+    const pos = acct.openOptionFromRvCandidate(buildRvSignal({ mark: 1.0 }), 'demo');
+    expect(pos).not.toBeNull();
+    // Trigger SL: drive mark below stopLossPremium. RV SL is 30% by default,
+    // so stopLossPremium = 1.05 × 0.7 = 0.735. Any mark ≤ 0.73 trips SL.
+    const marks = new Map<string, number>([[pos!.optionSymbol!, 0.70]]);
+    const closed = acct.checkExits(new Map(), marks);
+    expect(closed).toHaveLength(1);
+    const closedPos = closed[0]!;
+    // Effective exit = 0.735 × 0.95 = 0.69825 (stopLossPremium × (1 − slippage))
+    const expectedEffectiveExit = pos!.stopLossPremium * (1 - 0.05);
+    expect(closedPos.currentPremium).toBeCloseTo(expectedEffectiveExit, 4);
+    // Fee debited on close = contracts × 0.35
+    const expectedExitFee = pos!.contracts * 0.35;
+    const state = acct.getState();
+    // demoFeeCost is open fee + close fee.
+    expect(state.demoFeeCost).toBeCloseTo(pos!.contracts * 0.35 + expectedExitFee, 5);
+    // demoSlippageCost is open slippage + close slippage haircut.
+    const openSlippage = 0.05 * pos!.contracts * 100;
+    const closeSlippage = (pos!.stopLossPremium - expectedEffectiveExit) * pos!.contracts * 100;
+    expect(state.demoSlippageCost).toBeCloseTo(openSlippage + closeSlippage, 4);
+  });
+
+  it('does NOT apply slippage/fee on a live position exit (positionMode === live)', () => {
+    const acct = new PaperOptionsAccount({
+      initialEquity: 50_000,
+      managedAccountRatio: 0.5,
+      demoSlippagePct: 0.05,
+      demoFeePerContract: 0.35,
+    });
+    const pos = acct.openOptionFromRvCandidate(buildRvSignal({ mark: 1.0 }), 'live', 50_000);
+    expect(pos).not.toBeNull();
+    const marks = new Map<string, number>([[pos!.optionSymbol!, 0.70]]);
+    const closed = acct.checkExits(new Map(), marks);
+    expect(closed).toHaveLength(1);
+    // Live position exits at stopLossPremium exactly — no haircut.
+    expect(closed[0]!.currentPremium).toBeCloseTo(pos!.stopLossPremium, 5);
+    // No demo-cost accumulation from a live exit.
+    expect(acct.getState().demoSlippageCost).toBe(0);
+    expect(acct.getState().demoFeeCost).toBe(0);
+  });
+
+  it('exposes 0 demoSlippageCost / demoFeeCost in getStateForMode("live")', () => {
+    const acct = new PaperOptionsAccount({
+      initialEquity: 50_000,
+      managedAccountRatio: 0.5,
+      demoSlippagePct: 0.05,
+      demoFeePerContract: 0.35,
+    });
+    acct.openOptionFromRvCandidate(buildRvSignal({ mark: 1.0 }), 'demo');
+    // The cumulative cost on the demo bucket is non-zero…
+    expect(acct.getStateForMode('demo').demoSlippageCost).toBeGreaterThan(0);
+    // …but the live envelope must zero it out so the dashboard doesn't
+    // imply Tradier paid the modelled cost on top of its real spread.
+    expect(acct.getStateForMode('live').demoSlippageCost).toBe(0);
+    expect(acct.getStateForMode('live').demoFeeCost).toBe(0);
+  });
+
+  it('drops contracts count when slippage pushes per-contract cost above the budget', () => {
+    const acct = new PaperOptionsAccount({
+      initialEquity: 50_000,
+      managedAccountRatio: 0.5,
+      demoSlippagePct: 0.05,
+      demoFeePerContract: 0,
+    });
+    // RV budget = 50_000 * 0.5 * 0.03 = $750.
+    // mark = $2.50 → no slippage: floor(750 / 250) = 3 contracts.
+    // With 5% slippage: 2.625 → floor(750 / 262.50) = floor(2.857) = 2 contracts.
+    const pos = acct.openOptionFromRvCandidate(buildRvSignal({ mark: 2.50 }), 'demo');
+    expect(pos).not.toBeNull();
+    expect(pos!.contracts).toBe(2);
+  });
+
+  it('defaults to 0/0 when no demo cost config is supplied (back-compat)', () => {
+    const acct = new PaperOptionsAccount({ initialEquity: 50_000, managedAccountRatio: 0.5 });
+    const pos = acct.openOptionFromRvCandidate(buildRvSignal({ mark: 1.0 }), 'demo');
+    expect(pos).not.toBeNull();
+    expect(pos!.premiumPaid).toBe(1.0); // no haircut
+    expect(acct.getState().demoSlippageCost).toBe(0);
+    expect(acct.getState().demoFeeCost).toBe(0);
+  });
+
+  it('flips on via updateConfig so a settings save takes effect on the next open', () => {
+    const acct = new PaperOptionsAccount({ initialEquity: 50_000, managedAccountRatio: 0.5 });
+    acct.updateConfig({ demoSlippagePct: 0.05, demoFeePerContract: 0.35 });
+    const pos = acct.openOptionFromRvCandidate(buildRvSignal({ mark: 1.0 }), 'demo');
+    expect(pos).not.toBeNull();
+    expect(pos!.premiumPaid).toBeCloseTo(1.05, 5);
+  });
+});

@@ -335,9 +335,18 @@ describe('SignalEngine — legacy options snapshot routing (TRA-237)', () => {
 // verification on a low-buying-power account.
 describe('SignalEngine — TRA-319 live RV mirror reconciliation', () => {
   type WaitOpts = { timeoutMs?: number; intervalMs?: number; sleep?: (ms: number) => Promise<void> };
+  /**
+   * TRA-374 — the entry mirror now goes through `submitSmartBuyToOpen`, which
+   * needs `getOptionQuote`, `buyContractsLimit`, `cancelOrder`, and
+   * `waitForOrderTerminalStatus` on the client. The pre-TRA-374 tests used
+   * a `buyContracts` (market) stub; the interface and call sites below are
+   * updated to drive the new LIMIT walk path.
+   */
   interface TradierLiveStub {
     getAccountBalance: ReturnType<typeof vi.fn>;
-    buyContracts: ReturnType<typeof vi.fn>;
+    getOptionQuote: ReturnType<typeof vi.fn>;
+    buyContractsLimit: ReturnType<typeof vi.fn>;
+    cancelOrder: ReturnType<typeof vi.fn>;
     waitForOrderTerminalStatus: ReturnType<typeof vi.fn>;
     sellContracts?: ReturnType<typeof vi.fn>;
   }
@@ -361,12 +370,23 @@ describe('SignalEngine — TRA-319 live RV mirror reconciliation', () => {
     return scanner;
   }
 
+  /**
+   * TRA-374 — quote that yields mid 1.20 (matches the scanner's mark) so the
+   * smart-open walk submits at mid + 1¢ on the first attempt and a stub fill
+   * at 1.21 reflects what the broker would have given us.
+   */
+  function tightQuote() {
+    return { symbol: 'AAPL240705C00200000', bid: 1.15, ask: 1.25 };
+  }
+
   it('voids the paper open, surfaces a skip-reason signal, and frees the slot when Tradier ends in canceled', async () => {
     const stub: TradierLiveStub = {
       getAccountBalance: vi.fn().mockResolvedValue({
         totalEquity: 1000, totalCash: 300, optionBuyingPower: 999_999,
       }),
-      buyContracts: vi.fn().mockResolvedValue({ id: 7, status: 'ok' }),
+      getOptionQuote: vi.fn().mockResolvedValue(tightQuote()),
+      buyContractsLimit: vi.fn().mockResolvedValue({ id: 7, status: 'ok' }),
+      cancelOrder: vi.fn().mockResolvedValue(undefined),
       waitForOrderTerminalStatus: vi.fn(async (_id: number, _opts?: WaitOpts) => ({
         id: 7, status: 'canceled', reason_description: 'insufficient buying power',
       })),
@@ -380,8 +400,8 @@ describe('SignalEngine — TRA-319 live RV mirror reconciliation', () => {
     };
     await (engine as unknown as { runRelativeValueScan: (s: string[]) => Promise<void> }).runRelativeValueScan(['AAPL']);
 
-    // The mirror DID submit (we only know it's bad after Tradier reconciles).
-    expect(stub.buyContracts).toHaveBeenCalledTimes(1);
+    // The mirror DID submit a LIMIT (we only know it's bad after Tradier reconciles).
+    expect(stub.buyContractsLimit).toHaveBeenCalledTimes(1);
     expect(stub.waitForOrderTerminalStatus).toHaveBeenCalledTimes(1);
 
     const state = engine.getState();
@@ -396,14 +416,18 @@ describe('SignalEngine — TRA-319 live RV mirror reconciliation', () => {
     // TRA-332 — the Signals panel now surfaces the rejected signal with a
     // liveSkipReason so the user can see the diagnosis instead of mining logs.
     expect(state.signals).toHaveLength(1);
-    expect(state.signals[0].liveSkipReason).toContain('canceled');
+    // TRA-374 — smart-open prefixes the reason with the order id and the
+    // Tradier reason_description. The exact prefix is "Tradier order N rejected:".
+    expect(state.signals[0].liveSkipReason).toMatch(/rejected/);
     expect(state.signals[0].liveSkipReason).toContain('insufficient buying power');
   });
 
   it('skips the order entirely when cached optionBuyingPower is below notional cost (TRA-332 surfaces it on the dashboard)', async () => {
     const stub: TradierLiveStub = {
       getAccountBalance: vi.fn(),
-      buyContracts: vi.fn(),
+      getOptionQuote: vi.fn(),
+      buyContractsLimit: vi.fn(),
+      cancelOrder: vi.fn(),
       waitForOrderTerminalStatus: vi.fn(),
     };
     const engine = setupLiveEngine(stub, freshScanner());
@@ -417,7 +441,7 @@ describe('SignalEngine — TRA-319 live RV mirror reconciliation', () => {
     await (engine as unknown as { runRelativeValueScan: (s: string[]) => Promise<void> }).runRelativeValueScan(['AAPL']);
 
     // Pre-check fired — we never bothered the broker.
-    expect(stub.buyContracts).not.toHaveBeenCalled();
+    expect(stub.buyContractsLimit).not.toHaveBeenCalled();
     expect(stub.waitForOrderTerminalStatus).not.toHaveBeenCalled();
 
     const state = engine.getState();
@@ -429,10 +453,12 @@ describe('SignalEngine — TRA-319 live RV mirror reconciliation', () => {
     expect(state.signals[0].liveSkipReason).toContain('budget');
   });
 
-  it('voids the paper open and surfaces a skip signal when the buyContracts call itself throws (network/auth failure)', async () => {
+  it('voids the paper open and surfaces a skip signal when the buyContractsLimit call itself throws (network/auth failure)', async () => {
     const stub: TradierLiveStub = {
       getAccountBalance: vi.fn(),
-      buyContracts: vi.fn().mockRejectedValue(new Error('Tradier 401 unauthorized')),
+      getOptionQuote: vi.fn().mockResolvedValue(tightQuote()),
+      buyContractsLimit: vi.fn().mockRejectedValue(new Error('Tradier 401 unauthorized')),
+      cancelOrder: vi.fn(),
       waitForOrderTerminalStatus: vi.fn(),
     };
     const engine = setupLiveEngine(stub, freshScanner());
@@ -449,7 +475,10 @@ describe('SignalEngine — TRA-319 live RV mirror reconciliation', () => {
     expect(state.options.dailyOptionsCount).toBe(0);
     // TRA-332 — surface the broker-throw reason on the dashboard.
     expect(state.signals).toHaveLength(1);
-    expect(state.signals[0].liveSkipReason).toContain('Tradier live buy threw');
+    // TRA-374 — when buyContractsLimit throws, smart-open returns a `rejected`
+    // outcome whose reason carries the thrown message; the engine surfaces it
+    // through the "Tradier order ... rejected" path.
+    expect(state.signals[0].liveSkipReason).toMatch(/rejected|threw/);
     // We never reached the polling step.
     expect(stub.waitForOrderTerminalStatus).not.toHaveBeenCalled();
   });
@@ -459,15 +488,17 @@ describe('SignalEngine — TRA-319 live RV mirror reconciliation', () => {
       getAccountBalance: vi.fn().mockResolvedValue({
         totalEquity: 25_000, totalCash: 25_000, optionBuyingPower: 25_000,
       }),
-      buyContracts: vi.fn().mockResolvedValue({ id: 11, status: 'ok' }),
+      getOptionQuote: vi.fn().mockResolvedValue(tightQuote()),
+      buyContractsLimit: vi.fn().mockResolvedValue({ id: 11, status: 'ok' }),
+      cancelOrder: vi.fn(),
       waitForOrderTerminalStatus: vi.fn(async (_id: number, _opts?: WaitOpts) => ({
-        id: 11, status: 'filled', exec_quantity: 1, avg_fill_price: 1.20,
+        id: 11, status: 'filled', exec_quantity: 1, avg_fill_price: 1.21,
       })),
     };
     const engine = setupLiveEngine(stub, freshScanner());
     await (engine as unknown as { runRelativeValueScan: (s: string[]) => Promise<void> }).runRelativeValueScan(['AAPL']);
 
-    expect(stub.buyContracts).toHaveBeenCalledTimes(1);
+    expect(stub.buyContractsLimit).toHaveBeenCalledTimes(1);
     expect(stub.waitForOrderTerminalStatus).toHaveBeenCalledTimes(1);
 
     const state = engine.getState();
@@ -480,13 +511,22 @@ describe('SignalEngine — TRA-319 live RV mirror reconciliation', () => {
     expect(state.signals[0].type).toBe('relative_value');
   });
 
-  it('keeps the paper open when Tradier never reaches a terminal state within the wait window (treats as live, lets the periodic balance poll catch any drift)', async () => {
+  it('voids the paper open when the smart-open walk exhausts all 5 attempts without a fill (TRA-374)', async () => {
+    // TRA-374 — pre-374 behaviour kept the position open on a non-terminal
+    // wait, trusting the periodic balance poll to catch drift. The new
+    // smart-open helper instead walks the LIMIT from mid+1¢ → ask in 0.25
+    // steps and voids the paper open after 5 attempts, surfacing a clear
+    // "walk to ask exhausted" reason. This test locks in that new
+    // behaviour — a phantom long position that never actually filled at
+    // any walk step is worse than a missed entry.
     const stub: TradierLiveStub = {
       getAccountBalance: vi.fn().mockResolvedValue({
         totalEquity: 25_000, totalCash: 25_000, optionBuyingPower: 25_000,
       }),
-      buyContracts: vi.fn().mockResolvedValue({ id: 13, status: 'ok' }),
-      // Returns a non-terminal final detail (waitFor… exhausted its window).
+      getOptionQuote: vi.fn().mockResolvedValue(tightQuote()),
+      buyContractsLimit: vi.fn().mockResolvedValue({ id: 13, status: 'ok' }),
+      cancelOrder: vi.fn().mockResolvedValue(undefined),
+      // Always pending → walk exhausts the full schedule.
       waitForOrderTerminalStatus: vi.fn(async (_id: number, _opts?: WaitOpts) => ({
         id: 13, status: 'pending',
       })),
@@ -499,12 +539,15 @@ describe('SignalEngine — TRA-319 live RV mirror reconciliation', () => {
     await (engine as unknown as { runRelativeValueScan: (s: string[]) => Promise<void> }).runRelativeValueScan(['AAPL']);
 
     const state = engine.getState();
-    // Pending is NOT in the rejected set — we conservatively keep the paper
-    // open and let the next periodic Tradier balance poll surface drift.
-    expect(state.options.openOptions).toHaveLength(1);
-    expect(state.options.dailyOptionsCount).toBe(1);
+    // TRA-374 — walk_exhausted voids the paper open: no phantom position,
+    // slot freed, walk-to-ask-exhausted surfaced as the skip reason.
+    expect(state.options.openOptions).toHaveLength(0);
+    expect(state.options.dailyOptionsCount).toBe(0);
     expect(state.signals).toHaveLength(1);
-    expect(state.signals[0].liveSkipReason).toBeUndefined();
+    expect(state.signals[0].liveSkipReason).toContain('walk to ask exhausted');
+    // The walk submitted 5 LIMITs and cancelled each in turn.
+    expect(stub.buyContractsLimit).toHaveBeenCalledTimes(5);
+    expect(stub.cancelOrder).toHaveBeenCalledTimes(5);
   });
 });
 
@@ -519,10 +562,20 @@ describe('SignalEngine — TRA-319 live RV mirror reconciliation', () => {
 //     the dashboard so the user can self-diagnose
 describe('SignalEngine — TRA-332 live sizing uses real Tradier equity', () => {
   type WaitOpts = { timeoutMs?: number; intervalMs?: number; sleep?: (ms: number) => Promise<void> };
+  /**
+   * TRA-374 — see the TRA-319 describe block above for the same stub-surface
+   * update rationale (smart-open replaces market `buyContracts`).
+   */
   interface TradierLiveStub {
     getAccountBalance: ReturnType<typeof vi.fn>;
-    buyContracts: ReturnType<typeof vi.fn>;
+    getOptionQuote: ReturnType<typeof vi.fn>;
+    buyContractsLimit: ReturnType<typeof vi.fn>;
+    cancelOrder: ReturnType<typeof vi.fn>;
     waitForOrderTerminalStatus: ReturnType<typeof vi.fn>;
+  }
+
+  function tightQuote(symbol = 'AAPL240705C00200000') {
+    return { symbol, bid: 1.15, ask: 1.25 };
   }
 
   function setupLiveEngine(stub: TradierLiveStub, scanner: StubScanner) {
@@ -547,7 +600,9 @@ describe('SignalEngine — TRA-332 live sizing uses real Tradier equity', () => 
   it('surfaces a budget-too-small skip signal for a $300 cash account (the original TRA-332 report)', async () => {
     const stub: TradierLiveStub = {
       getAccountBalance: vi.fn(),
-      buyContracts: vi.fn(),
+      getOptionQuote: vi.fn(),
+      buyContractsLimit: vi.fn(),
+      cancelOrder: vi.fn(),
       waitForOrderTerminalStatus: vi.fn(),
     };
     const engine = setupLiveEngine(stub, freshScanner(1.20));
@@ -560,7 +615,7 @@ describe('SignalEngine — TRA-332 live sizing uses real Tradier equity', () => 
 
     await (engine as unknown as { runRelativeValueScan: (s: string[]) => Promise<void> }).runRelativeValueScan(['AAPL']);
 
-    expect(stub.buyContracts).not.toHaveBeenCalled();
+    expect(stub.buyContractsLimit).not.toHaveBeenCalled();
     const state = engine.getState();
     expect(state.options.openOptions).toHaveLength(0);
     expect(state.options.dailyOptionsCount).toBe(0);
@@ -579,7 +634,9 @@ describe('SignalEngine — TRA-332 live sizing uses real Tradier equity', () => 
     // them silently — the regression we're fixing.
     const stub: TradierLiveStub = {
       getAccountBalance: vi.fn(),
-      buyContracts: vi.fn(),
+      getOptionQuote: vi.fn(),
+      buyContractsLimit: vi.fn(),
+      cancelOrder: vi.fn(),
       waitForOrderTerminalStatus: vi.fn(),
     };
     const engine = setupLiveEngine(stub, freshScanner(1.0));
@@ -591,9 +648,9 @@ describe('SignalEngine — TRA-332 live sizing uses real Tradier equity', () => 
 
     // No order submitted — pre-check tripped on the LIVE budget, not the
     // paper-account budget. This is the lock-in: if the engine reverted to
-    // paper-equity sizing the pre-check would pass and buyContracts would
-    // fire, repeating the original silent-void bug.
-    expect(stub.buyContracts).not.toHaveBeenCalled();
+    // paper-equity sizing the pre-check would pass and the broker LIMIT
+    // would fire, repeating the original silent-void bug.
+    expect(stub.buyContractsLimit).not.toHaveBeenCalled();
     const state = engine.getState();
     expect(state.signals).toHaveLength(1);
     expect(state.signals[0].liveSkipReason).toContain('budget');
@@ -602,9 +659,11 @@ describe('SignalEngine — TRA-332 live sizing uses real Tradier equity', () => 
   it('opens a sized position when live equity is sufficient (regression check on the override path)', async () => {
     const stub: TradierLiveStub = {
       getAccountBalance: vi.fn(),
-      buyContracts: vi.fn().mockResolvedValue({ id: 21, status: 'ok' }),
+      getOptionQuote: vi.fn().mockResolvedValue(tightQuote()),
+      buyContractsLimit: vi.fn().mockResolvedValue({ id: 21, status: 'ok' }),
+      cancelOrder: vi.fn(),
       waitForOrderTerminalStatus: vi.fn(async (_id: number, _opts?: WaitOpts) => ({
-        id: 21, status: 'filled',
+        id: 21, status: 'filled', avg_fill_price: 1.01,
       })),
     };
     const engine = setupLiveEngine(stub, freshScanner(1.0));
@@ -615,7 +674,7 @@ describe('SignalEngine — TRA-332 live sizing uses real Tradier equity', () => 
 
     await (engine as unknown as { runRelativeValueScan: (s: string[]) => Promise<void> }).runRelativeValueScan(['AAPL']);
 
-    expect(stub.buyContracts).toHaveBeenCalledTimes(1);
+    expect(stub.buyContractsLimit).toHaveBeenCalledTimes(1);
     const state = engine.getState();
     expect(state.options.openOptions).toHaveLength(1);
     expect(state.options.openOptions[0].contracts).toBe(7);
@@ -632,7 +691,9 @@ describe('SignalEngine — TRA-332 live sizing uses real Tradier equity', () => 
     // balance even though the user opted out of options routing entirely.
     const stub: TradierLiveStub = {
       getAccountBalance: vi.fn(),
-      buyContracts: vi.fn(),
+      getOptionQuote: vi.fn(),
+      buyContractsLimit: vi.fn(),
+      cancelOrder: vi.fn(),
       waitForOrderTerminalStatus: vi.fn(),
     };
     const engine = setupLiveEngine(stub, freshScanner(1.0));
@@ -649,7 +710,7 @@ describe('SignalEngine — TRA-332 live sizing uses real Tradier equity', () => 
     // → 3 contracts at $100 each). No live-budget skip surfaces. The buy
     // mirror is also gated on `tradierLiveOptionsEnabled` (TRA-355) so the
     // broker call never fires.
-    expect(stub.buyContracts).not.toHaveBeenCalled();
+    expect(stub.buyContractsLimit).not.toHaveBeenCalled();
     const state = engine.getState();
     expect(state.options.openOptions).toHaveLength(1);
     expect(state.options.openOptions[0].contracts).toBe(3);
@@ -660,7 +721,9 @@ describe('SignalEngine — TRA-332 live sizing uses real Tradier equity', () => 
   it('falls back to optionBuyingPower over totalEquity when both are present (cash account semantics)', async () => {
     const stub: TradierLiveStub = {
       getAccountBalance: vi.fn(),
-      buyContracts: vi.fn(),
+      getOptionQuote: vi.fn(),
+      buyContractsLimit: vi.fn(),
+      cancelOrder: vi.fn(),
       waitForOrderTerminalStatus: vi.fn(),
     };
     const engine = setupLiveEngine(stub, freshScanner(1.0));
@@ -675,7 +738,7 @@ describe('SignalEngine — TRA-332 live sizing uses real Tradier equity', () => 
 
     // OBP = $200 → budget $3 → 0 contracts. Without the OBP preference this
     // would size off totalEquity ($50 K) and submit a doomed order.
-    expect(stub.buyContracts).not.toHaveBeenCalled();
+    expect(stub.buyContractsLimit).not.toHaveBeenCalled();
     const state = engine.getState();
     expect(state.signals).toHaveLength(1);
     expect(state.signals[0].liveSkipReason).toContain('equity $200.00');
