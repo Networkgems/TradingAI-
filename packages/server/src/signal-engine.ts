@@ -992,19 +992,35 @@ export class SignalEngine {
    * positions, so callers can pass it through unconditionally to both
    * `checkExits` (engine-driven exits, RV/OTM only) and
    * `refreshImportedMarks` (display-only, imports only).
+   *
+   * TRA-383 — scans BOTH env buckets (sandbox + production), not just the
+   * active-env account. Imported positions land in whichever bucket the
+   * user synced against (`reconcileTradierPositions(env, …)`); reading only
+   * `this.optionsAccount` (the active env) missed imports held in the other
+   * bucket, leaving their "Current Mark" / P&L stuck at `—` forever. We
+   * dedupe by OCC symbol so a contract present in both buckets is fetched
+   * once, and `refreshImportedMarksAllAccounts` fans the result back to
+   * every bucket regardless.
    */
   private async refreshOptionMarks(): Promise<Map<string, number>> {
     const marks = new Map<string, number>();
     if (!this.rvScanner) return marks;
 
-    const open = this.optionsAccount.getState().openOptions.filter(
-      (o) =>
-        (o.signalType === 'relative_value'
-          || o.signalType === 'otm_mispricing'
-          || o.signalType === 'tradier_import') &&
-        o.optionSymbol &&
-        o.expiration,
-    );
+    const seenSymbols = new Set<string>();
+    const open: import('@trading-app/shared').OptionPosition[] = [];
+    for (const acct of this.allOptionsAccounts()) {
+      for (const o of acct.getState().openOptions) {
+        const eligible =
+          (o.signalType === 'relative_value'
+            || o.signalType === 'otm_mispricing'
+            || o.signalType === 'tradier_import')
+          && !!o.optionSymbol
+          && !!o.expiration;
+        if (!eligible || seenSymbols.has(o.optionSymbol!)) continue;
+        seenSymbols.add(o.optionSymbol!);
+        open.push(o);
+      }
+    }
     if (open.length === 0) return marks;
 
     await Promise.all(
