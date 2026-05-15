@@ -14,6 +14,8 @@ import type {
 import {
   DEFAULT_ACCOUNT_SETTINGS,
   OPTIONS_BUDGET_RATIO,
+  OPTIONS_POSITION_CAP_RATIO,
+  OPTIONS_OTM_MIN_EQUITY,
   OPTIONS_TP1_PCT,
   OPTIONS_SL_PCT,
   OPTIONS_ATM_PREMIUM_RATIO,
@@ -79,6 +81,17 @@ function applyImportedRiskThresholds(
 interface OptionsAccountConfig {
   initialEquity?: number;
   managedAccountRatio?: number;
+  /**
+   * TRA-378 — the user's Settings "Risk Per Trade (%)" knob, plumbed through
+   * so it actually drives live options sizing (the panel caption already
+   * claims it does). In LIVE sizing (when an `equityOverride` is supplied to
+   * an open path) the per-trade options budget is
+   * `equity × managedAccountRatio × riskPerTrade` instead of the hardcoded
+   * per-strategy `budgetRatio`. Demo / fallback sizing keeps the per-strategy
+   * `budgetRatio` constants. Optional so existing tests / call sites that
+   * don't size live still compile; defaults to `DEFAULT_ACCOUNT_SETTINGS.riskPerTrade`.
+   */
+  riskPerTrade?: number;
   /**
    * TRA-233 — Tradier env this paper account belongs to. Stamped onto every
    * opened position so the dashboard / Open Positions view can segregate
@@ -147,6 +160,8 @@ interface OptionsAccountConfig {
 export class PaperOptionsAccount {
   private initialEquity: number;
   private managedAccountRatio: number;
+  /** TRA-378 — Settings "Risk Per Trade (%)"; drives LIVE options sizing. */
+  private riskPerTrade: number;
   private optionsDailyTradesLimit: number;
   private otmRiskParams: OtmRiskParams;
   private equity: number;
@@ -217,6 +232,9 @@ export class PaperOptionsAccount {
   constructor(config: OptionsAccountConfig = {}) {
     this.initialEquity = config.initialEquity ?? DEFAULT_ACCOUNT_SETTINGS.demoEquity;
     this.managedAccountRatio = config.managedAccountRatio ?? DEFAULT_ACCOUNT_SETTINGS.managedAccountRatio;
+    // TRA-378 — `normalizeNonNegative` guards against a fat-finger negative
+    // risk setting silently inverting the budget.
+    this.riskPerTrade = normalizeNonNegative(config.riskPerTrade, DEFAULT_ACCOUNT_SETTINGS.riskPerTrade);
     this.optionsDailyTradesLimit = config.optionsDailyTradesLimit ?? DEFAULT_ACCOUNT_SETTINGS.optionsDailyTradesLimit;
     this.otmRiskParams = config.otmRiskParams ?? OTM_RISK_PARAMS;
     this.rvRiskParams = config.rvRiskParams ?? RV_RISK_PARAMS;
@@ -243,6 +261,9 @@ export class PaperOptionsAccount {
   reset(config: OptionsAccountConfig = {}): void {
     if (config.initialEquity !== undefined) this.initialEquity = config.initialEquity;
     if (config.managedAccountRatio !== undefined) this.managedAccountRatio = config.managedAccountRatio;
+    if (config.riskPerTrade !== undefined) {
+      this.riskPerTrade = normalizeNonNegative(config.riskPerTrade, this.riskPerTrade);
+    }
     if (config.optionsDailyTradesLimit !== undefined) this.optionsDailyTradesLimit = config.optionsDailyTradesLimit;
     if (config.otmRiskParams !== undefined) this.otmRiskParams = config.otmRiskParams;
     if (config.rvRiskParams !== undefined) this.rvRiskParams = config.rvRiskParams;
@@ -271,6 +292,11 @@ export class PaperOptionsAccount {
 
   updateConfig(config: OptionsAccountConfig): void {
     if (config.managedAccountRatio !== undefined) this.managedAccountRatio = config.managedAccountRatio;
+    // TRA-378 — flow the Risk Per Trade knob in live so a Settings edit
+    // re-sizes the next live options entry without a server restart.
+    if (config.riskPerTrade !== undefined) {
+      this.riskPerTrade = normalizeNonNegative(config.riskPerTrade, this.riskPerTrade);
+    }
     if (config.optionsDailyTradesLimit !== undefined) this.optionsDailyTradesLimit = config.optionsDailyTradesLimit;
     if (config.otmRiskParams !== undefined) this.otmRiskParams = config.otmRiskParams;
     if (config.rvRiskParams !== undefined) this.rvRiskParams = config.rvRiskParams;
@@ -381,19 +407,60 @@ export class PaperOptionsAccount {
     };
   }
 
-  private budgetPerTrade(equityOverride?: number): number {
+  /**
+   * TRA-378 — dollar budget for a single options ticket.
+   *
+   *   • LIVE sizing (`equityOverride` supplied — the engine passes the user's
+   *     real Tradier equity): `equity × managedAccountRatio × riskPerTrade`.
+   *     This is what makes the Settings "Risk Per Trade (%)" knob actually
+   *     drive options sizing.
+   *   • DEMO / fallback sizing (`equityOverride` omitted): the per-strategy
+   *     `budgetRatio` constant, unchanged from before TRA-378.
+   *
+   * In both cases the result is hard-capped at `equity × OPTIONS_POSITION_CAP_RATIO`
+   * (15%) so no single ticket can dominate a small book — applied here, before
+   * the `floor()` in {@link sizeContracts}.
+   */
+  private sizingBudget(strategyBudgetRatio: number, equityOverride?: number): number {
     const equity = equityOverride ?? this.equity;
-    return equity * this.managedAccountRatio * OPTIONS_BUDGET_RATIO;
+    const ratio = equityOverride !== undefined ? this.riskPerTrade : strategyBudgetRatio;
+    const budget = equity * this.managedAccountRatio * ratio;
+    return Math.min(budget, equity * OPTIONS_POSITION_CAP_RATIO);
+  }
+
+  /**
+   * TRA-378 — contracts a ticket sizes to. Normally `floor(budget / cost)`,
+   * but when that rounds to 0 in LIVE sizing we force exactly 1 contract as
+   * long as a single contract's notional still clears the 15%-equity
+   * per-position cap. A $1k account can plainly afford a $1.20-mark contract
+   * ($120 < $1,000); pre-TRA-378 it could never enter one. The forced floor
+   * is LIVE-only (`equityOverride` supplied) — demo keeps the legacy
+   * null-on-zero behaviour so the per-strategy `budgetRatio` constants and
+   * the existing demo tests stand.
+   */
+  private sizeContracts(budget: number, costPerContract: number, equityOverride?: number): number {
+    if (!Number.isFinite(costPerContract) || costPerContract <= 0) return 0;
+    const contracts = Math.floor(budget / costPerContract);
+    if (contracts > 0) return contracts;
+    if (
+      equityOverride !== undefined
+      && costPerContract <= equityOverride * OPTIONS_POSITION_CAP_RATIO
+    ) {
+      return 1;
+    }
+    return 0;
+  }
+
+  private budgetPerTrade(equityOverride?: number): number {
+    return this.sizingBudget(OPTIONS_BUDGET_RATIO, equityOverride);
   }
 
   private otmBudgetPerTrade(equityOverride?: number): number {
-    const equity = equityOverride ?? this.equity;
-    return equity * this.managedAccountRatio * this.otmRiskParams.budgetRatio;
+    return this.sizingBudget(this.otmRiskParams.budgetRatio, equityOverride);
   }
 
   private rvBudgetPerTrade(equityOverride?: number): number {
-    const equity = equityOverride ?? this.equity;
-    return equity * this.managedAccountRatio * this.rvRiskParams.budgetRatio;
+    return this.sizingBudget(this.rvRiskParams.budgetRatio, equityOverride);
   }
 
   /**
@@ -405,7 +472,34 @@ export class PaperOptionsAccount {
    * dollar budget for an RV ticket given a hypothetical equity figure.
    */
   getRvBudgetForEquity(equity: number): number {
-    return equity * this.managedAccountRatio * this.rvRiskParams.budgetRatio;
+    // TRA-378 — always the LIVE sizing path (this is only ever called with
+    // the user's real Tradier equity), so `equity` is passed as the
+    // `equityOverride` to pick the `riskPerTrade` budget + 15% cap.
+    return this.sizingBudget(this.rvRiskParams.budgetRatio, equity);
+  }
+
+  /**
+   * TRA-378 — how many contracts an RV candidate at `mark` would open at the
+   * given live equity, applying the riskPerTrade budget, the 15%-equity
+   * per-position cap, and the forced 1-contract floor. The signal-engine
+   * live pre-check uses this (instead of a raw budget-vs-cost comparison) so
+   * it surfaces a skip ONLY when even a single capped contract won't fit —
+   * otherwise the floor would open a trade the pre-check wrongly vetoed.
+   */
+  getRvContractsForEquity(equity: number, mark: number): number {
+    const budget = this.sizingBudget(this.rvRiskParams.budgetRatio, equity);
+    return this.sizeContracts(budget, mark * 100, equity);
+  }
+
+  /**
+   * TRA-378 — OTM equivalent of {@link getRvContractsForEquity}. Returns 0
+   * below {@link OPTIONS_OTM_MIN_EQUITY} because OTM is gated off for small
+   * live accounts (see {@link openOptionFromCandidate}).
+   */
+  getOtmContractsForEquity(equity: number, mark: number): number {
+    if (equity < OPTIONS_OTM_MIN_EQUITY) return 0;
+    const budget = this.sizingBudget(this.otmRiskParams.budgetRatio, equity);
+    return this.sizeContracts(budget, mark * 100, equity);
   }
 
   private resetDayIfNeeded(): void {
@@ -458,6 +552,14 @@ export class PaperOptionsAccount {
     if (!isValidTradingWindow(Date.now())) return null;
     if (this.dailyOptionsTotal() >= this.optionsDailyTradesLimit) return null;
 
+    // TRA-378 — gate the OTM scanner off for small LIVE accounts. OTM
+    // mispricing is a right-tail strategy (~40% win rate, ~59% hard-SL rate
+    // in the TRA-375 backtest); it needs many tickets for the tail to pay
+    // off and is wrong for a sub-$5k book. Below the equity floor we run RV
+    // only. Demo (no `equityOverride`) is unaffected — it sizes off paper
+    // equity and the OTM scanner is disabled there anyway.
+    if (equityOverride !== undefined && equityOverride < OPTIONS_OTM_MIN_EQUITY) return null;
+
     // Dedup by OCC symbol — one open contract at a time per strike/expiration.
     const existing = Array.from(this.openOptions.values()).find(
       o => o.optionSymbol === signal.optionSymbol,
@@ -474,7 +576,8 @@ export class PaperOptionsAccount {
 
     const budget = this.otmBudgetPerTrade(equityOverride);
     const costPerContract = premiumPaid * 100;
-    const contracts = Math.floor(budget / costPerContract);
+    // TRA-378 — `sizeContracts` applies the forced 1-contract floor (live).
+    const contracts = this.sizeContracts(budget, costPerContract, equityOverride);
     if (contracts <= 0) return null;
 
     const totalCost = contracts * costPerContract;
@@ -559,7 +662,8 @@ export class PaperOptionsAccount {
 
     const budget = this.rvBudgetPerTrade(equityOverride);
     const costPerContract = premiumPaid * 100;
-    const contracts = Math.floor(budget / costPerContract);
+    // TRA-378 — `sizeContracts` applies the forced 1-contract floor (live).
+    const contracts = this.sizeContracts(budget, costPerContract, equityOverride);
     if (contracts <= 0) return null;
 
     const totalCost = contracts * costPerContract;
@@ -626,7 +730,10 @@ export class PaperOptionsAccount {
 
     const budget = this.budgetPerTrade();
     const costPerContract = premiumPaid * 100;
-    const contracts = Math.floor(budget / costPerContract);
+    // TRA-378 — ATM auto-open has no live-equity override (the engine has
+    // disabled this path since TRA-191), so the forced 1-contract floor
+    // never engages here; `sizeContracts` keeps the legacy `floor()` result.
+    const contracts = this.sizeContracts(budget, costPerContract);
     if (contracts <= 0) return null;
 
     const totalCost = contracts * costPerContract;

@@ -431,9 +431,10 @@ describe('SignalEngine — TRA-319 live RV mirror reconciliation', () => {
       waitForOrderTerminalStatus: vi.fn(),
     };
     const engine = setupLiveEngine(stub, freshScanner());
-    // TRA-332: with a $50 OBP and the default RV budget ratio, the engine's
-    // own pre-check (live budget < cost-per-contract) trips before any broker
-    // call. Surfaces a skip-reason signal so the user sees what happened.
+    // TRA-332 / TRA-378: with a $50 OBP, a single $1.20-mark contract ($120)
+    // blows past the 15% per-position cap ($7.50), so even the forced
+    // 1-contract floor can't open it — the engine's pre-check trips before
+    // any broker call and surfaces a skip-reason signal.
     (engine as unknown as { liveTradierBalance: { totalEquity: number; totalCash: number; optionBuyingPower: number } | null }).liveTradierBalance = {
       totalEquity: 100, totalCash: 50, optionBuyingPower: 50,
     };
@@ -450,7 +451,7 @@ describe('SignalEngine — TRA-319 live RV mirror reconciliation', () => {
     // TRA-332 — surfaces the skip on the dashboard so the user sees the diagnosis.
     expect(state.signals).toHaveLength(1);
     expect(state.signals[0].mode).toBe('live');
-    expect(state.signals[0].liveSkipReason).toContain('budget');
+    expect(state.signals[0].liveSkipReason).toContain('per-position cap');
   });
 
   it('voids the paper open and surfaces a skip signal when the buyContractsLimit call itself throws (network/auth failure)', async () => {
@@ -607,8 +608,9 @@ describe('SignalEngine — TRA-332 live sizing uses real Tradier equity', () => 
     };
     const engine = setupLiveEngine(stub, freshScanner(1.20));
     // The exact balance the user reported on TRA-332 — a Tradier cash account
-    // with $300 available. Default RV budget = 300 * 0.5 * 0.03 = $4.50,
-    // far below the $120 cost-per-contract; engine must skip with a reason.
+    // with $300 available. TRA-378 — a single $1.20-mark contract costs $120,
+    // which exceeds the 15% per-position cap ($45), so even the forced
+    // 1-contract floor can't open it; the engine must skip with a reason.
     (engine as unknown as { liveTradierBalance: { totalEquity: number; totalCash: number; optionBuyingPower: number } | null }).liveTradierBalance = {
       totalEquity: 300, totalCash: 300, optionBuyingPower: 300,
     };
@@ -622,22 +624,24 @@ describe('SignalEngine — TRA-332 live sizing uses real Tradier equity', () => 
     // The dashboard now shows the user WHY their account isn't trading.
     expect(state.signals).toHaveLength(1);
     expect(state.signals[0].mode).toBe('live');
-    expect(state.signals[0].liveSkipReason).toContain('budget $4.50');
-    expect(state.signals[0].liveSkipReason).toContain('$120.00/contract');
+    expect(state.signals[0].liveSkipReason).toContain('per-position cap');
+    expect(state.signals[0].liveSkipReason).toContain('$120.00');
+    expect(state.signals[0].liveSkipReason).toContain('equity $300.00');
   });
 
-  it('sizes positions off live Tradier equity, not the stale paper equity', async () => {
-    // Mark = $1 → 1 contract = $100 notional.
-    // Live equity = $1,000 → live RV budget = 1000 * 0.5 * 0.03 = $15 (still
-    // too small for 1 contract). Without the live override, paper equity
-    // ($25 K demo default) would size 3 contracts and TRA-319 would void
-    // them silently — the regression we're fixing.
+  it('opens a forced 1-contract floor for a small ($1k) live account (TRA-378)', async () => {
+    // Mark = $1 → 1 contract = $100 notional. Live equity = $1,000:
+    // riskPerTrade budget rounds below one contract, but the contract ($100)
+    // clears the 15% per-position cap ($150), so the forced 1-contract floor
+    // opens exactly one. Pre-TRA-378 this account silently skipped the signal.
     const stub: TradierLiveStub = {
       getAccountBalance: vi.fn(),
-      getOptionQuote: vi.fn(),
-      buyContractsLimit: vi.fn(),
+      getOptionQuote: vi.fn().mockResolvedValue(tightQuote()),
+      buyContractsLimit: vi.fn().mockResolvedValue({ id: 31, status: 'ok' }),
       cancelOrder: vi.fn(),
-      waitForOrderTerminalStatus: vi.fn(),
+      waitForOrderTerminalStatus: vi.fn(async (_id: number, _opts?: WaitOpts) => ({
+        id: 31, status: 'filled', avg_fill_price: 1.01,
+      })),
     };
     const engine = setupLiveEngine(stub, freshScanner(1.0));
     (engine as unknown as { liveTradierBalance: { totalEquity: number; totalCash: number; optionBuyingPower: number } | null }).liveTradierBalance = {
@@ -646,14 +650,14 @@ describe('SignalEngine — TRA-332 live sizing uses real Tradier equity', () => 
 
     await (engine as unknown as { runRelativeValueScan: (s: string[]) => Promise<void> }).runRelativeValueScan(['AAPL']);
 
-    // No order submitted — pre-check tripped on the LIVE budget, not the
-    // paper-account budget. This is the lock-in: if the engine reverted to
-    // paper-equity sizing the pre-check would pass and the broker LIMIT
-    // would fire, repeating the original silent-void bug.
-    expect(stub.buyContractsLimit).not.toHaveBeenCalled();
+    // The floor opened exactly one contract and mirrored it to the broker —
+    // sized off the LIVE $1k equity, not the stale paper equity.
+    expect(stub.buyContractsLimit).toHaveBeenCalledTimes(1);
     const state = engine.getState();
+    expect(state.options.openOptions).toHaveLength(1);
+    expect(state.options.openOptions[0].contracts).toBe(1);
     expect(state.signals).toHaveLength(1);
-    expect(state.signals[0].liveSkipReason).toContain('budget');
+    expect(state.signals[0].liveSkipReason).toBeUndefined();
   });
 
   it('opens a sized position when live equity is sufficient (regression check on the override path)', async () => {
@@ -667,7 +671,9 @@ describe('SignalEngine — TRA-332 live sizing uses real Tradier equity', () => 
       })),
     };
     const engine = setupLiveEngine(stub, freshScanner(1.0));
-    // $50 K live equity → RV budget = $750 → 7 contracts at $100 each.
+    // $50 K live equity → TRA-378 live budget = min(50_000 * 0.5 * 0.01,
+    // 50_000 * 0.15) = $250 → 2 contracts at $100 each (riskPerTrade defaults
+    // to 0.01 when the engine is built without settings).
     (engine as unknown as { liveTradierBalance: { totalEquity: number; totalCash: number; optionBuyingPower: number } | null }).liveTradierBalance = {
       totalEquity: 50_000, totalCash: 50_000, optionBuyingPower: 50_000,
     };
@@ -677,7 +683,7 @@ describe('SignalEngine — TRA-332 live sizing uses real Tradier equity', () => 
     expect(stub.buyContractsLimit).toHaveBeenCalledTimes(1);
     const state = engine.getState();
     expect(state.options.openOptions).toHaveLength(1);
-    expect(state.options.openOptions[0].contracts).toBe(7);
+    expect(state.options.openOptions[0].contracts).toBe(2);
     expect(state.signals).toHaveLength(1);
     expect(state.signals[0].liveSkipReason).toBeUndefined();
   });

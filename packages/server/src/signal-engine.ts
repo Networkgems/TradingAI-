@@ -1,6 +1,6 @@
 import { OrbStrategy, BbFadeStrategy, IchimokuStrategy, TradierOptionsClient, TradierOrderClient, TRADIER_REJECTED_STATUSES } from '@trading-app/engine';
 import type { TradierAccountBalance } from '@trading-app/engine';
-import { WATCHLIST, MANAGED_ACCOUNT_RATIO, MAX_CONSECUTIVE_LOSSES, DAILY_DRAWDOWN_HALT_PCT, aliasWatchlistSymbol, isLiveTradierOptionsEnabled, isStockMarketOpen, resolveAutoManageImportedTradierOptions, resolveDemoCostModel, resolveLiveTradeEquitiesTradier, resolveManagedAccountRatio, resolveRiskPerTrade, resolveRvDtePrefs, resolveTradierOptionsCreds, DEFAULT_RV_DTE_MIN, DEFAULT_RV_DTE_MAX, DEFAULT_RV_DTE_TARGET } from '@trading-app/shared';
+import { WATCHLIST, MANAGED_ACCOUNT_RATIO, MAX_CONSECUTIVE_LOSSES, DAILY_DRAWDOWN_HALT_PCT, OPTIONS_POSITION_CAP_RATIO, aliasWatchlistSymbol, isLiveTradierOptionsEnabled, isStockMarketOpen, resolveAutoManageImportedTradierOptions, resolveDemoCostModel, resolveLiveTradeEquitiesTradier, resolveManagedAccountRatio, resolveRiskPerTrade, resolveRvDtePrefs, resolveTradierOptionsCreds, DEFAULT_RV_DTE_MIN, DEFAULT_RV_DTE_MAX, DEFAULT_RV_DTE_TARGET } from '@trading-app/shared';
 import type { TradeSignal, RelativeValueSignal, Candle, OptionsAccountState, SignalType, Position, AccountSettings, AccountState, NewsItem, TradierEnv } from '@trading-app/shared';
 import { fetchMinuteBars, fetchQuotes, fetchStocksNews, isYahooBreakerOpen, setActiveInterestSymbols } from './yahoo-feed.js';
 import { PaperAccount } from './paper-account.js';
@@ -334,6 +334,10 @@ export class SignalEngine {
       sandbox: new PaperOptionsAccount({
         initialEquity: currentEquity,
         managedAccountRatio: demoStocksRatio,
+        // TRA-378 — mirrors the managedAccountRatio bucket split: sandbox ←
+        // (demo, stocks), production ← (live, stocks). riskPerTrade only
+        // drives sizing on the live (equityOverride) path.
+        riskPerTrade: demoStocksRisk,
         optionsDailyTradesLimit: activeOptionsDailyLimit(settings),
         tradierEnv: 'sandbox',
         autoManageImportedTradierOptions: autoManageImports,
@@ -343,6 +347,7 @@ export class SignalEngine {
       production: new PaperOptionsAccount({
         initialEquity: currentEquity,
         managedAccountRatio: liveStocksRatio,
+        riskPerTrade: liveStocksRisk,
         optionsDailyTradesLimit: activeOptionsDailyLimit(settings),
         tradierEnv: 'production',
         autoManageImportedTradierOptions: autoManageImports,
@@ -421,6 +426,9 @@ export class SignalEngine {
     const demoCost = resolveDemoCostModel(settings);
     this.optionsAccounts.sandbox.updateConfig({
       managedAccountRatio: demoStocksRatio,
+      // TRA-378 — re-plumb riskPerTrade so a Settings PATCH re-sizes live
+      // options entries end-to-end (settings → engine → PaperOptionsAccount).
+      riskPerTrade: demoStocksRisk,
       optionsDailyTradesLimit: activeOptionsDailyLimit(settings),
       autoManageImportedTradierOptions: autoManageImports,
       demoSlippagePct: demoCost.slippagePct,
@@ -428,6 +436,7 @@ export class SignalEngine {
     });
     this.optionsAccounts.production.updateConfig({
       managedAccountRatio: liveStocksRatio,
+      riskPerTrade: liveStocksRisk,
       optionsDailyTradesLimit: activeOptionsDailyLimit(settings),
       autoManageImportedTradierOptions: autoManageImports,
       demoSlippagePct: demoCost.slippagePct,
@@ -522,6 +531,7 @@ export class SignalEngine {
     const demoStocksRatio = resolveManagedAccountRatio(settings, 'stocks', 'demo');
     const demoStocksRisk = resolveRiskPerTrade(settings, 'stocks', 'demo');
     const liveStocksRatio = resolveManagedAccountRatio(settings, 'stocks', 'live');
+    const liveStocksRisk = resolveRiskPerTrade(settings, 'stocks', 'live');
     this.account.reset({
       initialEquity: equity,
       managedAccountRatio: demoStocksRatio,
@@ -533,11 +543,13 @@ export class SignalEngine {
     this.optionsAccounts.sandbox.reset({
       initialEquity: equity,
       managedAccountRatio: demoStocksRatio,
+      riskPerTrade: demoStocksRisk,
       optionsDailyTradesLimit: activeOptionsDailyLimit(settings),
     });
     this.optionsAccounts.production.reset({
       initialEquity: equity,
       managedAccountRatio: liveStocksRatio,
+      riskPerTrade: liveStocksRisk,
       optionsDailyTradesLimit: activeOptionsDailyLimit(settings),
     });
     this.allClosedPositions = [];
@@ -1264,16 +1276,21 @@ export class SignalEngine {
             : (Number.isFinite(total) ? total : undefined);
         }
 
-        // Pre-check: under live equity, can a single contract even fit the
-        // RV-strategy budget? If not, surface a clear skip reason instead of
-        // returning null silently — the user needs to see why no trade fired.
+        // Pre-check: under live equity, would this RV candidate size to ≥1
+        // contract? TRA-378 — ask the account for the contract count (which
+        // applies the riskPerTrade budget, the 15% per-position cap, and the
+        // forced 1-contract floor) rather than comparing a raw budget to the
+        // contract cost. A naive budget-vs-cost check would surface a false
+        // skip on a contract the floor would actually open. The skip now
+        // fires only when even a single capped contract won't fit.
         if (this.mode === 'live' && typeof liveEquity === 'number') {
-          const liveBudget = this.optionsAccount.getRvBudgetForEquity(liveEquity);
-          const costPerContract = cheap.mark * 100;
-          if (liveBudget < costPerContract) {
+          const liveContracts = this.optionsAccount.getRvContractsForEquity(liveEquity, cheap.mark);
+          if (liveContracts < 1) {
+            const costPerContract = cheap.mark * 100;
+            const cap = liveEquity * OPTIONS_POSITION_CAP_RATIO;
             surfaceLiveSkip(
-              `RV budget $${liveBudget.toFixed(2)} < $${costPerContract.toFixed(2)}/contract `
-                + `(equity $${liveEquity.toFixed(2)}) — increase managed ratio or deposit more capital`,
+              `RV contract $${costPerContract.toFixed(2)} exceeds the 15% per-position cap `
+                + `$${cap.toFixed(2)} (equity $${liveEquity.toFixed(2)}) — too rich for this account size`,
             );
             continue;
           }

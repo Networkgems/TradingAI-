@@ -885,6 +885,26 @@ export const OPTIONS_TRAIL_ACTIVATE_PCT = 0.20; // activate trailing stop once p
 export const OPTIONS_TRAIL_OFFSET_PCT = 0.12; // trail 12% below peak (tighter than previous 15%)
 export const OPTIONS_PARTIAL_EXIT_RATIO = 0.5; // exit 50% of contracts at TP1; trail the rest
 
+// ── Small-account options sizing guards (TRA-378) ───────────────────────────
+//
+// The board runs live options on a small DCA account ($1k → ~$6k). The
+// per-strategy budget ratios above (5% / 2.5% / 3%) make a sub-$5k account
+// effectively non-tradeable — `floor(budget / costPerContract)` rounds to 0
+// and the engine silently skips ~half its RV signals. These two knobs (plus
+// the riskPerTrade wiring in `options-account.ts`) make small books tradeable
+// without letting one ticket dominate the book.
+//
+//   • OPTIONS_POSITION_CAP_RATIO — hard cap on a single options position's
+//     notional cost as a fraction of equity. Applied as `min(budget, cap)`
+//     before `floor()`, and also gates the forced 1-contract floor so a
+//     single rich contract can never blow past it. Scales with the account.
+//   • OPTIONS_OTM_MIN_EQUITY — live-equity floor below which the OTM
+//     mispricing scanner is skipped (RV-only). OTM is a tail strategy
+//     (~40% win rate) that needs many tickets for the right tail to pay
+//     off — wrong for a small book.
+export const OPTIONS_POSITION_CAP_RATIO = 0.15; // cap a single options position at 15% of equity
+export const OPTIONS_OTM_MIN_EQUITY = 5_000;    // skip the OTM scanner below this live equity
+
 // ── OTM long-premium risk overrides (TRA-160) ───────────────────────────────
 //
 // Far-OTM long premium has a fundamentally different payoff distribution from

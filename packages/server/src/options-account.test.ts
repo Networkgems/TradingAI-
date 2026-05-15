@@ -272,26 +272,33 @@ describe('PaperOptionsAccount — TRA-332 live equity override sizing', () => {
   }
 
   it('sizes against equityOverride instead of paper equity in live mode', () => {
-    // Paper account seeded at $50 K (matches the demo equity that survives
-    // a live flip). Without the override, RV budget = $750 → 7 contracts at
-    // $100 each. With override = $2,000 → budget = $30 → 0 contracts.
-    const acct = new PaperOptionsAccount({ initialEquity: 50_000, managedAccountRatio: 0.5 });
-    const sig = buildRvSignal({ mark: 1.0 });
-
-    const pos = acct.openOptionFromRvCandidate(sig, 'live', 2000);
-    // 0 contracts → returns null. The fix is that this returns null on the
-    // LIVE figure, not the paper figure — preventing the engine from sizing
-    // a too-large position that TRA-319 would silently void downstream.
-    expect(pos).toBeNull();
-    expect(acct.getState().dailyOptionsCount).toBe(0);
+    // Paper account seeded at $50 K (matches the demo equity that survives a
+    // live flip). TRA-378 — live sizing uses riskPerTrade, not the per-
+    // strategy budgetRatio: without the override, demo budget =
+    // 50_000 * 1.0 * 0.03 = $1,500 → 15 contracts. With override = $2,000 →
+    // budget = min(2_000 * 1.0 * 0.10, 2_000 * 0.15) = $200 → 2 contracts.
+    const acct = new PaperOptionsAccount({
+      initialEquity: 50_000,
+      managedAccountRatio: 1.0,
+      riskPerTrade: 0.10,
+    });
+    const pos = acct.openOptionFromRvCandidate(buildRvSignal({ mark: 1.0 }), 'live', 2000);
+    expect(pos).not.toBeNull();
+    expect(pos!.contracts).toBe(2);
+    expect(pos!.mode).toBe('live');
   });
 
   it('opens positions sized off the override when the live equity supports it', () => {
-    const acct = new PaperOptionsAccount({ initialEquity: 50_000, managedAccountRatio: 0.5 });
-    // Override = $20 K → RV budget = 20_000 * 0.5 * 0.03 = $300 → 3 contracts.
+    const acct = new PaperOptionsAccount({
+      initialEquity: 50_000,
+      managedAccountRatio: 0.5,
+      riskPerTrade: 0.10,
+    });
+    // Override = $20 K → budget = min(20_000 * 0.5 * 0.10, 20_000 * 0.15)
+    //   = min($1,000, $3,000) = $1,000 → 10 contracts at $100 each.
     const pos = acct.openOptionFromRvCandidate(buildRvSignal({ mark: 1.0 }), 'live', 20_000);
     expect(pos).not.toBeNull();
-    expect(pos!.contracts).toBe(3);
+    expect(pos!.contracts).toBe(10);
     expect(pos!.mode).toBe('live');
   });
 
@@ -300,19 +307,164 @@ describe('PaperOptionsAccount — TRA-332 live equity override sizing', () => {
     // overflow the paper account. The override should bypass that check —
     // the real buying-power constraint is enforced upstream against
     // Tradier's optionBuyingPower, not paper cash.
-    const acct = new PaperOptionsAccount({ initialEquity: 100, managedAccountRatio: 0.5 });
+    const acct = new PaperOptionsAccount({
+      initialEquity: 100,
+      managedAccountRatio: 0.5,
+      riskPerTrade: 0.10,
+    });
     const pos = acct.openOptionFromRvCandidate(buildRvSignal({ mark: 1.0 }), 'live', 50_000);
     expect(pos).not.toBeNull();
     expect(pos!.contracts).toBeGreaterThan(0);
   });
 
-  it('getRvBudgetForEquity reflects the configured managedRatio and budget ratio', () => {
-    const acct = new PaperOptionsAccount({ initialEquity: 50_000, managedAccountRatio: 0.5 });
-    // 300 * 0.5 * 0.03 = $4.50 (the original TRA-332 user's budget).
-    expect(acct.getRvBudgetForEquity(300)).toBeCloseTo(4.5, 5);
-    // Doubling managedRatio doubles the budget.
-    acct.updateConfig({ managedAccountRatio: 1.0 });
-    expect(acct.getRvBudgetForEquity(300)).toBeCloseTo(9, 5);
+  it('getRvBudgetForEquity reflects managedRatio and the riskPerTrade knob (TRA-378)', () => {
+    const acct = new PaperOptionsAccount({
+      initialEquity: 50_000,
+      managedAccountRatio: 0.5,
+      riskPerTrade: 0.10,
+    });
+    // 300 * 0.5 * 0.10 = $15 (below the 15% cap of $45).
+    expect(acct.getRvBudgetForEquity(300)).toBeCloseTo(15, 5);
+    // Editing the riskPerTrade knob re-sizes the live budget.
+    acct.updateConfig({ riskPerTrade: 0.20 });
+    expect(acct.getRvBudgetForEquity(300)).toBeCloseTo(30, 5);
+  });
+});
+
+// TRA-378 — small-account options sizing: riskPerTrade-driven live budget,
+// the forced 1-contract floor, the 15%-of-equity per-position cap, and the
+// sub-$5k OTM scanner gate.
+describe('PaperOptionsAccount — TRA-378 small-account sizing', () => {
+  function buildRvSignal(overrides: Partial<RelativeValueSignal> = {}): RelativeValueSignal {
+    return {
+      id: 'rv-1',
+      symbol: 'AAPL',
+      type: 'relative_value',
+      side: 'buy',
+      entryPrice: 1.0,
+      stopLoss: 0.75,
+      takeProfit: 1.5,
+      riskRewardRatio: 2,
+      timestamp: TRADING_TIME,
+      optionSymbol: 'AAPL240705C00200000',
+      optionType: 'call',
+      strike: 200,
+      expiration: '2024-07-05',
+      mark: 1.0,
+      fairPrice: 1.30,
+      mispricingPct: -0.23,
+      zScore: -2.1,
+      ivFitted: 0.32,
+      ivUsed: 0.28,
+      delta: 0.18,
+      reason: 'cheap-vs-curve',
+      ...overrides,
+    };
+  }
+
+  // $1k account, fully managed, 10% risk per trade — the board's live DCA case.
+  function smallAccount(): PaperOptionsAccount {
+    return new PaperOptionsAccount({
+      initialEquity: 1_000,
+      managedAccountRatio: 1.0,
+      riskPerTrade: 0.10,
+    });
+  }
+
+  it('sizes a $1.00-mark RV candidate to ≥1 contract at $1k equity (was 0)', () => {
+    // budget = min(1_000 * 1.0 * 0.10, 1_000 * 0.15) = $100; cost = $100 → 1.
+    const pos = smallAccount().openOptionFromRvCandidate(buildRvSignal({ mark: 1.0 }), 'live', 1_000);
+    expect(pos).not.toBeNull();
+    expect(pos!.contracts).toBeGreaterThanOrEqual(1);
+  });
+
+  it('forces a 1-contract floor when the budget alone rounds to 0 contracts', () => {
+    // budget $100, mark $1.20 → cost $120 → floor(100/120) = 0. The $120
+    // contract still clears the 15% cap ($150) → forced 1 contract.
+    const pos = smallAccount().openOptionFromRvCandidate(buildRvSignal({ mark: 1.20 }), 'live', 1_000);
+    expect(pos).not.toBeNull();
+    expect(pos!.contracts).toBe(1);
+  });
+
+  it('sizes a sub-dollar ($0.30) mark to multiple contracts at $1k equity', () => {
+    // budget $100, cost $30 → 3 contracts.
+    const pos = smallAccount().openOptionFromRvCandidate(buildRvSignal({ mark: 0.30 }), 'live', 1_000);
+    expect(pos).not.toBeNull();
+    expect(pos!.contracts).toBe(3);
+  });
+
+  it('skips a $4.00-mark contract at $1k — the 15% cap, not a $400 position', () => {
+    // cost $400 > 15% cap ($150) → the forced floor is gated off → null.
+    const acct = smallAccount();
+    const pos = acct.openOptionFromRvCandidate(buildRvSignal({ mark: 4.0 }), 'live', 1_000);
+    expect(pos).toBeNull();
+    expect(acct.getState().optionsCash).toBe(1_000); // cash untouched
+  });
+
+  it('skips a $3.00-mark contract at $1k — one ticket would be 30% of the book', () => {
+    // cost $300 > 15% cap ($150) → null (issue #3 example).
+    const pos = smallAccount().openOptionFromRvCandidate(buildRvSignal({ mark: 3.0 }), 'live', 1_000);
+    expect(pos).toBeNull();
+  });
+
+  it('caps the riskPerTrade budget at 15% of equity before the floor', () => {
+    // riskPerTrade 0.50 would budget $5,000 at $10k equity, but the cap
+    // pins it to 0.15 * 10_000 = $1,500 → 15 contracts at $100, not 50.
+    const acct = new PaperOptionsAccount({
+      initialEquity: 10_000,
+      managedAccountRatio: 1.0,
+      riskPerTrade: 0.50,
+    });
+    const pos = acct.openOptionFromRvCandidate(buildRvSignal({ mark: 1.0 }), 'live', 10_000);
+    expect(pos).not.toBeNull();
+    expect(pos!.contracts).toBe(15);
+  });
+
+  it('getRvContractsForEquity matches what the open path would size', () => {
+    const acct = smallAccount();
+    expect(acct.getRvContractsForEquity(1_000, 1.0)).toBe(1);
+    expect(acct.getRvContractsForEquity(1_000, 0.30)).toBe(3);
+    expect(acct.getRvContractsForEquity(1_000, 4.0)).toBe(0); // 15% cap
+  });
+
+  it('demo sizing (no equityOverride) keeps the legacy null-on-zero behaviour', () => {
+    // $1k DEMO account: budget = 1_000 * 1.0 * 0.03 = $30; no forced floor in
+    // demo → a $1 mark ($100 cost) still returns null. Per-strategy
+    // budgetRatio constants stay the demo / fallback default.
+    const acct = new PaperOptionsAccount({ initialEquity: 1_000, managedAccountRatio: 1.0 });
+    expect(acct.openOptionFromRvCandidate(buildRvSignal({ mark: 1.0 }), 'demo')).toBeNull();
+  });
+
+  it('gates the OTM scanner off below $5k live equity (RV-only)', () => {
+    const acct = new PaperOptionsAccount({
+      initialEquity: 4_000,
+      managedAccountRatio: 1.0,
+      riskPerTrade: 0.10,
+    });
+    // OTM open is refused under the equity floor regardless of sizing.
+    expect(acct.openOptionFromCandidate(buildSignal({ mark: 1.0 }), 'live', 4_000)).toBeNull();
+    expect(acct.getOtmContractsForEquity(4_000, 1.0)).toBe(0);
+  });
+
+  it('allows the OTM scanner at or above $5k live equity', () => {
+    const acct = new PaperOptionsAccount({
+      initialEquity: 6_000,
+      managedAccountRatio: 1.0,
+      riskPerTrade: 0.10,
+    });
+    const pos = acct.openOptionFromCandidate(buildSignal({ mark: 1.0 }), 'live', 6_000);
+    expect(pos).not.toBeNull();
+    expect(pos!.contracts).toBeGreaterThanOrEqual(1);
+  });
+
+  it('OTM equity gate does not apply to demo sizing (no equityOverride)', () => {
+    // A $1k DEMO account never hits the live OTM gate; it still sizes off
+    // the per-strategy budgetRatio (and here rounds to 0 → null).
+    const acct = new PaperOptionsAccount({ initialEquity: 1_000, managedAccountRatio: 1.0 });
+    // Demo at 50k sizes fine — proves the gate is live-only, not a hard block.
+    const big = new PaperOptionsAccount({ initialEquity: 50_000, managedAccountRatio: 1.0 });
+    expect(big.openOptionFromCandidate(buildSignal({ mark: 1.0 }), 'demo')).not.toBeNull();
+    expect(acct.openOptionFromCandidate(buildSignal({ mark: 1.0 }), 'demo')).toBeNull();
   });
 });
 
