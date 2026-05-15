@@ -354,3 +354,105 @@ describe('MarketScheduler — TRA-249-D onHourly funding hook', () => {
     expect(onDaily).not.toHaveBeenCalled();
   });
 });
+
+describe('MarketScheduler — TRA-368 onPremarket 9 AM ET hook', () => {
+  let scheduler: MarketScheduler;
+
+  // 9:00 AM ET (EDT, UTC-4) → 13:00 UTC; back off 60 s for the first tick.
+  const at0900EDT = (yyyy: number, mm: number, dd: number) =>
+    new Date(Date.UTC(yyyy, mm - 1, dd, 12, 59, 0));
+
+  beforeEach(() => {
+    vi.useFakeTimers();
+    scheduler = new MarketScheduler();
+  });
+
+  afterEach(() => {
+    scheduler.stop();
+    vi.useRealTimers();
+  });
+
+  it('fires onPremarket exactly once at 9:00 AM ET on a normal weekday', () => {
+    // 2026-04-30 = Thursday, 9:00 EDT
+    vi.setSystemTime(at0900EDT(2026, 4, 30));
+    const onPremarket = vi.fn();
+    scheduler.start({ onPremarket });
+
+    vi.advanceTimersByTime(60_000);
+    expect(onPremarket).toHaveBeenCalledTimes(1);
+  });
+
+  it('does not fire onPremarket on a weekend', () => {
+    // 2026-05-02 = Saturday
+    vi.setSystemTime(at0900EDT(2026, 5, 2));
+    const onPremarket = vi.fn();
+    scheduler.start({ onPremarket });
+
+    vi.advanceTimersByTime(60_000);
+    expect(onPremarket).not.toHaveBeenCalled();
+  });
+
+  it('does not fire onPremarket on a US market holiday', () => {
+    // Memorial Day 2026 = Monday, May 25
+    vi.setSystemTime(at0900EDT(2026, 5, 25));
+    const onPremarket = vi.fn();
+    scheduler.start({ onPremarket });
+
+    vi.advanceTimersByTime(60_000);
+    expect(onPremarket).not.toHaveBeenCalled();
+  });
+
+  it('does not double-fire onPremarket within the same ET day (idempotency)', () => {
+    vi.setSystemTime(at0900EDT(2026, 4, 30));
+    const onPremarket = vi.fn();
+    scheduler.start({ onPremarket });
+
+    vi.advanceTimersByTime(60_000);
+    expect(onPremarket).toHaveBeenCalledTimes(1);
+
+    // Time wedges at 9:00 — next polling tick is still inside the same
+    // ET minute. Must NOT re-fire.
+    vi.advanceTimersByTime(60_000);
+    expect(onPremarket).toHaveBeenCalledTimes(1);
+  });
+
+  it('fires onPremarket again on the next trading day', () => {
+    vi.setSystemTime(at0900EDT(2026, 4, 30));
+    const onPremarket = vi.fn();
+    scheduler.start({ onPremarket });
+
+    vi.advanceTimersByTime(60_000);
+    expect(onPremarket).toHaveBeenCalledTimes(1);
+
+    // Jump to 9:00 ET the following day.
+    vi.setSystemTime(at0900EDT(2026, 5, 1));
+    vi.advanceTimersByTime(60_000);
+    expect(onPremarket).toHaveBeenCalledTimes(2);
+  });
+
+  it('catches async errors thrown by onPremarket and keeps subsequent days firing', async () => {
+    vi.setSystemTime(at0900EDT(2026, 4, 30));
+    const onPremarket = vi
+      .fn()
+      .mockRejectedValueOnce(new Error('boom'))
+      .mockResolvedValue(undefined);
+    const errSpy = vi.spyOn(console, 'error').mockImplementation(() => {});
+    scheduler.start({ onPremarket });
+
+    vi.advanceTimersByTime(60_000);
+    await vi.advanceTimersByTimeAsync(0);
+
+    expect(onPremarket).toHaveBeenCalledTimes(1);
+    expect(errSpy).toHaveBeenCalledWith(
+      '[scheduler] pre-market callback error:',
+      expect.any(Error),
+    );
+
+    // Next ET day should still fire — error did not poison the schedule.
+    vi.setSystemTime(at0900EDT(2026, 5, 1));
+    vi.advanceTimersByTime(60_000);
+    expect(onPremarket).toHaveBeenCalledTimes(2);
+
+    errSpy.mockRestore();
+  });
+});

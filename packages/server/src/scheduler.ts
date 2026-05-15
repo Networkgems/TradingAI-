@@ -85,6 +85,15 @@ export interface ScheduleCallbacks {
    * (`YYYY-MM-DD-HH`) keeps the callback to one fire per hour.
    */
   onHourly?: EodTriggerCallback;
+  /**
+   * TRA-368 — fires at 9:00 AM ET on stock-market trading days, 30 minutes
+   * before the opening bell. Used to build a "smart watchlist" by combining
+   * the prior session's post-market EOD review (top movers, signal accuracy)
+   * with a fresh pre-market scan (gainers / losers / volume / trending), and
+   * feeding the result into each user's SignalEngine so the engine has a
+   * curated symbol set ready when the bell rings.
+   */
+  onPremarket?: EodTriggerCallback;
 }
 
 export class MarketScheduler {
@@ -94,6 +103,8 @@ export class MarketScheduler {
   private lastArchiveDate = '';
   /** TRA-249-D — `YYYY-MM-DD-HH` ET key of the last `onHourly` fire. Dedupes within an hour. */
   private lastHourlyKey = '';
+  /** TRA-368 — last ET date the 9 AM pre-market hook fired. Dedupes within the day. */
+  private lastPremarketDate = '';
 
   /**
    * Start polling. Accepts either a single market-close callback (legacy form)
@@ -129,6 +140,20 @@ export class MarketScheduler {
         }
       }
 
+      // TRA-368 — 9:00 AM ET pre-market hook, 30 min before the opening bell.
+      // Gated on market days so weekends + NYSE holidays are skipped. The
+      // callback is responsible for replaying the prior session's post-market
+      // EOD review + a fresh pre-market scan into a curated watchlist.
+      if (hour === 9 && minute === 0) {
+        if (cfg.onPremarket && isMarketDay(date) && this.lastPremarketDate !== todayKey) {
+          this.lastPremarketDate = todayKey;
+          console.log(`[scheduler] pre-market trigger fired for ${todayKey}`);
+          Promise.resolve(cfg.onPremarket()).catch(err =>
+            console.error('[scheduler] pre-market callback error:', err),
+          );
+        }
+      }
+
       if (hour === 21 && minute === 0) {
         if (cfg.onArchive && this.lastArchiveDate !== todayKey) {
           this.lastArchiveDate = todayKey;
@@ -155,7 +180,7 @@ export class MarketScheduler {
       }
     }, 60_000);
 
-    console.log('[scheduler] EOD scheduler started (4:05 PM ET reports, 9:00 PM ET archive)');
+    console.log('[scheduler] EOD scheduler started (9:00 AM ET pre-market, 4:05 PM ET reports, 9:00 PM ET archive)');
   }
 
   stop(): void {

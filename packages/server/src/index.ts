@@ -26,6 +26,7 @@ import {
   removeStocksSymbol,
 } from './watchlist-store.js';
 import { scanStocksMarket, scanCryptoMarket } from './market-scanner.js';
+import { runPremarketForAllUsers } from './premarket-watchlist.js';
 import {
   loadUsers,
   validateUserCredentials,
@@ -2496,6 +2497,11 @@ scheduler.start({
   // at minute=0 every ET hour; per-user trackers no-op when no perps are
   // open or the user is in demo mode.
   onHourly: runHourlyFundingForAllUsers,
+  // TRA-368 — 9:00 AM ET pre-market routine. Replays prior session's EOD
+  // review + a fresh pre-market scan into each user's smart watchlist so
+  // the SignalEngine starts the new session with curated symbols. Stocks
+  // only — crypto's 24/7 market has no pre-market boundary.
+  onPremarket: runPremarketForAllUsers,
 });
 
 httpServer.listen(PORT, () => {
