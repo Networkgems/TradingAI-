@@ -1,6 +1,6 @@
 import { OrbStrategy, BbFadeStrategy, IchimokuStrategy, TradierOptionsClient, TradierOrderClient, TRADIER_REJECTED_STATUSES } from '@trading-app/engine';
 import type { TradierAccountBalance } from '@trading-app/engine';
-import { WATCHLIST, MANAGED_ACCOUNT_RATIO, MAX_CONSECUTIVE_LOSSES, DAILY_DRAWDOWN_HALT_PCT, aliasWatchlistSymbol, isLiveTradierOptionsEnabled, isStockMarketOpen, resolveAutoManageImportedTradierOptions, resolveManagedAccountRatio, resolveRiskPerTrade, resolveTradierOptionsCreds } from '@trading-app/shared';
+import { WATCHLIST, MANAGED_ACCOUNT_RATIO, MAX_CONSECUTIVE_LOSSES, DAILY_DRAWDOWN_HALT_PCT, aliasWatchlistSymbol, isLiveTradierOptionsEnabled, isStockMarketOpen, resolveAutoManageImportedTradierOptions, resolveLiveTradeEquitiesTradier, resolveManagedAccountRatio, resolveRiskPerTrade, resolveTradierOptionsCreds } from '@trading-app/shared';
 import type { TradeSignal, RelativeValueSignal, Candle, OptionsAccountState, SignalType, Position, AccountSettings, AccountState, NewsItem, TradierEnv } from '@trading-app/shared';
 import { fetchMinuteBars, fetchQuotes, fetchStocksNews, isYahooBreakerOpen, setActiveInterestSymbols } from './yahoo-feed.js';
 import { PaperAccount } from './paper-account.js';
@@ -336,7 +336,7 @@ export class SignalEngine {
     if (settings) {
       this.tradierLiveClient = buildTradierLiveClient(settings);
       this.tradierLiveOptionsEnabled = isLiveTradierOptionsEnabled(settings);
-      this.liveTradeEquitiesTradier = settings.liveTradeEquitiesTradier === true;
+      this.liveTradeEquitiesTradier = resolveLiveTradeEquitiesTradier(settings);
       this.tradierLiveEquityClient = buildTradierLiveEquityClient(settings);
       this.tradierOptionsClientByEnv = buildTradierOptionsClientsByEnv(settings);
     }
@@ -415,8 +415,9 @@ export class SignalEngine {
     this.tradierLiveOptionsEnabled = isLiveTradierOptionsEnabled(settings);
     // TRA-335 — re-resolve the equity client + toggle on every settings
     // change so flipping `liveTradeEquitiesTradier` takes effect on the
-    // next tick without a server restart.
-    this.liveTradeEquitiesTradier = settings.liveTradeEquitiesTradier === true;
+    // next tick without a server restart. TRA-370 — absent ↔ true so Live
+    // mirrors Demo's signal flow out of the box.
+    this.liveTradeEquitiesTradier = resolveLiveTradeEquitiesTradier(settings);
     this.tradierLiveEquityClient = buildTradierLiveEquityClient(settings);
     if (this.mode === 'live') {
       // TRA-226 — fetch the Tradier balance immediately so the broadcast that
@@ -2446,7 +2447,8 @@ function buildTradierOptionsClientsByEnv(
  */
 function buildTradierLiveEquityClient(settings: AccountSettings): TradierOrderClient | null {
   if (settings.mode !== 'live') return null;
-  if (settings.liveTradeEquitiesTradier !== true) return null;
+  // TRA-370 — absent ↔ true so Live opens equity brackets out of the box.
+  if (!resolveLiveTradeEquitiesTradier(settings)) return null;
   const resolved = resolveTradierOptionsCreds(settings);
   const env = resolved.env;
   const apiToken = (

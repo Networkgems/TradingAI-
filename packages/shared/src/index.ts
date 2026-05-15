@@ -625,8 +625,12 @@ export const DEFAULT_ACCOUNT_SETTINGS: AccountSettings = {
   liveApiKeyOptionsProduction: '',
   liveAccountIdOptionsProduction: '',
   liveTradierEnvOptions: 'sandbox',
-  liveTradierMarkets: 'options',
-  liveTradeEquitiesTradier: false,
+  // TRA-370 — Live (production) now mirrors Demo by default: both equity and
+  // options signals fire, and both are routed to Tradier when creds are
+  // configured. Users who want to narrow to a single market can still pick
+  // 'options' or 'equity' in Settings.
+  liveTradierMarkets: 'both',
+  liveTradeEquitiesTradier: true,
   autoManageImportedTradierOptions: true,
   activeStrategyPreset: DEFAULT_STRATEGY_PRESET_ID,
 };
@@ -659,13 +663,14 @@ export function resolveTradierOptionsCreds(s: AccountSettings): {
 }
 
 /**
- * TRA-336 — resolve which Tradier markets the engine should route into when
- * running live. Defaults to `'options'` (TRA-220 behaviour) when the field is
- * absent so saved settings written before TRA-336 keep the options-only
- * routing they had previously.
+ * TRA-336 / TRA-370 — resolve which Tradier markets the engine should route
+ * into when running live. Defaults to `'both'` (TRA-370) so a Live account
+ * mirrors Demo's signal flow — equity and options strategies both fire.
+ * Users who want to narrow the routing can still pick `'options'` or
+ * `'equity'` explicitly in Settings; absent (legacy snapshots) → both.
  */
 export function resolveLiveTradierMarkets(s: AccountSettings): LiveTradierMarkets {
-  return s.liveTradierMarkets ?? 'options';
+  return s.liveTradierMarkets ?? 'both';
 }
 
 /** TRA-336 — true when Tradier Live should route options signals. */
@@ -678,6 +683,15 @@ export function isLiveTradierOptionsEnabled(s: AccountSettings): boolean {
 export function isLiveTradierEquityEnabled(s: AccountSettings): boolean {
   const markets = resolveLiveTradierMarkets(s);
   return markets === 'equity' || markets === 'both';
+}
+
+/**
+ * TRA-370 — resolve the Tradier Live equity (share) toggle. Absent ↔ true so
+ * a Live account opens equity brackets out of the box, matching Demo's signal
+ * flow. Users can still opt out by explicitly saving `false` in Settings.
+ */
+export function resolveLiveTradeEquitiesTradier(s: AccountSettings): boolean {
+  return s.liveTradeEquitiesTradier !== false;
 }
 
 /**

@@ -6,6 +6,7 @@ import {
   DEFAULT_ACCOUNT_SETTINGS,
   isLiveTradierEquityEnabled,
   isLiveTradierOptionsEnabled,
+  resolveLiveTradeEquitiesTradier,
   resolveLiveTradierMarkets,
 } from '@trading-app/shared';
 import type { AccountSettings, TradeSignal, TradierEnv } from '@trading-app/shared';
@@ -681,21 +682,22 @@ describe('SignalEngine — TRA-332 live sizing uses real Tradier equity', () => 
   });
 });
 
-// TRA-336 — `liveTradierMarkets` is the user-facing tri-state for "what
-// should Tradier Live trade" (Options / Positions / Both). Default
-// 'options' preserves the TRA-220 options-only behaviour; 'equity' opts out
-// of the options mirror entirely (and TRA-335 lights up share routing).
+// TRA-336 / TRA-370 — `liveTradierMarkets` is the user-facing tri-state for
+// "what should Tradier Live trade" (Options / Positions / Both). TRA-370
+// flipped the absent-field default from 'options' to 'both' so a Live account
+// mirrors Demo's signal flow (equity + options) out of the box. Users can
+// still pick 'options' or 'equity' explicitly in Settings to narrow routing.
 describe('shared/AccountSettings — TRA-336 liveTradierMarkets resolvers', () => {
   function withMarkets(markets: AccountSettings['liveTradierMarkets']): AccountSettings {
     return { ...DEFAULT_ACCOUNT_SETTINGS, liveTradierMarkets: markets };
   }
 
-  it("defaults to 'options' so saved settings without the field keep TRA-220 behaviour", () => {
+  it("defaults to 'both' (TRA-370) so absent saved settings mirror Demo's signal flow", () => {
     const s: AccountSettings = { ...DEFAULT_ACCOUNT_SETTINGS };
     delete s.liveTradierMarkets;
-    expect(resolveLiveTradierMarkets(s)).toBe('options');
+    expect(resolveLiveTradierMarkets(s)).toBe('both');
     expect(isLiveTradierOptionsEnabled(s)).toBe(true);
-    expect(isLiveTradierEquityEnabled(s)).toBe(false);
+    expect(isLiveTradierEquityEnabled(s)).toBe(true);
   });
 
   it("'options' enables only the options mirror", () => {
@@ -717,11 +719,42 @@ describe('shared/AccountSettings — TRA-336 liveTradierMarkets resolvers', () =
   });
 });
 
+// TRA-370 — Demo and Live (production) should fire the same signals and trade
+// both equity positions AND options out of the box. The defaults + resolver
+// fallbacks below are the wire-level contract that makes that true; pin them
+// so a future change to TRA-336 routing doesn't silently regress a Live
+// account back to options-only or equity-only behaviour.
+describe('shared/AccountSettings — TRA-370 Live/Demo parity defaults', () => {
+  it("DEFAULT_ACCOUNT_SETTINGS routes Live to BOTH equity + options", () => {
+    expect(DEFAULT_ACCOUNT_SETTINGS.liveTradierMarkets).toBe('both');
+    expect(DEFAULT_ACCOUNT_SETTINGS.liveTradeEquitiesTradier).toBe(true);
+  });
+
+  it("absent liveTradierMarkets resolves to 'both' so Live mirrors Demo's signal flow", () => {
+    const s: AccountSettings = { ...DEFAULT_ACCOUNT_SETTINGS };
+    delete s.liveTradierMarkets;
+    expect(resolveLiveTradierMarkets(s)).toBe('both');
+    expect(isLiveTradierOptionsEnabled(s)).toBe(true);
+    expect(isLiveTradierEquityEnabled(s)).toBe(true);
+  });
+
+  it("absent liveTradeEquitiesTradier resolves to true so Live opens equity brackets out of the box", () => {
+    const s: AccountSettings = { ...DEFAULT_ACCOUNT_SETTINGS };
+    delete s.liveTradeEquitiesTradier;
+    expect(resolveLiveTradeEquitiesTradier(s)).toBe(true);
+  });
+
+  it("explicit liveTradeEquitiesTradier === false still opts out (user-facing override survives)", () => {
+    const s: AccountSettings = { ...DEFAULT_ACCOUNT_SETTINGS, liveTradeEquitiesTradier: false };
+    expect(resolveLiveTradeEquitiesTradier(s)).toBe(false);
+  });
+});
+
 describe('SignalEngine — TRA-336 markets-selector gate', () => {
   // The flag the doTick gate consults. Confirms the engine reflects the
   // user's selection at construction and after applySettings — flipping
   // the tri-state must take effect on the next tick without a restart.
-  it("constructs with tradierLiveOptionsEnabled === true under the default ('options')", () => {
+  it("constructs with tradierLiveOptionsEnabled === true under the default ('both', TRA-370)", () => {
     const engine = new SignalEngine({ ...DEFAULT_ACCOUNT_SETTINGS, mode: 'live' });
     expect(
       (engine as unknown as { tradierLiveOptionsEnabled: boolean }).tradierLiveOptionsEnabled,

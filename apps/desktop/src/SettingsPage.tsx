@@ -13,6 +13,7 @@ import {
   DEFAULT_STRATEGY_PRESET_ID,
   STRATEGY_PRESETS,
   managedAccountRatioField,
+  resolveLiveTradeEquitiesTradier,
   resolveManagedAccountRatio,
   resolveRiskPerTrade,
   riskPerTradeField,
@@ -71,11 +72,11 @@ function liveAccountIdOptionsField(
 ): 'liveAccountIdOptionsSandbox' | 'liveAccountIdOptionsProduction' {
   return env === 'production' ? 'liveAccountIdOptionsProduction' : 'liveAccountIdOptionsSandbox';
 }
-// TRA-336 — markets selector for Tradier Live. Default ('options') preserves
-// the TRA-220 options-only behaviour for users who saved before the field
-// existed.
+// TRA-336 / TRA-370 — markets selector for Tradier Live. Default ('both')
+// mirrors Demo's signal flow so a Live account trades both equity positions
+// and options out of the box; matches the server-side resolver fallback.
 function readLiveTradierMarkets(s: AccountSettings): LiveTradierMarkets {
-  return s.liveTradierMarkets ?? 'options';
+  return s.liveTradierMarkets ?? 'both';
 }
 
 function PasswordInput({
@@ -1620,16 +1621,18 @@ export default function SettingsPage({ token, httpUrl, context, onModeChange, on
                   </div>
                 </div>
 
-                {/* TRA-335 — opt-in toggle for Tradier Live equity (stock-share)
-                    trading. When on, BB-fade / ORB / Ichimoku entries fire as
-                    OTOCO bracket orders against the same Tradier account that
-                    powers options. Default off so deployments that haven't
-                    opted in keep the TRA-220 options-only behaviour. */}
+                {/* TRA-335 / TRA-370 — toggle for Tradier Live equity
+                    (stock-share) trading. When on, BB-fade / ORB / Ichimoku
+                    entries fire as OTOCO bracket orders against the same
+                    Tradier account that powers options. TRA-370 — default ON
+                    so a Live account mirrors Demo's signal flow (equity +
+                    options) out of the box; uncheck to keep the
+                    relative-value options scanner as the only live path. */}
                 <div className="settings-field" style={{ marginTop: '1rem' }}>
                   <label className="checkbox-option">
                     <input
                       type="checkbox"
-                      checked={settings.liveTradeEquitiesTradier === true}
+                      checked={resolveLiveTradeEquitiesTradier(settings)}
                       onChange={e => set('liveTradeEquitiesTradier', e.target.checked)}
                     />
                     <span>
@@ -1637,8 +1640,8 @@ export default function SettingsPage({ token, httpUrl, context, onModeChange, on
                       <p className="field-hint">
                         Mirror BB-fade / ORB / Ichimoku entries to Tradier as OTOCO bracket orders
                         (limit entry + OCO take-profit / stop-loss). Requires Tradier production
-                        buying power. Off by default — leave off if you only want the relative-value
-                        options scanner to trade live.
+                        buying power. On by default (TRA-370) so Live matches Demo's signal flow;
+                        uncheck to keep the relative-value options scanner as the only live path.
                       </p>
                     </span>
                   </label>
