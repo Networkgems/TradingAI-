@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useLayoutEffect, useRef, useState } from 'react';
 import { createPortal } from 'react-dom';
-import type { TradeSignal, Position, AccountState, OptionPosition, OptionsAccountState, CryptoEngineState, LiveSkip, NewsItem, AccountSettings } from '@trading-app/shared';
+import type { TradeSignal, Position, AccountState, OptionPosition, OptionsAccountState, CryptoEngineState, LiveSkip, NewsItem, AccountSettings, OptionType } from '@trading-app/shared';
 import { DEFAULT_ACCOUNT_SETTINGS } from '@trading-app/shared';
 
 // TRA-327 — surface the options-daily cap that matches the active mode.
@@ -827,10 +827,27 @@ function CryptoDashboard({ token, onBack, onLogout, onActivity, theme, onToggleT
                     </div>
                     <div className="signal-body">
                       <div className="sig-stat"><span>Entry</span><strong>${fmt(sig.entryPrice)}</strong></div>
-                      <div className="sig-stat"><span>Stop</span><strong className="red">${fmt(sig.stopLoss)}</strong></div>
-                      <div className="sig-stat"><span>Target</span><strong className="green">${fmt(sig.takeProfit)}</strong></div>
+                      <div className="sig-stat">
+                        <span>Stop</span>
+                        <strong className="red">
+                          ${fmt(sig.stopLoss)}
+                          {sig.entryPrice > 0 && (
+                            <span className="sig-stat-pct"> ({fmtSignedIntPct((sig.stopLoss - sig.entryPrice) / sig.entryPrice * 100)})</span>
+                          )}
+                        </strong>
+                      </div>
+                      <div className="sig-stat">
+                        <span>Target</span>
+                        <strong className="green">
+                          ${fmt(sig.takeProfit)}
+                          {sig.entryPrice > 0 && (
+                            <span className="sig-stat-pct"> ({fmtSignedIntPct((sig.takeProfit - sig.entryPrice) / sig.entryPrice * 100)})</span>
+                          )}
+                        </strong>
+                      </div>
                       <div className="sig-stat"><span>R:R</span><strong>1:{sig.riskRewardRatio}</strong></div>
                     </div>
+                    <SignalOptionRow sig={sig} />
                     {sig.signalSkipReason && (
                       // TRA-261 — pre-route suppression (universe gate, §5
                       // short filters, MR-shorts off-strategy). Distinct from
@@ -1108,6 +1125,15 @@ function fmtPct(n: number | null | undefined) {
   return `${sign}${fmt(n, 2)}%`;
 }
 
+// TRA-372 — compact signed-integer percent for the signal-card Target/Stop
+// chips: "+50%" / "−25%" (proper U+2212 minus). Returns '—' on sentinel input.
+function fmtSignedIntPct(n: number | null | undefined): string {
+  if (n == null || !Number.isFinite(n)) return '—';
+  const rounded = Math.round(n);
+  if (rounded === 0) return '0%';
+  return rounded > 0 ? `+${rounded}%` : `−${Math.abs(rounded)}%`;
+}
+
 // Dollar-prefixed price for un-signed columns (entry, stop, target, cost).
 // Returns "—" alone (no leading "$") when the value is missing/sentinel.
 function fmtPrice(n: number | null | undefined, decimals = 2) {
@@ -1136,6 +1162,72 @@ function quoteStatusLabel(s: { lastUpdated: number; quoteStatus?: 'ok' | 'rate_l
 
 function formatTime(ts: number) {
   return new Date(ts).toLocaleTimeString('en-US', { hour: '2-digit', minute: '2-digit', second: '2-digit' });
+}
+
+// TRA-372 — parse a YYYY-MM-DD option-expiration string as a local-date
+// (avoids the UTC interpretation new Date('2026-05-29') would give and the
+// off-by-one display on Pacific timezones).
+function parseExpirationDate(iso: string | undefined | null): Date | null {
+  if (!iso) return null;
+  const m = /^(\d{4})-(\d{2})-(\d{2})$/.exec(iso);
+  if (!m) return null;
+  const d = new Date(Number(m[1]), Number(m[2]) - 1, Number(m[3]));
+  return Number.isNaN(d.getTime()) ? null : d;
+}
+
+// TRA-372 — "May 29, 2026" for the signal card. Returns '' if unparseable so
+// the caller can short-circuit rendering.
+function formatExpirationFull(iso: string | undefined | null): string {
+  const d = parseExpirationDate(iso);
+  if (!d) return '';
+  return d.toLocaleDateString('en-US', { month: 'short', day: 'numeric', year: 'numeric' });
+}
+
+// TRA-372 — compact "May 29" (or "May 29, 2027" off-year) for the table cell.
+function formatExpirationShort(iso: string | undefined | null): string {
+  const d = parseExpirationDate(iso);
+  if (!d) return '';
+  const sameYear = d.getFullYear() === new Date().getFullYear();
+  return d.toLocaleDateString('en-US', sameYear
+    ? { month: 'short', day: 'numeric' }
+    : { month: 'short', day: 'numeric', year: 'numeric' });
+}
+
+// TRA-372 — integer days from a reference timestamp to a yyyy-mm-dd expiration.
+// Floors to the calendar-day boundary so "fires at 3pm, expires same day" reads
+// as 0d, not −0d.
+function daysToExpiration(iso: string | undefined | null, fromTs: number): number | null {
+  const exp = parseExpirationDate(iso);
+  if (!exp) return null;
+  const from = new Date(fromTs);
+  const fromDay = new Date(from.getFullYear(), from.getMonth(), from.getDate());
+  const ms = exp.getTime() - fromDay.getTime();
+  return Math.round(ms / 86_400_000);
+}
+
+// TRA-372 — contract detail row rendered under the entry/stop/target/RR block
+// on option signals (currently relative_value; future option SignalTypes fall
+// through the same render path as long as `strike`/`expiration` are present).
+// Returns null for non-option signals so the crypto signal feed renders byte
+// identical to before.
+function SignalOptionRow({ sig }: { sig: TradeSignal }) {
+  const opt = sig as TradeSignal & { optionType?: OptionType; strike?: number; expiration?: string };
+  if (sig.type !== 'relative_value') return null;
+  if (opt.strike == null || !opt.expiration) return null;
+  const expFull = formatExpirationFull(opt.expiration);
+  if (!expFull) return null;
+  const dte = daysToExpiration(opt.expiration, sig.timestamp);
+  const optType = opt.optionType ?? 'call';
+  return (
+    <div className="signal-option-row">
+      <span className={`option-badge ${optType}`}>{optType.toUpperCase()}</span>
+      <span className="option-strike">Strike ${Math.round(opt.strike)}</span>
+      <span className="option-exp">
+        Exp {expFull}
+        {dte != null && <span className="option-dte"> ({dte}d)</span>}
+      </span>
+    </div>
+  );
 }
 
 function signalLabel(type: string) {
@@ -2135,17 +2227,28 @@ function Dashboard({ token, onLogout, onGoHome, onActivity, theme, onToggleTheme
                       </div>
                       <div className="sig-stat">
                         <span>Stop</span>
-                        <strong className="red">${fmt(sig.stopLoss)}</strong>
+                        <strong className="red">
+                          ${fmt(sig.stopLoss)}
+                          {sig.entryPrice > 0 && (
+                            <span className="sig-stat-pct"> ({fmtSignedIntPct((sig.stopLoss - sig.entryPrice) / sig.entryPrice * 100)})</span>
+                          )}
+                        </strong>
                       </div>
                       <div className="sig-stat">
                         <span>Target</span>
-                        <strong className="green">${fmt(sig.takeProfit)}</strong>
+                        <strong className="green">
+                          ${fmt(sig.takeProfit)}
+                          {sig.entryPrice > 0 && (
+                            <span className="sig-stat-pct"> ({fmtSignedIntPct((sig.takeProfit - sig.entryPrice) / sig.entryPrice * 100)})</span>
+                          )}
+                        </strong>
                       </div>
                       <div className="sig-stat">
                         <span>R:R</span>
                         <strong>1:{sig.riskRewardRatio}</strong>
                       </div>
                     </div>
+                    <SignalOptionRow sig={sig} />
                   </div>
                 ))}
               </div>
@@ -2307,6 +2410,9 @@ function Dashboard({ token, onLogout, onGoHome, onActivity, theme, onToggleTheme
                     <tr>
                       <SortableTH label="Symbol" sortKey="symbol" sort={openOptSort.sort} onSort={openOptSort.onSort} />
                       <SortableTH label="Type" sortKey="type" sort={openOptSort.sort} onSort={openOptSort.onSort} />
+                      {/* TRA-372 — surface contract detail directly on the table so the user can confirm which contract is open on the broker without drilling into the position. */}
+                      <th>Strike</th>
+                      <th>Expiration</th>
                       <SortableTH label="Contracts" sortKey="contracts" sort={openOptSort.sort} onSort={openOptSort.onSort} />
                       <SortableTH label="Premium Paid" sortKey="premiumPaid" sort={openOptSort.sort} onSort={openOptSort.onSort} />
                       <SortableTH label="Current Mark" sortKey="currentMark" sort={openOptSort.sort} onSort={openOptSort.onSort} />
@@ -2357,6 +2463,8 @@ function Dashboard({ token, onLogout, onGoHome, onActivity, theme, onToggleTheme
                           <td className={o.optionType === 'call' ? 'green' : 'red'}>
                             {o.optionType.toUpperCase()}
                           </td>
+                          <td>{o.strike != null ? `$${Math.round(o.strike)}` : '—'}</td>
+                          <td className="muted">{o.expiration ? formatExpirationShort(o.expiration) : '—'}</td>
                           <td>{o.contracts}</td>
                           <td>${fmt(o.premiumPaid)}</td>
                           <td className={!hasMark ? 'muted' : (pnlPct >= 0 ? 'green' : 'red')}>
@@ -2468,6 +2576,9 @@ function Dashboard({ token, onLogout, onGoHome, onActivity, theme, onToggleTheme
                     <tr>
                       <SortableTH label="Symbol" sortKey="symbol" sort={closedOptSort.sort} onSort={closedOptSort.onSort} />
                       <SortableTH label="Type" sortKey="type" sort={closedOptSort.sort} onSort={closedOptSort.onSort} />
+                      {/* TRA-372 — mirror Open Options contract detail on the closed table too. */}
+                      <th>Strike</th>
+                      <th>Expiration</th>
                       <SortableTH label="Contracts" sortKey="contracts" sort={closedOptSort.sort} onSort={closedOptSort.onSort} />
                       <SortableTH label="Premium Paid" sortKey="premiumPaid" sort={closedOptSort.sort} onSort={closedOptSort.onSort} />
                       <SortableTH label="Exit Premium" sortKey="exitPremium" sort={closedOptSort.sort} onSort={closedOptSort.onSort} />
@@ -2492,6 +2603,8 @@ function Dashboard({ token, onLogout, onGoHome, onActivity, theme, onToggleTheme
                           <td className={o.optionType === 'call' ? 'green' : 'red'}>
                             {o.optionType.toUpperCase()}
                           </td>
+                          <td>{o.strike != null ? `$${Math.round(o.strike)}` : '—'}</td>
+                          <td className="muted">{o.expiration ? formatExpirationShort(o.expiration) : '—'}</td>
                           <td>{o.contracts}</td>
                           <td>${fmt(o.premiumPaid)}</td>
                           <td>${fmt(o.currentPremium)}</td>

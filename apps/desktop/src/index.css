@@ -452,6 +452,32 @@ tr:hover td { background: var(--bg-hover); }
 .sig-stat { display: flex; flex-direction: column; }
 .sig-stat span { font-size: 0.6rem; color: var(--muted); text-transform: uppercase; }
 .sig-stat strong { font-size: 0.8rem; }
+/* TRA-372 — inline percent on the Target/Stop chips: lighter weight + smaller font so it reads as a qualifier and doesn't fight the dollar number for attention. */
+.sig-stat-pct { font-size: 0.7rem; font-weight: 500; opacity: 0.8; }
+
+/* TRA-372 — option contract row rendered under the entry/stop/target/RR block
+   on option signals. Matches the call/put colour treatment used in the Open
+   Options table so the user can recognise the contract side at a glance. */
+.signal-option-row {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+  margin-top: 0.55rem;
+  font-size: 0.75rem;
+  flex-wrap: wrap;
+}
+.signal-option-row .option-badge {
+  font-size: 0.65rem;
+  font-weight: 800;
+  padding: 0.15em 0.5em;
+  border-radius: 3px;
+  letter-spacing: 0.08em;
+}
+.signal-option-row .option-badge.call { background: var(--green-soft); color: var(--green); }
+.signal-option-row .option-badge.put { background: var(--red-soft); color: var(--red); }
+.signal-option-row .option-strike { font-weight: 600; }
+.signal-option-row .option-exp { color: var(--muted); }
+.signal-option-row .option-dte { font-size: 0.7rem; opacity: 0.85; }
 
 .signal-skip-reason {
   margin-top: 0.5rem;
