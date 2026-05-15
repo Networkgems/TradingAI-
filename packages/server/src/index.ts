@@ -27,6 +27,7 @@ import {
 } from './watchlist-store.js';
 import { scanStocksMarket, scanCryptoMarket } from './market-scanner.js';
 import { runPremarketForAllUsers } from './premarket-watchlist.js';
+import { recordOptionChains } from './options-chain-recorder.js';
 import {
   loadUsers,
   validateUserCredentials,
@@ -75,6 +76,7 @@ import {
   resolveTradierOptionsCreds,
   STRATEGY_PRESETS,
   DEFAULT_STRATEGY_PRESET_ID,
+  WATCHLIST,
   type AccountSettings,
   type NewsItem,
   type ResearchReport,
@@ -805,6 +807,58 @@ async function runDailyCloseForAllUsers(): Promise<void> {
     } catch (err) {
       console.error(`[archive:${ctx.username}] archive failed:`, err);
     }
+  }
+}
+
+// TRA-380 — option-chain recorder hook (parent TRA-379, step 1). Fires from
+// the MarketScheduler at 3:55 PM ET on trading days and runs the TRA-376
+// recorder against the live Tradier production API, writing one date
+// partition under `<DATA_DIR>/option-chains/<YYYY-MM-DD>/`.
+//
+// Why DATA_DIR and not the CLI's `./data/option-chains`: on Render the
+// container filesystem is ephemeral and only the persistent disk (mounted at
+// DATA_DIR, see render.yaml `disk.mountPath`) survives restarts/redeploys.
+// The replay harness needs ~30 daily partitions accumulated over ~6 weeks,
+// so the partitions must land on the disk. `CHAINS_OUT_DIR` can override.
+//
+// DTE window is 14–60 days — NOT the CLI's 35-day default. Per the TRA-379
+// sweep spec the RV scanner's live window is 21–60d (TRA-373); a 35-day cap
+// would starve RV's upper half in the replay. 14–60 is the union the OTM +
+// RV scanners both need.
+//
+// Production creds come from the server env (TRADIER_API_TOKEN). A missing
+// token logs a warning and no-ops rather than throwing — equity/crypto
+// trading is unaffected. Per-symbol errors are isolated inside
+// `recordOptionChains` and logged, never fatal.
+const CHAIN_RECORD_OUT_DIR = process.env['CHAINS_OUT_DIR'] ?? join(DATA_DIR, 'option-chains');
+
+async function runChainRecord(): Promise<void> {
+  const apiToken = (process.env['TRADIER_API_TOKEN'] ?? '').trim();
+  if (!apiToken) {
+    console.warn('[chain-recorder] TRADIER_API_TOKEN unset — skipping option-chain snapshot');
+    return;
+  }
+  const accountId = (process.env['TRADIER_ACCOUNT_ID'] ?? '').trim() || 'recorder-readonly';
+  const client = new TradierOptionsClient(apiToken, accountId, 'production');
+  const symbols = [...WATCHLIST];
+
+  console.log(
+    `[chain-recorder] starting: symbols=${symbols.length} dte=[14,60] outDir=${CHAIN_RECORD_OUT_DIR}`,
+  );
+  const result = await recordOptionChains({
+    symbols,
+    client,
+    outDir: CHAIN_RECORD_OUT_DIR,
+    minDteDays: 14,
+    maxDteDays: 60,
+  });
+  const written = result.symbols.filter((s) => s.outcome === 'written').length;
+  const errored = result.symbols.filter((s) => s.outcome === 'error');
+  console.log(
+    `[chain-recorder] date=${result.date} written=${written}/${result.symbols.length} dir=${result.outDir}`,
+  );
+  for (const s of errored) {
+    console.warn(`[chain-recorder]   - ${s.symbol}: ${s.errorMessage}`);
   }
 }
 
@@ -2518,6 +2572,10 @@ scheduler.start({
   // the SignalEngine starts the new session with curated symbols. Stocks
   // only — crypto's 24/7 market has no pre-market boundary.
   onPremarket: runPremarketForAllUsers,
+  // TRA-380 — 3:55 PM ET option-chain recorder. Captures one Tradier chain
+  // snapshot per trading day into the persistent disk for the TRA-379
+  // replay backtest harness. Market days only; see `runChainRecord`.
+  onChainRecord: runChainRecord,
 });
 
 httpServer.listen(PORT, () => {

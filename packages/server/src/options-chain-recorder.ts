@@ -13,9 +13,10 @@
  *   <outDir>/<YYYY-MM-DD>/_meta.json     recorder run metadata
  *
  * The recorder is a pure data layer — it does not touch any user / paper
- * account state. A future heartbeat can wire it into the `MarketScheduler`
- * but the standalone CLI in `scripts/record-option-chains.ts` is sufficient
- * for the initial 30-day capture window.
+ * account state. TRA-380 wires it into the `MarketScheduler` as the
+ * `onChainRecord` hook (3:55 PM ET, market days) for the managed in-process
+ * daily capture; the standalone CLI in `scripts/record-option-chains.ts`
+ * remains as the manual backfill / one-off entry point.
  */
 
 import { mkdir, writeFile } from 'fs/promises';

@@ -94,6 +94,15 @@ export interface ScheduleCallbacks {
    * curated symbol set ready when the bell rings.
    */
   onPremarket?: EodTriggerCallback;
+  /**
+   * TRA-380 — fires at 3:55 PM ET on stock-market trading days, 5 minutes
+   * before the closing bell. Drives the TRA-376 option-chain recorder so a
+   * fresh date-partitioned chain snapshot lands once per trading day for the
+   * replay backtest harness (parent TRA-379). Gated on `isMarketDay` so
+   * weekends + NYSE holidays are skipped, and deduped per ET date so the 60s
+   * polling loop can't double-fire within the 3:55 minute.
+   */
+  onChainRecord?: EodTriggerCallback;
 }
 
 export class MarketScheduler {
@@ -105,6 +114,8 @@ export class MarketScheduler {
   private lastHourlyKey = '';
   /** TRA-368 — last ET date the 9 AM pre-market hook fired. Dedupes within the day. */
   private lastPremarketDate = '';
+  /** TRA-380 — last ET date the 3:55 PM option-chain recorder hook fired. Dedupes within the day. */
+  private lastChainRecordDate = '';
 
   /**
    * Start polling. Accepts either a single market-close callback (legacy form)
@@ -154,6 +165,20 @@ export class MarketScheduler {
         }
       }
 
+      // TRA-380 — 3:55 PM ET option-chain recorder hook, 5 min before the
+      // closing bell. Gated on market days so weekends + NYSE holidays are
+      // skipped. The callback runs the TRA-376 recorder, writing one date
+      // partition per trading day for the replay backtest harness.
+      if (hour === 15 && minute === 55) {
+        if (cfg.onChainRecord && isMarketDay(date) && this.lastChainRecordDate !== todayKey) {
+          this.lastChainRecordDate = todayKey;
+          console.log(`[scheduler] option-chain recorder trigger fired for ${todayKey}`);
+          Promise.resolve(cfg.onChainRecord()).catch(err =>
+            console.error('[scheduler] option-chain recorder callback error:', err),
+          );
+        }
+      }
+
       if (hour === 21 && minute === 0) {
         if (cfg.onArchive && this.lastArchiveDate !== todayKey) {
           this.lastArchiveDate = todayKey;
@@ -180,7 +205,7 @@ export class MarketScheduler {
       }
     }, 60_000);
 
-    console.log('[scheduler] EOD scheduler started (9:00 AM ET pre-market, 4:05 PM ET reports, 9:00 PM ET archive)');
+    console.log('[scheduler] EOD scheduler started (9:00 AM ET pre-market, 3:55 PM ET chain recorder, 4:05 PM ET reports, 9:00 PM ET archive)');
   }
 
   stop(): void {
