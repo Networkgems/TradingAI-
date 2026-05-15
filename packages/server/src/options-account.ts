@@ -29,6 +29,14 @@ import {
 
 const ATM_DELTA = 0.50;
 
+/**
+ * TRA-384 — consecutive ticks an OTM/RV position may go without a fresh live
+ * mark before `checkExits` falls back to the underlying-delta extrapolation so
+ * the stop loss can still be evaluated. At the engine's ~30s tick this is ~90s
+ * of grace for a transient chain-fetch blip before the backstop engages.
+ */
+const STALE_MARK_BACKSTOP_TICKS = 3;
+
 function toDateKey(ts: number): string {
   return new Date(ts).toISOString().slice(0, 10);
 }
@@ -546,6 +554,15 @@ export class PaperOptionsAccount {
      * enforced by the live mirror's pre-check in signal-engine.ts.
      */
     equityOverride?: number,
+    /**
+     * TRA-384 — the underlying's spot price at entry. `signal.entryPrice` on an
+     * OTM / RV signal is the per-share OPTION mark, not the underlying, so it
+     * cannot seed `underlyingEntryPrice` for the stale-mark delta backstop.
+     * Callers that have the real spot (the scanner result carries it) should
+     * pass it; absent, we fall back to the legacy `signal.entryPrice` and the
+     * backstop simply won't engage usefully for that position.
+     */
+    underlyingSpot?: number,
   ): OptionPosition | null {
     this.resetDayIfNeeded();
 
@@ -614,7 +631,14 @@ export class PaperOptionsAccount {
       peakPremium: premiumPaid,
       trailingActive: false,
       trailingStopPremium: trailActivatePremium,
-      underlyingEntryPrice: signal.entryPrice,
+      underlyingEntryPrice:
+        Number.isFinite(underlyingSpot) && (underlyingSpot as number) > 0
+          ? (underlyingSpot as number)
+          : signal.entryPrice,
+      // TRA-384 — persist the scanner's entry delta so `checkExits` can run an
+      // honest underlying-delta extrapolation as a stop-loss backstop when the
+      // live mark feed stalls.
+      ...(Number.isFinite(signal.delta) ? { entryDelta: signal.delta } : {}),
       openedAt: Date.now(),
       signalId: signal.id,
       signalType: 'otm_mispricing',
@@ -644,6 +668,8 @@ export class PaperOptionsAccount {
     mode: AccountMode = 'demo',
     /** TRA-332 — see {@link openOptionFromCandidate} for the live-equity rationale. */
     equityOverride?: number,
+    /** TRA-384 — see {@link openOptionFromCandidate} for the underlying-spot rationale. */
+    underlyingSpot?: number,
   ): OptionPosition | null {
     this.resetDayIfNeeded();
 
@@ -698,7 +724,13 @@ export class PaperOptionsAccount {
       peakPremium: premiumPaid,
       trailingActive: false,
       trailingStopPremium: trailActivatePremium,
-      underlyingEntryPrice: signal.entryPrice,
+      underlyingEntryPrice:
+        Number.isFinite(underlyingSpot) && (underlyingSpot as number) > 0
+          ? (underlyingSpot as number)
+          : signal.entryPrice,
+      // TRA-384 — see `openOptionFromCandidate`: persist entry delta + the real
+      // underlying spot for the stale-mark stop-loss backstop in `checkExits`.
+      ...(Number.isFinite(signal.delta) ? { entryDelta: signal.delta } : {}),
       openedAt: Date.now(),
       signalId: signal.id,
       signalType: 'relative_value',
@@ -783,10 +815,13 @@ export class PaperOptionsAccount {
    * `optionMarks` (TRA-159) supplies live per-share marks keyed by OCC symbol
    * — when present for a position with `optionSymbol`, that mark is used
    * directly instead of extrapolating off the underlying with a fixed delta.
-   * Positions opened from the OTM scanner (`signalType === 'otm_mispricing'`)
-   * REQUIRE a fresh mark to evaluate exits; if the chain wasn't fetched this
-   * tick the position is skipped (next tick gets it). ATM positions opened
-   * from `openOption` keep the existing delta-extrapolation fallback.
+   * Positions opened from the OTM / RV scanners prefer a fresh mark to evaluate
+   * exits; a single missed chain snapshot skips them for that tick (next tick
+   * gets it). TRA-384 — but after `STALE_MARK_BACKSTOP_TICKS` consecutive
+   * misses they fall back to the underlying-delta extrapolation (using the
+   * persisted `entryDelta`) so a stalled mark feed can't leave a position open
+   * with its stop loss never evaluated. ATM positions opened from `openOption`
+   * use that delta-extrapolation fallback every tick.
    */
   checkExits(
     underlyingPrices: Map<string, number>,
@@ -835,11 +870,31 @@ export class PaperOptionsAccount {
       let mark: number;
       if (typeof liveMark === 'number' && liveMark > 0) {
         mark = liveMark;
+        // Fresh mark this tick — clear the stale-mark backstop counter.
+        opt.staleMarkTicks = 0;
       } else if (opt.signalType === 'otm_mispricing' || opt.signalType === 'relative_value') {
-        // OTM and RV positions are mark-driven. Without a fresh chain snapshot
-        // we'd have no honest way to update them, so wait for the next tick
-        // rather than synthesise a fake mark off the underlying delta.
-        continue;
+        // TRA-384 — OTM and RV positions are mark-driven. A single missed
+        // chain snapshot is a transient blip, so we still wait one tick
+        // rather than act on a synthesised mark. But waiting *forever* means
+        // a position whose mark feed has stalled (after-hours, RV-scanner
+        // circuit breaker, illiquid contract with no bid/ask, rate limit)
+        // never gets its stop loss evaluated — it sits open, unprotected,
+        // indefinitely. After STALE_MARK_BACKSTOP_TICKS consecutive misses
+        // fall back to the same underlying-delta extrapolation ATM positions
+        // already use every tick, so SL / trailing can still fire. The entry
+        // delta (persisted from the scanner) keeps the extrapolation honest
+        // for OTM strikes; absent it (legacy snapshots) we use ATM_DELTA.
+        opt.staleMarkTicks = (opt.staleMarkTicks ?? 0) + 1;
+        if (opt.staleMarkTicks < STALE_MARK_BACKSTOP_TICKS) continue;
+        const currentUnderlying = underlyingPrices.get(opt.symbol);
+        if (currentUnderlying == null) continue;
+        const underlyingMove = currentUnderlying - opt.underlyingEntryPrice;
+        const deltaMag =
+          opt.entryDelta != null && Number.isFinite(opt.entryDelta) && opt.entryDelta !== 0
+            ? Math.abs(opt.entryDelta)
+            : ATM_DELTA;
+        const premiumMove = underlyingMove * deltaMag * (opt.optionType === 'call' ? 1 : -1);
+        mark = Math.max(0.01, opt.premiumPaid + premiumMove);
       } else {
         const currentUnderlying = underlyingPrices.get(opt.symbol);
         if (currentUnderlying == null) continue;

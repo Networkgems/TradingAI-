@@ -1316,7 +1316,17 @@ export class SignalEngine {
         // the dashboard scopes Open / Recent Closed Options per-mode.
         // TRA-332 — pass `liveEquity` so live sizing uses the real Tradier
         // figure instead of stale paper-account equity.
-        const opened = this.optionsAccount.openOptionFromRvCandidate(signal, this.mode, liveEquity);
+        // TRA-384 — pass the scanner's underlying spot so the position can seed
+        // `underlyingEntryPrice` for the stale-mark stop-loss backstop (the
+        // signal's `entryPrice` is the option mark, not the underlying).
+        const underlyingSpot =
+          typeof result.spot === 'number' && result.spot > 0 ? result.spot : undefined;
+        const opened = this.optionsAccount.openOptionFromRvCandidate(
+          signal,
+          this.mode,
+          liveEquity,
+          underlyingSpot,
+        );
         if (!opened) continue;
 
         // TRA-221 — when running live with Tradier configured, mirror the

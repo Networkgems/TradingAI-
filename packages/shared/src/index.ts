@@ -1200,6 +1200,23 @@ export interface OptionPosition {
    * Cleared once a fresh pendingExit is submitted on a later tick.
    */
   exitErrorReason?: string;
+  /**
+   * TRA-384 — sign-adjusted Black-Scholes delta captured from the OTM / RV
+   * scanner at entry. Used by `checkExits` as the extrapolation slope when the
+   * live mark feed has stalled, so the stop-loss backstop tracks an OTM strike
+   * honestly instead of assuming an ATM 0.50 delta. Absent on ATM opens and on
+   * snapshots persisted before this field existed.
+   */
+  entryDelta?: number;
+  /**
+   * TRA-384 — consecutive `checkExits` ticks this OTM / RV position has gone
+   * without a fresh live mark. Reset to 0 the moment a mark lands. Once it
+   * reaches `STALE_MARK_BACKSTOP_TICKS`, `checkExits` stops skipping the
+   * position and evaluates SL / trailing off the underlying-delta backstop so
+   * a stalled mark feed can't silently disable the stop loss. Absent ↔ never
+   * missed a mark / legacy snapshot.
+   */
+  staleMarkTicks?: number;
 }
 
 export interface OptionsAccountState {

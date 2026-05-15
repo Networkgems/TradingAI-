@@ -1574,3 +1574,104 @@ describe('PaperOptionsAccount — TRA-374 demo cost model', () => {
     expect(pos!.premiumPaid).toBeCloseTo(1.05, 5);
   });
 });
+
+// ─── TRA-384 — stale-mark stop-loss backstop ───────────────────────────────
+// Bug report: "TradeAI is not closing trades using stop losses." Root cause —
+// `checkExits` skipped every OTM / RV position on any tick it couldn't fetch a
+// fresh option mark, and that skip had no upper bound. When the mark feed
+// stalled (after-hours, RV-scanner circuit breaker, illiquid contract with no
+// bid/ask, rate limit) the position sat open with its stop loss never once
+// evaluated. The fix lets the skip absorb a few transient blips, then falls
+// back to the underlying-delta extrapolation so the SL can still fire.
+describe('PaperOptionsAccount — TRA-384 stale-mark SL backstop', () => {
+  function buildRvSignal(overrides: Partial<RelativeValueSignal> = {}): RelativeValueSignal {
+    return {
+      id: 'rv-1',
+      symbol: 'AAPL',
+      type: 'relative_value',
+      side: 'buy',
+      entryPrice: 1.0, // per-share OPTION mark — NOT the underlying spot
+      stopLoss: 0.75,
+      takeProfit: 1.5,
+      riskRewardRatio: 2,
+      timestamp: TRADING_TIME,
+      optionSymbol: 'AAPL240705C00200000',
+      optionType: 'call',
+      strike: 200,
+      expiration: '2024-07-05',
+      mark: 1.0,
+      fairPrice: 1.30,
+      mispricingPct: -0.23,
+      zScore: -2.1,
+      ivFitted: 0.32,
+      ivUsed: 0.28,
+      delta: 0.18,
+      reason: 'cheap-vs-curve',
+      ...overrides,
+    };
+  }
+
+  it('persists entryDelta and the real underlying spot (not the option mark) at open', () => {
+    const acct = new PaperOptionsAccount({ initialEquity: 50_000, managedAccountRatio: 0.5 });
+    const pos = acct.openOptionFromRvCandidate(buildRvSignal({ mark: 1.0 }), 'demo', undefined, 190);
+    expect(pos).not.toBeNull();
+    expect(pos!.entryDelta).toBe(0.18);
+    // Seeded from the spot arg — the legacy `signal.entryPrice` (1.0) would be
+    // the option mark and would make the delta extrapolation nonsense.
+    expect(pos!.underlyingEntryPrice).toBe(190);
+  });
+
+  it('skips the first STALE_MARK_BACKSTOP_TICKS-1 missed marks, then fires SL off the underlying', () => {
+    const acct = new PaperOptionsAccount({ initialEquity: 50_000, managedAccountRatio: 0.5 });
+    const pos = acct.openOptionFromRvCandidate(buildRvSignal({ mark: 1.0 }), 'demo', undefined, 100);
+    expect(pos).not.toBeNull();
+    // RV SL = premiumPaid × (1 − 0.30) = 0.70. Drive the underlying down so the
+    // delta-extrapolated mark = 1.0 + (98 − 100) × 0.18 = 0.64 ≤ 0.70.
+    const underlying = new Map<string, number>([['AAPL', 98]]);
+    const noMarks = new Map<string, number>();
+
+    // Ticks 1 & 2 — no mark, still inside the grace window: position untouched.
+    expect(acct.checkExits(underlying, noMarks)).toHaveLength(0);
+    expect(acct.getState().openOptions[0].staleMarkTicks).toBe(1);
+    expect(acct.checkExits(underlying, noMarks)).toHaveLength(0);
+    expect(acct.getState().openOptions[0].staleMarkTicks).toBe(2);
+
+    // Tick 3 — third consecutive miss: backstop engages and the SL fires.
+    const closed = acct.checkExits(underlying, noMarks);
+    expect(closed).toHaveLength(1);
+    expect(closed[0].closedAt).toBeDefined();
+    expect(closed[0].currentPremium).toBeCloseTo(pos!.stopLossPremium, 5);
+    expect(acct.getState().openOptions).toHaveLength(0);
+  });
+
+  it('does NOT fire the backstop when the underlying has not breached the stop', () => {
+    const acct = new PaperOptionsAccount({ initialEquity: 50_000, managedAccountRatio: 0.5 });
+    acct.openOptionFromRvCandidate(buildRvSignal({ mark: 1.0 }), 'demo', undefined, 100);
+    // Underlying flat — extrapolated mark stays at premiumPaid, well above SL.
+    const underlying = new Map<string, number>([['AAPL', 100]]);
+    const noMarks = new Map<string, number>();
+    for (let i = 0; i < 5; i += 1) acct.checkExits(underlying, noMarks);
+    expect(acct.getState().openOptions).toHaveLength(1);
+  });
+
+  it('resets the stale counter the moment a fresh mark lands', () => {
+    const acct = new PaperOptionsAccount({ initialEquity: 50_000, managedAccountRatio: 0.5 });
+    const pos = acct.openOptionFromRvCandidate(buildRvSignal({ mark: 1.0 }), 'demo', undefined, 100);
+    const underlying = new Map<string, number>([['AAPL', 98]]);
+    const noMarks = new Map<string, number>();
+
+    acct.checkExits(underlying, noMarks);
+    acct.checkExits(underlying, noMarks);
+    expect(acct.getState().openOptions[0].staleMarkTicks).toBe(2);
+
+    // A real mark above the SL lands — counter clears, position stays open.
+    const freshMark = new Map<string, number>([[pos!.optionSymbol!, 0.95]]);
+    expect(acct.checkExits(underlying, freshMark)).toHaveLength(0);
+    expect(acct.getState().openOptions[0].staleMarkTicks).toBe(0);
+
+    // Two more misses only get back to 2 — the backstop does not engage early.
+    acct.checkExits(underlying, noMarks);
+    expect(acct.checkExits(underlying, noMarks)).toHaveLength(0);
+    expect(acct.getState().openOptions).toHaveLength(1);
+  });
+});
