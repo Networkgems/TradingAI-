@@ -6,7 +6,18 @@ const MONTH_NAMES = [
   'July', 'August', 'September', 'October', 'November', 'December',
 ];
 const MONTH_SHORT = ['Jan','Feb','Mar','Apr','May','Jun','Jul','Aug','Sep','Oct','Nov','Dec'];
-const DAY_LABELS  = ['MON', 'TUE', 'WED', 'THU', 'FRI', 'SAT', 'SUN'];
+const DAY_LABELS_FULL = ['MON', 'TUE', 'WED', 'THU', 'FRI', 'SAT', 'SUN'];
+const DAY_LABELS_WEEKDAYS = ['MON', 'TUE', 'WED', 'THU', 'FRI'];
+
+// TRA-369 — stocks market is closed Sat/Sun, so any P&L row dated on a
+// weekend is stale/imported noise. Strip weekend rows so monthly totals,
+// trading-day counts, and win-rate stats reflect the real trading week.
+function isWeekendIso(dateIso: string): boolean {
+  const [y, m, d] = dateIso.split('-').map(Number);
+  if (!y || !m || !d) return false;
+  const dow = new Date(y, m - 1, d).getDay(); // 0=Sun … 6=Sat
+  return dow === 0 || dow === 6;
+}
 
 // Compact P&L format matching the Webull reference: +$1.00K, -$234.56, --
 function fmtCompact(value: number): string {
@@ -30,21 +41,38 @@ function isoDate(year: number, month: number, day: number): string {
   return `${year}-${String(month + 1).padStart(2, '0')}-${String(day).padStart(2, '0')}`;
 }
 
-// Build an array of weeks for the given month. Each week is a 7-element array
-// (Mon–Sun) of day numbers or null for out-of-month / padding.
+// Build an array of weeks for the given month. Each week is an N-element array
+// of day numbers or null for out-of-month / padding.
 // TRA-286 — crypto trades 24/7 and stock P&L can post on weekends (settlement,
-// adjustments), so the calendar now includes Saturday and Sunday columns.
-function buildMonthWeeks(year: number, month: number): (number | null)[][] {
+// adjustments), so the crypto calendar includes Saturday and Sunday columns.
+// TRA-369 — the stocks market is closed on Sat/Sun, so the stocks calendar
+// renders Mon–Fri only and skips weekend rows. `cols` controls the layout:
+// 7 → Mon–Sun (crypto), 5 → Mon–Fri (stocks).
+function buildMonthWeeks(year: number, month: number, cols: 5 | 7): (number | null)[][] {
   const weeks: (number | null)[][] = [];
   const lastDayNum = new Date(year, month + 1, 0).getDate();
-  const emptyWeek = (): (number | null)[] => [null, null, null, null, null, null, null];
+  const emptyWeek = (): (number | null)[] => Array.from({ length: cols }, () => null);
   let week = emptyWeek();
 
   for (let d = 1; d <= lastDayNum; d++) {
     const dow = new Date(year, month, d).getDay(); // 0=Sun … 6=Sat
-    const col = dow === 0 ? 6 : dow - 1;           // Mon=0 … Sun=6
+    if (cols === 5 && (dow === 0 || dow === 6)) {
+      // Skip weekends in the stocks layout; close the row on Friday or month-end.
+      if (dow === 0 || d === lastDayNum) {
+        // Only push if the row already has at least one weekday entry.
+        if (week.some(c => c !== null)) {
+          weeks.push(week);
+          week = emptyWeek();
+        }
+      }
+      continue;
+    }
+    const col = cols === 5
+      ? dow - 1                              // Mon=0 … Fri=4
+      : (dow === 0 ? 6 : dow - 1);           // Mon=0 … Sun=6
     week[col] = d;
-    if (dow === 0 || d === lastDayNum) {           // end of week (Sun) or month
+    const endOfWeek = cols === 5 ? dow === 5 : dow === 0;
+    if (endOfWeek || d === lastDayNum) {
       weeks.push(week);
       week = emptyWeek();
     }
@@ -55,18 +83,20 @@ function buildMonthWeeks(year: number, month: number): (number | null)[][] {
 
 // ── Month grid ──────────────────────────────────────────────────────────────
 
-function MonthGrid({ year, month, reports, onSelectDate }: {
+function MonthGrid({ year, month, reports, onSelectDate, cols }: {
   year: number; month: number; reports: Record<string, EodReport>;
   onSelectDate: (date: string) => void;
+  cols: 5 | 7;
 }) {
   const today  = new Date();
-  const weeks  = buildMonthWeeks(year, month);
+  const weeks  = buildMonthWeeks(year, month, cols);
   const isCurr = today.getFullYear() === year && today.getMonth() === month;
+  const dayLabels = cols === 5 ? DAY_LABELS_WEEKDAYS : DAY_LABELS_FULL;
 
   return (
-    <div className="cal-grid">
+    <div className="cal-grid" style={{ ['--cal-cols' as string]: cols }}>
       <div className="cal-day-headers">
-        {DAY_LABELS.map(d => <div key={d} className="cal-day-label">{d}</div>)}
+        {dayLabels.map(d => <div key={d} className="cal-day-label">{d}</div>)}
       </div>
       {weeks.map((week, wi) => (
         <div key={wi} className="cal-week">
@@ -113,6 +143,8 @@ function MonthSummary({ year, month, reports }: {
   const prefix = `${year}-${String(month + 1).padStart(2, '0')}-`;
   const monthly = Object.values(reports).filter(r => r.date.startsWith(prefix));
   if (monthly.length === 0) return null;
+  // `reports` is already weekend-filtered upstream for the stocks calendar, so
+  // monthly/winRate/losses here line up with what the grid renders.
 
   const net    = monthly.reduce((s, r) => s + r.combinedPnl, 0);
   const wins   = monthly.filter(r => r.combinedPnl > 0).length;
@@ -342,8 +374,9 @@ function EodReportDetail({ report, onBack }: { report: EodReport; onBack: () => 
 // ── Main CalendarTab export ──────────────────────────────────────────────────
 
 export type CalendarMode = 'demo' | 'live' | 'sandbox';
+export type CalendarMarket = 'stocks' | 'crypto';
 
-export function CalendarTab({ token, httpUrl, reportsPath = '/api/reports', mode }: {
+export function CalendarTab({ token, httpUrl, reportsPath = '/api/reports', mode, market = 'stocks' }: {
   token: string;
   httpUrl: string;
   reportsPath?: string;
@@ -351,6 +384,11 @@ export function CalendarTab({ token, httpUrl, reportsPath = '/api/reports', mode
   // can be demo/live/sandbox; crypto is demo/live. Omitting falls back to the
   // server's default (active settings) for legacy callers.
   mode?: CalendarMode;
+  // TRA-369 — stocks markets are closed Sat/Sun, so the stocks calendar drops
+  // weekend rows entirely; crypto stays 24/7. Defaults to 'stocks' (the
+  // legacy/equity callers) to make the behaviour change opt-out for callers
+  // that don't pass `market`.
+  market?: CalendarMarket;
 }) {
   const [view,    setView]    = useState<'month' | 'year'>('month');
   const [year,    setYear]    = useState(new Date().getFullYear());
@@ -367,10 +405,11 @@ export function CalendarTab({ token, httpUrl, reportsPath = '/api/reports', mode
 
   // TRA-244 — flipping accounts must clear the cached month state so a brief
   // render of the previous bucket's rows can't leak through.
+  // TRA-369 — also reset when toggling stocks ↔ crypto.
   useEffect(() => {
     setReports({});
     setSelectedDate(null);
-  }, [mode, reportsPath]);
+  }, [mode, reportsPath, market]);
 
   useEffect(() => {
     let cancelled = false;
@@ -383,8 +422,16 @@ export function CalendarTab({ token, httpUrl, reportsPath = '/api/reports', mode
         if (!r.ok || cancelled) return;
         const { dates } = (await r.json()) as { dates: string[] };
 
+        // TRA-369 — drop weekend-dated rows on the stocks calendar. The U.S.
+        // equity market is closed Sat/Sun, so any saved report with a weekend
+        // date is stale/imported noise we shouldn't surface in totals or
+        // monthly stats. Crypto keeps every day.
+        const filteredDates = market === 'stocks'
+          ? dates.filter(d => !isWeekendIso(d))
+          : dates;
+
         const results = await Promise.all(
-          dates.map(d =>
+          filteredDates.map(d =>
             fetch(`${httpUrl}${reportsPath}/${d}${modeQuery}`, { headers: { Authorization: `Bearer ${token}` } })
               .then(res => (res.ok ? (res.json() as Promise<EodReport>) : null))
               .catch(() => null),
@@ -392,7 +439,11 @@ export function CalendarTab({ token, httpUrl, reportsPath = '/api/reports', mode
         );
         if (cancelled) return;
         const map: Record<string, EodReport> = {};
-        for (const rep of results) if (rep) map[rep.date] = rep;
+        for (const rep of results) {
+          if (!rep) continue;
+          if (market === 'stocks' && isWeekendIso(rep.date)) continue;
+          map[rep.date] = rep;
+        }
         setReports(map);
       } finally {
         if (!cancelled) setLoading(false);
@@ -400,7 +451,7 @@ export function CalendarTab({ token, httpUrl, reportsPath = '/api/reports', mode
     }
     load();
     return () => { cancelled = true; };
-  }, [token, httpUrl, reportsPath, modeQuery]);
+  }, [token, httpUrl, reportsPath, modeQuery, market]);
 
   // TRA-219 — fetch a fresh copy of the selected day's report so the detail
   // view picks up trades that closed after the initial month load.
@@ -492,6 +543,7 @@ export function CalendarTab({ token, httpUrl, reportsPath = '/api/reports', mode
             month={month}
             reports={reports}
             onSelectDate={setSelectedDate}
+            cols={market === 'stocks' ? 5 : 7}
           />
           <MonthSummary year={year} month={month} reports={reports} />
         </>

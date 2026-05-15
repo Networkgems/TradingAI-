@@ -1056,6 +1056,7 @@ function CryptoDashboard({ token, onBack, onLogout, onActivity, theme, onToggleT
             httpUrl={HTTP_URL}
             reportsPath="/api/crypto/reports"
             mode={accountMode}
+            market="crypto"
           />
         )}
       </main>

@@ -1214,17 +1214,20 @@ tr:hover td { background: var(--bg-hover); }
 }
 
 /* Month grid */
+/* TRA-369 — the stocks calendar drops Sat/Sun columns (5-wide grid); crypto
+   keeps the full 7-wide week. `--cal-cols` is set inline by <MonthGrid>. */
 .cal-grid {
   display: flex;
   flex-direction: column;
   border: 1px solid var(--border);
   border-radius: 6px;
   overflow: hidden;
+  --cal-cols: 7;
 }
 
 .cal-day-headers {
   display: grid;
-  grid-template-columns: repeat(7, 1fr);
+  grid-template-columns: repeat(var(--cal-cols), 1fr);
   background: var(--surface);
   border-bottom: 1px solid var(--border);
 }
@@ -1241,7 +1244,7 @@ tr:hover td { background: var(--bg-hover); }
 
 .cal-week {
   display: grid;
-  grid-template-columns: repeat(7, 1fr);
+  grid-template-columns: repeat(var(--cal-cols), 1fr);
   border-bottom: 1px solid var(--border);
 }
 
