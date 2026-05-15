@@ -158,6 +158,19 @@ export class PaperOptionsAccount {
    * {@link checkExits} (per-tick gate).
    */
   private autoManageImportedTradierOptions: boolean;
+  /**
+   * TRA-367 — per-date sum of realtime-attributed P&L for Tradier-imported
+   * closes (from {@link recordImportedFill} and {@link finalizePendingExit}
+   * on imports). Real-time updates land on `optionsPnlByMode.live` so the
+   * dashboard's Total Options P&L pill reflects the close immediately
+   * rather than waiting for the EOD Tradier-history reconcile. To stop
+   * the EOD reconcile from double-counting the same fill (it fetches
+   * Tradier's account history which already includes our `sell_to_close`),
+   * the reconciler subtracts whatever this map holds for each date before
+   * calling {@link addReconciledTradierPnl}, then drains via
+   * {@link consumeRealtimeImportedPnl}.
+   */
+  private realtimeImportedPnlByDate: Map<string, number> = new Map();
   private currentDayKey = toDateKey(Date.now());
 
   constructor(config: OptionsAccountConfig = {}) {
@@ -827,13 +840,19 @@ export class PaperOptionsAccount {
     // proceeds live on Tradier. The engine attaches P&L to the closed-options
     // row only so the dashboard's "Recent Closed" view reflects realized
     // P&L (mirrors the recordImportedFill semantics for user-initiated
-    // closes). The per-mode realised total (`optionsPnlByMode`) is also
-    // skipped — the broker-attributed reconcile path
-    // (`addReconciledTradierPnl`) owns Tradier P&L attribution.
+    // closes).
+    //
+    // TRA-367 — for imports we ALSO bump `optionsPnlByMode.live` immediately
+    // (via {@link applyRealtimeImportedPnl}) so the dashboard's Total Options
+    // P&L pill updates the moment the sell_to_close fills, instead of waiting
+    // for the EOD Tradier-history reconcile. The reconciler drains
+    // `realtimeImportedPnlByDate` to avoid double-counting.
     if (!opt.importedFromTradier) {
       this.cash += price * exitContracts * 100;
       this.equity += pnl;
       this.optionsPnlByMode[opt.mode ?? 'demo'] += pnl;
+    } else {
+      this.applyRealtimeImportedPnl(pnl);
     }
     opt.pnl = (opt.pnl ?? 0) + pnl;
     opt.currentPremium = price;
@@ -1118,7 +1137,40 @@ export class PaperOptionsAccount {
     delete opt.pendingCloseOrderId;
     this.openOptions.delete(optionId);
     this.closedOptions.push({ ...opt });
+    // TRA-367 — surface realised P&L immediately on the Live pill instead
+    // of waiting for the EOD Tradier-history reconcile. The reconciler
+    // drains `realtimeImportedPnlByDate` so the same close isn't counted
+    // twice when its Tradier history event lands.
+    this.applyRealtimeImportedPnl(pnl);
     return { ...opt };
+  }
+
+  /**
+   * TRA-367 — internal helper: attribute realtime imported close P&L to
+   * the live bucket and the per-date dedup map. Centralises the "import
+   * close happened via TradeAI" path used by {@link recordImportedFill}
+   * and {@link finalizePendingExit} so future imported-close exits can
+   * share one update site.
+   */
+  private applyRealtimeImportedPnl(pnl: number): void {
+    if (!Number.isFinite(pnl) || pnl === 0) return;
+    this.optionsPnlByMode.live += pnl;
+    const dateKey = toDateKey(Date.now());
+    const prev = this.realtimeImportedPnlByDate.get(dateKey) ?? 0;
+    this.realtimeImportedPnlByDate.set(dateKey, prev + pnl);
+  }
+
+  /**
+   * TRA-367 — drain the realtime-attributed P&L map. Returns the per-date
+   * totals so the EOD Tradier-history reconciler can subtract them from
+   * the broker-side `realizedByDate` before calling
+   * {@link addReconciledTradierPnl}, then clears the map. After draining
+   * the next reconcile sweep treats subsequent realtime closes as fresh.
+   */
+  consumeRealtimeImportedPnl(): Map<string, number> {
+    const snapshot = new Map(this.realtimeImportedPnlByDate);
+    this.realtimeImportedPnlByDate.clear();
+    return snapshot;
   }
 
   /**

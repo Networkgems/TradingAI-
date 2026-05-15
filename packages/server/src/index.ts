@@ -374,12 +374,28 @@ async function reconcileTradierOptionsHistory(
 
   if (totals.seenTransactionIds.size === 0) return;
 
+  // TRA-367 — `recordImportedFill` / `finalizePendingExit` for imports
+  // attribute realised P&L to `optionsPnlByMode.live` in realtime so the
+  // dashboard pill updates the moment a sell_to_close fills. Those fills
+  // ALSO show up in Tradier's account history, so the broker-side total
+  // below would double-count them. Drain the per-date realtime tally
+  // here and subtract it from the broker total before bumping the pill.
+  // The per-day sidecar (used by the calendar) still gets the full
+  // broker-side total since it's the canonical "this is what Tradier
+  // settled today" record.
+  const realtimeByDate = ctx.engine.consumeRealtimeImportedPnl(env);
+  let realtimeOffset = 0;
+  for (const v of realtimeByDate.values()) realtimeOffset += v;
+
   // Bump the engine's live-mode P&L bucket by the sum of newly reconciled
   // realized P&L across all dates in the window so the dashboard pill
-  // updates on the next state broadcast.
+  // updates on the next state broadcast. Subtract the realtime offset so
+  // closes we already attributed via {@link applyRealtimeImportedPnl}
+  // aren't counted again.
   let added = 0;
   for (const realized of totals.realizedByDate.values()) added += realized;
-  ctx.engine.addReconciledTradierOptionsPnl(env, added);
+  const netAdded = added - realtimeOffset;
+  if (netAdded !== 0) ctx.engine.addReconciledTradierOptionsPnl(env, netAdded);
 
   // Persist per-day totals onto a sidecar so `mergeReconciledDailyTotalsIntoReport`
   // can sum across runs (the cursor file is the dedup source of truth;
@@ -395,7 +411,7 @@ async function reconcileTradierOptionsHistory(
   await saveTradierHistoryCursor(ctx, env, cursor);
 
   console.log(
-    `[tradier-reconcile:${ctx.username}] env=${env} merged ${totals.seenTransactionIds.size} new fills, +${added.toFixed(2)} realized across ${totals.realizedByDate.size} day(s)`,
+    `[tradier-reconcile:${ctx.username}] env=${env} merged ${totals.seenTransactionIds.size} new fills, +${added.toFixed(2)} realized (−${realtimeOffset.toFixed(2)} realtime offset → +${netAdded.toFixed(2)} pill) across ${totals.realizedByDate.size} day(s)`,
   );
 }
 

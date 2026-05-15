@@ -719,7 +719,7 @@ describe('PaperOptionsAccount auto-manage imported (TRA-361)', () => {
     expect(acct.getState().openOptions[0].pendingExit).toBeUndefined();
   });
 
-  it('finalizePendingExit on an imported full-close does NOT mutate paper cash/per-mode P&L', () => {
+  it('finalizePendingExit on an imported full-close leaves paper cash alone but updates live-mode P&L (TRA-367)', () => {
     const acct = new PaperOptionsAccount({
       initialEquity: 25_000,
       tradierEnv: 'sandbox',
@@ -739,23 +739,31 @@ describe('PaperOptionsAccount auto-manage imported (TRA-361)', () => {
     acct.attachPendingExit(open.id, 'tradier-order-1');
 
     const cashBefore = acct.getState().optionsCash;
-    const pnlBefore = acct.getState().optionsPnl;
+    const pnlBeforeLive = acct.getStateForMode('live').optionsPnl;
 
-    // Pretend Tradier filled at $1.50 — paper cash must not be credited.
+    // Pretend Tradier filled at $1.50 — paper cash must not be credited
+    // (proceeds live on Tradier).
     const finalised = acct.finalizePendingExit(open.id, 1.50);
     expect(finalised).not.toBeNull();
     expect(finalised?.contractsRemaining).toBe(0);
-    // P&L is attached to the position snapshot so the dashboard's closed-row
-    // shows realised loss — same convention as recordImportedFill — but the
-    // bucket-wide totals stay untouched (broker-attributed reconcile path
-    // owns Tradier P&L).
     expect(finalised?.pnl).toBeCloseTo((1.50 - 2.0) * 2 * 100, 5); // -$100
 
     const state = acct.getState();
     expect(state.openOptions).toHaveLength(0);
     expect(state.optionsCash).toBe(cashBefore);
-    expect(state.optionsPnl).toBe(pnlBefore);
     expect(state.closedOptions.find(o => o.id === open.id)).toBeDefined();
+
+    // TRA-367 — the live-mode pill MUST reflect the realised loss
+    // immediately instead of waiting for the EOD Tradier reconcile.
+    expect(acct.getStateForMode('live').optionsPnl).toBeCloseTo(pnlBeforeLive - 100, 5);
+
+    // The per-date dedup map drains the realtime offset so the EOD
+    // reconcile path can subtract it from the Tradier-history total.
+    const realtime = acct.consumeRealtimeImportedPnl();
+    const drained = Array.from(realtime.values()).reduce((a, b) => a + b, 0);
+    expect(drained).toBeCloseTo(-100, 5);
+    // Draining is idempotent — second consume returns empty.
+    expect(acct.consumeRealtimeImportedPnl().size).toBe(0);
   });
 });
 
@@ -832,6 +840,25 @@ describe('PaperOptionsAccount.recordImportedFill', () => {
     const opened = acct.openOptionFromCandidate(buildSignal());
     expect(opened).not.toBeNull();
     expect(acct.recordImportedFill(opened!.id, 2.0)).toBeNull();
+  });
+
+  // TRA-367 — surfaces realised P&L on the Live pill the moment the
+  // sell_to_close fills instead of waiting for the EOD Tradier-history
+  // reconcile. The per-date dedup map then lets the reconcile pass
+  // subtract this offset so the same close isn't counted twice.
+  it('bumps optionsPnlByMode.live in realtime and exposes a drainable per-date offset', () => {
+    const acct = new PaperOptionsAccount({ initialEquity: 25_000, tradierEnv: 'production' });
+    acct.reconcileTradierPositions([buildTradierPosition({ contracts: 2, premiumPaid: 1.6 })]);
+    const id = acct.getState().openOptions[0].id;
+    const liveBefore = acct.getStateForMode('live').optionsPnl;
+
+    acct.recordImportedFill(id, 1.85); // +$50 realised
+
+    expect(acct.getStateForMode('live').optionsPnl).toBeCloseTo(liveBefore + 50, 5);
+    const realtime = acct.consumeRealtimeImportedPnl();
+    expect(Array.from(realtime.values()).reduce((a, b) => a + b, 0)).toBeCloseTo(50, 5);
+    // Map drained.
+    expect(acct.consumeRealtimeImportedPnl().size).toBe(0);
   });
 });
 

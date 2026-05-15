@@ -1420,7 +1420,7 @@ type OptionOpenSortKey =
   | 'currentMark' | 'pnlDollar' | 'status' | 'opened';
 type OptionClosedSortKey =
   | 'symbol' | 'type' | 'contracts' | 'premiumPaid'
-  | 'exitPremium' | 'pnlDollar' | 'closed';
+  | 'exitPremium' | 'pnlPct' | 'pnlDollar' | 'closed';
 
 function getStockOpenPosSortValue(p: Position, key: StockOpenPosSortKey, symbols: readonly SymbolState[]): unknown {
   const sym = symbols.find(s => s.symbol === p.symbol);
@@ -1458,19 +1458,17 @@ function getStockClosedPosSortValue(p: Position, key: StockClosedPosSortKey): un
 }
 
 function getOptionOpenSortValue(o: OptionPosition, key: OptionOpenSortKey): unknown {
-  const isImported = !!o.importedFromTradier;
   switch (key) {
     case 'symbol': return o.symbol;
     case 'type': return o.optionType;
     case 'contracts': return o.contracts;
     case 'premiumPaid': return o.premiumPaid;
-    case 'currentMark': return isImported ? null : o.currentPremium;
+    case 'currentMark': return o.currentPremium;
     case 'pnlDollar': {
-      if (isImported) return null;
       const unrealized = (o.currentPremium - o.premiumPaid) * o.contractsRemaining * 100;
       return unrealized + (o.pnl ?? 0);
     }
-    case 'status': return isImported ? 'tradier' : (o.trailingActive ? 'trailing' : 'open');
+    case 'status': return o.trailingActive ? 'trailing' : 'open';
     case 'opened': return o.openedAt;
   }
 }
@@ -1482,6 +1480,13 @@ function getOptionClosedSortValue(o: OptionPosition, key: OptionClosedSortKey): 
     case 'contracts': return o.contracts;
     case 'premiumPaid': return o.premiumPaid;
     case 'exitPremium': return o.currentPremium;
+    // TRA-367 — sort key for the new P&L % column. Computes from the stored
+    // exit premium (`currentPremium`) vs entry, ignoring partial-exit P&L
+    // already realised on `o.pnl` — that's how it's displayed in the cell.
+    case 'pnlPct': {
+      if (!(o.premiumPaid > 0)) return 0;
+      return ((o.currentPremium - o.premiumPaid) / o.premiumPaid) * 100;
+    }
     case 'pnlDollar': return o.pnl ?? 0;
     case 'closed': return o.closedAt ?? 0;
   }
@@ -2315,15 +2320,26 @@ function Dashboard({ token, onLogout, onGoHome, onActivity, theme, onToggleTheme
                   </thead>
                   <tbody>
                     {sortRows(openOptions, openOptSort.sort, getOptionOpenSortValue).map(o => {
-                      const pnlPct = ((o.currentPremium - o.premiumPaid) / o.premiumPaid) * 100;
-                      const unrealized = (o.currentPremium - o.premiumPaid) * o.contractsRemaining * 100;
-                      const pnlDollar = unrealized + (o.pnl ?? 0);
-                      // TRA-323 — imported Tradier positions don't have a
-                      // local TP/SL schedule (`tp1Premium = +Inf`, `SL = 0`)
-                      // and no live mark refresh wired up yet, so the P&L
-                      // and Trail/SL columns would render `Infinity`/garbage.
-                      // Render a clean "—" / "Tradier" treatment instead.
+                      // TRA-367 — imports flow through the same auto-managed
+                      // pipeline as engine-opened rows since TRA-361 (live
+                      // marks via `refreshImportedMarks`, SL/TP1/trail
+                      // installed in `reconcileTradierPositions`). The old
+                      // "—" / "TRADIER" short-circuit hid information the
+                      // user needs to manage the position; render Current
+                      // Mark / P&L / Status / Trail-SL the same way for
+                      // both origins. The `(Tradier)` badge next to the
+                      // symbol still flags origin so the user knows
+                      // closing routes a real `sell_to_close`.
                       const isImported = !!o.importedFromTradier;
+                      const hasMark = Number.isFinite(o.currentPremium) && o.currentPremium > 0 && o.premiumPaid > 0;
+                      const pnlPct = hasMark ? ((o.currentPremium - o.premiumPaid) / o.premiumPaid) * 100 : 0;
+                      const unrealized = hasMark ? (o.currentPremium - o.premiumPaid) * o.contractsRemaining * 100 : 0;
+                      const pnlDollar = unrealized + (o.pnl ?? 0);
+                      // Auto-managed imports get RV-default thresholds; legacy
+                      // imports with auto-management off keep sentinels
+                      // (`tp1 = +Inf`, `SL/trail = 0`) and we render "—" so the
+                      // user sees the row isn't auto-managed.
+                      const hasStopSchedule = o.stopLossPremium > 0 && Number.isFinite(o.tp1Premium);
                       return (
                         <tr key={o.id}>
                           <td className="symbol">
@@ -2343,17 +2359,17 @@ function Dashboard({ token, onLogout, onGoHome, onActivity, theme, onToggleTheme
                           </td>
                           <td>{o.contracts}</td>
                           <td>${fmt(o.premiumPaid)}</td>
-                          <td className={isImported ? 'muted' : (pnlPct >= 0 ? 'green' : 'red')}>
-                            {isImported ? '—' : `$${fmt(o.currentPremium)} (${fmtPct(pnlPct)})`}
+                          <td className={!hasMark ? 'muted' : (pnlPct >= 0 ? 'green' : 'red')}>
+                            {hasMark ? `$${fmt(o.currentPremium)} (${fmtPct(pnlPct)})` : '—'}
                           </td>
-                          <td className={isImported ? 'muted' : (pnlDollar >= 0 ? 'green' : 'red')}>
-                            {isImported ? '—' : fmtDollar(pnlDollar)}
+                          <td className={!hasMark ? 'muted' : (pnlDollar >= 0 ? 'green' : 'red')}>
+                            {hasMark ? fmtDollar(pnlDollar) : '—'}
                           </td>
-                          <td className={isImported ? 'muted' : (o.trailingActive ? 'green' : 'muted')}>
-                            {isImported ? 'TRADIER' : (o.trailingActive ? 'TRAILING' : 'OPEN')}
+                          <td className={o.trailingActive ? 'green' : 'muted'}>
+                            {o.trailingActive ? 'TRAILING' : 'OPEN'}
                           </td>
-                          <td className={isImported ? 'muted' : 'red'}>
-                            {isImported
+                          <td className={hasStopSchedule ? 'red' : 'muted'}>
+                            {!hasStopSchedule
                               ? '—'
                               : o.trailingActive
                                 ? `$${fmt(o.trailingStopPremium)} (trail)`
@@ -2455,6 +2471,7 @@ function Dashboard({ token, onLogout, onGoHome, onActivity, theme, onToggleTheme
                       <SortableTH label="Contracts" sortKey="contracts" sort={closedOptSort.sort} onSort={closedOptSort.onSort} />
                       <SortableTH label="Premium Paid" sortKey="premiumPaid" sort={closedOptSort.sort} onSort={closedOptSort.onSort} />
                       <SortableTH label="Exit Premium" sortKey="exitPremium" sort={closedOptSort.sort} onSort={closedOptSort.onSort} />
+                      <SortableTH label={<>P&amp;L %</>} sortKey="pnlPct" sort={closedOptSort.sort} onSort={closedOptSort.onSort} />
                       <SortableTH label={<>P&amp;L $</>} sortKey="pnlDollar" sort={closedOptSort.sort} onSort={closedOptSort.onSort} />
                       <th>Signal</th>
                       <SortableTH label="Closed" sortKey="closed" sort={closedOptSort.sort} onSort={closedOptSort.onSort} />
@@ -2463,6 +2480,12 @@ function Dashboard({ token, onLogout, onGoHome, onActivity, theme, onToggleTheme
                   <tbody>
                     {sortRows(closedOptions, closedOptSort.sort, getOptionClosedSortValue).map(o => {
                       const pnlDollar = o.pnl ?? 0;
+                      // TRA-367 — P&L % from entry-to-exit premium. Used
+                      // alongside the dollar P&L column so the user can see
+                      // returns on imported / partial-exit closes in
+                      // percentage terms without doing the math.
+                      const hasEntry = o.premiumPaid > 0;
+                      const pnlPct = hasEntry ? ((o.currentPremium - o.premiumPaid) / o.premiumPaid) * 100 : 0;
                       return (
                         <tr key={o.id}>
                           <td className="symbol">{o.symbol}</td>
@@ -2472,6 +2495,9 @@ function Dashboard({ token, onLogout, onGoHome, onActivity, theme, onToggleTheme
                           <td>{o.contracts}</td>
                           <td>${fmt(o.premiumPaid)}</td>
                           <td>${fmt(o.currentPremium)}</td>
+                          <td className={!hasEntry ? 'muted' : pnlPct >= 0 ? 'green' : 'red'}>
+                            {hasEntry ? fmtPct(pnlPct) : '—'}
+                          </td>
                           <td className={pnlDollar >= 0 ? 'green' : 'red'}>{fmtDollar(pnlDollar)}</td>
                           <td>{signalLabel(o.signalType)}</td>
                           <td className="muted">{o.closedAt ? formatTime(o.closedAt) : '—'}</td>
@@ -2494,13 +2520,32 @@ function Dashboard({ token, onLogout, onGoHome, onActivity, theme, onToggleTheme
               </div>
             )}
 
-            {optionsState && (
-              <div style={{ marginTop: '1.5rem', display: 'flex', gap: '2rem', fontSize: '0.85rem', color: 'var(--muted)' }}>
-                <span>Options Cash: <strong>${fmt(optionsState.optionsCash)}</strong></span>
-                <span>Total Options P&amp;L: <strong className={optionsState.optionsPnl >= 0 ? 'green' : 'red'}>{fmtDollar(optionsState.optionsPnl)}</strong></span>
-                <span>Daily Trades: <strong className={optionsState.dailyOptionsCount >= optionsDailyLimit ? 'red' : ''}>{optionsState.dailyOptionsCount}/{optionsDailyLimit}</strong></span>
-              </div>
-            )}
+            {optionsState && (() => {
+              // TRA-367 — on Live mode the paper "Options Cash" bucket
+              // is misleading: it gets drained by both demo and live
+              // opens because `openOptionFromRvCandidate` deducts
+              // `cost` unconditionally. The user wants the broker-side
+              // option buying power instead. `account.optionBuyingPower`
+              // is set from `liveTradierBalance.optionBuyingPower` (or
+              // `totalCash` fallback) in `getState()`; absent in demo
+              // and before the first Tradier balance fetch lands.
+              const isLive = accountMode === 'live';
+              const liveOptionBP = isLive ? account?.optionBuyingPower : undefined;
+              const showLiveBP = isLive && typeof liveOptionBP === 'number';
+              return (
+                <div style={{ marginTop: '1.5rem', display: 'flex', gap: '2rem', fontSize: '0.85rem', color: 'var(--muted)' }}>
+                  {showLiveBP ? (
+                    <span title="Tradier option buying power for the active live env">
+                      Options Buying Power: <strong>${fmt(liveOptionBP!)}</strong>
+                    </span>
+                  ) : (
+                    <span>Options Cash: <strong>${fmt(optionsState.optionsCash)}</strong></span>
+                  )}
+                  <span>Total Options P&amp;L: <strong className={optionsState.optionsPnl >= 0 ? 'green' : 'red'}>{fmtDollar(optionsState.optionsPnl)}</strong></span>
+                  <span>Daily Trades: <strong className={optionsState.dailyOptionsCount >= optionsDailyLimit ? 'red' : ''}>{optionsState.dailyOptionsCount}/{optionsDailyLimit}</strong></span>
+                </div>
+              );
+            })()}
           </div>
         )}
 

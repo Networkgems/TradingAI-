@@ -247,6 +247,14 @@ export interface AccountState {
   monthlyPnl?: number;
   yearlyPnl?: number;
   allTimePnl?: number;
+  /**
+   * TRA-367 — broker-reported option buying power (Tradier margin/PDT/cash
+   * account flavour). Surfaced in live mode so the Options panel can show
+   * the real "cash available for options trades" instead of the paper
+   * bookkeeping bucket (which mixes demo + live opens). Absent in demo or
+   * when Tradier hasn't returned a balance yet.
+   */
+  optionBuyingPower?: number;
 }
 
 export const DEFAULT_RISK_PER_TRADE = 0.01; // 1% of account equity

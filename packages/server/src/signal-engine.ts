@@ -1928,6 +1928,18 @@ export class SignalEngine {
   }
 
   /**
+   * TRA-367 — drain the per-env "imported close P&L attributed in
+   * realtime" map so the EOD Tradier-history reconciler can subtract
+   * those amounts from the broker-side `realizedByDate` totals before
+   * calling {@link addReconciledTradierOptionsPnl}. Without this the
+   * same close would be counted twice (once via `recordImportedFill` /
+   * `finalizePendingExit`, once via the reconcile sweep).
+   */
+  consumeRealtimeImportedPnl(env: TradierEnv): Map<string, number> {
+    return this.optionsAccounts[env].consumeRealtimeImportedPnl();
+  }
+
+  /**
    * TRA-356 — periodic Tradier portfolio reconcile while live mode is the
    * active surface. Once per cadence window the active env's open
    * positions are pulled and routed through {@link PaperOptionsAccount.reconcileTradierPositions}
@@ -2046,12 +2058,20 @@ export class SignalEngine {
       // Positions tab. When the toggle is off the map is empty so this
       // is identical to the TRA-226 behaviour.
       const liveOpenPositions = Array.from(this.liveEquityPositions.values());
+      // TRA-367 — surface Tradier optionBuyingPower so the Options panel
+      // can show broker-truth "cash available for options" on Live mode
+      // instead of the paper bookkeeping bucket (drained by both demo +
+      // live opens). Falls back to `totalCash` when the account type
+      // didn't surface a dedicated option BP (cash accounts).
       const liveAccount: AccountState = this.liveTradierBalance
         ? {
           totalEquity: this.liveTradierBalance.totalEquity,
           availableCash: this.liveTradierBalance.totalCash,
           openPositions: liveOpenPositions,
           dailyPnl: 0,
+          optionBuyingPower:
+            this.liveTradierBalance.optionBuyingPower
+            ?? this.liveTradierBalance.totalCash,
         }
         : { totalEquity: 0, availableCash: 0, openPositions: liveOpenPositions, dailyPnl: 0 };
       return {
