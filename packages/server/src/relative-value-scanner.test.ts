@@ -7,7 +7,9 @@ class FakeClient {
   getChainSnapshot = vi.fn<(s: string, e: string) => Promise<OptionChainRow[]>>();
 }
 
-// Inside the 14–35 day expiration window so pickExpiration always picks one.
+// Inside the 21–60 day expiration window (TRA-373) so pickExpiration always
+// picks one. 2024-02-15 is 31 days from NOW_BASE — close to the default 35d
+// target, well clear of the 21d / 60d edges.
 const NOW_BASE = Date.parse('2024-01-15T15:00:00Z');
 const EXP = '2024-02-15';
 
@@ -121,11 +123,57 @@ describe('TradierRelativeValueScannerService', () => {
     expect(result.reason).toBe('no_spot');
   });
 
-  it('reports no_expirations when none are in the 14–35 day window', async () => {
+  it('reports no_expirations when none are in the 21–60 day window (TRA-373)', async () => {
     const { svc, client } = makeService();
     client.getExpirations.mockResolvedValueOnce(['2024-01-16']); // 1 day out — outside window
     const result = await svc.scan('TEST');
     expect(result.reason).toBe('no_expirations');
+  });
+
+  it('picks the expiration closest to the 35d target within the window (TRA-373)', async () => {
+    // Anchor `now` at midnight UTC so listed-expiration dates (parsed as
+    // YYYY-MM-DDT00:00:00Z) align cleanly with N-days-from-now arithmetic.
+    const MIDNIGHT = Date.parse('2024-01-15T00:00:00Z');
+    const { svc, client } = makeService({ now: MIDNIGHT });
+    // Spec regression case from TRA-373: chain offers 15d / 30d / 45d / 90d.
+    // 15d/90d are outside [21,60]; inside the window 30d (|30-35|=5) beats
+    // 45d (|45-35|=10).
+    client.getExpirations.mockResolvedValueOnce([
+      '2024-01-30', // 15d — outside [21,60]
+      '2024-02-14', // 30d — inside, 5d below target
+      '2024-02-29', // 45d — inside, 10d above target
+      '2024-04-14', // 90d — outside [21,60]
+    ]);
+    client.getChainSnapshot.mockResolvedValueOnce([row(100, 'call', 0.30)]);
+    const result = await svc.scan('TEST');
+    expect(result.expiration).toBe('2024-02-14');
+    expect(client.getChainSnapshot).toHaveBeenCalledWith('TEST', '2024-02-14');
+  });
+
+  it('on equal target distance, picks the earlier expiration (TRA-373 tie-break)', async () => {
+    const MIDNIGHT = Date.parse('2024-01-15T00:00:00Z');
+    const { svc, client } = makeService({ now: MIDNIGHT });
+    // Target = 2024-02-19. Both 2024-02-14 (5d before) and 2024-02-24
+    // (5d after) are equidistant; spec prefers the earlier expiration.
+    client.getExpirations.mockResolvedValueOnce(['2024-02-14', '2024-02-24']);
+    client.getChainSnapshot.mockResolvedValueOnce([row(100, 'call', 0.30)]);
+    const result = await svc.scan('TEST');
+    expect(result.expiration).toBe('2024-02-14');
+  });
+
+  it('respects per-call dtePrefs overrides (TRA-373)', async () => {
+    const MIDNIGHT = Date.parse('2024-01-15T00:00:00Z');
+    const { svc, client } = makeService({ now: MIDNIGHT });
+    // Override to [40,80] target 60. 30d outside, 50d/70d inside and
+    // equidistant from target 60 → earlier (50d) wins.
+    client.getExpirations.mockResolvedValueOnce([
+      '2024-02-14', // 30d — outside the overridden 40-80 window
+      '2024-03-05', // 50d — inside, 10d under target
+      '2024-03-25', // 70d — inside, 10d over target → tie → earlier wins
+    ]);
+    client.getChainSnapshot.mockResolvedValueOnce([row(100, 'call', 0.30)]);
+    const result = await svc.scan('TEST', undefined, { min: 40, max: 80, target: 60 });
+    expect(result.expiration).toBe('2024-03-05');
   });
 
   it('getOptionMark serves the cached chain snapshot', async () => {

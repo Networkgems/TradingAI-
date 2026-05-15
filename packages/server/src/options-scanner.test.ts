@@ -126,11 +126,55 @@ describe('TradierOtmMispricingService', () => {
     expect(result.spot).toBeNull();
   });
 
-  it('reports no_expirations when no expiry is in the 14-35d window', async () => {
+  it('reports no_expirations when no expiry is in the 21-60d window (TRA-373)', async () => {
     const { svc, client } = makeService();
     client.getExpirations.mockResolvedValueOnce(['2024-01-16']); // 1 day out — too close
     const result = await svc.scan('TEST');
     expect(result.reason).toBe('no_expirations');
+  });
+
+  it('picks the expiration closest to the 35d target within the window (TRA-373)', async () => {
+    // Anchor `now` at midnight UTC so listed-expiration dates align with
+    // N-days-from-now arithmetic without sub-day drift.
+    const MIDNIGHT = Date.parse('2024-01-15T00:00:00Z');
+    const { svc, client } = makeService({ now: MIDNIGHT });
+    // TRA-373 spec regression: chain offers 15d / 30d / 45d / 90d → 30d wins
+    // (15d/90d out of [21,60]; 30d closer to target 35 than 45d is).
+    client.getExpirations.mockResolvedValueOnce([
+      '2024-01-30', // 15d — outside [21,60]
+      '2024-02-14', // 30d — inside, |30-35|=5
+      '2024-02-29', // 45d — inside, |45-35|=10
+      '2024-04-14', // 90d — outside [21,60]
+    ]);
+    client.getChainSnapshot.mockResolvedValueOnce([row(110, 'call', 1.40)]);
+    const result = await svc.scan('TEST');
+    expect(result.expiration).toBe('2024-02-14');
+    expect(client.getChainSnapshot).toHaveBeenCalledWith('TEST', '2024-02-14');
+  });
+
+  it('on equal target distance, picks the earlier expiration (TRA-373 tie-break)', async () => {
+    const MIDNIGHT = Date.parse('2024-01-15T00:00:00Z');
+    const { svc, client } = makeService({ now: MIDNIGHT });
+    // Target = 2024-02-19. 2024-02-14 (5d before) ties 2024-02-24 (5d after).
+    client.getExpirations.mockResolvedValueOnce(['2024-02-14', '2024-02-24']);
+    client.getChainSnapshot.mockResolvedValueOnce([row(110, 'call', 1.40)]);
+    const result = await svc.scan('TEST');
+    expect(result.expiration).toBe('2024-02-14');
+  });
+
+  it('respects per-call dtePrefs overrides (TRA-373)', async () => {
+    const MIDNIGHT = Date.parse('2024-01-15T00:00:00Z');
+    const { svc, client } = makeService({ now: MIDNIGHT });
+    // Override to [40,80] target 60 — 30d outside, 50d/70d inside; target 60
+    // is equidistant from 50d/70d → earlier (50d) wins.
+    client.getExpirations.mockResolvedValueOnce([
+      '2024-02-14', // 30d — outside the 40-80d override
+      '2024-03-05', // 50d — inside
+      '2024-03-25', // 70d — inside (tie with 50d → earlier wins)
+    ]);
+    client.getChainSnapshot.mockResolvedValueOnce([row(110, 'call', 1.40)]);
+    const result = await svc.scan('TEST', undefined, { min: 40, max: 80, target: 60 });
+    expect(result.expiration).toBe('2024-03-05');
   });
 
   it('caches expirations for 6h to avoid redundant calls', async () => {

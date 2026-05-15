@@ -1,9 +1,13 @@
 import { describe, it, expect } from 'vitest';
 import {
   DEFAULT_ACCOUNT_SETTINGS,
+  DEFAULT_RV_DTE_MAX,
+  DEFAULT_RV_DTE_MIN,
+  DEFAULT_RV_DTE_TARGET,
   managedAccountRatioField,
   resolveManagedAccountRatio,
   resolveRiskPerTrade,
+  resolveRvDtePrefs,
   riskPerTradeField,
 } from './index.js';
 import type { AccountMode, AccountSettings } from './index.js';
@@ -134,5 +138,59 @@ describe('field-name resolvers (TRA-346)', () => {
         expect(resolveRiskPerTrade(s, market, mode)).toBe(0.07);
       }
     }
+  });
+});
+
+describe('resolveRvDtePrefs (TRA-373)', () => {
+  it('returns the spec defaults (21 / 60 / 35) when no fields are saved', () => {
+    // Saved-before-TRA-373 snapshot: rvDte* fields are absent. Every read
+    // must surface the spec defaults so the user keeps the new wider window
+    // until they edit it.
+    const s: AccountSettings = {
+      ...DEFAULT_ACCOUNT_SETTINGS,
+      rvDteMin: undefined,
+      rvDteMax: undefined,
+      rvDteTarget: undefined,
+    };
+    expect(resolveRvDtePrefs(s)).toEqual({
+      min: DEFAULT_RV_DTE_MIN,
+      max: DEFAULT_RV_DTE_MAX,
+      target: DEFAULT_RV_DTE_TARGET,
+    });
+  });
+
+  it('honours saved overrides verbatim when they are well-formed', () => {
+    const s = { ...DEFAULT_ACCOUNT_SETTINGS, rvDteMin: 30, rvDteMax: 90, rvDteTarget: 50 };
+    expect(resolveRvDtePrefs(s)).toEqual({ min: 30, max: 90, target: 50 });
+  });
+
+  it('reverts to spec defaults when min > max (fat-finger swap)', () => {
+    const s = { ...DEFAULT_ACCOUNT_SETTINGS, rvDteMin: 60, rvDteMax: 21, rvDteTarget: 35 };
+    expect(resolveRvDtePrefs(s)).toEqual({
+      min: DEFAULT_RV_DTE_MIN,
+      max: DEFAULT_RV_DTE_MAX,
+      target: DEFAULT_RV_DTE_TARGET,
+    });
+  });
+
+  it('clamps target into the saved [min, max] range', () => {
+    const tooLow = { ...DEFAULT_ACCOUNT_SETTINGS, rvDteMin: 30, rvDteMax: 90, rvDteTarget: 10 };
+    expect(resolveRvDtePrefs(tooLow).target).toBe(30);
+    const tooHigh = { ...DEFAULT_ACCOUNT_SETTINGS, rvDteMin: 30, rvDteMax: 90, rvDteTarget: 200 };
+    expect(resolveRvDtePrefs(tooHigh).target).toBe(90);
+  });
+
+  it('coerces non-finite / non-positive saves back to the spec defaults', () => {
+    const s = {
+      ...DEFAULT_ACCOUNT_SETTINGS,
+      rvDteMin: 0,
+      rvDteMax: Number.NaN,
+      rvDteTarget: -5,
+    };
+    expect(resolveRvDtePrefs(s)).toEqual({
+      min: DEFAULT_RV_DTE_MIN,
+      max: DEFAULT_RV_DTE_MAX,
+      target: DEFAULT_RV_DTE_TARGET,
+    });
   });
 });

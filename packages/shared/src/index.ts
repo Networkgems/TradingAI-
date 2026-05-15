@@ -585,6 +585,21 @@ export interface AccountSettings {
    * stays pinned regardless of per-user saves until ops drops the env var.
    */
   activeStrategyPreset?: StrategyPresetId;
+  /**
+   * TRA-373 — RV scanner expiration window (days-to-expiry) and target.
+   * Per-call overrides for the relative-value scanner's `pickExpiration`; the
+   * scanner picks the listed expiration whose DTE is closest to
+   * `rvDteTarget` within `[rvDteMin, rvDteMax]`. Absent fields fall back to
+   * the spec defaults (21 / 60 / 35) — see {@link resolveRvDtePrefs}.
+   *
+   * Widened from the pre-373 hardcoded 14–35d window because RV signals
+   * collapsed to month-end past mid-month and the 14–21 DTE fit is noisier
+   * (gamma/jump-dominated). 21–60d gives smoother IV-skew fits and signal
+   * frequency that is not phase-locked to the calendar.
+   */
+  rvDteMin?: number;
+  rvDteMax?: number;
+  rvDteTarget?: number;
 }
 
 export const DEFAULT_ACCOUNT_SETTINGS: AccountSettings = {
@@ -633,6 +648,12 @@ export const DEFAULT_ACCOUNT_SETTINGS: AccountSettings = {
   liveTradeEquitiesTradier: true,
   autoManageImportedTradierOptions: true,
   activeStrategyPreset: DEFAULT_STRATEGY_PRESET_ID,
+  // TRA-373 — RV scanner DTE window. 21–60d (target 35d) replaces the
+  // pre-373 14–35d window so signals are not phase-locked to month-end and
+  // the IV-skew fit is computed on smoother far-dated chains.
+  rvDteMin: 21,
+  rvDteMax: 60,
+  rvDteTarget: 35,
 };
 
 /**
@@ -703,6 +724,40 @@ export function resolveLiveTradeEquitiesTradier(s: AccountSettings): boolean {
  */
 export function resolveAutoManageImportedTradierOptions(s: AccountSettings): boolean {
   return s.autoManageImportedTradierOptions !== false;
+}
+
+/** TRA-373 — spec defaults for the RV scanner DTE window. */
+export const DEFAULT_RV_DTE_MIN = 21;
+export const DEFAULT_RV_DTE_MAX = 60;
+export const DEFAULT_RV_DTE_TARGET = 35;
+
+export interface RvDtePrefs {
+  min: number;
+  max: number;
+  target: number;
+}
+
+/**
+ * TRA-373 — resolve the RV scanner DTE window with the spec defaults
+ * (21 / 60 / 35). Coerces non-finite, non-positive, or inverted ranges back to
+ * the defaults so a fat-finger save can't silently disable the scanner; the
+ * target is clamped into the resolved [min, max] range. Read this on every
+ * scan tick so a saved edit takes effect on the next scan without restarting.
+ */
+export function resolveRvDtePrefs(s: AccountSettings): RvDtePrefs {
+  const rawMin = s.rvDteMin;
+  const rawMax = s.rvDteMax;
+  const rawTarget = s.rvDteTarget;
+  let min = Number.isFinite(rawMin) && (rawMin as number) > 0 ? (rawMin as number) : DEFAULT_RV_DTE_MIN;
+  let max = Number.isFinite(rawMax) && (rawMax as number) > 0 ? (rawMax as number) : DEFAULT_RV_DTE_MAX;
+  if (max < min) {
+    min = DEFAULT_RV_DTE_MIN;
+    max = DEFAULT_RV_DTE_MAX;
+  }
+  let target = Number.isFinite(rawTarget) && (rawTarget as number) > 0 ? (rawTarget as number) : DEFAULT_RV_DTE_TARGET;
+  if (target < min) target = min;
+  if (target > max) target = max;
+  return { min, max, target };
 }
 
 /**
@@ -1319,7 +1374,8 @@ export interface EodTradeEntry {
     | 'Swing'
     | 'OTM'
     | 'RV'           // TRA-191 — relative-value scanner
-    | 'Tradier';     // TRA-323 — imported from Tradier (never actually written to disk: imports don't trade through the EOD exporter)
+    | 'Tradier'      // TRA-323 — imported from Tradier (never actually written to disk: imports don't trade through the EOD exporter)
+    | 'Options';     // TRA-365 follow-up — option closes that arrived without a more specific signal mapping
   side: Side;
   entryPrice: number;
   exitPrice: number;
@@ -1329,6 +1385,24 @@ export interface EodTradeEntry {
   rr: number;
   openedAt: number;
   closedAt: number;
+  /**
+   * TRA-365 follow-up — kind of instrument this row represents. Optional for
+   * back-compat with reports persisted before options were enumerated; absent
+   * is treated as 'equity' by every reader.
+   */
+  kind?: 'equity' | 'option';
+  /**
+   * TRA-365 follow-up — percent P&L on this single trade. For equities this is
+   * (exit−entry)/entry signed by side; for options the entry/exit prices are
+   * per-contract premiums so (exit−entry)/entry is always long-equivalent.
+   * Optional for back-compat with reports persisted before pnlPct existed.
+   */
+  pnlPct?: number;
+  /** Options only — call/put, strike, expiration, full OCC contract symbol. */
+  optionType?: 'call' | 'put';
+  strike?: number;
+  expiration?: string;
+  optionSymbol?: string;
 }
 
 export interface EodMover {
@@ -1355,6 +1429,16 @@ export interface EodReport {
   totalPnl: number;
   optionsPnl: number;
   combinedPnl: number;
+  /**
+   * TRA-365 follow-up — realized / options / combined P&L expressed as a
+   * fraction of session-open equity (managed account). Optional for back-compat
+   * with reports persisted before the percent fields were added; readers that
+   * encounter an older report on disk should treat absent values as null and
+   * render `--` rather than 0.0% so they're distinguishable from a flat day.
+   */
+  realizedPnlPct?: number;
+  optionsPnlPct?: number;
+  combinedPnlPct?: number;
 
   // Account
   totalEquity: number;

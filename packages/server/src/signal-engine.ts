@@ -1,6 +1,6 @@
 import { OrbStrategy, BbFadeStrategy, IchimokuStrategy, TradierOptionsClient, TradierOrderClient, TRADIER_REJECTED_STATUSES } from '@trading-app/engine';
 import type { TradierAccountBalance } from '@trading-app/engine';
-import { WATCHLIST, MANAGED_ACCOUNT_RATIO, MAX_CONSECUTIVE_LOSSES, DAILY_DRAWDOWN_HALT_PCT, aliasWatchlistSymbol, isLiveTradierOptionsEnabled, isStockMarketOpen, resolveAutoManageImportedTradierOptions, resolveLiveTradeEquitiesTradier, resolveManagedAccountRatio, resolveRiskPerTrade, resolveTradierOptionsCreds } from '@trading-app/shared';
+import { WATCHLIST, MANAGED_ACCOUNT_RATIO, MAX_CONSECUTIVE_LOSSES, DAILY_DRAWDOWN_HALT_PCT, aliasWatchlistSymbol, isLiveTradierOptionsEnabled, isStockMarketOpen, resolveAutoManageImportedTradierOptions, resolveLiveTradeEquitiesTradier, resolveManagedAccountRatio, resolveRiskPerTrade, resolveRvDtePrefs, resolveTradierOptionsCreds, DEFAULT_RV_DTE_MIN, DEFAULT_RV_DTE_MAX, DEFAULT_RV_DTE_TARGET } from '@trading-app/shared';
 import type { TradeSignal, RelativeValueSignal, Candle, OptionsAccountState, SignalType, Position, AccountSettings, AccountState, NewsItem, TradierEnv } from '@trading-app/shared';
 import { fetchMinuteBars, fetchQuotes, fetchStocksNews, isYahooBreakerOpen, setActiveInterestSymbols } from './yahoo-feed.js';
 import { PaperAccount } from './paper-account.js';
@@ -171,6 +171,16 @@ export class SignalEngine {
   private readonly rvScanner: RelativeValueScannerService | undefined;
   /** Last successful RV scan timestamp — gates the 5-minute cadence. */
   private lastRvScanAt = 0;
+  /**
+   * TRA-373 — per-user RV scanner DTE window. The scanner is a shared
+   * singleton (`relativeValueScannerService` in index.ts), so per-user
+   * preferences are forwarded through `scan(symbol, opts, dtePrefs)` instead
+   * of being baked into the scanner instance. Re-read on every
+   * `applySettings` call so an edit takes effect on the next scan tick.
+   */
+  private rvDteMin: number = DEFAULT_RV_DTE_MIN;
+  private rvDteMax: number = DEFAULT_RV_DTE_MAX;
+  private rvDteTarget: number = DEFAULT_RV_DTE_TARGET;
 
   private symbolState: Map<string, SymbolState> = new Map();
   private candleCache: Map<string, Candle[]> = new Map();
@@ -339,6 +349,13 @@ export class SignalEngine {
       this.liveTradeEquitiesTradier = resolveLiveTradeEquitiesTradier(settings);
       this.tradierLiveEquityClient = buildTradierLiveEquityClient(settings);
       this.tradierOptionsClientByEnv = buildTradierOptionsClientsByEnv(settings);
+      // TRA-373 — seed the RV DTE window from saved settings so an engine
+      // boot picks up the user's window without waiting for the first
+      // applySettings call.
+      const dte = resolveRvDtePrefs(settings);
+      this.rvDteMin = dte.min;
+      this.rvDteMax = dte.max;
+      this.rvDteTarget = dte.target;
     }
   }
 
@@ -419,6 +436,12 @@ export class SignalEngine {
     // mirrors Demo's signal flow out of the box.
     this.liveTradeEquitiesTradier = resolveLiveTradeEquitiesTradier(settings);
     this.tradierLiveEquityClient = buildTradierLiveEquityClient(settings);
+    // TRA-373 — re-read the RV DTE window so a saved edit takes effect on
+    // the next scan tick (5-minute cadence).
+    const dte = resolveRvDtePrefs(settings);
+    this.rvDteMin = dte.min;
+    this.rvDteMax = dte.max;
+    this.rvDteTarget = dte.target;
     if (this.mode === 'live') {
       // TRA-226 — fetch the Tradier balance immediately so the broadcast that
       // follows in the PUT /api/account/settings handler reflects the user's
@@ -1130,9 +1153,13 @@ export class SignalEngine {
   private async runRelativeValueScan(activeSymbols: string[]): Promise<void> {
     if (!this.rvScanner) return;
 
+    // TRA-373 — per-user DTE window overrides the shared scanner singleton's
+    // defaults on every call so a settings edit takes effect on the next
+    // scan tick.
+    const dtePrefs = { min: this.rvDteMin, max: this.rvDteMax, target: this.rvDteTarget };
     for (const sym of activeSymbols) {
       try {
-        const result = await this.rvScanner.scan(sym);
+        const result = await this.rvScanner.scan(sym, undefined, dtePrefs);
         if (result.reason !== 'ok' || result.candidates.length === 0) continue;
 
         // The scanner already ranks by composite score — pick the strongest

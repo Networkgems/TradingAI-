@@ -9,8 +9,20 @@ import {
 const CHAIN_CACHE_TTL_MS = 60_000;          // 1 min — chain snapshots stale that fast anyway
 const EXPIRATIONS_CACHE_TTL_MS = 6 * 60 * 60_000; // 6h — expirations don't move during the day
 const RATE_LIMIT_COOLDOWN_MS = 60 * 60_000; // 1h — Tradier sandbox: 60 req/min, prod: 120/min
-const MIN_DTE_DAYS = 14;
-const MAX_DTE_DAYS = 35;
+// TRA-373 — widened from 14–35 to 21–60 with a 35-day target; see the matching
+// note in relative-value-scanner.ts. The OTM service is no longer wired into
+// the live signal-engine path (TRA-191 left RV as the only enabled scanner),
+// but its DTE window stays aligned with RV so revivals don't reintroduce the
+// month-end-only-firing bug.
+const MIN_DTE_DAYS = 21;
+const MAX_DTE_DAYS = 60;
+const TARGET_DTE_DAYS = 35;
+
+export interface DtePrefs {
+  min?: number;
+  max?: number;
+  target?: number;
+}
 
 type ChainKey = `${string}|${string}`; // `${symbol}|${expiration}`
 
@@ -20,7 +32,17 @@ interface CacheEntry<T> {
 }
 
 export interface OtmMispricingService {
-  scan(symbol: string, opts?: OtmScannerOptions): Promise<OtmMispricingScanResult>;
+  /**
+   * TRA-373 — `dtePrefs` overrides the expiration window per-call (per-user
+   * `AccountSettings.rvDte{Min,Max,Target}` flow through the shared service
+   * singleton). Absent fields fall back to the service's constructor
+   * defaults, then to the spec constants (21 / 60 / 35).
+   */
+  scan(
+    symbol: string,
+    opts?: OtmScannerOptions,
+    dtePrefs?: DtePrefs,
+  ): Promise<OtmMispricingScanResult>;
   /**
    * Look up the current mid (per-share mark) for an option contract belonging
    * to `symbol`'s `expiration` chain. Reads from the same 60s-cached chain
@@ -75,6 +97,14 @@ export interface OtmMispricingServiceConfig {
   clientFactory?: (token: string, accountId: string, env: 'sandbox' | 'production') => TradierOptionsClient;
   /** Test seam for time. */
   now?: () => number;
+  /**
+   * TRA-373 — process-wide defaults for the DTE expiration window. Per-call
+   * overrides on `scan()` win when supplied; absent fields here fall back to
+   * the spec constants (21 / 60 / 35).
+   */
+  dteMin?: number;
+  dteMax?: number;
+  dteTarget?: number;
 }
 
 /**
@@ -84,8 +114,9 @@ export interface OtmMispricingServiceConfig {
  *     repeated scans of the same symbol within a minute serve from cache.
  *   • Circuit breaker on transient errors — once a fetch throws (typically a 429
  *     or upstream outage), the breaker opens for 1 h so we don't spam the API.
- *   • Expiration auto-pick — closest expiration in the 14–35 day window, the
- *     same window the existing Tradier `findATMContract` uses.
+ *   • Expiration auto-pick — closest-to-target inside the configured DTE
+ *     window (default 21–60d, target 35d, TRA-373). Per-call overrides on
+ *     `scan()` carry per-user `AccountSettings.rvDte*` knobs through.
  *
  * Pure data layer. Does not place trades and does not modify any account state —
  * downstream signal/account integration tracks via child issues of TRA-158.
@@ -94,6 +125,9 @@ export class TradierOtmMispricingService implements OtmMispricingService {
   private readonly client: TradierOptionsClient | null;
   private readonly fetchSpot: (symbol: string) => Promise<number | null>;
   private readonly now: () => number;
+  private readonly defaultDteMin: number;
+  private readonly defaultDteMax: number;
+  private readonly defaultDteTarget: number;
 
   private readonly chainCache = new Map<ChainKey, CacheEntry<OptionChainRow[]>>();
   private readonly expirationsCache = new Map<string, CacheEntry<string[]>>();
@@ -102,6 +136,14 @@ export class TradierOtmMispricingService implements OtmMispricingService {
   constructor(config: OtmMispricingServiceConfig) {
     this.fetchSpot = config.fetchSpot;
     this.now = config.now ?? Date.now;
+    this.defaultDteMin =
+      Number.isFinite(config.dteMin) && (config.dteMin as number) > 0 ? (config.dteMin as number) : MIN_DTE_DAYS;
+    this.defaultDteMax =
+      Number.isFinite(config.dteMax) && (config.dteMax as number) > 0 ? (config.dteMax as number) : MAX_DTE_DAYS;
+    this.defaultDteTarget =
+      Number.isFinite(config.dteTarget) && (config.dteTarget as number) > 0
+        ? (config.dteTarget as number)
+        : TARGET_DTE_DAYS;
 
     const token = config.tradierApiToken ?? '';
     const accountId = config.tradierAccountId ?? '';
@@ -124,7 +166,11 @@ export class TradierOtmMispricingService implements OtmMispricingService {
     };
   }
 
-  async scan(symbol: string, opts: OtmScannerOptions = {}): Promise<OtmMispricingScanResult> {
+  async scan(
+    symbol: string,
+    opts: OtmScannerOptions = {},
+    dtePrefs: DtePrefs = {},
+  ): Promise<OtmMispricingScanResult> {
     const upper = symbol.trim().toUpperCase();
     if (!this.client) {
       return { symbol: upper, spot: null, expiration: null, candidates: [], reason: 'no_credentials' };
@@ -148,7 +194,7 @@ export class TradierOtmMispricingService implements OtmMispricingService {
 
     let expiration: string | null;
     try {
-      expiration = await this.pickExpiration(upper);
+      expiration = await this.pickExpiration(upper, dtePrefs);
     } catch (err) {
       this.tripBreaker(`getExpirations(${upper}) failed`, err);
       return {
@@ -217,7 +263,7 @@ export class TradierOtmMispricingService implements OtmMispricingService {
     console.warn(`[options-scanner] breaker open ${RATE_LIMIT_COOLDOWN_MS / 60_000}m: ${label}: ${msg}`);
   }
 
-  private async pickExpiration(symbol: string): Promise<string | null> {
+  private async pickExpiration(symbol: string, dtePrefs: DtePrefs = {}): Promise<string | null> {
     const cached = this.expirationsCache.get(symbol);
     let expirations: string[];
     if (cached && this.now() - cached.at < EXPIRATIONS_CACHE_TTL_MS) {
@@ -228,16 +274,45 @@ export class TradierOtmMispricingService implements OtmMispricingService {
     }
     if (expirations.length === 0) return null;
 
+    // TRA-373 — per-call overrides win, then service defaults, then spec
+    // constants. See the matching block in relative-value-scanner.ts.
+    let min =
+      Number.isFinite(dtePrefs.min) && (dtePrefs.min as number) > 0
+        ? (dtePrefs.min as number)
+        : this.defaultDteMin;
+    let max =
+      Number.isFinite(dtePrefs.max) && (dtePrefs.max as number) > 0
+        ? (dtePrefs.max as number)
+        : this.defaultDteMax;
+    if (max < min) {
+      min = this.defaultDteMin;
+      max = this.defaultDteMax;
+    }
+    let target =
+      Number.isFinite(dtePrefs.target) && (dtePrefs.target as number) > 0
+        ? (dtePrefs.target as number)
+        : this.defaultDteTarget;
+    if (target < min) target = min;
+    if (target > max) target = max;
+
     const now = this.now();
-    const minMs = now + MIN_DTE_DAYS * 24 * 60 * 60_000;
-    const maxMs = now + MAX_DTE_DAYS * 24 * 60 * 60_000;
+    const minMs = now + min * 24 * 60 * 60_000;
+    const maxMs = now + max * 24 * 60 * 60_000;
+    const targetMs = now + target * 24 * 60 * 60_000;
 
     const inWindow = expirations
       .map((d) => ({ d, ms: Date.parse(`${d}T00:00:00Z`) }))
-      .filter((e) => Number.isFinite(e.ms) && e.ms >= minMs && e.ms <= maxMs)
-      .sort((a, b) => a.ms - b.ms);
+      .filter((e) => Number.isFinite(e.ms) && e.ms >= minMs && e.ms <= maxMs);
+    if (inWindow.length === 0) return null;
 
-    return inWindow[0]?.d ?? null;
+    // Closest-to-target; on ties prefer the earlier expiration (less theta).
+    inWindow.sort((a, b) => {
+      const da = Math.abs(a.ms - targetMs);
+      const db = Math.abs(b.ms - targetMs);
+      if (da !== db) return da - db;
+      return a.ms - b.ms;
+    });
+    return inWindow[0]!.d;
   }
 
   private async fetchChain(symbol: string, expiration: string): Promise<OptionChainRow[]> {
