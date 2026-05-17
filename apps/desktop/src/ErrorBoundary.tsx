@@ -44,14 +44,20 @@ function reportClientError(label: string, error: Error, info: React.ErrorInfo): 
       time: new Date().toISOString(),
     };
     const body = JSON.stringify(payload);
-    // sendBeacon survives even if the page is being torn down; fall back to
-    // fetch with keepalive when it is unavailable.
+    // The body is JSON, but we send it as text/plain on purpose. An
+    // application/json Content-Type is NOT a CORS-safelisted request header,
+    // so cross-origin (e.g. the Tauri desktop webview hitting a remote API)
+    // it forces a CORS preflight. Chromium sends the OPTIONS preflight but
+    // then silently drops the sendBeacon POST — and sendBeacon still returns
+    // true, so the lost report is invisible. text/plain is CORS-safelisted,
+    // so no preflight is needed and the beacon delivers cross-origin. The
+    // server parses /api/client-error as text and JSON.parses the body.
     if (typeof navigator !== 'undefined' && typeof navigator.sendBeacon === 'function') {
-      navigator.sendBeacon(`${HTTP_URL}/api/client-error`, new Blob([body], { type: 'application/json' }));
+      navigator.sendBeacon(`${HTTP_URL}/api/client-error`, new Blob([body], { type: 'text/plain' }));
     } else {
       void fetch(`${HTTP_URL}/api/client-error`, {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
+        headers: { 'Content-Type': 'text/plain' },
         body,
         keepalive: true,
       }).catch(() => { /* reporting is best-effort */ });

@@ -974,9 +974,27 @@ app.get('/api/health', (_req, res) => {
 // login or after the token expires, and the boundary uses navigator.sendBeacon
 // (which cannot attach auth headers). Payload is logged only — never persisted
 // or echoed back — and oversized fields are clamped to bound log volume.
-app.post('/api/client-error', (req, res) => {
+//
+// TRA-400 — the boundary sends the report as a text/plain Blob so the beacon
+// stays CORS-safelisted (an application/json Content-Type forces a preflight
+// that silently drops cross-origin beacons — see ErrorBoundary.tsx). The
+// global express.json() above does not parse text/plain, so this route gets
+// an express.text() parser and JSON.parses the raw body itself. Same-origin
+// callers that still send application/json (already parsed into an object by
+// express.json()) keep working via the object branch below.
+app.post('/api/client-error', express.text({ type: 'text/plain', limit: '64kb' }), (req, res) => {
   try {
-    const b = (req.body ?? {}) as Record<string, unknown>;
+    let b: Record<string, unknown> = {};
+    if (typeof req.body === 'string') {
+      try {
+        const parsed: unknown = JSON.parse(req.body);
+        if (parsed && typeof parsed === 'object') b = parsed as Record<string, unknown>;
+      } catch {
+        /* malformed report body — log what we can below */
+      }
+    } else if (req.body && typeof req.body === 'object') {
+      b = req.body as Record<string, unknown>;
+    }
     const clamp = (v: unknown, max: number): string =>
       typeof v === 'string' ? v.slice(0, max) : '';
     console.error(
