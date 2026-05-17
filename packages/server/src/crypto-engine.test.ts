@@ -4,6 +4,7 @@ import {
   DEFAULT_STRATEGY_PRESET_ID,
   STRATEGY_PRESETS,
   resolveStrategyPreset,
+  presetAllowsStrategySymbol,
 } from '@trading-app/shared';
 import type { AccountSettings } from '@trading-app/shared';
 import type {
@@ -274,6 +275,49 @@ describe('Strategy presets — TRA-325', () => {
     const p = STRATEGY_PRESETS.bb_fade_sol_doge;
     expect(p.enabledStrategies).toEqual(['bb_fade']);
     expect(p.symbolFilter).toEqual(['SOL-USD', 'DOGE-USD']);
+  });
+
+  // TRA-421 — the TRA-405 §8 validated roster.
+  it('tra405_validated enables only bb_fade and gates it to BTC+SOL via strategyUniverse', () => {
+    const p = STRATEGY_PRESETS.tra405_validated;
+    expect(p.enabledStrategies).toEqual(['bb_fade']);
+    // No preset-wide filter — the per-strategy universe carries the gate so
+    // the macd_bollinger/bb_fade edge is restricted to its validated symbols.
+    expect(p.symbolFilter).toBeNull();
+    expect(p.strategyUniverse?.bb_fade).toEqual(['BTC-USD', 'SOL-USD']);
+    // momentum / breakout_vol are NO-GO: disabled by absence from the roster.
+    expect(p.enabledStrategies).not.toContain('momentum');
+    expect(p.enabledStrategies).not.toContain('breakout_vol');
+  });
+
+  it('resolves the tra405_validated id (the live LIVE_STRATEGY_PRESET pin)', () => {
+    expect(resolveStrategyPreset('tra405_validated').id).toBe('tra405_validated');
+  });
+
+  // TRA-421 — presetAllowsStrategySymbol: the symbolFilter + strategyUniverse gate.
+  it('presetAllowsStrategySymbol gates bb_fade to BTC+SOL under tra405_validated', () => {
+    const p = STRATEGY_PRESETS.tra405_validated;
+    expect(presetAllowsStrategySymbol(p, 'bb_fade', 'BTC-USD')).toBe(true);
+    expect(presetAllowsStrategySymbol(p, 'bb_fade', 'SOL-USD')).toBe(true);
+    expect(presetAllowsStrategySymbol(p, 'bb_fade', 'DOGE-USD')).toBe(false);
+    expect(presetAllowsStrategySymbol(p, 'bb_fade', 'ETH-USD')).toBe(false);
+  });
+
+  it('presetAllowsStrategySymbol leaves an unmapped strategy gated by symbolFilter only', () => {
+    // legacy_5: no symbolFilter, no strategyUniverse → every strategy/symbol allowed.
+    const legacy = STRATEGY_PRESETS.legacy_5;
+    expect(presetAllowsStrategySymbol(legacy, 'momentum', 'ANY-USD')).toBe(true);
+    // tra405_validated: swing_trade is not in strategyUniverse and there is no
+    // preset-wide filter, so it is unrestricted (it is separately disabled by
+    // not being in enabledStrategies — a gate this helper deliberately ignores).
+    const validated = STRATEGY_PRESETS.tra405_validated;
+    expect(presetAllowsStrategySymbol(validated, 'swing_trade', 'XRP-USD')).toBe(true);
+  });
+
+  it('presetAllowsStrategySymbol — preset-wide symbolFilter still applies', () => {
+    const p = STRATEGY_PRESETS.bb_fade_sol_doge;
+    expect(presetAllowsStrategySymbol(p, 'bb_fade', 'SOL-USD')).toBe(true);
+    expect(presetAllowsStrategySymbol(p, 'bb_fade', 'BTC-USD')).toBe(false);
   });
 
   it('TRA-345 — getState().activePreset surfaces the resolved preset for API verification', () => {

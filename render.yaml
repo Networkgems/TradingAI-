@@ -72,17 +72,27 @@ services:
       # actually want to route real orders.
       - key: TRADIER_ENV
         sync: false
-      # TRA-324 / TRA-325 — process-wide forced strategy preset override.
-      # When set, every CryptoSignalEngine instance pins to this preset
-      # regardless of the user's saved `activeStrategyPreset` selection in
-      # the Settings UI. This is the ops-level kill-switch that pinned the
+      # TRA-324 / TRA-325 / TRA-421 — process-wide forced strategy preset
+      # override. When set, every CryptoSignalEngine instance pins to this
+      # preset regardless of the user's saved `activeStrategyPreset` selection
+      # in the Settings UI. This is the ops-level kill-switch that pinned the
       # $180 board test (board decision on TRA-305, target 2026-05-06) to
-      # bb_fade-only on SOL+DOGE. Drop the env var to release control back
-      # to per-user settings (default `legacy_5` = pre-324 5-strategy
-      # roster). The legacy value `bb_fade_sol_doge_only` from TRA-324 is
-      # still accepted (mapped to `bb_fade_sol_doge`) for revert safety.
+      # bb_fade-only on SOL+DOGE.
+      #
+      # TRA-421 — pinned to `tra405_validated`: the TRA-405 §8 out-of-sample
+      # go/no-go (board-confirmed) found the macd_bollinger / bb_fade edge
+      # survives costs only on BTC-USD and SOL-USD, and that momentum /
+      # breakout_vol are OOS-negative on every symbol tested. The preset
+      # enables bb_fade alone and gates it to {BTC-USD, SOL-USD}. The earlier
+      # `bb_fade_sol_doge` pin traded DOGE-USD, which TRA-405 found
+      # OOS-negative (−5.2%, profit factor 0.50).
+      #
+      # Drop the env var to release control back to per-user settings (default
+      # `legacy_5` = pre-324 5-strategy roster). The legacy value
+      # `bb_fade_sol_doge_only` from TRA-324 is still accepted (mapped to
+      # `bb_fade_sol_doge`) for revert safety.
       - key: LIVE_STRATEGY_PRESET
-        value: bb_fade_sol_doge
+        value: tra405_validated
       # TRA-406 — observability. All optional; sane defaults apply when unset.
       #   LOG_LEVEL          debug|info|warn|error (default info)
       #   ERROR_WEBHOOK_URL  HTTPS endpoint captured errors are POSTed to

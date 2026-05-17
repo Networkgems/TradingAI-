@@ -98,6 +98,7 @@ export type {
   StrategyRouterOptions,
   RouterEvaluation,
   RouterPriority,
+  RouterUniverse,
 } from './router.js';
 export {
   TIME_STOP_BARS,

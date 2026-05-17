@@ -850,9 +850,19 @@ function StrategyPresetSection({
                   <div>
                     <strong>Symbols:</strong>{' '}
                     {preset.symbolFilter === null
-                      ? 'entire crypto watchlist'
+                      ? (preset.strategyUniverse
+                          ? 'crypto watchlist, narrowed per strategy below'
+                          : 'entire crypto watchlist')
                       : preset.symbolFilter.join(', ')}
                   </div>
+                  {preset.strategyUniverse && (
+                    <div>
+                      <strong>Per-strategy universe:</strong>{' '}
+                      {Object.entries(preset.strategyUniverse)
+                        .map(([strat, syms]) => `${strat} → ${(syms ?? []).join(', ') || 'none'}`)
+                        .join('; ')}
+                    </div>
+                  )}
                 </div>
               </div>
             </label>

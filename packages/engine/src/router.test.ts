@@ -327,3 +327,91 @@ describe('StrategyRouter — regime detector ownership', () => {
     expect(updateCalls).toBe(2);
   });
 });
+
+describe('StrategyRouter — TRA-421 per-strategy universe filter', () => {
+  // The TRA-405 §8 out-of-sample go/no-go gates each strategy to a validated
+  // symbol set. These tests pin the router-level gate: a strategy fires for a
+  // symbol only when the universe whitelist admits it. Stub strategies that
+  // always fire isolate the gate from the regime/indicator logic.
+  const fixedSig = (type: TradeSignal['type'], symbol: string): TradeSignal => ({
+    id: `${type}-${symbol}`,
+    symbol,
+    type,
+    side: 'buy',
+    entryPrice: 100,
+    stopLoss: 99,
+    takeProfit: 102,
+    riskRewardRatio: 2,
+    timestamp: 0,
+  });
+  // Stub whose evaluate echoes a signal stamped with the symbol it was called
+  // for, so a test can prove the gate keyed off the evaluated symbol.
+  const firesFor = (type: TradeSignal['type']) => ({
+    evaluate: (symbol: string) => fixedSig(type, symbol),
+  });
+
+  function buildStubRouter(universe?: Record<string, readonly string[]>): StrategyRouter {
+    return new StrategyRouter({
+      regime: new RegimeDetector(),
+      momentum: firesFor('momentum') as unknown as MomentumStrategy,
+      breakout: firesFor('breakout_vol') as unknown as BreakoutVolStrategy,
+      meanReversion: firesFor('mean_reversion') as unknown as MeanReversionCryptoStrategy,
+      universe,
+    });
+  }
+
+  it('emits a gated strategy only for symbols in its universe list', () => {
+    const router = buildStubRouter({ momentum: ['BTC-USD', 'SOL-USD'] });
+    // In-universe: momentum is highest priority and wins.
+    expect(router.evaluate('BTC-USD', [])?.type).toBe('momentum');
+    expect(router.evaluate('SOL-USD', [])?.type).toBe('momentum');
+    // Out-of-universe: momentum is dropped, so the next-priority strategy
+    // (breakout_vol — unrestricted here) wins instead.
+    const eth = router.evaluateDetailed('ETH-USD', []);
+    expect(eth.signal?.type).toBe('breakout_vol');
+    expect(eth.fired.map(f => f.priority)).not.toContain('momentum');
+  });
+
+  it('treats an empty universe list as "disabled on every symbol"', () => {
+    // Per TRA-405 §8, momentum and breakout_vol are OOS-negative everywhere.
+    const router = buildStubRouter({ momentum: [], breakout_vol: [] });
+    for (const sym of ['BTC-USD', 'SOL-USD', 'ETH-USD']) {
+      const r = router.evaluateDetailed(sym, []);
+      // Only the unrestricted mean_reversion survives.
+      expect(r.signal?.type).toBe('mean_reversion');
+      expect(r.fired.map(f => f.priority)).toEqual(['mean_reversion']);
+    }
+  });
+
+  it('leaves a strategy absent from the universe map unrestricted', () => {
+    // Only momentum is gated; breakout_vol / mean_reversion are unmapped and
+    // must still fire on any symbol.
+    const router = buildStubRouter({ momentum: ['BTC-USD'] });
+    expect(router.evaluate('DOGE-USD', [])?.type).toBe('breakout_vol');
+  });
+
+  it('applies no symbol gating when no universe is configured', () => {
+    const router = buildStubRouter();
+    expect(router.evaluate('ANY-USD', [])?.type).toBe('momentum');
+  });
+
+  it('setUniverse re-points a live router (cached per symbol by the engine)', () => {
+    const router = buildStubRouter();
+    expect(router.evaluate('ETH-USD', [])?.type).toBe('momentum');
+    // The crypto engine caches one router per symbol and re-points it when the
+    // active preset changes; setUniverse must take effect on the next evaluate.
+    router.setUniverse({ momentum: ['BTC-USD'] });
+    expect(router.evaluate('ETH-USD', [])?.type).toBe('breakout_vol');
+    router.setUniverse({});
+    expect(router.evaluate('ETH-USD', [])?.type).toBe('momentum');
+  });
+
+  it('gates the evaluated symbol, not the candle symbol field', () => {
+    // The stub stamps each signal with the symbol evaluate() was called for;
+    // confirm the gate keys off that argument.
+    const router = buildStubRouter({ momentum: ['SOL-USD'] });
+    expect(router.evaluate('SOL-USD', [])?.symbol).toBe('SOL-USD');
+    expect(router.evaluateDetailed('BTC-USD', []).fired.map(f => f.priority))
+      .not.toContain('momentum');
+  });
+});

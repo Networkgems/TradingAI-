@@ -44,6 +44,20 @@ export const DEFAULT_ROUTER_PRIORITY: RouterPriority = [
   'mean_reversion',
 ];
 
+/**
+ * TRA-421 — per-strategy universe whitelist for {@link StrategyRouter}.
+ *
+ * Maps a routable signal type to the symbols that strategy is validated to
+ * trade. A type present in the map emits a signal only for symbols in its
+ * list; an explicit empty array disables the strategy on every symbol. A type
+ * absent from the map is unrestricted — the router does not gate it by symbol.
+ *
+ * Per the TRA-405 §8 out-of-sample go/no-go, `momentum` and `breakout_vol`
+ * are OOS-negative on every symbol tested and map to the empty set, while the
+ * validated mean-reversion edge is gated to its two profitable symbols.
+ */
+export type RouterUniverse = Readonly<Partial<Record<SignalType, readonly string[]>>>;
+
 export interface StrategyRouterOptions {
   regime: RegimeDetector;
   momentum: MomentumStrategy;
@@ -56,6 +70,15 @@ export interface StrategyRouterOptions {
    * match, which would silently drop their signals.
    */
   priority?: RouterPriority;
+  /**
+   * TRA-421 — optional per-strategy universe whitelist. A strategy whose type
+   * is listed here only contributes a signal when the evaluated symbol is in
+   * its list; out-of-universe fires are dropped before the dedupe joust.
+   * Omit (or pass `{}`) for no symbol gating. Mutable at runtime via
+   * {@link StrategyRouter.setUniverse} — the crypto engine caches one router
+   * per symbol and re-points it when the active preset changes.
+   */
+  universe?: RouterUniverse;
 }
 
 /**
@@ -89,6 +112,8 @@ export class StrategyRouter {
   private readonly meanReversion: MeanReversionCryptoStrategy;
   private readonly breakout: BreakoutVolStrategy;
   private readonly priority: RouterPriority;
+  /** TRA-421 — per-strategy universe whitelist; mutable via {@link setUniverse}. */
+  private universe: RouterUniverse;
 
   constructor(opts: StrategyRouterOptions) {
     this.regime = opts.regime;
@@ -96,11 +121,33 @@ export class StrategyRouter {
     this.meanReversion = opts.meanReversion;
     this.breakout = opts.breakout;
     this.priority = opts.priority ?? DEFAULT_ROUTER_PRIORITY;
+    this.universe = opts.universe ?? {};
   }
 
   /** Active regime label without consuming a bar. */
   currentRegime(): Regime {
     return this.regime.current();
+  }
+
+  /**
+   * TRA-421 — replace the per-strategy universe whitelist. The crypto engine
+   * caches one router per symbol, so when the active strategy preset changes
+   * the cached router is re-pointed here rather than rebuilt (rebuilding would
+   * discard the per-symbol regime hysteresis state). Pass `{}` to clear all
+   * symbol gating.
+   */
+  setUniverse(universe: RouterUniverse): void {
+    this.universe = universe;
+  }
+
+  /**
+   * TRA-421 — is `type` permitted to emit a signal for `symbol`? A type absent
+   * from the universe map is unrestricted; a type mapped to a list (including
+   * an empty list) must contain `symbol`.
+   */
+  private universeAllows(type: SignalType, symbol: string): boolean {
+    const allowed = this.universe[type];
+    return allowed === undefined || allowed.includes(symbol);
   }
 
   /**
@@ -134,14 +181,25 @@ export class StrategyRouter {
     // strategy-specific (breakout deliberately fires on the `flat → high_vol`
     // transition bar, for example) and centralizing it here would risk drift
     // every time a strategy's spec changes.
+    //
+    // TRA-421 — a fired signal is then dropped when the per-strategy universe
+    // whitelist excludes `symbol`. The gate is applied here (not after the
+    // dedupe joust) so an out-of-universe strategy never displaces a lower-
+    // priority strategy that *is* validated on this symbol.
     const momentumSig = this.momentum.evaluate(symbol, candles, regime);
-    if (momentumSig) fired.push({ priority: 'momentum', signal: momentumSig });
+    if (momentumSig && this.universeAllows('momentum', symbol)) {
+      fired.push({ priority: 'momentum', signal: momentumSig });
+    }
 
     const breakoutSig = this.breakout.evaluate(symbol, candles, regime);
-    if (breakoutSig) fired.push({ priority: 'breakout_vol', signal: breakoutSig });
+    if (breakoutSig && this.universeAllows('breakout_vol', symbol)) {
+      fired.push({ priority: 'breakout_vol', signal: breakoutSig });
+    }
 
     const meanRevSig = this.meanReversion.evaluate(symbol, candles, regime);
-    if (meanRevSig) fired.push({ priority: 'mean_reversion', signal: meanRevSig });
+    if (meanRevSig && this.universeAllows('mean_reversion', symbol)) {
+      fired.push({ priority: 'mean_reversion', signal: meanRevSig });
+    }
 
     if (fired.length === 0) return { regime, signal: null, fired: [] };
 

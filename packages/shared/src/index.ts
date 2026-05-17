@@ -284,7 +284,7 @@ export const MANAGED_ACCOUNT_RATIO = 0.5;   // 50% of total account auto-managed
 // user/engine to the named preset regardless of saved settings.
 
 /** Canonical preset identifiers — the literal union doubles as runtime validation. */
-export type StrategyPresetId = 'legacy_5' | 'bb_fade_sol_doge';
+export type StrategyPresetId = 'legacy_5' | 'bb_fade_sol_doge' | 'tra405_validated';
 
 /** Crypto-strategy SignalTypes routable by the engine. Subset of {@link SignalType}. */
 export type CryptoStrategyType =
@@ -311,17 +311,38 @@ export interface StrategyPreset {
    * case-sensitively against the engine's product ids (e.g. 'SOL-USD').
    * `null` means no preset-level filter — the existing per-strategy gates
    * (long universe, perp-shorts universe, denylist) apply unchanged.
+   *
+   * Applies to *every* enabled strategy uniformly. For strategies validated on
+   * different symbol sets, use {@link strategyUniverse} instead.
    */
   symbolFilter: readonly string[] | null;
+  /**
+   * TRA-421 — optional per-strategy universe whitelist. Maps a strategy id to
+   * the symbols that strategy is validated to trade; a strategy emits a signal
+   * only when the symbol is in its list. A strategy absent from this map is
+   * gated by {@link symbolFilter} alone. An explicit empty array disables the
+   * strategy on every symbol.
+   *
+   * This is the lever the TRA-405 §8 out-of-sample go/no-go calls for: the
+   * macd_bollinger mean-reversion edge survives costs only on BTC-USD and
+   * SOL-USD, so the live `bb_fade` strategy (its productionised form — see the
+   * `tra405_validated` preset) is mapped to exactly those two symbols while
+   * other strategies on the same preset keep their own (or no) universe.
+   * Evaluated in addition to {@link symbolFilter}; both gates must pass.
+   */
+  strategyUniverse?: Readonly<Partial<Record<CryptoStrategyType, readonly string[]>>>;
 }
 
 /**
- * Read-only preset library. v1 ships two presets per board ask:
+ * Read-only preset library:
  *   • `legacy_5`         — pre-TRA-325 status quo: all 5 crypto strategies on
  *                          all 51 long symbols, perp shorts on PERP_SHORTS_UNIVERSE.
  *   • `bb_fade_sol_doge` — bb_fade only, scoped to SOL-USD + DOGE-USD. This
  *                          captures the live test config that shipped via
  *                          TRA-324's env-var hardcoding.
+ *   • `tra405_validated` — TRA-421: the TRA-405 §8 out-of-sample go/no-go
+ *                          roster. bb_fade only, gated to {BTC-USD, SOL-USD}
+ *                          via {@link StrategyPreset.strategyUniverse}.
  *
  * Future presets are added here without code changes elsewhere — the engine
  * resolves by id, the UI lists `Object.values(STRATEGY_PRESETS)`.
@@ -343,6 +364,31 @@ export const STRATEGY_PRESETS: Readonly<Record<StrategyPresetId, StrategyPreset>
     enabledStrategies: ['bb_fade'] as const,
     symbolFilter: ['SOL-USD', 'DOGE-USD'] as const,
   },
+  // TRA-421 — the TRA-405 §8 out-of-sample go/no-go roster.
+  //
+  // TRA-405 re-ran the strategy roster on 3.05 years of real Coinbase 4H bars
+  // (IS vs OOS split, tiered cost model, block-bootstrap confidence). Of five
+  // strategies × six symbols, exactly two cells survived costs out-of-sample:
+  // `macd_bollinger` on BTC-USD and on SOL-USD. `momentum` and `breakout_vol`
+  // were OOS-negative on every symbol tested; `mean_reversion` was inert.
+  //
+  // Strategy-name mapping: TRA-405's backtest `macd_bollinger` strategy runs
+  // the engine's macd-trend + bb-fade strategies together, and the report
+  // (§4.1) attributes its entire OOS edge to "the bb_fade pattern". macd-trend
+  // was dropped from the live engine in TRA-313, so the live carrier of the
+  // validated macd_bollinger edge is `bb_fade`. This preset therefore enables
+  // `bb_fade` only and gates it — via `strategyUniverse` — to {BTC-USD,
+  // SOL-USD}. momentum / breakout_vol are simply not in `enabledStrategies`,
+  // which is how a strategy is disabled on the generic universe.
+  tra405_validated: {
+    id: 'tra405_validated',
+    displayName: 'TRA-405 validated — macd_bollinger (bb_fade) on BTC + SOL',
+    description:
+      'TRA-405 §8 out-of-sample go/no-go roster: only the macd_bollinger / bb_fade mean-reversion edge survives costs, and only on BTC-USD and SOL-USD. momentum and breakout_vol are OOS-negative on every symbol tested and are disabled.',
+    enabledStrategies: ['bb_fade'] as const,
+    symbolFilter: null,
+    strategyUniverse: { bb_fade: ['BTC-USD', 'SOL-USD'] as const },
+  },
 };
 
 export const DEFAULT_STRATEGY_PRESET_ID: StrategyPresetId = 'legacy_5';
@@ -361,6 +407,29 @@ export function resolveStrategyPreset(id: string | undefined | null): StrategyPr
   if (!id) return STRATEGY_PRESETS[DEFAULT_STRATEGY_PRESET_ID];
   if (id === 'bb_fade_sol_doge_only') return STRATEGY_PRESETS.bb_fade_sol_doge;
   return STRATEGY_PRESETS[id as StrategyPresetId] ?? STRATEGY_PRESETS[DEFAULT_STRATEGY_PRESET_ID];
+}
+
+/**
+ * TRA-421 — does `preset` permit `strategy` to emit a signal for `symbol`?
+ *
+ * Combines the two preset-level symbol gates: the preset-wide
+ * {@link StrategyPreset.symbolFilter} and the per-strategy
+ * {@link StrategyPreset.strategyUniverse} whitelist. Both must pass — a
+ * strategy validated only on a subset of symbols (e.g. `bb_fade` on
+ * {BTC-USD, SOL-USD} per the TRA-405 §8 OOS findings) appears in
+ * `strategyUniverse`; a strategy absent from that map is gated by the
+ * preset-wide filter alone. `enabledStrategies` is a separate, prior gate and
+ * is intentionally not re-checked here.
+ */
+export function presetAllowsStrategySymbol(
+  preset: StrategyPreset,
+  strategy: CryptoStrategyType,
+  symbol: string,
+): boolean {
+  if (preset.symbolFilter !== null && !preset.symbolFilter.includes(symbol)) return false;
+  const universe = preset.strategyUniverse?.[strategy];
+  if (universe !== undefined && !universe.includes(symbol)) return false;
+  return true;
 }
 
 // ── Account Modes ─────────────────────────────────────────────────────────────
@@ -1567,6 +1636,13 @@ export interface CryptoEngineState {
     envValue: string;
     enabledStrategies: readonly CryptoStrategyType[];
     symbolFilter: readonly string[] | null;
+    /**
+     * TRA-421 — the resolved preset's per-strategy universe whitelist
+     * ({@link StrategyPreset.strategyUniverse}), surfaced so operators can
+     * confirm the validated-symbol gate is live without log access. Omitted
+     * when the preset declares no per-strategy universe.
+     */
+    strategyUniverse?: Readonly<Partial<Record<CryptoStrategyType, readonly string[]>>>;
   };
 }
 

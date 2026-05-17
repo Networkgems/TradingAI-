@@ -14,8 +14,9 @@ import {
   SKIP_NOT_IN_UNIVERSE,
   type ShortFilterContext,
   type ClosedShortTrade,
+  type RouterUniverse,
 } from '@trading-app/engine';
-import { CRYPTO_WATCHLIST, isCryptoSymbolBlocked, aliasCryptoSymbol, resolveManagedAccountRatio, resolveRiskPerTrade, resolveStrategyPreset } from '@trading-app/shared';
+import { CRYPTO_WATCHLIST, isCryptoSymbolBlocked, aliasCryptoSymbol, resolveManagedAccountRatio, resolveRiskPerTrade, resolveStrategyPreset, presetAllowsStrategySymbol } from '@trading-app/shared';
 import type {
   TradeSignal,
   Candle,
@@ -494,6 +495,9 @@ export class CryptoSignalEngine {
       env: FORCED_PRESET_ENV,
       strategies: startupPreset.enabledStrategies,
       symbolFilter: filterStr,
+      // TRA-421 — surface the per-strategy universe gate at boot so the
+      // validated-symbol restriction is visible alongside the preset id.
+      strategyUniverse: startupPreset.strategyUniverse ?? '(none)',
     });
     // Pre-seed symbolState so clients that connect before the first tick see all expected symbols.
     // Entries with lastUpdated=0 signal "loading" to the UI.
@@ -568,8 +572,14 @@ export class CryptoSignalEngine {
    * the others. Strategies inside the router are also per-router because
    * MomentumStrategy carries `lastFireTs` state that would otherwise be
    * shared across symbols and rate-limit cross-asset signals incorrectly.
+   *
+   * TRA-421 — the caller passes the active preset's per-strategy universe so
+   * the (cached) router gates momentum / breakout_vol / mean_reversion to
+   * their validated symbol sets. It is re-applied every call rather than baked
+   * in at construction because the active preset can change at runtime while
+   * the per-symbol regime state must survive that change.
    */
-  private getRouter(symbol: string): StrategyRouter {
+  private getRouter(symbol: string, universe: RouterUniverse): StrategyRouter {
     let r = this.routers.get(symbol);
     if (!r) {
       const regime = new RegimeDetector();
@@ -645,6 +655,9 @@ export class CryptoSignalEngine {
       });
       this.routers.set(symbol, r);
     }
+    // TRA-421 — re-point the (possibly cached) router at the current preset's
+    // per-strategy universe before it evaluates this tick.
+    r.setUniverse(universe);
     return r;
   }
 
@@ -968,23 +981,31 @@ export class CryptoSignalEngine {
         const candles = this.candleCache.get(sym) ?? [];
         const dailyCandles = this.dailyCandleCache.get(sym) ?? [];
 
-        // Evaluate each strategy independently with its own minimum bar requirement.
+        // Evaluate each strategy independently with its own minimum bar
+        // requirement. TRA-421 — `presetAllowsStrategySymbol` combines the
+        // preset-wide `symbolFilter` with the per-strategy `strategyUniverse`
+        // whitelist, so bb_fade only fires on its validated symbols.
         const bbFadeSignal = candles.length >= CryptoSignalEngine.MIN_BARS_BB_FADE
-          && strategyEnabled('bb_fade') && symbolAllowed(sym)
+          && strategyEnabled('bb_fade') && presetAllowsStrategySymbol(preset, 'bb_fade', sym)
           ? this.bbFade.evaluate(sym, candles) : null;
-        const swingSignal = strategyEnabled('swing_trade') && symbolAllowed(sym)
+        const swingSignal = strategyEnabled('swing_trade')
+          && presetAllowsStrategySymbol(preset, 'swing_trade', sym)
           && dailyCandles.length >= 205
           ? this.swing.evaluate(sym, dailyCandles) : null;
         // TRA-208: regime-aware router emits at most one momentum / breakout
         // / mean-reversion signal per tick. The router runs whenever any of
         // its three strategies are enabled by the preset; the post-router
         // filter below drops emissions for strategies outside the preset.
+        // TRA-421 — the router itself applies the per-strategy universe gate
+        // (passed via getRouter), so an out-of-universe router strategy never
+        // emits; the preset-wide `symbolAllowed` gate still decides whether
+        // the router runs at all.
         const routerEnabled = strategyEnabled('momentum')
           || strategyEnabled('mean_reversion')
           || strategyEnabled('breakout_vol');
         const rawRouterSignal = routerEnabled && symbolAllowed(sym)
           && candles.length >= CryptoSignalEngine.MIN_BARS_ROUTER
-          ? this.getRouter(sym).evaluate(sym, candles) : null;
+          ? this.getRouter(sym, preset.strategyUniverse ?? {}).evaluate(sym, candles) : null;
         const routerSignal = rawRouterSignal
           && (rawRouterSignal.type === 'momentum'
             || rawRouterSignal.type === 'mean_reversion'
@@ -1175,20 +1196,24 @@ export class CryptoSignalEngine {
       const candles = this.candleCache.get(sym) ?? [];
       const dailyCandles = this.dailyCandleCache.get(sym) ?? [];
 
+      // TRA-421 — per-strategy universe gate (preset-wide filter + the
+      // strategy's `strategyUniverse` whitelist). Mirrors the demo path.
       const bbFadeSignal = candles.length >= CryptoSignalEngine.MIN_BARS_BB_FADE
-        && strategyEnabled('bb_fade') && symbolAllowed(sym)
+        && strategyEnabled('bb_fade') && presetAllowsStrategySymbol(preset, 'bb_fade', sym)
         ? this.bbFade.evaluate(sym, candles) : null;
-      const swingSignal = strategyEnabled('swing_trade') && symbolAllowed(sym)
+      const swingSignal = strategyEnabled('swing_trade')
+        && presetAllowsStrategySymbol(preset, 'swing_trade', sym)
         && dailyCandles.length >= 205
         ? this.swing.evaluate(sym, dailyCandles) : null;
       // TRA-208: same router pipeline as the demo path so live and paper
       // produce identical regime-aware entries from the same regime state.
+      // TRA-421 — getRouter applies the per-strategy universe gate.
       const routerEnabled = strategyEnabled('momentum')
         || strategyEnabled('mean_reversion')
         || strategyEnabled('breakout_vol');
       const rawRouterSignal = routerEnabled && symbolAllowed(sym)
         && candles.length >= CryptoSignalEngine.MIN_BARS_ROUTER
-        ? this.getRouter(sym).evaluate(sym, candles) : null;
+        ? this.getRouter(sym, preset.strategyUniverse ?? {}).evaluate(sym, candles) : null;
       const routerSignal = rawRouterSignal
         && (rawRouterSignal.type === 'momentum'
           || rawRouterSignal.type === 'mean_reversion'
@@ -1369,6 +1394,10 @@ export class CryptoSignalEngine {
       envValue: FORCED_PRESET_ENV,
       enabledStrategies: resolvedPreset.enabledStrategies,
       symbolFilter: resolvedPreset.symbolFilter,
+      // TRA-421 — per-strategy universe gate, omitted when the preset has none.
+      ...(resolvedPreset.strategyUniverse
+        ? { strategyUniverse: resolvedPreset.strategyUniverse }
+        : {}),
     };
     if (this.mode === 'live') {
       // Live mode: if a Coinbase broker is configured, surface its USD-equivalent
