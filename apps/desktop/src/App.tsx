@@ -22,6 +22,8 @@ import SettingsPage, { ChangePasswordSection, UserManagementSection } from './Se
 import { CalendarTab } from './CalendarTab.tsx';
 import { ErrorBoundary } from './ErrorBoundary.tsx';
 import { SERVER_URL, HTTP_URL } from './server-url';
+import { logger } from './lib/logger';
+import { useFocusTrap } from './lib/useFocusTrap';
 import './index.css';
 
 // TRA-339 — generic per-table sort. Each dashboard table picks a column
@@ -103,7 +105,7 @@ function readInitialTheme(): Theme {
   try {
     const stored = localStorage.getItem(THEME_STORAGE_KEY);
     if (stored === 'dark' || stored === 'light') return stored;
-  } catch { /* ignore */ }
+  } catch (err) { logger.warn('theme', 'could not read stored theme preference', err); }
   return 'light';
 }
 
@@ -114,7 +116,7 @@ function useTheme(): { theme: Theme; toggleTheme: () => void } {
     const root = document.documentElement;
     root.classList.remove('theme-light', 'theme-dark');
     root.classList.add(theme === 'dark' ? 'theme-dark' : 'theme-light');
-    try { localStorage.setItem(THEME_STORAGE_KEY, theme); } catch { /* ignore */ }
+    try { localStorage.setItem(THEME_STORAGE_KEY, theme); } catch (err) { logger.warn('theme', 'could not persist theme preference', err); }
   }, [theme]);
 
   const toggleTheme = useCallback(() => {
@@ -463,7 +465,7 @@ function CryptoDashboard({ token, onBack, onLogout, onActivity, theme, onToggleT
           const msg = JSON.parse(e.data as string);
           if (msg.type === 'crypto_state') { setState(msg.payload as CryptoEngineState); setEverConnected(true); }
           onActivity?.();
-        } catch { /* ignore */ }
+        } catch (err) { logger.warn('crypto-ws', 'dropped malformed WebSocket message', err); }
       };
     }
     connect();
@@ -483,7 +485,7 @@ function CryptoDashboard({ token, onBack, onLogout, onActivity, theme, onToggleT
         });
         if (r.status === 401) { onLogout(); return; }
         if (r.ok) setState(await r.json() as CryptoEngineState);
-      } catch { /* ignore */ }
+      } catch (err) { logger.warn('crypto-http', 'state poll failed; will retry', err); }
     }, 5000);
     return () => clearInterval(id);
     // eslint-disable-next-line react-hooks/exhaustive-deps -- onLogout is an event-style callback; adding it would restart the polling interval on every parent render
@@ -496,7 +498,7 @@ function CryptoDashboard({ token, onBack, onLogout, onActivity, theme, onToggleT
           headers: { Authorization: `Bearer ${token}` },
         });
         if (r.ok) setNews(await r.json() as NewsItem[]);
-      } catch { /* ignore */ }
+      } catch (err) { logger.warn('crypto-http', 'news fetch failed; keeping previous items', err); }
     }
     loadNews();
     const id = setInterval(loadNews, 5 * 60_000);
@@ -1739,7 +1741,7 @@ function Dashboard({ token, onLogout, onGoHome, onActivity, theme, onToggleTheme
           // EOD report payloads are now consumed by the Calendar tab via the
           // `/api/reports/:date` REST endpoint, not pushed into the dashboard.
           onActivity?.();
-        } catch { /* ignore malformed */ }
+        } catch (err) { logger.warn('stock-ws', 'dropped malformed WebSocket message', err); }
       };
     }
 
@@ -1761,7 +1763,7 @@ function Dashboard({ token, onLogout, onGoHome, onActivity, theme, onToggleTheme
         });
         if (r.status === 401) { onLogout(); return; }
         if (r.ok) setState(await r.json() as AppState);
-      } catch { /* ignore */ }
+      } catch (err) { logger.warn('stock-http', 'state poll failed; will retry', err); }
     }, 5000);
     return () => clearInterval(id);
   }, [connected, token, onLogout]);
@@ -1773,7 +1775,7 @@ function Dashboard({ token, onLogout, onGoHome, onActivity, theme, onToggleTheme
           headers: { Authorization: `Bearer ${token}` },
         });
         if (r.ok) setNews(await r.json() as NewsItem[]);
-      } catch { /* ignore */ }
+      } catch (err) { logger.warn('stock-http', 'news fetch failed; keeping previous items', err); }
     }
     loadNews();
     const id = setInterval(loadNews, 5 * 60_000);
@@ -1934,6 +1936,11 @@ function Dashboard({ token, onLogout, onGoHome, onActivity, theme, onToggleTheme
   function closeDrawerCancel() {
     setCloseDrawer(prev => (prev?.submitting ? prev : null));
   }
+
+  // TRA-409 — keyboard accessibility for the close drawer: trap Tab focus
+  // inside the dialog while it is open, close it on Esc, and restore focus to
+  // the triggering control once it closes.
+  const closeDrawerRef = useFocusTrap<HTMLDivElement>(closeDrawer != null, closeDrawerCancel);
 
   async function submitCloseDrawer() {
     if (!closeDrawer || closeDrawer.submitting) return;
@@ -2814,8 +2821,10 @@ function Dashboard({ token, onLogout, onGoHome, onActivity, theme, onToggleTheme
             style={{ background: 'rgba(0,0,0,0.4)' }}
           />
           <div
+            ref={closeDrawerRef}
             className="profile-dropdown"
             role="dialog"
+            aria-modal="true"
             aria-label="Close option position"
             style={{
               position: 'fixed',
