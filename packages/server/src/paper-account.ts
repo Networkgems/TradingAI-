@@ -81,7 +81,16 @@ export class PaperAccount {
     return Math.floor(this.maxRiskPerTrade() / dist);
   }
 
-  openPosition(signal: TradeSignal, currentPrice: number): Position | null {
+  /**
+   * Open a paper position for `signal` at `currentPrice`.
+   *
+   * `sizeMultiplier` (TRA-389) is a position-size scalar in (0,1] applied
+   * after the risk- and managed-equity caps — the signal engine passes the
+   * market-review regime's `sizingMultiplier` here when the gate-consumption
+   * flag is on. Defaults to 1 (no trim) so every other caller sizes exactly
+   * as before. A multiplier that rounds the share count to 0 skips the open.
+   */
+  openPosition(signal: TradeSignal, currentPrice: number, sizeMultiplier = 1): Position | null {
     let qty = this.sizeFromStop(signal.entryPrice, signal.stopLoss);
     if (qty <= 0) {
       console.warn(`[paper-account] skip ${signal.symbol} ${signal.type}: qty=0 (entry=${signal.entryPrice} stop=${signal.stopLoss} maxRisk=${this.maxRiskPerTrade().toFixed(2)})`);
@@ -97,6 +106,14 @@ export class PaperAccount {
       return null;
     }
     qty = Math.min(qty, maxQtyForManagedEquity);
+    // TRA-389 — trim by the market-review regime scalar (1 ↔ no-op).
+    if (Number.isFinite(sizeMultiplier) && sizeMultiplier > 0 && sizeMultiplier < 1) {
+      qty = Math.floor(qty * sizeMultiplier);
+      if (qty <= 0) {
+        console.warn(`[paper-account] skip ${signal.symbol} ${signal.type}: market-review sizing multiplier ${sizeMultiplier} rounded qty to 0`);
+        return null;
+      }
+    }
     const cost = currentPrice * qty;
     if (cost > this.cash) {
       console.warn(`[paper-account] skip ${signal.symbol} ${signal.type}: cost=${cost.toFixed(2)} > cash=${this.cash.toFixed(2)} (existing positions consuming cash)`);

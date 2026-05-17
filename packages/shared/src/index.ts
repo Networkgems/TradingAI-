@@ -611,6 +611,16 @@ export interface AccountSettings {
    */
   demoSlippagePct?: number;
   demoFeePerContract?: number;
+  /**
+   * TRA-389 — feature flag for the market-review gate consumption path.
+   * When `true`, the signal engine reads the latest premarket
+   * {@link MarketReview} each tick and suppresses / re-sizes equity signals
+   * per its {@link MarketReviewGates}. Default `false` — soft-launch behind a
+   * setting (same pattern as TRA-374's `demoSlippagePct`): the engine ignores
+   * the regime review entirely until QA / the user opts in from the Settings
+   * page. Absent ↔ off; resolve via {@link resolveMarketReviewGatesEnabled}.
+   */
+  marketReviewGatesEnabled?: boolean;
 }
 
 export const DEFAULT_ACCOUNT_SETTINGS: AccountSettings = {
@@ -668,6 +678,8 @@ export const DEFAULT_ACCOUNT_SETTINGS: AccountSettings = {
   // TRA-374 — demo cost model defaults off until QA flips it on.
   demoSlippagePct: 0,
   demoFeePerContract: 0,
+  // TRA-389 — market-review gate consumption defaults off (soft-launch).
+  marketReviewGatesEnabled: false,
 };
 
 /**
@@ -765,6 +777,17 @@ export function resolveDemoCostModel(s: AccountSettings): DemoCostModel {
       ? s.demoFeePerContract
       : 0;
   return { slippagePct, feePerContract };
+}
+
+/**
+ * TRA-389 — resolve the market-review gate consumption flag. Defaults to
+ * `false` so the regime gates stay dormant until QA flips them on (soft-
+ * launch, mirroring {@link resolveDemoCostModel}). Only an explicit `true`
+ * enables the path — `undefined` (legacy snapshots) and `false` both keep the
+ * engine on its pre-TRA-389 behaviour.
+ */
+export function resolveMarketReviewGatesEnabled(s: AccountSettings): boolean {
+  return s.marketReviewGatesEnabled === true;
 }
 
 /** TRA-373 — spec defaults for the RV scanner DTE window. */
@@ -1432,6 +1455,37 @@ export interface MarketReview {
   gates: MarketReviewGates;
   /** Always `auto` — distinguishes from a hand-written QuantTrader review. */
   source: 'auto';
+}
+
+/** TRA-389 — one strategy the regime gates suppress, plus the reason why. */
+export interface GatedStrategyNote {
+  /** Strategy label, e.g. `ORB longs`, `ORB shorts`, `Breakouts (ORB)`. */
+  strategy: string;
+  /** Human reason the regime gate suppressed it. */
+  reason: string;
+}
+
+/**
+ * TRA-389 — market-review regime context surfaced in the signal engine's
+ * state envelope (`EngineState.marketReview`) so the dashboard can render
+ * "Regime: 🟡 YELLOW" and explain why a strategy stopped firing.
+ *
+ * `enabled` is `false` — and the remaining fields null / empty — whenever the
+ * TRA-389 consumption flag ({@link AccountSettings.marketReviewGatesEnabled})
+ * is off or no premarket review has been generated yet, so the dashboard can
+ * branch on a single boolean.
+ */
+export interface EngineMarketReviewState {
+  /** True when the consumption path is flagged on AND a review is cached. */
+  enabled: boolean;
+  /** ET date (`YYYY-MM-DD`) of the premarket review the gates were read from. */
+  reviewDate: string | null;
+  regime: MarketRegimeLabel | null;
+  /** Human rationale for the regime, copied from the cached review. */
+  regimeRationale: string | null;
+  gates: MarketReviewGates | null;
+  /** Strategies the regime gates currently suppress, with a human reason. */
+  gatedStrategies: GatedStrategyNote[];
 }
 
 export interface CryptoSymbolState {

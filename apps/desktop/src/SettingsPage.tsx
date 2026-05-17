@@ -1205,6 +1205,33 @@ export default function SettingsPage({ token, httpUrl, context, onModeChange, on
               })()}
             </div>
 
+            {/* TRA-389 — opt-in for the market-review regime gates. Default
+                off (soft-launch): until checked the engine ignores the
+                TRA-386 regime review entirely. Stocks-only — the gates
+                govern equity (ORB) signals. */}
+            {(!context || context === 'stocks') && (
+              <div className="settings-field" style={{ marginTop: '0.5rem' }}>
+                <label className="checkbox-option">
+                  <input
+                    type="checkbox"
+                    checked={settings.marketReviewGatesEnabled === true}
+                    onChange={e => set('marketReviewGatesEnabled', e.target.checked)}
+                  />
+                  <span>
+                    <strong>Apply market-review regime gates</strong>
+                    <p className="field-hint">
+                      Let the automated pre-market review (S&amp;P 500 / VIX / 10Y
+                      yield regime) gate the signal engine: suppress ORB long /
+                      short and breakout entries in an unfavourable tape, and trim
+                      position sizing in elevated-volatility or high-rate regimes.
+                      Off by default — turn on to roll it out. Applies to demo and
+                      live stock trading; the active regime shows on the Signals tab.
+                    </p>
+                  </span>
+                </label>
+              </div>
+            )}
+
             <div className="settings-actions-row">
               <button
                 type="button"

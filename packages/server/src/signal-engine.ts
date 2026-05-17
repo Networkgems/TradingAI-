@@ -1,7 +1,8 @@
 import { OrbStrategy, BbFadeStrategy, IchimokuStrategy, TradierOptionsClient, TradierOrderClient, TRADIER_REJECTED_STATUSES } from '@trading-app/engine';
 import type { TradierAccountBalance } from '@trading-app/engine';
-import { WATCHLIST, MANAGED_ACCOUNT_RATIO, MAX_CONSECUTIVE_LOSSES, DAILY_DRAWDOWN_HALT_PCT, OPTIONS_POSITION_CAP_RATIO, aliasWatchlistSymbol, isLiveTradierOptionsEnabled, isStockMarketOpen, resolveAutoManageImportedTradierOptions, resolveDemoCostModel, resolveLiveTradeEquitiesTradier, resolveManagedAccountRatio, resolveRiskPerTrade, resolveRvDtePrefs, resolveTradierOptionsCreds, DEFAULT_RV_DTE_MIN, DEFAULT_RV_DTE_MAX, DEFAULT_RV_DTE_TARGET } from '@trading-app/shared';
-import type { TradeSignal, RelativeValueSignal, Candle, OptionsAccountState, SignalType, Position, AccountSettings, AccountState, NewsItem, TradierEnv } from '@trading-app/shared';
+import { WATCHLIST, MANAGED_ACCOUNT_RATIO, MAX_CONSECUTIVE_LOSSES, DAILY_DRAWDOWN_HALT_PCT, OPTIONS_POSITION_CAP_RATIO, aliasWatchlistSymbol, isLiveTradierOptionsEnabled, isStockMarketOpen, resolveAutoManageImportedTradierOptions, resolveDemoCostModel, resolveLiveTradeEquitiesTradier, resolveManagedAccountRatio, resolveMarketReviewGatesEnabled, resolveRiskPerTrade, resolveRvDtePrefs, resolveTradierOptionsCreds, DEFAULT_RV_DTE_MIN, DEFAULT_RV_DTE_MAX, DEFAULT_RV_DTE_TARGET } from '@trading-app/shared';
+import type { TradeSignal, RelativeValueSignal, Candle, OptionsAccountState, SignalType, Position, AccountSettings, AccountState, NewsItem, TradierEnv, MarketReview, MarketReviewGates, EngineMarketReviewState, GatedStrategyNote } from '@trading-app/shared';
+import { getLatestMarketReview } from './market-review.js';
 import { fetchMinuteBars, fetchQuotes, fetchStocksNews, isYahooBreakerOpen, setActiveInterestSymbols } from './yahoo-feed.js';
 import { PaperAccount } from './paper-account.js';
 import { PaperOptionsAccount } from './options-account.js';
@@ -45,6 +46,12 @@ export interface EngineState {
   autoTradingEnabled: boolean;
   /** True when US stock market is currently open (weekdays 9:30 AM–4 PM ET). */
   marketOpen: boolean;
+  /**
+   * TRA-389 — market-review regime context. `enabled` is false when the
+   * consumption flag is off or no review has been generated yet, so the
+   * dashboard can branch on one boolean before rendering the regime banner.
+   */
+  marketReview: EngineMarketReviewState;
 }
 
 export type EngineEventHandler = (state: EngineState) => void;
@@ -93,6 +100,81 @@ function activeOptionsDailyLimit(settings?: AccountSettings): number | undefined
 // chain cache. RV is the *only* options strategy enabled for stock options
 // (TRA-191 directive); ATM auto-open and OTM scans are disabled below.
 const RV_SCAN_INTERVAL_MS = 5 * 60_000;
+
+/**
+ * TRA-389 — how often the engine re-reads the persisted premarket
+ * MarketReview. The review only changes twice a day (9 AM / 9 PM ET
+ * scheduler hooks), so a 5-minute cache keeps the per-tick gate read off
+ * disk while still picking up a fresh review well within the trading day.
+ */
+const MARKET_REVIEW_REFRESH_MS = 5 * 60_000;
+
+/**
+ * TRA-389 — strategy suppression reason for `signal` under the regime
+ * `gates`, or `null` when the regime permits the signal to route.
+ *
+ * The signal engine runs three equity strategies — ORB (`orb_breakout`),
+ * BB-fade (`bb_fade`), and Ichimoku (`ichimoku`). Only ORB is a breakout
+ * strategy, so the breakout / ORB-direction gates scope to `orb_breakout`:
+ *
+ *   - `breakoutsEnabled === false` → suppress every ORB signal (VIX > 22 —
+ *     the regime classifier disables breakouts in a high-volatility tape).
+ *   - `orbLongs === false` → suppress ORB longs (S&P 500 below its 20-DMA).
+ *   - `orbShorts === false` → suppress ORB shorts (tape not in a downtrend).
+ *
+ * BB-fade and Ichimoku are not breakout strategies and carry no per-signal
+ * suppression gate. `meanReversionTilt` is a *tilt* — surfaced in the engine
+ * state envelope as regime context, not a kill-switch — so it never suppresses
+ * a signal here (mean reversion stays available across regimes; the tilt only
+ * tells the dashboard the VIX is in the 16–22 band).
+ */
+export function gateSignalOnReview(
+  signal: TradeSignal,
+  gates: MarketReviewGates,
+): string | null {
+  if (signal.type !== 'orb_breakout') return null;
+  if (!gates.breakoutsEnabled) {
+    return 'Breakouts disabled by market-review regime (VIX > 22 — high-volatility tape)';
+  }
+  if (signal.side === 'buy' && !gates.orbLongs) {
+    return 'ORB longs gated off by market-review regime (S&P 500 below its 20-DMA)';
+  }
+  if (signal.side === 'sell' && !gates.orbShorts) {
+    return 'ORB shorts gated off by market-review regime (tape not in a downtrend)';
+  }
+  return null;
+}
+
+/**
+ * TRA-389 — human-readable list of strategies the regime gates currently
+ * suppress. Drives the `gatedStrategies` field of the engine state envelope
+ * so the dashboard can explain why a strategy stopped firing. When breakouts
+ * are off the whole ORB strategy is gated, so we list it once rather than
+ * double-listing the long / short legs.
+ */
+export function describeGatedStrategies(gates: MarketReviewGates): GatedStrategyNote[] {
+  const notes: GatedStrategyNote[] = [];
+  if (!gates.breakoutsEnabled) {
+    notes.push({
+      strategy: 'Breakouts (ORB)',
+      reason: 'VIX > 22 — high-volatility tape',
+    });
+    return notes;
+  }
+  if (!gates.orbLongs) {
+    notes.push({
+      strategy: 'ORB longs',
+      reason: 'S&P 500 below its 20-DMA (downtrend)',
+    });
+  }
+  if (!gates.orbShorts) {
+    notes.push({
+      strategy: 'ORB shorts',
+      reason: 'Tape not in a downtrend',
+    });
+  }
+  return notes;
+}
 
 /**
  * Tracks daily consecutive losses and cumulative P&L to enforce circuit-breakers:
@@ -297,6 +379,24 @@ export class SignalEngine {
   /** TRA-335 — Tradier order id (entry leg) → local Position id, used for reconcile. */
   private liveEquityOrderIds: Map<string, number | string> = new Map();
 
+  /**
+   * TRA-389 — when true, the engine consults the latest premarket
+   * {@link MarketReview} each tick and suppresses / re-sizes equity signals
+   * per its gates. Sourced from {@link resolveMarketReviewGatesEnabled};
+   * defaults to false so the regime gates stay dormant until QA opts in
+   * (soft-launch, same pattern as the TRA-374 demo cost model).
+   */
+  private marketReviewGatesEnabled = false;
+  /**
+   * TRA-389 — cached premarket {@link MarketReview}. Refreshed at most every
+   * {@link MARKET_REVIEW_REFRESH_MS} so the per-tick gate read doesn't hit
+   * disk on every 30s tick. Null until the first refresh, when the flag is
+   * off, or when no review has been generated yet — all of which the gate
+   * logic treats as "no gates, route normally".
+   */
+  private cachedMarketReview: MarketReview | null = null;
+  private lastMarketReviewFetchAt = 0;
+
   constructor(settings?: AccountSettings, tracker?: PnlTracker, rvScanner?: RelativeValueScannerService) {
     this.tracker = tracker;
     this.rvScanner = rvScanner;
@@ -373,6 +473,10 @@ export class SignalEngine {
       this.rvDteMin = dte.min;
       this.rvDteMax = dte.max;
       this.rvDteTarget = dte.target;
+      // TRA-389 — seed the market-review gate flag from saved settings so an
+      // engine boot picks up the user's opt-in without waiting for the first
+      // applySettings call. Default off when no settings are provided.
+      this.marketReviewGatesEnabled = resolveMarketReviewGatesEnabled(settings);
     }
   }
 
@@ -470,6 +574,15 @@ export class SignalEngine {
     this.rvDteMin = dte.min;
     this.rvDteMax = dte.max;
     this.rvDteTarget = dte.target;
+    // TRA-389 — re-read the market-review gate flag so toggling it in
+    // Settings takes effect on the next tick without a server restart. When
+    // the flag is switched off, drop the cached review so a stale regime
+    // can't keep gating signals after the user opted out.
+    this.marketReviewGatesEnabled = resolveMarketReviewGatesEnabled(settings);
+    if (!this.marketReviewGatesEnabled) {
+      this.cachedMarketReview = null;
+      this.lastMarketReviewFetchAt = 0;
+    }
     if (this.mode === 'live') {
       // TRA-226 — fetch the Tradier balance immediately so the broadcast that
       // follows in the PUT /api/account/settings handler reflects the user's
@@ -629,6 +742,18 @@ export class SignalEngine {
       const news = await fetchStocksNews(this.getActiveSymbols());
       if (news.length > 0) this.newsCache = news;
       this.lastNewsRefresh = Date.now();
+    }
+
+    // TRA-389 — refresh the cached premarket market-review so the per-tick
+    // gate read stays off disk. Only when the consumption flag is on;
+    // getLatestMarketReview returns null before the first review of the
+    // process's lifetime, which the gate logic treats as "no gates".
+    if (
+      this.marketReviewGatesEnabled
+      && Date.now() - this.lastMarketReviewFetchAt > MARKET_REVIEW_REFRESH_MS
+    ) {
+      this.cachedMarketReview = await getLatestMarketReview('premarket').catch(() => null);
+      this.lastMarketReviewFetchAt = Date.now();
     }
 
     // TRA-226 — keep the live Tradier equity figure fresh while in live mode.
@@ -895,6 +1020,23 @@ export class SignalEngine {
           // can scope this entry to the demo (or live) mode it fired under.
           signal.mode = this.mode;
 
+          // TRA-389 — market-review regime gates. When the consumption path
+          // is flagged on and a premarket review is cached, suppress signals
+          // the regime gates declined to route (ORB longs/shorts, breakouts).
+          // The signal is still recorded with a `signalSkipReason` so the
+          // dashboard shows the strategy fired and why we declined — mirrors
+          // the live-skip surfacing below. No position (paper or broker) is
+          // opened for a suppressed signal.
+          if (this.marketReviewGatesEnabled && this.cachedMarketReview) {
+            const gateSkip = gateSignalOnReview(signal, this.cachedMarketReview.gates);
+            if (gateSkip) {
+              signal.signalSkipReason = gateSkip;
+              this.recentSignals.unshift(signal);
+              if (this.recentSignals.length > MAX_SIGNALS) this.recentSignals.pop();
+              continue;
+            }
+          }
+
           // TRA-335 — in live mode, mirror the equity entry as a Tradier
           // OTOCO bracket order. We submit the broker order *first* so the
           // local Position only mirrors a confirmed fill (or a synchronous
@@ -936,9 +1078,12 @@ export class SignalEngine {
           // off the cached Tradier balance (not paper-account cash) so we pass
           // the resolved qty into a thin local-mirror open instead of letting
           // PaperAccount.openPosition re-size.
+          // TRA-389 — scale the paper open by the market-review position-size
+          // multiplier (1 when the regime-gate path is off). The live path
+          // applied the same scalar inside `placeTradierEquityBracket`.
           const pos = this.mode === 'live'
             ? this.openLiveEquityMirror(signal, price, liveOrderId!)
-            : this.account.openPosition(signal, price);
+            : this.account.openPosition(signal, price, this.activeSizingMultiplier());
           if (pos) {
             // TRA-231 — same rationale as the signal stamp above; the closed-
             // positions list is filtered per-mode in getState().
@@ -2239,6 +2384,7 @@ export class SignalEngine {
         haltReason: this.riskGovernor.getHaltReason(),
         autoTradingEnabled: this.isAutoTradingEnabled(),
         marketOpen: isStockMarketOpen(),
+        marketReview: this.buildMarketReviewState(),
       };
     }
     return {
@@ -2252,6 +2398,7 @@ export class SignalEngine {
       haltReason: this.riskGovernor.getHaltReason(),
       autoTradingEnabled: this.isAutoTradingEnabled(),
       marketOpen: isStockMarketOpen(),
+      marketReview: this.buildMarketReviewState(),
     };
   }
 
@@ -2339,6 +2486,46 @@ export class SignalEngine {
   }
 
   /**
+   * TRA-389 — active position-size scalar from the cached regime gates.
+   * Returns 1 (no-op) when the consumption flag is off or no review is
+   * cached, so non-opted-in deployments size exactly as before.
+   */
+  private activeSizingMultiplier(): number {
+    if (this.marketReviewGatesEnabled && this.cachedMarketReview) {
+      return this.cachedMarketReview.gates.sizingMultiplier;
+    }
+    return 1;
+  }
+
+  /**
+   * TRA-389 — build the market-review envelope surfaced in `getState()`.
+   * When the consumption flag is off or no review has been cached yet,
+   * `enabled` is false and the rest of the fields are null / empty so the
+   * dashboard can branch on one boolean.
+   */
+  private buildMarketReviewState(): EngineMarketReviewState {
+    const review = this.cachedMarketReview;
+    if (!this.marketReviewGatesEnabled || !review) {
+      return {
+        enabled: false,
+        reviewDate: null,
+        regime: null,
+        regimeRationale: null,
+        gates: null,
+        gatedStrategies: [],
+      };
+    }
+    return {
+      enabled: true,
+      reviewDate: review.date,
+      regime: review.regime,
+      regimeRationale: review.regimeRationale,
+      gates: review.gates,
+      gatedStrategies: describeGatedStrategies(review.gates),
+    };
+  }
+
+  /**
    * TRA-335 — true when a live equity position with the same symbol +
    * strategy type is already open. Mirrors
    * `PaperAccount.hasOpenPositionForSignalType` for the live store.
@@ -2377,6 +2564,8 @@ export class SignalEngine {
       entryPrice: signal.entryPrice,
       stopPrice: signal.stopLoss,
       currentPrice,
+      // TRA-389 — trim the live order by the regime position-size scalar.
+      sizeMultiplier: this.activeSizingMultiplier(),
     });
     if (qty <= 0) {
       return {
@@ -2440,6 +2629,9 @@ export class SignalEngine {
       entryPrice: signal.entryPrice,
       stopPrice: signal.stopLoss,
       currentPrice,
+      // TRA-389 — keep the local mirror's qty in lockstep with the broker
+      // order placed by `placeTradierEquityBracket` (same regime scalar).
+      sizeMultiplier: this.activeSizingMultiplier(),
     });
     if (qty <= 0) return null;
     const position: Position = {
@@ -2640,6 +2832,14 @@ export function sizeLiveEquityFromStop(args: {
   entryPrice: number;
   stopPrice: number;
   currentPrice: number;
+  /**
+   * TRA-389 — market-review position-size scalar in (0,1]. Applied to the
+   * final share count after all risk / equity / buying-power caps so the
+   * regime trim composes cleanly with the existing limits. Omitted ↔ 1
+   * (no trim), so callers that haven't opted into the regime gates size
+   * exactly as before.
+   */
+  sizeMultiplier?: number;
 }): number {
   const { balance, managedAccountRatio, riskPerTrade, entryPrice, stopPrice, currentPrice } = args;
   const dist = Math.abs(entryPrice - stopPrice);
@@ -2656,6 +2856,10 @@ export function sizeLiveEquityFromStop(args: {
   const sbp = balance.stockBuyingPower;
   if (typeof sbp === 'number' && sbp > 0) {
     qty = Math.min(qty, Math.floor(sbp / currentPrice));
+  }
+  const mult = args.sizeMultiplier;
+  if (typeof mult === 'number' && Number.isFinite(mult) && mult > 0 && mult < 1) {
+    qty = Math.floor(qty * mult);
   }
   return qty > 0 ? qty : 0;
 }

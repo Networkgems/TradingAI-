@@ -1,5 +1,6 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
-import { SignalEngine, sizeLiveEquityFromStop } from './signal-engine.js';
+import { SignalEngine, sizeLiveEquityFromStop, gateSignalOnReview, describeGatedStrategies } from './signal-engine.js';
+import { PaperAccount } from './paper-account.js';
 import type { RelativeValueScannerService, RelativeValueScanResult } from './relative-value-scanner.js';
 import type { RelativeValueCandidate, TradierAccountBalance, TradierOptionsClient, TradierOrderClient } from '@trading-app/engine';
 import {
@@ -8,8 +9,16 @@ import {
   isLiveTradierOptionsEnabled,
   resolveLiveTradeEquitiesTradier,
   resolveLiveTradierMarkets,
+  resolveMarketReviewGatesEnabled,
 } from '@trading-app/shared';
-import type { AccountSettings, TradeSignal, TradierEnv } from '@trading-app/shared';
+import type {
+  AccountSettings,
+  TradeSignal,
+  TradierEnv,
+  MarketReview,
+  MarketReviewGates,
+  MarketRegimeLabel,
+} from '@trading-app/shared';
 
 // Inside an ET trading window: 10:00 AM ET on a Tuesday → 14:00 UTC during EDT.
 const TRADING_TIME = Date.parse('2024-06-04T14:00:00Z');
@@ -2019,5 +2028,228 @@ describe('SignalEngine — TRA-361 submitStagedOptionExits pricing', () => {
 
     expect(stub.sellContracts).toHaveBeenCalledWith('NFLX260515P00400000', 1);
     expect(stub.sellContractsLimit).not.toHaveBeenCalled();
+  });
+});
+
+// ── TRA-389 — market-review regime gate consumption ──────────────────────────
+
+describe('TRA-389 — market-review regime gates', () => {
+  function gates(o: Partial<MarketReviewGates> = {}): MarketReviewGates {
+    return {
+      orbLongs: true,
+      orbShorts: true,
+      meanReversionTilt: false,
+      breakoutsEnabled: true,
+      sizingMultiplier: 1,
+      ...o,
+    };
+  }
+
+  function sig(o: Partial<TradeSignal> = {}): TradeSignal {
+    return {
+      id: 'sig-1',
+      symbol: 'AAPL',
+      type: 'orb_breakout',
+      side: 'buy',
+      entryPrice: 100,
+      stopLoss: 95,
+      takeProfit: 110,
+      riskRewardRatio: 2,
+      timestamp: TRADING_TIME,
+      ...o,
+    };
+  }
+
+  function review(
+    g: Partial<MarketReviewGates> = {},
+    regime: MarketRegimeLabel = 'yellow',
+  ): MarketReview {
+    return {
+      id: 'premarket-2024-06-04',
+      kind: 'premarket',
+      date: '2024-06-04',
+      generatedAt: new Date(TRADING_TIME).toISOString(),
+      regime,
+      regimeRationale: 'test rationale',
+      indexes: [],
+      gates: gates(g),
+      source: 'auto',
+    };
+  }
+
+  describe('gateSignalOnReview — per-gate suppression paths', () => {
+    it('orbLongs=false suppresses ORB longs but not ORB shorts', () => {
+      const g = gates({ orbLongs: false });
+      expect(gateSignalOnReview(sig({ side: 'buy' }), g)).toMatch(/ORB longs gated off/);
+      expect(gateSignalOnReview(sig({ side: 'sell' }), g)).toBeNull();
+    });
+
+    it('orbShorts=false suppresses ORB shorts but not ORB longs', () => {
+      const g = gates({ orbShorts: false });
+      expect(gateSignalOnReview(sig({ side: 'sell' }), g)).toMatch(/ORB shorts gated off/);
+      expect(gateSignalOnReview(sig({ side: 'buy' }), g)).toBeNull();
+    });
+
+    it('breakoutsEnabled=false suppresses every ORB signal regardless of side', () => {
+      const g = gates({ breakoutsEnabled: false });
+      expect(gateSignalOnReview(sig({ side: 'buy' }), g)).toMatch(/Breakouts disabled/);
+      expect(gateSignalOnReview(sig({ side: 'sell' }), g)).toMatch(/Breakouts disabled/);
+    });
+
+    it('all gates open routes the signal (no suppression reason)', () => {
+      expect(gateSignalOnReview(sig({ side: 'buy' }), gates())).toBeNull();
+      expect(gateSignalOnReview(sig({ side: 'sell' }), gates())).toBeNull();
+    });
+
+    it('never suppresses non-breakout strategies (bb_fade / ichimoku)', () => {
+      // Even with every ORB-relevant gate slammed shut, bb_fade and ichimoku
+      // are not breakout strategies and route normally — meanReversionTilt is
+      // a regime *tilt*, not a kill-switch.
+      const g = gates({ orbLongs: false, orbShorts: false, breakoutsEnabled: false });
+      expect(gateSignalOnReview(sig({ type: 'bb_fade', side: 'buy' }), g)).toBeNull();
+      expect(gateSignalOnReview(sig({ type: 'bb_fade', side: 'sell' }), g)).toBeNull();
+      expect(gateSignalOnReview(sig({ type: 'ichimoku', side: 'buy' }), g)).toBeNull();
+    });
+
+    it('meanReversionTilt does not gate any signal on its own', () => {
+      // Tilt off vs on must not change routing — it is surfaced as regime
+      // context only. bb_fade routes in both cases.
+      expect(gateSignalOnReview(sig({ type: 'bb_fade' }), gates({ meanReversionTilt: false }))).toBeNull();
+      expect(gateSignalOnReview(sig({ type: 'bb_fade' }), gates({ meanReversionTilt: true }))).toBeNull();
+    });
+  });
+
+  describe('describeGatedStrategies', () => {
+    it('lists nothing when every gate is open', () => {
+      expect(describeGatedStrategies(gates())).toEqual([]);
+    });
+
+    it('lists ORB longs / shorts independently when each is gated', () => {
+      expect(describeGatedStrategies(gates({ orbLongs: false })).map(n => n.strategy))
+        .toEqual(['ORB longs']);
+      expect(describeGatedStrategies(gates({ orbShorts: false })).map(n => n.strategy))
+        .toEqual(['ORB shorts']);
+      expect(describeGatedStrategies(gates({ orbLongs: false, orbShorts: false })).map(n => n.strategy))
+        .toEqual(['ORB longs', 'ORB shorts']);
+    });
+
+    it('collapses to a single ORB entry when breakouts are disabled', () => {
+      // breakoutsEnabled=false gates the whole strategy, so the long / short
+      // legs are not double-listed.
+      const notes = describeGatedStrategies(gates({ orbLongs: false, orbShorts: true, breakoutsEnabled: false }));
+      expect(notes).toHaveLength(1);
+      expect(notes[0].strategy).toBe('Breakouts (ORB)');
+    });
+  });
+
+  describe('sizeLiveEquityFromStop — sizingMultiplier path (TRA-389)', () => {
+    const balance: TradierAccountBalance = {
+      totalEquity: 25_000,
+      totalCash: 10_000,
+      optionBuyingPower: 10_000,
+      stockBuyingPower: 20_000,
+      longMarketValue: 15_000,
+    };
+    const base = {
+      balance,
+      managedAccountRatio: 0.5,
+      riskPerTrade: 0.01,
+      entryPrice: 100,
+      stopPrice: 95,
+      currentPrice: 100,
+    };
+
+    it('trims the share count by the multiplier and floors to whole shares', () => {
+      // Un-trimmed qty is 25 (see TRA-335 suite). 0.5× → floor(12.5) = 12.
+      expect(sizeLiveEquityFromStop(base)).toBe(25);
+      expect(sizeLiveEquityFromStop({ ...base, sizeMultiplier: 0.5 })).toBe(12);
+    });
+
+    it('treats an absent / 1 / out-of-range multiplier as no trim', () => {
+      expect(sizeLiveEquityFromStop({ ...base, sizeMultiplier: 1 })).toBe(25);
+      expect(sizeLiveEquityFromStop({ ...base, sizeMultiplier: 0 })).toBe(25);
+      expect(sizeLiveEquityFromStop({ ...base, sizeMultiplier: Number.NaN })).toBe(25);
+    });
+  });
+
+  describe('PaperAccount.openPosition — sizingMultiplier path (TRA-389)', () => {
+    it('scales the opened quantity by the multiplier', () => {
+      const acct = new PaperAccount({ initialEquity: 100_000, managedAccountRatio: 1, riskPerTrade: 0.01 });
+      const full = acct.openPosition(sig(), 100);
+      const acct2 = new PaperAccount({ initialEquity: 100_000, managedAccountRatio: 1, riskPerTrade: 0.01 });
+      const trimmed = acct2.openPosition(sig(), 100, 0.5);
+      expect(full).not.toBeNull();
+      expect(trimmed).not.toBeNull();
+      expect(trimmed!.quantity).toBe(Math.floor(full!.quantity * 0.5));
+    });
+
+    it('multiplier of 1 leaves sizing unchanged', () => {
+      const acct = new PaperAccount({ initialEquity: 100_000, managedAccountRatio: 1, riskPerTrade: 0.01 });
+      const a = acct.openPosition(sig(), 100);
+      const acct2 = new PaperAccount({ initialEquity: 100_000, managedAccountRatio: 1, riskPerTrade: 0.01 });
+      const b = acct2.openPosition(sig(), 100, 1);
+      expect(a!.quantity).toBe(b!.quantity);
+    });
+  });
+
+  describe('resolveMarketReviewGatesEnabled', () => {
+    it('defaults off — absent or false both resolve false, only explicit true enables', () => {
+      expect(resolveMarketReviewGatesEnabled(DEFAULT_ACCOUNT_SETTINGS)).toBe(false);
+      expect(resolveMarketReviewGatesEnabled({ ...DEFAULT_ACCOUNT_SETTINGS, marketReviewGatesEnabled: undefined })).toBe(false);
+      expect(resolveMarketReviewGatesEnabled({ ...DEFAULT_ACCOUNT_SETTINGS, marketReviewGatesEnabled: false })).toBe(false);
+      expect(resolveMarketReviewGatesEnabled({ ...DEFAULT_ACCOUNT_SETTINGS, marketReviewGatesEnabled: true })).toBe(true);
+    });
+  });
+
+  describe('SignalEngine — flag plumbing + state envelope', () => {
+    const flag = (e: SignalEngine) =>
+      (e as unknown as { marketReviewGatesEnabled: boolean }).marketReviewGatesEnabled;
+
+    it('constructs with the flag off by default and on when the setting is true', () => {
+      expect(flag(new SignalEngine({ ...DEFAULT_ACCOUNT_SETTINGS }))).toBe(false);
+      expect(flag(new SignalEngine({ ...DEFAULT_ACCOUNT_SETTINGS, marketReviewGatesEnabled: true }))).toBe(true);
+    });
+
+    it('applySettings flips the flag and drops the cached review when turned off', async () => {
+      const engine = new SignalEngine({ ...DEFAULT_ACCOUNT_SETTINGS, marketReviewGatesEnabled: true });
+      // Seed a cached review as the doTick refresh would.
+      (engine as unknown as { cachedMarketReview: MarketReview }).cachedMarketReview = review();
+      await engine.applySettings({ ...DEFAULT_ACCOUNT_SETTINGS, marketReviewGatesEnabled: false });
+      expect(flag(engine)).toBe(false);
+      expect((engine as unknown as { cachedMarketReview: MarketReview | null }).cachedMarketReview).toBeNull();
+
+      await engine.applySettings({ ...DEFAULT_ACCOUNT_SETTINGS, marketReviewGatesEnabled: true });
+      expect(flag(engine)).toBe(true);
+    });
+
+    it('getState surfaces a disabled envelope when the flag is off', () => {
+      const engine = new SignalEngine({ ...DEFAULT_ACCOUNT_SETTINGS });
+      const mr = engine.getState().marketReview;
+      expect(mr.enabled).toBe(false);
+      expect(mr.regime).toBeNull();
+      expect(mr.gatedStrategies).toEqual([]);
+    });
+
+    it('getState surfaces the regime + gated strategies once a review is cached', () => {
+      const engine = new SignalEngine({ ...DEFAULT_ACCOUNT_SETTINGS, marketReviewGatesEnabled: true });
+      (engine as unknown as { cachedMarketReview: MarketReview }).cachedMarketReview =
+        review({ orbLongs: false, sizingMultiplier: 0.75 }, 'yellow');
+      const mr = engine.getState().marketReview;
+      expect(mr.enabled).toBe(true);
+      expect(mr.regime).toBe('yellow');
+      expect(mr.reviewDate).toBe('2024-06-04');
+      expect(mr.gates?.sizingMultiplier).toBe(0.75);
+      expect(mr.gatedStrategies.map(n => n.strategy)).toEqual(['ORB longs']);
+    });
+
+    it('activeSizingMultiplier is 1 when off and the gate value when on', () => {
+      const engine = new SignalEngine({ ...DEFAULT_ACCOUNT_SETTINGS, marketReviewGatesEnabled: true });
+      const mult = () => (engine as unknown as { activeSizingMultiplier(): number }).activeSizingMultiplier();
+      // No cached review yet → no trim.
+      expect(mult()).toBe(1);
+      (engine as unknown as { cachedMarketReview: MarketReview }).cachedMarketReview =
+        review({ sizingMultiplier: 0.5 });
+      expect(mult()).toBe(0.5);
+    });
   });
 });
