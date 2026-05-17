@@ -1,0 +1,113 @@
+{
+  "generatedAt": "2026-05-17T20:28:38.930Z",
+  "issue": "TRA-423",
+  "spec": "TRA-411 correlation-cap-spec §8",
+  "oosWindow": {
+    "start": "2025-01-01T00:00:00.000Z",
+    "end": "2026-05-17T20:28:37.258Z"
+  },
+  "initialEquity": 25000,
+  "barTimeframe": "4h",
+  "dataSource": "coinbase-exchange",
+  "capConfig": "recommended defaults (TRA-411 §5)",
+  "cells": [
+    {
+      "symbol": "BTC-USD",
+      "capOff": {
+        "trades": 25,
+        "winRatePct": 20,
+        "expectancyR": -0.3251887889339315,
+        "sharpe": -0.23150853036418642,
+        "maxDdPct": 4.9293411393455635,
+        "totalPnlUsd": -250.91811037306692,
+        "worstCasePnlUsd": -250.91811037306692,
+        "returnPct": -1.0036724414922675,
+        "worstCaseReturnPct": -1.0036724414922675,
+        "correlationCap": null,
+        "oosBlockBootstrap": {
+          "p5": 23552.100992745993,
+          "p50": 24756.531615204727,
+          "p95": 25955.16315687319,
+          "worstDdPct": 10.326594549937028,
+          "blockLen": 5,
+          "iterations": 3000
+        }
+      },
+      "capOn": {
+        "trades": 17,
+        "winRatePct": 29.411764705882355,
+        "expectancyR": 0.10226003630383801,
+        "sharpe": -0.09781034422038316,
+        "maxDdPct": 3.2940920851701785,
+        "totalPnlUsd": -78.7667639431412,
+        "worstCasePnlUsd": -78.7667639431412,
+        "returnPct": -0.31506705577256483,
+        "worstCaseReturnPct": -0.31506705577256483,
+        "correlationCap": {
+          "enabled": true,
+          "rejected": 8,
+          "scaledDown": 9
+        },
+        "oosBlockBootstrap": {
+          "p5": 24079.25926944556,
+          "p50": 24941.031030305112,
+          "p95": 25702.91059077514,
+          "worstDdPct": 7.41688435887458,
+          "blockLen": 5,
+          "iterations": 3000
+        }
+      }
+    },
+    {
+      "symbol": "SOL-USD",
+      "capOff": {
+        "trades": 35,
+        "winRatePct": 17.142857142857142,
+        "expectancyR": -0.47852961294086366,
+        "sharpe": -0.5721100562645541,
+        "maxDdPct": 5.99780610235683,
+        "totalPnlUsd": -959.9831908466462,
+        "worstCasePnlUsd": -959.9831908466462,
+        "returnPct": -3.8399327633865847,
+        "worstCaseReturnPct": -3.8399327633865847,
+        "correlationCap": null,
+        "oosBlockBootstrap": {
+          "p5": 22262.120861144358,
+          "p50": 23996.54181557032,
+          "p95": 26254.87921915947,
+          "worstDdPct": 14.663449238661094,
+          "blockLen": 5,
+          "iterations": 3000
+        }
+      },
+      "capOn": {
+        "trades": 19,
+        "winRatePct": 31.57894736842105,
+        "expectancyR": 0.1910349040058572,
+        "sharpe": -0.2008272307663389,
+        "maxDdPct": 2.5058899140162607,
+        "totalPnlUsd": -165.1780978309803,
+        "worstCasePnlUsd": -165.1780978309803,
+        "returnPct": -0.6607123913239212,
+        "worstCaseReturnPct": -0.6607123913239212,
+        "correlationCap": {
+          "enabled": true,
+          "rejected": 16,
+          "scaledDown": 4
+        },
+        "oosBlockBootstrap": {
+          "p5": 23690.16914989636,
+          "p50": 24842.137329913927,
+          "p95": 25948.02011327417,
+          "worstDdPct": 9.927423140283485,
+          "blockLen": 5,
+          "iterations": 3000
+        }
+      }
+    }
+  ],
+  "capBindsTotal": {
+    "rejected": 24,
+    "scaledDown": 13
+  }
+}
