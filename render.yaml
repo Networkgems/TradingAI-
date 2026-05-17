@@ -83,6 +83,23 @@ services:
       # still accepted (mapped to `bb_fade_sol_doge`) for revert safety.
       - key: LIVE_STRATEGY_PRESET
         value: bb_fade_sol_doge
+      # TRA-406 — observability. All optional; sane defaults apply when unset.
+      #   LOG_LEVEL          debug|info|warn|error (default info)
+      #   ERROR_WEBHOOK_URL  HTTPS endpoint captured errors are POSTed to
+      #                      (Sentry/Datadog ingest proxy, Slack webhook, …)
+      #   ALERT_EMAIL        comma-separated ops recipients for alert emails
+      #   ALERT_WEBHOOK_URL  HTTPS endpoint operational alerts are POSTed to
+      #   DISK_MIN_FREE_PCT  free-space % below which a disk alert fires (10)
+      - key: LOG_LEVEL
+        sync: false
+      - key: ERROR_WEBHOOK_URL
+        sync: false
+      - key: ALERT_EMAIL
+        sync: false
+      - key: ALERT_WEBHOOK_URL
+        sync: false
+      - key: DISK_MIN_FREE_PCT
+        sync: false
       # TRA-341 — process-wide override for the §6 single-symbol short cap on
       # the live perp router (fraction of strategy equity, e.g. `0.5` ↔ 50%).
       # Per-user `liveSingleSymbolShortCap` (Settings → Live Trading Risk)

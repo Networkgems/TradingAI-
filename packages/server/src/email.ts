@@ -100,3 +100,23 @@ export async function sendPasswordResetEmail(
 
   await transport.sendMail({ from: SMTP_FROM, to: toEmail, subject, text, html });
 }
+
+/**
+ * TRA-406 — send an operational alert email to the addresses in `ALERT_EMAIL`
+ * (comma-separated). No-ops cleanly when SMTP or `ALERT_EMAIL` is unconfigured
+ * so alerting still works (log + webhook) on a box without mail credentials.
+ */
+export async function sendOpsAlertEmail(subject: string, text: string): Promise<void> {
+  const recipients = (process.env.ALERT_EMAIL ?? '')
+    .split(',')
+    .map((s) => s.trim())
+    .filter(Boolean);
+  if (recipients.length === 0) return;
+
+  const transport = getTransport();
+  if (!transport) {
+    console.warn(`[email] ALERT (no SMTP configured) — ${subject}`);
+    return;
+  }
+  await transport.sendMail({ from: SMTP_FROM, to: recipients.join(','), subject, text });
+}

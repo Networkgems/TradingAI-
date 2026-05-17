@@ -3,6 +3,7 @@ import type { TradierAccountBalance } from '@trading-app/engine';
 import { WATCHLIST, MANAGED_ACCOUNT_RATIO, MAX_CONSECUTIVE_LOSSES, DAILY_DRAWDOWN_HALT_PCT, OPTIONS_POSITION_CAP_RATIO, aliasWatchlistSymbol, isLiveTradierOptionsEnabled, isStockMarketOpen, resolveAutoManageImportedTradierOptions, resolveDemoCostModel, resolveLiveTradeEquitiesTradier, resolveManagedAccountRatio, resolveMarketReviewGatesEnabled, resolveRiskPerTrade, resolveRvDtePrefs, resolveTradierOptionsCreds, DEFAULT_RV_DTE_MIN, DEFAULT_RV_DTE_MAX, DEFAULT_RV_DTE_TARGET } from '@trading-app/shared';
 import type { TradeSignal, RelativeValueSignal, Candle, OptionsAccountState, SignalType, Position, AccountSettings, AccountState, NewsItem, TradierEnv, MarketReview, MarketReviewGates, EngineMarketReviewState, GatedStrategyNote } from '@trading-app/shared';
 import { getLatestMarketReview } from './market-review.js';
+import { etDateString } from './scheduler.js';
 import { fetchMinuteBars, fetchQuotes, fetchStocksNews, isYahooBreakerOpen, setActiveInterestSymbols } from './yahoo-feed.js';
 import { PaperAccount } from './paper-account.js';
 import { PaperOptionsAccount } from './options-account.js';
@@ -17,6 +18,9 @@ import type { RelativeValueScannerService } from './relative-value-scanner.js';
 import type { DailySignalRecord } from './reports/eod-report.js';
 import type { PnlTracker } from './pnl-tracker.js';
 import { randomUUID } from 'crypto';
+import { logger } from './observability/index.js';
+
+const balanceLog = logger.child({ module: 'signal-engine' });
 
 export interface SymbolState {
   symbol: string;
@@ -63,6 +67,13 @@ const NEWS_REFRESH_MS = 5 * 60_000;
 // equity does not need second-level freshness — order fills come through
 // the trade path, not the balance poll.
 const TRADIER_BALANCE_REFRESH_MS = 2 * 60_000;
+// TRA-406 — staleness ceiling for the cached live Tradier balance. A failed
+// refresh keeps the previous snapshot so a transient blip doesn't flicker the
+// dashboard equity (see `refreshTradierBalance`). But a snapshot is only kept
+// while it is plausibly current: once the last *successful* fetch is older
+// than this, the stale figure is dropped to null rather than left on screen
+// indefinitely as if it were live broker truth.
+const TRADIER_BALANCE_STALE_MS = 10 * 60_000;
 // TRA-356 — cadence for the periodic Tradier portfolio reconcile. The tick
 // loop runs every 30s, so this guard is currently a no-op floor; we keep
 // it as a constant so the cadence is named and easy to slow down (e.g.
@@ -180,16 +191,29 @@ export function describeGatedStrategies(gates: MarketReviewGates): GatedStrategy
  * Tracks daily consecutive losses and cumulative P&L to enforce circuit-breakers:
  *   • Halt after MAX_CONSECUTIVE_LOSSES (3) consecutive losing trades
  *   • Halt if daily drawdown exceeds DAILY_DRAWDOWN_HALT_PCT (8%) of managed equity
+ *
+ * TRA-407 (C3) — the "trading day" rolls on the ET calendar date, not the UTC
+ * date. The scheduler runs in ET; rolling the governor's day on a UTC date
+ * string (`new Date().toISOString().slice(0, 10)`) advanced it 4–5 hours
+ * early — at UTC-midnight, which falls in the ET evening (≈19:00–20:00 ET).
+ * A halt set earlier that ET afternoon would then be dropped while the ET
+ * trading day was still in progress, re-enabling new entries before the day
+ * actually ended. `etDateString` (shared with `scheduler.ts`) closes that
+ * window. The `now` clock is injectable so the boundary is unit-testable.
  */
-class DailyRiskGovernor {
+export class DailyRiskGovernor {
   private consecutiveLosses = 0;
   private dailyPnl = 0;
-  private currentDay = new Date().toISOString().slice(0, 10);
+  private currentDay: string;
   private halted = false;
   private haltReason: string | null = null;
 
+  constructor(private readonly now: () => Date = () => new Date()) {
+    this.currentDay = etDateString(this.now());
+  }
+
   private resetIfNewDay(): void {
-    const today = new Date().toISOString().slice(0, 10);
+    const today = etDateString(this.now());
     if (today !== this.currentDay) {
       this.consecutiveLosses = 0;
       this.dailyPnl = 0;
@@ -285,6 +309,12 @@ export class SignalEngine {
 
   private tickTimer: ReturnType<typeof setInterval> | null = null;
   private tickRunning = false;
+  /**
+   * TRA-407 (C5) — the in-progress tick's promise (or a resolved promise when
+   * idle). `drain()` awaits this so a graceful shutdown finishes the current
+   * tick rather than being killed mid-tick.
+   */
+  private activeTick: Promise<void> = Promise.resolve();
   private handlers: EngineEventHandler[] = [];
   // TRA-229 — per-mode auto-trading flags. The active flag (consulted on each
   // tick and surfaced in getState()) is whichever one matches `this.mode`.
@@ -358,6 +388,9 @@ export class SignalEngine {
    */
   private liveTradierBalance: TradierAccountBalance | null = null;
   private lastTradierBalanceFetchAt = 0;
+  /** TRA-406 — timestamp of the last *successful* balance fetch (not merely
+   *  attempted). Drives the `TRADIER_BALANCE_STALE_MS` staleness timeout. */
+  private lastTradierBalanceSuccessAt = 0;
   /**
    * TRA-356 — last successful (or attempted) Tradier portfolio reconcile.
    * Compared against `TRADIER_PORTFOLIO_RECONCILE_MS` to gate the per-tick
@@ -719,15 +752,63 @@ export class SignalEngine {
     }
   }
 
+  /**
+   * TRA-407 (C5) — resolve once any in-progress tick has finished. The
+   * graceful-shutdown hook awaits this (after `stop()` has cleared the timer
+   * so no new tick starts) so the process drains the current tick instead of
+   * being killed mid-tick. Resolves immediately when idle and never rejects.
+   */
+  async drain(): Promise<void> {
+    await this.activeTick.catch(() => {});
+  }
+
+  /**
+   * TRA-407 (C5) — snapshot every Tradier order id currently in flight: a
+   * staged `sell_to_close` awaiting reconcile (`pendingCloseOrderId`) and an
+   * engine-staged exit with a broker id attached (`pendingExit`). The
+   * graceful-shutdown hook logs this so a redeploy mid-reconcile leaves a
+   * record of which broker orders the next boot's reconciler must resolve.
+   */
+  inFlightBrokerOrderIds(): Array<{
+    env: TradierEnv;
+    optionSymbol: string;
+    orderId: number | string;
+    kind: 'pending_close' | 'pending_exit';
+  }> {
+    const out: Array<{
+      env: TradierEnv;
+      optionSymbol: string;
+      orderId: number | string;
+      kind: 'pending_close' | 'pending_exit';
+    }> = [];
+    for (const env of Object.keys(this.optionsAccounts) as TradierEnv[]) {
+      const acct = this.optionsAccounts[env];
+      for (const row of acct.listPendingCloses()) {
+        out.push({ env, optionSymbol: row.optionSymbol, orderId: row.pendingCloseOrderId, kind: 'pending_close' });
+      }
+      for (const opt of acct.listPendingExits()) {
+        const id = opt.pendingExit?.tradierOrderId;
+        if (id === undefined || id === '') continue;
+        out.push({ env, optionSymbol: opt.optionSymbol ?? opt.symbol, orderId: id, kind: 'pending_exit' });
+      }
+    }
+    return out;
+  }
+
   refresh(): void {
     this.tick().catch((err: unknown) => {
       console.error('[signal-engine] refresh tick error:', err instanceof Error ? err.message : String(err));
     });
   }
 
-  private async tick(): Promise<void> {
-    if (this.tickRunning) return;
+  private tick(): Promise<void> {
+    if (this.tickRunning) return this.activeTick;
     this.tickRunning = true;
+    this.activeTick = this.runTickGuarded();
+    return this.activeTick;
+  }
+
+  private async runTickGuarded(): Promise<void> {
     try {
       await this.doTick();
     } catch (err: unknown) {
@@ -2664,12 +2745,22 @@ export class SignalEngine {
       const balance = await this.tradierLiveClient.getAccountBalance();
       if (balance) {
         this.liveTradierBalance = balance;
+        this.lastTradierBalanceSuccessAt = Date.now();
       }
     } catch (err: unknown) {
-      console.error(
-        '[signal-engine] Tradier balance refresh failed:',
-        err instanceof Error ? err.message : String(err),
-      );
+      // TRA-406 — log the failure (was `console.error`), and enforce a
+      // staleness timeout: if the last *successful* fetch is now older than
+      // `TRADIER_BALANCE_STALE_MS`, drop the cached snapshot rather than keep
+      // showing a stale balance as if it were live broker truth. The UI then
+      // surfaces an explicit $0 / unavailable state until the next good fetch.
+      const staleMs = Date.now() - this.lastTradierBalanceSuccessAt;
+      const dropped = this.liveTradierBalance !== null && staleMs > TRADIER_BALANCE_STALE_MS;
+      if (dropped) this.liveTradierBalance = null;
+      balanceLog.warn('Tradier balance refresh failed', {
+        reason: err instanceof Error ? err.message : String(err),
+        staleMs,
+        droppedStaleSnapshot: dropped,
+      });
     } finally {
       this.lastTradierBalanceFetchAt = Date.now();
     }

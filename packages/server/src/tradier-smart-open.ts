@@ -5,6 +5,9 @@ import {
   TRADIER_REJECTED_STATUSES,
   roundToCent,
 } from '@trading-app/engine';
+import { logger } from './observability/index.js';
+
+const openLog = logger.child({ module: 'tradier-smart-open' });
 
 /**
  * TRA-374 — outcome of {@link submitSmartBuyToOpen}. The live-entry mirror
@@ -163,8 +166,14 @@ export async function submitSmartBuyToOpen(
     // cancel call; either way, we proceed to the next attempt or return.
     try {
       await client.cancelOrder(order.id);
-    } catch {
+    } catch (err) {
       // Best-effort cleanup; the next limit submission still proceeds.
+      // TRA-406 — was a bare `catch {}`. Logged so a persistent cancel
+      // failure (a live limit that won't clear) is visible on the broker path.
+      openLog.warn('cancelOrder failed during smart-open walk', {
+        orderId: order.id,
+        reason: err instanceof Error ? err.message : String(err),
+      });
     }
   }
 

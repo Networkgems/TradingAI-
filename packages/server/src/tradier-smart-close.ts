@@ -6,6 +6,9 @@ import {
   TRADIER_TERMINAL_STATUSES,
   roundToCent,
 } from '@trading-app/engine';
+import { logger } from './observability/index.js';
+
+const closeLog = logger.child({ module: 'tradier-smart-close' });
 
 /**
  * TRA-352 — outcome of {@link submitSmartSellToClose}. The HTTP close handler
@@ -140,8 +143,16 @@ export async function submitSmartSellToClose(
     if (attempt < maxAttempts - 1) {
       try {
         await client.cancelOrder(order.id);
-      } catch {
+      } catch (err) {
         // Best-effort cleanup; the next limit submission still proceeds.
+        // TRA-406 — was a bare `catch {}`. Cancel failures are expected when
+        // the order already terminated, but on a broker path they must not be
+        // invisible: a repeated cancel failure can mean a stale live limit.
+        closeLog.warn('cancelOrder failed during smart-close walk', {
+          orderId: order.id,
+          attempt,
+          reason: err instanceof Error ? err.message : String(err),
+        });
       }
     }
   }

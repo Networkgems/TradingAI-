@@ -48,6 +48,23 @@ import {
   setUserLocked,
 } from './users.js';
 import { sendPasswordResetEmail } from './email.js';
+import {
+  logger,
+  flushLogs,
+  traceMiddleware,
+  setTraceUser,
+  installGlobalErrorHandlers,
+  errorMiddleware,
+  TradeAuditTracker,
+  getTradeOpenCount,
+  getRecentAlerts,
+  getErrorCountSince,
+  runHealthCheck,
+  checkDiskSpace,
+  recordBootAndCheckRestarts,
+  checkTradeVolume,
+  checkErrorSpike,
+} from './observability/index.js';
 import { rotateBackups, checkDataDirHealth } from './trade-store.js';
 import { TradierRelativeValueScannerService } from './relative-value-scanner.js';
 import { CoinbaseOrderClient, tradierBaseUrl, TradierOptionsClient } from '@trading-app/engine';
@@ -214,6 +231,11 @@ app.use((req, res, next) => {
   }
   next();
 });
+
+// TRA-406 — open a trace for every request so logs, captured errors and the
+// `X-Trace-Id` response header all correlate to the same request.
+app.use(traceMiddleware);
+
 app.use(express.json());
 
 // ── Auth middleware ───────────────────────────────────────────────────────────
@@ -234,6 +256,9 @@ function requireAuth(req: express.Request, res: express.Response, next: express.
     return;
   }
   res.locals['authUser'] = user;
+  // TRA-406 — stamp the authenticated user onto the request trace so every
+  // subsequent log line and captured error carries it.
+  setTraceUser(user);
   next();
 }
 
@@ -968,6 +993,17 @@ async function runChainRecord(): Promise<void> {
 
 app.get('/api/health', (_req, res) => {
   res.json({ ok: true, time: new Date().toISOString() });
+});
+
+// TRA-406 — observability surface. Returns the recent in-memory alerts and the
+// 15-minute captured-error count so QA / ops can see incident state without
+// shelling into the box. Gated by auth — alert detail can carry path/host info.
+app.get('/api/health/alerts', requireAuth, (_req, res) => {
+  res.json({
+    alerts: getRecentAlerts(),
+    errorCount15m: getErrorCountSince(),
+    time: new Date().toISOString(),
+  });
 });
 
 // TRA-398 — client-side error sink. The desktop/mobile React error boundary
@@ -1932,6 +1968,19 @@ app.post('/api/options/:id/close', requireAuth, async (req, res) => {
   // filled at 0.05 instead of ~0.11.
   const imported = ctx.engine.findImportedOption(id);
   if (imported) {
+    // TRA-407 (C4) — pending-close double-submit guard. The desktop UI
+    // already swaps the Close button for a disabled "Pending #N" badge once
+    // `pendingCloseOrderId` is set, but a stale client or a double-click
+    // landing before that state broadcasts round-trips can still POST a
+    // second close. Refuse server-side so a single contract can never have
+    // two live `sell_to_close` orders working at the broker at once.
+    if (imported.position.pendingCloseOrderId !== undefined) {
+      res.status(409).json({
+        error: 'A close order is already in flight for this position — wait for it to fill or be reconciled before closing again.',
+        pendingCloseOrderId: imported.position.pendingCloseOrderId,
+      });
+      return;
+    }
     const settings = getSettings(username);
     const client = buildTradierOptionsClientForEnv(settings, imported.env);
     if (!client) {
@@ -2740,11 +2789,20 @@ wss.on('connection', async (ws) => {
 });
 
 // Wire up per-user engine onTick → user-scoped WS broadcasts.
+//
+// TRA-406 — the same onTick stream feeds a TradeAuditTracker per engine. The
+// tracker diffs successive states so every position open/close (auto or
+// manual, demo or live) lands in `trade-audit.jsonl` without touching the
+// engine internals.
 function attachBroadcastHandlers(ctx: UserContext): void {
+  const equityAudit = new TradeAuditTracker(ctx.username, 'equity');
+  const cryptoAudit = new TradeAuditTracker(ctx.username, 'crypto');
   ctx.engine.onTick((state) => {
+    try { equityAudit.observe(state as unknown as Parameters<typeof equityAudit.observe>[0]); } catch { /* audit must never break broadcast */ }
     broadcastToUser(ctx.username, JSON.stringify({ type: 'state', payload: state }));
   });
   ctx.cryptoEngine.onTick((state) => {
+    try { cryptoAudit.observe(state as unknown as Parameters<typeof cryptoAudit.observe>[0]); } catch { /* audit must never break broadcast */ }
     broadcastToUser(ctx.username, JSON.stringify({ type: 'crypto_state', payload: state }));
   });
 }
@@ -2796,7 +2854,57 @@ if (existsSync(DIST_DIR)) {
   });
 }
 
+// TRA-406 — error-handling middleware. Mounted last so it catches anything a
+// route handler threw; captures it against the request trace id and returns a
+// 500 carrying that id. Express recognises this as an error handler by its
+// 4-argument shape.
+app.use(errorMiddleware);
+
+// ── Observability monitor ────────────────────────────────────────────────────
+//
+// TRA-406 — run every 60s scheduler tick (see `onMonitor` below). Probes
+// `/api/health`, checks disk space, watches captured-error volume, and — on
+// market days past noon ET — alerts if no trades have been placed. Each alert
+// key throttles itself, so a sustained outage produces one alert per window.
+
+async function probeHealth(): Promise<boolean> {
+  try {
+    const resp = await fetch(`http://127.0.0.1:${PORT}/api/health`, {
+      signal: AbortSignal.timeout(5000),
+    });
+    if (!resp.ok) return false;
+    const body = (await resp.json()) as { ok?: boolean };
+    return body.ok === true;
+  } catch {
+    return false;
+  }
+}
+
+async function runObservabilityMonitor(): Promise<void> {
+  await runHealthCheck(probeHealth);
+  await checkDiskSpace(DATA_DIR);
+  checkErrorSpike(getErrorCountSince());
+
+  // Trade-volume-zero — only meaningful on a stock-market trading day.
+  const now = new Date();
+  const etHour = Number(
+    now.toLocaleString('en-US', { timeZone: 'America/New_York', hour: '2-digit', hour12: false }),
+  );
+  checkTradeVolume({
+    tradeCountToday: getTradeOpenCount(),
+    etHour: Number.isFinite(etHour) ? etHour : 0,
+    isMarketDay: isMarketDay(now),
+  });
+}
+
 // ── Start ────────────────────────────────────────────────────────────────────
+
+// TRA-406 — capture errors that escape every try/catch, and record this boot
+// so a crash-loop toward PM2's max_restarts raises a `restart-storm` alert.
+installGlobalErrorHandlers();
+void recordBootAndCheckRestarts().catch(err =>
+  logger.warn('boot-history check failed', { reason: err instanceof Error ? err.message : String(err) }),
+);
 
 const scheduler = new MarketScheduler();
 scheduler.start({
@@ -2836,6 +2944,8 @@ scheduler.start({
   // snapshot per trading day into the persistent disk for the TRA-379
   // replay backtest harness. Market days only; see `runChainRecord`.
   onChainRecord: runChainRecord,
+  // TRA-406 — observability monitor on every 60s tick.
+  onMonitor: runObservabilityMonitor,
 });
 
 httpServer.listen(PORT, () => {
@@ -2843,15 +2953,56 @@ httpServer.listen(PORT, () => {
   console.log(`WebSocket endpoint: ws://localhost:${PORT}`);
 });
 
+/**
+ * TRA-407 (C5) — upper bound on how long shutdown waits for in-progress ticks
+ * to drain. A tick that ignores the timer (e.g. a wedged socket) must not
+ * block the process from exiting within Render's SIGTERM grace window.
+ */
+const SHUTDOWN_DRAIN_TIMEOUT_MS = 15_000;
+
+/** TRA-407 (C5) — guard so a doubled SIGTERM/SIGINT can't re-enter shutdown. */
+let shuttingDown = false;
+
 async function gracefulShutdown(signal: string): Promise<void> {
-  console.log(`[shutdown] received ${signal} — stopping engines and flushing trade history`);
+  if (shuttingDown) return;
+  shuttingDown = true;
+  console.log(`[shutdown] received ${signal} — draining ticks, recording in-flight orders, flushing trade history`);
   scheduler.stop();
   const all = getAllUserContexts();
+  // Clear each engine's tick timer first so no new tick starts; the in-flight
+  // tick (if any) keeps running and is drained next.
   for (const ctx of all) {
     ctx.engine.stop();
     ctx.cryptoEngine.stop();
     if (ctx.stocksPersistTimer) clearTimeout(ctx.stocksPersistTimer);
     if (ctx.cryptoPersistTimer) clearTimeout(ctx.cryptoPersistTimer);
+  }
+  // TRA-407 (C5) — finish the current tick so we exit on a tick boundary, not
+  // mid-tick. Bounded by SHUTDOWN_DRAIN_TIMEOUT_MS so a wedged tick can't hold
+  // the process past the redeploy grace window.
+  const drainAll = Promise.all(all.flatMap(ctx => [ctx.engine.drain(), ctx.cryptoEngine.drain()]));
+  let drainTimer: ReturnType<typeof setTimeout> | undefined;
+  await Promise.race([
+    drainAll.then(() => undefined),
+    new Promise<void>(resolve => {
+      drainTimer = setTimeout(() => {
+        console.warn(`[shutdown] tick drain exceeded ${SHUTDOWN_DRAIN_TIMEOUT_MS}ms — exiting anyway`);
+        resolve();
+      }, SHUTDOWN_DRAIN_TIMEOUT_MS);
+      drainTimer.unref?.();
+    }),
+  ]);
+  if (drainTimer) clearTimeout(drainTimer);
+  // TRA-407 (C5) — record in-flight Tradier order ids so a redeploy mid-
+  // reconcile leaves an audit trail for the next boot's reconciler.
+  for (const ctx of all) {
+    const inflight = ctx.engine.inFlightBrokerOrderIds();
+    if (inflight.length > 0) {
+      console.warn(
+        `[shutdown] ${inflight.length} in-flight Tradier order(s) at exit: `
+        + inflight.map(o => `${o.kind} ${o.optionSymbol} #${o.orderId} (${o.env})`).join(', '),
+      );
+    }
   }
   // Flush every user's pending trade-history writes synchronously before exit.
   try {
@@ -2859,6 +3010,9 @@ async function gracefulShutdown(signal: string): Promise<void> {
   } catch (err: unknown) {
     console.warn(`[shutdown] persist failed: ${err instanceof Error ? err.message : String(err)}`);
   }
+  // TRA-406 — drain any in-flight structured-log / audit / alert file writes.
+  await flushLogs().catch(() => undefined);
+  console.log('[shutdown] drain complete — exiting');
   process.exit(0);
 }
 

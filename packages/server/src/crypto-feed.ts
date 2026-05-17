@@ -10,6 +10,9 @@ import {
 
 export { isCoinbaseBreakerOpen };
 import { isYahooBreakerOpen, toIsoTime, tripYahooBreakerFromExternal } from './yahoo-feed.js';
+import { logger } from './observability/index.js';
+
+const feedLog = logger.child({ module: 'crypto-feed' });
 
 const yf = new YahooFinance({
   suppressNotices: ['yahooSurvey'],
@@ -213,7 +216,13 @@ async function fetchCoinbaseStatsQuotes(
       const changePct = Number.isFinite(open) && open > 0 ? ((price - open) / open) * 100 : 0;
       const change = price - (Number.isFinite(open) ? open : price);
       return [sym, { price, volume, change, changePct, source: 'coinbase' as const }] as const;
-    } catch {
+    } catch (err) {
+      // TRA-406 — was a bare `catch {}`. A Coinbase feed failure is a degraded
+      // signal source; log it (the caller still falls back to a null quote).
+      feedLog.warn('Coinbase stats quote failed', {
+        symbol: sym,
+        reason: err instanceof Error ? err.message : String(err),
+      });
       return [sym, null] as const;
     }
   }));

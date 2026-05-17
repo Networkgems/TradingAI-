@@ -36,11 +36,23 @@ const MARKET_HOLIDAYS = new Set<string>([
   '2026-12-25', // Christmas
 ]);
 
+/**
+ * TRA-407 — the calendar date in ET (`YYYY-MM-DD`) for `date`. This is the
+ * single ET-correct date helper the scheduler and the daily risk governor
+ * both roll their "trading day" on. Deriving the day from a UTC date string
+ * (`new Date().toISOString().slice(0, 10)`) rolls the day 4–5 hours early —
+ * at UTC-midnight rather than ET-midnight — which can drop a halt or reset a
+ * dedupe key in the ET evening. Always route a day-boundary check through
+ * here so that window is closed.
+ */
+export function etDateString(date: Date = new Date()): string {
+  return date.toLocaleDateString('en-CA', { timeZone: 'America/New_York' });
+}
+
 export function isMarketDay(date: Date = new Date()): boolean {
   const dayOfWeek = date.getDay(); // 0=Sun, 6=Sat
   if (dayOfWeek === 0 || dayOfWeek === 6) return false;
-  const dateStr = date.toLocaleDateString('en-CA', { timeZone: 'America/New_York' });
-  return !MARKET_HOLIDAYS.has(dateStr);
+  return !MARKET_HOLIDAYS.has(etDateString(date));
 }
 
 /**
@@ -166,6 +178,52 @@ export interface ScheduleCallbacks {
    * polling loop can't double-fire within the 3:55 minute.
    */
   onChainRecord?: EodTriggerCallback;
+  /**
+   * TRA-406 — fires on every 60s scheduler tick. Drives the observability
+   * monitor (health probe, disk-space, restart-storm and trade-volume
+   * checks). Unlike the other hooks it is not time-gated; the individual
+   * alert checks own their throttling and thresholds.
+   */
+  onMonitor?: EodTriggerCallback;
+}
+
+/**
+ * TRA-407 — hard ceiling for any single scheduled callback. A hung job (e.g.
+ * a stalled feed fetch inside the market-review generation) otherwise leaves
+ * a never-settling promise: its `.catch` never runs, so the failure is
+ * silent and unbounded. Racing every callback against this timeout makes a
+ * stuck job observable (it logs an error) and stops it from holding a live
+ * promise across the rest of the trading day.
+ */
+const SCHEDULED_JOB_TIMEOUT_MS = 5 * 60_000;
+
+/**
+ * TRA-407 — resolve when `job` settles, or reject once `ms` elapses. The
+ * timeout timer is `unref`-ed so it never keeps the event loop alive on its
+ * own. Note this bounds the *promise chain*, not the underlying work — a job
+ * that ignores cancellation keeps running, but the scheduler stops waiting on
+ * it and surfaces the timeout.
+ */
+function withTimeout(job: Promise<void>, ms: number, label: string): Promise<void> {
+  let timer: ReturnType<typeof setTimeout>;
+  const timeout = new Promise<void>((_, reject) => {
+    timer = setTimeout(
+      () => reject(new Error(`scheduled job '${label}' exceeded ${ms}ms timeout`)),
+      ms,
+    );
+    timer.unref?.();
+  });
+  return Promise.race([job, timeout]).finally(() => clearTimeout(timer));
+}
+
+/**
+ * TRA-407 — run a scheduled callback fire-and-forget with a timeout guard so
+ * a hung callback can neither stall the 60s polling loop nor fail silently.
+ */
+function runScheduled(label: string, cb: EodTriggerCallback): void {
+  withTimeout(Promise.resolve(cb()), SCHEDULED_JOB_TIMEOUT_MS, label).catch(err =>
+    console.error(`[scheduler] ${label} callback error:`, err),
+  );
 }
 
 export class MarketScheduler {
@@ -194,23 +252,19 @@ export class MarketScheduler {
     // Check every 60 seconds
     this.timer = setInterval(() => {
       const { hour, minute, date } = nowET();
-      const todayKey = date.toLocaleDateString('en-CA', { timeZone: 'America/New_York' });
+      const todayKey = etDateString(date);
 
       if (hour === 16 && minute === 5) {
         if (cfg.onMarketClose && isMarketDay(date) && this.lastMarketCloseDate !== todayKey) {
           this.lastMarketCloseDate = todayKey;
           console.log(`[scheduler] market-close EOD trigger fired for ${todayKey}`);
-          Promise.resolve(cfg.onMarketClose()).catch(err =>
-            console.error('[scheduler] market-close EOD callback error:', err),
-          );
+          runScheduled('market-close EOD', cfg.onMarketClose);
         }
 
         if (cfg.onDaily && this.lastDailyDate !== todayKey) {
           this.lastDailyDate = todayKey;
           console.log(`[scheduler] daily EOD trigger fired for ${todayKey}`);
-          Promise.resolve(cfg.onDaily()).catch(err =>
-            console.error('[scheduler] daily EOD callback error:', err),
-          );
+          runScheduled('daily EOD', cfg.onDaily);
         }
       }
 
@@ -222,9 +276,7 @@ export class MarketScheduler {
         if (cfg.onPremarket && isMarketDay(date) && this.lastPremarketDate !== todayKey) {
           this.lastPremarketDate = todayKey;
           console.log(`[scheduler] pre-market trigger fired for ${todayKey}`);
-          Promise.resolve(cfg.onPremarket()).catch(err =>
-            console.error('[scheduler] pre-market callback error:', err),
-          );
+          runScheduled('pre-market', cfg.onPremarket);
         }
       }
 
@@ -236,9 +288,7 @@ export class MarketScheduler {
         if (cfg.onChainRecord && isMarketDay(date) && this.lastChainRecordDate !== todayKey) {
           this.lastChainRecordDate = todayKey;
           console.log(`[scheduler] option-chain recorder trigger fired for ${todayKey}`);
-          Promise.resolve(cfg.onChainRecord()).catch(err =>
-            console.error('[scheduler] option-chain recorder callback error:', err),
-          );
+          runScheduled('option-chain recorder', cfg.onChainRecord);
         }
       }
 
@@ -253,9 +303,7 @@ export class MarketScheduler {
         if (cfg.onArchive && this.lastArchiveDate !== todayKey) {
           this.lastArchiveDate = todayKey;
           console.log(`[scheduler] archive trigger fired for ${todayKey} (${String(hour).padStart(2, '0')}:${String(minute).padStart(2, '0')} ET)`);
-          Promise.resolve(cfg.onArchive()).catch(err =>
-            console.error('[scheduler] archive callback error:', err),
-          );
+          runScheduled('archive', cfg.onArchive);
         }
       }
 
@@ -268,10 +316,16 @@ export class MarketScheduler {
         if (this.lastHourlyKey !== hourlyKey) {
           this.lastHourlyKey = hourlyKey;
           console.log(`[scheduler] hourly trigger fired for ${hourlyKey}`);
-          Promise.resolve(cfg.onHourly()).catch(err =>
-            console.error('[scheduler] hourly callback error:', err),
-          );
+          runScheduled('hourly', cfg.onHourly);
         }
+      }
+
+      // TRA-406 — observability monitor. Runs every tick; the alert checks
+      // throttle themselves so this can't spam.
+      if (cfg.onMonitor) {
+        Promise.resolve(cfg.onMonitor()).catch(err =>
+          console.error('[scheduler] monitor callback error:', err),
+        );
       }
     }, 60_000);
 
