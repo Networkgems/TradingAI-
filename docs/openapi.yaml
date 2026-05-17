@@ -1,0 +1,991 @@
+openapi: 3.0.3
+info:
+  title: TradeAI Server API
+  version: "1.0.0"
+  description: >
+    REST API for the TradeAI trading server (`@trading-app/server`).
+    Spun out of the TRA-402 review (§6 — "no API spec").
+
+
+    Conventions:
+
+    - All routes are prefixed with `/api`.
+
+    - Authenticated routes require an `Authorization: Bearer <token>` header.
+      The token is obtained from `POST /api/auth/login` or `/signup`.
+
+    - Admin-only routes additionally require the caller to be an administrator.
+
+    - Most mutating routes return a thin acknowledgement; the authoritative
+      result is pushed to the client over the WebSocket as a fresh `state`
+      snapshot (see the WebSocket section below).
+
+    - Error responses are JSON: `{ "error": "<message>" }`. A `500` also
+      carries `{ "traceId": "<id>" }` for log correlation.
+
+
+    WebSocket (not an OpenAPI route): connect to `ws://<host>:<port>/?token=<token>`.
+    The handshake is rejected with `401` if the token is invalid. The server
+    pushes JSON messages `{ type, payload }` where `type` is one of
+    `state`, `crypto_state`, `eod_report`. The protocol is server-push only.
+servers:
+  - url: http://localhost:4242
+    description: Local development
+  - url: https://tradingai-server.onrender.com
+    description: Production (Render)
+
+tags:
+  - name: Health
+  - name: Auth
+  - name: Admin
+  - name: State
+  - name: Trading
+  - name: Crypto
+  - name: Options
+  - name: Watchlist
+  - name: Reports
+  - name: Research
+
+components:
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
+      description: Session token from `/api/auth/login` or `/api/auth/signup`.
+  schemas:
+    Error:
+      type: object
+      properties:
+        error:
+          type: string
+    TokenResponse:
+      type: object
+      properties:
+        token:
+          type: string
+    Ok:
+      type: object
+      properties:
+        ok:
+          type: boolean
+    EngineState:
+      type: object
+      description: >
+        Full engine state snapshot — equity tracking, open and closed
+        positions, signals, settings. Large and evolving; treat as an opaque
+        object and consult `@trading-app/shared` for the field-level shape.
+      additionalProperties: true
+  responses:
+    BadRequest:
+      description: Malformed or missing request parameters.
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/Error" }
+    Unauthorized:
+      description: Missing or invalid bearer token.
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/Error" }
+    Forbidden:
+      description: Authenticated but not an administrator.
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/Error" }
+    NotFound:
+      description: Resource not found.
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/Error" }
+    Throttled:
+      description: Too many requests — rate limited. Carries a `Retry-After` header.
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/Error" }
+  parameters:
+    Username:
+      name: username
+      in: path
+      required: true
+      schema:
+        type: string
+    PositionId:
+      name: id
+      in: path
+      required: true
+      schema:
+        type: string
+    Symbol:
+      name: symbol
+      in: path
+      required: true
+      schema:
+        type: string
+    DatePath:
+      name: date
+      in: path
+      required: true
+      description: Report date, `YYYY-MM-DD`.
+      schema:
+        type: string
+
+security:
+  - bearerAuth: []
+
+paths:
+  # ───────────────────────────── Health ──────────────────────────────
+  /api/health:
+    get:
+      tags: [Health]
+      summary: Liveness probe (used by the Render health check).
+      security: []
+      responses:
+        "200":
+          description: Server is up.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  ok: { type: boolean }
+                  time: { type: string, format: date-time }
+  /api/health/alerts:
+    get:
+      tags: [Health]
+      summary: Recent operational alerts and the 15-minute captured-error count.
+      responses:
+        "200":
+          description: Alert state.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  alerts:
+                    type: array
+                    items: { type: object, additionalProperties: true }
+                  errorCount15m: { type: integer }
+                  time: { type: string, format: date-time }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+  /api/health/storage:
+    get:
+      tags: [Health]
+      summary: Data-disk diagnostic — confirms the persistent volume is mounted.
+      security: []
+      responses:
+        "200":
+          description: Storage state.
+          content:
+            application/json:
+              schema:
+                type: object
+                additionalProperties: true
+  /api/health/quotes:
+    get:
+      tags: [Health]
+      summary: Market-data feed freshness diagnostic.
+      security: []
+      responses:
+        "200":
+          description: Quote-feed state.
+          content:
+            application/json:
+              schema:
+                type: object
+                additionalProperties: true
+  /api/health/options-mispricing:
+    get:
+      tags: [Health]
+      summary: Relative-value scanner diagnostics (breaker / cache state).
+      security: []
+      responses:
+        "200":
+          description: Scanner diagnostics.
+          content:
+            application/json:
+              schema:
+                type: object
+                additionalProperties: true
+  /api/client-error:
+    post:
+      tags: [Health]
+      summary: Client-side error sink for the desktop/web error boundary.
+      description: >
+        Unauthenticated and best-effort. Accepts a `text/plain` body (a JSON
+        string) so the report can ride a CORS-safelisted `sendBeacon`. Always
+        returns `204`.
+      security: []
+      requestBody:
+        content:
+          text/plain:
+            schema:
+              type: string
+      responses:
+        "204":
+          description: Report accepted (fire-and-forget).
+
+  # ───────────────────────────── Auth ────────────────────────────────
+  /api/auth/login:
+    post:
+      tags: [Auth]
+      summary: Log in with username and password.
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [username, password]
+              properties:
+                username: { type: string }
+                password: { type: string }
+      responses:
+        "200":
+          description: Session token.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/TokenResponse" }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "401":
+          description: Invalid username or password.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+        "423":
+          description: Account is locked.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+        "429": { $ref: "#/components/responses/Throttled" }
+  /api/auth/signup:
+    post:
+      tags: [Auth]
+      summary: Register a new user.
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [username, email, password]
+              properties:
+                username: { type: string }
+                email: { type: string, format: email }
+                password: { type: string, minLength: 6 }
+      responses:
+        "200":
+          description: Session token for the new user.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/TokenResponse" }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "409":
+          description: Username or email already taken.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+  /api/auth/forgot-password:
+    post:
+      tags: [Auth]
+      summary: Request a password-reset email.
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [email]
+              properties:
+                email: { type: string, format: email }
+      responses:
+        "200":
+          description: Reset email sent if the address is registered.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Ok" }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "429": { $ref: "#/components/responses/Throttled" }
+  /api/auth/reset-password:
+    post:
+      tags: [Auth]
+      summary: Complete a password reset with a reset token.
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [token, password]
+              properties:
+                token: { type: string }
+                password: { type: string, minLength: 6 }
+      responses:
+        "200":
+          description: Password updated.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Ok" }
+        "400": { $ref: "#/components/responses/BadRequest" }
+  /api/auth/change-password:
+    post:
+      tags: [Auth]
+      summary: Change the authenticated user's password.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [currentPassword, newPassword]
+              properties:
+                currentPassword: { type: string }
+                newPassword: { type: string, minLength: 6 }
+      responses:
+        "200":
+          description: Password changed.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Ok" }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+  /api/auth/me:
+    get:
+      tags: [Auth]
+      summary: Get the authenticated user's profile.
+      responses:
+        "200":
+          description: User profile.
+          content:
+            application/json:
+              schema: { type: object, additionalProperties: true }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+    patch:
+      tags: [Auth]
+      summary: Update the authenticated user's profile.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { type: object, additionalProperties: true }
+      responses:
+        "200":
+          description: Updated profile.
+          content:
+            application/json:
+              schema: { type: object, additionalProperties: true }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+
+  # ───────────────────────────── Admin ───────────────────────────────
+  /api/admin/users:
+    get:
+      tags: [Admin]
+      summary: List all users (admin only).
+      responses:
+        "200":
+          description: User list.
+          content:
+            application/json:
+              schema:
+                type: array
+                items: { type: object, additionalProperties: true }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+    post:
+      tags: [Admin]
+      summary: Create a user (admin only).
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [username, password]
+              properties:
+                username: { type: string }
+                email: { type: string, format: email }
+                password: { type: string }
+      responses:
+        "200":
+          description: User created.
+          content:
+            application/json:
+              schema: { type: object, additionalProperties: true }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "409":
+          description: User already exists.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+  /api/admin/users/{username}:
+    patch:
+      tags: [Admin]
+      summary: Update a user (admin only).
+      parameters: [{ $ref: "#/components/parameters/Username" }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { type: object, additionalProperties: true }
+      responses:
+        "200": { description: User updated. }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "404": { $ref: "#/components/responses/NotFound" }
+    delete:
+      tags: [Admin]
+      summary: Delete a user (admin only).
+      parameters: [{ $ref: "#/components/parameters/Username" }]
+      responses:
+        "200": { description: User deleted. }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "404": { $ref: "#/components/responses/NotFound" }
+  /api/admin/users/{username}/password:
+    post:
+      tags: [Admin]
+      summary: Set a user's password directly (admin only).
+      parameters: [{ $ref: "#/components/parameters/Username" }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [password]
+              properties:
+                password: { type: string }
+      responses:
+        "200": { description: Password set. }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+  /api/admin/users/{username}/lock:
+    post:
+      tags: [Admin]
+      summary: Lock or unlock a user account (admin only).
+      parameters: [{ $ref: "#/components/parameters/Username" }]
+      requestBody:
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                locked: { type: boolean }
+      responses:
+        "200": { description: Lock state updated. }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+  /api/admin/users/{username}/reset-password:
+    post:
+      tags: [Admin]
+      summary: Trigger a password reset for a user (admin only).
+      parameters: [{ $ref: "#/components/parameters/Username" }]
+      responses:
+        "200": { description: Reset triggered. }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+
+  # ───────────────────────────── State ───────────────────────────────
+  /api/state:
+    get:
+      tags: [State]
+      summary: Current equity-engine state snapshot.
+      responses:
+        "200":
+          description: Engine state.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/EngineState" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+  /api/crypto/state:
+    get:
+      tags: [State]
+      summary: Current crypto-engine state snapshot.
+      responses:
+        "200":
+          description: Crypto-engine state.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/EngineState" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+  /api/snapshots:
+    get:
+      tags: [State]
+      summary: Historical engine snapshots.
+      responses:
+        "200":
+          description: Snapshot list.
+          content:
+            application/json:
+              schema:
+                type: array
+                items: { type: object, additionalProperties: true }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+  /api/news:
+    get:
+      tags: [State]
+      summary: Latest equities-relevant news.
+      responses:
+        "200":
+          description: News items.
+          content:
+            application/json:
+              schema: { type: object, additionalProperties: true }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+  /api/crypto/news:
+    get:
+      tags: [State]
+      summary: Latest crypto-relevant news.
+      responses:
+        "200":
+          description: News items.
+          content:
+            application/json:
+              schema: { type: object, additionalProperties: true }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+  /api/account/settings:
+    get:
+      tags: [State]
+      summary: Get the authenticated user's account settings.
+      responses:
+        "200":
+          description: Account settings.
+          content:
+            application/json:
+              schema: { type: object, additionalProperties: true }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+    put:
+      tags: [State]
+      summary: Replace the authenticated user's account settings.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { type: object, additionalProperties: true }
+      responses:
+        "200":
+          description: Updated settings.
+          content:
+            application/json:
+              schema: { type: object, additionalProperties: true }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+  /api/account/reset-demo:
+    post:
+      tags: [State]
+      summary: Reset the user's demo account (equity, positions, history).
+      responses:
+        "200": { description: Demo account reset. }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+
+  # ──────────────────────────── Trading ──────────────────────────────
+  /api/trading/start:
+    post:
+      tags: [Trading]
+      summary: Start the equity auto-trading engine.
+      responses:
+        "200": { description: Trading started; new state broadcast over WS. }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+  /api/trading/stop:
+    post:
+      tags: [Trading]
+      summary: Stop the equity auto-trading engine.
+      responses:
+        "200": { description: Trading stopped. }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+  /api/signals/reset:
+    post:
+      tags: [Trading]
+      summary: Clear the equity engine's pending signals.
+      responses:
+        "200": { description: Signals cleared. }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+  /api/positions/{id}/close:
+    post:
+      tags: [Trading]
+      summary: Close an open equity position.
+      parameters: [{ $ref: "#/components/parameters/PositionId" }]
+      responses:
+        "200": { description: Position closed; new state broadcast over WS. }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "404": { $ref: "#/components/responses/NotFound" }
+  /api/tradier/positions/sync:
+    post:
+      tags: [Trading]
+      summary: Reconcile equity positions against the Tradier broker.
+      responses:
+        "200": { description: Positions synced. }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+
+  # ──────────────────────────── Options ──────────────────────────────
+  /api/options/{id}/close:
+    post:
+      tags: [Options]
+      summary: Close an open options position (Tradier smart-close walk).
+      description: >
+        May return a `pending` result while the final limit order is live on
+        the broker and the reconciler tracks it. Do not re-submit while
+        `pendingCloseOrderId` is set.
+      parameters: [{ $ref: "#/components/parameters/PositionId" }]
+      responses:
+        "200": { description: Close submitted or completed. }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "404": { $ref: "#/components/responses/NotFound" }
+  /api/options/{id}/cancel-pending-exit:
+    post:
+      tags: [Options]
+      summary: Cancel a pending options-exit order.
+      parameters: [{ $ref: "#/components/parameters/PositionId" }]
+      responses:
+        "200": { description: Pending exit cancelled. }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "404": { $ref: "#/components/responses/NotFound" }
+  /api/options/tradier/test-connection:
+    post:
+      tags: [Options]
+      summary: Test the Tradier API connection / credentials.
+      responses:
+        "200":
+          description: Connection result.
+          content:
+            application/json:
+              schema: { type: object, additionalProperties: true }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+  /api/options/relative-value:
+    get:
+      tags: [Options]
+      summary: Ranked relative-value (mispricing) candidates for a symbol.
+      parameters:
+        - name: symbol
+          in: query
+          required: true
+          schema: { type: string }
+        - name: limit
+          in: query
+          schema: { type: integer, default: 10, minimum: 1, maximum: 50 }
+        - name: minZ
+          in: query
+          description: Minimum z-score threshold.
+          schema: { type: number }
+      responses:
+        "200":
+          description: Scan result with candidates and diagnostics.
+          content:
+            application/json:
+              schema: { type: object, additionalProperties: true }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+
+  # ───────────────────────────── Crypto ──────────────────────────────
+  /api/crypto/trading/start:
+    post:
+      tags: [Crypto]
+      summary: Start the crypto auto-trading engine.
+      responses:
+        "200": { description: Crypto trading started. }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+  /api/crypto/trading/stop:
+    post:
+      tags: [Crypto]
+      summary: Stop the crypto auto-trading engine.
+      responses:
+        "200": { description: Crypto trading stopped. }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+  /api/crypto/signals/reset:
+    post:
+      tags: [Crypto]
+      summary: Clear the crypto engine's pending signals.
+      responses:
+        "200": { description: Signals cleared. }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+  /api/crypto/positions/{id}/close:
+    post:
+      tags: [Crypto]
+      summary: Close an open crypto position.
+      parameters: [{ $ref: "#/components/parameters/PositionId" }]
+      responses:
+        "200": { description: Position closed. }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "404": { $ref: "#/components/responses/NotFound" }
+  /api/crypto/coinbase/test-connection:
+    post:
+      tags: [Crypto]
+      summary: Test the Coinbase API connection / credentials.
+      responses:
+        "200":
+          description: Connection result.
+          content:
+            application/json:
+              schema: { type: object, additionalProperties: true }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+  /api/crypto/coinbase/place-test-order:
+    post:
+      tags: [Crypto]
+      summary: Place a small test order against Coinbase to verify trading access.
+      requestBody:
+        content:
+          application/json:
+            schema: { type: object, additionalProperties: true }
+      responses:
+        "200":
+          description: Test-order result.
+          content:
+            application/json:
+              schema: { type: object, additionalProperties: true }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+
+  # ─────────────────────────── Watchlist ─────────────────────────────
+  /api/watchlist/crypto:
+    get:
+      tags: [Watchlist]
+      summary: Get the crypto watchlist.
+      responses:
+        "200":
+          description: Crypto watchlist.
+          content:
+            application/json:
+              schema: { type: array, items: { type: string } }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+    post:
+      tags: [Watchlist]
+      summary: Add a symbol to the crypto watchlist.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [symbol]
+              properties:
+                symbol: { type: string }
+      responses:
+        "200": { description: Symbol added. }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+  /api/watchlist/crypto/{symbol}:
+    delete:
+      tags: [Watchlist]
+      summary: Remove a symbol from the crypto watchlist.
+      parameters: [{ $ref: "#/components/parameters/Symbol" }]
+      responses:
+        "200": { description: Symbol removed. }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+  /api/watchlist/crypto/scan:
+    post:
+      tags: [Watchlist]
+      summary: Run a scan over the crypto watchlist.
+      responses:
+        "200":
+          description: Scan result.
+          content:
+            application/json:
+              schema: { type: object, additionalProperties: true }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+  /api/watchlist/stocks:
+    get:
+      tags: [Watchlist]
+      summary: Get the stocks watchlist.
+      responses:
+        "200":
+          description: Stocks watchlist.
+          content:
+            application/json:
+              schema: { type: array, items: { type: string } }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+    post:
+      tags: [Watchlist]
+      summary: Add a symbol to the stocks watchlist.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [symbol]
+              properties:
+                symbol: { type: string }
+      responses:
+        "200": { description: Symbol added. }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+  /api/watchlist/stocks/{symbol}:
+    delete:
+      tags: [Watchlist]
+      summary: Remove a symbol from the stocks watchlist.
+      parameters: [{ $ref: "#/components/parameters/Symbol" }]
+      responses:
+        "200": { description: Symbol removed. }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+  /api/watchlist/stocks/scan:
+    post:
+      tags: [Watchlist]
+      summary: Run a scan over the stocks watchlist.
+      responses:
+        "200":
+          description: Scan result.
+          content:
+            application/json:
+              schema: { type: object, additionalProperties: true }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+
+  # ──────────────────────────── Reports ──────────────────────────────
+  /api/reports:
+    get:
+      tags: [Reports]
+      summary: List available end-of-day equity reports.
+      responses:
+        "200":
+          description: Report list.
+          content:
+            application/json:
+              schema: { type: array, items: { type: object, additionalProperties: true } }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+  /api/reports/latest:
+    get:
+      tags: [Reports]
+      summary: Latest end-of-day equity report.
+      responses:
+        "200":
+          description: Report.
+          content:
+            application/json:
+              schema: { type: object, additionalProperties: true }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+  /api/reports/{date}:
+    get:
+      tags: [Reports]
+      summary: End-of-day equity report for a specific date.
+      parameters: [{ $ref: "#/components/parameters/DatePath" }]
+      responses:
+        "200":
+          description: Report.
+          content:
+            application/json:
+              schema: { type: object, additionalProperties: true }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "404": { $ref: "#/components/responses/NotFound" }
+  /api/reports/generate:
+    post:
+      tags: [Reports]
+      summary: Generate an end-of-day equity report on demand.
+      responses:
+        "200": { description: Report generated. }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+  /api/crypto/reports:
+    get:
+      tags: [Reports]
+      summary: List available end-of-day crypto reports.
+      responses:
+        "200":
+          description: Report list.
+          content:
+            application/json:
+              schema: { type: array, items: { type: object, additionalProperties: true } }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+  /api/crypto/reports/latest:
+    get:
+      tags: [Reports]
+      summary: Latest end-of-day crypto report.
+      responses:
+        "200":
+          description: Report.
+          content:
+            application/json:
+              schema: { type: object, additionalProperties: true }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+  /api/crypto/reports/{date}:
+    get:
+      tags: [Reports]
+      summary: End-of-day crypto report for a specific date.
+      parameters: [{ $ref: "#/components/parameters/DatePath" }]
+      responses:
+        "200":
+          description: Report.
+          content:
+            application/json:
+              schema: { type: object, additionalProperties: true }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "404": { $ref: "#/components/responses/NotFound" }
+  /api/crypto/reports/generate:
+    post:
+      tags: [Reports]
+      summary: Generate an end-of-day crypto report on demand.
+      responses:
+        "200": { description: Report generated. }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+  /api/market-review:
+    get:
+      tags: [Reports]
+      summary: List market-review documents.
+      responses:
+        "200":
+          description: Market-review list.
+          content:
+            application/json:
+              schema: { type: array, items: { type: object, additionalProperties: true } }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+  /api/market-review/latest:
+    get:
+      tags: [Reports]
+      summary: Latest market-review document.
+      responses:
+        "200":
+          description: Market review.
+          content:
+            application/json:
+              schema: { type: object, additionalProperties: true }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+  /api/market-review/run:
+    post:
+      tags: [Reports]
+      summary: Run a market review on demand (admin only).
+      responses:
+        "200": { description: Market review generated. }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+
+  # ─────────────────────────── Research ──────────────────────────────
+  /api/research/reports:
+    get:
+      tags: [Research]
+      summary: List research reports.
+      responses:
+        "200":
+          description: Research-report list.
+          content:
+            application/json:
+              schema: { type: array, items: { type: object, additionalProperties: true } }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+    post:
+      tags: [Research]
+      summary: Publish a research report (admin only).
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { type: object, additionalProperties: true }
+      responses:
+        "200": { description: Report published. }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+  /api/research/reports/{id}:
+    get:
+      tags: [Research]
+      summary: Get a research report by id.
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema: { type: string }
+      responses:
+        "200":
+          description: Research report.
+          content:
+            application/json:
+              schema: { type: object, additionalProperties: true }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "404": { $ref: "#/components/responses/NotFound" }
