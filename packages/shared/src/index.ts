@@ -27,6 +27,12 @@ export interface Candle {
   low: number;
   close: number;
   volume: number;
+  /**
+   * TRA-427 — set when this bar was synthesised to bridge a genuine
+   * exchange data gap (no upstream OHLCV for the interval). Synthetic bars
+   * are flat (O=H=L=C = prior close) with zero volume. Absent on real bars.
+   */
+  synthetic?: boolean;
 }
 
 export interface TradeSignal {

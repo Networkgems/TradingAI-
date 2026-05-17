@@ -17,7 +17,8 @@ import { fileURLToPath } from 'node:url';
 import YahooFinance from 'yahoo-finance2';
 import { PERP_SHORTS_UNIVERSE } from '@trading-app/engine';
 import type { Candle } from '@trading-app/shared';
-import { fetchCoinbase4hBars, fetchCoinbaseMinuteBars } from './coinbase-feed.js';
+import { fetchCoinbase4hBars, fetchCoinbaseMinuteBars, summarize4hGaps } from './coinbase-feed.js';
+import type { GridGap } from './coinbase-feed.js';
 
 const yf = new YahooFinance({
   suppressNotices: ['yahooSurvey'],
@@ -34,6 +35,12 @@ export interface CacheEntry {
   start: number;
   end: number;
   candles: Candle[];
+  /**
+   * TRA-427 — genuine exchange gaps bridged with synthetic flat bars when the
+   * cache was built. Present on 4H Coinbase caches; absent on legacy / daily
+   * caches. An empty array means the grid was already contiguous.
+   */
+  gaps?: GridGap[];
 }
 
 export function cachePathFor(symbol: string): string {
@@ -43,6 +50,12 @@ export function cachePathFor(symbol: string): string {
 export function cachePathFor4h(symbol: string): string {
   return resolve(DATA_DIR, `${symbol.toLowerCase()}.4h.json`);
 }
+
+/**
+ * TRA-427 — symbols with an on-disk 4H Coinbase cache. Used by the cache
+ * audit (`verify-4h-cache.ts`) as the default sweep set.
+ */
+export const DEFAULT_4H_SYMBOLS = ['BTC-USD', 'ETH-USD', 'SOL-USD', 'ADA-USD', 'DOGE-USD', 'LINK-USD'] as const;
 
 /**
  * TRA-307 — 1m cache key includes the date range so a 30-day scalping cache
@@ -145,15 +158,21 @@ export async function loadOrFetch4hBars(
   if (candles.length === 0) {
     throw new Error(`Coinbase returned 0 4H bars for ${symbol} in [${new Date(fromMs).toISOString()}, ${new Date(toMs).toISOString()}]`);
   }
+  // TRA-427 — `fetchCoinbase4hBars` returns a gap-filled, contiguous grid.
+  // Persist the bridged exchange gaps alongside the bars so the cache is
+  // self-describing and `verify-4h-cache.ts` can audit it without re-fetching.
+  const gaps = summarize4hGaps(candles);
   const entry: CacheEntry = {
     symbol,
     fetchedAt: Date.now(),
     start: candles[0].timestamp,
     end: candles[candles.length - 1].timestamp,
     candles,
+    gaps,
   };
   writeFileSync(path, JSON.stringify(entry));
-  console.log(`[fetch-tra266-data] ${symbol} 4H: ${candles.length} bars cached (${new Date(entry.start).toISOString().slice(0, 10)} → ${new Date(entry.end).toISOString().slice(0, 10)})`);
+  const synthetic = gaps.reduce((s, g) => s + g.filledBars, 0);
+  console.log(`[fetch-tra266-data] ${symbol} 4H: ${candles.length} bars cached (${new Date(entry.start).toISOString().slice(0, 10)} → ${new Date(entry.end).toISOString().slice(0, 10)}), ${gaps.length} gap(s)/${synthetic} synthetic bar(s)`);
   return candles.filter((c) => c.timestamp >= fromMs && c.timestamp <= toMs);
 }
 

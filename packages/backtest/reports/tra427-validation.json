@@ -1,0 +1,64 @@
+{
+  "generatedAt": "2026-05-17T20:46:45.371Z",
+  "issue": "TRA-427",
+  "cacheVariant": "clean",
+  "oosWindow": {
+    "start": "2025-01-01T00:00:00.000Z",
+    "end": "2026-05-17T20:46:44.401Z"
+  },
+  "initialEquity": 25000,
+  "strategy": "macd_bollinger",
+  "correlationCap": "OFF",
+  "barTimeframe": "4h",
+  "dataSource": "coinbase-exchange",
+  "cells": [
+    {
+      "symbol": "BTC-USD",
+      "cacheVariant": "clean",
+      "bars": 6677,
+      "syntheticBars": 4,
+      "gapRuns": 2,
+      "tra405Baseline": {
+        "trades": 24,
+        "returnPct": 4.12,
+        "profitFactor": 1.62,
+        "sharpe": 0.77
+      },
+      "current": {
+        "trades": 25,
+        "winRatePct": 20,
+        "profitFactor": 0.8666970886572648,
+        "sharpe": -0.2313162907414081,
+        "maxDdPct": 4.9293411393455635,
+        "totalPnlUsd": -250.91811037306692,
+        "returnPct": -1.0036724414922675
+      },
+      "deltaReturnPp": -5.123672441492268,
+      "reproducesWithinTolerance": false
+    },
+    {
+      "symbol": "SOL-USD",
+      "cacheVariant": "clean",
+      "bars": 6677,
+      "syntheticBars": 4,
+      "gapRuns": 2,
+      "tra405Baseline": {
+        "trades": 31,
+        "returnPct": 5.78,
+        "profitFactor": 1.61,
+        "sharpe": 0.86
+      },
+      "current": {
+        "trades": 34,
+        "winRatePct": 17.647058823529413,
+        "profitFactor": 0.7016268735046086,
+        "sharpe": -0.7130644705475898,
+        "maxDdPct": 5.706338020591982,
+        "totalPnlUsd": -887.116170405434,
+        "returnPct": -3.548464681621736
+      },
+      "deltaReturnPp": -9.328464681621735,
+      "reproducesWithinTolerance": false
+    }
+  ]
+}

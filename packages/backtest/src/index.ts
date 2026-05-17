@@ -51,9 +51,12 @@ export {
   fetchCoinbaseMinuteBars,
   fetchCoinbaseDailyBars,
   aggregate1hTo4h,
+  fillGrid4h,
+  summarize4hGaps,
   paceCoinbaseFetch,
   isCoinbaseBreakerOpen,
 } from './coinbase-feed.js';
+export type { GridGap } from './coinbase-feed.js';
 export {
   cachePathFor,
   cachePathFor4h,

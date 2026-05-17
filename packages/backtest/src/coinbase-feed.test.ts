@@ -18,8 +18,10 @@ import {
   aggregate1hTo4h,
   fetchCoinbaseHourlyBars,
   fetchCoinbase4hBars,
+  fillGrid4h,
   isCoinbaseBreakerOpen,
   paceCoinbaseFetch,
+  summarize4hGaps,
 } from './coinbase-feed.js';
 
 const ONE_HOUR_MS = 60 * 60 * 1000;
@@ -96,6 +98,83 @@ describe('aggregate1hTo4h', () => {
     const out = aggregate1hTo4h(shuffled);
     expect(out).toHaveLength(2);
     expect(out[0].timestamp).toBeLessThan(out[1].timestamp);
+  });
+});
+
+describe('fillGrid4h / summarize4hGaps (TRA-427)', () => {
+  function fourHourBar(symbol: string, ts: number, close: number): Candle {
+    return { symbol, timestamp: ts, open: close - 1, high: close + 2, low: close - 2, close, volume: 100 };
+  }
+
+  it('returns the input unchanged when the 4H grid is already contiguous', () => {
+    const start = Date.UTC(2025, 0, 1, 0, 0, 0);
+    const bars = [0, 1, 2, 3, 4].map((i) => fourHourBar('BTC-USD', start + i * FOUR_HOURS_MS, 100 + i));
+    const filled = fillGrid4h(bars);
+    expect(filled).toEqual(bars);
+    expect(filled.some((b) => b.synthetic)).toBe(false);
+    expect(summarize4hGaps(filled)).toEqual([]);
+  });
+
+  it('bridges a single missing 4H slot with one flat synthetic bar carrying the prior close', () => {
+    const start = Date.UTC(2025, 0, 1, 0, 0, 0);
+    // Slot index 2 (start + 2×4H) is missing.
+    const bars = [
+      fourHourBar('SOL-USD', start + 0 * FOUR_HOURS_MS, 100),
+      fourHourBar('SOL-USD', start + 1 * FOUR_HOURS_MS, 110),
+      fourHourBar('SOL-USD', start + 3 * FOUR_HOURS_MS, 130),
+    ];
+    const filled = fillGrid4h(bars);
+    expect(filled).toHaveLength(4);
+    const synth = filled[2];
+    expect(synth.synthetic).toBe(true);
+    expect(synth.timestamp).toBe(start + 2 * FOUR_HOURS_MS);
+    // Flat bar carrying the prior real bar's close (110), zero volume.
+    expect(synth).toMatchObject({ open: 110, high: 110, low: 110, close: 110, volume: 0 });
+    // Grid is now contiguous.
+    for (let i = 1; i < filled.length; i++) {
+      expect(filled[i].timestamp - filled[i - 1].timestamp).toBe(FOUR_HOURS_MS);
+    }
+  });
+
+  it('bridges a multi-bar gap (verified 2-bar exchange gap shape from the cache audit)', () => {
+    const start = Date.UTC(2025, 9, 25, 12, 0, 0); // mirrors the real 2025-10-25 gap
+    // 16:00 and 20:00 slots missing — jump straight from 12:00 to next-day 00:00.
+    const bars = [
+      fourHourBar('BTC-USD', start + 0 * FOUR_HOURS_MS, 111466),
+      fourHourBar('BTC-USD', start + 3 * FOUR_HOURS_MS, 111900),
+    ];
+    const filled = fillGrid4h(bars);
+    expect(filled).toHaveLength(4);
+    expect(filled.filter((b) => b.synthetic)).toHaveLength(2);
+    const gaps = summarize4hGaps(filled);
+    expect(gaps).toHaveLength(1);
+    expect(gaps[0]).toEqual({
+      fromTimestamp: start + 1 * FOUR_HOURS_MS,
+      toTimestamp: start + 2 * FOUR_HOURS_MS,
+      filledBars: 2,
+    });
+  });
+
+  it('summarizes two separate gaps as two distinct runs', () => {
+    const start = Date.UTC(2025, 0, 1, 0, 0, 0);
+    const bars = [
+      fourHourBar('ETH-USD', start + 0 * FOUR_HOURS_MS, 100),
+      // slot 1 missing
+      fourHourBar('ETH-USD', start + 2 * FOUR_HOURS_MS, 120),
+      fourHourBar('ETH-USD', start + 3 * FOUR_HOURS_MS, 130),
+      // slot 4 missing
+      fourHourBar('ETH-USD', start + 5 * FOUR_HOURS_MS, 150),
+    ];
+    const gaps = summarize4hGaps(fillGrid4h(bars));
+    expect(gaps).toHaveLength(2);
+    expect(gaps[0].filledBars).toBe(1);
+    expect(gaps[1].filledBars).toBe(1);
+    expect(gaps[1].fromTimestamp).toBeGreaterThan(gaps[0].toTimestamp);
+  });
+
+  it('handles empty input', () => {
+    expect(fillGrid4h([])).toEqual([]);
+    expect(summarize4hGaps([])).toEqual([]);
   });
 });
 
@@ -235,6 +314,41 @@ describe('fetchCoinbase4hBars', () => {
     expect(bars[0].timestamp).toBe(start);
     expect(bars[5].timestamp).toBe(start + 5 * FOUR_HOURS_MS);
     expect(bars[0].volume).toBe(200); // 4 × 50
+  });
+
+  it('TRA-427 — gap-fills the 4H grid when the 1H feed has an exchange gap', async () => {
+    // 24-hour window, but the exchange has no 1H rows for 16:00–20:00 UTC —
+    // the verified shape of the real 2025-10-25 / 2026-05-08 cache gaps. The
+    // 16:00 4H bucket loses all four constituents; the output must still be a
+    // contiguous 6-bar grid with one synthetic bar bridging the hole.
+    const start = Date.UTC(2025, 0, 1, 0, 0, 0);
+    const end = start + 24 * ONE_HOUR_MS;
+    const gapFrom = start + 16 * ONE_HOUR_MS;
+    const gapTo = start + 20 * ONE_HOUR_MS;
+    vi.stubGlobal('fetch', vi.fn(async (input: string | URL) => {
+      const u = new URL(String(input));
+      const reqStart = new Date(u.searchParams.get('start') ?? 0).getTime();
+      const reqEnd = new Date(u.searchParams.get('end') ?? 0).getTime();
+      const rows: Array<[number, number, number, number, number, number]> = [];
+      for (let t = reqStart; t < reqEnd; t += ONE_HOUR_MS) {
+        if (t >= gapFrom && t < gapTo) continue; // exchange gap — no rows
+        rows.push([t / 1000, 99, 105, 100, 102, 50]);
+      }
+      return new Response(JSON.stringify(rows), { status: 200 });
+    }));
+
+    const promise = fetchCoinbase4hBars('BTC-USD', start, end);
+    await vi.runAllTimersAsync();
+    const bars = await promise;
+
+    expect(bars).toHaveLength(6); // contiguous grid, not 5
+    for (let i = 1; i < bars.length; i++) {
+      expect(bars[i].timestamp - bars[i - 1].timestamp).toBe(FOUR_HOURS_MS);
+    }
+    const synth = bars.find((b) => b.timestamp === start + 16 * ONE_HOUR_MS);
+    expect(synth?.synthetic).toBe(true);
+    expect(synth).toMatchObject({ volume: 0 });
+    expect(summarize4hGaps(bars)).toHaveLength(1);
   });
 });
 

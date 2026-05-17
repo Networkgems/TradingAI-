@@ -263,10 +263,101 @@ export function aggregate1hTo4h(hourly: ReadonlyArray<Candle>): Candle[] {
 }
 
 /**
+ * TRA-427 — a contiguous run of synthetic 4H bars inserted to bridge a
+ * genuine Coinbase exchange data gap. `fromTimestamp`/`toTimestamp` are the
+ * first and last *missing* 4H slots (inclusive); `filledBars` is the count
+ * of synthetic bars used to bridge them.
+ */
+export interface GridGap {
+  fromTimestamp: number;
+  toTimestamp: number;
+  filledBars: number;
+}
+
+/**
+ * TRA-427 — make the 4H grid contiguous and deterministic.
+ *
+ * `aggregate1hTo4h` only emits a 4H bar when all four 1H constituents are
+ * present and contiguous. When Coinbase itself has no 1H data for an interval
+ * — verified exchange-side gaps, e.g. BTC-USD 2025-10-25 16:00–20:00 UTC and
+ * 2026-05-08 00:00–04:00 UTC, where the public-candles endpoint returns no
+ * rows — the affected 4H buckets are simply absent, leaving holes in the grid.
+ *
+ * A hole is not benign: it shifts every downstream MACD / Bollinger window by
+ * one or more bars, and because the exact set of holes depends on which fetch
+ * snapshot Coinbase served, two cache regenerations of the *same* history can
+ * disagree. On a thin 24–35-trade OOS sample that non-determinism is enough to
+ * flip the macd_bollinger edge sign (the TRA-423 §8 regression).
+ *
+ * This function walks the 4H grid from the first to the last real bar and
+ * fills every missing slot with a synthetic **flat** bar — O=H=L=C carry the
+ * prior bar's close, volume 0 — the neutral "no information" choice during an
+ * exchange outage. Synthetic bars are flagged `synthetic: true` so the cache
+ * audit (`verify-4h-cache.ts`) and any downstream consumer can see them. The
+ * result is a gap-free, snapshot-independent grid: a regeneration tomorrow
+ * produces byte-identical history for any window that ends in the past.
+ *
+ * Note this is forward-fill of *genuine exchange gaps only*. Transport-level
+ * fetch failures (429s, timeouts) are handled separately by the breaker /
+ * retry path and never reach here as gaps — a failed window aborts the fetch.
+ */
+export function fillGrid4h(bars: ReadonlyArray<Candle>): Candle[] {
+  if (bars.length === 0) return [];
+  const sorted = [...bars].sort((a, b) => a.timestamp - b.timestamp);
+  const out: Candle[] = [sorted[0]];
+  for (let i = 1; i < sorted.length; i++) {
+    const cur = sorted[i];
+    let expected = out[out.length - 1].timestamp + FOUR_HOURS_MS;
+    // Bridge any missing slots between the previous real bar and `cur`.
+    while (expected < cur.timestamp) {
+      const last = out[out.length - 1];
+      out.push({
+        symbol: last.symbol,
+        timestamp: expected,
+        open: last.close,
+        high: last.close,
+        low: last.close,
+        close: last.close,
+        volume: 0,
+        synthetic: true,
+      });
+      expected += FOUR_HOURS_MS;
+    }
+    out.push(cur);
+  }
+  return out;
+}
+
+/**
+ * TRA-427 — collapse the synthetic bars in a gap-filled 4H series into the
+ * contiguous {@link GridGap} runs they bridge. Used for fetch-time logging and
+ * for the `gaps` audit field persisted into the on-disk cache entry.
+ */
+export function summarize4hGaps(candles: ReadonlyArray<Candle>): GridGap[] {
+  const gaps: GridGap[] = [];
+  let run: GridGap | null = null;
+  for (const c of candles) {
+    if (c.synthetic) {
+      if (run && run.toTimestamp + FOUR_HOURS_MS === c.timestamp) {
+        run.toTimestamp = c.timestamp;
+        run.filledBars += 1;
+      } else {
+        if (run) gaps.push(run);
+        run = { fromTimestamp: c.timestamp, toTimestamp: c.timestamp, filledBars: 1 };
+      }
+    }
+  }
+  if (run) gaps.push(run);
+  return gaps;
+}
+
+/**
  * Fetch 4H OHLCV bars for `symbol` over `[fromMs, toMs)`. Internally pulls
- * 1H bars from Coinbase Exchange and aggregates to 4H — see file-header note
- * on why we don't request `granularity=14400` directly. Returns the same
- * `Candle[]` shape as the existing minute / daily helpers in `crypto-feed.ts`.
+ * 1H bars from Coinbase Exchange, aggregates to 4H — see file-header note on
+ * why we don't request `granularity=14400` directly — and TRA-427 gap-fills
+ * the 4H grid so the result is contiguous and snapshot-deterministic. Returns
+ * the same `Candle[]` shape as the existing minute / daily helpers in
+ * `crypto-feed.ts`; any bar with `synthetic: true` bridges an exchange gap.
  */
 export async function fetchCoinbase4hBars(
   symbol: string,
@@ -274,5 +365,18 @@ export async function fetchCoinbase4hBars(
   toMs: number,
 ): Promise<Candle[]> {
   const hourly = await fetchCoinbaseHourlyBars(symbol, fromMs, toMs);
-  return aggregate1hTo4h(hourly);
+  const filled = fillGrid4h(aggregate1hTo4h(hourly));
+  const gaps = summarize4hGaps(filled);
+  if (gaps.length > 0) {
+    const total = gaps.reduce((s, g) => s + g.filledBars, 0);
+    console.warn(
+      `[coinbase-feed] ${symbol} 4H: bridged ${gaps.length} exchange gap(s) with ${total} synthetic bar(s):`,
+    );
+    for (const g of gaps) {
+      console.warn(
+        `  ${new Date(g.fromTimestamp).toISOString()} … ${new Date(g.toTimestamp).toISOString()} (${g.filledBars} bar(s))`,
+      );
+    }
+  }
+  return filled;
 }
