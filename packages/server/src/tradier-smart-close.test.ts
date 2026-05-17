@@ -1,5 +1,12 @@
 import { describe, it, expect, vi } from 'vitest';
-import { derivePricingPath, reconcilePendingCloseOrder, submitSmartSellToClose } from './tradier-smart-close.js';
+import {
+  computeRepriceLimit,
+  derivePricingPath,
+  PENDING_CLOSE_MAX_REPRICE_STEPS,
+  reconcilePendingCloseOrder,
+  repricePendingCloseOrder,
+  submitSmartSellToClose,
+} from './tradier-smart-close.js';
 import type { TradierOptionQuote, TradierOptionsClient, TradierOrderDetail, TradierOrderResponse } from '@trading-app/engine';
 
 /**
@@ -281,5 +288,138 @@ describe('reconcilePendingCloseOrder', () => {
     const client = buildStatusClient({ id: 6, status: 'filled' } as TradierOrderDetail);
     const outcome = await reconcilePendingCloseOrder(client, 6);
     expect(outcome.status).toBe('unknown');
+  });
+});
+
+/**
+ * TRA-392 — fill-chaser. A `pending` `sell_to_close` that stalls at its
+ * original limit must be cancelled and resubmitted one step lower toward the
+ * bid until it fills, instead of sitting pending forever. These tests cover
+ * the price-walk math and the cancel/reprice primitive.
+ */
+describe('computeRepriceLimit', () => {
+  const MAX = PENDING_CLOSE_MAX_REPRICE_STEPS; // 4
+
+  it('walks the limit monotonically down toward the bid, landing on the bid', () => {
+    // bid 16 / ask 18 → spread 2. Step 1 sits at bid + 0.2·spread, the final
+    // step lands exactly on the bid.
+    const quote: TradierOptionQuote = { symbol: 'X', bid: 16, ask: 18 };
+    const limits = [1, 2, 3, 4].map((s) => computeRepriceLimit(quote, s, MAX));
+    expect(limits).toEqual([16.4, 16.27, 16.13, 16]);
+    // Strictly descending.
+    for (let i = 1; i < limits.length; i += 1) {
+      expect(limits[i]!).toBeLessThan(limits[i - 1]!);
+    }
+  });
+
+  it('clamps steps beyond max to the bid (most-aggressive marketable price)', () => {
+    const quote: TradierOptionQuote = { symbol: 'X', bid: 16, ask: 18 };
+    expect(computeRepriceLimit(quote, 99, MAX)).toBe(16);
+  });
+
+  it('walks a single-sided (last-only) quote down toward — never to — zero', () => {
+    const quote: TradierOptionQuote = { symbol: 'X', ask: 0.3, last: 0.25 };
+    const limits = [1, 2, 3, 4].map((s) => computeRepriceLimit(quote, s, MAX));
+    // last × (steps−k+1)/(steps+1): 0.25·4/5, 3/5, 2/5, 1/5.
+    expect(limits).toEqual([0.2, 0.15, 0.1, 0.05]);
+    expect(limits.every((l) => l! > 0)).toBe(true);
+  });
+
+  it('returns null when no usable quote is available (price floor — no $0 order)', () => {
+    expect(computeRepriceLimit({ symbol: 'X', bid: 0, ask: 0, last: 0 }, 1, MAX)).toBeNull();
+    expect(computeRepriceLimit(null, 1, MAX)).toBeNull();
+  });
+});
+
+describe('repricePendingCloseOrder', () => {
+  type RepriceClient = Pick<TradierOptionsClient, 'getOptionQuote' | 'sellContractsLimit' | 'cancelOrder'>;
+  function buildRepriceClient(overrides: Partial<RepriceClient> = {}): RepriceClient {
+    return {
+      getOptionQuote: vi.fn(async () => ({ symbol: 'X', bid: 16, ask: 18 } as TradierOptionQuote)),
+      sellContractsLimit: vi.fn(async () => ({ id: 900, status: 'ok' } as TradierOrderResponse)),
+      cancelOrder: vi.fn(async () => undefined),
+      ...overrides,
+    };
+  }
+
+  it('cancels the stale order and resubmits one step lower toward the bid', async () => {
+    const cancelSpy = vi.fn(async () => undefined);
+    const sellSpy = vi.fn(async () => ({ id: 901, status: 'ok' } as TradierOrderResponse));
+    const client = buildRepriceClient({ cancelOrder: cancelSpy, sellContractsLimit: sellSpy });
+
+    const outcome = await repricePendingCloseOrder(client, 'X', 3, 800, 1, PENDING_CLOSE_MAX_REPRICE_STEPS);
+
+    expect(outcome).toEqual({ status: 'repriced', orderId: 901, limitPrice: 16.4, step: 1 });
+    // Stale order cancelled BEFORE the resubmit so the close size isn't doubled.
+    expect(cancelSpy).toHaveBeenCalledWith(800);
+    expect(sellSpy).toHaveBeenCalledWith('X', 3, 16.4);
+  });
+
+  it('pulls a fresh quote on every reprice so the limit tracks the live bid/ask', async () => {
+    let call = 0;
+    const quoteSpy = vi.fn(async () => {
+      call += 1;
+      // Bid drifts up between steps — the limit must follow the live quote.
+      return call === 1
+        ? ({ symbol: 'X', bid: 16, ask: 18 } as TradierOptionQuote)
+        : ({ symbol: 'X', bid: 17, ask: 18 } as TradierOptionQuote);
+    });
+    const sellSpy = vi.fn(async () => ({ id: 1, status: 'ok' } as TradierOrderResponse));
+    const client = buildRepriceClient({ getOptionQuote: quoteSpy, sellContractsLimit: sellSpy });
+
+    const first = await repricePendingCloseOrder(client, 'X', 1, 10, 1, PENDING_CLOSE_MAX_REPRICE_STEPS);
+    const second = await repricePendingCloseOrder(client, 'X', 1, 11, 2, PENDING_CLOSE_MAX_REPRICE_STEPS);
+
+    expect(quoteSpy).toHaveBeenCalledTimes(2);
+    // Step 1 off the 16/18 quote: 16 + 2·0.2 = 16.40.
+    expect((first as { limitPrice: number }).limitPrice).toBe(16.4);
+    // Step 2 off the *fresh* 17/18 quote: 17 + 1·(0.2·2/3) = 17.13.
+    expect((second as { limitPrice: number }).limitPrice).toBe(17.13);
+  });
+
+  it('holds (no cancel, no resubmit) when the floor is reached — never a $0 order', async () => {
+    const cancelSpy = vi.fn(async () => undefined);
+    const sellSpy = vi.fn(async () => ({ id: 1, status: 'ok' } as TradierOrderResponse));
+    const client = buildRepriceClient({
+      getOptionQuote: vi.fn(async () => ({ symbol: 'X', bid: 0, ask: 0, last: 0 } as TradierOptionQuote)),
+      cancelOrder: cancelSpy,
+      sellContractsLimit: sellSpy,
+    });
+
+    const outcome = await repricePendingCloseOrder(client, 'X', 1, 800, 1, PENDING_CLOSE_MAX_REPRICE_STEPS);
+
+    expect(outcome.status).toBe('held');
+    // Critically — the original order is left LIVE; we don't cancel into a
+    // no-order limbo and we never submit a $0 order.
+    expect(cancelSpy).not.toHaveBeenCalled();
+    expect(sellSpy).not.toHaveBeenCalled();
+  });
+
+  it('holds when the quote lookup throws (transient broker error)', async () => {
+    const cancelSpy = vi.fn(async () => undefined);
+    const client = buildRepriceClient({
+      getOptionQuote: vi.fn(async () => {
+        throw new Error('socket reset');
+      }),
+      cancelOrder: cancelSpy,
+    });
+
+    const outcome = await repricePendingCloseOrder(client, 'X', 1, 800, 1, PENDING_CLOSE_MAX_REPRICE_STEPS);
+
+    expect(outcome.status).toBe('held');
+    expect(cancelSpy).not.toHaveBeenCalled();
+  });
+
+  it('reports error when the resubmit fails after the cancel went through', async () => {
+    const client = buildRepriceClient({
+      sellContractsLimit: vi.fn(async () => {
+        throw new Error('Tradier order failed (401)');
+      }),
+    });
+
+    const outcome = await repricePendingCloseOrder(client, 'X', 1, 800, 1, PENDING_CLOSE_MAX_REPRICE_STEPS);
+
+    expect(outcome.status).toBe('error');
+    expect((outcome as { reason: string }).reason).toContain('401');
   });
 });

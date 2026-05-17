@@ -5,7 +5,12 @@ import type { TradeSignal, RelativeValueSignal, Candle, OptionsAccountState, Sig
 import { fetchMinuteBars, fetchQuotes, fetchStocksNews, isYahooBreakerOpen, setActiveInterestSymbols } from './yahoo-feed.js';
 import { PaperAccount } from './paper-account.js';
 import { PaperOptionsAccount } from './options-account.js';
-import { reconcilePendingCloseOrder } from './tradier-smart-close.js';
+import {
+  PENDING_CLOSE_MAX_REPRICE_STEPS,
+  PENDING_CLOSE_REPRICE_STALENESS_MS,
+  reconcilePendingCloseOrder,
+  repricePendingCloseOrder,
+} from './tradier-smart-close.js';
 import { submitSmartBuyToOpen } from './tradier-smart-open.js';
 import type { RelativeValueScannerService } from './relative-value-scanner.js';
 import type { DailySignalRecord } from './reports/eod-report.js';
@@ -738,9 +743,9 @@ export class SignalEngine {
     // can't take down the rest of the tick.
     try {
       const summary = await this.reconcilePendingCloses();
-      if (summary.filled + summary.cleared > 0) {
+      if (summary.filled + summary.cleared + summary.repriced > 0) {
         console.log(
-          `[tradier-reconcile] tick summary filled=${summary.filled} cleared=${summary.cleared} stillPending=${summary.stillPending} noClient=${summary.noClient}`,
+          `[tradier-reconcile] tick summary filled=${summary.filled} cleared=${summary.cleared} repriced=${summary.repriced} stillPending=${summary.stillPending} noClient=${summary.noClient}`,
         );
       }
     } catch (err: unknown) {
@@ -1937,8 +1942,12 @@ export class SignalEngine {
    *    — clear `pendingCloseOrderId` so the row re-renders the Close
    *    button. The user can click Close again and the smart-close walk
    *    will resubmit at the current mid.
-   *  - still pending / status fetch failed — no mutation; we try again
-   *    next tick.
+   *  - still pending — TRA-392 fill-chaser. Once the order has sat pending
+   *    past `PENDING_CLOSE_REPRICE_STALENESS_MS`, cancel it and resubmit one
+   *    step lower toward the live bid (`repricePendingCloseOrder`), bounded
+   *    by `PENDING_CLOSE_MAX_REPRICE_STEPS`. Below the staleness window or
+   *    after the walk is exhausted, no mutation — we poll again next tick.
+   *  - status fetch failed (`unknown`) — no mutation; retry next tick.
    *
    * Iterates BOTH env buckets so a sandbox pending close still reconciles
    * while the user is toggled into production (and vice versa); each
@@ -1950,11 +1959,13 @@ export class SignalEngine {
     cleared: number;
     stillPending: number;
     noClient: number;
+    repriced: number;
   }> {
     let filled = 0;
     let cleared = 0;
     let stillPending = 0;
     let noClient = 0;
+    let repriced = 0;
     for (const env of ['sandbox', 'production'] as const) {
       const acct = this.optionsAccounts[env];
       const pending = acct.listPendingCloses();
@@ -1998,8 +2009,53 @@ export class SignalEngine {
                 `[tradier-reconcile] sell_to_close ${row.optionSymbol} env=${env} order=${row.pendingCloseOrderId} terminal-no-fill (${outcome.reason}) — cleared pending so user can retry`,
               );
             }
+          } else if (outcome.status === 'pending') {
+            // TRA-392 — fill-chaser. A `sell_to_close` that's sat pending
+            // past the staleness window is cancelled and resubmitted one
+            // step lower toward the live bid, so closes don't stall at the
+            // original limit. The walk is bounded by a max step count; once
+            // it's exhausted the last (at-the-bid) order just keeps polling.
+            const ageMs = Date.now() - (row.pendingCloseSubmittedAt ?? 0);
+            const stepsDone = row.pendingCloseRepriceSteps ?? 0;
+            const stale = ageMs >= PENDING_CLOSE_REPRICE_STALENESS_MS;
+            if (stale && stepsDone < PENDING_CLOSE_MAX_REPRICE_STEPS && row.contractsRemaining > 0) {
+              const nextStep = stepsDone + 1;
+              const rp = await repricePendingCloseOrder(
+                client,
+                row.optionSymbol,
+                row.contractsRemaining,
+                row.pendingCloseOrderId,
+                nextStep,
+                PENDING_CLOSE_MAX_REPRICE_STEPS,
+              );
+              if (rp.status === 'repriced') {
+                acct.markPendingCloseRepriced(row.optionId, rp.orderId, nextStep);
+                repriced += 1;
+                console.log(
+                  `[tradier-reprice] sell_to_close ${row.optionSymbol} env=${env} step ${nextStep}/${PENDING_CLOSE_MAX_REPRICE_STEPS} order ${row.pendingCloseOrderId}→${rp.orderId} @${rp.limitPrice.toFixed(2)}`,
+                );
+              } else if (rp.status === 'error') {
+                // Cancel went through but the resubmit failed — the old
+                // order is gone. Clear pending so the row re-renders Close
+                // (imported) / `checkExits` can retry (engine-opened).
+                if (acct.clearPendingCloseOrderId(row.optionId)) {
+                  cleared += 1;
+                  console.warn(
+                    `[tradier-reprice] sell_to_close ${row.optionSymbol} env=${env} reprice failed (${rp.reason}) — cleared pending so it can be re-closed`,
+                  );
+                }
+              } else {
+                // held — no usable lower price this tick; original order
+                // stays live and pending. Retry next tick.
+                stillPending += 1;
+              }
+            } else {
+              // Not stale yet, walk exhausted, or zero contracts — leave the
+              // pending order in place.
+              stillPending += 1;
+            }
           } else {
-            // pending or unknown — still in flight, leave the row alone.
+            // unknown — status lookup failed; leave the row alone and retry.
             stillPending += 1;
           }
         } catch (err: unknown) {
@@ -2013,7 +2069,7 @@ export class SignalEngine {
         }
       }
     }
-    return { filled, cleared, stillPending, noClient };
+    return { filled, cleared, stillPending, noClient, repriced };
   }
 
   /**

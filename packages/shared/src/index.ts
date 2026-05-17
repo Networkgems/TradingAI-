@@ -1182,6 +1182,24 @@ export interface OptionPosition {
    */
   pendingCloseOrderId?: number | string;
   /**
+   * TRA-392 — wall-clock ms when {@link pendingCloseOrderId} was last
+   * (re)stamped, either by the initial smart-close submit or by a fill-chaser
+   * reprice. The engine's per-tick close reconciler uses this to decide when a
+   * still-pending `sell_to_close` has gone stale and should be cancelled +
+   * resubmitted one step lower toward the bid. Absent on snapshots persisted
+   * before this field existed; absent ↔ "stale immediately" so a leftover
+   * pending order from a previous session gets repriced on the next tick.
+   */
+  pendingCloseSubmittedAt?: number;
+  /**
+   * TRA-392 — how many times the fill-chaser has cancelled + repriced the
+   * pending `sell_to_close` down toward the bid. Bounds the walk: once it
+   * reaches the configured max-steps the reconciler stops repricing and just
+   * polls the (most-aggressive, at-the-bid) order. Reset to 0 each time a
+   * fresh close order is stamped via the normal close path.
+   */
+  pendingCloseRepriceSteps?: number;
+  /**
    * TRA-354 — engine-fired exit (TP1 partial / SL / trailing) has submitted
    * a Tradier `sell_to_close` LIMIT order and is waiting for the broker to
    * confirm. While this is set, the paper book holds the position open;

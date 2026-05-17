@@ -1382,6 +1382,197 @@ describe('SignalEngine — TRA-352 pending-close reconciler', () => {
   });
 });
 
+// TRA-392 — fill-chaser. A `sell_to_close` that stalls `pending` past the
+// staleness window must be cancelled and resubmitted one step lower toward
+// the bid by the engine's per-tick close reconciler, instead of sitting at
+// the original limit until the operator manually reprices it. These tests
+// drive `reconcilePendingCloses` against stub Tradier clients with the clock
+// advanced past the staleness window.
+describe('SignalEngine — TRA-392 pending-close fill-chaser', () => {
+  interface ChaserClient {
+    getOrderStatus: ReturnType<typeof vi.fn>;
+    getOptionQuote: ReturnType<typeof vi.fn>;
+    cancelOrder: ReturnType<typeof vi.fn>;
+    sellContractsLimit: ReturnType<typeof vi.fn>;
+  }
+  interface ChaserAcct {
+    openOptionFromCandidate(sig: unknown, mode: 'live'): { id: string } | null;
+    setPendingCloseOrderId(id: string, orderId: number): boolean;
+    getState(): {
+      openOptions: Array<{
+        id: string;
+        contractsRemaining: number;
+        pendingCloseOrderId?: number | string;
+        pendingCloseRepriceSteps?: number;
+      }>;
+      closedOptions: Array<{ id: string; currentPremium: number }>;
+    };
+  }
+  type Internals = {
+    tradierOptionsClientByEnv: Record<TradierEnv, unknown>;
+    optionsAccounts: Record<TradierEnv, ChaserAcct>;
+  };
+
+  const T0 = Date.parse('2024-06-04T15:00:00Z');
+
+  function asInternals(engine: SignalEngine): Internals {
+    return engine as unknown as Internals;
+  }
+
+  function openPendingRow(engine: SignalEngine, client: ChaserClient, orderId: number) {
+    asInternals(engine).tradierOptionsClientByEnv = { sandbox: client, production: null };
+    const acct = asInternals(engine).optionsAccounts.sandbox;
+    const opened = acct.openOptionFromCandidate(
+      {
+        id: 'sig',
+        symbol: 'AAPL',
+        type: 'otm_mispricing',
+        side: 'buy',
+        entryPrice: 1.0,
+        stopLoss: 0.75,
+        takeProfit: 1.5,
+        riskRewardRatio: 2,
+        timestamp: TRADING_TIME,
+        optionSymbol: 'AAPL240705C00200000',
+        optionType: 'call',
+        strike: 200,
+        expiration: '2024-07-05',
+        mark: 1.0,
+        theo: 1.3,
+        mispricingPct: -0.23,
+        delta: 0.18,
+      },
+      'live',
+    );
+    if (!opened) throw new Error('test setup: failed to open option');
+    acct.setPendingCloseOrderId(opened.id, orderId);
+    return { acct, optionId: opened.id };
+  }
+
+  beforeEach(() => {
+    vi.useFakeTimers();
+    vi.setSystemTime(T0);
+  });
+  afterEach(() => {
+    vi.useRealTimers();
+  });
+
+  it('cancels and reprices a stale pending close one step down toward the bid', async () => {
+    const client: ChaserClient = {
+      getOrderStatus: vi.fn(async () => ({ id: 700, status: 'open' })),
+      getOptionQuote: vi.fn(async () => ({ symbol: 'AAPL240705C00200000', bid: 16, ask: 18 })),
+      cancelOrder: vi.fn(async () => undefined),
+      sellContractsLimit: vi.fn(async () => ({ id: 5555, status: 'ok' })),
+    };
+    const engine = new SignalEngine();
+    const { acct, optionId } = openPendingRow(engine, client, 700);
+    const contracts = acct.getState().openOptions.find((o) => o.id === optionId)!.contractsRemaining;
+
+    // Order has sat pending past the 20s staleness window.
+    vi.setSystemTime(T0 + 25_000);
+    const summary = await engine.reconcilePendingCloses();
+
+    expect(summary.repriced).toBe(1);
+    expect(summary.stillPending).toBe(0);
+    // Stale order cancelled, fresh limit submitted at bid + 0.2·spread = 16.40.
+    expect(client.cancelOrder).toHaveBeenCalledWith(700);
+    expect(client.sellContractsLimit).toHaveBeenCalledWith('AAPL240705C00200000', contracts, 16.4);
+    const row = acct.getState().openOptions.find((o) => o.id === optionId);
+    expect(row?.pendingCloseOrderId).toBe(5555);
+    expect(row?.pendingCloseRepriceSteps).toBe(1);
+  });
+
+  it('leaves a fresh pending close alone until it crosses the staleness window', async () => {
+    const client: ChaserClient = {
+      getOrderStatus: vi.fn(async () => ({ id: 700, status: 'open' })),
+      getOptionQuote: vi.fn(async () => ({ symbol: 'AAPL240705C00200000', bid: 16, ask: 18 })),
+      cancelOrder: vi.fn(async () => undefined),
+      sellContractsLimit: vi.fn(async () => ({ id: 5555, status: 'ok' })),
+    };
+    const engine = new SignalEngine();
+    openPendingRow(engine, client, 700);
+
+    // Reconcile immediately — the order is only milliseconds old.
+    const summary = await engine.reconcilePendingCloses();
+
+    expect(summary.repriced).toBe(0);
+    expect(summary.stillPending).toBe(1);
+    expect(client.cancelOrder).not.toHaveBeenCalled();
+    expect(client.sellContractsLimit).not.toHaveBeenCalled();
+  });
+
+  it('closes the row at the broker fill once a repriced order fills on a later tick', async () => {
+    const client: ChaserClient = {
+      getOrderStatus: vi.fn(async () => ({ id: 700, status: 'open' })),
+      getOptionQuote: vi.fn(async () => ({ symbol: 'AAPL240705C00200000', bid: 16, ask: 18 })),
+      cancelOrder: vi.fn(async () => undefined),
+      sellContractsLimit: vi.fn(async () => ({ id: 5555, status: 'ok' })),
+    };
+    const engine = new SignalEngine();
+    const { acct, optionId } = openPendingRow(engine, client, 700);
+
+    // Tick 1: stale → reprice down to 16.40 (new order 5555).
+    vi.setSystemTime(T0 + 25_000);
+    await engine.reconcilePendingCloses();
+
+    // Tick 2: the repriced order fills at the bid-tracking limit.
+    client.getOrderStatus.mockResolvedValue({ id: 5555, status: 'filled', avg_fill_price: 16.4 });
+    vi.setSystemTime(T0 + 60_000);
+    const summary = await engine.reconcilePendingCloses();
+
+    expect(summary.filled).toBe(1);
+    const state = acct.getState();
+    expect(state.openOptions.find((o) => o.id === optionId)).toBeUndefined();
+    expect(state.closedOptions.find((o) => o.id === optionId)?.currentPremium).toBeCloseTo(16.4, 5);
+  });
+
+  it('holds the live order without repricing when the floor is reached (no $0 order)', async () => {
+    const client: ChaserClient = {
+      getOrderStatus: vi.fn(async () => ({ id: 700, status: 'open' })),
+      // Dead contract — no usable bid/ask/last, so no lower limit can be priced.
+      getOptionQuote: vi.fn(async () => ({ symbol: 'AAPL240705C00200000', bid: 0, ask: 0, last: 0 })),
+      cancelOrder: vi.fn(async () => undefined),
+      sellContractsLimit: vi.fn(async () => ({ id: 5555, status: 'ok' })),
+    };
+    const engine = new SignalEngine();
+    const { acct, optionId } = openPendingRow(engine, client, 700);
+
+    vi.setSystemTime(T0 + 25_000);
+    const summary = await engine.reconcilePendingCloses();
+
+    expect(summary.repriced).toBe(0);
+    expect(summary.stillPending).toBe(1);
+    // Original order left LIVE — never cancelled into a no-order limbo.
+    expect(client.cancelOrder).not.toHaveBeenCalled();
+    expect(client.sellContractsLimit).not.toHaveBeenCalled();
+    expect(acct.getState().openOptions.find((o) => o.id === optionId)?.pendingCloseOrderId).toBe(700);
+  });
+
+  it('stops repricing once the bounded walk is exhausted', async () => {
+    const client: ChaserClient = {
+      getOrderStatus: vi.fn(async () => ({ id: 700, status: 'open' })),
+      getOptionQuote: vi.fn(async () => ({ symbol: 'AAPL240705C00200000', bid: 16, ask: 18 })),
+      cancelOrder: vi.fn(async () => undefined),
+      sellContractsLimit: vi.fn(async (_s: string, _q: number, _p: number) => ({ id: 5000, status: 'ok' })),
+    };
+    const engine = new SignalEngine();
+    const { acct, optionId } = openPendingRow(engine, client, 700);
+
+    // Run enough stale ticks to exhaust the 4-step walk, then one more.
+    for (let i = 1; i <= 6; i += 1) {
+      vi.setSystemTime(T0 + i * 25_000);
+      await engine.reconcilePendingCloses();
+    }
+
+    // The walk caps at PENDING_CLOSE_MAX_REPRICE_STEPS (4) resubmits.
+    expect(client.sellContractsLimit).toHaveBeenCalledTimes(4);
+    const row = acct.getState().openOptions.find((o) => o.id === optionId);
+    expect(row?.pendingCloseRepriceSteps).toBe(4);
+    // Final step lands exactly on the bid (most-aggressive marketable price).
+    expect(client.sellContractsLimit).toHaveBeenLastCalledWith('AAPL240705C00200000', expect.any(Number), 16);
+  });
+});
+
 // TRA-356 — periodic portfolio reconcile while live mode is active. The
 // engine pulls Tradier's open positions on a cadence and feeds them
 // through the existing `reconcileTradierPositions` rules so manual

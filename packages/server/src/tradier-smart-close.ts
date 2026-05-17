@@ -302,3 +302,144 @@ function priceForAttempt(path: MidPath | LastPath, attempt: number): number {
   const fraction = Math.max(0, 0.5 / Math.pow(2, attempt));
   return path.bid + spread * fraction;
 }
+
+/* -------------------------------------------------------------------------
+ * TRA-392 — fill-chaser repricer for stuck `pending` sell_to_close orders.
+ * ---------------------------------------------------------------------- */
+
+/**
+ * TRA-392 — fill-chaser tuning. Hardcoded defaults (no settings knob — see
+ * TRA-392 AC #5) documented here as the single source of truth:
+ *
+ *  - {@link PENDING_CLOSE_REPRICE_STALENESS_MS} — a `sell_to_close` must sit
+ *    `pending`/`open` at least this long before the per-tick reconciler
+ *    cancels and resubmits it one step lower. The engine tick is ~30s, so 20s
+ *    means a pending order stamped on tick N is repriced on tick N+1 — every
+ *    price level gets one full tick (~30s) to fill before stepping down.
+ *  - {@link PENDING_CLOSE_MAX_REPRICE_STEPS} — hard cap on cancel+reprice
+ *    cycles. After this many steps the reconciler stops walking and just
+ *    polls; by the final step the order sits exactly on the bid (a sell limit
+ *    at the bid is immediately marketable), which is the most aggressive
+ *    price the chaser will ever use.
+ */
+export const PENDING_CLOSE_REPRICE_STALENESS_MS = 20_000;
+export const PENDING_CLOSE_MAX_REPRICE_STEPS = 4;
+
+/**
+ * TRA-392 — fraction of the bid/ask spread the chaser's FIRST reprice step
+ * sits above the bid. The smart-close walk ({@link submitSmartSellToClose})
+ * leaves its pending order at `bid + 0.25 × spread` (attempt 1 of a 2-attempt
+ * walk), so the chaser starts just below that and walks down to the bid.
+ */
+const CHASE_START_FRACTION = 0.2;
+
+/**
+ * TRA-392 — outcome of {@link repricePendingCloseOrder}:
+ *  - `repriced` → the stale order was cancelled and a fresh limit
+ *    `sell_to_close` was submitted at `limitPrice`; caller restamps the row
+ *    with the new `orderId` and bumps the reprice-step counter.
+ *  - `held` → no usable lower limit could be priced (no quote this tick, or
+ *    the price floor was reached). The ORIGINAL order is left live and
+ *    pending — we never cancel into a no-order limbo. Caller leaves the row
+ *    alone and tries again next tick.
+ *  - `error` → the cancel went through but the resubmit failed; the original
+ *    order is gone. Caller clears the pending marker so the row re-renders
+ *    Close (imported) or lets `checkExits` retry (engine-opened).
+ */
+export type RepriceOutcome =
+  | { status: 'repriced'; orderId: number; limitPrice: number; step: number }
+  | { status: 'held'; reason: string }
+  | { status: 'error'; reason: string };
+
+/**
+ * TRA-392 — compute the limit price for the n-th fill-chaser reprice step,
+ * pulling the geometry from a FRESH option quote. Exported for unit tests.
+ *
+ * Mid path (bid > 0 and ask > 0): walk the limit down toward the bid. Step 1
+ * sits at `bid + 0.2 × spread` (just below where {@link submitSmartSellToClose}
+ * left the order); the final step lands exactly on the bid. Linear in between.
+ *
+ * Last path (single-sided quote — no bid to anchor on): walk the limit down
+ * toward, but never reaching, zero (`step k → last × (steps−k+1)/(steps+1)`),
+ * so we never submit a $0 order Tradier would reject.
+ *
+ * Returns `null` when no usable quote is available or the computed limit
+ * rounds to ≤ 0 — the caller treats `null` as "hold, don't reprice".
+ */
+export function computeRepriceLimit(
+  quote: TradierOptionQuote | null,
+  step: number,
+  maxSteps: number,
+): number | null {
+  const path = derivePricingPath(quote);
+  if (path.kind === 'none') return null;
+  const steps = Math.max(1, Math.floor(maxSteps));
+  const k = Math.min(Math.max(1, Math.floor(step)), steps);
+  let raw: number;
+  if (path.kind === 'mid') {
+    const spread = Math.max(0, path.ask - path.bid);
+    // fraction: step 1 → CHASE_START_FRACTION, final step → 0 (the bid).
+    const fraction = steps <= 1 ? 0 : (CHASE_START_FRACTION * (steps - k)) / (steps - 1);
+    raw = path.bid + spread * fraction;
+  } else {
+    // Single-sided quote — walk down toward (never reaching) zero.
+    raw = (path.last * (steps - k + 1)) / (steps + 1);
+  }
+  const limit = roundToCent(raw);
+  if (!Number.isFinite(limit) || limit <= 0) return null;
+  return limit;
+}
+
+/**
+ * TRA-392 — fill-chaser. Cancel a stale `pending` `sell_to_close` and
+ * resubmit it one step lower toward the live bid so closes don't stall at the
+ * original limit. Called by the engine's per-tick close reconciler once an
+ * order has been pending past {@link PENDING_CLOSE_REPRICE_STALENESS_MS}.
+ *
+ * Order of operations matters for AC #3 (never leave the row with no live
+ * order): we pull a fresh quote and compute the next limit BEFORE touching
+ * the broker. If no valid lower limit can be priced we return `held` and the
+ * existing order stays live. Only once we have a real limit do we cancel the
+ * stale order and submit the replacement.
+ */
+export async function repricePendingCloseOrder(
+  client: Pick<TradierOptionsClient, 'getOptionQuote' | 'sellContractsLimit' | 'cancelOrder'>,
+  optionSymbol: string,
+  qty: number,
+  currentOrderId: number | string,
+  step: number,
+  maxSteps: number,
+): Promise<RepriceOutcome> {
+  // AC #2 — fresh quote every reprice so the new limit tracks the live
+  // bid/ask, not the stale quote from the original submit.
+  let quote: TradierOptionQuote | null;
+  try {
+    quote = await client.getOptionQuote(optionSymbol);
+  } catch (err: unknown) {
+    return {
+      status: 'held',
+      reason: `quote lookup failed: ${err instanceof Error ? err.message : String(err)}`,
+    };
+  }
+  // AC #3 — price the next step before cancelling. A null limit (no quote /
+  // floor reached) means we hold: the existing order stays live and pending.
+  const limitPrice = computeRepriceLimit(quote, step, maxSteps);
+  if (limitPrice === null) {
+    return { status: 'held', reason: 'no usable quote / price floor reached' };
+  }
+  // Cancel the stale order first so the resubmit doesn't double the close
+  // size. Best-effort: Tradier sometimes 422s if the order already
+  // terminated between the reconcile poll and here — the resubmit proceeds.
+  try {
+    await client.cancelOrder(currentOrderId);
+  } catch {
+    // Swallow — proceed to resubmit at the lower limit.
+  }
+  let order;
+  try {
+    order = await client.sellContractsLimit(optionSymbol, qty, limitPrice);
+  } catch (err: unknown) {
+    return { status: 'error', reason: err instanceof Error ? err.message : String(err) };
+  }
+  return { status: 'repriced', orderId: order.id, limitPrice, step };
+}

@@ -1412,6 +1412,8 @@ export class PaperOptionsAccount {
     opt.currentPremium = avgFillPrice;
     opt.contractsRemaining = 0;
     delete opt.pendingCloseOrderId;
+    delete opt.pendingCloseSubmittedAt; // TRA-392 — clear fill-chaser bookkeeping
+    delete opt.pendingCloseRepriceSteps;
     this.openOptions.delete(optionId);
     this.closedOptions.push({ ...opt });
     // TRA-367 — surface realised P&L immediately on the Live pill instead
@@ -1466,6 +1468,27 @@ export class PaperOptionsAccount {
     const opt = this.openOptions.get(optionId);
     if (!opt) return false;
     opt.pendingCloseOrderId = orderId;
+    // TRA-392 — stamp the submit time and reset the fill-chaser step counter
+    // so the per-tick close reconciler can age this order and walk it down
+    // toward the bid once it goes stale.
+    opt.pendingCloseSubmittedAt = Date.now();
+    opt.pendingCloseRepriceSteps = 0;
+    return true;
+  }
+
+  /**
+   * TRA-392 — restamp a pending close after the fill-chaser cancelled the
+   * stale order and resubmitted a fresh limit one step lower toward the bid.
+   * Updates the order id, refreshes the staleness clock, and records how many
+   * reprice steps have been taken so the reconciler can bound the walk.
+   * Returns true only when a row was matched.
+   */
+  markPendingCloseRepriced(optionId: string, newOrderId: number | string, step: number): boolean {
+    const opt = this.openOptions.get(optionId);
+    if (!opt) return false;
+    opt.pendingCloseOrderId = newOrderId;
+    opt.pendingCloseSubmittedAt = Date.now();
+    opt.pendingCloseRepriceSteps = step;
     return true;
   }
 
@@ -1481,6 +1504,10 @@ export class PaperOptionsAccount {
     if (!opt) return false;
     if (opt.pendingCloseOrderId === undefined) return false;
     delete opt.pendingCloseOrderId;
+    // TRA-392 — drop the fill-chaser bookkeeping alongside the order id so a
+    // future close starts a fresh walk.
+    delete opt.pendingCloseSubmittedAt;
+    delete opt.pendingCloseRepriceSteps;
     return true;
   }
 
@@ -1498,12 +1525,18 @@ export class PaperOptionsAccount {
     optionSymbol: string;
     pendingCloseOrderId: number | string;
     importedFromTradier: boolean;
+    contractsRemaining: number;
+    pendingCloseSubmittedAt?: number;
+    pendingCloseRepriceSteps?: number;
   }> {
     const out: Array<{
       optionId: string;
       optionSymbol: string;
       pendingCloseOrderId: number | string;
       importedFromTradier: boolean;
+      contractsRemaining: number;
+      pendingCloseSubmittedAt?: number;
+      pendingCloseRepriceSteps?: number;
     }> = [];
     for (const opt of this.openOptions.values()) {
       if (opt.pendingCloseOrderId === undefined) continue;
@@ -1513,6 +1546,11 @@ export class PaperOptionsAccount {
         optionSymbol: opt.optionSymbol,
         pendingCloseOrderId: opt.pendingCloseOrderId,
         importedFromTradier: opt.importedFromTradier === true,
+        // TRA-392 — the fill-chaser needs the close size to resubmit and the
+        // submit time / step counter to age + bound the walk.
+        contractsRemaining: opt.contractsRemaining,
+        pendingCloseSubmittedAt: opt.pendingCloseSubmittedAt,
+        pendingCloseRepriceSteps: opt.pendingCloseRepriceSteps,
       });
     }
     return out;
@@ -1558,6 +1596,8 @@ export class PaperOptionsAccount {
     opt.currentPremium = effectiveExit;
     opt.contractsRemaining = 0;
     delete opt.pendingCloseOrderId;
+    delete opt.pendingCloseSubmittedAt; // TRA-392 — clear fill-chaser bookkeeping
+    delete opt.pendingCloseRepriceSteps;
     this.cash += effectiveExit * remainingContracts * 100 - exitFee;
     this.equity += pnl - exitFee;
     // TRA-246 — same per-mode attribution as the auto-exit paths above.
