@@ -13,6 +13,10 @@ services:
     envVars:
       - key: AUTH_SECRET
         generateValue: true
+      # TRA-404 — session-token max lifetime in hours. Leave unset for the
+      # 24h default; `verifyToken` rejects any token older than this.
+      - key: AUTH_TOKEN_TTL_HOURS
+        sync: false
       - key: NODE_ENV
         value: production
       - key: NODE_VERSION

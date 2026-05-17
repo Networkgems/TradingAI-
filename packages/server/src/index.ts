@@ -15,6 +15,7 @@ import {
   findPreviousBalanceSnapshot,
 } from './reports/tradier-reconcile.js';
 import { createToken, verifyToken, generateResetToken, consumeResetToken, initResetTokenStore } from './auth.js';
+import { checkThrottle, recordFailure, recordSuccess } from './auth-throttle.js';
 import { getSettings, mergeScopedRiskSettings, saveSettings } from './account-settings.js';
 import {
   initWatchlistStore,
@@ -196,6 +197,10 @@ void getLatestMarketReview().then(existing => {
 });
 
 const app = express();
+// TRA-404 — behind Render's proxy the socket address is the proxy, not the
+// client. Trust the X-Forwarded-For chain so `req.ip` is the real caller IP
+// (used to key the auth-endpoint brute-force throttle).
+app.set('trust proxy', true);
 
 // ── CORS ─────────────────────────────────────────────────────────────────────
 
@@ -1091,13 +1096,45 @@ app.get('/api/health/storage', async (_req, res) => {
 
 // ── Auth endpoints ────────────────────────────────────────────────────────────
 
+// TRA-404 / C2 — brute-force throttle for the auth endpoints. `clientKey`
+// buckets attempts by the real caller IP (see `trust proxy` above); login also
+// buckets per-username so a distributed attack on one account is still caught.
+function clientKey(req: express.Request): string {
+  return req.ip ?? req.socket.remoteAddress ?? 'unknown';
+}
+
+// If any of `keys` is currently throttled, write a 429 (with Retry-After) and
+// return true so the caller can bail out before doing the expensive auth work.
+function rejectIfThrottled(res: express.Response, keys: string[]): boolean {
+  let worst = 0;
+  for (const key of keys) {
+    const d = checkThrottle(key);
+    if (d.blocked) worst = Math.max(worst, d.retryAfterSec);
+  }
+  if (worst > 0) {
+    res.setHeader('Retry-After', String(worst));
+    res.status(429).json({
+      error: `Too many attempts. Try again in ${worst}s.`,
+      retryAfterSec: worst,
+    });
+    return true;
+  }
+  return false;
+}
+
 app.post('/api/auth/login', async (req, res) => {
   const { username, password } = req.body as { username?: string; password?: string };
   if (typeof username !== 'string' || typeof password !== 'string') {
     res.status(400).json({ error: 'username and password are required' });
     return;
   }
+  const ipKey = `login:ip:${clientKey(req)}`;
+  const userKey = `login:user:${username.toLowerCase()}`;
+  if (rejectIfThrottled(res, [ipKey, userKey])) return;
+
   if (!(await validateUserCredentials(username, password))) {
+    recordFailure(ipKey);
+    recordFailure(userKey);
     res.status(401).json({ error: 'Invalid username or password' });
     return;
   }
@@ -1107,6 +1144,9 @@ app.post('/api/auth/login', async (req, res) => {
     res.status(423).json({ error: 'Account is locked. Contact an administrator.' });
     return;
   }
+  // Valid credentials → wipe the brute-force counters for this caller/account.
+  recordSuccess(ipKey);
+  recordSuccess(userKey);
   res.json({ token: createToken(username) });
 });
 
@@ -1141,6 +1181,12 @@ app.post('/api/auth/forgot-password', async (req, res) => {
     res.status(400).json({ error: 'A valid email address is required' });
     return;
   }
+  // TRA-404 / C2 — throttle by IP to stop reset-email flooding. Every request
+  // counts toward the limit (the endpoint always returns ok, so there is no
+  // "success" to clear); honest users only ever call it once or twice.
+  const forgotKey = `forgot:ip:${clientKey(req)}`;
+  if (rejectIfThrottled(res, [forgotKey])) return;
+  recordFailure(forgotKey);
   const user = getUserByEmail(email);
   if (user) {
     const code = generateResetToken(user.username);
@@ -1163,11 +1209,18 @@ app.post('/api/auth/reset-password', async (req, res) => {
     res.status(400).json({ error: 'Password must be at least 6 characters' });
     return;
   }
+  // TRA-404 / C2 — the reset code is an 8-digit number; throttle by IP so it
+  // cannot be brute-forced.
+  const resetKey = `reset:ip:${clientKey(req)}`;
+  if (rejectIfThrottled(res, [resetKey])) return;
+
   const username = consumeResetToken(code);
   if (!username) {
+    recordFailure(resetKey);
     res.status(400).json({ error: 'Invalid or expired reset code' });
     return;
   }
+  recordSuccess(resetKey);
   await changeUserPassword(username, newPassword);
   res.json({ ok: true, message: 'Password has been reset. You can now log in.' });
 });

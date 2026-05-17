@@ -2,14 +2,68 @@ import { createHmac, randomBytes, timingSafeEqual } from 'node:crypto';
 import { readFileSync, writeFileSync, existsSync } from 'fs';
 import { join } from 'path';
 
-const SECRET = process.env.AUTH_SECRET ?? randomBytes(32).toString('hex');
+/**
+ * Resolve the HMAC signing secret (TRA-404).
+ *
+ * On Render, `render.yaml` injects `AUTH_SECRET` via `generateValue: true`,
+ * which Render generates once and persists across deploys — so the env var is
+ * always present in production. The old `?? randomBytes(32)` fallback silently
+ * span up an *ephemeral* secret whenever the env var was missing, which on a
+ * non-Render production host means every restart invalidates all sessions and
+ * old `?? randomBytes(32)` fallback silently spun up an *ephemeral* secret
+ * whenever the env var was missing, which on a non-Render production host
+ * means every restart invalidates all sessions and the operator never finds
+ * out. Fail loud there instead; keep the ephemeral fallback (with a loud
+ * warning) only for local dev / tests.
+ */
+function resolveAuthSecret(): string {
+  const fromEnv = process.env.AUTH_SECRET;
+  if (fromEnv && fromEnv.length > 0) return fromEnv;
+
+  const onRender = !!process.env.RENDER;
+  const isProd = process.env.NODE_ENV === 'production';
+  if (isProd && !onRender) {
+    throw new Error(
+      'AUTH_SECRET is not set. Refusing to start in production with an ephemeral ' +
+        'signing key — every restart would silently invalidate all sessions. Set ' +
+        'AUTH_SECRET in the environment (Render injects it automatically via ' +
+        'render.yaml `generateValue: true`).',
+    );
+  }
+  console.warn(
+    '[auth] AUTH_SECRET is not set — using an ephemeral random secret. All ' +
+      'sessions will be invalidated when the process restarts. Set AUTH_SECRET ' +
+      'for stable sessions.',
+  );
+  return randomBytes(32).toString('hex');
+}
+
+const SECRET = resolveAuthSecret();
+
+/**
+ * Max session-token lifetime in ms (TRA-404 / C1). Configurable via
+ * `AUTH_TOKEN_TTL_HOURS`; defaults to 24h. Invalid / non-positive values fall
+ * back to the default so a typo can never disable expiry.
+ */
+export function resolveTtlMs(raw: string | undefined): number {
+  const DEFAULT_HOURS = 24;
+  const hours = raw === undefined || raw.trim() === '' ? DEFAULT_HOURS : Number(raw);
+  if (!Number.isFinite(hours) || hours <= 0) return DEFAULT_HOURS * 60 * 60 * 1000;
+  return hours * 60 * 60 * 1000;
+}
+
+export const TOKEN_TTL_MS = resolveTtlMs(process.env.AUTH_TOKEN_TTL_HOURS);
 
 function sign(encoded: string): string {
   return createHmac('sha256', SECRET).update(encoded).digest('base64url');
 }
 
-export function createToken(username: string): string {
-  const payload = Buffer.from(JSON.stringify({ sub: username, iat: Date.now() })).toString('base64url');
+/**
+ * Issue a signed session token. `issuedAt` defaults to now; an explicit value
+ * exists for tests that need to simulate an aged token.
+ */
+export function createToken(username: string, issuedAt: number = Date.now()): string {
+  const payload = Buffer.from(JSON.stringify({ sub: username, iat: issuedAt })).toString('base64url');
   return `${payload}.${sign(payload)}`;
 }
 
@@ -28,7 +82,13 @@ export function verifyToken(token: string): string | null {
   }
   try {
     const data = JSON.parse(Buffer.from(payload, 'base64url').toString());
-    return typeof data.sub === 'string' ? data.sub : null;
+    if (typeof data.sub !== 'string') return null;
+    // C1 (TRA-404): enforce a max token lifetime. `createToken` always stamps a
+    // numeric `iat`, so a token missing/!finite `iat` is malformed or forged →
+    // reject. Tokens older than TOKEN_TTL_MS are expired → reject.
+    if (typeof data.iat !== 'number' || !Number.isFinite(data.iat)) return null;
+    if (Date.now() - data.iat > TOKEN_TTL_MS) return null;
+    return data.sub;
   } catch {
     return null;
   }
