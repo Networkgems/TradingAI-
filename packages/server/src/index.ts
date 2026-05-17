@@ -29,6 +29,11 @@ import { scanStocksMarket, scanCryptoMarket } from './market-scanner.js';
 import { runPremarketForAllUsers } from './premarket-watchlist.js';
 import { recordOptionChains } from './options-chain-recorder.js';
 import {
+  generateMarketReview,
+  getLatestMarketReview,
+  listMarketReviews,
+} from './market-review.js';
+import {
   loadUsers,
   validateUserCredentials,
   changeUserPassword,
@@ -179,6 +184,16 @@ await initAllUserContexts();
 // No-op once the store has at least one report, so real reports posted via
 // `/api/research/reports` aren't shadowed.
 await seedSampleResearchReportIfEmpty();
+
+// TRA-386 — warm the market-review feed on boot so `/api/market-review/latest`
+// and the News tab have a regime read before the first scheduled fire. Fired
+// non-blocking: a cold/slow Yahoo feed must not delay server startup.
+void getLatestMarketReview().then(existing => {
+  if (existing) return;
+  void generateMarketReview('premarket').catch(err =>
+    console.error('[market-review] boot-time generation failed:', err),
+  );
+});
 
 const app = express();
 
@@ -1290,6 +1305,46 @@ app.get('/api/research/reports/:id', requireAuth, async (req, res) => {
     return;
   }
   res.json(report);
+});
+
+// TRA-386 — automated market-review feed. The scheduler regenerates this at
+// 9 AM ET (pre-market) and 9 PM ET (post-market); the signal engine and
+// watchlist builder pull the latest regime gates from here instead of waiting
+// on a hand-written QuantTrader review.
+//
+// `GET /api/market-review/latest` — most recent review; `?kind=premarket` or
+// `?kind=postmarket` scopes it. Returns 404 before the first scheduler fire.
+app.get('/api/market-review/latest', requireAuth, async (req, res) => {
+  const rawKind = (req.query as Record<string, unknown>)['kind'];
+  const kind =
+    rawKind === 'premarket' || rawKind === 'postmarket' ? rawKind : undefined;
+  const review = await getLatestMarketReview(kind);
+  if (!review) {
+    res.status(404).json({ error: 'No market review available yet' });
+    return;
+  }
+  res.json(review);
+});
+
+app.get('/api/market-review', requireAuth, async (_req, res) => {
+  res.json(await listMarketReviews());
+});
+
+// Admin-only on-demand regeneration — lets QA / the desk refresh the review
+// without waiting for the next scheduler fire.
+app.post('/api/market-review/run', requireAuth, requireAdmin, async (req, res) => {
+  const rawKind = (req.body as Record<string, unknown> | undefined)?.['kind'];
+  const kind = rawKind === 'postmarket' ? 'postmarket' : 'premarket';
+  try {
+    const review = await generateMarketReview(kind);
+    res.status(201).json(review);
+  } catch (err) {
+    console.error(
+      '[market-review] on-demand run failed:',
+      err instanceof Error ? err.message : String(err),
+    );
+    res.status(500).json({ error: 'Failed to generate market review' });
+  }
 });
 
 // TRA-244 — `?mode=` lets the client pick which calendar bucket to read.
@@ -2562,7 +2617,15 @@ scheduler.start({
   // ran before the reset, leaving the row visible at 4:05 but the dashboard
   // still showing the stale total until 9). Stocks generation is gated on
   // market days inside the callback; crypto fires every day (24/7).
-  onArchive: runDailyCloseForAllUsers,
+  //
+  // TRA-386 — the post-market regime review runs on the same hook, after the
+  // daily close so the EOD reports are already on disk.
+  onArchive: async () => {
+    await runDailyCloseForAllUsers();
+    await generateMarketReview('postmarket').catch(err =>
+      console.error('[market-review] post-market generation failed:', err),
+    );
+  },
   // TRA-249-D — hourly funding accrual on open Coinbase INTX perps. Fires
   // at minute=0 every ET hour; per-user trackers no-op when no perps are
   // open or the user is in demo mode.
@@ -2571,7 +2634,16 @@ scheduler.start({
   // review + a fresh pre-market scan into each user's smart watchlist so
   // the SignalEngine starts the new session with curated symbols. Stocks
   // only — crypto's 24/7 market has no pre-market boundary.
-  onPremarket: runPremarketForAllUsers,
+  //
+  // TRA-386 — the pre-market regime review runs first so its GREEN/YELLOW/RED
+  // gates are persisted before the watchlist builder (and any engine reader)
+  // looks them up.
+  onPremarket: async () => {
+    await generateMarketReview('premarket').catch(err =>
+      console.error('[market-review] pre-market generation failed:', err),
+    );
+    await runPremarketForAllUsers();
+  },
   // TRA-380 — 3:55 PM ET option-chain recorder. Captures one Tradier chain
   // snapshot per trading day into the persistent disk for the TRA-379
   // replay backtest harness. Market days only; see `runChainRecord`.

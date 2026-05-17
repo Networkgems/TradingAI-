@@ -298,6 +298,40 @@ export async function fetchMinuteBars(symbol: string, count = 60): Promise<Candl
   return bars;
 }
 
+/**
+ * TRA-386 — fetch the last N *daily* candles for a symbol via Yahoo's chart
+ * endpoint. Used by the automated market-review generator to read index-level
+ * series (`^GSPC`, `^VIX`, `^TNX`) that the intraday minute-bar path does not
+ * cover. Yahoo is the only provider queried here — Tradier's timesales feed is
+ * intraday-only and these index symbols are not in the Twelve Data budget set.
+ *
+ * Returns an empty array on any failure; callers must tolerate a cold feed.
+ */
+export async function fetchDailyCandles(symbol: string, count = 30): Promise<Candle[]> {
+  const now = new Date();
+  // Pull a generous calendar window so weekends/holidays still leave `count`
+  // trading sessions: ~1.6 calendar days per trading day, plus a week of slack.
+  const from = new Date(now.getTime() - (count * 1.6 + 7) * 24 * 60 * 60 * 1000);
+  const result = await withRetry(
+    () => yf.chart(symbol, { period1: from, period2: now, interval: '1d' }),
+    `dailyChart(${symbol})`,
+  );
+  if (!result) return [];
+  const candles: Candle[] = (result.quotes ?? [])
+    .filter(q => q.open != null && q.high != null && q.low != null && q.close != null)
+    .map(q => ({
+      symbol,
+      timestamp: new Date(q.date).getTime(),
+      open: q.open!,
+      high: q.high!,
+      low: q.low!,
+      close: q.close!,
+      volume: q.volume ?? 0,
+    }))
+    .sort((a, b) => a.timestamp - b.timestamp);
+  return candles.slice(-count);
+}
+
 export interface TradierCandleDiag {
   reason: 'no_credentials' | 'breaker_open' | 'http_error' | 'no_data' | 'fetch_error' | 'ok';
   httpStatus?: number;
