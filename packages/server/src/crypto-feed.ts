@@ -232,6 +232,82 @@ async function fetchCoinbaseStatsQuotes(
   return results;
 }
 
+/**
+ * TRA-437 — keyless Coinbase Advanced Trade public price fallback.
+ *
+ * `fetchCoinbaseStatsQuotes` above hits `api.exchange.coinbase.com`. On the
+ * Render egress IP that host can be rate-limited or unreachable independently
+ * of the Advanced Trade host, which leaves the cascade with no working keyless
+ * source once Yahoo's breaker is open and CMC has no API key — the exact
+ * failure mode behind TRA-437 (every crypto watchlist symbol rendered
+ * "Quote unavailable — provider rate-limited" for demo users).
+ *
+ * This fetcher hits the *public* Advanced Trade market endpoint —
+ * `GET /api/v3/brokerage/market/products` on `api.coinbase.com`. No API key,
+ * no request signing: it is the unauthenticated `market/` sibling of the
+ * signed `/api/v3/brokerage/products` endpoint the live broker uses. Adding it
+ * gives the cascade a second keyless venue on a different host, so demo crypto
+ * engines (no live broker attached) still render real prices when the Exchange
+ * host is degraded.
+ *
+ * One batched request covers every symbol (the endpoint accepts repeated
+ * `product_ids` params). Symbols Coinbase doesn't list are simply absent from
+ * the response and fall through to the caller's next provider. `source` is
+ * tagged `coinbase` — same venue as live execution — so the engine's
+ * Coinbase-strict entry gate (TRA-338) accepts these prices for entries.
+ */
+const COINBASE_ADVANCED_TRADE_BASE = 'https://api.coinbase.com';
+export async function fetchCoinbaseAdvancedTradeQuotes(
+  symbols: readonly string[],
+): Promise<Map<string, CryptoQuote>> {
+  const results = new Map<string, CryptoQuote>();
+  if (symbols.length === 0) return results;
+  try {
+    const params = new URLSearchParams();
+    for (const s of symbols) params.append('product_ids', s);
+    const resp = await withTimeout(
+      fetch(
+        `${COINBASE_ADVANCED_TRADE_BASE}/api/v3/brokerage/market/products?${params.toString()}`,
+        { headers: { 'User-Agent': 'TRA-437/1.0', Accept: 'application/json' } },
+      ),
+      FEED_CALL_TIMEOUT_MS,
+      'Coinbase Advanced Trade market/products',
+    );
+    if (!resp.ok) {
+      feedLog.warn('Coinbase Advanced Trade market/products failed', { status: resp.status });
+      return results;
+    }
+    const json = (await resp.json()) as {
+      products?: Array<{
+        product_id?: string;
+        price?: string;
+        volume_24h?: string;
+        price_percentage_change_24h?: string;
+      }>;
+    };
+    for (const p of json.products ?? []) {
+      if (!p?.product_id) continue;
+      const price = Number(p.price);
+      if (!Number.isFinite(price) || price <= 0) continue;
+      const changePct = Number(p.price_percentage_change_24h);
+      const volume = Number(p.volume_24h);
+      const safeChangePct = Number.isFinite(changePct) ? changePct : 0;
+      results.set(p.product_id, {
+        price,
+        volume: Number.isFinite(volume) ? volume : 0,
+        change: price * (safeChangePct / 100),
+        changePct: safeChangePct,
+        source: 'coinbase',
+      });
+    }
+  } catch (err: unknown) {
+    feedLog.warn('Coinbase Advanced Trade quote fetch failed', {
+      reason: err instanceof Error ? err.message : String(err),
+    });
+  }
+  return results;
+}
+
 async function fetchCMCBatchQuotes(
   symbols: readonly string[],
 ): Promise<Map<string, CryptoQuote>> {
@@ -475,9 +551,13 @@ export async function fetchCryptoQuote(symbol: string): Promise<CryptoQuote | nu
  * in `feed-freshness.ts`):
  *   1. Coinbase Exchange `/products/{id}/stats` — primary. Same venue as the
  *      live crypto broker, so quote ↔ execution prices stay aligned.
- *   2. Yahoo Finance — backstops symbols Coinbase does not list (BNB-USD,
+ *   2. Coinbase Advanced Trade `market/products` — keyless backstop on a
+ *      different host (TRA-437). Covers the residual when the Exchange host
+ *      is degraded for the egress IP, so the cascade keeps a working keyless
+ *      source even with Yahoo's breaker open and no CMC key.
+ *   3. Yahoo Finance — backstops symbols Coinbase does not list (BNB-USD,
  *      VET-USD, …). Skipped while the shared Yahoo rate-limit breaker is open.
- *   3. CoinMarketCap — final fallback for the residual set.
+ *   4. CoinMarketCap — final fallback for the residual set.
  * Each symbol takes the result from the first provider in this order that
  * returns it; the `source` tag on every `CryptoQuote` records which one.
  */
@@ -495,6 +575,17 @@ export async function fetchCryptoQuotes(
   // Yahoo started 429-ing the Render egress).
   const cbResults = await fetchCoinbaseStatsQuotes(symbols);
   for (const [sym, quote] of cbResults) results.set(sym, quote);
+
+  // TRA-437 — keyless Coinbase Advanced Trade backstop on a different host.
+  // The Exchange host above can be rate-limited / unreachable for the Render
+  // egress IP independently of the Advanced Trade host; this second keyless
+  // venue keeps the cascade alive for demo crypto users when Yahoo's breaker
+  // is open and CMC has no API key. One batched request covers the residual.
+  const needCoinbaseAt = symbols.filter(s => !results.has(s));
+  if (needCoinbaseAt.length > 0) {
+    const atResults = await fetchCoinbaseAdvancedTradeQuotes(needCoinbaseAt);
+    for (const [sym, quote] of atResults) results.set(sym, quote);
+  }
 
   // Yahoo backstops symbols Coinbase doesn't list (e.g. BNB-USD, VET-USD,
   // EGLD-USD, RUNE-USD — Binance/Cosmos-only assets). Same parallel-batch

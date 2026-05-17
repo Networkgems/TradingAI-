@@ -38,6 +38,7 @@ import {
   fetchCryptoDailyBars,
   fetchCrypto4hBars,
   fetchCryptoQuotes,
+  fetchCoinbaseAdvancedTradeQuotes,
   fetchCryptoNews,
   refreshCoinbaseProductCatalog,
   isCoinbaseListed,
@@ -890,17 +891,27 @@ export class CryptoSignalEngine {
       });
     }
 
-    // TRA-344 — Coinbase fallback for symbols Yahoo+CMC don't carry. PLUME-USD
-    // is only listed on Coinbase Advanced Trade; previously its price column
-    // showed $0.00 (-100% P&L) because the watchlist feeders had no source.
-    // We also patch in any open-position symbols outside the watchlist so an
-    // imported holding always renders a real Current price. RNDR-USD post-rebrand
-    // still won't resolve here (Coinbase product is now RENDER-USD) — that case
-    // is handled by the symbol alias map elsewhere.
-    if (this.liveAccount) {
+    // TRA-344 / TRA-437 — Coinbase Advanced Trade fallback for symbols the
+    // primary cascade didn't carry, plus any open-position symbol outside the
+    // watchlist (an imported holding must still render a real Current price).
+    // PLUME-USD, for example, is only listed on Coinbase Advanced Trade;
+    // previously its price column showed $0.00 (-100% P&L).
+    //
+    // TRA-437 — this fallback was gated behind `if (this.liveAccount)` and
+    // routed through the *authenticated* `getProductPrices` on the live
+    // broker's client. Demo crypto engines have no live broker, so they never
+    // reached it: with Yahoo's breaker open and no CMC key, every watchlist
+    // symbol was left without a quote and rendered "Quote unavailable —
+    // provider rate-limited". It now runs for every engine (demo or live) via
+    // the *keyless* public Advanced Trade market endpoint. RNDR-USD
+    // post-rebrand still won't resolve here (Coinbase product is now
+    // RENDER-USD) — that case is handled by the symbol alias map below.
+    {
       const positionSymbols = new Set<string>();
-      for (const p of this.liveAccount.getState().openPositions) positionSymbols.add(p.symbol);
       for (const p of this.account.getState().openPositions) positionSymbols.add(p.symbol);
+      if (this.liveAccount) {
+        for (const p of this.liveAccount.getState().openPositions) positionSymbols.add(p.symbol);
+      }
       const fallbackTargets = new Set<string>();
       for (const sym of activeSymbols) {
         if (!quotes.has(sym)) fallbackTargets.add(sym);
@@ -910,19 +921,16 @@ export class CryptoSignalEngine {
       }
       if (fallbackTargets.size > 0) {
         try {
-          const cbPrices = await this.liveAccount
-            .getCoinbaseClient()
-            .getProductPrices(Array.from(fallbackTargets));
-          for (const [sym, price] of cbPrices) {
-            if (!Number.isFinite(price) || price <= 0) continue;
-            prices.set(sym, price);
-            const prev = this.symbolState.get(sym);
+          const cbQuotes = await fetchCoinbaseAdvancedTradeQuotes(Array.from(fallbackTargets));
+          for (const [sym, q] of cbQuotes) {
+            prices.set(sym, q.price);
+            quoteSources.set(sym, q.source);
             this.symbolState.set(sym, {
               symbol: sym,
-              price,
-              volume: prev?.volume ?? 0,
-              change: prev?.change ?? 0,
-              changePct: prev?.changePct ?? 0,
+              price: q.price,
+              volume: q.volume,
+              change: q.change,
+              changePct: q.changePct,
               lastUpdated: Date.now(),
               quoteStatus: 'ok',
             });
