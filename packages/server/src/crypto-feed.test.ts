@@ -2,6 +2,7 @@ import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import {
   isCoinbaseListed,
   fetchCoinbaseAdvancedTradeQuotes,
+  fetchCoinbaseAdvancedTradeCandles,
   _resetCoinbaseProductCatalogForTests,
   _seedCoinbaseProductCatalogForTests,
 } from './crypto-feed.js';
@@ -142,5 +143,108 @@ describe('fetchCoinbaseAdvancedTradeQuotes — keyless Advanced Trade fallback (
     globalThis.fetch = fetchMock as unknown as typeof fetch;
     const out = await fetchCoinbaseAdvancedTradeQuotes(['BTC-USD']);
     expect(out.size).toBe(0);
+  });
+});
+
+describe('fetchCoinbaseAdvancedTradeCandles — keyless OHLC candle fallback (TRA-438)', () => {
+  const realFetch = globalThis.fetch;
+  const HOUR = 3_600_000;
+
+  afterEach(() => {
+    globalThis.fetch = realFetch;
+    vi.restoreAllMocks();
+  });
+
+  it('returns an empty array without calling fetch for a non-positive window', async () => {
+    const fetchMock = vi.fn();
+    globalThis.fetch = fetchMock as unknown as typeof fetch;
+    const now = Date.now();
+    const out = await fetchCoinbaseAdvancedTradeCandles('BTC-USD', 3_600, now, now);
+    expect(out).toEqual([]);
+    expect(fetchMock).not.toHaveBeenCalled();
+  });
+
+  it('hits the keyless market/products candles endpoint with the granularity enum', async () => {
+    const now = Date.now();
+    const fetchMock = vi.fn(async (url: string) => {
+      // Must be the unauthenticated `market/` sibling on the Advanced Trade
+      // host — no API key, no signing.
+      expect(url).toContain('https://api.coinbase.com/api/v3/brokerage/market/products/BTC-USD/candles');
+      expect(url).toContain('granularity=ONE_HOUR');
+      return {
+        ok: true,
+        status: 200,
+        json: async () => ({
+          candles: [
+            { start: String(Math.floor((now - HOUR) / 1000)), low: '99', high: '101', open: '100', close: '100.5', volume: '12' },
+          ],
+        }),
+      };
+    });
+    globalThis.fetch = fetchMock as unknown as typeof fetch;
+
+    const out = await fetchCoinbaseAdvancedTradeCandles('BTC-USD', 3_600, now - 2 * HOUR, now);
+    expect(out).toHaveLength(1);
+    expect(out[0]).toMatchObject({ symbol: 'BTC-USD', open: 100, high: 101, low: 99, close: 100.5, volume: 12 });
+  });
+
+  it('parses candle rows ascending and deduped on the open second', async () => {
+    const now = Date.now();
+    const t1 = Math.floor((now - 2 * HOUR) / 1000);
+    const t2 = Math.floor((now - HOUR) / 1000);
+    const fetchMock = vi.fn(async () => ({
+      ok: true,
+      status: 200,
+      json: async () => ({
+        // Coinbase returns descending; one duplicate timestamp.
+        candles: [
+          { start: String(t2), low: '5', high: '7', open: '6', close: '6.5', volume: '2' },
+          { start: String(t1), low: '4', high: '6', open: '5', close: '5.5', volume: '1' },
+          { start: String(t2), low: '5', high: '7', open: '6', close: '6.5', volume: '2' },
+        ],
+      }),
+    }));
+    globalThis.fetch = fetchMock as unknown as typeof fetch;
+
+    const out = await fetchCoinbaseAdvancedTradeCandles('ETH-USD', 3_600, now - 3 * HOUR, now);
+    expect(out).toHaveLength(2);
+    expect(out[0].timestamp).toBeLessThan(out[1].timestamp);
+  });
+
+  it('drops rows with a non-positive or unparseable close', async () => {
+    const now = Date.now();
+    const base = Math.floor((now - 3 * HOUR) / 1000);
+    const fetchMock = vi.fn(async () => ({
+      ok: true,
+      status: 200,
+      json: async () => ({
+        candles: [
+          { start: String(base), low: '4', high: '6', open: '5', close: '5.5', volume: '1' },
+          { start: String(base + 3600), low: '0', high: '0', open: '0', close: '0', volume: '0' },
+          { start: String(base + 7200), low: 'x', high: 'x', open: 'x', close: 'x', volume: 'x' },
+        ],
+      }),
+    }));
+    globalThis.fetch = fetchMock as unknown as typeof fetch;
+
+    const out = await fetchCoinbaseAdvancedTradeCandles('BTC-USD', 3_600, now - 4 * HOUR, now);
+    expect(out).toHaveLength(1);
+    expect(out[0].close).toBe(5.5);
+  });
+
+  it('returns an empty array (does not throw) on a non-OK HTTP response', async () => {
+    const now = Date.now();
+    const fetchMock = vi.fn(async () => ({ ok: false, status: 429, json: async () => ({}) }));
+    globalThis.fetch = fetchMock as unknown as typeof fetch;
+    const out = await fetchCoinbaseAdvancedTradeCandles('BTC-USD', 60, now - HOUR, now);
+    expect(out).toEqual([]);
+  });
+
+  it('returns an empty array (does not throw) when fetch rejects', async () => {
+    const now = Date.now();
+    const fetchMock = vi.fn(async () => { throw new Error('network down'); });
+    globalThis.fetch = fetchMock as unknown as typeof fetch;
+    const out = await fetchCoinbaseAdvancedTradeCandles('BTC-USD', 86_400, now - 86_400_000, now);
+    expect(out).toEqual([]);
   });
 });

@@ -6,6 +6,8 @@ import {
   fetchCoinbaseMinuteBars,
   isCoinbaseBreakerOpen,
   paceCoinbaseFetch,
+  aggregate1hTo4h,
+  fillGrid4h,
 } from '@trading-app/backtest';
 
 export { isCoinbaseBreakerOpen };
@@ -308,6 +310,126 @@ export async function fetchCoinbaseAdvancedTradeQuotes(
   return results;
 }
 
+/**
+ * TRA-438 — keyless Coinbase Advanced Trade public OHLCV candles fallback.
+ *
+ * TRA-437 gave the *quote* cascade a second keyless venue on `api.coinbase.com`
+ * so demo crypto users keep getting prices when the Exchange host
+ * (`api.exchange.coinbase.com`) is rate-limited / unreachable for the Render
+ * egress IP. But the *candle* feeders (`fetchCryptoMinuteBars` /
+ * `fetchCrypto4hBars` / `fetchCryptoDailyBars`) were never given the same
+ * backstop: their cascade is Coinbase Exchange → Yahoo only. When the Exchange
+ * breaker is open AND Yahoo's per-IP breaker is open, every candle fetcher
+ * returns `[]` → strategies receive empty OHLC series → zero signals → zero
+ * trades. Quotes alone don't help: strategies evaluate off candles, not the
+ * last price (TRA-438 board report — "no signals or trades" in demo Crypto).
+ *
+ * This fetcher hits the *public* Advanced Trade market candles endpoint —
+ * `GET /api/v3/brokerage/market/products/{product_id}/candles` on
+ * `api.coinbase.com`. No API key, no request signing: the unauthenticated
+ * `market/` sibling of the signed `/api/v3/brokerage/products/.../candles`
+ * endpoint the live broker uses. It is a different host from the Exchange
+ * feed, so a demo engine keeps a working keyless OHLC source when the Exchange
+ * host is degraded.
+ *
+ * Granularity is an enum (`ONE_MINUTE` / `ONE_HOUR` / `ONE_DAY`); the endpoint
+ * caps each response at 350 candles, so the `[fromMs, toMs)` window is
+ * paginated in 300-bar chunks (300 < 350 leaves headroom). Rows come back as
+ * `{ start, low, high, open, close, volume }` string fields. Result is
+ * ascending-by-timestamp and deduped on the bar's open second, matching the
+ * `Candle[]` shape the Exchange path emits.
+ */
+const COINBASE_AT_CANDLE_GRANULARITY: Record<number, string> = {
+  60: 'ONE_MINUTE',
+  3_600: 'ONE_HOUR',
+  86_400: 'ONE_DAY',
+};
+const COINBASE_AT_MAX_CANDLES = 300; // endpoint hard cap is 350; 300 leaves headroom
+
+export async function fetchCoinbaseAdvancedTradeCandles(
+  symbol: string,
+  granularitySeconds: 60 | 3_600 | 86_400,
+  fromMs: number,
+  toMs: number,
+): Promise<Candle[]> {
+  if (toMs <= fromMs) return [];
+  const granEnum = COINBASE_AT_CANDLE_GRANULARITY[granularitySeconds];
+  if (!granEnum) return [];
+  const stepMs = COINBASE_AT_MAX_CANDLES * granularitySeconds * 1000;
+  const all: Candle[] = [];
+  try {
+    let cursor = fromMs;
+    while (cursor < toMs) {
+      const winEnd = Math.min(cursor + stepMs, toMs);
+      const params = new URLSearchParams({
+        start: String(Math.floor(cursor / 1000)),
+        end: String(Math.floor(winEnd / 1000)),
+        granularity: granEnum,
+        limit: String(COINBASE_AT_MAX_CANDLES),
+      });
+      const resp = await withTimeout(
+        fetch(
+          `${COINBASE_ADVANCED_TRADE_BASE}/api/v3/brokerage/market/products/${encodeURIComponent(symbol)}/candles?${params.toString()}`,
+          { headers: { 'User-Agent': 'TRA-438/1.0', Accept: 'application/json' } },
+        ),
+        FEED_CALL_TIMEOUT_MS,
+        `Coinbase AT candles(${symbol} ${granEnum})`,
+      );
+      if (!resp.ok) {
+        // A failed window aborts the fetch — partial OHLC history would shift
+        // every downstream indicator window, so we return what we have (or
+        // nothing) and let the caller fall through to the next provider.
+        feedLog.warn('Coinbase Advanced Trade candles failed', {
+          symbol,
+          granularity: granEnum,
+          status: resp.status,
+        });
+        break;
+      }
+      const json = (await resp.json()) as {
+        candles?: Array<{
+          start?: string;
+          low?: string;
+          high?: string;
+          open?: string;
+          close?: string;
+          volume?: string;
+        }>;
+      };
+      for (const c of json.candles ?? []) {
+        const ts = Number(c?.start) * 1000;
+        const open = Number(c?.open);
+        const high = Number(c?.high);
+        const low = Number(c?.low);
+        const close = Number(c?.close);
+        const volume = Number(c?.volume);
+        if (!Number.isFinite(ts) || ts <= 0) continue;
+        if (![open, high, low, close].every(Number.isFinite) || close <= 0) continue;
+        all.push({
+          symbol,
+          timestamp: ts,
+          open,
+          high,
+          low,
+          close,
+          volume: Number.isFinite(volume) ? volume : 0,
+        });
+      }
+      cursor = winEnd;
+    }
+  } catch (err: unknown) {
+    feedLog.warn('Coinbase Advanced Trade candle fetch failed', {
+      symbol,
+      granularity: granEnum,
+      reason: err instanceof Error ? err.message : String(err),
+    });
+    return [];
+  }
+  all.sort((a, b) => a.timestamp - b.timestamp);
+  const seen = new Set<number>();
+  return all.filter(c => (seen.has(c.timestamp) ? false : (seen.add(c.timestamp), true)));
+}
+
 async function fetchCMCBatchQuotes(
   symbols: readonly string[],
 ): Promise<Map<string, CryptoQuote>> {
@@ -388,6 +510,18 @@ export async function fetchCryptoDailyBars(symbol: string, count = 260): Promise
     }
   }
 
+  // TRA-438 — keyless Coinbase Advanced Trade backstop on a different host.
+  // Runs before Yahoo so a demo engine still gets daily OHLC when the Exchange
+  // breaker is open AND Yahoo's per-IP breaker is open. Same volume>0 filter as
+  // the Exchange path; the in-progress UTC day is retained when it has volume.
+  try {
+    const atBars = await fetchCoinbaseAdvancedTradeCandles(symbol, 86_400, fromMs, now);
+    const usable = atBars.filter(b => b.volume > 0);
+    if (usable.length > 0) return usable.slice(-count);
+  } catch (err: unknown) {
+    console.warn(`[crypto-feed] fetchCryptoDailyBars(${symbol}) Coinbase Advanced Trade: ${err instanceof Error ? err.message : String(err)} — falling back to Yahoo`);
+  }
+
   // Fallback: Yahoo Finance.
   try {
     const fromDate = new Date(fromMs);
@@ -429,18 +563,39 @@ export async function fetchCryptoDailyBars(symbol: string, count = 260): Promise
  * never crashes on a transient Coinbase blip.
  */
 export async function fetchCrypto4hBars(symbol: string, count = 260): Promise<Candle[]> {
+  const now = Date.now();
+  // Pad the request window so a fresh-cache miss still lands `count` bars
+  // even if Coinbase drops a few 1H constituents (aggregation is strict —
+  // see `aggregate1hTo4h`'s contiguity guard).
+  const fromMs = now - count * 4 * 60 * 60 * 1000 * 1.25;
+
+  // Primary: Coinbase Exchange (1H bars aggregated + gap-filled to 4H).
   try {
-    const now = Date.now();
-    // Pad the request window so a fresh-cache miss still lands `count` bars
-    // even if Coinbase drops a few 1H constituents (aggregation is strict —
-    // see `aggregate1hTo4h`'s contiguity guard).
-    const fromMs = now - count * 4 * 60 * 60 * 1000 * 1.25;
     const bars = await fetchCoinbase4hBars(symbol, fromMs, now);
-    return bars.slice(-count);
+    if (bars.length > 0) return bars.slice(-count);
   } catch (err: unknown) {
-    console.error(`[crypto-feed] fetchCrypto4hBars(${symbol}):`, err instanceof Error ? err.message : String(err));
-    return [];
+    const msg = err instanceof Error ? err.message : String(err);
+    if (!/Coinbase 404|Coinbase breaker open/.test(msg)) {
+      console.warn(`[crypto-feed] fetchCrypto4hBars(${symbol}) Coinbase: ${msg} — falling back to Advanced Trade`);
+    }
   }
+
+  // TRA-438 — keyless Coinbase Advanced Trade backstop on a different host.
+  // The Exchange path was the *only* source for 4H bars (no Yahoo fallback),
+  // so a degraded Exchange host starved the perp-shorts 4H layer entirely.
+  // Fetch keyless 1H candles and run them through the same aggregate→gap-fill
+  // pipeline (`aggregate1hTo4h` + `fillGrid4h`) the Exchange path uses, so the
+  // 4H grid stays contiguous and shape-identical regardless of the source.
+  try {
+    const hourly = await fetchCoinbaseAdvancedTradeCandles(symbol, 3_600, fromMs, now);
+    if (hourly.length > 0) {
+      const aggregated = fillGrid4h(aggregate1hTo4h(hourly));
+      if (aggregated.length > 0) return aggregated.slice(-count);
+    }
+  } catch (err: unknown) {
+    console.error(`[crypto-feed] fetchCrypto4hBars(${symbol}) Advanced Trade:`, err instanceof Error ? err.message : String(err));
+  }
+  return [];
 }
 
 /**
@@ -475,6 +630,22 @@ export async function fetchCryptoMinuteBars(symbol: string, count = 60): Promise
     if (!/Coinbase 404|Coinbase breaker open/.test(msg)) {
       console.warn(`[crypto-feed] fetchCryptoMinuteBars(${symbol}) Coinbase: ${msg} — falling back to Yahoo`);
     }
+  }
+
+  // TRA-438 — keyless Coinbase Advanced Trade backstop on a different host.
+  // The minute-candle cache is the critical path for signal generation (every
+  // router / bb_fade / swing strategy evaluates off it); without this backstop
+  // a demo engine produced zero signals once both the Exchange and Yahoo
+  // breakers were open. Same in-progress-bar and 0-volume-gap drops as the
+  // Exchange path so indicator math sees an identical series shape.
+  try {
+    const atBars = await fetchCoinbaseAdvancedTradeCandles(symbol, 60, fromMs, now);
+    const completed = atBars
+      .filter(b => b.timestamp < currentMinuteStart)
+      .filter(b => b.volume > 0);
+    if (completed.length > 0) return completed.slice(-count);
+  } catch (err: unknown) {
+    console.warn(`[crypto-feed] fetchCryptoMinuteBars(${symbol}) Coinbase Advanced Trade: ${err instanceof Error ? err.message : String(err)} — falling back to Yahoo`);
   }
 
   // Fallback: Yahoo Finance.
