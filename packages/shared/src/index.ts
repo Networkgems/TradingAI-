@@ -1529,6 +1529,20 @@ export interface CryptoEngineState {
    * existing per-signal `liveSkipReason` channel keeps the user informed.
    */
   liveSkips?: LiveSkip[];
+  /**
+   * TRA-345 — the strategy preset the engine is currently gating signal
+   * emission on. Surfaced in engine state so the active config can be
+   * verified from `/api/crypto/state` without Render dashboard or server-log
+   * access. `id` is the resolved preset; `envValue` is the raw
+   * `LIVE_STRATEGY_PRESET` process-env string (empty when unset) so a typo
+   * that silently falls back to `legacy_5` is directly visible to operators.
+   */
+  activePreset: {
+    id: StrategyPresetId;
+    envValue: string;
+    enabledStrategies: readonly CryptoStrategyType[];
+    symbolFilter: readonly string[] | null;
+  };
 }
 
 /**

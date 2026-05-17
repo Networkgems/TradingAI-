@@ -275,6 +275,20 @@ describe('Strategy presets — TRA-325', () => {
     expect(p.enabledStrategies).toEqual(['bb_fade']);
     expect(p.symbolFilter).toEqual(['SOL-USD', 'DOGE-USD']);
   });
+
+  it('TRA-345 — getState().activePreset surfaces the resolved preset for API verification', () => {
+    // With no LIVE_STRATEGY_PRESET env var set under test, the engine resolves
+    // to legacy_5. The activePreset block lets /api/crypto/state confirm the
+    // live config without Render dashboard / server-log access.
+    const engine = new CryptoSignalEngine();
+    const ap = engine.getState().activePreset;
+    expect(ap.id).toBe('legacy_5');
+    expect(ap.envValue).toBe('');
+    expect([...ap.enabledStrategies].sort()).toEqual(
+      ['bb_fade', 'breakout_vol', 'mean_reversion', 'momentum', 'swing_trade'],
+    );
+    expect(ap.symbolFilter).toBeNull();
+  });
 });
 
 describe('CryptoPaperAccount fee + slippage modeling — TRA-342', () => {

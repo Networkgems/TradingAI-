@@ -1246,6 +1246,15 @@ export class CryptoSignalEngine {
     // paths only ran in demo (live broker integration came later).
     const isMode = (m: 'demo' | 'live' | undefined): boolean => (m ?? 'demo') === this.mode;
     const scopedSignals = this.recentSignals.filter(s => isMode(s.mode));
+    // TRA-345 — surface the resolved preset so the active gating config can be
+    // verified from /api/crypto/state without Render dashboard / log access.
+    const resolvedPreset = this.resolvePreset();
+    const activePreset: CryptoEngineState['activePreset'] = {
+      id: resolvedPreset.id,
+      envValue: FORCED_PRESET_ENV,
+      enabledStrategies: resolvedPreset.enabledStrategies,
+      symbolFilter: resolvedPreset.symbolFilter,
+    };
     if (this.mode === 'live') {
       // Live mode: if a Coinbase broker is configured, surface its USD-equivalent
       // cash plus the positions we've opened in this session. Otherwise show a
@@ -1282,6 +1291,7 @@ export class CryptoSignalEngine {
           // `getRecentSkips` returns a defensive copy so consumers can't
           // mutate the underlying buffer.
           liveSkips: ls.recentSkips,
+          activePreset,
         };
       }
       const account: AccountState = {
@@ -1303,6 +1313,7 @@ export class CryptoSignalEngine {
         lastTick: Date.now(),
         autoTradingEnabled: this.isAutoTradingEnabled(),
         marketOpen: true as const,
+        activePreset,
       };
     }
     const accountBase = this.account.getState();
@@ -1328,6 +1339,7 @@ export class CryptoSignalEngine {
       lastTick: Date.now(),
       autoTradingEnabled: this.isAutoTradingEnabled(),
       marketOpen: true as const,
+      activePreset,
     };
   }
 
