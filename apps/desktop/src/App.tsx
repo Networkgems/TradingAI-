@@ -1702,6 +1702,11 @@ function Dashboard({ token, onLogout, onGoHome, onActivity, theme, onToggleTheme
   // button while the cancel POST is in flight; per-row state keyed by
   // option id so multiple in-flight cancels don't fight for one boolean.
   const [cancellingExits, setCancellingExits] = useState<Record<string, boolean>>({});
+  // TRA-407 (C4) — per-row lock while a close POST is in flight. Closes the
+  // narrow double-click window before the server's `pendingCloseOrderId`
+  // (which swaps the button for a "Pending #N" badge) round-trips back, so a
+  // single contract can't get two `sell_to_close` orders working at once.
+  const [closingOptions, setClosingOptions] = useState<Record<string, boolean>>({});
   // TRA-339 — per-table sort state for the Stocks dashboard.
   const watchlistSort = useTableSort<CryptoWatchSortKey>('changePct', 'desc');
   const openPosSort = useTableSort<StockOpenPosSortKey>('opened', 'desc');
@@ -1890,7 +1895,19 @@ function Dashboard({ token, onLogout, onGoHome, onActivity, theme, onToggleTheme
   // close which keeps the existing TRA-352 / TRA-348 behaviour.
   function openCloseDrawer(o: OptionPosition, isLiveEngineOpened: boolean) {
     if (!isLiveEngineOpened) {
-      void closeOption(o.id);
+      // TRA-407 (C4) — direct close path (imported / engine-opened demo).
+      // Lock the row while the POST is in flight so a double-click can't
+      // fire a second sell_to_close before the server's pendingCloseOrderId
+      // round-trips back and swaps the button for a "Pending #N" badge.
+      if (closingOptions[o.id]) return;
+      setClosingOptions(prev => ({ ...prev, [o.id]: true }));
+      void closeOption(o.id).finally(() => {
+        setClosingOptions(prev => {
+          const next = { ...prev };
+          delete next[o.id];
+          return next;
+        });
+      });
       return;
     }
     if (o.pendingExit) {
@@ -2617,15 +2634,17 @@ function Dashboard({ token, onLogout, onGoHome, onActivity, theme, onToggleTheme
                                   </span>
                                 );
                               }
+                              const closeInFlight = closingOptions[o.id] === true;
                               return (
                                 <button
                                   className="btn-close-pos"
+                                  disabled={closeInFlight}
                                   onClick={() => openCloseDrawer(o, isLiveEngineOpened)}
                                   title={isLiveEngineOpened
                                     ? 'Open the limit-close panel (mirrors Tradier price/qty/duration)'
                                     : 'Close this position'}
                                 >
-                                  Close
+                                  {closeInFlight ? 'Closing…' : 'Close'}
                                 </button>
                               );
                             })()}

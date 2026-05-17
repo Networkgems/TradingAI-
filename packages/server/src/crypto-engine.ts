@@ -137,6 +137,11 @@ export class CryptoSignalEngine {
 
   private tickTimer: ReturnType<typeof setInterval> | null = null;
   private tickRunning = false;
+  /**
+   * TRA-407 (C5) — the in-progress tick's promise (resolved when idle).
+   * `drain()` awaits this so a graceful shutdown finishes the current tick.
+   */
+  private activeTick: Promise<void> = Promise.resolve();
   private handlers: CryptoEngineEventHandler[] = [];
   // TRA-229 — per-mode auto-trading flags. The active flag (consulted on each
   // tick and surfaced in getState()) is whichever one matches `this.mode`.
@@ -465,6 +470,15 @@ export class CryptoSignalEngine {
     }
   }
 
+  /**
+   * TRA-407 (C5) — resolve once any in-progress tick has finished. Awaited by
+   * the graceful-shutdown hook (after `stop()`) so the process drains the
+   * current tick. Resolves immediately when idle and never rejects.
+   */
+  async drain(): Promise<void> {
+    await this.activeTick.catch(() => {});
+  }
+
   refresh(): void {
     this.tick().catch((err: unknown) => {
       console.error('[crypto-engine] refresh tick error:', err instanceof Error ? err.message : String(err));
@@ -696,9 +710,14 @@ export class CryptoSignalEngine {
     return out;
   }
 
-  private async tick(): Promise<void> {
-    if (this.tickRunning) return;
+  private tick(): Promise<void> {
+    if (this.tickRunning) return this.activeTick;
     this.tickRunning = true;
+    this.activeTick = this.runTickGuarded();
+    return this.activeTick;
+  }
+
+  private async runTickGuarded(): Promise<void> {
     try {
       await this.doTick();
     } catch (err: unknown) {
