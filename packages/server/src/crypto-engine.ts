@@ -151,6 +151,15 @@ export class CryptoSignalEngine {
   /** Live broker (Coinbase) — initialised when live mode is active and creds are configured. */
   private liveAccount: CryptoLiveAccount | null = null;
   /**
+   * TRA-408 — re-entry guard for {@link tryInitLiveBroker}. Since TRA-408
+   * defers the `this.liveAccount` assignment until boot reconcile completes,
+   * the `if (this.liveAccount)` guard no longer blocks a second concurrent
+   * init (constructor background init racing an `applySettings` call). This
+   * flag closes that window so we never build two brokers / fire two boot
+   * reconciles.
+   */
+  private liveBrokerInitInFlight = false;
+  /**
    * TRA-249-D — hourly funding-rate accrual for open Coinbase INTX perp
    * positions. Constructed alongside the live broker; rebuilt on every
    * `tryInitLiveBroker` so a re-init after a settings save (new Coinbase
@@ -287,18 +296,37 @@ export class CryptoSignalEngine {
    * already swallows network/auth errors and just logs.
    */
   private async tryInitLiveBroker(): Promise<void> {
-    if (this.liveAccount) return;
+    if (this.liveAccount || this.liveBrokerInitInFlight) return;
     const broker = this.buildLiveBroker();
     if (!broker) {
       console.warn('[crypto-engine] live mode active but Coinbase credentials not configured — orders will not be sent.');
       return;
     }
-    this.liveAccount = broker;
-    // TRA-249-D — bind the funding tracker to the new live broker so the
-    // next hourly scheduler tick accrues against the freshly-initialised
-    // account (including any positions reconciled from Coinbase below).
-    this.fundingTracker = new FundingRateTracker(broker, broker.getCoinbaseClient());
-    console.log('[crypto-engine] Coinbase live broker initialised — live trading active.');
+    this.liveBrokerInitInFlight = true;
+    try {
+      await this.bootInitLiveBroker(broker);
+    } finally {
+      this.liveBrokerInitInFlight = false;
+    }
+  }
+
+  /**
+   * TRA-408 — boot-time reconcile + catalog warm-up for a freshly built live
+   * broker. Extracted from {@link tryInitLiveBroker} so the re-entry guard /
+   * `finally` cleanup stays readable. Publishes `this.liveAccount` only on the
+   * last line, after broker truth has been reconciled.
+   */
+  private async bootInitLiveBroker(broker: CryptoLiveAccount): Promise<void> {
+    console.log('[crypto-engine] Coinbase live broker initialised — reconciling broker state before first live tick…');
+    // TRA-408 — reconcile broker truth (balances + open spot/perp positions)
+    // BEFORE publishing `broker` to `this.liveAccount`. While `liveAccount` is
+    // null `runLiveTick` no-ops, so deferring the assignment guarantees the
+    // first live tick that actually evaluates signals sees a fully reconciled
+    // account. A perp position opened directly on the Coinbase UI is therefore
+    // surfaced on boot and can never be shadowed by a duplicate engine entry
+    // during the startup window. `refreshBalance` runs `reconcilePerpPositions`
+    // on its first call (lastPerpReconcileAt = 0), so the boot reconcile is
+    // implicit in the call below; the periodic 5-min reconcile then takes over.
     await broker.refreshBalance();
     // TRA-243 — pre-load the set of Coinbase-tradable product_ids for the
     // active watchlist so the very first live tick can skip delisted/renamed
@@ -317,6 +345,14 @@ export class CryptoSignalEngine {
     // failure here is logged per-product and the per-tick refresh in
     // `runLiveTick` retries on the next iteration.
     await broker.refreshPerpOrderBookSpreads(this.getActiveSymbols());
+    // TRA-408 — publish the broker only now that boot reconcile + catalogs
+    // have landed. `runLiveTick` keys "is live trading ready?" off this field.
+    this.liveAccount = broker;
+    // TRA-249-D — bind the funding tracker to the live broker so the next
+    // hourly scheduler tick accrues against the freshly-initialised account
+    // (including any positions reconciled from Coinbase above).
+    this.fundingTracker = new FundingRateTracker(broker, broker.getCoinbaseClient());
+    console.log('[crypto-engine] Coinbase live broker ready — live trading active.');
   }
 
   /**
