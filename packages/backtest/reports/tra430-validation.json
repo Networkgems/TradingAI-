@@ -1,0 +1,160 @@
+{
+  "generatedAt": "2026-05-17T21:04:07.782Z",
+  "issue": "TRA-430",
+  "spec": "TRA-428 vol-kelly-sizing-spec §6",
+  "oosWindow": {
+    "start": "2025-01-01T00:00:00.000Z",
+    "end": "2026-05-17T00:00:00.000Z"
+  },
+  "initialEquity": 25000,
+  "barTimeframe": "4h",
+  "dataSource": "coinbase-exchange (post-TRA-427 clean cache)",
+  "arms": {
+    "A": "flat 1% baseline (sizer OFF)",
+    "B": "volatility-targeted only",
+    "C": "volatility-targeted + ¼-Kelly cap"
+  },
+  "sizerConfig": "recommended defaults (TRA-428 §7)",
+  "tolerances": {
+    "returnPp": 1,
+    "tailRelative": 0.1
+  },
+  "cells": [
+    {
+      "symbol": "BTC-USD",
+      "kellyExpectancy": {
+        "winRate": 0.2,
+        "payoffRatio": 3.4667883546290597,
+        "trades": 25
+      },
+      "armA_flat1pct": {
+        "trades": 25,
+        "winRatePct": 20,
+        "expectancyR": -0.3251887889339315,
+        "sharpe": -0.23147004409621857,
+        "maxDdPct": 4.9293411393455635,
+        "totalPnlUsd": -250.91811037306692,
+        "returnPct": -1.0036724414922675,
+        "worstTradeLossUsd": 137.13170802814793,
+        "var95PerTradeLossUsd": 136.3896671159101,
+        "volKellySizer": null
+      },
+      "armB_volOnly": {
+        "trades": 25,
+        "winRatePct": 20,
+        "expectancyR": -0.3251887889339315,
+        "sharpe": -0.3656479183122389,
+        "maxDdPct": 5.851006359183539,
+        "totalPnlUsd": -408.5564067938194,
+        "returnPct": -1.6342256271752775,
+        "worstTradeLossUsd": 213.41953624213204,
+        "var95PerTradeLossUsd": 205.59231053368634,
+        "volKellySizer": {
+          "enabled": true,
+          "applied": 25,
+          "zeroEdgeSkipped": 0,
+          "avgEffRiskPct": 0.012582012916419787
+        }
+      },
+      "armC_volKelly": {
+        "trades": 0,
+        "winRatePct": 0,
+        "expectancyR": 0,
+        "sharpe": 0,
+        "maxDdPct": 0,
+        "totalPnlUsd": 0,
+        "returnPct": 0,
+        "worstTradeLossUsd": 0,
+        "var95PerTradeLossUsd": 0,
+        "volKellySizer": {
+          "enabled": true,
+          "applied": 32,
+          "zeroEdgeSkipped": 32,
+          "avgEffRiskPct": 0
+        }
+      },
+      "acceptanceVsArmA": {
+        "returnDeltaPp": 1.0036724414922675,
+        "returnNotDegraded": true,
+        "maxDdNotWorsened": true,
+        "worstTradeLossNotWorsened": true,
+        "var95NotWorsened": true,
+        "cellPass": true
+      },
+      "tra405Baseline": {
+        "returnPct": 4.12
+      },
+      "baselineReproduces": false
+    },
+    {
+      "symbol": "SOL-USD",
+      "kellyExpectancy": {
+        "winRate": 0.17647058823529413,
+        "payoffRatio": 3.2742587430215067,
+        "trades": 34
+      },
+      "armA_flat1pct": {
+        "trades": 34,
+        "winRatePct": 17.647058823529413,
+        "expectancyR": -0.455456915944741,
+        "sharpe": -0.7135385350929435,
+        "maxDdPct": 5.706338020591982,
+        "totalPnlUsd": -887.116170405434,
+        "returnPct": -3.548464681621736,
+        "worstTradeLossUsd": 161.48062269008528,
+        "var95PerTradeLossUsd": 159.24058465297642,
+        "volKellySizer": null
+      },
+      "armB_volOnly": {
+        "trades": 34,
+        "winRatePct": 17.647058823529413,
+        "expectancyR": -0.455456915944741,
+        "sharpe": -1.081343559564747,
+        "maxDdPct": 5.536161615146178,
+        "totalPnlUsd": -1041.5564659802938,
+        "returnPct": -4.166225863921174,
+        "worstTradeLossUsd": 146.98392213689903,
+        "var95PerTradeLossUsd": 143.01987002731892,
+        "volKellySizer": {
+          "enabled": true,
+          "applied": 34,
+          "zeroEdgeSkipped": 0,
+          "avgEffRiskPct": 0.007626695268333888
+        }
+      },
+      "armC_volKelly": {
+        "trades": 0,
+        "winRatePct": 0,
+        "expectancyR": 0,
+        "sharpe": 0,
+        "maxDdPct": 0,
+        "totalPnlUsd": 0,
+        "returnPct": 0,
+        "worstTradeLossUsd": 0,
+        "var95PerTradeLossUsd": 0,
+        "volKellySizer": {
+          "enabled": true,
+          "applied": 36,
+          "zeroEdgeSkipped": 36,
+          "avgEffRiskPct": 0
+        }
+      },
+      "acceptanceVsArmA": {
+        "returnDeltaPp": 3.548464681621736,
+        "returnNotDegraded": true,
+        "maxDdNotWorsened": true,
+        "worstTradeLossNotWorsened": true,
+        "var95NotWorsened": true,
+        "cellPass": true
+      },
+      "tra405Baseline": {
+        "returnPct": 5.78
+      },
+      "baselineReproduces": false
+    }
+  ],
+  "harnessAcceptanceAllCells": true,
+  "baselineReproduces": false,
+  "sixSignOffStatus": "blocked_baseline_unmet",
+  "note": "Harness produces the §6 numbers; the GO/NO-GO acceptance sign-off is QuantTrader-owned per the TRA-428 hand-back. Do not enable the flag on any live book before that sign-off. PRECONDITION UNMET: arm A does NOT reproduce the TRA-405 §4.1 validated GO (the macd_bollinger OOS book shows negative return even on the post-TRA-427 clean cache). Per the spec §6 hard dependency a profitability-lever GO/NO-GO is meaningless on a negative-OOS book — the §6 sign-off is blocked until the macd_bollinger edge regression is resolved, which is outside TRA-430 implementation scope."
+}

@@ -54,6 +54,21 @@ export type {
   ClusterCapBinding,
   ClusterCapDecision,
 } from './correlation-cap.js';
+export {
+  trailingRealisedVol,
+  volScalar,
+  volRiskPct,
+  kellyFull,
+  kellyCapPct,
+  effectiveRiskPct,
+  resolveVolKellySizerConfig,
+  barsPerYearFor,
+  DEFAULT_VOL_KELLY_SIZER_CONFIG,
+} from './vol-kelly-sizer.js';
+export type {
+  VolKellySizerConfig,
+  CellExpectancy,
+} from './vol-kelly-sizer.js';
 export { PositionManager } from './positions.js';
 export { AlpacaFeed } from './feed/index.js';
 export type { AlpacaFeedEvents } from './feed/index.js';

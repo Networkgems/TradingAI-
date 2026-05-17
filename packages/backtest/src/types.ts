@@ -1,5 +1,5 @@
 import { Candle, Position } from '@trading-app/shared';
-import type { BreakoutVolOptions, CorrelationCapConfig, CostModel, IchimokuOptions, MeanReversionCryptoOptions, MomentumOptions, OrbOptions, RegimeDetectorOptions, ScalpingOptions, SwingOptions } from '@trading-app/engine';
+import type { BreakoutVolOptions, CellExpectancy, CorrelationCapConfig, CostModel, IchimokuOptions, MeanReversionCryptoOptions, MomentumOptions, OrbOptions, RegimeDetectorOptions, ScalpingOptions, SwingOptions, VolKellySizerConfig } from '@trading-app/engine';
 
 export interface BacktestReversalOpts {
   rsiPeriod?: number;
@@ -89,6 +89,29 @@ export interface CorrelationCapOpts {
   dailyCandlesBySymbol?: Record<string, Candle[]>;
 }
 
+/**
+ * TRA-430 — volatility-/Kelly-scaled per-trade risk sizing (TRA-428 spec).
+ *
+ * When `enabled`, the runner computes an effective per-trade risk fraction
+ * (vol-targeted off trailing realised vol, bounded by a fractional-Kelly cap)
+ * and feeds it to `RiskManager` as a per-call `riskPct` override — *ahead* of
+ * the TRA-423 cluster cap, which still runs last. Omit (or `enabled: false`)
+ * to leave behaviour unchanged: the sizer ships dark.
+ *
+ * `config` overrides any of the §7 spec keys; omitted keys take the
+ * recommended defaults.
+ *
+ * `expectancyByCell` supplies the §3.4 static per-cell expectancy table for
+ * the backtest Kelly cap. Keys are matched as `${signalType}|${symbol}` first,
+ * then a bare `${symbol}` fallback. Omit the table for the §6 "vol-only" arm —
+ * the Kelly cap is then inactive and vol-targeting alone governs.
+ */
+export interface VolKellySizerOpts {
+  enabled?: boolean;
+  config?: Partial<VolKellySizerConfig>;
+  expectancyByCell?: Record<string, CellExpectancy>;
+}
+
 export interface SignalEdgeOpts {
   /**
    * Bars to look ahead for the 1R-target test. Default = 24 (one trading
@@ -166,6 +189,12 @@ export interface BacktestConfig {
    * `macd_bollinger` book.
    */
   correlationCapOpts?: CorrelationCapOpts;
+  /**
+   * TRA-430 — volatility-/Kelly-scaled per-trade risk sizing (TRA-428 spec).
+   * Omit (or `enabled: false`) to leave sizing unchanged. The §6 three-arm
+   * validation toggles this on the {BTC-USD, SOL-USD} `macd_bollinger` book.
+   */
+  volKellySizerOpts?: VolKellySizerOpts;
   signalEdgeOpts?: SignalEdgeOpts;
   /**
    * Per-fill commission charged on entry and exit, in basis points of notional
@@ -280,6 +309,20 @@ export interface BacktestResult {
     enabled: boolean;
     rejected: number;
     scaledDown: number;
+  };
+  /**
+   * TRA-430 — vol-/Kelly-sizer activity. Present only when
+   * {@link BacktestConfig.volKellySizerOpts} enabled the sizer. `applied`
+   * counts entries whose risk fraction the sizer set; `zeroEdgeSkipped` counts
+   * entries dropped because the Kelly cap forced `effRiskPct = 0` (non-positive
+   * edge); `avgEffRiskPct` is the mean effective risk fraction over applied
+   * entries (the §6 arms compare this against the flat 1% baseline).
+   */
+  volKellySizer?: {
+    enabled: boolean;
+    applied: number;
+    zeroEdgeSkipped: number;
+    avgEffRiskPct: number;
   };
   signalEdge?: SignalEdge;
   confidenceBands?: ConfidenceBands;

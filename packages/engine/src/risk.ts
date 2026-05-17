@@ -147,8 +147,19 @@ export class RiskManager {
    *
    * Returns 0 when the inputs cannot produce a finite stop distance, so
    * callers can short-circuit signals where ATR is unavailable.
+   *
+   * Pass `opts.riskPct` to override the global 1% per-trade budget — mirrors
+   * `sizeFromStop` (TRA-211) and is the hook the TRA-430 vol-/Kelly sizer uses
+   * to feed an effective per-trade risk fraction into ATR-stop callers.
+   * Defaults to `DEFAULT_RISK_PER_TRADE` when omitted.
    */
-  sizeFromAtr(entryPrice: number, atr: number, atrMultiplier: number, lotSize?: number): number {
+  sizeFromAtr(
+    entryPrice: number,
+    atr: number,
+    atrMultiplier: number,
+    lotSize?: number,
+    opts: { riskPct?: number } = {},
+  ): number {
     if (!Number.isFinite(atr) || atr <= 0) return 0;
     if (!Number.isFinite(atrMultiplier) || atrMultiplier <= 0) return 0;
     const stopDistance = atr * atrMultiplier;
@@ -156,7 +167,7 @@ export class RiskManager {
       if (lotSize !== undefined && lotSize > 0) return Math.floor(n / lotSize) * lotSize;
       return this.fractionalQuantity ? Math.floor(n * 1e8) / 1e8 : Math.floor(n);
     };
-    const riskBased = truncate(this.maxRiskPerTrade() / stopDistance);
+    const riskBased = truncate(this.maxRiskPerTrade(opts.riskPct) / stopDistance);
     if (entryPrice <= 0) return Math.max(0, riskBased);
     const notionalCap = truncate((this.managedEquity() * this.maxNotionalRatio) / entryPrice);
     return Math.max(0, Math.min(riskBased, notionalCap));

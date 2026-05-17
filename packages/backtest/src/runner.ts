@@ -3,6 +3,9 @@ import {
   CorrelationMatrix,
   admitUnderClusterCap,
   resolveCorrelationCapConfig,
+  effectiveRiskPct,
+  resolveVolKellySizerConfig,
+  trailingRealisedVol,
   OrbStrategy,
   ReversalStrategy,
   MacdTrendStrategy,
@@ -303,6 +306,23 @@ export class BacktestRunner {
     let correlationCapRejected = 0;
     let correlationCapScaledDown = 0;
 
+    // TRA-430 — volatility-/Kelly-scaled per-trade risk sizing (TRA-428 spec).
+    // Runs *ahead* of the TRA-423 cluster cap: it sets the candidate's
+    // per-trade risk fraction (vol-targeted, Kelly-capped) before sizing, then
+    // the cluster cap admits/scales the sized qty unchanged. Master `enabled`
+    // flag defaults false → the sizer ships dark. `resolveVolKellySizerConfig`
+    // asserts `riskPctFloor >= minTradeRiskPct` against the resolved cluster
+    // cap floor (§5 floor coherence).
+    const volKellyEnabled = config.volKellySizerOpts?.enabled === true;
+    const volKellyConfig = resolveVolKellySizerConfig(
+      config.volKellySizerOpts?.config,
+      corrCapConfig.minTradeRiskPct,
+    );
+    const volKellyExpectancy = config.volKellySizerOpts?.expectancyByCell ?? {};
+    let volKellyApplied = 0;
+    let volKellyZeroEdgeSkipped = 0;
+    let volKellyEffRiskPctSum = 0;
+
     const lookahead = config.signalEdgeOpts?.lookaheadBars ?? DEFAULT_LOOKAHEAD_BARS;
     const signalLog: Array<{ signal: TradeSignal; barIndex: number }> = [];
     const seenSignalIds = new Set<string>();
@@ -339,10 +359,40 @@ export class BacktestRunner {
         // 1% default that momentum/breakout share). The override applies only
         // to `mean_reversion` signals — other types use whatever
         // `RiskManager` defaults to.
-        const riskPct = signal.type === 'mean_reversion'
+        let riskPct = signal.type === 'mean_reversion'
           ? (config.meanReversionRiskPct ?? DEFAULT_MEAN_REVERSION_RISK_PCT)
           : undefined;
-        const qty = risk.sizeFromStop(signal.entryPrice, signal.stopLoss, { riskPct });
+
+        // TRA-430 — vol-/Kelly-scaled per-trade risk (TRA-428 spec §3). When
+        // enabled, the effective risk fraction replaces the flat budget for
+        // every signal type. `σ_sym` is the trailing realised vol of the
+        // strategy-timeframe closes that are fully closed at fill time —
+        // `window` ends on `latest`, the bar whose open is the fill price, so
+        // its close is excluded (`slice(0, -1)`) to avoid look-ahead (§3.2).
+        let volKellyEffRiskPct: number | null = null;
+        if (volKellyEnabled) {
+          const closedCloses = window.slice(0, -1).map(c => c.close);
+          const sigmaSym = trailingRealisedVol(
+            closedCloses,
+            volKellyConfig.volWindowBars,
+            volKellyConfig.barsPerYear,
+          );
+          // §3.1 cell key — try `${signalType}|${symbol}`, then bare symbol.
+          const expectancy =
+            volKellyExpectancy[`${signal.type}|${signal.symbol}`] ??
+            volKellyExpectancy[signal.symbol];
+          volKellyEffRiskPct = effectiveRiskPct(volKellyConfig, sigmaSym, expectancy);
+          volKellyApplied += 1;
+          volKellyEffRiskPctSum += volKellyEffRiskPct;
+          riskPct = volKellyEffRiskPct;
+        }
+
+        // §3.4/§3.5 — a non-positive-edge cell yields `effRiskPct = 0`; size to
+        // zero so the trade is dropped (belt-and-suspenders to TRA-421).
+        const qty = volKellyEffRiskPct === 0
+          ? 0
+          : risk.sizeFromStop(signal.entryPrice, signal.stopLoss, { riskPct });
+        if (volKellyEffRiskPct === 0) volKellyZeroEdgeSkipped += 1;
 
         // TRA-423 — correlation / concentration cap admission (spec §6). Runs
         // after sizing because the cap reasons about the candidate's dollar
@@ -719,6 +769,14 @@ export class BacktestRunner {
       skippedConcentration,
       correlationCap: corrCapEnabled
         ? { enabled: true, rejected: correlationCapRejected, scaledDown: correlationCapScaledDown }
+        : undefined,
+      volKellySizer: volKellyEnabled
+        ? {
+            enabled: true,
+            applied: volKellyApplied,
+            zeroEdgeSkipped: volKellyZeroEdgeSkipped,
+            avgEffRiskPct: volKellyApplied > 0 ? volKellyEffRiskPctSum / volKellyApplied : 0,
+          }
         : undefined,
       signalEdge,
       ambiguousTrades,
