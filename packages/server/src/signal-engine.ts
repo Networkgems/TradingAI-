@@ -5,6 +5,7 @@ import type { TradeSignal, RelativeValueSignal, Candle, OptionsAccountState, Sig
 import { getLatestMarketReview } from './market-review.js';
 import { etDateString } from './scheduler.js';
 import { fetchMinuteBars, fetchQuotes, fetchStocksNews, isYahooBreakerOpen, setActiveInterestSymbols } from './yahoo-feed.js';
+import { evaluateFeedFreshness } from './feed-freshness.js';
 import { PaperAccount } from './paper-account.js';
 import { PaperOptionsAccount } from './options-account.js';
 import {
@@ -1110,10 +1111,26 @@ export class SignalEngine {
     // TRA-229: isAutoTradingEnabled() resolves the per-mode flag.
     if (equityStrategiesActiveOnTick && this.isAutoTradingEnabled() && !this.riskGovernor.isHalted()) {
       let symbolsWithData = 0;
+      // TRA-418 — data-feed freshness gate. During market hours a working feed
+      // delivers fresh minute bars every tick; when the latest cached bar has
+      // aged past the staleness threshold the equity feed (Tradier → Yahoo →
+      // Twelve Data cascade) is down, so we must not evaluate strategies off
+      // the stale candle cache — a dead feed would otherwise fire an entry on
+      // hours-old bars. Outside market hours bars are *expected* to be stale
+      // (no new prints), so the gate only applies while the market is open.
+      const equityFeedGateActive = isStockMarketOpen();
+      const freshnessNow = Date.now();
       // Run strategies and collect new signals
       for (const sym of activeSymbols) {
         const candles = this.candleCache.get(sym) ?? [];
         if (candles.length < 15) continue;
+        if (equityFeedGateActive) {
+          const verdict = evaluateFeedFreshness({ candles }, freshnessNow);
+          if (verdict.stale) {
+            console.warn(`[signal-engine] ${sym} equity feed stale — ${verdict.reason}; skipping signal evaluation`);
+            continue;
+          }
+        }
         symbolsWithData++;
 
         const orbSignal = this.orb.evaluate(sym, candles);

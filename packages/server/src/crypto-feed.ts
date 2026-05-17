@@ -468,6 +468,19 @@ export async function fetchCryptoQuote(symbol: string): Promise<CryptoQuote | nu
   return cmcResults.get(symbol) ?? null;
 }
 
+/**
+ * Crypto quote fetch with ordered failover (TRA-418).
+ *
+ * Failover order — `coinbase → yahoo → cmc` (see `CRYPTO_FEED_FAILOVER_ORDER`
+ * in `feed-freshness.ts`):
+ *   1. Coinbase Exchange `/products/{id}/stats` — primary. Same venue as the
+ *      live crypto broker, so quote ↔ execution prices stay aligned.
+ *   2. Yahoo Finance — backstops symbols Coinbase does not list (BNB-USD,
+ *      VET-USD, …). Skipped while the shared Yahoo rate-limit breaker is open.
+ *   3. CoinMarketCap — final fallback for the residual set.
+ * Each symbol takes the result from the first provider in this order that
+ * returns it; the `source` tag on every `CryptoQuote` records which one.
+ */
 export async function fetchCryptoQuotes(
   symbols: readonly string[],
 ): Promise<Map<string, CryptoQuote>> {

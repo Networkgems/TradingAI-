@@ -288,8 +288,10 @@ async function fetchTwelveDataMinuteBars(
 /**
  * Fetch the last N 1-minute candles for a symbol.
  *
- * Tradier is the primary source. When its breaker is open or it returns no
- * usable bars, we cascade through Yahoo → Twelve Data. Stooq is intentionally
+ * Ordered failover (TRA-418) — `tradier → yahoo → twelvedata` (see
+ * `EQUITY_CANDLE_FAILOVER_ORDER` in `feed-freshness.ts`). Tradier timesales is
+ * the primary source; when its breaker is open or it returns no usable bars we
+ * cascade through Yahoo charts and then Twelve Data. Stooq is intentionally
  * not in the chart fallback chain — it's EOD-ish and would corrupt indicator
  * math built off intraday minute bars.
  */
@@ -447,10 +449,11 @@ type QuoteResult = { price: number; volume: number; change: number; changePct: n
 /**
  * Fetch the current quote for a single symbol.
  *
- * Tradier is the primary source. When its breaker is open or it returns no
- * quote, cascade through Yahoo → Stooq. Stooq stays last-resort so the
- * watchlist always has *something* to render even when both primary and Yahoo
- * are unreachable.
+ * Ordered failover (TRA-418) — `tradier → yahoo → stooq` (see
+ * `EQUITY_QUOTE_FAILOVER_ORDER` in `feed-freshness.ts`). Tradier is the primary
+ * source; when its breaker is open or it returns no quote we cascade through
+ * Yahoo and then Stooq. Stooq stays last-resort so the watchlist always has
+ * *something* to render even when both primary and Yahoo are unreachable.
  */
 export async function fetchQuote(symbol: string): Promise<QuoteResult | null> {
   // Primary: Tradier. (Single-symbol path — `fetchQuotes` uses the multi-symbol

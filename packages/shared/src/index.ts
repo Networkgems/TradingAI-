@@ -1520,8 +1520,12 @@ export interface CryptoSymbolState {
    * Why this symbol's quote is missing/stale. The watchlist UI uses this to render
    * a useful state ("Quote unavailable — provider rate-limited") instead of a
    * permanent "Loading…" spinner when upstream providers are down.
+   *
+   * TRA-418 — `'stale'` marks a symbol whose quote or backing candles aged past
+   * the freshness threshold (feed down). A stale symbol is excluded from
+   * strategy evaluation so a dead feed can never produce a new entry signal.
    */
-  quoteStatus?: 'ok' | 'rate_limited' | 'unavailable';
+  quoteStatus?: 'ok' | 'rate_limited' | 'unavailable' | 'stale';
 }
 
 export interface CryptoEngineState {

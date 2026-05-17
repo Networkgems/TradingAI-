@@ -38,6 +38,7 @@ import {
   isCoinbaseListed,
 } from './crypto-feed.js';
 import { isYahooBreakerOpen } from './yahoo-feed.js';
+import { evaluateFeedFreshness } from './feed-freshness.js';
 import { CryptoPaperAccount } from './crypto-account.js';
 import { CryptoLiveAccount } from './crypto-live-account.js';
 import { FundingRateTracker } from './funding-rate-tracker.js';
@@ -937,6 +938,11 @@ export class CryptoSignalEngine {
       );
     }
 
+    // TRA-418 — data-feed freshness gate. Run after the candle refresh above so
+    // a symbol whose feed is down is detected from the (now-attempted) cache
+    // age, marked `quoteStatus: 'stale'`, and excluded from signal evaluation.
+    const staleSymbols = this.markStaleSymbols(activeSymbols);
+
     if (this.isAutoTradingEnabled()) {
       // TRA-325 — resolve the active preset once per tick. Strategies outside
       // the preset short-circuit to null without running indicators; symbols
@@ -948,6 +954,12 @@ export class CryptoSignalEngine {
       let symbolsEvaluated = 0;
       let symbolsSkipped = 0;
       for (const sym of activeSymbols) {
+        // TRA-418 — a stale feed must never produce a new entry signal. Skip
+        // strategy evaluation entirely so no signal is even generated.
+        if (staleSymbols.has(sym)) {
+          symbolsSkipped++;
+          continue;
+        }
         const candles = this.candleCache.get(sym) ?? [];
         const dailyCandles = this.dailyCandleCache.get(sym) ?? [];
 
@@ -1139,6 +1151,11 @@ export class CryptoSignalEngine {
       );
     }
 
+    // TRA-418 — data-feed freshness gate, same as the demo path. A stale feed
+    // must never reach the broker with a new entry, so we detect and exclude
+    // stale symbols before strategy evaluation.
+    const staleSymbols = this.markStaleSymbols(activeSymbols);
+
     // TRA-325 — resolve the active preset once per live tick. Same semantics
     // as the demo path so verification on demo before flipping to live is
     // meaningful.
@@ -1148,6 +1165,8 @@ export class CryptoSignalEngine {
     const strategyEnabled = (s: CryptoStrategyType) => preset.enabledStrategies.includes(s);
 
     for (const sym of activeSymbols) {
+      // TRA-418 — skip stale-feed symbols before any strategy runs.
+      if (staleSymbols.has(sym)) continue;
       const candles = this.candleCache.get(sym) ?? [];
       const dailyCandles = this.dailyCandleCache.get(sym) ?? [];
 
@@ -1236,6 +1255,42 @@ export class CryptoSignalEngine {
   private async refreshCandles(symbol: string): Promise<void> {
     const bars = await fetchCryptoMinuteBars(symbol, 80);
     if (bars.length > 0) this.candleCache.set(symbol, bars);
+  }
+
+  /**
+   * TRA-418 — data-feed freshness gate.
+   *
+   * For each symbol, evaluate the age of its last quote (`symbolState
+   * .lastUpdated`) and its backing minute-candle series against the staleness
+   * thresholds. A symbol whose feed has gone stale is marked
+   * `quoteStatus: 'stale'` (so the watchlist UI surfaces the degraded feed)
+   * and returned in the result set; callers exclude those symbols from signal
+   * evaluation entirely. This is the guard that stops the engine evaluating a
+   * strategy — and firing a brand-new entry signal — off a cache that a dead
+   * feed left behind (TRA-408 review §5).
+   *
+   * Runs after the per-tick candle refresh so the cache age reflects this
+   * tick's fetch attempt: a feed that succeeded this tick reads fresh, a feed
+   * that failed leaves the prior (now-older) bars in place.
+   */
+  private markStaleSymbols(symbols: readonly string[]): Set<string> {
+    const stale = new Set<string>();
+    const now = Date.now();
+    for (const sym of symbols) {
+      const state = this.symbolState.get(sym);
+      const verdict = evaluateFeedFreshness(
+        { quoteLastUpdated: state?.lastUpdated, candles: this.candleCache.get(sym) },
+        now,
+      );
+      if (!verdict.stale) continue;
+      stale.add(sym);
+      // Reuse/extend the existing quoteStatus field (TRA-418). Preserve the
+      // last known price/volume so the row still renders a number under the
+      // "stale" badge instead of collapsing to a Loading… spinner.
+      if (state) this.symbolState.set(sym, { ...state, quoteStatus: 'stale' });
+      console.warn(`[crypto-engine] ${sym} feed stale — ${verdict.reason}; skipping signal evaluation`);
+    }
+    return stale;
   }
 
   /**
