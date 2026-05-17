@@ -1,5 +1,4 @@
 // TRA-419 — DashboardSelector component extracted from App.tsx.
-import React from 'react';
 import { ThemeToggle } from './ThemeToggle';
 import { CandlestickIcon, BitcoinIcon } from './Icons';
 import type { Theme } from './ThemeToggle';

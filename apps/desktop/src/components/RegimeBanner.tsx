@@ -4,7 +4,6 @@
 // of strategies the regime gates currently suppress. Returns null when the
 // gate-consumption flag is off (or no review has been generated yet) so the
 // banner only appears once an operator has opted into regime gating.
-import React from 'react';
 import type { EngineMarketReviewState } from '@trading-app/shared';
 
 export function RegimeBanner({ review }: { review?: EngineMarketReviewState }) {

@@ -51,9 +51,12 @@ export function timeAgo(ts: number) {
  * provider state so a rate-limited or down quote source shows actionable text
  * instead of a perpetual "Loading…" spinner.
  */
-export function quoteStatusLabel(s: { lastUpdated: number; quoteStatus?: 'ok' | 'rate_limited' | 'unavailable' }): string {
+export function quoteStatusLabel(s: { lastUpdated: number; quoteStatus?: 'ok' | 'rate_limited' | 'unavailable' | 'stale' }): string {
   if (s.quoteStatus === 'rate_limited') return 'Quote unavailable — provider rate-limited';
   if (s.quoteStatus === 'unavailable') return 'Quote unavailable';
+  // TRA-418 — `'stale'` marks a quote that aged past the freshness threshold
+  // (feed down). Surface it distinctly from a healthy "x ago" timestamp.
+  if (s.quoteStatus === 'stale') return 'Quote stale — feed delayed';
   if (s.lastUpdated === 0) return 'Loading…';
   return timeAgo(s.lastUpdated);
 }

@@ -4,7 +4,6 @@
 // through the same render path as long as `strike`/`expiration` are present).
 // Returns null for non-option signals so the crypto signal feed renders byte
 // identical to before.
-import React from 'react';
 import type { TradeSignal, OptionType } from '@trading-app/shared';
 import { formatExpirationFull, daysToExpiration } from '../lib/format';
 

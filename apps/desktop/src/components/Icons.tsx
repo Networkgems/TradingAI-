@@ -1,5 +1,4 @@
 // TRA-419 — SVG icon components extracted from App.tsx.
-import React from 'react';
 
 export function CandlestickIcon() {
   return (

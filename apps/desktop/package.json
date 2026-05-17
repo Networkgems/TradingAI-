@@ -9,7 +9,7 @@
     "vite:dev": "vite",
     "vite:build": "tsc --noEmit -p tsconfig.app.json && vite build",
     "preview": "vite preview",
-    "typecheck": "tsc --noEmit",
+    "typecheck": "tsc --noEmit -p tsconfig.app.json && tsc --noEmit -p tsconfig.node.json",
     "test": "vitest run --passWithNoTests",
     "test:watch": "vitest"
   },
