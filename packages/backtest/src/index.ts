@@ -13,10 +13,21 @@ export type {
   BacktestIchimokuOpts,
   BacktestMacdBollingerOpts,
   PortfolioOpts,
+  CorrelationCapOpts,
+  VolKellySizerOpts,
   SignalEdgeOpts,
   ConfidenceBands,
   SignalEdge,
 } from './types.js';
+// TRA-429 — multi-symbol portfolio backtest runner. Ticks several symbols on
+// one shared timeline against shared portfolio / risk state so the TRA-423
+// cross-symbol correlation-cluster cap is regression-tested on historical data.
+export { PortfolioBacktestRunner } from './portfolio-runner.js';
+export type {
+  PortfolioBacktestConfig,
+  PortfolioBacktestResult,
+  PortfolioSymbolResult,
+} from './portfolio-runner.js';
 export {
   trendingCandles,
   rangingCandles,
