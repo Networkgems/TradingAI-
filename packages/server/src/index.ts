@@ -967,6 +967,33 @@ app.get('/api/health', (_req, res) => {
   res.json({ ok: true, time: new Date().toISOString() });
 });
 
+// TRA-398 — client-side error sink. The desktop/mobile React error boundary
+// posts uncaught render-time exceptions here so QA/ops have visibility into
+// white-screen-class failures instead of them being lost in the browser.
+// Intentionally unauthenticated and best-effort: a crash can happen before
+// login or after the token expires, and the boundary uses navigator.sendBeacon
+// (which cannot attach auth headers). Payload is logged only — never persisted
+// or echoed back — and oversized fields are clamped to bound log volume.
+app.post('/api/client-error', (req, res) => {
+  try {
+    const b = (req.body ?? {}) as Record<string, unknown>;
+    const clamp = (v: unknown, max: number): string =>
+      typeof v === 'string' ? v.slice(0, max) : '';
+    console.error(
+      `[client-error] label=${clamp(b['label'], 120) || 'unknown'} ` +
+      `url=${clamp(b['url'], 300)} ` +
+      `ua=${clamp(b['userAgent'], 200)}\n` +
+      `  message: ${clamp(b['message'], 500)}\n` +
+      `  stack: ${clamp(b['stack'], 2000)}\n` +
+      `  componentStack: ${clamp(b['componentStack'], 2000)}`,
+    );
+  } catch (err) {
+    console.error('[client-error] failed to handle report:', err);
+  }
+  // Always 204 — the client treats this as fire-and-forget.
+  res.status(204).end();
+});
+
 // TRA-191 — surface live relative-value scan output. Read-only, gated by auth.
 // Returns up to `limit` ranked candidates and the diagnostics block so QA can
 // see whether the breaker is open / cache is warm without needing server logs.

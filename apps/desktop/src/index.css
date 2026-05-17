@@ -1966,3 +1966,90 @@ tr:hover td { background: var(--bg-hover); }
   background: var(--surface);
 }
 
+/* TRA-398 — React error boundary fallback UI. */
+.error-boundary {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+
+.error-boundary-page {
+  min-height: 100vh;
+  width: 100%;
+  background: var(--bg);
+  padding: 2rem;
+}
+
+.error-boundary-panel {
+  padding: 2rem 1rem;
+}
+
+.error-boundary-card {
+  max-width: 32rem;
+  width: 100%;
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 1.5rem;
+  box-shadow: 0 1px 3px rgba(0, 0, 0, 0.08);
+}
+
+.error-boundary-title {
+  font-size: 1.1rem;
+  font-weight: 600;
+  color: var(--red);
+  margin-bottom: 0.5rem;
+}
+
+.error-boundary-text {
+  font-size: 0.875rem;
+  color: var(--text);
+  margin-bottom: 0.75rem;
+}
+
+.error-boundary-detail {
+  font-size: 0.75rem;
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  color: var(--muted);
+  background: var(--surface2);
+  border: 1px solid var(--border-subtle);
+  border-radius: 6px;
+  padding: 0.6rem 0.75rem;
+  margin-bottom: 1rem;
+  white-space: pre-wrap;
+  word-break: break-word;
+  max-height: 8rem;
+  overflow: auto;
+}
+
+.error-boundary-actions {
+  display: flex;
+  gap: 0.5rem;
+  justify-content: flex-end;
+}
+
+.error-boundary-btn {
+  font-size: 0.825rem;
+  font-weight: 500;
+  padding: 0.45rem 0.9rem;
+  border-radius: 6px;
+  border: 1px solid var(--border);
+  background: var(--surface);
+  color: var(--text);
+  cursor: pointer;
+}
+
+.error-boundary-btn:hover {
+  background: var(--bg-hover);
+}
+
+.error-boundary-btn-primary {
+  background: var(--blue);
+  border-color: var(--blue);
+  color: var(--accent-on);
+}
+
+.error-boundary-btn-primary:hover {
+  background: var(--blue-strong);
+}
+

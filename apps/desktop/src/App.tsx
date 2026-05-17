@@ -20,6 +20,7 @@ import ForgotPasswordPage from './ForgotPasswordPage.tsx';
 import SignUpPage from './SignUpPage.tsx';
 import SettingsPage, { ChangePasswordSection, UserManagementSection } from './SettingsPage.tsx';
 import { CalendarTab } from './CalendarTab.tsx';
+import { ErrorBoundary } from './ErrorBoundary.tsx';
 import { SERVER_URL, HTTP_URL } from './server-url';
 import './index.css';
 
@@ -742,6 +743,9 @@ function CryptoDashboard({ token, onBack, onLogout, onActivity, theme, onToggleT
       )}
 
       <main className="content">
+       {/* TRA-398 — per-tab error boundary. `key={tab}` remounts it on tab
+           switch so a render crash in one tab cannot white-screen the app. */}
+       <ErrorBoundary key={tab} label={`crypto:${tab}`} variant="panel">
         {!state && !everConnected && (
           <div className="loading">
             <div className="spinner" />
@@ -1076,6 +1080,7 @@ function CryptoDashboard({ token, onBack, onLogout, onActivity, theme, onToggleT
             market="crypto"
           />
         )}
+       </ErrorBoundary>
       </main>
     </div>
   );
@@ -2206,6 +2211,9 @@ function Dashboard({ token, onLogout, onGoHome, onActivity, theme, onToggleTheme
       </nav>
 
       <main className="content">
+       {/* TRA-398 — per-tab error boundary. `key={tab}` remounts it on tab
+           switch so a render crash in one tab cannot white-screen the app. */}
+       <ErrorBoundary key={tab} label={`stocks:${tab}`} variant="panel">
         {!state && (
           <div className="loading">
             <div className="spinner" />
@@ -2769,6 +2777,7 @@ function Dashboard({ token, onLogout, onGoHome, onActivity, theme, onToggleTheme
             }
           />
         )}
+       </ErrorBoundary>
       </main>
       {/* TRA-358 — Tradier-style limit-close drawer for engine-opened LIVE
           option positions. Mirrors the price/qty/duration form Tradier shows
