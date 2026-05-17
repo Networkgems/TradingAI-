@@ -471,6 +471,7 @@ function CryptoDashboard({ token, onBack, onLogout, onActivity, theme, onToggleT
       wsRef.current?.close();
       if (reconnectTimer.current) clearTimeout(reconnectTimer.current);
     };
+    // eslint-disable-next-line react-hooks/exhaustive-deps -- onActivity/onLogout are event-style callbacks; adding them would tear down and reconnect the WebSocket on every parent render
   }, [token, onBack]);
 
   useEffect(() => {
@@ -485,6 +486,7 @@ function CryptoDashboard({ token, onBack, onLogout, onActivity, theme, onToggleT
       } catch { /* ignore */ }
     }, 5000);
     return () => clearInterval(id);
+    // eslint-disable-next-line react-hooks/exhaustive-deps -- onLogout is an event-style callback; adding it would restart the polling interval on every parent render
   }, [connected, token, onBack]);
 
   useEffect(() => {
@@ -1741,6 +1743,7 @@ function Dashboard({ token, onLogout, onGoHome, onActivity, theme, onToggleTheme
       wsRef.current?.close();
       if (reconnectTimer.current) clearTimeout(reconnectTimer.current);
     };
+    // eslint-disable-next-line react-hooks/exhaustive-deps -- onActivity is an event-style callback; adding it would tear down and reconnect the WebSocket on every parent render
   }, [token, onLogout]);
 
   // Fallback REST polling when WS isn't connected
@@ -2939,7 +2942,7 @@ export default function App() {
       if (!cancelled) setTokenChecked(true);
     });
     return () => { cancelled = true; };
-  }, []); // eslint-disable-line react-hooks/exhaustive-deps
+  }, []);
 
   function resetIdleTimer() {
     if (idleTimerRef.current) clearTimeout(idleTimerRef.current);

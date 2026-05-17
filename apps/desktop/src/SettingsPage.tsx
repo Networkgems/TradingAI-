@@ -1,4 +1,4 @@
-import { useEffect, useState } from 'react';
+import { useCallback, useEffect, useState } from 'react';
 import type {
   AccountMode,
   AccountSettings,
@@ -390,7 +390,7 @@ export function UserManagementSection({ token, httpUrl }: { token: string; httpU
   const [lockBusy, setLockBusy] = useState(false);
   const [lockMessage, setLockMessage] = useState<{ kind: 'ok' | 'err'; text: string } | null>(null);
 
-  async function loadUsers() {
+  const loadUsers = useCallback(async () => {
     try {
       const r = await fetch(`${httpUrl}/api/admin/users`, {
         headers: { Authorization: `Bearer ${token}` },
@@ -402,9 +402,9 @@ export function UserManagementSection({ token, httpUrl }: { token: string; httpU
     } finally {
       setLoading(false);
     }
-  }
+  }, [token, httpUrl]);
 
-  useEffect(() => { void loadUsers(); }, [token, httpUrl]);
+  useEffect(() => { void loadUsers(); }, [loadUsers]);
 
   async function handleCreate(e: React.FormEvent) {
     e.preventDefault();
