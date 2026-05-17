@@ -239,8 +239,8 @@ describe('CryptoSignalEngine.manualClosePosition — live mode wiring (TRA-320)'
 describe('Strategy presets — TRA-325', () => {
   // The preset library is the load-bearing contract for the Settings UI and
   // the live $180 board test. These tests pin the resolver behavior + the
-  // shape of the two v1 presets so a future refactor can't silently shift
-  // the deployed configuration.
+  // shape of each preset so a future refactor can't silently shift the
+  // deployed configuration.
 
   it('resolves an undefined / null id to the default legacy_5 preset', () => {
     expect(resolveStrategyPreset(undefined).id).toBe(DEFAULT_STRATEGY_PRESET_ID);
@@ -317,6 +317,25 @@ describe('Strategy presets — TRA-325', () => {
   it('presetAllowsStrategySymbol — preset-wide symbolFilter still applies', () => {
     const p = STRATEGY_PRESETS.bb_fade_sol_doge;
     expect(presetAllowsStrategySymbol(p, 'bb_fade', 'SOL-USD')).toBe(true);
+    expect(presetAllowsStrategySymbol(p, 'bb_fade', 'BTC-USD')).toBe(false);
+  });
+
+  it('TRA-434 — no_trade resolves and enables zero strategies on zero symbols', () => {
+    // Risk stand-down preset pinned via LIVE_STRATEGY_PRESET after the
+    // TRA-432 NO-GO (which superseded TRA-405's dirty-cache "go"). With no
+    // enabled strategies, every per-tick strategyEnabled() check returns
+    // false, so the engine opens no new entries; the empty symbolFilter is
+    // belt-and-suspenders. Exit logic is not preset-gated, so open positions
+    // still close on their own rules.
+    const p = resolveStrategyPreset('no_trade');
+    expect(p.id).toBe('no_trade');
+    expect(p.enabledStrategies).toEqual([]);
+    expect(p.symbolFilter).toEqual([]);
+    expect(STRATEGY_PRESETS.no_trade).toBe(p);
+    // Empty symbolFilter also fails the presetAllowsStrategySymbol gate, so
+    // even a strategy that somehow stayed enabled could not fire on any leg.
+    expect(presetAllowsStrategySymbol(p, 'bb_fade', 'SOL-USD')).toBe(false);
+    expect(presetAllowsStrategySymbol(p, 'bb_fade', 'DOGE-USD')).toBe(false);
     expect(presetAllowsStrategySymbol(p, 'bb_fade', 'BTC-USD')).toBe(false);
   });
 

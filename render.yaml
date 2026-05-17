@@ -87,12 +87,27 @@ services:
       # `bb_fade_sol_doge` pin traded DOGE-USD, which TRA-405 found
       # OOS-negative (−5.2%, profit factor 0.50).
       #
+      # TRA-434 — risk stand-down, pinned to `no_trade`. QuantTrader's
+      # clean-cache OOS re-validation (TRA-432) supersedes TRA-405: with the
+      # data cache rebuilt clean, bb_fade FAILS the CTO-adopted lower-CI-bound
+      # robustness gate on both live legs (DOGE-USD block-bootstrap CI entirely
+      # below zero; SOL-USD OOS -2.75%, p5 -8.57%). TRA-405's "go" — including
+      # the BTC-USD leg `tra405_validated` carried — used the dirty cache and
+      # is no longer trusted, so bb_fade has no clean lower-CI-bound-gate pass
+      # on ANY symbol. Per the CTO directive, Phase-2 live-capital trading
+      # stays on hold company-wide until a strategy passes that gate, so the
+      # live engine is pinned to `no_trade`: zero enabled strategies, empty
+      # symbol whitelist — it opens NO new entries on any symbol. Open
+      # positions still close on their existing exit logic (the preset gates
+      # entries only, not exits). To re-authorise a pilot once a strategy
+      # passes the CI gate, repoint this value to the approved preset id.
+      #
       # Drop the env var to release control back to per-user settings (default
       # `legacy_5` = pre-324 5-strategy roster). The legacy value
       # `bb_fade_sol_doge_only` from TRA-324 is still accepted (mapped to
       # `bb_fade_sol_doge`) for revert safety.
       - key: LIVE_STRATEGY_PRESET
-        value: tra405_validated
+        value: no_trade
       # TRA-406 — observability. All optional; sane defaults apply when unset.
       #   LOG_LEVEL          debug|info|warn|error (default info)
       #   ERROR_WEBHOOK_URL  HTTPS endpoint captured errors are POSTed to

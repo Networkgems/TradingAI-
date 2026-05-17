@@ -290,7 +290,7 @@ export const MANAGED_ACCOUNT_RATIO = 0.5;   // 50% of total account auto-managed
 // user/engine to the named preset regardless of saved settings.
 
 /** Canonical preset identifiers — the literal union doubles as runtime validation. */
-export type StrategyPresetId = 'legacy_5' | 'bb_fade_sol_doge' | 'tra405_validated';
+export type StrategyPresetId = 'legacy_5' | 'bb_fade_sol_doge' | 'tra405_validated' | 'no_trade';
 
 /** Crypto-strategy SignalTypes routable by the engine. Subset of {@link SignalType}. */
 export type CryptoStrategyType =
@@ -349,6 +349,20 @@ export interface StrategyPreset {
  *   • `tra405_validated` — TRA-421: the TRA-405 §8 out-of-sample go/no-go
  *                          roster. bb_fade only, gated to {BTC-USD, SOL-USD}
  *                          via {@link StrategyPreset.strategyUniverse}.
+ *                          Superseded by `no_trade` as the live pin — see
+ *                          TRA-434 below — but kept in the library for the
+ *                          Settings UI and as the revert target once a
+ *                          strategy clears the lower-CI-bound gate.
+ *   • `no_trade`         — TRA-434 risk stand-down preset: zero enabled
+ *                          strategies and an empty symbol whitelist, so every
+ *                          per-tick `strategyEnabled()` / `symbolAllowed()`
+ *                          check returns false and the engine opens NO new
+ *                          entries. Exit/position-management logic is not
+ *                          gated by the preset, so positions already open
+ *                          continue to close on their own stop/target rules.
+ *                          Used by the `LIVE_STRATEGY_PRESET` env var to pause
+ *                          the live crypto pilot after the TRA-432 NO-GO,
+ *                          which superseded TRA-405's dirty-cache "go".
  *
  * Future presets are added here without code changes elsewhere — the engine
  * resolves by id, the UI lists `Object.values(STRATEGY_PRESETS)`.
@@ -386,14 +400,28 @@ export const STRATEGY_PRESETS: Readonly<Record<StrategyPresetId, StrategyPreset>
   // `bb_fade` only and gates it — via `strategyUniverse` — to {BTC-USD,
   // SOL-USD}. momentum / breakout_vol are simply not in `enabledStrategies`,
   // which is how a strategy is disabled on the generic universe.
+  //
+  // TRA-432/TRA-434 NOTE: this preset is no longer the live pin. QuantTrader's
+  // clean-cache OOS re-validation (TRA-432) found bb_fade fails the
+  // CTO-adopted lower-CI-bound robustness gate, so `LIVE_STRATEGY_PRESET` is
+  // pinned to `no_trade`. The preset stays in the library for the Settings UI
+  // and as the revert target once a strategy clears the gate.
   tra405_validated: {
     id: 'tra405_validated',
     displayName: 'TRA-405 validated — macd_bollinger (bb_fade) on BTC + SOL',
     description:
-      'TRA-405 §8 out-of-sample go/no-go roster: only the macd_bollinger / bb_fade mean-reversion edge survives costs, and only on BTC-USD and SOL-USD. momentum and breakout_vol are OOS-negative on every symbol tested and are disabled.',
+      'TRA-405 §8 out-of-sample go/no-go roster: only the macd_bollinger / bb_fade mean-reversion edge survives costs, and only on BTC-USD and SOL-USD. momentum and breakout_vol are OOS-negative on every symbol tested and are disabled. Superseded as the live pin by no_trade after the TRA-432 clean-cache re-validation NO-GO.',
     enabledStrategies: ['bb_fade'] as const,
     symbolFilter: null,
     strategyUniverse: { bb_fade: ['BTC-USD', 'SOL-USD'] as const },
+  },
+  no_trade: {
+    id: 'no_trade',
+    displayName: 'No-trade — engine paused',
+    description:
+      'Risk stand-down (TRA-434): no strategies enabled and an empty symbol whitelist, so the engine opens no new entries on any symbol. Open positions still close on their existing exit logic. Used to pause the live crypto pilot after the TRA-432 NO-GO verdict.',
+    enabledStrategies: [] as const,
+    symbolFilter: [] as const,
   },
 };
 
