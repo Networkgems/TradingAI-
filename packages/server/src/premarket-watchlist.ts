@@ -45,6 +45,9 @@ import {
   stockReportsDirFor,
   type UserContext,
 } from './user-context.js';
+import { logger } from './observability/index.js';
+
+const log = logger.child({ module: 'premarket-watchlist' });
 
 /** Soft cap on net-new symbols added per user per pre-market run. */
 const MAX_NEW_SYMBOLS = 15;
@@ -85,10 +88,11 @@ async function loadLatestEodReport(ctx: UserContext): Promise<EodReport | null> 
     const raw = await readFile(file, 'utf-8');
     return JSON.parse(raw) as EodReport;
   } catch (err) {
-    console.warn(
-      `[premarket:${ctx.username}] failed to read EOD report ${file}:`,
-      err instanceof Error ? err.message : String(err),
-    );
+    log.warn('failed to read EOD report', {
+      username: ctx.username,
+      file,
+      reason: err instanceof Error ? err.message : String(err),
+    });
     return null;
   }
 }
@@ -142,10 +146,10 @@ export async function generateSmartWatchlist(ctx: UserContext): Promise<string[]
   try {
     preMarketScan = await scanStocksMarket();
   } catch (err) {
-    console.warn(
-      `[premarket:${ctx.username}] scanStocksMarket failed:`,
-      err instanceof Error ? err.message : String(err),
-    );
+    log.warn('scanStocksMarket failed', {
+      username: ctx.username,
+      reason: err instanceof Error ? err.message : String(err),
+    });
   }
 
   const ranked = scoreSymbols(eod, preMarketScan);
@@ -160,10 +164,11 @@ export async function generateSmartWatchlist(ctx: UserContext): Promise<string[]
       await addStocksSymbol(ctx.username, r.symbol);
       ctx.engine.addSymbol(r.symbol);
     } catch (err) {
-      console.warn(
-        `[premarket:${ctx.username}] failed to add ${r.symbol}:`,
-        err instanceof Error ? err.message : String(err),
-      );
+      log.warn('failed to add symbol', {
+        username: ctx.username,
+        symbol: r.symbol,
+        reason: err instanceof Error ? err.message : String(err),
+      });
     }
   }
 
@@ -172,9 +177,11 @@ export async function generateSmartWatchlist(ctx: UserContext): Promise<string[]
   }
 
   const summary = newcomers.map(s => `${s.symbol}(${s.sources.join('|')})`).join(', ');
-  console.log(
-    `[premarket:${ctx.username}] smart watchlist: +${newcomers.length} symbol(s)${summary ? ` → ${summary}` : ''}`,
-  );
+  log.info('smart watchlist built', {
+    username: ctx.username,
+    added: newcomers.length,
+    ...(summary ? { symbols: summary } : {}),
+  });
 
   return newcomers.map(s => s.symbol);
 }
@@ -190,7 +197,10 @@ export async function runPremarketForAllUsers(): Promise<void> {
     try {
       await generateSmartWatchlist(ctx);
     } catch (err) {
-      console.error(`[premarket:${ctx.username}] smart watchlist failed:`, err);
+      log.error('smart watchlist failed', {
+        username: ctx.username,
+        reason: err instanceof Error ? err.message : String(err),
+      });
     }
   }
 }

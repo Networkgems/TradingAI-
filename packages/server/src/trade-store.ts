@@ -5,6 +5,9 @@ import { join, dirname } from 'path';
 import { fileURLToPath } from 'url';
 import type { AccountMode, Position, TradeSignal, OptionPosition, SignalType, TradierEnv } from '@trading-app/shared';
 import type { DailySignalRecord } from './reports/eod-report.js';
+import { logger } from './observability/index.js';
+
+const log = logger.child({ module: 'trade-store' });
 
 // ─────────────────────────────────────────────────────────────────────────────
 // TRA-140 — durable trade-history store with automatic backups.
@@ -146,7 +149,10 @@ async function readJsonOrNull<T>(file: string): Promise<T | null> {
     if (!raw.trim()) return null;
     return JSON.parse(raw) as T;
   } catch (err: unknown) {
-    console.warn(`[trade-store] Failed to parse ${file}: ${err instanceof Error ? err.message : String(err)}`);
+    log.warn('Failed to parse JSON file', {
+      file,
+      reason: err instanceof Error ? err.message : String(err),
+    });
     return null;
   }
 }
@@ -177,12 +183,15 @@ async function tryRestoreFromBackup<T>(targetFile: string, username: string, fil
   try {
     const raw = await readFile(backupFile, 'utf-8');
     const parsed = JSON.parse(raw) as T;
-    console.warn(`[trade-store] ⚠ Restored ${targetFile} from backup ${backupFile}`);
+    log.warn('Restored file from backup', { targetFile, backupFile });
     await ensureDir(dirname(targetFile));
     await writeFile(targetFile, raw, 'utf-8');
     return parsed;
   } catch (err: unknown) {
-    console.warn(`[trade-store] Backup at ${backupFile} also unparseable: ${err instanceof Error ? err.message : String(err)}`);
+    log.warn('Backup file also unparseable', {
+      backupFile,
+      reason: err instanceof Error ? err.message : String(err),
+    });
     return null;
   }
 }
@@ -233,7 +242,10 @@ export async function rotateBackups(): Promise<void> {
     try {
       await copyFile(src, join(target, name));
     } catch (err: unknown) {
-      console.warn(`[trade-store] backup copy failed for ${name}: ${err instanceof Error ? err.message : String(err)}`);
+      log.warn('backup copy failed', {
+        name,
+        reason: err instanceof Error ? err.message : String(err),
+      });
     }
   }
 
@@ -266,7 +278,11 @@ export async function rotateBackups(): Promise<void> {
         try {
           await copyFile(src, join(dstDir, name));
         } catch (err: unknown) {
-          console.warn(`[trade-store] backup copy failed for ${username}/${name}: ${err instanceof Error ? err.message : String(err)}`);
+          log.warn('backup copy failed', {
+            username,
+            name,
+            reason: err instanceof Error ? err.message : String(err),
+          });
         }
       }
       // Crypto subdir for tracker state files.
@@ -295,7 +311,9 @@ export async function rotateBackups(): Promise<void> {
       await rm(join(BACKUP_DIR, entries[i]), { recursive: true, force: true });
     }
   } catch (err: unknown) {
-    console.warn(`[trade-store] backup prune failed: ${err instanceof Error ? err.message : String(err)}`);
+    log.warn('backup prune failed', {
+      reason: err instanceof Error ? err.message : String(err),
+    });
   }
 }
 
@@ -309,11 +327,11 @@ export async function checkDataDirHealth(): Promise<void> {
     DATA_DIR.includes('node_modules') ||
     DATA_DIR.includes(`${'packages'}${process.platform === 'win32' ? '\\' : '/'}server`);
 
-  console.log(`[startup] DATA_DIR = ${DATA_DIR}`);
+  log.info('DATA_DIR resolved', { dataDir: DATA_DIR });
   if (isEphemeral) {
-    console.warn('[startup] ⚠⚠⚠ DATA_DIR appears to be inside the build directory.');
-    console.warn('[startup] ⚠⚠⚠ On Render this means trades, settings, and users will be ERASED on every redeploy.');
-    console.warn('[startup] ⚠⚠⚠ Set DATA_DIR=/data and mount the tradingai-data persistent disk.');
+    log.warn('DATA_DIR appears to be inside the build directory.');
+    log.warn('On Render this means trades, settings, and users will be ERASED on every redeploy.');
+    log.warn('Set DATA_DIR=/data and mount the tradingai-data persistent disk.');
   }
   try {
     await ensureDir(DATA_DIR);
@@ -322,15 +340,17 @@ export async function checkDataDirHealth(): Promise<void> {
     await access(probe, FS.R_OK);
     await rm(probe, { force: true });
   } catch (err: unknown) {
-    console.error(`[startup] ✗ DATA_DIR is not writable: ${err instanceof Error ? err.message : String(err)}`);
+    log.error('DATA_DIR is not writable', {
+      reason: err instanceof Error ? err.message : String(err),
+    });
   }
   const latest = await findLatestBackupDir();
   if (latest) {
     try {
       const s = await stat(latest);
-      console.log(`[startup] Latest backup: ${latest} (${s.mtime.toISOString()})`);
+      log.info('Latest backup found', { latest, mtime: s.mtime.toISOString() });
     } catch { /* ignore */ }
   } else {
-    console.log('[startup] No backups yet — first one will be written shortly.');
+    log.info('No backups yet — first one will be written shortly.');
   }
 }

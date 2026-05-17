@@ -4,6 +4,9 @@ import { dirname, join } from 'path';
 import { fileURLToPath } from 'url';
 import { randomUUID } from 'crypto';
 import type { ResearchReport, ResearchReportKind } from '@trading-app/shared';
+import { logger } from './observability/index.js';
+
+const log = logger.child({ module: 'research-store' });
 
 // TRA-227 — file-backed store for QuantTrader research reports surfaced in
 // the Stocks News tab. Reports are global (not per-user) — the routine
@@ -43,7 +46,9 @@ async function ensureLoaded(): Promise<ResearchReport[]> {
     const parsed = JSON.parse(raw) as Partial<StoreFile>;
     cache = Array.isArray(parsed.reports) ? parsed.reports : [];
   } catch (err) {
-    console.error('[research-store] failed to read store, starting empty:', err instanceof Error ? err.message : String(err));
+    log.error('failed to read store, starting empty', {
+      reason: err instanceof Error ? err.message : String(err),
+    });
     cache = [];
   }
   return cache;
@@ -202,7 +207,7 @@ export async function seedSampleResearchReportIfEmpty(): Promise<ResearchReport 
   };
   cache = [sample];
   await persist();
-  console.log('[research-store] seeded sample QuantTrader report (id=sample-premarket)');
+  log.info('seeded sample QuantTrader report', { reportId: 'sample-premarket' });
   return sample;
 }
 

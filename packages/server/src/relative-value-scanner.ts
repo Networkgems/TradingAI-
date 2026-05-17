@@ -5,6 +5,9 @@ import {
   type RelativeValueCandidate,
   type RelativeValueScannerOptions,
 } from '@trading-app/engine';
+import { logger } from './observability/index.js';
+
+const log = logger.child({ module: 'relative-value-scanner' });
 
 const CHAIN_CACHE_TTL_MS = 60_000;
 const EXPIRATIONS_CACHE_TTL_MS = 6 * 60 * 60_000;
@@ -259,7 +262,11 @@ export class TradierRelativeValueScannerService implements RelativeValueScannerS
   private tripBreaker(label: string, err: unknown): void {
     this.breakerOpenedAtMs = this.now();
     const msg = err instanceof Error ? err.message : String(err);
-    console.warn(`[rv-scanner] breaker open ${RATE_LIMIT_COOLDOWN_MS / 60_000}m: ${label}: ${msg}`);
+    log.warn('breaker open', {
+      cooldownMinutes: RATE_LIMIT_COOLDOWN_MS / 60_000,
+      label,
+      reason: msg,
+    });
   }
 
   private async pickExpiration(symbol: string, dtePrefs: DtePrefs = {}): Promise<string | null> {

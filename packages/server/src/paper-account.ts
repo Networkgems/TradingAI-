@@ -1,6 +1,9 @@
 import type { AccountState, Position, TradeSignal, SignalType } from '@trading-app/shared';
 import { DEFAULT_ACCOUNT_SETTINGS } from '@trading-app/shared';
 import { randomUUID } from 'crypto';
+import { logger } from './observability/index.js';
+
+const log = logger.child({ module: 'paper-account' });
 
 interface PaperAccountConfig {
   initialEquity?: number;
@@ -93,7 +96,13 @@ export class PaperAccount {
   openPosition(signal: TradeSignal, currentPrice: number, sizeMultiplier = 1): Position | null {
     let qty = this.sizeFromStop(signal.entryPrice, signal.stopLoss);
     if (qty <= 0) {
-      console.warn(`[paper-account] skip ${signal.symbol} ${signal.type}: qty=0 (entry=${signal.entryPrice} stop=${signal.stopLoss} maxRisk=${this.maxRiskPerTrade().toFixed(2)})`);
+      log.warn('skip signal: qty=0', {
+        symbol: signal.symbol,
+        signalType: signal.type,
+        entry: signal.entryPrice,
+        stop: signal.stopLoss,
+        maxRisk: this.maxRiskPerTrade().toFixed(2),
+      });
       return null;
     }
     // Cap qty so the position cost never exceeds managed equity.
@@ -102,7 +111,12 @@ export class PaperAccount {
     // the position always fits while still deploying a meaningful allocation.
     const maxQtyForManagedEquity = Math.floor(this.managedEquity() / currentPrice);
     if (maxQtyForManagedEquity <= 0) {
-      console.warn(`[paper-account] skip ${signal.symbol} ${signal.type}: managedEquity=${this.managedEquity().toFixed(2)} < price=${currentPrice} (equity too small for one share)`);
+      log.warn('skip signal: managedEquity below price (equity too small for one share)', {
+        symbol: signal.symbol,
+        signalType: signal.type,
+        managedEquity: this.managedEquity().toFixed(2),
+        price: currentPrice,
+      });
       return null;
     }
     qty = Math.min(qty, maxQtyForManagedEquity);
@@ -110,13 +124,22 @@ export class PaperAccount {
     if (Number.isFinite(sizeMultiplier) && sizeMultiplier > 0 && sizeMultiplier < 1) {
       qty = Math.floor(qty * sizeMultiplier);
       if (qty <= 0) {
-        console.warn(`[paper-account] skip ${signal.symbol} ${signal.type}: market-review sizing multiplier ${sizeMultiplier} rounded qty to 0`);
+        log.warn('skip signal: market-review sizing multiplier rounded qty to 0', {
+          symbol: signal.symbol,
+          signalType: signal.type,
+          sizeMultiplier,
+        });
         return null;
       }
     }
     const cost = currentPrice * qty;
     if (cost > this.cash) {
-      console.warn(`[paper-account] skip ${signal.symbol} ${signal.type}: cost=${cost.toFixed(2)} > cash=${this.cash.toFixed(2)} (existing positions consuming cash)`);
+      log.warn('skip signal: cost exceeds cash (existing positions consuming cash)', {
+        symbol: signal.symbol,
+        signalType: signal.type,
+        cost: cost.toFixed(2),
+        cash: this.cash.toFixed(2),
+      });
       return null;
     }
 

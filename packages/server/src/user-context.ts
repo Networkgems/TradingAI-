@@ -27,6 +27,9 @@ import {
 import type { OptionsBucketSnapshot } from './trade-store.js';
 import type { TradierEnv } from '@trading-app/shared';
 import { getAllUsers } from './users.js';
+import { logger } from './observability/index.js';
+
+const log = logger.child({ module: 'user-context' });
 
 // ─────────────────────────────────────────────────────────────────────────────
 // TRA-142 — per-user account isolation.
@@ -139,17 +142,17 @@ export async function runFirstBootMigration(adminUsername = 'admin'): Promise<vo
     try {
       await mkdir(dirname(dst), { recursive: true });
       await rename(src, dst);
-      console.log(`[migration TRA-142] moved ${src} -> ${dst}`);
+      log.info('migration TRA-142: moved file', { migration: 'TRA-142', src, dst });
       migratedAny = true;
     } catch {
       // Cross-device rename can fail; fall back to copy + delete.
       try {
         await copyFile(src, dst);
         await rm(src, { force: true });
-        console.log(`[migration TRA-142] copied ${src} -> ${dst} (rename failed)`);
+        log.info('migration TRA-142: copied file (rename failed)', { migration: 'TRA-142', src, dst });
         migratedAny = true;
       } catch (copyErr: unknown) {
-        console.warn(`[migration TRA-142] failed to migrate ${src}: ${copyErr instanceof Error ? copyErr.message : String(copyErr)}`);
+        log.warn('migration TRA-142: failed to migrate file', { migration: 'TRA-142', src, reason: copyErr instanceof Error ? copyErr.message : String(copyErr) });
       }
     }
   }
@@ -163,17 +166,17 @@ export async function runFirstBootMigration(adminUsername = 'admin'): Promise<vo
     try {
       await mkdir(dirname(target), { recursive: true });
       await rename(legacy, target);
-      console.log(`[migration TRA-142] moved ${legacy} -> ${target}`);
+      log.info('migration TRA-142: moved directory', { migration: 'TRA-142', src: legacy, dst: target });
       migratedAny = true;
     } catch (err: unknown) {
-      console.warn(`[migration TRA-142] failed to migrate ${legacy}: ${err instanceof Error ? err.message : String(err)}`);
+      log.warn('migration TRA-142: failed to migrate directory', { migration: 'TRA-142', src: legacy, reason: err instanceof Error ? err.message : String(err) });
     }
   }
 
   await writeFile(markerFile, new Date().toISOString(), 'utf-8');
-  console.log(migratedAny
-    ? '[migration TRA-142] complete — admin namespace populated.'
-    : '[migration TRA-142] no legacy files to migrate (fresh install).');
+  log.info(migratedAny
+    ? 'migration TRA-142: complete — admin namespace populated.'
+    : 'migration TRA-142: no legacy files to migrate (fresh install).', { migration: 'TRA-142' });
 }
 
 /**
@@ -229,14 +232,14 @@ export async function runTra237OptionsReset(): Promise<void> {
         },
       });
       resetCount += 1;
-      console.log(`[migration TRA-237] reset options buckets for ${u.username}`);
+      log.info('migration TRA-237: reset options buckets for user', { migration: 'TRA-237', username: u.username });
     } catch (err: unknown) {
-      console.warn(`[migration TRA-237] reset failed for ${u.username}: ${err instanceof Error ? err.message : String(err)}`);
+      log.warn('migration TRA-237: reset failed for user', { migration: 'TRA-237', username: u.username, reason: err instanceof Error ? err.message : String(err) });
     }
   }
 
   await writeFile(markerFile, new Date().toISOString(), 'utf-8');
-  console.log(`[migration TRA-237] complete — cleared options state for ${resetCount} user(s).`);
+  log.info('migration TRA-237: complete — cleared options state.', { migration: 'TRA-237', resetCount });
 }
 
 /**
@@ -301,17 +304,17 @@ export async function runTra241CalendarReset(): Promise<void> {
           await unlink(snapPath);
           fileCount += 1;
         } catch (err: unknown) {
-          console.warn(`[migration TRA-241] could not remove ${snapPath}: ${err instanceof Error ? err.message : String(err)}`);
+          log.warn('migration TRA-241: could not remove snapshot', { migration: 'TRA-241', path: snapPath, reason: err instanceof Error ? err.message : String(err) });
         }
       }
       userCount += 1;
     } catch (err: unknown) {
-      console.warn(`[migration TRA-241] reset failed for ${u.username}: ${err instanceof Error ? err.message : String(err)}`);
+      log.warn('migration TRA-241: reset failed for user', { migration: 'TRA-241', username: u.username, reason: err instanceof Error ? err.message : String(err) });
     }
   }
 
   await writeFile(markerFile, new Date().toISOString(), 'utf-8');
-  console.log(`[migration TRA-241] complete — cleared ${fileCount} calendar file(s) for ${userCount} user(s).`);
+  log.info('migration TRA-241: complete — cleared calendar files.', { migration: 'TRA-241', fileCount, userCount });
 }
 
 /**
@@ -399,18 +402,18 @@ export async function runTra330CryptoEquityReset(): Promise<void> {
           await unlink(filePath);
           fileCount += 1;
         } catch (err: unknown) {
-          console.warn(`[migration TRA-330] could not remove ${filePath}: ${err instanceof Error ? err.message : String(err)}`);
+          log.warn('migration TRA-330: could not remove file', { migration: 'TRA-330', path: filePath, reason: err instanceof Error ? err.message : String(err) });
         }
       }
       fileCount += await clearReportsTree(join(dir, 'crypto-reports'));
       userCount += 1;
     } catch (err: unknown) {
-      console.warn(`[migration TRA-330] reset failed for ${u.username}: ${err instanceof Error ? err.message : String(err)}`);
+      log.warn('migration TRA-330: reset failed for user', { migration: 'TRA-330', username: u.username, reason: err instanceof Error ? err.message : String(err) });
     }
   }
 
   await writeFile(markerFile, new Date().toISOString(), 'utf-8');
-  console.log(`[migration TRA-330] complete — wiped ${fileCount} crypto-state file(s) for ${userCount} user(s).`);
+  log.info('migration TRA-330: complete — wiped crypto-state files.', { migration: 'TRA-330', fileCount, userCount });
 }
 
 /**
@@ -460,7 +463,7 @@ export async function runTra338MegaUsdCleanup(): Promise<void> {
       if (!raw.trim()) continue;
       snap = JSON.parse(raw) as import('./trade-store.js').CryptoTradeSnapshot;
     } catch (err: unknown) {
-      console.warn(`[migration TRA-338] could not parse ${file}: ${err instanceof Error ? err.message : String(err)}`);
+      log.warn('migration TRA-338: could not parse snapshot', { migration: 'TRA-338', path: file, reason: err instanceof Error ? err.message : String(err) });
       continue;
     }
     if (!snap || !Array.isArray(snap.openPositions)) continue;
@@ -474,9 +477,14 @@ export async function runTra338MegaUsdCleanup(): Promise<void> {
       if (Number.isFinite(refund) && refund > 0) {
         userRefund += refund;
       }
-      console.log(
-        `[migration TRA-338:${u.username}] expunging phantom MEGA-USD ${p.id} qty=${p.quantity} entry=${p.entryPrice} → refund $${refund.toFixed(2)}`,
-      );
+      log.info('migration TRA-338: expunging phantom MEGA-USD position', {
+        migration: 'TRA-338',
+        username: u.username,
+        positionId: p.id,
+        quantity: p.quantity,
+        entryPrice: p.entryPrice,
+        refund,
+      });
     }
 
     const nextOpen = snap.openPositions.filter(p => p.symbol !== 'MEGA-USD');
@@ -496,14 +504,17 @@ export async function runTra338MegaUsdCleanup(): Promise<void> {
       positionsRemoved += ghosts.length;
       cashRefunded += userRefund;
     } catch (err: unknown) {
-      console.warn(`[migration TRA-338:${u.username}] persist failed: ${err instanceof Error ? err.message : String(err)}`);
+      log.warn('migration TRA-338: persist failed', { migration: 'TRA-338', username: u.username, reason: err instanceof Error ? err.message : String(err) });
     }
   }
 
   await writeFile(markerFile, new Date().toISOString(), 'utf-8');
-  console.log(
-    `[migration TRA-338] complete — removed ${positionsRemoved} phantom MEGA-USD position(s) across ${usersTouched} user(s), refunded $${cashRefunded.toFixed(2)} cash.`,
-  );
+  log.info('migration TRA-338: complete — removed phantom MEGA-USD positions.', {
+    migration: 'TRA-338',
+    positionsRemoved,
+    usersTouched,
+    cashRefunded,
+  });
 }
 
 export async function runTra301DemoFreshStart(): Promise<void> {
@@ -530,19 +541,19 @@ export async function runTra301DemoFreshStart(): Promise<void> {
           await unlink(filePath);
           fileCount += 1;
         } catch (err: unknown) {
-          console.warn(`[migration TRA-301] could not remove ${filePath}: ${err instanceof Error ? err.message : String(err)}`);
+          log.warn('migration TRA-301: could not remove file', { migration: 'TRA-301', path: filePath, reason: err instanceof Error ? err.message : String(err) });
         }
       }
       fileCount += await clearReportsTree(join(dir, 'reports'));
       fileCount += await clearReportsTree(join(dir, 'crypto-reports'));
       userCount += 1;
     } catch (err: unknown) {
-      console.warn(`[migration TRA-301] reset failed for ${u.username}: ${err instanceof Error ? err.message : String(err)}`);
+      log.warn('migration TRA-301: reset failed for user', { migration: 'TRA-301', username: u.username, reason: err instanceof Error ? err.message : String(err) });
     }
   }
 
   await writeFile(markerFile, new Date().toISOString(), 'utf-8');
-  console.log(`[migration TRA-301] complete — wiped ${fileCount} demo-history file(s) for ${userCount} user(s).`);
+  log.info('migration TRA-301: complete — wiped demo-history files.', { migration: 'TRA-301', fileCount, userCount });
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -697,10 +708,14 @@ async function createUserContext(username: string): Promise<UserContext> {
           }
           : {}),
       });
-      console.log(`[user-context:${username}] Restored stocks trade history: ${stocksSnap.openPositions?.length ?? 0} open, ${stocksSnap.closedPositions?.length ?? 0} closed.`);
+      log.info('Restored stocks trade history', {
+        username,
+        open: stocksSnap.openPositions?.length ?? 0,
+        closed: stocksSnap.closedPositions?.length ?? 0,
+      });
     }
   } catch (err: unknown) {
-    console.warn(`[user-context:${username}] Failed to restore stocks history: ${err instanceof Error ? err.message : String(err)}`);
+    log.warn('Failed to restore stocks history', { username, reason: err instanceof Error ? err.message : String(err) });
   }
 
   try {
@@ -724,10 +739,15 @@ async function createUserContext(username: string): Promise<UserContext> {
       });
       const demoCount = cryptoSnap.demoClosedPositions?.length ?? cryptoSnap.closedPositions?.length ?? 0;
       const liveCount = cryptoSnap.liveClosedPositions?.length ?? 0;
-      console.log(`[user-context:${username}] Restored crypto trade history: ${cryptoSnap.openPositions?.length ?? 0} open, ${demoCount} demo closed, ${liveCount} live closed.`);
+      log.info('Restored crypto trade history', {
+        username,
+        open: cryptoSnap.openPositions?.length ?? 0,
+        demoClosed: demoCount,
+        liveClosed: liveCount,
+      });
     }
   } catch (err: unknown) {
-    console.warn(`[user-context:${username}] Failed to restore crypto history: ${err instanceof Error ? err.message : String(err)}`);
+    log.warn('Failed to restore crypto history', { username, reason: err instanceof Error ? err.message : String(err) });
   }
 
   // Restore watchlist into engines
@@ -769,10 +789,15 @@ async function createUserContext(username: string): Promise<UserContext> {
       const stockMoved = await migrateLegacyReports(ctx.reportsDir, reportsMarker);
       const cryptoMoved = await migrateLegacyReports(ctx.cryptoReportsDir, reportsMarker);
       if (stockMoved + cryptoMoved > 0) {
-        console.log(`[migration TRA-244:${username}] moved ${stockMoved} stock and ${cryptoMoved} crypto report file(s) into demo/`);
+        log.info('migration TRA-244: moved report files into demo/', {
+          migration: 'TRA-244',
+          username,
+          stockMoved,
+          cryptoMoved,
+        });
       }
     } catch (err: unknown) {
-      console.warn(`[migration TRA-244:${username}] failed: ${err instanceof Error ? err.message : String(err)}`);
+      log.warn('migration TRA-244: failed', { migration: 'TRA-244', username, reason: err instanceof Error ? err.message : String(err) });
     }
   }
   // Pre-create the per-mode subfolders so writers/readers don't need to mkdir.
@@ -863,7 +888,7 @@ export async function persistStocksNow(ctx: UserContext): Promise<void> {
       },
     });
   } catch (err: unknown) {
-    console.warn(`[user-context:${ctx.username}] stocks persist failed: ${err instanceof Error ? err.message : String(err)}`);
+    log.warn('stocks persist failed', { username: ctx.username, reason: err instanceof Error ? err.message : String(err) });
   }
 }
 
@@ -889,7 +914,7 @@ export async function persistCryptoNow(ctx: UserContext): Promise<void> {
       },
     });
   } catch (err: unknown) {
-    console.warn(`[user-context:${ctx.username}] crypto persist failed: ${err instanceof Error ? err.message : String(err)}`);
+    log.warn('crypto persist failed', { username: ctx.username, reason: err instanceof Error ? err.message : String(err) });
   }
 }
 
@@ -899,7 +924,7 @@ export async function initAllUserContexts(): Promise<void> {
     try {
       await initUserContext(u.username);
     } catch (err: unknown) {
-      console.warn(`[user-context] failed to init ${u.username}: ${err instanceof Error ? err.message : String(err)}`);
+      log.warn('failed to init user context', { username: u.username, reason: err instanceof Error ? err.message : String(err) });
     }
   }
 }

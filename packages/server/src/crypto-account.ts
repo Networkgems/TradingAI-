@@ -1,6 +1,9 @@
 import type { AccountState, Position, PositionQuoteSource, TradeSignal, SignalType } from '@trading-app/shared';
 import { DEFAULT_ACCOUNT_SETTINGS } from '@trading-app/shared';
 import { randomUUID } from 'crypto';
+import { logger } from './observability/index.js';
+
+const log = logger.child({ module: 'crypto-account' });
 
 const INITIAL_EQUITY = 25_000;
 
@@ -139,7 +142,13 @@ export class CryptoPaperAccount {
   openPosition(signal: TradeSignal, currentPrice: number, quoteSource?: PositionQuoteSource): Position | null {
     let qty = this.sizeFromStop(signal.entryPrice, signal.stopLoss);
     if (qty <= 0) {
-      console.warn(`[crypto-account] skip ${signal.symbol} ${signal.type}: qty=0 (entry=${signal.entryPrice} stop=${signal.stopLoss} maxRisk=${this.maxRiskPerTrade().toFixed(2)})`);
+      log.warn('skip signal: qty=0', {
+        symbol: signal.symbol,
+        signalType: signal.type,
+        entry: signal.entryPrice,
+        stop: signal.stopLoss,
+        maxRisk: this.maxRiskPerTrade().toFixed(2),
+      });
       return null;
     }
     // Cap qty so cost never exceeds managed equity — same rationale as PaperAccount:
@@ -148,7 +157,12 @@ export class CryptoPaperAccount {
     qty = Math.min(qty, maxQtyForManagedEquity);
     qty = Math.round(qty * 1_000_000) / 1_000_000;
     if (qty <= 0) {
-      console.warn(`[crypto-account] skip ${signal.symbol} ${signal.type}: managedEquity=${this.managedEquity().toFixed(2)} too small for price=${currentPrice}`);
+      log.warn('skip signal: managedEquity too small for price', {
+        symbol: signal.symbol,
+        signalType: signal.type,
+        managedEquity: this.managedEquity().toFixed(2),
+        price: currentPrice,
+      });
       return null;
     }
     // TRA-342 — apply Coinbase taker fee on the entry leg so demo cash flow
@@ -162,7 +176,12 @@ export class CryptoPaperAccount {
     const entryFee = notional * FEE_RATE;
     const cost = notional + entryFee;
     if (signal.side === 'buy' && cost > this.cash) {
-      console.warn(`[crypto-account] skip ${signal.symbol} ${signal.type}: cost=${cost.toFixed(2)} > cash=${this.cash.toFixed(2)} (existing positions consuming cash)`);
+      log.warn('skip signal: cost exceeds cash (existing positions consuming cash)', {
+        symbol: signal.symbol,
+        signalType: signal.type,
+        cost: cost.toFixed(2),
+        cash: this.cash.toFixed(2),
+      });
       return null;
     }
 
@@ -291,11 +310,14 @@ export class CryptoPaperAccount {
     const equityBreach = Math.abs(this.equity) > CRYPTO_MAX_EQUITY;
     const cashBreach = Math.abs(this.cash) > CRYPTO_MAX_EQUITY;
     if (!equityBreach && !cashBreach) return false;
-    console.warn(
-      `[crypto-account] INVARIANT BREACH equity=${this.equity.toFixed(2)} cash=${this.cash.toFixed(2)} `
-      + `positions=${this.positions.size} initialEquity=${this.initialEquity.toFixed(2)} `
-      + `(>${CRYPTO_MAX_EQUITY}); rebasing to ${rebaseTarget}`,
-    );
+    log.warn('INVARIANT BREACH; rebasing account', {
+      equity: this.equity.toFixed(2),
+      cash: this.cash.toFixed(2),
+      positions: this.positions.size,
+      initialEquity: this.initialEquity.toFixed(2),
+      maxEquity: CRYPTO_MAX_EQUITY,
+      rebaseTarget,
+    });
     this.initialEquity = rebaseTarget;
     this.equity = rebaseTarget;
     this.cash = rebaseTarget;

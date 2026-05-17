@@ -41,6 +41,9 @@ import type {
 } from '@trading-app/shared';
 import { fetchDailyCandles, fetchQuote } from './yahoo-feed.js';
 import { saveResearchReport } from './research-store.js';
+import { logger } from './observability/index.js';
+
+const log = logger.child({ module: 'market-review' });
 
 // ── Index symbols + regime thresholds (TRA-385 gates) ────────────────────────
 
@@ -93,10 +96,9 @@ async function ensureLoaded(): Promise<MarketReview[]> {
     const parsed = JSON.parse(await readFile(path, 'utf-8')) as Partial<StoreFile>;
     cache = Array.isArray(parsed.reviews) ? parsed.reviews : [];
   } catch (err) {
-    console.error(
-      '[market-review] failed to read store, starting empty:',
-      err instanceof Error ? err.message : String(err),
-    );
+    log.error('failed to read store, starting empty', {
+      reason: err instanceof Error ? err.message : String(err),
+    });
     cache = [];
   }
   return cache;
@@ -337,10 +339,11 @@ export async function generateMarketReview(
     inputs = read.inputs;
     readings = read.readings;
   } catch (err) {
-    console.error(
-      `[market-review] index feed read failed for ${kind} ${date}:`,
-      err instanceof Error ? err.message : String(err),
-    );
+    log.error('index feed read failed', {
+      kind,
+      date,
+      reason: err instanceof Error ? err.message : String(err),
+    });
     readings = [
       { symbol: SPX_SYMBOL, label: 'S&P 500', value: null, ma20: null, note: 'Feed unavailable.' },
       { symbol: VIX_SYMBOL, label: 'VIX', value: null, ma20: null, note: 'Feed unavailable.' },
@@ -387,17 +390,22 @@ export async function generateMarketReview(
       tickers: [SPX_SYMBOL, VIX_SYMBOL, TNX_SYMBOL],
     });
   } catch (err) {
-    console.error(
-      `[market-review] failed to publish research report for ${review.id}:`,
-      err instanceof Error ? err.message : String(err),
-    );
+    log.error('failed to publish research report', {
+      reviewId: review.id,
+      reason: err instanceof Error ? err.message : String(err),
+    });
   }
 
-  console.log(
-    `[market-review] ${kind} ${date}: regime=${regime} ` +
-      `spx=${fmt(inputs.spx)} ma20=${fmt(inputs.spxMa20)} vix=${fmt(inputs.vix)} tnx=${fmt(inputs.tnx)} ` +
-      `sizing=${gates.sizingMultiplier}×`,
-  );
+  log.info('market review generated', {
+    kind,
+    date,
+    regime,
+    spx: fmt(inputs.spx),
+    ma20: fmt(inputs.spxMa20),
+    vix: fmt(inputs.vix),
+    tnx: fmt(inputs.tnx),
+    sizingMultiplier: gates.sizingMultiplier,
+  });
 
   return review;
 }

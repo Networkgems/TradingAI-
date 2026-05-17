@@ -1,5 +1,8 @@
 import YahooFinance from 'yahoo-finance2';
 import { WATCHLIST, CRYPTO_WATCHLIST, isCryptoSymbolBlocked } from '@trading-app/shared';
+import { logger } from './observability/index.js';
+
+const log = logger.child({ module: 'market-scanner' });
 
 const yf = new YahooFinance({ suppressNotices: ['yahooSurvey'], validation: { logErrors: true } });
 
@@ -37,7 +40,7 @@ export async function scanStocksMarket(): Promise<ScanResult[]> {
       }
     }
   } catch (err: unknown) {
-    console.warn('[market-scanner] screener(day_gainers):', err instanceof Error ? err.message : String(err));
+    log.warn('screener failed', { screener: 'day_gainers', reason: err instanceof Error ? err.message : String(err) });
   }
 
   // Day losers (big moves worth watching)
@@ -49,7 +52,7 @@ export async function scanStocksMarket(): Promise<ScanResult[]> {
       }
     }
   } catch (err: unknown) {
-    console.warn('[market-scanner] screener(day_losers):', err instanceof Error ? err.message : String(err));
+    log.warn('screener failed', { screener: 'day_losers', reason: err instanceof Error ? err.message : String(err) });
   }
 
   // Most active by volume
@@ -61,7 +64,7 @@ export async function scanStocksMarket(): Promise<ScanResult[]> {
       }
     }
   } catch (err: unknown) {
-    console.warn('[market-scanner] screener(most_actives):', err instanceof Error ? err.message : String(err));
+    log.warn('screener failed', { screener: 'most_actives', reason: err instanceof Error ? err.message : String(err) });
   }
 
   // Trending symbols (news/search-driven)
@@ -74,7 +77,7 @@ export async function scanStocksMarket(): Promise<ScanResult[]> {
       }
     }
   } catch (err: unknown) {
-    console.warn('[market-scanner] trendingSymbols:', err instanceof Error ? err.message : String(err));
+    log.warn('trendingSymbols failed', { reason: err instanceof Error ? err.message : String(err) });
   }
 
   return filterNew(dedup(collected), WATCHLIST);
@@ -130,7 +133,7 @@ export async function scanCryptoMarket(): Promise<ScanResult[]> {
       }
     }
   } catch (err: unknown) {
-    console.warn('[market-scanner] trendingSymbols(crypto):', err instanceof Error ? err.message : String(err));
+    log.warn('trendingSymbols failed', { market: 'crypto', reason: err instanceof Error ? err.message : String(err) });
   }
 
   // TRA-283: drop denylisted tickers from scanner suggestions so they can't be

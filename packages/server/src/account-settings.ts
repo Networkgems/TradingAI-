@@ -4,6 +4,9 @@ import { join, dirname } from 'path';
 import { fileURLToPath } from 'url';
 import type { AccountSettings } from '@trading-app/shared';
 import { DEFAULT_ACCOUNT_SETTINGS } from '@trading-app/shared';
+import { logger } from './observability/index.js';
+
+const log = logger.child({ module: 'account-settings' });
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const DATA_DIR = process.env.DATA_DIR ?? join(__dirname, '..', 'data');
@@ -110,14 +113,13 @@ export async function loadSettings(username: string): Promise<AccountSettings> {
     if (migrated) {
       try {
         await persistMigrated(username, settings);
-        if (credsResult.migrated) console.log(`[migration TRA-165] cleared legacy live creds for ${username}`);
-        if (flagsResult.migrated) console.log(`[migration TRA-229] split auto-trading flags by mode for ${username}`);
+        if (credsResult.migrated) log.info('TRA-165 migration: cleared legacy live creds', { username });
+        if (flagsResult.migrated) log.info('TRA-229 migration: split auto-trading flags by mode', { username });
       } catch (err: unknown) {
-        console.warn(
-          `[migration] failed to persist migrated settings for ${username}: ${
-            err instanceof Error ? err.message : String(err)
-          }`,
-        );
+        log.warn('migration: failed to persist migrated settings', {
+          username,
+          reason: err instanceof Error ? err.message : String(err),
+        });
       }
     }
     cache.set(username, settings);

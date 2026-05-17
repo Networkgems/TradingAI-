@@ -1,4 +1,7 @@
 import nodemailer from 'nodemailer';
+import { logger } from './observability/index.js';
+
+const log = logger.child({ module: 'email' });
 
 const SMTP_HOST = process.env.SMTP_HOST;
 const SMTP_PORT = Number(process.env.SMTP_PORT ?? 587);
@@ -89,12 +92,13 @@ export async function sendPasswordResetEmail(
   const { subject, text, html } = buildResetEmail(username, resetCode);
 
   if (!transport) {
-    console.log('\n[email] ─────────────────────────────────────────');
-    console.log(`[email] To: ${toEmail}`);
-    console.log(`[email] Subject: ${subject}`);
-    console.log(`[email] Reset code: ${resetCode}`);
-    if (APP_URL) console.log(`[email] Reset link: ${APP_URL}/?reset_code=${resetCode}`);
-    console.log('[email] ─────────────────────────────────────────\n');
+    // Intentional: console, not the structured logger. The reset code is a
+    // short-lived secret and must not land in the on-disk `app.jsonl` sink —
+    // this dev fallback prints it to the operator's stdout so a local run
+    // without SMTP can still complete a password reset.
+    console.log(`[email] Password reset for ${username} <${toEmail}> — no SMTP configured.`);
+    console.log(`[email]   Code: ${resetCode}`);
+    if (APP_URL) console.log(`[email]   Link: ${APP_URL}/?reset_code=${resetCode}`);
     return;
   }
 
@@ -115,7 +119,7 @@ export async function sendOpsAlertEmail(subject: string, text: string): Promise<
 
   const transport = getTransport();
   if (!transport) {
-    console.warn(`[email] ALERT (no SMTP configured) — ${subject}`);
+    log.warn('ALERT (no SMTP configured)', { subject });
     return;
   }
   await transport.sendMail({ from: SMTP_FROM, to: recipients.join(','), subject, text });

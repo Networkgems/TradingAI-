@@ -1,6 +1,9 @@
 import { createHmac, randomBytes, timingSafeEqual } from 'node:crypto';
 import { readFileSync, writeFileSync, existsSync } from 'fs';
 import { join } from 'path';
+import { logger } from './observability/index.js';
+
+const log = logger.child({ module: 'auth' });
 
 /**
  * Resolve the HMAC signing secret (TRA-404).
@@ -30,8 +33,8 @@ function resolveAuthSecret(): string {
         'render.yaml `generateValue: true`).',
     );
   }
-  console.warn(
-    '[auth] AUTH_SECRET is not set — using an ephemeral random secret. All ' +
+  log.warn(
+    'AUTH_SECRET is not set — using an ephemeral random secret. All ' +
       'sessions will be invalidated when the process restarts. Set AUTH_SECRET ' +
       'for stable sessions.',
   );

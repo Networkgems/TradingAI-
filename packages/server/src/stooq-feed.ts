@@ -10,6 +10,10 @@
  * previous close, so we approximate `change` / `changePct` from the
  * intraday open. This is degraded but usable for top-mover ranking.
  */
+import { logger } from './observability/index.js';
+
+const log = logger.child({ module: 'stooq-feed' });
+
 export interface QuoteData {
   price: number;
   volume: number;
@@ -74,18 +78,18 @@ export async function fetchStooqQuote(symbol: string): Promise<QuoteData | null>
   try {
     const resp = await withTimeout(fetch(url), STOOQ_CALL_TIMEOUT_MS, `stooq(${symbol})`);
     if (!resp.ok) {
-      console.warn(`[stooq-feed] ${symbol}: HTTP ${resp.status}`);
+      log.warn('quote fetch returned non-OK status', { symbol, status: resp.status });
       return null;
     }
     const csv = await resp.text();
     const parsed = parseStooqCsv(csv);
     if (!parsed) {
-      console.warn(`[stooq-feed] ${symbol}: unparseable CSV (likely unknown symbol)`);
+      log.warn('unparseable CSV (likely unknown symbol)', { symbol });
     }
     return parsed;
   } catch (err: unknown) {
     const msg = err instanceof Error ? err.message : String(err);
-    console.warn(`[stooq-feed] ${symbol} failed: ${msg}`);
+    log.warn('quote fetch failed', { symbol, reason: msg });
     return null;
   }
 }

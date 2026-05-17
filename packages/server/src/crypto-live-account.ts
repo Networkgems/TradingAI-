@@ -26,6 +26,10 @@ import {
 } from '@trading-app/engine';
 import { randomUUID } from 'crypto';
 
+import { logger } from './observability/index.js';
+
+const log = logger.child({ module: 'crypto-live-account' });
+
 /**
  * TRA-264 — leverage and margin mode for perp shorts opened by the engine.
  * Phase-1 caps leverage at 1× isolated so liquidation risk on a 1% adverse move
@@ -227,7 +231,7 @@ export class PerpCatalog {
     try {
       products = await coinbase.listProducts('FUTURE');
     } catch (err: unknown) {
-      console.warn('[crypto-live] perp catalog refresh failed:', err instanceof Error ? err.message : String(err));
+      log.warn('perp catalog refresh failed', { reason: err instanceof Error ? err.message : String(err) });
       return;
     }
     this.applyProducts(products, spotSymbols);
@@ -536,7 +540,7 @@ export class CryptoLiveAccount {
     try {
       accounts = await this.coinbase.listAccounts();
     } catch (err: unknown) {
-      console.warn('[crypto-live] balance refresh failed:', err instanceof Error ? err.message : String(err));
+      log.warn('balance refresh failed', { reason: err instanceof Error ? err.message : String(err) });
       return;
     }
     let cash = 0;
@@ -558,7 +562,7 @@ export class CryptoLiveAccount {
       try {
         prices = await this.coinbase.getProductPrices(Array.from(cryptoBalances.keys()));
       } catch (err: unknown) {
-        console.warn('[crypto-live] product price lookup failed:', err instanceof Error ? err.message : String(err));
+        log.warn('product price lookup failed', { reason: err instanceof Error ? err.message : String(err) });
         prices = new Map();
       }
       for (const [productId, balance] of cryptoBalances) {
@@ -693,7 +697,7 @@ export class CryptoLiveAccount {
     if (this.recentSkips.length > RECENT_SKIPS_CAP) {
       this.recentSkips.splice(0, this.recentSkips.length - RECENT_SKIPS_CAP);
     }
-    console.warn(`[crypto-live] skip ${signal.symbol} ${signal.type} ${signal.side}: ${reason}`);
+    log.warn('skip', { symbol: signal.symbol, signalType: signal.type, side: signal.side, reason });
     return null;
   }
 
@@ -791,7 +795,7 @@ export class CryptoLiveAccount {
     if (this.recentSkips.length > RECENT_SKIPS_CAP) {
       this.recentSkips.splice(0, this.recentSkips.length - RECENT_SKIPS_CAP);
     }
-    console.warn(`[crypto-live] strategy-skip ${signal.symbol} ${signal.type} ${signal.side}: ${reason}`);
+    log.warn('strategy-skip', { symbol: signal.symbol, signalType: signal.type, side: signal.side, reason });
     return null;
   }
 
@@ -817,7 +821,7 @@ export class CryptoLiveAccount {
     try {
       products = await this.coinbase.getProducts(Array.from(productIds));
     } catch (err: unknown) {
-      console.warn('[crypto-live] tradable products refresh failed:', err instanceof Error ? err.message : String(err));
+      log.warn('tradable products refresh failed', { reason: err instanceof Error ? err.message : String(err) });
       return;
     }
     this.tradableProducts = products;
@@ -850,7 +854,7 @@ export class CryptoLiveAccount {
     try {
       products = await this.coinbase.listProducts('FUTURE');
     } catch (err: unknown) {
-      console.warn('[crypto-live] perp catalog refresh failed:', err instanceof Error ? err.message : String(err));
+      log.warn('perp catalog refresh failed', { reason: err instanceof Error ? err.message : String(err) });
       return;
     }
     this.perpCatalog.applyProducts(products, spotSymbols);
@@ -909,10 +913,10 @@ export class CryptoLiveAccount {
             next.delete(perpId);
           }
         } catch (err: unknown) {
-          console.warn(
-            `[crypto-live] product_book ${perpId} failed:`,
-            err instanceof Error ? err.message : String(err),
-          );
+          log.warn('product_book lookup failed', {
+            perpId,
+            reason: err instanceof Error ? err.message : String(err),
+          });
           next.delete(perpId);
         }
       }),
@@ -993,7 +997,7 @@ export class CryptoLiveAccount {
     try {
       openPerps = await this.coinbase.listFuturesPositions(uuid);
     } catch (err: unknown) {
-      console.warn('[crypto-live] perp position reconcile failed:', err instanceof Error ? err.message : String(err));
+      log.warn('perp position reconcile failed', { reason: err instanceof Error ? err.message : String(err) });
       return;
     }
     this.mergePerpPositions(openPerps);
@@ -1011,7 +1015,7 @@ export class CryptoLiveAccount {
       this.intxPortfolioUuid = intx.uuid;
       return this.intxPortfolioUuid;
     } catch (err: unknown) {
-      console.warn('[crypto-live] INTX portfolio lookup failed:', err instanceof Error ? err.message : String(err));
+      log.warn('INTX portfolio lookup failed', { reason: err instanceof Error ? err.message : String(err) });
       return null;
     }
   }
@@ -1070,9 +1074,11 @@ export class CryptoLiveAccount {
       };
       this.positions.set(positionId, position);
       this.perpProductByPositionId.set(positionId, p.product_id);
-      console.log(
-        `[crypto-live] reconcile imported perp ${p.product_id} ${p.position_side} size=${size} (no engine TP/SL — manual close only)`,
-      );
+      log.info('reconcile imported perp (no engine TP/SL — manual close only)', {
+        productId: p.product_id,
+        positionSide: p.position_side,
+        size,
+      });
     }
   }
 
@@ -1279,7 +1285,7 @@ export class CryptoLiveAccount {
       // rejection lands in the aggregate skip channel too.
       const msg = err instanceof Error ? err.message : String(err);
       this.recordSkip(signal, `Coinbase rejected order: ${msg}`);
-      console.error(`[crypto-live] open failed for ${signal.symbol}: ${msg}`);
+      log.error('open failed', { symbol: signal.symbol, reason: msg });
       throw err;
     }
 
@@ -1311,7 +1317,12 @@ export class CryptoLiveAccount {
     // Optimistic cash debit; refreshBalance() will reconcile from Coinbase.
     this.cashUsd -= entryPrice * filledQty;
     const reconciled = fill ? `@ ${entryPrice.toFixed(2)} (filled ${filledQty})` : `@ ~${currentPrice.toFixed(2)} (unreconciled)`;
-    console.log(`[crypto-live] OPEN ${signal.side.toUpperCase()} ${signal.symbol} ${reconciled} (coinbase order=${resp.order_id})`);
+    log.info('OPEN', {
+      side: signal.side.toUpperCase(),
+      symbol: signal.symbol,
+      reconciled,
+      coinbaseOrderId: resp.order_id,
+    });
     return position;
   }
 
@@ -1450,7 +1461,7 @@ export class CryptoLiveAccount {
     } catch (err: unknown) {
       const msg = err instanceof Error ? err.message : String(err);
       this.recordSkip(signal, `Coinbase rejected order: ${msg}`);
-      console.error(`[crypto-live] perp short open failed for ${signal.symbol}: ${msg}`);
+      log.error('perp short open failed', { symbol: signal.symbol, reason: msg });
       throw err;
     }
 
@@ -1498,9 +1509,14 @@ export class CryptoLiveAccount {
     const reconciled = fill
       ? `@ ${entryPrice.toFixed(2)} (filled ${filledQty})`
       : `@ ~${currentPrice.toFixed(2)} (unreconciled)`;
-    console.log(
-      `[crypto-live] OPEN SHORT ${signal.symbol} ${reconciled} (perp ${perpProductId} ${PERP_SHORT_LEVERAGE}× ${PERP_SHORT_MARGIN_TYPE}, coinbase order=${resp.order_id})`,
-    );
+    log.info('OPEN SHORT', {
+      symbol: signal.symbol,
+      reconciled,
+      perpProductId,
+      leverage: PERP_SHORT_LEVERAGE,
+      marginType: PERP_SHORT_MARGIN_TYPE,
+      coinbaseOrderId: resp.order_id,
+    });
     return position;
   }
 
@@ -1574,7 +1590,10 @@ export class CryptoLiveAccount {
           });
         }
       } catch (err: unknown) {
-        console.error(`[crypto-live] exit failed for ${pos.symbol}: ${err instanceof Error ? err.message : String(err)} — leaving position open, will retry next tick`);
+        log.error('exit failed — leaving position open, will retry next tick', {
+          symbol: pos.symbol,
+          reason: err instanceof Error ? err.message : String(err),
+        });
         // Re-add the unrealised contribution since we did not actually close.
         if (pos.side === 'sell') {
           openShortsUnrealised += (pos.entryPrice - price) * pos.quantity;
@@ -1620,7 +1639,15 @@ export class CryptoLiveAccount {
       }
       this.positions.delete(id);
       closed.push({ ...pos });
-      console.log(`[crypto-live] CLOSE ${pos.symbol} ${hit.toUpperCase()} @ ${exitPrice.toFixed(2)} pnl=${pos.pnl.toFixed(2)}${fundingPnl !== 0 ? ` (price=${pricePnl.toFixed(2)} funding=${fundingPnl.toFixed(2)})` : ''}`);
+      log.info('CLOSE', {
+        symbol: pos.symbol,
+        hit: hit.toUpperCase(),
+        exitPrice: exitPrice.toFixed(2),
+        pnl: pos.pnl.toFixed(2),
+        ...(fundingPnl !== 0
+          ? { pricePnl: pricePnl.toFixed(2), fundingPnl: fundingPnl.toFixed(2) }
+          : {}),
+      });
     }
     this.openShortsUnrealisedPnlUsd = openShortsUnrealised;
     return closed;
@@ -1741,7 +1768,11 @@ export class CryptoLiveAccount {
     this.cashUsd += exitPrice * exitQty;
     this.equityUsd += pricePnl;
     this.importedSpotPositions.delete(pos.symbol);
-    console.log(`[crypto-live] CLOSE imported spot ${pos.symbol} @ ${exitPrice.toFixed(2)} pnl=${pricePnl.toFixed(2)}`);
+    log.info('CLOSE imported spot', {
+      symbol: pos.symbol,
+      exitPrice: exitPrice.toFixed(2),
+      pnl: pricePnl.toFixed(2),
+    });
     return closed;
   }
 
@@ -1779,7 +1810,12 @@ export class CryptoLiveAccount {
       try {
         order = await this.coinbase.getOrder(orderId);
       } catch (err: unknown) {
-        console.warn(`[crypto-live] fill lookup ${orderId} (${symbol}) attempt ${i + 1} failed: ${err instanceof Error ? err.message : String(err)}`);
+        log.warn('fill lookup attempt failed', {
+          orderId,
+          symbol,
+          attempt: i + 1,
+          reason: err instanceof Error ? err.message : String(err),
+        });
         continue;
       }
       lastStatus = (order.status ?? 'unknown').toUpperCase();
@@ -1789,16 +1825,26 @@ export class CryptoLiveAccount {
         if (Number.isFinite(price) && Number.isFinite(size) && price > 0 && size > 0) {
           return { price, size };
         }
-        console.warn(`[crypto-live] fill ${orderId} (${symbol}) FILLED with bad numbers price=${order.average_filled_price} size=${order.filled_size}`);
+        log.warn('fill FILLED with bad numbers', {
+          orderId,
+          symbol,
+          price: order.average_filled_price,
+          size: order.filled_size,
+        });
         return null;
       }
       if (TERMINAL_FAILURE_STATUSES.has(lastStatus)) {
-        console.warn(`[crypto-live] fill ${orderId} (${symbol}) terminal status=${lastStatus}; cannot reconcile`);
+        log.warn('fill terminal status; cannot reconcile', { orderId, symbol, status: lastStatus });
         return null;
       }
       // OPEN / PENDING — keep polling.
     }
-    console.warn(`[crypto-live] fill ${orderId} (${symbol}) did not settle within ${FILL_POLL_DELAYS_MS.length} attempts (last status=${lastStatus})`);
+    log.warn('fill did not settle within attempt budget', {
+      orderId,
+      symbol,
+      attempts: FILL_POLL_DELAYS_MS.length,
+      lastStatus,
+    });
     return null;
   }
 }

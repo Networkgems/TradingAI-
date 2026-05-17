@@ -8,6 +8,10 @@
  * US market holidays are pre-computed for 2025–2026 and checked on each fire.
  */
 
+import { logger } from './observability/index.js';
+
+const log = logger.child({ module: 'scheduler' });
+
 // ── Holiday calendar (NYSE observed dates) ───────────────────────────────────
 
 /** Set of YYYY-MM-DD strings that are NYSE market holidays. */
@@ -222,7 +226,10 @@ function withTimeout(job: Promise<void>, ms: number, label: string): Promise<voi
  */
 function runScheduled(label: string, cb: EodTriggerCallback): void {
   withTimeout(Promise.resolve(cb()), SCHEDULED_JOB_TIMEOUT_MS, label).catch(err =>
-    console.error(`[scheduler] ${label} callback error:`, err),
+    log.error('scheduled callback error', {
+      label,
+      reason: err instanceof Error ? err.message : String(err),
+    }),
   );
 }
 
@@ -257,13 +264,13 @@ export class MarketScheduler {
       if (hour === 16 && minute === 5) {
         if (cfg.onMarketClose && isMarketDay(date) && this.lastMarketCloseDate !== todayKey) {
           this.lastMarketCloseDate = todayKey;
-          console.log(`[scheduler] market-close EOD trigger fired for ${todayKey}`);
+          log.info('market-close EOD trigger fired', { date: todayKey });
           runScheduled('market-close EOD', cfg.onMarketClose);
         }
 
         if (cfg.onDaily && this.lastDailyDate !== todayKey) {
           this.lastDailyDate = todayKey;
-          console.log(`[scheduler] daily EOD trigger fired for ${todayKey}`);
+          log.info('daily EOD trigger fired', { date: todayKey });
           runScheduled('daily EOD', cfg.onDaily);
         }
       }
@@ -275,7 +282,7 @@ export class MarketScheduler {
       if (hour === 9 && minute === 0) {
         if (cfg.onPremarket && isMarketDay(date) && this.lastPremarketDate !== todayKey) {
           this.lastPremarketDate = todayKey;
-          console.log(`[scheduler] pre-market trigger fired for ${todayKey}`);
+          log.info('pre-market trigger fired', { date: todayKey });
           runScheduled('pre-market', cfg.onPremarket);
         }
       }
@@ -287,7 +294,7 @@ export class MarketScheduler {
       if (hour === 15 && minute === 55) {
         if (cfg.onChainRecord && isMarketDay(date) && this.lastChainRecordDate !== todayKey) {
           this.lastChainRecordDate = todayKey;
-          console.log(`[scheduler] option-chain recorder trigger fired for ${todayKey}`);
+          log.info('option-chain recorder trigger fired', { date: todayKey });
           runScheduled('option-chain recorder', cfg.onChainRecord);
         }
       }
@@ -302,7 +309,10 @@ export class MarketScheduler {
       if (hour >= 21) {
         if (cfg.onArchive && this.lastArchiveDate !== todayKey) {
           this.lastArchiveDate = todayKey;
-          console.log(`[scheduler] archive trigger fired for ${todayKey} (${String(hour).padStart(2, '0')}:${String(minute).padStart(2, '0')} ET)`);
+          log.info('archive trigger fired', {
+            date: todayKey,
+            etTime: `${String(hour).padStart(2, '0')}:${String(minute).padStart(2, '0')} ET`,
+          });
           runScheduled('archive', cfg.onArchive);
         }
       }
@@ -315,7 +325,7 @@ export class MarketScheduler {
         const hourlyKey = `${todayKey}-${String(hour).padStart(2, '0')}`;
         if (this.lastHourlyKey !== hourlyKey) {
           this.lastHourlyKey = hourlyKey;
-          console.log(`[scheduler] hourly trigger fired for ${hourlyKey}`);
+          log.info('hourly trigger fired', { hourlyKey });
           runScheduled('hourly', cfg.onHourly);
         }
       }
@@ -324,12 +334,14 @@ export class MarketScheduler {
       // throttle themselves so this can't spam.
       if (cfg.onMonitor) {
         Promise.resolve(cfg.onMonitor()).catch(err =>
-          console.error('[scheduler] monitor callback error:', err),
+          log.error('monitor callback error', {
+            reason: err instanceof Error ? err.message : String(err),
+          }),
         );
       }
     }, 60_000);
 
-    console.log('[scheduler] EOD scheduler started (9:00 AM ET pre-market, 3:55 PM ET chain recorder, 4:05 PM ET reports, 9:00 PM ET archive)');
+    log.info('EOD scheduler started (9:00 AM ET pre-market, 3:55 PM ET chain recorder, 4:05 PM ET reports, 9:00 PM ET archive)');
   }
 
   stop(): void {

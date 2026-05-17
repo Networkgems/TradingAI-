@@ -112,9 +112,13 @@ describe('CryptoPaperAccount.enforceEquityInvariant (TRA-330)', () => {
       openingEquityToday: corrupt,
       openPositions: [],
     });
-    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    // TRA-414 — the invariant-breach warning now routes through the structured
+    // logger; a `warn` record is written to stderr as a JSON line.
+    const warn = vi.spyOn(process.stderr, 'write').mockImplementation(() => true);
     expect(acct.enforceEquityInvariant(25_000)).toBe(true);
-    expect(warn).toHaveBeenCalled();
+    expect(
+      warn.mock.calls.some((c) => String(c[0]).includes('INVARIANT BREACH')),
+    ).toBe(true);
     warn.mockRestore();
     const post = acct.getState();
     expect(post.totalEquity).toBe(25_000);
@@ -133,7 +137,8 @@ describe('CryptoPaperAccount.enforceEquityInvariant (TRA-330)', () => {
       openingEquityToday: 25_000,
       openPositions: [],
     });
-    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    // TRA-414 — suppress the structured-logger stderr line for this case.
+    const warn = vi.spyOn(process.stderr, 'write').mockImplementation(() => true);
     expect(acct.enforceEquityInvariant(25_000)).toBe(true);
     warn.mockRestore();
     expect(acct.getState().availableCash).toBe(25_000);

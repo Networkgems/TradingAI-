@@ -179,7 +179,9 @@ describe('MarketScheduler — TRA-193 onDaily / onMarketClose / onArchive', () =
   it('catches async errors thrown by onDaily and keeps the timer alive', async () => {
     vi.setSystemTime(at1605EDT(2026, 4, 30));
     const onDaily = vi.fn().mockRejectedValue(new Error('boom'));
-    const errSpy = vi.spyOn(console, 'error').mockImplementation(() => {});
+    // TRA-414 — scheduler now routes the callback error through the structured
+    // logger; an `error` record is written to stderr as a JSON line.
+    const errSpy = vi.spyOn(process.stderr, 'write').mockImplementation(() => true);
     scheduler.start({ onDaily });
 
     vi.advanceTimersByTime(60_000);
@@ -187,10 +189,11 @@ describe('MarketScheduler — TRA-193 onDaily / onMarketClose / onArchive', () =
     await vi.advanceTimersByTimeAsync(0);
 
     expect(onDaily).toHaveBeenCalledTimes(1);
-    expect(errSpy).toHaveBeenCalledWith(
-      '[scheduler] daily EOD callback error:',
-      expect.any(Error),
-    );
+    const dailyErr = errSpy.mock.calls
+      .map((c) => String(c[0]))
+      .find((l) => l.includes('scheduled callback error'));
+    expect(dailyErr).toContain('"label":"daily EOD"');
+    expect(dailyErr).toContain('"reason":"boom"');
 
     // Next ET day should still fire — error did not poison the schedule.
     vi.setSystemTime(at1605EDT(2026, 5, 1));
@@ -325,14 +328,19 @@ describe('MarketScheduler — TRA-249-D onHourly funding hook', () => {
   it('catches async errors thrown by onHourly and keeps subsequent hours firing', async () => {
     vi.setSystemTime(at1600EDT(2026, 4, 30));
     const onHourly = vi.fn().mockRejectedValueOnce(new Error('boom')).mockResolvedValue(undefined);
-    const errSpy = vi.spyOn(console, 'error').mockImplementation(() => {});
+    // TRA-414 — callback error now goes through the structured logger (stderr).
+    const errSpy = vi.spyOn(process.stderr, 'write').mockImplementation(() => true);
     scheduler.start({ onHourly });
 
     vi.advanceTimersByTime(60_000);
     await vi.advanceTimersByTimeAsync(0);
 
     expect(onHourly).toHaveBeenCalledTimes(1);
-    expect(errSpy).toHaveBeenCalledWith('[scheduler] hourly callback error:', expect.any(Error));
+    const hourlyErr = errSpy.mock.calls
+      .map((c) => String(c[0]))
+      .find((l) => l.includes('scheduled callback error'));
+    expect(hourlyErr).toContain('"label":"hourly"');
+    expect(hourlyErr).toContain('"reason":"boom"');
 
     vi.setSystemTime(at1700EDT(2026, 4, 30));
     vi.advanceTimersByTime(60_000);
@@ -436,17 +444,19 @@ describe('MarketScheduler — TRA-368 onPremarket 9 AM ET hook', () => {
       .fn()
       .mockRejectedValueOnce(new Error('boom'))
       .mockResolvedValue(undefined);
-    const errSpy = vi.spyOn(console, 'error').mockImplementation(() => {});
+    // TRA-414 — callback error now goes through the structured logger (stderr).
+    const errSpy = vi.spyOn(process.stderr, 'write').mockImplementation(() => true);
     scheduler.start({ onPremarket });
 
     vi.advanceTimersByTime(60_000);
     await vi.advanceTimersByTimeAsync(0);
 
     expect(onPremarket).toHaveBeenCalledTimes(1);
-    expect(errSpy).toHaveBeenCalledWith(
-      '[scheduler] pre-market callback error:',
-      expect.any(Error),
-    );
+    const premarketErr = errSpy.mock.calls
+      .map((c) => String(c[0]))
+      .find((l) => l.includes('scheduled callback error'));
+    expect(premarketErr).toContain('"label":"pre-market"');
+    expect(premarketErr).toContain('"reason":"boom"');
 
     // Next ET day should still fire — error did not poison the schedule.
     vi.setSystemTime(at0900EDT(2026, 5, 1));

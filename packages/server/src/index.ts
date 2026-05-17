@@ -115,6 +115,8 @@ import {
   ResearchValidationError,
 } from './research-store.js';
 
+const log = logger.child({ module: 'index' });
+
 const PORT = Number(process.env.PORT ?? 4242);
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const DATA_DIR = process.env.DATA_DIR ?? join(__dirname, '..', 'data');
@@ -162,9 +164,10 @@ const relativeValueScannerService = new TradierRelativeValueScannerService({
 setRvScanner(
   relativeValueScannerService.diagnostics().configured ? relativeValueScannerService : undefined,
 );
-console.log(
-  `[rv-scanner] env=${tradierEnv} configured=${relativeValueScannerService.diagnostics().configured}`,
-);
+log.info('rv-scanner initialized', {
+  env: tradierEnv,
+  configured: relativeValueScannerService.diagnostics().configured,
+});
 
 // TRA-142 — migrate legacy global files into the admin namespace exactly once,
 // then bootstrap per-user contexts (engines, trackers, persistence timers) for
@@ -211,7 +214,9 @@ await seedSampleResearchReportIfEmpty();
 void getLatestMarketReview().then(existing => {
   if (existing) return;
   void generateMarketReview('premarket').catch(err =>
-    console.error('[market-review] boot-time generation failed:', err),
+    log.error('market-review boot-time generation failed', {
+      reason: err instanceof Error ? err.message : String(err),
+    }),
   );
 });
 
@@ -334,9 +339,10 @@ async function generateAndSaveReport(
     try {
       await reconcileTradierOptionsHistory(ctx, settings, mode);
     } catch (err) {
-      console.warn(
-        `[tradier-reconcile:${ctx.username}] failed: ${err instanceof Error ? err.message : String(err)}`,
-      );
+      log.warn('tradier-reconcile failed', {
+        username: ctx.username,
+        reason: err instanceof Error ? err.message : String(err),
+      });
     }
   }
 
@@ -365,9 +371,10 @@ async function generateAndSaveReport(
         finalReport = applyTradierBalanceOverride(finalReport, override, todayBalance);
       }
     } catch (err) {
-      console.warn(
-        `[tradier-live-calendar:${ctx.username}] override failed: ${err instanceof Error ? err.message : String(err)}`,
-      );
+      log.warn('tradier-live-calendar override failed', {
+        username: ctx.username,
+        reason: err instanceof Error ? err.message : String(err),
+      });
     }
   }
 
@@ -404,9 +411,10 @@ async function generateAndSaveReport(
     });
   }
 
-  console.log(
-    `[reports:${ctx.username}] EOD report ${backfill ? 'backfilled' : 'saved'} → ${datePath}`,
-  );
+  log.info(`EOD report ${backfill ? 'backfilled' : 'saved'}`, {
+    username: ctx.username,
+    datePath,
+  });
 
   if (!backfill) {
     broadcastToUser(ctx.username, JSON.stringify({ type: 'eod_report', payload: finalReport }));
@@ -444,18 +452,27 @@ async function catchUpMissedEodReports(): Promise<void> {
       }
       const missed = missedTradingDays(existing, today);
       if (missed.length === 0) continue;
-      console.log(
-        `[reports:${ctx.username}] catch-up: backfilling ${missed.length} missed EOD report(s): ${missed.join(', ')}`,
-      );
+      log.info('reports catch-up: backfilling missed EOD reports', {
+        username: ctx.username,
+        missedCount: missed.length,
+        missed: missed.join(', '),
+      });
       for (const date of missed) {
         try {
           await generateAndSaveReport(ctx, { asOfDate: date });
         } catch (err) {
-          console.error(`[reports:${ctx.username}] catch-up for ${date} failed:`, err);
+          log.error('reports catch-up failed', {
+            username: ctx.username,
+            date,
+            reason: err instanceof Error ? err.message : String(err),
+          });
         }
       }
     } catch (err) {
-      console.error(`[reports:${ctx.username}] catch-up scan failed:`, err);
+      log.error('reports catch-up scan failed', {
+        username: ctx.username,
+        reason: err instanceof Error ? err.message : String(err),
+      });
     }
   }
 }
@@ -494,9 +511,11 @@ async function reconcileTradierOptionsHistory(
   try {
     fills = await client.listAccountHistory({ start, end, type: 'trade', limit: 1000 });
   } catch (err) {
-    console.warn(
-      `[tradier-reconcile:${ctx.username}] history fetch failed env=${env}: ${err instanceof Error ? err.message : String(err)}`,
-    );
+    log.warn('tradier-reconcile history fetch failed', {
+      username: ctx.username,
+      env,
+      reason: err instanceof Error ? err.message : String(err),
+    });
     return;
   }
   if (fills.length === 0) return;
@@ -543,9 +562,15 @@ async function reconcileTradierOptionsHistory(
   for (const id of totals.seenTransactionIds) cursor.seenIds.push(id);
   await saveTradierHistoryCursor(ctx, env, cursor);
 
-  console.log(
-    `[tradier-reconcile:${ctx.username}] env=${env} merged ${totals.seenTransactionIds.size} new fills, +${added.toFixed(2)} realized (−${realtimeOffset.toFixed(2)} realtime offset → +${netAdded.toFixed(2)} pill) across ${totals.realizedByDate.size} day(s)`,
-  );
+  log.info('tradier-reconcile merged new fills', {
+    username: ctx.username,
+    env,
+    newFills: totals.seenTransactionIds.size,
+    realizedAdded: Number(added.toFixed(2)),
+    realtimeOffset: Number(realtimeOffset.toFixed(2)),
+    netAddedToPill: Number(netAdded.toFixed(2)),
+    days: totals.realizedByDate.size,
+  });
 }
 
 interface TradierHistoryCursor {
@@ -786,9 +811,11 @@ async function reconcileTradierLiveCalendar(
       for (const id of totals.seenTransactionIds) cashFlowState.seenIds.push(id);
       await saveTradierCashFlow(ctx, env, cashFlowState);
     } catch (err) {
-      console.warn(
-        `[tradier-live-calendar:${ctx.username}] cash event fetch failed env=${env}: ${err instanceof Error ? err.message : String(err)}`,
-      );
+      log.warn('tradier-live-calendar cash event fetch failed', {
+        username: ctx.username,
+        env,
+        reason: err instanceof Error ? err.message : String(err),
+      });
     }
   }
 
@@ -807,9 +834,12 @@ async function reconcileTradierLiveCalendar(
     reportDate,
   );
   if (!prev) {
-    console.log(
-      `[tradier-live-calendar:${ctx.username}] env=${env} seeded balance ${reportDate}=$${todayBalance.toFixed(2)} (no prior anchor — overriding skipped this run)`,
-    );
+    log.info('tradier-live-calendar seeded balance (no prior anchor — overriding skipped this run)', {
+      username: ctx.username,
+      env,
+      reportDate,
+      balance: Number(todayBalance.toFixed(2)),
+    });
     return null;
   }
 
@@ -817,9 +847,16 @@ async function reconcileTradierLiveCalendar(
   const pnl = computeBalanceDailyPnl(todayBalance, prev.balance, netCashFlow);
   if (pnl === null) return null;
 
-  console.log(
-    `[tradier-live-calendar:${ctx.username}] env=${env} ${reportDate}: balance $${todayBalance.toFixed(2)} − prev ${prev.date} $${prev.balance.toFixed(2)} − cashFlow $${netCashFlow.toFixed(2)} = $${pnl.toFixed(2)}`,
-  );
+  log.info('tradier-live-calendar computed daily pnl', {
+    username: ctx.username,
+    env,
+    reportDate,
+    balance: Number(todayBalance.toFixed(2)),
+    prevDate: prev.date,
+    prevBalance: Number(prev.balance.toFixed(2)),
+    netCashFlow: Number(netCashFlow.toFixed(2)),
+    pnl: Number(pnl.toFixed(2)),
+  });
   return { combinedPnl: pnl, prevDate: prev.date, prevBalance: prev.balance, netCashFlow };
 }
 
@@ -869,7 +906,7 @@ async function generateAndSaveCryptoReport(ctx: UserContext): Promise<void> {
     });
   }
 
-  console.log(`[crypto-reports:${ctx.username}] EOD report saved → ${datePath}`);
+  log.info('crypto EOD report saved', { username: ctx.username, datePath });
 
   const msg = JSON.stringify({ type: 'crypto_eod_report', payload: report });
   broadcastToUser(ctx.username, msg);
@@ -896,7 +933,10 @@ async function runHourlyFundingForAllUsers(): Promise<void> {
     try {
       await ctx.cryptoEngine.tickFundingHourly();
     } catch (err) {
-      console.error(`[funding:${ctx.username}] hourly tick failed:`, err);
+      log.error('funding hourly tick failed', {
+        username: ctx.username,
+        reason: err instanceof Error ? err.message : String(err),
+      });
     }
   }
 }
@@ -915,14 +955,20 @@ async function runDailyCloseForAllUsers(): Promise<void> {
         try {
           await generateAndSaveReport(ctx);
         } catch (err) {
-          console.error(`[reports:${ctx.username}] EOD report failed:`, err);
+          log.error('EOD report failed', {
+            username: ctx.username,
+            reason: err instanceof Error ? err.message : String(err),
+          });
         }
       }
       // 1b. Crypto EOD — every calendar day (24/7 market).
       try {
         await generateAndSaveCryptoReport(ctx);
       } catch (err) {
-        console.error(`[crypto-reports:${ctx.username}] EOD report failed:`, err);
+        log.error('crypto EOD report failed', {
+          username: ctx.username,
+          reason: err instanceof Error ? err.message : String(err),
+        });
       }
 
       // 2. Reset dashboard daily-P&L baselines for the new trading day.
@@ -937,11 +983,17 @@ async function runDailyCloseForAllUsers(): Promise<void> {
       await Promise.all([persistStocksNow(ctx), persistCryptoNow(ctx)]);
       broadcastEngineState(ctx);
       broadcastCryptoState(ctx);
-      console.log(
-        `[archive:${ctx.username}] reset dailyPnl, archived ${stocks.positions} closed positions, ${stocks.options} closed options, ${crypto} closed crypto positions`,
-      );
+      log.info('archive: reset dailyPnl and archived closed trades', {
+        username: ctx.username,
+        closedPositions: stocks.positions,
+        closedOptions: stocks.options,
+        closedCryptoPositions: crypto,
+      });
     } catch (err) {
-      console.error(`[archive:${ctx.username}] archive failed:`, err);
+      log.error('archive failed', {
+        username: ctx.username,
+        reason: err instanceof Error ? err.message : String(err),
+      });
     }
   }
 }
@@ -971,16 +1023,18 @@ const CHAIN_RECORD_OUT_DIR = process.env['CHAINS_OUT_DIR'] ?? join(DATA_DIR, 'op
 async function runChainRecord(): Promise<void> {
   const apiToken = (process.env['TRADIER_API_TOKEN'] ?? '').trim();
   if (!apiToken) {
-    console.warn('[chain-recorder] TRADIER_API_TOKEN unset — skipping option-chain snapshot');
+    log.warn('chain-recorder TRADIER_API_TOKEN unset — skipping option-chain snapshot');
     return;
   }
   const accountId = (process.env['TRADIER_ACCOUNT_ID'] ?? '').trim() || 'recorder-readonly';
   const client = new TradierOptionsClient(apiToken, accountId, 'production');
   const symbols = [...WATCHLIST];
 
-  console.log(
-    `[chain-recorder] starting: symbols=${symbols.length} dte=[14,60] outDir=${CHAIN_RECORD_OUT_DIR}`,
-  );
+  log.info('chain-recorder starting', {
+    symbols: symbols.length,
+    dte: '[14,60]',
+    outDir: CHAIN_RECORD_OUT_DIR,
+  });
   const result = await recordOptionChains({
     symbols,
     client,
@@ -990,11 +1044,17 @@ async function runChainRecord(): Promise<void> {
   });
   const written = result.symbols.filter((s) => s.outcome === 'written').length;
   const errored = result.symbols.filter((s) => s.outcome === 'error');
-  console.log(
-    `[chain-recorder] date=${result.date} written=${written}/${result.symbols.length} dir=${result.outDir}`,
-  );
+  log.info('chain-recorder complete', {
+    date: result.date,
+    written,
+    total: result.symbols.length,
+    dir: result.outDir,
+  });
   for (const s of errored) {
-    console.warn(`[chain-recorder]   - ${s.symbol}: ${s.errorMessage}`);
+    log.warn('chain-recorder symbol error', {
+      symbol: s.symbol,
+      errorMessage: s.errorMessage,
+    });
   }
 }
 
@@ -1083,7 +1143,9 @@ app.post('/api/client-error', express.text({ type: 'text/plain', limit: '64kb' }
     if (clientTraceId) runWithTrace({ traceId: clientTraceId }, file);
     else file();
   } catch (err) {
-    console.error('[client-error] failed to handle report:', err);
+    log.error('client-error failed to handle report', {
+      reason: err instanceof Error ? err.message : String(err),
+    });
   }
   // Always 204 — the client treats this as fire-and-forget.
   res.status(204).end();
@@ -1267,7 +1329,9 @@ app.post('/api/auth/forgot-password', async (req, res) => {
     try {
       await sendPasswordResetEmail(email, user.username, code);
     } catch (err) {
-      console.error('[auth] Failed to send reset email:', err);
+      log.error('auth: failed to send reset email', {
+        reason: err instanceof Error ? err.message : String(err),
+      });
     }
   }
   res.json({ ok: true, message: 'If an account with that email exists, a reset code has been sent.' });
@@ -1455,7 +1519,9 @@ app.post('/api/admin/users/:username/reset-password', requireAuth, requireAdmin,
   try {
     await sendPasswordResetEmail(user.email, user.username, code);
   } catch (err) {
-    console.error('[admin] Failed to send reset email:', err);
+    log.error('admin: failed to send reset email', {
+      reason: err instanceof Error ? err.message : String(err),
+    });
     res.status(502).json({ error: 'Failed to send reset email' });
     return;
   }
@@ -1542,7 +1608,9 @@ app.post('/api/research/reports', requireAuth, requireAdmin, async (req, res) =>
       res.status(400).json({ error: err.message });
       return;
     }
-    console.error('[research] save failed:', err instanceof Error ? err.message : String(err));
+    log.error('research save failed', {
+      reason: err instanceof Error ? err.message : String(err),
+    });
     res.status(500).json({ error: 'Failed to save research report' });
   }
 });
@@ -1593,10 +1661,9 @@ app.post('/api/market-review/run', requireAuth, requireAdmin, async (req, res) =
     const review = await generateMarketReview(kind);
     res.status(201).json(review);
   } catch (err) {
-    console.error(
-      '[market-review] on-demand run failed:',
-      err instanceof Error ? err.message : String(err),
-    );
+    log.error('market-review on-demand run failed', {
+      reason: err instanceof Error ? err.message : String(err),
+    });
     res.status(500).json({ error: 'Failed to generate market review' });
   }
 });
@@ -2035,23 +2102,32 @@ app.post('/api/options/:id/close', requireAuth, async (req, res) => {
     }
     const outcome = await submitSmartSellToClose(client, optionSymbol, contracts);
     if (outcome.status === 'no_quote') {
-      console.warn(
-        `[tradier-import] sell_to_close ${optionSymbol} env=${imported.env} aborted: ${outcome.reason}`,
-      );
+      log.warn('tradier-import sell_to_close aborted', {
+        optionSymbol,
+        env: imported.env,
+        reason: outcome.reason,
+      });
       res.status(409).json({ error: outcome.reason });
       return;
     }
     if (outcome.status === 'rejected') {
-      console.warn(
-        `[tradier-import] sell_to_close ${optionSymbol} env=${imported.env} rejected: ${outcome.reason}`,
-      );
+      log.warn('tradier-import sell_to_close rejected', {
+        optionSymbol,
+        env: imported.env,
+        reason: outcome.reason,
+      });
       res.status(502).json({ error: `Tradier rejected the close: ${outcome.reason}` });
       return;
     }
     if (outcome.status === 'filled') {
-      console.log(
-        `[tradier-import] sell_to_close ${optionSymbol} qty=${contracts} env=${imported.env} order=${outcome.orderId} filled@${outcome.avgFillPrice.toFixed(2)} (limit ${outcome.limitPrice.toFixed(2)})`,
-      );
+      log.info('tradier-import sell_to_close filled', {
+        optionSymbol,
+        qty: contracts,
+        env: imported.env,
+        order: outcome.orderId,
+        fillPrice: Number(outcome.avgFillPrice.toFixed(2)),
+        limitPrice: Number(outcome.limitPrice.toFixed(2)),
+      });
       ctx.engine.recordImportedOptionFill(id, outcome.avgFillPrice);
       broadcastEngineState(ctx);
       res.json({
@@ -2064,9 +2140,13 @@ app.post('/api/options/:id/close', requireAuth, async (req, res) => {
       return;
     }
     // outcome.status === 'pending'
-    console.log(
-      `[tradier-import] sell_to_close ${optionSymbol} qty=${contracts} env=${imported.env} order=${outcome.orderId} pending@${outcome.limitPrice.toFixed(2)}`,
-    );
+    log.info('tradier-import sell_to_close pending', {
+      optionSymbol,
+      qty: contracts,
+      env: imported.env,
+      order: outcome.orderId,
+      limitPrice: Number(outcome.limitPrice.toFixed(2)),
+    });
     ctx.engine.setPendingCloseOrderId(id, outcome.orderId);
     broadcastEngineState(ctx);
     res.status(202).json({ ok: true, imported: true, status: 'pending', orderId: outcome.orderId });
@@ -2243,7 +2323,7 @@ app.post('/api/tradier/positions/sync', requireAuth, async (req, res) => {
     positions = await client.listOpenOptionPositions();
   } catch (err: unknown) {
     const message = err instanceof Error ? err.message : String(err);
-    console.error(`[tradier-import] list positions failed (${env}): ${message}`);
+    log.error('tradier-import list positions failed', { env, reason: message });
     res.status(502).json({ error: `Tradier list-positions failed: ${message}` });
     return;
   }
@@ -2660,7 +2740,7 @@ app.post('/api/crypto/positions/:id/close', requireAuth, async (req, res) => {
     await ctx.cryptoEngine.manualClosePosition(id, price);
   } catch (err: unknown) {
     const reason = err instanceof Error ? err.message : String(err);
-    console.warn(`[crypto-engine] manualClose live failed: ${reason}`);
+    log.warn('crypto-engine manualClose live failed', { reason });
     broadcastCryptoState(ctx);
     res.status(502).json({ error: 'Coinbase rejected close', reason });
     return;
@@ -2854,7 +2934,9 @@ for (const ctx of getAllUserContexts()) {
 // This is what fills the calendar gap the next time the app is opened, rather
 // than waiting for — and depending on — that night's archive tick.
 void catchUpMissedEodReports().catch(err =>
-  console.warn(`[reports] startup catch-up failed: ${err instanceof Error ? err.message : String(err)}`),
+  log.warn('reports startup catch-up failed', {
+    reason: err instanceof Error ? err.message : String(err),
+  }),
 );
 
 /**
@@ -2868,7 +2950,10 @@ async function provisionUser(username: string): Promise<void> {
     const ctx = await initUserContext(username);
     attachBroadcastHandlers(ctx);
   } catch (err: unknown) {
-    console.warn(`[provisionUser] failed for ${username}: ${err instanceof Error ? err.message : String(err)}`);
+    log.warn('provisionUser failed', {
+      username,
+      reason: err instanceof Error ? err.message : String(err),
+    });
   }
 }
 
@@ -2876,10 +2961,10 @@ async function provisionUser(username: string): Promise<void> {
 // files are copied into a timestamped folder under DATA_DIR/backups/. Old
 // folders are pruned (last 24 kept = ~12 hours). On startup, missing/corrupt
 // primary files auto-restore from the latest backup.
-void rotateBackups().catch(err => console.warn(`[trade-store] initial backup failed: ${err instanceof Error ? err.message : String(err)}`));
+void rotateBackups().catch(err => log.warn('trade-store initial backup failed', { reason: err instanceof Error ? err.message : String(err) }));
 const BACKUP_INTERVAL_MS = 30 * 60_000;
 const backupTimer = setInterval(() => {
-  void rotateBackups().catch(err => console.warn(`[trade-store] backup failed: ${err instanceof Error ? err.message : String(err)}`));
+  void rotateBackups().catch(err => log.warn('trade-store backup failed', { reason: err instanceof Error ? err.message : String(err) }));
 }, BACKUP_INTERVAL_MS);
 backupTimer.unref?.();
 
@@ -2957,7 +3042,9 @@ scheduler.start({
   onArchive: async () => {
     await runDailyCloseForAllUsers();
     await generateMarketReview('postmarket').catch(err =>
-      console.error('[market-review] post-market generation failed:', err),
+      log.error('market-review post-market generation failed', {
+        reason: err instanceof Error ? err.message : String(err),
+      }),
     );
   },
   // TRA-249-D — hourly funding accrual on open Coinbase INTX perps. Fires
@@ -2974,7 +3061,9 @@ scheduler.start({
   // looks them up.
   onPremarket: async () => {
     await generateMarketReview('premarket').catch(err =>
-      console.error('[market-review] pre-market generation failed:', err),
+      log.error('market-review pre-market generation failed', {
+        reason: err instanceof Error ? err.message : String(err),
+      }),
     );
     await runPremarketForAllUsers();
   },
@@ -3004,7 +3093,7 @@ let shuttingDown = false;
 async function gracefulShutdown(signal: string): Promise<void> {
   if (shuttingDown) return;
   shuttingDown = true;
-  console.log(`[shutdown] received ${signal} — draining ticks, recording in-flight orders, flushing trade history`);
+  log.info('shutdown received — draining ticks, recording in-flight orders, flushing trade history', { signal });
   scheduler.stop();
   const all = getAllUserContexts();
   // Clear each engine's tick timer first so no new tick starts; the in-flight
@@ -3024,7 +3113,9 @@ async function gracefulShutdown(signal: string): Promise<void> {
     drainAll.then(() => undefined),
     new Promise<void>(resolve => {
       drainTimer = setTimeout(() => {
-        console.warn(`[shutdown] tick drain exceeded ${SHUTDOWN_DRAIN_TIMEOUT_MS}ms — exiting anyway`);
+        log.warn('shutdown tick drain exceeded timeout — exiting anyway', {
+          timeoutMs: SHUTDOWN_DRAIN_TIMEOUT_MS,
+        });
         resolve();
       }, SHUTDOWN_DRAIN_TIMEOUT_MS);
       drainTimer.unref?.();
@@ -3036,21 +3127,23 @@ async function gracefulShutdown(signal: string): Promise<void> {
   for (const ctx of all) {
     const inflight = ctx.engine.inFlightBrokerOrderIds();
     if (inflight.length > 0) {
-      console.warn(
-        `[shutdown] ${inflight.length} in-flight Tradier order(s) at exit: `
-        + inflight.map(o => `${o.kind} ${o.optionSymbol} #${o.orderId} (${o.env})`).join(', '),
-      );
+      log.warn('shutdown: in-flight Tradier orders at exit', {
+        count: inflight.length,
+        orders: inflight.map(o => `${o.kind} ${o.optionSymbol} #${o.orderId} (${o.env})`).join(', '),
+      });
     }
   }
   // Flush every user's pending trade-history writes synchronously before exit.
   try {
     await Promise.all(all.flatMap(ctx => [persistStocksNow(ctx), persistCryptoNow(ctx)]));
   } catch (err: unknown) {
-    console.warn(`[shutdown] persist failed: ${err instanceof Error ? err.message : String(err)}`);
+    log.warn('shutdown persist failed', {
+      reason: err instanceof Error ? err.message : String(err),
+    });
   }
   // TRA-406 — drain any in-flight structured-log / audit / alert file writes.
   await flushLogs().catch(() => undefined);
-  console.log('[shutdown] drain complete — exiting');
+  log.info('shutdown drain complete — exiting');
   process.exit(0);
 }
 

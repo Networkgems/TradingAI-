@@ -4,6 +4,9 @@ import { readFile, writeFile, mkdir } from 'fs/promises';
 import { existsSync } from 'fs';
 import { join, dirname } from 'path';
 import { fileURLToPath } from 'url';
+import { logger } from './observability/index.js';
+
+const log = logger.child({ module: 'users' });
 
 const scryptAsync = promisify(scrypt);
 const __dirname = dirname(fileURLToPath(import.meta.url));
@@ -68,10 +71,13 @@ export async function loadUsers(): Promise<void> {
     users = [defaultUser];
     await persistUsers();
     if (!envPassword) {
-      console.log('\n[TradingAI] First-run admin account created.');
-      console.log('[TradingAI] Username: admin');
-      console.log(`[TradingAI] Password: ${initialPassword}`);
-      console.log('[TradingAI] Change this password immediately after logging in.\n');
+      // Intentional: console, not the structured logger. The generated admin
+      // password is a secret and must not land in the on-disk `app.jsonl`
+      // sink — this first-run banner prints it once to the operator's stdout.
+      console.log(
+        `[users] First-run admin account created — username: admin, password: ${initialPassword}`,
+      );
+      console.log('[users] Change this password immediately after logging in.');
     }
     return;
   }
@@ -103,7 +109,7 @@ export async function loadUsers(): Promise<void> {
         users[adminIdx].passwordHash = await hashPassword(forcePassword);
         await persistUsers();
         await writeFile(ADMIN_RESET_MARKER, JSON.stringify({ fingerprint }), 'utf-8');
-        console.log('[TradingAI] Admin password updated from ADMIN_PASSWORD env var.');
+        log.info('Admin password updated from ADMIN_PASSWORD env var.');
       }
     }
   }

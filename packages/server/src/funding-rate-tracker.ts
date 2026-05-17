@@ -1,5 +1,8 @@
 import type { CoinbaseFundingRate, CoinbaseOrderClient } from '@trading-app/engine';
 import type { Position } from '@trading-app/shared';
+import { logger } from './observability/index.js';
+
+const log = logger.child({ module: 'funding-rate-tracker' });
 
 /**
  * TRA-249-D — minimal surface FundingRateTracker needs from
@@ -73,10 +76,9 @@ export class FundingRateTracker {
     try {
       rates = await this.coinbase.getFundingRates(Array.from(productIds));
     } catch (err: unknown) {
-      console.warn(
-        '[funding-tracker] funding rate fetch failed:',
-        err instanceof Error ? err.message : String(err),
-      );
+      log.warn('funding rate fetch failed', {
+        reason: err instanceof Error ? err.message : String(err),
+      });
       return;
     }
 

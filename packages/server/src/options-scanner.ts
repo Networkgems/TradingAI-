@@ -5,6 +5,9 @@ import {
   type OtmMispricingCandidate,
   type OtmScannerOptions,
 } from '@trading-app/engine';
+import { logger } from './observability/index.js';
+
+const log = logger.child({ module: 'options-scanner' });
 
 const CHAIN_CACHE_TTL_MS = 60_000;          // 1 min — chain snapshots stale that fast anyway
 const EXPIRATIONS_CACHE_TTL_MS = 6 * 60 * 60_000; // 6h — expirations don't move during the day
@@ -260,7 +263,11 @@ export class TradierOtmMispricingService implements OtmMispricingService {
   private tripBreaker(label: string, err: unknown): void {
     this.breakerOpenedAtMs = this.now();
     const msg = err instanceof Error ? err.message : String(err);
-    console.warn(`[options-scanner] breaker open ${RATE_LIMIT_COOLDOWN_MS / 60_000}m: ${label}: ${msg}`);
+    log.warn('breaker open', {
+      cooldownMinutes: RATE_LIMIT_COOLDOWN_MS / 60_000,
+      label,
+      reason: msg,
+    });
   }
 
   private async pickExpiration(symbol: string, dtePrefs: DtePrefs = {}): Promise<string | null> {
