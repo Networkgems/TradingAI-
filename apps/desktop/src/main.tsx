@@ -2,7 +2,21 @@ import React from 'react';
 import ReactDOM from 'react-dom/client';
 import App from './App.tsx';
 import { ErrorBoundary } from './ErrorBoundary.tsx';
+import {
+  installGlobalErrorHandlers,
+  installTraceHeader,
+  drainMainProcessCrashes,
+} from './lib/telemetry';
 import './index.css';
+
+// TRA-413 — desktop error telemetry. Install before the app mounts so an error
+// during initial render is still captured, before any React tree exists:
+//   * installTraceHeader         — stamp X-Trace-Id on outbound API requests
+//   * installGlobalErrorHandlers — catch errors outside React's render path
+//   * drainMainProcessCrashes    — flush Rust host-process panic records
+installTraceHeader();
+installGlobalErrorHandlers();
+void drainMainProcessCrashes();
 
 // Auto-reload once the freshly installed PWA service worker takes control,
 // so users on mobile pick up new releases without a manual hard refresh.

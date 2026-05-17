@@ -2022,6 +2022,27 @@ tr:hover td { background: var(--bg-hover); }
   overflow: auto;
 }
 
+/* TRA-413 — trace id surfaced so a user can quote it in a bug report. */
+.error-boundary-trace {
+  font-size: 0.75rem;
+  color: var(--muted);
+  margin-bottom: 1rem;
+}
+
+.error-boundary-trace code {
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  background: var(--surface2);
+  border: 1px solid var(--border-subtle);
+  border-radius: 4px;
+  padding: 0.1rem 0.35rem;
+  user-select: all;
+}
+
+.error-boundary-trace-hint {
+  margin-top: 0.3rem;
+  opacity: 0.8;
+}
+
 .error-boundary-actions {
   display: flex;
   gap: 0.5rem;

@@ -52,7 +52,9 @@ import {
   logger,
   flushLogs,
   traceMiddleware,
+  runWithTrace,
   setTraceUser,
+  captureException,
   installGlobalErrorHandlers,
   errorMiddleware,
   TradeAuditTracker,
@@ -224,7 +226,14 @@ app.set('trust proxy', true);
 app.use((req, res, next) => {
   res.setHeader('Access-Control-Allow-Origin', '*');
   res.setHeader('Access-Control-Allow-Methods', 'GET, POST, PUT, PATCH, DELETE, OPTIONS');
-  res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization');
+  // TRA-413 — allow the desktop client to send `X-Trace-Id` (not a CORS-
+  // safelisted header) so its requests correlate with the traces they produce,
+  // and expose the response header so a client can read the id the server
+  // filed under. `Max-Age` lets the browser cache the preflight so a polling
+  // client does not re-preflight every request.
+  res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization, X-Trace-Id');
+  res.setHeader('Access-Control-Expose-Headers', 'X-Trace-Id');
+  res.setHeader('Access-Control-Max-Age', '86400');
   if (req.method === 'OPTIONS') {
     res.status(204).end();
     return;
@@ -1011,8 +1020,8 @@ app.get('/api/health/alerts', requireAuth, (_req, res) => {
 // white-screen-class failures instead of them being lost in the browser.
 // Intentionally unauthenticated and best-effort: a crash can happen before
 // login or after the token expires, and the boundary uses navigator.sendBeacon
-// (which cannot attach auth headers). Payload is logged only — never persisted
-// or echoed back — and oversized fields are clamped to bound log volume.
+// (which cannot attach auth headers). Oversized fields are clamped to bound
+// volume.
 //
 // TRA-400 — the boundary sends the report as a text/plain Blob so the beacon
 // stays CORS-safelisted (an application/json Content-Type forces a preflight
@@ -1021,6 +1030,14 @@ app.get('/api/health/alerts', requireAuth, (_req, res) => {
 // an express.text() parser and JSON.parses the raw body itself. Same-origin
 // callers that still send application/json (already parsed into an object by
 // express.json()) keep working via the object branch below.
+//
+// TRA-413 — the report is now filed through `captureException`, the same path
+// server-side errors take, so a desktop error lands in the queryable
+// destination (`errors.jsonl` / `ERROR_WEBHOOK_URL`). The desktop client mints
+// its own trace id per error and sends it in the body (a custom header cannot
+// ride a CORS-safelisted sendBeacon); we file the error under that exact id so
+// the desktop "something went wrong" screen and this server record share one
+// reference.
 app.post('/api/client-error', express.text({ type: 'text/plain', limit: '64kb' }), (req, res) => {
   try {
     let b: Record<string, unknown> = {};
@@ -1029,21 +1046,42 @@ app.post('/api/client-error', express.text({ type: 'text/plain', limit: '64kb' }
         const parsed: unknown = JSON.parse(req.body);
         if (parsed && typeof parsed === 'object') b = parsed as Record<string, unknown>;
       } catch {
-        /* malformed report body — log what we can below */
+        /* malformed report body — captured below as best we can */
       }
     } else if (req.body && typeof req.body === 'object') {
       b = req.body as Record<string, unknown>;
     }
-    const clamp = (v: unknown, max: number): string =>
-      typeof v === 'string' ? v.slice(0, max) : '';
-    console.error(
-      `[client-error] label=${clamp(b['label'], 120) || 'unknown'} ` +
-      `url=${clamp(b['url'], 300)} ` +
-      `ua=${clamp(b['userAgent'], 200)}\n` +
-      `  message: ${clamp(b['message'], 500)}\n` +
-      `  stack: ${clamp(b['stack'], 2000)}\n` +
-      `  componentStack: ${clamp(b['componentStack'], 2000)}`,
-    );
+    const str = (v: unknown, max: number): string | undefined =>
+      typeof v === 'string' && v.length > 0 ? v.slice(0, max) : undefined;
+
+    // Reconstruct an Error so captureException records a normal name/message/
+    // stack. The browser stack is the client's, not this process's.
+    const message = str(b['message'], 2000) ?? 'unknown client error';
+    const err = new Error(message);
+    err.name = str(b['name'], 200) ?? 'ClientError';
+    const stack = str(b['stack'], 8000);
+    if (stack) err.stack = stack;
+
+    const label = str(b['label'], 200) ?? 'unknown';
+    const context: Record<string, unknown> = {
+      label,
+      source: str(b['source'], 60) ?? 'renderer',
+      url: str(b['url'], 500),
+      userAgent: str(b['userAgent'], 300),
+      sessionTraceId: str(b['sessionTraceId'], 64),
+      componentStack: str(b['componentStack'], 8000),
+      clientTime: str(b['time'], 40),
+    };
+
+    // File under the client-supplied trace id when present (length-bounded to
+    // match traceMiddleware) so the id the user sees is the id ops query.
+    const rawTraceId = str(b['traceId'], 64);
+    const clientTraceId = rawTraceId && rawTraceId.length >= 8 ? rawTraceId : undefined;
+    const file = (): void => {
+      captureException(err, `desktop.${label}`, context);
+    };
+    if (clientTraceId) runWithTrace({ traceId: clientTraceId }, file);
+    else file();
   } catch (err) {
     console.error('[client-error] failed to handle report:', err);
   }

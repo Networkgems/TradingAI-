@@ -1,5 +1,5 @@
 import React from 'react';
-import { HTTP_URL } from './server-url.ts';
+import { captureClientError, newTraceId } from './lib/telemetry';
 
 // TRA-398 — React error boundary.
 //
@@ -10,10 +10,13 @@ import { HTTP_URL } from './server-url.ts';
 // render could take down desktop and mobile PWA alike.
 //
 // This boundary catches such errors, renders a fallback UI with a reload
-// action, logs to the console, and makes a best-effort report to the server
-// so QA/ops have visibility. Used at the top level (around <App/>) and at a
-// finer grain around each dashboard's tab content so one bad tab does not
-// white-screen the whole app.
+// action, logs to the console, and reports the error to the server.
+//
+// TRA-413 — the report now goes through `captureClientError`, which forwards
+// it to the server's queryable error destination (`errors.jsonl` /
+// `ERROR_WEBHOOK_URL`). Each error is filed under a trace id that the fallback
+// UI shows, so a user can quote it in a bug report and ops can pull every
+// correlated log line.
 
 interface ErrorBoundaryProps {
   /** Human-readable name of the wrapped region, used in the report + log. */
@@ -28,55 +31,26 @@ interface ErrorBoundaryProps {
 
 interface ErrorBoundaryState {
   error: Error | null;
-}
-
-// Best-effort, fire-and-forget client error report. Never throws — a failure
-// to report must not itself crash the fallback UI.
-function reportClientError(label: string, error: Error, info: React.ErrorInfo): void {
-  try {
-    const payload = {
-      label,
-      message: String(error?.message ?? error),
-      stack: error?.stack ?? null,
-      componentStack: info?.componentStack ?? null,
-      url: typeof window !== 'undefined' ? window.location.href : null,
-      userAgent: typeof navigator !== 'undefined' ? navigator.userAgent : null,
-      time: new Date().toISOString(),
-    };
-    const body = JSON.stringify(payload);
-    // The body is JSON, but we send it as text/plain on purpose. An
-    // application/json Content-Type is NOT a CORS-safelisted request header,
-    // so cross-origin (e.g. the Tauri desktop webview hitting a remote API)
-    // it forces a CORS preflight. Chromium sends the OPTIONS preflight but
-    // then silently drops the sendBeacon POST — and sendBeacon still returns
-    // true, so the lost report is invisible. text/plain is CORS-safelisted,
-    // so no preflight is needed and the beacon delivers cross-origin. The
-    // server parses /api/client-error as text and JSON.parses the body.
-    if (typeof navigator !== 'undefined' && typeof navigator.sendBeacon === 'function') {
-      navigator.sendBeacon(`${HTTP_URL}/api/client-error`, new Blob([body], { type: 'text/plain' }));
-    } else {
-      void fetch(`${HTTP_URL}/api/client-error`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'text/plain' },
-        body,
-        keepalive: true,
-      }).catch(() => { /* reporting is best-effort */ });
-    }
-  } catch {
-    /* reporting is best-effort — never let it surface to the user */
-  }
+  /** Trace id the error was filed under — shown so the user can quote it. */
+  traceId: string | null;
 }
 
 export class ErrorBoundary extends React.Component<ErrorBoundaryProps, ErrorBoundaryState> {
-  state: ErrorBoundaryState = { error: null };
+  state: ErrorBoundaryState = { error: null, traceId: null };
 
   static getDerivedStateFromError(error: Error): ErrorBoundaryState {
-    return { error };
+    // Mint the trace id here so it is on screen the moment the fallback paints,
+    // before the async report in componentDidCatch has even started.
+    return { error, traceId: newTraceId() };
   }
 
   componentDidCatch(error: Error, info: React.ErrorInfo): void {
     console.error(`[ErrorBoundary:${this.props.label}]`, error, info.componentStack);
-    reportClientError(this.props.label, error, info);
+    captureClientError(this.props.label, error, {
+      source: 'renderer',
+      componentStack: info.componentStack ?? null,
+      traceId: this.state.traceId ?? newTraceId(),
+    });
   }
 
   private handleReload = (): void => {
@@ -86,11 +60,11 @@ export class ErrorBoundary extends React.Component<ErrorBoundaryProps, ErrorBoun
   private handleRetry = (): void => {
     // Clear the error so the wrapped subtree re-mounts. Useful for per-tab
     // boundaries where a transient bad payload may have since been replaced.
-    this.setState({ error: null });
+    this.setState({ error: null, traceId: null });
   };
 
   render(): React.ReactNode {
-    const { error } = this.state;
+    const { error, traceId } = this.state;
     if (!error) return this.props.children;
 
     const variant = this.props.variant ?? 'page';
@@ -106,6 +80,14 @@ export class ErrorBoundary extends React.Component<ErrorBoundaryProps, ErrorBoun
               : `This section ("${this.props.label}") hit an unexpected error.`}
           </div>
           <pre className="error-boundary-detail">{message}</pre>
+          {traceId && (
+            <div className="error-boundary-trace">
+              Reference id: <code>{traceId}</code>
+              <div className="error-boundary-trace-hint">
+                Quote this id in a bug report so we can trace what happened.
+              </div>
+            </div>
+          )}
           <div className="error-boundary-actions">
             {variant === 'panel' && (
               <button className="error-boundary-btn" onClick={this.handleRetry}>Try again</button>
