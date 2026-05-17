@@ -224,9 +224,20 @@ export interface ReportInput {
   signalTypeMap: Map<string, SignalType>;
 }
 
-export function generateEodReport(input: ReportInput): EodReport {
+/**
+ * Build an EOD report.
+ *
+ * `asOfDate` (TRA-388) — when supplied (a `YYYY-MM-DD` string), the report is
+ * stamped with that date and "today's" closed trades / signals are selected
+ * for that date instead of the current ET day. Used by the missed-day
+ * catch-up to backfill a report for a day whose 21:00 ET archive tick was
+ * missed: the day's closed positions are still retained in engine state
+ * (archiving, which clears them, never ran), so filtering by `closedAt` for
+ * the missed date reconstructs that day's realized P&L accurately.
+ */
+export function generateEodReport(input: ReportInput, asOfDate?: string): EodReport {
   const { state, allClosedPositions, dailySignals, signalTypeMap } = input;
-  const today = new Date().toLocaleDateString('en-CA', { timeZone: 'America/New_York' });
+  const today = asOfDate ?? new Date().toLocaleDateString('en-CA', { timeZone: 'America/New_York' });
 
   // Closed trades for today only
   const todayClosed = allClosedPositions.filter(p =>

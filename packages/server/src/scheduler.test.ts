@@ -1,5 +1,5 @@
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
-import { MarketScheduler, isMarketDay } from './scheduler.js';
+import { MarketScheduler, isMarketDay, isMarketDayIso, missedTradingDays } from './scheduler.js';
 
 /**
  * TRA-193 — coverage for the scheduler that drives both the per-market-day
@@ -454,5 +454,128 @@ describe('MarketScheduler — TRA-368 onPremarket 9 AM ET hook', () => {
     expect(onPremarket).toHaveBeenCalledTimes(2);
 
     errSpy.mockRestore();
+  });
+});
+
+// ── TRA-388: archive fires at OR AFTER 21:00 ET ──────────────────────────────
+
+describe('MarketScheduler — TRA-388 archive window', () => {
+  beforeEach(() => { vi.useFakeTimers(); });
+  afterEach(() => { vi.useRealTimers(); });
+
+  it('fires onArchive when the server first ticks at 22:30 ET (after the 21:00 boundary)', () => {
+    // 22:30 EDT = next-day 02:30 UTC; back off 60 s for the first poll tick.
+    vi.setSystemTime(new Date(Date.UTC(2026, 4, 15, 2, 29, 0)));
+    const onArchive = vi.fn();
+    const scheduler = new MarketScheduler();
+    scheduler.start({ onArchive });
+
+    vi.advanceTimersByTime(60_000);
+    expect(onArchive).toHaveBeenCalledTimes(1);
+    scheduler.stop();
+  });
+
+  it('still fires onArchive exactly once when the server is up across 21:00 → 23:00 ET', () => {
+    vi.setSystemTime(at2100EDT(2026, 5, 1));
+    const onArchive = vi.fn();
+    const scheduler = new MarketScheduler();
+    scheduler.start({ onArchive });
+
+    // Many ticks across the evening — dedup keeps it to one fire per ET day.
+    for (let i = 0; i < 120; i++) vi.advanceTimersByTime(60_000);
+    expect(onArchive).toHaveBeenCalledTimes(1);
+    scheduler.stop();
+  });
+
+  it('does not fire onArchive before 21:00 ET', () => {
+    // 20:30 EDT = next-day 00:30 UTC; back off 60 s.
+    vi.setSystemTime(new Date(Date.UTC(2026, 4, 16, 0, 29, 0)));
+    const onArchive = vi.fn();
+    const scheduler = new MarketScheduler();
+    scheduler.start({ onArchive });
+
+    vi.advanceTimersByTime(60_000);
+    expect(onArchive).not.toHaveBeenCalled();
+    scheduler.stop();
+  });
+});
+
+// ── TRA-388: missed-day catch-up ─────────────────────────────────────────────
+
+describe('isMarketDayIso', () => {
+  it('returns true for ordinary weekdays', () => {
+    expect(isMarketDayIso('2026-05-14')).toBe(true); // Thursday
+    expect(isMarketDayIso('2026-05-15')).toBe(true); // Friday
+  });
+
+  it('returns false for weekends', () => {
+    expect(isMarketDayIso('2026-05-16')).toBe(false); // Saturday
+    expect(isMarketDayIso('2026-05-17')).toBe(false); // Sunday
+  });
+
+  it('returns false for NYSE holidays', () => {
+    expect(isMarketDayIso('2026-05-25')).toBe(false); // Memorial Day
+    expect(isMarketDayIso('2026-01-01')).toBe(false); // New Year's Day
+  });
+
+  it('returns false for malformed input', () => {
+    expect(isMarketDayIso('not-a-date')).toBe(false);
+    expect(isMarketDayIso('2026-5-1')).toBe(false);
+  });
+});
+
+describe('missedTradingDays', () => {
+  it('finds the TRA-388 gap: Thu 5/14 + Fri 5/15 missing, last report 5/13', () => {
+    // Mirrors the reported calendar: reports through 5/13, today is 5/17.
+    const existing = ['2026-05-05', '2026-05-11', '2026-05-12', '2026-05-13'];
+    expect(missedTradingDays(existing, '2026-05-17')).toEqual([
+      '2026-05-14',
+      '2026-05-15',
+    ]);
+  });
+
+  it('skips weekends inside the gap', () => {
+    // Last report Fri 5/8; today Wed 5/13 → only weekdays 5/11, 5/12 backfilled.
+    expect(missedTradingDays(['2026-05-08'], '2026-05-13')).toEqual([
+      '2026-05-11',
+      '2026-05-12',
+    ]);
+  });
+
+  it('skips NYSE holidays inside the gap', () => {
+    // Memorial Day 2026 = Mon 5/25. Gap from Fri 5/22 to Wed 5/27.
+    expect(missedTradingDays(['2026-05-22'], '2026-05-27')).toEqual([
+      '2026-05-26',
+    ]);
+  });
+
+  it('returns nothing when reports are already current', () => {
+    expect(missedTradingDays(['2026-05-14', '2026-05-15'], '2026-05-16')).toEqual([]);
+  });
+
+  it('returns nothing when there is no anchor report', () => {
+    expect(missedTradingDays([], '2026-05-17')).toEqual([]);
+  });
+
+  it('does not backfill older gaps before the most recent report', () => {
+    // 5/6, 5/8 are blank but predate the 5/11 report — not reconstructable.
+    const existing = ['2026-05-05', '2026-05-11'];
+    expect(missedTradingDays(existing, '2026-05-14')).toEqual([
+      '2026-05-12',
+      '2026-05-13',
+    ]);
+  });
+
+  it('never includes today or future dates', () => {
+    const out = missedTradingDays(['2026-05-11'], '2026-05-13');
+    expect(out).not.toContain('2026-05-13');
+    expect(out.every(d => d < '2026-05-13')).toBe(true);
+  });
+
+  it('caps the backfill window to maxLookbackDays', () => {
+    // Anchor far in the past; with a 3-day window only 5/12–5/14 are eligible
+    // (today 5/15 itself is always excluded), and 5/11 falls outside the cap.
+    const out = missedTradingDays(['2026-04-01'], '2026-05-15', 3);
+    expect(out).toEqual(['2026-05-12', '2026-05-13', '2026-05-14']);
   });
 });

@@ -133,6 +133,47 @@ describe('generateEodReport', () => {
     expect(revTrade?.pnl).toBe(-20);
   });
 
+  // TRA-388 — `asOfDate` backfill: stamp a report for a past trading day
+  // whose 21:00 ET archive tick was missed, selecting that day's closed
+  // trades from still-retained engine state.
+  it('backfills a past day with asOfDate, selecting only that day\'s closed trades', () => {
+    const may14 = Date.parse('2026-05-14T18:00:00Z'); // closes mid-session 5/14 UTC
+    const may15 = Date.parse('2026-05-15T18:00:00Z');
+
+    const tradeOn14 = makePosition({
+      id: 'pos-14', symbol: 'AAPL', pnl: 75,
+      openedAt: may14 - 3600_000, closedAt: may14,
+    });
+    const tradeOn15 = makePosition({
+      id: 'pos-15', symbol: 'MSFT', pnl: -30,
+      openedAt: may15 - 3600_000, closedAt: may15,
+    });
+
+    const report = generateEodReport({
+      state: makeEngineState(),
+      allClosedPositions: [tradeOn14, tradeOn15],
+      dailySignals: [],
+      signalTypeMap: new Map(),
+    }, '2026-05-14');
+
+    expect(report.date).toBe('2026-05-14');
+    expect(report.totalTrades).toBe(1);
+    expect(report.trades[0].id).toBe('pos-14');
+    expect(report.realizedPnl).toBeCloseTo(75, 2);
+    expect(report.markdown).toContain('# Daily EOD Report — 2026-05-14');
+  });
+
+  it('without asOfDate, stamps the current ET day', () => {
+    const today = new Date().toLocaleDateString('en-CA', { timeZone: 'America/New_York' });
+    const report = generateEodReport({
+      state: makeEngineState(),
+      allClosedPositions: [],
+      dailySignals: [],
+      signalTypeMap: new Map(),
+    });
+    expect(report.date).toBe(today);
+  });
+
   it('computes top 5 movers sorted by absolute % change', () => {
     const report = generateEodReport({
       state: makeEngineState(),

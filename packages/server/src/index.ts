@@ -5,7 +5,7 @@ import { writeFile, readFile, readdir, stat } from 'fs/promises';
 import { existsSync } from 'fs';
 import { join, dirname } from 'path';
 import { fileURLToPath } from 'url';
-import { MarketScheduler, isMarketDay } from './scheduler.js';
+import { MarketScheduler, isMarketDay, missedTradingDays } from './scheduler.js';
 import { generateEodReport } from './reports/eod-report.js';
 import { generateCryptoEodReport } from './reports/crypto-eod-report.js';
 import {
@@ -259,9 +259,29 @@ async function userCtx(res: express.Response): Promise<UserContext> {
 
 // ── EOD Report generation ────────────────────────────────────────────────────
 
-async function generateAndSaveReport(ctx: UserContext): Promise<void> {
+/**
+ * Generate and persist the stocks EOD report.
+ *
+ * `opts.asOfDate` (TRA-388) — when set, this is a *backfill* run for a past
+ * trading day whose 21:00 ET archive tick was missed (server offline). A
+ * backfill:
+ *   - stamps the report with `asOfDate` and selects that day's closed trades
+ *     (still retained in engine state — archiving never ran);
+ *   - skips the Tradier reconcile + broker-truth `combinedPnl` override: that
+ *     path keys off *today's* Tradier balance and would mis-stamp a past
+ *     cell. Per-day broker-truth reconstruction of missed days is a separate
+ *     follow-up;
+ *   - does not touch `latest.json` / the equity tracker / WS broadcast, so
+ *     filling an old gap can't clobber the genuine latest report or rebase
+ *     the live dashboard's opening equity.
+ */
+async function generateAndSaveReport(
+  ctx: UserContext,
+  opts: { asOfDate?: string } = {},
+): Promise<void> {
+  const backfill = opts.asOfDate != null;
   const snapshot = ctx.engine.getReportSnapshot();
-  const report = generateEodReport(snapshot);
+  const report = generateEodReport(snapshot, opts.asOfDate);
   // TRA-244 — write under the active stocks bucket (demo / live / sandbox)
   // so the per-account calendar shows only the rows that belong to it.
   const settings = getSettings(ctx.username);
@@ -273,7 +293,7 @@ async function generateAndSaveReport(ctx: UserContext): Promise<void> {
   // broker UI, or `sell_to_close` orders that resolved after the 5s
   // wait window) into the per-day reports for the active env. Failures
   // here must not block the local report from being written.
-  if (settings.mode === 'live') {
+  if (settings.mode === 'live' && !backfill) {
     try {
       await reconcileTradierOptionsHistory(ctx, settings, mode);
     } catch (err) {
@@ -287,14 +307,14 @@ async function generateAndSaveReport(ctx: UserContext): Promise<void> {
   // reflects any Tradier-side closes we just merged (the dashboard pill
   // reads the same aggregate).
   const finalSnapshot = ctx.engine.getReportSnapshot();
-  let finalReport = generateEodReport(finalSnapshot);
+  let finalReport = generateEodReport(finalSnapshot, opts.asOfDate);
 
   // TRA-359 — in live mode, override the report's `combinedPnl` with the
   // Tradier-truth daily delta (today.balance − prev.balance − netCashFlow)
   // so the Live calendar mirrors what the user sees on the broker. The
   // engine view of realized / unrealized / options is left intact for
   // diagnostic context — a markdown header documents the override.
-  if (settings.mode === 'live') {
+  if (settings.mode === 'live' && !backfill) {
     try {
       const todayBalance = finalSnapshot.state.account.totalEquity;
       const override = await reconcileTradierLiveCalendar(
@@ -316,32 +336,91 @@ async function generateAndSaveReport(ctx: UserContext): Promise<void> {
 
   const datePath = join(targetDir, `${finalReport.date}.json`);
   const mdPath = join(targetDir, `${finalReport.date}.md`);
-  const latestJsonPath = join(targetDir, 'latest.json');
-  const latestMdPath = join(targetDir, 'latest.md');
 
-  await Promise.all([
+  const writes: Promise<void>[] = [
     writeFile(datePath, JSON.stringify(finalReport, null, 2), 'utf-8'),
     writeFile(mdPath, finalReport.markdown, 'utf-8'),
-    writeFile(latestJsonPath, JSON.stringify(finalReport, null, 2), 'utf-8'),
-    writeFile(latestMdPath, finalReport.markdown, 'utf-8'),
-  ]);
+  ];
+  // A backfill is for an old date — never let it become "latest".
+  if (!backfill) {
+    writes.push(
+      writeFile(join(targetDir, 'latest.json'), JSON.stringify(finalReport, null, 2), 'utf-8'),
+      writeFile(join(targetDir, 'latest.md'), finalReport.markdown, 'utf-8'),
+    );
+  }
+  await Promise.all(writes);
 
-  // Persist daily equity snapshot for cumulative tracking.
-  const equitySnap = ctx.engine.getEquitySnapshot();
-  ctx.tracker.saveSnapshot({
-    date: finalReport.date,
-    openingEquity: ctx.tracker.getOpeningEquity(),
-    closingEquity: equitySnap.equity,
-    dailyPnl: equitySnap.equity - ctx.tracker.getOpeningEquity(),
-    optionsPnl: equitySnap.optionsPnl,
-    combinedPnl: (equitySnap.equity - ctx.tracker.getOpeningEquity()) + equitySnap.optionsPnl,
-    trades: finalSnapshot.allClosedPositions.length,
-  });
+  // Persist daily equity snapshot for cumulative tracking. Skipped on a
+  // backfill: `saveSnapshot` rebases the dashboard's opening equity to the
+  // snapshot's closing equity, so writing a stale past row would corrupt the
+  // live daily-P&L baseline.
+  if (!backfill) {
+    const equitySnap = ctx.engine.getEquitySnapshot();
+    ctx.tracker.saveSnapshot({
+      date: finalReport.date,
+      openingEquity: ctx.tracker.getOpeningEquity(),
+      closingEquity: equitySnap.equity,
+      dailyPnl: equitySnap.equity - ctx.tracker.getOpeningEquity(),
+      optionsPnl: equitySnap.optionsPnl,
+      combinedPnl: (equitySnap.equity - ctx.tracker.getOpeningEquity()) + equitySnap.optionsPnl,
+      trades: finalSnapshot.allClosedPositions.length,
+    });
+  }
 
-  console.log(`[reports:${ctx.username}] EOD report saved → ${datePath}`);
+  console.log(
+    `[reports:${ctx.username}] EOD report ${backfill ? 'backfilled' : 'saved'} → ${datePath}`,
+  );
 
-  const msg = JSON.stringify({ type: 'eod_report', payload: finalReport });
-  broadcastToUser(ctx.username, msg);
+  if (!backfill) {
+    broadcastToUser(ctx.username, JSON.stringify({ type: 'eod_report', payload: finalReport }));
+  }
+}
+
+/**
+ * TRA-388 — backfill EOD reports for trading days the 21:00 ET archive tick
+ * missed because the server was offline during its fire window (the desktop
+ * server is routinely closed overnight; a Render redeploy or crash has the
+ * same effect). Without this, a missed day was silently lost forever and the
+ * Calendar showed a permanent gap — the recurring "Calendar issue".
+ *
+ * Runs at startup and again at the top of `runDailyCloseForAllUsers`, so a
+ * gap is healed at the earliest opportunity — crucially before the archive
+ * step clears `allClosedPositions`, while the missed day's closed trades are
+ * still retained in engine state and can be selected by `closedAt` date.
+ *
+ * Safe to call repeatedly: `missedTradingDays` only returns days with no
+ * report file, so an already-backfilled day is skipped.
+ */
+async function catchUpMissedEodReports(): Promise<void> {
+  const today = new Date().toLocaleDateString('en-CA', { timeZone: 'America/New_York' });
+  for (const ctx of getAllUserContexts()) {
+    try {
+      const mode = stockModeKey(getSettings(ctx.username));
+      const dir = stockReportsDirFor(ctx, mode);
+      let existing: string[] = [];
+      try {
+        existing = (await readdir(dir))
+          .filter(f => /^\d{4}-\d{2}-\d{2}\.json$/.test(f))
+          .map(f => f.slice(0, 10));
+      } catch {
+        existing = [];
+      }
+      const missed = missedTradingDays(existing, today);
+      if (missed.length === 0) continue;
+      console.log(
+        `[reports:${ctx.username}] catch-up: backfilling ${missed.length} missed EOD report(s): ${missed.join(', ')}`,
+      );
+      for (const date of missed) {
+        try {
+          await generateAndSaveReport(ctx, { asOfDate: date });
+        } catch (err) {
+          console.error(`[reports:${ctx.username}] catch-up for ${date} failed:`, err);
+        }
+      }
+    } catch (err) {
+      console.error(`[reports:${ctx.username}] catch-up scan failed:`, err);
+    }
+  }
 }
 
 // ── TRA-348: Tradier history reconcile ───────────────────────────────────────
@@ -787,6 +866,11 @@ async function runHourlyFundingForAllUsers(): Promise<void> {
 
 async function runDailyCloseForAllUsers(): Promise<void> {
   const stocksMarketDay = isMarketDay();
+  // TRA-388 — heal any calendar gap from a missed 21:00 ET archive tick
+  // BEFORE the archive step below clears `allClosedPositions`. A missed day's
+  // closed trades are still retained until that point, so a pre-archive
+  // catch-up can reconstruct the day's report accurately.
+  await catchUpMissedEodReports();
   for (const ctx of getAllUserContexts()) {
     try {
       // 1a. Stocks EOD — only on trading days (Mon–Fri, non-holiday).
@@ -2572,6 +2656,14 @@ function attachBroadcastHandlers(ctx: UserContext): void {
 for (const ctx of getAllUserContexts()) {
   attachBroadcastHandlers(ctx);
 }
+
+// TRA-388 — on startup, backfill any EOD report whose 21:00 ET archive tick
+// was missed while the server was offline (overnight close, redeploy, crash).
+// This is what fills the calendar gap the next time the app is opened, rather
+// than waiting for — and depending on — that night's archive tick.
+void catchUpMissedEodReports().catch(err =>
+  console.warn(`[reports] startup catch-up failed: ${err instanceof Error ? err.message : String(err)}`),
+);
 
 /**
  * Provision a brand-new user: build their context and wire WS broadcast

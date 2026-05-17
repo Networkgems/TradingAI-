@@ -43,6 +43,69 @@ export function isMarketDay(date: Date = new Date()): boolean {
   return !MARKET_HOLIDAYS.has(dateStr);
 }
 
+/**
+ * TRA-388 — `isMarketDay` for a calendar date already expressed as a
+ * `YYYY-MM-DD` string. The `Date`-based variant derives day-of-week from the
+ * host's local timezone, which is wrong for a date-only value; deriving it
+ * from a UTC date keeps the result timezone-independent. Used by the missed-
+ * day catch-up so a backfill scan never mis-classifies a weekend/holiday.
+ */
+export function isMarketDayIso(dateIso: string): boolean {
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(dateIso)) return false;
+  if (MARKET_HOLIDAYS.has(dateIso)) return false;
+  const [y, m, d] = dateIso.split('-').map(Number);
+  const dow = new Date(Date.UTC(y, m - 1, d)).getUTCDay(); // 0=Sun … 6=Sat
+  return dow !== 0 && dow !== 6;
+}
+
+/**
+ * TRA-388 — compute the trading days that should have an EOD report on disk
+ * but don't, so a startup / pre-archive catch-up can backfill them.
+ *
+ * Root cause this guards against: the EOD report is generated only by the
+ * 21:00 ET archive tick (`onArchive` → `runDailyCloseForAllUsers`). That tick
+ * needs the server process alive during its fire window and the dedup key is
+ * in-memory only, so a server that is closed overnight (the desktop case), a
+ * Render redeploy, or a crash silently drops that day — there was no catch-up.
+ * This is what left May 14/15 2026 blank on the calendar (TRA-388), a repeat
+ * of the earlier calendar gaps.
+ *
+ * Returns the missed market days in ascending order, restricted to:
+ *   - strictly AFTER the most recent existing report — older gaps can't be
+ *     reconstructed from current engine state (those trades were archived);
+ *   - strictly BEFORE `today` — today's report is the normal tick's job;
+ *   - actual NYSE trading days (`isMarketDayIso`);
+ *   - within `maxLookbackDays` of today — a safety cap so a long-idle install
+ *     does not try to fabricate weeks of history.
+ *
+ * When `existingDates` is empty there is no anchor, so nothing is returned:
+ * the next normal EOD run seeds the first report.
+ */
+export function missedTradingDays(
+  existingDates: readonly string[],
+  today: string,
+  maxLookbackDays = 14,
+): string[] {
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(today)) return [];
+  const valid = existingDates
+    .filter(d => /^\d{4}-\d{2}-\d{2}$/.test(d))
+    .sort();
+  if (valid.length === 0) return [];
+  const anchor = valid[valid.length - 1];
+  if (anchor >= today) return [];
+  const have = new Set(valid);
+  const out: string[] = [];
+  const todayMs = Date.parse(`${today}T00:00:00Z`);
+  for (let back = maxLookbackDays; back >= 1; back--) {
+    const iso = new Date(todayMs - back * 86_400_000).toISOString().slice(0, 10);
+    if (iso <= anchor || iso >= today) continue;
+    if (have.has(iso)) continue;
+    if (!isMarketDayIso(iso)) continue;
+    out.push(iso);
+  }
+  return out;
+}
+
 /** Returns the current hour and minute in ET. */
 function nowET(): { hour: number; minute: number; date: Date } {
   const now = new Date();
@@ -179,10 +242,17 @@ export class MarketScheduler {
         }
       }
 
-      if (hour === 21 && minute === 0) {
+      // TRA-388 — fire at OR AFTER 21:00 ET (once per ET day) instead of
+      // demanding the exact 21:00 minute. The archive drives the Calendar's
+      // EOD report; a server that was asleep/restarting at 21:00 but is up
+      // later that evening still gets the day archived rather than losing it
+      // outright. A full-evening outage is healed separately by the missed-
+      // day catch-up (see `missedTradingDays`). Late archiving is harmless —
+      // it is end-of-day bookkeeping, not a time-sensitive market action.
+      if (hour >= 21) {
         if (cfg.onArchive && this.lastArchiveDate !== todayKey) {
           this.lastArchiveDate = todayKey;
-          console.log(`[scheduler] archive trigger fired for ${todayKey}`);
+          console.log(`[scheduler] archive trigger fired for ${todayKey} (${String(hour).padStart(2, '0')}:${String(minute).padStart(2, '0')} ET)`);
           Promise.resolve(cfg.onArchive()).catch(err =>
             console.error('[scheduler] archive callback error:', err),
           );
