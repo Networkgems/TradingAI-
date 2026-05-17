@@ -155,7 +155,12 @@ async function main() {
     dailyCandlesBySymbol: { ...daily },
   };
 
-  const cells: Array<Record<string, unknown>> = [];
+  type CellEntry = ReturnType<typeof metricsOf> & {
+    oosBlockBootstrap: ReturnType<typeof blockBootstrap>;
+  };
+  type Cell = { symbol: string; capOff: CellEntry; capOn: CellEntry };
+
+  const cells: Cell[] = [];
   for (const symbol of SYMBOLS) {
     const off = await runner.run(cfg(symbol, OOS_START_MS, OOS_END_MS), bars[symbol]);
     const on = await runner.run(cfg(symbol, OOS_START_MS, OOS_END_MS, capOpts), bars[symbol]);
@@ -186,8 +191,8 @@ async function main() {
     );
   }
 
-  const totalRejected = cells.reduce((s, c) => s + ((c.capOn as any).correlationCap?.rejected ?? 0), 0);
-  const totalScaled = cells.reduce((s, c) => s + ((c.capOn as any).correlationCap?.scaledDown ?? 0), 0);
+  const totalRejected = cells.reduce((s, c) => s + (c.capOn.correlationCap?.rejected ?? 0), 0);
+  const totalScaled = cells.reduce((s, c) => s + (c.capOn.correlationCap?.scaledDown ?? 0), 0);
 
   const payload = {
     generatedAt: new Date().toISOString(),
