@@ -1436,10 +1436,25 @@ export function aliasWatchlistSymbol(symbol: string): string {
 
 export const CRYPTO_WATCHLIST: readonly string[] = [
   'BTC-USD',   'ETH-USD',   'BNB-USD',   'SOL-USD',   'ADA-USD',
-  'DOT-USD',   'AVAX-USD',  'LINK-USD',  'MATIC-USD', 'XRP-USD',
+  // TRA-445 — MATIC rebranded to POL (Polygon token migration, Sept 2024).
+  // The old MATIC-USD product is delisted on Coinbase (Exchange 400 /
+  // Advanced Trade 404); the watchlist tracks POL-USD now. Legacy positions
+  // still keyed by MATIC-USD are aliased through `aliasCryptoSymbol` so
+  // quotes still resolve. Mirrors the TRA-344 RNDR→RENDER pattern below.
+  'DOT-USD',   'AVAX-USD',  'LINK-USD',  'POL-USD',   'XRP-USD',
   'LTC-USD',   'BCH-USD',   'ATOM-USD',  'DOGE-USD',  'SHIB-USD',
-  'NEAR-USD',  'FTM-USD',   'SAND-USD',  'MANA-USD',  'AXS-USD',
+  // TRA-445 — FTM rebranded to Sonic (S) (FTM→S token migration completed
+  // 2025). Coinbase delisted FTM-USD and lists S-USD; same alias treatment
+  // as MATIC→POL above.
+  'NEAR-USD',  'S-USD',     'SAND-USD',  'MANA-USD',  'AXS-USD',
   'UNI-USD',   'AAVE-USD',  'MKR-USD',   'CRV-USD',   'ALGO-USD',
+  // TRA-445 — TRX-USD and THETA-USD are NOT delisted: Coinbase simply never
+  // listed them, so the Coinbase Exchange / Advanced Trade paths 404 and the
+  // engine's Coinbase-strict entry gate (TRA-338) will never open a position
+  // in them. They are kept because they are valid, actively-traded assets
+  // that Yahoo Finance still serves — the cascade falls through to Yahoo for
+  // quotes and daily/minute candles (no 4H Yahoo fallback). Removing them
+  // would drop a real asset, not a dead ticker.
   'XLM-USD',   'ETC-USD',   'TRX-USD',   'FIL-USD',   'VET-USD',
   'THETA-USD', 'HBAR-USD',  'ICP-USD',   'FLOW-USD',  'GRT-USD',
   'ARB-USD',   'OP-USD',    'APT-USD',   'SUI-USD',   'INJ-USD',
@@ -1447,6 +1462,9 @@ export const CRYPTO_WATCHLIST: readonly string[] = [
   // RNDR-USD product is delisted; Yahoo/CMC also dropped the legacy ticker,
   // so the watchlist tracks RENDER-USD now. Legacy positions still keyed by
   // RNDR-USD are aliased through `aliasCryptoSymbol` so quotes still resolve.
+  // SNX-USD (Synthetix) is retained — TRA-443 flagged a stale feed, but
+  // Coinbase still lists SNX-USD live (Exchange + Advanced Trade 200), so the
+  // stale read was transient, not a delisting.
   'RUNE-USD',  'RENDER-USD','IMX-USD',   'EGLD-USD',  'LDO-USD',
   'SNX-USD',   'APE-USD',   'COMP-USD',  'CHZ-USD',   'ZEC-USD',
 ] as const;
@@ -1457,9 +1475,13 @@ export const CRYPTO_WATCHLIST: readonly string[] = [
  * upstream without manual migration. Mirrors {@link STOCK_TICKER_ALIASES}.
  *
  * TRA-344 — RNDR-USD → RENDER-USD (Coinbase rebrand 2024-04-23).
+ * TRA-445 — MATIC-USD → POL-USD (Polygon token migration, Sept 2024).
+ * TRA-445 — FTM-USD → S-USD (Fantom → Sonic token migration, 2025).
  */
 const CRYPTO_TICKER_ALIASES: Readonly<Record<string, string>> = {
   'RNDR-USD': 'RENDER-USD',
+  'MATIC-USD': 'POL-USD',
+  'FTM-USD': 'S-USD',
 };
 
 export function aliasCryptoSymbol(symbol: string): string {

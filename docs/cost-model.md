@@ -43,7 +43,7 @@ Per-fill cost = (commissionBps, slippageBps). Round-trip = 2 × (commissionBps +
 | `major`    |             4 |           2 |     12 bps | BTC-USD, ETH-USD                     |
 | `high_liq` |            10 |           8 |     36 bps | SOL-USD                              |
 | `mid`      |            20 |          10 |     60 bps | LINK-USD, AVAX-USD                   |
-| `small`    |            35 |          15 |    100 bps | ADA-USD, MATIC-USD, DOGE-USD, *fallback* |
+| `small`    |            35 |          15 |    100 bps | ADA-USD, POL-USD, DOGE-USD, *fallback* |
 
 `commissionBps` represents the exchange fee component (Coinbase Advanced
 Trade taker fees range from ~10 bps on Tier-1 volume tiers up to 60 bps on

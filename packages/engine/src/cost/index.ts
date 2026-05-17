@@ -71,7 +71,9 @@ export const DEFAULT_CRYPTO_TIERS: ReadonlyMap<string, CryptoSpreadTier> = new M
   ['LINK-USD', 'mid'],
   ['AVAX-USD', 'mid'],
   ['ADA-USD',  'small'],
-  ['MATIC-USD', 'small'],
+  // TRA-445 — MATIC rebranded to POL (Polygon token migration). The cost
+  // tier is unchanged (small-cap alt); the key follows the watchlist rename.
+  ['POL-USD',  'small'],
   ['DOGE-USD', 'small'],
 ]);
 
