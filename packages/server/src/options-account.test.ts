@@ -1675,3 +1675,121 @@ describe('PaperOptionsAccount — TRA-384 stale-mark SL backstop', () => {
     expect(acct.getState().openOptions).toHaveLength(1);
   });
 });
+
+// ─── TRA-416: partial-fill booking on a terminal sell_to_close ───────────────
+//
+// A `sell_to_close` can fill PART of its quantity and then go terminal
+// (expire / cancel). `bookPartialClose` realises the filled slice, reduces
+// the position to the remainder, and is idempotent against the per-tick
+// reconcile sweep so a slice is never double-counted.
+describe('PaperOptionsAccount.bookPartialClose (TRA-416)', () => {
+  it('books the filled slice of an engine-opened position and leaves the remainder open', () => {
+    // initialEquity 80k × 0.5 ratio × 0.025 budget ÷ ($1.00 × 100) = 10 contracts.
+    const acct = new PaperOptionsAccount({ initialEquity: 80_000, managedAccountRatio: 0.5 });
+    const pos = acct.openOptionFromCandidate(buildSignal({ mark: 1.0 }), 'live');
+    expect(pos).not.toBeNull();
+    expect(pos!.contracts).toBe(10);
+    const cashBefore = acct.getState().optionsCash;
+
+    // Order #501 filled 6 of 10 contracts at 1.50 then expired.
+    const booked = acct.bookPartialClose(pos!.id, 501, 6, 1.50);
+
+    expect(booked).not.toBeNull();
+    // 6 closed → 4 remain, position stays open.
+    expect(booked!.contractsRemaining).toBe(4);
+    expect(acct.getState().openOptions).toHaveLength(1);
+    expect(acct.getState().closedOptions).toHaveLength(0);
+    // Realised slice P&L = (1.50 − 1.00) × 6 × 100 = $300.
+    expect(booked!.pnl).toBeCloseTo(300, 5);
+    expect(acct.getStateForMode('live').optionsPnl).toBeCloseTo(300, 5);
+    // Engine-opened rows credit the paper cash bucket at the broker fill.
+    expect(acct.getState().optionsCash - cashBefore).toBeCloseTo(1.50 * 6 * 100, 5);
+    // The terminal order id is stamped for the idempotency guard.
+    expect(booked!.partialCloseBookedOrderId).toBe(501);
+    expect(booked!.pendingCloseOrderId).toBeUndefined();
+  });
+
+  it('is idempotent — re-booking the same terminal order id does not double-count', () => {
+    const acct = new PaperOptionsAccount({ initialEquity: 80_000, managedAccountRatio: 0.5 });
+    const pos = acct.openOptionFromCandidate(buildSignal({ mark: 1.0 }), 'live');
+    expect(pos).not.toBeNull();
+
+    const first = acct.bookPartialClose(pos!.id, 501, 6, 1.50);
+    expect(first).not.toBeNull();
+    const pnlAfterFirst = acct.getStateForMode('live').optionsPnl;
+    const cashAfterFirst = acct.getState().optionsCash;
+    const remainingAfterFirst = acct.getState().openOptions[0].contractsRemaining;
+
+    // The per-tick sweep sees the same terminal order #501 again.
+    const second = acct.bookPartialClose(pos!.id, 501, 6, 1.50);
+
+    expect(second).toBeNull();
+    expect(acct.getStateForMode('live').optionsPnl).toBeCloseTo(pnlAfterFirst, 5);
+    expect(acct.getState().optionsCash).toBeCloseTo(cashAfterFirst, 5);
+    expect(acct.getState().openOptions[0].contractsRemaining).toBe(remainingAfterFirst);
+  });
+
+  it('retires the position when a later partial drains the remainder, accumulating P&L', () => {
+    const acct = new PaperOptionsAccount({ initialEquity: 80_000, managedAccountRatio: 0.5 });
+    const pos = acct.openOptionFromCandidate(buildSignal({ mark: 1.0 }), 'live');
+    expect(pos).not.toBeNull();
+
+    // Slice 1: 6 @ 1.50 → +$300, 4 remain.
+    acct.bookPartialClose(pos!.id, 501, 6, 1.50);
+    // Slice 2: a fresh order #502 fills the remaining 4 @ 1.20 → +$80, drains.
+    const drained = acct.bookPartialClose(pos!.id, 502, 4, 1.20);
+
+    expect(drained).not.toBeNull();
+    expect(drained!.contractsRemaining).toBe(0);
+    // Position retired into closed-options with the ACCUMULATED P&L.
+    expect(acct.getState().openOptions).toHaveLength(0);
+    const closed = acct.getState().closedOptions;
+    expect(closed).toHaveLength(1);
+    // 300 + (1.20 − 1.00) × 4 × 100 = 300 + 80 = 380.
+    expect(closed[0].pnl).toBeCloseTo(380, 5);
+  });
+
+  it('clamps the slice to the contracts the position actually holds', () => {
+    const acct = new PaperOptionsAccount({ initialEquity: 80_000, managedAccountRatio: 0.5 });
+    const pos = acct.openOptionFromCandidate(buildSignal({ mark: 1.0 }), 'live');
+    expect(pos).not.toBeNull();
+
+    // Broker reports 14 filled but the position only holds 10 — treat as a
+    // full close, never book phantom contracts.
+    const booked = acct.bookPartialClose(pos!.id, 501, 14, 1.50);
+
+    expect(booked).not.toBeNull();
+    expect(booked!.contractsRemaining).toBe(0);
+    expect(acct.getState().openOptions).toHaveLength(0);
+    expect(acct.getState().closedOptions[0].pnl).toBeCloseTo(0.50 * 10 * 100, 5);
+  });
+
+  it('books an imported partial fill without touching the paper cash bucket', () => {
+    const acct = new PaperOptionsAccount({ initialEquity: 25_000, tradierEnv: 'sandbox' });
+    acct.reconcileTradierPositions([buildTradierPosition({ contracts: 10, premiumPaid: 1.0 })]);
+    const imported = acct.getState().openOptions[0];
+    expect(imported.importedFromTradier).toBe(true);
+    const cashBefore = acct.getState().optionsCash;
+
+    const booked = acct.bookPartialClose(imported.id, 777, 6, 1.50);
+
+    expect(booked).not.toBeNull();
+    expect(booked!.contractsRemaining).toBe(4);
+    // Imported proceeds live on Tradier — paper cash is untouched.
+    expect(acct.getState().optionsCash).toBe(cashBefore);
+    // Realised slice P&L still surfaces on the live options pill.
+    expect(acct.getStateForMode('live').optionsPnl).toBeCloseTo(0.50 * 6 * 100, 5);
+  });
+
+  it('rejects non-bookable inputs (unknown id, non-positive qty / price)', () => {
+    const acct = new PaperOptionsAccount({ initialEquity: 80_000, managedAccountRatio: 0.5 });
+    const pos = acct.openOptionFromCandidate(buildSignal({ mark: 1.0 }), 'live');
+    expect(pos).not.toBeNull();
+
+    expect(acct.bookPartialClose('no-such-id', 1, 6, 1.5)).toBeNull();
+    expect(acct.bookPartialClose(pos!.id, 1, 0, 1.5)).toBeNull();
+    expect(acct.bookPartialClose(pos!.id, 1, 6, 0)).toBeNull();
+    // The position was not mutated by any of the rejected calls.
+    expect(acct.getState().openOptions[0].contractsRemaining).toBe(10);
+  });
+});

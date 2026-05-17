@@ -51,8 +51,29 @@ export const TRADIER_REJECTED_STATUSES = new Set<string>([
 ]);
 
 interface TradierOrderEnvelope {
-  order?: (TradierOrderResponse & TradierOrderDetail) & { errors?: { error: string | string[] } };
+  order?: (TradierOrderResponse & TradierOrderDetail) & {
+    errors?: { error: string | string[] };
+    // TRA-416 — Tradier's cumulative filled-quantity field is `exec_quantity`
+    // on the REST `/orders/{id}` payload, but the account-event / streaming
+    // shapes surface the same number as `last_fill_quantity` / `fill_quantity`.
+    // Declared here so `getOrderStatus` can coalesce whichever the broker sent.
+    last_fill_quantity?: number;
+    fill_quantity?: number;
+  };
   errors?: { error: string | string[] };
+}
+
+/**
+ * TRA-416 — return the first finite number from the candidates, or `undefined`
+ * when none qualify. Used to coalesce Tradier's filled-quantity field, which
+ * the broker names `exec_quantity` on the order-status payload but
+ * `last_fill_quantity` / `fill_quantity` on other order shapes.
+ */
+function firstFiniteNumber(...values: unknown[]): number | undefined {
+  for (const v of values) {
+    if (typeof v === 'number' && Number.isFinite(v)) return v;
+  }
+  return undefined;
 }
 
 /**
@@ -227,7 +248,10 @@ export class TradierOrderClient {
       id: o.id,
       status: typeof o.status === 'string' ? o.status.toLowerCase() : '',
       reason_description: o.reason_description,
-      exec_quantity: typeof o.exec_quantity === 'number' ? o.exec_quantity : undefined,
+      // TRA-416 — coalesce the filled-quantity field across the names Tradier
+      // uses on different order shapes so a partial-fill detector downstream
+      // sees a value regardless of which envelope the broker returned.
+      exec_quantity: firstFiniteNumber(o.exec_quantity, o.last_fill_quantity, o.fill_quantity),
       remaining_quantity: typeof o.remaining_quantity === 'number' ? o.remaining_quantity : undefined,
       avg_fill_price: typeof o.avg_fill_price === 'number' ? o.avg_fill_price : undefined,
     };

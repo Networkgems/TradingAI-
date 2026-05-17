@@ -1425,6 +1425,80 @@ export class PaperOptionsAccount {
   }
 
   /**
+   * TRA-416 — book the FILLED slice of a `sell_to_close` that partially
+   * filled and then went terminal (expired / cancelled). Realises P&L on
+   * `filledQty` contracts at the broker's `avgFillPrice`, reduces the
+   * position to the remainder, and clears the in-flight close marker so the
+   * caller can re-submit a fresh order for what's left. Mirrors the partial
+   * branch of {@link finalizePendingExit}: the closed-options row is NOT
+   * pushed while the position still has contracts open — the accumulated
+   * `pnl` rides on the position and lands on the closed row when the
+   * remainder finally closes via {@link closeOption} / {@link recordImportedFill}.
+   *
+   * Imported rows attribute P&L through {@link applyRealtimeImportedPnl}
+   * (no paper cash — proceeds live on Tradier); engine-opened rows credit
+   * the paper cash bucket and bump equity, same convention as `closeOption`.
+   * No demo cost model is applied: partial fills only occur on real Tradier
+   * orders, and the live close path never models slippage / fees locally.
+   *
+   * Idempotency (TRA-416 AC): the per-tick reconcile sweep can observe the
+   * same terminal order id more than once. `partialCloseBookedOrderId`
+   * records which order's slice has already been realised; a repeat call
+   * with that same `orderId` returns `null` WITHOUT re-booking, so a slice
+   * is never double-counted.
+   *
+   * Returns the post-booking snapshot (with `contractsRemaining` reduced),
+   * or `null` when the id is unknown, the slice was already booked, or the
+   * inputs are not bookable (`filledQty` / `avgFillPrice` non-positive).
+   */
+  bookPartialClose(
+    optionId: string,
+    orderId: number | string,
+    filledQty: number,
+    avgFillPrice: number,
+  ): OptionPosition | null {
+    const opt = this.openOptions.get(optionId);
+    if (!opt) return null;
+    // Idempotency guard — this terminal order's slice is already realised.
+    if (opt.partialCloseBookedOrderId === orderId) return null;
+    if (!Number.isFinite(filledQty) || filledQty <= 0) return null;
+    if (!Number.isFinite(avgFillPrice) || avgFillPrice <= 0) return null;
+    // Never book more than the position actually holds — a broker
+    // `exec_quantity` at / above the remainder is treated as a full close.
+    const slice = Math.min(Math.floor(filledQty), opt.contractsRemaining);
+    if (slice <= 0) return null;
+
+    const pnl = (avgFillPrice - opt.premiumPaid) * slice * 100;
+    if (!opt.importedFromTradier) {
+      this.cash += avgFillPrice * slice * 100;
+      this.equity += pnl;
+      this.optionsPnlByMode[opt.mode ?? 'demo'] += pnl;
+    } else {
+      this.applyRealtimeImportedPnl(pnl);
+    }
+    opt.pnl = (opt.pnl ?? 0) + pnl;
+    opt.currentPremium = avgFillPrice;
+    opt.contractsRemaining -= slice;
+    opt.partialCloseBookedOrderId = orderId;
+    // The terminal order is done — drop the in-flight close marker + the
+    // fill-chaser bookkeeping. The caller re-stamps `pendingCloseOrderId`
+    // via `setPendingCloseOrderId` once it has re-submitted the remainder.
+    delete opt.pendingCloseOrderId;
+    delete opt.pendingCloseSubmittedAt;
+    delete opt.pendingCloseRepriceSteps;
+
+    if (opt.contractsRemaining <= 0) {
+      // The "partial" actually drained the position (broker filled the whole
+      // remainder before terminating) — retire it like a full close.
+      opt.contractsRemaining = 0;
+      opt.closedAt = Date.now();
+      this.openOptions.delete(optionId);
+      this.closedOptions.push({ ...opt });
+    }
+    return { ...opt };
+  }
+
+  /**
    * TRA-367 — internal helper: attribute realtime imported close P&L to
    * the live bucket and the per-date dedup map. Centralises the "import
    * close happened via TradeAI" path used by {@link recordImportedFill}

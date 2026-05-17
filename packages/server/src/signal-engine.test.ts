@@ -2517,3 +2517,188 @@ describe('TRA-389 — market-review regime gates', () => {
     });
   });
 });
+
+// TRA-416 — partial-fill handling in the per-tick close reconciler. A
+// `sell_to_close` that fills PART of its size then goes terminal (expire /
+// cancel) must have the filled slice booked and the un-filled remainder
+// re-ordered, end-to-end through `reconcilePendingCloses`.
+describe('SignalEngine — TRA-416 partial-fill close reconciliation', () => {
+  const OCC = 'AAPL240705C00200000';
+
+  interface PartialClient {
+    getOrderStatus: ReturnType<typeof vi.fn>;
+    getOptionQuote: ReturnType<typeof vi.fn>;
+    sellContractsLimit: ReturnType<typeof vi.fn>;
+    cancelOrder: ReturnType<typeof vi.fn>;
+    waitForOrderTerminalStatus: ReturnType<typeof vi.fn>;
+  }
+  interface PartialAcct {
+    openOptionFromCandidate(sig: unknown, mode: 'live'): { id: string } | null;
+    setPendingCloseOrderId(id: string, orderId: number): boolean;
+    getState(): {
+      openOptions: Array<{
+        id: string;
+        contracts: number;
+        contractsRemaining: number;
+        premiumPaid: number;
+        pnl?: number;
+        pendingCloseOrderId?: number | string;
+        partialCloseBookedOrderId?: number | string;
+      }>;
+      closedOptions: Array<{ id: string; pnl?: number; currentPremium: number }>;
+    };
+  }
+  type Internals = {
+    tradierOptionsClientByEnv: Record<TradierEnv, unknown>;
+    optionsAccounts: Record<TradierEnv, PartialAcct>;
+  };
+
+  function asInternals(engine: SignalEngine): Internals {
+    return engine as unknown as Internals;
+  }
+
+  // Open an engine-opened live row, then normalise it to exactly 10 contracts
+  // at $1.00 premium so a 60/40 partial split lands on whole numbers.
+  function openTenContractRow(engine: SignalEngine, orderId: number): { acct: PartialAcct; optionId: string } {
+    const acct = asInternals(engine).optionsAccounts.sandbox;
+    const opened = acct.openOptionFromCandidate(
+      {
+        id: 'sig', symbol: 'AAPL', type: 'otm_mispricing', side: 'buy',
+        entryPrice: 1.0, stopLoss: 0.75, takeProfit: 1.5, riskRewardRatio: 2,
+        timestamp: TRADING_TIME, optionSymbol: OCC, optionType: 'call',
+        strike: 200, expiration: '2024-07-05', mark: 1.0, theo: 1.3,
+        mispricingPct: -0.23, delta: 0.18,
+      },
+      'live',
+    );
+    if (!opened) throw new Error('test setup: failed to open option');
+    const row = acct.getState().openOptions.find((o) => o.id === opened.id)!;
+    row.contracts = 10;
+    row.contractsRemaining = 10;
+    row.premiumPaid = 1.0;
+    row.pnl = 0;
+    acct.setPendingCloseOrderId(opened.id, orderId);
+    return { acct, optionId: opened.id };
+  }
+
+  it('books a 60% partial fill, re-orders the 40% remainder, and P&L matches', async () => {
+    const client: PartialClient = {
+      // Order #700: filled 6 of 10 contracts at 1.50, then expired.
+      getOrderStatus: vi.fn(async () => ({
+        id: 700, status: 'expired', exec_quantity: 6, avg_fill_price: 1.50,
+        reason_description: 'EOD expiration',
+      })),
+      getOptionQuote: vi.fn(async () => ({ symbol: OCC, bid: 1.0, ask: 1.2 })),
+      sellContractsLimit: vi.fn(async () => ({ id: 800, status: 'ok' })),
+      cancelOrder: vi.fn(async () => undefined),
+      // Re-order #800 stays open inside the wait window → `pending` outcome.
+      waitForOrderTerminalStatus: vi.fn(async () => ({ id: 800, status: 'open' })),
+    };
+    const engine = new SignalEngine();
+    asInternals(engine).tradierOptionsClientByEnv = { sandbox: client, production: null };
+    const { acct, optionId } = openTenContractRow(engine, 700);
+
+    const summary = await engine.reconcilePendingCloses();
+
+    // Slice booked = 1 fill; remainder re-ordered + still working = 1 pending.
+    expect(summary.filled).toBe(1);
+    expect(summary.stillPending).toBe(1);
+
+    const row = acct.getState().openOptions.find((o) => o.id === optionId);
+    expect(row).toBeDefined();
+    // 60% closed → 40% (4 contracts) remain open.
+    expect(row?.contractsRemaining).toBe(4);
+    // Realised slice P&L = (1.50 − 1.00) × 6 × 100 = $300.
+    expect(row?.pnl).toBeCloseTo(300, 5);
+    // The terminal order id is stamped for the idempotency guard...
+    expect(row?.partialCloseBookedOrderId).toBe(700);
+    // ...and the remainder was re-ordered (new pending order #800).
+    expect(row?.pendingCloseOrderId).toBe(800);
+    // The re-submit was for the 4-contract remainder, not the original 10.
+    expect(client.sellContractsLimit).toHaveBeenCalledWith(OCC, 4, expect.any(Number));
+  });
+
+  it('fully closes the position when the re-ordered remainder fills immediately', async () => {
+    const client: PartialClient = {
+      getOrderStatus: vi.fn(async () => ({
+        id: 700, status: 'expired', exec_quantity: 6, avg_fill_price: 1.50,
+      })),
+      getOptionQuote: vi.fn(async () => ({ symbol: OCC, bid: 1.0, ask: 1.2 })),
+      sellContractsLimit: vi.fn(async () => ({ id: 800, status: 'ok' })),
+      cancelOrder: vi.fn(async () => undefined),
+      // Re-order #800 fills at 1.10 inside the wait window.
+      waitForOrderTerminalStatus: vi.fn(async () => ({ id: 800, status: 'filled', avg_fill_price: 1.10 })),
+    };
+    const engine = new SignalEngine();
+    asInternals(engine).tradierOptionsClientByEnv = { sandbox: client, production: null };
+    const { acct, optionId } = openTenContractRow(engine, 700);
+
+    const summary = await engine.reconcilePendingCloses();
+
+    // Slice fill + remainder fill = 2.
+    expect(summary.filled).toBe(2);
+    expect(acct.getState().openOptions.find((o) => o.id === optionId)).toBeUndefined();
+    const closed = acct.getState().closedOptions.find((o) => o.id === optionId);
+    expect(closed).toBeDefined();
+    // Accumulated P&L = 300 (slice) + (1.10 − 1.00) × 4 × 100 = 300 + 40 = 340.
+    expect(closed?.pnl).toBeCloseTo(340, 5);
+  });
+
+  it('leaves the reduced remainder OPEN for retry when the re-order finds no quote', async () => {
+    const client: PartialClient = {
+      getOrderStatus: vi.fn(async () => ({
+        id: 700, status: 'canceled', exec_quantity: 6, avg_fill_price: 1.50,
+      })),
+      // Dead contract — no usable quote, so `submitSmartSellToClose` → no_quote.
+      getOptionQuote: vi.fn(async () => ({ symbol: OCC, bid: 0, ask: 0, last: 0 })),
+      sellContractsLimit: vi.fn(async () => ({ id: 800, status: 'ok' })),
+      cancelOrder: vi.fn(async () => undefined),
+      waitForOrderTerminalStatus: vi.fn(async () => ({ id: 800, status: 'open' })),
+    };
+    const engine = new SignalEngine();
+    asInternals(engine).tradierOptionsClientByEnv = { sandbox: client, production: null };
+    const { acct, optionId } = openTenContractRow(engine, 700);
+
+    const summary = await engine.reconcilePendingCloses();
+
+    expect(summary.filled).toBe(1);
+    expect(summary.cleared).toBe(1);
+    const row = acct.getState().openOptions.find((o) => o.id === optionId);
+    // Slice booked: 4 contracts remain, row open with the Close button back
+    // (no pending marker) so the remainder can be re-closed.
+    expect(row?.contractsRemaining).toBe(4);
+    expect(row?.pnl).toBeCloseTo(300, 5);
+    expect(row?.pendingCloseOrderId).toBeUndefined();
+    expect(client.sellContractsLimit).not.toHaveBeenCalled();
+  });
+
+  it('does not re-book the slice when the sweep runs again before the re-order resolves', async () => {
+    const client: PartialClient = {
+      // #700 partial-expired; #800 (the re-order) still open on tick 2.
+      getOrderStatus: vi.fn(async (id: number) =>
+        id === 700
+          ? { id: 700, status: 'expired', exec_quantity: 6, avg_fill_price: 1.50 }
+          : { id: 800, status: 'open' },
+      ),
+      getOptionQuote: vi.fn(async () => ({ symbol: OCC, bid: 1.0, ask: 1.2 })),
+      sellContractsLimit: vi.fn(async () => ({ id: 800, status: 'ok' })),
+      cancelOrder: vi.fn(async () => undefined),
+      waitForOrderTerminalStatus: vi.fn(async () => ({ id: 800, status: 'open' })),
+    };
+    const engine = new SignalEngine();
+    asInternals(engine).tradierOptionsClientByEnv = { sandbox: client, production: null };
+    const { acct, optionId } = openTenContractRow(engine, 700);
+
+    // Tick 1: partial fill booked, remainder re-ordered as #800.
+    await engine.reconcilePendingCloses();
+    // Tick 2: #800 still open — must not re-book the #700 slice.
+    await engine.reconcilePendingCloses();
+
+    const row = acct.getState().openOptions.find((o) => o.id === optionId);
+    // P&L and contract count unchanged from the single slice booking.
+    expect(row?.contractsRemaining).toBe(4);
+    expect(row?.pnl).toBeCloseTo(300, 5);
+    // The remainder was re-ordered exactly once across both sweeps.
+    expect(client.sellContractsLimit).toHaveBeenCalledTimes(1);
+  });
+});

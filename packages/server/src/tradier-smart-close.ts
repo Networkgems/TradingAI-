@@ -194,8 +194,15 @@ interface NoPath {
  *  - `filled` → broker filled the order; caller closes the local row at
  *    `avgFillPrice` (paper bucket credited at the real fill, not the stale
  *    mid we submitted at).
+ *  - `partial_fill` → TRA-416. The order filled PART of its quantity at
+ *    `avgFillPrice` and then went terminal (expired / cancelled) with a
+ *    non-zero `filledQty` left un-filled. Caller books the filled slice as a
+ *    realised close, reduces the local position to the remainder, and
+ *    re-submits a fresh `sell_to_close` for what's left so the exit
+ *    completes. Without this branch the slice that DID fill leaks: the
+ *    position + P&L stay as if nothing closed.
  *  - `rejected` → broker drove the order to a terminal non-fill state
- *    (cancel / reject / expire / error); caller clears
+ *    (cancel / reject / expire / error) with NOTHING filled; caller clears
  *    `pendingCloseOrderId` so the dashboard shows the row OPEN again and
  *    the user can re-click Close.
  *  - `pending` → still open / pending on Tradier; caller leaves the row as
@@ -215,9 +222,36 @@ interface NoPath {
  */
 export type ReconcileOutcome =
   | { status: 'filled'; orderId: number | string; avgFillPrice: number; limitPrice?: number }
+  | { status: 'partial_fill'; orderId: number | string; avgFillPrice: number; filledQty: number }
   | { status: 'rejected'; orderId: number | string; reason: string }
   | { status: 'pending'; orderId: number | string }
   | { status: 'unknown'; orderId: number | string; reason: string };
+
+/**
+ * TRA-416 — extract the filled slice of a TERMINAL `sell_to_close` order.
+ * Returns `{ filledQty, avgFillPrice }` only when the order genuinely
+ * filled part of its quantity at a usable price; returns `null` (→ caller
+ * treats it as a plain no-fill rejection) when:
+ *  - `exec_quantity` is absent / ≤ 0 (nothing filled), or
+ *  - `avg_fill_price` is absent / ≤ 0 (a fill we can't price — booking it at
+ *    $0 would corrupt P&L; the periodic portfolio reconcile picks up the
+ *    contract drift instead).
+ */
+function extractPartialFill(
+  detail: TradierOrderDetail,
+): { filledQty: number; avgFillPrice: number } | null {
+  const filledQty =
+    typeof detail.exec_quantity === 'number' && Number.isFinite(detail.exec_quantity)
+      ? detail.exec_quantity
+      : 0;
+  if (!(filledQty > 0)) return null;
+  const avg =
+    typeof detail.avg_fill_price === 'number' && Number.isFinite(detail.avg_fill_price)
+      ? detail.avg_fill_price
+      : NaN;
+  if (!Number.isFinite(avg) || avg <= 0) return null;
+  return { filledQty, avgFillPrice: avg };
+}
 
 /**
  * TRA-352 follow-up — look up a single Tradier close order by id and map its
@@ -256,6 +290,14 @@ export async function reconcilePendingCloseOrder(
     return { status: 'filled', orderId, avgFillPrice: avgFill };
   }
   if (TRADIER_REJECTED_STATUSES.has(status)) {
+    // TRA-416 — a "rejected"-family terminal state (cancelled / expired /
+    // error) can still carry a non-zero `exec_quantity`: the order filled
+    // PART of its size before the broker terminated it. Book that slice as a
+    // partial fill instead of throwing the whole position back OPEN.
+    const partial = extractPartialFill(detail);
+    if (partial) {
+      return { status: 'partial_fill', orderId, avgFillPrice: partial.avgFillPrice, filledQty: partial.filledQty };
+    }
     return {
       status: 'rejected',
       orderId,
@@ -264,8 +306,13 @@ export async function reconcilePendingCloseOrder(
   }
   if (TRADIER_TERMINAL_STATUSES.has(status)) {
     // Defensive — TRADIER_TERMINAL_STATUSES is filled + rejected family.
-    // Any other terminal state we haven't categorized: treat as rejected so
-    // the user can re-click Close instead of getting stuck.
+    // Any other terminal state we haven't categorized: surface a partial
+    // fill if one is present, else treat as rejected so the user can
+    // re-click Close instead of getting stuck.
+    const partial = extractPartialFill(detail);
+    if (partial) {
+      return { status: 'partial_fill', orderId, avgFillPrice: partial.avgFillPrice, filledQty: partial.filledQty };
+    }
     return { status: 'rejected', orderId, reason: status };
   }
   return { status: 'pending', orderId };

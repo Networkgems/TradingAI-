@@ -1232,6 +1232,18 @@ export interface OptionPosition {
    */
   pendingCloseRepriceSteps?: number;
   /**
+   * TRA-416 — Tradier order id of the most recent `sell_to_close` whose
+   * PARTIAL fill slice has already been realised into local P&L. When a close
+   * order fills part-way and then goes terminal (expired / cancelled), the
+   * per-tick close reconciler books the filled slice, reduces the position to
+   * the remainder, and re-submits a fresh order for what's left. Stamping the
+   * terminal order id here is the idempotency guard: if the same terminal
+   * order is reconciled again on a later sweep (e.g. the re-submit failed and
+   * the marker wasn't replaced), the slice is recognised as already booked and
+   * is not realised twice. Absent ↔ no partial fill seen / legacy snapshot.
+   */
+  partialCloseBookedOrderId?: number | string;
+  /**
    * TRA-354 — engine-fired exit (TP1 partial / SL / trailing) has submitted
    * a Tradier `sell_to_close` LIMIT order and is waiting for the broker to
    * confirm. While this is set, the paper book holds the position open;

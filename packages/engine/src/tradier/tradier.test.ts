@@ -550,6 +550,33 @@ describe('TradierOrderClient.getOrderStatus', () => {
     const client = new TradierOrderClient('tok', 'A1');
     expect(await client.getOrderStatus(7)).toBeNull();
   });
+
+  // TRA-416 — Tradier surfaces the cumulative filled quantity as
+  // `exec_quantity` on `/orders/{id}`, but other order shapes name it
+  // `last_fill_quantity` / `fill_quantity`. `getOrderStatus` coalesces them
+  // so a partial-fill detector downstream always sees a value.
+  it('coalesces last_fill_quantity into exec_quantity when exec_quantity is absent', async () => {
+    fetchMock.mockResolvedValueOnce(
+      jsonResponse({
+        order: { id: 50, status: 'expired', last_fill_quantity: 4, avg_fill_price: 0.85 },
+      }),
+    );
+    const client = new TradierOrderClient('tok', 'A1');
+    const detail = await client.getOrderStatus(50);
+    expect(detail?.exec_quantity).toBe(4);
+    expect(detail?.avg_fill_price).toBe(0.85);
+  });
+
+  it('prefers exec_quantity over the fallback fill-quantity field names', async () => {
+    fetchMock.mockResolvedValueOnce(
+      jsonResponse({
+        order: { id: 51, status: 'canceled', exec_quantity: 7, fill_quantity: 99 },
+      }),
+    );
+    const client = new TradierOrderClient('tok', 'A1');
+    const detail = await client.getOrderStatus(51);
+    expect(detail?.exec_quantity).toBe(7);
+  });
 });
 
 describe('TradierOrderClient.waitForOrderTerminalStatus', () => {

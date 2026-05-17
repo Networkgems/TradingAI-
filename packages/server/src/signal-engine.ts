@@ -12,6 +12,7 @@ import {
   PENDING_CLOSE_REPRICE_STALENESS_MS,
   reconcilePendingCloseOrder,
   repricePendingCloseOrder,
+  submitSmartSellToClose,
 } from './tradier-smart-close.js';
 import { submitSmartBuyToOpen } from './tradier-smart-open.js';
 import type { RelativeValueScannerService } from './relative-value-scanner.js';
@@ -2209,6 +2210,12 @@ export class SignalEngine {
    *    cash touched — proceeds live on Tradier). Both record a closed-
    *    options row so the dashboard's "Closed Today" reflects the real
    *    realized P&L.
+   *  - partial fill (TRA-416) — the order filled PART of its size then went
+   *    terminal. Book the filled slice at the broker avg fill via
+   *    `bookPartialClose` (realised P&L on that slice, position reduced to
+   *    the remainder), then re-submit a fresh `sell_to_close` for the
+   *    remainder. `bookPartialClose` is idempotent against this sweep so a
+   *    slice is never double-booked.
    *  - terminal non-fill (`canceled` / `rejected` / `expired` / `error`)
    *    — clear `pendingCloseOrderId` so the row re-renders the Close
    *    button. The user can click Close again and the smart-close walk
@@ -2271,6 +2278,80 @@ export class SignalEngine {
                   this.account.getState().totalEquity,
                   this.optionsAccount.getState().optionsPnl,
                 );
+              }
+            }
+          } else if (outcome.status === 'partial_fill') {
+            // TRA-416 — the close order filled PART of its size and then went
+            // terminal (expired / cancelled). Book the filled slice at the
+            // broker's avg fill, reduce the local position to the remainder,
+            // then re-submit a fresh `sell_to_close` for what's left so the
+            // exit completes. `bookPartialClose` is idempotent against the
+            // per-tick sweep: it stamps the terminal order id and refuses to
+            // re-book that same order, so a slice is never double-counted.
+            const booked = acct.bookPartialClose(
+              row.optionId,
+              row.pendingCloseOrderId,
+              outcome.filledQty,
+              outcome.avgFillPrice,
+            );
+            if (!booked) {
+              // Slice already booked on an earlier sweep (idempotency guard)
+              // or the row vanished — nothing to do this tick.
+              stillPending += 1;
+            } else {
+              filled += 1;
+              const remainder = booked.contractsRemaining;
+              console.log(
+                `[tradier-reconcile] sell_to_close ${row.optionSymbol} env=${env} order=${row.pendingCloseOrderId} partial-fill ${outcome.filledQty}@${outcome.avgFillPrice.toFixed(2)} booked; remainder=${remainder}`,
+              );
+              if (!row.importedFromTradier) {
+                this.tracker?.saveEquity(
+                  this.account.getState().totalEquity,
+                  this.optionsAccount.getState().optionsPnl,
+                );
+              }
+              if (remainder > 0) {
+                // Re-submit the un-filled remainder. One smart-pricing attempt
+                // (mid limit); if it doesn't fill in the wait window it lands
+                // `pending` and the existing reconcile / fill-chaser machinery
+                // takes over on the next tick.
+                const resub = await submitSmartSellToClose(
+                  client,
+                  row.optionSymbol,
+                  remainder,
+                  { maxAttempts: 1 },
+                );
+                if (resub.status === 'pending') {
+                  acct.setPendingCloseOrderId(row.optionId, resub.orderId);
+                  stillPending += 1;
+                  console.log(
+                    `[tradier-reconcile] sell_to_close ${row.optionSymbol} env=${env} remainder=${remainder} re-ordered pending #${resub.orderId}`,
+                  );
+                } else if (resub.status === 'filled') {
+                  const closed = row.importedFromTradier
+                    ? acct.recordImportedFill(row.optionId, resub.avgFillPrice)
+                    : acct.closeOption(row.optionId, resub.avgFillPrice);
+                  if (closed) {
+                    filled += 1;
+                    if (!row.importedFromTradier) {
+                      this.tracker?.saveEquity(
+                        this.account.getState().totalEquity,
+                        this.optionsAccount.getState().optionsPnl,
+                      );
+                    }
+                    console.log(
+                      `[tradier-reconcile] sell_to_close ${row.optionSymbol} env=${env} remainder=${remainder} re-ordered filled@${resub.avgFillPrice.toFixed(2)}`,
+                    );
+                  }
+                } else {
+                  // rejected / no_quote — `bookPartialClose` already cleared
+                  // the pending marker, so the row re-renders Close with the
+                  // reduced (remainder) contract count for a manual retry.
+                  cleared += 1;
+                  console.warn(
+                    `[tradier-reconcile] sell_to_close ${row.optionSymbol} env=${env} remainder=${remainder} re-order failed (${resub.reason}) — left open for retry`,
+                  );
+                }
               }
             }
           } else if (outcome.status === 'rejected') {

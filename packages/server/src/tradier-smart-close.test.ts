@@ -289,6 +289,53 @@ describe('reconcilePendingCloseOrder', () => {
     const outcome = await reconcilePendingCloseOrder(client, 6);
     expect(outcome.status).toBe('unknown');
   });
+
+  // TRA-416 — a terminal "rejected"-family status can still carry a non-zero
+  // `exec_quantity`: the order filled PART of its size before the broker
+  // expired / cancelled it. That must surface as `partial_fill`, not
+  // `rejected`, so the caller books the slice instead of leaking it.
+  it('reports partial_fill when a terminal order filled part of its size', async () => {
+    for (const status of ['canceled', 'expired', 'rejected', 'error']) {
+      const client = buildStatusClient({
+        id: 10,
+        status,
+        exec_quantity: 6,
+        avg_fill_price: 1.20,
+        reason_description: 'EOD expiration',
+      } as TradierOrderDetail);
+      const outcome = await reconcilePendingCloseOrder(client, 10);
+      expect(outcome).toEqual({
+        status: 'partial_fill',
+        orderId: 10,
+        avgFillPrice: 1.20,
+        filledQty: 6,
+      });
+    }
+  });
+
+  it('falls back to plain rejected when a terminal order filled nothing', async () => {
+    const client = buildStatusClient({
+      id: 12,
+      status: 'canceled',
+      exec_quantity: 0,
+      reason_description: 'user cancelled',
+    } as TradierOrderDetail);
+    const outcome = await reconcilePendingCloseOrder(client, 12);
+    expect(outcome.status).toBe('rejected');
+  });
+
+  it('treats a partial fill with no usable avg_fill_price as rejected (no $0 booking)', async () => {
+    // exec_quantity present but no price — booking the slice at $0 would
+    // corrupt P&L, so we surface `rejected` and let the portfolio reconcile
+    // pick up the contract drift instead.
+    const client = buildStatusClient({
+      id: 13,
+      status: 'expired',
+      exec_quantity: 3,
+    } as TradierOrderDetail);
+    const outcome = await reconcilePendingCloseOrder(client, 13);
+    expect(outcome.status).toBe('rejected');
+  });
 });
 
 /**
