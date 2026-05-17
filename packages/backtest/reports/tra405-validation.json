@@ -1,0 +1,948 @@
+{
+  "generatedAt": "2026-05-17T18:21:32.377Z",
+  "isWindow": {
+    "start": "2023-05-01T00:00:00.000Z",
+    "end": "2024-12-31T23:59:59.999Z"
+  },
+  "oosWindow": {
+    "start": "2025-01-01T00:00:00.000Z",
+    "end": "2026-05-17T18:16:21.117Z"
+  },
+  "initialEquity": 25000,
+  "barTimeframe": "4h",
+  "dataSource": "coinbase-exchange",
+  "costModel": "cryptoTieredCostModel (TRA-185)",
+  "cells": [
+    {
+      "symbol": "BTC-USD",
+      "costTier": "major",
+      "strategy": "reversal",
+      "is": {
+        "trades": 0,
+        "winRatePct": 0,
+        "expectancyR": 0,
+        "profitFactor": 0,
+        "sharpe": 0,
+        "maxDdPct": 0,
+        "totalPnlUsd": 0,
+        "worstCasePnlUsd": 0,
+        "returnPct": 0
+      },
+      "oos": {
+        "trades": 2,
+        "winRatePct": 100,
+        "expectancyR": 2.900168744946045,
+        "profitFactor": -1,
+        "sharpe": 1.4415809302111458,
+        "maxDdPct": 0.6607649039894301,
+        "totalPnlUsd": 624.0303981181589,
+        "worstCasePnlUsd": 624.0303981181589,
+        "returnPct": 2.4961215924726354
+      },
+      "oosBlockBootstrap": null
+    },
+    {
+      "symbol": "BTC-USD",
+      "costTier": "major",
+      "strategy": "macd_bollinger",
+      "is": {
+        "trades": 33,
+        "winRatePct": 30.303030303030305,
+        "expectancyR": 2.554973719064586,
+        "profitFactor": 1.1728091821826159,
+        "sharpe": 0.3187480960299214,
+        "maxDdPct": 3.1829010112852587,
+        "totalPnlUsd": 398.0154280545408,
+        "worstCasePnlUsd": 398.0154280545408,
+        "returnPct": 1.592061712218163
+      },
+      "oos": {
+        "trades": 24,
+        "winRatePct": 29.166666666666668,
+        "expectancyR": 5.885450972001274,
+        "profitFactor": 1.6228257360805824,
+        "sharpe": 0.7651062149175443,
+        "maxDdPct": 4.666625852462301,
+        "totalPnlUsd": 1031.2327718816712,
+        "worstCasePnlUsd": 1031.2327718816712,
+        "returnPct": 4.124931087526685
+      },
+      "oosBlockBootstrap": {
+        "p5": 24127.836609041675,
+        "p50": 26058.994662476223,
+        "p95": 27980.232327115467,
+        "worstDdPct": 9.178886302482686,
+        "blockLen": 5,
+        "iterations": 3000
+      }
+    },
+    {
+      "symbol": "BTC-USD",
+      "costTier": "major",
+      "strategy": "momentum",
+      "is": {
+        "trades": 29,
+        "winRatePct": 44.827586206896555,
+        "expectancyR": 0.3361193421834135,
+        "profitFactor": 1.5793928645323703,
+        "sharpe": 1.0491515013160844,
+        "maxDdPct": 2.1861190069978735,
+        "totalPnlUsd": 1118.5658829700021,
+        "worstCasePnlUsd": 1118.5658829700021,
+        "returnPct": 4.474263531880009
+      },
+      "oos": {
+        "trades": 34,
+        "winRatePct": 23.52941176470588,
+        "expectancyR": -0.4106455064993226,
+        "profitFactor": 0.4140676404086521,
+        "sharpe": -1.997140083121204,
+        "maxDdPct": 7.593188027207158,
+        "totalPnlUsd": -1898.297006801792,
+        "worstCasePnlUsd": -1898.297006801792,
+        "returnPct": -7.593188027207168
+      },
+      "oosBlockBootstrap": {
+        "p5": 21640.934158977114,
+        "p50": 23084.68424936613,
+        "p95": 24563.960864721885,
+        "worstDdPct": 17.801499029895204,
+        "blockLen": 5,
+        "iterations": 3000
+      }
+    },
+    {
+      "symbol": "BTC-USD",
+      "costTier": "major",
+      "strategy": "breakout_vol",
+      "is": {
+        "trades": 37,
+        "winRatePct": 32.432432432432435,
+        "expectancyR": -0.3362093412281749,
+        "profitFactor": 0.365677727889082,
+        "sharpe": -1.7825591322434868,
+        "maxDdPct": 7.202193069219779,
+        "totalPnlUsd": -1740.0353508199478,
+        "worstCasePnlUsd": -1900.2793481996628,
+        "returnPct": -6.960141403279792
+      },
+      "oos": {
+        "trades": 33,
+        "winRatePct": 30.303030303030305,
+        "expectancyR": -0.39923683327996046,
+        "profitFactor": 0.30940259902701833,
+        "sharpe": -2.149892779159168,
+        "maxDdPct": 7.475346985129878,
+        "totalPnlUsd": -1813.021256410309,
+        "worstCasePnlUsd": -1875.8241222016952,
+        "returnPct": -7.252085025641236
+      },
+      "oosBlockBootstrap": {
+        "p5": 22540.2648410983,
+        "p50": 23170.704186079445,
+        "p95": 23948.367415838686,
+        "worstDdPct": 12.315505123757656,
+        "blockLen": 5,
+        "iterations": 3000
+      }
+    },
+    {
+      "symbol": "BTC-USD",
+      "costTier": "major",
+      "strategy": "mean_reversion",
+      "is": {
+        "trades": 8,
+        "winRatePct": 50,
+        "expectancyR": 0.5714302406055887,
+        "profitFactor": 2.1936390328167787,
+        "sharpe": 0.9080970507880962,
+        "maxDdPct": 0.515952826466434,
+        "totalPnlUsd": 397.21612592686375,
+        "worstCasePnlUsd": 397.21612592686375,
+        "returnPct": 1.5888645037074551
+      },
+      "oos": {
+        "trades": 1,
+        "winRatePct": 100,
+        "expectancyR": 0.1910600918589538,
+        "profitFactor": -1,
+        "sharpe": 0.08177295868951698,
+        "maxDdPct": 0.504923840311211,
+        "totalPnlUsd": 13.008202933785366,
+        "worstCasePnlUsd": 13.008202933785366,
+        "returnPct": 0.05203281173514146
+      },
+      "oosBlockBootstrap": null
+    },
+    {
+      "symbol": "ETH-USD",
+      "costTier": "major",
+      "strategy": "reversal",
+      "is": {
+        "trades": 3,
+        "winRatePct": 0,
+        "expectancyR": -1.0196994469795342,
+        "profitFactor": 0,
+        "sharpe": -1.2454605294066556,
+        "maxDdPct": 1.5924007061833496,
+        "totalPnlUsd": -384.3868234703543,
+        "worstCasePnlUsd": -384.3868234703543,
+        "returnPct": -1.5375472938814172
+      },
+      "oos": {
+        "trades": 1,
+        "winRatePct": 100,
+        "expectancyR": 2.9707550245875907,
+        "profitFactor": -1,
+        "sharpe": 1.3273398832372356,
+        "maxDdPct": 0.2392121186696895,
+        "totalPnlUsd": 370.7219446762599,
+        "worstCasePnlUsd": 370.7219446762599,
+        "returnPct": 1.4828877787050396
+      },
+      "oosBlockBootstrap": null
+    },
+    {
+      "symbol": "ETH-USD",
+      "costTier": "major",
+      "strategy": "macd_bollinger",
+      "is": {
+        "trades": 30,
+        "winRatePct": 20,
+        "expectancyR": -0.2739467435314235,
+        "profitFactor": 0.617959074143402,
+        "sharpe": -0.8011141965009058,
+        "maxDdPct": 5.508951724781147,
+        "totalPnlUsd": -885.6485564056759,
+        "worstCasePnlUsd": -885.6485564056759,
+        "returnPct": -3.5425942256227034
+      },
+      "oos": {
+        "trades": 18,
+        "winRatePct": 16.666666666666664,
+        "expectancyR": -0.5128676311560388,
+        "profitFactor": 0.4129256775755061,
+        "sharpe": -1.2112583788712223,
+        "maxDdPct": 4.456037149798315,
+        "totalPnlUsd": -1060.083979177283,
+        "worstCasePnlUsd": -1060.083979177283,
+        "returnPct": -4.240335916709133
+      },
+      "oosBlockBootstrap": {
+        "p5": 23348.323980627683,
+        "p50": 23939.09595660929,
+        "p95": 24543.66205763904,
+        "worstDdPct": 8.500508460889977,
+        "blockLen": 5,
+        "iterations": 3000
+      }
+    },
+    {
+      "symbol": "ETH-USD",
+      "costTier": "major",
+      "strategy": "momentum",
+      "is": {
+        "trades": 26,
+        "winRatePct": 34.61538461538461,
+        "expectancyR": 0.011151156250960196,
+        "profitFactor": 0.9815022511532306,
+        "sharpe": -0.025782602564076825,
+        "maxDdPct": 3.8606208587591144,
+        "totalPnlUsd": -39.67096114743104,
+        "worstCasePnlUsd": -39.67096114743104,
+        "returnPct": -0.15868384458972418
+      },
+      "oos": {
+        "trades": 30,
+        "winRatePct": 23.333333333333332,
+        "expectancyR": -0.4128897169664834,
+        "profitFactor": 0.4113165083311988,
+        "sharpe": -1.8510286239877627,
+        "maxDdPct": 6.870084084589808,
+        "totalPnlUsd": -1625.8374585545835,
+        "worstCasePnlUsd": -1625.8374585545835,
+        "returnPct": -6.503349834218334
+      },
+      "oosBlockBootstrap": {
+        "p5": 22251.821274799167,
+        "p50": 23299.520461762564,
+        "p95": 24653.757040835575,
+        "worstDdPct": 13.80775569551633,
+        "blockLen": 5,
+        "iterations": 3000
+      }
+    },
+    {
+      "symbol": "ETH-USD",
+      "costTier": "major",
+      "strategy": "breakout_vol",
+      "is": {
+        "trades": 22,
+        "winRatePct": 27.27272727272727,
+        "expectancyR": -0.3124142034332615,
+        "profitFactor": 0.46068277586914524,
+        "sharpe": -1.3813811727655205,
+        "maxDdPct": 4.2361302860856656,
+        "totalPnlUsd": -950.268489904831,
+        "worstCasePnlUsd": -1049.5617257886288,
+        "returnPct": -3.801073959619324
+      },
+      "oos": {
+        "trades": 5,
+        "winRatePct": 20,
+        "expectancyR": -0.24764722519218738,
+        "profitFactor": 0.5875079257718218,
+        "sharpe": -0.4899700593672765,
+        "maxDdPct": 1.6499634652942,
+        "totalPnlUsd": -171.81472765625836,
+        "worstCasePnlUsd": -266.5866359521732,
+        "returnPct": -0.6872589106250334
+      },
+      "oosBlockBootstrap": null
+    },
+    {
+      "symbol": "ETH-USD",
+      "costTier": "major",
+      "strategy": "mean_reversion",
+      "is": {
+        "trades": 5,
+        "winRatePct": 80,
+        "expectancyR": 1.3886085612857662,
+        "profitFactor": 21.93177983419319,
+        "sharpe": 1.7665411069219623,
+        "maxDdPct": 0.3585215437100876,
+        "totalPnlUsd": 634.564112848171,
+        "worstCasePnlUsd": 634.564112848171,
+        "returnPct": 2.538256451392684
+      },
+      "oos": {
+        "trades": 3,
+        "winRatePct": 66.66666666666666,
+        "expectancyR": 0.17333261046995907,
+        "profitFactor": 1.4103591147094008,
+        "sharpe": 0.2158599248794413,
+        "maxDdPct": 0.5775269952936164,
+        "totalPnlUsd": 40.486221670679356,
+        "worstCasePnlUsd": 40.486221670679356,
+        "returnPct": 0.16194488668271742
+      },
+      "oosBlockBootstrap": null
+    },
+    {
+      "symbol": "SOL-USD",
+      "costTier": "high_liq",
+      "strategy": "reversal",
+      "is": {
+        "trades": 0,
+        "winRatePct": 0,
+        "expectancyR": 0,
+        "profitFactor": 0,
+        "sharpe": 0,
+        "maxDdPct": 0,
+        "totalPnlUsd": 0,
+        "worstCasePnlUsd": 0,
+        "returnPct": 0
+      },
+      "oos": {
+        "trades": 0,
+        "winRatePct": 0,
+        "expectancyR": 0,
+        "profitFactor": 0,
+        "sharpe": 0,
+        "maxDdPct": 0,
+        "totalPnlUsd": 0,
+        "worstCasePnlUsd": 0,
+        "returnPct": 0
+      },
+      "oosBlockBootstrap": null
+    },
+    {
+      "symbol": "SOL-USD",
+      "costTier": "high_liq",
+      "strategy": "macd_bollinger",
+      "is": {
+        "trades": 33,
+        "winRatePct": 39.39393939393939,
+        "expectancyR": 0.6772784768928627,
+        "profitFactor": 1.9949967289086108,
+        "sharpe": 1.3673268550238877,
+        "maxDdPct": 2.3503998604508207,
+        "totalPnlUsd": 2394.30432176968,
+        "worstCasePnlUsd": 2394.30432176968,
+        "returnPct": 9.577217287078719
+      },
+      "oos": {
+        "trades": 31,
+        "winRatePct": 29.03225806451613,
+        "expectancyR": 1.7082334497850489,
+        "profitFactor": 1.6072112209899125,
+        "sharpe": 0.8610542195381711,
+        "maxDdPct": 3.798126351869287,
+        "totalPnlUsd": 1443.7861590587027,
+        "worstCasePnlUsd": 1443.7861590587027,
+        "returnPct": 5.775144636234811
+      },
+      "oosBlockBootstrap": {
+        "p5": 23094.80231800059,
+        "p50": 26197.067308386813,
+        "p95": 30814.173136985937,
+        "worstDdPct": 13.938077018217824,
+        "blockLen": 5,
+        "iterations": 3000
+      }
+    },
+    {
+      "symbol": "SOL-USD",
+      "costTier": "high_liq",
+      "strategy": "momentum",
+      "is": {
+        "trades": 38,
+        "winRatePct": 34.21052631578947,
+        "expectancyR": -0.04857378124203828,
+        "profitFactor": 0.8713853384635263,
+        "sharpe": -0.29724774425497014,
+        "maxDdPct": 4.606029111300662,
+        "totalPnlUsd": -393.909456075427,
+        "worstCasePnlUsd": -393.909456075427,
+        "returnPct": -1.575637824301708
+      },
+      "oos": {
+        "trades": 34,
+        "winRatePct": 23.52941176470588,
+        "expectancyR": -0.2136710690451068,
+        "profitFactor": 0.6256224100307649,
+        "sharpe": -1.0773009828970457,
+        "maxDdPct": 6.1403196961060935,
+        "totalPnlUsd": -1096.124371765582,
+        "worstCasePnlUsd": -1096.124371765582,
+        "returnPct": -4.384497487062329
+      },
+      "oosBlockBootstrap": {
+        "p5": 22868.84182176422,
+        "p50": 23907.709986070266,
+        "p95": 24899.445790333128,
+        "worstDdPct": 12.579060766626702,
+        "blockLen": 5,
+        "iterations": 3000
+      }
+    },
+    {
+      "symbol": "SOL-USD",
+      "costTier": "high_liq",
+      "strategy": "breakout_vol",
+      "is": {
+        "trades": 6,
+        "winRatePct": 66.66666666666666,
+        "expectancyR": 0.16324234814867125,
+        "profitFactor": 1.2815890509669947,
+        "sharpe": 0.21571239207288764,
+        "maxDdPct": 0.6857083783573326,
+        "totalPnlUsd": 79.19385866620522,
+        "worstCasePnlUsd": 79.19385866620522,
+        "returnPct": 0.31677543466482083
+      },
+      "oos": {
+        "trades": 6,
+        "winRatePct": 33.33333333333333,
+        "expectancyR": -0.4673074281704131,
+        "profitFactor": 0.2712372833319164,
+        "sharpe": -1.16674300048677,
+        "maxDdPct": 1.6522987316125195,
+        "totalPnlUsd": -401.83556021281663,
+        "worstCasePnlUsd": -401.83556021281663,
+        "returnPct": -1.6073422408512665
+      },
+      "oosBlockBootstrap": null
+    },
+    {
+      "symbol": "SOL-USD",
+      "costTier": "high_liq",
+      "strategy": "mean_reversion",
+      "is": {
+        "trades": 1,
+        "winRatePct": 0,
+        "expectancyR": -1.0166366988955802,
+        "profitFactor": 0,
+        "sharpe": -0.40880513484082504,
+        "maxDdPct": 0.6359030024878551,
+        "totalPnlUsd": -100.71296432243284,
+        "worstCasePnlUsd": -100.71296432243284,
+        "returnPct": -0.4028518572897314
+      },
+      "oos": {
+        "trades": 4,
+        "winRatePct": 0,
+        "expectancyR": -1.022139452453887,
+        "profitFactor": 0,
+        "sharpe": -1.381033581478673,
+        "maxDdPct": 1.835783489888061,
+        "totalPnlUsd": -413.5876315059293,
+        "worstCasePnlUsd": -413.5876315059293,
+        "returnPct": -1.6543505260237172
+      },
+      "oosBlockBootstrap": null
+    },
+    {
+      "symbol": "ADA-USD",
+      "costTier": "small",
+      "strategy": "reversal",
+      "is": {
+        "trades": 2,
+        "winRatePct": 100,
+        "expectancyR": 2.071240293813652,
+        "profitFactor": -1,
+        "sharpe": 0.9284275999040109,
+        "maxDdPct": 0.5528441661559025,
+        "totalPnlUsd": 318.9315205871382,
+        "worstCasePnlUsd": 318.9315205871382,
+        "returnPct": 1.275726082348553
+      },
+      "oos": {
+        "trades": 2,
+        "winRatePct": 0,
+        "expectancyR": -1.0827258235769772,
+        "profitFactor": 0,
+        "sharpe": -1.049049500560307,
+        "maxDdPct": 1.9285222073201576,
+        "totalPnlUsd": -398.9626452167458,
+        "worstCasePnlUsd": -398.9626452167458,
+        "returnPct": -1.595850580866983
+      },
+      "oosBlockBootstrap": null
+    },
+    {
+      "symbol": "ADA-USD",
+      "costTier": "small",
+      "strategy": "macd_bollinger",
+      "is": {
+        "trades": 29,
+        "winRatePct": 27.586206896551722,
+        "expectancyR": -0.335769767819022,
+        "profitFactor": 0.42677059794796834,
+        "sharpe": -1.7137390646187327,
+        "maxDdPct": 7.7004234850497415,
+        "totalPnlUsd": -1886.6357529859984,
+        "worstCasePnlUsd": -1886.6357529859984,
+        "returnPct": -7.546543011943993
+      },
+      "oos": {
+        "trades": 22,
+        "winRatePct": 36.36363636363637,
+        "expectancyR": -0.10133881555518105,
+        "profitFactor": 0.5974508402959255,
+        "sharpe": -0.7123409674370424,
+        "maxDdPct": 5.6169570088780585,
+        "totalPnlUsd": -955.4502564974746,
+        "worstCasePnlUsd": -955.4502564974746,
+        "returnPct": -3.821801025989898
+      },
+      "oosBlockBootstrap": {
+        "p5": 22884.035295464495,
+        "p50": 24034.905257598723,
+        "p95": 25241.732611858813,
+        "worstDdPct": 12.630525592760344,
+        "blockLen": 5,
+        "iterations": 3000
+      }
+    },
+    {
+      "symbol": "ADA-USD",
+      "costTier": "small",
+      "strategy": "momentum",
+      "is": {
+        "trades": 34,
+        "winRatePct": 32.35294117647059,
+        "expectancyR": -0.030244265468062536,
+        "profitFactor": 0.7346835169354297,
+        "sharpe": -0.6814903520882098,
+        "maxDdPct": 6.179680102161366,
+        "totalPnlUsd": -816.059276174311,
+        "worstCasePnlUsd": -816.059276174311,
+        "returnPct": -3.264237104697244
+      },
+      "oos": {
+        "trades": 22,
+        "winRatePct": 27.27272727272727,
+        "expectancyR": -0.21202495011207717,
+        "profitFactor": 0.515876729812161,
+        "sharpe": -1.208431750282162,
+        "maxDdPct": 4.070349755471466,
+        "totalPnlUsd": -980.3122915137001,
+        "worstCasePnlUsd": -980.3122915137001,
+        "returnPct": -3.9212491660548
+      },
+      "oosBlockBootstrap": {
+        "p5": 22808.91703000728,
+        "p50": 24004.126074483418,
+        "p95": 25293.81607747244,
+        "worstDdPct": 12.591827921484148,
+        "blockLen": 5,
+        "iterations": 3000
+      }
+    },
+    {
+      "symbol": "ADA-USD",
+      "costTier": "small",
+      "strategy": "breakout_vol",
+      "is": {
+        "trades": 4,
+        "winRatePct": 0,
+        "expectancyR": -0.6155627547021054,
+        "profitFactor": 0,
+        "sharpe": -1.558632797759017,
+        "maxDdPct": 1.8026774211668852,
+        "totalPnlUsd": -430.1785100903811,
+        "worstCasePnlUsd": -430.1785100903811,
+        "returnPct": -1.7207140403615244
+      },
+      "oos": {
+        "trades": 1,
+        "winRatePct": 0,
+        "expectancyR": -1.036739842359978,
+        "profitFactor": 0,
+        "sharpe": -0.8538395142927213,
+        "maxDdPct": 0.6298304703776231,
+        "totalPnlUsd": -157.45761759440532,
+        "worstCasePnlUsd": -157.45761759440532,
+        "returnPct": -0.6298304703776213
+      },
+      "oosBlockBootstrap": null
+    },
+    {
+      "symbol": "ADA-USD",
+      "costTier": "small",
+      "strategy": "mean_reversion",
+      "is": {
+        "trades": 1,
+        "winRatePct": 0,
+        "expectancyR": -0.07942189261610408,
+        "profitFactor": 0,
+        "sharpe": -0.3336112705975696,
+        "maxDdPct": 0.3827596846471716,
+        "totalPnlUsd": -41.135400438013875,
+        "worstCasePnlUsd": -41.135400438013875,
+        "returnPct": -0.16454160175205548
+      },
+      "oos": {
+        "trades": 0,
+        "winRatePct": 0,
+        "expectancyR": 0,
+        "profitFactor": 0,
+        "sharpe": 0,
+        "maxDdPct": 0,
+        "totalPnlUsd": 0,
+        "worstCasePnlUsd": 0,
+        "returnPct": 0
+      },
+      "oosBlockBootstrap": null
+    },
+    {
+      "symbol": "DOGE-USD",
+      "costTier": "small",
+      "strategy": "reversal",
+      "is": {
+        "trades": 2,
+        "winRatePct": 0,
+        "expectancyR": -1.148422167642616,
+        "profitFactor": 0,
+        "sharpe": -1.1140479914203114,
+        "maxDdPct": 1.9003389245887736,
+        "totalPnlUsd": -468.4463304778732,
+        "worstCasePnlUsd": -468.4463304778732,
+        "returnPct": -1.8737853219114926
+      },
+      "oos": {
+        "trades": 0,
+        "winRatePct": 0,
+        "expectancyR": 0,
+        "profitFactor": 0,
+        "sharpe": 0,
+        "maxDdPct": 0,
+        "totalPnlUsd": 0,
+        "worstCasePnlUsd": 0,
+        "returnPct": 0
+      },
+      "oosBlockBootstrap": null
+    },
+    {
+      "symbol": "DOGE-USD",
+      "costTier": "small",
+      "strategy": "macd_bollinger",
+      "is": {
+        "trades": 20,
+        "winRatePct": 30,
+        "expectancyR": -0.43628880516637647,
+        "profitFactor": 0.31430963692481095,
+        "sharpe": -1.5317248663380034,
+        "maxDdPct": 5.763364798690273,
+        "totalPnlUsd": -1423.888036715802,
+        "worstCasePnlUsd": -1423.888036715802,
+        "returnPct": -5.695552146863208
+      },
+      "oos": {
+        "trades": 28,
+        "winRatePct": 35.714285714285715,
+        "expectancyR": -0.26087240924196237,
+        "profitFactor": 0.5004301756867081,
+        "sharpe": -1.4030656993310398,
+        "maxDdPct": 5.195988990584651,
+        "totalPnlUsd": -1298.9972476461683,
+        "worstCasePnlUsd": -1298.9972476461683,
+        "returnPct": -5.195988990584674
+      },
+      "oosBlockBootstrap": {
+        "p5": 22540.005679514845,
+        "p50": 23704.32329497182,
+        "p95": 24889.539303497117,
+        "worstDdPct": 15.440873493902036,
+        "blockLen": 5,
+        "iterations": 3000
+      }
+    },
+    {
+      "symbol": "DOGE-USD",
+      "costTier": "small",
+      "strategy": "momentum",
+      "is": {
+        "trades": 30,
+        "winRatePct": 33.33333333333333,
+        "expectancyR": -0.04759752607764613,
+        "profitFactor": 0.7782096667194398,
+        "sharpe": -0.5396037421358603,
+        "maxDdPct": 3.566155860599538,
+        "totalPnlUsd": -648.749121336948,
+        "worstCasePnlUsd": -648.749121336948,
+        "returnPct": -2.594996485347792
+      },
+      "oos": {
+        "trades": 30,
+        "winRatePct": 30,
+        "expectancyR": -0.16570741522099125,
+        "profitFactor": 0.591110656106866,
+        "sharpe": -1.2556199226152118,
+        "maxDdPct": 4.522108706633487,
+        "totalPnlUsd": -1130.5271766583737,
+        "worstCasePnlUsd": -1130.5271766583737,
+        "returnPct": -4.522108706633495
+      },
+      "oosBlockBootstrap": {
+        "p5": 22749.816555895733,
+        "p50": 23864.432148655822,
+        "p95": 24972.025805446847,
+        "worstDdPct": 15.006690698036993,
+        "blockLen": 5,
+        "iterations": 3000
+      }
+    },
+    {
+      "symbol": "DOGE-USD",
+      "costTier": "small",
+      "strategy": "breakout_vol",
+      "is": {
+        "trades": 8,
+        "winRatePct": 25,
+        "expectancyR": -0.4893658679889284,
+        "profitFactor": 0.11513460785873199,
+        "sharpe": -1.732526184182699,
+        "maxDdPct": 3.0164928547658785,
+        "totalPnlUsd": -754.1232136914705,
+        "worstCasePnlUsd": -754.1232136914705,
+        "returnPct": -3.016492854765882
+      },
+      "oos": {
+        "trades": 3,
+        "winRatePct": 0,
+        "expectancyR": -1.0390142794498145,
+        "profitFactor": 0,
+        "sharpe": -1.4787496065836823,
+        "maxDdPct": 1.9143567975851619,
+        "totalPnlUsd": -478.58919939629254,
+        "worstCasePnlUsd": -478.58919939629254,
+        "returnPct": -1.91435679758517
+      },
+      "oosBlockBootstrap": null
+    },
+    {
+      "symbol": "DOGE-USD",
+      "costTier": "small",
+      "strategy": "mean_reversion",
+      "is": {
+        "trades": 6,
+        "winRatePct": 0,
+        "expectancyR": -0.9023577520324871,
+        "profitFactor": 0,
+        "sharpe": -1.7548083490800428,
+        "maxDdPct": 2.6840213071362378,
+        "totalPnlUsd": -671.0053267840591,
+        "worstCasePnlUsd": -671.0053267840591,
+        "returnPct": -2.684021307136236
+      },
+      "oos": {
+        "trades": 5,
+        "winRatePct": 20,
+        "expectancyR": -0.45713835421701654,
+        "profitFactor": 0.3393086019524592,
+        "sharpe": -1.0109360106619583,
+        "maxDdPct": 1.9872431452067394,
+        "totalPnlUsd": -325.6072989441466,
+        "worstCasePnlUsd": -325.6072989441466,
+        "returnPct": -1.3024291957765863
+      },
+      "oosBlockBootstrap": null
+    },
+    {
+      "symbol": "LINK-USD",
+      "costTier": "mid",
+      "strategy": "reversal",
+      "is": {
+        "trades": 0,
+        "winRatePct": 0,
+        "expectancyR": 0,
+        "profitFactor": 0,
+        "sharpe": 0,
+        "maxDdPct": 0,
+        "totalPnlUsd": 0,
+        "worstCasePnlUsd": 0,
+        "returnPct": 0
+      },
+      "oos": {
+        "trades": 3,
+        "winRatePct": 33.33333333333333,
+        "expectancyR": -0.005029355996741813,
+        "profitFactor": 0.2802587466201891,
+        "sharpe": -0.5833704084034237,
+        "maxDdPct": 1.6010109094234195,
+        "totalPnlUsd": -251.6231854343142,
+        "worstCasePnlUsd": -251.6231854343142,
+        "returnPct": -1.006492741737257
+      },
+      "oosBlockBootstrap": null
+    },
+    {
+      "symbol": "LINK-USD",
+      "costTier": "mid",
+      "strategy": "macd_bollinger",
+      "is": {
+        "trades": 31,
+        "winRatePct": 29.03225806451613,
+        "expectancyR": 0.08209653486177602,
+        "profitFactor": 0.9353274708208722,
+        "sharpe": -0.08323656376947035,
+        "maxDdPct": 3.8034682518474217,
+        "totalPnlUsd": -203.02913551275418,
+        "worstCasePnlUsd": -203.02913551275418,
+        "returnPct": -0.8121165420510168
+      },
+      "oos": {
+        "trades": 26,
+        "winRatePct": 23.076923076923077,
+        "expectancyR": 0.17931127581196787,
+        "profitFactor": 0.8058498259511627,
+        "sharpe": -0.33512566160754065,
+        "maxDdPct": 5.1988611535530405,
+        "totalPnlUsd": -552.2646736315354,
+        "worstCasePnlUsd": -1102.2399819877155,
+        "returnPct": -2.2090586945261417
+      },
+      "oosBlockBootstrap": {
+        "p5": 23139.185025740757,
+        "p50": 24456.010501247343,
+        "p95": 25763.418925798087,
+        "worstDdPct": 13.660294088106644,
+        "blockLen": 5,
+        "iterations": 3000
+      }
+    },
+    {
+      "symbol": "LINK-USD",
+      "costTier": "mid",
+      "strategy": "momentum",
+      "is": {
+        "trades": 38,
+        "winRatePct": 26.31578947368421,
+        "expectancyR": -0.17727879953656414,
+        "profitFactor": 0.6150914737448944,
+        "sharpe": -1.0193344558050526,
+        "maxDdPct": 5.101597304351399,
+        "totalPnlUsd": -1210.5466844743544,
+        "worstCasePnlUsd": -1210.5466844743544,
+        "returnPct": -4.842186737897417
+      },
+      "oos": {
+        "trades": 31,
+        "winRatePct": 32.25806451612903,
+        "expectancyR": -0.022016874620836242,
+        "profitFactor": 0.8322811334004742,
+        "sharpe": -0.3902441517225802,
+        "maxDdPct": 4.16118563811552,
+        "totalPnlUsd": -382.3878204098954,
+        "worstCasePnlUsd": -382.3878204098954,
+        "returnPct": -1.5295512816395815
+      },
+      "oosBlockBootstrap": {
+        "p5": 23377.10210657775,
+        "p50": 24598.653765768555,
+        "p95": 25950.966617624475,
+        "worstDdPct": 10.66221691275209,
+        "blockLen": 5,
+        "iterations": 3000
+      }
+    },
+    {
+      "symbol": "LINK-USD",
+      "costTier": "mid",
+      "strategy": "breakout_vol",
+      "is": {
+        "trades": 6,
+        "winRatePct": 16.666666666666664,
+        "expectancyR": -0.34540912750498015,
+        "profitFactor": 0.08281389852012773,
+        "sharpe": -1.1045689381057493,
+        "maxDdPct": 1.7992245732437877,
+        "totalPnlUsd": -387.63609071476014,
+        "worstCasePnlUsd": -387.63609071476014,
+        "returnPct": -1.5505443628590405
+      },
+      "oos": {
+        "trades": 0,
+        "winRatePct": 0,
+        "expectancyR": 0,
+        "profitFactor": 0,
+        "sharpe": 0,
+        "maxDdPct": 0,
+        "totalPnlUsd": 0,
+        "worstCasePnlUsd": 0,
+        "returnPct": 0
+      },
+      "oosBlockBootstrap": null
+    },
+    {
+      "symbol": "LINK-USD",
+      "costTier": "mid",
+      "strategy": "mean_reversion",
+      "is": {
+        "trades": 1,
+        "winRatePct": 100,
+        "expectancyR": 1.9653841711380382,
+        "profitFactor": -1,
+        "sharpe": 0.7731691324445238,
+        "maxDdPct": 0,
+        "totalPnlUsd": 178.7819191677369,
+        "worstCasePnlUsd": -108.46297684796464,
+        "returnPct": 0.7151276766709476
+      },
+      "oos": {
+        "trades": 2,
+        "winRatePct": 50,
+        "expectancyR": -0.3130806693282171,
+        "profitFactor": 0.21426893260943028,
+        "sharpe": -0.34736850194777785,
+        "maxDdPct": 0.637764109772775,
+        "totalPnlUsd": -89.1367080394903,
+        "worstCasePnlUsd": -89.1367080394903,
+        "returnPct": -0.3565468321579612
+      },
+      "oosBlockBootstrap": null
+    }
+  ]
+}
