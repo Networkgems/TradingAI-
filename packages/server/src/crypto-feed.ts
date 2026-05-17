@@ -241,7 +241,12 @@ async function fetchCMCBatchQuotes(
       console.error(`[crypto-feed] CMC quotes/latest HTTP ${resp.status} for ${cmcSymbolList}`);
       return new Map();
     }
-    const json = (await resp.json()) as any;
+    const json = (await resp.json()) as {
+      data?: Record<
+        string,
+        { quote?: { USD?: { price?: number; percent_change_24h?: number; volume_24h?: number } } }
+      >;
+    };
     const results = new Map<string, CryptoQuote>();
     for (const sym of symbols) {
       const data = json?.data?.[toCMCSymbol(sym)]?.quote?.USD;

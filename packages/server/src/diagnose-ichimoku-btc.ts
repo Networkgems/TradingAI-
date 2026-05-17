@@ -25,6 +25,11 @@ import { ichimoku } from '@trading-app/engine';
 import { BacktestRunner } from '@trading-app/backtest';
 import { COMMISSION_BPS, SLIPPAGE_BPS } from './backtest-crypto.js';
 
+declare global {
+  // Diagnostic-only override knob toggled by `analyseFloor()`.
+  var __KUMO_FLOOR__: number | undefined;
+}
+
 const yf = new YahooFinance({ validation: { logErrors: false } });
 
 const SYMBOLS = ['BTC-USD', 'ETH-USD', 'SOL-USD'];
@@ -356,10 +361,10 @@ async function main() {
 
 function analyseFloor(candles: Candle[], floor: number): FunnelCounts {
   // mutate the module-level constant via a thin wrapper without touching analyse()
-  const saved = (globalThis as any).__KUMO_FLOOR__;
-  (globalThis as any).__KUMO_FLOOR__ = floor;
+  const saved = globalThis.__KUMO_FLOOR__;
+  globalThis.__KUMO_FLOOR__ = floor;
   const result = analyseWithFloor(candles, floor);
-  (globalThis as any).__KUMO_FLOOR__ = saved;
+  globalThis.__KUMO_FLOOR__ = saved;
   return result;
 }
 

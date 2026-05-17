@@ -1,6 +1,6 @@
 import { Candle, TradeSignal, Side, isValidCryptoTradingWindow } from '@trading-app/shared';
 import { randomUUID } from 'crypto';
-import { ema, emaCross } from '../indicators/ema.js';
+import { emaCross } from '../indicators/ema.js';
 import { rsi } from '../indicators/rsi.js';
 import { VwapTracker } from '../indicators/vwap.js';
 import { atr } from '../indicators/atr.js';

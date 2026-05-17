@@ -8,7 +8,7 @@
 
 import YahooFinance from 'yahoo-finance2';
 import type { Candle } from '@trading-app/shared';
-import { rsi, rsiDivergence, adx, ema, atr } from '@trading-app/engine';
+import { rsi, rsiDivergence, adx, atr } from '@trading-app/engine';
 import { detectPattern, isBullishPattern, isBearishPattern } from '@trading-app/engine';
 
 const yf = new YahooFinance({ suppressNotices: ['yahooSurvey'] });
@@ -42,7 +42,7 @@ async function diagnose(symbol: string, days: number) {
   console.log(`\n${symbol} — ${candles.length} bars over ${days}d`);
   console.log('─'.repeat(72));
 
-  let nADX_lt20 = 0, nADX_25to30 = 0, nADX_gte25 = 0, nADXNull = 0;
+  let nADX_lt20 = 0, nADX_gte25 = 0, nADXNull = 0;
   let nRSI_lt35 = 0, nRSI_gt65 = 0, nRSI_lt30 = 0;
   let nVolSpike13 = 0, nVolSpike15 = 0;
   let nBullPattern = 0, nBearPattern = 0, nDivBull = 0, nDivBear = 0;
@@ -63,7 +63,6 @@ async function diagnose(symbol: string, days: number) {
     if (a == null) nADXNull++;
     else if (a.adx < 20) nADX_lt20++;
     else if (a.adx >= 25) nADX_gte25++;
-    else nADX_25to30++;
 
     // RSI buckets
     const r = rsi(closes, rsiPeriod);

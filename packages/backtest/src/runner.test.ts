@@ -121,28 +121,6 @@ describe('reachedOneR', () => {
 
 // ── TRA-169: cost model + ambiguous-fill resolution ───────────────────────────
 
-/**
- * Hand-rolled candle stream that opens an ORB-like setup and then closes
- * either at TP (clean win), SL (clean loss), or a wide bar that straddles
- * both (ambiguous). Volumes are inflated so the ORB volume-spike + ADX gates
- * never veto the signal. Times are 1-minute spaced from a fixed UTC anchor
- * inside the 9:30–10:30 ET morning window, since the default ORB session
- * anchor + time filter target US equity hours.
- */
-function morningCandles(closes: Array<{ high: number; low: number; close: number; volume: number }>) : Candle[] {
-  // 2024-01-08 14:31:00 UTC = 9:31 AM ET (Monday) — inside morning window.
-  const anchor = Date.UTC(2024, 0, 8, 14, 31, 0);
-  return closes.map((c, i) => ({
-    symbol: 'AAPL',
-    timestamp: anchor + i * 60_000,
-    open: c.close,
-    high: c.high,
-    low: c.low,
-    close: c.close,
-    volume: c.volume,
-  }));
-}
-
 describe('BacktestRunner cost model + ambiguous fills (TRA-169)', () => {
   function baseConfig(over: Partial<BacktestConfig> = {}): BacktestConfig {
     return {

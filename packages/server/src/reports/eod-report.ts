@@ -24,15 +24,6 @@ function dateString(ts: number): string {
   return new Date(ts).toISOString().slice(0, 10);
 }
 
-function todayET(): string {
-  return new Date().toLocaleDateString('en-US', { timeZone: 'America/New_York', year: 'numeric', month: '2-digit', day: '2-digit' })
-    .split('/')
-    .reverse()
-    .join('-')
-    // mm-dd-yyyy → yyyy-mm-dd
-    .replace(/(\d{4})-(\d{2})-(\d{2})/, '$1-$3-$2');
-}
-
 function strategyLabel(t: SignalType): EodTradeEntry['strategy'] {
   switch (t) {
     case 'orb_breakout': return 'ORB';

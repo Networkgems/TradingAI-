@@ -11,6 +11,10 @@ export interface TradierFeedEvents {
   error: [err: Error];
 }
 
+// Intentional class/interface merge: this interface narrows EventEmitter's
+// `on`/`emit` to the typed `TradierFeedEvents` map. The merge is safe because
+// the interface only refines (never overrides) inherited signatures.
+// eslint-disable-next-line @typescript-eslint/no-unsafe-declaration-merging
 export declare interface TradierFeed {
   on<K extends keyof TradierFeedEvents>(event: K, listener: (...args: TradierFeedEvents[K]) => void): this;
   emit<K extends keyof TradierFeedEvents>(event: K, ...args: TradierFeedEvents[K]): boolean;

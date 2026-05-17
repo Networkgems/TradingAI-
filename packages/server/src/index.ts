@@ -49,7 +49,7 @@ import {
 import { sendPasswordResetEmail } from './email.js';
 import { rotateBackups, checkDataDirHealth } from './trade-store.js';
 import { TradierRelativeValueScannerService } from './relative-value-scanner.js';
-import { CoinbaseOrderClient, tradierBaseUrl, TradierOptionsClient, TRADIER_REJECTED_STATUSES } from '@trading-app/engine';
+import { CoinbaseOrderClient, tradierBaseUrl, TradierOptionsClient } from '@trading-app/engine';
 import { submitSmartSellToClose } from './tradier-smart-close.js';
 import type { TradierEnv } from '@trading-app/shared';
 import { fetchQuotes } from './yahoo-feed.js';
@@ -280,8 +280,6 @@ async function generateAndSaveReport(
   opts: { asOfDate?: string } = {},
 ): Promise<void> {
   const backfill = opts.asOfDate != null;
-  const snapshot = ctx.engine.getReportSnapshot();
-  const report = generateEodReport(snapshot, opts.asOfDate);
   // TRA-244 — write under the active stocks bucket (demo / live / sandbox)
   // so the per-account calendar shows only the rows that belong to it.
   const settings = getSettings(ctx.username);

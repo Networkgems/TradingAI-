@@ -85,7 +85,6 @@ describe('generateEodReport', () => {
   });
 
   it('aggregates P&L for two closed positions', () => {
-    const now = Date.now();
     const today = new Date().toLocaleDateString('en-CA', { timeZone: 'America/New_York' });
     const todayTs = new Date(`${today}T15:00:00`).getTime();
 

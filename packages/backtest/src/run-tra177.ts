@@ -127,10 +127,6 @@ const fmtMoney = (n: number) => `$${n.toFixed(2)}`;
 const fmtPct = (n: number) => `${(n * 100).toFixed(2)}%`;
 const fmtPf = (n: number) =>
   n === Infinity ? '∞' : Number.isFinite(n) ? n.toFixed(2) : '—';
-const fmtSig = (r: BacktestResult) =>
-  r.signalEdge && r.signalEdge.totalSignals > 0
-    ? `${r.signalEdge.hitRatePct.toFixed(1)}% (${r.signalEdge.reachedOneR}/${r.signalEdge.totalSignals})`
-    : '—';
 const dateStr = (ts: number) => new Date(ts).toISOString().slice(0, 10);
 
 // ── In-sample (commission-adjusted) ───────────────────────────────────────────

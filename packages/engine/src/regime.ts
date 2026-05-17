@@ -37,7 +37,7 @@ export interface RegimeDetectorOptions {
   cooldownBars?: number;
 }
 
-interface Resolved extends Required<RegimeDetectorOptions> {}
+type Resolved = Required<RegimeDetectorOptions>;
 
 const DEFAULTS: Resolved = {
   adxPeriod: 14,

@@ -13,6 +13,10 @@ export interface AlpacaFeedEvents {
   error: [err: Error];
 }
 
+// Intentional class/interface merge: this interface narrows EventEmitter's
+// `on`/`emit` to the typed `AlpacaFeedEvents` map. The merge is safe because
+// the interface only refines (never overrides) inherited signatures.
+// eslint-disable-next-line @typescript-eslint/no-unsafe-declaration-merging
 export declare interface AlpacaFeed {
   on<K extends keyof AlpacaFeedEvents>(event: K, listener: (...args: AlpacaFeedEvents[K]) => void): this;
   emit<K extends keyof AlpacaFeedEvents>(event: K, ...args: AlpacaFeedEvents[K]): boolean;

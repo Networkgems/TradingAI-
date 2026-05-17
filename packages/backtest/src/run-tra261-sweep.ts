@@ -91,7 +91,7 @@ import {
   type RegimeDetectorOptions,
   type ShortFilterContext,
 } from '@trading-app/engine';
-import type { Candle, ExitReason, Position, TradeSignal } from '@trading-app/shared';
+import type { Candle, ExitReason, Position } from '@trading-app/shared';
 import { loadOrFetch4hBars, loadOrFetchDailyBars } from './fetch-tra266-data.js';
 import { loadOrFetchFunding, lookupFundingPerHour, type FundingPoint } from './funding-feed.js';
 

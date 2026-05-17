@@ -1082,7 +1082,7 @@ function buildReport(
   lines.push(`BTC.D synthetic series: ${points.length} daily points spanning ${fmtDate(points[0].ts)} → ${fmtDate(points[points.length - 1].ts)}; SMA(50) warm-up extended back from 2022-01-01 (≥ 558d before aligned start, comfortably > 50d).`);
   lines.push('');
 
-  lines.push(`Asset-side EMA(200) warm-up: each window\'s slice covers train(${TRAIN_BARS}×4H) + test(${TEST_BARS}×4H) = ${TRAIN_BARS + TEST_BARS} bars per asset. The 1080-bar train alone is ≥ 200, so EMA(200) is fully warm at every window\'s \`testStart\`. EMA(50) slope (which needs 2 prior values) is warm at \`testStart\` for the same reason. Confirmed.`);
+  lines.push(`Asset-side EMA(200) warm-up: each window's slice covers train(${TRAIN_BARS}×4H) + test(${TEST_BARS}×4H) = ${TRAIN_BARS + TEST_BARS} bars per asset. The 1080-bar train alone is ≥ 200, so EMA(200) is fully warm at every window's \`testStart\`. EMA(50) slope (which needs 2 prior values) is warm at \`testStart\` for the same reason. Confirmed.`);
   lines.push('');
 
   lines.push('Risk knobs (binding, UNCHANGED): 1% account risk per trade, ATR-2.0 stop below entry, 1:2 R:R minimum target, ATR-trail engages at +1R favorable (trail = high-water close − 2.0×ATR(14)).');

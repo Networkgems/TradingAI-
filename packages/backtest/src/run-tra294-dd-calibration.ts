@@ -404,18 +404,6 @@ function fmtDate(ts: number): string {
   return new Date(ts).toISOString().slice(0, 10);
 }
 
-interface PerWindowOutput {
-  index: number;
-  testStartTs: number;
-  testEndTs: number;
-  bhRollingDdPct: number;
-  bhTotalDdPct: number;
-  bhFinalEquityUsd: number;
-  syntheticMc: MCSummary;
-  perAssetSigmaWindow: Record<string, number>;
-  portfolioSigmaWindow: number;
-}
-
 interface FullOutput {
   generatedAt: string;
   granularity: '4h';

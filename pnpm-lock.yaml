@@ -20,6 +20,9 @@ importers:
       eslint-plugin-react-hooks:
         specifier: ^5.2.0
         version: 5.2.0(eslint@9.39.4)
+      globals:
+        specifier: ^14.0.0
+        version: 14.0.0
       typescript:
         specifier: ^5.4.5
         version: 5.9.3
