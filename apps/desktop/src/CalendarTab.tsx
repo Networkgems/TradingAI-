@@ -33,7 +33,9 @@ function fmt(n: number, decimals = 2) {
 }
 
 function fmtDollar(n: number) {
-  const sign = n >= 0 ? '+' : '';
+  // TRA-424 — same negative-sign bug as lib/format.ts#fmtDollar: `Math.abs(n)`
+  // strips the sign so the negative branch must prepend '-' explicitly.
+  const sign = n >= 0 ? '+' : '-';
   return `${sign}$${fmt(Math.abs(n))}`;
 }
 

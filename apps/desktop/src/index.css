@@ -775,6 +775,10 @@ tr:hover td { background: var(--bg-hover); }
   font-size: 0.7rem;
   padding: 0.25rem 0.6rem;
   transition: color 0.15s, border-color 0.15s;
+  /* TRA-424 — keep header action labels ("⏹ Stop Trading", "👤 Profile ▼")
+     on one line; without this they wrap in a crowded header and the leading
+     icon overlaps the clipped second line. */
+  white-space: nowrap;
 }
 
 .logout-btn:hover { color: var(--text); border-color: var(--text); }

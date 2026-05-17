@@ -13,7 +13,11 @@ export function fmt(n: number | null | undefined, decimals = 2) {
 
 export function fmtDollar(n: number | null | undefined) {
   if (n == null || !Number.isFinite(n) || Math.abs(n) >= 1e15) return '—';
-  const sign = n >= 0 ? '+' : '';
+  // TRA-424 — negative deltas dropped their sign: `Math.abs(n)` strips it and
+  // the negative branch prepended '' instead of '-', so a −$0.19 change
+  // rendered as "$0.19" (red, but no minus). The explicit '-' is required
+  // here because fmt() receives Math.abs(n) and never sees the sign.
+  const sign = n >= 0 ? '+' : '-';
   return `${sign}$${fmt(Math.abs(n))}`;
 }
 
