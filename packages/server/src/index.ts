@@ -3076,6 +3076,8 @@ scheduler.start({
 });
 
 httpServer.listen(PORT, () => {
+  // Intentional: console, not the structured logger — this is the genuine
+  // startup banner an operator expects on stdout when the process comes up.
   console.log(`Trading server running on http://localhost:${PORT}`);
   console.log(`WebSocket endpoint: ws://localhost:${PORT}`);
 });
