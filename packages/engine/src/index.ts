@@ -51,6 +51,7 @@ export {
   underlyingFromOcc,
   parseOccSymbol,
   parseTradierPositions,
+  parseTradierEquityPositions,
   parseTradierHistory,
   parseTradierCashEvents,
   roundToCent,
@@ -67,6 +68,7 @@ export type {
   TradierEquityQuote,
   TradierAccountBalance,
   TradierOpenOptionPosition,
+  TradierOpenEquityPosition,
   TradierTradeHistoryFill,
   TradierCashEvent,
 } from './tradier/index.js';

@@ -55,6 +55,95 @@ interface TradierOrderEnvelope {
   errors?: { error: string | string[] };
 }
 
+/**
+ * TRA-415 — open equity (stock) position imported from Tradier's
+ * `/accounts/{id}/positions` endpoint. That endpoint returns equity and
+ * option rows together; option legs are dropped at the parser by symbol
+ * shape (OCC option symbols decode, plain tickers don't). Holds the
+ * minimum the engine's live equity mirror needs to surface the position.
+ */
+export interface TradierOpenEquityPosition {
+  /** Plain equity ticker (e.g. `AAPL`). */
+  symbol: string;
+  /** Shares held. Always positive — `side` carries the long/short sign. */
+  quantity: number;
+  /** `'buy'` for a long position, `'sell'` for a short. */
+  side: Side;
+  /** Per-share cost basis (Tradier `cost_basis` ÷ shares). */
+  costBasis: number;
+  /** When Tradier acquired the position (ms epoch); falls back to `Date.now()`. */
+  acquiredAt: number;
+  /** Tradier's numeric position id, when the API surfaces one. */
+  tradierPositionId?: number;
+}
+
+/** Raw shape of a single row in the Tradier `/positions` envelope. */
+interface TradierRawPositionRow {
+  symbol?: unknown;
+  quantity?: unknown;
+  cost_basis?: unknown;
+  date_acquired?: unknown;
+  id?: unknown;
+}
+
+/** Tradier returns `T | T[]`, sometimes `null`/empty string when there are none. */
+interface TradierRawPositionsEnvelope {
+  positions?:
+    | { position?: TradierRawPositionRow | TradierRawPositionRow[] }
+    | string
+    | null;
+}
+
+/**
+ * Matches an OCC option symbol — ROOT (1-6 letters) + YYMMDD + C/P +
+ * 8-digit strike. Equity tickers never match, so a non-match is the
+ * discriminator that keeps option legs out of the equity parser.
+ */
+const OCC_OPTION_SYMBOL = /^[A-Z]{1,6}\d{6}[CP]\d{8}$/;
+
+/**
+ * TRA-415 — normalise the Tradier `/accounts/{id}/positions` envelope into
+ * a list of open equity positions. Exported so unit tests can exercise the
+ * parser without mocking `fetch`. Drops option legs (their OCC symbols
+ * match {@link OCC_OPTION_SYMBOL}), zero-quantity rows, and any row whose
+ * symbol / quantity / cost basis can't be coerced — we'd rather omit a row
+ * than poison the live equity mirror with garbage. A negative `quantity`
+ * is a short position; it surfaces as `side: 'sell'` with a positive
+ * `quantity` so downstream consumers don't have to special-case the sign.
+ */
+export function parseTradierEquityPositions(
+  envelope: TradierRawPositionsEnvelope | null,
+): TradierOpenEquityPosition[] {
+  if (!envelope || typeof envelope.positions !== 'object' || envelope.positions == null) {
+    return [];
+  }
+  const raw = envelope.positions.position;
+  const rows = raw == null ? [] : Array.isArray(raw) ? raw : [raw];
+  const out: TradierOpenEquityPosition[] = [];
+  for (const row of rows) {
+    if (typeof row.symbol !== 'string' || row.symbol === '') continue;
+    // Option legs decode as OCC symbols — they go through the options path.
+    if (OCC_OPTION_SYMBOL.test(row.symbol)) continue;
+    if (typeof row.quantity !== 'number' || !Number.isFinite(row.quantity) || row.quantity === 0) {
+      continue;
+    }
+    if (typeof row.cost_basis !== 'number' || !Number.isFinite(row.cost_basis)) continue;
+    const shares = Math.abs(row.quantity);
+    const costBasis = Math.abs(row.cost_basis) / shares;
+    if (!Number.isFinite(costBasis) || costBasis <= 0) continue;
+    const acquiredMs = Date.parse(String(row.date_acquired));
+    out.push({
+      symbol: row.symbol,
+      quantity: shares,
+      side: row.quantity > 0 ? 'buy' : 'sell',
+      costBasis,
+      acquiredAt: Number.isFinite(acquiredMs) ? acquiredMs : Date.now(),
+      ...(typeof row.id === 'number' ? { tradierPositionId: row.id } : {}),
+    });
+  }
+  return out;
+}
+
 const SANDBOX_BASE = 'https://sandbox.tradier.com/v1';
 const PROD_BASE = 'https://api.tradier.com/v1';
 
@@ -176,6 +265,26 @@ export class TradierOrderClient {
       await sleep(Math.min(intervalMs, remaining));
     }
     return last;
+  }
+
+  /**
+   * TRA-415 — list open equity positions held in the configured Tradier
+   * account. Tradier's `/accounts/{id}/positions` endpoint returns equity
+   * and option rows together; option legs are filtered out at the parser
+   * by symbol shape. Used by the engine's periodic equity reconcile so a
+   * stock opened / closed out-of-band (on Tradier's web UI, or by a failed
+   * mirror order) flows back into local state. Returns `[]` on a non-2xx
+   * response so a transient Tradier failure can't poison the live equity
+   * mirror with a half-fetched list.
+   */
+  async listOpenEquityPositions(): Promise<TradierOpenEquityPosition[]> {
+    const resp = await fetch(
+      `${this.baseUrl}/accounts/${encodeURIComponent(this.accountId)}/positions`,
+      { headers: { Authorization: this.headers.Authorization, Accept: 'application/json' } },
+    );
+    if (!resp.ok) return [];
+    const data = (await resp.json()) as TradierRawPositionsEnvelope;
+    return parseTradierEquityPositions(data);
   }
 
   protected async postOrder(body: URLSearchParams): Promise<TradierOrderResponse> {

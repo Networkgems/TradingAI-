@@ -411,6 +411,24 @@ export class SignalEngine {
   private liveEquityPositions: Map<string, Position> = new Map();
   /** TRA-335 — Tradier order id (entry leg) → local Position id, used for reconcile. */
   private liveEquityOrderIds: Map<string, number | string> = new Map();
+  /**
+   * TRA-415 — last successful (or attempted) Tradier live-equity reconcile.
+   * Compared against `TRADIER_PORTFOLIO_RECONCILE_MS` to gate the per-tick
+   * sweep so we never list positions more than once per cadence window even
+   * if the tick fires faster. Independent of `lastTradierPortfolioReconcileAt`
+   * (the options sweep) so the two cadences don't shadow each other.
+   */
+  private lastTradierEquityReconcileAt = 0;
+  /**
+   * TRA-415 — whether the boot-time live-equity reconcile has run. The first
+   * tick forces a sweep (bypassing the cadence + idle-account throttle) so
+   * equity positions opened out-of-band before the engine started are
+   * imported even though the live mirror starts empty on every boot. Stays
+   * `false` until a sweep actually reaches Tradier, so a boot with no creds
+   * yet (live mode toggled on later via settings) still gets one forced
+   * sweep on the first tick after the client is built.
+   */
+  private equityReconciledOnBoot = false;
 
   /**
    * TRA-389 — when true, the engine consults the latest premarket
@@ -712,6 +730,11 @@ export class SignalEngine {
     // must close them in Tradier or re-import via reconciliation.
     this.liveEquityPositions.clear();
     this.liveEquityOrderIds.clear();
+    // TRA-415 — re-arm the forced boot sweep so the next tick re-imports any
+    // equity positions still open on Tradier (the reset wiped the mirror but
+    // not the broker-side positions).
+    this.equityReconciledOnBoot = false;
+    this.lastTradierEquityReconcileAt = 0;
     if (this.tracker) {
       this.tracker.setInitialEquity(equity);
       this.tracker.saveEquity(equity, this.optionsAccount.getState().optionsPnl);
@@ -972,6 +995,28 @@ export class SignalEngine {
     } catch (err: unknown) {
       console.warn(
         '[tradier-portfolio-reconcile] sweep threw:',
+        err instanceof Error ? err.message : String(err),
+      );
+    }
+    // TRA-415 — equity-position reconcile so a stock opened / closed
+    // out-of-band on the Tradier UI (or left behind by a failed mirror
+    // order) flows back into the live equity mirror between ticks. The
+    // first tick forces a sweep (bypassing the cadence + idle throttle)
+    // since the mirror starts empty on every boot and would otherwise be
+    // skipped by the idle-account throttle. Errors are caught inside the
+    // method; this guard only covers an unexpected throw.
+    try {
+      const bootSweep = !this.equityReconciledOnBoot;
+      const summary = await this.reconcileLiveEquityPortfolio({ force: bootSweep });
+      // Flip the boot flag only once a sweep actually reached Tradier so a
+      // boot with no creds yet keeps the forced sweep armed for the tick
+      // after the equity client is built.
+      if (bootSweep && summary.skipped === null) {
+        this.equityReconciledOnBoot = true;
+      }
+    } catch (err: unknown) {
+      console.warn(
+        '[tradier-equity-reconcile] sweep threw:',
         err instanceof Error ? err.message : String(err),
       );
     }
@@ -2396,6 +2441,167 @@ export class SignalEngine {
       );
     }
     return { skipped: null, ...summary };
+  }
+
+  /**
+   * TRA-415 — periodic reconcile for live **equity** positions, the
+   * equity-side counterpart of {@link reconcileLivePortfolio}. The options
+   * sweep above covers Tradier option legs; equity positions opened or
+   * closed out-of-band (on the Tradier web UI, or left behind by a failed
+   * mirror order) had no periodic reconcile, so stale equity state could
+   * persist indefinitely.
+   *
+   * Pulls live equity positions from {@link tradierLiveEquityClient}
+   * (Tradier's positions endpoint returns equity + option rows; the parser
+   * keeps only the equity rows) and merges them into the TRA-335 live
+   * equity mirror via {@link mergeLiveEquityPositions}: out-of-band opens
+   * are imported as `importedFromTradier` rows with sentinel TP/SL, rows
+   * closed on Tradier are dropped, and partial fills update the quantity.
+   *
+   * Throttling mirrors the options sweep:
+   *   • gated on `mode === 'live'` and a configured equity client,
+   *   • a once-per-`TRADIER_PORTFOLIO_RECONCILE_MS` cadence,
+   *   • an idle-account skip when the local mirror is empty — there's
+   *     nothing for a sweep to cross-check, and a quiet account doesn't
+   *     need to be polled.
+   *
+   * `force` bypasses the cadence + idle-account checks. The tick caller
+   * passes it on the first tick so the boot sweep imports out-of-band
+   * positions even though the mirror always starts empty (the live equity
+   * store isn't persisted across restarts).
+   *
+   * Returns a counter so the tick caller can log activity.
+   */
+  async reconcileLiveEquityPortfolio(opts: { force?: boolean } = {}): Promise<{
+    skipped: 'mode' | 'no-client' | 'cadence' | 'empty' | null;
+    added: number;
+    updated: number;
+    removed: number;
+    total: number;
+  }> {
+    const empty = { added: 0, updated: 0, removed: 0, total: 0 };
+    if (this.mode !== 'live') return { skipped: 'mode', ...empty };
+    const client = this.tradierLiveEquityClient;
+    if (!client) return { skipped: 'no-client', ...empty };
+
+    const now = Date.now();
+    if (!opts.force && now - this.lastTradierEquityReconcileAt < TRADIER_PORTFOLIO_RECONCILE_MS) {
+      return { skipped: 'cadence', ...empty };
+    }
+
+    // Idle-account throttle (mirrors `reconcileLivePortfolio`): when the
+    // local mirror is empty there's nothing for a sweep to cross-check, so
+    // skip the network round-trip. Leave the timestamp unchanged so the
+    // next non-empty tick reconciles immediately rather than waiting out
+    // the cadence. A forced (boot) sweep bypasses this so out-of-band
+    // positions present before the engine started are still imported.
+    if (!opts.force && this.liveEquityPositions.size === 0) {
+      return { skipped: 'empty', ...empty };
+    }
+
+    let positions: readonly import('@trading-app/engine').TradierOpenEquityPosition[];
+    try {
+      positions = await client.listOpenEquityPositions();
+    } catch (err: unknown) {
+      console.warn(
+        `[tradier-equity-reconcile] list positions failed: ${err instanceof Error ? err.message : String(err)}`,
+      );
+      // Bump the timestamp so a Tradier outage doesn't burn the cadence
+      // budget with a tight retry loop; the next tick after the window
+      // tries again.
+      this.lastTradierEquityReconcileAt = now;
+      return { skipped: null, ...empty };
+    }
+
+    this.lastTradierEquityReconcileAt = now;
+    const summary = this.mergeLiveEquityPositions(positions);
+    if (summary.added + summary.updated + summary.removed > 0) {
+      console.log(
+        `[tradier-equity-reconcile] added=${summary.added} updated=${summary.updated} removed=${summary.removed} total=${summary.total}`,
+      );
+    }
+    return { skipped: null, ...summary };
+  }
+
+  /**
+   * TRA-415 — merge a freshly-listed set of Tradier equity positions into
+   * the live equity mirror. Reconciliation rules mirror
+   * {@link PaperOptionsAccount.reconcileTradierPositions}:
+   *   • Match against existing rows by `symbol`. An imported row whose
+   *     quantity / side / cost basis drifted (partial fill) is updated
+   *     in-place rather than orphaned.
+   *   • Engine-opened rows (no `importedFromTradier` flag) are left
+   *     untouched even when they share a symbol with a Tradier row — the
+   *     mirror path already tracks those, and we don't want to double-count.
+   *   • Imported rows whose symbol no longer appears in Tradier's payload
+   *     are dropped (the position was closed on Tradier).
+   * Imported rows get sentinel TP/SL (a long can never reach a `0` stop
+   * or a `+Infinity` target — and the inverse for a short) so no exit path
+   * could ever fire on an imported row.
+   */
+  private mergeLiveEquityPositions(
+    positions: readonly import('@trading-app/engine').TradierOpenEquityPosition[],
+  ): { added: number; updated: number; removed: number; total: number } {
+    const tradierBySymbol = new Map<string, import('@trading-app/engine').TradierOpenEquityPosition>();
+    for (const p of positions) tradierBySymbol.set(p.symbol, p);
+
+    let added = 0;
+    let updated = 0;
+    let removed = 0;
+
+    // Drop imported rows Tradier no longer reports (closed elsewhere).
+    for (const [id, pos] of this.liveEquityPositions) {
+      if (!pos.importedFromTradier) continue;
+      if (!tradierBySymbol.has(pos.symbol)) {
+        this.liveEquityPositions.delete(id);
+        this.liveEquityOrderIds.delete(id);
+        removed += 1;
+      }
+    }
+
+    for (const incoming of positions) {
+      const existing = Array.from(this.liveEquityPositions.values()).find(
+        p => p.symbol === incoming.symbol,
+      );
+      if (existing) {
+        // Engine-opened row covers this symbol — skip so we don't conflict
+        // with the mirror path's own bookkeeping (dedupe).
+        if (!existing.importedFromTradier) continue;
+        const qtyChanged = existing.quantity !== incoming.quantity;
+        const sideChanged = existing.side !== incoming.side;
+        const basisChanged = Math.abs(existing.entryPrice - incoming.costBasis) > 1e-6;
+        if (qtyChanged || sideChanged || basisChanged) {
+          existing.quantity = incoming.quantity;
+          existing.side = incoming.side;
+          existing.entryPrice = incoming.costBasis;
+          existing.stopLoss = incoming.side === 'buy' ? 0 : Number.POSITIVE_INFINITY;
+          existing.takeProfit = incoming.side === 'buy' ? Number.POSITIVE_INFINITY : 0;
+          updated += 1;
+        }
+        continue;
+      }
+
+      const position: Position = {
+        id: randomUUID(),
+        symbol: incoming.symbol,
+        side: incoming.side,
+        signalType: 'tradier_import',
+        entryPrice: incoming.costBasis,
+        quantity: incoming.quantity,
+        // Sentinel TP/SL — a long never reaches a `0` stop / `+Infinity`
+        // target, a short never reaches the inverse, so no exit path can
+        // fire on an imported row.
+        stopLoss: incoming.side === 'buy' ? 0 : Number.POSITIVE_INFINITY,
+        takeProfit: incoming.side === 'buy' ? Number.POSITIVE_INFINITY : 0,
+        openedAt: incoming.acquiredAt,
+        mode: 'live',
+        importedFromTradier: true,
+      };
+      this.liveEquityPositions.set(position.id, position);
+      added += 1;
+    }
+
+    return { added, updated, removed, total: positions.length };
   }
 
   /**

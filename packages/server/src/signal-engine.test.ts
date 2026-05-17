@@ -18,6 +18,7 @@ import type {
   MarketReview,
   MarketReviewGates,
   MarketRegimeLabel,
+  Position,
 } from '@trading-app/shared';
 
 // Inside an ET trading window: 10:00 AM ET on a Tuesday → 14:00 UTC during EDT.
@@ -1804,6 +1805,269 @@ describe('SignalEngine — TRA-356 periodic portfolio reconcile', () => {
     const second = await engine.reconcileLivePortfolio();
     expect(second.skipped).toBe('cadence');
     expect(stub.listOpenOptionPositions).toHaveBeenCalledTimes(1);
+  });
+});
+
+// TRA-415 — periodic equity-position reconcile while live mode is active.
+// The equity-side counterpart of the TRA-356 options sweep: the engine
+// pulls Tradier's open equity positions on a cadence and merges them into
+// the TRA-335 live equity mirror so a stock opened / closed out-of-band
+// (on Tradier's web UI, or by a failed mirror order) flows back into local
+// state. These tests drive `reconcileLiveEquityPortfolio` directly so we
+// can assert import / update / remove + the skip / dedupe behaviours.
+describe('SignalEngine — TRA-415 periodic equity-position reconcile', () => {
+  interface ListEquityStub {
+    listOpenEquityPositions: ReturnType<typeof vi.fn>;
+  }
+  type EquityInternals = {
+    mode: 'demo' | 'live';
+    tradierLiveEquityClient: ListEquityStub | null;
+    liveEquityPositions: Map<string, Position>;
+    liveEquityOrderIds: Map<string, number | string>;
+    lastTradierEquityReconcileAt: number;
+    equityReconciledOnBoot: boolean;
+  };
+
+  function asEquityInternals(engine: SignalEngine): EquityInternals {
+    return engine as unknown as EquityInternals;
+  }
+
+  function setupEquityEngine(opts: {
+    mode?: 'demo' | 'live';
+    client?: ListEquityStub | null;
+  } = {}) {
+    const engine = new SignalEngine();
+    const internals = asEquityInternals(engine);
+    internals.mode = opts.mode ?? 'live';
+    internals.tradierLiveEquityClient = opts.client ?? null;
+    return engine;
+  }
+
+  // Seed a row directly into the live equity mirror. `imported` rows carry
+  // `importedFromTradier: true` (a prior reconcile sweep); engine-opened
+  // rows leave the flag absent.
+  function seedEquityRow(
+    engine: SignalEngine,
+    overrides: Partial<Position> & { imported?: boolean } = {},
+  ): Position {
+    const { imported, ...rest } = overrides;
+    const pos: Position = {
+      id: rest.id ?? `pos-${rest.symbol ?? 'AAPL'}`,
+      symbol: 'AAPL',
+      side: 'buy',
+      signalType: imported ? 'tradier_import' : 'orb_breakout',
+      entryPrice: 100,
+      quantity: 10,
+      stopLoss: imported ? 0 : 95,
+      takeProfit: imported ? Number.POSITIVE_INFINITY : 110,
+      openedAt: TRADING_TIME,
+      mode: 'live',
+      ...(imported ? { importedFromTradier: true } : {}),
+      ...rest,
+    };
+    asEquityInternals(engine).liveEquityPositions.set(pos.id, pos);
+    return pos;
+  }
+
+  function tradierEquityRow(overrides: Record<string, unknown> = {}) {
+    return {
+      symbol: 'AAPL',
+      quantity: 10,
+      side: 'buy' as const,
+      costBasis: 100,
+      acquiredAt: TRADING_TIME,
+      ...overrides,
+    };
+  }
+
+  it('skips the network call entirely in demo mode', async () => {
+    const stub: ListEquityStub = { listOpenEquityPositions: vi.fn() };
+    const engine = setupEquityEngine({ mode: 'demo', client: stub });
+
+    const summary = await engine.reconcileLiveEquityPortfolio();
+
+    expect(summary.skipped).toBe('mode');
+    expect(stub.listOpenEquityPositions).not.toHaveBeenCalled();
+  });
+
+  it('skips when no Tradier equity client is configured', async () => {
+    const engine = setupEquityEngine({ mode: 'live', client: null });
+
+    const summary = await engine.reconcileLiveEquityPortfolio();
+
+    expect(summary.skipped).toBe('no-client');
+  });
+
+  it('skips the network call when the live equity mirror is empty (idle account)', async () => {
+    const stub: ListEquityStub = { listOpenEquityPositions: vi.fn() };
+    const engine = setupEquityEngine({ client: stub });
+
+    const summary = await engine.reconcileLiveEquityPortfolio();
+
+    expect(summary.skipped).toBe('empty');
+    expect(stub.listOpenEquityPositions).not.toHaveBeenCalled();
+    // Idle skip leaves the cadence timestamp untouched so the next non-empty
+    // tick reconciles immediately.
+    expect(asEquityInternals(engine).lastTradierEquityReconcileAt).toBe(0);
+  });
+
+  it('force bypasses the idle throttle so the boot sweep imports a cold-start position', async () => {
+    const stub: ListEquityStub = {
+      listOpenEquityPositions: vi.fn().mockResolvedValue([tradierEquityRow()]),
+    };
+    const engine = setupEquityEngine({ client: stub });
+
+    // Mirror is empty — a non-forced sweep would skip. The boot sweep forces.
+    const summary = await engine.reconcileLiveEquityPortfolio({ force: true });
+
+    expect(summary.skipped).toBeNull();
+    expect(summary.added).toBe(1);
+    expect(stub.listOpenEquityPositions).toHaveBeenCalledTimes(1);
+  });
+
+  it('imports an out-of-band open as an importedFromTradier row with sentinel TP/SL', async () => {
+    const stub: ListEquityStub = {
+      listOpenEquityPositions: vi.fn().mockResolvedValue([
+        tradierEquityRow({ symbol: 'MSFT', quantity: 5, costBasis: 420 }),
+      ]),
+    };
+    const engine = setupEquityEngine({ client: stub });
+    // Seed an unrelated row so the idle throttle lets the sweep through.
+    seedEquityRow(engine, { id: 'seed', symbol: 'NVDA', imported: true });
+
+    const summary = await engine.reconcileLiveEquityPortfolio();
+
+    expect(summary.added).toBe(1);
+    const rows = Array.from(asEquityInternals(engine).liveEquityPositions.values());
+    const msft = rows.find(r => r.symbol === 'MSFT');
+    expect(msft).toBeDefined();
+    expect(msft?.importedFromTradier).toBe(true);
+    expect(msft?.quantity).toBe(5);
+    expect(msft?.entryPrice).toBe(420);
+    expect(msft?.signalType).toBe('tradier_import');
+    // Sentinel TP/SL — a long can never reach a 0 stop or a +Infinity target.
+    expect(msft?.stopLoss).toBe(0);
+    expect(msft?.takeProfit).toBe(Number.POSITIVE_INFINITY);
+  });
+
+  it('imports a short out-of-band open with inverted sentinel TP/SL', async () => {
+    const stub: ListEquityStub = {
+      listOpenEquityPositions: vi.fn().mockResolvedValue([
+        tradierEquityRow({ symbol: 'TSLA', side: 'sell', quantity: 3, costBasis: 250 }),
+      ]),
+    };
+    const engine = setupEquityEngine({ client: stub });
+    seedEquityRow(engine, { id: 'seed', symbol: 'NVDA', imported: true });
+
+    await engine.reconcileLiveEquityPortfolio();
+
+    const tsla = Array.from(asEquityInternals(engine).liveEquityPositions.values())
+      .find(r => r.symbol === 'TSLA');
+    expect(tsla?.side).toBe('sell');
+    expect(tsla?.stopLoss).toBe(Number.POSITIVE_INFINITY);
+    expect(tsla?.takeProfit).toBe(0);
+  });
+
+  it('updates the quantity of an imported row on a partial fill', async () => {
+    const stub: ListEquityStub = {
+      listOpenEquityPositions: vi.fn().mockResolvedValue([
+        tradierEquityRow({ quantity: 7, costBasis: 101 }),
+      ]),
+    };
+    const engine = setupEquityEngine({ client: stub });
+    const seeded = seedEquityRow(engine, { id: 'imp', imported: true, quantity: 10, entryPrice: 100 });
+
+    const summary = await engine.reconcileLiveEquityPortfolio();
+
+    expect(summary.updated).toBe(1);
+    expect(summary.added).toBe(0);
+    expect(seeded.quantity).toBe(7);
+    expect(seeded.entryPrice).toBe(101);
+    // Still the same row — updated in place, not orphaned.
+    expect(asEquityInternals(engine).liveEquityPositions.size).toBe(1);
+  });
+
+  it('drops an imported row Tradier no longer reports (closed out-of-band)', async () => {
+    const stub: ListEquityStub = {
+      listOpenEquityPositions: vi.fn().mockResolvedValue([]),
+    };
+    const engine = setupEquityEngine({ client: stub });
+    seedEquityRow(engine, { id: 'imp', imported: true });
+    asEquityInternals(engine).liveEquityOrderIds.set('imp', 12345);
+
+    const summary = await engine.reconcileLiveEquityPortfolio();
+
+    expect(summary.removed).toBe(1);
+    expect(asEquityInternals(engine).liveEquityPositions.size).toBe(0);
+    expect(asEquityInternals(engine).liveEquityOrderIds.has('imp')).toBe(false);
+  });
+
+  it('does not double-import or drop an engine-opened row sharing the Tradier symbol', async () => {
+    const stub: ListEquityStub = {
+      listOpenEquityPositions: vi.fn().mockResolvedValue([tradierEquityRow()]),
+    };
+    const engine = setupEquityEngine({ client: stub });
+    // Engine-opened row (no importedFromTradier flag) for the same symbol.
+    seedEquityRow(engine, { id: 'engine', symbol: 'AAPL' });
+
+    const summary = await engine.reconcileLiveEquityPortfolio();
+
+    expect(summary.added).toBe(0);
+    expect(summary.updated).toBe(0);
+    expect(summary.removed).toBe(0);
+    const rows = asEquityInternals(engine).liveEquityPositions;
+    expect(rows.size).toBe(1);
+    expect(rows.get('engine')?.importedFromTradier).toBeUndefined();
+  });
+
+  it('leaves an engine-opened row untouched even when Tradier reports nothing', async () => {
+    const stub: ListEquityStub = {
+      listOpenEquityPositions: vi.fn().mockResolvedValue([]),
+    };
+    const engine = setupEquityEngine({ client: stub });
+    seedEquityRow(engine, { id: 'engine', symbol: 'AAPL' });
+
+    const summary = await engine.reconcileLiveEquityPortfolio();
+
+    expect(summary.removed).toBe(0);
+    expect(asEquityInternals(engine).liveEquityPositions.has('engine')).toBe(true);
+  });
+
+  it('enforces the cadence — a second call inside the window is short-circuited', async () => {
+    const stub: ListEquityStub = {
+      listOpenEquityPositions: vi.fn().mockResolvedValue([tradierEquityRow()]),
+    };
+    const engine = setupEquityEngine({ client: stub });
+    seedEquityRow(engine, { id: 'imp', imported: true });
+
+    const first = await engine.reconcileLiveEquityPortfolio();
+    expect(first.skipped).toBeNull();
+
+    const second = await engine.reconcileLiveEquityPortfolio();
+    expect(second.skipped).toBe('cadence');
+    expect(stub.listOpenEquityPositions).toHaveBeenCalledTimes(1);
+
+    vi.setSystemTime(TRADING_TIME + 31_000);
+    const third = await engine.reconcileLiveEquityPortfolio();
+    expect(third.skipped).toBeNull();
+    expect(stub.listOpenEquityPositions).toHaveBeenCalledTimes(2);
+  });
+
+  it('swallows list-positions failures and bumps the cadence timestamp so we do not tight-loop', async () => {
+    const stub: ListEquityStub = {
+      listOpenEquityPositions: vi.fn().mockRejectedValue(new Error('socket reset')),
+    };
+    const engine = setupEquityEngine({ client: stub });
+    seedEquityRow(engine, { id: 'imp', imported: true });
+
+    const summary = await engine.reconcileLiveEquityPortfolio();
+
+    expect(summary.skipped).toBeNull();
+    expect(summary.added).toBe(0);
+    expect(asEquityInternals(engine).lastTradierEquityReconcileAt).toBe(TRADING_TIME);
+    const second = await engine.reconcileLiveEquityPortfolio();
+    expect(second.skipped).toBe('cadence');
+    expect(stub.listOpenEquityPositions).toHaveBeenCalledTimes(1);
   });
 });
 

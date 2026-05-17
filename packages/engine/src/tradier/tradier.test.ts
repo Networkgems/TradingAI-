@@ -1,5 +1,5 @@
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
-import { TradierOrderClient, tradierBaseUrl } from './order-client.js';
+import { TradierOrderClient, tradierBaseUrl, parseTradierEquityPositions } from './order-client.js';
 import {
   TradierOptionsClient,
   underlyingFromOcc,
@@ -739,6 +739,81 @@ describe('TradierOptionsClient.listOpenOptionPositions', () => {
     fetchMock.mockResolvedValueOnce(textResponse('boom', 500));
     const client = new TradierOptionsClient('tok', 'A1');
     expect(await client.listOpenOptionPositions()).toEqual([]);
+  });
+});
+
+// ─── TRA-415: parseTradierEquityPositions + listOpenEquityPositions ─────────
+
+describe('parseTradierEquityPositions', () => {
+  it('keeps equity rows and drops option legs from a mixed payload', () => {
+    const out = parseTradierEquityPositions({
+      positions: {
+        position: [
+          { symbol: 'AAPL', quantity: 10, cost_basis: 1850, date_acquired: '2026-05-01T15:30:00.000Z', id: 7 },
+          { symbol: 'SPY260515C00450000', quantity: 2, cost_basis: 320, date_acquired: '2026-05-01T15:30:00.000Z' },
+        ],
+      },
+    });
+    expect(out).toHaveLength(1);
+    expect(out[0]).toMatchObject({
+      symbol: 'AAPL',
+      quantity: 10,
+      side: 'buy',
+      costBasis: 185,
+      tradierPositionId: 7,
+    });
+  });
+
+  it('surfaces a negative-quantity row as a short with positive quantity', () => {
+    const out = parseTradierEquityPositions({
+      positions: {
+        position: { symbol: 'TSLA', quantity: -3, cost_basis: -750, date_acquired: '2026-05-01' },
+      },
+    });
+    expect(out).toEqual([
+      { symbol: 'TSLA', quantity: 3, side: 'sell', costBasis: 250, acquiredAt: Date.parse('2026-05-01') },
+    ]);
+  });
+
+  it('drops zero-quantity, non-finite, and non-positive cost-basis rows', () => {
+    const out = parseTradierEquityPositions({
+      positions: {
+        position: [
+          { symbol: 'A', quantity: 0, cost_basis: 100, date_acquired: '2026-05-01' },
+          { symbol: 'B', quantity: 5, cost_basis: 0, date_acquired: '2026-05-01' },
+          { symbol: '', quantity: 5, cost_basis: 100, date_acquired: '2026-05-01' },
+        ],
+      },
+    });
+    expect(out).toEqual([]);
+  });
+
+  it('returns [] for an empty / string-null envelope', () => {
+    expect(parseTradierEquityPositions({ positions: 'null' })).toEqual([]);
+    expect(parseTradierEquityPositions(null)).toEqual([]);
+  });
+});
+
+describe('TradierOrderClient.listOpenEquityPositions', () => {
+  it('hits /accounts/{id}/positions and returns the parsed equity list', async () => {
+    fetchMock.mockResolvedValueOnce(
+      jsonResponse({
+        positions: {
+          position: { symbol: 'MSFT', quantity: 4, cost_basis: 1680, date_acquired: '2026-05-01' },
+        },
+      }),
+    );
+    const client = new TradierOrderClient('tok', 'ACCT9', 'sandbox');
+    const positions = await client.listOpenEquityPositions();
+    expect(positions).toHaveLength(1);
+    expect(positions[0].symbol).toBe('MSFT');
+    expect(callUrl(0)).toBe('https://sandbox.tradier.com/v1/accounts/ACCT9/positions');
+  });
+
+  it('returns [] on a non-2xx response', async () => {
+    fetchMock.mockResolvedValueOnce(textResponse('boom', 500));
+    const client = new TradierOrderClient('tok', 'A1');
+    expect(await client.listOpenEquityPositions()).toEqual([]);
   });
 });
 

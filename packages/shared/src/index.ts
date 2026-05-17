@@ -228,6 +228,15 @@ export interface Position {
    * existed. Stocks / options paths do not stamp this today.
    */
   quoteSource?: PositionQuoteSource;
+  /**
+   * TRA-415 — set on equity positions imported from Tradier by the periodic
+   * live-equity reconcile sweep (a stock opened out-of-band on the Tradier
+   * web UI, or left behind by a failed mirror order). Distinguishes these
+   * rows from engine-opened live equity mirrors so the reconciler can drop
+   * them when Tradier no longer reports the symbol without touching the
+   * engine's own bookkeeping. Absent on every engine-opened position.
+   */
+  importedFromTradier?: boolean;
 }
 
 /**
