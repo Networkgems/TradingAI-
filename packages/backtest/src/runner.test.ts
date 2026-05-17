@@ -768,3 +768,86 @@ describe('BacktestRunner TRA-420 warmupStartDate', () => {
     expect(explicitNoWarmup.totalPnl).toBeCloseTo(cold.totalPnl, 6);
   });
 });
+
+describe('BacktestRunner TRA-423 correlation / concentration cap', () => {
+  function baseConfig(over: Partial<BacktestConfig> = {}): BacktestConfig {
+    return {
+      symbol: 'AAPL',
+      startDate: 0,
+      endDate: Number.MAX_SAFE_INTEGER,
+      initialEquity: 100_000,
+      strategyType: 'orb',
+      ...over,
+    };
+  }
+
+  it('leaves results unchanged and reports no cap stats when disabled', async () => {
+    const candles = orbFixtureCandles(60, 0.05);
+    const base = await new BacktestRunner().run(baseConfig(), candles);
+    const off = await new BacktestRunner().run(
+      baseConfig({ correlationCapOpts: { enabled: false } }),
+      candles,
+    );
+    expect(off.correlationCap).toBeUndefined();
+    expect(off.totalTrades).toBe(base.totalTrades);
+    expect(off.totalPnl).toBeCloseTo(base.totalPnl, 6);
+  });
+
+  it('admits every entry untouched when the caps are set wide enough never to bind', async () => {
+    const candles = orbFixtureCandles(60, 0.05);
+    const base = await new BacktestRunner().run(baseConfig(), candles);
+    const wide = await new BacktestRunner().run(
+      baseConfig({
+        correlationCapOpts: {
+          enabled: true,
+          // Caps far above any single-symbol book — nothing should bind.
+          config: {
+            maxClusterRiskPct: 100,
+            maxPortfolioRiskPct: 100,
+            maxClusterNotionalPct: 100,
+          },
+        },
+      }),
+      candles,
+    );
+    expect(wide.correlationCap).toEqual({ enabled: true, rejected: 0, scaledDown: 0 });
+    expect(wide.totalTrades).toBe(base.totalTrades);
+    expect(wide.totalPnl).toBeCloseTo(base.totalPnl, 6);
+  });
+
+  it('hard-rejects every entry when the cluster risk cap is zero', async () => {
+    const candles = orbFixtureCandles(60, 0.05);
+    const base = await new BacktestRunner().run(baseConfig(), candles);
+    const capped = await new BacktestRunner().run(
+      baseConfig({ correlationCapOpts: { enabled: true, config: { maxClusterRiskPct: 0 } } }),
+      candles,
+    );
+    if (base.totalTrades > 0) {
+      expect(capped.totalTrades).toBe(0);
+      expect(capped.correlationCap?.rejected).toBeGreaterThan(0);
+    }
+  });
+
+  it('scales entries down (not rejects) when the risk cap leaves partial headroom', async () => {
+    const candles = orbFixtureCandles(60, 0.05);
+    const base = await new BacktestRunner().run(baseConfig(), candles);
+    const capped = await new BacktestRunner().run(
+      baseConfig({
+        correlationCapOpts: {
+          enabled: true,
+          // 0.5% cluster cap on $50k managed equity ⇒ $250 headroom vs the
+          // $500 a 1%-risk entry wants — half-size, still above the $125
+          // scale-down floor. Notional cap kept wide so risk is the binder.
+          config: { maxClusterRiskPct: 0.005, maxClusterNotionalPct: 100 },
+        },
+      }),
+      candles,
+    );
+    if (base.totalTrades > 0) {
+      // Entries are admitted at a reduced size, not dropped.
+      expect(capped.totalTrades).toBe(base.totalTrades);
+      expect(capped.correlationCap?.scaledDown).toBeGreaterThan(0);
+      expect(capped.correlationCap?.rejected).toBe(0);
+    }
+  });
+});

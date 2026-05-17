@@ -1,5 +1,8 @@
-import { Candle, ExitReason, Position, TradeSignal } from '@trading-app/shared';
+import { Candle, ExitReason, Position, TradeSignal, MANAGED_ACCOUNT_RATIO } from '@trading-app/shared';
 import {
+  CorrelationMatrix,
+  admitUnderClusterCap,
+  resolveCorrelationCapConfig,
   OrbStrategy,
   ReversalStrategy,
   MacdTrendStrategy,
@@ -283,6 +286,23 @@ export class BacktestRunner {
     let prevMtmEquity = config.initialEquity;
 
     let skippedConcentration = 0;
+
+    // TRA-423 — portfolio correlation / concentration cap (TRA-411 spec §6).
+    // An *additional* gate on top of `admitsUnderPortfolioCap`: clusters the
+    // open book by daily-return correlation, then hard-rejects a candidate in
+    // a full cluster or scales it down to the binding risk/notional headroom.
+    // `dailyCandlesBySymbol` feeds the real correlation estimate; with none
+    // supplied the §3 fallback applies — fine for a single-symbol backtest
+    // where every open position is the same symbol (ρ=1.0 with itself), so
+    // they collapse into one cluster and the risk/count caps still bind.
+    const corrCapEnabled = config.correlationCapOpts?.enabled === true;
+    const corrCapConfig = resolveCorrelationCapConfig(config.correlationCapOpts?.config);
+    const corrMatrix = new CorrelationMatrix(
+      config.correlationCapOpts?.dailyCandlesBySymbol ?? {},
+    );
+    let correlationCapRejected = 0;
+    let correlationCapScaledDown = 0;
+
     const lookahead = config.signalEdgeOpts?.lookaheadBars ?? DEFAULT_LOOKAHEAD_BARS;
     const signalLog: Array<{ signal: TradeSignal; barIndex: number }> = [];
     const seenSignalIds = new Set<string>();
@@ -323,8 +343,45 @@ export class BacktestRunner {
           ? (config.meanReversionRiskPct ?? DEFAULT_MEAN_REVERSION_RISK_PCT)
           : undefined;
         const qty = risk.sizeFromStop(signal.entryPrice, signal.stopLoss, { riskPct });
-        if (qty > 0) {
-          const opened = positions.open(signal, qty);
+
+        // TRA-423 — correlation / concentration cap admission (spec §6). Runs
+        // after sizing because the cap reasons about the candidate's dollar
+        // risk and notional. A hard reject drops the entry; a scale-down
+        // shrinks the quantity to the binding headroom. Risk and notional
+        // scale together for a fixed stop, so trimming qty is sufficient.
+        let finalQty = qty;
+        if (corrCapEnabled && qty > 0) {
+          const stopDistance = Math.abs(signal.entryPrice - signal.stopLoss);
+          const open = positions.getOpen().map(p => ({
+            symbol: p.symbol,
+            risk: Math.abs(p.entryPrice - p.stopLoss) * p.quantity,
+            notional: p.entryPrice * p.quantity,
+          }));
+          const decision = admitUnderClusterCap(
+            {
+              symbol: signal.symbol,
+              risk: stopDistance * qty,
+              notional: signal.entryPrice * qty,
+            },
+            open,
+            runningEquity * MANAGED_ACCOUNT_RATIO,
+            corrMatrix.correlation,
+            corrCapConfig,
+          );
+          if (!decision.admitted) {
+            correlationCapRejected += 1;
+            continue;
+          }
+          if (decision.scale < 1) {
+            correlationCapScaledDown += 1;
+            finalQty = fractionalQuantity
+              ? Math.floor(qty * decision.scale * 1e8) / 1e8
+              : Math.floor(qty * decision.scale);
+          }
+        }
+
+        if (finalQty > 0) {
+          const opened = positions.open(signal, finalQty);
           // TRA-420 §4: entry fills at THIS bar's open — the first price
           // obtainable after the prior bar's close-derived signal.
           entryFills.set(opened.id, applyEntryFill(signal.side, latest.open));
@@ -660,6 +717,9 @@ export class BacktestRunner {
       losers: losers.length,
       profitFactor,
       skippedConcentration,
+      correlationCap: corrCapEnabled
+        ? { enabled: true, rejected: correlationCapRejected, scaledDown: correlationCapScaledDown }
+        : undefined,
       signalEdge,
       ambiguousTrades,
       worstCaseTotalPnl,

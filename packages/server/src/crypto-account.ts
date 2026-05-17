@@ -139,7 +139,18 @@ export class CryptoPaperAccount {
    *                     in code review rather than silently writing
    *                     `'unknown'` onto a fresh entry.
    */
-  openPosition(signal: TradeSignal, currentPrice: number, quoteSource?: PositionQuoteSource): Position | null {
+  /**
+   * @param sizeMultiplier TRA-423 — position-size scalar in (0,1] applied after
+   *   the risk- and managed-equity caps. The crypto engine passes the
+   *   correlation / concentration cap's scale-down factor here; defaults to 1
+   *   (no trim) so every other caller sizes exactly as before.
+   */
+  openPosition(
+    signal: TradeSignal,
+    currentPrice: number,
+    quoteSource?: PositionQuoteSource,
+    sizeMultiplier = 1,
+  ): Position | null {
     let qty = this.sizeFromStop(signal.entryPrice, signal.stopLoss);
     if (qty <= 0) {
       log.warn('skip signal: qty=0', {
@@ -155,6 +166,10 @@ export class CryptoPaperAccount {
     // tight stops yield large fractional quantities whose cost exceeds cash.
     const maxQtyForManagedEquity = this.managedEquity() / currentPrice;
     qty = Math.min(qty, maxQtyForManagedEquity);
+    // TRA-423 — correlation / concentration cap scale-down (1 ↔ no-op).
+    if (Number.isFinite(sizeMultiplier) && sizeMultiplier > 0 && sizeMultiplier < 1) {
+      qty *= sizeMultiplier;
+    }
     qty = Math.round(qty * 1_000_000) / 1_000_000;
     if (qty <= 0) {
       log.warn('skip signal: managedEquity too small for price', {

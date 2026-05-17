@@ -1,5 +1,5 @@
-import { Position } from '@trading-app/shared';
-import type { BreakoutVolOptions, CostModel, IchimokuOptions, MeanReversionCryptoOptions, MomentumOptions, OrbOptions, RegimeDetectorOptions, ScalpingOptions, SwingOptions } from '@trading-app/engine';
+import { Candle, Position } from '@trading-app/shared';
+import type { BreakoutVolOptions, CorrelationCapConfig, CostModel, IchimokuOptions, MeanReversionCryptoOptions, MomentumOptions, OrbOptions, RegimeDetectorOptions, ScalpingOptions, SwingOptions } from '@trading-app/engine';
 
 export interface BacktestReversalOpts {
   rsiPeriod?: number;
@@ -64,6 +64,29 @@ export interface PortfolioOpts {
    * `*-USD` ticker to `crypto` and everything else to `equity`.
    */
   sectorOf?: (symbol: string) => string;
+}
+
+/**
+ * TRA-423 — portfolio correlation / concentration cap (TRA-411 spec).
+ *
+ * When `enabled`, the runner enforces the §6 admission rule on every entry:
+ * the position-count cap is a hard reject, the cluster/portfolio risk and
+ * cluster-notional caps scale the candidate down to exact headroom (rejecting
+ * below `minTradeRiskPct`). It is an *additional* gate on top of
+ * {@link PortfolioOpts} — `maxOpen` / `maxSector` still apply.
+ *
+ * `config` overrides any of the five spec §5 keys; omitted keys take the
+ * recommended defaults so the cap is tunable without a code change.
+ *
+ * `dailyCandlesBySymbol` supplies the real Coinbase daily history used to
+ * estimate correlations. When omitted, the insufficient-history fallback
+ * applies — which, for a single-symbol backtest, correctly collapses every
+ * open position into one cluster (a symbol is ρ=1.0 with itself).
+ */
+export interface CorrelationCapOpts {
+  enabled?: boolean;
+  config?: Partial<CorrelationCapConfig>;
+  dailyCandlesBySymbol?: Record<string, Candle[]>;
 }
 
 export interface SignalEdgeOpts {
@@ -135,6 +158,14 @@ export interface BacktestConfig {
   scalpingOpts?: ScalpingOptions;
   swingOpts?: SwingOptions;
   portfolioOpts?: PortfolioOpts;
+  /**
+   * TRA-423 — portfolio correlation / concentration cap. Omit (or set
+   * `enabled: false`) to leave behaviour unchanged; set `enabled: true` to
+   * have the runner enforce the TRA-411 §6 admission rule. QuantTrader drives
+   * the spec §8 validation by toggling this on the {BTC-USD, SOL-USD}
+   * `macd_bollinger` book.
+   */
+  correlationCapOpts?: CorrelationCapOpts;
   signalEdgeOpts?: SignalEdgeOpts;
   /**
    * Per-fill commission charged on entry and exit, in basis points of notional
@@ -238,6 +269,18 @@ export interface BacktestResult {
   profitFactor: number;
   /** Number of would-be entries skipped because they exceeded the portfolio cap. */
   skippedConcentration?: number;
+  /**
+   * TRA-423 — portfolio correlation / concentration cap activity. Present only
+   * when {@link BacktestConfig.correlationCapOpts} enabled the cap. `rejected`
+   * counts hard-rejected entries (full-cluster or below the scale-down floor);
+   * `scaledDown` counts entries admitted at a reduced size. The §8 validation
+   * checks `rejected + scaledDown > 0` to prove the cap actually binds.
+   */
+  correlationCap?: {
+    enabled: boolean;
+    rejected: number;
+    scaledDown: number;
+  };
   signalEdge?: SignalEdge;
   confidenceBands?: ConfidenceBands;
   /**

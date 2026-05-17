@@ -1151,7 +1151,12 @@ export class CryptoLiveAccount {
    * `recordSkip`). Without this, skips were `console.warn`-only and operators
    * saw "8 signals, 0 positions" with no way to self-diagnose.
    */
-  async openPosition(signal: TradeSignal, currentPrice: number, quoteSource?: PositionQuoteSource): Promise<Position | null> {
+  async openPosition(
+    signal: TradeSignal,
+    currentPrice: number,
+    quoteSource?: PositionQuoteSource,
+    sizeMultiplier = 1,
+  ): Promise<Position | null> {
     // TRA-264 — SELL-side fork. Symbols inside the Phase-1 perp shorts
     // universe (TRA-261 / TRA-255 §2: BTC, ETH, SOL, XRP, DOGE) route to
     // Coinbase INTX as 1× isolated perp shorts. Anything else falls back to
@@ -1232,6 +1237,12 @@ export class CryptoLiveAccount {
     const maxCashSpend = this.cashUsd * CASH_FEE_BUFFER;
     const maxQtyForCash = maxCashSpend / currentPrice;
     qty = Math.min(qty, maxQtyForCash);
+    // TRA-423 — correlation / concentration cap scale-down (1 ↔ no-op).
+    // Applied to the long (spot BUY) path only; perp shorts route through
+    // `openPerpShort`, which is governed by the TRA-261 short notional caps.
+    if (Number.isFinite(sizeMultiplier) && sizeMultiplier > 0 && sizeMultiplier < 1) {
+      qty *= sizeMultiplier;
+    }
     // TRA-243 — Coinbase enforces a per-product `base_increment` (e.g.
     // `0.00000001` for BTC, `1` for SHIB). Sending finer-grained sizes
     // returns "Too many decimals in order amount". Quantize here using the

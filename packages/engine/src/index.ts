@@ -32,6 +32,28 @@ export { SwingStrategy } from './strategies/swing-strategy.js';
 export type { SwingOptions } from './strategies/swing-strategy.js';
 export { RiskManager } from './risk.js';
 export type { RiskManagerOptions } from './risk.js';
+export {
+  CorrelationMatrix,
+  admitUnderClusterCap,
+  formClusters,
+  resolveCorrelationCapConfig,
+  assetClassOf,
+  dailyLogReturns,
+  toDailyCloses,
+  pearson,
+  utcDayOf,
+  DEFAULT_CORRELATION_CAP_CONFIG,
+  CORRELATION_WINDOW_OBS,
+  MIN_CORRELATION_OBS,
+} from './correlation-cap.js';
+export type {
+  CorrelationCapConfig,
+  CorrelationFn,
+  ClusterCapPosition,
+  ClusterCapCandidate,
+  ClusterCapBinding,
+  ClusterCapDecision,
+} from './correlation-cap.js';
 export { PositionManager } from './positions.js';
 export { AlpacaFeed } from './feed/index.js';
 export type { AlpacaFeedEvents } from './feed/index.js';

@@ -7,6 +7,9 @@ import {
   MeanReversionCryptoStrategy,
   BreakoutVolStrategy,
   StrategyRouter,
+  CorrelationMatrix,
+  admitUnderClusterCap,
+  resolveCorrelationCapConfig,
   evaluateShortFilters,
   evaluateShortBookCaps,
   symbolShortCooldownActive,
@@ -15,6 +18,7 @@ import {
   type ShortFilterContext,
   type ClosedShortTrade,
   type RouterUniverse,
+  type CorrelationCapConfig,
 } from '@trading-app/engine';
 import { CRYPTO_WATCHLIST, isCryptoSymbolBlocked, aliasCryptoSymbol, resolveManagedAccountRatio, resolveRiskPerTrade, resolveStrategyPreset, presetAllowsStrategySymbol } from '@trading-app/shared';
 import type {
@@ -120,6 +124,18 @@ export class CryptoSignalEngine {
   private symbolState: Map<string, CryptoEngineState['symbols'][number]> = new Map();
   private candleCache: Map<string, Candle[]> = new Map();
   private dailyCandleCache: Map<string, Candle[]> = new Map();
+  /**
+   * TRA-423 — portfolio correlation / concentration cap (TRA-411 spec §6).
+   * Enforced on long (BUY) entries before `openPosition` in both the demo and
+   * live paths. Short entries route through the perp machinery, which carries
+   * its own TRA-261 notional caps. The five spec §5 keys take the recommended
+   * defaults; {@link correlationMatrix} is rebuilt at most once per UTC day
+   * from `dailyCandleCache` (spec §3 — major-coin correlation is slow-moving).
+   */
+  private readonly correlationCapEnabled = true;
+  private readonly correlationCapConfig: CorrelationCapConfig = resolveCorrelationCapConfig();
+  private correlationMatrix: CorrelationMatrix | null = null;
+  private correlationMatrixUtcDay = -1;
   /**
    * TRA-267 — 4H candle cache for the Phase-1 perp-shorts universe (BTC, ETH,
    * SOL, XRP, DOGE). Populated alongside `dailyCandleCache` by
@@ -565,6 +581,66 @@ export class CryptoSignalEngine {
   // 50 bars to seed the regime classifier's MA, mean-reversion gates on a
   // 50-bar EMA. 50 covers all three.
   private static readonly MIN_BARS_ROUTER = 50;
+
+  /**
+   * TRA-423 — pairwise daily-return correlation matrix for the watchlist,
+   * rebuilt at most once per UTC day from `dailyCandleCache` (spec §3). The
+   * matrix's own insufficient-history fallback covers symbols whose daily
+   * series hasn't loaded yet, so this is always safe to call.
+   */
+  private getCorrelationMatrix(): CorrelationMatrix {
+    const utcDay = Math.floor(Date.now() / 86_400_000);
+    if (!this.correlationMatrix || this.correlationMatrixUtcDay !== utcDay) {
+      this.correlationMatrix = new CorrelationMatrix(this.dailyCandleCache);
+      this.correlationMatrixUtcDay = utcDay;
+    }
+    return this.correlationMatrix;
+  }
+
+  /**
+   * TRA-423 — run the correlation / concentration cap admission rule (spec §6)
+   * for a long entry. Returns the position-size multiplier to apply to the
+   * broker sizing (`1` = full size, `<1` = scaled down to the binding
+   * headroom), or `null` when the entry is rejected — in which case
+   * `signal.signalSkipReason` is stamped so the dashboard surfaces why.
+   *
+   * `sizedQty` is the broker-sized quantity; the candidate's dollar risk and
+   * notional are derived from it. The position-count cap is a hard reject; the
+   * cluster / portfolio risk and cluster-notional caps scale the candidate
+   * down. This is an *additional* gate — the per-symbol dedup and the existing
+   * cash / managed-equity caps still apply.
+   */
+  private clusterCapMultiplier(
+    signal: TradeSignal,
+    sizedQty: number,
+    price: number,
+    managedEquity: number,
+    openPositions: ReadonlyArray<Position>,
+  ): number | null {
+    if (!this.correlationCapEnabled) return 1;
+    if (!(sizedQty > 0)) return 1;
+    const stopDistance = Math.abs(signal.entryPrice - signal.stopLoss);
+    const open = openPositions.map(p => ({
+      symbol: p.symbol,
+      risk: Math.abs(p.entryPrice - p.stopLoss) * p.quantity,
+      notional: p.entryPrice * p.quantity,
+    }));
+    const decision = admitUnderClusterCap(
+      { symbol: signal.symbol, risk: stopDistance * sizedQty, notional: price * sizedQty },
+      open,
+      managedEquity,
+      this.getCorrelationMatrix().correlation,
+      this.correlationCapConfig,
+    );
+    if (!decision.admitted) {
+      const cluster = decision.clusterSymbols.join(', ');
+      signal.signalSkipReason = decision.reason === 'max_positions_per_cluster'
+        ? `correlation cap — cluster {${cluster}} already holds ${this.correlationCapConfig.maxPositionsPerCluster} positions`
+        : `correlation cap — would scale below the ${(this.correlationCapConfig.minTradeRiskPct * 100).toFixed(2)}% min-trade-risk floor (cluster {${cluster}})`;
+      return null;
+    }
+    return decision.scale;
+  }
 
   /**
    * Lazily build a per-symbol regime-aware router (TRA-208). One router per
@@ -1086,7 +1162,27 @@ export class CryptoSignalEngine {
             continue;
           }
 
-          const opened = this.account.openPosition(signal, price, source);
+          // TRA-423 — correlation / concentration cap (spec §6) on long
+          // entries. A reject stamps `signalSkipReason` and skips the open; a
+          // scale-down passes the size multiplier through to the broker.
+          let clusterCapMultiplier = 1;
+          if (signal.side === 'buy') {
+            const sizedQty = this.account.sizeFromStop(signal.entryPrice, signal.stopLoss);
+            const mult = this.clusterCapMultiplier(
+              signal,
+              sizedQty,
+              price,
+              this.account.managedEquity(),
+              this.account.getState().openPositions,
+            );
+            if (mult === null) {
+              log.warn('signal skipped', { sym, signalType: signal.type, reason: signal.signalSkipReason });
+              continue;
+            }
+            clusterCapMultiplier = mult;
+          }
+
+          const opened = this.account.openPosition(signal, price, source, clusterCapMultiplier);
           if (opened) opened.mode = 'demo';
         }
       }
@@ -1273,8 +1369,28 @@ export class CryptoSignalEngine {
           continue;
         }
 
+        // TRA-423 — correlation / concentration cap (spec §6) on long entries.
+        // Short entries route to Coinbase INTX perps via `openPerpShort`,
+        // which is governed by the TRA-261 short notional caps instead.
+        let clusterCapMultiplier = 1;
+        if (signal.side === 'buy') {
+          const sizedQty = live.sizeFromStop(signal.entryPrice, signal.stopLoss);
+          const mult = this.clusterCapMultiplier(
+            signal,
+            sizedQty,
+            price,
+            live.managedEquity(),
+            live.getState().openPositions,
+          );
+          if (mult === null) {
+            log.warn('signal skipped', { sym, signalType: signal.type, reason: signal.signalSkipReason });
+            continue;
+          }
+          clusterCapMultiplier = mult;
+        }
+
         try {
-          await live.openPosition(signal, price, source);
+          await live.openPosition(signal, price, source, clusterCapMultiplier);
         } catch (err: unknown) {
           log.warn('live open failed', { sym, reason: err instanceof Error ? err.message : String(err) });
         }
