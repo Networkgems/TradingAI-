@@ -2,6 +2,7 @@ import React from 'react';
 import ReactDOM from 'react-dom/client';
 import App from './App.tsx';
 import { ErrorBoundary } from './ErrorBoundary.tsx';
+import { ToastProvider, ToastViewport } from './lib/toast.tsx';
 import {
   installGlobalErrorHandlers,
   installTraceHeader,
@@ -30,10 +31,16 @@ if ('serviceWorker' in navigator) {
   });
 }
 
+// TRA-419 — mount the toast system once at the app root so every dashboard
+// component can call useToast() to surface success/failure feedback on async
+// actions. ToastViewport renders the live stack and sits inside the provider.
 ReactDOM.createRoot(document.getElementById('root')!).render(
   <React.StrictMode>
     <ErrorBoundary label="app">
-      <App />
+      <ToastProvider>
+        <App />
+        <ToastViewport />
+      </ToastProvider>
     </ErrorBoundary>
   </React.StrictMode>,
 );

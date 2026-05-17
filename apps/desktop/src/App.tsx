@@ -24,6 +24,9 @@ import { ErrorBoundary } from './ErrorBoundary.tsx';
 import { SERVER_URL, HTTP_URL } from './server-url';
 import { logger } from './lib/logger';
 import { useFocusTrap } from './lib/useFocusTrap';
+import { useToast } from './lib/toast.tsx';
+import { createReconnectController } from './lib/backoff';
+import { validateLimitPrice, validateCloseQty } from './lib/validation';
 import './index.css';
 
 // TRA-339 — generic per-table sort. Each dashboard table picks a column
@@ -306,6 +309,7 @@ function AccountModeSwitcher({
   token: string;
 }) {
   const [busy, setBusy] = useState(false);
+  const toast = useToast();
 
   async function switchTo(next: 'demo' | 'live') {
     if (next === mode || busy) return;
@@ -329,8 +333,17 @@ function AccountModeSwitcher({
         headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' },
         body: JSON.stringify({ mode: next }),
       });
-      if (r.ok) onChange(next);
-    } catch { /* ignore */ } finally {
+      if (r.ok) {
+        onChange(next);
+        toast.success(`Switched to ${next === 'live' ? 'Live' : 'Demo'} account`);
+      } else {
+        logger.warn('account-mode', `mode switch returned HTTP ${r.status}`);
+        toast.error(`Could not switch to ${next} account (HTTP ${r.status})`);
+      }
+    } catch (err) {
+      logger.error('account-mode', `failed to switch to ${next} account`, err);
+      toast.error(`Could not switch to ${next} account — network error`);
+    } finally {
       setBusy(false);
     }
   }
@@ -448,16 +461,20 @@ function CryptoDashboard({ token, onBack, onLogout, onActivity, theme, onToggleT
   const wsRef = useRef<WebSocket | null>(null);
   const reconnectTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
   const scanStatusTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const toast = useToast();
 
   useEffect(() => {
+    // TRA-419 — exponential reconnect backoff (was a flat 3s timer that
+    // hammered the server during an outage). reset() on a healthy open.
+    const reconnect = createReconnectController();
     function connect() {
       const ws = new WebSocket(`${SERVER_URL}?token=${token}`);
       wsRef.current = ws;
-      ws.onopen = () => setConnected(true);
+      ws.onopen = () => { setConnected(true); reconnect.reset(); };
       ws.onclose = (e) => {
         setConnected(false);
         if (e.code === 1008) { onLogout(); return; }
-        reconnectTimer.current = setTimeout(connect, 3000);
+        reconnectTimer.current = setTimeout(connect, reconnect.nextDelay());
       };
       ws.onerror = () => ws.close();
       ws.onmessage = (e) => {
@@ -508,7 +525,10 @@ function CryptoDashboard({ token, onBack, onLogout, onActivity, theme, onToggleT
   useEffect(() => {
     fetch(`${HTTP_URL}/api/admin/users`, { headers: { Authorization: `Bearer ${token}` } })
       .then(r => { if (r.ok) setIsAdmin(true); })
-      .catch(() => {});
+      // Background probe — a non-admin token gets 401/403, which is expected;
+      // a network failure is logged (not toasted) so it stays diagnosable
+      // without nagging the user on a screen they didn't ask anything of.
+      .catch(err => logger.warn('admin-check', 'admin probe failed', err));
   }, [token]);
 
   // TRA-327 — apply a fresh AccountSettings snapshot after the initial fetch
@@ -524,7 +544,9 @@ function CryptoDashboard({ token, onBack, onLogout, onActivity, theme, onToggleT
     fetch(`${HTTP_URL}/api/account/settings`, { headers: { Authorization: `Bearer ${token}` } })
       .then(r => r.ok ? r.json() : null)
       .then((s: Partial<AccountSettings> | null) => applyAccountSettings(s))
-      .catch(() => {});
+      // Background settings refresh on tab switch — log a fetch failure for
+      // diagnosis; the cached settings stay in effect, so no toast is needed.
+      .catch(err => logger.warn('account-settings', 'settings refresh failed', err));
   }, [tab, token, applyAccountSettings]);
 
   const account = state?.account;
@@ -539,12 +561,22 @@ function CryptoDashboard({ token, onBack, onLogout, onActivity, theme, onToggleT
 
   async function toggleAutoTrading() {
     setTradingToggling(true);
+    const next = autoTradingEnabled ? 'stop' : 'start';
     try {
-      await fetch(`${HTTP_URL}/api/crypto/trading/${autoTradingEnabled ? 'stop' : 'start'}`, {
+      const r = await fetch(`${HTTP_URL}/api/crypto/trading/${next}`, {
         method: 'POST',
         headers: { Authorization: `Bearer ${token}` },
       });
-    } catch { /* ignore */ } finally {
+      if (r.ok) {
+        toast.success(next === 'start' ? 'Auto-trading started' : 'Auto-trading stopped');
+      } else {
+        logger.warn('crypto-trading', `${next} returned HTTP ${r.status}`);
+        toast.error(`Could not ${next} auto-trading (HTTP ${r.status})`);
+      }
+    } catch (err) {
+      logger.error('crypto-trading', `failed to ${next} auto-trading`, err);
+      toast.error(`Could not ${next} auto-trading — network error`);
+    } finally {
       setTradingToggling(false);
     }
   }
@@ -562,10 +594,17 @@ function CryptoDashboard({ token, onBack, onLogout, onActivity, theme, onToggleT
         // is still open at the broker (the next state broadcast will keep
         // surfacing it instead of optimistically removing it).
         const body = await r.json().catch(() => ({})) as { error?: string; reason?: string };
-        setCloseError(body.reason || body.error || `Close failed (HTTP ${r.status})`);
+        const reason = body.reason || body.error || `Close failed (HTTP ${r.status})`;
+        setCloseError(reason);
+        toast.error(`Close rejected: ${reason}`);
+      } else {
+        toast.success('Position close submitted');
       }
     } catch (err) {
-      setCloseError(err instanceof Error ? err.message : 'Close failed');
+      logger.error('crypto-close', 'position close failed', err);
+      const message = err instanceof Error ? err.message : 'Close failed';
+      setCloseError(message);
+      toast.error(`Close failed: ${message}`);
     }
   }
 
@@ -582,18 +621,32 @@ function CryptoDashboard({ token, onBack, onLogout, onActivity, theme, onToggleT
     }
     setWatchlistError('');
     setWatchlistInput('');
-    await fetch(`${HTTP_URL}/api/watchlist/crypto`, {
-      method: 'POST',
-      headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' },
-      body: JSON.stringify({ symbol: sym }),
-    }).catch(() => {});
+    try {
+      const r = await fetch(`${HTTP_URL}/api/watchlist/crypto`, {
+        method: 'POST',
+        headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' },
+        body: JSON.stringify({ symbol: sym }),
+      });
+      if (r.ok) toast.success(`${sym} added to watchlist`);
+      else toast.error(`Could not add ${sym} (HTTP ${r.status})`);
+    } catch (err) {
+      logger.error('crypto-watchlist', `failed to add ${sym}`, err);
+      toast.error(`Could not add ${sym} — network error`);
+    }
   }
 
   async function removeFromWatchlist(symbol: string) {
-    await fetch(`${HTTP_URL}/api/watchlist/crypto/${encodeURIComponent(symbol)}`, {
-      method: 'DELETE',
-      headers: { Authorization: `Bearer ${token}` },
-    }).catch(() => {});
+    try {
+      const r = await fetch(`${HTTP_URL}/api/watchlist/crypto/${encodeURIComponent(symbol)}`, {
+        method: 'DELETE',
+        headers: { Authorization: `Bearer ${token}` },
+      });
+      if (r.ok) toast.success(`${symbol} removed from watchlist`);
+      else toast.error(`Could not remove ${symbol} (HTTP ${r.status})`);
+    } catch (err) {
+      logger.error('crypto-watchlist', `failed to remove ${symbol}`, err);
+      toast.error(`Could not remove ${symbol} — network error`);
+    }
   }
 
   async function scanCryptoMarket() {
@@ -610,17 +663,31 @@ function CryptoDashboard({ token, onBack, onLogout, onActivity, theme, onToggleT
         setScanStatus(msg);
         if (scanStatusTimer.current) clearTimeout(scanStatusTimer.current);
         scanStatusTimer.current = setTimeout(() => setScanStatus(''), 5000);
+        toast.info(msg);
+      } else {
+        logger.warn('crypto-scan', `scan returned HTTP ${r.status}`);
+        toast.error(`Market scan failed (HTTP ${r.status})`);
       }
-    } catch { /* ignore */ } finally {
+    } catch (err) {
+      logger.error('crypto-scan', 'market scan failed', err);
+      toast.error('Market scan failed — network error');
+    } finally {
       setScanning(false);
     }
   }
 
   async function resetSignals() {
-    await fetch(`${HTTP_URL}/api/crypto/signals/reset`, {
-      method: 'POST',
-      headers: { Authorization: `Bearer ${token}` },
-    }).catch(() => {});
+    try {
+      const r = await fetch(`${HTTP_URL}/api/crypto/signals/reset`, {
+        method: 'POST',
+        headers: { Authorization: `Bearer ${token}` },
+      });
+      if (r.ok) toast.success('Signals cleared');
+      else toast.error(`Could not reset signals (HTTP ${r.status})`);
+    } catch (err) {
+      logger.error('crypto-signals', 'reset signals failed', err);
+      toast.error('Could not reset signals — network error');
+    }
   }
 
   return (
@@ -1718,20 +1785,24 @@ function Dashboard({ token, onLogout, onGoHome, onActivity, theme, onToggleTheme
   const wsRef = useRef<WebSocket | null>(null);
   const reconnectTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
   const scanStatusTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const toast = useToast();
 
   useEffect(() => {
+    // TRA-419 — exponential reconnect backoff (was a flat 3s timer that
+    // hammered the server during an outage). reset() on a healthy open.
+    const reconnect = createReconnectController();
     function connect() {
       const ws = new WebSocket(`${SERVER_URL}?token=${token}`);
       wsRef.current = ws;
 
-      ws.onopen = () => setConnected(true);
+      ws.onopen = () => { setConnected(true); reconnect.reset(); };
       ws.onclose = (e) => {
         setConnected(false);
         if (e.code === 1008) {
           onLogout();
           return;
         }
-        reconnectTimer.current = setTimeout(connect, 3000);
+        reconnectTimer.current = setTimeout(connect, reconnect.nextDelay());
       };
       ws.onerror = () => ws.close();
       ws.onmessage = (e) => {
@@ -1785,7 +1856,10 @@ function Dashboard({ token, onLogout, onGoHome, onActivity, theme, onToggleTheme
   useEffect(() => {
     fetch(`${HTTP_URL}/api/admin/users`, { headers: { Authorization: `Bearer ${token}` } })
       .then(r => { if (r.ok) setIsAdmin(true); })
-      .catch(() => {});
+      // Background probe — a non-admin token gets 401/403, which is expected;
+      // a network failure is logged (not toasted) so it stays diagnosable
+      // without nagging the user on a screen they didn't ask anything of.
+      .catch(err => logger.warn('admin-check', 'admin probe failed', err));
   }, [token]);
 
   // TRA-327 — apply a fresh AccountSettings snapshot to the dashboard's
@@ -1806,7 +1880,9 @@ function Dashboard({ token, onLogout, onGoHome, onActivity, theme, onToggleTheme
     fetch(`${HTTP_URL}/api/account/settings`, { headers: { Authorization: `Bearer ${token}` } })
       .then(r => r.ok ? r.json() : null)
       .then((s: Partial<AccountSettings> | null) => applyAccountSettings(s))
-      .catch(() => {});
+      // Background settings refresh on tab switch — log a fetch failure for
+      // diagnosis; the cached settings stay in effect, so no toast is needed.
+      .catch(err => logger.warn('account-settings', 'settings refresh failed', err));
   }, [tab, token, applyAccountSettings]);
 
   const account = state?.account;
@@ -1837,21 +1913,38 @@ function Dashboard({ token, onLogout, onGoHome, onActivity, theme, onToggleTheme
 
   async function toggleAutoTrading() {
     setTradingToggling(true);
+    const next = autoTradingEnabled ? 'stop' : 'start';
     try {
-      await fetch(`${HTTP_URL}/api/trading/${autoTradingEnabled ? 'stop' : 'start'}`, {
+      const r = await fetch(`${HTTP_URL}/api/trading/${next}`, {
         method: 'POST',
         headers: { Authorization: `Bearer ${token}` },
       });
-    } catch { /* ignore */ } finally {
+      if (r.ok) {
+        toast.success(next === 'start' ? 'Auto-trading started' : 'Auto-trading stopped');
+      } else {
+        logger.warn('stock-trading', `${next} returned HTTP ${r.status}`);
+        toast.error(`Could not ${next} auto-trading (HTTP ${r.status})`);
+      }
+    } catch (err) {
+      logger.error('stock-trading', `failed to ${next} auto-trading`, err);
+      toast.error(`Could not ${next} auto-trading — network error`);
+    } finally {
       setTradingToggling(false);
     }
   }
 
   async function closePosition(positionId: string) {
-    await fetch(`${HTTP_URL}/api/positions/${positionId}/close`, {
-      method: 'POST',
-      headers: { Authorization: `Bearer ${token}` },
-    }).catch(() => {});
+    try {
+      const r = await fetch(`${HTTP_URL}/api/positions/${positionId}/close`, {
+        method: 'POST',
+        headers: { Authorization: `Bearer ${token}` },
+      });
+      if (r.ok) toast.success('Position close submitted');
+      else toast.error(`Close failed (HTTP ${r.status})`);
+    } catch (err) {
+      logger.error('stock-close', 'position close failed', err);
+      toast.error('Position close failed — network error');
+    }
   }
 
   // TRA-358 — direct close path used by the imported and demo branches
@@ -1872,21 +1965,29 @@ function Dashboard({ token, onLogout, onGoHome, onActivity, theme, onToggleTheme
     // (sell_to_close failed) so the row doesn't sit stuck. The 202 path
     // (Tradier accepted but the order didn't reach a terminal state in
     // the wait window) leaves the row visible with a Pending badge.
-    if (!r) return { ok: false as const, error: 'Network error' };
+    if (!r) {
+      logger.error('stock-close', 'network error closing option', { optionId });
+      toast.error('Close failed — network error');
+      return { ok: false as const, error: 'Network error' };
+    }
     const data = await r.json().catch(() => ({} as { error?: string; status?: string; orderId?: number | string; fillPrice?: number }));
     if (r.status === 202 && data?.status === 'pending') {
       setTradierSyncStatus(`Tradier close pending #${data.orderId ?? '?'} — row will drop once Tradier fills`);
       if (tradierSyncStatusTimer.current) clearTimeout(tradierSyncStatusTimer.current);
       tradierSyncStatusTimer.current = setTimeout(() => setTradierSyncStatus(''), 8000);
+      toast.info(`Tradier close pending #${data.orderId ?? '?'}`);
       return { ok: true as const, status: 'pending' as const, orderId: data?.orderId };
     }
     if (!r.ok) {
       const message = data?.error ?? `Close failed (${r.status})`;
+      logger.warn('stock-close', 'option close rejected', { optionId, status: r.status, message });
       setTradierSyncStatus(`Close failed: ${message}`);
       if (tradierSyncStatusTimer.current) clearTimeout(tradierSyncStatusTimer.current);
       tradierSyncStatusTimer.current = setTimeout(() => setTradierSyncStatus(''), 6000);
+      toast.error(`Close failed: ${message}`);
       return { ok: false as const, error: message };
     }
+    toast.success('Option close submitted');
     return { ok: true as const, status: data?.status ?? 'filled', orderId: data?.orderId, fillPrice: data?.fillPrice };
   }
 
@@ -1944,19 +2045,20 @@ function Dashboard({ token, onLogout, onGoHome, onActivity, theme, onToggleTheme
 
   async function submitCloseDrawer() {
     if (!closeDrawer || closeDrawer.submitting) return;
+    // TRA-419 — validation routed through src/lib/validation.ts so the
+    // close-drawer rules are unit-tested and stay in sync with the server.
+    const priceError = validateLimitPrice(closeDrawer.price);
+    if (priceError) {
+      setCloseDrawer(prev => prev ? { ...prev, error: priceError } : prev);
+      return;
+    }
+    const qtyError = validateCloseQty(closeDrawer.qty, closeDrawer.contractsRemaining);
+    if (qtyError) {
+      setCloseDrawer(prev => prev ? { ...prev, error: qtyError } : prev);
+      return;
+    }
     const limitPrice = Number(closeDrawer.price);
-    if (!Number.isFinite(limitPrice) || limitPrice <= 0) {
-      setCloseDrawer(prev => prev ? { ...prev, error: 'Limit price must be greater than 0.' } : prev);
-      return;
-    }
-    const qty = Math.floor(Number(closeDrawer.qty));
-    if (!Number.isFinite(qty) || qty <= 0 || qty > closeDrawer.contractsRemaining) {
-      setCloseDrawer(prev => prev ? {
-        ...prev,
-        error: `Qty must be between 1 and ${closeDrawer.contractsRemaining}.`,
-      } : prev);
-      return;
-    }
+    const qty = Number(closeDrawer.qty);
     setCloseDrawer(prev => prev ? { ...prev, submitting: true, error: undefined } : prev);
     const result = await closeOption(closeDrawer.optionId, {
       limitPrice,
@@ -1985,12 +2087,18 @@ function Dashboard({ token, onLogout, onGoHome, onActivity, theme, onToggleTheme
         headers: { Authorization: `Bearer ${token}` },
       }).catch(() => null);
       if (!r) {
+        logger.error('stock-close', 'network error cancelling pending exit', { optionId });
         setTradierSyncStatus('Cancel failed: network error');
+        toast.error('Cancel failed — network error');
       } else if (!r.ok) {
         const data = await r.json().catch(() => ({} as { error?: string }));
-        setTradierSyncStatus(`Cancel failed: ${data?.error ?? r.status}`);
+        const message = data?.error ?? String(r.status);
+        logger.warn('stock-close', 'cancel pending exit rejected', { optionId, message });
+        setTradierSyncStatus(`Cancel failed: ${message}`);
+        toast.error(`Cancel failed: ${message}`);
       } else {
         setTradierSyncStatus('Tradier cancel accepted');
+        toast.success('Tradier cancel accepted');
       }
       if (tradierSyncStatusTimer.current) clearTimeout(tradierSyncStatusTimer.current);
       tradierSyncStatusTimer.current = setTimeout(() => setTradierSyncStatus(''), 6000);
@@ -2016,7 +2124,10 @@ function Dashboard({ token, onLogout, onGoHome, onActivity, theme, onToggleTheme
       );
       const data = await r.json().catch(() => ({} as { error?: string; added?: number; updated?: number; removed?: number; total?: number }));
       if (!r.ok) {
-        setTradierSyncStatus(data?.error ?? `Sync failed (${r.status})`);
+        const message = data?.error ?? `Sync failed (${r.status})`;
+        logger.warn('tradier-sync', 'positions sync rejected', { env: tradierEnv, message });
+        setTradierSyncStatus(message);
+        toast.error(`Tradier sync failed: ${message}`);
       } else {
         const added = data.added ?? 0;
         const updated = data.updated ?? 0;
@@ -2024,14 +2135,17 @@ function Dashboard({ token, onLogout, onGoHome, onActivity, theme, onToggleTheme
         const total = data.total ?? 0;
         if (total === 0) {
           setTradierSyncStatus(`Tradier ${tradierEnv}: no open positions`);
+          toast.info(`Tradier ${tradierEnv}: no open positions`);
         } else {
-          setTradierSyncStatus(
-            `Synced ${total} Tradier ${tradierEnv} position(s): +${added} new, ~${updated} updated, −${removed} closed`,
-          );
+          const summary = `Synced ${total} Tradier ${tradierEnv} position(s): +${added} new, ~${updated} updated, −${removed} closed`;
+          setTradierSyncStatus(summary);
+          toast.success(summary);
         }
       }
     } catch (err) {
+      logger.error('tradier-sync', 'positions sync failed', err);
       setTradierSyncStatus(`Sync error: ${err instanceof Error ? err.message : String(err)}`);
+      toast.error('Tradier sync failed — network error');
     } finally {
       setTradierSyncing(false);
       if (tradierSyncStatusTimer.current) clearTimeout(tradierSyncStatusTimer.current);
@@ -2052,18 +2166,32 @@ function Dashboard({ token, onLogout, onGoHome, onActivity, theme, onToggleTheme
     }
     setWatchlistError('');
     setWatchlistInput('');
-    await fetch(`${HTTP_URL}/api/watchlist/stocks`, {
-      method: 'POST',
-      headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' },
-      body: JSON.stringify({ symbol: sym }),
-    }).catch(() => {});
+    try {
+      const r = await fetch(`${HTTP_URL}/api/watchlist/stocks`, {
+        method: 'POST',
+        headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' },
+        body: JSON.stringify({ symbol: sym }),
+      });
+      if (r.ok) toast.success(`${sym} added to watchlist`);
+      else toast.error(`Could not add ${sym} (HTTP ${r.status})`);
+    } catch (err) {
+      logger.error('stock-watchlist', `failed to add ${sym}`, err);
+      toast.error(`Could not add ${sym} — network error`);
+    }
   }
 
   async function removeFromStocksWatchlist(symbol: string) {
-    await fetch(`${HTTP_URL}/api/watchlist/stocks/${encodeURIComponent(symbol)}`, {
-      method: 'DELETE',
-      headers: { Authorization: `Bearer ${token}` },
-    }).catch(() => {});
+    try {
+      const r = await fetch(`${HTTP_URL}/api/watchlist/stocks/${encodeURIComponent(symbol)}`, {
+        method: 'DELETE',
+        headers: { Authorization: `Bearer ${token}` },
+      });
+      if (r.ok) toast.success(`${symbol} removed from watchlist`);
+      else toast.error(`Could not remove ${symbol} (HTTP ${r.status})`);
+    } catch (err) {
+      logger.error('stock-watchlist', `failed to remove ${symbol}`, err);
+      toast.error(`Could not remove ${symbol} — network error`);
+    }
   }
 
   async function scanStocksMarket() {
@@ -2080,17 +2208,31 @@ function Dashboard({ token, onLogout, onGoHome, onActivity, theme, onToggleTheme
         setScanStatus(msg);
         if (scanStatusTimer.current) clearTimeout(scanStatusTimer.current);
         scanStatusTimer.current = setTimeout(() => setScanStatus(''), 5000);
+        toast.info(msg);
+      } else {
+        logger.warn('stock-scan', `scan returned HTTP ${r.status}`);
+        toast.error(`Market scan failed (HTTP ${r.status})`);
       }
-    } catch { /* ignore */ } finally {
+    } catch (err) {
+      logger.error('stock-scan', 'market scan failed', err);
+      toast.error('Market scan failed — network error');
+    } finally {
       setScanning(false);
     }
   }
 
   async function resetSignals() {
-    await fetch(`${HTTP_URL}/api/signals/reset`, {
-      method: 'POST',
-      headers: { Authorization: `Bearer ${token}` },
-    }).catch(() => {});
+    try {
+      const r = await fetch(`${HTTP_URL}/api/signals/reset`, {
+        method: 'POST',
+        headers: { Authorization: `Bearer ${token}` },
+      });
+      if (r.ok) toast.success('Signals cleared');
+      else toast.error(`Could not reset signals (HTTP ${r.status})`);
+    } catch (err) {
+      logger.error('stock-signals', 'reset signals failed', err);
+      toast.error('Could not reset signals — network error');
+    }
   }
 
   return (

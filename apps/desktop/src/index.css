@@ -2074,3 +2074,72 @@ tr:hover td { background: var(--bg-hover); }
   background: var(--blue-strong);
 }
 
+/* TRA-419 — toast notifications. Fixed bottom-right stack rendered by
+   <ToastViewport/>; each toast auto-dismisses (durations in toast.tsx) or can
+   be closed with the × button. Colour-coded by kind for at-a-glance status. */
+.toast-viewport {
+  position: fixed;
+  bottom: 1rem;
+  right: 1rem;
+  z-index: 1000;
+  display: flex;
+  flex-direction: column;
+  gap: 0.5rem;
+  max-width: min(24rem, 92vw);
+  pointer-events: none;
+}
+
+.toast {
+  display: flex;
+  align-items: flex-start;
+  gap: 0.6rem;
+  padding: 0.6rem 0.75rem;
+  border-radius: 8px;
+  border: 1px solid var(--border);
+  background: var(--surface);
+  color: var(--text);
+  box-shadow: 0 6px 20px rgba(0, 0, 0, 0.25);
+  font-size: 0.825rem;
+  line-height: 1.4;
+  pointer-events: auto;
+  animation: toast-in 0.16s ease-out;
+}
+
+@keyframes toast-in {
+  from { opacity: 0; transform: translateY(0.5rem); }
+  to { opacity: 1; transform: translateY(0); }
+}
+
+.toast-message {
+  flex: 1;
+  word-break: break-word;
+}
+
+.toast-dismiss {
+  flex-shrink: 0;
+  background: none;
+  border: none;
+  color: inherit;
+  cursor: pointer;
+  font-size: 1rem;
+  line-height: 1;
+  padding: 0;
+  opacity: 0.7;
+}
+
+.toast-dismiss:hover {
+  opacity: 1;
+}
+
+.toast-success {
+  border-left: 3px solid var(--green, #3fb950);
+}
+
+.toast-error {
+  border-left: 3px solid var(--red, #f85149);
+}
+
+.toast-info {
+  border-left: 3px solid var(--blue, #3b82f6);
+}
+
