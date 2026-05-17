@@ -176,7 +176,10 @@ export function getFallbackRequestCounts(): { day: string; tradier: number; twel
 type MinuteBarSource = 'tradier' | 'yahoo' | 'twelvedata' | 'none';
 type MinuteBarCacheEntry = {
   bars: Candle[];
-  source: Exclude<MinuteBarSource, 'none'>;
+  // `'none'` is a negative-cache marker (TRA-439): when the whole cascade
+  // misses we record that miss for the rest of the minute so back-to-back
+  // ticks don't re-fire the Twelve Data fallback for the same symbol.
+  source: MinuteBarSource;
   expiresAt: number;
 };
 const minuteBarCache = new Map<string, MinuteBarCacheEntry>();
@@ -198,6 +201,88 @@ if (!TWELVE_DATA_API_KEY) {
   console.warn('[yahoo-feed] TWELVE_DATA_API_KEY is not set — Twelve Data minute-bar fallback disabled');
 }
 
+// ── Twelve Data quota guard (TRA-439) ────────────────────────────────────────
+// Twelve Data's free tier is 800 requests/day. Before TRA-439 the minute-bar
+// fallback had no breaker and no daily cap: whenever Tradier timesales returned
+// no bars and Yahoo's breaker was open, every active-interest symbol re-fired a
+// Twelve Data request on every 30-second tick — which burned ~27.7k calls/day
+// against the 800 limit (the TRA-436 regression). Two guards now bound this:
+//
+//   • Daily budget cap — once `TWELVE_DATA_DAILY_BUDGET` requests have been
+//     spent in the current UTC day, the fallback is skipped until the
+//     UTC-midnight counter rollover. Default 700 leaves headroom under 800 for
+//     the per-day health-check probe.
+//   • Circuit breaker — a credit/rate-limit error opens the breaker until the
+//     next UTC midnight (Twelve Data's free-tier credits reset daily), so a
+//     single "out of credits" response stops all further calls for the day
+//     instead of retrying every tick.
+
+const TWELVE_DATA_DAILY_BUDGET = (() => {
+  const raw = Number(process.env.TWELVE_DATA_DAILY_BUDGET);
+  return Number.isFinite(raw) && raw > 0 ? Math.floor(raw) : 700;
+})();
+
+let twelveDataBlockedUntil = 0;
+function isTwelveDataBlocked(): boolean {
+  return Date.now() < twelveDataBlockedUntil;
+}
+
+/** Epoch-ms of the next UTC midnight — when Twelve Data's daily credits reset. */
+function nextUtcMidnight(): number {
+  const d = new Date();
+  return Date.UTC(d.getUTCFullYear(), d.getUTCMonth(), d.getUTCDate() + 1, 0, 0, 0, 0);
+}
+
+function tripTwelveDataBreaker(reason: string): void {
+  twelveDataBlockedUntil = nextUtcMidnight();
+  console.warn(`[yahoo-feed] Twelve Data breaker tripped until next UTC midnight after ${reason}`);
+}
+
+export type TwelveDataGateReason = 'ok' | 'no_key' | 'not_active_interest' | 'breaker_open' | 'quota_exhausted';
+
+/**
+ * Pure decision function for whether a Twelve Data fallback request may fire.
+ * Extracted so the quota / breaker logic is unit-testable without a live feed
+ * or module-level env state (TRA-439).
+ */
+export function evaluateTwelveDataGate(input: {
+  hasApiKey: boolean;
+  isActiveInterest: boolean;
+  breakerOpenUntil: number;
+  callsToday: number;
+  dailyBudget: number;
+  now: number;
+}): { allowed: boolean; reason: TwelveDataGateReason } {
+  if (!input.hasApiKey) return { allowed: false, reason: 'no_key' };
+  if (!input.isActiveInterest) return { allowed: false, reason: 'not_active_interest' };
+  if (input.now < input.breakerOpenUntil) return { allowed: false, reason: 'breaker_open' };
+  if (input.callsToday >= input.dailyBudget) return { allowed: false, reason: 'quota_exhausted' };
+  return { allowed: true, reason: 'ok' };
+}
+
+/**
+ * Current Twelve Data quota / breaker state — surfaced by `/api/health/quotes`
+ * so QA can see how much of the daily budget is spent and whether the breaker
+ * is open (TRA-439).
+ */
+export function getTwelveDataQuotaState(): {
+  dailyBudget: number;
+  callsToday: number;
+  remaining: number;
+  breakerOpen: boolean;
+  breakerOpenUntil: string | null;
+} {
+  rollFallbackCountersIfNeeded();
+  const used = fallbackCounters.twelveData;
+  return {
+    dailyBudget: TWELVE_DATA_DAILY_BUDGET,
+    callsToday: used,
+    remaining: Math.max(0, TWELVE_DATA_DAILY_BUDGET - used),
+    breakerOpen: isTwelveDataBlocked(),
+    breakerOpenUntil: twelveDataBlockedUntil > Date.now() ? new Date(twelveDataBlockedUntil).toISOString() : null,
+  };
+}
+
 interface TwelveDataValue {
   datetime?: string;
   open?: string;
@@ -214,7 +299,17 @@ interface TwelveDataResponse {
 }
 
 export interface TwelveDataCandleDiag {
-  reason: 'no_key' | 'not_active_interest' | 'http_error' | 'no_data' | 'parse_error' | 'fetch_error' | 'rate_limited' | 'ok';
+  reason:
+    | 'no_key'
+    | 'not_active_interest'
+    | 'breaker_open'
+    | 'quota_exhausted'
+    | 'http_error'
+    | 'no_data'
+    | 'parse_error'
+    | 'fetch_error'
+    | 'rate_limited'
+    | 'ok';
   httpStatus?: number;
   rawLen?: number;
   filteredLen?: number;
@@ -233,8 +328,15 @@ async function fetchTwelveDataMinuteBars(
   count: number,
   isActive: boolean,
 ): Promise<{ bars: Candle[]; diag: TwelveDataCandleDiag }> {
-  if (!TWELVE_DATA_API_KEY) return { bars: [], diag: { reason: 'no_key' } };
-  if (!isActive) return { bars: [], diag: { reason: 'not_active_interest' } };
+  const gate = evaluateTwelveDataGate({
+    hasApiKey: TWELVE_DATA_API_KEY.length > 0,
+    isActiveInterest: isActive,
+    breakerOpenUntil: twelveDataBlockedUntil,
+    callsToday: getFallbackRequestCounts().twelveData,
+    dailyBudget: TWELVE_DATA_DAILY_BUDGET,
+    now: Date.now(),
+  });
+  if (!gate.allowed) return { bars: [], diag: { reason: gate.reason } };
   const outputsize = Math.min(Math.max(count * 2, 30), 500);
   try {
     bumpFallbackCounter('twelveData');
@@ -243,6 +345,11 @@ async function fetchTwelveDataMinuteBars(
     if (!resp.ok) {
       const errorBody = await resp.text().catch(() => '');
       console.warn(`[yahoo-feed] twelvedata candle(${symbol}) HTTP ${resp.status}: ${errorBody.slice(0, 200)}`);
+      if (resp.status === 429) {
+        // Out of credits / rate-limited — stop calling Twelve Data for the day.
+        tripTwelveDataBreaker(`HTTP 429 on candle(${symbol})`);
+        return { bars: [], diag: { reason: 'rate_limited', httpStatus: resp.status, errorBody: errorBody.slice(0, 200) } };
+      }
       return { bars: [], diag: { reason: 'http_error', httpStatus: resp.status, errorBody: errorBody.slice(0, 200) } };
     }
     const json = (await resp.json()) as TwelveDataResponse;
@@ -250,6 +357,9 @@ async function fetchTwelveDataMinuteBars(
       const msg = json.message ?? 'unknown error';
       const code = json.code ?? 0;
       if (code === 429 || /\b(rate|limit|credits|daily)\b/i.test(msg)) {
+        // Twelve Data returns 200 OK with a JSON error body when the daily
+        // credit budget is exhausted; open the breaker so we stop here.
+        tripTwelveDataBreaker(`credit/rate-limit response on candle(${symbol}): ${msg.slice(0, 80)}`);
         return { bars: [], diag: { reason: 'rate_limited', httpStatus: resp.status, errorBody: msg.slice(0, 200) } };
       }
       return { bars: [], diag: { reason: 'http_error', httpStatus: resp.status, errorBody: msg.slice(0, 200) } };
@@ -435,6 +545,10 @@ export async function fetchMinuteBarsWithSource(
     };
   }
 
+  // Negative-cache the miss so a back-to-back tick in the same minute does not
+  // re-run the Twelve Data fallback (TRA-439). Bars only roll on the minute
+  // boundary, so a miss now is a miss until the next boundary.
+  minuteBarCache.set(symbol, { bars: [], source: 'none', expiresAt: nextMinuteBoundary() });
   return {
     bars: [],
     source: 'none',

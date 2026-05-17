@@ -2761,6 +2761,7 @@ app.get('/api/health/quotes', async (_req, res) => {
     isTradierStocksConfigured,
     fetchMinuteBarsWithSource,
     getFallbackRequestCounts,
+    getTwelveDataQuotaState,
   } = await import('./yahoo-feed.js');
   const { testCoinMarketCap, testCoinbase, isCoinbaseBreakerOpen } = await import('./crypto-feed.js');
   const results: Record<string, unknown> = {};
@@ -2824,6 +2825,11 @@ app.get('/api/health/quotes', async (_req, res) => {
 
   // Daily request counters per provider. Resets at UTC midnight.
   results['fallbackRequestsToday'] = getFallbackRequestCounts();
+
+  // TRA-439 — Twelve Data quota guard: how much of the daily budget is spent
+  // and whether the credit/rate-limit breaker is open. Lets QA confirm a
+  // single provider can no longer blow its free-tier cap.
+  results['twelveDataQuota'] = getTwelveDataQuotaState();
 
   const ok = (key: string) => {
     const v = results[key];
