@@ -98,4 +98,31 @@ describe('walkForward (TRA-203)', () => {
     expect(report.windows).toHaveLength(0);
     expect(report.aggregate.totalTrades).toBe(0);
   });
+
+  it('accepts a warmup prefix and keeps OOS trades inside the test window (TRA-420 §3)', async () => {
+    const candles = syntheticCryptoSeries(60, 'BTC-USD', 30_000, 60, 31);
+    const trainBars = 14 * 24;
+    const testBars = 7 * 24;
+    const windows = buildWindows(candles.length, trainBars, testBars);
+    expect(windows.length).toBeGreaterThan(0);
+
+    const report = await walkForward(reversalConfig(), candles, {
+      trainBars,
+      testBars,
+      warmupBars: 2 * 24,
+    });
+    expect(report.windows).toHaveLength(windows.length);
+
+    // Warmup bars only advance indicator state — no per-window OOS result may
+    // count a trade opened before its test slice starts.
+    for (let w = 0; w < report.windows.length; w++) {
+      const testStartTs = candles[windows[w].testStart].timestamp;
+      for (const t of report.windows[w].trades) {
+        expect(t.openedAt).toBeGreaterThanOrEqual(testStartTs);
+      }
+    }
+    expect(Number.isFinite(report.aggregate.sharpeRatio)).toBe(true);
+    expect(report.aggregate.maxDrawdown).toBeGreaterThanOrEqual(0);
+    expect(report.aggregate.maxDrawdown).toBeLessThanOrEqual(1);
+  });
 });

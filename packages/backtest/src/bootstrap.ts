@@ -17,6 +17,16 @@ export interface BootstrapOptions {
   seed?: number;
 }
 
+export interface BlockBootstrapOptions extends BootstrapOptions {
+  /**
+   * Block length — number of *consecutive* trades drawn together each pick.
+   * Drawing blocks rather than single trades preserves within-block
+   * autocorrelation (losing streaks, winning clusters), which the IID
+   * {@link bootstrapEquityCurves} destroys. Defaults to 5 (TRA-405 §4).
+   */
+  blockLength?: number;
+}
+
 // Mulberry32 — same generator the synthetic-candle module uses, kept inline
 // to avoid a circular dependency between modules that both want determinism.
 function mulberry32(seed: number) {
@@ -77,6 +87,79 @@ export function bootstrapEquityCurves(
       peak = Math.max(peak, equity);
       const drawdown = peak > 0 ? (peak - equity) / peak : 0;
       if (drawdown > dd) dd = drawdown;
+    }
+
+    finals.push(equity);
+    if (dd > worstDrawdown) worstDrawdown = dd;
+  }
+
+  finals.sort((a, b) => a - b);
+
+  return {
+    p5: percentile(finals, 5),
+    p50: percentile(finals, 50),
+    p95: percentile(finals, 95),
+    worstDrawdown,
+    iterations,
+  };
+}
+
+/**
+ * Moving-block bootstrap over the realised closed-trade list (TRA-420 §2,
+ * promoted from the TRA-405 research harness).
+ *
+ * The IID {@link bootstrapEquityCurves} draws one trade at a time, which
+ * silently assumes trade outcomes are independent. They are not: trend
+ * strategies cluster wins, mean-reversion strategies cluster losses, and a
+ * regime shift drags a whole run of trades the same way. Resampling *blocks*
+ * of `blockLength` consecutive trades keeps that short-range autocorrelation
+ * intact, so the resulting drawdown / p5 band is a more honest tail estimate.
+ *
+ * Each iteration draws `ceil(n / blockLength)` blocks from random (circular)
+ * start offsets, truncating the final block so exactly `n` trades are
+ * replayed — equity, peak and drawdown are tracked the same way as the IID
+ * variant so the {@link ConfidenceBands} shape is interchangeable.
+ */
+export function blockBootstrapEquityCurves(
+  trades: ReadonlyArray<Position>,
+  initialEquity: number,
+  opts: BlockBootstrapOptions = {},
+): ConfidenceBands {
+  const iterations = opts.iterations ?? 1000;
+  const blockLength = Math.max(1, Math.floor(opts.blockLength ?? 5));
+  const rand = opts.seed !== undefined ? mulberry32(opts.seed) : Math.random;
+  const pnls = trades.map(t => t.pnl ?? 0);
+
+  if (pnls.length === 0) {
+    return {
+      p5: initialEquity,
+      p50: initialEquity,
+      p95: initialEquity,
+      worstDrawdown: 0,
+      iterations,
+    };
+  }
+
+  const n = pnls.length;
+  const finals: number[] = [];
+  let worstDrawdown = 0;
+
+  for (let it = 0; it < iterations; it++) {
+    let equity = initialEquity;
+    let peak = initialEquity;
+    let dd = 0;
+    let drawn = 0;
+
+    while (drawn < n) {
+      const start = Math.floor(rand() * n);
+      for (let k = 0; k < blockLength && drawn < n; k++, drawn++) {
+        // Circular wrap so a start offset near the tail still yields a full
+        // block — keeps every trade equally likely to head a block.
+        equity += pnls[(start + k) % n];
+        peak = Math.max(peak, equity);
+        const drawdown = peak > 0 ? (peak - equity) / peak : 0;
+        if (drawdown > dd) dd = drawdown;
+      }
     }
 
     finals.push(equity);

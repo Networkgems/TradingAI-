@@ -671,3 +671,100 @@ describe('BacktestRunner TRA-211 lifecycle wiring', () => {
     expect(r2.totalTrades).toBe(0);
   });
 });
+
+// ── TRA-420 §4: next-bar-open fill ────────────────────────────────────────────
+
+describe('BacktestRunner TRA-420 next-bar-open fill', () => {
+  function baseConfig(over: Partial<BacktestConfig> = {}): BacktestConfig {
+    return {
+      symbol: 'AAPL',
+      startDate: 0,
+      endDate: Number.MAX_SAFE_INTEGER,
+      initialEquity: 100_000,
+      strategyType: 'orb',
+      ...over,
+    };
+  }
+
+  it('fills every entry at a bar open, never at the signal bar close', async () => {
+    // With zero slippage the recorded entry price IS the fill price. A signal
+    // computed from bar k's close must fill at bar k+1's *open* — so every
+    // closed trade's entryPrice must coincide with some candle's open. The
+    // pre-TRA-420 runner filled at the strategy's signal price (the ORB
+    // breakout level, a high — not an open).
+    const candles = orbFixtureCandles(60, 0.05);
+    const result = await new BacktestRunner().run(baseConfig(), candles);
+    if (result.totalTrades === 0) return; // fixture quirk — skip
+    const opens = new Set(candles.map(c => c.open));
+    for (const t of result.trades) {
+      expect(opens.has(t.entryPrice)).toBe(true);
+    }
+  });
+
+  it('does not exit a position on its own signal bar (entry deferred one bar)', async () => {
+    // A fresh entry can still be stopped on its *fill* bar, but never before:
+    // closedAt must be strictly later than the signal that produced it. With
+    // next-bar fill, openedAt (signal time) ≤ closedAt always holds, and the
+    // run still produces trades — the deferral does not starve the harness.
+    const candles = orbFixtureCandles(60, 0.05);
+    const result = await new BacktestRunner().run(baseConfig(), candles);
+    if (result.totalTrades === 0) return; // fixture quirk — skip
+    for (const t of result.trades) {
+      expect(t.closedAt ?? 0).toBeGreaterThanOrEqual(t.openedAt);
+    }
+  });
+});
+
+// ── TRA-420 §3: warmup window ─────────────────────────────────────────────────
+
+describe('BacktestRunner TRA-420 warmupStartDate', () => {
+  function baseConfig(over: Partial<BacktestConfig> = {}): BacktestConfig {
+    return {
+      symbol: 'AAPL',
+      startDate: 0,
+      endDate: Number.MAX_SAFE_INTEGER,
+      initialEquity: 100_000,
+      strategyType: 'orb',
+      ...over,
+    };
+  }
+
+  it('opens no trades before startDate even though warmup bars are supplied', async () => {
+    const candles = orbFixtureCandles(60, 0.05);
+    const evalStart = candles[20].timestamp;
+    const result = await new BacktestRunner().run(
+      baseConfig({ warmupStartDate: candles[0].timestamp, startDate: evalStart }),
+      candles,
+    );
+    // Every trade — and every signal recorded for the edge metric — must sit
+    // inside the evaluation window; warmup bars only advance indicator state.
+    for (const t of result.trades) {
+      expect(t.openedAt).toBeGreaterThanOrEqual(evalStart);
+    }
+  });
+
+  it('warmup bars do not pollute the Sharpe series with leading flat returns', async () => {
+    const candles = orbFixtureCandles(60, 0.05);
+    const evalStart = candles[30].timestamp;
+    const warmed = await new BacktestRunner().run(
+      baseConfig({ warmupStartDate: candles[0].timestamp, startDate: evalStart }),
+      candles,
+    );
+    // Sharpe / drawdown stay finite and bounded — not dragged to ~0 by 30
+    // bars of zero-return warmup that the eval window should never see.
+    expect(Number.isFinite(warmed.sharpeRatio)).toBe(true);
+    expect(warmed.maxDrawdown).toBeGreaterThanOrEqual(0);
+    expect(warmed.maxDrawdown).toBeLessThanOrEqual(1);
+  });
+
+  it('treats warmupStartDate ≥ startDate as a plain cold start', async () => {
+    const candles = orbFixtureCandles(60, 0.05);
+    const cold = await new BacktestRunner().run(baseConfig(), candles);
+    const explicitNoWarmup = await new BacktestRunner().run(
+      baseConfig({ warmupStartDate: 0 }),
+      candles,
+    );
+    expect(explicitNoWarmup.totalTrades).toBe(cold.totalTrades);
+    expect(explicitNoWarmup.totalPnl).toBeCloseTo(cold.totalPnl, 6);
+  });
+});

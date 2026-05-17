@@ -23,8 +23,8 @@ export {
   mixedRegimeCandles,
   syntheticCryptoSeries,
 } from './synthetic.js';
-export { bootstrapEquityCurves } from './bootstrap.js';
-export type { BootstrapOptions } from './bootstrap.js';
+export { bootstrapEquityCurves, blockBootstrapEquityCurves } from './bootstrap.js';
+export type { BootstrapOptions, BlockBootstrapOptions } from './bootstrap.js';
 export { buildWindows, walkForward } from './walk-forward.js';
 export type { WindowSpec, WalkForwardOptions, WalkForwardReport } from './walk-forward.js';
 // Re-export the TRA-185 cost model surface so harness scripts can pick up

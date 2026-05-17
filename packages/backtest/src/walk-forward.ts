@@ -21,16 +21,21 @@ import { writeFileSync } from 'node:fs';
 import { resolve, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { BacktestRunner } from './runner.js';
-import { syntheticCryptoSeries } from './synthetic.js';
+import { loadOrFetch4hBars } from './fetch-tra266-data.js';
+import { cryptoTieredCostModel } from '@trading-app/engine';
 import type { Candle } from '@trading-app/shared';
 import type { BacktestConfig, BacktestResult } from './types.js';
 
 const INITIAL_EQUITY = 25_000;
 const SYMBOL = 'BTC-USD';
-const DAYS = 90;
-const BAR_INTERVAL_MIN = 60; // hourly candles → 24 bars/day
-
-const BARS_PER_DAY = Math.floor((24 * 60) / BAR_INTERVAL_MIN);
+// TRA-420 §1: the committed harness runs on real Coinbase 4H bars — 6 bars
+// per 24h day — not the retired 90-day synthetic series.
+const BARS_PER_DAY = 6;
+// 4H bars: warmup must cover the slowest indicator window (200-bar EMA /
+// 90-bar ATR-median regime window). 250 bars clears both with margin.
+const WARMUP_BARS = 250;
+// Aligned with the TRA-405 4H data window (the on-disk Coinbase cache).
+const DATA_START_MS = Date.UTC(2023, 4, 1); // 2023-05-01
 
 export interface WindowSpec {
   trainStart: number; // bar index (inclusive)
@@ -79,16 +84,25 @@ export interface WalkForwardOptions {
   testBars: number;
   /** Window advance per step. Defaults to `testBars` (non-overlapping tests). */
   stepBars?: number;
+  /**
+   * TRA-420 §3: trailing warmup bars prefixed before each test slice. Without
+   * it a 30-day 4H test slice (~180 bars) cannot warm a 200-bar EMA or a
+   * 90-bar ATR-median regime window, so OOS trade counts get starved to ~0.
+   * The warmup bars advance indicator state only — no trades are opened or
+   * counted there. Defaults to 0 (cold start, legacy behaviour).
+   */
+  warmupBars?: number;
 }
 
 export interface WalkForwardReport {
   windows: BacktestResult[];
   /**
-   * Concatenated trades across every test window with metrics recomputed.
-   * `config.startDate`/`endDate` are clamped to the first window's start and
-   * the last window's end so downstream consumers see the OOS span as a
-   * single contiguous run. The bar series passed to the runner is the union
-   * of test slices, so per-bar Sharpe annualization stays valid.
+   * Out-of-sample aggregate: a single continuous run spanning the first test
+   * window's start to the last test window's end, prefixed with `warmupBars`
+   * of warmup history. With the default non-overlapping cadence the test
+   * windows are contiguous, so this span is exactly their union and per-bar
+   * Sharpe annualization stays valid. Metrics cover only the test span — the
+   * warmup prefix advances indicator state but opens no positions.
    */
   aggregate: BacktestResult;
 }
@@ -99,24 +113,28 @@ export async function walkForward(
   opts: WalkForwardOptions,
 ): Promise<WalkForwardReport> {
   const stepBars = opts.stepBars ?? opts.testBars;
+  const warmupBars = Math.max(0, opts.warmupBars ?? 0);
   const windows = buildWindows(candles.length, opts.trainBars, opts.testBars, stepBars);
   const runner = new BacktestRunner();
 
   const windowResults: BacktestResult[] = [];
-  const aggregateCandles: Candle[] = [];
   for (const win of windows) {
-    const slice = candles.slice(win.testStart, win.testEnd);
-    if (slice.length === 0) continue;
+    if (win.testEnd <= win.testStart) continue;
+    // TRA-420 §3: pass the full candle array and carve the test window with
+    // date bounds. `warmupStartDate` pulls trailing history into the runner's
+    // view so indicators are warm by the first test bar; only trades opened
+    // at-or-after `startDate` are counted.
+    const warmupIdx = Math.max(0, win.testStart - warmupBars);
     const result = await runner.run(
       {
         ...config,
-        startDate: slice[0].timestamp,
-        endDate: slice[slice.length - 1].timestamp,
+        warmupStartDate: candles[warmupIdx].timestamp,
+        startDate: candles[win.testStart].timestamp,
+        endDate: candles[win.testEnd - 1].timestamp,
       },
-      slice,
+      candles,
     );
     windowResults.push(result);
-    aggregateCandles.push(...slice);
   }
 
   if (windowResults.length === 0) {
@@ -127,17 +145,20 @@ export async function walkForward(
     return { windows: [], aggregate: empty };
   }
 
-  // Aggregate: rerun the config across the union of test slices. This is
-  // cheaper than stitching per-window stats and keeps Sharpe/MDD computed by
-  // the same code path used elsewhere — drift would silently bias headline
-  // numbers.
+  // Aggregate: one continuous run over the span of every test window, warmed
+  // by a trailing prefix before the first window. Keeps Sharpe/MDD on the
+  // same code path used elsewhere — drift would silently bias headline numbers.
+  const firstTest = windows[0].testStart;
+  const lastTestEnd = windows[windows.length - 1].testEnd;
+  const aggWarmupIdx = Math.max(0, firstTest - warmupBars);
   const aggregate = await runner.run(
     {
       ...config,
-      startDate: aggregateCandles[0].timestamp,
-      endDate: aggregateCandles[aggregateCandles.length - 1].timestamp,
+      warmupStartDate: candles[aggWarmupIdx].timestamp,
+      startDate: candles[firstTest].timestamp,
+      endDate: candles[lastTestEnd - 1].timestamp,
     },
-    aggregateCandles,
+    candles,
   );
 
   return { windows: windowResults, aggregate };
@@ -187,65 +208,101 @@ const STRATEGIES: Array<{
   { name: 'macd_bollinger', type: 'macd_bollinger', grid: MACD_GRID },
 ];
 
-async function evaluateOnSlice(
+/**
+ * Run one strategy/param point over a single warmed window. `candles` is the
+ * full series; the runner carves `[evalStart, evalEnd]` for evaluation and
+ * uses `[warmupStart, evalStart)` purely to warm indicators (TRA-420 §3).
+ */
+async function evaluateWindow(
   runner: BacktestRunner,
-  slice: Candle[],
+  candles: Candle[],
   type: BacktestConfig['strategyType'],
   point: ParamPoint,
+  warmupStart: number,
+  evalStart: number,
+  evalEnd: number,
 ): Promise<BacktestResult> {
-  const start = slice[0].timestamp;
-  const end = slice[slice.length - 1].timestamp;
   return runner.run(
     {
       symbol: SYMBOL,
-      startDate: start,
-      endDate: end,
+      warmupStartDate: warmupStart,
+      startDate: evalStart,
+      endDate: evalEnd,
       initialEquity: INITIAL_EQUITY,
       strategyType: type,
+      // TRA-420 §1: real data → real costs. Same tiered crypto cost model the
+      // TRA-405 validation harness and the live router use.
+      costModel: cryptoTieredCostModel(),
       reversalOpts: point.reversalOpts,
       macdBollingerOpts: point.macdBollingerOpts,
       portfolioOpts: { maxOpenPositions: 3, maxSectorExposure: 3 },
     },
-    slice,
+    candles,
   );
 }
 
 async function main() {
-  const candles = syntheticCryptoSeries(DAYS, SYMBOL, 30_000, BAR_INTERVAL_MIN, 31);
-  const trainBars = 60 * BARS_PER_DAY;
+  // TRA-420 §1: real Coinbase 4H bars, not the retired synthetic series.
+  const candles = await loadOrFetch4hBars(SYMBOL, DATA_START_MS, Date.now());
+  const trainBars = 120 * BARS_PER_DAY;
   const testBars = 30 * BARS_PER_DAY;
   const windows = buildWindows(candles.length, trainBars, testBars);
 
-  console.log(`Generated ${candles.length} ${BAR_INTERVAL_MIN}-min candles for ${SYMBOL} (${DAYS} days).`);
-  console.log(`Walk-forward: train=${trainBars} bars (${trainBars / BARS_PER_DAY}d), test=${testBars} bars (${testBars / BARS_PER_DAY}d), windows=${windows.length}`);
+  const span = candles.length
+    ? (candles[candles.length - 1].timestamp - candles[0].timestamp) / (365.25 * 864e5)
+    : 0;
+  console.log(`Loaded ${candles.length} real Coinbase 4H bars for ${SYMBOL} (${span.toFixed(2)}y).`);
+  console.log(
+    `Walk-forward: train=${trainBars} bars (${trainBars / BARS_PER_DAY}d, in-sample sweep), ` +
+      `test=${testBars} bars (${testBars / BARS_PER_DAY}d, out-of-sample), ` +
+      `warmup=${WARMUP_BARS} bars, windows=${windows.length}`,
+  );
+  if (windows.length === 0) {
+    throw new Error(
+      `Not enough bars (${candles.length}) for train+test = ${trainBars + testBars}`,
+    );
+  }
 
   const runner = new BacktestRunner();
+  // IS (train-window sweep) and OOS (test-window) columns are reported side by
+  // side so the in-sample vs out-of-sample gap is visible per row.
   const rows: string[] = [
-    'strategy,window,trainStart,trainEnd,testStart,testEnd,pickedParams,trainSharpe,trainTrades,testSharpe,testPnl,testWinRate,testTrades,testSignalEdgePct',
+    'strategy,window,trainStart,trainEnd,testStart,testEnd,pickedParams,' +
+      'isSharpe,isTrades,isPnl,oosSharpe,oosPnl,oosWinRate,oosTrades,oosSignalEdgePct',
   ];
 
   for (const strat of STRATEGIES) {
     for (let w = 0; w < windows.length; w++) {
       const win = windows[w];
-      const trainSlice = candles.slice(win.trainStart, win.trainEnd);
-      const testSlice = candles.slice(win.testStart, win.testEnd);
+      const trainWarmup = candles[Math.max(0, win.trainStart - WARMUP_BARS)].timestamp;
+      const trainStartTs = candles[win.trainStart].timestamp;
+      const trainEndTs = candles[win.trainEnd - 1].timestamp;
+      const testWarmup = candles[Math.max(0, win.testStart - WARMUP_BARS)].timestamp;
+      const testStartTs = candles[win.testStart].timestamp;
+      const testEndTs = candles[win.testEnd - 1].timestamp;
 
-      let best: { point: ParamPoint; sharpe: number; trades: number } | null = null;
+      // ── In-sample: sweep the grid on the warmed train window.
+      let best: { point: ParamPoint; is: BacktestResult } | null = null;
       for (const point of strat.grid) {
-        const r = await evaluateOnSlice(runner, trainSlice, strat.type, point);
+        const r = await evaluateWindow(
+          runner, candles, strat.type, point, trainWarmup, trainStartTs, trainEndTs,
+        );
         // Tie-break: prefer the point with more trades when sharpe is degenerate
         // (zero trades or near-zero variance both yield sharpe = 0).
         if (
           best === null ||
-          r.sharpeRatio > best.sharpe ||
-          (r.sharpeRatio === best.sharpe && r.totalTrades > best.trades)
+          r.sharpeRatio > best.is.sharpeRatio ||
+          (r.sharpeRatio === best.is.sharpeRatio && r.totalTrades > best.is.totalTrades)
         ) {
-          best = { point, sharpe: r.sharpeRatio, trades: r.totalTrades };
+          best = { point, is: r };
         }
       }
       if (best === null) continue;
 
-      const oos = await evaluateOnSlice(runner, testSlice, strat.type, best.point);
+      // ── Out-of-sample: evaluate the picked params on the warmed test window.
+      const oos = await evaluateWindow(
+        runner, candles, strat.type, best.point, testWarmup, testStartTs, testEndTs,
+      );
       rows.push([
         strat.name,
         String(w),
@@ -254,8 +311,9 @@ async function main() {
         String(win.testStart),
         String(win.testEnd),
         `"${best.point.label}"`,
-        best.sharpe.toFixed(4),
-        String(best.trades),
+        best.is.sharpeRatio.toFixed(4),
+        String(best.is.totalTrades),
+        best.is.totalPnl.toFixed(2),
         oos.sharpeRatio.toFixed(4),
         oos.totalPnl.toFixed(2),
         (oos.winRate * 100).toFixed(2),
@@ -264,7 +322,9 @@ async function main() {
       ].join(','));
 
       console.log(
-        `  [${strat.name} window ${w}] train sharpe=${best.sharpe.toFixed(3)} (${best.trades} trades) → ` +
+        `  [${strat.name} window ${w}] ` +
+          `IS sharpe=${best.is.sharpeRatio.toFixed(3)} trades=${best.is.totalTrades} ` +
+          `pnl=$${best.is.totalPnl.toFixed(2)} → ` +
           `OOS sharpe=${oos.sharpeRatio.toFixed(3)} pnl=$${oos.totalPnl.toFixed(2)} ` +
           `winRate=${(oos.winRate * 100).toFixed(1)}% trades=${oos.totalTrades} ` +
           `picked=[${best.point.label}]`,

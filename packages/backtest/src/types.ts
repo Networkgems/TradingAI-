@@ -78,6 +78,16 @@ export interface BacktestConfig {
   symbol: string;
   startDate: number;
   endDate: number;
+  /**
+   * TRA-420 §3: optional warmup-history boundary. When set earlier than
+   * {@link startDate}, the runner feeds candles in `[warmupStartDate,
+   * startDate)` to the strategies (and the stateful regime detector) to warm
+   * indicators — a 200-bar EMA or 90-bar ATR-median window cannot be filled
+   * by a short test slice on its own — but opens no positions and records no
+   * metrics for those bars. Trades and headline metrics still cover only
+   * `[startDate, endDate]`. Omit (or set ≥ startDate) for a cold start.
+   */
+  warmupStartDate?: number;
   initialEquity: number;
   strategyType:
     | 'orb'

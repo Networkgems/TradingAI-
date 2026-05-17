@@ -232,10 +232,11 @@ export class BacktestRunner {
       if (leg === 'exit') return feeRates.taker;
       return executionMode === 'limit' ? feeRates.maker : feeRates.taker;
     };
-    const applyEntrySlippage = (signal: TradeSignal): number =>
-      signal.side === 'buy'
-        ? signal.entryPrice * (1 + slipRate)
-        : signal.entryPrice * (1 - slipRate);
+    // TRA-420 §4: entries fill at the *next* bar's open, not the signal
+    // bar's close, so the caller supplies the raw fill price per fill.
+    // Slippage is still applied adversely (buys up, sells down).
+    const applyEntryFill = (side: 'buy' | 'sell', rawEntry: number): number =>
+      side === 'buy' ? rawEntry * (1 + slipRate) : rawEntry * (1 - slipRate);
     const applyExitSlippage = (side: 'buy' | 'sell', rawExit: number): number =>
       side === 'buy' ? rawExit * (1 - slipRate) : rawExit * (1 + slipRate);
     const computePnl = (
@@ -252,8 +253,15 @@ export class BacktestRunner {
       return gross - commission;
     };
 
+    // TRA-420 §3: when `warmupStartDate` precedes `startDate`, pull the
+    // earlier bars into `filtered` so the strategies — and the stateful
+    // regime detector — warm up on real history. `evalStart` is the boundary
+    // past which positions are opened and metrics recorded; warmup bars only
+    // advance indicator state. Defaults to a cold start (warmup = startDate).
+    const evalStart = config.startDate;
+    const warmupStart = Math.min(config.warmupStartDate ?? evalStart, evalStart);
     const filtered = candles.filter(
-      c => c.timestamp >= config.startDate && c.timestamp <= config.endDate,
+      c => c.timestamp >= warmupStart && c.timestamp <= config.endDate,
     );
 
     const closedTrades: Position[] = [];
@@ -278,61 +286,22 @@ export class BacktestRunner {
     const lookahead = config.signalEdgeOpts?.lookaheadBars ?? DEFAULT_LOOKAHEAD_BARS;
     const signalLog: Array<{ signal: TradeSignal; barIndex: number }> = [];
     const seenSignalIds = new Set<string>();
+    // TRA-420 §4: signals computed on bar k's close, parked here until bar
+    // k+1 so they fill at the next bar's open. Only ever holds one bar's
+    // worth — drained at the top of every iteration.
+    let pendingSignals: TradeSignal[] = [];
 
     for (let i = 1; i <= filtered.length; i++) {
       const window = filtered.slice(0, i);
-      const signals = [];
+      const latest = filtered[i - 1];
+      // TRA-420 §3: bars before `evalStart` only warm indicator/regime state.
+      const inEvalWindow = latest.timestamp >= evalStart;
 
-      if (config.strategyType === 'orb' || config.strategyType === 'combined') {
-        const s = orb.evaluate(config.symbol, window);
-        if (s) signals.push(s);
-      }
-      if (config.strategyType === 'reversal' || config.strategyType === 'combined') {
-        const s = reversal.evaluate(config.symbol, window);
-        if (s) signals.push(s);
-      }
-      if (config.strategyType === 'macd' || config.strategyType === 'macd_trend' || config.strategyType === 'macd_bollinger' || config.strategyType === 'combined') {
-        const t = macdTrend.evaluate(config.symbol, window);
-        if (t) signals.push(t);
-      }
-      if (config.strategyType === 'bb_fade' || config.strategyType === 'macd_bollinger' || config.strategyType === 'combined') {
-        const f = bbFade.evaluate(config.symbol, window);
-        if (f) signals.push(f);
-      }
-      if (config.strategyType === 'momentum' || config.strategyType === 'combined') {
-        const m = momentum.evaluate(config.symbol, window);
-        if (m) signals.push(m);
-      }
-      if (config.strategyType === 'breakout_vol' || config.strategyType === 'combined') {
-        const b = breakoutVol.evaluate(config.symbol, window);
-        if (b) signals.push(b);
-      }
-      if (config.strategyType === 'mean_reversion' || config.strategyType === 'combined') {
-        const m = meanReversion.evaluate(config.symbol, window);
-        if (m) signals.push(m);
-      }
-      if (config.strategyType === 'ichimoku' || config.strategyType === 'combined') {
-        const s = ichimoku.evaluate(config.symbol, window);
-        if (s) signals.push(s);
-      }
-      if (config.strategyType === 'scalping' || config.strategyType === 'combined') {
-        const s = scalping.evaluate(config.symbol, window);
-        if (s) signals.push(s);
-      }
-      if (config.strategyType === 'swing' || config.strategyType === 'combined') {
-        const s = swing.evaluate(config.symbol, window);
-        if (s) signals.push(s);
-      }
-
-      for (const signal of signals) {
-        // Track every distinct signal exactly once for the signal-edge metric,
-        // independent of whether the trade is taken (some get blocked by
-        // already-open / portfolio-cap filters below).
-        if (!seenSignalIds.has(signal.id)) {
-          seenSignalIds.add(signal.id);
-          signalLog.push({ signal, barIndex: i - 1 });
-        }
-
+      // ── (A) Fill signals queued on the *previous* bar at this bar's open.
+      // TRA-420 §4: a signal computed from bar k's close cannot fill before
+      // bar k+1's open — checking it against bar k's own high/low is
+      // look-ahead bias. `pendingSignals` carries exactly one bar's worth.
+      for (const signal of pendingSignals) {
         const alreadyOpen = positions.getOpen().some(p => p.signalType === signal.type);
         if (alreadyOpen) continue;
 
@@ -356,7 +325,9 @@ export class BacktestRunner {
         const qty = risk.sizeFromStop(signal.entryPrice, signal.stopLoss, { riskPct });
         if (qty > 0) {
           const opened = positions.open(signal, qty);
-          entryFills.set(opened.id, applyEntrySlippage(signal));
+          // TRA-420 §4: entry fills at THIS bar's open — the first price
+          // obtainable after the prior bar's close-derived signal.
+          entryFills.set(opened.id, applyEntryFill(signal.side, latest.open));
           // TRA-211: seed the per-position lifecycle state at entry so the
           // RSI-50 alt-exit can compare against the entry-bar RSI and the
           // breakout BE trigger uses the entry-bar ATR (immune to subsequent
@@ -365,13 +336,13 @@ export class BacktestRunner {
           positions.setLifecycle(opened.id, initLifecycleState(opened, window));
         }
       }
+      pendingSignals = [];
 
       // ── Per-bar lifecycle: time stops, trailing-stop ratchets, RSI alt
       // exit (TRA-211). Runs BEFORE the hard-stop / take-profit check so a
       // tightened trail can fire on the same bar it was raised, and
       // time-stop / RSI-alt exits beat a slower bracket exit when both
       // would resolve on the same bar.
-      const latest = filtered[i - 1];
       for (const pos of positions.getOpen()) {
         const ls = positions.getLifecycle(pos.id);
         if (!ls) continue;
@@ -539,25 +510,88 @@ export class BacktestRunner {
       // TRA-203: bar-level mark-to-market. After processing entries and
       // exits, value remaining open positions at this bar's close so peak
       // equity / drawdown / per-bar returns capture unrealized PnL too.
-      const closePx = filtered[i - 1].close;
-      let unrealized = 0;
-      for (const pos of positions.getOpen()) {
-        const entryFill = entryFills.get(pos.id) ?? pos.entryPrice;
-        const dir = pos.side === 'buy' ? 1 : -1;
-        unrealized += (closePx - entryFill) * pos.quantity * dir;
+      // TRA-420 §3: skipped during warmup — no positions are open there, and
+      // recording flat warmup bars would dilute the annualized Sharpe.
+      if (inEvalWindow) {
+        const closePx = latest.close;
+        let unrealized = 0;
+        for (const pos of positions.getOpen()) {
+          const entryFill = entryFills.get(pos.id) ?? pos.entryPrice;
+          const dir = pos.side === 'buy' ? 1 : -1;
+          unrealized += (closePx - entryFill) * pos.quantity * dir;
+        }
+        const mtmEquity = runningEquity + unrealized;
+        peakEquity = Math.max(peakEquity, mtmEquity);
+        if (peakEquity > 0) {
+          const drawdown = (peakEquity - mtmEquity) / peakEquity;
+          if (drawdown > maxDrawdown) maxDrawdown = drawdown;
+        }
+        if (prevMtmEquity > 0) {
+          barReturns.push((mtmEquity - prevMtmEquity) / prevMtmEquity);
+        } else {
+          barReturns.push(0);
+        }
+        prevMtmEquity = mtmEquity;
       }
-      const mtmEquity = runningEquity + unrealized;
-      peakEquity = Math.max(peakEquity, mtmEquity);
-      if (peakEquity > 0) {
-        const drawdown = (peakEquity - mtmEquity) / peakEquity;
-        if (drawdown > maxDrawdown) maxDrawdown = drawdown;
+
+      // ── (E) Evaluate strategies on the window ending at this bar. Run even
+      // during warmup so the stateful regime detector's hysteresis is warm by
+      // the first eval bar; only eval-window signals are recorded for the
+      // signal-edge metric and queued to fill at the next bar's open.
+      const signals = [];
+      if (config.strategyType === 'orb' || config.strategyType === 'combined') {
+        const s = orb.evaluate(config.symbol, window);
+        if (s) signals.push(s);
       }
-      if (prevMtmEquity > 0) {
-        barReturns.push((mtmEquity - prevMtmEquity) / prevMtmEquity);
-      } else {
-        barReturns.push(0);
+      if (config.strategyType === 'reversal' || config.strategyType === 'combined') {
+        const s = reversal.evaluate(config.symbol, window);
+        if (s) signals.push(s);
       }
-      prevMtmEquity = mtmEquity;
+      if (config.strategyType === 'macd' || config.strategyType === 'macd_trend' || config.strategyType === 'macd_bollinger' || config.strategyType === 'combined') {
+        const t = macdTrend.evaluate(config.symbol, window);
+        if (t) signals.push(t);
+      }
+      if (config.strategyType === 'bb_fade' || config.strategyType === 'macd_bollinger' || config.strategyType === 'combined') {
+        const f = bbFade.evaluate(config.symbol, window);
+        if (f) signals.push(f);
+      }
+      if (config.strategyType === 'momentum' || config.strategyType === 'combined') {
+        const m = momentum.evaluate(config.symbol, window);
+        if (m) signals.push(m);
+      }
+      if (config.strategyType === 'breakout_vol' || config.strategyType === 'combined') {
+        const b = breakoutVol.evaluate(config.symbol, window);
+        if (b) signals.push(b);
+      }
+      if (config.strategyType === 'mean_reversion' || config.strategyType === 'combined') {
+        const m = meanReversion.evaluate(config.symbol, window);
+        if (m) signals.push(m);
+      }
+      if (config.strategyType === 'ichimoku' || config.strategyType === 'combined') {
+        const s = ichimoku.evaluate(config.symbol, window);
+        if (s) signals.push(s);
+      }
+      if (config.strategyType === 'scalping' || config.strategyType === 'combined') {
+        const s = scalping.evaluate(config.symbol, window);
+        if (s) signals.push(s);
+      }
+      if (config.strategyType === 'swing' || config.strategyType === 'combined') {
+        const s = swing.evaluate(config.symbol, window);
+        if (s) signals.push(s);
+      }
+
+      if (inEvalWindow) {
+        for (const signal of signals) {
+          // Track every distinct signal exactly once for the signal-edge
+          // metric, independent of whether the trade is ultimately taken.
+          if (!seenSignalIds.has(signal.id)) {
+            seenSignalIds.add(signal.id);
+            signalLog.push({ signal, barIndex: i - 1 });
+          }
+          // Queue for a next-bar-open fill (TRA-420 §4).
+          pendingSignals.push(signal);
+        }
+      }
     }
 
     const winners = closedTrades.filter(t => (t.pnl ?? 0) > 0);
