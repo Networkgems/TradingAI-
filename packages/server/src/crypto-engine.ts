@@ -43,6 +43,9 @@ import { CryptoPaperAccount } from './crypto-account.js';
 import { CryptoLiveAccount } from './crypto-live-account.js';
 import { FundingRateTracker } from './funding-rate-tracker.js';
 import type { PnlTracker } from './pnl-tracker.js';
+import { logger } from './observability/index.js';
+
+const log = logger.child({ module: 'crypto-engine' });
 
 export type CryptoEngineEventHandler = (state: CryptoEngineState) => void;
 
@@ -243,7 +246,7 @@ export class CryptoSignalEngine {
       // Surface the auth scheme so an operator pasting a PEM private key into
       // the API Secret field can confirm it parsed as CDP (rather than silently
       // falling back to HMAC and 401-ing on every order).
-      console.log(`[crypto-engine] Coinbase client built (auth=${client.getAuthScheme()}).`);
+      log.info('Coinbase client built', { auth: client.getAuthScheme() });
       // TRA-249-C — seed routing mode from settings so the very first tick
       // respects spot_only when the user opted out. Default 'hybrid' matches
       // DEFAULT_ACCOUNT_SETTINGS for users that pre-date TRA-249-E.
@@ -282,7 +285,7 @@ export class CryptoSignalEngine {
       }
       return live;
     } catch (err: unknown) {
-      console.warn('[crypto-engine] Coinbase init failed:', err instanceof Error ? err.message : String(err));
+      log.warn('Coinbase init failed', { reason: err instanceof Error ? err.message : String(err) });
       return null;
     }
   }
@@ -300,7 +303,7 @@ export class CryptoSignalEngine {
     if (this.liveAccount || this.liveBrokerInitInFlight) return;
     const broker = this.buildLiveBroker();
     if (!broker) {
-      console.warn('[crypto-engine] live mode active but Coinbase credentials not configured — orders will not be sent.');
+      log.warn('live mode active but Coinbase credentials not configured — orders will not be sent');
       return;
     }
     this.liveBrokerInitInFlight = true;
@@ -318,7 +321,7 @@ export class CryptoSignalEngine {
    * last line, after broker truth has been reconciled.
    */
   private async bootInitLiveBroker(broker: CryptoLiveAccount): Promise<void> {
-    console.log('[crypto-engine] Coinbase live broker initialised — reconciling broker state before first live tick…');
+    log.info('Coinbase live broker initialised — reconciling broker state before first live tick');
     // TRA-408 — reconcile broker truth (balances + open spot/perp positions)
     // BEFORE publishing `broker` to `this.liveAccount`. While `liveAccount` is
     // null `runLiveTick` no-ops, so deferring the assignment guarantees the
@@ -353,7 +356,7 @@ export class CryptoSignalEngine {
     // hourly scheduler tick accrues against the freshly-initialised account
     // (including any positions reconciled from Coinbase above).
     this.fundingTracker = new FundingRateTracker(broker, broker.getCoinbaseClient());
-    console.log('[crypto-engine] Coinbase live broker ready — live trading active.');
+    log.info('Coinbase live broker ready — live trading active');
   }
 
   /**
@@ -486,9 +489,12 @@ export class CryptoSignalEngine {
     const filterStr = startupPreset.symbolFilter
       ? `[${startupPreset.symbolFilter.join(',')}]`
       : '(no filter — all watchlist symbols)';
-    console.log(
-      `[crypto-engine] startup preset: id=${startupPreset.id} env="${FORCED_PRESET_ENV}" strategies=[${startupPreset.enabledStrategies.join(',')}] symbolFilter=${filterStr}`,
-    );
+    log.info('startup preset', {
+      id: startupPreset.id,
+      env: FORCED_PRESET_ENV,
+      strategies: startupPreset.enabledStrategies,
+      symbolFilter: filterStr,
+    });
     // Pre-seed symbolState so clients that connect before the first tick see all expected symbols.
     // Entries with lastUpdated=0 signal "loading" to the UI.
     for (const sym of this.getActiveSymbols()) {
@@ -518,7 +524,7 @@ export class CryptoSignalEngine {
 
   refresh(): void {
     this.tick().catch((err: unknown) => {
-      console.error('[crypto-engine] refresh tick error:', err instanceof Error ? err.message : String(err));
+      log.error('refresh tick error', { reason: err instanceof Error ? err.message : String(err) });
     });
   }
 
@@ -758,7 +764,7 @@ export class CryptoSignalEngine {
     try {
       await this.doTick();
     } catch (err: unknown) {
-      console.error('[crypto-engine] tick error:', err instanceof Error ? err.message : String(err));
+      log.error('tick error', { reason: err instanceof Error ? err.message : String(err) });
     } finally {
       this.tickRunning = false;
     }
@@ -833,10 +839,9 @@ export class CryptoSignalEngine {
             });
           }
         } catch (err: unknown) {
-          console.warn(
-            '[crypto-engine] Coinbase fallback price lookup failed:',
-            err instanceof Error ? err.message : String(err),
-          );
+          log.warn('Coinbase fallback price lookup failed', {
+            reason: err instanceof Error ? err.message : String(err),
+          });
         }
       }
     }
@@ -1011,7 +1016,7 @@ export class CryptoSignalEngine {
           // quote doesn't block the signal from retrying for 5 minutes.
           const price = prices.get(sym);
           if (!price) {
-            console.warn(`[crypto-engine] ${sym} ${signal.type}: no quote in cache — skipping (will retry next tick)`);
+            log.warn('no quote in cache — skipping (will retry next tick)', { sym, signalType: signal.type });
             continue;
           }
 
@@ -1041,13 +1046,13 @@ export class CryptoSignalEngine {
           const cbListed = isCoinbaseListed(sym);
           if (cbListed === false) {
             signal.signalSkipReason = `${sym} not listed on Coinbase Exchange — skipping entry (we only trade what Coinbase trades)`;
-            console.warn(`[crypto-engine] ${sym} ${signal.type}: ${signal.signalSkipReason}`);
+            log.warn('signal skipped', { sym, signalType: signal.type, reason: signal.signalSkipReason });
             continue;
           }
           const source = quoteSources.get(sym);
           if (cbListed === true && source !== 'coinbase') {
             signal.signalSkipReason = `${sym} listed on Coinbase but no Coinbase quote this tick (got ${source ?? 'no quote'}) — refusing fallback-priced entry`;
-            console.warn(`[crypto-engine] ${sym} ${signal.type}: ${signal.signalSkipReason}`);
+            log.warn('signal skipped', { sym, signalType: signal.type, reason: signal.signalSkipReason });
             continue;
           }
           // cbListed === null → catalog never refreshed successfully. Fall
@@ -1056,7 +1061,7 @@ export class CryptoSignalEngine {
           // through Yahoo's ghost ticker. This is the fail-closed branch.
           if (cbListed === null && source !== 'coinbase') {
             signal.signalSkipReason = `${sym} no Coinbase quote and Coinbase product catalog unavailable — refusing fallback-priced entry`;
-            console.warn(`[crypto-engine] ${sym} ${signal.type}: ${signal.signalSkipReason}`);
+            log.warn('signal skipped', { sym, signalType: signal.type, reason: signal.signalSkipReason });
             continue;
           }
 
@@ -1065,7 +1070,7 @@ export class CryptoSignalEngine {
         }
       }
       if (symbolsSkipped > 0) {
-        console.warn(`[crypto-engine] tick: ${symbolsEvaluated} symbols evaluated, ${symbolsSkipped} skipped (no candle data)`);
+        log.warn('tick: symbols skipped (no candle data)', { symbolsEvaluated, symbolsSkipped });
       }
     }
 
@@ -1133,7 +1138,7 @@ export class CryptoSignalEngine {
         this.liveClosedPositions.push(...closed);
       }
     } catch (err: unknown) {
-      console.warn('[crypto-engine] live exits error:', err instanceof Error ? err.message : String(err));
+      log.warn('live exits error', { reason: err instanceof Error ? err.message : String(err) });
     }
 
     // Refresh candle caches so live mode evaluates strategies on fresh bars.
@@ -1228,25 +1233,25 @@ export class CryptoSignalEngine {
         const cbListed = isCoinbaseListed(sym);
         if (cbListed === false) {
           signal.signalSkipReason = `${sym} not listed on Coinbase Exchange — skipping entry (we only trade what Coinbase trades)`;
-          console.warn(`[crypto-engine] ${sym} ${signal.type}: ${signal.signalSkipReason}`);
+          log.warn('signal skipped', { sym, signalType: signal.type, reason: signal.signalSkipReason });
           continue;
         }
         const source = quoteSources.get(sym);
         if (cbListed === true && source !== 'coinbase') {
           signal.signalSkipReason = `${sym} listed on Coinbase but no Coinbase quote this tick (got ${source ?? 'no quote'}) — refusing fallback-priced entry`;
-          console.warn(`[crypto-engine] ${sym} ${signal.type}: ${signal.signalSkipReason}`);
+          log.warn('signal skipped', { sym, signalType: signal.type, reason: signal.signalSkipReason });
           continue;
         }
         if (cbListed === null && source !== 'coinbase') {
           signal.signalSkipReason = `${sym} no Coinbase quote and Coinbase product catalog unavailable — refusing fallback-priced entry`;
-          console.warn(`[crypto-engine] ${sym} ${signal.type}: ${signal.signalSkipReason}`);
+          log.warn('signal skipped', { sym, signalType: signal.type, reason: signal.signalSkipReason });
           continue;
         }
 
         try {
           await live.openPosition(signal, price, source);
         } catch (err: unknown) {
-          console.warn(`[crypto-engine] live open failed for ${sym}: ${err instanceof Error ? err.message : String(err)}`);
+          log.warn('live open failed', { sym, reason: err instanceof Error ? err.message : String(err) });
         }
       }
     }
@@ -1288,7 +1293,7 @@ export class CryptoSignalEngine {
       // last known price/volume so the row still renders a number under the
       // "stale" badge instead of collapsing to a Loading… spinner.
       if (state) this.symbolState.set(sym, { ...state, quoteStatus: 'stale' });
-      console.warn(`[crypto-engine] ${sym} feed stale — ${verdict.reason}; skipping signal evaluation`);
+      log.warn('feed stale; skipping signal evaluation', { sym, reason: verdict.reason });
     }
     return stale;
   }
@@ -1482,7 +1487,7 @@ export class CryptoSignalEngine {
     try {
       await tracker.tick();
     } catch (err: unknown) {
-      console.warn('[crypto-engine] funding hourly tick failed:', err instanceof Error ? err.message : String(err));
+      log.warn('funding hourly tick failed', { reason: err instanceof Error ? err.message : String(err) });
     }
   }
 

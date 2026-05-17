@@ -23,6 +23,7 @@ import { randomUUID } from 'crypto';
 import { logger } from './observability/index.js';
 
 const balanceLog = logger.child({ module: 'signal-engine' });
+const log = logger.child({ module: 'signal-engine' });
 
 export interface SymbolState {
   symbol: string;
@@ -822,7 +823,7 @@ export class SignalEngine {
 
   refresh(): void {
     this.tick().catch((err: unknown) => {
-      console.error('[signal-engine] refresh tick error:', err instanceof Error ? err.message : String(err));
+      log.error('refresh tick error', { reason: err instanceof Error ? err.message : String(err) });
     });
   }
 
@@ -837,7 +838,7 @@ export class SignalEngine {
     try {
       await this.doTick();
     } catch (err: unknown) {
-      console.error('[signal-engine] tick error:', err instanceof Error ? err.message : String(err));
+      log.error('tick error', { reason: err instanceof Error ? err.message : String(err) });
     } finally {
       this.tickRunning = false;
     }
@@ -975,15 +976,20 @@ export class SignalEngine {
     try {
       const summary = await this.reconcilePendingCloses();
       if (summary.filled + summary.cleared + summary.repriced > 0) {
-        console.log(
-          `[tradier-reconcile] tick summary filled=${summary.filled} cleared=${summary.cleared} repriced=${summary.repriced} stillPending=${summary.stillPending} noClient=${summary.noClient}`,
-        );
+        log.info('tradier-reconcile tick summary', {
+          component: 'tradier-reconcile',
+          filled: summary.filled,
+          cleared: summary.cleared,
+          repriced: summary.repriced,
+          stillPending: summary.stillPending,
+          noClient: summary.noClient,
+        });
       }
     } catch (err: unknown) {
-      console.warn(
-        '[tradier-reconcile] sweep threw:',
-        err instanceof Error ? err.message : String(err),
-      );
+      log.warn('tradier-reconcile sweep threw', {
+        component: 'tradier-reconcile',
+        reason: err instanceof Error ? err.message : String(err),
+      });
     }
     // TRA-356 — portfolio-level reconcile so manual Tradier-side activity
     // (opens, closes, partial fills) flows back into local state between
@@ -995,10 +1001,10 @@ export class SignalEngine {
     try {
       await this.reconcileLivePortfolio();
     } catch (err: unknown) {
-      console.warn(
-        '[tradier-portfolio-reconcile] sweep threw:',
-        err instanceof Error ? err.message : String(err),
-      );
+      log.warn('tradier-portfolio-reconcile sweep threw', {
+        component: 'tradier-portfolio-reconcile',
+        reason: err instanceof Error ? err.message : String(err),
+      });
     }
     // TRA-415 — equity-position reconcile so a stock opened / closed
     // out-of-band on the Tradier UI (or left behind by a failed mirror
@@ -1017,10 +1023,10 @@ export class SignalEngine {
         this.equityReconciledOnBoot = true;
       }
     } catch (err: unknown) {
-      console.warn(
-        '[tradier-equity-reconcile] sweep threw:',
-        err instanceof Error ? err.message : String(err),
-      );
+      log.warn('tradier-equity-reconcile sweep threw', {
+        component: 'tradier-equity-reconcile',
+        reason: err instanceof Error ? err.message : String(err),
+      });
     }
     const optionMarks = await this.refreshOptionMarks();
     // TRA-351 — push the freshly-fetched marks onto imported rows BEFORE
@@ -1127,7 +1133,7 @@ export class SignalEngine {
         if (equityFeedGateActive) {
           const verdict = evaluateFeedFreshness({ candles }, freshnessNow);
           if (verdict.stale) {
-            console.warn(`[signal-engine] ${sym} equity feed stale — ${verdict.reason}; skipping signal evaluation`);
+            log.warn('equity feed stale; skipping signal evaluation', { sym, reason: verdict.reason });
             continue;
           }
         }
@@ -1156,7 +1162,7 @@ export class SignalEngine {
           // saw the same signal fire every 5 minutes for hours with zero positions opened.
           const price = prices.get(sym);
           if (!price) {
-            console.warn(`[signal-engine] ${sym} ${signal.type}: no quote in cache — skipping (will retry next tick)`);
+            log.warn('no quote in cache — skipping (will retry next tick)', { sym, signalType: signal.type });
             continue;
           }
 
@@ -1245,7 +1251,7 @@ export class SignalEngine {
         }
       }
       if (symbolsWithData === 0 && activeSymbols.length > 0) {
-        console.warn('[signal-engine] tick: no symbols had sufficient candle data (market closed or data unavailable)');
+        log.warn('tick: no symbols had sufficient candle data (market closed or data unavailable)');
       }
     }
 
@@ -1323,7 +1329,7 @@ export class SignalEngine {
           const mark = await this.rvScanner!.getOptionMark(o.symbol, o.expiration!, o.optionSymbol!);
           if (mark != null && mark > 0) marks.set(o.optionSymbol!, mark);
         } catch (err: unknown) {
-          console.warn(`[signal-engine] getOptionMark(${o.optionSymbol}) failed: ${err instanceof Error ? err.message : String(err)}`);
+          log.warn('getOptionMark failed', { optionSymbol: o.optionSymbol, reason: err instanceof Error ? err.message : String(err) });
         }
       }),
     );
@@ -1386,22 +1392,28 @@ export class SignalEngine {
               ? detail.avg_fill_price
               : pendingExit.limitPrice;
             acct.finalizePendingExit(opt.id, fill);
-            console.log(
-              `[signal-engine] tradier sell_to_close ${opt.optionSymbol} qty=${pendingExit.qty} `
-              + `filled @ $${fill.toFixed(2)} (order=${pendingExit.tradierOrderId}, kind=${pendingExit.kind})`,
-            );
+            log.info('tradier sell_to_close filled', {
+              optionSymbol: opt.optionSymbol,
+              qty: pendingExit.qty,
+              fillPrice: fill,
+              order: pendingExit.tradierOrderId,
+              kind: pendingExit.kind,
+            });
           } else if (TRADIER_REJECTED_STATUSES.has(status)) {
             const reasonSuffix = detail.reason_description ? `: ${detail.reason_description}` : '';
             const reason = `Tradier sell_to_close ${status}${reasonSuffix}`;
             acct.clearPendingExit(opt.id, reason);
-            console.warn(
-              `[signal-engine] tradier sell_to_close ${opt.optionSymbol} (order=${pendingExit.tradierOrderId}) ${status}${reasonSuffix} — leaving paper position open`,
-            );
+            log.warn('tradier sell_to_close not filled — leaving paper position open', {
+              optionSymbol: opt.optionSymbol,
+              order: pendingExit.tradierOrderId,
+              status: `${status}${reasonSuffix}`,
+            });
           }
         } catch (err: unknown) {
-          console.warn(
-            `[signal-engine] resolvePendingOptionExits(${opt.optionSymbol}) failed: ${err instanceof Error ? err.message : String(err)}`,
-          );
+          log.warn('resolvePendingOptionExits failed', {
+            optionSymbol: opt.optionSymbol,
+            reason: err instanceof Error ? err.message : String(err),
+          });
         }
       }
     }
@@ -1440,7 +1452,7 @@ export class SignalEngine {
       } catch (err: unknown) {
         const reason = `Tradier sell_to_close submit threw: ${err instanceof Error ? err.message : String(err)}`;
         acct.clearPendingExit(snapshot.id, reason);
-        console.warn(`[signal-engine] ${reason} — ${snapshot.optionSymbol}`);
+        log.warn(reason, { optionSymbol: snapshot.optionSymbol });
         continue;
       }
 
@@ -1448,11 +1460,15 @@ export class SignalEngine {
       const priceTag = isMarket
         ? '@ market'
         : `@ limit $${intent.limitPrice.toFixed(2)}`;
-      console.log(
-        `[signal-engine] tradier sell_to_close ${snapshot.optionSymbol} qty=${intent.qty} `
-        + `${priceTag} order=${resp.id} status=${resp.status} kind=${intent.kind}`
-        + (snapshot.importedFromTradier ? ' (imported)' : ''),
-      );
+      log.info('tradier sell_to_close submitted', {
+        optionSymbol: snapshot.optionSymbol,
+        qty: intent.qty,
+        price: priceTag,
+        order: resp.id,
+        status: resp.status,
+        kind: intent.kind,
+        imported: snapshot.importedFromTradier === true,
+      });
 
       // Reach for terminal status synchronously — same pattern as TRA-319's
       // buy-side reconciliation. If Tradier filled fast we book it on this
@@ -1471,9 +1487,10 @@ export class SignalEngine {
           acct.clearPendingExit(snapshot.id, `Tradier sell_to_close ${detail.status}${reasonSuffix}`);
         }
       } catch (err: unknown) {
-        console.warn(
-          `[signal-engine] waitForOrderTerminalStatus(${resp.id}) failed: ${err instanceof Error ? err.message : String(err)} — leaving pendingExit for next tick poll`,
-        );
+        log.warn('waitForOrderTerminalStatus failed — leaving pendingExit for next tick poll', {
+          order: resp.id,
+          reason: err instanceof Error ? err.message : String(err),
+        });
       }
     }
   }
@@ -1558,7 +1575,7 @@ export class SignalEngine {
             type: 'relative_value',
             firedAt: signal.timestamp,
           });
-          console.warn(`[signal-engine] live RV signal suppressed (${cheap.optionSymbol}) — ${reason}`);
+          log.warn('live RV signal suppressed', { optionSymbol: cheap.optionSymbol, reason });
         };
 
         // TRA-332 — in live mode, size the position off the user's REAL
@@ -1651,9 +1668,11 @@ export class SignalEngine {
           // TRA-332 — also surface the void reason on the dashboard so the
           // user sees why no trade opened, not just a silent log line.
           const tradierVoid = (reason: string): void => {
-            console.warn(
-              `[signal-engine] voiding paper open ${opened.id} (${opened.optionSymbol}) — ${reason}`,
-            );
+            log.warn('voiding paper open', {
+              positionId: opened.id,
+              optionSymbol: opened.optionSymbol,
+              reason,
+            });
             this.optionsAccount.voidOpenOption(opened.id);
             surfaceLiveSkip(reason);
           };
@@ -1687,11 +1706,16 @@ export class SignalEngine {
             );
             if (outcome.status === 'filled') {
               const midStr = outcome.mid == null ? 'n/a' : `$${outcome.mid.toFixed(2)}`;
-              console.log(
-                `[smart-open] filled at $${outcome.avgFillPrice.toFixed(2)} `
-                  + `(mid ${midStr}, ask $${outcome.ask.toFixed(2)}, walk ${outcome.walk}) `
-                  + `${opened.optionSymbol} qty=${opened.contracts} order=${outcome.orderId}`,
-              );
+              log.info('smart-open filled', {
+                component: 'smart-open',
+                avgFillPrice: outcome.avgFillPrice,
+                mid: midStr,
+                ask: outcome.ask,
+                walk: outcome.walk,
+                optionSymbol: opened.optionSymbol,
+                qty: opened.contracts,
+                order: outcome.orderId,
+              });
               mirrored = true;
             } else if (outcome.status === 'rejected') {
               const idSuffix = outcome.orderId !== undefined ? ` ${outcome.orderId}` : '';
@@ -1728,7 +1752,7 @@ export class SignalEngine {
           firedAt: signal.timestamp,
         });
       } catch (err: unknown) {
-        console.warn(`[signal-engine] RV scan(${sym}) failed: ${err instanceof Error ? err.message : String(err)}`);
+        log.warn('RV scan failed', { sym, reason: err instanceof Error ? err.message : String(err) });
       }
     }
   }
@@ -1838,11 +1862,10 @@ export class SignalEngine {
     if (liveOpen && this.tradierLiveEquityClient) {
       const orderId = this.liveEquityOrderIds.get(positionId);
       this.closeTradierEquityPosition(liveOpen, currentPrice, orderId).catch((err: unknown) => {
-        console.warn(
-          `[signal-engine] Tradier live equity close ${positionId} failed: ${
-            err instanceof Error ? err.message : String(err)
-          }`,
-        );
+        log.warn('Tradier live equity close failed', {
+          positionId,
+          reason: err instanceof Error ? err.message : String(err),
+        });
       });
       const multiplier = liveOpen.side === 'buy' ? 1 : -1;
       const pnl = (currentPrice - liveOpen.entryPrice) * liveOpen.quantity * multiplier;
@@ -1898,11 +1921,10 @@ export class SignalEngine {
       } catch (err: unknown) {
         // Cancel failures are non-fatal — the OCO may already have filled or
         // the order may already be terminal. Log and continue with the sell.
-        console.warn(
-          `[signal-engine] Tradier OCO cancel ${entryOrderId} failed: ${
-            err instanceof Error ? err.message : String(err)
-          }`,
-        );
+        log.warn('Tradier OCO cancel failed', {
+          entryOrderId,
+          reason: err instanceof Error ? err.message : String(err),
+        });
       }
     }
     const closeSide = pos.side === 'buy' ? 'sell' : 'buy';
@@ -2110,15 +2132,20 @@ export class SignalEngine {
     } catch (err: unknown) {
       const reason = `Tradier sell_to_close submit threw: ${err instanceof Error ? err.message : String(err)}`;
       acct.clearPendingExit(optionId, reason);
-      console.warn(`[signal-engine] manual-close ${optionSymbol} env=${env} ${reason}`);
+      log.warn('manual-close', { optionSymbol, env, reason });
       return { status: 'rejected', reason };
     }
 
     acct.attachPendingExit(optionId, resp.id);
-    console.log(
-      `[signal-engine] manual sell_to_close ${optionSymbol} env=${env} qty=${intent.qty} `
-      + `@ limit $${intent.limitPrice.toFixed(2)} duration=${intent.duration ?? 'day'} order=${resp.id} status=${resp.status}`,
-    );
+    log.info('manual sell_to_close', {
+      optionSymbol,
+      env,
+      qty: intent.qty,
+      limitPrice: intent.limitPrice,
+      duration: intent.duration ?? 'day',
+      order: resp.id,
+      status: resp.status,
+    });
 
     try {
       const detail = await client.waitForOrderTerminalStatus(resp.id);
@@ -2142,9 +2169,10 @@ export class SignalEngine {
         }
       }
     } catch (err: unknown) {
-      console.warn(
-        `[signal-engine] manual-close waitForOrderTerminalStatus(${resp.id}) failed: ${err instanceof Error ? err.message : String(err)} — leaving pendingExit for next tick poll`,
-      );
+      log.warn('manual-close waitForOrderTerminalStatus failed — leaving pendingExit for next tick poll', {
+        order: resp.id,
+        reason: err instanceof Error ? err.message : String(err),
+      });
     }
     return { status: 'pending', orderId: resp.id };
   }
@@ -2200,11 +2228,11 @@ export class SignalEngine {
         await client.cancelOrder(orderId);
       } catch (err: unknown) {
         const reason = err instanceof Error ? err.message : String(err);
-        console.warn(`[signal-engine] cancel sell_to_close order=${orderId} env=${env} failed: ${reason}`);
+        log.warn('cancel sell_to_close failed', { order: orderId, env, reason });
         return { status: 'error', reason, orderId };
       }
       acct.clearPendingExit(optionId, 'User cancelled the close order.');
-      console.log(`[signal-engine] cancel sell_to_close order=${orderId} env=${env} accepted; pendingExit cleared`);
+      log.info('cancel sell_to_close accepted; pendingExit cleared', { order: orderId, env });
       return { status: 'cancelled', orderId };
     }
     return { status: 'not_found' };
@@ -2280,17 +2308,25 @@ export class SignalEngine {
               const closed = acct.recordImportedFill(row.optionId, outcome.avgFillPrice);
               if (closed) {
                 filled += 1;
-                console.log(
-                  `[tradier-reconcile] sell_to_close ${row.optionSymbol} env=${env} imported order=${row.pendingCloseOrderId} filled@${outcome.avgFillPrice.toFixed(2)}`,
-                );
+                log.info('sell_to_close imported order filled', {
+                  component: 'tradier-reconcile',
+                  optionSymbol: row.optionSymbol,
+                  env,
+                  order: row.pendingCloseOrderId,
+                  avgFillPrice: outcome.avgFillPrice,
+                });
               }
             } else {
               const closed = acct.closeOption(row.optionId, outcome.avgFillPrice);
               if (closed) {
                 filled += 1;
-                console.log(
-                  `[tradier-reconcile] sell_to_close ${row.optionSymbol} env=${env} engine order=${row.pendingCloseOrderId} filled@${outcome.avgFillPrice.toFixed(2)}`,
-                );
+                log.info('sell_to_close engine order filled', {
+                  component: 'tradier-reconcile',
+                  optionSymbol: row.optionSymbol,
+                  env,
+                  order: row.pendingCloseOrderId,
+                  avgFillPrice: outcome.avgFillPrice,
+                });
                 this.tracker?.saveEquity(
                   this.account.getState().totalEquity,
                   this.optionsAccount.getState().optionsPnl,
@@ -2318,9 +2354,15 @@ export class SignalEngine {
             } else {
               filled += 1;
               const remainder = booked.contractsRemaining;
-              console.log(
-                `[tradier-reconcile] sell_to_close ${row.optionSymbol} env=${env} order=${row.pendingCloseOrderId} partial-fill ${outcome.filledQty}@${outcome.avgFillPrice.toFixed(2)} booked; remainder=${remainder}`,
-              );
+              log.info('sell_to_close partial-fill booked', {
+                component: 'tradier-reconcile',
+                optionSymbol: row.optionSymbol,
+                env,
+                order: row.pendingCloseOrderId,
+                filledQty: outcome.filledQty,
+                avgFillPrice: outcome.avgFillPrice,
+                remainder,
+              });
               if (!row.importedFromTradier) {
                 this.tracker?.saveEquity(
                   this.account.getState().totalEquity,
@@ -2341,9 +2383,13 @@ export class SignalEngine {
                 if (resub.status === 'pending') {
                   acct.setPendingCloseOrderId(row.optionId, resub.orderId);
                   stillPending += 1;
-                  console.log(
-                    `[tradier-reconcile] sell_to_close ${row.optionSymbol} env=${env} remainder=${remainder} re-ordered pending #${resub.orderId}`,
-                  );
+                  log.info('sell_to_close remainder re-ordered pending', {
+                    component: 'tradier-reconcile',
+                    optionSymbol: row.optionSymbol,
+                    env,
+                    remainder,
+                    order: resub.orderId,
+                  });
                 } else if (resub.status === 'filled') {
                   const closed = row.importedFromTradier
                     ? acct.recordImportedFill(row.optionId, resub.avgFillPrice)
@@ -2356,27 +2402,39 @@ export class SignalEngine {
                         this.optionsAccount.getState().optionsPnl,
                       );
                     }
-                    console.log(
-                      `[tradier-reconcile] sell_to_close ${row.optionSymbol} env=${env} remainder=${remainder} re-ordered filled@${resub.avgFillPrice.toFixed(2)}`,
-                    );
+                    log.info('sell_to_close remainder re-ordered filled', {
+                      component: 'tradier-reconcile',
+                      optionSymbol: row.optionSymbol,
+                      env,
+                      remainder,
+                      avgFillPrice: resub.avgFillPrice,
+                    });
                   }
                 } else {
                   // rejected / no_quote — `bookPartialClose` already cleared
                   // the pending marker, so the row re-renders Close with the
                   // reduced (remainder) contract count for a manual retry.
                   cleared += 1;
-                  console.warn(
-                    `[tradier-reconcile] sell_to_close ${row.optionSymbol} env=${env} remainder=${remainder} re-order failed (${resub.reason}) — left open for retry`,
-                  );
+                  log.warn('sell_to_close remainder re-order failed — left open for retry', {
+                    component: 'tradier-reconcile',
+                    optionSymbol: row.optionSymbol,
+                    env,
+                    remainder,
+                    reason: resub.reason,
+                  });
                 }
               }
             }
           } else if (outcome.status === 'rejected') {
             if (acct.clearPendingCloseOrderId(row.optionId)) {
               cleared += 1;
-              console.warn(
-                `[tradier-reconcile] sell_to_close ${row.optionSymbol} env=${env} order=${row.pendingCloseOrderId} terminal-no-fill (${outcome.reason}) — cleared pending so user can retry`,
-              );
+              log.warn('sell_to_close terminal-no-fill — cleared pending so user can retry', {
+                component: 'tradier-reconcile',
+                optionSymbol: row.optionSymbol,
+                env,
+                order: row.pendingCloseOrderId,
+                reason: outcome.reason,
+              });
             }
           } else if (outcome.status === 'pending') {
             // TRA-392 — fill-chaser. A `sell_to_close` that's sat pending
@@ -2400,18 +2458,27 @@ export class SignalEngine {
               if (rp.status === 'repriced') {
                 acct.markPendingCloseRepriced(row.optionId, rp.orderId, nextStep);
                 repriced += 1;
-                console.log(
-                  `[tradier-reprice] sell_to_close ${row.optionSymbol} env=${env} step ${nextStep}/${PENDING_CLOSE_MAX_REPRICE_STEPS} order ${row.pendingCloseOrderId}→${rp.orderId} @${rp.limitPrice.toFixed(2)}`,
-                );
+                log.info('sell_to_close repriced', {
+                  component: 'tradier-reprice',
+                  optionSymbol: row.optionSymbol,
+                  env,
+                  step: `${nextStep}/${PENDING_CLOSE_MAX_REPRICE_STEPS}`,
+                  oldOrder: row.pendingCloseOrderId,
+                  newOrder: rp.orderId,
+                  limitPrice: rp.limitPrice,
+                });
               } else if (rp.status === 'error') {
                 // Cancel went through but the resubmit failed — the old
                 // order is gone. Clear pending so the row re-renders Close
                 // (imported) / `checkExits` can retry (engine-opened).
                 if (acct.clearPendingCloseOrderId(row.optionId)) {
                   cleared += 1;
-                  console.warn(
-                    `[tradier-reprice] sell_to_close ${row.optionSymbol} env=${env} reprice failed (${rp.reason}) — cleared pending so it can be re-closed`,
-                  );
+                  log.warn('sell_to_close reprice failed — cleared pending so it can be re-closed', {
+                    component: 'tradier-reprice',
+                    optionSymbol: row.optionSymbol,
+                    env,
+                    reason: rp.reason,
+                  });
                 }
               } else {
                 // held — no usable lower price this tick; original order
@@ -2431,9 +2498,13 @@ export class SignalEngine {
           // Defensive — reconcilePendingCloseOrder swallows its own errors,
           // but if anything escapes we don't want one bad row to abort the
           // sweep for the others.
-          console.warn(
-            `[tradier-reconcile] sell_to_close ${row.optionSymbol} env=${env} order=${row.pendingCloseOrderId} reconcile threw: ${err instanceof Error ? err.message : String(err)}`,
-          );
+          log.warn('sell_to_close reconcile threw', {
+            component: 'tradier-reconcile',
+            optionSymbol: row.optionSymbol,
+            env,
+            order: row.pendingCloseOrderId,
+            reason: err instanceof Error ? err.message : String(err),
+          });
           stillPending += 1;
         }
       }
@@ -2521,9 +2592,11 @@ export class SignalEngine {
     try {
       positions = await client.listOpenOptionPositions();
     } catch (err: unknown) {
-      console.warn(
-        `[tradier-portfolio-reconcile] list positions failed env=${env}: ${err instanceof Error ? err.message : String(err)}`,
-      );
+      log.warn('list positions failed', {
+        component: 'tradier-portfolio-reconcile',
+        env,
+        reason: err instanceof Error ? err.message : String(err),
+      });
       // Still bump the timestamp so a Tradier outage doesn't burn the cadence
       // budget with a tight retry loop; the next tick after the window will
       // try again.
@@ -2534,9 +2607,14 @@ export class SignalEngine {
     this.lastTradierPortfolioReconcileAt = now;
     const summary = acct.reconcileTradierPositions(positions, 'live');
     if (summary.added + summary.updated + summary.removed > 0) {
-      console.log(
-        `[tradier-portfolio-reconcile] env=${env} added=${summary.added} updated=${summary.updated} removed=${summary.removed} total=${summary.total}`,
-      );
+      log.info('portfolio reconcile summary', {
+        component: 'tradier-portfolio-reconcile',
+        env,
+        added: summary.added,
+        updated: summary.updated,
+        removed: summary.removed,
+        total: summary.total,
+      });
     }
     return { skipped: null, ...summary };
   }
@@ -2601,9 +2679,10 @@ export class SignalEngine {
     try {
       positions = await client.listOpenEquityPositions();
     } catch (err: unknown) {
-      console.warn(
-        `[tradier-equity-reconcile] list positions failed: ${err instanceof Error ? err.message : String(err)}`,
-      );
+      log.warn('list positions failed', {
+        component: 'tradier-equity-reconcile',
+        reason: err instanceof Error ? err.message : String(err),
+      });
       // Bump the timestamp so a Tradier outage doesn't burn the cadence
       // budget with a tight retry loop; the next tick after the window
       // tries again.
@@ -2614,9 +2693,13 @@ export class SignalEngine {
     this.lastTradierEquityReconcileAt = now;
     const summary = this.mergeLiveEquityPositions(positions);
     if (summary.added + summary.updated + summary.removed > 0) {
-      console.log(
-        `[tradier-equity-reconcile] added=${summary.added} updated=${summary.updated} removed=${summary.removed} total=${summary.total}`,
-      );
+      log.info('equity reconcile summary', {
+        component: 'tradier-equity-reconcile',
+        added: summary.added,
+        updated: summary.updated,
+        removed: summary.removed,
+        total: summary.total,
+      });
     }
     return { skipped: null, ...summary };
   }
@@ -2970,14 +3053,19 @@ export class SignalEngine {
       });
     } catch (err: unknown) {
       const reason = err instanceof Error ? err.message : String(err);
-      console.warn(
-        `[signal-engine] Tradier bracket order ${signal.symbol} ${signal.type} threw: ${reason}`,
-      );
+      log.warn('Tradier bracket order threw', {
+        symbol: signal.symbol,
+        signalType: signal.type,
+        reason,
+      });
       return { ok: false, reason: `Tradier rejected order: ${reason.slice(0, 200)}` };
     }
-    console.log(
-      `[signal-engine] tradier live equity bracket ${signal.symbol} qty=${qty} order=${resp.id} status=${resp.status}`,
-    );
+    log.info('tradier live equity bracket', {
+      symbol: signal.symbol,
+      qty,
+      order: resp.id,
+      status: resp.status,
+    });
     // Wait briefly for Tradier to flip the order to a terminal state. If it's
     // still pending after the window we accept it as live — Tradier may still
     // fill by the close. Rejections/cancels void the open and surface on the
