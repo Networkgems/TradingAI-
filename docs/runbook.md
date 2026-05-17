@@ -17,9 +17,11 @@ scaling and alert response.
 > This section is authoritative; the alternative Render flow is called out
 > inline only where it differs.
 
-- **Host:** a single company-operated machine. The server is a self-hosted
-  Node process managed by **PM2** ([`ecosystem.config.cjs`](../ecosystem.config.cjs),
-  app name `trading-server`).
+- **Host:** `PG-DEVOPS14` — a single company-operated Windows workstation. The
+  server is a self-hosted Node process managed by **PM2**
+  ([`ecosystem.config.cjs`](../ecosystem.config.cjs), app name `trading-server`).
+  This is the operational instance TRA-438/TRA-441/TRA-442 were verified
+  against.
 - **Topology:** one instance, engine state and the WebSocket bus in-process.
   There is **no failover** and the app is **not multi-instance safe** — run
   exactly one `trading-server` process (see §4). Never run a second instance
@@ -28,8 +30,13 @@ scaling and alert response.
   `NODE_ENV=production`, `autorestart: true`, `restart_delay: 3000`,
   `max_restarts: 10`.
 - **Port:** the server listens on `$PORT` (default `4242`) and binds
-  host-local. Any external access is via an operator-provided reverse proxy —
-  record the public URL for this deployment here: _<fill in for your host>_.
+  host-local on `PG-DEVOPS14`. **No public URL or reverse proxy is provisioned**
+  — the operational instance is reachable only on the host itself at
+  `http://localhost:4242` (`ws://localhost:4242` for the WebSocket bus). The
+  desktop client falls back to `ws://localhost:4242` whenever it is not served
+  from a remote origin (see
+  [`apps/desktop/src/server-url.ts`](../apps/desktop/src/server-url.ts)). If a
+  reverse proxy is added later, record its public URL here.
 - **Data dir:** all user data, backups and logs live under `DATA_DIR`. PM2 does
   **not** set it, so it falls back to the server default
   (`packages/server/data/`). Set `DATA_DIR` in the process environment to
@@ -222,6 +229,6 @@ Carried forward from the TRA-402 review — be aware when on call:
   not a wired Sentry/Datadog SDK.
 - **PM2 stops after 10 restarts** (`max_restarts`); the `restart-storm` alert is
   the in-process proxy for noticing that.
-- **Production host not externally documented** (TRA-444) — the self-hosted
-  machine and any public URL/reverse proxy are not captured in the repo. Fill in
-  §1 for this deployment.
+- **No external access path** — the instance binds host-local on `PG-DEVOPS14`
+  with no reverse proxy, so it can only be reached from the host itself.
+  Recorded in §1 (closes the TRA-444 / TRA-447 documentation follow-up).
