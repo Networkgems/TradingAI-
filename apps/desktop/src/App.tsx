@@ -713,7 +713,7 @@ function CryptoDashboard({ token, onBack, onLogout, onActivity, theme, onToggleT
             >
               &#x2715;
             </button>
-            <SettingsPage token={token} httpUrl={HTTP_URL} context="crypto" onModeChange={setAccountMode} onSettingsSaved={applyAccountSettings} />
+            <SettingsPage token={token} httpUrl={HTTP_URL} context="crypto" onModeChange={setAccountMode} onSettingsSaved={applyAccountSettings} onLogout={onLogout} />
           </div>
         </div>
       )}
@@ -2163,7 +2163,7 @@ function Dashboard({ token, onLogout, onGoHome, onActivity, theme, onToggleTheme
             >
               &#x2715;
             </button>
-            <SettingsPage token={token} httpUrl={HTTP_URL} context="stocks" onModeChange={setAccountMode} onSettingsSaved={applyAccountSettings} />
+            <SettingsPage token={token} httpUrl={HTTP_URL} context="stocks" onModeChange={setAccountMode} onSettingsSaved={applyAccountSettings} onLogout={onLogout} />
           </div>
         </div>
       )}

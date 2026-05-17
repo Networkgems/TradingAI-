@@ -195,6 +195,9 @@ interface Props {
   // hosting dashboard can refetch /api/account/settings and refresh any
   // cached fields (e.g. the daily-options badge) without a hard reload.
   onSettingsSaved?: (settings: AccountSettings) => void;
+  // TRA-397 — invoked when the initial settings fetch returns 401 so an
+  // expired token logs the user out instead of silently rendering defaults.
+  onLogout?: () => void;
 }
 
 type SaveStatus = 'idle' | 'saving' | 'saved' | 'error';
@@ -866,9 +869,13 @@ function StrategyPresetSection({
   );
 }
 
-export default function SettingsPage({ token, httpUrl, context, onModeChange, onSettingsSaved }: Props) {
+export default function SettingsPage({ token, httpUrl, context, onModeChange, onSettingsSaved, onLogout }: Props) {
   const [settings, setSettings] = useState<AccountSettings>(DEFAULT_ACCOUNT_SETTINGS);
   const [loading, setLoading] = useState(true);
+  // TRA-397 — set when the initial settings fetch fails with a non-OK status
+  // (other than 401, which logs out) or a network/parse error, so the form
+  // never renders defaults as if they were the user's saved settings.
+  const [loadError, setLoadError] = useState<string | null>(null);
   const [saveStatus, setSaveStatus] = useState<SaveStatus>('idle');
   const [resetPending, setResetPending] = useState(false);
   const [isAdmin, setIsAdmin] = useState(false);
@@ -902,17 +909,49 @@ export default function SettingsPage({ token, httpUrl, context, onModeChange, on
     | { ok: false; authScheme?: 'hmac' | 'cdp'; error: string }
   >(null);
 
+  // TRA-397 — bumped to re-run the initial fetch when the user retries after
+  // a transient load failure.
+  const [loadAttempt, setLoadAttempt] = useState(0);
+
   useEffect(() => {
+    let cancelled = false;
+    setLoading(true);
+    setLoadError(null);
     fetch(`${httpUrl}/api/account/settings`, {
       headers: { Authorization: `Bearer ${token}` },
     })
-      .then(r => r.json())
-      .then((data: AccountSettings) => {
+      .then(async r => {
+        if (cancelled) return;
+        // TRA-397 — an expired/invalid token must log the user out, matching
+        // the 401 handling in App.tsx polling/WS code. Without this guard the
+        // server's JSON error body would be spread into `settings` and the
+        // form would render silently with default values.
+        if (r.status === 401) {
+          onLogout?.();
+          return;
+        }
+        if (!r.ok) {
+          setLoadError(`Couldn't load your settings (server returned ${r.status}).`);
+          setLoading(false);
+          return;
+        }
+        const data = (await r.json()) as AccountSettings;
+        if (cancelled) return;
         setSettings({ ...DEFAULT_ACCOUNT_SETTINGS, ...data });
         setLoading(false);
       })
-      .catch(() => setLoading(false));
+      .catch(() => {
+        if (cancelled) return;
+        // Network failure or non-JSON body — surface it instead of leaving
+        // the form blank with no feedback.
+        setLoadError("Couldn't load your settings — check your connection and try again.");
+        setLoading(false);
+      });
 
+    return () => { cancelled = true; };
+  }, [token, httpUrl, loadAttempt, onLogout]);
+
+  useEffect(() => {
     // Check if admin
     fetch(`${httpUrl}/api/admin/users`, { headers: { Authorization: `Bearer ${token}` } })
       .then(r => { if (r.ok) setIsAdmin(true); })
@@ -1034,6 +1073,20 @@ export default function SettingsPage({ token, httpUrl, context, onModeChange, on
 
   if (loading) {
     return <div className="loading"><div className="spinner" /><p>Loading settings…</p></div>;
+  }
+
+  // TRA-397 — a non-OK / network failure surfaces an explicit error with a
+  // retry instead of rendering DEFAULT_ACCOUNT_SETTINGS as the user's saved
+  // settings (which a blind save would then overwrite the real ones with).
+  if (loadError) {
+    return (
+      <div className="loading">
+        <p className="save-error">{loadError}</p>
+        <button type="button" className="btn-primary" onClick={() => setLoadAttempt(n => n + 1)}>
+          Retry
+        </button>
+      </div>
+    );
   }
 
   return (
