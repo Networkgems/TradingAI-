@@ -1,3 +1,18 @@
+# ─────────────────────────────────────────────────────────────────────────────
+# Render Blueprint — OPTIONAL / NOT THE CURRENT PRODUCTION TARGET (TRA-444)
+#
+# As of 2026-05-17 no Render service is provisioned from this blueprint:
+# `https://tradingai-server.onrender.com` returns `x-render-routing: no-server`.
+# Production currently runs as a self-hosted PM2 process — see `docs/runbook.md`
+# §1 and `ecosystem.config.cjs`.
+#
+# CTO decision (TRA-444): reconcile — production is self-hosted PM2, not Render.
+# This file is kept as a ready-to-use blueprint should the company later choose
+# to host on Render (a Blueprint deploy picks it up, auto-deploys from `main`,
+# and provisions the 1 GB `/data` disk). Until then it is NOT live — do not
+# document it as the production host, and never run it alongside the
+# self-hosted instance (the app is not multi-instance safe).
+# ─────────────────────────────────────────────────────────────────────────────
 services:
   - type: web
     name: tradingai-server

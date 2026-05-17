@@ -125,12 +125,12 @@ and the engine tick loops themselves.
 ### Graceful shutdown
 
 `gracefulShutdown()` is bound to `SIGINT` / `SIGTERM` (re-entrancy guarded). On
-a Render redeploy it finishes the current tick and closes cleanly within the
-SIGTERM grace window.
+a redeploy (a PM2 restart, or a Render redeploy) it finishes the current tick
+and closes cleanly within the signal grace window.
 
 ## 3. Persistence
 
-All durable state lives under `DATA_DIR` (a Render persistent disk in prod):
+All durable state lives under `DATA_DIR` (a persistent volume in prod):
 
 ```
 $DATA_DIR/

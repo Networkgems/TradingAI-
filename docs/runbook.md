@@ -9,33 +9,64 @@ scaling and alert response.
 
 ## 1. Production topology
 
-- **Host:** [Render](https://render.com), one `web` service defined in
-  [`render.yaml`](../render.yaml) at the repo root.
-- **Plan:** `starter` — a single instance. There is **no failover.**
-- **Process:** `node packages/server/dist/index.js`, started directly by Render.
-  (PM2 / `ecosystem.config.cjs` is for self-hosting, not the Render deploy.)
-- **Persistent disk:** 1 GB, mounted at `/data` (`DATA_DIR=/data`). Survives
-  redeploys; this is where all user data, backups and logs live.
-- **Health check:** Render polls `GET /api/health`; a non-200 blocks the deploy.
-- **Port:** the server listens on `$PORT` (default `4242`).
+> **TRA-444 (CTO decision, 2026-05-17):** production runs **self-hosted under
+> PM2**, not on Render. The Render service that earlier docs named
+> (`https://tradingai-server.onrender.com`) is **unprovisioned** — it returns
+> `x-render-routing: no-server`. [`render.yaml`](../render.yaml) is retained
+> only as an optional, not-currently-deployed blueprint (see its file header).
+> This section is authoritative; the alternative Render flow is called out
+> inline only where it differs.
+
+- **Host:** a single company-operated machine. The server is a self-hosted
+  Node process managed by **PM2** ([`ecosystem.config.cjs`](../ecosystem.config.cjs),
+  app name `trading-server`).
+- **Topology:** one instance, engine state and the WebSocket bus in-process.
+  There is **no failover** and the app is **not multi-instance safe** — run
+  exactly one `trading-server` process (see §4). Never run a second instance
+  (e.g. a parallel Render service) against the same broker credentials.
+- **Process:** `node packages/server/dist/index.js`, launched by PM2 with
+  `NODE_ENV=production`, `autorestart: true`, `restart_delay: 3000`,
+  `max_restarts: 10`.
+- **Port:** the server listens on `$PORT` (default `4242`) and binds
+  host-local. Any external access is via an operator-provided reverse proxy —
+  record the public URL for this deployment here: _<fill in for your host>_.
+- **Data dir:** all user data, backups and logs live under `DATA_DIR`. PM2 does
+  **not** set it, so it falls back to the server default
+  (`packages/server/data/`). Set `DATA_DIR` in the process environment to
+  relocate it onto a dedicated volume — recommended for production.
+- **Auth secret:** the server **refuses to start in production without
+  `AUTH_SECRET`** and uses an ephemeral one otherwise (all sessions drop on
+  restart). Set a stable `AUTH_SECRET` in the environment. (The Render blueprint
+  injected this automatically via `generateValue: true`; self-hosting must
+  provide it.)
+- **Health check:** `GET /api/health` returns `{ ok: true }`. Poll it after
+  every restart/deploy before considering the process healthy.
 
 ## 2. Deploy procedure
 
-### Standard deploy
+### Standard deploy (self-hosted PM2)
 
-1. Merge to `main`. Render auto-deploys from `main` (or trigger a manual deploy
-   from the Render dashboard).
-2. Render runs the build: `pnpm install --frozen-lockfile && pnpm run web:build`.
-3. Render starts `node packages/server/dist/index.js` and polls
-   `/api/health` until it returns `{ ok: true }`.
-4. The new instance only takes traffic once the health check passes; the old
-   instance is then stopped with `SIGTERM`.
+1. On the production machine, sync the target commit — deploys track `main`:
+   `git fetch origin && git checkout main && git pull`.
+2. Build: `pnpm install --frozen-lockfile && pnpm run web:build`.
+3. Restart the process: `npx pm2 restart trading-server`
+   (first run on a fresh box: `npx pm2 start ecosystem.config.cjs`).
+4. PM2 keeps the process up via `autorestart`; verify `/api/health` before
+   declaring the deploy done. PM2 stops retrying after `max_restarts` (10) — the
+   `restart-storm` alert (§5) is the in-process proxy for noticing that.
+
+> **Render alternative (not currently provisioned).** If the company later
+> deploys the [`render.yaml`](../render.yaml) blueprint, Render auto-deploys
+> from `main`: it runs the build, starts `node packages/server/dist/index.js`,
+> and polls `/api/health` until `{ ok: true }` before cutting traffic over.
+> Provisioning Render is tracked in TRA-444 and needs dashboard access — do not
+> run it alongside the self-hosted instance.
 
 ### Verify a deploy
 
 ```bash
-curl -s https://<host>/api/health            # { "ok": true, "time": "..." }
-curl -s https://<host>/api/health/storage    # confirm dataDir_exists + backupsCount > 0
+curl -s http://<host>/api/health            # { "ok": true, "time": "..." }
+curl -s http://<host>/api/health/storage    # confirm dataDir_exists + backupsCount > 0
 ```
 
 Then log into the dashboard and confirm a `state` snapshot arrives over the
@@ -43,27 +74,32 @@ WebSocket (the UI populates).
 
 ### What a redeploy does to running state
 
-- `SIGTERM` triggers `gracefulShutdown()` — the current engine tick finishes and
-  the process exits cleanly inside Render's grace window.
+- A PM2 restart sends `SIGINT`/`SIGTERM`, which triggers `gracefulShutdown()` —
+  the current engine tick finishes and the process exits cleanly inside the
+  signal grace window.
 - In-flight broker orders are **not** held across the restart; the next
   reconcile pass picks them up. Avoid redeploying during active trading hours
   if it can wait.
-- Session tokens **survive** a redeploy — `AUTH_SECRET` is generated once by
-  Render (`generateValue: true`) and persisted.
+- Session tokens **survive** a restart **only if `AUTH_SECRET` is a stable env
+  var** (see §1). With an ephemeral secret every restart logs all users out.
 
 ### Rollback
 
-Use Render's **"Rollback to this deploy"** on a previous successful deploy, or
-revert the offending commit on `main` and let the auto-deploy run. The
-persistent disk is untouched by a rollback, so user data is unaffected. If a
-rollback crosses a data-format migration, restore data from a backup taken
-before the bad deploy (see §3).
+Roll back by checking out the last-good commit and redeploying: on the
+production machine `git checkout <good-commit>`, rebuild (step 2 above) and
+`npx pm2 restart trading-server`. Or revert the offending commit on `main` and
+redeploy. The data dir is untouched by a rollback, so user data is unaffected.
+If a rollback crosses a data-format migration, restore data from a backup taken
+before the bad deploy (see §3). (On Render: use **"Rollback to this deploy"**.)
 
 ### Environment / secret changes
 
-Broker credentials and all tuning knobs are env vars (`sync: false` in
-`render.yaml` — set in the Render dashboard, never committed). Changing one
-requires a restart to take effect. The full annotated list is in `render.yaml`.
+Broker credentials and all tuning knobs are env vars — the annotated list lives
+in [`render.yaml`](../render.yaml) (the keys are the same whether self-hosted or
+on Render; `sync: false` there just means "set out-of-band, never committed").
+For the self-hosted process, set them in the environment PM2 launches with
+(shell env, an `env` block in `ecosystem.config.cjs`, or a process-manager
+`.env`). Changing one requires a `pm2 restart` to take effect.
 
 ## 3. Backup & recovery
 
@@ -86,56 +122,59 @@ For most single-file corruption, no operator action is needed — just restart.
 
 If automatic restore is not enough (e.g. you need an older point in time):
 
-1. Open a shell on the Render instance (Render dashboard → **Shell**).
+1. Open a shell on the production machine (on Render: dashboard → **Shell**).
 2. List snapshots — newest last:
    ```bash
-   ls -1 /data/backups
+   ls -1 $DATA_DIR/backups
    ```
 3. Pick a timestamp from *before* the corruption. To restore everything:
    ```bash
-   cp -r /data/backups/<timestamp>/* /data/
+   cp -r $DATA_DIR/backups/<timestamp>/* $DATA_DIR/
    ```
    To restore one user only:
    ```bash
-   cp -r /data/backups/<timestamp>/users/<username> /data/users/
+   cp -r $DATA_DIR/backups/<timestamp>/users/<username> $DATA_DIR/users/
    ```
-4. Restart the service from the Render dashboard.
+4. Restart the service (`npx pm2 restart trading-server`).
 5. Verify with `GET /api/health/storage` and a dashboard login.
 
 > **Backups are on the same disk.** The 30-min snapshots protect against file
 > corruption and bad writes, **not** disk loss. For disaster recovery, copy
-> `/data` (or the latest `backups/<ts>/`) off-box periodically — currently a
+> `$DATA_DIR` (or the latest `backups/<ts>/`) off-box periodically — currently a
 > manual step; an off-box backup is a known gap.
 
 ## 4. Scaling guide
 
 ### Current limits
 
-The `starter` plan is **one instance with a 1 GB disk** — fine for a small user
-base, paper trading, and a controlled live test. Constraints to watch:
+The self-hosted single instance is **one process on one machine** — fine for a
+small user base, paper trading, and a controlled live test. Constraints to
+watch:
 
-- **Disk (1 GB).** Logs rotate at 10 MB per file; backups keep ~12h of
-  snapshots; trade history and option-chain caches grow over time. The
-  `disk-near-full` alert fires below `DISK_MIN_FREE_PCT` (10%).
+- **Disk.** Logs rotate at 10 MB per file; backups keep ~12h of snapshots;
+  trade history and option-chain caches grow over time. The `disk-near-full`
+  alert fires below `DISK_MIN_FREE_PCT` (10%).
 - **CPU / memory.** Every active user runs their own equity + crypto engine in
   the single process. Engine count scales with user count.
 - **No horizontal scale.** Engine state and the WebSocket bus are in-process;
-  the app is **not** multi-instance safe today. Do not raise the instance count.
+  the app is **not** multi-instance safe today. Run exactly one instance.
 
 ### When to scale up
 
 | Symptom | Action |
 |---|---|
-| `disk-near-full` alert; `health/storage` shows low free space | Prune old option-chain caches; raise disk `sizeGB` in `render.yaml`. |
-| Tick loop lagging / high memory under user growth | Move to a larger Render plan (more CPU/RAM) — vertical scale only. |
+| `disk-near-full` alert; `health/storage` shows low free space | Prune old option-chain caches; attach a larger volume / raise free space on the `DATA_DIR` disk. |
+| Tick loop lagging / high memory under user growth | Move the process to a larger machine — vertical scale only. |
 | Need true HA / horizontal scale | Larger effort: extract engine state to shared storage and add a message bus. Not supported today; scope as a project. |
 
 ### Scaling steps (vertical)
 
-1. Edit `render.yaml` — bump `plan` and/or `disk.sizeGB`.
-2. Merge to `main`; Render applies it on the next deploy. A disk resize is
-   online and non-destructive.
+1. Provision a larger machine / bigger volume.
+2. Deploy the process there per §2 and migrate `$DATA_DIR` (copy the data dir,
+   then start the new instance — never run both at once).
 3. Confirm via `GET /api/health/storage`.
+
+(On Render, vertical scale is a `plan` / `disk.sizeGB` bump in `render.yaml`.)
 
 ## 5. Alert response
 
@@ -147,9 +186,9 @@ alert per window.
 
 | Alert | Meaning | First response |
 |---|---|---|
-| `health-check` | `GET /api/health` stopped returning `{ ok: true }`. | Check Render service status & logs. If the process is down, redeploy / restart. Confirm `/api/health` recovers. |
-| `disk-near-full` | Free space on `/data` below 10%. | `GET /api/health/storage` for sizes. Prune old option-chain caches and stale logs; if structurally full, raise `disk.sizeGB` (§4). |
-| `restart-storm` | >5 process boots in 10 min — instance is crash-looping. | Read `errors.jsonl` / Render logs for the crash cause (bad deploy, corrupt data, OOM). Roll back the deploy (§2) or restore data (§3). |
+| `health-check` | `GET /api/health` stopped returning `{ ok: true }`. | Check the PM2 process (`npx pm2 status`) and logs. If the process is down, `npx pm2 restart trading-server`. Confirm `/api/health` recovers. |
+| `disk-near-full` | Free space on the `DATA_DIR` disk below 10%. | `GET /api/health/storage` for sizes. Prune old option-chain caches and stale logs; if structurally full, attach a larger volume (§4). |
+| `restart-storm` | >5 process boots in 10 min — instance is crash-looping. | Read `errors.jsonl` / PM2 logs for the crash cause (bad deploy, corrupt data, OOM). Roll back the deploy (§2) or restore data (§3). Note PM2 gives up after `max_restarts` (10). |
 | `trade-volume-zero` | No positions opened by 12:00 ET on a stock trading day. | Often benign (no qualifying signals). Confirm data feeds are fresh (`GET /api/health/quotes`) and auto-trading is enabled. Escalate only if feeds are stale. |
 | `error-spike` | >25 errors captured in 15 min. | Grep `errors.jsonl` for the dominant error; correlate by `traceId`. See `observability.md`. |
 
@@ -157,7 +196,7 @@ alert per window.
 
 1. **`GET /api/health/alerts`** (authenticated) — recent alerts + 15-min error
    count, without shelling into the box.
-2. **Logs** — `$DATA_DIR/logs/` (also on Render's log stream). `app.jsonl`,
+2. **Logs** — `$DATA_DIR/logs/` (and `npx pm2 logs trading-server`). `app.jsonl`,
    `errors.jsonl` are JSON-lines; pipe through `jq`. Query by `traceId`.
 3. **Storage** — `GET /api/health/storage` for disk / data-file state.
 4. **Feeds** — `GET /api/health/quotes` for market-data freshness.
@@ -166,11 +205,10 @@ alert per window.
 
 | Task | How |
 |---|---|
-| Tail logs (self-hosted PM2) | `npx pm2 logs trading-server` |
-| Tail logs (Render) | Render dashboard → **Logs**, or `$DATA_DIR/logs/*.jsonl` |
-| Restart | Render dashboard → **Manual Deploy / Restart**; self-hosted: `npx pm2 restart trading-server` |
-| Check health | `curl https://<host>/api/health` |
-| Inspect storage | `curl -H 'Authorization: Bearer <token>' https://<host>/api/health/storage` |
+| Tail logs | `npx pm2 logs trading-server`, or `$DATA_DIR/logs/*.jsonl` (on Render: dashboard → **Logs**) |
+| Restart | `npx pm2 restart trading-server` (on Render: dashboard → **Manual Deploy / Restart**) |
+| Check health | `curl http://<host>/api/health` |
+| Inspect storage | `curl -H 'Authorization: Bearer <token>' http://<host>/api/health/storage` |
 | Lock / unlock a user | `POST /api/admin/users/:username/lock` (admin token) |
 | Reset a user's password | `POST /api/admin/users/:username/reset-password` (admin token) |
 
@@ -182,5 +220,8 @@ Carried forward from the TRA-402 review — be aware when on call:
 - **Single instance, no failover** — an instance outage is a full outage.
 - **No vendor APM** — error telemetry is a webhook seam (`ERROR_WEBHOOK_URL`),
   not a wired Sentry/Datadog SDK.
-- **Self-hosted PM2** stops after 10 restarts; the `restart-storm` alert is the
-  in-process proxy for noticing that.
+- **PM2 stops after 10 restarts** (`max_restarts`); the `restart-storm` alert is
+  the in-process proxy for noticing that.
+- **Production host not externally documented** (TRA-444) — the self-hosted
+  machine and any public URL/reverse proxy are not captured in the repo. Fill in
+  §1 for this deployment.

@@ -30,9 +30,11 @@ info:
     `state`, `crypto_state`, `eod_report`. The protocol is server-push only.
 servers:
   - url: http://localhost:4242
-    description: Local development
-  - url: https://tradingai-server.onrender.com
-    description: Production (Render)
+    description: >-
+      Host-local URL. Used for local development and by the self-hosted PM2
+      production instance (TRA-444 — production is self-hosted, not Render).
+      External clients reach production through an operator-provided reverse
+      proxy; substitute that public URL when calling a remote deployment.
 
 tags:
   - name: Health
