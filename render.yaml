@@ -123,6 +123,21 @@ services:
       # `bb_fade_sol_doge`) for revert safety.
       - key: LIVE_STRATEGY_PRESET
         value: no_trade
+      # TRA-456 — DEMO engine strategy preset. The `LIVE_STRATEGY_PRESET`
+      # stand-down above is scoped to the LIVE engine only: it is a
+      # capital-allocation control, and the demo engine trades paper money
+      # with zero real-capital exposure. Freezing demo bought no risk
+      # reduction and only blanked the board's dashboard (0 signals / 0
+      # positions). The demo engine therefore runs this preset instead,
+      # deterministically — it does NOT fall through to per-user
+      # `activeStrategyPreset`, so the board always watches one consistent
+      # roster. Pinned to `tra405_validated` (bb_fade on BTC-USD + SOL-USD),
+      # the documented live candidate roster and the revert target once a
+      # strategy clears the lower-CI-bound robustness gate. If unset the
+      # engine defaults to `tra405_validated` anyway; this key makes the
+      # demo pin explicit in the deploy config.
+      - key: DEMO_STRATEGY_PRESET
+        value: tra405_validated
       # TRA-406 — observability. All optional; sane defaults apply when unset.
       #   LOG_LEVEL          debug|info|warn|error (default info)
       #   ERROR_WEBHOOK_URL  HTTPS endpoint captured errors are POSTed to

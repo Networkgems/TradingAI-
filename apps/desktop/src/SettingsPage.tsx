@@ -865,10 +865,13 @@ function StrategyPresetSection({
         })}
       </div>
       <p className="settings-hint" style={{ marginTop: '0.75rem' }}>
-        Note: the <code>LIVE_STRATEGY_PRESET</code> environment variable on the server
-        (when set) overrides this selection process-wide. Used by ops to pin a preset
-        across all users for live tests; drop the env var to release control back to
-        per-user settings.
+        Note: this selection applies to the <strong>Live</strong> engine only. The Demo
+        engine runs a fixed preset (<code>DEMO_STRATEGY_PRESET</code>, default{' '}
+        <code>tra405_validated</code>) so the dashboard always shows one consistent
+        roster (TRA-456). On the server the <code>LIVE_STRATEGY_PRESET</code> environment
+        variable (when set) overrides this selection for the live engine — ops use it to
+        pin a preset for live tests; drop the env var to release control back to this
+        per-user setting.
       </p>
     </section>
   );

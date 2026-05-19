@@ -32,6 +32,7 @@ import type {
   AccountSettings,
   CryptoStrategyType,
   StrategyPreset,
+  StrategyPresetId,
 } from '@trading-app/shared';
 import {
   fetchCryptoMinuteBars,
@@ -59,17 +60,34 @@ const MAX_SIGNALS = 50;
 const NEWS_REFRESH_MS = 5 * 60_000;
 
 /**
- * TRA-325 — process-wide forced strategy preset override. When set in the
- * environment (Render dashboard, ops shell, etc.) every engine instance pins
- * to this preset regardless of the user's saved `activeStrategyPreset`. This
+ * TRA-325 — forced strategy preset override for the LIVE engine. When set in
+ * the environment (Render dashboard, ops shell, etc.) the live engine pins to
+ * this preset regardless of the user's saved `activeStrategyPreset`. This
  * subsumes TRA-324's `LIVE_STRATEGY_PRESET=bb_fade_sol_doge_only` env-flag
  * behaviour and keeps it as an ops-level kill-switch for the live $180 test:
- * dropping the env var on Render frees per-user settings to drive the engine
- * without a code change. The legacy value `'bb_fade_sol_doge_only'` is still
- * accepted (mapped via {@link resolveStrategyPreset}) so a render.yaml that
- * predates this commit keeps working.
+ * dropping the env var on Render frees per-user settings to drive the live
+ * engine without a code change. The legacy value `'bb_fade_sol_doge_only'` is
+ * still accepted (mapped via {@link resolveStrategyPreset}) so a render.yaml
+ * that predates this commit keeps working.
+ *
+ * TRA-456 — this override is LIVE-ONLY. The demo engine ignores it and runs
+ * {@link DEMO_PRESET_ENV} instead. The live `no_trade` stand-down (TRA-434) is
+ * a capital-allocation control; freezing the paper-money demo engine bought no
+ * risk reduction and only blanked the board's dashboard. See {@link resolvePreset}.
  */
 const FORCED_PRESET_ENV = (process.env.LIVE_STRATEGY_PRESET ?? '').trim();
+
+/**
+ * TRA-456 — strategy preset for the DEMO engine. The demo engine runs paper
+ * money with zero real-capital exposure, so it is deliberately NOT subject to
+ * the live `LIVE_STRATEGY_PRESET` stand-down. It resolves this env var instead,
+ * defaulting to {@link DEMO_PRESET_DEFAULT} (`tra405_validated` — bb_fade on
+ * BTC-USD + SOL-USD, the documented live candidate roster) so the board always
+ * watches one consistent roster. The demo engine never falls through to
+ * per-user `activeStrategyPreset`; see {@link resolvePreset}.
+ */
+const DEMO_PRESET_ENV = (process.env.DEMO_STRATEGY_PRESET ?? '').trim();
+const DEMO_PRESET_DEFAULT: StrategyPresetId = 'tra405_validated';
 
 /**
  * TRA-341 — process-wide override for the §6 single-symbol short cap on the
@@ -378,16 +396,30 @@ export class CryptoSignalEngine {
   }
 
   /**
-   * TRA-325 — resolve the strategy preset that should drive this tick. The
-   * `LIVE_STRATEGY_PRESET` env var, when set, wins over per-user settings so
-   * Render can pin every engine to one preset (the live-test override path
-   * inherited from TRA-324). Otherwise we honour the user's saved
-   * `activeStrategyPreset`, defaulting to `legacy_5` for snapshots persisted
-   * before this field existed.
+   * TRA-325 / TRA-456 — resolve the strategy preset that drives this tick,
+   * scoped by engine mode:
+   *
+   *   • live — `LIVE_STRATEGY_PRESET` ({@link FORCED_PRESET_ENV}), when set,
+   *     wins over per-user settings so Render can pin the live engine
+   *     (currently `no_trade`, the TRA-434 risk stand-down). With the env var
+   *     unset the live engine honours the user's saved `activeStrategyPreset`,
+   *     defaulting to `legacy_5` for snapshots persisted before that field
+   *     existed.
+   *
+   *   • demo — paper money, zero real-capital exposure. The live stand-down is
+   *     a capital-allocation control, not a demo-visibility control, so the
+   *     demo engine is NOT frozen by `LIVE_STRATEGY_PRESET`. It resolves
+   *     `DEMO_STRATEGY_PRESET` ({@link DEMO_PRESET_ENV}), defaulting to
+   *     `tra405_validated`, and deliberately does NOT fall through to per-user
+   *     `activeStrategyPreset` — the board needs one deterministic candidate
+   *     roster on the demo dashboard (TRA-456 CTO decision).
    */
   private resolvePreset(): StrategyPreset {
-    if (FORCED_PRESET_ENV) return resolveStrategyPreset(FORCED_PRESET_ENV);
-    return resolveStrategyPreset(this.currentSettings?.activeStrategyPreset);
+    if (this.mode === 'live') {
+      if (FORCED_PRESET_ENV) return resolveStrategyPreset(FORCED_PRESET_ENV);
+      return resolveStrategyPreset(this.currentSettings?.activeStrategyPreset);
+    }
+    return resolveStrategyPreset(DEMO_PRESET_ENV || DEMO_PRESET_DEFAULT);
   }
 
   /**

@@ -392,6 +392,12 @@ export interface StrategyPreset {
  *                          Used by the `LIVE_STRATEGY_PRESET` env var to pause
  *                          the live crypto pilot after the TRA-432 NO-GO,
  *                          which superseded TRA-405's dirty-cache "go".
+ *                          TRA-456: `LIVE_STRATEGY_PRESET` is scoped to the
+ *                          LIVE engine only — the demo engine ignores it and
+ *                          runs `DEMO_STRATEGY_PRESET` (default
+ *                          `tra405_validated`), so this stand-down freezes
+ *                          live-capital trading without blanking the
+ *                          paper-money demo dashboard.
  *
  * Future presets are added here without code changes elsewhere — the engine
  * resolves by id, the UI lists `Object.values(STRATEGY_PRESETS)`.

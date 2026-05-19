@@ -339,18 +339,47 @@ describe('Strategy presets — TRA-325', () => {
     expect(presetAllowsStrategySymbol(p, 'bb_fade', 'BTC-USD')).toBe(false);
   });
 
-  it('TRA-345 — getState().activePreset surfaces the resolved preset for API verification', () => {
-    // With no LIVE_STRATEGY_PRESET env var set under test, the engine resolves
-    // to legacy_5. The activePreset block lets /api/crypto/state confirm the
-    // live config without Render dashboard / server-log access.
+  it('TRA-345 / TRA-456 — getState().activePreset surfaces the resolved preset for API verification', () => {
+    // The default engine is a DEMO engine. Since TRA-456 the demo engine runs
+    // DEMO_STRATEGY_PRESET (default `tra405_validated`) deterministically — it
+    // is no longer frozen by the live `no_trade` stand-down and no longer
+    // falls through to per-user `activeStrategyPreset`. The activePreset block
+    // lets /api/crypto/state confirm the active config without Render
+    // dashboard / server-log access.
     const engine = new CryptoSignalEngine();
     const ap = engine.getState().activePreset;
-    expect(ap.id).toBe('legacy_5');
+    expect(ap.id).toBe('tra405_validated');
+    // envValue surfaces the LIVE_STRATEGY_PRESET var; unset under test.
     expect(ap.envValue).toBe('');
-    expect([...ap.enabledStrategies].sort()).toEqual(
-      ['bb_fade', 'breakout_vol', 'mean_reversion', 'momentum', 'swing_trade'],
-    );
+    expect([...ap.enabledStrategies]).toEqual(['bb_fade']);
     expect(ap.symbolFilter).toBeNull();
+    expect(ap.strategyUniverse?.bb_fade).toEqual(['BTC-USD', 'SOL-USD']);
+  });
+
+  it('TRA-456 — demo runs tra405_validated deterministically; live honours per-user preset', async () => {
+    // TRA-456 CTO decision: the `LIVE_STRATEGY_PRESET` stand-down is a
+    // capital-allocation control scoped to the LIVE engine. The demo engine
+    // trades paper money with zero real-capital exposure, so it runs
+    // `tra405_validated` deterministically and must NOT fall through to
+    // per-user `activeStrategyPreset` — the board needs one consistent
+    // candidate roster on the demo dashboard.
+    const engine = new CryptoSignalEngine();
+
+    // Demo: even with the per-user preset explicitly set to legacy_5, the demo
+    // engine ignores it and resolves tra405_validated.
+    await engine.applySettings(fourBucketCryptoSettings({
+      mode: 'demo',
+      activeStrategyPreset: 'legacy_5',
+    }));
+    expect(engine.getState().activePreset.id).toBe('tra405_validated');
+
+    // Live: with no LIVE_STRATEGY_PRESET env set under test, the live engine
+    // falls through to the user's saved activeStrategyPreset (no env override).
+    await engine.applySettings(fourBucketCryptoSettings({
+      mode: 'live',
+      activeStrategyPreset: 'bb_fade_sol_doge',
+    }));
+    expect(engine.getState().activePreset.id).toBe('bb_fade_sol_doge');
   });
 });
 
