@@ -12,8 +12,10 @@
  *   - RVOL_daily    = today volume / AvgVol20.
  *   - dist_atr      = (close - SMA200) / ATR(14) — distance to the 200-SMA in ATRs.
  *
- * Nothing here trades. The output is display-only until QuantTrader clears the
- * backtest acceptance gate (profit factor > 1.3, beats buy-and-hold).
+ * TRA-458/TRA-460 — Signal 2 (pullback) v2 cleared the TRA-455 acceptance
+ * gate; the server's SignalEngine now opens a live position off it. Signal 3
+ * (reclaim) failed validation and stays display-only. This module only
+ * computes the signals — the entry wiring lives in the SignalEngine.
  */
 import type { Candle } from '@trading-app/shared';
 import { atr } from './indicators/atr.js';
@@ -29,6 +31,15 @@ export const SMA200_MIN_AVG_DOLLAR_VOL = 5_000_000;
 
 /** Debounce: one signal per symbol per type within this many daily bars. */
 export const SMA200_DEBOUNCE_BARS = 5;
+
+/**
+ * TRA-458 — Signal 2 v2 trend-strength gate. A pullback bounce only fires when
+ * the 200-SMA is rising at least this much over the trailing 20 bars
+ * (`SMA200[t] / SMA200[t-20] − 1`). 2.0% cleared the TRA-455 acceptance gate
+ * (PF 1.93, MAR 0.61 vs SPY 0.41, robust across the 2R/2.5R/3R TP sweep).
+ * QuantTrader owns future tuning of this threshold.
+ */
+export const SMA200_PULLBACK_MIN_SLOPE20 = 0.02;
 
 export type Sma200SignalKind = 'sma200_pullback' | 'sma200_reclaim';
 
@@ -115,12 +126,6 @@ export function smaSeries(values: number[], period: number): number[] {
   return out;
 }
 
-/** RSI(14) evaluated on `closes[0 .. end]` (Wilder). NaN if too short. */
-function rsiAt(closes: number[], end: number, period = 14): number {
-  if (end < period) return NaN;
-  return rsi(closes.slice(0, end + 1), period);
-}
-
 /** max(high) − min(low) over `candles[start .. end]` inclusive. */
 function rangeOf(candles: Candle[], start: number, end: number): number {
   let hi = -Infinity;
@@ -198,6 +203,9 @@ export function evaluateSma200(symbol: string, candles: Candle[]): Sma200Evaluat
   const signals: Sma200SignalResult[] = [];
 
   // ---- Signal 2: Pullback-to-200 Bounce (continuation long) -------------
+  // TRA-458 v2 — cleared the TRA-455 acceptance gate after two revisions vs
+  // v1: a trend-strength gate (200-SMA 20-bar slope ≥ 2.0%) and a decisive
+  // up-close trigger that replaces the late-firing RSI-cross-40 momentum turn.
   // Pullback: low within 1.5×ATR of the 200-SMA on today or the prior 1–3 bars.
   let pullbackTouched = false;
   for (let i = t; i >= t - 3 && i >= 0; i--) {
@@ -210,17 +218,12 @@ export function evaluateSma200(symbol: string, candles: Candle[]): Sma200Evaluat
   const dayRange = today.high - today.low;
   const topOfRange = dayRange > 0 && (today.close - today.low) / dayRange >= 0.6;
   const holdConfirmed = today.close > sma200 && (today.close > today.open || topOfRange);
-  // Momentum turn: RSI(14) crossed back up through 40 within the last 3 bars.
-  let rsiCrossUp40 = false;
-  for (let i = t; i >= t - 2 && i >= 1; i--) {
-    const prev = rsiAt(closes, i - 1);
-    const cur = rsiAt(closes, i);
-    if (Number.isFinite(prev) && Number.isFinite(cur) && prev < 40 && cur >= 40) {
-      rsiCrossUp40 = true;
-      break;
-    }
-  }
-  if (trendQuality && pullbackTouched && holdConfirmed && rsiCrossUp40) {
+  // Trend strength: the 200-SMA must be rising ≥ 2.0% over the trailing 20 bars.
+  const sma200Slope20 = sma200 / sma200Prev - 1;
+  const trendStrength = sma200Slope20 >= SMA200_PULLBACK_MIN_SLOPE20;
+  // Trigger: a decisive up-close above the highs of *both* prior bars.
+  const decisiveUpClose = today.close > candles[t - 1].high && today.close > candles[t - 2].high;
+  if (trendQuality && trendStrength && pullbackTouched && holdConfirmed && decisiveUpClose) {
     const stop = sma200 - 1.0 * atr14;
     signals.push({
       kind: 'sma200_pullback',

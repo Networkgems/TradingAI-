@@ -105,14 +105,15 @@ export function StockSignalsPanel({
             </div>
           )}
           {/* TRA-451 — "SMA-200" category: daily-bar trend-filter signals.
-              Display-only until QuantTrader clears the backtest acceptance
-              gate; rendered separately so they don't read as live entries. */}
+              TRA-460 — pullbacks cleared the backtest acceptance gate and now
+              open live positions; reclaims stay display-only. Rendered as a
+              separate category from the intraday strategy signals. */}
           {sma200Signals.length > 0 && (
             <div className="signal-category">
               <div className="signal-category-header">
                 <span className="signal-category-title">SMA-200</span>
                 <span className="signal-category-note">
-                  Daily trend filter — research only, not yet trade-enabled
+                  Daily trend filter — pullbacks are trade-enabled; reclaims are research-only
                 </span>
               </div>
               <div className="signal-list">

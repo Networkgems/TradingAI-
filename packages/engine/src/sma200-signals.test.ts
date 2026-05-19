@@ -144,26 +144,41 @@ describe('evaluateSma200 — Signal 1 trend/quality filter', () => {
 });
 
 /**
- * Signal 2 fixture — an established uptrend (rising SMA200, price well above
- * both MAs) that prints a sharp 4-bar pullback whose low wicks down toward the
- * 200-SMA, then a strong hold-confirmation bar that closes back up with RSI
- * crossing back through 40.
+ * Signal 2 v2 fixture (TRA-458) — an established uptrend (200-SMA rising well
+ * above the 2.0% slope gate, price above both MAs) that prints a sharp 4-bar
+ * pullback whose low wicks down toward the 200-SMA, then a decisive up-close
+ * that finishes above the highs of *both* prior bars (the v2 trigger).
+ *
+ * `opts.flattenSlope` lifts an early-base slab so the 200-SMA's trailing
+ * 20-bar slope drops under the 2.0% gate — without touching the pullback
+ * shape, trend-quality, hold or trigger. `opts.maskTrigger` towers the t-1
+ * bar's high over today's close so the decisive-up-close trigger cannot fire.
  */
-function pullbackSeries(): Candle[] {
+function pullbackSeries(
+  opts: { flattenSlope?: boolean; maskTrigger?: boolean } = {},
+): Candle[] {
   // 100 bars @ 70, then a 144-bar grind up ⇒ rising SMA200 well below price.
   const base = flat(100, 70);
   const ramp = Array.from({ length: 144 }, (_, i) => 90 + i * 0.13); // 90 → ~108.6
-  // Tail: a 4-bar pullback in the closes (RSI collapses) then today's bounce.
+  // Tail: a 4-bar pullback in the closes, then today's decisive up-close.
   const tail = [107, 104, 101, 99, 98, 108];
   const closes = [...base, ...ramp, ...tail]; // 250 bars
+  // Lift an early-base slab (indices 30–46, clear of every trailing window
+  // except the t-20 200-SMA) so the 20-bar slope falls under the 2.0% gate.
+  if (opts.flattenSlope) {
+    for (let i = 30; i <= 46; i++) closes[i] = 95;
+  }
   // The t-1 bar wicks its low down to the 200-SMA (≈ 92) — the pullback touch.
   const lows: number[] = [];
   lows[closes.length - 2] = 91;
-  return buildSeries(closes, { spread: 1, lows });
+  // Mask the trigger: the t-1 bar's high towers above today's close.
+  const highs: number[] = [];
+  if (opts.maskTrigger) highs[closes.length - 2] = 112;
+  return buildSeries(closes, { spread: 1, lows, highs });
 }
 
-describe('evaluateSma200 — Signal 2 pullback-to-200 bounce', () => {
-  it('fires a continuation long with the spec stop and label', () => {
+describe('evaluateSma200 — Signal 2 v2 pullback-to-200 bounce', () => {
+  it('fires a continuation long on a decisive up-close above both prior highs', () => {
     const candles = pullbackSeries();
     const res = evaluateSma200('TEST', candles);
     const sig = res.signals.find(s => s.kind === 'sma200_pullback');
@@ -174,6 +189,26 @@ describe('evaluateSma200 — Signal 2 pullback-to-200 bounce', () => {
     const ind = res.indicators!;
     expect(sig!.stop).toBeCloseTo(ind.sma200 - ind.atr14);
     expect(sig!.entry).toBeCloseTo(candles[candles.length - 1].close);
+    // the v2 trigger: today's close cleared the highs of both prior bars.
+    const t = candles.length - 1;
+    expect(candles[t].close).toBeGreaterThan(candles[t - 1].high);
+    expect(candles[t].close).toBeGreaterThan(candles[t - 2].high);
+  });
+
+  it('does not fire when the 200-SMA 20-bar slope is under the 2.0% gate', () => {
+    const candles = pullbackSeries({ flattenSlope: true });
+    const res = evaluateSma200('TEST', candles);
+    // trend-quality still holds — the slope-strength gate is the only block.
+    expect(res.trendQuality).toBe(true);
+    expect(res.signals.find(s => s.kind === 'sma200_pullback')).toBeUndefined();
+  });
+
+  it('does not fire without a decisive up-close above both prior bars highs', () => {
+    const candles = pullbackSeries({ maskTrigger: true });
+    const res = evaluateSma200('TEST', candles);
+    // trend-quality + slope gate both hold — only the trigger fails.
+    expect(res.trendQuality).toBe(true);
+    expect(res.signals.find(s => s.kind === 'sma200_pullback')).toBeUndefined();
   });
 
   it('does not fire when the symbol is not uptrend-quality', () => {

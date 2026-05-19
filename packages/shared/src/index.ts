@@ -143,9 +143,9 @@ export interface RelativeValueSignal extends TradeSignal {
  * fields ride along so the Signals tab can render the spec UI row (RSI,
  * dist_atr, trend-quality badge) without a second lookup.
  *
- * These are display-only until QuantTrader clears the backtest acceptance
- * gate (profit factor > 1.3, beats buy-and-hold); the engine never opens a
- * position off an `Sma200Signal`.
+ * TRA-460 — `sma200_pullback` (Signal 2 v2) cleared the TRA-455 acceptance
+ * gate and the engine opens a live position off it; `sma200_reclaim`
+ * (Signal 3) failed validation and stays display-only.
  */
 export interface Sma200Signal extends TradeSignal {
   type: 'sma200_pullback' | 'sma200_reclaim';
