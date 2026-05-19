@@ -16,6 +16,8 @@ export type SignalType =
   | 'swing_trade'
   | 'otm_mispricing'
   | 'relative_value' // TRA-191: options chain relative-value scanner (IV skew + monotonic + no-arb)
+  | 'sma200_pullback' // TRA-451: pullback-to-200 bounce (continuation long), daily bars
+  | 'sma200_reclaim'  // TRA-451: 200-SMA reclaim reversal (trend-change swing), daily bars
   | 'tradier_import'; // TRA-323: position imported from Tradier (opened directly on the broker, synced into TradeAI to be closed here)
 export type OptionType = 'call' | 'put';
 
@@ -131,6 +133,33 @@ export interface RelativeValueSignal extends TradeSignal {
   delta: number;
   /** Free-text reason mirrored from the scanner — surfaces in the UI feed. */
   reason: string;
+}
+
+/**
+ * TRA-451 — signal emitted by the SMA-200 trend-filter scanner. Covers the
+ * pullback-to-200 bounce (`sma200_pullback`) and the 200-SMA reclaim reversal
+ * (`sma200_reclaim`), both computed on daily bars. `entryPrice` is the latest
+ * daily close and `stopLoss` is the spec-defined protective stop; the extra
+ * fields ride along so the Signals tab can render the spec UI row (RSI,
+ * dist_atr, trend-quality badge) without a second lookup.
+ *
+ * These are display-only until QuantTrader clears the backtest acceptance
+ * gate (profit factor > 1.3, beats buy-and-hold); the engine never opens a
+ * position off an `Sma200Signal`.
+ */
+export interface Sma200Signal extends TradeSignal {
+  type: 'sma200_pullback' | 'sma200_reclaim';
+  side: 'buy';
+  /** RSI(14) at the fire bar. */
+  rsi: number;
+  /** (close − SMA200) / ATR(14) — distance to the 200-SMA in ATRs. */
+  distAtr: number;
+  /** Signal-1 uptrend-quality gate state at the fire bar. */
+  trendQuality: boolean;
+  /** Reclaim-only: SMA50 > SMA200 golden-cross secondary confirmation. */
+  goldenCross?: boolean;
+  /** Human-readable context label from the spec ("continuation …" etc.). */
+  context: string;
 }
 
 /**
@@ -1782,7 +1811,8 @@ export interface EodTradeEntry {
     | 'OTM'
     | 'RV'           // TRA-191 — relative-value scanner
     | 'Tradier'      // TRA-323 — imported from Tradier (never actually written to disk: imports don't trade through the EOD exporter)
-    | 'Options';     // TRA-365 follow-up — option closes that arrived without a more specific signal mapping
+    | 'Options'      // TRA-365 follow-up — option closes that arrived without a more specific signal mapping
+    | 'SMA-200';     // TRA-451 — SMA-200 pullback/reclaim signals (display-only; never opens a position, so never reaches the EOD exporter)
   side: Side;
   entryPrice: number;
   exitPrice: number;

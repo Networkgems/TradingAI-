@@ -1,10 +1,10 @@
-import { OrbStrategy, BbFadeStrategy, IchimokuStrategy, TradierOptionsClient, TradierOrderClient, TRADIER_REJECTED_STATUSES } from '@trading-app/engine';
+import { OrbStrategy, BbFadeStrategy, IchimokuStrategy, TradierOptionsClient, TradierOrderClient, TRADIER_REJECTED_STATUSES, evaluateSma200, SMA200_MIN_BARS, SMA200_DEBOUNCE_BARS } from '@trading-app/engine';
 import type { TradierAccountBalance } from '@trading-app/engine';
 import { WATCHLIST, MANAGED_ACCOUNT_RATIO, MAX_CONSECUTIVE_LOSSES, DAILY_DRAWDOWN_HALT_PCT, OPTIONS_POSITION_CAP_RATIO, aliasWatchlistSymbol, isLiveTradierOptionsEnabled, isStockMarketOpen, resolveAutoManageImportedTradierOptions, resolveDemoCostModel, resolveLiveTradeEquitiesTradier, resolveManagedAccountRatio, resolveMarketReviewGatesEnabled, resolveRiskPerTrade, resolveRvDtePrefs, resolveTradierOptionsCreds, DEFAULT_RV_DTE_MIN, DEFAULT_RV_DTE_MAX, DEFAULT_RV_DTE_TARGET } from '@trading-app/shared';
-import type { TradeSignal, RelativeValueSignal, Candle, OptionsAccountState, SignalType, Position, AccountSettings, AccountState, NewsItem, TradierEnv, MarketReview, MarketReviewGates, EngineMarketReviewState, GatedStrategyNote } from '@trading-app/shared';
+import type { TradeSignal, RelativeValueSignal, Sma200Signal, Candle, OptionsAccountState, SignalType, Position, AccountSettings, AccountState, NewsItem, TradierEnv, MarketReview, MarketReviewGates, EngineMarketReviewState, GatedStrategyNote } from '@trading-app/shared';
 import { getLatestMarketReview } from './market-review.js';
 import { etDateString } from './scheduler.js';
-import { fetchMinuteBars, fetchQuotes, fetchStocksNews, isYahooBreakerOpen, setActiveInterestSymbols } from './yahoo-feed.js';
+import { fetchMinuteBars, fetchDailyCandles, fetchQuotes, fetchStocksNews, isYahooBreakerOpen, setActiveInterestSymbols } from './yahoo-feed.js';
 import { evaluateFeedFreshness } from './feed-freshness.js';
 import { PaperAccount } from './paper-account.js';
 import { PaperOptionsAccount } from './options-account.js';
@@ -92,6 +92,13 @@ const TRADIER_PORTFOLIO_RECONCILE_MS = 30_000;
  * Twelve Data candle access stays in sync with what's still on the board.
  */
 const SIGNAL_VALID_MS = 30 * 60_000;
+/**
+ * TRA-451 — SMA-200 pullback/reclaim signals fire on *daily* bars, so the
+ * 30-minute equity-signal TTL would prune them before the next scan. They
+ * stay on the board for ~5 trading days, matching the spec's 5-bar debounce
+ * so an emitted setup is visible for the life of its debounce window.
+ */
+const SMA200_SIGNAL_VALID_MS = 5 * 24 * 60 * 60_000;
 
 /**
  * TRA-327 — pick the options-daily-trades cap that matches the active mode.
@@ -115,6 +122,13 @@ function activeOptionsDailyLimit(settings?: AccountSettings): number | undefined
 // chain cache. RV is the *only* options strategy enabled for stock options
 // (TRA-191 directive); ATM auto-open and OTM scans are disabled below.
 const RV_SCAN_INTERVAL_MS = 5 * 60_000;
+// TRA-451 — SMA-200 daily-bar scan cadence. The signals only change once per
+// daily close, so a 4-hour cadence is plenty: ~6 scans/day keeps the board
+// fresh without burning Yahoo quota on a per-tick (30s) daily-candle refresh.
+const SMA200_SCAN_INTERVAL_MS = 4 * 60 * 60_000;
+// TRA-451 — daily bars pulled per symbol for the SMA-200 scan. The spec needs
+// ≥ 250 sessions; an extra ~30-bar cushion covers holidays / missing prints.
+const SMA200_DAILY_BARS = SMA200_MIN_BARS + 30;
 
 /**
  * TRA-389 — how often the engine re-reads the persisted premarket
@@ -301,6 +315,15 @@ export class SignalEngine {
   private symbolState: Map<string, SymbolState> = new Map();
   private candleCache: Map<string, Candle[]> = new Map();
   private recentSignals: TradeSignal[] = [];
+  /** TRA-451 — last SMA-200 daily-bar scan timestamp (gates the 4h cadence). */
+  private lastSma200ScanAt = 0;
+  /**
+   * TRA-451 — debounce ledger for SMA-200 signals: maps `${symbol}:${type}`
+   * to the daily-bar timestamp the last signal of that type fired on. A new
+   * signal of the same key is suppressed until 5 daily bars have elapsed
+   * (spec guardrail: one signal per symbol per type, 5-bar debounce).
+   */
+  private sma200LastFired: Map<string, number> = new Map();
   private allClosedPositions: Position[] = [];
   private newsCache: NewsItem[] = [];
   private lastNewsRefresh = 0;
@@ -729,6 +752,9 @@ export class SignalEngine {
     this.recentSignals = [];
     this.dailySignals = [];
     this.positionSignalType.clear();
+    // TRA-451 — clear the SMA-200 debounce ledger so signals can re-emit
+    // against the next daily scan after a full reset.
+    this.sma200LastFired.clear();
     // TRA-335 — wipe the live equity mirror too. The Tradier-side positions
     // are NOT canceled here (forceReset is local-only by design); the user
     // must close them in Tradier or re-import via reconciliation.
@@ -754,6 +780,9 @@ export class SignalEngine {
    */
   clearSignals(): void {
     this.recentSignals = [];
+    // TRA-451 — also clear the SMA-200 debounce ledger; otherwise a cleared
+    // daily signal would stay debounced for 5 bars and never re-appear.
+    this.sma200LastFired.clear();
   }
 
   onTick(handler: EngineEventHandler): void {
@@ -1277,7 +1306,98 @@ export class SignalEngine {
       }
     }
 
+    // TRA-451 — SMA-200 trend-filter scan on daily bars. Runs on its own slow
+    // cadence (daily bars only change at the daily close) and independent of
+    // the auto-trading flag: these signals are display-only — the engine
+    // never opens a position off them until QuantTrader clears the backtest
+    // acceptance gate in the spec. A failed scan is swallowed so a cold Yahoo
+    // feed can't take down the rest of the tick.
+    if (Date.now() - this.lastSma200ScanAt >= SMA200_SCAN_INTERVAL_MS) {
+      this.lastSma200ScanAt = Date.now();
+      try {
+        await this.runSma200Scan(activeSymbols);
+      } catch (err: unknown) {
+        log.warn('sma200 scan threw', {
+          component: 'sma200-scan',
+          reason: err instanceof Error ? err.message : String(err),
+        });
+      }
+    }
+
     for (const h of this.handlers) h(this.getState());
+  }
+
+  /**
+   * TRA-451 — scan the watchlist for SMA-200 pullback/reclaim signals on daily
+   * bars. Fetches ≥ 250 daily candles per symbol, evaluates the spec's three
+   * signals via {@link evaluateSma200}, applies the one-per-symbol-per-type +
+   * 5-bar debounce guardrail, and pushes any fresh signals onto the display
+   * feed. No position (paper or broker) is ever opened here.
+   */
+  private async runSma200Scan(symbols: string[]): Promise<void> {
+    if (symbols.length === 0) return;
+    const SCAN_BATCH = 5;
+    let fired = 0;
+    for (let i = 0; i < symbols.length; i += SCAN_BATCH) {
+      await Promise.all(
+        symbols.slice(i, i + SCAN_BATCH).map(async (sym) => {
+          let candles: Candle[];
+          try {
+            candles = await fetchDailyCandles(sym, SMA200_DAILY_BARS);
+          } catch (err: unknown) {
+            log.warn('sma200: daily candle fetch failed', {
+              component: 'sma200-scan', sym,
+              reason: err instanceof Error ? err.message : String(err),
+            });
+            return;
+          }
+          if (candles.length < SMA200_MIN_BARS) return;
+          const evalResult = evaluateSma200(sym, candles);
+          const latestBarTs = candles[candles.length - 1].timestamp;
+          for (const result of evalResult.signals) {
+            const key = `${sym}:${result.kind}`;
+            const lastFiredBarTs = this.sma200LastFired.get(key);
+            // Already emitted for this exact daily bar — never duplicate it.
+            if (lastFiredBarTs === latestBarTs) continue;
+            // 5-bar debounce: suppress until 5 daily bars have elapsed since
+            // the last fire of this symbol+type.
+            if (lastFiredBarTs !== undefined) {
+              const lastIdx = candles.findIndex(c => c.timestamp === lastFiredBarTs);
+              if (lastIdx >= 0 && candles.length - 1 - lastIdx < SMA200_DEBOUNCE_BARS) {
+                continue;
+              }
+            }
+            const risk = result.entry - result.stop;
+            const signal: Sma200Signal = {
+              id: randomUUID(),
+              symbol: sym,
+              type: result.kind,
+              side: 'buy',
+              entryPrice: result.entry,
+              stopLoss: result.stop,
+              // Display-only 2R projection — the spec defines no profit
+              // target (QuantTrader's backtest owns the exit model).
+              takeProfit: risk > 0 ? result.entry + 2 * risk : result.entry,
+              riskRewardRatio: 2,
+              timestamp: Date.now(),
+              mode: this.mode,
+              rsi: result.rsi,
+              distAtr: result.distAtr,
+              trendQuality: result.trendQuality,
+              goldenCross: result.goldenCross,
+              context: result.label,
+            };
+            this.recentSignals.unshift(signal);
+            if (this.recentSignals.length > MAX_SIGNALS) this.recentSignals.pop();
+            this.sma200LastFired.set(key, latestBarTs);
+            fired++;
+          }
+        }),
+      );
+    }
+    if (fired > 0) {
+      log.info('sma200 scan emitted signals', { component: 'sma200-scan', count: fired });
+    }
   }
 
   /**
@@ -1808,9 +1928,13 @@ export class SignalEngine {
    * compared to the underlying quote, so we only age those out.
    */
   private pruneInvalidSignals(prices: Map<string, number>): void {
-    const cutoff = Date.now() - SIGNAL_VALID_MS;
+    const now = Date.now();
     this.recentSignals = this.recentSignals.filter(sig => {
-      if (sig.timestamp < cutoff) return false;
+      // TRA-451 — SMA-200 signals fire on daily bars and get a multi-day TTL
+      // so they survive the 30-minute intraday-signal window.
+      const isSma200 = sig.type === 'sma200_pullback' || sig.type === 'sma200_reclaim';
+      const ttl = isSma200 ? SMA200_SIGNAL_VALID_MS : SIGNAL_VALID_MS;
+      if (sig.timestamp < now - ttl) return false;
       if (sig.type === 'otm_mispricing' || sig.type === 'relative_value') return true;
       const price = prices.get(sig.symbol);
       if (!price) return true;

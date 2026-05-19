@@ -44,6 +44,11 @@ function strategyLabel(t: SignalType): EodTradeEntry['strategy'] {
     // for completeness (and to keep the switch exhaustive); this label is
     // never emitted to disk in practice.
     case 'tradier_import': return 'Tradier';
+    // TRA-451 — SMA-200 signals are display-only; the engine never opens a
+    // position off them, so they never reach the EOD trade exporter. Mapped
+    // here only to keep the switch exhaustive over `SignalType`.
+    case 'sma200_pullback':
+    case 'sma200_reclaim': return 'SMA-200';
   }
 }
 

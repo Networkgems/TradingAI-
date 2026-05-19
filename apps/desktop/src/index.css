@@ -501,6 +501,56 @@ tr:hover td { background: var(--bg-hover); }
   padding: 0.2rem 0.5rem;
 }
 
+/* TRA-451 — "SMA-200" Signals-tab category: a labelled section that groups
+   the daily trend-filter signals apart from the intraday strategy cards. */
+.signal-category { margin-top: 1rem; }
+.signal-category-header {
+  display: flex;
+  align-items: baseline;
+  gap: 0.6rem;
+  margin-bottom: 0.5rem;
+  padding-bottom: 0.3rem;
+  border-bottom: 1px solid var(--border);
+}
+.signal-category-title {
+  font-size: 0.8rem;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+  color: var(--blue);
+}
+.signal-category-note { font-size: 0.68rem; color: var(--muted); }
+
+/* TRA-451 — SMA-200 signal card: a research card, so it uses a neutral blue
+   accent rather than the green buy treatment of a live entry. */
+.signal-card.sma200-card { border-left: 3px solid var(--blue); background: var(--surface); }
+.sma200-badge {
+  font-size: 0.62rem;
+  font-weight: 700;
+  padding: 0.15em 0.5em;
+  border-radius: 3px;
+  letter-spacing: 0.04em;
+}
+.sma200-badge.ok { background: var(--green-soft); color: var(--green); }
+.sma200-badge.off { background: var(--bg); color: var(--muted); }
+.sma200-context {
+  margin-top: 0.55rem;
+  font-size: 0.72rem;
+  color: var(--muted);
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+  flex-wrap: wrap;
+}
+.sma200-chip {
+  font-size: 0.62rem;
+  font-weight: 700;
+  padding: 0.12em 0.45em;
+  border-radius: 3px;
+  background: var(--green-soft);
+  color: var(--green);
+}
+
 .positions-panel h3 {
   font-size: 0.8rem;
   text-transform: uppercase;

@@ -123,6 +123,8 @@ export function signalLabel(type: string) {
     case 'relative_value': return 'Relative Value';
     case 'otm_mispricing': return 'OTM Mispricing';
     case 'tradier_import': return 'Tradier Import';
+    case 'sma200_pullback': return 'Pullback → 200';
+    case 'sma200_reclaim': return '200-SMA Reclaim';
     default: return type;
   }
 }

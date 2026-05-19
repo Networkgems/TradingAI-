@@ -75,6 +75,11 @@ function strategyLabel(t: SignalType): StrategyLabel {
     // never reach the crypto EOD exporter. Mapped here only to keep the
     // switch exhaustive for the shared `SignalType` enum.
     case 'tradier_import': return 'Tradier';
+    // TRA-451 — SMA-200 signals are stock-equity, display-only, and never
+    // reach the crypto EOD exporter. Mapped only to keep the switch
+    // exhaustive over the shared `SignalType` enum.
+    case 'sma200_pullback':
+    case 'sma200_reclaim': return 'SMA-200';
   }
 }
 

@@ -128,6 +128,20 @@ export type {
 } from './coinbase/index.js';
 export { rsi, rsiDivergence, VwapTracker, detectPattern, isBullishPattern, isBearishPattern, adx, ema, emaCross, emaSeries, maSlope, atr, atrPct, donchian, ichimoku, tkCross } from './indicators/index.js';
 export type { VwapState, CandlePattern, AdxResult, DonchianChannel, IchimokuState } from './indicators/index.js';
+export {
+  evaluateSma200,
+  smaSeries,
+  SMA200_MIN_BARS,
+  SMA200_MIN_PRICE,
+  SMA200_MIN_AVG_DOLLAR_VOL,
+  SMA200_DEBOUNCE_BARS,
+} from './sma200-signals.js';
+export type {
+  Sma200Indicators,
+  Sma200SignalResult,
+  Sma200SignalKind,
+  Sma200Evaluation,
+} from './sma200-signals.js';
 export { RegimeDetector, classifyRegime } from './regime.js';
 export type { Regime, RegimeDetectorOptions } from './regime.js';
 export { StrategyRouter, DEFAULT_ROUTER_PRIORITY } from './router.js';
