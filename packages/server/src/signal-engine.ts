@@ -2217,7 +2217,11 @@ export class SignalEngine {
       const orderId = opt.pendingExit.tradierOrderId;
       if (orderId === '' || orderId === undefined) {
         // Nothing on the broker yet — clear locally and report success.
-        acct.clearPendingExit(optionId, 'Cancelled before Tradier order id was attached.');
+        // TRA-450 — a user cancel is not a broker rejection; don't trip the
+        // auto-close circuit breaker.
+        acct.clearPendingExit(optionId, 'Cancelled before Tradier order id was attached.', {
+          countRejection: false,
+        });
         return { status: 'cancelled' };
       }
       const client = this.tradierOptionsClientByEnv[env];
@@ -2231,7 +2235,8 @@ export class SignalEngine {
         log.warn('cancel sell_to_close failed', { order: orderId, env, reason });
         return { status: 'error', reason, orderId };
       }
-      acct.clearPendingExit(optionId, 'User cancelled the close order.');
+      // TRA-450 — user cancel, not a broker rejection: skip the breaker count.
+      acct.clearPendingExit(optionId, 'User cancelled the close order.', { countRejection: false });
       log.info('cancel sell_to_close accepted; pendingExit cleared', { order: orderId, env });
       return { status: 'cancelled', orderId };
     }

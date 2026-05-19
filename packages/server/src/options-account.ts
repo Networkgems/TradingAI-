@@ -37,6 +37,22 @@ const ATM_DELTA = 0.50;
  */
 const STALE_MARK_BACKSTOP_TICKS = 3;
 
+/**
+ * TRA-450 — circuit breaker for the engine's auto-close retry loop. Each tick
+ * `checkExits` re-stages a `sell_to_close` for a position still under its
+ * stop-loss / trailing trigger; a broker rejection clears the staged exit and
+ * `checkExits` would otherwise re-stage it on the very next tick, forever. The
+ * Tradier export on this ticket showed 3 positions retried ~490 times each
+ * (1,476 rejected `sell_to_close` orders, 9 filled). Once a position has
+ * `MAX_CONSECUTIVE_CLOSE_REJECTS` consecutive rejected auto-close attempts,
+ * `checkExits` stops staging new exits for it and leaves `exitErrorReason` on
+ * the row so the dashboard surfaces it for manual action. The counter resets
+ * on a fill ({@link OptionsAccount.finalizePendingExit}) or when the user
+ * explicitly re-stages a close ({@link OptionsAccount.stageManualPendingExit}),
+ * so a one-off broker hiccup never permanently strands a closeable position.
+ */
+const MAX_CONSECUTIVE_CLOSE_REJECTS = 3;
+
 function toDateKey(ts: number): string {
   return new Date(ts).toISOString().slice(0, 10);
 }
@@ -939,6 +955,17 @@ export class PaperOptionsAccount {
         opt.trailingStopPremium = opt.peakPremium * (1 - trailOffsetPct);
       }
 
+      // TRA-450 — auto-close circuit breaker. After MAX_CONSECUTIVE_CLOSE_REJECTS
+      // rejected `sell_to_close` attempts the broker is clearly refusing this
+      // contract (no bid / illiquid / unfillable). Stop re-staging the exit so
+      // we don't spray Tradier with hundreds of doomed orders; the row keeps
+      // `exitErrorReason` (NOT cleared below) so the dashboard surfaces it for
+      // a manual close. The counter resets on a fill or a user re-stage, so a
+      // transient hiccup never strands a position that could still close. We
+      // still update the mark / trailing state above so the dashboard stays
+      // live — only NEW order submission is suppressed.
+      if ((opt.closeRejectCount ?? 0) >= MAX_CONSECUTIVE_CLOSE_REJECTS) continue;
+
       // Partial exit at TP1: sell `partialExitRatio` of contracts, trail the rest
       if (!opt.tp1Hit && mark >= opt.tp1Premium && opt.contractsRemaining > 1) {
         const exitContracts = Math.floor(opt.contractsRemaining * partialExitRatio);
@@ -1100,6 +1127,10 @@ export class PaperOptionsAccount {
   ): OptionPosition | null {
     const opt = this.openOptions.get(optionId);
     if (!opt || !opt.pendingExit) return null;
+    // TRA-450 — a fill is a successful close: reset the rejection counter so
+    // a future exit on the remainder (TP1 / manual partial) starts fresh and
+    // the circuit breaker only ever counts *consecutive* failures.
+    delete opt.closeRejectCount;
     const pending = opt.pendingExit;
     const price = (typeof fillPrice === 'number' && Number.isFinite(fillPrice) && fillPrice > 0)
       ? fillPrice
@@ -1207,6 +1238,11 @@ export class PaperOptionsAccount {
       duration,
     };
     delete opt.exitErrorReason;
+    // TRA-450 — the user explicitly re-staged this close, so clear any
+    // tripped auto-close breaker. If this manual attempt also fails the
+    // counter climbs again from zero; a deliberate user retry always gets a
+    // clean slate rather than inheriting the engine's abandoned-retry state.
+    delete opt.closeRejectCount;
     return { ...opt };
   }
 
@@ -1216,12 +1252,34 @@ export class PaperOptionsAccount {
    * the submit itself throws. The position remains open at its current
    * mark; the surfaced `reason` is stamped on `exitErrorReason` so the
    * dashboard can render a notice next to the row.
+   *
+   * TRA-450 — a broker rejection (the default) bumps `closeRejectCount`,
+   * which feeds the {@link MAX_CONSECUTIVE_CLOSE_REJECTS} circuit breaker in
+   * `checkExits`. Pass `{ countRejection: false }` for a user-initiated
+   * cancel (the user pulled their own order — that is not the broker
+   * refusing the contract, so it must not trip the breaker).
    */
-  clearPendingExit(optionId: string, reason?: string): boolean {
+  clearPendingExit(
+    optionId: string,
+    reason?: string,
+    options: { countRejection?: boolean } = {},
+  ): boolean {
     const opt = this.openOptions.get(optionId);
     if (!opt || !opt.pendingExit) return false;
     delete opt.pendingExit;
     if (reason) opt.exitErrorReason = reason;
+    if (options.countRejection !== false) {
+      opt.closeRejectCount = (opt.closeRejectCount ?? 0) + 1;
+      if (opt.closeRejectCount >= MAX_CONSECUTIVE_CLOSE_REJECTS) {
+        // The breaker just tripped — make the surfaced reason explain why
+        // the engine has stopped retrying so the dashboard notice is
+        // actionable rather than just echoing the raw broker status.
+        opt.exitErrorReason =
+          `${reason ? `${reason} — ` : ''}auto-close paused after ` +
+          `${opt.closeRejectCount} rejected attempts; close this position ` +
+          `manually on Tradier or with the Close button.`;
+      }
+    }
     return true;
   }
 

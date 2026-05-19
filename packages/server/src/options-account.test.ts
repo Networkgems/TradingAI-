@@ -1279,6 +1279,79 @@ describe('PaperOptionsAccount — TRA-354 wait-and-hold exits', () => {
     expect(open.contractsRemaining).toBe(pos!.contracts);
   });
 
+  it('TRA-450 — auto-close circuit breaker stops re-staging after MAX consecutive rejections', () => {
+    const acct = new PaperOptionsAccount({ initialEquity: 50_000, managedAccountRatio: 0.5 });
+    const pos = acct.openOptionFromRvCandidate(buildRvSignal({ mark: 1.0 }), 'live');
+    const marks = new Map<string, number>([[pos!.optionSymbol!, 0.30]]);
+
+    // Three ticks: each stages an exit; the broker rejects each one.
+    for (let i = 0; i < 3; i += 1) {
+      const staged = acct.checkExits(new Map(), marks, 'live', { waitAndHold: true });
+      expect(staged).toHaveLength(1);
+      acct.clearPendingExit(pos!.id, 'Tradier sell_to_close rejected');
+    }
+
+    // Fourth tick: the breaker has tripped — checkExits must NOT stage another
+    // exit even though the SL trigger still holds. This is the fix for the
+    // 1,476-rejected-orders storm in the Tradier export on TRA-450.
+    const fourth = acct.checkExits(new Map(), marks, 'live', { waitAndHold: true });
+    expect(fourth).toHaveLength(0);
+
+    const open = acct.getState().openOptions[0];
+    expect(open.id).toBe(pos!.id);
+    expect(open.pendingExit).toBeUndefined();
+    expect(open.closeRejectCount).toBe(3);
+    // The surfaced reason explains the engine has stopped retrying.
+    expect(open.exitErrorReason).toContain('auto-close paused');
+    // Position is still open and the paper book is untouched.
+    expect(open.contractsRemaining).toBe(pos!.contracts);
+    expect(acct.getState().closedOptions).toHaveLength(0);
+  });
+
+  it('TRA-450 — a fill resets the rejection counter so a later exit gets a clean slate', () => {
+    const acct = new PaperOptionsAccount({ initialEquity: 50_000, managedAccountRatio: 0.5 });
+    const pos = acct.openOptionFromRvCandidate(buildRvSignal({ mark: 1.0 }), 'live');
+    // TP1 partial fill, then later an SL exit on the remainder.
+    const tp1Marks = new Map<string, number>([[pos!.optionSymbol!, 1.60]]);
+    const staged = acct.checkExits(new Map(), tp1Marks, 'live', { waitAndHold: true });
+    // One rejection bumps the counter before the fill lands.
+    acct.clearPendingExit(pos!.id, 'Tradier sell_to_close rejected');
+    expect(acct.getState().openOptions[0].closeRejectCount).toBe(1);
+    // Re-stage and fill the TP1 partial — finalize must clear the counter.
+    acct.checkExits(new Map(), tp1Marks, 'live', { waitAndHold: true });
+    acct.finalizePendingExit(pos!.id, staged[0].pendingExit!.limitPrice);
+    expect(acct.getState().openOptions[0].closeRejectCount).toBeUndefined();
+  });
+
+  it('TRA-450 — a user re-stage (stageManualPendingExit) clears a tripped breaker', () => {
+    const acct = new PaperOptionsAccount({ initialEquity: 50_000, managedAccountRatio: 0.5 });
+    const pos = acct.openOptionFromRvCandidate(buildRvSignal({ mark: 1.0 }), 'live');
+    const marks = new Map<string, number>([[pos!.optionSymbol!, 0.30]]);
+    for (let i = 0; i < 3; i += 1) {
+      acct.checkExits(new Map(), marks, 'live', { waitAndHold: true });
+      acct.clearPendingExit(pos!.id, 'Tradier sell_to_close rejected');
+    }
+    expect(acct.getState().openOptions[0].closeRejectCount).toBe(3);
+    // The user explicitly closes — the breaker resets so the attempt proceeds.
+    const restaged = acct.stageManualPendingExit(pos!.id, 1, 0.30);
+    expect(restaged).not.toBeNull();
+    expect(acct.getState().openOptions[0].closeRejectCount).toBeUndefined();
+  });
+
+  it('TRA-450 — a user cancel does not count toward the breaker', () => {
+    const acct = new PaperOptionsAccount({ initialEquity: 50_000, managedAccountRatio: 0.5 });
+    const pos = acct.openOptionFromRvCandidate(buildRvSignal({ mark: 1.0 }), 'live');
+    const marks = new Map<string, number>([[pos!.optionSymbol!, 0.30]]);
+    for (let i = 0; i < 5; i += 1) {
+      const staged = acct.checkExits(new Map(), marks, 'live', { waitAndHold: true });
+      expect(staged).toHaveLength(1);
+      acct.clearPendingExit(pos!.id, 'User cancelled the close order.', { countRejection: false });
+    }
+    // Five user cancels never trip the breaker — the engine keeps staging.
+    expect(acct.getState().openOptions[0].closeRejectCount).toBeUndefined();
+    expect(acct.checkExits(new Map(), marks, 'live', { waitAndHold: true })).toHaveLength(1);
+  });
+
   it('attachPendingExit stamps the Tradier order id; listPendingExits surfaces all in-flight rows', () => {
     const acct = new PaperOptionsAccount({ initialEquity: 50_000, managedAccountRatio: 0.5 });
     const pos = acct.openOptionFromRvCandidate(buildRvSignal({ mark: 1.0 }), 'live');

@@ -1366,6 +1366,18 @@ export interface OptionPosition {
    */
   exitErrorReason?: string;
   /**
+   * TRA-450 — consecutive rejected auto-close (`sell_to_close`) attempts the
+   * engine has made for this position. Bumped by `clearPendingExit` each time
+   * the broker rejects / cancels / expires a staged exit (or the submit
+   * throws); reset to absent on a fill (`finalizePendingExit`) or a user
+   * re-stage (`stageManualPendingExit`). Once it reaches the engine's
+   * `MAX_CONSECUTIVE_CLOSE_REJECTS` threshold, `checkExits` stops re-staging
+   * the exit so the engine can't spray the broker with hundreds of doomed
+   * orders — the row keeps `exitErrorReason` so the user can close manually.
+   * Absent ↔ no rejected close attempt outstanding / legacy snapshot.
+   */
+  closeRejectCount?: number;
+  /**
    * TRA-384 — sign-adjusted Black-Scholes delta captured from the OTM / RV
    * scanner at entry. Used by `checkExits` as the extrapolation slope when the
    * live mark feed has stalled, so the stop-loss backstop tracks an OTM strike
