@@ -1126,6 +1126,10 @@ tr:hover td { background: var(--bg-hover); }
   align-items: center;
   justify-content: center;
   z-index: 200;
+  /* TRA-463 — reserve the device safe-area insets so a centred modal (and its
+     close button) never tucks under the status bar / notch on mobile web. */
+  padding: env(safe-area-inset-top) env(safe-area-inset-right)
+           env(safe-area-inset-bottom) env(safe-area-inset-left);
 }
 
 .modal-card {
@@ -1143,7 +1147,9 @@ tr:hover td { background: var(--bg-hover); }
 .modal-card-settings {
   position: relative;
   max-width: 820px;
-  max-height: calc(100vh - 80px);
+  /* TRA-463 — subtract the safe-area insets the backdrop now reserves so the
+     centred card stays fully inside the visible/tappable area on mobile. */
+  max-height: calc(100vh - 80px - env(safe-area-inset-top) - env(safe-area-inset-bottom));
   padding: 0;
   overflow: hidden;
   display: flex;
