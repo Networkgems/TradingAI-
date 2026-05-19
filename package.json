@@ -5,7 +5,7 @@
   "scripts": {
     "dev": "pnpm --filter desktop tauri dev",
     "build": "pnpm --filter desktop tauri build",
-    "render-build": "pnpm --filter @trading-app/shared build && pnpm --filter @trading-app/engine build && pnpm --filter @trading-app/backtest build && pnpm --filter @trading-app/server build && pnpm --filter desktop vite:build",
+    "render-build": "pnpm lint && pnpm --filter @trading-app/shared build && pnpm --filter @trading-app/engine build && pnpm --filter @trading-app/backtest build && pnpm --filter @trading-app/server build && pnpm --filter desktop vite:build",
     "server:dev": "pnpm --filter @trading-app/server dev",
     "server:build": "pnpm --filter @trading-app/server build",
     "server:start": "pnpm --filter @trading-app/server start",
