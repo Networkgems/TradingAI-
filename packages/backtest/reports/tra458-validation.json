@@ -1,0 +1,924 @@
+{
+  "issue": "TRA-458",
+  "generatedAt": "2026-05-19T02:28:59.670Z",
+  "window": {
+    "testStart": "2022-01-01",
+    "testEnd": "2026-05-18",
+    "years": 4.38
+  },
+  "spyBuyHoldMar": 0.41372195568211406,
+  "shipGate": "profit factor > 1.3 AND MAR > SPY buy-and-hold MAR",
+  "primaryTp": 2.5,
+  "signal2_pullback": [
+    {
+      "name": "v1-baseline (rsi40)",
+      "cfg": {
+        "requireGoldenCross": false,
+        "minSlope20": 0,
+        "minAdx": 0,
+        "trigger": "rsi40"
+      },
+      "primary": {
+        "trades": 56,
+        "winRatePct": 42.857142857142854,
+        "avgR": 0.08592077775437339,
+        "profitFactor": 1.1753335469883914,
+        "cagrPct": 1.001676470947066,
+        "maxDrawdownPct": 11.513342902368828,
+        "mar": 0.08700135828847542
+      },
+      "gate": false,
+      "tpSweep": [
+        {
+          "tp": 2,
+          "m": {
+            "trades": 56,
+            "winRatePct": 42.857142857142854,
+            "avgR": 0.048575166692218855,
+            "profitFactor": 1.09912452487391,
+            "cagrPct": 0.5340120421675865,
+            "maxDrawdownPct": 11.753817941212807,
+            "mar": 0.04543307075526175
+          }
+        },
+        {
+          "tp": 2.5,
+          "m": {
+            "trades": 56,
+            "winRatePct": 42.857142857142854,
+            "avgR": 0.08592077775437339,
+            "profitFactor": 1.1753335469883914,
+            "cagrPct": 1.001676470947066,
+            "maxDrawdownPct": 11.513342902368828,
+            "mar": 0.08700135828847542
+          }
+        },
+        {
+          "tp": 3,
+          "m": {
+            "trades": 56,
+            "winRatePct": 42.857142857142854,
+            "avgR": 0.14837874923166858,
+            "profitFactor": 1.3027879062601404,
+            "cagrPct": 1.787727956158136,
+            "maxDrawdownPct": 11.513342902368828,
+            "mar": 0.15527444733625692
+          }
+        }
+      ]
+    },
+    {
+      "name": "priorHigh trigger",
+      "cfg": {
+        "requireGoldenCross": false,
+        "minSlope20": 0,
+        "minAdx": 0,
+        "trigger": "priorHigh"
+      },
+      "primary": {
+        "trades": 437,
+        "winRatePct": 38.215102974828376,
+        "avgR": 0.04153526308991089,
+        "profitFactor": 1.0698275681542362,
+        "cagrPct": 3.1855393177322444,
+        "maxDrawdownPct": 54.3290267877004,
+        "mar": 0.058634205434606124
+      },
+      "gate": false,
+      "tpSweep": [
+        {
+          "tp": 2,
+          "m": {
+            "trades": 437,
+            "winRatePct": 39.130434782608695,
+            "avgR": -0.0023924199775486464,
+            "profitFactor": 0.995909331237164,
+            "cagrPct": -1.0807381708756059,
+            "maxDrawdownPct": 51.50367578222137,
+            "mar": -0.020983709501539452
+          }
+        },
+        {
+          "tp": 2.5,
+          "m": {
+            "trades": 437,
+            "winRatePct": 38.215102974828376,
+            "avgR": 0.04153526308991089,
+            "profitFactor": 1.0698275681542362,
+            "cagrPct": 3.1855393177322444,
+            "maxDrawdownPct": 54.3290267877004,
+            "mar": 0.058634205434606124
+          }
+        },
+        {
+          "tp": 3,
+          "m": {
+            "trades": 437,
+            "winRatePct": 37.75743707093822,
+            "avgR": 0.08530448381494893,
+            "profitFactor": 1.1419622148852193,
+            "cagrPct": 7.6142813031752965,
+            "maxDrawdownPct": 56.18464332912876,
+            "mar": 0.13552246400446036
+          }
+        }
+      ]
+    },
+    {
+      "name": "priorHigh + goldenCross",
+      "cfg": {
+        "requireGoldenCross": true,
+        "minSlope20": 0,
+        "minAdx": 0,
+        "trigger": "priorHigh"
+      },
+      "primary": {
+        "trades": 255,
+        "winRatePct": 42.35294117647059,
+        "avgR": 0.12655825923536498,
+        "profitFactor": 1.242427654662658,
+        "cagrPct": 7.071105903472374,
+        "maxDrawdownPct": 30.45427094708515,
+        "mar": 0.23218765984444514
+      },
+      "gate": false,
+      "tpSweep": [
+        {
+          "tp": 2,
+          "m": {
+            "trades": 255,
+            "winRatePct": 42.745098039215684,
+            "avgR": 0.07288783422055313,
+            "profitFactor": 1.1406856693840934,
+            "cagrPct": 3.868876799342136,
+            "maxDrawdownPct": 29.32314192948351,
+            "mar": 0.13193936750181945
+          }
+        },
+        {
+          "tp": 2.5,
+          "m": {
+            "trades": 255,
+            "winRatePct": 42.35294117647059,
+            "avgR": 0.12655825923536498,
+            "profitFactor": 1.242427654662658,
+            "cagrPct": 7.071105903472374,
+            "maxDrawdownPct": 30.45427094708515,
+            "mar": 0.23218765984444514
+          }
+        },
+        {
+          "tp": 3,
+          "m": {
+            "trades": 255,
+            "winRatePct": 42.35294117647059,
+            "avgR": 0.17282928810545273,
+            "profitFactor": 1.3310617515250536,
+            "cagrPct": 9.907584906737178,
+            "maxDrawdownPct": 30.918220090255254,
+            "mar": 0.3204448664190676
+          }
+        }
+      ]
+    },
+    {
+      "name": "priorHigh + slope≥1.0%",
+      "cfg": {
+        "requireGoldenCross": false,
+        "minSlope20": 0.01,
+        "minAdx": 0,
+        "trigger": "priorHigh"
+      },
+      "primary": {
+        "trades": 209,
+        "winRatePct": 44.01913875598086,
+        "avgR": 0.20545442215586565,
+        "profitFactor": 1.3999650944259416,
+        "cagrPct": 9.761604725950246,
+        "maxDrawdownPct": 27.41317779575271,
+        "mar": 0.3560916869500139
+      },
+      "gate": false,
+      "tpSweep": [
+        {
+          "tp": 2,
+          "m": {
+            "trades": 209,
+            "winRatePct": 44.97607655502392,
+            "avgR": 0.16279898907437731,
+            "profitFactor": 1.3230668457054353,
+            "cagrPct": 7.62943742903035,
+            "maxDrawdownPct": 27.015331076573762,
+            "mar": 0.28241139845390184
+          }
+        },
+        {
+          "tp": 2.5,
+          "m": {
+            "trades": 209,
+            "winRatePct": 44.01913875598086,
+            "avgR": 0.20545442215586565,
+            "profitFactor": 1.3999650944259416,
+            "cagrPct": 9.761604725950246,
+            "maxDrawdownPct": 27.41317779575271,
+            "mar": 0.3560916869500139
+          }
+        },
+        {
+          "tp": 3,
+          "m": {
+            "trades": 209,
+            "winRatePct": 43.54066985645933,
+            "avgR": 0.2578091179345928,
+            "profitFactor": 1.4944889124897285,
+            "cagrPct": 12.434527804193918,
+            "maxDrawdownPct": 29.435087661783264,
+            "mar": 0.4224389594850147
+          }
+        }
+      ]
+    },
+    {
+      "name": "priorHigh + slope≥1.5%",
+      "cfg": {
+        "requireGoldenCross": false,
+        "minSlope20": 0.015,
+        "minAdx": 0,
+        "trigger": "priorHigh"
+      },
+      "primary": {
+        "trades": 124,
+        "winRatePct": 47.58064516129033,
+        "avgR": 0.2924612817550849,
+        "profitFactor": 1.5939271788553673,
+        "cagrPct": 8.29705032767103,
+        "maxDrawdownPct": 17.224565517422313,
+        "mar": 0.48169867154435475
+      },
+      "gate": true,
+      "tpSweep": [
+        {
+          "tp": 2,
+          "m": {
+            "trades": 124,
+            "winRatePct": 48.38709677419355,
+            "avgR": 0.24172433662548706,
+            "profitFactor": 1.499136399581763,
+            "cagrPct": 6.804760212528338,
+            "maxDrawdownPct": 17.226642787042216,
+            "mar": 0.3950137178003621
+          }
+        },
+        {
+          "tp": 2.5,
+          "m": {
+            "trades": 124,
+            "winRatePct": 47.58064516129033,
+            "avgR": 0.2924612817550849,
+            "profitFactor": 1.5939271788553673,
+            "cagrPct": 8.29705032767103,
+            "maxDrawdownPct": 17.224565517422313,
+            "mar": 0.48169867154435475
+          }
+        },
+        {
+          "tp": 3,
+          "m": {
+            "trades": 124,
+            "winRatePct": 47.58064516129033,
+            "avgR": 0.3614044245611725,
+            "profitFactor": 1.7339361607709034,
+            "cagrPct": 10.372249578541526,
+            "maxDrawdownPct": 17.22456551742231,
+            "mar": 0.6021777192609125
+          }
+        }
+      ]
+    },
+    {
+      "name": "priorHigh + slope≥2.0%",
+      "cfg": {
+        "requireGoldenCross": false,
+        "minSlope20": 0.02,
+        "minAdx": 0,
+        "trigger": "priorHigh"
+      },
+      "primary": {
+        "trades": 68,
+        "winRatePct": 50,
+        "avgR": 0.41468475819972495,
+        "profitFactor": 1.9347522016535155,
+        "cagrPct": 6.467025580528052,
+        "maxDrawdownPct": 10.654912320290673,
+        "mar": 0.6069524915951281
+      },
+      "gate": true,
+      "tpSweep": [
+        {
+          "tp": 2,
+          "m": {
+            "trades": 68,
+            "winRatePct": 51.470588235294116,
+            "avgR": 0.3609649576034093,
+            "profitFactor": 1.8418074093932708,
+            "cagrPct": 5.618625528908372,
+            "maxDrawdownPct": 10.657154456952155,
+            "mar": 0.5272162988351062
+          }
+        },
+        {
+          "tp": 2.5,
+          "m": {
+            "trades": 68,
+            "winRatePct": 50,
+            "avgR": 0.41468475819972495,
+            "profitFactor": 1.9347522016535155,
+            "cagrPct": 6.467025580528052,
+            "maxDrawdownPct": 10.654912320290673,
+            "mar": 0.6069524915951281
+          }
+        },
+        {
+          "tp": 3,
+          "m": {
+            "trades": 68,
+            "winRatePct": 50,
+            "avgR": 0.5150928850654656,
+            "profitFactor": 2.1610848936461458,
+            "cagrPct": 8.094052329284063,
+            "maxDrawdownPct": 10.654912320290649,
+            "mar": 0.7596545223436686
+          }
+        }
+      ]
+    },
+    {
+      "name": "priorHigh + slope≥2.5%",
+      "cfg": {
+        "requireGoldenCross": false,
+        "minSlope20": 0.025,
+        "minAdx": 0,
+        "trigger": "priorHigh"
+      },
+      "primary": {
+        "trades": 43,
+        "winRatePct": 46.51162790697674,
+        "avgR": 0.2766655191976585,
+        "profitFactor": 1.5602585658955463,
+        "cagrPct": 2.6439943824367873,
+        "maxDrawdownPct": 8.558896716703302,
+        "mar": 0.3089176642682044
+      },
+      "gate": false,
+      "tpSweep": [
+        {
+          "tp": 2,
+          "m": {
+            "trades": 43,
+            "winRatePct": 48.837209302325576,
+            "avgR": 0.2508375006215976,
+            "profitFactor": 1.5332877450740987,
+            "cagrPct": 2.40685307409918,
+            "maxDrawdownPct": 7.627175590055954,
+            "mar": 0.3155628247548347
+          }
+        },
+        {
+          "tp": 2.5,
+          "m": {
+            "trades": 43,
+            "winRatePct": 46.51162790697674,
+            "avgR": 0.2766655191976585,
+            "profitFactor": 1.5602585658955463,
+            "cagrPct": 2.6439943824367873,
+            "maxDrawdownPct": 8.558896716703302,
+            "mar": 0.3089176642682044
+          }
+        },
+        {
+          "tp": 3,
+          "m": {
+            "trades": 43,
+            "winRatePct": 46.51162790697674,
+            "avgR": 0.3595723829425371,
+            "profitFactor": 1.72814822818273,
+            "cagrPct": 3.4594070012189837,
+            "maxDrawdownPct": 8.558896716703302,
+            "mar": 0.4041884270513164
+          }
+        }
+      ]
+    },
+    {
+      "name": "priorHigh + slope≥3.0%",
+      "cfg": {
+        "requireGoldenCross": false,
+        "minSlope20": 0.03,
+        "minAdx": 0,
+        "trigger": "priorHigh"
+      },
+      "primary": {
+        "trades": 29,
+        "winRatePct": 44.827586206896555,
+        "avgR": 0.21213218436160525,
+        "profitFactor": 1.4358564890846839,
+        "cagrPct": 1.3519426419680292,
+        "maxDrawdownPct": 6.684170826484248,
+        "mar": 0.20226033670643428
+      },
+      "gate": false,
+      "tpSweep": [
+        {
+          "tp": 2,
+          "m": {
+            "trades": 29,
+            "winRatePct": 44.827586206896555,
+            "avgR": 0.13483434478586714,
+            "profitFactor": 1.27703681222753,
+            "cagrPct": 0.845300423837192,
+            "maxDrawdownPct": 6.684170826484248,
+            "mar": 0.12646301924060857
+          }
+        },
+        {
+          "tp": 2.5,
+          "m": {
+            "trades": 29,
+            "winRatePct": 44.827586206896555,
+            "avgR": 0.21213218436160525,
+            "profitFactor": 1.4358564890846839,
+            "cagrPct": 1.3519426419680292,
+            "maxDrawdownPct": 6.684170826484248,
+            "mar": 0.20226033670643428
+          }
+        },
+        {
+          "tp": 3,
+          "m": {
+            "trades": 29,
+            "winRatePct": 44.827586206896555,
+            "avgR": 0.30599289307335875,
+            "profitFactor": 1.6287069944675416,
+            "cagrPct": 1.9656101868951392,
+            "maxDrawdownPct": 6.684170826484248,
+            "mar": 0.2940694123356231
+          }
+        }
+      ]
+    },
+    {
+      "name": "priorHigh + GC + slope≥2.0%",
+      "cfg": {
+        "requireGoldenCross": true,
+        "minSlope20": 0.02,
+        "minAdx": 0,
+        "trigger": "priorHigh"
+      },
+      "primary": {
+        "trades": 62,
+        "winRatePct": 48.38709677419355,
+        "avgR": 0.2987958934697773,
+        "profitFactor": 1.638983668127338,
+        "cagrPct": 4.175263710637056,
+        "maxDrawdownPct": 10.654912320290673,
+        "mar": 0.3918627939045445
+      },
+      "gate": false,
+      "tpSweep": [
+        {
+          "tp": 2,
+          "m": {
+            "trades": 62,
+            "winRatePct": 50,
+            "avgR": 0.2838046327278455,
+            "profitFactor": 1.628800948832203,
+            "cagrPct": 3.9747945838148446,
+            "maxDrawdownPct": 10.657154456952155,
+            "mar": 0.37296959520201967
+          }
+        },
+        {
+          "tp": 2.5,
+          "m": {
+            "trades": 62,
+            "winRatePct": 48.38709677419355,
+            "avgR": 0.2987958934697773,
+            "profitFactor": 1.638983668127338,
+            "cagrPct": 4.175263710637056,
+            "maxDrawdownPct": 10.654912320290673,
+            "mar": 0.3918627939045445
+          }
+        },
+        {
+          "tp": 3,
+          "m": {
+            "trades": 62,
+            "winRatePct": 48.38709677419355,
+            "avgR": 0.38298014422068916,
+            "profitFactor": 1.8190141254361847,
+            "cagrPct": 5.389554186965384,
+            "maxDrawdownPct": 10.654912320290649,
+            "mar": 0.5058281124192644
+          }
+        }
+      ]
+    },
+    {
+      "name": "priorHigh + ADX≥20",
+      "cfg": {
+        "requireGoldenCross": false,
+        "minSlope20": 0,
+        "minAdx": 20,
+        "trigger": "priorHigh"
+      },
+      "primary": {
+        "trades": 206,
+        "winRatePct": 34.46601941747573,
+        "avgR": -0.14177858504499485,
+        "profitFactor": 0.7673407089738437,
+        "cagrPct": -6.8002328344129115,
+        "maxDrawdownPct": 35.172187800072685,
+        "mar": -0.19334119540891506
+      },
+      "gate": false,
+      "tpSweep": [
+        {
+          "tp": 2,
+          "m": {
+            "trades": 206,
+            "winRatePct": 35.43689320388349,
+            "avgR": -0.12961589732809867,
+            "profitFactor": 0.7828355213579743,
+            "cagrPct": -6.238751366330697,
+            "maxDrawdownPct": 31.666599861710843,
+            "mar": -0.19701361666789438
+          }
+        },
+        {
+          "tp": 2.5,
+          "m": {
+            "trades": 206,
+            "winRatePct": 34.46601941747573,
+            "avgR": -0.14177858504499485,
+            "profitFactor": 0.7673407089738437,
+            "cagrPct": -6.8002328344129115,
+            "maxDrawdownPct": 35.172187800072685,
+            "mar": -0.19334119540891506
+          }
+        },
+        {
+          "tp": 3,
+          "m": {
+            "trades": 206,
+            "winRatePct": 33.980582524271846,
+            "avgR": -0.12168285702319052,
+            "profitFactor": 0.8028401529234249,
+            "cagrPct": -5.9606752584832945,
+            "maxDrawdownPct": 37.74786166842937,
+            "mar": -0.15790762694959587
+          }
+        }
+      ]
+    },
+    {
+      "name": "rsi40 + slope≥2.0%",
+      "cfg": {
+        "requireGoldenCross": false,
+        "minSlope20": 0.02,
+        "minAdx": 0,
+        "trigger": "rsi40"
+      },
+      "primary": {
+        "trades": 14,
+        "winRatePct": 64.28571428571429,
+        "avgR": 0.4207259777267615,
+        "profitFactor": 2.1607048508211326,
+        "cagrPct": 1.3263793388387901,
+        "maxDrawdownPct": 4.003326187232325,
+        "mar": 0.3313193271807247
+      },
+      "gate": false,
+      "tpSweep": [
+        {
+          "tp": 2,
+          "m": {
+            "trades": 14,
+            "winRatePct": 64.28571428571429,
+            "avgR": 0.49939305586282173,
+            "profitFactor": 2.377732712247247,
+            "cagrPct": 1.5796166208493778,
+            "maxDrawdownPct": 4.003326187232325,
+            "mar": 0.3945760467601157
+          }
+        },
+        {
+          "tp": 2.5,
+          "m": {
+            "trades": 14,
+            "winRatePct": 64.28571428571429,
+            "avgR": 0.4207259777267615,
+            "profitFactor": 2.1607048508211326,
+            "cagrPct": 1.3263793388387901,
+            "maxDrawdownPct": 4.003326187232325,
+            "mar": 0.3313193271807247
+          }
+        },
+        {
+          "tp": 3,
+          "m": {
+            "trades": 14,
+            "winRatePct": 64.28571428571429,
+            "avgR": 0.493780603189021,
+            "profitFactor": 2.3622489974581513,
+            "cagrPct": 1.5571856639561066,
+            "maxDrawdownPct": 4.003326187232325,
+            "mar": 0.38897296676008736
+          }
+        }
+      ]
+    }
+  ],
+  "signal3_reclaim": [
+    {
+      "name": "v1-baseline",
+      "cfg": {
+        "followThrough": false,
+        "sma50Rising": false,
+        "minAdx": 0
+      },
+      "primary": {
+        "trades": 17,
+        "winRatePct": 35.294117647058826,
+        "avgR": -0.04260847716064074,
+        "profitFactor": 0.9294003269403166,
+        "cagrPct": -0.2020370464332788,
+        "maxDrawdownPct": 3.9907097025638993,
+        "mar": -0.0506268462232361
+      },
+      "gate": false,
+      "tpSweep": [
+        {
+          "tp": 2,
+          "m": {
+            "trades": 17,
+            "winRatePct": 41.17647058823529,
+            "avgR": 0.01528532367638276,
+            "profitFactor": 1.0258676018552537,
+            "cagrPct": 0.024519029682434912,
+            "maxDrawdownPct": 3.7843507485884302,
+            "mar": 0.0064790584465725205
+          }
+        },
+        {
+          "tp": 2.5,
+          "m": {
+            "trades": 17,
+            "winRatePct": 35.294117647058826,
+            "avgR": -0.04260847716064074,
+            "profitFactor": 0.9294003269403166,
+            "cagrPct": -0.2020370464332788,
+            "maxDrawdownPct": 3.9907097025638993,
+            "mar": -0.0506268462232361
+          }
+        },
+        {
+          "tp": 3,
+          "m": {
+            "trades": 17,
+            "winRatePct": 35.294117647058826,
+            "avgR": 0.04562681695700634,
+            "profitFactor": 1.0756008797914578,
+            "cagrPct": 0.13155008998069206,
+            "maxDrawdownPct": 3.990709702563875,
+            "mar": 0.03296408403151356
+          }
+        }
+      ]
+    },
+    {
+      "name": "followThrough",
+      "cfg": {
+        "followThrough": true,
+        "sma50Rising": false,
+        "minAdx": 0
+      },
+      "primary": {
+        "trades": 6,
+        "winRatePct": 33.33333333333333,
+        "avgR": -0.04656016868237378,
+        "profitFactor": 0.9259555377066607,
+        "cagrPct": -0.07626438028704996,
+        "maxDrawdownPct": 2.733115133653019,
+        "mar": -0.027903830083117184
+      },
+      "gate": false,
+      "tpSweep": [
+        {
+          "tp": 2,
+          "m": {
+            "trades": 6,
+            "winRatePct": 33.33333333333333,
+            "avgR": -0.1377333079814501,
+            "profitFactor": 0.7809632349285244,
+            "cagrPct": -0.19836389861674908,
+            "maxDrawdownPct": 2.733115133653019,
+            "mar": -0.07257795186682107
+          }
+        },
+        {
+          "tp": 2.5,
+          "m": {
+            "trades": 6,
+            "winRatePct": 33.33333333333333,
+            "avgR": -0.04656016868237378,
+            "profitFactor": 0.9259555377066607,
+            "cagrPct": -0.07626438028704996,
+            "maxDrawdownPct": 2.733115133653019,
+            "mar": -0.027903830083117184
+          }
+        },
+        {
+          "tp": 3,
+          "m": {
+            "trades": 6,
+            "winRatePct": 33.33333333333333,
+            "avgR": 0.04537205053620241,
+            "profitFactor": 1.0721550024446358,
+            "cagrPct": 0.04634394975235878,
+            "maxDrawdownPct": 2.733115133653019,
+            "mar": 0.01695645718752306
+          }
+        }
+      ]
+    },
+    {
+      "name": "followThrough + sma50Rising",
+      "cfg": {
+        "followThrough": true,
+        "sma50Rising": true,
+        "minAdx": 0
+      },
+      "primary": {
+        "trades": 2,
+        "winRatePct": 50,
+        "avgR": 0.8163812389798261,
+        "profitFactor": 2.8050620206028545,
+        "cagrPct": 0.36568644711587606,
+        "maxDrawdownPct": 0.904546469497125,
+        "mar": 0.4042760205776673
+      },
+      "gate": false,
+      "tpSweep": [
+        {
+          "tp": 2,
+          "m": {
+            "trades": 2,
+            "winRatePct": 50,
+            "avgR": 0.5428618210825972,
+            "profitFactor": 2.200296147050132,
+            "cagrPct": 0.24304689710286098,
+            "maxDrawdownPct": 0.904546469497125,
+            "mar": 0.26869476063289577
+          }
+        },
+        {
+          "tp": 2.5,
+          "m": {
+            "trades": 2,
+            "winRatePct": 50,
+            "avgR": 0.8163812389798261,
+            "profitFactor": 2.8050620206028545,
+            "cagrPct": 0.36568644711587606,
+            "maxDrawdownPct": 0.904546469497125,
+            "mar": 0.4042760205776673
+          }
+        },
+        {
+          "tp": 3,
+          "m": {
+            "trades": 2,
+            "winRatePct": 50,
+            "avgR": 1.0921778966355542,
+            "profitFactor": 3.414862991489527,
+            "cagrPct": 0.4888370592524449,
+            "maxDrawdownPct": 0.904546469497125,
+            "mar": 0.5404222731909061
+          }
+        }
+      ]
+    },
+    {
+      "name": "followThrough + ADX≥20",
+      "cfg": {
+        "followThrough": true,
+        "sma50Rising": false,
+        "minAdx": 20
+      },
+      "primary": {
+        "trades": 4,
+        "winRatePct": 50,
+        "avgR": 0.4386024769544315,
+        "profitFactor": 2.0087969778368744,
+        "cagrPct": 0.39170422065721855,
+        "maxDrawdownPct": 1.0147698584657483,
+        "mar": 0.38600301082005367
+      },
+      "gate": false,
+      "tpSweep": [
+        {
+          "tp": 2,
+          "m": {
+            "trades": 4,
+            "winRatePct": 50,
+            "avgR": 0.30184276800581705,
+            "profitFactor": 1.6942461297997204,
+            "cagrPct": 0.26903287882216187,
+            "maxDrawdownPct": 1.0147698584657547,
+            "mar": 0.2651171362430064
+          }
+        },
+        {
+          "tp": 2.5,
+          "m": {
+            "trades": 4,
+            "winRatePct": 50,
+            "avgR": 0.4386024769544315,
+            "profitFactor": 2.0087969778368744,
+            "cagrPct": 0.39170422065721855,
+            "maxDrawdownPct": 1.0147698584657483,
+            "mar": 0.38600301082005367
+          }
+        },
+        {
+          "tp": 3,
+          "m": {
+            "trades": 4,
+            "winRatePct": 50,
+            "avgR": 0.5765008057822958,
+            "profitFactor": 2.3259666808815704,
+            "cagrPct": 0.5148867570982985,
+            "maxDrawdownPct": 1.0147698584657405,
+            "mar": 0.5073926396244862
+          }
+        }
+      ]
+    },
+    {
+      "name": "followThrough + sma50R + ADX20",
+      "cfg": {
+        "followThrough": true,
+        "sma50Rising": true,
+        "minAdx": 20
+      },
+      "primary": {
+        "trades": 2,
+        "winRatePct": 50,
+        "avgR": 0.8163812389798261,
+        "profitFactor": 2.8050620206028545,
+        "cagrPct": 0.36568644711587606,
+        "maxDrawdownPct": 0.904546469497125,
+        "mar": 0.4042760205776673
+      },
+      "gate": false,
+      "tpSweep": [
+        {
+          "tp": 2,
+          "m": {
+            "trades": 2,
+            "winRatePct": 50,
+            "avgR": 0.5428618210825972,
+            "profitFactor": 2.200296147050132,
+            "cagrPct": 0.24304689710286098,
+            "maxDrawdownPct": 0.904546469497125,
+            "mar": 0.26869476063289577
+          }
+        },
+        {
+          "tp": 2.5,
+          "m": {
+            "trades": 2,
+            "winRatePct": 50,
+            "avgR": 0.8163812389798261,
+            "profitFactor": 2.8050620206028545,
+            "cagrPct": 0.36568644711587606,
+            "maxDrawdownPct": 0.904546469497125,
+            "mar": 0.4042760205776673
+          }
+        },
+        {
+          "tp": 3,
+          "m": {
+            "trades": 2,
+            "winRatePct": 50,
+            "avgR": 1.0921778966355542,
+            "profitFactor": 3.414862991489527,
+            "cagrPct": 0.4888370592524449,
+            "maxDrawdownPct": 0.904546469497125,
+            "mar": 0.5404222731909061
+          }
+        }
+      ]
+    }
+  ],
+  "anyConfigPasses": true
+}
