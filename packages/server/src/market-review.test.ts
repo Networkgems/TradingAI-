@@ -7,6 +7,7 @@ import {
   classifyMarketRegime,
   deriveGates,
   normalizeTnx,
+  pickSpxTrendCandles,
   simpleMa,
   listMarketReviews,
   getLatestMarketReview,
@@ -124,6 +125,50 @@ describe('deriveGates', () => {
   it('10Y above 4.50% caps sizing at 0.5 even in a YELLOW regime', () => {
     const inputs: RegimeInputs = { spx: 5200, spxMa20: 5100, vix: 13, tnx: 4.7 };
     expect(deriveGates('yellow', inputs).sizingMultiplier).toBe(0.5);
+  });
+
+  // TRA-469 — trendState records *why* the trend gates resolved so the signal
+  // engine can tell a real downtrend apart from a dark feed.
+  it('trendState reflects an uptrend / downtrend / unreadable feed', () => {
+    expect(
+      deriveGates('green', { spx: 5200, spxMa20: 5100, vix: 13, tnx: 4.0 }).trendState,
+    ).toBe('up');
+    expect(
+      deriveGates('red', { spx: 5000, spxMa20: 5100, vix: 13, tnx: 4.0 }).trendState,
+    ).toBe('down');
+    expect(
+      deriveGates('yellow', { spx: null, spxMa20: null, vix: 13, tnx: 4.0 }).trendState,
+    ).toBe('unknown');
+  });
+});
+
+// ── TRA-469 — S&P trend-feed fallback ────────────────────────────────────────
+
+describe('pickSpxTrendCandles (TRA-469 SPY fallback)', () => {
+  it('keeps the ^GSPC primary feed when it has enough history', () => {
+    const primary = candles(Array.from({ length: 25 }, (_, i) => 5000 + i));
+    const fallback = candles(Array.from({ length: 25 }, (_, i) => 500 + i));
+    const picked = pickSpxTrendCandles(primary, fallback);
+    expect(picked.symbol).toBe('^GSPC');
+    expect(picked.viaFallback).toBe(false);
+    expect(picked.candles).toBe(primary);
+  });
+
+  it('falls back to SPY when ^GSPC is short of the 20-DMA window', () => {
+    const primary = candles([5000, 5010, 5020]); // < 20 bars
+    const fallback = candles(Array.from({ length: 25 }, (_, i) => 500 + i));
+    const picked = pickSpxTrendCandles(primary, fallback);
+    expect(picked.symbol).toBe('SPY');
+    expect(picked.viaFallback).toBe(true);
+    expect(picked.candles).toBe(fallback);
+  });
+
+  it('returns the longer series (still degrading to null) when both feeds are dark', () => {
+    const primary = candles([5000, 5010]);
+    const fallback = candles([500, 510, 520, 530]);
+    const picked = pickSpxTrendCandles(primary, fallback);
+    expect(picked.symbol).toBe('SPY');
+    expect(simpleMa(picked.candles, 20)).toBeNull();
   });
 });
 

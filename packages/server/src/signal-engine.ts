@@ -148,7 +148,8 @@ const MARKET_REVIEW_REFRESH_MS = 5 * 60_000;
  *
  *   - `breakoutsEnabled === false` → suppress every ORB signal (VIX > 22 —
  *     the regime classifier disables breakouts in a high-volatility tape).
- *   - `orbLongs === false` → suppress ORB longs (S&P 500 below its 20-DMA).
+ *   - `orbLongs === false` → suppress ORB longs (downtrend, *or* a dark S&P
+ *     trend feed — TRA-469 attributes the reason via `gates.trendState`).
  *   - `orbShorts === false` → suppress ORB shorts (tape not in a downtrend).
  *
  * BB-fade and Ichimoku are not breakout strategies and carry no per-signal
@@ -157,6 +158,33 @@ const MARKET_REVIEW_REFRESH_MS = 5 * 60_000;
  * a signal here (mean reversion stays available across regimes; the tilt only
  * tells the dashboard the VIX is in the 16–22 band).
  */
+/**
+ * TRA-469 — cause of an `orbLongs` / `orbShorts` suppression. `orbLongs` is
+ * false for *two* distinct reasons — a genuine S&P 500 downtrend, or a trend
+ * feed that could not be read — so the reason text must branch on
+ * {@link MarketReviewGates.trendState} rather than always blaming a downtrend
+ * (the contradiction TRA-468 surfaced: the review headline said "trend feed
+ * unavailable" while the gate reason said "below its 20-DMA"). `undefined`
+ * trendState ↔ a review persisted before TRA-469; fall back to a cause-neutral
+ * phrasing rather than re-asserting a downtrend.
+ */
+function orbLongsSuppressionCause(gates: MarketReviewGates): string {
+  if (gates.trendState === 'unknown') {
+    return 'S&P 500 trend feed unavailable — longs held back as a precaution';
+  }
+  if (gates.trendState === 'down') {
+    return 'S&P 500 below its 20-DMA (downtrend)';
+  }
+  return 'S&P 500 not in a confirmed uptrend';
+}
+
+function orbShortsSuppressionCause(gates: MarketReviewGates): string {
+  if (gates.trendState === 'unknown') {
+    return 'S&P 500 trend feed unavailable — downtrend not confirmed';
+  }
+  return 'Tape not in a downtrend';
+}
+
 export function gateSignalOnReview(
   signal: TradeSignal,
   gates: MarketReviewGates,
@@ -166,10 +194,10 @@ export function gateSignalOnReview(
     return 'Breakouts disabled by market-review regime (VIX > 22 — high-volatility tape)';
   }
   if (signal.side === 'buy' && !gates.orbLongs) {
-    return 'ORB longs gated off by market-review regime (S&P 500 below its 20-DMA)';
+    return `ORB longs gated off by market-review regime (${orbLongsSuppressionCause(gates)})`;
   }
   if (signal.side === 'sell' && !gates.orbShorts) {
-    return 'ORB shorts gated off by market-review regime (tape not in a downtrend)';
+    return `ORB shorts gated off by market-review regime (${orbShortsSuppressionCause(gates)})`;
   }
   return null;
 }
@@ -193,13 +221,14 @@ export function describeGatedStrategies(gates: MarketReviewGates): GatedStrategy
   if (!gates.orbLongs) {
     notes.push({
       strategy: 'ORB longs',
-      reason: 'S&P 500 below its 20-DMA (downtrend)',
+      // TRA-469 — branch on trendState so a dark feed isn't reported as a downtrend.
+      reason: orbLongsSuppressionCause(gates),
     });
   }
   if (!gates.orbShorts) {
     notes.push({
       strategy: 'ORB shorts',
-      reason: 'Tape not in a downtrend',
+      reason: orbShortsSuppressionCause(gates),
     });
   }
   return notes;

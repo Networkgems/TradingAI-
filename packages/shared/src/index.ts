@@ -1657,6 +1657,18 @@ export interface MarketReviewGates {
   breakoutsEnabled: boolean;
   /** Position-size scalar in (0,1]; trimmed in elevated-vol / high-rate tape. */
   sizingMultiplier: number;
+  /**
+   * TRA-469 — direction of the S&P 500 trend filter the gates were derived
+   * from: `'up'` / `'down'` relative to the 20-DMA, or `'unknown'` when the
+   * trend feed (`^GSPC`, with the `SPY` fallback) could not be reached.
+   *
+   * `orbLongs` goes false for two distinct reasons — a genuine downtrend *or*
+   * an unreadable trend feed — so the consumer needs this to attribute the
+   * suppression to the real cause instead of always reporting a downtrend
+   * (the gate-reason contradiction TRA-468 surfaced). Optional so reviews
+   * persisted before TRA-469 still deserialise.
+   */
+  trendState?: 'up' | 'down' | 'unknown';
 }
 
 export interface MarketReview {

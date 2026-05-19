@@ -2412,6 +2412,36 @@ describe('TRA-389 — market-review regime gates', () => {
       expect(gateSignalOnReview(sig({ type: 'bb_fade' }), gates({ meanReversionTilt: false }))).toBeNull();
       expect(gateSignalOnReview(sig({ type: 'bb_fade' }), gates({ meanReversionTilt: true }))).toBeNull();
     });
+
+    // TRA-469 — the orbLongs suppression reason must name the *real* cause:
+    // a genuine downtrend vs. an unreadable S&P trend feed. Reporting
+    // "below its 20-DMA" while the feed is dark is the contradiction TRA-468
+    // surfaced.
+    it('orbLongs=false names a downtrend when trendState is down', () => {
+      const reason = gateSignalOnReview(
+        sig({ side: 'buy' }),
+        gates({ orbLongs: false, trendState: 'down' }),
+      );
+      expect(reason).toMatch(/below its 20-DMA/);
+      expect(reason).not.toMatch(/feed unavailable/i);
+    });
+
+    it('orbLongs=false names the dark feed (not a downtrend) when trendState is unknown', () => {
+      const reason = gateSignalOnReview(
+        sig({ side: 'buy' }),
+        gates({ orbLongs: false, trendState: 'unknown' }),
+      );
+      expect(reason).toMatch(/trend feed unavailable/i);
+      expect(reason).not.toMatch(/below its 20-DMA/);
+    });
+
+    it('orbShorts=false names the dark feed when trendState is unknown', () => {
+      const reason = gateSignalOnReview(
+        sig({ side: 'sell' }),
+        gates({ orbShorts: false, trendState: 'unknown' }),
+      );
+      expect(reason).toMatch(/trend feed unavailable/i);
+    });
   });
 
   describe('describeGatedStrategies', () => {
@@ -2434,6 +2464,20 @@ describe('TRA-389 — market-review regime gates', () => {
       const notes = describeGatedStrategies(gates({ orbLongs: false, orbShorts: true, breakoutsEnabled: false }));
       expect(notes).toHaveLength(1);
       expect(notes[0].strategy).toBe('Breakouts (ORB)');
+    });
+
+    // TRA-469 — the dashboard note must distinguish a downtrend from a dark feed.
+    it('attributes the ORB longs note to a downtrend vs. a dark feed via trendState', () => {
+      const downReason = describeGatedStrategies(
+        gates({ orbLongs: false, trendState: 'down' }),
+      )[0].reason;
+      expect(downReason).toMatch(/below its 20-DMA/);
+
+      const unknownReason = describeGatedStrategies(
+        gates({ orbLongs: false, trendState: 'unknown' }),
+      )[0].reason;
+      expect(unknownReason).toMatch(/trend feed unavailable/i);
+      expect(unknownReason).not.toMatch(/below its 20-DMA/);
     });
   });
 

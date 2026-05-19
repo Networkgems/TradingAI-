@@ -48,6 +48,15 @@ const log = logger.child({ module: 'market-review' });
 // ── Index symbols + regime thresholds (TRA-385 gates) ────────────────────────
 
 const SPX_SYMBOL = '^GSPC';
+/**
+ * TRA-469 — fallback for the S&P 500 trend filter. Yahoo's `^GSPC` index
+ * endpoint is flakier than its equity endpoints (and trips its own breaker),
+ * which left the trend filter dark and forced a YELLOW "feed unavailable"
+ * regime. `SPY` is the S&P 500 ETF: it tracks the index ~1:10, and the trend
+ * gate only compares the latest close against its *own* 20-DMA — a scale-free
+ * test — so the proxy yields an identical up/down read.
+ */
+const SPX_FALLBACK_SYMBOL = 'SPY';
 const VIX_SYMBOL = '^VIX';
 const TNX_SYMBOL = '^TNX';
 
@@ -200,28 +209,90 @@ export function deriveGates(regime: MarketRegimeLabel, inputs: RegimeInputs): Ma
   // 10Y above 4.50% cuts tech-long sizing by half on top of the regime scalar.
   if (highRates) sizingMultiplier = Math.min(sizingMultiplier, 0.5);
 
+  // TRA-469 — record *why* the trend gates resolved, so the signal engine can
+  // tell a real downtrend apart from a dark feed instead of always blaming a
+  // downtrend when `orbLongs` is off.
+  const trendState: 'up' | 'down' | 'unknown' = !trendKnown
+    ? 'unknown'
+    : trendUp
+      ? 'up'
+      : 'down';
+
   return {
     orbLongs: trendUp && !highVix,
     orbShorts: trendDown,
     meanReversionTilt: elevatedVix,
     breakoutsEnabled: !highVix,
     sizingMultiplier,
+    trendState,
   };
 }
 
 // ── Feed reads ───────────────────────────────────────────────────────────────
+
+/** Result of resolving the S&P 500 trend series across the primary + fallback feeds. */
+export interface SpxTrendSource {
+  candles: Candle[];
+  /** Symbol the candles actually came from (`^GSPC` or the `SPY` fallback). */
+  symbol: string;
+  /** True when the `^GSPC` feed was dark and `SPY` was used as a proxy. */
+  viaFallback: boolean;
+}
+
+/**
+ * TRA-469 — pick the S&P 500 trend series. Prefers the `^GSPC` primary feed;
+ * uses the `SPY` proxy when `^GSPC` returns too few bars to compute the
+ * 20-DMA. Pure (no I/O) so the fallback precedence is unit-testable.
+ */
+export function pickSpxTrendCandles(primary: Candle[], fallback: Candle[]): SpxTrendSource {
+  if (primary.length >= MA_PERIOD) {
+    return { candles: primary, symbol: SPX_SYMBOL, viaFallback: false };
+  }
+  if (fallback.length >= MA_PERIOD) {
+    return { candles: fallback, symbol: SPX_FALLBACK_SYMBOL, viaFallback: true };
+  }
+  // Neither feed has enough history — keep whichever has more bars so
+  // `simpleMa` still degrades to `null` cleanly and the regime goes YELLOW.
+  return primary.length >= fallback.length
+    ? { candles: primary, symbol: SPX_SYMBOL, viaFallback: false }
+    : { candles: fallback, symbol: SPX_FALLBACK_SYMBOL, viaFallback: true };
+}
+
+/**
+ * Resolve the S&P 500 trend candles, falling back from `^GSPC` to `SPY` when
+ * the primary index feed is dark. The `SPY` request is only issued when the
+ * primary comes up short, so a healthy `^GSPC` read costs nothing extra.
+ */
+async function readSpxTrend(): Promise<SpxTrendSource> {
+  const primary = await fetchDailyCandles(SPX_SYMBOL, MA_PERIOD + 5).catch(() => [] as Candle[]);
+  if (primary.length >= MA_PERIOD) {
+    return { candles: primary, symbol: SPX_SYMBOL, viaFallback: false };
+  }
+  const fallback = await fetchDailyCandles(SPX_FALLBACK_SYMBOL, MA_PERIOD + 5).catch(
+    () => [] as Candle[],
+  );
+  const picked = pickSpxTrendCandles(primary, fallback);
+  if (picked.viaFallback) {
+    log.warn('^GSPC trend feed dark — using SPY proxy', {
+      primaryBars: primary.length,
+      fallbackBars: fallback.length,
+    });
+  }
+  return picked;
+}
 
 /** Pull the three index readings. Each leg degrades to `null` independently. */
 async function readIndexes(): Promise<{
   inputs: RegimeInputs;
   readings: MarketReviewIndexReading[];
 }> {
-  const [spxCandles, vixQuote, tnxQuote] = await Promise.all([
-    fetchDailyCandles(SPX_SYMBOL, MA_PERIOD + 5).catch(() => [] as Candle[]),
+  const [spxTrend, vixQuote, tnxQuote] = await Promise.all([
+    readSpxTrend(),
     fetchQuote(VIX_SYMBOL).catch(() => null),
     fetchQuote(TNX_SYMBOL).catch(() => null),
   ]);
 
+  const spxCandles = spxTrend.candles;
   const spx = spxCandles.length > 0 ? spxCandles[spxCandles.length - 1].close : null;
   const spxMa20 = simpleMa(spxCandles, MA_PERIOD);
   const vix = vixQuote?.price ?? null;
@@ -229,12 +300,13 @@ async function readIndexes(): Promise<{
 
   const inputs: RegimeInputs = { spx, spxMa20, vix, tnx };
 
+  const spxProxyNote = spxTrend.viaFallback ? ' (via SPY proxy — ^GSPC feed down)' : '';
   const spxNote =
     spx == null || spxMa20 == null
-      ? 'Feed unavailable — trend filter cannot be confirmed.'
+      ? 'Feed unavailable — trend filter cannot be confirmed (^GSPC and SPY both unreachable).'
       : spx >= spxMa20
-        ? `Above 20-DMA (${spxMa20.toFixed(2)}) — uptrend, ORB longs enabled.`
-        : `Below 20-DMA (${spxMa20.toFixed(2)}) — downtrend, ORB longs OFF.`;
+        ? `Above 20-DMA (${spxMa20.toFixed(2)}) — uptrend, ORB longs enabled.${spxProxyNote}`
+        : `Below 20-DMA (${spxMa20.toFixed(2)}) — downtrend, ORB longs OFF.${spxProxyNote}`;
   const vixNote =
     vix == null
       ? 'Feed unavailable.'
@@ -251,7 +323,7 @@ async function readIndexes(): Promise<{
         : `≤ ${TNX_HIGH}% — no rate-driven sizing cut.`;
 
   const readings: MarketReviewIndexReading[] = [
-    { symbol: SPX_SYMBOL, label: 'S&P 500', value: spx, ma20: spxMa20, note: spxNote },
+    { symbol: spxTrend.symbol, label: 'S&P 500', value: spx, ma20: spxMa20, note: spxNote },
     { symbol: VIX_SYMBOL, label: 'VIX', value: vix, ma20: null, note: vixNote },
     { symbol: TNX_SYMBOL, label: '10Y Yield', value: tnx, ma20: null, note: tnxNote },
   ];
