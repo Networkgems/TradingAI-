@@ -3,7 +3,6 @@ import type {
   AccountMode,
   AccountSettings,
   BrokerageType,
-  LiveTradeMode,
   LiveTradierMarkets,
   StrategyPresetId,
   TradierEnv,
@@ -25,14 +24,10 @@ type Market = 'crypto' | 'stocks';
 // on the Crypto dashboard never appears on the Stock dashboard. Read-time
 // helpers fall back to the legacy un-suffixed fields for users that saved
 // before this split — new writes go straight to the scoped fields.
-function readLiveBrokerageType(s: AccountSettings, m: Market): BrokerageType {
-  const scoped = m === 'crypto' ? s.liveBrokerageTypeCrypto : s.liveBrokerageTypeStocks;
-  return scoped ?? s.liveBrokerageType ?? (m === 'crypto' ? 'coinbase' : 'webull');
-}
-function readLiveTradeMode(s: AccountSettings, m: Market): LiveTradeMode {
-  const scoped = m === 'crypto' ? s.liveTradeModeCrypto : s.liveTradeModeStocks;
-  return scoped ?? s.liveTradeMode ?? 'ai_in_brokerage';
-}
+// TRA-457 — `readLiveBrokerageType` / `readLiveTradeMode` were removed with the
+// crypto Brokerage selector and the Trading Mode radio: both controls were dead
+// (single-option dropdown; no engine/server reader for the `liveTradeMode*`
+// fields).
 function readLiveApiKey(s: AccountSettings, m: Market): string {
   const scoped = m === 'crypto' ? s.liveApiKeyCrypto : s.liveApiKeyStocks;
   return scoped ?? s.liveApiKey ?? '';
@@ -1475,16 +1470,10 @@ export default function SettingsPage({ token, httpUrl, context, onModeChange, on
                 {!context && <h3 className="settings-subheading">Crypto (Coinbase)</h3>}
 
                 <div className="settings-grid">
-                  <div className="settings-field">
-                    <label>Brokerage</label>
-                    <select
-                      value={readLiveBrokerageType(settings, 'crypto')}
-                      onChange={e => set('liveBrokerageTypeCrypto', e.target.value as BrokerageType)}
-                    >
-                      <option value="coinbase">Coinbase</option>
-                    </select>
-                  </div>
-
+                  {/* TRA-457 — Brokerage selector removed: Coinbase is the only
+                      crypto broker, and the crypto engine deliberately never
+                      gates on `liveBrokerageTypeCrypto`, so the single-option
+                      dropdown was redundant clutter. */}
                   <div className="settings-field">
                     <label>API Key</label>
                     <PasswordInput
@@ -1518,42 +1507,13 @@ export default function SettingsPage({ token, httpUrl, context, onModeChange, on
                   </div>
                 </div>
 
-                <div className="settings-field" style={{ marginTop: '1.25rem' }}>
-                  <label>Trading Mode</label>
-                  <div className="radio-group">
-                    <label className="radio-option">
-                      <input
-                        type="radio"
-                        name="liveTradeMode-crypto"
-                        value="ai_in_brokerage"
-                        checked={readLiveTradeMode(settings, 'crypto') === 'ai_in_brokerage'}
-                        onChange={() => set('liveTradeModeCrypto', 'ai_in_brokerage')}
-                      />
-                      <div>
-                        <strong>AI trades in Coinbase</strong>
-                        <p className="field-hint">AI controls your Coinbase account directly. Trades execute inside Coinbase using your balance.</p>
-                      </div>
-                    </label>
-                    <label className="radio-option">
-                      <input
-                        type="radio"
-                        name="liveTradeMode-crypto"
-                        value="transfer_to_platform"
-                        checked={readLiveTradeMode(settings, 'crypto') === 'transfer_to_platform'}
-                        onChange={() => set('liveTradeModeCrypto', 'transfer_to_platform')}
-                      />
-                      <div>
-                        <strong>Transfer funds to platform</strong>
-                        <p className="field-hint">Funds transfer from Coinbase into TradingAI, trades execute here, then profits transfer back.</p>
-                      </div>
-                    </label>
-                  </div>
-                </div>
+                {/* TRA-457 — "Trading Mode" radio (AI-in-brokerage vs
+                    transfer-to-platform) removed: it was dead. Nothing in
+                    packages/server or packages/engine reads `liveTradeMode*`,
+                    and the transfer-to-platform flow was never built — the
+                    crypto engine always trades directly in Coinbase. */}
 
-                {/* TRA-249-E — Live trading routing (spot / hybrid / perp-only)
-                    and operator-facing leverage cap. The leverage cap is
-                    surfaced even though the engine pins at 1× today so raising
-                    the ceiling later doesn't require a settings migration. */}
+                {/* TRA-249-E — Live trading routing (spot / hybrid / perp-only). */}
                 <div className="settings-field" style={{ marginTop: '1.25rem' }}>
                   <label>Live trading mode</label>
                   <div className="radio-group">
@@ -1599,6 +1559,14 @@ export default function SettingsPage({ token, httpUrl, context, onModeChange, on
                   </div>
                 </div>
 
+                {/* TRA-457 — "Max leverage" knob hidden (not deleted). It
+                    round-trips to `AccountSettings.liveMaxLeverageCrypto` and
+                    the server clamps it to [1,5], but the live engine pins
+                    leverage at 1× (PERP_SHORT_LEVERAGE) and never reads the
+                    field, so the control has no effect today. Hidden rather
+                    than removed so a future leverage ramp can re-surface it
+                    without a settings migration — restore the block below:
+
                 <div className="settings-field" style={{ marginTop: '1.25rem' }}>
                   <label>Max leverage</label>
                   <input
@@ -1610,11 +1578,10 @@ export default function SettingsPage({ token, httpUrl, context, onModeChange, on
                     onChange={e => set('liveMaxLeverageCrypto', Math.max(1, Math.min(5, Math.round(Number(e.target.value)))))}
                   />
                   <span className="field-hint">
-                    Leverage ceiling for crypto perp positions (1–5). Phase-1 the engine pins leverage at 1× —
-                    raising this above 1 has no effect today, but the setting is surfaced so future ramps don't
-                    require a migration.
+                    Leverage ceiling for crypto perp positions (1-5). Phase-1 the engine pins leverage at 1x.
                   </span>
                 </div>
+                */}
               </div>
             )}
 
