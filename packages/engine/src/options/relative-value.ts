@@ -1,4 +1,5 @@
 import type { OptionType } from '@trading-app/shared';
+import { RV_MIN_MARK_FLOOR } from '@trading-app/shared';
 import {
   blackScholesPrice,
   blackScholesDelta,
@@ -75,11 +76,14 @@ export interface RelativeValueScannerOptions {
   riskFreeRate?: number;
   /** Continuous dividend yield (default 0). */
   dividendYield?: number;
-  /** Reject rows with (ask − bid)/mid > this (default 0.20 = 20%). */
+  /** Reject rows with (ask − bid)/mid > this (default 0.10 = 10%). */
   maxSpreadPct?: number;
-  /** Reject rows with open interest below this (default 50). */
+  /** Reject rows with open interest below this (default 250). */
   minOpenInterest?: number;
-  /** Reject rows whose mark falls below this dollar floor (default 0.05). */
+  /**
+   * Reject rows whose mark falls below this dollar floor (default 0.40 —
+   * `RV_MIN_MARK_FLOOR`, the TRA-461 sub-tick / penny-option guard).
+   */
   minMark?: number;
   /** Minimum rows per (expiration, type) group required to fit a skew (default 5). */
   minGroupSize?: number;
@@ -98,9 +102,9 @@ export interface RelativeValueScannerOptions {
 const DEFAULTS: Required<Omit<RelativeValueScannerOptions, 'now'>> = {
   riskFreeRate: 0.045,
   dividendYield: 0,
-  maxSpreadPct: 0.2,
-  minOpenInterest: 50,
-  minMark: 0.05,
+  maxSpreadPct: 0.10,
+  minOpenInterest: 250,
+  minMark: RV_MIN_MARK_FLOOR,
   minGroupSize: 5,
   zScoreThreshold: 2.0,
   monotonicEpsilonPct: 0.02,

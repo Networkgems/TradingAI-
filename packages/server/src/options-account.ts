@@ -24,8 +24,21 @@ import {
   OPTIONS_PARTIAL_EXIT_RATIO,
   OTM_RISK_PARAMS,
   RV_RISK_PARAMS,
+  RV_MIN_MARK_FLOOR,
   isValidTradingWindow,
 } from '@trading-app/shared';
+
+/**
+ * TRA-462 — RV stop-loss premium with the dollar-distance floor. The stop
+ * *distance* is `max(premium · slPct, slDollarFloor)` so a percentage stop can
+ * never collapse to sub-tick on a low-premium contract (the TRA-461 failure
+ * mode). The resulting stop premium is floored at 0. Shared by the RV open
+ * path and the imported-position risk-threshold writer so both stay in sync.
+ */
+function rvStopLossPremium(premium: number, rvRiskParams: RvRiskParams): number {
+  const distance = Math.max(premium * rvRiskParams.slPct, rvRiskParams.slDollarFloor);
+  return Math.max(0, premium - distance);
+}
 
 const ATM_DELTA = 0.50;
 
@@ -80,13 +93,20 @@ function normalizeNonNegative(value: number | undefined, fallback: number): numb
  * `peak * (1 - trailOffsetPct)` once the position runs in profit, but
  * staging at the activation threshold lets a freshly-synced position skip
  * straight into a trailing exit if it's already well into profit.
+ *
+ * TRA-462 — a sub-floor contract (`premiumPaid < RV_MIN_MARK_FLOOR`) can never
+ * be risk-managed: even with the dollar stop floor its stop is sub-tick and
+ * quote microstructure books it out, the original TRA-361/TRA-461 failure
+ * mode. Such imports take the unmanaged sentinel path regardless of the
+ * `autoManage` flag and are left for the user. At/above the floor the RV
+ * schedule applies, with the dollar-floored stop from `rvStopLossPremium`.
  */
 function applyImportedRiskThresholds(
   opt: OptionPosition,
   rvRiskParams: RvRiskParams,
   autoManage: boolean,
 ): void {
-  if (!autoManage) {
+  if (!autoManage || opt.premiumPaid < RV_MIN_MARK_FLOOR) {
     opt.tp1Premium = Number.POSITIVE_INFINITY;
     opt.tp1Hit = false;
     opt.stopLossPremium = 0;
@@ -94,7 +114,7 @@ function applyImportedRiskThresholds(
     opt.trailingStopPremium = 0;
     return;
   }
-  opt.stopLossPremium = opt.premiumPaid * (1 - rvRiskParams.slPct);
+  opt.stopLossPremium = rvStopLossPremium(opt.premiumPaid, rvRiskParams);
   opt.tp1Premium = opt.premiumPaid * (1 + rvRiskParams.tp1Pct);
   // Pre-activation sentinel — `checkExits` re-derives the real trailing stop
   // once `mark >= premium * (1 + trailActivatePct)` activates trailing.
@@ -720,7 +740,8 @@ export class PaperOptionsAccount {
     }
 
     const tp1Premium = premiumPaid * (1 + this.rvRiskParams.tp1Pct);
-    const stopLossPremium = premiumPaid * (1 - this.rvRiskParams.slPct);
+    // TRA-462 — dollar-floored stop so a percentage stop can't go sub-tick.
+    const stopLossPremium = rvStopLossPremium(premiumPaid, this.rvRiskParams);
     const trailActivatePremium = premiumPaid * (1 + this.rvRiskParams.trailActivatePct);
 
     const position: OptionPosition = {

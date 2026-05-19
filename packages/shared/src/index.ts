@@ -1136,7 +1136,7 @@ export const OTM_RISK_PARAMS: OtmRiskParams = {
 // We size smaller than ATM directional plays (richer alpha density per ticket)
 // and run a tighter stop than OTM far-tail tickets. Daily limit is split out
 // so RV doesn't compete with ATM directional or OTM tail slots.
-export const RV_OPTIONS_BUDGET_RATIO = 0.03;        // 3% of managed equity per RV ticket
+export const RV_OPTIONS_BUDGET_RATIO = 0.02;        // 2% of managed equity per RV ticket — reconciled with the recommended 2% live risk-per-trade (TRA-461)
 export const RV_OPTIONS_SL_PCT = 0.25;              // tighter than OTM, looser than ATM
 export const RV_OPTIONS_TP1_PCT = 0.40;             // partial-take when residual half-collapses
 export const RV_OPTIONS_TRAIL_ACTIVATE_PCT = 0.25;  // engage trailing at +25%
@@ -1144,9 +1144,34 @@ export const RV_OPTIONS_TRAIL_OFFSET_PCT = 0.15;
 export const RV_OPTIONS_PARTIAL_EXIT_RATIO = 0.5;
 export const RV_OPTIONS_DAILY_LIMIT = 4;
 
+// ── RV selection / sub-tick guards (TRA-461 recalibration) ──────────────────
+//
+// `tra461-rv-recalibration.md` confirmed every penny-option ($0.05–$0.10) RV
+// ticket is mathematically unable to win: at that premium one $0.01 tick is a
+// ~20% move and a 25% percentage stop is sub-tick, so positions are booked out
+// by quote microstructure, not by an adverse thesis. The sweep showed
+// expectancy/ticket only crosses solidly positive at a $0.40 mark.
+//
+//   • RV_MIN_MARK_FLOOR — the scanner's `minMark` selection floor. Also gates
+//     auto-management of imported (Tradier) positions: a contract below the
+//     floor cannot be risk-managed (its stop would be sub-tick) so it is left
+//     for the user instead.
+//   • RV_OPTIONS_SL_DOLLAR_FLOOR — minimum stop *distance* in dollars. The RV
+//     stop distance is `max(premium·slPct, slDollarFloor)` so a stop is never
+//     sub-tick. At `minMark 0.40` it is essentially non-binding (0.40·0.25 =
+//     0.10) — pure insurance for imports / edge cases below the floor.
+export const RV_MIN_MARK_FLOOR = 0.40;
+export const RV_OPTIONS_SL_DOLLAR_FLOOR = 0.10;
+
 export interface RvRiskParams {
   budgetRatio: number;
   slPct: number;
+  /**
+   * Minimum stop *distance* in dollars of premium (TRA-461). The RV stop is
+   * placed at `premium − max(premium·slPct, slDollarFloor)` so a percentage
+   * stop can never collapse to sub-tick on a low-premium contract.
+   */
+  slDollarFloor: number;
   tp1Pct: number;
   trailActivatePct: number;
   trailOffsetPct: number;
@@ -1157,6 +1182,7 @@ export interface RvRiskParams {
 export const RV_RISK_PARAMS: RvRiskParams = {
   budgetRatio: RV_OPTIONS_BUDGET_RATIO,
   slPct: RV_OPTIONS_SL_PCT,
+  slDollarFloor: RV_OPTIONS_SL_DOLLAR_FLOOR,
   tp1Pct: RV_OPTIONS_TP1_PCT,
   trailActivatePct: RV_OPTIONS_TRAIL_ACTIVATE_PCT,
   trailOffsetPct: RV_OPTIONS_TRAIL_OFFSET_PCT,

@@ -722,14 +722,14 @@ describe('SignalEngine — TRA-332 live sizing uses real Tradier equity', () => 
 
     await (engine as unknown as { runRelativeValueScan: (s: string[]) => Promise<void> }).runRelativeValueScan(['AAPL']);
 
-    // Paper equity sizing produces contracts (25000 * 0.5 * 0.03 = $375 budget
-    // → 3 contracts at $100 each). No live-budget skip surfaces. The buy
+    // Paper equity sizing produces contracts (25000 * 0.5 * 0.02 = $250 budget
+    // → 2 contracts at $100 each). No live-budget skip surfaces. The buy
     // mirror is also gated on `tradierLiveOptionsEnabled` (TRA-355) so the
     // broker call never fires.
     expect(stub.buyContractsLimit).not.toHaveBeenCalled();
     const state = engine.getState();
     expect(state.options.openOptions).toHaveLength(1);
-    expect(state.options.openOptions[0].contracts).toBe(3);
+    expect(state.options.openOptions[0].contracts).toBe(2);
     expect(state.signals).toHaveLength(1);
     expect(state.signals[0].liveSkipReason).toBeUndefined();
   });

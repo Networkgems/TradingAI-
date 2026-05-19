@@ -202,7 +202,7 @@ describe('PaperOptionsAccount.voidOpenOption (TRA-319)', () => {
     const startCash = acct.getState().optionsCash;
     const pos = acct.openOptionFromRvCandidate(buildRvSignal({ mark: 1.0 }), 'live');
     expect(pos).not.toBeNull();
-    // RV budget = 50_000 * 0.5 * 0.05 = $1,250 → 12 contracts at $100 each.
+    // RV budget = 50_000 * 0.5 * 0.02 = $500 → 5 contracts at $100 each.
     const cashAfterOpen = acct.getState().optionsCash;
     expect(cashAfterOpen).toBeLessThan(startCash);
     expect(acct.getState().dailyOptionsCount).toBe(1);
@@ -222,6 +222,24 @@ describe('PaperOptionsAccount.voidOpenOption (TRA-319)', () => {
   it('returns false for an unknown id', () => {
     const acct = new PaperOptionsAccount({ initialEquity: 50_000, managedAccountRatio: 0.5 });
     expect(acct.voidOpenOption('does-not-exist')).toBe(false);
+  });
+
+  it('floors the RV stop distance at the dollar floor on a low-premium open (TRA-462)', () => {
+    const acct = new PaperOptionsAccount({ initialEquity: 50_000, managedAccountRatio: 0.5 });
+    // $0.30 premium: the percentage stop distance is 0.30 · 0.25 = $0.075,
+    // sub-tick. The $0.10 dollar floor governs → stop = 0.30 − 0.10 = 0.20.
+    const pos = acct.openOptionFromRvCandidate(buildRvSignal({ mark: 0.30 }), 'demo');
+    expect(pos).not.toBeNull();
+    expect(pos!.stopLossPremium).toBeCloseTo(0.20, 5);
+  });
+
+  it('keeps the RV percentage stop when it dominates the dollar floor (TRA-462)', () => {
+    const acct = new PaperOptionsAccount({ initialEquity: 50_000, managedAccountRatio: 0.5 });
+    // $1.00 premium: percentage stop distance 1.00 · 0.25 = $0.25 > $0.10
+    // floor → percentage governs, stop = 1.00 − 0.25 = 0.75.
+    const pos = acct.openOptionFromRvCandidate(buildRvSignal({ mark: 1.0 }), 'demo');
+    expect(pos).not.toBeNull();
+    expect(pos!.stopLossPremium).toBeCloseTo(0.75, 5);
   });
 
   it('frees the daily slot so a new RV open can take its place after a void', () => {
@@ -275,7 +293,7 @@ describe('PaperOptionsAccount — TRA-332 live equity override sizing', () => {
     // Paper account seeded at $50 K (matches the demo equity that survives a
     // live flip). TRA-378 — live sizing uses riskPerTrade, not the per-
     // strategy budgetRatio: without the override, demo budget =
-    // 50_000 * 1.0 * 0.03 = $1,500 → 15 contracts. With override = $2,000 →
+    // 50_000 * 1.0 * 0.02 = $1,000 → 10 contracts. With override = $2,000 →
     // budget = min(2_000 * 1.0 * 0.10, 2_000 * 0.15) = $200 → 2 contracts.
     const acct = new PaperOptionsAccount({
       initialEquity: 50_000,
@@ -428,7 +446,7 @@ describe('PaperOptionsAccount — TRA-378 small-account sizing', () => {
   });
 
   it('demo sizing (no equityOverride) keeps the legacy null-on-zero behaviour', () => {
-    // $1k DEMO account: budget = 1_000 * 1.0 * 0.03 = $30; no forced floor in
+    // $1k DEMO account: budget = 1_000 * 1.0 * 0.02 = $20; no forced floor in
     // demo → a $1 mark ($100 cost) still returns null. Per-strategy
     // budgetRatio constants stay the demo / fallback default.
     const acct = new PaperOptionsAccount({ initialEquity: 1_000, managedAccountRatio: 1.0 });
@@ -747,6 +765,7 @@ describe('PaperOptionsAccount auto-manage imported (TRA-361)', () => {
       rvRiskParams: {
         budgetRatio: 0.025,
         slPct: 0.25,
+        slDollarFloor: 0.10,
         tp1Pct: 0.50,
         trailActivatePct: 0.20,
         trailOffsetPct: 0.12,
@@ -762,6 +781,38 @@ describe('PaperOptionsAccount auto-manage imported (TRA-361)', () => {
     expect(opt.trailingStopPremium).toBeCloseTo(2.0 * 1.20, 5); // 2.40
     expect(opt.trailingActive).toBe(false);
     expect(opt.tp1Hit).toBe(false);
+  });
+
+  it('does NOT auto-manage a sub-floor import even when auto-manage is on (TRA-462)', () => {
+    const acct = new PaperOptionsAccount({
+      initialEquity: 25_000,
+      tradierEnv: 'sandbox',
+      autoManageImportedTradierOptions: true,
+    });
+    // premiumPaid $0.08 is below the $0.40 RV minMark floor — the engine
+    // cannot risk-manage it (its stop would be sub-tick), so it stays on the
+    // unmanaged sentinel path regardless of the auto-manage flag.
+    acct.reconcileTradierPositions([buildTradierPosition({ premiumPaid: 0.08 })]);
+    const opt = acct.getState().openOptions[0];
+    expect(opt.tp1Premium).toBe(Number.POSITIVE_INFINITY);
+    expect(opt.stopLossPremium).toBe(0);
+    expect(opt.trailingStopPremium).toBe(0);
+    expect(opt.trailingActive).toBe(false);
+  });
+
+  it('still applies the RV schedule to an at-floor import (premiumPaid $0.60, TRA-462)', () => {
+    const acct = new PaperOptionsAccount({
+      initialEquity: 25_000,
+      tradierEnv: 'sandbox',
+      autoManageImportedTradierOptions: true,
+    });
+    acct.reconcileTradierPositions([buildTradierPosition({ premiumPaid: 0.60 })]);
+    const opt = acct.getState().openOptions[0];
+    // $0.60 ≥ $0.40 floor → RV schedule applies. Stop distance =
+    // max(0.60 · 0.25, 0.10) = $0.15 → stopLossPremium = 0.60 − 0.15 = 0.45.
+    expect(opt.stopLossPremium).toBeCloseTo(0.45, 5);
+    expect(opt.tp1Premium).toBeLessThan(Number.POSITIVE_INFINITY);
+    expect(opt.tp1Premium).toBeCloseTo(importedTP1(0.60, 0.40), 5); // 0.84
   });
 
   it('reconcile keeps sentinel thresholds when auto-manage is off', () => {
@@ -1560,13 +1611,14 @@ describe('PaperOptionsAccount — TRA-374 demo cost model', () => {
     });
     const pos = acct.openOptionFromRvCandidate(buildRvSignal({ mark: 1.0 }), 'demo');
     expect(pos).not.toBeNull();
-    // Trigger SL: drive mark below stopLossPremium. RV SL is 30% by default,
-    // so stopLossPremium = 1.05 × 0.7 = 0.735. Any mark ≤ 0.73 trips SL.
+    // Trigger SL: drive mark below stopLossPremium. RV slPct is 25%, so the
+    // stop distance = max(1.05·0.25, 0.10) = 0.2625 and stopLossPremium =
+    // 1.05 − 0.2625 = 0.7875. Mark 0.70 sits below it and trips SL.
     const marks = new Map<string, number>([[pos!.optionSymbol!, 0.70]]);
     const closed = acct.checkExits(new Map(), marks);
     expect(closed).toHaveLength(1);
     const closedPos = closed[0]!;
-    // Effective exit = 0.735 × 0.95 = 0.69825 (stopLossPremium × (1 − slippage))
+    // Effective exit = stopLossPremium × (1 − slippage).
     const expectedEffectiveExit = pos!.stopLossPremium * (1 - 0.05);
     expect(closedPos.currentPremium).toBeCloseTo(expectedEffectiveExit, 4);
     // Fee debited on close = contracts × 0.35
@@ -1622,10 +1674,10 @@ describe('PaperOptionsAccount — TRA-374 demo cost model', () => {
       demoSlippagePct: 0.05,
       demoFeePerContract: 0,
     });
-    // RV budget = 50_000 * 0.5 * 0.03 = $750.
-    // mark = $2.50 → no slippage: floor(750 / 250) = 3 contracts.
-    // With 5% slippage: 2.625 → floor(750 / 262.50) = floor(2.857) = 2 contracts.
-    const pos = acct.openOptionFromRvCandidate(buildRvSignal({ mark: 2.50 }), 'demo');
+    // RV budget = 50_000 * 0.5 * 0.02 = $500.
+    // mark = $1.60 → no slippage: floor(500 / 160) = 3 contracts.
+    // With 5% slippage: 1.68 → floor(500 / 168) = floor(2.976) = 2 contracts.
+    const pos = acct.openOptionFromRvCandidate(buildRvSignal({ mark: 1.60 }), 'demo');
     expect(pos).not.toBeNull();
     expect(pos!.contracts).toBe(2);
   });
@@ -1698,8 +1750,9 @@ describe('PaperOptionsAccount — TRA-384 stale-mark SL backstop', () => {
     const acct = new PaperOptionsAccount({ initialEquity: 50_000, managedAccountRatio: 0.5 });
     const pos = acct.openOptionFromRvCandidate(buildRvSignal({ mark: 1.0 }), 'demo', undefined, 100);
     expect(pos).not.toBeNull();
-    // RV SL = premiumPaid × (1 − 0.30) = 0.70. Drive the underlying down so the
-    // delta-extrapolated mark = 1.0 + (98 − 100) × 0.18 = 0.64 ≤ 0.70.
+    // RV SL = premiumPaid − max(premiumPaid·0.25, 0.10) = 1.0 − 0.25 = 0.75.
+    // Drive the underlying down so the delta-extrapolated mark
+    // = 1.0 + (98 − 100) × 0.18 = 0.64 ≤ 0.75.
     const underlying = new Map<string, number>([['AAPL', 98]]);
     const noMarks = new Map<string, number>();
 

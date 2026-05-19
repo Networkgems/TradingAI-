@@ -16,9 +16,12 @@ const EXP = '2024-02-15';
 function row(strike: number, optionType: 'call' | 'put', iv: number): OptionChainRow {
   // Build a row whose bid/ask straddle a representative mark close to BS-fair.
   // The scanner only needs midIv populated to use it as the σ for fitting.
+  // Extrinsic value is scaled so even OTM rows clear the recalibrated $0.40
+  // `minMark` floor (TRA-461) — this fixture exercises scanner plumbing
+  // (caching, breaker, expiration pick, skew fit), not the selection filter.
   const intrinsic = optionType === 'call' ? Math.max(0, 100 - strike) : Math.max(0, strike - 100);
-  const timeValue = 0.30 * 0.5; // small time value scaled by iv-like factor
-  const mark = Math.max(0.10, intrinsic + timeValue * (iv / 0.30));
+  const extrinsic = 1.0 * (iv / 0.30); // representative time value, scaled by IV
+  const mark = Math.max(0.50, intrinsic + extrinsic);
   const half = mark * 0.02;
   return {
     optionSymbol: `TEST${strike}${optionType.toUpperCase()}`,

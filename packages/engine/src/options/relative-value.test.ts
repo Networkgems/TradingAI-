@@ -13,6 +13,15 @@ const R = 0.045;
 const SPOT = 100;
 
 /**
+ * Behaviour tests below exercise the skew fit + anomaly classification, not
+ * the TRA-461 production selection floor. They deliberately build deep-OTM
+ * chains whose marks fall to ~$0.05 — well below the recalibrated $0.40
+ * `minMark` default. Pin the pre-recalibration floor so those rows still
+ * reach the fitter; the new defaults get their own dedicated test below.
+ */
+const SCAN_OPTS = { now: NOW, minMark: 0.05 } as const;
+
+/**
  * Build a same-expiration chain where every contract's mark equals BS-fair at
  * `iv`, with a 4% bid-ask spread and ample liquidity. Pass per-strike `ivOverride`
  * to inject relative-value anomalies (one strike priced off-curve).
@@ -62,7 +71,7 @@ describe('findRelativeValueOpportunities', () => {
       [100, 0.45],
     ]);
     const calls = buildChain(strikes, 'call', 0.30, ivs);
-    const result = findRelativeValueOpportunities(calls, SPOT, { now: NOW });
+    const result = findRelativeValueOpportunities(calls, SPOT, SCAN_OPTS);
 
     const flagged = result.find((r) => r.strike === 100 && r.optionType === 'call');
     expect(flagged).toBeDefined();
@@ -82,7 +91,7 @@ describe('findRelativeValueOpportunities', () => {
       [95, 0.22],
     ]);
     const puts = buildChain(strikes, 'put', 0.30, ivs);
-    const result = findRelativeValueOpportunities(puts, SPOT, { now: NOW });
+    const result = findRelativeValueOpportunities(puts, SPOT, SCAN_OPTS);
 
     const cheap = result.find((r) => r.strike === 95 && r.optionType === 'put');
     expect(cheap).toBeDefined();
@@ -104,7 +113,7 @@ describe('findRelativeValueOpportunities', () => {
     calls[idx105].bid = newMid * 0.99;
     calls[idx105].ask = newMid * 1.01;
 
-    const result = findRelativeValueOpportunities(calls, SPOT, { now: NOW });
+    const result = findRelativeValueOpportunities(calls, SPOT, SCAN_OPTS);
     const flagged = result.find((r) => r.strike === 105);
     expect(flagged).toBeDefined();
     expect(['monotonic_violation', 'expensive']).toContain(flagged!.classification);
@@ -121,7 +130,7 @@ describe('findRelativeValueOpportunities', () => {
     calls[idx].bid = 4.95;
     calls[idx].ask = 5.05;
 
-    const result = findRelativeValueOpportunities(calls, SPOT, { now: NOW });
+    const result = findRelativeValueOpportunities(calls, SPOT, SCAN_OPTS);
     const flagged = result.find((r) => r.strike === 80);
     expect(flagged).toBeDefined();
     expect(flagged!.classification).toBe('below_intrinsic');
@@ -135,7 +144,7 @@ describe('findRelativeValueOpportunities', () => {
     calls[idx].bid = 0.20;
     calls[idx].ask = 1.20;
 
-    const result = findRelativeValueOpportunities(calls, SPOT, { now: NOW });
+    const result = findRelativeValueOpportunities(calls, SPOT, SCAN_OPTS);
     expect(result.find((r) => r.strike === 110)).toBeUndefined();
     // Other strikes still scan normally.
     expect(result.length).toBe(strikes.length - 1);
@@ -148,13 +157,13 @@ describe('findRelativeValueOpportunities', () => {
     ]);
     const calls = buildChain(strikes, 'call', 0.30, undefined, overrides);
 
-    const result = findRelativeValueOpportunities(calls, SPOT, { now: NOW });
+    const result = findRelativeValueOpportunities(calls, SPOT, SCAN_OPTS);
     expect(result.find((r) => r.strike === 105)).toBeUndefined();
   });
 
   it('skips groups smaller than minGroupSize', () => {
     const calls = buildChain([95, 100, 105], 'call', 0.30); // 3 < default 5
-    const result = findRelativeValueOpportunities(calls, SPOT, { now: NOW });
+    const result = findRelativeValueOpportunities(calls, SPOT, SCAN_OPTS);
     expect(result).toHaveLength(0);
   });
 
@@ -165,7 +174,7 @@ describe('findRelativeValueOpportunities', () => {
       strikes.map((s) => [s, { midIv: undefined, smvVol: undefined }]),
     );
     const calls = buildChain(strikes, 'call', 0.30, undefined, overrides);
-    const result = findRelativeValueOpportunities(calls, SPOT, { now: NOW });
+    const result = findRelativeValueOpportunities(calls, SPOT, SCAN_OPTS);
     expect(result.length).toBe(strikes.length);
     for (const c of result) {
       // Implied vol should land near the originating 0.30 ± noise.
@@ -181,7 +190,7 @@ describe('findRelativeValueOpportunities', () => {
       [95, 0.20],  // cheap outlier
     ]);
     const calls = buildChain(strikes, 'call', 0.30, ivs);
-    const result = findRelativeValueOpportunities(calls, SPOT, { now: NOW });
+    const result = findRelativeValueOpportunities(calls, SPOT, SCAN_OPTS);
 
     expect(result.length).toBeGreaterThan(0);
     // The flagged anomalies should outrank the fair rows.
@@ -197,15 +206,15 @@ describe('findRelativeValueOpportunities', () => {
   });
 
   it('returns empty for an empty chain or non-finite spot', () => {
-    expect(findRelativeValueOpportunities([], 100, { now: NOW })).toEqual([]);
+    expect(findRelativeValueOpportunities([], 100, SCAN_OPTS)).toEqual([]);
     const calls = buildChain([95, 100, 105, 110, 115], 'call', 0.30);
-    expect(findRelativeValueOpportunities(calls, NaN, { now: NOW })).toEqual([]);
-    expect(findRelativeValueOpportunities(calls, 0, { now: NOW })).toEqual([]);
+    expect(findRelativeValueOpportunities(calls, NaN, SCAN_OPTS)).toEqual([]);
+    expect(findRelativeValueOpportunities(calls, 0, SCAN_OPTS)).toEqual([]);
   });
 
   it('classifies fairly-priced contracts as fair with |z| < threshold', () => {
     const calls = buildChain([90, 95, 100, 105, 110, 115], 'call', 0.30);
-    const result = findRelativeValueOpportunities(calls, SPOT, { now: NOW });
+    const result = findRelativeValueOpportunities(calls, SPOT, SCAN_OPTS);
     for (const c of result) {
       expect(c.classification).toBe('fair');
       expect(Math.abs(c.zScore)).toBeLessThan(2);
@@ -216,11 +225,32 @@ describe('findRelativeValueOpportunities', () => {
     const strikes = [85, 90, 95, 100, 105, 110, 115, 120];
     const ivs = new Map<number, number>([[100, 0.45]]);
     const calls = buildChain(strikes, 'call', 0.30, ivs);
-    const result = findRelativeValueOpportunities(calls, SPOT, { now: NOW });
+    const result = findRelativeValueOpportunities(calls, SPOT, SCAN_OPTS);
     const flagged = result.filter((r: RelativeValueCandidate) => r.classification !== 'fair');
     expect(flagged.length).toBeGreaterThan(0);
     for (const c of flagged) {
       expect(c.reason.length).toBeGreaterThan(0);
     }
+  });
+
+  it('applies the TRA-461 recalibrated selection floor (minMark $0.40 / spread 10% / OI 250)', () => {
+    // ITM/ATM call base group — marks well above $0.40, OI 1000 and 4% spread
+    // comfortably inside the recalibrated defaults so the skew still fits.
+    const strikes = [80, 85, 90, 95, 100, 105, 110];
+    const rowOverrides = new Map<number, Partial<OptionChainRow>>([
+      // $0.20 mark / 15% spread / OI 100 — fails every recalibrated filter.
+      [105, { bid: 0.185, ask: 0.215, openInterest: 100 }],
+      // $0.45 mark / 8% spread / OI 400 — clears every recalibrated filter.
+      [110, { bid: 0.432, ask: 0.468, openInterest: 400 }],
+    ]);
+    const calls = buildChain(strikes, 'call', 0.30, undefined, rowOverrides);
+
+    // Production DEFAULTS — no minMark / maxSpreadPct / minOpenInterest override.
+    const result = findRelativeValueOpportunities(calls, SPOT, { now: NOW });
+
+    expect(result.find((r) => r.strike === 105)).toBeUndefined();
+    const admitted = result.find((r) => r.strike === 110);
+    expect(admitted).toBeDefined();
+    expect(admitted!.mark).toBeCloseTo(0.45, 5);
   });
 });
