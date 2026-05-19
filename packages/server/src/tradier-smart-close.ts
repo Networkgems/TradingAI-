@@ -342,6 +342,40 @@ export function derivePricingPath(quote: TradierOptionQuote | null): MidPath | L
 }
 
 /**
+ * TRA-450 — derive a LIVE per-share limit for an engine-staged
+ * `sell_to_close` from a fresh Tradier option quote. The engine's staged-exit
+ * path previously submitted at the position's entry-time trigger price
+ * (`stopLossPremium` / `tp1Premium`), which goes stale the moment the
+ * contract's mark drifts — the TRA-450 Tradier export showed a TSLA stop
+ * submitting `limit @ 0.17` against a contract that had decayed to
+ * $0.05–0.09. Pricing off the live quote keeps the order marketable.
+ *
+ * `level` picks how aggressive the limit is:
+ *  - `'bid'` → an SL / trailing-stop exit wants a FILL, so sit on the bid;
+ *    a sell limit at the bid is immediately marketable.
+ *  - `'mid'` → a TP1 / manual exit should not give away the spread, so
+ *    price at the midpoint.
+ *
+ * Single-sided quotes (no bid) fall back to `last` for either level — the
+ * best live price we have. Returns `null` when the quote yields nothing
+ * usable; the caller then falls back to the staged trigger price.
+ */
+export function liveSellLimit(
+  quote: TradierOptionQuote | null,
+  level: 'mid' | 'bid',
+): number | null {
+  const path = derivePricingPath(quote);
+  if (path.kind === 'none') return null;
+  const raw =
+    path.kind === 'mid'
+      ? (level === 'bid' ? path.bid : (path.bid + path.ask) / 2)
+      : path.last;
+  const limit = roundToCent(raw);
+  if (!Number.isFinite(limit) || limit <= 0) return null;
+  return limit;
+}
+
+/**
  * TRA-352 — compute the limit price for the n-th attempt along the configured
  * pricing path. Mid path walks from the midpoint toward the bid in quarter
  * steps so attempt 0 = mid, attempt 1 = bid + 0.75 × (ask − bid), and so on.

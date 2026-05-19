@@ -1099,11 +1099,29 @@ export class PaperOptionsAccount {
    * after `checkExits({ waitAndHold: true })` returns its staged intents.
    * Returns false when the position is unknown or has no pendingExit so
    * the caller can log / drop without throwing.
+   *
+   * TRA-450 — `submittedLimitPrice`, when supplied, overwrites the staged
+   * `limitPrice` with the price the order was ACTUALLY submitted at. The
+   * engine reprices staged LIMIT exits off a live quote at submit time, so
+   * the staged trigger price is no longer what hit the broker; keeping
+   * `pendingExit.limitPrice` in sync means a fill without an `avg_fill_price`
+   * (`finalizePendingExit` fallback) books P&L at the real submitted price.
    */
-  attachPendingExit(optionId: string, tradierOrderId: string | number): boolean {
+  attachPendingExit(
+    optionId: string,
+    tradierOrderId: string | number,
+    submittedLimitPrice?: number,
+  ): boolean {
     const opt = this.openOptions.get(optionId);
     if (!opt || !opt.pendingExit) return false;
     opt.pendingExit.tradierOrderId = tradierOrderId;
+    if (
+      typeof submittedLimitPrice === 'number'
+      && Number.isFinite(submittedLimitPrice)
+      && submittedLimitPrice > 0
+    ) {
+      opt.pendingExit.limitPrice = submittedLimitPrice;
+    }
     return true;
   }
 

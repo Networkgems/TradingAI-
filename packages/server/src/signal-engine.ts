@@ -11,6 +11,7 @@ import { PaperOptionsAccount } from './options-account.js';
 import {
   PENDING_CLOSE_MAX_REPRICE_STEPS,
   PENDING_CLOSE_REPRICE_STALENESS_MS,
+  liveSellLimit,
   reconcilePendingCloseOrder,
   repricePendingCloseOrder,
   submitSmartSellToClose,
@@ -1441,13 +1442,34 @@ export class SignalEngine {
       // opened positions keep LIMIT (TRA-354 policy) — the staged intent
       // already encodes the right pricing.
       const isMarket = intent.pricing === 'market';
+      // TRA-450 — reprice a LIMIT exit off a fresh Tradier quote so the order
+      // tracks the live market instead of the (stale) entry-time trigger
+      // price. SL / trailing exits want a fill so they sit on the bid; TP1 /
+      // manual exits price at the mid to keep the spread. If the quote lookup
+      // fails or yields no usable price we fall back to the staged trigger
+      // price (pre-TRA-450 behaviour) rather than block the exit entirely.
+      let submitLimit = intent.limitPrice;
+      if (!isMarket) {
+        try {
+          const quote = await this.tradierLiveClient.getOptionQuote(snapshot.optionSymbol);
+          const level = intent.kind === 'sl' || intent.kind === 'trail' ? 'bid' : 'mid';
+          const live = liveSellLimit(quote, level);
+          if (live !== null) submitLimit = live;
+        } catch (err: unknown) {
+          log.warn('staged-exit quote lookup failed — using staged trigger price', {
+            optionSymbol: snapshot.optionSymbol,
+            staged: intent.limitPrice,
+            reason: err instanceof Error ? err.message : String(err),
+          });
+        }
+      }
       try {
         resp = isMarket
           ? await this.tradierLiveClient.sellContracts(snapshot.optionSymbol, intent.qty)
           : await this.tradierLiveClient.sellContractsLimit(
               snapshot.optionSymbol,
               intent.qty,
-              intent.limitPrice,
+              submitLimit,
             );
       } catch (err: unknown) {
         const reason = `Tradier sell_to_close submit threw: ${err instanceof Error ? err.message : String(err)}`;
@@ -1456,10 +1478,13 @@ export class SignalEngine {
         continue;
       }
 
-      acct.attachPendingExit(snapshot.id, resp.id);
+      // Stamp the order id AND the price we actually submitted at, so a fill
+      // that comes back without an `avg_fill_price` books P&L at the live
+      // limit rather than the stale staged trigger.
+      acct.attachPendingExit(snapshot.id, resp.id, isMarket ? undefined : submitLimit);
       const priceTag = isMarket
         ? '@ market'
-        : `@ limit $${intent.limitPrice.toFixed(2)}`;
+        : `@ limit $${submitLimit.toFixed(2)}`;
       log.info('tradier sell_to_close submitted', {
         optionSymbol: snapshot.optionSymbol,
         qty: intent.qty,
@@ -1480,7 +1505,7 @@ export class SignalEngine {
         if (detail.status === 'filled') {
           const fill = typeof detail.avg_fill_price === 'number' && detail.avg_fill_price > 0
             ? detail.avg_fill_price
-            : intent.limitPrice;
+            : submitLimit;
           acct.finalizePendingExit(snapshot.id, fill);
         } else if (TRADIER_REJECTED_STATUSES.has(detail.status)) {
           const reasonSuffix = detail.reason_description ? `: ${detail.reason_description}` : '';

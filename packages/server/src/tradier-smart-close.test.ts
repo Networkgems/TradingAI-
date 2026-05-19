@@ -2,6 +2,7 @@ import { describe, it, expect, vi } from 'vitest';
 import {
   computeRepriceLimit,
   derivePricingPath,
+  liveSellLimit,
   PENDING_CLOSE_MAX_REPRICE_STEPS,
   reconcilePendingCloseOrder,
   repricePendingCloseOrder,
@@ -54,6 +55,32 @@ describe('derivePricingPath', () => {
     expect(derivePricingPath({ symbol: 'X' })).toEqual({ kind: 'none' });
     expect(derivePricingPath({ symbol: 'X', bid: 0, ask: 0, last: 0 })).toEqual({ kind: 'none' });
     expect(derivePricingPath(null)).toEqual({ kind: 'none' });
+  });
+});
+
+describe('liveSellLimit (TRA-450)', () => {
+  it('prices a stop exit on the bid (immediately marketable)', () => {
+    expect(liveSellLimit({ symbol: 'X', bid: 0.05, ask: 0.17 }, 'bid')).toBe(0.05);
+  });
+
+  it('prices a profit / manual exit at the midpoint', () => {
+    expect(liveSellLimit({ symbol: 'X', bid: 0.05, ask: 0.17 }, 'mid')).toBe(0.11);
+  });
+
+  it('falls back to last on a single-sided quote for either level', () => {
+    expect(liveSellLimit({ symbol: 'X', ask: 0.30, last: 0.25 }, 'bid')).toBe(0.25);
+    expect(liveSellLimit({ symbol: 'X', ask: 0.30, last: 0.25 }, 'mid')).toBe(0.25);
+  });
+
+  it('returns null when the quote yields no usable price', () => {
+    expect(liveSellLimit({ symbol: 'X' }, 'bid')).toBeNull();
+    expect(liveSellLimit({ symbol: 'X', bid: 0, ask: 0, last: 0 }, 'mid')).toBeNull();
+    expect(liveSellLimit(null, 'mid')).toBeNull();
+  });
+
+  it('rounds the midpoint to the nearest cent', () => {
+    // (0.05 + 0.18) / 2 = 0.115 → 0.12 (round half up via roundToCent).
+    expect(liveSellLimit({ symbol: 'X', bid: 0.05, ask: 0.18 }, 'mid')).toBe(0.12);
   });
 });
 

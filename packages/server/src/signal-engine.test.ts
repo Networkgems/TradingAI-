@@ -2214,13 +2214,16 @@ describe('SignalEngine — TRA-346 four-bucket sub-account wiring (TRA-349)', ()
   });
 });
 
-// ─── TRA-361 — submitStagedOptionExits honors MARKET vs LIMIT pricing ───────
-// The PaperOptionsAccount stages a pendingExit with `pricing: 'market'` for
-// deep-underwater imported positions (the LIMIT at the SL would never fill).
-// The engine's submit path must call `sellContracts` (market) for those and
-// `sellContractsLimit` (the TRA-354 default) for everything else.
-describe('SignalEngine — TRA-361 submitStagedOptionExits pricing', () => {
+// ─── TRA-361 / TRA-450 — submitStagedOptionExits pricing ────────────────────
+// TRA-361: the PaperOptionsAccount stages a pendingExit with `pricing:'market'`
+// for deep-underwater imported positions; the engine must route those through
+// `sellContracts` (market) and everything else through `sellContractsLimit`.
+// TRA-450: a LIMIT exit must be repriced off a FRESH live quote at submit time
+// — an SL / trailing exit sits on the bid (marketable), a TP1 / manual exit at
+// the mid — instead of submitting at the stale entry-time trigger price.
+describe('SignalEngine — TRA-361/TRA-450 submitStagedOptionExits pricing', () => {
   interface TradierExitStub {
+    getOptionQuote: ReturnType<typeof vi.fn>;
     sellContractsLimit: ReturnType<typeof vi.fn>;
     sellContracts: ReturnType<typeof vi.fn>;
     waitForOrderTerminalStatus: ReturnType<typeof vi.fn>;
@@ -2228,6 +2231,7 @@ describe('SignalEngine — TRA-361 submitStagedOptionExits pricing', () => {
 
   function makeStub(): TradierExitStub {
     return {
+      getOptionQuote: vi.fn().mockResolvedValue({ symbol: 'X', bid: 0.80, ask: 1.20 }),
       sellContractsLimit: vi.fn().mockResolvedValue({ id: 901, status: 'pending' }),
       sellContracts: vi.fn().mockResolvedValue({ id: 902, status: 'pending' }),
       // No terminal status — keep the pendingExit and let the next tick poll.
@@ -2241,30 +2245,57 @@ describe('SignalEngine — TRA-361 submitStagedOptionExits pricing', () => {
     return engine;
   }
 
-  it('routes a LIMIT-pricing intent through sellContractsLimit', async () => {
-    const stub = makeStub();
-    const engine = setupEngine(stub);
-    const submit = (engine as unknown as {
+  function bindSubmit(engine: SignalEngine) {
+    return (engine as unknown as {
       submitStagedOptionExits: (s: import('@trading-app/shared').OptionPosition[]) => Promise<void>;
     }).submitStagedOptionExits.bind(engine);
+  }
 
-    const snapshot = {
+  function stagedExit(
+    over: Partial<import('@trading-app/shared').OptionPendingExit> & { optionSymbol?: string },
+  ): import('@trading-app/shared').OptionPosition {
+    const { optionSymbol = 'SPY260515C00450000', ...exit } = over;
+    return {
       id: 'opt-1',
       symbol: 'SPY',
-      optionSymbol: 'SPY260515C00450000',
+      optionSymbol,
       pendingExit: {
         tradierOrderId: '',
         qty: 2,
-        limitPrice: 1.50,
+        limitPrice: 1.50, // stale entry-time trigger — must NOT be submitted
         submittedAt: Date.now(),
         kind: 'sl',
         pricing: 'limit',
+        ...exit,
       },
     } as unknown as import('@trading-app/shared').OptionPosition;
-    await submit([snapshot]);
+  }
 
-    expect(stub.sellContractsLimit).toHaveBeenCalledWith('SPY260515C00450000', 2, 1.50);
+  it('TRA-450 — reprices an SL LIMIT exit onto the live bid, not the stale trigger', async () => {
+    const stub = makeStub();
+    const submit = bindSubmit(setupEngine(stub));
+    await submit([stagedExit({ kind: 'sl' })]);
+    // bid 0.80 — a sell limit at the bid is immediately marketable. The stale
+    // 1.50 trigger is never submitted.
+    expect(stub.getOptionQuote).toHaveBeenCalledWith('SPY260515C00450000');
+    expect(stub.sellContractsLimit).toHaveBeenCalledWith('SPY260515C00450000', 2, 0.80);
     expect(stub.sellContracts).not.toHaveBeenCalled();
+  });
+
+  it('TRA-450 — reprices a TP1 LIMIT exit onto the live mid', async () => {
+    const stub = makeStub();
+    const submit = bindSubmit(setupEngine(stub));
+    await submit([stagedExit({ kind: 'tp1' })]);
+    // mid of 0.80 / 1.20 = 1.00 — a profit-taking exit keeps the spread.
+    expect(stub.sellContractsLimit).toHaveBeenCalledWith('SPY260515C00450000', 2, 1.00);
+  });
+
+  it('TRA-450 — falls back to the staged trigger price when the quote lookup fails', async () => {
+    const stub = makeStub();
+    stub.getOptionQuote.mockRejectedValueOnce(new Error('Tradier 503'));
+    const submit = bindSubmit(setupEngine(stub));
+    await submit([stagedExit({ kind: 'sl' })]);
+    expect(stub.sellContractsLimit).toHaveBeenCalledWith('SPY260515C00450000', 2, 1.50);
   });
 
   it('escalates a MARKET-pricing intent through sellContracts (deep-underwater fallback)', async () => {
