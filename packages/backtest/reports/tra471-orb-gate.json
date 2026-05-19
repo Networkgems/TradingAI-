@@ -1,0 +1,231 @@
+{
+  "issue": "TRA-471",
+  "generatedAt": "2026-05-19T16:51:51.915Z",
+  "feed": "Yahoo intraday (5m + 1h) + ^GSPC daily",
+  "gspcDailyBars": 687,
+  "riskPerTrade": 0.01,
+  "slippageBps": 5,
+  "passes": [
+    {
+      "label": "Primary — 5m bars (~58d, faithful 30-min ORB)",
+      "interval": "5m",
+      "window": {
+        "start": "2026-03-23",
+        "end": "2026-05-19",
+        "months": 1.88
+      },
+      "intradayBars": 190761,
+      "symbols": 25,
+      "fetchFailures": [],
+      "totalOrbSignals": 97,
+      "rows": [
+        {
+          "config": "No gate (raw ORB)",
+          "trades": 97,
+          "longs": 51,
+          "shorts": 46,
+          "droppedByGate": 0,
+          "netReturnPct": -2.372690611618733,
+          "sharpe": -0.5284218702775476,
+          "maxDrawdownPct": 12.169212259041906,
+          "winRatePct": 43.29896907216495,
+          "gateFlips": 0,
+          "gateFlipsPerMonth": 0
+        },
+        {
+          "config": "SMA-20 (baseline)",
+          "trades": 45,
+          "longs": 33,
+          "shorts": 12,
+          "droppedByGate": 52,
+          "netReturnPct": 5.347799097402262,
+          "sharpe": 2.0043669623205096,
+          "maxDrawdownPct": 5.320886589838255,
+          "winRatePct": 55.55555555555556,
+          "gateFlips": 1,
+          "gateFlipsPerMonth": 0.5121951219512195
+        },
+        {
+          "config": "SMA-50",
+          "trades": 50,
+          "longs": 33,
+          "shorts": 17,
+          "droppedByGate": 47,
+          "netReturnPct": 4.031866052465061,
+          "sharpe": 1.4527132301652128,
+          "maxDrawdownPct": 6.503553670396786,
+          "winRatePct": 52,
+          "gateFlips": 1,
+          "gateFlipsPerMonth": 0.5121951219512195
+        },
+        {
+          "config": "SMA-200",
+          "trades": 50,
+          "longs": 33,
+          "shorts": 17,
+          "droppedByGate": 47,
+          "netReturnPct": 4.031866052465061,
+          "sharpe": 1.4527132301652128,
+          "maxDrawdownPct": 6.503553670396786,
+          "winRatePct": 52,
+          "gateFlips": 1,
+          "gateFlipsPerMonth": 0.5121951219512195
+        },
+        {
+          "config": "EMA-50",
+          "trades": 50,
+          "longs": 33,
+          "shorts": 17,
+          "droppedByGate": 47,
+          "netReturnPct": 4.031866052465061,
+          "sharpe": 1.4527132301652128,
+          "maxDrawdownPct": 6.503553670396786,
+          "winRatePct": 52,
+          "gateFlips": 1,
+          "gateFlipsPerMonth": 0.5121951219512195
+        },
+        {
+          "config": "Dual-MA 50/200",
+          "trades": 33,
+          "longs": 33,
+          "shorts": 0,
+          "droppedByGate": 64,
+          "netReturnPct": 0.9987705132874058,
+          "sharpe": 0.5274544406077126,
+          "maxDrawdownPct": 4.251040141615174,
+          "winRatePct": 54.54545454545454,
+          "gateFlips": 1,
+          "gateFlipsPerMonth": 0.5121951219512195
+        },
+        {
+          "config": "SMA-50 ±1% hysteresis",
+          "trades": 49,
+          "longs": 26,
+          "shorts": 23,
+          "droppedByGate": 48,
+          "netReturnPct": -0.4425290856574726,
+          "sharpe": -0.05929646657254522,
+          "maxDrawdownPct": 9.976525332027256,
+          "winRatePct": 44.89795918367347,
+          "gateFlips": 1,
+          "gateFlipsPerMonth": 0.5121951219512195
+        }
+      ],
+      "markdownTable": "**Primary — 5m bars (~58d, faithful 30-min ORB)** — window 2026-03-23 → 2026-05-19, 97 raw ORB signals\n\n| Config | Net Return | Sharpe | Max DD | Trades (L/S) | Win % | Gate Flips (/mo) |\n|---|---:|---:|---:|---:|---:|---:|\n| No gate (raw ORB) | -2.37% | -0.53 | 12.17% | 97 (51/46) | 43.3% | 0 (0.0) |\n| SMA-20 (baseline) | 5.35% | 2.00 | 5.32% | 45 (33/12) | 55.6% | 1 (0.5) |\n| SMA-50 | 4.03% | 1.45 | 6.50% | 50 (33/17) | 52.0% | 1 (0.5) |\n| SMA-200 | 4.03% | 1.45 | 6.50% | 50 (33/17) | 52.0% | 1 (0.5) |\n| EMA-50 | 4.03% | 1.45 | 6.50% | 50 (33/17) | 52.0% | 1 (0.5) |\n| Dual-MA 50/200 | 1.00% | 0.53 | 4.25% | 33 (33/0) | 54.5% | 1 (0.5) |\n| SMA-50 ±1% hysteresis | -0.44% | -0.06 | 9.98% | 49 (26/23) | 44.9% | 1 (0.5) |"
+    },
+    {
+      "label": "Long-window — 1h bars (~730d, regime-discriminating)",
+      "interval": "1h",
+      "window": {
+        "start": "2024-05-20",
+        "end": "2026-05-19",
+        "months": 23.95
+      },
+      "intradayBars": 204460,
+      "symbols": 25,
+      "fetchFailures": [],
+      "totalOrbSignals": 303,
+      "rows": [
+        {
+          "config": "No gate (raw ORB)",
+          "trades": 303,
+          "longs": 141,
+          "shorts": 162,
+          "droppedByGate": 0,
+          "netReturnPct": -37.018026066454624,
+          "sharpe": -2.7618905572630523,
+          "maxDrawdownPct": 37.018026066454624,
+          "winRatePct": 31.683168316831683,
+          "gateFlips": 0,
+          "gateFlipsPerMonth": 0
+        },
+        {
+          "config": "SMA-20 (baseline)",
+          "trades": 133,
+          "longs": 98,
+          "shorts": 35,
+          "droppedByGate": 170,
+          "netReturnPct": -26.381262137531703,
+          "sharpe": -2.7420814331006196,
+          "maxDrawdownPct": 27.10768191609074,
+          "winRatePct": 31.57894736842105,
+          "gateFlips": 46,
+          "gateFlipsPerMonth": 1.9281437125748502
+        },
+        {
+          "config": "SMA-50",
+          "trades": 127,
+          "longs": 98,
+          "shorts": 29,
+          "droppedByGate": 176,
+          "netReturnPct": -25.73021892923557,
+          "sharpe": -2.9801268406958616,
+          "maxDrawdownPct": 26.040877317496914,
+          "winRatePct": 29.133858267716533,
+          "gateFlips": 30,
+          "gateFlipsPerMonth": 1.2574850299401197
+        },
+        {
+          "config": "SMA-200",
+          "trades": 123,
+          "longs": 114,
+          "shorts": 9,
+          "droppedByGate": 180,
+          "netReturnPct": -27.935279933452694,
+          "sharpe": -3.1829347641765877,
+          "maxDrawdownPct": 28.23671491095783,
+          "winRatePct": 30.89430894308943,
+          "gateFlips": 6,
+          "gateFlipsPerMonth": 0.2581967213114754
+        },
+        {
+          "config": "EMA-50",
+          "trades": 131,
+          "longs": 106,
+          "shorts": 25,
+          "droppedByGate": 172,
+          "netReturnPct": -27.981797554596366,
+          "sharpe": -3.2212788933996204,
+          "maxDrawdownPct": 28.283037956474644,
+          "winRatePct": 28.24427480916031,
+          "gateFlips": 34,
+          "gateFlipsPerMonth": 1.4251497005988025
+        },
+        {
+          "config": "Dual-MA 50/200",
+          "trades": 78,
+          "longs": 76,
+          "shorts": 2,
+          "droppedByGate": 225,
+          "netReturnPct": -17.78932486484609,
+          "sharpe": -2.182332457899961,
+          "maxDrawdownPct": 18.06945932458851,
+          "winRatePct": 26.923076923076923,
+          "gateFlips": 32,
+          "gateFlipsPerMonth": 1.3770491803278688
+        },
+        {
+          "config": "SMA-50 ±1% hysteresis",
+          "trades": 128,
+          "longs": 108,
+          "shorts": 20,
+          "droppedByGate": 175,
+          "netReturnPct": -28.028152657055294,
+          "sharpe": -3.3069648409207097,
+          "maxDrawdownPct": 28.270524659110407,
+          "winRatePct": 30.46875,
+          "gateFlips": 14,
+          "gateFlipsPerMonth": 0.5868263473053892
+        }
+      ],
+      "markdownTable": "**Long-window — 1h bars (~730d, regime-discriminating)** — window 2024-05-20 → 2026-05-19, 303 raw ORB signals\n\n| Config | Net Return | Sharpe | Max DD | Trades (L/S) | Win % | Gate Flips (/mo) |\n|---|---:|---:|---:|---:|---:|---:|\n| No gate (raw ORB) | -37.02% | -2.76 | 37.02% | 303 (141/162) | 31.7% | 0 (0.0) |\n| SMA-20 (baseline) | -26.38% | -2.74 | 27.11% | 133 (98/35) | 31.6% | 46 (1.9) |\n| SMA-50 | -25.73% | -2.98 | 26.04% | 127 (98/29) | 29.1% | 30 (1.3) |\n| SMA-200 | -27.94% | -3.18 | 28.24% | 123 (114/9) | 30.9% | 6 (0.3) |\n| EMA-50 | -27.98% | -3.22 | 28.28% | 131 (106/25) | 28.2% | 34 (1.4) |\n| Dual-MA 50/200 | -17.79% | -2.18 | 18.07% | 78 (76/2) | 26.9% | 32 (1.4) |\n| SMA-50 ±1% hysteresis | -28.03% | -3.31 | 28.27% | 128 (108/20) | 30.5% | 14 (0.6) |"
+    }
+  ],
+  "notes": [
+    "ORB-only P&L; the gate keeps longs when UP and shorts when DOWN.",
+    "Twelve Data key absent in this environment — Yahoo feed used (no key required).",
+    "Yahoo caps 5m history at ~60 days and 1h at ~730 days; the 2022 bear market is not reachable on a free intraday tier.",
+    "5m pass = faithful 30-min ORB; 1h pass = coarser first-hour-range ORB but a 2-year window that actually discriminates the MA variants.",
+    "Production market-review.ts readIndexes() fetches MA_PERIOD+5 (=25) ^GSPC bars; this harness fetches max(period,200)+window+slack — the TRA-470 data-depth fix. No production edit made."
+  ]
+}
