@@ -1,0 +1,72 @@
+{
+  "generatedAt": "2026-05-19T02:03:34.348Z",
+  "windowStart": "2025-05-01",
+  "windowEnd": "2026-04-30",
+  "strategy": "bb_fade",
+  "timeframe": "4h",
+  "initialEquityUsd": 25000,
+  "feeBps": 40,
+  "slippageBps": 5,
+  "results": [
+    {
+      "symbol": "BTC-USD",
+      "bars": 2188,
+      "totalTrades": 10,
+      "winRate": 0.3,
+      "expectancy": 5.4584680713087685,
+      "profitFactor": 0.8050596340333477,
+      "sharpeRatio": -0.3031244863789801,
+      "maxDrawdownPct": 0.03796727974963709,
+      "totalPnlUsd": -225.83359024350034,
+      "longTrades": 10,
+      "longWinRate": 0.3,
+      "longPnlUsd": -225.83359024350034,
+      "longProfitFactor": 0.8050596340333477
+    },
+    {
+      "symbol": "ETH-USD",
+      "bars": 2188,
+      "totalTrades": 3,
+      "winRate": 0,
+      "expectancy": -1.0591555943967526,
+      "profitFactor": 0,
+      "sharpeRatio": -1.4800463395978767,
+      "maxDrawdownPct": 0.02547586374305698,
+      "totalPnlUsd": -636.896593576427,
+      "longTrades": 3,
+      "longWinRate": 0,
+      "longPnlUsd": -636.896593576427,
+      "longProfitFactor": 0
+    },
+    {
+      "symbol": "SOL-USD",
+      "bars": 2188,
+      "totalTrades": 12,
+      "winRate": 0.4166666666666667,
+      "expectancy": 6.085605243606444,
+      "profitFactor": 2.379244281506052,
+      "sharpeRatio": 1.181969305337023,
+      "maxDrawdownPct": 0.02989231978056734,
+      "totalPnlUsd": 1450.5753009625996,
+      "longTrades": 12,
+      "longWinRate": 0.4166666666666667,
+      "longPnlUsd": 1450.5753009625996,
+      "longProfitFactor": 2.379244281506052
+    },
+    {
+      "symbol": "DOGE-USD",
+      "bars": 2188,
+      "totalTrades": 12,
+      "winRate": 0.5833333333333334,
+      "expectancy": 0.051955763025462086,
+      "profitFactor": 0.8709510905587861,
+      "sharpeRatio": -0.18555943714450582,
+      "maxDrawdownPct": 0.01904722384262135,
+      "totalPnlUsd": -90.59455875672978,
+      "longTrades": 12,
+      "longWinRate": 0.5833333333333334,
+      "longPnlUsd": -90.59455875672978,
+      "longProfitFactor": 0.8709510905587861
+    }
+  ]
+}
