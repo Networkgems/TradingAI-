@@ -1635,8 +1635,13 @@ export interface MarketReviewIndexReading {
   label: string;
   /** Latest value, or `null` when the feed could not be reached. */
   value: number | null;
-  /** 20-day moving average — only computed for the S&P 500 trend gate. */
-  ma20: number | null;
+  /**
+   * Trend moving average — only computed for the S&P 500 trend gate. The
+   * period is `MA_PERIOD` in `market-review.ts` (TRA-472: 50-day SMA).
+   * Period-agnostic name — renamed from `ma20` so a future period bump does
+   * not leave the field lying about its window.
+   */
+  trendMa: number | null;
   /** One-line interpretation of this reading. */
   note: string;
 }
@@ -1647,9 +1652,9 @@ export interface MarketReviewIndexReading {
  * waiting on a hand-written QuantTrader review.
  */
 export interface MarketReviewGates {
-  /** Opening-range-breakout longs enabled (S&P 500 above its 20-DMA). */
+  /** Opening-range-breakout longs enabled (S&P 500 in an uptrend per the trend MA). */
   orbLongs: boolean;
-  /** ORB shorts enabled (S&P 500 below its 20-DMA — downtrend tape). */
+  /** ORB shorts enabled (S&P 500 in a downtrend per the trend MA). */
   orbShorts: boolean;
   /** Mean-reversion tilt — VIX in the 16–22 band. */
   meanReversionTilt: boolean;
@@ -1659,8 +1664,9 @@ export interface MarketReviewGates {
   sizingMultiplier: number;
   /**
    * TRA-469 — direction of the S&P 500 trend filter the gates were derived
-   * from: `'up'` / `'down'` relative to the 20-DMA, or `'unknown'` when the
-   * trend feed (`^GSPC`, with the `SPY` fallback) could not be reached.
+   * from: `'up'` / `'down'` relative to the trend MA (TRA-472: 50-day SMA
+   * with a ±1% hysteresis band), or `'unknown'` when the trend feed (`^GSPC`,
+   * with the `SPY` fallback) could not be reached.
    *
    * `orbLongs` goes false for two distinct reasons — a genuine downtrend *or*
    * an unreadable trend feed — so the consumer needs this to attribute the

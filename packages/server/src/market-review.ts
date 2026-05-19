@@ -12,7 +12,8 @@
  * This module replaces the *deterministic* core of that routine with a
  * server-side job. It pulls three index-level series from Yahoo:
  *
- *   - `^GSPC` — S&P 500, with its 20-day moving average (the trend filter).
+ *   - `^GSPC` — S&P 500, with its trend moving average (the trend filter —
+ *     TRA-472: a 50-day SMA with a ±1% hysteresis band).
  *   - `^VIX`  — volatility index (breakout / mean-reversion gate).
  *   - `^TNX`  — 10-year Treasury yield (rate-pressure / sizing gate).
  *
@@ -53,15 +54,42 @@ const SPX_SYMBOL = '^GSPC';
  * endpoint is flakier than its equity endpoints (and trips its own breaker),
  * which left the trend filter dark and forced a YELLOW "feed unavailable"
  * regime. `SPY` is the S&P 500 ETF: it tracks the index ~1:10, and the trend
- * gate only compares the latest close against its *own* 20-DMA — a scale-free
- * test — so the proxy yields an identical up/down read.
+ * gate only compares the latest close against its *own* trend MA — a
+ * scale-free test — so the proxy yields an identical up/down read.
  */
 const SPX_FALLBACK_SYMBOL = 'SPY';
 const VIX_SYMBOL = '^VIX';
 const TNX_SYMBOL = '^TNX';
 
-/** Bars of S&P 500 history averaged for the trend filter. */
-const MA_PERIOD = 20;
+/**
+ * Bars of S&P 500 history averaged for the trend filter.
+ *
+ * TRA-472 — bumped 20 → 50 per the board-approved TRA-470 recommendation
+ * (approval `fd37318c`). The 20-DMA flipped the ORB regime gate too often on
+ * shallow noise; the 50-day SMA + the {@link TREND_HYSTERESIS} band below cut
+ * the whipsaw. Exported so the test suite stays period-agnostic.
+ */
+export const MA_PERIOD = 50;
+
+/**
+ * TRA-472 — ±1% hysteresis band around the trend MA. The trend read only
+ * flips once price clears the band (`spx > MA·1.01` → up, `spx < MA·0.99` →
+ * down); inside the band it holds the prior review's trend state. This is the
+ * whipsaw damper the TRA-470 report quantified.
+ */
+export const TREND_HYSTERESIS = 0.01;
+
+/**
+ * Floor on the trend-history depth. The trend filter must always be
+ * computable, so {@link readSpxTrend} fetches `max(MA_PERIOD, MIN_TREND_BARS)`
+ * bars (+ a small margin). With `MA_PERIOD` at 50 this floor is slack, but a
+ * future period bump (e.g. 200) then scales the fetch depth automatically
+ * instead of silently starving the MA — the data-depth defect TRA-470 flagged.
+ */
+const MIN_TREND_BARS = 50;
+
+/** Trend candles to request — scales with the period so the MA never starves. */
+const TREND_FETCH_BARS = Math.max(MA_PERIOD, MIN_TREND_BARS) + 5;
 
 /** VIX < this → trend-follow regime; at/above → mean-reversion tilt. */
 const VIX_TREND_FOLLOW = 16;
@@ -127,12 +155,57 @@ async function persist(): Promise<void> {
 export interface RegimeInputs {
   /** Latest S&P 500 close, or `null` when the feed could not be reached. */
   spx: number | null;
-  /** S&P 500 20-day moving average, or `null`. */
-  spxMa20: number | null;
+  /** S&P 500 trend moving average ({@link MA_PERIOD}-day SMA), or `null`. */
+  spxTrendMa: number | null;
   /** Latest VIX value, or `null`. */
   vix: number | null;
   /** 10-year Treasury yield as a percent (e.g. `4.31`), or `null`. */
   tnx: number | null;
+}
+
+/** Resolved trend read — output of {@link resolveTrend}. */
+export interface TrendRead {
+  /** True ↔ confirmed uptrend (price above the hysteresis band, or held up). */
+  trendUp: boolean;
+  /** True ↔ confirmed downtrend (price below the band, or held down). */
+  trendDown: boolean;
+  /** False ↔ the trend feed was dark (`spx` or the trend MA was `null`). */
+  trendKnown: boolean;
+}
+
+/**
+ * TRA-472 — resolve the S&P 500 trend direction with a ±1% hysteresis band.
+ *
+ *   - flip to **up** only when `spx > trendMa·(1 + {@link TREND_HYSTERESIS})`;
+ *   - flip to **down** only when `spx < trendMa·(1 - TREND_HYSTERESIS)`;
+ *   - inside the band: **hold** `prevTrendUp` (the prior review's trend state);
+ *   - cold store (`prevTrendUp` null/undefined) inside the band: seed from the
+ *     plain `spx >= trendMa` comparison.
+ *
+ * Pure so both {@link classifyMarketRegime} and {@link deriveGates} resolve an
+ * identical trend, and the band is unit-testable in isolation.
+ */
+export function resolveTrend(
+  spx: number | null,
+  trendMa: number | null,
+  prevTrendUp?: boolean | null,
+): TrendRead {
+  if (spx == null || trendMa == null) {
+    return { trendUp: false, trendDown: false, trendKnown: false };
+  }
+  const upperBand = trendMa * (1 + TREND_HYSTERESIS);
+  const lowerBand = trendMa * (1 - TREND_HYSTERESIS);
+  let up: boolean;
+  if (spx > upperBand) {
+    up = true;
+  } else if (spx < lowerBand) {
+    up = false;
+  } else if (prevTrendUp != null) {
+    up = prevTrendUp; // inside the band — hold the prior review's state
+  } else {
+    up = spx >= trendMa; // cold store — seed from the plain comparison
+  }
+  return { trendUp: up, trendDown: !up, trendKnown: true };
 }
 
 /**
@@ -157,19 +230,25 @@ export function simpleMa(candles: Candle[], period: number): number | null {
  * Classify the GREEN / YELLOW / RED regime from the index readings, applying
  * the TRA-385 gate order:
  *
- *   - RED    — S&P 500 below its 20-DMA (downtrend) **or** VIX > 22 (high vol).
+ *   - RED    — S&P 500 in a downtrend **or** VIX > 22 (high vol).
  *   - YELLOW — VIX in the 16–22 band **or** 10Y yield > 4.50% (rate pressure),
  *              or the feeds were too cold to confirm a GREEN tape.
- *   - GREEN  — S&P 500 above its 20-DMA, VIX < 16, 10Y ≤ 4.50%.
+ *   - GREEN  — S&P 500 in an uptrend, VIX < 16, 10Y ≤ 4.50%.
+ *
+ * The trend read is resolved via {@link resolveTrend} (TRA-472: a
+ * {@link MA_PERIOD}-day SMA with a ±1% hysteresis band). `prevTrendUp` carries
+ * the prior review's trend state so a price inside the band holds rather than
+ * flips; pass `null`/omit on a cold store.
  */
-export function classifyMarketRegime(inputs: RegimeInputs): {
+export function classifyMarketRegime(
+  inputs: RegimeInputs,
+  prevTrendUp?: boolean | null,
+): {
   regime: MarketRegimeLabel;
   rationale: string;
 } {
-  const { spx, spxMa20, vix, tnx } = inputs;
-  const trendKnown = spx != null && spxMa20 != null;
-  const trendDown = trendKnown && spx! < spxMa20!;
-  const trendUp = trendKnown && spx! >= spxMa20!;
+  const { spx, spxTrendMa, vix, tnx } = inputs;
+  const { trendKnown, trendUp, trendDown } = resolveTrend(spx, spxTrendMa, prevTrendUp);
   const highVix = vix != null && vix > VIX_NO_BREAKOUT;
   const elevatedVix = vix != null && vix >= VIX_TREND_FOLLOW && vix <= VIX_NO_BREAKOUT;
   const highRates = tnx != null && tnx > TNX_HIGH;
@@ -177,7 +256,7 @@ export function classifyMarketRegime(inputs: RegimeInputs): {
   const reasons: string[] = [];
 
   if (trendDown || highVix) {
-    if (trendDown) reasons.push('S&P 500 is below its 20-day average (downtrend)');
+    if (trendDown) reasons.push(`S&P 500 is below its ${MA_PERIOD}-day average (downtrend)`);
     if (highVix) reasons.push(`VIX ${vix!.toFixed(1)} > ${VIX_NO_BREAKOUT} (high volatility)`);
     return { regime: 'red', rationale: reasons.join('; ') + '.' };
   }
@@ -189,18 +268,24 @@ export function classifyMarketRegime(inputs: RegimeInputs): {
     return { regime: 'yellow', rationale: reasons.join('; ') + '.' };
   }
 
-  if (trendUp) reasons.push('S&P 500 above its 20-day average');
+  if (trendUp) reasons.push(`S&P 500 above its ${MA_PERIOD}-day average`);
   if (vix != null) reasons.push(`VIX ${vix.toFixed(1)} < ${VIX_TREND_FOLLOW} (trend-follow)`);
   if (tnx != null) reasons.push(`10Y yield ${tnx.toFixed(2)}% ≤ ${TNX_HIGH}%`);
   return { regime: 'green', rationale: reasons.join('; ') + '.' };
 }
 
-/** Derive the deterministic strategy gates from the regime + raw readings. */
-export function deriveGates(regime: MarketRegimeLabel, inputs: RegimeInputs): MarketReviewGates {
-  const { spx, spxMa20, vix, tnx } = inputs;
-  const trendKnown = spx != null && spxMa20 != null;
-  const trendUp = trendKnown && spx! >= spxMa20!;
-  const trendDown = trendKnown && spx! < spxMa20!;
+/**
+ * Derive the deterministic strategy gates from the regime + raw readings.
+ * `prevTrendUp` threads the prior review's trend state into {@link resolveTrend}
+ * so the ±1% hysteresis band holds consistently with {@link classifyMarketRegime}.
+ */
+export function deriveGates(
+  regime: MarketRegimeLabel,
+  inputs: RegimeInputs,
+  prevTrendUp?: boolean | null,
+): MarketReviewGates {
+  const { spx, spxTrendMa, vix, tnx } = inputs;
+  const { trendKnown, trendUp, trendDown } = resolveTrend(spx, spxTrendMa, prevTrendUp);
   const highVix = vix != null && vix > VIX_NO_BREAKOUT;
   const elevatedVix = vix != null && vix >= VIX_TREND_FOLLOW && vix <= VIX_NO_BREAKOUT;
   const highRates = tnx != null && tnx > TNX_HIGH;
@@ -242,7 +327,7 @@ export interface SpxTrendSource {
 /**
  * TRA-469 — pick the S&P 500 trend series. Prefers the `^GSPC` primary feed;
  * uses the `SPY` proxy when `^GSPC` returns too few bars to compute the
- * 20-DMA. Pure (no I/O) so the fallback precedence is unit-testable.
+ * trend MA. Pure (no I/O) so the fallback precedence is unit-testable.
  */
 export function pickSpxTrendCandles(primary: Candle[], fallback: Candle[]): SpxTrendSource {
   if (primary.length >= MA_PERIOD) {
@@ -264,11 +349,11 @@ export function pickSpxTrendCandles(primary: Candle[], fallback: Candle[]): SpxT
  * primary comes up short, so a healthy `^GSPC` read costs nothing extra.
  */
 async function readSpxTrend(): Promise<SpxTrendSource> {
-  const primary = await fetchDailyCandles(SPX_SYMBOL, MA_PERIOD + 5).catch(() => [] as Candle[]);
+  const primary = await fetchDailyCandles(SPX_SYMBOL, TREND_FETCH_BARS).catch(() => [] as Candle[]);
   if (primary.length >= MA_PERIOD) {
     return { candles: primary, symbol: SPX_SYMBOL, viaFallback: false };
   }
-  const fallback = await fetchDailyCandles(SPX_FALLBACK_SYMBOL, MA_PERIOD + 5).catch(
+  const fallback = await fetchDailyCandles(SPX_FALLBACK_SYMBOL, TREND_FETCH_BARS).catch(
     () => [] as Candle[],
   );
   const picked = pickSpxTrendCandles(primary, fallback);
@@ -281,8 +366,12 @@ async function readSpxTrend(): Promise<SpxTrendSource> {
   return picked;
 }
 
-/** Pull the three index readings. Each leg degrades to `null` independently. */
-async function readIndexes(): Promise<{
+/**
+ * Pull the three index readings. Each leg degrades to `null` independently.
+ * `prevTrendUp` carries the prior review's trend state so the S&P 500 note
+ * reflects the same ±1% hysteresis-banded read the gates use.
+ */
+async function readIndexes(prevTrendUp?: boolean | null): Promise<{
   inputs: RegimeInputs;
   readings: MarketReviewIndexReading[];
 }> {
@@ -294,19 +383,20 @@ async function readIndexes(): Promise<{
 
   const spxCandles = spxTrend.candles;
   const spx = spxCandles.length > 0 ? spxCandles[spxCandles.length - 1].close : null;
-  const spxMa20 = simpleMa(spxCandles, MA_PERIOD);
+  const spxTrendMa = simpleMa(spxCandles, MA_PERIOD);
   const vix = vixQuote?.price ?? null;
   const tnx = normalizeTnx(tnxQuote?.price ?? null);
 
-  const inputs: RegimeInputs = { spx, spxMa20, vix, tnx };
+  const inputs: RegimeInputs = { spx, spxTrendMa, vix, tnx };
 
   const spxProxyNote = spxTrend.viaFallback ? ' (via SPY proxy — ^GSPC feed down)' : '';
-  const spxNote =
-    spx == null || spxMa20 == null
-      ? 'Feed unavailable — trend filter cannot be confirmed (^GSPC and SPY both unreachable).'
-      : spx >= spxMa20
-        ? `Above 20-DMA (${spxMa20.toFixed(2)}) — uptrend, ORB longs enabled.${spxProxyNote}`
-        : `Below 20-DMA (${spxMa20.toFixed(2)}) — downtrend, ORB longs OFF.${spxProxyNote}`;
+  const trend = resolveTrend(spx, spxTrendMa, prevTrendUp);
+  const maLabel = `${MA_PERIOD}-DMA`;
+  const spxNote = !trend.trendKnown
+    ? 'Feed unavailable — trend filter cannot be confirmed (^GSPC and SPY both unreachable).'
+    : trend.trendUp
+      ? `Above ${maLabel} (${spxTrendMa!.toFixed(2)}, ±1% band) — uptrend, ORB longs enabled.${spxProxyNote}`
+      : `Below ${maLabel} (${spxTrendMa!.toFixed(2)}, ±1% band) — downtrend, ORB longs OFF.${spxProxyNote}`;
   const vixNote =
     vix == null
       ? 'Feed unavailable.'
@@ -323,9 +413,9 @@ async function readIndexes(): Promise<{
         : `≤ ${TNX_HIGH}% — no rate-driven sizing cut.`;
 
   const readings: MarketReviewIndexReading[] = [
-    { symbol: spxTrend.symbol, label: 'S&P 500', value: spx, ma20: spxMa20, note: spxNote },
-    { symbol: VIX_SYMBOL, label: 'VIX', value: vix, ma20: null, note: vixNote },
-    { symbol: TNX_SYMBOL, label: '10Y Yield', value: tnx, ma20: null, note: tnxNote },
+    { symbol: spxTrend.symbol, label: 'S&P 500', value: spx, trendMa: spxTrendMa, note: spxNote },
+    { symbol: VIX_SYMBOL, label: 'VIX', value: vix, trendMa: null, note: vixNote },
+    { symbol: TNX_SYMBOL, label: '10Y Yield', value: tnx, trendMa: null, note: tnxNote },
   ];
 
   return { inputs, readings };
@@ -360,10 +450,10 @@ function renderMarkdown(review: MarketReview): string {
   lines.push('');
   lines.push('## Index readings');
   lines.push('');
-  lines.push('| Index | Value | 20-DMA | Read |');
+  lines.push(`| Index | Value | ${MA_PERIOD}-DMA | Read |`);
   lines.push('|---|---|---|---|');
   for (const r of indexes) {
-    lines.push(`| ${r.label} | ${fmt(r.value)} | ${fmt(r.ma20)} | ${r.note} |`);
+    lines.push(`| ${r.label} | ${fmt(r.value)} | ${fmt(r.trendMa)} | ${r.note} |`);
   }
   lines.push('');
   lines.push('## Strategy gates');
@@ -391,6 +481,17 @@ function etDate(now: Date = new Date()): string {
 // ── Public API ───────────────────────────────────────────────────────────────
 
 /**
+ * TRA-472 — map a persisted review's `trendState` gate into the `prevTrendUp`
+ * the hysteresis band consumes: `'up'` → true, `'down'` → false, and
+ * `'unknown'`/absent → `null` (cold-store seed via the plain comparison).
+ */
+function trendStateToPrev(
+  state: 'up' | 'down' | 'unknown' | undefined,
+): boolean | null {
+  return state === 'up' ? true : state === 'down' ? false : null;
+}
+
+/**
  * Generate a market review for `kind`, persist it, and publish a matching
  * `ResearchReport` to the Stocks News tab. Idempotent per ET date + kind:
  * a same-day re-run upserts both the review and the research report in place.
@@ -404,10 +505,20 @@ export async function generateMarketReview(
   const now = new Date();
   const date = etDate(now);
 
-  let inputs: RegimeInputs = { spx: null, spxMa20: null, vix: null, tnx: null };
+  // TRA-472 — thread the most-recent persisted review's trend state into the
+  // ±1% hysteresis band so a price inside the band holds rather than flips.
+  // On a cold store this is `null` and `resolveTrend` seeds from `spx ≥ MA`.
+  const persisted = await ensureLoaded();
+  const latestPrior =
+    persisted.length > 0
+      ? persisted.reduce((a, b) => (b.generatedAt > a.generatedAt ? b : a))
+      : null;
+  const prevTrendUp = trendStateToPrev(latestPrior?.gates.trendState);
+
+  let inputs: RegimeInputs = { spx: null, spxTrendMa: null, vix: null, tnx: null };
   let readings: MarketReviewIndexReading[] = [];
   try {
-    const read = await readIndexes();
+    const read = await readIndexes(prevTrendUp);
     inputs = read.inputs;
     readings = read.readings;
   } catch (err) {
@@ -417,14 +528,14 @@ export async function generateMarketReview(
       reason: err instanceof Error ? err.message : String(err),
     });
     readings = [
-      { symbol: SPX_SYMBOL, label: 'S&P 500', value: null, ma20: null, note: 'Feed unavailable.' },
-      { symbol: VIX_SYMBOL, label: 'VIX', value: null, ma20: null, note: 'Feed unavailable.' },
-      { symbol: TNX_SYMBOL, label: '10Y Yield', value: null, ma20: null, note: 'Feed unavailable.' },
+      { symbol: SPX_SYMBOL, label: 'S&P 500', value: null, trendMa: null, note: 'Feed unavailable.' },
+      { symbol: VIX_SYMBOL, label: 'VIX', value: null, trendMa: null, note: 'Feed unavailable.' },
+      { symbol: TNX_SYMBOL, label: '10Y Yield', value: null, trendMa: null, note: 'Feed unavailable.' },
     ];
   }
 
-  const { regime, rationale } = classifyMarketRegime(inputs);
-  const gates = deriveGates(regime, inputs);
+  const { regime, rationale } = classifyMarketRegime(inputs, prevTrendUp);
+  const gates = deriveGates(regime, inputs, prevTrendUp);
 
   const review: MarketReview = {
     id: `${kind}-${date}`,
@@ -473,7 +584,7 @@ export async function generateMarketReview(
     date,
     regime,
     spx: fmt(inputs.spx),
-    ma20: fmt(inputs.spxMa20),
+    trendMa: fmt(inputs.spxTrendMa),
     vix: fmt(inputs.vix),
     tnx: fmt(inputs.tnx),
     sizingMultiplier: gates.sizingMultiplier,
