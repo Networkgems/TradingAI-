@@ -396,8 +396,8 @@ export class CryptoSignalEngine {
   }
 
   /**
-   * TRA-325 / TRA-456 — resolve the strategy preset that drives this tick,
-   * scoped by engine mode:
+   * TRA-325 / TRA-456 / TRA-480 — resolve the strategy preset that drives a
+   * tick, scoped by the requested branch mode (NOT `this.mode`):
    *
    *   • live — `LIVE_STRATEGY_PRESET` ({@link FORCED_PRESET_ENV}), when set,
    *     wins over per-user settings so Render can pin the live engine
@@ -413,9 +413,14 @@ export class CryptoSignalEngine {
    *     `tra405_validated`, and deliberately does NOT fall through to per-user
    *     `activeStrategyPreset` — the board needs one deterministic candidate
    *     roster on the demo dashboard (TRA-456 CTO decision).
+   *
+   * TRA-480 — `mode` defaults to `this.mode` so legacy callers (boot logger,
+   * `buildState`) keep their original semantics. The parallel demo+live tick
+   * paths pass an explicit mode so each branch resolves its own preset, even
+   * when the engine is bound to a different user-selected mode.
    */
-  private resolvePreset(): StrategyPreset {
-    if (this.mode === 'live') {
+  private resolvePreset(mode: 'demo' | 'live' = this.mode): StrategyPreset {
+    if (mode === 'live') {
       if (FORCED_PRESET_ENV) return resolveStrategyPreset(FORCED_PRESET_ENV);
       return resolveStrategyPreset(this.currentSettings?.activeStrategyPreset);
     }
@@ -535,26 +540,46 @@ export class CryptoSignalEngine {
     // produced the 13 wrong-symbol/strategy trades on 2026-05-05→05-07. Logging
     // this once at boot means the next time someone questions whether the
     // preset is active, the server logs answer it directly.
-    const startupPreset = this.resolvePreset();
-    const filterStr = startupPreset.symbolFilter
-      ? `[${startupPreset.symbolFilter.join(',')}]`
-      : '(no filter — all watchlist symbols)';
+    // TRA-480 — log BOTH branches' resolved presets at boot so future triage
+    // doesn't have to guess which roster is actually running on each side.
+    // TRA-479's root-cause investigation took an extra half-day because the
+    // boot line only showed `id: legacy_5` and didn't distinguish whether the
+    // engine was in demo or live mode (or what env values were in effect).
+    const liveStartupPreset = this.resolvePreset('live');
+    const demoStartupPreset = this.resolvePreset('demo');
+    const filterStr = (p: StrategyPreset) =>
+      p.symbolFilter ? `[${p.symbolFilter.join(',')}]` : '(no filter — all watchlist symbols)';
     log.info('startup preset', {
-      id: startupPreset.id,
-      // TRA-479 — surface the engine mode and BOTH preset env vars so a future
-      // "demo dashboard idle" triage can read the boot log instead of guessing.
-      // Pre-479, only FORCED_PRESET_ENV (live) was logged, which made it
-      // impossible to tell from logs whether the demo branch was on `legacy_5`
-      // (env override) or just inactive because mode === 'live'.
+      // TRA-479 / TRA-480 — engine mode + both preset env vars so future
+      // "demo dashboard idle" triage can read the boot log directly instead
+      // of guessing. `liveEnv` is `LIVE_STRATEGY_PRESET`; `demoEnv` is
+      // `DEMO_STRATEGY_PRESET` (empty → default `tra405_validated`).
       mode: this.mode,
       liveEnv: FORCED_PRESET_ENV,
       demoEnv: DEMO_PRESET_ENV,
+      // Back-compat: preserve the `id` / `env` / `strategies` / `symbolFilter`
+      // / `strategyUniverse` fields that pre-TRA-480 dashboards / log parsers
+      // may rely on. These continue to reflect the engine's current-mode
+      // resolution (live when mode='live', demo when mode='demo').
+      id: (this.mode === 'live' ? liveStartupPreset : demoStartupPreset).id,
       env: FORCED_PRESET_ENV,
-      strategies: startupPreset.enabledStrategies,
-      symbolFilter: filterStr,
+      strategies: (this.mode === 'live' ? liveStartupPreset : demoStartupPreset).enabledStrategies,
+      symbolFilter: filterStr(this.mode === 'live' ? liveStartupPreset : demoStartupPreset),
       // TRA-421 — surface the per-strategy universe gate at boot so the
       // validated-symbol restriction is visible alongside the preset id.
-      strategyUniverse: startupPreset.strategyUniverse ?? '(none)',
+      strategyUniverse: (this.mode === 'live' ? liveStartupPreset : demoStartupPreset).strategyUniverse ?? '(none)',
+      // TRA-480 — explicit per-branch summary. Both branches tick every minute
+      // post-TRA-480, so both rosters are observable from a single boot line.
+      live: {
+        id: liveStartupPreset.id,
+        strategies: liveStartupPreset.enabledStrategies,
+        symbolFilter: filterStr(liveStartupPreset),
+      },
+      demo: {
+        id: demoStartupPreset.id,
+        strategies: demoStartupPreset.enabledStrategies,
+        symbolFilter: filterStr(demoStartupPreset),
+      },
     });
     // Pre-seed symbolState so clients that connect before the first tick see all expected symbols.
     // Entries with lastUpdated=0 signal "loading" to the UI.
@@ -802,7 +827,7 @@ export class CryptoSignalEngine {
    * skip per the strategy layer's best-effort contract. Universe and BTC
    * regime gates always apply regardless of mode.
    */
-  private applyShortGates(signal: TradeSignal): void {
+  private applyShortGates(signal: TradeSignal, mode: 'demo' | 'live' = this.mode): void {
     if (signal.side !== 'sell') return;
 
     if (!isPerpShortSymbol(signal.symbol)) {
@@ -826,16 +851,14 @@ export class CryptoSignalEngine {
       return;
     }
 
-    // TRA-261 / TRA-255 §3.1 + §6 — book-wide pre-route caps. Counted across
-    // both the demo paper account and the live broker (only one is active per
-    // tick, but the helper accepts whichever is the source of truth) so the
-    // signal carries the right cap reason regardless of mode. The cooldown
-    // input pulls from the closed-positions list scoped to the active mode.
+    // TRA-261 / TRA-255 §3.1 + §6 — book-wide pre-route caps. Counted against
+    // the branch (demo or live) that produced the signal so a demo-paper short
+    // cap doesn't bleed into the live broker's cooldown ledger.
     const bookReason = evaluateShortBookCaps(signal, {
-      openShortCount: this.countOpenShorts(),
+      openShortCount: this.countOpenShorts(mode),
       symbolCooldownActive: symbolShortCooldownActive(
         signal.symbol,
-        this.recentClosedShorts(),
+        this.recentClosedShorts(mode),
         Date.now(),
       ),
     });
@@ -848,9 +871,13 @@ export class CryptoSignalEngine {
    * fall-through (live broker not yet initialised) count as zero — the
    * routing path bails on the live mode early in that case so this is a
    * defensive default rather than an observable code path.
+   *
+   * TRA-480 — `mode` defaults to `this.mode` so legacy callers stay scoped to
+   * the engine's active mode; parallel-tick paths pass an explicit mode so
+   * each branch counts against its own account book.
    */
-  private countOpenShorts(): number {
-    const positions = this.mode === 'live' && this.liveAccount
+  private countOpenShorts(mode: 'demo' | 'live' = this.mode): number {
+    const positions = mode === 'live' && this.liveAccount
       ? this.liveAccount.getState().openPositions
       : this.account.getState().openPositions;
     let n = 0;
@@ -860,13 +887,14 @@ export class CryptoSignalEngine {
 
   /**
    * Closed-shorts feed for the §3.1 cooldown helper. Reads the closed-position
-   * list scoped to the active mode (the same lists the dashboard reads), so
-   * a Demo session that just took 3 SOL losses doesn't suppress Live shorts
-   * on the same ticker — and vice versa. Pre-TRA-242 snapshots without a
-   * `closedAt` are filtered out (we can't bound them to the cooldown window).
+   * list scoped to the requested branch mode (the same lists the dashboard
+   * reads), so a Demo session that just took 3 SOL losses doesn't suppress
+   * Live shorts on the same ticker — and vice versa. Pre-TRA-242 snapshots
+   * without a `closedAt` are filtered out (we can't bound them to the
+   * cooldown window). TRA-480 — mode defaults to `this.mode`.
    */
-  private recentClosedShorts(): ClosedShortTrade[] {
-    const list = this.mode === 'live' ? this.liveClosedPositions : this.demoClosedPositions;
+  private recentClosedShorts(mode: 'demo' | 'live' = this.mode): ClosedShortTrade[] {
+    const list = mode === 'live' ? this.liveClosedPositions : this.demoClosedPositions;
     const cutoff = Date.now() - 30 * 24 * 60 * 60 * 1000; // 30d window covers the 48h cooldown plus headroom for streak-walking
     const out: ClosedShortTrade[] = [];
     for (const p of list) {
@@ -1027,18 +1055,77 @@ export class CryptoSignalEngine {
       for (const h of this.handlers) h(earlyState);
     }
 
-    // Live mode: keep market data flowing so the UI shows live quotes. If a
-    // Coinbase live broker is configured, route signals/exits through it. If
-    // not, freeze in place — the demo state the user left is exactly what they
-    // see when they switch back.
-    if (this.mode === 'live') {
-      if (this.liveAccount) {
-        await this.runLiveTick(prices, activeSymbols, quoteSources);
-      }
-      for (const h of this.handlers) h(this.buildState());
-      return;
+    // TRA-480 — candle refresh + freshness gate are shared between branches.
+    // Done once per tick before either branch evaluates so the demo and live
+    // paths read identical bar caches and feed-stale verdicts. Pre-TRA-480
+    // each branch ran its own refresh in isolation; now that both branches
+    // can run on the same tick we share the work to keep our Coinbase API
+    // budget unchanged when a user is in live mode.
+    const CANDLE_BATCH = 5;
+    for (let i = 0; i < activeSymbols.length; i += CANDLE_BATCH) {
+      await Promise.all(
+        activeSymbols.slice(i, i + CANDLE_BATCH).map(sym => this.refreshCandles(sym)),
+      );
+      await Promise.all(
+        activeSymbols.slice(i, i + CANDLE_BATCH).map(sym => this.refreshDailyCandles(sym)),
+      );
+      // TRA-267 — 4H refresh runs alongside daily but `refresh4hCandles`
+      // early-exits on non-perp-short symbols, so only the 5-symbol Phase-1
+      // shorts universe actually hits Coinbase. No long-side consumer reads
+      // from `_4hCandleCache`, so the long path stays byte-identical.
+      await Promise.all(
+        activeSymbols.slice(i, i + CANDLE_BATCH).map(sym => this.refresh4hCandles(sym)),
+      );
     }
 
+    // TRA-418 — data-feed freshness gate. Run after the candle refresh above so
+    // a symbol whose feed is down is detected from the (now-attempted) cache
+    // age, marked `quoteStatus: 'stale'`, and excluded from signal evaluation.
+    const staleSymbols = this.markStaleSymbols(activeSymbols);
+
+    // TRA-480 — demo branch ALWAYS runs, regardless of `this.mode`. The board
+    // expects the demo dashboard to track `tra405_validated` deterministically
+    // (TRA-456) so a user in live mode who flips back to demo lands on a fresh
+    // candidate roster instead of the frozen snapshot from the last demo
+    // session. Pre-TRA-480 this branch lived inside `if (this.mode !== 'live')`
+    // and only ran in demo mode, which is what produced TRA-479's "Crypto Demo
+    // idle" report — once the engine flipped to live the demo state froze
+    // until the user switched back, and the candidate-strategy showcase the
+    // board cares about under TRA-434's live stand-down went dark.
+    await this.runDemoTick(prices, activeSymbols, quoteSources, staleSymbols);
+
+    // TRA-480 — live branch is still mode-gated. Live trading is a
+    // capital-allocation operation; it must NEVER run when the user is on
+    // demo. The live broker also stays unbuilt in demo mode (see
+    // `applySettings`), so this is belt-and-suspenders.
+    if (this.mode === 'live' && this.liveAccount) {
+      await this.runLiveTick(prices, activeSymbols, quoteSources, staleSymbols);
+    }
+
+    if (Date.now() - this.lastNewsRefresh > NEWS_REFRESH_MS) {
+      const news = await fetchCryptoNews(this.getActiveSymbols());
+      if (news.length > 0) this.newsCache = news;
+      this.lastNewsRefresh = Date.now();
+    }
+
+    const state = this.buildState();
+    for (const h of this.handlers) h(state);
+  }
+
+  /**
+   * TRA-480 — the demo paper-account branch, extracted from `doTick`. Always
+   * runs, regardless of `this.mode`. Resolves the DEMO_STRATEGY_PRESET so the
+   * board's demo dashboard tracks a deterministic candidate roster even while
+   * the live engine is on a different preset. Caller is responsible for
+   * candle refresh and stale-feed detection (shared with the live branch in
+   * `doTick`).
+   */
+  private async runDemoTick(
+    prices: Map<string, number>,
+    activeSymbols: string[],
+    quoteSources: Map<string, PositionQuoteSource>,
+    staleSymbols: Set<string>,
+  ): Promise<void> {
     // TRA-330 — runtime tripwire. Runs before checkExits so a corrupt account
     // can't keep emitting skipped signals or absurd PnL on the same tick that
     // detects the breach. On rebase we also realign the persisted tracker so
@@ -1062,199 +1149,169 @@ export class CryptoSignalEngine {
       this.tracker?.saveEquity(this.account.getEquity(), 0);
     }
 
-    // Fetch candles in parallel batches to avoid 60-100s sequential delay for 50 symbols
-    const CANDLE_BATCH = 5;
-    for (let i = 0; i < activeSymbols.length; i += CANDLE_BATCH) {
-      await Promise.all(
-        activeSymbols.slice(i, i + CANDLE_BATCH).map(sym => this.refreshCandles(sym)),
-      );
-      await Promise.all(
-        activeSymbols.slice(i, i + CANDLE_BATCH).map(sym => this.refreshDailyCandles(sym)),
-      );
-      // TRA-267 — 4H refresh runs alongside daily but `refresh4hCandles`
-      // early-exits on non-perp-short symbols, so only the 5-symbol Phase-1
-      // shorts universe actually hits Coinbase. No long-side consumer reads
-      // from `_4hCandleCache`, so the long path stays byte-identical.
-      await Promise.all(
-        activeSymbols.slice(i, i + CANDLE_BATCH).map(sym => this.refresh4hCandles(sym)),
-      );
-    }
+    if (!this.isAutoTradingEnabled('demo')) return;
 
-    // TRA-418 — data-feed freshness gate. Run after the candle refresh above so
-    // a symbol whose feed is down is detected from the (now-attempted) cache
-    // age, marked `quoteStatus: 'stale'`, and excluded from signal evaluation.
-    const staleSymbols = this.markStaleSymbols(activeSymbols);
+    // TRA-480 — explicit `mode='demo'` so the preset/short-gate helpers
+    // resolve against the demo branch's contract even when `this.mode='live'`.
+    const preset = this.resolvePreset('demo');
+    const symbolAllowed = (sym: string) =>
+      preset.symbolFilter === null || preset.symbolFilter.includes(sym);
+    const strategyEnabled = (s: CryptoStrategyType) => preset.enabledStrategies.includes(s);
+    let symbolsEvaluated = 0;
+    let symbolsSkipped = 0;
+    for (const sym of activeSymbols) {
+      // TRA-418 — a stale feed must never produce a new entry signal. Skip
+      // strategy evaluation entirely so no signal is even generated.
+      if (staleSymbols.has(sym)) {
+        symbolsSkipped++;
+        continue;
+      }
+      const candles = this.candleCache.get(sym) ?? [];
+      const dailyCandles = this.dailyCandleCache.get(sym) ?? [];
 
-    if (this.isAutoTradingEnabled()) {
-      // TRA-325 — resolve the active preset once per tick. Strategies outside
-      // the preset short-circuit to null without running indicators; symbols
-      // outside the preset's whitelist (when set) skip every strategy.
-      const preset = this.resolvePreset();
-      const symbolAllowed = (sym: string) =>
-        preset.symbolFilter === null || preset.symbolFilter.includes(sym);
-      const strategyEnabled = (s: CryptoStrategyType) => preset.enabledStrategies.includes(s);
-      let symbolsEvaluated = 0;
-      let symbolsSkipped = 0;
-      for (const sym of activeSymbols) {
-        // TRA-418 — a stale feed must never produce a new entry signal. Skip
-        // strategy evaluation entirely so no signal is even generated.
-        if (staleSymbols.has(sym)) {
-          symbolsSkipped++;
+      // Evaluate each strategy independently with its own minimum bar
+      // requirement. TRA-421 — `presetAllowsStrategySymbol` combines the
+      // preset-wide `symbolFilter` with the per-strategy `strategyUniverse`
+      // whitelist, so bb_fade only fires on its validated symbols.
+      const bbFadeSignal = candles.length >= CryptoSignalEngine.MIN_BARS_BB_FADE
+        && strategyEnabled('bb_fade') && presetAllowsStrategySymbol(preset, 'bb_fade', sym)
+        ? this.bbFade.evaluate(sym, candles) : null;
+      const swingSignal = strategyEnabled('swing_trade')
+        && presetAllowsStrategySymbol(preset, 'swing_trade', sym)
+        && dailyCandles.length >= 205
+        ? this.swing.evaluate(sym, dailyCandles) : null;
+      // TRA-208: regime-aware router emits at most one momentum / breakout
+      // / mean-reversion signal per tick. The router runs whenever any of
+      // its three strategies are enabled by the preset; the post-router
+      // filter below drops emissions for strategies outside the preset.
+      const routerEnabled = strategyEnabled('momentum')
+        || strategyEnabled('mean_reversion')
+        || strategyEnabled('breakout_vol');
+      const rawRouterSignal = routerEnabled && symbolAllowed(sym)
+        && candles.length >= CryptoSignalEngine.MIN_BARS_ROUTER
+        ? this.getRouter(sym, preset.strategyUniverse ?? {}).evaluate(sym, candles) : null;
+      const routerSignal = rawRouterSignal
+        && (rawRouterSignal.type === 'momentum'
+          || rawRouterSignal.type === 'mean_reversion'
+          || rawRouterSignal.type === 'breakout_vol')
+        && strategyEnabled(rawRouterSignal.type)
+        ? rawRouterSignal
+        : null;
+
+      if (candles.length === 0) {
+        symbolsSkipped++;
+      } else {
+        symbolsEvaluated++;
+      }
+
+      for (const signal of [bbFadeSignal, swingSignal, routerSignal]) {
+        if (!signal) continue;
+        // TRA-261 — apply the perp shorts gates BEFORE the open-position /
+        // recent-signal dedup. A suppressed signal still surfaces on the
+        // dashboard with `signalSkipReason`, so the user knows the strategy
+        // fired and was deliberately blocked.
+        this.applyShortGates(signal, 'demo');
+        if (this.account.hasOpenPositionForSignalType(sym, signal.type)) continue;
+        // TRA-480 — dedup against the demo branch only. Pre-TRA-480 the engine
+        // ran one branch at a time so a single `recentSignals` window served
+        // both modes; now that both branches can tick on the same minute, a
+        // demo signal must not suppress a live signal (or vice versa) just
+        // because it landed first.
+        const recent = this.recentSignals.find(
+          s => s.symbol === signal.symbol && s.type === signal.type
+            && (s.mode ?? 'demo') === 'demo'
+            && Date.now() - s.timestamp < 5 * 60_000,
+        );
+        if (recent) continue;
+
+        // TRA-134: Defer dedup until we know a quote is available so a missing
+        // quote doesn't block the signal from retrying for 5 minutes.
+        const price = prices.get(sym);
+        if (!price) {
+          log.warn('no quote in cache — skipping (will retry next tick)', { sym, signalType: signal.type });
           continue;
         }
-        const candles = this.candleCache.get(sym) ?? [];
-        const dailyCandles = this.dailyCandleCache.get(sym) ?? [];
 
-        // Evaluate each strategy independently with its own minimum bar
-        // requirement. TRA-421 — `presetAllowsStrategySymbol` combines the
-        // preset-wide `symbolFilter` with the per-strategy `strategyUniverse`
-        // whitelist, so bb_fade only fires on its validated symbols.
-        const bbFadeSignal = candles.length >= CryptoSignalEngine.MIN_BARS_BB_FADE
-          && strategyEnabled('bb_fade') && presetAllowsStrategySymbol(preset, 'bb_fade', sym)
-          ? this.bbFade.evaluate(sym, candles) : null;
-        const swingSignal = strategyEnabled('swing_trade')
-          && presetAllowsStrategySymbol(preset, 'swing_trade', sym)
-          && dailyCandles.length >= 205
-          ? this.swing.evaluate(sym, dailyCandles) : null;
-        // TRA-208: regime-aware router emits at most one momentum / breakout
-        // / mean-reversion signal per tick. The router runs whenever any of
-        // its three strategies are enabled by the preset; the post-router
-        // filter below drops emissions for strategies outside the preset.
-        // TRA-421 — the router itself applies the per-strategy universe gate
-        // (passed via getRouter), so an out-of-universe router strategy never
-        // emits; the preset-wide `symbolAllowed` gate still decides whether
-        // the router runs at all.
-        const routerEnabled = strategyEnabled('momentum')
-          || strategyEnabled('mean_reversion')
-          || strategyEnabled('breakout_vol');
-        const rawRouterSignal = routerEnabled && symbolAllowed(sym)
-          && candles.length >= CryptoSignalEngine.MIN_BARS_ROUTER
-          ? this.getRouter(sym, preset.strategyUniverse ?? {}).evaluate(sym, candles) : null;
-        const routerSignal = rawRouterSignal
-          && (rawRouterSignal.type === 'momentum'
-            || rawRouterSignal.type === 'mean_reversion'
-            || rawRouterSignal.type === 'breakout_vol')
-          && strategyEnabled(rawRouterSignal.type)
-          ? rawRouterSignal
-          : null;
+        // TRA-231 — stamp the active mode so the dashboard scopes Signals
+        // and Open Positions per-mode. Stamping the in-flight signal record
+        // also propagates to the position the demo account opens off it
+        // (`account.openPosition` does not copy `mode`, so we stamp the
+        // returned position too).
+        signal.mode = 'demo';
+        this.recentSignals.unshift(signal);
+        if (this.recentSignals.length > MAX_SIGNALS) this.recentSignals.pop();
 
-        if (candles.length === 0) {
-          symbolsSkipped++;
-        } else {
-          symbolsEvaluated++;
+        // TRA-261 — suppressed signals still display on the dashboard but
+        // do not open a position. Pre-routing skip strings are set by
+        // `applyShortGates` (universe gate + multiplicative §5 filters) and
+        // by `MeanReversionCryptoStrategy` (off-strategy MR shorts).
+        if (signal.signalSkipReason) continue;
+
+        // TRA-338 — Coinbase-strict entry gate. We trade what Coinbase
+        // trades; if the symbol isn't listed there (e.g. Yahoo's MEGA-USD
+        // pointing at a 2022-delisted "MegaCryptoPolis" token, which gave
+        // TRA-337 a frozen $4.05 entry), we don't open.
+        const cbListed = isCoinbaseListed(sym);
+        if (cbListed === false) {
+          signal.signalSkipReason = `${sym} not listed on Coinbase Exchange — skipping entry (we only trade what Coinbase trades)`;
+          log.warn('signal skipped', { sym, signalType: signal.type, reason: signal.signalSkipReason });
+          continue;
+        }
+        const source = quoteSources.get(sym);
+        if (cbListed === true && source !== 'coinbase') {
+          signal.signalSkipReason = `${sym} listed on Coinbase but no Coinbase quote this tick (got ${source ?? 'no quote'}) — refusing fallback-priced entry`;
+          log.warn('signal skipped', { sym, signalType: signal.type, reason: signal.signalSkipReason });
+          continue;
+        }
+        if (cbListed === null && source !== 'coinbase') {
+          signal.signalSkipReason = `${sym} no Coinbase quote and Coinbase product catalog unavailable — refusing fallback-priced entry`;
+          log.warn('signal skipped', { sym, signalType: signal.type, reason: signal.signalSkipReason });
+          continue;
         }
 
-        for (const signal of [bbFadeSignal, swingSignal, routerSignal]) {
-          if (!signal) continue;
-          // TRA-261 — apply the perp shorts gates BEFORE the open-position /
-          // recent-signal dedup. A suppressed signal still surfaces on the
-          // dashboard with `signalSkipReason`, so the user knows the strategy
-          // fired and was deliberately blocked.
-          this.applyShortGates(signal);
-          if (this.account.hasOpenPositionForSignalType(sym, signal.type)) continue;
-          const recent = this.recentSignals.find(
-            s => s.symbol === signal.symbol && s.type === signal.type && Date.now() - s.timestamp < 5 * 60_000,
+        // TRA-423 — correlation / concentration cap (spec §6) on long entries.
+        let clusterCapMultiplier = 1;
+        if (signal.side === 'buy') {
+          const sizedQty = this.account.sizeFromStop(signal.entryPrice, signal.stopLoss);
+          const mult = this.clusterCapMultiplier(
+            signal,
+            sizedQty,
+            price,
+            this.account.managedEquity(),
+            this.account.getState().openPositions,
           );
-          if (recent) continue;
-
-          // TRA-134: Defer dedup until we know a quote is available so a missing
-          // quote doesn't block the signal from retrying for 5 minutes.
-          const price = prices.get(sym);
-          if (!price) {
-            log.warn('no quote in cache — skipping (will retry next tick)', { sym, signalType: signal.type });
-            continue;
-          }
-
-          // TRA-231 — stamp the active mode so the dashboard scopes Signals
-          // and Open Positions per-mode. Stamping the in-flight signal record
-          // also propagates to the position the demo account opens off it
-          // (`account.openPosition` does not copy `mode`, so we stamp the
-          // returned position too).
-          signal.mode = 'demo';
-          this.recentSignals.unshift(signal);
-          if (this.recentSignals.length > MAX_SIGNALS) this.recentSignals.pop();
-
-          // TRA-261 — suppressed signals still display on the dashboard but
-          // do not open a position. Pre-routing skip strings are set by
-          // `applyShortGates` (universe gate + multiplicative §5 filters) and
-          // by `MeanReversionCryptoStrategy` (off-strategy MR shorts).
-          if (signal.signalSkipReason) continue;
-
-          // TRA-338 — Coinbase-strict entry gate. We trade what Coinbase
-          // trades; if the symbol isn't listed there (e.g. Yahoo's MEGA-USD
-          // pointing at a 2022-delisted "MegaCryptoPolis" token, which gave
-          // TRA-337 a frozen $4.05 entry), we don't open. And even when the
-          // product *is* listed, the entry price MUST come from Coinbase —
-          // otherwise we'd mark the entry off a YF/CMC ghost and watch the
-          // P&L diverge against Coinbase's actual current price the moment
-          // the next refresh lands.
-          const cbListed = isCoinbaseListed(sym);
-          if (cbListed === false) {
-            signal.signalSkipReason = `${sym} not listed on Coinbase Exchange — skipping entry (we only trade what Coinbase trades)`;
+          if (mult === null) {
             log.warn('signal skipped', { sym, signalType: signal.type, reason: signal.signalSkipReason });
             continue;
           }
-          const source = quoteSources.get(sym);
-          if (cbListed === true && source !== 'coinbase') {
-            signal.signalSkipReason = `${sym} listed on Coinbase but no Coinbase quote this tick (got ${source ?? 'no quote'}) — refusing fallback-priced entry`;
-            log.warn('signal skipped', { sym, signalType: signal.type, reason: signal.signalSkipReason });
-            continue;
-          }
-          // cbListed === null → catalog never refreshed successfully. Fall
-          // through to the existing source-based gate; we still refuse non-
-          // Coinbase prices for entries because the cascade may have routed
-          // through Yahoo's ghost ticker. This is the fail-closed branch.
-          if (cbListed === null && source !== 'coinbase') {
-            signal.signalSkipReason = `${sym} no Coinbase quote and Coinbase product catalog unavailable — refusing fallback-priced entry`;
-            log.warn('signal skipped', { sym, signalType: signal.type, reason: signal.signalSkipReason });
-            continue;
-          }
-
-          // TRA-423 — correlation / concentration cap (spec §6) on long
-          // entries. A reject stamps `signalSkipReason` and skips the open; a
-          // scale-down passes the size multiplier through to the broker.
-          let clusterCapMultiplier = 1;
-          if (signal.side === 'buy') {
-            const sizedQty = this.account.sizeFromStop(signal.entryPrice, signal.stopLoss);
-            const mult = this.clusterCapMultiplier(
-              signal,
-              sizedQty,
-              price,
-              this.account.managedEquity(),
-              this.account.getState().openPositions,
-            );
-            if (mult === null) {
-              log.warn('signal skipped', { sym, signalType: signal.type, reason: signal.signalSkipReason });
-              continue;
-            }
-            clusterCapMultiplier = mult;
-          }
-
-          const opened = this.account.openPosition(signal, price, source, clusterCapMultiplier);
-          if (opened) opened.mode = 'demo';
+          clusterCapMultiplier = mult;
         }
-      }
-      if (symbolsSkipped > 0) {
-        log.warn('tick: symbols skipped (no candle data)', { symbolsEvaluated, symbolsSkipped });
+
+        const opened = this.account.openPosition(signal, price, source, clusterCapMultiplier);
+        if (opened) opened.mode = 'demo';
       }
     }
-
-    if (Date.now() - this.lastNewsRefresh > NEWS_REFRESH_MS) {
-      const news = await fetchCryptoNews(this.getActiveSymbols());
-      if (news.length > 0) this.newsCache = news;
-      this.lastNewsRefresh = Date.now();
+    if (symbolsSkipped > 0) {
+      log.warn('tick: symbols skipped (no candle data)', { symbolsEvaluated, symbolsSkipped });
     }
-
-    const state = this.buildState();
-    for (const h of this.handlers) h(state);
   }
 
   /**
    * Live-mode tick: refresh Coinbase balance if stale, exit positions whose
    * TP/SL was hit, then evaluate strategies and open new positions on
    * Coinbase. Mirrors the demo-mode flow but every order hits the broker.
+   *
+   * TRA-480 — candle refresh + freshness verdict are computed once in
+   * `doTick` and passed in. Pre-TRA-480 this method re-ran both on its own,
+   * which doubled the Coinbase API budget once the demo branch also started
+   * ticking on the same minute.
    */
-  private async runLiveTick(prices: Map<string, number>, activeSymbols: string[], quoteSources: Map<string, PositionQuoteSource>): Promise<void> {
+  private async runLiveTick(
+    prices: Map<string, number>,
+    activeSymbols: string[],
+    quoteSources: Map<string, PositionQuoteSource>,
+    staleSymbols: Set<string>,
+  ): Promise<void> {
     const live = this.liveAccount;
     if (!live) return;
 
@@ -1280,8 +1337,10 @@ export class CryptoSignalEngine {
     // wallet holdings above so the dashboard stays accurate, but exit + open
     // order placement are both gated. The user takes manual ownership of any
     // open positions (close via the dashboard or directly on Coinbase) until
-    // they re-enable auto-trading.
-    if (!this.isAutoTradingEnabled()) {
+    // they re-enable auto-trading. TRA-480 — explicit `'live'` so the gate
+    // can't be flipped by an accidental this.mode toggle while this branch
+    // is mid-flight (defensive; this.mode is checked before we get here).
+    if (!this.isAutoTradingEnabled('live')) {
       return;
     }
 
@@ -1306,30 +1365,15 @@ export class CryptoSignalEngine {
       log.warn('live exits error', { reason: err instanceof Error ? err.message : String(err) });
     }
 
-    // Refresh candle caches so live mode evaluates strategies on fresh bars.
-    const CANDLE_BATCH = 5;
-    for (let i = 0; i < activeSymbols.length; i += CANDLE_BATCH) {
-      await Promise.all(
-        activeSymbols.slice(i, i + CANDLE_BATCH).map(sym => this.refreshCandles(sym)),
-      );
-      await Promise.all(
-        activeSymbols.slice(i, i + CANDLE_BATCH).map(sym => this.refreshDailyCandles(sym)),
-      );
-      // TRA-267 — see demo-path equivalent above.
-      await Promise.all(
-        activeSymbols.slice(i, i + CANDLE_BATCH).map(sym => this.refresh4hCandles(sym)),
-      );
-    }
+    // TRA-480 — candle refresh + freshness verdict come from `doTick`. The
+    // duplicate-refresh code that previously lived here is gone; the demo
+    // branch primed the same caches we read below.
 
-    // TRA-418 — data-feed freshness gate, same as the demo path. A stale feed
-    // must never reach the broker with a new entry, so we detect and exclude
-    // stale symbols before strategy evaluation.
-    const staleSymbols = this.markStaleSymbols(activeSymbols);
-
-    // TRA-325 — resolve the active preset once per live tick. Same semantics
-    // as the demo path so verification on demo before flipping to live is
-    // meaningful.
-    const preset = this.resolvePreset();
+    // TRA-325 / TRA-480 — explicit `'live'` so the live branch always
+    // resolves the live preset (LIVE_STRATEGY_PRESET or the user's saved
+    // preset), even when called from a hypothetical future caller with
+    // this.mode still on demo.
+    const preset = this.resolvePreset('live');
     const symbolAllowed = (sym: string) =>
       preset.symbolFilter === null || preset.symbolFilter.includes(sym);
     const strategyEnabled = (s: CryptoStrategyType) => preset.enabledStrategies.includes(s);
@@ -1371,10 +1415,14 @@ export class CryptoSignalEngine {
         // TRA-261 — apply the perp shorts gates BEFORE dedup so suppressed
         // signals still flow to the dashboard's Signals panel with the
         // pre-route reason instead of being silently dropped.
-        this.applyShortGates(signal);
+        this.applyShortGates(signal, 'live');
         if (live.hasOpenPositionForSignalType(sym, signal.type)) continue;
+        // TRA-480 — dedup against live-mode signals only; the demo branch
+        // maintains its own recent-signal window in the same buffer.
         const recent = this.recentSignals.find(
-          s => s.symbol === signal.symbol && s.type === signal.type && Date.now() - s.timestamp < 5 * 60_000,
+          s => s.symbol === signal.symbol && s.type === signal.type
+            && (s.mode ?? 'demo') === 'live'
+            && Date.now() - s.timestamp < 5 * 60_000,
         );
         if (recent) continue;
 
@@ -1662,8 +1710,15 @@ export class CryptoSignalEngine {
     else this.autoTradingEnabledDemo = enabled;
   }
 
-  isAutoTradingEnabled(): boolean {
-    return this.mode === 'live' ? this.autoTradingEnabledLive : this.autoTradingEnabledDemo;
+  /**
+   * TRA-480 — `mode` defaults to `this.mode` so the public API and
+   * `buildState` keep their pre-fix semantics (surface only the active
+   * mode's auto-trading flag). The parallel-tick paths pass an explicit
+   * mode so the demo branch can gate on `autoTradingEnabledDemo` even when
+   * the engine is in live mode.
+   */
+  isAutoTradingEnabled(mode: 'demo' | 'live' = this.mode): boolean {
+    return mode === 'live' ? this.autoTradingEnabledLive : this.autoTradingEnabledDemo;
   }
 
   /**

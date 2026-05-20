@@ -26,6 +26,7 @@ import {
   CRYPTO_FEE_BPS,
   CRYPTO_SLIPPAGE_BPS,
 } from './crypto-account.js';
+import type { PositionQuoteSource, StrategyPreset } from '@trading-app/shared';
 
 // TRA-320 — exercise the CryptoSignalEngine.manualClosePosition wiring against
 // a live account backed by a stubbed Coinbase client. This is the path the
@@ -664,5 +665,181 @@ describe('CryptoSignalEngine — TRA-346 four-bucket sub-account wiring (TRA-349
     expect(live).not.toBeNull();
     expect(live!.managedAccountRatio).toBe(0.33);
     expect(live!.riskPerTrade).toBe(0.02);
+  });
+});
+
+// TRA-480 — parallel demo + live ticking. Before the fix the engine ran one
+// branch per tick: `tick()` checked `this.mode` and either ran the demo
+// paper-account branch OR the live broker branch, never both. That kept the
+// "Crypto Demo idle (0 signals / 0 positions / $0 P&L)" report under TRA-479
+// alive — once the user flipped to live the demo state froze until they
+// switched back, and the candidate-strategy showcase the board cares about
+// under TRA-434's live stand-down went dark. The board's documented
+// expectation (TRA-456) is that the demo dashboard runs `tra405_validated`
+// deterministically regardless of `settings.mode`, so the parallel-tick fix
+// extracts the demo path into `runDemoTick` and runs it unconditionally; the
+// live branch keeps its mode + broker gate. The tests below pin three
+// invariants:
+//
+//   (1) `runDemoTick` runs the demo paper account's `checkExits` against the
+//       passed prices even while `this.mode === 'live'`, so a TP-hit
+//       paper-position closes and lands on the demo history list.
+//   (2) `resolvePreset('demo')` resolves to `tra405_validated` and
+//       `resolvePreset('live')` to the live-side preset (per-user fallback
+//       with no env var set), independent of `this.mode`.
+//   (3) `applyShortGates(signal, 'demo' | 'live')` reads the
+//       open-shorts / closed-shorts feed from the matching branch's book, so
+//       a demo cooldown can't suppress live shorts and vice versa.
+
+interface CryptoSignalEnginePrivateTickInternals {
+  mode: 'demo' | 'live';
+  liveAccount: CryptoLiveAccount | null;
+  account: CryptoPaperAccount;
+  runDemoTick: (
+    prices: Map<string, number>,
+    activeSymbols: string[],
+    quoteSources: Map<string, PositionQuoteSource>,
+    staleSymbols: Set<string>,
+  ) => Promise<void>;
+  resolvePreset: (mode?: 'demo' | 'live') => StrategyPreset;
+  applyShortGates: (signal: TradeSignal, mode?: 'demo' | 'live') => void;
+  countOpenShorts: (mode?: 'demo' | 'live') => number;
+  isAutoTradingEnabled: (mode?: 'demo' | 'live') => boolean;
+}
+
+describe('CryptoSignalEngine — TRA-480 parallel demo + live ticking', () => {
+  beforeEach(() => {
+    vi.spyOn(console, 'log').mockImplementation(() => {});
+    vi.spyOn(console, 'warn').mockImplementation(() => {});
+  });
+
+  it('runs the demo paper-account branch (checkExits) even while mode=live', async () => {
+    const engine = new CryptoSignalEngine();
+    const internal = engine as unknown as CryptoSignalEnginePrivateTickInternals;
+
+    // Seed the demo paper account with an open long position whose TP sits at
+    // 65k. We open at the entry price (60k) so the position fills cleanly.
+    const opened = internal.account.openPosition({
+      id: 'demo-bb-1',
+      symbol: 'BTC-USD',
+      type: 'bb_fade',
+      side: 'buy',
+      entryPrice: 60_000,
+      stopLoss: 59_000,
+      takeProfit: 65_000,
+      riskRewardRatio: 5,
+      timestamp: Date.now(),
+    }, 60_000);
+    expect(opened).not.toBeNull();
+
+    // Flip the engine to live AFTER seeding the demo position (so the open
+    // position predates the live switch — exactly the TRA-479 reproduction).
+    internal.mode = 'live';
+
+    // Run the demo branch directly with a TP-trigger price. Pre-TRA-480 this
+    // branch was unreachable from `doTick` while mode='live'; the very fact
+    // that the method exists and can be invoked is the structural fix. We
+    // verify it actually does work by checking that the paper account's
+    // exit pipeline ran.
+    const prices = new Map<string, number>([['BTC-USD', 70_000]]);
+    const quoteSources = new Map<string, PositionQuoteSource>([['BTC-USD', 'coinbase']]);
+    await internal.runDemoTick(prices, ['BTC-USD'], quoteSources, new Set<string>());
+
+    // checkExits should have closed the long position via TP. The exact
+    // exit price is `tp × (1 − slip)` per the TRA-342 cost model — we just
+    // assert the position is closed and the demo history list picked it up.
+    expect(internal.account.getState().openPositions).toHaveLength(0);
+    const report = engine.getReportSnapshot('demo');
+    expect(report.allClosedPositions).toHaveLength(1);
+    expect(report.allClosedPositions[0]!.mode).toBe('demo');
+    expect(report.allClosedPositions[0]!.symbol).toBe('BTC-USD');
+
+    // Live state is untouched: no live broker initialised in this test, so
+    // the live history list stays empty. This is the (1)-vs-(3) split the
+    // fix is buying — demo state moves forward, live state stays inert.
+    const liveReport = engine.getReportSnapshot('live');
+    expect(liveReport.allClosedPositions).toHaveLength(0);
+  });
+
+  it('resolvePreset(mode) ignores this.mode — demo → tra405_validated, live → per-user', () => {
+    const engine = new CryptoSignalEngine();
+    const internal = engine as unknown as CryptoSignalEnginePrivateTickInternals;
+
+    // Force the engine into live mode. The demo branch's preset MUST still
+    // resolve deterministically to `tra405_validated` (DEMO_PRESET_DEFAULT)
+    // even though `this.mode === 'live'` — that's the TRA-456 contract.
+    internal.mode = 'live';
+    expect(internal.resolvePreset('demo').id).toBe('tra405_validated');
+
+    // With no LIVE_STRATEGY_PRESET env set (default under test) the live
+    // branch falls through to the per-user `activeStrategyPreset`, which
+    // defaults to `legacy_5` when no settings are bound.
+    expect(internal.resolvePreset('live').id).toBe('legacy_5');
+
+    // Sanity: same answers when this.mode='demo'. The branch's preset is a
+    // function of the argument, not of the engine's current mode.
+    internal.mode = 'demo';
+    expect(internal.resolvePreset('demo').id).toBe('tra405_validated');
+    expect(internal.resolvePreset('live').id).toBe('legacy_5');
+  });
+
+  it('isAutoTradingEnabled(mode) reads the per-branch flag, not this.mode', () => {
+    const engine = new CryptoSignalEngine();
+    const internal = engine as unknown as CryptoSignalEnginePrivateTickInternals & {
+      autoTradingEnabledDemo: boolean;
+      autoTradingEnabledLive: boolean;
+    };
+    internal.mode = 'live';
+    internal.autoTradingEnabledDemo = true;
+    internal.autoTradingEnabledLive = false;
+
+    // The demo branch must still be allowed to trade even when the user has
+    // paused live trading (TRA-318 Stop Trading is a live-only switch).
+    expect(internal.isAutoTradingEnabled('demo')).toBe(true);
+    expect(internal.isAutoTradingEnabled('live')).toBe(false);
+    // No-arg overload still surfaces the active mode's flag for legacy
+    // callers (`buildState`, the public getter on the engine).
+    expect(internal.isAutoTradingEnabled()).toBe(false);
+  });
+
+  it('countOpenShorts(mode) routes to the matching branch book', async () => {
+    // The live broker is built lazily and we want both books to be live
+    // sources of truth, not fall-throughs. We attach a real CryptoLiveAccount
+    // with one open short and seed a demo short on the paper account — the
+    // helper must return each book's own count when called with that branch's
+    // mode, not the active engine mode.
+    const engine = new CryptoSignalEngine();
+    const internal = engine as unknown as CryptoSignalEnginePrivateTickInternals;
+
+    // Seed a demo short on the paper account.
+    internal.account.openPosition({
+      id: 'demo-short-1',
+      symbol: 'BTC-USD',
+      type: 'momentum',
+      side: 'sell',
+      entryPrice: 60_000,
+      stopLoss: 61_200,
+      takeProfit: 56_000,
+      riskRewardRatio: 3.3,
+      timestamp: Date.now(),
+    }, 60_000);
+
+    // Build a live broker mirror with no open positions so `countOpenShorts('live')`
+    // returns the live book's true zero (not a demo-book fall-through).
+    const coinbase = new FakeCoinbaseClient();
+    coinbase.listAccounts.mockResolvedValue([
+      {
+        uuid: 'usd', name: 'USD', currency: 'USD',
+        available_balance: { value: '100000', currency: 'USD' },
+        hold: { value: '0', currency: 'USD' },
+      },
+    ]);
+    const liveAccount = new CryptoLiveAccount(asClient(coinbase), { sleep: async () => {} });
+    await liveAccount.refreshBalance();
+    internal.liveAccount = liveAccount;
+
+    // Demo book: 1 open short. Live book: 0.
+    expect(internal.countOpenShorts('demo')).toBe(1);
+    expect(internal.countOpenShorts('live')).toBe(0);
   });
 });
