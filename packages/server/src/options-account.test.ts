@@ -788,27 +788,96 @@ describe('PaperOptionsAccount.reconcileTradierPositions', () => {
     expect(opt.premiumPaid).toBeCloseTo(1.7, 5);
   });
 
-  it('drops imported rows that disappear from Tradier (closed elsewhere)', () => {
+  it('drops imported rows that disappear from Tradier (closed elsewhere) AND records the close into closedOptions (TRA-475)', () => {
     const acct = new PaperOptionsAccount({ initialEquity: 25_000, tradierEnv: 'sandbox' });
     acct.reconcileTradierPositions([
-      buildTradierPosition({ optionSymbol: 'SPY260515C00450000' }),
+      buildTradierPosition({ optionSymbol: 'SPY260515C00450000', premiumPaid: 1.6 }),
       buildTradierPosition({
         optionSymbol: 'AAPL260920P00187500',
         underlying: 'AAPL',
         optionType: 'put',
         strike: 187.5,
         expiration: '2026-09-20',
+        contracts: 1,
+        premiumPaid: 2.0,
       }),
     ]);
     expect(acct.getState().openOptions).toHaveLength(2);
+    // Refresh the AAPL mark — what `refreshImportedMarks` would do after a
+    // quote fetch — so the externally-closed row gets a realistic exit
+    // estimate instead of break-even.
+    acct.refreshImportedMarks(new Map([['AAPL260920P00187500', 2.5]]));
 
     const summary = acct.reconcileTradierPositions([
-      buildTradierPosition({ optionSymbol: 'SPY260515C00450000' }),
+      buildTradierPosition({ optionSymbol: 'SPY260515C00450000', premiumPaid: 1.6 }),
     ]);
     expect(summary).toEqual({ added: 0, updated: 0, removed: 1, total: 1 });
     const open = acct.getState().openOptions;
     expect(open).toHaveLength(1);
     expect(open[0].optionSymbol).toBe('SPY260515C00450000');
+
+    // TRA-475 — the dropped imported position must surface as a Closed Today
+    // row so the user can see it (previously it silently disappeared).
+    const closed = acct.getState().closedOptions;
+    expect(closed).toHaveLength(1);
+    expect(closed[0].optionSymbol).toBe('AAPL260920P00187500');
+    expect(closed[0].importedFromTradier).toBe(true);
+    // Exit premium = last refreshed mark (2.5), realised = (2.5 − 2.0) × 1 × 100 = +50.
+    expect(closed[0].currentPremium).toBeCloseTo(2.5, 5);
+    expect(closed[0].pnl).toBeCloseTo(50, 5);
+    // And realised P&L lands on the live bucket immediately (the dashboard
+    // pill no longer waits for the EOD Tradier-history reconcile).
+    expect(acct.getStateForMode('live').optionsPnl).toBeCloseTo(50, 5);
+  });
+
+  // TRA-475 — when an imported position has no fresh mark (`currentPremium`
+  // is 0 or still equal to `premiumPaid` because `refreshImportedMarks` hasn't
+  // landed), recording a synthetic close still has to fire so the row appears
+  // in the Closed Today table. The pnl falls back to 0 and the EOD Tradier
+  // history reconcile corrects the cumulative pill on its next pass via the
+  // existing `realtimeImportedPnlByDate` dedup.
+  it('records a break-even synthetic close when an externally-closed import has no fresh mark (TRA-475)', () => {
+    const acct = new PaperOptionsAccount({ initialEquity: 25_000, tradierEnv: 'sandbox' });
+    acct.reconcileTradierPositions([
+      buildTradierPosition({ optionSymbol: 'SPY260515C00450000', premiumPaid: 1.6 }),
+    ]);
+    // No `refreshImportedMarks` — currentPremium is still 1.6 (the seed value
+    // from reconcile). The "fresh mark" guard treats `currentPremium ===
+    // premiumPaid` as the no-refresh case in practice; the synthetic close
+    // still records, with pnl = 0.
+    const summary = acct.reconcileTradierPositions([]);
+    expect(summary).toEqual({ added: 0, updated: 0, removed: 1, total: 0 });
+    const closed = acct.getState().closedOptions;
+    expect(closed).toHaveLength(1);
+    expect(closed[0].pnl).toBeCloseTo(0, 5);
+    // Live pill unchanged at $0 — the EOD reconcile will land the broker-side
+    // P&L when it next runs, and the realtime dedup map is empty for this
+    // case so no double-count.
+    expect(acct.getStateForMode('live').optionsPnl).toBe(0);
+  });
+
+  // TRA-475 — the synthetic close from the portfolio-reconcile drop feeds
+  // `realtimeImportedPnlByDate` so the EOD Tradier-history reconcile path
+  // can subtract our estimate via `consumeRealtimeImportedPnl` before adding
+  // broker-truth P&L. Without this, the same close would be double-counted
+  // (once here, once when its Tradier history fill lands).
+  it('externally-closed import dedups against the EOD Tradier-history reconcile (TRA-475)', () => {
+    const acct = new PaperOptionsAccount({ initialEquity: 25_000, tradierEnv: 'sandbox' });
+    // Default Tradier position has 2 contracts; realised on close = (mark − paid) × 2 × 100.
+    acct.reconcileTradierPositions([
+      buildTradierPosition({ optionSymbol: 'SPY260515C00450000', premiumPaid: 1.6 }),
+    ]);
+    acct.refreshImportedMarks(new Map([['SPY260515C00450000', 1.8]]));
+    // External close: position disappears from Tradier's payload.
+    acct.reconcileTradierPositions([]);
+    // Live pill jumped immediately by our estimate: +$40 = (1.8 − 1.6) × 2 × 100.
+    expect(acct.getStateForMode('live').optionsPnl).toBeCloseTo(40, 5);
+    // The dedup map carries the same +$40 so the EOD reconcile can subtract
+    // it before applying broker truth — no double-count when Tradier history
+    // returns this fill on the next sweep.
+    const realtime = acct.consumeRealtimeImportedPnl();
+    const drained = Array.from(realtime.values()).reduce((a, b) => a + b, 0);
+    expect(drained).toBeCloseTo(40, 5);
   });
 
   it('leaves engine-opened positions untouched even when Tradier reports the same OCC', () => {

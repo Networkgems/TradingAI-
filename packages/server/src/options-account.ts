@@ -1433,14 +1433,38 @@ export class PaperOptionsAccount {
     let updated = 0;
     let removed = 0;
 
-    // Drop imported positions Tradier no longer reports (closed elsewhere).
+    // TRA-475 — imported positions Tradier no longer reports were closed
+    // externally (Tradier web UI, or filled outside our reconcile window).
+    // Previously the position was silently `delete`'d here, which:
+    //   1. dropped the row from the Open Options table with no `Closed Today`
+    //      entry — the user saw the position vanish but no realised P&L row
+    //      appeared, so it looked like the close never happened; and
+    //   2. left realised P&L attribution to the daily EOD Tradier-history
+    //      reconcile, which means the dashboard pill lagged the broker by up
+    //      to 24h when the user just closed something on Tradier.
+    // Route the removal through `recordImportedFill` instead: it pushes a
+    // `closedOptions` row mirroring the broker close, attributes realised P&L
+    // via `applyRealtimeImportedPnl` (so the Live pill updates immediately),
+    // AND records the realtime amount per-date so the next EOD history
+    // reconcile dedupes via `consumeRealtimeImportedPnl` instead of
+    // double-counting the same fill.
+    //
+    // `currentPremium` is our best-effort exit estimate — `refreshImportedMarks`
+    // populates it from the quote cache. When it's stale or absent (≤ 0 or
+    // never refreshed) we fall back to `premiumPaid` so the row at least
+    // appears at break-even; the EOD history reconcile will subtract our
+    // estimate and add the broker-truth realised so the cumulative pill
+    // self-corrects on the next pass.
     for (const [id, opt] of this.openOptions) {
       if (!opt.importedFromTradier) continue;
       if (!opt.optionSymbol) continue;
-      if (!tradierBySymbol.has(opt.optionSymbol)) {
-        this.openOptions.delete(id);
-        removed += 1;
-      }
+      if (tradierBySymbol.has(opt.optionSymbol)) continue;
+      const estimatedFill =
+        Number.isFinite(opt.currentPremium) && opt.currentPremium > 0
+          ? opt.currentPremium
+          : opt.premiumPaid;
+      this.recordImportedFill(id, estimatedFill);
+      removed += 1;
     }
 
     for (const incoming of positions) {
