@@ -224,6 +224,15 @@ export class PaperOptionsAccount {
    * aggregate.
    */
   private optionsPnlByMode: Record<AccountMode, number> = { demo: 0, live: 0 };
+  /**
+   * TRA-475 — per-mode opening realized P&L baseline for the current ET-day.
+   * Rolled forward by {@link resetDayIfNeeded}; `dailyOptionsPnl(mode)` then
+   * returns `optionsPnlByMode[mode] − openingOptionsPnlByMode[mode]` plus the
+   * live MTM on currently-open positions for that mode, so the dashboard
+   * "Daily Opts P&L" pill resets at the same boundary as the equity Daily P&L
+   * pill instead of carrying yesterday's realized P&L forward forever.
+   */
+  private openingOptionsPnlByMode: Record<AccountMode, number> = { demo: 0, live: 0 };
   private dailyCount = 0;
   /**
    * Per-source counters retained so the badge `n/N` display can attribute
@@ -326,6 +335,9 @@ export class PaperOptionsAccount {
     this.openOptions.clear();
     this.closedOptions = [];
     this.optionsPnlByMode = { demo: 0, live: 0 };
+    // TRA-475 — rebase the daily baseline on reset so the next "Daily Opts P&L"
+    // sample starts at 0 (matches realized buckets that just zeroed).
+    this.openingOptionsPnlByMode = { demo: 0, live: 0 };
     this.dailyCount = 0;
     this.dailyOtmCount = 0;
     this.dailyRvCount = 0;
@@ -403,11 +415,59 @@ export class PaperOptionsAccount {
     return this.optionsPnlByMode.demo + this.optionsPnlByMode.live;
   }
 
+  /**
+   * TRA-475 — mark-to-market unrealized P&L on currently-open long options
+   * for a mode. Mirrors `StockOptionsPanel`'s per-row formula
+   * (`(currentPremium − premiumPaid) × contractsRemaining × 100`) so the
+   * dashboard's pill and the per-row column agree. Positions without a fresh
+   * mark (`currentPremium ≤ 0` or `premiumPaid ≤ 0`) contribute 0, matching
+   * the panel's "no mark, no contribution" rendering rather than synthesising
+   * a P&L from stale data.
+   */
+  private unrealizedPnlForMode(mode: AccountMode): number {
+    let total = 0;
+    for (const opt of this.openOptions.values()) {
+      if ((opt.mode ?? 'demo') !== mode) continue;
+      if (!Number.isFinite(opt.currentPremium) || opt.currentPremium <= 0) continue;
+      if (!Number.isFinite(opt.premiumPaid) || opt.premiumPaid <= 0) continue;
+      const remaining = opt.contractsRemaining ?? opt.contracts;
+      if (!Number.isFinite(remaining) || remaining <= 0) continue;
+      total += (opt.currentPremium - opt.premiumPaid) * remaining * 100;
+    }
+    return total;
+  }
+
+  /**
+   * TRA-475 — today's options P&L for a mode: realized delta since the
+   * ET-midnight rollover plus the live MTM on currently-open positions for
+   * that mode. Mirrors the equity `AccountState.dailyPnl` semantics so the
+   * dashboard pill resets at the same boundary instead of carrying yesterday's
+   * realized P&L forward forever.
+   *
+   * Pure read — does not mutate `currentDayKey` / `openingOptionsPnlByMode`.
+   * The opening baseline only rolls forward when an entry path fires
+   * {@link resetDayIfNeeded}; on a day-crossed read with no new entries we
+   * still want the pill to display 0 (today started at the prior cumulative),
+   * so we short-circuit the realized delta to 0 when the stored day key is
+   * stale. The unrealized MTM term keeps tracking live mark drift either
+   * way — that's the part the user notices first after midnight.
+   */
+  private dailyOptionsPnlForMode(mode: AccountMode): number {
+    const today = toDateKey(Date.now());
+    const realizedDelta = today === this.currentDayKey
+      ? this.optionsPnlByMode[mode] - this.openingOptionsPnlByMode[mode]
+      : 0;
+    return realizedDelta + this.unrealizedPnlForMode(mode);
+  }
+
   getState(): OptionsAccountState {
     return {
       openOptions: Array.from(this.openOptions.values()),
       closedOptions: [...this.closedOptions].slice(-20),
       optionsPnl: this.totalOptionsPnl(),
+      // TRA-475 — bucket-wide daily P&L: sum of per-mode daily deltas + MTM.
+      dailyOptionsPnl:
+        this.dailyOptionsPnlForMode('demo') + this.dailyOptionsPnlForMode('live'),
       optionsCash: this.cash,
       dailyOptionsCount: this.dailyCount + this.dailyOtmCount + this.dailyRvCount,
       // TRA-374 — surface the cumulative demo cost-model drag so the dashboard
@@ -441,6 +501,8 @@ export class PaperOptionsAccount {
       openOptions: Array.from(this.openOptions.values()).filter(matches),
       closedOptions: this.closedOptions.filter(matches).slice(-20),
       optionsPnl: this.optionsPnlByMode[mode],
+      // TRA-475 — per-mode daily P&L drives the dashboard "Daily Opts P&L" pill.
+      dailyOptionsPnl: this.dailyOptionsPnlForMode(mode),
       optionsCash: mode === 'demo' ? 0 : this.cash,
       dailyOptionsCount: this.dailyCount + this.dailyOtmCount + this.dailyRvCount,
       // TRA-374 — the cost model is demo-only by construction; live mode
@@ -552,6 +614,11 @@ export class PaperOptionsAccount {
       this.dailyCount = 0;
       this.dailyOtmCount = 0;
       this.dailyRvCount = 0;
+      // TRA-475 — snapshot per-mode realized P&L so the next day's
+      // `dailyOptionsPnl` starts from a fresh 0 even though the cumulative
+      // `optionsPnlByMode` keeps growing (EOD report / PnlTracker still need
+      // the all-time bucket).
+      this.openingOptionsPnlByMode = { ...this.optionsPnlByMode };
       this.currentDayKey = today;
     }
   }
@@ -1857,6 +1924,14 @@ export class PaperOptionsAccount {
      * missing one or both keys).
      */
     optionsPnlByMode?: Partial<Record<AccountMode, number>>;
+    /**
+     * TRA-475 — per-mode opening realized P&L for the current ET-day.
+     * Persisted so a server restart mid-day keeps the "Daily Opts P&L" pill
+     * anchored to today's opening baseline instead of resetting to 0 (which
+     * would make a restart look like the day just started — wrong if any
+     * realized P&L already booked today).
+     */
+    openingOptionsPnlByMode?: Partial<Record<AccountMode, number>>;
     dailyCount: number;
     dailyOtmCount?: number;
     dailyRvCount?: number;
@@ -1871,6 +1946,7 @@ export class PaperOptionsAccount {
       closedOptions: [...this.closedOptions],
       optionsPnl: this.totalOptionsPnl(),
       optionsPnlByMode: { ...this.optionsPnlByMode },
+      openingOptionsPnlByMode: { ...this.openingOptionsPnlByMode },
       dailyCount: this.dailyCount,
       dailyOtmCount: this.dailyOtmCount,
       dailyRvCount: this.dailyRvCount,
@@ -1894,6 +1970,14 @@ export class PaperOptionsAccount {
      * one-shot reset already wiped pre-fix state).
      */
     optionsPnlByMode?: Partial<Record<AccountMode, number>>;
+    /**
+     * TRA-475 — per-mode opening baseline for "today". Older snapshots don't
+     * carry it; legacy restores fall back to the current `optionsPnlByMode`
+     * so the post-restart pill samples 0 today (we have no way to recover
+     * the morning baseline; this matches the equity Daily P&L behaviour of
+     * a freshly-rebased account).
+     */
+    openingOptionsPnlByMode?: Partial<Record<AccountMode, number>>;
     dailyCount: number;
     /** Added in TRA-160 — older snapshots don't have it; default to 0. */
     dailyOtmCount?: number;
@@ -1913,6 +1997,17 @@ export class PaperOptionsAccount {
       };
     } else {
       this.optionsPnlByMode = { demo: 0, live: snap.optionsPnl };
+    }
+    if (snap.openingOptionsPnlByMode) {
+      this.openingOptionsPnlByMode = {
+        demo: snap.openingOptionsPnlByMode.demo ?? 0,
+        live: snap.openingOptionsPnlByMode.live ?? 0,
+      };
+    } else {
+      // TRA-475 — legacy snapshot: anchor the opening baseline to current
+      // cumulative so today's daily pill starts at 0 (we don't have history
+      // for what the realized P&L was at 00:00 ET).
+      this.openingOptionsPnlByMode = { ...this.optionsPnlByMode };
     }
     this.dailyCount = snap.dailyCount;
     this.dailyOtmCount = snap.dailyOtmCount ?? 0;

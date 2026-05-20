@@ -51,6 +51,12 @@ export interface OptionsBucketSnapshot {
    * bucket (demo cannot open options under TRA-220).
    */
   optionsPnlByMode?: Partial<Record<AccountMode, number>>;
+  /**
+   * TRA-475 — per-mode opening realized P&L for the current ET-day, used
+   * to compute the dashboard "Daily Opts P&L" pill. Optional for back-compat;
+   * legacy snapshots have the bucket re-anchor to current cumulative on import.
+   */
+  openingOptionsPnlByMode?: Partial<Record<AccountMode, number>>;
   dailyCount: number;
   /** Added in TRA-160 — older snapshots may be missing it. */
   dailyOtmCount?: number;

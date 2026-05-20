@@ -111,10 +111,24 @@ export function DashboardHeader({
                 <div className="stat-divider" />
                 <div className="stat-group">
                   <div className="stat">
-                    <span className="stat-label">Opts P&amp;L</span>
-                    <span className={`stat-value ${optionsState.optionsPnl >= 0 ? 'green' : 'red'}`}>
-                      {fmtDollar(optionsState.optionsPnl)}
-                    </span>
+                    {/* TRA-475 — pill shows today's options P&L (realized
+                        delta since ET-midnight + live MTM on open contracts)
+                        so it resets daily, mirroring the equity Daily P&L pill
+                        instead of holding yesterday's cumulative realized
+                        forever. Cumulative "Total Options P&L" is still shown
+                        on the Options tab footer. Legacy state files without
+                        `dailyOptionsPnl` fall back to `optionsPnl` so a
+                        first-tick render before the server rolls forward
+                        doesn't render `$NaN`. */}
+                    <span className="stat-label">Daily Opts P&amp;L</span>
+                    {(() => {
+                      const dailyOptsPnl = optionsState.dailyOptionsPnl ?? optionsState.optionsPnl;
+                      return (
+                        <span className={`stat-value ${dailyOptsPnl >= 0 ? 'green' : 'red'}`}>
+                          {fmtDollar(dailyOptsPnl)}
+                        </span>
+                      );
+                    })()}
                   </div>
                   <div className="stat">
                     <span className="stat-label">Options</span>

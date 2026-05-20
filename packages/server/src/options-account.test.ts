@@ -590,6 +590,133 @@ describe('PaperOptionsAccount.getStateForMode — per-mode P&L (TRA-246)', () =>
     expect(acct.getState().optionsPnl).toBe(524.50);
   });
 
+  // ─── TRA-475: Daily-reset Opts P&L pill ────────────────────────────────────
+  describe('PaperOptionsAccount — dailyOptionsPnl daily reset (TRA-475)', () => {
+    it('returns 0 on day one with no closes and no marks', () => {
+      const acct = new PaperOptionsAccount({ initialEquity: 50_000, managedAccountRatio: 0.5 });
+      expect(acct.getStateForMode('live').dailyOptionsPnl).toBe(0);
+      expect(acct.getStateForMode('demo').dailyOptionsPnl).toBe(0);
+      expect(acct.getState().dailyOptionsPnl).toBe(0);
+    });
+
+    it('today\'s realized loss surfaces in dailyOptionsPnl AND in cumulative optionsPnl', () => {
+      const acct = new PaperOptionsAccount({ initialEquity: 50_000, managedAccountRatio: 0.5 });
+      const pos = acct.openOptionFromCandidate(buildSignal({ mark: 1.0 }), 'live');
+      expect(pos).not.toBeNull();
+      // SL fill → realized loss booked into the live bucket.
+      acct.checkExits(new Map(), new Map([[pos!.optionSymbol!, 0.75]]), 'live');
+      const live = acct.getStateForMode('live');
+      // Cumulative and daily both reflect the loss on day one (opening baseline = 0).
+      expect(live.optionsPnl).toBeLessThan(0);
+      expect(live.dailyOptionsPnl).toBeCloseTo(live.optionsPnl, 5);
+    });
+
+    it('rolls the opening baseline forward on the next ET day — daily pill resets, cumulative persists', () => {
+      const acct = new PaperOptionsAccount({ initialEquity: 50_000, managedAccountRatio: 0.5 });
+      const pos = acct.openOptionFromCandidate(buildSignal({ mark: 1.0 }), 'live');
+      acct.checkExits(new Map(), new Map([[pos!.optionSymbol!, 0.75]]), 'live');
+      const liveBefore = acct.getStateForMode('live');
+      expect(liveBefore.dailyOptionsPnl).toBeLessThan(0);
+      const cumulative = liveBefore.optionsPnl;
+
+      // Advance the clock past ET midnight so the next sample triggers
+      // the daily rollover. `getStateForMode` itself calls resetDayIfNeeded
+      // so we don't need to open a new position to force the rollover.
+      vi.setSystemTime(TRADING_TIME + 24 * 60 * 60 * 1000);
+
+      const liveAfter = acct.getStateForMode('live');
+      // Cumulative realized survives the day change; daily delta resets to 0.
+      expect(liveAfter.optionsPnl).toBeCloseTo(cumulative, 5);
+      expect(liveAfter.dailyOptionsPnl).toBe(0);
+    });
+
+    it('dailyOptionsPnl includes unrealized MTM on currently-open positions for that mode', () => {
+      const acct = new PaperOptionsAccount({ initialEquity: 50_000, managedAccountRatio: 0.5 });
+      const pos = acct.openOptionFromCandidate(buildSignal({ mark: 1.0 }), 'live');
+      expect(pos).not.toBeNull();
+      // Mark the live position up (no exit) → only contributes via unrealized.
+      const opened = acct.getStateForMode('live').openOptions[0];
+      opened.currentPremium = 1.25;
+      const live = acct.getStateForMode('live');
+      // Unrealized = (1.25 − 1.00) × contracts × 100, fully credited to "today"
+      // because the position was opened today and nothing's closed.
+      const expectedUnrealized = (1.25 - 1.0) * opened.contractsRemaining * 100;
+      expect(live.dailyOptionsPnl).toBeCloseTo(expectedUnrealized, 5);
+      // No closes ⇒ cumulative realized still 0; the daily pill is the only
+      // place the MTM shows up at the header.
+      expect(live.optionsPnl).toBe(0);
+    });
+
+    it('open position without a fresh mark (currentPremium = 0) contributes 0 — no NaN from a stale tick', () => {
+      const acct = new PaperOptionsAccount({ initialEquity: 50_000, managedAccountRatio: 0.5 });
+      acct.openOptionFromCandidate(buildSignal({ mark: 1.0 }), 'live');
+      const opened = acct.getStateForMode('live').openOptions[0];
+      opened.currentPremium = 0; // stale: scanner hasn't populated a mark yet
+      const live = acct.getStateForMode('live');
+      expect(live.dailyOptionsPnl).toBe(0);
+      expect(Number.isFinite(live.dailyOptionsPnl)).toBe(true);
+    });
+
+    it('per-mode daily pill is isolated — live MTM does not leak into demo dashboard', () => {
+      const acct = new PaperOptionsAccount({ initialEquity: 50_000, managedAccountRatio: 0.5 });
+      acct.openOptionFromCandidate(buildSignal({ mark: 1.0 }), 'live');
+      const opened = acct.getStateForMode('live').openOptions[0];
+      opened.currentPremium = 1.50; // live MTM gain
+      expect(acct.getStateForMode('live').dailyOptionsPnl).toBeGreaterThan(0);
+      // Demo dashboard sees $0 — the TRA-246 cross-mode shield extended to
+      // the daily pill so a Demo viewer doesn't see Live's MTM.
+      expect(acct.getStateForMode('demo').dailyOptionsPnl).toBe(0);
+    });
+
+    it('legacy snapshot without openingOptionsPnlByMode anchors baseline at current cumulative (post-restart pill = 0)', () => {
+      const acct = new PaperOptionsAccount({ initialEquity: 50_000, managedAccountRatio: 0.5 });
+      // Pre-TRA-475 snapshot: per-mode realized P&L only.
+      acct.importSnapshot({
+        openOptions: [],
+        closedOptions: [],
+        optionsPnl: -19_471,
+        optionsPnlByMode: { demo: 0, live: -19_471 },
+        dailyCount: 1,
+        currentDayKey: '2026-05-20',
+        cash: 64_224.32,
+        equity: 50_000 - 19_471,
+      });
+      // Cumulative survives the import.
+      expect(acct.getStateForMode('live').optionsPnl).toBeCloseTo(-19_471, 5);
+      // Daily resets to 0 — the rollover-from-snapshot can't reconstruct
+      // when today's losses booked, so it anchors to "now" and starts fresh.
+      // This is the exact symptom the user filed TRA-475 against (header
+      // showing a huge negative cumulative as if it were today's number).
+      expect(acct.getStateForMode('live').dailyOptionsPnl).toBe(0);
+    });
+
+    it('round-trips openingOptionsPnlByMode through export/import once an entry rolls it forward', () => {
+      const a = new PaperOptionsAccount({ initialEquity: 50_000, managedAccountRatio: 0.5 });
+      const pos = a.openOptionFromCandidate(buildSignal({ mark: 1.0 }), 'live');
+      a.checkExits(new Map(), new Map([[pos!.optionSymbol!, 0.75]]), 'live');
+      const dayOnePnl = a.getStateForMode('live').optionsPnl;
+
+      // Advance to day two and open a fresh position — the entry path's
+      // `resetDayIfNeeded()` is what actually rolls the opening baseline,
+      // so the snapshot reflects "today started at the prior cumulative".
+      vi.setSystemTime(TRADING_TIME + 24 * 60 * 60 * 1000);
+      a.openOptionFromCandidate(buildSignal({ id: 's-d2', optionSymbol: 'AAPL240712C00200000', mark: 1.0 }), 'live');
+
+      const snap = a.exportSnapshot();
+      expect(snap.openingOptionsPnlByMode).toBeDefined();
+      expect(snap.openingOptionsPnlByMode!.live).toBeCloseTo(dayOnePnl, 5);
+
+      const b = new PaperOptionsAccount({ initialEquity: 50_000, managedAccountRatio: 0.5 });
+      b.importSnapshot(snap);
+      // After import, the per-mode opening baseline persisted so cumulative
+      // realized is preserved (the EOD / PnlTracker view).
+      expect(b.getStateForMode('live').optionsPnl).toBeCloseTo(dayOnePnl, 5);
+      // The day-two position has no mark yet, so its unrealized contribution
+      // is 0, and realized hasn't moved since the roll — daily pill = 0.
+      expect(b.getStateForMode('live').dailyOptionsPnl).toBe(0);
+    });
+  });
+
   it('round-trips per-mode P&L via export/import', () => {
     const a = new PaperOptionsAccount({ initialEquity: 50_000, managedAccountRatio: 0.5 });
     const pos = a.openOptionFromCandidate(buildSignal({ mark: 1.0 }), 'live');

@@ -207,4 +207,59 @@ describe('DashboardHeader (TRA-422)', () => {
     expect(screen.getByText('LIVE')).toBeInTheDocument();
     expect(screen.getByRole('button', { name: /Stop Trading/ })).toBeInTheDocument();
   });
+
+  // TRA-475 — the options pill in the header reads today's options P&L,
+  // not the cumulative realized number. The bug the issue filed against
+  // was the pill showing yesterday's cumulative (e.g. −$19,471 with no
+  // option closes today). Lock in the new contract: render `dailyOptionsPnl`
+  // and prefer it over the cumulative `optionsPnl` when both are present.
+  it('renders Daily Opts P&L from optionsState.dailyOptionsPnl, not cumulative optionsPnl', () => {
+    renderWithToast(
+      <DashboardHeader
+        token="t" account={account}
+        optionsState={{
+          openOptions: [], closedOptions: [],
+          // Cumulative realized = a big negative; pill must IGNORE it.
+          optionsPnl: -19_471,
+          // Today's P&L = a small loss the engine is reporting fresh.
+          dailyOptionsPnl: -91.99,
+          optionsCash: 64_224.32, dailyOptionsCount: 1,
+        }}
+        openPositionsCount={0} openOptionsCount={3} optionsDailyLimit={10}
+        connected={true} lastTick={Date.now()} autoTradingEnabled={true}
+        accountMode="live" onAccountModeChange={() => {}}
+        theme="dark" onToggleTheme={() => {}} isAdmin={false}
+        onOpenProfileModal={() => {}} onGoHome={() => {}} onLogout={() => {}}
+      />,
+    );
+    expect(screen.getByText('Daily Opts P&L')).toBeInTheDocument();
+    // The new value renders; the cumulative does not appear in the header.
+    expect(screen.getByText(/−\$91\.99|-\$91\.99/)).toBeInTheDocument();
+    expect(screen.queryByText(/19,471/)).not.toBeInTheDocument();
+  });
+
+  // TRA-475 back-compat: a server snapshot that pre-dates `dailyOptionsPnl`
+  // (e.g. older deploy still in flight while the desktop updates) must not
+  // render `$NaN` or crash; falls back to the cumulative `optionsPnl` until
+  // the server upgrades.
+  it('falls back to optionsPnl when dailyOptionsPnl is missing from the server payload', () => {
+    renderWithToast(
+      <DashboardHeader
+        token="t" account={account}
+        optionsState={{
+          openOptions: [], closedOptions: [],
+          optionsPnl: 12.50,
+          // dailyOptionsPnl intentionally omitted — simulates legacy server.
+          optionsCash: 25_000, dailyOptionsCount: 0,
+        }}
+        openPositionsCount={0} openOptionsCount={0} optionsDailyLimit={10}
+        connected={true} lastTick={Date.now()} autoTradingEnabled={true}
+        accountMode="demo" onAccountModeChange={() => {}}
+        theme="dark" onToggleTheme={() => {}} isAdmin={false}
+        onOpenProfileModal={() => {}} onGoHome={() => {}} onLogout={() => {}}
+      />,
+    );
+    expect(screen.getByText('Daily Opts P&L')).toBeInTheDocument();
+    expect(screen.getByText(/\$12\.50/)).toBeInTheDocument();
+  });
 });

@@ -1461,6 +1461,15 @@ export interface OptionsAccountState {
   openOptions: OptionPosition[];
   closedOptions: OptionPosition[];
   optionsPnl: number;
+  /**
+   * TRA-475 — today's options P&L for the requested mode: realized delta
+   * since the most recent ET-midnight rollover (`optionsPnl − opening`) plus
+   * the live mark-to-market on currently-open positions for that mode. Mirrors
+   * the equity `AccountState.dailyPnl` semantics so the dashboard "Daily Opts
+   * P&L" pill can reset at the same boundary instead of accumulating yesterday's
+   * realized P&L. Optional for back-compat with older persisted state files.
+   */
+  dailyOptionsPnl?: number;
   optionsCash: number;
   dailyOptionsCount: number;  // number of options opened today (resets at market open)
   /**
