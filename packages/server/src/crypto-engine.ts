@@ -541,6 +541,14 @@ export class CryptoSignalEngine {
       : '(no filter — all watchlist symbols)';
     log.info('startup preset', {
       id: startupPreset.id,
+      // TRA-479 — surface the engine mode and BOTH preset env vars so a future
+      // "demo dashboard idle" triage can read the boot log instead of guessing.
+      // Pre-479, only FORCED_PRESET_ENV (live) was logged, which made it
+      // impossible to tell from logs whether the demo branch was on `legacy_5`
+      // (env override) or just inactive because mode === 'live'.
+      mode: this.mode,
+      liveEnv: FORCED_PRESET_ENV,
+      demoEnv: DEMO_PRESET_ENV,
       env: FORCED_PRESET_ENV,
       strategies: startupPreset.enabledStrategies,
       symbolFilter: filterStr,
