@@ -2372,112 +2372,53 @@ describe('TRA-389 — market-review regime gates', () => {
     };
   }
 
-  describe('gateSignalOnReview — per-gate suppression paths', () => {
-    it('orbLongs=false suppresses ORB longs but not ORB shorts', () => {
-      const g = gates({ orbLongs: false });
-      expect(gateSignalOnReview(sig({ side: 'buy' }), g)).toMatch(/ORB longs gated off/);
-      expect(gateSignalOnReview(sig({ side: 'sell' }), g)).toBeNull();
+  describe('gateSignalOnReview / describeGatedStrategies — TRA-474 deprecation', () => {
+    // TRA-389 / TRA-469 / TRA-472 originally let the premarket regime gate
+    // suppress ORB signals and the dashboard report which legs were gated
+    // off. TRA-474 removed that dependency on 2026-05-20 — a wrong report
+    // could silently kill every ticket for the day. Both functions are
+    // retained for ABI continuity, but the bodies are now no-ops. These
+    // tests pin that contract so a future refactor can't re-introduce the
+    // dependency accidentally.
+    it('gateSignalOnReview returns null for every ORB gate configuration', () => {
+      const cases: Partial<MarketReviewGates>[] = [
+        {},
+        { orbLongs: false },
+        { orbShorts: false },
+        { breakoutsEnabled: false },
+        { orbLongs: false, orbShorts: false, breakoutsEnabled: false },
+        { orbLongs: false, trendState: 'down' },
+        { orbLongs: false, trendState: 'unknown' },
+        { orbShorts: false, trendState: 'unknown' },
+        { meanReversionTilt: false },
+        { meanReversionTilt: true },
+      ];
+      for (const g of cases) {
+        expect(gateSignalOnReview(sig({ side: 'buy' }), gates(g))).toBeNull();
+        expect(gateSignalOnReview(sig({ side: 'sell' }), gates(g))).toBeNull();
+      }
     });
 
-    it('orbShorts=false suppresses ORB shorts but not ORB longs', () => {
-      const g = gates({ orbShorts: false });
-      expect(gateSignalOnReview(sig({ side: 'sell' }), g)).toMatch(/ORB shorts gated off/);
-      expect(gateSignalOnReview(sig({ side: 'buy' }), g)).toBeNull();
-    });
-
-    it('breakoutsEnabled=false suppresses every ORB signal regardless of side', () => {
-      const g = gates({ breakoutsEnabled: false });
-      expect(gateSignalOnReview(sig({ side: 'buy' }), g)).toMatch(/Breakouts disabled/);
-      expect(gateSignalOnReview(sig({ side: 'sell' }), g)).toMatch(/Breakouts disabled/);
-    });
-
-    it('all gates open routes the signal (no suppression reason)', () => {
-      expect(gateSignalOnReview(sig({ side: 'buy' }), gates())).toBeNull();
-      expect(gateSignalOnReview(sig({ side: 'sell' }), gates())).toBeNull();
-    });
-
-    it('never suppresses non-breakout strategies (bb_fade / ichimoku)', () => {
-      // Even with every ORB-relevant gate slammed shut, bb_fade and ichimoku
-      // are not breakout strategies and route normally — meanReversionTilt is
-      // a regime *tilt*, not a kill-switch.
+    it('gateSignalOnReview returns null for non-ORB strategies regardless of gate state', () => {
       const g = gates({ orbLongs: false, orbShorts: false, breakoutsEnabled: false });
       expect(gateSignalOnReview(sig({ type: 'bb_fade', side: 'buy' }), g)).toBeNull();
       expect(gateSignalOnReview(sig({ type: 'bb_fade', side: 'sell' }), g)).toBeNull();
       expect(gateSignalOnReview(sig({ type: 'ichimoku', side: 'buy' }), g)).toBeNull();
     });
 
-    it('meanReversionTilt does not gate any signal on its own', () => {
-      // Tilt off vs on must not change routing — it is surfaced as regime
-      // context only. bb_fade routes in both cases.
-      expect(gateSignalOnReview(sig({ type: 'bb_fade' }), gates({ meanReversionTilt: false }))).toBeNull();
-      expect(gateSignalOnReview(sig({ type: 'bb_fade' }), gates({ meanReversionTilt: true }))).toBeNull();
-    });
-
-    // TRA-469 — the orbLongs suppression reason must name the *real* cause:
-    // a genuine downtrend vs. an unreadable S&P trend feed. Reporting
-    // "below its 20-DMA" while the feed is dark is the contradiction TRA-468
-    // surfaced.
-    it('orbLongs=false names a downtrend when trendState is down', () => {
-      const reason = gateSignalOnReview(
-        sig({ side: 'buy' }),
-        gates({ orbLongs: false, trendState: 'down' }),
-      );
-      expect(reason).toMatch(/below its 20-DMA/);
-      expect(reason).not.toMatch(/feed unavailable/i);
-    });
-
-    it('orbLongs=false names the dark feed (not a downtrend) when trendState is unknown', () => {
-      const reason = gateSignalOnReview(
-        sig({ side: 'buy' }),
-        gates({ orbLongs: false, trendState: 'unknown' }),
-      );
-      expect(reason).toMatch(/trend feed unavailable/i);
-      expect(reason).not.toMatch(/below its 20-DMA/);
-    });
-
-    it('orbShorts=false names the dark feed when trendState is unknown', () => {
-      const reason = gateSignalOnReview(
-        sig({ side: 'sell' }),
-        gates({ orbShorts: false, trendState: 'unknown' }),
-      );
-      expect(reason).toMatch(/trend feed unavailable/i);
-    });
-  });
-
-  describe('describeGatedStrategies', () => {
-    it('lists nothing when every gate is open', () => {
-      expect(describeGatedStrategies(gates())).toEqual([]);
-    });
-
-    it('lists ORB longs / shorts independently when each is gated', () => {
-      expect(describeGatedStrategies(gates({ orbLongs: false })).map(n => n.strategy))
-        .toEqual(['ORB longs']);
-      expect(describeGatedStrategies(gates({ orbShorts: false })).map(n => n.strategy))
-        .toEqual(['ORB shorts']);
-      expect(describeGatedStrategies(gates({ orbLongs: false, orbShorts: false })).map(n => n.strategy))
-        .toEqual(['ORB longs', 'ORB shorts']);
-    });
-
-    it('collapses to a single ORB entry when breakouts are disabled', () => {
-      // breakoutsEnabled=false gates the whole strategy, so the long / short
-      // legs are not double-listed.
-      const notes = describeGatedStrategies(gates({ orbLongs: false, orbShorts: true, breakoutsEnabled: false }));
-      expect(notes).toHaveLength(1);
-      expect(notes[0].strategy).toBe('Breakouts (ORB)');
-    });
-
-    // TRA-469 — the dashboard note must distinguish a downtrend from a dark feed.
-    it('attributes the ORB longs note to a downtrend vs. a dark feed via trendState', () => {
-      const downReason = describeGatedStrategies(
-        gates({ orbLongs: false, trendState: 'down' }),
-      )[0].reason;
-      expect(downReason).toMatch(/below its 20-DMA/);
-
-      const unknownReason = describeGatedStrategies(
-        gates({ orbLongs: false, trendState: 'unknown' }),
-      )[0].reason;
-      expect(unknownReason).toMatch(/trend feed unavailable/i);
-      expect(unknownReason).not.toMatch(/below its 20-DMA/);
+    it('describeGatedStrategies returns an empty list for every configuration', () => {
+      const cases: Partial<MarketReviewGates>[] = [
+        {},
+        { orbLongs: false },
+        { orbShorts: false },
+        { breakoutsEnabled: false },
+        { orbLongs: false, orbShorts: false, breakoutsEnabled: false },
+        { orbLongs: false, trendState: 'down' },
+        { orbLongs: false, trendState: 'unknown' },
+      ];
+      for (const g of cases) {
+        expect(describeGatedStrategies(gates(g))).toEqual([]);
+      }
     });
   });
 
@@ -2569,7 +2510,10 @@ describe('TRA-389 — market-review regime gates', () => {
       expect(mr.gatedStrategies).toEqual([]);
     });
 
-    it('getState surfaces the regime + gated strategies once a review is cached', () => {
+    it('getState surfaces the regime context with no gated strategies once a review is cached', () => {
+      // TRA-474 — the regime banner still renders for context (regime label,
+      // rationale, raw gates), but `gatedStrategies` is now always empty
+      // because the gate is no longer wired to the signal path.
       const engine = new SignalEngine({ ...DEFAULT_ACCOUNT_SETTINGS, marketReviewGatesEnabled: true });
       (engine as unknown as { cachedMarketReview: MarketReview }).cachedMarketReview =
         review({ orbLongs: false, sizingMultiplier: 0.75 }, 'yellow');
@@ -2578,17 +2522,19 @@ describe('TRA-389 — market-review regime gates', () => {
       expect(mr.regime).toBe('yellow');
       expect(mr.reviewDate).toBe('2024-06-04');
       expect(mr.gates?.sizingMultiplier).toBe(0.75);
-      expect(mr.gatedStrategies.map(n => n.strategy)).toEqual(['ORB longs']);
+      expect(mr.gatedStrategies).toEqual([]);
     });
 
-    it('activeSizingMultiplier is 1 when off and the gate value when on', () => {
+    it('activeSizingMultiplier is always 1 — TRA-474 removed the gate-driven trim', () => {
+      // Pin the deprecation: even with the flag on AND a cached review
+      // carrying a 0.5 sizingMultiplier, the engine sizes at 1.0× — sizing
+      // is driven by managedAccountRatio / riskPerTrade only.
       const engine = new SignalEngine({ ...DEFAULT_ACCOUNT_SETTINGS, marketReviewGatesEnabled: true });
       const mult = () => (engine as unknown as { activeSizingMultiplier(): number }).activeSizingMultiplier();
-      // No cached review yet → no trim.
       expect(mult()).toBe(1);
       (engine as unknown as { cachedMarketReview: MarketReview }).cachedMarketReview =
         review({ sizingMultiplier: 0.5 });
-      expect(mult()).toBe(0.5);
+      expect(mult()).toBe(1);
     });
   });
 });

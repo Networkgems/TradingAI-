@@ -139,99 +139,47 @@ const SMA200_DAILY_BARS = SMA200_MIN_BARS + 30;
 const MARKET_REVIEW_REFRESH_MS = 5 * 60_000;
 
 /**
- * TRA-389 — strategy suppression reason for `signal` under the regime
- * `gates`, or `null` when the regime permits the signal to route.
+ * TRA-389 / TRA-469 / TRA-472 / TRA-474 — strategy suppression reason for
+ * `signal` under the regime `gates`.
  *
- * The signal engine runs three equity strategies — ORB (`orb_breakout`),
- * BB-fade (`bb_fade`), and Ichimoku (`ichimoku`). Only ORB is a breakout
- * strategy, so the breakout / ORB-direction gates scope to `orb_breakout`:
+ * **DEPRECATED — now always returns `null` (no suppression).** TRA-474:
+ * board directive on 2026-05-20 — the live engine closed Tradier exits but
+ * never opened new entries because a (possibly wrong) premarket report can
+ * silently kill every ORB ticket for the rest of the day. Going forward the
+ * signal path does NOT depend on the market-review report:
  *
- *   - `breakoutsEnabled === false` → suppress every ORB signal (VIX > 22 —
- *     the regime classifier disables breakouts in a high-volatility tape).
- *   - `orbLongs === false` → suppress ORB longs (downtrend, *or* a dark S&P
- *     trend feed — TRA-469 attributes the reason via `gates.trendState`).
- *   - `orbShorts === false` → suppress ORB shorts (tape not in a downtrend).
+ *   - ORB longs / shorts and breakouts route on the strategy's own evaluator.
+ *   - The regime banner on the dashboard still renders for context, but it
+ *     never decides whether a trade opens.
  *
- * BB-fade and Ichimoku are not breakout strategies and carry no per-signal
- * suppression gate. `meanReversionTilt` is a *tilt* — surfaced in the engine
- * state envelope as regime context, not a kill-switch — so it never suppresses
- * a signal here (mean reversion stays available across regimes; the tilt only
- * tells the dashboard the VIX is in the 16–22 band).
+ * The function is retained so existing call sites (and the unit tests that
+ * exercise the contract) compile against the same signature; the body is a
+ * no-op. Parameters are underscore-prefixed (`_signal`, `_gates`) so the
+ * unused-args lint stays quiet without dropping the contract on the floor.
  */
-/**
- * TRA-469 — cause of an `orbLongs` / `orbShorts` suppression. `orbLongs` is
- * false for *two* distinct reasons — a genuine S&P 500 downtrend, or a trend
- * feed that could not be read — so the reason text must branch on
- * {@link MarketReviewGates.trendState} rather than always blaming a downtrend
- * (the contradiction TRA-468 surfaced: the review headline said "trend feed
- * unavailable" while the gate reason said "below its 20-DMA"). `undefined`
- * trendState ↔ a review persisted before TRA-469; fall back to a cause-neutral
- * phrasing rather than re-asserting a downtrend.
- */
-function orbLongsSuppressionCause(gates: MarketReviewGates): string {
-  if (gates.trendState === 'unknown') {
-    return 'S&P 500 trend feed unavailable — longs held back as a precaution';
-  }
-  if (gates.trendState === 'down') {
-    return 'S&P 500 below its 20-DMA (downtrend)';
-  }
-  return 'S&P 500 not in a confirmed uptrend';
-}
-
-function orbShortsSuppressionCause(gates: MarketReviewGates): string {
-  if (gates.trendState === 'unknown') {
-    return 'S&P 500 trend feed unavailable — downtrend not confirmed';
-  }
-  return 'Tape not in a downtrend';
-}
-
 export function gateSignalOnReview(
-  signal: TradeSignal,
-  gates: MarketReviewGates,
+  _signal: TradeSignal,
+  _gates: MarketReviewGates,
 ): string | null {
-  if (signal.type !== 'orb_breakout') return null;
-  if (!gates.breakoutsEnabled) {
-    return 'Breakouts disabled by market-review regime (VIX > 22 — high-volatility tape)';
-  }
-  if (signal.side === 'buy' && !gates.orbLongs) {
-    return `ORB longs gated off by market-review regime (${orbLongsSuppressionCause(gates)})`;
-  }
-  if (signal.side === 'sell' && !gates.orbShorts) {
-    return `ORB shorts gated off by market-review regime (${orbShortsSuppressionCause(gates)})`;
-  }
   return null;
 }
 
 /**
- * TRA-389 — human-readable list of strategies the regime gates currently
- * suppress. Drives the `gatedStrategies` field of the engine state envelope
- * so the dashboard can explain why a strategy stopped firing. When breakouts
- * are off the whole ORB strategy is gated, so we list it once rather than
- * double-listing the long / short legs.
+ * TRA-389 / TRA-474 — human-readable list of strategies the regime gates
+ * currently suppress.
+ *
+ * **DEPRECATED — now always returns `[]`.** TRA-474 removed the regime
+ * gate from the signal path entirely, so there are no longer any
+ * regime-suppressed strategies to surface. The dashboard regime banner
+ * still renders the underlying review (regime label, rationale, VIX band)
+ * — that's context, not gating. Listing "ORB longs gated off" here would
+ * be misleading now that nothing is actually gated off.
+ *
+ * Kept as a named export so the contract and consumers compile against
+ * the same signature.
  */
-export function describeGatedStrategies(gates: MarketReviewGates): GatedStrategyNote[] {
-  const notes: GatedStrategyNote[] = [];
-  if (!gates.breakoutsEnabled) {
-    notes.push({
-      strategy: 'Breakouts (ORB)',
-      reason: 'VIX > 22 — high-volatility tape',
-    });
-    return notes;
-  }
-  if (!gates.orbLongs) {
-    notes.push({
-      strategy: 'ORB longs',
-      // TRA-469 — branch on trendState so a dark feed isn't reported as a downtrend.
-      reason: orbLongsSuppressionCause(gates),
-    });
-  }
-  if (!gates.orbShorts) {
-    notes.push({
-      strategy: 'ORB shorts',
-      reason: orbShortsSuppressionCause(gates),
-    });
-  }
-  return notes;
+export function describeGatedStrategies(_gates: MarketReviewGates): GatedStrategyNote[] {
+  return [];
 }
 
 /**
@@ -1229,22 +1177,12 @@ export class SignalEngine {
           // can scope this entry to the demo (or live) mode it fired under.
           signal.mode = this.mode;
 
-          // TRA-389 — market-review regime gates. When the consumption path
-          // is flagged on and a premarket review is cached, suppress signals
-          // the regime gates declined to route (ORB longs/shorts, breakouts).
-          // The signal is still recorded with a `signalSkipReason` so the
-          // dashboard shows the strategy fired and why we declined — mirrors
-          // the live-skip surfacing below. No position (paper or broker) is
-          // opened for a suppressed signal.
-          if (this.marketReviewGatesEnabled && this.cachedMarketReview) {
-            const gateSkip = gateSignalOnReview(signal, this.cachedMarketReview.gates);
-            if (gateSkip) {
-              signal.signalSkipReason = gateSkip;
-              this.recentSignals.unshift(signal);
-              if (this.recentSignals.length > MAX_SIGNALS) this.recentSignals.pop();
-              continue;
-            }
-          }
+          // TRA-389 / TRA-474 — the market-review regime gate used to sit
+          // here. Removed: a (possibly wrong) premarket report must not be
+          // able to silently suppress every ORB ticket for the rest of the
+          // day. `gateSignalOnReview` is retained as a no-op so the contract
+          // and tests survive; the dashboard banner still renders the regime
+          // context, but it never decides whether a position opens.
 
           // TRA-335 — in live mode, mirror the equity entry as a Tradier
           // OTOCO bracket order. We submit the broker order *first* so the
@@ -3187,14 +3125,14 @@ export class SignalEngine {
   }
 
   /**
-   * TRA-389 — active position-size scalar from the cached regime gates.
-   * Returns 1 (no-op) when the consumption flag is off or no review is
-   * cached, so non-opted-in deployments size exactly as before.
+   * TRA-389 / TRA-474 — active position-size scalar from the cached regime
+   * gates. **Deprecated — always 1 (no trim).** TRA-474: the live engine
+   * must not depend on the premarket report for sizing or routing. A wrong
+   * report shouldn't shrink (or zero) every ticket for the day. Sizing now
+   * flows entirely off `managedAccountRatio` and `riskPerTrade` — the
+   * pre-TRA-389 behaviour.
    */
   private activeSizingMultiplier(): number {
-    if (this.marketReviewGatesEnabled && this.cachedMarketReview) {
-      return this.cachedMarketReview.gates.sizingMultiplier;
-    }
     return 1;
   }
 
