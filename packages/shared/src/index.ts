@@ -777,6 +777,17 @@ export interface AccountSettings {
    * page. Absent ↔ off; resolve via {@link resolveMarketReviewGatesEnabled}.
    */
   marketReviewGatesEnabled?: boolean;
+  /**
+   * TRA-483 — hold live options opened today overnight so the round trip
+   * doesn't count as a day trade (PDT). When `true`, `checkExits` skips
+   * TP1 partial / SL / trailing exits for any live position whose
+   * `openedAt` date matches the current trading day; auto-exits resume on
+   * the next session. Manual closes (user-initiated) are unaffected.
+   * Default `true` per the issue's wake comment ("we have to be able to
+   * hold trade for a day, so we don't trigger Day Trading pattern").
+   * Absent ↔ on. Resolve via {@link resolveHoldLiveOptionsOvernight}.
+   */
+  holdLiveOptionsOvernightForPdt?: boolean;
 }
 
 export const DEFAULT_ACCOUNT_SETTINGS: AccountSettings = {
@@ -836,6 +847,8 @@ export const DEFAULT_ACCOUNT_SETTINGS: AccountSettings = {
   demoFeePerContract: 0,
   // TRA-389 — market-review gate consumption defaults off (soft-launch).
   marketReviewGatesEnabled: false,
+  // TRA-483 — PDT-aware overnight hold defaults ON for live positions.
+  holdLiveOptionsOvernightForPdt: true,
 };
 
 /**
@@ -944,6 +957,16 @@ export function resolveDemoCostModel(s: AccountSettings): DemoCostModel {
  */
 export function resolveMarketReviewGatesEnabled(s: AccountSettings): boolean {
   return s.marketReviewGatesEnabled === true;
+}
+
+/**
+ * TRA-483 — resolve the live-options overnight-hold flag. Defaults to `true`:
+ * the issue wake comment makes it the required default so the engine doesn't
+ * round-trip a position the same day and burn DTBP. Only an explicit `false`
+ * disables the gate; `undefined` (legacy snapshots) keeps the new behaviour.
+ */
+export function resolveHoldLiveOptionsOvernight(s: AccountSettings): boolean {
+  return s.holdLiveOptionsOvernightForPdt !== false;
 }
 
 /** TRA-373 — spec defaults for the RV scanner DTE window. */

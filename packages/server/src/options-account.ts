@@ -189,6 +189,18 @@ interface OptionsAccountConfig {
    * fees on equity options, rounded up. Set to `0.0` to disable.
    */
   demoFeePerContract?: number;
+  /**
+   * TRA-483 — when true, {@link checkExits} skips engine-fired exits (TP1
+   * partial, hard SL, trailing) for live positions opened earlier in the
+   * same trading day so the round trip doesn't count as a day trade and
+   * burn the PDT day-trade buying power. Auto-exits resume on the next
+   * session. Manual closes (user-initiated `closeOption` / staged closes)
+   * are unaffected. Default `true` per the issue's wake comment; tests
+   * can pass `false` to keep legacy intra-day exit behaviour where it
+   * matters. Demo positions are always evaluated normally — paper round
+   * trips have no PDT impact.
+   */
+  holdLiveOptionsOvernightForPdt?: boolean;
 }
 
 /**
@@ -280,6 +292,14 @@ export class PaperOptionsAccount {
   private demoFeePerContract: number;
   private demoSlippageCost = 0;
   private demoFeeCost = 0;
+  /**
+   * TRA-483 — overnight-hold gate for live positions opened today. Default
+   * `true`: refuse to fire same-day TP1/SL/trail exits on live positions so
+   * the round trip doesn't count as a day trade. Demo always evaluates
+   * normally (no PDT impact on paper). Flipped from {@link updateConfig}
+   * when the user toggles the matching AccountSettings field.
+   */
+  private holdLiveOptionsOvernightForPdt: boolean;
   private currentDayKey = toDateKey(Date.now());
 
   constructor(config: OptionsAccountConfig = {}) {
@@ -297,6 +317,12 @@ export class PaperOptionsAccount {
     // the user (or QA) deliberately flips it on via AccountSettings.
     this.demoSlippagePct = normalizeNonNegative(config.demoSlippagePct, 0);
     this.demoFeePerContract = normalizeNonNegative(config.demoFeePerContract, 0);
+    // TRA-483 — constructor default OFF for back-compat with the broad set
+    // of unit tests that exercise live-mode close paths. Production runs
+    // (SignalEngine) override this from AccountSettings via
+    // {@link resolveHoldLiveOptionsOvernight}, which defaults to ON and
+    // matches the issue's wake-comment requirement.
+    this.holdLiveOptionsOvernightForPdt = config.holdLiveOptionsOvernightForPdt ?? false;
     this.equity = this.initialEquity;
     this.cash = this.initialEquity;
   }
@@ -329,6 +355,9 @@ export class PaperOptionsAccount {
     }
     if (config.demoFeePerContract !== undefined) {
       this.demoFeePerContract = normalizeNonNegative(config.demoFeePerContract, this.demoFeePerContract);
+    }
+    if (config.holdLiveOptionsOvernightForPdt !== undefined) {
+      this.holdLiveOptionsOvernightForPdt = config.holdLiveOptionsOvernightForPdt;
     }
     this.equity = this.initialEquity;
     this.cash = this.initialEquity;
@@ -378,6 +407,9 @@ export class PaperOptionsAccount {
     }
     if (config.demoFeePerContract !== undefined) {
       this.demoFeePerContract = normalizeNonNegative(config.demoFeePerContract, this.demoFeePerContract);
+    }
+    if (config.holdLiveOptionsOvernightForPdt !== undefined) {
+      this.holdLiveOptionsOvernightForPdt = config.holdLiveOptionsOvernightForPdt;
     }
   }
 
@@ -1053,6 +1085,26 @@ export class PaperOptionsAccount {
       // still update the mark / trailing state above so the dashboard stays
       // live — only NEW order submission is suppressed.
       if ((opt.closeRejectCount ?? 0) >= MAX_CONSECUTIVE_CLOSE_REJECTS) continue;
+
+      // TRA-483 — PDT-aware overnight hold. Same-day round trips on a live
+      // position count as a day trade and burn DTBP; the issue's wake comment
+      // makes overnight hold the required default for live so the engine
+      // doesn't keep tripping the PDT rule. The gate fires for any live
+      // position whose `openedAt` matches today's date key (the engine sets
+      // this on every open; imports inherit Tradier's `acquired_at`).
+      // Demo paper round trips are PDT-irrelevant so they're never gated.
+      // Manual close paths (user-initiated `closeOption`, the smart-close
+      // drawer) don't reach `checkExits` at all and stay unaffected.
+      // State updates above (mark, peak, trailing activation) still run so
+      // the dashboard tracks the position live and the trailing-stop math
+      // is correct when the gate releases on the next session.
+      if (
+        this.holdLiveOptionsOvernightForPdt
+        && (opt.mode ?? 'demo') === 'live'
+        && toDateKey(opt.openedAt) === toDateKey(Date.now())
+      ) {
+        continue;
+      }
 
       // Partial exit at TP1: sell `partialExitRatio` of contracts, trail the rest
       if (!opt.tp1Hit && mark >= opt.tp1Premium && opt.contractsRemaining > 1) {

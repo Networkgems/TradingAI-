@@ -1,6 +1,6 @@
 import { OrbStrategy, BbFadeStrategy, IchimokuStrategy, TradierOptionsClient, TradierOrderClient, TRADIER_REJECTED_STATUSES, evaluateSma200, SMA200_MIN_BARS, SMA200_DEBOUNCE_BARS } from '@trading-app/engine';
 import type { TradierAccountBalance } from '@trading-app/engine';
-import { WATCHLIST, MANAGED_ACCOUNT_RATIO, MAX_CONSECUTIVE_LOSSES, DAILY_DRAWDOWN_HALT_PCT, OPTIONS_POSITION_CAP_RATIO, aliasWatchlistSymbol, isLiveTradierOptionsEnabled, isStockMarketOpen, resolveAutoManageImportedTradierOptions, resolveDemoCostModel, resolveLiveTradeEquitiesTradier, resolveManagedAccountRatio, resolveMarketReviewGatesEnabled, resolveRiskPerTrade, resolveRvDtePrefs, resolveTradierOptionsCreds, DEFAULT_RV_DTE_MIN, DEFAULT_RV_DTE_MAX, DEFAULT_RV_DTE_TARGET } from '@trading-app/shared';
+import { WATCHLIST, MANAGED_ACCOUNT_RATIO, MAX_CONSECUTIVE_LOSSES, DAILY_DRAWDOWN_HALT_PCT, OPTIONS_POSITION_CAP_RATIO, aliasWatchlistSymbol, isLiveTradierOptionsEnabled, isStockMarketOpen, resolveAutoManageImportedTradierOptions, resolveDemoCostModel, resolveHoldLiveOptionsOvernight, resolveLiveTradeEquitiesTradier, resolveManagedAccountRatio, resolveMarketReviewGatesEnabled, resolveRiskPerTrade, resolveRvDtePrefs, resolveTradierOptionsCreds, DEFAULT_RV_DTE_MIN, DEFAULT_RV_DTE_MAX, DEFAULT_RV_DTE_TARGET } from '@trading-app/shared';
 import type { TradeSignal, RelativeValueSignal, Sma200Signal, Candle, OptionsAccountState, SignalType, Position, AccountSettings, AccountState, NewsItem, TradierEnv, MarketReview, MarketReviewGates, EngineMarketReviewState, GatedStrategyNote } from '@trading-app/shared';
 import { getLatestMarketReview } from './market-review.js';
 import { etDateString } from './scheduler.js';
@@ -490,6 +490,11 @@ export class SignalEngine {
     const autoManageImports = settings ? resolveAutoManageImportedTradierOptions(settings) : true;
     // TRA-374 — demo cost model knobs (default 0 / 0 = off).
     const demoCost = settings ? resolveDemoCostModel(settings) : { slippagePct: 0, feePerContract: 0 };
+    // TRA-483 — PDT-aware overnight hold for live positions opened today
+    // (default ON). Plumbed into both env buckets so the gate fires regardless
+    // of which env the user is trading.
+    const holdLiveOptionsOvernightForPdt =
+      settings ? resolveHoldLiveOptionsOvernight(settings) : true;
     this.optionsAccounts = {
       sandbox: new PaperOptionsAccount({
         initialEquity: currentEquity,
@@ -503,6 +508,7 @@ export class SignalEngine {
         autoManageImportedTradierOptions: autoManageImports,
         demoSlippagePct: demoCost.slippagePct,
         demoFeePerContract: demoCost.feePerContract,
+        holdLiveOptionsOvernightForPdt,
       }),
       production: new PaperOptionsAccount({
         initialEquity: currentEquity,
@@ -513,6 +519,7 @@ export class SignalEngine {
         autoManageImportedTradierOptions: autoManageImports,
         demoSlippagePct: demoCost.slippagePct,
         demoFeePerContract: demoCost.feePerContract,
+        holdLiveOptionsOvernightForPdt,
       }),
     };
     if (settings) {
@@ -588,6 +595,8 @@ export class SignalEngine {
     // TRA-374 — flow demo cost model knobs through so a Settings edit takes
     // effect on the next open / close without restarting the server.
     const demoCost = resolveDemoCostModel(settings);
+    // TRA-483 — re-read so a Settings toggle takes effect on the next tick.
+    const holdLiveOptionsOvernightForPdt = resolveHoldLiveOptionsOvernight(settings);
     this.optionsAccounts.sandbox.updateConfig({
       managedAccountRatio: demoStocksRatio,
       // TRA-378 — re-plumb riskPerTrade so a Settings PATCH re-sizes live
@@ -597,6 +606,7 @@ export class SignalEngine {
       autoManageImportedTradierOptions: autoManageImports,
       demoSlippagePct: demoCost.slippagePct,
       demoFeePerContract: demoCost.feePerContract,
+      holdLiveOptionsOvernightForPdt,
     });
     this.optionsAccounts.production.updateConfig({
       managedAccountRatio: liveStocksRatio,
@@ -605,6 +615,7 @@ export class SignalEngine {
       autoManageImportedTradierOptions: autoManageImports,
       demoSlippagePct: demoCost.slippagePct,
       demoFeePerContract: demoCost.feePerContract,
+      holdLiveOptionsOvernightForPdt,
     });
     // TRA-221 — re-resolve the Tradier live client whenever settings change
     // so toggling Live mode or editing the API token takes effect on the

@@ -169,6 +169,103 @@ describe('PaperOptionsAccount.checkExits — chain-driven OTM marks', () => {
   });
 });
 
+// TRA-483 — PDT-aware overnight-hold gate. Live positions opened today
+// must not auto-close today (TP1 / SL / trailing) so the round trip
+// doesn't count as a day trade and burn DTBP. Demo positions are
+// unaffected (paper round trips have no PDT impact). Tests opt in
+// explicitly because the constructor default is OFF for back-compat
+// with the broader unit-test surface — production wires the gate ON via
+// `resolveHoldLiveOptionsOvernight(settings)`.
+describe('PaperOptionsAccount.checkExits — TRA-483 overnight hold for live (PDT)', () => {
+  function gatedAccount(extras: object = {}): PaperOptionsAccount {
+    return new PaperOptionsAccount({
+      initialEquity: 50_000,
+      managedAccountRatio: 0.5,
+      holdLiveOptionsOvernightForPdt: true,
+      ...extras,
+    });
+  }
+
+  it('skips a same-day live SL exit when the gate is on', () => {
+    const acct = gatedAccount();
+    // Live open at $1.00 mark — gate prevents same-day SL today even
+    // though the mark crashes through the SL.
+    const pos = acct.openOptionFromCandidate(buildSignal({ mark: 1.0 }), 'live', 50_000);
+    expect(pos).not.toBeNull();
+    expect(pos!.mode).toBe('live');
+
+    const marks = new Map<string, number>([[pos!.optionSymbol!, 0.30]]);
+    const closed = acct.checkExits(new Map(), marks);
+
+    // No exit fired: position must still be open and no closed row recorded.
+    expect(closed).toHaveLength(0);
+    expect(acct.getState().openOptions).toHaveLength(1);
+    expect(acct.getState().closedOptions).toHaveLength(0);
+    // But the mark / dashboard state did update — the gate must not freeze
+    // the live mark on the position.
+    expect(acct.getState().openOptions[0].currentPremium).toBe(0.30);
+  });
+
+  it('allows the SL exit on the next trading session', () => {
+    const acct = gatedAccount();
+    const pos = acct.openOptionFromCandidate(buildSignal({ mark: 1.0 }), 'live', 50_000);
+    expect(pos).not.toBeNull();
+
+    // Advance the clock past today; openedAt's date key no longer matches
+    // today, so the gate releases and the SL fires.
+    vi.setSystemTime(TRADING_TIME + 24 * 60 * 60 * 1000);
+
+    const marks = new Map<string, number>([[pos!.optionSymbol!, 0.30]]);
+    const closed = acct.checkExits(new Map(), marks);
+
+    expect(closed).toHaveLength(1);
+    expect(closed[0].pnl).toBeLessThan(0);
+    expect(acct.getState().openOptions).toHaveLength(0);
+  });
+
+  it('still closes a same-day demo position even with the gate on (paper has no PDT impact)', () => {
+    const acct = gatedAccount();
+    // Demo open (no equityOverride) — gate must not apply, same-day SL fires.
+    const pos = acct.openOptionFromCandidate(buildSignal({ mark: 1.0 }), 'demo');
+    expect(pos).not.toBeNull();
+    expect(pos!.mode).toBe('demo');
+
+    const marks = new Map<string, number>([[pos!.optionSymbol!, 0.30]]);
+    const closed = acct.checkExits(new Map(), marks);
+
+    expect(closed).toHaveLength(1);
+    expect(closed[0].pnl).toBeLessThan(0);
+  });
+
+  it('honours the off-default constructor (legacy back-compat: same-day live SL fires)', () => {
+    const acct = new PaperOptionsAccount({ initialEquity: 50_000, managedAccountRatio: 0.5 });
+    const pos = acct.openOptionFromCandidate(buildSignal({ mark: 1.0 }), 'live', 50_000);
+    expect(pos).not.toBeNull();
+
+    const marks = new Map<string, number>([[pos!.optionSymbol!, 0.30]]);
+    const closed = acct.checkExits(new Map(), marks);
+
+    expect(closed).toHaveLength(1);
+    expect(closed[0].pnl).toBeLessThan(0);
+  });
+
+  it('updateConfig({holdLiveOptionsOvernightForPdt:true}) flips the gate on at runtime', () => {
+    const acct = new PaperOptionsAccount({ initialEquity: 50_000, managedAccountRatio: 0.5 });
+    const pos = acct.openOptionFromCandidate(buildSignal({ mark: 1.0 }), 'live', 50_000);
+    expect(pos).not.toBeNull();
+
+    // Off by default — flip the gate on. A subsequent checkExits with the
+    // mark crashed below SL must NOT close the position; the gate now
+    // covers both pre-existing and freshly-opened live rows.
+    acct.updateConfig({ holdLiveOptionsOvernightForPdt: true });
+    const marks = new Map<string, number>([[pos!.optionSymbol!, 0.30]]);
+    const closed = acct.checkExits(new Map(), marks);
+
+    expect(closed).toHaveLength(0);
+    expect(acct.getState().openOptions).toHaveLength(1);
+  });
+});
+
 describe('PaperOptionsAccount.voidOpenOption (TRA-319)', () => {
   function buildRvSignal(overrides: Partial<RelativeValueSignal> = {}): RelativeValueSignal {
     return {

@@ -1732,6 +1732,31 @@ export default function SettingsPage({ token, httpUrl, context, onModeChange, on
                   </label>
                 </div>
 
+                {/* TRA-483 — hold live options overnight to avoid PDT. When
+                    on (default), the engine's automatic SL / TP1 / trailing
+                    exits don't fire on a live position the same day it
+                    opened, so the round trip can't count as a day trade.
+                    Manual closes are unaffected. */}
+                <div className="settings-field" style={{ marginTop: '1rem' }}>
+                  <label className="checkbox-option">
+                    <input
+                      type="checkbox"
+                      checked={settings.holdLiveOptionsOvernightForPdt !== false}
+                      onChange={e => set('holdLiveOptionsOvernightForPdt', e.target.checked)}
+                    />
+                    <span>
+                      <strong>Hold live options overnight (avoid PDT)</strong>
+                      <p className="field-hint">
+                        Skip automatic stop-loss / partial-take-profit / trailing-stop exits on live
+                        option positions opened earlier the same trading day, so the round trip
+                        doesn't count as a day trade and burn Tradier's day-trade buying power.
+                        Auto-exits resume on the next session. Manual closes from the dashboard
+                        always fire regardless of this setting.
+                      </p>
+                    </span>
+                  </label>
+                </div>
+
                 <div className="settings-field" style={{ marginTop: '1rem' }}>
                   <button
                     type="button"
