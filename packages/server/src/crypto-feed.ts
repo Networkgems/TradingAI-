@@ -783,7 +783,18 @@ export async function fetchCryptoQuotes(
   // EGLD-USD, RUNE-USD — Binance/Cosmos-only assets). Same parallel-batch
   // shape as before so a slow YF response can't stall the tick, with the
   // first-429 short-circuit preserved end-to-end.
-  let needYahoo = symbols.filter(s => !results.has(s));
+  //
+  // TRA-300 — but skip Yahoo for symbols the Coinbase catalog has *confirmed*
+  // are not listed (e.g. SUL-USD, NEFTY-USD, HYPE32196-USD — random tokens
+  // scanners used to dump into the watchlist). Yahoo doesn't have meaningful
+  // data for these either, so the only thing the cascade accomplished was
+  // burning the per-IP YF budget on a few dozen useless lookups and tripping
+  // the shared 429 breaker — which then labelled the *entire* crypto
+  // watchlist "Quote unavailable — provider rate-limited", including the
+  // genuinely Coinbase-listed symbols on the next tick. `null` status (cold
+  // catalog) keeps the legacy behaviour so a network blip during catalog
+  // refresh doesn't silently drop quotes for a valid Yahoo-only listing.
+  let needYahoo = symbols.filter(s => !results.has(s) && isCoinbaseListed(s) !== false);
   if (needYahoo.length > 0 && !shouldSkipYahoo()) {
     const QUOTE_BATCH = 5;
     let yahooBreakerJustTripped = false;

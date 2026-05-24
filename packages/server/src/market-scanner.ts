@@ -1,6 +1,7 @@
 import YahooFinance from 'yahoo-finance2';
 import { WATCHLIST, CRYPTO_WATCHLIST, isCryptoSymbolBlocked } from '@trading-app/shared';
 import { logger } from './observability/index.js';
+import { isCoinbaseListed, refreshCoinbaseProductCatalog } from './crypto-feed.js';
 
 const log = logger.child({ module: 'market-scanner' });
 
@@ -86,6 +87,18 @@ export async function scanStocksMarket(): Promise<ScanResult[]> {
 export async function scanCryptoMarket(): Promise<ScanResult[]> {
   const collected: ScanResult[] = [];
 
+  // TRA-300 — scanner suggestions must be tradable on Coinbase. CMC's
+  // top-volume / top-gainer lists include thousands of obscure tokens
+  // (SUL-USD, WEVER-USD, NEFTY-USD, …) that Coinbase doesn't list. Adding
+  // them to the watchlist is pure noise: per TRA-338 the entry gate refuses
+  // to open positions on non-Coinbase symbols, and the quote cascade then
+  // burns its Yahoo budget on every tick trying to price them — which trips
+  // the shared 429 breaker and labels the entire watchlist
+  // "Quote unavailable — provider rate-limited". Warm the catalog first so
+  // the final filter below has authoritative data instead of a cold-cache
+  // `null` that would force fail-open.
+  await refreshCoinbaseProductCatalog();
+
   if (CMC_API_KEY) {
     // Top by 24h volume
     try {
@@ -139,5 +152,11 @@ export async function scanCryptoMarket(): Promise<ScanResult[]> {
   // TRA-283: drop denylisted tickers from scanner suggestions so they can't be
   // re-added via the "Scan Market" UI flow.
   const blocked = collected.filter(r => !isCryptoSymbolBlocked(r.symbol));
-  return filterNew(dedup(blocked), CRYPTO_WATCHLIST);
+
+  // TRA-300 — final Coinbase-listed gate. Fail-closed: if the catalog refresh
+  // above failed and `isCoinbaseListed` returns `null` for every symbol, we
+  // suggest nothing this scan rather than re-introducing the noise we just
+  // fixed. The next scan attempt re-warms the catalog and proceeds normally.
+  const tradable = blocked.filter(r => isCoinbaseListed(r.symbol) === true);
+  return filterNew(dedup(tradable), CRYPTO_WATCHLIST);
 }
