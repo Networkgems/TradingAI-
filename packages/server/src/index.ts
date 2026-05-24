@@ -16,7 +16,7 @@ import {
 } from './reports/tradier-reconcile.js';
 import { createToken, verifyToken, generateResetToken, consumeResetToken, initResetTokenStore } from './auth.js';
 import { checkThrottle, recordFailure, recordSuccess } from './auth-throttle.js';
-import { getSettings, mergeScopedRiskSettings, saveSettings } from './account-settings.js';
+import { getSettings, loadSettings, mergeScopedRiskSettings, saveSettings } from './account-settings.js';
 import {
   initWatchlistStore,
   getCryptoWatchlistData,
@@ -1818,16 +1818,32 @@ app.get('/api/snapshots', requireAuth, async (_req, res) => {
 
 // ── Account Settings ─────────────────────────────────────────────────────────
 
-app.get('/api/account/settings', requireAuth, (_req, res) => {
+// TRA-485 — `loadSettings` (not the cache-only `getSettings`) so a user who
+// missed boot-time `initAllUserContexts` warmup (signed up after boot, or
+// warmup threw for their row) still gets their persisted settings instead of
+// silently seeing `DEFAULT_ACCOUNT_SETTINGS`. `loadSettings` is cache-first so
+// the warm path stays O(1); only a cold lookup hits disk. Errors propagate to
+// the Express error handler instead of being swallowed into a 200-of-defaults.
+app.get('/api/account/settings', requireAuth, async (_req, res, next) => {
   const username = res.locals['authUser'] as string;
-  res.json(getSettings(username));
+  try {
+    const settings = await loadSettings(username);
+    res.json(settings);
+  } catch (err) {
+    next(err);
+  }
 });
 
 app.put('/api/account/settings', requireAuth, async (req, res) => {
   const username = res.locals['authUser'] as string;
   const ctx = await userCtx(res);
   const body = req.body as Partial<AccountSettings>;
-  const current = getSettings(username);
+  // TRA-485 — paired with the GET-handler change: read the saved snapshot
+  // through `loadSettings` so a cache-cold PUT (partial body like
+  // AccountModeSwitcher's `{ mode: 'live' }`) merges against the user's
+  // real persisted settings rather than DEFAULT_ACCOUNT_SETTINGS — which
+  // would otherwise quietly wipe every untouched field on disk.
+  const current = await loadSettings(username);
   const clampEquity = (v: number) => Math.max(1_000, Math.min(10_000_000, Number(v)));
   const updated: AccountSettings = {
     ...current,

@@ -1,4 +1,5 @@
 import { useCallback, useEffect, useState } from 'react';
+import { logger } from './lib/logger';
 import type {
   AccountMode,
   AccountSettings,
@@ -943,15 +944,30 @@ export default function SettingsPage({ token, httpUrl, context, onModeChange, on
           setLoading(false);
           return;
         }
-        const data = (await r.json()) as AccountSettings;
+        // TRA-485 — parse JSON inside its own try so a 200-OK-with-bad-body
+        // (e.g. a reverse proxy interstitial, an HTML error page that slipped
+        // past `r.ok`) surfaces as "bad response" instead of being mislabelled
+        // as a connection problem by the outer `.catch`.
+        let data: AccountSettings;
+        try {
+          data = (await r.json()) as AccountSettings;
+        } catch (parseErr) {
+          logger.warn('settings', 'settings load failed: invalid JSON body', parseErr);
+          setLoadError("Couldn't load your settings — the server returned an unexpected response.");
+          setLoading(false);
+          return;
+        }
         if (cancelled) return;
         setSettings({ ...DEFAULT_ACCOUNT_SETTINGS, ...data });
         setLoading(false);
       })
-      .catch(() => {
+      .catch(err => {
         if (cancelled) return;
-        // Network failure or non-JSON body — surface it instead of leaving
-        // the form blank with no feedback.
+        // TRA-485 — only the network-failure path reaches here now (`r.json`
+        // parse errors are caught above). Keep the original copy so the
+        // existing "check your connection" message stays accurate, and log
+        // the underlying reason for support diagnostics.
+        logger.warn('settings', 'settings load failed (network)', err);
         setLoadError("Couldn't load your settings — check your connection and try again.");
         setLoading(false);
       });

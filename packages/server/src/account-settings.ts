@@ -124,7 +124,18 @@ export async function loadSettings(username: string): Promise<AccountSettings> {
     }
     cache.set(username, settings);
     return settings;
-  } catch {
+  } catch (err) {
+    // TRA-485 — log the corrupt-settings path. Without this the user sees
+    // their dashboard quietly populated with DEFAULT_ACCOUNT_SETTINGS and
+    // there is no server-side breadcrumb explaining why their saved values
+    // disappeared. We still return defaults so the user can keep operating
+    // (rather than 500-ing the route), but operators now have something to
+    // grep for when "all my settings reset" reports come in.
+    log.warn('loadSettings: falling back to defaults after read/parse error', {
+      username,
+      file,
+      reason: err instanceof Error ? err.message : String(err),
+    });
     const fresh = { ...DEFAULT_ACCOUNT_SETTINGS };
     cache.set(username, fresh);
     return fresh;
