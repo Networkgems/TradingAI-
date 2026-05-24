@@ -11,7 +11,25 @@ const log = logger.child({ module: 'options-scanner' });
 
 const CHAIN_CACHE_TTL_MS = 60_000;          // 1 min — chain snapshots stale that fast anyway
 const EXPIRATIONS_CACHE_TTL_MS = 6 * 60 * 60_000; // 6h — expirations don't move during the day
-const RATE_LIMIT_COOLDOWN_MS = 60 * 60_000; // 1h — Tradier sandbox: 60 req/min, prod: 120/min
+// TRA-417 — discriminated breaker cooldowns. Mirrors the RV scanner; see
+// `relative-value-scanner.ts` for the full rationale. Kept in sync here so
+// that if the OTM scanner is ever re-enabled (TRA-191 disabled it) the
+// breaker behaves the same as RV's, and so the two files do not drift.
+const RATE_LIMIT_429_COOLDOWN_MS = 90_000;
+const UPSTREAM_ERROR_COOLDOWN_MS = 5 * 60_000;
+const BACKOFF_429_WINDOW_MS = 5 * 60_000;
+const BACKOFF_429_MAX_MS = 10 * 60_000;
+
+function is429Error(err: unknown): boolean {
+  const msg = err instanceof Error ? err.message : String(err);
+  return /\b429\b|Too Many Requests/i.test(msg);
+}
+
+interface BreakerState {
+  openedAt: number;
+  cooldownMs: number;
+}
+
 // TRA-373 — widened from 14–35 to 21–60 with a 35-day target; see the matching
 // note in relative-value-scanner.ts. The OTM service is no longer wired into
 // the live signal-engine path (TRA-191 left RV as the only enabled scanner),
@@ -115,8 +133,10 @@ export interface OtmMispricingServiceConfig {
  *
  *   • Chain-snapshot caching (60 s TTL) — Tradier's free tier is rate-limited so
  *     repeated scans of the same symbol within a minute serve from cache.
- *   • Circuit breaker on transient errors — once a fetch throws (typically a 429
- *     or upstream outage), the breaker opens for 1 h so we don't spam the API.
+ *   • Discriminated circuit breaker (TRA-417) — once a fetch throws, the
+ *     breaker opens until a cooldown elapses. 429-shaped errors get a short
+ *     cooldown (~90s) with exp backoff on repeated trips; other upstream
+ *     errors get ~5 min — replaces the previous flat 1 h cooldown.
  *   • Expiration auto-pick — closest-to-target inside the configured DTE
  *     window (default 21–60d, target 35d, TRA-373). Per-call overrides on
  *     `scan()` carry per-user `AccountSettings.rvDte*` knobs through.
@@ -134,7 +154,10 @@ export class TradierOtmMispricingService implements OtmMispricingService {
 
   private readonly chainCache = new Map<ChainKey, CacheEntry<OptionChainRow[]>>();
   private readonly expirationsCache = new Map<string, CacheEntry<string[]>>();
-  private breakerOpenedAtMs: number | null = null;
+  // TRA-417 — see relative-value-scanner.ts for the rationale; mirrored here.
+  private breakerState: BreakerState | null = null;
+  private last429AtMs: number | null = null;
+  private consecutive429 = 0;
 
   constructor(config: OtmMispricingServiceConfig) {
     this.fetchSpot = config.fetchSpot;
@@ -163,7 +186,7 @@ export class TradierOtmMispricingService implements OtmMispricingService {
     return {
       configured: this.client !== null,
       breakerOpen: this.isBreakerOpen(),
-      breakerOpenedAtMs: this.breakerOpenedAtMs,
+      breakerOpenedAtMs: this.breakerState?.openedAt ?? null,
       cacheSize: this.chainCache.size,
       expirationsCacheSize: this.expirationsCache.size,
     };
@@ -252,22 +275,50 @@ export class TradierOtmMispricingService implements OtmMispricingService {
   }
 
   private isBreakerOpen(): boolean {
-    if (this.breakerOpenedAtMs == null) return false;
-    if (this.now() - this.breakerOpenedAtMs >= RATE_LIMIT_COOLDOWN_MS) {
-      this.breakerOpenedAtMs = null;
+    if (this.breakerState == null) return false;
+    if (this.now() - this.breakerState.openedAt >= this.breakerState.cooldownMs) {
+      this.breakerState = null;
       return false;
     }
     return true;
   }
 
   private tripBreaker(label: string, err: unknown): void {
-    this.breakerOpenedAtMs = this.now();
+    const now = this.now();
     const msg = err instanceof Error ? err.message : String(err);
-    log.warn('breaker open', {
-      cooldownMinutes: RATE_LIMIT_COOLDOWN_MS / 60_000,
-      label,
-      reason: msg,
-    });
+    if (is429Error(err)) {
+      if (this.last429AtMs != null && now - this.last429AtMs <= BACKOFF_429_WINDOW_MS) {
+        this.consecutive429 += 1;
+      } else {
+        this.consecutive429 = 1;
+      }
+      this.last429AtMs = now;
+      const cooldownMs = Math.min(
+        RATE_LIMIT_429_COOLDOWN_MS * 2 ** (this.consecutive429 - 1),
+        BACKOFF_429_MAX_MS,
+      );
+      this.breakerState = { openedAt: now, cooldownMs };
+      log.warn('breaker open (rate limit)', {
+        cooldownSeconds: Math.round(cooldownMs / 1000),
+        consecutive429: this.consecutive429,
+        label,
+        reason: msg,
+      });
+    } else {
+      this.breakerState = { openedAt: now, cooldownMs: UPSTREAM_ERROR_COOLDOWN_MS };
+      log.warn('breaker open (upstream error)', {
+        cooldownSeconds: Math.round(UPSTREAM_ERROR_COOLDOWN_MS / 1000),
+        label,
+        reason: msg,
+      });
+    }
+  }
+
+  private noteUpstreamSuccess(): void {
+    if (this.consecutive429 !== 0) {
+      this.consecutive429 = 0;
+      this.last429AtMs = null;
+    }
   }
 
   private async pickExpiration(symbol: string, dtePrefs: DtePrefs = {}): Promise<string | null> {
@@ -277,6 +328,7 @@ export class TradierOtmMispricingService implements OtmMispricingService {
       expirations = cached.value;
     } else {
       expirations = await this.client!.getExpirations(symbol);
+      this.noteUpstreamSuccess();
       this.expirationsCache.set(symbol, { value: expirations, at: this.now() });
     }
     if (expirations.length === 0) return null;
@@ -329,6 +381,7 @@ export class TradierOtmMispricingService implements OtmMispricingService {
       return cached.value;
     }
     const rows = await this.client!.getChainSnapshot(symbol, expiration);
+    this.noteUpstreamSuccess();
     this.chainCache.set(key, { value: rows, at: this.now() });
     return rows;
   }

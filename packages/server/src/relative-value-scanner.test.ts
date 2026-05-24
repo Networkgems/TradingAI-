@@ -190,4 +190,102 @@ describe('TradierRelativeValueScannerService', () => {
     // Cache hit — no extra Tradier call.
     expect(client.getChainSnapshot).toHaveBeenCalledTimes(1);
   });
+
+  describe('breaker cooldowns (TRA-417)', () => {
+    it('429-shaped error auto-closes after ~90s and lets the next scan proceed', async () => {
+      const { svc, client, advance } = makeService();
+      client.getExpirations.mockRejectedValueOnce(new Error('429 too many requests'));
+      await svc.scan('TEST');
+      expect(svc.diagnostics().breakerOpen).toBe(true);
+
+      advance(89_000);
+      expect(svc.diagnostics().breakerOpen).toBe(true);
+
+      advance(2_000); // crosses the 90s cooldown
+      expect(svc.diagnostics().breakerOpen).toBe(false);
+
+      client.getExpirations.mockResolvedValueOnce([EXP]);
+      client.getChainSnapshot.mockResolvedValueOnce([row(100, 'call', 0.30)]);
+      const result = await svc.scan('TEST');
+      expect(result.reason).toBe('ok');
+    });
+
+    it('non-429 upstream error uses the ~5min cooldown, not the 90s one', async () => {
+      const { svc, client, advance } = makeService();
+      client.getExpirations.mockRejectedValueOnce(new Error('ETIMEDOUT'));
+      await svc.scan('TEST');
+      expect(svc.diagnostics().breakerOpen).toBe(true);
+
+      // Past the 90s 429 cooldown but well within the 5min upstream cooldown.
+      advance(2 * 60_000);
+      expect(svc.diagnostics().breakerOpen).toBe(true);
+
+      advance(4 * 60_000); // total 6min — past 5min cooldown
+      expect(svc.diagnostics().breakerOpen).toBe(false);
+    });
+
+    it('repeated 429s within the backoff window exponentially extend the cooldown', async () => {
+      const { svc, client, advance } = makeService();
+      client.getExpirations.mockResolvedValue([EXP]); // expirations always succeed; chain is what 429s
+      client.getChainSnapshot.mockRejectedValueOnce(new Error('429 Too Many Requests'));
+      await svc.scan('TEST');
+      expect(svc.diagnostics().breakerOpen).toBe(true);
+
+      advance(91_000); // first 90s cooldown elapses
+      expect(svc.diagnostics().breakerOpen).toBe(false);
+
+      // Second 429 inside the 5min backoff window → cooldown doubles to ~180s.
+      client.getChainSnapshot.mockRejectedValueOnce(new Error('429 Too Many Requests'));
+      await svc.scan('TEST');
+      expect(svc.diagnostics().breakerOpen).toBe(true);
+
+      advance(120_000); // 120s into the 180s second cooldown — still open
+      expect(svc.diagnostics().breakerOpen).toBe(true);
+
+      advance(61_000); // total 181s after second trip — closed
+      expect(svc.diagnostics().breakerOpen).toBe(false);
+    });
+
+    it('a successful upstream call resets the consecutive-429 backoff counter', async () => {
+      const { svc, client, advance } = makeService();
+      client.getExpirations.mockResolvedValue([EXP]);
+
+      // Trip 1: 429 on the chain.
+      client.getChainSnapshot.mockRejectedValueOnce(new Error('429 Too Many Requests'));
+      await svc.scan('TEST');
+      advance(91_000); // first 90s cooldown done
+
+      // Successful intermediate scan resets the counter.
+      client.getChainSnapshot.mockResolvedValueOnce([row(100, 'call', 0.30)]);
+      const ok = await svc.scan('TEST');
+      expect(ok.reason).toBe('ok');
+
+      // Past the 60s chain cache TTL so the next scan hits the client again.
+      advance(61_000);
+
+      // Trip 2: another 429 — should get the BASE 90s cooldown, not the
+      // backed-off 180s, because the success reset the counter.
+      client.getChainSnapshot.mockRejectedValueOnce(new Error('429 Too Many Requests'));
+      await svc.scan('TEST');
+      expect(svc.diagnostics().breakerOpen).toBe(true);
+
+      advance(89_000);
+      expect(svc.diagnostics().breakerOpen).toBe(true);
+
+      advance(2_000); // crosses 90s
+      expect(svc.diagnostics().breakerOpen).toBe(false);
+    });
+
+    it('diagnostics.breakerOpenedAtMs reflects the most recent trip', async () => {
+      const { svc, client, advance } = makeService();
+      const t0 = svc.diagnostics().breakerOpenedAtMs;
+      expect(t0).toBeNull();
+
+      advance(1_000);
+      client.getExpirations.mockRejectedValueOnce(new Error('429 too many requests'));
+      await svc.scan('TEST');
+      const t1 = svc.diagnostics().breakerOpenedAtMs;
+      expect(t1).toBe(NOW_BASE + 1_000);
+    });
+  });
 });

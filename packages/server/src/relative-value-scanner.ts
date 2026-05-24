@@ -11,7 +11,38 @@ const log = logger.child({ module: 'relative-value-scanner' });
 
 const CHAIN_CACHE_TTL_MS = 60_000;
 const EXPIRATIONS_CACHE_TTL_MS = 6 * 60 * 60_000;
-const RATE_LIMIT_COOLDOWN_MS = 60 * 60_000;
+// TRA-417 — replaced the flat 1h cooldown with discriminated cooldowns.
+// Tradier's rate limit is a ~60s sliding window (60/min sandbox, 120/min
+// prod); a 1h breaker over-suppressed scanning by ~60x on any transient
+// error. `tripBreaker` now picks the cooldown based on the error class:
+//   • 429: RATE_LIMIT_429_COOLDOWN_MS (~90s = window + buffer). Repeated
+//     429s inside BACKOFF_429_WINDOW_MS exponentially back off up to
+//     BACKOFF_429_MAX_MS so a sustained bucket-exhaustion is not hammered
+//     with retries. A single successful upstream call resets the counter.
+//   • Non-429 (network blip, 5xx, parse error): UPSTREAM_ERROR_COOLDOWN_MS
+//     (~5 min), short enough to recover quickly without 1h dead-time.
+// NOTE: today the Tradier options-client (`packages/engine/src/tradier/
+// options-client.ts`) swallows non-ok responses (including 429) in its
+// private `getJson` and returns `null`/`[]` instead of throwing — so in
+// practice only the non-429 branch fires (on fetch failures / JSON parse
+// errors). The 429 branch is forward-compatible scaffolding; wiring 429
+// into the throw path belongs in a follow-up. The immediate win is the
+// 1h→5min shrink for transient blips.
+const RATE_LIMIT_429_COOLDOWN_MS = 90_000;
+const UPSTREAM_ERROR_COOLDOWN_MS = 5 * 60_000;
+const BACKOFF_429_WINDOW_MS = 5 * 60_000;
+const BACKOFF_429_MAX_MS = 10 * 60_000;
+
+function is429Error(err: unknown): boolean {
+  const msg = err instanceof Error ? err.message : String(err);
+  return /\b429\b|Too Many Requests/i.test(msg);
+}
+
+interface BreakerState {
+  openedAt: number;
+  cooldownMs: number;
+}
+
 // TRA-373 — widened from 14–35 to 21–60 with a 35-day target. The previous
 // 14–35 window collapsed RV signals to month-end past mid-month (the listed
 // monthly was always the earliest-in-window pick), and the 14–21 DTE fit is
@@ -114,8 +145,11 @@ export interface RelativeValueScannerConfig {
  *
  *   • 60 s chain-snapshot cache — repeated scans of the same expiration serve
  *     from cache so we stay well under the 60/min Tradier sandbox cap.
- *   • 1 h circuit breaker — once an upstream fetch throws (typically 429 or
- *     outage), further scans short-circuit until the cooldown elapses.
+ *   • Discriminated circuit breaker (TRA-417) — once an upstream fetch
+ *     throws, further scans short-circuit until a cooldown elapses. The
+ *     cooldown is short (~90s) for 429-shaped errors with exponential
+ *     backoff on repeated trips, and ~5 min for other upstream errors,
+ *     replacing the previous flat 1 h cooldown.
  *   • Expiration auto-pick — selects the listed expiration whose DTE is
  *     closest to the target (default 35d) inside the [min, max] window
  *     (default 21–60d, TRA-373). Per-call overrides on `scan()` carry the
@@ -133,7 +167,13 @@ export class TradierRelativeValueScannerService implements RelativeValueScannerS
 
   private readonly chainCache = new Map<ChainKey, CacheEntry<OptionChainRow[]>>();
   private readonly expirationsCache = new Map<string, CacheEntry<string[]>>();
-  private breakerOpenedAtMs: number | null = null;
+  // TRA-417 — breaker state holds the dynamic cooldown chosen at trip time
+  // (90s for 429 with backoff, 5min for other upstream errors). Backoff
+  // tracking is separate so a long quiet period between 429s resets the
+  // counter without clearing an in-flight cooldown.
+  private breakerState: BreakerState | null = null;
+  private last429AtMs: number | null = null;
+  private consecutive429 = 0;
 
   constructor(config: RelativeValueScannerConfig) {
     this.fetchSpot = config.fetchSpot;
@@ -162,7 +202,7 @@ export class TradierRelativeValueScannerService implements RelativeValueScannerS
     return {
       configured: this.client !== null,
       breakerOpen: this.isBreakerOpen(),
-      breakerOpenedAtMs: this.breakerOpenedAtMs,
+      breakerOpenedAtMs: this.breakerState?.openedAt ?? null,
       cacheSize: this.chainCache.size,
       expirationsCacheSize: this.expirationsCache.size,
     };
@@ -251,22 +291,55 @@ export class TradierRelativeValueScannerService implements RelativeValueScannerS
   }
 
   private isBreakerOpen(): boolean {
-    if (this.breakerOpenedAtMs == null) return false;
-    if (this.now() - this.breakerOpenedAtMs >= RATE_LIMIT_COOLDOWN_MS) {
-      this.breakerOpenedAtMs = null;
+    if (this.breakerState == null) return false;
+    if (this.now() - this.breakerState.openedAt >= this.breakerState.cooldownMs) {
+      this.breakerState = null;
       return false;
     }
     return true;
   }
 
   private tripBreaker(label: string, err: unknown): void {
-    this.breakerOpenedAtMs = this.now();
+    const now = this.now();
     const msg = err instanceof Error ? err.message : String(err);
-    log.warn('breaker open', {
-      cooldownMinutes: RATE_LIMIT_COOLDOWN_MS / 60_000,
-      label,
-      reason: msg,
-    });
+    if (is429Error(err)) {
+      if (this.last429AtMs != null && now - this.last429AtMs <= BACKOFF_429_WINDOW_MS) {
+        this.consecutive429 += 1;
+      } else {
+        this.consecutive429 = 1;
+      }
+      this.last429AtMs = now;
+      const cooldownMs = Math.min(
+        RATE_LIMIT_429_COOLDOWN_MS * 2 ** (this.consecutive429 - 1),
+        BACKOFF_429_MAX_MS,
+      );
+      this.breakerState = { openedAt: now, cooldownMs };
+      log.warn('breaker open (rate limit)', {
+        cooldownSeconds: Math.round(cooldownMs / 1000),
+        consecutive429: this.consecutive429,
+        label,
+        reason: msg,
+      });
+    } else {
+      this.breakerState = { openedAt: now, cooldownMs: UPSTREAM_ERROR_COOLDOWN_MS };
+      log.warn('breaker open (upstream error)', {
+        cooldownSeconds: Math.round(UPSTREAM_ERROR_COOLDOWN_MS / 1000),
+        label,
+        reason: msg,
+      });
+    }
+  }
+
+  /**
+   * Reset the consecutive-429 counter when an upstream call returns without
+   * throwing. Cache hits do not call this (no network traffic = no fresh
+   * signal about the rate-limit bucket).
+   */
+  private noteUpstreamSuccess(): void {
+    if (this.consecutive429 !== 0) {
+      this.consecutive429 = 0;
+      this.last429AtMs = null;
+    }
   }
 
   private async pickExpiration(symbol: string, dtePrefs: DtePrefs = {}): Promise<string | null> {
@@ -276,6 +349,7 @@ export class TradierRelativeValueScannerService implements RelativeValueScannerS
       expirations = cached.value;
     } else {
       expirations = await this.client!.getExpirations(symbol);
+      this.noteUpstreamSuccess();
       this.expirationsCache.set(symbol, { value: expirations, at: this.now() });
     }
     if (expirations.length === 0) return null;
@@ -333,6 +407,7 @@ export class TradierRelativeValueScannerService implements RelativeValueScannerS
       return cached.value;
     }
     const rows = await this.client!.getChainSnapshot(symbol, expiration);
+    this.noteUpstreamSuccess();
     this.chainCache.set(key, { value: rows, at: this.now() });
     return rows;
   }
