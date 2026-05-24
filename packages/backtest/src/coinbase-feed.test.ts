@@ -14,12 +14,15 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import type { Candle } from '@trading-app/shared';
 import {
+  _resetCoinbaseAdvancedTradeBreakerForTests,
   _resetCoinbaseBreakerForTests,
   aggregate1hTo4h,
   fetchCoinbaseHourlyBars,
   fetchCoinbase4hBars,
   fillGrid4h,
+  isCoinbaseAdvancedTradeBreakerOpen,
   isCoinbaseBreakerOpen,
+  paceCoinbaseAdvancedTradeFetch,
   paceCoinbaseFetch,
   summarize4hGaps,
 } from './coinbase-feed.js';
@@ -487,5 +490,208 @@ describe('paceCoinbaseFetch (TRA-329)', () => {
 
     expect(isCoinbaseBreakerOpen()).toBe(false);
     expect(callsBeforeBreakerExpected).toBe(4 + 1 + 4);
+  });
+});
+
+/**
+ * TRA-484 — sibling pacer for the keyless `api.coinbase.com` host. The
+ * Exchange pacer above is *host-scoped*; the Advanced Trade pacer keeps its
+ * own chain / breaker so a hang on one host does not poison the other.
+ * Mirrors the coverage shape of the Exchange pacer block: abort, breaker
+ * trip, counter reset, plus a cross-pacer isolation check.
+ */
+describe('paceCoinbaseAdvancedTradeFetch (TRA-484)', () => {
+  beforeEach(() => {
+    vi.useFakeTimers();
+    _resetCoinbaseAdvancedTradeBreakerForTests();
+    _resetCoinbaseBreakerForTests();
+  });
+  afterEach(() => {
+    vi.useRealTimers();
+    vi.unstubAllGlobals();
+    _resetCoinbaseAdvancedTradeBreakerForTests();
+    _resetCoinbaseBreakerForTests();
+  });
+
+  it('aborts a hung fetch via AbortController so the chain is not poisoned', async () => {
+    let abortedSignal: AbortSignal | null = null;
+    const responses: Array<(req: { signal?: AbortSignal | null }) => Promise<Response>> = [
+      (req) => new Promise<Response>((_resolve, reject) => {
+        const sig = req.signal ?? null;
+        abortedSignal = sig;
+        if (!sig) return;
+        const onAbort = () => {
+          const reason = (sig as AbortSignal & { reason?: unknown }).reason;
+          reject(reason instanceof Error ? reason : new DOMException('Aborted', 'AbortError'));
+        };
+        if (sig.aborted) onAbort();
+        else sig.addEventListener('abort', onAbort);
+      }),
+      async () => new Response(JSON.stringify({ ok: true }), { status: 200 }),
+    ];
+    let callIdx = 0;
+    vi.stubGlobal('fetch', vi.fn(async (_url: string | URL, init?: RequestInit) => {
+      const handler = responses[callIdx++];
+      return handler({ signal: init?.signal ?? null });
+    }));
+
+    const first = paceCoinbaseAdvancedTradeFetch(
+      'https://api.coinbase.com/api/v3/brokerage/market/products',
+      {},
+      { timeoutMs: 500 },
+    ).catch((e) => e);
+    const second = paceCoinbaseAdvancedTradeFetch(
+      'https://api.coinbase.com/api/v3/brokerage/market/products/BTC-USD/candles',
+      {},
+      { timeoutMs: 500 },
+    );
+
+    await vi.runAllTimersAsync();
+    const firstErr = await first;
+    expect(firstErr).toBeInstanceOf(Error);
+    expect((firstErr as Error).message).toMatch(/Coinbase Advanced Trade fetch timed out after 500ms/);
+    const resp = await second;
+    expect(resp.ok).toBe(true);
+    expect(abortedSignal).not.toBeNull();
+    expect(abortedSignal!.aborted).toBe(true);
+  });
+
+  it('trips the breaker after 5 transport failures and fast-fails subsequent calls', async () => {
+    vi.stubGlobal('fetch', vi.fn(async (_url: string | URL, init?: RequestInit) => {
+      const sig = init?.signal ?? null;
+      return new Promise<Response>((_resolve, reject) => {
+        if (!sig) return;
+        const onAbort = () => reject(new DOMException('Aborted', 'AbortError'));
+        if (sig.aborted) onAbort();
+        else sig.addEventListener('abort', onAbort);
+      });
+    }));
+
+    expect(isCoinbaseAdvancedTradeBreakerOpen()).toBe(false);
+
+    const failures: Promise<unknown>[] = [];
+    for (let i = 0; i < 5; i++) {
+      failures.push(
+        paceCoinbaseAdvancedTradeFetch(
+          `https://api.coinbase.com/api/v3/brokerage/market/products/SYM${i}/candles`,
+          {},
+          { timeoutMs: 100 },
+        ).catch((e) => e),
+      );
+    }
+    await vi.runAllTimersAsync();
+    await Promise.all(failures);
+
+    expect(isCoinbaseAdvancedTradeBreakerOpen()).toBe(true);
+
+    const fetchMock = globalThis.fetch as unknown as ReturnType<typeof vi.fn>;
+    const before = fetchMock.mock.calls.length;
+    await expect(
+      paceCoinbaseAdvancedTradeFetch(
+        'https://api.coinbase.com/api/v3/brokerage/market/products/BTC-USD/candles',
+        {},
+        { timeoutMs: 5_000 },
+      ),
+    ).rejects.toThrow(/Coinbase advanced-trade breaker open/);
+    expect(fetchMock.mock.calls.length).toBe(before);
+  });
+
+  it('resets the failure counter on a successful fetch', async () => {
+    let nextShouldHang = true;
+    let callsObserved = 0;
+    vi.stubGlobal('fetch', vi.fn(async (_url: string | URL, init?: RequestInit) => {
+      callsObserved += 1;
+      if (nextShouldHang) {
+        const sig = init?.signal ?? null;
+        return new Promise<Response>((_resolve, reject) => {
+          if (!sig) return;
+          const onAbort = () => reject(new DOMException('Aborted', 'AbortError'));
+          if (sig.aborted) onAbort();
+          else sig.addEventListener('abort', onAbort);
+        });
+      }
+      return new Response(JSON.stringify({}), { status: 200 });
+    }));
+
+    for (let i = 0; i < 4; i++) {
+      const p = paceCoinbaseAdvancedTradeFetch(`https://x/${i}`, {}, { timeoutMs: 50 }).catch((e) => e);
+      await vi.runAllTimersAsync();
+      await p;
+    }
+    nextShouldHang = false;
+    const okPromise = paceCoinbaseAdvancedTradeFetch('https://x/ok', {}, { timeoutMs: 50 });
+    await vi.runAllTimersAsync();
+    const ok = await okPromise;
+    expect(ok.ok).toBe(true);
+
+    nextShouldHang = true;
+    for (let i = 0; i < 4; i++) {
+      const p = paceCoinbaseAdvancedTradeFetch(`https://x/post${i}`, {}, { timeoutMs: 50 }).catch((e) => e);
+      await vi.runAllTimersAsync();
+      await p;
+    }
+
+    expect(isCoinbaseAdvancedTradeBreakerOpen()).toBe(false);
+    expect(callsObserved).toBe(4 + 1 + 4);
+  });
+
+  it('keeps Exchange and Advanced Trade pacers isolated — tripping one does not trip the other', async () => {
+    // Five hung Advanced Trade fetches → AT breaker trips. Exchange breaker
+    // must remain closed because each pacer owns its own failure counter.
+    vi.stubGlobal('fetch', vi.fn(async (_url: string | URL, init?: RequestInit) => {
+      const sig = init?.signal ?? null;
+      return new Promise<Response>((_resolve, reject) => {
+        if (!sig) return;
+        const onAbort = () => reject(new DOMException('Aborted', 'AbortError'));
+        if (sig.aborted) onAbort();
+        else sig.addEventListener('abort', onAbort);
+      });
+    }));
+
+    const failures: Promise<unknown>[] = [];
+    for (let i = 0; i < 5; i++) {
+      failures.push(
+        paceCoinbaseAdvancedTradeFetch(
+          `https://api.coinbase.com/api/v3/brokerage/market/products/SYM${i}/candles`,
+          {},
+          { timeoutMs: 100 },
+        ).catch((e) => e),
+      );
+    }
+    await vi.runAllTimersAsync();
+    await Promise.all(failures);
+
+    expect(isCoinbaseAdvancedTradeBreakerOpen()).toBe(true);
+    expect(isCoinbaseBreakerOpen()).toBe(false);
+
+    // And an Exchange call still goes through (mocked to hang, but the
+    // breaker fast-fail is the bit we care about — it must NOT short-circuit).
+    const exchangeAttempt = paceCoinbaseFetch(
+      'https://api.exchange.coinbase.com/products/BTC-USD/stats',
+      {},
+      { timeoutMs: 100 },
+    ).catch((e) => e);
+    await vi.runAllTimersAsync();
+    const exErr = await exchangeAttempt;
+    expect(String((exErr as Error).message)).not.toMatch(/breaker open/);
+  });
+
+  it('paces requests with the 150 ms min-gap between calls', async () => {
+    // Two back-to-back fetches must be ≥150 ms apart, observed via Date.now()
+    // captured inside the mocked fetch.
+    const stamps: number[] = [];
+    vi.stubGlobal('fetch', vi.fn(async () => {
+      stamps.push(Date.now());
+      return new Response(JSON.stringify({}), { status: 200 });
+    }));
+
+    const a = paceCoinbaseAdvancedTradeFetch('https://api.coinbase.com/a', {}, { timeoutMs: 1_000 });
+    const b = paceCoinbaseAdvancedTradeFetch('https://api.coinbase.com/b', {}, { timeoutMs: 1_000 });
+    await vi.runAllTimersAsync();
+    await a;
+    await b;
+
+    expect(stamps).toHaveLength(2);
+    expect(stamps[1] - stamps[0]).toBeGreaterThanOrEqual(150);
   });
 });

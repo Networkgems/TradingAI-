@@ -29,119 +29,202 @@ const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 type CoinbaseCandleRow = [number, number, number, number, number, number];
 
 /**
- * TRA-300 — global rate limiter for *all* Coinbase Exchange public-data
- * requests originating from this process. Coinbase enforces 10 req/s per IP
- * across the entire `api.exchange.coinbase.com` surface (candles, stats,
- * tickers, products, …), so the live engine's tick — which fans out ~50
- * stats + 50 minute + 50 daily + 5 4H requests within a few seconds — was
- * blowing the budget and getting bulk-429'd back to Yahoo. The scheduler
- * serialises every Coinbase fetch through a single Promise chain with a
- * 120 ms min gap (≈ 8.3 req/s sustained, leaving headroom for the
- * occasional retry without crossing 10/s). All call sites — including
- * `fetchCoinbaseStatsQuotes` in `packages/server/src/crypto-feed.ts` —
- * route through {@link paceCoinbaseFetch} so the limit is enforced
- * regardless of which file kicked off the request.
+ * TRA-300 / TRA-329 — host-keyed rate limiter + circuit breaker for Coinbase
+ * public-data requests.
  *
- * TRA-329 — added a per-fetch `AbortController` and a circuit breaker.
- * The TRA-300 design only had an *outer* `withTimeout` wrapper around each
- * call (in `crypto-feed.ts`); when a single fetch hung longer than the
- * budget the outer wrapper rejected, but the underlying socket was still
- * waiting on Coinbase. The hung fetch held the rate-limiter chain link
- * open, and every subsequent enqueue piled up behind it — each timing out
- * at the outer 8 s wrapper too. One genuinely slow Coinbase response
- * therefore cascaded into "every call timed out, falling back to Yahoo"
- * for the remainder of the tick (TRA-329 prod symptom). The
- * `AbortController` here actually cancels the hung fetch so the chain
- * advances; the breaker stops us from burning the 8 s outer budget on
- * every symbol once we know Coinbase is unhealthy.
+ * Coinbase enforces a per-IP request budget on each host independently
+ * (`api.exchange.coinbase.com` and the keyless `api.coinbase.com` Advanced
+ * Trade host are separate buckets), so a single global pacer either over-paces
+ * the cheaper host or blows the budget on the more sensitive one. The factory
+ * below produces an isolated pacer per host: each has its own Promise chain
+ * (so a hung fetch on one host can't poison the other), its own failure
+ * counter, and its own cooldown window. {@link paceCoinbaseFetch} is the
+ * Exchange-host instance (~120 ms gap ≈ 8.3 req/s, comfortably under the
+ * documented 10 req/s/IP cap). TRA-484 added
+ * {@link paceCoinbaseAdvancedTradeFetch} for `api.coinbase.com` with a
+ * slightly larger 150 ms gap (~6.6 req/s) — the Advanced Trade public surface
+ * is the keyless Exchange-breaker-open fallback path, so a more conservative
+ * gap leaves headroom for the cascade when ~45 watchlist symbols fan out at
+ * once.
+ *
+ * TRA-300 background — the live engine's tick fans out ~50 stats + 50 minute
+ * + 50 daily + 5 4H requests within a few seconds; without pacing, the
+ * Exchange host bulk-429'd every call and the cascade collapsed back to
+ * Yahoo. TRA-329 added the per-fetch `AbortController` after observing that
+ * one slow Coinbase response could hold the chain link open and stall every
+ * subsequent enqueue (each in turn timing out at the outer 8 s wrapper). The
+ * breaker fast-fails subsequent calls so we stop burning the outer budget
+ * once we know the host is unhealthy.
  */
-const COINBASE_MIN_GAP_MS = 120;
+const COINBASE_EXCHANGE_MIN_GAP_MS = 120;
+const COINBASE_ADVANCED_TRADE_MIN_GAP_MS = 150;
 const COINBASE_FETCH_TIMEOUT_MS = 7_000;
 const COINBASE_BREAKER_FAILURE_THRESHOLD = 5;
 const COINBASE_BREAKER_FAILURE_WINDOW_MS = 30_000;
 const COINBASE_BREAKER_COOLDOWN_MS = 60_000;
 
-let coinbaseChain: Promise<unknown> = Promise.resolve();
-let coinbaseLastRequestAt = 0;
-let recentCoinbaseFailures: number[] = [];
-let coinbaseBreakerOpenUntil = 0;
+interface HostPacer {
+  pace: (
+    url: string,
+    init?: { headers?: Record<string, string> },
+    options?: { timeoutMs?: number },
+  ) => Promise<Response>;
+  isBreakerOpen: () => boolean;
+  reset: () => void;
+}
+
+interface HostPacerOptions {
+  /** Label inserted into log lines (e.g. "exchange" / "advanced-trade"). */
+  logLabel: string;
+  /** Minimum gap between fetches on this host. */
+  minGapMs: number;
+  /** Error message thrown when the breaker is open. Substring-matched by callers in `crypto-feed.ts`. */
+  breakerOpenMessage: string;
+  /** Error-message prefix for the per-fetch abort timeout. */
+  timeoutMessagePrefix: string;
+}
+
+function createHostPacer(opts: HostPacerOptions): HostPacer {
+  let chain: Promise<unknown> = Promise.resolve();
+  let lastRequestAt = 0;
+  let recentFailures: number[] = [];
+  let breakerOpenUntil = 0;
+
+  const isBreakerOpen = (): boolean => Date.now() < breakerOpenUntil;
+
+  const recordFailure = (): void => {
+    const now = Date.now();
+    recentFailures.push(now);
+    while (recentFailures.length > 0 && recentFailures[0] < now - COINBASE_BREAKER_FAILURE_WINDOW_MS) {
+      recentFailures.shift();
+    }
+    if (recentFailures.length >= COINBASE_BREAKER_FAILURE_THRESHOLD) {
+      breakerOpenUntil = now + COINBASE_BREAKER_COOLDOWN_MS;
+      recentFailures = [];
+      console.warn(
+        `[coinbase-feed] ${opts.logLabel} circuit breaker tripped — skipping for ${COINBASE_BREAKER_COOLDOWN_MS / 1000}s after ${COINBASE_BREAKER_FAILURE_THRESHOLD} consecutive transport failures`,
+      );
+    }
+  };
+
+  const recordSuccess = (): void => {
+    recentFailures = [];
+  };
+
+  const pace = async (
+    url: string,
+    init?: { headers?: Record<string, string> },
+    options: { timeoutMs?: number } = {},
+  ): Promise<Response> => {
+    if (isBreakerOpen()) {
+      throw new Error(opts.breakerOpenMessage);
+    }
+    const timeoutMs = options.timeoutMs ?? COINBASE_FETCH_TIMEOUT_MS;
+    const next = chain.then(async () => {
+      // Skip the wait when the gap is already exceeded *or* when `Date.now()`
+      // appears to go backwards (vitest's fake timers reset the clock between
+      // `it()`s, which would otherwise compute a huge positive wait against a
+      // never-advancing fake clock and deadlock the suite).
+      const elapsed = Date.now() - lastRequestAt;
+      if (elapsed >= 0 && elapsed < opts.minGapMs) {
+        await sleep(opts.minGapMs - elapsed);
+      }
+      lastRequestAt = Date.now();
+
+      // TRA-329 — the AbortController is the load-bearing piece. Without it,
+      // a slow fetch would leave the chain link open even after the outer
+      // `withTimeout` rejected, blocking every subsequent enqueue.
+      const controller = new AbortController();
+      const abortTimer = setTimeout(() => controller.abort(), timeoutMs);
+      try {
+        const resp = await fetch(url, { ...init, signal: controller.signal });
+        recordSuccess();
+        return resp;
+      } catch (err) {
+        recordFailure();
+        if (controller.signal.aborted) {
+          throw new Error(`${opts.timeoutMessagePrefix} timed out after ${timeoutMs}ms`);
+        }
+        throw err;
+      } finally {
+        clearTimeout(abortTimer);
+      }
+    });
+    // Keep the chain alive even if a call rejects, so a single failed request
+    // doesn't poison every subsequent enqueue.
+    chain = next.catch(() => undefined);
+    return next as Promise<Response>;
+  };
+
+  const reset = (): void => {
+    recentFailures = [];
+    breakerOpenUntil = 0;
+    chain = Promise.resolve();
+    lastRequestAt = 0;
+  };
+
+  return { pace, isBreakerOpen, reset };
+}
+
+const exchangePacer = createHostPacer({
+  logLabel: 'exchange',
+  minGapMs: COINBASE_EXCHANGE_MIN_GAP_MS,
+  // Substring-matched by warn-suppression filters in `crypto-feed.ts` — do not rename.
+  breakerOpenMessage: 'Coinbase breaker open',
+  timeoutMessagePrefix: 'Coinbase fetch',
+});
+const advancedTradePacer = createHostPacer({
+  logLabel: 'advanced-trade',
+  minGapMs: COINBASE_ADVANCED_TRADE_MIN_GAP_MS,
+  breakerOpenMessage: 'Coinbase advanced-trade breaker open',
+  timeoutMessagePrefix: 'Coinbase Advanced Trade fetch',
+});
 
 export function isCoinbaseBreakerOpen(): boolean {
-  return Date.now() < coinbaseBreakerOpenUntil;
+  return exchangePacer.isBreakerOpen();
 }
 
-/** Test seam — reset all breaker / chain state between unit tests. */
+/**
+ * TRA-484 — `true` while the Advanced Trade pacer is in its cooldown window.
+ * Exposed for parity with {@link isCoinbaseBreakerOpen} and for health probes
+ * that want to surface both keyless paths independently.
+ */
+export function isCoinbaseAdvancedTradeBreakerOpen(): boolean {
+  return advancedTradePacer.isBreakerOpen();
+}
+
+/** Test seam — reset Exchange-pacer breaker / chain state between unit tests. */
 export function _resetCoinbaseBreakerForTests(): void {
-  recentCoinbaseFailures = [];
-  coinbaseBreakerOpenUntil = 0;
-  coinbaseChain = Promise.resolve();
-  coinbaseLastRequestAt = 0;
+  exchangePacer.reset();
 }
 
-function recordCoinbaseFailure(): void {
-  const now = Date.now();
-  recentCoinbaseFailures.push(now);
-  while (recentCoinbaseFailures.length > 0 && recentCoinbaseFailures[0] < now - COINBASE_BREAKER_FAILURE_WINDOW_MS) {
-    recentCoinbaseFailures.shift();
-  }
-  if (recentCoinbaseFailures.length >= COINBASE_BREAKER_FAILURE_THRESHOLD) {
-    coinbaseBreakerOpenUntil = now + COINBASE_BREAKER_COOLDOWN_MS;
-    recentCoinbaseFailures = [];
-    console.warn(
-      `[coinbase-feed] circuit breaker tripped — skipping Coinbase for ${COINBASE_BREAKER_COOLDOWN_MS / 1000}s after ${COINBASE_BREAKER_FAILURE_THRESHOLD} consecutive transport failures`,
-    );
-  }
+/** Test seam — reset Advanced Trade pacer breaker / chain state. */
+export function _resetCoinbaseAdvancedTradeBreakerForTests(): void {
+  advancedTradePacer.reset();
 }
 
-function recordCoinbaseSuccess(): void {
-  recentCoinbaseFailures = [];
-}
-
-export async function paceCoinbaseFetch(
+export function paceCoinbaseFetch(
   url: string,
   init?: { headers?: Record<string, string> },
   options: { timeoutMs?: number } = {},
 ): Promise<Response> {
-  // TRA-329 — fast-fail when the breaker is open so callers fall through to
-  // Yahoo immediately instead of paying the outer 8 s budget per symbol.
-  if (isCoinbaseBreakerOpen()) {
-    throw new Error('Coinbase breaker open');
-  }
-  const timeoutMs = options.timeoutMs ?? COINBASE_FETCH_TIMEOUT_MS;
-  const next = coinbaseChain.then(async () => {
-    // Skip the wait when the gap is already exceeded *or* when `Date.now()`
-    // appears to go backwards (vitest's fake timers reset the clock between
-    // `it()`s, which would otherwise compute a huge positive wait against a
-    // never-advancing fake clock and deadlock the suite).
-    const elapsed = Date.now() - coinbaseLastRequestAt;
-    if (elapsed >= 0 && elapsed < COINBASE_MIN_GAP_MS) {
-      await sleep(COINBASE_MIN_GAP_MS - elapsed);
-    }
-    coinbaseLastRequestAt = Date.now();
+  return exchangePacer.pace(url, init, options);
+}
 
-    // TRA-329 — the AbortController is the load-bearing piece. Without it,
-    // a slow fetch would leave the chain link open even after the outer
-    // `withTimeout` rejected, blocking every subsequent enqueue.
-    const controller = new AbortController();
-    const abortTimer = setTimeout(() => controller.abort(), timeoutMs);
-    try {
-      const resp = await fetch(url, { ...init, signal: controller.signal });
-      recordCoinbaseSuccess();
-      return resp;
-    } catch (err) {
-      recordCoinbaseFailure();
-      if (controller.signal.aborted) {
-        throw new Error(`Coinbase fetch timed out after ${timeoutMs}ms`);
-      }
-      throw err;
-    } finally {
-      clearTimeout(abortTimer);
-    }
-  });
-  // Keep the chain alive even if a call rejects, so a single failed request
-  // doesn't poison every subsequent enqueue.
-  coinbaseChain = next.catch(() => undefined);
-  return next as Promise<Response>;
+/**
+ * TRA-484 — sibling of {@link paceCoinbaseFetch} for the keyless Advanced
+ * Trade host (`api.coinbase.com`). Same chain / breaker semantics, separate
+ * state. Route every `api.coinbase.com/api/v3/brokerage/market/...` call
+ * through this so the keyless fallback path stays inside Coinbase's per-IP
+ * budget when the Exchange breaker is open and the cascade fans out the full
+ * watchlist against it.
+ */
+export function paceCoinbaseAdvancedTradeFetch(
+  url: string,
+  init?: { headers?: Record<string, string> },
+  options: { timeoutMs?: number } = {},
+): Promise<Response> {
+  return advancedTradePacer.pace(url, init, options);
 }
 
 /**

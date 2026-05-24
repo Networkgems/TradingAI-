@@ -6,6 +6,7 @@ import {
   fetchCoinbaseMinuteBars,
   isCoinbaseBreakerOpen,
   paceCoinbaseFetch,
+  paceCoinbaseAdvancedTradeFetch,
   aggregate1hTo4h,
   fillGrid4h,
 } from '@trading-app/backtest';
@@ -267,8 +268,12 @@ export async function fetchCoinbaseAdvancedTradeQuotes(
   try {
     const params = new URLSearchParams();
     for (const s of symbols) params.append('product_ids', s);
+    // TRA-484 — route through the Advanced Trade pacer so the keyless
+    // `api.coinbase.com` host stays inside Coinbase's per-IP budget. Without
+    // pacing, when the Exchange breaker is open and ~45 watchlist symbols
+    // cascade here at once, the host bulk-429s every call.
     const resp = await withTimeout(
-      fetch(
+      paceCoinbaseAdvancedTradeFetch(
         `${COINBASE_ADVANCED_TRADE_BASE}/api/v3/brokerage/market/products?${params.toString()}`,
         { headers: { 'User-Agent': 'TRA-437/1.0', Accept: 'application/json' } },
       ),
@@ -367,8 +372,13 @@ export async function fetchCoinbaseAdvancedTradeCandles(
         granularity: granEnum,
         limit: String(COINBASE_AT_MAX_CANDLES),
       });
+      // TRA-484 — paced via the Advanced Trade pacer (separate per-host bucket
+      // from the Exchange pacer). The candle fan-out is the dominant 429 source
+      // when the Exchange breaker opens and every watchlist symbol cascades
+      // here, so the pacer + breaker are required to keep the keyless host
+      // healthy under that load.
       const resp = await withTimeout(
-        fetch(
+        paceCoinbaseAdvancedTradeFetch(
           `${COINBASE_ADVANCED_TRADE_BASE}/api/v3/brokerage/market/products/${encodeURIComponent(symbol)}/candles?${params.toString()}`,
           { headers: { 'User-Agent': 'TRA-438/1.0', Accept: 'application/json' } },
         ),
@@ -519,7 +529,12 @@ export async function fetchCryptoDailyBars(symbol: string, count = 260): Promise
     const usable = atBars.filter(b => b.volume > 0);
     if (usable.length > 0) return usable.slice(-count);
   } catch (err: unknown) {
-    console.warn(`[crypto-feed] fetchCryptoDailyBars(${symbol}) Coinbase Advanced Trade: ${err instanceof Error ? err.message : String(err)} — falling back to Yahoo`);
+    const msg = err instanceof Error ? err.message : String(err);
+    // TRA-484 — suppress per-symbol warn while the AT breaker is open; the
+    // breaker logs a single trip line, same pattern as the Exchange path.
+    if (!/Coinbase advanced-trade breaker open/.test(msg)) {
+      console.warn(`[crypto-feed] fetchCryptoDailyBars(${symbol}) Coinbase Advanced Trade: ${msg} — falling back to Yahoo`);
+    }
   }
 
   // Fallback: Yahoo Finance.
@@ -593,7 +608,10 @@ export async function fetchCrypto4hBars(symbol: string, count = 260): Promise<Ca
       if (aggregated.length > 0) return aggregated.slice(-count);
     }
   } catch (err: unknown) {
-    console.error(`[crypto-feed] fetchCrypto4hBars(${symbol}) Advanced Trade:`, err instanceof Error ? err.message : String(err));
+    const msg = err instanceof Error ? err.message : String(err);
+    if (!/Coinbase advanced-trade breaker open/.test(msg)) {
+      console.error(`[crypto-feed] fetchCrypto4hBars(${symbol}) Advanced Trade:`, msg);
+    }
   }
   return [];
 }
@@ -645,7 +663,10 @@ export async function fetchCryptoMinuteBars(symbol: string, count = 60): Promise
       .filter(b => b.volume > 0);
     if (completed.length > 0) return completed.slice(-count);
   } catch (err: unknown) {
-    console.warn(`[crypto-feed] fetchCryptoMinuteBars(${symbol}) Coinbase Advanced Trade: ${err instanceof Error ? err.message : String(err)} — falling back to Yahoo`);
+    const msg = err instanceof Error ? err.message : String(err);
+    if (!/Coinbase advanced-trade breaker open/.test(msg)) {
+      console.warn(`[crypto-feed] fetchCryptoMinuteBars(${symbol}) Coinbase Advanced Trade: ${msg} — falling back to Yahoo`);
+    }
   }
 
   // Fallback: Yahoo Finance.

@@ -65,7 +65,9 @@ export {
   fillGrid4h,
   summarize4hGaps,
   paceCoinbaseFetch,
+  paceCoinbaseAdvancedTradeFetch,
   isCoinbaseBreakerOpen,
+  isCoinbaseAdvancedTradeBreakerOpen,
 } from './coinbase-feed.js';
 export type { GridGap } from './coinbase-feed.js';
 export {
