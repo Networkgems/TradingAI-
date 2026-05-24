@@ -131,15 +131,26 @@ interface TradierBalancesEnvelope {
     open_pl?: number;
     /** TRA-335 — total long market value, used for live equity sizing. */
     long_market_value?: number;
-    /** TRA-319 — margin accounts surface option buying power under `margin`. */
+    /**
+     * TRA-319 — margin accounts surface option buying power under `margin`.
+     * TRA-483 — `day_trade_buying_power` is the PDT day-trading limit (rolling
+     * 5-day window). Tradier returns this on margin accounts flagged PDT.
+     */
     margin?: {
       option_buying_power?: number;
       stock_buying_power?: number;
+      day_trade_buying_power?: number;
     } | null;
-    /** TRA-319 — pattern-day-trader accounts surface it under `pdt`. */
+    /**
+     * TRA-319 — pattern-day-trader accounts surface it under `pdt`.
+     * TRA-483 — `day_trade_buying_power` is the actionable day-trade limit
+     * for these accounts; once it hits $0 Tradier rejects every same-day
+     * close even with positive `option_buying_power`.
+     */
     pdt?: {
       option_buying_power?: number;
       stock_buying_power?: number;
+      day_trade_buying_power?: number;
     } | null;
     /** TRA-319 — cash accounts only have `cash.cash_available`. */
     cash?: {
@@ -174,6 +185,16 @@ export interface TradierAccountBalance {
    * for sizing. `null` when Tradier didn't return the field.
    */
   longMarketValue: number | null;
+  /**
+   * TRA-483 — pattern-day-trader day-trading buying power. Tradier reports
+   * this on margin / PDT accounts; cash accounts don't carry it. When it
+   * drops to $0 the broker rejects same-day option round trips even though
+   * `optionBuyingPower` may still be positive — which is the exact failure
+   * mode the issue captured (option BP looked fine but trades stopped
+   * opening). `null` when Tradier didn't surface the field; the live
+   * pre-check skips the DTBP gate in that case and stays permissive.
+   */
+  dayTradeBuyingPower: number | null;
 }
 
 /** Tradier returns `T | T[]` depending on result count; sometimes `null`/empty string when none. */
@@ -457,7 +478,22 @@ export class TradierOptionsClient extends TradierOrderClient {
     const stockBuyingPower = typeof sbpRaw === 'number' && Number.isFinite(sbpRaw) ? sbpRaw : null;
     const lmvRaw = b.long_market_value;
     const longMarketValue = typeof lmvRaw === 'number' && Number.isFinite(lmvRaw) ? lmvRaw : null;
-    return { totalEquity, totalCash, optionBuyingPower, stockBuyingPower, longMarketValue };
+    // TRA-483 — surface day_trade_buying_power so the live engine can refuse
+    // to open same-day round trips when the broker's DTBP is exhausted. Only
+    // margin / PDT accounts carry it; cash accounts get `null`.
+    const dtbpRaw =
+      b.margin?.day_trade_buying_power
+      ?? b.pdt?.day_trade_buying_power;
+    const dayTradeBuyingPower =
+      typeof dtbpRaw === 'number' && Number.isFinite(dtbpRaw) ? dtbpRaw : null;
+    return {
+      totalEquity,
+      totalCash,
+      optionBuyingPower,
+      stockBuyingPower,
+      longMarketValue,
+      dayTradeBuyingPower,
+    };
   }
 
   /**

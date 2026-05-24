@@ -432,6 +432,125 @@ describe('SignalEngine — TRA-319 live RV mirror reconciliation', () => {
     expect(state.signals[0].liveSkipReason).toContain('insufficient buying power');
   });
 
+  // TRA-483 — when Tradier's day-trade buying power (PDT limit) hits $0 the
+  // broker rejects every same-day option round trip even though
+  // `optionBuyingPower` may still be positive. The signal-time pre-check now
+  // surfaces a skip signal up-front instead of submitting orders Tradier
+  // will silently cancel for "insufficient day-trade buying power". The
+  // dashboard then shows the DTBP-exhausted skip reason next to the failed
+  // signal so the user can diagnose without mining logs (the issue's
+  // screenshot showed positive Option BP but DTBP $0 and no trades opening).
+  it('skips the order at the signal pre-check when dayTradeBuyingPower is below notional cost (TRA-483)', async () => {
+    const stub: TradierLiveStub = {
+      getAccountBalance: vi.fn(),
+      getOptionQuote: vi.fn(),
+      buyContractsLimit: vi.fn(),
+      cancelOrder: vi.fn(),
+      waitForOrderTerminalStatus: vi.fn(),
+    };
+    const engine = setupLiveEngine(stub, freshScanner());
+    // Option BP large enough to clear the per-position cap, but DTBP=$0 —
+    // the exact PDT-limit-reached failure mode from the issue's screenshot.
+    (engine as unknown as {
+      liveTradierBalance: {
+        totalEquity: number;
+        totalCash: number;
+        optionBuyingPower: number;
+        dayTradeBuyingPower: number;
+      } | null;
+    }).liveTradierBalance = {
+      totalEquity: 25_000,
+      totalCash: 25_000,
+      optionBuyingPower: 25_000,
+      dayTradeBuyingPower: 0,
+    };
+
+    await (engine as unknown as { runRelativeValueScan: (s: string[]) => Promise<void> }).runRelativeValueScan(['AAPL']);
+
+    // Broker never called — DTBP gate trips at the signal pre-check.
+    expect(stub.buyContractsLimit).not.toHaveBeenCalled();
+    expect(stub.waitForOrderTerminalStatus).not.toHaveBeenCalled();
+
+    const state = engine.getState();
+    expect(state.options.openOptions).toHaveLength(0);
+    expect(state.options.dailyOptionsCount).toBe(0);
+    expect(state.signals).toHaveLength(1);
+    expect(state.signals[0].mode).toBe('live');
+    expect(state.signals[0].liveSkipReason).toContain('day-trade buying power');
+    expect(state.signals[0].liveSkipReason).toContain('DTBP exhausted');
+  });
+
+  it('stays permissive when dayTradeBuyingPower is null (cash accounts have no DTBP) (TRA-483)', async () => {
+    const stub: TradierLiveStub = {
+      getAccountBalance: vi.fn().mockResolvedValue({
+        totalEquity: 25_000, totalCash: 25_000, optionBuyingPower: 25_000,
+      }),
+      getOptionQuote: vi.fn().mockResolvedValue(tightQuote()),
+      buyContractsLimit: vi.fn().mockResolvedValue({ id: 21, status: 'ok' }),
+      cancelOrder: vi.fn(),
+      waitForOrderTerminalStatus: vi.fn(async (_id: number, _opts?: WaitOpts) => ({
+        id: 21, status: 'filled', exec_quantity: 1, avg_fill_price: 1.21,
+      })),
+    };
+    const engine = setupLiveEngine(stub, freshScanner());
+    // DTBP = null (cash accounts don't carry it). The gate must skip its
+    // check rather than treating "no value" as "zero".
+    (engine as unknown as {
+      liveTradierBalance: {
+        totalEquity: number;
+        totalCash: number;
+        optionBuyingPower: number;
+        dayTradeBuyingPower: number | null;
+      } | null;
+    }).liveTradierBalance = {
+      totalEquity: 25_000,
+      totalCash: 25_000,
+      optionBuyingPower: 25_000,
+      dayTradeBuyingPower: null,
+    };
+    await (engine as unknown as { runRelativeValueScan: (s: string[]) => Promise<void> }).runRelativeValueScan(['AAPL']);
+
+    // The order DID submit — cash accounts have no DTBP and the gate is
+    // skipped entirely. This locks in the cash-account regression boundary.
+    expect(stub.buyContractsLimit).toHaveBeenCalledTimes(1);
+    const state = engine.getState();
+    expect(state.options.openOptions).toHaveLength(1);
+  });
+
+  it('surfaces dayTradeBuyingPower on liveAccount when Tradier reports it (TRA-483)', () => {
+    const engine = new SignalEngine(undefined, undefined, undefined);
+    (engine as unknown as { mode: 'demo' | 'live' }).mode = 'live';
+    (engine as unknown as {
+      liveTradierBalance: TradierAccountBalance | null;
+    }).liveTradierBalance = {
+      totalEquity: 25_000,
+      totalCash: 25_000,
+      optionBuyingPower: 25_000,
+      stockBuyingPower: 25_000,
+      longMarketValue: 0,
+      dayTradeBuyingPower: 7500,
+    };
+    const state = engine.getState();
+    expect(state.account.dayTradeBuyingPower).toBe(7500);
+  });
+
+  it('omits dayTradeBuyingPower on liveAccount for cash accounts (no DTBP bucket) (TRA-483)', () => {
+    const engine = new SignalEngine(undefined, undefined, undefined);
+    (engine as unknown as { mode: 'demo' | 'live' }).mode = 'live';
+    (engine as unknown as {
+      liveTradierBalance: TradierAccountBalance | null;
+    }).liveTradierBalance = {
+      totalEquity: 500,
+      totalCash: 480,
+      optionBuyingPower: 480,
+      stockBuyingPower: 480,
+      longMarketValue: 0,
+      dayTradeBuyingPower: null,
+    };
+    const state = engine.getState();
+    expect(state.account.dayTradeBuyingPower).toBeUndefined();
+  });
+
   it('skips the order entirely when cached optionBuyingPower is below notional cost (TRA-332 surfaces it on the dashboard)', async () => {
     const stub: TradierLiveStub = {
       getAccountBalance: vi.fn(),
@@ -911,6 +1030,9 @@ describe('sizeLiveEquityFromStop (TRA-335)', () => {
       optionBuyingPower: 10_000,
       stockBuyingPower: 20_000,
       longMarketValue: 15_000,
+      // TRA-483 — DTBP default; tests can override via the `overrides` arg
+      // when they need to exercise the PDT-exhausted path.
+      dayTradeBuyingPower: null,
       ...overrides,
     };
   }
@@ -1033,6 +1155,7 @@ describe('SignalEngine — TRA-335 live equity bracket placement', () => {
       optionBuyingPower: 10_000,
       stockBuyingPower: 20_000,
       longMarketValue: 15_000,
+      dayTradeBuyingPower: null,
     };
     return engine;
   }
@@ -2429,6 +2552,7 @@ describe('TRA-389 — market-review regime gates', () => {
       optionBuyingPower: 10_000,
       stockBuyingPower: 20_000,
       longMarketValue: 15_000,
+      dayTradeBuyingPower: null,
     };
     const base = {
       balance,

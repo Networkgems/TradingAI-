@@ -299,6 +299,15 @@ export interface AccountState {
    * when Tradier hasn't returned a balance yet.
    */
   optionBuyingPower?: number;
+  /**
+   * TRA-483 — broker-reported day-trade buying power (PDT day-trading
+   * limit) from Tradier. Surfaced in live mode so the Options panel can
+   * show the real DTBP alongside `optionBuyingPower` — when DTBP=$0 the
+   * broker rejects same-day round trips even with positive option BP, so
+   * the live engine also gates RV opens against it. Absent in demo, on
+   * cash accounts (no DTBP), or before the first balance fetch.
+   */
+  dayTradeBuyingPower?: number;
 }
 
 export const DEFAULT_RISK_PER_TRADE = 0.01; // 1% of account equity

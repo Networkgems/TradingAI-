@@ -1783,6 +1783,25 @@ export class SignalEngine {
             );
             continue;
           }
+
+          // TRA-483 — refuse to open when Tradier's day-trade buying power is
+          // exhausted. The RV scanner trades intraday round trips, so a $0
+          // DTBP means the broker will reject every same-day close even if
+          // `optionBuyingPower` is still positive. We surface a skip signal
+          // up-front rather than letting Tradier silently drop the order.
+          // `dayTradeBuyingPower` is null on cash accounts (no PDT bucket);
+          // we stay permissive there.
+          const dtbp = this.liveTradierBalance?.dayTradeBuyingPower;
+          if (typeof dtbp === 'number' && Number.isFinite(dtbp)) {
+            const notionalCost = cheap.mark * 100;
+            if (dtbp < notionalCost) {
+              surfaceLiveSkip(
+                `Tradier day-trade buying power $${dtbp.toFixed(2)} < required `
+                  + `$${notionalCost.toFixed(2)} — DTBP exhausted, no day trades until it resets`,
+              );
+              continue;
+            }
+          }
         }
 
         // TRA-231 — pass `this.mode` so the position is stamped at open time;
@@ -1848,6 +1867,18 @@ export class SignalEngine {
           if (typeof obp === 'number' && Number.isFinite(obp) && obp < notionalCost) {
             tradierVoid(
               `Tradier option buying power $${obp.toFixed(2)} < required $${notionalCost.toFixed(2)}`,
+            );
+            continue;
+          }
+          // TRA-483 — second-line DTBP guard right before the broker call.
+          // Mirrors the OBP pre-check above so a balance that arrives between
+          // the upstream signal-time gate and the broker submit still gets
+          // refused locally instead of relying on Tradier to cancel the
+          // order with the cryptic "insufficient day-trade buying power".
+          const dtbp = this.liveTradierBalance?.dayTradeBuyingPower;
+          if (typeof dtbp === 'number' && Number.isFinite(dtbp) && dtbp < notionalCost) {
+            tradierVoid(
+              `Tradier day-trade buying power $${dtbp.toFixed(2)} < required $${notionalCost.toFixed(2)}`,
             );
             continue;
           }
@@ -3001,6 +3032,11 @@ export class SignalEngine {
       // instead of the paper bookkeeping bucket (drained by both demo +
       // live opens). Falls back to `totalCash` when the account type
       // didn't surface a dedicated option BP (cash accounts).
+      // TRA-483 — also surface `dayTradeBuyingPower` so the Options panel
+      // can show DTBP alongside option BP. Only set the field when Tradier
+      // actually returned the number (margin/PDT accounts); cash accounts
+      // leave it undefined so the UI can hide it instead of showing $0.
+      const liveDtbp = this.liveTradierBalance?.dayTradeBuyingPower;
       const liveAccount: AccountState = this.liveTradierBalance
         ? {
           totalEquity: this.liveTradierBalance.totalEquity,
@@ -3010,6 +3046,9 @@ export class SignalEngine {
           optionBuyingPower:
             this.liveTradierBalance.optionBuyingPower
             ?? this.liveTradierBalance.totalCash,
+          ...(typeof liveDtbp === 'number' && Number.isFinite(liveDtbp)
+            ? { dayTradeBuyingPower: liveDtbp }
+            : {}),
         }
         : { totalEquity: 0, availableCash: 0, openPositions: liveOpenPositions, dailyPnl: 0 };
       return {

@@ -339,6 +339,7 @@ describe('TradierOptionsClient.getAccountBalance (TRA-226)', () => {
       optionBuyingPower: null,
       stockBuyingPower: null,
       longMarketValue: null,
+      dayTradeBuyingPower: null,
     });
     expect(callUrl(0)).toBe('https://sandbox.tradier.com/v1/accounts/A1/balances');
     const headers = callInit(0).headers as Record<string, string>;
@@ -389,6 +390,7 @@ describe('TradierOptionsClient.getAccountBalance (TRA-226)', () => {
       optionBuyingPower: 250,
       stockBuyingPower: 600,
       longMarketValue: null,
+      dayTradeBuyingPower: null,
     });
   });
 
@@ -413,6 +415,63 @@ describe('TradierOptionsClient.getAccountBalance (TRA-226)', () => {
     );
     const client = new TradierOptionsClient('tok', 'A1');
     expect((await client.getAccountBalance())?.optionBuyingPower).toBeNull();
+  });
+
+  // TRA-483 — day_trade_buying_power is the PDT day-trading limit. Tradier
+  // surfaces it on margin / PDT accounts; the engine reads it so it can
+  // refuse same-day round-trip opens when DTBP=$0 even with positive
+  // optionBuyingPower (the exact failure mode the issue captured).
+  it('extracts day_trade_buying_power from a margin balance', async () => {
+    fetchMock.mockResolvedValueOnce(
+      jsonResponse({
+        balances: {
+          total_equity: 2500,
+          total_cash: 1000,
+          account_type: 'margin',
+          margin: {
+            option_buying_power: 1500,
+            stock_buying_power: 3000,
+            day_trade_buying_power: 0,
+          },
+        },
+      }),
+    );
+    const client = new TradierOptionsClient('tok', 'A1');
+    expect((await client.getAccountBalance())?.dayTradeBuyingPower).toBe(0);
+  });
+
+  it('extracts day_trade_buying_power from a pdt balance', async () => {
+    fetchMock.mockResolvedValueOnce(
+      jsonResponse({
+        balances: {
+          total_equity: 30_000,
+          total_cash: 5000,
+          account_type: 'pdt',
+          pdt: {
+            option_buying_power: 10_000,
+            stock_buying_power: 20_000,
+            day_trade_buying_power: 7500,
+          },
+        },
+      }),
+    );
+    const client = new TradierOptionsClient('tok', 'A1');
+    expect((await client.getAccountBalance())?.dayTradeBuyingPower).toBe(7500);
+  });
+
+  it('returns dayTradeBuyingPower=null for cash accounts (no DTBP bucket)', async () => {
+    fetchMock.mockResolvedValueOnce(
+      jsonResponse({
+        balances: {
+          total_equity: 500,
+          total_cash: 500,
+          account_type: 'cash',
+          cash: { cash_available: 480 },
+        },
+      }),
+    );
+    const client = new TradierOptionsClient('tok', 'A1');
+    expect((await client.getAccountBalance())?.dayTradeBuyingPower).toBeNull();
   });
 });
 

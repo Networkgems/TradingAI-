@@ -275,6 +275,12 @@ export function StockOptionsPanel({
         const isLive = accountMode === 'live';
         const liveOptionBP = isLive ? account?.optionBuyingPower : undefined;
         const showLiveBP = isLive && typeof liveOptionBP === 'number';
+        // TRA-483 — surface Day Trade Buying Power next to Option BP so the
+        // user can see when DTBP=$0 is the reason no live RV trades are
+        // opening (the screenshot in the issue showed positive Option BP
+        // but DTBP $0). Only margin / PDT accounts carry it.
+        const liveDayTradeBP = isLive ? account?.dayTradeBuyingPower : undefined;
+        const showLiveDayTradeBP = isLive && typeof liveDayTradeBP === 'number';
         return (
           <div style={{ marginTop: '1.5rem', display: 'flex', gap: '2rem', fontSize: '0.85rem', color: 'var(--muted)' }}>
             {showLiveBP ? (
@@ -284,6 +290,14 @@ export function StockOptionsPanel({
             ) : (
               <span>Options Cash: <strong>${fmt(optionsState.optionsCash)}</strong></span>
             )}
+            {showLiveDayTradeBP ? (
+              <span title="Tradier day-trade buying power (PDT limit). When this hits $0 the live engine refuses new day-trade RV opens.">
+                Day Trade BP:{' '}
+                <strong className={liveDayTradeBP! <= 0 ? 'red' : ''}>
+                  ${fmt(liveDayTradeBP!)}
+                </strong>
+              </span>
+            ) : null}
             <span>Total Options P&amp;L: <strong className={optionsState.optionsPnl >= 0 ? 'green' : 'red'}>{fmtDollar(optionsState.optionsPnl)}</strong></span>
             <span>Daily Trades: <strong className={optionsState.dailyOptionsCount >= optionsDailyLimit ? 'red' : ''}>{optionsState.dailyOptionsCount}/{optionsDailyLimit}</strong></span>
             {/* TRA-374 — surface the demo cost-model drag (slippage + per-contract
