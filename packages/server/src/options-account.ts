@@ -14,6 +14,7 @@ import type {
 import {
   DEFAULT_ACCOUNT_SETTINGS,
   OPTIONS_BUDGET_RATIO,
+  OPTIONS_PER_TICKET_DOLLAR_FLOOR,
   OPTIONS_POSITION_CAP_RATIO,
   OPTIONS_OTM_MIN_EQUITY,
   OPTIONS_TP1_PCT,
@@ -39,6 +40,28 @@ function rvStopLossPremium(premium: number, rvRiskParams: RvRiskParams): number 
   const distance = Math.max(premium * rvRiskParams.slPct, rvRiskParams.slDollarFloor);
   return Math.max(0, premium - distance);
 }
+
+/**
+ * TRA-495 — per-position notional cap with the $100 dollar floor baked in.
+ * Below ~$667 equity the raw 15% cap (`equity × 0.15`) drops below the
+ * $100 ticket floor, which would null out every live RV signal on a small
+ * book even though the budget says one contract fits. Capping at
+ * `max($100, 15% × equity)` mirrors the floor on the budget side so a
+ * $0.95-mark contract at $550 equity still clears the per-position check.
+ */
+function perPositionCap(equity: number): number {
+  return Math.max(OPTIONS_PER_TICKET_DOLLAR_FLOOR, equity * OPTIONS_POSITION_CAP_RATIO);
+}
+
+/**
+ * TRA-495 — swing rule: skip the TP1 partial-exit fire while a position is
+ * younger than 24h. The RV scanner targets 21–60d expirations; partialling
+ * out on day-1 noise would defeat the swing thesis. Hard SL and the
+ * trailing stop still fire — only the +TP1 partial branch waits. This is
+ * distinct from TRA-483's `holdLiveOptionsOvernightForPdt` which (when on)
+ * suppresses ALL engine exits same-day; TRA-495 always-on but TP1-only.
+ */
+const TP1_SUPPRESSION_MS = 24 * 60 * 60 * 1000;
 
 const ATM_DELTA = 0.50;
 
@@ -546,7 +569,7 @@ export class PaperOptionsAccount {
   }
 
   /**
-   * TRA-378 — dollar budget for a single options ticket.
+   * TRA-378 / TRA-495 — dollar budget for a single options ticket.
    *
    *   • LIVE sizing (`equityOverride` supplied — the engine passes the user's
    *     real Tradier equity): `equity × managedAccountRatio × riskPerTrade`.
@@ -555,38 +578,62 @@ export class PaperOptionsAccount {
    *   • DEMO / fallback sizing (`equityOverride` omitted): the per-strategy
    *     `budgetRatio` constant, unchanged from before TRA-378.
    *
-   * In both cases the result is hard-capped at `equity × OPTIONS_POSITION_CAP_RATIO`
-   * (15%) so no single ticket can dominate a small book — applied here, before
-   * the `floor()` in {@link sizeContracts}.
+   * Two guardrails on top of the pct math:
+   *   • Dollar floor (TRA-495) — bump the budget up to
+   *     `OPTIONS_PER_TICKET_DOLLAR_FLOOR` ($100) so a $550 live book whose
+   *     0.5 × 0.10 ratio computes to $27.50 still has $100 to spend on a
+   *     cheap $0.40-mark contract.
+   *   • Hard per-position cap — `max($100, equity × 15%)` so no single
+   *     ticket can dominate a small book, even after the dollar floor lifts
+   *     the budget. The cap also keeps its own $100 floor so a sub-$667
+   *     book doesn't see a `$<100` cap reject a contract the budget would
+   *     otherwise allow.
    */
   private sizingBudget(strategyBudgetRatio: number, equityOverride?: number): number {
     const equity = equityOverride ?? this.equity;
     const ratio = equityOverride !== undefined ? this.riskPerTrade : strategyBudgetRatio;
-    const budget = equity * this.managedAccountRatio * ratio;
-    return Math.min(budget, equity * OPTIONS_POSITION_CAP_RATIO);
+    const pctBudget = equity * this.managedAccountRatio * ratio;
+    const hardCap = perPositionCap(equity);
+    return Math.min(hardCap, Math.max(pctBudget, OPTIONS_PER_TICKET_DOLLAR_FLOOR));
   }
 
   /**
-   * TRA-378 — contracts a ticket sizes to. Normally `floor(budget / cost)`,
-   * but when that rounds to 0 in LIVE sizing we force exactly 1 contract as
-   * long as a single contract's notional still clears the 15%-equity
-   * per-position cap. A $1k account can plainly afford a $1.20-mark contract
-   * ($120 < $1,000); pre-TRA-378 it could never enter one. The forced floor
-   * is LIVE-only (`equityOverride` supplied) — demo keeps the legacy
-   * null-on-zero behaviour so the per-strategy `budgetRatio` constants and
-   * the existing demo tests stand.
+   * TRA-378 / TRA-495 — contracts a ticket sizes to. Normally
+   * `floor(budget / cost)`, but when that rounds to 0 in LIVE sizing we
+   * force exactly 1 contract as long as a single contract's notional still
+   * clears the `max($100, 15% × equity)` per-position cap. A $550 live book
+   * can afford a $0.95-mark contract ($95 ≤ $100); pre-TRA-378 it could
+   * never enter one. The forced floor is LIVE-only (`equityOverride`
+   * supplied) — demo keeps the legacy null-on-zero behaviour so the
+   * per-strategy `budgetRatio` constants and the existing demo tests stand.
+   *
+   * After picking the floor or the floor-divided count we ALSO re-check
+   * the per-position cap: a budget that the dollar floor lifted to $100
+   * on a sub-$667 book could in principle size to 2 contracts at $40 cost
+   * for a $80 notional that's still ≤ $100, but the same logic at a richer
+   * mark would happily blow past the cap. Pinning the upper bound after
+   * the floor-divide guarantees the cap binds regardless of which branch
+   * picked the count.
    */
   private sizeContracts(budget: number, costPerContract: number, equityOverride?: number): number {
     if (!Number.isFinite(costPerContract) || costPerContract <= 0) return 0;
-    const contracts = Math.floor(budget / costPerContract);
-    if (contracts > 0) return contracts;
-    if (
-      equityOverride !== undefined
-      && costPerContract <= equityOverride * OPTIONS_POSITION_CAP_RATIO
-    ) {
-      return 1;
+    let sized = Math.floor(budget / costPerContract);
+    if (sized === 0 && equityOverride !== undefined && costPerContract <= perPositionCap(equityOverride)) {
+      sized = 1;
     }
-    return 0;
+    if (sized === 0) return 0;
+    if (equityOverride !== undefined) {
+      const cap = perPositionCap(equityOverride);
+      if (sized * costPerContract > cap) {
+        // Trim back to whatever count still fits under the cap; null when
+        // even one contract blows past it (the forced-floor branch above
+        // already vetoed that case in LIVE — this trims multi-contract
+        // overshoot when the dollar floor pushed the budget above the cap).
+        const trimmed = Math.floor(cap / costPerContract);
+        return trimmed > 0 ? trimmed : 0;
+      }
+    }
+    return sized;
   }
 
   private budgetPerTrade(equityOverride?: number): number {
@@ -1106,8 +1153,18 @@ export class PaperOptionsAccount {
         continue;
       }
 
+      // TRA-495 — swing rule: skip TP1 partial fires for positions younger
+      // than 24h. The RV scanner now targets ≥7-DTE contracts and the board
+      // wants the engine to ride a winner overnight instead of partialling
+      // out on day-1 noise. Hard SL and trailing-stop fires still trigger
+      // — only the +TP1 partial waits. Manual closes (via stageManualPendingExit)
+      // are unaffected; they don't flow through this branch. Layered ABOVE
+      // TRA-483's same-day-all-exits gate so this still kicks in for users
+      // who turn PDT-hold off.
+      const positionAgeMs = Date.now() - opt.openedAt;
+      const tp1Eligible = positionAgeMs >= TP1_SUPPRESSION_MS;
       // Partial exit at TP1: sell `partialExitRatio` of contracts, trail the rest
-      if (!opt.tp1Hit && mark >= opt.tp1Premium && opt.contractsRemaining > 1) {
+      if (!opt.tp1Hit && tp1Eligible && mark >= opt.tp1Premium && opt.contractsRemaining > 1) {
         const exitContracts = Math.floor(opt.contractsRemaining * partialExitRatio);
         if (exitContracts > 0) {
           if (waitAndHold) {

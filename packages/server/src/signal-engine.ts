@@ -1,6 +1,6 @@
 import { OrbStrategy, BbFadeStrategy, IchimokuStrategy, TradierOptionsClient, TradierOrderClient, TRADIER_REJECTED_STATUSES, evaluateSma200, SMA200_MIN_BARS, SMA200_DEBOUNCE_BARS } from '@trading-app/engine';
 import type { TradierAccountBalance } from '@trading-app/engine';
-import { WATCHLIST, MANAGED_ACCOUNT_RATIO, MAX_CONSECUTIVE_LOSSES, DAILY_DRAWDOWN_HALT_PCT, OPTIONS_POSITION_CAP_RATIO, aliasWatchlistSymbol, isLiveTradierOptionsEnabled, isStockMarketOpen, resolveAutoManageImportedTradierOptions, resolveDemoCostModel, resolveHoldLiveOptionsOvernight, resolveLiveTradeEquitiesTradier, resolveManagedAccountRatio, resolveMarketReviewGatesEnabled, resolveRiskPerTrade, resolveRvDtePrefs, resolveTradierOptionsCreds, DEFAULT_RV_DTE_MIN, DEFAULT_RV_DTE_MAX, DEFAULT_RV_DTE_TARGET } from '@trading-app/shared';
+import { WATCHLIST, MANAGED_ACCOUNT_RATIO, MAX_CONSECUTIVE_LOSSES, DAILY_DRAWDOWN_HALT_PCT, OPTIONS_PER_TICKET_DOLLAR_FLOOR, OPTIONS_POSITION_CAP_RATIO, aliasWatchlistSymbol, isLiveTradierOptionsEnabled, isStockMarketOpen, resolveAutoManageImportedTradierOptions, resolveDemoCostModel, resolveHoldLiveOptionsOvernight, resolveLiveTradeEquitiesTradier, resolveManagedAccountRatio, resolveMarketReviewGatesEnabled, resolveRiskPerTrade, resolveRvDtePrefs, resolveTradierOptionsCreds, DEFAULT_RV_DTE_MIN, DEFAULT_RV_DTE_MAX, DEFAULT_RV_DTE_TARGET } from '@trading-app/shared';
 import type { TradeSignal, RelativeValueSignal, Sma200Signal, Candle, OptionsAccountState, SignalType, Position, AccountSettings, AccountState, NewsItem, TradierEnv, MarketReview, MarketReviewGates, EngineMarketReviewState, GatedStrategyNote } from '@trading-app/shared';
 import { getLatestMarketReview } from './market-review.js';
 import { etDateString } from './scheduler.js';
@@ -1787,9 +1787,16 @@ export class SignalEngine {
           const liveContracts = this.optionsAccount.getRvContractsForEquity(liveEquity, cheap.mark);
           if (liveContracts < 1) {
             const costPerContract = cheap.mark * 100;
-            const cap = liveEquity * OPTIONS_POSITION_CAP_RATIO;
+            // TRA-495 — surface the effective per-position cap, which has a
+            // $100 floor below ~$667 equity (the raw 15% cap drops below the
+            // ticket floor on small books). Matches the cap the account's
+            // forced-1-contract floor checks against.
+            const cap = Math.max(
+              OPTIONS_PER_TICKET_DOLLAR_FLOOR,
+              liveEquity * OPTIONS_POSITION_CAP_RATIO,
+            );
             surfaceLiveSkip(
-              `RV contract $${costPerContract.toFixed(2)} exceeds the 15% per-position cap `
+              `RV contract $${costPerContract.toFixed(2)} exceeds the per-position cap `
                 + `$${cap.toFixed(2)} (equity $${liveEquity.toFixed(2)}) — too rich for this account size`,
             );
             continue;

@@ -253,4 +253,63 @@ describe('findRelativeValueOpportunities', () => {
     expect(admitted).toBeDefined();
     expect(admitted!.mark).toBeCloseTo(0.45, 5);
   });
+
+  // TRA-495 — swing thesis: reject contracts closer than `minDaysToExpiry`
+  // (default 7d). Defense-in-depth against a stale-expiration chain slipping
+  // a 1-DTE lottery ticket through. Uses `SCAN_OPTS` so the TRA-461 minMark /
+  // spread / OI floors don't double-gate these chains.
+  describe('TRA-495 — minDaysToExpiry default (7d)', () => {
+    function buildChainAt(exp: string, strikes: number[]): OptionChainRow[] {
+      const T_local = daysToExpiration(exp, NOW) / 365;
+      return strikes.map((strike) => {
+        const fair = blackScholesPrice({
+          spot: SPOT,
+          strike,
+          timeToExpiryYears: T_local,
+          riskFreeRate: R,
+          volatility: 0.30,
+          optionType: 'call',
+        });
+        const mark = Math.max(0.05, fair);
+        const half = mark * 0.02;
+        return {
+          optionSymbol: `TEST${strike}C${exp}`,
+          underlying: 'TEST',
+          optionType: 'call' as const,
+          strike,
+          expiration: exp,
+          bid: Math.max(0.01, mark - half),
+          ask: mark + half,
+          last: mark,
+          volume: 500,
+          openInterest: 1000,
+          midIv: 0.30,
+        };
+      });
+    }
+
+    it('rejects a 1-DTE chain by default (all rows filtered)', () => {
+      // 2024-01-16 = next calendar day → DTE = 1, below the default 7d floor.
+      const calls = buildChainAt('2024-01-16', [90, 95, 100, 105, 110, 115]);
+      const result = findRelativeValueOpportunities(calls, SPOT, SCAN_OPTS);
+      expect(result).toHaveLength(0);
+    });
+
+    it('accepts a 10-DTE chain by default (above the 7d floor)', () => {
+      // 2024-01-25 = 10 days from NOW.
+      const calls = buildChainAt('2024-01-25', [90, 95, 100, 105, 110, 115]);
+      const result = findRelativeValueOpportunities(calls, SPOT, SCAN_OPTS);
+      expect(result.length).toBeGreaterThan(0);
+    });
+
+    it('honours a caller-supplied minDaysToExpiry override (3d in this test)', () => {
+      // A 5-DTE chain is rejected by the default 7d floor, but passes when
+      // the caller lowers the override to 3d.
+      const calls = buildChainAt('2024-01-20', [90, 95, 100, 105, 110, 115]);
+      const defaulted = findRelativeValueOpportunities(calls, SPOT, SCAN_OPTS);
+      expect(defaulted).toHaveLength(0);
+      const overridden = findRelativeValueOpportunities(calls, SPOT, { ...SCAN_OPTS, minDaysToExpiry: 3 });
+      expect(overridden.length).toBeGreaterThan(0);
+    });
+  });
 });

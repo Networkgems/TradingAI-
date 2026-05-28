@@ -57,12 +57,14 @@ describe('PaperOptionsAccount.openOptionFromCandidate', () => {
     expect(pos!.tp1Premium).toBeCloseTo(1.50, 5);          // 1 + 0.50 TP1
   });
 
-  it('returns null when contracts size to zero (mark too rich for the OTM budget)', () => {
+  it('returns null when the mark blows past the per-position cap (TRA-495 floor applies)', () => {
+    // TRA-495 — the $100 dollar floor on the budget lifts the OTM pct-budget
+    // ($1K × 0.5 × 0.025 = $12.50) to $100, but the per-position cap
+    // (max($100, $1K × 15%) = $150) still rejects a mark whose cost exceeds
+    // the cap. At mark=$2.00 (cost $200), the floor can't help — $200 > $150.
     const acct = new PaperOptionsAccount({ initialEquity: 1_000, managedAccountRatio: 0.5 });
-    // OTM budget = 1_000 * 0.5 * 0.025 = $12.50; one contract at mark=$1 costs $100 → 0 contracts.
-    const sig = buildSignal({ mark: 1.0 });
+    const sig = buildSignal({ mark: 2.0 });
     expect(acct.openOptionFromCandidate(sig)).toBeNull();
-    // Cash untouched.
     expect(acct.getState().optionsCash).toBe(1_000);
     expect(acct.getState().dailyOptionsCount).toBe(0);
   });
@@ -432,17 +434,24 @@ describe('PaperOptionsAccount — TRA-332 live equity override sizing', () => {
     expect(pos!.contracts).toBeGreaterThan(0);
   });
 
-  it('getRvBudgetForEquity reflects managedRatio and the riskPerTrade knob (TRA-378)', () => {
+  it('getRvBudgetForEquity reflects managedRatio and the riskPerTrade knob (TRA-378 / TRA-495)', () => {
+    // TRA-495 — the $100 ticket floor lifts small-equity budgets up to $100
+    // even when the pct math would compute much less, so a sub-$1k book can
+    // still size cheap contracts. The riskPerTrade knob still drives the
+    // budget above the floor.
     const acct = new PaperOptionsAccount({
       initialEquity: 50_000,
       managedAccountRatio: 0.5,
       riskPerTrade: 0.10,
     });
-    // 300 * 0.5 * 0.10 = $15 (below the 15% cap of $45).
-    expect(acct.getRvBudgetForEquity(300)).toBeCloseTo(15, 5);
-    // Editing the riskPerTrade knob re-sizes the live budget.
+    // 300 * 0.5 * 0.10 = $15 (pct math); $100 floor wins.
+    expect(acct.getRvBudgetForEquity(300)).toBeCloseTo(100, 5);
+    // Above the floor: 10_000 * 0.5 * 0.10 = $500 — pct math wins.
+    expect(acct.getRvBudgetForEquity(10_000)).toBeCloseTo(500, 5);
+    // Editing the riskPerTrade knob re-sizes the live budget above the floor.
     acct.updateConfig({ riskPerTrade: 0.20 });
-    expect(acct.getRvBudgetForEquity(300)).toBeCloseTo(30, 5);
+    // 10_000 * 0.5 * 0.20 = $1_000.
+    expect(acct.getRvBudgetForEquity(10_000)).toBeCloseTo(1_000, 5);
   });
 });
 
@@ -542,12 +551,20 @@ describe('PaperOptionsAccount — TRA-378 small-account sizing', () => {
     expect(acct.getRvContractsForEquity(1_000, 4.0)).toBe(0); // 15% cap
   });
 
-  it('demo sizing (no equityOverride) keeps the legacy null-on-zero behaviour', () => {
-    // $1k DEMO account: budget = 1_000 * 1.0 * 0.02 = $20; no forced floor in
-    // demo → a $1 mark ($100 cost) still returns null. Per-strategy
-    // budgetRatio constants stay the demo / fallback default.
+  it('demo sizing also picks up the $100 ticket floor on a small paper book (TRA-495 parity)', () => {
+    // $1k DEMO account: pct-budget = 1_000 * 1.0 * 0.02 = $20 (post-TRA-461
+    // RV budget tweak), lifted to $100 by the dollar floor. At mark=$1.0
+    // (cost $100) → 1 contract. Demo keeps the legacy null-on-zero ONLY when
+    // the floor itself can't make a single contract fit (cost > $100 with no
+    // equityOverride to trigger the cap-gated forced floor).
     const acct = new PaperOptionsAccount({ initialEquity: 1_000, managedAccountRatio: 1.0 });
-    expect(acct.openOptionFromRvCandidate(buildRvSignal({ mark: 1.0 }), 'demo')).toBeNull();
+    const pos = acct.openOptionFromRvCandidate(buildRvSignal({ mark: 1.0 }), 'demo');
+    expect(pos).not.toBeNull();
+    expect(pos!.contracts).toBe(1);
+    // A $2.00-mark contract still nulls out — $200 cost > $100 budget, and
+    // the forced-1-contract floor is LIVE-only (no equityOverride here).
+    const acct2 = new PaperOptionsAccount({ initialEquity: 1_000, managedAccountRatio: 1.0 });
+    expect(acct2.openOptionFromRvCandidate(buildRvSignal({ mark: 2.0 }), 'demo')).toBeNull();
   });
 
   it('gates the OTM scanner off below $5k live equity (RV-only)', () => {
@@ -573,13 +590,164 @@ describe('PaperOptionsAccount — TRA-378 small-account sizing', () => {
   });
 
   it('OTM equity gate does not apply to demo sizing (no equityOverride)', () => {
-    // A $1k DEMO account never hits the live OTM gate; it still sizes off
-    // the per-strategy budgetRatio (and here rounds to 0 → null).
+    // A $1k DEMO account never hits the live OTM gate; it sizes off the per-
+    // strategy budgetRatio, but TRA-495's $100 ticket floor is universal so
+    // a $1 mark fits. A $2.50 mark ($250 cost) still nulls because demo has
+    // no equityOverride-gated forced floor.
     const acct = new PaperOptionsAccount({ initialEquity: 1_000, managedAccountRatio: 1.0 });
-    // Demo at 50k sizes fine — proves the gate is live-only, not a hard block.
     const big = new PaperOptionsAccount({ initialEquity: 50_000, managedAccountRatio: 1.0 });
     expect(big.openOptionFromCandidate(buildSignal({ mark: 1.0 }), 'demo')).not.toBeNull();
-    expect(acct.openOptionFromCandidate(buildSignal({ mark: 1.0 }), 'demo')).toBeNull();
+    expect(acct.openOptionFromCandidate(buildSignal({ mark: 2.5 }), 'demo')).toBeNull();
+  });
+});
+
+// TRA-495 — wire small-equity live options sizing + swing rules.
+// Validates the spec test cases from the issue: $550 live book sizing, the
+// dollar-floor + 15%-cap-with-$100-floor interaction, and the 24h TP1 swing
+// suppression in checkExits. The minDaysToExpiry filter is covered in
+// `relative-value.test.ts` (the scanner-side enforcement).
+describe('PaperOptionsAccount — TRA-495 $550 live sizing + swing rules', () => {
+  function buildRvSignal(overrides: Partial<RelativeValueSignal> = {}): RelativeValueSignal {
+    return {
+      id: 'rv-1',
+      symbol: 'AAPL',
+      type: 'relative_value',
+      side: 'buy',
+      entryPrice: 1.0,
+      stopLoss: 0.75,
+      takeProfit: 1.5,
+      riskRewardRatio: 2,
+      timestamp: TRADING_TIME,
+      optionSymbol: 'AAPL240705C00200000',
+      optionType: 'call',
+      strike: 200,
+      expiration: '2024-07-05',
+      mark: 1.0,
+      fairPrice: 1.30,
+      mispricingPct: -0.23,
+      zScore: -2.1,
+      ivFitted: 0.32,
+      ivUsed: 0.28,
+      delta: 0.18,
+      reason: 'cheap-vs-curve',
+      ...overrides,
+    };
+  }
+
+  /**
+   * The board's actual live book: $550 buying power, managed-account ratio 50%,
+   * Risk Per Trade 10%. The RV scanner's per-strategy budgetRatio (0.03) only
+   * influences demo sizing — under `equityOverride` the engine uses
+   * `riskPerTrade`.
+   */
+  function liveBook(): PaperOptionsAccount {
+    return new PaperOptionsAccount({
+      initialEquity: 550,
+      managedAccountRatio: 0.5,
+      riskPerTrade: 0.10,
+    });
+  }
+
+  it('sizes a $0.40-mark RV candidate to ≥1 contract on a $550 live book (was 0 pre-TRA-495)', () => {
+    // pctBudget = 550 * 0.5 * 0.10 = $27.50 — too small to size a single
+    // $40 contract pre-TRA-495. The $100 ticket floor lifts the budget,
+    // and the cap = max($100, $82.50) = $100 lets the $40 cost through.
+    const pos = liveBook().openOptionFromRvCandidate(buildRvSignal({ mark: 0.40 }), 'live', 550);
+    expect(pos).not.toBeNull();
+    expect(pos!.contracts).toBeGreaterThanOrEqual(1);
+  });
+
+  it('rejects a $1.50-mark RV candidate at $550 — cost $150 blows past the $100 per-position cap', () => {
+    // cap = max($100, 550 × 0.15) = max($100, $82.50) = $100. $150 > $100 → null.
+    const acct = liveBook();
+    expect(acct.openOptionFromRvCandidate(buildRvSignal({ mark: 1.50 }), 'live', 550)).toBeNull();
+    // Cash and counter untouched on reject.
+    expect(acct.getState().optionsCash).toBe(550);
+    expect(acct.getState().dailyOptionsCount).toBe(0);
+  });
+
+  it('sizes a $0.95-mark RV candidate to 1 contract on a $550 book — fits under the $100 cap', () => {
+    // cost = $95 ≤ $100 cap → forced-floor branch picks 1 contract.
+    const pos = liveBook().openOptionFromRvCandidate(buildRvSignal({ mark: 0.95 }), 'live', 550);
+    expect(pos).not.toBeNull();
+    expect(pos!.contracts).toBe(1);
+  });
+
+  it('refuses the 6th entry of the day once optionsDailyTradesLimit is reached', () => {
+    const acct = new PaperOptionsAccount({
+      initialEquity: 550,
+      managedAccountRatio: 0.5,
+      riskPerTrade: 0.10,
+      optionsDailyTradesLimit: 5,
+    });
+    const occ = (i: number) => `AAPL240705C002${(10 + i).toString().padStart(2, '0')}000`;
+    for (let i = 0; i < 5; i += 1) {
+      const pos = acct.openOptionFromRvCandidate(
+        buildRvSignal({ id: `rv-${i}`, optionSymbol: occ(i), strike: 210 + i, mark: 0.40 }),
+        'live',
+        550,
+      );
+      expect(pos).not.toBeNull();
+    }
+    expect(acct.getState().dailyOptionsCount).toBe(5);
+    const sixth = acct.openOptionFromRvCandidate(
+      buildRvSignal({ id: 'rv-6', optionSymbol: occ(99), strike: 250, mark: 0.40 }),
+      'live',
+      550,
+    );
+    expect(sixth).toBeNull();
+  });
+
+  it('per-position cap keeps its $100 floor even when equity × 15% drops below it', () => {
+    // At $550 equity the raw 0.15 cap = $82.50 would falsely reject a $90
+    // contract that fits inside the $100 budget. The floor on the cap
+    // (max($100, …)) keeps the contract eligible.
+    const pos = liveBook().openOptionFromRvCandidate(buildRvSignal({ mark: 0.90 }), 'live', 550);
+    expect(pos).not.toBeNull();
+    expect(pos!.contracts).toBe(1);
+  });
+
+  it('suppresses the TP1 partial fire for the first 24h after open; SL still fires', () => {
+    const acct = new PaperOptionsAccount({ initialEquity: 50_000, managedAccountRatio: 0.5 });
+    const pos = acct.openOptionFromRvCandidate(buildRvSignal({ mark: 1.0 }), 'live');
+    expect(pos!.contracts).toBeGreaterThan(1);
+
+    // 1h after open — mark crosses the RV TP1 trigger (1.40). The position
+    // should remain at full size because the partial is suppressed.
+    vi.advanceTimersByTime(60 * 60 * 1000);
+    const tp1Mark = new Map<string, number>([[pos!.optionSymbol!, 1.60]]);
+    acct.checkExits(new Map(), tp1Mark, 'live');
+    const stillFull = acct.getState().openOptions[0];
+    expect(stillFull.tp1Hit).toBe(false);
+    expect(stillFull.contractsRemaining).toBe(pos!.contracts);
+  });
+
+  it('fires TP1 partial after 25h on the same position (suppression window expired)', () => {
+    const acct = new PaperOptionsAccount({ initialEquity: 50_000, managedAccountRatio: 0.5 });
+    const pos = acct.openOptionFromRvCandidate(buildRvSignal({ mark: 1.0 }), 'live');
+    const initialContracts = pos!.contracts;
+    expect(initialContracts).toBeGreaterThan(1);
+
+    vi.advanceTimersByTime(25 * 60 * 60 * 1000);
+    const tp1Mark = new Map<string, number>([[pos!.optionSymbol!, 1.60]]);
+    acct.checkExits(new Map(), tp1Mark, 'live');
+    const after = acct.getState().openOptions[0];
+    expect(after.tp1Hit).toBe(true);
+    expect(after.contractsRemaining).toBeLessThan(initialContracts);
+  });
+
+  it('hard SL still fires inside the 24h suppression window (only TP1 is delayed)', () => {
+    const acct = new PaperOptionsAccount({ initialEquity: 50_000, managedAccountRatio: 0.5 });
+    const pos = acct.openOptionFromRvCandidate(buildRvSignal({ mark: 1.0 }), 'live');
+    expect(pos).not.toBeNull();
+
+    // 1h after open the mark slumps past the RV SL (premium × 0.75 = 0.75).
+    vi.advanceTimersByTime(60 * 60 * 1000);
+    const slMark = new Map<string, number>([[pos!.optionSymbol!, 0.40]]);
+    const closed = acct.checkExits(new Map(), slMark, 'live');
+    expect(closed).toHaveLength(1);
+    expect(closed[0].pnl).toBeLessThan(0);
+    expect(acct.getState().openOptions).toHaveLength(0);
   });
 });
 
@@ -1580,7 +1748,10 @@ describe('PaperOptionsAccount — TRA-354 wait-and-hold exits', () => {
     const acct = new PaperOptionsAccount({ initialEquity: 50_000, managedAccountRatio: 0.5 });
     const pos = acct.openOptionFromRvCandidate(buildRvSignal({ mark: 1.0 }), 'live');
     expect(pos!.contracts).toBeGreaterThan(1);
-    // Mark crosses the RV TP1 trigger (RV tp1Pct = 0.50 for premium=1.0 → 1.50).
+    // TRA-495 — TP1 partials are suppressed for the first 24h after open.
+    // Advance the clock past the suppression window so the trigger fires.
+    vi.advanceTimersByTime(25 * 60 * 60 * 1000);
+    // Mark crosses the RV TP1 trigger (RV tp1Pct = 0.40 for premium=1.0 → 1.40).
     const marks = new Map<string, number>([[pos!.optionSymbol!, 1.60]]);
 
     const staged = acct.checkExits(new Map(), marks, 'live', { waitAndHold: true });
@@ -1655,6 +1826,8 @@ describe('PaperOptionsAccount — TRA-354 wait-and-hold exits', () => {
   it('TRA-450 — a fill resets the rejection counter so a later exit gets a clean slate', () => {
     const acct = new PaperOptionsAccount({ initialEquity: 50_000, managedAccountRatio: 0.5 });
     const pos = acct.openOptionFromRvCandidate(buildRvSignal({ mark: 1.0 }), 'live');
+    // TRA-495 — push past the 24h TP1 suppression window so the partial fires.
+    vi.advanceTimersByTime(25 * 60 * 60 * 1000);
     // TP1 partial fill, then later an SL exit on the remainder.
     const tp1Marks = new Map<string, number>([[pos!.optionSymbol!, 1.60]]);
     const staged = acct.checkExits(new Map(), tp1Marks, 'live', { waitAndHold: true });

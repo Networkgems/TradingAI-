@@ -861,22 +861,27 @@ describe('SignalEngine — TRA-332 live sizing uses real Tradier equity', () => 
       cancelOrder: vi.fn(),
       waitForOrderTerminalStatus: vi.fn(),
     };
-    const engine = setupLiveEngine(stub, freshScanner(1.0));
-    // Owned positions could push totalEquity above optionBuyingPower (e.g.,
-    // unsettled cash). Sizing must respect the tighter constraint (OBP) so
-    // we don't submit an order Tradier will cancel for unsettled funds.
+    // TRA-495 — the $100 ticket floor would normally let a $1.0-mark contract
+    // through on a $200 OBP book ($100 cost ≤ $100 cap). To still verify the
+    // engine picks OBP over totalEquity, use a $1.50-mark candidate whose
+    // $150 cost blows past the $200-OBP cap ($100) — but would have fit
+    // under the $50K-totalEquity cap ($7.5K). The skip surfaces because
+    // the engine sized off the tighter OBP figure.
+    const engine = setupLiveEngine(stub, freshScanner(1.50));
     (engine as unknown as { liveTradierBalance: { totalEquity: number; totalCash: number; optionBuyingPower: number } | null }).liveTradierBalance = {
       totalEquity: 50_000, totalCash: 50_000, optionBuyingPower: 200,
     };
 
     await (engine as unknown as { runRelativeValueScan: (s: string[]) => Promise<void> }).runRelativeValueScan(['AAPL']);
 
-    // OBP = $200 → budget $3 → 0 contracts. Without the OBP preference this
-    // would size off totalEquity ($50 K) and submit a doomed order.
+    // $150 cost > $100 cap (max($100, $30)) under OBP sizing → skip. If the
+    // engine had used totalEquity ($50K, cap $7,500) the contract would have
+    // sized fine — proves OBP took precedence.
     expect(stub.buyContractsLimit).not.toHaveBeenCalled();
     const state = engine.getState();
     expect(state.signals).toHaveLength(1);
     expect(state.signals[0].liveSkipReason).toContain('equity $200.00');
+    expect(state.signals[0].liveSkipReason).toContain('per-position cap');
   });
 });
 
@@ -2845,5 +2850,162 @@ describe('SignalEngine — TRA-416 partial-fill close reconciliation', () => {
     expect(row?.pnl).toBeCloseTo(300, 5);
     // The remainder was re-ordered exactly once across both sweeps.
     expect(client.sellContractsLimit).toHaveBeenCalledTimes(1);
+  });
+});
+
+// TRA-495 — verify the stocks (Tradier equity) and options (Tradier options) routes
+// both run on a live tick without either silently nulling the other. The board's
+// $550 DCA flow needs both legs operational against one Tradier production account.
+describe('SignalEngine — TRA-495 live stocks + options coexistence', () => {
+  type WaitOpts = { timeoutMs?: number; intervalMs?: number; sleep?: (ms: number) => Promise<void> };
+
+  interface OptionsTradierStub {
+    getOptionQuote: ReturnType<typeof vi.fn>;
+    buyContractsLimit: ReturnType<typeof vi.fn>;
+    cancelOrder: ReturnType<typeof vi.fn>;
+    waitForOrderTerminalStatus: ReturnType<typeof vi.fn>;
+  }
+
+  interface EquityTradierStub {
+    submitBracketOrder: ReturnType<typeof vi.fn>;
+    waitForOrderTerminalStatus: ReturnType<typeof vi.fn>;
+    cancelOrder?: ReturnType<typeof vi.fn>;
+  }
+
+  function buildEngine(scanner: StubScanner): SignalEngine {
+    return new SignalEngine({
+      ...DEFAULT_ACCOUNT_SETTINGS,
+      mode: 'live',
+      stocksAutoTradingEnabledLive: true,
+      liveTradeEquitiesTradier: true,
+      liveTradierMarkets: 'both',
+      liveBrokerageTypeStocks: 'webull',
+      liveTradierEnvOptions: 'production',
+      managedAccountRatio: 0.5,
+      riskPerTrade: 0.01,
+    }, undefined, scanner);
+  }
+
+  function freshScanner(mark = 1.0): StubScanner {
+    const scanner = new StubScanner();
+    scanner.scan.mockResolvedValue({
+      symbol: 'AAPL',
+      spot: 195,
+      expiration: '2024-07-05',
+      candidates: [makeCandidate({ mark })],
+      reason: 'ok',
+    });
+    return scanner;
+  }
+
+  it('runs both routes on the same engine: RV opens an option and the equity bracket places a stock order', async () => {
+    const optionsStub: OptionsTradierStub = {
+      getOptionQuote: vi.fn().mockResolvedValue({ symbol: 'AAPL240705C00200000', bid: 0.95, ask: 1.05 }),
+      buyContractsLimit: vi.fn().mockResolvedValue({ id: 71, status: 'ok' }),
+      cancelOrder: vi.fn(),
+      waitForOrderTerminalStatus: vi.fn(async (_id: number, _o?: WaitOpts) => ({
+        id: 71, status: 'filled', avg_fill_price: 1.0,
+      })),
+    };
+    const equityStub: EquityTradierStub = {
+      submitBracketOrder: vi.fn().mockResolvedValue({ id: 42, status: 'ok' }),
+      waitForOrderTerminalStatus: vi.fn(async (_id: number, _o?: WaitOpts) => ({
+        id: 42, status: 'filled', exec_quantity: 25, avg_fill_price: 100,
+      })),
+    };
+
+    const scanner = freshScanner(1.0);
+    const engine = buildEngine(scanner);
+    (engine as unknown as { tradierLiveClient: unknown }).tradierLiveClient = optionsStub;
+    (engine as unknown as { tradierLiveEquityClient: unknown }).tradierLiveEquityClient = equityStub;
+    (engine as unknown as { liveTradierBalance: TradierAccountBalance }).liveTradierBalance = {
+      totalEquity: 25_000,
+      totalCash: 10_000,
+      optionBuyingPower: 10_000,
+      stockBuyingPower: 20_000,
+      longMarketValue: 15_000,
+      dayTradeBuyingPower: null,
+    };
+
+    // ── 1) Options leg: RV scanner fires an open. ─────────────────────────
+    await (engine as unknown as { runRelativeValueScan: (s: string[]) => Promise<void> }).runRelativeValueScan(['AAPL']);
+
+    // ── 2) Equity leg: BB-fade signal places an OTOCO bracket. ────────────
+    const sig: TradeSignal = {
+      id: 'sig-stock-1',
+      symbol: 'AAPL',
+      type: 'bb_fade',
+      side: 'buy',
+      entryPrice: 100,
+      stopLoss: 95,
+      takeProfit: 110,
+      riskRewardRatio: 2,
+      timestamp: Date.now(),
+    };
+    const placement = await (engine as unknown as {
+      placeTradierEquityBracket: (s: TradeSignal, p: number) => Promise<{ ok: boolean; orderId?: number | string; reason?: string }>;
+    }).placeTradierEquityBracket(sig, 100);
+    expect(placement.ok).toBe(true);
+    expect(equityStub.submitBracketOrder).toHaveBeenCalledTimes(1);
+
+    // Seed the live equity mirror so the dashboard's live bucket reflects the
+    // open position. This is what runTick does immediately after a successful
+    // bracket placement.
+    (engine as unknown as {
+      openLiveEquityMirror: (s: TradeSignal, p: number, oid: number | string) => { id: string } | null;
+    }).openLiveEquityMirror(sig, 100, placement.orderId!);
+
+    // ── 3) Both routes succeeded WITHOUT one silently nulling the other. ──
+    expect(optionsStub.buyContractsLimit).toHaveBeenCalledTimes(1);
+    expect(equityStub.submitBracketOrder).toHaveBeenCalledTimes(1);
+
+    const state = engine.getState();
+    // Live bucket carries BOTH the option position AND the stock position.
+    expect(state.options.openOptions).toHaveLength(1);
+    expect(state.options.openOptions[0].optionSymbol).toBe('AAPL240705C00200000');
+    expect(state.account.openPositions).toHaveLength(1);
+    expect(state.account.openPositions[0].symbol).toBe('AAPL');
+    // Both signals surfaced.
+    expect(state.signals.find(s => s.type === 'relative_value')).toBeDefined();
+  });
+
+  it('getStateForMode(live) returns both stock and option positions in the live bucket', async () => {
+    // Same setup as the previous test, condensed to verify the per-mode state
+    // accessor doesn't drop one path on its way out of the engine.
+    const optionsStub: OptionsTradierStub = {
+      getOptionQuote: vi.fn().mockResolvedValue({ symbol: 'AAPL240705C00200000', bid: 0.95, ask: 1.05 }),
+      buyContractsLimit: vi.fn().mockResolvedValue({ id: 71, status: 'ok' }),
+      cancelOrder: vi.fn(),
+      waitForOrderTerminalStatus: vi.fn(async () => ({ id: 71, status: 'filled', avg_fill_price: 1.0 })),
+    };
+    const equityStub: EquityTradierStub = {
+      submitBracketOrder: vi.fn().mockResolvedValue({ id: 42, status: 'ok' }),
+      waitForOrderTerminalStatus: vi.fn(async () => ({
+        id: 42, status: 'filled', exec_quantity: 25, avg_fill_price: 100,
+      })),
+    };
+    const engine = buildEngine(freshScanner(1.0));
+    (engine as unknown as { tradierLiveClient: unknown }).tradierLiveClient = optionsStub;
+    (engine as unknown as { tradierLiveEquityClient: unknown }).tradierLiveEquityClient = equityStub;
+    (engine as unknown as { liveTradierBalance: TradierAccountBalance }).liveTradierBalance = {
+      totalEquity: 25_000, totalCash: 10_000, optionBuyingPower: 10_000,
+      stockBuyingPower: 20_000, longMarketValue: 15_000, dayTradeBuyingPower: null,
+    };
+
+    await (engine as unknown as { runRelativeValueScan: (s: string[]) => Promise<void> }).runRelativeValueScan(['AAPL']);
+    const sig: TradeSignal = {
+      id: 'sig-2', symbol: 'AAPL', type: 'bb_fade', side: 'buy',
+      entryPrice: 100, stopLoss: 95, takeProfit: 110, riskRewardRatio: 2, timestamp: Date.now(),
+    };
+    const placement = await (engine as unknown as {
+      placeTradierEquityBracket: (s: TradeSignal, p: number) => Promise<{ ok: boolean; orderId?: number | string }>;
+    }).placeTradierEquityBracket(sig, 100);
+    (engine as unknown as {
+      openLiveEquityMirror: (s: TradeSignal, p: number, oid: number | string) => { id: string } | null;
+    }).openLiveEquityMirror(sig, 100, placement.orderId!);
+
+    const live = engine.getState();
+    expect(live.options.openOptions.length).toBeGreaterThan(0);
+    expect(live.account.openPositions.length).toBeGreaterThan(0);
   });
 });

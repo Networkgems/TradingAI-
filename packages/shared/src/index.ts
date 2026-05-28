@@ -1087,24 +1087,34 @@ export const OPTIONS_TRAIL_ACTIVATE_PCT = 0.20; // activate trailing stop once p
 export const OPTIONS_TRAIL_OFFSET_PCT = 0.12; // trail 12% below peak (tighter than previous 15%)
 export const OPTIONS_PARTIAL_EXIT_RATIO = 0.5; // exit 50% of contracts at TP1; trail the rest
 
-// ── Small-account options sizing guards (TRA-378) ───────────────────────────
+// ── Small-account options sizing guards (TRA-378 / TRA-495) ─────────────────
 //
-// The board runs live options on a small DCA account ($1k → ~$6k). The
-// per-strategy budget ratios above (5% / 2.5% / 3%) make a sub-$5k account
+// The board runs live options on a small DCA account ($550 → ~$6k). The
+// per-strategy budget ratios above (5% / 2.5% / 3%) make a sub-$2k account
 // effectively non-tradeable — `floor(budget / costPerContract)` rounds to 0
-// and the engine silently skips ~half its RV signals. These two knobs (plus
-// the riskPerTrade wiring in `options-account.ts`) make small books tradeable
+// and the engine silently skips ~half its RV signals. These knobs (plus the
+// riskPerTrade wiring in `options-account.ts`) make small books tradeable
 // without letting one ticket dominate the book.
 //
 //   • OPTIONS_POSITION_CAP_RATIO — hard cap on a single options position's
 //     notional cost as a fraction of equity. Applied as `min(budget, cap)`
 //     before `floor()`, and also gates the forced 1-contract floor so a
 //     single rich contract can never blow past it. Scales with the account.
+//   • OPTIONS_PER_TICKET_DOLLAR_FLOOR (TRA-495) — minimum per-ticket budget
+//     in dollars. Bumps the pct-budget up to $100 when the percent math
+//     rounds to less than $100 (e.g. $550 * 0.5 * 0.10 = $27.50), so a
+//     $0.40-mark RV candidate can size to ≥1 contract on a $550 live book.
+//     Also raises the per-position cap floor (`max($100, 15% × equity)`)
+//     so the same $100 ticket budget can clear the cap on a sub-$667 book.
+//   • OPTIONS_PER_POSITION_PCT_CAP — alias for OPTIONS_POSITION_CAP_RATIO
+//     spelled out for callers that prefer the "PCT_CAP" form.
 //   • OPTIONS_OTM_MIN_EQUITY — live-equity floor below which the OTM
 //     mispricing scanner is skipped (RV-only). OTM is a tail strategy
 //     (~40% win rate) that needs many tickets for the right tail to pay
 //     off — wrong for a small book.
 export const OPTIONS_POSITION_CAP_RATIO = 0.15; // cap a single options position at 15% of equity
+export const OPTIONS_PER_POSITION_PCT_CAP = OPTIONS_POSITION_CAP_RATIO;
+export const OPTIONS_PER_TICKET_DOLLAR_FLOOR = 100; // $100 per-ticket floor while equity is small
 export const OPTIONS_OTM_MIN_EQUITY = 5_000;    // skip the OTM scanner below this live equity
 
 // ── OTM long-premium risk overrides (TRA-160) ───────────────────────────────

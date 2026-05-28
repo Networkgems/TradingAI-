@@ -1411,6 +1411,11 @@ export default function SettingsPage({ token, httpUrl, context, onModeChange, on
                         />
                         <span className="field-hint">
                           Max equity risked per live trade (default: 1%). Only affects {liveBrokerLabel} sizing.
+                          {context === 'stocks' && (
+                            <> On small live accounts (equity &lt; $2k) a $100 per-ticket floor takes over so
+                            cheap RV contracts can still size to ≥1 contract; the 15%-of-equity per-position
+                            cap (with a $100 floor) still applies.</>
+                          )}
                         </span>
                       </div>
                     </>

@@ -95,6 +95,14 @@ export interface RelativeValueScannerOptions {
    * of the lower-strike mark (default 0.02 = 2%).
    */
   monotonicEpsilonPct?: number;
+  /**
+   * TRA-495 — minimum calendar days to expiration on each row. Defense in
+   * depth against the RV swing thesis: the scanner already auto-picks an
+   * expiration ≥ `dteMin` (default 21d), but a chain that's loaded for an
+   * older expiration (cache + clock drift) shouldn't slip a 1-DTE lottery
+   * ticket through. Default 7 — aligns with the swing rules in TRA-495.
+   */
+  minDaysToExpiry?: number;
   /** Override of `Date.now()` — test seam. */
   now?: number;
 }
@@ -108,6 +116,7 @@ const DEFAULTS: Required<Omit<RelativeValueScannerOptions, 'now'>> = {
   minGroupSize: 5,
   zScoreThreshold: 2.0,
   monotonicEpsilonPct: 0.02,
+  minDaysToExpiry: 7,
 };
 
 interface PreparedRow {
@@ -376,6 +385,12 @@ export function findRelativeValueOpportunities(
 
       const dte = daysToExpiration(row.expiration, now);
       if (dte <= 0) continue;
+      // TRA-495 — defense in depth on the swing thesis: reject rows whose
+      // expiration is closer than the configured floor (default 7d). The
+      // scanner's auto-pick already filters expirations by `dteMin`/`dteMax`,
+      // but a cached chain for a stale expiration shouldn't slip a near-DTE
+      // lottery ticket through.
+      if (dte < opts.minDaysToExpiry) continue;
       const T = dte / 365;
 
       const iv = resolveIv(row, mark, underlyingPrice, T, opts.riskFreeRate, opts.dividendYield);
