@@ -3589,12 +3589,23 @@ export function sizeLiveEquityFromStop(args: {
   //      `floor(cap / currentPrice)`. This is the same trim the options path
   //      does after the dollar floor lifts the budget above the cap.
   //
-  // Cap is `max($150, 15% × equity)`. A 1-share-cost-exceeds-cap reject (e.g.
-  // $150 stock on a $550 book) returns 0 — the position concentration is too
-  // high for the small-account swing thesis. Fractional-share support is
-  // intentionally not enabled here (see TRA-499 spec).
+  // Cap is `max($150, 15% × equity)`. Per QuantTrader on the TRA-499 review
+  // handoff, the equity sizing uses a *strict-less-than* admission boundary
+  // for the 1-share-cost vs the per-position cap: a single ticket whose
+  // 1-share cost equals or exceeds the cap is rejected up-front, because
+  // that ticket would consume 100% of the cap (e.g. a $150 stock on a $550
+  // book is 27% concentration in one fill). This is intentionally asymmetric
+  // with `OptionsAccount.sizeContracts`, where the 1-contract floor uses
+  // `<= cap` because options have 100× quantization and the cap floor was
+  // raised to $150 in TRA-497 specifically to admit a $1.50-mark contract
+  // on a small book. Multi-share equity positions trimmed down so that the
+  // final notional equals the cap exactly (e.g. 3 × $50 = $150) are kept —
+  // the per-share granularity diversifies the same dollar concentration
+  // across multiple fills. Fractional-share support is intentionally not
+  // enabled here (see TRA-499 spec).
   const cap = perPositionCap(baseEquity);
-  if (qty <= 0 && currentPrice <= cap) {
+  if (currentPrice >= cap) return 0;
+  if (qty <= 0) {
     qty = 1;
   }
   if (qty > 0 && qty * currentPrice > cap) {

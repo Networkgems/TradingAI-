@@ -1172,12 +1172,12 @@ describe('sizeLiveEquityFromStop — TRA-499 small-book caps', () => {
 
   it('returns 0 when 1-share cost exceeds the per-position cap on a small book', () => {
     // baseEquity = $550 → cap = max($150, $82.50) = $150. A $200 stock has
-    // 1-share cost $200 > $150 cap. risk math: managedEquity = $550,
-    // maxRisk = $55, stop $10 → riskQty = 5; equityCap = floor($550/$200) = 2;
-    // qty = min(5, 2, 2) = 2. cap trim: 2 × $200 = $400 > $150 → trim to
-    // floor($150/$200) = 0. 1-share floor checks currentPrice($200) > cap($150),
-    // so it doesn't re-arm. Final: 0 — position is too concentrated for
-    // the small-book swing thesis.
+    // 1-share cost $200 ≥ $150 cap → up-front reject. Risk math would
+    // otherwise have produced 2 shares (riskQty=5, equityCap=2, min=2)
+    // and the multi-share trim would have ground them down to
+    // floor($150/$200)=0 anyway, but the early exit short-circuits the
+    // whole sizing pass. Final: 0 — position is too concentrated for the
+    // small-book swing thesis.
     const qty = sizeLiveEquityFromStop({
       balance: smallBookBalance(),
       managedAccountRatio: 1.0,
@@ -1185,6 +1185,28 @@ describe('sizeLiveEquityFromStop — TRA-499 small-book caps', () => {
       entryPrice: 200,
       stopPrice: 190,
       currentPrice: 200,
+    });
+    expect(qty).toBe(0);
+  });
+
+  it('rejects a $150 single-ticket on a $550 book (strict-less-than cap admission, QT TRA-499 nit)', () => {
+    // The cap is `max($150, 15% × $550) = $150`. A $150 stock has 1-share
+    // cost = $150 = cap exactly. The risk-from-stop math here would otherwise
+    // size up: managedEquity = $550, maxRisk = $55, stop $7.50 → riskQty = 7;
+    // equityCap = floor($550/$150) = 3; sbp cap = 3; qty = 3. Pre-fix the
+    // multi-share trim would have given floor($150/$150) = 1 → admit 1 share
+    // (1 × $150 = $150 ≤ $150 cap). Post-fix: the up-front strict-less-than
+    // admission check (`currentPrice >= cap`) short-circuits to 0 — a single
+    // ticket that would consume 100% of the per-position cap is rejected.
+    // This is asymmetric with `OptionsAccount.sizeContracts` on purpose; see
+    // the in-code comment in `sizeLiveEquityFromStop`.
+    const qty = sizeLiveEquityFromStop({
+      balance: smallBookBalance(),
+      managedAccountRatio: 1.0,
+      riskPerTrade: 0.10,
+      entryPrice: 150,
+      stopPrice: 142.50,
+      currentPrice: 150,
     });
     expect(qty).toBe(0);
   });
@@ -1213,8 +1235,10 @@ describe('sizeLiveEquityFromStop — TRA-499 small-book caps', () => {
     // and a wide stop. managedAccountRatio = 0.01, riskPerTrade = 0.01,
     // baseEquity = $550 → managedEquity = $5.50, maxRisk = $0.055.
     // 5% stop on $50 = $2.50 → riskQty = 0. equityCap = floor($5.50/$50) = 0.
-    // qty = 0. Cap = $150, currentPrice $50 ≤ $150 → forced floor fires →
-    // qty = 1. Cap recheck: 1 × $50 = $50 ≤ $150 → no trim. Final: 1 share.
+    // qty = 0. Cap = $150, currentPrice $50 < $150 → up-front admit, forced
+    // floor fires → qty = 1. Multi-share trim: 1 × $50 = $50 ≤ $150 → no
+    // trim. Final: 1 share. Boundary semantics: the strict-less-than gate
+    // bites only at currentPrice ≥ cap (see the $150 boundary test above).
     const qty = sizeLiveEquityFromStop({
       balance: smallBookBalance(),
       managedAccountRatio: 0.01,
