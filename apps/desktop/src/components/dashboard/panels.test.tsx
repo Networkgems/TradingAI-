@@ -115,16 +115,56 @@ describe('StockSignalsPanel (TRA-422)', () => {
 
 describe('StockPositionsPanel (TRA-422)', () => {
   it('shows the empty state when there are no positions', () => {
-    renderWithToast(<StockPositionsPanel token="t" openPositions={[]} closedPositions={[]} symbols={[]} />);
+    renderWithToast(
+      <StockPositionsPanel
+        token="t" openPositions={[]} closedPositions={[]} symbols={[]}
+        accountMode="demo" tradierEnv="production"
+      />,
+    );
     expect(screen.getByText(/No open positions/)).toBeInTheDocument();
   });
 
   it('renders an open position row with a Close button', () => {
     renderWithToast(
-      <StockPositionsPanel token="t" openPositions={[position()]} closedPositions={[]} symbols={[symbol()]} />,
+      <StockPositionsPanel
+        token="t" openPositions={[position()]} closedPositions={[]} symbols={[symbol()]}
+        accountMode="demo" tradierEnv="production"
+      />,
     );
     expect(screen.getByText('Open Positions')).toBeInTheDocument();
     expect(screen.getByRole('button', { name: 'Close' })).toBeInTheDocument();
+  });
+
+  // TRA-503 — Tradier equity sync mirrors the Options pattern: hidden in demo,
+  // shown in live (regardless of env).
+  it('hides the Tradier sync button in demo mode', () => {
+    renderWithToast(
+      <StockPositionsPanel
+        token="t" openPositions={[]} closedPositions={[]} symbols={[]}
+        accountMode="demo" tradierEnv="production"
+      />,
+    );
+    expect(screen.queryByRole('button', { name: /Sync Tradier/ })).not.toBeInTheDocument();
+  });
+
+  it('shows the Tradier sync button in live mode (production env)', () => {
+    renderWithToast(
+      <StockPositionsPanel
+        token="t" openPositions={[]} closedPositions={[]} symbols={[]}
+        accountMode="live" tradierEnv="production"
+      />,
+    );
+    expect(screen.getByRole('button', { name: /Sync Tradier production positions/ })).toBeInTheDocument();
+  });
+
+  it('shows the Tradier sync button in live mode (sandbox env)', () => {
+    renderWithToast(
+      <StockPositionsPanel
+        token="t" openPositions={[]} closedPositions={[]} symbols={[]}
+        accountMode="live" tradierEnv="sandbox"
+      />,
+    );
+    expect(screen.getByRole('button', { name: /Sync Tradier sandbox positions/ })).toBeInTheDocument();
   });
 });
 

@@ -1,6 +1,9 @@
 // TRA-422 — the Stocks Positions tab, extracted from Dashboard.tsx. Owns the
 // manual position-close mutation; the open / closed position lists and live
 // quotes are passed in from the parent.
+// TRA-503 — also owns the "Sync Tradier {env} positions" button (live only),
+// which forces the engine's equity-portfolio reconcile so out-of-band Tradier
+// opens land in the Positions table without waiting for the cadence.
 import type { Position } from '@trading-app/shared';
 import { HTTP_URL } from '../../server-url';
 import { logger } from '../../lib/logger';
@@ -11,21 +14,34 @@ import { positionSignalCell } from '../../lib/cells';
 import { getStockOpenPosSortValue, getStockClosedPosSortValue } from '../../lib/stockSort';
 import type { StockOpenPosSortKey, StockClosedPosSortKey } from '../../lib/stockSort';
 import type { SymbolState } from '../../types/app';
+import { useTradierEquitySync } from '../../hooks/useTradierEquitySync';
 
 export function StockPositionsPanel({
   token,
   openPositions,
   closedPositions,
   symbols,
+  accountMode,
+  tradierEnv,
 }: {
   token: string;
   openPositions: Position[];
   closedPositions: Position[];
   symbols: SymbolState[];
+  accountMode: 'demo' | 'live';
+  tradierEnv: 'sandbox' | 'production';
 }) {
   const openPosSort = useTableSort<StockOpenPosSortKey>('opened', 'desc');
   const closedPosSort = useTableSort<StockClosedPosSortKey>('closed', 'desc');
   const toast = useToast();
+  const {
+    syncTradierEquityPositions,
+    syncing: equitySyncing,
+    status: equitySyncStatus,
+  } = useTradierEquitySync(token, tradierEnv);
+  // TRA-503 — Demo doesn't route equities through Tradier, so the sync would
+  // never pull anything. Match the gate on the Options panel.
+  const showTradierSync = accountMode === 'live';
 
   async function closePosition(positionId: string) {
     try {
@@ -43,6 +59,23 @@ export function StockPositionsPanel({
 
   return (
     <div className="positions-panel">
+      {/* TRA-503 — pull open equity positions from Tradier into TradeAI so the
+          Positions table catches out-of-band opens before the cadence sweep. */}
+      {showTradierSync && (
+        <div style={{ display: 'flex', alignItems: 'center', gap: '0.75rem', marginBottom: '0.75rem', flexWrap: 'wrap' }}>
+          <button
+            className="btn-secondary"
+            onClick={syncTradierEquityPositions}
+            disabled={equitySyncing}
+            title={`Pull open equity positions from Tradier ${tradierEnv} into TradeAI`}
+          >
+            {equitySyncing ? 'Syncing…' : `Sync Tradier ${tradierEnv} positions`}
+          </button>
+          {equitySyncStatus && (
+            <span className="muted" style={{ fontSize: '0.85rem' }}>{equitySyncStatus}</span>
+          )}
+        </div>
+      )}
       {openPositions.length > 0 && (
         <>
           <h3>Open Positions</h3>

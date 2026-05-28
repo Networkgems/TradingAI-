@@ -2354,6 +2354,41 @@ app.post('/api/tradier/positions/sync', requireAuth, async (req, res) => {
 });
 
 /**
+ * TRA-503 — manual Tradier equity-position sync, matching the option sync
+ * above. The signal engine already runs `reconcileLiveEquityPortfolio` on a
+ * cadence (TRA-415); this endpoint forces an immediate sweep so the user can
+ * pull out-of-band equity opens into the Positions tab on demand. Uses the
+ * engine's already-configured live equity client (driven by saved Tradier
+ * settings), so no env override is needed.
+ *
+ * Returns the same `{ added, updated, removed, total }` shape as the option
+ * sync so the UI feedback line can be written once. `skipped` is folded into
+ * an HTTP error for the no-creds / wrong-mode cases.
+ */
+app.post('/api/tradier/equity-positions/sync', requireAuth, async (_req, res) => {
+  const ctx = await userCtx(res);
+  const result = await ctx.engine.reconcileLiveEquityPortfolio({ force: true });
+  if (result.skipped === 'mode') {
+    res.status(409).json({ error: 'Equity sync requires Live mode.' });
+    return;
+  }
+  if (result.skipped === 'no-client') {
+    res.status(409).json({
+      error: 'No Tradier credentials saved — set them in Settings before syncing equity positions.',
+    });
+    return;
+  }
+  broadcastEngineState(ctx);
+  res.json({
+    ok: true,
+    added: result.added,
+    updated: result.updated,
+    removed: result.removed,
+    total: result.total,
+  });
+});
+
+/**
  * Smoke-test Coinbase live credentials without placing any orders.
  *
  * Pulls the user's saved API key/secret (env-var fallback identical to

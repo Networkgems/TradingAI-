@@ -116,7 +116,14 @@ export default function Dashboard({ token, onLogout, onGoHome, onActivity, theme
         )}
 
         {state && tab === 'positions' && (
-          <StockPositionsPanel token={token} openPositions={openPositions} closedPositions={closedPositions} symbols={symbols} />
+          <StockPositionsPanel
+            token={token}
+            openPositions={openPositions}
+            closedPositions={closedPositions}
+            symbols={symbols}
+            accountMode={accountMode}
+            tradierEnv={tradierEnv}
+          />
         )}
 
         {state && tab === 'options' && (
