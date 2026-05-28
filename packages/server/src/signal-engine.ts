@@ -1787,10 +1787,10 @@ export class SignalEngine {
           const liveContracts = this.optionsAccount.getRvContractsForEquity(liveEquity, cheap.mark);
           if (liveContracts < 1) {
             const costPerContract = cheap.mark * 100;
-            // TRA-495 — surface the effective per-position cap, which has a
-            // $100 floor below ~$667 equity (the raw 15% cap drops below the
-            // ticket floor on small books). Matches the cap the account's
-            // forced-1-contract floor checks against.
+            // TRA-495 / TRA-497 — surface the effective per-position cap,
+            // which has a $150 floor below ~$1k equity (the raw 15% cap
+            // drops below the ticket floor on small books). Matches the cap
+            // the account's forced-1-contract floor checks against.
             const cap = Math.max(
               OPTIONS_PER_TICKET_DOLLAR_FLOOR,
               liveEquity * OPTIONS_POSITION_CAP_RATIO,

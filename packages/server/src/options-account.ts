@@ -42,12 +42,13 @@ function rvStopLossPremium(premium: number, rvRiskParams: RvRiskParams): number 
 }
 
 /**
- * TRA-495 — per-position notional cap with the $100 dollar floor baked in.
- * Below ~$667 equity the raw 15% cap (`equity × 0.15`) drops below the
- * $100 ticket floor, which would null out every live RV signal on a small
- * book even though the budget says one contract fits. Capping at
- * `max($100, 15% × equity)` mirrors the floor on the budget side so a
- * $0.95-mark contract at $550 equity still clears the per-position check.
+ * TRA-495 / TRA-497 — per-position notional cap with the $150 dollar floor
+ * baked in. Below ~$1k equity the raw 15% cap (`equity × 0.15`) drops below
+ * the $150 ticket floor, which would null out every live RV signal on a
+ * small book even though the budget says one contract fits. Capping at
+ * `max($150, 15% × equity)` mirrors the floor on the budget side so a
+ * $1.50-mark contract at $550 equity still clears the per-position check
+ * (board raised the floor from $100 to $150 on TRA-497, 2026-05-28).
  */
 function perPositionCap(equity: number): number {
   return Math.max(OPTIONS_PER_TICKET_DOLLAR_FLOOR, equity * OPTIONS_POSITION_CAP_RATIO);
@@ -569,14 +570,14 @@ export class PaperOptionsAccount {
    *     `budgetRatio` constant, unchanged from before TRA-378.
    *
    * Two guardrails on top of the pct math:
-   *   • Dollar floor (TRA-495) — bump the budget up to
-   *     `OPTIONS_PER_TICKET_DOLLAR_FLOOR` ($100) so a $550 live book whose
-   *     0.5 × 0.10 ratio computes to $27.50 still has $100 to spend on a
+   *   • Dollar floor (TRA-495 / TRA-497) — bump the budget up to
+   *     `OPTIONS_PER_TICKET_DOLLAR_FLOOR` ($150) so a $550 live book whose
+   *     0.5 × 0.10 ratio computes to $27.50 still has $150 to spend on a
    *     cheap $0.40-mark contract.
-   *   • Hard per-position cap — `max($100, equity × 15%)` so no single
+   *   • Hard per-position cap — `max($150, equity × 15%)` so no single
    *     ticket can dominate a small book, even after the dollar floor lifts
-   *     the budget. The cap also keeps its own $100 floor so a sub-$667
-   *     book doesn't see a `$<100` cap reject a contract the budget would
+   *     the budget. The cap also keeps its own $150 floor so a sub-$1k
+   *     book doesn't see a `$<150` cap reject a contract the budget would
    *     otherwise allow.
    */
   private sizingBudget(strategyBudgetRatio: number, equityOverride?: number): number {
@@ -588,22 +589,22 @@ export class PaperOptionsAccount {
   }
 
   /**
-   * TRA-378 / TRA-495 — contracts a ticket sizes to. Normally
+   * TRA-378 / TRA-495 / TRA-497 — contracts a ticket sizes to. Normally
    * `floor(budget / cost)`, but when that rounds to 0 in LIVE sizing we
    * force exactly 1 contract as long as a single contract's notional still
-   * clears the `max($100, 15% × equity)` per-position cap. A $550 live book
-   * can afford a $0.95-mark contract ($95 ≤ $100); pre-TRA-378 it could
+   * clears the `max($150, 15% × equity)` per-position cap. A $550 live book
+   * can afford a $1.50-mark contract ($150 ≤ $150); pre-TRA-378 it could
    * never enter one. The forced floor is LIVE-only (`equityOverride`
    * supplied) — demo keeps the legacy null-on-zero behaviour so the
    * per-strategy `budgetRatio` constants and the existing demo tests stand.
    *
    * After picking the floor or the floor-divided count we ALSO re-check
-   * the per-position cap: a budget that the dollar floor lifted to $100
-   * on a sub-$667 book could in principle size to 2 contracts at $40 cost
-   * for a $80 notional that's still ≤ $100, but the same logic at a richer
-   * mark would happily blow past the cap. Pinning the upper bound after
-   * the floor-divide guarantees the cap binds regardless of which branch
-   * picked the count.
+   * the per-position cap: a budget that the dollar floor lifted to $150
+   * on a sub-$1k book could in principle size to multiple contracts at a
+   * cheap mark for a notional that's still ≤ $150, but the same logic at
+   * a richer mark would happily blow past the cap. Pinning the upper bound
+   * after the floor-divide guarantees the cap binds regardless of which
+   * branch picked the count.
    */
   private sizeContracts(budget: number, costPerContract: number, equityOverride?: number): number {
     if (!Number.isFinite(costPerContract) || costPerContract <= 0) return 0;

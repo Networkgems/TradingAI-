@@ -1100,12 +1100,14 @@ export const OPTIONS_PARTIAL_EXIT_RATIO = 0.5; // exit 50% of contracts at TP1; 
 //     notional cost as a fraction of equity. Applied as `min(budget, cap)`
 //     before `floor()`, and also gates the forced 1-contract floor so a
 //     single rich contract can never blow past it. Scales with the account.
-//   • OPTIONS_PER_TICKET_DOLLAR_FLOOR (TRA-495) — minimum per-ticket budget
-//     in dollars. Bumps the pct-budget up to $100 when the percent math
-//     rounds to less than $100 (e.g. $550 * 0.5 * 0.10 = $27.50), so a
+//   • OPTIONS_PER_TICKET_DOLLAR_FLOOR (TRA-495 / TRA-497) — minimum per-ticket
+//     budget in dollars. Bumps the pct-budget up to $150 when the percent math
+//     rounds to less than $150 (e.g. $550 * 0.5 * 0.10 = $27.50), so a
 //     $0.40-mark RV candidate can size to ≥1 contract on a $550 live book.
-//     Also raises the per-position cap floor (`max($100, 15% × equity)`)
-//     so the same $100 ticket budget can clear the cap on a sub-$667 book.
+//     Also raises the per-position cap floor (`max($150, 15% × equity)`)
+//     so the same $150 ticket budget can clear the cap on a sub-$1k book.
+//     Board raised this from $100 to $150 on TRA-497 (2026-05-28) — a $1.50
+//     contract should now clear the cap on the $550 book, not just $0.95.
 //   • OPTIONS_PER_POSITION_PCT_CAP — alias for OPTIONS_POSITION_CAP_RATIO
 //     spelled out for callers that prefer the "PCT_CAP" form.
 //   • OPTIONS_OTM_MIN_EQUITY — live-equity floor below which the OTM
@@ -1114,7 +1116,7 @@ export const OPTIONS_PARTIAL_EXIT_RATIO = 0.5; // exit 50% of contracts at TP1; 
 //     off — wrong for a small book.
 export const OPTIONS_POSITION_CAP_RATIO = 0.15; // cap a single options position at 15% of equity
 export const OPTIONS_PER_POSITION_PCT_CAP = OPTIONS_POSITION_CAP_RATIO;
-export const OPTIONS_PER_TICKET_DOLLAR_FLOOR = 100; // $100 per-ticket floor while equity is small
+export const OPTIONS_PER_TICKET_DOLLAR_FLOOR = 150; // $150 per-ticket floor while equity is small (TRA-497)
 export const OPTIONS_OTM_MIN_EQUITY = 5_000;    // skip the OTM scanner below this live equity
 
 // ── OTM long-premium risk overrides (TRA-160) ───────────────────────────────

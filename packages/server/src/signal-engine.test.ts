@@ -368,13 +368,13 @@ describe('SignalEngine — TRA-319 live RV mirror reconciliation', () => {
     return engine;
   }
 
-  function freshScanner(): StubScanner {
+  function freshScanner(mark = 1.20): StubScanner {
     const scanner = new StubScanner();
     scanner.scan.mockResolvedValue({
       symbol: 'AAPL',
       spot: 195,
       expiration: '2024-07-05',
-      candidates: [makeCandidate({ mark: 1.20 })],
+      candidates: [makeCandidate({ mark })],
       reason: 'ok',
     });
     return scanner;
@@ -559,11 +559,15 @@ describe('SignalEngine — TRA-319 live RV mirror reconciliation', () => {
       cancelOrder: vi.fn(),
       waitForOrderTerminalStatus: vi.fn(),
     };
-    const engine = setupLiveEngine(stub, freshScanner());
-    // TRA-332 / TRA-378: with a $50 OBP, a single $1.20-mark contract ($120)
-    // blows past the 15% per-position cap ($7.50), so even the forced
-    // 1-contract floor can't open it — the engine's pre-check trips before
-    // any broker call and surfaces a skip-reason signal.
+    // TRA-497 — bump mark above the new $150 per-position cap floor so the
+    // small-OBP skip still fires. Pre-TRA-497 a $1.20 mark ($120 cost) was
+    // enough; the $150 cap floor now lets that through.
+    const engine = setupLiveEngine(stub, freshScanner(1.60));
+    // TRA-332 / TRA-378 / TRA-497: with a $50 OBP, a single $1.60-mark
+    // contract ($160) blows past the 15% per-position cap (max($150, $7.50)
+    // = $150), so even the forced 1-contract floor can't open it — the
+    // engine's pre-check trips before any broker call and surfaces a
+    // skip-reason signal.
     (engine as unknown as { liveTradierBalance: { totalEquity: number; totalCash: number; optionBuyingPower: number } | null }).liveTradierBalance = {
       totalEquity: 100, totalCash: 50, optionBuyingPower: 50,
     };
@@ -727,7 +731,7 @@ describe('SignalEngine — TRA-332 live sizing uses real Tradier equity', () => 
     return scanner;
   }
 
-  it('surfaces a budget-too-small skip signal for a $300 cash account (the original TRA-332 report)', async () => {
+  it('surfaces a budget-too-small skip signal for a $300 cash account (TRA-332, recalibrated for TRA-497 $150 cap)', async () => {
     const stub: TradierLiveStub = {
       getAccountBalance: vi.fn(),
       getOptionQuote: vi.fn(),
@@ -735,11 +739,12 @@ describe('SignalEngine — TRA-332 live sizing uses real Tradier equity', () => 
       cancelOrder: vi.fn(),
       waitForOrderTerminalStatus: vi.fn(),
     };
-    const engine = setupLiveEngine(stub, freshScanner(1.20));
-    // The exact balance the user reported on TRA-332 — a Tradier cash account
-    // with $300 available. TRA-378 — a single $1.20-mark contract costs $120,
-    // which exceeds the 15% per-position cap ($45), so even the forced
-    // 1-contract floor can't open it; the engine must skip with a reason.
+    // TRA-497 — the per-position cap floor moved from $100 to $150 on
+    // 2026-05-28. To still verify the skip reason on a $300 cash account
+    // (the original TRA-332 report), use a $1.60-mark candidate whose $160
+    // cost still exceeds the new $150 cap. Pre-TRA-497 this was $1.20 / $120
+    // against the $100 cap.
+    const engine = setupLiveEngine(stub, freshScanner(1.60));
     (engine as unknown as { liveTradierBalance: { totalEquity: number; totalCash: number; optionBuyingPower: number } | null }).liveTradierBalance = {
       totalEquity: 300, totalCash: 300, optionBuyingPower: 300,
     };
@@ -754,15 +759,16 @@ describe('SignalEngine — TRA-332 live sizing uses real Tradier equity', () => 
     expect(state.signals).toHaveLength(1);
     expect(state.signals[0].mode).toBe('live');
     expect(state.signals[0].liveSkipReason).toContain('per-position cap');
-    expect(state.signals[0].liveSkipReason).toContain('$120.00');
+    expect(state.signals[0].liveSkipReason).toContain('$160.00');
     expect(state.signals[0].liveSkipReason).toContain('equity $300.00');
   });
 
-  it('opens a forced 1-contract floor for a small ($1k) live account (TRA-378)', async () => {
+  it('opens a 1-contract position for a small ($1k) live account (TRA-378 / TRA-497)', async () => {
     // Mark = $1 → 1 contract = $100 notional. Live equity = $1,000:
-    // riskPerTrade budget rounds below one contract, but the contract ($100)
-    // clears the 15% per-position cap ($150), so the forced 1-contract floor
-    // opens exactly one. Pre-TRA-378 this account silently skipped the signal.
+    // pctBudget = $1k * 0.5 * 0.01 = $5 (rounds well below one contract),
+    // but the $150 ticket floor (TRA-497) lifts the budget so floor($150/$100)
+    // = 1 contract clears the $150 per-position cap. Pre-TRA-378 this
+    // account silently skipped the signal.
     const stub: TradierLiveStub = {
       getAccountBalance: vi.fn(),
       getOptionQuote: vi.fn().mockResolvedValue(tightQuote()),
@@ -861,20 +867,20 @@ describe('SignalEngine — TRA-332 live sizing uses real Tradier equity', () => 
       cancelOrder: vi.fn(),
       waitForOrderTerminalStatus: vi.fn(),
     };
-    // TRA-495 — the $100 ticket floor would normally let a $1.0-mark contract
-    // through on a $200 OBP book ($100 cost ≤ $100 cap). To still verify the
-    // engine picks OBP over totalEquity, use a $1.50-mark candidate whose
-    // $150 cost blows past the $200-OBP cap ($100) — but would have fit
-    // under the $50K-totalEquity cap ($7.5K). The skip surfaces because
-    // the engine sized off the tighter OBP figure.
-    const engine = setupLiveEngine(stub, freshScanner(1.50));
+    // TRA-495 / TRA-497 — the $150 ticket floor would normally let a
+    // $1.0-mark contract through on a $200 OBP book ($100 cost ≤ $150 cap).
+    // To still verify the engine picks OBP over totalEquity, use a
+    // $1.60-mark candidate whose $160 cost blows past the $200-OBP cap
+    // ($150) — but would have fit under the $50K-totalEquity cap ($7.5K).
+    // The skip surfaces because the engine sized off the tighter OBP figure.
+    const engine = setupLiveEngine(stub, freshScanner(1.60));
     (engine as unknown as { liveTradierBalance: { totalEquity: number; totalCash: number; optionBuyingPower: number } | null }).liveTradierBalance = {
       totalEquity: 50_000, totalCash: 50_000, optionBuyingPower: 200,
     };
 
     await (engine as unknown as { runRelativeValueScan: (s: string[]) => Promise<void> }).runRelativeValueScan(['AAPL']);
 
-    // $150 cost > $100 cap (max($100, $30)) under OBP sizing → skip. If the
+    // $160 cost > $150 cap (max($150, $30)) under OBP sizing → skip. If the
     // engine had used totalEquity ($50K, cap $7,500) the contract would have
     // sized fine — proves OBP took precedence.
     expect(stub.buyContractsLimit).not.toHaveBeenCalled();

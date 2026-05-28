@@ -57,11 +57,12 @@ describe('PaperOptionsAccount.openOptionFromCandidate', () => {
     expect(pos!.tp1Premium).toBeCloseTo(1.50, 5);          // 1 + 0.50 TP1
   });
 
-  it('returns null when the mark blows past the per-position cap (TRA-495 floor applies)', () => {
-    // TRA-495 — the $100 dollar floor on the budget lifts the OTM pct-budget
-    // ($1K × 0.5 × 0.025 = $12.50) to $100, but the per-position cap
-    // (max($100, $1K × 15%) = $150) still rejects a mark whose cost exceeds
-    // the cap. At mark=$2.00 (cost $200), the floor can't help — $200 > $150.
+  it('returns null when the mark blows past the per-position cap (TRA-495/TRA-497 floor applies)', () => {
+    // TRA-495 / TRA-497 — the $150 dollar floor on the budget lifts the OTM
+    // pct-budget ($1K × 0.5 × 0.025 = $12.50) to $150, but the per-position
+    // cap (max($150, $1K × 15%) = $150) still rejects a mark whose cost
+    // exceeds the cap. At mark=$2.00 (cost $200), the floor can't help —
+    // $200 > $150.
     const acct = new PaperOptionsAccount({ initialEquity: 1_000, managedAccountRatio: 0.5 });
     const sig = buildSignal({ mark: 2.0 });
     expect(acct.openOptionFromCandidate(sig)).toBeNull();
@@ -434,18 +435,18 @@ describe('PaperOptionsAccount — TRA-332 live equity override sizing', () => {
     expect(pos!.contracts).toBeGreaterThan(0);
   });
 
-  it('getRvBudgetForEquity reflects managedRatio and the riskPerTrade knob (TRA-378 / TRA-495)', () => {
-    // TRA-495 — the $100 ticket floor lifts small-equity budgets up to $100
-    // even when the pct math would compute much less, so a sub-$1k book can
-    // still size cheap contracts. The riskPerTrade knob still drives the
-    // budget above the floor.
+  it('getRvBudgetForEquity reflects managedRatio and the riskPerTrade knob (TRA-378 / TRA-495 / TRA-497)', () => {
+    // TRA-495 / TRA-497 — the $150 ticket floor lifts small-equity budgets
+    // up to $150 even when the pct math would compute much less, so a
+    // sub-$1k book can still size cheap contracts. The riskPerTrade knob
+    // still drives the budget above the floor.
     const acct = new PaperOptionsAccount({
       initialEquity: 50_000,
       managedAccountRatio: 0.5,
       riskPerTrade: 0.10,
     });
-    // 300 * 0.5 * 0.10 = $15 (pct math); $100 floor wins.
-    expect(acct.getRvBudgetForEquity(300)).toBeCloseTo(100, 5);
+    // 300 * 0.5 * 0.10 = $15 (pct math); $150 floor wins.
+    expect(acct.getRvBudgetForEquity(300)).toBeCloseTo(150, 5);
     // Above the floor: 10_000 * 0.5 * 0.10 = $500 — pct math wins.
     expect(acct.getRvBudgetForEquity(10_000)).toBeCloseTo(500, 5);
     // Editing the riskPerTrade knob re-sizes the live budget above the floor.
@@ -496,25 +497,38 @@ describe('PaperOptionsAccount — TRA-378 small-account sizing', () => {
   }
 
   it('sizes a $1.00-mark RV candidate to ≥1 contract at $1k equity (was 0)', () => {
-    // budget = min(1_000 * 1.0 * 0.10, 1_000 * 0.15) = $100; cost = $100 → 1.
+    // budget = min(1_000 * 0.15, max(1_000 * 1.0 * 0.10, $150)) = $150;
+    // cost = $100 → floor(150/100) = 1.
     const pos = smallAccount().openOptionFromRvCandidate(buildRvSignal({ mark: 1.0 }), 'live', 1_000);
     expect(pos).not.toBeNull();
     expect(pos!.contracts).toBeGreaterThanOrEqual(1);
   });
 
   it('forces a 1-contract floor when the budget alone rounds to 0 contracts', () => {
-    // budget $100, mark $1.20 → cost $120 → floor(100/120) = 0. The $120
-    // contract still clears the 15% cap ($150) → forced 1 contract.
-    const pos = smallAccount().openOptionFromRvCandidate(buildRvSignal({ mark: 1.20 }), 'live', 1_000);
+    // TRA-497 — with the $150 ticket floor at $1k equity the budget AND cap
+    // are both $150, so the forced-floor edge (budget<cost<=cap) collapses
+    // on a $1k book. Move to a $2k account where the cap rises to $300
+    // ($2k * 0.15) but pctBudget at the smallAccount-style 10% would compute
+    // to $200 and the floor still wins at $150 — wait: $200 > $150 so the
+    // budget is $200 here. Use risk=0.05 so pctBudget=$100 lifts to $150,
+    // leaving cost in ($150, $300] as the forced-floor window. Mark $2.00
+    // → cost $200 → floor(150/200)=0; $200 ≤ $300 cap → forced 1 contract.
+    const acct = new PaperOptionsAccount({
+      initialEquity: 2_000,
+      managedAccountRatio: 1.0,
+      riskPerTrade: 0.05,
+    });
+    const pos = acct.openOptionFromRvCandidate(buildRvSignal({ mark: 2.0 }), 'live', 2_000);
     expect(pos).not.toBeNull();
     expect(pos!.contracts).toBe(1);
   });
 
   it('sizes a sub-dollar ($0.30) mark to multiple contracts at $1k equity', () => {
-    // budget $100, cost $30 → 3 contracts.
+    // budget $150, cost $30 → floor(150/30) = 5 contracts; cap check
+    // 5 * 30 = $150 ≤ $150 cap → 5 contracts.
     const pos = smallAccount().openOptionFromRvCandidate(buildRvSignal({ mark: 0.30 }), 'live', 1_000);
     expect(pos).not.toBeNull();
-    expect(pos!.contracts).toBe(3);
+    expect(pos!.contracts).toBe(5);
   });
 
   it('skips a $4.00-mark contract at $1k — the 15% cap, not a $400 position', () => {
@@ -547,21 +561,22 @@ describe('PaperOptionsAccount — TRA-378 small-account sizing', () => {
   it('getRvContractsForEquity matches what the open path would size', () => {
     const acct = smallAccount();
     expect(acct.getRvContractsForEquity(1_000, 1.0)).toBe(1);
-    expect(acct.getRvContractsForEquity(1_000, 0.30)).toBe(3);
+    expect(acct.getRvContractsForEquity(1_000, 0.30)).toBe(5); // TRA-497: 150/30
     expect(acct.getRvContractsForEquity(1_000, 4.0)).toBe(0); // 15% cap
   });
 
-  it('demo sizing also picks up the $100 ticket floor on a small paper book (TRA-495 parity)', () => {
+  it('demo sizing also picks up the $150 ticket floor on a small paper book (TRA-495 / TRA-497 parity)', () => {
     // $1k DEMO account: pct-budget = 1_000 * 1.0 * 0.02 = $20 (post-TRA-461
-    // RV budget tweak), lifted to $100 by the dollar floor. At mark=$1.0
-    // (cost $100) → 1 contract. Demo keeps the legacy null-on-zero ONLY when
-    // the floor itself can't make a single contract fit (cost > $100 with no
-    // equityOverride to trigger the cap-gated forced floor).
+    // RV budget tweak), lifted to $150 by the dollar floor. At mark=$1.0
+    // (cost $100) → floor(150/100) = 1 contract. Demo keeps the legacy
+    // null-on-zero ONLY when the floor itself can't make a single contract
+    // fit (cost > $150 with no equityOverride to trigger the cap-gated
+    // forced floor).
     const acct = new PaperOptionsAccount({ initialEquity: 1_000, managedAccountRatio: 1.0 });
     const pos = acct.openOptionFromRvCandidate(buildRvSignal({ mark: 1.0 }), 'demo');
     expect(pos).not.toBeNull();
     expect(pos!.contracts).toBe(1);
-    // A $2.00-mark contract still nulls out — $200 cost > $100 budget, and
+    // A $2.00-mark contract still nulls out — $200 cost > $150 budget, and
     // the forced-1-contract floor is LIVE-only (no equityOverride here).
     const acct2 = new PaperOptionsAccount({ initialEquity: 1_000, managedAccountRatio: 1.0 });
     expect(acct2.openOptionFromRvCandidate(buildRvSignal({ mark: 2.0 }), 'demo')).toBeNull();
@@ -591,9 +606,9 @@ describe('PaperOptionsAccount — TRA-378 small-account sizing', () => {
 
   it('OTM equity gate does not apply to demo sizing (no equityOverride)', () => {
     // A $1k DEMO account never hits the live OTM gate; it sizes off the per-
-    // strategy budgetRatio, but TRA-495's $100 ticket floor is universal so
-    // a $1 mark fits. A $2.50 mark ($250 cost) still nulls because demo has
-    // no equityOverride-gated forced floor.
+    // strategy budgetRatio, but TRA-495/TRA-497's $150 ticket floor is
+    // universal so a $1 mark fits. A $2.50 mark ($250 cost) still nulls
+    // because demo has no equityOverride-gated forced floor.
     const acct = new PaperOptionsAccount({ initialEquity: 1_000, managedAccountRatio: 1.0 });
     const big = new PaperOptionsAccount({ initialEquity: 50_000, managedAccountRatio: 1.0 });
     expect(big.openOptionFromCandidate(buildSignal({ mark: 1.0 }), 'demo')).not.toBeNull();
@@ -601,9 +616,9 @@ describe('PaperOptionsAccount — TRA-378 small-account sizing', () => {
   });
 });
 
-// TRA-495 — wire small-equity live options sizing + swing rules.
+// TRA-495 / TRA-497 — wire small-equity live options sizing + swing rules.
 // Validates the spec test cases from the issue: $550 live book sizing, the
-// dollar-floor + 15%-cap-with-$100-floor interaction, and the 24h TP1 swing
+// dollar-floor + 15%-cap-with-$150-floor interaction, and the same-day exit
 // suppression in checkExits. The minDaysToExpiry filter is covered in
 // `relative-value.test.ts` (the scanner-side enforcement).
 describe('PaperOptionsAccount — TRA-495 $550 live sizing + swing rules', () => {
@@ -650,24 +665,34 @@ describe('PaperOptionsAccount — TRA-495 $550 live sizing + swing rules', () =>
 
   it('sizes a $0.40-mark RV candidate to ≥1 contract on a $550 live book (was 0 pre-TRA-495)', () => {
     // pctBudget = 550 * 0.5 * 0.10 = $27.50 — too small to size a single
-    // $40 contract pre-TRA-495. The $100 ticket floor lifts the budget,
-    // and the cap = max($100, $82.50) = $100 lets the $40 cost through.
+    // $40 contract pre-TRA-495. The $150 ticket floor lifts the budget,
+    // and the cap = max($150, $82.50) = $150 lets the $40 cost through.
     const pos = liveBook().openOptionFromRvCandidate(buildRvSignal({ mark: 0.40 }), 'live', 550);
     expect(pos).not.toBeNull();
     expect(pos!.contracts).toBeGreaterThanOrEqual(1);
   });
 
-  it('rejects a $1.50-mark RV candidate at $550 — cost $150 blows past the $100 per-position cap', () => {
-    // cap = max($100, 550 × 0.15) = max($100, $82.50) = $100. $150 > $100 → null.
+  it('sizes a $1.50-mark RV candidate to 1 contract at $550 — cost $150 fits at the new $150 cap (TRA-497)', () => {
+    // TRA-497 — board raised the max per trade from $100 to $150 on
+    // 2026-05-28. cap = max($150, 550 × 0.15) = max($150, $82.50) = $150.
+    // $150 cost exactly clears the cap → forced-floor branch picks 1.
     const acct = liveBook();
-    expect(acct.openOptionFromRvCandidate(buildRvSignal({ mark: 1.50 }), 'live', 550)).toBeNull();
+    const pos = acct.openOptionFromRvCandidate(buildRvSignal({ mark: 1.50 }), 'live', 550);
+    expect(pos).not.toBeNull();
+    expect(pos!.contracts).toBe(1);
+  });
+
+  it('rejects a $1.60-mark RV candidate at $550 — cost $160 still blows past the $150 per-position cap (TRA-497)', () => {
+    // cap = max($150, 550 × 0.15) = max($150, $82.50) = $150. $160 > $150 → null.
+    const acct = liveBook();
+    expect(acct.openOptionFromRvCandidate(buildRvSignal({ mark: 1.60 }), 'live', 550)).toBeNull();
     // Cash and counter untouched on reject.
     expect(acct.getState().optionsCash).toBe(550);
     expect(acct.getState().dailyOptionsCount).toBe(0);
   });
 
-  it('sizes a $0.95-mark RV candidate to 1 contract on a $550 book — fits under the $100 cap', () => {
-    // cost = $95 ≤ $100 cap → forced-floor branch picks 1 contract.
+  it('sizes a $0.95-mark RV candidate to 1 contract on a $550 book — fits under the $150 cap', () => {
+    // cost = $95 ≤ $150 cap → forced-floor branch picks 1 contract.
     const pos = liveBook().openOptionFromRvCandidate(buildRvSignal({ mark: 0.95 }), 'live', 550);
     expect(pos).not.toBeNull();
     expect(pos!.contracts).toBe(1);
@@ -698,10 +723,10 @@ describe('PaperOptionsAccount — TRA-495 $550 live sizing + swing rules', () =>
     expect(sixth).toBeNull();
   });
 
-  it('per-position cap keeps its $100 floor even when equity × 15% drops below it', () => {
+  it('per-position cap keeps its $150 floor even when equity × 15% drops below it', () => {
     // At $550 equity the raw 0.15 cap = $82.50 would falsely reject a $90
-    // contract that fits inside the $100 budget. The floor on the cap
-    // (max($100, …)) keeps the contract eligible.
+    // contract that fits inside the $150 budget. The floor on the cap
+    // (max($150, …)) keeps the contract eligible.
     const pos = liveBook().openOptionFromRvCandidate(buildRvSignal({ mark: 0.90 }), 'live', 550);
     expect(pos).not.toBeNull();
     expect(pos!.contracts).toBe(1);
