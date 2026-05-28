@@ -707,47 +707,70 @@ describe('PaperOptionsAccount — TRA-495 $550 live sizing + swing rules', () =>
     expect(pos!.contracts).toBe(1);
   });
 
-  it('suppresses the TP1 partial fire for the first 24h after open; SL still fires', () => {
-    const acct = new PaperOptionsAccount({ initialEquity: 50_000, managedAccountRatio: 0.5 });
-    const pos = acct.openOptionFromRvCandidate(buildRvSignal({ mark: 1.0 }), 'live');
-    expect(pos!.contracts).toBeGreaterThan(1);
+  it('suppresses ALL engine exits same trading day for an RV swing position (TP1, SL, trail)', () => {
+    // Board directive 2026-05-28 on TRA-495: "no same buy and sell, hold for
+    // at least still the next day trading sessions before exiting." Replaces
+    // the original TP1-only 24h gate with a same-day all-exits gate scoped
+    // to the RV swing flow. The trigger types covered:
+    //   • TP1 partial — mark 1.60 (> RV TP1 1.40).
+    //   • Hard SL     — mark 0.40 (< RV SL 0.75).
+    //   • Trailing    — mark 1.50 (engages trail) then dip below trail stop.
+    // All three must leave the position fully open same-day.
+    const tp1 = new PaperOptionsAccount({ initialEquity: 50_000, managedAccountRatio: 0.5 });
+    const sl  = new PaperOptionsAccount({ initialEquity: 50_000, managedAccountRatio: 0.5 });
+    const tp1Pos = tp1.openOptionFromRvCandidate(buildRvSignal({ mark: 1.0 }), 'live');
+    const slPos  = sl.openOptionFromRvCandidate(buildRvSignal({ mark: 1.0 }), 'live');
 
-    // 1h after open — mark crosses the RV TP1 trigger (1.40). The position
-    // should remain at full size because the partial is suppressed.
+    // 1h after open — same calendar date.
     vi.advanceTimersByTime(60 * 60 * 1000);
-    const tp1Mark = new Map<string, number>([[pos!.optionSymbol!, 1.60]]);
-    acct.checkExits(new Map(), tp1Mark, 'live');
-    const stillFull = acct.getState().openOptions[0];
-    expect(stillFull.tp1Hit).toBe(false);
-    expect(stillFull.contractsRemaining).toBe(pos!.contracts);
+
+    tp1.checkExits(new Map(), new Map([[tp1Pos!.optionSymbol!, 1.60]]), 'live');
+    const tp1After = tp1.getState().openOptions[0];
+    expect(tp1After.tp1Hit).toBe(false);
+    expect(tp1After.contractsRemaining).toBe(tp1Pos!.contracts);
+
+    sl.checkExits(new Map(), new Map([[slPos!.optionSymbol!, 0.40]]), 'live');
+    expect(sl.getState().openOptions).toHaveLength(1);
+    expect(sl.getState().closedOptions).toHaveLength(0);
   });
 
-  it('fires TP1 partial after 25h on the same position (suppression window expired)', () => {
+  it('releases the gate on the next trading session — TP1 partial fires the next calendar day', () => {
     const acct = new PaperOptionsAccount({ initialEquity: 50_000, managedAccountRatio: 0.5 });
     const pos = acct.openOptionFromRvCandidate(buildRvSignal({ mark: 1.0 }), 'live');
     const initialContracts = pos!.contracts;
     expect(initialContracts).toBeGreaterThan(1);
 
+    // Jump 25h forward — date key flips, gate releases.
     vi.advanceTimersByTime(25 * 60 * 60 * 1000);
-    const tp1Mark = new Map<string, number>([[pos!.optionSymbol!, 1.60]]);
-    acct.checkExits(new Map(), tp1Mark, 'live');
+    acct.checkExits(new Map(), new Map([[pos!.optionSymbol!, 1.60]]), 'live');
     const after = acct.getState().openOptions[0];
     expect(after.tp1Hit).toBe(true);
     expect(after.contractsRemaining).toBeLessThan(initialContracts);
   });
 
-  it('hard SL still fires inside the 24h suppression window (only TP1 is delayed)', () => {
+  it('releases the gate on the next trading session — SL fires the next calendar day', () => {
     const acct = new PaperOptionsAccount({ initialEquity: 50_000, managedAccountRatio: 0.5 });
     const pos = acct.openOptionFromRvCandidate(buildRvSignal({ mark: 1.0 }), 'live');
     expect(pos).not.toBeNull();
 
-    // 1h after open the mark slumps past the RV SL (premium × 0.75 = 0.75).
-    vi.advanceTimersByTime(60 * 60 * 1000);
-    const slMark = new Map<string, number>([[pos!.optionSymbol!, 0.40]]);
-    const closed = acct.checkExits(new Map(), slMark, 'live');
+    vi.advanceTimersByTime(25 * 60 * 60 * 1000);
+    const closed = acct.checkExits(new Map(), new Map([[pos!.optionSymbol!, 0.40]]), 'live');
     expect(closed).toHaveLength(1);
     expect(closed[0].pnl).toBeLessThan(0);
     expect(acct.getState().openOptions).toHaveLength(0);
+  });
+
+  it('gate is RV-specific — OTM same-day SL still fires (preserves the legacy non-swing path)', () => {
+    // TRA-495's gate is scoped to `signalType === 'relative_value'` so the
+    // ATM / OTM / imported paths keep their existing same-day exit behaviour.
+    // Live-mode OTM positions opened on a $5K+ book are still gated to PDT-
+    // overnight via TRA-483's broader gate (default ON); this test covers
+    // DEMO OTM which falls outside both gates and must keep firing SL.
+    const acct = new PaperOptionsAccount({ initialEquity: 50_000, managedAccountRatio: 0.5 });
+    const pos = acct.openOptionFromCandidate(buildSignal({ mark: 1.0 }), 'demo');
+    expect(pos).not.toBeNull();
+    const closed = acct.checkExits(new Map(), new Map([[pos!.optionSymbol!, 0.75]]), 'demo');
+    expect(closed).toHaveLength(1);
   });
 });
 
@@ -1685,6 +1708,9 @@ describe('PaperOptionsAccount — TRA-354 wait-and-hold exits', () => {
     const acct = new PaperOptionsAccount({ initialEquity: 50_000, managedAccountRatio: 0.5 });
     const pos = acct.openOptionFromRvCandidate(buildRvSignal({ mark: 1.0 }), 'live');
     expect(pos).not.toBeNull();
+    // TRA-495 — live RV positions are gated to the next trading session;
+    // advance past midnight so the SL trigger is reachable in this test.
+    vi.advanceTimersByTime(25 * 60 * 60 * 1000);
     const cashBefore = acct.getState().optionsCash;
 
     // Mark drops past the RV SL (RV uses different params; 0.30 will be below
@@ -1707,6 +1733,7 @@ describe('PaperOptionsAccount — TRA-354 wait-and-hold exits', () => {
   it('subsequent checkExits ticks do not re-fire while pendingExit is set', () => {
     const acct = new PaperOptionsAccount({ initialEquity: 50_000, managedAccountRatio: 0.5 });
     const pos = acct.openOptionFromRvCandidate(buildRvSignal({ mark: 1.0 }), 'live');
+    vi.advanceTimersByTime(25 * 60 * 60 * 1000); // TRA-495 — past the same-day swing gate
     const marks = new Map<string, number>([[pos!.optionSymbol!, 0.30]]);
     const first = acct.checkExits(new Map(), marks, 'live', { waitAndHold: true });
     expect(first).toHaveLength(1);
@@ -1720,6 +1747,7 @@ describe('PaperOptionsAccount — TRA-354 wait-and-hold exits', () => {
   it('finalizePendingExit on SL fill books P&L, closes the position, and clears pendingExit', () => {
     const acct = new PaperOptionsAccount({ initialEquity: 50_000, managedAccountRatio: 0.5 });
     const pos = acct.openOptionFromRvCandidate(buildRvSignal({ mark: 1.0 }), 'live');
+    vi.advanceTimersByTime(25 * 60 * 60 * 1000); // TRA-495 — past the same-day swing gate
     const cashBefore = acct.getState().optionsCash;
 
     const marks = new Map<string, number>([[pos!.optionSymbol!, 0.30]]);
@@ -1777,6 +1805,7 @@ describe('PaperOptionsAccount — TRA-354 wait-and-hold exits', () => {
   it('clearPendingExit leaves the position open and stamps exitErrorReason on the open row', () => {
     const acct = new PaperOptionsAccount({ initialEquity: 50_000, managedAccountRatio: 0.5 });
     const pos = acct.openOptionFromRvCandidate(buildRvSignal({ mark: 1.0 }), 'live');
+    vi.advanceTimersByTime(25 * 60 * 60 * 1000); // TRA-495 — past the same-day swing gate
     const cashBefore = acct.getState().optionsCash;
 
     const marks = new Map<string, number>([[pos!.optionSymbol!, 0.30]]);
@@ -1797,6 +1826,7 @@ describe('PaperOptionsAccount — TRA-354 wait-and-hold exits', () => {
   it('TRA-450 — auto-close circuit breaker stops re-staging after MAX consecutive rejections', () => {
     const acct = new PaperOptionsAccount({ initialEquity: 50_000, managedAccountRatio: 0.5 });
     const pos = acct.openOptionFromRvCandidate(buildRvSignal({ mark: 1.0 }), 'live');
+    vi.advanceTimersByTime(25 * 60 * 60 * 1000); // TRA-495 — past the same-day swing gate
     const marks = new Map<string, number>([[pos!.optionSymbol!, 0.30]]);
 
     // Three ticks: each stages an exit; the broker rejects each one.
@@ -1843,6 +1873,7 @@ describe('PaperOptionsAccount — TRA-354 wait-and-hold exits', () => {
   it('TRA-450 — a user re-stage (stageManualPendingExit) clears a tripped breaker', () => {
     const acct = new PaperOptionsAccount({ initialEquity: 50_000, managedAccountRatio: 0.5 });
     const pos = acct.openOptionFromRvCandidate(buildRvSignal({ mark: 1.0 }), 'live');
+    vi.advanceTimersByTime(25 * 60 * 60 * 1000); // TRA-495 — past the same-day swing gate
     const marks = new Map<string, number>([[pos!.optionSymbol!, 0.30]]);
     for (let i = 0; i < 3; i += 1) {
       acct.checkExits(new Map(), marks, 'live', { waitAndHold: true });
@@ -1858,6 +1889,7 @@ describe('PaperOptionsAccount — TRA-354 wait-and-hold exits', () => {
   it('TRA-450 — a user cancel does not count toward the breaker', () => {
     const acct = new PaperOptionsAccount({ initialEquity: 50_000, managedAccountRatio: 0.5 });
     const pos = acct.openOptionFromRvCandidate(buildRvSignal({ mark: 1.0 }), 'live');
+    vi.advanceTimersByTime(25 * 60 * 60 * 1000); // TRA-495 — past the same-day swing gate
     const marks = new Map<string, number>([[pos!.optionSymbol!, 0.30]]);
     for (let i = 0; i < 5; i += 1) {
       const staged = acct.checkExits(new Map(), marks, 'live', { waitAndHold: true });
@@ -1872,6 +1904,7 @@ describe('PaperOptionsAccount — TRA-354 wait-and-hold exits', () => {
   it('attachPendingExit stamps the Tradier order id; listPendingExits surfaces all in-flight rows', () => {
     const acct = new PaperOptionsAccount({ initialEquity: 50_000, managedAccountRatio: 0.5 });
     const pos = acct.openOptionFromRvCandidate(buildRvSignal({ mark: 1.0 }), 'live');
+    vi.advanceTimersByTime(25 * 60 * 60 * 1000); // TRA-495 — past the same-day swing gate
     const marks = new Map<string, number>([[pos!.optionSymbol!, 0.30]]);
     acct.checkExits(new Map(), marks, 'live', { waitAndHold: true });
 
@@ -2107,6 +2140,7 @@ describe('PaperOptionsAccount — TRA-374 demo cost model', () => {
     });
     const pos = acct.openOptionFromRvCandidate(buildRvSignal({ mark: 1.0 }), 'live', 50_000);
     expect(pos).not.toBeNull();
+    vi.advanceTimersByTime(25 * 60 * 60 * 1000); // TRA-495 — past the same-day swing gate
     const marks = new Map<string, number>([[pos!.optionSymbol!, 0.70]]);
     const closed = acct.checkExits(new Map(), marks);
     expect(closed).toHaveLength(1);

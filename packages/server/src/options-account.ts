@@ -53,16 +53,6 @@ function perPositionCap(equity: number): number {
   return Math.max(OPTIONS_PER_TICKET_DOLLAR_FLOOR, equity * OPTIONS_POSITION_CAP_RATIO);
 }
 
-/**
- * TRA-495 — swing rule: skip the TP1 partial-exit fire while a position is
- * younger than 24h. The RV scanner targets 21–60d expirations; partialling
- * out on day-1 noise would defeat the swing thesis. Hard SL and the
- * trailing stop still fire — only the +TP1 partial branch waits. This is
- * distinct from TRA-483's `holdLiveOptionsOvernightForPdt` which (when on)
- * suppresses ALL engine exits same-day; TRA-495 always-on but TP1-only.
- */
-const TP1_SUPPRESSION_MS = 24 * 60 * 60 * 1000;
-
 const ATM_DELTA = 0.50;
 
 /**
@@ -1153,18 +1143,34 @@ export class PaperOptionsAccount {
         continue;
       }
 
-      // TRA-495 — swing rule: skip TP1 partial fires for positions younger
-      // than 24h. The RV scanner now targets ≥7-DTE contracts and the board
-      // wants the engine to ride a winner overnight instead of partialling
-      // out on day-1 noise. Hard SL and trailing-stop fires still trigger
-      // — only the +TP1 partial waits. Manual closes (via stageManualPendingExit)
-      // are unaffected; they don't flow through this branch. Layered ABOVE
-      // TRA-483's same-day-all-exits gate so this still kicks in for users
-      // who turn PDT-hold off.
-      const positionAgeMs = Date.now() - opt.openedAt;
-      const tp1Eligible = positionAgeMs >= TP1_SUPPRESSION_MS;
+      // TRA-495 — swing rule (board directive 2026-05-28: "no same buy and
+      // sell, hold for at least still the next day trading sessions before
+      // exiting"). Suppress ALL engine-fired exits (TP1 partial, hard SL,
+      // trailing stop) for LIVE RV positions opened in today's trading
+      // session; resume on the next session. The gate is scoped to:
+      //   • `signalType === 'relative_value'` — the swing flow is RV-only
+      //     (ATM/OTM live paths keep their existing semantics; OTM is
+      //     gated <$5K live anyway).
+      //   • `(opt.mode ?? 'demo') === 'live'` — the board's directive is
+      //     about the live book. Demo keeps the legacy same-day exit
+      //     behaviour so the exit-mechanic test suite continues to work
+      //     against synthetic data without an artificial clock advance.
+      //   • Same calendar-date key — aligns with TRA-483's "next trading
+      //     session" semantics rather than a literal 24h clock.
+      // This gate is independent of TRA-483 (`holdLiveOptionsOvernightForPdt`)
+      // so it still kicks in if a user explicitly disables that knob.
+      // Manual closes (`stageManualPendingExit`, `closeOption`) don't flow
+      // through this branch and stay available to the user.
+      if (
+        opt.signalType === 'relative_value'
+        && (opt.mode ?? 'demo') === 'live'
+        && toDateKey(opt.openedAt) === toDateKey(Date.now())
+      ) {
+        continue;
+      }
+
       // Partial exit at TP1: sell `partialExitRatio` of contracts, trail the rest
-      if (!opt.tp1Hit && tp1Eligible && mark >= opt.tp1Premium && opt.contractsRemaining > 1) {
+      if (!opt.tp1Hit && mark >= opt.tp1Premium && opt.contractsRemaining > 1) {
         const exitContracts = Math.floor(opt.contractsRemaining * partialExitRatio);
         if (exitContracts > 0) {
           if (waitAndHold) {
