@@ -15,7 +15,6 @@ import {
   DEFAULT_ACCOUNT_SETTINGS,
   OPTIONS_BUDGET_RATIO,
   OPTIONS_PER_TICKET_DOLLAR_FLOOR,
-  OPTIONS_POSITION_CAP_RATIO,
   OPTIONS_OTM_MIN_EQUITY,
   OPTIONS_TP1_PCT,
   OPTIONS_SL_PCT,
@@ -27,6 +26,7 @@ import {
   RV_RISK_PARAMS,
   RV_MIN_MARK_FLOOR,
   isValidTradingWindow,
+  perPositionCap,
 } from '@trading-app/shared';
 
 /**
@@ -41,18 +41,10 @@ function rvStopLossPremium(premium: number, rvRiskParams: RvRiskParams): number 
   return Math.max(0, premium - distance);
 }
 
-/**
- * TRA-495 / TRA-497 — per-position notional cap with the $150 dollar floor
- * baked in. Below ~$1k equity the raw 15% cap (`equity × 0.15`) drops below
- * the $150 ticket floor, which would null out every live RV signal on a
- * small book even though the budget says one contract fits. Capping at
- * `max($150, 15% × equity)` mirrors the floor on the budget side so a
- * $1.50-mark contract at $550 equity still clears the per-position check
- * (board raised the floor from $100 to $150 on TRA-497, 2026-05-28).
- */
-function perPositionCap(equity: number): number {
-  return Math.max(OPTIONS_PER_TICKET_DOLLAR_FLOOR, equity * OPTIONS_POSITION_CAP_RATIO);
-}
+// TRA-499 — `perPositionCap` moved to `@trading-app/shared` so the live-equity
+// sizing path can reuse the same floor + 15%-of-equity cap as the options
+// ticket budget. The math is unchanged from the original TRA-495/TRA-497
+// helper that lived here; only the import site moved.
 
 const ATM_DELTA = 0.50;
 

@@ -1,6 +1,6 @@
 import { OrbStrategy, BbFadeStrategy, IchimokuStrategy, TradierOptionsClient, TradierOrderClient, TRADIER_REJECTED_STATUSES, evaluateSma200, SMA200_MIN_BARS, SMA200_DEBOUNCE_BARS } from '@trading-app/engine';
 import type { TradierAccountBalance } from '@trading-app/engine';
-import { WATCHLIST, MANAGED_ACCOUNT_RATIO, MAX_CONSECUTIVE_LOSSES, DAILY_DRAWDOWN_HALT_PCT, OPTIONS_PER_TICKET_DOLLAR_FLOOR, OPTIONS_POSITION_CAP_RATIO, aliasWatchlistSymbol, isLiveTradierOptionsEnabled, isStockMarketOpen, resolveAutoManageImportedTradierOptions, resolveDemoCostModel, resolveHoldLiveOptionsOvernight, resolveLiveTradeEquitiesTradier, resolveManagedAccountRatio, resolveMarketReviewGatesEnabled, resolveRiskPerTrade, resolveRvDtePrefs, resolveTradierOptionsCreds, DEFAULT_RV_DTE_MIN, DEFAULT_RV_DTE_MAX, DEFAULT_RV_DTE_TARGET } from '@trading-app/shared';
+import { WATCHLIST, MANAGED_ACCOUNT_RATIO, MAX_CONSECUTIVE_LOSSES, DAILY_DRAWDOWN_HALT_PCT, OPTIONS_PER_TICKET_DOLLAR_FLOOR, OPTIONS_POSITION_CAP_RATIO, aliasWatchlistSymbol, isLiveTradierOptionsEnabled, isStockMarketOpen, perPositionCap, resolveAutoManageImportedTradierOptions, resolveDemoCostModel, resolveHoldLiveOptionsOvernight, resolveLiveTradeEquitiesTradier, resolveManagedAccountRatio, resolveMarketReviewGatesEnabled, resolveRiskPerTrade, resolveRvDtePrefs, resolveTradierOptionsCreds, DEFAULT_RV_DTE_MIN, DEFAULT_RV_DTE_MAX, DEFAULT_RV_DTE_TARGET } from '@trading-app/shared';
 import type { TradeSignal, RelativeValueSignal, Sma200Signal, Candle, OptionsAccountState, SignalType, Position, AccountSettings, AccountState, NewsItem, TradierEnv, MarketReview, MarketReviewGates, EngineMarketReviewState, GatedStrategyNote } from '@trading-app/shared';
 import { getLatestMarketReview } from './market-review.js';
 import { etDateString } from './scheduler.js';
@@ -3571,6 +3571,34 @@ export function sizeLiveEquityFromStop(args: {
   const mult = args.sizeMultiplier;
   if (typeof mult === 'number' && Number.isFinite(mult) && mult > 0 && mult < 1) {
     qty = Math.floor(qty * mult);
+  }
+  // TRA-499 — per-position dollar cap on live equity tickets, mirroring the
+  // TRA-495/TRA-497 options ticket cap. Below ~$1k equity the raw 15%-of-equity
+  // cap drops below the $150 ticket floor and would null out reasonable
+  // entries even though the risk-from-stop math allows them. Apply the cap
+  // *after* the risk/equity/BP/regime trims so the cap is the final upper
+  // bound rather than something the broader risk math has to respect.
+  //
+  // Two-step gate, mirroring `OptionsAccount.sizeContracts`:
+  //   1. If the risk-from-stop math rounded `qty` to 0 (e.g. $550 book, $50
+  //      share, $2 stop distance ⇒ `riskQty = 13` but the buying-power /
+  //      managed-equity caps trim it down) AND a single share's notional fits
+  //      under the per-position cap, force `qty = 1`. This is the LIVE-only
+  //      1-share floor that makes a $550 book actually buy something.
+  //   2. If multi-share `qty × currentPrice` exceeds the cap, trim back to
+  //      `floor(cap / currentPrice)`. This is the same trim the options path
+  //      does after the dollar floor lifts the budget above the cap.
+  //
+  // Cap is `max($150, 15% × equity)`. A 1-share-cost-exceeds-cap reject (e.g.
+  // $150 stock on a $550 book) returns 0 — the position concentration is too
+  // high for the small-account swing thesis. Fractional-share support is
+  // intentionally not enabled here (see TRA-499 spec).
+  const cap = perPositionCap(baseEquity);
+  if (qty <= 0 && currentPrice <= cap) {
+    qty = 1;
+  }
+  if (qty > 0 && qty * currentPrice > cap) {
+    qty = Math.floor(cap / currentPrice);
   }
   return qty > 0 ? qty : 0;
 }

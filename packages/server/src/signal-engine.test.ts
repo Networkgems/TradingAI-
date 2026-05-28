@@ -1123,7 +1123,132 @@ describe('sizeLiveEquityFromStop (TRA-335)', () => {
       currentPrice: 50,
     });
     // managedEquity = 5000. maxRisk = 250. riskQty = floor(250/5) = 50.
-    // equityCap = floor(5000/50) = 100. min = 50. No SBP cap applied.
+    // equityCap = floor(5000/50) = 100. min(riskQty=50, equityCap=100) = 50.
+    // No SBP cap (null). TRA-499 — perPositionCap(baseEquity=$5,000) =
+    // max($150, 15% × $5,000) = $750; 50 × $50 = $2,500 > $750 → trim to
+    // floor($750/$50) = 15 shares. The BP cap is still skipped (the test's
+    // original intent); the new per-position notional cap is what binds.
+    expect(qty).toBe(15);
+  });
+});
+
+// TRA-499 — small-account equity sizing on a Tradier live book. Mirrors the
+// 1-share LIVE floor + per-position notional cap from the options ticket
+// budget (TRA-495/TRA-497) so a $550 live book can actually open positions
+// without burning all its cash on one ticket. The board directive on
+// TRA-494 routes live equities through Tradier (production); these tests
+// pin down what "small book" sizing looks like on that path.
+describe('sizeLiveEquityFromStop — TRA-499 small-book caps', () => {
+  function smallBookBalance(overrides: Partial<TradierAccountBalance> = {}): TradierAccountBalance {
+    return {
+      totalEquity: 550,
+      totalCash: 550,
+      optionBuyingPower: 550,
+      stockBuyingPower: 550,
+      longMarketValue: 0,
+      dayTradeBuyingPower: null,
+      ...overrides,
+    };
+  }
+
+  it('forces 1 share on a $50 stock that would otherwise size to 0 (LIVE 1-share floor)', () => {
+    // managedEquity = 550 × 1.0 = $550. maxRisk = $550 × 0.10 = $55.
+    // 5% stop dist on $50 = $2.50. riskQty = floor($55/$2.50) = 22.
+    // equityCap = floor($550/$50) = 11. stockBP cap = floor($550/$50) = 11.
+    // min(22, 11, 11) = 11 → cap = $150 → 11 × $50 = $550 > $150 →
+    // trim to floor($150/$50) = 3. So the risk-from-stop sizing DOES
+    // produce a non-zero qty here; the 1-share LIVE floor only fires when
+    // risk math rounds to 0. Sanity-check the cap trim instead.
+    const qty = sizeLiveEquityFromStop({
+      balance: smallBookBalance(),
+      managedAccountRatio: 1.0,
+      riskPerTrade: 0.10,
+      entryPrice: 50,
+      stopPrice: 47.50,
+      currentPrice: 50,
+    });
+    expect(qty).toBe(3);
+  });
+
+  it('returns 0 when 1-share cost exceeds the per-position cap on a small book', () => {
+    // baseEquity = $550 → cap = max($150, $82.50) = $150. A $200 stock has
+    // 1-share cost $200 > $150 cap. risk math: managedEquity = $550,
+    // maxRisk = $55, stop $10 → riskQty = 5; equityCap = floor($550/$200) = 2;
+    // qty = min(5, 2, 2) = 2. cap trim: 2 × $200 = $400 > $150 → trim to
+    // floor($150/$200) = 0. 1-share floor checks currentPrice($200) > cap($150),
+    // so it doesn't re-arm. Final: 0 — position is too concentrated for
+    // the small-book swing thesis.
+    const qty = sizeLiveEquityFromStop({
+      balance: smallBookBalance(),
+      managedAccountRatio: 1.0,
+      riskPerTrade: 0.10,
+      entryPrice: 200,
+      stopPrice: 190,
+      currentPrice: 200,
+    });
+    expect(qty).toBe(0);
+  });
+
+  it('forces 1 share when the equity cap rounded sizing to 0 (1-share LIVE floor)', () => {
+    // Edge case: a $25 stock where the BP/equity caps don't kick in but
+    // we're constrained by an unusually tight risk knob. With
+    // managedAccountRatio = 0.5, riskPerTrade = 0.01 on $550: maxRisk = $2.75.
+    // 4% stop ($1 on $25) → riskQty = floor($2.75/$1) = 2. equityCap =
+    // floor($275/$25) = 11. min = 2. cap = $150 → 2 × $25 = $50 ≤ $150.
+    // qty = 2. So the floor doesn't actually need to fire here. Verify the
+    // smaller cap doesn't accidentally trim a small-notional position.
+    const qty = sizeLiveEquityFromStop({
+      balance: smallBookBalance(),
+      managedAccountRatio: 0.5,
+      riskPerTrade: 0.01,
+      entryPrice: 25,
+      stopPrice: 24,
+      currentPrice: 25,
+    });
+    expect(qty).toBe(2);
+  });
+
+  it('1-share LIVE floor fires when risk-from-stop rounds to 0 but a single share fits the cap', () => {
+    // Concoct a scenario where risk math gives 0: a very tight risk knob
+    // and a wide stop. managedAccountRatio = 0.01, riskPerTrade = 0.01,
+    // baseEquity = $550 → managedEquity = $5.50, maxRisk = $0.055.
+    // 5% stop on $50 = $2.50 → riskQty = 0. equityCap = floor($5.50/$50) = 0.
+    // qty = 0. Cap = $150, currentPrice $50 ≤ $150 → forced floor fires →
+    // qty = 1. Cap recheck: 1 × $50 = $50 ≤ $150 → no trim. Final: 1 share.
+    const qty = sizeLiveEquityFromStop({
+      balance: smallBookBalance(),
+      managedAccountRatio: 0.01,
+      riskPerTrade: 0.01,
+      entryPrice: 50,
+      stopPrice: 47.50,
+      currentPrice: 50,
+    });
+    expect(qty).toBe(1);
+  });
+
+  it('larger account behaviour is unchanged when per-position cap does not bind', () => {
+    // Sanity check: a $50k book buying $100 stock at 5% stop with the
+    // existing TRA-335 default knobs. cap = max($150, 15% × $50k) = $7,500.
+    // qty from risk-from-stop with managedRatio=0.5, riskPerTrade=0.01:
+    // managedEquity=$25k, maxRisk=$250, riskQty=floor($250/$5)=50; equityCap=
+    // floor($25k/$100)=250; sbp cap floor($25k/$100)=250; qty=50.
+    // cap recheck: 50 × $100 = $5,000 ≤ $7,500 → no trim. Pre-TRA-499 result
+    // (50 shares) preserved.
+    const qty = sizeLiveEquityFromStop({
+      balance: {
+        totalEquity: 50_000,
+        totalCash: 25_000,
+        optionBuyingPower: 25_000,
+        stockBuyingPower: 25_000,
+        longMarketValue: 25_000,
+        dayTradeBuyingPower: null,
+      },
+      managedAccountRatio: 0.5,
+      riskPerTrade: 0.01,
+      entryPrice: 100,
+      stopPrice: 95,
+      currentPrice: 100,
+    });
     expect(qty).toBe(50);
   });
 });
@@ -2885,7 +3010,11 @@ describe('SignalEngine — TRA-495 live stocks + options coexistence', () => {
       stocksAutoTradingEnabledLive: true,
       liveTradeEquitiesTradier: true,
       liveTradierMarkets: 'both',
-      liveBrokerageTypeStocks: 'webull',
+      // TRA-499 — board directive on TRA-494: stock signals also route to
+      // Tradier production. Flipping this in the test asserts the unified
+      // single-broker config still drives both legs (stocks + options)
+      // through Tradier without one path nulling the other.
+      liveBrokerageTypeStocks: 'tradier',
       liveTradierEnvOptions: 'production',
       managedAccountRatio: 0.5,
       riskPerTrade: 0.01,

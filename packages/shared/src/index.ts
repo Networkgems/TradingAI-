@@ -816,7 +816,15 @@ export const DEFAULT_ACCOUNT_SETTINGS: AccountSettings = {
   liveApiSecretCrypto: '',
   liveTradeRoutingCrypto: 'hybrid',
   liveMaxLeverageCrypto: 1,
-  liveBrokerageTypeStocks: 'webull',
+  // TRA-499 — board directive on TRA-494: stock signals should also be
+  // Tradier production. The live equity entry path in `signal-engine.ts`
+  // already routes through Tradier OTOCO when `liveTradeEquitiesTradier`
+  // is on (default `true`, set below); the Webull live-equity SDK was
+  // never integrated (see `signal-engine.ts:945-952` and the TRA-225 note
+  // in `SettingsPage.tsx`). Flipping this default aligns the recorded
+  // brokerage with what actually executes the live orders. Existing
+  // saves stay on their persisted value — no auto-migration.
+  liveBrokerageTypeStocks: 'tradier',
   liveTradeModeStocks: 'ai_in_brokerage',
   liveApiKeyStocks: '',
   liveAccountIdStocks: '',
@@ -1118,6 +1126,19 @@ export const OPTIONS_POSITION_CAP_RATIO = 0.15; // cap a single options position
 export const OPTIONS_PER_POSITION_PCT_CAP = OPTIONS_POSITION_CAP_RATIO;
 export const OPTIONS_PER_TICKET_DOLLAR_FLOOR = 150; // $150 per-ticket floor while equity is small (TRA-497)
 export const OPTIONS_OTM_MIN_EQUITY = 5_000;    // skip the OTM scanner below this live equity
+
+/**
+ * TRA-499 — per-position notional cap shared by the options and equity sizing
+ * paths. Hoisted out of `options-account.ts` so the live-equity sizing path
+ * (`signal-engine.ts > sizeLiveEquityFromStop`) can reuse the same floor as
+ * the options ticket-budget cap without re-deriving it. The dollar floor
+ * mirrors the options ticket floor: when 15% of equity falls below the floor
+ * on a small live book the cap stays anchored at the floor so a single ticket
+ * that fits the floor's budget can still clear the cap.
+ */
+export function perPositionCap(equity: number): number {
+  return Math.max(OPTIONS_PER_TICKET_DOLLAR_FLOOR, equity * OPTIONS_POSITION_CAP_RATIO);
+}
 
 // ── OTM long-premium risk overrides (TRA-160) ───────────────────────────────
 //
