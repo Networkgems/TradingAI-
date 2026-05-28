@@ -137,7 +137,38 @@ describe('StockOptionsPanel (TRA-422)', () => {
       />,
     );
     expect(screen.getByText(/Relative Value/)).toBeInTheDocument();
+  });
+
+  // TRA-503 — Demo doesn't route through Tradier, so the manual sync import
+  // has nothing to pull. Hide the button there.
+  it('hides the Tradier sync button in demo mode', () => {
+    renderWithToast(
+      <StockOptionsPanel
+        token="t" tradierEnv="sandbox" accountMode="demo" account={undefined}
+        optionsState={undefined} openOptions={[]} closedOptions={[]} optionsDailyLimit={5}
+      />,
+    );
+    expect(screen.queryByRole('button', { name: /Sync Tradier/ })).not.toBeInTheDocument();
+  });
+
+  it('shows the Tradier sync button in live mode (sandbox env)', () => {
+    renderWithToast(
+      <StockOptionsPanel
+        token="t" tradierEnv="sandbox" accountMode="live" account={undefined}
+        optionsState={undefined} openOptions={[]} closedOptions={[]} optionsDailyLimit={5}
+      />,
+    );
     expect(screen.getByRole('button', { name: /Sync Tradier sandbox positions/ })).toBeInTheDocument();
+  });
+
+  it('shows the Tradier sync button in live mode (production env)', () => {
+    renderWithToast(
+      <StockOptionsPanel
+        token="t" tradierEnv="production" accountMode="live" account={undefined}
+        optionsState={undefined} openOptions={[]} closedOptions={[]} optionsDailyLimit={5}
+      />,
+    );
+    expect(screen.getByRole('button', { name: /Sync Tradier production positions/ })).toBeInTheDocument();
   });
 });
 

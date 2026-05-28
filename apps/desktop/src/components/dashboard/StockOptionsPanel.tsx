@@ -37,24 +37,32 @@ export function StockOptionsPanel({
     syncTradierPositions, tradierSyncing, tradierSyncStatus,
   } = useStockOptionClose(token, tradierEnv);
 
+  // TRA-503 — Demo doesn't route through Tradier, so the manual "Sync Tradier
+  // positions" import has nothing to pull. Hide the button (and its status
+  // line) in demo to avoid the misleading "production" wording in the demo
+  // header.
+  const showTradierSync = accountMode === 'live';
+
   return (
     <div className="positions-panel">
       {/* TRA-323 — pull open option positions from Tradier into TradeAI so they
           can be closed from here. The button targets the Tradier env selected
           in Settings; the toast that follows reports the count summary. */}
-      <div style={{ display: 'flex', alignItems: 'center', gap: '0.75rem', marginBottom: '0.75rem', flexWrap: 'wrap' }}>
-        <button
-          className="btn-secondary"
-          onClick={syncTradierPositions}
-          disabled={tradierSyncing}
-          title={`Pull open option positions from Tradier ${tradierEnv} into TradeAI`}
-        >
-          {tradierSyncing ? 'Syncing…' : `Sync Tradier ${tradierEnv} positions`}
-        </button>
-        {tradierSyncStatus && (
-          <span className="muted" style={{ fontSize: '0.85rem' }}>{tradierSyncStatus}</span>
-        )}
-      </div>
+      {showTradierSync && (
+        <div style={{ display: 'flex', alignItems: 'center', gap: '0.75rem', marginBottom: '0.75rem', flexWrap: 'wrap' }}>
+          <button
+            className="btn-secondary"
+            onClick={syncTradierPositions}
+            disabled={tradierSyncing}
+            title={`Pull open option positions from Tradier ${tradierEnv} into TradeAI`}
+          >
+            {tradierSyncing ? 'Syncing…' : `Sync Tradier ${tradierEnv} positions`}
+          </button>
+          {tradierSyncStatus && (
+            <span className="muted" style={{ fontSize: '0.85rem' }}>{tradierSyncStatus}</span>
+          )}
+        </div>
+      )}
       {openOptions.length > 0 && (
         <>
           <h3>Open Option Positions</h3>

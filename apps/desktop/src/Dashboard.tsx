@@ -4,7 +4,7 @@
 // hooks; this file now only owns the tab + profile-modal state and wires the
 // pieces together. Behaviour (toast feedback, focus-trapped close drawer, sort
 // hooks, backoff/validation libs from TRA-419) carries through unchanged.
-import { useEffect, useState } from 'react';
+import { useState } from 'react';
 import { HTTP_URL } from './server-url';
 import { ErrorBoundary } from './ErrorBoundary.tsx';
 import { CalendarTab } from './CalendarTab.tsx';
@@ -41,16 +41,6 @@ export default function Dashboard({ token, onLogout, onGoHome, onActivity, theme
   const openOptions = optionsState?.openOptions ?? [];
   const closedOptions = optionsState?.closedOptions ?? [];
   const autoTradingEnabled = state?.autoTradingEnabled ?? true;
-  // TRA-326 — Stocks dashboard scoping: Live + Tradier production (margin) is
-  // an options-only account, so the equity Positions tab is hidden there.
-  const showPositionsTab = !(accountMode === 'live' && tradierEnv === 'production');
-
-  // If the user is on the Positions tab and flips to Live+Production (where
-  // Positions is hidden), bounce them to Options so the content area doesn't
-  // go blank.
-  useEffect(() => {
-    if (!showPositionsTab && tab === 'positions') setTab('options');
-  }, [showPositionsTab, tab]);
 
   return (
     <div className="app">
@@ -87,8 +77,10 @@ export default function Dashboard({ token, onLogout, onGoHome, onActivity, theme
       />
 
       <nav className="tabs">
-        {/* TRA-326 — drop the Positions tab in Live+Production (margin / options-only). */}
-        {((['watchlist', 'signals', 'positions', 'options'] as const).filter(t => t !== 'positions' || showPositionsTab)).map(t => (
+        {/* TRA-503 — Positions tab is shown in every account/env so Live + Tradier
+            Production matches Demo. The earlier TRA-326 carve-out hid it on
+            Live+Production. */}
+        {(['watchlist', 'signals', 'positions', 'options'] as const).map(t => (
           <button key={t} className={`tab ${tab === t ? 'active' : ''}`} onClick={() => setTab(t)}>
             {t === 'watchlist' ? `Watchlist (${symbols.length})` :
              t === 'signals' ? `Signals (${signals.length})` :
@@ -123,7 +115,7 @@ export default function Dashboard({ token, onLogout, onGoHome, onActivity, theme
           <StockSignalsPanel token={token} signals={signals} symbols={symbols} marketReview={state.marketReview} />
         )}
 
-        {state && tab === 'positions' && showPositionsTab && (
+        {state && tab === 'positions' && (
           <StockPositionsPanel token={token} openPositions={openPositions} closedPositions={closedPositions} symbols={symbols} />
         )}
 
