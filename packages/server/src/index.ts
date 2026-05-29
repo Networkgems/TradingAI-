@@ -102,6 +102,8 @@ import {
   STRATEGY_PRESETS,
   DEFAULT_STRATEGY_PRESET_ID,
   WATCHLIST,
+  validateLiveCredentials,
+  validateProductionTradierKeys,
   type AccountSettings,
   type NewsItem,
   type ResearchReport,
@@ -1905,6 +1907,32 @@ app.put('/api/account/settings', requireAuth, async (req, res) => {
       return DEFAULT_STRATEGY_PRESET_ID;
     })(),
   };
+  // TRA-506 — guardrails so a user can't silently run "Live + Tradier
+  // production" with no creds. Two independent rejects:
+  //   1. mode=live + any required cred for an enabled live market blank.
+  //   2. liveTradierEnvOptions=production + either production key blank,
+  //      independent of mode — so flipping the env to production in demo
+  //      can't park the user in a half-configured state.
+  // Error body shape matches the issue spec so the dashboard banner can
+  // surface a specific actionable message per-field.
+  const liveCredsCheck = validateLiveCredentials(updated);
+  if (!liveCredsCheck.ok) {
+    res.status(422).json({
+      ok: false,
+      code: 'missing_live_credentials',
+      missing: liveCredsCheck.missing,
+    });
+    return;
+  }
+  const prodKeysCheck = validateProductionTradierKeys(updated);
+  if (!prodKeysCheck.ok) {
+    res.status(422).json({
+      ok: false,
+      code: 'missing_live_credentials',
+      missing: prodKeysCheck.missing,
+    });
+    return;
+  }
   await saveSettings(username, updated);
   // Await the stocks engine: TRA-226 makes applySettings async so a flip into
   // live mode can refresh the Tradier balance once before the broadcast,
@@ -2550,25 +2578,56 @@ app.post('/api/crypto/coinbase/place-test-order', requireAuth, async (req, res) 
  * vars only if the user explicitly left the per-options fields blank — a hint
  * that the saved RV-scanner creds should also work for live trading.
  */
-app.post('/api/options/tradier/test-connection', requireAuth, async (_req, res) => {
+app.post('/api/options/tradier/test-connection', requireAuth, async (req, res) => {
   const username = res.locals['authUser'] as string;
   const settings = getSettings(username);
+  // TRA-506 — caller can pin the env explicitly via body / query so the
+  // Settings page can render two buttons ("Test sandbox", "Test production")
+  // that probe the saved pair for that env regardless of the currently
+  // selected `liveTradierEnvOptions`. Falls back to the saved env when the
+  // caller omits the parameter so the pre-506 single-button flow still works.
+  const requestedEnv = ((): TradierEnv | null => {
+    const fromBody = (req.body as { env?: unknown } | undefined)?.env;
+    const fromQuery = req.query['env'];
+    const raw = (typeof fromBody === 'string' ? fromBody : typeof fromQuery === 'string' ? fromQuery : '').trim();
+    if (raw === 'production' || raw === 'sandbox') return raw;
+    return null;
+  })();
   // TRA-226 — sandbox/production credentials are stored on separate fields so
   // the resolver only returns the pair matching the currently selected env.
   // Env-var fallback is layered on top here so a deployment that bootstrapped
   // creds via env (TRADIER_*) still works without forcing every user to retype
   // them in Settings.
   const resolved = resolveTradierOptionsCreds(settings);
-  const env = resolved.env;
+  const env: TradierEnv = requestedEnv ?? resolved.env;
+  // TRA-506 — when the caller pinned an env different from the saved one, the
+  // resolver's apiToken/accountId belong to the OTHER env. Read the env-pinned
+  // fields directly off settings instead so "Test production" probes the
+  // production pair even while the saved env is sandbox (and vice versa).
+  const credsForEnv = ((): { apiToken: string; accountId: string } => {
+    if (env === resolved.env) {
+      return { apiToken: resolved.apiToken, accountId: resolved.accountId };
+    }
+    if (env === 'production') {
+      return {
+        apiToken: (settings.liveApiKeyOptionsProduction ?? '').trim(),
+        accountId: (settings.liveAccountIdOptionsProduction ?? '').trim(),
+      };
+    }
+    return {
+      apiToken: (settings.liveApiKeyOptionsSandbox ?? settings.liveApiKeyOptions ?? '').trim(),
+      accountId: (settings.liveAccountIdOptionsSandbox ?? settings.liveAccountIdOptions ?? '').trim(),
+    };
+  })();
   const apiToken = (
-    resolved.apiToken
+    credsForEnv.apiToken
     || (env === 'production'
       ? process.env['TRADIER_API_TOKEN']
       : (process.env['TRADIER_SANDBOX_API_TOKEN'] ?? process.env['TRADIER_API_TOKEN']))
     || ''
   ).trim();
   const accountId = (
-    resolved.accountId
+    credsForEnv.accountId
     || (env === 'production'
       ? process.env['TRADIER_ACCOUNT_ID']
       : (process.env['TRADIER_SANDBOX_ACCOUNT_ID'] ?? process.env['TRADIER_ACCOUNT_ID']))
@@ -2577,6 +2636,7 @@ app.post('/api/options/tradier/test-connection', requireAuth, async (_req, res) 
   if (!apiToken || !accountId) {
     res.json({
       ok: false,
+      env,
       error: `Tradier ${env} API token and Account ID are not configured. Save them in Settings before testing.`,
     });
     return;
@@ -2587,7 +2647,7 @@ app.post('/api/options/tradier/test-connection', requireAuth, async (_req, res) 
     });
     if (!profileResp.ok) {
       const text = await profileResp.text().catch(() => '');
-      res.json({ ok: false, error: `Tradier ${profileResp.status} — ${text || profileResp.statusText}` });
+      res.json({ ok: false, env, error: `Tradier ${profileResp.status} — ${text || profileResp.statusText}` });
       return;
     }
     const data = (await profileResp.json()) as {
@@ -2604,9 +2664,32 @@ app.post('/api/options/tradier/test-connection', requireAuth, async (_req, res) 
       const known = accounts.map(a => a.account_number).filter(Boolean).join(', ') || 'none';
       res.json({
         ok: false,
+        env,
         error: `Token authenticated but Account ID ${accountId} not found on this Tradier profile (known: ${known}).`,
       });
       return;
+    }
+    // TRA-506 — surface buying power so the user sees a concrete signal that
+    // the production credentials actually map to the funded account they
+    // think they're trading against (e.g. "Production OK, $550.00"). Fetched
+    // best-effort: a failed `/balances` call does not flip the connection
+    // probe to `ok: false` because the profile lookup already proved the
+    // creds work.
+    let buyingPower: number | null = null;
+    try {
+      const client = new TradierOptionsClient(apiToken, accountId, env);
+      const balance = await client.getAccountBalance();
+      if (balance) {
+        buyingPower =
+          balance.optionBuyingPower
+          ?? balance.stockBuyingPower
+          ?? (Number.isFinite(balance.totalCash) ? balance.totalCash : null);
+      }
+    } catch (err: unknown) {
+      log.warn('TRA-506 tradier test-connection: balance fetch failed', {
+        env,
+        reason: err instanceof Error ? err.message : String(err),
+      });
     }
     res.json({
       ok: true,
@@ -2614,9 +2697,10 @@ app.post('/api/options/tradier/test-connection', requireAuth, async (_req, res) 
       accountNumber: matched.account_number,
       status: matched.status,
       classification: matched.classification,
+      buyingPower,
     });
   } catch (err: unknown) {
-    res.json({ ok: false, error: err instanceof Error ? err.message : String(err) });
+    res.json({ ok: false, env, error: err instanceof Error ? err.message : String(err) });
   }
 });
 

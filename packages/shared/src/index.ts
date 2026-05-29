@@ -977,6 +977,98 @@ export function resolveHoldLiveOptionsOvernight(s: AccountSettings): boolean {
   return s.holdLiveOptionsOvernightForPdt !== false;
 }
 
+/**
+ * TRA-506 — credential fields the `validateLiveCredentials` and
+ * `validateProductionTradierKeys` checks may surface as missing. The string
+ * literals match the `AccountSettings` field names so the desktop banner can
+ * deep-link to the matching Settings input.
+ */
+export type LiveCredentialField =
+  | 'liveApiKeyOptionsProduction'
+  | 'liveAccountIdOptionsProduction'
+  | 'liveApiKeyOptionsSandbox'
+  | 'liveAccountIdOptionsSandbox'
+  | 'liveApiKeyCrypto'
+  | 'liveApiSecretCrypto';
+
+export interface LiveCredentialsCheck {
+  ok: boolean;
+  missing: LiveCredentialField[];
+}
+
+function isBlankCred(v: string | undefined): boolean {
+  return (v ?? '').trim() === '';
+}
+
+/**
+ * TRA-506 — return the set of required-but-empty live credential fields for
+ * the markets enabled on `s`. Shared between the server-side PUT guardrail
+ * and the dashboard banner so both surfaces agree on what counts as
+ * "missing" for a given Settings snapshot.
+ *
+ * Gating per the issue spec:
+ *   - Tradier pair (per `liveTradierEnvOptions`) is required when
+ *     `liveTradeEquitiesTradier && liveBrokerageTypeStocks === 'tradier'`
+ *     (stocks) OR `liveTradierMarkets in ('options','both')` (options).
+ *   - Coinbase pair is required when `liveBrokerageTypeCrypto === 'coinbase'`.
+ *
+ * Defaults match `DEFAULT_ACCOUNT_SETTINGS` so a fresh user with no overrides
+ * still triggers the check: stocks (Tradier), options (both), crypto
+ * (Coinbase) are all on out of the box.
+ */
+export function findMissingLiveCredentials(s: AccountSettings): LiveCredentialField[] {
+  const missing = new Set<LiveCredentialField>();
+  const env: TradierEnv = s.liveTradierEnvOptions ?? 'sandbox';
+  const stocksOnTradier =
+    resolveLiveTradeEquitiesTradier(s) && (s.liveBrokerageTypeStocks ?? 'tradier') === 'tradier';
+  const optionsOnTradier = isLiveTradierOptionsEnabled(s);
+  if (stocksOnTradier || optionsOnTradier) {
+    if (env === 'production') {
+      if (isBlankCred(s.liveApiKeyOptionsProduction)) missing.add('liveApiKeyOptionsProduction');
+      if (isBlankCred(s.liveAccountIdOptionsProduction)) missing.add('liveAccountIdOptionsProduction');
+    } else {
+      const sandboxKey = s.liveApiKeyOptionsSandbox ?? s.liveApiKeyOptions ?? '';
+      const sandboxAcct = s.liveAccountIdOptionsSandbox ?? s.liveAccountIdOptions ?? '';
+      if (isBlankCred(sandboxKey)) missing.add('liveApiKeyOptionsSandbox');
+      if (isBlankCred(sandboxAcct)) missing.add('liveAccountIdOptionsSandbox');
+    }
+  }
+  if ((s.liveBrokerageTypeCrypto ?? 'coinbase') === 'coinbase') {
+    if (isBlankCred(s.liveApiKeyCrypto)) missing.add('liveApiKeyCrypto');
+    if (isBlankCred(s.liveApiSecretCrypto)) missing.add('liveApiSecretCrypto');
+  }
+  return Array.from(missing);
+}
+
+/**
+ * TRA-506 — guardrail for the PUT /api/account/settings route. Returns
+ * `{ ok: false, missing }` only when `mode === 'live'` AND at least one
+ * required cred is blank. Demo mode short-circuits to `ok: true` so a user
+ * tweaking demo settings doesn't get blocked by missing live creds — the
+ * issue is "user silently runs live with no creds," not "user is forbidden
+ * from saving anything until they configure every broker."
+ */
+export function validateLiveCredentials(s: AccountSettings): LiveCredentialsCheck {
+  if (s.mode !== 'live') return { ok: true, missing: [] };
+  const missing = findMissingLiveCredentials(s);
+  return { ok: missing.length === 0, missing };
+}
+
+/**
+ * TRA-506 — paired guardrail that fires independent of `mode`: saving
+ * `liveTradierEnvOptions = 'production'` with either production key blank is
+ * always rejected. This prevents the "half-configured production" state
+ * where a user flips the env to production in demo, leaves the keys empty,
+ * then later flips to live and discovers there's nothing actually wired up.
+ */
+export function validateProductionTradierKeys(s: AccountSettings): LiveCredentialsCheck {
+  if ((s.liveTradierEnvOptions ?? 'sandbox') !== 'production') return { ok: true, missing: [] };
+  const missing: LiveCredentialField[] = [];
+  if (isBlankCred(s.liveApiKeyOptionsProduction)) missing.push('liveApiKeyOptionsProduction');
+  if (isBlankCred(s.liveAccountIdOptionsProduction)) missing.push('liveAccountIdOptionsProduction');
+  return { ok: missing.length === 0, missing };
+}
+
 /** TRA-373 — spec defaults for the RV scanner DTE window. */
 export const DEFAULT_RV_DTE_MIN = 21;
 export const DEFAULT_RV_DTE_MAX = 60;

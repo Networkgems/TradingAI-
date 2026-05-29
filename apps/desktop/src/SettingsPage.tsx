@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useState } from 'react';
+import { useCallback, useEffect, useRef, useState } from 'react';
 import { logger } from './lib/logger';
 import type {
   AccountMode,
@@ -87,6 +87,9 @@ function PasswordInput({
   // the paste. Single-line inputs strip newlines, breaking PEM parsing.
   multiline,
   rows,
+  // TRA-506 — set on cred inputs so the dashboard's missing-creds banner can
+  // querySelector → focus the right input on modal open.
+  dataCredField,
 }: {
   value: string;
   onChange: (v: string) => void;
@@ -97,6 +100,7 @@ function PasswordInput({
   minLength?: number;
   multiline?: boolean;
   rows?: number;
+  dataCredField?: string;
 }) {
   const [show, setShow] = useState(false);
   // `-webkit-text-security: disc` is the only way to mask a textarea in
@@ -124,6 +128,7 @@ function PasswordInput({
           minLength={minLength}
           rows={rows ?? 6}
           spellCheck={false}
+          data-cred-field={dataCredField}
           style={{
             paddingRight: '2.5rem',
             width: '100%',
@@ -144,6 +149,7 @@ function PasswordInput({
           disabled={disabled}
           required={required}
           minLength={minLength}
+          data-cred-field={dataCredField}
           style={{ paddingRight: '2.5rem', width: '100%', boxSizing: 'border-box' }}
         />
       )}
@@ -194,6 +200,11 @@ interface Props {
   // TRA-397 — invoked when the initial settings fetch returns 401 so an
   // expired token logs the user out instead of silently rendering defaults.
   onLogout?: () => void;
+  // TRA-506 — when the dashboard's missing-creds banner opens this modal,
+  // it passes the AccountSettings field name of the first missing input. The
+  // form scrolls + focuses that input on mount so the user lands on the
+  // fix-it spot without scanning the whole Brokers section.
+  focusCredField?: import('@trading-app/shared').LiveCredentialField | null;
 }
 
 type SaveStatus = 'idle' | 'saving' | 'saved' | 'error';
@@ -878,7 +889,7 @@ function StrategyPresetSection({
   );
 }
 
-export default function SettingsPage({ token, httpUrl, context, onModeChange, onSettingsSaved, onLogout }: Props) {
+export default function SettingsPage({ token, httpUrl, context, onModeChange, onSettingsSaved, onLogout, focusCredField }: Props) {
   const [settings, setSettings] = useState<AccountSettings>(DEFAULT_ACCOUNT_SETTINGS);
   const [loading, setLoading] = useState(true);
   // TRA-397 — set when the initial settings fetch fails with a non-OK status
@@ -894,12 +905,25 @@ export default function SettingsPage({ token, httpUrl, context, onModeChange, on
     | { ok: true; authScheme: 'hmac' | 'cdp'; accountCount: number; currencies: string[] }
     | { ok: false; authScheme?: 'hmac' | 'cdp'; error: string }
   >(null);
-  const [tradierTestStatus, setTradierTestStatus] = useState<'idle' | 'testing'>('idle');
-  const [tradierTestResult, setTradierTestResult] = useState<
+  // TRA-506 — per-env test state so each block ("Sandbox", "Production")
+  // surfaces its own status and result independent of the saved
+  // `liveTradierEnvOptions`. A user can confirm Production buying power
+  // before flipping the env over.
+  type TradierTestResult =
     | null
-    | { ok: true; env: TradierEnv; accountNumber?: string; status?: string; classification?: string }
-    | { ok: false; error: string }
-  >(null);
+    | {
+        ok: true;
+        env: TradierEnv;
+        accountNumber?: string;
+        status?: string;
+        classification?: string;
+        buyingPower?: number | null;
+      }
+    | { ok: false; env?: TradierEnv; error: string };
+  const [tradierTestStatusSandbox, setTradierTestStatusSandbox] = useState<'idle' | 'testing'>('idle');
+  const [tradierTestResultSandbox, setTradierTestResultSandbox] = useState<TradierTestResult>(null);
+  const [tradierTestStatusProduction, setTradierTestStatusProduction] = useState<'idle' | 'testing'>('idle');
+  const [tradierTestResultProduction, setTradierTestResultProduction] = useState<TradierTestResult>(null);
   // TRA-222 — one-shot $1 BTC-USD market BUY to verify the live order path
   // before flipping auto-trading on. The server caps quoteSize at $5.
   const [coinbaseOrderStatus, setCoinbaseOrderStatus] = useState<'idle' | 'placing'>('idle');
@@ -982,6 +1006,42 @@ export default function SettingsPage({ token, httpUrl, context, onModeChange, on
       .catch(() => { /* not admin */ });
   }, [token, httpUrl]);
 
+  // TRA-506 — when the dashboard's missing-creds banner opened this modal, it
+  // passed the AccountSettings field name of the first missing input as
+  // `focusCredField`. Scroll + focus that input once the form has loaded.
+  // The Tradier inputs only render the pair matching the currently selected
+  // env, so if the target is a production field and the form is on sandbox
+  // (or vice versa), flip the local form state first — the user can save or
+  // discard from there, but the field they need to fill is always in view.
+  //
+  // `appliedFocusRef` guards against re-focusing on every settings keystroke
+  // after the user has moved cursor away. The effect runs again when settings
+  // changes (so the env-flip path works), but only the first successful
+  // focus per `focusCredField` value steals the cursor.
+  const appliedFocusRef = useRef<string | null>(null);
+  useEffect(() => {
+    if (loading) return;
+    if (!focusCredField) return;
+    if (appliedFocusRef.current === focusCredField) return;
+    const targetEnv: TradierEnv | null =
+      focusCredField === 'liveApiKeyOptionsProduction' || focusCredField === 'liveAccountIdOptionsProduction'
+        ? 'production'
+        : focusCredField === 'liveApiKeyOptionsSandbox' || focusCredField === 'liveAccountIdOptionsSandbox'
+          ? 'sandbox'
+          : null;
+    if (targetEnv && readLiveTradierEnvOptions(settings) !== targetEnv) {
+      set('liveTradierEnvOptions', targetEnv);
+      return;
+    }
+    const node = document.querySelector<HTMLElement>(`[data-cred-field="${focusCredField}"]`);
+    if (!node) return;
+    appliedFocusRef.current = focusCredField;
+    node.scrollIntoView({ behavior: 'smooth', block: 'center' });
+    // Give scrollIntoView a frame to complete before grabbing focus so the
+    // viewport doesn't snap-jump on focus().
+    requestAnimationFrame(() => node.focus());
+  }, [loading, focusCredField, settings]);
+
   async function handleSave(e: React.FormEvent) {
     e.preventDefault();
     setSaveStatus('saving');
@@ -1055,20 +1115,27 @@ export default function SettingsPage({ token, httpUrl, context, onModeChange, on
     }
   }
 
-  async function handleTestTradier() {
-    setTradierTestStatus('testing');
-    setTradierTestResult(null);
+  // TRA-506 — env-pinned probe. The server reads `env` from the body and
+  // tests the saved pair for that env regardless of the currently selected
+  // `liveTradierEnvOptions`, so the user can verify Production while their
+  // saved env is still Sandbox.
+  async function handleTestTradier(env: TradierEnv) {
+    const setStatus = env === 'production' ? setTradierTestStatusProduction : setTradierTestStatusSandbox;
+    const setResult = env === 'production' ? setTradierTestResultProduction : setTradierTestResultSandbox;
+    setStatus('testing');
+    setResult(null);
     try {
       const r = await fetch(`${httpUrl}/api/options/tradier/test-connection`, {
         method: 'POST',
-        headers: { Authorization: `Bearer ${token}` },
+        headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${token}` },
+        body: JSON.stringify({ env }),
       });
       const data = await r.json();
-      setTradierTestResult(data);
+      setResult(data);
     } catch (err) {
-      setTradierTestResult({ ok: false, error: err instanceof Error ? err.message : String(err) });
+      setResult({ ok: false, env, error: err instanceof Error ? err.message : String(err) });
     } finally {
-      setTradierTestStatus('idle');
+      setStatus('idle');
     }
   }
 
@@ -1505,6 +1572,7 @@ export default function SettingsPage({ token, httpUrl, context, onModeChange, on
                       onChange={v => set('liveApiKeyCrypto', v)}
                       placeholder={'organizations/{org-id}/apiKeys/{key-id}'}
                       autoComplete="off"
+                      dataCredField="liveApiKeyCrypto"
                     />
                     <p className="field-hint">
                       Paste the full <strong>API key name</strong> Coinbase shows when you create a CDP key
@@ -1521,6 +1589,7 @@ export default function SettingsPage({ token, httpUrl, context, onModeChange, on
                       autoComplete="off"
                       multiline
                       rows={6}
+                      dataCredField="liveApiSecretCrypto"
                     />
                     <p className="field-hint">
                       For CDP keys, paste the entire private key — including the
@@ -1682,6 +1751,7 @@ export default function SettingsPage({ token, httpUrl, context, onModeChange, on
                       onChange={v => set(liveApiKeyOptionsField(readLiveTradierEnvOptions(settings)), v)}
                       placeholder={'Tradier OAuth token (e.g. abc123XYZ…)'}
                       autoComplete="off"
+                      dataCredField={liveApiKeyOptionsField(readLiveTradierEnvOptions(settings))}
                     />
                     <p className="field-hint">
                       Generate from Tradier dashboard → API Access. Production tokens are separate
@@ -1698,6 +1768,7 @@ export default function SettingsPage({ token, httpUrl, context, onModeChange, on
                       placeholder="Tradier account number (e.g. VA1234567)"
                       value={readLiveAccountIdOptions(settings, readLiveTradierEnvOptions(settings))}
                       onChange={e => set(liveAccountIdOptionsField(readLiveTradierEnvOptions(settings)), e.target.value)}
+                      data-cred-field={liveAccountIdOptionsField(readLiveTradierEnvOptions(settings))}
                     />
                   </div>
                 </div>
@@ -1778,33 +1849,79 @@ export default function SettingsPage({ token, httpUrl, context, onModeChange, on
                   </label>
                 </div>
 
-                <div className="settings-field" style={{ marginTop: '1rem' }}>
-                  <button
-                    type="button"
-                    className="btn-secondary"
-                    onClick={handleTestTradier}
-                    disabled={tradierTestStatus === 'testing'}
-                  >
-                    {tradierTestStatus === 'testing' ? 'Testing…' : 'Test Tradier Connection'}
-                  </button>
-                  <p className="field-hint">
-                    Reads your account profile from Tradier to verify the saved credentials. No orders are placed.
-                    Save the form first if you just edited the API token.
-                  </p>
-                  {tradierTestResult && (
-                    tradierTestResult.ok ? (
-                      <div className="save-success" style={{ marginTop: '0.5rem' }}>
-                        ✓ Connected (env={tradierTestResult.env}). Tradier account
-                        {tradierTestResult.accountNumber ? ` ${tradierTestResult.accountNumber}` : ''}
-                        {tradierTestResult.status ? `, status=${tradierTestResult.status}` : ''}
-                        {tradierTestResult.classification ? `, ${tradierTestResult.classification}` : ''}.
-                      </div>
-                    ) : (
-                      <div className="save-error" style={{ marginTop: '0.5rem' }}>
-                        ✗ {tradierTestResult.error}
-                      </div>
-                    )
-                  )}
+                {/* TRA-506 — two env-pinned probes. Each button targets its
+                    own saved cred pair so a user can verify Production
+                    buying power before flipping the env over. The saved
+                    `liveTradierEnvOptions` no longer decides which one
+                    runs — the body's `env` field does. */}
+                <div
+                  className="settings-field"
+                  style={{ marginTop: '1rem', display: 'grid', gap: '1rem', gridTemplateColumns: 'repeat(auto-fit, minmax(280px, 1fr))' }}
+                >
+                  <div>
+                    <button
+                      type="button"
+                      className="btn-secondary"
+                      onClick={() => handleTestTradier('sandbox')}
+                      disabled={tradierTestStatusSandbox === 'testing'}
+                    >
+                      {tradierTestStatusSandbox === 'testing' ? 'Testing sandbox…' : 'Test Tradier sandbox connection'}
+                    </button>
+                    <p className="field-hint">
+                      Reads your sandbox account profile and balance to verify the saved credentials.
+                      No orders are placed. Save the form first if you just edited the API token.
+                    </p>
+                    {tradierTestResultSandbox && (
+                      tradierTestResultSandbox.ok ? (
+                        <div className="save-success" style={{ marginTop: '0.5rem' }}>
+                          ✓ Sandbox OK{
+                            typeof tradierTestResultSandbox.buyingPower === 'number'
+                              ? `, $${tradierTestResultSandbox.buyingPower.toFixed(2)} buying power`
+                              : ''
+                          }. Account
+                          {tradierTestResultSandbox.accountNumber ? ` ${tradierTestResultSandbox.accountNumber}` : ''}
+                          {tradierTestResultSandbox.status ? `, status=${tradierTestResultSandbox.status}` : ''}
+                          {tradierTestResultSandbox.classification ? `, ${tradierTestResultSandbox.classification}` : ''}.
+                        </div>
+                      ) : (
+                        <div className="save-error" style={{ marginTop: '0.5rem' }}>
+                          ✗ {tradierTestResultSandbox.error}
+                        </div>
+                      )
+                    )}
+                  </div>
+                  <div>
+                    <button
+                      type="button"
+                      className="btn-secondary"
+                      onClick={() => handleTestTradier('production')}
+                      disabled={tradierTestStatusProduction === 'testing'}
+                    >
+                      {tradierTestStatusProduction === 'testing' ? 'Testing production…' : 'Test Tradier production connection'}
+                    </button>
+                    <p className="field-hint">
+                      Reads your production account profile and balance to verify the saved credentials.
+                      No orders are placed. Save the form first if you just edited the API token.
+                    </p>
+                    {tradierTestResultProduction && (
+                      tradierTestResultProduction.ok ? (
+                        <div className="save-success" style={{ marginTop: '0.5rem' }}>
+                          ✓ Production OK{
+                            typeof tradierTestResultProduction.buyingPower === 'number'
+                              ? `, $${tradierTestResultProduction.buyingPower.toFixed(2)} buying power`
+                              : ''
+                          }. Account
+                          {tradierTestResultProduction.accountNumber ? ` ${tradierTestResultProduction.accountNumber}` : ''}
+                          {tradierTestResultProduction.status ? `, status=${tradierTestResultProduction.status}` : ''}
+                          {tradierTestResultProduction.classification ? `, ${tradierTestResultProduction.classification}` : ''}.
+                        </div>
+                      ) : (
+                        <div className="save-error" style={{ marginTop: '0.5rem' }}>
+                          ✗ {tradierTestResultProduction.error}
+                        </div>
+                      )
+                    )}
+                  </div>
                 </div>
               </div>
             )}

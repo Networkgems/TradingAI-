@@ -21,6 +21,14 @@ export interface StockEngine {
   setAccountMode: (mode: 'demo' | 'live') => void;
   tradierEnv: 'sandbox' | 'production';
   optionsDailyLimit: number;
+  /**
+   * TRA-506 — the full saved AccountSettings snapshot used by
+   * `<LiveCredentialsBanner>` to detect a misconfigured live broker. `null`
+   * while the initial fetch is in flight; partial saves over the wire are
+   * merged into the previous snapshot so a body that omits a field doesn't
+   * mask its actual value.
+   */
+  accountSettings: AccountSettings | null;
   applyAccountSettings: (s: Partial<AccountSettings> | null | undefined) => void;
 }
 
@@ -41,6 +49,9 @@ export function useStockEngine(
   const [optionsDailyLimit, setOptionsDailyLimit] = useState<number>(
     DEFAULT_ACCOUNT_SETTINGS.optionsDailyTradesLimit,
   );
+  // TRA-506 — keep the full settings snapshot so the dashboard banner can
+  // detect missing live credentials without a second fetch round.
+  const [accountSettings, setAccountSettings] = useState<AccountSettings | null>(null);
   const wsRef = useRef<WebSocket | null>(null);
   const reconnectTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
 
@@ -131,6 +142,13 @@ export function useStockEngine(
     if (s.liveTradierEnvOptions === 'sandbox' || s.liveTradierEnvOptions === 'production') {
       setTradierEnv(s.liveTradierEnvOptions);
     }
+    // TRA-506 — merge the partial into the previous snapshot so a save that
+    // ships only `{ mode: 'live' }` doesn't blank out the cached cred fields
+    // the banner reads.
+    setAccountSettings(prev => ({
+      ...(prev ?? DEFAULT_ACCOUNT_SETTINGS),
+      ...s,
+    }));
   }, []);
 
   useEffect(() => {
@@ -145,6 +163,7 @@ export function useStockEngine(
   return {
     state, connected, news, isAdmin,
     accountMode, setAccountMode, tradierEnv, optionsDailyLimit,
+    accountSettings,
     applyAccountSettings,
   };
 }

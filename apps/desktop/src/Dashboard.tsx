@@ -5,6 +5,7 @@
 // pieces together. Behaviour (toast feedback, focus-trapped close drawer, sort
 // hooks, backoff/validation libs from TRA-419) carries through unchanged.
 import { useState } from 'react';
+import type { LiveCredentialField } from '@trading-app/shared';
 import { HTTP_URL } from './server-url';
 import { ErrorBoundary } from './ErrorBoundary.tsx';
 import { CalendarTab } from './CalendarTab.tsx';
@@ -17,6 +18,7 @@ import { StockSignalsPanel } from './components/dashboard/StockSignalsPanel';
 import { StockPositionsPanel } from './components/dashboard/StockPositionsPanel';
 import { StockOptionsPanel } from './components/dashboard/StockOptionsPanel';
 import { NewsPanel } from './components/dashboard/NewsPanel';
+import { LiveCredentialsBanner } from './components/dashboard/LiveCredentialsBanner';
 import { useStockEngine } from './hooks/useStockEngine';
 
 type StockTab = 'watchlist' | 'signals' | 'positions' | 'options' | 'news' | 'calendar';
@@ -24,10 +26,15 @@ type StockTab = 'watchlist' | 'signals' | 'positions' | 'options' | 'news' | 'ca
 export default function Dashboard({ token, onLogout, onGoHome, onActivity, theme, onToggleTheme }: { token: string; onLogout: () => void; onGoHome: () => void; onActivity?: () => void; theme: Theme; onToggleTheme: () => void }) {
   const [tab, setTab] = useState<StockTab>('watchlist');
   const [profileModal, setProfileModal] = useState<ProfileModal | null>(null);
+  // TRA-506 — the banner deep-links into Settings with a specific input
+  // focused. Tracked here so the modal can read it on open and clear it
+  // on close, without leaking the focus hint into the URL.
+  const [focusCredField, setFocusCredField] = useState<LiveCredentialField | null>(null);
 
   const {
     state, connected, news, isAdmin,
-    accountMode, setAccountMode, tradierEnv, optionsDailyLimit, applyAccountSettings,
+    accountMode, setAccountMode, tradierEnv, optionsDailyLimit,
+    accountSettings, applyAccountSettings,
   } = useStockEngine(token, tab, onLogout, onActivity);
 
   const account = state?.account;
@@ -66,7 +73,7 @@ export default function Dashboard({ token, onLogout, onGoHome, onActivity, theme
 
       <ProfileModals
         which={profileModal}
-        onClose={() => setProfileModal(null)}
+        onClose={() => { setProfileModal(null); setFocusCredField(null); }}
         token={token}
         httpUrl={HTTP_URL}
         context="stocks"
@@ -74,6 +81,15 @@ export default function Dashboard({ token, onLogout, onGoHome, onActivity, theme
         onModeChange={setAccountMode}
         onSettingsSaved={applyAccountSettings}
         onLogout={onLogout}
+        focusCredField={focusCredField}
+      />
+
+      {/* TRA-506 — persistent guardrail when the user is live but a required
+          broker credential is empty. Renders nothing in demo or when every
+          required cred is filled. */}
+      <LiveCredentialsBanner
+        settings={accountSettings}
+        onOpenSettings={(field) => { setFocusCredField(field); setProfileModal('settings'); }}
       />
 
       <nav className="tabs">

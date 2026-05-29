@@ -7,8 +7,9 @@ import { render, screen } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
 import type { ReactElement } from 'react';
 import type {
-  Position, TradeSignal, AccountState, NewsItem, CryptoSymbolState,
+  Position, TradeSignal, AccountState, NewsItem, CryptoSymbolState, AccountSettings,
 } from '@trading-app/shared';
+import { DEFAULT_ACCOUNT_SETTINGS } from '@trading-app/shared';
 import { ToastProvider } from '../../lib/toast.tsx';
 import type { SymbolState } from '../../types/app';
 import { NewsPanel } from './NewsPanel';
@@ -20,6 +21,7 @@ import { CryptoWatchlistPanel } from './CryptoWatchlistPanel';
 import { CryptoSignalsPanel } from './CryptoSignalsPanel';
 import { CryptoPositionsPanel } from './CryptoPositionsPanel';
 import { DashboardHeader } from './DashboardHeader';
+import { LiveCredentialsBanner } from './LiveCredentialsBanner';
 
 // Render a panel inside the ToastProvider its useToast() call requires.
 function renderWithToast(ui: ReactElement) {
@@ -332,5 +334,81 @@ describe('DashboardHeader (TRA-422)', () => {
     );
     expect(screen.getByText('Daily Opts P&L')).toBeInTheDocument();
     expect(screen.getByText(/\$12\.50/)).toBeInTheDocument();
+  });
+});
+
+// TRA-506 — banner is the user-visible half of the guardrail. The server
+// rejects bad saves, but the user the issue captured already had a stale
+// "live + sandbox + empty production creds" snapshot persisted; the banner
+// is what surfaces that state on every dashboard render so the user can't
+// keep assuming live is running.
+describe('LiveCredentialsBanner (TRA-506)', () => {
+  // Helpers so each test pins exactly one state condition. `liveFullCreds`
+  // mirrors the validator test fixture so the panels and server suites
+  // agree on what "fully configured" looks like.
+  function liveFullCreds(): AccountSettings {
+    return {
+      ...DEFAULT_ACCOUNT_SETTINGS,
+      mode: 'live',
+      liveTradierEnvOptions: 'production',
+      liveApiKeyOptionsProduction: 'prod-token',
+      liveAccountIdOptionsProduction: 'VA123',
+      liveApiKeyCrypto: 'cb-key',
+      liveApiSecretCrypto: 'cb-secret',
+    };
+  }
+
+  it('renders nothing while settings are still loading (null prop)', () => {
+    const { container } = render(<LiveCredentialsBanner settings={null} onOpenSettings={() => {}} />);
+    expect(container).toBeEmptyDOMElement();
+  });
+
+  it('renders nothing in demo mode even when every live cred is blank', () => {
+    const demoBlank: AccountSettings = {
+      ...DEFAULT_ACCOUNT_SETTINGS,
+      mode: 'demo',
+      liveApiKeyOptionsProduction: '',
+      liveAccountIdOptionsProduction: '',
+      liveApiKeyCrypto: '',
+      liveApiSecretCrypto: '',
+    };
+    const { container } = render(<LiveCredentialsBanner settings={demoBlank} onOpenSettings={() => {}} />);
+    expect(container).toBeEmptyDOMElement();
+  });
+
+  it('renders nothing in live mode when every required cred is filled', () => {
+    const { container } = render(
+      <LiveCredentialsBanner settings={liveFullCreds()} onOpenSettings={() => {}} />,
+    );
+    expect(container).toBeEmptyDOMElement();
+  });
+
+  it('renders a warning when live + Tradier production creds are blank, calling onOpenSettings with the first missing field', async () => {
+    // Mirrors the exact state from the issue's reporter snapshot: live mode
+    // selected, production env selected, both production creds blank.
+    const broken: AccountSettings = {
+      ...liveFullCreds(),
+      liveApiKeyOptionsProduction: '',
+      liveAccountIdOptionsProduction: '',
+    };
+    const onOpenSettings = vi.fn();
+    render(<LiveCredentialsBanner settings={broken} onOpenSettings={onOpenSettings} />);
+    expect(screen.getByTestId('live-credentials-banner')).toBeInTheDocument();
+    expect(screen.getByText(/Tradier production API token/)).toBeInTheDocument();
+    expect(screen.getByText(/Tradier production account ID/)).toBeInTheDocument();
+    await userEvent.click(screen.getByRole('button', { name: /Open settings/ }));
+    expect(onOpenSettings).toHaveBeenCalledWith('liveApiKeyOptionsProduction');
+  });
+
+  it('renders a warning when live + Coinbase creds are blank', () => {
+    const broken: AccountSettings = {
+      ...liveFullCreds(),
+      liveApiKeyCrypto: '',
+      liveApiSecretCrypto: '',
+    };
+    render(<LiveCredentialsBanner settings={broken} onOpenSettings={() => {}} />);
+    expect(screen.getByTestId('live-credentials-banner')).toBeInTheDocument();
+    expect(screen.getByText(/Coinbase API key/)).toBeInTheDocument();
+    expect(screen.getByText(/Coinbase API secret/)).toBeInTheDocument();
   });
 });

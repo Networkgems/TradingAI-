@@ -2,6 +2,7 @@
 // Management) extracted from Dashboard.tsx / CryptoDashboard.tsx, which carried
 // byte-identical copies. Behaviour is unchanged: backdrop click closes, the
 // inner card stops propagation, and User Management is gated on `isAdmin`.
+import type { LiveCredentialField } from '@trading-app/shared';
 import SettingsPage, { ChangePasswordSection, UserManagementSection } from '../../SettingsPage.tsx';
 
 export type ProfileModal = 'settings' | 'change-password' | 'user-management';
@@ -16,6 +17,7 @@ export function ProfileModals({
   onModeChange,
   onSettingsSaved,
   onLogout,
+  focusCredField,
 }: {
   which: ProfileModal | null;
   onClose: () => void;
@@ -26,6 +28,12 @@ export function ProfileModals({
   onModeChange: (mode: 'demo' | 'live') => void;
   onSettingsSaved: (settings: import('@trading-app/shared').AccountSettings) => void;
   onLogout: () => void;
+  /**
+   * TRA-506 — when the Settings modal opens because the user clicked the
+   * dashboard's missing-creds banner, focus this input on mount. Cleared
+   * by the parent when the modal closes.
+   */
+  focusCredField?: LiveCredentialField | null;
 }) {
   if (!which) return null;
 
@@ -48,6 +56,7 @@ export function ProfileModals({
             onModeChange={onModeChange}
             onSettingsSaved={onSettingsSaved}
             onLogout={onLogout}
+            focusCredField={focusCredField ?? null}
           />
         </div>
       </div>

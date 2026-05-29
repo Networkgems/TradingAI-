@@ -3,7 +3,11 @@ import { mkdtempSync, rmSync, mkdirSync, writeFileSync, readFileSync } from 'fs'
 import { tmpdir } from 'os';
 import { join } from 'path';
 import type { AccountSettings } from '@trading-app/shared';
-import { DEFAULT_ACCOUNT_SETTINGS } from '@trading-app/shared';
+import {
+  DEFAULT_ACCOUNT_SETTINGS,
+  validateLiveCredentials,
+  validateProductionTradierKeys,
+} from '@trading-app/shared';
 
 // account-settings.ts captures DATA_DIR at module-evaluation time, so set
 // process.env.DATA_DIR BEFORE importing it (same pattern as trade-store.test.ts).
@@ -361,5 +365,155 @@ describe('mergeScopedRiskSettings — bucket isolation (TRA-346 / TRA-349)', () 
       riskPerTradeDemoCrypto: 0.005,
       riskPerTradeLiveCrypto: 0.01,
     });
+  });
+});
+
+// TRA-506 — guardrails so the user can't silently run "Live + Tradier
+// production" with no creds. `validateLiveCredentials` gates the PUT
+// /api/account/settings handler; `validateProductionTradierKeys` runs as
+// an env-level invariant that fires even in demo mode. Each test pins one
+// reject path so a regression breaks exactly one case rather than the
+// whole bundle.
+describe('validateLiveCredentials (TRA-506)', () => {
+  // Build a settings snapshot that's fully credentialed for stocks +
+  // options + crypto so each test can blank exactly one cred and verify
+  // the reject path is wired to that one field.
+  function liveFullCreds(): AccountSettings {
+    return {
+      ...DEFAULT_ACCOUNT_SETTINGS,
+      mode: 'live',
+      liveTradierEnvOptions: 'production',
+      liveApiKeyOptionsProduction: 'prod-token',
+      liveAccountIdOptionsProduction: 'VA123',
+      liveApiKeyCrypto: 'cb-key',
+      liveApiSecretCrypto: 'cb-secret',
+    };
+  }
+
+  it('happy path: live + every required cred filled returns ok=true with no missing fields', () => {
+    const result = validateLiveCredentials(liveFullCreds());
+    expect(result).toEqual({ ok: true, missing: [] });
+  });
+
+  it('demo mode short-circuits even when every live cred is blank', () => {
+    // The issue is "user silently runs LIVE with no creds." A demo user
+    // tweaking unrelated settings (e.g. demoEquity) must not get blocked
+    // because their saved-but-unused live broker fields are empty.
+    const blank: AccountSettings = {
+      ...DEFAULT_ACCOUNT_SETTINGS,
+      mode: 'demo',
+      liveApiKeyOptionsProduction: '',
+      liveAccountIdOptionsProduction: '',
+      liveApiKeyCrypto: '',
+      liveApiSecretCrypto: '',
+    };
+    expect(validateLiveCredentials(blank)).toEqual({ ok: true, missing: [] });
+  });
+
+  it('rejects when Tradier production API token is blank (mode=live, env=production)', () => {
+    const s = { ...liveFullCreds(), liveApiKeyOptionsProduction: '' };
+    const result = validateLiveCredentials(s);
+    expect(result.ok).toBe(false);
+    expect(result.missing).toContain('liveApiKeyOptionsProduction');
+  });
+
+  it('rejects when Tradier production Account ID is blank (mode=live, env=production)', () => {
+    const s = { ...liveFullCreds(), liveAccountIdOptionsProduction: '' };
+    const result = validateLiveCredentials(s);
+    expect(result.ok).toBe(false);
+    expect(result.missing).toContain('liveAccountIdOptionsProduction');
+  });
+
+  it('rejects when Tradier sandbox pair is blank (mode=live, env=sandbox)', () => {
+    // Switching the env to sandbox flips which pair the guardrail reads. A
+    // user with production creds saved but sandbox env selected and blank
+    // sandbox creds still gets the same "no live broker wired up" reject.
+    const s: AccountSettings = {
+      ...liveFullCreds(),
+      liveTradierEnvOptions: 'sandbox',
+      liveApiKeyOptionsSandbox: '',
+      liveAccountIdOptionsSandbox: '',
+      liveApiKeyOptions: '',
+      liveAccountIdOptions: '',
+    };
+    const result = validateLiveCredentials(s);
+    expect(result.ok).toBe(false);
+    expect(result.missing).toEqual(
+      expect.arrayContaining(['liveApiKeyOptionsSandbox', 'liveAccountIdOptionsSandbox']),
+    );
+  });
+
+  it('rejects when Coinbase API key is blank (mode=live, brokerage=coinbase)', () => {
+    const s = { ...liveFullCreds(), liveApiKeyCrypto: '' };
+    const result = validateLiveCredentials(s);
+    expect(result.ok).toBe(false);
+    expect(result.missing).toContain('liveApiKeyCrypto');
+  });
+
+  it('rejects when Coinbase API secret is blank (mode=live, brokerage=coinbase)', () => {
+    const s = { ...liveFullCreds(), liveApiSecretCrypto: '' };
+    const result = validateLiveCredentials(s);
+    expect(result.ok).toBe(false);
+    expect(result.missing).toContain('liveApiSecretCrypto');
+  });
+
+  it('whitespace-only credentials count as missing (defense against fat-finger saves)', () => {
+    // A user who pastes a token with only spaces or a stray newline must
+    // not slip past the guardrail — the server trims at use time, so a
+    // whitespace-only save would surface as "auth failed" at order time
+    // instead of upfront at save time.
+    const s = {
+      ...liveFullCreds(),
+      liveApiKeyOptionsProduction: '   ',
+      liveAccountIdOptionsProduction: '\n\t',
+    };
+    const result = validateLiveCredentials(s);
+    expect(result.ok).toBe(false);
+    expect(result.missing).toEqual(
+      expect.arrayContaining(['liveApiKeyOptionsProduction', 'liveAccountIdOptionsProduction']),
+    );
+  });
+});
+
+describe('validateProductionTradierKeys (TRA-506)', () => {
+  it('rejects production env with blank production creds even in demo mode', () => {
+    // The "half-configured production" trap: user is in demo, flips env to
+    // production, leaves creds empty, saves. Later flipping mode to live
+    // would silently run with no broker — so the env-level guard rejects
+    // the save up front, independent of mode.
+    const s: AccountSettings = {
+      ...DEFAULT_ACCOUNT_SETTINGS,
+      mode: 'demo',
+      liveTradierEnvOptions: 'production',
+      liveApiKeyOptionsProduction: '',
+      liveAccountIdOptionsProduction: '',
+    };
+    const result = validateProductionTradierKeys(s);
+    expect(result.ok).toBe(false);
+    expect(result.missing).toEqual(
+      expect.arrayContaining(['liveApiKeyOptionsProduction', 'liveAccountIdOptionsProduction']),
+    );
+  });
+
+  it('sandbox env short-circuits regardless of production cred state', () => {
+    // Saving sandbox env must never be blocked by missing production
+    // creds — that's the whole point of having two separate pairs.
+    const s: AccountSettings = {
+      ...DEFAULT_ACCOUNT_SETTINGS,
+      liveTradierEnvOptions: 'sandbox',
+      liveApiKeyOptionsProduction: '',
+      liveAccountIdOptionsProduction: '',
+    };
+    expect(validateProductionTradierKeys(s)).toEqual({ ok: true, missing: [] });
+  });
+
+  it('production env with both production creds present returns ok=true', () => {
+    const s: AccountSettings = {
+      ...DEFAULT_ACCOUNT_SETTINGS,
+      liveTradierEnvOptions: 'production',
+      liveApiKeyOptionsProduction: 'prod-token',
+      liveAccountIdOptionsProduction: 'VA123',
+    };
+    expect(validateProductionTradierKeys(s)).toEqual({ ok: true, missing: [] });
   });
 });
