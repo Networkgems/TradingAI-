@@ -35,8 +35,9 @@ import { readFile } from 'fs/promises';
 import { existsSync } from 'fs';
 import { join } from 'path';
 import type { EodReport } from '@trading-app/shared';
-import { WATCHLIST } from '@trading-app/shared';
+import { WATCHLIST, WATCHLIST_MIN_PRICE } from '@trading-app/shared';
 import { scanStocksMarket, type ScanResult } from './market-scanner.js';
+import { fetchQuotes } from './yahoo-feed.js';
 import { addStocksSymbol } from './watchlist-store.js';
 import { getSettings } from './account-settings.js';
 import {
@@ -134,6 +135,87 @@ export function scoreSymbols(
 }
 
 /**
+ * TRA-510 — drop ranked newcomers whose last-known quote is below
+ * {@link WATCHLIST_MIN_PRICE}. Symbols already on the base WATCHLIST are
+ * passed back through untouched (the caller has already split base members
+ * out of `newcomers`; this is a belt-and-braces invariant — see the call
+ * site in {@link generateSmartWatchlist}).
+ *
+ * Price lookup precedence per symbol:
+ *   1. `eod.top5Movers[].price` — the prior-session close already on hand.
+ *      Free; no API round-trip; the only price source for the `eod_mover`
+ *      bucket that drove every QTEX-style stop-out in TRA-508.
+ *   2. `quoteLookup(symbols)` — batched fetch for whatever is left after
+ *      step 1. In production this is `fetchQuotes` (a single Tradier
+ *      multi-symbol call); tests pass an in-memory map. Symbols the
+ *      lookup can't price are conservatively dropped — without a price we
+ *      can't prove the symbol clears the floor.
+ *
+ * Returns `{ kept, dropped }`. `dropped` carries `{ symbol, price, reason }`
+ * so the call site can emit one structured `info` log per dropped name.
+ *
+ * Exported so the unit test can exercise the filter without touching disk,
+ * Yahoo, or Tradier.
+ */
+export async function filterByPriceFloor(
+  newcomers: ScoredSymbol[],
+  eod: EodReport | null,
+  quoteLookup: (symbols: readonly string[]) => Promise<Map<string, { price: number }>>,
+  minPrice: number = WATCHLIST_MIN_PRICE,
+): Promise<{
+  kept: ScoredSymbol[];
+  dropped: Array<{ symbol: string; price: number | null; reason: 'below_min_price' | 'no_quote' }>;
+}> {
+  if (newcomers.length === 0) {
+    return { kept: [], dropped: [] };
+  }
+
+  // Step 1: seed the price map from yesterday's EOD top-5 movers (cheap).
+  const priceBySymbol = new Map<string, number>();
+  if (eod) {
+    for (const mover of eod.top5Movers) {
+      priceBySymbol.set(mover.symbol.toUpperCase(), mover.price);
+    }
+  }
+
+  // Step 2: batch-fetch the remainder so the watchlist refresh is one HTTP
+  // call (Tradier multi-symbol) instead of N.
+  const needsFetch = newcomers.filter(r => !priceBySymbol.has(r.symbol)).map(r => r.symbol);
+  if (needsFetch.length > 0) {
+    try {
+      const fetched = await quoteLookup(needsFetch);
+      for (const [sym, q] of fetched) {
+        priceBySymbol.set(sym.toUpperCase(), q.price);
+      }
+    } catch (err) {
+      log.warn('price-floor quote lookup failed — falling back to drop-without-quote', {
+        symbols: needsFetch,
+        reason: err instanceof Error ? err.message : String(err),
+      });
+    }
+  }
+
+  const kept: ScoredSymbol[] = [];
+  const dropped: Array<{ symbol: string; price: number | null; reason: 'below_min_price' | 'no_quote' }> = [];
+  for (const r of newcomers) {
+    const price = priceBySymbol.get(r.symbol);
+    if (price == null || !Number.isFinite(price) || price <= 0) {
+      // No usable quote — drop conservatively. Without a price we can't
+      // prove the symbol clears the floor, and TRA-508 showed unfiltered
+      // micro-caps are exactly the cohort the floor is meant to gate out.
+      dropped.push({ symbol: r.symbol, price: null, reason: 'no_quote' });
+      continue;
+    }
+    if (price < minPrice) {
+      dropped.push({ symbol: r.symbol, price, reason: 'below_min_price' });
+      continue;
+    }
+    kept.push(r);
+  }
+  return { kept, dropped };
+}
+
+/**
  * Build today's smart watchlist for `ctx` and feed it into the user's
  * SignalEngine. Returns the list of symbols actually added (already-present
  * symbols are filtered out so the dashboard's per-user audit trail in
@@ -157,7 +239,28 @@ export async function generateSmartWatchlist(ctx: UserContext): Promise<string[]
   // Skip names already in the base WATCHLIST — those are watched by default
   // and re-adding them would just clutter the per-user `stocks.added` audit.
   const baseSet = new Set((WATCHLIST as readonly string[]).map(s => s.toUpperCase()));
-  const newcomers = ranked.filter(r => !baseSet.has(r.symbol)).slice(0, MAX_NEW_SYMBOLS);
+  const baseCandidates = ranked.filter(r => !baseSet.has(r.symbol));
+
+  // TRA-510 — gate sub-$5 micro-caps out before applying the MAX_NEW_SYMBOLS
+  // cap, so a slate of QTEX-style names can't crowd out the legitimate
+  // higher-priced movers we actually want to watch. Symbols on the base
+  // WATCHLIST were already excluded above and stay watched regardless of
+  // price (the floor is a *newcomer* filter, not a delisting tool).
+  const { kept: priceFiltered, dropped } = await filterByPriceFloor(
+    baseCandidates,
+    eod,
+    (syms) => fetchQuotes(syms),
+  );
+  for (const d of dropped) {
+    log.info('symbol filtered from smart watchlist', {
+      username: ctx.username,
+      symbol: d.symbol,
+      ...(d.price != null ? { price: d.price } : {}),
+      reason: d.reason,
+      minPrice: WATCHLIST_MIN_PRICE,
+    });
+  }
+  const newcomers = priceFiltered.slice(0, MAX_NEW_SYMBOLS);
 
   for (const r of newcomers) {
     try {

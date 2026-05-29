@@ -1263,6 +1263,22 @@ export const ADX_RANGING_THRESHOLD = 20;    // ADX < 20 → ranging → favor re
 export const MAX_CONSECUTIVE_LOSSES = 3;     // halt new entries after 3 consecutive losses
 export const DAILY_DRAWDOWN_HALT_PCT = 0.08; // halt if daily P&L < −8% of managed equity
 
+/**
+ * TRA-510 — smart-watchlist micro-cap price floor (USD). Newcomers fed in by
+ * the TRA-368 generator are dropped when their last-known quote is below this
+ * floor; symbols already on the base {@link WATCHLIST} are exempt. Drives the
+ * filter applied between {@link scoreSymbols} and the MAX_NEW_SYMBOLS cap in
+ * `premarket-watchlist.ts::generateSmartWatchlist`.
+ *
+ * Why: the TRA-508 post-mortem traced 5 of 5 demo stop-outs on 2026-05-28 to
+ * `eod_mover` sub-$5 names (e.g. QTEX at $2.7472 with a 24% stop distance) —
+ * micro-caps trade on a price scale where the engine's R-multiple stops are
+ * structurally wider than the strategy can absorb. The floor gates the
+ * micro-cap subset out of the watchlist without changing the `eod_mover`
+ * weight (a $60 NVDA on a +15% gap is still a high-value follow-through).
+ */
+export const WATCHLIST_MIN_PRICE = 5.00;
+
 // Valid ET trading windows stored as [startMinuteOfDay, endMinuteOfDay]
 export const TRADING_WINDOWS: readonly [number, number][] = [
   [9 * 60 + 35,  11 * 60 + 30],  // 9:35–11:30 AM ET (morning session)
