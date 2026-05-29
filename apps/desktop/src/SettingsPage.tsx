@@ -897,6 +897,22 @@ export default function SettingsPage({ token, httpUrl, context, onModeChange, on
   // never renders defaults as if they were the user's saved settings.
   const [loadError, setLoadError] = useState<string | null>(null);
   const [saveStatus, setSaveStatus] = useState<SaveStatus>('idle');
+  // TRA-511 — track the last-persisted snapshot so the footer can answer two
+  // questions the previous "Saved!" toast left ambiguous:
+  //   1. *When* did the last successful save actually happen? ("saved at HH:MM:SS")
+  //   2. Are there pending edits that the user might think were saved? ("unsaved changes")
+  // Both fall out naturally from comparing the live `settings` to the snapshot
+  // captured on load and re-captured on every 200 PUT. We deliberately do NOT
+  // mark the form dirty just because the saved snapshot disagrees in a
+  // server-clamped field — handleSave merges the server's `data.settings`
+  // back into both the live state AND the snapshot so the post-save diff is
+  // empty even after clamps fired.
+  const [lastSavedSettings, setLastSavedSettings] = useState<AccountSettings | null>(null);
+  const [savedAtMs, setSavedAtMs] = useState<number | null>(null);
+  // TRA-511 — distinguishes a network/5xx failure from the server's explicit
+  // `settings_persist_failed` code so the operator sees "disk write failed,
+  // your changes are NOT saved" instead of the generic connection message.
+  const [saveErrorKind, setSaveErrorKind] = useState<'network' | 'persist' | null>(null);
   const [resetPending, setResetPending] = useState(false);
   const [isAdmin, setIsAdmin] = useState(false);
   const [coinbaseTestStatus, setCoinbaseTestStatus] = useState<'idle' | 'testing'>('idle');
@@ -982,7 +998,16 @@ export default function SettingsPage({ token, httpUrl, context, onModeChange, on
           return;
         }
         if (cancelled) return;
-        setSettings({ ...DEFAULT_ACCOUNT_SETTINGS, ...data });
+        const merged = { ...DEFAULT_ACCOUNT_SETTINGS, ...data };
+        setSettings(merged);
+        // TRA-511 — anchor the "unsaved changes" diff against what the server
+        // says is currently persisted, NOT against DEFAULT_ACCOUNT_SETTINGS.
+        // Without this anchor the form would render dirty on first paint for
+        // every user who has any non-default field, which would defeat the
+        // whole point of the indicator.
+        setLastSavedSettings(merged);
+        setSavedAtMs(null);
+        setSaveErrorKind(null);
         setLoading(false);
       })
       .catch(err => {
@@ -1045,6 +1070,7 @@ export default function SettingsPage({ token, httpUrl, context, onModeChange, on
   async function handleSave(e: React.FormEvent) {
     e.preventDefault();
     setSaveStatus('saving');
+    setSaveErrorKind(null);
     try {
       const r = await fetch(`${httpUrl}/api/account/settings`, {
         method: 'PUT',
@@ -1060,15 +1086,28 @@ export default function SettingsPage({ token, httpUrl, context, onModeChange, on
         // server actually persisted (no hard refresh required).
         const data = await r.json().catch(() => null) as { ok?: boolean; settings?: AccountSettings } | null;
         const persisted = data?.settings ?? settings;
-        setSettings(prev => ({ ...prev, ...persisted }));
+        // TRA-511 — merge the persisted snapshot into BOTH the live form state
+        // and the saved-snapshot baseline. Computing them in the same render
+        // tick (instead of letting setSettings flow → effect → setSavedAtMs)
+        // keeps the "saved at HH:MM:SS" indicator from flickering through a
+        // transient "unsaved changes" state on every successful save.
+        const mergedPersisted: AccountSettings = { ...settings, ...persisted };
+        setSettings(mergedPersisted);
+        setLastSavedSettings(mergedPersisted);
+        setSavedAtMs(Date.now());
         setSaveStatus('saved');
-        setTimeout(() => setSaveStatus('idle'), 2000);
         onModeChange?.(persisted.mode);
         onSettingsSaved?.(persisted);
       } else {
+        // TRA-511 — discriminate the new `settings_persist_failed` code from
+        // a generic non-OK so the footer can tell the user their changes did
+        // NOT make it to disk, rather than the older ambiguous "Save failed".
+        const errData = await r.json().catch(() => null) as { code?: string } | null;
+        setSaveErrorKind(errData?.code === 'settings_persist_failed' ? 'persist' : 'network');
         setSaveStatus('error');
       }
     } catch {
+      setSaveErrorKind('network');
       setSaveStatus('error');
     }
   }
@@ -1161,6 +1200,22 @@ export default function SettingsPage({ token, httpUrl, context, onModeChange, on
   function set<K extends keyof AccountSettings>(key: K, value: AccountSettings[K]) {
     setSettings(prev => ({ ...prev, [key]: value }));
   }
+
+  // TRA-511 — compute "unsaved changes" against the snapshot anchored on the
+  // last successful load/save. We stringify both sides instead of using a
+  // shallow per-key compare because some fields are optional and may be
+  // legitimately `undefined` vs absent; JSON.stringify normalizes both into
+  // the same key omission, so we don't spuriously flag "dirty" right after
+  // load just because the GET response omitted an optional field that the
+  // form's local `set()` later wrote back as the same value.
+  const hasUnsavedChanges = lastSavedSettings !== null
+    && JSON.stringify(settings) !== JSON.stringify(lastSavedSettings);
+  // TRA-511 — format the saved-at timestamp into "HH:MM:SS" using the user's
+  // locale so the indicator matches the clock on their wall, not a UTC
+  // surprise. `null` is the pre-save state and is hidden by the renderer.
+  const savedAtLabel = savedAtMs === null
+    ? null
+    : new Date(savedAtMs).toLocaleTimeString();
 
   if (loading) {
     return <div className="loading"><div className="spinner" /><p>Loading settings…</p></div>;
@@ -2024,9 +2079,37 @@ export default function SettingsPage({ token, httpUrl, context, onModeChange, on
         {/* ── Save + Reset row ──────────────────────────────────────────── */}
         <div className="settings-footer">
           <button type="submit" className="btn-primary" disabled={saveStatus === 'saving'}>
-            {saveStatus === 'saving' ? 'Saving…' : saveStatus === 'saved' ? 'Saved!' : 'Save Settings'}
+            {saveStatus === 'saving' ? 'Saving…' : 'Save Settings'}
           </button>
-          {saveStatus === 'error' && <span className="save-error">Save failed — check server connection.</span>}
+          {/* TRA-511 — three mutually-exclusive footer states (besides the
+              raw "idle" no-pill default):
+                · saving:     suppress all pills so the button label carries the spinner
+                · error:      red pill, copy depends on whether server told us the
+                              write itself failed (persist) or we never got a 2xx (network)
+                · saved+dirty: amber "Unsaved changes" so the user knows the green
+                              "saved at" timestamp from earlier is now stale
+                · saved+clean: green "Saved at HH:MM:SS" — the concrete confirmation
+                              the parent ticket called out as missing */}
+          {saveStatus === 'error' && saveErrorKind === 'persist' && (
+            <span className="save-error" data-testid="settings-save-state">
+              Save failed on the server — your changes were not written to disk. Please retry.
+            </span>
+          )}
+          {saveStatus === 'error' && saveErrorKind !== 'persist' && (
+            <span className="save-error" data-testid="settings-save-state">
+              Save failed — check server connection.
+            </span>
+          )}
+          {saveStatus !== 'saving' && saveStatus !== 'error' && savedAtLabel && hasUnsavedChanges && (
+            <span className="save-unsaved" data-testid="settings-save-state">
+              Unsaved changes
+            </span>
+          )}
+          {saveStatus !== 'saving' && saveStatus !== 'error' && savedAtLabel && !hasUnsavedChanges && (
+            <span className="save-success" data-testid="settings-save-state">
+              Saved at {savedAtLabel}
+            </span>
+          )}
 
           {settings.mode === 'demo' && (
             <button

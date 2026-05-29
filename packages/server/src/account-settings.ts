@@ -146,13 +146,61 @@ export function getSettings(username: string): AccountSettings {
   return cache.get(username) ?? { ...DEFAULT_ACCOUNT_SETTINGS };
 }
 
+// TRA-511 — credential field names we audit on every successful save so an
+// operator can grep "saveSettings: persisted" lines to confirm which creds
+// were actually present in the payload that hit disk (without ever logging
+// the cleartext values themselves). Catches the "Test Connection passed but
+// the on-disk file is empty" class of bug the parent ticket investigated.
+const CREDENTIAL_FIELDS: ReadonlyArray<keyof AccountSettings> = [
+  'liveApiKeyStocks',
+  'liveAccountIdStocks',
+  'liveApiKeyCrypto',
+  'liveApiSecretCrypto',
+  'liveApiKeyOptionsSandbox',
+  'liveAccountIdOptionsSandbox',
+  'liveApiKeyOptionsProduction',
+  'liveAccountIdOptionsProduction',
+];
+
+function summarizeCredentialPresence(settings: AccountSettings): {
+  filled: string[];
+  blank: string[];
+} {
+  const filled: string[] = [];
+  const blank: string[] = [];
+  for (const field of CREDENTIAL_FIELDS) {
+    const raw = settings[field];
+    if (typeof raw === 'string' && raw.trim() !== '') {
+      filled.push(String(field));
+    } else {
+      blank.push(String(field));
+    }
+  }
+  return { filled, blank };
+}
+
 export async function saveSettings(username: string, settings: AccountSettings): Promise<void> {
   const dir = dirname(userSettingsFile(username));
   if (!existsSync(dir)) {
     await mkdir(dir, { recursive: true });
   }
+  // TRA-511 — write to disk BEFORE mutating the cache so a failed `writeFile`
+  // leaves the in-memory state matching what's actually persisted. Without
+  // this, a partial disk write would race: the route handler reports success
+  // (cache says new creds present), Test Connection passes against cache, but
+  // the next GET /api/account/settings reload pulls the old (or empty) file.
+  // Exactly the divergence the TRA-505 screenshot captured.
+  const file = userSettingsFile(username);
+  await writeFile(file, JSON.stringify(settings, null, 2), 'utf-8');
   cache.set(username, { ...settings });
-  await writeFile(userSettingsFile(username), JSON.stringify(settings, null, 2), 'utf-8');
+  const presence = summarizeCredentialPresence(settings);
+  log.info('saveSettings: persisted', {
+    username,
+    mode: settings.mode,
+    liveTradierEnvOptions: settings.liveTradierEnvOptions,
+    credentialsFilled: presence.filled,
+    credentialsBlank: presence.blank,
+  });
 }
 
 export function clearSettingsCache(username: string): void {

@@ -517,3 +517,68 @@ describe('validateProductionTradierKeys (TRA-506)', () => {
     expect(validateProductionTradierKeys(s)).toEqual({ ok: true, missing: [] });
   });
 });
+
+// TRA-511 — pin the disk-write-before-cache-set ordering. If `writeFile`
+// fails, the in-memory cache MUST NOT advance, because Test Connection reads
+// from `getSettings` (the cache) and would otherwise validate against creds
+// that were never persisted — the exact divergence the parent ticket
+// (TRA-505) saw in the screenshot.
+describe('saveSettings persistence contract (TRA-511)', () => {
+  it('does not mutate the cache when the disk write fails', async () => {
+    // Seed the user file + cache with a known baseline so we can detect
+    // whether a subsequent failed save leaks the new payload into cache.
+    const baseline: AccountSettings = {
+      ...DEFAULT_ACCOUNT_SETTINGS,
+      liveApiKeyOptionsProduction: 'baseline-prod-token',
+      liveAccountIdOptionsProduction: 'baseline-account',
+    };
+    await saveSettings(USER, baseline);
+    clearSettingsCache(USER);
+    // Prime the cache via loadSettings so getSettings() returns the baseline.
+    await loadSettings(USER);
+
+    // Force writeFile to fail by replacing the user dir with a regular file
+    // of the same name — `mkdir(..., { recursive: true })` succeeds (it
+    // no-ops because the parent dir already exists from the baseline save),
+    // and `writeFile` then errors with EISDIR/ENOTDIR because the target
+    // path is shadowed. This mirrors the "disk write failed silently"
+    // production scenario without requiring fs/promises mocking.
+    const file = join(TMP_ROOT, 'users', USER, 'account-settings.json');
+    rmSync(file, { force: true });
+    mkdirSync(file); // turn the file path into a directory → writeFile fails
+
+    const next: AccountSettings = {
+      ...baseline,
+      liveApiKeyOptionsProduction: 'new-but-doomed-token',
+      liveAccountIdOptionsProduction: 'new-but-doomed-account',
+    };
+    await expect(saveSettings(USER, next)).rejects.toBeDefined();
+
+    // Cache must still reflect the baseline — a Test Connection probe right
+    // now must NOT see the "new-but-doomed-token" that never made it to disk.
+    const cached = (await loadSettings(USER));
+    expect(cached.liveApiKeyOptionsProduction).toBe('baseline-prod-token');
+    expect(cached.liveAccountIdOptionsProduction).toBe('baseline-account');
+
+    rmSync(file, { recursive: true, force: true });
+  });
+
+  it('updates BOTH cache + disk on a successful save', async () => {
+    const stored: AccountSettings = {
+      ...DEFAULT_ACCOUNT_SETTINGS,
+      liveApiKeyOptionsProduction: 'persisted-prod-token',
+      liveAccountIdOptionsProduction: 'persisted-account',
+    };
+    await saveSettings(USER, stored);
+    // Cache: read via getSettings would go through loadSettings if cold; we
+    // use loadSettings directly to assert what subsequent reads will see.
+    const reloaded = await loadSettings(USER);
+    expect(reloaded.liveApiKeyOptionsProduction).toBe('persisted-prod-token');
+    expect(reloaded.liveAccountIdOptionsProduction).toBe('persisted-account');
+    // Disk: the file on disk must match what the cache says.
+    const file = join(TMP_ROOT, 'users', USER, 'account-settings.json');
+    const onDisk = JSON.parse(readFileSync(file, 'utf-8')) as AccountSettings;
+    expect(onDisk.liveApiKeyOptionsProduction).toBe('persisted-prod-token');
+    expect(onDisk.liveAccountIdOptionsProduction).toBe('persisted-account');
+  });
+});

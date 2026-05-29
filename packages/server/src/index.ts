@@ -1933,7 +1933,26 @@ app.put('/api/account/settings', requireAuth, async (req, res) => {
     });
     return;
   }
-  await saveSettings(username, updated);
+  // TRA-511 — wrap the persistence call so a `writeFile` failure (disk full,
+  // EACCES, EROFS, etc.) surfaces to the UI as a red "save failed" toast
+  // instead of silently appearing to succeed. Before this, an EBUSY on the
+  // user's account-settings.json could bubble out as a generic 500 with no
+  // structured code for the dashboard to discriminate on, leaving the
+  // Settings page in a "looks-saved" state while disk still held stale data.
+  try {
+    await saveSettings(username, updated);
+  } catch (err: unknown) {
+    log.error('TRA-511 saveSettings: persistence failed', {
+      username,
+      reason: err instanceof Error ? err.message : String(err),
+    });
+    res.status(500).json({
+      ok: false,
+      code: 'settings_persist_failed',
+      error: 'Failed to persist account settings. Please retry; if the problem persists, contact support.',
+    });
+    return;
+  }
   // Await the stocks engine: TRA-226 makes applySettings async so a flip into
   // live mode can refresh the Tradier balance once before the broadcast,
   // matching the Coinbase pattern from TRA-224 — without this the dashboard

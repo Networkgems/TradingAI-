@@ -1042,6 +1042,14 @@ tr:hover td { background: var(--bg-hover); }
 
 .save-error { color: var(--red); font-size: 0.8rem; }
 .save-success { color: var(--green); font-size: 0.8rem; }
+/* TRA-511 — amber pill for "unsaved changes" reuses the existing `--orange`
+   token from the dashboard's mode palette to avoid introducing a new color
+   variable solely for this indicator. */
+.save-unsaved {
+  color: var(--orange);
+  font-size: 0.8rem;
+  font-weight: 600;
+}
 
 /* ── Forgot password link ─────────────────────────────────────────────────── */
 
