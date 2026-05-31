@@ -389,7 +389,17 @@ export async function fetchCoinbaseAdvancedTradeCandles(
         // A failed window aborts the fetch — partial OHLC history would shift
         // every downstream indicator window, so we return what we have (or
         // nothing) and let the caller fall through to the next provider.
-        feedLog.warn('Coinbase Advanced Trade candles failed', {
+        //
+        // TRA-514 — a 400 here is the Advanced Trade host's deterministic
+        // "product not listed" response (the same non-Coinbase symbols that
+        // get a 404 on the Exchange host — SUL-USD, NEFTY-USD, MSTR-USD,
+        // IBIT-USD, LABUBU-USD, … — random tokens / equities scanners dump
+        // into the watchlist). It is expected and unactionable, so it logs at
+        // `debug` to match how the Exchange bar fetchers already suppress the
+        // per-symbol 404 warn. Transient/actionable statuses (429 throttling,
+        // 5xx) still surface at `warn`.
+        const level = resp.status === 400 ? 'debug' : 'warn';
+        feedLog[level]('Coinbase Advanced Trade candles failed', {
           symbol,
           granularity: granEnum,
           status: resp.status,
