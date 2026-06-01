@@ -1907,32 +1907,33 @@ app.put('/api/account/settings', requireAuth, async (req, res) => {
       return DEFAULT_STRATEGY_PRESET_ID;
     })(),
   };
-  // TRA-506 — guardrails so a user can't silently run "Live + Tradier
-  // production" with no creds. Two independent rejects:
-  //   1. mode=live + any required cred for an enabled live market blank.
-  //   2. liveTradierEnvOptions=production + either production key blank,
-  //      independent of mode — so flipping the env to production in demo
-  //      can't park the user in a half-configured state.
-  // Error body shape matches the issue spec so the dashboard banner can
-  // surface a specific actionable message per-field.
-  const liveCredsCheck = validateLiveCredentials(updated);
-  if (!liveCredsCheck.ok) {
-    res.status(422).json({
-      ok: false,
-      code: 'missing_live_credentials',
-      missing: liveCredsCheck.missing,
-    });
-    return;
-  }
-  const prodKeysCheck = validateProductionTradierKeys(updated);
-  if (!prodKeysCheck.ok) {
-    res.status(422).json({
-      ok: false,
-      code: 'missing_live_credentials',
-      missing: prodKeysCheck.missing,
-    });
-    return;
-  }
+  // TRA-515 — the TRA-506 guardrail used to 422-reject this PUT whenever any
+  // required live cred was blank. But the PUT is atomic: rejecting it
+  // discarded the user's *valid* Tradier production keys the moment an
+  // unrelated market was unconfigured — e.g. a Tradier-only stocks+options
+  // user in live mode who never set up Coinbase. `findMissingLiveCredentials`
+  // demands the Coinbase pair in live mode (default `liveBrokerageTypeCrypto`
+  // is 'coinbase'), so their save 422'd, the Tradier keys never reached disk,
+  // and GET /api/account/settings kept returning empty
+  // `liveApiKeyOptionsProduction` / `liveAccountIdOptionsProduction` — live
+  // Tradier trading could never start.
+  //
+  // The warning the user actually needs is already rendered client-side by
+  // LiveCredentialsBanner, which derives the missing set from the loaded
+  // settings via `findMissingLiveCredentials` — it never depended on this
+  // 422. And the engine builds a null broker client for any market whose
+  // creds are blank (`buildTradierLiveClient` / `buildTradierLiveEquityClient`
+  // / crypto `buildLiveBroker` all return null), so persisting a partially
+  // configured snapshot can never place orders on an unconfigured market.
+  //
+  // So: persist unconditionally and surface the missing set as a
+  // non-blocking `missingLiveCredentials` warning on the 200 response. A
+  // market with its creds filled (Tradier) goes live; markets still missing
+  // creds stay dormant and keep nagging through the banner.
+  const missingLiveCredentials = Array.from(new Set([
+    ...validateLiveCredentials(updated).missing,
+    ...validateProductionTradierKeys(updated).missing,
+  ]));
   // TRA-511 — wrap the persistence call so a `writeFile` failure (disk full,
   // EACCES, EROFS, etc.) surfaces to the UI as a red "save failed" toast
   // instead of silently appearing to succeed. Before this, an EBUSY on the
@@ -1964,7 +1965,7 @@ app.put('/api/account/settings', requireAuth, async (req, res) => {
   // instead of a transient $0 the user sees until the next 60s tick (TRA-224).
   await ctx.cryptoEngine.applySettings(updated);
   broadcastCryptoState(ctx);
-  res.json({ ok: true, settings: updated });
+  res.json({ ok: true, settings: updated, missingLiveCredentials });
 });
 
 // Per-market scope (TRA-192): Stockdashboard and Cryptodashboard each have

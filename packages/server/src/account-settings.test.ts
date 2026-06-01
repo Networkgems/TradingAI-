@@ -582,3 +582,53 @@ describe('saveSettings persistence contract (TRA-511)', () => {
     expect(onDisk.liveAccountIdOptionsProduction).toBe('persisted-account');
   });
 });
+
+// TRA-515 — a Tradier-only stocks+options user in live mode (no Coinbase
+// creds) must still have their production Tradier keys persisted. The old
+// TRA-506 PUT guardrail 422-rejected the whole save because the live-mode
+// check also demands the Coinbase pair, so the user's valid Tradier keys
+// never reached disk and GET kept returning them empty. The route now
+// persists unconditionally and downgrades the missing set to a non-blocking
+// warning, so the keys round-trip.
+describe('Tradier production keys persist for a Tradier-only live user (TRA-515)', () => {
+  function tradierOnlyLive(): AccountSettings {
+    return {
+      ...DEFAULT_ACCOUNT_SETTINGS,
+      mode: 'live',
+      liveTradierEnvOptions: 'production',
+      liveApiKeyOptionsProduction: 'prod-token',
+      liveAccountIdOptionsProduction: 'VA123',
+      // Crypto deliberately left unconfigured — this user only trades Tradier.
+      liveApiKeyCrypto: '',
+      liveApiSecretCrypto: '',
+    };
+  }
+
+  it('round-trips the production token + account id through save → load even with Coinbase blank', async () => {
+    await saveSettings(USER, tradierOnlyLive());
+    // Drop the in-memory cache so the assertion proves the values came off
+    // disk (what GET /api/account/settings reads on a cache-cold request),
+    // not just the cache saveSettings populated.
+    clearSettingsCache(USER);
+    const loaded = await loadSettings(USER);
+    expect(loaded.liveApiKeyOptionsProduction).toBe('prod-token');
+    expect(loaded.liveAccountIdOptionsProduction).toBe('VA123');
+  });
+
+  it('the Tradier keys are not what the guardrail flags — only the unconfigured Coinbase pair is', () => {
+    // The route folds both validators into a single non-blocking
+    // `missingLiveCredentials` list. The Tradier production pair is filled,
+    // so it must NOT appear; the missing set is purely the Coinbase creds the
+    // banner nags about — and it no longer blocks the save.
+    const s = tradierOnlyLive();
+    const missing = Array.from(new Set([
+      ...validateLiveCredentials(s).missing,
+      ...validateProductionTradierKeys(s).missing,
+    ]));
+    expect(missing).not.toContain('liveApiKeyOptionsProduction');
+    expect(missing).not.toContain('liveAccountIdOptionsProduction');
+    expect(missing).toEqual(
+      expect.arrayContaining(['liveApiKeyCrypto', 'liveApiSecretCrypto']),
+    );
+  });
+});
