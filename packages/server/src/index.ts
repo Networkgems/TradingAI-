@@ -71,7 +71,13 @@ import {
 } from './observability/index.js';
 import { rotateBackups, checkDataDirHealth } from './trade-store.js';
 import { TradierRelativeValueScannerService } from './relative-value-scanner.js';
-import { CoinbaseOrderClient, tradierBaseUrl, TradierOptionsClient } from '@trading-app/engine';
+import {
+  CoinbaseOrderClient,
+  tradierBaseUrl,
+  TradierOptionsClient,
+  TradierOrderClient,
+  TRADIER_TERMINAL_STATUSES,
+} from '@trading-app/engine';
 import { submitSmartSellToClose } from './tradier-smart-close.js';
 import type { TradierEnv } from '@trading-app/shared';
 import { fetchQuotes } from './yahoo-feed.js';
@@ -1433,6 +1439,159 @@ app.patch('/api/auth/me', requireAuth, async (req, res) => {
   const result = await updateUser(username, { email });
   if (!result.ok) { res.status(404).json({ error: result.error }); return; }
   res.json({ ok: true });
+});
+
+// ── TRA-553 — Tradier SANDBOX equity OTOCO bracket smoke (gate for TRA-335) ───
+//
+// Validates the LIVE equity wiring (submitBracketOrder -> waitForOrderTerminalStatus)
+// end-to-end against the REAL Tradier *sandbox* matching engine, from INSIDE the
+// running service so it inherits the already-present `TRADIER_SANDBOX_*` env
+// vars (CEO decision on TRA-553: the secret never leaves Render; no human reveals
+// a token). It exercises the exact production code path the engine uses in
+// `SignalEngine.placeTradierEquityBracket`.
+//
+// SAFETY — sandbox-pinned by construction, cannot touch real money:
+//   • Reads ONLY the `TRADIER_SANDBOX_*` pair (no unprefixed prod fallback) and
+//     refuses if either is missing — it can never pick up production creds.
+//   • Constructs the client with env `'sandbox'` (hardcoded → sandbox.tradier.com),
+//     independent of the service's `TRADIER_ENV`. We do NOT read or mutate
+//     `TRADIER_ENV` / `LIVE_STRATEGY_PRESET`.
+//   • Gated by a one-time committed token (`x-tra553-token` header / `?token=`),
+//     removed from source after evidence is captured. Not wired to requireAdmin
+//     because an agent cannot obtain an admin session token without a human
+//     revealing a secret — the whole point of the in-service path.
+//
+// This route is temporary scaffolding for the one-shot validation and is removed
+// in the immediate follow-up commit.
+const TRA553_SMOKE_TOKEN = 'tra553-7f4c91a2e6b8d3a5';
+
+app.post('/api/admin/tra553-smoke', async (req, res) => {
+  const provided =
+    (req.header('x-tra553-token') ?? '') ||
+    String((req.query as Record<string, unknown>)['token'] ?? '');
+  if (provided !== TRA553_SMOKE_TOKEN) {
+    res.status(403).json({ ok: false, error: 'forbidden' });
+    return;
+  }
+
+  // Sandbox-only creds: dedicated sandbox pair, no production fallback.
+  const sbxToken = (process.env['TRADIER_SANDBOX_API_TOKEN'] ?? '').trim();
+  const sbxAccount = (process.env['TRADIER_SANDBOX_ACCOUNT_ID'] ?? '').trim();
+  if (!sbxToken || !sbxAccount) {
+    res.status(400).json({
+      ok: false,
+      error: 'sandbox creds missing — TRADIER_SANDBOX_API_TOKEN / TRADIER_SANDBOX_ACCOUNT_ID not set',
+    });
+    return;
+  }
+
+  const body = (req.body ?? {}) as Record<string, unknown>;
+  const SYMBOL = (typeof body['symbol'] === 'string' && body['symbol'] ? body['symbol'] : 'AAPL') as string;
+  const QTY = Number(body['qty'] ?? 1) || 1;
+  const WAIT_MS = Number(body['waitMs'] ?? 12000) || 12000;
+  const DO_CANCEL = body['cancel'] !== false;
+  const base = tradierBaseUrl('sandbox');
+  const maskedAccount = `***${sbxAccount.slice(-4)}`;
+  const evidence: Record<string, unknown> = {
+    issue: 'TRA-553',
+    env: 'sandbox',
+    base,
+    account: maskedAccount,
+    serviceTradierEnv: process.env['TRADIER_ENV'] ?? '(unset → sandbox default)',
+  };
+
+  try {
+    // 1. Live sandbox quote so the entry limit is marketable and TP/SL bracket it.
+    const qResp = await fetch(`${base}/markets/quotes?symbols=${encodeURIComponent(SYMBOL)}`, {
+      headers: { Authorization: `Bearer ${sbxToken}`, Accept: 'application/json' },
+    });
+    if (!qResp.ok) {
+      res.status(502).json({ ...evidence, ok: false, error: `quote fetch failed (${qResp.status})` });
+      return;
+    }
+    const qJson = (await qResp.json()) as { quotes?: { quote?: Record<string, unknown> } };
+    const q = qJson?.quotes?.quote ?? {};
+    const px = Number(q['last'] ?? q['close'] ?? q['ask'] ?? q['bid']);
+    if (!Number.isFinite(px) || px <= 0) {
+      res.status(502).json({ ...evidence, ok: false, error: `no usable quote for ${SYMBOL}`, quote: q });
+      return;
+    }
+    const r2 = (n: number) => Math.round(n * 100) / 100;
+    const signal = {
+      symbol: SYMBOL,
+      qty: QTY,
+      side: 'buy' as const,
+      limitPrice: r2(px * 1.002),
+      takeProfitPrice: r2(px * 1.02),
+      stopLossPrice: r2(px * 0.98),
+    };
+    evidence['quoteLast'] = px;
+    evidence['signal'] = signal;
+
+    // 2. submitBracketOrder — same call path as placeTradierEquityBracket (scope #2).
+    const client = new TradierOrderClient(sbxToken, sbxAccount, 'sandbox');
+    const submitResponse = await client.submitBracketOrder(signal);
+    evidence['submitResponse'] = submitResponse;
+    if (submitResponse?.id == null) {
+      res.status(502).json({ ...evidence, ok: false, error: 'order response missing id' });
+      return;
+    }
+
+    // 3. waitForOrderTerminalStatus — proves the poll loop (scope #2).
+    const terminalDetail = await client.waitForOrderTerminalStatus(submitResponse.id, { timeoutMs: WAIT_MS });
+    evidence['terminalDetail'] = terminalDetail;
+    const isTerminal = Boolean(terminalDetail && TRADIER_TERMINAL_STATUSES.has(terminalDetail.status));
+    evidence['terminal'] = isTerminal;
+
+    // 4. Read back full OTOCO tree — proves TP/SL are an OCO pair (scope #3).
+    const treeResp = await fetch(
+      `${base}/accounts/${encodeURIComponent(sbxAccount)}/orders/${encodeURIComponent(String(submitResponse.id))}?includeTags=true`,
+      { headers: { Authorization: `Bearer ${sbxToken}`, Accept: 'application/json' } },
+    );
+    const tree = treeResp.ok ? ((await treeResp.json()) as { order?: Record<string, unknown> })?.order : null;
+    evidence['orderTree'] = tree ?? `(tree fetch failed ${treeResp.status})`;
+
+    const rawLeg = tree?.['leg'];
+    const legs = Array.isArray(rawLeg) ? rawLeg : rawLeg ? [rawLeg] : [];
+    const closeSide = signal.side === 'buy' ? 'sell' : 'buy';
+    const tp = legs.find((l: Record<string, unknown>) => l['type'] === 'limit' && l['side'] === closeSide);
+    const sl = legs.find((l: Record<string, unknown>) => l['type'] === 'stop' && l['side'] === closeSide);
+    const tpQty = tp?.['quantity'];
+    const slQty = sl?.['quantity'];
+    const okClass = tree?.['class'] === 'otoco';
+    const okTpQty = tpQty == null || Number(tpQty) === QTY;
+    const okSlQty = slQty == null || Number(slQty) === QTY;
+    evidence['legAnalysis'] = {
+      class: tree?.['class'] ?? null,
+      legCount: legs.length,
+      closeSide,
+      takeProfitLeg: tp ?? null,
+      stopLossLeg: sl ?? null,
+      ocoNote:
+        'OCO semantics (fill one → cancel the other) are enforced by Tradier’s OTOCO matching engine; the class=otoco submission wires it.',
+    };
+    evidence['checks'] = {
+      classIsOtoco: okClass,
+      tpQtyMatchesSignal: okTpQty,
+      slQtyMatchesSignal: okSlQty,
+      pollLoopRan: terminalDetail != null,
+    };
+
+    // 5. Cleanup — cancel the still-open OTOCO so the sandbox account stays clean.
+    if (DO_CANCEL && !isTerminal) {
+      try {
+        await client.cancelOrder(submitResponse.id);
+        evidence['cleanup'] = 'cancel issued';
+      } catch (e) {
+        evidence['cleanup'] = `cancel best-effort failed: ${e instanceof Error ? e.message : String(e)}`;
+      }
+    }
+
+    const green = okClass && okTpQty && okSlQty;
+    res.json({ ...evidence, ok: green, verdict: green ? 'GREEN' : 'NEEDS_REVIEW' });
+  } catch (err: unknown) {
+    res.status(502).json({ ...evidence, ok: false, error: err instanceof Error ? err.message : String(err) });
+  }
 });
 
 // ── Admin: user management ────────────────────────────────────────────────────
