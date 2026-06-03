@@ -17,7 +17,8 @@
   },
   "references": [
     { "path": "../../packages/shared" },
-    { "path": "../../packages/engine" }
+    { "path": "../../packages/engine" },
+    { "path": "../../packages/agents" }
   ],
   "include": ["src"]
 }

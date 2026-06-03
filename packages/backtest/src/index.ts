@@ -131,3 +131,42 @@ export {
   DEFAULT_REPLAY_CONFIG,
 } from './run-options-replay.js';
 export type { ReplayConfig } from './run-options-replay.js';
+// TRA-546 (TRA-529 P3) — advisory multi-agent validation harness: point-in-time
+// replay (as-of clock, no look-ahead) → scoring → calibration + net-of-cost
+// edge. Drives the P1 stub graph; NO LLM spend.
+export {
+  replayAgents,
+  momentumCandidate,
+  clampConviction,
+} from './agent-replay.js';
+export type {
+  CandidateGenerator,
+  AgentReplayRecord,
+  AgentReplayConfig,
+  AgentReplayResult,
+} from './agent-replay.js';
+export {
+  realizedR,
+  summarizeAccuracy,
+  scoreSignal,
+  scoreReplay,
+} from './agent-scoring.js';
+export type { ScoredSignal, AgentScoreReport } from './agent-scoring.js';
+export {
+  reliabilityCurve,
+  netOfCostEdge,
+} from './agent-calibration.js';
+export type {
+  CalibrationBin,
+  ReliabilityCurve,
+  NetEdgeReport,
+} from './agent-calibration.js';
+export {
+  runAgentValidation,
+  buildValidationMarkdown,
+} from './agent-validation.js';
+export type {
+  AgentValidationOptions,
+  AgentValidationReport,
+  RecommendationLedgerRow,
+} from './agent-validation.js';

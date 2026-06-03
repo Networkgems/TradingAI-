@@ -1,0 +1,4978 @@
+{
+  "symbol": "BTC-USD",
+  "bars": 2880,
+  "decisions": 486,
+  "horizonBars": 24,
+  "recommendations": [
+    {
+      "asOf": 1767333600000,
+      "barIndex": 30,
+      "action": "BUY",
+      "verdict": "REVISE",
+      "conviction": 0.2097,
+      "routable": false,
+      "costUsd": 0,
+      "latencyMs": 1
+    },
+    {
+      "asOf": 1767348000000,
+      "barIndex": 34,
+      "action": "BUY",
+      "verdict": "REVISE",
+      "conviction": 0.2833,
+      "routable": false,
+      "costUsd": 0,
+      "latencyMs": 0
+    },
+    {
+      "asOf": 1767362400000,
+      "barIndex": 38,
+      "action": "BUY",
+      "verdict": "REVISE",
+      "conviction": 0.2092,
+      "routable": false,
+      "costUsd": 0,
+      "latencyMs": 0
+    },
+    {
+      "asOf": 1767376800000,
+      "barIndex": 42,
+      "action": "BUY",
+      "verdict": "REVISE",
+      "conviction": 0.1726,
+      "routable": false,
+      "costUsd": 0,
+      "latencyMs": 0
+    },
+    {
+      "asOf": 1767391200000,
+      "barIndex": 46,
+      "action": "BUY",
+      "verdict": "REVISE",
+      "conviction": 0.1549,
+      "routable": false,
+      "costUsd": 0,
+      "latencyMs": 0
+    },
+    {
+      "asOf": 1767405600000,
+      "barIndex": 50,
+      "action": "BUY",
+      "verdict": "REVISE",
+      "conviction": 0.1961,
+      "routable": false,
+      "costUsd": 0,
+      "latencyMs": 0
+    },
+    {
+      "asOf": 1767420000000,
+      "barIndex": 54,
+      "action": "BUY",
+      "verdict": "REVISE",
+      "conviction": 0.1895,
+      "routable": false,
+      "costUsd": 0,
+      "latencyMs": 0
+    },
+    {
+      "asOf": 1767434400000,
+      "barIndex": 58,
+      "action": "BUY",
+      "verdict": "REVISE",
+      "conviction": 0.1312,
+      "routable": false,
+      "costUsd": 0,
+      "latencyMs": 0
+    },
+    {
+      "asOf": 1767448800000,
+      "barIndex": 62,
+      "action": "BUY",
+      "verdict": "REVISE",
+      "conviction": 0.1582,
+      "routable": false,
+      "costUsd": 0,
+      "latencyMs": 0
+    },
+    {
+      "asOf": 1767463200000,
+      "barIndex": 66,
+      "action": "BUY",
+      "verdict": "REVISE",
+      "conviction": 0.2086,
+      "routable": false,
+      "costUsd": 0,
+      "latencyMs": 0
+    },
+    {
+      "asOf": 1767477600000,
+      "barIndex": 70,
+      "action": "BUY",
+      "verdict": "REVISE",
+      "conviction": 0.2331,
+      "routable": false,
+      "costUsd": 0,
+      "latencyMs": 0
+    },
+    {
+      "asOf": 1767492000000,
+      "barIndex": 74,
+      "action": "BUY",
+      "verdict": "REVISE",
+      "conviction": 0.1761,
+      "routable": false,
+      "costUsd": 0,
+      "latencyMs": 0
+    },
+    {
+      "asOf": 1767506400000,
+      "barIndex": 78,
+      "action": "BUY",
+      "verdict": "REVISE",
+      "conviction": 0.1625,
+      "routable": false,
+      "costUsd": 0,
+      "latencyMs": 0
+    },
+    {
+      "asOf": 1767520800000,
+      "barIndex": 82,
+      "action": "BUY",
+      "verdict": "REVISE",
+      "conviction": 0.1982,
+      "routable": false,
+      "costUsd": 0,
+      "latencyMs": 0
+    },
+    {
+      "asOf": 1767535200000,
+      "barIndex": 86,
+      "action": "BUY",
+      "verdict": "REVISE",
+      "conviction": 0.1906,
+      "routable": false,
+      "costUsd": 0,
+      "latencyMs": 0
+    },
+    {
+      "asOf": 1767549600000,
+      "barIndex": 90,
+      "action": "BUY",
+      "verdict": "REVISE",
+      "conviction": 0.1509,
+      "routable": false,
+      "costUsd": 0,
+      "latencyMs": 0
+    },
+    {
+      "asOf": 1767564000000,
+      "barIndex": 94,
+      "action": "BUY",
+      "verdict": "REVISE",
+      "conviction": 0.0872,
+      "routable": false,
+      "costUsd": 0,
+      "latencyMs": 0
+    },
+    {
+      "asOf": 1767578400000,
+      "barIndex": 98,
+      "action": "BUY",
+      "verdict": "REVISE",
+      "conviction": 0.1183,
+      "routable": false,
+      "costUsd": 0,
+      "latencyMs": 0
+    },
+    {
+      "asOf": 1767592800000,
+      "barIndex": 102,
+      "action": "BUY",
+      "verdict": "REVISE",
+      "conviction": 0.1272,
+      "routable": false,
+      "costUsd": 0,
+      "latencyMs": 0
+    },
+    {
+      "asOf": 1767607200000,
+      "barIndex": 106,
+      "action": "BUY",
+      "verdict": "REVISE",
+      "conviction": 0.1241,
+      "routable": false,
+      "costUsd": 0,
+      "latencyMs": 0
+    },
+    {
+      "asOf": 1767621600000,
+      "barIndex": 110,
+      "action": "BUY",
+      "verdict": "REVISE",
+      "conviction": 0.0764,
+      "routable": false,
+      "costUsd": 0,
+      "latencyMs": 0
+    },
+    {
+      "asOf": 1767636000000,
+      "barIndex": 114,
+      "action": "BUY",
+      "verdict": "REVISE",
+      "conviction": 0.0887,
+      "routable": false,
+      "costUsd": 0,
+      "latencyMs": 0
+    },
+    {
+      "asOf": 1767650400000,
+      "barIndex": 118,
+      "action": "BUY",
+      "verdict": "REVISE",
+      "conviction": 0.124,
+      "routable": false,
+      "costUsd": 0,
+      "latencyMs": 0
+    },
+    {
+      "asOf": 1767664800000,
+      "barIndex": 122,
+      "action": "BUY",
+      "verdict": "REVISE",
+      "conviction": 0.2291,
+      "routable": false,
+      "costUsd": 0,
+      "latencyMs": 0
+    },
+    {
+      "asOf": 1767679200000,
+      "barIndex": 126,
+      "action": "BUY",
+      "verdict": "REVISE",
+      "conviction": 0.289,
+      "routable": false,
+      "costUsd": 0,
+      "latencyMs": 0
+    },
+    {
+      "asOf": 1767693600000,
+      "barIndex": 130,
+      "action": "BUY",
+      "verdict": "REVISE",
+      "conviction": 0.2686,
+      "routable": false,
+      "costUsd": 0,
+      "latencyMs": 0
+    },
+    {
+      "asOf": 1767708000000,
+      "barIndex": 134,
+      "action": "BUY",
+      "verdict": "REVISE",
+      "conviction": 0.2268,
+      "routable": false,
+      "costUsd": 0,
+      "latencyMs": 0
+    },
+    {
+      "asOf": 1767722400000,
+      "barIndex": 138,
+      "action": "BUY",
+      "verdict": "REVISE",
+      "conviction": 0.2413,
+      "routable": false,
+      "costUsd": 0,
+      "latencyMs": 0
+    },
+    {
+      "asOf": 1767736800000,
+      "barIndex": 142,
+      "action": "BUY",
+      "verdict": "REVISE",
+      "conviction": 0.28,
+      "routable": false,
+      "costUsd": 0,
+      "latencyMs": 0
+    },
+    {
+      "asOf": 1767751200000,
+      "barIndex": 146,
+      "action": "BUY",
+      "verdict": "REVISE",
+      "conviction": 0.2559,
+      "routable": false,
+      "costUsd": 0,
+      "latencyMs": 0
+    },
+    {
+      "asOf": 1767765600000,
+      "barIndex": 150,
+      "action": "BUY",
+      "verdict": "REVISE",
+      "conviction": 0.3057,
+      "routable": false,
+      "costUsd": 0,
+      "latencyMs": 0
+    },
+    {
+      "asOf": 1767780000000,
+      "barIndex": 154,
+      "action": "BUY",
+      "verdict": "REVISE",
+      "conviction": 0.3437,
+      "routable": false,
+      "costUsd": 0,
+      "latencyMs": 0
+    },
+    {
+      "asOf": 1767794400000,
+      "barIndex": 158,
+      "action": "BUY",
+      "verdict": "REVISE",
+      "conviction": 0.2592,
+      "routable": false,
+      "costUsd": 0,
+      "latencyMs": 0
+    },
+    {
+      "asOf": 1767808800000,
+      "barIndex": 162,
+      "action": "BUY",
+      "verdict": "REVISE",
+      "conviction": 0.2316,
+      "routable": false,
+      "costUsd": 0,
+      "latencyMs": 0
+    },
+    {
+      "asOf": 1767823200000,
+      "barIndex": 166,
+      "action": "BUY",
+      "verdict": "REVISE",
+      "conviction": 0.2755,
+      "routable": false,
+      "costUsd": 0,
+      "latencyMs": 0
+    },
+    {
+      "asOf": 1767837600000,
+      "barIndex": 170,
+      "action": "BUY",
+      "verdict": "REVISE",
+      "conviction": 0.2605,
+      "routable": false,
+      "costUsd": 0,
+      "latencyMs": 0
+    },
+    {
+      "asOf": 1767909600000,
+      "barIndex": 190,
+      "action": "SELL",
+      "verdict": "REVISE",
+      "conviction": 0.0671,
+      "routable": false,
+      "costUsd": 0,
+      "latencyMs": 0
+    },
+    {
+      "asOf": 1767924000000,
+      "barIndex": 194,
+      "action": "BUY",
+      "verdict": "REVISE",
+      "conviction": 0.068,
+      "routable": false,
+      "costUsd": 0,
+      "latencyMs": 0
+    },
+    {
+      "asOf": 1767996000000,
+      "barIndex": 214,
+      "action": "SELL",
+      "verdict": "REVISE",
+      "conviction": 0.0657,
+      "routable": false,
+      "costUsd": 0,
+      "latencyMs": 0
+    },
+    {
+      "asOf": 1768039200000,
+      "barIndex": 226,
+      "action": "BUY",
+      "verdict": "REVISE",
+      "conviction": 0.066,
+      "routable": false,
+      "costUsd": 0,
+      "latencyMs": 0
+    },
+    {
+      "asOf": 1768053600000,
+      "barIndex": 230,
+      "action": "SELL",
+      "verdict": "REVISE",
+      "conviction": 0.0677,
+      "routable": false,
+      "costUsd": 0,
+      "latencyMs": 0
+    },
+    {
+      "asOf": 1768197600000,
+      "barIndex": 270,
+      "action": "SELL",
+      "verdict": "REVISE",
+      "conviction": 0.0747,
+      "routable": false,
+      "costUsd": 0,
+      "latencyMs": 0
+    },
+    {
+      "asOf": 1768212000000,
+      "barIndex": 274,
+      "action": "BUY",
+      "verdict": "REVISE",
+      "conviction": 0.0797,
+      "routable": false,
+      "costUsd": 0,
+      "latencyMs": 0
+    },
+    {
+      "asOf": 1768226400000,
+      "barIndex": 278,
+      "action": "SELL",
+      "verdict": "REVISE",
+      "conviction": 0.0743,
+      "routable": false,
+      "costUsd": 0,
+      "latencyMs": 0
+    },
+    {
+      "asOf": 1768240800000,
+      "barIndex": 282,
+      "action": "BUY",
+      "verdict": "REVISE",
+      "conviction": 0.0784,
+      "routable": false,
+      "costUsd": 0,
+      "latencyMs": 0
+    },
+    {
+      "asOf": 1768284000000,
+      "barIndex": 294,
+      "action": "SELL",
+      "verdict": "REVISE",
+      "conviction": 0.0745,
+      "routable": false,
+      "costUsd": 0,
+      "latencyMs": 0
+    },
+    {
+      "asOf": 1768327200000,
+      "barIndex": 306,
+      "action": "BUY",
+      "verdict": "REVISE",
+      "conviction": 0.0777,
+      "routable": false,
+      "costUsd": 0,
+      "latencyMs": 0
+    },
+    {
+      "asOf": 1768370400000,
+      "barIndex": 318,
+      "action": "SELL",
+      "verdict": "REVISE",
+      "conviction": 0.0694,
+      "routable": false,
+      "costUsd": 0,
+      "latencyMs": 0
+    },
+    {
+      "asOf": 1768413600000,
+      "barIndex": 330,
+      "action": "BUY",
+      "verdict": "REVISE",
+      "conviction": 0.0881,
+      "routable": false,
+      "costUsd": 0,
+      "latencyMs": 0
+    },
+    {
+      "asOf": 1768442400000,
+      "barIndex": 338,
+      "action": "SELL",
+      "verdict": "REVISE",
+      "conviction": 0.162,
+      "routable": false,
+      "costUsd": 0,
+      "latencyMs": 0
+    },
+    {
+      "asOf": 1768456800000,
+      "barIndex": 342,
+      "action": "SELL",
+      "verdict": "REVISE",
+      "conviction": 0.2398,
+      "routable": false,
+      "costUsd": 0,
+      "latencyMs": 0
+    },
+    {
+      "asOf": 1768471200000,
+      "barIndex": 346,
+      "action": "SELL",
+      "verdict": "REVISE",
+      "conviction": 0.2436,
+      "routable": false,
+      "costUsd": 0,
+      "latencyMs": 0
+    },
+    {
+      "asOf": 1768485600000,
+      "barIndex": 350,
+      "action": "SELL",
+      "verdict": "REVISE",
+      "conviction": 0.246,
+      "routable": false,
+      "costUsd": 0,
+      "latencyMs": 0
+    },
+    {
+      "asOf": 1768500000000,
+      "barIndex": 354,
+      "action": "SELL",
+      "verdict": "REVISE",
+      "conviction": 0.2857,
+      "routable": false,
+      "costUsd": 0,
+      "latencyMs": 0
+    },
+    {
+      "asOf": 1768514400000,
+      "barIndex": 358,
+      "action": "SELL",
+      "verdict": "REVISE",
+      "conviction": 0.2355,
+      "routable": false,
+      "costUsd": 0,
+      "latencyMs": 0
+    },
+    {
+      "asOf": 1768528800000,
+      "barIndex": 362,
+      "action": "SELL",
+      "verdict": "REVISE",
+      "conviction": 0.2285,
+      "routable": false,
+      "costUsd": 0,
+      "latencyMs": 0
+    },
+    {
+      "asOf": 1768543200000,
+      "barIndex": 366,
+      "action": "SELL",
+      "verdict": "REVISE",
+      "conviction": 0.2655,
+      "routable": false,
+      "costUsd": 0,
+      "latencyMs": 0
+    },
+    {
+      "asOf": 1768557600000,
+      "barIndex": 370,
+      "action": "SELL",
+      "verdict": "REVISE",
+      "conviction": 0.2731,
+      "routable": false,
+      "costUsd": 0,
+      "latencyMs": 0
+    },
+    {
+      "asOf": 1768572000000,
+      "barIndex": 374,
+      "action": "SELL",
+      "verdict": "REVISE",
+      "conviction": 0.2639,
+      "routable": false,
+      "costUsd": 0,
+      "latencyMs": 0
+    },
+    {
+      "asOf": 1768586400000,
+      "barIndex": 378,
+      "action": "SELL",
+      "verdict": "REVISE",
+      "conviction": 0.2045,
+      "routable": false,
+      "costUsd": 0,
+      "latencyMs": 0
+    },
+    {
+      "asOf": 1768600800000,
+      "barIndex": 382,
+      "action": "SELL",
+      "verdict": "REVISE",
+      "conviction": 0.1479,
+      "routable": false,
+      "costUsd": 0,
+      "latencyMs": 0
+    },
+    {
+      "asOf": 1768615200000,
+      "barIndex": 386,
+      "action": "SELL",
+      "verdict": "REVISE",
+      "conviction": 0.1427,
+      "routable": false,
+      "costUsd": 0,
+      "latencyMs": 0
+    },
+    {
+      "asOf": 1768629600000,
+      "barIndex": 390,
+      "action": "SELL",
+      "verdict": "REVISE",
+      "conviction": 0.2214,
+      "routable": false,
+      "costUsd": 0,
+      "latencyMs": 0
+    },
+    {
+      "asOf": 1768644000000,
+      "barIndex": 394,
+      "action": "SELL",
+      "verdict": "REVISE",
+      "conviction": 0.2625,
+      "routable": false,
+      "costUsd": 0,
+      "latencyMs": 0
+    },
+    {
+      "asOf": 1768658400000,
+      "barIndex": 398,
+      "action": "SELL",
+      "verdict": "REVISE",
+      "conviction": 0.1908,
+      "routable": false,
+      "costUsd": 0,
+      "latencyMs": 0
+    },
+    {
+      "asOf": 1768672800000,
+      "barIndex": 402,
+      "action": "SELL",
+      "verdict": "REVISE",
+      "conviction": 0.2247,
+      "routable": false,
+      "costUsd": 0,
+      "latencyMs": 0
+    },
+    {
+      "asOf": 1768687200000,
+      "barIndex": 406,
+      "action": "SELL",
+      "verdict": "REVISE",
+      "conviction": 0.2368,
+      "routable": false,
+      "costUsd": 0,
+      "latencyMs": 0
+    },
+    {
+      "asOf": 1768701600000,
+      "barIndex": 410,
+      "action": "SELL",
+      "verdict": "REVISE",
+      "conviction": 0.1688,
+      "routable": false,
+      "costUsd": 0,
+      "latencyMs": 0
+    },
+    {
+      "asOf": 1768716000000,
+      "barIndex": 414,
+      "action": "SELL",
+      "verdict": "REVISE",
+      "conviction": 0.1976,
+      "routable": false,
+      "costUsd": 0,
+      "latencyMs": 0
+    },
+    {
+      "asOf": 1768730400000,
+      "barIndex": 418,
+      "action": "SELL",
+      "verdict": "REVISE",
+      "conviction": 0.267,
+      "routable": false,
+      "costUsd": 0,
+      "latencyMs": 0
+    },
+    {
+      "asOf": 1768744800000,
+      "barIndex": 422,
+      "action": "SELL",
+      "verdict": "REVISE",
+      "conviction": 0.2441,
+      "routable": false,
+      "costUsd": 0,
+      "latencyMs": 0
+    },
+    {
+      "asOf": 1768759200000,
+      "barIndex": 426,
+      "action": "SELL",
+      "verdict": "REVISE",
+      "conviction": 0.2425,
+      "routable": false,
+      "costUsd": 0,
+      "latencyMs": 0
+    },
+    {
+      "asOf": 1768773600000,
+      "barIndex": 430,
+      "action": "SELL",
+      "verdict": "REVISE",
+      "conviction": 0.2225,
+      "routable": false,
+      "costUsd": 0,
+      "latencyMs": 0
+    },
+    {
+      "asOf": 1768788000000,
+      "barIndex": 434,
+      "action": "SELL",
+      "verdict": "REVISE",
+      "conviction": 0.2214,
+      "routable": false,
+      "costUsd": 0,
+      "latencyMs": 0
+    },
+    {
+      "asOf": 1768802400000,
+      "barIndex": 438,
+      "action": "SELL",
+      "verdict": "REVISE",
+      "conviction": 0.2084,
+      "routable": false,
+      "costUsd": 0,
+      "latencyMs": 0
+    },
+    {
+      "asOf": 1768816800000,
+      "barIndex": 442,
+      "action": "SELL",
+      "verdict": "REVISE",
+      "conviction": 0.2044,
+      "routable": false,
+      "costUsd": 0,
+      "latencyMs": 0
+    },
+    {
+      "asOf": 1768831200000,
+      "barIndex": 446,
+      "action": "SELL",
+      "verdict": "REVISE",
+      "conviction": 0.166,
+      "routable": false,
+      "costUsd": 0,
+      "latencyMs": 0
+    },
+    {
+      "asOf": 1768845600000,
+      "barIndex": 450,
+      "action": "SELL",
+      "verdict": "REVISE",
+      "conviction": 0.1841,
+      "routable": false,
+      "costUsd": 0,
+      "latencyMs": 0
+    },
+    {
+      "asOf": 1768860000000,
+      "barIndex": 454,
+      "action": "SELL",
+      "verdict": "REVISE",
+      "conviction": 0.2356,
+      "routable": false,
+      "costUsd": 0,
+      "latencyMs": 0
+    },
+    {
+      "asOf": 1768874400000,
+      "barIndex": 458,
+      "action": "SELL",
+      "verdict": "REVISE",
+      "conviction": 0.2066,
+      "routable": false,
+      "costUsd": 0,
+      "latencyMs": 0
+    },
+    {
+      "asOf": 1768888800000,
+      "barIndex": 462,
+      "action": "SELL",
+      "verdict": "REVISE",
+      "conviction": 0.1501,
+      "routable": false,
+      "costUsd": 0,
+      "latencyMs": 0
+    },
+    {
+      "asOf": 1768903200000,
+      "barIndex": 466,
+      "action": "SELL",
+      "verdict": "REVISE",
+      "conviction": 0.1207,
+      "routable": false,
+      "costUsd": 0,
+      "latencyMs": 0
+    },
+    {
+      "asOf": 1768917600000,
+      "barIndex": 470,
+      "action": "SELL",
+      "verdict": "REVISE",
+      "conviction": 0.1224,
+      "routable": false,
+      "costUsd": 0,
+      "latencyMs": 0
+    },
+    {
+      "asOf": 1768932000000,
+      "barIndex": 474,
+      "action": "SELL",
+      "verdict": "REVISE",
+      "conviction": 0.1616,
+      "routable": false,
+      "costUsd": 0,
+      "latencyMs": 0
+    },
+    {
+      "asOf": 1768946400000,
+      "barIndex": 478,
+      "action": "SELL",
+      "verdict": "REVISE",
+      "conviction": 0.1484,
+      "routable": false,
+      "costUsd": 0,
+      "latencyMs": 0
+    },
+    {
+      "asOf": 1768960800000,
+      "barIndex": 482,
+      "action": "SELL",
+      "verdict": "REVISE",
+      "conviction": 0.1197,
+      "routable": false,
+      "costUsd": 0,
+      "latencyMs": 0
+    },
+    {
+      "asOf": 1768975200000,
+      "barIndex": 486,
+      "action": "SELL",
+      "verdict": "REVISE",
+      "conviction": 0.1058,
+      "routable": false,
+      "costUsd": 0,
+      "latencyMs": 0
+    },
+    {
+      "asOf": 1768989600000,
+      "barIndex": 490,
+      "action": "SELL",
+      "verdict": "REVISE",
+      "conviction": 0.1238,
+      "routable": false,
+      "costUsd": 0,
+      "latencyMs": 0
+    },
+    {
+      "asOf": 1769004000000,
+      "barIndex": 494,
+      "action": "SELL",
+      "verdict": "REVISE",
+      "conviction": 0.1984,
+      "routable": false,
+      "costUsd": 0,
+      "latencyMs": 0
+    },
+    {
+      "asOf": 1769018400000,
+      "barIndex": 498,
+      "action": "SELL",
+      "verdict": "REVISE",
+      "conviction": 0.2882,
+      "routable": false,
+      "costUsd": 0,
+      "latencyMs": 0
+    },
+    {
+      "asOf": 1769032800000,
+      "barIndex": 502,
+      "action": "SELL",
+      "verdict": "REVISE",
+      "conviction": 0.2738,
+      "routable": false,
+      "costUsd": 0,
+      "latencyMs": 0
+    },
+    {
+      "asOf": 1769047200000,
+      "barIndex": 506,
+      "action": "SELL",
+      "verdict": "REVISE",
+      "conviction": 0.0823,
+      "routable": false,
+      "costUsd": 0,
+      "latencyMs": 0
+    },
+    {
+      "asOf": 1769061600000,
+      "barIndex": 510,
+      "action": "SELL",
+      "verdict": "REVISE",
+      "conviction": 0.1041,
+      "routable": false,
+      "costUsd": 0,
+      "latencyMs": 0
+    },
+    {
+      "asOf": 1769090400000,
+      "barIndex": 518,
+      "action": "SELL",
+      "verdict": "REVISE",
+      "conviction": 0.0827,
+      "routable": false,
+      "costUsd": 0,
+      "latencyMs": 0
+    },
+    {
+      "asOf": 1769119200000,
+      "barIndex": 526,
+      "action": "SELL",
+      "verdict": "REVISE",
+      "conviction": 0.0719,
+      "routable": false,
+      "costUsd": 0,
+      "latencyMs": 0
+    },
+    {
+      "asOf": 1769162400000,
+      "barIndex": 538,
+      "action": "BUY",
+      "verdict": "REVISE",
+      "conviction": 0.0785,
+      "routable": false,
+      "costUsd": 0,
+      "latencyMs": 0
+    },
+    {
+      "asOf": 1769176800000,
+      "barIndex": 542,
+      "action": "SELL",
+      "verdict": "REVISE",
+      "conviction": 0.0775,
+      "routable": false,
+      "costUsd": 0,
+      "latencyMs": 0
+    },
+    {
+      "asOf": 1769205600000,
+      "barIndex": 550,
+      "action": "SELL",
+      "verdict": "REVISE",
+      "conviction": 0.075,
+      "routable": false,
+      "costUsd": 0,
+      "latencyMs": 0
+    },
+    {
+      "asOf": 1769292000000,
+      "barIndex": 574,
+      "action": "SELL",
+      "verdict": "REVISE",
+      "conviction": 0.0879,
+      "routable": false,
+      "costUsd": 0,
+      "latencyMs": 0
+    },
+    {
+      "asOf": 1769306400000,
+      "barIndex": 578,
+      "action": "BUY",
+      "verdict": "REVISE",
+      "conviction": 0.0692,
+      "routable": false,
+      "costUsd": 0,
+      "latencyMs": 0
+    },
+    {
+      "asOf": 1769392800000,
+      "barIndex": 602,
+      "action": "BUY",
+      "verdict": "REVISE",
+      "conviction": 0.0745,
+      "routable": false,
+      "costUsd": 0,
+      "latencyMs": 0
+    },
+    {
+      "asOf": 1769464800000,
+      "barIndex": 622,
+      "action": "SELL",
+      "verdict": "REVISE",
+      "conviction": 0.0683,
+      "routable": false,
+      "costUsd": 0,
+      "latencyMs": 0
+    },
+    {
+      "asOf": 1769493600000,
+      "barIndex": 630,
+      "action": "SELL",
+      "verdict": "REVISE",
+      "conviction": 0.0657,
+      "routable": false,
+      "costUsd": 0,
+      "latencyMs": 0
+    },
+    {
+      "asOf": 1769536800000,
+      "barIndex": 642,
+      "action": "BUY",
+      "verdict": "REVISE",
+      "conviction": 0.0673,
+      "routable": false,
+      "costUsd": 0,
+      "latencyMs": 0
+    },
+    {
+      "asOf": 1769580000000,
+      "barIndex": 654,
+      "action": "SELL",
+      "verdict": "REVISE",
+      "conviction": 0.0653,
+      "routable": false,
+      "costUsd": 0,
+      "latencyMs": 0
+    },
+    {
+      "asOf": 1769594400000,
+      "barIndex": 658,
+      "action": "BUY",
+      "verdict": "REVISE",
+      "conviction": 0.0723,
+      "routable": false,
+      "costUsd": 0,
+      "latencyMs": 0
+    },
+    {
+      "asOf": 1769680800000,
+      "barIndex": 682,
+      "action": "BUY",
+      "verdict": "REVISE",
+      "conviction": 0.2064,
+      "routable": false,
+      "costUsd": 0,
+      "latencyMs": 0
+    },
+    {
+      "asOf": 1769695200000,
+      "barIndex": 686,
+      "action": "BUY",
+      "verdict": "REVISE",
+      "conviction": 0.2857,
+      "routable": false,
+      "costUsd": 0,
+      "latencyMs": 0
+    },
+    {
+      "asOf": 1769709600000,
+      "barIndex": 690,
+      "action": "BUY",
+      "verdict": "REVISE",
+      "conviction": 0.1695,
+      "routable": false,
+      "costUsd": 0,
+      "latencyMs": 0
+    },
+    {
+      "asOf": 1769724000000,
+      "barIndex": 694,
+      "action": "BUY",
+      "verdict": "REVISE",
+      "conviction": 0.1671,
+      "routable": false,
+      "costUsd": 0,
+      "latencyMs": 0
+    },
+    {
+      "asOf": 1769738400000,
+      "barIndex": 698,
+      "action": "BUY",
+      "verdict": "REVISE",
+      "conviction": 0.204,
+      "routable": false,
+      "costUsd": 0,
+      "latencyMs": 0
+    },
+    {
+      "asOf": 1769752800000,
+      "barIndex": 702,
+      "action": "BUY",
+      "verdict": "REVISE",
+      "conviction": 0.3579,
+      "routable": false,
+      "costUsd": 0,
+      "latencyMs": 0
+    },
+    {
+      "asOf": 1769767200000,
+      "barIndex": 706,
+      "action": "BUY",
+      "verdict": "REVISE",
+      "conviction": 0.2348,
+      "routable": false,
+      "costUsd": 0,
+      "latencyMs": 0
+    },
+    {
+      "asOf": 1769781600000,
+      "barIndex": 710,
+      "action": "BUY",
+      "verdict": "REVISE",
+      "conviction": 0.2014,
+      "routable": false,
+      "costUsd": 0,
+      "latencyMs": 0
+    },
+    {
+      "asOf": 1769796000000,
+      "barIndex": 714,
+      "action": "BUY",
+      "verdict": "REVISE",
+      "conviction": 0.1218,
+      "routable": false,
+      "costUsd": 0,
+      "latencyMs": 0
+    },
+    {
+      "asOf": 1769810400000,
+      "barIndex": 718,
+      "action": "BUY",
+      "verdict": "REVISE",
+      "conviction": 0.153,
+      "routable": false,
+      "costUsd": 0,
+      "latencyMs": 0
+    },
+    {
+      "asOf": 1769824800000,
+      "barIndex": 722,
+      "action": "BUY",
+      "verdict": "REVISE",
+      "conviction": 0.2466,
+      "routable": false,
+      "costUsd": 0,
+      "latencyMs": 0
+    },
+    {
+      "asOf": 1769839200000,
+      "barIndex": 726,
+      "action": "BUY",
+      "verdict": "REVISE",
+      "conviction": 0.2314,
+      "routable": false,
+      "costUsd": 0,
+      "latencyMs": 0
+    },
+    {
+      "asOf": 1769853600000,
+      "barIndex": 730,
+      "action": "BUY",
+      "verdict": "REVISE",
+      "conviction": 0.1926,
+      "routable": false,
+      "costUsd": 0,
+      "latencyMs": 0
+    },
+    {
+      "asOf": 1769868000000,
+      "barIndex": 734,
+      "action": "BUY",
+      "verdict": "REVISE",
+      "conviction": 0.1516,
+      "routable": false,
+      "costUsd": 0,
+      "latencyMs": 0
+    },
+    {
+      "asOf": 1769882400000,
+      "barIndex": 738,
+      "action": "BUY",
+      "verdict": "REVISE",
+      "conviction": 0.1861,
+      "routable": false,
+      "costUsd": 0,
+      "latencyMs": 0
+    },
+    {
+      "asOf": 1769896800000,
+      "barIndex": 742,
+      "action": "BUY",
+      "verdict": "REVISE",
+      "conviction": 0.2096,
+      "routable": false,
+      "costUsd": 0,
+      "latencyMs": 0
+    },
+    {
+      "asOf": 1769911200000,
+      "barIndex": 746,
+      "action": "BUY",
+      "verdict": "REVISE",
+      "conviction": 0.1293,
+      "routable": false,
+      "costUsd": 0,
+      "latencyMs": 0
+    },
+    {
+      "asOf": 1769925600000,
+      "barIndex": 750,
+      "action": "BUY",
+      "verdict": "REVISE",
+      "conviction": 0.1763,
+      "routable": false,
+      "costUsd": 0,
+      "latencyMs": 0
+    },
+    {
+      "asOf": 1769940000000,
+      "barIndex": 754,
+      "action": "BUY",
+      "verdict": "REVISE",
+      "conviction": 0.1867,
+      "routable": false,
+      "costUsd": 0,
+      "latencyMs": 0
+    },
+    {
+      "asOf": 1769954400000,
+      "barIndex": 758,
+      "action": "BUY",
+      "verdict": "REVISE",
+      "conviction": 0.1897,
+      "routable": false,
+      "costUsd": 0,
+      "latencyMs": 0
+    },
+    {
+      "asOf": 1769968800000,
+      "barIndex": 762,
+      "action": "BUY",
+      "verdict": "REVISE",
+      "conviction": 0.231,
+      "routable": false,
+      "costUsd": 0,
+      "latencyMs": 0
+    },
+    {
+      "asOf": 1769983200000,
+      "barIndex": 766,
+      "action": "BUY",
+      "verdict": "REVISE",
+      "conviction": 0.3161,
+      "routable": false,
+      "costUsd": 0,
+      "latencyMs": 0
+    },
+    {
+      "asOf": 1769997600000,
+      "barIndex": 770,
+      "action": "BUY",
+      "verdict": "REVISE",
+      "conviction": 0.1889,
+      "routable": false,
+      "costUsd": 0,
+      "latencyMs": 0
+    },
+    {
+      "asOf": 1770012000000,
+      "barIndex": 774,
+      "action": "BUY",
+      "verdict": "REVISE",
+      "conviction": 0.1978,
+      "routable": false,
+      "costUsd": 0,
+      "latencyMs": 0
+    },
+    {
+      "asOf": 1770026400000,
+      "barIndex": 778,
+      "action": "BUY",
+      "verdict": "REVISE",
+      "conviction": 0.1657,
+      "routable": false,
+      "costUsd": 0,
+      "latencyMs": 0
+    },
+    {
+      "asOf": 1770040800000,
+      "barIndex": 782,
+      "action": "BUY",
+      "verdict": "REVISE",
+      "conviction": 0.0844,
+      "routable": false,
+      "costUsd": 0,
+      "latencyMs": 0
+    },
+    {
+      "asOf": 1770055200000,
+      "barIndex": 786,
+      "action": "BUY",
+      "verdict": "REVISE",
+      "conviction": 0.1613,
+      "routable": false,
+      "costUsd": 0,
+      "latencyMs": 0
+    },
+    {
+      "asOf": 1770069600000,
+      "barIndex": 790,
+      "action": "BUY",
+      "verdict": "REVISE",
+      "conviction": 0.2754,
+      "routable": false,
+      "costUsd": 0,
+      "latencyMs": 0
+    },
+    {
+      "asOf": 1770084000000,
+      "barIndex": 794,
+      "action": "BUY",
+      "verdict": "REVISE",
+      "conviction": 0.294,
+      "routable": false,
+      "costUsd": 0,
+      "latencyMs": 0
+    },
+    {
+      "asOf": 1770098400000,
+      "barIndex": 798,
+      "action": "BUY",
+      "verdict": "REVISE",
+      "conviction": 0.1758,
+      "routable": false,
+      "costUsd": 0,
+      "latencyMs": 1
+    },
+    {
+      "asOf": 1770112800000,
+      "barIndex": 802,
+      "action": "BUY",
+      "verdict": "REVISE",
+      "conviction": 0.1402,
+      "routable": false,
+      "costUsd": 0,
+      "latencyMs": 0
+    },
+    {
+      "asOf": 1770127200000,
+      "barIndex": 806,
+      "action": "BUY",
+      "verdict": "REVISE",
+      "conviction": 0.1565,
+      "routable": false,
+      "costUsd": 0,
+      "latencyMs": 0
+    },
+    {
+      "asOf": 1770141600000,
+      "barIndex": 810,
+      "action": "BUY",
+      "verdict": "REVISE",
+      "conviction": 0.2309,
+      "routable": false,
+      "costUsd": 0,
+      "latencyMs": 0
+    },
+    {
+      "asOf": 1770156000000,
+      "barIndex": 814,
+      "action": "BUY",
+      "verdict": "REVISE",
+      "conviction": 0.1655,
+      "routable": false,
+      "costUsd": 0,
+      "latencyMs": 0
+    },
+    {
+      "asOf": 1770170400000,
+      "barIndex": 818,
+      "action": "BUY",
+      "verdict": "REVISE",
+      "conviction": 0.2014,
+      "routable": false,
+      "costUsd": 0,
+      "latencyMs": 0
+    },
+    {
+      "asOf": 1770184800000,
+      "barIndex": 822,
+      "action": "BUY",
+      "verdict": "REVISE",
+      "conviction": 0.2218,
+      "routable": false,
+      "costUsd": 0,
+      "latencyMs": 0
+    },
+    {
+      "asOf": 1770199200000,
+      "barIndex": 826,
+      "action": "BUY",
+      "verdict": "REVISE",
+      "conviction": 0.2588,
+      "routable": false,
+      "costUsd": 0,
+      "latencyMs": 0
+    },
+    {
+      "asOf": 1770213600000,
+      "barIndex": 830,
+      "action": "BUY",
+      "verdict": "REVISE",
+      "conviction": 0.2136,
+      "routable": false,
+      "costUsd": 0,
+      "latencyMs": 0
+    },
+    {
+      "asOf": 1770228000000,
+      "barIndex": 834,
+      "action": "BUY",
+      "verdict": "REVISE",
+      "conviction": 0.2495,
+      "routable": false,
+      "costUsd": 0,
+      "latencyMs": 0
+    },
+    {
+      "asOf": 1770242400000,
+      "barIndex": 838,
+      "action": "BUY",
+      "verdict": "REVISE",
+      "conviction": 0.3353,
+      "routable": false,
+      "costUsd": 0,
+      "latencyMs": 0
+    },
+    {
+      "asOf": 1770256800000,
+      "barIndex": 842,
+      "action": "BUY",
+      "verdict": "REVISE",
+      "conviction": 0.3676,
+      "routable": false,
+      "costUsd": 0,
+      "latencyMs": 0
+    },
+    {
+      "asOf": 1770271200000,
+      "barIndex": 846,
+      "action": "BUY",
+      "verdict": "REVISE",
+      "conviction": 0.0902,
+      "routable": false,
+      "costUsd": 0,
+      "latencyMs": 0
+    },
+    {
+      "asOf": 1770300000000,
+      "barIndex": 854,
+      "action": "SELL",
+      "verdict": "REVISE",
+      "conviction": 0.0781,
+      "routable": false,
+      "costUsd": 0,
+      "latencyMs": 0
+    },
+    {
+      "asOf": 1770314400000,
+      "barIndex": 858,
+      "action": "BUY",
+      "verdict": "REVISE",
+      "conviction": 0.0787,
+      "routable": false,
+      "costUsd": 0,
+      "latencyMs": 0
+    },
+    {
+      "asOf": 1770328800000,
+      "barIndex": 862,
+      "action": "SELL",
+      "verdict": "REVISE",
+      "conviction": 0.0728,
+      "routable": false,
+      "costUsd": 0,
+      "latencyMs": 0
+    },
+    {
+      "asOf": 1770372000000,
+      "barIndex": 874,
+      "action": "BUY",
+      "verdict": "REVISE",
+      "conviction": 0.0682,
+      "routable": false,
+      "costUsd": 0,
+      "latencyMs": 0
+    },
+    {
+      "asOf": 1770386400000,
+      "barIndex": 878,
+      "action": "SELL",
+      "verdict": "REVISE",
+      "conviction": 0.0849,
+      "routable": false,
+      "costUsd": 0,
+      "latencyMs": 0
+    },
+    {
+      "asOf": 1770415200000,
+      "barIndex": 886,
+      "action": "SELL",
+      "verdict": "REVISE",
+      "conviction": 0.0843,
+      "routable": false,
+      "costUsd": 0,
+      "latencyMs": 0
+    },
+    {
+      "asOf": 1770458400000,
+      "barIndex": 898,
+      "action": "BUY",
+      "verdict": "REVISE",
+      "conviction": 0.0725,
+      "routable": false,
+      "costUsd": 0,
+      "latencyMs": 0
+    },
+    {
+      "asOf": 1770516000000,
+      "barIndex": 914,
+      "action": "BUY",
+      "verdict": "REVISE",
+      "conviction": 0.0702,
+      "routable": false,
+      "costUsd": 0,
+      "latencyMs": 0
+    },
+    {
+      "asOf": 1770544800000,
+      "barIndex": 922,
+      "action": "BUY",
+      "verdict": "REVISE",
+      "conviction": 0.0716,
+      "routable": false,
+      "costUsd": 0,
+      "latencyMs": 0
+    },
+    {
+      "asOf": 1770631200000,
+      "barIndex": 946,
+      "action": "BUY",
+      "verdict": "REVISE",
+      "conviction": 0.0696,
+      "routable": false,
+      "costUsd": 0,
+      "latencyMs": 0
+    },
+    {
+      "asOf": 1770717600000,
+      "barIndex": 970,
+      "action": "BUY",
+      "verdict": "REVISE",
+      "conviction": 0.0653,
+      "routable": false,
+      "costUsd": 0,
+      "latencyMs": 1
+    },
+    {
+      "asOf": 1770732000000,
+      "barIndex": 974,
+      "action": "SELL",
+      "verdict": "REVISE",
+      "conviction": 0.0666,
+      "routable": false,
+      "costUsd": 0,
+      "latencyMs": 0
+    },
+    {
+      "asOf": 1770760800000,
+      "barIndex": 982,
+      "action": "SELL",
+      "verdict": "REVISE",
+      "conviction": 0.0656,
+      "routable": false,
+      "costUsd": 0,
+      "latencyMs": 0
+    },
+    {
+      "asOf": 1770789600000,
+      "barIndex": 990,
+      "action": "SELL",
+      "verdict": "REVISE",
+      "conviction": 0.0886,
+      "routable": false,
+      "costUsd": 0,
+      "latencyMs": 0
+    },
+    {
+      "asOf": 1770804000000,
+      "barIndex": 994,
+      "action": "BUY",
+      "verdict": "REVISE",
+      "conviction": 0.0904,
+      "routable": false,
+      "costUsd": 0,
+      "latencyMs": 0
+    },
+    {
+      "asOf": 1770818400000,
+      "barIndex": 998,
+      "action": "SELL",
+      "verdict": "REVISE",
+      "conviction": 0.0659,
+      "routable": false,
+      "costUsd": 0,
+      "latencyMs": 0
+    },
+    {
+      "asOf": 1770832800000,
+      "barIndex": 1002,
+      "action": "BUY",
+      "verdict": "REVISE",
+      "conviction": 0.0673,
+      "routable": false,
+      "costUsd": 0,
+      "latencyMs": 0
+    },
+    {
+      "asOf": 1770847200000,
+      "barIndex": 1006,
+      "action": "SELL",
+      "verdict": "REVISE",
+      "conviction": 0.0891,
+      "routable": false,
+      "costUsd": 0,
+      "latencyMs": 0
+    },
+    {
+      "asOf": 1770876000000,
+      "barIndex": 1014,
+      "action": "SELL",
+      "verdict": "REVISE",
+      "conviction": 0.1353,
+      "routable": false,
+      "costUsd": 0,
+      "latencyMs": 0
+    },
+    {
+      "asOf": 1770890400000,
+      "barIndex": 1018,
+      "action": "SELL",
+      "verdict": "REVISE",
+      "conviction": 0.1576,
+      "routable": false,
+      "costUsd": 0,
+      "latencyMs": 0
+    },
+    {
+      "asOf": 1770904800000,
+      "barIndex": 1022,
+      "action": "SELL",
+      "verdict": "REVISE",
+      "conviction": 0.1608,
+      "routable": false,
+      "costUsd": 0,
+      "latencyMs": 0
+    },
+    {
+      "asOf": 1770919200000,
+      "barIndex": 1026,
+      "action": "SELL",
+      "verdict": "REVISE",
+      "conviction": 0.24,
+      "routable": false,
+      "costUsd": 0,
+      "latencyMs": 0
+    },
+    {
+      "asOf": 1770933600000,
+      "barIndex": 1030,
+      "action": "SELL",
+      "verdict": "REVISE",
+      "conviction": 0.267,
+      "routable": false,
+      "costUsd": 0,
+      "latencyMs": 0
+    },
+    {
+      "asOf": 1770948000000,
+      "barIndex": 1034,
+      "action": "SELL",
+      "verdict": "REVISE",
+      "conviction": 0.278,
+      "routable": false,
+      "costUsd": 0,
+      "latencyMs": 0
+    },
+    {
+      "asOf": 1770962400000,
+      "barIndex": 1038,
+      "action": "SELL",
+      "verdict": "REVISE",
+      "conviction": 0.2365,
+      "routable": false,
+      "costUsd": 0,
+      "latencyMs": 0
+    },
+    {
+      "asOf": 1770976800000,
+      "barIndex": 1042,
+      "action": "SELL",
+      "verdict": "REVISE",
+      "conviction": 0.2012,
+      "routable": false,
+      "costUsd": 0,
+      "latencyMs": 0
+    },
+    {
+      "asOf": 1770991200000,
+      "barIndex": 1046,
+      "action": "SELL",
+      "verdict": "REVISE",
+      "conviction": 0.1753,
+      "routable": false,
+      "costUsd": 0,
+      "latencyMs": 0
+    },
+    {
+      "asOf": 1771005600000,
+      "barIndex": 1050,
+      "action": "SELL",
+      "verdict": "REVISE",
+      "conviction": 0.1769,
+      "routable": false,
+      "costUsd": 0,
+      "latencyMs": 0
+    },
+    {
+      "asOf": 1771020000000,
+      "barIndex": 1054,
+      "action": "SELL",
+      "verdict": "REVISE",
+      "conviction": 0.1689,
+      "routable": false,
+      "costUsd": 0,
+      "latencyMs": 0
+    },
+    {
+      "asOf": 1771034400000,
+      "barIndex": 1058,
+      "action": "SELL",
+      "verdict": "REVISE",
+      "conviction": 0.228,
+      "routable": false,
+      "costUsd": 0,
+      "latencyMs": 0
+    },
+    {
+      "asOf": 1771048800000,
+      "barIndex": 1062,
+      "action": "SELL",
+      "verdict": "REVISE",
+      "conviction": 0.1665,
+      "routable": false,
+      "costUsd": 0,
+      "latencyMs": 0
+    },
+    {
+      "asOf": 1771063200000,
+      "barIndex": 1066,
+      "action": "SELL",
+      "verdict": "REVISE",
+      "conviction": 0.2476,
+      "routable": false,
+      "costUsd": 0,
+      "latencyMs": 0
+    },
+    {
+      "asOf": 1771077600000,
+      "barIndex": 1070,
+      "action": "SELL",
+      "verdict": "REVISE",
+      "conviction": 0.2529,
+      "routable": false,
+      "costUsd": 0,
+      "latencyMs": 0
+    },
+    {
+      "asOf": 1771092000000,
+      "barIndex": 1074,
+      "action": "SELL",
+      "verdict": "REVISE",
+      "conviction": 0.1897,
+      "routable": false,
+      "costUsd": 0,
+      "latencyMs": 0
+    },
+    {
+      "asOf": 1771106400000,
+      "barIndex": 1078,
+      "action": "SELL",
+      "verdict": "REVISE",
+      "conviction": 0.1389,
+      "routable": false,
+      "costUsd": 0,
+      "latencyMs": 0
+    },
+    {
+      "asOf": 1771120800000,
+      "barIndex": 1082,
+      "action": "SELL",
+      "verdict": "REVISE",
+      "conviction": 0.2329,
+      "routable": false,
+      "costUsd": 0,
+      "latencyMs": 0
+    },
+    {
+      "asOf": 1771135200000,
+      "barIndex": 1086,
+      "action": "SELL",
+      "verdict": "REVISE",
+      "conviction": 0.2801,
+      "routable": false,
+      "costUsd": 0,
+      "latencyMs": 0
+    },
+    {
+      "asOf": 1771149600000,
+      "barIndex": 1090,
+      "action": "SELL",
+      "verdict": "REVISE",
+      "conviction": 0.2551,
+      "routable": false,
+      "costUsd": 0,
+      "latencyMs": 0
+    },
+    {
+      "asOf": 1771164000000,
+      "barIndex": 1094,
+      "action": "SELL",
+      "verdict": "REVISE",
+      "conviction": 0.1743,
+      "routable": false,
+      "costUsd": 0,
+      "latencyMs": 0
+    },
+    {
+      "asOf": 1771178400000,
+      "barIndex": 1098,
+      "action": "SELL",
+      "verdict": "REVISE",
+      "conviction": 0.1655,
+      "routable": false,
+      "costUsd": 0,
+      "latencyMs": 0
+    },
+    {
+      "asOf": 1771192800000,
+      "barIndex": 1102,
+      "action": "SELL",
+      "verdict": "REVISE",
+      "conviction": 0.1767,
+      "routable": false,
+      "costUsd": 0,
+      "latencyMs": 0
+    },
+    {
+      "asOf": 1771207200000,
+      "barIndex": 1106,
+      "action": "SELL",
+      "verdict": "REVISE",
+      "conviction": 0.0961,
+      "routable": false,
+      "costUsd": 0,
+      "latencyMs": 0
+    },
+    {
+      "asOf": 1771221600000,
+      "barIndex": 1110,
+      "action": "SELL",
+      "verdict": "REVISE",
+      "conviction": 0.0965,
+      "routable": false,
+      "costUsd": 0,
+      "latencyMs": 0
+    },
+    {
+      "asOf": 1771236000000,
+      "barIndex": 1114,
+      "action": "SELL",
+      "verdict": "REVISE",
+      "conviction": 0.137,
+      "routable": false,
+      "costUsd": 0,
+      "latencyMs": 0
+    },
+    {
+      "asOf": 1771250400000,
+      "barIndex": 1118,
+      "action": "SELL",
+      "verdict": "REVISE",
+      "conviction": 0.1906,
+      "routable": false,
+      "costUsd": 0,
+      "latencyMs": 0
+    },
+    {
+      "asOf": 1771264800000,
+      "barIndex": 1122,
+      "action": "SELL",
+      "verdict": "REVISE",
+      "conviction": 0.1673,
+      "routable": false,
+      "costUsd": 0,
+      "latencyMs": 0
+    },
+    {
+      "asOf": 1771279200000,
+      "barIndex": 1126,
+      "action": "SELL",
+      "verdict": "REVISE",
+      "conviction": 0.1602,
+      "routable": false,
+      "costUsd": 0,
+      "latencyMs": 0
+    },
+    {
+      "asOf": 1771293600000,
+      "barIndex": 1130,
+      "action": "SELL",
+      "verdict": "REVISE",
+      "conviction": 0.1861,
+      "routable": false,
+      "costUsd": 0,
+      "latencyMs": 0
+    },
+    {
+      "asOf": 1771308000000,
+      "barIndex": 1134,
+      "action": "SELL",
+      "verdict": "REVISE",
+      "conviction": 0.2145,
+      "routable": false,
+      "costUsd": 0,
+      "latencyMs": 0
+    },
+    {
+      "asOf": 1771322400000,
+      "barIndex": 1138,
+      "action": "SELL",
+      "verdict": "REVISE",
+      "conviction": 0.2218,
+      "routable": false,
+      "costUsd": 0,
+      "latencyMs": 0
+    },
+    {
+      "asOf": 1771336800000,
+      "barIndex": 1142,
+      "action": "SELL",
+      "verdict": "REVISE",
+      "conviction": 0.2894,
+      "routable": false,
+      "costUsd": 0,
+      "latencyMs": 0
+    },
+    {
+      "asOf": 1771351200000,
+      "barIndex": 1146,
+      "action": "SELL",
+      "verdict": "REVISE",
+      "conviction": 0.3236,
+      "routable": false,
+      "costUsd": 0,
+      "latencyMs": 0
+    },
+    {
+      "asOf": 1771365600000,
+      "barIndex": 1150,
+      "action": "SELL",
+      "verdict": "REVISE",
+      "conviction": 0.309,
+      "routable": false,
+      "costUsd": 0,
+      "latencyMs": 0
+    },
+    {
+      "asOf": 1771380000000,
+      "barIndex": 1154,
+      "action": "SELL",
+      "verdict": "REVISE",
+      "conviction": 0.3096,
+      "routable": false,
+      "costUsd": 0,
+      "latencyMs": 0
+    },
+    {
+      "asOf": 1771394400000,
+      "barIndex": 1158,
+      "action": "SELL",
+      "verdict": "REVISE",
+      "conviction": 0.2458,
+      "routable": false,
+      "costUsd": 0,
+      "latencyMs": 0
+    },
+    {
+      "asOf": 1771408800000,
+      "barIndex": 1162,
+      "action": "SELL",
+      "verdict": "REVISE",
+      "conviction": 0.2521,
+      "routable": false,
+      "costUsd": 0,
+      "latencyMs": 0
+    },
+    {
+      "asOf": 1771423200000,
+      "barIndex": 1166,
+      "action": "SELL",
+      "verdict": "REVISE",
+      "conviction": 0.2318,
+      "routable": false,
+      "costUsd": 0,
+      "latencyMs": 0
+    },
+    {
+      "asOf": 1771437600000,
+      "barIndex": 1170,
+      "action": "SELL",
+      "verdict": "REVISE",
+      "conviction": 0.2901,
+      "routable": false,
+      "costUsd": 0,
+      "latencyMs": 0
+    },
+    {
+      "asOf": 1771452000000,
+      "barIndex": 1174,
+      "action": "SELL",
+      "verdict": "REVISE",
+      "conviction": 0.2676,
+      "routable": false,
+      "costUsd": 0,
+      "latencyMs": 0
+    },
+    {
+      "asOf": 1771466400000,
+      "barIndex": 1178,
+      "action": "SELL",
+      "verdict": "REVISE",
+      "conviction": 0.1056,
+      "routable": false,
+      "costUsd": 0,
+      "latencyMs": 0
+    },
+    {
+      "asOf": 1771581600000,
+      "barIndex": 1210,
+      "action": "BUY",
+      "verdict": "REVISE",
+      "conviction": 0.071,
+      "routable": false,
+      "costUsd": 0,
+      "latencyMs": 0
+    },
+    {
+      "asOf": 1771610400000,
+      "barIndex": 1218,
+      "action": "BUY",
+      "verdict": "REVISE",
+      "conviction": 0.0726,
+      "routable": false,
+      "costUsd": 0,
+      "latencyMs": 0
+    },
+    {
+      "asOf": 1771624800000,
+      "barIndex": 1222,
+      "action": "SELL",
+      "verdict": "REVISE",
+      "conviction": 0.0665,
+      "routable": false,
+      "costUsd": 0,
+      "latencyMs": 0
+    },
+    {
+      "asOf": 1771639200000,
+      "barIndex": 1226,
+      "action": "BUY",
+      "verdict": "REVISE",
+      "conviction": 0.0805,
+      "routable": false,
+      "costUsd": 0,
+      "latencyMs": 0
+    },
+    {
+      "asOf": 1771653600000,
+      "barIndex": 1230,
+      "action": "SELL",
+      "verdict": "REVISE",
+      "conviction": 0.0662,
+      "routable": false,
+      "costUsd": 0,
+      "latencyMs": 0
+    },
+    {
+      "asOf": 1771668000000,
+      "barIndex": 1234,
+      "action": "BUY",
+      "verdict": "REVISE",
+      "conviction": 0.0671,
+      "routable": false,
+      "costUsd": 0,
+      "latencyMs": 0
+    },
+    {
+      "asOf": 1771711200000,
+      "barIndex": 1246,
+      "action": "SELL",
+      "verdict": "REVISE",
+      "conviction": 0.0691,
+      "routable": false,
+      "costUsd": 0,
+      "latencyMs": 0
+    },
+    {
+      "asOf": 1771740000000,
+      "barIndex": 1254,
+      "action": "SELL",
+      "verdict": "REVISE",
+      "conviction": 0.0716,
+      "routable": false,
+      "costUsd": 0,
+      "latencyMs": 0
+    },
+    {
+      "asOf": 1771783200000,
+      "barIndex": 1266,
+      "action": "BUY",
+      "verdict": "REVISE",
+      "conviction": 0.0658,
+      "routable": false,
+      "costUsd": 0,
+      "latencyMs": 0
+    },
+    {
+      "asOf": 1771840800000,
+      "barIndex": 1282,
+      "action": "BUY",
+      "verdict": "REVISE",
+      "conviction": 0.0806,
+      "routable": false,
+      "costUsd": 0,
+      "latencyMs": 0
+    },
+    {
+      "asOf": 1771855200000,
+      "barIndex": 1286,
+      "action": "SELL",
+      "verdict": "REVISE",
+      "conviction": 0.0664,
+      "routable": false,
+      "costUsd": 0,
+      "latencyMs": 0
+    },
+    {
+      "asOf": 1771869600000,
+      "barIndex": 1290,
+      "action": "BUY",
+      "verdict": "REVISE",
+      "conviction": 0.0699,
+      "routable": false,
+      "costUsd": 0,
+      "latencyMs": 0
+    },
+    {
+      "asOf": 1771884000000,
+      "barIndex": 1294,
+      "action": "SELL",
+      "verdict": "REVISE",
+      "conviction": 0.0717,
+      "routable": false,
+      "costUsd": 0,
+      "latencyMs": 1
+    },
+    {
+      "asOf": 1771912800000,
+      "barIndex": 1302,
+      "action": "SELL",
+      "verdict": "REVISE",
+      "conviction": 0.0826,
+      "routable": false,
+      "costUsd": 0,
+      "latencyMs": 0
+    },
+    {
+      "asOf": 1771941600000,
+      "barIndex": 1310,
+      "action": "SELL",
+      "verdict": "REVISE",
+      "conviction": 0.0653,
+      "routable": false,
+      "costUsd": 0,
+      "latencyMs": 0
+    },
+    {
+      "asOf": 1771956000000,
+      "barIndex": 1314,
+      "action": "BUY",
+      "verdict": "REVISE",
+      "conviction": 0.0721,
+      "routable": false,
+      "costUsd": 0,
+      "latencyMs": 0
+    },
+    {
+      "asOf": 1771999200000,
+      "barIndex": 1326,
+      "action": "SELL",
+      "verdict": "REVISE",
+      "conviction": 0.0898,
+      "routable": false,
+      "costUsd": 0,
+      "latencyMs": 0
+    },
+    {
+      "asOf": 1772013600000,
+      "barIndex": 1330,
+      "action": "BUY",
+      "verdict": "REVISE",
+      "conviction": 0.0738,
+      "routable": false,
+      "costUsd": 0,
+      "latencyMs": 0
+    },
+    {
+      "asOf": 1772056800000,
+      "barIndex": 1342,
+      "action": "SELL",
+      "verdict": "REVISE",
+      "conviction": 0.0653,
+      "routable": false,
+      "costUsd": 0,
+      "latencyMs": 0
+    },
+    {
+      "asOf": 1772100000000,
+      "barIndex": 1354,
+      "action": "BUY",
+      "verdict": "REVISE",
+      "conviction": 0.1108,
+      "routable": false,
+      "costUsd": 0,
+      "latencyMs": 0
+    },
+    {
+      "asOf": 1772114400000,
+      "barIndex": 1358,
+      "action": "BUY",
+      "verdict": "REVISE",
+      "conviction": 0.1815,
+      "routable": false,
+      "costUsd": 0,
+      "latencyMs": 0
+    },
+    {
+      "asOf": 1772128800000,
+      "barIndex": 1362,
+      "action": "BUY",
+      "verdict": "REVISE",
+      "conviction": 0.2484,
+      "routable": false,
+      "costUsd": 0,
+      "latencyMs": 0
+    },
+    {
+      "asOf": 1772143200000,
+      "barIndex": 1366,
+      "action": "BUY",
+      "verdict": "REVISE",
+      "conviction": 0.3192,
+      "routable": false,
+      "costUsd": 0,
+      "latencyMs": 0
+    },
+    {
+      "asOf": 1772157600000,
+      "barIndex": 1370,
+      "action": "BUY",
+      "verdict": "REVISE",
+      "conviction": 0.2645,
+      "routable": false,
+      "costUsd": 0,
+      "latencyMs": 0
+    },
+    {
+      "asOf": 1772172000000,
+      "barIndex": 1374,
+      "action": "BUY",
+      "verdict": "REVISE",
+      "conviction": 0.2759,
+      "routable": false,
+      "costUsd": 0,
+      "latencyMs": 0
+    },
+    {
+      "asOf": 1772186400000,
+      "barIndex": 1378,
+      "action": "BUY",
+      "verdict": "REVISE",
+      "conviction": 0.1739,
+      "routable": false,
+      "costUsd": 0,
+      "latencyMs": 0
+    },
+    {
+      "asOf": 1772200800000,
+      "barIndex": 1382,
+      "action": "BUY",
+      "verdict": "REVISE",
+      "conviction": 0.1858,
+      "routable": false,
+      "costUsd": 0,
+      "latencyMs": 0
+    },
+    {
+      "asOf": 1772215200000,
+      "barIndex": 1386,
+      "action": "BUY",
+      "verdict": "REVISE",
+      "conviction": 0.2237,
+      "routable": false,
+      "costUsd": 0,
+      "latencyMs": 0
+    },
+    {
+      "asOf": 1772229600000,
+      "barIndex": 1390,
+      "action": "BUY",
+      "verdict": "REVISE",
+      "conviction": 0.3542,
+      "routable": false,
+      "costUsd": 0,
+      "latencyMs": 0
+    },
+    {
+      "asOf": 1772244000000,
+      "barIndex": 1394,
+      "action": "BUY",
+      "verdict": "REVISE",
+      "conviction": 0.2413,
+      "routable": false,
+      "costUsd": 0,
+      "latencyMs": 0
+    },
+    {
+      "asOf": 1772258400000,
+      "barIndex": 1398,
+      "action": "BUY",
+      "verdict": "REVISE",
+      "conviction": 0.1874,
+      "routable": false,
+      "costUsd": 0,
+      "latencyMs": 0
+    },
+    {
+      "asOf": 1772272800000,
+      "barIndex": 1402,
+      "action": "BUY",
+      "verdict": "REVISE",
+      "conviction": 0.2123,
+      "routable": false,
+      "costUsd": 0,
+      "latencyMs": 0
+    },
+    {
+      "asOf": 1772287200000,
+      "barIndex": 1406,
+      "action": "BUY",
+      "verdict": "REVISE",
+      "conviction": 0.1914,
+      "routable": false,
+      "costUsd": 0,
+      "latencyMs": 0
+    },
+    {
+      "asOf": 1772301600000,
+      "barIndex": 1410,
+      "action": "BUY",
+      "verdict": "REVISE",
+      "conviction": 0.1062,
+      "routable": false,
+      "costUsd": 0,
+      "latencyMs": 0
+    },
+    {
+      "asOf": 1772316000000,
+      "barIndex": 1414,
+      "action": "BUY",
+      "verdict": "REVISE",
+      "conviction": 0.1312,
+      "routable": false,
+      "costUsd": 0,
+      "latencyMs": 0
+    },
+    {
+      "asOf": 1772330400000,
+      "barIndex": 1418,
+      "action": "BUY",
+      "verdict": "REVISE",
+      "conviction": 0.112,
+      "routable": false,
+      "costUsd": 0,
+      "latencyMs": 0
+    },
+    {
+      "asOf": 1772344800000,
+      "barIndex": 1422,
+      "action": "BUY",
+      "verdict": "REVISE",
+      "conviction": 0.1101,
+      "routable": false,
+      "costUsd": 0,
+      "latencyMs": 0
+    },
+    {
+      "asOf": 1772359200000,
+      "barIndex": 1426,
+      "action": "BUY",
+      "verdict": "REVISE",
+      "conviction": 0.1654,
+      "routable": false,
+      "costUsd": 0,
+      "latencyMs": 0
+    },
+    {
+      "asOf": 1772373600000,
+      "barIndex": 1430,
+      "action": "BUY",
+      "verdict": "REVISE",
+      "conviction": 0.1901,
+      "routable": false,
+      "costUsd": 0,
+      "latencyMs": 0
+    },
+    {
+      "asOf": 1772388000000,
+      "barIndex": 1434,
+      "action": "BUY",
+      "verdict": "REVISE",
+      "conviction": 0.1308,
+      "routable": false,
+      "costUsd": 0,
+      "latencyMs": 0
+    },
+    {
+      "asOf": 1772402400000,
+      "barIndex": 1438,
+      "action": "BUY",
+      "verdict": "REVISE",
+      "conviction": 0.1739,
+      "routable": false,
+      "costUsd": 0,
+      "latencyMs": 0
+    },
+    {
+      "asOf": 1772416800000,
+      "barIndex": 1442,
+      "action": "BUY",
+      "verdict": "REVISE",
+      "conviction": 0.1845,
+      "routable": false,
+      "costUsd": 0,
+      "latencyMs": 0
+    },
+    {
+      "asOf": 1772431200000,
+      "barIndex": 1446,
+      "action": "BUY",
+      "verdict": "REVISE",
+      "conviction": 0.1963,
+      "routable": false,
+      "costUsd": 0,
+      "latencyMs": 0
+    },
+    {
+      "asOf": 1772445600000,
+      "barIndex": 1450,
+      "action": "BUY",
+      "verdict": "REVISE",
+      "conviction": 0.2297,
+      "routable": false,
+      "costUsd": 0,
+      "latencyMs": 0
+    },
+    {
+      "asOf": 1772460000000,
+      "barIndex": 1454,
+      "action": "BUY",
+      "verdict": "REVISE",
+      "conviction": 0.2275,
+      "routable": false,
+      "costUsd": 0,
+      "latencyMs": 0
+    },
+    {
+      "asOf": 1772474400000,
+      "barIndex": 1458,
+      "action": "BUY",
+      "verdict": "REVISE",
+      "conviction": 0.21,
+      "routable": false,
+      "costUsd": 0,
+      "latencyMs": 0
+    },
+    {
+      "asOf": 1772488800000,
+      "barIndex": 1462,
+      "action": "BUY",
+      "verdict": "REVISE",
+      "conviction": 0.1959,
+      "routable": false,
+      "costUsd": 0,
+      "latencyMs": 0
+    },
+    {
+      "asOf": 1772503200000,
+      "barIndex": 1466,
+      "action": "BUY",
+      "verdict": "REVISE",
+      "conviction": 0.2359,
+      "routable": false,
+      "costUsd": 0,
+      "latencyMs": 0
+    },
+    {
+      "asOf": 1772517600000,
+      "barIndex": 1470,
+      "action": "BUY",
+      "verdict": "REVISE",
+      "conviction": 0.3437,
+      "routable": false,
+      "costUsd": 0,
+      "latencyMs": 0
+    },
+    {
+      "asOf": 1772532000000,
+      "barIndex": 1474,
+      "action": "BUY",
+      "verdict": "REVISE",
+      "conviction": 0.3585,
+      "routable": false,
+      "costUsd": 0,
+      "latencyMs": 0
+    },
+    {
+      "asOf": 1772546400000,
+      "barIndex": 1478,
+      "action": "BUY",
+      "verdict": "REVISE",
+      "conviction": 0.3014,
+      "routable": false,
+      "costUsd": 0,
+      "latencyMs": 0
+    },
+    {
+      "asOf": 1772560800000,
+      "barIndex": 1482,
+      "action": "BUY",
+      "verdict": "REVISE",
+      "conviction": 0.2655,
+      "routable": false,
+      "costUsd": 0,
+      "latencyMs": 0
+    },
+    {
+      "asOf": 1772575200000,
+      "barIndex": 1486,
+      "action": "BUY",
+      "verdict": "REVISE",
+      "conviction": 0.2404,
+      "routable": false,
+      "costUsd": 0,
+      "latencyMs": 0
+    },
+    {
+      "asOf": 1772589600000,
+      "barIndex": 1490,
+      "action": "BUY",
+      "verdict": "REVISE",
+      "conviction": 0.1553,
+      "routable": false,
+      "costUsd": 0,
+      "latencyMs": 0
+    },
+    {
+      "asOf": 1772604000000,
+      "barIndex": 1494,
+      "action": "BUY",
+      "verdict": "REVISE",
+      "conviction": 0.1109,
+      "routable": false,
+      "costUsd": 0,
+      "latencyMs": 0
+    },
+    {
+      "asOf": 1772618400000,
+      "barIndex": 1498,
+      "action": "BUY",
+      "verdict": "REVISE",
+      "conviction": 0.1264,
+      "routable": false,
+      "costUsd": 0,
+      "latencyMs": 0
+    },
+    {
+      "asOf": 1772632800000,
+      "barIndex": 1502,
+      "action": "BUY",
+      "verdict": "REVISE",
+      "conviction": 0.1547,
+      "routable": false,
+      "costUsd": 0,
+      "latencyMs": 0
+    },
+    {
+      "asOf": 1772647200000,
+      "barIndex": 1506,
+      "action": "BUY",
+      "verdict": "REVISE",
+      "conviction": 0.2771,
+      "routable": false,
+      "costUsd": 0,
+      "latencyMs": 0
+    },
+    {
+      "asOf": 1772661600000,
+      "barIndex": 1510,
+      "action": "BUY",
+      "verdict": "REVISE",
+      "conviction": 0.2718,
+      "routable": false,
+      "costUsd": 0,
+      "latencyMs": 0
+    },
+    {
+      "asOf": 1772676000000,
+      "barIndex": 1514,
+      "action": "BUY",
+      "verdict": "REVISE",
+      "conviction": 0.2184,
+      "routable": false,
+      "costUsd": 0,
+      "latencyMs": 0
+    },
+    {
+      "asOf": 1772719200000,
+      "barIndex": 1526,
+      "action": "SELL",
+      "verdict": "REVISE",
+      "conviction": 0.0722,
+      "routable": false,
+      "costUsd": 0,
+      "latencyMs": 0
+    },
+    {
+      "asOf": 1772776800000,
+      "barIndex": 1542,
+      "action": "SELL",
+      "verdict": "REVISE",
+      "conviction": 0.065,
+      "routable": false,
+      "costUsd": 0,
+      "latencyMs": 0
+    },
+    {
+      "asOf": 1772820000000,
+      "barIndex": 1554,
+      "action": "BUY",
+      "verdict": "REVISE",
+      "conviction": 0.068,
+      "routable": false,
+      "costUsd": 0,
+      "latencyMs": 0
+    },
+    {
+      "asOf": 1772834400000,
+      "barIndex": 1558,
+      "action": "SELL",
+      "verdict": "REVISE",
+      "conviction": 0.0655,
+      "routable": false,
+      "costUsd": 0,
+      "latencyMs": 0
+    },
+    {
+      "asOf": 1772863200000,
+      "barIndex": 1566,
+      "action": "SELL",
+      "verdict": "REVISE",
+      "conviction": 0.0679,
+      "routable": false,
+      "costUsd": 0,
+      "latencyMs": 0
+    },
+    {
+      "asOf": 1772978400000,
+      "barIndex": 1598,
+      "action": "SELL",
+      "verdict": "REVISE",
+      "conviction": 0.0664,
+      "routable": false,
+      "costUsd": 0,
+      "latencyMs": 0
+    },
+    {
+      "asOf": 1773021600000,
+      "barIndex": 1610,
+      "action": "BUY",
+      "verdict": "REVISE",
+      "conviction": 0.0708,
+      "routable": false,
+      "costUsd": 0,
+      "latencyMs": 0
+    },
+    {
+      "asOf": 1773036000000,
+      "barIndex": 1614,
+      "action": "SELL",
+      "verdict": "REVISE",
+      "conviction": 0.066,
+      "routable": false,
+      "costUsd": 0,
+      "latencyMs": 0
+    },
+    {
+      "asOf": 1773079200000,
+      "barIndex": 1626,
+      "action": "BUY",
+      "verdict": "REVISE",
+      "conviction": 0.0797,
+      "routable": false,
+      "costUsd": 0,
+      "latencyMs": 0
+    },
+    {
+      "asOf": 1773108000000,
+      "barIndex": 1634,
+      "action": "BUY",
+      "verdict": "REVISE",
+      "conviction": 0.0881,
+      "routable": false,
+      "costUsd": 0,
+      "latencyMs": 0
+    },
+    {
+      "asOf": 1773136800000,
+      "barIndex": 1642,
+      "action": "BUY",
+      "verdict": "REVISE",
+      "conviction": 0.0657,
+      "routable": false,
+      "costUsd": 0,
+      "latencyMs": 0
+    },
+    {
+      "asOf": 1773223200000,
+      "barIndex": 1666,
+      "action": "BUY",
+      "verdict": "REVISE",
+      "conviction": 0.0747,
+      "routable": false,
+      "costUsd": 0,
+      "latencyMs": 0
+    },
+    {
+      "asOf": 1773295200000,
+      "barIndex": 1686,
+      "action": "SELL",
+      "verdict": "REVISE",
+      "conviction": 0.2744,
+      "routable": false,
+      "costUsd": 0,
+      "latencyMs": 0
+    },
+    {
+      "asOf": 1773309600000,
+      "barIndex": 1690,
+      "action": "SELL",
+      "verdict": "REVISE",
+      "conviction": 0.2969,
+      "routable": false,
+      "costUsd": 0,
+      "latencyMs": 0
+    },
+    {
+      "asOf": 1773324000000,
+      "barIndex": 1694,
+      "action": "SELL",
+      "verdict": "REVISE",
+      "conviction": 0.3303,
+      "routable": false,
+      "costUsd": 0,
+      "latencyMs": 0
+    },
+    {
+      "asOf": 1773338400000,
+      "barIndex": 1698,
+      "action": "SELL",
+      "verdict": "REVISE",
+      "conviction": 0.3038,
+      "routable": false,
+      "costUsd": 0,
+      "latencyMs": 0
+    },
+    {
+      "asOf": 1773352800000,
+      "barIndex": 1702,
+      "action": "SELL",
+      "verdict": "REVISE",
+      "conviction": 0.2561,
+      "routable": false,
+      "costUsd": 0,
+      "latencyMs": 0
+    },
+    {
+      "asOf": 1773367200000,
+      "barIndex": 1706,
+      "action": "SELL",
+      "verdict": "REVISE",
+      "conviction": 0.1949,
+      "routable": false,
+      "costUsd": 0,
+      "latencyMs": 0
+    },
+    {
+      "asOf": 1773381600000,
+      "barIndex": 1710,
+      "action": "SELL",
+      "verdict": "REVISE",
+      "conviction": 0.2053,
+      "routable": false,
+      "costUsd": 0,
+      "latencyMs": 0
+    },
+    {
+      "asOf": 1773396000000,
+      "barIndex": 1714,
+      "action": "SELL",
+      "verdict": "REVISE",
+      "conviction": 0.3007,
+      "routable": false,
+      "costUsd": 0,
+      "latencyMs": 0
+    },
+    {
+      "asOf": 1773410400000,
+      "barIndex": 1718,
+      "action": "SELL",
+      "verdict": "REVISE",
+      "conviction": 0.1854,
+      "routable": false,
+      "costUsd": 0,
+      "latencyMs": 0
+    },
+    {
+      "asOf": 1773424800000,
+      "barIndex": 1722,
+      "action": "SELL",
+      "verdict": "REVISE",
+      "conviction": 0.1433,
+      "routable": false,
+      "costUsd": 0,
+      "latencyMs": 0
+    },
+    {
+      "asOf": 1773439200000,
+      "barIndex": 1726,
+      "action": "SELL",
+      "verdict": "REVISE",
+      "conviction": 0.1321,
+      "routable": false,
+      "costUsd": 0,
+      "latencyMs": 0
+    },
+    {
+      "asOf": 1773453600000,
+      "barIndex": 1730,
+      "action": "SELL",
+      "verdict": "REVISE",
+      "conviction": 0.2717,
+      "routable": false,
+      "costUsd": 0,
+      "latencyMs": 0
+    },
+    {
+      "asOf": 1773468000000,
+      "barIndex": 1734,
+      "action": "SELL",
+      "verdict": "REVISE",
+      "conviction": 0.3213,
+      "routable": false,
+      "costUsd": 0,
+      "latencyMs": 0
+    },
+    {
+      "asOf": 1773482400000,
+      "barIndex": 1738,
+      "action": "SELL",
+      "verdict": "REVISE",
+      "conviction": 0.2858,
+      "routable": false,
+      "costUsd": 0,
+      "latencyMs": 0
+    },
+    {
+      "asOf": 1773496800000,
+      "barIndex": 1742,
+      "action": "SELL",
+      "verdict": "REVISE",
+      "conviction": 0.1728,
+      "routable": false,
+      "costUsd": 0,
+      "latencyMs": 0
+    },
+    {
+      "asOf": 1773511200000,
+      "barIndex": 1746,
+      "action": "SELL",
+      "verdict": "REVISE",
+      "conviction": 0.1706,
+      "routable": false,
+      "costUsd": 0,
+      "latencyMs": 0
+    },
+    {
+      "asOf": 1773525600000,
+      "barIndex": 1750,
+      "action": "SELL",
+      "verdict": "REVISE",
+      "conviction": 0.1621,
+      "routable": false,
+      "costUsd": 0,
+      "latencyMs": 0
+    },
+    {
+      "asOf": 1773540000000,
+      "barIndex": 1754,
+      "action": "SELL",
+      "verdict": "REVISE",
+      "conviction": 0.2209,
+      "routable": false,
+      "costUsd": 0,
+      "latencyMs": 0
+    },
+    {
+      "asOf": 1773554400000,
+      "barIndex": 1758,
+      "action": "SELL",
+      "verdict": "REVISE",
+      "conviction": 0.2668,
+      "routable": false,
+      "costUsd": 0,
+      "latencyMs": 0
+    },
+    {
+      "asOf": 1773568800000,
+      "barIndex": 1762,
+      "action": "SELL",
+      "verdict": "REVISE",
+      "conviction": 0.2528,
+      "routable": false,
+      "costUsd": 0,
+      "latencyMs": 0
+    },
+    {
+      "asOf": 1773583200000,
+      "barIndex": 1766,
+      "action": "SELL",
+      "verdict": "REVISE",
+      "conviction": 0.1706,
+      "routable": false,
+      "costUsd": 0,
+      "latencyMs": 0
+    },
+    {
+      "asOf": 1773597600000,
+      "barIndex": 1770,
+      "action": "SELL",
+      "verdict": "REVISE",
+      "conviction": 0.1858,
+      "routable": false,
+      "costUsd": 0,
+      "latencyMs": 0
+    },
+    {
+      "asOf": 1773612000000,
+      "barIndex": 1774,
+      "action": "SELL",
+      "verdict": "REVISE",
+      "conviction": 0.1831,
+      "routable": false,
+      "costUsd": 0,
+      "latencyMs": 0
+    },
+    {
+      "asOf": 1773626400000,
+      "barIndex": 1778,
+      "action": "SELL",
+      "verdict": "REVISE",
+      "conviction": 0.1839,
+      "routable": false,
+      "costUsd": 0,
+      "latencyMs": 0
+    },
+    {
+      "asOf": 1773640800000,
+      "barIndex": 1782,
+      "action": "SELL",
+      "verdict": "REVISE",
+      "conviction": 0.2122,
+      "routable": false,
+      "costUsd": 0,
+      "latencyMs": 0
+    },
+    {
+      "asOf": 1773655200000,
+      "barIndex": 1786,
+      "action": "SELL",
+      "verdict": "REVISE",
+      "conviction": 0.2257,
+      "routable": false,
+      "costUsd": 0,
+      "latencyMs": 0
+    },
+    {
+      "asOf": 1773669600000,
+      "barIndex": 1790,
+      "action": "SELL",
+      "verdict": "REVISE",
+      "conviction": 0.2071,
+      "routable": false,
+      "costUsd": 0,
+      "latencyMs": 0
+    },
+    {
+      "asOf": 1773684000000,
+      "barIndex": 1794,
+      "action": "SELL",
+      "verdict": "REVISE",
+      "conviction": 0.2385,
+      "routable": false,
+      "costUsd": 0,
+      "latencyMs": 0
+    },
+    {
+      "asOf": 1773698400000,
+      "barIndex": 1798,
+      "action": "SELL",
+      "verdict": "REVISE",
+      "conviction": 0.2238,
+      "routable": false,
+      "costUsd": 0,
+      "latencyMs": 0
+    },
+    {
+      "asOf": 1773712800000,
+      "barIndex": 1802,
+      "action": "SELL",
+      "verdict": "REVISE",
+      "conviction": 0.2356,
+      "routable": false,
+      "costUsd": 0,
+      "latencyMs": 0
+    },
+    {
+      "asOf": 1773727200000,
+      "barIndex": 1806,
+      "action": "SELL",
+      "verdict": "REVISE",
+      "conviction": 0.3244,
+      "routable": false,
+      "costUsd": 0,
+      "latencyMs": 1
+    },
+    {
+      "asOf": 1773741600000,
+      "barIndex": 1810,
+      "action": "SELL",
+      "verdict": "REVISE",
+      "conviction": 0.2567,
+      "routable": false,
+      "costUsd": 0,
+      "latencyMs": 0
+    },
+    {
+      "asOf": 1773756000000,
+      "barIndex": 1814,
+      "action": "SELL",
+      "verdict": "REVISE",
+      "conviction": 0.2052,
+      "routable": false,
+      "costUsd": 0,
+      "latencyMs": 0
+    },
+    {
+      "asOf": 1773770400000,
+      "barIndex": 1818,
+      "action": "SELL",
+      "verdict": "REVISE",
+      "conviction": 0.1852,
+      "routable": false,
+      "costUsd": 0,
+      "latencyMs": 0
+    },
+    {
+      "asOf": 1773784800000,
+      "barIndex": 1822,
+      "action": "SELL",
+      "verdict": "REVISE",
+      "conviction": 0.2615,
+      "routable": false,
+      "costUsd": 0,
+      "latencyMs": 0
+    },
+    {
+      "asOf": 1773799200000,
+      "barIndex": 1826,
+      "action": "SELL",
+      "verdict": "REVISE",
+      "conviction": 0.2114,
+      "routable": false,
+      "costUsd": 0,
+      "latencyMs": 0
+    },
+    {
+      "asOf": 1773813600000,
+      "barIndex": 1830,
+      "action": "SELL",
+      "verdict": "REVISE",
+      "conviction": 0.2262,
+      "routable": false,
+      "costUsd": 0,
+      "latencyMs": 0
+    },
+    {
+      "asOf": 1773828000000,
+      "barIndex": 1834,
+      "action": "SELL",
+      "verdict": "REVISE",
+      "conviction": 0.23,
+      "routable": false,
+      "costUsd": 0,
+      "latencyMs": 0
+    },
+    {
+      "asOf": 1773842400000,
+      "barIndex": 1838,
+      "action": "SELL",
+      "verdict": "REVISE",
+      "conviction": 0.2401,
+      "routable": false,
+      "costUsd": 0,
+      "latencyMs": 0
+    },
+    {
+      "asOf": 1773856800000,
+      "barIndex": 1842,
+      "action": "SELL",
+      "verdict": "REVISE",
+      "conviction": 0.2713,
+      "routable": false,
+      "costUsd": 0,
+      "latencyMs": 0
+    },
+    {
+      "asOf": 1773871200000,
+      "barIndex": 1846,
+      "action": "SELL",
+      "verdict": "REVISE",
+      "conviction": 0.2539,
+      "routable": false,
+      "costUsd": 0,
+      "latencyMs": 0
+    },
+    {
+      "asOf": 1773885600000,
+      "barIndex": 1850,
+      "action": "SELL",
+      "verdict": "REVISE",
+      "conviction": 0.112,
+      "routable": false,
+      "costUsd": 0,
+      "latencyMs": 0
+    },
+    {
+      "asOf": 1773900000000,
+      "barIndex": 1854,
+      "action": "SELL",
+      "verdict": "REVISE",
+      "conviction": 0.1312,
+      "routable": false,
+      "costUsd": 0,
+      "latencyMs": 0
+    },
+    {
+      "asOf": 1773972000000,
+      "barIndex": 1874,
+      "action": "BUY",
+      "verdict": "REVISE",
+      "conviction": 0.0662,
+      "routable": false,
+      "costUsd": 0,
+      "latencyMs": 0
+    },
+    {
+      "asOf": 1774044000000,
+      "barIndex": 1894,
+      "action": "SELL",
+      "verdict": "REVISE",
+      "conviction": 0.0802,
+      "routable": false,
+      "costUsd": 0,
+      "latencyMs": 0
+    },
+    {
+      "asOf": 1774116000000,
+      "barIndex": 1914,
+      "action": "BUY",
+      "verdict": "REVISE",
+      "conviction": 0.0727,
+      "routable": false,
+      "costUsd": 0,
+      "latencyMs": 0
+    },
+    {
+      "asOf": 1774130400000,
+      "barIndex": 1918,
+      "action": "SELL",
+      "verdict": "REVISE",
+      "conviction": 0.0757,
+      "routable": false,
+      "costUsd": 0,
+      "latencyMs": 0
+    },
+    {
+      "asOf": 1774173600000,
+      "barIndex": 1930,
+      "action": "BUY",
+      "verdict": "REVISE",
+      "conviction": 0.0797,
+      "routable": false,
+      "costUsd": 0,
+      "latencyMs": 0
+    },
+    {
+      "asOf": 1774188000000,
+      "barIndex": 1934,
+      "action": "SELL",
+      "verdict": "REVISE",
+      "conviction": 0.0653,
+      "routable": false,
+      "costUsd": 0,
+      "latencyMs": 0
+    },
+    {
+      "asOf": 1774216800000,
+      "barIndex": 1942,
+      "action": "SELL",
+      "verdict": "REVISE",
+      "conviction": 0.0714,
+      "routable": false,
+      "costUsd": 0,
+      "latencyMs": 0
+    },
+    {
+      "asOf": 1774303200000,
+      "barIndex": 1966,
+      "action": "SELL",
+      "verdict": "REVISE",
+      "conviction": 0.0744,
+      "routable": false,
+      "costUsd": 0,
+      "latencyMs": 0
+    },
+    {
+      "asOf": 1774404000000,
+      "barIndex": 1994,
+      "action": "BUY",
+      "verdict": "REVISE",
+      "conviction": 0.0793,
+      "routable": false,
+      "costUsd": 0,
+      "latencyMs": 0
+    },
+    {
+      "asOf": 1774519200000,
+      "barIndex": 2026,
+      "action": "BUY",
+      "verdict": "REVISE",
+      "conviction": 0.1532,
+      "routable": false,
+      "costUsd": 0,
+      "latencyMs": 0
+    },
+    {
+      "asOf": 1774533600000,
+      "barIndex": 2030,
+      "action": "BUY",
+      "verdict": "REVISE",
+      "conviction": 0.2106,
+      "routable": false,
+      "costUsd": 0,
+      "latencyMs": 0
+    },
+    {
+      "asOf": 1774548000000,
+      "barIndex": 2034,
+      "action": "BUY",
+      "verdict": "REVISE",
+      "conviction": 0.2605,
+      "routable": false,
+      "costUsd": 0,
+      "latencyMs": 0
+    },
+    {
+      "asOf": 1774562400000,
+      "barIndex": 2038,
+      "action": "BUY",
+      "verdict": "REVISE",
+      "conviction": 0.3009,
+      "routable": false,
+      "costUsd": 0,
+      "latencyMs": 0
+    },
+    {
+      "asOf": 1774576800000,
+      "barIndex": 2042,
+      "action": "BUY",
+      "verdict": "REVISE",
+      "conviction": 0.239,
+      "routable": false,
+      "costUsd": 0,
+      "latencyMs": 0
+    },
+    {
+      "asOf": 1774591200000,
+      "barIndex": 2046,
+      "action": "BUY",
+      "verdict": "REVISE",
+      "conviction": 0.2683,
+      "routable": false,
+      "costUsd": 0,
+      "latencyMs": 0
+    },
+    {
+      "asOf": 1774605600000,
+      "barIndex": 2050,
+      "action": "BUY",
+      "verdict": "REVISE",
+      "conviction": 0.2103,
+      "routable": false,
+      "costUsd": 0,
+      "latencyMs": 0
+    },
+    {
+      "asOf": 1774620000000,
+      "barIndex": 2054,
+      "action": "BUY",
+      "verdict": "REVISE",
+      "conviction": 0.225,
+      "routable": false,
+      "costUsd": 0,
+      "latencyMs": 0
+    },
+    {
+      "asOf": 1774634400000,
+      "barIndex": 2058,
+      "action": "BUY",
+      "verdict": "REVISE",
+      "conviction": 0.2282,
+      "routable": false,
+      "costUsd": 0,
+      "latencyMs": 0
+    },
+    {
+      "asOf": 1774648800000,
+      "barIndex": 2062,
+      "action": "BUY",
+      "verdict": "REVISE",
+      "conviction": 0.3272,
+      "routable": false,
+      "costUsd": 0,
+      "latencyMs": 0
+    },
+    {
+      "asOf": 1774663200000,
+      "barIndex": 2066,
+      "action": "BUY",
+      "verdict": "REVISE",
+      "conviction": 0.3213,
+      "routable": false,
+      "costUsd": 0,
+      "latencyMs": 0
+    },
+    {
+      "asOf": 1774677600000,
+      "barIndex": 2070,
+      "action": "BUY",
+      "verdict": "REVISE",
+      "conviction": 0.2826,
+      "routable": false,
+      "costUsd": 0,
+      "latencyMs": 0
+    },
+    {
+      "asOf": 1774692000000,
+      "barIndex": 2074,
+      "action": "BUY",
+      "verdict": "REVISE",
+      "conviction": 0.1658,
+      "routable": false,
+      "costUsd": 0,
+      "latencyMs": 0
+    },
+    {
+      "asOf": 1774706400000,
+      "barIndex": 2078,
+      "action": "BUY",
+      "verdict": "REVISE",
+      "conviction": 0.1965,
+      "routable": false,
+      "costUsd": 0,
+      "latencyMs": 0
+    },
+    {
+      "asOf": 1774720800000,
+      "barIndex": 2082,
+      "action": "BUY",
+      "verdict": "REVISE",
+      "conviction": 0.1864,
+      "routable": false,
+      "costUsd": 0,
+      "latencyMs": 0
+    },
+    {
+      "asOf": 1774735200000,
+      "barIndex": 2086,
+      "action": "BUY",
+      "verdict": "REVISE",
+      "conviction": 0.2578,
+      "routable": false,
+      "costUsd": 0,
+      "latencyMs": 0
+    },
+    {
+      "asOf": 1774749600000,
+      "barIndex": 2090,
+      "action": "BUY",
+      "verdict": "REVISE",
+      "conviction": 0.2085,
+      "routable": false,
+      "costUsd": 0,
+      "latencyMs": 0
+    },
+    {
+      "asOf": 1774764000000,
+      "barIndex": 2094,
+      "action": "BUY",
+      "verdict": "REVISE",
+      "conviction": 0.307,
+      "routable": false,
+      "costUsd": 0,
+      "latencyMs": 0
+    },
+    {
+      "asOf": 1774778400000,
+      "barIndex": 2098,
+      "action": "BUY",
+      "verdict": "REVISE",
+      "conviction": 0.289,
+      "routable": false,
+      "costUsd": 0,
+      "latencyMs": 0
+    },
+    {
+      "asOf": 1774792800000,
+      "barIndex": 2102,
+      "action": "BUY",
+      "verdict": "REVISE",
+      "conviction": 0.1556,
+      "routable": false,
+      "costUsd": 0,
+      "latencyMs": 0
+    },
+    {
+      "asOf": 1774807200000,
+      "barIndex": 2106,
+      "action": "BUY",
+      "verdict": "REVISE",
+      "conviction": 0.1785,
+      "routable": false,
+      "costUsd": 0,
+      "latencyMs": 0
+    },
+    {
+      "asOf": 1774821600000,
+      "barIndex": 2110,
+      "action": "BUY",
+      "verdict": "REVISE",
+      "conviction": 0.173,
+      "routable": false,
+      "costUsd": 0,
+      "latencyMs": 0
+    },
+    {
+      "asOf": 1774836000000,
+      "barIndex": 2114,
+      "action": "BUY",
+      "verdict": "REVISE",
+      "conviction": 0.2331,
+      "routable": false,
+      "costUsd": 0,
+      "latencyMs": 0
+    },
+    {
+      "asOf": 1774850400000,
+      "barIndex": 2118,
+      "action": "BUY",
+      "verdict": "REVISE",
+      "conviction": 0.1776,
+      "routable": false,
+      "costUsd": 0,
+      "latencyMs": 1
+    },
+    {
+      "asOf": 1774864800000,
+      "barIndex": 2122,
+      "action": "BUY",
+      "verdict": "REVISE",
+      "conviction": 0.1402,
+      "routable": false,
+      "costUsd": 0,
+      "latencyMs": 0
+    },
+    {
+      "asOf": 1774879200000,
+      "barIndex": 2126,
+      "action": "BUY",
+      "verdict": "REVISE",
+      "conviction": 0.1874,
+      "routable": false,
+      "costUsd": 0,
+      "latencyMs": 0
+    },
+    {
+      "asOf": 1774893600000,
+      "barIndex": 2130,
+      "action": "BUY",
+      "verdict": "REVISE",
+      "conviction": 0.2447,
+      "routable": false,
+      "costUsd": 0,
+      "latencyMs": 0
+    },
+    {
+      "asOf": 1774908000000,
+      "barIndex": 2134,
+      "action": "BUY",
+      "verdict": "REVISE",
+      "conviction": 0.2263,
+      "routable": false,
+      "costUsd": 0,
+      "latencyMs": 0
+    },
+    {
+      "asOf": 1774922400000,
+      "barIndex": 2138,
+      "action": "BUY",
+      "verdict": "REVISE",
+      "conviction": 0.1852,
+      "routable": false,
+      "costUsd": 0,
+      "latencyMs": 0
+    },
+    {
+      "asOf": 1774936800000,
+      "barIndex": 2142,
+      "action": "BUY",
+      "verdict": "REVISE",
+      "conviction": 0.2414,
+      "routable": false,
+      "costUsd": 0,
+      "latencyMs": 0
+    },
+    {
+      "asOf": 1774951200000,
+      "barIndex": 2146,
+      "action": "BUY",
+      "verdict": "REVISE",
+      "conviction": 0.2508,
+      "routable": false,
+      "costUsd": 0,
+      "latencyMs": 0
+    },
+    {
+      "asOf": 1774965600000,
+      "barIndex": 2150,
+      "action": "BUY",
+      "verdict": "REVISE",
+      "conviction": 0.2353,
+      "routable": false,
+      "costUsd": 0,
+      "latencyMs": 0
+    },
+    {
+      "asOf": 1774980000000,
+      "barIndex": 2154,
+      "action": "BUY",
+      "verdict": "REVISE",
+      "conviction": 0.186,
+      "routable": false,
+      "costUsd": 0,
+      "latencyMs": 0
+    },
+    {
+      "asOf": 1774994400000,
+      "barIndex": 2158,
+      "action": "BUY",
+      "verdict": "REVISE",
+      "conviction": 0.2584,
+      "routable": false,
+      "costUsd": 0,
+      "latencyMs": 0
+    },
+    {
+      "asOf": 1775008800000,
+      "barIndex": 2162,
+      "action": "BUY",
+      "verdict": "REVISE",
+      "conviction": 0.2326,
+      "routable": false,
+      "costUsd": 0,
+      "latencyMs": 0
+    },
+    {
+      "asOf": 1775023200000,
+      "barIndex": 2166,
+      "action": "BUY",
+      "verdict": "REVISE",
+      "conviction": 0.2053,
+      "routable": false,
+      "costUsd": 0,
+      "latencyMs": 0
+    },
+    {
+      "asOf": 1775037600000,
+      "barIndex": 2170,
+      "action": "BUY",
+      "verdict": "REVISE",
+      "conviction": 0.2417,
+      "routable": false,
+      "costUsd": 0,
+      "latencyMs": 0
+    },
+    {
+      "asOf": 1775052000000,
+      "barIndex": 2174,
+      "action": "BUY",
+      "verdict": "REVISE",
+      "conviction": 0.2518,
+      "routable": false,
+      "costUsd": 0,
+      "latencyMs": 0
+    },
+    {
+      "asOf": 1775066400000,
+      "barIndex": 2178,
+      "action": "BUY",
+      "verdict": "REVISE",
+      "conviction": 0.2057,
+      "routable": false,
+      "costUsd": 0,
+      "latencyMs": 0
+    },
+    {
+      "asOf": 1775080800000,
+      "barIndex": 2182,
+      "action": "BUY",
+      "verdict": "REVISE",
+      "conviction": 0.2766,
+      "routable": false,
+      "costUsd": 0,
+      "latencyMs": 0
+    },
+    {
+      "asOf": 1775095200000,
+      "barIndex": 2186,
+      "action": "BUY",
+      "verdict": "REVISE",
+      "conviction": 0.271,
+      "routable": false,
+      "costUsd": 0,
+      "latencyMs": 0
+    },
+    {
+      "asOf": 1775152800000,
+      "barIndex": 2202,
+      "action": "BUY",
+      "verdict": "REVISE",
+      "conviction": 0.0654,
+      "routable": false,
+      "costUsd": 0,
+      "latencyMs": 0
+    },
+    {
+      "asOf": 1775239200000,
+      "barIndex": 2226,
+      "action": "BUY",
+      "verdict": "REVISE",
+      "conviction": 0.0694,
+      "routable": false,
+      "costUsd": 0,
+      "latencyMs": 0
+    },
+    {
+      "asOf": 1775296800000,
+      "barIndex": 2242,
+      "action": "BUY",
+      "verdict": "REVISE",
+      "conviction": 0.0652,
+      "routable": false,
+      "costUsd": 0,
+      "latencyMs": 0
+    },
+    {
+      "asOf": 1775311200000,
+      "barIndex": 2246,
+      "action": "SELL",
+      "verdict": "REVISE",
+      "conviction": 0.0696,
+      "routable": false,
+      "costUsd": 0,
+      "latencyMs": 0
+    },
+    {
+      "asOf": 1775368800000,
+      "barIndex": 2262,
+      "action": "SELL",
+      "verdict": "REVISE",
+      "conviction": 0.0853,
+      "routable": false,
+      "costUsd": 0,
+      "latencyMs": 0
+    },
+    {
+      "asOf": 1775383200000,
+      "barIndex": 2266,
+      "action": "BUY",
+      "verdict": "REVISE",
+      "conviction": 0.0702,
+      "routable": false,
+      "costUsd": 0,
+      "latencyMs": 0
+    },
+    {
+      "asOf": 1775397600000,
+      "barIndex": 2270,
+      "action": "SELL",
+      "verdict": "REVISE",
+      "conviction": 0.0683,
+      "routable": false,
+      "costUsd": 0,
+      "latencyMs": 0
+    },
+    {
+      "asOf": 1775412000000,
+      "barIndex": 2274,
+      "action": "BUY",
+      "verdict": "REVISE",
+      "conviction": 0.0786,
+      "routable": false,
+      "costUsd": 0,
+      "latencyMs": 0
+    },
+    {
+      "asOf": 1775440800000,
+      "barIndex": 2282,
+      "action": "BUY",
+      "verdict": "REVISE",
+      "conviction": 0.07,
+      "routable": false,
+      "costUsd": 0,
+      "latencyMs": 0
+    },
+    {
+      "asOf": 1775455200000,
+      "barIndex": 2286,
+      "action": "SELL",
+      "verdict": "REVISE",
+      "conviction": 0.0696,
+      "routable": false,
+      "costUsd": 0,
+      "latencyMs": 0
+    },
+    {
+      "asOf": 1775527200000,
+      "barIndex": 2306,
+      "action": "BUY",
+      "verdict": "REVISE",
+      "conviction": 0.065,
+      "routable": false,
+      "costUsd": 0,
+      "latencyMs": 0
+    },
+    {
+      "asOf": 1775570400000,
+      "barIndex": 2318,
+      "action": "SELL",
+      "verdict": "REVISE",
+      "conviction": 0.0842,
+      "routable": false,
+      "costUsd": 0,
+      "latencyMs": 0
+    },
+    {
+      "asOf": 1775599200000,
+      "barIndex": 2326,
+      "action": "SELL",
+      "verdict": "REVISE",
+      "conviction": 0.0727,
+      "routable": false,
+      "costUsd": 0,
+      "latencyMs": 0
+    },
+    {
+      "asOf": 1775628000000,
+      "barIndex": 2334,
+      "action": "SELL",
+      "verdict": "REVISE",
+      "conviction": 0.0719,
+      "routable": false,
+      "costUsd": 0,
+      "latencyMs": 0
+    },
+    {
+      "asOf": 1775642400000,
+      "barIndex": 2338,
+      "action": "BUY",
+      "verdict": "REVISE",
+      "conviction": 0.066,
+      "routable": false,
+      "costUsd": 0,
+      "latencyMs": 0
+    },
+    {
+      "asOf": 1775656800000,
+      "barIndex": 2342,
+      "action": "SELL",
+      "verdict": "REVISE",
+      "conviction": 0.0913,
+      "routable": false,
+      "costUsd": 0,
+      "latencyMs": 0
+    },
+    {
+      "asOf": 1775671200000,
+      "barIndex": 2346,
+      "action": "BUY",
+      "verdict": "REVISE",
+      "conviction": 0.0722,
+      "routable": false,
+      "costUsd": 0,
+      "latencyMs": 0
+    },
+    {
+      "asOf": 1775714400000,
+      "barIndex": 2358,
+      "action": "SELL",
+      "verdict": "REVISE",
+      "conviction": 0.2114,
+      "routable": false,
+      "costUsd": 0,
+      "latencyMs": 0
+    },
+    {
+      "asOf": 1775728800000,
+      "barIndex": 2362,
+      "action": "SELL",
+      "verdict": "REVISE",
+      "conviction": 0.2005,
+      "routable": false,
+      "costUsd": 0,
+      "latencyMs": 0
+    },
+    {
+      "asOf": 1775743200000,
+      "barIndex": 2366,
+      "action": "SELL",
+      "verdict": "REVISE",
+      "conviction": 0.2868,
+      "routable": false,
+      "costUsd": 0,
+      "latencyMs": 0
+    },
+    {
+      "asOf": 1775757600000,
+      "barIndex": 2370,
+      "action": "SELL",
+      "verdict": "REVISE",
+      "conviction": 0.1728,
+      "routable": false,
+      "costUsd": 0,
+      "latencyMs": 0
+    },
+    {
+      "asOf": 1775772000000,
+      "barIndex": 2374,
+      "action": "SELL",
+      "verdict": "REVISE",
+      "conviction": 0.1727,
+      "routable": false,
+      "costUsd": 0,
+      "latencyMs": 0
+    },
+    {
+      "asOf": 1775786400000,
+      "barIndex": 2378,
+      "action": "SELL",
+      "verdict": "REVISE",
+      "conviction": 0.2344,
+      "routable": false,
+      "costUsd": 0,
+      "latencyMs": 0
+    },
+    {
+      "asOf": 1775800800000,
+      "barIndex": 2382,
+      "action": "SELL",
+      "verdict": "REVISE",
+      "conviction": 0.2137,
+      "routable": false,
+      "costUsd": 0,
+      "latencyMs": 0
+    },
+    {
+      "asOf": 1775815200000,
+      "barIndex": 2386,
+      "action": "SELL",
+      "verdict": "REVISE",
+      "conviction": 0.1863,
+      "routable": false,
+      "costUsd": 0,
+      "latencyMs": 0
+    },
+    {
+      "asOf": 1775829600000,
+      "barIndex": 2390,
+      "action": "SELL",
+      "verdict": "REVISE",
+      "conviction": 0.1567,
+      "routable": false,
+      "costUsd": 0,
+      "latencyMs": 0
+    },
+    {
+      "asOf": 1775844000000,
+      "barIndex": 2394,
+      "action": "SELL",
+      "verdict": "REVISE",
+      "conviction": 0.1533,
+      "routable": false,
+      "costUsd": 0,
+      "latencyMs": 0
+    },
+    {
+      "asOf": 1775858400000,
+      "barIndex": 2398,
+      "action": "SELL",
+      "verdict": "REVISE",
+      "conviction": 0.2033,
+      "routable": false,
+      "costUsd": 0,
+      "latencyMs": 0
+    },
+    {
+      "asOf": 1775872800000,
+      "barIndex": 2402,
+      "action": "SELL",
+      "verdict": "REVISE",
+      "conviction": 0.2088,
+      "routable": false,
+      "costUsd": 0,
+      "latencyMs": 0
+    },
+    {
+      "asOf": 1775887200000,
+      "barIndex": 2406,
+      "action": "SELL",
+      "verdict": "REVISE",
+      "conviction": 0.2092,
+      "routable": false,
+      "costUsd": 0,
+      "latencyMs": 0
+    },
+    {
+      "asOf": 1775901600000,
+      "barIndex": 2410,
+      "action": "SELL",
+      "verdict": "REVISE",
+      "conviction": 0.2296,
+      "routable": false,
+      "costUsd": 0,
+      "latencyMs": 0
+    },
+    {
+      "asOf": 1775916000000,
+      "barIndex": 2414,
+      "action": "SELL",
+      "verdict": "REVISE",
+      "conviction": 0.2596,
+      "routable": false,
+      "costUsd": 0,
+      "latencyMs": 0
+    },
+    {
+      "asOf": 1775930400000,
+      "barIndex": 2418,
+      "action": "SELL",
+      "verdict": "REVISE",
+      "conviction": 0.1836,
+      "routable": false,
+      "costUsd": 0,
+      "latencyMs": 0
+    },
+    {
+      "asOf": 1775944800000,
+      "barIndex": 2422,
+      "action": "SELL",
+      "verdict": "REVISE",
+      "conviction": 0.2704,
+      "routable": false,
+      "costUsd": 0,
+      "latencyMs": 0
+    },
+    {
+      "asOf": 1775959200000,
+      "barIndex": 2426,
+      "action": "SELL",
+      "verdict": "REVISE",
+      "conviction": 0.28,
+      "routable": false,
+      "costUsd": 0,
+      "latencyMs": 0
+    },
+    {
+      "asOf": 1775973600000,
+      "barIndex": 2430,
+      "action": "SELL",
+      "verdict": "REVISE",
+      "conviction": 0.2575,
+      "routable": false,
+      "costUsd": 0,
+      "latencyMs": 0
+    },
+    {
+      "asOf": 1775988000000,
+      "barIndex": 2434,
+      "action": "SELL",
+      "verdict": "REVISE",
+      "conviction": 0.2332,
+      "routable": false,
+      "costUsd": 0,
+      "latencyMs": 0
+    },
+    {
+      "asOf": 1776002400000,
+      "barIndex": 2438,
+      "action": "SELL",
+      "verdict": "REVISE",
+      "conviction": 0.2279,
+      "routable": false,
+      "costUsd": 0,
+      "latencyMs": 0
+    },
+    {
+      "asOf": 1776016800000,
+      "barIndex": 2442,
+      "action": "SELL",
+      "verdict": "REVISE",
+      "conviction": 0.269,
+      "routable": false,
+      "costUsd": 0,
+      "latencyMs": 0
+    },
+    {
+      "asOf": 1776031200000,
+      "barIndex": 2446,
+      "action": "SELL",
+      "verdict": "REVISE",
+      "conviction": 0.1786,
+      "routable": false,
+      "costUsd": 0,
+      "latencyMs": 0
+    },
+    {
+      "asOf": 1776045600000,
+      "barIndex": 2450,
+      "action": "SELL",
+      "verdict": "REVISE",
+      "conviction": 0.1593,
+      "routable": false,
+      "costUsd": 0,
+      "latencyMs": 0
+    },
+    {
+      "asOf": 1776060000000,
+      "barIndex": 2454,
+      "action": "SELL",
+      "verdict": "REVISE",
+      "conviction": 0.2079,
+      "routable": false,
+      "costUsd": 0,
+      "latencyMs": 0
+    },
+    {
+      "asOf": 1776074400000,
+      "barIndex": 2458,
+      "action": "SELL",
+      "verdict": "REVISE",
+      "conviction": 0.235,
+      "routable": false,
+      "costUsd": 0,
+      "latencyMs": 0
+    },
+    {
+      "asOf": 1776088800000,
+      "barIndex": 2462,
+      "action": "SELL",
+      "verdict": "REVISE",
+      "conviction": 0.1644,
+      "routable": false,
+      "costUsd": 0,
+      "latencyMs": 0
+    },
+    {
+      "asOf": 1776103200000,
+      "barIndex": 2466,
+      "action": "SELL",
+      "verdict": "REVISE",
+      "conviction": 0.1773,
+      "routable": false,
+      "costUsd": 0,
+      "latencyMs": 0
+    },
+    {
+      "asOf": 1776117600000,
+      "barIndex": 2470,
+      "action": "SELL",
+      "verdict": "REVISE",
+      "conviction": 0.1367,
+      "routable": false,
+      "costUsd": 0,
+      "latencyMs": 0
+    },
+    {
+      "asOf": 1776132000000,
+      "barIndex": 2474,
+      "action": "SELL",
+      "verdict": "REVISE",
+      "conviction": 0.2531,
+      "routable": false,
+      "costUsd": 0,
+      "latencyMs": 0
+    },
+    {
+      "asOf": 1776146400000,
+      "barIndex": 2478,
+      "action": "SELL",
+      "verdict": "REVISE",
+      "conviction": 0.2359,
+      "routable": false,
+      "costUsd": 0,
+      "latencyMs": 0
+    },
+    {
+      "asOf": 1776160800000,
+      "barIndex": 2482,
+      "action": "SELL",
+      "verdict": "REVISE",
+      "conviction": 0.1418,
+      "routable": false,
+      "costUsd": 0,
+      "latencyMs": 0
+    },
+    {
+      "asOf": 1776175200000,
+      "barIndex": 2486,
+      "action": "SELL",
+      "verdict": "REVISE",
+      "conviction": 0.1495,
+      "routable": false,
+      "costUsd": 0,
+      "latencyMs": 0
+    },
+    {
+      "asOf": 1776189600000,
+      "barIndex": 2490,
+      "action": "SELL",
+      "verdict": "REVISE",
+      "conviction": 0.2483,
+      "routable": false,
+      "costUsd": 0,
+      "latencyMs": 0
+    },
+    {
+      "asOf": 1776204000000,
+      "barIndex": 2494,
+      "action": "SELL",
+      "verdict": "REVISE",
+      "conviction": 0.2803,
+      "routable": false,
+      "costUsd": 0,
+      "latencyMs": 0
+    },
+    {
+      "asOf": 1776218400000,
+      "barIndex": 2498,
+      "action": "SELL",
+      "verdict": "REVISE",
+      "conviction": 0.3008,
+      "routable": false,
+      "costUsd": 0,
+      "latencyMs": 0
+    },
+    {
+      "asOf": 1776232800000,
+      "barIndex": 2502,
+      "action": "SELL",
+      "verdict": "REVISE",
+      "conviction": 0.2124,
+      "routable": false,
+      "costUsd": 0,
+      "latencyMs": 0
+    },
+    {
+      "asOf": 1776247200000,
+      "barIndex": 2506,
+      "action": "SELL",
+      "verdict": "REVISE",
+      "conviction": 0.215,
+      "routable": false,
+      "costUsd": 0,
+      "latencyMs": 0
+    },
+    {
+      "asOf": 1776261600000,
+      "barIndex": 2510,
+      "action": "SELL",
+      "verdict": "REVISE",
+      "conviction": 0.2568,
+      "routable": false,
+      "costUsd": 0,
+      "latencyMs": 0
+    },
+    {
+      "asOf": 1776276000000,
+      "barIndex": 2514,
+      "action": "SELL",
+      "verdict": "REVISE",
+      "conviction": 0.2754,
+      "routable": false,
+      "costUsd": 0,
+      "latencyMs": 0
+    },
+    {
+      "asOf": 1776290400000,
+      "barIndex": 2518,
+      "action": "SELL",
+      "verdict": "REVISE",
+      "conviction": 0.3797,
+      "routable": false,
+      "costUsd": 0,
+      "latencyMs": 0
+    },
+    {
+      "asOf": 1776304800000,
+      "barIndex": 2522,
+      "action": "SELL",
+      "verdict": "REVISE",
+      "conviction": 0.2431,
+      "routable": false,
+      "costUsd": 0,
+      "latencyMs": 0
+    },
+    {
+      "asOf": 1776319200000,
+      "barIndex": 2526,
+      "action": "SELL",
+      "verdict": "REVISE",
+      "conviction": 0.1592,
+      "routable": false,
+      "costUsd": 0,
+      "latencyMs": 0
+    },
+    {
+      "asOf": 1776348000000,
+      "barIndex": 2534,
+      "action": "SELL",
+      "verdict": "REVISE",
+      "conviction": 0.0696,
+      "routable": false,
+      "costUsd": 0,
+      "latencyMs": 0
+    },
+    {
+      "asOf": 1776391200000,
+      "barIndex": 2546,
+      "action": "BUY",
+      "verdict": "REVISE",
+      "conviction": 0.0703,
+      "routable": false,
+      "costUsd": 0,
+      "latencyMs": 0
+    },
+    {
+      "asOf": 1776463200000,
+      "barIndex": 2566,
+      "action": "SELL",
+      "verdict": "REVISE",
+      "conviction": 0.0757,
+      "routable": false,
+      "costUsd": 0,
+      "latencyMs": 0
+    },
+    {
+      "asOf": 1776506400000,
+      "barIndex": 2578,
+      "action": "BUY",
+      "verdict": "REVISE",
+      "conviction": 0.0778,
+      "routable": false,
+      "costUsd": 0,
+      "latencyMs": 0
+    },
+    {
+      "asOf": 1776549600000,
+      "barIndex": 2590,
+      "action": "SELL",
+      "verdict": "REVISE",
+      "conviction": 0.0693,
+      "routable": false,
+      "costUsd": 0,
+      "latencyMs": 0
+    },
+    {
+      "asOf": 1776607200000,
+      "barIndex": 2606,
+      "action": "SELL",
+      "verdict": "REVISE",
+      "conviction": 0.0783,
+      "routable": false,
+      "costUsd": 0,
+      "latencyMs": 0
+    },
+    {
+      "asOf": 1776636000000,
+      "barIndex": 2614,
+      "action": "SELL",
+      "verdict": "REVISE",
+      "conviction": 0.0706,
+      "routable": false,
+      "costUsd": 0,
+      "latencyMs": 0
+    },
+    {
+      "asOf": 1776664800000,
+      "barIndex": 2622,
+      "action": "SELL",
+      "verdict": "REVISE",
+      "conviction": 0.0668,
+      "routable": false,
+      "costUsd": 0,
+      "latencyMs": 0
+    },
+    {
+      "asOf": 1776722400000,
+      "barIndex": 2638,
+      "action": "SELL",
+      "verdict": "REVISE",
+      "conviction": 0.0664,
+      "routable": false,
+      "costUsd": 0,
+      "latencyMs": 0
+    },
+    {
+      "asOf": 1776808800000,
+      "barIndex": 2662,
+      "action": "SELL",
+      "verdict": "REVISE",
+      "conviction": 0.0692,
+      "routable": false,
+      "costUsd": 0,
+      "latencyMs": 0
+    },
+    {
+      "asOf": 1776909600000,
+      "barIndex": 2690,
+      "action": "BUY",
+      "verdict": "REVISE",
+      "conviction": 0.0699,
+      "routable": false,
+      "costUsd": 0,
+      "latencyMs": 0
+    },
+    {
+      "asOf": 1776924000000,
+      "barIndex": 2694,
+      "action": "BUY",
+      "verdict": "REVISE",
+      "conviction": 0.1239,
+      "routable": false,
+      "costUsd": 0,
+      "latencyMs": 0
+    },
+    {
+      "asOf": 1776938400000,
+      "barIndex": 2698,
+      "action": "BUY",
+      "verdict": "REVISE",
+      "conviction": 0.301,
+      "routable": false,
+      "costUsd": 0,
+      "latencyMs": 0
+    },
+    {
+      "asOf": 1776952800000,
+      "barIndex": 2702,
+      "action": "BUY",
+      "verdict": "REVISE",
+      "conviction": 0.3659,
+      "routable": false,
+      "costUsd": 0,
+      "latencyMs": 0
+    },
+    {
+      "asOf": 1776967200000,
+      "barIndex": 2706,
+      "action": "BUY",
+      "verdict": "REVISE",
+      "conviction": 0.3587,
+      "routable": false,
+      "costUsd": 0,
+      "latencyMs": 0
+    },
+    {
+      "asOf": 1776981600000,
+      "barIndex": 2710,
+      "action": "BUY",
+      "verdict": "REVISE",
+      "conviction": 0.2446,
+      "routable": false,
+      "costUsd": 0,
+      "latencyMs": 0
+    },
+    {
+      "asOf": 1776996000000,
+      "barIndex": 2714,
+      "action": "BUY",
+      "verdict": "REVISE",
+      "conviction": 0.2009,
+      "routable": false,
+      "costUsd": 0,
+      "latencyMs": 0
+    },
+    {
+      "asOf": 1777010400000,
+      "barIndex": 2718,
+      "action": "BUY",
+      "verdict": "REVISE",
+      "conviction": 0.2451,
+      "routable": false,
+      "costUsd": 0,
+      "latencyMs": 0
+    },
+    {
+      "asOf": 1777024800000,
+      "barIndex": 2722,
+      "action": "BUY",
+      "verdict": "REVISE",
+      "conviction": 0.2657,
+      "routable": false,
+      "costUsd": 0,
+      "latencyMs": 0
+    },
+    {
+      "asOf": 1777039200000,
+      "barIndex": 2726,
+      "action": "BUY",
+      "verdict": "REVISE",
+      "conviction": 0.3429,
+      "routable": false,
+      "costUsd": 0,
+      "latencyMs": 0
+    },
+    {
+      "asOf": 1777053600000,
+      "barIndex": 2730,
+      "action": "BUY",
+      "verdict": "APPROVE",
+      "conviction": 0.4267,
+      "routable": true,
+      "costUsd": 0,
+      "latencyMs": 0
+    },
+    {
+      "asOf": 1777068000000,
+      "barIndex": 2734,
+      "action": "BUY",
+      "verdict": "APPROVE",
+      "conviction": 0.4155,
+      "routable": true,
+      "costUsd": 0,
+      "latencyMs": 0
+    },
+    {
+      "asOf": 1777082400000,
+      "barIndex": 2738,
+      "action": "BUY",
+      "verdict": "REVISE",
+      "conviction": 0.263,
+      "routable": false,
+      "costUsd": 0,
+      "latencyMs": 0
+    },
+    {
+      "asOf": 1777096800000,
+      "barIndex": 2742,
+      "action": "BUY",
+      "verdict": "REVISE",
+      "conviction": 0.1972,
+      "routable": false,
+      "costUsd": 0,
+      "latencyMs": 0
+    },
+    {
+      "asOf": 1777111200000,
+      "barIndex": 2746,
+      "action": "BUY",
+      "verdict": "REVISE",
+      "conviction": 0.1451,
+      "routable": false,
+      "costUsd": 0,
+      "latencyMs": 0
+    },
+    {
+      "asOf": 1777125600000,
+      "barIndex": 2750,
+      "action": "BUY",
+      "verdict": "REVISE",
+      "conviction": 0.1898,
+      "routable": false,
+      "costUsd": 0,
+      "latencyMs": 0
+    },
+    {
+      "asOf": 1777140000000,
+      "barIndex": 2754,
+      "action": "BUY",
+      "verdict": "REVISE",
+      "conviction": 0.2068,
+      "routable": false,
+      "costUsd": 0,
+      "latencyMs": 0
+    },
+    {
+      "asOf": 1777154400000,
+      "barIndex": 2758,
+      "action": "BUY",
+      "verdict": "REVISE",
+      "conviction": 0.1889,
+      "routable": false,
+      "costUsd": 0,
+      "latencyMs": 0
+    },
+    {
+      "asOf": 1777168800000,
+      "barIndex": 2762,
+      "action": "BUY",
+      "verdict": "REVISE",
+      "conviction": 0.1456,
+      "routable": false,
+      "costUsd": 0,
+      "latencyMs": 0
+    },
+    {
+      "asOf": 1777183200000,
+      "barIndex": 2766,
+      "action": "BUY",
+      "verdict": "REVISE",
+      "conviction": 0.1483,
+      "routable": false,
+      "costUsd": 0,
+      "latencyMs": 0
+    },
+    {
+      "asOf": 1777197600000,
+      "barIndex": 2770,
+      "action": "BUY",
+      "verdict": "REVISE",
+      "conviction": 0.2195,
+      "routable": false,
+      "costUsd": 0,
+      "latencyMs": 0
+    },
+    {
+      "asOf": 1777212000000,
+      "barIndex": 2774,
+      "action": "BUY",
+      "verdict": "REVISE",
+      "conviction": 0.2352,
+      "routable": false,
+      "costUsd": 0,
+      "latencyMs": 0
+    },
+    {
+      "asOf": 1777226400000,
+      "barIndex": 2778,
+      "action": "BUY",
+      "verdict": "REVISE",
+      "conviction": 0.2929,
+      "routable": false,
+      "costUsd": 0,
+      "latencyMs": 0
+    },
+    {
+      "asOf": 1777240800000,
+      "barIndex": 2782,
+      "action": "BUY",
+      "verdict": "REVISE",
+      "conviction": 0.2344,
+      "routable": false,
+      "costUsd": 0,
+      "latencyMs": 1
+    },
+    {
+      "asOf": 1777255200000,
+      "barIndex": 2786,
+      "action": "BUY",
+      "verdict": "REVISE",
+      "conviction": 0.272,
+      "routable": false,
+      "costUsd": 0,
+      "latencyMs": 0
+    },
+    {
+      "asOf": 1777269600000,
+      "barIndex": 2790,
+      "action": "BUY",
+      "verdict": "REVISE",
+      "conviction": 0.2181,
+      "routable": false,
+      "costUsd": 0,
+      "latencyMs": 0
+    },
+    {
+      "asOf": 1777284000000,
+      "barIndex": 2794,
+      "action": "BUY",
+      "verdict": "REVISE",
+      "conviction": 0.2742,
+      "routable": false,
+      "costUsd": 0,
+      "latencyMs": 0
+    },
+    {
+      "asOf": 1777298400000,
+      "barIndex": 2798,
+      "action": "BUY",
+      "verdict": "REVISE",
+      "conviction": 0.3055,
+      "routable": false,
+      "costUsd": 0,
+      "latencyMs": 0
+    },
+    {
+      "asOf": 1777312800000,
+      "barIndex": 2802,
+      "action": "BUY",
+      "verdict": "REVISE",
+      "conviction": 0.2293,
+      "routable": false,
+      "costUsd": 0,
+      "latencyMs": 0
+    },
+    {
+      "asOf": 1777327200000,
+      "barIndex": 2806,
+      "action": "BUY",
+      "verdict": "REVISE",
+      "conviction": 0.1853,
+      "routable": false,
+      "costUsd": 0,
+      "latencyMs": 0
+    },
+    {
+      "asOf": 1777341600000,
+      "barIndex": 2810,
+      "action": "BUY",
+      "verdict": "REVISE",
+      "conviction": 0.1741,
+      "routable": false,
+      "costUsd": 0,
+      "latencyMs": 0
+    },
+    {
+      "asOf": 1777356000000,
+      "barIndex": 2814,
+      "action": "BUY",
+      "verdict": "REVISE",
+      "conviction": 0.2206,
+      "routable": false,
+      "costUsd": 0,
+      "latencyMs": 0
+    },
+    {
+      "asOf": 1777370400000,
+      "barIndex": 2818,
+      "action": "BUY",
+      "verdict": "REVISE",
+      "conviction": 0.2364,
+      "routable": false,
+      "costUsd": 0,
+      "latencyMs": 0
+    },
+    {
+      "asOf": 1777384800000,
+      "barIndex": 2822,
+      "action": "BUY",
+      "verdict": "REVISE",
+      "conviction": 0.1457,
+      "routable": false,
+      "costUsd": 0,
+      "latencyMs": 0
+    },
+    {
+      "asOf": 1777399200000,
+      "barIndex": 2826,
+      "action": "BUY",
+      "verdict": "REVISE",
+      "conviction": 0.099,
+      "routable": false,
+      "costUsd": 0,
+      "latencyMs": 0
+    },
+    {
+      "asOf": 1777413600000,
+      "barIndex": 2830,
+      "action": "BUY",
+      "verdict": "REVISE",
+      "conviction": 0.118,
+      "routable": false,
+      "costUsd": 0,
+      "latencyMs": 0
+    },
+    {
+      "asOf": 1777428000000,
+      "barIndex": 2834,
+      "action": "BUY",
+      "verdict": "REVISE",
+      "conviction": 0.1465,
+      "routable": false,
+      "costUsd": 0,
+      "latencyMs": 0
+    },
+    {
+      "asOf": 1777442400000,
+      "barIndex": 2838,
+      "action": "BUY",
+      "verdict": "REVISE",
+      "conviction": 0.21,
+      "routable": false,
+      "costUsd": 0,
+      "latencyMs": 0
+    },
+    {
+      "asOf": 1777456800000,
+      "barIndex": 2842,
+      "action": "BUY",
+      "verdict": "REVISE",
+      "conviction": 0.2057,
+      "routable": false,
+      "costUsd": 0,
+      "latencyMs": 0
+    },
+    {
+      "asOf": 1777471200000,
+      "barIndex": 2846,
+      "action": "BUY",
+      "verdict": "REVISE",
+      "conviction": 0.2601,
+      "routable": false,
+      "costUsd": 0,
+      "latencyMs": 0
+    },
+    {
+      "asOf": 1777485600000,
+      "barIndex": 2850,
+      "action": "BUY",
+      "verdict": "REVISE",
+      "conviction": 0.3312,
+      "routable": false,
+      "costUsd": 0,
+      "latencyMs": 0
+    },
+    {
+      "asOf": 1777500000000,
+      "barIndex": 2854,
+      "action": "BUY",
+      "verdict": "REVISE",
+      "conviction": 0.2523,
+      "routable": false,
+      "costUsd": 0,
+      "latencyMs": 0
+    },
+    {
+      "asOf": 1777514400000,
+      "barIndex": 2858,
+      "action": "BUY",
+      "verdict": "REVISE",
+      "conviction": 0.2456,
+      "routable": false,
+      "costUsd": 0,
+      "latencyMs": 0
+    }
+  ],
+  "totalCostUsd": 0,
+  "totalLatencyMs": 7,
+  "scoring": {
+    "agent": {
+      "totalSignals": 2,
+      "winningSignals": 2,
+      "winRate": 1,
+      "avgRR": 2
+    },
+    "baseline": {
+      "totalSignals": 486,
+      "winningSignals": 404,
+      "winRate": 0.8313,
+      "avgRR": 1.3689
+    },
+    "edgeVsBaseline": {
+      "winRateDelta": 0.1687,
+      "avgRDelta": 0.6311
+    },
+    "horizonBars": 24,
+    "routableCount": 2,
+    "totalRecommendations": 486
+  },
+  "calibration": {
+    "bins": [
+      {
+        "lo": 0,
+        "hi": 0.1,
+        "count": 0,
+        "meanConviction": 0,
+        "hitRate": 0
+      },
+      {
+        "lo": 0.1,
+        "hi": 0.2,
+        "count": 0,
+        "meanConviction": 0,
+        "hitRate": 0
+      },
+      {
+        "lo": 0.2,
+        "hi": 0.3,
+        "count": 0,
+        "meanConviction": 0,
+        "hitRate": 0
+      },
+      {
+        "lo": 0.3,
+        "hi": 0.4,
+        "count": 0,
+        "meanConviction": 0,
+        "hitRate": 0
+      },
+      {
+        "lo": 0.4,
+        "hi": 0.5,
+        "count": 2,
+        "meanConviction": 0.4211,
+        "hitRate": 1
+      },
+      {
+        "lo": 0.5,
+        "hi": 0.6,
+        "count": 0,
+        "meanConviction": 0,
+        "hitRate": 0
+      },
+      {
+        "lo": 0.6,
+        "hi": 0.7,
+        "count": 0,
+        "meanConviction": 0,
+        "hitRate": 0
+      },
+      {
+        "lo": 0.7,
+        "hi": 0.8,
+        "count": 0,
+        "meanConviction": 0,
+        "hitRate": 0
+      },
+      {
+        "lo": 0.8,
+        "hi": 0.9,
+        "count": 0,
+        "meanConviction": 0,
+        "hitRate": 0
+      },
+      {
+        "lo": 0.9,
+        "hi": 1,
+        "count": 0,
+        "meanConviction": 0,
+        "hitRate": 0
+      }
+    ],
+    "expectedCalibrationError": 0.5789,
+    "brierScore": 0.3352,
+    "sampleSize": 2
+  },
+  "netEdge": {
+    "trades": 2,
+    "grossEdgeR": 2,
+    "riskBudgetUsd": 100,
+    "grossEdgeUsd": 400,
+    "totalCostUsd": 0,
+    "avgCostUsd": 0,
+    "netEdgeUsd": 400,
+    "netEdgePerTradeUsd": 200
+  }
+}

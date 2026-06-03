@@ -106,6 +106,9 @@ importers:
 
   packages/backtest:
     dependencies:
+      '@trading-app/agents':
+        specifier: workspace:*
+        version: link:../agents
       '@trading-app/engine':
         specifier: workspace:*
         version: link:../engine
