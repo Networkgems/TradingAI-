@@ -116,6 +116,19 @@ import {
   seedSampleResearchReportIfEmpty,
   ResearchValidationError,
 } from './research-store.js';
+// TRA-532 — Live-Trading Promotion Gate enforcement + audit store/service.
+import {
+  registerBacktestReport,
+  recordSignoff,
+  listStrategyRecords,
+  getEffectiveThresholds,
+  PromotionValidationError,
+} from './promotion-store.js';
+import {
+  buildPromotionStatus,
+  snapshotPaperMetrics,
+  evaluateLiveTransitionGate,
+} from './promotion-service.js';
 
 const log = logger.child({ module: 'index' });
 
@@ -1670,6 +1683,133 @@ app.post('/api/market-review/run', requireAuth, requireAdmin, async (req, res) =
   }
 });
 
+// ── Live-Trading Promotion Gate (TRA-532) ────────────────────────────────────
+//
+// The gate refuses a live transition unless a strategy has passed backtest +
+// paper and carries a sign-off (enforced in PUT /api/account/settings above).
+// These routes surface the per-stage status with metrics computed from data,
+// register a Stage-1 backtest report, and record the Stage-3 sign-off audit.
+
+// Per-strategy promotion status (per-stage state + computed metrics + verdict).
+// Scoped to the caller's paper ledger; backtest/sign-off are global. Any
+// authenticated user can read so the dashboard can render the gate UI.
+app.get('/api/promotion/status/:strategyId', requireAuth, async (req, res, next) => {
+  const username = res.locals['authUser'] as string;
+  try {
+    const status = await buildPromotionStatus(username, req.params['strategyId'] as string);
+    res.json(status);
+  } catch (err) {
+    next(err);
+  }
+});
+
+// All registered strategies' records + the caller's live status for each, plus
+// the effective thresholds — drives the gate overview panel.
+app.get('/api/promotion/status', requireAuth, async (_req, res, next) => {
+  const username = res.locals['authUser'] as string;
+  try {
+    const records = await listStrategyRecords();
+    const statuses = await Promise.all(
+      records.map(async r => ({
+        record: r,
+        status: await buildPromotionStatus(username, r.strategyId),
+        thresholds: await getEffectiveThresholds(r.strategyId),
+      })),
+    );
+    res.json({ strategies: statuses });
+  } catch (err) {
+    next(err);
+  }
+});
+
+// Stage 1 — register a backtest report for a strategy. Admin-only. The body
+// carries the FULL computed `BacktestResult`; the server picks the gate metrics
+// off it (deriveBacktestGateMetrics) so the registered numbers always reflect a
+// real run — a reviewer cannot hand-type metrics to clear the gate (TRA-527 §3).
+app.post('/api/promotion/backtest', requireAuth, requireAdmin, async (req, res) => {
+  const username = res.locals['authUser'] as string;
+  try {
+    const body = req.body as { strategyId?: string; reportId?: string; report?: unknown };
+    if (!body?.strategyId || typeof body.strategyId !== 'string') {
+      res.status(400).json({ error: 'strategyId is required' });
+      return;
+    }
+    if (!body.report || typeof body.report !== 'object') {
+      res.status(400).json({ error: 'report (a computed BacktestResult) is required' });
+      return;
+    }
+    const rec = await registerBacktestReport({
+      strategyId: body.strategyId,
+      report: body.report as Parameters<typeof registerBacktestReport>[0]['report'],
+      reportId: typeof body.reportId === 'string' ? body.reportId : 'unspecified',
+      registeredBy: username,
+    });
+    res.status(201).json(rec);
+  } catch (err) {
+    if (err instanceof PromotionValidationError) {
+      res.status(400).json({ error: err.message });
+      return;
+    }
+    log.error('TRA-532 register backtest failed', { reason: err instanceof Error ? err.message : String(err) });
+    res.status(500).json({ error: 'Failed to register backtest report' });
+  }
+});
+
+// Stage 3 — record a sign-off (`promotion_decision`). Admin-only (QuantTrader
+// is an admin reviewer). Refuses to sign off a strategy that is not actually
+// passing both gates UNLESS the reviewer supplies a threshold override + a
+// written rationale (loosen-only audit per TRA-527 §3/§Enforcement).
+app.post('/api/promotion/signoff', requireAuth, requireAdmin, async (req, res) => {
+  const username = res.locals['authUser'] as string;
+  try {
+    const body = req.body as {
+      strategyId?: string;
+      thresholdOverrides?: unknown;
+      rationale?: string;
+    };
+    if (!body?.strategyId || typeof body.strategyId !== 'string') {
+      res.status(400).json({ error: 'strategyId is required' });
+      return;
+    }
+    const overrides = body.thresholdOverrides as Parameters<typeof recordSignoff>[0]['thresholdOverrides'];
+    // Evaluate current state (with any proposed overrides not yet stored, the
+    // base status must already pass both data gates; overrides only loosen and
+    // are recorded for audit). Block sign-off if a data gate fails and no
+    // override+rationale justifies it.
+    const status = await buildPromotionStatus(username, body.strategyId);
+    const dataGatesPass = status.backtest.state === 'pass' && status.paper.state === 'pass';
+    if (!dataGatesPass && !overrides) {
+      res.status(422).json({
+        ok: false,
+        code: 'signoff_blocked',
+        error:
+          'Cannot sign off: the strategy does not pass both data gates. '
+          + 'Supply thresholdOverrides + rationale to loosen (audited), or fix the underlying metrics. '
+          + status.blockedReasons.join(' | '),
+        status,
+      });
+      return;
+    }
+    const paperMetrics = await snapshotPaperMetrics(username, body.strategyId);
+    const decision = await recordSignoff({
+      strategyId: body.strategyId,
+      reviewer: username,
+      backtestMetrics: status.backtest.metrics,
+      paperMetrics,
+      thresholdOverrides: overrides,
+      rationale: typeof body.rationale === 'string' ? body.rationale : undefined,
+    });
+    res.status(201).json({ ok: true, decision, status: await buildPromotionStatus(username, body.strategyId) });
+  } catch (err) {
+    if (err instanceof PromotionValidationError) {
+      res.status(400).json({ error: err.message });
+      return;
+    }
+    log.error('TRA-532 sign-off failed', { reason: err instanceof Error ? err.message : String(err) });
+    res.status(500).json({ error: 'Failed to record sign-off' });
+  }
+});
+
 // TRA-244 — `?mode=` lets the client pick which calendar bucket to read.
 // Defaults follow the user's saved settings so callers without the query
 // (legacy clients, scripts) keep their current behavior.
@@ -1934,6 +2074,43 @@ app.put('/api/account/settings', requireAuth, async (req, res) => {
     ...validateLiveCredentials(updated).missing,
     ...validateProductionTradierKeys(updated).missing,
   ]));
+  // TRA-532 — Live-Trading Promotion Gate. Before persisting a settings change
+  // whose *result* runs live crypto auto-trading, every strategy the active
+  // preset would trade live must be fully promoted
+  // (backtest=pass AND paper=pass AND signoff=present). An unpromoted strategy
+  // blocks the save with the exact failing gate so the UI can surface it. The
+  // gate only fires on results that turn/keep live ON — turning live OFF or
+  // editing settings in Demo is never blocked (see evaluateLiveTransitionGate).
+  try {
+    const gate = await evaluateLiveTransitionGate(username, updated);
+    if (!gate.allowed) {
+      log.warn('TRA-532 refused live transition', { username, blocked: gate.blocked.map(b => b.strategyId) });
+      res.status(422).json({
+        ok: false,
+        code: 'promotion_gate_blocked',
+        error:
+          'Live trading is blocked by the promotion gate: '
+          + gate.blocked
+            .map(b => `${b.strategyId} — ${b.reasons.join(' | ')}`)
+            .join(' ;; '),
+        blocked: gate.blocked,
+      });
+      return;
+    }
+  } catch (err: unknown) {
+    // Fail CLOSED: if the gate cannot be evaluated we must not silently let a
+    // live flip through. Surface a 500 the dashboard can retry.
+    log.error('TRA-532 promotion gate evaluation failed', {
+      username,
+      reason: err instanceof Error ? err.message : String(err),
+    });
+    res.status(500).json({
+      ok: false,
+      code: 'promotion_gate_error',
+      error: 'Could not verify the live-trading promotion gate. Live transition refused; please retry.',
+    });
+    return;
+  }
   // TRA-511 — wrap the persistence call so a `writeFile` failure (disk full,
   // EACCES, EROFS, etc.) surfaces to the UI as a red "save failed" toast
   // instead of silently appearing to succeed. Before this, an EBUSY on the
