@@ -1,7 +1,7 @@
-import { OrbStrategy, BbFadeStrategy, IchimokuStrategy, TradierOptionsClient, TradierOrderClient, TRADIER_REJECTED_STATUSES, evaluateSma200, SMA200_MIN_BARS, SMA200_DEBOUNCE_BARS } from '@trading-app/engine';
+import { OrbStrategy, BbFadeStrategy, IchimokuStrategy, TradierOptionsClient, TradierOrderClient, TRADIER_REJECTED_STATUSES, evaluateSma200, SMA200_MIN_BARS, SMA200_DEBOUNCE_BARS, composeTechnicalSnapshot, resampleCandles, TF_BUCKET_MS } from '@trading-app/engine';
 import type { TradierAccountBalance } from '@trading-app/engine';
 import { WATCHLIST, MANAGED_ACCOUNT_RATIO, MAX_CONSECUTIVE_LOSSES, DAILY_DRAWDOWN_HALT_PCT, OPTIONS_PER_TICKET_DOLLAR_FLOOR, OPTIONS_POSITION_CAP_RATIO, aliasWatchlistSymbol, isLiveTradierOptionsEnabled, isStockMarketOpen, perPositionCap, resolveAutoManageImportedTradierOptions, resolveDemoCostModel, resolveHoldLiveOptionsOvernight, resolveLiveTradeEquitiesTradier, resolveManagedAccountRatio, resolveMarketReviewGatesEnabled, resolveRiskPerTrade, resolveRvDtePrefs, resolveTradierOptionsCreds, validateBracket, DEFAULT_RV_DTE_MIN, DEFAULT_RV_DTE_MAX, DEFAULT_RV_DTE_TARGET, scoreNewsSentiment, aggregateSymbolSentiment, nameAliasesFor } from '@trading-app/shared';
-import type { TradeSignal, RelativeValueSignal, Sma200Signal, Candle, OptionsAccountState, SignalType, Position, AccountSettings, AccountState, NewsItem, SymbolSentiment, TradierEnv, MarketReview, MarketReviewGates, EngineMarketReviewState, GatedStrategyNote } from '@trading-app/shared';
+import type { TradeSignal, RelativeValueSignal, Sma200Signal, Candle, OptionsAccountState, SignalType, Position, AccountSettings, AccountState, NewsItem, SymbolSentiment, TechnicalSignalSnapshot, TradierEnv, MarketReview, MarketReviewGates, EngineMarketReviewState, GatedStrategyNote } from '@trading-app/shared';
 import { getLatestMarketReview } from './market-review.js';
 import { etDateString } from './scheduler.js';
 import { fetchMinuteBars, fetchDailyCandles, fetchQuotes, fetchStocksNews, isYahooBreakerOpen, setActiveInterestSymbols, setTradierStocksFeedClient } from './yahoo-feed.js';
@@ -129,6 +129,18 @@ const SMA200_SCAN_INTERVAL_MS = 4 * 60 * 60_000;
 // TRA-451 — daily bars pulled per symbol for the SMA-200 scan. The spec needs
 // ≥ 250 sessions; an extra ~30-bar cushion covers holidays / missing prints.
 const SMA200_DAILY_BARS = SMA200_MIN_BARS + 30;
+
+// TRA-533 (TRA-530 Part A) — multi-timeframe technical snapshot refresh. A full
+// snapshot for one symbol pulls a deep minute-bar history (resampled to 15m/1h)
+// plus daily candles, so it is materially heavier than the 30s candle refresh.
+// A 5-minute throttle keeps the per-symbol snapshots fresh for the TRA-529
+// analysts without burning Yahoo quota on every tick; the breadth route also
+// computes on demand for cold symbols. The minute pull is sized to the deepest
+// intraday history Yahoo's 1m feed serves (~7 sessions); 15m/1h indicators that
+// still lack history degrade to null reads (the daily TF carries SMA200).
+const TECHNICAL_SNAPSHOT_REFRESH_MS = 5 * 60_000;
+const MTF_MINUTE_BARS = 2000;
+const MTF_DAILY_BARS = 260;
 
 /**
  * TRA-389 — how often the engine re-reads the persisted premarket
@@ -340,6 +352,13 @@ export class SignalEngine {
   private allClosedPositions: Position[] = [];
   private newsCache: NewsItem[] = [];
   private lastNewsRefresh = 0;
+  /**
+   * TRA-533 — per-symbol multi-timeframe technical snapshots, refreshed on the
+   * tick (throttled, see {@link TECHNICAL_SNAPSHOT_REFRESH_MS}) and read by
+   * `GET /api/analysis/breadth/:symbol`.
+   */
+  private technicalSnapshots: Map<string, TechnicalSignalSnapshot> = new Map();
+  private lastTechnicalRefreshAt = 0;
 
   private dailySignals: DailySignalRecord[] = [];
   private positionSignalType: Map<string, SignalType> = new Map();
@@ -1389,6 +1408,22 @@ export class SignalEngine {
       } catch (err: unknown) {
         log.warn('sma200 scan threw', {
           component: 'sma200-scan',
+          reason: err instanceof Error ? err.message : String(err),
+        });
+      }
+    }
+
+    // TRA-533 — refresh the per-symbol multi-timeframe technical snapshots for
+    // the TRA-529 analysts. Throttled (5 min) and batched so the deep
+    // minute-bar pulls don't hammer Yahoo every tick; swallowed so a cold feed
+    // can't take down the tick.
+    if (Date.now() - this.lastTechnicalRefreshAt >= TECHNICAL_SNAPSHOT_REFRESH_MS) {
+      this.lastTechnicalRefreshAt = Date.now();
+      try {
+        await this.refreshTechnicalSnapshots(activeSymbols);
+      } catch (err: unknown) {
+        log.warn('technical snapshot scan threw', {
+          component: 'mtf',
           reason: err instanceof Error ? err.message : String(err),
         });
       }
@@ -3228,6 +3263,65 @@ export class SignalEngine {
       news: this.newsCache,
       now: Date.now(),
     });
+  }
+
+  /**
+   * TRA-533 — fetch + resample candles for one symbol and compose its
+   * multi-timeframe technical snapshot, caching the result. 15m/1h are
+   * resampled from a deep minute-bar pull; 1d from daily candles. Never throws:
+   * a feed failure leaves the previous snapshot in place (or returns null on a
+   * cold symbol). Deterministic given the fetched candles — the math lives in
+   * the pure engine `composeTechnicalSnapshot`.
+   */
+  async refreshTechnicalSnapshot(symbol: string): Promise<TechnicalSignalSnapshot | null> {
+    const sym = aliasWatchlistSymbol(symbol).toUpperCase();
+    try {
+      const [minuteBars, dailyBars] = await Promise.all([
+        fetchMinuteBars(sym, MTF_MINUTE_BARS).catch(() => [] as Candle[]),
+        fetchDailyCandles(sym, MTF_DAILY_BARS).catch(() => [] as Candle[]),
+      ]);
+      const snap = composeTechnicalSnapshot(sym, new Date().toISOString(), {
+        '15m': resampleCandles(minuteBars, TF_BUCKET_MS['15m']),
+        '1h': resampleCandles(minuteBars, TF_BUCKET_MS['1h']),
+        '1d': dailyBars,
+      });
+      this.technicalSnapshots.set(sym, snap);
+      return snap;
+    } catch (err: unknown) {
+      log.warn('technical snapshot refresh failed', {
+        component: 'mtf',
+        sym,
+        reason: err instanceof Error ? err.message : String(err),
+      });
+      return this.technicalSnapshots.get(sym) ?? null;
+    }
+  }
+
+  /** TRA-533 — batched snapshot refresh over the active watchlist. */
+  private async refreshTechnicalSnapshots(symbols: string[]): Promise<void> {
+    const BATCH = 5;
+    for (let i = 0; i < symbols.length; i += BATCH) {
+      await Promise.all(symbols.slice(i, i + BATCH).map(sym => this.refreshTechnicalSnapshot(sym)));
+    }
+  }
+
+  /**
+   * TRA-533 — cached multi-timeframe technical snapshot for a symbol. Returns
+   * null until the first refresh has run for it (the breadth route falls back
+   * to an on-demand compute). Never throws.
+   */
+  getTechnicalSnapshot(symbol: string): TechnicalSignalSnapshot | null {
+    return this.technicalSnapshots.get(aliasWatchlistSymbol(symbol).toUpperCase()) ?? null;
+  }
+
+  /**
+   * TRA-533 — cached snapshot if present, otherwise compute one on demand. Used
+   * by `GET /api/analysis/breadth/:symbol` so an analyst querying a symbol the
+   * tick hasn't reached yet still gets a (freshly-computed) feed rather than
+   * null. Returns null only when both the cache miss and the fetch fail.
+   */
+  async getOrComputeTechnicalSnapshot(symbol: string): Promise<TechnicalSignalSnapshot | null> {
+    return this.getTechnicalSnapshot(symbol) ?? this.refreshTechnicalSnapshot(symbol);
   }
 
   getReportSnapshot() {

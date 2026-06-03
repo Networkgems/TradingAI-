@@ -1642,10 +1642,15 @@ app.get('/api/analysis/breadth/:symbol', requireAuth, async (req, res) => {
     notes.sentiment = err instanceof Error ? err.message : 'sentiment unavailable';
   }
 
-  // TRA-533 fills this in (multi-timeframe technical snapshot). Until then the
-  // analyst sees a null technical feed with a reason, not a 500.
-  const technical = null;
-  notes.technical = 'technical snapshot not yet implemented (TRA-533)';
+  // TRA-533 — multi-timeframe technical snapshot. Cached-or-on-demand; degrades
+  // to a null feed with a reason (no candles yet / feed cold) rather than 500ing.
+  let technical = null;
+  try {
+    technical = await ctx.engine.getOrComputeTechnicalSnapshot(symbol);
+    if (!technical) notes.technical = 'no technical data available for symbol';
+  } catch (err) {
+    notes.technical = err instanceof Error ? err.message : 'technical snapshot unavailable';
+  }
 
   res.json({
     symbol,

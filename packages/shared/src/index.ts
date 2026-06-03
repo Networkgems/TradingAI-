@@ -1924,6 +1924,65 @@ export interface SymbolSentimentHeadline {
   publishedAt: string; // ISO
 }
 
+/**
+ * TRA-533 (TRA-530 Part A) — multi-timeframe technical signal snapshot handed
+ * to the TRA-529 technical analyst and surfaced in
+ * `GET /api/analysis/breadth/:symbol`. Computed by the deterministic engine
+ * compose function {@link composeTechnicalSnapshot} (see
+ * `packages/engine/src/indicators/mtf.ts`) over per-timeframe candle arrays.
+ */
+export type TechnicalTimeframe = '15m' | '1h' | '1d';
+
+/**
+ * Directional read on `mtfScore`, bucketed per the TRA-530 spec at ±0.2 / ±0.5.
+ */
+export type MtfBias = 'strong_bull' | 'bull' | 'neutral' | 'bear' | 'strong_bear';
+
+/** Raw indicator reads for one timeframe; `null` when data was insufficient. */
+export interface TechnicalIndicatorReads {
+  /** Wilder RSI(14) on closes. */
+  rsi: number | null;
+  /** ADX(14) trend strength. */
+  adx: number | null;
+  /** MACD(12,26,9) histogram (macd − signal). */
+  macdHist: number | null;
+  /** EMA(20). */
+  emaFast: number | null;
+  /** EMA(50). */
+  emaSlow: number | null;
+  /** ATR(14) as a fraction of the latest close. */
+  atrPct: number | null;
+  /** Bollinger %B — (price − lower) / (upper − lower); ~0..1, can over/undershoot. */
+  bbPercentB: number | null;
+  /** Intraday only: signed distance of price from VWAP, as a fraction of price. */
+  vwapDist?: number | null;
+}
+
+/** Per-timeframe directional decomposition. Each sub-score is in [-1,+1]. */
+export interface TimeframeSignal {
+  /** EMA stack / SMA200 position / slope vote, de-weighted ×0.5 when ADX<15. */
+  trend: number;
+  /** RSI band + MACD histogram sign vote. */
+  momentum: number;
+  /** Bollinger %B (+ VWAP side on intraday TFs). */
+  location: number;
+  /** 0.45·trend + 0.35·momentum + 0.20·location, clamped [-1,+1]. */
+  tfScore: number;
+  indicators: TechnicalIndicatorReads;
+}
+
+export interface TechnicalSignalSnapshot {
+  symbol: string;
+  asOf: string; // ISO
+  /** Present timeframes only; a TF is omitted when it had no candles at all. */
+  timeframes: Partial<Record<TechnicalTimeframe, TimeframeSignal>>;
+  /** 0.50·tf(1d) + 0.30·tf(1h) + 0.20·tf(15m), renormalized over present TFs. */
+  mtfScore: number;
+  mtfBias: MtfBias;
+  /** Fraction of present TFs whose tfScore sign matches sign(mtfScore). */
+  mtfAlignment: number;
+}
+
 export type ResearchReportKind = 'premarket' | 'postmarket' | 'weekly_review';
 
 /**
