@@ -56,7 +56,7 @@ export function normalPpf(p: number): number {
 
   const plow = 0.02425;
   const phigh = 1 - plow;
-  let q: number, r: number;
+  let q: number;
 
   if (pp < plow) {
     q = Math.sqrt(-2 * Math.log(pp));
@@ -69,7 +69,7 @@ export function normalPpf(p: number): number {
       ((((d[0] * q + d[1]) * q + d[2]) * q + d[3]) * q + 1);
   }
   q = pp - 0.5;
-  r = q * q;
+  const r = q * q;
   return (((((a[0] * r + a[1]) * r + a[2]) * r + a[3]) * r + a[4]) * r + a[5]) * q /
     (((((b[0] * r + b[1]) * r + b[2]) * r + b[3]) * r + b[4]) * r + 1);
 }
@@ -296,7 +296,6 @@ export function probabilityOfBacktestOverfitting(input: PboInput): PboResult {
   // Equal blocks — trim trailing remainder columns so every block is the same
   // size (CSCV requires balanced IS/OOS concatenations).
   const groupSize = Math.floor(tCols / s);
-  const usable = groupSize * s;
   const blocks: number[][] = [];
   for (let g = 0; g < s; g++) {
     const cols: number[] = [];

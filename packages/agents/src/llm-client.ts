@@ -71,7 +71,7 @@ export class StubLlmClient implements LlmClient {
   }
 }
 
-export interface CompleteJsonOptions<T> {
+export interface CompleteJsonOptions {
   /** Returns the list of field-level errors; empty ↔ valid. */
   validate: (value: unknown) => string[];
   /** Total tries including the first (default 3). */
@@ -118,7 +118,7 @@ export function extractJson(text: string): string {
 export async function completeJson<T>(
   llm: LlmClient,
   req: LlmCompletionRequest,
-  opts: CompleteJsonOptions<T>,
+  opts: CompleteJsonOptions,
 ): Promise<CompleteJsonResult<T>> {
   const maxAttempts = Math.max(1, opts.maxAttempts ?? 3);
   const messages: LlmMessage[] = [...req.messages];
