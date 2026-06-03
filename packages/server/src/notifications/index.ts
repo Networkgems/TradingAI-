@@ -1,8 +1,8 @@
 // TRA-563 (TRA-410 A1) — notifications barrel.
+// TRA-566 (TRA-410 A2) — channel adapters + shared renderer + link store added.
 //
-// The dispatcher core + event model live here. Channel adapters
-// (email / Telegram / Discord) and the shared renderer land in A2 and will be
-// re-exported from this barrel as they arrive.
+// The dispatcher core + event model, the shared event→message renderer, and the
+// email / Telegram / Discord channel adapters are all re-exported from here.
 
 export {
   NotificationDispatcher,
@@ -21,3 +21,31 @@ export type {
   ChannelAdapter,
   DispatcherDeps,
 } from './dispatcher.js';
+
+export { renderAlert } from './renderer.js';
+export type { RenderedAlert } from './renderer.js';
+
+export { buildSampleAlertEvent } from './sample-event.js';
+
+export {
+  registerChannelAdapters,
+  EmailChannelAdapter,
+  TelegramChannelAdapter,
+  DiscordChannelAdapter,
+  isValidDiscordWebhook,
+} from './channels/index.js';
+export type {
+  ChannelAdapterDeps,
+  EmailAdapterDeps,
+  TelegramAdapterDeps,
+  DiscordAdapterDeps,
+} from './channels/index.js';
+
+export {
+  issueLinkToken,
+  consumeLinkToken,
+  parseStartCommand,
+  pendingLinkTokenCount,
+  __resetLinkTokensForTest,
+  LINK_TOKEN_TTL_MS,
+} from './telegram-link.js';

@@ -17,7 +17,16 @@ import {
 import { createToken, verifyToken, generateResetToken, consumeResetToken, initResetTokenStore } from './auth.js';
 import { checkThrottle, recordFailure, recordSuccess } from './auth-throttle.js';
 import { getSettings, loadSettings, mergeScopedRiskSettings, saveSettings } from './account-settings.js';
-import { initNotificationDispatcher } from './notifications/index.js';
+import {
+  initNotificationDispatcher,
+  registerChannelAdapters,
+  buildSampleAlertEvent,
+  issueLinkToken,
+  consumeLinkToken,
+  parseStartCommand,
+  isValidDiscordWebhook,
+  type ChannelAdapter,
+} from './notifications/index.js';
 import {
   initWatchlistStore,
   getCryptoWatchlistData,
@@ -133,6 +142,10 @@ import {
   type Position,
   type OptionPosition,
   type AccountMode,
+  ALERT_CHANNELS,
+  resolveAlertPreferences,
+  type AlertChannel,
+  type AlertPreferences,
 } from '@trading-app/shared';
 import {
   saveResearchReport,
@@ -218,10 +231,17 @@ log.info('rv-scanner initialized', {
 
 // TRA-563 (TRA-410 A1) — install the notification dispatcher. Preferences are
 // resolved from the cache-first per-user settings (warm once a user's context
-// is created). Channel adapters (email / Telegram / Discord) register in A2;
-// until then events with no eligible+configured channel are simply no-ops.
-initNotificationDispatcher({ loadSettings: (username) => getSettings(username) });
-log.info('notification dispatcher initialized');
+// is created).
+// TRA-566 (TRA-410 A2) — register the email / Telegram / Discord channel
+// adapters. Each is inert until configured (SMTP creds / a linked Telegram chat
+// / a pasted Discord webhook), so an unconfigured channel is skipped cleanly.
+const notificationDispatcher = initNotificationDispatcher({
+  loadSettings: (username) => getSettings(username),
+});
+const channelAdapters = registerChannelAdapters(notificationDispatcher);
+log.info('notification dispatcher initialized', {
+  channels: ALERT_CHANNELS,
+});
 
 // TRA-142 — migrate legacy global files into the admin namespace exactly once,
 // then bootstrap per-user contexts (engines, trackers, persistence timers) for
@@ -2395,6 +2415,220 @@ app.put('/api/account/settings', requireAuth, async (req, res) => {
   await ctx.cryptoEngine.applySettings(updated);
   broadcastCryptoState(ctx);
   res.json({ ok: true, settings: updated, missingLiveCredentials });
+});
+
+// ── TRA-566 (TRA-410 A2) — alert notifications ───────────────────────────────
+//
+// Channel adapters + shared renderer live in `notifications/`; these routes are
+// the user-facing surface: edit prefs, fire a test send, and link a Telegram
+// chat. The dispatcher itself fans out engine events (A1) through the same
+// registered adapters.
+
+/**
+ * Validate + deep-merge a partial AlertPreferences patch over the user's
+ * current (fully-resolved) prefs. Returns the sanitized result, or an error
+ * string for a 400. Never lets a malformed field corrupt the stored snapshot.
+ */
+function sanitizeNotificationPrefs(
+  base: AlertPreferences,
+  patch: Partial<AlertPreferences> | undefined,
+): { prefs: AlertPreferences; error?: string } {
+  const next: AlertPreferences = resolveAlertPreferences({ alertPreferences: base });
+  if (!patch || typeof patch !== 'object') return { prefs: next };
+
+  // Channels
+  if (patch.channels && typeof patch.channels === 'object') {
+    for (const ch of ALERT_CHANNELS) {
+      const inc = patch.channels[ch];
+      if (!inc || typeof inc !== 'object') continue;
+      const cur = next.channels[ch];
+      if (typeof inc.enabled === 'boolean') cur.enabled = inc.enabled;
+      if (typeof inc.emailAddress === 'string') {
+        const v = inc.emailAddress.trim();
+        if (v && !v.includes('@')) return { prefs: next, error: 'invalid email address' };
+        cur.emailAddress = v || undefined;
+      }
+      if (typeof inc.telegramChatId === 'string') {
+        cur.telegramChatId = inc.telegramChatId.trim() || undefined;
+      }
+      if (typeof inc.discordWebhookUrl === 'string') {
+        const v = inc.discordWebhookUrl.trim();
+        if (v && !isValidDiscordWebhook(v)) {
+          return { prefs: next, error: 'invalid Discord webhook URL' };
+        }
+        cur.discordWebhookUrl = v || undefined;
+      }
+    }
+  }
+
+  // Event routing matrix
+  if (patch.events && typeof patch.events === 'object') {
+    for (const klass of Object.keys(next.events) as (keyof AlertPreferences['events'])[]) {
+      const incRow = patch.events[klass];
+      if (!incRow || typeof incRow !== 'object') continue;
+      for (const ch of ALERT_CHANNELS) {
+        if (typeof incRow[ch] === 'boolean') next.events[klass][ch] = incRow[ch];
+      }
+    }
+  }
+
+  // Quiet hours
+  if (patch.quietHours && typeof patch.quietHours === 'object') {
+    const q = patch.quietHours;
+    if (typeof q.enabled === 'boolean') next.quietHours.enabled = q.enabled;
+    const hm = /^([01]?\d|2[0-3]):[0-5]\d$/;
+    if (typeof q.start === 'string') {
+      if (!hm.test(q.start.trim())) return { prefs: next, error: 'invalid quiet-hours start (HH:MM)' };
+      next.quietHours.start = q.start.trim();
+    }
+    if (typeof q.end === 'string') {
+      if (!hm.test(q.end.trim())) return { prefs: next, error: 'invalid quiet-hours end (HH:MM)' };
+      next.quietHours.end = q.end.trim();
+    }
+    if (typeof q.timezone === 'string' && q.timezone.trim()) {
+      const tz = q.timezone.trim();
+      try {
+        new Intl.DateTimeFormat('en-US', { timeZone: tz });
+      } catch {
+        return { prefs: next, error: 'invalid timezone' };
+      }
+      next.quietHours.timezone = tz;
+    }
+  }
+
+  // Signal digest
+  if (patch.signalDigest !== undefined) {
+    if (!['immediate', '15min', 'hourly'].includes(patch.signalDigest)) {
+      return { prefs: next, error: 'invalid signalDigest' };
+    }
+    next.signalDigest = patch.signalDigest;
+  }
+
+  return { prefs: next };
+}
+
+// Edit alert preferences. Partial patches are deep-merged over the user's
+// current prefs and validated; a bad field 400s without touching disk.
+app.put('/api/account/notifications', requireAuth, async (req, res) => {
+  const username = res.locals['authUser'] as string;
+  try {
+    const current = await loadSettings(username);
+    const base = resolveAlertPreferences(current);
+    const { prefs, error } = sanitizeNotificationPrefs(base, req.body as Partial<AlertPreferences>);
+    if (error) {
+      res.status(400).json({ ok: false, error });
+      return;
+    }
+    await saveSettings(username, { ...current, alertPreferences: prefs });
+    res.json({ ok: true, alertPreferences: prefs });
+  } catch (err) {
+    log.error('PUT /api/account/notifications failed', {
+      username,
+      reason: err instanceof Error ? err.message : String(err),
+    });
+    res.status(500).json({ ok: false, error: 'Failed to save notification preferences.' });
+  }
+});
+
+// Fire a test alert through ONE channel, bypassing routing/quiet-hours/digest
+// so the user can confirm a channel is wired. The channel must be configured
+// (SMTP creds / linked Telegram chat / valid Discord webhook) or this 409s.
+app.post('/api/notifications/test', requireAuth, async (req, res) => {
+  const username = res.locals['authUser'] as string;
+  const channel = (req.body as { channel?: string } | undefined)?.channel;
+  if (!channel || !ALERT_CHANNELS.includes(channel as AlertChannel)) {
+    res.status(400).json({ ok: false, error: `channel must be one of ${ALERT_CHANNELS.join(', ')}` });
+    return;
+  }
+  const adapter: ChannelAdapter | undefined =
+    channelAdapters[channel as keyof typeof channelAdapters];
+  if (!adapter) {
+    res.status(500).json({ ok: false, error: 'channel adapter not registered' });
+    return;
+  }
+  try {
+    const settings = await loadSettings(username);
+    const prefs = resolveAlertPreferences(settings);
+    if (!adapter.isConfigured(prefs)) {
+      res.status(409).json({
+        ok: false,
+        code: 'channel_not_configured',
+        error: `The ${channel} channel is not configured yet.`,
+      });
+      return;
+    }
+    await adapter.send(buildSampleAlertEvent(username), prefs);
+    res.json({ ok: true, channel });
+  } catch (err) {
+    log.warn('test notification failed', {
+      username,
+      channel,
+      reason: err instanceof Error ? err.message : String(err),
+    });
+    res.status(502).json({
+      ok: false,
+      code: 'send_failed',
+      error: `Test send failed: ${err instanceof Error ? err.message : String(err)}`,
+    });
+  }
+});
+
+// Issue a single-use Telegram link token + deep link. The user taps the link,
+// Telegram delivers `/start <token>` to the bot, and the webhook below records
+// their chat_id. Requires a deployment bot token to be useful.
+app.post('/api/notifications/telegram/link', requireAuth, (req, res) => {
+  const username = res.locals['authUser'] as string;
+  const botUsername = process.env['TELEGRAM_BOT_USERNAME'];
+  if (!process.env['TELEGRAM_BOT_TOKEN']) {
+    res.status(503).json({
+      ok: false,
+      code: 'telegram_not_configured',
+      error: 'Telegram is not enabled on this deployment (no TELEGRAM_BOT_TOKEN).',
+    });
+    return;
+  }
+  const token = issueLinkToken(username);
+  const deepLink = botUsername ? `https://t.me/${botUsername}?start=${token}` : undefined;
+  res.json({ ok: true, token, deepLink, botUsername: botUsername ?? null });
+});
+
+// Telegram webhook receiver — records the chat_id for a `/start <token>` deep
+// link. Unauthenticated (Telegram calls it) but gated by the secret token
+// configured via setWebhook (`TELEGRAM_WEBHOOK_SECRET`); without it the route
+// is closed so it can never be used to write arbitrary prefs.
+app.post('/api/notifications/telegram/webhook', async (req, res) => {
+  const secret = process.env['TELEGRAM_WEBHOOK_SECRET'];
+  if (!secret || req.header('x-telegram-bot-api-secret-token') !== secret) {
+    res.status(403).json({ ok: false });
+    return;
+  }
+  // Telegram always expects a 200 quickly; we never surface internal errors to it.
+  try {
+    const update = req.body as {
+      message?: { text?: string; chat?: { id?: number | string } };
+    };
+    const text = update?.message?.text;
+    const chatId = update?.message?.chat?.id;
+    const token = parseStartCommand(text);
+    if (token && chatId != null) {
+      const username = consumeLinkToken(token);
+      if (username) {
+        const current = await loadSettings(username);
+        const prefs = resolveAlertPreferences(current);
+        prefs.channels.telegram.telegramChatId = String(chatId);
+        prefs.channels.telegram.enabled = true;
+        await saveSettings(username, { ...current, alertPreferences: prefs });
+        log.info('telegram chat linked', { username });
+      } else {
+        log.debug('telegram link token unknown/expired');
+      }
+    }
+  } catch (err) {
+    log.warn('telegram webhook handling failed', {
+      reason: err instanceof Error ? err.message : String(err),
+    });
+  }
+  res.json({ ok: true });
 });
 
 // Per-market scope (TRA-192): Stockdashboard and Cryptodashboard each have

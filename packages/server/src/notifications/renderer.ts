@@ -1,0 +1,209 @@
+// TRA-566 (TRA-410 A2) — shared event→message renderer.
+//
+// A single renderer turns a typed {@link AlertEvent} into one {@link RenderedAlert}
+// (subject + plain text + minimal HTML) that every channel adapter reuses:
+//   • email  → subject + html (falls back to text),
+//   • Telegram → text (sent with parse_mode=HTML, so the html is also valid),
+//   • Discord → text (posted as webhook `content`).
+//
+// The format follows the §1.4 sample payload:
+//     🟢 TradingAI — Position Exited
+//     ETH-USD  ·  LIVE  ·  mean-reversion
+//     Exit: take-profit @ 3,142.50    P&L: +$84.20 (+1.32R)
+//     2026-05-17 14:32 ET
+//
+// Pure + side-effect-free (no I/O, no module singletons) so it is trivially
+// unit-testable and safe to call on every dispatch.
+
+import type {
+  AlertEvent,
+  ExitAlertEvent,
+  FillAlertEvent,
+  RiskHaltAlertEvent,
+  SignalAlertEvent,
+} from './dispatcher.js';
+
+export interface RenderedAlert {
+  /** Headline incl. status emoji, e.g. "🟢 TradingAI — Position Exited". */
+  title: string;
+  /** Email subject line (no emoji — some clients render it poorly in subjects). */
+  subject: string;
+  /** Plain-text body — used verbatim by Telegram/Discord and as the email text part. */
+  text: string;
+  /** Minimal HTML body for the email channel. Also valid Telegram HTML. */
+  html: string;
+}
+
+// ── small formatting helpers ─────────────────────────────────────────────────
+
+/** Compact price/number formatting with thousands separators. */
+function fmtNum(n: number, maxFrac = 2): string {
+  if (!Number.isFinite(n)) return String(n);
+  return n.toLocaleString('en-US', { minimumFractionDigits: 0, maximumFractionDigits: maxFrac });
+}
+
+/** Signed USD with fixed 2dp, e.g. "+$84.20" / "-$12.00". */
+function fmtSignedUsd(n: number): string {
+  const sign = n >= 0 ? '+' : '-';
+  const abs = Math.abs(n).toLocaleString('en-US', {
+    minimumFractionDigits: 2,
+    maximumFractionDigits: 2,
+  });
+  return `${sign}$${abs}`;
+}
+
+/** "2026-05-17 14:32 ET" in US/Eastern (the desk's reference tz). */
+function fmtTimestamp(ts: number): string {
+  try {
+    const parts = new Intl.DateTimeFormat('en-CA', {
+      timeZone: 'America/New_York',
+      year: 'numeric',
+      month: '2-digit',
+      day: '2-digit',
+      hour: '2-digit',
+      minute: '2-digit',
+      hour12: false,
+    }).formatToParts(new Date(ts));
+    const get = (t: string) => parts.find((p) => p.type === t)?.value ?? '';
+    return `${get('year')}-${get('month')}-${get('day')} ${get('hour')}:${get('minute')} ET`;
+  } catch {
+    return new Date(ts).toISOString();
+  }
+}
+
+/** HTML-escape so symbols/strategy names can never break the email markup. */
+function esc(s: string): string {
+  return s
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;');
+}
+
+// ── per-kind rendering ───────────────────────────────────────────────────────
+
+interface Rendered {
+  emoji: string;
+  /** Short noun phrase, e.g. "Position Exited". */
+  headline: string;
+  /** Context line: "ETH-USD · LIVE · mean-reversion". */
+  context: string;
+  /** One or more detail lines. */
+  lines: string[];
+}
+
+function renderFill(e: FillAlertEvent): Rendered {
+  return {
+    emoji: '🔵',
+    headline: 'Order Filled',
+    context: joinContext(e.symbol, e.mode, e.strategy),
+    lines: [
+      `${capitalize(e.side)} ${fmtNum(e.quantity, 6)} @ ${fmtNum(e.price)}`,
+    ],
+  };
+}
+
+function renderExit(e: ExitAlertEvent): Rendered {
+  const profit = (e.pnl ?? 0) >= 0;
+  const pnlBits: string[] = [];
+  if (e.pnl != null) {
+    const r = e.pnlR != null ? ` (${e.pnlR >= 0 ? '+' : ''}${fmtNum(e.pnlR)}R)` : '';
+    pnlBits.push(`P&L: ${fmtSignedUsd(e.pnl)}${r}`);
+  }
+  const exitBit = e.exitReason ? `Exit: ${e.exitReason}` : 'Exited';
+  return {
+    emoji: profit ? '🟢' : '🔴',
+    headline: 'Position Exited',
+    context: joinContext(e.symbol, e.mode, e.strategy),
+    lines: [[exitBit, ...pnlBits].join('    ')],
+  };
+}
+
+function renderSignal(e: SignalAlertEvent): Rendered {
+  const levels: string[] = [];
+  if (e.entryPrice != null) levels.push(`entry ${fmtNum(e.entryPrice)}`);
+  if (e.stopLoss != null) levels.push(`SL ${fmtNum(e.stopLoss)}`);
+  if (e.takeProfit != null) levels.push(`TP ${fmtNum(e.takeProfit)}`);
+  const lines = [`${capitalize(e.side)} signal`];
+  if (levels.length) lines.push(levels.join('  ·  '));
+  return {
+    emoji: '🔔',
+    headline: 'New Trade Signal',
+    context: joinContext(e.symbol, undefined, e.signalType),
+    lines,
+  };
+}
+
+function renderRiskHalt(e: RiskHaltAlertEvent): Rendered {
+  return {
+    emoji: '🛑',
+    headline: 'Risk Halt Triggered',
+    context: e.mode.toUpperCase(),
+    lines: [e.reason],
+  };
+}
+
+function renderBody(event: AlertEvent): Rendered {
+  switch (event.kind) {
+    case 'fill':
+      return renderFill(event);
+    case 'exit':
+      return renderExit(event);
+    case 'signal':
+      return renderSignal(event);
+    case 'risk_halt':
+      return renderRiskHalt(event);
+  }
+}
+
+// ── public entry ─────────────────────────────────────────────────────────────
+
+/** Render a typed alert event into a channel-agnostic message. Pure. */
+export function renderAlert(event: AlertEvent, now: number = Date.now()): RenderedAlert {
+  const r = renderBody(event);
+  const ts = event.timestamp ?? now;
+  const stamp = fmtTimestamp(ts);
+
+  const title = `${r.emoji} TradingAI — ${r.headline}`;
+  const subject = `TradingAI — ${r.headline}: ${plainContext(event)}`;
+
+  const text = [title, r.context, ...r.lines, stamp].filter(Boolean).join('\n');
+
+  const html = [
+    `<div style="font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Helvetica,Arial,sans-serif;color:#c9d1d9;background:#0d1117;padding:24px;border-radius:8px;max-width:520px;">`,
+    `<div style="font-size:18px;font-weight:600;margin-bottom:4px;">${esc(title)}</div>`,
+    `<div style="color:#8b949e;font-size:14px;margin-bottom:12px;">${esc(r.context)}</div>`,
+    ...r.lines.map(
+      (l) => `<div style="font-size:15px;margin:2px 0;">${esc(l)}</div>`,
+    ),
+    `<div style="color:#484f58;font-size:12px;margin-top:14px;">${esc(stamp)}</div>`,
+    `</div>`,
+  ].join('');
+
+  return { title, subject, text, html };
+}
+
+// ── internals ────────────────────────────────────────────────────────────────
+
+function joinContext(symbol: string, mode?: string, tag?: string): string {
+  return [symbol, mode ? mode.toUpperCase() : undefined, tag]
+    .filter((s): s is string => !!s)
+    .join('  ·  ');
+}
+
+/** A short symbol/mode tag for the email subject line. */
+function plainContext(event: AlertEvent): string {
+  switch (event.kind) {
+    case 'fill':
+    case 'exit':
+      return `${event.symbol} ${event.mode.toUpperCase()}`;
+    case 'signal':
+      return `${event.symbol} ${event.signalType}`;
+    case 'risk_halt':
+      return event.mode.toUpperCase();
+  }
+}
+
+function capitalize(s: string): string {
+  return s.length ? s[0]!.toUpperCase() + s.slice(1) : s;
+}

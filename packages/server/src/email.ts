@@ -20,6 +20,39 @@ function getTransport() {
   });
 }
 
+/**
+ * TRA-566 (TRA-410 A2) — whether the shared SMTP transport is usable. The email
+ * notification adapter uses this to report itself "configured" so the dispatcher
+ * skips it cleanly on a box without mail credentials.
+ */
+export function isSmtpConfigured(): boolean {
+  return Boolean(SMTP_HOST && SMTP_USER && SMTP_PASS);
+}
+
+/**
+ * TRA-566 (TRA-410 A2) — send an arbitrary transactional email through the same
+ * SMTP transport already configured for password reset (§1.5: "email wraps
+ * existing email.ts — NO new email infra"). Throws if SMTP is unconfigured so
+ * the caller (the notification dispatcher's isolated, timeout-bounded send) can
+ * log + swallow it; never silently no-ops.
+ */
+export async function sendNotificationEmail(opts: {
+  to: string;
+  subject: string;
+  text: string;
+  html?: string;
+}): Promise<void> {
+  const transport = getTransport();
+  if (!transport) throw new Error('SMTP not configured');
+  await transport.sendMail({
+    from: SMTP_FROM,
+    to: opts.to,
+    subject: opts.subject,
+    text: opts.text,
+    ...(opts.html ? { html: opts.html } : {}),
+  });
+}
+
 function buildResetEmail(username: string, resetCode: string): { subject: string; text: string; html: string } {
   const resetLink = APP_URL ? `${APP_URL}/?reset_code=${resetCode}` : null;
   const subject = 'TradingAI — Password Reset';
