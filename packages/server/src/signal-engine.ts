@@ -202,6 +202,17 @@ export class DailyRiskGovernor {
   private currentDay: string;
   private halted = false;
   private haltReason: string | null = null;
+  /**
+   * TRA-526 — global kill switch. A manual, operator-engaged master stop that
+   * overrides every new-entry path (the engine's three entry gates all check
+   * `isHalted()`). Unlike the automatic daily circuit-breakers above, the kill
+   * switch is intentionally NOT cleared by the ET day roll — once engaged it
+   * stays engaged until an operator explicitly releases it, so a halt set at the
+   * end of a bad day can't quietly evaporate at the next ET-midnight. This is
+   * the "math disposes" master override: the AI proposes, this can veto all of it.
+   */
+  private killSwitchEngaged = false;
+  private killSwitchReason: string | null = null;
 
   constructor(private readonly now: () => Date = () => new Date()) {
     this.currentDay = etDateString(this.now());
@@ -215,7 +226,29 @@ export class DailyRiskGovernor {
       this.halted = false;
       this.haltReason = null;
       this.currentDay = today;
+      // NOTE: killSwitchEngaged is deliberately preserved across the day roll.
     }
+  }
+
+  /**
+   * TRA-526 — engage the global kill switch. Idempotent; a second call refreshes
+   * the reason but does not change engaged state. Takes effect immediately on the
+   * next `isHalted()` check at every entry gate.
+   */
+  engageKillSwitch(reason?: string): void {
+    this.killSwitchEngaged = true;
+    this.killSwitchReason = reason?.trim() || 'Global kill switch engaged — all new entries halted';
+  }
+
+  /** TRA-526 — release the global kill switch. Daily circuit-breakers (if any) remain in force. */
+  releaseKillSwitch(): void {
+    this.killSwitchEngaged = false;
+    this.killSwitchReason = null;
+  }
+
+  /** TRA-526 — whether the manual global kill switch is currently engaged. */
+  isKillSwitchEngaged(): boolean {
+    return this.killSwitchEngaged;
   }
 
   recordTrade(pnl: number, managedEquity: number): void {
@@ -242,10 +275,13 @@ export class DailyRiskGovernor {
 
   isHalted(): boolean {
     this.resetIfNewDay();
-    return this.halted;
+    // TRA-526 — the kill switch overrides regardless of the daily counters.
+    return this.killSwitchEngaged || this.halted;
   }
 
   getHaltReason(): string | null {
+    // TRA-526 — surface the kill-switch reason first; it is the master override.
+    if (this.killSwitchEngaged) return this.killSwitchReason;
     return this.haltReason;
   }
 }
@@ -581,6 +617,13 @@ export class SignalEngine {
     // start/stop UI state for either mode) keeps the engine in sync.
     this.autoTradingEnabledDemo = settings.stocksAutoTradingEnabledDemo ?? true;
     this.autoTradingEnabledLive = settings.stocksAutoTradingEnabledLive ?? true;
+    // TRA-526 — reconcile the global kill switch from persisted settings so an
+    // operator halt survives a server restart instead of silently lifting.
+    if (settings.globalKillSwitchEngaged) {
+      this.riskGovernor.engageKillSwitch(settings.globalKillSwitchReason || undefined);
+    } else {
+      this.riskGovernor.releaseKillSwitch();
+    }
     // TRA-346 — each sub-account reads from its own mode-locked bucket so a
     // Demo-side edit doesn't leak into Live sizing (and vice versa). The
     // engine-level fields drive live equity sizing (TRA-335) so they always
@@ -2105,6 +2148,26 @@ export class SignalEngine {
 
   isAutoTradingEnabled(): boolean {
     return this.mode === 'live' ? this.autoTradingEnabledLive : this.autoTradingEnabledDemo;
+  }
+
+  /**
+   * TRA-526 — engage the global kill switch (deterministic master override).
+   * Halts every new-entry path immediately, across demo and live, regardless of
+   * the per-mode auto-trading flags. The caller persists the engaged state to
+   * settings so it survives a restart.
+   */
+  engageKillSwitch(reason?: string): void {
+    this.riskGovernor.engageKillSwitch(reason);
+  }
+
+  /** TRA-526 — release the global kill switch. Daily circuit-breakers still apply. */
+  releaseKillSwitch(): void {
+    this.riskGovernor.releaseKillSwitch();
+  }
+
+  /** TRA-526 — whether the global kill switch is currently engaged. */
+  isKillSwitchEngaged(): boolean {
+    return this.riskGovernor.isKillSwitchEngaged();
   }
 
   manualClosePosition(positionId: string, currentPrice: number): Position | null {

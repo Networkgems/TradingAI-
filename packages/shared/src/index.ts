@@ -1,5 +1,9 @@
 // Shared types and utilities across all packages
 
+// TRA-532 — Live-Trading Promotion Gate (pure core: thresholds, metric
+// computation from data, per-stage evaluation, overall verdict, audit record).
+export * from './promotion-gate.js';
+
 export type Side = 'buy' | 'sell';
 export type OrderStatus = 'pending' | 'filled' | 'cancelled' | 'rejected';
 export type SignalType =
@@ -852,6 +856,17 @@ export interface AccountSettings {
    * Absent ↔ on. Resolve via {@link resolveHoldLiveOptionsOvernight}.
    */
   holdLiveOptionsOvernightForPdt?: boolean;
+  /**
+   * TRA-526 — global kill switch (deterministic risk layer master override).
+   * When `true`, the engine engages {@link DailyRiskGovernor}'s kill switch on
+   * load and every new-entry path is halted regardless of auto-trading flags or
+   * daily counters. Persisted so the halt SURVIVES a server restart — a safety
+   * stop that silently lifts on restart is worse than no stop at all. Absent ↔
+   * disengaged. The operator toggles it via `/api/trading/kill-switch`.
+   */
+  globalKillSwitchEngaged?: boolean;
+  /** TRA-526 — optional operator note shown as the halt reason while engaged. */
+  globalKillSwitchReason?: string;
 }
 
 export const DEFAULT_ACCOUNT_SETTINGS: AccountSettings = {
@@ -1200,7 +1215,13 @@ export function resolveRiskPerTrade(
   const scoped = market === 'crypto'
     ? (mode === 'live' ? s.riskPerTradeLiveCrypto : s.riskPerTradeDemoCrypto)
     : (mode === 'live' ? s.riskPerTradeLiveStocks : s.riskPerTradeDemoStocks);
-  return scoped ?? s.riskPerTrade;
+  const resolved = scoped ?? s.riskPerTrade;
+  // TRA-526 — deterministic hard cap. Whatever the operator (or a strategy/LLM
+  // proposal that lands in this knob) asks for, the math caps it at
+  // HARD_MAX_RISK_PER_TRADE of managed equity. A non-finite / non-positive value
+  // (corrupt save) falls back to the default rather than disabling sizing.
+  if (!Number.isFinite(resolved) || resolved <= 0) return DEFAULT_ACCOUNT_SETTINGS.riskPerTrade;
+  return Math.min(resolved, HARD_MAX_RISK_PER_TRADE);
 }
 
 /**
@@ -1418,6 +1439,25 @@ export const ADX_RANGING_THRESHOLD = 20;    // ADX < 20 → ranging → favor re
 // Daily risk circuit-breakers
 export const MAX_CONSECUTIVE_LOSSES = 3;     // halt new entries after 3 consecutive losses
 export const DAILY_DRAWDOWN_HALT_PCT = 0.08; // halt if daily P&L < −8% of managed equity
+
+/**
+ * TRA-526 — deterministic per-trade risk ceiling ("the math disposes" layer).
+ *
+ * The per-(mode×market) `riskPerTrade` knobs are operator-tunable and the route
+ * clamp (`index.ts`, `account-settings.ts`) admits anything in `[0.001, 0.5]`,
+ * i.e. up to 50% of managed equity risked on a single ticket. That is fine as a
+ * *soft* preference but is not a hard cap: a fat-fingered save (or an over-eager
+ * strategy/LLM proposal that flows into the sizing knob) could risk half the book
+ * on one trade. This constant is the deterministic upper bound that
+ * {@link resolveRiskPerTrade} enforces *after* the operator value is resolved, so
+ * no configured value can ever size a trade above {@link HARD_MAX_RISK_PER_TRADE}
+ * of managed equity. The issue spec calls for a 1–2% hard cap; 2% is the ceiling,
+ * the default (`DEFAULT_ACCOUNT_SETTINGS.riskPerTrade = 0.01`) sits at 1%.
+ *
+ * This is intentionally a compile-time constant, not a setting: the whole point
+ * of the deterministic risk layer is that it cannot be widened from the UI.
+ */
+export const HARD_MAX_RISK_PER_TRADE = 0.02; // never risk more than 2% of managed equity on one trade
 
 /**
  * TRA-510 — smart-watchlist micro-cap price floor (USD). Newcomers fed in by

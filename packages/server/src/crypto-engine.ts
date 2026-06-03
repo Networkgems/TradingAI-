@@ -187,6 +187,14 @@ export class CryptoSignalEngine {
   // tick and surfaced in getState()) is whichever one matches `this.mode`.
   private autoTradingEnabledDemo = true;
   private autoTradingEnabledLive = true;
+  /**
+   * TRA-526 — global kill switch (deterministic master override). Mirrors the
+   * equities/options {@link DailyRiskGovernor} kill switch so a single operator
+   * halt stops new entries across BOTH engines. Checked in the demo and live
+   * entry gates alongside the per-mode auto-trading flags; persisted via
+   * `globalKillSwitchEngaged` so it survives a restart.
+   */
+  private killSwitchEngaged = false;
   private mode: 'demo' | 'live' = 'demo';
   /** Live broker (Coinbase) — initialised when live mode is active and creds are configured. */
   private liveAccount: CryptoLiveAccount | null = null;
@@ -446,6 +454,9 @@ export class CryptoSignalEngine {
     // start/stop UI state for either mode) keeps the engine in sync.
     this.autoTradingEnabledDemo = settings.cryptoAutoTradingEnabledDemo ?? true;
     this.autoTradingEnabledLive = settings.cryptoAutoTradingEnabledLive ?? true;
+    // TRA-526 — reconcile the global kill switch so an operator halt persists
+    // across restarts and applies to crypto as well as equities/options.
+    this.killSwitchEngaged = settings.globalKillSwitchEngaged === true;
     // TRA-232 — push fresh risk knobs into the demo account on every settings
     // save. The live account is rebuilt below (or via tryInitLiveBroker) and
     // picks up the same values when buildLiveBroker reads currentSettings.
@@ -1149,6 +1160,7 @@ export class CryptoSignalEngine {
       this.tracker?.saveEquity(this.account.getEquity(), 0);
     }
 
+    if (this.killSwitchEngaged) return; // TRA-526 — global kill switch halts new entries
     if (!this.isAutoTradingEnabled('demo')) return;
 
     // TRA-480 — explicit `mode='demo'` so the preset/short-gate helpers
@@ -1340,6 +1352,7 @@ export class CryptoSignalEngine {
     // they re-enable auto-trading. TRA-480 — explicit `'live'` so the gate
     // can't be flipped by an accidental this.mode toggle while this branch
     // is mid-flight (defensive; this.mode is checked before we get here).
+    if (this.killSwitchEngaged) return; // TRA-526 — global kill switch halts new entries
     if (!this.isAutoTradingEnabled('live')) {
       return;
     }
@@ -1708,6 +1721,16 @@ export class CryptoSignalEngine {
     const target = mode ?? this.mode;
     if (target === 'live') this.autoTradingEnabledLive = enabled;
     else this.autoTradingEnabledDemo = enabled;
+  }
+
+  /** TRA-526 — engage/release the global kill switch on the crypto engine. */
+  setKillSwitch(engaged: boolean): void {
+    this.killSwitchEngaged = engaged;
+  }
+
+  /** TRA-526 — whether the crypto engine's global kill switch is engaged. */
+  isKillSwitchEngaged(): boolean {
+    return this.killSwitchEngaged;
   }
 
   /**

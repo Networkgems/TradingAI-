@@ -72,3 +72,60 @@ describe('DailyRiskGovernor — TRA-407 (C3) day boundary', () => {
     expect(gov.isHalted()).toBe(true);
   });
 });
+
+// TRA-526 — global kill switch: the deterministic master override. Unlike the
+// automatic daily circuit-breakers, it is operator-engaged and must NOT clear
+// on the ET day roll — a safety stop that silently lifts overnight is worse
+// than no stop at all.
+describe('DailyRiskGovernor — TRA-526 global kill switch', () => {
+  it('halts immediately on a clean slate when engaged, with the supplied reason', () => {
+    const gov = new DailyRiskGovernor(() => new Date('2026-06-02T15:00:00Z'));
+    expect(gov.isHalted()).toBe(false);
+    gov.engageKillSwitch('Manual halt — volatile open');
+    expect(gov.isKillSwitchEngaged()).toBe(true);
+    expect(gov.isHalted()).toBe(true);
+    expect(gov.getHaltReason()).toBe('Manual halt — volatile open');
+  });
+
+  it('falls back to a default reason when none is supplied', () => {
+    const gov = new DailyRiskGovernor(() => new Date('2026-06-02T15:00:00Z'));
+    gov.engageKillSwitch();
+    expect(gov.getHaltReason()).toMatch(/kill switch/i);
+  });
+
+  it('overrides the daily counters — engaging and then releasing reveals the underlying state', () => {
+    const gov = new DailyRiskGovernor(() => new Date('2026-06-02T15:00:00Z'));
+    gov.engageKillSwitch('stop everything');
+    expect(gov.isHalted()).toBe(true);
+    gov.releaseKillSwitch();
+    // No daily halt was tripped, so releasing the switch returns to running.
+    expect(gov.isHalted()).toBe(false);
+    expect(gov.getHaltReason()).toBeNull();
+  });
+
+  it('does NOT clear on the ET day roll (persists overnight until released)', () => {
+    let now = new Date('2026-05-18T01:00:00Z'); // 21:00 ET 05-17
+    const gov = new DailyRiskGovernor(() => now);
+    gov.engageKillSwitch('halt over the weekend');
+    expect(gov.isHalted()).toBe(true);
+    // Cross ET-midnight into the next trading day — daily counters would reset
+    // here, but the kill switch must remain engaged.
+    now = new Date('2026-05-18T05:00:00Z'); // 01:00 ET 05-18
+    expect(gov.isHalted()).toBe(true);
+    expect(gov.getHaltReason()).toBe('halt over the weekend');
+  });
+
+  it('takes precedence over an underlying daily halt in getHaltReason', () => {
+    const gov = new DailyRiskGovernor(() => new Date('2026-06-02T15:00:00Z'));
+    gov.recordTrade(-100, 10_000);
+    gov.recordTrade(-100, 10_000);
+    gov.recordTrade(-100, 10_000); // daily loss-streak halt
+    expect(gov.getHaltReason()).toMatch(/consecutive losses/i);
+    gov.engageKillSwitch('operator override');
+    expect(gov.getHaltReason()).toBe('operator override');
+    // Releasing the kill switch reveals the still-active daily halt.
+    gov.releaseKillSwitch();
+    expect(gov.isHalted()).toBe(true);
+    expect(gov.getHaltReason()).toMatch(/consecutive losses/i);
+  });
+});

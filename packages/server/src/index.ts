@@ -2079,6 +2079,39 @@ app.post('/api/trading/stop', requireAuth, async (req, res) => {
   res.json({ ok: true, mode, autoTradingEnabled: false });
 });
 
+// TRA-526 — global kill switch (deterministic risk-layer master override).
+// Engages/releases the manual master halt across BOTH the equities/options
+// engine (via DailyRiskGovernor) and the crypto engine, and persists the state
+// to settings so the halt survives a server restart. While engaged, every
+// new-entry path is blocked regardless of the per-mode auto-trading flags or
+// daily circuit-breakers — "the AI proposes, the math disposes."
+app.post('/api/trading/kill-switch', requireAuth, async (req, res) => {
+  const username = res.locals['authUser'] as string;
+  const ctx = await userCtx(res);
+  const settings = getSettings(username);
+  const body = req.body as { engaged?: unknown; reason?: unknown } | undefined;
+  const engaged = body?.engaged === true || body?.engaged === 'true';
+  const reason = typeof body?.reason === 'string' ? body.reason.trim().slice(0, 280) : undefined;
+
+  if (engaged) ctx.engine.engageKillSwitch(reason);
+  else ctx.engine.releaseKillSwitch();
+  ctx.cryptoEngine.setKillSwitch(engaged);
+
+  const updated: AccountSettings = {
+    ...settings,
+    globalKillSwitchEngaged: engaged,
+    ...(engaged && reason ? { globalKillSwitchReason: reason } : { globalKillSwitchReason: undefined }),
+  };
+  await saveSettings(username, updated);
+  broadcastEngineState(ctx);
+  broadcastCryptoState(ctx);
+  res.json({
+    ok: true,
+    killSwitchEngaged: ctx.engine.isKillSwitchEngaged(),
+    haltReason: engaged ? (reason ?? null) : null,
+  });
+});
+
 // TRA-230: clear the displayed signal list without resetting positions or equity.
 app.post('/api/signals/reset', requireAuth, async (_req, res) => {
   const ctx = await userCtx(res);

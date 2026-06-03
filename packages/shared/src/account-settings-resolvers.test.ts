@@ -4,6 +4,7 @@ import {
   DEFAULT_RV_DTE_MAX,
   DEFAULT_RV_DTE_MIN,
   DEFAULT_RV_DTE_TARGET,
+  HARD_MAX_RISK_PER_TRADE,
   managedAccountRatioField,
   resolveManagedAccountRatio,
   resolveRiskPerTrade,
@@ -93,14 +94,44 @@ describe('resolveRiskPerTrade (TRA-346)', () => {
   });
 
   it('isolates each (market, mode) bucket — touching one never bleeds into another', () => {
+    // Sub-cap values (≤ HARD_MAX_RISK_PER_TRADE) so this test exercises bucket
+    // isolation only — the TRA-526 hard cap is covered separately below.
     const s = makeSettings({
       riskPerTrade: 0.01,
-      riskPerTradeLiveCrypto: 0.05,
+      riskPerTradeLiveCrypto: 0.015,
     });
-    expect(resolveRiskPerTrade(s, 'crypto', 'live')).toBe(0.05);
+    expect(resolveRiskPerTrade(s, 'crypto', 'live')).toBe(0.015);
     expect(resolveRiskPerTrade(s, 'crypto', 'demo')).toBe(0.01);
     expect(resolveRiskPerTrade(s, 'stocks', 'demo')).toBe(0.01);
     expect(resolveRiskPerTrade(s, 'stocks', 'live')).toBe(0.01);
+  });
+});
+
+// TRA-526 — deterministic per-trade risk hard cap. The operator knobs (and the
+// route clamp, which admits up to 0.5) are a soft preference; resolveRiskPerTrade
+// is the chokepoint that the engine sizes from, so the hard ceiling lives here.
+describe('resolveRiskPerTrade — TRA-526 hard cap', () => {
+  it('caps any resolved value at HARD_MAX_RISK_PER_TRADE (2%)', () => {
+    const s = makeSettings({
+      riskPerTradeLiveStocks: 0.5,   // 50% — what the route clamp would admit
+      riskPerTradeLiveCrypto: 0.25,
+      riskPerTradeDemoStocks: 0.03,  // just over the cap
+    });
+    expect(resolveRiskPerTrade(s, 'stocks', 'live')).toBe(HARD_MAX_RISK_PER_TRADE);
+    expect(resolveRiskPerTrade(s, 'crypto', 'live')).toBe(HARD_MAX_RISK_PER_TRADE);
+    expect(resolveRiskPerTrade(s, 'stocks', 'demo')).toBe(HARD_MAX_RISK_PER_TRADE);
+  });
+
+  it('leaves sub-cap values untouched, including the 1% default', () => {
+    expect(resolveRiskPerTrade(makeSettings(), 'stocks', 'live')).toBe(0.01);
+    expect(resolveRiskPerTrade(makeSettings({ riskPerTradeLiveStocks: 0.018 }), 'stocks', 'live')).toBe(0.018);
+    expect(resolveRiskPerTrade(makeSettings({ riskPerTradeLiveStocks: HARD_MAX_RISK_PER_TRADE }), 'stocks', 'live')).toBe(HARD_MAX_RISK_PER_TRADE);
+  });
+
+  it('falls back to the default for corrupt (non-finite / non-positive) saves rather than disabling sizing', () => {
+    expect(resolveRiskPerTrade(makeSettings({ riskPerTradeLiveStocks: 0 }), 'stocks', 'live')).toBe(DEFAULT_ACCOUNT_SETTINGS.riskPerTrade);
+    expect(resolveRiskPerTrade(makeSettings({ riskPerTradeLiveStocks: -0.01 }), 'stocks', 'live')).toBe(DEFAULT_ACCOUNT_SETTINGS.riskPerTrade);
+    expect(resolveRiskPerTrade(makeSettings({ riskPerTradeLiveStocks: NaN }), 'stocks', 'live')).toBe(DEFAULT_ACCOUNT_SETTINGS.riskPerTrade);
   });
 });
 
@@ -132,10 +163,10 @@ describe('field-name resolvers (TRA-346)', () => {
           managedAccountRatio: 0.5,
           riskPerTrade: 0.01,
           [ratioKey]: 0.99,
-          [riskKey]: 0.07,
+          [riskKey]: 0.017, // sub-cap (≤ HARD_MAX_RISK_PER_TRADE) so this asserts key consistency, not the TRA-526 cap
         } as Partial<AccountSettings>);
         expect(resolveManagedAccountRatio(s, market, mode)).toBe(0.99);
-        expect(resolveRiskPerTrade(s, market, mode)).toBe(0.07);
+        expect(resolveRiskPerTrade(s, market, mode)).toBe(0.017);
       }
     }
   });
