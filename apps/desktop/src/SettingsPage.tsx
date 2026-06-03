@@ -5,6 +5,7 @@ import type {
   AccountSettings,
   BrokerageType,
   LiveTradierMarkets,
+  StrategyPreset,
   StrategyPresetId,
   TradierEnv,
 } from '@trading-app/shared';
@@ -804,12 +805,98 @@ export function UserManagementSection({ token, httpUrl }: { token: string; httpU
 }
 
 /**
- * TRA-325 — strategy preset selector. Lists every preset from
+ * TRA-325 — strategy preset selector. Renders each preset from
  * `STRATEGY_PRESETS` as a radio card, expanded to show enabled strategies
  * and the symbol-filter (or "all watchlist symbols" when null). The active
  * id lives on `AccountSettings.activeStrategyPreset` so it saves on the
  * existing form submit alongside the other account settings.
+ *
+ * TRA-524 — the picker now leads with only the two presets that matter: the
+ * recommended "works" roster (`tra405_validated`) and `no_trade` (engine
+ * paused). Every other preset in the library — `legacy_5`, `bb_fade_sol_doge`,
+ * and any future entry — stays reachable behind an "Advanced / show all"
+ * disclosure. This is a presentation change only: the full `STRATEGY_PRESETS`
+ * library is untouched so `resolveStrategyPreset` and the
+ * `LIVE/DEMO_STRATEGY_PRESET` env vars still resolve every id.
  */
+// The single preset the board considers a "works" option today. If
+// QuantTrader's TRA-521 R&D ships a new validated keeper, repoint this id.
+const RECOMMENDED_PRESET_ID: StrategyPresetId = 'tra405_validated';
+// Presets surfaced in the primary list. Everything else lives under Advanced.
+const PRIMARY_PRESET_IDS: readonly StrategyPresetId[] = [RECOMMENDED_PRESET_ID, 'no_trade'];
+
+function StrategyPresetCard({
+  preset,
+  active,
+  onChange,
+}: {
+  preset: StrategyPreset;
+  active: StrategyPresetId;
+  onChange: (id: StrategyPresetId) => void;
+}) {
+  const isActive = preset.id === active;
+  return (
+    <label
+      className={`mode-card ${isActive ? 'active' : ''}`}
+      style={{ alignItems: 'flex-start' }}
+    >
+      <input
+        type="radio"
+        name="activeStrategyPreset"
+        value={preset.id}
+        checked={isActive}
+        onChange={() => onChange(preset.id)}
+      />
+      <div className="mode-card-inner" style={{ width: '100%' }}>
+        <span className="mode-card-title">
+          {preset.displayName}
+          {preset.id === RECOMMENDED_PRESET_ID && (
+            <span
+              style={{
+                marginLeft: '0.5rem',
+                fontSize: '0.7rem',
+                fontWeight: 600,
+                textTransform: 'uppercase',
+                letterSpacing: '0.04em',
+                color: 'var(--green, #3fb950)',
+              }}
+            >
+              Recommended
+            </span>
+          )}
+        </span>
+        <span className="mode-card-desc" style={{ marginBottom: '0.5rem' }}>
+          {preset.description}
+        </span>
+        <div style={{ fontSize: '0.85rem', color: 'var(--muted, #8b949e)', display: 'grid', gap: '0.25rem' }}>
+          <div>
+            <strong>Strategies:</strong>{' '}
+            {preset.enabledStrategies.length > 0
+              ? preset.enabledStrategies.join(', ')
+              : 'none (engine idle)'}
+          </div>
+          <div>
+            <strong>Symbols:</strong>{' '}
+            {preset.symbolFilter === null
+              ? (preset.strategyUniverse
+                  ? 'crypto watchlist, narrowed per strategy below'
+                  : 'entire crypto watchlist')
+              : preset.symbolFilter.join(', ')}
+          </div>
+          {preset.strategyUniverse && (
+            <div>
+              <strong>Per-strategy universe:</strong>{' '}
+              {Object.entries(preset.strategyUniverse)
+                .map(([strat, syms]) => `${strat} → ${(syms ?? []).join(', ') || 'none'}`)
+                .join('; ')}
+            </div>
+          )}
+        </div>
+      </div>
+    </label>
+  );
+}
+
 function StrategyPresetSection({
   active,
   onChange,
@@ -817,65 +904,63 @@ function StrategyPresetSection({
   active: StrategyPresetId;
   onChange: (id: StrategyPresetId) => void;
 }) {
-  const presets = Object.values(STRATEGY_PRESETS);
+  const primaryPresets = PRIMARY_PRESET_IDS.map(id => STRATEGY_PRESETS[id]);
+  const advancedPresets = Object.values(STRATEGY_PRESETS).filter(
+    p => !PRIMARY_PRESET_IDS.includes(p.id),
+  );
+  // Auto-open the Advanced list when the saved selection lives in it, so the
+  // active radio is always visible (and the user can tell what's persisted).
+  const activeIsAdvanced = advancedPresets.some(p => p.id === active);
+  const [showAdvanced, setShowAdvanced] = useState(activeIsAdvanced);
   return (
     <section className="settings-section">
       <h2 className="settings-section-title">Crypto Strategy Preset</h2>
       <p className="settings-hint">
-        Choose which crypto strategies fire and on which symbols. Presets are read-only —
-        adding a new preset requires a code change. Switching takes effect on the next
-        engine tick (no restart required).
+        Choose which crypto strategies fire and on which symbols. Switching takes effect
+        on the next engine tick (no restart required).
+      </p>
+      <p className="settings-hint" style={{ marginTop: '0.5rem' }}>
+        Why only one real option? Coinbase taker fees (~0.6% round-trip) erase the edge of
+        every high-turnover preset, so only the low-frequency{' '}
+        <strong>{STRATEGY_PRESETS[RECOMMENDED_PRESET_ID].displayName}</strong> roster stays
+        profitable after costs. Pick <strong>No-trade</strong> to pause the engine entirely.
       </p>
       <div className="strategy-preset-list" style={{ display: 'flex', flexDirection: 'column', gap: '0.75rem', marginTop: '0.75rem' }}>
-        {presets.map(preset => {
-          const isActive = preset.id === active;
-          return (
-            <label
-              key={preset.id}
-              className={`mode-card ${isActive ? 'active' : ''}`}
-              style={{ alignItems: 'flex-start' }}
-            >
-              <input
-                type="radio"
-                name="activeStrategyPreset"
-                value={preset.id}
-                checked={isActive}
-                onChange={() => onChange(preset.id)}
-              />
-              <div className="mode-card-inner" style={{ width: '100%' }}>
-                <span className="mode-card-title">{preset.displayName}</span>
-                <span className="mode-card-desc" style={{ marginBottom: '0.5rem' }}>
-                  {preset.description}
-                </span>
-                <div style={{ fontSize: '0.85rem', color: 'var(--muted, #8b949e)', display: 'grid', gap: '0.25rem' }}>
-                  <div>
-                    <strong>Strategies:</strong>{' '}
-                    {preset.enabledStrategies.length > 0
-                      ? preset.enabledStrategies.join(', ')
-                      : 'none (engine idle)'}
-                  </div>
-                  <div>
-                    <strong>Symbols:</strong>{' '}
-                    {preset.symbolFilter === null
-                      ? (preset.strategyUniverse
-                          ? 'crypto watchlist, narrowed per strategy below'
-                          : 'entire crypto watchlist')
-                      : preset.symbolFilter.join(', ')}
-                  </div>
-                  {preset.strategyUniverse && (
-                    <div>
-                      <strong>Per-strategy universe:</strong>{' '}
-                      {Object.entries(preset.strategyUniverse)
-                        .map(([strat, syms]) => `${strat} → ${(syms ?? []).join(', ') || 'none'}`)
-                        .join('; ')}
-                    </div>
-                  )}
-                </div>
-              </div>
-            </label>
-          );
-        })}
+        {primaryPresets.map(preset => (
+          <StrategyPresetCard key={preset.id} preset={preset} active={active} onChange={onChange} />
+        ))}
       </div>
+
+      {advancedPresets.length > 0 && (
+        <div style={{ marginTop: '0.75rem' }}>
+          <button
+            type="button"
+            className="btn-secondary btn-sm"
+            aria-expanded={showAdvanced}
+            onClick={() => setShowAdvanced(v => !v)}
+          >
+            {showAdvanced ? 'Hide advanced presets' : 'Advanced / show all presets'}
+          </button>
+          {showAdvanced && (
+            <>
+              <p className="settings-hint" style={{ marginTop: '0.5rem' }}>
+                These legacy and experimental presets are kept for reference and live tests.
+                They are higher-turnover and not recommended — taker fees make them
+                unprofitable in practice.
+              </p>
+              <div
+                className="strategy-preset-list"
+                style={{ display: 'flex', flexDirection: 'column', gap: '0.75rem', marginTop: '0.5rem' }}
+              >
+                {advancedPresets.map(preset => (
+                  <StrategyPresetCard key={preset.id} preset={preset} active={active} onChange={onChange} />
+                ))}
+              </div>
+            </>
+          )}
+        </div>
+      )}
+
       <p className="settings-hint" style={{ marginTop: '0.75rem' }}>
         Note: this selection applies to the <strong>Live</strong> engine only. The Demo
         engine runs a fixed preset (<code>DEMO_STRATEGY_PRESET</code>, default{' '}
