@@ -12,6 +12,7 @@ import type {
 import {
   DEFAULT_ACCOUNT_SETTINGS,
   DEFAULT_STRATEGY_PRESET_ID,
+  HARD_MAX_RISK_PER_TRADE,
   STRATEGY_PRESETS,
   managedAccountRatioField,
   resolveLiveTradeEquitiesTradier,
@@ -1482,6 +1483,8 @@ export default function SettingsPage({ token, httpUrl, context, onModeChange, on
                       <span className="field-hint">
                         Max equity risked per trade (default: 1%). Only affects
                         {context === 'crypto' ? ' demo crypto' : context === 'stocks' ? ' demo stocks/options' : ' demo'}.
+                        {' '}<strong>Hard cap: {(HARD_MAX_RISK_PER_TRADE * 100).toFixed(0)}%</strong> — the
+                        deterministic risk layer (TRA-526) clamps any larger value at trade time.
                       </span>
                     </div>
                   </>
@@ -1618,6 +1621,8 @@ export default function SettingsPage({ token, httpUrl, context, onModeChange, on
                         />
                         <span className="field-hint">
                           Max equity risked per live trade (default: 1%). Only affects {liveBrokerLabel} sizing.
+                          {' '}<strong>Hard cap: {(HARD_MAX_RISK_PER_TRADE * 100).toFixed(0)}%</strong> — the
+                          deterministic risk layer (TRA-526) clamps any larger value at trade time.
                           {context === 'stocks' && (
                             <> On small live accounts (equity &lt; $2k) a $100 per-ticket floor takes over so
                             cheap RV contracts can still size to ≥1 contract; the 15%-of-equity per-position

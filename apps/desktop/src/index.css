@@ -839,6 +839,19 @@ tr:hover td { background: var(--bg-hover); }
 .logout-btn.trading-stopped:hover { color: var(--green-strong); border-color: var(--green-strong); }
 .logout-btn:disabled { opacity: 0.5; cursor: not-allowed; }
 
+/* TRA-535 — global kill-switch control. Idle it reads as a muted danger
+   affordance; engaged it flips to a filled red pill so the ENGAGED master-halt
+   state is unmistakable in the header. */
+.kill-switch-btn { color: var(--red); border-color: var(--red); }
+.kill-switch-btn:hover:not(:disabled) { color: var(--red-strong); border-color: var(--red-strong); }
+.kill-switch-btn.engaged {
+  background: var(--red);
+  color: #ffffff;
+  border-color: var(--red);
+  font-weight: 600;
+}
+.kill-switch-btn.engaged:hover:not(:disabled) { background: var(--red-strong); border-color: var(--red-strong); }
+
 .btn-close-pos {
   background: none;
   border: 1px solid var(--red);

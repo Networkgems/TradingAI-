@@ -12,6 +12,7 @@ import { ThemeToggle } from '../ThemeToggle';
 import type { Theme } from '../ThemeToggle';
 import { ProfileMenu } from '../ProfileMenu';
 import { AccountModeSwitcher } from '../AccountModeSwitcher';
+import { KillSwitchButton } from './KillSwitchButton';
 import type { ProfileModal } from './ProfileModals';
 
 export function CryptoDashboardHeader({
@@ -21,6 +22,8 @@ export function CryptoDashboardHeader({
   connected,
   lastTick,
   autoTradingEnabled,
+  killSwitchEngaged,
+  onKillSwitchToggled,
   accountMode,
   onAccountModeChange,
   theme,
@@ -36,6 +39,8 @@ export function CryptoDashboardHeader({
   connected: boolean;
   lastTick: number | undefined;
   autoTradingEnabled: boolean;
+  killSwitchEngaged: boolean;
+  onKillSwitchToggled: (engaged: boolean) => void;
   accountMode: 'demo' | 'live';
   onAccountModeChange: (mode: 'demo' | 'live') => void;
   theme: Theme;
@@ -126,6 +131,7 @@ export function CryptoDashboardHeader({
           >
             {autoTradingEnabled ? '⏹ Stop Trading' : '▶ Start Trading'}
           </button>
+          <KillSwitchButton token={token} engaged={killSwitchEngaged} onToggled={onKillSwitchToggled} />
           <ThemeToggle theme={theme} onToggle={onToggleTheme} />
           <ProfileMenu
             onSettings={() => onOpenProfileModal('settings')}

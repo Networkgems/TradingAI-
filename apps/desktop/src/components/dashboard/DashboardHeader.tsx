@@ -12,6 +12,7 @@ import { ThemeToggle } from '../ThemeToggle';
 import type { Theme } from '../ThemeToggle';
 import { ProfileMenu } from '../ProfileMenu';
 import { AccountModeSwitcher } from '../AccountModeSwitcher';
+import { KillSwitchButton } from './KillSwitchButton';
 import type { ProfileModal } from './ProfileModals';
 
 export function DashboardHeader({
@@ -24,6 +25,7 @@ export function DashboardHeader({
   connected,
   lastTick,
   autoTradingEnabled,
+  killSwitchEngaged,
   accountMode,
   onAccountModeChange,
   theme,
@@ -42,6 +44,7 @@ export function DashboardHeader({
   connected: boolean;
   lastTick: number | undefined;
   autoTradingEnabled: boolean;
+  killSwitchEngaged: boolean;
   accountMode: 'demo' | 'live';
   onAccountModeChange: (mode: 'demo' | 'live') => void;
   theme: Theme;
@@ -163,6 +166,7 @@ export function DashboardHeader({
           >
             {autoTradingEnabled ? '⏹ Stop Trading' : '▶ Start Trading'}
           </button>
+          <KillSwitchButton token={token} engaged={killSwitchEngaged} />
           <ThemeToggle theme={theme} onToggle={onToggleTheme} />
           <ProfileMenu
             onSettings={() => onOpenProfileModal('settings')}

@@ -19,6 +19,7 @@ import { StockPositionsPanel } from './components/dashboard/StockPositionsPanel'
 import { StockOptionsPanel } from './components/dashboard/StockOptionsPanel';
 import { NewsPanel } from './components/dashboard/NewsPanel';
 import { LiveCredentialsBanner } from './components/dashboard/LiveCredentialsBanner';
+import { HaltBanner } from './components/dashboard/HaltBanner';
 import { useStockEngine } from './hooks/useStockEngine';
 
 type StockTab = 'watchlist' | 'signals' | 'positions' | 'options' | 'news' | 'calendar';
@@ -61,6 +62,7 @@ export default function Dashboard({ token, onLogout, onGoHome, onActivity, theme
         connected={connected}
         lastTick={state?.lastTick}
         autoTradingEnabled={autoTradingEnabled}
+        killSwitchEngaged={accountSettings?.globalKillSwitchEngaged ?? false}
         accountMode={accountMode}
         onAccountModeChange={setAccountMode}
         theme={theme}
@@ -91,6 +93,11 @@ export default function Dashboard({ token, onLogout, onGoHome, onActivity, theme
         settings={accountSettings}
         onOpenSettings={(field) => { setFocusCredField(field); setProfileModal('settings'); }}
       />
+
+      {/* TRA-535 — halt banner. `tradingHalted`/`haltReason` from /api/state
+          reflect the TRA-526 kill switch (reason takes precedence over the
+          daily circuit-breakers) and update live over the WebSocket. */}
+      <HaltBanner halted={state?.tradingHalted ?? false} reason={state?.haltReason ?? null} />
 
       <nav className="tabs">
         {/* TRA-503 — Positions tab is shown in every account/env so Live + Tradier

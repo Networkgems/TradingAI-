@@ -12,6 +12,7 @@ import { logger } from './lib/logger';
 import { createReconnectController } from './lib/backoff';
 import type { Theme } from './components/ThemeToggle';
 import { CryptoDashboardHeader } from './components/dashboard/CryptoDashboardHeader';
+import { HaltBanner } from './components/dashboard/HaltBanner';
 import { ProfileModals } from './components/dashboard/ProfileModals';
 import type { ProfileModal } from './components/dashboard/ProfileModals';
 import { CryptoWatchlistPanel } from './components/dashboard/CryptoWatchlistPanel';
@@ -31,6 +32,12 @@ export default function CryptoDashboard({ token, onBack, onLogout, onActivity, t
   const [profileModal, setProfileModal] = useState<ProfileModal | null>(null);
   const [isAdmin, setIsAdmin] = useState(false);
   const [accountMode, setAccountMode] = useState<'demo' | 'live'>('demo');
+  // TRA-535 — the global kill switch is a single account-settings flag shared
+  // with the stock engine. Crypto's WebSocket state has no `tradingHalted`
+  // field, so this is seeded from the settings fetch below and updated
+  // optimistically by the header button; it drives both the header toggle and
+  // the halt banner.
+  const [killSwitchEngaged, setKillSwitchEngaged] = useState(false);
   const wsRef = useRef<WebSocket | null>(null);
   const reconnectTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
 
@@ -112,7 +119,13 @@ export default function CryptoDashboard({ token, onBack, onLogout, onActivity, t
   useEffect(() => {
     fetch(`${HTTP_URL}/api/account/settings`, { headers: { Authorization: `Bearer ${token}` } })
       .then(r => r.ok ? r.json() : null)
-      .then((s: Partial<AccountSettings> | null) => applyAccountSettings(s))
+      .then((s: Partial<AccountSettings> | null) => {
+        applyAccountSettings(s);
+        // TRA-535 — re-seed the kill-switch state from the persisted flag so the
+        // header toggle and halt banner survive a reload / reflect another
+        // operator's change picked up on the next settings refresh.
+        if (s) setKillSwitchEngaged(s.globalKillSwitchEngaged === true);
+      })
       // Background settings refresh on tab switch — log a fetch failure for
       // diagnosis; the cached settings stay in effect, so no toast is needed.
       .catch(err => logger.warn('account-settings', 'settings refresh failed', err));
@@ -136,6 +149,8 @@ export default function CryptoDashboard({ token, onBack, onLogout, onActivity, t
         connected={connected}
         lastTick={state?.lastTick}
         autoTradingEnabled={autoTradingEnabled}
+        killSwitchEngaged={killSwitchEngaged}
+        onKillSwitchToggled={setKillSwitchEngaged}
         accountMode={accountMode}
         onAccountModeChange={setAccountMode}
         theme={theme}
@@ -145,6 +160,11 @@ export default function CryptoDashboard({ token, onBack, onLogout, onActivity, t
         onBack={onBack}
         onLogout={onLogout}
       />
+
+      {/* TRA-535 — crypto has no daily circuit-breaker surfaced in engine
+          state, so the kill switch is its only halt source; drive the banner
+          straight from the engaged flag. */}
+      <HaltBanner halted={killSwitchEngaged} reason={null} />
 
       <nav className="tabs">
         {(['watchlist', 'signals', 'positions', 'news'] as const).map(t => (

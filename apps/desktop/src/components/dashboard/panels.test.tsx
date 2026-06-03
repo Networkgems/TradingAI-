@@ -21,6 +21,8 @@ import { CryptoWatchlistPanel } from './CryptoWatchlistPanel';
 import { CryptoSignalsPanel } from './CryptoSignalsPanel';
 import { CryptoPositionsPanel } from './CryptoPositionsPanel';
 import { DashboardHeader } from './DashboardHeader';
+import { KillSwitchButton } from './KillSwitchButton';
+import { HaltBanner } from './HaltBanner';
 import { LiveCredentialsBanner } from './LiveCredentialsBanner';
 import { PromotionGatePanel } from './PromotionGatePanel';
 import { DEFAULT_PROMOTION_THRESHOLDS } from '@trading-app/shared';
@@ -272,7 +274,7 @@ describe('DashboardHeader (TRA-422)', () => {
       <DashboardHeader
         token="t" account={account} optionsState={undefined}
         openPositionsCount={0} openOptionsCount={0} optionsDailyLimit={5}
-        connected={true} lastTick={Date.now()} autoTradingEnabled={true}
+        connected={true} lastTick={Date.now()} autoTradingEnabled={true} killSwitchEngaged={false}
         accountMode="demo" onAccountModeChange={() => {}}
         theme="dark" onToggleTheme={() => {}} isAdmin={false}
         onOpenProfileModal={() => {}} onGoHome={() => {}} onLogout={() => {}}
@@ -301,7 +303,7 @@ describe('DashboardHeader (TRA-422)', () => {
           optionsCash: 64_224.32, dailyOptionsCount: 1,
         }}
         openPositionsCount={0} openOptionsCount={3} optionsDailyLimit={10}
-        connected={true} lastTick={Date.now()} autoTradingEnabled={true}
+        connected={true} lastTick={Date.now()} autoTradingEnabled={true} killSwitchEngaged={false}
         accountMode="live" onAccountModeChange={() => {}}
         theme="dark" onToggleTheme={() => {}} isAdmin={false}
         onOpenProfileModal={() => {}} onGoHome={() => {}} onLogout={() => {}}
@@ -328,7 +330,7 @@ describe('DashboardHeader (TRA-422)', () => {
           optionsCash: 25_000, dailyOptionsCount: 0,
         }}
         openPositionsCount={0} openOptionsCount={0} optionsDailyLimit={10}
-        connected={true} lastTick={Date.now()} autoTradingEnabled={true}
+        connected={true} lastTick={Date.now()} autoTradingEnabled={true} killSwitchEngaged={false}
         accountMode="demo" onAccountModeChange={() => {}}
         theme="dark" onToggleTheme={() => {}} isAdmin={false}
         onOpenProfileModal={() => {}} onGoHome={() => {}} onLogout={() => {}}
@@ -412,6 +414,71 @@ describe('LiveCredentialsBanner (TRA-506)', () => {
     expect(screen.getByTestId('live-credentials-banner')).toBeInTheDocument();
     expect(screen.getByText(/Coinbase API key/)).toBeInTheDocument();
     expect(screen.getByText(/Coinbase API secret/)).toBeInTheDocument();
+  });
+});
+
+// TRA-535 — operator-facing surface for the TRA-526 global kill switch.
+describe('HaltBanner (TRA-535)', () => {
+  it('renders nothing when not halted', () => {
+    const { container } = render(<HaltBanner halted={false} reason={null} />);
+    expect(container).toBeEmptyDOMElement();
+  });
+
+  it('surfaces the halt reason when halted', () => {
+    render(<HaltBanner halted={true} reason="Global kill switch engaged — quarter-end freeze" />);
+    expect(screen.getByTestId('halt-banner')).toBeInTheDocument();
+    expect(screen.getByText(/no new entries/)).toBeInTheDocument();
+    expect(screen.getByText(/quarter-end freeze/)).toBeInTheDocument();
+  });
+
+  it('falls back to a default message when halted with no reason', () => {
+    render(<HaltBanner halted={true} reason={null} />);
+    expect(screen.getByText(/Global kill switch engaged/)).toBeInTheDocument();
+  });
+});
+
+describe('KillSwitchButton (TRA-535)', () => {
+  it('renders the idle label when not engaged and the ON label when engaged', () => {
+    const { rerender } = renderWithToast(<KillSwitchButton token="t" engaged={false} />);
+    expect(screen.getByRole('button', { name: /Kill Switch$/ })).toBeInTheDocument();
+    rerender(<ToastProvider><KillSwitchButton token="t" engaged={true} /></ToastProvider>);
+    expect(screen.getByRole('button', { name: /Kill Switch ON/ })).toBeInTheDocument();
+  });
+
+  it('does NOT POST when the confirm dialog is dismissed (fat-finger guard)', async () => {
+    const confirmSpy = vi.spyOn(window, 'confirm').mockReturnValue(false);
+    const fetchMock = vi.fn(() => Promise.resolve(new Response('{}', { status: 200 })));
+    vi.stubGlobal('fetch', fetchMock);
+    renderWithToast(<KillSwitchButton token="t" engaged={false} />);
+    await userEvent.click(screen.getByRole('button', { name: /Kill Switch$/ }));
+    expect(confirmSpy).toHaveBeenCalled();
+    expect(fetchMock).not.toHaveBeenCalled();
+  });
+
+  it('POSTs { engaged: true, reason } after confirm + reason prompt, then flips to ON', async () => {
+    vi.spyOn(window, 'confirm').mockReturnValue(true);
+    vi.spyOn(window, 'prompt').mockReturnValue('end-of-day freeze');
+    const fetchMock = vi.fn(() => Promise.resolve(new Response('{"ok":true}', { status: 200 })));
+    vi.stubGlobal('fetch', fetchMock);
+    const onToggled = vi.fn();
+    renderWithToast(<KillSwitchButton token="t" engaged={false} onToggled={onToggled} />);
+    await userEvent.click(screen.getByRole('button', { name: /Kill Switch$/ }));
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+    const [url, opts] = fetchMock.mock.calls[0]!;
+    expect(String(url)).toMatch(/\/api\/trading\/kill-switch$/);
+    expect(JSON.parse((opts as RequestInit).body as string)).toEqual({ engaged: true, reason: 'end-of-day freeze' });
+    expect(onToggled).toHaveBeenCalledWith(true);
+    expect(await screen.findByRole('button', { name: /Kill Switch ON/ })).toBeInTheDocument();
+  });
+
+  it('releases without a confirm prompt and POSTs { engaged: false }', async () => {
+    const confirmSpy = vi.spyOn(window, 'confirm');
+    const fetchMock = vi.fn(() => Promise.resolve(new Response('{"ok":true}', { status: 200 })));
+    vi.stubGlobal('fetch', fetchMock);
+    renderWithToast(<KillSwitchButton token="t" engaged={true} />);
+    await userEvent.click(screen.getByRole('button', { name: /Kill Switch ON/ }));
+    expect(confirmSpy).not.toHaveBeenCalled();
+    expect(JSON.parse((fetchMock.mock.calls[0]![1] as RequestInit).body as string)).toEqual({ engaged: false });
   });
 });
 
