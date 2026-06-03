@@ -107,11 +107,11 @@ const TRADIER_API_TOKEN = TRADIER_ENV === 'production'
   ? (process.env['TRADIER_API_TOKEN'] ?? '')
   : (process.env['TRADIER_SANDBOX_API_TOKEN'] ?? process.env['TRADIER_API_TOKEN'] ?? '');
 
-const tradierStocksClient: TradierStocksClient | null =
+let tradierStocksClient: TradierStocksClient | null =
   TRADIER_API_TOKEN ? new TradierStocksClient(TRADIER_API_TOKEN, TRADIER_ENV) : null;
 
 if (!tradierStocksClient) {
-  console.warn('[yahoo-feed] Tradier stocks feed disabled (no TRADIER_*_API_TOKEN) — using Yahoo as primary');
+  console.warn('[yahoo-feed] Tradier stocks feed disabled (no TRADIER_*_API_TOKEN at boot) — using Yahoo as primary until settings supply a token');
 }
 
 const TRADIER_BREAKER_COOLDOWN_MS = 90_000;
@@ -126,6 +126,35 @@ function tripTradierBreaker(label: string, msg: string): void {
 
 export function isTradierStocksConfigured(): boolean {
   return tradierStocksClient !== null;
+}
+
+// ── TRA-505: wire the quote feed to the live UI creds ─────────────────────────
+// The Tradier client above is seeded ONCE at module load from the TRADIER_*
+// env vars. But the live app writes the user's Tradier creds into per-user
+// account-settings (via the Settings page), NOT env — so on a normal deployment
+// `TRADIER_API_TOKEN` is empty and this feed has no Tradier source, even after
+// the user has a fully working Tradier production connection (balance + trades).
+// Quotes then fall through to Yahoo Finance's free per-IP feed, which 429s and
+// trips the breaker, surfacing "Quote unavailable — provider rate-limited" on
+// the watchlist. The signal-engine calls the setter below from applySettings so
+// quotes flow through the SAME Tradier account that already powers trading.
+let tradierFeedToken = TRADIER_API_TOKEN;
+let tradierFeedEnv: TradierEnv = TRADIER_ENV;
+export function setTradierStocksFeedClient(token: string | null | undefined, env: TradierEnv): void {
+  const next = (token ?? '').trim();
+  if (next === tradierFeedToken && env === tradierFeedEnv) return;
+  tradierFeedToken = next;
+  tradierFeedEnv = env;
+  tradierStocksClient = next ? new TradierStocksClient(next, env) : null;
+  // A credential change earns Tradier an immediate retry: clear any breaker the
+  // old (empty/stale) token had tripped on a 401/429 so the very next tick can
+  // use the new token instead of staying on Yahoo for another cooldown window.
+  tradierBlockedUntil = 0;
+  if (tradierStocksClient) {
+    console.info(`[yahoo-feed] Tradier stocks feed enabled from account settings (env=${env}) — Tradier is now the primary quote source`);
+  } else {
+    console.warn('[yahoo-feed] Tradier stocks feed disabled (no token in settings) — using Yahoo as primary');
+  }
 }
 
 // ── Daily fallback request counters ──────────────────────────────────────────

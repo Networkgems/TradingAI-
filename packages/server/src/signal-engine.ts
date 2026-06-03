@@ -4,7 +4,7 @@ import { WATCHLIST, MANAGED_ACCOUNT_RATIO, MAX_CONSECUTIVE_LOSSES, DAILY_DRAWDOW
 import type { TradeSignal, RelativeValueSignal, Sma200Signal, Candle, OptionsAccountState, SignalType, Position, AccountSettings, AccountState, NewsItem, TradierEnv, MarketReview, MarketReviewGates, EngineMarketReviewState, GatedStrategyNote } from '@trading-app/shared';
 import { getLatestMarketReview } from './market-review.js';
 import { etDateString } from './scheduler.js';
-import { fetchMinuteBars, fetchDailyCandles, fetchQuotes, fetchStocksNews, isYahooBreakerOpen, setActiveInterestSymbols } from './yahoo-feed.js';
+import { fetchMinuteBars, fetchDailyCandles, fetchQuotes, fetchStocksNews, isYahooBreakerOpen, setActiveInterestSymbols, setTradierStocksFeedClient } from './yahoo-feed.js';
 import { evaluateFeedFreshness } from './feed-freshness.js';
 import { PaperAccount } from './paper-account.js';
 import { PaperOptionsAccount } from './options-account.js';
@@ -528,6 +528,10 @@ export class SignalEngine {
       this.liveTradeEquitiesTradier = resolveLiveTradeEquitiesTradier(settings);
       this.tradierLiveEquityClient = buildTradierLiveEquityClient(settings);
       this.tradierOptionsClientByEnv = buildTradierOptionsClientsByEnv(settings);
+      // TRA-505 — seed the watchlist quote feed from the saved Tradier creds at
+      // boot so quotes use Tradier (not Yahoo's rate-limited free feed) from the
+      // first tick, without waiting for the next Settings save.
+      this.applyTradierQuoteFeed(settings);
       // TRA-373 — seed the RV DTE window from saved settings so an engine
       // boot picks up the user's window without waiting for the first
       // applySettings call.
@@ -634,6 +638,11 @@ export class SignalEngine {
     // mirrors Demo's signal flow out of the box.
     this.liveTradeEquitiesTradier = resolveLiveTradeEquitiesTradier(settings);
     this.tradierLiveEquityClient = buildTradierLiveEquityClient(settings);
+    // TRA-505 — re-point the watchlist quote feed at the user's saved Tradier
+    // creds on every settings change so a freshly entered/rotated token takes
+    // effect on the next tick. Without this the feed only ever sees the (usually
+    // empty) TRADIER_* env vars and quotes rate-limit on Yahoo's free feed.
+    this.applyTradierQuoteFeed(settings);
     // TRA-373 — re-read the RV DTE window so a saved edit takes effect on
     // the next scan tick (5-minute cadence).
     const dte = resolveRvDtePrefs(settings);
@@ -860,6 +869,21 @@ export class SignalEngine {
     } finally {
       this.tickRunning = false;
     }
+  }
+
+  /**
+   * TRA-505 — point the watchlist quote feed at the Tradier credentials the
+   * user saved in Settings. Quotes are read-only market data, so we wire the
+   * feed whenever a token is present regardless of `mode` — this fixes the
+   * "Quote unavailable — provider rate-limited" state that appeared once the
+   * user had a working Tradier production trading connection but the feed was
+   * still using Yahoo's free per-IP source (no TRADIER_* env vars set). An
+   * empty token leaves the feed on the Yahoo→Stooq fallback chain, exactly as
+   * before.
+   */
+  private applyTradierQuoteFeed(settings: AccountSettings): void {
+    const creds = resolveTradierOptionsCreds(settings);
+    setTradierStocksFeedClient(creds.apiToken, creds.env);
   }
 
   private async doTick(): Promise<void> {

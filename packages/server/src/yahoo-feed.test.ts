@@ -1,6 +1,38 @@
 import { describe, it, expect } from 'vitest';
 
-import { evaluateTwelveDataGate } from './yahoo-feed.js';
+import {
+  evaluateTwelveDataGate,
+  isTradierStocksConfigured,
+  setTradierStocksFeedClient,
+} from './yahoo-feed.js';
+
+// TRA-505 — the watchlist quote feed must follow the Tradier creds the user
+// saves in the live Settings page, not only the boot-time TRADIER_* env vars.
+// When no env token is set (the normal deployment), the feed has no Tradier
+// source and quotes fall back to Yahoo's free per-IP feed, which 429s and shows
+// "Quote unavailable — provider rate-limited". setTradierStocksFeedClient is the
+// hook the signal-engine calls from applySettings to swap the feed onto the same
+// account that already powers trading/balance.
+describe('setTradierStocksFeedClient (TRA-505 live-creds quote feed)', () => {
+  it('enables the Tradier feed once a token from settings is supplied', () => {
+    // No TRADIER_* env vars in the test env → feed starts unconfigured.
+    expect(isTradierStocksConfigured()).toBe(false);
+    setTradierStocksFeedClient('test-prod-token', 'production');
+    expect(isTradierStocksConfigured()).toBe(true);
+  });
+
+  it('disables the feed (back to Yahoo) when settings clear the token', () => {
+    setTradierStocksFeedClient('test-prod-token', 'production');
+    expect(isTradierStocksConfigured()).toBe(true);
+    setTradierStocksFeedClient('', 'production');
+    expect(isTradierStocksConfigured()).toBe(false);
+  });
+
+  it('treats a whitespace-only token as no token', () => {
+    setTradierStocksFeedClient('   ', 'production');
+    expect(isTradierStocksConfigured()).toBe(false);
+  });
+});
 
 // TRA-439 — Twelve Data quota guard. Before this fix the minute-bar fallback
 // had no breaker and no daily cap, so a degraded primary feed let one provider
