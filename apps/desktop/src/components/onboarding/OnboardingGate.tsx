@@ -7,6 +7,7 @@
 // finished onboarding.
 import { useOnboarding } from '../../hooks/useOnboarding';
 import { WizardModal } from './WizardModal';
+import { requestTourAutostart } from './tour';
 
 export interface OnboardingGateProps {
   token: string | null;
@@ -29,6 +30,13 @@ export function OnboardingGate({ token, onConnectBroker }: OnboardingGateProps) 
       onConnectBroker={() => {
         complete();
         onConnectBroker();
+      }}
+      onStartTour={() => {
+        // TRA-569 — step 3 hand-off to the coach-mark tour. Mark onboarding
+        // complete and request the tour to start on the dashboard (live event if
+        // one is mounted, breadcrumb otherwise — see requestTourAutostart).
+        complete();
+        requestTourAutostart();
       }}
     />
   );

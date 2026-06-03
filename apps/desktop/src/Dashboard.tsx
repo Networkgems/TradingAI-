@@ -25,6 +25,7 @@ import { NewsPanel } from './components/dashboard/NewsPanel';
 import { LiveCredentialsBanner } from './components/dashboard/LiveCredentialsBanner';
 import { HaltBanner } from './components/dashboard/HaltBanner';
 import { HealthPanel } from './components/dashboard/HealthPanel';
+import { DashboardTour } from './components/onboarding/CoachMarkTour';
 import { useStockEngine } from './hooks/useStockEngine';
 
 type StockTab = 'watchlist' | 'signals' | 'positions' | 'options' | 'news' | 'calendar' | 'health';
@@ -126,7 +127,14 @@ export default function Dashboard({ token, onLogout, onGoHome, onActivity, theme
             Production matches Demo. The earlier TRA-326 carve-out hid it on
             Live+Production. */}
         {(['watchlist', 'signals', 'positions', 'options'] as const).map(t => (
-          <button key={t} className={`tab ${tab === t ? 'active' : ''}`} onClick={() => setTab(t)}>
+          <button
+            key={t}
+            /* TRA-569 — coach-mark anchors (design §3.3): Signals/watchlist and
+               Positions stops point at their tab buttons. */
+            data-tour={t === 'signals' || t === 'positions' ? t : undefined}
+            className={`tab ${tab === t ? 'active' : ''}`}
+            onClick={() => setTab(t)}
+          >
             {t === 'watchlist' ? `Watchlist (${symbols.length})` :
              t === 'signals' ? `Signals (${signals.length})` :
              t === 'positions' ? `Positions (${openPositions.length})` :
@@ -136,7 +144,11 @@ export default function Dashboard({ token, onLogout, onGoHome, onActivity, theme
         <button className={`tab ${tab === 'news' ? 'active' : ''}`} onClick={() => setTab('news')}>
           {`News (${news.length})`}
         </button>
-        <button className={`tab ${tab === 'calendar' ? 'active' : ''}`} onClick={() => setTab('calendar')}>
+        <button
+          data-tour="calendar"
+          className={`tab ${tab === 'calendar' ? 'active' : ''}`}
+          onClick={() => setTab('calendar')}
+        >
           Calendar
         </button>
         {/* TRA-539 — live reliability dashboard (TRA-528 /api/health/live). */}
@@ -214,6 +226,11 @@ export default function Dashboard({ token, onLogout, onGoHome, onActivity, theme
         )}
        </ErrorBoundary>
       </main>
+
+      {/* TRA-569 (TRA-410 C2) — coach-mark tour. Self-contained: starts on the
+          replay event (profile menu) or the first-run autostart breadcrumb.
+          Renders nothing until then. */}
+      <DashboardTour />
     </div>
   );
 }

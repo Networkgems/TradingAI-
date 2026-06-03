@@ -35,11 +35,18 @@ export interface WizardModalProps {
    * broker), so the component does not call `onFinish` itself afterwards.
    */
   onConnectBroker: () => void;
+  /**
+   * TRA-569 — step 3 hand-off to the dashboard coach-mark tour. Like
+   * `onConnectBroker`, the gate marks onboarding complete and starts the tour,
+   * so the component does not call `onFinish` itself. Optional: when omitted the
+   * step just describes the tour and the user replays it later from the menu.
+   */
+  onStartTour?: () => void;
 }
 
 const TOTAL_STEPS = 4;
 
-export function WizardModal({ onFinish, onConnectBroker }: WizardModalProps) {
+export function WizardModal({ onFinish, onConnectBroker, onStartTour }: WizardModalProps) {
   const [step, setStep] = useState(0);
 
   const skip = useCallback(() => onFinish('skipped'), [onFinish]);
@@ -107,7 +114,7 @@ export function WizardModal({ onFinish, onConnectBroker }: WizardModalProps) {
         <div className="onboarding-body">
           {step === 0 && <StepDemoVsLive />}
           {step === 1 && <StepConnectBroker onConnectBroker={onConnectBroker} />}
-          {step === 2 && <StepDashboardTour />}
+          {step === 2 && <StepDashboardTour onStartTour={onStartTour} />}
           {step === 3 && <StepRecap />}
         </div>
 
@@ -193,7 +200,7 @@ function StepConnectBroker({ onConnectBroker }: { onConnectBroker: () => void })
   );
 }
 
-function StepDashboardTour() {
+function StepDashboardTour({ onStartTour }: { onStartTour?: () => void }) {
   return (
     <section aria-labelledby="onboarding-step3-h">
       <h3 id="onboarding-step3-h" className="onboarding-step-title">
@@ -204,9 +211,23 @@ function StepDashboardTour() {
         reports all live on the dashboard. A guided coach-mark tour walks you
         through each panel.
       </p>
-      <p className="onboarding-note">
-        The interactive tour lands next — for now, click Next to finish setup.
-      </p>
+      {/* TRA-569 — hand off to the coach-mark tour. The gate marks onboarding
+          complete and starts the tour, so this both closes the wizard and kicks
+          off the dashboard walkthrough. */}
+      {onStartTour ? (
+        <button
+          type="button"
+          className="onboarding-primary onboarding-broker-btn"
+          onClick={onStartTour}
+        >
+          Start dashboard tour
+        </button>
+      ) : (
+        <p className="onboarding-note">
+          The interactive tour lands next — for now, click Next to finish setup.
+        </p>
+      )}
+      <p className="onboarding-note">You can replay it anytime from the profile menu.</p>
     </section>
   );
 }

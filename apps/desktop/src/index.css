@@ -1459,6 +1459,121 @@ tr:hover td { background: var(--bg-hover); }
   filter: brightness(1.05);
 }
 
+/* ── TRA-569 — Coach-mark tour (dashboard walkthrough) ─────────────────────── */
+
+/* `.tour-anchor` keeps the wrapped account-mode switcher inline so the spotlight
+   hugs it rather than a full-width block. */
+.tour-anchor {
+  display: inline-flex;
+}
+
+/* Root sits above the wizard backdrop (z 300) and everything else. The blocker
+   captures clicks so the dimmed app is inert; the spotlight + tooltip layer on
+   top of it. */
+.coachmark-root {
+  position: fixed;
+  inset: 0;
+  z-index: 400;
+}
+
+.coachmark-blocker {
+  position: absolute;
+  inset: 0;
+  /* Transparent — the dimming is done by the spotlight's box-shadow so the
+     cut-out stays perfectly clear. This layer only swallows clicks. */
+  background: transparent;
+}
+
+/* The clear "hole": a transparent box whose massive box-shadow dims the rest of
+   the screen, leaving the anchored element fully visible inside it. */
+.coachmark-spotlight {
+  position: absolute;
+  border-radius: 8px;
+  box-shadow: 0 0 0 9999px rgba(0, 0, 0, 0.6);
+  outline: 2px solid var(--accent, #3b82f6);
+  outline-offset: 2px;
+  pointer-events: none;
+  transition: top 0.15s ease, left 0.15s ease, width 0.15s ease, height 0.15s ease;
+}
+
+.coachmark-tooltip {
+  position: absolute;
+  background: var(--bg-elevated, var(--bg, #fff));
+  color: var(--text);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 0.9rem 1rem;
+  box-shadow: 0 8px 24px rgba(0, 0, 0, 0.25);
+  display: flex;
+  flex-direction: column;
+  gap: 0.5rem;
+}
+
+.coachmark-title {
+  margin: 0;
+  font-size: 1rem;
+}
+
+.coachmark-body {
+  margin: 0;
+  font-size: 0.85rem;
+  color: var(--text-muted, #6b7280);
+  line-height: 1.4;
+}
+
+.coachmark-footer {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 0.75rem;
+  margin-top: 0.25rem;
+}
+
+.coachmark-count {
+  font-size: 0.78rem;
+  color: var(--text-muted, #6b7280);
+}
+
+.coachmark-nav {
+  display: flex;
+  gap: 0.4rem;
+}
+
+.coachmark-skip,
+.coachmark-back {
+  background: none;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  padding: 0.35rem 0.7rem;
+  color: var(--text);
+  cursor: pointer;
+  font-size: 0.8rem;
+}
+
+.coachmark-skip:hover,
+.coachmark-back:hover:not(:disabled) {
+  background: var(--bg-hover);
+}
+
+.coachmark-back:disabled {
+  opacity: 0.4;
+  cursor: default;
+}
+
+.coachmark-primary {
+  background: var(--accent, #3b82f6);
+  color: #fff;
+  border: 1px solid var(--accent, #3b82f6);
+  border-radius: 6px;
+  padding: 0.35rem 0.8rem;
+  cursor: pointer;
+  font-size: 0.8rem;
+}
+
+.coachmark-primary:hover {
+  filter: brightness(1.05);
+}
+
 /* ── Calendar Tab ─────────────────────────────────────────────────────────── */
 
 .cal-panel {

@@ -2,12 +2,18 @@
 import { useState, useRef, useLayoutEffect, useEffect } from 'react';
 import { createPortal } from 'react-dom';
 
-export function ProfileMenu({ onSettings, onChangePassword, onUserManagement, onLogout, isAdmin }: {
+export function ProfileMenu({ onSettings, onChangePassword, onUserManagement, onLogout, isAdmin, onReplayTour }: {
   onSettings: () => void;
   onChangePassword: () => void;
   onUserManagement: () => void;
   onLogout: () => void;
   isAdmin: boolean;
+  /**
+   * TRA-569 — optional "Replay product tour" entry. Only the Stocks dashboard
+   * (which has the `data-tour` anchors + a mounted tour) passes this; the menu
+   * item is hidden everywhere else so it never dead-ends.
+   */
+  onReplayTour?: () => void;
 }) {
   const [open, setOpen] = useState(false);
   const btnRef = useRef<HTMLButtonElement>(null);
@@ -85,6 +91,18 @@ export function ProfileMenu({ onSettings, onChangePassword, onUserManagement, on
               >
                 Account Management
               </button>
+            )}
+            {onReplayTour && (
+              <>
+                <div className="profile-dropdown-divider" />
+                <button
+                  className="profile-dropdown-item"
+                  role="menuitem"
+                  onClick={() => { setOpen(false); onReplayTour(); }}
+                >
+                  Replay product tour
+                </button>
+              </>
             )}
             <div className="profile-dropdown-divider" />
             <button

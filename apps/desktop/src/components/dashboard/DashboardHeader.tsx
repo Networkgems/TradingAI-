@@ -11,6 +11,7 @@ import { fmt, fmtDollar, timeAgo } from '../../lib/format';
 import { ThemeToggle } from '../ThemeToggle';
 import type { Theme } from '../ThemeToggle';
 import { ProfileMenu } from '../ProfileMenu';
+import { startTour } from '../onboarding/tour';
 import { AccountModeSwitcher } from '../AccountModeSwitcher';
 import { KillSwitchButton } from './KillSwitchButton';
 import { TradingAgentsButton } from './TradingAgentsButton';
@@ -90,7 +91,10 @@ export function DashboardHeader({
       <div className="header-left">
         <button className="back-btn" onClick={onGoHome} title="Back to dashboard selector">&#8592; Home</button>
         <h1>TradingAI <span className="mode-badge stocks">Stocks</span></h1>
-        <AccountModeSwitcher mode={accountMode} onChange={onAccountModeChange} market="stocks" token={token} />
+        {/* TRA-569 — coach-mark anchor for the account-mode stop (design §3.3). */}
+        <span data-tour="account-mode" className="tour-anchor">
+          <AccountModeSwitcher mode={accountMode} onChange={onAccountModeChange} market="stocks" token={token} />
+        </span>
       </div>
       <div className="header-right">
         {/* TRA-544 (TRA-529 §2B) — "Trading Agents" master switch, centred in
@@ -173,6 +177,8 @@ export function DashboardHeader({
         <div className="stat-divider" />
         <div className="action-group">
           <button
+            /* TRA-569 — coach-mark anchor for the Auto-trading stop (design §3.3). */
+            data-tour="auto-trading"
             className={`logout-btn${autoTradingEnabled ? ' trading-active' : ' trading-stopped'}`}
             onClick={toggleAutoTrading}
             disabled={tradingToggling}
@@ -191,6 +197,9 @@ export function DashboardHeader({
             onUserManagement={() => onOpenProfileModal('user-management')}
             onLogout={onLogout}
             isAdmin={isAdmin}
+            /* TRA-569 — "Replay product tour" re-runs the coach-mark tour without
+               resetting the onboarding completion flag (design §3.4). */
+            onReplayTour={startTour}
           />
         </div>
       </div>
