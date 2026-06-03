@@ -17,7 +17,12 @@ let svc: typeof import('./promotion-service.js');
 let store: typeof import('./promotion-store.js');
 let tradeStore: typeof import('./trade-store.js');
 
+const DAY_MS = 24 * 60 * 60 * 1000;
+
 function paperTrade(pnl: number, i: number): Position {
+  // Space trades one per day so the ledger spans ~weeks — long enough for the
+  // gate to annualize the paper Sharpe (TRA-538); a near-zero span would mark
+  // the Sharpe unverified and fail Stage 2.
   return {
     id: `t${i}`,
     symbol: 'BTC-USD',
@@ -27,8 +32,8 @@ function paperTrade(pnl: number, i: number): Position {
     quantity: 1,
     stopLoss: 99, // risk distance 1 → R == pnl
     takeProfit: 103,
-    openedAt: 1_000 + i,
-    closedAt: 2_000 + i,
+    openedAt: i * DAY_MS,
+    closedAt: i * DAY_MS + 3_600_000,
     pnl,
     mode: 'demo',
   };

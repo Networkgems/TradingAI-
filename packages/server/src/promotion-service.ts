@@ -21,12 +21,20 @@ const log = logger.child({ module: 'promotion-service' });
 
 /**
  * A closed position maps to a {@link PromotionTradeSample} 1:1 — `Position`
- * already carries `pnl`, `entryPrice`, `stopLoss`, `quantity`. Slippage fields
- * are absent on today's `Position` shape, so the slippage check stays
- * advisory (see promotion-gate `evaluatePaperGate`).
+ * already carries `pnl`, `entryPrice`, `stopLoss`, `quantity`, and the
+ * `openedAt`/`closedAt` timestamps the gate needs to annualize the paper
+ * Sharpe (TRA-538). Slippage fields are absent on today's `Position` shape, so
+ * the slippage check stays advisory (see promotion-gate `evaluatePaperGate`).
  */
 function toSample(p: Position): PromotionTradeSample {
-  return { pnl: p.pnl, entryPrice: p.entryPrice, stopLoss: p.stopLoss, quantity: p.quantity };
+  return {
+    pnl: p.pnl,
+    entryPrice: p.entryPrice,
+    stopLoss: p.stopLoss,
+    quantity: p.quantity,
+    openedAt: p.openedAt,
+    closedAt: p.closedAt,
+  };
 }
 
 /**

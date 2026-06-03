@@ -147,7 +147,12 @@ function StrategyCard({ entry }: { entry: PromotionStatusEntry }) {
           <div className="gate-metrics">
             <MetricRow label="Trades" value={num(paper.tradeCount, 0)} threshold={`≥ ${t.paper.minTradeCount}`} pass={paper.tradeCount >= t.paper.minTradeCount} />
             <MetricRow label="Expectancy (R)" value={num(paper.expectancy, 3)} threshold={`> ${t.paper.minExpectancy}`} pass={paper.expectancy > t.paper.minExpectancy} />
-            <MetricRow label="Sharpe" value={num(paper.sharpe)} threshold={`≥ ${t.paper.minSharpe}`} pass={paper.sharpe >= t.paper.minSharpe} />
+            <MetricRow
+              label="Sharpe (annualized)"
+              value={paper.sharpe == null ? 'unverified' : num(paper.sharpe)}
+              threshold={`≥ ${t.paper.minSharpe}`}
+              pass={paper.sharpe == null ? false : paper.sharpe >= t.paper.minSharpe}
+            />
             <MetricRow label="Profit factor" value={num(paper.profitFactor)} pass={null} />
             <MetricRow
               label="Slippage (realized ÷ modeled)"

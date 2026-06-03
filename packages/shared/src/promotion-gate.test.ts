@@ -19,24 +19,38 @@ const PASSING_BT: BacktestGateMetrics = {
   tradeCount: 140,
 };
 
+const MS_PER_DAY = 24 * 60 * 60 * 1000;
+
 /**
- * Build N paper trades with a fixed risk distance so R = pnl / (risk*qty) is
+ * Build one paper trade with a fixed risk distance so R = pnl / (risk*qty) is
  * controllable. risk distance = 1, qty = 1 → R == pnl.
  */
 function trade(pnl: number, extra: Partial<PromotionTradeSample> = {}): PromotionTradeSample {
   return { pnl, entryPrice: 100, stopLoss: 99, quantity: 1, ...extra };
 }
 
+/**
+ * Build a ledger from a list of pnl (== R) values, spacing the trades evenly
+ * across `spanDays` (open→close timestamps) so the gate can annualize the
+ * Sharpe. `spanDays = 60` keeps the span comfortably above the
+ * MIN_PAPER_SHARPE_YEARS_SPAN guard.
+ */
+function spaced(pnls: number[], spanDays = 60, extra: Partial<PromotionTradeSample> = {}): PromotionTradeSample[] {
+  const stepMs = pnls.length > 1 ? (spanDays * MS_PER_DAY) / (pnls.length - 1) : MS_PER_DAY;
+  return pnls.map((pnl, i) => trade(pnl, { openedAt: i * stepMs, closedAt: i * stepMs + 60_000, ...extra }));
+}
+
 describe('computePaperGateMetrics — metrics are derived from the ledger, not hand-entered', () => {
-  it('computes expectancy as mean R, profit factor, and per-trade Sharpe', () => {
+  it('computes expectancy as mean R, profit factor, and an annualized Sharpe', () => {
     // R values: +2, +2, -1, -1, +1  → mean = 0.6
-    const trades = [trade(2), trade(2), trade(-1), trade(-1), trade(1)];
+    const trades = spaced([2, 2, -1, -1, 1]);
     const m = computePaperGateMetrics(trades);
     expect(m.tradeCount).toBe(5);
     expect(m.expectancy).toBeCloseTo(0.6, 6);
     // grossWin = 5, grossLoss = 2 → PF = 2.5
     expect(m.profitFactor).toBeCloseTo(2.5, 6);
-    expect(m.sharpe).toBeGreaterThan(0);
+    expect(m.sharpe).not.toBeNull();
+    expect(m.sharpe as number).toBeGreaterThan(0);
   });
 
   it('caps profit factor when there are no losses (JSON-safe, not Infinity)', () => {
@@ -56,6 +70,12 @@ describe('computePaperGateMetrics — metrics are derived from the ledger, not h
     expect(m.tradeCount).toBe(2);
     // only the first has a valid R → expectancy = 2
     expect(m.expectancy).toBeCloseTo(2, 6);
+  });
+
+  it('reports a null (unverified) Sharpe when the ledger carries no timestamps to annualize over', () => {
+    // trade() omits openedAt/closedAt → no span → cannot annualize → null.
+    const m = computePaperGateMetrics([trade(2), trade(-1), trade(1), trade(-0.5)]);
+    expect(m.sharpe).toBeNull();
   });
 
   it('reports slippageRatio only when modeled slippage is instrumented; else null', () => {
@@ -100,11 +120,11 @@ describe('evaluateBacktestGate (Stage 1)', () => {
 });
 
 describe('evaluatePaperGate (Stage 2)', () => {
-  // 60 strong paper trades: alternating +2 / +1 with a few losers → positive expectancy.
-  // 50 winners of +1.5, 10 small losers of -0.5 → mean R ≈ 1.17, Sharpe ≈ 1.5,
-  // comfortably clearing every Stage-2 threshold.
+  // 60 strong paper trades over ~60 days: 50 winners of +1.5, 10 small losers of
+  // -0.5 → mean R ≈ 1.17, annualized Sharpe well above 0.8, clearing every
+  // Stage-2 threshold.
   const strongPaper = computePaperGateMetrics(
-    Array.from({ length: 60 }, (_, i) => trade(i % 6 === 0 ? -0.5 : 1.5)),
+    spaced(Array.from({ length: 60 }, (_, i) => (i % 6 === 0 ? -0.5 : 1.5))),
   );
 
   it('passes when count, expectancy, ratio, and Sharpe clear thresholds', () => {
@@ -119,7 +139,7 @@ describe('evaluatePaperGate (Stage 2)', () => {
   it('fails when paper expectancy collapses below 0.5x backtest (overfit signal)', () => {
     // backtest expectancy 0.2 → floor 0.1. Paper expectancy ~0.02 (tiny edge).
     const weak = computePaperGateMetrics(
-      Array.from({ length: 60 }, (_, i) => trade(i % 2 === 0 ? 0.5 : -0.46)),
+      spaced(Array.from({ length: 60 }, (_, i) => (i % 2 === 0 ? 0.5 : -0.46))),
     );
     const r = evaluatePaperGate(weak, PASSING_BT);
     expect(r.state).toBe('fail');
@@ -127,7 +147,7 @@ describe('evaluatePaperGate (Stage 2)', () => {
   });
 
   it('fails when fewer than 50 monitored trades', () => {
-    const few = computePaperGateMetrics(Array.from({ length: 20 }, () => trade(1)));
+    const few = computePaperGateMetrics(spaced(Array.from({ length: 20 }, () => 1)));
     const r = evaluatePaperGate(few, PASSING_BT);
     expect(r.state).toBe('fail');
     expect(r.failedChecks.join(' ')).toMatch(/trade count/);
@@ -140,21 +160,60 @@ describe('evaluatePaperGate (Stage 2)', () => {
 
   it('fails when realized slippage exceeds 1.5x modeled', () => {
     const slipped = computePaperGateMetrics(
-      Array.from({ length: 60 }, (_, i) =>
-        trade(i % 5 === 0 ? -1 : 1, { realizedSlippage: 2, modeledSlippage: 1 }),
-      ),
+      spaced(Array.from({ length: 60 }, (_, i) => (i % 5 === 0 ? -1 : 1)), 60, {
+        realizedSlippage: 2,
+        modeledSlippage: 1,
+      }),
     );
     const r = evaluatePaperGate(slipped, PASSING_BT);
     expect(r.state).toBe('fail');
     expect(r.failedChecks.join(' ')).toMatch(/slippage/);
   });
+
+  // ── TRA-538: paper Sharpe is annualized to the Stage-1 backtest basis ────────
+  describe('annualized paper Sharpe (TRA-538)', () => {
+    it('rejects a high per-trade-IR ledger that lacks the span to annualize (no √-blow-up pass)', () => {
+      // 60 strong trades crammed into a single minute. Per-trade IR is high, but
+      // the span is far under ~5 trading days, so the Sharpe is unverified and
+      // Stage 2 fails — it does NOT auto-pass off a near-zero denominator.
+      const burst = computePaperGateMetrics(
+        Array.from({ length: 60 }, (_, i) =>
+          trade(i % 6 === 0 ? -0.5 : 1.5, { openedAt: i * 1000, closedAt: i * 1000 + 500 }),
+        ),
+      );
+      expect(burst.sharpe).toBeNull();
+      const r = evaluatePaperGate(burst, PASSING_BT);
+      expect(r.state).toBe('fail');
+      expect(r.failedChecks.join(' ')).toMatch(/Sharpe unverified/);
+    });
+
+    it('passes a realistic ledger whose per-trade IR < 0.8 once annualized to ≥ 0.8', () => {
+      // mean R = 0.12, sd ≈ 1.09 → per-trade IR ≈ 0.11, which is FAR under the
+      // 0.8 bar the old un-annualized check compared against (it would have
+      // wrongly failed). Spread over ~60 days the annualized Sharpe is ≈ 2.1, so
+      // the strategy now correctly clears Stage 2.
+      const pnls = Array.from({ length: 60 }, (_, i) => (i % 2 === 0 ? 1.2 : -0.96));
+      const realistic = computePaperGateMetrics(spaced(pnls, 60));
+      expect(realistic.expectancy).toBeCloseTo(0.12, 6);
+      expect(realistic.sharpe).not.toBeNull();
+      expect(realistic.sharpe as number).toBeGreaterThanOrEqual(0.8);
+      expect(evaluatePaperGate(realistic, PASSING_BT).state).toBe('pass');
+
+      // The very same R distribution crammed into seconds is unverified → fail.
+      const crammed = computePaperGateMetrics(
+        pnls.map((pnl, i) => trade(pnl, { openedAt: i * 1000, closedAt: i * 1000 + 500 })),
+      );
+      expect(crammed.sharpe).toBeNull();
+      expect(evaluatePaperGate(crammed, PASSING_BT).state).toBe('fail');
+    });
+  });
 });
 
 describe('evaluatePromotion — overall verdict (the one-line rule)', () => {
-  // 50 winners of +1.5, 10 small losers of -0.5 → mean R ≈ 1.17, Sharpe ≈ 1.5,
-  // comfortably clearing every Stage-2 threshold.
+  // 50 winners of +1.5, 10 small losers of -0.5 over ~60 days → mean R ≈ 1.17,
+  // annualized Sharpe well above 0.8, comfortably clearing every Stage-2 threshold.
   const strongPaper = computePaperGateMetrics(
-    Array.from({ length: 60 }, (_, i) => trade(i % 6 === 0 ? -0.5 : 1.5)),
+    spaced(Array.from({ length: 60 }, (_, i) => (i % 6 === 0 ? -0.5 : 1.5))),
   );
 
   it('allows live only when backtest=pass AND paper=pass AND signoff=present', () => {

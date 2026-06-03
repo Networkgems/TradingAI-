@@ -92,8 +92,21 @@ export interface PaperGateMetrics {
   tradeCount: number;
   /** Average R per trade (same unit as backtest expectancy). */
   expectancy: number;
-  /** Per-trade information ratio: mean(R) / stdev(R). Not annualized. */
-  sharpe: number;
+  /**
+   * Annualized Sharpe — `perTradeIR × √(tradesPerYear)` — on the SAME time
+   * basis as the Stage-1 backtest Sharpe, so the `paper.minSharpe = 0.8`
+   * threshold is a like-for-like (mildly relaxed) sibling of Stage-1's 1.0.
+   * Per-trade IR is `mean(R) / stdev(R)`; `tradesPerYear` is derived from the
+   * ledger's open/close timestamps (see {@link computePaperGateMetrics}).
+   *
+   * `null` when the Sharpe cannot be credibly annualized — fewer than 2 valid-R
+   * trades, no usable open/close timestamps, a zero-variance R series, or a
+   * span shorter than {@link MIN_PAPER_SHARPE_YEARS_SPAN}. A `null` Sharpe is
+   * treated as a hard Stage-2 *fail* (unverified), never a pass — see
+   * {@link evaluatePaperGate}. This guard stops a near-zero span from minting a
+   * fake pass via the √ blow-up.
+   */
+  sharpe: number | null;
   profitFactor: number;
   /**
    * Realized ÷ modeled slippage over trades that carry both figures, or `null`
@@ -121,6 +134,10 @@ export interface PromotionTradeSample {
   realizedSlippage?: number;
   /** Per-trade modeled slippage cost (account currency), if instrumented. */
   modeledSlippage?: number;
+  /** Epoch ms the trade was opened. Used to derive the ledger span for annualizing Sharpe. */
+  openedAt?: number;
+  /** Epoch ms the trade was closed. Used to derive the ledger span for annualizing Sharpe. */
+  closedAt?: number;
 }
 
 // ── Metric computation (from data) ───────────────────────────────────────────
@@ -140,6 +157,17 @@ function stdev(xs: number[]): number {
  */
 export const PROFIT_FACTOR_CAP = 999;
 
+/** Milliseconds in one year — same basis the backtest runner uses for annualization. */
+const MS_PER_YEAR = 365.25 * 24 * 60 * 60 * 1_000;
+
+/**
+ * Minimum ledger span (in years) required to credibly annualize the paper
+ * Sharpe. ~0.02y ≈ 5 trading days. Below this, `tradesPerYear` (and thus the
+ * √ annualization factor) blows up off a near-zero denominator and would mint a
+ * fake pass, so the Sharpe is reported as `null` (unverified) instead.
+ */
+export const MIN_PAPER_SHARPE_YEARS_SPAN = 0.02;
+
 /**
  * Compute the Stage-2 paper metrics from a closed-trade ledger. R per trade is
  * `pnl / (|entryPrice − stopLoss| × quantity)` — the same risk-unit definition
@@ -154,6 +182,10 @@ export function computePaperGateMetrics(trades: readonly PromotionTradeSample[])
   let realizedSlip = 0;
   let modeledSlip = 0;
   let slippageSampleSize = 0;
+  // Span of the valid-R trades, from earliest open to latest close, used to
+  // derive trades-per-year for annualizing the Sharpe.
+  let firstOpenedAt = Infinity;
+  let lastClosedAt = -Infinity;
 
   for (const t of trades) {
     if (typeof t.pnl !== 'number' || !Number.isFinite(t.pnl)) continue;
@@ -164,6 +196,10 @@ export function computePaperGateMetrics(trades: readonly PromotionTradeSample[])
     const riskAmount = riskDistance * t.quantity;
     if (riskAmount > 0 && Number.isFinite(riskAmount)) {
       rs.push(t.pnl / riskAmount);
+      if (typeof t.openedAt === 'number' && Number.isFinite(t.openedAt) && t.openedAt < firstOpenedAt)
+        firstOpenedAt = t.openedAt;
+      if (typeof t.closedAt === 'number' && Number.isFinite(t.closedAt) && t.closedAt > lastClosedAt)
+        lastClosedAt = t.closedAt;
     }
 
     if (typeof t.realizedSlippage === 'number' && typeof t.modeledSlippage === 'number') {
@@ -175,7 +211,20 @@ export function computePaperGateMetrics(trades: readonly PromotionTradeSample[])
 
   const expectancy = rs.length > 0 ? rs.reduce((a, b) => a + b, 0) / rs.length : 0;
   const sd = stdev(rs);
-  const sharpe = rs.length >= 2 && sd > 0 ? expectancy / sd : 0;
+  // Per-trade information ratio, then annualized to the backtest's time basis so
+  // the 0.8 threshold reads as a standard annualized Sharpe. Guarded: with < 2
+  // valid-R trades, zero variance, no usable timestamps, or a span shorter than
+  // MIN_PAPER_SHARPE_YEARS_SPAN, the Sharpe is unverified (`null`) — a fail, not
+  // a √-blow-up pass.
+  let sharpe: number | null = null;
+  if (rs.length >= 2 && sd > 0 && Number.isFinite(firstOpenedAt) && Number.isFinite(lastClosedAt)) {
+    const yearsSpan = (lastClosedAt - firstOpenedAt) / MS_PER_YEAR;
+    if (yearsSpan >= MIN_PAPER_SHARPE_YEARS_SPAN) {
+      const perTradeIR = expectancy / sd;
+      const tradesPerYear = rs.length / yearsSpan;
+      sharpe = perTradeIR * Math.sqrt(tradesPerYear);
+    }
+  }
   const profitFactor =
     grossLoss > 0 ? Math.min(grossWin / grossLoss, PROFIT_FACTOR_CAP) : grossWin > 0 ? PROFIT_FACTOR_CAP : 0;
   const slippageRatio = slippageSampleSize > 0 && modeledSlip > 0 ? realizedSlip / modeledSlip : null;
@@ -260,7 +309,11 @@ export function evaluatePaperGate(
         `paper expectancy ${fmt(paper.expectancy)} < ${fmt(t.minExpectancyVsBacktestRatio)}× backtest (${fmt(floor)}) — overfit signal`,
       );
   }
-  if (!(paper.sharpe >= t.minSharpe)) failed.push(`paper Sharpe ${fmt(paper.sharpe)} < ${t.minSharpe}`);
+  if (paper.sharpe === null)
+    failed.push(
+      'paper Sharpe unverified — too few valid-R trades or too short a span to annualize (need ≥2 trades over ≥~5 trading days)',
+    );
+  else if (!(paper.sharpe >= t.minSharpe)) failed.push(`paper Sharpe ${fmt(paper.sharpe)} < ${t.minSharpe}`);
   if (paper.slippageRatio !== null && !(paper.slippageRatio <= t.maxSlippageRatio))
     failed.push(`realized slippage ${fmt(paper.slippageRatio)}× modeled > ${t.maxSlippageRatio}×`);
   return { state: failed.length === 0 ? 'pass' : 'fail', failedChecks: failed };
