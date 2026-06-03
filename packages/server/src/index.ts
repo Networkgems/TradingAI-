@@ -75,8 +75,6 @@ import {
   CoinbaseOrderClient,
   tradierBaseUrl,
   TradierOptionsClient,
-  TradierOrderClient,
-  TRADIER_TERMINAL_STATUSES,
 } from '@trading-app/engine';
 import { submitSmartSellToClose } from './tradier-smart-close.js';
 import type { TradierEnv } from '@trading-app/shared';
