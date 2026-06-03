@@ -1,6 +1,6 @@
 import { OrbStrategy, BbFadeStrategy, IchimokuStrategy, TradierOptionsClient, TradierOrderClient, TRADIER_REJECTED_STATUSES, evaluateSma200, SMA200_MIN_BARS, SMA200_DEBOUNCE_BARS } from '@trading-app/engine';
 import type { TradierAccountBalance } from '@trading-app/engine';
-import { WATCHLIST, MANAGED_ACCOUNT_RATIO, MAX_CONSECUTIVE_LOSSES, DAILY_DRAWDOWN_HALT_PCT, OPTIONS_PER_TICKET_DOLLAR_FLOOR, OPTIONS_POSITION_CAP_RATIO, aliasWatchlistSymbol, isLiveTradierOptionsEnabled, isStockMarketOpen, perPositionCap, resolveAutoManageImportedTradierOptions, resolveDemoCostModel, resolveHoldLiveOptionsOvernight, resolveLiveTradeEquitiesTradier, resolveManagedAccountRatio, resolveMarketReviewGatesEnabled, resolveRiskPerTrade, resolveRvDtePrefs, resolveTradierOptionsCreds, DEFAULT_RV_DTE_MIN, DEFAULT_RV_DTE_MAX, DEFAULT_RV_DTE_TARGET } from '@trading-app/shared';
+import { WATCHLIST, MANAGED_ACCOUNT_RATIO, MAX_CONSECUTIVE_LOSSES, DAILY_DRAWDOWN_HALT_PCT, OPTIONS_PER_TICKET_DOLLAR_FLOOR, OPTIONS_POSITION_CAP_RATIO, aliasWatchlistSymbol, isLiveTradierOptionsEnabled, isStockMarketOpen, perPositionCap, resolveAutoManageImportedTradierOptions, resolveDemoCostModel, resolveHoldLiveOptionsOvernight, resolveLiveTradeEquitiesTradier, resolveManagedAccountRatio, resolveMarketReviewGatesEnabled, resolveRiskPerTrade, resolveRvDtePrefs, resolveTradierOptionsCreds, validateBracket, DEFAULT_RV_DTE_MIN, DEFAULT_RV_DTE_MAX, DEFAULT_RV_DTE_TARGET } from '@trading-app/shared';
 import type { TradeSignal, RelativeValueSignal, Sma200Signal, Candle, OptionsAccountState, SignalType, Position, AccountSettings, AccountState, NewsItem, TradierEnv, MarketReview, MarketReviewGates, EngineMarketReviewState, GatedStrategyNote } from '@trading-app/shared';
 import { getLatestMarketReview } from './market-review.js';
 import { etDateString } from './scheduler.js';
@@ -1187,6 +1187,26 @@ export class SignalEngine {
           // TRA-231 — stamp the active mode so the dashboard's Signals panel
           // can scope this entry to the demo (or live) mode it fired under.
           signal.mode = this.mode;
+
+          // TRA-520 — final position-creation guard, against the actual fill
+          // price, for every equity strategy (ORB / BB-fade / Ichimoku) and
+          // both modes. Per-strategy signal-gen guards should already reject a
+          // wrong-side bracket, but a non-positive or inverted stop/target must
+          // never reach the broker or the paper book — it disables the risk
+          // exits. Surface the suppressed signal with a reason instead of
+          // silently opening an unprotected position.
+          const equityBracket = validateBracket(signal.side, price, signal.stopLoss, signal.takeProfit);
+          if (!equityBracket.ok) {
+            signal.signalSkipReason = `invalid bracket: ${equityBracket.reason}`;
+            log.warn('equity signal suppressed: invalid stop/take bracket', {
+              component: 'equity-scan', sym, signalType: signal.type,
+              side: signal.side, price, stop: signal.stopLoss,
+              takeProfit: signal.takeProfit, reason: equityBracket.reason,
+            });
+            this.recentSignals.unshift(signal);
+            if (this.recentSignals.length > MAX_SIGNALS) this.recentSignals.pop();
+            continue;
+          }
 
           // TRA-389 / TRA-474 — the market-review regime gate used to sit
           // here. Removed: a (possibly wrong) premarket report must not be

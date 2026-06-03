@@ -225,17 +225,24 @@ export function evaluateSma200(symbol: string, candles: Candle[]): Sma200Evaluat
   const decisiveUpClose = today.close > candles[t - 1].high && today.close > candles[t - 2].high;
   if (trendQuality && trendStrength && pullbackTouched && holdConfirmed && decisiveUpClose) {
     const stop = sma200 - 1.0 * atr14;
-    signals.push({
-      kind: 'sma200_pullback',
-      symbol,
-      entry: today.close,
-      stop,
-      rsi: rsi14,
-      distAtr,
-      trendQuality: true,
-      label: 'continuation — trend was already up',
-      timestamp: today.timestamp,
-    });
+    // TRA-520 — guard against a non-positive / above-entry stop. When daily
+    // data is spiky (an outlier bar inflates ATR(14) past the SMA200 level)
+    // `sma200 − ATR` can go ≤ 0, which slipped through and persisted as a
+    // negative stopLoss (e.g. ASTC stopLoss=-0.215) — a long with no real
+    // downside protection. A valid pullback long must have 0 < stop < entry.
+    if (stop > 0 && stop < today.close) {
+      signals.push({
+        kind: 'sma200_pullback',
+        symbol,
+        entry: today.close,
+        stop,
+        rsi: rsi14,
+        distAtr,
+        trendQuality: true,
+        label: 'continuation — trend was already up',
+        timestamp: today.timestamp,
+      });
+    }
   }
 
   // ---- Signal 3: 200-SMA Reclaim Reversal (trend-change swing) ----------

@@ -1,4 +1,4 @@
-import { Candle, MarketQuote, TradeSignal, Side, ADX_RANGING_THRESHOLD, isValidTradingWindow, getEasternUtcOffset } from '@trading-app/shared';
+import { Candle, MarketQuote, TradeSignal, Side, ADX_RANGING_THRESHOLD, isValidTradingWindow, getEasternUtcOffset, validateBracket } from '@trading-app/shared';
 import { randomUUID } from 'crypto';
 import { adx } from '../indicators/adx.js';
 import type { AlpacaOrderClient } from '../alpaca/index.js';
@@ -120,6 +120,12 @@ export class OrbStrategy {
     const takeProfit = side === 'buy'
       ? entryPrice + stopDistance * 2
       : entryPrice - stopDistance * 2;
+
+    // TRA-520 — on a low-priced short the 2R target can fall below zero
+    // (e.g. PRFX entry 3.05, stop 4.64 → target −0.04), which is unreachable
+    // and disables the profit-taking exit. Drop any signal whose bracket is
+    // non-positive or on the wrong side of entry rather than emit it.
+    if (!validateBracket(side, entryPrice, stopLoss, takeProfit).ok) return null;
 
     return {
       id: randomUUID(),

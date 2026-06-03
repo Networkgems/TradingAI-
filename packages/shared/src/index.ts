@@ -162,6 +162,62 @@ export interface Sma200Signal extends TradeSignal {
   context: string;
 }
 
+/** Result of a protective-bracket sanity check (TRA-520). */
+export interface BracketCheck {
+  ok: boolean;
+  /** Human-readable failure reason; present only when `ok === false`. */
+  reason?: string;
+}
+
+/**
+ * TRA-520 — validate that a signal's / position's protective bracket is
+ * structurally sound before it is emitted or opened.
+ *
+ * Invariants enforced:
+ *   - `entryPrice`, `stopLoss`, `takeProfit` are all finite and **positive**
+ *     (a non-positive stop/target is unreachable, so the exit never fires).
+ *   - The stop and target sit on the correct side of entry for the direction:
+ *       long  (`buy`):  `stopLoss < entry < takeProfit`
+ *       short (`sell`): `takeProfit < entry < stopLoss`
+ *
+ * A negative stop on a long leaves the position with no real downside
+ * protection; a negative target on a short can never be reached. Both were
+ * observed in the wild (ASTC `stopLoss=-0.215`, PRFX `takeProfit=-0.04`) and
+ * silently disabled the risk-management exits — this check rejects them.
+ */
+export function validateBracket(
+  side: Side,
+  entryPrice: number,
+  stopLoss: number,
+  takeProfit: number,
+): BracketCheck {
+  if (!Number.isFinite(entryPrice) || entryPrice <= 0) {
+    return { ok: false, reason: `entry must be a positive finite price (got ${entryPrice})` };
+  }
+  if (!Number.isFinite(stopLoss) || stopLoss <= 0) {
+    return { ok: false, reason: `stopLoss must be a positive finite price (got ${stopLoss})` };
+  }
+  if (!Number.isFinite(takeProfit) || takeProfit <= 0) {
+    return { ok: false, reason: `takeProfit must be a positive finite price (got ${takeProfit})` };
+  }
+  if (side === 'buy') {
+    if (stopLoss >= entryPrice) {
+      return { ok: false, reason: `long stopLoss ${stopLoss} must be below entry ${entryPrice}` };
+    }
+    if (takeProfit <= entryPrice) {
+      return { ok: false, reason: `long takeProfit ${takeProfit} must be above entry ${entryPrice}` };
+    }
+  } else {
+    if (stopLoss <= entryPrice) {
+      return { ok: false, reason: `short stopLoss ${stopLoss} must be above entry ${entryPrice}` };
+    }
+    if (takeProfit >= entryPrice) {
+      return { ok: false, reason: `short takeProfit ${takeProfit} must be below entry ${entryPrice}` };
+    }
+  }
+  return { ok: true };
+}
+
 /**
  * Why a closed position exited. Surfaced in `Position.exitReason` so backtest
  * trade logs can break PnL down by lifecycle path:

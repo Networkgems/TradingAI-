@@ -1,5 +1,5 @@
 import type { AccountState, Position, TradeSignal, SignalType } from '@trading-app/shared';
-import { DEFAULT_ACCOUNT_SETTINGS } from '@trading-app/shared';
+import { DEFAULT_ACCOUNT_SETTINGS, validateBracket } from '@trading-app/shared';
 import { randomUUID } from 'crypto';
 import { logger } from './observability/index.js';
 
@@ -94,6 +94,24 @@ export class PaperAccount {
    * as before. A multiplier that rounds the share count to 0 skips the open.
    */
   openPosition(signal: TradeSignal, currentPrice: number, sizeMultiplier = 1): Position | null {
+    // TRA-520 — never open a position whose protective bracket is on the wrong
+    // side of entry (or non-positive). A negative stop/target silently disables
+    // the risk-management exits, letting a loser run unbounded. Validate against
+    // the actual fill price the position will carry (`currentPrice`), since that
+    // — not the signal's entry — is what the exit checks compare against.
+    const bracket = validateBracket(signal.side, currentPrice, signal.stopLoss, signal.takeProfit);
+    if (!bracket.ok) {
+      log.warn('skip signal: invalid stop/take bracket', {
+        symbol: signal.symbol,
+        signalType: signal.type,
+        side: signal.side,
+        price: currentPrice,
+        stop: signal.stopLoss,
+        takeProfit: signal.takeProfit,
+        reason: bracket.reason,
+      });
+      return null;
+    }
     let qty = this.sizeFromStop(signal.entryPrice, signal.stopLoss);
     if (qty <= 0) {
       log.warn('skip signal: qty=0', {

@@ -2756,6 +2756,28 @@ describe('TRA-389 — market-review regime gates', () => {
     });
   });
 
+  describe('PaperAccount.openPosition — bracket guard (TRA-520)', () => {
+    const acct = () => new PaperAccount({ initialEquity: 100_000, managedAccountRatio: 1, riskPerTrade: 0.01 });
+
+    it('refuses a long with a negative stop (ASTC repro)', () => {
+      expect(acct().openPosition(sig({ side: 'buy', stopLoss: -0.215, takeProfit: 148.93 }), 49.5)).toBeNull();
+    });
+
+    it('refuses a short with a negative target (PRFX repro)', () => {
+      expect(acct().openPosition(sig({ side: 'sell', stopLoss: 4.64, takeProfit: -0.04 }), 3.05)).toBeNull();
+    });
+
+    it('refuses a long whose stop sits above the fill price', () => {
+      // Bracket is fine vs the signal entry (95<100<110) but the actual fill
+      // is below the stop — the guard validates against the fill price.
+      expect(acct().openPosition(sig({ side: 'buy', stopLoss: 95, takeProfit: 110 }), 90)).toBeNull();
+    });
+
+    it('still opens a well-formed long', () => {
+      expect(acct().openPosition(sig({ side: 'buy', stopLoss: 95, takeProfit: 110 }), 100)).not.toBeNull();
+    });
+  });
+
   describe('resolveMarketReviewGatesEnabled', () => {
     it('defaults off — absent or false both resolve false, only explicit true enables', () => {
       expect(resolveMarketReviewGatesEnabled(DEFAULT_ACCOUNT_SETTINGS)).toBe(false);
