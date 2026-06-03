@@ -1,7 +1,11 @@
 import { OrbStrategy, BbFadeStrategy, IchimokuStrategy, TradierOptionsClient, TradierOrderClient, TRADIER_REJECTED_STATUSES, evaluateSma200, SMA200_MIN_BARS, SMA200_DEBOUNCE_BARS, composeTechnicalSnapshot, resampleCandles, TF_BUCKET_MS } from '@trading-app/engine';
 import type { TradierAccountBalance } from '@trading-app/engine';
 import { WATCHLIST, MANAGED_ACCOUNT_RATIO, MAX_CONSECUTIVE_LOSSES, DAILY_DRAWDOWN_HALT_PCT, OPTIONS_PER_TICKET_DOLLAR_FLOOR, OPTIONS_POSITION_CAP_RATIO, aliasWatchlistSymbol, isLiveTradierOptionsEnabled, isStockMarketOpen, perPositionCap, resolveAutoManageImportedTradierOptions, resolveDemoCostModel, resolveHoldLiveOptionsOvernight, resolveLiveTradeEquitiesTradier, resolveManagedAccountRatio, resolveMarketReviewGatesEnabled, resolveRiskPerTrade, resolveRvDtePrefs, resolveTradierOptionsCreds, validateBracket, DEFAULT_RV_DTE_MIN, DEFAULT_RV_DTE_MAX, DEFAULT_RV_DTE_TARGET, scoreNewsSentiment, aggregateSymbolSentiment, nameAliasesFor } from '@trading-app/shared';
-import type { TradeSignal, RelativeValueSignal, Sma200Signal, Candle, OptionsAccountState, SignalType, Position, AccountSettings, AccountState, NewsItem, SymbolSentiment, TechnicalSignalSnapshot, TradierEnv, MarketReview, MarketReviewGates, EngineMarketReviewState, GatedStrategyNote } from '@trading-app/shared';
+import type { TradeSignal, RelativeValueSignal, Sma200Signal, Candle, OptionsAccountState, SignalType, Position, AccountSettings, AccountState, NewsItem, SymbolSentiment, TechnicalSignalSnapshot, TradierEnv, MarketReview, MarketReviewGates, EngineMarketReviewState, GatedStrategyNote, AgentRecommendation } from '@trading-app/shared';
+// TRA-544 (TRA-529 P1) — advisory multi-agent layer. P1 runs the deterministic
+// STUB graph (no LLM calls, zero spend); ON suspends deterministic auto-routing
+// and the engine surfaces the stub recommendations on the WS state.
+import { runAgentGraph } from '@trading-app/agents';
 import { getLatestMarketReview } from './market-review.js';
 import { etDateString } from './scheduler.js';
 import { fetchMinuteBars, fetchDailyCandles, fetchQuotes, fetchStocksNews, isYahooBreakerOpen, setActiveInterestSymbols, setTradierStocksFeedClient } from './yahoo-feed.js';
@@ -52,6 +56,19 @@ export interface EngineState {
   tradingHalted: boolean;
   haltReason: string | null;
   autoTradingEnabled: boolean;
+  /**
+   * TRA-544 — true when the "Trading Agents" master switch is ON, i.e. the
+   * multi-agent layer is the active decision-maker and deterministic
+   * auto-routing is suspended. The banner button seeds from account settings;
+   * this lets the dashboard confirm true server state.
+   */
+  tradingAgentsEnabled: boolean;
+  /**
+   * TRA-544 — latest advisory recommendations from the multi-agent layer (P1
+   * deterministic stub). Empty when the layer is off. Advisor-only: surfaced
+   * for display + audit, not routed (gating mode is P4).
+   */
+  agentRecommendations: AgentRecommendation[];
   /** True when US stock market is currently open (weekdays 9:30 AM–4 PM ET). */
   marketOpen: boolean;
   /**
@@ -380,6 +397,15 @@ export class SignalEngine {
   private autoTradingEnabledDemo = true;
   private autoTradingEnabledLive = true;
   private mode: 'demo' | 'live' = 'demo';
+  // TRA-544 (TRA-529 §2B) — runtime "Trading Agents" master switch. When true
+  // the multi-agent layer is the active decision-maker: deterministic
+  // auto-routing is SUSPENDED (never both deciding at once) and the engine runs
+  // the advisory stub graph each tick, surfacing its recommendations on state.
+  // Persisted in AccountSettings.tradingAgentsEnabled; reconciled in
+  // applySettings so the choice survives a restart. P1 is advisor-only — the
+  // stub never routes orders (gating mode is P4).
+  private tradingAgentsEnabled = false;
+  private latestAgentRecommendations: AgentRecommendation[] = [];
   /**
    * TRA-221 — Tradier live options client. Built from per-options
    * AccountSettings (apiToken/accountId/env) when mode flips to 'live' AND the
@@ -636,6 +662,8 @@ export class SignalEngine {
     // start/stop UI state for either mode) keeps the engine in sync.
     this.autoTradingEnabledDemo = settings.stocksAutoTradingEnabledDemo ?? true;
     this.autoTradingEnabledLive = settings.stocksAutoTradingEnabledLive ?? true;
+    // TRA-544 — reconcile the multi-agent master switch from persisted settings.
+    this.tradingAgentsEnabled = settings.tradingAgentsEnabled === true;
     // TRA-526 — reconcile the global kill switch from persisted settings so an
     // operator halt survives a server restart instead of silently lifting.
     if (settings.globalKillSwitchEngaged) {
@@ -1224,7 +1252,9 @@ export class SignalEngine {
     // creds are configured; the broker-mirror branch below replaces the
     // paper open with a Tradier OTOCO bracket order.
     // TRA-229: isAutoTradingEnabled() resolves the per-mode flag.
-    if (equityStrategiesActiveOnTick && this.isAutoTradingEnabled() && !this.riskGovernor.isHalted()) {
+    // TRA-544: isDeterministicAutoTradingEnabled() additionally suspends this
+    // path when the "Trading Agents" toggle hands control to the agent layer.
+    if (equityStrategiesActiveOnTick && this.isDeterministicAutoTradingEnabled() && !this.riskGovernor.isHalted()) {
       let symbolsWithData = 0;
       // TRA-418 — data-feed freshness gate. During market hours a working feed
       // delivers fresh minute bars every tick; when the latest cached bar has
@@ -1388,11 +1418,24 @@ export class SignalEngine {
     // no paper opens (and no Tradier orders) fire. Demo mode is unaffected;
     // existing live option positions still get marks via refreshOptionMarks().
     const skipOptionsForLiveEquityOnly = this.mode === 'live' && !this.tradierLiveOptionsEnabled;
-    if (this.isAutoTradingEnabled() && !this.riskGovernor.isHalted() && this.rvScanner && isStockMarketOpen() && !skipOptionsForLiveEquityOnly) {
+    // TRA-544: also suspended when the agent layer has taken over (§2B).
+    if (this.isDeterministicAutoTradingEnabled() && !this.riskGovernor.isHalted() && this.rvScanner && isStockMarketOpen() && !skipOptionsForLiveEquityOnly) {
       if (Date.now() - this.lastRvScanAt >= RV_SCAN_INTERVAL_MS) {
         this.lastRvScanAt = Date.now();
         await this.runRelativeValueScan(activeSymbols);
       }
+    }
+
+    // TRA-544 (TRA-529 §2B) — when the operator has handed control to the
+    // multi-agent layer, the deterministic routing above is suspended and the
+    // advisory STUB graph runs instead, surfacing its recommendations on state.
+    // Risk-gated like every entry path: a halt / kill switch suppresses it.
+    // Advisor-only in P1 — the stub never routes orders (gating mode is P4).
+    if (this.tradingAgentsEnabled && equityStrategiesActiveOnTick && !this.riskGovernor.isHalted()) {
+      await this.runTradingAgentsAdvisory(activeSymbols);
+    } else if (this.latestAgentRecommendations.length > 0) {
+      // Clear stale recommendations once the layer is switched back off.
+      this.latestAgentRecommendations = [];
     }
 
     // TRA-451 — SMA-200 trend-filter scan on daily bars. Runs on its own slow
@@ -1525,7 +1568,8 @@ export class SignalEngine {
    * those gates suppress the open.
    */
   private async openSma200Pullback(signal: Sma200Signal): Promise<void> {
-    if (!this.isAutoTradingEnabled() || this.riskGovernor.isHalted()) return;
+    // TRA-544: suspended when the agent layer owns the decision (§2B).
+    if (!this.isDeterministicAutoTradingEnabled() || this.riskGovernor.isHalted()) return;
     // Skip when an equity position for this symbol+type is already open.
     if (this.account.hasOpenPositionForSignalType(signal.symbol, signal.type)) return;
     if (this.mode === 'live' && this.hasOpenLiveEquityPosition(signal.symbol, signal.type)) return;
@@ -2188,6 +2232,56 @@ export class SignalEngine {
 
   isAutoTradingEnabled(): boolean {
     return this.mode === 'live' ? this.autoTradingEnabledLive : this.autoTradingEnabledDemo;
+  }
+
+  /**
+   * TRA-544 — flip the runtime "Trading Agents" master switch (banner toggle).
+   * ON makes the multi-agent layer the active decision-maker and SUSPENDS the
+   * deterministic auto-router; the persisted setting is written by the REST
+   * route so the choice survives a restart.
+   */
+  setTradingAgents(enabled: boolean): void {
+    this.tradingAgentsEnabled = enabled === true;
+  }
+
+  /** TRA-544 — true when the multi-agent layer owns the trade decision. */
+  isTradingAgentsEnabled(): boolean {
+    return this.tradingAgentsEnabled;
+  }
+
+  /**
+   * TRA-544 — the gate the deterministic entry-routing paths consult. It is the
+   * per-mode auto-trading flag AND-ed with "agents are OFF": when the operator
+   * hands control to the multi-agent layer, deterministic auto-routing is
+   * suspended so the two systems never decide at once (TRA-529 §2B). The plain
+   * {@link isAutoTradingEnabled} still reports the operator's start/stop
+   * preference for the UI; this resolves whether the deterministic router may
+   * actually open positions this tick.
+   */
+  isDeterministicAutoTradingEnabled(): boolean {
+    return this.isAutoTradingEnabled() && !this.tradingAgentsEnabled;
+  }
+
+  /**
+   * TRA-544 — run the advisory multi-agent graph (P1 deterministic STUB, no LLM
+   * spend) for the given symbols and cache the recommendations for broadcast on
+   * the WS state. Advisor-only: the stub never routes orders (gating mode is
+   * P4). Per-symbol failures are logged and skipped so one bad symbol can't kill
+   * the tick. Risk-gated by the caller (halt / kill switch suppress it).
+   */
+  private async runTradingAgentsAdvisory(symbols: string[]): Promise<void> {
+    const recos: AgentRecommendation[] = [];
+    for (const sym of symbols) {
+      const candles = this.candleCache.get(sym) ?? [];
+      if (candles.length < 15) continue;
+      const asOf = candles[candles.length - 1]!.timestamp;
+      try {
+        recos.push(await runAgentGraph({ symbol: sym, asOf, candles, candidateSignal: null }));
+      } catch (err) {
+        logger.warn('trading-agents advisory failed for symbol', { sym, err: String(err) });
+      }
+    }
+    this.latestAgentRecommendations = recos;
   }
 
   /**
@@ -3226,6 +3320,8 @@ export class SignalEngine {
         tradingHalted: this.riskGovernor.isHalted(),
         haltReason: this.riskGovernor.getHaltReason(),
         autoTradingEnabled: this.isAutoTradingEnabled(),
+        tradingAgentsEnabled: this.tradingAgentsEnabled,
+        agentRecommendations: this.latestAgentRecommendations,
         marketOpen: isStockMarketOpen(),
         marketReview: this.buildMarketReviewState(),
       };
@@ -3240,6 +3336,8 @@ export class SignalEngine {
       tradingHalted: this.riskGovernor.isHalted(),
       haltReason: this.riskGovernor.getHaltReason(),
       autoTradingEnabled: this.isAutoTradingEnabled(),
+      tradingAgentsEnabled: this.tradingAgentsEnabled,
+      agentRecommendations: this.latestAgentRecommendations,
       marketOpen: isStockMarketOpen(),
       marketReview: this.buildMarketReviewState(),
     };

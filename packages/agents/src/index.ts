@@ -1,0 +1,43 @@
+// TRA-544 (TRA-529 P1) — @trading-app/agents: the advisory multi-agent analyst
+// layer. P1 scaffolding only — contracts, the LlmClient seam, and the
+// orchestration graph wired to DETERMINISTIC FAKE agents (no LLM calls, zero
+// spend). The graph's wire contracts (AnalystReport, TraderDecision,
+// RiskVerdict, AgentRecommendation) live in @trading-app/shared.
+export type {
+  AgentGraphInput,
+  FundamentalSnapshot,
+  NewsHeadline,
+} from './types.js';
+export {
+  selectDecisionPath,
+  isAgentsPathActive,
+  isDeterministicPathActive,
+  type DecisionPath,
+} from './decision-path.js';
+export {
+  StubLlmClient,
+  LlmSchemaError,
+  completeJson,
+  extractJson,
+  type LlmClient,
+  type LlmTier,
+  type LlmMessage,
+  type LlmCompletionRequest,
+  type LlmCompletionResponse,
+  type CompleteJsonOptions,
+  type CompleteJsonResult,
+} from './llm-client.js';
+export {
+  runAnalysts,
+  technicalAnalyst,
+  fundamentalAnalyst,
+  newsSentimentAnalyst,
+} from './analysts.js';
+export { runDebate, netLean } from './debate.js';
+export { runTrader, type TraderConfig } from './trader.js';
+export { runRiskPanel, type RiskPanelConfig } from './risk-panel.js';
+export {
+  runAgentGraph,
+  AgentGraphError,
+  type AgentGraphDeps,
+} from './graph.js';

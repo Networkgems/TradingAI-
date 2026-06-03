@@ -2380,6 +2380,30 @@ app.post('/api/trading/kill-switch', requireAuth, async (req, res) => {
   });
 });
 
+// TRA-544 (TRA-529 §2B) — flip the runtime "Trading Agents" master switch from
+// the banner toggle. ON hands trade decisions to the advisory multi-agent layer
+// and SUSPENDS the deterministic auto-router; OFF restores the deterministic
+// stack. The takeover never bypasses risk: agent orders still clear the
+// deterministic RiskManager hard caps and the TRA-526 kill switch overrides
+// everything. Persisted to settings so the choice survives a restart, and the
+// state push confirms the new value to every client (per docs/architecture.md
+// §2: REST flips, the WS state confirms). P1 is advisor-only (stub, no LLM
+// spend); gating mode is P4.
+app.post('/api/trading/trading-agents', requireAuth, async (req, res) => {
+  const username = res.locals['authUser'] as string;
+  const ctx = await userCtx(res);
+  const settings = getSettings(username);
+  const body = req.body as { enabled?: unknown } | undefined;
+  const enabled = body?.enabled === true || body?.enabled === 'true';
+
+  ctx.engine.setTradingAgents(enabled);
+
+  const updated: AccountSettings = { ...settings, tradingAgentsEnabled: enabled };
+  await saveSettings(username, updated);
+  broadcastEngineState(ctx);
+  res.json({ ok: true, tradingAgentsEnabled: enabled });
+});
+
 // TRA-230: clear the displayed signal list without resetting positions or equity.
 app.post('/api/signals/reset', requireAuth, async (_req, res) => {
   const ctx = await userCtx(res);

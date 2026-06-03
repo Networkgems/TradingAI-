@@ -3190,3 +3190,41 @@ describe('SignalEngine — TRA-495 live stocks + options coexistence', () => {
     expect(live.account.openPositions.length).toBeGreaterThan(0);
   });
 });
+
+// TRA-544 (TRA-529 §2B) — the "Trading Agents" decision-path switch. ON makes
+// the multi-agent layer the active decision-maker and SUSPENDS the
+// deterministic auto-router; the per-mode start/stop preference is left intact
+// so the UI still reports it. Reconciled from persisted settings on apply.
+describe('SignalEngine — Trading Agents decision-path switch (TRA-544)', () => {
+  it('defaults off: deterministic routing is active, agents path is not', async () => {
+    const engine = new SignalEngine(undefined, undefined, undefined);
+    await engine.applySettings({ ...DEFAULT_ACCOUNT_SETTINGS, mode: 'demo' });
+    expect(engine.isTradingAgentsEnabled()).toBe(false);
+    // Auto-trading defaults on in demo → deterministic router may route.
+    expect(engine.isDeterministicAutoTradingEnabled()).toBe(true);
+    expect(engine.getState().tradingAgentsEnabled).toBe(false);
+    expect(engine.getState().agentRecommendations).toEqual([]);
+  });
+
+  it('ON suspends the deterministic router while keeping auto-trading reported', async () => {
+    const engine = new SignalEngine(undefined, undefined, undefined);
+    await engine.applySettings({ ...DEFAULT_ACCOUNT_SETTINGS, mode: 'demo', tradingAgentsEnabled: true });
+    expect(engine.isTradingAgentsEnabled()).toBe(true);
+    // Deterministic auto-routing is suspended (never both deciding at once)…
+    expect(engine.isDeterministicAutoTradingEnabled()).toBe(false);
+    // …but the operator's start/stop preference is unchanged for the UI.
+    expect(engine.isAutoTradingEnabled()).toBe(true);
+    expect(engine.getState().tradingAgentsEnabled).toBe(true);
+  });
+
+  it('setTradingAgents flips the live runtime switch both ways', async () => {
+    const engine = new SignalEngine(undefined, undefined, undefined);
+    await engine.applySettings({ ...DEFAULT_ACCOUNT_SETTINGS, mode: 'demo' });
+    engine.setTradingAgents(true);
+    expect(engine.isTradingAgentsEnabled()).toBe(true);
+    expect(engine.isDeterministicAutoTradingEnabled()).toBe(false);
+    engine.setTradingAgents(false);
+    expect(engine.isTradingAgentsEnabled()).toBe(false);
+    expect(engine.isDeterministicAutoTradingEnabled()).toBe(true);
+  });
+});

@@ -22,6 +22,7 @@ import { CryptoSignalsPanel } from './CryptoSignalsPanel';
 import { CryptoPositionsPanel } from './CryptoPositionsPanel';
 import { DashboardHeader } from './DashboardHeader';
 import { KillSwitchButton } from './KillSwitchButton';
+import { TradingAgentsButton } from './TradingAgentsButton';
 import { HaltBanner } from './HaltBanner';
 import { LiveCredentialsBanner } from './LiveCredentialsBanner';
 import { PromotionGatePanel } from './PromotionGatePanel';
@@ -276,7 +277,7 @@ describe('DashboardHeader (TRA-422)', () => {
       <DashboardHeader
         token="t" account={account} optionsState={undefined}
         openPositionsCount={0} openOptionsCount={0} optionsDailyLimit={5}
-        connected={true} lastTick={Date.now()} autoTradingEnabled={true} killSwitchEngaged={false}
+        connected={true} lastTick={Date.now()} autoTradingEnabled={true} killSwitchEngaged={false} tradingAgentsEnabled={false}
         accountMode="demo" onAccountModeChange={() => {}}
         theme="dark" onToggleTheme={() => {}} isAdmin={false}
         onOpenProfileModal={() => {}} onGoHome={() => {}} onLogout={() => {}}
@@ -305,7 +306,7 @@ describe('DashboardHeader (TRA-422)', () => {
           optionsCash: 64_224.32, dailyOptionsCount: 1,
         }}
         openPositionsCount={0} openOptionsCount={3} optionsDailyLimit={10}
-        connected={true} lastTick={Date.now()} autoTradingEnabled={true} killSwitchEngaged={false}
+        connected={true} lastTick={Date.now()} autoTradingEnabled={true} killSwitchEngaged={false} tradingAgentsEnabled={false}
         accountMode="live" onAccountModeChange={() => {}}
         theme="dark" onToggleTheme={() => {}} isAdmin={false}
         onOpenProfileModal={() => {}} onGoHome={() => {}} onLogout={() => {}}
@@ -332,7 +333,7 @@ describe('DashboardHeader (TRA-422)', () => {
           optionsCash: 25_000, dailyOptionsCount: 0,
         }}
         openPositionsCount={0} openOptionsCount={0} optionsDailyLimit={10}
-        connected={true} lastTick={Date.now()} autoTradingEnabled={true} killSwitchEngaged={false}
+        connected={true} lastTick={Date.now()} autoTradingEnabled={true} killSwitchEngaged={false} tradingAgentsEnabled={false}
         accountMode="demo" onAccountModeChange={() => {}}
         theme="dark" onToggleTheme={() => {}} isAdmin={false}
         onOpenProfileModal={() => {}} onGoHome={() => {}} onLogout={() => {}}
@@ -481,6 +482,52 @@ describe('KillSwitchButton (TRA-535)', () => {
     await userEvent.click(screen.getByRole('button', { name: /Kill Switch ON/ }));
     expect(confirmSpy).not.toHaveBeenCalled();
     expect(JSON.parse((fetchMock.mock.calls[0]![1] as RequestInit).body as string)).toEqual({ engaged: false });
+  });
+});
+
+// TRA-544 — the "Trading Agents" banner toggle. Confirms both flip directions
+// gate behind a confirm dialog and POST the runtime flag to the engine.
+describe('TradingAgentsButton (TRA-544)', () => {
+  it('renders the idle label when off and the ON label when enabled', () => {
+    const { rerender } = renderWithToast(<TradingAgentsButton token="t" enabled={false} />);
+    expect(screen.getByRole('button', { name: /Trading Agents$/ })).toBeInTheDocument();
+    rerender(<ToastProvider><TradingAgentsButton token="t" enabled={true} /></ToastProvider>);
+    expect(screen.getByRole('button', { name: /Trading Agents ON/ })).toBeInTheDocument();
+  });
+
+  it('does NOT POST when the confirm dialog is dismissed (mode-switch guard)', async () => {
+    const confirmSpy = vi.spyOn(window, 'confirm').mockReturnValue(false);
+    const fetchMock = vi.fn(() => Promise.resolve(new Response('{}', { status: 200 })));
+    vi.stubGlobal('fetch', fetchMock);
+    renderWithToast(<TradingAgentsButton token="t" enabled={false} />);
+    await userEvent.click(screen.getByRole('button', { name: /Trading Agents$/ }));
+    expect(confirmSpy).toHaveBeenCalled();
+    expect(fetchMock).not.toHaveBeenCalled();
+  });
+
+  it('POSTs { enabled: true } after confirm and flips to ON', async () => {
+    vi.spyOn(window, 'confirm').mockReturnValue(true);
+    const fetchMock = vi.fn(() => Promise.resolve(new Response('{"ok":true}', { status: 200 })));
+    vi.stubGlobal('fetch', fetchMock);
+    const onToggled = vi.fn();
+    renderWithToast(<TradingAgentsButton token="t" enabled={false} onToggled={onToggled} />);
+    await userEvent.click(screen.getByRole('button', { name: /Trading Agents$/ }));
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+    const [url, opts] = fetchMock.mock.calls[0]!;
+    expect(String(url)).toMatch(/\/api\/trading\/trading-agents$/);
+    expect(JSON.parse((opts as RequestInit).body as string)).toEqual({ enabled: true });
+    expect(onToggled).toHaveBeenCalledWith(true);
+    expect(await screen.findByRole('button', { name: /Trading Agents ON/ })).toBeInTheDocument();
+  });
+
+  it('switching OFF also confirms, then POSTs { enabled: false }', async () => {
+    const confirmSpy = vi.spyOn(window, 'confirm').mockReturnValue(true);
+    const fetchMock = vi.fn(() => Promise.resolve(new Response('{"ok":true}', { status: 200 })));
+    vi.stubGlobal('fetch', fetchMock);
+    renderWithToast(<TradingAgentsButton token="t" enabled={true} />);
+    await userEvent.click(screen.getByRole('button', { name: /Trading Agents ON/ }));
+    expect(confirmSpy).toHaveBeenCalled();
+    expect(JSON.parse((fetchMock.mock.calls[0]![1] as RequestInit).body as string)).toEqual({ enabled: false });
   });
 });
 

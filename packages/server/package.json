@@ -13,6 +13,7 @@
     "test": "vitest run --passWithNoTests"
   },
   "dependencies": {
+    "@trading-app/agents": "workspace:*",
     "@trading-app/backtest": "workspace:*",
     "@trading-app/engine": "workspace:*",
     "@trading-app/shared": "workspace:*",

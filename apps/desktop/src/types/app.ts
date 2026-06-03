@@ -1,5 +1,5 @@
 // TRA-419 — App-level interfaces extracted from App.tsx.
-import type { TradeSignal, AccountState, Position, OptionsAccountState, EngineMarketReviewState } from '@trading-app/shared';
+import type { TradeSignal, AccountState, Position, OptionsAccountState, EngineMarketReviewState, AgentRecommendation } from '@trading-app/shared';
 
 export interface SymbolState {
   symbol: string;
@@ -21,6 +21,13 @@ export interface AppState {
   tradingHalted: boolean;
   haltReason: string | null;
   autoTradingEnabled: boolean;
+  // TRA-544 — true when the "Trading Agents" multi-agent layer is the active
+  // decision-maker (deterministic auto-routing suspended). Optional so a
+  // pre-TRA-544 server still type-checks against this state.
+  tradingAgentsEnabled?: boolean;
+  // TRA-544 — latest advisory recommendations from the multi-agent layer (P1
+  // deterministic stub). Empty/absent when the layer is off.
+  agentRecommendations?: AgentRecommendation[];
   // TRA-389 — market-review regime context. `enabled` is false when the
   // gate-consumption flag is off (or no review exists yet); optional so a
   // server running a pre-TRA-389 build still type-checks against this state.

@@ -892,6 +892,21 @@ export interface AccountSettings {
   globalKillSwitchEngaged?: boolean;
   /** TRA-526 — optional operator note shown as the halt reason while engaged. */
   globalKillSwitchReason?: string;
+  /**
+   * TRA-544 (TRA-529 P1) — runtime master switch for the advisory multi-agent
+   * analyst layer ("Trading Agents"). `false` (default) → the deterministic
+   * strategy/router/risk stack drives trading exactly as today. `true` → the
+   * multi-agent pipeline becomes the active decision-maker and deterministic
+   * auto-routing is SUSPENDED so the two systems never decide at once
+   * (TRA-529 §2B). It is a runtime flag flippable live from the banner, NOT a
+   * build-time config; persisted under DATA_DIR like every other account
+   * setting so the choice survives a restart, and broadcast on the WS `state`
+   * so the button always reflects true server state. Even when ON, every agent
+   * order still passes through the deterministic RiskManager hard caps and the
+   * TRA-526 kill switch overrides everything. Absent ↔ off; resolve via
+   * {@link resolveTradingAgentsEnabled}.
+   */
+  tradingAgentsEnabled?: boolean;
 }
 
 export const DEFAULT_ACCOUNT_SETTINGS: AccountSettings = {
@@ -961,6 +976,9 @@ export const DEFAULT_ACCOUNT_SETTINGS: AccountSettings = {
   marketReviewGatesEnabled: false,
   // TRA-483 — PDT-aware overnight hold defaults ON for live positions.
   holdLiveOptionsOvernightForPdt: true,
+  // TRA-544 — multi-agent layer defaults OFF; deterministic stack drives until
+  // the operator opts in from the banner (advisory takeover, still risk-gated).
+  tradingAgentsEnabled: false,
 };
 
 /**
@@ -2383,4 +2401,264 @@ export interface EodReport {
 
   // Markdown report body
   markdown: string;
+}
+
+// ===========================================================================
+// TRA-544 (TRA-529 P1) — Multi-agent analyst layer contracts
+// ---------------------------------------------------------------------------
+// Strict, schema-validated I/O for the advisory "Trading Agents" pipeline
+// (analysts → bull/bear debate → trader synthesis → risk panel/manager →
+// AgentRecommendation). Every agent returns bounded JSON so the graph is
+// deterministic and auditable — no free-text-only handoffs (TRA-529 §3).
+// These are the wire contracts only; the orchestration graph and the (P1
+// stubbed) agents live in @trading-app/agents. Numeric conventions:
+//   stance  ∈ [-1, +1]  (directional: −1 max-bearish … +1 max-bullish)
+//   confidence / sizeMultiplier / conviction ∈ [0, 1]
+// ===========================================================================
+
+/** Directional verb a trader/recommendation can emit (TRA-529 §3.3). */
+export type AgentAction = 'BUY' | 'SELL' | 'HOLD';
+
+/** The three core analysts shipped in P1 (TRA-529 §3.1). */
+export type AnalystKind = 'technical' | 'fundamental' | 'news_sentiment';
+
+/** Risk-manager verdict over a proposed TraderDecision (TRA-529 §3.4). */
+export type RiskVerdictKind = 'APPROVE' | 'REVISE' | 'VETO';
+
+/** Risk-panel persona (TRA-529 §3.4). */
+export type RiskPersona = 'aggressive' | 'neutral' | 'conservative';
+
+/** Side of a debate round (TRA-529 §3.2). */
+export type DebateSide = 'bull' | 'bear';
+
+/**
+ * One analyst's structured read on a symbol (TRA-529 §3.1). The three analysts
+ * all return this shape; `drivers` cite the specific evidence (indicator,
+ * fundamental metric, or timestamped headline) that moved the stance so the
+ * recommendation is auditable. Thin/stale evidence MUST yield low `confidence`
+ * (we down-weight, never fabricate conviction).
+ */
+export interface AnalystReport {
+  kind: AnalystKind;
+  /** Directional read, −1 (max bearish) … +1 (max bullish). */
+  stance: number;
+  /** Earned confidence in `stance`, 0 … 1. */
+  confidence: number;
+  /** Intended holding horizon for the thesis, in days. */
+  horizonDays: number;
+  /** Key technical levels the analyst is watching. */
+  keyLevels: { support: number; resistance: number };
+  /** Human-readable evidence bullets that justify the stance. */
+  drivers: string[];
+  /** Free-text note (≤ a few sentences). */
+  notes: string;
+}
+
+/** One bull-vs-bear exchange in the research debate (TRA-529 §3.2). */
+export interface DebateRound {
+  round: number;
+  side: DebateSide;
+  claims: string[];
+  rebuttals: string[];
+  strongestPoint: string;
+  /** The arguer's confidence in its own side this round, 0 … 1. */
+  confidence: number;
+}
+
+/**
+ * The full N-round bull/bear debate plus the judged surviving thesis
+ * (TRA-529 §3.2). Persisted for audit.
+ */
+export interface DebateTranscript {
+  rounds: DebateRound[];
+  /** The thesis that survived the debate, extracted by the judge. */
+  survivingThesis: string;
+  /** Net directional lean of the debate, −1 … +1 (bear … bull). */
+  netLean: number;
+}
+
+/**
+ * The trader's proposed trade synthesised from the analyst reports + debate
+ * (TRA-529 §3.3). `dissent` is mandatory by design: it forces the trader to
+ * name the strongest opposing point it chose to override — the single biggest
+ * guard against LLM over-confidence.
+ */
+export interface TraderDecision {
+  action: AgentAction;
+  /** Conviction 0 … 1; drives the size suggestion, capped by the risk panel. */
+  conviction: number;
+  proposedEntry: number;
+  proposedStop: number;
+  proposedTarget: number;
+  /** Must clear the engine minimum or the trader auto-HOLDs. */
+  riskRewardRatio: number;
+  /** 2–3 sentence rationale citing the drivers. */
+  thesis: string;
+  /** The strongest opposing point the trader chose to override (mandatory). */
+  dissent: string;
+}
+
+/** One risk persona's view on the proposed trade (TRA-529 §3.4). */
+export interface RiskPersonaView {
+  persona: RiskPersona;
+  /** This persona's preferred fraction of full size, 0 … 1. */
+  sizeMultiplier: number;
+  reasons: string[];
+}
+
+/**
+ * The risk manager's final verdict over a TraderDecision, after arbitrating
+ * the three persona views (TRA-529 §3.4). The verdict is then handed to the
+ * deterministic RiskManager (engine/src/risk.ts), whose hard limits always win.
+ */
+export interface RiskVerdict {
+  verdict: RiskVerdictKind;
+  /** Final size fraction the manager allows, 0 … 1 (0 on VETO). */
+  sizeMultiplier: number;
+  panel: RiskPersonaView[];
+  reasons: string[];
+}
+
+/**
+ * The multi-agent layer's single externally-consumed object (TRA-529 §4).
+ * In advisor mode it is logged + broadcast on the WS state and rendered on the
+ * dashboard; in gating mode `proposedSignal` (if APPROVE) feeds the existing
+ * router/risk path. Every recommendation carries its own cost + latency so the
+ * §6 daily-$ budget can be enforced and reported (P1 stub: costUsd = 0).
+ */
+export interface AgentRecommendation {
+  symbol: string;
+  /** Decision-bar timestamp (epoch ms); analysts see only data at/before it. */
+  asOf: number;
+  action: AgentAction;
+  conviction: number;
+  sizeMultiplier: number;
+  /** The trade to route on APPROVE; null on HOLD/VETO. */
+  proposedSignal: TradeSignal | null;
+  verdict: RiskVerdictKind;
+  analystReports: AnalystReport[];
+  debateTranscript: DebateTranscript;
+  traderDecision: TraderDecision;
+  riskVerdict: RiskVerdict;
+  /** USD billed for this recommendation's LLM calls. 0 for the P1 stub. */
+  costUsd: number;
+  /** Wall-clock latency of the graph run, in ms. */
+  latencyMs: number;
+}
+
+/**
+ * TRA-544 — resolve the runtime "Trading Agents" master switch. Absent ↔ off,
+ * so a settings snapshot written before TRA-544 (or a partial PUT) keeps the
+ * deterministic stack in charge. {@link AccountSettings.tradingAgentsEnabled}.
+ */
+export function resolveTradingAgentsEnabled(s: AccountSettings): boolean {
+  return s.tradingAgentsEnabled === true;
+}
+
+// --- Runtime schema validators (TRA-529 §3: "schema-validated, retried on
+// malformed output"). Hand-written guards — the repo carries no zod. Each
+// returns the field-paths that failed so the LLM-client retry loop can feed a
+// precise "your JSON was wrong here" message back to the model. An empty array
+// means valid. Bounds are enforced, not coerced: an out-of-range stance is a
+// validation failure, not silently clamped, so a misbehaving model is retried
+// rather than trusted. ---
+
+function inRange(v: unknown, lo: number, hi: number): boolean {
+  return typeof v === 'number' && Number.isFinite(v) && v >= lo && v <= hi;
+}
+
+function isStringArray(v: unknown): boolean {
+  return Array.isArray(v) && v.every(x => typeof x === 'string');
+}
+
+export function validateAnalystReport(value: unknown): string[] {
+  const errors: string[] = [];
+  const r = value as Partial<AnalystReport> | null | undefined;
+  if (r == null || typeof r !== 'object') return ['report: not an object'];
+  if (r.kind !== 'technical' && r.kind !== 'fundamental' && r.kind !== 'news_sentiment') {
+    errors.push('kind: must be technical|fundamental|news_sentiment');
+  }
+  if (!inRange(r.stance, -1, 1)) errors.push('stance: must be a number in [-1, 1]');
+  if (!inRange(r.confidence, 0, 1)) errors.push('confidence: must be a number in [0, 1]');
+  if (typeof r.horizonDays !== 'number' || !Number.isFinite(r.horizonDays) || r.horizonDays < 0) {
+    errors.push('horizonDays: must be a non-negative number');
+  }
+  if (
+    r.keyLevels == null
+    || typeof r.keyLevels !== 'object'
+    || typeof r.keyLevels.support !== 'number'
+    || typeof r.keyLevels.resistance !== 'number'
+  ) {
+    errors.push('keyLevels: must be { support:number, resistance:number }');
+  }
+  if (!isStringArray(r.drivers)) errors.push('drivers: must be string[]');
+  if (typeof r.notes !== 'string') errors.push('notes: must be a string');
+  return errors;
+}
+
+export function validateTraderDecision(value: unknown): string[] {
+  const errors: string[] = [];
+  const d = value as Partial<TraderDecision> | null | undefined;
+  if (d == null || typeof d !== 'object') return ['decision: not an object'];
+  if (d.action !== 'BUY' && d.action !== 'SELL' && d.action !== 'HOLD') {
+    errors.push('action: must be BUY|SELL|HOLD');
+  }
+  if (!inRange(d.conviction, 0, 1)) errors.push('conviction: must be a number in [0, 1]');
+  for (const f of ['proposedEntry', 'proposedStop', 'proposedTarget', 'riskRewardRatio'] as const) {
+    if (typeof d[f] !== 'number' || !Number.isFinite(d[f])) errors.push(`${f}: must be a finite number`);
+  }
+  if (typeof d.thesis !== 'string') errors.push('thesis: must be a string');
+  if (typeof d.dissent !== 'string' || d.dissent.trim() === '') {
+    errors.push('dissent: must be a non-empty string (mandatory opposing point)');
+  }
+  return errors;
+}
+
+export function validateRiskVerdict(value: unknown): string[] {
+  const errors: string[] = [];
+  const v = value as Partial<RiskVerdict> | null | undefined;
+  if (v == null || typeof v !== 'object') return ['verdict: not an object'];
+  if (v.verdict !== 'APPROVE' && v.verdict !== 'REVISE' && v.verdict !== 'VETO') {
+    errors.push('verdict: must be APPROVE|REVISE|VETO');
+  }
+  if (!inRange(v.sizeMultiplier, 0, 1)) errors.push('sizeMultiplier: must be a number in [0, 1]');
+  if (!Array.isArray(v.panel)) {
+    errors.push('panel: must be an array of RiskPersonaView');
+  } else {
+    v.panel.forEach((p, i) => {
+      if (p == null || typeof p !== 'object') { errors.push(`panel[${i}]: not an object`); return; }
+      if (p.persona !== 'aggressive' && p.persona !== 'neutral' && p.persona !== 'conservative') {
+        errors.push(`panel[${i}].persona: must be aggressive|neutral|conservative`);
+      }
+      if (!inRange(p.sizeMultiplier, 0, 1)) errors.push(`panel[${i}].sizeMultiplier: must be a number in [0, 1]`);
+      if (!isStringArray(p.reasons)) errors.push(`panel[${i}].reasons: must be string[]`);
+    });
+  }
+  if (!isStringArray(v.reasons)) errors.push('reasons: must be string[]');
+  return errors;
+}
+
+export function validateAgentRecommendation(value: unknown): string[] {
+  const errors: string[] = [];
+  const r = value as Partial<AgentRecommendation> | null | undefined;
+  if (r == null || typeof r !== 'object') return ['recommendation: not an object'];
+  if (typeof r.symbol !== 'string' || r.symbol === '') errors.push('symbol: must be a non-empty string');
+  if (typeof r.asOf !== 'number' || !Number.isFinite(r.asOf)) errors.push('asOf: must be an epoch-ms number');
+  if (r.action !== 'BUY' && r.action !== 'SELL' && r.action !== 'HOLD') errors.push('action: must be BUY|SELL|HOLD');
+  if (!inRange(r.conviction, 0, 1)) errors.push('conviction: must be a number in [0, 1]');
+  if (!inRange(r.sizeMultiplier, 0, 1)) errors.push('sizeMultiplier: must be a number in [0, 1]');
+  if (r.verdict !== 'APPROVE' && r.verdict !== 'REVISE' && r.verdict !== 'VETO') errors.push('verdict: must be APPROVE|REVISE|VETO');
+  // APPROVE must carry a routable signal; HOLD/VETO must not (TRA-529 §4).
+  if (r.verdict === 'APPROVE' && r.action !== 'HOLD') {
+    if (r.proposedSignal == null) errors.push('proposedSignal: must be present on APPROVE');
+  } else if (r.proposedSignal != null) {
+    errors.push('proposedSignal: must be null on HOLD/VETO');
+  }
+  if (typeof r.costUsd !== 'number' || !Number.isFinite(r.costUsd) || r.costUsd < 0) {
+    errors.push('costUsd: must be a non-negative number');
+  }
+  if (typeof r.latencyMs !== 'number' || !Number.isFinite(r.latencyMs) || r.latencyMs < 0) {
+    errors.push('latencyMs: must be a non-negative number');
+  }
+  return errors;
 }

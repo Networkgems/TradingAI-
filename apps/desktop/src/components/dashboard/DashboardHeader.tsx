@@ -13,6 +13,7 @@ import type { Theme } from '../ThemeToggle';
 import { ProfileMenu } from '../ProfileMenu';
 import { AccountModeSwitcher } from '../AccountModeSwitcher';
 import { KillSwitchButton } from './KillSwitchButton';
+import { TradingAgentsButton } from './TradingAgentsButton';
 import { VersionChip } from './VersionChip';
 import type { ProfileModal } from './ProfileModals';
 
@@ -27,6 +28,7 @@ export function DashboardHeader({
   lastTick,
   autoTradingEnabled,
   killSwitchEngaged,
+  tradingAgentsEnabled,
   accountMode,
   onAccountModeChange,
   theme,
@@ -46,6 +48,9 @@ export function DashboardHeader({
   lastTick: number | undefined;
   autoTradingEnabled: boolean;
   killSwitchEngaged: boolean;
+  /** TRA-544 — seed for the "Trading Agents" banner toggle (true ↔ the
+   *  multi-agent layer is the active decision-maker). */
+  tradingAgentsEnabled: boolean;
   accountMode: 'demo' | 'live';
   onAccountModeChange: (mode: 'demo' | 'live') => void;
   theme: Theme;
@@ -88,6 +93,14 @@ export function DashboardHeader({
         <AccountModeSwitcher mode={accountMode} onChange={onAccountModeChange} market="stocks" token={token} />
       </div>
       <div className="header-right">
+        {/* TRA-544 (TRA-529 §2B) — "Trading Agents" master switch, centred in
+            the banner between the DEMO/LIVE switcher and the equity stats. ON
+            hands the trade decision to the multi-agent layer and suspends the
+            deterministic auto-router. */}
+        <div className="trading-agents-group">
+          <TradingAgentsButton token={token} enabled={tradingAgentsEnabled} />
+        </div>
+        <div className="stat-divider" />
         {account && (
           <>
             <div className="stat-group">

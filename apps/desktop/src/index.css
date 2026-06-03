@@ -852,6 +852,21 @@ tr:hover td { background: var(--bg-hover); }
 }
 .kill-switch-btn.engaged:hover:not(:disabled) { background: var(--red-strong); border-color: var(--red-strong); }
 
+/* TRA-544 — "Trading Agents" banner toggle. OFF reads as a neutral control;
+   ON glows blue/active to make it unmistakable that the multi-agent layer is
+   the active decision-maker. */
+.trading-agents-group { display: flex; align-items: center; }
+.trading-agents-btn { color: var(--blue); border-color: var(--blue); }
+.trading-agents-btn:hover:not(:disabled) { color: var(--text); border-color: var(--text); }
+.trading-agents-btn.active {
+  background: var(--blue);
+  color: #ffffff;
+  border-color: var(--blue);
+  font-weight: 600;
+  box-shadow: 0 0 8px var(--blue);
+}
+.trading-agents-btn.active:hover:not(:disabled) { background: var(--blue); border-color: var(--text); }
+
 .btn-close-pos {
   background: none;
   border: 1px solid var(--red);

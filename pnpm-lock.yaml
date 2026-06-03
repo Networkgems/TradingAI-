@@ -88,6 +88,22 @@ importers:
         specifier: ^2.1.8
         version: 2.1.9(@types/node@22.19.17)(jsdom@25.0.1)(terser@5.46.2)
 
+  packages/agents:
+    dependencies:
+      '@trading-app/shared':
+        specifier: workspace:*
+        version: link:../shared
+    devDependencies:
+      '@types/node':
+        specifier: ^22.0.0
+        version: 22.19.17
+      typescript:
+        specifier: ^5.4.5
+        version: 5.9.3
+      vitest:
+        specifier: ^2.0.0
+        version: 2.1.9(@types/node@22.19.17)(jsdom@25.0.1)(terser@5.46.2)
+
   packages/backtest:
     dependencies:
       '@trading-app/engine':
@@ -137,6 +153,9 @@ importers:
 
   packages/server:
     dependencies:
+      '@trading-app/agents':
+        specifier: workspace:*
+        version: link:../agents
       '@trading-app/backtest':
         specifier: workspace:*
         version: link:../backtest

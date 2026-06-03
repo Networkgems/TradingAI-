@@ -64,6 +64,7 @@ export default function Dashboard({ token, onLogout, onGoHome, onActivity, theme
         lastTick={state?.lastTick}
         autoTradingEnabled={autoTradingEnabled}
         killSwitchEngaged={accountSettings?.globalKillSwitchEngaged ?? false}
+        tradingAgentsEnabled={state?.tradingAgentsEnabled ?? accountSettings?.tradingAgentsEnabled ?? false}
         accountMode={accountMode}
         onAccountModeChange={setAccountMode}
         theme={theme}
