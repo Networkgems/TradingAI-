@@ -206,13 +206,14 @@ export function setTradierStocksFeedClient(
   reconcileTradierFeedClient();
 }
 
-// Seed the boot env token (if present) under the reserved env key so it survives
-// every per-user clear. Absent → the feed stays on Yahoo until a user supplies one.
-if (TRADIER_API_TOKEN) {
-  setTradierStocksFeedClient(TRADIER_API_TOKEN, TRADIER_ENV, FEED_ENV_CONTEXT_KEY);
-} else {
-  console.warn('[yahoo-feed] Tradier stocks feed disabled (no TRADIER_*_API_TOKEN at boot) — using Yahoo as primary until settings supply a token');
-}
+// NOTE: the boot env-token seed call lives at the BOTTOM of this module
+// (`seedBootEnvTradierToken()`), not here. It runs `reconcileTradierFeedClient`
+// → `clearQuoteCache()` → `quoteCache.clear()`, and `quoteCache` is a `const`
+// declared further down. `const`/`let` are not value-hoisted, so calling the
+// seed here at module-init order threw a temporal-dead-zone ReferenceError
+// ("Cannot access 'quoteCache' before initialization") and crash-looped the
+// prod deploy (TRA-574, regression from the TRA-572 per-context registry).
+// Deferring the call until after every declaration is initialized fixes it.
 
 // ── Daily fallback request counters ──────────────────────────────────────────
 // Tracks how many fallback minute-bar requests we send per provider per UTC day
@@ -1005,3 +1006,23 @@ export function tripYahooBreakerFromExternal(label: string, msg: string): void {
 export function isTradierBreakerOpen(): boolean {
   return isTradierBlocked();
 }
+
+// ── Boot env-token seed (TRA-574) ─────────────────────────────────────────────
+// Seed the boot env token (if present) under the reserved env key so it survives
+// every per-user clear. Absent → the feed stays on Yahoo until a user supplies one.
+//
+// This MUST run after every module-level declaration above is initialized: the
+// seed calls reconcileTradierFeedClient → clearQuoteCache → quoteCache.clear(),
+// and `quoteCache` (and friends) are `const`/`let` declared earlier in the file
+// but not value-hoisted. Invoking the seed at its original (mid-file) position
+// hit those bindings inside their temporal dead zone and threw at module eval,
+// crash-looping the prod deploy. Running it as the final top-level statement
+// guarantees the caches exist before the seed touches them.
+function seedBootEnvTradierToken(): void {
+  if (TRADIER_API_TOKEN) {
+    setTradierStocksFeedClient(TRADIER_API_TOKEN, TRADIER_ENV, FEED_ENV_CONTEXT_KEY);
+  } else {
+    console.warn('[yahoo-feed] Tradier stocks feed disabled (no TRADIER_*_API_TOKEN at boot) — using Yahoo as primary until settings supply a token');
+  }
+}
+seedBootEnvTradierToken();
