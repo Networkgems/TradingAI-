@@ -122,6 +122,7 @@ import {
 // TRA-532 — Live-Trading Promotion Gate enforcement + audit store/service.
 import {
   registerBacktestReport,
+  registerOptimizationVerdict,
   recordSignoff,
   listStrategyRecords,
   getEffectiveThresholds,
@@ -1804,6 +1805,44 @@ app.post('/api/promotion/backtest', requireAuth, requireAdmin, async (req, res) 
     }
     log.error('TRA-532 register backtest failed', { reason: err instanceof Error ? err.message : String(err) });
     res.status(500).json({ error: 'Failed to register backtest report' });
+  }
+});
+
+// Stage 1 (TRA-541) — register the backtest leg from a TRA-540 optimization
+// `verdict` block. Admin-only. The body carries the machine-generated `verdict`
+// from `optimization-report.json`; the server ingests its `backtestMetrics` 1:1
+// AND stores the six-guard `pass` flag, which then GATES the leg: a strategy
+// whose verdict.pass === false cannot clear Stage 1 even with strong headline
+// metrics (the six-guard battery is the gate, not the raw numbers). The blessed
+// parameter set is recorded for audit.
+app.post('/api/promotion/optimization', requireAuth, requireAdmin, async (req, res) => {
+  const username = res.locals['authUser'] as string;
+  try {
+    const body = req.body as { strategyId?: string; reportId?: string; verdict?: unknown };
+    if (!body?.strategyId || typeof body.strategyId !== 'string') {
+      res.status(400).json({ error: 'strategyId is required' });
+      return;
+    }
+    if (!body.verdict || typeof body.verdict !== 'object') {
+      res.status(400).json({ error: 'verdict (the TRA-540 optimization verdict block) is required' });
+      return;
+    }
+    const rec = await registerOptimizationVerdict({
+      strategyId: body.strategyId,
+      verdict: body.verdict as Parameters<typeof registerOptimizationVerdict>[0]['verdict'],
+      reportId: typeof body.reportId === 'string' ? body.reportId : 'unspecified',
+      registeredBy: username,
+    });
+    res.status(201).json(rec);
+  } catch (err) {
+    if (err instanceof PromotionValidationError) {
+      res.status(400).json({ error: err.message });
+      return;
+    }
+    log.error('TRA-541 register optimization verdict failed', {
+      reason: err instanceof Error ? err.message : String(err),
+    });
+    res.status(500).json({ error: 'Failed to register optimization verdict' });
   }
 });
 

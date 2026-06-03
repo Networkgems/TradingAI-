@@ -129,6 +129,50 @@ describe('TRA-532 promotion gate — end-to-end enforcement', () => {
   });
 });
 
+// TRA-541 — buildPromotionStatus must honor a registered TRA-540 optimization
+// verdict: the Stage-1 leg passes iff verdict.pass, regardless of how strong the
+// ingested headline metrics look.
+describe('TRA-541 promotion gate — optimization verdict gates Stage 1', () => {
+  const strongMetrics = { sharpe: 1.4, expectancy: 0.25, profitFactor: 1.7, maxDrawdown: 0.1, tradeCount: 120 };
+
+  it('FAILS Stage 1 when verdict.pass=false even with strong ingested metrics', async () => {
+    await store.registerOptimizationVerdict({
+      strategyId: 'reversal',
+      verdict: {
+        pass: false,
+        guards: { G2: { pass: false, value: 1 }, G4: { pass: false, value: -50 } },
+        blessedParams: { strategy: 'reversal', label: 'rsiOverbought=70,lookback=5' },
+        backtestMetrics: strongMetrics,
+      },
+      reportId: 'tra540-reversal',
+      registeredBy: 'qt',
+    });
+    const status = await svc.buildPromotionStatus(USER, 'reversal');
+    expect(status.backtest.metrics?.sharpe).toBe(1.4); // strong metrics ingested 1:1
+    expect(status.backtest.state).toBe('fail'); // …but the verdict blocks the leg
+    expect(status.backtest.verdict?.pass).toBe(false);
+    expect(status.backtest.failedChecks.join(' ')).toMatch(/verdict FAIL/);
+    expect(status.canGoLive).toBe(false);
+  });
+
+  it('PASSES Stage 1 once a verdict.pass=true is registered', async () => {
+    await store.registerOptimizationVerdict({
+      strategyId: 'reversal',
+      verdict: {
+        pass: true,
+        guards: { G1: { pass: true, value: 0.8 } },
+        blessedParams: { strategy: 'reversal', label: 'rsiOverbought=70,lookback=5' },
+        backtestMetrics: strongMetrics,
+      },
+      reportId: 'tra540-reversal-v2',
+      registeredBy: 'qt',
+    });
+    const status = await svc.buildPromotionStatus(USER, 'reversal');
+    expect(status.backtest.state).toBe('pass');
+    expect(status.backtest.verdict?.pass).toBe(true);
+  });
+});
+
 // TRA-536 — the paper fill paths now stamp realized/modeled slippage on each
 // closed Position. Once present in the ledger the Stage-2 slippage check stops
 // being advisory: the gate computes a non-null ratio and hard-fails a strategy

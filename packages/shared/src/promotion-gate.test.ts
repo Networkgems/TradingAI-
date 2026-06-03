@@ -119,6 +119,81 @@ describe('evaluateBacktestGate (Stage 1)', () => {
   });
 });
 
+// ── TRA-541: the TRA-540 six-guard verdict gates Stage 1 ─────────────────────
+describe('evaluateBacktestGate — optimization verdict is authoritative (TRA-541)', () => {
+  it('FAILS the leg when verdict.pass === false even with strong headline metrics', () => {
+    // PASSING_BT clears every raw threshold, but the six-guard battery is red.
+    const r = evaluateBacktestGate(PASSING_BT, DEFAULT_PROMOTION_THRESHOLDS, {
+      pass: false,
+      guards: { G1: { pass: true, value: 0.6 }, G2: { pass: false, value: 1 }, G4: { pass: false, value: -10 } },
+    });
+    expect(r.state).toBe('fail');
+    expect(r.failedChecks.join(' ')).toMatch(/verdict FAIL/);
+    // names exactly the guards that were red
+    expect(r.failedChecks.join(' ')).toMatch(/G2/);
+    expect(r.failedChecks.join(' ')).toMatch(/G4/);
+    expect(r.failedChecks.join(' ')).not.toMatch(/G1/);
+  });
+
+  it('PASSES the leg when verdict.pass === true (verdict supersedes raw thresholds)', () => {
+    // Metrics that would FAIL the raw thresholds (sharpe < 1, tradeCount < 100),
+    // but the six-guard battery is all green → the verdict clears Stage 1.
+    const weakMetrics: BacktestGateMetrics = {
+      sharpe: 0.6,
+      expectancy: 0.05,
+      profitFactor: 1.1,
+      maxDrawdown: 0.05,
+      tradeCount: 30,
+    };
+    const r = evaluateBacktestGate(weakMetrics, DEFAULT_PROMOTION_THRESHOLDS, { pass: true });
+    expect(r.state).toBe('pass');
+    expect(r.failedChecks).toHaveLength(0);
+  });
+
+  it('falls back to raw-metric thresholds when no verdict is registered', () => {
+    // Backward compat: the legacy register-a-BacktestResult path has no verdict.
+    expect(evaluateBacktestGate(PASSING_BT).state).toBe('pass');
+    expect(evaluateBacktestGate(PASSING_BT, DEFAULT_PROMOTION_THRESHOLDS, null).state).toBe('pass');
+  });
+
+  it('is still missing (not fail) when no metrics are registered, regardless of verdict', () => {
+    expect(evaluateBacktestGate(null, DEFAULT_PROMOTION_THRESHOLDS, { pass: true }).state).toBe('missing');
+  });
+});
+
+describe('evaluatePromotion — verdict.pass=false blocks live even with passing paper + sign-off (TRA-541)', () => {
+  const strongPaper = computePaperGateMetrics(
+    spaced(Array.from({ length: 60 }, (_, i) => (i % 6 === 0 ? -0.5 : 1.5))),
+  );
+
+  it('refuses go-live when the optimization verdict failed', () => {
+    const r = evaluatePromotion({
+      strategyId: 'bb_fade',
+      backtest: PASSING_BT,
+      backtestVerdict: { pass: false, guards: { G3: { pass: false, value: 0.7 } } },
+      paper: strongPaper,
+      signoff: 'present',
+    });
+    expect(r.canGoLive).toBe(false);
+    expect(r.backtest.state).toBe('fail');
+    expect(r.backtest.verdict?.pass).toBe(false);
+    expect(r.blockedReasons.join(' ')).toMatch(/Stage 1.*verdict FAIL/);
+  });
+
+  it('allows go-live when the verdict passes and the other stages clear', () => {
+    const r = evaluatePromotion({
+      strategyId: 'bb_fade',
+      backtest: PASSING_BT,
+      backtestVerdict: { pass: true },
+      paper: strongPaper,
+      signoff: 'present',
+    });
+    expect(r.canGoLive).toBe(true);
+    expect(r.backtest.state).toBe('pass');
+    expect(r.backtest.verdict?.pass).toBe(true);
+  });
+});
+
 describe('evaluatePaperGate (Stage 2)', () => {
   // 60 strong paper trades over ~60 days: 50 winners of +1.5, 10 small losers of
   // -0.5 → mean R ≈ 1.17, annualized Sharpe well above 0.8, clearing every

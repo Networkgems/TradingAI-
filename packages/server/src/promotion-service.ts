@@ -78,6 +78,9 @@ export async function buildPromotionStatus(username: string, strategyId: string)
   const thresholds = await getEffectiveThresholds(strategyId);
 
   const backtest = rec?.backtest?.metrics ?? null;
+  // TRA-541 — when a TRA-540 optimization verdict was registered, it is
+  // authoritative for Stage 1: the leg passes iff verdict.pass is true.
+  const backtestVerdict = rec?.backtest?.verdict ?? null;
 
   const paperTrades = await collectPaperTrades(username, strategyId);
   const paper: PaperGateMetrics | null =
@@ -85,7 +88,7 @@ export async function buildPromotionStatus(username: string, strategyId: string)
 
   const signoff = rec && rec.decisions.length > 0 ? 'present' : 'absent';
 
-  return evaluatePromotion({ strategyId, backtest, paper, signoff, thresholds });
+  return evaluatePromotion({ strategyId, backtest, backtestVerdict, paper, signoff, thresholds });
 }
 
 /** Most recent paper metrics for a strategy, used when persisting a sign-off snapshot. */

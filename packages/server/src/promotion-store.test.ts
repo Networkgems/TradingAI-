@@ -1,11 +1,13 @@
 import { describe, it, expect, beforeEach, afterEach } from 'vitest';
 import { tmpdir } from 'os';
-import { join } from 'path';
-import { mkdtempSync, rmSync } from 'fs';
+import { join, dirname } from 'path';
+import { fileURLToPath } from 'url';
+import { mkdtempSync, rmSync, readFileSync } from 'fs';
 import {
   __resetPromotionStoreForTests,
   deriveBacktestGateMetrics,
   registerBacktestReport,
+  registerOptimizationVerdict,
   recordSignoff,
   hasSignoff,
   getEffectiveThresholds,
@@ -13,8 +15,8 @@ import {
   getStrategyRecord,
   PromotionValidationError,
 } from './promotion-store.js';
-import { DEFAULT_PROMOTION_THRESHOLDS } from '@trading-app/shared';
-import type { BacktestResult } from '@trading-app/backtest';
+import { DEFAULT_PROMOTION_THRESHOLDS, evaluateBacktestGate } from '@trading-app/shared';
+import type { BacktestResult, OptimizationReport, OptimizationVerdict } from '@trading-app/backtest';
 
 let dir: string;
 
@@ -61,6 +63,80 @@ describe('registerBacktestReport + persistence', () => {
     expect(rec?.backtest?.metrics.sharpe).toBe(1.3);
     expect(rec?.backtest?.reportId).toBe('TRA-405');
     expect(rec?.backtest?.registeredBy).toBe('qt');
+  });
+});
+
+describe('registerOptimizationVerdict — TRA-541 Stage-1 from a TRA-540 verdict', () => {
+  // The validated TRA-540 reversal report: verdict.pass === false (the OOS
+  // guard battery is red) yet its headline Sharpe (1.247) is "strong". This is
+  // the exact gaming case the gate must refuse.
+  function loadReport(name: string): OptimizationReport {
+    const here = dirname(fileURLToPath(import.meta.url));
+    const p = join(here, '..', '..', 'backtest', 'reports', name);
+    return JSON.parse(readFileSync(p, 'utf-8')) as OptimizationReport;
+  }
+
+  it('ingests verdict.backtestMetrics 1:1 and stores the pass flag + blessed params', async () => {
+    const report = loadReport('tra540-reversal-BTC-USD.json');
+    const rec = await registerOptimizationVerdict({
+      strategyId: 'reversal',
+      verdict: report.verdict,
+      reportId: 'tra540-reversal-BTC-USD',
+      registeredBy: 'qt',
+    });
+    // 1:1 mapping, no renaming.
+    expect(rec.backtest?.metrics.sharpe).toBe(report.verdict.backtestMetrics.sharpe);
+    expect(rec.backtest?.metrics.tradeCount).toBe(report.verdict.backtestMetrics.tradeCount);
+    expect(rec.backtest?.verdict?.pass).toBe(report.verdict.pass);
+    expect(rec.backtest?.blessedParams).toEqual(report.verdict.blessedParams);
+
+    __resetPromotionStoreForTests(join(dir, 'promotion-gate.json'));
+    const reloaded = await getStrategyRecord('reversal');
+    expect(reloaded?.backtest?.verdict?.pass).toBe(false);
+    expect(reloaded?.backtest?.blessedParams).toBeTruthy();
+  });
+
+  it('a verdict.pass=false report with strong metrics FAILS the Stage-1 leg', async () => {
+    const report = loadReport('tra540-reversal-BTC-USD.json');
+    expect(report.verdict.pass).toBe(false);
+    expect(report.verdict.backtestMetrics.sharpe).toBeGreaterThan(1.0); // headline looks strong
+    await registerOptimizationVerdict({
+      strategyId: 'reversal',
+      verdict: report.verdict,
+      reportId: 'tra540-reversal-BTC-USD',
+      registeredBy: 'qt',
+    });
+    const rec = await getStrategyRecord('reversal');
+    const stage1 = evaluateBacktestGate(rec!.backtest!.metrics, DEFAULT_PROMOTION_THRESHOLDS, rec!.backtest!.verdict);
+    expect(stage1.state).toBe('fail');
+    expect(stage1.failedChecks.join(' ')).toMatch(/verdict FAIL/);
+  });
+
+  it('a verdict.pass=true report PASSES the Stage-1 leg', async () => {
+    // Synthesize a pass=true verdict (the curated real reports both legitimately
+    // FAIL; here we exercise the green path).
+    const verdict: OptimizationVerdict = {
+      pass: true,
+      guards: { G1: { pass: true, value: 0.8 }, G2: { pass: true, value: 0.97 }, G3: { pass: true, value: 0.2 },
+        G4: { pass: true, value: 500 }, G5: { pass: true, value: 0.9 }, G6: { pass: true, value: 0.3 } },
+      blessedParams: { strategy: 'reversal', label: 'rsiOverbought=70,lookback=5' },
+      backtestMetrics: { sharpe: 1.4, expectancy: 0.25, profitFactor: 1.7, maxDrawdown: 0.1, tradeCount: 120 },
+    };
+    await registerOptimizationVerdict({ strategyId: 'reversal', verdict, reportId: 'synthetic-pass', registeredBy: 'qt' });
+    const rec = await getStrategyRecord('reversal');
+    const stage1 = evaluateBacktestGate(rec!.backtest!.metrics, DEFAULT_PROMOTION_THRESHOLDS, rec!.backtest!.verdict);
+    expect(stage1.state).toBe('pass');
+  });
+
+  it('rejects a verdict missing the pass flag (anti hand-entry)', async () => {
+    await expect(
+      registerOptimizationVerdict({
+        strategyId: 'reversal',
+        verdict: { backtestMetrics: { sharpe: 1 } } as unknown as OptimizationVerdict,
+        reportId: 'bad',
+        registeredBy: 'qt',
+      }),
+    ).rejects.toThrow(PromotionValidationError);
   });
 });
 

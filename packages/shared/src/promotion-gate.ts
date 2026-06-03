@@ -87,6 +87,28 @@ export interface BacktestGateMetrics {
   tradeCount: number;
 }
 
+/**
+ * TRA-541 — the TRA-540 optimization harness's machine-readable `verdict`,
+ * reduced to what the Stage-1 gate needs. The harness runs a six-guard
+ * overfitting battery (G1 walk-forward efficiency, G2 deflated/probabilistic
+ * Sharpe, G3 probability of backtest overfitting, G4 bootstrap OOS floor,
+ * G5 holdout confirmation, G6 cost/slippage stress) and only sets `pass: true`
+ * when ALL SIX are green.
+ *
+ * When such a verdict is registered for a strategy it BECOMES the Stage-1 gate:
+ * the leg passes iff `pass === true`. A strategy with strong headline
+ * `BacktestGateMetrics` but `pass === false` must NOT clear Stage 1 — the
+ * six-guard verdict is the gate, not the raw metrics. Kept structural (no
+ * dependency on `@trading-app/backtest`) to preserve the backtest → shared
+ * dependency direction.
+ */
+export interface BacktestGateVerdict {
+  /** True iff all six TRA-540 overfitting guards (G1–G6) are green. */
+  pass: boolean;
+  /** Per-guard pass/value, used to name which guard(s) blocked Stage 1. */
+  guards?: Record<string, { pass: boolean; value: number }>;
+}
+
 /** Computed paper-trade metrics that feed the Stage-2 gate. */
 export interface PaperGateMetrics {
   tradeCount: number;
@@ -259,12 +281,39 @@ function fmt(n: number): string {
 /**
  * Stage 1 — backtest gate. `metrics === null` means no backtest report is
  * registered for the strategy → `missing`.
+ *
+ * TRA-541: when a TRA-540 optimization `verdict` is registered (passed as
+ * `verdict`), the six-guard verdict IS the gate — the leg passes iff
+ * `verdict.pass === true`, regardless of how strong the raw `metrics` look.
+ * A `verdict.pass === false` therefore fails Stage 1 even when every metric
+ * threshold is cleared. When no verdict is registered (`verdict` omitted/null),
+ * the gate falls back to the legacy raw-metric threshold checks below.
  */
 export function evaluateBacktestGate(
   metrics: BacktestGateMetrics | null,
   thresholds: PromotionThresholds = DEFAULT_PROMOTION_THRESHOLDS,
+  verdict?: BacktestGateVerdict | null,
 ): StageEvaluation {
   if (!metrics) return { state: 'missing', failedChecks: ['no backtest report registered'] };
+  if (verdict) {
+    if (!verdict.pass) {
+      const failedGuards = verdict.guards
+        ? Object.entries(verdict.guards)
+            .filter(([, g]) => !g.pass)
+            .map(([id]) => id)
+        : [];
+      return {
+        state: 'fail',
+        failedChecks: [
+          `optimization verdict FAIL — TRA-540 six-guard overfitting battery not all green`
+            + (failedGuards.length ? ` (failed: ${failedGuards.join(', ')})` : ''),
+        ],
+      };
+    }
+    // All six guards green: the strategy is robustly OOS-validated. The verdict
+    // is authoritative for Stage 1 — it supersedes the raw-metric thresholds.
+    return { state: 'pass', failedChecks: [] };
+  }
   const t = thresholds.backtest;
   const failed: string[] = [];
   if (!(metrics.tradeCount >= t.minTradeCount))
@@ -326,6 +375,11 @@ export interface PromotionEvaluationInput {
   strategyId: string;
   /** Stage-1 metrics from the registered backtest report, or null if none registered. */
   backtest: BacktestGateMetrics | null;
+  /**
+   * TRA-541 — the registered TRA-540 optimization verdict, if any. When present
+   * it is authoritative for Stage 1 (see {@link evaluateBacktestGate}).
+   */
+  backtestVerdict?: BacktestGateVerdict | null;
   /** Stage-2 metrics computed from the paper ledger, or null if none. */
   paper: PaperGateMetrics | null;
   /** Whether a Stage-3 sign-off (`promotion_decision`) record exists. */
@@ -340,7 +394,13 @@ export interface PromotionEvaluationInput {
  */
 export interface PromotionStatus {
   strategyId: string;
-  backtest: { state: PromotionStageState; metrics: BacktestGateMetrics | null; failedChecks: string[] };
+  backtest: {
+    state: PromotionStageState;
+    metrics: BacktestGateMetrics | null;
+    /** TRA-541 — the optimization verdict that gated Stage 1, if one is registered. */
+    verdict?: BacktestGateVerdict | null;
+    failedChecks: string[];
+  };
   paper: {
     state: PromotionStageState;
     tradeCount: number;
@@ -361,7 +421,7 @@ export interface PromotionStatus {
  */
 export function evaluatePromotion(input: PromotionEvaluationInput): PromotionStatus {
   const thresholds = input.thresholds ?? DEFAULT_PROMOTION_THRESHOLDS;
-  const bt = evaluateBacktestGate(input.backtest, thresholds);
+  const bt = evaluateBacktestGate(input.backtest, thresholds, input.backtestVerdict);
   const paper = evaluatePaperGate(input.paper, input.backtest, thresholds);
 
   const blockedReasons: string[] = [];
@@ -373,7 +433,12 @@ export function evaluatePromotion(input: PromotionEvaluationInput): PromotionSta
 
   return {
     strategyId: input.strategyId,
-    backtest: { state: bt.state, metrics: input.backtest, failedChecks: bt.failedChecks },
+    backtest: {
+      state: bt.state,
+      metrics: input.backtest,
+      verdict: input.backtestVerdict ?? null,
+      failedChecks: bt.failedChecks,
+    },
     paper: {
       state: paper.state,
       tradeCount: input.paper?.tradeCount ?? 0,

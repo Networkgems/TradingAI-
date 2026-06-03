@@ -5,12 +5,13 @@ import { fileURLToPath } from 'url';
 import { randomUUID } from 'crypto';
 import type {
   BacktestGateMetrics,
+  BacktestGateVerdict,
   PaperGateMetrics,
   PromotionDecision,
   PromotionThresholds,
 } from '@trading-app/shared';
 import { DEFAULT_PROMOTION_THRESHOLDS } from '@trading-app/shared';
-import type { BacktestResult } from '@trading-app/backtest';
+import type { BacktestResult, OptimizationVerdict } from '@trading-app/backtest';
 import { logger } from './observability/index.js';
 
 const log = logger.child({ module: 'promotion-store' });
@@ -43,6 +44,19 @@ export interface RegisteredBacktest {
   reportId: string;
   registeredAt: string;
   registeredBy: string;
+  /**
+   * TRA-541 — the TRA-540 optimization six-guard verdict, present only when the
+   * Stage-1 metrics were ingested from an optimization report. When present it
+   * is authoritative for the Stage-1 leg (passes iff `verdict.pass`), so strong
+   * headline `metrics` cannot clear the gate with a failed guard battery.
+   */
+  verdict?: BacktestGateVerdict;
+  /**
+   * TRA-541 — the parameter set the verdict certified (`verdict.blessedParams`),
+   * recorded so the promoted config is auditable. Free-form (strategy + label +
+   * the strategy-opts overlay).
+   */
+  blessedParams?: Record<string, unknown>;
 }
 
 export interface StrategyPromotionRecord {
@@ -166,6 +180,60 @@ export async function registerBacktestReport(args: {
   store.strategies[args.strategyId] = rec;
   await persist();
   log.info('registered backtest report', { strategyId: args.strategyId, reportId: args.reportId });
+  return rec;
+}
+
+/**
+ * TRA-541 — register the Stage-1 backtest leg from a TRA-540 optimization
+ * `verdict` block (`optimization-report.json`). The verdict's `backtestMetrics`
+ * are field-for-field identical to {@link BacktestGateMetrics} — `{ sharpe,
+ * expectancy, profitFactor, maxDrawdown, tradeCount }` — so they are ingested
+ * 1:1 with no renaming. The six-guard `pass` flag and per-guard results are
+ * stored alongside; once registered, the verdict is authoritative for Stage 1
+ * (a `pass === false` verdict fails the leg regardless of how strong the raw
+ * metrics look — see `evaluateBacktestGate`). `blessedParams` is recorded so the
+ * promoted configuration is auditable.
+ */
+export async function registerOptimizationVerdict(args: {
+  strategyId: string;
+  verdict: OptimizationVerdict;
+  reportId: string;
+  registeredBy: string;
+}): Promise<StrategyPromotionRecord> {
+  if (!args.strategyId) throw new PromotionValidationError('strategyId is required');
+  const v = args.verdict;
+  if (!v || typeof v.pass !== 'boolean') {
+    throw new PromotionValidationError('optimization verdict missing boolean `pass` flag');
+  }
+  const bm = v.backtestMetrics;
+  if (!bm || typeof bm !== 'object') {
+    throw new PromotionValidationError('optimization verdict missing `backtestMetrics`');
+  }
+  // 1:1 ingest — verdict.backtestMetrics already matches BacktestGateMetrics.
+  const metrics: BacktestGateMetrics = {
+    sharpe: bm.sharpe,
+    expectancy: bm.expectancy,
+    profitFactor: bm.profitFactor,
+    maxDrawdown: bm.maxDrawdown,
+    tradeCount: bm.tradeCount,
+  };
+  const store = await ensureLoaded();
+  const rec = store.strategies[args.strategyId] ?? blankRecord(args.strategyId);
+  rec.backtest = {
+    metrics,
+    reportId: args.reportId || 'unspecified',
+    registeredAt: new Date().toISOString(),
+    registeredBy: args.registeredBy,
+    verdict: { pass: v.pass, guards: v.guards },
+    blessedParams: v.blessedParams,
+  };
+  store.strategies[args.strategyId] = rec;
+  await persist();
+  log.info('registered optimization verdict', {
+    strategyId: args.strategyId,
+    reportId: args.reportId,
+    pass: v.pass,
+  });
   return rec;
 }
 
