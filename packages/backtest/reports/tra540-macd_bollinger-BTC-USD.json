@@ -1,0 +1,367 @@
+{
+  "harness": "run-optimization@TRA-540",
+  "strategy": "macd_bollinger",
+  "symbol": "BTC-USD",
+  "trialCount": 9,
+  "partition": {
+    "optStartTs": 1682899200000,
+    "optEndTs": 1751169600000,
+    "holdoutStartTs": 1754856000000,
+    "holdoutEndTs": 1780444800000,
+    "warmupBars": 250,
+    "embargoBars": 5,
+    "optBars": 4742,
+    "gapBars": 255,
+    "holdoutBars": 1778,
+    "totalBars": 6775
+  },
+  "windows": [
+    {
+      "window": 0,
+      "pickedParams": "bbPeriod=15,volumeMultiplier=2",
+      "isSharpe": -4.612388286563499,
+      "isTrades": 10,
+      "isPnl": -782.4823760921292,
+      "oosSharpe": 0,
+      "oosPnl": 0,
+      "oosTrades": 0
+    },
+    {
+      "window": 1,
+      "pickedParams": "bbPeriod=15,volumeMultiplier=2",
+      "isSharpe": -4.016754317856205,
+      "isTrades": 8,
+      "isPnl": -571.0596293572299,
+      "oosSharpe": 4.377294118416962,
+      "oosPnl": 246.50053730598816,
+      "oosTrades": 1
+    },
+    {
+      "window": 2,
+      "pickedParams": "bbPeriod=15,volumeMultiplier=2",
+      "isSharpe": 1.1754334321107758,
+      "isTrades": 4,
+      "isPnl": 139.78816983209447,
+      "oosSharpe": -0.644031930343524,
+      "oosPnl": -18.64940985581746,
+      "oosTrades": 1
+    },
+    {
+      "window": 3,
+      "pickedParams": "bbPeriod=15,volumeMultiplier=2",
+      "isSharpe": 1.105210134068945,
+      "isTrades": 4,
+      "isPnl": 155.19354462712204,
+      "oosSharpe": 0.6448897626253524,
+      "oosPnl": -50.15683585724596,
+      "oosTrades": 1
+    },
+    {
+      "window": 4,
+      "pickedParams": "bbPeriod=15,volumeMultiplier=2",
+      "isSharpe": 2.708148821477856,
+      "isTrades": 4,
+      "isPnl": 425.41109733104406,
+      "oosSharpe": -2.300356854620908,
+      "oosPnl": -227.32293541980812,
+      "oosTrades": 2
+    },
+    {
+      "window": 5,
+      "pickedParams": "bbPeriod=15,volumeMultiplier=2",
+      "isSharpe": 2.4052514548875203,
+      "isTrades": 8,
+      "isPnl": 702.2486709737775,
+      "oosSharpe": 2.045534458497171,
+      "oosPnl": 0,
+      "oosTrades": 0
+    },
+    {
+      "window": 6,
+      "pickedParams": "bbPeriod=15,volumeMultiplier=2",
+      "isSharpe": 1.9247539757859333,
+      "isTrades": 7,
+      "isPnl": 455.74813366778926,
+      "oosSharpe": -0.38313143014055523,
+      "oosPnl": -126.87864208250441,
+      "oosTrades": 1
+    },
+    {
+      "window": 7,
+      "pickedParams": "bbPeriod=15,volumeMultiplier=2",
+      "isSharpe": 1.4664051735192194,
+      "isTrades": 7,
+      "isPnl": 346.764152173279,
+      "oosSharpe": -4.230454298262814,
+      "oosPnl": -257.10524232993384,
+      "oosTrades": 2
+    },
+    {
+      "window": 8,
+      "pickedParams": "bbPeriod=15,volumeMultiplier=2",
+      "isSharpe": -1.5881040494222778,
+      "isTrades": 7,
+      "isPnl": -492.27843017327393,
+      "oosSharpe": 3.120935694625147,
+      "oosPnl": 240.41915064382516,
+      "oosTrades": 1
+    },
+    {
+      "window": 9,
+      "pickedParams": "bbPeriod=15,volumeMultiplier=2",
+      "isSharpe": -0.6589503678288682,
+      "isTrades": 4,
+      "isPnl": -137.72990615352077,
+      "oosSharpe": -4.646014032061829,
+      "oosPnl": -127.63488150268473,
+      "oosTrades": 1
+    },
+    {
+      "window": 10,
+      "pickedParams": "bbPeriod=15,volumeMultiplier=2",
+      "isSharpe": -1.9515330730271476,
+      "isTrades": 4,
+      "isPnl": -511.8659636132876,
+      "oosSharpe": 0,
+      "oosPnl": 0,
+      "oosTrades": 0
+    },
+    {
+      "window": 11,
+      "pickedParams": "bbPeriod=15,volumeMultiplier=2",
+      "isSharpe": -0.6967388643711129,
+      "isTrades": 4,
+      "isPnl": -143.86009267557947,
+      "oosSharpe": -3.4892692644735983,
+      "oosPnl": -60.149455730349516,
+      "oosTrades": 1
+    },
+    {
+      "window": 12,
+      "pickedParams": "bbPeriod=15,volumeMultiplier=2",
+      "isSharpe": 0.33185076960309573,
+      "isTrades": 3,
+      "isPnl": 53.09569392400486,
+      "oosSharpe": 4.221044305597131,
+      "oosPnl": 246.59764702253045,
+      "oosTrades": 1
+    },
+    {
+      "window": 13,
+      "pickedParams": "bbPeriod=15,volumeMultiplier=2",
+      "isSharpe": 0.44464053126181297,
+      "isTrades": 3,
+      "isPnl": 58.8133097894962,
+      "oosSharpe": 2.5630674630516617,
+      "oosPnl": 165.1686980729536,
+      "oosTrades": 2
+    },
+    {
+      "window": 14,
+      "pickedParams": "bbPeriod=15,volumeMultiplier=2",
+      "isSharpe": 0.6850600124302253,
+      "isTrades": 3,
+      "isPnl": 104.77907247834352,
+      "oosSharpe": -3.7461577522260203,
+      "oosPnl": -242.27605994618148,
+      "oosTrades": 2
+    },
+    {
+      "window": 15,
+      "pickedParams": "bbPeriod=15,volumeMultiplier=2",
+      "isSharpe": 0.6103536029765926,
+      "isTrades": 6,
+      "isPnl": 109.34082941895302,
+      "oosSharpe": 0,
+      "oosPnl": 0,
+      "oosTrades": 0
+    },
+    {
+      "window": 16,
+      "pickedParams": "bbPeriod=15,volumeMultiplier=2",
+      "isSharpe": 0.9880716959315717,
+      "isTrades": 5,
+      "isPnl": 169.49028514930257,
+      "oosSharpe": -4.748821002012837,
+      "oosPnl": -127.37556745576177,
+      "oosTrades": 1
+    },
+    {
+      "window": 17,
+      "pickedParams": "bbPeriod=15,volumeMultiplier=2",
+      "isSharpe": 0.0924950231611221,
+      "isTrades": 4,
+      "isPnl": -77.1073618732279,
+      "oosSharpe": 3.0752072235315375,
+      "oosPnl": 233.55335410403578,
+      "oosTrades": 4
+    },
+    {
+      "window": 18,
+      "pickedParams": "bbPeriod=15,volumeMultiplier=2",
+      "isSharpe": 0.9699891015705627,
+      "isTrades": 5,
+      "isPnl": 118.10610241386121,
+      "oosSharpe": 0,
+      "oosPnl": 0,
+      "oosTrades": 0
+    },
+    {
+      "window": 19,
+      "pickedParams": "bbPeriod=15,volumeMultiplier=2",
+      "isSharpe": 1.6577709118860244,
+      "isTrades": 5,
+      "isPnl": 475.16126416122484,
+      "oosSharpe": -3.489269264473574,
+      "oosPnl": -136.3896671159101,
+      "oosTrades": 1
+    },
+    {
+      "window": 20,
+      "pickedParams": "bbPeriod=15,volumeMultiplier=2",
+      "isSharpe": 0.7119641291280787,
+      "isTrades": 7,
+      "isPnl": 211.39602958955297,
+      "oosSharpe": 0,
+      "oosPnl": 0,
+      "oosTrades": 0
+    },
+    {
+      "window": 21,
+      "pickedParams": "bbPeriod=15,volumeMultiplier=2",
+      "isSharpe": 1.1505237717367405,
+      "isTrades": 6,
+      "isPnl": 338.7715970453147,
+      "oosSharpe": 5.462484961539991,
+      "oosPnl": 264.9485049808561,
+      "oosTrades": 2
+    }
+  ],
+  "blessed": {
+    "label": "bbPeriod=15,volumeMultiplier=2",
+    "overlay": {
+      "macdBollingerOpts": {
+        "bbPeriod": 15,
+        "volumeMultiplier": 2,
+        "enforceTimeFilter": false
+      }
+    },
+    "meanIsSharpe": 0.22288425374849838,
+    "meanIsTrades": 5.363636363636363,
+    "plateauScore": 0.10670559177993233,
+    "eligibleTrials": 0
+  },
+  "oosAggregate": {
+    "sharpe": 0.6386087225664677,
+    "expectancy": 0.10436658552187948,
+    "profitFactor": 1.4754028993992152,
+    "maxDrawdown": 0.03556220497390483,
+    "tradeCount": 29,
+    "totalPnl": 897.5056393050095
+  },
+  "holdout": {
+    "sharpe": -0.3404644465360709,
+    "expectancy": -0.3595889734503236,
+    "profitFactor": 0.7823861736427529,
+    "maxDrawdown": 0.030066131152544747,
+    "tradeCount": 13,
+    "totalPnl": -198.83103250175617,
+    "worstCasePnl": -198.83103250175617,
+    "stressedExpectancy": -0.3780621941575074
+  },
+  "guards": [
+    {
+      "id": "G1",
+      "name": "Walk-forward efficiency",
+      "pass": false,
+      "value": -0.4419431741903938,
+      "threshold": "≥ 0.5 and OOS Sharpe > 0",
+      "detail": "IS Sharpe 0.223 → OOS Sharpe -0.099"
+    },
+    {
+      "id": "G2",
+      "name": "Deflated Sharpe Ratio",
+      "pass": false,
+      "value": 0.09548179620018482,
+      "threshold": "PSR vs SR*(N=9) > 0.95, n ≥ 20",
+      "detail": "PSR 0.0955, SR* 0.171, obs/trade Sharpe -0.124, n=24"
+    },
+    {
+      "id": "G3",
+      "name": "Probability of Backtest Overfitting",
+      "pass": true,
+      "value": 0.1794871794871795,
+      "threshold": "PBO < 0.5 (target < 0.25)",
+      "detail": "PBO 0.179 over 12870 CSCV splits, S=16"
+    },
+    {
+      "id": "G4",
+      "name": "Bootstrap OOS floor",
+      "pass": false,
+      "value": -808.5303349129172,
+      "threshold": "p5 aggregate PnL > 0, n ≥ 20",
+      "detail": "block-bootstrap p5 equity $24191 (PnL $-809), p50 $25976"
+    },
+    {
+      "id": "G5",
+      "name": "Holdout confirmation",
+      "pass": false,
+      "value": -0.3404644465360709,
+      "threshold": "holdout Sharpe > 0 and holdout PnL ≥ G4 bootstrap p5 floor",
+      "detail": "holdout Sharpe -0.340, PnL $-199 vs floor $-809, trades 13"
+    },
+    {
+      "id": "G6",
+      "name": "Cost / slippage stress",
+      "pass": false,
+      "value": -0.3780621941575074,
+      "threshold": "1.5× cost expectancy > 0 and worst-case PnL > 0",
+      "detail": "1.5× cost expectancy -0.378R, worst-case PnL $-199"
+    }
+  ],
+  "verdict": {
+    "pass": false,
+    "guards": {
+      "G1": {
+        "pass": false,
+        "value": -0.4419431741903938
+      },
+      "G2": {
+        "pass": false,
+        "value": 0.09548179620018482
+      },
+      "G3": {
+        "pass": true,
+        "value": 0.1794871794871795
+      },
+      "G4": {
+        "pass": false,
+        "value": -808.5303349129172
+      },
+      "G5": {
+        "pass": false,
+        "value": -0.3404644465360709
+      },
+      "G6": {
+        "pass": false,
+        "value": -0.3780621941575074
+      }
+    },
+    "blessedParams": {
+      "strategy": "macd_bollinger",
+      "label": "bbPeriod=15,volumeMultiplier=2",
+      "macdBollingerOpts": {
+        "bbPeriod": 15,
+        "volumeMultiplier": 2,
+        "enforceTimeFilter": false
+      }
+    },
+    "backtestMetrics": {
+      "sharpe": 0.6386087225664677,
+      "expectancy": 0.10436658552187948,
+      "profitFactor": 1.4754028993992152,
+      "maxDrawdown": 0.03556220497390483,
+      "tradeCount": 29
+    }
+  }
+}

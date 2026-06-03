@@ -38,6 +38,34 @@ export { bootstrapEquityCurves, blockBootstrapEquityCurves } from './bootstrap.j
 export type { BootstrapOptions, BlockBootstrapOptions } from './bootstrap.js';
 export { buildWindows, walkForward } from './walk-forward.js';
 export type { WindowSpec, WalkForwardOptions, WalkForwardReport } from './walk-forward.js';
+// TRA-540 — automated optimization harness + overfitting guards (TRA-531 spec).
+export {
+  normalCdf,
+  normalPpf,
+  sampleMoments,
+  probabilisticSharpeRatio,
+  expectedMaxSharpe,
+  deflatedSharpeRatio,
+  probabilityOfBacktestOverfitting,
+} from './overfitting-stats.js';
+export type {
+  SampleMoments,
+  DeflatedSharpeInput,
+  DeflatedSharpeResult,
+  PboInput,
+  PboResult,
+} from './overfitting-stats.js';
+export { partitionData, DataPartition } from './data-partition.js';
+export type { PartitionOptions, PartitionBoundaries } from './data-partition.js';
+export { runOptimization, enumerateTrials, STRATEGY_SPECS } from './run-optimization.js';
+export type {
+  OptimizationReport,
+  OptimizationVerdict,
+  BacktestVerdictMetrics,
+  GuardResult,
+  WindowRow,
+  RunOptimizationOpts,
+} from './run-optimization.js';
 // Re-export the TRA-185 cost model surface so harness scripts can pick up
 // the spread-aware tiers without needing to also pin @trading-app/engine.
 export {

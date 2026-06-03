@@ -1,0 +1,369 @@
+{
+  "harness": "run-optimization@TRA-540",
+  "strategy": "reversal",
+  "symbol": "BTC-USD",
+  "trialCount": 9,
+  "partition": {
+    "optStartTs": 1682899200000,
+    "optEndTs": 1751169600000,
+    "holdoutStartTs": 1754856000000,
+    "holdoutEndTs": 1780444800000,
+    "warmupBars": 250,
+    "embargoBars": 5,
+    "optBars": 4742,
+    "gapBars": 255,
+    "holdoutBars": 1778,
+    "totalBars": 6775
+  },
+  "windows": [
+    {
+      "window": 0,
+      "pickedParams": "rsiOverbought=75,lookback=7",
+      "isSharpe": 0,
+      "isTrades": 0,
+      "isPnl": 0,
+      "oosSharpe": 0,
+      "oosPnl": 0,
+      "oosTrades": 0
+    },
+    {
+      "window": 1,
+      "pickedParams": "rsiOverbought=75,lookback=7",
+      "isSharpe": 0,
+      "isTrades": 0,
+      "isPnl": 0,
+      "oosSharpe": 0,
+      "oosPnl": 0,
+      "oosTrades": 0
+    },
+    {
+      "window": 2,
+      "pickedParams": "rsiOverbought=75,lookback=7",
+      "isSharpe": 0,
+      "isTrades": 0,
+      "isPnl": 0,
+      "oosSharpe": 0,
+      "oosPnl": 0,
+      "oosTrades": 0
+    },
+    {
+      "window": 3,
+      "pickedParams": "rsiOverbought=75,lookback=7",
+      "isSharpe": 0,
+      "isTrades": 0,
+      "isPnl": 0,
+      "oosSharpe": 0,
+      "oosPnl": 0,
+      "oosTrades": 0
+    },
+    {
+      "window": 4,
+      "pickedParams": "rsiOverbought=75,lookback=7",
+      "isSharpe": 0,
+      "isTrades": 0,
+      "isPnl": 0,
+      "oosSharpe": 5.167751501082852,
+      "oosPnl": 216.26928451853786,
+      "oosTrades": 1
+    },
+    {
+      "window": 5,
+      "pickedParams": "rsiOverbought=75,lookback=7",
+      "isSharpe": 2.577466136019156,
+      "isTrades": 1,
+      "isPnl": 216.26928451853786,
+      "oosSharpe": 0,
+      "oosPnl": 0,
+      "oosTrades": 0
+    },
+    {
+      "window": 6,
+      "pickedParams": "rsiOverbought=75,lookback=7",
+      "isSharpe": 2.577466136019149,
+      "isTrades": 1,
+      "isPnl": 216.26928451853786,
+      "oosSharpe": 0,
+      "oosPnl": 0,
+      "oosTrades": 0
+    },
+    {
+      "window": 7,
+      "pickedParams": "rsiOverbought=75,lookback=7",
+      "isSharpe": 2.577466136019142,
+      "isTrades": 1,
+      "isPnl": 216.26928451853786,
+      "oosSharpe": 0,
+      "oosPnl": 0,
+      "oosTrades": 0
+    },
+    {
+      "window": 8,
+      "pickedParams": "rsiOverbought=75,lookback=7",
+      "isSharpe": 2.5774661360191344,
+      "isTrades": 1,
+      "isPnl": 216.26928451853786,
+      "oosSharpe": 0,
+      "oosPnl": 0,
+      "oosTrades": 0
+    },
+    {
+      "window": 9,
+      "pickedParams": "rsiOverbought=75,lookback=7",
+      "isSharpe": 0,
+      "isTrades": 0,
+      "isPnl": 0,
+      "oosSharpe": 0,
+      "oosPnl": 0,
+      "oosTrades": 0
+    },
+    {
+      "window": 10,
+      "pickedParams": "rsiOverbought=75,lookback=7",
+      "isSharpe": 0,
+      "isTrades": 0,
+      "isPnl": 0,
+      "oosSharpe": 0,
+      "oosPnl": 0,
+      "oosTrades": 0
+    },
+    {
+      "window": 11,
+      "pickedParams": "rsiOverbought=75,lookback=7",
+      "isSharpe": 0,
+      "isTrades": 0,
+      "isPnl": 0,
+      "oosSharpe": 0,
+      "oosPnl": 0,
+      "oosTrades": 0
+    },
+    {
+      "window": 12,
+      "pickedParams": "rsiOverbought=75,lookback=7",
+      "isSharpe": 0,
+      "isTrades": 0,
+      "isPnl": 0,
+      "oosSharpe": 0,
+      "oosPnl": 0,
+      "oosTrades": 0
+    },
+    {
+      "window": 13,
+      "pickedParams": "rsiOverbought=75,lookback=7",
+      "isSharpe": 0,
+      "isTrades": 0,
+      "isPnl": 0,
+      "oosSharpe": 0,
+      "oosPnl": 0,
+      "oosTrades": 0
+    },
+    {
+      "window": 14,
+      "pickedParams": "rsiOverbought=75,lookback=7",
+      "isSharpe": 0,
+      "isTrades": 0,
+      "isPnl": 0,
+      "oosSharpe": 0,
+      "oosPnl": 0,
+      "oosTrades": 0
+    },
+    {
+      "window": 15,
+      "pickedParams": "rsiOverbought=75,lookback=7",
+      "isSharpe": 0,
+      "isTrades": 0,
+      "isPnl": 0,
+      "oosSharpe": 0,
+      "oosPnl": 0,
+      "oosTrades": 0
+    },
+    {
+      "window": 16,
+      "pickedParams": "rsiOverbought=75,lookback=7",
+      "isSharpe": 0,
+      "isTrades": 0,
+      "isPnl": 0,
+      "oosSharpe": 0,
+      "oosPnl": 0,
+      "oosTrades": 0
+    },
+    {
+      "window": 17,
+      "pickedParams": "rsiOverbought=75,lookback=7",
+      "isSharpe": 0,
+      "isTrades": 0,
+      "isPnl": 0,
+      "oosSharpe": 0,
+      "oosPnl": 0,
+      "oosTrades": 0
+    },
+    {
+      "window": 18,
+      "pickedParams": "rsiOverbought=75,lookback=7",
+      "isSharpe": 0,
+      "isTrades": 0,
+      "isPnl": 0,
+      "oosSharpe": 0,
+      "oosPnl": 0,
+      "oosTrades": 0
+    },
+    {
+      "window": 19,
+      "pickedParams": "rsiOverbought=75,lookback=7",
+      "isSharpe": 0,
+      "isTrades": 0,
+      "isPnl": 0,
+      "oosSharpe": 4.047260461395574,
+      "oosPnl": 364.5848080158828,
+      "oosTrades": 1
+    },
+    {
+      "window": 20,
+      "pickedParams": "rsiOverbought=75,lookback=7",
+      "isSharpe": 2.022173584081181,
+      "isTrades": 1,
+      "isPnl": 364.5848080158828,
+      "oosSharpe": 0,
+      "oosPnl": 0,
+      "oosTrades": 0
+    },
+    {
+      "window": 21,
+      "pickedParams": "rsiOverbought=75,lookback=7",
+      "isSharpe": 2.0221735840811736,
+      "isTrades": 1,
+      "isPnl": 364.5848080158828,
+      "oosSharpe": 0,
+      "oosPnl": 0,
+      "oosTrades": 0
+    }
+  ],
+  "blessed": {
+    "label": "rsiOverbought=75,lookback=7",
+    "overlay": {
+      "reversalOpts": {
+        "rsiOverbought": 75,
+        "rsiOversold": 25,
+        "lookback": 7,
+        "enforceTimeFilter": false
+      }
+    },
+    "meanIsSharpe": 0.6524641687381334,
+    "meanIsTrades": 0.2727272727272727,
+    "plateauScore": 0.4962540998884883,
+    "eligibleTrials": 0
+  },
+  "oosAggregate": {
+    "sharpe": 1.2472783357388812,
+    "expectancy": 2.887549101997929,
+    "profitFactor": null,
+    "maxDrawdown": 0.0065513427565733525,
+    "tradeCount": 2,
+    "totalPnl": 580.8540925344207
+  },
+  "holdout": {
+    "sharpe": 0,
+    "expectancy": 0,
+    "profitFactor": 0,
+    "maxDrawdown": 0,
+    "tradeCount": 0,
+    "totalPnl": 0,
+    "worstCasePnl": 0,
+    "stressedExpectancy": 0
+  },
+  "guards": [
+    {
+      "id": "G1",
+      "name": "Walk-forward efficiency",
+      "pass": true,
+      "value": 0.6419726939530481,
+      "threshold": "≥ 0.5 and OOS Sharpe > 0",
+      "detail": "IS Sharpe 0.652 → OOS Sharpe 0.419"
+    },
+    {
+      "id": "G2",
+      "name": "Deflated Sharpe Ratio",
+      "pass": false,
+      "value": 1,
+      "threshold": "PSR vs SR*(N=9) > 0.95, n ≥ 20",
+      "detail": "INSUFFICIENT OOS SAMPLE: n=2 < 20 trades — cannot certify (PSR 1.0000 on this sample is noise)"
+    },
+    {
+      "id": "G3",
+      "name": "Probability of Backtest Overfitting",
+      "pass": false,
+      "value": 1,
+      "threshold": "PBO < 0.5 (target < 0.25)",
+      "detail": "PBO 1.000 over 12870 CSCV splits, S=16"
+    },
+    {
+      "id": "G4",
+      "name": "Bootstrap OOS floor",
+      "pass": false,
+      "value": 580.8540925344205,
+      "threshold": "p5 aggregate PnL > 0, n ≥ 20",
+      "detail": "INSUFFICIENT OOS SAMPLE: 2 aggregate trades < 20 — bootstrap floor is noise"
+    },
+    {
+      "id": "G5",
+      "name": "Holdout confirmation",
+      "pass": false,
+      "value": 0,
+      "threshold": "holdout Sharpe > 0 and holdout PnL ≥ G4 bootstrap p5 floor",
+      "detail": "holdout Sharpe 0.000, PnL $0 vs floor $581, trades 0"
+    },
+    {
+      "id": "G6",
+      "name": "Cost / slippage stress",
+      "pass": false,
+      "value": 0,
+      "threshold": "1.5× cost expectancy > 0 and worst-case PnL > 0",
+      "detail": "1.5× cost expectancy 0.000R, worst-case PnL $0"
+    }
+  ],
+  "verdict": {
+    "pass": false,
+    "guards": {
+      "G1": {
+        "pass": true,
+        "value": 0.6419726939530481
+      },
+      "G2": {
+        "pass": false,
+        "value": 1
+      },
+      "G3": {
+        "pass": false,
+        "value": 1
+      },
+      "G4": {
+        "pass": false,
+        "value": 580.8540925344205
+      },
+      "G5": {
+        "pass": false,
+        "value": 0
+      },
+      "G6": {
+        "pass": false,
+        "value": 0
+      }
+    },
+    "blessedParams": {
+      "strategy": "reversal",
+      "label": "rsiOverbought=75,lookback=7",
+      "reversalOpts": {
+        "rsiOverbought": 75,
+        "rsiOversold": 25,
+        "lookback": 7,
+        "enforceTimeFilter": false
+      }
+    },
+    "backtestMetrics": {
+      "sharpe": 1.2472783357388812,
+      "expectancy": 2.887549101997929,
+      "profitFactor": null,
+      "maxDrawdown": 0.0065513427565733525,
+      "tradeCount": 2
+    }
+  }
+}
