@@ -11,10 +11,20 @@
 # not revert `name:` to it or a re-applied blueprint will provision a SECOND,
 # empty service instead of updating the live one.
 #
-# ⚠️ Not multi-instance safe: never run this Render service AND the self-hosted
-# PM2 process (`docs/runbook.md` §1) against the same broker credentials. The
-# PM2-vs-Render ownership reconciliation is an open item — see the TRA-547 note
-# in `docs/runbook.md` §1.
+# ⚠️ Not multi-instance safe: never run two live instances against the same
+# broker (Tradier) credentials.
+#
+# TRA-549 OWNERSHIP DECISION (CTO, 2026-06-03): THIS Render service
+# (`tradingai-bqb1`) is the SINGLE owner of live (production) Tradier
+# credentials — it is the only publicly-reachable backend (it serves the GitHub
+# Pages site), whereas the self-hosted PM2 process on `PG-DEVOPS14`
+# (`docs/runbook.md` §1) binds host-local with no reverse proxy and cannot be
+# the public live-trading instance. The PM2 self-host is stood down to
+# sandbox-only (`TRADIER_ENV=sandbox`, hard-pinned in `ecosystem.config.cjs`),
+# so set `TRADIER_ENV=production` and the production `TRADIER_*` pair HERE (in
+# the Render dashboard) — and NOWHERE else. Gate: this ownership must hold (or
+# be explicitly re-decided, de-credentialing the loser first) before any change
+# flips `LIVE_STRATEGY_PRESET` off `no_trade`.
 #
 # Historical (TRA-444, 2026-05-17): at that time no Render service was
 # provisioned and production ran self-hosted under PM2. Superseded by the

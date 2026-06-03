@@ -30,6 +30,18 @@ module.exports = {
         NODE_ENV: 'production',
         PORT: 4242,
         DATA_DIR,
+        // TRA-549 — live-broker ownership stand-down. The app is NOT
+        // multi-instance safe: two live instances must never run against the
+        // same Tradier credentials. Per the TRA-549 decision, the SINGLE owner
+        // of live (production) Tradier credentials is the Render service
+        // `tradingai-bqb1` (the only publicly-reachable backend; this PM2
+        // self-host binds host-local with no reverse proxy and cannot serve the
+        // public site). This self-host is therefore hard-pinned to `sandbox` so
+        // it can only ever route PAPER orders, even if production TRADIER_* are
+        // set out-of-band in the shell env. Do NOT change this to `production`
+        // here — if you ever need the self-host to own live trading instead,
+        // first de-credential Render bqb1 (see render.yaml header / runbook §1).
+        TRADIER_ENV: 'sandbox',
       },
     },
   ],

@@ -32,6 +32,12 @@
 //
 // PROD_BACKEND_URL is the ONE place the production backend host is hardcoded.
 // If the backend moves, change it here (and the CI `VITE_SERVER_URL` secret).
+//
+// TRA-549 — this host (`tradingai-bqb1` on Render) is also the SINGLE owner of
+// live (production) Tradier credentials. The self-hosted PM2 process on
+// `PG-DEVOPS14` is stood down to sandbox-only (see `docs/runbook.md` §1 and the
+// `render.yaml` header). The app is not multi-instance safe, so if this URL
+// ever changes, re-confirm that only one instance holds live broker creds.
 export const PROD_BACKEND_URL = 'wss://tradingai-bqb1.onrender.com';
 const LOCAL_BACKEND_URL = 'ws://localhost:4242';
 

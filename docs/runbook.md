@@ -20,13 +20,26 @@ scaling and alert response.
 > (`PROD_BACKEND_URL`) and the CI `VITE_SERVER_URL` secret. The old name
 > `tradingai-server.onrender.com` is **dead (404)** — do not reference it.
 >
-> ⚠️ **Open reconciliation (owner confirmation needed):** the PM2 self-host on
-> `PG-DEVOPS14` (below) and this Render service must not both run against the
-> **same broker credentials** (the app is not multi-instance safe — see
-> §1 "Topology"). Confirm which instance owns live broker credentials and retire
-> or de-credential the other. Until that is confirmed, treat Render bqb1 as the
-> **public read/UI backend** and do not point a second live trading instance at
-> the same Tradier account.
+> ✅ **Live-broker ownership — RESOLVED (TRA-549, CTO decision, 2026-06-03).**
+> The app is not multi-instance safe, so exactly one instance may hold live
+> (production) Tradier credentials. **Render `tradingai-bqb1` is that single
+> owner** — it is the only publicly-reachable backend (it serves the GitHub
+> Pages site), whereas the PM2 self-host on `PG-DEVOPS14` (below) binds
+> host-local with **no reverse proxy** and cannot be the public live-trading
+> instance. The PM2 self-host is therefore **stood down to sandbox-only**:
+> `TRADIER_ENV=sandbox` is hard-pinned in
+> [`ecosystem.config.cjs`](../ecosystem.config.cjs) (TRA-549), so it can only
+> ever route **paper** orders even if production `TRADIER_*` are set out-of-band
+> on the host. Set the production `TRADIER_*` pair and `TRADIER_ENV=production`
+> **only in the Render dashboard** — never on the PM2 host.
+>
+> **Gate:** this ownership must hold (or be explicitly re-decided — de-credential
+> the loser *first*) before any change flips `LIVE_STRATEGY_PRESET` off
+> `no_trade`. To hand live ownership to the PM2 self-host instead, you must
+> (1) clear `TRADIER_*` / set `TRADIER_ENV=sandbox` on Render bqb1, (2) drop the
+> `TRADIER_ENV: 'sandbox'` pin in `ecosystem.config.cjs`, and (3) update this
+> §1, the [`render.yaml`](../render.yaml) header, and the
+> [`server-url.ts`](../apps/desktop/src/server-url.ts) note — in one change.
 >
 > ---
 >
@@ -44,8 +57,10 @@ scaling and alert response.
   against.
 - **Topology:** one instance, engine state and the WebSocket bus in-process.
   There is **no failover** and the app is **not multi-instance safe** — run
-  exactly one `trading-server` process (see §4). Never run a second instance
-  (e.g. a parallel Render service) against the same broker credentials.
+  exactly one `trading-server` process (see §4). Never run two instances against
+  the **same live broker credentials**: per TRA-549 (note above) live Tradier
+  ownership belongs to Render `tradingai-bqb1`, and this PM2 self-host is pinned
+  to `TRADIER_ENV=sandbox` so the two never collide on the same live account.
 - **Process:** `node packages/server/dist/index.js`, launched by PM2 with
   `NODE_ENV=production`, `autorestart: true`, `restart_delay: 3000`,
   `max_restarts: 10`.
