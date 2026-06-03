@@ -1,7 +1,7 @@
 import { OrbStrategy, BbFadeStrategy, IchimokuStrategy, TradierOptionsClient, TradierOrderClient, TRADIER_REJECTED_STATUSES, evaluateSma200, SMA200_MIN_BARS, SMA200_DEBOUNCE_BARS } from '@trading-app/engine';
 import type { TradierAccountBalance } from '@trading-app/engine';
-import { WATCHLIST, MANAGED_ACCOUNT_RATIO, MAX_CONSECUTIVE_LOSSES, DAILY_DRAWDOWN_HALT_PCT, OPTIONS_PER_TICKET_DOLLAR_FLOOR, OPTIONS_POSITION_CAP_RATIO, aliasWatchlistSymbol, isLiveTradierOptionsEnabled, isStockMarketOpen, perPositionCap, resolveAutoManageImportedTradierOptions, resolveDemoCostModel, resolveHoldLiveOptionsOvernight, resolveLiveTradeEquitiesTradier, resolveManagedAccountRatio, resolveMarketReviewGatesEnabled, resolveRiskPerTrade, resolveRvDtePrefs, resolveTradierOptionsCreds, validateBracket, DEFAULT_RV_DTE_MIN, DEFAULT_RV_DTE_MAX, DEFAULT_RV_DTE_TARGET } from '@trading-app/shared';
-import type { TradeSignal, RelativeValueSignal, Sma200Signal, Candle, OptionsAccountState, SignalType, Position, AccountSettings, AccountState, NewsItem, TradierEnv, MarketReview, MarketReviewGates, EngineMarketReviewState, GatedStrategyNote } from '@trading-app/shared';
+import { WATCHLIST, MANAGED_ACCOUNT_RATIO, MAX_CONSECUTIVE_LOSSES, DAILY_DRAWDOWN_HALT_PCT, OPTIONS_PER_TICKET_DOLLAR_FLOOR, OPTIONS_POSITION_CAP_RATIO, aliasWatchlistSymbol, isLiveTradierOptionsEnabled, isStockMarketOpen, perPositionCap, resolveAutoManageImportedTradierOptions, resolveDemoCostModel, resolveHoldLiveOptionsOvernight, resolveLiveTradeEquitiesTradier, resolveManagedAccountRatio, resolveMarketReviewGatesEnabled, resolveRiskPerTrade, resolveRvDtePrefs, resolveTradierOptionsCreds, validateBracket, DEFAULT_RV_DTE_MIN, DEFAULT_RV_DTE_MAX, DEFAULT_RV_DTE_TARGET, scoreNewsSentiment, aggregateSymbolSentiment, nameAliasesFor } from '@trading-app/shared';
+import type { TradeSignal, RelativeValueSignal, Sma200Signal, Candle, OptionsAccountState, SignalType, Position, AccountSettings, AccountState, NewsItem, SymbolSentiment, TradierEnv, MarketReview, MarketReviewGates, EngineMarketReviewState, GatedStrategyNote } from '@trading-app/shared';
 import { getLatestMarketReview } from './market-review.js';
 import { etDateString } from './scheduler.js';
 import { fetchMinuteBars, fetchDailyCandles, fetchQuotes, fetchStocksNews, isYahooBreakerOpen, setActiveInterestSymbols, setTradierStocksFeedClient } from './yahoo-feed.js';
@@ -932,7 +932,12 @@ export class SignalEngine {
   private async doTick(): Promise<void> {
     if (Date.now() - this.lastNewsRefresh > NEWS_REFRESH_MS) {
       const news = await fetchStocksNews(this.getActiveSymbols());
-      if (news.length > 0) this.newsCache = news;
+      // TRA-534 — attach deterministic lexicon-v1 sentiment to each article on
+      // the 5-min refresh so getNews()/getSymbolSentiment() and the News tab
+      // read scored items without re-scoring per request.
+      if (news.length > 0) {
+        this.newsCache = news.map(n => ({ ...n, sentiment: scoreNewsSentiment(n) }));
+      }
       this.lastNewsRefresh = Date.now();
     }
 
@@ -3207,6 +3212,22 @@ export class SignalEngine {
 
   getNews(): NewsItem[] {
     return [...this.newsCache];
+  }
+
+  /**
+   * TRA-534 — per-symbol recency-weighted news-sentiment aggregate built from
+   * the (already scored) news cache. Pure reduction over `Date.now()`; maps
+   * articles to the symbol by ticker/name mention. Returns an empty neutral
+   * aggregate when no articles mention the symbol (never throws).
+   */
+  getSymbolSentiment(symbol: string): SymbolSentiment {
+    const sym = aliasWatchlistSymbol(symbol).toUpperCase();
+    return aggregateSymbolSentiment({
+      symbol: sym,
+      names: nameAliasesFor(sym),
+      news: this.newsCache,
+      now: Date.now(),
+    });
   }
 
   getReportSnapshot() {

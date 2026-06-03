@@ -4,6 +4,9 @@
 // computation from data, per-stage evaluation, overall verdict, audit record).
 export * from './promotion-gate.js';
 
+// TRA-534 — News-sentiment scorer (lexicon-v1) + per-symbol aggregate.
+export * from './news-sentiment.js';
+
 export type Side = 'buy' | 'sell';
 export type OrderStatus = 'pending' | 'filled' | 'cancelled' | 'rejected';
 export type SignalType =
@@ -1873,6 +1876,52 @@ export interface NewsItem {
   id?: string;
   kind?: ResearchReportKind;
   bodyMarkdown?: string;
+  /**
+   * TRA-534 — optional per-article sentiment, attached by the signal-engine's
+   * 5-min news refresh via {@link scoreNewsSentiment}. Optional so raw feeds
+   * (and historical cached items) remain valid without it. `method` tags the
+   * scorer (`lexicon-v1` today) so a FinBERT scorer can replace it later
+   * without a schema change.
+   */
+  sentiment?: NewsSentiment;
+}
+
+export interface NewsSentiment {
+  /** Polarity in [-1,+1]; positive = bullish tone. */
+  score: number;
+  label: 'positive' | 'neutral' | 'negative';
+  /** [0,1] — scales with the number of lexicon tokens matched. */
+  confidence: number;
+  /** Scorer identifier, e.g. `lexicon-v1`. */
+  method: string;
+}
+
+/**
+ * TRA-534 — per-symbol recency-weighted news-sentiment aggregate handed to the
+ * TRA-529 news analyst and surfaced in `GET /api/analysis/breadth/:symbol`.
+ */
+export interface SymbolSentiment {
+  symbol: string;
+  asOf: string; // ISO
+  window: '24h';
+  /** Recency-weighted mean of article scores (half-life 6h), clamped [-1,+1]. */
+  netScore: number;
+  articleCount: number;
+  /** Age of the newest mapped article, in minutes. */
+  freshnessMinutes: number;
+  /**
+   * Gated directional read on `netScore`: bullish ≥ +0.25, bearish ≤ -0.25.
+   * Forced `neutral` when `articleCount < 2` or `freshnessMinutes > 720` (stale).
+   */
+  tilt: 'bullish' | 'bearish' | 'neutral';
+  topHeadlines: SymbolSentimentHeadline[];
+}
+
+export interface SymbolSentimentHeadline {
+  title: string;
+  source: string;
+  score: number;
+  publishedAt: string; // ISO
 }
 
 export type ResearchReportKind = 'premarket' | 'postmarket' | 'weekly_review';

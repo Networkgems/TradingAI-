@@ -102,6 +102,7 @@ import {
   STRATEGY_PRESETS,
   DEFAULT_STRATEGY_PRESET_ID,
   WATCHLIST,
+  aliasWatchlistSymbol,
   validateLiveCredentials,
   validateProductionTradierKeys,
   type AccountSettings,
@@ -1607,6 +1608,42 @@ app.get('/api/news', requireAuth, async (_req, res) => {
   const yahoo = ctx.engine.getNews();
   const merged = await mergeResearchAndNews(yahoo);
   res.json(merged);
+});
+
+// TRA-530 — per-symbol analysis breadth bundle for the TRA-529 analyst agents.
+// Returns `{ technical, sentiment }`. This issue (TRA-534/Part B) creates the
+// route and fills the `sentiment` half; the `technical` half is filled by
+// TRA-533/Part A (multi-timeframe snapshot) when it lands. Each feed degrades
+// to `null` with a reason rather than 500ing (acceptance #4).
+app.get('/api/analysis/breadth/:symbol', requireAuth, async (req, res) => {
+  const raw = (req.params as Record<string, string>)['symbol'] ?? '';
+  const symbol = aliasWatchlistSymbol(raw).toUpperCase();
+  if (!symbol) {
+    res.status(400).json({ error: 'symbol required' });
+    return;
+  }
+  const ctx = await userCtx(res);
+  const notes: { technical?: string; sentiment?: string } = {};
+
+  let sentiment = null;
+  try {
+    sentiment = ctx.engine.getSymbolSentiment(symbol);
+  } catch (err) {
+    notes.sentiment = err instanceof Error ? err.message : 'sentiment unavailable';
+  }
+
+  // TRA-533 fills this in (multi-timeframe technical snapshot). Until then the
+  // analyst sees a null technical feed with a reason, not a 500.
+  const technical = null;
+  notes.technical = 'technical snapshot not yet implemented (TRA-533)';
+
+  res.json({
+    symbol,
+    asOf: new Date().toISOString(),
+    technical,
+    sentiment,
+    notes,
+  });
 });
 
 // TRA-227 — research-report ingestion + listing.

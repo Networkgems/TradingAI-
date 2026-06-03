@@ -4,8 +4,27 @@
 // expand/collapse button that reveals the formatted markdown body. Identifiable
 // via `bodyMarkdown` and the `kind` field set by the server.
 import { useState } from 'react';
-import type { NewsItem } from '@trading-app/shared';
+import type { NewsItem, NewsSentiment } from '@trading-app/shared';
 import { timeAgo, researchKindLabel, renderResearchMarkdown } from '../lib/format';
+
+// TRA-534 — pos/neg/neutral sentiment badge for a scored headline. Renders
+// nothing for unscored items (older cache / research posts) so the card looks
+// unchanged when no sentiment is present.
+function SentimentBadge({ sentiment }: { sentiment?: NewsSentiment }) {
+  if (!sentiment) return null;
+  const label =
+    sentiment.label === 'positive' ? 'Bullish'
+    : sentiment.label === 'negative' ? 'Bearish'
+    : 'Neutral';
+  return (
+    <span
+      className={`sentiment-badge sentiment-${sentiment.label}`}
+      title={`score ${sentiment.score.toFixed(2)} · confidence ${(sentiment.confidence * 100).toFixed(0)}% · ${sentiment.method}`}
+    >
+      {label}
+    </span>
+  );
+}
 
 export function NewsCard({ item }: { item: NewsItem }) {
   const isResearch = !!item.bodyMarkdown && item.source === 'QuantTrader';
@@ -14,7 +33,10 @@ export function NewsCard({ item }: { item: NewsItem }) {
     return (
       <div className="news-card">
         <div className="signal-header">
-          <span className="signal-symbol">{item.source}</span>
+          <span className="signal-symbol">
+            {item.source}
+            <SentimentBadge sentiment={item.sentiment} />
+          </span>
           <span className="signal-time muted">{timeAgo(new Date(item.publishedAt).getTime())}</span>
         </div>
         <div style={{ padding: '0.5rem 0' }}>

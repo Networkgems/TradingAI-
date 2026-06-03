@@ -1832,6 +1832,31 @@ tr:hover td { background: var(--bg-hover); }
   letter-spacing: 0.04em;
 }
 
+/* TRA-534 — per-headline news-sentiment badge (lexicon-v1). */
+.sentiment-badge {
+  display: inline-block;
+  padding: 0.05rem 0.45rem;
+  border-radius: 4px;
+  font-size: 0.6rem;
+  font-weight: 700;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+  margin-left: 0.5rem;
+  vertical-align: middle;
+}
+.sentiment-positive {
+  background: rgba(26, 127, 55, 0.16);
+  color: var(--green);
+}
+.sentiment-negative {
+  background: rgba(207, 34, 46, 0.16);
+  color: var(--red);
+}
+.sentiment-neutral {
+  background: rgba(87, 96, 106, 0.16);
+  color: var(--muted);
+}
+
 .research-toggle {
   background: none;
   border: 1px solid var(--border);
