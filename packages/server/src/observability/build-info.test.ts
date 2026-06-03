@@ -1,7 +1,7 @@
 // TRA-528 — build-info / deploy-version pinning tests.
 
 import { describe, it, expect } from 'vitest';
-import { interpretGitHead, computeBuildInfo } from './build-info.js';
+import { interpretGitHead, computeBuildInfo, resolveBuildInfo } from './build-info.js';
 
 const SHA = 'a'.repeat(40);
 const SHA2 = 'b'.repeat(40);
@@ -93,5 +93,25 @@ describe('computeBuildInfo', () => {
   it('clamps negative uptime (clock skew) to 0', () => {
     const info = computeBuildInfo({ ...base, env: {}, nowMs: 999_000 });
     expect(info.uptimeSec).toBe(0);
+  });
+});
+
+// Regression guard for the live-deploy incident where `/api/health/version` and
+// `/api/health/live` 500'd with `ReferenceError: __dirname is not defined`: the
+// server runs as ESM, so the module's `.git` / `package.json` walk-up fallbacks
+// must not reference the (nonexistent) CommonJS `__dirname` global. The earlier
+// tests all inject `gitResolver`/`version`, so they never exercised those
+// fallback paths — this calls the *real* runtime resolver end-to-end.
+describe('resolveBuildInfo (real runtime resolver)', () => {
+  it('does not throw and returns a well-formed BuildInfo under ESM', () => {
+    const info = resolveBuildInfo();
+    expect(typeof info.version).toBe('string');
+    expect(['env', 'git', 'none']).toContain(info.commitSource);
+    expect(info.nodeVersion).toBe(process.version);
+    expect(info.pid).toBe(process.pid);
+    expect(info.uptimeSec).toBeGreaterThanOrEqual(0);
+    // Running inside the repo with no baked env, the `.git` walk-up (the path
+    // that previously threw on `__dirname`) resolves a real 40-hex commit.
+    expect(info.commit).toMatch(/^[0-9a-f]{40}$/);
   });
 });

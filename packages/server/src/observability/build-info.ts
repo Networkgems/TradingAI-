@@ -17,7 +17,16 @@
 // and cached; only the uptime is recomputed per call.
 
 import { readFileSync } from 'fs';
-import { join } from 'path';
+import { dirname, join } from 'path';
+import { fileURLToPath } from 'url';
+
+// The server is built as ESM (`"type": "module"`), so the CommonJS `__dirname`
+// global does not exist at runtime — referencing it throws `ReferenceError:
+// __dirname is not defined`. Derive the module directory from `import.meta.url`
+// instead so the `.git` / `package.json` walk-up fallbacks actually work on the
+// live PM2 box (where neither `GIT_COMMIT` nor `npm_package_version` is set).
+// Matches the `__dirname` idiom used across the rest of the server package.
+const __dirname = dirname(fileURLToPath(import.meta.url));
 
 export interface BuildInfo {
   /** Semver from package.json (currently 0.0.0 — placeholder until released). */
