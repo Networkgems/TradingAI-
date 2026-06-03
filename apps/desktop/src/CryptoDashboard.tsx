@@ -18,8 +18,9 @@ import { CryptoWatchlistPanel } from './components/dashboard/CryptoWatchlistPane
 import { CryptoSignalsPanel } from './components/dashboard/CryptoSignalsPanel';
 import { CryptoPositionsPanel } from './components/dashboard/CryptoPositionsPanel';
 import { NewsPanel } from './components/dashboard/NewsPanel';
+import { PromotionGatePanel } from './components/dashboard/PromotionGatePanel';
 
-type CryptoTab = 'watchlist' | 'signals' | 'positions' | 'news' | 'calendar';
+type CryptoTab = 'watchlist' | 'signals' | 'positions' | 'news' | 'gate' | 'calendar';
 
 export default function CryptoDashboard({ token, onBack, onLogout, onActivity, theme, onToggleTheme }: { token: string; onBack: () => void; onLogout: () => void; onActivity?: () => void; theme: Theme; onToggleTheme: () => void }) {
   const [state, setState] = useState<CryptoEngineState | null>(null);
@@ -154,6 +155,9 @@ export default function CryptoDashboard({ token, onBack, onLogout, onActivity, t
              `News (${news.length})`}
           </button>
         ))}
+        <button className={`tab ${tab === 'gate' ? 'active' : ''}`} onClick={() => setTab('gate')}>
+          Gate
+        </button>
         <button className={`tab ${tab === 'calendar' ? 'active' : ''}`} onClick={() => setTab('calendar')}>
           P&amp;L Calendar
         </button>
@@ -208,6 +212,13 @@ export default function CryptoDashboard({ token, onBack, onLogout, onActivity, t
 
         {tab === 'news' && (
           <NewsPanel news={news} loadingText="Loading crypto news…" />
+        )}
+
+        {/* TRA-537 — the gate reads its own `/api/promotion/status` endpoint and
+            is independent of the crypto WebSocket state, so it renders without
+            waiting for the engine snapshot. */}
+        {tab === 'gate' && (
+          <PromotionGatePanel token={token} />
         )}
 
         {tab === 'calendar' && (

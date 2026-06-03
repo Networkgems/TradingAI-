@@ -22,6 +22,8 @@ import { CryptoSignalsPanel } from './CryptoSignalsPanel';
 import { CryptoPositionsPanel } from './CryptoPositionsPanel';
 import { DashboardHeader } from './DashboardHeader';
 import { LiveCredentialsBanner } from './LiveCredentialsBanner';
+import { PromotionGatePanel } from './PromotionGatePanel';
+import { DEFAULT_PROMOTION_THRESHOLDS } from '@trading-app/shared';
 
 // Render a panel inside the ToastProvider its useToast() call requires.
 function renderWithToast(ui: ReactElement) {
@@ -410,5 +412,101 @@ describe('LiveCredentialsBanner (TRA-506)', () => {
     expect(screen.getByTestId('live-credentials-banner')).toBeInTheDocument();
     expect(screen.getByText(/Coinbase API key/)).toBeInTheDocument();
     expect(screen.getByText(/Coinbase API secret/)).toBeInTheDocument();
+  });
+});
+
+// TRA-537 — Promotion-Gate status panel. fetch is stubbed to serve the
+// `/api/promotion/status` payload so the panel renders without a live server.
+describe('PromotionGatePanel (TRA-537)', () => {
+  // A passing strategy: every stage clears, so canGoLive is true.
+  const readyEntry = {
+    record: {
+      strategyId: 'tra405_validated',
+      backtest: { reportId: 'TRA-405', registeredAt: '2026-05-01T00:00:00.000Z', registeredBy: 'quant' },
+      decisions: [{ reviewer: 'quanttrader', decidedAt: '2026-05-20T00:00:00.000Z' }],
+    },
+    status: {
+      strategyId: 'tra405_validated',
+      backtest: {
+        state: 'pass',
+        metrics: { sharpe: 1.4, expectancy: 0.22, profitFactor: 1.8, maxDrawdown: 0.12, tradeCount: 240 },
+        failedChecks: [],
+      },
+      paper: {
+        state: 'pass',
+        tradeCount: 80,
+        metrics: { tradeCount: 80, expectancy: 0.18, sharpe: 1.1, profitFactor: 1.6, slippageRatio: 1.1, slippageSampleSize: 80 },
+        failedChecks: [],
+      },
+      signoff: 'present',
+      canGoLive: true,
+      blockedReasons: [],
+    },
+    thresholds: DEFAULT_PROMOTION_THRESHOLDS,
+  };
+
+  // A blocked strategy: paper trade count is short and there is no sign-off.
+  const blockedEntry = {
+    record: { strategyId: 'bb_fade_sol_doge', backtest: null, decisions: [] },
+    status: {
+      strategyId: 'bb_fade_sol_doge',
+      backtest: { state: 'missing', metrics: null, failedChecks: ['no backtest report registered'] },
+      paper: {
+        state: 'fail',
+        tradeCount: 12,
+        metrics: { tradeCount: 12, expectancy: 0.05, sharpe: 0.4, profitFactor: 1.1, slippageRatio: null, slippageSampleSize: 0 },
+        failedChecks: ['paper trade count 12 < 50'],
+      },
+      signoff: 'absent',
+      canGoLive: false,
+      blockedReasons: [
+        'Stage 1 (backtest) missing: no backtest report registered',
+        'Stage 2 (paper) fail: paper trade count 12 < 50',
+        'Stage 3 (sign-off) absent: no promotion_decision on record',
+      ],
+    },
+    thresholds: DEFAULT_PROMOTION_THRESHOLDS,
+  };
+
+  function stubStatus(payload: unknown) {
+    vi.stubGlobal('fetch', vi.fn(() => Promise.resolve(new Response(JSON.stringify(payload), { status: 200 }))));
+  }
+
+  it('renders a card per strategy with the API-computed metrics and verdicts', async () => {
+    stubStatus({ strategies: [readyEntry, blockedEntry] });
+    render(<PromotionGatePanel token="t" />);
+
+    // Ready strategy: READY badge + the API's computed Sharpe value verbatim.
+    expect(await screen.findByText('READY FOR LIVE')).toBeInTheDocument();
+    expect(screen.getByText('1.4')).toBeInTheDocument(); // backtest sharpe, not recomputed
+    expect(screen.getByText(/Signed off by/)).toBeInTheDocument();
+
+    // Blocked strategy: BLOCKED badge is present alongside the ready one.
+    expect(screen.getByText('BLOCKED')).toBeInTheDocument();
+  });
+
+  it('shows which gate failed and why for a blocked strategy', async () => {
+    stubStatus({ strategies: [blockedEntry] });
+    render(<PromotionGatePanel token="t" />);
+
+    expect(await screen.findByText('BLOCKED')).toBeInTheDocument();
+    expect(screen.getByText("Why this strategy can't go live")).toBeInTheDocument();
+    // Each blocked reason from the API is surfaced verbatim.
+    expect(screen.getByText('Stage 2 (paper) fail: paper trade count 12 < 50')).toBeInTheDocument();
+    expect(screen.getByText('Stage 3 (sign-off) absent: no promotion_decision on record')).toBeInTheDocument();
+    // Missing-stage placeholders render rather than crashing on null metrics.
+    expect(screen.getByText('No backtest report registered.')).toBeInTheDocument();
+  });
+
+  it('shows an empty state when no strategies are registered', async () => {
+    stubStatus({ strategies: [] });
+    render(<PromotionGatePanel token="t" />);
+    expect(await screen.findByText(/No strategies are registered/)).toBeInTheDocument();
+  });
+
+  it('surfaces an error when the status endpoint fails', async () => {
+    vi.stubGlobal('fetch', vi.fn(() => Promise.resolve(new Response('nope', { status: 500 }))));
+    render(<PromotionGatePanel token="t" />);
+    expect(await screen.findByText(/Could not load promotion status/)).toBeInTheDocument();
   });
 });

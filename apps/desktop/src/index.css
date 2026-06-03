@@ -2236,3 +2236,208 @@ tr:hover td { background: var(--bg-hover); }
   border-left: 3px solid var(--blue, #3b82f6);
 }
 
+/* ── TRA-537 Promotion-Gate status panel ──────────────────────────────────── */
+
+.promotion-gate-panel {
+  padding: 0.25rem 0 1rem;
+}
+
+.gate-intro {
+  margin: 0 0 0.75rem;
+  line-height: 1.4;
+}
+
+.gate-stale {
+  margin: 0 0 0.75rem;
+  color: var(--orange);
+}
+
+.gate-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(340px, 1fr));
+  gap: 0.85rem;
+}
+
+.gate-card {
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: var(--surface);
+  padding: 0.85rem 0.95rem;
+  display: flex;
+  flex-direction: column;
+  gap: 0.7rem;
+}
+
+.gate-card-ready {
+  border-color: var(--green);
+}
+
+.gate-card-head {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 0.5rem;
+}
+
+.gate-card-title {
+  display: flex;
+  flex-direction: column;
+  gap: 0.15rem;
+  min-width: 0;
+}
+
+.gate-strategy-name {
+  font-weight: 700;
+  font-size: 0.95rem;
+}
+
+.gate-strategy-id {
+  font-size: 0.68rem;
+  color: var(--muted);
+  background: var(--surface2);
+  padding: 0.05em 0.4em;
+  border-radius: 3px;
+  align-self: flex-start;
+}
+
+.gate-verdict {
+  font-size: 0.62rem;
+  font-weight: 700;
+  letter-spacing: 0.06em;
+  padding: 0.25em 0.55em;
+  border-radius: 999px;
+  white-space: nowrap;
+  flex-shrink: 0;
+}
+
+.gate-verdict-ready {
+  color: var(--green-strong);
+  background: var(--green-soft);
+}
+
+.gate-verdict-blocked {
+  color: var(--red-strong);
+  background: var(--red-soft);
+}
+
+.gate-chips {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.4rem;
+}
+
+.gate-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.35em;
+  font-size: 0.7rem;
+  font-weight: 600;
+  padding: 0.2em 0.55em;
+  border-radius: 5px;
+  border: 1px solid var(--border);
+}
+
+.gate-chip-icon { font-weight: 700; }
+.gate-chip-state { text-transform: uppercase; font-size: 0.6rem; letter-spacing: 0.05em; opacity: 0.8; }
+
+.gate-chip-pass {
+  color: var(--green-strong);
+  background: var(--green-soft);
+  border-color: var(--green);
+}
+.gate-chip-fail {
+  color: var(--red-strong);
+  background: var(--red-soft);
+  border-color: var(--red);
+}
+.gate-chip-missing {
+  color: var(--muted);
+  background: var(--surface2);
+}
+
+.gate-stage {
+  border-top: 1px solid var(--border-subtle);
+  padding-top: 0.55rem;
+}
+
+.gate-stage-head {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 0.5rem;
+  font-size: 0.68rem;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  color: var(--muted);
+  margin-bottom: 0.4rem;
+}
+
+.gate-stage-count {
+  text-transform: none;
+  letter-spacing: 0;
+  font-weight: 600;
+  color: var(--text-subtle);
+}
+
+.gate-stage-empty {
+  margin: 0;
+  font-size: 0.78rem;
+  color: var(--muted);
+  font-style: italic;
+}
+
+.gate-metrics {
+  display: flex;
+  flex-direction: column;
+  gap: 0.2rem;
+}
+
+.gate-metric {
+  display: grid;
+  grid-template-columns: 1fr auto 1.1em;
+  align-items: baseline;
+  gap: 0.5rem;
+  font-size: 0.8rem;
+}
+
+.gate-metric-label { color: var(--text-subtle); }
+.gate-metric-value { font-weight: 600; font-variant-numeric: tabular-nums; text-align: right; }
+.gate-metric-threshold { color: var(--muted); font-weight: 400; }
+.gate-metric-tick { text-align: center; color: var(--green); font-weight: 700; }
+
+.gate-metric-fail .gate-metric-value { color: var(--red); }
+.gate-metric-fail .gate-metric-tick { color: var(--red); }
+
+.gate-signoff {
+  margin: 0;
+  font-size: 0.8rem;
+}
+
+.gate-signoff-rationale { color: var(--muted); }
+
+.gate-blocked {
+  border-top: 1px solid var(--border-subtle);
+  padding-top: 0.55rem;
+}
+
+.gate-blocked-head {
+  font-size: 0.7rem;
+  font-weight: 700;
+  color: var(--red);
+  margin-bottom: 0.3rem;
+}
+
+.gate-blocked-list {
+  margin: 0;
+  padding-left: 1.1rem;
+  display: flex;
+  flex-direction: column;
+  gap: 0.2rem;
+}
+
+.gate-blocked-list li {
+  font-size: 0.78rem;
+  color: var(--text);
+  line-height: 1.35;
+}
+
