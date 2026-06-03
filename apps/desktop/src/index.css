@@ -1124,6 +1124,64 @@ tr:hover td { background: var(--bg-hover); }
   letter-spacing: 0.04em;
 }
 
+/* ── TRA-567 (TRA-410 A3) — Settings → Notifications ─────────────────────── */
+.notif-channels {
+  display: grid;
+  grid-template-columns: 1fr 1fr 1fr;
+  gap: 0.75rem;
+  margin-bottom: 1.25rem;
+}
+
+@media (max-width: 720px) {
+  .notif-channels { grid-template-columns: 1fr; }
+}
+
+.notif-channel-card {
+  display: flex;
+  flex-direction: column;
+  gap: 0.6rem;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  padding: 0.85rem 1rem;
+}
+
+.notif-channel-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 0.5rem;
+}
+
+.notif-channel-toggle {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+  cursor: pointer;
+  font-size: 0.85rem;
+}
+
+.notif-channel-toggle input[type="checkbox"] { flex-shrink: 0; }
+
+.notif-channel-name { font-weight: 700; }
+
+.notif-test-btn { font-size: 0.75rem; padding: 0.25rem 0.6rem; }
+
+.notif-telegram { display: flex; flex-direction: column; gap: 0.4rem; }
+
+.notif-subhead {
+  font-size: 0.8rem;
+  font-weight: 700;
+  color: var(--text);
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  margin: 1.25rem 0 0.75rem;
+}
+
+.notif-matrix th:not(:first-child),
+.notif-matrix .notif-matrix-cell { text-align: center; }
+
+.notif-matrix-cell input[type="checkbox"] { cursor: pointer; }
+
 .role-badge {
   display: inline-block;
   padding: 0.15rem 0.5rem;

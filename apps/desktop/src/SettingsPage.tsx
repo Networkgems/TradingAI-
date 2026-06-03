@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
 import { logger } from './lib/logger';
+import { NotificationsSettings } from './components/notifications/NotificationsSettings';
 import type {
   AccountMode,
   AccountSettings,
@@ -2224,9 +2225,13 @@ export default function SettingsPage({ token, httpUrl, context, onModeChange, on
         </div>
       </form>
 
-      {/* ── Profile / Change Password / User Management (hidden in crypto/stocks context) */}
+      {/* ── Profile / Change Password / Notifications / User Management (hidden in crypto/stocks context) */}
       {!context && <ProfileSection token={token} httpUrl={httpUrl} />}
       {!context && <ChangePasswordSection token={token} httpUrl={httpUrl} />}
+      {/* TRA-567 (TRA-410 A3) — standalone Notifications surface. Account-global,
+          so it lives on the main Settings page next to Profile, not the
+          per-market dashboard settings. */}
+      {!context && <NotificationsSettings token={token} httpUrl={httpUrl} />}
       {isAdmin && <UserManagementSection token={token} httpUrl={httpUrl} />}
     </div>
   );
