@@ -69,7 +69,21 @@ import {
   registerLiveHealthRoutes,
   runStaleStateCheck,
 } from './observability/index.js';
-import { rotateBackups, checkDataDirHealth } from './trade-store.js';
+import {
+  rotateBackups,
+  checkDataDirHealth,
+  loadStocksTradeSnapshot,
+  loadCryptoTradeSnapshot,
+  type StocksTradeSnapshot,
+  type CryptoTradeSnapshot,
+} from './trade-store.js';
+import {
+  buildExport,
+  toCsv,
+  type ExportFilters,
+  type ExportFormat,
+  type ExportMarket,
+} from './export.js';
 import { TradierRelativeValueScannerService } from './relative-value-scanner.js';
 import {
   CoinbaseOrderClient,
@@ -115,6 +129,9 @@ import {
   type NewsItem,
   type ResearchReport,
   type StrategyPresetId,
+  type Position,
+  type OptionPosition,
+  type AccountMode,
 } from '@trading-app/shared';
 import {
   saveResearchReport,
@@ -1606,6 +1623,132 @@ async function mergeResearchAndNews(yahoo: NewsItem[]): Promise<NewsItem[]> {
   rest.sort((a, b) => b.publishedAt.localeCompare(a.publishedAt));
   return [...pinned, ...rest];
 }
+
+// ── Trade history export (TRA-564, parent TRA-410 §2.4 / B1) ─────────────────
+
+/** Parse a comma-separated, lower-cased, de-duped query list. */
+function parseCsvParam(raw: unknown): string[] {
+  if (typeof raw !== 'string' || !raw.trim()) return [];
+  return Array.from(
+    new Set(
+      raw
+        .split(',')
+        .map(s => s.trim().toLowerCase())
+        .filter(Boolean),
+    ),
+  );
+}
+
+/**
+ * Parse a `from`/`to` boundary as epoch-ms. Accepts an epoch-ms number, an ISO
+ * timestamp, or a bare `YYYY-MM-DD` date. A date-only `to` is widened to the
+ * end of that UTC day so the upper bound is inclusive of trades closed any time
+ * that day. Returns undefined on an unparseable / blank value.
+ */
+function parseExportBoundary(raw: unknown, isEnd: boolean): number | undefined {
+  if (typeof raw !== 'string' || !raw.trim()) return undefined;
+  const trimmed = raw.trim();
+  if (/^\d+$/.test(trimmed)) {
+    const n = Number(trimmed);
+    return Number.isFinite(n) ? n : undefined;
+  }
+  const ms = Date.parse(trimmed);
+  if (!Number.isFinite(ms)) return undefined;
+  // Date-only end boundary → end of the UTC day (inclusive).
+  if (isEnd && /^\d{4}-\d{2}-\d{2}$/.test(trimmed)) {
+    return ms + 86_400_000 - 1;
+  }
+  return ms;
+}
+
+const VALID_MARKETS: ExportMarket[] = ['stocks', 'crypto', 'options'];
+const VALID_MODES: AccountMode[] = ['demo', 'live'];
+
+/** Union the per-env closed-options buckets from a stocks snapshot, de-duped by id. */
+function collectClosedOptions(snap: StocksTradeSnapshot | null): OptionPosition[] {
+  if (!snap) return [];
+  const byId = new Map<string, OptionPosition>();
+  const buckets = snap.optionsByEnv
+    ? Object.values(snap.optionsByEnv)
+    : snap.options
+      ? [snap.options]
+      : [];
+  for (const bucket of buckets) {
+    for (const opt of bucket?.closedOptions ?? []) byId.set(opt.id, opt);
+  }
+  return Array.from(byId.values());
+}
+
+/**
+ * Collect crypto closed positions, preferring the TRA-242 mode-split lists
+ * (stamping mode so legacy rows without it land in the right bucket) and
+ * falling back to the merged list. De-duped by id.
+ */
+function collectClosedCrypto(snap: CryptoTradeSnapshot | null): Position[] {
+  if (!snap) return [];
+  const byId = new Map<string, Position>();
+  const hasSplit = snap.demoClosedPositions || snap.liveClosedPositions;
+  if (hasSplit) {
+    for (const p of snap.demoClosedPositions ?? []) byId.set(p.id, { ...p, mode: p.mode ?? 'demo' });
+    for (const p of snap.liveClosedPositions ?? []) byId.set(p.id, { ...p, mode: p.mode ?? 'live' });
+  } else {
+    for (const p of snap.closedPositions ?? []) byId.set(p.id, p);
+  }
+  return Array.from(byId.values());
+}
+
+app.get('/api/trades/export', requireAuth, async (req, res, next) => {
+  try {
+    const username = res.locals['authUser'] as string;
+    const query = req.query as Record<string, unknown>;
+
+    const format: ExportFormat = String(query['format'] ?? 'csv').toLowerCase() === 'json' ? 'json' : 'csv';
+    if (query['format'] && format !== String(query['format']).toLowerCase()) {
+      res.status(400).json({ error: "format must be 'csv' or 'json'" });
+      return;
+    }
+
+    const markets = parseCsvParam(query['markets']).filter((m): m is ExportMarket =>
+      (VALID_MARKETS as string[]).includes(m),
+    );
+    const modes = parseCsvParam(query['modes']).filter((m): m is AccountMode =>
+      (VALID_MODES as string[]).includes(m),
+    );
+    const filters: ExportFilters = {
+      markets,
+      modes,
+      from: parseExportBoundary(query['from'], false),
+      to: parseExportBoundary(query['to'], true),
+    };
+
+    const [stocksSnap, cryptoSnap] = await Promise.all([
+      loadStocksTradeSnapshot(username),
+      loadCryptoTradeSnapshot(username),
+    ]);
+
+    const { rows, summary } = buildExport(
+      {
+        stocksClosed: stocksSnap?.closedPositions ?? [],
+        cryptoClosed: collectClosedCrypto(cryptoSnap),
+        optionsClosed: collectClosedOptions(stocksSnap),
+      },
+      filters,
+    );
+
+    const stamp = new Date().toISOString().slice(0, 10);
+    if (format === 'json') {
+      res.setHeader('Content-Type', 'application/json; charset=utf-8');
+      res.setHeader('Content-Disposition', `attachment; filename="trades-export-${stamp}.json"`);
+      res.send(JSON.stringify({ summary, trades: rows }, null, 2));
+    } else {
+      res.setHeader('Content-Type', 'text/csv; charset=utf-8');
+      res.setHeader('Content-Disposition', `attachment; filename="trades-export-${stamp}.csv"`);
+      res.send(toCsv(rows));
+    }
+  } catch (err) {
+    next(err);
+  }
+});
 
 // ── State ─────────────────────────────────────────────────────────────────────
 
