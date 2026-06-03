@@ -18,7 +18,40 @@ const log = logger.child({ module: 'trade-store' });
 // ─────────────────────────────────────────────────────────────────────────────
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
-const DATA_DIR = process.env.DATA_DIR ?? join(__dirname, '..', 'data');
+
+/**
+ * TRA-522 — resolve the on-disk persistence root.
+ *
+ * Root cause of the silent demo-book swap on restart: this path was only ever
+ * pinned to `process.env.DATA_DIR`, and the fallback anchors to the *module's*
+ * location (`<repo>/packages/server/data`). On the self-hosted host two repos
+ * exist (`_default/tradingai_repo` and a sibling `~/TradingAI`), each with its
+ * own `packages/server/data`. A PM2 restart launched from a different repo /
+ * ecosystem file therefore loaded a *different* book — that is how the demo
+ * account flipped from $1,000 (live book) to $26,397 (stale sibling book).
+ *
+ * The contract this helper guarantees:
+ *   1. When `DATA_DIR` is set, it wins verbatim — the canonical, launch-cwd /
+ *      repo-independent location ops point every instance at (see
+ *      `ops/bootstrap-trading-server.sh` and `docs/runbook.md` §1).
+ *   2. The fallback is anchored to `moduleDir`, never to `process.cwd()`, so
+ *      the resolved path does not move just because PM2 was started from a
+ *      different working directory.
+ *
+ * `ecosystem.config.cjs` now sets `DATA_DIR` explicitly so the canonical
+ * production launch path always takes branch (1); the fallback only applies to
+ * ad-hoc / dev runs.
+ */
+export function resolveDataDir(
+  env: NodeJS.ProcessEnv = process.env,
+  moduleDir: string = __dirname,
+): string {
+  const fromEnv = env.DATA_DIR;
+  if (fromEnv && fromEnv.trim()) return fromEnv;
+  return join(moduleDir, '..', 'data');
+}
+
+const DATA_DIR = resolveDataDir();
 const BACKUP_DIR = join(DATA_DIR, 'backups');
 
 /** Maximum number of timestamped backup folders to keep. */

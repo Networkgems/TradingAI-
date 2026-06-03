@@ -1,0 +1,3 @@
+# Shell scripts must keep LF endings so they run on the Linux/PM2 host
+# regardless of the committer's platform (TRA-522 ops bootstrap script).
+*.sh text eol=lf

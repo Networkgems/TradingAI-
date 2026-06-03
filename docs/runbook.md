@@ -37,10 +37,21 @@ scaling and alert response.
   from a remote origin (see
   [`apps/desktop/src/server-url.ts`](../apps/desktop/src/server-url.ts)). If a
   reverse proxy is added later, record its public URL here.
-- **Data dir:** all user data, backups and logs live under `DATA_DIR`. PM2 does
-  **not** set it, so it falls back to the server default
-  (`packages/server/data/`). Set `DATA_DIR` in the process environment to
-  relocate it onto a dedicated volume — recommended for production.
+- **Data dir:** all user data, backups and logs live under `DATA_DIR`.
+  [`ecosystem.config.cjs`](../ecosystem.config.cjs) now **sets `DATA_DIR`
+  explicitly** to an absolute path anchored to the repo it launches from
+  (`<repo>/packages/server/data/`), so a PM2 restart always resolves the **same**
+  store regardless of the working directory it was launched from (TRA-522).
+  Override `DATA_DIR` in the process environment to relocate onto a dedicated
+  volume — recommended for production. **The override MUST be the same absolute
+  path on every launch.**
+  - ⚠️ **Single canonical launch path (TRA-522).** Start the server **only** via
+    [`ops/bootstrap-trading-server.sh`](../ops/bootstrap-trading-server.sh) (or
+    `npx pm2 start ecosystem.config.cjs` from the canonical repo). Do **not**
+    launch from a second clone (e.g. a sibling `~/TradingAI`): each clone has its
+    own `packages/server/data/`, and a restart from the wrong clone silently
+    loads a **different account book**. See "Account-snapshot swap (TRA-522)"
+    under §6.
 - **Auth secret:** the server **refuses to start in production without
   `AUTH_SECRET`** and uses an ephemeral one otherwise (all sessions drop on
   restart). Set a stable `AUTH_SECRET` in the environment. (The Render blueprint
@@ -218,6 +229,46 @@ alert per window.
 | Inspect storage | `curl -H 'Authorization: Bearer <token>' http://<host>/api/health/storage` |
 | Lock / unlock a user | `POST /api/admin/users/:username/lock` (admin token) |
 | Reset a user's password | `POST /api/admin/users/:username/reset-password` (admin token) |
+
+### Account-snapshot swap on restart (TRA-522)
+
+**Symptom.** After a `trading-server` restart the demo/live book changes
+wholesale — equity, open positions, options and closed history all flip to a
+different, stale set (observed 2026-06-03: $1,000 → $26,397, QBTS/NVAX/GM →
+IREN/ASTC, open options → none). This is **not** drift; it is a *different book*.
+
+**Root cause.** Account state persists under `DATA_DIR`. When `DATA_DIR` is
+unset, the server falls back to a path anchored to its own module —
+`<repo>/packages/server/data/`. The host carries **two clones** of the repo
+(`_default/tradingai_repo` and a sibling `~/TradingAI`, each with its own
+`ecosystem.config.cjs` using `cwd: __dirname`). A restart launched from the
+*other* clone / ecosystem file therefore reads that clone's
+`packages/server/data/` — a different snapshot — and the live book becomes
+invisible (it is not lost, just not loaded).
+
+**Fix (shipped).** `ecosystem.config.cjs` now sets `DATA_DIR` explicitly, and
+`trade-store.resolveDataDir()` guarantees the path is launch-cwd independent
+(regression: `packages/server/src/data-dir-persistence.test.ts`). Start the
+server only from the canonical path via
+[`ops/bootstrap-trading-server.sh`](../ops/bootstrap-trading-server.sh).
+
+**If it recurs — confirm a second instance / wrong clone:**
+
+```bash
+npx pm2 jlist | npx --yes json -a name pm_cwd                 # PM2 cwd per app
+npx pm2 describe trading-server | grep -E 'cwd|exec cwd|script'
+# Any second listener on :4242 (a parallel instance)?
+ss -ltnp 'sport = :4242'      # Linux
+netstat -ano | findstr :4242  # Windows
+# Which data dir did the live process actually resolve?
+grep -F 'DATA_DIR resolved' "$DATA_DIR/logs/"*.jsonl | tail -1
+ls -1d ~/TradingAI/packages/server/data ~/_default/*/packages/server/data 2>/dev/null
+```
+
+Recovery: stop the stray/duplicate process, relaunch the single instance from
+the canonical path, and confirm `/api/state` shows the expected book. If the
+wrong clone overwrote nothing (it never does — it writes only its own dir), the
+live book is intact under the canonical `DATA_DIR`; no data restore is needed.
 
 ## 7. Known operational gaps
 
