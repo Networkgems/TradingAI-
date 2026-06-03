@@ -286,46 +286,58 @@ function fmt(n: number): string {
  * `verdict`), the six-guard verdict IS the gate — the leg passes iff
  * `verdict.pass === true`, regardless of how strong the raw `metrics` look.
  * A `verdict.pass === false` therefore fails Stage 1 even when every metric
- * threshold is cleared. When no verdict is registered (`verdict` omitted/null),
- * the gate falls back to the legacy raw-metric threshold checks below.
+ * threshold is cleared.
+ *
+ * TRA-542 — **fail-closed**: a registered TRA-540 verdict is now *required* to
+ * clear Stage 1. When `metrics` are registered but no verdict accompanies them
+ * (the legacy `POST /api/promotion/backtest` path, or any report ingested before
+ * the optimization harness was run), the leg **fails** rather than falling back
+ * to the raw-metric thresholds. Strong headline numbers can no longer mint a
+ * Stage-1 pass on their own — the six-guard overfitting battery is the gate, and
+ * an unrun (absent) battery is treated as a hard block, never a silent pass.
+ * This closes the hole where a strategy with no overfitting verification could
+ * still be flipped live. The raw `metrics` are still surfaced on
+ * `promotion_status` for context, but they no longer constitute a pass path.
+ *
+ * The `thresholds` parameter is retained for signature stability (and is still
+ * consulted by the Stage-2 paper gate); Stage 1 no longer reads its `backtest`
+ * thresholds because the verdict supersedes them.
  */
 export function evaluateBacktestGate(
   metrics: BacktestGateMetrics | null,
+  // eslint-disable-next-line @typescript-eslint/no-unused-vars
   thresholds: PromotionThresholds = DEFAULT_PROMOTION_THRESHOLDS,
   verdict?: BacktestGateVerdict | null,
 ): StageEvaluation {
   if (!metrics) return { state: 'missing', failedChecks: ['no backtest report registered'] };
-  if (verdict) {
-    if (!verdict.pass) {
-      const failedGuards = verdict.guards
-        ? Object.entries(verdict.guards)
-            .filter(([, g]) => !g.pass)
-            .map(([id]) => id)
-        : [];
-      return {
-        state: 'fail',
-        failedChecks: [
-          `optimization verdict FAIL — TRA-540 six-guard overfitting battery not all green`
-            + (failedGuards.length ? ` (failed: ${failedGuards.join(', ')})` : ''),
-        ],
-      };
-    }
-    // All six guards green: the strategy is robustly OOS-validated. The verdict
-    // is authoritative for Stage 1 — it supersedes the raw-metric thresholds.
-    return { state: 'pass', failedChecks: [] };
+  if (!verdict) {
+    // TRA-542 fail-closed: no overfitting verdict on record → refuse Stage 1.
+    return {
+      state: 'fail',
+      failedChecks: [
+        'no TRA-540 optimization verdict registered — Stage 1 is fail-closed and requires a '
+          + 'passing six-guard overfitting verdict (run the TRA-540 harness and register it via '
+          + 'POST /api/promotion/optimization)',
+      ],
+    };
   }
-  const t = thresholds.backtest;
-  const failed: string[] = [];
-  if (!(metrics.tradeCount >= t.minTradeCount))
-    failed.push(`backtest trade count ${fmt(metrics.tradeCount)} < ${t.minTradeCount}`);
-  if (!(metrics.sharpe >= t.minSharpe)) failed.push(`backtest Sharpe ${fmt(metrics.sharpe)} < ${t.minSharpe}`);
-  if (!(metrics.expectancy > t.minExpectancy))
-    failed.push(`backtest expectancy ${fmt(metrics.expectancy)} not > ${t.minExpectancy}`);
-  if (!(metrics.profitFactor >= t.minProfitFactor))
-    failed.push(`backtest profit factor ${fmt(metrics.profitFactor)} < ${t.minProfitFactor}`);
-  if (!(metrics.maxDrawdown <= t.maxDrawdownPct))
-    failed.push(`backtest max drawdown ${fmt(metrics.maxDrawdown * 100)}% > ${t.maxDrawdownPct * 100}%`);
-  return { state: failed.length === 0 ? 'pass' : 'fail', failedChecks: failed };
+  if (!verdict.pass) {
+    const failedGuards = verdict.guards
+      ? Object.entries(verdict.guards)
+          .filter(([, g]) => !g.pass)
+          .map(([id]) => id)
+      : [];
+    return {
+      state: 'fail',
+      failedChecks: [
+        `optimization verdict FAIL — TRA-540 six-guard overfitting battery not all green`
+          + (failedGuards.length ? ` (failed: ${failedGuards.join(', ')})` : ''),
+      ],
+    };
+  }
+  // All six guards green: the strategy is robustly OOS-validated. The verdict
+  // is authoritative for Stage 1 — it supersedes the raw-metric thresholds.
+  return { state: 'pass', failedChecks: [] };
 }
 
 /**

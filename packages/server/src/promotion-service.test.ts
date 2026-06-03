@@ -83,9 +83,23 @@ describe('TRA-532 promotion gate — end-to-end enforcement', () => {
   });
 
   it('still blocks after only the backtest is registered (paper + sign-off missing)', async () => {
-    await store.registerBacktestReport({
+    // TRA-542 — Stage 1 is fail-closed, so a passing TRA-540 optimization verdict
+    // (not the legacy bare backtest report) is what clears the leg.
+    const r = passingReport();
+    await store.registerOptimizationVerdict({
       strategyId: 'bb_fade',
-      report: passingReport(),
+      verdict: {
+        pass: true,
+        guards: { G1: { pass: true, value: 0.8 } },
+        blessedParams: { strategy: 'bb_fade', label: 'tra405' },
+        backtestMetrics: {
+          sharpe: r.sharpeRatio,
+          expectancy: r.expectancy,
+          profitFactor: r.profitFactor,
+          maxDrawdown: r.maxDrawdown,
+          tradeCount: r.totalTrades,
+        },
+      },
       reportId: 'TRA-405',
       registeredBy: 'qt',
     });
@@ -170,6 +184,26 @@ describe('TRA-541 promotion gate — optimization verdict gates Stage 1', () => 
     const status = await svc.buildPromotionStatus(USER, 'reversal');
     expect(status.backtest.state).toBe('pass');
     expect(status.backtest.verdict?.pass).toBe(true);
+  });
+});
+
+// TRA-542 — fail-closed: registering a bare backtest report (the legacy
+// `POST /api/promotion/backtest` path, no TRA-540 verdict) must NOT clear Stage 1,
+// even when its metrics beat every legacy raw threshold.
+describe('TRA-542 promotion gate — Stage 1 is fail-closed without a verdict', () => {
+  it('keeps Stage 1 failing when only a verdict-less backtest report is registered', async () => {
+    await store.registerBacktestReport({
+      strategyId: 'legacy_only',
+      report: passingReport(), // clears every legacy raw threshold
+      reportId: 'TRA-405-legacy',
+      registeredBy: 'qt',
+    });
+    const status = await svc.buildPromotionStatus(USER, 'legacy_only');
+    expect(status.backtest.metrics?.sharpe).toBe(1.3); // metrics ingested…
+    expect(status.backtest.verdict ?? null).toBeNull(); // …but no verdict on record
+    expect(status.backtest.state).toBe('fail'); // → fail-closed
+    expect(status.backtest.failedChecks.join(' ')).toMatch(/no TRA-540 optimization verdict registered/);
+    expect(status.canGoLive).toBe(false);
   });
 });
 

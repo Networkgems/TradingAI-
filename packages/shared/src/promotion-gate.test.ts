@@ -93,29 +93,23 @@ describe('computePaperGateMetrics — metrics are derived from the ledger, not h
 });
 
 describe('evaluateBacktestGate (Stage 1)', () => {
-  it('passes when all thresholds are met', () => {
-    expect(evaluateBacktestGate(PASSING_BT).state).toBe('pass');
+  it('passes when a passing optimization verdict is registered', () => {
+    expect(evaluateBacktestGate(PASSING_BT, DEFAULT_PROMOTION_THRESHOLDS, { pass: true }).state).toBe('pass');
   });
 
   it('is missing when no report is registered', () => {
     expect(evaluateBacktestGate(null).state).toBe('missing');
   });
 
-  it('fails and names each unmet threshold', () => {
-    const r = evaluateBacktestGate({
-      sharpe: 0.5,
-      expectancy: -0.1,
-      profitFactor: 1.0,
-      maxDrawdown: 0.3,
-      tradeCount: 40,
-    });
+  // ── TRA-542: fail-closed — a registered verdict is REQUIRED ─────────────────
+  it('fails closed when metrics are registered but no verdict is on record', () => {
+    // PASSING_BT clears every legacy raw threshold, yet with no TRA-540 verdict
+    // the leg must NOT pass — strong headline numbers alone can no longer mint a
+    // Stage-1 pass.
+    const r = evaluateBacktestGate(PASSING_BT);
     expect(r.state).toBe('fail');
-    expect(r.failedChecks.join(' ')).toMatch(/Sharpe/);
-    expect(r.failedChecks.join(' ')).toMatch(/expectancy/);
-    expect(r.failedChecks.join(' ')).toMatch(/profit factor/);
-    expect(r.failedChecks.join(' ')).toMatch(/drawdown/);
-    expect(r.failedChecks.join(' ')).toMatch(/trade count/);
-    expect(r.failedChecks).toHaveLength(5);
+    expect(r.failedChecks.join(' ')).toMatch(/no TRA-540 optimization verdict registered/);
+    expect(r.failedChecks.join(' ')).toMatch(/fail-closed/);
   });
 });
 
@@ -150,10 +144,15 @@ describe('evaluateBacktestGate — optimization verdict is authoritative (TRA-54
     expect(r.failedChecks).toHaveLength(0);
   });
 
-  it('falls back to raw-metric thresholds when no verdict is registered', () => {
-    // Backward compat: the legacy register-a-BacktestResult path has no verdict.
-    expect(evaluateBacktestGate(PASSING_BT).state).toBe('pass');
-    expect(evaluateBacktestGate(PASSING_BT, DEFAULT_PROMOTION_THRESHOLDS, null).state).toBe('pass');
+  it('fails closed when no verdict is registered — TRA-542 (the raw-metric fallback is gone)', () => {
+    // Previously the legacy register-a-BacktestResult path (no verdict) fell back
+    // to raw thresholds and could PASS. TRA-542 makes that fail-closed: a passing
+    // six-guard verdict is now required, so PASSING_BT alone fails Stage 1.
+    expect(evaluateBacktestGate(PASSING_BT).state).toBe('fail');
+    expect(evaluateBacktestGate(PASSING_BT, DEFAULT_PROMOTION_THRESHOLDS, null).state).toBe('fail');
+    expect(evaluateBacktestGate(PASSING_BT, DEFAULT_PROMOTION_THRESHOLDS, null).failedChecks.join(' ')).toMatch(
+      /no TRA-540 optimization verdict registered/,
+    );
   });
 
   it('is still missing (not fail) when no metrics are registered, regardless of verdict', () => {
@@ -295,6 +294,7 @@ describe('evaluatePromotion — overall verdict (the one-line rule)', () => {
     const r = evaluatePromotion({
       strategyId: 'bb_fade',
       backtest: PASSING_BT,
+      backtestVerdict: { pass: true }, // TRA-542 — Stage 1 requires a passing verdict
       paper: strongPaper,
       signoff: 'present',
     });
@@ -308,11 +308,26 @@ describe('evaluatePromotion — overall verdict (the one-line rule)', () => {
     const r = evaluatePromotion({
       strategyId: 'bb_fade',
       backtest: PASSING_BT,
+      backtestVerdict: { pass: true }, // Stage 1 + Stage 2 pass; only sign-off missing
       paper: strongPaper,
       signoff: 'absent',
     });
     expect(r.canGoLive).toBe(false);
+    expect(r.backtest.state).toBe('pass');
+    expect(r.paper.state).toBe('pass');
     expect(r.blockedReasons.join(' ')).toMatch(/sign-off/i);
+  });
+
+  it('fails closed: a backtest report with no verdict blocks live on Stage 1 (TRA-542)', () => {
+    const r = evaluatePromotion({
+      strategyId: 'bb_fade',
+      backtest: PASSING_BT, // strong metrics, but no verdict registered
+      paper: strongPaper,
+      signoff: 'present',
+    });
+    expect(r.canGoLive).toBe(false);
+    expect(r.backtest.state).toBe('fail');
+    expect(r.blockedReasons.join(' ')).toMatch(/Stage 1.*no TRA-540 optimization verdict registered/);
   });
 
   it('blocks when the backtest report is missing', () => {
