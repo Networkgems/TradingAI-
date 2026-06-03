@@ -44,8 +44,24 @@ export function AccountModeSwitcher({
         onChange(next);
         toast.success(`Switched to ${next === 'live' ? 'Live' : 'Demo'} account`);
       } else {
-        logger.warn('account-mode', `mode switch returned HTTP ${r.status}`);
-        toast.error(`Could not switch to ${next} account (HTTP ${r.status})`);
+        // TRA-575 — surface the server's structured reason instead of a bare
+        // "HTTP 422". The promotion gate returns { code, error, blocked } with
+        // the exact blocking strategies; show the operator WHY and where to fix
+        // it rather than an opaque status code.
+        let reason = `HTTP ${r.status}`;
+        let isPromotionGate = false;
+        try {
+          const body = (await r.json()) as { code?: string; error?: string };
+          if (typeof body?.error === 'string' && body.error.trim() !== '') reason = body.error;
+          isPromotionGate = body?.code === 'promotion_gate_blocked';
+        } catch {
+          // Non-JSON body — keep the status-code fallback.
+        }
+        logger.warn('account-mode', `mode switch returned HTTP ${r.status}: ${reason}`);
+        toast.error(
+          `Could not switch to ${next} account — ${reason}`
+          + (isPromotionGate ? ' (promote the strategy in Settings → Promotion before going live)' : ''),
+        );
       }
     } catch (err) {
       logger.error('account-mode', `failed to switch to ${next} account`, err);

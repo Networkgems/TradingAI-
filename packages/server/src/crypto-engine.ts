@@ -195,7 +195,10 @@ export class CryptoSignalEngine {
   // TRA-229 — per-mode auto-trading flags. The active flag (consulted on each
   // tick and surfaced in getState()) is whichever one matches `this.mode`.
   private autoTradingEnabledDemo = true;
-  private autoTradingEnabledLive = true;
+  // TRA-575 — live crypto auto-trading defaults OFF (matches the shared
+  // DEFAULT_ACCOUNT_SETTINGS flip). Real capital never auto-trades until the user
+  // explicitly enables it through the gated path.
+  private autoTradingEnabledLive = false;
   /**
    * TRA-526 — global kill switch (deterministic master override). Mirrors the
    * equities/options {@link DailyRiskGovernor} kill switch so a single operator
@@ -462,7 +465,9 @@ export class CryptoSignalEngine {
     // Re-read both per-mode flags so a settings PUT (which may include the
     // start/stop UI state for either mode) keeps the engine in sync.
     this.autoTradingEnabledDemo = settings.cryptoAutoTradingEnabledDemo ?? true;
-    this.autoTradingEnabledLive = settings.cryptoAutoTradingEnabledLive ?? true;
+    // TRA-575 — absent ↔ OFF for live, matching the gate's strict `=== true`
+    // check so an undefined flag can never auto-trade live crypto past the gate.
+    this.autoTradingEnabledLive = settings.cryptoAutoTradingEnabledLive ?? false;
     // TRA-526 — reconcile the global kill switch so an operator halt persists
     // across restarts and applies to crypto as well as equities/options.
     this.killSwitchEngaged = settings.globalKillSwitchEngaged === true;

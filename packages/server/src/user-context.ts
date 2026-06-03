@@ -766,7 +766,8 @@ async function createUserContext(username: string): Promise<UserContext> {
   engine.setAutoTrading(settings.stocksAutoTradingEnabledDemo ?? true, 'demo');
   engine.setAutoTrading(settings.stocksAutoTradingEnabledLive ?? true, 'live');
   cryptoEngine.setAutoTrading(settings.cryptoAutoTradingEnabledDemo ?? true, 'demo');
-  cryptoEngine.setAutoTrading(settings.cryptoAutoTradingEnabledLive ?? true, 'live');
+  // TRA-575 — absent ↔ OFF for live crypto (matches the gate's strict `=== true`).
+  cryptoEngine.setAutoTrading(settings.cryptoAutoTradingEnabledLive ?? false, 'live');
 
   const ctx: UserContext = {
     username,

@@ -136,6 +136,34 @@ describe('TRA-532 promotion gate — end-to-end enforcement', () => {
     expect(gate.allowed).toBe(true);
   });
 
+  // TRA-575 — a stocks-only Tradier user flips the single global `mode` to live
+  // with crypto auto-trading OFF (the new default). The crypto promotion gate
+  // must stay dormant: live stocks must NOT be blocked by crypto strategy
+  // promotion, even when no crypto strategy is promoted on the account.
+  it('allows a live transition when crypto auto-trading is OFF, even with zero promoted strategies', async () => {
+    const stocksOnlyLive = {
+      mode: 'live',
+      cryptoAutoTradingEnabledLive: false,
+      activeStrategyPreset: 'legacy_5', // a full unpromoted roster — irrelevant while crypto is OFF
+    } as AccountSettings;
+    const gate = await svc.evaluateLiveTransitionGate('stocks-only-user', stocksOnlyLive);
+    expect(gate.allowed).toBe(true);
+    expect(gate.blocked).toHaveLength(0);
+  });
+
+  // TRA-575 — but the gate must remain fully intact the moment live crypto
+  // auto-trading is explicitly enabled on an unpromoted roster.
+  it('still blocks once live crypto auto-trading is explicitly turned ON with unpromoted strategies', async () => {
+    const cryptoLive = {
+      mode: 'live',
+      cryptoAutoTradingEnabledLive: true,
+      activeStrategyPreset: 'legacy_5',
+    } as AccountSettings;
+    const gate = await svc.evaluateLiveTransitionGate('stocks-only-user', cryptoLive);
+    expect(gate.allowed).toBe(false);
+    expect(gate.blocked.length).toBeGreaterThan(0);
+  });
+
   it('computed paper metrics reflect the ledger (count and positive expectancy)', async () => {
     const m = await svc.snapshotPaperMetrics(USER, 'bb_fade');
     expect(m?.tradeCount).toBe(60);

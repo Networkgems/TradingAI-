@@ -1119,7 +1119,16 @@ export const DEFAULT_ACCOUNT_SETTINGS: AccountSettings = {
   stocksAutoTradingEnabledDemo: true,
   stocksAutoTradingEnabledLive: true,
   cryptoAutoTradingEnabledDemo: true,
-  cryptoAutoTradingEnabledLive: true,
+  // TRA-575 — defaults to FALSE. Live crypto auto-trading places real capital on
+  // the strategy roster and is the trigger for the TRA-532 promotion gate
+  // (`liveCryptoOn` = mode==='live' && cryptoAutoTradingEnabledLive===true). With
+  // the old `true` default, ANY account flipping the single global `mode` to live
+  // — including a stocks-only Tradier user with zero crypto intent — tripped the
+  // crypto promotion gate and got a 422. Defaulting OFF makes live crypto strictly
+  // opt-in: a fresh account can go live on stocks, while live crypto stays gated
+  // until the user explicitly enables it (which re-arms the gate). Never auto-trade
+  // real crypto capital by default.
+  cryptoAutoTradingEnabledLive: false,
   liveBrokerageType: 'webull',
   liveTradeMode: 'ai_in_brokerage',
   liveApiKey: '',

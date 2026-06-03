@@ -3449,13 +3449,50 @@ app.post('/api/crypto/trading/start', requireAuth, async (req, res) => {
   const ctx = await userCtx(res);
   const settings = getSettings(username);
   const mode = resolveTradingMode(req.body, settings.mode);
-  ctx.cryptoEngine.setAutoTrading(true, mode);
   const updated: AccountSettings = {
     ...settings,
     ...(mode === 'live'
       ? { cryptoAutoTradingEnabledLive: true }
       : { cryptoAutoTradingEnabledDemo: true }),
   };
+  // TRA-575 — enabling LIVE crypto auto-trading is the real trigger for the
+  // TRA-532 promotion gate. Now that `cryptoAutoTradingEnabledLive` defaults OFF,
+  // this endpoint (not the global mode flip) is the path a user takes to turn it
+  // on — so it must enforce the same gate as PUT /api/account/settings, otherwise
+  // it would be an ungated bypass. Demo starts are never gated; only a result that
+  // runs live crypto auto-trading. Fail CLOSED if the gate can't be evaluated.
+  if (mode === 'live') {
+    try {
+      const gate = await evaluateLiveTransitionGate(username, updated);
+      if (!gate.allowed) {
+        log.warn('TRA-575 refused live crypto start — promotion gate', {
+          username,
+          blocked: gate.blocked.map(b => b.strategyId),
+        });
+        res.status(422).json({
+          ok: false,
+          code: 'promotion_gate_blocked',
+          error:
+            'Live crypto auto-trading is blocked by the promotion gate: '
+            + gate.blocked.map(b => `${b.strategyId} — ${b.reasons.join(' | ')}`).join(' ;; '),
+          blocked: gate.blocked,
+        });
+        return;
+      }
+    } catch (err: unknown) {
+      log.error('TRA-575 crypto-start promotion gate evaluation failed', {
+        username,
+        reason: err instanceof Error ? err.message : String(err),
+      });
+      res.status(500).json({
+        ok: false,
+        code: 'promotion_gate_error',
+        error: 'Could not verify the live-trading promotion gate. Live crypto start refused; please retry.',
+      });
+      return;
+    }
+  }
+  ctx.cryptoEngine.setAutoTrading(true, mode);
   await saveSettings(username, updated);
   broadcastCryptoState(ctx);
   res.json({ ok: true, mode, autoTradingEnabled: true });
