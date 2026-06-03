@@ -4,7 +4,11 @@ import {
   evaluateTwelveDataGate,
   isTradierStocksConfigured,
   setTradierStocksFeedClient,
+  partitionCachedQuotes,
+  requestsInWindow,
 } from './yahoo-feed.js';
+
+const Q = (price: number) => ({ price, volume: 0, change: 0, changePct: 0 });
 
 // TRA-505 — the watchlist quote feed must follow the Tradier creds the user
 // saves in the live Settings page, not only the boot-time TRADIER_* env vars.
@@ -111,5 +115,87 @@ describe('evaluateTwelveDataGate', () => {
         callsToday: 9_999,
       }),
     ).toEqual({ allowed: false, reason: 'breaker_open' });
+  });
+});
+
+// TRA-552 — short-TTL quote cache. Tradier is the sole stock-quote source, so
+// repeated reads of the same symbol inside the TTL window (watchlist poll + RV
+// scanner spot + signal-engine tick) must collapse to one upstream call.
+// `partitionCachedQuotes` is the pure split that decides which symbols are
+// served from cache and which still need a fetch.
+describe('partitionCachedQuotes (TRA-552 quote cache TTL)', () => {
+  const now = 1_000_000;
+
+  it('serves a symbol cached inside the TTL window without a fetch', () => {
+    const cache = new Map([['AAPL', { quote: Q(315), storedAt: now - 1_000 }]]);
+    const { fresh, stale } = partitionCachedQuotes({ symbols: ['AAPL'], cache, ttlMs: 3_000, now });
+    expect(stale).toEqual([]);
+    expect(fresh.get('AAPL')).toEqual(Q(315));
+  });
+
+  it('treats an entry older than the TTL as stale (needs a fetch)', () => {
+    const cache = new Map([['AAPL', { quote: Q(315), storedAt: now - 5_000 }]]);
+    const { fresh, stale } = partitionCachedQuotes({ symbols: ['AAPL'], cache, ttlMs: 3_000, now });
+    expect(fresh.size).toBe(0);
+    expect(stale).toEqual(['AAPL']);
+  });
+
+  it('treats an exact-TTL-age entry as stale (boundary is exclusive)', () => {
+    const cache = new Map([['AAPL', { quote: Q(315), storedAt: now - 3_000 }]]);
+    const { stale } = partitionCachedQuotes({ symbols: ['AAPL'], cache, ttlMs: 3_000, now });
+    expect(stale).toEqual(['AAPL']);
+  });
+
+  it('routes a cache miss to the stale set', () => {
+    const cache = new Map<string, { quote: ReturnType<typeof Q>; storedAt: number }>();
+    const { fresh, stale } = partitionCachedQuotes({ symbols: ['MSFT'], cache, ttlMs: 3_000, now });
+    expect(fresh.size).toBe(0);
+    expect(stale).toEqual(['MSFT']);
+  });
+
+  it('partitions a mixed list into fresh hits and the stale remainder', () => {
+    const cache = new Map([
+      ['AAPL', { quote: Q(315), storedAt: now - 500 }],   // fresh
+      ['TSLA', { quote: Q(240), storedAt: now - 9_000 }], // expired
+    ]);
+    const { fresh, stale } = partitionCachedQuotes({
+      symbols: ['AAPL', 'TSLA', 'NVDA'],
+      cache,
+      ttlMs: 3_000,
+      now,
+    });
+    expect([...fresh.keys()]).toEqual(['AAPL']);
+    expect(stale).toEqual(['TSLA', 'NVDA']);
+  });
+
+  it('treats every symbol as stale when the TTL is zero (cache disabled)', () => {
+    const cache = new Map([['AAPL', { quote: Q(315), storedAt: now }]]);
+    const { fresh, stale } = partitionCachedQuotes({ symbols: ['AAPL'], cache, ttlMs: 0, now });
+    expect(fresh.size).toBe(0);
+    expect(stale).toEqual(['AAPL']);
+  });
+});
+
+// TRA-552 — rolling Tradier requests/min meter surfaced in /api/health/quotes.
+// `requestsInWindow` is the pure window count: how many requests fall inside the
+// last `windowMs`, plus the pruned list so expired timestamps drop off.
+describe('requestsInWindow (TRA-552 req/min meter)', () => {
+  const now = 1_000_000;
+  const W = 60_000;
+
+  it('counts only timestamps inside the window and prunes the rest', () => {
+    const ts = [now - 70_000, now - 30_000, now - 5_000, now];
+    const { count, kept } = requestsInWindow(ts, now, W);
+    expect(count).toBe(3);
+    expect(kept).toEqual([now - 30_000, now - 5_000, now]);
+  });
+
+  it('excludes a timestamp exactly at the window edge (boundary exclusive)', () => {
+    const { count } = requestsInWindow([now - W], now, W);
+    expect(count).toBe(0);
+  });
+
+  it('returns zero for an empty history', () => {
+    expect(requestsInWindow([], now, W)).toEqual({ count: 0, kept: [] });
   });
 });

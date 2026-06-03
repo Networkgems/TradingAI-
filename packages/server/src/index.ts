@@ -175,7 +175,13 @@ const relativeValueScannerService = new TradierRelativeValueScannerService({
   tradierAccountId,
   tradierEnv,
   fetchSpot: async (symbol) => {
-    const quotes = await fetchQuotes([symbol]);
+    // TRA-552 — the RV scanner only needs an underlying spot for options
+    // mispricing math, which tolerates a few seconds of staleness. Reuse a
+    // recent watchlist/engine quote (up to 15s old) from the shared quote cache
+    // instead of firing a fresh per-symbol Tradier call — Tradier is now the
+    // sole stock-quote source and these per-symbol spot fetches were a large
+    // slice of the daily request counter.
+    const quotes = await fetchQuotes([symbol], { maxStaleMs: 15_000 });
     const q = quotes.get(symbol);
     return q && q.price > 0 ? q.price : null;
   },
@@ -3242,6 +3248,7 @@ app.get('/api/health/quotes', async (_req, res) => {
     fetchMinuteBarsWithSource,
     getFallbackRequestCounts,
     getTwelveDataQuotaState,
+    getTradierQuoteRateState,
   } = await import('./yahoo-feed.js');
   const { testCoinMarketCap, testCoinbase, isCoinbaseBreakerOpen } = await import('./crypto-feed.js');
   const results: Record<string, unknown> = {};
@@ -3305,6 +3312,13 @@ app.get('/api/health/quotes', async (_req, res) => {
 
   // Daily request counters per provider. Resets at UTC midnight.
   results['fallbackRequestsToday'] = getFallbackRequestCounts();
+
+  // TRA-552 — rolling Tradier quote requests/min + quote-cache state. Tradier is
+  // the sole stock-quote source, so this is the headroom gauge against its
+  // production rolling-window quota: a high `requestsLastMin` with few
+  // `cachedSymbols` means coalescing isn't engaging and quotes are at risk of
+  // re-breaking.
+  results['tradierQuoteRate'] = getTradierQuoteRateState();
 
   // TRA-439 — Twelve Data quota guard: how much of the daily budget is spent
   // and whether the credit/rate-limit breaker is open. Lets QA confirm a

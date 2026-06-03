@@ -150,6 +150,9 @@ export function setTradierStocksFeedClient(token: string | null | undefined, env
   // old (empty/stale) token had tripped on a 401/429 so the very next tick can
   // use the new token instead of staying on Yahoo for another cooldown window.
   tradierBlockedUntil = 0;
+  // TRA-552 — drop any quotes cached under the previous token so a key rotation
+  // never serves stale-cred data from the short-TTL cache.
+  clearQuoteCache();
   if (tradierStocksClient) {
     console.info(`[yahoo-feed] Tradier stocks feed enabled from account settings (env=${env}) — Tradier is now the primary quote source`);
   } else {
@@ -193,6 +196,114 @@ export function getFallbackRequestCounts(): { day: string; tradier: number; twel
     day: fallbackCountersDay,
     tradier: fallbackCounters.tradier,
     twelveData: fallbackCounters.twelveData,
+  };
+}
+
+// ── TRA-552: short-TTL quote cache + Tradier request-rate meter ───────────────
+// Tradier is now the SOLE stock-quote source — Yahoo 429s permanently on
+// Render's shared egress IP. At ~168k quote requests/day the production Tradier
+// account risks tripping its OWN rolling rate-limit window and re-breaking
+// quotes (the failure that cost the board a week). Two guards bound the volume:
+//   • a short-TTL per-symbol quote cache so repeated reads of the same symbol
+//     inside a few seconds — the watchlist poll, the relative-value scanner spot
+//     fetch, and the signal-engine tick all read overlapping symbols — collapse
+//     to a single upstream Tradier call instead of one each, and
+//   • a rolling requests/min meter surfaced in /api/health/quotes so we can see
+//     how much headroom remains under the production quota.
+
+const QUOTE_CACHE_TTL_MS = (() => {
+  const raw = Number(process.env['QUOTE_CACHE_TTL_MS']);
+  return Number.isFinite(raw) && raw >= 0 ? Math.floor(raw) : 3_000;
+})();
+
+interface QuoteCacheEntry {
+  quote: QuoteResult;
+  storedAt: number;
+}
+const quoteCache = new Map<string, QuoteCacheEntry>();
+
+/**
+ * Pure split of a requested symbol list into cache-fresh hits and the stale
+ * remainder that still needs an upstream fetch. Extracted so the TTL behaviour
+ * is unit-testable without a live feed or fake timers (TRA-552). A symbol is
+ * fresh when its entry is younger than `ttlMs`; everything else (miss or
+ * expired) goes to `stale`.
+ */
+export function partitionCachedQuotes(input: {
+  symbols: readonly string[];
+  cache: ReadonlyMap<string, QuoteCacheEntry>;
+  ttlMs: number;
+  now: number;
+}): { fresh: Map<string, QuoteResult>; stale: string[] } {
+  const fresh = new Map<string, QuoteResult>();
+  const stale: string[] = [];
+  for (const sym of input.symbols) {
+    const hit = input.cache.get(sym);
+    if (hit && input.now - hit.storedAt < input.ttlMs) {
+      fresh.set(sym, hit.quote);
+    } else {
+      stale.push(sym);
+    }
+  }
+  return { fresh, stale };
+}
+
+function cacheFreshQuotes(entries: Iterable<readonly [string, QuoteResult]>, now: number): void {
+  for (const [sym, q] of entries) quoteCache.set(sym, { quote: q, storedAt: now });
+}
+
+/** Clear every cached quote — called on a Tradier credential change so the
+ * feed never serves a quote fetched under the old token after a key rotation. */
+function clearQuoteCache(): void {
+  quoteCache.clear();
+}
+
+// Rolling window of Tradier quote-request timestamps (epoch-ms). Only ACTUAL
+// upstream Tradier quote calls are recorded — cache hits are free and must not
+// inflate the meter, otherwise it can't show the quota headroom the cache buys.
+const QUOTE_RATE_WINDOW_MS = 60_000;
+const tradierQuoteReqTimestamps: number[] = [];
+
+/**
+ * Pure rolling-window count: how many of `timestamps` fall within `windowMs`
+ * of `now`, plus the pruned list (entries still inside the window). Extracted
+ * for unit testing the req/min meter without timers (TRA-552).
+ */
+export function requestsInWindow(
+  timestamps: readonly number[],
+  now: number,
+  windowMs: number,
+): { count: number; kept: number[] } {
+  const cutoff = now - windowMs;
+  const kept = timestamps.filter(t => t > cutoff);
+  return { count: kept.length, kept };
+}
+
+function recordTradierQuoteRequest(now: number): void {
+  tradierQuoteReqTimestamps.push(now);
+  const { kept } = requestsInWindow(tradierQuoteReqTimestamps, now, QUOTE_RATE_WINDOW_MS);
+  tradierQuoteReqTimestamps.length = 0;
+  for (const t of kept) tradierQuoteReqTimestamps.push(t);
+}
+
+/**
+ * Tradier quote-request rate, surfaced by `/api/health/quotes` (TRA-552). At a
+ * 30s tick the watchlist poll alone is ~2 calls/min; sustained values far above
+ * that mean the cache/coalescing isn't engaging and we're approaching the
+ * production rolling-window quota.
+ */
+export function getTradierQuoteRateState(now: number = Date.now()): {
+  requestsLastMin: number;
+  windowSec: number;
+  cachedSymbols: number;
+  cacheTtlMs: number;
+} {
+  const { count } = requestsInWindow(tradierQuoteReqTimestamps, now, QUOTE_RATE_WINDOW_MS);
+  return {
+    requestsLastMin: count,
+    windowSec: QUOTE_RATE_WINDOW_MS / 1000,
+    cachedSymbols: quoteCache.size,
+    cacheTtlMs: QUOTE_CACHE_TTL_MS,
   };
 }
 
@@ -516,6 +627,20 @@ export async function fetchMinuteBarsWithSource(
 }> {
   const yahooSkipped = isRateLimited();
 
+  // TRA-552 — minute bars are immutable within their own minute, but the signal
+  // engine ticks every 30s (≈2 ticks/min) and pulls bars per symbol from two
+  // call sites (the analysis loop + the MTF snapshot refresh). Re-hitting Tradier
+  // each time doubles-plus the minute-bar request volume — the bulk of the ~168k
+  // daily Tradier counter. If this minute already has a successful Tradier pull
+  // with at least as many bars as requested, reuse it and skip the upstream call.
+  // Guarded to `source === 'tradier'` (Yahoo/Twelve-Data entries are still
+  // re-tried so a recovered primary can take over) and to `bars.length >= count`
+  // so a shallow earlier pull never short-changes a deeper caller.
+  const fresh = minuteBarCache.get(symbol);
+  if (fresh && fresh.expiresAt > Date.now() && fresh.source === 'tradier' && fresh.bars.length >= count) {
+    return { bars: fresh.bars.slice(-count), source: 'tradier', yahooSkipped, cached: true };
+  }
+
   // Primary: Tradier intraday timesales.
   const tradier = await fetchTradierMinuteBars(symbol, count);
   if (tradier.bars.length > 0) {
@@ -644,15 +769,30 @@ export async function fetchQuote(symbol: string): Promise<QuoteResult | null> {
  * watchlist refreshes in one HTTP call. Symbols Tradier doesn't return fall
  * through to the per-symbol Yahoo / Stooq cascade.
  */
-export async function fetchQuotes(symbols: readonly string[]): Promise<Map<string, QuoteResult>> {
+export async function fetchQuotes(
+  symbols: readonly string[],
+  opts?: { maxStaleMs?: number },
+): Promise<Map<string, QuoteResult>> {
   const results = new Map<string, QuoteResult>();
   if (symbols.length === 0) return results;
 
-  // Primary: one Tradier call for the whole list.
+  const now = Date.now();
+  // TRA-552 — serve symbols still inside the cache window without any upstream
+  // call. `maxStaleMs` lets a staleness-tolerant caller (e.g. the relative-value
+  // scanner's spot fetch) reuse a slightly older quote rather than burning a
+  // fresh Tradier request; it defaults to the short live-quote TTL.
+  const ttlMs = Math.max(0, opts?.maxStaleMs ?? QUOTE_CACHE_TTL_MS);
+  const { fresh, stale } = partitionCachedQuotes({ symbols, cache: quoteCache, ttlMs, now });
+  for (const [sym, q] of fresh) results.set(sym, q);
+  if (stale.length === 0) return results;
+  const staleSet = new Set(stale);
+
+  // Primary: one Tradier call for the stale remainder (cache hits already served).
   if (tradierStocksClient && !isTradierBlocked()) {
     try {
       bumpFallbackCounter('tradier');
-      const tradier = await tradierStocksClient.getQuotes(symbols);
+      recordTradierQuoteRequest(now);
+      const tradier = await tradierStocksClient.getQuotes(stale);
       for (const [sym, q] of tradier) {
         results.set(sym, { price: q.price, volume: q.volume, change: q.change, changePct: q.changePct });
       }
@@ -663,10 +803,8 @@ export async function fetchQuotes(symbols: readonly string[]): Promise<Map<strin
     }
   }
 
-  // Fan out the leftovers to the secondary chain in parallel batches.
-  const remaining = symbols.filter((s) => !results.has(s));
-  if (remaining.length === 0) return results;
-
+  // Fan out the leftovers (symbols Tradier didn't return) to the secondary chain.
+  const remaining = stale.filter((s) => !results.has(s));
   const QUOTE_BATCH = 5;
   let failures = 0;
   for (let i = 0; i < remaining.length; i += QUOTE_BATCH) {
@@ -681,6 +819,11 @@ export async function fetchQuotes(symbols: readonly string[]): Promise<Map<strin
   if (failures > 0) {
     console.warn(`[yahoo-feed] fetchQuotes: ${failures}/${symbols.length} symbols failed${isRateLimited() ? ' (Yahoo breaker open)' : ''}`);
   }
+
+  // TRA-552 — cache the freshly resolved (stale-set) quotes so overlapping
+  // readers within the window reuse them. Pre-existing fresh hits keep their
+  // original timestamp; only re-stamp what we just fetched.
+  cacheFreshQuotes([...results].filter(([s]) => staleSet.has(s)), now);
   return results;
 }
 
