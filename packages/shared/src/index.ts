@@ -343,6 +343,28 @@ export interface Position {
    * engine's own bookkeeping. Absent on every engine-opened position.
    */
   importedFromTradier?: boolean;
+  /**
+   * TRA-536 — realized entry slippage cost in account currency: the magnitude
+   * of the drift between the price the strategy intended to enter at
+   * (`signal.entryPrice`) and the live price the paper fill actually executed
+   * at (`Position.entryPrice`), times quantity — i.e.
+   * `|fillPrice − signalEntryPrice| × quantity`. Stamped at open by the paper
+   * fill paths (stocks + crypto demo). Consumed by the TRA-532 Stage-2
+   * promotion gate, which compares Σrealized ÷ Σmodeled against the
+   * `maxSlippageRatio` cap. Optional → back-compat with snapshots persisted
+   * before the field existed (those keep the slippage check advisory).
+   */
+  realizedSlippage?: number;
+  /**
+   * TRA-536 — modeled slippage budget in account currency for this trade's
+   * entry fill: `slippageBps/10000 × entryNotional`, using the same 5 bps
+   * per-fill assumption the backtest cost model charges (crypto
+   * `CRYPTO_SLIPPAGE_BPS`, equity `backtest-equity` `SLIPPAGE_BPS`). The gate
+   * divides realized by this to detect live fills that drift materially worse
+   * than the cost model assumed. Optional for the same back-compat reason as
+   * {@link realizedSlippage}.
+   */
+  modeledSlippage?: number;
 }
 
 /**

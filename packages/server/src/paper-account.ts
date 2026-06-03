@@ -5,6 +5,16 @@ import { logger } from './observability/index.js';
 
 const log = logger.child({ module: 'paper-account' });
 
+/**
+ * TRA-536 — per-fill modeled slippage assumption for equity paper fills, in
+ * basis points of notional. Mirrors `SLIPPAGE_BPS` in `backtest-equity.ts` so
+ * the demo book's modeled slippage budget matches what the equity backtest
+ * charges (commission-free brokers; slippage alone captures the drag). Used to
+ * stamp `Position.modeledSlippage` at open for the TRA-532 Stage-2 gate.
+ */
+export const STOCK_SLIPPAGE_BPS = 5;
+const STOCK_SLIPPAGE_RATE = STOCK_SLIPPAGE_BPS / 10_000;
+
 interface PaperAccountConfig {
   initialEquity?: number;
   managedAccountRatio?: number;
@@ -162,6 +172,17 @@ export class PaperAccount {
     }
 
     this.cash -= cost;
+    // TRA-536 — stamp realized vs modeled entry slippage so the Stage-2
+    // promotion gate can enforce its realized-≤-1.5×-modeled check. Realized =
+    // how far the live fill (`currentPrice`) drifted from the price the
+    // strategy intended (`signal.entryPrice`); modeled = the 5 bps per-fill
+    // budget the equity backtest charges. Guard against a non-finite signal
+    // entry so we never write NaN onto the snapshot.
+    const intendedEntry = signal.entryPrice;
+    const realizedSlippage = Number.isFinite(intendedEntry)
+      ? Math.abs(currentPrice - intendedEntry) * qty
+      : undefined;
+    const modeledSlippage = realizedSlippage === undefined ? undefined : STOCK_SLIPPAGE_RATE * currentPrice * qty;
     const position: Position = {
       id: randomUUID(),
       symbol: signal.symbol,
@@ -173,6 +194,7 @@ export class PaperAccount {
       stopLoss: signal.stopLoss,
       takeProfit: signal.takeProfit,
       openedAt: Date.now(),
+      ...(realizedSlippage !== undefined ? { realizedSlippage, modeledSlippage } : {}),
     };
     this.positions.set(position.id, position);
     return position;

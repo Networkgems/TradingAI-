@@ -1,6 +1,6 @@
 import { describe, it, expect, vi } from 'vitest';
 import type { TradeSignal } from '@trading-app/shared';
-import { CryptoPaperAccount, CRYPTO_MAX_EQUITY } from './crypto-account.js';
+import { CryptoPaperAccount, CRYPTO_MAX_EQUITY, CRYPTO_SLIPPAGE_BPS } from './crypto-account.js';
 
 function buildSignal(overrides: Partial<TradeSignal> = {}): TradeSignal {
   return {
@@ -142,5 +142,28 @@ describe('CryptoPaperAccount.enforceEquityInvariant (TRA-330)', () => {
     expect(acct.enforceEquityInvariant(25_000)).toBe(true);
     warn.mockRestore();
     expect(acct.getState().availableCash).toBe(25_000);
+  });
+});
+
+describe('CryptoPaperAccount slippage instrumentation (TRA-536)', () => {
+  it('stamps realized (fill-vs-intended drift) and modeled (5 bps budget) slippage at open', () => {
+    const acct = new CryptoPaperAccount(25_000);
+    // Intended entry 100; live Coinbase fill drifts to 100.4.
+    const signal = buildSignal({ entryPrice: 100, stopLoss: 95, takeProfit: 110 });
+    const opened = acct.openPosition(signal, 100.4);
+    expect(opened).not.toBeNull();
+    const qty = opened!.quantity;
+    expect(opened!.realizedSlippage).toBeCloseTo(Math.abs(100.4 - 100) * qty, 9);
+    expect(opened!.modeledSlippage).toBeCloseTo((CRYPTO_SLIPPAGE_BPS / 10_000) * 100.4 * qty, 9);
+  });
+
+  it('carries both slippage figures through the close onto the realized position', () => {
+    const acct = new CryptoPaperAccount(25_000);
+    const signal = buildSignal({ entryPrice: 100, stopLoss: 95, takeProfit: 110 });
+    const opened = acct.openPosition(signal, 100.4);
+    const closed = acct.checkExits(new Map([['BTC-USD', 110]]));
+    expect(closed).toHaveLength(1);
+    expect(closed[0].realizedSlippage).toBeCloseTo(opened!.realizedSlippage!, 9);
+    expect(closed[0].modeledSlippage).toBeCloseTo(opened!.modeledSlippage!, 9);
   });
 });

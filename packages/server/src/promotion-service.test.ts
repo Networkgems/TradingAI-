@@ -128,3 +128,57 @@ describe('TRA-532 promotion gate — end-to-end enforcement', () => {
     expect(m?.expectancy).toBeGreaterThan(0.5);
   });
 });
+
+// TRA-536 — the paper fill paths now stamp realized/modeled slippage on each
+// closed Position. Once present in the ledger the Stage-2 slippage check stops
+// being advisory: the gate computes a non-null ratio and hard-fails a strategy
+// whose realized slippage runs above 1.5× modeled.
+describe('TRA-536 promotion gate — slippage check enforces once instrumented', () => {
+  const SLIP_USER = 'carol';
+
+  function slipTrade(pnl: number, i: number, realized: number, modeled: number): Position {
+    return { ...paperTrade(pnl, i), id: `s${i}`, realizedSlippage: realized, modeledSlippage: modeled };
+  }
+
+  it('surfaces a non-null slippageRatio and blocks when realized > 1.5× modeled', async () => {
+    // 60 monitored bb_fade trades that clear count / expectancy / Sharpe, but
+    // each fill drifted 2× the modeled budget → ratio 2.0 > 1.5 cap.
+    const closed = Array.from({ length: 60 }, (_, i) => slipTrade(i % 6 === 0 ? -0.5 : 1.5, i, 2, 1));
+    await tradeStore.saveCryptoTradeSnapshot(SLIP_USER, {
+      version: 1,
+      savedAt: new Date().toISOString(),
+      openPositions: [],
+      closedPositions: closed,
+      demoClosedPositions: closed,
+      recentSignals: [],
+      account: { cash: 25_000, equity: 25_000, initialEquity: 25_000, openingEquityToday: 25_000 },
+    });
+
+    const status = await svc.buildPromotionStatus(SLIP_USER, 'bb_fade');
+    // backtest + sign-off were registered globally for bb_fade earlier, so the
+    // only thing that can block this user is the paper slippage check.
+    expect(status.paper.metrics?.slippageRatio).toBeCloseTo(2, 6);
+    expect(status.paper.metrics?.slippageSampleSize).toBe(60);
+    expect(status.paper.state).toBe('fail');
+    expect(status.paper.failedChecks.join(' ')).toMatch(/realized slippage .*modeled/i);
+    expect(status.canGoLive).toBe(false);
+  });
+
+  it('passes the slippage check when realized stays within the 1.5× cap', async () => {
+    const closed = Array.from({ length: 60 }, (_, i) => slipTrade(i % 6 === 0 ? -0.5 : 1.5, i, 1, 1));
+    await tradeStore.saveCryptoTradeSnapshot(SLIP_USER, {
+      version: 1,
+      savedAt: new Date().toISOString(),
+      openPositions: [],
+      closedPositions: closed,
+      demoClosedPositions: closed,
+      recentSignals: [],
+      account: { cash: 25_000, equity: 25_000, initialEquity: 25_000, openingEquityToday: 25_000 },
+    });
+
+    const status = await svc.buildPromotionStatus(SLIP_USER, 'bb_fade');
+    expect(status.paper.metrics?.slippageRatio).toBeCloseTo(1, 6);
+    expect(status.paper.failedChecks.join(' ')).not.toMatch(/slippage/i);
+    expect(status.paper.state).toBe('pass');
+  });
+});

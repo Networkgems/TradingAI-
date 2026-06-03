@@ -23,8 +23,11 @@ const log = logger.child({ module: 'promotion-service' });
  * A closed position maps to a {@link PromotionTradeSample} 1:1 — `Position`
  * already carries `pnl`, `entryPrice`, `stopLoss`, `quantity`, and the
  * `openedAt`/`closedAt` timestamps the gate needs to annualize the paper
- * Sharpe (TRA-538). Slippage fields are absent on today's `Position` shape, so
- * the slippage check stays advisory (see promotion-gate `evaluatePaperGate`).
+ * Sharpe (TRA-538). TRA-536 added per-trade `realizedSlippage`/`modeledSlippage`
+ * to the paper fill paths; passing them through here populates the gate's
+ * slippage ratio, flipping the Stage-2 slippage check from advisory to
+ * enforced for any strategy whose trades carry both figures. Positions from
+ * snapshots predating TRA-536 leave the fields undefined and stay advisory.
  */
 function toSample(p: Position): PromotionTradeSample {
   return {
@@ -34,6 +37,8 @@ function toSample(p: Position): PromotionTradeSample {
     quantity: p.quantity,
     openedAt: p.openedAt,
     closedAt: p.closedAt,
+    realizedSlippage: p.realizedSlippage,
+    modeledSlippage: p.modeledSlippage,
   };
 }
 

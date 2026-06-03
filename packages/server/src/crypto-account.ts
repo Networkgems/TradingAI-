@@ -209,6 +209,17 @@ export class CryptoPaperAccount {
       // short's fee-aware PnL, keeping cash and equity in lock-step.
       this.cash += notional - entryFee;
     }
+    // TRA-536 — stamp realized vs modeled entry slippage for the Stage-2
+    // promotion gate. Realized = drift between the strategy's intended entry
+    // (`signal.entryPrice`) and the live Coinbase fill (`currentPrice`);
+    // modeled = the CRYPTO_SLIPPAGE_BPS (5 bps) per-fill budget the backtest
+    // cost model charges. Guard a non-finite signal entry so we never write
+    // NaN onto the persisted snapshot.
+    const intendedEntry = signal.entryPrice;
+    const realizedSlippage = Number.isFinite(intendedEntry)
+      ? Math.abs(currentPrice - intendedEntry) * qty
+      : undefined;
+    const modeledSlippage = realizedSlippage === undefined ? undefined : SLIPPAGE_RATE * currentPrice * qty;
     const position: Position = {
       id: randomUUID(),
       symbol: signal.symbol,
@@ -221,6 +232,7 @@ export class CryptoPaperAccount {
       takeProfit: signal.takeProfit,
       openedAt: Date.now(),
       quoteSource,
+      ...(realizedSlippage !== undefined ? { realizedSlippage, modeledSlippage } : {}),
     };
     this.positions.set(position.id, position);
     return position;
