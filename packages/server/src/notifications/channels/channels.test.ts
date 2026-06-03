@@ -56,7 +56,9 @@ describe('EmailChannelAdapter', () => {
   });
 
   it('sends a rendered message to the resolved address', async () => {
-    const sendMail = vi.fn(async () => {});
+    const sendMail = vi.fn(
+      async (_opts: { to: string; subject: string; text: string; html?: string }) => {},
+    );
     const a = new EmailChannelAdapter({
       sendMail,
       resolveLoginEmail: () => 'login@x.com',
@@ -91,7 +93,7 @@ describe('TelegramChannelAdapter', () => {
   });
 
   it('POSTs sendMessage with the chat id and rendered text', async () => {
-    const fetchFn = vi.fn(async () => okResponse());
+    const fetchFn = vi.fn(async (_url: string | URL | Request, _init?: RequestInit) => okResponse());
     const a = new TelegramChannelAdapter({ botToken: 'BOTTOK', fetchFn, now: () => TS });
     const prefs = prefsWith((p) => {
       p.channels.telegram.telegramChatId = '999';
@@ -137,7 +139,7 @@ describe('DiscordChannelAdapter', () => {
   });
 
   it('POSTs the rendered text as webhook content', async () => {
-    const fetchFn = vi.fn(async () => okResponse());
+    const fetchFn = vi.fn(async (_url: string | URL | Request, _init?: RequestInit) => okResponse());
     const a = new DiscordChannelAdapter({ fetchFn, now: () => TS });
     const prefs = prefsWith((p) => { p.channels.discord.discordWebhookUrl = goodUrl; });
     await a.send(exitEvent, prefs);
