@@ -227,13 +227,21 @@ export function validateBracket(
  *   - `trailing`     trailing-stop ratchet exited (incl. break-even after +Nx ATR)
  *   - `rsi_alt_exit` mean-reversion alternate exit (RSI re-crossed 50 from
  *                    the entry-side extreme, beating the BB-middle target)
+ *   - `invalid_bracket` TRA-518 — self-heal close of a position whose protective
+ *                    bracket was structurally invalid (negative/NaN stop or
+ *                    target, or on the wrong side of entry; predates the
+ *                    TRA-520 `validateBracket` guard). Such a bracket can never
+ *                    hit stop or target, so the position would otherwise stay
+ *                    open forever ("demo account never closes anything"). The
+ *                    monitor force-closes it at the live price.
  */
 export type ExitReason =
   | 'stop'
   | 'target'
   | 'time_stop'
   | 'trailing'
-  | 'rsi_alt_exit';
+  | 'rsi_alt_exit'
+  | 'invalid_bracket';
 
 export interface Position {
   id: string;

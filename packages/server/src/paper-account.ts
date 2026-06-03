@@ -184,6 +184,34 @@ export class PaperAccount {
       const price = prices.get(pos.symbol);
       if (price == null) continue;
 
+      // TRA-518 — self-heal: a position whose protective bracket is structurally
+      // invalid (negative/NaN stop or target, or sitting on the wrong side of
+      // entry) can never satisfy the stop/target comparisons below, so it would
+      // stay open forever — the "demo account never closes anything / nothing
+      // updates" symptom. These brackets predate the TRA-520 `validateBracket`
+      // guard (observed live: ASTC stopLoss=-0.215, PRFX takeProfit=-0.04).
+      // Force-close at the live price so the book unfreezes and the bad data is
+      // purged; healthy brackets pass validateBracket and are untouched.
+      const bracket = validateBracket(pos.side, pos.entryPrice, pos.stopLoss, pos.takeProfit);
+      if (!bracket.ok) {
+        const healed = this.closePosition(id, price);
+        if (healed) {
+          healed.exitReason = 'invalid_bracket';
+          log.warn('force-closed position with invalid bracket (TRA-518 self-heal)', {
+            positionId: id,
+            symbol: pos.symbol,
+            side: pos.side,
+            entryPrice: pos.entryPrice,
+            stopLoss: pos.stopLoss,
+            takeProfit: pos.takeProfit,
+            exitPrice: price,
+            reason: bracket.reason,
+          });
+          closed.push(healed);
+        }
+        continue;
+      }
+
       let hit: 'tp' | 'sl' | null = null;
       if (pos.side === 'buy') {
         if (price >= pos.takeProfit) hit = 'tp';
