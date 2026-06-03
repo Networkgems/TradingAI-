@@ -35,6 +35,25 @@ export {
   recordBootAndCheckRestarts,
   checkTradeVolume,
   checkErrorSpike,
+  checkStaleState,
   __resetAlertsForTest,
 } from './alerts.js';
 export type { Alert, AlertKey, AlertSeverity, DiskReading } from './alerts.js';
+
+// TRA-528 — live reliability + observability dashboard.
+export { resolveBuildInfo, computeBuildInfo, interpretGitHead } from './build-info.js';
+export type { BuildInfo, BuildInfoInputs } from './build-info.js';
+export {
+  summarizeLiveHealth,
+  summarizeFeed,
+  MAX_TICK_AGE_MS,
+} from './live-health.js';
+export type {
+  LiveHealthSummary,
+  LiveHealthInput,
+  LiveHealthSymbol,
+  FeedHealth,
+  HealthStatus,
+} from './live-health.js';
+export { registerLiveHealthRoutes, runStaleStateCheck } from './health-routes.js';
+export type { LiveHealthDeps, HealthUserContext, HealthEngineLike } from './health-routes.js';

@@ -24,7 +24,8 @@ export type AlertKey =
   | 'disk-near-full'
   | 'restart-storm'
   | 'trade-volume-zero'
-  | 'error-spike';
+  | 'error-spike'
+  | 'stale-state';
 
 export type AlertSeverity = 'warning' | 'critical';
 
@@ -271,4 +272,41 @@ export function checkErrorSpike(errorCount: number, threshold = Number(process.e
     errorCount,
     threshold,
   });
+}
+
+/**
+ * TRA-528 — alert when the market-data feed has gone stale while the market is
+ * open. This is the direct detector for the recurring "nothing works in Live"
+ * incident: the engine is up and `/api/health` is green, but no fresh quotes
+ * are landing, so no signals fire and the desk silently stops trading.
+ *
+ * Fires a critical alert only when ALL of:
+ *   - the market is open (a stale feed after hours is expected, not an incident);
+ *   - the engine is tracking at least one symbol;
+ *   - not one tracked symbol carries a fresh quote (`freshSymbols === 0`).
+ *
+ * Throttled on the `stale-state` key like every other alert, so a sustained
+ * outage produces one alert per window rather than one per monitor tick.
+ */
+export function checkStaleState(opts: {
+  marketOpen: boolean;
+  trackedSymbols: number;
+  freshSymbols: number;
+  mode?: string;
+  lastTickAgeSec?: number | null;
+}): boolean {
+  if (!opts.marketOpen) return false;
+  if (opts.trackedSymbols <= 0) return false;
+  if (opts.freshSymbols > 0) return false;
+  return dispatchAlert(
+    'stale-state',
+    'critical',
+    `Market open but 0/${opts.trackedSymbols} tracked symbols have a fresh quote — data feed appears stale`,
+    {
+      mode: opts.mode ?? 'unknown',
+      trackedSymbols: opts.trackedSymbols,
+      freshSymbols: opts.freshSymbols,
+      lastTickAgeSec: opts.lastTickAgeSec ?? null,
+    },
+  );
 }

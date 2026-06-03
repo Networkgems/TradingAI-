@@ -66,6 +66,8 @@ import {
   recordBootAndCheckRestarts,
   checkTradeVolume,
   checkErrorSpike,
+  registerLiveHealthRoutes,
+  runStaleStateCheck,
 } from './observability/index.js';
 import { rotateBackups, checkDataDirHealth } from './trade-store.js';
 import { TradierRelativeValueScannerService } from './relative-value-scanner.js';
@@ -1079,6 +1081,14 @@ async function runChainRecord(): Promise<void> {
 app.get('/api/health', (_req, res) => {
   res.json({ ok: true, time: new Date().toISOString() });
 });
+
+// TRA-528 — live reliability + observability surface:
+//   GET /api/health/version  → deploy-version pinning (commit/build/uptime).
+//   GET /api/health/live     → consolidated GREEN/YELLOW/RED Live verdict
+//                              (mode, broker auth, feed freshness, halt, build).
+// Handlers + the monitor's stale-state probe live in observability/health-routes
+// so this file only injects the request-scoped deps it owns.
+registerLiveHealthRoutes(app, { requireAuth, userCtx, getSettings });
 
 // TRA-406 — observability surface. Returns the recent in-memory alerts and the
 // 15-minute captured-error count so QA / ops can see incident state without
@@ -3426,6 +3436,11 @@ async function runObservabilityMonitor(): Promise<void> {
     etHour: Number.isFinite(etHour) ? etHour : 0,
     isMarketDay: isMarketDay(now),
   });
+
+  // TRA-528 — stale-state probe. Walk live user engines and raise the
+  // `stale-state` alert if the market is open but no fresh quotes are landing —
+  // the direct detector for "nothing works in Live" (engine up, feed dead).
+  runStaleStateCheck(getAllUserContexts(), getSettings, now.getTime());
 }
 
 // ── Start ────────────────────────────────────────────────────────────────────
