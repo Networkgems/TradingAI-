@@ -9,13 +9,33 @@ scaling and alert response.
 
 ## 1. Production topology
 
-> **TRA-444 (CTO decision, 2026-05-17):** production runs **self-hosted under
-> PM2**, not on Render. The Render service that earlier docs named
-> (`https://tradingai-server.onrender.com`) is **unprovisioned** — it returns
-> `x-render-routing: no-server`. [`render.yaml`](../render.yaml) is retained
-> only as an optional, not-currently-deployed blueprint (see its file header).
-> This section is authoritative; the alternative Render flow is called out
-> inline only where it differs.
+> **TRA-547 (CTO update, 2026-06-03) — READ FIRST, supersedes the TRA-444 note
+> below on the public-backend question.** The public TradeAI site
+> (<https://networkgems.github.io/TradingAI-/>, GitHub Pages) is now served by a
+> **live Render backend at `https://tradingai-bqb1.onrender.com`**
+> (`wss://tradingai-bqb1.onrender.com` for the WebSocket bus) — verified
+> `GET /api/health → {ok:true}` on 2026-06-03. This is the **canonical public
+> backend URL**; it is the single hardcoded fallback in
+> [`apps/desktop/src/server-url.ts`](../apps/desktop/src/server-url.ts)
+> (`PROD_BACKEND_URL`) and the CI `VITE_SERVER_URL` secret. The old name
+> `tradingai-server.onrender.com` is **dead (404)** — do not reference it.
+>
+> ⚠️ **Open reconciliation (owner confirmation needed):** the PM2 self-host on
+> `PG-DEVOPS14` (below) and this Render service must not both run against the
+> **same broker credentials** (the app is not multi-instance safe — see
+> §1 "Topology"). Confirm which instance owns live broker credentials and retire
+> or de-credential the other. Until that is confirmed, treat Render bqb1 as the
+> **public read/UI backend** and do not point a second live trading instance at
+> the same Tradier account.
+>
+> ---
+>
+> **TRA-444 (CTO decision, 2026-05-17) — historical, see TRA-547 above:**
+> production ran **self-hosted under PM2**, not on Render, and the Render service
+> that earlier docs named (`https://tradingai-server.onrender.com`) was
+> **unprovisioned**. [`render.yaml`](../render.yaml) is retained as a blueprint
+> (see its file header). The PM2 operational detail below remains accurate for
+> the self-hosted instance; the public backend is now Render bqb1 per TRA-547.
 
 - **Host:** `PG-DEVOPS14` — a single company-operated Windows workstation. The
   server is a self-hosted Node process managed by **PM2**

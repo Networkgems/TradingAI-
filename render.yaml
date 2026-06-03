@@ -1,21 +1,28 @@
 # ─────────────────────────────────────────────────────────────────────────────
-# Render Blueprint — OPTIONAL / NOT THE CURRENT PRODUCTION TARGET (TRA-444)
+# Render Blueprint
 #
-# As of 2026-05-17 no Render service is provisioned from this blueprint:
-# `https://tradingai-server.onrender.com` returns `x-render-routing: no-server`.
-# Production currently runs as a self-hosted PM2 process — see `docs/runbook.md`
-# §1 and `ecosystem.config.cjs`.
+# TRA-547 UPDATE (2026-06-03): a Render service IS now live and is the backend
+# for the public GitHub Pages site — `https://tradingai-bqb1.onrender.com`
+# (health verified `GET /api/health → {ok:true}`). The canonical public backend
+# URL is recorded in `apps/desktop/src/server-url.ts` (`PROD_BACKEND_URL`) and
+# the CI `VITE_SERVER_URL` secret. The `name:` below is now `tradingai-bqb1`
+# to MATCH the live service (Render derives the hostname from the service
+# name). The earlier name (`tradingai-server.onrender.com`) is dead (404); do
+# not revert `name:` to it or a re-applied blueprint will provision a SECOND,
+# empty service instead of updating the live one.
 #
-# CTO decision (TRA-444): reconcile — production is self-hosted PM2, not Render.
-# This file is kept as a ready-to-use blueprint should the company later choose
-# to host on Render (a Blueprint deploy picks it up, auto-deploys from `main`,
-# and provisions the 1 GB `/data` disk). Until then it is NOT live — do not
-# document it as the production host, and never run it alongside the
-# self-hosted instance (the app is not multi-instance safe).
+# ⚠️ Not multi-instance safe: never run this Render service AND the self-hosted
+# PM2 process (`docs/runbook.md` §1) against the same broker credentials. The
+# PM2-vs-Render ownership reconciliation is an open item — see the TRA-547 note
+# in `docs/runbook.md` §1.
+#
+# Historical (TRA-444, 2026-05-17): at that time no Render service was
+# provisioned and production ran self-hosted under PM2. Superseded by the
+# TRA-547 update above for the public-backend question.
 # ─────────────────────────────────────────────────────────────────────────────
 services:
   - type: web
-    name: tradingai-server
+    name: tradingai-bqb1
     runtime: node
     plan: starter
     buildCommand: pnpm install --frozen-lockfile && pnpm run web:build

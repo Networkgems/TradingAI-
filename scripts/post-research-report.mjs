@@ -4,7 +4,7 @@
 //
 // Usage (env-only, body from stdin):
 //
-//   API_BASE=https://tradingai-server.onrender.com \
+//   API_BASE=https://tradingai-bqb1.onrender.com \
 //   ADMIN_USERNAME=admin ADMIN_PASSWORD=… \
 //   node scripts/post-research-report.mjs \
 //     --kind=premarket --title="Pre-Market Prep — Mon 2026-05-04" \
