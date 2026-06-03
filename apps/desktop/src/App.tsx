@@ -7,6 +7,8 @@ import { ThemeToggle, useTheme } from './components/ThemeToggle';
 import { DashboardSelector } from './components/DashboardSelector';
 import { SkippedSignalsPanel } from './components/SkippedSignalsPanel';
 export { SkippedSignalsPanel };
+import { OnboardingGate } from './components/onboarding/OnboardingGate';
+import { ONBOARDING_DEEP_LINK_KEY, OPEN_BROKER_SETTINGS_EVENT } from './lib/onboarding-deep-link';
 import CryptoDashboard from './CryptoDashboard';
 import Dashboard from './Dashboard';
 import './index.css';
@@ -94,6 +96,20 @@ export default function App() {
     setAppMode(null);
   }
 
+  // TRA-565 — onboarding step 2 "Open broker settings" deep-link. Brokers live
+  // inside a dashboard's Settings modal, so we drop a breadcrumb and either
+  // (a) mount the stocks dashboard if the user is still on the home selector —
+  // the dashboard reads the breadcrumb on mount and pops Settings, or
+  // (b) fire an event the already-mounted dashboard listens for.
+  function handleConnectBroker() {
+    localStorage.setItem(ONBOARDING_DEEP_LINK_KEY, 'brokers');
+    if (appMode === null) {
+      selectMode('stocks');
+    } else {
+      window.dispatchEvent(new CustomEvent(OPEN_BROKER_SETTINGS_EVENT));
+    }
+  }
+
   const floatingToggle = (
     <div className="theme-toggle-floating">
       <ThemeToggle theme={theme} onToggle={toggleTheme} />
@@ -136,6 +152,7 @@ export default function App() {
   return (
     <>
       {mainContent}
+      <OnboardingGate token={token} onConnectBroker={handleConnectBroker} />
       {idleWarning && (
         <div className="idle-warning-banner">
           <span>You've been idle — you'll be signed out automatically in 2 minutes.</span>

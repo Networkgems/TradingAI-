@@ -4,9 +4,13 @@
 // hooks; this file now only owns the tab + profile-modal state and wires the
 // pieces together. Behaviour (toast feedback, focus-trapped close drawer, sort
 // hooks, backoff/validation libs from TRA-419) carries through unchanged.
-import { useState } from 'react';
+import { useEffect, useState } from 'react';
 import type { LiveCredentialField } from '@trading-app/shared';
 import { HTTP_URL } from './server-url';
+import {
+  consumeBrokerDeepLink,
+  OPEN_BROKER_SETTINGS_EVENT,
+} from './lib/onboarding-deep-link';
 import { ErrorBoundary } from './ErrorBoundary.tsx';
 import { CalendarTab } from './CalendarTab.tsx';
 import type { Theme } from './components/ThemeToggle';
@@ -32,6 +36,22 @@ export default function Dashboard({ token, onLogout, onGoHome, onActivity, theme
   // focused. Tracked here so the modal can read it on open and clear it
   // on close, without leaking the focus hint into the URL.
   const [focusCredField, setFocusCredField] = useState<LiveCredentialField | null>(null);
+
+  // TRA-565 — onboarding "Open broker settings" deep-link. Open Settings when
+  // a breadcrumb is pending on mount (the dashboard was just mounted by the
+  // wizard) or when an already-mounted dashboard receives the event.
+  useEffect(() => {
+    function openBrokerSettings() {
+      setProfileModal('settings');
+    }
+    if (consumeBrokerDeepLink()) openBrokerSettings();
+    const onEvent = () => {
+      consumeBrokerDeepLink();
+      openBrokerSettings();
+    };
+    window.addEventListener(OPEN_BROKER_SETTINGS_EVENT, onEvent);
+    return () => window.removeEventListener(OPEN_BROKER_SETTINGS_EVENT, onEvent);
+  }, []);
 
   const {
     state, connected, news, isAdmin,

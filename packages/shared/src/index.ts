@@ -1068,6 +1068,41 @@ export interface AccountSettings {
    * {@link resolveAlertPreferences} so partial saves are filled from defaults.
    */
   alertPreferences?: AlertPreferences;
+  /**
+   * TRA-565 (TRA-410 C1) — first-run onboarding state. `onboardingCompletedAt`
+   * is the ISO timestamp the user finished (or skipped) the welcome wizard;
+   * absent ↔ the wizard has never been completed, which is the first-run
+   * signal the desktop app uses to show {@link WizardModal}. `onboardingVersion`
+   * records which wizard revision they saw so a future "what's new" pass can
+   * re-trigger by bumping {@link CURRENT_ONBOARDING_VERSION} without resetting
+   * the completion flag. Both are intentionally absent from
+   * {@link DEFAULT_ACCOUNT_SETTINGS} so every user (new or pre-existing) starts
+   * unset and is shown the wizard exactly once. Resolve via
+   * {@link isOnboardingComplete}.
+   */
+  onboardingCompletedAt?: string;
+  onboardingVersion?: number;
+}
+
+/**
+ * TRA-565 — current first-run wizard revision. Bump this when the onboarding
+ * flow changes materially enough to re-show it to users who already finished an
+ * older version (a "what's new" pass). {@link isOnboardingComplete} treats a
+ * saved `onboardingVersion` below this number as "not complete".
+ */
+export const CURRENT_ONBOARDING_VERSION = 1;
+
+/**
+ * TRA-565 — true when the user has completed a wizard run at least as recent as
+ * {@link CURRENT_ONBOARDING_VERSION}. Used by the desktop app to decide whether
+ * to show the first-run wizard. Unset completion, or a completion recorded
+ * against an older wizard version, both count as "not complete" → show wizard.
+ */
+export function isOnboardingComplete(
+  s: Pick<AccountSettings, 'onboardingCompletedAt' | 'onboardingVersion'> | null | undefined,
+): boolean {
+  if (!s || !s.onboardingCompletedAt) return false;
+  return (s.onboardingVersion ?? 0) >= CURRENT_ONBOARDING_VERSION;
 }
 
 export const DEFAULT_ACCOUNT_SETTINGS: AccountSettings = {
