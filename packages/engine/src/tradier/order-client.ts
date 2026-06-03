@@ -193,25 +193,37 @@ export class TradierOrderClient {
    * an OCO pair of take-profit (limit) and stop-loss (stop).
    */
   async submitBracketOrder(params: TradierBracketOrderParams): Promise<TradierOrderResponse> {
+    // Tradier OTOCO orders are multileg: the underlying symbol and duration are
+    // specified PER LEG (`symbol[n]` / `duration[n]`), not once at the top level,
+    // and equity legs must NOT carry an `option_symbol[n]`. Sending a single
+    // top-level `symbol` makes Tradier reject the order with
+    // "Invalid parameter, symbol: is not valid" (TRA-553 sandbox validation).
+    // Entry is `day`; the protective OCO legs are `gtc` so take-profit/stop-loss
+    // stay working until one fills and cancels the other (a position can be held
+    // past the session).
+    const closeSide = params.side === 'buy' ? 'sell' : 'buy';
     const body = new URLSearchParams({
       class: 'otoco',
-      symbol: params.symbol,
-      duration: 'day',
-      // Leg 0 — entry
+      // Leg 0 — entry (limit)
+      'symbol[0]': params.symbol,
       'side[0]': params.side,
       'quantity[0]': String(params.qty),
       'type[0]': 'limit',
+      'duration[0]': 'day',
       'price[0]': params.limitPrice.toFixed(2),
-      'option_symbol[0]': '',
-      // Leg 1 — take profit (close)
-      'side[1]': params.side === 'buy' ? 'sell' : 'buy',
+      // Leg 1 — take profit (limit close), OCO with leg 2
+      'symbol[1]': params.symbol,
+      'side[1]': closeSide,
       'quantity[1]': String(params.qty),
       'type[1]': 'limit',
+      'duration[1]': 'gtc',
       'price[1]': params.takeProfitPrice.toFixed(2),
-      // Leg 2 — stop loss (close)
-      'side[2]': params.side === 'buy' ? 'sell' : 'buy',
+      // Leg 2 — stop loss (stop close), OCO with leg 1
+      'symbol[2]': params.symbol,
+      'side[2]': closeSide,
       'quantity[2]': String(params.qty),
       'type[2]': 'stop',
+      'duration[2]': 'gtc',
       'stop[2]': params.stopLossPrice.toFixed(2),
     });
 

@@ -85,15 +85,30 @@ describe('TradierOrderClient', () => {
 
     const params = new URLSearchParams(callInit(0).body as string);
     expect(params.get('class')).toBe('otoco');
-    expect(params.get('symbol')).toBe('AAPL');
+    // OTOCO is multileg: symbol + duration are per-leg, there is NO top-level
+    // `symbol`, and equity legs carry no `option_symbol` (TRA-553).
+    expect(params.get('symbol')).toBeNull();
+    expect(params.get('option_symbol[0]')).toBeNull();
+    // Leg 0 — entry
+    expect(params.get('symbol[0]')).toBe('AAPL');
     expect(params.get('side[0]')).toBe('buy');
     expect(params.get('quantity[0]')).toBe('10');
     expect(params.get('type[0]')).toBe('limit');
+    expect(params.get('duration[0]')).toBe('day');
     expect(params.get('price[0]')).toBe('150.50');
+    // Leg 1 — take profit (OCO with leg 2)
+    expect(params.get('symbol[1]')).toBe('AAPL');
     expect(params.get('side[1]')).toBe('sell');
+    expect(params.get('quantity[1]')).toBe('10');
+    expect(params.get('type[1]')).toBe('limit');
+    expect(params.get('duration[1]')).toBe('gtc');
     expect(params.get('price[1]')).toBe('155.00');
+    // Leg 2 — stop loss (OCO with leg 1)
+    expect(params.get('symbol[2]')).toBe('AAPL');
     expect(params.get('side[2]')).toBe('sell');
+    expect(params.get('quantity[2]')).toBe('10');
     expect(params.get('type[2]')).toBe('stop');
+    expect(params.get('duration[2]')).toBe('gtc');
     expect(params.get('stop[2]')).toBe('148.00');
   });
 
