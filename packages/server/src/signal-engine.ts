@@ -370,6 +370,14 @@ export class SignalEngine {
    * hard dependency on the notification subsystem.
    */
   private alertUsername: string | undefined;
+  /**
+   * TRA-572 — unique key for this engine's slot in the process-global stock
+   * quote feed registry (yahoo-feed). Keying per engine means a credential-less
+   * context clearing its own Tradier token can never evict another engine's
+   * working feed, which previously took stock quotes dark process-wide.
+   */
+  private static feedContextSeq = 0;
+  private readonly feedContextKey = `engine-${(SignalEngine.feedContextSeq += 1)}`;
   private readonly tracker: PnlTracker | undefined;
   /**
    * TRA-191 — only enabled options scanner for stock options. ATM-per-equity-
@@ -1013,7 +1021,9 @@ export class SignalEngine {
    */
   private applyTradierQuoteFeed(settings: AccountSettings): void {
     const creds = resolveTradierOptionsCreds(settings);
-    setTradierStocksFeedClient(creds.apiToken, creds.env);
+    // TRA-572 — register under this engine's own key so a credential-less
+    // context never evicts another engine's working quote feed.
+    setTradierStocksFeedClient(creds.apiToken, creds.env, this.feedContextKey);
   }
 
   private async doTick(): Promise<void> {

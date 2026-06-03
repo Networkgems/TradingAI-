@@ -107,12 +107,12 @@ const TRADIER_API_TOKEN = TRADIER_ENV === 'production'
   ? (process.env['TRADIER_API_TOKEN'] ?? '')
   : (process.env['TRADIER_SANDBOX_API_TOKEN'] ?? process.env['TRADIER_API_TOKEN'] ?? '');
 
-let tradierStocksClient: TradierStocksClient | null =
-  TRADIER_API_TOKEN ? new TradierStocksClient(TRADIER_API_TOKEN, TRADIER_ENV) : null;
-
-if (!tradierStocksClient) {
-  console.warn('[yahoo-feed] Tradier stocks feed disabled (no TRADIER_*_API_TOKEN at boot) — using Yahoo as primary until settings supply a token');
-}
+// The stock quote client is a process-global singleton. Its token can come from
+// the boot env (seeded below) and/or from each logged-in user's saved Tradier
+// creds (wired per engine via setTradierStocksFeedClient). See the multi-tenant
+// note on that setter (TRA-572) for why tokens are tracked per context key
+// instead of a single mutable slot.
+let tradierStocksClient: TradierStocksClient | null = null;
 
 const TRADIER_BREAKER_COOLDOWN_MS = 90_000;
 let tradierBlockedUntil = 0;
@@ -128,36 +128,90 @@ export function isTradierStocksConfigured(): boolean {
   return tradierStocksClient !== null;
 }
 
-// ── TRA-505: wire the quote feed to the live UI creds ─────────────────────────
-// The Tradier client above is seeded ONCE at module load from the TRADIER_*
-// env vars. But the live app writes the user's Tradier creds into per-user
-// account-settings (via the Settings page), NOT env — so on a normal deployment
-// `TRADIER_API_TOKEN` is empty and this feed has no Tradier source, even after
-// the user has a fully working Tradier production connection (balance + trades).
-// Quotes then fall through to Yahoo Finance's free per-IP feed, which 429s and
-// trips the breaker, surfacing "Quote unavailable — provider rate-limited" on
-// the watchlist. The signal-engine calls the setter below from applySettings so
+// ── TRA-505 / TRA-572: wire the quote feed to live UI creds, multi-tenant-safe ─
+// TRA-505: the live app writes each user's Tradier creds into per-user account
+// settings (Settings page), NOT env — so on a normal deployment `TRADIER_API_TOKEN`
+// is empty and the feed has no Tradier source even after the user has a working
+// Tradier production connection (balance + trades). Quotes then fall through to
+// Yahoo's free per-IP feed, which 429s and surfaces "Quote unavailable — provider
+// rate-limited". The signal-engine calls the setter below from applySettings so
 // quotes flow through the SAME Tradier account that already powers trading.
-let tradierFeedToken = TRADIER_API_TOKEN;
+//
+// TRA-572: but `tradierStocksClient` is a PROCESS-GLOBAL singleton shared by every
+// user context, while the token is supplied PER context. The old single-slot setter
+// let one credential-less context (e.g. a fresh demo signup with no Tradier token)
+// call this with an empty string and null the client for EVERY user — stock quotes
+// went dark process-wide and the watchlist showed "provider rate-limited" even
+// though another logged-in account had a perfectly good Tradier production feed.
+// We now track tokens per context key: clearing one context only removes ITS entry,
+// and the feed stays live as long as ANY context still supplies a token. Quotes are
+// read-only market data, so serving them from whichever context has a working token
+// is correct and account-agnostic. The boot env token (if any) registers under a
+// reserved key so a per-user clear can never evict it.
+const FEED_ENV_CONTEXT_KEY = '__env__';
+const feedTokensByContext = new Map<string, { token: string; env: TradierEnv }>();
+let tradierFeedToken = '';
 let tradierFeedEnv: TradierEnv = TRADIER_ENV;
-export function setTradierStocksFeedClient(token: string | null | undefined, env: TradierEnv): void {
-  const next = (token ?? '').trim();
-  if (next === tradierFeedToken && env === tradierFeedEnv) return;
-  tradierFeedToken = next;
-  tradierFeedEnv = env;
-  tradierStocksClient = next ? new TradierStocksClient(next, env) : null;
+
+/** Pick the token the shared feed should use: prefer a production data feed,
+ *  else any sandbox token. Returns null when no context supplies a token. */
+function pickActiveFeedToken(): { token: string; env: TradierEnv } | null {
+  let fallback: { token: string; env: TradierEnv } | null = null;
+  for (const entry of feedTokensByContext.values()) {
+    if (entry.env === 'production') return entry;
+    if (!fallback) fallback = entry;
+  }
+  return fallback;
+}
+
+/** Rebuild the singleton client from the best available context token, but only
+ *  when the effective (token, env) actually changes — so an unrelated context's
+ *  update never churns the breaker/cache of an unchanged active feed. */
+function reconcileTradierFeedClient(): void {
+  const active = pickActiveFeedToken();
+  const nextToken = active?.token ?? '';
+  const nextEnv = active?.env ?? tradierFeedEnv;
+  if (nextToken === tradierFeedToken && nextEnv === tradierFeedEnv) return;
+  tradierFeedToken = nextToken;
+  tradierFeedEnv = nextEnv;
+  tradierStocksClient = nextToken ? new TradierStocksClient(nextToken, nextEnv) : null;
   // A credential change earns Tradier an immediate retry: clear any breaker the
-  // old (empty/stale) token had tripped on a 401/429 so the very next tick can
-  // use the new token instead of staying on Yahoo for another cooldown window.
+  // old (empty/stale) token tripped on a 401/429 so the next tick uses the new
+  // token instead of staying on Yahoo for another cooldown window.
   tradierBlockedUntil = 0;
-  // TRA-552 — drop any quotes cached under the previous token so a key rotation
-  // never serves stale-cred data from the short-TTL cache.
+  // TRA-552 — drop quotes cached under the previous token so a key rotation never
+  // serves stale-cred data from the short-TTL cache.
   clearQuoteCache();
   if (tradierStocksClient) {
-    console.info(`[yahoo-feed] Tradier stocks feed enabled from account settings (env=${env}) — Tradier is now the primary quote source`);
+    console.info(`[yahoo-feed] Tradier stocks feed enabled (env=${nextEnv}; ${feedTokensByContext.size} context(s) supplying creds) — Tradier is the primary quote source`);
   } else {
-    console.warn('[yahoo-feed] Tradier stocks feed disabled (no token in settings) — using Yahoo as primary');
+    console.warn('[yahoo-feed] Tradier stocks feed disabled (no context supplies a token) — using Yahoo as primary');
   }
+}
+
+/**
+ * Register (or, with an empty token, unregister) one context's Tradier quote
+ * creds. `contextKey` isolates each user/engine so a credential-less context can
+ * never evict another context's working feed (TRA-572). Omitting it targets a
+ * shared default slot (used by tests and any single-context caller).
+ */
+export function setTradierStocksFeedClient(
+  token: string | null | undefined,
+  env: TradierEnv,
+  contextKey = '__default__',
+): void {
+  const next = (token ?? '').trim();
+  if (next) feedTokensByContext.set(contextKey, { token: next, env });
+  else feedTokensByContext.delete(contextKey);
+  reconcileTradierFeedClient();
+}
+
+// Seed the boot env token (if present) under the reserved env key so it survives
+// every per-user clear. Absent → the feed stays on Yahoo until a user supplies one.
+if (TRADIER_API_TOKEN) {
+  setTradierStocksFeedClient(TRADIER_API_TOKEN, TRADIER_ENV, FEED_ENV_CONTEXT_KEY);
+} else {
+  console.warn('[yahoo-feed] Tradier stocks feed disabled (no TRADIER_*_API_TOKEN at boot) — using Yahoo as primary until settings supply a token');
 }
 
 // ── Daily fallback request counters ──────────────────────────────────────────

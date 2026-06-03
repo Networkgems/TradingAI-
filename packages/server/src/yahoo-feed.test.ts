@@ -38,6 +38,49 @@ describe('setTradierStocksFeedClient (TRA-505 live-creds quote feed)', () => {
   });
 });
 
+// TRA-572 — the stock quote feed is a PROCESS-GLOBAL singleton, but its token is
+// supplied PER user context. Before this fix a single credential-less context
+// (e.g. a fresh demo signup with no Tradier token) calling the setter with an
+// empty string nulled the client for EVERY user — stock quotes went dark
+// process-wide ("Quote unavailable — provider rate-limited") even while another
+// logged-in account had a working Tradier production feed. The setter now tracks
+// tokens per `contextKey`, so clearing one context can never evict another's.
+describe('setTradierStocksFeedClient multi-tenant isolation (TRA-572)', () => {
+  it('a credential-less context does not evict another context that has a token', () => {
+    setTradierStocksFeedClient('live-prod-token', 'production', 'engine-A');
+    expect(isTradierStocksConfigured()).toBe(true);
+    // A fresh demo signup with no Tradier creds applies settings → empty token.
+    setTradierStocksFeedClient('', 'production', 'engine-B');
+    // Feed must stay live on engine-A's token.
+    expect(isTradierStocksConfigured()).toBe(true);
+    // Cleanup: clearing the provider context drops the feed.
+    setTradierStocksFeedClient('', 'production', 'engine-A');
+    expect(isTradierStocksConfigured()).toBe(false);
+  });
+
+  it('keeps the feed up while any one of several contexts still supplies a token', () => {
+    setTradierStocksFeedClient('token-1', 'production', 'engine-1');
+    setTradierStocksFeedClient('token-2', 'production', 'engine-2');
+    expect(isTradierStocksConfigured()).toBe(true);
+    setTradierStocksFeedClient('', 'production', 'engine-1');
+    expect(isTradierStocksConfigured()).toBe(true); // engine-2 still has a token
+    setTradierStocksFeedClient('', 'production', 'engine-2');
+    expect(isTradierStocksConfigured()).toBe(false); // now nobody does
+  });
+
+  it('prefers a production token over a sandbox token for the data feed', () => {
+    setTradierStocksFeedClient('sbx', 'sandbox', 'engine-sbx');
+    expect(isTradierStocksConfigured()).toBe(true);
+    setTradierStocksFeedClient('prod', 'production', 'engine-prod');
+    expect(isTradierStocksConfigured()).toBe(true);
+    // Dropping production falls back to the still-registered sandbox token.
+    setTradierStocksFeedClient('', 'production', 'engine-prod');
+    expect(isTradierStocksConfigured()).toBe(true);
+    setTradierStocksFeedClient('', 'sandbox', 'engine-sbx');
+    expect(isTradierStocksConfigured()).toBe(false);
+  });
+});
+
 // TRA-439 — Twelve Data quota guard. Before this fix the minute-bar fallback
 // had no breaker and no daily cap, so a degraded primary feed let one provider
 // burn ~27.7k calls/day against an 800/day free-tier limit. `evaluateTwelveDataGate`
