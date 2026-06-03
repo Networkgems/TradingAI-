@@ -131,13 +131,14 @@ services:
       # positions). The demo engine therefore runs this preset instead,
       # deterministically — it does NOT fall through to per-user
       # `activeStrategyPreset`, so the board always watches one consistent
-      # roster. Pinned to `tra405_validated` (bb_fade on BTC-USD + SOL-USD),
-      # the documented live candidate roster and the revert target once a
-      # strategy clears the lower-CI-bound robustness gate. If unset the
-      # engine defaults to `tra405_validated` anyway; this key makes the
-      # demo pin explicit in the deploy config.
+      # roster. TRA-521 — the board asked for an ACTIVE demo dashboard (live
+      # stays paused; they evaluate demo P&L before funding live), so this is
+      # pinned to `legacy_5` (all five strategies, full Coinbase watchlist) for
+      # visible activity. It is paper money and reaches nothing live without
+      # passing the TRA-532 promotion gate. If unset the engine defaults to
+      # `legacy_5` anyway; this key makes the demo pin explicit in the config.
       - key: DEMO_STRATEGY_PRESET
-        value: tra405_validated
+        value: legacy_5
       # TRA-406 — observability. All optional; sane defaults apply when unset.
       #   LOG_LEVEL          debug|info|warn|error (default info)
       #   ERROR_WEBHOOK_URL  HTTPS endpoint captured errors are POSTed to

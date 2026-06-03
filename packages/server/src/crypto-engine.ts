@@ -78,16 +78,25 @@ const NEWS_REFRESH_MS = 5 * 60_000;
 const FORCED_PRESET_ENV = (process.env.LIVE_STRATEGY_PRESET ?? '').trim();
 
 /**
- * TRA-456 — strategy preset for the DEMO engine. The demo engine runs paper
- * money with zero real-capital exposure, so it is deliberately NOT subject to
- * the live `LIVE_STRATEGY_PRESET` stand-down. It resolves this env var instead,
- * defaulting to {@link DEMO_PRESET_DEFAULT} (`tra405_validated` — bb_fade on
- * BTC-USD + SOL-USD, the documented live candidate roster) so the board always
- * watches one consistent roster. The demo engine never falls through to
- * per-user `activeStrategyPreset`; see {@link resolvePreset}.
+ * TRA-456 / TRA-521 — strategy preset for the DEMO engine. The demo engine runs
+ * paper money with zero real-capital exposure, so it is deliberately NOT subject
+ * to the live `LIVE_STRATEGY_PRESET` stand-down. It resolves this env var,
+ * defaulting to {@link DEMO_PRESET_DEFAULT}.
+ *
+ * TRA-521 — the board's directive: keep LIVE paused but get the DEMO dashboard
+ * actively trading again, so they can watch demo results before funding the
+ * live Coinbase account. The previous default `tra405_validated` only fires
+ * bb_fade on BTC-USD + SOL-USD, which is why the demo sat idle for ~a month.
+ * The default is now `legacy_5` — all five strategies across the full Coinbase
+ * watchlist — so the demo generates real, visible activity. This is paper money:
+ * it honestly exercises the whole roster (which TRA-523's fee-aware backtest
+ * found unprofitable net of fees), so the board can judge live-readiness from
+ * actual demo P&L. Nothing reaches LIVE without passing the TRA-532 promotion
+ * gate, regardless of what the demo runs. The demo engine never falls through
+ * to per-user `activeStrategyPreset`; see {@link resolvePreset}.
  */
 const DEMO_PRESET_ENV = (process.env.DEMO_STRATEGY_PRESET ?? '').trim();
-const DEMO_PRESET_DEFAULT: StrategyPresetId = 'tra405_validated';
+const DEMO_PRESET_DEFAULT: StrategyPresetId = 'legacy_5';
 
 /**
  * TRA-341 — process-wide override for the §6 single-symbol short cap on the
@@ -564,7 +573,7 @@ export class CryptoSignalEngine {
       // TRA-479 / TRA-480 — engine mode + both preset env vars so future
       // "demo dashboard idle" triage can read the boot log directly instead
       // of guessing. `liveEnv` is `LIVE_STRATEGY_PRESET`; `demoEnv` is
-      // `DEMO_STRATEGY_PRESET` (empty → default `tra405_validated`).
+      // `DEMO_STRATEGY_PRESET` (empty → default `legacy_5`, TRA-521).
       mode: this.mode,
       liveEnv: FORCED_PRESET_ENV,
       demoEnv: DEMO_PRESET_ENV,
