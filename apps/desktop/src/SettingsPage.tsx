@@ -812,19 +812,26 @@ export function UserManagementSection({ token, httpUrl }: { token: string; httpU
  * id lives on `AccountSettings.activeStrategyPreset` so it saves on the
  * existing form submit alongside the other account settings.
  *
- * TRA-524 — the picker now leads with only the two presets that matter: the
- * recommended "works" roster (`tra405_validated`) and `no_trade` (engine
- * paused). Every other preset in the library — `legacy_5`, `bb_fade_sol_doge`,
+ * TRA-524 — the picker leads with the two presets that matter: `no_trade`
+ * (engine paused, the recommended posture after the TRA-523 NO-GO) and
+ * `tra405_validated` (kept as the historical best, no longer badged). Every
+ * other preset in the library — `legacy_5`, `bb_fade_sol_doge`,
  * and any future entry — stays reachable behind an "Advanced / show all"
  * disclosure. This is a presentation change only: the full `STRATEGY_PRESETS`
  * library is untouched so `resolveStrategyPreset` and the
  * `LIVE/DEMO_STRATEGY_PRESET` env vars still resolve every id.
  */
-// The single preset the board considers a "works" option today. If
-// QuantTrader's TRA-521 R&D ships a new validated keeper, repoint this id.
-const RECOMMENDED_PRESET_ID: StrategyPresetId = 'tra405_validated';
+// TRA-521 / TRA-523 — QuantTrader's fee-aware R&D re-ran the roster on fresh
+// OOS data with maker-order fills modeled and returned a NO-GO: zero keepers.
+// bb_fade (the `tra405_validated` roster) is OOS-negative net of fees and fails
+// Stage 1 of the Live-Trading Promotion Gate (TRA-532), so it can no longer be
+// badged "Recommended". Until a strategy passes the gate, the recommended
+// posture is to keep the engine paused (`no_trade`). `tra405_validated` stays in
+// the primary list as the historical best ("worked in the past") option, just
+// without the badge. Repoint this id once a strategy clears the promotion gate.
+const RECOMMENDED_PRESET_ID: StrategyPresetId = 'no_trade';
 // Presets surfaced in the primary list. Everything else lives under Advanced.
-const PRIMARY_PRESET_IDS: readonly StrategyPresetId[] = [RECOMMENDED_PRESET_ID, 'no_trade'];
+const PRIMARY_PRESET_IDS: readonly StrategyPresetId[] = ['tra405_validated', 'no_trade'];
 
 function StrategyPresetCard({
   preset,
@@ -921,10 +928,13 @@ function StrategyPresetSection({
         on the next engine tick (no restart required).
       </p>
       <p className="settings-hint" style={{ marginTop: '0.5rem' }}>
-        Why only one real option? Coinbase taker fees (~0.6% round-trip) erase the edge of
-        every high-turnover preset, so only the low-frequency{' '}
-        <strong>{STRATEGY_PRESETS[RECOMMENDED_PRESET_ID].displayName}</strong> roster stays
-        profitable after costs. Pick <strong>No-trade</strong> to pause the engine entirely.
+        Why is the engine paused by default? QuantTrader's fee-aware backtest (TRA-523)
+        re-ran every roster net of Coinbase taker fees and found <strong>none</strong>{' '}
+        profitable out-of-sample — including{' '}
+        <strong>{STRATEGY_PRESETS['tra405_validated'].displayName}</strong>, which worked
+        in-sample but is now OOS-negative and fails the Live-Trading Promotion Gate. Until a
+        strategy clears the gate, <strong>No-trade</strong> is the recommended setting. The
+        historical rosters stay selectable below.
       </p>
       <div className="strategy-preset-list" style={{ display: 'flex', flexDirection: 'column', gap: '0.75rem', marginTop: '0.75rem' }}>
         {primaryPresets.map(preset => (
