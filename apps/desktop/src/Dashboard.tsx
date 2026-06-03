@@ -20,9 +20,10 @@ import { StockOptionsPanel } from './components/dashboard/StockOptionsPanel';
 import { NewsPanel } from './components/dashboard/NewsPanel';
 import { LiveCredentialsBanner } from './components/dashboard/LiveCredentialsBanner';
 import { HaltBanner } from './components/dashboard/HaltBanner';
+import { HealthPanel } from './components/dashboard/HealthPanel';
 import { useStockEngine } from './hooks/useStockEngine';
 
-type StockTab = 'watchlist' | 'signals' | 'positions' | 'options' | 'news' | 'calendar';
+type StockTab = 'watchlist' | 'signals' | 'positions' | 'options' | 'news' | 'calendar' | 'health';
 
 export default function Dashboard({ token, onLogout, onGoHome, onActivity, theme, onToggleTheme }: { token: string; onLogout: () => void; onGoHome: () => void; onActivity?: () => void; theme: Theme; onToggleTheme: () => void }) {
   const [tab, setTab] = useState<StockTab>('watchlist');
@@ -117,6 +118,10 @@ export default function Dashboard({ token, onLogout, onGoHome, onActivity, theme
         <button className={`tab ${tab === 'calendar' ? 'active' : ''}`} onClick={() => setTab('calendar')}>
           Calendar
         </button>
+        {/* TRA-539 — live reliability dashboard (TRA-528 /api/health/live). */}
+        <button className={`tab ${tab === 'health' ? 'active' : ''}`} onClick={() => setTab('health')}>
+          Health
+        </button>
       </nav>
 
       <main className="content">
@@ -176,6 +181,15 @@ export default function Dashboard({ token, onLogout, onGoHome, onActivity, theme
                 : tradierEnv === 'production' ? 'live' : 'sandbox'
             }
           />
+        )}
+
+        {/* TRA-539 — the Health tab reads its own `/api/health/live` endpoint
+            and is independent of the WebSocket engine snapshot, so it renders
+            without waiting for `state` (the surface that diagnoses a dead Live
+            session must work even when the engine feed is the thing that's
+            broken). */}
+        {tab === 'health' && (
+          <HealthPanel token={token} />
         )}
        </ErrorBoundary>
       </main>

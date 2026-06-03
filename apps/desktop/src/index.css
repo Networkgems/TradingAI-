@@ -2454,3 +2454,188 @@ tr:hover td { background: var(--bg-hover); }
   line-height: 1.35;
 }
 
+/* TRA-539 — Health dashboard tab (consumes TRA-528 /api/health/live). */
+.health-tab {
+  display: flex;
+  flex-direction: column;
+  gap: 0.9rem;
+}
+
+.health-banner {
+  display: flex;
+  align-items: center;
+  gap: 0.6rem;
+  padding: 0.7rem 1rem;
+  border-radius: 8px;
+  border: 1px solid var(--border);
+  font-weight: 600;
+}
+
+.health-banner-dot {
+  width: 12px;
+  height: 12px;
+  border-radius: 50%;
+  flex: 0 0 auto;
+}
+
+.health-banner-status {
+  font-size: 0.85rem;
+  letter-spacing: 0.06em;
+}
+
+.health-banner-label { font-weight: 500; }
+
+.health-banner-time {
+  margin-left: auto;
+  font-size: 0.72rem;
+  font-weight: 400;
+  color: var(--muted);
+}
+
+.health-banner-green {
+  background: var(--green-soft);
+  border-color: var(--green);
+  color: var(--green-strong);
+}
+.health-banner-green .health-banner-dot { background: var(--green); }
+
+.health-banner-yellow {
+  background: var(--orange-soft);
+  border-color: var(--orange);
+  color: var(--orange);
+}
+.health-banner-yellow .health-banner-dot { background: var(--orange); }
+
+.health-banner-red {
+  background: var(--red-soft);
+  border-color: var(--red);
+  color: var(--red-strong);
+}
+.health-banner-red .health-banner-dot { background: var(--red); }
+
+.health-stale {
+  margin: -0.3rem 0 0;
+}
+
+.health-issues {
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 0.7rem 0.9rem;
+  background: var(--bg-elevated);
+}
+
+.health-issues-clear {
+  font-size: 0.82rem;
+  color: var(--muted);
+}
+
+.health-issues-head {
+  font-size: 0.72rem;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+  color: var(--muted);
+  margin-bottom: 0.4rem;
+}
+
+.health-issues-list {
+  margin: 0;
+  padding-left: 1.1rem;
+  display: flex;
+  flex-direction: column;
+  gap: 0.25rem;
+}
+
+.health-issues-list li {
+  font-size: 0.82rem;
+  color: var(--text);
+  line-height: 1.4;
+}
+
+.health-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(240px, 1fr));
+  gap: 0.8rem;
+}
+
+.health-panel {
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: var(--bg-elevated);
+  overflow: hidden;
+}
+
+.health-panel-head {
+  font-size: 0.72rem;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+  color: var(--muted);
+  padding: 0.55rem 0.8rem;
+  border-bottom: 1px solid var(--border-subtle);
+}
+
+.health-panel-body {
+  display: flex;
+  flex-direction: column;
+}
+
+.health-row {
+  display: flex;
+  justify-content: space-between;
+  align-items: baseline;
+  gap: 0.8rem;
+  padding: 0.4rem 0.8rem;
+  font-size: 0.82rem;
+}
+.health-row + .health-row { border-top: 1px solid var(--border-subtle); }
+
+.health-row-label { color: var(--muted); }
+
+.health-row-value {
+  font-weight: 600;
+  text-align: right;
+  word-break: break-word;
+}
+.health-row-value code { font-size: 0.78rem; }
+
+.health-ok { color: var(--green); }
+.health-warn { color: var(--orange); }
+.health-bad { color: var(--red); }
+
+/* TRA-539 — always-visible running-build chip in the header. */
+.version-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.3rem;
+  padding: 0.2rem 0.5rem;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  background: var(--bg-elevated);
+  color: var(--muted);
+  font-size: 0.72rem;
+  white-space: nowrap;
+  cursor: default;
+}
+
+.version-chip-icon { opacity: 0.7; }
+
+.version-chip-sha {
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  font-size: 0.72rem;
+  color: var(--text);
+}
+
+.version-chip-branch {
+  padding: 0 0.3rem;
+  border-radius: 4px;
+  background: var(--orange-soft);
+  color: var(--orange);
+  font-weight: 600;
+}
+
+.version-chip-unknown {
+  border-color: var(--orange);
+  color: var(--orange);
+}
+

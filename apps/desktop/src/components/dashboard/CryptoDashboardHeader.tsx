@@ -13,6 +13,7 @@ import type { Theme } from '../ThemeToggle';
 import { ProfileMenu } from '../ProfileMenu';
 import { AccountModeSwitcher } from '../AccountModeSwitcher';
 import { KillSwitchButton } from './KillSwitchButton';
+import { VersionChip } from './VersionChip';
 import type { ProfileModal } from './ProfileModals';
 
 export function CryptoDashboardHeader({
@@ -132,6 +133,9 @@ export function CryptoDashboardHeader({
             {autoTradingEnabled ? '⏹ Stop Trading' : '▶ Start Trading'}
           </button>
           <KillSwitchButton token={token} engaged={killSwitchEngaged} onToggled={onKillSwitchToggled} />
+          {/* TRA-539 — running build always visible so an operator can spot a
+              stale binary vs origin/main at a glance. */}
+          <VersionChip />
           <ThemeToggle theme={theme} onToggle={onToggleTheme} />
           <ProfileMenu
             onSettings={() => onOpenProfileModal('settings')}

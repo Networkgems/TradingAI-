@@ -26,6 +26,8 @@ import { HaltBanner } from './HaltBanner';
 import { LiveCredentialsBanner } from './LiveCredentialsBanner';
 import { PromotionGatePanel } from './PromotionGatePanel';
 import { DEFAULT_PROMOTION_THRESHOLDS } from '@trading-app/shared';
+import { HealthPanel } from './HealthPanel';
+import { VersionChip, formatUptime } from './VersionChip';
 
 // Render a panel inside the ToastProvider its useToast() call requires.
 function renderWithToast(ui: ReactElement) {
@@ -575,5 +577,96 @@ describe('PromotionGatePanel (TRA-537)', () => {
     vi.stubGlobal('fetch', vi.fn(() => Promise.resolve(new Response('nope', { status: 500 }))));
     render(<PromotionGatePanel token="t" />);
     expect(await screen.findByText(/Could not load promotion status/)).toBeInTheDocument();
+  });
+});
+
+describe('HealthPanel (TRA-539)', () => {
+  const build = {
+    version: '0.0.0', commit: 'a'.repeat(40), commitShort: 'aaaaaaaaaaaa', branch: 'main',
+    buildTime: '2026-06-03T00:00:00.000Z', commitSource: 'env' as const,
+    nodeVersion: 'v20.0.0', pid: 1234, startedAt: '2026-06-03T00:00:00.000Z', uptimeSec: 3661,
+  };
+
+  // A clean GREEN snapshot the way /api/health/live returns it.
+  const green = {
+    status: 'green', mode: 'demo', broker: { env: 'sandbox', authOk: true, missingCredentials: [] },
+    autoTradingEnabled: true, tradingHalted: false, haltReason: null, marketOpen: false,
+    feed: { trackedSymbols: 5, freshSymbols: 5, staleSymbols: 0, neverQuoted: 0, lastTickAgeSec: 10, stale: false },
+    issues: [], build, time: '2026-06-03T12:00:00.000Z',
+  };
+
+  // RED: live with missing broker creds + market-open feed stale.
+  const red = {
+    status: 'red', mode: 'live', broker: { env: 'production', authOk: false, missingCredentials: ['liveTradierToken'] },
+    autoTradingEnabled: false, tradingHalted: true, haltReason: 'Kill switch engaged', marketOpen: true,
+    feed: { trackedSymbols: 4, freshSymbols: 0, staleSymbols: 4, neverQuoted: 0, lastTickAgeSec: 420, stale: true },
+    issues: [
+      'Live mode but broker credentials missing: liveTradierToken',
+      'Market open but data feed is stale (0/4 symbols fresh)',
+      'Trading halted: Kill switch engaged',
+    ],
+    build, time: '2026-06-03T12:00:00.000Z',
+  };
+
+  function stubHealth(payload: unknown) {
+    vi.stubGlobal('fetch', vi.fn(() => Promise.resolve(new Response(JSON.stringify(payload), { status: 200 }))));
+  }
+
+  it('renders the GREEN banner with a clear no-issues message and build panel', async () => {
+    stubHealth(green);
+    render(<HealthPanel token="t" />);
+    const banner = await screen.findByTestId('health-banner');
+    expect(banner).toHaveTextContent('GREEN');
+    expect(screen.getByText(/the live trading path is healthy/i)).toBeInTheDocument();
+    // Build panel surfaces the running commit verbatim.
+    expect(screen.getByText('aaaaaaaaaaaa')).toBeInTheDocument();
+  });
+
+  it('renders the RED banner and the API issues list verbatim', async () => {
+    stubHealth(red);
+    render(<HealthPanel token="t" />);
+    const banner = await screen.findByTestId('health-banner');
+    expect(banner).toHaveTextContent('RED');
+    // Every API issue string is surfaced, worst-first, not recomputed.
+    expect(screen.getByText('Live mode but broker credentials missing: liveTradierToken')).toBeInTheDocument();
+    expect(screen.getByText('Market open but data feed is stale (0/4 symbols fresh)')).toBeInTheDocument();
+    // Missing-credential names are surfaced in the broker panel.
+    expect(screen.getByText('liveTradierToken')).toBeInTheDocument();
+    // Halt reason from the trading-state panel.
+    expect(screen.getByText('Kill switch engaged')).toBeInTheDocument();
+  });
+
+  it('surfaces an error when the live-health endpoint fails', async () => {
+    vi.stubGlobal('fetch', vi.fn(() => Promise.resolve(new Response('nope', { status: 503 }))));
+    render(<HealthPanel token="t" />);
+    expect(await screen.findByText(/Could not load live health/)).toBeInTheDocument();
+  });
+});
+
+describe('VersionChip (TRA-539)', () => {
+  const build = {
+    version: '0.0.0', commit: 'b'.repeat(40), commitShort: 'bbbbbbbbbbbb', branch: 'main',
+    buildTime: '2026-06-03T00:00:00.000Z', commitSource: 'env' as const,
+    nodeVersion: 'v20.0.0', pid: 99, startedAt: '2026-06-03T00:00:00.000Z', uptimeSec: 120,
+  };
+
+  it('formatUptime renders compact human durations', () => {
+    expect(formatUptime(45)).toBe('45s');
+    expect(formatUptime(125)).toBe('2m 5s');
+    expect(formatUptime(3661)).toBe('1h 1m');
+    expect(formatUptime(90_000)).toBe('1d 1h');
+    expect(formatUptime(-1)).toBe('—');
+  });
+
+  it('shows the running commit short SHA from /api/health/version', async () => {
+    vi.stubGlobal('fetch', vi.fn(() => Promise.resolve(new Response(JSON.stringify(build), { status: 200 }))));
+    render(<VersionChip />);
+    expect(await screen.findByText('bbbbbbbbbbbb')).toBeInTheDocument();
+  });
+
+  it('falls back to a "build ?" chip when the server is unreachable', async () => {
+    vi.stubGlobal('fetch', vi.fn(() => Promise.reject(new Error('offline'))));
+    render(<VersionChip />);
+    expect(await screen.findByText('build ?')).toBeInTheDocument();
   });
 });
