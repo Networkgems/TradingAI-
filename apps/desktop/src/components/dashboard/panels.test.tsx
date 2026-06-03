@@ -3,7 +3,7 @@
 // isolation; panels that call useToast are wrapped in <ToastProvider>. fetch is
 // stubbed so the watchlist/close mutations never hit the network.
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
-import { render, screen } from '@testing-library/react';
+import { render, screen, act } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
 import type { ReactElement } from 'react';
 import type {
@@ -715,5 +715,38 @@ describe('VersionChip (TRA-539)', () => {
     vi.stubGlobal('fetch', vi.fn(() => Promise.reject(new Error('offline'))));
     render(<VersionChip />);
     expect(await screen.findByText('build ?')).toBeInTheDocument();
+  });
+
+  // TRA-545 — a healthy fetch that returns a non-OK status (e.g. a stale
+  // binary 500ing on /api/health/version) is a different failure than an
+  // unreachable server, so the chip shows a distinct "build !" label.
+  it('shows a "build !" chip when the build endpoint returns a non-OK status', async () => {
+    vi.stubGlobal('fetch', vi.fn(() => Promise.resolve(new Response('boom', { status: 500 }))));
+    render(<VersionChip />);
+    const chip = await screen.findByText('build !');
+    expect(chip).toBeInTheDocument();
+    expect(chip.getAttribute('title')).toContain('HTTP 500');
+  });
+
+  // TRA-545 — a failed first load must not look permanent: the chip retries on
+  // a short backoff and recovers to the running SHA without a page reload.
+  it('retries after a transient failure and recovers the running commit', async () => {
+    vi.useFakeTimers();
+    try {
+      const fetchMock = vi
+        .fn()
+        .mockRejectedValueOnce(new Error('offline'))
+        .mockResolvedValue(new Response(JSON.stringify(build), { status: 200 }));
+      vi.stubGlobal('fetch', fetchMock);
+      render(<VersionChip />);
+      // First load rejects → unreachable chip.
+      await act(async () => { await vi.advanceTimersByTimeAsync(0); });
+      expect(screen.getByText('build ?')).toBeInTheDocument();
+      // Backoff fires the retry (RETRY_BASE_MS = 2s), which succeeds.
+      await act(async () => { await vi.advanceTimersByTimeAsync(2_000); });
+      expect(screen.getByText('bbbbbbbbbbbb')).toBeInTheDocument();
+    } finally {
+      vi.useRealTimers();
+    }
   });
 });
