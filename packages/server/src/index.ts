@@ -3722,6 +3722,16 @@ app.get('/api/health/quotes', async (_req, res) => {
   // TRA-331 — Coinbase is primary for crypto; YF/CMC are fallbacks only.
   const cryptoOk = ok('coinbase') || ok('yahooFinance') || ok('coinMarketCap');
   const allOk = stocksOk && cryptoOk;
+  // TRA-572 diagnostic: report which boot-time env vars the process sees (boolean
+  // presence only — no secret values). Lets ops confirm whether Render is actually
+  // injecting the credentials before each new process starts.
+  const bootEnv = {
+    TRADIER_ENV: process.env['TRADIER_ENV'] ?? '(unset — defaults to sandbox)',
+    TRADIER_API_TOKEN_set: !!process.env['TRADIER_API_TOKEN'],
+    TRADIER_SANDBOX_API_TOKEN_set: !!process.env['TRADIER_SANDBOX_API_TOKEN'],
+    TRADIER_ACCOUNT_ID_set: !!process.env['TRADIER_ACCOUNT_ID'],
+    TRADIER_SANDBOX_ACCOUNT_ID_set: !!process.env['TRADIER_SANDBOX_ACCOUNT_ID'],
+  };
   res.status(allOk ? 200 : 502).json({
     ok: allOk,
     stocksOk,
@@ -3730,6 +3740,7 @@ app.get('/api/health/quotes', async (_req, res) => {
     tradierBreakerOpen: isTradierBreakerOpen(),
     yahooBreakerOpen: isYahooBreakerOpen(),
     coinbaseBreakerOpen: isCoinbaseBreakerOpen(),
+    bootEnv,
     results,
     ts: new Date().toISOString(),
   });
