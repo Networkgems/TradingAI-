@@ -17,6 +17,7 @@ import {
 import { createToken, verifyToken, generateResetToken, consumeResetToken, initResetTokenStore } from './auth.js';
 import { checkThrottle, recordFailure, recordSuccess } from './auth-throttle.js';
 import { getSettings, loadSettings, mergeScopedRiskSettings, saveSettings } from './account-settings.js';
+import { initNotificationDispatcher } from './notifications/index.js';
 import {
   initWatchlistStore,
   getCryptoWatchlistData,
@@ -214,6 +215,13 @@ log.info('rv-scanner initialized', {
   env: tradierEnv,
   configured: relativeValueScannerService.diagnostics().configured,
 });
+
+// TRA-563 (TRA-410 A1) — install the notification dispatcher. Preferences are
+// resolved from the cache-first per-user settings (warm once a user's context
+// is created). Channel adapters (email / Telegram / Discord) register in A2;
+// until then events with no eligible+configured channel are simply no-ops.
+initNotificationDispatcher({ loadSettings: (username) => getSettings(username) });
+log.info('notification dispatcher initialized');
 
 // TRA-142 — migrate legacy global files into the admin namespace exactly once,
 // then bootstrap per-user contexts (engines, trackers, persistence timers) for

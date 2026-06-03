@@ -1,7 +1,7 @@
 import { OrbStrategy, BbFadeStrategy, IchimokuStrategy, TradierOptionsClient, TradierOrderClient, TRADIER_REJECTED_STATUSES, evaluateSma200, SMA200_MIN_BARS, SMA200_DEBOUNCE_BARS, composeTechnicalSnapshot, resampleCandles, TF_BUCKET_MS } from '@trading-app/engine';
 import type { TradierAccountBalance } from '@trading-app/engine';
 import { WATCHLIST, MANAGED_ACCOUNT_RATIO, MAX_CONSECUTIVE_LOSSES, DAILY_DRAWDOWN_HALT_PCT, OPTIONS_PER_TICKET_DOLLAR_FLOOR, OPTIONS_POSITION_CAP_RATIO, aliasWatchlistSymbol, isLiveTradierOptionsEnabled, isStockMarketOpen, perPositionCap, resolveAutoManageImportedTradierOptions, resolveDemoCostModel, resolveHoldLiveOptionsOvernight, resolveLiveTradeEquitiesTradier, resolveManagedAccountRatio, resolveMarketReviewGatesEnabled, resolveRiskPerTrade, resolveRvDtePrefs, resolveTradierOptionsCreds, validateBracket, DEFAULT_RV_DTE_MIN, DEFAULT_RV_DTE_MAX, DEFAULT_RV_DTE_TARGET, scoreNewsSentiment, aggregateSymbolSentiment, nameAliasesFor } from '@trading-app/shared';
-import type { TradeSignal, RelativeValueSignal, Sma200Signal, Candle, OptionsAccountState, SignalType, Position, AccountSettings, AccountState, NewsItem, SymbolSentiment, TechnicalSignalSnapshot, TradierEnv, MarketReview, MarketReviewGates, EngineMarketReviewState, GatedStrategyNote, AgentRecommendation } from '@trading-app/shared';
+import type { TradeSignal, RelativeValueSignal, Sma200Signal, Candle, OptionsAccountState, SignalType, Position, OptionPosition, AccountMode, AccountSettings, AccountState, NewsItem, SymbolSentiment, TechnicalSignalSnapshot, TradierEnv, MarketReview, MarketReviewGates, EngineMarketReviewState, GatedStrategyNote, AgentRecommendation } from '@trading-app/shared';
 // TRA-544 (TRA-529 P1) — advisory multi-agent layer. P1 runs the deterministic
 // STUB graph (no LLM calls, zero spend); ON suspends deterministic auto-routing
 // and the engine surfaces the stub recommendations on the WS state.
@@ -26,6 +26,10 @@ import type { DailySignalRecord } from './reports/eod-report.js';
 import type { PnlTracker } from './pnl-tracker.js';
 import { randomUUID } from 'crypto';
 import { logger } from './observability/index.js';
+// TRA-563 (TRA-410 A1) — fire-and-forget user-facing alerts. `emitAlert` is a
+// no-op until the dispatcher is installed at boot and can NEVER throw, so these
+// hooks are safe to call inline on the trade paths.
+import { emitAlert } from './notifications/index.js';
 
 const balanceLog = logger.child({ module: 'signal-engine' });
 const log = logger.child({ module: 'signal-engine' });
@@ -243,8 +247,23 @@ export class DailyRiskGovernor {
   private killSwitchEngaged = false;
   private killSwitchReason: string | null = null;
 
+  /**
+   * TRA-563 — optional listener fired exactly once when the governor TRANSITIONS
+   * into the halted state from a recorded trade (loss-streak / daily-drawdown
+   * circuit breaker). Wired by SignalEngine to emit a risk_halt alert. Kept as a
+   * plain callback (not an EventEmitter) so the governor stays dependency-free,
+   * and only the automatic breakers fire it — the manual kill switch does not,
+   * so a restart that re-engages a persisted kill switch never re-alerts.
+   */
+  private haltListener: ((reason: string) => void) | null = null;
+
   constructor(private readonly now: () => Date = () => new Date()) {
     this.currentDay = etDateString(this.now());
+  }
+
+  /** TRA-563 — register the risk_halt alert listener (see {@link haltListener}). */
+  setHaltListener(listener: (reason: string) => void): void {
+    this.haltListener = listener;
   }
 
   private resetIfNewDay(): void {
@@ -290,6 +309,8 @@ export class DailyRiskGovernor {
       this.consecutiveLosses = 0; // reset streak on a win
     }
 
+    const wasHalted = this.halted;
+
     if (!this.halted && this.consecutiveLosses >= MAX_CONSECUTIVE_LOSSES) {
       this.halted = true;
       this.haltReason = `${MAX_CONSECUTIVE_LOSSES} consecutive losses — no new entries for the day`;
@@ -299,6 +320,15 @@ export class DailyRiskGovernor {
     if (!this.halted && this.dailyPnl < 0 && drawdownPct >= DAILY_DRAWDOWN_HALT_PCT) {
       this.halted = true;
       this.haltReason = `Daily drawdown −${(drawdownPct * 100).toFixed(1)}% exceeded ${DAILY_DRAWDOWN_HALT_PCT * 100}% limit`;
+    }
+
+    // TRA-563 — fire the risk_halt alert on the false→true transition only.
+    if (!wasHalted && this.halted && this.haltListener) {
+      try {
+        this.haltListener(this.haltReason ?? 'Trading halted by daily risk governor');
+      } catch {
+        // A notification failure must never break the risk-governor accounting.
+      }
     }
   }
 
@@ -333,6 +363,13 @@ export class SignalEngine {
   private optionsAccounts: Record<TradierEnv, PaperOptionsAccount>;
   private tradierEnv: TradierEnv = 'sandbox';
   private readonly riskGovernor = new DailyRiskGovernor();
+  /**
+   * TRA-563 — owning username for alert routing. Set by the per-user context
+   * after construction via {@link setAlertUsername}. When unset (e.g. a bare
+   * engine in a unit test) every alert hook is a no-op, so the engine has no
+   * hard dependency on the notification subsystem.
+   */
+  private alertUsername: string | undefined;
   private readonly tracker: PnlTracker | undefined;
   /**
    * TRA-191 — only enabled options scanner for stock options. ATM-per-equity-
@@ -537,6 +574,9 @@ export class SignalEngine {
     this.tracker = tracker;
     this.rvScanner = rvScanner;
     this.mode = settings?.mode === 'live' ? 'live' : 'demo';
+    // TRA-563 — bridge the risk-governor circuit-breaker transition to a
+    // risk_halt alert. Fire-and-forget; never blocks the governor.
+    this.riskGovernor.setHaltListener((reason) => this.emitRiskHaltAlert(reason));
     // Demo state is always loaded internally so a live → demo switch can
     // restore positions, equity, and dailyPnl without rebasing to the default
     // starting balance. Live mode masks this state via getState().
@@ -1086,6 +1126,7 @@ export class SignalEngine {
           }
           // Feed daily risk governor with the closed trade's P&L
           this.riskGovernor.recordTrade(pos.pnl ?? 0, managedEquity);
+          this.emitExitAlert(pos); // TRA-563 exit alert (demo equity)
         }
         // Persist equity after equity positions close
         this.tracker?.saveEquity(
@@ -1212,6 +1253,8 @@ export class SignalEngine {
         this.account.getState().totalEquity,
         this.optionsAccount.getState().optionsPnl,
       );
+      // TRA-563 — exit alert per closed option contract.
+      for (const opt of optsClosed) this.emitOptionExitAlert(opt);
     }
 
     // TRA-154: tag symbols that have an open position or a recent signal as
@@ -1324,7 +1367,7 @@ export class SignalEngine {
               side: signal.side, price, stop: signal.stopLoss,
               takeProfit: signal.takeProfit, reason: equityBracket.reason,
             });
-            this.recentSignals.unshift(signal);
+            this.recentSignals.unshift(signal); this.emitSignalAlert(signal);
             if (this.recentSignals.length > MAX_SIGNALS) this.recentSignals.pop();
             continue;
           }
@@ -1347,14 +1390,14 @@ export class SignalEngine {
           if (this.mode === 'live') {
             if (!this.tradierLiveEquityClient) {
               signal.liveSkipReason = 'Tradier equity client not configured';
-              this.recentSignals.unshift(signal);
+              this.recentSignals.unshift(signal); this.emitSignalAlert(signal);
               if (this.recentSignals.length > MAX_SIGNALS) this.recentSignals.pop();
               continue;
             }
             const placement = await this.placeTradierEquityBracket(signal, price);
             if (!placement.ok) {
               signal.liveSkipReason = placement.reason;
-              this.recentSignals.unshift(signal);
+              this.recentSignals.unshift(signal); this.emitSignalAlert(signal);
               if (this.recentSignals.length > MAX_SIGNALS) this.recentSignals.pop();
               continue;
             }
@@ -1365,7 +1408,7 @@ export class SignalEngine {
             this.refreshTradierBalance().catch(() => {});
           }
 
-          this.recentSignals.unshift(signal);
+          this.recentSignals.unshift(signal); this.emitSignalAlert(signal);
           if (this.recentSignals.length > MAX_SIGNALS) this.recentSignals.pop();
 
           // Auto-open equity paper position. Stock options for the same equity
@@ -1388,6 +1431,7 @@ export class SignalEngine {
             // positions list is filtered per-mode in getState().
             pos.mode = this.mode;
             this.positionSignalType.set(pos.id, signal.type);
+            this.emitFillAlert(pos, signal.type); // TRA-563 fill alert
           }
 
           // Record signal for daily accuracy tracking
@@ -1536,7 +1580,7 @@ export class SignalEngine {
               goldenCross: result.goldenCross,
               context: result.label,
             };
-            this.recentSignals.unshift(signal);
+            this.recentSignals.unshift(signal); this.emitSignalAlert(signal);
             if (this.recentSignals.length > MAX_SIGNALS) this.recentSignals.pop();
             this.sma200LastFired.set(key, latestBarTs);
             fired++;
@@ -1596,6 +1640,7 @@ export class SignalEngine {
     if (pos) {
       pos.mode = this.mode;
       this.positionSignalType.set(pos.id, signal.type);
+      this.emitFillAlert(pos, signal.type); // TRA-563 fill alert
     }
   }
 
@@ -1911,7 +1956,7 @@ export class SignalEngine {
         const surfaceLiveSkip = (reason: string): void => {
           signal.mode = 'live';
           signal.liveSkipReason = reason;
-          this.recentSignals.unshift(signal);
+          this.recentSignals.unshift(signal); this.emitSignalAlert(signal);
           if (this.recentSignals.length > MAX_SIGNALS) this.recentSignals.pop();
           this.dailySignals.push({
             id: signal.id,
@@ -2122,10 +2167,13 @@ export class SignalEngine {
           if (!mirrored) continue;
         }
 
+        // TRA-563 — option open is confirmed here (every void/rollback path
+        // above `continue`d), so emit the fill alert for the opened contract.
+        this.emitOptionFillAlert(opened);
         // TRA-231 — stamp the active mode so the Signals panel scopes the
         // entry per-mode. RV runs in both demo and live (TRA-220 fix).
         signal.mode = this.mode;
-        this.recentSignals.unshift(signal);
+        this.recentSignals.unshift(signal); this.emitSignalAlert(signal);
         if (this.recentSignals.length > MAX_SIGNALS) this.recentSignals.pop();
         this.dailySignals.push({
           id: signal.id,
@@ -2284,6 +2332,112 @@ export class SignalEngine {
     this.latestAgentRecommendations = recos;
   }
 
+  // ── TRA-563 (TRA-410 A1) alert hooks ──────────────────────────────────────
+  //
+  // All four helpers are fire-and-forget: they early-return when no alert
+  // username is bound and route through `emitAlert`, which never throws. They
+  // are safe to call inline on the trade paths (open / close / signal / halt).
+
+  /** TRA-563 — bind the owning user so emitted alerts resolve that user's prefs. */
+  setAlertUsername(username: string): void {
+    this.alertUsername = username;
+  }
+
+  private alertMode(): AccountMode {
+    return this.mode === 'live' ? 'live' : 'demo';
+  }
+
+  /** Emit a fill (position-opened) alert. `pos` is the freshly opened position. */
+  private emitFillAlert(pos: Position, strategy?: SignalType | string): void {
+    if (!this.alertUsername) return;
+    emitAlert({
+      kind: 'fill',
+      username: this.alertUsername,
+      symbol: pos.symbol,
+      market: 'stocks',
+      mode: this.alertMode(),
+      side: pos.side,
+      quantity: pos.quantity,
+      price: pos.entryPrice,
+      strategy: strategy ? String(strategy) : undefined,
+      positionId: pos.id,
+    });
+  }
+
+  /** Emit an options fill alert (RV option open). */
+  private emitOptionFillAlert(opt: OptionPosition): void {
+    if (!this.alertUsername) return;
+    emitAlert({
+      kind: 'fill',
+      username: this.alertUsername,
+      symbol: opt.symbol,
+      market: 'options',
+      mode: this.alertMode(),
+      side: 'buy',
+      quantity: opt.contracts,
+      price: opt.premiumPaid,
+      strategy: opt.signalType ? String(opt.signalType) : 'relative_value',
+      positionId: opt.id,
+    });
+  }
+
+  /** Emit an exit (position-closed) alert for a closed equity position. */
+  private emitExitAlert(pos: Position, market: 'stocks' | 'crypto' = 'stocks'): void {
+    if (!this.alertUsername) return;
+    emitAlert({
+      kind: 'exit',
+      username: this.alertUsername,
+      symbol: pos.symbol,
+      market,
+      mode: this.alertMode(),
+      exitReason: pos.exitReason,
+      pnl: pos.pnl,
+      positionId: pos.id,
+    });
+  }
+
+  /** Emit an exit alert for a closed option position. */
+  private emitOptionExitAlert(opt: OptionPosition): void {
+    if (!this.alertUsername) return;
+    emitAlert({
+      kind: 'exit',
+      username: this.alertUsername,
+      symbol: opt.symbol,
+      market: 'options',
+      mode: this.alertMode(),
+      pnl: opt.pnl,
+      positionId: opt.id,
+    });
+  }
+
+  /** Emit a new-signal alert. Accepts equity or RV option signals. */
+  private emitSignalAlert(signal: TradeSignal | RelativeValueSignal): void {
+    if (!this.alertUsername) return;
+    const market: 'stocks' | 'options' = signal.type === 'relative_value' ? 'options' : 'stocks';
+    emitAlert({
+      kind: 'signal',
+      username: this.alertUsername,
+      symbol: signal.symbol,
+      market,
+      signalType: String(signal.type),
+      side: signal.side,
+      entryPrice: signal.entryPrice,
+      stopLoss: signal.stopLoss,
+      takeProfit: signal.takeProfit,
+    });
+  }
+
+  /** Emit a risk_halt alert — bridged from the governor circuit breaker. */
+  private emitRiskHaltAlert(reason: string): void {
+    if (!this.alertUsername) return;
+    emitAlert({
+      kind: 'risk_halt',
+      username: this.alertUsername,
+      mode: this.alertMode(),
+      reason,
+    });
+  }
+
   /**
    * TRA-526 — engage the global kill switch (deterministic master override).
    * Halts every new-entry path immediately, across demo and live, regardless of
@@ -2340,6 +2494,7 @@ export class SignalEngine {
       // representative of live capital.
       const liveEquity = this.liveTradierBalance?.totalEquity ?? 0;
       this.riskGovernor.recordTrade(pnl, liveEquity * this.managedAccountRatio);
+      this.emitExitAlert(closed); // TRA-563 exit alert (manual close, live equity)
       // Refresh balance so the dashboard equity reflects the close as
       // soon as Tradier marks the position out.
       this.refreshTradierBalance().catch(() => {});
@@ -2350,6 +2505,7 @@ export class SignalEngine {
     if (closed) {
       this.allClosedPositions.push(closed);
       this.riskGovernor.recordTrade(closed.pnl ?? 0, this.account.managedEquity());
+      this.emitExitAlert(closed); // TRA-563 exit alert (manual close, demo equity)
       this.tracker?.saveEquity(
         this.account.getState().totalEquity,
         this.optionsAccount.getState().optionsPnl,

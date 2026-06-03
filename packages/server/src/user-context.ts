@@ -660,6 +660,9 @@ async function createUserContext(username: string): Promise<UserContext> {
   );
 
   const engine = new SignalEngine(settings, tracker, sharedRvScanner);
+  // TRA-563 — bind the owning user so engine alert hooks (fill/exit/signal/
+  // risk-halt) resolve this user's notification preferences.
+  engine.setAlertUsername(username);
   const cryptoEngine = new CryptoSignalEngine(cryptoTracker, settings);
 
   // Restore trade history (TRA-140)

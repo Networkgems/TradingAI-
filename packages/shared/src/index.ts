@@ -644,6 +644,160 @@ export type TradierEnv = 'sandbox' | 'production';
  */
 export type LiveTradierMarkets = 'options' | 'equity' | 'both';
 
+// ─────────────────────────────────────────────────────────────────────────────
+// TRA-563 (TRA-410 A1) — Notification / alert preferences.
+//
+// Per-user alert configuration consumed by the server-side notification
+// dispatcher (`packages/server/src/notifications/dispatcher.ts`). The channel
+// adapters (email / Telegram / Discord) are built in A2 and the Settings →
+// Notifications UI in A3; this schema is the contract all three share.
+//
+// Every field is OPTIONAL on AccountSettings for back-compat with snapshots
+// saved before TRA-563. Always read through {@link resolveAlertPreferences},
+// which deep-merges the persisted value over {@link DEFAULT_ALERT_PREFERENCES}
+// so a partial save (or a future field) still yields a fully-populated object.
+// ─────────────────────────────────────────────────────────────────────────────
+
+/**
+ * Delivery channels an alert can be routed to. SMS is intentionally excluded
+ * (TRA-410 §1.6 — it is the only channel that carries a per-message cost).
+ */
+export type AlertChannel = 'email' | 'telegram' | 'discord';
+
+export const ALERT_CHANNELS: readonly AlertChannel[] = ['email', 'telegram', 'discord'];
+
+/** The four event classes the dispatcher fans out (TRA-410 §1.1). */
+export type AlertEventClass = 'fill' | 'exit' | 'signal' | 'risk_halt';
+
+export const ALERT_EVENT_CLASSES: readonly AlertEventClass[] = [
+  'fill',
+  'exit',
+  'signal',
+  'risk_halt',
+];
+
+/** Batching mode for the high-frequency `signal` class (TRA-410 §1.3 "Digest"). */
+export type AlertDigestMode = 'immediate' | '15min' | 'hourly';
+
+/** Per-channel enable toggle + connection config. */
+export interface AlertChannelConfig {
+  /** Master enable for the channel. When false the channel never receives any event. */
+  enabled: boolean;
+  /**
+   * Email destination. When blank the dispatcher falls back to the account's
+   * login email (resolved server-side in A2), so a fresh user needs no setup.
+   */
+  emailAddress?: string;
+  /** Telegram chat id captured via the A2 `/start <token>` link flow. Inert until linked. */
+  telegramChatId?: string;
+  /** Discord incoming-webhook URL. Inert until set. */
+  discordWebhookUrl?: string;
+}
+
+/**
+ * Per-event-class × per-channel routing matrix — the "ALERT ME WHEN…" grid in
+ * the §1.3 mockup. A channel fires for an event only when BOTH the matrix cell
+ * and the channel's own `enabled` toggle are true (and the channel is
+ * configured). risk_halt additionally bypasses quiet hours + digest batching.
+ */
+export type AlertEventMatrix = Record<AlertEventClass, Record<AlertChannel, boolean>>;
+
+/**
+ * Quiet-hours window. Suppresses non-critical alerts (fill / exit / signal)
+ * while active; risk_halt always bypasses it (the safety-critical alert, §1.3).
+ * The window wraps past midnight when `end` is earlier than `start`.
+ */
+export interface AlertQuietHours {
+  enabled: boolean;
+  /** "HH:MM" 24h, evaluated in `timezone`. Inclusive start. */
+  start: string;
+  /** "HH:MM" 24h, evaluated in `timezone`. Exclusive end. */
+  end: string;
+  /** IANA timezone the window is evaluated in (e.g. "America/New_York"). */
+  timezone: string;
+}
+
+export interface AlertPreferences {
+  channels: Record<AlertChannel, AlertChannelConfig>;
+  /** Which channels fire for each event class. */
+  events: AlertEventMatrix;
+  quietHours: AlertQuietHours;
+  /** Batching for `signal` alerts — the only high-frequency class. */
+  signalDigest: AlertDigestMode;
+}
+
+/**
+ * Default alert preferences (TRA-410 §1.3 mockup):
+ *   • risk_halt → every channel (safety-critical, on by default).
+ *   • fill / exit → email + Discord.
+ *   • signal → Discord only (high-frequency; quietest default).
+ *   • Email enabled by default (the account already has an address); Telegram
+ *     and Discord disabled until the user links / pastes a webhook.
+ *   • Quiet hours off; signal digest immediate.
+ */
+export const DEFAULT_ALERT_PREFERENCES: AlertPreferences = {
+  channels: {
+    email: { enabled: true },
+    telegram: { enabled: false },
+    discord: { enabled: false },
+  },
+  events: {
+    fill: { email: true, telegram: false, discord: true },
+    exit: { email: true, telegram: false, discord: true },
+    signal: { email: false, telegram: false, discord: true },
+    risk_halt: { email: true, telegram: true, discord: true },
+  },
+  quietHours: { enabled: false, start: '22:00', end: '07:00', timezone: 'America/New_York' },
+  signalDigest: 'immediate',
+};
+
+/**
+ * Resolve a fully-populated {@link AlertPreferences} from a (possibly partial,
+ * possibly absent) persisted value. Deep-merges the saved prefs over
+ * {@link DEFAULT_ALERT_PREFERENCES} so:
+ *   • a snapshot saved before TRA-563 (no `alertPreferences`) → defaults;
+ *   • a save that only set one channel still gets every other field defaulted;
+ *   • a future-added event class / channel is back-filled from the default.
+ * Pure + side-effect-free so it is safe to call on every dispatch.
+ */
+export function resolveAlertPreferences(
+  settings?: Pick<AccountSettings, 'alertPreferences'> | null,
+): AlertPreferences {
+  const saved = settings?.alertPreferences;
+  const base = DEFAULT_ALERT_PREFERENCES;
+  if (!saved || typeof saved !== 'object') {
+    // Return a deep clone so callers can't mutate the shared default.
+    return cloneAlertPreferences(base);
+  }
+  const channels = {} as Record<AlertChannel, AlertChannelConfig>;
+  for (const ch of ALERT_CHANNELS) {
+    channels[ch] = { ...base.channels[ch], ...(saved.channels?.[ch] ?? {}) };
+  }
+  const events = {} as AlertEventMatrix;
+  for (const ev of ALERT_EVENT_CLASSES) {
+    events[ev] = { ...base.events[ev], ...(saved.events?.[ev] ?? {}) };
+  }
+  return {
+    channels,
+    events,
+    quietHours: { ...base.quietHours, ...(saved.quietHours ?? {}) },
+    signalDigest: saved.signalDigest ?? base.signalDigest,
+  };
+}
+
+function cloneAlertPreferences(prefs: AlertPreferences): AlertPreferences {
+  const channels = {} as Record<AlertChannel, AlertChannelConfig>;
+  for (const ch of ALERT_CHANNELS) channels[ch] = { ...prefs.channels[ch] };
+  const events = {} as AlertEventMatrix;
+  for (const ev of ALERT_EVENT_CLASSES) events[ev] = { ...prefs.events[ev] };
+  return {
+    channels,
+    events,
+    quietHours: { ...prefs.quietHours },
+    signalDigest: prefs.signalDigest,
+  };
+}
+
 export interface AccountSettings {
   mode: AccountMode;
   // Demo mode settings
@@ -907,6 +1061,13 @@ export interface AccountSettings {
    * {@link resolveTradingAgentsEnabled}.
    */
   tradingAgentsEnabled?: boolean;
+  /**
+   * TRA-563 (TRA-410 A1) — per-user notification/alert preferences. Optional
+   * for back-compat with snapshots saved before TRA-563; absent ↔
+   * {@link DEFAULT_ALERT_PREFERENCES}. Always resolve via
+   * {@link resolveAlertPreferences} so partial saves are filled from defaults.
+   */
+  alertPreferences?: AlertPreferences;
 }
 
 export const DEFAULT_ACCOUNT_SETTINGS: AccountSettings = {
@@ -979,6 +1140,9 @@ export const DEFAULT_ACCOUNT_SETTINGS: AccountSettings = {
   // TRA-544 — multi-agent layer defaults OFF; deterministic stack drives until
   // the operator opts in from the banner (advisory takeover, still risk-gated).
   tradingAgentsEnabled: false,
+  // TRA-563 — alert preferences default per the §1.3 mockup (risk_halt on every
+  // channel; fills/exits on email+discord; signals on discord; quiet hours off).
+  alertPreferences: DEFAULT_ALERT_PREFERENCES,
 };
 
 /**
