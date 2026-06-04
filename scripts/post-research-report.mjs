@@ -17,8 +17,16 @@
 //
 // Auth: prefers ADMIN_TOKEN if set; otherwise POSTs /api/auth/login with
 // ADMIN_USERNAME (default `admin`) + ADMIN_PASSWORD to get a fresh token.
-// Tokens issued by the server are HMAC-signed and have no expiry, so logging
-// in once per fire is fine.
+//
+// Self-healing (TRA-578): a baked static ADMIN_TOKEN is fragile — server
+// tokens are HMAC-signed with AUTH_SECRET (invalidated on secret rotation /
+// restart) AND carry a max-age TTL (AUTH_TOKEN_TTL_HOURS, default 24h), so a
+// token minted once and stored in the routine env reliably dies within a day.
+// To survive that, when the POST is rejected as unauthenticated (401/403) and
+// an ADMIN_PASSWORD is available, this script discards the stale token, logs
+// in fresh, and retries the POST once. The robust routine wiring is therefore
+// ADMIN_USERNAME + ADMIN_PASSWORD (mint fresh each fire); a static ADMIN_TOKEN
+// is at best an optimization that the password path now backstops.
 //
 // Idempotent: id defaults to `${kind}-${YYYY-MM-DD}` so same-day re-runs
 // upsert in place rather than duplicating.
@@ -106,17 +114,15 @@ if (args['dry-run']) {
 
 const API_BASE = (process.env.API_BASE ?? 'http://localhost:4242').replace(/\/+$/, '');
 
-async function getToken() {
-  if (process.env.ADMIN_TOKEN) return process.env.ADMIN_TOKEN;
+const ADMIN_PASSWORD = process.env.ADMIN_PASSWORD;
+const canPasswordLogin = typeof ADMIN_PASSWORD === 'string' && ADMIN_PASSWORD.length > 0;
+
+async function loginWithPassword() {
   const username = process.env.ADMIN_USERNAME ?? 'admin';
-  const password = process.env.ADMIN_PASSWORD;
-  if (!password) {
-    fail(3, 'No ADMIN_TOKEN and no ADMIN_PASSWORD — cannot authenticate.');
-  }
   const r = await fetch(`${API_BASE}/api/auth/login`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ username, password }),
+    body: JSON.stringify({ username, password: ADMIN_PASSWORD }),
   });
   if (!r.ok) {
     const text = await r.text().catch(() => '');
@@ -129,16 +135,41 @@ async function getToken() {
   return body.token;
 }
 
-const token = await getToken();
+// Initial token: a pre-issued ADMIN_TOKEN if supplied, otherwise a fresh login.
+// `fromToken` records whether the credential is the (possibly stale) static
+// token, which is what we transparently re-mint on a 401/403 below.
+let token;
+let fromToken = false;
+if (process.env.ADMIN_TOKEN) {
+  token = process.env.ADMIN_TOKEN;
+  fromToken = true;
+} else if (canPasswordLogin) {
+  token = await loginWithPassword();
+} else {
+  fail(3, 'No ADMIN_TOKEN and no ADMIN_PASSWORD — cannot authenticate.');
+}
 
-const r = await fetch(`${API_BASE}/api/research/reports`, {
-  method: 'POST',
-  headers: {
-    'Content-Type': 'application/json',
-    Authorization: `Bearer ${token}`,
-  },
-  body: JSON.stringify(payload),
-});
+async function postReport(bearer) {
+  return fetch(`${API_BASE}/api/research/reports`, {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      Authorization: `Bearer ${bearer}`,
+    },
+    body: JSON.stringify(payload),
+  });
+}
+
+let r = await postReport(token);
+
+// Self-healing: the static token was rejected as unauthenticated (expired TTL
+// or AUTH_SECRET rotation). If we have a password, mint a fresh token and retry
+// once before giving up.
+if ((r.status === 401 || r.status === 403) && fromToken && canPasswordLogin) {
+  console.error(`Static ADMIN_TOKEN rejected (${r.status}); re-authenticating via ADMIN_PASSWORD and retrying.`);
+  token = await loginWithPassword();
+  r = await postReport(token);
+}
 
 if (!r.ok) {
   const text = await r.text().catch(() => '');
