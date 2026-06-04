@@ -40,7 +40,7 @@ import type {
   MarketReviewGates,
   MarketReviewIndexReading,
 } from '@trading-app/shared';
-import { fetchDailyCandles, fetchQuote } from './yahoo-feed.js';
+import { fetchDailyCandles, fetchQuote, fetchTradierDailyCandles } from './yahoo-feed.js';
 import { saveResearchReport } from './research-store.js';
 import { logger } from './observability/index.js';
 
@@ -59,6 +59,12 @@ const SPX_SYMBOL = '^GSPC';
  */
 const SPX_FALLBACK_SYMBOL = 'SPY';
 const VIX_SYMBOL = '^VIX';
+/**
+ * TRA-586 — Tradier quotes the CBOE Volatility Index under the bare `VIX`
+ * ticker, not Yahoo's `^VIX` index symbol. Used as the VIX proxy when the Yahoo
+ * `^VIX` quote path is dark (breaker open).
+ */
+const VIX_TRADIER_SYMBOL = 'VIX';
 const TNX_SYMBOL = '^TNX';
 
 /**
@@ -315,6 +321,9 @@ export function deriveGates(
 
 // ── Feed reads ───────────────────────────────────────────────────────────────
 
+/** Which upstream provider served the S&P 500 trend candles. */
+export type SpxTrendProvider = 'yahoo' | 'tradier';
+
 /** Result of resolving the S&P 500 trend series across the primary + fallback feeds. */
 export interface SpxTrendSource {
   candles: Candle[];
@@ -322,48 +331,93 @@ export interface SpxTrendSource {
   symbol: string;
   /** True when the `^GSPC` feed was dark and `SPY` was used as a proxy. */
   viaFallback: boolean;
+  /**
+   * TRA-586 — provider that actually served the candles. `tradier` means both
+   * Yahoo paths were dark and the non-Yahoo daily-history feed supplied the MA.
+   */
+  provider: SpxTrendProvider;
 }
 
 /**
- * TRA-469 — pick the S&P 500 trend series. Prefers the `^GSPC` primary feed;
- * uses the `SPY` proxy when `^GSPC` returns too few bars to compute the
- * trend MA. Pure (no I/O) so the fallback precedence is unit-testable.
+ * Pick the S&P 500 trend series across the three sources, in precedence order:
+ *
+ *   1. `^GSPC` via Yahoo   (primary index feed)
+ *   2. `SPY`  via Yahoo    (TRA-469 — ETF proxy when `^GSPC` is short)
+ *   3. `SPY`  via Tradier  (TRA-586 — non-Yahoo fallback when Yahoo is dark)
+ *
+ * The first source with at least {@link MA_PERIOD} bars wins. When none has
+ * enough history the longest series is returned so `simpleMa` still degrades to
+ * `null` cleanly and the regime goes YELLOW. Pure (no I/O) so the precedence is
+ * unit-testable.
  */
-export function pickSpxTrendCandles(primary: Candle[], fallback: Candle[]): SpxTrendSource {
+export function pickSpxTrendCandles(
+  primary: Candle[],
+  yahooFallback: Candle[],
+  tradierFallback: Candle[] = [],
+): SpxTrendSource {
   if (primary.length >= MA_PERIOD) {
-    return { candles: primary, symbol: SPX_SYMBOL, viaFallback: false };
+    return { candles: primary, symbol: SPX_SYMBOL, viaFallback: false, provider: 'yahoo' };
   }
-  if (fallback.length >= MA_PERIOD) {
-    return { candles: fallback, symbol: SPX_FALLBACK_SYMBOL, viaFallback: true };
+  if (yahooFallback.length >= MA_PERIOD) {
+    return { candles: yahooFallback, symbol: SPX_FALLBACK_SYMBOL, viaFallback: true, provider: 'yahoo' };
   }
-  // Neither feed has enough history — keep whichever has more bars so
-  // `simpleMa` still degrades to `null` cleanly and the regime goes YELLOW.
-  return primary.length >= fallback.length
-    ? { candles: primary, symbol: SPX_SYMBOL, viaFallback: false }
-    : { candles: fallback, symbol: SPX_FALLBACK_SYMBOL, viaFallback: true };
+  if (tradierFallback.length >= MA_PERIOD) {
+    return { candles: tradierFallback, symbol: SPX_FALLBACK_SYMBOL, viaFallback: true, provider: 'tradier' };
+  }
+  // No source has enough history — keep whichever has the most bars (preserving
+  // the precedence order on ties) so `simpleMa` degrades to `null` cleanly.
+  const candidates: SpxTrendSource[] = [
+    { candles: primary, symbol: SPX_SYMBOL, viaFallback: false, provider: 'yahoo' },
+    { candles: yahooFallback, symbol: SPX_FALLBACK_SYMBOL, viaFallback: true, provider: 'yahoo' },
+    { candles: tradierFallback, symbol: SPX_FALLBACK_SYMBOL, viaFallback: true, provider: 'tradier' },
+  ];
+  return candidates.reduce((best, c) => (c.candles.length > best.candles.length ? c : best));
 }
 
 /**
- * Resolve the S&P 500 trend candles, falling back from `^GSPC` to `SPY` when
- * the primary index feed is dark. The `SPY` request is only issued when the
- * primary comes up short, so a healthy `^GSPC` read costs nothing extra.
+ * Resolve the S&P 500 trend candles, cascading `^GSPC` (Yahoo) → `SPY` (Yahoo)
+ * → `SPY` (Tradier). Each fallback request is only issued when the prior source
+ * comes up short, so a healthy `^GSPC` read costs nothing extra and the Tradier
+ * call only fires when both Yahoo paths are dark (TRA-586).
  */
 async function readSpxTrend(): Promise<SpxTrendSource> {
   const primary = await fetchDailyCandles(SPX_SYMBOL, TREND_FETCH_BARS).catch(() => [] as Candle[]);
   if (primary.length >= MA_PERIOD) {
-    return { candles: primary, symbol: SPX_SYMBOL, viaFallback: false };
+    return { candles: primary, symbol: SPX_SYMBOL, viaFallback: false, provider: 'yahoo' };
   }
-  const fallback = await fetchDailyCandles(SPX_FALLBACK_SYMBOL, TREND_FETCH_BARS).catch(
+  const yahooFallback = await fetchDailyCandles(SPX_FALLBACK_SYMBOL, TREND_FETCH_BARS).catch(
     () => [] as Candle[],
   );
-  const picked = pickSpxTrendCandles(primary, fallback);
+  if (yahooFallback.length >= MA_PERIOD) {
+    return { candles: yahooFallback, symbol: SPX_FALLBACK_SYMBOL, viaFallback: true, provider: 'yahoo' };
+  }
+  // TRA-586 — both Yahoo daily paths are dark (breaker open). Reach for the
+  // Tradier `/markets/history` feed that already powers /api/health/quotes.
+  const tradierFallback = await fetchTradierDailyCandles(SPX_FALLBACK_SYMBOL, TREND_FETCH_BARS).catch(
+    () => [] as Candle[],
+  );
+  const picked = pickSpxTrendCandles(primary, yahooFallback, tradierFallback);
   if (picked.viaFallback) {
     log.warn('^GSPC trend feed dark — using SPY proxy', {
+      provider: picked.provider,
       primaryBars: primary.length,
-      fallbackBars: fallback.length,
+      yahooFallbackBars: yahooFallback.length,
+      tradierFallbackBars: tradierFallback.length,
     });
   }
   return picked;
+}
+
+/**
+ * TRA-586 — resolve the VIX level. Tries the Yahoo `^VIX` quote first; when that
+ * is dark, falls back to the Tradier `VIX` quote (Tradier tickers the index
+ * without the `^` prefix). Returns `null` only when every provider is cold.
+ */
+async function readVix(): Promise<number | null> {
+  const primary = await fetchQuote(VIX_SYMBOL).catch(() => null);
+  if (primary?.price != null) return primary.price;
+  const tradier = await fetchQuote(VIX_TRADIER_SYMBOL).catch(() => null);
+  return tradier?.price ?? null;
 }
 
 /**
@@ -375,25 +429,28 @@ async function readIndexes(prevTrendUp?: boolean | null): Promise<{
   inputs: RegimeInputs;
   readings: MarketReviewIndexReading[];
 }> {
-  const [spxTrend, vixQuote, tnxQuote] = await Promise.all([
+  const [spxTrend, vix, tnxQuote] = await Promise.all([
     readSpxTrend(),
-    fetchQuote(VIX_SYMBOL).catch(() => null),
+    readVix(),
     fetchQuote(TNX_SYMBOL).catch(() => null),
   ]);
 
   const spxCandles = spxTrend.candles;
   const spx = spxCandles.length > 0 ? spxCandles[spxCandles.length - 1].close : null;
   const spxTrendMa = simpleMa(spxCandles, MA_PERIOD);
-  const vix = vixQuote?.price ?? null;
   const tnx = normalizeTnx(tnxQuote?.price ?? null);
 
   const inputs: RegimeInputs = { spx, spxTrendMa, vix, tnx };
 
-  const spxProxyNote = spxTrend.viaFallback ? ' (via SPY proxy — ^GSPC feed down)' : '';
+  const spxProxyNote = spxTrend.viaFallback
+    ? spxTrend.provider === 'tradier'
+      ? ' (via SPY/Tradier proxy — Yahoo ^GSPC + SPY feed down)'
+      : ' (via SPY proxy — ^GSPC feed down)'
+    : '';
   const trend = resolveTrend(spx, spxTrendMa, prevTrendUp);
   const maLabel = `${MA_PERIOD}-DMA`;
   const spxNote = !trend.trendKnown
-    ? 'Feed unavailable — trend filter cannot be confirmed (^GSPC and SPY both unreachable).'
+    ? 'Feed unavailable — trend filter cannot be confirmed (^GSPC, SPY/Yahoo and SPY/Tradier all unreachable).'
     : trend.trendUp
       ? `Above ${maLabel} (${spxTrendMa!.toFixed(2)}, ±1% band) — uptrend, ORB longs enabled.${spxProxyNote}`
       : `Below ${maLabel} (${spxTrendMa!.toFixed(2)}, ±1% band) — downtrend, ORB longs OFF.${spxProxyNote}`;

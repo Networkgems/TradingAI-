@@ -639,6 +639,31 @@ export async function fetchDailyCandles(symbol: string, count = 30): Promise<Can
   return candles.slice(-count);
 }
 
+/**
+ * TRA-586 — fetch daily candles via the Tradier `/markets/history` feed.
+ *
+ * `fetchDailyCandles` above is Yahoo-only, so when Yahoo's chart breaker is open
+ * (429 on Render's shared egress) the market-review regime read goes dark and
+ * defaults to a cautious YELLOW. This routes the same trend-MA read through the
+ * Tradier account that already powers `/api/health/quotes`, using `SPY` as the
+ * S&P 500 proxy (Tradier serves listed ETFs, not the `^GSPC` cash index).
+ *
+ * Honors the shared Tradier circuit breaker and returns `[]` when Tradier is
+ * unconfigured, blocked, or errors so callers tolerate a cold feed.
+ */
+export async function fetchTradierDailyCandles(symbol: string, count = 30): Promise<Candle[]> {
+  if (!tradierStocksClient || isTradierBlocked()) return [];
+  try {
+    bumpFallbackCounter('tradier');
+    return await tradierStocksClient.getDailyBars(symbol, count);
+  } catch (err: unknown) {
+    const msg = err instanceof Error ? err.message : String(err);
+    if (/HTTP\s+(429|5\d\d)/.test(msg)) tripTradierBreaker(`history(${symbol})`, msg);
+    else console.warn(`[yahoo-feed] tradier history(${symbol}) error: ${msg}`);
+    return [];
+  }
+}
+
 export interface TradierCandleDiag {
   reason: 'no_credentials' | 'breaker_open' | 'http_error' | 'no_data' | 'fetch_error' | 'ok';
   httpStatus?: number;

@@ -269,23 +269,56 @@ describe('pickSpxTrendCandles (TRA-469 SPY fallback)', () => {
     const picked = pickSpxTrendCandles(primary, fallback);
     expect(picked.symbol).toBe('^GSPC');
     expect(picked.viaFallback).toBe(false);
+    expect(picked.provider).toBe('yahoo');
     expect(picked.candles).toBe(primary);
   });
 
-  it('falls back to SPY when ^GSPC is short of the trend-MA window', () => {
+  it('falls back to SPY (Yahoo) when ^GSPC is short of the trend-MA window', () => {
     const primary = candles([5000, 5010, 5020]); // < MA_PERIOD bars
     const fallback = candles(Array.from({ length: MA_PERIOD + 5 }, (_, i) => 500 + i));
     const picked = pickSpxTrendCandles(primary, fallback);
     expect(picked.symbol).toBe('SPY');
     expect(picked.viaFallback).toBe(true);
+    expect(picked.provider).toBe('yahoo');
     expect(picked.candles).toBe(fallback);
   });
 
-  it('returns the longer series (still degrading to null) when both feeds are dark', () => {
+  it('returns the longer series (still degrading to null) when both Yahoo feeds are dark', () => {
     const primary = candles([5000, 5010]);
     const fallback = candles([500, 510, 520, 530]);
     const picked = pickSpxTrendCandles(primary, fallback);
     expect(picked.symbol).toBe('SPY');
+    expect(simpleMa(picked.candles, MA_PERIOD)).toBeNull();
+  });
+
+  // TRA-586 — the non-Yahoo third tier.
+  it('falls back to SPY via Tradier when both Yahoo paths are short', () => {
+    const primary = candles([5000, 5010, 5020]); // ^GSPC dark (Yahoo)
+    const yahooFallback = candles([500, 510]); // SPY/Yahoo dark too
+    const tradierFallback = candles(Array.from({ length: MA_PERIOD + 5 }, (_, i) => 500 + i));
+    const picked = pickSpxTrendCandles(primary, yahooFallback, tradierFallback);
+    expect(picked.symbol).toBe('SPY');
+    expect(picked.viaFallback).toBe(true);
+    expect(picked.provider).toBe('tradier');
+    expect(picked.candles).toBe(tradierFallback);
+  });
+
+  it('prefers Yahoo SPY over Tradier SPY when both have enough history', () => {
+    const primary = candles([5000]); // ^GSPC dark
+    const yahooFallback = candles(Array.from({ length: MA_PERIOD + 5 }, (_, i) => 500 + i));
+    const tradierFallback = candles(Array.from({ length: MA_PERIOD + 5 }, (_, i) => 400 + i));
+    const picked = pickSpxTrendCandles(primary, yahooFallback, tradierFallback);
+    expect(picked.provider).toBe('yahoo');
+    expect(picked.candles).toBe(yahooFallback);
+  });
+
+  it('keeps the longest series across all three when none reaches the MA window', () => {
+    const primary = candles([5000, 5010]);
+    const yahooFallback = candles([500, 510, 520]);
+    const tradierFallback = candles([400, 410, 420, 430, 440]);
+    const picked = pickSpxTrendCandles(primary, yahooFallback, tradierFallback);
+    expect(picked.provider).toBe('tradier');
+    expect(picked.candles).toBe(tradierFallback);
     expect(simpleMa(picked.candles, MA_PERIOD)).toBeNull();
   });
 });

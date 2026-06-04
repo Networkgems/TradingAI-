@@ -156,3 +156,85 @@ describe('TradierStocksClient.getMinuteBars', () => {
     expect(url).toContain('session_filter=open');
   });
 });
+
+describe('TradierStocksClient.getDailyBars (TRA-586)', () => {
+  it('parses a daily history envelope into Candle objects', async () => {
+    fetchMock.mockResolvedValueOnce(jsonResponse({
+      history: {
+        day: [
+          { date: '2026-05-18', open: 500, high: 505, low: 498, close: 503, volume: 70_000_000 },
+          { date: '2026-05-19', open: 503, high: 508, low: 502, close: 507, volume: 65_000_000 },
+        ],
+      },
+    }));
+    const client = new TradierStocksClient('tok');
+    const bars = await client.getDailyBars('SPY', 60);
+    expect(bars.length).toBe(2);
+    expect(bars[0].timestamp).toBeLessThan(bars[1].timestamp); // ascending
+    expect(bars[1]).toMatchObject({ symbol: 'SPY', open: 503, high: 508, low: 502, close: 507 });
+  });
+
+  it('preserves zero-volume rows (cash indices report no daily volume)', async () => {
+    fetchMock.mockResolvedValueOnce(jsonResponse({
+      history: { day: { date: '2026-05-19', open: 100, high: 101, low: 99, close: 100.5, volume: 0 } },
+    }));
+    const client = new TradierStocksClient('tok');
+    const bars = await client.getDailyBars('SPY', 60);
+    expect(bars.length).toBe(1);
+    expect(bars[0].volume).toBe(0);
+  });
+
+  it('returns an empty list when the history series is empty', async () => {
+    fetchMock.mockResolvedValueOnce(jsonResponse({ history: 'null' }));
+    const client = new TradierStocksClient('tok');
+    expect(await client.getDailyBars('SPY', 60)).toEqual([]);
+  });
+
+  it('drops rows with missing OHLC', async () => {
+    fetchMock.mockResolvedValueOnce(jsonResponse({
+      history: {
+        day: [
+          { date: '2026-05-18', open: 500, high: 505, close: 503, volume: 1 }, // no low
+          { date: '2026-05-19', open: 503, high: 508, low: 502, close: 507, volume: 1 },
+        ],
+      },
+    }));
+    const client = new TradierStocksClient('tok');
+    const bars = await client.getDailyBars('SPY', 60);
+    expect(bars.length).toBe(1);
+    expect(bars[0].close).toBe(507);
+  });
+
+  it('takes only the trailing `count` bars', async () => {
+    const day = (i: number): string => `2026-${String(1 + Math.floor(i / 28)).padStart(2, '0')}-${String(1 + (i % 28)).padStart(2, '0')}`;
+    const rows = Array.from({ length: 60 }, (_, i) => ({
+      date: day(i), open: 100 + i, high: 100 + i + 1, low: 100 + i - 1, close: 100 + i, volume: 1000 + i,
+    }));
+    fetchMock.mockResolvedValueOnce(jsonResponse({ history: { day: rows } }));
+    const client = new TradierStocksClient('tok');
+    const bars = await client.getDailyBars('SPY', 10);
+    expect(bars.length).toBe(10);
+  });
+
+  it('throws on non-2xx responses so the caller can fall back', async () => {
+    fetchMock.mockResolvedValueOnce(textResponse('rate limit', 429));
+    const client = new TradierStocksClient('tok');
+    await expect(client.getDailyBars('SPY', 60)).rejects.toThrow(/HTTP 429/);
+  });
+
+  it('hits /markets/history with interval=daily', async () => {
+    fetchMock.mockResolvedValueOnce(jsonResponse({ history: { day: [] } }));
+    const client = new TradierStocksClient('tok');
+    await client.getDailyBars('SPY', 60);
+    const url = String(fetchMock.mock.calls[0][0]);
+    expect(url).toContain('/markets/history');
+    expect(url).toContain('symbol=SPY');
+    expect(url).toContain('interval=daily');
+  });
+
+  it('returns [] without an HTTP call for a non-positive count', async () => {
+    const client = new TradierStocksClient('tok');
+    expect(await client.getDailyBars('SPY', 0)).toEqual([]);
+    expect(fetchMock).not.toHaveBeenCalled();
+  });
+});

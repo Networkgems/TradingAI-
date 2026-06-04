@@ -46,6 +46,20 @@ interface TradierTimeSalesEnvelope {
   series?: { data?: TradierTimeSalesRow | TradierTimeSalesRow[] } | string | null;
 }
 
+interface TradierHistoryDay {
+  /** "YYYY-MM-DD" — trading session date. */
+  date?: string;
+  open?: number;
+  high?: number;
+  low?: number;
+  close?: number;
+  volume?: number;
+}
+
+interface TradierHistoryEnvelope {
+  history?: { day?: TradierHistoryDay | TradierHistoryDay[] } | string | null;
+}
+
 function asArray<T>(value: T | T[] | undefined | null | string): T[] {
   if (value == null || value === '') return [];
   if (Array.isArray(value)) return value;
@@ -77,6 +91,12 @@ function formatEt(d: Date): string {
   return `${get('year')}-${get('month')}-${get('day')} ${hour}:${get('minute')}`;
 }
 
+/** Format a `Date` as `YYYY-MM-DD` in US/Eastern — the form Tradier
+ * `/markets/history` expects for the `start` / `end` day bounds. */
+function formatDay(d: Date): string {
+  return formatEt(d).slice(0, 10);
+}
+
 /**
  * Tradier equity-data client. Reuses the same auth/base-URL plumbing as
  * `TradierOrderClient` and `TradierOptionsClient` but exposes only the
@@ -85,6 +105,9 @@ function formatEt(d: Date): string {
  *   • `getQuotes(symbols[])` → multi-symbol last/change/volume snapshot.
  *   • `getMinuteBars(symbol, count)` → up to `count` 1-minute OHLCV bars,
  *     intraday only (Tradier returns the current and prior trading day).
+ *   • `getDailyBars(symbol, count)` → up to `count` daily OHLCV bars from the
+ *     `/markets/history` endpoint (TRA-586 — the non-Yahoo trend-MA fallback for
+ *     the market-review regime read).
  *
  * No constructor-level account id — quotes / timesales don't need account
  * scope, only the API token.
@@ -184,6 +207,64 @@ export class TradierStocksClient {
         low: r.low,
         close: r.close,
         volume: v,
+      });
+    }
+    candles.sort((a, b) => a.timestamp - b.timestamp);
+    return candles.slice(-count);
+  }
+
+  /**
+   * TRA-586 — fetch up to `count` *daily* OHLCV bars for `symbol`, ending today.
+   *
+   * Tradier `/markets/history` returns end-of-day bars between `start` and `end`
+   * (US/Eastern day bounds). We request a generous calendar window (~1.6
+   * calendar days per trading day, plus a week of slack) so weekends/holidays
+   * still leave `count` sessions, then take the trailing `count` rows.
+   *
+   * Unlike intraday timesales, daily bars are NOT volume-filtered — cash indices
+   * report zero daily volume — so an index/ETF series is preserved intact.
+   *
+   * Returns `[]` when the series is empty; throws on a non-2xx response so the
+   * caller can trip its breaker and fall through to a backup feed.
+   */
+  async getDailyBars(symbol: string, count: number): Promise<Candle[]> {
+    if (!Number.isFinite(count) || count <= 0) return [];
+    const end = new Date();
+    const start = new Date(end.getTime() - (count * 1.6 + 7) * 24 * 60 * 60 * 1000);
+    const params = new URLSearchParams({
+      symbol,
+      interval: 'daily',
+      start: formatDay(start),
+      end: formatDay(end),
+    });
+    const url = `${this.baseUrl}/markets/history?${params}`;
+    const resp = await fetch(url, { headers: this.headers });
+    if (!resp.ok) {
+      throw new Error(`Tradier history(${symbol}) HTTP ${resp.status}: ${(await resp.text().catch(() => '')).slice(0, 200)}`);
+    }
+    const data = (await resp.json()) as TradierHistoryEnvelope;
+    if (!data.history || typeof data.history !== 'object') return [];
+    const candles: Candle[] = [];
+    for (const r of asArray(data.history.day)) {
+      if (!r.date) continue;
+      if (
+        typeof r.open !== 'number' ||
+        typeof r.high !== 'number' ||
+        typeof r.low !== 'number' ||
+        typeof r.close !== 'number'
+      ) continue;
+      // Anchor the daily bar at ET market-day midnight so the timestamp lands on
+      // the correct calendar session regardless of the runtime's local zone.
+      const ts = Date.parse(`${r.date}T00:00:00${currentEtIsoOffset(end)}`);
+      if (!Number.isFinite(ts)) continue;
+      candles.push({
+        symbol,
+        timestamp: ts,
+        open: r.open,
+        high: r.high,
+        low: r.low,
+        close: r.close,
+        volume: r.volume ?? 0,
       });
     }
     candles.sort((a, b) => a.timestamp - b.timestamp);
