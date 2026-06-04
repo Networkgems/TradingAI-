@@ -722,6 +722,76 @@ export async function getLatestMarketReview(
   return match ?? null;
 }
 
+/**
+ * TRA-589 — pick the review kind to (re)generate for an off-schedule run. The
+ * scheduled jobs fire pre-market (9 AM ET) and post-market (9 PM ET); an
+ * on-boot or stale-recompute run picks the kind that matches the current ET
+ * session — pre-market through the trading day, post-market once the cash
+ * session has closed (≥ 16:00 ET).
+ */
+export function defaultReviewKind(now: Date = new Date()): 'premarket' | 'postmarket' {
+  const hour = Number(
+    now.toLocaleString('en-US', {
+      timeZone: 'America/New_York',
+      hour: '2-digit',
+      hour12: false,
+    }),
+  );
+  // `hour` is 0–24 (some runtimes print "24" at midnight); treat the cash-close
+  // boundary (16:00 ET) onward as post-market.
+  return Number.isFinite(hour) && hour >= 16 && hour < 24 ? 'postmarket' : 'premarket';
+}
+
+/**
+ * TRA-589 — a persisted review is *stale* when it can no longer be trusted to
+ * describe the current tape:
+ *
+ *   - there is no review yet (cold store), or
+ *   - it predates the current ET trading session (`date` ≠ today ET), or
+ *   - it was produced from a dark trend feed (`trendState` unknown/absent).
+ *
+ * The last case is the TRA-589 bug: a deploy can repair the feed (the Tradier
+ * fallback now resolves a real regime) while the banner keeps rendering the last
+ * persisted YELLOW "feed unavailable" review until the next scheduled job. A
+ * stale review is recomputed live before it is served.
+ */
+export function isReviewStale(
+  review: MarketReview | null | undefined,
+  now: Date = new Date(),
+): boolean {
+  if (!review) return true;
+  if (review.date !== etDate(now)) return true;
+  const trendState = review.gates.trendState;
+  return trendState == null || trendState === 'unknown';
+}
+
+/**
+ * TRA-589 — the review the dashboard banner reads. Returns the latest persisted
+ * review when it is current, otherwise recomputes it live (and persists +
+ * republishes it) before serving, so a deploy that repairs a dark feed reflects
+ * immediately instead of waiting for the next scheduled review job. Reuses the
+ * live-compute path of {@link generateMarketReview} rather than duplicating the
+ * regime logic; on a recompute failure it falls back to the stale review (or
+ * `null`) rather than erroring.
+ */
+export async function getFreshMarketReview(
+  kind?: 'premarket' | 'postmarket',
+  now: Date = new Date(),
+): Promise<MarketReview | null> {
+  const persisted = await getLatestMarketReview(kind);
+  if (!isReviewStale(persisted, now)) return persisted;
+  const refreshKind = kind ?? persisted?.kind ?? defaultReviewKind(now);
+  try {
+    return await generateMarketReview(refreshKind);
+  } catch (err) {
+    log.error('stale market-review live recompute failed', {
+      refreshKind,
+      reason: err instanceof Error ? err.message : String(err),
+    });
+    return persisted ?? null;
+  }
+}
+
 /** Test-only: reset the in-memory cache and optionally override the store path. */
 export function __resetMarketReviewStoreForTests(overridePath?: string | null): void {
   cache = null;

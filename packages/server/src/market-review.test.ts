@@ -1,8 +1,37 @@
-import { describe, it, expect, beforeEach, afterEach } from 'vitest';
+import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import { mkdtempSync, rmSync, writeFileSync } from 'fs';
 import { tmpdir } from 'os';
 import { join } from 'path';
 import type { Candle, MarketReview } from '@trading-app/shared';
+
+// TRA-589 — the stale-recompute path calls the live feeds + research store. Stub
+// both so `getFreshMarketReview` recomputes deterministically (no network, no
+// stray file writes). The pure-helper and store-round-trip suites below never
+// touch these modules, so the module-wide mock is inert for them.
+vi.mock('./yahoo-feed.js', () => ({
+  // A clean 55-bar uptrend: last close clears the +1% trend band → GREEN.
+  fetchDailyCandles: vi.fn(async () =>
+    Array.from({ length: 55 }, (_, i) => ({
+      symbol: '^GSPC',
+      timestamp: i * 86_400_000,
+      open: 5000 + i * 10,
+      high: 5000 + i * 10,
+      low: 5000 + i * 10,
+      close: 5000 + i * 10,
+      volume: 0,
+    })),
+  ),
+  fetchTradierDailyCandles: vi.fn(async () => [] as Candle[]),
+  fetchQuote: vi.fn(async (symbol: string) => {
+    if (symbol === '^VIX' || symbol === 'VIX') return { price: 13, volume: 0, change: 0, changePct: 0 };
+    if (symbol === '^TNX') return { price: 4.0, volume: 0, change: 0, changePct: 0 };
+    return null;
+  }),
+}));
+
+vi.mock('./research-store.js', () => ({
+  saveResearchReport: vi.fn(async () => undefined),
+}));
 import {
   classifyMarketRegime,
   deriveGates,
@@ -12,6 +41,9 @@ import {
   simpleMa,
   listMarketReviews,
   getLatestMarketReview,
+  getFreshMarketReview,
+  isReviewStale,
+  defaultReviewKind,
   __resetMarketReviewStoreForTests,
   MA_PERIOD,
   TREND_HYSTERESIS,
@@ -389,5 +421,151 @@ describe('market-review store', () => {
 
   it('returns null when no review has been generated yet', async () => {
     expect(await getLatestMarketReview()).toBeNull();
+  });
+});
+
+// ── TRA-589 — stale-banner recompute ─────────────────────────────────────────
+
+describe('isReviewStale (TRA-589)', () => {
+  // Fixed clock: 2026-06-04 15:00Z = 11:00 ET → today ET is 2026-06-04.
+  const now = new Date('2026-06-04T15:00:00.000Z');
+
+  function review(date: string, trendState?: 'up' | 'down' | 'unknown'): MarketReview {
+    return {
+      id: `premarket-${date}`,
+      kind: 'premarket',
+      date,
+      generatedAt: `${date}T13:00:00.000Z`,
+      regime: 'green',
+      regimeRationale: 'test',
+      indexes: [],
+      gates: {
+        orbLongs: true,
+        orbShorts: false,
+        meanReversionTilt: false,
+        breakoutsEnabled: true,
+        sizingMultiplier: 1,
+        trendState,
+      },
+      source: 'auto',
+    };
+  }
+
+  it('is stale when there is no review (cold store)', () => {
+    expect(isReviewStale(null, now)).toBe(true);
+    expect(isReviewStale(undefined, now)).toBe(true);
+  });
+
+  it('is stale when the review predates the current ET session', () => {
+    expect(isReviewStale(review('2026-06-03', 'up'), now)).toBe(true);
+  });
+
+  it('is stale when the trend feed was dark (trendState unknown/absent)', () => {
+    expect(isReviewStale(review('2026-06-04', 'unknown'), now)).toBe(true);
+    expect(isReviewStale(review('2026-06-04', undefined), now)).toBe(true);
+  });
+
+  it('is fresh when current-session with a known trend', () => {
+    expect(isReviewStale(review('2026-06-04', 'up'), now)).toBe(false);
+    expect(isReviewStale(review('2026-06-04', 'down'), now)).toBe(false);
+  });
+});
+
+describe('defaultReviewKind (TRA-589)', () => {
+  it('is premarket through the trading day and postmarket after the cash close', () => {
+    // 13:00Z = 09:00 ET → premarket; 21:00Z = 17:00 ET → postmarket.
+    expect(defaultReviewKind(new Date('2026-06-04T13:00:00.000Z'))).toBe('premarket');
+    expect(defaultReviewKind(new Date('2026-06-04T21:00:00.000Z'))).toBe('postmarket');
+  });
+});
+
+describe('getFreshMarketReview (TRA-589 live recompute)', () => {
+  let tmpRoot: string;
+  let storePath: string;
+  // 2026-06-04 15:00Z = 11:00 ET → today ET is 2026-06-04.
+  const now = new Date('2026-06-04T15:00:00.000Z');
+
+  function review(date: string, trendState: 'up' | 'down' | 'unknown'): MarketReview {
+    return {
+      id: `premarket-${date}`,
+      kind: 'premarket',
+      date,
+      generatedAt: `${date}T13:00:00.000Z`,
+      regime: trendState === 'unknown' ? 'yellow' : 'green',
+      regimeRationale: 'seed',
+      indexes: [],
+      gates: {
+        orbLongs: trendState === 'up',
+        orbShorts: trendState === 'down',
+        meanReversionTilt: false,
+        breakoutsEnabled: true,
+        sizingMultiplier: 1,
+        trendState,
+      },
+      source: 'auto',
+    };
+  }
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+    tmpRoot = mkdtempSync(join(tmpdir(), 'market-review-fresh-'));
+    storePath = join(tmpRoot, 'market-review.json');
+    __resetMarketReviewStoreForTests(storePath);
+  });
+
+  afterEach(() => {
+    rmSync(tmpRoot, { recursive: true, force: true });
+    __resetMarketReviewStoreForTests(null);
+  });
+
+  it('serves the persisted review unchanged when it is current and trend-known', async () => {
+    const { fetchDailyCandles } = await import('./yahoo-feed.js');
+    writeFileSync(
+      storePath,
+      JSON.stringify({ version: 1, reviews: [review('2026-06-04', 'up')] }),
+    );
+    const served = await getFreshMarketReview(undefined, now);
+    expect(served?.regimeRationale).toBe('seed');
+    // No live recompute when the persisted review is fresh.
+    expect(fetchDailyCandles).not.toHaveBeenCalled();
+  });
+
+  it('recomputes live + persists when the persisted review came from a dark feed', async () => {
+    const { fetchDailyCandles } = await import('./yahoo-feed.js');
+    // Same ET day, but trendState unknown — the TRA-589 stale-banner case.
+    writeFileSync(
+      storePath,
+      JSON.stringify({ version: 1, reviews: [review('2026-06-04', 'unknown')] }),
+    );
+    const served = await getFreshMarketReview(undefined, now);
+    expect(fetchDailyCandles).toHaveBeenCalled();
+    // Mocked uptrend feed → GREEN with a known up-trend, not the dark default.
+    expect(served?.regime).toBe('green');
+    expect(served?.gates.trendState).toBe('up');
+    expect(served?.regimeRationale).not.toBe('seed');
+    // Recompute persisted so the next read is consistent.
+    const persisted = await getLatestMarketReview();
+    expect(persisted?.regime).toBe('green');
+    expect(persisted?.gates.trendState).toBe('up');
+  });
+
+  it('recomputes live when the persisted review predates the session', async () => {
+    const { fetchDailyCandles } = await import('./yahoo-feed.js');
+    writeFileSync(
+      storePath,
+      JSON.stringify({ version: 1, reviews: [review('2026-06-03', 'up')] }),
+    );
+    const served = await getFreshMarketReview(undefined, now);
+    expect(fetchDailyCandles).toHaveBeenCalled();
+    // The recompute supersedes the prior-session seed (newer generatedAt).
+    expect(served?.regimeRationale).not.toBe('seed');
+    expect(served?.regime).toBe('green');
+  });
+
+  it('recomputes from a cold store (no review yet)', async () => {
+    const served = await getFreshMarketReview(undefined, now);
+    expect(served).not.toBeNull();
+    expect(served?.regime).toBe('green');
+    expect(served?.gates.trendState).toBe('up');
   });
 });

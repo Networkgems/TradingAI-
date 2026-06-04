@@ -42,6 +42,9 @@ import { recordOptionChains } from './options-chain-recorder.js';
 import {
   generateMarketReview,
   getLatestMarketReview,
+  getFreshMarketReview,
+  isReviewStale,
+  defaultReviewKind,
   listMarketReviews,
   peekMarketRegime,
 } from './market-review.js';
@@ -283,12 +286,17 @@ await initAllUserContexts();
 // `/api/research/reports` aren't shadowed.
 await seedSampleResearchReportIfEmpty();
 
-// TRA-386 — warm the market-review feed on boot so `/api/market-review/latest`
-// and the News tab have a regime read before the first scheduled fire. Fired
-// non-blocking: a cold/slow Yahoo feed must not delay server startup.
+// TRA-386 / TRA-589 — warm the market-review feed on boot so the dashboard
+// banner and News tab reflect the *current* regime before the first scheduled
+// fire. Regenerates when there is no review yet OR the latest is stale —
+// predates the current ET session or came from a dark trend feed — so a deploy
+// that repairs the feed (e.g. the TRA-586 Tradier fallback) reflects
+// immediately instead of serving the last persisted YELLOW review until the
+// next scheduled job. Fired non-blocking: a cold/slow feed must not delay
+// startup.
 void getLatestMarketReview().then(existing => {
-  if (existing) return;
-  void generateMarketReview('premarket').catch(err =>
+  if (!isReviewStale(existing)) return;
+  void generateMarketReview(existing?.kind ?? defaultReviewKind()).catch(err =>
     log.error('market-review boot-time generation failed', {
       reason: err instanceof Error ? err.message : String(err),
     }),
@@ -1896,12 +1904,17 @@ app.get('/api/research/reports/:id', requireAuth, async (req, res) => {
 // on a hand-written QuantTrader review.
 //
 // `GET /api/market-review/latest` — most recent review; `?kind=premarket` or
-// `?kind=postmarket` scopes it. Returns 404 before the first scheduler fire.
+// `?kind=postmarket` scopes it. TRA-589: recomputes live when the persisted
+// review is stale/dark. Returns 404 only when no review exists and a live
+// recompute could not produce one.
 app.get('/api/market-review/latest', requireAuth, async (req, res) => {
   const rawKind = (req.query as Record<string, unknown>)['kind'];
   const kind =
     rawKind === 'premarket' || rawKind === 'postmarket' ? rawKind : undefined;
-  const review = await getLatestMarketReview(kind);
+  // TRA-589 — recompute live before serving when the persisted review is stale
+  // (predates the current ET session or came from a dark feed), so the banner
+  // reflects a feed repaired by a deploy without waiting for the next job.
+  const review = await getFreshMarketReview(kind);
   if (!review) {
     res.status(404).json({ error: 'No market review available yet' });
     return;
