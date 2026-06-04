@@ -430,6 +430,7 @@ export class SignalEngine {
 
   private tickTimer: ReturnType<typeof setInterval> | null = null;
   private tickRunning = false;
+  private candleScanTickCount = 0;
   /**
    * TRA-407 (C5) — the in-progress tick's promise (or a resolved promise when
    * idle). `drain()` awaits this so a graceful shutdown finishes the current
@@ -1291,11 +1292,23 @@ export class SignalEngine {
       this.mode === 'demo'
       || (this.mode === 'live' && this.liveTradeEquitiesTradier && this.tradierLiveEquityClient !== null);
     if (equityStrategiesActiveOnTick) {
+      this.candleScanTickCount++;
       const CANDLE_BATCH = 5;
-      for (let i = 0; i < activeSymbols.length; i += CANDLE_BATCH) {
-        await Promise.all(
-          activeSymbols.slice(i, i + CANDLE_BATCH).map(sym => this.refreshCandles(sym)),
+      // TRA-554: gate the bar pull to active-interest symbols every tick, with a
+      // slow full-watchlist scan every 10 ticks (~5 min) for signal discovery.
+      // Skip entirely when the market is closed — Tradier timesales returns empty
+      // outside session hours (session_filter=open) so fetching is pure waste.
+      if (isStockMarketOpen()) {
+        const COLD_SCAN_INTERVAL = 10;
+        const isColdScanTick = this.candleScanTickCount % COLD_SCAN_INTERVAL === 0;
+        const symbolsToFetch = activeSymbols.filter(
+          sym => activeInterest.has(sym) || isColdScanTick,
         );
+        for (let i = 0; i < symbolsToFetch.length; i += CANDLE_BATCH) {
+          await Promise.all(
+            symbolsToFetch.slice(i, i + CANDLE_BATCH).map(sym => this.refreshCandles(sym)),
+          );
+        }
       }
     }
 
