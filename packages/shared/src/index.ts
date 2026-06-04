@@ -864,6 +864,16 @@ export interface AccountSettings {
   stocksAutoTradingEnabled?: boolean;
   /** @deprecated TRA-229 — superseded by cryptoAutoTradingEnabled{Demo,Live}. */
   cryptoAutoTradingEnabled?: boolean;
+  /**
+   * TRA-587 — one-shot marker that the server's legacy `cryptoAutoTradingEnabledLive`
+   * default migration has already run for this account. Pre-TRA-575 installs persisted
+   * `cryptoAutoTradingEnabledLive: true` (the old default), which keeps overriding the
+   * new `false` default on load and re-arms the crypto promotion gate on every
+   * live-switch. The server flips that stale `true` to `false` ONCE and stamps this
+   * marker so a user who later deliberately re-enables live crypto is never re-flipped.
+   * Absent on legacy files (triggers the migration); `true` on every new/migrated file.
+   */
+  cryptoLiveDefaultMigratedTra587?: boolean;
   // Live mode settings — legacy un-suffixed fields. Kept as a read-time
   // fallback so existing saved settings still surface in the UI; new writes
   // land on the per-market fields below so Coinbase (crypto) and Webull
@@ -1129,6 +1139,11 @@ export const DEFAULT_ACCOUNT_SETTINGS: AccountSettings = {
   // until the user explicitly enables it (which re-arms the gate). Never auto-trade
   // real crypto capital by default.
   cryptoAutoTradingEnabledLive: false,
+  // TRA-587 — new accounts are born already-migrated so the legacy crypto-live
+  // default migration never touches them; only files written before this field
+  // existed (no marker) get the one-shot true→false flip. See the server-side
+  // `migrateLegacyCryptoLiveDefault`.
+  cryptoLiveDefaultMigratedTra587: true,
   liveBrokerageType: 'webull',
   liveTradeMode: 'ai_in_brokerage',
   liveApiKey: '',

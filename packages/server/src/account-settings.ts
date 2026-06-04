@@ -86,6 +86,37 @@ export function migrateLegacyLiveCredentials(input: AccountSettings): {
   return { settings: next, migrated: true };
 }
 
+// TRA-587 — pre-TRA-575 installs persisted `cryptoAutoTradingEnabledLive: true`
+// (the old DEFAULT_ACCOUNT_SETTINGS value). TRA-575 flipped that default to
+// `false` so a live-switch no longer trips the TRA-532 crypto promotion gate for
+// stocks-only users — but it never migrated EXISTING saved files, whose persisted
+// `true` still overrides the new default on load (loadSettings merges
+// `{ ...DEFAULT_ACCOUNT_SETTINGS, ...JSON.parse(raw) }`). Those legacy accounts
+// therefore keep getting "Could not switch to live — promotion gate" (TRA-587).
+//
+// Flip the stale `true` to `false` exactly ONCE per account, completing TRA-575's
+// "live crypto is strictly opt-in" intent for existing accounts. A user who truly
+// wants live crypto re-enables it via POST /api/crypto/trading/start (mode=live),
+// which sets the flag back on AND enforces the same gate — so nobody is stranded
+// and the gate is not weakened. The `cryptoLiveDefaultMigratedTra587` marker
+// (born `true` in DEFAULT_ACCOUNT_SETTINGS for new accounts, absent on legacy
+// files) guarantees we only flip on the first load of a pre-marker file and never
+// re-flip a deliberate post-migration opt-in. `markerPresentOnDisk` must be read
+// from the RAW parsed JSON, not the defaults-merged object — the merge would
+// otherwise inject the default `true` marker and mask every legacy file.
+export function migrateLegacyCryptoLiveDefault(
+  input: AccountSettings,
+  markerPresentOnDisk: boolean,
+): {
+  settings: AccountSettings;
+  migrated: boolean;
+} {
+  if (markerPresentOnDisk) return { settings: input, migrated: false };
+  const next: AccountSettings = { ...input, cryptoLiveDefaultMigratedTra587: true };
+  if (input.cryptoAutoTradingEnabledLive === true) next.cryptoAutoTradingEnabledLive = false;
+  return { settings: next, migrated: true };
+}
+
 async function persistMigrated(username: string, settings: AccountSettings): Promise<void> {
   const dir = dirname(userSettingsFile(username));
   if (!existsSync(dir)) {
@@ -105,16 +136,28 @@ export async function loadSettings(username: string): Promise<AccountSettings> {
   }
   try {
     const raw = await readFile(file, 'utf-8');
-    const merged = { ...DEFAULT_ACCOUNT_SETTINGS, ...JSON.parse(raw) } as AccountSettings;
+    const parsed = JSON.parse(raw) as Partial<AccountSettings>;
+    const merged = { ...DEFAULT_ACCOUNT_SETTINGS, ...parsed } as AccountSettings;
     const credsResult = migrateLegacyLiveCredentials(merged);
     const flagsResult = migrateLegacyAutoTradingFlags(credsResult.settings);
-    const settings = flagsResult.settings;
-    const migrated = credsResult.migrated || flagsResult.migrated;
+    // TRA-587 — detect the legacy crypto-live default from the RAW parse: the
+    // defaults-merged `merged` always carries the marker, so the marker presence
+    // check must read `parsed`, not `merged` (see migrateLegacyCryptoLiveDefault).
+    const cryptoLiveResult = migrateLegacyCryptoLiveDefault(
+      flagsResult.settings,
+      parsed.cryptoLiveDefaultMigratedTra587 === true,
+    );
+    const settings = cryptoLiveResult.settings;
+    const migrated = credsResult.migrated || flagsResult.migrated || cryptoLiveResult.migrated;
     if (migrated) {
       try {
         await persistMigrated(username, settings);
         if (credsResult.migrated) log.info('TRA-165 migration: cleared legacy live creds', { username });
         if (flagsResult.migrated) log.info('TRA-229 migration: split auto-trading flags by mode', { username });
+        if (cryptoLiveResult.migrated)
+          log.info('TRA-587 migration: defaulted legacy live-crypto auto-trading OFF (strictly opt-in)', {
+            username,
+          });
       } catch (err: unknown) {
         log.warn('migration: failed to persist migrated settings', {
           username,

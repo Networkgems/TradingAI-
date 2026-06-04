@@ -19,6 +19,7 @@ let loadSettings: AccountSettingsModule['loadSettings'];
 let saveSettings: AccountSettingsModule['saveSettings'];
 let clearSettingsCache: AccountSettingsModule['clearSettingsCache'];
 let migrateLegacyLiveCredentials: AccountSettingsModule['migrateLegacyLiveCredentials'];
+let migrateLegacyCryptoLiveDefault: AccountSettingsModule['migrateLegacyCryptoLiveDefault'];
 // TRA-349 — also bound through the same dynamic import so the helpers we test
 // belong to the same module instance whose DATA_DIR was captured against
 // TMP_ROOT. A static `import { ... } from './account-settings.js'` at the top
@@ -35,6 +36,7 @@ beforeAll(async () => {
   saveSettings = mod.saveSettings;
   clearSettingsCache = mod.clearSettingsCache;
   migrateLegacyLiveCredentials = mod.migrateLegacyLiveCredentials;
+  migrateLegacyCryptoLiveDefault = mod.migrateLegacyCryptoLiveDefault;
   clampScopedRatio = mod.clampScopedRatio;
   clampScopedRisk = mod.clampScopedRisk;
   mergeScopedRiskSettings = mod.mergeScopedRiskSettings;
@@ -163,6 +165,81 @@ describe('loadSettings persistence (TRA-165)', () => {
     const second = await loadSettings(USER);
     expect(second.liveApiKey).toBe('');
     expect(second.liveApiKeyCrypto).toBe('coinbase-key');
+  });
+});
+
+describe('migrateLegacyCryptoLiveDefault (TRA-587)', () => {
+  it('flips a legacy persisted cryptoAutoTradingEnabledLive: true to false and stamps the marker', () => {
+    const before: AccountSettings = {
+      ...DEFAULT_ACCOUNT_SETTINGS,
+      cryptoAutoTradingEnabledLive: true,
+    };
+    // markerPresentOnDisk = false → legacy file written before the marker existed.
+    const { settings, migrated } = migrateLegacyCryptoLiveDefault(before, false);
+    expect(migrated).toBe(true);
+    expect(settings.cryptoAutoTradingEnabledLive).toBe(false);
+    expect(settings.cryptoLiveDefaultMigratedTra587).toBe(true);
+  });
+
+  it('still stamps the marker (one-shot) even when crypto-live was already false', () => {
+    const before: AccountSettings = {
+      ...DEFAULT_ACCOUNT_SETTINGS,
+      cryptoAutoTradingEnabledLive: false,
+    };
+    const { settings, migrated } = migrateLegacyCryptoLiveDefault(before, false);
+    expect(migrated).toBe(true);
+    expect(settings.cryptoAutoTradingEnabledLive).toBe(false);
+    expect(settings.cryptoLiveDefaultMigratedTra587).toBe(true);
+  });
+
+  it('is a no-op once the marker is present — never re-flips a deliberate opt-in', () => {
+    const before: AccountSettings = {
+      ...DEFAULT_ACCOUNT_SETTINGS,
+      cryptoAutoTradingEnabledLive: true,
+      cryptoLiveDefaultMigratedTra587: true,
+    };
+    const { settings, migrated } = migrateLegacyCryptoLiveDefault(before, true);
+    expect(migrated).toBe(false);
+    expect(settings.cryptoAutoTradingEnabledLive).toBe(true);
+    expect(settings).toBe(before);
+  });
+});
+
+describe('loadSettings crypto-live default migration (TRA-587)', () => {
+  it('disables live crypto for a legacy file with the old true default and persists it', async () => {
+    // A pre-TRA-575 file: crypto-live ON, no migration marker. This is the
+    // TRA-587 reporter's state — switching to live trips the crypto gate.
+    const file = writeUserSettingsFile({
+      mode: 'demo',
+      cryptoAutoTradingEnabledLive: true,
+    });
+    clearSettingsCache(USER);
+
+    const first = await loadSettings(USER);
+    expect(first.cryptoAutoTradingEnabledLive).toBe(false);
+    expect(first.cryptoLiveDefaultMigratedTra587).toBe(true);
+
+    const onDisk = JSON.parse(readFileSync(file, 'utf-8')) as AccountSettings;
+    expect(onDisk.cryptoAutoTradingEnabledLive).toBe(false);
+    expect(onDisk.cryptoLiveDefaultMigratedTra587).toBe(true);
+
+    // Next read is already clean — the migration does not run twice.
+    clearSettingsCache(USER);
+    const second = await loadSettings(USER);
+    expect(second.cryptoAutoTradingEnabledLive).toBe(false);
+  });
+
+  it('preserves a deliberate live-crypto opt-in once the marker is on disk', async () => {
+    // Post-migration the user re-enabled live crypto (marker already present).
+    // A subsequent load must NOT flip it back off.
+    writeUserSettingsFile({
+      mode: 'live',
+      cryptoAutoTradingEnabledLive: true,
+      cryptoLiveDefaultMigratedTra587: true,
+    });
+    clearSettingsCache(USER);
+    const reloaded = await loadSettings(USER);
+    expect(reloaded.cryptoAutoTradingEnabledLive).toBe(true);
   });
 });
 
