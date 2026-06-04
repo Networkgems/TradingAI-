@@ -83,6 +83,46 @@ export interface EngineState {
   marketReview: EngineMarketReviewState;
 }
 
+/**
+ * TRA-580 — redacted, read-only acceptance snapshot for one engine, proving
+ * the first organic production Tradier equity OTOCO bracket fired correctly.
+ * Carries ONLY booleans / counts / coarse timestamps — never a symbol,
+ * quantity, price, order id, account id, or balance — so it can back an
+ * unauthenticated `/api/health/live-equity` probe without leaking trade
+ * specifics or strategy detail (parity with the existing unauth
+ * `/api/health/version` surface). Each field maps to a TRA-580 acceptance
+ * line:
+ *
+ *   1. `liveSignalCount`              — signals stamped `mode:live` fired.
+ *   2. `liveEquityBracketsWithBothLegs` — mirror carries OCO TP + SL legs.
+ *   3. `liveEquityMirrorsWithOrderId` — engine mirrored the Tradier fill.
+ *   4. `liveSkipReasonCount`         — broker-side rejects surfaced (not dropped).
+ */
+export interface LiveEquityAcceptance {
+  /** Active engine mode at read time. */
+  mode: 'demo' | 'live';
+  /** Tradier env this engine is configured against. */
+  tradierEnv: TradierEnv;
+  /** True when a live Tradier equity client is wired (creds + toggle + live mode). */
+  liveEquityClientConfigured: boolean;
+  /** True when the user opted into live equity mirroring (`liveTradeEquitiesTradier`). */
+  liveEquityTradingEnabled: boolean;
+  /** Count of recent signals stamped `mode:live` (acceptance line 1). */
+  liveSignalCount: number;
+  /** Count of mirrored live Tradier equity positions (acceptance line 3). */
+  liveEquityPositionCount: number;
+  /** Of those mirrors, how many carry BOTH a take-profit and a stop-loss leg (line 2). */
+  liveEquityBracketsWithBothLegs: number;
+  /** Of those mirrors, how many captured a Tradier entry-leg order id (line 3). */
+  liveEquityMirrorsWithOrderId: number;
+  /** Count of recent live signals carrying a broker-side `liveSkipReason` (line 4). */
+  liveSkipReasonCount: number;
+  /** True once a mirror exists with both OCO legs AND a captured order id. */
+  firstLiveEquityFillConfirmed: boolean;
+  /** ISO time of the most recent live-equity mirror open, or null. Coarse — no trade detail. */
+  lastLiveEquityFillAt: string | null;
+}
+
 export type EngineEventHandler = (state: EngineState) => void;
 
 const MAX_SIGNALS = 50;
@@ -3519,6 +3559,45 @@ export class SignalEngine {
       agentRecommendations: this.latestAgentRecommendations,
       marketOpen: isStockMarketOpen(),
       marketReview: this.buildMarketReviewState(),
+    };
+  }
+
+  /**
+   * TRA-580 — redacted, read-only acceptance snapshot for the first organic
+   * production Tradier equity OTOCO fill. Returns ONLY booleans / counts /
+   * coarse timestamps (see {@link LiveEquityAcceptance}); never a symbol,
+   * quantity, price, order id, account id, or balance — so it can back an
+   * unauthenticated `/api/health/live-equity` probe without leaking trade
+   * specifics. Mode-independent: reads the live-equity stores directly rather
+   * than the mode-masked `getState()` view, so the evidence holds regardless
+   * of the dashboard's current Demo/Live toggle. Pure read — never throws.
+   */
+  getLiveEquityAcceptance(): LiveEquityAcceptance {
+    const mirrors = Array.from(this.liveEquityPositions.values());
+    // A real OTOCO mirror carries both an OCO take-profit and a stop-loss leg.
+    const bracketsWithBothLegs = mirrors.filter(
+      p => Number.isFinite(p.takeProfit) && Number.isFinite(p.stopLoss),
+    ).length;
+    // Entry-leg order id captured — proves Tradier accepted the bracket.
+    const mirrorsWithOrderId = mirrors.filter(p => this.liveEquityOrderIds.has(p.id)).length;
+    const liveSignals = this.recentSignals.filter(s => s.mode === 'live');
+    const liveSkipReasonCount = liveSignals.filter(
+      s => typeof s.liveSkipReason === 'string' && s.liveSkipReason.length > 0,
+    ).length;
+    let lastOpenedAt = 0;
+    for (const p of mirrors) if (p.openedAt > lastOpenedAt) lastOpenedAt = p.openedAt;
+    return {
+      mode: this.mode,
+      tradierEnv: this.tradierEnv,
+      liveEquityClientConfigured: this.tradierLiveEquityClient !== null,
+      liveEquityTradingEnabled: this.liveTradeEquitiesTradier,
+      liveSignalCount: liveSignals.length,
+      liveEquityPositionCount: mirrors.length,
+      liveEquityBracketsWithBothLegs: bracketsWithBothLegs,
+      liveEquityMirrorsWithOrderId: mirrorsWithOrderId,
+      liveSkipReasonCount,
+      firstLiveEquityFillConfirmed: bracketsWithBothLegs > 0 && mirrorsWithOrderId > 0,
+      lastLiveEquityFillAt: lastOpenedAt > 0 ? new Date(lastOpenedAt).toISOString() : null,
     };
   }
 

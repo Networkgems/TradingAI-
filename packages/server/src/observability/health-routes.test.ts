@@ -7,11 +7,12 @@ import { describe, it, expect, beforeEach } from 'vitest';
 import {
   registerLiveHealthRoutes,
   runStaleStateCheck,
+  aggregateLiveEquityAcceptance,
   type HealthUserContext,
 } from './health-routes.js';
 import { checkStaleState } from './alerts.js';
 import { getRecentAlerts, __resetAlertsForTest } from './alerts.js';
-import type { EngineState } from '../signal-engine.js';
+import type { EngineState, LiveEquityAcceptance } from '../signal-engine.js';
 import type { AccountSettings } from '@trading-app/shared';
 
 const NOW = 2_000_000_000;
@@ -101,6 +102,103 @@ describe('registerLiveHealthRoutes', () => {
     expect(body.status).toBe('green');
     expect(body.build).toBeDefined();
     expect(body.feed.trackedSymbols).toBe(1);
+  });
+});
+
+describe('TRA-580 live-equity acceptance probe', () => {
+  function snap(over: Partial<LiveEquityAcceptance> = {}): LiveEquityAcceptance {
+    return {
+      mode: 'live',
+      tradierEnv: 'production',
+      liveEquityClientConfigured: true,
+      liveEquityTradingEnabled: true,
+      liveSignalCount: 0,
+      liveEquityPositionCount: 0,
+      liveEquityBracketsWithBothLegs: 0,
+      liveEquityMirrorsWithOrderId: 0,
+      liveSkipReasonCount: 0,
+      firstLiveEquityFillConfirmed: false,
+      lastLiveEquityFillAt: null,
+      ...over,
+    };
+  }
+
+  it('aggregates fleet counts and confirms the first fill when a mirror has both legs + an order id', () => {
+    const report = aggregateLiveEquityAcceptance(
+      [
+        snap({
+          liveSignalCount: 2,
+          liveEquityPositionCount: 1,
+          liveEquityBracketsWithBothLegs: 1,
+          liveEquityMirrorsWithOrderId: 1,
+          firstLiveEquityFillConfirmed: true,
+          lastLiveEquityFillAt: new Date(NOW - 60_000).toISOString(),
+        }),
+        snap({ mode: 'demo', tradierEnv: 'sandbox', liveSignalCount: 0, liveSkipReasonCount: 1 }),
+      ],
+      NOW,
+    );
+    expect(report.ok).toBe(true);
+    expect(report.engineCount).toBe(2);
+    expect(report.liveEngineCount).toBe(1);
+    expect(report.productionEngineCount).toBe(1);
+    expect(report.firstLiveEquityFillConfirmed).toBe(true);
+    expect(report.totals).toMatchObject({
+      liveSignals: 2,
+      liveEquityPositions: 1,
+      liveEquityBracketsWithBothLegs: 1,
+      liveEquityMirrorsWithOrderId: 1,
+      liveSkipReasons: 1,
+    });
+    expect(report.lastLiveEquityFillAt).toBe(new Date(NOW - 60_000).toISOString());
+    expect(report.build).toBeDefined();
+  });
+
+  it('reports not-yet-confirmed for an armed-but-unfired fleet and never leaks trade specifics', () => {
+    const report = aggregateLiveEquityAcceptance([snap()], NOW);
+    expect(report.firstLiveEquityFillConfirmed).toBe(false);
+    expect(report.lastLiveEquityFillAt).toBeNull();
+    // Redaction guard: only the documented redacted keys are present.
+    expect(Object.keys(report).sort()).toEqual(
+      [
+        'build',
+        'engineCount',
+        'firstLiveEquityFillConfirmed',
+        'lastLiveEquityFillAt',
+        'liveEngineCount',
+        'liveEquityClientConfigured',
+        'liveEquityTradingEnabled',
+        'ok',
+        'productionEngineCount',
+        'time',
+        'totals',
+      ].sort(),
+    );
+  });
+
+  it('mounts GET /api/health/live-equity (unauthenticated) only when the dep is provided', () => {
+    const withDep = fakeApp();
+    registerLiveHealthRoutes(withDep.app, {
+      requireAuth: ((_q: unknown, _s: unknown, n: () => void) => n()) as never,
+      userCtx: async () => ctx('admin', engineState()),
+      getSettings: () => settings(),
+      liveEquityAcceptance: () => [snap({ firstLiveEquityFillConfirmed: true })],
+      now: () => NOW,
+    });
+    const handlers = withDep.routes.get('/api/health/live-equity')!;
+    expect(handlers).toHaveLength(1); // unauthenticated, like /version
+    const res = fakeRes();
+    handlers[0]!({}, res);
+    expect((res.body as { firstLiveEquityFillConfirmed: boolean }).firstLiveEquityFillConfirmed).toBe(true);
+
+    const without = fakeApp();
+    registerLiveHealthRoutes(without.app, {
+      requireAuth: ((_q: unknown, _s: unknown, n: () => void) => n()) as never,
+      userCtx: async () => ctx('admin', engineState()),
+      getSettings: () => settings(),
+      now: () => NOW,
+    });
+    expect(without.routes.get('/api/health/live-equity')).toBeUndefined();
   });
 });
 

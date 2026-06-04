@@ -1144,7 +1144,18 @@ app.get('/api/health', (_req, res) => {
 //                              (mode, broker auth, feed freshness, halt, build).
 // Handlers + the monitor's stale-state probe live in observability/health-routes
 // so this file only injects the request-scoped deps it owns.
-registerLiveHealthRoutes(app, { requireAuth, userCtx, getSettings });
+// TRA-580 — also expose the redacted, unauthenticated live-equity acceptance
+// probe. `liveEquityAcceptance` enumerates every engine via the existing
+// `getAllUserContexts()` and maps each to its redacted snapshot (booleans /
+// counts / timestamps only — no trade specifics), so the first organic
+// production Tradier OTOCO fill can be verified against the live deployment
+// without shipping credentials into an agent env.
+registerLiveHealthRoutes(app, {
+  requireAuth,
+  userCtx,
+  getSettings,
+  liveEquityAcceptance: () => getAllUserContexts().map(ctx => ctx.engine.getLiveEquityAcceptance()),
+});
 
 // TRA-406 — observability surface. Returns the recent in-memory alerts and the
 // 15-minute captured-error count so QA / ops can see incident state without

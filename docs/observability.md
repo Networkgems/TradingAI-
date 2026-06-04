@@ -124,6 +124,32 @@ All optional — defaults are listed in `render.yaml`.
 | `MAX_BOOTS_PER_WINDOW` | Restart-storm threshold (default 5 / 10 min). |
 | `ERROR_SPIKE_THRESHOLD` | Errors-per-15-min alert threshold (default 25). |
 
+## Live-equity acceptance probe (TRA-580)
+
+`GET /api/health/live-equity` is an **unauthenticated, read-only** probe (parity
+with `GET /api/health/version`) that proves the first organic **production**
+Tradier equity OTOCO bracket fired correctly — without shipping broker
+credentials into a dev/agent env. It enumerates every engine and returns ONLY
+booleans / counts / timestamps; **never** a symbol, quantity, price, order id,
+account id, or balance.
+
+```bash
+curl -s https://<deployment>/api/health/live-equity | jq
+```
+
+Maps to the four TRA-580 acceptance lines:
+
+| Field | Acceptance line |
+| --- | --- |
+| `totals.liveSignals` / `liveEngineCount` | 1 — a signal fired in `mode:live`. |
+| `totals.liveEquityBracketsWithBothLegs` | 2 — OTOCO has paired OCO TP + SL legs. |
+| `totals.liveEquityMirrorsWithOrderId`, `lastLiveEquityFillAt` | 3 — engine mirrored the Tradier fill (`mode:live`). |
+| `totals.liveSkipReasons` | 4 — broker rejects surface (not silently dropped). |
+
+`firstLiveEquityFillConfirmed` is the headline bit: `true` once any engine has a
+mirror carrying both OCO legs **and** a captured order id. `productionEngineCount`
+confirms the reading is against a `production`-env engine, not sandbox.
+
 ## Known follow-ups
 
 - Desktop-app (Electron) error telemetry — tracked separately; the renderer

@@ -55,5 +55,5 @@ export type {
   FeedHealth,
   HealthStatus,
 } from './live-health.js';
-export { registerLiveHealthRoutes, runStaleStateCheck } from './health-routes.js';
-export type { LiveHealthDeps, HealthUserContext, HealthEngineLike } from './health-routes.js';
+export { registerLiveHealthRoutes, runStaleStateCheck, aggregateLiveEquityAcceptance } from './health-routes.js';
+export type { LiveHealthDeps, HealthUserContext, HealthEngineLike, LiveEquityAcceptanceReport } from './health-routes.js';
