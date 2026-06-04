@@ -428,6 +428,8 @@ async function readVix(): Promise<number | null> {
 async function readIndexes(prevTrendUp?: boolean | null): Promise<{
   inputs: RegimeInputs;
   readings: MarketReviewIndexReading[];
+  /** TRA-586 — the resolved S&P 500 trend source (provider / fallback flags). */
+  spxTrend: SpxTrendSource;
 }> {
   const [spxTrend, vix, tnxQuote] = await Promise.all([
     readSpxTrend(),
@@ -475,7 +477,7 @@ async function readIndexes(prevTrendUp?: boolean | null): Promise<{
     { symbol: TNX_SYMBOL, label: '10Y Yield', value: tnx, trendMa: null, note: tnxNote },
   ];
 
-  return { inputs, readings };
+  return { inputs, readings, spxTrend };
 }
 
 // ── Markdown rendering ───────────────────────────────────────────────────────
@@ -549,6 +551,62 @@ function trendStateToPrev(
 }
 
 /**
+ * The most-recent persisted review's trend state, mapped to the `prevTrendUp`
+ * the ±1% hysteresis band consumes. Read-only — used by both the persisting
+ * {@link generateMarketReview} and the read-only {@link peekMarketRegime}.
+ */
+async function latestPrevTrendUp(): Promise<boolean | null> {
+  const persisted = await ensureLoaded();
+  const latestPrior =
+    persisted.length > 0
+      ? persisted.reduce((a, b) => (b.generatedAt > a.generatedAt ? b : a))
+      : null;
+  return trendStateToPrev(latestPrior?.gates.trendState);
+}
+
+/**
+ * TRA-586 — redacted, read-only snapshot of the *current* regime computed from
+ * the live feeds, without persisting or publishing anything. Backs the
+ * unauthenticated `GET /api/health/market-review` acceptance probe so the
+ * Tradier trend fallback can be verified against the live tape without admin
+ * creds (parity with the TRA-580 `/api/health/live-equity` probe). All fields
+ * are public market data — index levels, the regime label, and which provider
+ * served the S&P 500 trend MA.
+ */
+export interface MarketRegimePeek {
+  generatedAt: string;
+  regime: MarketRegimeLabel;
+  regimeRationale: string;
+  indexes: MarketReviewIndexReading[];
+  gates: MarketReviewGates;
+  /** Provider that served the S&P 500 trend MA, or `null` when every feed was dark. */
+  spxTrendProvider: SpxTrendProvider | null;
+  /** True when a `SPY` proxy stood in for a dark `^GSPC` feed. */
+  spxTrendViaFallback: boolean;
+}
+
+/**
+ * Compute the current regime from the live index feeds without touching the
+ * store. Reads the persisted latest review only to thread `prevTrendUp` into the
+ * hysteresis band. Never persists, never publishes.
+ */
+export async function peekMarketRegime(): Promise<MarketRegimePeek> {
+  const prevTrendUp = await latestPrevTrendUp();
+  const { inputs, readings, spxTrend } = await readIndexes(prevTrendUp);
+  const { regime, rationale } = classifyMarketRegime(inputs, prevTrendUp);
+  const gates = deriveGates(regime, inputs, prevTrendUp);
+  return {
+    generatedAt: new Date().toISOString(),
+    regime,
+    regimeRationale: rationale,
+    indexes: readings,
+    gates,
+    spxTrendProvider: inputs.spx == null ? null : spxTrend.provider,
+    spxTrendViaFallback: spxTrend.viaFallback,
+  };
+}
+
+/**
  * Generate a market review for `kind`, persist it, and publish a matching
  * `ResearchReport` to the Stocks News tab. Idempotent per ET date + kind:
  * a same-day re-run upserts both the review and the research report in place.
@@ -565,12 +623,7 @@ export async function generateMarketReview(
   // TRA-472 — thread the most-recent persisted review's trend state into the
   // ±1% hysteresis band so a price inside the band holds rather than flips.
   // On a cold store this is `null` and `resolveTrend` seeds from `spx ≥ MA`.
-  const persisted = await ensureLoaded();
-  const latestPrior =
-    persisted.length > 0
-      ? persisted.reduce((a, b) => (b.generatedAt > a.generatedAt ? b : a))
-      : null;
-  const prevTrendUp = trendStateToPrev(latestPrior?.gates.trendState);
+  const prevTrendUp = await latestPrevTrendUp();
 
   let inputs: RegimeInputs = { spx: null, spxTrendMa: null, vix: null, tnx: null };
   let readings: MarketReviewIndexReading[] = [];

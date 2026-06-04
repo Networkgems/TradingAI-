@@ -43,6 +43,7 @@ import {
   generateMarketReview,
   getLatestMarketReview,
   listMarketReviews,
+  peekMarketRegime,
 } from './market-review.js';
 import {
   loadUsers,
@@ -1910,6 +1911,25 @@ app.get('/api/market-review/latest', requireAuth, async (req, res) => {
 
 app.get('/api/market-review', requireAuth, async (_req, res) => {
   res.json(await listMarketReviews());
+});
+
+// TRA-586 — redacted, read-only acceptance probe (parity with the TRA-580
+// `/api/health/live-equity` probe). Unauthenticated by design: it computes a
+// FRESH regime from the live index feeds without persisting or publishing, and
+// returns only public market data (index levels, the regime label, and which
+// provider served the S&P 500 trend MA). This proves the non-Yahoo (Tradier)
+// trend fallback engages when Yahoo's breaker is open — verifiable against the
+// live deployment without shipping admin credentials into an agent env.
+app.get('/api/health/market-review', async (_req, res) => {
+  try {
+    const peek = await peekMarketRegime();
+    res.json(peek);
+  } catch (err) {
+    log.error('market-review health probe failed', {
+      reason: err instanceof Error ? err.message : String(err),
+    });
+    res.status(500).json({ error: 'Failed to compute market regime' });
+  }
 });
 
 // Admin-only on-demand regeneration — lets QA / the desk refresh the review

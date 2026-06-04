@@ -150,6 +150,34 @@ Maps to the four TRA-580 acceptance lines:
 mirror carrying both OCO legs **and** a captured order id. `productionEngineCount`
 confirms the reading is against a `production`-env engine, not sandbox.
 
+## Market-review regime acceptance probe (TRA-586)
+
+`GET /api/health/market-review` is an **unauthenticated, read-only** probe (same
+pattern as the live-equity probe above) that computes a **fresh** market-review
+regime from the live index feeds — without persisting or publishing anything. It
+returns only public market data, so it can be verified against the live
+deployment without admin credentials.
+
+```bash
+curl -s https://<deployment>/api/health/market-review | jq
+```
+
+It proves the **non-Yahoo (Tradier) trend fallback** added in TRA-586: when
+Yahoo's daily-chart breaker is open (429 on Render egress), the S&P 500 trend MA
+now cascades `^GSPC` (Yahoo) → `SPY` (Yahoo) → `SPY` (Tradier) instead of going
+dark and defaulting to a cautious YELLOW.
+
+| Field | Meaning |
+| --- | --- |
+| `regime` | `green` / `yellow` / `red` — derived from real data, not the dark-feed default. |
+| `indexes[0].value`, `indexes[0].trendMa` | Non-null S&P 500 level + trend MA when ANY provider is healthy. |
+| `spxTrendProvider` | `yahoo` or `tradier` — `tradier` confirms the fallback engaged. |
+| `spxTrendViaFallback` | `true` when a `SPY` proxy stood in for a dark `^GSPC` feed. |
+
+The persisted `GET /api/market-review/latest` (auth-gated) refreshes on the
+scheduler's pre-/post-market fires using the same code path; this probe lets QA
+confirm the regime read on demand between fires.
+
 ## Known follow-ups
 
 - Desktop-app (Electron) error telemetry — tracked separately; the renderer
