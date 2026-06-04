@@ -461,6 +461,7 @@ export class SignalEngine {
    */
   private technicalSnapshots: Map<string, TechnicalSignalSnapshot> = new Map();
   private lastTechnicalRefreshAt = 0;
+  private technicalRefreshCycleCount = 0;
 
   private dailySignals: DailySignalRecord[] = [];
   private positionSignalType: Map<string, SignalType> = new Map();
@@ -1569,13 +1570,36 @@ export class SignalEngine {
     // can't take down the tick.
     if (Date.now() - this.lastTechnicalRefreshAt >= TECHNICAL_SNAPSHOT_REFRESH_MS) {
       this.lastTechnicalRefreshAt = Date.now();
-      try {
-        await this.refreshTechnicalSnapshots(activeSymbols);
-      } catch (err: unknown) {
-        log.warn('technical snapshot scan threw', {
-          component: 'mtf',
-          reason: err instanceof Error ? err.message : String(err),
-        });
+      // TRA-554: this refresh is a SECOND Tradier bar consumer, distinct from
+      // the candle loop above — it pulls MTF_MINUTE_BARS (2000) bars per symbol,
+      // which the 80-bar candle cache can never satisfy, so every cycle hits the
+      // upstream feed. Left ungated it ran the full watchlist across every engine
+      // continuously (~120 req/min) even after the close, which is what kept the
+      // after-hours Tradier fallback at ~150/min despite 13f5e90 gating the
+      // candle loop. Gate it the same way:
+      //  • skip entirely when the market is closed — resampled 15m/1h snapshots
+      //    don't change without new prints, and getOrComputeTechnicalSnapshot
+      //    still serves any analyst query on demand;
+      //  • during market hours refresh only active-interest symbols each cycle,
+      //    with a full-watchlist cold scan every 4th cycle (~20 min) so cold
+      //    symbols stay warm for the analysts.
+      if (isStockMarketOpen()) {
+        this.technicalRefreshCycleCount++;
+        const TECHNICAL_COLD_SCAN_INTERVAL = 4;
+        const isColdCycle = this.technicalRefreshCycleCount % TECHNICAL_COLD_SCAN_INTERVAL === 0;
+        const mtfSymbols = isColdCycle
+          ? activeSymbols
+          : activeSymbols.filter(sym => activeInterest.has(sym));
+        if (mtfSymbols.length > 0) {
+          try {
+            await this.refreshTechnicalSnapshots(mtfSymbols);
+          } catch (err: unknown) {
+            log.warn('technical snapshot scan threw', {
+              component: 'mtf',
+              reason: err instanceof Error ? err.message : String(err),
+            });
+          }
+        }
       }
     }
 
