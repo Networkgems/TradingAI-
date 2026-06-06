@@ -232,6 +232,13 @@ export type {
   RelativeValueClassification,
 } from './options/relative-value.js';
 export {
+  EarningsCalendarClient,
+  parseFinnhubEarnings,
+  daysUntil,
+  nextEarningsDate,
+} from './earnings/index.js';
+export type { EarningsEvent, EarningsWindowOptions } from './earnings/index.js';
+export {
   cryptoTieredCostModel,
   flatCostModel,
   cryptoTierOf,

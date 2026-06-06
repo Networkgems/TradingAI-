@@ -7,6 +7,7 @@ import type { TradeSignal, RelativeValueSignal, Sma200Signal, Candle, OptionsAcc
 // and the engine surfaces the stub recommendations on the WS state.
 import { runAgentGraph } from '@trading-app/agents';
 import { getLatestMarketReview } from './market-review.js';
+import { earningsInDaysSync } from './earnings-store.js';
 import { etDateString } from './scheduler.js';
 import { fetchMinuteBars, fetchDailyCandles, fetchQuotes, fetchStocksNews, isYahooBreakerOpen, setActiveInterestSymbols, setTradierStocksFeedClient } from './yahoo-feed.js';
 import { evaluateFeedFreshness } from './feed-freshness.js';
@@ -2410,8 +2411,15 @@ export class SignalEngine {
       const candles = this.candleCache.get(sym) ?? [];
       if (candles.length < 15) continue;
       const asOf = candles[candles.length - 1]!.timestamp;
+      // TRA-596 — feed the real upcoming-earnings count into the fundamental
+      // analyst. `earningsInDaysSync` reads the boot-loaded calendar cache and
+      // returns null for uncovered symbols (the analyst then reports "earnings
+      // date unknown"), so this stays additive and never blocks the tick.
+      const nextEarningsInDays = earningsInDaysSync(sym, asOf);
+      const fundamentals =
+        nextEarningsInDays !== null ? { nextEarningsInDays } : undefined;
       try {
-        recos.push(await runAgentGraph({ symbol: sym, asOf, candles, candidateSignal: null }));
+        recos.push(await runAgentGraph({ symbol: sym, asOf, candles, candidateSignal: null, fundamentals }));
       } catch (err) {
         logger.warn('trading-agents advisory failed for symbol', { sym, err: String(err) });
       }

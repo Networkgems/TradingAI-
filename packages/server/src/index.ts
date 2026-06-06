@@ -158,6 +158,12 @@ import {
   seedSampleResearchReportIfEmpty,
   ResearchValidationError,
 } from './research-store.js';
+// TRA-596 (TRA-595 C1) — upcoming-earnings calendar feed/store + refresh job.
+import {
+  initEarningsStore,
+  refreshEarningsCalendar,
+  makeEarningsClientFromEnv,
+} from './earnings-store.js';
 // TRA-532 — Live-Trading Promotion Gate enforcement + audit store/service.
 import {
   registerBacktestReport,
@@ -302,6 +308,13 @@ void getLatestMarketReview().then(existing => {
     }),
   );
 });
+
+// TRA-596 (TRA-595 C1) — warm the earnings-calendar cache from disk so the
+// synchronous accessor (`earningsInDaysSync`) the engine reads each tick has
+// data immediately, then kick a non-blocking refresh of the active stock
+// universe. A slow/absent provider must never delay server startup.
+await initEarningsStore();
+void runEarningsRefresh();
 
 const app = express();
 // TRA-404 — behind Render's proxy the socket address is the proxy, not the
@@ -1137,6 +1150,27 @@ async function runChainRecord(): Promise<void> {
     log.warn('chain-recorder symbol error', {
       symbol: s.symbol,
       errorMessage: s.errorMessage,
+    });
+  }
+}
+
+// TRA-596 (TRA-595 C1) — refresh the upcoming-earnings calendar for the active
+// stock universe. Runs on boot and on the 9 AM ET pre-market hook. Skips (with
+// a warning) when FINNHUB_API_TOKEN is unset, and isolates provider failures so
+// a bad/rate-limited fetch can never fault the boot path or a scheduled tick.
+async function runEarningsRefresh(): Promise<void> {
+  const client = makeEarningsClientFromEnv();
+  if (!client) {
+    log.warn('earnings-refresh FINNHUB_API_TOKEN unset — skipping earnings-calendar refresh');
+    return;
+  }
+  const symbols = [...WATCHLIST];
+  try {
+    const { covered, uncovered } = await refreshEarningsCalendar(client, symbols);
+    log.info('earnings-refresh complete', { requested: symbols.length, covered, uncovered });
+  } catch (err) {
+    log.error('earnings-refresh failed', {
+      reason: err instanceof Error ? err.message : String(err),
     });
   }
 }
@@ -4052,6 +4086,9 @@ scheduler.start({
       }),
     );
     await runPremarketForAllUsers();
+    // TRA-596 — refresh the upcoming-earnings calendar once per trading day,
+    // pre-bell, so the engine's event-proximity read is current for the session.
+    await runEarningsRefresh();
   },
   // TRA-380 — 3:55 PM ET option-chain recorder. Captures one Tradier chain
   // snapshot per trading day into the persistent disk for the TRA-379
