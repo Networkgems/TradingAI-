@@ -1,7 +1,7 @@
 import { describe, it, expect } from 'vitest';
 import { generateEodReport } from './eod-report.js';
 import type { EngineState } from '../signal-engine.js';
-import type { Position } from '@trading-app/shared';
+import type { OptionPosition, Position } from '@trading-app/shared';
 
 // ── Helpers ──────────────────────────────────────────────────────────────────
 
@@ -59,6 +59,29 @@ function makeEngineState(overrides: Partial<EngineState> = {}): EngineState {
       gates: null,
       gatedStrategies: [],
     },
+    ...overrides,
+  };
+}
+
+function makeOption(overrides: Partial<OptionPosition> & { id: string }): OptionPosition {
+  return {
+    symbol: 'AAPL',
+    optionType: 'call',
+    contracts: 1,
+    contractsRemaining: 0,
+    premiumPaid: 1,
+    currentPremium: 1,
+    tp1Premium: 1.25,
+    tp1Hit: false,
+    stopLossPremium: 0.75,
+    peakPremium: 1,
+    trailingActive: false,
+    trailingStopPremium: 0,
+    underlyingEntryPrice: 100,
+    openedAt: Date.now() - 60_000,
+    signalId: 'sig',
+    signalType: 'relative_value',
+    mode: 'demo',
     ...overrides,
   };
 }
@@ -354,5 +377,99 @@ describe('generateEodReport', () => {
 
     expect(report.unrealizedPnl).toBeCloseTo(40, 1);
     expect(report.openPositionCount).toBe(1);
+  });
+});
+
+// ── TRA-594 — Calendar per-day aggregation ───────────────────────────────────
+//
+// The Calendar tab reads `report.combinedPnl` per day. These pin the three
+// bugs that made it "track nothing right" on the demo account:
+//   1. `optionsPnl` was the all-time cumulative options total, booked into
+//      every day's cell — now it's only the options that closed that day.
+//   2. `combinedPnl` folded in open-position MTM, so a position held open
+//      across days re-counted into every cell — now it's realized-only.
+//   3. evening-ET closes (next-day in UTC) were bucketed to the wrong day —
+//      now both the close and the day key use the US/Eastern calendar.
+describe('generateEodReport — TRA-594 calendar aggregation', () => {
+  it('combinedPnl = day realized stock + day realized options, excluding open MTM', () => {
+    const today = new Date().toLocaleDateString('en-CA', { timeZone: 'America/New_York' });
+    const todayTs = new Date(`${today}T15:00:00`).getTime();
+
+    const stockWin = makePosition({
+      id: 'stk', pnl: 50, openedAt: todayTs - 3600_000, closedAt: todayTs,
+    });
+    // Open position with +$40 unrealized MTM (AAPL 100→104, qty 10) — must NOT
+    // leak into combinedPnl.
+    const openPos = makePosition({ id: 'open', symbol: 'AAPL', entryPrice: 100, quantity: 10 });
+    const optClosedToday = makeOption({ id: 'opt-today', pnl: 30, closedAt: todayTs });
+
+    const report = generateEodReport({
+      state: makeEngineState({
+        account: { totalEquity: 25_000, availableCash: 23_000, openPositions: [openPos], dailyPnl: 0 },
+      }),
+      allClosedPositions: [stockWin],
+      closedOptions: [optClosedToday],
+      dailySignals: [],
+      signalTypeMap: new Map(),
+    });
+
+    expect(report.realizedPnl).toBeCloseTo(50, 2);
+    expect(report.optionsPnl).toBeCloseTo(30, 2);
+    expect(report.unrealizedPnl).toBeCloseTo(40, 2); // still reported for the detail view
+    expect(report.combinedPnl).toBeCloseTo(80, 2);   // 50 + 30, NOT +40 MTM
+  });
+
+  it('optionsPnl counts only options closed today, never the cumulative total', () => {
+    const today = new Date().toLocaleDateString('en-CA', { timeZone: 'America/New_York' });
+    const todayTs = new Date(`${today}T15:00:00`).getTime();
+    const yesterday = new Date(Date.now() - 86_400_000)
+      .toLocaleDateString('en-CA', { timeZone: 'America/New_York' });
+    const yesterdayTs = new Date(`${yesterday}T15:00:00`).getTime();
+
+    const report = generateEodReport({
+      state: makeEngineState({
+        // A large cumulative options total in state must be ignored.
+        options: { openOptions: [], closedOptions: [], optionsPnl: 99_999, optionsCash: 25_000, dailyOptionsCount: 0 },
+      }),
+      allClosedPositions: [],
+      closedOptions: [
+        makeOption({ id: 'opt-today-a', pnl: 12, closedAt: todayTs }),
+        makeOption({ id: 'opt-today-b', pnl: -4, closedAt: todayTs }),
+        makeOption({ id: 'opt-prior',   pnl: 500, closedAt: yesterdayTs }),
+      ],
+      dailySignals: [],
+      signalTypeMap: new Map(),
+    });
+
+    expect(report.optionsPnl).toBeCloseTo(8, 2);   // 12 − 4, not 99,999 and not +500 prior day
+    expect(report.combinedPnl).toBeCloseTo(8, 2);
+  });
+
+  it('attributes an evening-ET close (next-day UTC) to the ET trading day', () => {
+    // 2026-03-16T01:30:00Z = 2026-03-15 21:30 EDT. The UTC date is the 16th but
+    // the ET trading day is the 15th — the day the backfill report is stamped.
+    const closeTs = Date.parse('2026-03-16T01:30:00Z');
+    const eveningTrade = makePosition({
+      id: 'evening', pnl: 25, openedAt: closeTs - 3600_000, closedAt: closeTs,
+    });
+
+    const onEt15 = generateEodReport({
+      state: makeEngineState(),
+      allClosedPositions: [eveningTrade],
+      dailySignals: [],
+      signalTypeMap: new Map(),
+    }, '2026-03-15');
+    expect(onEt15.totalTrades).toBe(1);
+    expect(onEt15.realizedPnl).toBeCloseTo(25, 2);
+
+    // The UTC date (the 16th) must NOT claim the trade.
+    const onUtc16 = generateEodReport({
+      state: makeEngineState(),
+      allClosedPositions: [eveningTrade],
+      dailySignals: [],
+      signalTypeMap: new Map(),
+    }, '2026-03-16');
+    expect(onUtc16.totalTrades).toBe(0);
+    expect(onUtc16.realizedPnl).toBe(0);
   });
 });

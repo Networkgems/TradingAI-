@@ -3708,6 +3708,12 @@ export class SignalEngine {
     return {
       state: this.getState(),
       allClosedPositions: [...this.allClosedPositions],
+      // TRA-594 — full closed-options list for the active mode so the EOD
+      // report can sum the day's *realized* options P&L instead of folding in
+      // the all-time cumulative `state.options.optionsPnl` (which corrupted
+      // every calendar cell). Scoped to `this.mode` to match `state.options`,
+      // which is itself `getStateForMode(this.mode)`.
+      closedOptions: this.optionsAccount.getClosedOptionsForMode(this.mode),
       dailySignals: [...this.dailySignals],
       signalTypeMap: new Map(this.positionSignalType),
     };

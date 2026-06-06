@@ -2044,6 +2044,17 @@ export class PaperOptionsAccount {
     return dropped;
   }
 
+  /**
+   * TRA-594 — full (uncapped) closed-options list for a mode. The EOD report
+   * sums a single day's closes from this to compute that day's realized
+   * options P&L; `getStateForMode().closedOptions` caps at the last 20 (a UI
+   * "Recent Closed" window) and would silently drop options on a busy day.
+   * Legacy positions with no `mode` stamp route to demo (see TRA-231/TRA-246).
+   */
+  getClosedOptionsForMode(mode: AccountMode): OptionPosition[] {
+    return this.closedOptions.filter(p => (p.mode ?? 'demo') === mode);
+  }
+
   /** Serialize current state for durable storage (TRA-140). */
   exportSnapshot(): {
     openOptions: OptionPosition[];

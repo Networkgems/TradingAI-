@@ -2559,10 +2559,25 @@ export interface EodReport {
   generatedAt: number;   // Unix ms
 
   // P&L
+  /** Realized P&L from equity/crypto positions that *closed* on `date`. */
   realizedPnl: number;
+  /** Open-position MTM at report time. Informational only — see `combinedPnl`. */
   unrealizedPnl: number;
   totalPnl: number;
+  /**
+   * TRA-594 — realized P&L from options that *closed* on `date`, NOT the
+   * mode's all-time cumulative options total. The old code booked the
+   * cumulative figure into every day, corrupting the whole calendar.
+   */
   optionsPnl: number;
+  /**
+   * The Calendar tab's per-day figure: `realizedPnl + optionsPnl` — the day's
+   * *realized* total. TRA-594: `unrealizedPnl` is deliberately excluded so a
+   * position held open across days doesn't re-book its drifting mark into
+   * every cell (which made monthly Net P&L multi-count). In live stock mode
+   * this is overridden with the Tradier broker-truth daily balance delta
+   * (TRA-359).
+   */
   combinedPnl: number;
   /**
    * TRA-365 follow-up — realized / options / combined P&L expressed as a

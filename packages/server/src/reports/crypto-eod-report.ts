@@ -2,8 +2,13 @@ import type { EodReport, EodTradeEntry, EodMover, EodSignalAccuracy, Position, S
 type StrategyLabel = EodTradeEntry['strategy'];
 import { MANAGED_ACCOUNT_RATIO } from '@trading-app/shared';
 
+// TRA-594 — bucket by the US/Eastern calendar day to match `today` below.
+// Crypto trades 24/7, so a UTC date key misattributed every position closed
+// in the evening ET (already tomorrow in UTC) to the wrong day, which is a
+// core reason the crypto Calendar "tracked nothing": evening closes fell out
+// of today's report. Mirrors the equities fix in eod-report.ts.
 function dateString(ts: number): string {
-  return new Date(ts).toISOString().slice(0, 10);
+  return new Date(ts).toLocaleDateString('en-CA', { timeZone: 'America/New_York' });
 }
 
 function calcRR(pos: Position): number {
@@ -190,7 +195,11 @@ export function generateCryptoEodReport(snapshot: CryptoReportSnapshot): EodRepo
     return sum + (sym.price - p.entryPrice) * p.quantity * multiplier;
   }, 0);
 
-  const combinedPnl = realizedPnl + unrealizedPnl;
+  // TRA-594 — realized-only per-day calendar figure (matches the equities
+  // report). Open-position MTM is excluded so a coin held open across days
+  // doesn't re-book its drifting mark into every day's cell and inflate the
+  // monthly total; `unrealizedPnl` stays on the report for the detail view.
+  const combinedPnl = realizedPnl;
   const totalEquity = snapshot.accountState.totalEquity;
   const managedEquity = totalEquity * MANAGED_ACCOUNT_RATIO;
   const availableCash = snapshot.accountState.availableCash;

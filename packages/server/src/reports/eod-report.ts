@@ -3,6 +3,7 @@ import type {
   EodTradeEntry,
   EodMover,
   EodSignalAccuracy,
+  OptionPosition,
   Position,
   SignalType,
 } from '@trading-app/shared';
@@ -20,8 +21,16 @@ export interface DailySignalRecord {
   rr?: number;
 }
 
+// TRA-594 — bucket a trade by its US/Eastern calendar day, NOT its UTC day.
+// `today` (and any `asOfDate` backfill key) is an Eastern date, so comparing
+// against a UTC `toISOString().slice(0,10)` misattributed every trade closed
+// in the evening ET (already the next calendar day in UTC) to the wrong day.
+// For 24/7 crypto and any post-20:00-ET equity/options close this silently
+// dropped the trade out of its day's report — a core reason the Calendar tab
+// "tracked nothing": the close landed under tomorrow's (not-yet-generated)
+// report instead of today's.
 function dateString(ts: number): string {
-  return new Date(ts).toISOString().slice(0, 10);
+  return new Date(ts).toLocaleDateString('en-CA', { timeZone: 'America/New_York' });
 }
 
 function strategyLabel(t: SignalType): EodTradeEntry['strategy'] {
@@ -214,6 +223,16 @@ export interface ReportInput {
   state: EngineState;
   /** All closed positions for the current session (not capped to 20) */
   allClosedPositions: Position[];
+  /**
+   * TRA-594 — all closed *options* for the active mode this session, full and
+   * uncapped. The report sums only this day's closes for `optionsPnl`. Was
+   * previously sourced from `state.options.optionsPnl`, which is the
+   * all-time cumulative options P&L for the mode — folding that into every
+   * day's `combinedPnl` made the whole calendar wrong (each cell carried the
+   * running options total, not the day's). Optional so legacy/crypto callers
+   * (no options) keep type-checking; an absent list means zero options P&L.
+   */
+  closedOptions?: OptionPosition[];
   /** Signals fired today with their outcomes once known */
   dailySignals: DailySignalRecord[];
   /** Map from signal id → SignalType for strategy tagging */
@@ -232,7 +251,7 @@ export interface ReportInput {
  * the missed date reconstructs that day's realized P&L accurately.
  */
 export function generateEodReport(input: ReportInput, asOfDate?: string): EodReport {
-  const { state, allClosedPositions, dailySignals, signalTypeMap } = input;
+  const { state, allClosedPositions, closedOptions = [], dailySignals, signalTypeMap } = input;
   const today = asOfDate ?? new Date().toLocaleDateString('en-CA', { timeZone: 'America/New_York' });
 
   // Closed trades for today only
@@ -259,8 +278,23 @@ export function generateEodReport(input: ReportInput, asOfDate?: string): EodRep
     return sum + (sym.price - p.entryPrice) * p.quantity * multiplier;
   }, 0);
 
-  const optionsPnl = state.options.optionsPnl;
-  const combinedPnl = realizedPnl + unrealizedPnl + optionsPnl;
+  // TRA-594 — the day's *realized* options P&L, summed from options that
+  // actually closed on `today`. NOT `state.options.optionsPnl`, which is the
+  // mode's all-time cumulative options P&L — using that booked the entire
+  // running total into every single calendar cell.
+  const todayClosedOptions = closedOptions.filter(o =>
+    o.closedAt != null && dateString(o.closedAt) === today
+  );
+  const optionsPnl = todayClosedOptions.reduce((sum, o) => sum + (o.pnl ?? 0), 0);
+
+  // TRA-594 — the Calendar is a *realized* per-day P&L view (Webull-style), so
+  // a day's cell is the realized stock P&L plus the realized options P&L for
+  // that day. Open-position MTM (`unrealizedPnl`) is deliberately excluded: a
+  // position held open across N days would otherwise re-book its (drifting)
+  // mark into every one of those N cells, so the monthly "Net P&L" total
+  // multi-counted the same unclosed position. `unrealizedPnl` is still carried
+  // on the report for the detail breakdown, just not in the calendar figure.
+  const combinedPnl = realizedPnl + optionsPnl;
 
   const totalEquity = state.account.totalEquity;
   const managedEquity = totalEquity * MANAGED_ACCOUNT_RATIO;
