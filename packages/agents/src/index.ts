@@ -41,3 +41,21 @@ export {
   AgentGraphError,
   type AgentGraphDeps,
 } from './graph.js';
+export {
+  runOptionsResearch,
+  optionsResearchBatchKey,
+  validateOptionsIdeaBatch,
+  isDefinedRiskStrategy,
+  DEFINED_RISK_STRATEGIES,
+  DEFAULT_OPTIONS_GUARDRAIL,
+  type DefinedRiskStrategy,
+  type OptionsScannerCandidate,
+  type OptionsResearchSymbol,
+  type DayTradingGuardrail,
+  type OptionsResearchInput,
+  type OptionsIdea,
+  type RejectedIdea,
+  type OptionsResearchResult,
+  type OptionsResearchCache,
+  type OptionsResearchDeps,
+} from './options-research.js';
