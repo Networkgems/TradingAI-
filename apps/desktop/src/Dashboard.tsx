@@ -21,6 +21,7 @@ import { StockWatchlistPanel } from './components/dashboard/StockWatchlistPanel'
 import { StockSignalsPanel } from './components/dashboard/StockSignalsPanel';
 import { StockPositionsPanel } from './components/dashboard/StockPositionsPanel';
 import { StockOptionsPanel } from './components/dashboard/StockOptionsPanel';
+import { AiOptionsIdeasPanel } from './components/dashboard/AiOptionsIdeasPanel';
 import { NewsPanel } from './components/dashboard/NewsPanel';
 import { LiveCredentialsBanner } from './components/dashboard/LiveCredentialsBanner';
 import { HaltBanner } from './components/dashboard/HaltBanner';
@@ -28,7 +29,8 @@ import { HealthPanel } from './components/dashboard/HealthPanel';
 import { DashboardTour } from './components/onboarding/CoachMarkTour';
 import { useStockEngine } from './hooks/useStockEngine';
 
-type StockTab = 'watchlist' | 'signals' | 'positions' | 'options' | 'news' | 'calendar' | 'health';
+// TRA-600 — 'ideas' is the new "AI Options Ideas" surface (Phase 3 of TRA-595).
+type StockTab = 'watchlist' | 'signals' | 'positions' | 'options' | 'ideas' | 'news' | 'calendar' | 'health';
 
 export default function Dashboard({ token, onLogout, onGoHome, onActivity, theme, onToggleTheme }: { token: string; onLogout: () => void; onGoHome: () => void; onActivity?: () => void; theme: Theme; onToggleTheme: () => void }) {
   const [tab, setTab] = useState<StockTab>('watchlist');
@@ -141,6 +143,14 @@ export default function Dashboard({ token, onLogout, onGoHome, onActivity, theme
              `Options (${openOptions.length})`}
           </button>
         ))}
+        {/* TRA-600 — event-aware "AI Options Ideas" surface (Phase 3 of TRA-595). */}
+        <button
+          className={`tab ${tab === 'ideas' ? 'active' : ''}`}
+          onClick={() => setTab('ideas')}
+          title="Ranked, defined-risk options ideas with earnings/Fed event context — paper entry only"
+        >
+          AI Ideas
+        </button>
         <button className={`tab ${tab === 'news' ? 'active' : ''}`} onClick={() => setTab('news')}>
           {`News (${news.length})`}
         </button>
@@ -198,6 +208,13 @@ export default function Dashboard({ token, onLogout, onGoHome, onActivity, theme
             closedOptions={closedOptions}
             optionsDailyLimit={optionsDailyLimit}
           />
+        )}
+
+        {/* TRA-600 — the AI Options Ideas tab reads its own /api/options/ideas
+            feed (lands with C4) and falls back to a clearly-labelled preview
+            until then, so it renders without waiting for the engine snapshot. */}
+        {tab === 'ideas' && (
+          <AiOptionsIdeasPanel token={token} />
         )}
 
         {tab === 'news' && (
