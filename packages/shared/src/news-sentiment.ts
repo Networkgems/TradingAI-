@@ -92,6 +92,18 @@ const LEXICON: Readonly<Record<string, number>> = {
   struggle: -0.6, struggles: -0.6, struggling: -0.6,
   halt: -0.55, halts: -0.55, halted: -0.55,
   pressure: -0.4, headwind: -0.55, headwinds: -0.55,
+  // --- TRA-597: Fed / monetary-policy tone (risk-asset orientation) ---
+  // Easier policy / lower rates read bullish for risk assets; tighter policy /
+  // higher rates and hot inflation read bearish. Terms are scored from the
+  // equity/crypto-holder's perspective so they compose with the lexicon above.
+  dovish: 0.7, easing: 0.55, accommodative: 0.55, stimulus: 0.5,
+  hawkish: -0.7, tightening: -0.55, restrictive: -0.5,
+  disinflation: 0.5, cooling: 0.35, 'soft-landing': 0.5,
+  hot: -0.4, 'sticky': -0.45, 'hotter-than-expected': -0.6, accelerating: -0.35,
+  hike: -0.45, hikes: -0.45, hiked: -0.45,
+  // (note: "cut"/"cuts" already score negative above for the corporate sense
+  // — earnings cuts, guidance cuts — so a literal "rate cut" nets out roughly
+  // neutral rather than falsely bullish, which is the conservative read.)
 };
 
 // Negators flip the polarity of a nearby lexicon token (dampened, VADER-style).
@@ -301,4 +313,44 @@ export const EQUITY_NAME_ALIASES: Readonly<Record<string, readonly string[]>> = 
 
 export function nameAliasesFor(symbol: string): readonly string[] {
   return EQUITY_NAME_ALIASES[symbol.toUpperCase()] ?? [];
+}
+
+// ── TRA-597 (TRA-595 C2): Fed / macro headline lane ──────────────────────────
+//
+// Macro and Fed-policy headlines (FOMC, Powell, CPI, jobs, PCE) don't name a
+// single ticker, so the per-symbol aggregator above never picks them up. This
+// lane routes them into the *same* recency-weighted scorer under a synthetic
+// "MACRO" symbol, so Fed/macro tone contributes to the sentiment aggregate the
+// engine and the LLM research pass already consume — just request the MACRO
+// symbol (or call {@link aggregateFedSentiment}). The new Fed/monetary-policy
+// lexicon terms above give these headlines a meaningful polarity.
+
+/** Synthetic symbol the Fed/macro lane aggregates under. */
+export const FED_MACRO_SYMBOL = 'MACRO';
+
+/**
+ * Distinctive macro/Fed phrases used to map a headline into the Fed lane via the
+ * existing {@link newsMentionsSymbol} alias path. Lowercase substrings, ≥3 chars.
+ */
+export const FED_MACRO_ALIASES: readonly string[] = [
+  'fed', 'federal reserve', 'fomc', 'powell', 'rate decision', 'interest rate',
+  'rate cut', 'rate hike', 'monetary policy', 'central bank', 'jerome powell',
+  'cpi', 'inflation', 'consumer price', 'pce', 'jobs report', 'nonfarm',
+  'payrolls', 'unemployment', 'jobless', 'basis points', 'rate path',
+];
+
+/**
+ * Aggregate Fed/macro headlines into a {@link SymbolSentiment} under the
+ * {@link FED_MACRO_SYMBOL} synthetic symbol — the Fed-headline lane feeding the
+ * news-sentiment scorer. Pure given `now`; a thin wrapper over
+ * {@link aggregateSymbolSentiment} so the recency-weighting, tilt-gating and
+ * top-headline logic are shared with the per-equity path.
+ */
+export function aggregateFedSentiment(news: readonly NewsItem[], now: number): SymbolSentiment {
+  return aggregateSymbolSentiment({
+    symbol: FED_MACRO_SYMBOL,
+    names: FED_MACRO_ALIASES,
+    news,
+    now,
+  });
 }

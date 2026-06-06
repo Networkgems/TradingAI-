@@ -238,6 +238,24 @@ export {
   nextEarningsDate,
 } from './earnings/index.js';
 export type { EarningsEvent, EarningsWindowOptions } from './earnings/index.js';
+// TRA-597 (TRA-595 C2) — macro / Fed economic-event calendar. `daysUntil` is
+// already re-exported above (earnings) so it is intentionally omitted here.
+export {
+  EconomicCalendarClient,
+  parseFredReleaseDates,
+  eventsNearDate,
+  nextEventOfType,
+  daysToNextFOMC,
+  fomcEvents,
+  FRED_RELEASES,
+  FOMC_MEETINGS,
+} from './macro/index.js';
+export type {
+  MacroEvent,
+  MacroEventType,
+  MacroImportance,
+  MacroWindowOptions,
+} from './macro/index.js';
 export {
   cryptoTieredCostModel,
   flatCostModel,

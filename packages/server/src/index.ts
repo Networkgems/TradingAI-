@@ -164,6 +164,12 @@ import {
   refreshEarningsCalendar,
   makeEarningsClientFromEnv,
 } from './earnings-store.js';
+// TRA-597 (TRA-595 C2) — macro / Fed economic-event calendar feed/store + refresh.
+import {
+  initMacroStore,
+  refreshMacroCalendar,
+  makeMacroClientFromEnv,
+} from './macro-store.js';
 // TRA-532 — Live-Trading Promotion Gate enforcement + audit store/service.
 import {
   registerBacktestReport,
@@ -315,6 +321,12 @@ void getLatestMarketReview().then(existing => {
 // universe. A slow/absent provider must never delay server startup.
 await initEarningsStore();
 void runEarningsRefresh();
+
+// TRA-597 (TRA-595 C2) — warm the macro/Fed economic-calendar cache from disk
+// (the curated FOMC schedule is available even before the first fetch), then
+// kick a non-blocking refresh. A slow/absent provider must never delay startup.
+await initMacroStore();
+void runMacroRefresh();
 
 const app = express();
 // TRA-404 — behind Render's proxy the socket address is the proxy, not the
@@ -1170,6 +1182,26 @@ async function runEarningsRefresh(): Promise<void> {
     log.info('earnings-refresh complete', { requested: symbols.length, covered, uncovered });
   } catch (err) {
     log.error('earnings-refresh failed', {
+      reason: err instanceof Error ? err.message : String(err),
+    });
+  }
+}
+
+// TRA-597 (TRA-595 C2) — refresh the macro/Fed economic calendar (FOMC + CPI /
+// NFP / PCE). Runs on boot and on the 9 AM ET pre-market hook. Skips the FRED
+// fetch (with a warning) when FRED_API_KEY is unset, and isolates provider
+// failures so a bad/rate-limited fetch can never fault boot or a scheduled tick.
+async function runMacroRefresh(): Promise<void> {
+  const client = makeMacroClientFromEnv();
+  if (!client) {
+    log.warn('macro-refresh FRED_API_KEY unset — skipping economic-calendar refresh');
+    return;
+  }
+  try {
+    const { stored, fomc } = await refreshMacroCalendar(client);
+    log.info('macro-refresh complete', { stored, fomc });
+  } catch (err) {
+    log.error('macro-refresh failed', {
       reason: err instanceof Error ? err.message : String(err),
     });
   }
@@ -4089,6 +4121,9 @@ scheduler.start({
     // TRA-596 — refresh the upcoming-earnings calendar once per trading day,
     // pre-bell, so the engine's event-proximity read is current for the session.
     await runEarningsRefresh();
+    // TRA-597 — refresh the macro/Fed economic calendar (FOMC + CPI/NFP/PCE)
+    // pre-bell so daysToNextFOMC()/eventsNearDate() are current for the session.
+    await runMacroRefresh();
   },
   // TRA-380 — 3:55 PM ET option-chain recorder. Captures one Tradier chain
   // snapshot per trading day into the persistent disk for the TRA-379

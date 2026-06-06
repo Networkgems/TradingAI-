@@ -2,7 +2,9 @@ import { describe, it, expect } from 'vitest';
 import {
   scoreNewsSentiment,
   aggregateSymbolSentiment,
+  aggregateFedSentiment,
   newsMentionsSymbol,
+  FED_MACRO_SYMBOL,
   SENTIMENT_METHOD,
 } from './index.js';
 import type { NewsItem } from './index.js';
@@ -148,6 +150,40 @@ describe('aggregateSymbolSentiment', () => {
     const a = aggregateSymbolSentiment({ symbol: 'AAPL', names: ['apple'], news, now: NOW });
     const b = aggregateSymbolSentiment({ symbol: 'AAPL', names: ['apple'], news, now: NOW });
     expect(a).toEqual(b);
+  });
+});
+
+describe('aggregateFedSentiment (TRA-597 Fed lane)', () => {
+  it('maps Fed/macro headlines that name no ticker into the MACRO aggregate', () => {
+    const news: NewsItem[] = [
+      item({ title: 'Fed holds rates, Powell signals dovish pivot', publishedAt: minutesAgo(15) }),
+      item({ title: 'FOMC minutes point to easing as disinflation continues', publishedAt: minutesAgo(45) }),
+      // An equity-only headline must NOT pollute the Fed lane.
+      item({ title: 'Apple shares rally to record high', publishedAt: minutesAgo(20) }),
+    ];
+    const fed = aggregateFedSentiment(news, NOW);
+    expect(fed.symbol).toBe(FED_MACRO_SYMBOL);
+    expect(fed.articleCount).toBe(2); // only the two macro headlines map
+    expect(fed.netScore).toBeGreaterThan(0); // dovish + easing + disinflation = bullish tone
+    expect(fed.tilt).toBe('bullish');
+  });
+
+  it('scores a hawkish/hot-inflation macro tape bearish', () => {
+    const news: NewsItem[] = [
+      item({ title: 'Hawkish Powell warns on sticky inflation', publishedAt: minutesAgo(10) }),
+      item({ title: 'Hotter-than-expected CPI fuels rate-hike fears', publishedAt: minutesAgo(30) }),
+    ];
+    const fed = aggregateFedSentiment(news, NOW);
+    expect(fed.articleCount).toBe(2);
+    expect(fed.netScore).toBeLessThan(0);
+    expect(fed.tilt).toBe('bearish');
+  });
+
+  it('returns a neutral empty aggregate when no macro headlines are present', () => {
+    const news: NewsItem[] = [item({ title: 'Apple shares rally to record high' })];
+    const fed = aggregateFedSentiment(news, NOW);
+    expect(fed.articleCount).toBe(0);
+    expect(fed.tilt).toBe('neutral');
   });
 });
 
