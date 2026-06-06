@@ -19,7 +19,8 @@ import type {
 } from '@trading-app/engine';
 import type { TradeSignal } from '@trading-app/shared';
 
-import { CryptoSignalEngine, resolveLiveSingleSymbolShortCap } from './crypto-engine.js';
+import { CryptoSignalEngine, resolveLiveSingleSymbolShortCap, mergeCandles } from './crypto-engine.js';
+import type { Candle } from '@trading-app/shared';
 import { CryptoLiveAccount } from './crypto-live-account.js';
 import {
   CryptoPaperAccount,
@@ -842,5 +843,63 @@ describe('CryptoSignalEngine — TRA-480 parallel demo + live ticking', () => {
     // Demo book: 1 open short. Live book: 0.
     expect(internal.countOpenShorts('demo')).toBe(1);
     expect(internal.countOpenShorts('live')).toBe(0);
+  });
+});
+
+describe('mergeCandles — warm-cache eviction guard (TRA-593)', () => {
+  const bar = (ts: number, close = 100): Candle => ({
+    symbol: 'BTC-USD', timestamp: ts, open: close, high: close, low: close, close, volume: 1,
+  });
+  // Contiguous minute series ending at the given last-minute index.
+  const series = (count: number, lastTs = count): Candle[] =>
+    Array.from({ length: count }, (_, i) => bar(lastTs - (count - 1 - i)));
+
+  it('returns the fresh series (capped) when there is no warm cache', () => {
+    const fresh = series(100, 100);
+    const out = mergeCandles(undefined, fresh, 80);
+    expect(out).toHaveLength(80);
+    expect(out[out.length - 1].timestamp).toBe(100);
+  });
+
+  it('a rate-limited partial fetch does NOT evict a warm cache below threshold', () => {
+    // Warm: 80 contiguous bars [21..100]. Partial 429 fetch returns only the
+    // last 17 bars [84..100]. Pre-fix this replaced the cache with 17 bars,
+    // dropping below MIN_BARS_ROUTER(50)/MIN_BARS_BB_FADE(28) and silencing
+    // the symbol. The merge must retain the warm history.
+    const warm = series(80, 100);
+    const partial = series(17, 100);
+    const out = mergeCandles(warm, partial, 80);
+    expect(out.length).toBeGreaterThanOrEqual(50); // still above the router floor
+    expect(out).toHaveLength(80);
+    expect(out[out.length - 1].timestamp).toBe(100);
+  });
+
+  it('advances the tail when the partial fetch carries newer bars', () => {
+    const warm = series(80, 100);             // [21..100]
+    const partial = [bar(101), bar(102)];     // two newer minutes
+    const out = mergeCandles(warm, partial, 80);
+    expect(out).toHaveLength(80);
+    expect(out[out.length - 1].timestamp).toBe(102);
+    expect(out[0].timestamp).toBe(23); // oldest two evicted to honour the cap
+  });
+
+  it('a healthy full fetch yields the same series as a plain replace (byte-identical path)', () => {
+    const warm = series(80, 100);
+    const full = series(80, 140); // fully newer, non-overlapping window
+    const out = mergeCandles(warm, full, 80);
+    expect(out).toEqual(full); // old history fully rolled off; identical to replace
+  });
+
+  it('fresh wins on an overlapping timestamp (finalised bar value)', () => {
+    const warm = [bar(1, 100), bar(2, 100)];
+    const fresh = [bar(2, 222), bar(3, 333)];
+    const out = mergeCandles(warm, fresh, 80);
+    expect(out.find(c => c.timestamp === 2)?.close).toBe(222);
+    expect(out.map(c => c.timestamp)).toEqual([1, 2, 3]);
+  });
+
+  it('returns the cache unchanged when the fresh fetch is empty', () => {
+    const warm = series(80, 100);
+    expect(mergeCandles(warm, [], 80)).toBe(warm);
   });
 });

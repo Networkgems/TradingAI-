@@ -123,6 +123,45 @@ export function resolveLiveSingleSymbolShortCap(
   }
   return null;
 }
+
+/**
+ * TRA-593 — merge a fresh candle fetch into the retained cache instead of
+ * blindly replacing it.
+ *
+ * Root cause of TRA-593 (demo crypto: healthy quotes, zero signals): a
+ * rate-limited tick returns a *partial* bar series — e.g. Coinbase Exchange
+ * 429s the egress IP, the keyless Advanced Trade backstop 429s too, and the
+ * thin Yahoo fallback yields only ~17 minute bars. The old
+ * `cache.set(symbol, bars)` then evicted a previously-warm 80-bar series and
+ * left 17, dropping the symbol below the strategy minimum-bar thresholds
+ * (`MIN_BARS_BB_FADE`=28 / `MIN_BARS_ROUTER`=50) so *every* strategy skipped
+ * it. Under sustained throttling (44 watchlist symbols, egress shared with
+ * the live engine, 60s ticks) the cache thrashed between warm and cold and the
+ * demo engine emitted near-zero signals despite quotes reading "ok".
+ *
+ * Merging by timestamp keeps the warm history and only advances the tail, so a
+ * partial fetch can never regress warmup. `fresh` wins on an overlapping
+ * timestamp (it carries the finalised bar). The result is capped to `cap` (the
+ * per-timeframe fetch count) so a healthy full fetch yields the exact same
+ * series the pre-fix path did — behaviour is byte-identical when the feed is
+ * not throttled. Retained-but-stale history is still protected downstream by
+ * the TRA-418 freshness gate, which skips a symbol whose latest bar has aged
+ * past threshold regardless of how many bars are cached.
+ *
+ * Exported as a pure helper so unit tests can exercise the eviction-guard
+ * without standing up a full engine + mocked feed (mirrors the pattern used by
+ * {@link resolveLiveSingleSymbolShortCap}).
+ */
+export function mergeCandles(cached: Candle[] | undefined, fresh: readonly Candle[], cap: number): Candle[] {
+  if (!cached || cached.length === 0) return fresh.slice(-cap);
+  if (fresh.length === 0) return cached;
+  const byTs = new Map<number, Candle>();
+  for (const c of cached) byTs.set(c.timestamp, c);
+  for (const c of fresh) byTs.set(c.timestamp, c); // fresh wins on overlap
+  const merged = Array.from(byTs.values()).sort((a, b) => a.timestamp - b.timestamp);
+  return merged.slice(-cap);
+}
+
 /**
  * TRA-230 — drop signals from the displayed list once they're no longer
  * actionable. A signal becomes invalid when it ages past this window or when
@@ -1523,7 +1562,11 @@ export class CryptoSignalEngine {
 
   private async refreshCandles(symbol: string): Promise<void> {
     const bars = await fetchCryptoMinuteBars(symbol, 80);
-    if (bars.length > 0) this.candleCache.set(symbol, bars);
+    // TRA-593 — merge rather than replace so a rate-limited partial fetch
+    // cannot evict a warm cache below the strategy minimum-bar thresholds.
+    if (bars.length > 0) {
+      this.candleCache.set(symbol, mergeCandles(this.candleCache.get(symbol), bars, 80));
+    }
   }
 
   /**
@@ -1593,7 +1636,11 @@ export class CryptoSignalEngine {
       if (Date.now() - lastBar.timestamp < hourMs) return;
     }
     const bars = await fetchCryptoDailyBars(symbol, 260);
-    if (bars.length > 0) this.dailyCandleCache.set(symbol, bars);
+    // TRA-593 — merge so a rate-limited partial daily fetch can't drop the
+    // swing strategy's 205-bar history below threshold and silence it.
+    if (bars.length > 0) {
+      this.dailyCandleCache.set(symbol, mergeCandles(this.dailyCandleCache.get(symbol), bars, 260));
+    }
   }
 
   /**
@@ -1612,7 +1659,11 @@ export class CryptoSignalEngine {
       if (Date.now() - lastBar.timestamp < hourMs) return;
     }
     const bars = await fetchCrypto4hBars(symbol, 260);
-    if (bars.length > 0) this._4hCandleCache.set(symbol, bars);
+    // TRA-593 — merge so a rate-limited partial 4H fetch can't regress the
+    // perp-shorts warmup below threshold.
+    if (bars.length > 0) {
+      this._4hCandleCache.set(symbol, mergeCandles(this._4hCandleCache.get(symbol), bars, 260));
+    }
   }
 
   private buildState(): CryptoEngineState {
