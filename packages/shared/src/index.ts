@@ -10,6 +10,10 @@ export * from './news-sentiment.js';
 // TRA-602 — StockTwits social-sentiment aggregate.
 export * from './social-sentiment.js';
 
+// TRA-598 (C3) — first-class "no day trading" guardrail: central config block
+// + pure decision helpers shared by idea-gen and the order-time paths.
+export * from './day-trading-guardrail.js';
+
 export type Side = 'buy' | 'sell';
 export type OrderStatus = 'pending' | 'filled' | 'cancelled' | 'rejected';
 export type SignalType =

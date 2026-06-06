@@ -133,6 +133,17 @@ describe('runOptionsResearch', () => {
     expect(reasonBlob).toMatch(/not in universe/);
   });
 
+  // TRA-598 (C3) acceptance — a 0DTE idea must never be surfaced.
+  it('rejects a 0DTE idea at idea generation', async () => {
+    const llm = new StubLlmClient(() =>
+      JSON.stringify({ ideas: [goodIdea({ dteDays: 0 })] }),
+    );
+    const out = await runOptionsResearch(input(), { llm });
+    expect(out.ideas).toHaveLength(0);
+    expect(out.rejected).toHaveLength(1);
+    expect(out.rejected[0]!.reasons.join(' ')).toMatch(/day-trade guardrail/);
+  });
+
   it('every returned idea is defined-risk and clears the guardrail', async () => {
     const llm = new StubLlmClient(() =>
       JSON.stringify({

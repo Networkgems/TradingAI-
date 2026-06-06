@@ -56,6 +56,40 @@ describe('derivePricingPath (open)', () => {
   });
 });
 
+describe('submitSmartBuyToOpen — no-day-trading backstop (TRA-598 C3)', () => {
+  it('rejects a 0DTE OCC buy_to_open before any quote/order call', async () => {
+    const client = buildClient();
+    const outcome = await submitSmartBuyToOpen(client, 'AAPL240604C00200000', 1, {
+      now: Date.parse('2024-06-04T14:00:00Z'), // same day as the OCC expiration → 0DTE
+    });
+    expect(outcome.status).toBe('rejected');
+    expect(outcome).toMatchObject({ reason: expect.stringMatching(/no day trading/i) });
+    expect((client.getOptionQuote as ReturnType<typeof vi.fn>).mock.calls).toHaveLength(0);
+    expect((client.buyContractsLimit as ReturnType<typeof vi.fn>).mock.calls).toHaveLength(0);
+  });
+
+  it('lets a far-dated OCC entry through to the quote path', async () => {
+    const client = buildClient({
+      getOptionQuote: vi.fn(async () => ({ symbol: 'AAPL', bid: 1.0, ask: 1.2 } as TradierOptionQuote)),
+      waitForOrderTerminalStatus: vi.fn(async () => ({ id: 1, status: 'filled', avg_fill_price: 1.11 } as TradierOrderDetail)),
+    });
+    const outcome = await submitSmartBuyToOpen(client, 'AAPL240705C00200000', 1, {
+      now: Date.parse('2024-06-04T14:00:00Z'), // 31 DTE → clears the floor
+    });
+    expect(outcome.status).toBe('filled');
+    expect((client.getOptionQuote as ReturnType<typeof vi.fn>).mock.calls).toHaveLength(1);
+  });
+
+  it('skips the backstop for a non-OCC symbol (no expiration to parse)', async () => {
+    const client = buildClient({
+      getOptionQuote: vi.fn(async () => ({ symbol: 'X', bid: 1.0, ask: 1.2 } as TradierOptionQuote)),
+      waitForOrderTerminalStatus: vi.fn(async () => ({ id: 1, status: 'filled', avg_fill_price: 1.11 } as TradierOrderDetail)),
+    });
+    const outcome = await submitSmartBuyToOpen(client, 'X', 1);
+    expect(outcome.status).toBe('filled');
+  });
+});
+
 describe('submitSmartBuyToOpen', () => {
   it('submits a limit at mid + 1¢ and returns the broker fill on first attempt', async () => {
     // bid 1.00 / ask 1.20 → mid 1.10 → attempt 0 = mid + 0.01 = 1.11.

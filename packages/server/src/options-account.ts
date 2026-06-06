@@ -10,6 +10,8 @@ import type {
   RelativeValueSignal,
   RvRiskParams,
   TradierEnv,
+  DayTradingGuardrailConfig,
+  GuardrailVerdict,
 } from '@trading-app/shared';
 import {
   DEFAULT_ACCOUNT_SETTINGS,
@@ -27,7 +29,17 @@ import {
   RV_MIN_MARK_FLOOR,
   isValidTradingWindow,
   perPositionCap,
+  DAY_TRADING_GUARDRAIL,
+  checkEntryDte,
+  checkDiscretionaryClose,
+  dteFromExpiration,
 } from '@trading-app/shared';
+import { logger } from './observability/index.js';
+
+// TRA-598 (C3) — clear-reason channel for guardrail rejections. The open paths
+// keep their `null`-on-reject contract; this surfaces *why* an entry was
+// refused to the logs (and gives tests / callers a programmatic read).
+const guardLog = logger.child({ module: 'day-trading-guardrail' });
 
 /**
  * TRA-462 — RV stop-loss premium with the dollar-distance floor. The stop
@@ -207,6 +219,14 @@ interface OptionsAccountConfig {
    * trips have no PDT impact.
    */
   holdLiveOptionsOvernightForPdt?: boolean;
+  /**
+   * TRA-598 (C3) — the first-class "no day trading" guardrail config. Drives the
+   * order-time entry-DTE floor and the same-session round-trip block. Optional;
+   * defaults to the shipped {@link DAY_TRADING_GUARDRAIL}. Tests pass an override
+   * (e.g. a higher `minEntryDteDays`, or `blockSameSessionRoundTrip: false`) to
+   * exercise the gates deterministically.
+   */
+  dayTradingGuardrail?: DayTradingGuardrailConfig;
 }
 
 /**
@@ -306,6 +326,8 @@ export class PaperOptionsAccount {
    * when the user toggles the matching AccountSettings field.
    */
   private holdLiveOptionsOvernightForPdt: boolean;
+  /** TRA-598 (C3) — resolved no-day-trading thresholds; see {@link OptionsAccountConfig.dayTradingGuardrail}. */
+  private dayTradingGuardrail: DayTradingGuardrailConfig;
   private currentDayKey = toDateKey(Date.now());
 
   constructor(config: OptionsAccountConfig = {}) {
@@ -329,6 +351,7 @@ export class PaperOptionsAccount {
     // {@link resolveHoldLiveOptionsOvernight}, which defaults to ON and
     // matches the issue's wake-comment requirement.
     this.holdLiveOptionsOvernightForPdt = config.holdLiveOptionsOvernightForPdt ?? false;
+    this.dayTradingGuardrail = config.dayTradingGuardrail ?? DAY_TRADING_GUARDRAIL;
     this.equity = this.initialEquity;
     this.cash = this.initialEquity;
   }
@@ -364,6 +387,9 @@ export class PaperOptionsAccount {
     }
     if (config.holdLiveOptionsOvernightForPdt !== undefined) {
       this.holdLiveOptionsOvernightForPdt = config.holdLiveOptionsOvernightForPdt;
+    }
+    if (config.dayTradingGuardrail !== undefined) {
+      this.dayTradingGuardrail = config.dayTradingGuardrail;
     }
     this.equity = this.initialEquity;
     this.cash = this.initialEquity;
@@ -417,6 +443,57 @@ export class PaperOptionsAccount {
     if (config.holdLiveOptionsOvernightForPdt !== undefined) {
       this.holdLiveOptionsOvernightForPdt = config.holdLiveOptionsOvernightForPdt;
     }
+    if (config.dayTradingGuardrail !== undefined) {
+      this.dayTradingGuardrail = config.dayTradingGuardrail;
+    }
+  }
+
+  /** TRA-598 (C3) — read the resolved no-day-trading thresholds (UI/introspection). */
+  getDayTradingGuardrail(): DayTradingGuardrailConfig {
+    return this.dayTradingGuardrail;
+  }
+
+  /**
+   * TRA-598 (C3) — discretionary-close gate. The server's user-initiated close
+   * handlers call this BEFORE closing an engine/AI-opened position so a
+   * voluntary same-session round trip (the textbook day trade) is refused with a
+   * clear reason. Returns `allowed` for:
+   *   • positions not on this account (caller resolves not-found),
+   *   • Tradier-imported rows (the user's pre-existing external book — outside
+   *     the AI product's no-day-trading scope),
+   *   • any close once the position has crossed into a later session.
+   * Risk-driven exits (SL/TP/trailing in {@link checkExits}) never call this and
+   * are always allowed, so a losing position still auto-exits at its stop.
+   */
+  checkDayTradingClose(optionId: string, now: number = Date.now()): GuardrailVerdict {
+    const opt = this.openOptions.get(optionId);
+    if (!opt) return { allowed: true };
+    if (opt.importedFromTradier) return { allowed: true };
+    return checkDiscretionaryClose(opt.openedAt, now, this.dayTradingGuardrail);
+  }
+
+  /**
+   * TRA-598 (C3) — order-time entry gate. Refuses a sub-threshold-DTE entry
+   * (0DTE / short-dated) on ANY open path, independent of which scanner produced
+   * the signal. The scanners already surface only 21–60 DTE, so this is a
+   * defense-in-depth backstop: a manual/imported/refactored path can never slip
+   * a day-trade-DTE entry past the broker boundary. Keeps the open paths'
+   * `null`-on-reject contract; logs the reason for the UI/ops.
+   */
+  private passesEntryDteGuard(optionSymbol: string, expiration: string | undefined, now: number): boolean {
+    const dte = expiration ? dteFromExpiration(expiration, now) : null;
+    const verdict = checkEntryDte(dte ?? Number.NaN, this.dayTradingGuardrail);
+    if (!verdict.allowed) {
+      guardLog.warn('option entry blocked by no-day-trading guardrail', {
+        optionSymbol,
+        expiration: expiration ?? null,
+        dte,
+        minEntryDteDays: this.dayTradingGuardrail.minEntryDteDays,
+        reason: verdict.reason,
+      });
+      return false;
+    }
+    return true;
   }
 
   /** Current options daily cap — exposed so the UI can render a count badge. */
@@ -748,6 +825,9 @@ export class PaperOptionsAccount {
     );
     if (existing) return null;
 
+    // TRA-598 (C3) — no-day-trading entry gate: refuse sub-threshold-DTE entries.
+    if (!this.passesEntryDteGuard(signal.optionSymbol, signal.expiration, Date.now())) return null;
+
     // TRA-374 — in demo, bias `premiumPaid` up by `demoSlippagePct` so the
     // demo book pays the modelled cost of crossing the spread instead of
     // booking at the mid. Live mode keeps the raw mark — Tradier already
@@ -845,6 +925,9 @@ export class PaperOptionsAccount {
       o => o.optionSymbol === signal.optionSymbol,
     );
     if (existing) return null;
+
+    // TRA-598 (C3) — no-day-trading entry gate: refuse sub-threshold-DTE entries.
+    if (!this.passesEntryDteGuard(signal.optionSymbol, signal.expiration, Date.now())) return null;
 
     // TRA-374 — see `openOptionFromCandidate` for the demo cost-model rationale.
     const rawMark = signal.mark;

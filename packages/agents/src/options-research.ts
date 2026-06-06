@@ -16,7 +16,7 @@
 // `StubLlmClient` for the company Anthropic key in production is a config change,
 // not a code change. One call per idea batch; results are cacheable by a
 // deterministic batch key so a re-run within the same trading day costs $0.
-import type { OptionType } from '@trading-app/shared';
+import { DAY_TRADING_GUARDRAIL, type OptionType } from '@trading-app/shared';
 import { completeJson, type CompleteJsonResult, type LlmClient, type LlmMessage } from './llm-client.js';
 
 /**
@@ -126,9 +126,14 @@ export interface DayTradingGuardrail {
   definedRiskOnly: boolean;
 }
 
-/** Matches the live scanner window floor (21–60 DTE); see TRA-373/TRA-595 §3. */
+/**
+ * Idea-gen guardrail defaults. `minDteDays` is sourced from the C3 central
+ * config block (`DAY_TRADING_GUARDRAIL.minIdeaDteDays`, TRA-598) so idea-gen and
+ * the order-time paths share one source of truth — it matches the live scanner
+ * window floor (21–60 DTE; TRA-373/TRA-595 §3).
+ */
 export const DEFAULT_OPTIONS_GUARDRAIL: DayTradingGuardrail = {
-  minDteDays: 21,
+  minDteDays: DAY_TRADING_GUARDRAIL.minIdeaDteDays,
   definedRiskOnly: true,
 };
 

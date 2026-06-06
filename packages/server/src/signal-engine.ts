@@ -2720,6 +2720,26 @@ export class SignalEngine {
   }
 
   /**
+   * TRA-598 (C3) — no-day-trading discretionary-close gate for a user-initiated
+   * option close. Runs the owning account's {@link PaperOptionsAccount.checkDayTradingClose}
+   * across both env buckets so the `/api/options/:id/close` handler can refuse a
+   * voluntary same-session round trip with a clear reason before mirroring
+   * anything to the broker. Imported rows and risk-driven exits are exempt (see
+   * the account method). Returns `allowed` when no engine-opened row matches —
+   * the caller resolves not-found separately.
+   */
+  checkOptionDayTradingClose(
+    optionId: string,
+    now: number = Date.now(),
+  ): import('@trading-app/shared').GuardrailVerdict {
+    for (const acct of this.allOptionsAccounts()) {
+      const verdict = acct.checkDayTradingClose(optionId, now);
+      if (!verdict.allowed) return verdict;
+    }
+    return { allowed: true };
+  }
+
+  /**
    * TRA-352 — locate an engine-opened open option position across env
    * buckets. Returns the position with the env it lives in so the close
    * handler can build a Tradier client for the right env. Excludes

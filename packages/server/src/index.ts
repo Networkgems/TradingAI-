@@ -3067,6 +3067,19 @@ app.post('/api/options/:id/close', requireAuth, async (req, res) => {
     res.status(404).json({ error: 'Option position not found' });
     return;
   }
+  // TRA-598 (C3) — no-day-trading guardrail: refuse a voluntary same-session
+  // round trip on an AI/engine-opened position. Risk-driven auto-exits don't go
+  // through this route, so a losing position still auto-exits at its stop; this
+  // only blocks the user from manually closing a position they opened today.
+  const dayTradeGuard = ctx.engine.checkOptionDayTradingClose(id);
+  if (!dayTradeGuard.allowed) {
+    log.info('option close blocked by no-day-trading guardrail', {
+      optionId: id,
+      reason: dayTradeGuard.reason,
+    });
+    res.status(409).json({ error: dayTradeGuard.reason });
+    return;
+  }
   const liveMirror = engineOpened.position.mode === 'live';
   if (liveMirror) {
     // TRA-358 — user-driven LIMIT close on engine-opened live positions.

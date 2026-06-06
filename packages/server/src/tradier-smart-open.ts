@@ -4,7 +4,14 @@ import {
   type TradierOrderDetail,
   TRADIER_REJECTED_STATUSES,
   roundToCent,
+  parseOccSymbol,
 } from '@trading-app/engine';
+import {
+  DAY_TRADING_GUARDRAIL,
+  checkEntryDte,
+  dteFromExpiration,
+  type DayTradingGuardrailConfig,
+} from '@trading-app/shared';
 import { logger } from './observability/index.js';
 
 const openLog = logger.child({ module: 'tradier-smart-open' });
@@ -47,6 +54,16 @@ export interface SmartBuyOptions {
   timeoutMs?: number;
   /** Injectable for tests so we don't need real timers. */
   sleep?: (ms: number) => Promise<void>;
+  /**
+   * TRA-598 (C3) — no-day-trading guardrail config. Defaults to the shipped
+   * {@link DAY_TRADING_GUARDRAIL}. The entry-DTE floor is enforced here as a
+   * last-line backstop at the broker boundary (the OCC symbol encodes the
+   * expiration), so a 0DTE / sub-threshold `buy_to_open` can never reach Tradier
+   * even if a caller bypassed the account-level entry gate. Injectable for tests.
+   */
+  guardrail?: DayTradingGuardrailConfig;
+  /** Clock seam for the DTE backstop (ms epoch). Defaults to `Date.now()`. */
+  now?: number;
 }
 
 /**
@@ -90,6 +107,25 @@ export async function submitSmartBuyToOpen(
 ): Promise<SmartBuyOutcome> {
   const timeoutMs = options.timeoutMs ?? 30_000;
   const sleep = options.sleep ?? ((ms) => new Promise<void>((r) => setTimeout(r, ms)));
+
+  // TRA-598 (C3) — no-day-trading backstop. The OCC symbol encodes the
+  // expiration; refuse a sub-threshold-DTE `buy_to_open` before any broker call.
+  // A non-OCC symbol (can't parse) skips the check rather than blocking blindly.
+  const guardrail = options.guardrail ?? DAY_TRADING_GUARDRAIL;
+  const parsed = parseOccSymbol(optionSymbol);
+  if (parsed) {
+    const dte = dteFromExpiration(parsed.expiration, options.now ?? Date.now());
+    const verdict = checkEntryDte(dte ?? Number.NaN, guardrail);
+    if (!verdict.allowed) {
+      openLog.warn('buy_to_open blocked by no-day-trading guardrail', {
+        optionSymbol,
+        expiration: parsed.expiration,
+        dte,
+        reason: verdict.reason,
+      });
+      return { status: 'rejected', reason: verdict.reason ?? 'no day trading: entry DTE below minimum' };
+    }
+  }
 
   let quote: TradierOptionQuote | null = null;
   try {
