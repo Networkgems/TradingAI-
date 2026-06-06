@@ -1,6 +1,6 @@
 import { OrbStrategy, BbFadeStrategy, IchimokuStrategy, TradierOptionsClient, TradierOrderClient, TRADIER_REJECTED_STATUSES, evaluateSma200, SMA200_MIN_BARS, SMA200_DEBOUNCE_BARS, composeTechnicalSnapshot, resampleCandles, TF_BUCKET_MS } from '@trading-app/engine';
 import type { TradierAccountBalance } from '@trading-app/engine';
-import { WATCHLIST, MANAGED_ACCOUNT_RATIO, MAX_CONSECUTIVE_LOSSES, DAILY_DRAWDOWN_HALT_PCT, OPTIONS_PER_TICKET_DOLLAR_FLOOR, OPTIONS_POSITION_CAP_RATIO, aliasWatchlistSymbol, isLiveTradierOptionsEnabled, isStockMarketOpen, perPositionCap, resolveAutoManageImportedTradierOptions, resolveDemoCostModel, resolveHoldLiveOptionsOvernight, resolveLiveTradeEquitiesTradier, resolveManagedAccountRatio, resolveMarketReviewGatesEnabled, resolveRiskPerTrade, resolveRvDtePrefs, resolveTradierOptionsCreds, validateBracket, DEFAULT_RV_DTE_MIN, DEFAULT_RV_DTE_MAX, DEFAULT_RV_DTE_TARGET, scoreNewsSentiment, aggregateSymbolSentiment, aggregateFedSentiment, aggregateStockTwitsSentiment, nameAliasesFor } from '@trading-app/shared';
+import { WATCHLIST, MANAGED_ACCOUNT_RATIO, MAX_CONSECUTIVE_LOSSES, DAILY_DRAWDOWN_HALT_PCT, OPTIONS_PER_TICKET_DOLLAR_FLOOR, OPTIONS_POSITION_CAP_RATIO, aliasWatchlistSymbol, isLiveTradierOptionsEnabled, isStockMarketOpen, perPositionCap, resolveAutoManageImportedTradierOptions, resolveDemoCostModel, resolveHoldLiveOptionsOvernight, resolveLiveTradeEquitiesTradier, resolveManagedAccountRatio, resolveMarketReviewGatesEnabled, resolveRiskPerTrade, resolveRvDtePrefs, resolveTradierOptionsCreds, validateBracket, DEFAULT_RV_DTE_MIN, DEFAULT_RV_DTE_MAX, DEFAULT_RV_DTE_TARGET, scoreNewsSentiment, aggregateSymbolSentiment, aggregateFedSentiment, aggregateStockTwitsSentiment, dedupeStockTwitsMessages, mapCuratedMessagesBySymbol, nameAliasesFor } from '@trading-app/shared';
 import type { TradeSignal, RelativeValueSignal, Sma200Signal, Candle, OptionsAccountState, SignalType, Position, OptionPosition, AccountMode, AccountSettings, AccountState, NewsItem, SymbolSentiment, SocialSentiment, StockTwitsMessage, TechnicalSignalSnapshot, TradierEnv, MarketReview, MarketReviewGates, EngineMarketReviewState, GatedStrategyNote, AgentRecommendation } from '@trading-app/shared';
 // TRA-544 (TRA-529 P1) — advisory multi-agent layer. P1 runs the deterministic
 // STUB graph (no LLM calls, zero spend); ON suspends deterministic auto-routing
@@ -10,7 +10,7 @@ import { getLatestMarketReview } from './market-review.js';
 import { earningsInDaysSync } from './earnings-store.js';
 import { etDateString } from './scheduler.js';
 import { fetchMinuteBars, fetchDailyCandles, fetchQuotes, fetchStocksNews, isYahooBreakerOpen, setActiveInterestSymbols, setTradierStocksFeedClient } from './yahoo-feed.js';
-import { fetchStockTwitsStream } from './stocktwits-feed.js';
+import { fetchStockTwitsStream, fetchStockTwitsUserStream, getCuratedStockTwitsAccounts } from './stocktwits-feed.js';
 import { evaluateFeedFreshness } from './feed-freshness.js';
 import { PaperAccount } from './paper-account.js';
 import { PaperOptionsAccount } from './options-account.js';
@@ -468,6 +468,14 @@ export class SignalEngine {
    * symbol; absent until the first successful fetch for that symbol.
    */
   private socialCache: Map<string, StockTwitsMessage[]> = new Map();
+  /**
+   * TRA-603 — curated followed-account lane, keyed by uppercased symbol. Refreshed
+   * wholesale on the social cadence (each refresh is a full snapshot of every
+   * curated account, so a stale fold-out can't linger), merged with the crowd
+   * cache on read by {@link getSocialSentiment}. Curated messages carry a higher
+   * weight in the aggregate (see `aggregateStockTwitsSentiment`).
+   */
+  private curatedSocialCache: Map<string, StockTwitsMessage[]> = new Map();
   private lastSocialRefresh = 0;
   /**
    * TRA-533 — per-symbol multi-timeframe technical snapshots, refreshed on the
@@ -3706,6 +3714,37 @@ export class SignalEngine {
         });
       }
     }
+    await this.refreshCuratedSocialSentiment();
+  }
+
+  /**
+   * TRA-603 — pull every curated followed-account stream and rebuild the
+   * per-symbol curated cache from the combined batch (deduped, mapped by the
+   * message `symbols` entity). Best-effort: if every account fetch degrades to
+   * null (breaker open / 429 / cold), the previous curated snapshot is left
+   * untouched so a transient blip never wipes a good read. Never throws.
+   */
+  private async refreshCuratedSocialSentiment(): Promise<void> {
+    const accounts = getCuratedStockTwitsAccounts();
+    const collected: StockTwitsMessage[] = [];
+    let anySuccess = false;
+    for (const user of accounts) {
+      try {
+        const messages = await fetchStockTwitsUserStream(user);
+        if (messages !== null) {
+          anySuccess = true;
+          collected.push(...messages);
+        }
+      } catch (err) {
+        log.warn('curated social refresh failed', {
+          account: user,
+          reason: err instanceof Error ? err.message : String(err),
+        });
+      }
+    }
+    // No account responded (breaker open / all failed) — keep the last snapshot.
+    if (!anySuccess) return;
+    this.curatedSocialCache = mapCuratedMessagesBySymbol(collected);
   }
 
   /**
@@ -3715,7 +3754,12 @@ export class SignalEngine {
    */
   getSocialSentiment(symbol: string): SocialSentiment {
     const sym = aliasWatchlistSymbol(symbol).toUpperCase();
-    const messages: StockTwitsMessage[] = this.socialCache.get(sym) ?? [];
+    const crowd = this.socialCache.get(sym) ?? [];
+    const curated = this.curatedSocialCache.get(sym) ?? [];
+    // Merge both lanes, deduping by message id (a curated post about this symbol
+    // can also appear in its crowd stream); the curated copy wins so the higher
+    // weight survives (TRA-603).
+    const messages = dedupeStockTwitsMessages([...curated, ...crowd]);
     return aggregateStockTwitsSentiment({ symbol: sym, messages, now: Date.now() });
   }
 

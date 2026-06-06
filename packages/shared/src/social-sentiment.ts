@@ -23,6 +23,12 @@ const TILT_THRESHOLD = 0.25;
 const STALE_MINUTES = 720;
 /** Minimum bull+bear-tagged messages required for a non-neutral tilt. */
 const MIN_TAGGED_FOR_TILT = 5;
+/**
+ * TRA-603 — recency-weight multiplier applied to curated (followed-account)
+ * messages so a high-signal analyst/official-feed call moves `netScore` more
+ * than an anonymous crowd post of the same age.
+ */
+const CURATED_WEIGHT_MULTIPLIER = 3;
 
 function clamp(v: number, lo: number, hi: number): number {
   return v < lo ? lo : v > hi ? hi : v;
@@ -75,7 +81,7 @@ export function aggregateStockTwitsSentiment(opts: AggregateSocialOptions): Soci
 
     const ageMinutes = Math.max(0, (now - t) / 60000);
     const polarity = m.sentiment === 'Bullish' ? 1 : -1;
-    const weight = recencyWeight(ageMinutes);
+    const weight = recencyWeight(ageMinutes) * (m.curated ? CURATED_WEIGHT_MULTIPLIER : 1);
     weighted += polarity * weight;
     weightSum += weight;
     if (polarity > 0) bullishCount += 1;
@@ -108,4 +114,53 @@ export function aggregateStockTwitsSentiment(opts: AggregateSocialOptions): Soci
     freshnessMinutes,
     tilt,
   };
+}
+
+/**
+ * TRA-603 — dedupe a batch of StockTwits messages by message id, preferring the
+ * curated copy on a collision. A curated account's post about a symbol can also
+ * surface in that symbol's anonymous crowd stream; keeping the curated copy
+ * ensures the higher weight survives the merge. Order is otherwise preserved
+ * (first occurrence wins for non-curated collisions). Pure; never throws.
+ */
+export function dedupeStockTwitsMessages(
+  messages: readonly StockTwitsMessage[],
+): StockTwitsMessage[] {
+  const byId = new Map<number, StockTwitsMessage>();
+  for (const m of messages) {
+    const existing = byId.get(m.id);
+    if (!existing) {
+      byId.set(m.id, m);
+    } else if (m.curated && !existing.curated) {
+      byId.set(m.id, m); // upgrade an anonymous copy to its curated twin
+    }
+  }
+  return [...byId.values()];
+}
+
+/**
+ * TRA-603 — fan a batch of curated messages out into a per-symbol map keyed by
+ * uppercased ticker, using each message's `symbols` entity. A message that
+ * mentions N symbols is emitted under all N. Messages without symbols are
+ * skipped (they cannot be attributed to a per-symbol cache). The returned arrays
+ * are deduped by message id. Pure; never throws.
+ */
+export function mapCuratedMessagesBySymbol(
+  messages: readonly StockTwitsMessage[],
+): Map<string, StockTwitsMessage[]> {
+  const bySymbol = new Map<string, StockTwitsMessage[]>();
+  for (const m of messages) {
+    if (!Array.isArray(m.symbols)) continue;
+    for (const raw of m.symbols) {
+      const sym = raw.toUpperCase();
+      if (!sym) continue;
+      const bucket = bySymbol.get(sym);
+      if (bucket) bucket.push(m);
+      else bySymbol.set(sym, [m]);
+    }
+  }
+  for (const [sym, bucket] of bySymbol) {
+    bySymbol.set(sym, dedupeStockTwitsMessages(bucket));
+  }
+  return bySymbol;
 }

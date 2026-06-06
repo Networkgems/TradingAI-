@@ -1,5 +1,9 @@
 import { describe, it, expect } from 'vitest';
-import { aggregateStockTwitsSentiment } from './index.js';
+import {
+  aggregateStockTwitsSentiment,
+  dedupeStockTwitsMessages,
+  mapCuratedMessagesBySymbol,
+} from './index.js';
 import type { StockTwitsMessage } from './index.js';
 
 // Fixed clock so recency weighting is deterministic.
@@ -123,5 +127,63 @@ describe('aggregateStockTwitsSentiment', () => {
       now: NOW,
     });
     expect(r.freshnessMinutes).toBe(45);
+  });
+
+  it('weights a curated message above an anonymous one of the same age (TRA-603)', () => {
+    // One curated bull vs one anonymous bear, identical age. The curated weight
+    // multiplier (3×) tips the recency-weighted net positive despite the 1:1
+    // raw count.
+    const curatedBull: StockTwitsMessage = { id: 1, createdAt: minutesAgo(5), sentiment: 'Bullish', curated: true };
+    const anonBear: StockTwitsMessage = { id: 2, createdAt: minutesAgo(5), sentiment: 'Bearish' };
+    const r = aggregateStockTwitsSentiment({ symbol: 'AAPL', messages: [curatedBull, anonBear], now: NOW });
+    expect(r.bullishCount).toBe(1);
+    expect(r.bearishCount).toBe(1);
+    expect(r.netScore).toBeGreaterThan(0); // curated bull dominates
+    // 3× bull weight vs 1× bear ⇒ (3-1)/(3+1) = +0.5
+    expect(r.netScore).toBeCloseTo(0.5, 4);
+  });
+});
+
+describe('dedupeStockTwitsMessages (TRA-603)', () => {
+  it('dedupes by message id, keeping the first non-curated copy', () => {
+    const a: StockTwitsMessage = { id: 1, createdAt: '2026-06-06T16:00:00Z', sentiment: 'Bullish' };
+    const dup: StockTwitsMessage = { id: 1, createdAt: '2026-06-06T16:00:00Z', sentiment: 'Bearish' };
+    const b: StockTwitsMessage = { id: 2, createdAt: '2026-06-06T15:59:00Z', sentiment: null };
+    const out = dedupeStockTwitsMessages([a, dup, b]);
+    expect(out).toHaveLength(2);
+    expect(out[0]).toBe(a);
+    expect(out[1]).toBe(b);
+  });
+
+  it('upgrades an anonymous copy to its curated twin regardless of order', () => {
+    const anon: StockTwitsMessage = { id: 7, createdAt: '2026-06-06T16:00:00Z', sentiment: 'Bullish' };
+    const curated: StockTwitsMessage = { id: 7, createdAt: '2026-06-06T16:00:00Z', sentiment: 'Bullish', curated: true, symbols: ['AAPL'] };
+    expect(dedupeStockTwitsMessages([anon, curated])[0]).toBe(curated);
+    expect(dedupeStockTwitsMessages([curated, anon])[0]).toBe(curated);
+  });
+});
+
+describe('mapCuratedMessagesBySymbol (TRA-603)', () => {
+  it('fans a multi-symbol message out onto every symbol it references', () => {
+    const m: StockTwitsMessage = { id: 1, createdAt: '2026-06-06T16:00:00Z', sentiment: 'Bullish', curated: true, symbols: ['AAPL', 'TSLA'] };
+    const map = mapCuratedMessagesBySymbol([m]);
+    expect(map.get('AAPL')).toEqual([m]);
+    expect(map.get('TSLA')).toEqual([m]);
+  });
+
+  it('uppercases keys and skips messages without symbols', () => {
+    const withSym: StockTwitsMessage = { id: 1, createdAt: '2026-06-06T16:00:00Z', sentiment: null, curated: true, symbols: ['nvda'] };
+    const noSym: StockTwitsMessage = { id: 2, createdAt: '2026-06-06T16:00:00Z', sentiment: 'Bullish', curated: true };
+    const map = mapCuratedMessagesBySymbol([withSym, noSym]);
+    expect([...map.keys()]).toEqual(['NVDA']);
+    expect(map.get('NVDA')).toEqual([withSym]);
+  });
+
+  it('dedupes per-symbol buckets by message id', () => {
+    const m1: StockTwitsMessage = { id: 1, createdAt: '2026-06-06T16:00:00Z', sentiment: 'Bullish', curated: true, symbols: ['AAPL'] };
+    const m1dup: StockTwitsMessage = { id: 1, createdAt: '2026-06-06T16:00:00Z', sentiment: 'Bullish', curated: true, symbols: ['AAPL'] };
+    const m2: StockTwitsMessage = { id: 2, createdAt: '2026-06-06T15:59:00Z', sentiment: 'Bearish', curated: true, symbols: ['AAPL'] };
+    const map = mapCuratedMessagesBySymbol([m1, m1dup, m2]);
+    expect(map.get('AAPL')).toHaveLength(2);
   });
 });

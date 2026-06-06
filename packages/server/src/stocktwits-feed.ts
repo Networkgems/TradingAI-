@@ -72,6 +72,8 @@ interface RawStockTwitsMessage {
   id?: number;
   created_at?: string;
   entities?: { sentiment?: { basic?: string } | null } | null;
+  /** TRA-603 — tickers a message references; present on user-stream messages. */
+  symbols?: Array<{ symbol?: string } | null> | null;
 }
 
 /** Raw StockTwits stream shape — only the fields we read are typed. */
@@ -79,13 +81,105 @@ interface RawStockTwitsStream {
   messages?: RawStockTwitsMessage[];
 }
 
-/** Normalize one raw message; returns null when it lacks an id/timestamp. */
-function normalizeMessage(raw: RawStockTwitsMessage): StockTwitsMessage | null {
+/**
+ * Normalize one raw message; returns null when it lacks an id/timestamp.
+ * When `curated` is set, the message is tagged `curated` and its `symbols`
+ * entity is parsed into an uppercased, deduped ticker list (TRA-603) so it can
+ * be folded onto every symbol it mentions.
+ */
+function normalizeMessage(
+  raw: RawStockTwitsMessage,
+  opts: { curated?: boolean } = {},
+): StockTwitsMessage | null {
   if (typeof raw?.id !== 'number' || typeof raw?.created_at !== 'string') return null;
   const basic = raw.entities?.sentiment?.basic;
   const sentiment: StockTwitsMessage['sentiment'] =
     basic === 'Bullish' || basic === 'Bearish' ? basic : null;
-  return { id: raw.id, createdAt: raw.created_at, sentiment };
+  const msg: StockTwitsMessage = { id: raw.id, createdAt: raw.created_at, sentiment };
+  if (opts.curated) {
+    msg.curated = true;
+    const symbols = Array.isArray(raw.symbols)
+      ? raw.symbols
+          .map(s => (typeof s?.symbol === 'string' ? s.symbol.toUpperCase() : null))
+          .filter((s): s is string => !!s)
+      : [];
+    msg.symbols = [...new Set(symbols)];
+  }
+  return msg;
+}
+
+/**
+ * Shared fetch+normalize path for the symbol and user stream endpoints. Honors
+ * the rate-limit breaker, trips it on a 429, and degrades every failure to null
+ * (never throws). `opts` is threaded to {@link normalizeMessage}.
+ */
+async function fetchStreamMessages(
+  url: string,
+  label: string,
+  opts: { curated?: boolean } = {},
+): Promise<StockTwitsMessage[] | null> {
+  const now = Date.now();
+  if (isStockTwitsBreakerOpen(now)) {
+    log.debug('skipping fetch — rate-limit breaker open', { label });
+    return null;
+  }
+  try {
+    const resp = await withTimeout(fetch(url), ST_CALL_TIMEOUT_MS, label);
+    if (resp.status === 429) {
+      const until = resetDeadlineFrom(resp, now);
+      tripStockTwitsBreaker(until);
+      log.warn('rate-limited (429); breaker open', { label, until: new Date(until).toISOString() });
+      return null;
+    }
+    if (!resp.ok) {
+      log.warn('stream fetch returned non-OK status', { label, status: resp.status });
+      return null;
+    }
+    const body = (await resp.json()) as RawStockTwitsStream;
+    const raw = Array.isArray(body?.messages) ? body.messages : [];
+    const messages: StockTwitsMessage[] = [];
+    for (const m of raw.slice(0, MAX_MESSAGES)) {
+      const norm = normalizeMessage(m, opts);
+      if (norm) messages.push(norm);
+    }
+    return messages;
+  } catch (err: unknown) {
+    const msg = err instanceof Error ? err.message : String(err);
+    log.warn('stream fetch failed', { label, reason: msg });
+    return null;
+  }
+}
+
+/**
+ * TRA-603 — curated high-signal StockTwits accounts whose user streams are
+ * ingested as a higher-weight lane. Seeded from the `clipse2` Following list on
+ * the TRA-602 screenshots (analysts + official feeds).
+ */
+export const DEFAULT_CURATED_STOCKTWITS_ACCOUNTS: readonly string[] = [
+  'ivanhoff',
+  'howardlindzon',
+  'Jonathan_Morgan',
+  'JFDI',
+  'JoeyRockets',
+  'StocktwitsNews',
+  'StocktwitsEarnings',
+  'Cryptotwits',
+  'Stocktwits',
+];
+
+/**
+ * TRA-603 — resolve the curated account list. Overridable via the
+ * `CURATED_STOCKTWITS_ACCOUNTS` env (comma-separated usernames); falls back to
+ * {@link DEFAULT_CURATED_STOCKTWITS_ACCOUNTS}.
+ */
+export function getCuratedStockTwitsAccounts(
+  env: NodeJS.ProcessEnv = process.env,
+): string[] {
+  const raw = env.CURATED_STOCKTWITS_ACCOUNTS;
+  if (typeof raw === 'string' && raw.trim().length > 0) {
+    return raw.split(',').map(s => s.trim()).filter(Boolean);
+  }
+  return [...DEFAULT_CURATED_STOCKTWITS_ACCOUNTS];
 }
 
 /**
@@ -93,39 +187,22 @@ function normalizeMessage(raw: RawStockTwitsMessage): StockTwitsMessage | null {
  * {@link StockTwitsMessage}[]. Returns null on any failure (timeout, non-OK,
  * unparseable body) or when the rate-limit breaker is open. Never throws.
  */
-export async function fetchStockTwitsStream(symbol: string): Promise<StockTwitsMessage[] | null> {
-  const now = Date.now();
-  if (isStockTwitsBreakerOpen(now)) {
-    log.debug('skipping fetch — rate-limit breaker open', { symbol });
-    return null;
-  }
+export function fetchStockTwitsStream(symbol: string): Promise<StockTwitsMessage[] | null> {
   const sym = symbol.toUpperCase();
   const url = `https://api.stocktwits.com/api/2/streams/symbol/${encodeURIComponent(sym)}.json`;
-  try {
-    const resp = await withTimeout(fetch(url), ST_CALL_TIMEOUT_MS, `stocktwits(${sym})`);
-    if (resp.status === 429) {
-      const until = resetDeadlineFrom(resp, now);
-      tripStockTwitsBreaker(until);
-      log.warn('rate-limited (429); breaker open', { symbol: sym, until: new Date(until).toISOString() });
-      return null;
-    }
-    if (!resp.ok) {
-      log.warn('stream fetch returned non-OK status', { symbol: sym, status: resp.status });
-      return null;
-    }
-    const body = (await resp.json()) as RawStockTwitsStream;
-    const raw = Array.isArray(body?.messages) ? body.messages : [];
-    const messages: StockTwitsMessage[] = [];
-    for (const m of raw.slice(0, MAX_MESSAGES)) {
-      const norm = normalizeMessage(m);
-      if (norm) messages.push(norm);
-    }
-    return messages;
-  } catch (err: unknown) {
-    const msg = err instanceof Error ? err.message : String(err);
-    log.warn('stream fetch failed', { symbol: sym, reason: msg });
-    return null;
-  }
+  return fetchStreamMessages(url, `stocktwits(${sym})`);
+}
+
+/**
+ * TRA-603 — fetch the recent message stream for one curated account, normalized
+ * to {@link StockTwitsMessage}[] with `curated: true` and each message's
+ * `symbols` entity parsed. Reuses the TRA-602 rate-limit breaker and the same
+ * degrade-to-null contract as {@link fetchStockTwitsStream}; never throws.
+ */
+export function fetchStockTwitsUserStream(username: string): Promise<StockTwitsMessage[] | null> {
+  const user = username.trim();
+  const url = `https://api.stocktwits.com/api/2/streams/user/${encodeURIComponent(user)}.json`;
+  return fetchStreamMessages(url, `stocktwits-user(${user})`, { curated: true });
 }
 
 /** Test StockTwits connectivity — returns the message count for AAPL or throws. */

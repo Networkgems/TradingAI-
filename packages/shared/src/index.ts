@@ -2199,6 +2199,18 @@ export interface StockTwitsMessage {
   id: number;
   createdAt: string; // ISO
   sentiment: 'Bullish' | 'Bearish' | null;
+  /**
+   * TRA-603 — uppercased ticker symbols this message references (parsed from the
+   * raw `symbols` entity). Populated for curated user-stream messages so they can
+   * be folded onto every symbol they mention; omitted for symbol-stream messages,
+   * which are already scoped to a single symbol.
+   */
+  symbols?: string[];
+  /**
+   * TRA-603 — true when sourced from a curated followed account. Curated messages
+   * are weighted above anonymous crowd messages in `aggregateStockTwitsSentiment`.
+   */
+  curated?: boolean;
 }
 
 /**
