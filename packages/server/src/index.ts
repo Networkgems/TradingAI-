@@ -1901,13 +1901,23 @@ app.get('/api/analysis/breadth/:symbol', requireAuth, async (req, res) => {
     return;
   }
   const ctx = await userCtx(res);
-  const notes: { technical?: string; sentiment?: string } = {};
+  const notes: { technical?: string; sentiment?: string; social?: string } = {};
 
   let sentiment = null;
   try {
     sentiment = ctx.engine.getSymbolSentiment(symbol);
   } catch (err) {
     notes.sentiment = err instanceof Error ? err.message : 'sentiment unavailable';
+  }
+
+  // TRA-602 — StockTwits social-sentiment half. Degrades to a null feed with a
+  // reason (cold cache / feed throttled) rather than 500ing, mirroring the news
+  // and technical halves.
+  let social = null;
+  try {
+    social = ctx.engine.getSocialSentiment(symbol);
+  } catch (err) {
+    notes.social = err instanceof Error ? err.message : 'social sentiment unavailable';
   }
 
   // TRA-533 — multi-timeframe technical snapshot. Cached-or-on-demand; degrades
@@ -1925,6 +1935,7 @@ app.get('/api/analysis/breadth/:symbol', requireAuth, async (req, res) => {
     asOf: new Date().toISOString(),
     technical,
     sentiment,
+    social,
     notes,
   });
 });

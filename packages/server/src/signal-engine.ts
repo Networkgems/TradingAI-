@@ -1,7 +1,7 @@
 import { OrbStrategy, BbFadeStrategy, IchimokuStrategy, TradierOptionsClient, TradierOrderClient, TRADIER_REJECTED_STATUSES, evaluateSma200, SMA200_MIN_BARS, SMA200_DEBOUNCE_BARS, composeTechnicalSnapshot, resampleCandles, TF_BUCKET_MS } from '@trading-app/engine';
 import type { TradierAccountBalance } from '@trading-app/engine';
-import { WATCHLIST, MANAGED_ACCOUNT_RATIO, MAX_CONSECUTIVE_LOSSES, DAILY_DRAWDOWN_HALT_PCT, OPTIONS_PER_TICKET_DOLLAR_FLOOR, OPTIONS_POSITION_CAP_RATIO, aliasWatchlistSymbol, isLiveTradierOptionsEnabled, isStockMarketOpen, perPositionCap, resolveAutoManageImportedTradierOptions, resolveDemoCostModel, resolveHoldLiveOptionsOvernight, resolveLiveTradeEquitiesTradier, resolveManagedAccountRatio, resolveMarketReviewGatesEnabled, resolveRiskPerTrade, resolveRvDtePrefs, resolveTradierOptionsCreds, validateBracket, DEFAULT_RV_DTE_MIN, DEFAULT_RV_DTE_MAX, DEFAULT_RV_DTE_TARGET, scoreNewsSentiment, aggregateSymbolSentiment, aggregateFedSentiment, nameAliasesFor } from '@trading-app/shared';
-import type { TradeSignal, RelativeValueSignal, Sma200Signal, Candle, OptionsAccountState, SignalType, Position, OptionPosition, AccountMode, AccountSettings, AccountState, NewsItem, SymbolSentiment, TechnicalSignalSnapshot, TradierEnv, MarketReview, MarketReviewGates, EngineMarketReviewState, GatedStrategyNote, AgentRecommendation } from '@trading-app/shared';
+import { WATCHLIST, MANAGED_ACCOUNT_RATIO, MAX_CONSECUTIVE_LOSSES, DAILY_DRAWDOWN_HALT_PCT, OPTIONS_PER_TICKET_DOLLAR_FLOOR, OPTIONS_POSITION_CAP_RATIO, aliasWatchlistSymbol, isLiveTradierOptionsEnabled, isStockMarketOpen, perPositionCap, resolveAutoManageImportedTradierOptions, resolveDemoCostModel, resolveHoldLiveOptionsOvernight, resolveLiveTradeEquitiesTradier, resolveManagedAccountRatio, resolveMarketReviewGatesEnabled, resolveRiskPerTrade, resolveRvDtePrefs, resolveTradierOptionsCreds, validateBracket, DEFAULT_RV_DTE_MIN, DEFAULT_RV_DTE_MAX, DEFAULT_RV_DTE_TARGET, scoreNewsSentiment, aggregateSymbolSentiment, aggregateFedSentiment, aggregateStockTwitsSentiment, nameAliasesFor } from '@trading-app/shared';
+import type { TradeSignal, RelativeValueSignal, Sma200Signal, Candle, OptionsAccountState, SignalType, Position, OptionPosition, AccountMode, AccountSettings, AccountState, NewsItem, SymbolSentiment, SocialSentiment, StockTwitsMessage, TechnicalSignalSnapshot, TradierEnv, MarketReview, MarketReviewGates, EngineMarketReviewState, GatedStrategyNote, AgentRecommendation } from '@trading-app/shared';
 // TRA-544 (TRA-529 P1) — advisory multi-agent layer. P1 runs the deterministic
 // STUB graph (no LLM calls, zero spend); ON suspends deterministic auto-routing
 // and the engine surfaces the stub recommendations on the WS state.
@@ -10,6 +10,7 @@ import { getLatestMarketReview } from './market-review.js';
 import { earningsInDaysSync } from './earnings-store.js';
 import { etDateString } from './scheduler.js';
 import { fetchMinuteBars, fetchDailyCandles, fetchQuotes, fetchStocksNews, isYahooBreakerOpen, setActiveInterestSymbols, setTradierStocksFeedClient } from './yahoo-feed.js';
+import { fetchStockTwitsStream } from './stocktwits-feed.js';
 import { evaluateFeedFreshness } from './feed-freshness.js';
 import { PaperAccount } from './paper-account.js';
 import { PaperOptionsAccount } from './options-account.js';
@@ -128,6 +129,12 @@ export type EngineEventHandler = (state: EngineState) => void;
 
 const MAX_SIGNALS = 50;
 const NEWS_REFRESH_MS = 5 * 60_000;
+// TRA-602 — StockTwits social-sentiment refresh cadence. Matches the news
+// refresh; the feed's own rate-limit breaker is the harder backstop. Capped to a
+// handful of active symbols per refresh so the unauthenticated endpoint's
+// per-IP budget is not exhausted (see SOCIAL_SYMBOL_LIMIT).
+const SOCIAL_REFRESH_MS = 5 * 60_000;
+const SOCIAL_SYMBOL_LIMIT = 8;
 // TRA-226 — refresh the Tradier `/accounts/{id}/balances` snapshot at most
 // every 2 minutes. Tradier rate-limits balance reads, and the dashboard
 // equity does not need second-level freshness — order fills come through
@@ -455,6 +462,13 @@ export class SignalEngine {
   private allClosedPositions: Position[] = [];
   private newsCache: NewsItem[] = [];
   private lastNewsRefresh = 0;
+  /**
+   * TRA-602 — per-symbol StockTwits message cache, refreshed on the 5-min news
+   * cadence and reduced on read by {@link getSocialSentiment}. Keyed by upper
+   * symbol; absent until the first successful fetch for that symbol.
+   */
+  private socialCache: Map<string, StockTwitsMessage[]> = new Map();
+  private lastSocialRefresh = 0;
   /**
    * TRA-533 — per-symbol multi-timeframe technical snapshots, refreshed on the
    * tick (throttled, see {@link TECHNICAL_SNAPSHOT_REFRESH_MS}) and read by
@@ -1079,6 +1093,16 @@ export class SignalEngine {
         this.newsCache = news.map(n => ({ ...n, sentiment: scoreNewsSentiment(n) }));
       }
       this.lastNewsRefresh = Date.now();
+    }
+
+    // TRA-602 — refresh the StockTwits social-message cache on the same 5-min
+    // cadence. Best-effort: each symbol fetch degrades to null (breaker open /
+    // throttled / cold) without disturbing the cached batch, so getSocialSentiment
+    // keeps serving the last good read. Capped to SOCIAL_SYMBOL_LIMIT symbols to
+    // stay within the unauthenticated per-IP budget.
+    if (Date.now() - this.lastSocialRefresh > SOCIAL_REFRESH_MS) {
+      await this.refreshSocialSentiment();
+      this.lastSocialRefresh = Date.now();
     }
 
     // TRA-389 — refresh the cached premarket market-review so the per-tick
@@ -3661,6 +3685,38 @@ export class SignalEngine {
    */
   getFedSentiment(): SymbolSentiment {
     return aggregateFedSentiment(this.newsCache, Date.now());
+  }
+
+  /**
+   * TRA-602 — pull the StockTwits stream for the most active symbols and refresh
+   * the per-symbol message cache. Best-effort: a null fetch (breaker open / 429 /
+   * cold) leaves that symbol's previous batch untouched, so a transient blip
+   * never wipes a good read. Never throws.
+   */
+  private async refreshSocialSentiment(): Promise<void> {
+    const symbols = this.getActiveSymbols().slice(0, SOCIAL_SYMBOL_LIMIT);
+    for (const sym of symbols) {
+      try {
+        const messages = await fetchStockTwitsStream(sym);
+        if (messages !== null) this.socialCache.set(sym.toUpperCase(), messages);
+      } catch (err) {
+        log.warn('social refresh failed', {
+          symbol: sym,
+          reason: err instanceof Error ? err.message : String(err),
+        });
+      }
+    }
+  }
+
+  /**
+   * TRA-602 — per-symbol StockTwits social-sentiment aggregate built from the
+   * cached message batch. Pure reduction over `Date.now()`; returns an empty
+   * neutral aggregate when no messages are cached for the symbol (never throws).
+   */
+  getSocialSentiment(symbol: string): SocialSentiment {
+    const sym = aliasWatchlistSymbol(symbol).toUpperCase();
+    const messages: StockTwitsMessage[] = this.socialCache.get(sym) ?? [];
+    return aggregateStockTwitsSentiment({ symbol: sym, messages, now: Date.now() });
   }
 
   /**

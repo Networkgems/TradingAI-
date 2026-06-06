@@ -7,6 +7,9 @@ export * from './promotion-gate.js';
 // TRA-534 — News-sentiment scorer (lexicon-v1) + per-symbol aggregate.
 export * from './news-sentiment.js';
 
+// TRA-602 — StockTwits social-sentiment aggregate.
+export * from './social-sentiment.js';
+
 export type Side = 'buy' | 'sell';
 export type OrderStatus = 'pending' | 'filled' | 'cancelled' | 'rejected';
 export type SignalType =
@@ -2185,6 +2188,46 @@ export interface SymbolSentimentHeadline {
   source: string;
   score: number;
   publishedAt: string; // ISO
+}
+
+/**
+ * TRA-602 — one normalized StockTwits message. Only the fields the social
+ * aggregate needs are kept (the raw stream carries far more). `sentiment` is the
+ * poster's self-reported tag (`entities.sentiment.basic`), `null` when untagged.
+ */
+export interface StockTwitsMessage {
+  id: number;
+  createdAt: string; // ISO
+  sentiment: 'Bullish' | 'Bearish' | null;
+}
+
+/**
+ * TRA-602 — per-symbol recency-weighted StockTwits social-sentiment aggregate.
+ * Surfaced in `GET /api/analysis/breadth/:symbol` as the `social` half alongside
+ * the news `sentiment` and `technical` reads, giving the scanners/engine a crowd
+ * read to complement the headline read.
+ */
+export interface SocialSentiment {
+  symbol: string;
+  asOf: string; // ISO
+  window: '24h';
+  /** Provider tag — `stocktwits` today; lets a second social feed fold in later. */
+  source: 'stocktwits';
+  /** Recency-weighted mean of per-message polarity (+1 bull / −1 bear), [-1,+1]. */
+  netScore: number;
+  bullishCount: number;
+  bearishCount: number;
+  /** bullishCount + bearishCount — messages carrying a directional tag. */
+  taggedCount: number;
+  /** Total messages seen, tagged or not — a raw social-buzz/volume proxy. */
+  messageCount: number;
+  /** Age of the newest tagged message, in minutes. */
+  freshnessMinutes: number;
+  /**
+   * Gated directional read on `netScore`: bullish ≥ +0.25, bearish ≤ -0.25.
+   * Forced `neutral` when `taggedCount < 5` or `freshnessMinutes > 720` (stale).
+   */
+  tilt: 'bullish' | 'bearish' | 'neutral';
 }
 
 /**
