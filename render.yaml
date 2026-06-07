@@ -83,6 +83,21 @@ services:
       # data pulls.
       - key: TWELVE_DATA_API_KEY
         sync: false
+      # AI Options Ideas — Anthropic (Claude) API key for the live
+      # `GET /api/options/ideas` feed (TRA-604 wiring, TRA-600 C5 UI). When
+      # UNSET (current state) the endpoint correctly degrades: HTTP 200 with
+      # `source:"non_live"`, empty `ideas`, and a note instructing to set
+      # ANTHROPIC_API_KEY — the panel falls back to a labelled preview and
+      # disables paper entry. This is the documented expected-non-bug
+      # degradation that passed QA in TRA-685; declaring the key here (dashboard
+      # `sync:false`) makes the blueprint launch-ready without committing the
+      # secret. Spend is pre-authorized at the $50/mo cap with the auto-degrade
+      # tripwire enforced in code per TRA-658 / TRA-604 (CFO guardrail). Set the
+      # value in the Render dashboard at the C6 live-launch (TRA-686) to flip the
+      # feed to `source:"live"`; leaving it unset keeps the feature in safe
+      # preview mode.
+      - key: ANTHROPIC_API_KEY
+        sync: false
       # Tradier API credentials (TRA-191) — required for the options-chain
       # relative-value scanner to fetch live chains. With these unset the
       # scanner reports `no_credentials` and the engine simply skips options
