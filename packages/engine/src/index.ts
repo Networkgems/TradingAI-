@@ -30,6 +30,8 @@ export { ScalpingStrategy } from './strategies/scalping-strategy.js';
 export type { ScalpingOptions } from './strategies/scalping-strategy.js';
 export { SwingStrategy } from './strategies/swing-strategy.js';
 export type { SwingOptions } from './strategies/swing-strategy.js';
+export { CryptoDcaStrategy } from './strategies/crypto-dca.js';
+export type { DcaOptions } from './strategies/crypto-dca.js';
 export { RiskManager } from './risk.js';
 export type { RiskManagerOptions } from './risk.js';
 export {

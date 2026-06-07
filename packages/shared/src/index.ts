@@ -28,6 +28,7 @@ export type SignalType =
   | 'ichimoku'
   | 'scalping'
   | 'swing_trade'
+  | 'dca'          // TRA-693: dollar-cost-averaging accumulation — long-only, trend-gated, cadence-paced
   | 'otm_mispricing'
   | 'relative_value' // TRA-191: options chain relative-value scanner (IV skew + monotonic + no-arb)
   | 'sma200_pullback' // TRA-451: pullback-to-200 bounce (continuation long), daily bars
@@ -2607,6 +2608,7 @@ export interface EodTradeEntry {
     | 'Ichimoku'
     | 'Scalping'
     | 'Swing'
+    | 'DCA'          // TRA-693 — dollar-cost-averaging accumulation
     | 'OTM'
     | 'RV'           // TRA-191 — relative-value scanner
     | 'Tradier'      // TRA-323 — imported from Tradier (never actually written to disk: imports don't trade through the EOD exporter)

@@ -120,6 +120,7 @@ export function signalLabel(type: string) {
     case 'ichimoku': return 'Ichimoku';
     case 'scalping': return 'Scalping';
     case 'swing_trade': return 'Swing';
+    case 'dca': return 'DCA';
     case 'relative_value': return 'Relative Value';
     case 'otm_mispricing': return 'OTM Mispricing';
     case 'tradier_import': return 'Tradier Import';

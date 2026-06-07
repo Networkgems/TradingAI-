@@ -46,6 +46,7 @@ function strategyLabel(t: SignalType): EodTradeEntry['strategy'] {
     case 'ichimoku': return 'Ichimoku';
     case 'scalping': return 'Scalping';
     case 'swing_trade': return 'Swing';
+    case 'dca': return 'DCA';                 // TRA-693 — DCA accumulation
     case 'otm_mispricing': return 'OTM';
     case 'relative_value': return 'RV';
     // TRA-323 — imported Tradier positions don't trade through the local

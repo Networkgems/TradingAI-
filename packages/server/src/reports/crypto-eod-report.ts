@@ -72,6 +72,7 @@ function strategyLabel(t: SignalType): StrategyLabel {
     case 'breakout_vol': return 'Breakout';
     case 'scalping': return 'Scalping';
     case 'swing_trade': return 'Swing';
+    case 'dca': return 'DCA';                 // TRA-693 — DCA accumulation
     case 'ichimoku': return 'Ichimoku';
     case 'orb_breakout': return 'ORB';
     case 'otm_mispricing': return 'OTM';
