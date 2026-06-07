@@ -88,6 +88,13 @@ export interface IdeaJournalEntry {
   spotAtEntry: number | null;
   /** IV-rank at surface time (0–100), when known. */
   ivRank: number | null;
+  /**
+   * TRA-678 (F2) — false iff this idea's structure was the thin-chain FALLBACK
+   * placeholder (legs not priced off real marks; `entryNetUsd = ±maxLoss` on a
+   * fabricated basis). The forward-test EXCLUDES fallback-priced entries from the
+   * gate metrics. Optional/absent on legacy entries → treated as priced (true).
+   */
+  priced?: boolean;
 }
 
 interface StoreFile {
@@ -203,6 +210,9 @@ function toEntry(
     breakevens: idea.breakevens,
     spotAtEntry: idea.underlyingPrice ?? null,
     ivRank: idea.ivRank ?? null,
+    // TRA-678 (F2) — capture whether the structure was really priced; absent
+    // on a non-live view defaults to priced (true).
+    priced: idea.priced ?? true,
   };
 }
 

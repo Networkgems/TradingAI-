@@ -48,6 +48,19 @@ export type IdeaStatus =
   /** No recorded chain after the surface date can value this idea. */
   | 'no_data';
 
+/**
+ * TRA-678 — why an outcome is excluded from the gate's aggregate metrics. An
+ * excluded idea is still valued and reported (for transparency) but never counts
+ * toward sample-size, hit-rate, expectancy, calibration, or breach totals.
+ */
+export type ExcludeReason =
+  /** F2 — entry was a thin-chain fallback placeholder (fabricated basis). */
+  | 'fallback_priced'
+  /** F4 — non-positive defined max-loss makes its R meaningless. */
+  | 'non_positive_max_loss'
+  /** F3 — settled on a chain too many trading days after expiry (drifted spot). */
+  | 'stale_settlement';
+
 export interface IdeaOutcome {
   key: string;
   ticker: string;
@@ -68,10 +81,26 @@ export interface IdeaOutcome {
   pnlUsd: number | null;
   /** Risk-normalized P/L (pnl / maxLoss) — the R-multiple. Null when unvalued. */
   pnlR: number | null;
+  /**
+   * TRA-678 (F1) — modeled round-trip transaction cost (USD/1-lot): commissions
+   * + half bid/ask spread crossed per leg, entry and exit. The mid-priced `pnl`
+   * above is PRE-cost; subtract this for the net figure the gate actually uses.
+   */
+  costsUsd: number;
+  /** F1 — cost-net P/L (USD/1-lot) = pnl − costsUsd. Null when unvalued. */
+  pnlNetUsd: number | null;
+  /** F1 — cost-net R-multiple (pnlNet ÷ maxLoss). Null when unvalued or no denom. */
+  pnlNetR: number | null;
   /** Win iff a RESOLVED idea's realized P/L > 0. Null while open/unvalued. */
   win: boolean | null;
   /** True when realized loss exceeded the stated defined-risk max (integrity flag). */
   maxLossBreached: boolean;
+  /** TRA-678 — true when this idea is excluded from the gate's aggregate metrics. */
+  excluded: boolean;
+  /** TRA-678 — why it was excluded (null when included). */
+  excludeReason: ExcludeReason | null;
+  /** F3 — trading days between expiry and the settlement chain (null unless resolved). */
+  settleLagDays: number | null;
 }
 
 // ── chain pricing ─────────────────────────────────────────────────────────────
@@ -130,12 +159,89 @@ function snapshotSpot(day: ChainDay, ticker: string): number | null {
 
 const r2 = (v: number): number => Math.round(v * 100) / 100;
 
+// ── transaction-cost model (F1) ─────────────────────────────────────────────
+//
+// Entry net and (open) marks price at MID; settlement is intrinsic. Real fills
+// cross the bid/ask per leg and pay commission, on BOTH the entry and the exit.
+// So mid-to-mid R is optimistically biased — a 4-leg condor crosses up to 8
+// half-spreads round-trip. We haircut a conservative, fully-disclosed cost so the
+// gate evaluates a *net* edge, not the paper-perfect one. Gross figures are kept
+// alongside so the bias is auditable and the model can be retuned in one place.
+
+export interface CostModel {
+  /** Commission per contract, per side (entry and exit are separate sides), USD. */
+  commissionPerContract: number;
+  /** Half bid/ask spread crossed per contract, per side, in premium points (× 100). */
+  halfSpreadPerContract: number;
+}
+
+/**
+ * Default round-trip cost model — deliberately conservative-but-modest retail
+ * assumptions for liquid US single-name/ETF options ($0.65/contract commission,
+ * a $0.02 half-spread per leg per side). One source of truth; mirrored in
+ * `docs/live-capital-gate.md`.
+ */
+export const DEFAULT_COST_MODEL: CostModel = {
+  commissionPerContract: 0.65,
+  halfSpreadPerContract: 0.02,
+};
+
+const SIDES = 2; // round trip: entry + exit
+
+/** Modeled round-trip transaction cost (USD per 1-lot) for a structure's legs. */
+export function structureCostUsd(legCount: number, model: CostModel = DEFAULT_COST_MODEL): number {
+  const commission = legCount * SIDES * model.commissionPerContract;
+  const spread = legCount * SIDES * model.halfSpreadPerContract * CONTRACT;
+  return r2(commission + spread);
+}
+
+/** F3 — max trading days a settlement chain may lag expiry before it's quarantined. */
+const MAX_SETTLE_LAG_TRADING_DAYS = 1;
+
+/**
+ * Weekday count strictly after `from` up to and including `to` (calendar-only, no
+ * exchange-holiday adjustment — a conservative over-count if a holiday falls in
+ * the window, which only quarantines MORE aggressively). Used to detect a
+ * settlement chain recorded well after expiry (drifted intrinsic spot).
+ */
+function tradingDaysBetween(from: string, to: string): number {
+  const a = new Date(`${from}T00:00:00Z`);
+  const b = new Date(`${to}T00:00:00Z`);
+  if (Number.isNaN(a.getTime()) || Number.isNaN(b.getTime()) || b <= a) return 0;
+  let count = 0;
+  const cur = new Date(a);
+  cur.setUTCDate(cur.getUTCDate() + 1);
+  while (cur <= b) {
+    const dow = cur.getUTCDay();
+    if (dow !== 0 && dow !== 6) count++;
+    cur.setUTCDate(cur.getUTCDate() + 1);
+  }
+  return count;
+}
+
 /**
  * Value one journaled idea against the recorded chain history. Pure given
  * `chainDays` (ascending) so it is fully unit-testable with synthetic chains.
  */
-export function valueIdea(entry: IdeaJournalEntry, chainDays: readonly ChainDay[], asOf: number): IdeaOutcome {
+export function valueIdea(
+  entry: IdeaJournalEntry,
+  chainDays: readonly ChainDay[],
+  asOf: number,
+  costModel: CostModel = DEFAULT_COST_MODEL,
+): IdeaOutcome {
   const asOfDate = etDateKey(asOf);
+  const costsUsd = structureCostUsd(entry.legs.length, costModel);
+  const hasDenom = entry.maxLossUsd > 0;
+
+  // Exclusion is decided from the captured entry up-front (F2/F4); a settlement
+  // lag (F3) can add an exclusion at resolve time. An excluded outcome is still
+  // valued and reported, but never counts toward the gate's aggregate metrics.
+  const entryExclude: ExcludeReason | null = !hasDenom
+    ? 'non_positive_max_loss' // F4 — no meaningful R denominator
+    : entry.priced === false
+      ? 'fallback_priced' // F2 — fabricated entry basis
+      : null;
+
   const base: IdeaOutcome = {
     key: entry.key,
     ticker: entry.ticker,
@@ -152,8 +258,14 @@ export function valueIdea(entry: IdeaJournalEntry, chainDays: readonly ChainDay[
     liquidationUsd: null,
     pnlUsd: null,
     pnlR: null,
+    costsUsd,
+    pnlNetUsd: null,
+    pnlNetR: null,
     win: null,
     maxLossBreached: false,
+    excluded: entryExclude != null,
+    excludeReason: entryExclude,
+    settleLagDays: null,
   };
 
   // Only chains AT/AFTER the surface date are admissible (no look-ahead, and an
@@ -166,31 +278,54 @@ export function valueIdea(entry: IdeaJournalEntry, chainDays: readonly ChainDay[
     day: ChainDay,
     liquidation: number,
     resolved: boolean,
+    reason: ExcludeReason | null,
+    settleLagDays: number | null,
   ): IdeaOutcome => {
     const pnl = r2(liquidation + entry.entryNetUsd);
-    const denom = entry.maxLossUsd > 0 ? entry.maxLossUsd : 1;
+    const pnlNet = r2(pnl - costsUsd);
+    // F4 — never substitute denom = 1 for a missing max-loss; leave R null (and
+    // the outcome is already excluded for `non_positive_max_loss`).
+    const pnlR = hasDenom ? r2(pnl / entry.maxLossUsd) : null;
+    const pnlNetR = hasDenom ? r2(pnlNet / entry.maxLossUsd) : null;
     return {
       ...base,
       status,
       valuedAt: day.date,
       liquidationUsd: r2(liquidation),
       pnlUsd: pnl,
-      pnlR: r2(pnl / denom),
+      pnlR,
+      pnlNetUsd: pnlNet,
+      pnlNetR,
       win: resolved ? pnl > 0 : null,
       // A held-to-expiry defined-risk loss should never exceed the stated max;
       // a breach (beyond a $1 rounding cushion) flags a modeling/data fault.
-      maxLossBreached: resolved && pnl < -(entry.maxLossUsd + 1),
+      maxLossBreached: resolved && hasDenom && pnl < -(entry.maxLossUsd + 1),
+      excluded: reason != null,
+      excludeReason: reason,
+      settleLagDays,
     };
   };
 
   const expired = asOfDate >= entry.expiration;
   if (expired) {
-    // Settle at the first recorded chain on/after expiration (intrinsic value).
+    // Settle at the first recorded chain on/after expiration — the expiration-day
+    // chain when present (intrinsic value). F3 — if the nearest settlement chain
+    // lags expiry by more than one trading day, its spot may have drifted, so
+    // quarantine the settlement (still reported, excluded from gate metrics).
     const settleDay = forward.find((d) => d.date >= entry.expiration);
     if (settleDay) {
       const spot = snapshotSpot(settleDay, entry.ticker);
       if (spot != null) {
-        return finish('resolved', settleDay, liquidationAtExpiry(entry.legs, spot), true);
+        const lag = tradingDaysBetween(entry.expiration, settleDay.date);
+        const staleReason = lag > MAX_SETTLE_LAG_TRADING_DAYS ? 'stale_settlement' : null;
+        return finish(
+          'resolved',
+          settleDay,
+          liquidationAtExpiry(entry.legs, spot),
+          true,
+          entryExclude ?? staleReason,
+          lag,
+        );
       }
     }
     // Past expiry but nothing to settle against yet.
@@ -205,7 +340,7 @@ export function valueIdea(entry: IdeaJournalEntry, chainDays: readonly ChainDay[
     const snap = day.bySymbol.get(entry.ticker.toUpperCase());
     if (!snap) continue;
     const liq = liquidationFromMarks(entry.legs, snap.rows);
-    if (liq != null) return finish('open', day, liq, false);
+    if (liq != null) return finish('open', day, liq, false, entryExclude, null);
   }
   return base;
 }
@@ -219,12 +354,13 @@ export async function forwardTestIdeas(
   entries: readonly IdeaJournalEntry[],
   dataDir: string = defaultChainsDir(),
   asOf: number = Date.now(),
+  costModel: CostModel = DEFAULT_COST_MODEL,
 ): Promise<IdeaOutcome[]> {
   const chainDays = await loadChainDays(dataDir);
   if (chainDays.length === 0) {
     log.info('forward-test: no recorded chains found', { dataDir });
   }
-  return entries.map((e) => valueIdea(e, chainDays, asOf));
+  return entries.map((e) => valueIdea(e, chainDays, asOf, costModel));
 }
 
 // ── weekly report ───────────────────────────────────────────────────────────
@@ -236,15 +372,21 @@ export interface WeeklyStats {
   open: number;
   awaitingData: number;
   noData: number;
+  /** TRA-678 — resolved/open ideas excluded from these metrics (fallback/stale/no-denom). */
+  excluded: number;
   wins: number;
   losses: number;
   scratches: number;
   /** wins / resolved — null when nothing resolved this week. */
   hitRate: number | null;
-  /** Mean realized P/L (USD) over resolved ideas — null when none resolved. */
+  /** Mean PRE-cost realized P/L (USD) over resolved ideas — null when none resolved. */
   expectancyUsd: number | null;
-  /** Mean realized R-multiple (P/L ÷ maxLoss) over resolved — the risk-normalized edge. */
+  /** Mean PRE-cost realized R-multiple (P/L ÷ maxLoss) over resolved. */
   expectancyR: number | null;
+  /** F1 — mean COST-NET realized P/L (USD) over resolved ideas. */
+  expectancyNetUsd: number | null;
+  /** F1 — mean COST-NET realized R-multiple over resolved — the gated edge. */
+  expectancyNetR: number | null;
   avgWinUsd: number | null;
   avgLossUsd: number | null;
   /** Σ win P/L ÷ |Σ loss P/L| — null when no losses (or nothing resolved). */
@@ -255,8 +397,10 @@ export interface WeeklyStats {
   popCalibrationGap: number | null;
   /** Count of resolved ideas whose realized loss breached the stated max-loss. */
   maxLossBreaches: number;
-  /** Convenience: expectancyR != null && > 0. */
+  /** Convenience: expectancyR (pre-cost) != null && > 0. */
   positiveExpectancy: boolean;
+  /** F1 — convenience: expectancyNetR != null && > 0 (the gated condition). */
+  positiveExpectancyNet: boolean;
 }
 
 export interface ForwardTestReport {
@@ -270,20 +414,30 @@ export interface ForwardTestReport {
     open: number;
     awaitingData: number;
     noData: number;
+    /** TRA-678 — outcomes excluded from every aggregate metric below. */
+    excluded: number;
     wins: number;
     losses: number;
     scratches: number;
     hitRate: number | null;
+    /** Mean PRE-cost P/L (USD) over included resolved ideas. */
     expectancyUsd: number | null;
+    /** Mean PRE-cost R-multiple over included resolved ideas. */
     expectancyR: number | null;
+    /** F1 — mean COST-NET P/L (USD) over included resolved ideas. */
+    expectancyNetUsd: number | null;
+    /** F1 — mean COST-NET R-multiple — the metric the gate evaluates. */
+    expectancyNetR: number | null;
     profitFactor: number | null;
     avgPredictedPop: number | null;
     popCalibrationGap: number | null;
     maxLossBreaches: number;
-    /** Distinct ISO weeks that have ≥1 resolved idea. */
+    /** Distinct ISO weeks that have ≥1 (included) resolved idea. */
     weeksWithResolved: number;
-    /** Of those, how many had positive R-expectancy. */
+    /** Of those, how many had positive PRE-cost R-expectancy. */
     weeksPositiveExpectancy: number;
+    /** F1 — of those, how many had positive COST-NET R-expectancy (the gated count). */
+    weeksPositiveExpectancyNet: number;
   };
   /** Per-week breakdown, ascending by ISO week. */
   weeks: WeeklyStats[];
@@ -296,7 +450,9 @@ function mean(xs: number[]): number | null {
 }
 
 function statsFor(week: string, outcomes: readonly IdeaOutcome[]): WeeklyStats {
-  const resolved = outcomes.filter((o) => o.status === 'resolved');
+  // TRA-678 — only INCLUDED (non-excluded) resolved ideas feed the metrics; a
+  // fabricated/stale/no-denom entry is reported separately and never aggregated.
+  const resolved = outcomes.filter((o) => o.status === 'resolved' && !o.excluded);
   const wins = resolved.filter((o) => o.win === true);
   const losses = resolved.filter((o) => o.pnlUsd != null && o.pnlUsd < 0);
   const scratches = resolved.filter((o) => o.pnlUsd != null && o.pnlUsd === 0);
@@ -304,6 +460,7 @@ function statsFor(week: string, outcomes: readonly IdeaOutcome[]): WeeklyStats {
   const lossPnl = losses.reduce((a, o) => a + (o.pnlUsd ?? 0), 0);
   const hitRate = resolved.length ? wins.length / resolved.length : null;
   const expectancyR = mean(resolved.map((o) => o.pnlR ?? 0));
+  const expectancyNetR = mean(resolved.map((o) => o.pnlNetR ?? 0));
   const avgPredictedPop = mean(resolved.map((o) => o.pop));
   return {
     week,
@@ -312,12 +469,15 @@ function statsFor(week: string, outcomes: readonly IdeaOutcome[]): WeeklyStats {
     open: outcomes.filter((o) => o.status === 'open').length,
     awaitingData: outcomes.filter((o) => o.status === 'awaiting_data').length,
     noData: outcomes.filter((o) => o.status === 'no_data').length,
+    excluded: outcomes.filter((o) => o.excluded).length,
     wins: wins.length,
     losses: losses.length,
     scratches: scratches.length,
     hitRate: hitRate == null ? null : r2(hitRate),
     expectancyUsd: mean(resolved.map((o) => o.pnlUsd ?? 0)),
     expectancyR: expectancyR == null ? null : r2(expectancyR),
+    expectancyNetUsd: mean(resolved.map((o) => o.pnlNetUsd ?? 0)),
+    expectancyNetR: expectancyNetR == null ? null : r2(expectancyNetR),
     avgWinUsd: wins.length ? r2(winPnl / wins.length) : null,
     avgLossUsd: losses.length ? r2(lossPnl / losses.length) : null,
     profitFactor: losses.length && lossPnl !== 0 ? r2(winPnl / Math.abs(lossPnl)) : null,
@@ -325,6 +485,7 @@ function statsFor(week: string, outcomes: readonly IdeaOutcome[]): WeeklyStats {
     popCalibrationGap: hitRate != null && avgPredictedPop != null ? r2(hitRate - avgPredictedPop) : null,
     maxLossBreaches: resolved.filter((o) => o.maxLossBreached).length,
     positiveExpectancy: expectancyR != null && expectancyR > 0,
+    positiveExpectancyNet: expectancyNetR != null && expectancyNetR > 0,
   };
 }
 
@@ -333,7 +494,14 @@ const METHODOLOGY =
   'then re-priced ONLY against option chains the recorder wrote on/after the surface date (no look-ahead). ' +
   'Resolved = held to expiry and settled at intrinsic value vs the recorded settlement-day spot; open = ' +
   'marked-to-market at the latest chain that prices every leg. P/L = structure liquidation value + entry net. ' +
+  'COSTS (TRA-678 F1): entry/exit marks are MIDs, so the raw R is PRE-cost and optimistically biased. A ' +
+  'conservative round-trip transaction-cost haircut (commission + half bid/ask spread per leg, entry and exit) ' +
+  'is modeled; expectancy is reported BOTH pre-cost and cost-NET, and the live-capital gate evaluates the ' +
+  'NET R-expectancy. A future live-wiring proposal must still re-validate costs against realized fills. ' +
   'Hit-rate = wins ÷ resolved; expectancy is reported in USD/1-lot and as an R-multiple (P/L ÷ defined max-loss). ' +
+  'DATA HYGIENE (TRA-678 F2/F3/F4): ideas whose legs could not be priced off real marks (thin-chain fallback ' +
+  'placeholders), whose defined max-loss is non-positive, or whose settlement chain lagged expiry by more than ' +
+  'one trading day (drifted spot) are reported but EXCLUDED from every gate metric. ' +
   'POP calibration compares the model’s mean stated probability-of-profit to the realized hit-rate. No live ' +
   'capital is wired by this report; it is the evidence input to the documented live-capital gate.';
 
@@ -351,7 +519,8 @@ export function buildForwardTestReport(
   }
   const weeks = [...byWeek.keys()].sort().map((w) => statsFor(w, byWeek.get(w)!));
 
-  const resolved = outcomes.filter((o) => o.status === 'resolved');
+  // TRA-678 — aggregate only INCLUDED (non-excluded) resolved ideas.
+  const resolved = outcomes.filter((o) => o.status === 'resolved' && !o.excluded);
   const wins = resolved.filter((o) => o.win === true);
   const losses = resolved.filter((o) => o.pnlUsd != null && o.pnlUsd < 0);
   const scratches = resolved.filter((o) => o.pnlUsd != null && o.pnlUsd === 0);
@@ -359,6 +528,7 @@ export function buildForwardTestReport(
   const lossPnl = losses.reduce((a, o) => a + (o.pnlUsd ?? 0), 0);
   const hitRate = resolved.length ? wins.length / resolved.length : null;
   const expectancyR = mean(resolved.map((o) => o.pnlR ?? 0));
+  const expectancyNetR = mean(resolved.map((o) => o.pnlNetR ?? 0));
   const avgPredictedPop = mean(resolved.map((o) => o.pop));
   const weeksWithResolved = weeks.filter((w) => w.resolved > 0);
 
@@ -372,12 +542,15 @@ export function buildForwardTestReport(
       open: outcomes.filter((o) => o.status === 'open').length,
       awaitingData: outcomes.filter((o) => o.status === 'awaiting_data').length,
       noData: outcomes.filter((o) => o.status === 'no_data').length,
+      excluded: outcomes.filter((o) => o.excluded).length,
       wins: wins.length,
       losses: losses.length,
       scratches: scratches.length,
       hitRate: hitRate == null ? null : r2(hitRate),
       expectancyUsd: mean(resolved.map((o) => o.pnlUsd ?? 0)),
       expectancyR: expectancyR == null ? null : r2(expectancyR),
+      expectancyNetUsd: mean(resolved.map((o) => o.pnlNetUsd ?? 0)),
+      expectancyNetR: expectancyNetR == null ? null : r2(expectancyNetR),
       profitFactor: losses.length && lossPnl !== 0 ? r2(winPnl / Math.abs(lossPnl)) : null,
       avgPredictedPop: avgPredictedPop == null ? null : r2(avgPredictedPop),
       popCalibrationGap:
@@ -385,6 +558,7 @@ export function buildForwardTestReport(
       maxLossBreaches: resolved.filter((o) => o.maxLossBreached).length,
       weeksWithResolved: weeksWithResolved.length,
       weeksPositiveExpectancy: weeksWithResolved.filter((w) => w.positiveExpectancy).length,
+      weeksPositiveExpectancyNet: weeksWithResolved.filter((w) => w.positiveExpectancyNet).length,
     },
     weeks,
     methodology: METHODOLOGY,

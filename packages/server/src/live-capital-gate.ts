@@ -19,7 +19,12 @@ export interface LiveCapitalGateCriteria {
   minWeeksWithResolved: number;
   /** Minimum total resolved ideas — a sample-size floor against small-n noise. */
   minResolvedIdeas: number;
-  /** Required overall R-expectancy (P/L ÷ max-loss). Must be strictly positive. */
+  /**
+   * Required overall COST-NET R-expectancy (net P/L ÷ max-loss). Must be strictly
+   * positive. TRA-678 (F1): the gate evaluates the cost-net figure, not the
+   * optimistic pre-cost mid-to-mid R, so a marginal paper edge that costs eat
+   * cannot clear the bar.
+   */
   minExpectancyR: number;
   /** Minimum fraction of resolved-bearing weeks that show positive R-expectancy. */
   minPositiveWeekFraction: number;
@@ -78,7 +83,9 @@ export function evaluateLiveCapitalGate(
   criteria: LiveCapitalGateCriteria = LIVE_CAPITAL_GATE,
 ): LiveCapitalGateResult {
   const t = report.totals;
-  const positiveWeekFraction = t.weeksWithResolved > 0 ? t.weeksPositiveExpectancy / t.weeksWithResolved : null;
+  // TRA-678 (F1) — durability is measured on the COST-NET weekly edge.
+  const positiveWeekFraction =
+    t.weeksWithResolved > 0 ? t.weeksPositiveExpectancyNet / t.weeksWithResolved : null;
   // Calibration only meaningful once there's a hit-rate to compare against.
   const calGap = t.popCalibrationGap;
 
@@ -99,14 +106,14 @@ export function evaluateLiveCapitalGate(
     },
     {
       name: 'positive_expectancy',
-      description: 'Overall risk-normalized expectancy (R = P/L ÷ max-loss)',
+      description: 'Overall cost-NET risk-normalized expectancy (R = net P/L ÷ max-loss)',
       required: `> ${criteria.minExpectancyR}`,
-      actual: t.expectancyR,
-      pass: t.expectancyR != null && t.expectancyR > criteria.minExpectancyR,
+      actual: t.expectancyNetR,
+      pass: t.expectancyNetR != null && t.expectancyNetR > criteria.minExpectancyR,
     },
     {
       name: 'expectancy_durability',
-      description: 'Fraction of resolved-bearing weeks with positive R-expectancy',
+      description: 'Fraction of resolved-bearing weeks with positive cost-NET R-expectancy',
       required: `≥ ${pct(criteria.minPositiveWeekFraction)}`,
       actual: positiveWeekFraction == null ? null : Math.round(positiveWeekFraction * 100) / 100,
       pass: positiveWeekFraction != null && positiveWeekFraction >= criteria.minPositiveWeekFraction,

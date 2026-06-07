@@ -3,7 +3,13 @@ import type { OptionChainRow } from '@trading-app/engine';
 import type { ChainDay } from '@trading-app/backtest';
 import type { IdeaJournalEntry } from './options-idea-journal.js';
 import type { IdeaLeg } from './options-ideas-feed.js';
-import { valueIdea, buildForwardTestReport, type IdeaOutcome } from './options-forward-test.js';
+import {
+  valueIdea,
+  buildForwardTestReport,
+  structureCostUsd,
+  DEFAULT_COST_MODEL,
+  type IdeaOutcome,
+} from './options-forward-test.js';
 import { evaluateLiveCapitalGate, LIVE_CAPITAL_GATE } from './live-capital-gate.js';
 
 // ── helpers ─────────────────────────────────────────────────────────────────
@@ -163,6 +169,117 @@ describe('valueIdea — defined-risk forward valuation', () => {
   });
 });
 
+// ── TRA-678 hardening: costs (F1) + data hygiene (F2/F3/F4) ──────────────────
+
+describe('TRA-678 F1 — transaction-cost haircut', () => {
+  it('models a conservative round-trip cost that scales with leg count', () => {
+    // 1-lot, default model: legs * 2 sides * ($0.65 commission + $0.02*100 spread).
+    expect(structureCostUsd(1)).toBe(5.3); // 1*2*0.65 + 1*2*0.02*100
+    expect(structureCostUsd(2)).toBe(10.6);
+    expect(structureCostUsd(4)).toBe(21.2); // a 4-leg condor crosses 8 half-spreads
+    expect(DEFAULT_COST_MODEL.commissionPerContract).toBeGreaterThan(0);
+  });
+
+  it('reports gross pnl unchanged but a cost-NET pnl/R below it', () => {
+    // A marginally-positive PRE-cost idea: +$5 gross on a $300 max-loss.
+    const e = entry({ legs: [leg('buy', 'call', 100, '2026-02-20')], entryNetUsd: -300 });
+    const o = valueIdea(e, [day('2026-02-20', 103.05, [])], ET_NOON('2026-02-23'));
+    expect(o.status).toBe('resolved');
+    expect(o.pnlUsd).toBe(5); // gross identity preserved (305 intrinsic − 300 debit)
+    expect(o.pnlR! > 0).toBe(true); // gross R still positive (0.02 after rounding)
+    expect(o.costsUsd).toBe(5.3); // 1-leg round trip
+    expect(o.pnlNetUsd).toBe(-0.3); // costs flip a +$5 gross into a net loss
+    expect(o.pnlNetUsd! < o.pnlUsd!).toBe(true);
+    expect(o.win).toBe(true); // hit-rate is on gross pnl (unchanged)
+    expect(o.excluded).toBe(false);
+  });
+
+  it('gate evaluates NET R: a positive-gross / negative-net record HOLDs', () => {
+    const outcomes: IdeaOutcome[] = [];
+    for (let w = 0; w < 8; w++) {
+      for (let i = 0; i < 5; i++) {
+        outcomes.push({
+          key: `w${w}-${i}`, ticker: 'AAA', strategy: 'long_call',
+          surfacedDate: '2026-01-05', surfacedWeek: `2026-W${String(w + 2).padStart(2, '0')}`,
+          expiration: '2026-02-20', pop: 0.5, maxLossUsd: 300, maxProfitUsd: 600,
+          entryNetUsd: -300, status: 'resolved', valuedAt: '2026-02-20', liquidationUsd: 305,
+          pnlUsd: 5, pnlR: 0.02, costsUsd: 11, pnlNetUsd: -6, pnlNetR: -0.02,
+          win: true, maxLossBreached: false, excluded: false, excludeReason: null, settleLagDays: 0,
+        });
+      }
+    }
+    const report = buildForwardTestReport(outcomes, { asOf: ET_NOON('2026-03-01') });
+    expect(report.totals.expectancyR! > 0).toBe(true); // pre-cost edge looks positive…
+    expect(report.totals.expectancyNetR! < 0).toBe(true); // …but is negative net of costs
+    const gate = evaluateLiveCapitalGate(report);
+    expect(gate.passed).toBe(false);
+    expect(gate.criteria.find((c) => c.name === 'positive_expectancy')?.pass).toBe(false);
+  });
+});
+
+describe('TRA-678 F2 — fallback-priced ideas excluded from metrics', () => {
+  it('marks a fallback-priced entry excluded and keeps it out of the gate denominators', () => {
+    const fb = entry({
+      key: 'fb', legs: [leg('buy', 'call', 100, '2026-02-20')], entryNetUsd: -300, priced: false,
+    });
+    const ok = entry({
+      key: 'ok', legs: [leg('buy', 'call', 100, '2026-02-20')], entryNetUsd: -300, priced: true,
+    });
+    const outcomes = [
+      valueIdea(fb, [day('2026-02-20', 110, [])], ET_NOON('2026-02-23')),
+      valueIdea(ok, [day('2026-02-20', 110, [])], ET_NOON('2026-02-23')),
+    ];
+    expect(outcomes[0]!.excluded).toBe(true);
+    expect(outcomes[0]!.excludeReason).toBe('fallback_priced');
+    const report = buildForwardTestReport(outcomes, { asOf: ET_NOON('2026-02-23') });
+    expect(report.totals.resolved).toBe(1); // only the real-priced idea counts
+    expect(report.totals.excluded).toBe(1);
+  });
+});
+
+describe('TRA-678 F3 — stale settlement quarantine', () => {
+  it('settles on the next trading day without quarantine (lag ≤ 1)', () => {
+    // Expiration Mon 2026-02-02; settle Tue 2026-02-03 (1 trading day).
+    const e = entry({
+      legs: [leg('buy', 'call', 100, '2026-02-02')], entryNetUsd: -300, expiration: '2026-02-02',
+    });
+    const o = valueIdea(e, [day('2026-02-03', 110, [])], ET_NOON('2026-02-06'));
+    expect(o.status).toBe('resolved');
+    expect(o.settleLagDays).toBe(1);
+    expect(o.excluded).toBe(false);
+  });
+
+  it('quarantines a settlement chain that lags expiry by > 1 trading day', () => {
+    // Expiration Mon 2026-02-02; nearest chain Thu 2026-02-05 (3 trading days).
+    const e = entry({
+      legs: [leg('buy', 'call', 100, '2026-02-02')], entryNetUsd: -300, expiration: '2026-02-02',
+    });
+    const o = valueIdea(e, [day('2026-02-05', 110, [])], ET_NOON('2026-02-09'));
+    expect(o.status).toBe('resolved'); // still valued for transparency
+    expect(o.settleLagDays).toBe(3);
+    expect(o.excluded).toBe(true);
+    expect(o.excludeReason).toBe('stale_settlement');
+    const report = buildForwardTestReport([o], { asOf: ET_NOON('2026-02-09') });
+    expect(report.totals.resolved).toBe(0); // excluded from the gate sample
+    expect(report.totals.excluded).toBe(1);
+  });
+});
+
+describe('TRA-678 F4 — guard the R denominator', () => {
+  it('does not substitute denom=1: a non-positive max-loss yields null R and is excluded', () => {
+    const e = entry({
+      legs: [leg('buy', 'call', 100, '2026-02-20')], entryNetUsd: -300, maxLossUsd: 0,
+    });
+    const o = valueIdea(e, [day('2026-02-20', 110, [])], ET_NOON('2026-02-23'));
+    expect(o.status).toBe('resolved');
+    expect(o.pnlUsd).toBe(700); // dollars still computed
+    expect(o.pnlR).toBeNull(); // NOT 700 (the old denom=1 distortion)
+    expect(o.pnlNetR).toBeNull();
+    expect(o.excluded).toBe(true);
+    expect(o.excludeReason).toBe('non_positive_max_loss');
+  });
+});
+
 // ── report ────────────────────────────────────────────────────────────────
 
 describe('buildForwardTestReport', () => {
@@ -233,7 +350,13 @@ describe('evaluateLiveCapitalGate', () => {
           liquidationUsd: 600,
           pnlUsd: 300,
           pnlR: 1.0,
+          costsUsd: 6,
+          pnlNetUsd: 294,
+          pnlNetR: 0.98,
           win: true,
+          excluded: false,
+          excludeReason: null,
+          settleLagDays: 0,
           maxLossBreached: false,
         });
       }
@@ -266,7 +389,13 @@ describe('evaluateLiveCapitalGate', () => {
           liquidationUsd: 600,
           pnlUsd: 300,
           pnlR: 1.0,
+          costsUsd: 6,
+          pnlNetUsd: 294,
+          pnlNetR: 0.98,
           win: true,
+          excluded: false,
+          excludeReason: null,
+          settleLagDays: 0,
           maxLossBreached: w === 0 && i === 0, // a single breach
         });
       }

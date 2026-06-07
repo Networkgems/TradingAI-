@@ -53,6 +53,13 @@ export interface OptionsIdeaView {
   dte: number;
   events: IdeaEvent[];
   legs: IdeaLeg[];
+  /**
+   * TRA-678 (F2) — false when the payoff is a thin-chain fallback placeholder
+   * (legs could not be priced off real marks). The forward-test journal carries
+   * this so fallback-priced ideas can be excluded from the gate metrics. Optional
+   * for back-compat with non-live/preview views that don't model a structure.
+   */
+  priced?: boolean;
 }
 
 export interface OptionsIdeasFeed {
@@ -207,6 +214,15 @@ export interface ModeledStructure {
   maxProfitUsd: number;
   /** + = net credit received, − = net debit paid (USD per 1-lot). */
   netUsd: number;
+  /**
+   * TRA-678 (F2) — true iff every leg was priced off a real chain mark. False
+   * when the thin-chain fallback fired: the payoff is a placeholder
+   * (`netUsd = ±maxLoss`, `maxProfit = maxLoss`) on a *fabricated* basis, not a
+   * real mid-fill. The journal carries this flag so the forward-test can EXCLUDE
+   * fallback-priced ideas from the gate metrics (a fabricated entry basis would
+   * be scored against real later marks otherwise).
+   */
+  priced: boolean;
 }
 
 const CONTRACT = 100;
@@ -248,6 +264,7 @@ export function modelStructure(
       maxLossUsd: maxLoss,
       maxProfitUsd: maxLoss, // 1:1 placeholder when we can't price the legs
       netUsd: isCredit ? maxLoss : -maxLoss,
+      priced: false, // TRA-678 (F2) — fabricated basis; excluded from forward-test
     };
   };
 
@@ -272,6 +289,7 @@ export function modelStructure(
         maxLossUsd: r2(debit * CONTRACT),
         maxProfitUsd: r2(debit * CONTRACT * 2), // sketch cap (unbounded upside)
         netUsd: r2(-debit * CONTRACT),
+        priced: true,
       };
     }
     case 'bull_call_spread':
@@ -293,6 +311,7 @@ export function modelStructure(
         maxLossUsd: r2(debit * CONTRACT),
         maxProfitUsd: r2(Math.max(0, width - debit) * CONTRACT),
         netUsd: r2(-debit * CONTRACT),
+        priced: true,
       };
     }
     case 'bull_put_spread':
@@ -314,6 +333,7 @@ export function modelStructure(
         maxLossUsd: r2(Math.max(0, width - credit) * CONTRACT),
         maxProfitUsd: r2(credit * CONTRACT),
         netUsd: r2(credit * CONTRACT),
+        priced: true,
       };
     }
     case 'iron_condor':
@@ -349,6 +369,7 @@ export function modelStructure(
         maxLossUsd: r2(Math.max(0, width - credit) * CONTRACT),
         maxProfitUsd: r2(credit * CONTRACT),
         netUsd: r2(credit * CONTRACT),
+        priced: true,
       };
     }
     case 'call_calendar':
@@ -439,6 +460,7 @@ export function buildOptionsIdeasFeed(args: BuildFeedArgs): BuiltFeed {
       dte: idea.dteDays,
       events: buildEventsForSymbol(sym),
       legs: structure.legs,
+      priced: structure.priced,
     });
 
     intents.set(id, {

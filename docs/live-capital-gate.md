@@ -55,6 +55,52 @@ The pipeline has three layers, all paper / point-in-time — no money moves:
    POP), and max-loss breach count. Served at
    `GET /api/options/forward-test/report`.
 
+### Transaction costs (TRA-678 F1) — reported pre-cost **and** cost-net
+
+Entry net and open marks are **mids**; settlement is intrinsic. Real fills cross
+the bid/ask **per leg** and pay commission, on **both** entry and exit — a 4-leg
+condor crosses up to **8 half-spreads** round-trip. So the raw mid-to-mid
+R-multiple is **optimistically biased**, and a marginally-positive paper R can be
+negative net of costs.
+
+The forward-test therefore models a conservative, fully-disclosed round-trip cost
+haircut and reports expectancy **both pre-cost and cost-net**:
+
+- **Model** (`DEFAULT_COST_MODEL` in `options-forward-test.ts`, the single source
+  of truth): `$0.65`/contract commission + a `$0.02` half-spread per leg, **per
+  side** (entry and exit). Cost scales with leg count: `legs × 2 sides ×
+  (commission + halfSpread × 100)` USD per 1-lot.
+- `costsUsd`, `pnlNetUsd`, `pnlNetR` are added to every outcome; `expectancyNetR`
+  / `expectancyNetUsd` and `weeksPositiveExpectancyNet` to the report totals. The
+  gross figures are retained alongside so the bias is auditable.
+- **The gate evaluates the cost-NET R-expectancy** (criteria 3 & 4 below), not the
+  pre-cost number. This is a built-in costs buffer: a paper edge that costs eat
+  cannot clear the bar.
+
+This is a *modeled* haircut, not measured fills. A future live-wiring proposal
+must still re-validate the cost model against realized executions.
+
+### Data hygiene exclusions (TRA-678 F2/F3/F4)
+
+Three classes of idea are **valued and reported for transparency but EXCLUDED
+from every gate metric** (sample-size, hit-rate, expectancy, calibration,
+breaches). Each carries an `excludeReason`; the report totals expose an
+`excluded` count:
+
+- **`fallback_priced` (F2)** — the structure modeler could not price the legs off
+  real chain marks (thin chain) and emitted a placeholder
+  (`netUsd = ±maxLoss`, `maxProfit = maxLoss`). The entry basis is fabricated, so
+  scoring it against real later marks is meaningless. The journal tags this at
+  capture time (`priced: false`). (Calendars, modeled as a single near leg, are
+  always fallback-priced and thus always excluded.)
+- **`stale_settlement` (F3)** — the nearest settlement chain lagged expiry by more
+  than **one trading day**, so the intrinsic-settlement spot may have drifted. The
+  expiration-day chain is preferred when present.
+- **`non_positive_max_loss` (F4)** — a zero/missing defined max-loss has no
+  meaningful R denominator. We do **not** substitute `denom = 1` (which would make
+  that idea's R equal raw dollars and distort `expectancyR`); its R is left null
+  and it is excluded.
+
 ## The gate criteria
 
 Live-capital wiring may be **proposed** only when **all** of the following hold
@@ -64,8 +110,8 @@ Live-capital wiring may be **proposed** only when **all** of the following hold
 |---|-----------|-----------|-----|
 | 1 | **Weeks of evidence** — distinct ISO weeks with ≥1 settled idea | **≥ 8** | ~2 months of weekly forward data; one lucky week is not a track record. |
 | 2 | **Sample size** — total resolved (settled) ideas | **≥ 30** | A small-n floor so hit-rate / expectancy are not noise. |
-| 3 | **Positive expectancy** — overall R-expectancy (P/L ÷ max-loss) | **> 0** | The edge must be positive *after* normalizing for risk taken. |
-| 4 | **Expectancy durability** — fraction of resolved-bearing weeks with positive R-expectancy | **≥ 60%** | The edge must persist across weeks, not come from one outlier. |
+| 3 | **Positive expectancy** — overall **cost-net** R-expectancy (net P/L ÷ max-loss) | **> 0** | The edge must be positive *after* normalizing for risk taken **and net of modeled transaction costs** (F1). |
+| 4 | **Expectancy durability** — fraction of resolved-bearing weeks with positive **cost-net** R-expectancy | **≥ 60%** | The edge must persist across weeks (net of costs), not come from one outlier. |
 | 5 | **POP calibration** — \|realized hit-rate − mean stated POP\| | **≤ 10 pts** | The model's stated probabilities must be honest, not optimistic. |
 | 6 | **Defined-risk integrity** — realized losses that breached the stated max-loss | **= 0** | Defined-risk must actually be defined; any breach is disqualifying. |
 
@@ -77,5 +123,7 @@ for acceptance verification at `GET /api/health/live-capital-gate`.
 A pass does **not** ship live trading. It unlocks a single next step: **Lead Dev
 files a follow-up issue proposing live wiring**, attaching the forward-test
 report as evidence, for board / CTO decision under TRA-532 and human sign-off.
-Until then the product ships as event-aware, risk-defined **idea generation +
-paper entry**, exactly as today.
+That proposal step **must re-validate the F1 cost model against realized fills**
+(the gate's costs are modeled, not measured) and confirm the data-hygiene
+exclusion counts are immaterial to the track record. Until then the product ships
+as event-aware, risk-defined **idea generation + paper entry**, exactly as today.

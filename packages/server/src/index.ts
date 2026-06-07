@@ -1471,8 +1471,14 @@ app.get('/api/health/live-capital-gate', async (_req, res) => {
         surfaced: report.totals.surfaced,
         resolved: report.totals.resolved,
         open: report.totals.open,
+        // TRA-678 — ideas dropped from the gate metrics (fallback/stale/no-denom).
+        excluded: report.totals.excluded,
         weeksWithResolved: report.totals.weeksWithResolved,
         weeksPositiveExpectancy: report.totals.weeksPositiveExpectancy,
+        // TRA-678 (F1) — the cost-NET figures the gate actually evaluates.
+        weeksPositiveExpectancyNet: report.totals.weeksPositiveExpectancyNet,
+        expectancyR: report.totals.expectancyR,
+        expectancyNetR: report.totals.expectancyNetR,
       },
     });
   } catch (err) {
