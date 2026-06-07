@@ -2035,25 +2035,40 @@ tr:hover td { background: var(--bg-hover); }
   .back-btn { min-height: 36px; }
   .last-tick { display: none; }
 
-  /* Header-right: single scrollable row on mobile */
+  /* TRA-702 — On phone widths the header-right used to be a single
+     horizontally-scrollable row with the scrollbar hidden, so the Profile
+     menu and Stop Trading control were clipped off the right edge with no
+     scroll affordance — users could not reach Profile → Settings/Sign Out
+     or Stop Trading. Instead of relying on hidden scroll, wrap the strip
+     and pin the critical action controls (Stop/Start Trading, theme
+     toggle, Profile) to their own always-visible full-width row, letting
+     the KPI stats wrap below them. Nothing hides behind a hidden scroll. */
   .header-right {
     width: 100%;
-    overflow-x: auto;
-    -webkit-overflow-scrolling: touch;
-    scrollbar-width: none;
-    padding-bottom: 2px;
+    flex-wrap: wrap;
+    row-gap: 0.5rem;
+    column-gap: 0.75rem;
   }
-  .header-right::-webkit-scrollbar { display: none; }
 
-  /* Prevent any header-right item from shrinking or disappearing */
-  .stat-group,
-  .status-group,
-  .action-group,
-  .stat-divider,
-  .header-right .logout-btn,
-  .header-right .profile-wrap {
-    flex-shrink: 0;
+  /* Action controls always visible, on their own row above the KPI stats.
+     order:-1 lifts them above the stat/status groups that precede them in
+     the DOM; full width + flex-end keeps them anchored top-right. */
+  .action-group {
+    order: -1;
+    width: 100%;
+    justify-content: flex-end;
+    gap: 0.6rem;
   }
+
+  /* KPI / status clusters wrap onto as many rows as needed instead of
+     scrolling off-screen; let individual stats wrap too so a wide group
+     never forces horizontal page overflow on narrow phones. */
+  .stat-group {
+    flex-wrap: wrap;
+    gap: 0.5rem 1rem;
+    padding: 0;
+  }
+  .status-group { flex-shrink: 0; }
 
   .stat-divider { display: none; }
 
