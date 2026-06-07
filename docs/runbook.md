@@ -100,6 +100,29 @@ scaling and alert response.
   provide it.)
 - **Health check:** `GET /api/health` returns `{ ok: true }`. Poll it after
   every restart/deploy before considering the process healthy.
+- **Autostart on reboot (TRA-605 / TRA-493 Part A).** PM2 does **not** auto-start
+  on Windows by default — after a host reboot the daemon stays dead and nothing
+  restores the saved process list, silently taking `trading-server` (and the
+  News-tab POST path) down until a human re-runs the bootstrap (TRA-491). A
+  scheduled task **`PM2 Resurrect`** — registered by
+  [`ops/install-pm2-autostart.ps1`](../ops/install-pm2-autostart.ps1), running
+  [`ops/pm2-resurrect-boot.ps1`](../ops/pm2-resurrect-boot.ps1) — now runs
+  **`pm2 resurrect` at machine start as `LOCAL_SYSTEM`**, so the daemon +
+  `trading-server` come back up unattended. **Keep the resurrect file current:**
+  run **`npx pm2 save` whenever you change the running process set** (after any
+  `pm2 start`/`delete`), or a reboot restores a stale list.
+  - ⚠️ **Daemon ownership after a reboot.** Because the task runs as
+    `LOCAL_SYSTEM`, after a reboot the PM2 daemon is owned by `SYSTEM`, so a
+    **non-elevated** `npx pm2 …` fails with `connect EPERM \\.\pipe\rpc.sock`
+    (HTTP `/api/health` is unaffected). Manage PM2 from an **elevated** shell
+    after a reboot — or `pm2 kill` the SYSTEM daemon and re-`resurrect` from a
+    normal shell to return to user-context ownership. This is inherent to any
+    no-password Windows autostart (incl. `pm2-installer`'s `LOCAL_SYSTEM` service).
+  - **Why a scheduled task, not `pm2-installer`:** `pm2-installer` is not a
+    published npm package (`npm view` → 404); its real form (jessety/pm2-installer)
+    relocates the **machine-wide npm global prefix**, unsafe on `PG-DEVOPS14`
+    which launches the Paperclip control plane via `npx`. The TRA-493 plan
+    pre-approved a scripted scheduled task as the Part A fallback.
 
 ## 2. Deploy procedure
 
@@ -270,6 +293,8 @@ alert per window.
 | Inspect storage | `curl -H 'Authorization: Bearer <token>' http://<host>/api/health/storage` |
 | Lock / unlock a user | `POST /api/admin/users/:username/lock` (admin token) |
 | Reset a user's password | `POST /api/admin/users/:username/reset-password` (admin token) |
+| Reseed reboot autostart | `npx pm2 save` after any change to the running process set (see §1 "Autostart on reboot"). The `PM2 Resurrect` scheduled task restores exactly what was last saved. |
+| Manage PM2 after a reboot | The daemon is `SYSTEM`-owned post-reboot → use an **elevated** shell for `npx pm2 …` (non-elevated gets `EPERM` on the pipe). To return to user-context ownership: elevated `pm2 kill`, then `npx pm2 resurrect` from a normal shell. |
 
 ### Account-snapshot swap on restart (TRA-522)
 
