@@ -2720,6 +2720,68 @@ export class SignalEngine {
   }
 
   /**
+   * TRA-604 (C4b) — route an accepted "AI Options Ideas" idea to the PAPER
+   * options account. The idea's anchor contract (a real, scanner-surfaced
+   * mispriced option) is opened as a single long leg via the RV open path. This
+   * is paper-only by construction — `mode: 'demo'` with no equity override means
+   * pure paper cash and NO Tradier mirror, so there is no live-capital path here
+   * (live entry stays gated behind C6). The C3 order-time DTE guard still runs
+   * inside `openOptionFromRvCandidate`, so a sub-floor-DTE idea is refused.
+   *
+   * Returns the opened position, or `null` when entry was refused (outside the
+   * trading window, daily cap hit, a position for the same OCC already open,
+   * sub-tick mark, or the C3 DTE guard blocked it).
+   */
+  enterPaperOptionsIdea(intent: {
+    ticker: string;
+    optionSymbol: string;
+    optionType: import('@trading-app/shared').OptionType;
+    strike: number;
+    expiration: string;
+    mark: number;
+    delta: number;
+    spot: number;
+  }): import('@trading-app/shared').OptionPosition | null {
+    const signal: import('@trading-app/shared').RelativeValueSignal = {
+      id: randomUUID(),
+      symbol: intent.ticker,
+      type: 'relative_value',
+      side: 'buy',
+      entryPrice: intent.mark,
+      stopLoss: 0,
+      takeProfit: 0,
+      riskRewardRatio: 0,
+      timestamp: Date.now(),
+      mode: 'demo',
+      optionSymbol: intent.optionSymbol,
+      optionType: intent.optionType,
+      strike: intent.strike,
+      expiration: intent.expiration,
+      mark: intent.mark,
+      fairPrice: intent.mark,
+      mispricingPct: 0,
+      zScore: 0,
+      ivFitted: 0,
+      ivUsed: 0,
+      delta: intent.delta,
+      reason: 'AI Options Ideas paper entry',
+    };
+    const opened = this.optionsAccounts[this.tradierEnv].openOptionFromRvCandidate(
+      signal,
+      'demo',
+      undefined,
+      intent.spot,
+    );
+    if (opened) {
+      this.tracker?.saveEquity(
+        this.account.getState().totalEquity,
+        this.optionsAccount.getState().optionsPnl,
+      );
+    }
+    return opened;
+  }
+
+  /**
    * TRA-598 (C3) — no-day-trading discretionary-close gate for a user-initiated
    * option close. Runs the owning account's {@link PaperOptionsAccount.checkDayTradingClose}
    * across both env buckets so the `/api/options/:id/close` handler can refuse a

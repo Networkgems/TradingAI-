@@ -18,6 +18,7 @@
     "test": "vitest run --passWithNoTests"
   },
   "dependencies": {
+    "@anthropic-ai/sdk": "^0.71.0",
     "@trading-app/shared": "workspace:*"
   },
   "devDependencies": {

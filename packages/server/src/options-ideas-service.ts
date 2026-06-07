@@ -1,0 +1,269 @@
+// TRA-604 (TRA-595 C4b) — the live `GET /api/options/ideas` orchestration.
+//
+// Wires the whole pipeline the issue describes:
+//   resolve live watchlist → pull chains (Tradier) → fuseOptionsResearchInput
+//   (earnings C1 + Fed/FOMC C2 + sentiment + IV-rank) → runOptionsResearch
+//   (real Anthropic LlmClient + batch cache + C3 guardrail config) → map to the
+//   C5 panel's `OptionsIdeasFeed`.
+//
+// Falls back to a clearly-labelled NON-LIVE response when no LLM key is set
+// (acceptance: "or a labelled non-live response when no LLM key is configured").
+import { type OptionChainRow, type TradierOptionsClient, daysUntil } from '@trading-app/engine';
+import {
+  runOptionsResearch,
+  createAnthropicLlmClientFromEnv,
+  type OptionsResearchCache,
+  type OptionsResearchResult,
+  type DayTradingGuardrail,
+} from '@trading-app/agents';
+import { DAY_TRADING_GUARDRAIL } from '@trading-app/shared';
+import {
+  fuseOptionsResearchInput,
+  type SymbolEventContext,
+} from './options-research-input.js';
+import type { OptionChainSnapshotFile } from './options-chain-recorder.js';
+import { earningsInDaysSync } from './earnings-store.js';
+import { daysToNextFOMCSync, eventsNearDateSync } from './macro-store.js';
+import { ivRankSync, recordDailyIv, atmIvFromRows } from './iv-rank-store.js';
+import {
+  buildOptionsIdeasFeed,
+  noDayTradingBlock,
+  type OptionsIdeasFeed,
+  type IdeaEntryIntent,
+} from './options-ideas-feed.js';
+import { logger } from './observability/index.js';
+
+const log = logger.child({ module: 'options-ideas' });
+
+/** Inclusive DTE window for chain pulls — matches the 21–60 idea-gen floor. */
+const MIN_DTE = DAY_TRADING_GUARDRAIL.minIdeaDteDays; // 21
+const MAX_DTE = 60;
+/** Bound the universe per request so a wide watchlist can't fan out into a Tradier rate-limit storm. */
+const MAX_SYMBOLS = 25;
+/** Process-wide feed cache TTL — the panel polls every 60s; chains move slowly. */
+const FEED_TTL_MS = 10 * 60_000;
+
+/** The C3 guardrail the pass enforces — sourced from the first-class config (TRA-598). */
+function ideaGuardrail(): DayTradingGuardrail {
+  return { minDteDays: DAY_TRADING_GUARDRAIL.minIdeaDteDays, definedRiskOnly: true };
+}
+
+// One batch cache for the whole process so an identical universe re-run within
+// the trading day costs $0 (the engine keys by UTC day + inputs).
+const researchCache: OptionsResearchCache = (() => {
+  const m = new Map<string, OptionsResearchResult>();
+  return { get: (k) => m.get(k), set: (k, v) => void m.set(k, v) };
+})();
+
+// Last-built entry intents, keyed by idea id, for POST …/paper-enter.
+const entryIntents = new Map<string, IdeaEntryIntent>();
+
+export function getEntryIntent(id: string): IdeaEntryIntent | undefined {
+  return entryIntents.get(id);
+}
+
+interface FeedCacheEntry {
+  key: string;
+  builtAt: number;
+  feed: OptionsIdeasFeed;
+}
+let feedCache: FeedCacheEntry | null = null;
+
+function daysBetween(fromTs: number, isoDate: string): number {
+  const target = Date.parse(`${isoDate}T16:00:00-04:00`);
+  if (!Number.isFinite(target)) return -1;
+  return Math.round((target - fromTs) / 86_400_000);
+}
+
+/**
+ * Infer spot from a chain via put-call parity at the near-ATM strike:
+ * `S ≈ K + (C − P)` where K minimises |C − P| (carry/rate ignored — fine for an
+ * intraday spot used only to anchor the scanners + sketch). Returns null when no
+ * strike has both a call and put mid.
+ */
+export function inferSpotFromRows(rows: readonly OptionChainRow[]): number | null {
+  const mids = new Map<string, { c?: number; p?: number }>();
+  for (const r of rows) {
+    const mid =
+      typeof r.bid === 'number' && typeof r.ask === 'number' && r.ask > 0
+        ? (r.bid + r.ask) / 2
+        : typeof r.last === 'number' && r.last > 0
+          ? r.last
+          : null;
+    if (mid == null) continue;
+    const k = `${r.expiration}:${r.strike}`;
+    const slot = mids.get(k) ?? {};
+    if (r.optionType === 'call') slot.c = mid;
+    else slot.p = mid;
+    mids.set(k, slot);
+  }
+  let best: { spot: number; diff: number } | null = null;
+  for (const [k, { c, p }] of mids) {
+    if (c == null || p == null) continue;
+    const strike = Number(k.split(':')[1]);
+    const diff = Math.abs(c - p);
+    if (!best || diff < best.diff) best = { spot: strike + (c - p), diff };
+  }
+  return best && best.spot > 0 ? best.spot : null;
+}
+
+/**
+ * Pull in-window chains for one symbol into an in-memory snapshot (the same
+ * shape the daily recorder writes, so `fuseOptionsResearchInput` consumes it
+ * unchanged). Spot is inferred from the chain. Returns null on no usable data.
+ */
+async function fetchSnapshot(
+  client: Pick<TradierOptionsClient, 'getExpirations' | 'getChainSnapshot'>,
+  symbol: string,
+  now: number,
+): Promise<OptionChainSnapshotFile | null> {
+  const sym = symbol.trim().toUpperCase();
+  const expirations = await client.getExpirations(sym);
+  const inWindow = expirations.filter((d) => {
+    const dte = daysBetween(now, d);
+    return dte >= MIN_DTE && dte <= MAX_DTE;
+  });
+  if (!inWindow.length) return null;
+  const rows: OptionChainRow[] = [];
+  for (const exp of inWindow) {
+    rows.push(...(await client.getChainSnapshot(sym, exp)));
+  }
+  if (!rows.length) return null;
+  const spot = inferSpotFromRows(rows);
+  if (spot == null) return null;
+  return { symbol: sym, spot, recordedAt: now, expirations: inWindow, rows };
+}
+
+/** Human macro labels ("CPI in 2d") for the fusion's `macroEventsNearby`. */
+function macroLabels(now: number): string[] {
+  const today = new Date(now).toISOString().slice(0, 10);
+  return eventsNearDateSync(today, 3)
+    .map((e) => {
+      const d = daysUntil(e.date, now);
+      if (d == null || d < 0) return null;
+      return `${e.type} in ${d}d`;
+    })
+    .filter((s): s is string => s != null);
+}
+
+export interface BuildIdeasOptions {
+  /** Configured Tradier client; null → cannot pull chains. */
+  client: Pick<TradierOptionsClient, 'getExpirations' | 'getChainSnapshot'> | null;
+  /** Live universe (resolved watchlist). */
+  symbols: readonly string[];
+  /** Clock seam. */
+  now?: number;
+  /** Bypass the process feed cache (tests). */
+  noCache?: boolean;
+}
+
+/**
+ * Build (or serve cached) the live ideas feed. Returns a NON-LIVE labelled feed
+ * when no LLM key is configured or no chains are available, so the panel always
+ * has something coherent to render.
+ */
+export async function buildIdeasFeed(opts: BuildIdeasOptions): Promise<OptionsIdeasFeed> {
+  const now = opts.now ?? Date.now();
+  const guardrail = DAY_TRADING_GUARDRAIL;
+  const universe = [...new Set(opts.symbols.map((s) => s.trim().toUpperCase()).filter(Boolean))];
+  if (universe.length > MAX_SYMBOLS) {
+    log.info('options-ideas universe truncated', { requested: universe.length, used: MAX_SYMBOLS });
+  }
+  const symbols = universe.slice(0, MAX_SYMBOLS);
+  const cacheKey = symbols.slice().sort().join(',');
+
+  if (!opts.noCache && feedCache && feedCache.key === cacheKey && now - feedCache.builtAt < FEED_TTL_MS) {
+    return feedCache.feed;
+  }
+
+  const nonLive = (note: string): OptionsIdeasFeed => ({
+    ideas: [],
+    noDayTrading: noDayTradingBlock(guardrail),
+    generatedAt: now,
+    source: 'non_live',
+    note,
+  });
+
+  const llm = createAnthropicLlmClientFromEnv();
+  if (!llm) {
+    return nonLive(
+      'AI Options Ideas is not live: no Anthropic API key is configured (set ANTHROPIC_API_KEY). The research pass and guardrails are wired; ideas appear once a key is set.',
+    );
+  }
+  if (!opts.client) {
+    return nonLive('AI Options Ideas is not live: no Tradier options credentials are configured to pull option chains.');
+  }
+  if (!symbols.length) {
+    return nonLive('AI Options Ideas is not live: the watchlist is empty.');
+  }
+
+  // 1) pull chains → snapshots, recording the daily ATM IV per symbol.
+  const snapshots: OptionChainSnapshotFile[] = [];
+  const rowsBySymbol = new Map<string, OptionChainRow[]>();
+  for (const sym of symbols) {
+    try {
+      const snap = await fetchSnapshot(opts.client, sym, now);
+      if (!snap) continue;
+      snapshots.push(snap);
+      rowsBySymbol.set(snap.symbol, snap.rows);
+      const atmIv = snap.spot != null ? atmIvFromRows(snap.rows, snap.spot) : null;
+      if (atmIv != null) {
+        // Fire-and-forget: building the trailing IV history is a side effect, not
+        // on the critical path for this request's rank read.
+        void recordDailyIv(snap.symbol, atmIv, now).catch(() => {});
+      }
+    } catch (err) {
+      log.warn('chain pull failed', { symbol: sym, reason: err instanceof Error ? err.message : String(err) });
+    }
+  }
+  if (!snapshots.length) {
+    return nonLive('AI Options Ideas is not live: no option chains returned for the current universe.');
+  }
+
+  // 2) fuse — wire C1 (earnings), C2 (Fed/FOMC + macro), IV-rank, sentiment.
+  const macroNearby = macroLabels(now);
+  const fomc = daysToNextFOMCSync(now);
+  const contextFor = (symbol: string): SymbolEventContext => {
+    const snap = snapshots.find((s) => s.symbol === symbol.toUpperCase());
+    const atmIv = snap && snap.spot != null ? atmIvFromRows(snap.rows, snap.spot) : null;
+    return {
+      ivRank: atmIv != null ? ivRankSync(symbol, atmIv, now) : null,
+      nextEarningsInDays: earningsInDaysSync(symbol, now),
+      daysToFOMC: fomc,
+      macroEventsNearby: macroNearby,
+      newsSentiment: null,
+    };
+  };
+  const input = fuseOptionsResearchInput(snapshots, now, { contextFor, now });
+  input.guardrail = ideaGuardrail();
+
+  // 3) run the Head-of-Options-Research pass against the real model.
+  let research: OptionsResearchResult;
+  try {
+    research = await runOptionsResearch(input, { llm, cache: researchCache });
+  } catch (err) {
+    log.error('options-research pass failed', { reason: err instanceof Error ? err.message : String(err) });
+    return nonLive('AI Options Ideas could not complete the research pass this cycle; try again shortly.');
+  }
+
+  // 4) map engine ideas → panel feed; refresh the entry-intent registry.
+  const { feed, intents } = buildOptionsIdeasFeed({
+    research,
+    input,
+    rowsBySymbol,
+    guardrail,
+    generatedAt: now,
+  });
+  entryIntents.clear();
+  for (const [id, intent] of intents) entryIntents.set(id, intent);
+
+  feedCache = { key: cacheKey, builtAt: now, feed };
+  log.info('options-ideas feed built', {
+    universe: symbols.length,
+    snapshots: snapshots.length,
+    ideas: feed.ideas.length,
+    costUsd: research.costUsd,
+    cached: research.cached,
+  });
+  return feed;
+}

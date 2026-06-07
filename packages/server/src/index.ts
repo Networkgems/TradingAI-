@@ -39,6 +39,8 @@ import {
 import { scanStocksMarket, scanCryptoMarket } from './market-scanner.js';
 import { runPremarketForAllUsers } from './premarket-watchlist.js';
 import { recordOptionChains } from './options-chain-recorder.js';
+import { buildIdeasFeed, getEntryIntent } from './options-ideas-service.js';
+import { initIvRankStore } from './iv-rank-store.js';
 import {
   generateMarketReview,
   getLatestMarketReview,
@@ -327,6 +329,11 @@ void runEarningsRefresh();
 // kick a non-blocking refresh. A slow/absent provider must never delay startup.
 await initMacroStore();
 void runMacroRefresh();
+
+// TRA-604 (TRA-595 C4b) — warm the trailing-IV store from disk so the
+// synchronous `ivRankSync` read used by the AI Options Ideas fusion has data
+// available right after boot. The store is appended to as chains are pulled.
+await initIvRankStore();
 
 const app = express();
 // TRA-404 — behind Render's proxy the socket address is the proxy, not the
@@ -1344,6 +1351,54 @@ app.get('/api/options/relative-value', requireAuth, async (req, res) => {
 
 app.get('/api/health/options-mispricing', (_req, res) => {
   res.json(relativeValueScannerService.diagnostics());
+});
+
+// TRA-604 (TRA-595 C4b) — live "AI Options Ideas" feed. Resolves the user's
+// watchlist, pulls Tradier chains, fuses the C1/C2/sentiment/IV-rank context,
+// runs the Head-of-Options-Research LLM pass behind the C3 guardrail, and maps
+// the result to the C5 panel's `OptionsIdeasFeed`. Returns a clearly-labelled
+// non-live response (HTTP 200, `source: 'non_live'`) when no Anthropic key or
+// Tradier creds are configured, so the panel always renders coherently.
+app.get('/api/options/ideas', requireAuth, async (_req, res) => {
+  const ctx = await userCtx(res);
+  const settings = getSettings(ctx.username);
+  const env = settings.liveTradierEnvOptions ?? 'sandbox';
+  const client = buildTradierOptionsClientForEnv(settings, env);
+  const symbols = getStocksWatchlistData(ctx.username).all;
+  const feed = await buildIdeasFeed({ client, symbols });
+  res.json(feed);
+});
+
+// TRA-604 (TRA-595 C4b) — route an accepted idea to the PAPER options account.
+// Paper-only by construction (no live-capital path — that stays gated behind
+// C6). The idea's anchor contract is opened as a single long leg; the C3
+// order-time DTE guard runs inside the account open path.
+app.post('/api/options/ideas/:id/paper-enter', requireAuth, async (req, res) => {
+  const ctx = await userCtx(res);
+  const { id } = req.params as Record<string, string>;
+  const intent = getEntryIntent(id);
+  if (!intent) {
+    res.status(404).json({
+      error: 'Idea not found or expired — refresh the AI Options Ideas feed and try again.',
+    });
+    return;
+  }
+  const opened = ctx.engine.enterPaperOptionsIdea(intent);
+  if (!opened) {
+    res.status(409).json({
+      error:
+        'Could not place the paper order — the market may be closed, the daily options cap reached, a position for this contract already open, or the idea fell below the no-day-trading DTE floor.',
+    });
+    return;
+  }
+  broadcastEngineState(ctx);
+  res.json({
+    ok: true,
+    positionId: opened.id,
+    optionSymbol: opened.optionSymbol,
+    contracts: opened.contracts,
+    premiumPaid: opened.premiumPaid,
+  });
 });
 
 // TRA-141 — storage diagnostic so QA can verify from outside the box that the

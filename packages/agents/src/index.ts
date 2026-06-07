@@ -28,6 +28,17 @@ export {
   type CompleteJsonResult,
 } from './llm-client.js';
 export {
+  AnthropicLlmClient,
+  createAnthropicLlmClientFromEnv,
+  modelAcceptsTemperature,
+  DEFAULT_TIER_MODELS,
+  DEFAULT_MODEL_PRICING,
+  type AnthropicLlmClientOptions,
+  type AnthropicLike,
+  type TierModelMap,
+  type ModelPricing,
+} from './anthropic-llm-client.js';
+export {
   runAnalysts,
   technicalAnalyst,
   fundamentalAnalyst,
