@@ -105,6 +105,49 @@ describe('modelStructure', () => {
     expect(s.breakevens).toEqual([440]); // 435 + 5
     expect(s.netUsd).toBeCloseTo(-500, 4);
   });
+
+  it('caps long-put max profit at the lesser of the 2x sketch and the true (strike - debit) max', () => {
+    // A low-strike put: true max (strike - debit) is SMALLER than the 2x sketch,
+    // so the bound must win (a put is not "unbounded").
+    const putRows: OptionChainRow[] = [putRow(5, 1.9, 2.1), putRow(6, 2.9, 3.1)]; // mids 2.0, 3.0
+    const s = modelStructure('long_put', candidate({ strike: 6, optionType: 'put' }), 10, putRows, 999);
+    expect(s.maxLossUsd).toBeCloseTo(300, 4); // 3.0 debit * 100
+    // min(2*3.0, 6-3.0)=min(6,3)=3.0 → 300, NOT the 600 the old sketch would show
+    expect(s.maxProfitUsd).toBeCloseTo(300, 4);
+    expect(s.breakevens).toEqual([3]); // 6 - 3
+    expect(s.netUsd).toBeCloseTo(-300, 4);
+  });
+
+  it('prices an iron condor by snapping long wings to the chain when the increment != median step', () => {
+    // Put increments tighten in (5) but the long wing falls on an unlisted
+    // arithmetic strike (425 - 5 = 420 not listed); call increments are uneven.
+    // Pre-fix this dropped the whole condor to the 1:1 fallback; snapping fixes it.
+    const condorRows: OptionChainRow[] = [
+      putRow(410, 1.0, 1.2),
+      putRow(415, 1.9, 2.1), // long wing, mid 2.0
+      putRow(425, 3.9, 4.1), // short, mid 4.0
+      putRow(430, 5.0, 5.2),
+      callRow(430, 5.0, 5.2),
+      callRow(435, 3.9, 4.1), // short, mid 4.0
+      callRow(442, 1.4, 1.6), // long wing, mid 1.5
+      callRow(450, 0.5, 0.7),
+    ];
+    // optionType 'put' → step derives from putStrikes median gap = 5.
+    const s = modelStructure('iron_condor', candidate({ strike: 425, optionType: 'put' }), 430, condorRows, 999);
+    expect(s.priced).toBe(true); // priced off real marks, not the fallback sketch
+    expect(s.legs).toEqual([
+      { action: 'sell', optionType: 'put', strike: 425, expiration: EXP },
+      { action: 'buy', optionType: 'put', strike: 415, expiration: EXP }, // snapped from 420
+      { action: 'sell', optionType: 'call', strike: 435, expiration: EXP },
+      { action: 'buy', optionType: 'call', strike: 442, expiration: EXP }, // snapped from 440
+    ]);
+    // credit = ps - pl + cs - cl = 4.0 - 2.0 + 4.0 - 1.5 = 4.5 → maxProfit 450
+    expect(s.maxProfitUsd).toBeCloseTo(450, 4);
+    expect(s.netUsd).toBeCloseTo(450, 4);
+    // width = max(442 - 435, 425 - 415) = 10 → maxLoss (10 - 4.5)*100 = 550
+    expect(s.maxLossUsd).toBeCloseTo(550, 4);
+    expect(s.breakevens).toEqual([420.5, 439.5]); // [425 - 4.5, 435 + 4.5]
+  });
 });
 
 describe('buildOptionsIdeasFeed', () => {

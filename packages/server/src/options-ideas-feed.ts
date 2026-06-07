@@ -233,9 +233,11 @@ const r2 = (v: number): number => Math.round(v * 100) / 100;
  * live chain. Prices each leg off real chain marks where available; when a leg
  * can't be priced (thin chain), falls back to the engine's `maxLossUsdFallback`
  * with a 1:1 reward placeholder so the panel still renders sensibly. All dollar
- * figures are per 1-lot (×100). For genuinely unbounded long singles the max
- * profit is a sketch cap (2× the debit) — the payoff preview is a What-If
- * sketch, not a guarantee.
+ * figures are per 1-lot (×100). A long call's upside is genuinely unbounded, so
+ * its max profit is a sketch cap (2× the debit) — the payoff preview is a
+ * What-If sketch, not a guarantee. A long put's upside is BOUNDED at
+ * (strike − debit)×100 (underlying → 0); it's capped at the lesser of that true
+ * max and the same 2×-debit sketch.
  */
 export function modelStructure(
   strategy: DefinedRiskStrategy,
@@ -283,11 +285,18 @@ export function modelStructure(
       const debit = midAt(rows, ot, exp, k) ?? anchor.mark;
       if (!(debit > 0)) return fallback([leg('buy', ot, k)], [k]);
       const be = ot === 'call' ? k + debit : k - debit;
+      // Call upside is genuinely unbounded → 2×-debit sketch cap. Put upside is
+      // bounded at (strike − debit)×100, so cap at the lesser of the sketch and
+      // that true max rather than mislabeling it "unbounded".
+      const maxProfitUsd =
+        ot === 'put'
+          ? r2(Math.min(debit * 2, Math.max(0, k - debit)) * CONTRACT)
+          : r2(debit * CONTRACT * 2);
       return {
         legs: [leg('buy', ot, k)],
         breakevens: [r2(be)],
         maxLossUsd: r2(debit * CONTRACT),
-        maxProfitUsd: r2(debit * CONTRACT * 2), // sketch cap (unbounded upside)
+        maxProfitUsd,
         netUsd: r2(-debit * CONTRACT),
         priced: true,
       };
@@ -346,8 +355,12 @@ export function modelStructure(
         center ?? nearestStrike(putStrikes, spot - step) ?? Math.round(spot - step);
       const kCallShort =
         center ?? nearestStrike(callStrikes, spot + step) ?? Math.round(spot + step);
-      const kPutLong = kPutShort - step;
-      const kCallLong = kCallShort + step;
+      // Snap the long wings to the chain (same as the shorts) so a listing
+      // increment that differs from the median `step` doesn't push the wing onto
+      // an unlisted strike — which would null out `midAt` and silently drop the
+      // whole condor to the 1:1 fallback sketch.
+      const kPutLong = nearestStrike(putStrikes, kPutShort - step) ?? kPutShort - step;
+      const kCallLong = nearestStrike(callStrikes, kCallShort + step) ?? kCallShort + step;
       const legs = [
         leg('sell', 'put', kPutShort),
         leg('buy', 'put', kPutLong),
