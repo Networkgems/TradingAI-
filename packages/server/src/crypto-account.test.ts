@@ -94,6 +94,62 @@ describe('CryptoPaperAccount short cash flow (TRA-330)', () => {
   });
 });
 
+describe('CryptoPaperAccount mark-to-market reconciliation (TRA-703)', () => {
+  it('keeps marked equity >= cash for a long-only book (the regression invariant)', () => {
+    const acct = new CryptoPaperAccount(25_000);
+    const long = buildSignal({ side: 'buy', entryPrice: 100, stopLoss: 99, takeProfit: 110 });
+    acct.openPosition(long, 100);
+    const cash = acct.getState().availableCash;
+    // Even with the price flat at entry, equity (cash + position value) must be
+    // >= cash for a long — the exact invariant the header violated in TRA-703.
+    const marked = acct.markToMarketEquity(new Map([['BTC-USD', 100]]));
+    expect(marked).toBeGreaterThanOrEqual(cash);
+  });
+
+  it('reconciles an open short so marked equity tracks cash minus the buyback liability', () => {
+    const acct = new CryptoPaperAccount(25_000);
+    const short = buildSignal({ side: 'sell', entryPrice: 100, stopLoss: 105, takeProfit: 90 });
+    acct.openPosition(short, 100);
+    const state = acct.getState();
+    // Realized-basis equity sits at the baseline while cash is inflated by the
+    // short proceeds — the inconsistent KPI the dashboard surfaced.
+    expect(state.availableCash).toBeGreaterThan(state.totalEquity);
+    // Marked to the entry price, equity is below cash by exactly the open
+    // buyback liability (qty * mark) — i.e. ~the baseline net of the entry fee.
+    const marked = acct.markToMarketEquity(new Map([['BTC-USD', 100]]));
+    expect(marked).toBeLessThan(state.availableCash);
+    expect(marked).toBeCloseTo(state.availableCash - 100 * short_qty(acct), 6);
+  });
+
+  it('falls back to entry price when a symbol has no live quote', () => {
+    const acct = new CryptoPaperAccount(25_000);
+    const long = buildSignal({ side: 'buy', entryPrice: 100, stopLoss: 99, takeProfit: 110 });
+    acct.openPosition(long, 100);
+    const withQuote = acct.markToMarketEquity(new Map([['BTC-USD', 100]]));
+    const noQuote = acct.markToMarketEquity(new Map());
+    const zeroQuote = acct.markToMarketEquity(new Map([['BTC-USD', 0]]));
+    expect(noQuote).toBeCloseTo(withQuote, 6);
+    expect(zeroQuote).toBeCloseTo(withQuote, 6);
+  });
+
+  it('getMarkedState derives dailyPnl from the marked equity', () => {
+    const acct = new CryptoPaperAccount(25_000);
+    const long = buildSignal({ side: 'buy', entryPrice: 100, stopLoss: 99, takeProfit: 110 });
+    acct.openPosition(long, 100);
+    // Price rallies — a long-only book should show positive daily P&L and
+    // equity above cash.
+    const marked = acct.getMarkedState(new Map([['BTC-USD', 110]]));
+    expect(marked.totalEquity).toBeGreaterThan(marked.availableCash);
+    expect(marked.dailyPnl).toBeGreaterThan(0);
+    expect(marked.dailyPnl).toBeCloseTo(marked.totalEquity - 25_000, 6);
+  });
+});
+
+function short_qty(acct: CryptoPaperAccount): number {
+  const positions = acct.getState().openPositions;
+  return positions.reduce((sum, p) => sum + p.quantity, 0);
+}
+
 describe('CryptoPaperAccount.enforceEquityInvariant (TRA-330)', () => {
   it('returns false and leaves state untouched when equity is healthy', () => {
     const acct = new CryptoPaperAccount(25_000);

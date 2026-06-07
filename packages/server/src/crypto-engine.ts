@@ -1714,7 +1714,15 @@ export class CryptoSignalEngine {
         activePreset,
       };
     }
-    const accountBase = this.account.getState();
+    // TRA-703 — mark the demo book to the latest live quotes so the header's
+    // Equity is reconciled with Cash (cash + net open-position value) instead
+    // of the realized-basis `this.equity` that only moves on close. Without
+    // this the dashboard showed Equity < Cash whenever legacy short positions
+    // inflated cash with their entry proceeds while equity sat at its capped
+    // baseline — an internally inconsistent KPI (the reported regression).
+    const markPrices = new Map<string, number>();
+    for (const s of this.symbolState.values()) markPrices.set(s.symbol, s.price);
+    const accountBase = this.account.getMarkedState(markPrices);
     const stats = this.tracker?.getCumulativeStats(accountBase.totalEquity);
     // TRA-231 — same idempotent stamp as the live branch above so demo open
     // positions carry an explicit mode tag through to the UI.

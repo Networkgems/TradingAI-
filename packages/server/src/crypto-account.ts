@@ -108,6 +108,48 @@ export class CryptoPaperAccount {
     return this.equity;
   }
 
+  /**
+   * TRA-703 — reconciled mark-to-market total equity = cash + the net signed
+   * market value of every open position. The stored `this.equity` only moves
+   * on close (open longs debit cash, open shorts credit it, equity untouched
+   * — see openPosition / the TRA-330 short tests), so the displayed header
+   * could show Equity < Cash whenever the book held positions whose proceeds
+   * inflated cash (e.g. legacy shorts opened before the DCA-only roster
+   * switch). Marking to market makes the KPI internally consistent at all
+   * times: a long contributes +qty*price and a short -qty*price, so for a
+   * long-only spot book the position value is always >= 0 and equity >= cash.
+   *
+   * A symbol with no live quote (missing / zero / non-finite) falls back to
+   * the position's entry price so a stale feed leaves that leg at cost basis
+   * rather than zeroing it out and understating equity.
+   */
+  markToMarketEquity(prices: Map<string, number>): number {
+    let positionValue = 0;
+    for (const pos of this.positions.values()) {
+      const quote = prices.get(pos.symbol);
+      const mark = quote != null && Number.isFinite(quote) && quote > 0 ? quote : pos.entryPrice;
+      const signed = pos.side === 'buy' ? 1 : -1;
+      positionValue += signed * pos.quantity * mark;
+    }
+    return this.cash + positionValue;
+  }
+
+  /**
+   * TRA-703 — same shape as `getState` but with `totalEquity` (and the
+   * `dailyPnl` derived from it) marked to the supplied live prices so the
+   * crypto dashboard header is internally consistent. Used by the engine's
+   * demo `buildState` branch where the live quote map is available.
+   */
+  getMarkedState(prices: Map<string, number>): Omit<AccountState, 'weeklyPnl' | 'monthlyPnl' | 'yearlyPnl' | 'allTimePnl'> {
+    const totalEquity = this.markToMarketEquity(prices);
+    return {
+      totalEquity,
+      availableCash: this.cash,
+      openPositions: Array.from(this.positions.values()),
+      dailyPnl: totalEquity - this.openingEquityToday,
+    };
+  }
+
   managedEquity(): number {
     return this.equity * this.managedAccountRatio;
   }
