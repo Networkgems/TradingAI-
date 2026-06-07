@@ -15,6 +15,7 @@ import { ErrorBoundary } from './ErrorBoundary.tsx';
 import { CalendarTab } from './CalendarTab.tsx';
 import type { Theme } from './components/ThemeToggle';
 import { DashboardHeader } from './components/dashboard/DashboardHeader';
+import { TabBar } from './components/dashboard/TabBar';
 import { ProfileModals } from './components/dashboard/ProfileModals';
 import type { ProfileModal } from './components/dashboard/ProfileModals';
 import { StockWatchlistPanel } from './components/dashboard/StockWatchlistPanel';
@@ -124,48 +125,32 @@ export default function Dashboard({ token, onLogout, onGoHome, onActivity, theme
           daily circuit-breakers) and update live over the WebSocket. */}
       <HaltBanner halted={state?.tradingHalted ?? false} reason={state?.haltReason ?? null} />
 
-      <nav className="tabs">
-        {/* TRA-503 — Positions tab is shown in every account/env so Live + Tradier
-            Production matches Demo. The earlier TRA-326 carve-out hid it on
-            Live+Production. */}
-        {(['watchlist', 'signals', 'positions', 'options'] as const).map(t => (
-          <button
-            key={t}
-            /* TRA-569 — coach-mark anchors (design §3.3): Signals/watchlist and
-               Positions stops point at their tab buttons. */
-            data-tour={t === 'signals' || t === 'positions' ? t : undefined}
-            className={`tab ${tab === t ? 'active' : ''}`}
-            onClick={() => setTab(t)}
-          >
-            {t === 'watchlist' ? `Watchlist (${symbols.length})` :
-             t === 'signals' ? `Signals (${signals.length})` :
-             t === 'positions' ? `Positions (${openPositions.length})` :
-             `Options (${openOptions.length})`}
-          </button>
-        ))}
-        {/* TRA-600 — event-aware "AI Options Ideas" surface (Phase 3 of TRA-595). */}
-        <button
-          className={`tab ${tab === 'ideas' ? 'active' : ''}`}
-          onClick={() => setTab('ideas')}
-          title="Ranked, defined-risk options ideas with earnings/Fed event context — paper entry only"
-        >
-          AI Ideas
-        </button>
-        <button className={`tab ${tab === 'news' ? 'active' : ''}`} onClick={() => setTab('news')}>
-          {`News (${news.length})`}
-        </button>
-        <button
-          data-tour="calendar"
-          className={`tab ${tab === 'calendar' ? 'active' : ''}`}
-          onClick={() => setTab('calendar')}
-        >
-          Calendar
-        </button>
-        {/* TRA-539 — live reliability dashboard (TRA-528 /api/health/live). */}
-        <button className={`tab ${tab === 'health' ? 'active' : ''}`} onClick={() => setTab('health')}>
-          Health
-        </button>
-      </nav>
+      {/* TRA-690 — grouped nav: the core trading workflow (Watchlist → Signals →
+          Positions → Options → AI Ideas) stays flat; reference/utility surfaces
+          (News, Calendar, Health) collapse into a "More ▾" dropdown so the bar
+          stays clean as features are added. The Calendar coach-mark anchor
+          (TRA-569 design §3.3) rides on the More trigger so the tour's last stop
+          still resolves to a visible element. */}
+      <TabBar
+        active={tab}
+        onSelect={setTab}
+        moreTour="calendar"
+        primary={[
+          // TRA-569 — Signals/Positions coach-mark anchors point at their tabs.
+          { id: 'watchlist', label: `Watchlist (${symbols.length})` },
+          { id: 'signals', label: `Signals (${signals.length})`, dataTour: 'signals' },
+          { id: 'positions', label: `Positions (${openPositions.length})`, dataTour: 'positions' },
+          { id: 'options', label: `Options (${openOptions.length})` },
+          // TRA-600 — event-aware "AI Options Ideas" surface (Phase 3 of TRA-595).
+          { id: 'ideas', label: 'AI Ideas', title: 'Ranked, defined-risk options ideas with earnings/Fed event context — paper entry only' },
+        ]}
+        more={[
+          { id: 'news', label: `News (${news.length})` },
+          { id: 'calendar', label: 'Calendar' },
+          // TRA-539 — live reliability dashboard (TRA-528 /api/health/live).
+          { id: 'health', label: 'Health' },
+        ]}
+      />
 
       <main className="content">
        {/* TRA-398 — per-tab error boundary. `key={tab}` remounts it on tab

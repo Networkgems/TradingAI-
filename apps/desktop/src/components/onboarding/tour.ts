@@ -49,7 +49,7 @@ export const TOUR_STOPS: readonly TourStop[] = [
   {
     id: 'calendar',
     title: 'Reports & calendar',
-    body: 'Your daily P&L, closed-trade history, and exportable reports live on the Calendar tab.',
+    body: 'Your daily P&L, closed-trade history, and exportable reports live under the More ▾ menu → Calendar.',
   },
 ] as const;
 

@@ -321,6 +321,18 @@ body {
 .tab:hover { color: var(--text); }
 .tab.active { color: var(--blue); border-bottom-color: var(--blue); }
 
+/* TRA-690 — "More ▾" grouped-tab dropdown trigger. Sits flush in the tab bar
+   and reuses `.tab`; the caret + non-capitalized label distinguish it as a
+   menu. It shows the active reference-tab label (e.g. "Calendar ▾") when a tab
+   inside the menu is selected, and lights up like any other active tab. */
+.tab-more-wrap { display: inline-flex; }
+.tab-more { text-transform: none; display: inline-flex; align-items: center; gap: 0.3rem; }
+.tab-more-dropdown { min-width: 160px; }
+.tab-more-dropdown .profile-dropdown-item.active {
+  color: var(--blue);
+  font-weight: 600;
+}
+
 .content {
   flex: 1;
   overflow: auto;

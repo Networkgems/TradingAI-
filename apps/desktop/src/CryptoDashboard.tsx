@@ -20,6 +20,7 @@ import { CryptoSignalsPanel } from './components/dashboard/CryptoSignalsPanel';
 import { CryptoPositionsPanel } from './components/dashboard/CryptoPositionsPanel';
 import { NewsPanel } from './components/dashboard/NewsPanel';
 import { PromotionGatePanel } from './components/dashboard/PromotionGatePanel';
+import { TabBar } from './components/dashboard/TabBar';
 
 type CryptoTab = 'watchlist' | 'signals' | 'positions' | 'news' | 'gate' | 'calendar';
 
@@ -166,22 +167,23 @@ export default function CryptoDashboard({ token, onBack, onLogout, onActivity, t
           straight from the engaged flag. */}
       <HaltBanner halted={killSwitchEngaged} reason={null} />
 
-      <nav className="tabs">
-        {(['watchlist', 'signals', 'positions', 'news'] as const).map(t => (
-          <button key={t} className={`tab ${tab === t ? 'active' : ''}`} onClick={() => setTab(t)}>
-            {t === 'watchlist' ? `Watchlist (${symbols.length})` :
-             t === 'signals' ? `Signals (${signals.length})` :
-             t === 'positions' ? `Positions (${openPositions.length})` :
-             `News (${news.length})`}
-          </button>
-        ))}
-        <button className={`tab ${tab === 'gate' ? 'active' : ''}`} onClick={() => setTab('gate')}>
-          Gate
-        </button>
-        <button className={`tab ${tab === 'calendar' ? 'active' : ''}`} onClick={() => setTab('calendar')}>
-          P&amp;L Calendar
-        </button>
-      </nav>
+      {/* TRA-690 — grouped nav: core trading surfaces stay flat; the Promotion
+          Gate and P&L Calendar collapse into a "More ▾" dropdown to keep the bar
+          clean. */}
+      <TabBar
+        active={tab}
+        onSelect={setTab}
+        primary={[
+          { id: 'watchlist', label: `Watchlist (${symbols.length})` },
+          { id: 'signals', label: `Signals (${signals.length})` },
+          { id: 'positions', label: `Positions (${openPositions.length})` },
+          { id: 'news', label: `News (${news.length})` },
+        ]}
+        more={[
+          { id: 'gate', label: 'Gate', title: 'Crypto → real-capital promotion gate status' },
+          { id: 'calendar', label: 'P&L Calendar' },
+        ]}
+      />
 
       <ProfileModals
         which={profileModal}
