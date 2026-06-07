@@ -1,5 +1,6 @@
 import { useEffect, useState } from 'react';
 import type { EodReport } from '@trading-app/shared';
+import { ExportTradesModal } from './components/ExportTradesModal';
 
 const MONTH_NAMES = [
   'January', 'February', 'March', 'April', 'May', 'June',
@@ -400,6 +401,8 @@ export function CalendarTab({ token, httpUrl, reportsPath = '/api/reports', mode
   // TRA-219 — date selected for the per-day EOD report detail view.
   const [selectedDate, setSelectedDate] = useState<string | null>(null);
   const [detailLoading, setDetailLoading] = useState(false);
+  // TRA-568 — trade-history export modal (design §2.2 toolbar control).
+  const [exportOpen, setExportOpen] = useState(false);
 
   // TRA-244 — append `?mode=<bucket>` so server reads from the matching
   // per-account folder (or omit when no mode is supplied).
@@ -523,8 +526,21 @@ export function CalendarTab({ token, httpUrl, reportsPath = '/api/reports', mode
             <span className="cal-period-label">{periodLabel}</span>
             <button className="cal-nav-btn" onClick={nextPeriod}>&#8250;</button>
           </div>
+          {/* TRA-568 — trade-history export (CSV/JSON) for the current user. */}
+          <button
+            type="button"
+            className="cal-export-btn"
+            onClick={() => setExportOpen(true)}
+            title="Export closed trades to CSV or JSON"
+          >
+            &#10515; Export
+          </button>
         </div>
       </div>
+
+      {exportOpen && (
+        <ExportTradesModal token={token} httpUrl={httpUrl} onClose={() => setExportOpen(false)} />
+      )}
 
       {selectedDate && (
         selectedReport ? (
