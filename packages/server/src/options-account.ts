@@ -3,6 +3,7 @@ import type { TradierOpenOptionPosition } from '@trading-app/engine';
 import type {
   AccountMode,
   TradeSignal,
+  OptionLeg,
   OptionPosition,
   OptionsAccountState,
   OtmMispricingSignal,
@@ -59,6 +60,9 @@ function rvStopLossPremium(premium: number, rvRiskParams: RvRiskParams): number 
 // helper that lived here; only the import site moved.
 
 const ATM_DELTA = 0.50;
+
+/** TRA-613 — round to 2dp (USD cents) for the defined-risk combo payload. */
+const r2 = (v: number): number => Math.round(v * 100) / 100;
 
 /**
  * TRA-384 — consecutive ticks an OTM/RV position may go without a fresh live
@@ -991,6 +995,150 @@ export class PaperOptionsAccount {
     return position;
   }
 
+  /**
+   * TRA-613 (TRA-595 C5) — open a defined-risk MULTI-LEG spread as a single
+   * paper combo position (bull put spread, iron condor, debit spread, …). This
+   * is the multi-leg counterpart to {@link openOptionFromRvCandidate}: the
+   * single-leg long path could only ever represent one leg, so every multi-leg
+   * AI-Options-Ideas idea was previously truncated to its anchor contract. Here
+   * the whole structure is entered as one combo row carrying its `legs`,
+   * `netUsd`, `maxLossUsd`, `maxProfitUsd`, and `breakevens`.
+   *
+   * Cash accounting (paper) — uniform capital-at-risk model: the entry debits
+   * the capped `maxLossUsd × contracts` from paper cash regardless of whether
+   * the structure was opened for a net debit or a net credit. For a debit
+   * spread `maxLoss == debit`, so this is exactly the premium paid; for a
+   * credit spread `maxLoss == width − credit`, which is the broker's
+   * buying-power hold (the credit is netted into the reserved capital rather
+   * than shown as free cash, so a credit spread can't masquerade as instant
+   * profit and free up cash to over-trade). `premiumPaid` is set to the
+   * per-share reserved capital so the existing close-path P&L math treats the
+   * worst case as the cost basis. NOTE: combo close/settlement is a follow-up —
+   * {@link checkExits} skips combos and {@link closeOption} books them off this
+   * conservative basis until per-leg settlement lands.
+   *
+   * Paper-only by construction (`mode: 'demo'`, no `equityOverride`). The C3
+   * order-time entry-DTE guard runs on the structure's expiration, so a
+   * sub-floor-DTE idea is refused. Returns `null` (consuming nothing) when
+   * outside the trading window, the daily cap is hit, a combo for the same
+   * structure key is already open, the C3 DTE guard blocks it, the structure is
+   * mispriced (`maxLossUsd ≤ 0`), or paper cash can't cover even one lot.
+   */
+  openDefinedRiskSpread(
+    params: {
+      symbol: string;
+      strategy: string;
+      legs: OptionLeg[];
+      /** + credit / − debit, USD per 1-lot. */
+      netUsd: number;
+      /** Capped max loss (capital at risk), USD per 1-lot. */
+      maxLossUsd: number;
+      /** Capped max profit, USD per 1-lot. */
+      maxProfitUsd: number;
+      breakevens: number[];
+      /** Underlying spot at entry (for the position's underlyingEntryPrice). */
+      spot: number;
+      signalId?: string;
+    },
+    mode: AccountMode = 'demo',
+  ): OptionPosition | null {
+    this.resetDayIfNeeded();
+
+    if (!isValidTradingWindow(Date.now())) return null;
+    if (this.dailyOptionsTotal() >= this.optionsDailyTradesLimit) return null;
+
+    const legs = params.legs;
+    if (!Array.isArray(legs) || legs.length < 2) return null;
+
+    // The structure's expiration is the (single) shared expiration across legs;
+    // calendars (two expirations) take the soonest leg as the DTE basis — the
+    // conservative side for the no-day-trading floor.
+    const expirations = [...new Set(legs.map((l) => l.expiration))].sort();
+    const expiration = expirations[0]!;
+
+    // Stable combo key for dedup + chain-lookup avoidance. A synthetic
+    // (non-OCC) `optionSymbol` means the engine's per-symbol mark refresh never
+    // matches it — combos are mark-managed only at close/expiry, not per tick.
+    const legKey = legs
+      .map((l) => `${l.action[0]}${l.optionType[0]}${l.strike}@${l.expiration}`)
+      .join('+');
+    const comboSymbol = `COMBO:${params.symbol.toUpperCase()}:${params.strategy}:${legKey}`;
+
+    const existing = Array.from(this.openOptions.values()).find(
+      (o) => o.optionSymbol === comboSymbol,
+    );
+    if (existing) return null;
+
+    // TRA-598 (C3) — no-day-trading entry gate on the structure's expiration.
+    if (!this.passesEntryDteGuard(comboSymbol, expiration, Date.now())) return null;
+
+    const maxLossPerLot = params.maxLossUsd;
+    if (!Number.isFinite(maxLossPerLot) || maxLossPerLot <= 0) return null;
+
+    // Size off the RV ticket budget against the capital-at-risk per lot. Demo
+    // (no equity override) keeps the legacy floor-divide; we force at least one
+    // lot when a single defined-risk lot still fits paper cash so a high
+    // max-loss spread isn't silently rejected for rounding to zero contracts.
+    const budget = this.rvBudgetPerTrade();
+    let contracts = Math.floor(budget / maxLossPerLot);
+    if (contracts < 1 && maxLossPerLot <= this.cash) contracts = 1;
+    if (contracts < 1) return null;
+
+    let totalRisk = contracts * maxLossPerLot;
+    // Trim to whatever paper cash can actually reserve (paper book is the
+    // binding constraint here — there is no live buying-power mirror).
+    if (totalRisk > this.cash) {
+      contracts = Math.floor(this.cash / maxLossPerLot);
+      if (contracts < 1) return null;
+      totalRisk = contracts * maxLossPerLot;
+    }
+
+    this.cash -= totalRisk;
+    this.dailyRvCount += 1;
+
+    // Per-share reserved-capital basis so the legacy P&L-on-close math treats
+    // the capped worst case as the cost basis.
+    const premiumPaid = maxLossPerLot / 100;
+
+    const position: OptionPosition = {
+      id: randomUUID(),
+      symbol: params.symbol.toUpperCase(),
+      optionSymbol: comboSymbol,
+      optionType: legs[0]!.optionType,
+      strike: legs[0]!.strike,
+      expiration,
+      contracts,
+      contractsRemaining: contracts,
+      premiumPaid,
+      currentPremium: premiumPaid,
+      // Combos are held to manual close / expiry; the per-leg SL/TP/trailing
+      // engine skips them (sentinels keep checkExits a no-op even if reached).
+      tp1Premium: Number.POSITIVE_INFINITY,
+      tp1Hit: false,
+      stopLossPremium: 0,
+      peakPremium: premiumPaid,
+      trailingActive: false,
+      trailingStopPremium: 0,
+      underlyingEntryPrice:
+        Number.isFinite(params.spot) && params.spot > 0 ? params.spot : 0,
+      openedAt: Date.now(),
+      signalId: params.signalId ?? randomUUID(),
+      signalType: 'relative_value',
+      mode,
+      // TRA-613 — the defined-risk combo payload (totals scaled by contracts).
+      legs,
+      spreadStrategy: params.strategy,
+      netUsd: r2(params.netUsd * contracts),
+      maxLossUsd: r2(totalRisk),
+      maxProfitUsd: r2(params.maxProfitUsd * contracts),
+      breakevens: params.breakevens,
+      ...(this.tradierEnv ? { tradierEnv: this.tradierEnv } : {}),
+    };
+
+    this.openOptions.set(position.id, position);
+    return position;
+  }
+
   /** TRA-231 — see {@link openOptionFromCandidate} for the `mode` stamp rationale. */
   openOption(signal: TradeSignal, underlyingPrice: number, mode: AccountMode = 'demo'): OptionPosition | null {
     this.resetDayIfNeeded();
@@ -1100,6 +1248,13 @@ export class PaperOptionsAccount {
 
     for (const [id, opt] of this.openOptions) {
       if (mode !== undefined && (opt.mode ?? 'demo') !== mode) continue;
+      // TRA-613 — defined-risk MULTI-LEG spread combos have no single-contract
+      // mark to drive the per-leg SL / TP1 / trailing schedule, and their
+      // downside is already capped at entry (max-loss reserved from cash). They
+      // are held to the user's manual close / expiry, so the per-tick exit
+      // engine skips them entirely rather than synthesising a single-leg mark
+      // that would misprice the structure.
+      if (opt.legs && opt.legs.length > 1) continue;
       const isImported = opt.importedFromTradier === true;
       if (isImported) {
         // TRA-361 — imports flow through SL/TP1/trail when auto-management is

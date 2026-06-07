@@ -166,6 +166,16 @@ describe('buildOptionsIdeasFeed', () => {
     const intent = intents.get(idea.id)!;
     expect(intent.optionSymbol).toBe('MSFT260717P00420000');
     expect(intent.spot).toBe(430);
+    // TRA-613 — the intent also carries the FULL modeled structure so
+    // paper-enter can open the multi-leg defined-risk spread (not just the
+    // anchor leg). The intent legs/payoff mirror the modeled idea exactly.
+    expect(intent.strategy).toBe('bull_put_spread');
+    expect(intent.legs).toEqual(idea.legs);
+    expect(intent.legs.length).toBe(2);
+    expect(intent.netUsd).toBe(idea.netUsd);
+    expect(intent.maxLossUsd).toBe(idea.maxLossUsd);
+    expect(intent.maxProfitUsd).toBe(idea.maxProfitUsd);
+    expect(intent.breakevens).toEqual(idea.breakevens);
   });
 
   it('drops ideas whose symbol has no anchor candidate', () => {

@@ -3228,3 +3228,60 @@ describe('SignalEngine — Trading Agents decision-path switch (TRA-544)', () =>
     expect(engine.isDeterministicAutoTradingEnabled()).toBe(true);
   });
 });
+
+describe('SignalEngine.enterPaperOptionsIdea — single vs multi-leg routing (TRA-613)', () => {
+  // Anchor contract ~31 DTE from the pinned Tuesday so the C3 entry-DTE floor
+  // passes on both branches.
+  const baseIntent = {
+    ticker: 'AAPL',
+    optionSymbol: 'AAPL240705P00095000',
+    optionType: 'put' as const,
+    strike: 95,
+    expiration: '2024-07-05',
+    mark: 1.5,
+    delta: -0.3,
+    spot: 100,
+  };
+
+  function demoEngine(): SignalEngine {
+    // Default settings → demo mode, sandbox env. enterPaperOptionsIdea opens on
+    // the sandbox bucket in demo mode, which getState() (demo) surfaces.
+    return new SignalEngine({ ...DEFAULT_ACCOUNT_SETTINGS, mode: 'demo', liveTradierEnvOptions: 'sandbox' });
+  }
+
+  it('routes a multi-leg idea to a single defined-risk spread combo position', () => {
+    const engine = demoEngine();
+    const pos = engine.enterPaperOptionsIdea({
+      ...baseIntent,
+      strategy: 'bull_put_spread',
+      legs: [
+        { action: 'sell', optionType: 'put', strike: 95, expiration: '2024-07-05' },
+        { action: 'buy', optionType: 'put', strike: 90, expiration: '2024-07-05' },
+      ],
+      netUsd: 180,
+      maxLossUsd: 320,
+      maxProfitUsd: 180,
+      breakevens: [93.2],
+    });
+
+    expect(pos).not.toBeNull();
+    expect(pos!.legs).toHaveLength(2);
+    expect(pos!.spreadStrategy).toBe('bull_put_spread');
+    expect(pos!.optionSymbol).toContain('COMBO:AAPL:bull_put_spread');
+    expect(pos!.maxLossUsd).toBe(320);
+
+    const open = engine.getState().options.openOptions;
+    expect(open).toHaveLength(1);
+    expect(open[0]!.id).toBe(pos!.id);
+  });
+
+  it('routes a single-leg idea through the long-only RV open path (anchor OCC)', () => {
+    const engine = demoEngine();
+    // No `legs` (or a 1-leg structure) ⇒ legacy single-leg long path.
+    const pos = engine.enterPaperOptionsIdea({ ...baseIntent });
+
+    expect(pos).not.toBeNull();
+    expect(pos!.optionSymbol).toBe('AAPL240705P00095000');
+    expect(pos!.legs).toBeUndefined();
+  });
+});

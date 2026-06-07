@@ -1866,6 +1866,19 @@ export interface OptionPendingExit {
   duration?: TradierOrderDuration;
 }
 
+/**
+ * TRA-613 (TRA-595 C5) — one leg of a defined-risk multi-leg options spread.
+ * Mirrors the C5 panel's idea-leg contract so a paper combo position can carry
+ * the exact structure that was surfaced and entered (bull put spread, iron
+ * condor, debit spread, …).
+ */
+export interface OptionLeg {
+  action: 'buy' | 'sell';
+  optionType: OptionType;
+  strike: number;
+  expiration: string;
+}
+
 export interface OptionPosition {
   id: string;
   symbol: string;
@@ -2005,6 +2018,35 @@ export interface OptionPosition {
    * missed a mark / legacy snapshot.
    */
   staleMarkTicks?: number;
+  /**
+   * TRA-613 (TRA-595 C5) — defined-risk MULTI-LEG spread combo. When present
+   * (length ≥ 2) this position represents an AI-Options-Ideas defined-risk
+   * structure (bull put spread, iron condor, debit spread, …) entered through
+   * the paper options account as a SINGLE combo, not a single long contract.
+   * The combo's capital-at-risk is the capped {@link maxLossUsd}: the entry
+   * debits `maxLossUsd × contracts` from paper cash (uniform across debit and
+   * credit structures — for a credit spread this is the broker buying-power
+   * hold `width − credit`, for a debit spread it is the debit) and
+   * `premiumPaid = maxLossUsd ÷ 100 ÷ contracts` carries that per-share basis so
+   * the existing P&L-on-close math treats the reserved capital as the cost
+   * basis. {@link netUsd} / {@link maxProfitUsd} / {@link breakevens} carry the
+   * entry credit/debit, capped upside, and payoff turn points for display.
+   * Combo positions are SKIPPED by the per-leg SL/TP/trailing engine
+   * ({@link checkExits}) — they are defined-risk and held to the user's manual
+   * close / expiry, so there is no single-contract mark to manage. Absent ↔
+   * single-leg position (the only structure pre-TRA-613).
+   */
+  legs?: OptionLeg[];
+  /** TRA-613 — defined-risk strategy id of the combo (e.g. 'bull_put_spread'). */
+  spreadStrategy?: string;
+  /** TRA-613 — net premium at entry, + credit / − debit, USD across all `contracts`. */
+  netUsd?: number;
+  /** TRA-613 — capped max loss (capital at risk), USD across all `contracts`. */
+  maxLossUsd?: number;
+  /** TRA-613 — capped max profit, USD across all `contracts`. */
+  maxProfitUsd?: number;
+  /** TRA-613 — payoff breakeven underlying price(s). */
+  breakevens?: number[];
 }
 
 export interface OptionsAccountState {

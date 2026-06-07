@@ -79,25 +79,41 @@ export const STRATEGY_DISPLAY: Record<DefinedRiskStrategy, string> = {
 };
 
 /**
- * What paper-enter needs to re-open the idea's primary contract on the paper
- * options account. We route the idea's anchor candidate (the real, scanner-
- * surfaced mispriced contract the research was built on) as a single long leg —
- * the only structure the paper account supports today (multi-leg paper spreads
- * are a C6 follow-up).
+ * What `POST …/paper-enter` needs to open the idea on the paper options account.
+ *
+ * TRA-613 — the intent now carries the FULL modeled defined-risk structure (the
+ * same one the panel renders), not just the anchor contract. Single-leg ideas
+ * (`long_call` / `long_put`) still route through the existing RV long-only open
+ * path off the `anchor*` fields (so they keep SL/TP/trailing + live-mark
+ * management); multi-leg ideas (bull put spread, iron condor, debit spread, …)
+ * route through the new defined-risk SPREAD combo path off `legs` / `netUsd` /
+ * `maxLossUsd` / `maxProfitUsd` / `breakevens`. The C3 order-time DTE guard
+ * applies on both paths.
  */
 export interface IdeaEntryIntent {
   ticker: string;
+  /** Anchor (scanner-surfaced) contract — drives the single-leg long open path. */
   optionSymbol: string;
   optionType: 'call' | 'put';
   strike: number;
   expiration: string;
-  /** Per-share mark used as the entry premium. */
+  /** Per-share mark used as the single-leg entry premium. */
   mark: number;
   /** Sign-adjusted Black-Scholes delta from the scanner. */
   delta: number;
   /** Underlying spot at build time (seeds the stale-mark backstop). */
   spot: number;
   strategy: DefinedRiskStrategy;
+  /** TRA-613 — the full modeled structure (≥ 2 legs ⇒ defined-risk spread combo). */
+  legs: IdeaLeg[];
+  /** TRA-613 — net premium at entry, + credit / − debit, USD per 1-lot. */
+  netUsd: number;
+  /** TRA-613 — capped max loss (capital at risk), USD per 1-lot. */
+  maxLossUsd: number;
+  /** TRA-613 — capped max profit, USD per 1-lot. */
+  maxProfitUsd: number;
+  /** TRA-613 — payoff breakeven underlying price(s). */
+  breakevens: number[];
 }
 
 // ── event badges ─────────────────────────────────────────────────────────────
@@ -435,6 +451,13 @@ export function buildOptionsIdeasFeed(args: BuildFeedArgs): BuiltFeed {
       delta: anchor.delta,
       spot: sym.spot,
       strategy: idea.strategy,
+      // TRA-613 — carry the full modeled structure so paper-enter can open the
+      // real defined-risk spread (not just the anchor leg).
+      legs: structure.legs,
+      netUsd: structure.netUsd,
+      maxLossUsd: structure.maxLossUsd,
+      maxProfitUsd: structure.maxProfitUsd,
+      breakevens: structure.breakevens,
     });
   }
 

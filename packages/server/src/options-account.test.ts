@@ -2444,3 +2444,87 @@ describe('PaperOptionsAccount.bookPartialClose (TRA-416)', () => {
     expect(acct.getState().openOptions[0].contractsRemaining).toBe(10);
   });
 });
+
+// TRA-613 (TRA-595 C5) — multi-leg defined-risk SPREAD combos. The pre-TRA-613
+// account was single-leg long only; every AI-Options-Ideas idea (bull put
+// spread, iron condor, debit spread, …) is multi-leg, so it now enters as one
+// combo row carrying the full structure + capped capital-at-risk.
+describe('PaperOptionsAccount.openDefinedRiskSpread', () => {
+  // A bull put spread (credit): short the 95 put, long the 90 put. Far enough
+  // out (~31 DTE from the pinned Tuesday) to clear the C3 entry-DTE floor.
+  const bullPutLegs = [
+    { action: 'sell' as const, optionType: 'put' as const, strike: 95, expiration: '2024-07-05' },
+    { action: 'buy' as const, optionType: 'put' as const, strike: 90, expiration: '2024-07-05' },
+  ];
+  const spreadParams = (overrides: Record<string, unknown> = {}) => ({
+    symbol: 'AAPL',
+    strategy: 'bull_put_spread',
+    legs: bullPutLegs,
+    netUsd: 180, // + credit received per lot
+    maxLossUsd: 320, // width(5) × 100 − credit(180)
+    maxProfitUsd: 180,
+    breakevens: [93.2],
+    spot: 100,
+    ...overrides,
+  });
+
+  it('opens a multi-leg combo, reserving capped max-loss from paper cash', () => {
+    // initialEquity 1_000 → demo RV budget ≈ $150 (per-ticket floor). maxLoss
+    // $320 > budget so the floor-divide is 0, but $320 ≤ cash so exactly one
+    // lot is forced. $320 reserved → $680 cash left.
+    const acct = new PaperOptionsAccount({ initialEquity: 1_000, managedAccountRatio: 0.5 });
+    const pos = acct.openDefinedRiskSpread(spreadParams());
+
+    expect(pos).not.toBeNull();
+    expect(pos!.contracts).toBe(1);
+    expect(pos!.legs).toHaveLength(2);
+    expect(pos!.spreadStrategy).toBe('bull_put_spread');
+    expect(pos!.netUsd).toBe(180);
+    expect(pos!.maxLossUsd).toBe(320);
+    expect(pos!.maxProfitUsd).toBe(180);
+    expect(pos!.breakevens).toEqual([93.2]);
+    expect(pos!.optionSymbol).toContain('COMBO:AAPL:bull_put_spread');
+    // Capital-at-risk reserved uniformly (credit netted into the hold).
+    expect(acct.getState().optionsCash).toBe(680);
+    expect(acct.getState().dailyOptionsCount).toBe(1);
+    // premiumPaid carries the per-share reserved basis for the close-path math.
+    expect(pos!.premiumPaid).toBeCloseTo(3.2, 5);
+  });
+
+  it('refuses a second identical combo (dedup by structure key)', () => {
+    const acct = new PaperOptionsAccount({ initialEquity: 1_000, managedAccountRatio: 0.5 });
+    expect(acct.openDefinedRiskSpread(spreadParams())).not.toBeNull();
+    expect(acct.openDefinedRiskSpread(spreadParams())).toBeNull();
+    // Only the first entry consumed cash / a daily slot.
+    expect(acct.getState().optionsCash).toBe(680);
+    expect(acct.getState().dailyOptionsCount).toBe(1);
+  });
+
+  it('honors the C3 entry-DTE guard (sub-floor expiration is refused)', () => {
+    const acct = new PaperOptionsAccount({ initialEquity: 1_000, managedAccountRatio: 0.5 });
+    const nearLegs = bullPutLegs.map((l) => ({ ...l, expiration: '2024-06-06' })); // 2 DTE
+    const pos = acct.openDefinedRiskSpread(spreadParams({ legs: nearLegs }));
+    expect(pos).toBeNull();
+    // Nothing consumed.
+    expect(acct.getState().optionsCash).toBe(1_000);
+    expect(acct.getState().dailyOptionsCount).toBe(0);
+  });
+
+  it('rejects malformed structures (single leg / mispriced max-loss)', () => {
+    const acct = new PaperOptionsAccount({ initialEquity: 1_000, managedAccountRatio: 0.5 });
+    expect(acct.openDefinedRiskSpread(spreadParams({ legs: [bullPutLegs[0]] }))).toBeNull();
+    expect(acct.openDefinedRiskSpread(spreadParams({ maxLossUsd: 0 }))).toBeNull();
+    expect(acct.getState().optionsCash).toBe(1_000);
+  });
+
+  it('is skipped by the per-tick exit engine (defined-risk, held to manual close)', () => {
+    const acct = new PaperOptionsAccount({ initialEquity: 1_000, managedAccountRatio: 0.5 });
+    const pos = acct.openDefinedRiskSpread(spreadParams());
+    expect(pos).not.toBeNull();
+    // A tick with a wildly adverse underlying must NOT close the combo.
+    const exited = acct.checkExits(new Map([['AAPL', 1]]), new Map(), 'demo');
+    expect(exited).toHaveLength(0);
+    expect(acct.getState().openOptions).toHaveLength(1);
+    expect(acct.getState().openOptions[0].id).toBe(pos!.id);
+  });
+});

@@ -2720,17 +2720,21 @@ export class SignalEngine {
   }
 
   /**
-   * TRA-604 (C4b) — route an accepted "AI Options Ideas" idea to the PAPER
-   * options account. The idea's anchor contract (a real, scanner-surfaced
-   * mispriced option) is opened as a single long leg via the RV open path. This
-   * is paper-only by construction — `mode: 'demo'` with no equity override means
-   * pure paper cash and NO Tradier mirror, so there is no live-capital path here
-   * (live entry stays gated behind C6). The C3 order-time DTE guard still runs
-   * inside `openOptionFromRvCandidate`, so a sub-floor-DTE idea is refused.
+   * TRA-604 (C4b) / TRA-613 (C5) — route an accepted "AI Options Ideas" idea to
+   * the PAPER options account. SINGLE-leg ideas (`long_call` / `long_put`) open
+   * the anchor contract (a real, scanner-surfaced mispriced option) as a single
+   * long leg via the RV open path, so they keep SL/TP/trailing + live-mark
+   * management. MULTI-leg ideas (bull put spread, iron condor, debit spread, …)
+   * open the whole modeled defined-risk structure as a single combo position via
+   * {@link PaperOptionsAccount.openDefinedRiskSpread}. Both paths are paper-only
+   * by construction — `mode: 'demo'` with no equity override means pure paper
+   * cash and NO Tradier mirror, so there is no live-capital path here (live entry
+   * stays gated behind C6). The C3 order-time DTE guard runs inside the account
+   * open path on both branches, so a sub-floor-DTE idea is refused.
    *
    * Returns the opened position, or `null` when entry was refused (outside the
-   * trading window, daily cap hit, a position for the same OCC already open,
-   * sub-tick mark, or the C3 DTE guard blocked it).
+   * trading window, daily cap hit, a position for the same OCC/combo already
+   * open, sub-tick mark / mispriced structure, or the C3 DTE guard blocked it).
    */
   enterPaperOptionsIdea(intent: {
     ticker: string;
@@ -2741,7 +2745,49 @@ export class SignalEngine {
     mark: number;
     delta: number;
     spot: number;
+    /** TRA-613 — present from the C5 feed; ≥ 2 legs ⇒ defined-risk spread combo. */
+    strategy?: string;
+    legs?: import('@trading-app/shared').OptionLeg[];
+    netUsd?: number;
+    maxLossUsd?: number;
+    maxProfitUsd?: number;
+    breakevens?: number[];
   }): import('@trading-app/shared').OptionPosition | null {
+    const acct = this.optionsAccounts[this.tradierEnv];
+
+    // TRA-613 — multi-leg ideas route through the defined-risk SPREAD combo path
+    // (the single-leg RV open can only ever represent one contract). All the
+    // payoff totals are modeled per 1-lot upstream by the feed builder.
+    const legs = intent.legs;
+    if (
+      legs &&
+      legs.length >= 2 &&
+      typeof intent.netUsd === 'number' &&
+      typeof intent.maxLossUsd === 'number' &&
+      typeof intent.maxProfitUsd === 'number'
+    ) {
+      const combo = acct.openDefinedRiskSpread(
+        {
+          symbol: intent.ticker,
+          strategy: intent.strategy ?? 'defined_risk_spread',
+          legs,
+          netUsd: intent.netUsd,
+          maxLossUsd: intent.maxLossUsd,
+          maxProfitUsd: intent.maxProfitUsd,
+          breakevens: intent.breakevens ?? [],
+          spot: intent.spot,
+        },
+        'demo',
+      );
+      if (combo) {
+        this.tracker?.saveEquity(
+          this.account.getState().totalEquity,
+          this.optionsAccount.getState().optionsPnl,
+        );
+      }
+      return combo;
+    }
+
     const signal: import('@trading-app/shared').RelativeValueSignal = {
       id: randomUUID(),
       symbol: intent.ticker,
@@ -2766,7 +2812,7 @@ export class SignalEngine {
       delta: intent.delta,
       reason: 'AI Options Ideas paper entry',
     };
-    const opened = this.optionsAccounts[this.tradierEnv].openOptionFromRvCandidate(
+    const opened = acct.openOptionFromRvCandidate(
       signal,
       'demo',
       undefined,
