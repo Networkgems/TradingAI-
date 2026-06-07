@@ -16,3 +16,8 @@ apps/desktop/src-tauri/gen
 # Local Yahoo-Finance candle cache for backtest sweeps (TRA-181, TRA-266)
 packages/server/.cache/
 packages/backtest/data/
+
+# Server runtime output — never commit user data, logs, or QA scratch (TRA-689)
+packages/server/data/
+packages/server/logs/
+packages/server/.qa-payload.json
