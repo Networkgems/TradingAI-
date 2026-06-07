@@ -341,39 +341,42 @@ describe('Strategy presets — TRA-325', () => {
     expect(presetAllowsStrategySymbol(p, 'bb_fade', 'BTC-USD')).toBe(false);
   });
 
-  it('TRA-345 / TRA-456 / TRA-521 — getState().activePreset surfaces the resolved preset for API verification', () => {
-    // The default engine is a DEMO engine. Since TRA-521 the demo engine runs
-    // DEMO_STRATEGY_PRESET (default `legacy_5`) deterministically — it is no
-    // longer frozen by the live `no_trade` stand-down and no longer falls
-    // through to per-user `activeStrategyPreset`. The activePreset block lets
-    // /api/crypto/state confirm the active config without Render dashboard /
-    // server-log access.
+  it('TRA-345 / TRA-456 / TRA-521 / TRA-696 — getState().activePreset surfaces the resolved preset for API verification', () => {
+    // The default engine is a DEMO engine. Since TRA-696 the demo engine runs
+    // DEMO_STRATEGY_PRESET (default `crypto_core`, the TRA-693/694 rebuild
+    // roster) deterministically — it is no longer frozen by the live `no_trade`
+    // stand-down and no longer falls through to per-user `activeStrategyPreset`.
+    // The activePreset block lets /api/crypto/state confirm the active config
+    // without Render dashboard / server-log access.
     const engine = new CryptoSignalEngine();
     const ap = engine.getState().activePreset;
-    expect(ap.id).toBe('legacy_5');
+    expect(ap.id).toBe('crypto_core');
     // envValue surfaces the LIVE_STRATEGY_PRESET var; unset under test.
     expect(ap.envValue).toBe('');
-    expect([...ap.enabledStrategies]).toEqual(['bb_fade', 'swing_trade', 'momentum', 'mean_reversion', 'breakout_vol']);
+    expect([...ap.enabledStrategies]).toEqual(['dca', 'swing_trade']);
     expect(ap.symbolFilter).toBeNull();
-    expect(ap.strategyUniverse).toBeUndefined();
+    expect(ap.strategyUniverse).toEqual({
+      dca: ['BTC-USD', 'ETH-USD', 'SOL-USD'],
+      swing_trade: ['BTC-USD', 'ETH-USD', 'SOL-USD'],
+    });
   });
 
-  it('TRA-456 / TRA-521 — demo runs the demo-default preset deterministically; live honours per-user preset', async () => {
+  it('TRA-456 / TRA-521 / TRA-696 — demo runs the demo-default preset deterministically; live honours per-user preset', async () => {
     // TRA-456 CTO decision: the `LIVE_STRATEGY_PRESET` stand-down is a
     // capital-allocation control scoped to the LIVE engine. The demo engine
     // trades paper money with zero real-capital exposure, so it runs the
-    // DEMO_STRATEGY_PRESET default (`legacy_5` since TRA-521) deterministically
+    // DEMO_STRATEGY_PRESET default (`crypto_core` since TRA-696) deterministically
     // and must NOT fall through to per-user `activeStrategyPreset` — the board
     // needs one consistent roster on the demo dashboard.
     const engine = new CryptoSignalEngine();
 
     // Demo: even with the per-user preset explicitly set to no_trade, the demo
-    // engine ignores it and resolves its own default (legacy_5).
+    // engine ignores it and resolves its own default (crypto_core).
     await engine.applySettings(fourBucketCryptoSettings({
       mode: 'demo',
       activeStrategyPreset: 'no_trade',
     }));
-    expect(engine.getState().activePreset.id).toBe('legacy_5');
+    expect(engine.getState().activePreset.id).toBe('crypto_core');
 
     // Live: with no LIVE_STRATEGY_PRESET env set under test, the live engine
     // falls through to the user's saved activeStrategyPreset (no env override).
@@ -686,7 +689,7 @@ describe('CryptoSignalEngine — TRA-346 four-bucket sub-account wiring (TRA-349
 //   (1) `runDemoTick` runs the demo paper account's `checkExits` against the
 //       passed prices even while `this.mode === 'live'`, so a TP-hit
 //       paper-position closes and lands on the demo history list.
-//   (2) `resolvePreset('demo')` resolves to `legacy_5` (the TRA-521 demo
+//   (2) `resolvePreset('demo')` resolves to `crypto_core` (the TRA-696 demo
 //       default) and `resolvePreset('live')` to the live-side preset (per-user
 //       fallback with no env var set), independent of `this.mode`.
 //   (3) `applyShortGates(signal, 'demo' | 'live')` reads the
@@ -763,25 +766,26 @@ describe('CryptoSignalEngine — TRA-480 parallel demo + live ticking', () => {
     expect(liveReport.allClosedPositions).toHaveLength(0);
   });
 
-  it('resolvePreset(mode) ignores this.mode — demo → legacy_5 (default), live → per-user', () => {
+  it('resolvePreset(mode) ignores this.mode — demo → crypto_core (default), live → per-user', () => {
     const engine = new CryptoSignalEngine();
     const internal = engine as unknown as CryptoSignalEnginePrivateTickInternals;
 
     // Force the engine into live mode. The demo branch's preset MUST still
-    // resolve deterministically to `legacy_5` (DEMO_PRESET_DEFAULT since
-    // TRA-521) even though `this.mode === 'live'` — that's the TRA-456 contract.
+    // resolve deterministically to `crypto_core` (DEMO_PRESET_DEFAULT since
+    // TRA-696) even though `this.mode === 'live'` — that's the TRA-456 contract.
     internal.mode = 'live';
-    expect(internal.resolvePreset('demo').id).toBe('legacy_5');
+    expect(internal.resolvePreset('demo').id).toBe('crypto_core');
 
     // With no LIVE_STRATEGY_PRESET env set (default under test) the live
     // branch falls through to the per-user `activeStrategyPreset`, which
-    // defaults to `legacy_5` when no settings are bound.
+    // defaults to `legacy_5` (DEFAULT_STRATEGY_PRESET_ID, unchanged so the live
+    // no_trade guard is unaffected) when no settings are bound.
     expect(internal.resolvePreset('live').id).toBe('legacy_5');
 
     // Sanity: same answers when this.mode='demo'. The branch's preset is a
     // function of the argument, not of the engine's current mode.
     internal.mode = 'demo';
-    expect(internal.resolvePreset('demo').id).toBe('legacy_5');
+    expect(internal.resolvePreset('demo').id).toBe('crypto_core');
     expect(internal.resolvePreset('live').id).toBe('legacy_5');
   });
 

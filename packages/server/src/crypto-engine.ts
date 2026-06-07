@@ -88,16 +88,22 @@ const FORCED_PRESET_ENV = (process.env.LIVE_STRATEGY_PRESET ?? '').trim();
  * actively trading again, so they can watch demo results before funding the
  * live Coinbase account. The previous default `tra405_validated` only fires
  * bb_fade on BTC-USD + SOL-USD, which is why the demo sat idle for ~a month.
- * The default is now `legacy_5` — all five strategies across the full Coinbase
- * watchlist — so the demo generates real, visible activity. This is paper money:
- * it honestly exercises the whole roster (which TRA-523's fee-aware backtest
- * found unprofitable net of fees), so the board can judge live-readiness from
- * actual demo P&L. Nothing reaches LIVE without passing the TRA-532 promotion
- * gate, regardless of what the demo runs. The demo engine never falls through
- * to per-user `activeStrategyPreset`; see {@link resolvePreset}.
+ * TRA-521 then broadened the default to `legacy_5` (all five legacy strategies)
+ * for visible activity.
+ *
+ * TRA-696 / TRA-693 — the legacy roster failed the OOS robustness gate (TRA-432)
+ * and is being retired (TRA-697). The demo default is now `crypto_core` — the
+ * board's rebuild roster (DCA + disciplined swing on BTC/ETH/SOL, wired in
+ * TRA-694) — so the demo dashboard runs the NEW strategies the board approved,
+ * not the benched legacy ones. This is the forward paper leg QuantTrader's
+ * TRA-695 verdict recommended before any live cutover. It remains paper money:
+ * nothing reaches LIVE without passing the TRA-532 promotion gate, and the LIVE
+ * engine stays pinned to `no_trade` via `LIVE_STRATEGY_PRESET` (board-gated
+ * under TRA-693), regardless of what the demo runs. The demo engine never falls
+ * through to per-user `activeStrategyPreset`; see {@link resolvePreset}.
  */
 const DEMO_PRESET_ENV = (process.env.DEMO_STRATEGY_PRESET ?? '').trim();
-const DEMO_PRESET_DEFAULT: StrategyPresetId = 'legacy_5';
+const DEMO_PRESET_DEFAULT: StrategyPresetId = 'crypto_core';
 
 /**
  * TRA-341 — process-wide override for the §6 single-symbol short cap on the
