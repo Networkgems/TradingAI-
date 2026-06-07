@@ -1,4 +1,4 @@
-import { describe, it, expect, vi, beforeEach } from 'vitest';
+import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import {
   DEFAULT_ACCOUNT_SETTINGS,
   DEFAULT_STRATEGY_PRESET_ID,
@@ -21,6 +21,10 @@ import type { TradeSignal } from '@trading-app/shared';
 
 import { CryptoSignalEngine, resolveLiveSingleSymbolShortCap, mergeCandles } from './crypto-engine.js';
 import type { Candle } from '@trading-app/shared';
+import {
+  _seedCoinbaseProductCatalogForTests,
+  _resetCoinbaseProductCatalogForTests,
+} from './crypto-feed.js';
 import { CryptoLiveAccount } from './crypto-live-account.js';
 import {
   CryptoPaperAccount,
@@ -280,13 +284,15 @@ describe('Strategy presets — TRA-325', () => {
   });
 
   // TRA-698 — the go-forward roster: DCA only on the OOS-survivable majors.
-  it('crypto_core enables only dca and gates it to BTC+SOL via strategyUniverse', () => {
+  it('TRA-693 — crypto_core enables only dca across the full Coinbase universe (no per-symbol cap)', () => {
     const p = STRATEGY_PRESETS.crypto_core;
     expect(p.enabledStrategies).toEqual(['dca']);
-    // No preset-wide filter — the per-strategy universe carries the gate so DCA
-    // accumulates only on the liquid majors that survived the TRA-695 OOS test.
+    // TRA-693 board directive widened crypto_core from the TRA-698 DCA-on-
+    // {BTC,SOL} cap to DCA across the FULL Coinbase-tradable universe: no
+    // preset-wide filter and no per-strategy universe — breadth is governed by
+    // the engine's active-symbol set (the Coinbase product catalog).
     expect(p.symbolFilter).toBeNull();
-    expect(p.strategyUniverse?.dca).toEqual(['BTC-USD', 'SOL-USD']);
+    expect(p.strategyUniverse).toBeUndefined();
     // The benched legacy strategies are absent from the roster.
     expect(p.enabledStrategies).not.toContain('swing_trade');
     expect(p.enabledStrategies).not.toContain('bb_fade');
@@ -296,13 +302,16 @@ describe('Strategy presets — TRA-325', () => {
     expect(resolveStrategyPreset('crypto_core').id).toBe('crypto_core');
   });
 
-  // TRA-421 / TRA-698 — presetAllowsStrategySymbol: the symbolFilter + strategyUniverse gate.
-  it('presetAllowsStrategySymbol gates dca to BTC+SOL under crypto_core', () => {
+  // TRA-421 / TRA-698 / TRA-693 — presetAllowsStrategySymbol gate.
+  it('TRA-693 — presetAllowsStrategySymbol admits dca on every symbol under crypto_core', () => {
     const p = STRATEGY_PRESETS.crypto_core;
+    // No symbolFilter and no per-strategy universe → DCA is admitted on every
+    // symbol the engine surfaces (the full Coinbase universe), not just BTC/SOL.
     expect(presetAllowsStrategySymbol(p, 'dca', 'BTC-USD')).toBe(true);
     expect(presetAllowsStrategySymbol(p, 'dca', 'SOL-USD')).toBe(true);
-    expect(presetAllowsStrategySymbol(p, 'dca', 'DOGE-USD')).toBe(false);
-    expect(presetAllowsStrategySymbol(p, 'dca', 'ETH-USD')).toBe(false);
+    expect(presetAllowsStrategySymbol(p, 'dca', 'DOGE-USD')).toBe(true);
+    expect(presetAllowsStrategySymbol(p, 'dca', 'ETH-USD')).toBe(true);
+    expect(presetAllowsStrategySymbol(p, 'dca', 'WIF-USD')).toBe(true);
   });
 
   it('presetAllowsStrategySymbol leaves an unmapped strategy gated by symbolFilter only', () => {
@@ -332,13 +341,16 @@ describe('Strategy presets — TRA-325', () => {
     expect(presetAllowsStrategySymbol(p, 'bb_fade', 'BTC-USD')).toBe(false);
   });
 
-  it('TRA-345 / TRA-456 / TRA-521 / TRA-696 / TRA-698 — getState().activePreset surfaces the resolved preset for API verification', () => {
+  it('TRA-345 / TRA-456 / TRA-521 / TRA-696 / TRA-698 / TRA-693 — getState().activePreset surfaces the resolved preset for API verification', () => {
     // The default engine is a DEMO engine. Since TRA-696 the demo engine runs
     // DEMO_STRATEGY_PRESET (default `crypto_core`, the TRA-693 rebuild roster)
     // deterministically — it is no longer frozen by the live `no_trade`
     // stand-down and no longer falls through to per-user `activeStrategyPreset`.
-    // TRA-698 narrowed crypto_core to DCA-only on {BTC-USD, SOL-USD} after the
-    // TRA-695 NO-GO on swing (all 6 symbols) and ETH/ADA/DOGE/LINK.
+    // TRA-693 (board directive) widened crypto_core from the TRA-698 DCA-only
+    // {BTC-USD, SOL-USD} cap to DCA across the FULL Coinbase-tradable USD
+    // universe — so there is no longer a per-strategy `strategyUniverse` cap;
+    // breadth is governed by the engine's active-symbol universe (the Coinbase
+    // product catalog), not the preset.
     // The activePreset block lets /api/crypto/state confirm the active config
     // without Render dashboard / server-log access.
     const engine = new CryptoSignalEngine();
@@ -348,8 +360,47 @@ describe('Strategy presets — TRA-325', () => {
     expect(ap.envValue).toBe('');
     expect([...ap.enabledStrategies]).toEqual(['dca']);
     expect(ap.symbolFilter).toBeNull();
-    expect(ap.strategyUniverse).toEqual({
-      dca: ['BTC-USD', 'SOL-USD'],
+    // No per-strategy universe cap → DCA runs on every active symbol.
+    expect(ap.strategyUniverse).toBeUndefined();
+  });
+
+  // TRA-693 — board directive: the crypto roster must trade the FULL
+  // Coinbase-tradable USD universe, not just the static CRYPTO_WATCHLIST. The
+  // engine's active-symbol set merges in every online, trading-enabled `*-USD`
+  // product from the Coinbase catalog (deduped, watchlist-led). On a cold
+  // catalog it falls back to the static watchlist so a /products outage can't
+  // empty the universe.
+  describe('TRA-693 — getActiveSymbols merges the full Coinbase-tradable universe', () => {
+    beforeEach(() => {
+      _resetCoinbaseProductCatalogForTests();
+    });
+    afterEach(() => {
+      _resetCoinbaseProductCatalogForTests();
+    });
+
+    it('falls back to the static watchlist when the Coinbase catalog is cold', () => {
+      const engine = new CryptoSignalEngine();
+      const syms = engine.getActiveSymbols();
+      expect(syms).toContain('BTC-USD');
+      // No catalog-only symbol should appear yet.
+      expect(syms).not.toContain('WIF-USD');
+    });
+
+    it('adds Coinbase catalog symbols beyond the static watchlist once loaded', () => {
+      _seedCoinbaseProductCatalogForTests([
+        { id: 'BTC-USD', online: true, tradingDisabled: false }, // already in watchlist
+        { id: 'WIF-USD', online: true, tradingDisabled: false }, // catalog-only
+        { id: 'PEPE-USD', online: true, tradingDisabled: false },// catalog-only
+        { id: 'DEAD-USD', online: false, tradingDisabled: false },// offline → excluded
+      ]);
+      const engine = new CryptoSignalEngine();
+      const syms = engine.getActiveSymbols();
+      expect(syms).toContain('WIF-USD');
+      expect(syms).toContain('PEPE-USD');
+      expect(syms).not.toContain('DEAD-USD');
+      // Curated majors still lead and there are no duplicates.
+      expect(syms[0]).toBe('BTC-USD');
+      expect(new Set(syms).size).toBe(syms.length);
     });
   });
 

@@ -152,6 +152,29 @@ export function isCoinbaseListed(symbol: string): boolean | null {
   return entry.online && !entry.tradingDisabled;
 }
 
+/**
+ * TRA-693 — every online, trading-enabled Coinbase `*-USD` spot product from
+ * the catalog populated by {@link refreshCoinbaseProductCatalog}. This is the
+ * "trade all Coinbase-tradable cryptos" universe the board asked the crypto
+ * roster to cover (≈395 pairs) instead of the static 44-symbol watchlist.
+ *
+ * Returns `[]` until the catalog has been fetched at least once, so a cold-start
+ * caller falls back to its static watchlist rather than trading an empty set.
+ * Perp / non-USD quote products (`*-PERP-INTX`, `*-USDC`, `*-EUR`, …) are
+ * excluded by the `-USD` suffix filter; the denylist gate is applied by the
+ * engine via {@link isCryptoSymbolBlocked}.
+ */
+export function listTradableCoinbaseUsdSymbols(): string[] {
+  if (!coinbaseProductCatalog) return [];
+  const out: string[] = [];
+  for (const [id, entry] of coinbaseProductCatalog) {
+    if (!id.endsWith('-USD')) continue;
+    if (!entry.online || entry.tradingDisabled) continue;
+    out.push(id);
+  }
+  return out;
+}
+
 /** Test hook: clear the catalog so tests can simulate cold-start states. */
 export function _resetCoinbaseProductCatalogForTests(): void {
   coinbaseProductCatalog = null;
@@ -769,24 +792,29 @@ export async function fetchCryptoQuotes(
   const results = new Map<string, CryptoQuote>();
   if (symbols.length === 0) return results;
 
-  // TRA-300 — Coinbase Exchange is the primary quote source for crypto. Same
-  // venue as the live trade account, so signal/quote prices match execution
-  // prices, and the public `/products/{id}/stats` endpoint needs no API key.
-  // This removes Yahoo's per-IP rate-limiter as a single point of failure for
-  // the watchlist (it would mark every symbol "Quote unavailable" the moment
-  // Yahoo started 429-ing the Render egress).
-  const cbResults = await fetchCoinbaseStatsQuotes(symbols);
-  for (const [sym, quote] of cbResults) results.set(sym, quote);
-
-  // TRA-437 — keyless Coinbase Advanced Trade backstop on a different host.
-  // The Exchange host above can be rate-limited / unreachable for the Render
-  // egress IP independently of the Advanced Trade host; this second keyless
-  // venue keeps the cascade alive for demo crypto users when Yahoo's breaker
-  // is open and CMC has no API key. One batched request covers the residual.
-  const needCoinbaseAt = symbols.filter(s => !results.has(s));
-  if (needCoinbaseAt.length > 0) {
-    const atResults = await fetchCoinbaseAdvancedTradeQuotes(needCoinbaseAt);
+  // TRA-693 — batched Coinbase Advanced Trade FIRST. The `/market/products`
+  // endpoint prices every requested `product_id` in ONE request, so the whole
+  // ~395-symbol Coinbase universe is covered in a handful of chunked calls per
+  // tick instead of 395 per-symbol `/stats` round-trips saturating the shared
+  // 10 req/s pacer. Same venue (`source: 'coinbase'`) as `/stats`, so quote
+  // prices still match live execution prices and position `quoteSource` tags
+  // are unchanged. Chunked so the query string stays well within URL limits.
+  const AT_QUOTE_BATCH = 100;
+  for (let i = 0; i < symbols.length; i += AT_QUOTE_BATCH) {
+    const slice = symbols.slice(i, i + AT_QUOTE_BATCH);
+    const atResults = await fetchCoinbaseAdvancedTradeQuotes(slice);
     for (const [sym, quote] of atResults) results.set(sym, quote);
+  }
+
+  // TRA-300 — per-symbol Coinbase Exchange `/products/{id}/stats` fills any
+  // residual the batched Advanced Trade call didn't price (e.g. a symbol listed
+  // on Exchange but momentarily absent from the Advanced Trade market feed).
+  // Public, keyless, same 10 req/s pacer; only the (usually small) residual set
+  // hits it, so this no longer scales with the full universe.
+  const needStats = symbols.filter(s => !results.has(s));
+  if (needStats.length > 0) {
+    const cbResults = await fetchCoinbaseStatsQuotes(needStats);
+    for (const [sym, quote] of cbResults) results.set(sym, quote);
   }
 
   // Yahoo backstops symbols Coinbase doesn't list (e.g. BNB-USD, VET-USD,

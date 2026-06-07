@@ -36,6 +36,7 @@ import {
   fetchCryptoNews,
   refreshCoinbaseProductCatalog,
   isCoinbaseListed,
+  listTradableCoinbaseUsdSymbols,
 } from './crypto-feed.js';
 import { isYahooBreakerOpen } from './yahoo-feed.js';
 import { evaluateFeedFreshness } from './feed-freshness.js';
@@ -207,6 +208,16 @@ export class CryptoSignalEngine {
   private symbolState: Map<string, CryptoEngineState['symbols'][number]> = new Map();
   private candleCache: Map<string, Candle[]> = new Map();
   private dailyCandleCache: Map<string, Candle[]> = new Map();
+  /**
+   * TRA-693 — wall-clock timestamp of the last *daily-bar fetch attempt* per
+   * symbol. The prior cadence guard compared `Date.now()` to the last daily
+   * *bar's* timestamp (today's 00:00 UTC open), which goes stale after 01:00
+   * UTC and made the engine refetch 260 daily bars for every symbol on every
+   * tick — the Coinbase 429 storm that starved signal generation. Gating on
+   * actual fetch time keeps daily refresh to ≤1/hour/symbol, so the full
+   * ~395-symbol Coinbase universe stays well inside the public rate limit.
+   */
+  private dailyFetchAt: Map<string, number> = new Map();
   /**
    * TRA-423 — portfolio correlation / concentration cap (TRA-411 spec §6).
    * Enforced on long (BUY) entries before `openPosition` in both the demo and
@@ -700,9 +711,46 @@ export class CryptoSignalEngine {
     // or new positions even if a stale client added them previously.
     const base = (CRYPTO_WATCHLIST as readonly string[])
       .filter(s => !this.hiddenSymbols.has(s) && !isCryptoSymbolBlocked(s));
+    // TRA-693 — board directive: trade the FULL Coinbase-tradable USD universe,
+    // not just the static 44-symbol watchlist. Merge in every online Coinbase
+    // `*-USD` product once the catalog has loaded (it's empty on a cold start,
+    // so we fall back to `base` until the first `refreshCoinbaseProductCatalog`).
+    // Hidden + denylist filters still apply; de-dup preserves insertion order so
+    // the curated majors lead the watchlist.
+    const coinbaseUniverse = listTradableCoinbaseUsdSymbols()
+      .filter(s => !this.hiddenSymbols.has(s) && !isCryptoSymbolBlocked(s));
     const dyn = Array.from(this.dynamicSymbols)
-      .filter(s => !base.includes(s) && !isCryptoSymbolBlocked(s));
-    return [...base, ...dyn];
+      .filter(s => !isCryptoSymbolBlocked(s));
+    const seen = new Set<string>();
+    const out: string[] = [];
+    for (const s of [...base, ...coinbaseUniverse, ...dyn]) {
+      if (seen.has(s)) continue;
+      seen.add(s);
+      out.push(s);
+    }
+    return out;
+  }
+
+  // TRA-693 — strategies that read minute (intraday) bars. Daily-only strategies
+  // (`dca`, `swing_trade`) are deliberately absent: under a preset that enables
+  // only those, the per-tick minute/4H Coinbase fetch is skipped entirely.
+  private static readonly INTRADAY_STRATEGIES: readonly CryptoStrategyType[] = [
+    'bb_fade', 'momentum', 'mean_reversion', 'breakout_vol',
+  ];
+
+  /**
+   * TRA-693 — does this tick need minute/4H bars? True iff the demo preset
+   * (always evaluated) or, in live mode, the live preset enables any intraday
+   * strategy. A DCA-only / swing-only / no_trade preset returns false, so the
+   * engine issues zero minute-bar calls and the daily feed scales to the full
+   * Coinbase universe without tripping the public rate limit.
+   */
+  private tickNeedsIntradayBars(): boolean {
+    const needs = (p: StrategyPreset): boolean =>
+      p.enabledStrategies.some(s => CryptoSignalEngine.INTRADAY_STRATEGIES.includes(s));
+    if (needs(this.resolvePreset('demo'))) return true;
+    if (this.mode === 'live' && this.liveAccount && needs(this.resolvePreset('live'))) return true;
+    return false;
   }
 
   addSymbol(symbol: string): void {
@@ -1048,21 +1096,47 @@ export class CryptoSignalEngine {
     // each branch ran its own refresh in isolation; now that both branches
     // can run on the same tick we share the work to keep our Coinbase API
     // budget unchanged when a user is in live mode.
+    //
+    // TRA-693 — minute & 4H bars are ONLY consumed by intraday strategies
+    // (bb_fade / momentum / mean_reversion / breakout_vol; 4H is the perp-short
+    // warmup). Under a daily-only preset like `crypto_core` (DCA) nothing reads
+    // them, so fetching them every tick for the full ~395-symbol universe is
+    // pure rate-limit waste — exactly the 429 storm that produced "no signals".
+    // Skip them when no enabled strategy (demo or, in live mode, live) needs
+    // intraday bars. Daily bars (DCA / swing) always refresh, but on their own
+    // ≤1/h-per-symbol cadence (see `refreshDailyCandles`).
+    const needsIntraday = this.tickNeedsIntradayBars();
+    // TRA-693 — daily-bar warmup is staggered across ticks. At full Coinbase
+    // breadth (~395 symbols) a cold-start cache means every symbol is "due" at
+    // once; fetching all of them in one tick bursts Coinbase's candle endpoint
+    // past its limit (429 storm) AND starves the shared quote limiter. So we
+    // only fetch the daily bars of up to DAILY_REFRESH_PER_TICK *due* symbols
+    // per tick (least-recently-fetched first). Cold start warms the full
+    // universe over a couple of minutes; steady state is ≤1 fetch/h/symbol, so
+    // the per-tick due-set is normally tiny.
+    const DAILY_REFRESH_PER_TICK = 16;
+    const dailyHourMs = 60 * 60 * 1000;
+    const nowForDaily = Date.now();
+    const dueDaily = activeSymbols
+      .filter(s => nowForDaily - (this.dailyFetchAt.get(s) ?? 0) >= dailyHourMs)
+      .sort((a, b) => (this.dailyFetchAt.get(a) ?? 0) - (this.dailyFetchAt.get(b) ?? 0))
+      .slice(0, DAILY_REFRESH_PER_TICK);
+
     const CANDLE_BATCH = 5;
-    for (let i = 0; i < activeSymbols.length; i += CANDLE_BATCH) {
-      await Promise.all(
-        activeSymbols.slice(i, i + CANDLE_BATCH).map(sym => this.refreshCandles(sym)),
-      );
-      await Promise.all(
-        activeSymbols.slice(i, i + CANDLE_BATCH).map(sym => this.refreshDailyCandles(sym)),
-      );
-      // TRA-267 — 4H refresh runs alongside daily but `refresh4hCandles`
-      // early-exits on non-perp-short symbols, so only the 5-symbol Phase-1
-      // shorts universe actually hits Coinbase. No long-side consumer reads
-      // from `_4hCandleCache`, so the long path stays byte-identical.
-      await Promise.all(
-        activeSymbols.slice(i, i + CANDLE_BATCH).map(sym => this.refresh4hCandles(sym)),
-      );
+    // Minute / 4H bars (intraday strategies only) still sweep the full active
+    // set each tick — but only when an intraday strategy is enabled.
+    if (needsIntraday) {
+      for (let i = 0; i < activeSymbols.length; i += CANDLE_BATCH) {
+        const slice = activeSymbols.slice(i, i + CANDLE_BATCH);
+        await Promise.all(slice.map(sym => this.refreshCandles(sym)));
+        // TRA-267 — 4H refresh early-exits on non-perp-short symbols, so only
+        // the small Phase-1 shorts universe actually hits Coinbase.
+        await Promise.all(slice.map(sym => this.refresh4hCandles(sym)));
+      }
+    }
+    // Daily bars (DCA / swing): bounded, paced warmup.
+    for (let i = 0; i < dueDaily.length; i += CANDLE_BATCH) {
+      await Promise.all(dueDaily.slice(i, i + CANDLE_BATCH).map(sym => this.refreshDailyCandles(sym)));
     }
 
     // TRA-418 — data-feed freshness gate. Run after the candle refresh above so
@@ -1512,14 +1586,20 @@ export class CryptoSignalEngine {
   }
 
   private async refreshDailyCandles(symbol: string): Promise<void> {
-    // Only refresh once per hour to avoid redundant API calls — daily bars change once per day
-    const cached = this.dailyCandleCache.get(symbol);
-    if (cached && cached.length > 0) {
-      const lastBar = cached[cached.length - 1];
-      const hourMs = 60 * 60 * 1000;
-      if (Date.now() - lastBar.timestamp < hourMs) return;
-    }
+    // TRA-693 — gate on the last *fetch* time, not the last bar's timestamp.
+    // A daily bar's `timestamp` is today's 00:00 UTC open, so the old
+    // `Date.now() - lastBar.timestamp < 1h` guard went false after 01:00 UTC
+    // and refetched 260 bars for every symbol on every tick — the Coinbase 429
+    // storm behind "no signals". Daily bars change once per day, so ≤1 fetch/h
+    // per symbol is plenty and lets the full Coinbase universe stay paced.
+    const hourMs = 60 * 60 * 1000;
+    const lastFetch = this.dailyFetchAt.get(symbol) ?? 0;
+    if (Date.now() - lastFetch < hourMs) return;
     const bars = await fetchCryptoDailyBars(symbol, 260);
+    // On success gate the next fetch a full hour out; on an empty/rate-limited
+    // result back off only ~5 min so a transient 429 retries soon instead of
+    // leaving the symbol bar-less (and DCA-silent) for a whole hour.
+    this.dailyFetchAt.set(symbol, bars.length > 0 ? Date.now() : Date.now() - (hourMs - 5 * 60 * 1000));
     // TRA-593 / TRA-699 — merge so a rate-limited partial daily fetch can't
     // drop the DCA strategy's 200-day-EMA history below threshold and silence it.
     if (bars.length > 0) {

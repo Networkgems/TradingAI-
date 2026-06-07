@@ -548,14 +548,15 @@ export const STRATEGY_PRESETS: Readonly<Record<StrategyPresetId, StrategyPreset>
   // and global kill-switch.
   crypto_core: {
     id: 'crypto_core',
-    displayName: 'Crypto Core — DCA only (BTC/SOL forward paper)',
+    displayName: 'Crypto Core — DCA across all Coinbase-tradable cryptos',
     description:
-      'TRA-698 go-forward roster: dollar-cost-averaging accumulation (long-only, trend-gated, cadence-paced) only, scoped to the OOS-survivable liquid majors BTC-USD / SOL-USD. DCA is robust by construction (no per-trade cost edge required), the failure mode that benched the legacy roster. Disciplined swing was dropped after TRA-695 returned NO-GO on all 6 symbols. Demo/paper-only forward leg under the TRA-526 2% cap + kill-switch; LIVE stays no_trade until the forward leg proves out and the board re-approves under TRA-693.',
+      'TRA-693 board directive: dollar-cost-averaging accumulation (long-only, trend-gated, cadence-paced) across the FULL Coinbase-tradable USD universe (≈395 pairs), not just BTC/SOL. DCA is robust by construction (no per-trade cost edge required), the failure mode that benched the legacy roster, and the trend gate (price > 200-day EMA) keeps entries to assets in an established uptrend. The engine sources the live universe from the Coinbase product catalog; minute-bar fetching is skipped under this DCA-only preset so the daily-bar feed stays inside Coinbase rate limits at full breadth. Demo/paper under the TRA-526 2% cap + kill-switch; LIVE stays no_trade until the forward leg proves out and the board re-approves real-money crypto via the TRA-532 promotion gate.',
     enabledStrategies: ['dca'] as const,
+    // TRA-693 — no per-strategy universe cap: DCA is evaluated on every active
+    // (Coinbase-tradable, non-denylisted) symbol the engine resolves. symbolFilter
+    // stays null so the preset-wide gate is open and breadth is governed by the
+    // engine's active-symbol universe (sourced from the Coinbase product catalog).
     symbolFilter: null,
-    strategyUniverse: {
-      dca: ['BTC-USD', 'SOL-USD'] as const,
-    },
   },
 };
 

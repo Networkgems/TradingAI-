@@ -1,6 +1,7 @@
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import {
   isCoinbaseListed,
+  listTradableCoinbaseUsdSymbols,
   fetchCoinbaseAdvancedTradeQuotes,
   fetchCoinbaseAdvancedTradeCandles,
   _resetCoinbaseProductCatalogForTests,
@@ -51,6 +52,35 @@ describe('isCoinbaseListed — Coinbase product allowlist gate (TRA-338)', () =>
       { id: 'BAR-USD', online: true, tradingDisabled: true },
     ]);
     expect(isCoinbaseListed('BAR-USD')).toBe(false);
+  });
+});
+
+// TRA-693 — `listTradableCoinbaseUsdSymbols` is the "trade all Coinbase-tradable
+// cryptos" universe (board directive). It feeds the engine's active-symbol set
+// so the DCA roster covers the full ~395-pair Coinbase USD universe instead of a
+// static watchlist. Same catalog + seed hooks as the gate tests above.
+describe('listTradableCoinbaseUsdSymbols — full Coinbase USD universe (TRA-693)', () => {
+  beforeEach(() => {
+    _resetCoinbaseProductCatalogForTests();
+  });
+
+  it('returns an empty list on a cold catalog so callers fall back to their static watchlist', () => {
+    expect(listTradableCoinbaseUsdSymbols()).toEqual([]);
+  });
+
+  it('returns only online, trading-enabled *-USD spot products', () => {
+    _seedCoinbaseProductCatalogForTests([
+      { id: 'BTC-USD', online: true, tradingDisabled: false },
+      { id: 'SOL-USD', online: true, tradingDisabled: false },
+      { id: 'WIF-USD', online: true, tradingDisabled: false },
+      { id: 'OFFLINE-USD', online: false, tradingDisabled: false }, // delisted/maintenance
+      { id: 'HALTED-USD', online: true, tradingDisabled: true },    // trading suspended
+      { id: 'BTC-USDC', online: true, tradingDisabled: false },     // non-USD quote
+      { id: 'ETH-EUR', online: true, tradingDisabled: false },      // non-USD quote
+      { id: 'BTC-PERP-INTX', online: true, tradingDisabled: false },// perp, not spot USD
+    ]);
+    const out = listTradableCoinbaseUsdSymbols().sort();
+    expect(out).toEqual(['BTC-USD', 'SOL-USD', 'WIF-USD']);
   });
 });
 
