@@ -1,0 +1,1608 @@
+{
+  "generatedAt": "2026-06-07T14:23:21.197Z",
+  "dataset": "coinbase-exchange 4H, on-disk cache (TRA-405 3.05y window)",
+  "isWindow": {
+    "start": "2023-05-01T00:00:00.000Z",
+    "end": "2024-12-31T23:59:59.999Z"
+  },
+  "oosWindowStart": "2025-01-01T00:00:00.000Z",
+  "initialEquity": 25000,
+  "contributionUsd": 100,
+  "costModel": "cryptoTieredCostModel (TRA-185)",
+  "coreSymbols": [
+    "BTC-USD",
+    "ETH-USD",
+    "SOL-USD"
+  ],
+  "swingShippedDefaults": [
+    {
+      "symbol": "BTC-USD",
+      "costTier": "major",
+      "is": {
+        "trades": 16,
+        "winRatePct": 25,
+        "expectancyR": -0.2637610307498289,
+        "profitFactor": 0.6231769835495468,
+        "sharpe": -0.6333787138728785,
+        "maxDdPct": 3.70945851620205,
+        "totalPnlUsd": -589.5243725413916,
+        "worstCasePnlUsd": -589.5243725413916,
+        "returnPct": -2.3580974901655662
+      },
+      "oos": {
+        "trades": 6,
+        "winRatePct": 50,
+        "expectancyR": 0.480746065599796,
+        "profitFactor": 1.8563973184384277,
+        "sharpe": 0.7023518232316557,
+        "maxDdPct": 1.9364605244027184,
+        "totalPnlUsd": 338.8237768239236,
+        "worstCasePnlUsd": 338.8237768239236,
+        "returnPct": 1.3552951072956942
+      },
+      "oosBlockBootstrap": null
+    },
+    {
+      "symbol": "ETH-USD",
+      "costTier": "major",
+      "is": {
+        "trades": 11,
+        "winRatePct": 36.36363636363637,
+        "expectancyR": 0.07407262791145051,
+        "profitFactor": 1.070251983228788,
+        "sharpe": 0.10172650689167849,
+        "maxDdPct": 1.8729016195745956,
+        "totalPnlUsd": 64.15207472481856,
+        "worstCasePnlUsd": 64.15207472481856,
+        "returnPct": 0.2566082988992743
+      },
+      "oos": {
+        "trades": 5,
+        "winRatePct": 20,
+        "expectancyR": -0.4080323176023152,
+        "profitFactor": 0.4780542107290336,
+        "sharpe": -0.5049731898644638,
+        "maxDdPct": 1.7079629437112356,
+        "totalPnlUsd": -268.7225244249596,
+        "worstCasePnlUsd": -268.7225244249596,
+        "returnPct": -1.0748900976998383
+      },
+      "oosBlockBootstrap": null
+    },
+    {
+      "symbol": "SOL-USD",
+      "costTier": "high_liq",
+      "is": {
+        "trades": 14,
+        "winRatePct": 28.57142857142857,
+        "expectancyR": -0.1731866132130346,
+        "profitFactor": 0.713020890395562,
+        "sharpe": -0.49239226733117103,
+        "maxDdPct": 3.140745644193732,
+        "totalPnlUsd": -385.95372142461633,
+        "worstCasePnlUsd": -385.95372142461633,
+        "returnPct": -1.5438148856984655
+      },
+      "oos": {
+        "trades": 5,
+        "winRatePct": 40,
+        "expectancyR": 0.15742335489834858,
+        "profitFactor": 1.1810093746159787,
+        "sharpe": 0.18559606853610194,
+        "maxDdPct": 1.1324876598981017,
+        "totalPnlUsd": 73.34307213759328,
+        "worstCasePnlUsd": 73.34307213759328,
+        "returnPct": 0.2933722885503731
+      },
+      "oosBlockBootstrap": null
+    },
+    {
+      "symbol": "ADA-USD",
+      "costTier": "small",
+      "is": {
+        "trades": 5,
+        "winRatePct": 20,
+        "expectancyR": -0.45557971265814456,
+        "profitFactor": 0.3567051778394104,
+        "sharpe": -0.7566304648989464,
+        "maxDdPct": 2.213737208552518,
+        "totalPnlUsd": -394.04897180716955,
+        "worstCasePnlUsd": -394.04897180716955,
+        "returnPct": -1.576195887228678
+      },
+      "oos": {
+        "trades": 6,
+        "winRatePct": 16.666666666666664,
+        "expectancyR": -0.5362999470468313,
+        "profitFactor": 0.3156215740575317,
+        "sharpe": -0.9564884583559371,
+        "maxDdPct": 3.2510562979853526,
+        "totalPnlUsd": -505.3198445811751,
+        "worstCasePnlUsd": -505.3198445811751,
+        "returnPct": -2.0212793783247007
+      },
+      "oosBlockBootstrap": null
+    },
+    {
+      "symbol": "DOGE-USD",
+      "costTier": "small",
+      "is": {
+        "trades": 11,
+        "winRatePct": 45.45454545454545,
+        "expectancyR": 0.2923280732775171,
+        "profitFactor": 1.2535216815039283,
+        "sharpe": 0.2780925367299247,
+        "maxDdPct": 2.9524789316267954,
+        "totalPnlUsd": 227.13584995041188,
+        "worstCasePnlUsd": 227.13584995041188,
+        "returnPct": 0.9085433998016476
+      },
+      "oos": {
+        "trades": 7,
+        "winRatePct": 14.285714285714285,
+        "expectancyR": -0.6152385854954525,
+        "profitFactor": 0.2511319894603306,
+        "sharpe": -1.445041095139941,
+        "maxDdPct": 2.752924603857231,
+        "totalPnlUsd": -688.2311509643064,
+        "worstCasePnlUsd": -688.2311509643064,
+        "returnPct": -2.7529246038572257
+      },
+      "oosBlockBootstrap": null
+    },
+    {
+      "symbol": "LINK-USD",
+      "costTier": "mid",
+      "is": {
+        "trades": 12,
+        "winRatePct": 41.66666666666667,
+        "expectancyR": 0.19493202065928794,
+        "profitFactor": 1.1588134488872244,
+        "sharpe": 0.22275986544261978,
+        "maxDdPct": 2.0092735720492634,
+        "totalPnlUsd": 158.35685626589685,
+        "worstCasePnlUsd": 158.35685626589685,
+        "returnPct": 0.6334274250635874
+      },
+      "oos": {
+        "trades": 8,
+        "winRatePct": 50,
+        "expectancyR": 0.45413975167814924,
+        "profitFactor": 1.6945922535367002,
+        "sharpe": 0.632134409129697,
+        "maxDdPct": 2.0429010996926396,
+        "totalPnlUsd": 387.0103821533961,
+        "worstCasePnlUsd": 387.0103821533961,
+        "returnPct": 1.5480415286135845
+      },
+      "oosBlockBootstrap": {
+        "p5": 24638.527798965697,
+        "p50": 25387.010382153392,
+        "p95": 26135.492965341095,
+        "worstDdPct": 3.269905513735734,
+        "blockLen": 5,
+        "iterations": 3000
+      }
+    }
+  ],
+  "swingPromotionGate": [
+    {
+      "symbol": "BTC-USD",
+      "verdict": {
+        "pass": false,
+        "guards": {
+          "G1": {
+            "pass": false,
+            "value": 0
+          },
+          "G2": {
+            "pass": false,
+            "value": 0.07106659923637026
+          },
+          "G3": {
+            "pass": true,
+            "value": 0.37012987012987014
+          },
+          "G4": {
+            "pass": false,
+            "value": -830.087773797979
+          },
+          "G5": {
+            "pass": true,
+            "value": 1.4229111427573873
+          },
+          "G6": {
+            "pass": true,
+            "value": 1.4503695008159376
+          }
+        },
+        "blessedParams": {
+          "strategy": "swing",
+          "label": "ema50ProximityPct=0.05,rrRatio=1.5",
+          "swingOpts": {
+            "ema50ProximityPct": 0.05,
+            "rrRatio": 1.5
+          }
+        },
+        "backtestMetrics": {
+          "sharpe": -0.24352146541431838,
+          "expectancy": -0.07414900806669741,
+          "profitFactor": 0.8454704402063418,
+          "maxDrawdown": 0.02317277404148577,
+          "tradeCount": 16
+        }
+      },
+      "blessed": {
+        "label": "ema50ProximityPct=0.05,rrRatio=1.5",
+        "overlay": {
+          "swingOpts": {
+            "ema50ProximityPct": 0.05,
+            "rrRatio": 1.5
+          }
+        },
+        "meanIsSharpe": -0.37730835497571014,
+        "meanIsTrades": 4.846153846153846,
+        "plateauScore": -0.447994856489354,
+        "eligibleTrials": 0
+      },
+      "oosAggregate": {
+        "sharpe": -0.24352146541431838,
+        "expectancy": -0.07414900806669741,
+        "profitFactor": 0.8454704402063418,
+        "maxDrawdown": 0.02317277404148577,
+        "tradeCount": 16,
+        "totalPnl": -200.86968441601036
+      },
+      "holdout": {
+        "sharpe": 1.4229111427573873,
+        "expectancy": 1.4660859954721883,
+        "profitFactor": null,
+        "maxDrawdown": 0.0038473594269718245,
+        "tradeCount": 1,
+        "totalPnl": 180.54343528255717,
+        "worstCasePnl": 180.54343528255717,
+        "stressedExpectancy": 1.4503695008159376
+      },
+      "guards": [
+        {
+          "id": "G1",
+          "name": "Walk-forward efficiency",
+          "pass": false,
+          "value": 0,
+          "threshold": "≥ 0.5 and OOS Sharpe > 0",
+          "detail": "IS Sharpe -0.377 → OOS Sharpe -0.535"
+        },
+        {
+          "id": "G2",
+          "name": "Deflated Sharpe Ratio",
+          "pass": false,
+          "value": 0.07106659923637026,
+          "threshold": "PSR vs SR*(N=9) > 0.95, n ≥ 20",
+          "detail": "PSR 0.0711, SR* 0.198, obs/trade Sharpe -0.148, n=21"
+        },
+        {
+          "id": "G3",
+          "name": "Probability of Backtest Overfitting",
+          "pass": true,
+          "value": 0.37012987012987014,
+          "threshold": "PBO < 0.5 (target < 0.25)",
+          "detail": "PBO 0.370 over 924 CSCV splits, S=12"
+        },
+        {
+          "id": "G4",
+          "name": "Bootstrap OOS floor",
+          "pass": false,
+          "value": -830.087773797979,
+          "threshold": "p5 aggregate PnL > 0, n ≥ 20",
+          "detail": "INSUFFICIENT OOS SAMPLE: 16 aggregate trades < 20 — bootstrap floor is noise"
+        },
+        {
+          "id": "G5",
+          "name": "Holdout confirmation",
+          "pass": true,
+          "value": 1.4229111427573873,
+          "threshold": "holdout Sharpe > 0 and holdout PnL ≥ G4 bootstrap p5 floor",
+          "detail": "holdout Sharpe 1.423, PnL $181 vs floor $-830, trades 1"
+        },
+        {
+          "id": "G6",
+          "name": "Cost / slippage stress",
+          "pass": true,
+          "value": 1.4503695008159376,
+          "threshold": "1.5× cost expectancy > 0 and worst-case PnL > 0",
+          "detail": "1.5× cost expectancy 1.450R, worst-case PnL $181"
+        }
+      ]
+    },
+    {
+      "symbol": "ETH-USD",
+      "verdict": {
+        "pass": false,
+        "guards": {
+          "G1": {
+            "pass": false,
+            "value": -1.670891946337227
+          },
+          "G2": {
+            "pass": false,
+            "value": 0.254546693848071
+          },
+          "G3": {
+            "pass": true,
+            "value": 0.4588744588744589
+          },
+          "G4": {
+            "pass": false,
+            "value": 83.98079046890416
+          },
+          "G5": {
+            "pass": false,
+            "value": -1.4087642208616824
+          },
+          "G6": {
+            "pass": false,
+            "value": -1.0072156292904317
+          }
+        },
+        "blessedParams": {
+          "strategy": "swing",
+          "label": "ema50ProximityPct=0.03,rrRatio=3",
+          "swingOpts": {
+            "ema50ProximityPct": 0.03,
+            "rrRatio": 3
+          }
+        },
+        "backtestMetrics": {
+          "sharpe": 1.0260532702822125,
+          "expectancy": 0.6930622229579406,
+          "profitFactor": 2.127593434798687,
+          "maxDrawdown": 0.011010027388952353,
+          "tradeCount": 7
+        }
+      },
+      "blessed": {
+        "label": "ema50ProximityPct=0.03,rrRatio=3",
+        "overlay": {
+          "swingOpts": {
+            "ema50ProximityPct": 0.03,
+            "rrRatio": 3
+          }
+        },
+        "meanIsSharpe": 0.27168633216242033,
+        "meanIsTrades": 3.5833333333333335,
+        "plateauScore": 0.024227568909138093,
+        "eligibleTrials": 0
+      },
+      "oosAggregate": {
+        "sharpe": 1.0260532702822125,
+        "expectancy": 0.6930622229579406,
+        "profitFactor": 2.127593434798687,
+        "maxDrawdown": 0.011010027388952353,
+        "tradeCount": 7,
+        "totalPnl": 588.1240287369562
+      },
+      "holdout": {
+        "sharpe": -1.4087642208616824,
+        "expectancy": -1.0048215375771403,
+        "profitFactor": 0,
+        "maxDrawdown": 0.013355588007427064,
+        "tradeCount": 2,
+        "totalPnl": -257.1071353847823,
+        "worstCasePnl": -257.1071353847823,
+        "stressedExpectancy": -1.0072156292904317
+      },
+      "guards": [
+        {
+          "id": "G1",
+          "name": "Walk-forward efficiency",
+          "pass": false,
+          "value": -1.670891946337227,
+          "threshold": "≥ 0.5 and OOS Sharpe > 0",
+          "detail": "IS Sharpe 0.272 → OOS Sharpe -0.454"
+        },
+        {
+          "id": "G2",
+          "name": "Deflated Sharpe Ratio",
+          "pass": false,
+          "value": 0.254546693848071,
+          "threshold": "PSR vs SR*(N=9) > 0.95, n ≥ 20",
+          "detail": "INSUFFICIENT OOS SAMPLE: n=13 < 20 trades — cannot certify (PSR 0.2545 on this sample is noise)"
+        },
+        {
+          "id": "G3",
+          "name": "Probability of Backtest Overfitting",
+          "pass": true,
+          "value": 0.4588744588744589,
+          "threshold": "PBO < 0.5 (target < 0.25)",
+          "detail": "PBO 0.459 over 924 CSCV splits, S=12"
+        },
+        {
+          "id": "G4",
+          "name": "Bootstrap OOS floor",
+          "pass": false,
+          "value": 83.98079046890416,
+          "threshold": "p5 aggregate PnL > 0, n ≥ 20",
+          "detail": "INSUFFICIENT OOS SAMPLE: 7 aggregate trades < 20 — bootstrap floor is noise"
+        },
+        {
+          "id": "G5",
+          "name": "Holdout confirmation",
+          "pass": false,
+          "value": -1.4087642208616824,
+          "threshold": "holdout Sharpe > 0 and holdout PnL ≥ G4 bootstrap p5 floor",
+          "detail": "holdout Sharpe -1.409, PnL $-257 vs floor $84, trades 2"
+        },
+        {
+          "id": "G6",
+          "name": "Cost / slippage stress",
+          "pass": false,
+          "value": -1.0072156292904317,
+          "threshold": "1.5× cost expectancy > 0 and worst-case PnL > 0",
+          "detail": "1.5× cost expectancy -1.007R, worst-case PnL $-257"
+        }
+      ]
+    },
+    {
+      "symbol": "SOL-USD",
+      "verdict": {
+        "pass": false,
+        "guards": {
+          "G1": {
+            "pass": true,
+            "value": 999
+          },
+          "G2": {
+            "pass": false,
+            "value": 0.3812649134024154
+          },
+          "G3": {
+            "pass": true,
+            "value": 0.49242424242424243
+          },
+          "G4": {
+            "pass": false,
+            "value": -1283.4428886499118
+          },
+          "G5": {
+            "pass": false,
+            "value": -0.4744385236648418
+          },
+          "G6": {
+            "pass": false,
+            "value": -0.22118412513816224
+          }
+        },
+        "blessedParams": {
+          "strategy": "swing",
+          "label": "ema50ProximityPct=0.08,rrRatio=1.5",
+          "swingOpts": {
+            "ema50ProximityPct": 0.08,
+            "rrRatio": 1.5
+          }
+        },
+        "backtestMetrics": {
+          "sharpe": -0.05204844835558123,
+          "expectancy": 0.00781317652948634,
+          "profitFactor": 0.9587466474004027,
+          "maxDrawdown": 0.031566225732566885,
+          "tradeCount": 12
+        }
+      },
+      "blessed": {
+        "label": "ema50ProximityPct=0.08,rrRatio=1.5",
+        "overlay": {
+          "swingOpts": {
+            "ema50ProximityPct": 0.08,
+            "rrRatio": 1.5
+          }
+        },
+        "meanIsSharpe": -0.01948969575189106,
+        "meanIsTrades": 4.583333333333333,
+        "plateauScore": -0.3266562388748488,
+        "eligibleTrials": 0
+      },
+      "oosAggregate": {
+        "sharpe": -0.05204844835558123,
+        "expectancy": 0.00781317652948634,
+        "profitFactor": 0.9587466474004027,
+        "maxDrawdown": 0.031566225732566885,
+        "tradeCount": 12,
+        "totalPnl": -38.38990840909216
+      },
+      "holdout": {
+        "sharpe": -0.4744385236648418,
+        "expectancy": -0.20300139672699138,
+        "profitFactor": 0.6484041901372855,
+        "maxDrawdown": 0.01140059234599671,
+        "tradeCount": 3,
+        "totalPnl": -95.08614536802497,
+        "worstCasePnl": -95.08614536802497,
+        "stressedExpectancy": -0.22118412513816224
+      },
+      "guards": [
+        {
+          "id": "G1",
+          "name": "Walk-forward efficiency",
+          "pass": true,
+          "value": 999,
+          "threshold": "≥ 0.5 and OOS Sharpe > 0",
+          "detail": "IS Sharpe -0.019 → OOS Sharpe 0.035"
+        },
+        {
+          "id": "G2",
+          "name": "Deflated Sharpe Ratio",
+          "pass": false,
+          "value": 0.3812649134024154,
+          "threshold": "PSR vs SR*(N=9) > 0.95, n ≥ 20",
+          "detail": "INSUFFICIENT OOS SAMPLE: n=14 < 20 trades — cannot certify (PSR 0.3813 on this sample is noise)"
+        },
+        {
+          "id": "G3",
+          "name": "Probability of Backtest Overfitting",
+          "pass": true,
+          "value": 0.49242424242424243,
+          "threshold": "PBO < 0.5 (target < 0.25)",
+          "detail": "PBO 0.492 over 924 CSCV splits, S=12"
+        },
+        {
+          "id": "G4",
+          "name": "Bootstrap OOS floor",
+          "pass": false,
+          "value": -1283.4428886499118,
+          "threshold": "p5 aggregate PnL > 0, n ≥ 20",
+          "detail": "INSUFFICIENT OOS SAMPLE: 12 aggregate trades < 20 — bootstrap floor is noise"
+        },
+        {
+          "id": "G5",
+          "name": "Holdout confirmation",
+          "pass": false,
+          "value": -0.4744385236648418,
+          "threshold": "holdout Sharpe > 0 and holdout PnL ≥ G4 bootstrap p5 floor",
+          "detail": "holdout Sharpe -0.474, PnL $-95 vs floor $-1283, trades 3"
+        },
+        {
+          "id": "G6",
+          "name": "Cost / slippage stress",
+          "pass": false,
+          "value": -0.22118412513816224,
+          "threshold": "1.5× cost expectancy > 0 and worst-case PnL > 0",
+          "detail": "1.5× cost expectancy -0.221R, worst-case PnL $-95"
+        }
+      ]
+    },
+    {
+      "symbol": "ADA-USD",
+      "verdict": {
+        "pass": false,
+        "guards": {
+          "G1": {
+            "pass": false,
+            "value": -1.459996741516016
+          },
+          "G2": {
+            "pass": false,
+            "value": 0.11665026675934903
+          },
+          "G3": {
+            "pass": true,
+            "value": 0.16233766233766234
+          },
+          "G4": {
+            "pass": false,
+            "value": -437.14291330720516
+          },
+          "G5": {
+            "pass": true,
+            "value": 0.0470098808108959
+          },
+          "G6": {
+            "pass": true,
+            "value": 0.15642259010973147
+          }
+        },
+        "blessedParams": {
+          "strategy": "swing",
+          "label": "ema50ProximityPct=0.08,rrRatio=1.5",
+          "swingOpts": {
+            "ema50ProximityPct": 0.08,
+            "rrRatio": 1.5
+          }
+        },
+        "backtestMetrics": {
+          "sharpe": -0.1859603547556991,
+          "expectancy": 0.008746312294653011,
+          "profitFactor": 0.8215209447888971,
+          "maxDrawdown": 0.012808953657144859,
+          "tradeCount": 7
+        }
+      },
+      "blessed": {
+        "label": "ema50ProximityPct=0.08,rrRatio=1.5",
+        "overlay": {
+          "swingOpts": {
+            "ema50ProximityPct": 0.08,
+            "rrRatio": 1.5
+          }
+        },
+        "meanIsSharpe": 0.2840540120407033,
+        "meanIsTrades": 1.75,
+        "plateauScore": 0.1824882313543411,
+        "eligibleTrials": 0
+      },
+      "oosAggregate": {
+        "sharpe": -0.1859603547556991,
+        "expectancy": 0.008746312294653011,
+        "profitFactor": 0.8215209447888971,
+        "maxDrawdown": 0.012808953657144859,
+        "tradeCount": 7,
+        "totalPnl": -104.84283613042007
+      },
+      "holdout": {
+        "sharpe": 0.0470098808108959,
+        "expectancy": 0.18950580529455985,
+        "profitFactor": 1.0534418688053968,
+        "maxDrawdown": 0.0065354403352624645,
+        "tradeCount": 2,
+        "totalPnl": 8.344831087093382,
+        "worstCasePnl": 8.344831087093382,
+        "stressedExpectancy": 0.15642259010973147
+      },
+      "guards": [
+        {
+          "id": "G1",
+          "name": "Walk-forward efficiency",
+          "pass": false,
+          "value": -1.459996741516016,
+          "threshold": "≥ 0.5 and OOS Sharpe > 0",
+          "detail": "IS Sharpe 0.284 → OOS Sharpe -0.415"
+        },
+        {
+          "id": "G2",
+          "name": "Deflated Sharpe Ratio",
+          "pass": false,
+          "value": 0.11665026675934903,
+          "threshold": "PSR vs SR*(N=9) > 0.95, n ≥ 20",
+          "detail": "INSUFFICIENT OOS SAMPLE: n=11 < 20 trades — cannot certify (PSR 0.1167 on this sample is noise)"
+        },
+        {
+          "id": "G3",
+          "name": "Probability of Backtest Overfitting",
+          "pass": true,
+          "value": 0.16233766233766234,
+          "threshold": "PBO < 0.5 (target < 0.25)",
+          "detail": "PBO 0.162 over 924 CSCV splits, S=12"
+        },
+        {
+          "id": "G4",
+          "name": "Bootstrap OOS floor",
+          "pass": false,
+          "value": -437.14291330720516,
+          "threshold": "p5 aggregate PnL > 0, n ≥ 20",
+          "detail": "INSUFFICIENT OOS SAMPLE: 7 aggregate trades < 20 — bootstrap floor is noise"
+        },
+        {
+          "id": "G5",
+          "name": "Holdout confirmation",
+          "pass": true,
+          "value": 0.0470098808108959,
+          "threshold": "holdout Sharpe > 0 and holdout PnL ≥ G4 bootstrap p5 floor",
+          "detail": "holdout Sharpe 0.047, PnL $8 vs floor $-437, trades 2"
+        },
+        {
+          "id": "G6",
+          "name": "Cost / slippage stress",
+          "pass": true,
+          "value": 0.15642259010973147,
+          "threshold": "1.5× cost expectancy > 0 and worst-case PnL > 0",
+          "detail": "1.5× cost expectancy 0.156R, worst-case PnL $8"
+        }
+      ]
+    },
+    {
+      "symbol": "DOGE-USD",
+      "verdict": {
+        "pass": false,
+        "guards": {
+          "G1": {
+            "pass": false,
+            "value": -0.2974357044230555
+          },
+          "G2": {
+            "pass": false,
+            "value": 0.5235076434571184
+          },
+          "G3": {
+            "pass": false,
+            "value": 0.7781385281385281
+          },
+          "G4": {
+            "pass": false,
+            "value": -682.5700526154251
+          },
+          "G5": {
+            "pass": false,
+            "value": -0.6809948463307555
+          },
+          "G6": {
+            "pass": false,
+            "value": -1.0390362273692637
+          }
+        },
+        "blessedParams": {
+          "strategy": "swing",
+          "label": "ema50ProximityPct=0.03,rrRatio=3",
+          "swingOpts": {
+            "ema50ProximityPct": 0.03,
+            "rrRatio": 3
+          }
+        },
+        "backtestMetrics": {
+          "sharpe": 0.4394927939487137,
+          "expectancy": 0.43439510729458786,
+          "profitFactor": 1.4333545874281666,
+          "maxDrawdown": 0.027371699269887896,
+          "tradeCount": 8
+        }
+      },
+      "blessed": {
+        "label": "ema50ProximityPct=0.03,rrRatio=3",
+        "overlay": {
+          "swingOpts": {
+            "ema50ProximityPct": 0.03,
+            "rrRatio": 3
+          }
+        },
+        "meanIsSharpe": 0.5019157832614515,
+        "meanIsTrades": 3,
+        "plateauScore": 0.3131363179118815,
+        "eligibleTrials": 0
+      },
+      "oosAggregate": {
+        "sharpe": 0.4394927939487137,
+        "expectancy": 0.43439510729458786,
+        "profitFactor": 1.4333545874281666,
+        "maxDrawdown": 0.027371699269887896,
+        "tradeCount": 8,
+        "totalPnl": 319.3549482731785
+      },
+      "holdout": {
+        "sharpe": -0.6809948463307555,
+        "expectancy": -1.0263711567003355,
+        "profitFactor": 0,
+        "maxDrawdown": 0.01590150582302554,
+        "tradeCount": 2,
+        "totalPnl": -296.2655113866247,
+        "worstCasePnl": -296.2655113866247,
+        "stressedExpectancy": -1.0390362273692637
+      },
+      "guards": [
+        {
+          "id": "G1",
+          "name": "Walk-forward efficiency",
+          "pass": false,
+          "value": -0.2974357044230555,
+          "threshold": "≥ 0.5 and OOS Sharpe > 0",
+          "detail": "IS Sharpe 0.502 → OOS Sharpe -0.149"
+        },
+        {
+          "id": "G2",
+          "name": "Deflated Sharpe Ratio",
+          "pass": false,
+          "value": 0.5235076434571184,
+          "threshold": "PSR vs SR*(N=9) > 0.95, n ≥ 20",
+          "detail": "INSUFFICIENT OOS SAMPLE: n=9 < 20 trades — cannot certify (PSR 0.5235 on this sample is noise)"
+        },
+        {
+          "id": "G3",
+          "name": "Probability of Backtest Overfitting",
+          "pass": false,
+          "value": 0.7781385281385281,
+          "threshold": "PBO < 0.5 (target < 0.25)",
+          "detail": "PBO 0.778 over 924 CSCV splits, S=12"
+        },
+        {
+          "id": "G4",
+          "name": "Bootstrap OOS floor",
+          "pass": false,
+          "value": -682.5700526154251,
+          "threshold": "p5 aggregate PnL > 0, n ≥ 20",
+          "detail": "INSUFFICIENT OOS SAMPLE: 8 aggregate trades < 20 — bootstrap floor is noise"
+        },
+        {
+          "id": "G5",
+          "name": "Holdout confirmation",
+          "pass": false,
+          "value": -0.6809948463307555,
+          "threshold": "holdout Sharpe > 0 and holdout PnL ≥ G4 bootstrap p5 floor",
+          "detail": "holdout Sharpe -0.681, PnL $-296 vs floor $-683, trades 2"
+        },
+        {
+          "id": "G6",
+          "name": "Cost / slippage stress",
+          "pass": false,
+          "value": -1.0390362273692637,
+          "threshold": "1.5× cost expectancy > 0 and worst-case PnL > 0",
+          "detail": "1.5× cost expectancy -1.039R, worst-case PnL $-296"
+        }
+      ]
+    },
+    {
+      "symbol": "LINK-USD",
+      "verdict": {
+        "pass": false,
+        "guards": {
+          "G1": {
+            "pass": false,
+            "value": 0.12690583460426746
+          },
+          "G2": {
+            "pass": false,
+            "value": 0.5007588325147563
+          },
+          "G3": {
+            "pass": true,
+            "value": 0.49783549783549785
+          },
+          "G4": {
+            "pass": false,
+            "value": -43.325025964921224
+          },
+          "G5": {
+            "pass": false,
+            "value": -0.8132084066274358
+          },
+          "G6": {
+            "pass": false,
+            "value": -1.0307462383896355
+          }
+        },
+        "blessedParams": {
+          "strategy": "swing",
+          "label": "ema50ProximityPct=0.03,rrRatio=2",
+          "swingOpts": {
+            "ema50ProximityPct": 0.03,
+            "rrRatio": 2
+          }
+        },
+        "backtestMetrics": {
+          "sharpe": 0.4878714163037003,
+          "expectancy": 0.3266164944303181,
+          "profitFactor": 1.4079948335831778,
+          "maxDrawdown": 0.0226520624329674,
+          "tradeCount": 11
+        }
+      },
+      "blessed": {
+        "label": "ema50ProximityPct=0.03,rrRatio=2",
+        "overlay": {
+          "swingOpts": {
+            "ema50ProximityPct": 0.03,
+            "rrRatio": 2
+          }
+        },
+        "meanIsSharpe": 0.2639743923687529,
+        "meanIsTrades": 3.5833333333333335,
+        "plateauScore": 0.01938215766919025,
+        "eligibleTrials": 0
+      },
+      "oosAggregate": {
+        "sharpe": 0.4878714163037003,
+        "expectancy": 0.3266164944303181,
+        "profitFactor": 1.4079948335831778,
+        "maxDrawdown": 0.0226520624329674,
+        "tradeCount": 11,
+        "totalPnl": 343.09924265698567
+      },
+      "holdout": {
+        "sharpe": -0.8132084066274358,
+        "expectancy": -1.0206995904594347,
+        "profitFactor": 0,
+        "maxDrawdown": 0.008213099615484266,
+        "tradeCount": 1,
+        "totalPnl": -140.6651500124741,
+        "worstCasePnl": -140.6651500124741,
+        "stressedExpectancy": -1.0307462383896355
+      },
+      "guards": [
+        {
+          "id": "G1",
+          "name": "Walk-forward efficiency",
+          "pass": false,
+          "value": 0.12690583460426746,
+          "threshold": "≥ 0.5 and OOS Sharpe > 0",
+          "detail": "IS Sharpe 0.264 → OOS Sharpe 0.033"
+        },
+        {
+          "id": "G2",
+          "name": "Deflated Sharpe Ratio",
+          "pass": false,
+          "value": 0.5007588325147563,
+          "threshold": "PSR vs SR*(N=9) > 0.95, n ≥ 20",
+          "detail": "INSUFFICIENT OOS SAMPLE: n=12 < 20 trades — cannot certify (PSR 0.5008 on this sample is noise)"
+        },
+        {
+          "id": "G3",
+          "name": "Probability of Backtest Overfitting",
+          "pass": true,
+          "value": 0.49783549783549785,
+          "threshold": "PBO < 0.5 (target < 0.25)",
+          "detail": "PBO 0.498 over 924 CSCV splits, S=12"
+        },
+        {
+          "id": "G4",
+          "name": "Bootstrap OOS floor",
+          "pass": false,
+          "value": -43.325025964921224,
+          "threshold": "p5 aggregate PnL > 0, n ≥ 20",
+          "detail": "INSUFFICIENT OOS SAMPLE: 11 aggregate trades < 20 — bootstrap floor is noise"
+        },
+        {
+          "id": "G5",
+          "name": "Holdout confirmation",
+          "pass": false,
+          "value": -0.8132084066274358,
+          "threshold": "holdout Sharpe > 0 and holdout PnL ≥ G4 bootstrap p5 floor",
+          "detail": "holdout Sharpe -0.813, PnL $-141 vs floor $-43, trades 1"
+        },
+        {
+          "id": "G6",
+          "name": "Cost / slippage stress",
+          "pass": false,
+          "value": -1.0307462383896355,
+          "threshold": "1.5× cost expectancy > 0 and worst-case PnL > 0",
+          "detail": "1.5× cost expectancy -1.031R, worst-case PnL $-141"
+        }
+      ]
+    }
+  ],
+  "dca": [
+    {
+      "symbol": "BTC-USD",
+      "costTier": "major",
+      "weeklyIs": {
+        "buys": 63,
+        "possibleWindows": 87,
+        "deploymentRatioPct": 72.41379310344827,
+        "invested": 6300,
+        "units": 0.13362107625153663,
+        "avgCost": 47148.25068569638,
+        "finalPrice": 93354.22,
+        "finalValue": 12474.091349022727,
+        "returnOnInvestedPct": 98.00144998448772,
+        "xirrAnnualPct": 122.55395464139642,
+        "maxDdRatioPct": 40.1663957972033,
+        "mar": 3.0511563760951033
+      },
+      "weeklyOos": {
+        "buys": 46,
+        "possibleWindows": 74,
+        "deploymentRatioPct": 62.16216216216216,
+        "invested": 4600,
+        "units": 0.04884389019819663,
+        "avgCost": 94177.59276204903,
+        "finalPrice": 65754.13,
+        "finalValue": 3211.687505797947,
+        "returnOnInvestedPct": -30.18070639569681,
+        "xirrAnnualPct": -39.62517124081438,
+        "maxDdRatioPct": 51.07997188913338,
+        "mar": -0.7757477104102349
+      },
+      "weeklyFull": {
+        "buys": 109,
+        "possibleWindows": 161,
+        "deploymentRatioPct": 67.70186335403726,
+        "invested": 10900,
+        "units": 0.18246496644973323,
+        "avgCost": 59737.49488509517,
+        "finalPrice": 65754.13,
+        "finalValue": 11997.825124381397,
+        "returnOnInvestedPct": 10.071790131939418,
+        "xirrAnnualPct": 6.149166619977978,
+        "maxDdRatioPct": 53.010058226801945,
+        "mar": 0.11599999746593286
+      },
+      "ungatedOos": {
+        "buys": 74,
+        "possibleWindows": 74,
+        "deploymentRatioPct": 100,
+        "invested": 7400,
+        "units": 0.08074933126018775,
+        "avgCost": 91641.62581304817,
+        "finalPrice": 65754.13,
+        "finalValue": 5309.60202509545,
+        "returnOnInvestedPct": -28.248621282493925,
+        "xirrAnnualPct": -38.74391197591714,
+        "maxDdRatioPct": 50.52014645725783,
+        "mar": -0.76690023075638
+      },
+      "lumpSumOos": {
+        "returnPct": -29.818639455414917,
+        "maxDdPct": 49.95733410650238
+      },
+      "cadenceOos": {
+        "weekly": {
+          "buys": 46,
+          "possibleWindows": 74,
+          "deploymentRatioPct": 62.16216216216216,
+          "invested": 4600,
+          "units": 0.04884389019819663,
+          "avgCost": 94177.59276204903,
+          "finalPrice": 65754.13,
+          "finalValue": 3211.687505797947,
+          "returnOnInvestedPct": -30.18070639569681,
+          "xirrAnnualPct": -39.62517124081438,
+          "maxDdRatioPct": 51.07997188913338,
+          "mar": -0.7757477104102349
+        },
+        "biweekly": {
+          "buys": 26,
+          "possibleWindows": 37,
+          "deploymentRatioPct": 70.27027027027027,
+          "invested": 2600,
+          "units": 0.02755656011899869,
+          "avgCost": 94351.39904154609,
+          "finalPrice": 65754.13,
+          "finalValue": 1811.9576364174554,
+          "returnOnInvestedPct": -30.30932167625171,
+          "xirrAnnualPct": -39.53438449476672,
+          "maxDdRatioPct": 50.54503271105967,
+          "mar": -0.7821616165680366
+        },
+        "monthly": {
+          "buys": 14,
+          "possibleWindows": 17,
+          "deploymentRatioPct": 82.35294117647058,
+          "invested": 1400,
+          "units": 0.014720312486936652,
+          "avgCost": 95106.67665801331,
+          "finalPrice": 65754.13,
+          "finalValue": 967.9213409066559,
+          "returnOnInvestedPct": -30.862761363810286,
+          "xirrAnnualPct": -39.650468834429056,
+          "maxDdRatioPct": 51.20742251434278,
+          "mar": -0.7743109668002385
+        }
+      }
+    },
+    {
+      "symbol": "ETH-USD",
+      "costTier": "major",
+      "weeklyIs": {
+        "buys": 56,
+        "possibleWindows": 87,
+        "deploymentRatioPct": 64.36781609195403,
+        "invested": 5600,
+        "units": 2.2264306665197613,
+        "avgCost": 2515.23664500796,
+        "finalPrice": 3330.32,
+        "finalValue": 7414.7265773240915,
+        "returnOnInvestedPct": 32.405831737930214,
+        "xirrAnnualPct": 39.85936732678266,
+        "maxDdRatioPct": 52.35365523513502,
+        "mar": 0.7613483174720659
+      },
+      "weeklyOos": {
+        "buys": 44,
+        "possibleWindows": 71,
+        "deploymentRatioPct": 61.97183098591549,
+        "invested": 4400,
+        "units": 1.5463540931951663,
+        "avgCost": 2845.4026276145237,
+        "finalPrice": 2185.41,
+        "finalValue": 3379.417698809648,
+        "returnOnInvestedPct": -23.195052299780727,
+        "xirrAnnualPct": -34.29067328476872,
+        "maxDdRatioPct": 66.3980143959689,
+        "mar": -0.5164412459727191
+      },
+      "weeklyFull": {
+        "buys": 100,
+        "possibleWindows": 158,
+        "deploymentRatioPct": 63.29113924050633,
+        "invested": 10000,
+        "units": 3.7727847597149275,
+        "avgCost": 2650.5620216605207,
+        "finalPrice": 2185.41,
+        "finalValue": 8245.0815417286,
+        "returnOnInvestedPct": -17.549184582714005,
+        "xirrAnnualPct": -12.380212844972927,
+        "maxDdRatioPct": 71.30228629343557,
+        "mar": -0.1736299561843462
+      },
+      "ungatedOos": {
+        "buys": 72,
+        "possibleWindows": 71,
+        "deploymentRatioPct": 101.40845070422534,
+        "invested": 7200,
+        "units": 2.7102139918738395,
+        "avgCost": 2656.6167917323482,
+        "finalPrice": 2185.41,
+        "finalValue": 5922.928759981007,
+        "returnOnInvestedPct": -17.737100555819353,
+        "xirrAnnualPct": -25.308789765263217,
+        "maxDdRatioPct": 66.58530503210923,
+        "mar": -0.38009572462059965
+      },
+      "lumpSumOos": {
+        "returnPct": -34.75275389247066,
+        "maxDdPct": 62.28109192845985
+      },
+      "cadenceOos": {
+        "weekly": {
+          "buys": 44,
+          "possibleWindows": 71,
+          "deploymentRatioPct": 61.97183098591549,
+          "invested": 4400,
+          "units": 1.5463540931951663,
+          "avgCost": 2845.4026276145237,
+          "finalPrice": 2185.41,
+          "finalValue": 3379.417698809648,
+          "returnOnInvestedPct": -23.195052299780727,
+          "xirrAnnualPct": -34.29067328476872,
+          "maxDdRatioPct": 66.3980143959689,
+          "mar": -0.5164412459727191
+        },
+        "biweekly": {
+          "buys": 25,
+          "possibleWindows": 35,
+          "deploymentRatioPct": 71.42857142857143,
+          "invested": 2500,
+          "units": 0.8895591955300962,
+          "avgCost": 2810.3807060419717,
+          "finalPrice": 2185.41,
+          "finalValue": 1944.0515615034274,
+          "returnOnInvestedPct": -22.237937539862905,
+          "xirrAnnualPct": -32.94241251061554,
+          "maxDdRatioPct": 66.21746054457375,
+          "mar": -0.4974883095741888
+        },
+        "monthly": {
+          "buys": 12,
+          "possibleWindows": 16,
+          "deploymentRatioPct": 75,
+          "invested": 1200,
+          "units": 0.4329533284632143,
+          "avgCost": 2771.6613341660855,
+          "finalPrice": 2185.41,
+          "finalValue": 946.1805335567932,
+          "returnOnInvestedPct": -21.15162220360056,
+          "xirrAnnualPct": -32.46294127442758,
+          "maxDdRatioPct": 67.14297556415083,
+          "mar": -0.48348976198427945
+        }
+      }
+    },
+    {
+      "symbol": "SOL-USD",
+      "costTier": "high_liq",
+      "weeklyIs": {
+        "buys": 63,
+        "possibleWindows": 87,
+        "deploymentRatioPct": 72.41379310344827,
+        "invested": 6300,
+        "units": 102.78796454972414,
+        "avgCost": 61.29122244610989,
+        "finalPrice": 188.82,
+        "finalValue": 19408.42346627891,
+        "returnOnInvestedPct": 208.07021375045886,
+        "xirrAnnualPct": 245.99232320113566,
+        "maxDdRatioPct": 56.60585476943676,
+        "mar": 4.34570459545387
+      },
+      "weeklyOos": {
+        "buys": 40,
+        "possibleWindows": 71,
+        "deploymentRatioPct": 56.33802816901409,
+        "invested": 4000,
+        "units": 27.327773399863016,
+        "avgCost": 146.37123711001095,
+        "finalPrice": 86.75,
+        "finalValue": 2370.684342438117,
+        "returnOnInvestedPct": -40.73289143904708,
+        "xirrAnnualPct": -55.56892248761465,
+        "maxDdRatioPct": 69.24485759724261,
+        "mar": -0.8024989062845217
+      },
+      "weeklyFull": {
+        "buys": 103,
+        "possibleWindows": 158,
+        "deploymentRatioPct": 65.18987341772153,
+        "invested": 10300,
+        "units": 130.11573794958716,
+        "avgCost": 79.16029346112379,
+        "finalPrice": 86.75,
+        "finalValue": 11287.540267126686,
+        "returnOnInvestedPct": 9.587769583754223,
+        "xirrAnnualPct": 5.820008985340529,
+        "maxDdRatioPct": 81.40786684139229,
+        "mar": 0.07149197259620753
+      },
+      "ungatedOos": {
+        "buys": 72,
+        "possibleWindows": 71,
+        "deploymentRatioPct": 101.40845070422534,
+        "invested": 7200,
+        "units": 52.71228333428807,
+        "avgCost": 136.5905543180402,
+        "finalPrice": 86.75,
+        "finalValue": 4572.790579249489,
+        "returnOnInvestedPct": -36.48901973264598,
+        "xirrAnnualPct": -50.98984084490262,
+        "maxDdRatioPct": 68.0618162892595,
+        "mar": -0.7491695582762326
+      },
+      "lumpSumOos": {
+        "returnPct": -54.42897515303373,
+        "maxDdPct": 73.19479429051218
+      },
+      "cadenceOos": {
+        "weekly": {
+          "buys": 40,
+          "possibleWindows": 71,
+          "deploymentRatioPct": 56.33802816901409,
+          "invested": 4000,
+          "units": 27.327773399863016,
+          "avgCost": 146.37123711001095,
+          "finalPrice": 86.75,
+          "finalValue": 2370.684342438117,
+          "returnOnInvestedPct": -40.73289143904708,
+          "xirrAnnualPct": -55.56892248761465,
+          "maxDdRatioPct": 69.24485759724261,
+          "mar": -0.8024989062845217
+        },
+        "biweekly": {
+          "buys": 25,
+          "possibleWindows": 35,
+          "deploymentRatioPct": 71.42857142857143,
+          "invested": 2500,
+          "units": 17.102392510466778,
+          "avgCost": 146.17837816960306,
+          "finalPrice": 86.75,
+          "finalValue": 1483.632550282993,
+          "returnOnInvestedPct": -40.654697988680276,
+          "xirrAnnualPct": -54.74395338262082,
+          "maxDdRatioPct": 69.38084171754043,
+          "mar": -0.7890355900479195
+        },
+        "monthly": {
+          "buys": 13,
+          "possibleWindows": 16,
+          "deploymentRatioPct": 81.25,
+          "invested": 1300,
+          "units": 9.110352970127781,
+          "avgCost": 142.6948005486297,
+          "finalPrice": 86.75,
+          "finalValue": 790.3231201585851,
+          "returnOnInvestedPct": -39.205913833954995,
+          "xirrAnnualPct": -52.57388273338438,
+          "maxDdRatioPct": 68.69234288161104,
+          "mar": -0.7653528840032973
+        }
+      }
+    },
+    {
+      "symbol": "ADA-USD",
+      "costTier": "small",
+      "weeklyIs": {
+        "buys": 47,
+        "possibleWindows": 87,
+        "deploymentRatioPct": 54.02298850574713,
+        "invested": 4700,
+        "units": 10723.729956538233,
+        "avgCost": 0.4382803389350942,
+        "finalPrice": 0.8434,
+        "finalValue": 9044.393845344346,
+        "returnOnInvestedPct": 92.4339116030712,
+        "xirrAnnualPct": 125.22641375724461,
+        "maxDdRatioPct": 65.41045101557074,
+        "mar": 1.9144710334963886
+      },
+      "weeklyOos": {
+        "buys": 36,
+        "possibleWindows": 71,
+        "deploymentRatioPct": 50.70422535211267,
+        "invested": 3600,
+        "units": 6741.3288246924285,
+        "avgCost": 0.5340193444968543,
+        "finalPrice": 0.2551,
+        "finalValue": 1719.7129831790385,
+        "returnOnInvestedPct": -52.23019491169338,
+        "xirrAnnualPct": -70.15403286208371,
+        "maxDdRatioPct": 73.52496921504343,
+        "mar": -0.9541524955542584
+      },
+      "weeklyFull": {
+        "buys": 83,
+        "possibleWindows": 158,
+        "deploymentRatioPct": 52.53164556962025,
+        "invested": 8300,
+        "units": 17465.05878123066,
+        "avgCost": 0.47523458718156963,
+        "finalPrice": 0.2551,
+        "finalValue": 4455.336495091941,
+        "returnOnInvestedPct": -46.321247047085045,
+        "xirrAnnualPct": -37.02918244497496,
+        "maxDdRatioPct": 84.66821669569194,
+        "mar": -0.43734454190835775
+      },
+      "ungatedOos": {
+        "buys": 72,
+        "possibleWindows": 71,
+        "deploymentRatioPct": 101.40845070422534,
+        "invested": 7200,
+        "units": 14637.014165169237,
+        "avgCost": 0.4919036026578001,
+        "finalPrice": 0.2551,
+        "finalValue": 3733.9023135346724,
+        "returnOnInvestedPct": -48.140245645351776,
+        "xirrAnnualPct": -66.03364152218543,
+        "maxDdRatioPct": 70.93886206229126,
+        "mar": -0.9308528443013567
+      },
+      "lumpSumOos": {
+        "returnPct": -70.15525928324035,
+        "maxDdPct": 79.25886898489638
+      },
+      "cadenceOos": {
+        "weekly": {
+          "buys": 36,
+          "possibleWindows": 71,
+          "deploymentRatioPct": 50.70422535211267,
+          "invested": 3600,
+          "units": 6741.3288246924285,
+          "avgCost": 0.5340193444968543,
+          "finalPrice": 0.2551,
+          "finalValue": 1719.7129831790385,
+          "returnOnInvestedPct": -52.23019491169338,
+          "xirrAnnualPct": -70.15403286208371,
+          "maxDdRatioPct": 73.52496921504343,
+          "mar": -0.9541524955542584
+        },
+        "biweekly": {
+          "buys": 23,
+          "possibleWindows": 35,
+          "deploymentRatioPct": 65.71428571428571,
+          "invested": 2300,
+          "units": 4423.777275126378,
+          "avgCost": 0.5199176759942765,
+          "finalPrice": 0.2551,
+          "finalValue": 1128.5055828847392,
+          "returnOnInvestedPct": -50.93453987457656,
+          "xirrAnnualPct": -69.61826695202923,
+          "maxDdRatioPct": 72.5630622698821,
+          "mar": -0.959417433254121
+        },
+        "monthly": {
+          "buys": 12,
+          "possibleWindows": 16,
+          "deploymentRatioPct": 75,
+          "invested": 1200,
+          "units": 2436.3840935617195,
+          "avgCost": 0.49253317782326145,
+          "finalPrice": 0.2551,
+          "finalValue": 621.5215822675947,
+          "returnOnInvestedPct": -48.20653481103378,
+          "xirrAnnualPct": -68.33246814182172,
+          "maxDdRatioPct": 71.34006180766181,
+          "mar": -0.9578414485545472
+        }
+      }
+    },
+    {
+      "symbol": "DOGE-USD",
+      "costTier": "small",
+      "weeklyIs": {
+        "buys": 53,
+        "possibleWindows": 87,
+        "deploymentRatioPct": 60.91954022988506,
+        "invested": 5300,
+        "units": 48473.470691636045,
+        "avgCost": 0.10933815805589715,
+        "finalPrice": 0.31536,
+        "finalValue": 15286.593717314341,
+        "returnOnInvestedPct": 188.42629655310077,
+        "xirrAnnualPct": 238.3602647840907,
+        "maxDdRatioPct": 67.86692307389772,
+        "mar": 3.5121713787517557
+      },
+      "weeklyOos": {
+        "buys": 36,
+        "possibleWindows": 71,
+        "deploymentRatioPct": 50.70422535211267,
+        "invested": 3600,
+        "units": 21789.664405195923,
+        "avgCost": 0.16521594518645044,
+        "finalPrice": 0.11037,
+        "finalValue": 2404.925260401474,
+        "returnOnInvestedPct": -33.1965205444035,
+        "xirrAnnualPct": -49.58679325263103,
+        "maxDdRatioPct": 68.53146626842404,
+        "mar": -0.7235624152328726
+      },
+      "weeklyFull": {
+        "buys": 89,
+        "possibleWindows": 158,
+        "deploymentRatioPct": 56.32911392405063,
+        "invested": 8900,
+        "units": 70263.13509683197,
+        "avgCost": 0.12666670776552474,
+        "finalPrice": 0.11037,
+        "finalValue": 7754.942220637345,
+        "returnOnInvestedPct": -12.865817745647812,
+        "xirrAnnualPct": -8.810837703293299,
+        "maxDdRatioPct": 84.90093696130019,
+        "mar": -0.10377786180745546
+      },
+      "ungatedOos": {
+        "buys": 72,
+        "possibleWindows": 71,
+        "deploymentRatioPct": 101.40845070422534,
+        "invested": 7200,
+        "units": 45142.03758010796,
+        "avgCost": 0.15949656652567035,
+        "finalPrice": 0.11037,
+        "finalValue": 4982.326687716515,
+        "returnOnInvestedPct": -30.801018226159517,
+        "xirrAnnualPct": -43.377832331315894,
+        "maxDdRatioPct": 66.9110925508487,
+        "mar": -0.648290599923341
+      },
+      "lumpSumOos": {
+        "returnPct": -65.48267480697146,
+        "maxDdPct": 78.80031684309067
+      },
+      "cadenceOos": {
+        "weekly": {
+          "buys": 36,
+          "possibleWindows": 71,
+          "deploymentRatioPct": 50.70422535211267,
+          "invested": 3600,
+          "units": 21789.664405195923,
+          "avgCost": 0.16521594518645044,
+          "finalPrice": 0.11037,
+          "finalValue": 2404.925260401474,
+          "returnOnInvestedPct": -33.1965205444035,
+          "xirrAnnualPct": -49.58679325263103,
+          "maxDdRatioPct": 68.53146626842404,
+          "mar": -0.7235624152328726
+        },
+        "biweekly": {
+          "buys": 22,
+          "possibleWindows": 35,
+          "deploymentRatioPct": 62.857142857142854,
+          "invested": 2200,
+          "units": 13393.059920579788,
+          "avgCost": 0.16426417958598677,
+          "finalPrice": 0.11037,
+          "finalValue": 1478.192023434391,
+          "returnOnInvestedPct": -32.809453480254945,
+          "xirrAnnualPct": -48.17496265673836,
+          "maxDdRatioPct": 68.56745387833068,
+          "mar": -0.7025922639948434
+        },
+        "monthly": {
+          "buys": 13,
+          "possibleWindows": 16,
+          "deploymentRatioPct": 81.25,
+          "invested": 1300,
+          "units": 8136.439230894918,
+          "avgCost": 0.15977505185115412,
+          "finalPrice": 0.11037,
+          "finalValue": 898.018797913872,
+          "returnOnInvestedPct": -30.921630929702147,
+          "xirrAnnualPct": -46.72535310323816,
+          "maxDdRatioPct": 68.96221838234838,
+          "mar": -0.677550029556445
+        }
+      }
+    },
+    {
+      "symbol": "LINK-USD",
+      "costTier": "mid",
+      "weeklyIs": {
+        "buys": 57,
+        "possibleWindows": 87,
+        "deploymentRatioPct": 65.51724137931035,
+        "invested": 5700,
+        "units": 481.3226017977765,
+        "avgCost": 11.842369293920683,
+        "finalPrice": 19.972,
+        "finalValue": 9612.975003105192,
+        "returnOnInvestedPct": 68.64868426500337,
+        "xirrAnnualPct": 82.9086055870226,
+        "maxDdRatioPct": 64.80906235235216,
+        "mar": 1.2792748819025854
+      },
+      "weeklyOos": {
+        "buys": 41,
+        "possibleWindows": 71,
+        "deploymentRatioPct": 57.74647887323944,
+        "invested": 4100,
+        "units": 283.4601180255033,
+        "avgCost": 14.46411589947591,
+        "finalPrice": 9.712,
+        "finalValue": 2752.964666263688,
+        "returnOnInvestedPct": -32.854520335032,
+        "xirrAnnualPct": -48.22589549480792,
+        "maxDdRatioPct": 71.22599644468667,
+        "mar": -0.6770827773853557
+      },
+      "weeklyFull": {
+        "buys": 98,
+        "possibleWindows": 158,
+        "deploymentRatioPct": 62.0253164556962,
+        "invested": 9800,
+        "units": 764.7827198232798,
+        "avgCost": 12.814097057873523,
+        "finalPrice": 9.712,
+        "finalValue": 7427.569774923692,
+        "returnOnInvestedPct": -24.208471684452114,
+        "xirrAnnualPct": -17.201498307169537,
+        "maxDdRatioPct": 77.35116698966668,
+        "mar": -0.22238188480682497
+      },
+      "ungatedOos": {
+        "buys": 72,
+        "possibleWindows": 71,
+        "deploymentRatioPct": 101.40845070422534,
+        "invested": 7200,
+        "units": 518.6743582184395,
+        "avgCost": 13.881542216065602,
+        "finalPrice": 9.712,
+        "finalValue": 5037.365367017484,
+        "returnOnInvestedPct": -30.036592124757178,
+        "xirrAnnualPct": -42.339027719870515,
+        "maxDdRatioPct": 70.503503229007,
+        "mar": -0.6005237439386009
+      },
+      "lumpSumOos": {
+        "returnPct": -51.64095371013104,
+        "maxDdPct": 70.92394304007065
+      },
+      "cadenceOos": {
+        "weekly": {
+          "buys": 41,
+          "possibleWindows": 71,
+          "deploymentRatioPct": 57.74647887323944,
+          "invested": 4100,
+          "units": 283.4601180255033,
+          "avgCost": 14.46411589947591,
+          "finalPrice": 9.712,
+          "finalValue": 2752.964666263688,
+          "returnOnInvestedPct": -32.854520335032,
+          "xirrAnnualPct": -48.22589549480792,
+          "maxDdRatioPct": 71.22599644468667,
+          "mar": -0.6770827773853557
+        },
+        "biweekly": {
+          "buys": 23,
+          "possibleWindows": 35,
+          "deploymentRatioPct": 65.71428571428571,
+          "invested": 2300,
+          "units": 158.15969152093217,
+          "avgCost": 14.542264074254335,
+          "finalPrice": 9.712,
+          "finalValue": 1536.0469240512932,
+          "returnOnInvestedPct": -33.21535112820464,
+          "xirrAnnualPct": -46.15847886455129,
+          "maxDdRatioPct": 71.09218090631896,
+          "mar": -0.6492764503226619
+        },
+        "monthly": {
+          "buys": 14,
+          "possibleWindows": 16,
+          "deploymentRatioPct": 87.5,
+          "invested": 1400,
+          "units": 95.6528232856404,
+          "avgCost": 14.63626427229745,
+          "finalPrice": 9.712,
+          "finalValue": 928.9802197501394,
+          "returnOnInvestedPct": -33.64427001784718,
+          "xirrAnnualPct": -46.19639858737589,
+          "maxDdRatioPct": 71.1268313296995,
+          "mar": -0.6494932745314954
+        }
+      }
+    }
+  ]
+}
