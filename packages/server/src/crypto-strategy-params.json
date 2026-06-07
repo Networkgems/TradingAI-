@@ -100,6 +100,27 @@
     },
     "cryptoRecommendation": "If keeping Ichimoku for crypto, use 4h candles with adjusted periods (7/22/44) to align with 7-day crypto weeks instead of 5-day stock weeks. Current implementation should be disabled for crypto until re-parameterized."
   },
+  "dca": {
+    "enabled": true,
+    "recommendation": "TRA-693/694 rebuild roster (crypto_core preset). Dollar-cost averaging is robust by construction — it does not need a per-trade timing edge that beats costs, which is the exact failure mode that benched the legacy timing roster (momentum / breakout_vol / mean_reversion / bb_fade) out-of-sample. Long-only, trend-gated, cadence-paced. Scoped to liquid majors BTC-USD / ETH-USD / SOL-USD. Demo/paper only until QuantTrader's go/no-go backtest clears the live promotion gate.",
+    "runsOn": "daily candles",
+    "params": {
+      "cadenceDays": 7,
+      "cadenceMs": 604800000,
+      "trendEmaPeriod": 200,
+      "requireUptrend": true,
+      "atrPeriod": 14,
+      "atrStopMultiplier": 6,
+      "targetRR": 4,
+      "_reasoning": {
+        "cadenceDays": "Weekly accumulation: one BUY per symbol per 7-day window. DCA's robustness comes from spacing buys over time and smoothing volatility, not from picking the bottom.",
+        "trendEmaPeriod": "200-day macro trend gate. Accumulate only while price holds above the 200-EMA so capital is committed to assets in a healthy regime and paused through deep structural downtrends (TRA-693 research: 'above the 200-EMA = a buying opportunity'). Needs trendEmaPeriod+1 = 201 daily bars before the strategy fires.",
+        "atrStopMultiplier": "Wide 6x ATR(14) catastrophe stop. DCA is hold-oriented, so the stop sits far out to cap a structural-collapse tail rather than scalp wiggles (TRA-693 non-negotiable: hard stop-loss on every position).",
+        "targetRR": "4R long-horizon target — comfortably clears the >=1:2 reward:risk floor while leaving room for multi-week appreciation."
+      }
+    },
+    "note": "These values are the source of truth that DCA_PARAMS in packages/server/src/crypto-engine.ts mirrors (the engine constructs CryptoDcaStrategy with constructor opts in code, matching how bb_fade / swing are configured). Keep the two in sync. Position SIZE and the 1-2% risk rule are enforced by the engine risk layer (resolveRiskPerTrade / TRA-526), not by these params."
+  },
   "globalCryptoSettings": {
     "sessionReset": "midnight UTC",
     "tradingHours": "24/7",

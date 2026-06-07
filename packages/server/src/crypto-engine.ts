@@ -1,6 +1,7 @@
 import {
   BbFadeStrategy,
   SwingStrategy,
+  CryptoDcaStrategy,
   CoinbaseOrderClient,
   RegimeDetector,
   MomentumStrategy,
@@ -170,12 +171,35 @@ export function mergeCandles(cached: Candle[] | undefined, fresh: readonly Candl
  */
 const SIGNAL_VALID_MS = 30 * 60_000;
 
+/**
+ * TRA-694 — DCA accumulation tuning. Kept here (not loaded from JSON) to match
+ * how every other crypto strategy is constructed — bb_fade / swing take their
+ * params as constructor opts in code. These values mirror the documented `dca`
+ * block in `crypto-strategy-params.json`; keep the two in sync. DCA runs on
+ * DAILY bars, so the cadence/EMA are expressed in day-scale terms:
+ *   • weekly cadence (one accumulation BUY per symbol per 7 calendar days),
+ *   • 200-day trend EMA gate (accumulate only above the macro trend),
+ *   • wide 6× ATR(14) catastrophe stop, 4R long-horizon target (≥1:2 floor).
+ */
+const DCA_PARAMS = {
+  cadenceMs: 7 * 24 * 60 * 60 * 1000,
+  trendEmaPeriod: 200,
+  requireUptrend: true,
+  atrPeriod: 14,
+  atrStopMultiplier: 6,
+  targetRR: 4,
+} as const;
+
 export class CryptoSignalEngine {
   // TRA-313: dropped reversal / macdTrend / scalping per board pick on TRA-305.
   //          BbFade and Swing remain as direct (non-router) strategies; the
   //          router below owns momentum / breakout_vol / mean_reversion.
   private readonly bbFade = new BbFadeStrategy({ enforceTimeFilter: false });
   private readonly swing = new SwingStrategy();
+  // TRA-694: DCA is a direct (non-router) strategy like bbFade/swing. One shared
+  // instance — it carries per-symbol cadence state (lastFireTs) internally, so a
+  // single instance paces every symbol independently across demo + live ticks.
+  private readonly dca = new CryptoDcaStrategy(DCA_PARAMS);
   /**
    * TRA-208: per-symbol regime-aware routers for the new strategy roster
    * (momentum / mean-reversion / breakout). Each router owns its own
@@ -711,6 +735,8 @@ export class CryptoSignalEngine {
   // 50 bars to seed the regime classifier's MA, mean-reversion gates on a
   // 50-bar EMA. 50 covers all three.
   private static readonly MIN_BARS_ROUTER = 50;
+  // TRA-694: DCA needs trendEmaPeriod(200)+1 daily bars to seed the macro EMA.
+  private static readonly MIN_BARS_DCA = DCA_PARAMS.trendEmaPeriod + 1;
 
   /**
    * TRA-423 — pairwise daily-return correlation matrix for the watchlist,
@@ -1245,6 +1271,13 @@ export class CryptoSignalEngine {
         && presetAllowsStrategySymbol(preset, 'swing_trade', sym)
         && dailyCandles.length >= 205
         ? this.swing.evaluate(sym, dailyCandles) : null;
+      // TRA-694: DCA is a direct strategy (like bb_fade / swing), gated by the
+      // preset's enabledStrategies + per-strategy universe. It runs on daily
+      // bars and paces itself via internal per-symbol cadence state.
+      const dcaSignal = strategyEnabled('dca')
+        && presetAllowsStrategySymbol(preset, 'dca', sym)
+        && dailyCandles.length >= CryptoSignalEngine.MIN_BARS_DCA
+        ? this.dca.evaluate(sym, dailyCandles) : null;
       // TRA-208: regime-aware router emits at most one momentum / breakout
       // / mean-reversion signal per tick. The router runs whenever any of
       // its three strategies are enabled by the preset; the post-router
@@ -1269,7 +1302,7 @@ export class CryptoSignalEngine {
         symbolsEvaluated++;
       }
 
-      for (const signal of [bbFadeSignal, swingSignal, routerSignal]) {
+      for (const signal of [bbFadeSignal, swingSignal, dcaSignal, routerSignal]) {
         if (!signal) continue;
         // TRA-261 — apply the perp shorts gates BEFORE the open-position /
         // recent-signal dedup. A suppressed signal still surfaces on the
@@ -1459,6 +1492,11 @@ export class CryptoSignalEngine {
         && presetAllowsStrategySymbol(preset, 'swing_trade', sym)
         && dailyCandles.length >= 205
         ? this.swing.evaluate(sym, dailyCandles) : null;
+      // TRA-694: DCA direct strategy on the live path, mirroring the demo loop.
+      const dcaSignal = strategyEnabled('dca')
+        && presetAllowsStrategySymbol(preset, 'dca', sym)
+        && dailyCandles.length >= CryptoSignalEngine.MIN_BARS_DCA
+        ? this.dca.evaluate(sym, dailyCandles) : null;
       // TRA-208: same router pipeline as the demo path so live and paper
       // produce identical regime-aware entries from the same regime state.
       // TRA-421 — getRouter applies the per-strategy universe gate.
@@ -1476,7 +1514,7 @@ export class CryptoSignalEngine {
         ? rawRouterSignal
         : null;
 
-      for (const signal of [bbFadeSignal, swingSignal, routerSignal]) {
+      for (const signal of [bbFadeSignal, swingSignal, dcaSignal, routerSignal]) {
         if (!signal) continue;
         // TRA-261 — apply the perp shorts gates BEFORE dedup so suppressed
         // signals still flow to the dashboard's Signals panel with the

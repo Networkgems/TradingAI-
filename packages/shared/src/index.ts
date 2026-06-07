@@ -429,7 +429,7 @@ export const MANAGED_ACCOUNT_RATIO = 0.5;   // 50% of total account auto-managed
 // user/engine to the named preset regardless of saved settings.
 
 /** Canonical preset identifiers — the literal union doubles as runtime validation. */
-export type StrategyPresetId = 'legacy_5' | 'bb_fade_sol_doge' | 'tra405_validated' | 'no_trade';
+export type StrategyPresetId = 'legacy_5' | 'bb_fade_sol_doge' | 'tra405_validated' | 'no_trade' | 'crypto_core';
 
 /** Crypto-strategy SignalTypes routable by the engine. Subset of {@link SignalType}. */
 export type CryptoStrategyType =
@@ -437,7 +437,8 @@ export type CryptoStrategyType =
   | 'swing_trade'
   | 'momentum'
   | 'mean_reversion'
-  | 'breakout_vol';
+  | 'breakout_vol'
+  | 'dca'; // TRA-694: dollar-cost-averaging accumulation (direct, non-router strategy)
 
 export interface StrategyPreset {
   id: StrategyPresetId;
@@ -567,6 +568,32 @@ export const STRATEGY_PRESETS: Readonly<Record<StrategyPresetId, StrategyPreset>
       'Risk stand-down (TRA-434): no strategies enabled and an empty symbol whitelist, so the engine opens no new entries on any symbol. Open positions still close on their existing exit logic. Used to pause the live crypto pilot after the TRA-432 NO-GO verdict.',
     enabledStrategies: [] as const,
     symbolFilter: [] as const,
+  },
+  // TRA-693 / TRA-694 — the post-TRA-432 replacement roster.
+  //
+  // The legacy timing strategies (momentum / breakout_vol / mean_reversion /
+  // bb_fade) all failed the CTO-adopted lower-CI-bound OOS robustness gate, so
+  // the live engine was stood down to `no_trade`. `crypto_core` is the board's
+  // recommended rebuild: dollar-cost averaging (DCA) — robust by construction
+  // because it does not need a per-trade edge that beats costs — paired with
+  // disciplined swing (trend filter + RSI pullback + ATR stop, ≥1:2 R:R). Both
+  // are scoped via `strategyUniverse` to the liquid majors (BTC/ETH/SOL) where a
+  // continuous bid and tight spreads make accumulation and stops dependable.
+  //
+  // TRA-694 lands DEMO wiring only. The live cutover (`LIVE_STRATEGY_PRESET`)
+  // stays `no_trade` and is owned by parent TRA-693 under board approval, gated
+  // on QuantTrader's go/no-go backtest of this roster on real Coinbase bars.
+  crypto_core: {
+    id: 'crypto_core',
+    displayName: 'Crypto Core — DCA + disciplined swing (BTC/ETH/SOL)',
+    description:
+      'TRA-693 rebuild roster: dollar-cost-averaging accumulation (long-only, trend-gated, cadence-paced) plus disciplined swing trading, scoped to the liquid majors BTC-USD / ETH-USD / SOL-USD. DCA is robust by construction (no per-trade cost edge required), the failure mode that benched the legacy roster. Demo/paper only until the live promotion gate passes.',
+    enabledStrategies: ['dca', 'swing_trade'] as const,
+    symbolFilter: null,
+    strategyUniverse: {
+      dca: ['BTC-USD', 'ETH-USD', 'SOL-USD'] as const,
+      swing_trade: ['BTC-USD', 'ETH-USD', 'SOL-USD'] as const,
+    },
   },
 };
 
