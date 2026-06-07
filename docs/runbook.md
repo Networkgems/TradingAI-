@@ -123,6 +123,18 @@ scaling and alert response.
     relocates the **machine-wide npm global prefix**, unsafe on `PG-DEVOPS14`
     which launches the Paperclip control plane via `npx`. The TRA-493 plan
     pre-approved a scripted scheduled task as the Part A fallback.
+- **Admin login for the News-tab POST path (per-fire login).** The pre-/post-market
+  routine publishes research to the Stocks → News tab via
+  [`scripts/post-research-report.mjs`](../scripts/post-research-report.mjs), which
+  **logs in fresh on every fire** with `ADMIN_USERNAME`/`ADMIN_PASSWORD` (TRA-493 /
+  TRA-578). Static bearer tokens are *not* the documented path — they are
+  HMAC-signed with `AUTH_SECRET` and expire after `AUTH_TOKEN_TTL_HOURS` (default
+  24h, TRA-404/C1), so a baked token dies within a day.
+  - ⚠️ **Rotating `ADMIN_PASSWORD`** requires updating **two** `.env` files
+    together, or the next routine fire 401s: (1) the **trading-server** `.env` on
+    `PG-DEVOPS14` (the credential the server authenticates against), and (2) the
+    **Paperclip instance** `.env` (the `ADMIN_PASSWORD` the routine passes to the
+    script). Change both in the same maintenance window (TRA-607).
 
 ## 2. Deploy procedure
 

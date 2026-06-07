@@ -2,31 +2,29 @@
 // so it surfaces in the Stocks → News tab. Used by the Pre-/Post-market
 // routine (TRA-223) on each fire, after the agent has produced its review.
 //
-// Usage (env-only, body from stdin):
+// Usage (env-only, body from stdin) — the self-hosted trading-server is
+// host-local under PM2 (docs/runbook.md §1), so API_BASE is localhost:
 //
-//   API_BASE=https://tradingai-bqb1.onrender.com \
+//   API_BASE=http://localhost:4242 \
 //   ADMIN_USERNAME=admin ADMIN_PASSWORD=… \
 //   node scripts/post-research-report.mjs \
 //     --kind=premarket --title="Pre-Market Prep — Mon 2026-05-04" \
 //     --tickers=AMD,PLTR,NVDA \
 //     --body-file=./review.md
 //
-// Or shortcut with a pre-issued bearer token (skips login):
+// Auth — per-fire login is the documented path (TRA-493/TRA-578): on each run
+// the script POSTs /api/auth/login with ADMIN_USERNAME (default `admin`) +
+// ADMIN_PASSWORD to mint a FRESH token. This is required because server tokens
+// are HMAC-signed with AUTH_SECRET (invalidated on secret rotation / restart)
+// AND carry a max-age TTL (AUTH_TOKEN_TTL_HOURS, default 24h — TRA-404/C1), so a
+// token minted once and stored in a routine env reliably dies within a day.
+// Therefore the robust routine wiring is ADMIN_USERNAME + ADMIN_PASSWORD.
 //
-//   ADMIN_TOKEN=… node scripts/post-research-report.mjs --kind=postmarket …
-//
-// Auth: prefers ADMIN_TOKEN if set; otherwise POSTs /api/auth/login with
-// ADMIN_USERNAME (default `admin`) + ADMIN_PASSWORD to get a fresh token.
-//
-// Self-healing (TRA-578): a baked static ADMIN_TOKEN is fragile — server
-// tokens are HMAC-signed with AUTH_SECRET (invalidated on secret rotation /
-// restart) AND carry a max-age TTL (AUTH_TOKEN_TTL_HOURS, default 24h), so a
-// token minted once and stored in the routine env reliably dies within a day.
-// To survive that, when the POST is rejected as unauthenticated (401/403) and
-// an ADMIN_PASSWORD is available, this script discards the stale token, logs
-// in fresh, and retries the POST once. The robust routine wiring is therefore
-// ADMIN_USERNAME + ADMIN_PASSWORD (mint fresh each fire); a static ADMIN_TOKEN
-// is at best an optimization that the password path now backstops.
+// Legacy backstop: a pre-issued ADMIN_TOKEN is still honored if present, but it
+// is fragile for the reasons above and should not be relied on. When the POST is
+// rejected as unauthenticated (401/403) and an ADMIN_PASSWORD is available, the
+// script discards the stale token, logs in fresh, and retries the POST once — so
+// a static ADMIN_TOKEN is at best an optimization the password path backstops.
 //
 // Idempotent: id defaults to `${kind}-${YYYY-MM-DD}` so same-day re-runs
 // upsert in place rather than duplicating.
