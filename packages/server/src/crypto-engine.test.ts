@@ -862,12 +862,13 @@ describe('mergeCandles — warm-cache eviction guard (TRA-593)', () => {
   it('a rate-limited partial fetch does NOT evict a warm cache below threshold', () => {
     // Warm: 80 contiguous bars [21..100]. Partial 429 fetch returns only the
     // last 17 bars [84..100]. Pre-fix this replaced the cache with 17 bars,
-    // dropping below MIN_BARS_ROUTER(50)/MIN_BARS_BB_FADE(28) and silencing
-    // the symbol. The merge must retain the warm history.
+    // dropping below the strategy minimum-bar floor and silencing the symbol
+    // (TRA-699 retired the bb_fade/router floors this once cited). The merge
+    // must retain the warm history.
     const warm = series(80, 100);
     const partial = series(17, 100);
     const out = mergeCandles(warm, partial, 80);
-    expect(out.length).toBeGreaterThanOrEqual(50); // still above the router floor
+    expect(out.length).toBeGreaterThanOrEqual(50); // warm history retained, not evicted to 17
     expect(out).toHaveLength(80);
     expect(out[out.length - 1].timestamp).toBe(100);
   });

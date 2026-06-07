@@ -1,13 +1,6 @@
 import {
-  BbFadeStrategy,
-  SwingStrategy,
   CryptoDcaStrategy,
   CoinbaseOrderClient,
-  RegimeDetector,
-  MomentumStrategy,
-  MeanReversionCryptoStrategy,
-  BreakoutVolStrategy,
-  StrategyRouter,
   CorrelationMatrix,
   admitUnderClusterCap,
   resolveCorrelationCapConfig,
@@ -18,7 +11,6 @@ import {
   SKIP_NOT_IN_UNIVERSE,
   type ShortFilterContext,
   type ClosedShortTrade,
-  type RouterUniverse,
   type CorrelationCapConfig,
 } from '@trading-app/engine';
 import { CRYPTO_WATCHLIST, isCryptoSymbolBlocked, aliasCryptoSymbol, resolveManagedAccountRatio, resolveRiskPerTrade, resolveStrategyPreset, presetAllowsStrategySymbol } from '@trading-app/shared';
@@ -140,9 +132,10 @@ export function resolveLiveSingleSymbolShortCap(
  * 429s the egress IP, the keyless Advanced Trade backstop 429s too, and the
  * thin Yahoo fallback yields only ~17 minute bars. The old
  * `cache.set(symbol, bars)` then evicted a previously-warm 80-bar series and
- * left 17, dropping the symbol below the strategy minimum-bar thresholds
- * (`MIN_BARS_BB_FADE`=28 / `MIN_BARS_ROUTER`=50) so *every* strategy skipped
- * it. Under sustained throttling (44 watchlist symbols, egress shared with
+ * left 17, dropping the symbol below the strategy minimum-bar thresholds so
+ * *every* strategy skipped it (TRA-699: the bb_fade/router floors this once
+ * cited are gone; the surviving DCA floor is `MIN_BARS_DCA`=201 daily bars).
+ * Under sustained throttling (44 watchlist symbols, egress shared with
  * the live engine, 60s ticks) the cache thrashed between warm and cold and the
  * demo engine emitted near-zero signals despite quotes reading "ok".
  *
@@ -197,24 +190,17 @@ const DCA_PARAMS = {
 } as const;
 
 export class CryptoSignalEngine {
-  // TRA-313: dropped reversal / macdTrend / scalping per board pick on TRA-305.
-  //          BbFade and Swing remain as direct (non-router) strategies; the
-  //          router below owns momentum / breakout_vol / mean_reversion.
-  private readonly bbFade = new BbFadeStrategy({ enforceTimeFilter: false });
-  private readonly swing = new SwingStrategy();
-  // TRA-694: DCA is a direct (non-router) strategy like bbFade/swing. One shared
-  // instance — it carries per-symbol cadence state (lastFireTs) internally, so a
-  // single instance paces every symbol independently across demo + live ticks.
+  // TRA-699: the legacy bb_fade / swing direct strategies and the per-symbol
+  // momentum / mean_reversion / breakout_vol StrategyRouter were retired here
+  // once TRA-697 benched the OOS-failed roster — no selectable preset enables
+  // them, so the wiring was inert. DCA is the sole surviving engine strategy.
+  // The strategy classes + StrategyRouter live on for the stock signal engine
+  // (signal-engine.ts) and the backtest harnesses; this engine no longer
+  // instantiates them.
+  // TRA-694: DCA is a direct strategy. One shared instance — it carries
+  // per-symbol cadence state (lastFireTs) internally, so a single instance
+  // paces every symbol independently across demo + live ticks.
   private readonly dca = new CryptoDcaStrategy(DCA_PARAMS);
-  /**
-   * TRA-208: per-symbol regime-aware routers for the new strategy roster
-   * (momentum / mean-reversion / breakout). Each router owns its own
-   * RegimeDetector — sharing across symbols would pollute the hysteresis
-   * label across uncorrelated tapes (BTC trending up while ETH ranges).
-   * Lazily created on first sight of each symbol so adding a coin to the
-   * watchlist mid-session doesn't require a restart.
-   */
-  private readonly routers = new Map<string, StrategyRouter>();
   private readonly account: CryptoPaperAccount;
   private readonly tracker: PnlTracker | undefined;
 
@@ -736,13 +722,10 @@ export class CryptoSignalEngine {
     this.symbolState.delete(symbol);
   }
 
-  // Minimum bars each strategy needs (used to gate evaluation per-symbol).
-  private static readonly MIN_BARS_BB_FADE = 28;    // bbPeriod(20) + adx warm-up
-  // TRA-208 router floor: momentum needs slowMaPeriod(50)+1, breakout needs
-  // 50 bars to seed the regime classifier's MA, mean-reversion gates on a
-  // 50-bar EMA. 50 covers all three.
-  private static readonly MIN_BARS_ROUTER = 50;
+  // Minimum bars the DCA strategy needs (used to gate evaluation per-symbol).
   // TRA-694: DCA needs trendEmaPeriod(200)+1 daily bars to seed the macro EMA.
+  // TRA-699: the legacy bb_fade (28-bar) and router (50-bar) floors were
+  // removed alongside their now-inert strategy wiring.
   private static readonly MIN_BARS_DCA = DCA_PARAMS.trendEmaPeriod + 1;
 
   /**
@@ -806,111 +789,13 @@ export class CryptoSignalEngine {
   }
 
   /**
-   * Lazily build a per-symbol regime-aware router (TRA-208). One router per
-   * symbol keeps each ticker's RegimeDetector hysteresis state isolated from
-   * the others. Strategies inside the router are also per-router because
-   * MomentumStrategy carries `lastFireTs` state that would otherwise be
-   * shared across symbols and rate-limit cross-asset signals incorrectly.
-   *
-   * TRA-421 — the caller passes the active preset's per-strategy universe so
-   * the (cached) router gates momentum / breakout_vol / mean_reversion to
-   * their validated symbol sets. It is re-applied every call rather than baked
-   * in at construction because the active preset can change at runtime while
-   * the per-symbol regime state must survive that change.
-   */
-  private getRouter(symbol: string, universe: RouterUniverse): StrategyRouter {
-    let r = this.routers.get(symbol);
-    if (!r) {
-      const regime = new RegimeDetector();
-      r = new StrategyRouter({
-        regime,
-        // TRA-261 — short overrides come straight from TRA-255 §4.1 / §4.2.
-        // Long-side fields are deliberately omitted so the long path stays
-        // byte-identical to the TRA-200 / TRA-207 spec values.
-        momentum: new MomentumStrategy(regime, {
-          paramsByDirection: {
-            short: {
-              // §4.1 — entry + 2.0 × ATR(14). Defensive lock in case the
-              // long-side default drifts later (TRA-200 says long should be
-              // 2.5 — separate ticket).
-              atrStopMultiplier: 2.0,
-              // §4.1 — 8-bar rearm overrides the donchianPeriod-derived default
-              // so short re-entry stays slower than long during clustered
-              // down moves.
-              rearmBars: 8,
-              // §4.1 — EMA(200) slope must be negative over the last 10 bars
-              // for a short. Long-side leaves this undefined (no slope check),
-              // preserving byte-identical long behaviour. On 4H bars the
-              // cascade-leg trigger below replaces the §4.1 short stack
-              // outright, so this gate only ever applies to non-4H short paths.
-              slowMaSlopeBars: 10,
-              // §4.1 — breakout-bar volume ≥ 1.25 × SMA(volume, 20). Mirrors
-              // BreakoutVolStrategy's volume guard but only applies to shorts.
-              volumeMultiplier: 1.25,
-              volumeSmaPeriod: 20,
-              // TRA-275 / TRA-255 §4.4 r6 — cascade-leg short trigger for 4H
-              // bars (Layer 3 structural rewrite). Activates only when the
-              // strategy detects 4H bar intervals; non-4H short paths fall
-              // through to the §4.1 stack above. Empty config = spec defaults
-              // (drop-bar 1.5× ATR, close-in-lower 33%, vol 1.5×, recent-high
-              // anchor 95% over 20-bar lookback).
-              byTimeframe: { '4h': {} },
-              // TRA-284 / TRA-255 §4.4 v2 — BTC RSI-extreme bracket trigger.
-              // Routes BTC-USD shorts through the bracket (RSI(14) ≥ 70 +
-              // 0.98 × max(high, 20) anchor + bearish-rejection close in
-              // lower-half range + softened daily-regime gate) instead of
-              // the cascade-leg trigger. Alts (ETH / SOL / XRP / DOGE) keep
-              // the cascade-leg trigger byte-unchanged. Bracket numerics
-              // resolve to the spec defaults; override knobs live on
-              // `btcRsiBracket` if needed in a future retune.
-              lowCascadeDensitySymbols: ['BTC-USD'],
-            },
-          },
-        }),
-        meanReversion: new MeanReversionCryptoStrategy(),
-        breakout: new BreakoutVolStrategy({
-          paramsByDirection: {
-            short: {
-              // §4.2 — ≥ 2.5 × SMA(volume, 20) volume confirmation. Phase-1.1
-              // 4H Breakout-short relaxes this to 1.50 × per the §4.4 r6
-              // knob-relaxation patch (matches the cascade-volume floor).
-              // The router can't dispatch on bar interval, so we run the 4H
-              // numbers across the live engine — the cascade-leg pre-route
-              // park (§4.4 r6) suppresses any non-4H Breakout short emission
-              // that would otherwise fire under the relaxed 1.50× gate.
-              volumeMultiplier: 1.5,
-              // §4.4 r6 — 4H-native consolidation window (10 bars × 4h ≈ 1.7
-              // days) replacing the 1D-derived 20-bar default. Same
-              // motivation as the volume relaxation: the long-side default
-              // is calibrated to daily bars and oversaturates on 4H.
-              consolidationBars: 10,
-              // §4.2 — entry + 1.75 × ATR(14) hard stop.
-              atrStopMultiplier: 1.75,
-              // §4.2 — entry − 3.0 × ATR(14) take profit (R:R ≈ 1.7:1).
-              atrTpMultiplier: 3.0,
-            },
-          },
-        }),
-      });
-      this.routers.set(symbol, r);
-    }
-    // TRA-421 — re-point the (possibly cached) router at the current preset's
-    // per-strategy universe before it evaluates this tick.
-    r.setUniverse(universe);
-    return r;
-  }
-
-  /**
    * TRA-261 — apply the perp shorts universe constraint and the §5
    * multiplicative short filters in priority order. Mutates the signal in
    * place by stamping `signalSkipReason` when a gate fails and returns the
    * resulting reason string (or null on a clean pass). Long signals are a
    * no-op — the function only inspects `side === 'sell'`.
    *
-   * Funding rate, BTC regime, spread, and OI inputs are sourced opportunistically:
-   *   - BTC regime: read live from the per-symbol router's RegimeDetector for
-   *     `BTC-USD`. Lazily creates the BTC router on first call so we don't
-   *     have to wait for BTC's own tick to ingest the gate.
+   * Funding rate, spread, and OI inputs are sourced opportunistically:
    *   - Funding rate / OI: hourly perp catalog refresh on the live broker
    *     (TRA-262). One `/products?product_type=FUTURE` round-trip populates
    *     the catalog AND the metrics cache, so adding the inputs costs zero
@@ -919,10 +804,17 @@ export class CryptoSignalEngine {
    *     the perp universe (TRA-262). A per-signal fetch would multiply the
    *     API budget on a tick that emits multiple short candidates.
    *
+   * TRA-699 — the BTC regime overlay (filter 2) previously read the
+   * per-symbol StrategyRouter's RegimeDetector. That router was retired with
+   * the inert momentum / mean_reversion / breakout_vol wiring, so no regime
+   * label is sourced here and the overlay is left undefined. This is a no-op
+   * under every selectable preset: the router strategies were the only short
+   * producers, so no short signal reaches this gate today regardless.
+   *
    * Demo-mode short signals: the live broker may be uninitialised, in which
    * case funding/OI/spread are left undefined and the corresponding gates
-   * skip per the strategy layer's best-effort contract. Universe and BTC
-   * regime gates always apply regardless of mode.
+   * skip per the strategy layer's best-effort contract. The universe gate
+   * always applies regardless of mode.
    */
   private applyShortGates(signal: TradeSignal, mode: 'demo' | 'live' = this.mode): void {
     if (signal.side !== 'sell') return;
@@ -932,14 +824,12 @@ export class CryptoSignalEngine {
       return;
     }
 
-    // BTC regime overlay (filter 2 — alts only). The per-symbol router for
-    // BTC-USD owns BTC's regime detector; querying its current label gives
-    // us the post-hysteresis regime without re-ticking the detector.
-    const btcRouter = this.routers.get('BTC-USD');
+    // TRA-699 — BTC regime overlay (filter 2) left undefined: its source was
+    // the per-symbol StrategyRouter's RegimeDetector, removed with the inert
+    // router wiring. Funding / OI / spread still come from the live broker.
     const liveCtx = this.liveAccount?.getPerpShortFilterContext(signal.symbol) ?? {};
     const ctx: ShortFilterContext = {
       ...liveCtx,
-      btcRegime: btcRouter ? btcRouter.currentRegime() : undefined,
     };
 
     const reason = evaluateShortFilters(signal, ctx);
@@ -1252,8 +1142,6 @@ export class CryptoSignalEngine {
     // TRA-480 — explicit `mode='demo'` so the preset/short-gate helpers
     // resolve against the demo branch's contract even when `this.mode='live'`.
     const preset = this.resolvePreset('demo');
-    const symbolAllowed = (sym: string) =>
-      preset.symbolFilter === null || preset.symbolFilter.includes(sym);
     const strategyEnabled = (s: CryptoStrategyType) => preset.enabledStrategies.includes(s);
     let symbolsEvaluated = 0;
     let symbolsSkipped = 0;
@@ -1267,41 +1155,17 @@ export class CryptoSignalEngine {
       const candles = this.candleCache.get(sym) ?? [];
       const dailyCandles = this.dailyCandleCache.get(sym) ?? [];
 
-      // Evaluate each strategy independently with its own minimum bar
-      // requirement. TRA-421 — `presetAllowsStrategySymbol` combines the
-      // preset-wide `symbolFilter` with the per-strategy `strategyUniverse`
-      // whitelist, so bb_fade only fires on its validated symbols.
-      const bbFadeSignal = candles.length >= CryptoSignalEngine.MIN_BARS_BB_FADE
-        && strategyEnabled('bb_fade') && presetAllowsStrategySymbol(preset, 'bb_fade', sym)
-        ? this.bbFade.evaluate(sym, candles) : null;
-      const swingSignal = strategyEnabled('swing_trade')
-        && presetAllowsStrategySymbol(preset, 'swing_trade', sym)
-        && dailyCandles.length >= 205
-        ? this.swing.evaluate(sym, dailyCandles) : null;
-      // TRA-694: DCA is a direct strategy (like bb_fade / swing), gated by the
-      // preset's enabledStrategies + per-strategy universe. It runs on daily
-      // bars and paces itself via internal per-symbol cadence state.
+      // TRA-699 — DCA is the only surviving engine strategy. The legacy
+      // bb_fade / swing direct strategies and the momentum / mean_reversion /
+      // breakout_vol router were removed here once TRA-697 left them gated off
+      // by every selectable preset. TRA-421 — `presetAllowsStrategySymbol`
+      // combines the preset-wide `symbolFilter` with the per-strategy
+      // `strategyUniverse` whitelist. DCA runs on daily bars and paces itself
+      // via internal per-symbol cadence state.
       const dcaSignal = strategyEnabled('dca')
         && presetAllowsStrategySymbol(preset, 'dca', sym)
         && dailyCandles.length >= CryptoSignalEngine.MIN_BARS_DCA
         ? this.dca.evaluate(sym, dailyCandles) : null;
-      // TRA-208: regime-aware router emits at most one momentum / breakout
-      // / mean-reversion signal per tick. The router runs whenever any of
-      // its three strategies are enabled by the preset; the post-router
-      // filter below drops emissions for strategies outside the preset.
-      const routerEnabled = strategyEnabled('momentum')
-        || strategyEnabled('mean_reversion')
-        || strategyEnabled('breakout_vol');
-      const rawRouterSignal = routerEnabled && symbolAllowed(sym)
-        && candles.length >= CryptoSignalEngine.MIN_BARS_ROUTER
-        ? this.getRouter(sym, preset.strategyUniverse ?? {}).evaluate(sym, candles) : null;
-      const routerSignal = rawRouterSignal
-        && (rawRouterSignal.type === 'momentum'
-          || rawRouterSignal.type === 'mean_reversion'
-          || rawRouterSignal.type === 'breakout_vol')
-        && strategyEnabled(rawRouterSignal.type)
-        ? rawRouterSignal
-        : null;
 
       if (candles.length === 0) {
         symbolsSkipped++;
@@ -1309,7 +1173,7 @@ export class CryptoSignalEngine {
         symbolsEvaluated++;
       }
 
-      for (const signal of [bbFadeSignal, swingSignal, dcaSignal, routerSignal]) {
+      for (const signal of [dcaSignal]) {
         if (!signal) continue;
         // TRA-261 — apply the perp shorts gates BEFORE the open-position /
         // recent-signal dedup. A suppressed signal still surfaces on the
@@ -1348,8 +1212,7 @@ export class CryptoSignalEngine {
 
         // TRA-261 — suppressed signals still display on the dashboard but
         // do not open a position. Pre-routing skip strings are set by
-        // `applyShortGates` (universe gate + multiplicative §5 filters) and
-        // by `MeanReversionCryptoStrategy` (off-strategy MR shorts).
+        // `applyShortGates` (universe gate + multiplicative §5 filters).
         if (signal.signalSkipReason) continue;
 
         // TRA-338 — Coinbase-strict entry gate. We trade what Coinbase
@@ -1480,48 +1343,24 @@ export class CryptoSignalEngine {
     // preset), even when called from a hypothetical future caller with
     // this.mode still on demo.
     const preset = this.resolvePreset('live');
-    const symbolAllowed = (sym: string) =>
-      preset.symbolFilter === null || preset.symbolFilter.includes(sym);
     const strategyEnabled = (s: CryptoStrategyType) => preset.enabledStrategies.includes(s);
 
     for (const sym of activeSymbols) {
       // TRA-418 — skip stale-feed symbols before any strategy runs.
       if (staleSymbols.has(sym)) continue;
-      const candles = this.candleCache.get(sym) ?? [];
       const dailyCandles = this.dailyCandleCache.get(sym) ?? [];
 
+      // TRA-699 — DCA is the only surviving engine strategy; the legacy
+      // bb_fade / swing direct strategies and the momentum / mean_reversion /
+      // breakout_vol router were removed here (inert behind the preset gate).
       // TRA-421 — per-strategy universe gate (preset-wide filter + the
       // strategy's `strategyUniverse` whitelist). Mirrors the demo path.
-      const bbFadeSignal = candles.length >= CryptoSignalEngine.MIN_BARS_BB_FADE
-        && strategyEnabled('bb_fade') && presetAllowsStrategySymbol(preset, 'bb_fade', sym)
-        ? this.bbFade.evaluate(sym, candles) : null;
-      const swingSignal = strategyEnabled('swing_trade')
-        && presetAllowsStrategySymbol(preset, 'swing_trade', sym)
-        && dailyCandles.length >= 205
-        ? this.swing.evaluate(sym, dailyCandles) : null;
-      // TRA-694: DCA direct strategy on the live path, mirroring the demo loop.
       const dcaSignal = strategyEnabled('dca')
         && presetAllowsStrategySymbol(preset, 'dca', sym)
         && dailyCandles.length >= CryptoSignalEngine.MIN_BARS_DCA
         ? this.dca.evaluate(sym, dailyCandles) : null;
-      // TRA-208: same router pipeline as the demo path so live and paper
-      // produce identical regime-aware entries from the same regime state.
-      // TRA-421 — getRouter applies the per-strategy universe gate.
-      const routerEnabled = strategyEnabled('momentum')
-        || strategyEnabled('mean_reversion')
-        || strategyEnabled('breakout_vol');
-      const rawRouterSignal = routerEnabled && symbolAllowed(sym)
-        && candles.length >= CryptoSignalEngine.MIN_BARS_ROUTER
-        ? this.getRouter(sym, preset.strategyUniverse ?? {}).evaluate(sym, candles) : null;
-      const routerSignal = rawRouterSignal
-        && (rawRouterSignal.type === 'momentum'
-          || rawRouterSignal.type === 'mean_reversion'
-          || rawRouterSignal.type === 'breakout_vol')
-        && strategyEnabled(rawRouterSignal.type)
-        ? rawRouterSignal
-        : null;
 
-      for (const signal of [bbFadeSignal, swingSignal, dcaSignal, routerSignal]) {
+      for (const signal of [dcaSignal]) {
         if (!signal) continue;
         // TRA-261 — apply the perp shorts gates BEFORE dedup so suppressed
         // signals still flow to the dashboard's Signals panel with the
@@ -1681,8 +1520,8 @@ export class CryptoSignalEngine {
       if (Date.now() - lastBar.timestamp < hourMs) return;
     }
     const bars = await fetchCryptoDailyBars(symbol, 260);
-    // TRA-593 — merge so a rate-limited partial daily fetch can't drop the
-    // swing strategy's 205-bar history below threshold and silence it.
+    // TRA-593 / TRA-699 — merge so a rate-limited partial daily fetch can't
+    // drop the DCA strategy's 200-day-EMA history below threshold and silence it.
     if (bars.length > 0) {
       this.dailyCandleCache.set(symbol, mergeCandles(this.dailyCandleCache.get(symbol), bars, 260));
     }
