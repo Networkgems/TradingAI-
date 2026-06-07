@@ -31,6 +31,11 @@ import {
   type OptionsIdeasFeed,
   type IdeaEntryIntent,
 } from './options-ideas-feed.js';
+import {
+  isOverMonthlyCap,
+  recordOptionsSpend,
+  optionsSpendStatus,
+} from './options-spend-store.js';
 import { logger } from './observability/index.js';
 
 const log = logger.child({ module: 'options-ideas' });
@@ -237,6 +242,18 @@ export async function buildIdeasFeed(opts: BuildIdeasOptions): Promise<OptionsId
   const input = fuseOptionsResearchInput(snapshots, now, { contextFor, now });
   input.guardrail = ideaGuardrail();
 
+  // CFO spend guardrail (TRA-658): hard tripwire BEFORE the paid LLM call so the
+  // feed can never spend past the board-approved monthly cap. Chains + IV history
+  // above are kept warm (near-zero cost) so ivRank stays accurate when the cap
+  // resets next month; only the Anthropic call is gated. Degrade to non_live —
+  // the panel keeps its PREVIEW label, no user-facing break, no live-capital impact.
+  if (isOverMonthlyCap(now)) {
+    const s = optionsSpendStatus(now);
+    return nonLive(
+      `AI Options Ideas is paused for the rest of ${s.month}: the $${s.capUsd}/mo research budget is reached ($${s.spentUsd.toFixed(2)} spent). The feed resumes next month; live capital is unaffected (paper-only).`,
+    );
+  }
+
   // 3) run the Head-of-Options-Research pass against the real model.
   let research: OptionsResearchResult;
   try {
@@ -257,6 +274,13 @@ export async function buildIdeasFeed(opts: BuildIdeasOptions): Promise<OptionsId
   entryIntents.clear();
   for (const [id, intent] of intents) entryIntents.set(id, intent);
 
+  // CFO spend guardrail (TRA-658): account only real spend. A batch-cache hit
+  // re-serves a prior result for $0 and must not double-count against the cap.
+  if (!research.cached && research.costUsd > 0) {
+    recordOptionsSpend(research.costUsd, now);
+  }
+  const spend = optionsSpendStatus(now);
+
   feedCache = { key: cacheKey, builtAt: now, feed };
   log.info('options-ideas feed built', {
     universe: symbols.length,
@@ -264,6 +288,8 @@ export async function buildIdeasFeed(opts: BuildIdeasOptions): Promise<OptionsId
     ideas: feed.ideas.length,
     costUsd: research.costUsd,
     cached: research.cached,
+    monthSpendUsd: spend.spentUsd,
+    monthCapUsd: spend.capUsd,
   });
   return feed;
 }

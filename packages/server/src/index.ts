@@ -40,6 +40,7 @@ import { scanStocksMarket, scanCryptoMarket } from './market-scanner.js';
 import { runPremarketForAllUsers } from './premarket-watchlist.js';
 import { recordOptionChains } from './options-chain-recorder.js';
 import { buildIdeasFeed, getEntryIntent } from './options-ideas-service.js';
+import { optionsSpendStatus } from './options-spend-store.js';
 import { initIvRankStore } from './iv-rank-store.js';
 import {
   generateMarketReview,
@@ -1399,6 +1400,14 @@ app.post('/api/options/ideas/:id/paper-enter', requireAuth, async (req, res) => 
     contracts: opened.contracts,
     premiumPaid: opened.premiumPaid,
   });
+});
+
+// TRA-658 — CFO spend diagnostic: the running monthly Anthropic spend for the
+// live AI Options Ideas feed vs the board-approved cap. No PII or secrets — only
+// the aggregate dollar total, the cap, and whether the auto-degrade tripwire is
+// active — so the CFO can review spend from the Render URL without log access.
+app.get('/api/health/options-spend', (_req, res) => {
+  res.json(optionsSpendStatus());
 });
 
 // TRA-141 — storage diagnostic so QA can verify from outside the box that the
