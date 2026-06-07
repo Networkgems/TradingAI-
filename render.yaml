@@ -24,7 +24,9 @@
 # so set `TRADIER_ENV=production` and the production `TRADIER_*` pair HERE (in
 # the Render dashboard) — and NOWHERE else. Gate: this ownership must hold (or
 # be explicitly re-decided, de-credentialing the loser first) before any change
-# flips `LIVE_STRATEGY_PRESET` off `no_trade`.
+# flips `LIVE_STRATEGY_PRESET` off `no_trade`. (TRA-609: that flip has now
+# happened per board override — Render is the sole production live instance and
+# the PM2 self-host is sandbox-only, so this ownership condition holds.)
 #
 # Historical (TRA-444, 2026-05-17): at that time no Render service was
 # provisioned and production ran self-hosted under PM2. Superseded by the
@@ -119,27 +121,45 @@ services:
       # `bb_fade_sol_doge` pin traded DOGE-USD, which TRA-405 found
       # OOS-negative (−5.2%, profit factor 0.50).
       #
-      # TRA-434 — risk stand-down, pinned to `no_trade`. QuantTrader's
-      # clean-cache OOS re-validation (TRA-432) supersedes TRA-405: with the
-      # data cache rebuilt clean, bb_fade FAILS the CTO-adopted lower-CI-bound
-      # robustness gate on both live legs (DOGE-USD block-bootstrap CI entirely
-      # below zero; SOL-USD OOS -2.75%, p5 -8.57%). TRA-405's "go" — including
-      # the BTC-USD leg `tra405_validated` carried — used the dirty cache and
-      # is no longer trusted, so bb_fade has no clean lower-CI-bound-gate pass
-      # on ANY symbol. Per the CTO directive, Phase-2 live-capital trading
-      # stays on hold company-wide until a strategy passes that gate, so the
-      # live engine is pinned to `no_trade`: zero enabled strategies, empty
-      # symbol whitelist — it opens NO new entries on any symbol. Open
-      # positions still close on their existing exit logic (the preset gates
-      # entries only, not exits). To re-authorise a pilot once a strategy
-      # passes the CI gate, repoint this value to the approved preset id.
+      # TRA-434 (HISTORICAL) — risk stand-down, pinned to `no_trade`.
+      # QuantTrader's clean-cache OOS re-validation (TRA-432) superseded TRA-405:
+      # with the data cache rebuilt clean, bb_fade FAILS the CTO-adopted
+      # lower-CI-bound robustness gate on both live legs (DOGE-USD block-bootstrap
+      # CI entirely below zero; SOL-USD OOS -2.75%, p5 -8.57%). That NO-GO pinned
+      # the live engine to `no_trade` (zero enabled strategies, empty symbol
+      # whitelist — NO new entries on any symbol; open positions still exit).
       #
-      # Drop the env var to release control back to per-user settings (default
-      # `legacy_5` = pre-324 5-strategy roster). The legacy value
-      # `bb_fade_sol_doge_only` from TRA-324 is still accepted (mapped to
-      # `bb_fade_sol_doge`) for revert safety.
+      # TRA-609 — RESUME LIVE PILOT per board override. The board (TRA-577
+      # interaction 944ad8cc, ACCEPTED by local-board) OVERRODE QuantTrader's
+      # NO-GO and authorised resuming the live crypto pilot, acknowledging the
+      # negative-edge downside. This UN-PINS the TRA-434 `no_trade` stand-down:
+      # the value is now empty, which `CryptoSignalEngine.resolvePreset('live')`
+      # treats as "no forced pin" and falls through to the user's saved
+      # `activeStrategyPreset` (the same preset the TRA-532 promotion gate
+      # validates). Releasing to the per-user preset — rather than re-pinning a
+      # forced roster like `legacy_5` — is deliberate: the gate
+      # (`evaluateLiveTransitionGate`) checks `activeStrategyPreset`, so pinning
+      # a different forced roster here would let the engine trade strategies the
+      # gate never validated. Empty keeps engine == gate, so the gate stays the
+      # single authoritative control.
+      #
+      # SAFETY — un-pinning alone places NO live entries. Two gates remain intact
+      # and are NOT weakened here:
+      #   • TRA-532 promotion gate — `PUT /api/account/settings` refuses to turn
+      #     ON live crypto auto-trading unless EVERY strategy in the active preset
+      #     is fully promoted (backtest + paper + sign-off). No crypto strategy is
+      #     currently promoted and bb_fade fails robustness (TRA-432 NO-GO), so
+      #     live auto-trading cannot be enabled — the pilot is GATE-BLOCKED.
+      #   • TRA-526 deterministic risk caps / global kill switch — unchanged.
+      # The path to live crypto P&L is to promote a gate-PASSING crypto strategy
+      # (coordinate TRA-340 / TRA-305 / TRA-593). Running bb_fade live DESPITE the
+      # NO-GO would require an explicit board manual-promotion override — do NOT
+      # silently bypass the gate; escalate to the board first.
+      #
+      # The legacy value `bb_fade_sol_doge_only` from TRA-324 is still accepted
+      # (mapped to `bb_fade_sol_doge`) if a forced pin is ever reinstated.
       - key: LIVE_STRATEGY_PRESET
-        value: no_trade
+        value: ""
       # TRA-456 — DEMO engine strategy preset. The `LIVE_STRATEGY_PRESET`
       # stand-down above is scoped to the LIVE engine only: it is a
       # capital-allocation control, and the demo engine trades paper money

@@ -35,7 +35,13 @@ scaling and alert response.
 >
 > **Gate:** this ownership must hold (or be explicitly re-decided — de-credential
 > the loser *first*) before any change flips `LIVE_STRATEGY_PRESET` off
-> `no_trade`. To hand live ownership to the PM2 self-host instead, you must
+> `no_trade`. (TRA-609: this flip has happened — the board overrode the TRA-432
+> NO-GO via TRA-577/944ad8cc and un-pinned `no_trade` to empty, releasing the
+> live engine to the per-user preset. The ownership condition holds: Render is
+> the sole production live instance, PM2 is sandbox-only. The live pilot is
+> re-enabled but **gate-blocked** — the TRA-532 promotion gate still refuses to
+> arm live crypto auto-trading until a crypto strategy is fully promoted, and no
+> strategy currently is.) To hand live ownership to the PM2 self-host instead, you must
 > (1) clear `TRADIER_*` / set `TRADIER_ENV=sandbox` on Render bqb1, (2) drop the
 > `TRADIER_ENV: 'sandbox'` pin in `ecosystem.config.cjs`, and (3) update this
 > §1, the [`render.yaml`](../render.yaml) header, and the
