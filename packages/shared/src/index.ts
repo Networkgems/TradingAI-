@@ -569,30 +569,38 @@ export const STRATEGY_PRESETS: Readonly<Record<StrategyPresetId, StrategyPreset>
     enabledStrategies: [] as const,
     symbolFilter: [] as const,
   },
-  // TRA-693 / TRA-694 — the post-TRA-432 replacement roster.
+  // TRA-693 / TRA-694 / TRA-698 — the post-TRA-432 replacement roster.
   //
   // The legacy timing strategies (momentum / breakout_vol / mean_reversion /
   // bb_fade) all failed the CTO-adopted lower-CI-bound OOS robustness gate, so
   // the live engine was stood down to `no_trade`. `crypto_core` is the board's
   // recommended rebuild: dollar-cost averaging (DCA) — robust by construction
-  // because it does not need a per-trade edge that beats costs — paired with
-  // disciplined swing (trend filter + RSI pullback + ATR stop, ≥1:2 R:R). Both
-  // are scoped via `strategyUniverse` to the liquid majors (BTC/ETH/SOL) where a
-  // continuous bid and tight spreads make accumulation and stops dependable.
+  // because it does not need a per-trade edge that beats costs.
   //
-  // TRA-694 lands DEMO wiring only. The live cutover (`LIVE_STRATEGY_PRESET`)
-  // stays `no_trade` and is owned by parent TRA-693 under board approval, gated
-  // on QuantTrader's go/no-go backtest of this roster on real Coinbase bars.
+  // TRA-695 backtested the original DCA + disciplined-swing roster on the
+  // TRA-405 4H caches and returned NO-GO for swing on all 6 symbols (too
+  // inactive at 4H, TRA-540 gate verdict.pass=false) and beta-not-alpha for
+  // DCA (OOS 2025-26 deep-bear drawdowns), with the only OOS-survivable
+  // accumulation core being the liquid majors {BTC-USD, SOL-USD}. On the
+  // TRA-693 gate (board approval `cf17cc82`, 2026-06-07) the board adopted the
+  // recommended path: DROP swing entirely and run `crypto_core` as a DCA-only
+  // forward paper leg on {BTC-USD, SOL-USD} before any live capital.
+  //
+  // TRA-698 sets this go-forward config: DCA only, BTC/SOL only. Demo/paper
+  // only — the live cutover (`LIVE_STRATEGY_PRESET`) stays `no_trade`, owned by
+  // parent TRA-693 under board approval, and will not promote until the forward
+  // paper leg shows OOS-positive, risk-adjusted, after-cost results AND the
+  // board re-approves. The forward leg runs under the TRA-526 2%/trade hard cap
+  // and global kill-switch.
   crypto_core: {
     id: 'crypto_core',
-    displayName: 'Crypto Core — DCA + disciplined swing (BTC/ETH/SOL)',
+    displayName: 'Crypto Core — DCA only (BTC/SOL forward paper)',
     description:
-      'TRA-693 rebuild roster: dollar-cost-averaging accumulation (long-only, trend-gated, cadence-paced) plus disciplined swing trading, scoped to the liquid majors BTC-USD / ETH-USD / SOL-USD. DCA is robust by construction (no per-trade cost edge required), the failure mode that benched the legacy roster. Demo/paper only until the live promotion gate passes.',
-    enabledStrategies: ['dca', 'swing_trade'] as const,
+      'TRA-698 go-forward roster: dollar-cost-averaging accumulation (long-only, trend-gated, cadence-paced) only, scoped to the OOS-survivable liquid majors BTC-USD / SOL-USD. DCA is robust by construction (no per-trade cost edge required), the failure mode that benched the legacy roster. Disciplined swing was dropped after TRA-695 returned NO-GO on all 6 symbols. Demo/paper-only forward leg under the TRA-526 2% cap + kill-switch; LIVE stays no_trade until the forward leg proves out and the board re-approves under TRA-693.',
+    enabledStrategies: ['dca'] as const,
     symbolFilter: null,
     strategyUniverse: {
-      dca: ['BTC-USD', 'ETH-USD', 'SOL-USD'] as const,
-      swing_trade: ['BTC-USD', 'ETH-USD', 'SOL-USD'] as const,
+      dca: ['BTC-USD', 'SOL-USD'] as const,
     },
   },
 };

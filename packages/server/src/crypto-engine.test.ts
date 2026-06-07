@@ -341,11 +341,13 @@ describe('Strategy presets — TRA-325', () => {
     expect(presetAllowsStrategySymbol(p, 'bb_fade', 'BTC-USD')).toBe(false);
   });
 
-  it('TRA-345 / TRA-456 / TRA-521 / TRA-696 — getState().activePreset surfaces the resolved preset for API verification', () => {
+  it('TRA-345 / TRA-456 / TRA-521 / TRA-696 / TRA-698 — getState().activePreset surfaces the resolved preset for API verification', () => {
     // The default engine is a DEMO engine. Since TRA-696 the demo engine runs
-    // DEMO_STRATEGY_PRESET (default `crypto_core`, the TRA-693/694 rebuild
-    // roster) deterministically — it is no longer frozen by the live `no_trade`
+    // DEMO_STRATEGY_PRESET (default `crypto_core`, the TRA-693 rebuild roster)
+    // deterministically — it is no longer frozen by the live `no_trade`
     // stand-down and no longer falls through to per-user `activeStrategyPreset`.
+    // TRA-698 narrowed crypto_core to DCA-only on {BTC-USD, SOL-USD} after the
+    // TRA-695 NO-GO on swing (all 6 symbols) and ETH/ADA/DOGE/LINK.
     // The activePreset block lets /api/crypto/state confirm the active config
     // without Render dashboard / server-log access.
     const engine = new CryptoSignalEngine();
@@ -353,11 +355,10 @@ describe('Strategy presets — TRA-325', () => {
     expect(ap.id).toBe('crypto_core');
     // envValue surfaces the LIVE_STRATEGY_PRESET var; unset under test.
     expect(ap.envValue).toBe('');
-    expect([...ap.enabledStrategies]).toEqual(['dca', 'swing_trade']);
+    expect([...ap.enabledStrategies]).toEqual(['dca']);
     expect(ap.symbolFilter).toBeNull();
     expect(ap.strategyUniverse).toEqual({
-      dca: ['BTC-USD', 'ETH-USD', 'SOL-USD'],
-      swing_trade: ['BTC-USD', 'ETH-USD', 'SOL-USD'],
+      dca: ['BTC-USD', 'SOL-USD'],
     });
   });
 

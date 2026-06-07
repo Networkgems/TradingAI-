@@ -184,13 +184,21 @@ services:
       # deterministically — it does NOT fall through to per-user
       # `activeStrategyPreset`, so the board always watches one consistent
       # roster. TRA-521 — the board asked for an ACTIVE demo dashboard (live
-      # stays paused; they evaluate demo P&L before funding live), so this is
-      # pinned to `legacy_5` (all five strategies, full Coinbase watchlist) for
-      # visible activity. It is paper money and reaches nothing live without
-      # passing the TRA-532 promotion gate. If unset the engine defaults to
-      # `legacy_5` anyway; this key makes the demo pin explicit in the config.
+      # stays paused; they evaluate demo P&L before funding live).
+      #
+      # TRA-696 / TRA-698 — the demo pin is now `crypto_core`, the post-TRA-432
+      # rebuild roster. TRA-695 backtested DCA+swing and returned NO-GO on swing
+      # (all 6 symbols) and beta-not-alpha on DCA, so on the TRA-693 gate (board
+      # approval `cf17cc82`, 2026-06-07) the board adopted the recommended path:
+      # run `crypto_core` as a DCA-ONLY forward paper leg on {BTC-USD, SOL-USD}
+      # to accumulate genuine forward OOS evidence before any live capital. The
+      # code default (`DEMO_PRESET_DEFAULT`) is already `crypto_core`; this key
+      # makes the demo pin explicit and matches it so the deployed demo engine
+      # actually runs the forward leg. It is paper money and reaches nothing live
+      # without passing the TRA-532 promotion gate. LIVE stays un-pinned (gate-
+      # blocked, no live entries) — only the board re-promotes under TRA-693.
       - key: DEMO_STRATEGY_PRESET
-        value: legacy_5
+        value: crypto_core
       # TRA-406 — observability. All optional; sane defaults apply when unset.
       #   LOG_LEVEL          debug|info|warn|error (default info)
       #   ERROR_WEBHOOK_URL  HTTPS endpoint captured errors are POSTed to

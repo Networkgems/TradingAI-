@@ -832,8 +832,8 @@ export function UserManagementSection({ token, httpUrl }: { token: string; httpU
 // without the badge. Repoint this id once a strategy clears the promotion gate.
 const RECOMMENDED_PRESET_ID: StrategyPresetId = 'no_trade';
 // Presets surfaced in the primary list. Everything else lives under Advanced.
-// TRA-694: surface `crypto_core` (the DCA + disciplined-swing rebuild roster)
-// in the primary list so operators can select it for demo/paper trading.
+// TRA-694 / TRA-698: surface `crypto_core` (the DCA-only BTC/SOL forward-paper
+// roster) in the primary list so operators can select it for demo/paper trading.
 const PRIMARY_PRESET_IDS: readonly StrategyPresetId[] = ['crypto_core', 'tra405_validated', 'no_trade'];
 
 function StrategyPresetCard({
