@@ -171,8 +171,12 @@ services:
       # NO-GO would require an explicit board manual-promotion override — do NOT
       # silently bypass the gate; escalate to the board first.
       #
-      # The legacy value `bb_fade_sol_doge_only` from TRA-324 is still accepted
-      # (mapped to `bb_fade_sol_doge`) if a forced pin is ever reinstated.
+      # TRA-697 — the OOS-failed legacy roster (`legacy_5`, `bb_fade_sol_doge`,
+      # `tra405_validated`) and TRA-324's `bb_fade_sol_doge_only` alias were
+      # RETIRED after the TRA-695 NO-GO and the TRA-693 board decision. Any of
+      # those values (or any other unknown id) now resolves to `no_trade` — the
+      # safe no-entry fallback — not a benched roster. The only surviving presets
+      # are `no_trade` (live stand-down) and `crypto_core` (DCA-only forward leg).
       - key: LIVE_STRATEGY_PRESET
         value: ""
       # TRA-456 — DEMO engine strategy preset. The `LIVE_STRATEGY_PRESET`

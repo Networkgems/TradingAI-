@@ -490,18 +490,18 @@ export class CryptoSignalEngine {
    *
    *   • live — `LIVE_STRATEGY_PRESET` ({@link FORCED_PRESET_ENV}), when set,
    *     wins over per-user settings so Render can pin the live engine
-   *     (currently `no_trade`, the TRA-434 risk stand-down). With the env var
-   *     unset the live engine honours the user's saved `activeStrategyPreset`,
-   *     defaulting to `legacy_5` for snapshots persisted before that field
-   *     existed.
+   *     (currently un-pinned, gate-blocked by TRA-532). With the env var unset
+   *     the live engine honours the user's saved `activeStrategyPreset`,
+   *     defaulting to `no_trade` (TRA-697; `legacy_5` was retired) for snapshots
+   *     persisted before that field existed — the safe, no-entry fallback.
    *
    *   • demo — paper money, zero real-capital exposure. The live stand-down is
    *     a capital-allocation control, not a demo-visibility control, so the
    *     demo engine is NOT frozen by `LIVE_STRATEGY_PRESET`. It resolves
    *     `DEMO_STRATEGY_PRESET` ({@link DEMO_PRESET_ENV}), defaulting to
-   *     `tra405_validated`, and deliberately does NOT fall through to per-user
-   *     `activeStrategyPreset` — the board needs one deterministic candidate
-   *     roster on the demo dashboard (TRA-456 CTO decision).
+   *     `crypto_core` (TRA-698 DCA-only forward leg), and deliberately does NOT
+   *     fall through to per-user `activeStrategyPreset` — the board needs one
+   *     deterministic candidate roster on the demo dashboard (TRA-456 CTO decision).
    *
    * TRA-480 — `mode` defaults to `this.mode` so legacy callers (boot logger,
    * `buildState`) keep their original semantics. The parallel demo+live tick
@@ -629,9 +629,10 @@ export class CryptoSignalEngine {
     // Prints the resolved preset id, enabled strategies, symbol filter, and the
     // raw `LIVE_STRATEGY_PRESET` env value the process actually saw. This is
     // the deploy gate: if the env var is unset on Render or has a typo,
-    // `resolveStrategyPreset` silently falls back to `legacy_5` and the live
-    // engine runs the unrestricted roster — exactly the regression that
-    // produced the 13 wrong-symbol/strategy trades on 2026-05-05→05-07. Logging
+    // `resolveStrategyPreset` falls back to `no_trade` (TRA-697; was `legacy_5`)
+    // so the live engine opens no new entries rather than running an
+    // unrestricted roster — the safe degrade for the regression that produced
+    // the 13 wrong-symbol/strategy trades on 2026-05-05→05-07. Logging
     // this once at boot means the next time someone questions whether the
     // preset is active, the server logs answer it directly.
     // TRA-480 — log BOTH branches' resolved presets at boot so future triage
@@ -647,7 +648,7 @@ export class CryptoSignalEngine {
       // TRA-479 / TRA-480 — engine mode + both preset env vars so future
       // "demo dashboard idle" triage can read the boot log directly instead
       // of guessing. `liveEnv` is `LIVE_STRATEGY_PRESET`; `demoEnv` is
-      // `DEMO_STRATEGY_PRESET` (empty → default `legacy_5`, TRA-521).
+      // `DEMO_STRATEGY_PRESET` (empty → default `crypto_core`, TRA-698).
       mode: this.mode,
       liveEnv: FORCED_PRESET_ENV,
       demoEnv: DEMO_PRESET_ENV,

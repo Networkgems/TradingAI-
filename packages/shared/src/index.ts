@@ -428,8 +428,18 @@ export const MANAGED_ACCOUNT_RATIO = 0.5;   // 50% of total account auto-managed
 // to act as a process-wide forced override — set on Render, it pins every
 // user/engine to the named preset regardless of saved settings.
 
-/** Canonical preset identifiers — the literal union doubles as runtime validation. */
-export type StrategyPresetId = 'legacy_5' | 'bb_fade_sol_doge' | 'tra405_validated' | 'no_trade' | 'crypto_core';
+/**
+ * Canonical preset identifiers — the literal union doubles as runtime validation.
+ *
+ * TRA-697 retired the OOS-failed legacy crypto roster: the `legacy_5`,
+ * `bb_fade_sol_doge`, and `tra405_validated` presets were dropped after
+ * QuantTrader's TRA-695 verdict (the legacy timing strategies and the
+ * macd_bollinger/bb_fade edge all fail the lower-CI-bound OOS robustness gate)
+ * and the TRA-693 board decision (approval `cf17cc82`) to run a DCA-only
+ * forward paper leg instead. Only the live-relevant presets survive: `no_trade`
+ * (the live stand-down) and `crypto_core` (the go-forward DCA-only roster).
+ */
+export type StrategyPresetId = 'no_trade' | 'crypto_core';
 
 /** Crypto-strategy SignalTypes routable by the engine. Subset of {@link SignalType}. */
 export type CryptoStrategyType =
@@ -480,87 +490,31 @@ export interface StrategyPreset {
 }
 
 /**
- * Read-only preset library:
- *   • `legacy_5`         — pre-TRA-325 status quo: all 5 crypto strategies on
- *                          all 51 long symbols, perp shorts on PERP_SHORTS_UNIVERSE.
- *   • `bb_fade_sol_doge` — bb_fade only, scoped to SOL-USD + DOGE-USD. This
- *                          captures the live test config that shipped via
- *                          TRA-324's env-var hardcoding.
- *   • `tra405_validated` — TRA-421: the TRA-405 §8 out-of-sample go/no-go
- *                          roster. bb_fade only, gated to {BTC-USD, SOL-USD}
- *                          via {@link StrategyPreset.strategyUniverse}.
- *                          Superseded by `no_trade` as the live pin — see
- *                          TRA-434 below — but kept in the library for the
- *                          Settings UI and as the revert target once a
- *                          strategy clears the lower-CI-bound gate.
- *   • `no_trade`         — TRA-434 risk stand-down preset: zero enabled
- *                          strategies and an empty symbol whitelist, so every
- *                          per-tick `strategyEnabled()` / `symbolAllowed()`
- *                          check returns false and the engine opens NO new
- *                          entries. Exit/position-management logic is not
- *                          gated by the preset, so positions already open
- *                          continue to close on their own stop/target rules.
- *                          Used by the `LIVE_STRATEGY_PRESET` env var to pause
- *                          the live crypto pilot after the TRA-432 NO-GO,
- *                          which superseded TRA-405's dirty-cache "go".
- *                          TRA-456: `LIVE_STRATEGY_PRESET` is scoped to the
- *                          LIVE engine only — the demo engine ignores it and
- *                          runs `DEMO_STRATEGY_PRESET` (default
- *                          `tra405_validated`), so this stand-down freezes
- *                          live-capital trading without blanking the
- *                          paper-money demo dashboard.
+ * Read-only preset library. TRA-697 retired the OOS-failed legacy roster
+ * (`legacy_5`, `bb_fade_sol_doge`, `tra405_validated`) — see {@link StrategyPresetId}
+ * — leaving the two live-relevant presets:
+ *   • `no_trade`   — TRA-434 risk stand-down preset: zero enabled strategies
+ *                    and an empty symbol whitelist, so every per-tick
+ *                    `strategyEnabled()` / `symbolAllowed()` check returns
+ *                    false and the engine opens NO new entries. Exit/position-
+ *                    management logic is not gated by the preset, so positions
+ *                    already open continue to close on their own stop/target
+ *                    rules. Used by the `LIVE_STRATEGY_PRESET` env var (and as
+ *                    the resolver's default — see {@link DEFAULT_STRATEGY_PRESET_ID})
+ *                    to keep the live crypto engine stood down.
+ *                    TRA-456: `LIVE_STRATEGY_PRESET` is scoped to the LIVE
+ *                    engine only — the demo engine ignores it and runs
+ *                    `DEMO_STRATEGY_PRESET` (default `crypto_core`), so the
+ *                    live stand-down never blanks the paper-money demo board.
+ *   • `crypto_core` — TRA-698 go-forward roster: DCA only, scoped to the
+ *                     OOS-survivable liquid majors {BTC-USD, SOL-USD}. Demo/
+ *                     paper-only forward leg; LIVE stays `no_trade` until the
+ *                     leg proves out and the board re-approves under TRA-693.
  *
  * Future presets are added here without code changes elsewhere — the engine
  * resolves by id, the UI lists `Object.values(STRATEGY_PRESETS)`.
  */
 export const STRATEGY_PRESETS: Readonly<Record<StrategyPresetId, StrategyPreset>> = {
-  legacy_5: {
-    id: 'legacy_5',
-    displayName: 'Legacy 5-strategy roster',
-    description:
-      'All five crypto strategies (bb_fade, mean_reversion, momentum, breakout_vol, swing_trade) firing across the full Coinbase watchlist. Perp shorts respect PERP_SHORTS_UNIVERSE.',
-    enabledStrategies: ['bb_fade', 'swing_trade', 'momentum', 'mean_reversion', 'breakout_vol'] as const,
-    symbolFilter: null,
-  },
-  bb_fade_sol_doge: {
-    id: 'bb_fade_sol_doge',
-    displayName: 'bb_fade only — SOL + DOGE',
-    description:
-      'bb_fade scoped to SOL-USD and DOGE-USD. Captures the TRA-324 live-test config: only bb_fade fires, only on the two symbols.',
-    enabledStrategies: ['bb_fade'] as const,
-    symbolFilter: ['SOL-USD', 'DOGE-USD'] as const,
-  },
-  // TRA-421 — the TRA-405 §8 out-of-sample go/no-go roster.
-  //
-  // TRA-405 re-ran the strategy roster on 3.05 years of real Coinbase 4H bars
-  // (IS vs OOS split, tiered cost model, block-bootstrap confidence). Of five
-  // strategies × six symbols, exactly two cells survived costs out-of-sample:
-  // `macd_bollinger` on BTC-USD and on SOL-USD. `momentum` and `breakout_vol`
-  // were OOS-negative on every symbol tested; `mean_reversion` was inert.
-  //
-  // Strategy-name mapping: TRA-405's backtest `macd_bollinger` strategy runs
-  // the engine's macd-trend + bb-fade strategies together, and the report
-  // (§4.1) attributes its entire OOS edge to "the bb_fade pattern". macd-trend
-  // was dropped from the live engine in TRA-313, so the live carrier of the
-  // validated macd_bollinger edge is `bb_fade`. This preset therefore enables
-  // `bb_fade` only and gates it — via `strategyUniverse` — to {BTC-USD,
-  // SOL-USD}. momentum / breakout_vol are simply not in `enabledStrategies`,
-  // which is how a strategy is disabled on the generic universe.
-  //
-  // TRA-432/TRA-434 NOTE: this preset is no longer the live pin. QuantTrader's
-  // clean-cache OOS re-validation (TRA-432) found bb_fade fails the
-  // CTO-adopted lower-CI-bound robustness gate, so `LIVE_STRATEGY_PRESET` is
-  // pinned to `no_trade`. The preset stays in the library for the Settings UI
-  // and as the revert target once a strategy clears the gate.
-  tra405_validated: {
-    id: 'tra405_validated',
-    displayName: 'TRA-405 validated — macd_bollinger (bb_fade) on BTC + SOL',
-    description:
-      'TRA-405 §8 out-of-sample go/no-go roster: only the macd_bollinger / bb_fade mean-reversion edge survives costs, and only on BTC-USD and SOL-USD. momentum and breakout_vol are OOS-negative on every symbol tested and are disabled. Superseded as the live pin by no_trade after the TRA-432 clean-cache re-validation NO-GO.',
-    enabledStrategies: ['bb_fade'] as const,
-    symbolFilter: null,
-    strategyUniverse: { bb_fade: ['BTC-USD', 'SOL-USD'] as const },
-  },
   no_trade: {
     id: 'no_trade',
     displayName: 'No-trade — engine paused',
@@ -605,21 +559,27 @@ export const STRATEGY_PRESETS: Readonly<Record<StrategyPresetId, StrategyPreset>
   },
 };
 
-export const DEFAULT_STRATEGY_PRESET_ID: StrategyPresetId = 'legacy_5';
+/**
+ * TRA-697 — the resolver default is now `no_trade`. Previously `legacy_5`, but
+ * that preset (and the whole OOS-failed legacy roster) was retired. `no_trade`
+ * is the safe fallback: a stored/garbage/legacy preset id that no longer
+ * resolves degrades to "open no new entries" rather than silently re-enabling
+ * a benched, negative-edge roster. On the LIVE engine this is defense-in-depth
+ * behind the TRA-532 promotion gate; on demo the engine resolves its own
+ * `crypto_core` default and never falls through to this id.
+ */
+export const DEFAULT_STRATEGY_PRESET_ID: StrategyPresetId = 'no_trade';
 
 /**
  * Resolve a preset id (possibly undefined or invalid from a stored settings
- * snapshot) to its definition. Falls back to `legacy_5` so a settings file
- * predating TRA-325 keeps the byte-identical pre-325 behaviour.
- *
- * Also accepts the legacy env-var value `'bb_fade_sol_doge_only'` from
- * TRA-324's `LIVE_STRATEGY_PRESET` for back-compat — the urgent-ticket
- * deployment shipped that value in render.yaml and should keep resolving
- * even if a render.yaml update lands after this commit.
+ * snapshot) to its definition. Falls back to `no_trade` (see
+ * {@link DEFAULT_STRATEGY_PRESET_ID}) so an unknown id — including the retired
+ * legacy ids `legacy_5` / `bb_fade_sol_doge` / `tra405_validated` and TRA-324's
+ * legacy env value `'bb_fade_sol_doge_only'` — degrades to the no-entry
+ * stand-down instead of resurrecting a retired roster.
  */
 export function resolveStrategyPreset(id: string | undefined | null): StrategyPreset {
   if (!id) return STRATEGY_PRESETS[DEFAULT_STRATEGY_PRESET_ID];
-  if (id === 'bb_fade_sol_doge_only') return STRATEGY_PRESETS.bb_fade_sol_doge;
   return STRATEGY_PRESETS[id as StrategyPresetId] ?? STRATEGY_PRESETS[DEFAULT_STRATEGY_PRESET_ID];
 }
 
@@ -1034,7 +994,7 @@ export interface AccountSettings {
    * The engine reads this on every tick so a switch takes effect on the next
    * evaluation; no restart required. Optional for back-compat with snapshots
    * persisted before TRA-325 — absent ↔ {@link DEFAULT_STRATEGY_PRESET_ID}
-   * (`'legacy_5'`), the pre-325 5-strategy roster.
+   * (`'no_trade'` since TRA-697 retired `legacy_5`), the safe no-entry fallback.
    *
    * Render's `LIVE_STRATEGY_PRESET` env var, when set, acts as a process-wide
    * forced override that wins over this field, so the live $180 test config
@@ -2561,7 +2521,7 @@ export interface CryptoEngineState {
    * verified from `/api/crypto/state` without Render dashboard or server-log
    * access. `id` is the resolved preset; `envValue` is the raw
    * `LIVE_STRATEGY_PRESET` process-env string (empty when unset) so a typo
-   * that silently falls back to `legacy_5` is directly visible to operators.
+   * that falls back to `no_trade` (TRA-697) is directly visible to operators.
    */
   activePreset: {
     id: StrategyPresetId;

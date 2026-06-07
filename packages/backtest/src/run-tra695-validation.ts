@@ -164,7 +164,10 @@ interface SwingCell {
 // because swing on 4H is a slower, lower-frequency strategy.
 const SWING_GATE_SPEC = {
   name: 'swing',
-  strategyType: 'swing',
+  // TRA-697: `as const` narrows the literal to the `BacktestConfig['strategyType']`
+  // union member instead of widening to `string` (pre-existing tsc -b break on
+  // main; behaviour-neutral fix to keep the deploy gate green).
+  strategyType: 'swing' as const,
   axes: [
     { name: 'ema50ProximityPct', values: [0.03, 0.05, 0.08] },
     { name: 'rrRatio', values: [1.5, 2.0, 3.0] },

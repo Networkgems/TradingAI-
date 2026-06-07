@@ -27,7 +27,7 @@ function paperTrade(pnl: number, i: number): Position {
     id: `t${i}`,
     symbol: 'BTC-USD',
     side: 'buy',
-    signalType: 'bb_fade',
+    signalType: 'dca',
     entryPrice: 100,
     quantity: 1,
     stopLoss: 99, // risk distance 1 → R == pnl
@@ -49,11 +49,14 @@ function passingReport(): BacktestResult {
   } as BacktestResult;
 }
 
-// Settings whose RESULT runs live crypto auto-trading on a bb_fade-only preset.
+// Settings whose RESULT runs live crypto auto-trading on the go-forward
+// DCA-only preset. TRA-697 retired the dca legacy roster, so the gate is
+// now exercised against `crypto_core` (enabledStrategies ['dca']), the only
+// roster a live crypto user can select post-retirement.
 const liveSettings = {
   mode: 'live',
   cryptoAutoTradingEnabledLive: true,
-  activeStrategyPreset: 'bb_fade_sol_doge', // enabledStrategies: ['bb_fade']
+  activeStrategyPreset: 'crypto_core', // enabledStrategies: ['dca']
 } as AccountSettings;
 
 beforeAll(async () => {
@@ -61,7 +64,7 @@ beforeAll(async () => {
   store = await import('./promotion-store.js');
   tradeStore = await import('./trade-store.js');
 
-  // Seed 60 monitored bb_fade paper trades (50 winners +1.5R, 10 losers -0.5R).
+  // Seed 60 monitored dca paper trades (50 winners +1.5R, 10 losers -0.5R).
   const closed = Array.from({ length: 60 }, (_, i) => paperTrade(i % 6 === 0 ? -0.5 : 1.5, i));
   await tradeStore.saveCryptoTradeSnapshot(USER, {
     version: 1,
@@ -78,7 +81,7 @@ describe('TRA-532 promotion gate — end-to-end enforcement', () => {
   it('blocks the live transition when no strategy is promoted (all three stages fail)', async () => {
     const gate = await svc.evaluateLiveTransitionGate(USER, liveSettings);
     expect(gate.allowed).toBe(false);
-    expect(gate.blocked[0]?.strategyId).toBe('bb_fade');
+    expect(gate.blocked[0]?.strategyId).toBe('dca');
     expect(gate.blocked[0]?.reasons.join(' ')).toMatch(/Stage 1/);
   });
 
@@ -87,11 +90,11 @@ describe('TRA-532 promotion gate — end-to-end enforcement', () => {
     // (not the legacy bare backtest report) is what clears the leg.
     const r = passingReport();
     await store.registerOptimizationVerdict({
-      strategyId: 'bb_fade',
+      strategyId: 'dca',
       verdict: {
         pass: true,
         guards: { G1: { pass: true, value: 0.8 } },
-        blessedParams: { strategy: 'bb_fade', label: 'tra405' },
+        blessedParams: { strategy: 'dca', label: 'tra405' },
         backtestMetrics: {
           sharpe: r.sharpeRatio,
           expectancy: r.expectancy,
@@ -103,7 +106,7 @@ describe('TRA-532 promotion gate — end-to-end enforcement', () => {
       reportId: 'TRA-405',
       registeredBy: 'qt',
     });
-    const status = await svc.buildPromotionStatus(USER, 'bb_fade');
+    const status = await svc.buildPromotionStatus(USER, 'dca');
     expect(status.backtest.state).toBe('pass');
     // Paper passes from the seeded ledger, but sign-off is still absent.
     expect(status.paper.state).toBe('pass');
@@ -117,12 +120,12 @@ describe('TRA-532 promotion gate — end-to-end enforcement', () => {
 
   it('allows the live transition once backtest + paper pass AND a sign-off is recorded', async () => {
     await store.recordSignoff({
-      strategyId: 'bb_fade',
+      strategyId: 'dca',
       reviewer: 'QuantTrader',
       backtestMetrics: store.deriveBacktestGateMetrics(passingReport()),
-      paperMetrics: await svc.snapshotPaperMetrics(USER, 'bb_fade'),
+      paperMetrics: await svc.snapshotPaperMetrics(USER, 'dca'),
     });
-    const status = await svc.buildPromotionStatus(USER, 'bb_fade');
+    const status = await svc.buildPromotionStatus(USER, 'dca');
     expect(status.canGoLive).toBe(true);
     expect(status.blockedReasons).toHaveLength(0);
 
@@ -144,7 +147,7 @@ describe('TRA-532 promotion gate — end-to-end enforcement', () => {
     const stocksOnlyLive = {
       mode: 'live',
       cryptoAutoTradingEnabledLive: false,
-      activeStrategyPreset: 'legacy_5', // a full unpromoted roster — irrelevant while crypto is OFF
+      activeStrategyPreset: 'crypto_core', // an unpromoted crypto roster — irrelevant while crypto is OFF
     } as AccountSettings;
     const gate = await svc.evaluateLiveTransitionGate('stocks-only-user', stocksOnlyLive);
     expect(gate.allowed).toBe(true);
@@ -157,7 +160,7 @@ describe('TRA-532 promotion gate — end-to-end enforcement', () => {
     const cryptoLive = {
       mode: 'live',
       cryptoAutoTradingEnabledLive: true,
-      activeStrategyPreset: 'legacy_5',
+      activeStrategyPreset: 'crypto_core',
     } as AccountSettings;
     const gate = await svc.evaluateLiveTransitionGate('stocks-only-user', cryptoLive);
     expect(gate.allowed).toBe(false);
@@ -165,7 +168,7 @@ describe('TRA-532 promotion gate — end-to-end enforcement', () => {
   });
 
   it('computed paper metrics reflect the ledger (count and positive expectancy)', async () => {
-    const m = await svc.snapshotPaperMetrics(USER, 'bb_fade');
+    const m = await svc.snapshotPaperMetrics(USER, 'dca');
     expect(m?.tradeCount).toBe(60);
     expect(m?.expectancy).toBeGreaterThan(0.5);
   });
@@ -247,7 +250,7 @@ describe('TRA-536 promotion gate — slippage check enforces once instrumented',
   }
 
   it('surfaces a non-null slippageRatio and blocks when realized > 1.5× modeled', async () => {
-    // 60 monitored bb_fade trades that clear count / expectancy / Sharpe, but
+    // 60 monitored dca trades that clear count / expectancy / Sharpe, but
     // each fill drifted 2× the modeled budget → ratio 2.0 > 1.5 cap.
     const closed = Array.from({ length: 60 }, (_, i) => slipTrade(i % 6 === 0 ? -0.5 : 1.5, i, 2, 1));
     await tradeStore.saveCryptoTradeSnapshot(SLIP_USER, {
@@ -260,8 +263,8 @@ describe('TRA-536 promotion gate — slippage check enforces once instrumented',
       account: { cash: 25_000, equity: 25_000, initialEquity: 25_000, openingEquityToday: 25_000 },
     });
 
-    const status = await svc.buildPromotionStatus(SLIP_USER, 'bb_fade');
-    // backtest + sign-off were registered globally for bb_fade earlier, so the
+    const status = await svc.buildPromotionStatus(SLIP_USER, 'dca');
+    // backtest + sign-off were registered globally for dca earlier, so the
     // only thing that can block this user is the paper slippage check.
     expect(status.paper.metrics?.slippageRatio).toBeCloseTo(2, 6);
     expect(status.paper.metrics?.slippageSampleSize).toBe(60);
@@ -282,7 +285,7 @@ describe('TRA-536 promotion gate — slippage check enforces once instrumented',
       account: { cash: 25_000, equity: 25_000, initialEquity: 25_000, openingEquityToday: 25_000 },
     });
 
-    const status = await svc.buildPromotionStatus(SLIP_USER, 'bb_fade');
+    const status = await svc.buildPromotionStatus(SLIP_USER, 'dca');
     expect(status.paper.metrics?.slippageRatio).toBeCloseTo(1, 6);
     expect(status.paper.failedChecks.join(' ')).not.toMatch(/slippage/i);
     expect(status.paper.state).toBe('pass');

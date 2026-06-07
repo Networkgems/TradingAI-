@@ -813,28 +813,25 @@ export function UserManagementSection({ token, httpUrl }: { token: string; httpU
  * id lives on `AccountSettings.activeStrategyPreset` so it saves on the
  * existing form submit alongside the other account settings.
  *
- * TRA-524 — the picker leads with the two presets that matter: `no_trade`
- * (engine paused, the recommended posture after the TRA-523 NO-GO) and
- * `tra405_validated` (kept as the historical best, no longer badged). Every
- * other preset in the library — `legacy_5`, `bb_fade_sol_doge`,
- * and any future entry — stays reachable behind an "Advanced / show all"
- * disclosure. This is a presentation change only: the full `STRATEGY_PRESETS`
- * library is untouched so `resolveStrategyPreset` and the
- * `LIVE/DEMO_STRATEGY_PRESET` env vars still resolve every id.
+ * TRA-697 — the OOS-failed legacy roster (`legacy_5`, `bb_fade_sol_doge`,
+ * `tra405_validated`) was retired after QuantTrader's TRA-695 NO-GO and the
+ * TRA-693 board decision. The library now holds exactly two live-relevant
+ * presets — `no_trade` (engine paused, the recommended posture) and
+ * `crypto_core` (the go-forward DCA-only BTC/SOL forward-paper roster) — so the
+ * picker shows both directly with no "Advanced" overflow.
  */
-// TRA-521 / TRA-523 — QuantTrader's fee-aware R&D re-ran the roster on fresh
-// OOS data with maker-order fills modeled and returned a NO-GO: zero keepers.
-// bb_fade (the `tra405_validated` roster) is OOS-negative net of fees and fails
-// Stage 1 of the Live-Trading Promotion Gate (TRA-532), so it can no longer be
-// badged "Recommended". Until a strategy passes the gate, the recommended
-// posture is to keep the engine paused (`no_trade`). `tra405_validated` stays in
-// the primary list as the historical best ("worked in the past") option, just
-// without the badge. Repoint this id once a strategy clears the promotion gate.
+// TRA-521 / TRA-523 / TRA-697 — QuantTrader's fee-aware R&D (and the later
+// TRA-695 re-validation) returned a NO-GO on the legacy roster: bb_fade and the
+// other timing strategies are OOS-negative net of fees and fail Stage 1 of the
+// Live-Trading Promotion Gate (TRA-532). Those presets are now retired. Until a
+// strategy clears the gate, the recommended posture is to keep the engine
+// paused (`no_trade`); `crypto_core` runs DCA as a demo/paper forward leg.
+// Repoint this id once a strategy clears the promotion gate.
 const RECOMMENDED_PRESET_ID: StrategyPresetId = 'no_trade';
-// Presets surfaced in the primary list. Everything else lives under Advanced.
-// TRA-694 / TRA-698: surface `crypto_core` (the DCA-only BTC/SOL forward-paper
-// roster) in the primary list so operators can select it for demo/paper trading.
-const PRIMARY_PRESET_IDS: readonly StrategyPresetId[] = ['crypto_core', 'tra405_validated', 'no_trade'];
+// Presets surfaced in the primary list. With the legacy roster retired
+// (TRA-697) the library is just these two, so there is no Advanced overflow.
+// TRA-694 / TRA-698: `crypto_core` is the DCA-only BTC/SOL forward-paper roster.
+const PRIMARY_PRESET_IDS: readonly StrategyPresetId[] = ['crypto_core', 'no_trade'];
 
 function StrategyPresetCard({
   preset,
@@ -931,13 +928,12 @@ function StrategyPresetSection({
         on the next engine tick (no restart required).
       </p>
       <p className="settings-hint" style={{ marginTop: '0.5rem' }}>
-        Why is the engine paused by default? QuantTrader's fee-aware backtest (TRA-523)
-        re-ran every roster net of Coinbase taker fees and found <strong>none</strong>{' '}
-        profitable out-of-sample — including{' '}
-        <strong>{STRATEGY_PRESETS['tra405_validated'].displayName}</strong>, which worked
-        in-sample but is now OOS-negative and fails the Live-Trading Promotion Gate. Until a
-        strategy clears the gate, <strong>No-trade</strong> is the recommended setting. The
-        historical rosters stay selectable below.
+        Why is the engine paused by default? QuantTrader's fee-aware backtests (TRA-523,
+        re-validated in TRA-695) re-ran every legacy roster net of Coinbase taker fees and
+        found <strong>none</strong> profitable out-of-sample, so the OOS-failed legacy
+        strategies were retired (TRA-697). Until a strategy clears the Live-Trading Promotion
+        Gate, <strong>No-trade</strong> is the recommended setting; <strong>Crypto Core</strong>{' '}
+        runs DCA on BTC/SOL as a demo/paper forward leg to gather forward evidence.
       </p>
       <div className="strategy-preset-list" style={{ display: 'flex', flexDirection: 'column', gap: '0.75rem', marginTop: '0.75rem' }}>
         {primaryPresets.map(preset => (
@@ -978,7 +974,7 @@ function StrategyPresetSection({
       <p className="settings-hint" style={{ marginTop: '0.75rem' }}>
         Note: this selection applies to the <strong>Live</strong> engine only. The Demo
         engine runs a fixed preset (<code>DEMO_STRATEGY_PRESET</code>, default{' '}
-        <code>legacy_5</code> since TRA-521) so the demo dashboard stays actively trading
+        <code>crypto_core</code> since TRA-698) so the demo dashboard stays actively trading
         on paper for evaluation. On the server the <code>LIVE_STRATEGY_PRESET</code> environment
         variable (when set) overrides this selection for the live engine — ops use it to
         pin a preset for live tests; drop the env var to release control back to this

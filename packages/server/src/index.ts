@@ -2574,8 +2574,8 @@ app.put('/api/account/settings', requireAuth, async (req, res) => {
       Math.min(5, Math.round(Number(body.liveMaxLeverageCrypto ?? current.liveMaxLeverageCrypto ?? 1))),
     ),
     // TRA-325 — clamp to a known preset id so a malformed request can't park
-    // the engine on an unknown preset (which would degrade-fall to legacy_5
-    // anyway via resolveStrategyPreset, but persisting a junk id would
+    // the engine on an unknown preset (which would degrade-fall to no_trade
+    // anyway via resolveStrategyPreset since TRA-697, but persisting a junk id would
     // surface as a confusing UI selection on next load).
     activeStrategyPreset: ((): StrategyPresetId => {
       const requested = body.activeStrategyPreset ?? current.activeStrategyPreset;

@@ -244,82 +244,73 @@ describe('Strategy presets — TRA-325', () => {
   // shape of each preset so a future refactor can't silently shift the
   // deployed configuration.
 
-  it('resolves an undefined / null id to the default legacy_5 preset', () => {
+  it('resolves an undefined / null id to the default no_trade preset', () => {
+    // TRA-697 — the resolver default moved from `legacy_5` (retired) to
+    // `no_trade`: an absent id degrades to the no-entry stand-down, never a
+    // benched, negative-edge roster.
+    expect(DEFAULT_STRATEGY_PRESET_ID).toBe('no_trade');
     expect(resolveStrategyPreset(undefined).id).toBe(DEFAULT_STRATEGY_PRESET_ID);
-    expect(resolveStrategyPreset(null).id).toBe('legacy_5');
+    expect(resolveStrategyPreset(null).id).toBe('no_trade');
   });
 
-  it('resolves a known id to the matching preset', () => {
-    expect(resolveStrategyPreset('legacy_5').id).toBe('legacy_5');
-    expect(resolveStrategyPreset('bb_fade_sol_doge').id).toBe('bb_fade_sol_doge');
+  it('resolves a known surviving id to the matching preset', () => {
+    expect(resolveStrategyPreset('no_trade').id).toBe('no_trade');
+    expect(resolveStrategyPreset('crypto_core').id).toBe('crypto_core');
   });
 
-  it('falls back to legacy_5 on an unknown id (defensive against junk in stored settings)', () => {
-    expect(resolveStrategyPreset('not_a_real_preset').id).toBe('legacy_5');
-    expect(resolveStrategyPreset('').id).toBe('legacy_5');
+  it('falls back to no_trade on an unknown id (defensive against junk in stored settings)', () => {
+    expect(resolveStrategyPreset('not_a_real_preset').id).toBe('no_trade');
+    expect(resolveStrategyPreset('').id).toBe('no_trade');
   });
 
-  it('maps the legacy TRA-324 env value bb_fade_sol_doge_only → bb_fade_sol_doge', () => {
-    // render.yaml shipped this value with TRA-324; until ops pushes the new
-    // preset id this fallback keeps the live test config pinned.
-    expect(resolveStrategyPreset('bb_fade_sol_doge_only').id).toBe('bb_fade_sol_doge');
+  it('TRA-697 — retired legacy ids (incl. the TRA-324 env value) resolve to the no_trade stand-down', () => {
+    // legacy_5 / bb_fade_sol_doge / tra405_validated and TRA-324's
+    // `bb_fade_sol_doge_only` env value were retired with the OOS-failed roster.
+    // A stored settings snapshot or a stale render.yaml carrying any of them
+    // must degrade to no_trade, not silently re-enable a benched strategy.
+    for (const retired of ['legacy_5', 'bb_fade_sol_doge', 'tra405_validated', 'bb_fade_sol_doge_only']) {
+      expect(resolveStrategyPreset(retired).id).toBe('no_trade');
+    }
   });
 
-  it('legacy_5 enables every crypto strategy with no symbol filter', () => {
-    const p = STRATEGY_PRESETS.legacy_5;
+  it('TRA-697 — the surviving preset library is exactly { no_trade, crypto_core }', () => {
+    // The OOS-failed legacy roster (legacy_5 / bb_fade_sol_doge / tra405_validated)
+    // was retired; only the live stand-down and the go-forward DCA roster remain.
+    expect(Object.keys(STRATEGY_PRESETS).sort()).toEqual(['crypto_core', 'no_trade']);
+  });
+
+  // TRA-698 — the go-forward roster: DCA only on the OOS-survivable majors.
+  it('crypto_core enables only dca and gates it to BTC+SOL via strategyUniverse', () => {
+    const p = STRATEGY_PRESETS.crypto_core;
+    expect(p.enabledStrategies).toEqual(['dca']);
+    // No preset-wide filter — the per-strategy universe carries the gate so DCA
+    // accumulates only on the liquid majors that survived the TRA-695 OOS test.
     expect(p.symbolFilter).toBeNull();
-    expect([...p.enabledStrategies].sort()).toEqual(
-      ['bb_fade', 'breakout_vol', 'mean_reversion', 'momentum', 'swing_trade'],
-    );
+    expect(p.strategyUniverse?.dca).toEqual(['BTC-USD', 'SOL-USD']);
+    // The benched legacy strategies are absent from the roster.
+    expect(p.enabledStrategies).not.toContain('swing_trade');
+    expect(p.enabledStrategies).not.toContain('bb_fade');
   });
 
-  it('bb_fade_sol_doge enables only bb_fade and scopes to SOL+DOGE', () => {
-    const p = STRATEGY_PRESETS.bb_fade_sol_doge;
-    expect(p.enabledStrategies).toEqual(['bb_fade']);
-    expect(p.symbolFilter).toEqual(['SOL-USD', 'DOGE-USD']);
+  it('resolves the crypto_core id (the demo forward-paper roster)', () => {
+    expect(resolveStrategyPreset('crypto_core').id).toBe('crypto_core');
   });
 
-  // TRA-421 — the TRA-405 §8 validated roster.
-  it('tra405_validated enables only bb_fade and gates it to BTC+SOL via strategyUniverse', () => {
-    const p = STRATEGY_PRESETS.tra405_validated;
-    expect(p.enabledStrategies).toEqual(['bb_fade']);
-    // No preset-wide filter — the per-strategy universe carries the gate so
-    // the macd_bollinger/bb_fade edge is restricted to its validated symbols.
-    expect(p.symbolFilter).toBeNull();
-    expect(p.strategyUniverse?.bb_fade).toEqual(['BTC-USD', 'SOL-USD']);
-    // momentum / breakout_vol are NO-GO: disabled by absence from the roster.
-    expect(p.enabledStrategies).not.toContain('momentum');
-    expect(p.enabledStrategies).not.toContain('breakout_vol');
-  });
-
-  it('resolves the tra405_validated id (the live LIVE_STRATEGY_PRESET pin)', () => {
-    expect(resolveStrategyPreset('tra405_validated').id).toBe('tra405_validated');
-  });
-
-  // TRA-421 — presetAllowsStrategySymbol: the symbolFilter + strategyUniverse gate.
-  it('presetAllowsStrategySymbol gates bb_fade to BTC+SOL under tra405_validated', () => {
-    const p = STRATEGY_PRESETS.tra405_validated;
-    expect(presetAllowsStrategySymbol(p, 'bb_fade', 'BTC-USD')).toBe(true);
-    expect(presetAllowsStrategySymbol(p, 'bb_fade', 'SOL-USD')).toBe(true);
-    expect(presetAllowsStrategySymbol(p, 'bb_fade', 'DOGE-USD')).toBe(false);
-    expect(presetAllowsStrategySymbol(p, 'bb_fade', 'ETH-USD')).toBe(false);
+  // TRA-421 / TRA-698 — presetAllowsStrategySymbol: the symbolFilter + strategyUniverse gate.
+  it('presetAllowsStrategySymbol gates dca to BTC+SOL under crypto_core', () => {
+    const p = STRATEGY_PRESETS.crypto_core;
+    expect(presetAllowsStrategySymbol(p, 'dca', 'BTC-USD')).toBe(true);
+    expect(presetAllowsStrategySymbol(p, 'dca', 'SOL-USD')).toBe(true);
+    expect(presetAllowsStrategySymbol(p, 'dca', 'DOGE-USD')).toBe(false);
+    expect(presetAllowsStrategySymbol(p, 'dca', 'ETH-USD')).toBe(false);
   });
 
   it('presetAllowsStrategySymbol leaves an unmapped strategy gated by symbolFilter only', () => {
-    // legacy_5: no symbolFilter, no strategyUniverse → every strategy/symbol allowed.
-    const legacy = STRATEGY_PRESETS.legacy_5;
-    expect(presetAllowsStrategySymbol(legacy, 'momentum', 'ANY-USD')).toBe(true);
-    // tra405_validated: swing_trade is not in strategyUniverse and there is no
-    // preset-wide filter, so it is unrestricted (it is separately disabled by
+    // crypto_core: a strategy absent from strategyUniverse with no preset-wide
+    // symbolFilter is unrestricted by this helper (it is separately disabled by
     // not being in enabledStrategies — a gate this helper deliberately ignores).
-    const validated = STRATEGY_PRESETS.tra405_validated;
-    expect(presetAllowsStrategySymbol(validated, 'swing_trade', 'XRP-USD')).toBe(true);
-  });
-
-  it('presetAllowsStrategySymbol — preset-wide symbolFilter still applies', () => {
-    const p = STRATEGY_PRESETS.bb_fade_sol_doge;
-    expect(presetAllowsStrategySymbol(p, 'bb_fade', 'SOL-USD')).toBe(true);
-    expect(presetAllowsStrategySymbol(p, 'bb_fade', 'BTC-USD')).toBe(false);
+    const p = STRATEGY_PRESETS.crypto_core;
+    expect(presetAllowsStrategySymbol(p, 'momentum', 'ANY-USD')).toBe(true);
   });
 
   it('TRA-434 — no_trade resolves and enables zero strategies on zero symbols', () => {
@@ -381,11 +372,13 @@ describe('Strategy presets — TRA-325', () => {
 
     // Live: with no LIVE_STRATEGY_PRESET env set under test, the live engine
     // falls through to the user's saved activeStrategyPreset (no env override).
+    // `no_trade` is a surviving preset distinct from the demo default, proving
+    // the live branch honours per-user selection rather than the demo roster.
     await engine.applySettings(fourBucketCryptoSettings({
       mode: 'live',
-      activeStrategyPreset: 'bb_fade_sol_doge',
+      activeStrategyPreset: 'no_trade',
     }));
-    expect(engine.getState().activePreset.id).toBe('bb_fade_sol_doge');
+    expect(engine.getState().activePreset.id).toBe('no_trade');
   });
 });
 
@@ -779,15 +772,15 @@ describe('CryptoSignalEngine — TRA-480 parallel demo + live ticking', () => {
 
     // With no LIVE_STRATEGY_PRESET env set (default under test) the live
     // branch falls through to the per-user `activeStrategyPreset`, which
-    // defaults to `legacy_5` (DEFAULT_STRATEGY_PRESET_ID, unchanged so the live
-    // no_trade guard is unaffected) when no settings are bound.
-    expect(internal.resolvePreset('live').id).toBe('legacy_5');
+    // defaults to `no_trade` (DEFAULT_STRATEGY_PRESET_ID since TRA-697 retired
+    // `legacy_5`) when no settings are bound — the safe, no-entry fallback.
+    expect(internal.resolvePreset('live').id).toBe('no_trade');
 
     // Sanity: same answers when this.mode='demo'. The branch's preset is a
     // function of the argument, not of the engine's current mode.
     internal.mode = 'demo';
     expect(internal.resolvePreset('demo').id).toBe('crypto_core');
-    expect(internal.resolvePreset('live').id).toBe('legacy_5');
+    expect(internal.resolvePreset('live').id).toBe('no_trade');
   });
 
   it('isAutoTradingEnabled(mode) reads the per-branch flag, not this.mode', () => {
