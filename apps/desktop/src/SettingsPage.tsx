@@ -1381,8 +1381,9 @@ export default function SettingsPage({ token, httpUrl, context, onModeChange, on
             <div className="settings-grid">
               {(!context || context === 'stocks') && (
                 <div className="settings-field">
-                  <label>{context === 'stocks' ? 'Starting Equity ($)' : 'Stock Starting Equity ($)'}</label>
+                  <label htmlFor="set-demoEquityStocks">{context === 'stocks' ? 'Starting Equity ($)' : 'Stock Starting Equity ($)'}</label>
                   <input
+                    id="set-demoEquityStocks"
                     type="number"
                     min={1000}
                     max={10000000}
@@ -1396,8 +1397,9 @@ export default function SettingsPage({ token, httpUrl, context, onModeChange, on
 
               {(!context || context === 'crypto') && (
                 <div className="settings-field">
-                  <label>{context === 'crypto' ? 'Starting Equity ($)' : 'Crypto Starting Equity ($)'}</label>
+                  <label htmlFor="set-demoEquityCrypto">{context === 'crypto' ? 'Starting Equity ($)' : 'Crypto Starting Equity ($)'}</label>
                   <input
+                    id="set-demoEquityCrypto"
                     type="number"
                     min={1000}
                     max={10000000}
@@ -1415,8 +1417,9 @@ export default function SettingsPage({ token, httpUrl, context, onModeChange, on
                   stock settings on a crypto page. */}
               {(!context || context === 'stocks') && (
                 <div className="settings-field">
-                  <label>Stock Daily Trades Limit</label>
+                  <label htmlFor="set-dailyTradesLimit">Stock Daily Trades Limit</label>
                   <input
+                    id="set-dailyTradesLimit"
                     type="number"
                     min={1}
                     max={100}
@@ -1429,8 +1432,9 @@ export default function SettingsPage({ token, httpUrl, context, onModeChange, on
 
               {(!context || context === 'stocks') && (
                 <div className="settings-field">
-                  <label>Options Daily Trades Limit</label>
+                  <label htmlFor="set-optionsDailyTradesLimit">Options Daily Trades Limit</label>
                   <input
+                    id="set-optionsDailyTradesLimit"
                     type="number"
                     min={1}
                     max={100}
@@ -1460,8 +1464,9 @@ export default function SettingsPage({ token, httpUrl, context, onModeChange, on
                 return (
                   <>
                     <div className="settings-field">
-                      <label>{`Managed Account Ratio (%)${labelSuffix}`}</label>
+                      <label htmlFor={`set-${ratioKey}`}>{`Managed Account Ratio (%)${labelSuffix}`}</label>
                       <input
+                        id={`set-${ratioKey}`}
                         type="number"
                         min={1}
                         max={100}
@@ -1477,8 +1482,9 @@ export default function SettingsPage({ token, httpUrl, context, onModeChange, on
                       </span>
                     </div>
                     <div className="settings-field">
-                      <label>{`Risk Per Trade (%)${labelSuffix}`}</label>
+                      <label htmlFor={`set-${riskKey}`}>{`Risk Per Trade (%)${labelSuffix}`}</label>
                       <input
+                        id={`set-${riskKey}`}
                         type="number"
                         min={0.1}
                         max={50}
@@ -1600,8 +1606,9 @@ export default function SettingsPage({ token, httpUrl, context, onModeChange, on
                   return (
                     <>
                       <div className="settings-field">
-                        <label>Managed Account Ratio (%)</label>
+                        <label htmlFor={`set-${ratioKey}`}>Managed Account Ratio (%)</label>
                         <input
+                          id={`set-${ratioKey}`}
                           type="number"
                           min={1}
                           max={100}
@@ -1616,8 +1623,9 @@ export default function SettingsPage({ token, httpUrl, context, onModeChange, on
                         </span>
                       </div>
                       <div className="settings-field">
-                        <label>Risk Per Trade (%)</label>
+                        <label htmlFor={`set-${riskKey}`}>Risk Per Trade (%)</label>
                         <input
+                          id={`set-${riskKey}`}
                           type="number"
                           min={0.1}
                           max={50}
@@ -1651,8 +1659,9 @@ export default function SettingsPage({ token, httpUrl, context, onModeChange, on
                     operator can move the floor without per-user saves. */}
                 {(!context || context === 'crypto') && (
                   <div className="settings-field">
-                    <label>Single-Symbol Short Cap (%)</label>
+                    <label htmlFor="set-liveSingleSymbolShortCap">Single-Symbol Short Cap (%)</label>
                     <input
+                      id="set-liveSingleSymbolShortCap"
                       type="number"
                       min={0}
                       max={100}
@@ -1683,8 +1692,9 @@ export default function SettingsPage({ token, httpUrl, context, onModeChange, on
                     saved a live-only value. */}
                 {(!context || context === 'stocks') && (
                   <div className="settings-field">
-                    <label>Stock Daily Trades Limit</label>
+                    <label htmlFor="set-dailyTradesLimitLive">Stock Daily Trades Limit</label>
                     <input
+                      id="set-dailyTradesLimitLive"
                       type="number"
                       min={1}
                       max={100}
@@ -1696,8 +1706,9 @@ export default function SettingsPage({ token, httpUrl, context, onModeChange, on
                 )}
                 {(!context || context === 'stocks') && (
                   <div className="settings-field">
-                    <label>Options Daily Trades Limit</label>
+                    <label htmlFor="set-optionsDailyTradesLimitLive">Options Daily Trades Limit</label>
                     <input
+                      id="set-optionsDailyTradesLimitLive"
                       type="number"
                       min={1}
                       max={100}
@@ -1841,8 +1852,9 @@ export default function SettingsPage({ token, httpUrl, context, onModeChange, on
 
                 <div className="settings-grid">
                   <div className="settings-field">
-                    <label>Brokerage</label>
+                    <label htmlFor="set-liveBrokerageTypeOptions">Brokerage</label>
                     <select
+                      id="set-liveBrokerageTypeOptions"
                       value={readLiveBrokerageTypeOptions(settings)}
                       onChange={e => set('liveBrokerageTypeOptions', e.target.value as BrokerageType)}
                     >
@@ -1851,8 +1863,9 @@ export default function SettingsPage({ token, httpUrl, context, onModeChange, on
                   </div>
 
                   <div className="settings-field">
-                    <label>Environment</label>
+                    <label htmlFor="set-liveTradierEnvOptions">Environment</label>
                     <select
+                      id="set-liveTradierEnvOptions"
                       value={readLiveTradierEnvOptions(settings)}
                       onChange={e => set('liveTradierEnvOptions', e.target.value as TradierEnv)}
                     >
@@ -1875,8 +1888,9 @@ export default function SettingsPage({ token, httpUrl, context, onModeChange, on
                       lands, picking 'equity' or 'both' simply suppresses the
                       options mirror. */}
                   <div className="settings-field">
-                    <label>Trade</label>
+                    <label htmlFor="set-liveTradierMarkets">Trade</label>
                     <select
+                      id="set-liveTradierMarkets"
                       value={readLiveTradierMarkets(settings)}
                       onChange={e => set('liveTradierMarkets', e.target.value as LiveTradierMarkets)}
                     >
@@ -1914,10 +1928,11 @@ export default function SettingsPage({ token, httpUrl, context, onModeChange, on
                   </div>
 
                   <div className="settings-field">
-                    <label>
+                    <label htmlFor="set-liveAccountIdOptions">
                       Account ID ({readLiveTradierEnvOptions(settings) === 'production' ? 'Production' : 'Sandbox'})
                     </label>
                     <input
+                      id="set-liveAccountIdOptions"
                       type="text"
                       placeholder="Tradier account number (e.g. VA1234567)"
                       value={readLiveAccountIdOptions(settings, readLiveTradierEnvOptions(settings))}

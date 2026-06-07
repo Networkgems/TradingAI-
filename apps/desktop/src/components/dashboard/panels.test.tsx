@@ -284,7 +284,9 @@ describe('DashboardHeader (TRA-422)', () => {
       />,
     );
     expect(screen.getByText('Equity')).toBeInTheDocument();
-    expect(screen.getByText('LIVE')).toBeInTheDocument();
+    // TRA-704 — connection badge reads "CONNECTED" (was "LIVE") so it can't be
+    // confused with the DEMO/LIVE real-money account-mode toggle.
+    expect(screen.getByText('CONNECTED')).toBeInTheDocument();
     expect(screen.getByRole('button', { name: /Stop Trading/ })).toBeInTheDocument();
   });
 

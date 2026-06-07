@@ -168,9 +168,12 @@ export function DashboardHeader({
         )}
         <div className="stat-divider" />
         <div className="status-group">
-          <div className={`status-dot ${connected ? 'live' : 'offline'}`} title={connected ? 'Live' : 'Reconnecting...'} />
+          <div className={`status-dot ${connected ? 'live' : 'offline'}`} title={connected ? 'Live data feed connected' : 'Reconnecting...'} />
           <div className="status-text">
-            <span className="status-label">{connected ? 'LIVE' : 'OFFLINE'}</span>
+            {/* TRA-704 — this badge reports the market-data feed/socket
+                connection, NOT the DEMO/LIVE account mode. Labelled "CONNECTED"
+                (was "LIVE") so it can't read as "real-money trading is on". */}
+            <span className="status-label">{connected ? 'CONNECTED' : 'OFFLINE'}</span>
             {lastTick != null && <span className="last-tick">Updated {timeAgo(lastTick)}</span>}
           </div>
         </div>
