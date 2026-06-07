@@ -36,6 +36,8 @@ import {
   recordOptionsSpend,
   optionsSpendStatus,
 } from './options-spend-store.js';
+import { recordSurfacedIdeas } from './options-idea-journal.js';
+import type { DefinedRiskStrategy } from '@trading-app/agents';
 import { logger } from './observability/index.js';
 
 const log = logger.child({ module: 'options-ideas' });
@@ -280,6 +282,18 @@ export async function buildIdeasFeed(opts: BuildIdeasOptions): Promise<OptionsId
     recordOptionsSpend(research.costUsd, now);
   }
   const spend = optionsSpendStatus(now);
+
+  // C6 (TRA-601): journal the surfaced ideas for forward-testing. Fire-and-forget
+  // and deduped per (ticker, strategy, expiration, ET day) inside the journal, so
+  // the panel's 60s poll can't inflate the validation sample. The strategy enum
+  // comes from the entry-intent registry (the panel view carries only a display
+  // string); the journal needs the enum to price the right structure class.
+  const strategyById = new Map<string, DefinedRiskStrategy>(
+    [...intents].map(([id, intent]) => [id, intent.strategy]),
+  );
+  void recordSurfacedIdeas(feed.ideas, strategyById, now).catch((err) => {
+    log.warn('idea journal append failed', { reason: err instanceof Error ? err.message : String(err) });
+  });
 
   feedCache = { key: cacheKey, builtAt: now, feed };
   log.info('options-ideas feed built', {

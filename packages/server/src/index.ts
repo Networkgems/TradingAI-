@@ -42,6 +42,13 @@ import { recordOptionChains } from './options-chain-recorder.js';
 import { buildIdeasFeed, getEntryIntent } from './options-ideas-service.js';
 import { optionsSpendStatus } from './options-spend-store.js';
 import { initIvRankStore } from './iv-rank-store.js';
+import { initIdeaJournal, listJournalEntries } from './options-idea-journal.js';
+import {
+  forwardTestIdeas,
+  buildForwardTestReport,
+  defaultChainsDir,
+} from './options-forward-test.js';
+import { evaluateLiveCapitalGate, LIVE_CAPITAL_GATE } from './live-capital-gate.js';
 import {
   generateMarketReview,
   getLatestMarketReview,
@@ -335,6 +342,11 @@ void runMacroRefresh();
 // synchronous `ivRankSync` read used by the AI Options Ideas fusion has data
 // available right after boot. The store is appended to as chains are pulled.
 await initIvRankStore();
+
+// TRA-601 (TRA-595 C6) — warm the forward-test idea journal so the report read
+// has the surfaced-idea history available right after boot. The journal is
+// appended to (deduped) every time the live ideas feed is built.
+await initIdeaJournal();
 
 const app = express();
 // TRA-404 — behind Render's proxy the socket address is the proxy, not the
@@ -1408,6 +1420,67 @@ app.post('/api/options/ideas/:id/paper-enter', requireAuth, async (req, res) => 
 // active — so the CFO can review spend from the Render URL without log access.
 app.get('/api/health/options-spend', (_req, res) => {
   res.json(optionsSpendStatus());
+});
+
+// TRA-601 (TRA-595 C6) — the forward-test report. Re-prices every surfaced idea
+// the journal captured against the option chains the recorder wrote AFTER it was
+// surfaced (no look-ahead) and rolls the result into a weekly hit-rate /
+// expectancy / max-loss-adherence / POP-calibration report. Read-only; wires no
+// capital. Any authenticated user can read so the desk can review methodology.
+app.get('/api/options/forward-test/report', requireAuth, async (_req, res) => {
+  try {
+    const entries = await listJournalEntries();
+    const outcomes = await forwardTestIdeas(entries);
+    const report = buildForwardTestReport(outcomes, { chainsDir: defaultChainsDir() });
+    res.json(report);
+  } catch (err) {
+    log.error('forward-test report failed', {
+      reason: err instanceof Error ? err.message : String(err),
+    });
+    res.status(500).json({ error: 'Failed to build the forward-test report.' });
+  }
+});
+
+// TRA-601 (TRA-595 C6) — the AI-Options-Ideas LIVE-CAPITAL GATE, as a redacted
+// read-only acceptance probe (parity with the TRA-580/586 health probes).
+// Unauthenticated by design: it exposes ONLY the pass/fail verdict and the
+// per-criterion booleans + thresholds — no idea text, no per-symbol P&L, no PII
+// — so QA can verify "the gate is wired and currently HOLDs" against the live
+// deployment without shipping admin credentials. Evaluating the gate wires NO
+// capital; a pass is permission to PROPOSE live wiring, nothing more.
+app.get('/api/health/live-capital-gate', async (_req, res) => {
+  try {
+    const entries = await listJournalEntries();
+    const outcomes = await forwardTestIdeas(entries);
+    const report = buildForwardTestReport(outcomes, { chainsDir: defaultChainsDir() });
+    const gate = evaluateLiveCapitalGate(report);
+    res.json({
+      passed: gate.passed,
+      asOfDate: gate.asOfDate,
+      summary: gate.summary,
+      note: gate.note,
+      thresholds: LIVE_CAPITAL_GATE,
+      criteria: gate.criteria.map((c) => ({
+        name: c.name,
+        description: c.description,
+        required: c.required,
+        actual: c.actual,
+        pass: c.pass,
+      })),
+      evidence: {
+        surfaced: report.totals.surfaced,
+        resolved: report.totals.resolved,
+        open: report.totals.open,
+        weeksWithResolved: report.totals.weeksWithResolved,
+        weeksPositiveExpectancy: report.totals.weeksPositiveExpectancy,
+      },
+    });
+  } catch (err) {
+    log.error('live-capital-gate probe failed', {
+      reason: err instanceof Error ? err.message : String(err),
+    });
+    res.status(500).json({ error: 'Failed to evaluate the live-capital gate.' });
+  }
 });
 
 // TRA-141 — storage diagnostic so QA can verify from outside the box that the
