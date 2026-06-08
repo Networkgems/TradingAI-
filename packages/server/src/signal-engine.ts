@@ -4355,6 +4355,44 @@ function buildTradierOptionsClientsByEnv(
  * this matches the issue's "single TRADIER_ACCOUNT_ID per env" out-of-scope
  * note. Layered env-var fallbacks mirror the options client.
  */
+/**
+ * TRA-713 — decide whether the production stocks engine should boot directly
+ * into Live mode so the live-equity arm survives a restart/redeploy WITHOUT a
+ * manual re-arm. Root cause of TRA-713: the Saturday arm lived only in the
+ * running engine's in-memory `mode`; on-disk `mode` stayed `demo`, so the
+ * Monday redeploy faithfully rehydrated `demo` and booted out of Live.
+ *
+ * This is a REAL-MONEY, board-ratified (approval 979c77c1) boot-arm, so it is
+ * deliberately scoped and default-OFF — every condition must hold:
+ *   • `LIVE_EQUITY_BOOT_USER` names THIS user (operator pin; unset ⇒ never arm).
+ *     This single-user scope is the critical safety gate: a fleet-wide arm would
+ *     trip the env-cred fallback below for every production-env engine and trade
+ *     the SHARED prod Tradier account.
+ *   • the server is in production Tradier mode (`TRADIER_ENV=production`),
+ *   • the user routes at the production Tradier env (`liveTradierEnvOptions`),
+ *   • the live-equity toggle is on (mirrors {@link buildTradierLiveEquityClient}),
+ *   • production Tradier creds resolve (per-user or server-env fallback) — the
+ *     exact precondition `buildTradierLiveEquityClient` needs to place real
+ *     orders, so we never flip to Live with no broker attached.
+ *
+ * `env` is injectable so the gate is unit-testable without mutating process.env.
+ */
+export function shouldBootArmLiveEquity(
+  settings: AccountSettings,
+  username: string,
+  env: NodeJS.ProcessEnv = process.env,
+): boolean {
+  const pinned = (env['LIVE_EQUITY_BOOT_USER'] ?? '').trim();
+  if (!pinned || pinned !== username) return false;
+  if ((env['TRADIER_ENV'] ?? '') !== 'production') return false;
+  if ((settings.liveTradierEnvOptions ?? 'sandbox') !== 'production') return false;
+  if (!resolveLiveTradeEquitiesTradier(settings)) return false;
+  const resolved = resolveTradierOptionsCreds(settings);
+  const apiToken = (resolved.apiToken || (env['TRADIER_API_TOKEN'] ?? '')).trim();
+  const accountId = (resolved.accountId || (env['TRADIER_ACCOUNT_ID'] ?? '')).trim();
+  return apiToken.length > 0 && accountId.length > 0;
+}
+
 function buildTradierLiveEquityClient(settings: AccountSettings): TradierOrderClient | null {
   if (settings.mode !== 'live') return null;
   // TRA-370 — absent ↔ true so Live opens equity brackets out of the box.

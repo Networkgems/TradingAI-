@@ -1,5 +1,5 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
-import { SignalEngine, sizeLiveEquityFromStop, gateSignalOnReview, describeGatedStrategies } from './signal-engine.js';
+import { SignalEngine, sizeLiveEquityFromStop, gateSignalOnReview, describeGatedStrategies, shouldBootArmLiveEquity } from './signal-engine.js';
 import { PaperAccount } from './paper-account.js';
 import type { RelativeValueScannerService, RelativeValueScanResult } from './relative-value-scanner.js';
 import type { RelativeValueCandidate, TradierAccountBalance, TradierOptionsClient, TradierOrderClient } from '@trading-app/engine';
@@ -3378,5 +3378,60 @@ describe('SignalEngine.enterPaperOptionsIdea — single vs multi-leg routing (TR
     expect(pos).not.toBeNull();
     expect(pos!.optionSymbol).toBe('AAPL240705P00095000');
     expect(pos!.legs).toBeUndefined();
+  });
+});
+
+describe('shouldBootArmLiveEquity — TRA-713 persistent live-equity boot-arm', () => {
+  const PIN = 'admin';
+  // A production-ready settings snapshot: production options env + per-user prod creds.
+  const prodSettings = (): AccountSettings => ({
+    ...DEFAULT_ACCOUNT_SETTINGS,
+    mode: 'demo',
+    liveTradierEnvOptions: 'production',
+    liveApiKeyOptionsProduction: 'tok-123',
+    liveAccountIdOptionsProduction: 'acct-123',
+  });
+  const prodEnv = (over: Record<string, string> = {}): NodeJS.ProcessEnv => ({
+    LIVE_EQUITY_BOOT_USER: PIN,
+    TRADIER_ENV: 'production',
+    ...over,
+  });
+
+  it('arms the pinned user when prod env + prod creds resolve', () => {
+    expect(shouldBootArmLiveEquity(prodSettings(), PIN, prodEnv())).toBe(true);
+  });
+
+  it('arms via server-env Tradier cred fallback when per-user creds are blank', () => {
+    const s = { ...prodSettings(), liveApiKeyOptionsProduction: '', liveAccountIdOptionsProduction: '' };
+    const env = prodEnv({ TRADIER_API_TOKEN: 'env-tok', TRADIER_ACCOUNT_ID: 'env-acct' });
+    expect(shouldBootArmLiveEquity(s, PIN, env)).toBe(true);
+  });
+
+  it('never arms a non-pinned user (shared-account blast-radius guard)', () => {
+    expect(shouldBootArmLiveEquity(prodSettings(), 'someone-else', prodEnv())).toBe(false);
+  });
+
+  it('default-OFF: no pin set ⇒ never arms', () => {
+    const env = prodEnv(); delete env['LIVE_EQUITY_BOOT_USER'];
+    expect(shouldBootArmLiveEquity(prodSettings(), PIN, env)).toBe(false);
+  });
+
+  it('refuses to arm when the server is not in production Tradier mode', () => {
+    expect(shouldBootArmLiveEquity(prodSettings(), PIN, prodEnv({ TRADIER_ENV: 'sandbox' }))).toBe(false);
+  });
+
+  it('refuses to arm a user routing options at the sandbox env', () => {
+    const s = { ...prodSettings(), liveTradierEnvOptions: 'sandbox' as const };
+    expect(shouldBootArmLiveEquity(s, PIN, prodEnv())).toBe(false);
+  });
+
+  it('refuses to arm when no production creds resolve anywhere', () => {
+    const s = { ...prodSettings(), liveApiKeyOptionsProduction: '', liveAccountIdOptionsProduction: '' };
+    expect(shouldBootArmLiveEquity(s, PIN, prodEnv())).toBe(false);
+  });
+
+  it('respects an explicit liveTradeEquitiesTradier:false opt-out', () => {
+    const s = { ...prodSettings(), liveTradeEquitiesTradier: false };
+    expect(shouldBootArmLiveEquity(s, PIN, prodEnv())).toBe(false);
   });
 });

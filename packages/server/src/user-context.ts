@@ -3,12 +3,13 @@ import { existsSync } from 'fs';
 import { join, dirname } from 'path';
 import { fileURLToPath } from 'url';
 
-import { SignalEngine } from './signal-engine.js';
+import { SignalEngine, shouldBootArmLiveEquity } from './signal-engine.js';
 import { CryptoSignalEngine } from './crypto-engine.js';
 import { PnlTracker } from './pnl-tracker.js';
 import type { RelativeValueScannerService } from './relative-value-scanner.js';
 import {
   loadSettings,
+  saveSettings,
   clearSettingsCache,
 } from './account-settings.js';
 import type { AccountSettings } from '@trading-app/shared';
@@ -649,6 +650,31 @@ async function createUserContext(username: string): Promise<UserContext> {
   if (!existsSync(cryptoDir)) await mkdir(cryptoDir, { recursive: true });
 
   const settings = await loadSettings(username);
+
+  // TRA-713 — persistent live-equity boot-arm (scoped, default-OFF, board-ratified
+  // approval 979c77c1). The original Live arm lived only in the running engine's
+  // in-memory `mode` and was lost on the next redeploy; re-arm the single
+  // operator-pinned production user deterministically at boot. `saveSettings`
+  // persists `mode:"live"` so it is visible via GET /api/account/settings and the
+  // engine/tracker below construct in Live from the same snapshot. No-op for every
+  // non-pinned user, so the shared prod Tradier account can never be armed
+  // fleet-wide. `loadSettings` returns the cached reference, so mutating + saving
+  // keeps cache, disk, and engine in agreement.
+  if (settings.mode !== 'live' && shouldBootArmLiveEquity(settings, username)) {
+    settings.mode = 'live';
+    try {
+      await saveSettings(username, settings);
+      log.info('TRA-713 boot-arm: forced production stocks engine to Live at boot', {
+        username,
+        liveTradierEnvOptions: settings.liveTradierEnvOptions,
+      });
+    } catch (err: unknown) {
+      log.warn('TRA-713 boot-arm: failed to persist forced live mode (engine still boots Live in-memory)', {
+        username,
+        reason: err instanceof Error ? err.message : String(err),
+      });
+    }
+  }
 
   const tracker = new PnlTracker(
     dataDir,

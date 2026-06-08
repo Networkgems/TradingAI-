@@ -121,6 +121,24 @@ services:
       # actually want to route real orders.
       - key: TRADIER_ENV
         sync: false
+      # TRA-713 — persistent live-equity boot-arm (board-ratified approval
+      # 979c77c1). FIX for "prod equity Live reverts to demo on restart": the
+      # original arm lived only in the running engine's in-memory `mode`, so every
+      # redeploy rehydrated the on-disk `demo` and booted out of Live. This pin
+      # names the ONE production user whose stocks engine should boot directly into
+      # Live (mode=live) at startup — no manual re-arm — handled by
+      # `shouldBootArmLiveEquity` in `createUserContext`.
+      #
+      # SAFETY — this is REAL-money and deliberately SINGLE-USER scoped. It must
+      # NOT be applied fleet-wide: `liveEquityTradingEnabled` defaults TRUE and the
+      # live-equity client falls back to the SHARED server-wide TRADIER_API_TOKEN /
+      # TRADIER_ACCOUNT_ID for any production-env engine, so a fleet-wide arm would
+      # trade the shared prod account for every such user. The gate also requires
+      # TRADIER_ENV=production + resolvable production creds, so leaving this empty
+      # (or naming a user without prod creds) arms nothing. Disarm = clear this
+      # value (or set the user's mode back to demo via Settings).
+      - key: LIVE_EQUITY_BOOT_USER
+        value: "admin"
       # TRA-324 / TRA-325 / TRA-421 — process-wide forced strategy preset
       # override. When set, every CryptoSignalEngine instance pins to this
       # preset regardless of the user's saved `activeStrategyPreset` selection
