@@ -1139,6 +1139,39 @@ export class CryptoSignalEngine {
       await Promise.all(dueDaily.slice(i, i + CANDLE_BATCH).map(sym => this.refreshDailyCandles(sym)));
     }
 
+    // TRA-693 — daily-close price fallback for quote-blocked egress (Render).
+    // Coinbase's *quote* endpoints (Exchange /stats, Advanced Trade
+    // /market/products) and Yahoo/CMC are all IP-blocked or rate-limited for
+    // datacenter egress, so on Render the quote fan-out above yields nothing and
+    // every DCA signal was dropped at the "no quote in cache" guard — zero
+    // signals, zero positions, exactly what the board saw. But the Advanced
+    // Trade *candle* endpoint DOES work from that IP (see TRA-705), so under a
+    // daily-only preset (DCA/swing — not price-sensitive intraday) we seed a
+    // symbol's price from its latest daily-bar close when no live quote landed.
+    // That close is genuine Coinbase data, so it carries `source: 'coinbase'`
+    // and satisfies the TRA-337 anti-ghost-price entry gate. Gated to non-
+    // intraday ticks so minute strategies never enter off a stale daily close.
+    if (!needsIntraday) {
+      for (const sym of activeSymbols) {
+        if (this.symbolState.get(sym)?.quoteStatus === 'ok') continue; // live quote already landed
+        const daily = this.dailyCandleCache.get(sym);
+        if (!daily || daily.length === 0) continue;
+        const close = daily[daily.length - 1].close;
+        if (!(close > 0)) continue;
+        prices.set(sym, close);
+        quoteSources.set(sym, 'coinbase');
+        this.symbolState.set(sym, {
+          symbol: sym,
+          price: close,
+          volume: 0,
+          change: 0,
+          changePct: 0,
+          lastUpdated: Date.now(),
+          quoteStatus: 'ok',
+        });
+      }
+    }
+
     // TRA-418 — data-feed freshness gate. Run after the candle refresh above so
     // a symbol whose feed is down is detected from the (now-attempted) cache
     // age, marked `quoteStatus: 'stale'`, and excluded from signal evaluation.
