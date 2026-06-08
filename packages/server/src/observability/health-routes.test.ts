@@ -170,10 +170,39 @@ describe('TRA-580 live-equity acceptance probe', () => {
         'liveEquityTradingEnabled',
         'ok',
         'productionEngineCount',
+        'serviceEnv',
         'time',
         'totals',
       ].sort(),
     );
+    // serviceEnv carries booleans only — never a credential value.
+    expect(Object.values(report.serviceEnv).every(v => typeof v === 'boolean')).toBe(true);
+  });
+
+  it('TRA-715 — serviceEnv reflects injected env presence as booleans only', () => {
+    const armed = aggregateLiveEquityAcceptance([snap()], NOW, {
+      TRADIER_ENV: 'production',
+      TRADIER_API_TOKEN: 'tok-redacted',
+      TRADIER_ACCOUNT_ID: 'acct-redacted',
+      LIVE_EQUITY_BOOT_USER: 'admin',
+    });
+    expect(armed.serviceEnv).toEqual({
+      tradierEnvProduction: true,
+      productionTradierTokenPresent: true,
+      productionTradierAccountPresent: true,
+      bootArmPinConfigured: true,
+    });
+
+    const bare = aggregateLiveEquityAcceptance([snap()], NOW, { TRADIER_ENV: 'sandbox' });
+    expect(bare.serviceEnv).toEqual({
+      tradierEnvProduction: false,
+      productionTradierTokenPresent: false,
+      productionTradierAccountPresent: false,
+      bootArmPinConfigured: false,
+    });
+    // No credential VALUE ever surfaces in the redacted report.
+    expect(JSON.stringify(armed)).not.toContain('tok-redacted');
+    expect(JSON.stringify(armed)).not.toContain('acct-redacted');
   });
 
   it('mounts GET /api/health/live-equity (unauthenticated) only when the dep is provided', () => {

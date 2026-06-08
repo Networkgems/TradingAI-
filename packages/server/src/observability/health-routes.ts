@@ -70,6 +70,26 @@ export interface LiveEquityAcceptanceReport {
   };
   /** Most recent live-equity mirror open across the fleet (ISO), or null. */
   lastLiveEquityFillAt: string | null;
+  /**
+   * TRA-715 — fully-redacted view of the SERVICE-level env that gates durable
+   * live-equity boot-arming. Booleans ONLY (presence, never values), so the
+   * board/ops can confirm — without Render dashboard access — that (a) the
+   * `TRADIER_API_TOKEN`/`TRADIER_ACCOUNT_ID` service creds the boot-arm cred
+   * fallback needs are actually set, and (b) the `LIVE_EQUITY_BOOT_USER` pin
+   * (TRA-713) has been applied to the running container via a Blueprint sync.
+   * When `bootArmPinConfigured` is false on bqb1, the env-pin did NOT sync and
+   * durable zero-touch arming cannot self-activate.
+   */
+  serviceEnv: {
+    /** `TRADIER_ENV === 'production'` — the boot-arm requires this. */
+    tradierEnvProduction: boolean;
+    /** `TRADIER_API_TOKEN` is set (service-level prod equity cred fallback). */
+    productionTradierTokenPresent: boolean;
+    /** `TRADIER_ACCOUNT_ID` is set (service-level prod equity cred fallback). */
+    productionTradierAccountPresent: boolean;
+    /** `LIVE_EQUITY_BOOT_USER` is set (TRA-713 env-pin synced to runtime). */
+    bootArmPinConfigured: boolean;
+  };
 }
 
 /**
@@ -80,7 +100,9 @@ export interface LiveEquityAcceptanceReport {
 export function aggregateLiveEquityAcceptance(
   snapshots: LiveEquityAcceptance[],
   now: number,
+  env: NodeJS.ProcessEnv = process.env,
 ): LiveEquityAcceptanceReport {
+  const present = (key: string): boolean => (env[key] ?? '').trim().length > 0;
   const sum = (pick: (s: LiveEquityAcceptance) => number): number =>
     snapshots.reduce((acc, s) => acc + pick(s), 0);
   let lastFillMs = 0;
@@ -107,6 +129,12 @@ export function aggregateLiveEquityAcceptance(
       liveSkipReasons: sum(s => s.liveSkipReasonCount),
     },
     lastLiveEquityFillAt: lastFillMs > 0 ? new Date(lastFillMs).toISOString() : null,
+    serviceEnv: {
+      tradierEnvProduction: (env['TRADIER_ENV'] ?? '').trim() === 'production',
+      productionTradierTokenPresent: present('TRADIER_API_TOKEN'),
+      productionTradierAccountPresent: present('TRADIER_ACCOUNT_ID'),
+      bootArmPinConfigured: present('LIVE_EQUITY_BOOT_USER'),
+    },
   };
 }
 
