@@ -1,0 +1,245 @@
+{
+  "generatedAt": "2026-06-08T12:53:30.381Z",
+  "issue": "TRA-310",
+  "strategy": "donchian_breakdown_short",
+  "candidate": "A (trend-following short, BTC-favorable gate)",
+  "preRegistered": {
+    "donchianPeriod": 20,
+    "btcdSmaPeriod": 50,
+    "note": "single config, no sweep (TRA-431 multiple-comparisons discipline)"
+  },
+  "universe": [
+    "SOL-USD",
+    "DOGE-USD"
+  ],
+  "barTimeframe": "4h",
+  "gate": "BTC-favorable: synthetic BTC.D >= SMA(50) (complement of TRA-296)",
+  "btcdSource": "synthetic-5coin-basket",
+  "btcdBasket": [
+    {
+      "symbol": "BTC-USD",
+      "supply": 19500000
+    },
+    {
+      "symbol": "ETH-USD",
+      "supply": 120000000
+    },
+    {
+      "symbol": "SOL-USD",
+      "supply": 400000000
+    },
+    {
+      "symbol": "DOGE-USD",
+      "supply": 144000000000
+    },
+    {
+      "symbol": "XRP-USD",
+      "supply": 55000000000
+    }
+  ],
+  "riskKnobs": {
+    "riskFraction": 0.01,
+    "atrKStop": 2,
+    "atrKTrail": 2,
+    "rrMin": 2,
+    "trailArmR": 1
+  },
+  "walkForward": {
+    "trainBars": 1080,
+    "testBars": 540,
+    "stepBars": 540,
+    "alignedStartTs": 1689278400000,
+    "windows": 9
+  },
+  "costModel": {
+    "feeBps": 40,
+    "slippageBps": 5,
+    "initialEquityUsd": 25000
+  },
+  "section8": {
+    "bar": "density>=4, hit>=35%, expectancy>=+0.10R, DD90<=25%, pass>=5/9",
+    "passingWindows": 2,
+    "requiredPassing": 5,
+    "verdict": "FAIL",
+    "perWindow": [
+      {
+        "index": 0,
+        "trades": 12,
+        "winners": 1,
+        "hitRatePct": 8.333333333333332,
+        "expectancyR": -0.815057808646575,
+        "totalPnlUsd": -2445.791959589999,
+        "rollingDdPct": 11.6398926920837,
+        "passes": false,
+        "reasons": [
+          "expectancy -0.815R < 0.10R",
+          "hit 8.3% < 35%"
+        ],
+        "preGate": 21,
+        "postGate": 13,
+        "gated": 8
+      },
+      {
+        "index": 1,
+        "trades": 34,
+        "winners": 11,
+        "hitRatePct": 32.35294117647059,
+        "expectancyR": -0.1882699225840268,
+        "totalPnlUsd": -2139.020094175664,
+        "rollingDdPct": 17.3469973255549,
+        "passes": false,
+        "reasons": [
+          "expectancy -0.188R < 0.10R",
+          "hit 32.4% < 35%"
+        ],
+        "preGate": 58,
+        "postGate": 34,
+        "gated": 24
+      },
+      {
+        "index": 2,
+        "trades": 48,
+        "winners": 25,
+        "hitRatePct": 52.083333333333336,
+        "expectancyR": 0.185209248233175,
+        "totalPnlUsd": 141.77373037405783,
+        "rollingDdPct": 20.199382953617953,
+        "passes": true,
+        "reasons": [],
+        "preGate": 52,
+        "postGate": 52,
+        "gated": 0
+      },
+      {
+        "index": 3,
+        "trades": 16,
+        "winners": 3,
+        "hitRatePct": 18.75,
+        "expectancyR": -0.6538824700697612,
+        "totalPnlUsd": -2594.31108134222,
+        "rollingDdPct": 15.15847112210741,
+        "passes": false,
+        "reasons": [
+          "expectancy -0.654R < 0.10R",
+          "hit 18.8% < 35%"
+        ],
+        "preGate": 34,
+        "postGate": 16,
+        "gated": 18
+      },
+      {
+        "index": 4,
+        "trades": 69,
+        "winners": 33,
+        "hitRatePct": 47.82608695652174,
+        "expectancyR": 0.16912460731837356,
+        "totalPnlUsd": 302.94302054405205,
+        "rollingDdPct": 12.281290147453626,
+        "passes": true,
+        "reasons": [],
+        "preGate": 79,
+        "postGate": 73,
+        "gated": 6
+      },
+      {
+        "index": 5,
+        "trades": 29,
+        "winners": 9,
+        "hitRatePct": 31.03448275862069,
+        "expectancyR": -0.22910154450984296,
+        "totalPnlUsd": -2480.062950637587,
+        "rollingDdPct": 17.86397901179538,
+        "passes": false,
+        "reasons": [
+          "expectancy -0.229R < 0.10R",
+          "hit 31.0% < 35%"
+        ],
+        "preGate": 47,
+        "postGate": 29,
+        "gated": 18
+      },
+      {
+        "index": 6,
+        "trades": 4,
+        "winners": 1,
+        "hitRatePct": 25,
+        "expectancyR": -0.3456972623266169,
+        "totalPnlUsd": -451.39563293357435,
+        "rollingDdPct": 5.4242807098681105,
+        "passes": false,
+        "reasons": [
+          "expectancy -0.346R < 0.10R",
+          "hit 25.0% < 35%"
+        ],
+        "preGate": 24,
+        "postGate": 4,
+        "gated": 20
+      },
+      {
+        "index": 7,
+        "trades": 55,
+        "winners": 13,
+        "hitRatePct": 23.636363636363637,
+        "expectancyR": -0.407981126056087,
+        "totalPnlUsd": -6054.401105934555,
+        "rollingDdPct": 28.97182162542603,
+        "passes": false,
+        "reasons": [
+          "expectancy -0.408R < 0.10R",
+          "hit 23.6% < 35%",
+          "DD90 29.0% > 25%"
+        ],
+        "preGate": 65,
+        "postGate": 58,
+        "gated": 7
+      },
+      {
+        "index": 8,
+        "trades": 40,
+        "winners": 8,
+        "hitRatePct": 20,
+        "expectancyR": -0.3335307496521344,
+        "totalPnlUsd": -3456.0652117095997,
+        "rollingDdPct": 21.24784137313451,
+        "passes": false,
+        "reasons": [
+          "expectancy -0.334R < 0.10R",
+          "hit 20.0% < 35%"
+        ],
+        "preGate": 52,
+        "postGate": 41,
+        "gated": 11
+      }
+    ]
+  },
+  "robustnessGate": {
+    "bar": "p5 of OOS block-bootstrap CI > start equity AND pooled OOS trades >= 25",
+    "pooledOosTrades": 307,
+    "aggHitPct": 33.876221498371336,
+    "aggExpectancyR": -0.162512294891967,
+    "aggRollingDd90Pct": 28.97182162542603,
+    "blockBootstrap": {
+      "blockLen": 5,
+      "iterations": 3000,
+      "p5Usd": -4030.208215506201,
+      "p50Usd": 5488.292965290348,
+      "p95Usd": 15861.745199262006,
+      "p5ReturnPct": -116.12083286202481,
+      "p50ReturnPct": -78.0468281388386,
+      "p95ReturnPct": -36.55301920295197,
+      "worstDdPct": 153.2633013118284
+    },
+    "structural": {
+      "grossProfitUsd": 24858.90321757666,
+      "top1WinShareOfGrossProfit": 0.018398880860803362,
+      "top3WinShareOfGrossProfit": 0.05443238426706865,
+      "excessKurtosis": -0.6098796785949139,
+      "tells": []
+    },
+    "p5Positive": false,
+    "sampleAdequate": true,
+    "verdict": "FAIL"
+  },
+  "bindingGate": "robustnessGate",
+  "verdict": "NO-GO"
+}
