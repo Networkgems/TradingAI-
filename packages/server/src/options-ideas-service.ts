@@ -261,8 +261,15 @@ export async function buildIdeasFeed(opts: BuildIdeasOptions): Promise<OptionsId
   try {
     research = await runOptionsResearch(input, { llm, cache: researchCache });
   } catch (err) {
-    log.error('options-research pass failed', { reason: err instanceof Error ? err.message : String(err) });
-    return nonLive('AI Options Ideas could not complete the research pass this cycle; try again shortly.');
+    const reason = err instanceof Error ? err.message : String(err);
+    log.error('options-research pass failed', { reason });
+    // Surface the concrete reason (TRA-714): a bare "try again" hid an auth
+    // failure (e.g. an Anthropic credential that is read but rejected at call
+    // time) behind a transient-looking message, making it undiagnosable from
+    // outside. The reason is truncated and carries no secrets.
+    return nonLive(
+      `AI Options Ideas could not complete the research pass this cycle: ${reason.slice(0, 240)}`,
+    );
   }
 
   // 4) map engine ideas → panel feed; refresh the entry-intent registry.
