@@ -1277,6 +1277,101 @@ describe('sizeLiveEquityFromStop — TRA-499 small-book caps', () => {
   });
 });
 
+describe('sizeLiveEquityFromStop — TRA-711 available-funds gate', () => {
+  // Mirrors the screenshot account: ~$226 cash with most of it committed to
+  // open option orders so Available Funds (stockBuyingPower) is only ~$26,
+  // while a swing signal fires on a ~$129 share. Pre-fix the buying-power cap
+  // ground qty to 0 and the LIVE 1-share floor re-inflated it to 1, so Tradier
+  // received — and rejected — a $129 order against $26 of available funds.
+  it('returns 0 when available funds cannot cover even one share (no rejected order)', () => {
+    const qty = sizeLiveEquityFromStop({
+      balance: {
+        totalEquity: 797.16,
+        totalCash: 226.66,
+        optionBuyingPower: 26.66,
+        stockBuyingPower: 26.66,
+        longMarketValue: 0,
+        dayTradeBuyingPower: null,
+      },
+      managedAccountRatio: 1.0,
+      riskPerTrade: 0.10,
+      entryPrice: 129.56,
+      stopPrice: 123.0,
+      currentPrice: 129.56,
+    });
+    expect(qty).toBe(0);
+  });
+
+  it('still admits 1 share when available funds cover exactly one share', () => {
+    // Available funds $130 ≥ one $129.56 share → the 1-share floor is allowed
+    // to fire. cap = max($150, 15% × baseEquity). baseEquity = $130 + $0 LMV
+    // → cap = $150 > $129.56, so the up-front strict-less-than gate admits it.
+    const qty = sizeLiveEquityFromStop({
+      balance: {
+        totalEquity: 130,
+        totalCash: 130,
+        optionBuyingPower: 130,
+        stockBuyingPower: 130,
+        longMarketValue: 0,
+        dayTradeBuyingPower: null,
+      },
+      managedAccountRatio: 1.0,
+      riskPerTrade: 0.01,
+      entryPrice: 129.56,
+      stopPrice: 123.0,
+      currentPrice: 129.56,
+    });
+    expect(qty).toBe(1);
+  });
+
+  it('caps a multi-share order at the affordable-share ceiling', () => {
+    // Risk-from-stop would want more shares than available funds can settle.
+    // managedEquity = $5,000 cash → maxRisk ($5,000 × 0.10) = $500, $5 stop →
+    // riskQty = 100; equityCap = floor($5,000/$50) = 100. But stockBuyingPower
+    // is only $260 (most cash committed elsewhere) → affordableShares =
+    // floor($260/$50) = 5. Per-position cap = max($150, 15% × $5,000=$750) =
+    // $750 → no further trim. Final: capped to the 5 shares funds can cover.
+    const qty = sizeLiveEquityFromStop({
+      balance: {
+        totalEquity: 5_000,
+        totalCash: 5_000,
+        optionBuyingPower: 260,
+        stockBuyingPower: 260,
+        longMarketValue: 0,
+        dayTradeBuyingPower: null,
+      },
+      managedAccountRatio: 1.0,
+      riskPerTrade: 0.10,
+      entryPrice: 50,
+      stopPrice: 45,
+      currentPrice: 50,
+    });
+    expect(qty).toBe(5);
+  });
+
+  it('stays permissive when stockBuyingPower is null (cash account, no bucket)', () => {
+    // No buying-power bucket from Tradier → affordableShares = Infinity, so the
+    // gate is a no-op and sizing falls back to the cash-based risk math. The
+    // post-submit reconcile voids the mirror if the broker still rejects.
+    const qty = sizeLiveEquityFromStop({
+      balance: {
+        totalEquity: 5_000,
+        totalCash: 5_000,
+        optionBuyingPower: null,
+        stockBuyingPower: null,
+        longMarketValue: 0,
+        dayTradeBuyingPower: null,
+      },
+      managedAccountRatio: 0.5,
+      riskPerTrade: 0.01,
+      entryPrice: 100,
+      stopPrice: 95,
+      currentPrice: 100,
+    });
+    expect(qty).toBeGreaterThan(0);
+  });
+});
+
 describe('SignalEngine — TRA-335 live equity bracket placement', () => {
   type WaitOpts = { timeoutMs?: number; intervalMs?: number; sleep?: (ms: number) => Promise<void> };
   interface TradierEquityStub {

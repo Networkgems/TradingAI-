@@ -4457,13 +4457,43 @@ export function sizeLiveEquityFromStop(args: {
   // the per-share granularity diversifies the same dollar concentration
   // across multiple fills. Fractional-share support is intentionally not
   // enabled here (see TRA-499 spec).
+  // TRA-711 — how many whole shares the account's *available funds* can
+  // actually cover. `stockBuyingPower` is Tradier's option/stock buying power
+  // on margin accounts and falls back to `cash.cash_available` on cash
+  // accounts, i.e. the funds left after cash already committed to open /
+  // pending orders — the same "Available Funds" figure the broker enforces at
+  // submit time. `null` ⇒ Tradier didn't surface any buying-power bucket ⇒
+  // stay permissive (Infinity) and let the post-submit reconcile void the
+  // mirror if the order bounces.
+  const affordableShares =
+    typeof sbp === 'number' && Number.isFinite(sbp) && sbp > 0
+      ? Math.floor(sbp / currentPrice)
+      : Number.POSITIVE_INFINITY;
+
   const cap = perPositionCap(baseEquity);
   if (currentPrice >= cap) return 0;
+  // TRA-711 — only lift to the LIVE 1-share floor when a single share's
+  // notional actually fits inside available funds. Forcing qty = 1 on a book
+  // whose available funds are below one share's cost (e.g. $26 available, a
+  // $129 share) is exactly what made Tradier reject the equity bracket in the
+  // screenshot: the buying-power cap above had already ground qty to 0 and
+  // this floor re-inflated it to an order the broker could never fill. When
+  // funds can't cover even one share, size to 0 so the caller surfaces a
+  // clean `liveSkipReason` instead of submitting an order we know will bounce.
   if (qty <= 0) {
+    if (affordableShares < 1) return 0;
     qty = 1;
   }
   if (qty > 0 && qty * currentPrice > cap) {
     qty = Math.floor(cap / currentPrice);
+  }
+  // TRA-711 — final hard ceiling on available funds. The buying-power cap
+  // above runs before the per-position-cap trim and the 1-share floor, so
+  // re-apply it here as the last word: never request more shares than the
+  // account's available funds can settle, no matter what the intermediate
+  // risk / cap / floor steps produced.
+  if (Number.isFinite(affordableShares)) {
+    qty = Math.min(qty, affordableShares);
   }
   return qty > 0 ? qty : 0;
 }
