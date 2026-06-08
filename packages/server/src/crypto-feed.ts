@@ -811,8 +811,16 @@ export async function fetchCryptoQuotes(
   // on Exchange but momentarily absent from the Advanced Trade market feed).
   // Public, keyless, same 10 req/s pacer; only the (usually small) residual set
   // hits it, so this no longer scales with the full universe.
+  //
+  // TRA-693 — when Render's egress IP is blocked by Coinbase, AT batch returns 0
+  // for a large universe. The Exchange per-symbol path uses the same IP and will
+  // fail too, but at 120ms pacing × N symbols it burns 40–50s before emptying.
+  // Skip it when AT returned nothing from ≥10 symbols — that's a datacenter-IP
+  // block signal, not a missing-symbol condition. The daily-close fallback in
+  // the engine covers pricing in this case.
   const needStats = symbols.filter(s => !results.has(s));
-  if (needStats.length > 0) {
+  const atBlockedUniverse = results.size === 0 && symbols.length >= 10;
+  if (needStats.length > 0 && !atBlockedUniverse) {
     const cbResults = await fetchCoinbaseStatsQuotes(needStats);
     for (const [sym, quote] of cbResults) results.set(sym, quote);
   }
