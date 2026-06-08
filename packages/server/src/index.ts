@@ -2936,23 +2936,30 @@ function buildTradierOptionsClientForEnv(
   settings: AccountSettings,
   env: TradierEnv,
 ): TradierOptionsClient | null {
+  // TRA-714: `||` (not `??`) so a BLANK saved cred ('' — the default when
+  // Tradier is configured only via env vars, e.g. the AI Ideas / options-ideas
+  // feed) falls through to the env-var fallback. With `??`, an empty-string
+  // field short-circuits and the env fallback never runs, leaving the feed stuck
+  // on "no Tradier options credentials" even when TRADIER_* env vars are set.
+  // (This is the copy the /api/options/ideas route actually calls; a sibling in
+  // signal-engine.ts was fixed in the same way.)
   const apiToken = (
     (env === 'production'
       ? settings.liveApiKeyOptionsProduction
-      : (settings.liveApiKeyOptionsSandbox ?? settings.liveApiKeyOptions))
-    ?? (env === 'production'
+      : (settings.liveApiKeyOptionsSandbox || settings.liveApiKeyOptions))
+    || (env === 'production'
       ? process.env['TRADIER_API_TOKEN']
-      : (process.env['TRADIER_SANDBOX_API_TOKEN'] ?? process.env['TRADIER_API_TOKEN']))
-    ?? ''
+      : (process.env['TRADIER_SANDBOX_API_TOKEN'] || process.env['TRADIER_API_TOKEN']))
+    || ''
   ).trim();
   const accountId = (
     (env === 'production'
       ? settings.liveAccountIdOptionsProduction
-      : (settings.liveAccountIdOptionsSandbox ?? settings.liveAccountIdOptions))
-    ?? (env === 'production'
+      : (settings.liveAccountIdOptionsSandbox || settings.liveAccountIdOptions))
+    || (env === 'production'
       ? process.env['TRADIER_ACCOUNT_ID']
-      : (process.env['TRADIER_SANDBOX_ACCOUNT_ID'] ?? process.env['TRADIER_ACCOUNT_ID']))
-    ?? ''
+      : (process.env['TRADIER_SANDBOX_ACCOUNT_ID'] || process.env['TRADIER_ACCOUNT_ID']))
+    || ''
   ).trim();
   if (!apiToken || !accountId) return null;
   return new TradierOptionsClient(apiToken, accountId, env);
