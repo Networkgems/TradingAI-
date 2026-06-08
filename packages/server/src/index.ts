@@ -3959,6 +3959,31 @@ const QUOTES_HEALTH_BUILD_TIMEOUT_MS = 9_000;
 let quotesHealthCache: { ts: number; payload: Record<string, unknown> } | null = null;
 let quotesHealthInFlight: Promise<Record<string, unknown>> | null = null;
 
+// TRA-708 — hard per-probe timeout. Without it the build's slowest legs (the
+// IP-blocked Coinbase Exchange host, the minute-bar/daily-bar candle cascades)
+// keep the single in-flight build running for 30-60s; even one such build is
+// enough to briefly load the web process and 502 other routes. Capping each
+// probe means the whole (parallel) build settles in a few seconds. The losing
+// race branch is swallowed so a late rejection from the orphaned upstream call
+// can't surface as an unhandled rejection after the timeout already won.
+const QUOTES_PROBE_TIMEOUT_MS = 4_500;
+async function runQuotesProbe(fn: () => Promise<unknown>): Promise<unknown> {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const guarded = Promise.resolve()
+    .then(fn)
+    .catch((err: unknown) => ({ error: err instanceof Error ? err.message : String(err) }));
+  try {
+    return await Promise.race<unknown>([
+      guarded,
+      new Promise<unknown>((resolve) => {
+        timer = setTimeout(() => resolve({ error: `timeout after ${QUOTES_PROBE_TIMEOUT_MS}ms` }), QUOTES_PROBE_TIMEOUT_MS);
+      }),
+    ]);
+  } finally {
+    if (timer) clearTimeout(timer);
+  }
+}
+
 app.get('/api/health/quotes', async (_req, res) => {
   const now = Date.now();
   if (quotesHealthCache && now - quotesHealthCache.ts < QUOTES_HEALTH_TTL_MS) {
@@ -4026,89 +4051,54 @@ async function buildQuotesHealthPayload(): Promise<Record<string, unknown>> {
   } = await import('./crypto-feed.js');
   const results: Record<string, unknown> = {};
 
-  try {
-    const tradier = await testTradier();
-    results['tradier'] = tradier ?? { skipped: 'TRADIER_*_API_TOKEN not set' };
-  } catch (err: unknown) {
-    results['tradier'] = { error: err instanceof Error ? err.message : String(err) };
-  }
-
-  // TRA-331 — Coinbase Exchange is the LIVE crypto engine's primary quote
-  // source. Probing it here makes the health response reflect the path the
-  // engine actually uses; without this the endpoint only saw fallbacks and
-  // reported `cryptoOk: false` whenever Yahoo/Twelve/CMC were degraded even
-  // though crypto was flowing through Coinbase fine.
-  try {
-    results['coinbase'] = await testCoinbase();
-  } catch (err: unknown) {
-    results['coinbase'] = { error: err instanceof Error ? err.message : String(err) };
-  }
-
-  // TRA-705 — Advanced Trade (`api.coinbase.com`) is the crypto engine's ACTUAL
-  // primary quote source (TRA-693), and it resolves from the Render datacenter
-  // egress IP that the Exchange host above blocks. Probe it so `cryptoOk`
-  // reflects the path the engine uses rather than only the IP-blocked Exchange
-  // host / breaker-tripped Yahoo / keyless-less CMC.
-  try {
-    results['coinbaseAdvancedTrade'] = await testCoinbaseAdvancedTrade();
-  } catch (err: unknown) {
-    results['coinbaseAdvancedTrade'] = { error: err instanceof Error ? err.message : String(err) };
-  }
-
-  try {
-    results['yahooFinance'] = await testYahooFinance();
-  } catch (err: unknown) {
-    results['yahooFinance'] = { error: err instanceof Error ? err.message : String(err) };
-  }
-
-  try {
-    const td = await testTwelveData();
-    results['twelveData'] = td ?? { skipped: 'TWELVE_DATA_API_KEY not set' };
-  } catch (err: unknown) {
-    results['twelveData'] = { error: err instanceof Error ? err.message : String(err) };
-  }
-
-  try {
-    const cmc = await testCoinMarketCap();
-    results['coinMarketCap'] = cmc ?? { skipped: 'CMC_API_KEY not set' };
-  } catch (err: unknown) {
-    results['coinMarketCap'] = { error: err instanceof Error ? err.message : String(err) };
-  }
-
-  // TRA-191 follow-up: probe the actual minute-bar path the signal engine uses,
-  // so QA can confirm Tradier (primary) is serving and the fallback chain
-  // engages when its breaker is open. All provider diags are surfaced so QA
-  // can see *why* a given tier returned nothing (no_data, http_error, etc.).
-  try {
-    const probe = await fetchMinuteBarsWithSource('AAPL', 60);
-    results['chartFallback'] = {
-      symbol: 'AAPL',
-      bars: probe.bars.length,
-      source: probe.source,
-      yahooSkipped: probe.yahooSkipped,
-      cached: probe.cached ?? false,
-      tradierDiag: probe.tradierDiag ?? null,
-      twelveDataDiag: probe.twelveDataDiag ?? null,
-    };
-  } catch (err: unknown) {
-    results['chartFallback'] = { error: err instanceof Error ? err.message : String(err) };
-  }
-
-  // TRA-705 — crypto strategies evaluate off the daily OHLC series, not the last
-  // quote, so probe the candle cascade (`fetchCryptoDailyBars`: Exchange → keyless
-  // Advanced Trade → Yahoo) the engine feeds its strategies. A non-zero `bars`
-  // here proves real OHLC is reaching the engine from a datacenter-resolvable
-  // source even when the Exchange/Yahoo legs are degraded — i.e. signals can flow.
-  try {
-    const dailyBars = await fetchCryptoDailyBars('BTC-USD', 60);
-    results['cryptoDailyBars'] = {
-      symbol: 'BTC-USD',
-      bars: dailyBars.length,
-      lastClose: dailyBars.at(-1)?.close ?? null,
-    };
-  } catch (err: unknown) {
-    results['cryptoDailyBars'] = { error: err instanceof Error ? err.message : String(err) };
-  }
+  // TRA-708 — run every probe in PARALLEL, each under `runQuotesProbe`'s hard
+  // timeout, so the whole build settles in a few seconds instead of the sum of
+  // eight serial network calls. Probe semantics are unchanged:
+  //   • tradier / twelveData / coinMarketCap keep their "skipped" fallback when
+  //     unconfigured (null result);
+  //   • coinbase (TRA-331 Exchange) + coinbaseAdvancedTrade (TRA-705 the real
+  //     Render-resolvable primary) + yahooFinance are probed as-is;
+  //   • chartFallback (TRA-191 minute-bar path) and cryptoDailyBars (TRA-705
+  //     daily OHLC candle cascade) preserve their full diagnostic shapes.
+  const [
+    tradier, coinbase, coinbaseAdvancedTrade, yahooFinance, twelveData,
+    coinMarketCap, chartFallback, cryptoDailyBars,
+  ] = await Promise.all([
+    runQuotesProbe(async () => (await testTradier()) ?? { skipped: 'TRADIER_*_API_TOKEN not set' }),
+    runQuotesProbe(() => testCoinbase()),
+    runQuotesProbe(() => testCoinbaseAdvancedTrade()),
+    runQuotesProbe(() => testYahooFinance()),
+    runQuotesProbe(async () => (await testTwelveData()) ?? { skipped: 'TWELVE_DATA_API_KEY not set' }),
+    runQuotesProbe(async () => (await testCoinMarketCap()) ?? { skipped: 'CMC_API_KEY not set' }),
+    runQuotesProbe(async () => {
+      const probe = await fetchMinuteBarsWithSource('AAPL', 60);
+      return {
+        symbol: 'AAPL',
+        bars: probe.bars.length,
+        source: probe.source,
+        yahooSkipped: probe.yahooSkipped,
+        cached: probe.cached ?? false,
+        tradierDiag: probe.tradierDiag ?? null,
+        twelveDataDiag: probe.twelveDataDiag ?? null,
+      };
+    }),
+    runQuotesProbe(async () => {
+      const dailyBars = await fetchCryptoDailyBars('BTC-USD', 60);
+      return {
+        symbol: 'BTC-USD',
+        bars: dailyBars.length,
+        lastClose: dailyBars.at(-1)?.close ?? null,
+      };
+    }),
+  ]);
+  results['tradier'] = tradier;
+  results['coinbase'] = coinbase;
+  results['coinbaseAdvancedTrade'] = coinbaseAdvancedTrade;
+  results['yahooFinance'] = yahooFinance;
+  results['twelveData'] = twelveData;
+  results['coinMarketCap'] = coinMarketCap;
+  results['chartFallback'] = chartFallback;
+  results['cryptoDailyBars'] = cryptoDailyBars;
 
   // Daily request counters per provider. Resets at UTC midnight.
   try { results['fallbackRequestsToday'] = getFallbackRequestCounts(); }
