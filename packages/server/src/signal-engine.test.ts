@@ -3411,9 +3411,18 @@ describe('shouldBootArmLiveEquity — TRA-713 persistent live-equity boot-arm', 
     expect(shouldBootArmLiveEquity(prodSettings(), 'someone-else', prodEnv())).toBe(false);
   });
 
-  it('default-OFF: no pin set ⇒ never arms', () => {
+  it('TRA-716: unset pin ⇒ falls back to committed default "admin" and arms (Blueprint-sync-free activation)', () => {
     const env = prodEnv(); delete env['LIVE_EQUITY_BOOT_USER'];
-    expect(shouldBootArmLiveEquity(prodSettings(), PIN, env)).toBe(false);
+    expect(shouldBootArmLiveEquity(prodSettings(), 'admin', env)).toBe(true);
+  });
+
+  it('TRA-716: unset pin ⇒ default only arms "admin", never another user', () => {
+    const env = prodEnv(); delete env['LIVE_EQUITY_BOOT_USER'];
+    expect(shouldBootArmLiveEquity(prodSettings(), 'someone-else', env)).toBe(false);
+  });
+
+  it('TRA-716: explicitly empty pin ⇒ disarms (clear-this-value kill-switch preserved)', () => {
+    expect(shouldBootArmLiveEquity(prodSettings(), PIN, prodEnv({ LIVE_EQUITY_BOOT_USER: '' }))).toBe(false);
   });
 
   it('refuses to arm when the server is not in production Tradier mode', () => {

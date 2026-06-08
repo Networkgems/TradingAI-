@@ -4363,8 +4363,15 @@ function buildTradierOptionsClientsByEnv(
  * Monday redeploy faithfully rehydrated `demo` and booted out of Live.
  *
  * This is a REAL-MONEY, board-ratified (approval 979c77c1) boot-arm, so it is
- * deliberately scoped and default-OFF — every condition must hold:
- *   • `LIVE_EQUITY_BOOT_USER` names THIS user (operator pin; unset ⇒ never arm).
+ * deliberately scoped — every condition must hold:
+ *   • `LIVE_EQUITY_BOOT_USER` names THIS user (operator pin). TRA-716: the value
+ *     "admin" is the board-ratified committed default (render.yaml + approval
+ *     979c77c1). Because a NEW Render Blueprint env key only reaches the runtime
+ *     via a dashboard Blueprint sync — which no agent can perform — an UNSET env
+ *     var falls back to {@link BOOT_ARM_LIVE_EQUITY_USER_DEFAULT} so a plain code
+ *     redeploy (git push) activates the approved arm. An EXPLICITLY EMPTY value
+ *     (`LIVE_EQUITY_BOOT_USER=""`) still disarms, preserving the documented
+ *     "clear this value" kill-switch.
  *     This single-user scope is the critical safety gate: a fleet-wide arm would
  *     trip the env-cred fallback below for every production-env engine and trade
  *     the SHARED prod Tradier account.
@@ -4377,12 +4384,27 @@ function buildTradierOptionsClientsByEnv(
  *
  * `env` is injectable so the gate is unit-testable without mutating process.env.
  */
+/**
+ * TRA-716 — board-ratified committed default for the boot-arm operator pin. This
+ * mirrors the `LIVE_EQUITY_BOOT_USER: value: "admin"` declaration in render.yaml
+ * (approval 979c77c1). It exists because a brand-new Render Blueprint env key
+ * only reaches the running container on a dashboard Blueprint sync — which no
+ * agent can perform — so relying on the env var alone left the arm permanently
+ * inert after a push-only redeploy. Falling back to this default lets an ordinary
+ * `git push` activate the approved arm. The fallback is `??` (nullish) only, so an
+ * EXPLICITLY EMPTY `LIVE_EQUITY_BOOT_USER=""` still resolves to "" and disarms —
+ * preserving the documented "clear this value" kill-switch. Every other gate
+ * condition (production Tradier env + resolvable prod creds, single-user scope)
+ * is unchanged, so only the prod-Tradier `admin` engine on bqb1 ever arms.
+ */
+export const BOOT_ARM_LIVE_EQUITY_USER_DEFAULT = 'admin';
+
 export function shouldBootArmLiveEquity(
   settings: AccountSettings,
   username: string,
   env: NodeJS.ProcessEnv = process.env,
 ): boolean {
-  const pinned = (env['LIVE_EQUITY_BOOT_USER'] ?? '').trim();
+  const pinned = (env['LIVE_EQUITY_BOOT_USER'] ?? BOOT_ARM_LIVE_EQUITY_USER_DEFAULT).trim();
   if (!pinned || pinned !== username) return false;
   if ((env['TRADIER_ENV'] ?? '') !== 'production') return false;
   if ((settings.liveTradierEnvOptions ?? 'sandbox') !== 'production') return false;
