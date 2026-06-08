@@ -53,6 +53,16 @@ export type CryptoEngineEventHandler = (state: CryptoEngineState) => void;
 const MAX_SIGNALS = 50;
 const NEWS_REFRESH_MS = 5 * 60_000;
 
+// TRA-693 — shared across all CryptoSignalEngine instances (one per demo user).
+// Without sharing, each engine independently fetches the same daily candles on
+// every tick, saturating the shared AT pacer (150ms/req × 16 candles/tick × N
+// engines = N×2.4s queue, pushing tail requests past the 8s timeout). A module-
+// level cache means only the first engine fetches a symbol; subsequent engines
+// see the TTL-gated dailyFetchAt entry and skip. Node.js is single-threaded so
+// concurrent Map access is safe.
+const sharedDailyCandleCache = new Map<string, Candle[]>();
+const sharedDailyFetchAt = new Map<string, number>();
+
 /**
  * TRA-325 — forced strategy preset override for the LIVE engine. When set in
  * the environment (Render dashboard, ops shell, etc.) the live engine pins to
@@ -207,17 +217,8 @@ export class CryptoSignalEngine {
 
   private symbolState: Map<string, CryptoEngineState['symbols'][number]> = new Map();
   private candleCache: Map<string, Candle[]> = new Map();
-  private dailyCandleCache: Map<string, Candle[]> = new Map();
-  /**
-   * TRA-693 — wall-clock timestamp of the last *daily-bar fetch attempt* per
-   * symbol. The prior cadence guard compared `Date.now()` to the last daily
-   * *bar's* timestamp (today's 00:00 UTC open), which goes stale after 01:00
-   * UTC and made the engine refetch 260 daily bars for every symbol on every
-   * tick — the Coinbase 429 storm that starved signal generation. Gating on
-   * actual fetch time keeps daily refresh to ≤1/hour/symbol, so the full
-   * ~395-symbol Coinbase universe stays well inside the public rate limit.
-   */
-  private dailyFetchAt: Map<string, number> = new Map();
+  // dailyCandleCache and dailyFetchAt are module-level singletons (sharedDailyCandleCache /
+  // sharedDailyFetchAt) so all per-user engine instances share one fetch budget.
   /**
    * TRA-423 — portfolio correlation / concentration cap (TRA-411 spec §6).
    * Enforced on long (BUY) entries before `openPosition` in both the demo and
@@ -785,7 +786,7 @@ export class CryptoSignalEngine {
   private getCorrelationMatrix(): CorrelationMatrix {
     const utcDay = Math.floor(Date.now() / 86_400_000);
     if (!this.correlationMatrix || this.correlationMatrixUtcDay !== utcDay) {
-      this.correlationMatrix = new CorrelationMatrix(this.dailyCandleCache);
+      this.correlationMatrix = new CorrelationMatrix(sharedDailyCandleCache);
       this.correlationMatrixUtcDay = utcDay;
     }
     return this.correlationMatrix;
@@ -1118,8 +1119,8 @@ export class CryptoSignalEngine {
     const dailyHourMs = 60 * 60 * 1000;
     const nowForDaily = Date.now();
     const dueDaily = activeSymbols
-      .filter(s => nowForDaily - (this.dailyFetchAt.get(s) ?? 0) >= dailyHourMs)
-      .sort((a, b) => (this.dailyFetchAt.get(a) ?? 0) - (this.dailyFetchAt.get(b) ?? 0))
+      .filter(s => nowForDaily - (sharedDailyFetchAt.get(s) ?? 0) >= dailyHourMs)
+      .sort((a, b) => (sharedDailyFetchAt.get(a) ?? 0) - (sharedDailyFetchAt.get(b) ?? 0))
       .slice(0, DAILY_REFRESH_PER_TICK);
 
     const CANDLE_BATCH = 5;
@@ -1154,7 +1155,7 @@ export class CryptoSignalEngine {
     if (!needsIntraday) {
       for (const sym of activeSymbols) {
         if (this.symbolState.get(sym)?.quoteStatus === 'ok') continue; // live quote already landed
-        const daily = this.dailyCandleCache.get(sym);
+        const daily = sharedDailyCandleCache.get(sym);
         if (!daily || daily.length === 0) continue;
         const close = daily[daily.length - 1].close;
         if (!(close > 0)) continue;
@@ -1260,7 +1261,7 @@ export class CryptoSignalEngine {
         continue;
       }
       const candles = this.candleCache.get(sym) ?? [];
-      const dailyCandles = this.dailyCandleCache.get(sym) ?? [];
+      const dailyCandles = sharedDailyCandleCache.get(sym) ?? [];
 
       // TRA-699 — DCA is the only surviving engine strategy. The legacy
       // bb_fade / swing direct strategies and the momentum / mean_reversion /
@@ -1455,7 +1456,7 @@ export class CryptoSignalEngine {
     for (const sym of activeSymbols) {
       // TRA-418 — skip stale-feed symbols before any strategy runs.
       if (staleSymbols.has(sym)) continue;
-      const dailyCandles = this.dailyCandleCache.get(sym) ?? [];
+      const dailyCandles = sharedDailyCandleCache.get(sym) ?? [];
 
       // TRA-699 — DCA is the only surviving engine strategy; the legacy
       // bb_fade / swing direct strategies and the momentum / mean_reversion /
@@ -1626,17 +1627,17 @@ export class CryptoSignalEngine {
     // storm behind "no signals". Daily bars change once per day, so ≤1 fetch/h
     // per symbol is plenty and lets the full Coinbase universe stay paced.
     const hourMs = 60 * 60 * 1000;
-    const lastFetch = this.dailyFetchAt.get(symbol) ?? 0;
+    const lastFetch = sharedDailyFetchAt.get(symbol) ?? 0;
     if (Date.now() - lastFetch < hourMs) return;
     const bars = await fetchCryptoDailyBars(symbol, 260);
     // On success gate the next fetch a full hour out; on an empty/rate-limited
     // result back off only ~5 min so a transient 429 retries soon instead of
     // leaving the symbol bar-less (and DCA-silent) for a whole hour.
-    this.dailyFetchAt.set(symbol, bars.length > 0 ? Date.now() : Date.now() - (hourMs - 5 * 60 * 1000));
+    sharedDailyFetchAt.set(symbol, bars.length > 0 ? Date.now() : Date.now() - (hourMs - 5 * 60 * 1000));
     // TRA-593 / TRA-699 — merge so a rate-limited partial daily fetch can't
     // drop the DCA strategy's 200-day-EMA history below threshold and silence it.
     if (bars.length > 0) {
-      this.dailyCandleCache.set(symbol, mergeCandles(this.dailyCandleCache.get(symbol), bars, 260));
+      sharedDailyCandleCache.set(symbol, mergeCandles(sharedDailyCandleCache.get(symbol), bars, 260));
     }
   }
 
