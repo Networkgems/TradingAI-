@@ -355,6 +355,8 @@ describe('TradierOptionsClient.getAccountBalance (TRA-226)', () => {
       stockBuyingPower: null,
       longMarketValue: null,
       dayTradeBuyingPower: null,
+      // TRA-724 — no account_type and no sub-envelope ⇒ indeterminate.
+      accountType: null,
     });
     expect(callUrl(0)).toBe('https://sandbox.tradier.com/v1/accounts/A1/balances');
     const headers = callInit(0).headers as Record<string, string>;
@@ -406,7 +408,43 @@ describe('TradierOptionsClient.getAccountBalance (TRA-226)', () => {
       stockBuyingPower: 600,
       longMarketValue: null,
       dayTradeBuyingPower: null,
+      accountType: 'margin',
     });
+  });
+
+  // TRA-724 — surface the account classification so the live engine can gate
+  // shorts on cash (non-marginable) accounts.
+  it('classifies the account from account_type (cash) and infers it from the sub-envelope when absent', async () => {
+    fetchMock.mockResolvedValueOnce(
+      jsonResponse({
+        balances: {
+          total_equity: 500,
+          total_cash: 500,
+          account_type: 'cash',
+          cash: { cash_available: 480 },
+        },
+      }),
+    );
+    let client = new TradierOptionsClient('tok', 'A1');
+    expect((await client.getAccountBalance())?.accountType).toBe('cash');
+
+    // No explicit account_type, but only a `cash` sub-envelope present ⇒ cash.
+    fetchMock.mockResolvedValueOnce(
+      jsonResponse({
+        balances: { total_equity: 500, total_cash: 500, cash: { cash_available: 480 } },
+      }),
+    );
+    client = new TradierOptionsClient('tok', 'A1');
+    expect((await client.getAccountBalance())?.accountType).toBe('cash');
+
+    // No explicit account_type, but a `margin` sub-envelope present ⇒ margin.
+    fetchMock.mockResolvedValueOnce(
+      jsonResponse({
+        balances: { total_equity: 1000, total_cash: 300, margin: { stock_buying_power: 600 } },
+      }),
+    );
+    client = new TradierOptionsClient('tok', 'A1');
+    expect((await client.getAccountBalance())?.accountType).toBe('margin');
   });
 
   it('falls back to cash.cash_available for cash accounts', async () => {

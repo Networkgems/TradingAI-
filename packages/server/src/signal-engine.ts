@@ -4107,6 +4107,12 @@ export class SignalEngine {
     if (!balance) {
       return { ok: false, reason: 'Tradier balance not yet fetched — try again next tick' };
     }
+    // TRA-724 — never submit a short (sell-to-open) equity bracket on a cash
+    // account; the broker can't fill it. Surface a clean skip instead of a
+    // guaranteed reject. Long entries and marginable accounts pass through.
+    if (shortBlockedOnCashAccount(signal.side, balance)) {
+      return { ok: false, reason: 'short not supported on a cash account' };
+    }
     const qty = sizeLiveEquityFromStop({
       balance,
       managedAccountRatio: this.managedAccountRatio,
@@ -4444,6 +4450,27 @@ function buildTradierLiveEquityClient(settings: AccountSettings): TradierOrderCl
   ).trim();
   if (!apiToken || !accountId) return null;
   return new TradierOrderClient(apiToken, accountId, env);
+}
+
+/**
+ * TRA-724 — cash (non-marginable) Tradier accounts cannot sell short, so a
+ * live equity sell-to-open (`side === 'sell'`) bracket on one is guaranteed to
+ * be rejected by the broker — exactly the GPUS/NXXT/BZFD/... rejects in the
+ * 2026-06-08 blotter incident (TRA-335). Detect that up-front from the balance
+ * snapshot's `accountType` and skip the entry with a clear `liveSkipReason`
+ * instead of firing an order we know will bounce.
+ *
+ * Only `side === 'sell'` on a known `cash` account is blocked. Long entries are
+ * never gated here. Margin / PDT accounts — and the indeterminate `accountType`
+ * cases (`undefined`/`null`, e.g. Tradier didn't surface the field) — stay
+ * permissive so the broker remains the final arbiter and a missing-field blip
+ * never silently suppresses legitimate shorts on a marginable account.
+ */
+export function shortBlockedOnCashAccount(
+  side: 'buy' | 'sell',
+  balance: Pick<TradierAccountBalance, 'accountType'>,
+): boolean {
+  return side === 'sell' && balance.accountType === 'cash';
 }
 
 /**

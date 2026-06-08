@@ -195,6 +195,18 @@ export interface TradierAccountBalance {
    * pre-check skips the DTBP gate in that case and stays permissive.
    */
   dayTradeBuyingPower: number | null;
+  /**
+   * TRA-724 — broker account classification, used to gate live equity short
+   * (sell-to-open) entries. Cash (non-marginable) accounts cannot sell short,
+   * so a short equity bracket on one is guaranteed to be rejected. Tradier
+   * surfaces this directly as `balances.account_type` ('cash' | 'margin' |
+   * 'pdt'); when that field is absent we infer it from which sub-envelope is
+   * present (`margin`/`pdt` ⇒ marginable, only `cash` ⇒ cash). `null` when
+   * neither is determinable — callers stay permissive and let the broker be
+   * the final word. Optional so existing balance literals/fixtures that
+   * predate the field keep compiling.
+   */
+  accountType?: 'cash' | 'margin' | 'pdt' | null;
 }
 
 /** Tradier returns `T | T[]` depending on result count; sometimes `null`/empty string when none. */
@@ -486,6 +498,24 @@ export class TradierOptionsClient extends TradierOrderClient {
       ?? b.pdt?.day_trade_buying_power;
     const dayTradeBuyingPower =
       typeof dtbpRaw === 'number' && Number.isFinite(dtbpRaw) ? dtbpRaw : null;
+    // TRA-724 — classify the account so the live engine can refuse shorts on
+    // cash (non-marginable) accounts. Prefer Tradier's explicit `account_type`;
+    // when it's missing, infer from which buying-power sub-envelope is present
+    // (margin/pdt ⇒ marginable, only cash ⇒ cash). `null` when indeterminate.
+    const rawType =
+      typeof b.account_type === 'string' ? b.account_type.trim().toLowerCase() : null;
+    let accountType: 'cash' | 'margin' | 'pdt' | null;
+    if (rawType === 'cash' || rawType === 'margin' || rawType === 'pdt') {
+      accountType = rawType;
+    } else if (b.margin) {
+      accountType = 'margin';
+    } else if (b.pdt) {
+      accountType = 'pdt';
+    } else if (b.cash) {
+      accountType = 'cash';
+    } else {
+      accountType = null;
+    }
     return {
       totalEquity,
       totalCash,
@@ -493,6 +523,7 @@ export class TradierOptionsClient extends TradierOrderClient {
       stockBuyingPower,
       longMarketValue,
       dayTradeBuyingPower,
+      accountType,
     };
   }
 

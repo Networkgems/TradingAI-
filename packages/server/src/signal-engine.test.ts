@@ -1,5 +1,5 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
-import { SignalEngine, sizeLiveEquityFromStop, gateSignalOnReview, describeGatedStrategies, shouldBootArmLiveEquity } from './signal-engine.js';
+import { SignalEngine, sizeLiveEquityFromStop, shortBlockedOnCashAccount, gateSignalOnReview, describeGatedStrategies, shouldBootArmLiveEquity } from './signal-engine.js';
 import { PaperAccount } from './paper-account.js';
 import type { RelativeValueScannerService, RelativeValueScanResult } from './relative-value-scanner.js';
 import type { RelativeValueCandidate, TradierAccountBalance, TradierOptionsClient, TradierOrderClient } from '@trading-app/engine';
@@ -1033,6 +1033,23 @@ describe('SignalEngine — TRA-336 markets-selector gate', () => {
 // account that powers options. These tests cover the placement + sizing +
 // manual-close paths in isolation; the runTick wiring is exercised
 // indirectly via the live equity gate in the open-loop dedup test.
+describe('shortBlockedOnCashAccount (TRA-724)', () => {
+  it('blocks a sell-to-open on a cash account', () => {
+    expect(shortBlockedOnCashAccount('sell', { accountType: 'cash' })).toBe(true);
+  });
+  it('allows a buy on a cash account (only shorts are gated)', () => {
+    expect(shortBlockedOnCashAccount('buy', { accountType: 'cash' })).toBe(false);
+  });
+  it('allows shorts on margin / pdt accounts', () => {
+    expect(shortBlockedOnCashAccount('sell', { accountType: 'margin' })).toBe(false);
+    expect(shortBlockedOnCashAccount('sell', { accountType: 'pdt' })).toBe(false);
+  });
+  it('stays permissive when the account type is indeterminate (null / undefined)', () => {
+    expect(shortBlockedOnCashAccount('sell', { accountType: null })).toBe(false);
+    expect(shortBlockedOnCashAccount('sell', {})).toBe(false);
+  });
+});
+
 describe('sizeLiveEquityFromStop (TRA-335)', () => {
   function balance(overrides: Partial<TradierAccountBalance> = {}): TradierAccountBalance {
     return {
@@ -1435,6 +1452,66 @@ describe('SignalEngine — TRA-335 live equity bracket placement', () => {
       symbol: 'AAPL', qty: 25, side: 'buy',
       limitPrice: 100, takeProfitPrice: 110, stopLossPrice: 95,
     });
+  });
+
+  it('skips a SHORT (sell-to-open) bracket on a cash account with a clear liveSkipReason and never hits the broker (TRA-724)', async () => {
+    const stub: TradierEquityStub = {
+      submitBracketOrder: vi.fn(),
+      waitForOrderTerminalStatus: vi.fn(),
+    };
+    const engine = setupLiveEquityEngine(stub);
+    // Flip the cached balance to a cash account — cash accounts cannot short.
+    (engine as unknown as { liveTradierBalance: TradierAccountBalance }).liveTradierBalance.accountType =
+      'cash';
+
+    const result = await (engine as unknown as {
+      placeTradierEquityBracket: (s: TradeSignal, p: number) => Promise<{ ok: boolean; orderId?: number | string; reason?: string }>
+    }).placeTradierEquityBracket(bbSignal({ side: 'sell' }), 100);
+
+    expect(result.ok).toBe(false);
+    expect(result.reason).toBe('short not supported on a cash account');
+    // Critical: the order never reached Tradier (no guaranteed reject).
+    expect(stub.submitBracketOrder).not.toHaveBeenCalled();
+  });
+
+  it('still submits a LONG (buy) bracket on a cash account — only shorts are gated (TRA-724)', async () => {
+    const stub: TradierEquityStub = {
+      submitBracketOrder: vi.fn().mockResolvedValue({ id: 7, status: 'ok' }),
+      waitForOrderTerminalStatus: vi.fn(async () => ({ id: 7, status: 'filled' })),
+    };
+    const engine = setupLiveEquityEngine(stub);
+    (engine as unknown as { liveTradierBalance: TradierAccountBalance }).liveTradierBalance.accountType =
+      'cash';
+
+    const result = await (engine as unknown as {
+      placeTradierEquityBracket: (s: TradeSignal, p: number) => Promise<{ ok: boolean; reason?: string }>
+    }).placeTradierEquityBracket(bbSignal({ side: 'buy' }), 100);
+
+    expect(result.ok).toBe(true);
+    expect(stub.submitBracketOrder).toHaveBeenCalledTimes(1);
+    expect(stub.submitBracketOrder).toHaveBeenCalledWith(
+      expect.objectContaining({ side: 'buy' }),
+    );
+  });
+
+  it('still submits a SHORT bracket on a margin account — shorts are only blocked on cash (TRA-724)', async () => {
+    const stub: TradierEquityStub = {
+      submitBracketOrder: vi.fn().mockResolvedValue({ id: 8, status: 'ok' }),
+      waitForOrderTerminalStatus: vi.fn(async () => ({ id: 8, status: 'filled' })),
+    };
+    const engine = setupLiveEquityEngine(stub);
+    (engine as unknown as { liveTradierBalance: TradierAccountBalance }).liveTradierBalance.accountType =
+      'margin';
+
+    const result = await (engine as unknown as {
+      placeTradierEquityBracket: (s: TradeSignal, p: number) => Promise<{ ok: boolean; reason?: string }>
+    }).placeTradierEquityBracket(bbSignal({ side: 'sell' }), 100);
+
+    expect(result.ok).toBe(true);
+    expect(stub.submitBracketOrder).toHaveBeenCalledTimes(1);
+    expect(stub.submitBracketOrder).toHaveBeenCalledWith(
+      expect.objectContaining({ side: 'sell' }),
+    );
   });
 
   it('returns ok:false with a reason when Tradier ends in canceled (e.g. insufficient buying power)', async () => {
