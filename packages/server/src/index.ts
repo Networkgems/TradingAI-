@@ -4065,6 +4065,17 @@ app.get('/api/health/quotes', async (_req, res) => {
     const v = results[key];
     return v && typeof v === 'object' && !('error' in (v as object)) && !('skipped' in (v as object));
   };
+  // TRA-705 — a `cryptoDailyBars` result with bars > 0 means the OHLC candle
+  // pipeline is operational: the engine can evaluate strategies and generate
+  // signals. Quote probes (`coinbase`, `coinbaseAdvancedTrade`, `yahooFinance`,
+  // `coinMarketCap`) are for watchlist display; the strategy layer runs on
+  // candles, not spot quotes. So `cryptoOk` is true if either the spot-quote
+  // path OR the candle path is live. On Render the AT candle endpoint
+  // (`market/products/{id}/candles`) resolves while the AT quote endpoint
+  // (`market/products`) does not — this gate ensures the gauge reports the
+  // truth (engine can trade) rather than a false outage (quote endpoint down).
+  const dailyBarsResult = results['cryptoDailyBars'] as { bars?: number } | undefined;
+  const dailyBarsOk = typeof dailyBarsResult?.bars === 'number' && dailyBarsResult.bars > 0;
   const stocksOk = ok('tradier') || ok('yahooFinance');
   // TRA-331 / TRA-705 — Coinbase is primary for crypto; YF/CMC are fallbacks
   // only. `coinbaseAdvancedTrade` (keyless `api.coinbase.com`) is the engine's
@@ -4072,6 +4083,7 @@ app.get('/api/health/quotes', async (_req, res) => {
   // it must count toward `cryptoOk` — otherwise the gauge reports a crypto
   // outage while the engine is happily pricing the universe through it.
   const cryptoOk =
+    dailyBarsOk ||
     ok('coinbaseAdvancedTrade') || ok('coinbase') || ok('yahooFinance') || ok('coinMarketCap');
   const allOk = stocksOk && cryptoOk;
   // TRA-572 diagnostic: report which boot-time env vars the process sees (boolean
