@@ -3940,7 +3940,71 @@ app.post('/api/crypto/positions/:id/close', requireAuth, async (req, res) => {
 
 // ── Data-source health check ─────────────────────────────────────────────────
 
+// TRA-708 — `/api/health/quotes` was a self-inflicted production DoS. It runs
+// eight network probes (incl. the Coinbase Exchange leg that Render's egress IP
+// is blocked from, which hangs to its full timeout, plus the heavy minute-bar
+// and daily-bar candle cascades). Each call could tie the work up for 30-60s,
+// and nothing de-duplicated concurrent calls. Under RTH sampling (TRA-707) the
+// heavy builds piled up on the single web process, which then flapped 502s on
+// EVERY route and got restarted — the ~14:00Z 2026-06-08 "service outage". Fix:
+//   • single-flight  → N concurrent samplers share ONE in-flight build, so the
+//     work can never pile up no matter how often the endpoint is hit;
+//   • short TTL cache → repeated samples reuse the last snapshot for free;
+//   • overall build timeout → a slow build returns the last good (stale)
+//     snapshot instead of holding the request open, and the lone in-flight
+//     build keeps running in the background until it settles (still capped to
+//     one at a time by single-flight).
+const QUOTES_HEALTH_TTL_MS = 20_000;
+const QUOTES_HEALTH_BUILD_TIMEOUT_MS = 9_000;
+let quotesHealthCache: { ts: number; payload: Record<string, unknown> } | null = null;
+let quotesHealthInFlight: Promise<Record<string, unknown>> | null = null;
+
 app.get('/api/health/quotes', async (_req, res) => {
+  const now = Date.now();
+  if (quotesHealthCache && now - quotesHealthCache.ts < QUOTES_HEALTH_TTL_MS) {
+    const p = quotesHealthCache.payload;
+    res.status(p['ok'] ? 200 : 502).json({ ...p, cached: true });
+    return;
+  }
+  if (!quotesHealthInFlight) {
+    quotesHealthInFlight = buildQuotesHealthPayload()
+      .then((payload) => {
+        quotesHealthCache = { ts: Date.now(), payload };
+        return payload;
+      })
+      .finally(() => {
+        quotesHealthInFlight = null;
+      });
+  }
+  try {
+    const payload = await Promise.race<Record<string, unknown> | null>([
+      quotesHealthInFlight,
+      new Promise<null>((resolve) => setTimeout(() => resolve(null), QUOTES_HEALTH_BUILD_TIMEOUT_MS)),
+    ]);
+    if (payload) {
+      res.status(payload['ok'] ? 200 : 502).json(payload);
+      return;
+    }
+    // Build is taking too long — serve the last good snapshot rather than hold
+    // the request (and the proxy) open. The in-flight build still completes and
+    // refreshes the cache for the next caller.
+    if (quotesHealthCache) {
+      const p = quotesHealthCache.payload;
+      res.status(p['ok'] ? 200 : 502).json({ ...p, stale: true, note: 'probe build in progress' });
+      return;
+    }
+    res.status(503).json({ ok: false, building: true, ts: new Date().toISOString() });
+  } catch (err: unknown) {
+    if (quotesHealthCache) {
+      const p = quotesHealthCache.payload;
+      res.status(p['ok'] ? 200 : 502).json({ ...p, stale: true, buildError: err instanceof Error ? err.message : String(err) });
+      return;
+    }
+    res.status(502).json({ ok: false, error: err instanceof Error ? err.message : String(err), ts: new Date().toISOString() });
+  }
+});
+
+async function buildQuotesHealthPayload(): Promise<Record<string, unknown>> {
   const {
     testYahooFinance,
     testTradier,
@@ -4099,7 +4163,7 @@ app.get('/api/health/quotes', async (_req, res) => {
     TRADIER_ACCOUNT_ID_set: !!process.env['TRADIER_ACCOUNT_ID'],
     TRADIER_SANDBOX_ACCOUNT_ID_set: !!process.env['TRADIER_SANDBOX_ACCOUNT_ID'],
   };
-  res.status(allOk ? 200 : 502).json({
+  return {
     ok: allOk,
     stocksOk,
     cryptoOk,
@@ -4110,8 +4174,8 @@ app.get('/api/health/quotes', async (_req, res) => {
     bootEnv,
     results,
     ts: new Date().toISOString(),
-  });
-});
+  };
+}
 
 // ── WebSocket ────────────────────────────────────────────────────────────────
 
