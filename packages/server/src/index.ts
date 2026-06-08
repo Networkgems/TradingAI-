@@ -3953,7 +3953,13 @@ app.get('/api/health/quotes', async (_req, res) => {
     getTwelveDataQuotaState,
     getTradierQuoteRateState,
   } = await import('./yahoo-feed.js');
-  const { testCoinMarketCap, testCoinbase, isCoinbaseBreakerOpen } = await import('./crypto-feed.js');
+  const {
+    testCoinMarketCap,
+    testCoinbase,
+    testCoinbaseAdvancedTrade,
+    isCoinbaseBreakerOpen,
+    fetchCryptoDailyBars,
+  } = await import('./crypto-feed.js');
   const results: Record<string, unknown> = {};
 
   try {
@@ -3972,6 +3978,17 @@ app.get('/api/health/quotes', async (_req, res) => {
     results['coinbase'] = await testCoinbase();
   } catch (err: unknown) {
     results['coinbase'] = { error: err instanceof Error ? err.message : String(err) };
+  }
+
+  // TRA-705 — Advanced Trade (`api.coinbase.com`) is the crypto engine's ACTUAL
+  // primary quote source (TRA-693), and it resolves from the Render datacenter
+  // egress IP that the Exchange host above blocks. Probe it so `cryptoOk`
+  // reflects the path the engine uses rather than only the IP-blocked Exchange
+  // host / breaker-tripped Yahoo / keyless-less CMC.
+  try {
+    results['coinbaseAdvancedTrade'] = await testCoinbaseAdvancedTrade();
+  } catch (err: unknown) {
+    results['coinbaseAdvancedTrade'] = { error: err instanceof Error ? err.message : String(err) };
   }
 
   try {
@@ -4013,6 +4030,22 @@ app.get('/api/health/quotes', async (_req, res) => {
     results['chartFallback'] = { error: err instanceof Error ? err.message : String(err) };
   }
 
+  // TRA-705 — crypto strategies evaluate off the daily OHLC series, not the last
+  // quote, so probe the candle cascade (`fetchCryptoDailyBars`: Exchange → keyless
+  // Advanced Trade → Yahoo) the engine feeds its strategies. A non-zero `bars`
+  // here proves real OHLC is reaching the engine from a datacenter-resolvable
+  // source even when the Exchange/Yahoo legs are degraded — i.e. signals can flow.
+  try {
+    const dailyBars = await fetchCryptoDailyBars('BTC-USD', 60);
+    results['cryptoDailyBars'] = {
+      symbol: 'BTC-USD',
+      bars: dailyBars.length,
+      lastClose: dailyBars.at(-1)?.close ?? null,
+    };
+  } catch (err: unknown) {
+    results['cryptoDailyBars'] = { error: err instanceof Error ? err.message : String(err) };
+  }
+
   // Daily request counters per provider. Resets at UTC midnight.
   results['fallbackRequestsToday'] = getFallbackRequestCounts();
 
@@ -4033,8 +4066,13 @@ app.get('/api/health/quotes', async (_req, res) => {
     return v && typeof v === 'object' && !('error' in (v as object)) && !('skipped' in (v as object));
   };
   const stocksOk = ok('tradier') || ok('yahooFinance');
-  // TRA-331 — Coinbase is primary for crypto; YF/CMC are fallbacks only.
-  const cryptoOk = ok('coinbase') || ok('yahooFinance') || ok('coinMarketCap');
+  // TRA-331 / TRA-705 — Coinbase is primary for crypto; YF/CMC are fallbacks
+  // only. `coinbaseAdvancedTrade` (keyless `api.coinbase.com`) is the engine's
+  // real primary and the one source that resolves from the Render egress IP, so
+  // it must count toward `cryptoOk` — otherwise the gauge reports a crypto
+  // outage while the engine is happily pricing the universe through it.
+  const cryptoOk =
+    ok('coinbaseAdvancedTrade') || ok('coinbase') || ok('yahooFinance') || ok('coinMarketCap');
   const allOk = stocksOk && cryptoOk;
   // TRA-572 diagnostic: report which boot-time env vars the process sees (boolean
   // presence only — no secret values). Lets ops confirm whether Render is actually

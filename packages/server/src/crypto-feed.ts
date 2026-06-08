@@ -992,3 +992,21 @@ export async function testCoinbase(): Promise<{ symbol: string; price: number }>
   if (!btc) throw new Error('No BTC-USD data from Coinbase Exchange');
   return { symbol: 'BTC-USD', price: btc.price };
 }
+
+/**
+ * TRA-705 — probe the keyless Coinbase Advanced Trade host (`api.coinbase.com`)
+ * so `/api/health/quotes` reflects the source the crypto engine ACTUALLY uses
+ * first (TRA-693 routes `fetchCryptoQuotes` through Advanced Trade ahead of the
+ * Exchange `/stats` path). The Exchange host (`api.exchange.coinbase.com`) is
+ * blocked for the Render datacenter egress IP, so `testCoinbase()` always errors
+ * on prod — which made the health endpoint report `cryptoOk:false` even while
+ * the engine was pricing the full Coinbase universe through Advanced Trade and
+ * opening real positions. This probe (and its inclusion in `cryptoOk`) makes the
+ * gauge read the path that resolves from a datacenter IP.
+ */
+export async function testCoinbaseAdvancedTrade(): Promise<{ symbol: string; price: number }> {
+  const quotes = await fetchCoinbaseAdvancedTradeQuotes(['BTC-USD']);
+  const btc = quotes.get('BTC-USD');
+  if (!btc) throw new Error('No BTC-USD data from Coinbase Advanced Trade');
+  return { symbol: 'BTC-USD', price: btc.price };
+}
