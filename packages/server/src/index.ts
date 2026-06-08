@@ -4047,19 +4047,22 @@ app.get('/api/health/quotes', async (_req, res) => {
   }
 
   // Daily request counters per provider. Resets at UTC midnight.
-  results['fallbackRequestsToday'] = getFallbackRequestCounts();
+  try { results['fallbackRequestsToday'] = getFallbackRequestCounts(); }
+  catch (err) { results['fallbackRequestsToday'] = { error: err instanceof Error ? err.message : String(err) }; }
 
   // TRA-552 — rolling Tradier quote requests/min + quote-cache state. Tradier is
   // the sole stock-quote source, so this is the headroom gauge against its
   // production rolling-window quota: a high `requestsLastMin` with few
   // `cachedSymbols` means coalescing isn't engaging and quotes are at risk of
   // re-breaking.
-  results['tradierQuoteRate'] = getTradierQuoteRateState();
+  try { results['tradierQuoteRate'] = getTradierQuoteRateState(); }
+  catch (err) { results['tradierQuoteRate'] = { error: err instanceof Error ? err.message : String(err) }; }
 
   // TRA-439 — Twelve Data quota guard: how much of the daily budget is spent
   // and whether the credit/rate-limit breaker is open. Lets QA confirm a
   // single provider can no longer blow its free-tier cap.
-  results['twelveDataQuota'] = getTwelveDataQuotaState();
+  try { results['twelveDataQuota'] = getTwelveDataQuotaState(); }
+  catch (err) { results['twelveDataQuota'] = { error: err instanceof Error ? err.message : String(err) }; }
 
   const ok = (key: string) => {
     const v = results[key];
