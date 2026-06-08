@@ -79,8 +79,14 @@ interface OptionsIdeasFeed {
   /** C3 "no day trading" guardrail status, surfaced verbatim from the server. */
   noDayTrading: { enforced: boolean; minHoldDays: number; note: string };
   generatedAt: number;
-  /** 'live' once C4 is wired; 'preview' is this panel's local illustrative set. */
-  source: 'live' | 'preview';
+  /**
+   * 'live' once C4 is wired; 'preview' is this panel's local illustrative set;
+   * 'non_live' is the server's labelled "wired but no credential / no chains"
+   * response (carries `note` explaining exactly what to configure).
+   */
+  source: 'live' | 'preview' | 'non_live';
+  /** Server-supplied reason when source is 'non_live' (e.g. missing LLM credential). */
+  note?: string;
 }
 
 // ── Preview (illustrative-only) feed ─────────────────────────────────────────
@@ -470,10 +476,16 @@ export function AiOptionsIdeasPanel({ token }: { token: string }) {
         }
         const data = (await r.json()) as OptionsIdeasFeed;
         if (cancelled) return;
-        // Empty live feed still beats nothing to look at — keep the preview so
-        // the surface is reviewable, but only when there are genuinely no live
-        // ideas to show.
-        setFeed(data.ideas?.length ? { ...data, source: 'live' } : PREVIEW_FEED);
+        // Empty live feed still beats nothing to look at — keep the preview
+        // cards so the surface is reviewable, but carry the server's `note`
+        // (and 'non_live' source) so the banner can explain exactly why Paper
+        // entry is disabled and how to enable it (TRA-714), instead of a
+        // generic preview message.
+        setFeed(
+          data.ideas?.length
+            ? { ...data, source: 'live' }
+            : { ...PREVIEW_FEED, source: data.source ?? 'preview', note: data.note },
+        );
         setLoading(false);
       } catch (err) {
         logger.warn('options-ideas', 'ideas fetch failed; showing preview', err);
@@ -543,11 +555,20 @@ export function AiOptionsIdeasPanel({ token }: { token: string }) {
             lineHeight: 1.4,
           }}
         >
-          <strong>Preview — illustrative ideas only.</strong> The live AI Options
-          Ideas feed ships with the earnings/Fed feeds, the no-day-trading
-          guardrail, and the options-research LLM pass (TRA-597 / TRA-598 /
-          TRA-599). Paper entry is disabled until then; the cards below show the
-          surface, not real signals.
+          <strong>Preview — illustrative ideas only.</strong>{' '}
+          {feed?.note ? (
+            <>
+              Paper entry is disabled because the live feed isn’t running yet:{' '}
+              {feed.note} The cards below show the surface, not real signals.
+            </>
+          ) : (
+            <>
+              The live AI Options Ideas feed ships with the earnings/Fed feeds, the
+              no-day-trading guardrail, and the options-research LLM pass (TRA-597 /
+              TRA-598 / TRA-599). Paper entry is disabled until then; the cards below
+              show the surface, not real signals.
+            </>
+          )}
         </div>
       )}
 

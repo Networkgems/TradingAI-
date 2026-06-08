@@ -160,21 +160,60 @@ export class AnthropicLlmClient implements LlmClient {
 }
 
 /**
+ * Beta header the Anthropic API requires when authenticating with a Claude
+ * subscription OAuth token (Claude Pro / Max / Claude Code) instead of a
+ * first-party API key. The OAuth bearer flow is gated behind this header.
+ */
+const OAUTH_BETA_HEADER = 'oauth-2025-04-20';
+
+/**
  * Build an {@link AnthropicLlmClient} from the environment, or return `null` when
- * no key is configured — the server uses that `null` to emit a clearly-labelled
- * non-live response instead of failing. Reads the company key from
- * `ANTHROPIC_API_KEY` (falling back to `CLAUDE_API_KEY`), and optional tier
- * overrides from `LLM_MODEL_FAST` / `LLM_MODEL_STRONG`.
+ * no credential is configured — the server uses that `null` to emit a
+ * clearly-labelled non-live response instead of failing.
+ *
+ * Two credential paths are supported, in priority order:
+ *
+ *  1. **API key** — `ANTHROPIC_API_KEY` (falling back to `CLAUDE_API_KEY`).
+ *     Sent as the standard `x-api-key` header. This is the console/billing key.
+ *
+ *  2. **Subscription OAuth token** — `ANTHROPIC_AUTH_TOKEN` (falling back to
+ *     `CLAUDE_CODE_OAUTH_TOKEN`). This is the path for users on a Claude Pro /
+ *     Max / Claude Code plan who have **no API key to issue** (TRA-714). The
+ *     token is sent on `Authorization: Bearer` (never `x-api-key`) with the
+ *     `oauth-2025-04-20` beta header — the same mechanism Claude Code uses to
+ *     authenticate against the API with a subscription. Generate one with
+ *     `claude setup-token` (or copy it from a Claude Code login) and set it as
+ *     the env var; no console API key is required.
+ *
+ * If both are set the API key wins (a key is the simpler, longer-lived
+ * credential and avoids the `x-api-key` + `Authorization` double-header that the
+ * API rejects). Optional tier overrides come from `LLM_MODEL_FAST` /
+ * `LLM_MODEL_STRONG`.
  */
 export function createAnthropicLlmClientFromEnv(
   env: NodeJS.ProcessEnv = process.env,
 ): AnthropicLlmClient | null {
   const apiKey = (env['ANTHROPIC_API_KEY'] ?? env['CLAUDE_API_KEY'] ?? '').trim();
-  if (!apiKey) return null;
+  const authToken = (env['ANTHROPIC_AUTH_TOKEN'] ?? env['CLAUDE_CODE_OAUTH_TOKEN'] ?? '').trim();
+  if (!apiKey && !authToken) return null;
+
   const models: Partial<TierModelMap> = {};
   const fast = env['LLM_MODEL_FAST']?.trim();
   const strong = env['LLM_MODEL_STRONG']?.trim();
   if (fast) models.fast = fast;
   if (strong) models.strong = strong;
-  return new AnthropicLlmClient({ client: new Anthropic({ apiKey }), models });
+
+  // Prefer the API key when both are present: passing apiKey + authToken makes
+  // the SDK send both `x-api-key` and `Authorization`, which the API 401s.
+  const client = apiKey
+    ? new Anthropic({ apiKey })
+    : new Anthropic({
+        // `apiKey: null` suppresses the SDK's env-var auto-pickup so only the
+        // bearer token is sent.
+        apiKey: null,
+        authToken,
+        defaultHeaders: { 'anthropic-beta': OAUTH_BETA_HEADER },
+      });
+
+  return new AnthropicLlmClient({ client, models });
 }

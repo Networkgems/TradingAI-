@@ -194,7 +194,7 @@ export async function buildIdeasFeed(opts: BuildIdeasOptions): Promise<OptionsId
   const llm = createAnthropicLlmClientFromEnv();
   if (!llm) {
     return nonLive(
-      'AI Options Ideas is not live: no Anthropic API key is configured (set ANTHROPIC_API_KEY). The research pass and guardrails are wired; ideas appear once a key is set.',
+      'AI Options Ideas is not live: no Anthropic credential is configured. Set ANTHROPIC_API_KEY, or — if you have no API key (e.g. a Claude Pro/Max plan) — set ANTHROPIC_AUTH_TOKEN to a Claude subscription OAuth token (run `claude setup-token`). The research pass and guardrails are wired; ideas and Paper entry activate once either is set.',
     );
   }
   if (!opts.client) {

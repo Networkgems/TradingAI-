@@ -104,10 +104,29 @@ describe('AnthropicLlmClient.complete', () => {
 });
 
 describe('createAnthropicLlmClientFromEnv', () => {
-  it('returns null when no key is set', () => {
+  it('returns null when no credential is set', () => {
     expect(createAnthropicLlmClientFromEnv({})).toBeNull();
   });
   it('builds a client when ANTHROPIC_API_KEY is present', () => {
     expect(createAnthropicLlmClientFromEnv({ ANTHROPIC_API_KEY: 'sk-test' })).not.toBeNull();
+  });
+  it('builds a client from a subscription OAuth token (no API key) — TRA-714', () => {
+    // Claude Pro/Max path: ANTHROPIC_AUTH_TOKEN (or CLAUDE_CODE_OAUTH_TOKEN) and
+    // no API key is enough to bring the feed live.
+    expect(
+      createAnthropicLlmClientFromEnv({ ANTHROPIC_AUTH_TOKEN: 'sk-ant-oat01-test' }),
+    ).not.toBeNull();
+    expect(
+      createAnthropicLlmClientFromEnv({ CLAUDE_CODE_OAUTH_TOKEN: 'sk-ant-oat01-test' }),
+    ).not.toBeNull();
+  });
+  it('configures the SDK client with the bearer token (not x-api-key) on the OAuth path', () => {
+    const llm = createAnthropicLlmClientFromEnv({ ANTHROPIC_AUTH_TOKEN: 'sk-ant-oat01-test' });
+    // The SDK records the resolved credentials on the client instance: authToken
+    // is set and apiKey is null (so only Authorization: Bearer is sent).
+    const sdk = (llm as unknown as { client: { apiKey: string | null; authToken: string | null } })
+      .client;
+    expect(sdk.authToken).toBe('sk-ant-oat01-test');
+    expect(sdk.apiKey).toBeNull();
   });
 });
