@@ -511,8 +511,19 @@ function nextMinuteBoundary(): number {
 // the minute. Minute bars are still immutable within their minute; a full 60s
 // window just guarantees the dedup spans two ticks even when the pull lands at
 // minute :58.
-const HOT_BAR_CACHE_MS = 60_000;
-const COLD_BAR_CACHE_MS = 5 * 60_000;
+// TRA-739: The acceptance criterion is TOTAL (quote+bar) <200/min. Quote path
+// contributes ~48/min regardless, so bar budget is ~150/min. With hot union
+// ~80-100 symbols and cold ~364 symbols:
+//   hot:  |union| / (HOT_BAR_CACHE_MS/60000) = 100/1.5 ≈ 67/min
+//   cold: 364     / (COLD_BAR_CACHE_MS/60000) = 364/10 ≈ 36/min
+//   bar total ≈ 103/min  +  quote ~48 = ~151/min  → comfortable under 200.
+// 90s hot TTL is safe because minute bars are immutable within their minute;
+// a signal engine ticking at 30s only misses a new bar for up to 60s after
+// it's appended -- acceptable discovery latency vs 2.5x budget overrun.
+// 10-min cold TTL matches the actual cold-scan discovery cadence (5-min shard
+// cycle × 2 for safety margin) so no discovery regression.
+const HOT_BAR_CACHE_MS = 90_000;
+const COLD_BAR_CACHE_MS = 10 * 60_000;
 
 function barCacheExpiry(symbol: string): number {
   return Date.now() + (isActiveInterest(symbol) ? HOT_BAR_CACHE_MS : COLD_BAR_CACHE_MS);
