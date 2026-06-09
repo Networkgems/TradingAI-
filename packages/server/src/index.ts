@@ -4048,6 +4048,7 @@ async function buildQuotesHealthPayload(): Promise<Record<string, unknown>> {
     getFallbackRequestCounts,
     getTwelveDataQuotaState,
     getTradierQuoteRateState,
+    getTradierBarPullRateState,
   } = await import('./yahoo-feed.js');
   const {
     testCoinMarketCap,
@@ -4118,6 +4119,14 @@ async function buildQuotesHealthPayload(): Promise<Record<string, unknown>> {
   // re-breaking.
   try { results['tradierQuoteRate'] = getTradierQuoteRateState(); }
   catch (err) { results['tradierQuoteRate'] = { error: err instanceof Error ? err.message : String(err) }; }
+
+  // TRA-739 — restart-resilient rolling Tradier bar-pull req/min (minute + daily
+  // timesales), the companion to `tradierQuoteRate`. Tradier's quota is
+  // account-wide, so total load is this plus the quote rate; this is the gauge the
+  // TRA-554 sampler should sum, since `fallbackRequestsToday` (cumulative, resets
+  // on restart) can't be differenced for a rate.
+  try { results['tradierBarPullRate'] = getTradierBarPullRateState(); }
+  catch (err) { results['tradierBarPullRate'] = { error: err instanceof Error ? err.message : String(err) }; }
 
   // TRA-439 — Twelve Data quota guard: how much of the daily budget is spent
   // and whether the credit/rate-limit breaker is open. Lets QA confirm a

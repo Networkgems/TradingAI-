@@ -243,6 +243,10 @@ function rollFallbackCountersIfNeeded(): void {
 function bumpFallbackCounter(provider: FallbackProvider): void {
   rollFallbackCountersIfNeeded();
   fallbackCounters[provider] += 1;
+  // TRA-739 — feed the restart-resilient rolling bar-pull meter on every actual
+  // upstream Tradier bar fetch (the only provider whose account-wide quota we are
+  // tracking against). Defined below; safe to call here as a hoisted declaration.
+  if (provider === 'tradier') recordTradierBarPullRequest(Date.now());
 }
 
 export function getFallbackRequestCounts(): { day: string; tradier: number; twelveData: number } {
@@ -360,6 +364,38 @@ export function getTradierQuoteRateState(now: number = Date.now()): {
     cachedSymbols: quoteCache.size,
     cacheTtlMs: QUOTE_CACHE_TTL_MS,
   };
+}
+
+// TRA-739 — rolling Tradier *bar-pull* requests/min (minute + daily timesales).
+// `fallbackRequestsToday.tradier` is a cumulative per-instance daily counter that
+// resets on every process restart (Render recycles instances), so it cannot be
+// differenced across two /api/health/quotes reads to recover a rate — a restart
+// between samples silently makes the delta negative. This 60s rolling meter
+// mirrors the quote meter above and is restart-resilient, giving the TRA-554
+// sampler a trustworthy bar-pull req/min reading separate from the quote path.
+const BAR_PULL_RATE_WINDOW_MS = 60_000;
+const tradierBarPullReqTimestamps: number[] = [];
+
+function recordTradierBarPullRequest(now: number): void {
+  tradierBarPullReqTimestamps.push(now);
+  const { kept } = requestsInWindow(tradierBarPullReqTimestamps, now, BAR_PULL_RATE_WINDOW_MS);
+  tradierBarPullReqTimestamps.length = 0;
+  for (const t of kept) tradierBarPullReqTimestamps.push(t);
+}
+
+/**
+ * Rolling Tradier bar-pull rate, surfaced by `/api/health/quotes` (TRA-739).
+ * Counts only actual upstream Tradier minute/daily-bar fetches (every
+ * `bumpFallbackCounter('tradier')` site); cache hits are free and never recorded.
+ * The quota Tradier enforces is account-wide, so total load = this bar-pull rate
+ * plus `tradierQuoteRate.requestsLastMin`.
+ */
+export function getTradierBarPullRateState(now: number = Date.now()): {
+  requestsLastMin: number;
+  windowSec: number;
+} {
+  const { count } = requestsInWindow(tradierBarPullReqTimestamps, now, BAR_PULL_RATE_WINDOW_MS);
+  return { requestsLastMin: count, windowSec: BAR_PULL_RATE_WINDOW_MS / 1000 };
 }
 
 // ── Per-symbol minute-bar cache ──────────────────────────────────────────────

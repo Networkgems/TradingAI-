@@ -7,6 +7,7 @@ import {
   partitionCachedQuotes,
   requestsInWindow,
   canReuseCachedTradierBars,
+  getTradierBarPullRateState,
 } from './yahoo-feed.js';
 
 const Q = (price: number) => ({ price, volume: 0, change: 0, changePct: 0 });
@@ -287,5 +288,19 @@ describe('canReuseCachedTradierBars (TRA-554 minute-bar coalescing)', () => {
 
   it('returns false for a cold symbol (no cache entry)', () => {
     expect(canReuseCachedTradierBars(undefined, 80, now)).toBe(false);
+  });
+});
+
+// TRA-739 — the bar-pull meter is the restart-resilient companion to the quote
+// meter. `fallbackRequestsToday.tradier` is cumulative and resets on process
+// restart, so the sampler must read this 60s rolling gauge instead of
+// differencing the daily counter. It is wired off `bumpFallbackCounter('tradier')`
+// and shares the (already-tested) `requestsInWindow` math.
+describe('getTradierBarPullRateState (TRA-739 bar-pull req/min meter)', () => {
+  it('exposes a 60s rolling window and a non-negative count', () => {
+    const state = getTradierBarPullRateState();
+    expect(state.windowSec).toBe(60);
+    expect(typeof state.requestsLastMin).toBe('number');
+    expect(state.requestsLastMin).toBeGreaterThanOrEqual(0);
   });
 });
