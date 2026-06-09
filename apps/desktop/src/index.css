@@ -2053,10 +2053,18 @@ tr:hover td { background: var(--bg-hover); }
   /* Action controls always visible, on their own row above the KPI stats.
      order:-1 lifts them above the stat/status groups that precede them in
      the DOM; full width + flex-end keeps them anchored top-right. */
+  /* TRA-732/TRA-733 — the action-group is wider than a phone viewport once
+     it holds Start/Stop Trading + Kill Switch + VersionChip + theme +
+     Profile. Without wrapping, justify-content:flex-end anchors the row
+     right and the *leftmost* control (Start/Stop Trading) overflowed off
+     the LEFT edge — clipped by `body{overflow:hidden}` with no scroll, so
+     it was unreachable on mobile. flex-wrap lets the row spill onto
+     additional right-aligned lines instead of hiding controls. */
   .action-group {
     order: -1;
     width: 100%;
     justify-content: flex-end;
+    flex-wrap: wrap;
     gap: 0.6rem;
   }
 
