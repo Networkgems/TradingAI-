@@ -1317,14 +1317,27 @@ export class SignalEngine {
       && this.tradierLiveClient !== null;
 
     if (liveOptionsMirroring) {
+      // Poll any in-flight sell_to_close from a prior tick regardless of the
+      // clock — this only finalises/clears existing broker orders, it never
+      // creates new ones, so an order left working into the close still resolves.
       await this.resolvePendingOptionExits();
     }
-    const optsClosed = this.optionsAccount.checkExits(
-      prices,
-      optionMarks,
-      this.mode,
-      { waitAndHold: liveOptionsMirroring },
-    );
+    // TRA-726 — no day trading after the close. In LIVE mode, only evaluate and
+    // submit options exits (TP1 / SL / trail sell_to_close) during regular
+    // market hours. After the close the marks are stale last-RTH prints, a `day`
+    // sell_to_close can't fill (the broker rejects it — the churn behind the
+    // 1,476 rejected/9 filled history), and the user's directive is to defer the
+    // close/hold/DCA decision to the next regular session. Demo (paper) is left
+    // simulating so the forward-test book is unaffected.
+    const optionsExitsActive = this.mode === 'demo' || isStockMarketOpen();
+    const optsClosed = optionsExitsActive
+      ? this.optionsAccount.checkExits(
+          prices,
+          optionMarks,
+          this.mode,
+          { waitAndHold: liveOptionsMirroring },
+        )
+      : [];
     if (liveOptionsMirroring && optsClosed.length > 0) {
       // TRA-354 — submit the staged Tradier sell_to_close LIMIT orders.
       // `checkExits` returned position snapshots already carrying the
@@ -1394,7 +1407,11 @@ export class SignalEngine {
     // TRA-229: isAutoTradingEnabled() resolves the per-mode flag.
     // TRA-544: isDeterministicAutoTradingEnabled() additionally suspends this
     // path when the "Trading Agents" toggle hands control to the agent layer.
-    if (equityStrategiesActiveOnTick && this.isDeterministicAutoTradingEnabled() && !this.riskGovernor.isHalted()) {
+    // TRA-726: no day trading after the close — the intraday equity strategies
+    // only evaluate (and open) during regular market hours. Outside RTH the
+    // minute bars are stale by definition (no new prints), so an entry fired
+    // here would be a decision off post-close noise; defer to the next session.
+    if (equityStrategiesActiveOnTick && this.isDeterministicAutoTradingEnabled() && !this.riskGovernor.isHalted() && isStockMarketOpen()) {
       let symbolsWithData = 0;
       // TRA-418 — data-feed freshness gate. During market hours a working feed
       // delivers fresh minute bars every tick; when the latest cached bar has
@@ -1734,6 +1751,10 @@ export class SignalEngine {
   private async openSma200Pullback(signal: Sma200Signal): Promise<void> {
     // TRA-544: suspended when the agent layer owns the decision (§2B).
     if (!this.isDeterministicAutoTradingEnabled() || this.riskGovernor.isHalted()) return;
+    // TRA-726: no day trading after the close — defer the SMA-200 pullback open
+    // to the next regular session. The display signal is still surfaced by the
+    // caller (runSma200Scan) before this point; only the position open is gated.
+    if (!isStockMarketOpen()) return;
     // Skip when an equity position for this symbol+type is already open.
     if (this.account.hasOpenPositionForSignalType(signal.symbol, signal.type)) return;
     if (this.mode === 'live' && this.hasOpenLiveEquityPosition(signal.symbol, signal.type)) return;
@@ -4112,6 +4133,16 @@ export class SignalEngine {
     signal: TradeSignal,
     currentPrice: number,
   ): Promise<{ ok: true; orderId: number | string } | { ok: false; reason: string }> {
+    // TRA-726 — no day trading after the close. Never submit a live equity
+    // bracket outside regular US market hours (9:30–16:00 ET, weekdays). A
+    // `day` OTOCO entry placed post-close can't fill and the broker just
+    // rejects/churns it; the user's directive is to defer entry/DCA/close/hold
+    // decisions to the next regular session. Centralised here so BOTH equity
+    // entry callers (intraday ORB/BB/Ichimoku and the SMA-200 pullback) inherit
+    // the gate and the dashboard surfaces a clean reason.
+    if (!isStockMarketOpen()) {
+      return { ok: false, reason: 'market closed — equity orders only placed during regular hours (9:30–16:00 ET)' };
+    }
     const client = this.tradierLiveEquityClient;
     if (!client) return { ok: false, reason: 'Tradier equity client not configured' };
     const balance = this.liveTradierBalance;

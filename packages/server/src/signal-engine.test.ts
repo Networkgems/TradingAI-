@@ -1454,6 +1454,24 @@ describe('SignalEngine — TRA-335 live equity bracket placement', () => {
     });
   });
 
+  it('refuses a live equity bracket outside regular market hours and never hits the broker (TRA-726)', async () => {
+    // Post-close: 2024-06-04T22:00:00Z = 18:00 ET (after the 16:00 close).
+    vi.setSystemTime(Date.parse('2024-06-04T22:00:00Z'));
+    const stub: TradierEquityStub = {
+      submitBracketOrder: vi.fn().mockResolvedValue({ id: 99, status: 'ok' }),
+      waitForOrderTerminalStatus: vi.fn(),
+    };
+    const engine = setupLiveEquityEngine(stub);
+
+    const result = await (engine as unknown as {
+      placeTradierEquityBracket: (s: TradeSignal, p: number) => Promise<{ ok: boolean; orderId?: number | string; reason?: string }>
+    }).placeTradierEquityBracket(bbSignal(), 100);
+
+    expect(result.ok).toBe(false);
+    expect(result.reason).toMatch(/market closed/i);
+    expect(stub.submitBracketOrder).not.toHaveBeenCalled();
+  });
+
   it('skips a SHORT (sell-to-open) bracket on a cash account with a clear liveSkipReason and never hits the broker (TRA-724)', async () => {
     const stub: TradierEquityStub = {
       submitBracketOrder: vi.fn(),
