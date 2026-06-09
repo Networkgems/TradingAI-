@@ -900,11 +900,16 @@ export async function fetchMinuteBarsWithSource(
     return { bars: fresh.bars.slice(-count), source: 'tradier', yahooSkipped, cached: true };
   }
 
-  // TRA-739 singleflight: if another caller (same or different engine) is already
-  // fetching this symbol, share its in-flight promise instead of firing a second
-  // upstream request. This prevents the "thundering herd" when many engines hit the
-  // same cold-scan shard simultaneously on an empty cache (e.g. after a restart).
-  const inflightKey = symbol;
+  // TRA-739 singleflight: tier the key by depth so std (count<MTF_DEPTH_THRESHOLD)
+  // and deep (count>=MTF_DEPTH_THRESHOLD) callers don't compete for the same slot.
+  // Without this, the hot scan (count=80) in-flight at T=0 steals the slot from the
+  // MTF (count=2000): MTF waits, gets 80-bar result, cache stays count=80, and the
+  // T+5min MTF cycle misses again (80 < 2000) causing a sustained burst every cycle.
+  // With separate keys, both std and deep fire independently at T=0. The deep entry
+  // (count=2000, 7-min TTL) satisfies the hot scan (2000 >= 80), so subsequent hot
+  // scans serve from cache. The next deep hit is at T+5min (cache valid), miss at
+  // T+10min (expired at T+7min), effectively halving the deep burst frequency.
+  const inflightKey = count >= MTF_DEPTH_THRESHOLD ? `${symbol}:deep` : symbol;
   const existingInflight = minuteBarInflight.get(inflightKey);
   if (existingInflight) {
     const entry = await existingInflight;
@@ -916,7 +921,13 @@ export async function fetchMinuteBarsWithSource(
     const tradier = await fetchTradierMinuteBars(symbol, count);
     if (tradier.bars.length > 0) {
       const entry: MinuteBarCacheEntry = { bars: tradier.bars, source: 'tradier', expiresAt: barCacheExpiry(symbol, count), requestedCount: count, cold: !isActiveInterest(symbol) };
-      minuteBarCache.set(symbol, entry);
+      // Guard: don't overwrite a deeper cached entry with a shallower one.
+      // At T+7min, both std (count=80) and deep (count=2000) may fire concurrently.
+      // If deep completes first, std must not replace its richer entry.
+      const existing = minuteBarCache.get(symbol);
+      if (!existing || entry.requestedCount >= existing.requestedCount) {
+        minuteBarCache.set(symbol, entry);
+      }
       return entry;
     }
 
