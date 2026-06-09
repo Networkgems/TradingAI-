@@ -170,3 +170,53 @@ export type {
   AgentValidationReport,
   RecommendationLedgerRow,
 } from './agent-validation.js';
+// TRA-731 (Phase 2) — synthetic-chain backtest harness for SupertrendConfluence.
+// Build only; QuantTrader runs the analysis. `enableSupertrend` routing unchanged.
+export {
+  realizedVolatility,
+  realizedVolSeries,
+  ivRank,
+  syntheticIv,
+  buildSyntheticChain,
+  rowDelta,
+  roundStrike,
+  isoDate as syntheticIsoDate,
+  SYNTHETIC_TAG,
+  DEFAULT_IV_MODEL,
+  DEFAULT_CHAIN_GEN,
+} from './synthetic-chain.js';
+export type { IvModelParams, ChainGenParams, SyntheticChainFile } from './synthetic-chain.js';
+export {
+  profitFactor,
+  tradeSharpe,
+  tradeSortino,
+  annualizedSharpe,
+  downsideDeviation,
+  summarizeTrades,
+  PROFIT_FACTOR_CAP,
+} from './tra731-metrics.js';
+export type { TradeMetrics } from './tra731-metrics.js';
+export {
+  replaySymbol,
+  replayPortfolio,
+  DEFAULT_REPLAY_PARAMS,
+} from './supertrend-confluence-replay.js';
+export type {
+  SupertrendReplayParams,
+  ReplayTrade,
+  SymbolReplayResult,
+  PortfolioReplayResult,
+} from './supertrend-confluence-replay.js';
+export {
+  runTrackA,
+  trackASymbol,
+  buyHoldStat,
+  DEFAULT_TRACK_A,
+} from './tra731-track-a.js';
+export type {
+  TrackAOptions,
+  TrackAReport,
+  SymbolTrackAResult,
+  BuyHoldStat,
+} from './tra731-track-a.js';
+export { TRA731_UNIVERSE, lookbackWindow, fetchUniverse } from './run-tra731-fetch.js';
