@@ -287,7 +287,7 @@ export function getFallbackRequestCounts(): { day: string; tradier: number; twel
 
 const QUOTE_CACHE_TTL_MS = (() => {
   const raw = Number(process.env['QUOTE_CACHE_TTL_MS']);
-  return Number.isFinite(raw) && raw >= 0 ? Math.floor(raw) : 3_000;
+  return Number.isFinite(raw) && raw >= 0 ? Math.floor(raw) : 20_000;
 })();
 
 interface QuoteCacheEntry {
@@ -525,12 +525,13 @@ function nextMinuteBoundary(): number {
 // the minute. Minute bars are still immutable within their minute; a full 60s
 // window just guarantees the dedup spans two ticks even when the pull lands at
 // minute :58.
-// TRA-739: The acceptance criterion is TOTAL (quote+bar) <200/min. Quote path
-// contributes ~48/min regardless, so bar budget is ~150/min. With hot union
-// ~80-100 symbols and cold ~364 symbols:
-//   hot:  |union| / (HOT_BAR_CACHE_MS/60000) = 100/1.5 ≈ 67/min
-//   cold: 364     / (COLD_BAR_CACHE_MS/60000) = 364/10 ≈ 36/min
-//   bar total ≈ 103/min  +  quote ~48 = ~151/min  → comfortable under 200.
+// TRA-739: The acceptance criterion is TOTAL (quote+bar) <200/min. Quote cache
+// TTL=20s keeps quote rate ~3-5/min (vs ~48/min at 3s). With hot union ~80-100
+// symbols and cold ~364 symbols:
+//   hot:  served from 7-min MTF cache between MTF cycles --> 0/min
+//   MTF burst (every 10 min): ~100 unique symbol fetches / 60s = ~100/min
+//   cold: 364 / (COLD_BAR_CACHE_MS/60000) = 364/10 ≈ 36/min
+//   bar total ≈ 136/min  +  quote ~5 = ~141/min  → comfortable under 200.
 // 90s hot TTL is safe because minute bars are immutable within their minute;
 // a signal engine ticking at 30s only misses a new bar for up to 60s after
 // it's appended -- acceptable discovery latency vs 2.5x budget overrun.
@@ -541,12 +542,12 @@ const COLD_BAR_CACHE_MS = 10 * 60_000;
 // TRA-739: the MTF technical snapshot fires every 5 min and requests count=2000
 // bars. Those pulls miss the 90s hot cache (expired long before the next 5-min
 // cycle) and re-hit Tradier for all active-interest symbols every 5 min, causing
-// another 100+ req/min burst. Cache deep pulls (count > 400) for at least one
-// full MTF cycle so the 5-min refresh finds a live entry. The signal-engine candle
-// loop uses count=80; only the MTF snapshot uses count=2000. Resampled 15m/1h
-// snapshots are acceptable up to 5 min stale — they only change when new minute
-// bars arrive, and the candle loop (count=80) stays minute-fresh for active signals.
-const MTF_BAR_CACHE_MS = 5 * 60_000;
+// another 100+ req/min burst. Cache deep pulls (count > 400) for 7 min so the
+// 5-min refresh always finds a live entry (even cycle = HIT). The miss cycle only
+// fires every 10 min (after the 7-min TTL lapses), halving the burst frequency.
+// The signal-engine candle loop uses count=80; the 7-min entry satisfies it too
+// (requestedCount=2000 >= 80), so hot symbols see 0 Tradier requests between bursts.
+const MTF_BAR_CACHE_MS = 7 * 60_000;
 const MTF_DEPTH_THRESHOLD = 400;
 
 function barCacheExpiry(symbol: string, count: number): number {
