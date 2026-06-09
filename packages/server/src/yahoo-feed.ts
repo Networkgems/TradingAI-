@@ -446,6 +446,13 @@ type MinuteBarCacheEntry = {
 };
 const minuteBarCache = new Map<string, MinuteBarCacheEntry>();
 
+// TRA-739 singleflight: when many engines call fetchMinuteBarsWithSource for
+// the same symbol concurrently (e.g. during a cold-scan tick after a restart
+// or cache expiry), only ONE upstream Tradier request fires; the rest await
+// the same promise. Prevents the "thundering herd" that caused 700+ req/min
+// spikes after every Render deploy.
+const minuteBarInflight = new Map<string, Promise<MinuteBarCacheEntry>>();
+
 /**
  * TRA-554 — decide whether a cached Tradier minute-bar pull can be reused
  * instead of re-hitting the upstream feed. Pure so it can be unit-tested.
@@ -873,75 +880,88 @@ export async function fetchMinuteBarsWithSource(
     return { bars: fresh.bars.slice(-count), source: 'tradier', yahooSkipped, cached: true };
   }
 
-  // Primary: Tradier intraday timesales.
-  const tradier = await fetchTradierMinuteBars(symbol, count);
-  if (tradier.bars.length > 0) {
-    minuteBarCache.set(symbol, { bars: tradier.bars, source: 'tradier', expiresAt: barCacheExpiry(symbol), requestedCount: count, cold: !isActiveInterest(symbol) });
-    return { bars: tradier.bars, source: 'tradier', yahooSkipped, tradierDiag: tradier.diag };
+  // TRA-739 singleflight: if another caller (same or different engine) is already
+  // fetching this symbol, share its in-flight promise instead of firing a second
+  // upstream request. This prevents the "thundering herd" when many engines hit the
+  // same cold-scan shard simultaneously on an empty cache (e.g. after a restart).
+  const inflightKey = symbol;
+  const existingInflight = minuteBarInflight.get(inflightKey);
+  if (existingInflight) {
+    const entry = await existingInflight;
+    return { bars: entry.bars.slice(-count), source: entry.source, yahooSkipped, cached: true };
   }
 
-  const now = new Date();
-  const from = new Date(now.getTime() - count * 60 * 1000 * 2);
-  const currentMinuteStart = Math.floor(now.getTime() / 60_000) * 60_000;
+  const fetchPromise: Promise<MinuteBarCacheEntry> = (async () => {
+    // Primary: Tradier intraday timesales.
+    const tradier = await fetchTradierMinuteBars(symbol, count);
+    if (tradier.bars.length > 0) {
+      const entry: MinuteBarCacheEntry = { bars: tradier.bars, source: 'tradier', expiresAt: barCacheExpiry(symbol), requestedCount: count, cold: !isActiveInterest(symbol) };
+      minuteBarCache.set(symbol, entry);
+      return entry;
+    }
 
-  // Fallback 1: Yahoo Finance.
-  const result = await withRetry(
-    () => yf.chart(symbol, { period1: from, period2: now, interval: '1m' }),
-    `chart(${symbol})`,
-  );
-  const yahooBars: Candle[] = result
-    ? (result.quotes ?? [])
-        .filter(q => q.open != null && q.high != null && q.low != null && q.close != null && q.volume != null)
-        .filter(q => (q.volume ?? 0) > 0)
-        .filter(q => new Date(q.date).getTime() < currentMinuteStart)
-        .map(q => ({
-          symbol,
-          timestamp: new Date(q.date).getTime(),
-          open: q.open!,
-          high: q.high!,
-          low: q.low!,
-          close: q.close!,
-          volume: q.volume!,
-        }))
-        .slice(-count)
-    : [];
+    const now = new Date();
+    const from = new Date(now.getTime() - count * 60 * 1000 * 2);
+    const currentMinuteStart = Math.floor(now.getTime() / 60_000) * 60_000;
 
-  if (yahooBars.length > 0) {
-    minuteBarCache.set(symbol, { bars: yahooBars, source: 'yahoo', expiresAt: nextMinuteBoundary(), requestedCount: count, cold: false });
-    return { bars: yahooBars, source: 'yahoo', yahooSkipped, tradierDiag: tradier.diag };
+    // Fallback 1: Yahoo Finance.
+    const result = await withRetry(
+      () => yf.chart(symbol, { period1: from, period2: now, interval: '1m' }),
+      `chart(${symbol})`,
+    );
+    const yahooBars: Candle[] = result
+      ? (result.quotes ?? [])
+          .filter(q => q.open != null && q.high != null && q.low != null && q.close != null && q.volume != null)
+          .filter(q => (q.volume ?? 0) > 0)
+          .filter(q => new Date(q.date).getTime() < currentMinuteStart)
+          .map(q => ({
+            symbol,
+            timestamp: new Date(q.date).getTime(),
+            open: q.open!,
+            high: q.high!,
+            low: q.low!,
+            close: q.close!,
+            volume: q.volume!,
+          }))
+          .slice(-count)
+      : [];
+
+    if (yahooBars.length > 0) {
+      const entry: MinuteBarCacheEntry = { bars: yahooBars, source: 'yahoo', expiresAt: nextMinuteBoundary(), requestedCount: count, cold: false };
+      minuteBarCache.set(symbol, entry);
+      return entry;
+    }
+
+    // Reuse a recent fallback response within the same TTL rather than re-firing.
+    const cached = minuteBarCache.get(symbol);
+    if (cached && cached.expiresAt > Date.now() && cached.source !== 'yahoo') {
+      return cached;
+    }
+
+    // Fallback 2: Twelve Data (gated to active-interest symbols to fit free-tier 800/day cap).
+    const twelveData = await fetchTwelveDataMinuteBars(symbol, count, isActiveInterest(symbol));
+    if (twelveData.bars.length > 0) {
+      console.info(`[yahoo-feed] chart(${symbol}): served ${twelveData.bars.length} bars from Twelve Data fallback`);
+      const entry: MinuteBarCacheEntry = { bars: twelveData.bars, source: 'twelvedata', expiresAt: nextMinuteBoundary(), requestedCount: count, cold: false };
+      minuteBarCache.set(symbol, entry);
+      return entry;
+    }
+
+    // Negative-cache the miss so a back-to-back tick in the same minute does not
+    // re-run the Twelve Data fallback (TRA-439). Bars only roll on the minute
+    // boundary, so a miss now is a miss until the next boundary.
+    const emptyEntry: MinuteBarCacheEntry = { bars: [], source: 'none', expiresAt: nextMinuteBoundary(), requestedCount: count, cold: false };
+    minuteBarCache.set(symbol, emptyEntry);
+    return emptyEntry;
+  })();
+
+  minuteBarInflight.set(inflightKey, fetchPromise);
+  try {
+    const entry = await fetchPromise;
+    return { bars: entry.bars.slice(-count), source: entry.source, yahooSkipped };
+  } finally {
+    minuteBarInflight.delete(inflightKey);
   }
-
-  // Reuse a recent fallback response within the same minute rather than re-firing providers.
-  const cached = minuteBarCache.get(symbol);
-  if (cached && cached.expiresAt > Date.now() && cached.source !== 'yahoo') {
-    return { bars: cached.bars, source: cached.source, yahooSkipped, cached: true, tradierDiag: tradier.diag };
-  }
-
-  // Fallback 2: Twelve Data (gated to active-interest symbols to fit free-tier 800/day cap).
-  const twelveData = await fetchTwelveDataMinuteBars(symbol, count, isActiveInterest(symbol));
-  if (twelveData.bars.length > 0) {
-    console.info(`[yahoo-feed] chart(${symbol}): served ${twelveData.bars.length} bars from Twelve Data fallback`);
-    minuteBarCache.set(symbol, { bars: twelveData.bars, source: 'twelvedata', expiresAt: nextMinuteBoundary(), requestedCount: count, cold: false });
-    return {
-      bars: twelveData.bars,
-      source: 'twelvedata',
-      yahooSkipped,
-      tradierDiag: tradier.diag,
-      twelveDataDiag: twelveData.diag,
-    };
-  }
-
-  // Negative-cache the miss so a back-to-back tick in the same minute does not
-  // re-run the Twelve Data fallback (TRA-439). Bars only roll on the minute
-  // boundary, so a miss now is a miss until the next boundary.
-  minuteBarCache.set(symbol, { bars: [], source: 'none', expiresAt: nextMinuteBoundary(), requestedCount: count, cold: false });
-  return {
-    bars: [],
-    source: 'none',
-    yahooSkipped,
-    tradierDiag: tradier.diag,
-    twelveDataDiag: twelveData.diag,
-  };
 }
 
 type QuoteResult = { price: number; volume: number; change: number; changePct: number };
