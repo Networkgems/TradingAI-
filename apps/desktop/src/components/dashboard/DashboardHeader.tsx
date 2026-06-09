@@ -7,7 +7,7 @@ import type { AccountState, OptionsAccountState } from '@trading-app/shared';
 import { HTTP_URL } from '../../server-url';
 import { logger } from '../../lib/logger';
 import { useToast } from '../../lib/toast.tsx';
-import { fmt, fmtDollar, timeAgo } from '../../lib/format';
+import { fmt, timeAgo } from '../../lib/format';
 import { ThemeToggle } from '../ThemeToggle';
 import type { Theme } from '../ThemeToggle';
 import { ProfileMenu } from '../ProfileMenu';
@@ -112,12 +112,9 @@ export function DashboardHeader({
                 <span className="stat-label">Equity</span>
                 <span className="stat-value">${fmt(account.totalEquity)}</span>
               </div>
-              <div className="stat">
-                <span className="stat-label">Daily P&amp;L</span>
-                <span className={`stat-value ${account.dailyPnl >= 0 ? 'green' : 'red'}`}>
-                  {fmtDollar(account.dailyPnl)}
-                </span>
-              </div>
+              {/* TRA-725 — daily P&L moved out of the header to the bottom
+                  DashboardFooter (board ask: Tradier shows "$X (Y%) Today"
+                  below the holdings, not in the account header). */}
               <div className="stat">
                 <span className="stat-label">Cash</span>
                 <span className="stat-value">${fmt(account.availableCash)}</span>
@@ -131,26 +128,8 @@ export function DashboardHeader({
               <>
                 <div className="stat-divider" />
                 <div className="stat-group">
-                  <div className="stat">
-                    {/* TRA-475 — pill shows today's options P&L (realized
-                        delta since ET-midnight + live MTM on open contracts)
-                        so it resets daily, mirroring the equity Daily P&L pill
-                        instead of holding yesterday's cumulative realized
-                        forever. Cumulative "Total Options P&L" is still shown
-                        on the Options tab footer. Legacy state files without
-                        `dailyOptionsPnl` fall back to `optionsPnl` so a
-                        first-tick render before the server rolls forward
-                        doesn't render `$NaN`. */}
-                    <span className="stat-label">Daily Opts P&amp;L</span>
-                    {(() => {
-                      const dailyOptsPnl = optionsState.dailyOptionsPnl ?? optionsState.optionsPnl;
-                      return (
-                        <span className={`stat-value ${dailyOptsPnl >= 0 ? 'green' : 'red'}`}>
-                          {fmtDollar(dailyOptsPnl)}
-                        </span>
-                      );
-                    })()}
-                  </div>
+                  {/* TRA-725 — "Daily Opts P&L" relocated to the bottom
+                      DashboardFooter alongside the equity Daily P&L. */}
                   <div className="stat">
                     <span className="stat-label">Options</span>
                     <span className="stat-value">{openOptionsCount}</span>

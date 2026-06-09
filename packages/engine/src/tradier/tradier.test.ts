@@ -357,6 +357,11 @@ describe('TradierOptionsClient.getAccountBalance (TRA-226)', () => {
       dayTradeBuyingPower: null,
       // TRA-724 — no account_type and no sub-envelope ⇒ indeterminate.
       accountType: null,
+      // TRA-725 — none of the account-panel fields present ⇒ all null.
+      settledFunds: null,
+      stockLongValue: null,
+      optionLongValue: null,
+      optionShortValue: null,
     });
     expect(callUrl(0)).toBe('https://sandbox.tradier.com/v1/accounts/A1/balances');
     const headers = callInit(0).headers as Record<string, string>;
@@ -409,7 +414,55 @@ describe('TradierOptionsClient.getAccountBalance (TRA-226)', () => {
       longMarketValue: null,
       dayTradeBuyingPower: null,
       accountType: 'margin',
+      settledFunds: null,
+      stockLongValue: null,
+      optionLongValue: null,
+      optionShortValue: null,
     });
+  });
+
+  // TRA-725 — mirror Tradier's account panel: settled funds (= total_cash −
+  // unsettled_funds) and the per-asset-class market values.
+  it('parses settled funds and per-asset-class market values (TRA-725)', async () => {
+    fetchMock.mockResolvedValueOnce(
+      jsonResponse({
+        balances: {
+          total_equity: 816.35,
+          total_cash: 225.35,
+          account_type: 'cash',
+          stock_long_value: 1,
+          option_long_value: 590,
+          option_short_value: 0,
+          cash: { cash_available: 0.06, unsettled_funds: 25.29 },
+        },
+      }),
+    );
+    const client = new TradierOptionsClient('tok', 'A1');
+    const balance = await client.getAccountBalance();
+    // settled = 225.35 − 25.29 = 200.06 (mirrors Tradier's $200.06 Settled Funds).
+    expect(balance?.settledFunds).toBeCloseTo(200.06, 2);
+    expect(balance?.stockLongValue).toBe(1);
+    expect(balance?.optionLongValue).toBe(590);
+    expect(balance?.optionShortValue).toBe(0);
+  });
+
+  it('leaves settled funds and market values null when Tradier omits them (TRA-725)', async () => {
+    fetchMock.mockResolvedValueOnce(
+      jsonResponse({
+        balances: {
+          total_equity: 1000,
+          total_cash: 300,
+          account_type: 'margin',
+          margin: { option_buying_power: 250, stock_buying_power: 600 },
+        },
+      }),
+    );
+    const client = new TradierOptionsClient('tok', 'A1');
+    const balance = await client.getAccountBalance();
+    expect(balance?.settledFunds).toBeNull();
+    expect(balance?.stockLongValue).toBeNull();
+    expect(balance?.optionLongValue).toBeNull();
+    expect(balance?.optionShortValue).toBeNull();
   });
 
   // TRA-724 — surface the account classification so the live engine can gate

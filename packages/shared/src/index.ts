@@ -409,6 +409,20 @@ export interface AccountState {
    * cash accounts (no DTBP), or before the first balance fetch.
    */
   dayTradeBuyingPower?: number;
+  /**
+   * TRA-725 — Tradier account-panel parity fields, surfaced in live mode so
+   * the Stocks dashboard can render a card mirroring what Tradier shows. All
+   * are live-only (sourced from the broker balance) and absent in demo or
+   * before the first balance fetch, so the card degrades gracefully ("—").
+   *
+   * `settledFunds` doubles as Tradier's "Settled Funds" and "Settled Cash"
+   * (same source: total_cash − unsettled_funds). The three *Value fields are
+   * Tradier's per-asset-class market values.
+   */
+  settledFunds?: number;
+  stockLongValue?: number;
+  optionLongValue?: number;
+  optionShortValue?: number;
 }
 
 export const DEFAULT_RISK_PER_TRADE = 0.01; // 1% of account equity

@@ -15,6 +15,7 @@ import { ErrorBoundary } from './ErrorBoundary.tsx';
 import { CalendarTab } from './CalendarTab.tsx';
 import type { Theme } from './components/ThemeToggle';
 import { DashboardHeader } from './components/dashboard/DashboardHeader';
+import { DashboardFooter } from './components/dashboard/DashboardFooter';
 import { TabBar } from './components/dashboard/TabBar';
 import { ProfileModals } from './components/dashboard/ProfileModals';
 import type { ProfileModal } from './components/dashboard/ProfileModals';
@@ -174,6 +175,7 @@ export default function Dashboard({ token, onLogout, onGoHome, onActivity, theme
         {state && tab === 'positions' && (
           <StockPositionsPanel
             token={token}
+            account={account}
             openPositions={openPositions}
             closedPositions={closedPositions}
             symbols={symbols}
@@ -228,6 +230,11 @@ export default function Dashboard({ token, onLogout, onGoHome, onActivity, theme
         )}
        </ErrorBoundary>
       </main>
+
+      {/* TRA-725 — daily P&L relocated from the top header to this bottom bar,
+          mirroring how Tradier shows the portfolio "$X (Y%) Today" below the
+          holdings. Always visible across tabs like the old header chips. */}
+      <DashboardFooter account={account} optionsState={optionsState} />
 
       {/* TRA-569 (TRA-410 C2) — coach-mark tour. Self-contained: starts on the
           replay event (profile menu) or the first-run autostart breadcrumb.

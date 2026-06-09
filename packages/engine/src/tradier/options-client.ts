@@ -132,6 +132,15 @@ interface TradierBalancesEnvelope {
     /** TRA-335 — total long market value, used for live equity sizing. */
     long_market_value?: number;
     /**
+     * TRA-725 — Tradier's per-asset-class market values, surfaced top-level on
+     * the balances payload (alongside `long_market_value`). The Stocks
+     * dashboard account card mirrors these as "Long Stock Value", "Long Option
+     * Value", and "Short Option Value" to match Tradier's own account panel.
+     */
+    stock_long_value?: number;
+    option_long_value?: number;
+    option_short_value?: number;
+    /**
      * TRA-319 — margin accounts surface option buying power under `margin`.
      * TRA-483 — `day_trade_buying_power` is the PDT day-trading limit (rolling
      * 5-day window). Tradier returns this on margin accounts flagged PDT.
@@ -152,9 +161,15 @@ interface TradierBalancesEnvelope {
       stock_buying_power?: number;
       day_trade_buying_power?: number;
     } | null;
-    /** TRA-319 — cash accounts only have `cash.cash_available`. */
+    /**
+     * TRA-319 — cash accounts only have `cash.cash_available`.
+     * TRA-725 — `unsettled_funds` is the portion of cash not yet settled;
+     * settled funds = `total_cash − unsettled_funds`. Tradier nests this under
+     * `cash` for cash accounts.
+     */
     cash?: {
       cash_available?: number;
+      unsettled_funds?: number;
     } | null;
   } | null;
 }
@@ -207,6 +222,29 @@ export interface TradierAccountBalance {
    * predate the field keep compiling.
    */
   accountType?: 'cash' | 'margin' | 'pdt' | null;
+  /**
+   * TRA-725 — settled funds = `total_cash − cash.unsettled_funds`. Tradier's
+   * account panel shows this as both "Settled Funds" and "Settled Cash". Only
+   * cash accounts carry `unsettled_funds`; `null` when Tradier didn't surface
+   * it (margin/PDT accounts, or a payload that predates the field). Optional so
+   * existing balance literals/fixtures keep compiling.
+   */
+  settledFunds?: number | null;
+  /**
+   * TRA-725 — Tradier `stock_long_value`: dollar value of long stock positions.
+   * `null` when absent. Mirrors "Long Stock Value" on the dashboard card.
+   */
+  stockLongValue?: number | null;
+  /**
+   * TRA-725 — Tradier `option_long_value`: dollar value of long option
+   * positions. `null` when absent. Mirrors "Long Option Value".
+   */
+  optionLongValue?: number | null;
+  /**
+   * TRA-725 — Tradier `option_short_value`: dollar value of short option
+   * positions. `null` when absent. Mirrors "Short Option Value".
+   */
+  optionShortValue?: number | null;
 }
 
 /** Tradier returns `T | T[]` depending on result count; sometimes `null`/empty string when none. */
@@ -516,6 +554,18 @@ export class TradierOptionsClient extends TradierOrderClient {
     } else {
       accountType = null;
     }
+    // TRA-725 — mirror Tradier's account panel. Settled funds = total_cash −
+    // unsettled_funds; only cash accounts carry `unsettled_funds`, so `null`
+    // (not 0) when absent so the card can degrade gracefully instead of
+    // implying everything is settled. The per-asset-class market values are
+    // surfaced verbatim.
+    const unsettledRaw = b.cash?.unsettled_funds;
+    const settledFunds =
+      typeof unsettledRaw === 'number' && Number.isFinite(unsettledRaw)
+        ? totalCash - unsettledRaw
+        : null;
+    const num = (v: number | undefined): number | null =>
+      typeof v === 'number' && Number.isFinite(v) ? v : null;
     return {
       totalEquity,
       totalCash,
@@ -524,6 +574,10 @@ export class TradierOptionsClient extends TradierOrderClient {
       longMarketValue,
       dayTradeBuyingPower,
       accountType,
+      settledFunds,
+      stockLongValue: num(b.stock_long_value),
+      optionLongValue: num(b.option_long_value),
+      optionShortValue: num(b.option_short_value),
     };
   }
 

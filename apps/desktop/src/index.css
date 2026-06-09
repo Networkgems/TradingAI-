@@ -3138,3 +3138,88 @@ tr:hover td { background: var(--bg-hover); }
   color: var(--orange);
 }
 
+/* TRA-725 — Tradier-parity account summary card on the Stocks Positions tab. */
+.account-summary-card {
+  background: var(--surface-raised);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 0.75rem 1rem;
+  margin-bottom: 1rem;
+}
+.account-summary-card__head {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 0.75rem;
+  margin-bottom: 0.6rem;
+}
+.account-summary-card__head h3 {
+  margin: 0;
+  font-size: 0.95rem;
+}
+.account-summary-card__src {
+  font-size: 0.72rem;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+}
+.account-summary-card__grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(150px, 1fr));
+  gap: 0.5rem 1.25rem;
+  margin: 0;
+}
+.account-summary-card__row {
+  display: flex;
+  flex-direction: column;
+  gap: 0.1rem;
+  padding: 0.25rem 0;
+  border-bottom: 1px solid var(--border-subtle);
+}
+.account-summary-card__row dt {
+  font-size: 0.62rem;
+  color: var(--muted);
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+  white-space: nowrap;
+}
+.account-summary-card__row dd {
+  margin: 0;
+  font-size: 0.9rem;
+  font-weight: 600;
+  font-variant-numeric: tabular-nums;
+}
+
+/* TRA-725 — bottom P&L bar (relocated from the top header). */
+.dashboard-footer {
+  display: flex;
+  align-items: center;
+  gap: 2rem;
+  flex-shrink: 0;
+  padding: 0.5rem calc(1.2rem + env(safe-area-inset-right)) calc(0.5rem + env(safe-area-inset-bottom)) calc(1.2rem + env(safe-area-inset-left));
+  background: var(--surface);
+  border-top: 1px solid var(--border);
+}
+.dashboard-footer__pnl {
+  display: flex;
+  align-items: baseline;
+  gap: 0.5rem;
+}
+.dashboard-footer__label {
+  font-size: 0.62rem;
+  color: var(--muted);
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  white-space: nowrap;
+}
+.dashboard-footer__value {
+  font-size: 0.95rem;
+  font-weight: 700;
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+}
+.dashboard-footer__pct {
+  font-size: 0.78rem;
+  font-weight: 600;
+  opacity: 0.85;
+}
+

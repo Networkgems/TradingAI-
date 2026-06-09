@@ -21,6 +21,8 @@ import { CryptoWatchlistPanel } from './CryptoWatchlistPanel';
 import { CryptoSignalsPanel } from './CryptoSignalsPanel';
 import { CryptoPositionsPanel } from './CryptoPositionsPanel';
 import { DashboardHeader } from './DashboardHeader';
+import { DashboardFooter } from './DashboardFooter';
+import { AccountSummaryCard } from './AccountSummaryCard';
 import { KillSwitchButton } from './KillSwitchButton';
 import { TradingAgentsButton } from './TradingAgentsButton';
 import { HaltBanner } from './HaltBanner';
@@ -337,21 +339,16 @@ describe('DashboardHeader (TRA-422)', () => {
     expect(screen.getByRole('button', { name: /Stop Trading/ })).toBeInTheDocument();
   });
 
-  // TRA-475 — the options pill in the header reads today's options P&L,
-  // not the cumulative realized number. The bug the issue filed against
-  // was the pill showing yesterday's cumulative (e.g. −$19,471 with no
-  // option closes today). Lock in the new contract: render `dailyOptionsPnl`
-  // and prefer it over the cumulative `optionsPnl` when both are present.
-  it('renders Daily Opts P&L from optionsState.dailyOptionsPnl, not cumulative optionsPnl', () => {
+  // TRA-725 — daily P&L moved out of the header to the bottom DashboardFooter.
+  // Lock that in: neither the equity "Daily P&L" nor the options "Daily Opts
+  // P&L" chip renders in the header anymore.
+  it('no longer renders the daily P&L chips in the header (relocated to footer)', () => {
     renderWithToast(
       <DashboardHeader
         token="t" account={account}
         optionsState={{
           openOptions: [], closedOptions: [],
-          // Cumulative realized = a big negative; pill must IGNORE it.
-          optionsPnl: -19_471,
-          // Today's P&L = a small loss the engine is reporting fresh.
-          dailyOptionsPnl: -91.99,
+          optionsPnl: -19_471, dailyOptionsPnl: -91.99,
           optionsCash: 64_224.32, dailyOptionsCount: 1,
         }}
         openPositionsCount={0} openOptionsCount={3} optionsDailyLimit={10}
@@ -361,35 +358,99 @@ describe('DashboardHeader (TRA-422)', () => {
         onOpenProfileModal={() => {}} onGoHome={() => {}} onLogout={() => {}}
       />,
     );
-    expect(screen.getByText('Daily Opts P&L')).toBeInTheDocument();
-    // The new value renders; the cumulative does not appear in the header.
-    expect(screen.getByText(/−\$91\.99|-\$91\.99/)).toBeInTheDocument();
-    expect(screen.queryByText(/19,471/)).not.toBeInTheDocument();
+    expect(screen.queryByText('Daily P&L')).not.toBeInTheDocument();
+    expect(screen.queryByText('Daily Opts P&L')).not.toBeInTheDocument();
+    // The non-P&L stats stay in the header.
+    expect(screen.getByText('Equity')).toBeInTheDocument();
+    expect(screen.getByText('Options')).toBeInTheDocument();
+  });
+});
+
+describe('DashboardFooter (TRA-725)', () => {
+  it('renders the relocated equity Daily P&L with a "% Today" delta', () => {
+    render(
+      <DashboardFooter
+        account={{ ...account, totalEquity: 10_042, dailyPnl: 42 }}
+        optionsState={undefined}
+      />,
+    );
+    expect(screen.getByText('Daily P&L')).toBeInTheDocument();
+    // 42 on a 10,000 start-of-day equity ⇒ +0.42% Today.
+    expect(screen.getByText(/\+\$42\.00/)).toBeInTheDocument();
+    expect(screen.getByText(/\+0\.42%\) Today/)).toBeInTheDocument();
   });
 
-  // TRA-475 back-compat: a server snapshot that pre-dates `dailyOptionsPnl`
-  // (e.g. older deploy still in flight while the desktop updates) must not
-  // render `$NaN` or crash; falls back to the cumulative `optionsPnl` until
-  // the server upgrades.
-  it('falls back to optionsPnl when dailyOptionsPnl is missing from the server payload', () => {
-    renderWithToast(
-      <DashboardHeader
-        token="t" account={account}
+  // TRA-475 contract carried over: the options figure prefers `dailyOptionsPnl`
+  // over the cumulative `optionsPnl` and never renders the cumulative number.
+  it('renders Daily Opts P&L from dailyOptionsPnl, not cumulative optionsPnl', () => {
+    render(
+      <DashboardFooter
+        account={account}
         optionsState={{
           openOptions: [], closedOptions: [],
-          optionsPnl: 12.50,
-          // dailyOptionsPnl intentionally omitted — simulates legacy server.
-          optionsCash: 25_000, dailyOptionsCount: 0,
+          optionsPnl: -19_471, dailyOptionsPnl: -91.99,
+          optionsCash: 64_224.32, dailyOptionsCount: 1,
         }}
-        openPositionsCount={0} openOptionsCount={0} optionsDailyLimit={10}
-        connected={true} lastTick={Date.now()} autoTradingEnabled={true} killSwitchEngaged={false} tradingAgentsEnabled={false}
-        accountMode="demo" onAccountModeChange={() => {}}
-        theme="dark" onToggleTheme={() => {}} isAdmin={false}
-        onOpenProfileModal={() => {}} onGoHome={() => {}} onLogout={() => {}}
       />,
     );
     expect(screen.getByText('Daily Opts P&L')).toBeInTheDocument();
-    expect(screen.getByText(/\$12\.50/)).toBeInTheDocument();
+    expect(screen.getByText(/-\$91\.99/)).toBeInTheDocument();
+    expect(screen.queryByText(/19,471/)).not.toBeInTheDocument();
+  });
+
+  // Back-compat: a legacy snapshot without `dailyOptionsPnl` falls back to the
+  // cumulative `optionsPnl` rather than rendering $NaN.
+  it('falls back to optionsPnl when dailyOptionsPnl is missing', () => {
+    render(
+      <DashboardFooter
+        account={account}
+        optionsState={{
+          openOptions: [], closedOptions: [],
+          optionsPnl: 12.50, optionsCash: 25_000, dailyOptionsCount: 0,
+        }}
+      />,
+    );
+    expect(screen.getByText(/\+\$12\.50/)).toBeInTheDocument();
+  });
+});
+
+describe('AccountSummaryCard (TRA-725)', () => {
+  it('renders Tradier-parity fields when the live balance carries them', () => {
+    render(
+      <AccountSummaryCard
+        account={{
+          ...account, totalEquity: 816.35, availableCash: 225.35,
+          optionBuyingPower: 0.06, settledFunds: 200.06,
+          stockLongValue: 1, optionLongValue: 590, optionShortValue: 0,
+        }}
+        accountMode="live"
+      />,
+    );
+    expect(screen.getByText('Account Summary')).toBeInTheDocument();
+    expect(screen.getByText('Settled Funds')).toBeInTheDocument();
+    expect(screen.getByText('Long Option Value')).toBeInTheDocument();
+    expect(screen.getByText('$590.00')).toBeInTheDocument();
+    // Settled Funds + Settled Cash share the same $200.06 source.
+    expect(screen.getAllByText('$200.06')).toHaveLength(2);
+  });
+
+  it('degrades live-only fields to "—" in demo (no broker balance)', () => {
+    render(
+      <AccountSummaryCard
+        account={{ ...account, totalEquity: 10_000, availableCash: 5_000 }}
+        accountMode="demo"
+      />,
+    );
+    // Total Value / Cash still render; the four live-only rows show "—".
+    expect(screen.getByText('Long Stock Value')).toBeInTheDocument();
+    expect(screen.getAllByText('—').length).toBeGreaterThanOrEqual(4);
+  });
+
+  it('renders nothing without an account snapshot', () => {
+    const { container } = render(
+      <AccountSummaryCard account={undefined} accountMode="demo" />,
+    );
+    expect(container).toBeEmptyDOMElement();
   });
 });
 

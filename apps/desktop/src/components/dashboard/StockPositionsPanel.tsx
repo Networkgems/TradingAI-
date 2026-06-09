@@ -4,7 +4,8 @@
 // TRA-503 — also owns the "Sync Tradier {env} positions" button (live only),
 // which forces the engine's equity-portfolio reconcile so out-of-band Tradier
 // opens land in the Positions table without waiting for the cadence.
-import type { Position } from '@trading-app/shared';
+import type { Position, AccountState } from '@trading-app/shared';
+import { AccountSummaryCard } from './AccountSummaryCard';
 import { HTTP_URL } from '../../server-url';
 import { logger } from '../../lib/logger';
 import { useToast } from '../../lib/toast.tsx';
@@ -18,6 +19,7 @@ import { useTradierEquitySync } from '../../hooks/useTradierEquitySync';
 
 export function StockPositionsPanel({
   token,
+  account,
   openPositions,
   closedPositions,
   symbols,
@@ -25,6 +27,7 @@ export function StockPositionsPanel({
   tradierEnv,
 }: {
   token: string;
+  account: AccountState | undefined;
   openPositions: Position[];
   closedPositions: Position[];
   symbols: SymbolState[];
@@ -59,6 +62,9 @@ export function StockPositionsPanel({
 
   return (
     <div className="positions-panel">
+      {/* TRA-725 — Tradier-parity account summary card at the top of the
+          holdings view. Live-only balance fields degrade to "—" in demo. */}
+      <AccountSummaryCard account={account} accountMode={accountMode} />
       {/* TRA-503 — pull open equity positions from Tradier into TradeAI so the
           Positions table catches out-of-band opens before the cadence sweep. */}
       {showTradierSync && (

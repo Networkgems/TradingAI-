@@ -3707,6 +3707,13 @@ export class SignalEngine {
       // actually returned the number (margin/PDT accounts); cash accounts
       // leave it undefined so the UI can hide it instead of showing $0.
       const liveDtbp = this.liveTradierBalance?.dayTradeBuyingPower;
+      // TRA-725 — surface Tradier's account-panel fields (settled funds and the
+      // per-asset-class market values) when present so the dashboard card can
+      // mirror Tradier in live mode. Each is spread conditionally so a field
+      // Tradier didn't return stays absent (the UI renders "—") rather than 0.
+      const liveBal = this.liveTradierBalance;
+      const optField = (key: keyof AccountState, value: number | null | undefined) =>
+        typeof value === 'number' && Number.isFinite(value) ? { [key]: value } : {};
       const liveAccount: AccountState = this.liveTradierBalance
         ? {
           totalEquity: this.liveTradierBalance.totalEquity,
@@ -3719,6 +3726,10 @@ export class SignalEngine {
           ...(typeof liveDtbp === 'number' && Number.isFinite(liveDtbp)
             ? { dayTradeBuyingPower: liveDtbp }
             : {}),
+          ...optField('settledFunds', liveBal?.settledFunds),
+          ...optField('stockLongValue', liveBal?.stockLongValue),
+          ...optField('optionLongValue', liveBal?.optionLongValue),
+          ...optField('optionShortValue', liveBal?.optionShortValue),
         }
         : { totalEquity: 0, availableCash: 0, openPositions: liveOpenPositions, dailyPnl: 0 };
       return {
