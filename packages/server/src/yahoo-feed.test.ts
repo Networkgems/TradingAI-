@@ -254,10 +254,11 @@ describe('requestsInWindow (TRA-552 req/min meter)', () => {
 describe('canReuseCachedTradierBars (TRA-554 minute-bar coalescing)', () => {
   const now = 1_000_000;
   const future = now + 30_000; // still inside this minute
-  const entry = (over: Partial<{ source: 'tradier' | 'yahoo' | 'twelvedata' | 'none'; expiresAt: number; requestedCount: number }> = {}) => ({
+  const entry = (over: Partial<{ source: 'tradier' | 'yahoo' | 'twelvedata' | 'none'; expiresAt: number; requestedCount: number; cold: boolean }> = {}) => ({
     source: 'tradier' as const,
     expiresAt: future,
     requestedCount: 80,
+    cold: false,
     ...over,
   });
 
@@ -288,6 +289,17 @@ describe('canReuseCachedTradierBars (TRA-554 minute-bar coalescing)', () => {
 
   it('returns false for a cold symbol (no cache entry)', () => {
     expect(canReuseCachedTradierBars(undefined, 80, now)).toBe(false);
+  });
+
+  // TRA-739 — cold (long-TTL discovery) entries must not serve a symbol that
+  // has since become active-interest; live decisions need minute-fresh bars.
+  it('refetches a cold-cached entry once its symbol becomes active-interest', () => {
+    // Cold entry, still inside its (longer) TTL, but the symbol is now hot.
+    expect(canReuseCachedTradierBars(entry({ cold: true }), 80, now, true)).toBe(false);
+    // Same cold entry while the symbol is still cold → reuse is fine.
+    expect(canReuseCachedTradierBars(entry({ cold: true }), 80, now, false)).toBe(true);
+    // A hot-cached entry is always reusable regardless of current interest.
+    expect(canReuseCachedTradierBars(entry({ cold: false }), 80, now, true)).toBe(true);
   });
 });
 

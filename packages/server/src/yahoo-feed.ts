@@ -86,14 +86,29 @@ async function withRetry<T>(fn: () => Promise<T>, label: string, retries = 2): P
 // stay inside its 800/day free-tier budget instead of burning credits on every
 // watchlist symbol on every tick.
 
-let activeInterestSymbols: ReadonlySet<string> = new Set<string>();
+// TRA-739: union-with-decay rather than a replaceable set. The signal process
+// runs many engines (one per account — ~100 in prod), and each calls
+// setActiveInterestSymbols every ~30s tick with ITS OWN active-interest set.
+// The old `= new Set(symbols)` let whichever engine ticked last overwrite the
+// global set, so the process-global cold/hot bar-cache split below could not
+// trust it. We now stamp each asserted symbol with the time it was last seen
+// and treat it as active-interest for ACTIVE_INTEREST_TTL_MS afterwards, so the
+// global view is the union of every engine's set and self-heals as symbols go
+// quiet (no engine re-asserts them → they decay back to cold).
+const ACTIVE_INTEREST_TTL_MS = 2 * 60_000;
+const activeInterestSeenAt = new Map<string, number>();
 
 export function setActiveInterestSymbols(symbols: Iterable<string>): void {
-  activeInterestSymbols = new Set(symbols);
+  const now = Date.now();
+  for (const s of symbols) activeInterestSeenAt.set(s, now);
+  for (const [s, seenAt] of activeInterestSeenAt) {
+    if (now - seenAt > ACTIVE_INTEREST_TTL_MS) activeInterestSeenAt.delete(s);
+  }
 }
 
 function isActiveInterest(symbol: string): boolean {
-  return activeInterestSymbols.has(symbol);
+  const seenAt = activeInterestSeenAt.get(symbol);
+  return seenAt !== undefined && Date.now() - seenAt <= ACTIVE_INTEREST_TTL_MS;
 }
 
 // ── Tradier primary feed (TRA-191 follow-up) ──────────────────────────────────
@@ -423,6 +438,11 @@ type MinuteBarCacheEntry = {
   // day only has ~390 minutes), so those callers refetched Tradier every single
   // tick — the bulk of the RTH bar-request volume TRA-735 measured.
   requestedCount: number;
+  // TRA-739: true when cached for a NON-active-interest ("cold") symbol on the
+  // long discovery TTL. A cold entry that's reused after the symbol becomes
+  // active-interest would serve minutes-stale bars to a live entry/exit
+  // decision, so `canReuseCachedTradierBars` forces a refresh in that case.
+  cold: boolean;
 };
 const minuteBarCache = new Map<string, MinuteBarCacheEntry>();
 
@@ -448,17 +468,43 @@ const minuteBarCache = new Map<string, MinuteBarCacheEntry>();
  * and upgrades the cached entry.
  */
 export function canReuseCachedTradierBars(
-  entry: { source: MinuteBarSource; expiresAt: number; requestedCount: number } | undefined,
+  entry: { source: MinuteBarSource; expiresAt: number; requestedCount: number; cold?: boolean } | undefined,
   count: number,
   now: number,
+  symbolActiveInterest = false,
 ): boolean {
   if (!entry) return false;
-  return entry.expiresAt > now && entry.source === 'tradier' && entry.requestedCount >= count;
+  if (!(entry.expiresAt > now && entry.source === 'tradier' && entry.requestedCount >= count)) {
+    return false;
+  }
+  // TRA-739: a long-TTL cold entry must not keep serving a symbol that has
+  // since become active-interest — live entry/exit decisions need minute-fresh
+  // bars. Force a refresh so the symbol is re-pulled and re-cached on the hot
+  // (minute) TTL.
+  if (symbolActiveInterest && entry.cold) return false;
+  return true;
 }
 
 function nextMinuteBoundary(): number {
   const now = Date.now();
   return Math.floor(now / 60_000) * 60_000 + 60_000;
+}
+
+// TRA-739: cold (non-active-interest) discovery symbols are cached this long
+// instead of just to the next minute boundary. The cold scan that pulls them
+// already runs on a ~5-min cadence, so a few-minute-stale bar set introduces no
+// discovery-latency regression — but it caps the PROCESS-GLOBAL Tradier
+// bar-pull rate. The per-minute cache (TRA-552/554) already deduped to ~1 pull
+// per symbol per minute, but with ~100 engines each cold-scanning + pulling
+// active-interest on unsynchronized phases, the union re-covered nearly the
+// whole ~364-symbol watchlist every minute (~265-320 req/min observed, above
+// the <200 budget). Pulling cold symbols once per ~5 min instead drops their
+// contribution to ~watchlist/5 ≈ 73/min, leaving headroom for the (smaller)
+// minute-fresh active-interest set.
+const COLD_BAR_CACHE_MS = 5 * 60_000;
+
+function barCacheExpiry(symbol: string): number {
+  return isActiveInterest(symbol) ? nextMinuteBoundary() : Date.now() + COLD_BAR_CACHE_MS;
 }
 
 // ── Twelve Data fallback for stock minute bars ───────────────────────────────
@@ -801,14 +847,14 @@ export async function fetchMinuteBarsWithSource(
   // (80 bars before 80 RTH minutes have elapsed; 2,000 bars ever) coalesces
   // instead of hammering Tradier every tick.
   const fresh = minuteBarCache.get(symbol);
-  if (fresh && canReuseCachedTradierBars(fresh, count, Date.now())) {
+  if (fresh && canReuseCachedTradierBars(fresh, count, Date.now(), isActiveInterest(symbol))) {
     return { bars: fresh.bars.slice(-count), source: 'tradier', yahooSkipped, cached: true };
   }
 
   // Primary: Tradier intraday timesales.
   const tradier = await fetchTradierMinuteBars(symbol, count);
   if (tradier.bars.length > 0) {
-    minuteBarCache.set(symbol, { bars: tradier.bars, source: 'tradier', expiresAt: nextMinuteBoundary(), requestedCount: count });
+    minuteBarCache.set(symbol, { bars: tradier.bars, source: 'tradier', expiresAt: barCacheExpiry(symbol), requestedCount: count, cold: !isActiveInterest(symbol) });
     return { bars: tradier.bars, source: 'tradier', yahooSkipped, tradierDiag: tradier.diag };
   }
 
@@ -839,7 +885,7 @@ export async function fetchMinuteBarsWithSource(
     : [];
 
   if (yahooBars.length > 0) {
-    minuteBarCache.set(symbol, { bars: yahooBars, source: 'yahoo', expiresAt: nextMinuteBoundary(), requestedCount: count });
+    minuteBarCache.set(symbol, { bars: yahooBars, source: 'yahoo', expiresAt: nextMinuteBoundary(), requestedCount: count, cold: false });
     return { bars: yahooBars, source: 'yahoo', yahooSkipped, tradierDiag: tradier.diag };
   }
 
@@ -853,7 +899,7 @@ export async function fetchMinuteBarsWithSource(
   const twelveData = await fetchTwelveDataMinuteBars(symbol, count, isActiveInterest(symbol));
   if (twelveData.bars.length > 0) {
     console.info(`[yahoo-feed] chart(${symbol}): served ${twelveData.bars.length} bars from Twelve Data fallback`);
-    minuteBarCache.set(symbol, { bars: twelveData.bars, source: 'twelvedata', expiresAt: nextMinuteBoundary(), requestedCount: count });
+    minuteBarCache.set(symbol, { bars: twelveData.bars, source: 'twelvedata', expiresAt: nextMinuteBoundary(), requestedCount: count, cold: false });
     return {
       bars: twelveData.bars,
       source: 'twelvedata',
@@ -866,7 +912,7 @@ export async function fetchMinuteBarsWithSource(
   // Negative-cache the miss so a back-to-back tick in the same minute does not
   // re-run the Twelve Data fallback (TRA-439). Bars only roll on the minute
   // boundary, so a miss now is a miss until the next boundary.
-  minuteBarCache.set(symbol, { bars: [], source: 'none', expiresAt: nextMinuteBoundary(), requestedCount: count });
+  minuteBarCache.set(symbol, { bars: [], source: 'none', expiresAt: nextMinuteBoundary(), requestedCount: count, cold: false });
   return {
     bars: [],
     source: 'none',
