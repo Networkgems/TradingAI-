@@ -295,6 +295,13 @@ interface QuoteCacheEntry {
   storedAt: number;
 }
 const quoteCache = new Map<string, QuoteCacheEntry>();
+// TRA-739: singleflight for quote batches. With ~100 engines all ticking every
+// 30s, multiple engines can call fetchQuotes simultaneously while the 3s cache
+// is stale. Without this, all N concurrent callers fire duplicate Tradier
+// batch-quote requests (the thundering herd that drove quote rate to 200+/min
+// when Yahoo is broken). One in-flight promise per unique sorted symbol key
+// caps concurrent duplicate batch requests to 1.
+const quoteInflight = new Map<string, Promise<void>>();
 
 /**
  * Pure split of a requested symbol list into cache-fresh hits and the stale
@@ -1051,18 +1058,43 @@ export async function fetchQuotes(
   const staleSet = new Set(stale);
 
   // Primary: one Tradier call for the stale remainder (cache hits already served).
+  // TRA-739 singleflight: coalesce concurrent callers that all find the same stale
+  // symbols — only the first one fires a Tradier batch; the others await that same
+  // promise and then read the now-populated cache entries.
   if (tradierStocksClient && !isTradierBlocked()) {
-    try {
-      bumpFallbackCounter('tradier');
-      recordTradierQuoteRequest(now);
-      const tradier = await tradierStocksClient.getQuotes(stale);
-      for (const [sym, q] of tradier) {
-        results.set(sym, { price: q.price, volume: q.volume, change: q.change, changePct: q.changePct });
+    const quoteInflightKey = stale.slice().sort().join(',');
+    const existingQuoteInflight = quoteInflight.get(quoteInflightKey);
+    if (existingQuoteInflight) {
+      await existingQuoteInflight;
+      // Re-read the cache entries that the in-flight call populated.
+      for (const sym of stale) {
+        const entry = quoteCache.get(sym);
+        if (entry) results.set(sym, entry.quote);
       }
-    } catch (err: unknown) {
-      const msg = err instanceof Error ? err.message : String(err);
-      if (/HTTP\s+(429|5\d\d)/.test(msg)) tripTradierBreaker('quotes(batch)', msg);
-      else console.warn(`[yahoo-feed] tradier quotes(batch) error: ${msg}`);
+    } else {
+      const quoteFetch = (async () => {
+        try {
+          bumpFallbackCounter('tradier');
+          recordTradierQuoteRequest(now);
+          const tradier = await tradierStocksClient!.getQuotes(stale);
+          const storedAt = Date.now();
+          for (const [sym, q] of tradier) {
+            const quote = { price: q.price, volume: q.volume, change: q.change, changePct: q.changePct };
+            quoteCache.set(sym, { quote, storedAt });
+            results.set(sym, quote);
+          }
+        } catch (err: unknown) {
+          const msg = err instanceof Error ? err.message : String(err);
+          if (/HTTP\s+(429|5\d\d)/.test(msg)) tripTradierBreaker('quotes(batch)', msg);
+          else console.warn(`[yahoo-feed] tradier quotes(batch) error: ${msg}`);
+        }
+      })();
+      quoteInflight.set(quoteInflightKey, quoteFetch);
+      try {
+        await quoteFetch;
+      } finally {
+        quoteInflight.delete(quoteInflightKey);
+      }
     }
   }
 
