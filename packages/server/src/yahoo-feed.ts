@@ -501,10 +501,21 @@ function nextMinuteBoundary(): number {
 // the <200 budget). Pulling cold symbols once per ~5 min instead drops their
 // contribution to ~watchlist/5 ≈ 73/min, leaving headroom for the (smaller)
 // minute-fresh active-interest set.
+//
+// TRA-739 follow-up: active-interest symbols previously used nextMinuteBoundary()
+// as their TTL, which can be just seconds away when a pull lands near a minute
+// boundary. With engines ticking every 30s on unsynchronized phases, this caused
+// each hot symbol to be re-pulled once per tick (~2x/min) rather than once/min.
+// Using `Date.now() + HOT_BAR_CACHE_MS` (a full 60s) instead guarantees at most
+// one Tradier pull per symbol per 60s regardless of where the pull falls within
+// the minute. Minute bars are still immutable within their minute; a full 60s
+// window just guarantees the dedup spans two ticks even when the pull lands at
+// minute :58.
+const HOT_BAR_CACHE_MS = 60_000;
 const COLD_BAR_CACHE_MS = 5 * 60_000;
 
 function barCacheExpiry(symbol: string): number {
-  return isActiveInterest(symbol) ? nextMinuteBoundary() : Date.now() + COLD_BAR_CACHE_MS;
+  return Date.now() + (isActiveInterest(symbol) ? HOT_BAR_CACHE_MS : COLD_BAR_CACHE_MS);
 }
 
 // ── Twelve Data fallback for stock minute bars ───────────────────────────────
