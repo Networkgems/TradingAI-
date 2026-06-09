@@ -295,13 +295,14 @@ interface QuoteCacheEntry {
   storedAt: number;
 }
 const quoteCache = new Map<string, QuoteCacheEntry>();
-// TRA-739: singleflight for quote batches. With ~100 engines all ticking every
-// 30s, multiple engines can call fetchQuotes simultaneously while the 3s cache
-// is stale. Without this, all N concurrent callers fire duplicate Tradier
-// batch-quote requests (the thundering herd that drove quote rate to 200+/min
-// when Yahoo is broken). One in-flight promise per unique sorted symbol key
-// caps concurrent duplicate batch requests to 1.
+// TRA-739: singleflight for Tradier quote batches. The previous approach keyed
+// on the sorted stale-set per caller, but 103 engines each have slightly different
+// stale subsets --> different keys --> N concurrent Tradier calls (thundering herd).
+// Fix: single global key so ANY concurrent caller waits on the same in-flight.
+// The winner fetches ALL globally-stale symbols at once so waiters find their
+// symbols fresh in cache when they wake.
 const quoteInflight = new Map<string, Promise<void>>();
+const TRADIER_QUOTE_INFLIGHT_KEY = '_g';
 
 /**
  * Pure split of a requested symbol list into cache-fresh hits and the stale
@@ -1063,26 +1064,32 @@ export async function fetchQuotes(
   // symbols — only the first one fires a Tradier batch; the others await that same
   // promise and then read the now-populated cache entries.
   if (tradierStocksClient && !isTradierBlocked()) {
-    const quoteInflightKey = stale.slice().sort().join(',');
-    const existingQuoteInflight = quoteInflight.get(quoteInflightKey);
+    const existingQuoteInflight = quoteInflight.get(TRADIER_QUOTE_INFLIGHT_KEY);
     if (existingQuoteInflight) {
       await existingQuoteInflight;
-      // Re-read the cache entries that the in-flight call populated.
+      // The in-flight fetched all globally-stale symbols; re-read cache.
       for (const sym of stale) {
         const entry = quoteCache.get(sym);
         if (entry) results.set(sym, entry.quote);
       }
     } else {
+      // Collect ALL stale symbols across the whole cache (not just this caller's
+      // subset) so concurrent waiters find their symbols fresh after this batch.
+      const toFetch = new Set<string>(stale);
+      for (const [sym, entry] of quoteCache) {
+        if (now - entry.storedAt > ttlMs) toFetch.add(sym);
+      }
+      const toFetchArr = [...toFetch];
       const quoteFetch = (async () => {
         try {
           bumpFallbackCounter('tradier');
           recordTradierQuoteRequest(now);
-          const tradier = await tradierStocksClient!.getQuotes(stale);
+          const tradier = await tradierStocksClient!.getQuotes(toFetchArr);
           const storedAt = Date.now();
           for (const [sym, q] of tradier) {
             const quote = { price: q.price, volume: q.volume, change: q.change, changePct: q.changePct };
             quoteCache.set(sym, { quote, storedAt });
-            results.set(sym, quote);
+            if (staleSet.has(sym)) results.set(sym, quote);
           }
         } catch (err: unknown) {
           const msg = err instanceof Error ? err.message : String(err);
@@ -1090,11 +1097,11 @@ export async function fetchQuotes(
           else console.warn(`[yahoo-feed] tradier quotes(batch) error: ${msg}`);
         }
       })();
-      quoteInflight.set(quoteInflightKey, quoteFetch);
+      quoteInflight.set(TRADIER_QUOTE_INFLIGHT_KEY, quoteFetch);
       try {
         await quoteFetch;
       } finally {
-        quoteInflight.delete(quoteInflightKey);
+        quoteInflight.delete(TRADIER_QUOTE_INFLIGHT_KEY);
       }
     }
   }
