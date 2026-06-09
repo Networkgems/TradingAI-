@@ -7,7 +7,7 @@ import type { AccountState, OptionsAccountState } from '@trading-app/shared';
 import { HTTP_URL } from '../../server-url';
 import { logger } from '../../lib/logger';
 import { useToast } from '../../lib/toast.tsx';
-import { fmt, timeAgo } from '../../lib/format';
+import { timeAgo } from '../../lib/format';
 import { ThemeToggle } from '../ThemeToggle';
 import type { Theme } from '../ThemeToggle';
 import { ProfileMenu } from '../ProfileMenu';
@@ -108,17 +108,6 @@ export function DashboardHeader({
         {account && (
           <>
             <div className="stat-group">
-              <div className="stat">
-                <span className="stat-label">Equity</span>
-                <span className="stat-value">${fmt(account.totalEquity)}</span>
-              </div>
-              {/* TRA-725 — daily P&L moved out of the header to the bottom
-                  DashboardFooter (board ask: Tradier shows "$X (Y%) Today"
-                  below the holdings, not in the account header). */}
-              <div className="stat">
-                <span className="stat-label">Cash</span>
-                <span className="stat-value">${fmt(account.availableCash)}</span>
-              </div>
               <div className="stat">
                 <span className="stat-label">Positions</span>
                 <span className="stat-value">{openPositionsCount}</span>

@@ -9,6 +9,7 @@ import { getOptionOpenSortValue, getOptionClosedSortValue } from '../../lib/stoc
 import type { OptionOpenSortKey, OptionClosedSortKey } from '../../lib/stockSort';
 import { useStockOptionClose } from '../../hooks/useStockOptionClose';
 import { CloseOptionDrawer } from './CloseOptionDrawer';
+import { AccountSummaryCard } from './AccountSummaryCard';
 
 export function StockOptionsPanel({
   token,
@@ -45,6 +46,7 @@ export function StockOptionsPanel({
 
   return (
     <div className="positions-panel">
+      <AccountSummaryCard account={account} accountMode={accountMode} />
       {/* TRA-323 — pull open option positions from Tradier into TradeAI so they
           can be closed from here. The button targets the Tradier env selected
           in Settings; the toast that follows reports the count summary. */}
