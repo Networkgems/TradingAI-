@@ -531,8 +531,19 @@ function nextMinuteBoundary(): number {
 // cycle × 2 for safety margin) so no discovery regression.
 const HOT_BAR_CACHE_MS = 90_000;
 const COLD_BAR_CACHE_MS = 10 * 60_000;
+// TRA-739: the MTF technical snapshot fires every 5 min and requests count=2000
+// bars. Those pulls miss the 90s hot cache (expired long before the next 5-min
+// cycle) and re-hit Tradier for all active-interest symbols every 5 min, causing
+// another 100+ req/min burst. Cache deep pulls (count > 400) for at least one
+// full MTF cycle so the 5-min refresh finds a live entry. The signal-engine candle
+// loop uses count=80; only the MTF snapshot uses count=2000. Resampled 15m/1h
+// snapshots are acceptable up to 5 min stale — they only change when new minute
+// bars arrive, and the candle loop (count=80) stays minute-fresh for active signals.
+const MTF_BAR_CACHE_MS = 5 * 60_000;
+const MTF_DEPTH_THRESHOLD = 400;
 
-function barCacheExpiry(symbol: string): number {
+function barCacheExpiry(symbol: string, count: number): number {
+  if (count >= MTF_DEPTH_THRESHOLD) return Date.now() + MTF_BAR_CACHE_MS;
   return Date.now() + (isActiveInterest(symbol) ? HOT_BAR_CACHE_MS : COLD_BAR_CACHE_MS);
 }
 
@@ -895,7 +906,7 @@ export async function fetchMinuteBarsWithSource(
     // Primary: Tradier intraday timesales.
     const tradier = await fetchTradierMinuteBars(symbol, count);
     if (tradier.bars.length > 0) {
-      const entry: MinuteBarCacheEntry = { bars: tradier.bars, source: 'tradier', expiresAt: barCacheExpiry(symbol), requestedCount: count, cold: !isActiveInterest(symbol) };
+      const entry: MinuteBarCacheEntry = { bars: tradier.bars, source: 'tradier', expiresAt: barCacheExpiry(symbol, count), requestedCount: count, cold: !isActiveInterest(symbol) };
       minuteBarCache.set(symbol, entry);
       return entry;
     }
