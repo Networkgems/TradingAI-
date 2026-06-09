@@ -1394,14 +1394,22 @@ export class SignalEngine {
       this.candleScanTickCount++;
       const CANDLE_BATCH = 5;
       // TRA-554: gate the bar pull to active-interest symbols every tick, with a
-      // slow full-watchlist scan every 10 ticks (~5 min) for signal discovery.
+      // slow full-watchlist scan for signal discovery.
+      // TRA-739: the old design pulled the ENTIRE watchlist on one "cold-scan"
+      // tick every 10 ticks. With ~364 symbols (Tradier is the minute-bar primary)
+      // that dumped ~364 bar-pulls into a single ~30s tick → a >200 req/min spike
+      // in the rolling 60s meter every 5 min, even though the steady-state rate is
+      // well under target. Instead, SHARD the cold scan: each tick covers one of
+      // COLD_SCAN_INTERVAL rotating slices of the watchlist, so every symbol is
+      // still refreshed once per ~5 min (identical total Tradier volume) but the
+      // per-minute peak is ~1/10th — smoothing the burst below the <200/min target.
       // Skip entirely when the market is closed — Tradier timesales returns empty
       // outside session hours (session_filter=open) so fetching is pure waste.
       if (isStockMarketOpen()) {
         const COLD_SCAN_INTERVAL = 10;
-        const isColdScanTick = this.candleScanTickCount % COLD_SCAN_INTERVAL === 0;
+        const coldScanShard = this.candleScanTickCount % COLD_SCAN_INTERVAL;
         const symbolsToFetch = activeSymbols.filter(
-          sym => activeInterest.has(sym) || isColdScanTick,
+          (sym, idx) => activeInterest.has(sym) || idx % COLD_SCAN_INTERVAL === coldScanShard,
         );
         for (let i = 0; i < symbolsToFetch.length; i += CANDLE_BATCH) {
           await Promise.all(
