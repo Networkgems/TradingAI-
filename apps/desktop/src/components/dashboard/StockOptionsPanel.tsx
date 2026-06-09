@@ -289,6 +289,23 @@ export function StockOptionsPanel({
         // but DTBP $0). Only margin / PDT accounts carry it.
         const liveDayTradeBP = isLive ? account?.dayTradeBuyingPower : undefined;
         const showLiveDayTradeBP = isLive && typeof liveDayTradeBP === 'number';
+        // TRA-711 — the footer "Total Options P&L" previously read the engine's
+        // cumulative mode-scoped realized total (`optionsState.optionsPnl`),
+        // which sits directly under the open-positions table yet contradicted
+        // every row in it (board screenshot: visible opens summed to +$41.50
+        // while the footer showed −$79.50 of old realized closes). Recompute it
+        // from exactly the rows the panel renders so the total always equals
+        // the sum of the per-row P&L the user can see: open unrealized
+        // (`(mark − paid) × contractsRemaining × 100` + any partial-exit
+        // realized) plus today's closed realized. Mirrors the row formulas at
+        // the open/closed table bodies above.
+        const totalOptionsPnl =
+          openOptions.reduce((sum, o) => {
+            const hasMark = Number.isFinite(o.currentPremium) && o.currentPremium > 0 && o.premiumPaid > 0;
+            const unrealized = hasMark ? (o.currentPremium - o.premiumPaid) * o.contractsRemaining * 100 : 0;
+            return sum + unrealized + (o.pnl ?? 0);
+          }, 0)
+          + closedOptions.reduce((sum, o) => sum + (o.pnl ?? 0), 0);
         return (
           <div style={{ marginTop: '1.5rem', display: 'flex', gap: '2rem', fontSize: '0.85rem', color: 'var(--muted)' }}>
             {showLiveBP ? (
@@ -306,7 +323,7 @@ export function StockOptionsPanel({
                 </strong>
               </span>
             ) : null}
-            <span>Total Options P&amp;L: <strong className={optionsState.optionsPnl >= 0 ? 'green' : 'red'}>{fmtDollar(optionsState.optionsPnl)}</strong></span>
+            <span>Total Options P&amp;L: <strong className={totalOptionsPnl >= 0 ? 'green' : 'red'}>{fmtDollar(totalOptionsPnl)}</strong></span>
             <span>Daily Trades: <strong className={optionsState.dailyOptionsCount >= optionsDailyLimit ? 'red' : ''}>{optionsState.dailyOptionsCount}/{optionsDailyLimit}</strong></span>
             {/* TRA-374 — surface the demo cost-model drag (slippage + per-contract
                 fee). Hidden in live and when both buckets are 0. */}

@@ -7,7 +7,7 @@ import { render, screen, act } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
 import type { ReactElement } from 'react';
 import type {
-  Position, TradeSignal, AccountState, NewsItem, CryptoSymbolState, AccountSettings,
+  Position, TradeSignal, AccountState, NewsItem, CryptoSymbolState, AccountSettings, OptionPosition,
 } from '@trading-app/shared';
 import { DEFAULT_ACCOUNT_SETTINGS } from '@trading-app/shared';
 import { ToastProvider } from '../../lib/toast.tsx';
@@ -55,6 +55,15 @@ const signal = (over: Partial<TradeSignal> = {}): TradeSignal => ({
   id: 's1', symbol: 'NVDA', type: 'momentum', side: 'buy',
   entryPrice: 100, stopLoss: 95, takeProfit: 120, riskRewardRatio: 4,
   timestamp: Date.now(), ...over,
+});
+
+// TRA-711 — minimal OptionPosition for the StockOptionsPanel footer test.
+const optionPos = (over: Partial<OptionPosition> = {}): OptionPosition => ({
+  id: 'o1', symbol: 'NVDA', optionType: 'call', strike: 100, expiration: '2026-07-17',
+  contracts: 1, contractsRemaining: 1, premiumPaid: 1.0, currentPremium: 1.0,
+  tp1Premium: 1.25, tp1Hit: false, stopLossPremium: 0.75, peakPremium: 1.0,
+  trailingActive: false, trailingStopPremium: 0, underlyingEntryPrice: 100,
+  openedAt: Date.now(), signalId: 's1', signalType: 'momentum', ...over,
 });
 
 const account: AccountState = {
@@ -218,6 +227,44 @@ describe('StockOptionsPanel (TRA-422)', () => {
       />,
     );
     expect(screen.getByRole('button', { name: /Sync Tradier production positions/ })).toBeInTheDocument();
+  });
+
+  // TRA-711 — the footer "Total Options P&L" previously read the engine's
+  // cumulative mode-scoped realized total (`optionsState.optionsPnl`). Sitting
+  // directly under the open-positions table, it contradicted every visible row:
+  // the board screenshot showed open positions summing to +$41.50 while the
+  // footer read −$79.50 of stale realized closes. Lock in the new contract:
+  // the footer equals the sum of the per-row P&L the user can see — open
+  // unrealized `(mark − paid) × contractsRemaining × 100` (+ partial realized)
+  // plus today's closed realized — and IGNORES the cumulative number.
+  it('renders Total Options P&L from the visible rows, not the cumulative optionsPnl', () => {
+    renderWithToast(
+      <StockOptionsPanel
+        token="t" tradierEnv="production" accountMode="live" account={undefined}
+        optionsState={{
+          // Cumulative realized = a big negative the board flagged as "wrong".
+          optionsPnl: -79.50,
+          dailyOptionsPnl: 41.50,
+          optionsCash: 1_000, dailyOptionsCount: 2,
+          openOptions: [], closedOptions: [],
+        }}
+        openOptions={[
+          // +$34.00 unrealized: (1.85 − 1.51) × 1 × 100
+          optionPos({ id: 'o1', symbol: 'RIOT', optionType: 'call', premiumPaid: 1.51, currentPremium: 1.85, contracts: 1, contractsRemaining: 1 }),
+          // −$15.00 unrealized: (0.38 − 0.43) × 3 × 100
+          optionPos({ id: 'o2', symbol: 'MSFT', optionType: 'call', premiumPaid: 0.43, currentPremium: 0.38, contracts: 3, contractsRemaining: 3 }),
+        ]}
+        // +$22.50 realized from a position closed today.
+        closedOptions={[
+          optionPos({ id: 'o3', symbol: 'AAPL', optionType: 'put', premiumPaid: 0.50, currentPremium: 0.95, contracts: 1, contractsRemaining: 0, pnl: 22.50, closedAt: Date.now() }),
+        ]}
+        optionsDailyLimit={5}
+      />,
+    );
+    // 34.00 − 15.00 + 22.50 = +41.50 — matches the visible rows.
+    expect(screen.getByText(/\+\$41\.50/)).toBeInTheDocument();
+    // The stale cumulative number must NOT appear in the footer.
+    expect(screen.queryByText(/-\$79\.50|−\$79\.50/)).not.toBeInTheDocument();
   });
 });
 
