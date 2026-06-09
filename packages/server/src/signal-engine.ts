@@ -184,6 +184,15 @@ function activeOptionsDailyLimit(settings?: AccountSettings): number | undefined
   return settings.optionsDailyTradesLimit;
 }
 
+/** TRA-554 — pick the equity daily-trades cap that matches the active mode. */
+function activeEquityDailyLimit(settings?: AccountSettings): number {
+  if (!settings) return 10;
+  if (settings.mode === 'live') {
+    return settings.dailyTradesLimitLive ?? settings.dailyTradesLimit;
+  }
+  return settings.dailyTradesLimit;
+}
+
 // TRA-191 — periodic relative-value scanner cadence. Tradier's free-tier
 // limit is 60 req/min (sandbox) or 120/min (production). With ~25 active-
 // interest symbols and 2 calls per scan (expirations + chain), a 5-minute
@@ -574,6 +583,8 @@ export class SignalEngine {
    */
   private managedAccountRatio: number;
   private riskPerTrade: number;
+  /** TRA-554 — equity entries allowed per ET calendar day. Updated on every applySettings call. */
+  private equityDailyTradesLimit = 10;
   /**
    * TRA-226 — last successful Tradier `/accounts/{id}/balances` snapshot.
    * Used in live mode so the dashboard reflects the user's actual Tradier
@@ -794,6 +805,7 @@ export class SignalEngine {
     const liveStocksRisk = resolveRiskPerTrade(settings, 'stocks', 'live');
     this.managedAccountRatio = liveStocksRatio;
     this.riskPerTrade = liveStocksRisk;
+    this.equityDailyTradesLimit = activeEquityDailyLimit(settings);
     this.account.updateConfig({
       managedAccountRatio: demoStocksRatio,
       riskPerTrade: demoStocksRisk,
@@ -1492,6 +1504,22 @@ export class SignalEngine {
           // day. `gateSignalOnReview` is retained as a no-op so the contract
           // and tests survive; the dashboard banner still renders the regime
           // context, but it never decides whether a position opens.
+
+          // TRA-554 — daily equity trades gate. Count today's entries from the
+          // persisted dailySignals list (keyed by ET date so the reset is
+          // automatic at midnight ET without a separate day-roll counter).
+          // Checked here — before the broker order — so no Tradier OTOCO is
+          // submitted when the cap has already been reached.
+          const equityDayKey = etDateString(new Date());
+          const equityTradesOpenedToday = this.dailySignals.filter(
+            s => etDateString(new Date(s.firedAt)) === equityDayKey,
+          ).length;
+          if (equityTradesOpenedToday >= this.equityDailyTradesLimit) {
+            signal.liveSkipReason = `daily equity limit reached (${equityTradesOpenedToday}/${this.equityDailyTradesLimit})`;
+            this.recentSignals.unshift(signal); this.emitSignalAlert(signal);
+            if (this.recentSignals.length > MAX_SIGNALS) this.recentSignals.pop();
+            continue;
+          }
 
           // TRA-335 — in live mode, mirror the equity entry as a Tradier
           // OTOCO bracket order. We submit the broker order *first* so the
