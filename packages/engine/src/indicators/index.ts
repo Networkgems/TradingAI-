@@ -14,6 +14,13 @@ export type { AdxResult } from './adx.js';
 export { ema, emaCross } from './ema.js';
 export { emaSeries, maSlope } from './ma.js';
 export { atr, atrPct } from './atr.js';
+export {
+  supertrend,
+  supertrendLatest,
+  SUPERTREND_DEFAULT_PERIOD,
+  SUPERTREND_DEFAULT_FACTOR,
+} from './supertrend.js';
+export type { SupertrendBar, SupertrendDirection, SupertrendOptions } from './supertrend.js';
 export { donchian } from './donchian.js';
 export type { DonchianChannel } from './donchian.js';
 export {

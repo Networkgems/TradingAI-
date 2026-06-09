@@ -5,6 +5,7 @@ import { MomentumStrategy } from './strategies/momentum.js';
 import { MeanReversionCryptoStrategy } from './strategies/mean-reversion-crypto.js';
 import { BreakoutVolStrategy } from './strategies/breakout-vol.js';
 import { StrategyRouter, DEFAULT_ROUTER_PRIORITY } from './router.js';
+import type { SupertrendConfluenceStrategy } from './strategies/supertrend-confluence.js';
 
 /**
  * Synthetic candle generators for the router integration test. The trend /
@@ -413,5 +414,100 @@ describe('StrategyRouter — TRA-421 per-strategy universe filter', () => {
     expect(router.evaluate('SOL-USD', [])?.symbol).toBe('SOL-USD');
     expect(router.evaluateDetailed('BTC-USD', []).fired.map(f => f.priority))
       .not.toContain('momentum');
+  });
+});
+
+describe('StrategyRouter — TRA-728 SupertrendConfluence gated OFF by default', () => {
+  // The SupertrendConfluence source must land in the router fully inert: until
+  // the Phase-2 backtest gate validates it, an omitted/false `enableSupertrend`
+  // means the strategy is never even evaluated, so the router behaves exactly as
+  // it did before TRA-728. These tests pin that invariant.
+  const stSig = (): TradeSignal => ({
+    id: 'st-1',
+    symbol: 'AMD',
+    type: 'supertrend_confluence',
+    side: 'buy',
+    entryPrice: 100,
+    stopLoss: 98,
+    takeProfit: 104,
+    riskRewardRatio: 2,
+    timestamp: 0,
+  });
+
+  function spyingSupertrend(): { strat: SupertrendConfluenceStrategy; calls: () => number } {
+    let calls = 0;
+    const strat = {
+      evaluate: () => {
+        calls += 1;
+        return stSig();
+      },
+    } as unknown as SupertrendConfluenceStrategy;
+    return { strat, calls: () => calls };
+  }
+
+  it('never evaluates the supertrend strategy when the flag is omitted (default off)', () => {
+    const { strat, calls } = spyingSupertrend();
+    const router = new StrategyRouter({
+      regime: new RegimeDetector(),
+      momentum: new MomentumStrategy(new RegimeDetector(), { fastMaPeriod: 10, slowMaPeriod: 50, donchianPeriod: 15 }),
+      meanReversion: new MeanReversionCryptoStrategy(),
+      breakout: new BreakoutVolStrategy(),
+      supertrend: strat,
+      // enableSupertrend omitted ⇒ default false
+    });
+    const tape = trendPhase(120, 100, 0.005, 0.4);
+    for (let i = 60; i <= tape.length; i++) router.evaluateDetailed('AMD', tape.slice(0, i));
+    expect(calls()).toBe(0);
+  });
+
+  it('never surfaces a supertrend_confluence signal when off, even if it would fire', () => {
+    const { strat } = spyingSupertrend();
+    const router = new StrategyRouter({
+      regime: new RegimeDetector(),
+      momentum: { evaluate: () => null } as unknown as MomentumStrategy,
+      meanReversion: { evaluate: () => null } as unknown as MeanReversionCryptoStrategy,
+      breakout: { evaluate: () => null } as unknown as BreakoutVolStrategy,
+      supertrend: strat,
+      enableSupertrend: false,
+    });
+    const result = router.evaluateDetailed('AMD', []);
+    expect(result.signal).toBeNull();
+    expect(result.fired).toHaveLength(0);
+  });
+
+  it('evaluates and forwards the signal only once explicitly enabled', () => {
+    const { strat, calls } = spyingSupertrend();
+    const router = new StrategyRouter({
+      regime: new RegimeDetector(),
+      momentum: { evaluate: () => null } as unknown as MomentumStrategy,
+      meanReversion: { evaluate: () => null } as unknown as MeanReversionCryptoStrategy,
+      breakout: { evaluate: () => null } as unknown as BreakoutVolStrategy,
+      supertrend: strat,
+      enableSupertrend: true,
+    });
+    const result = router.evaluateDetailed('AMD', []);
+    expect(calls()).toBe(1);
+    expect(result.signal?.type).toBe('supertrend_confluence');
+  });
+
+  it('ranks last when enabled: never displaces a validated strategy on the same bar', () => {
+    const { strat } = spyingSupertrend();
+    const momentumSig: TradeSignal = {
+      id: 'm-1', symbol: 'AMD', type: 'momentum', side: 'buy',
+      entryPrice: 100, stopLoss: 99, takeProfit: 102, riskRewardRatio: 2, timestamp: 0,
+    };
+    const router = new StrategyRouter({
+      regime: new RegimeDetector(),
+      momentum: { evaluate: () => momentumSig } as unknown as MomentumStrategy,
+      meanReversion: { evaluate: () => null } as unknown as MeanReversionCryptoStrategy,
+      breakout: { evaluate: () => null } as unknown as BreakoutVolStrategy,
+      supertrend: strat,
+      enableSupertrend: true,
+    });
+    const result = router.evaluateDetailed('AMD', []);
+    // Both fire, but the validated momentum strategy wins the dedupe joust.
+    expect(result.signal?.type).toBe('momentum');
+    expect(result.fired.map(f => f.priority)).toContain('supertrend_confluence');
+    expect(result.fired[result.fired.length - 1].priority).toBe('supertrend_confluence');
   });
 });

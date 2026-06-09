@@ -33,6 +33,7 @@ export type SignalType =
   | 'relative_value' // TRA-191: options chain relative-value scanner (IV skew + monotonic + no-arb)
   | 'sma200_pullback' // TRA-451: pullback-to-200 bounce (continuation long), daily bars
   | 'sma200_reclaim'  // TRA-451: 200-SMA reclaim reversal (trend-change swing), daily bars
+  | 'supertrend_confluence' // TRA-728: Supertrend + MA-stack + MACD + RSI confluence (options, router-gated off in Phase 1)
   | 'tradier_import'; // TRA-323: position imported from Tradier (opened directly on the broker, synced into TradeAI to be closed here)
 export type OptionType = 'call' | 'put';
 

@@ -3,6 +3,7 @@ import type { RegimeDetector, Regime } from './regime.js';
 import type { MomentumStrategy } from './strategies/momentum.js';
 import type { MeanReversionCryptoStrategy } from './strategies/mean-reversion-crypto.js';
 import type { BreakoutVolStrategy } from './strategies/breakout-vol.js';
+import type { SupertrendConfluenceStrategy } from './strategies/supertrend-confluence.js';
 
 /**
  * Per-tick decision the router would have produced if it took every signal
@@ -64,6 +65,19 @@ export interface StrategyRouterOptions {
   meanReversion: MeanReversionCryptoStrategy;
   breakout: BreakoutVolStrategy;
   /**
+   * TRA-728 (Phase 1) — optional SupertrendConfluence source. Wired in OFF by
+   * default: it only contributes a signal when {@link enableSupertrend} is
+   * explicitly true. Until the Phase-2 backtest gate validates the edge, the
+   * router must behave exactly as it did before this strategy existed, so an
+   * omitted/false flag means the strategy is never even evaluated.
+   */
+  supertrend?: SupertrendConfluenceStrategy;
+  /**
+   * TRA-728 — master switch for the SupertrendConfluence source. Default
+   * `false` (router-gated off). Set true only once Phase 2 signs off.
+   */
+  enableSupertrend?: boolean;
+  /**
    * Override the default {@link DEFAULT_ROUTER_PRIORITY} dedupe ordering. The
    * list MUST contain only signal types this router produces (`momentum`,
    * `breakout_vol`, `mean_reversion`) — unknown types are tolerated but never
@@ -111,6 +125,9 @@ export class StrategyRouter {
   private readonly momentum: MomentumStrategy;
   private readonly meanReversion: MeanReversionCryptoStrategy;
   private readonly breakout: BreakoutVolStrategy;
+  /** TRA-728 — optional SupertrendConfluence source, off unless `enableSupertrend`. */
+  private readonly supertrend: SupertrendConfluenceStrategy | null;
+  private readonly enableSupertrend: boolean;
   private readonly priority: RouterPriority;
   /** TRA-421 — per-strategy universe whitelist; mutable via {@link setUniverse}. */
   private universe: RouterUniverse;
@@ -120,6 +137,8 @@ export class StrategyRouter {
     this.momentum = opts.momentum;
     this.meanReversion = opts.meanReversion;
     this.breakout = opts.breakout;
+    this.supertrend = opts.supertrend ?? null;
+    this.enableSupertrend = opts.enableSupertrend ?? false;
     this.priority = opts.priority ?? DEFAULT_ROUTER_PRIORITY;
     this.universe = opts.universe ?? {};
   }
@@ -199,6 +218,19 @@ export class StrategyRouter {
     const meanRevSig = this.meanReversion.evaluate(symbol, candles, regime);
     if (meanRevSig && this.universeAllows('mean_reversion', symbol)) {
       fired.push({ priority: 'mean_reversion', signal: meanRevSig });
+    }
+
+    // TRA-728 (Phase 1) — SupertrendConfluence, gated entirely behind
+    // `enableSupertrend` (default false). When off, the strategy is never even
+    // evaluated, so the router is byte-for-byte identical to its pre-TRA-728
+    // behaviour. It is not in DEFAULT_ROUTER_PRIORITY, so even when enabled it
+    // ranks last in the dedupe joust (unknown priority → +∞) and can never
+    // displace a validated strategy — until Phase 2 promotes it.
+    if (this.enableSupertrend && this.supertrend) {
+      const stSig = this.supertrend.evaluate(symbol, candles);
+      if (stSig && this.universeAllows('supertrend_confluence', symbol)) {
+        fired.push({ priority: 'supertrend_confluence', signal: stSig });
+      }
     }
 
     if (fired.length === 0) return { regime, signal: null, fired: [] };

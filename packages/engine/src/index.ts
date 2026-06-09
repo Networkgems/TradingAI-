@@ -32,6 +32,15 @@ export { SwingStrategy } from './strategies/swing-strategy.js';
 export type { SwingOptions } from './strategies/swing-strategy.js';
 export { CryptoDcaStrategy } from './strategies/crypto-dca.js';
 export type { DcaOptions } from './strategies/crypto-dca.js';
+export {
+  SupertrendConfluenceStrategy,
+  evaluateSupertrendConfluence,
+  confluenceSide,
+} from './strategies/supertrend-confluence.js';
+export type {
+  SupertrendConfluenceParams,
+  ConfluenceReads,
+} from './strategies/supertrend-confluence.js';
 export { RiskManager } from './risk.js';
 export type { RiskManagerOptions } from './risk.js';
 export {
@@ -128,8 +137,8 @@ export type {
   MarketOrderParams as CoinbaseMarketOrderParams,
   LimitOrderParams as CoinbaseLimitOrderParams,
 } from './coinbase/index.js';
-export { rsi, rsiDivergence, VwapTracker, detectPattern, isBullishPattern, isBearishPattern, adx, ema, emaCross, emaSeries, maSlope, atr, atrPct, donchian, ichimoku, tkCross, composeTechnicalSnapshot, composeTimeframeSignal, resampleCandles, mtfBiasOf, MTF_CHOP_ADX, MTF_TF_WEIGHTS, TF_BUCKET_MS } from './indicators/index.js';
-export type { VwapState, CandlePattern, AdxResult, DonchianChannel, IchimokuState, TimeframeCandles } from './indicators/index.js';
+export { rsi, rsiDivergence, VwapTracker, detectPattern, isBullishPattern, isBearishPattern, adx, ema, emaCross, emaSeries, maSlope, atr, atrPct, supertrend, supertrendLatest, SUPERTREND_DEFAULT_PERIOD, SUPERTREND_DEFAULT_FACTOR, donchian, ichimoku, tkCross, composeTechnicalSnapshot, composeTimeframeSignal, resampleCandles, mtfBiasOf, MTF_CHOP_ADX, MTF_TF_WEIGHTS, TF_BUCKET_MS } from './indicators/index.js';
+export type { VwapState, CandlePattern, AdxResult, DonchianChannel, IchimokuState, TimeframeCandles, SupertrendBar, SupertrendDirection, SupertrendOptions } from './indicators/index.js';
 export {
   evaluateSma200,
   smaSeries,
@@ -220,6 +229,36 @@ export type {
 } from './perp-shorts.js';
 export { blackScholesPrice, blackScholesDelta, bsImpliedVolatility, daysToExpiration } from './options/black-scholes.js';
 export type { BlackScholesInputs, ImpliedVolInputs } from './options/black-scholes.js';
+export {
+  selectStructureByIv,
+  selectExpiry,
+  isThirdFriday,
+  selectStrikeByDelta,
+  deltasForStrikes,
+  optionTypeForSide,
+  evaluateExit,
+  sizeOptionContracts,
+  DEFAULT_IV_GATE,
+  DEFAULT_EXPIRY_PARAMS,
+  DEFAULT_DELTA_PARAMS,
+  DEFAULT_EXIT_PARAMS,
+  DEFAULT_OPTION_SIZING,
+} from './options/supertrend-options.js';
+export type {
+  OptionsStructure,
+  IvGateParams,
+  StructureDecision,
+  ExpiryParams,
+  ExpiryCandidate,
+  DeltaTargetParams,
+  StrikeCandidate,
+  ExitParams,
+  ExitReason,
+  ExitState,
+  OptionSizingParams,
+  OptionSizingInputs,
+  OptionSizingResult,
+} from './options/supertrend-options.js';
 export { findMispricedOtmContracts } from './options/otm-mispricing.js';
 export type {
   OptionChainRow,
