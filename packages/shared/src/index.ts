@@ -2624,7 +2624,8 @@ export interface EodTradeEntry {
     | 'RV'           // TRA-191 — relative-value scanner
     | 'Tradier'      // TRA-323 — imported from Tradier (never actually written to disk: imports don't trade through the EOD exporter)
     | 'Options'      // TRA-365 follow-up — option closes that arrived without a more specific signal mapping
-    | 'SMA-200';     // TRA-451 — SMA-200 pullback/reclaim signals (display-only; never opens a position, so never reaches the EOD exporter)
+    | 'SMA-200'      // TRA-451 — SMA-200 pullback/reclaim signals (display-only; never opens a position, so never reaches the EOD exporter)
+    | 'Supertrend';  // TRA-728 — Supertrend confluence (options, router-gated off in Phase 1; never reaches the EOD exporter, mapped for exhaustiveness)
   side: Side;
   entryPrice: number;
   exitPrice: number;

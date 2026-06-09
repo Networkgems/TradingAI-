@@ -86,6 +86,10 @@ function strategyLabel(t: SignalType): StrategyLabel {
     // exhaustive over the shared `SignalType` enum.
     case 'sma200_pullback':
     case 'sma200_reclaim': return 'SMA-200';
+    // TRA-728 — Supertrend confluence is a stock-options signal, router-gated
+    // off in Phase 1, and never reaches the crypto EOD exporter. Mapped only to
+    // keep the switch exhaustive over the shared `SignalType` enum.
+    case 'supertrend_confluence': return 'Supertrend';
   }
 }
 

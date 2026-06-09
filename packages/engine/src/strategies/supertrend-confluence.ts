@@ -1,6 +1,6 @@
 import { Candle, TradeSignal, Side } from '@trading-app/shared';
 import { randomUUID } from 'crypto';
-import { supertrend, supertrendLatest, type SupertrendOptions } from '../indicators/supertrend.js';
+import { supertrendLatest, type SupertrendOptions } from '../indicators/supertrend.js';
 import { smaSeries } from '../sma200-signals.js';
 import { macd, macdCross } from '../indicators/macd.js';
 import { rsi } from '../indicators/rsi.js';
@@ -29,7 +29,7 @@ import type { RiskManager } from '../risk.js';
  * the confluence logic is golden-fixture testable via
  * {@link evaluateSupertrendConfluence}.
  *
- * Reuses existing primitives only: {@link supertrend} (ATR-based), {@link smaSeries}
+ * Reuses existing primitives only: {@link supertrendLatest} (ATR-based), {@link smaSeries}
  * (SMA 5/10/20), {@link macd}/{@link macdCross} (12/26/9), {@link rsi} (14), and
  * {@link resampleCandles} for the MTF confirm fold.
  */

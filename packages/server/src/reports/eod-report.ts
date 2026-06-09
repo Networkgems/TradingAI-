@@ -59,6 +59,10 @@ function strategyLabel(t: SignalType): EodTradeEntry['strategy'] {
     // here only to keep the switch exhaustive over `SignalType`.
     case 'sma200_pullback':
     case 'sma200_reclaim': return 'SMA-200';
+    // TRA-728 — Supertrend confluence is an options signal, router-gated off in
+    // Phase 1, so it never reaches the EOD trade exporter. Mapped here only to
+    // keep the switch exhaustive over `SignalType`.
+    case 'supertrend_confluence': return 'Supertrend';
   }
 }
 

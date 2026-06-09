@@ -6,6 +6,7 @@ import {
   setTradierStocksFeedClient,
   partitionCachedQuotes,
   requestsInWindow,
+  canReuseCachedTradierBars,
 } from './yahoo-feed.js';
 
 const Q = (price: number) => ({ price, volume: 0, change: 0, changePct: 0 });
@@ -240,5 +241,51 @@ describe('requestsInWindow (TRA-552 req/min meter)', () => {
 
   it('returns zero for an empty history', () => {
     expect(requestsInWindow([], now, W)).toEqual({ count: 0, kept: [] });
+  });
+});
+
+// TRA-554 / TRA-735 — minute-bar coalescing must key on the *requested* depth,
+// not the returned bar count. The old `bars.length >= count` guard could never
+// be met by the 80-bar candle loop before 80 RTH minutes elapse, nor by the
+// 2,000-bar MTF snapshot pull (a session has ~390 minutes), so those callers
+// refetched Tradier every 30s tick — the ~1,300–2,300 req/min RTH volume QA
+// measured on prod bqb1.
+describe('canReuseCachedTradierBars (TRA-554 minute-bar coalescing)', () => {
+  const now = 1_000_000;
+  const future = now + 30_000; // still inside this minute
+  const entry = (over: Partial<{ source: 'tradier' | 'yahoo' | 'twelvedata' | 'none'; expiresAt: number; requestedCount: number }> = {}) => ({
+    source: 'tradier' as const,
+    expiresAt: future,
+    requestedCount: 80,
+    ...over,
+  });
+
+  it('reuses when a fresh Tradier entry already requested at least `count`', () => {
+    expect(canReuseCachedTradierBars(entry({ requestedCount: 80 }), 80, now)).toBe(true);
+    expect(canReuseCachedTradierBars(entry({ requestedCount: 2000 }), 80, now)).toBe(true);
+  });
+
+  it('reuses a short result the upstream returned for an equal-or-deeper request', () => {
+    // The 2,000-bar MTF pull stores requestedCount=2000 but only ~390 bars
+    // exist; a second MTF call the same minute must still coalesce.
+    expect(canReuseCachedTradierBars(entry({ requestedCount: 2000 }), 2000, now)).toBe(true);
+  });
+
+  it('refetches when the caller wants strictly more bars than were last requested', () => {
+    expect(canReuseCachedTradierBars(entry({ requestedCount: 80 }), 2000, now)).toBe(false);
+  });
+
+  it('refetches once the minute boundary has passed (entry expired)', () => {
+    expect(canReuseCachedTradierBars(entry({ expiresAt: now - 1 }), 80, now)).toBe(false);
+  });
+
+  it('does not reuse a non-Tradier entry so a recovered primary can reclaim it', () => {
+    expect(canReuseCachedTradierBars(entry({ source: 'yahoo' }), 80, now)).toBe(false);
+    expect(canReuseCachedTradierBars(entry({ source: 'twelvedata' }), 80, now)).toBe(false);
+    expect(canReuseCachedTradierBars(entry({ source: 'none' }), 80, now)).toBe(false);
+  });
+
+  it('returns false for a cold symbol (no cache entry)', () => {
+    expect(canReuseCachedTradierBars(undefined, 80, now)).toBe(false);
   });
 });

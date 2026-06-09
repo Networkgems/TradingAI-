@@ -37,7 +37,6 @@ import type { TradeMetrics } from './tra731-metrics.js';
 
 const HERE = dirname(fileURLToPath(import.meta.url));
 const DATA_DIR = resolve(HERE, '..', 'data');
-const DAY_MS = 24 * 60 * 60 * 1000;
 
 interface CacheEntryShape {
   symbol: string;

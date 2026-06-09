@@ -376,8 +376,50 @@ type MinuteBarCacheEntry = {
   // ticks don't re-fire the Twelve Data fallback for the same symbol.
   source: MinuteBarSource;
   expiresAt: number;
+  // TRA-554: how many bars this cached pull *asked* the upstream for. Minute
+  // bars are immutable within their own minute, so re-fetching the same symbol
+  // never yields additional history before the minute boundary — the data that
+  // exists is the data that exists. We therefore coalesce on the *requested*
+  // depth, not the returned length: if we already asked Tradier for ≥ the
+  // caller's `count` this minute, reuse the result. The old `bars.length >=
+  // count` guard could never be satisfied near the open (fewer than `count`
+  // RTH minutes have elapsed) or by the 2,000-bar MTF snapshot pull (a trading
+  // day only has ~390 minutes), so those callers refetched Tradier every single
+  // tick — the bulk of the RTH bar-request volume TRA-735 measured.
+  requestedCount: number;
 };
 const minuteBarCache = new Map<string, MinuteBarCacheEntry>();
+
+/**
+ * TRA-554 — decide whether a cached Tradier minute-bar pull can be reused
+ * instead of re-hitting the upstream feed. Pure so it can be unit-tested.
+ *
+ * Reuse requires all of:
+ *   • the entry is still inside its minute (`expiresAt > now`) — bars roll on
+ *     the minute boundary, so a cross-minute entry is genuinely stale;
+ *   • the entry came from Tradier — Yahoo/Twelve-Data entries are re-tried so a
+ *     recovered primary can reclaim the symbol;
+ *   • the entry already *requested* at least as many bars as this caller wants.
+ *
+ * The last clause is the TRA-735 fix. The previous guard compared
+ * `entry.bars.length >= count`, which a caller could never satisfy when its
+ * `count` exceeds the bars that physically exist this session: the 80-bar
+ * candle loop before 80 RTH minutes elapse, or the 2,000-bar MTF snapshot pull
+ * (a session has ~390 minutes). Those callers refetched Tradier every tick.
+ * Comparing on the *requested* depth instead lets them coalesce — re-fetching
+ * within the same minute can't return more history anyway — while a genuinely
+ * deeper caller (larger `count` than was last requested) still refetches once
+ * and upgrades the cached entry.
+ */
+export function canReuseCachedTradierBars(
+  entry: { source: MinuteBarSource; expiresAt: number; requestedCount: number } | undefined,
+  count: number,
+  now: number,
+): boolean {
+  if (!entry) return false;
+  return entry.expiresAt > now && entry.source === 'tradier' && entry.requestedCount >= count;
+}
+
 function nextMinuteBoundary(): number {
   const now = Date.now();
   return Math.floor(now / 60_000) * 60_000 + 60_000;
@@ -714,17 +756,23 @@ export async function fetchMinuteBarsWithSource(
   // daily Tradier counter. If this minute already has a successful Tradier pull
   // with at least as many bars as requested, reuse it and skip the upstream call.
   // Guarded to `source === 'tradier'` (Yahoo/Twelve-Data entries are still
-  // re-tried so a recovered primary can take over) and to `bars.length >= count`
-  // so a shallow earlier pull never short-changes a deeper caller.
+  // re-tried so a recovered primary can take over) and to `requestedCount >=
+  // count` (TRA-554): reuse when this minute already asked Tradier for at least
+  // as many bars as the caller wants. A deeper caller (e.g. the 2,000-bar MTF
+  // pull behind an 80-bar candle-loop entry) still refetches once and upgrades
+  // the cache, but a same-or-shallower caller never short-changes itself, and —
+  // crucially — a caller whose `count` can't physically be filled this session
+  // (80 bars before 80 RTH minutes have elapsed; 2,000 bars ever) coalesces
+  // instead of hammering Tradier every tick.
   const fresh = minuteBarCache.get(symbol);
-  if (fresh && fresh.expiresAt > Date.now() && fresh.source === 'tradier' && fresh.bars.length >= count) {
+  if (fresh && canReuseCachedTradierBars(fresh, count, Date.now())) {
     return { bars: fresh.bars.slice(-count), source: 'tradier', yahooSkipped, cached: true };
   }
 
   // Primary: Tradier intraday timesales.
   const tradier = await fetchTradierMinuteBars(symbol, count);
   if (tradier.bars.length > 0) {
-    minuteBarCache.set(symbol, { bars: tradier.bars, source: 'tradier', expiresAt: nextMinuteBoundary() });
+    minuteBarCache.set(symbol, { bars: tradier.bars, source: 'tradier', expiresAt: nextMinuteBoundary(), requestedCount: count });
     return { bars: tradier.bars, source: 'tradier', yahooSkipped, tradierDiag: tradier.diag };
   }
 
@@ -755,7 +803,7 @@ export async function fetchMinuteBarsWithSource(
     : [];
 
   if (yahooBars.length > 0) {
-    minuteBarCache.set(symbol, { bars: yahooBars, source: 'yahoo', expiresAt: nextMinuteBoundary() });
+    minuteBarCache.set(symbol, { bars: yahooBars, source: 'yahoo', expiresAt: nextMinuteBoundary(), requestedCount: count });
     return { bars: yahooBars, source: 'yahoo', yahooSkipped, tradierDiag: tradier.diag };
   }
 
@@ -769,7 +817,7 @@ export async function fetchMinuteBarsWithSource(
   const twelveData = await fetchTwelveDataMinuteBars(symbol, count, isActiveInterest(symbol));
   if (twelveData.bars.length > 0) {
     console.info(`[yahoo-feed] chart(${symbol}): served ${twelveData.bars.length} bars from Twelve Data fallback`);
-    minuteBarCache.set(symbol, { bars: twelveData.bars, source: 'twelvedata', expiresAt: nextMinuteBoundary() });
+    minuteBarCache.set(symbol, { bars: twelveData.bars, source: 'twelvedata', expiresAt: nextMinuteBoundary(), requestedCount: count });
     return {
       bars: twelveData.bars,
       source: 'twelvedata',
@@ -782,7 +830,7 @@ export async function fetchMinuteBarsWithSource(
   // Negative-cache the miss so a back-to-back tick in the same minute does not
   // re-run the Twelve Data fallback (TRA-439). Bars only roll on the minute
   // boundary, so a miss now is a miss until the next boundary.
-  minuteBarCache.set(symbol, { bars: [], source: 'none', expiresAt: nextMinuteBoundary() });
+  minuteBarCache.set(symbol, { bars: [], source: 'none', expiresAt: nextMinuteBoundary(), requestedCount: count });
   return {
     bars: [],
     source: 'none',

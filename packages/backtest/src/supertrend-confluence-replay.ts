@@ -49,7 +49,6 @@ import {
 } from '@trading-app/engine';
 import type { Candle, OptionType, Side } from '@trading-app/shared';
 import {
-  realizedVolatility,
   realizedVolSeries,
   ivRank,
   syntheticIv,
