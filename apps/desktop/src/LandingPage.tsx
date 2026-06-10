@@ -14,8 +14,8 @@ interface Props {
  * off) — see /TRA/issues/TRA-752#document-marketing-copy-deck. The §3 strategy
  * proof strip is aligned to the audited TRA-754 Features & Strategies deck
  * (source of truth: the TRA-753 feature audit): it lists exactly the SEVEN
- * strategies that run live and drops names the audit does not back (Momentum,
- * Swing, "Breakout-Vol"). Every claim maps to a `working` audit row or carries
+ * strategies that run live and drops the decommissioned / backtest-only names
+ * the audit does not back. Every claim maps to a `working` audit row or carries
  * the audit caveat; no invented performance/return numbers appear anywhere. The
  * Section 5 risk disclaimer is rendered in full in the footer and condensed
  * under the hero CTA.
