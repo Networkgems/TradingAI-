@@ -1,10 +1,16 @@
-// TRA-544 (TRA-529 §1–4) — the orchestration graph skeleton. Wires the tiers
-// in order:  analysts → bull/bear debate → trader synthesis → risk panel/manager
-// → AgentRecommendation. P1 runs the DETERMINISTIC FAKE agents (no LLM, zero
-// spend); the structure is the contract P2 fills with real, LlmClient-backed
-// agents. The single emitted object is an `AgentRecommendation` (§4): in
-// advisor mode it is logged + broadcast and rendered on the dashboard; only on
-// APPROVE does it carry a routable `proposedSignal`.
+// TRA-544 (TRA-529 §1–4) — the orchestration graph. Wires the tiers in order:
+// analysts → bull/bear debate → trader synthesis → risk panel/manager →
+// AgentRecommendation. The single emitted object is an `AgentRecommendation`
+// (§4): in advisor mode it is logged + broadcast and rendered on the dashboard;
+// only on APPROVE does it carry a routable `proposedSignal`.
+//
+// TRA-747 (P2) — the graph is now MODEL-AWARE. When `deps.llm` is supplied it
+// runs the REAL LlmClient-backed agents (analysts on the fast/Haiku tier, trader
+// + risk manager on the strong/Sonnet tier) and stamps the summed real `costUsd`
+// on the recommendation. With NO `llm` it runs the original DETERMINISTIC FAKES
+// (zero spend) — kept for the P3 replay harness's determinism and for unit tests.
+// The bull/bear debate stays deterministic (derived from the analyst reports) in
+// both paths; only the analysts + trader + risk manager are LLM calls.
 import {
   validateAgentRecommendation,
   type AgentRecommendation,
@@ -17,6 +23,7 @@ import { runAnalysts } from './analysts.js';
 import { runDebate } from './debate.js';
 import { runTrader, type TraderConfig } from './trader.js';
 import { runRiskPanel, type RiskPanelConfig } from './risk-panel.js';
+import { runAnalystsLlm, runTraderLlm, runRiskPanelLlm } from './llm-agents.js';
 
 export class AgentGraphError extends Error {
   constructor(message: string, readonly fieldErrors: string[] = []) {
@@ -72,14 +79,48 @@ export async function runAgentGraph(
   const now = deps.now ?? (() => Date.now());
   const startedAt = now();
 
-  // 1. Analyst tier (parallel-safe pure fakes in P1).
-  const analystReports = runAnalysts(input);
-  // 2. Bull/bear debate + judge.
-  const debateTranscript = runDebate(analystReports, deps.debateRounds ?? 2);
-  // 3. Trader synthesis.
-  const traderDecision = runTrader(input, analystReports, debateTranscript, deps.trader);
-  // 4. Risk panel + manager.
-  const riskVerdict = runRiskPanel(traderDecision, deps.risk);
+  if (deps.llm) {
+    // TRA-747 (P2) — real model calls through the LlmClient seam, cost summed.
+    // 1. Analyst tier (fast/Haiku, parallel fan-out).
+    const a = await runAnalystsLlm(input, deps.llm);
+    // 2. Bull/bear debate + judge (deterministic, derived from the reports).
+    const debate = runDebate(a.reports, deps.debateRounds ?? 2);
+    // 3. Trader synthesis (strong/Sonnet).
+    const t = await runTraderLlm(input, a.reports, debate, deps.llm);
+    // 4. Risk panel + manager (strong/Sonnet).
+    const r = await runRiskPanelLlm(t.decision, deps.llm, {
+      minRiskReward: deps.risk?.minRiskReward,
+    });
+    const costUsd = round6(a.costUsd + t.costUsd + r.costUsd);
+    return assemble(input, now, startedAt, a.reports, debate, t.decision, r.verdict, costUsd);
+  }
+
+  // No model wired — deterministic fakes (zero spend). Kept for the P3 replay
+  // harness's determinism and for unit tests.
+  const reports = runAnalysts(input);
+  const debate = runDebate(reports, deps.debateRounds ?? 2);
+  const decision = runTrader(input, reports, debate, deps.trader);
+  const verdict = runRiskPanel(decision, deps.risk);
+  return assemble(input, now, startedAt, reports, debate, decision, verdict, 0);
+}
+
+const round6 = (v: number): number => Math.round(v * 1e6) / 1e6;
+
+/**
+ * Assemble + self-validate the single AgentRecommendation. Shared by the LLM and
+ * deterministic paths so the §4 contract (APPROVE ⇒ routable signal; HOLD/VETO ⇒
+ * none) and the schema self-check are enforced identically regardless of source.
+ */
+function assemble(
+  input: AgentGraphInput,
+  now: () => number,
+  startedAt: number,
+  analystReports: AgentRecommendation['analystReports'],
+  debateTranscript: AgentRecommendation['debateTranscript'],
+  traderDecision: TraderDecision,
+  riskVerdict: AgentRecommendation['riskVerdict'],
+  costUsd: number,
+): AgentRecommendation {
 
   const routable = riskVerdict.verdict === 'APPROVE' && traderDecision.action !== 'HOLD';
   const proposedSignal = routable ? buildProposedSignal(input, traderDecision, input.asOf) : null;
@@ -96,7 +137,7 @@ export async function runAgentGraph(
     debateTranscript,
     traderDecision,
     riskVerdict,
-    costUsd: 0, // P1 stub: no LLM spend.
+    costUsd: round6(costUsd),
     latencyMs: Math.max(0, now() - startedAt),
   };
 

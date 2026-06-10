@@ -2,6 +2,7 @@ import { describe, it, expect } from 'vitest';
 import { validateAgentRecommendation, type Candle, type TradeSignal } from '@trading-app/shared';
 import { runAgentGraph } from './graph.js';
 import type { AgentGraphInput } from './types.js';
+import type { LlmClient, LlmCompletionRequest } from './llm-client.js';
 
 function candles(closes: number[], symbol = 'AAA', startTs = 1_000): Candle[] {
   return closes.map((c, i) => ({
@@ -100,5 +101,63 @@ describe('runAgentGraph (TRA-544 stub orchestration)', () => {
     nowCounter = 0;
     const reco = await runAgentGraph(input(rising()), { now: fakeNow });
     expect(reco.latencyMs).toBe(5); // second call − first call
+  });
+});
+
+describe('runAgentGraph (TRA-747 LLM path)', () => {
+  // A canned LlmClient: analysts return their requested kind, the trader BUYs,
+  // and the risk manager APPROVEs. Each call bills $0.01 so we can assert the
+  // graph SUMS real cost onto the recommendation.
+  function cannedLlm(costPerCall = 0.01): LlmClient & { calls: LlmCompletionRequest[] } {
+    const calls: LlmCompletionRequest[] = [];
+    return {
+      calls,
+      async complete(req) {
+        calls.push(req);
+        const kind = req.purpose.startsWith('analyst:') ? req.purpose.split(':')[1] : null;
+        let text: string;
+        if (kind) {
+          text = JSON.stringify({
+            kind, stance: 0.6, confidence: 0.7, horizonDays: 5,
+            keyLevels: { support: 90, resistance: 130 }, drivers: ['mom'], notes: 'ok',
+          });
+        } else if (req.purpose === 'trader') {
+          text = JSON.stringify({
+            action: 'BUY', conviction: 0.7, proposedEntry: 100, proposedStop: 98,
+            proposedTarget: 106, riskRewardRatio: 3, thesis: 'buy it', dissent: 'thin news',
+          });
+        } else {
+          text = JSON.stringify({
+            verdict: 'APPROVE', sizeMultiplier: 0.6,
+            panel: [
+              { persona: 'aggressive', sizeMultiplier: 0.6, reasons: ['x'] },
+              { persona: 'neutral', sizeMultiplier: 0.5, reasons: ['x'] },
+              { persona: 'conservative', sizeMultiplier: 0.3, reasons: ['x'] },
+            ],
+            reasons: ['ok'],
+          });
+        }
+        return { text, costUsd: costPerCall, model: req.tier === 'fast' ? 'claude-haiku-4-5' : 'claude-sonnet-4-6' };
+      },
+    };
+  }
+
+  it('routes through the LlmClient, sums real cost, and stays schema-valid', async () => {
+    const llm = cannedLlm(0.01);
+    const reco = await runAgentGraph(input(rising()), { llm });
+    expect(validateAgentRecommendation(reco)).toEqual([]);
+    // 3 analysts (fast) + trader + risk (strong) = 5 calls → $0.05.
+    expect(llm.calls).toHaveLength(5);
+    expect(llm.calls.filter((c) => c.tier === 'fast')).toHaveLength(3);
+    expect(llm.calls.filter((c) => c.tier === 'strong')).toHaveLength(2);
+    expect(reco.costUsd).toBeCloseTo(0.05, 6);
+    expect(reco.action).toBe('BUY');
+    expect(reco.verdict).toBe('APPROVE');
+    expect(reco.proposedSignal).not.toBeNull();
+  });
+
+  it('with no llm runs the deterministic path at zero cost (P3 replay determinism)', async () => {
+    const reco = await runAgentGraph(input(rising()));
+    expect(reco.costUsd).toBe(0);
   });
 });

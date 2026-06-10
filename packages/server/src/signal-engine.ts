@@ -2,10 +2,13 @@ import { OrbStrategy, BbFadeStrategy, IchimokuStrategy, TradierOptionsClient, Tr
 import type { TradierAccountBalance } from '@trading-app/engine';
 import { WATCHLIST, MANAGED_ACCOUNT_RATIO, MAX_CONSECUTIVE_LOSSES, DAILY_DRAWDOWN_HALT_PCT, OPTIONS_PER_TICKET_DOLLAR_FLOOR, OPTIONS_POSITION_CAP_RATIO, aliasWatchlistSymbol, isLiveTradierOptionsEnabled, isStockMarketOpen, perPositionCap, resolveAutoManageImportedTradierOptions, resolveDemoCostModel, resolveHoldLiveOptionsOvernight, resolveLiveTradeEquitiesTradier, resolveManagedAccountRatio, resolveMarketReviewGatesEnabled, resolveRiskPerTrade, resolveRvDtePrefs, resolveTradierOptionsCreds, validateBracket, DEFAULT_RV_DTE_MIN, DEFAULT_RV_DTE_MAX, DEFAULT_RV_DTE_TARGET, scoreNewsSentiment, aggregateSymbolSentiment, aggregateFedSentiment, aggregateStockTwitsSentiment, dedupeStockTwitsMessages, mapCuratedMessagesBySymbol, nameAliasesFor } from '@trading-app/shared';
 import type { TradeSignal, RelativeValueSignal, Sma200Signal, Candle, OptionsAccountState, SignalType, Position, OptionPosition, AccountMode, AccountSettings, AccountState, NewsItem, SymbolSentiment, SocialSentiment, StockTwitsMessage, TechnicalSignalSnapshot, TradierEnv, MarketReview, MarketReviewGates, EngineMarketReviewState, GatedStrategyNote, AgentRecommendation } from '@trading-app/shared';
-// TRA-544 (TRA-529 P1) — advisory multi-agent layer. P1 runs the deterministic
-// STUB graph (no LLM calls, zero spend); ON suspends deterministic auto-routing
-// and the engine surfaces the stub recommendations on the WS state.
-import { runAgentGraph } from '@trading-app/agents';
+// TRA-544 (TRA-529 P1) / TRA-747 (P2) — advisory multi-agent layer. ON suspends
+// deterministic auto-routing and the engine surfaces the recommendations on the
+// WS state. P2 wires the REAL LlmClient-backed agents (Haiku analysts + Sonnet
+// trader/risk) behind the `adviseSymbol` seam, which enforces the $2/user/day cap
+// and both kill switches and accounts spend — advisor-only, no path to capital.
+import type { LlmClient } from '@trading-app/agents';
+import { adviseSymbol, resolveTradingAgentsLlm } from './trading-agents-advisory.js';
 import { getLatestMarketReview } from './market-review.js';
 import { earningsInDaysSync } from './earnings-store.js';
 import { etDateString } from './scheduler.js';
@@ -525,6 +528,13 @@ export class SignalEngine {
   // stub never routes orders (gating mode is P4).
   private tradingAgentsEnabled = false;
   private latestAgentRecommendations: AgentRecommendation[] = [];
+  /**
+   * TRA-747 (P2) — the resolved advisory LlmClient, or null to run the
+   * deterministic zero-spend fallback (no Anthropic credential / env kill).
+   * Resolved lazily on the first advisory cycle and cached for the process (the
+   * credential env does not change at runtime). `undefined` = not yet resolved.
+   */
+  private agentsLlm: LlmClient | null | undefined = undefined;
   /**
    * TRA-221 — Tradier live options client. Built from per-options
    * AccountSettings (apiToken/accountId/env) when mode flips to 'live' AND the
@@ -2488,13 +2498,27 @@ export class SignalEngine {
   }
 
   /**
-   * TRA-544 — run the advisory multi-agent graph (P1 deterministic STUB, no LLM
-   * spend) for the given symbols and cache the recommendations for broadcast on
-   * the WS state. Advisor-only: the stub never routes orders (gating mode is
-   * P4). Per-symbol failures are logged and skipped so one bad symbol can't kill
-   * the tick. Risk-gated by the caller (halt / kill switch suppress it).
+   * TRA-747 (P2) — resolve the advisory LlmClient once for the process and cache
+   * it. Null when no Anthropic credential is configured or the env kill switch is
+   * set, in which case `adviseSymbol` runs the deterministic zero-spend fallback.
+   */
+  private resolveAgentsLlm(): LlmClient | null {
+    if (this.agentsLlm === undefined) this.agentsLlm = resolveTradingAgentsLlm();
+    return this.agentsLlm;
+  }
+
+  /**
+   * TRA-544 / TRA-747 — run the advisory multi-agent graph for the given symbols
+   * and cache the recommendations for broadcast on the WS state. P2 routes each
+   * symbol through `adviseSymbol`, which (a) runs the REAL Haiku/Sonnet agents when
+   * the layer is enabled, a model is wired, and the user is under the $2/user/day
+   * cap, else the deterministic zero-spend graph, (b) accounts real spend, and
+   * (c) NEVER routes to capital (advisor-only; gating is P4). Per-symbol failures
+   * are logged and skipped so one bad symbol can't kill the tick. Risk-gated by the
+   * caller (halt / kill switch suppress it).
    */
   private async runTradingAgentsAdvisory(symbols: string[]): Promise<void> {
+    const llm = this.resolveAgentsLlm();
     const recos: AgentRecommendation[] = [];
     for (const sym of symbols) {
       const candles = this.candleCache.get(sym) ?? [];
@@ -2508,7 +2532,11 @@ export class SignalEngine {
       const fundamentals =
         nextEarningsInDays !== null ? { nextEarningsInDays } : undefined;
       try {
-        recos.push(await runAgentGraph({ symbol: sym, asOf, candles, candidateSignal: null, fundamentals }));
+        const { recommendation } = await adviseSymbol(
+          { symbol: sym, asOf, candles, candidateSignal: null, fundamentals },
+          { user: this.alertUsername, enabled: this.tradingAgentsEnabled, llm },
+        );
+        recos.push(recommendation);
       } catch (err) {
         logger.warn('trading-agents advisory failed for symbol', { sym, err: String(err) });
       }

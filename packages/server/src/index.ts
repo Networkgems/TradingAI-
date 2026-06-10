@@ -41,6 +41,7 @@ import { runPremarketForAllUsers } from './premarket-watchlist.js';
 import { recordOptionChains } from './options-chain-recorder.js';
 import { buildIdeasFeed, getEntryIntent } from './options-ideas-service.js';
 import { optionsSpendStatus } from './options-spend-store.js';
+import { agentSpendAggregate } from './agent-spend-store.js';
 import { initIvRankStore } from './iv-rank-store.js';
 import { initIdeaJournal, listJournalEntries } from './options-idea-journal.js';
 import {
@@ -1420,6 +1421,16 @@ app.post('/api/options/ideas/:id/paper-enter', requireAuth, async (req, res) => 
 // active — so the CFO can review spend from the Render URL without log access.
 app.get('/api/health/options-spend', (_req, res) => {
   res.json(optionsSpendStatus());
+});
+
+// TRA-747 (TRA-529 P2 §6.5) — the advisory multi-agent layer's DAILY AGGREGATE
+// spend readout (CFO acceptance #4). Returns the absolute $/day total across ALL
+// users plus the per-user breakdown, the enforced $2/user/day cap, and the
+// re-review level. Read-only and unauthenticated by design (parity with
+// /api/health/options-spend) — it exposes only spend totals + usernames, no trade
+// detail. Wires NO capital; the layer is advisor-only in P2.
+app.get('/api/health/agent-spend', (_req, res) => {
+  res.json(agentSpendAggregate());
 });
 
 // TRA-601 (TRA-595 C6) — the forward-test report. Re-prices every surfaced idea

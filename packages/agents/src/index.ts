@@ -48,6 +48,13 @@ export {
 export { runDebate, netLean } from './debate.js';
 export { runTrader, type TraderConfig } from './trader.js';
 export { runRiskPanel, type RiskPanelConfig } from './risk-panel.js';
+// TRA-747 (P2) — the real LlmClient-backed agent tier (analysts/trader/risk).
+export {
+  runAnalystsLlm,
+  runTraderLlm,
+  runRiskPanelLlm,
+  type RiskPanelLlmConfig,
+} from './llm-agents.js';
 export {
   runAgentGraph,
   AgentGraphError,
