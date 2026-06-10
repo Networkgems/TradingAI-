@@ -10,11 +10,15 @@ interface Props {
 /**
  * Public landing / front page (logged-out route, `authScreen='landing'`).
  *
- * Copy is shipped VERBATIM from the Marketing Copy Deck §2 (TRA-752, CEO/CFO
- * signed off) — see /TRA/issues/TRA-752#document-marketing-copy-deck. Every
- * claim maps to a `working` audit row or carries the audit caveat; no invented
- * performance/return numbers appear anywhere. The Section 5 risk disclaimer is
- * rendered in full in the footer and condensed under the hero CTA.
+ * Copy is shipped from the Marketing Copy Deck (TRA-752 §2 base; CEO/CFO signed
+ * off) — see /TRA/issues/TRA-752#document-marketing-copy-deck. The §3 strategy
+ * proof strip is aligned to the audited TRA-754 Features & Strategies deck
+ * (source of truth: the TRA-753 feature audit): it lists exactly the SEVEN
+ * strategies that run live and drops names the audit does not back (Momentum,
+ * Swing, "Breakout-Vol"). Every claim maps to a `working` audit row or carries
+ * the audit caveat; no invented performance/return numbers appear anywhere. The
+ * Section 5 risk disclaimer is rendered in full in the footer and condensed
+ * under the hero CTA.
  *
  * Visual direction: TRA-765 Visual / UI Spec (single-column rhythm, F-pattern
  * hierarchy, single high-contrast primary CTA, secondary actions as text
@@ -106,19 +110,18 @@ export default function LandingPage({ onStart, onFeatures, onSignIn }: Props) {
           <div className="lp-chips">
             {[
               'Opening Range Breakout',
-              'Momentum',
+              'Relative-Value Options',
               'Bollinger-Band Fade',
-              'Breakout-Vol',
-              'Mean-Reversion',
-              'Ichimoku',
-              'Swing',
-              'Perp Shorts',
+              'Ichimoku Cloud Breakout',
+              'SMA-200 Trend Pullback',
+              'Crypto Mean-Reversion',
+              'Crypto Perpetual Shorts',
             ].map((name) => (
               <span key={name} className="lp-chip">{name}</span>
             ))}
           </div>
           <p className="lp-chips-caption">
-            Eight live strategies across equities and crypto.
+            Seven live strategies across equities and crypto.
           </p>
         </section>
 
