@@ -203,6 +203,14 @@ function activeEquityDailyLimit(settings?: AccountSettings): number {
 // chain cache. RV is the *only* options strategy enabled for stock options
 // (TRA-191 directive); ATM auto-open and OTM scans are disabled below.
 const RV_SCAN_INTERVAL_MS = 5 * 60_000;
+// TRA-776 — the relative-value options engine is OFF. The board considers this
+// strategy retired ("I thought we removed it, why is it opening options"), so
+// the auto-open path must never route a new option ticket in any mode (demo or
+// live). This is a hard kill switch on the *opening* side only: existing option
+// positions still get marks via refreshOptionMarks() and can be exited
+// normally — same containment pattern as TRA-726 (stop NEW orders, never strand
+// open ones). Flip back to `true` only if the board re-enables the RV engine.
+const RV_ENGINE_ENABLED: boolean = false;
 // TRA-451 — SMA-200 daily-bar scan cadence. The signals only change once per
 // daily close, so a 4-hour cadence is plenty: ~6 scans/day keeps the board
 // fresh without burning Yahoo quota on a per-tick (30s) daily-candle refresh.
@@ -1623,7 +1631,9 @@ export class SignalEngine {
     // existing live option positions still get marks via refreshOptionMarks().
     const skipOptionsForLiveEquityOnly = this.mode === 'live' && !this.tradierLiveOptionsEnabled;
     // TRA-544: also suspended when the agent layer has taken over (§2B).
-    if (this.isDeterministicAutoTradingEnabled() && !this.riskGovernor.isHalted() && this.rvScanner && isStockMarketOpen() && !skipOptionsForLiveEquityOnly) {
+    // TRA-776: RV_ENGINE_ENABLED is the hard kill — the relative-value engine is
+    // retired and must not open new option tickets in any mode.
+    if (RV_ENGINE_ENABLED && this.isDeterministicAutoTradingEnabled() && !this.riskGovernor.isHalted() && this.rvScanner && isStockMarketOpen() && !skipOptionsForLiveEquityOnly) {
       if (Date.now() - this.lastRvScanAt >= RV_SCAN_INTERVAL_MS) {
         this.lastRvScanAt = Date.now();
         await this.runRelativeValueScan(activeSymbols);
