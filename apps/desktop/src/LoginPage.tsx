@@ -5,9 +5,11 @@ interface Props {
   onLogin: (token: string) => void;
   onForgotPassword: () => void;
   onSignUp: () => void;
+  /** Public link to the Features & Strategies page (logged-out accessible). */
+  onFeatures: () => void;
 }
 
-export default function LoginPage({ onLogin, onForgotPassword, onSignUp }: Props) {
+export default function LoginPage({ onLogin, onForgotPassword, onSignUp, onFeatures }: Props) {
   const [username, setUsername] = useState('');
   const [password, setPassword] = useState('');
   const [error, setError] = useState('');
@@ -86,6 +88,14 @@ export default function LoginPage({ onLogin, onForgotPassword, onSignUp }: Props
             disabled={loading}
           >
             Don't have an account? Sign up
+          </button>
+          <button
+            type="button"
+            className="login-forgot-link"
+            onClick={onFeatures}
+            disabled={loading}
+          >
+            See features &amp; strategies
           </button>
         </form>
       </div>

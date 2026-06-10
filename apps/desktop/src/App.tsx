@@ -162,7 +162,7 @@ export default function App() {
     return (
       <>
         {floatingToggle}
-        <LoginPage onLogin={(t) => { setTokenChecked(true); setToken(t); }} onForgotPassword={() => setAuthScreen('forgot')} onSignUp={() => setAuthScreen('signup')} />
+        <LoginPage onLogin={(t) => { setTokenChecked(true); setToken(t); }} onForgotPassword={() => setAuthScreen('forgot')} onSignUp={() => setAuthScreen('signup')} onFeatures={() => setAuthScreen('features')} />
       </>
     );
   }

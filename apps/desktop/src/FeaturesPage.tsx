@@ -1,5 +1,3 @@
-import { RiskDisclaimer } from './LandingPage.tsx';
-
 interface Props {
   /** Single primary CTA — routes to SignUpPage ("Create your account"). */
   onStart: () => void;
@@ -12,61 +10,69 @@ interface Props {
 interface StrategyRow {
   name: string;
   what: string;
-  beta?: boolean;
+  markets: string;
 }
 
-/** Section A — strategies that run live. Copy verbatim from Copy Deck §3. */
+/** Section A — strategies that run live. Copy verbatim from the TRA-754
+ *  Features & Strategies Copy Deck §A. The internal "Audit" traceability column
+ *  is deliberately NOT rendered. */
 const STRATEGIES: StrategyRow[] = [
   {
     name: 'Opening Range Breakout (ORB)',
-    what: "Catches the day's first decisive move on equities, with a trend-regime filter so it sits out choppy markets.",
+    what: "Trades the breakout of the first 30 minutes' range, only when the trend filter confirms momentum; targets a 2:1 reward-to-risk.",
+    markets: 'Equities',
   },
   {
-    name: 'Momentum',
-    what: 'Rides established crypto trends using EMA + Donchian breakouts.',
+    name: 'Relative-Value Options Scanner',
+    what: 'A quantitative scanner that flags mispriced single-leg options using IV-skew curve fitting and no-arbitrage checks.',
+    markets: 'Stock options',
   },
   {
     name: 'Bollinger-Band Fade',
-    what: 'Fades overstretched moves back toward the mean, on equities and crypto.',
+    what: 'A mean-reversion play that fades stretched moves back toward the mean in range-bound tape.',
+    markets: 'Equities (long)',
   },
   {
-    name: 'Breakout-Vol',
-    what: 'Enters confirmed volatility breakouts in crypto.',
+    name: 'Ichimoku Cloud Breakout',
+    what: 'Enters on confirmed Ichimoku cloud breakouts.',
+    markets: 'Equities',
   },
   {
-    name: 'Mean-Reversion (crypto)',
-    what: 'Buys oversold dislocations with a tighter risk budget.',
+    name: 'SMA-200 Trend Pullback',
+    what: 'Buys pullbacks in line with the longer-term 200-day trend.',
+    markets: 'Equities',
   },
   {
-    name: 'Ichimoku',
-    what: 'Trend/momentum confirmation on equities.',
+    name: 'Crypto Mean-Reversion',
+    what: 'RSI + Bollinger mean-reversion on crypto in ranging conditions.',
+    markets: 'Crypto',
   },
   {
-    name: 'Swing',
-    what: 'Multi-day crypto positions on daily candles, no same-day exits.',
-  },
-  {
-    name: 'Perp Shorts',
-    what: 'Profits from downside on a curated perp universe, with funding and open-interest filters (1x isolated margin).',
-  },
-  {
-    name: 'SMA-200 Pullback (Signal 2)',
-    what: 'Buys equity pullbacks toward the 200-day trend after a confirmed setup.',
-    beta: true,
+    name: 'Crypto Perpetual Shorts',
+    what: 'Systematic short exposure on major crypto perpetuals.',
+    markets: 'Coinbase INTX perps · leveraged, real-money',
   },
 ];
 
 /**
  * Public "Features & Strategies" page (logged-out, `authScreen='features'`).
  *
- * Copy is shipped VERBATIM from the Marketing Copy Deck §3 (TRA-752, CEO/CFO
- * signed off) — /TRA/issues/TRA-752#document-marketing-copy-deck. Every row
- * maps to a `working` audit entry, or is explicitly labeled Beta with the
- * audit caveat. Deliberately excluded per the deck's traceability matrix:
- * reversal/MACD/scalping as live, user-selectable 1–3% risk or 1:2/1:3 toggle,
- * manual cash-out signal feed, SMA-200 reclaim (Signal 3) as live, Alpaca,
- * in-app backtesting, in-app P&L analytics. The §5 risk disclaimer is rendered
- * in full in the footer.
+ * Copy is shipped VERBATIM from the TRA-754 "Features & Strategies Page — Copy
+ * Deck + Spec" issue document (source of truth: the TRA-753 Feature Audit) —
+ * /TRA/issues/TRA-754#document-features-strategies-copy.
+ *
+ * Honesty guardrails enforced here (per the audit's ❌/⚠️ rows):
+ *  - The options scanner is described as a quantitative/relative-value scanner,
+ *    NEVER as "AI" — there is no LLM/AI surfaced to users on this page.
+ *  - No live "Reversal" strategy; no Momentum / MACD-trend / Swing as live.
+ *  - No Alpaca broker; no user-facing backtester or strategy builder.
+ *  - No user-set "1–3% risk dial" or selectable reward:risk ratio.
+ *  - No email/SMS trade alerts; equities/options default to a paper sandbox.
+ *  - No performance numbers anywhere.
+ *
+ * The internal "Audit" traceability column from the deck is NOT rendered. The
+ * four required risk disclaimers (deck §"Required risk disclaimers") render in
+ * the footer with real visual weight.
  */
 export default function FeaturesPage({ onStart, onHome, onSignIn }: Props) {
   return (
@@ -86,145 +92,130 @@ export default function FeaturesPage({ onStart, onHome, onSignIn }: Props) {
       </header>
 
       <main className="lp-features">
-        {/* ── Page header ───────────────────────────────────────────────── */}
+        {/* ── Page intro ─────────────────────────────────────────────────── */}
         <section className="lp-section lp-features-intro" aria-labelledby="fp-h1">
           <h1 id="fp-h1" className="lp-h1">
-            Everything TradeAI does today
+            Everything TradeAI does — in plain language.
           </h1>
           <p className="lp-subhead">
-            A straight list of what's live right now — no roadmap items dressed
-            up as features. Items marked Beta are live but ship off by default.
+            A complete, honest rundown of the strategies that trade your account
+            and the controls that keep them in check. If it's listed here, it's
+            live in the product.
           </p>
         </section>
 
-        {/* ── Section A — Strategies that run live ───────────────────────── */}
+        {/* ── Section A — Trading strategies (live) ──────────────────────── */}
         <section className="lp-section" aria-labelledby="fp-a">
-          <h2 id="fp-a" className="lp-section-h">Strategies that run live</h2>
-          <div className="lp-feature-table lp-ft-2col" role="table" aria-label="Strategies that run live">
+          <h2 id="fp-a" className="lp-section-h">Trading strategies (live)</h2>
+          <p className="lp-section-intro">
+            Seven rules-based strategies run live across equities and crypto.
+            Each one defines its own entries, exits, and risk.
+          </p>
+          <div className="lp-feature-table" role="table" aria-label="Trading strategies that run live">
             <div className="lp-ft-head" role="row">
               <span role="columnheader">Strategy</span>
-              <span role="columnheader">What it does for you</span>
+              <span role="columnheader">What it does</span>
+              <span role="columnheader">Markets</span>
             </div>
             {STRATEGIES.map((s) => (
               <div className="lp-ft-row" role="row" key={s.name}>
-                <span role="cell" className="lp-ft-name">
-                  {s.name}
-                  {s.beta && <span className="lp-beta">Beta</span>}
-                </span>
+                <span role="cell" className="lp-ft-name">{s.name}</span>
                 <span role="cell">{s.what}</span>
+                <span role="cell" className="lp-ft-markets">{s.markets}</span>
               </div>
             ))}
           </div>
           <p className="lp-ft-note">
-            Note on SMA-200: only the pullback signal (Signal 2) is live-wired in
-            the equity engine; the reclaim signal (Signal 3) is display-only.
+            Note on SMA-200: only the pullback variant trades live; the "reclaim"
+            signal is informational only.
           </p>
         </section>
 
-        {/* ── Section B — Risk & money management ────────────────────────── */}
+        {/* ── Section B — Risk, sizing & auto-trading ────────────────────── */}
         <section className="lp-section" aria-labelledby="fp-b">
-          <h2 id="fp-b" className="lp-section-h">Risk &amp; money management (the part most apps hide)</h2>
-          <ul className="lp-feature-list">
-            <li>
-              <strong>Only half your account is ever deployed.</strong> A hard
-              50% managed-account ratio keeps the rest in reserve.
-            </li>
-            <li>
-              <strong>Every position is capped.</strong> No single ticket
-              exceeds $150 or 15% of equity, whichever is larger.
-            </li>
-            <li>
-              <strong>Small, consistent risk per trade.</strong> A 1% default
-              risk budget sizes positions from the stop; some strategies risk
-              even less.
-            </li>
-            <li>
-              <strong>Defined reward-to-risk per strategy.</strong> Each strategy
-              carries its own reward:risk profile (for example, ORB targets
-              ~2:1).
-            </li>
-            <li>
-              <strong>Automatic drawdown brake.</strong> Hit a 10% drawdown and
-              position sizing is halved automatically.
-            </li>
-            <li>
-              <strong>Exposure caps.</strong> Total notional stays within 1x
-              managed equity, with correlation/cluster limits to avoid stacking
-              the same bet.
-            </li>
-          </ul>
-        </section>
-
-        {/* ── Section C — Live signals & monitoring ──────────────────────── */}
-        <section className="lp-section" aria-labelledby="fp-c">
-          <h2 id="fp-c" className="lp-section-h">Live signals &amp; monitoring</h2>
-          <ul className="lp-feature-list">
-            <li>
-              <strong>Live entry signals</strong> stream in real time over a
-              secure WebSocket connection.
-            </li>
-            <li>
-              <strong>Automatic exits</strong> — stop-loss, take-profit, and
-              trailing stops fire and surface in your feed.
-            </li>
-            <li>
-              <strong>25 high-volume stocks, monitored continuously</strong>,
-              re-scanned every 30 seconds with a premarket scan.
-            </li>
-          </ul>
-        </section>
-
-        {/* ── Section D — Markets you can trade ──────────────────────────── */}
-        <section className="lp-section" aria-labelledby="fp-d">
-          <h2 id="fp-d" className="lp-section-h">Markets you can trade</h2>
-          <ul className="lp-feature-list">
-            <li>
-              <strong>Crypto — live today.</strong> Coinbase spot buys/sells and
-              INTX perpetual shorts execute as real orders out of the box.
-            </li>
-            <li>
-              <strong>Equities &amp; options — live-capable, opt-in (Beta).</strong>{' '}
-              Full live order paths exist via Tradier (equity OTOCO brackets,
-              options smart limit entry/exit) but ship in demo/sandbox by
-              default; real-money trading requires your own production broker
-              credentials and an explicit opt-in.
-            </li>
-          </ul>
-        </section>
-
-        {/* ── Section E — Test before you trust ──────────────────────────── */}
-        <section className="lp-section" aria-labelledby="fp-e">
-          <h2 id="fp-e" className="lp-section-h">Test before you trust</h2>
-          <ul className="lp-feature-list">
-            <li>
-              <strong>Walk-forward backtesting</strong> with rolling
-              out-of-sample windows.
-            </li>
-            <li>
-              <strong>Monte-Carlo bootstrap</strong> stress-testing across
-              thousands of resampled paths.
-            </li>
-          </ul>
-          <p className="lp-ft-note">
-            Note: backtesting runs via the research toolchain, not yet as an
-            in-app screen.
+          <h2 id="fp-b" className="lp-section-h">Risk, sizing &amp; auto-trading</h2>
+          <p className="lp-section-intro">
+            Risk management isn't a setting you remember to turn on — it's wired
+            into the engine.
           </p>
-        </section>
-
-        {/* ── Section F — Platform ──────────────────────────────────────── */}
-        <section className="lp-section" aria-labelledby="fp-f">
-          <h2 id="fp-f" className="lp-section-h">Platform</h2>
           <ul className="lp-feature-list">
             <li>
-              <strong>Secure accounts</strong> with signed-token auth and
-              per-user isolation.
+              <strong>Trades ~half your account.</strong> Auto-trading (opt-in)
+              deploys roughly 50% of your account as a built-in capital cap.
             </li>
             <li>
-              <strong>Demo and Live modes</strong> with mode-scoped settings.
+              <strong>~1% risk per trade.</strong> Each position is sized to
+              about 1% of your managed equity.
             </li>
             <li>
-              <strong>Stocks and Crypto dashboards</strong> — watchlist,
-              signals, positions, options, news, calendar.
+              <strong>Favorable reward-to-risk by design.</strong> Strategies
+              target a 2:1 or better reward-to-risk on their trades — it's an
+              output of each strategy, not a knob you pick.
+            </li>
+            <li>
+              <strong>Daily circuit-breaker.</strong> A daily risk governor halts
+              new entries after three consecutive losses or a rough day, and
+              resets the next session.
+            </li>
+          </ul>
+        </section>
+
+        {/* ── Section C — Brokers, markets & signals ─────────────────────── */}
+        <section className="lp-section" aria-labelledby="fp-c">
+          <h2 id="fp-c" className="lp-section-h">Brokers, markets &amp; signals</h2>
+          <ul className="lp-feature-list">
+            <li>
+              <strong>Equities via Tradier.</strong> Automated bracket orders on
+              stocks — paper sandbox by default; real-money trading needs your
+              own production credentials.
+            </li>
+            <li>
+              <strong>Options via Tradier.</strong> Live long single-leg premium
+              orders — paper sandbox by default.
+            </li>
+            <li>
+              <strong>Crypto via Coinbase.</strong> Spot and perpetuals —
+              real-money only, no paper mode.
+            </li>
+            <li>
+              <strong>Live entry &amp; exit signals.</strong> The engine tells
+              you when it's getting in and when it's cashing out, and executes
+              automatically. Signals are delivered on the dashboard — no
+              email/SMS alerts.
+            </li>
+            <li>
+              <strong>25-stock volume watchlist.</strong> A curated 25-symbol
+              universe (mega-caps + index ETFs) with premarket movers blended in,
+              refreshed before the open — a curated default list, not a
+              whole-market volume scan.
+            </li>
+          </ul>
+        </section>
+
+        {/* ── Section D — Platform ───────────────────────────────────────── */}
+        <section className="lp-section" aria-labelledby="fp-d">
+          <h2 id="fp-d" className="lp-section-h">Platform</h2>
+          <ul className="lp-feature-list">
+            <li>
+              <strong>Real-time dashboard.</strong> Separate stocks and crypto
+              dashboards — watchlist, signals, positions, options, news, and
+              calendar — updating live.
+            </li>
+            <li>
+              <strong>Daily P&amp;L reports &amp; calendar.</strong> End-of-day
+              P&amp;L reporting with an in-app calendar view, reconciled against
+              your broker — in-app, with no scheduled email delivery.
+            </li>
+            <li>
+              <strong>Premarket scan &amp; market-review feed.</strong> A
+              premarket watchlist build and a market-regime review surfaced in
+              the News tab.
+            </li>
+            <li>
+              <strong>Validated by internal backtesting.</strong> Strategies are
+              pressure-tested with walk-forward and Monte-Carlo simulation before
+              they go live. There is no user-facing backtester or strategy
+              builder.
             </li>
           </ul>
         </section>
@@ -238,9 +229,9 @@ export default function FeaturesPage({ onStart, onHome, onSignIn }: Props) {
         </section>
       </main>
 
-      {/* ── Footer (full Section 5 risk disclaimer) ─────────────────────── */}
+      {/* ── Footer (four required risk disclaimers, real visual weight) ──── */}
       <footer className="lp-footer-wrap">
-        <RiskDisclaimer />
+        <FeaturesRiskDisclaimer />
         <div className="lp-footer">
           <button type="button" className="lp-brand lp-brand-btn" onClick={onHome}>
             TradeAI
@@ -256,5 +247,33 @@ export default function FeaturesPage({ onStart, onHome, onSignIn }: Props) {
         </div>
       </footer>
     </div>
+  );
+}
+
+/* ── Required risk disclaimers — TRA-754 deck, verbatim, four items ─────────── */
+function FeaturesRiskDisclaimer() {
+  return (
+    <section className="lp-risk" aria-labelledby="fp-risk-h">
+      <h2 id="fp-risk-h" className="lp-risk-h">Important risk disclosures</h2>
+      <ul className="lp-risk-list">
+        <li className="lp-risk-item">
+          <strong>Paper-first:</strong> equities &amp; options default to a paper
+          sandbox; real-money trading requires your own production broker
+          credentials.
+        </li>
+        <li className="lp-risk-item">
+          <strong>Crypto is real-money only</strong> — no paper mode.
+        </li>
+        <li className="lp-risk-item">
+          <strong>Auto-trading is opt-in</strong> and bounded by the daily risk
+          governor; results are not guaranteed.
+        </li>
+        <li className="lp-risk-item">
+          <strong>Trading involves substantial risk of loss.</strong> Backtested
+          and simulated results do not guarantee future performance. TradeAI is a
+          trading tool, not investment advice.
+        </li>
+      </ul>
+    </section>
   );
 }
