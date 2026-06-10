@@ -39,6 +39,9 @@ import {
 import { scanStocksMarket, scanCryptoMarket } from './market-scanner.js';
 import { runPremarketForAllUsers } from './premarket-watchlist.js';
 import { recordOptionChains } from './options-chain-recorder.js';
+// TRA-779 — replay smoke endpoint proves the captured chains are consumable by
+// the run-options-replay pipe. Server already depends on @trading-app/backtest.
+import { loadChainDays, runOptionsReplay, DEFAULT_REPLAY_CONFIG } from '@trading-app/backtest';
 import { buildIdeasFeed, getEntryIntent } from './options-ideas-service.js';
 import {
   getUserAnthropicApiKey,
@@ -1686,6 +1689,56 @@ app.get('/api/health/chain-capture', async (_req, res) => {
       missing: PHASE2_BASELINE.filter((s) => !baselineCovered.includes(s)),
     },
   });
+});
+
+// TRA-779 — replay smoke proof. Runs the real `run-options-replay` pure pipe
+// (`loadChainDays` → `runOptionsReplay`) against the on-disk captured chains and
+// returns the summarized buckets, proving the persisted partitions are
+// replay-consumable end-to-end on the box that actually holds the data — the
+// "smoke run on a few days of data proves the pipe" acceptance bullet, runnable
+// remotely without exec/filesystem access to the Render disk. Open like the
+// other health probes; bounded work (loads partitions once, pure replay). The
+// scanners it drives are the legacy OTM/RV ones — this proves the loader→replay
+// plumbing, not the Phase-2 strategy logic (that lands in TRA-781).
+app.get('/api/health/options-replay-smoke', async (_req, res) => {
+  try {
+    const days = await loadChainDays(CHAIN_RECORD_OUT_DIR);
+    if (days.length === 0) {
+      res.json({
+        issue: 'TRA-779',
+        ok: false,
+        reason: 'no_chain_partitions',
+        outDir: CHAIN_RECORD_OUT_DIR,
+      });
+      return;
+    }
+    const symbolsCount = new Set(days.flatMap((d) => Array.from(d.bySymbol.keys()))).size;
+    const buckets = runOptionsReplay(days, DEFAULT_REPLAY_CONFIG);
+    res.json({
+      issue: 'TRA-779',
+      ok: true,
+      outDir: CHAIN_RECORD_OUT_DIR,
+      daysReplayed: days.length,
+      symbolsCount,
+      firstDate: days[0].date,
+      lastDate: days[days.length - 1].date,
+      buckets: buckets.map((b) => ({
+        startingEquity: b.startingEquity,
+        trades: b.trades,
+        winRate: b.winRate,
+        totalPnl: b.totalPnl,
+        pnlPct: b.pnlPct,
+        maxDrawdown: b.maxDrawdown,
+        skippedZeroSize: b.skippedZeroSize,
+      })),
+    });
+  } catch (err) {
+    res.status(500).json({
+      issue: 'TRA-779',
+      ok: false,
+      reason: err instanceof Error ? err.message : String(err),
+    });
+  }
 });
 
 // ── Auth endpoints ────────────────────────────────────────────────────────────
