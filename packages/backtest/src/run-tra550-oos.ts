@@ -348,6 +348,53 @@ function reportKeyAvailability(): { reachable: boolean; summary: string } {
   return { reachable, summary };
 }
 
+// ─── transport resilience (TRA-755) ─────────────────────────────────────────
+// The only Anthropic credential reachable in LeadDev's runtime is a Claude-Max
+// subscription OAuth token (TRA-714 path), whose rolling rate limit is shared
+// with the live agent session, so the graph's call burst 429s. This wrapper is
+// PURELY transport-level: it serializes calls, spaces them by `minGapMs`, and
+// retries 429s with exponential backoff. It does NOT touch prompts, models,
+// scoring, or the verdict — the methodology is identical to the base driver.
+const sleep = (ms: number): Promise<void> => new Promise((r) => setTimeout(r, ms));
+
+class ThrottledLlmClient implements LlmClient {
+  private chain: Promise<unknown> = Promise.resolve();
+  constructor(
+    private readonly inner: LlmClient,
+    private readonly minGapMs = 4000,
+    private readonly maxRetries = 6,
+  ) {}
+  complete(req: Parameters<LlmClient['complete']>[0]): ReturnType<LlmClient['complete']> {
+    const run = this.chain.then(() => this.exec(req));
+    this.chain = run.then(
+      () => undefined,
+      () => undefined,
+    );
+    return run;
+  }
+  private async exec(
+    req: Parameters<LlmClient['complete']>[0],
+  ): ReturnType<LlmClient['complete']> {
+    await sleep(this.minGapMs);
+    for (let attempt = 0; ; attempt++) {
+      try {
+        return await this.inner.complete(req);
+      } catch (e) {
+        const status = (e as { status?: number } | null)?.status;
+        if (status === 429 && attempt < this.maxRetries) {
+          const wait = Math.min(60_000, 15_000 * 2 ** attempt);
+          console.log(
+            `[tra550] 429 on ${req.purpose ?? req.tier}; backoff ${wait}ms (retry ${attempt + 1}/${this.maxRetries})`,
+          );
+          await sleep(wait);
+          continue;
+        }
+        throw e;
+      }
+    }
+  }
+}
+
 async function main(): Promise<void> {
   const argv = process.argv.slice(2);
   const smoke = argv.includes('--smoke');
@@ -372,8 +419,8 @@ async function main(): Promise<void> {
   let mode: RunMode;
   let llm: LlmClient | null = null;
   if (execute) {
-    llm = createAnthropicLlmClientFromEnv();
-    if (!llm) {
+    const baseLlm = createAnthropicLlmClientFromEnv();
+    if (!baseLlm) {
       console.error(
         '[tra550] --execute requested but no Anthropic credential is reachable. ' +
           'Aborting before any spend. This is a real blocker for QuantTrader/CFO.',
@@ -381,8 +428,12 @@ async function main(): Promise<void> {
       process.exit(2);
       return;
     }
+    // TRA-755: throttle + 429-backoff for the Max-subscription rolling limit.
+    llm = new ThrottledLlmClient(baseLlm);
     mode = 'live-anthropic';
-    console.log('[tra550] --execute: REAL Anthropic run — this incurs LLM spend.');
+    console.log(
+      '[tra550] --execute: REAL Anthropic run — this incurs LLM spend (throttled transport for the OAuth rate limit).',
+    );
   } else {
     mode = 'smoke-deterministic';
     console.log('[tra550] --smoke: deterministic fakes, zero LLM spend.');
