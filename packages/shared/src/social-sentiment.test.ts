@@ -120,6 +120,33 @@ describe('aggregateStockTwitsSentiment', () => {
     expect(r.bullishCount).toBe(1);
   });
 
+  it('counts curated tagged messages that contributed to the score (TRA-745)', () => {
+    const curatedBull: StockTwitsMessage = {
+      id: nextId++, createdAt: minutesAgo(5), sentiment: 'Bullish', curated: true,
+    };
+    const curatedUntagged: StockTwitsMessage = {
+      id: nextId++, createdAt: minutesAgo(5), sentiment: null, curated: true,
+    };
+    const r = aggregateStockTwitsSentiment({
+      symbol: 'AAPL',
+      messages: [curatedBull, curatedUntagged, bull(5), bear(5)],
+      now: NOW,
+    });
+    // Only the tagged curated message counts; the untagged curated one is buzz only.
+    expect(r.curatedCount).toBe(1);
+    expect(r.taggedCount).toBe(3);
+    expect(r.messageCount).toBe(4);
+  });
+
+  it('reports zero curatedCount when no curated lane contributed', () => {
+    const r = aggregateStockTwitsSentiment({
+      symbol: 'AAPL',
+      messages: [bull(5), bear(5)],
+      now: NOW,
+    });
+    expect(r.curatedCount).toBe(0);
+  });
+
   it('reports freshness as the age of the newest tagged message', () => {
     const r = aggregateStockTwitsSentiment({
       symbol: 'AAPL',

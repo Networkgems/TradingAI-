@@ -70,6 +70,7 @@ export function aggregateStockTwitsSentiment(opts: AggregateSocialOptions): Soci
   let weightSum = 0;
   let bullishCount = 0;
   let bearishCount = 0;
+  let curatedCount = 0;
   let messageCount = 0;
   let newestTaggedAgeMin = Number.POSITIVE_INFINITY;
 
@@ -86,6 +87,7 @@ export function aggregateStockTwitsSentiment(opts: AggregateSocialOptions): Soci
     weightSum += weight;
     if (polarity > 0) bullishCount += 1;
     else bearishCount += 1;
+    if (m.curated) curatedCount += 1;
     if (ageMinutes < newestTaggedAgeMin) newestTaggedAgeMin = ageMinutes;
   }
 
@@ -110,6 +112,7 @@ export function aggregateStockTwitsSentiment(opts: AggregateSocialOptions): Soci
     bullishCount,
     bearishCount,
     taggedCount,
+    curatedCount,
     messageCount,
     freshnessMinutes,
     tilt,

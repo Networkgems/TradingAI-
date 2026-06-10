@@ -10,6 +10,8 @@ import { useTableSort, sortRows, SortableTH } from '../../lib/sort.tsx';
 import { getStockWatchSortValue } from '../../lib/stockSort';
 import type { StockWatchSortKey } from '../../lib/stockSort';
 import type { SymbolState } from '../../types/app';
+import { useSocialSentiment } from '../../hooks/useSocialSentiment';
+import { SocialSentimentBadge } from './SocialSentimentBadge';
 
 export function StockWatchlistPanel({ token, symbols }: { token: string; symbols: SymbolState[] }) {
   const [watchlistInput, setWatchlistInput] = useState('');
@@ -19,6 +21,8 @@ export function StockWatchlistPanel({ token, symbols }: { token: string; symbols
   const watchlistSort = useTableSort<StockWatchSortKey>('changePct', 'desc');
   const scanStatusTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
   const toast = useToast();
+  // TRA-745 — per-symbol StockTwits social-sentiment read (crowd + curated lane).
+  const social = useSocialSentiment(token, symbols.map(s => s.symbol));
 
   async function addToWatchlist() {
     const sym = watchlistInput.trim().toUpperCase();
@@ -113,6 +117,7 @@ export function StockWatchlistPanel({ token, symbols }: { token: string; symbols
             <SortableTH label="Change" sortKey="change" sort={watchlistSort.sort} onSort={watchlistSort.onSort} />
             <SortableTH label="Change %" sortKey="changePct" sort={watchlistSort.sort} onSort={watchlistSort.onSort} />
             <SortableTH label="Volume" sortKey="volume" sort={watchlistSort.sort} onSort={watchlistSort.onSort} />
+            <th title="StockTwits crowd + curated-analyst social tilt (24h)">Social</th>
             <SortableTH label="Updated" sortKey="updated" sort={watchlistSort.sort} onSort={watchlistSort.onSort} />
             <th></th>
           </tr>
@@ -125,6 +130,12 @@ export function StockWatchlistPanel({ token, symbols }: { token: string; symbols
               <td className={s.lastUpdated === 0 ? 'muted' : s.change >= 0 ? 'green' : 'red'}>{s.lastUpdated === 0 ? '—' : fmtDollar(s.change)}</td>
               <td className={s.lastUpdated === 0 ? 'muted' : s.changePct >= 0 ? 'green' : 'red'}>{s.lastUpdated === 0 ? '—' : fmtPct(s.changePct)}</td>
               <td>{s.lastUpdated === 0 ? '—' : (s.volume / 1_000_000).toFixed(1) + 'M'}</td>
+              <td className="social-td">
+                <SocialSentimentBadge
+                  social={social[s.symbol]?.social ?? null}
+                  note={social[s.symbol]?.note}
+                />
+              </td>
               <td className="muted">{quoteStatusLabel(s)}</td>
               <td><button className="watchlist-remove-btn" onClick={() => removeFromWatchlist(s.symbol)} title="Remove">&#xd7;</button></td>
             </tr>

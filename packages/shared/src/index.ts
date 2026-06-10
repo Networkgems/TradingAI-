@@ -2289,6 +2289,13 @@ export interface SocialSentiment {
   bearishCount: number;
   /** bullishCount + bearishCount — messages carrying a directional tag. */
   taggedCount: number;
+  /**
+   * TRA-603/TRA-745 — count of curated (followed-account) tagged messages that
+   * contributed to the score. `> 0` means the higher-weight analyst lane moved
+   * `netScore`, so a consumer can surface a "curated" marker rather than reading
+   * the number as pure anonymous crowd. Subset of `taggedCount`.
+   */
+  curatedCount: number;
   /** Total messages seen, tagged or not — a raw social-buzz/volume proxy. */
   messageCount: number;
   /** Age of the newest tagged message, in minutes. */
