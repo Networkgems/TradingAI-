@@ -287,14 +287,21 @@ export class MarketScheduler {
         }
       }
 
-      // TRA-380 — 3:55 PM ET option-chain recorder hook, 5 min before the
-      // closing bell. Gated on market days so weekends + NYSE holidays are
-      // skipped. The callback runs the TRA-376 recorder, writing one date
-      // partition per trading day for the replay backtest harness.
-      if (hour === 15 && minute === 55) {
+      // TRA-380 / TRA-779 — option-chain recorder hook. Fire once per market
+      // day at OR AFTER 3:55 PM ET (through 8 PM ET) rather than demanding the
+      // exact 15:55 minute. An EOD chain snapshot is a daily artifact, not a
+      // time-critical market action, so a server that was restarting/redeploying
+      // across 15:55 ET — but is up any time later that afternoon/evening — still
+      // captures the day instead of silently dropping it. This is the same
+      // resilience the EOD archive hook (hour >= 21) already has. The old
+      // exact-minute gate is the likely reason ~30 daily partitions never
+      // accumulated for the replay harness (TRA-779): any redeploy or GC pause
+      // across that single minute lost the whole trading day with no catch-up.
+      // Capturing at/after the 4 PM close is fine (settled EOD quotes/greeks).
+      if ((hour === 15 && minute >= 55) || (hour >= 16 && hour < 20)) {
         if (cfg.onChainRecord && isMarketDay(date) && this.lastChainRecordDate !== todayKey) {
           this.lastChainRecordDate = todayKey;
-          log.info('option-chain recorder trigger fired', { date: todayKey });
+          log.info('option-chain recorder trigger fired', { date: todayKey, etHour: hour, etMinute: minute });
           runScheduled('option-chain recorder', cfg.onChainRecord);
         }
       }

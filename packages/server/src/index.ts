@@ -1163,19 +1163,35 @@ async function runChainRecord(): Promise<void> {
   }
   const accountId = (process.env['TRADIER_ACCOUNT_ID'] ?? '').trim() || 'recorder-readonly';
   const client = new TradierOptionsClient(apiToken, accountId, 'production');
-  const symbols = [...WATCHLIST];
+
+  // TRA-779 — the capture universe defaults to the full equities WATCHLIST
+  // (a superset of the Phase-2 baseline names AAPL/MSFT/NVDA/AMD/AVGO/GOOGL/
+  // AMZN/META), but `CHAINS_WATCHLIST` can pin an explicit comma-separated list
+  // (e.g. the confirmed Phase-2 12-name universe) without a code deploy.
+  const rawUniverse = (process.env['CHAINS_WATCHLIST'] ?? '').trim();
+  const symbols = rawUniverse
+    ? rawUniverse.split(',').map((s) => s.trim().toUpperCase()).filter(Boolean)
+    : [...WATCHLIST];
+
+  // TRA-779 — DTE floor lowered 14 → 7 so the nearest weeklies are captured for
+  // short-dated call-debit-spread legs; the 21–35 DTE 0.25-delta puts and the
+  // 60-day ceiling (OTM+RV replay union) stay covered. Widening is additive for
+  // the existing replay scanners. `CHAINS_MIN_DTE` / `CHAINS_MAX_DTE` override.
+  const minDteDays = Number((process.env['CHAINS_MIN_DTE'] ?? '7').trim()) || 7;
+  const maxDteDays = Number((process.env['CHAINS_MAX_DTE'] ?? '60').trim()) || 60;
 
   log.info('chain-recorder starting', {
     symbols: symbols.length,
-    dte: '[14,60]',
+    universeSource: rawUniverse ? 'CHAINS_WATCHLIST' : 'WATCHLIST',
+    dte: `[${minDteDays},${maxDteDays}]`,
     outDir: CHAIN_RECORD_OUT_DIR,
   });
   const result = await recordOptionChains({
     symbols,
     client,
     outDir: CHAIN_RECORD_OUT_DIR,
-    minDteDays: 14,
-    maxDteDays: 60,
+    minDteDays,
+    maxDteDays,
   });
   const written = result.symbols.filter((s) => s.outcome === 'written').length;
   const errored = result.symbols.filter((s) => s.outcome === 'error');
@@ -1588,6 +1604,87 @@ app.get('/api/health/storage', async (_req, res) => {
     userCount: getAllUsers().length,
     userContextCount: getAllUserContexts().length,
     processStart: new Date(Date.now() - process.uptime() * 1000).toISOString(),
+  });
+});
+
+// TRA-779 — option-chain capture liveness. Open (no auth, like the other
+// health probes) so the Phase-2 owner can verify capture on any deploy without
+// a session: confirms the Tradier token is configured, counts the accumulated
+// daily partitions toward the 30-trading-day clock, and reports the latest
+// partition's universe coverage. Reads only the cheap per-date `_meta.json` +
+// the partition file list — it never loads full chains.
+app.get('/api/health/chain-capture', async (_req, res) => {
+  const DATE_PARTITION = /^\d{4}-\d{2}-\d{2}$/;
+  const PHASE2_BASELINE = ['AAPL', 'MSFT', 'NVDA', 'AMD', 'AVGO', 'GOOGL', 'AMZN', 'META'];
+  const outDir = CHAIN_RECORD_OUT_DIR;
+  const tokenConfigured = (process.env['TRADIER_API_TOKEN'] ?? '').trim().length > 0;
+  const rawUniverse = (process.env['CHAINS_WATCHLIST'] ?? '').trim();
+  const configuredUniverse = rawUniverse
+    ? rawUniverse.split(',').map((s) => s.trim().toUpperCase()).filter(Boolean)
+    : [...WATCHLIST];
+
+  let dates: string[] = [];
+  try {
+    dates = (await readdir(outDir)).filter((d) => DATE_PARTITION.test(d)).sort();
+  } catch {
+    dates = [];
+  }
+
+  let latest:
+    | { date: string; written: number | null; symbolsWritten: string[]; recordedAt: number | null; dteWindow: [number | null, number | null] }
+    | null = null;
+  if (dates.length > 0) {
+    const last = dates[dates.length - 1];
+    const dir = join(outDir, last);
+    let symbolsWritten: string[] = [];
+    try {
+      symbolsWritten = (await readdir(dir))
+        .filter((f) => f.endsWith('.json') && f !== '_meta.json')
+        .map((f) => f.replace(/\.json$/i, '').toUpperCase())
+        .sort();
+    } catch {
+      symbolsWritten = [];
+    }
+    let written: number | null = symbolsWritten.length;
+    let recordedAt: number | null = null;
+    let dteWindow: [number | null, number | null] = [null, null];
+    try {
+      const meta = JSON.parse(await readFile(join(dir, '_meta.json'), 'utf-8')) as {
+        written?: number;
+        recordedAt?: number;
+        minDteDays?: number;
+        maxDteDays?: number;
+      };
+      if (typeof meta.written === 'number') written = meta.written;
+      if (typeof meta.recordedAt === 'number') recordedAt = meta.recordedAt;
+      dteWindow = [meta.minDteDays ?? null, meta.maxDteDays ?? null];
+    } catch {
+      // _meta.json absent/corrupt — fall back to the file-list count above.
+    }
+    latest = { date: last, written, symbolsWritten, recordedAt, dteWindow };
+  }
+
+  const baselineCovered = latest
+    ? PHASE2_BASELINE.filter((s) => latest!.symbolsWritten.includes(s))
+    : [];
+
+  res.json({
+    issue: 'TRA-779',
+    outDir,
+    tokenConfigured,
+    capturing: tokenConfigured && dates.length > 0,
+    tradingDaysCaptured: dates.length,
+    progressToThirtyDays: { captured: dates.length, target: 30 },
+    firstDate: dates[0] ?? null,
+    lastDate: dates[dates.length - 1] ?? null,
+    universeSource: rawUniverse ? 'CHAINS_WATCHLIST' : 'WATCHLIST',
+    configuredUniverse,
+    latest,
+    phase2BaselineCoverage: {
+      required: PHASE2_BASELINE,
+      covered: baselineCovered,
+      missing: PHASE2_BASELINE.filter((s) => !baselineCovered.includes(s)),
+    },
   });
 });
 
