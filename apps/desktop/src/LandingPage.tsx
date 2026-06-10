@@ -77,10 +77,9 @@ export default function LandingPage({ onStart, onFeatures, onSignIn }: Props) {
               <h2 className="lp-card-h">Risk-first by design</h2>
               <p className="lp-card-lead">Keep losses small by default.</p>
               <p className="lp-card-b">
-                The engine deploys only 50% of your account, caps each position
-                at $150 or 15% of equity (whichever is larger), and applies a
-                default 1% risk-per-trade budget with an automatic drawdown
-                brake.
+                The engine deploys only 50% of your account, sizes each position
+                to about 1% of your managed equity, and a daily risk governor
+                halts new entries after three consecutive losses or a rough day.
               </p>
             </article>
             <article className="lp-card">
