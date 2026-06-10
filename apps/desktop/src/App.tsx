@@ -2,6 +2,8 @@ import { useEffect, useRef, useState } from 'react';
 import LoginPage from './LoginPage.tsx';
 import ForgotPasswordPage from './ForgotPasswordPage.tsx';
 import SignUpPage from './SignUpPage.tsx';
+import LandingPage from './LandingPage.tsx';
+import FeaturesPage from './FeaturesPage.tsx';
 import { HTTP_URL } from './server-url';
 import { ThemeToggle, useTheme } from './components/ThemeToggle';
 import { DashboardSelector } from './components/DashboardSelector';
@@ -16,7 +18,7 @@ import './index.css';
 const IDLE_TIMEOUT_MS = 30 * 60 * 1000;
 const IDLE_WARN_MS = 2 * 60 * 1000;
 
-type AuthScreen = 'login' | 'forgot' | 'signup';
+type AuthScreen = 'landing' | 'features' | 'login' | 'forgot' | 'signup';
 
 export default function App() {
   const { theme, toggleTheme } = useTheme();
@@ -24,7 +26,7 @@ export default function App() {
   const [token, setToken] = useState<string | null>(() => localStorage.getItem('auth_token'));
   const [tokenChecked, setTokenChecked] = useState<boolean>(() => !localStorage.getItem('auth_token'));
   const [authScreen, setAuthScreen] = useState<AuthScreen>(() =>
-    new URLSearchParams(window.location.search).has('reset_code') ? 'forgot' : 'login'
+    new URLSearchParams(window.location.search).has('reset_code') ? 'forgot' : 'landing'
   );
   const [appMode, setAppMode] = useState<null | 'stocks' | 'crypto'>(() => {
     const stored = localStorage.getItem('tradingMode');
@@ -117,6 +119,30 @@ export default function App() {
   );
 
   if (!token) {
+    if (authScreen === 'landing') {
+      return (
+        <>
+          {floatingToggle}
+          <LandingPage
+            onStart={() => setAuthScreen('signup')}
+            onFeatures={() => setAuthScreen('features')}
+            onSignIn={() => setAuthScreen('login')}
+          />
+        </>
+      );
+    }
+    if (authScreen === 'features') {
+      return (
+        <>
+          {floatingToggle}
+          <FeaturesPage
+            onStart={() => setAuthScreen('signup')}
+            onHome={() => setAuthScreen('landing')}
+            onSignIn={() => setAuthScreen('login')}
+          />
+        </>
+      );
+    }
     if (authScreen === 'forgot') {
       return (
         <>
