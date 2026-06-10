@@ -59,7 +59,7 @@ export default function LandingPage({ onStart, onFeatures, onSignIn }: Props) {
             </div>
             <p className="lp-cta-note">Starts in demo mode. Real-money trading is opt-in.</p>
             <p className="lp-cta-fineprint">
-              Trading involves substantial risk of loss. Not financial advice. Demo by default.
+              Trading involves substantial risk of loss. Not financial advice. Equities &amp; options start in demo; crypto is real-money only.
             </p>
           </div>
           <DashboardMock />
@@ -200,8 +200,9 @@ export function RiskDisclaimer() {
         equities, options, and crypto involves substantial risk, including the
         possible loss of your entire investment. Automated strategies can and do
         lose money; past or simulated performance does not guarantee future
-        results. TradeAI starts in demo mode — real-money trading is opt-in and
-        requires your own broker credentials. You are solely responsible for
+        results. Equities and options start in demo mode — real-money trading is
+        opt-in and requires your own production broker credentials. Crypto is
+        real-money only and has no paper mode. You are solely responsible for
         your trading decisions. No representation is made that any account will
         or is likely to achieve profits.
       </p>
