@@ -30,6 +30,7 @@ export {
 export {
   AnthropicLlmClient,
   createAnthropicLlmClientFromEnv,
+  describeAnthropicCredFromEnv,
   modelAcceptsTemperature,
   DEFAULT_TIER_MODELS,
   DEFAULT_MODEL_PRICING,

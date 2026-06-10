@@ -217,3 +217,31 @@ export function createAnthropicLlmClientFromEnv(
 
   return new AnthropicLlmClient({ client, models });
 }
+
+/**
+ * Non-secret description of which Anthropic credential path the env resolves to,
+ * for surfacing in diagnostic notes (TRA-714). Returns the auth mode and the
+ * leading **type prefix** of the resolved credential (e.g. `sk-ant-api03` for a
+ * console API key, `sk-ant-oat01` for a subscription OAuth token) — the prefix
+ * identifies the credential *kind* without exposing the secret body. Also flags
+ * whether a stale OAuth token is present alongside an API key, which is the
+ * classic cause of an unexpected 429 (an empty/whitespace API-key value silently
+ * falls back to the rate-limited subscription token).
+ */
+export function describeAnthropicCredFromEnv(env: NodeJS.ProcessEnv = process.env): {
+  mode: 'apiKey' | 'oauth' | 'none';
+  prefix: string;
+  apiKeyPresent: boolean;
+  oauthPresent: boolean;
+} {
+  const apiKey = (env['ANTHROPIC_API_KEY'] ?? env['CLAUDE_API_KEY'] ?? '').trim();
+  const authToken = (env['ANTHROPIC_AUTH_TOKEN'] ?? env['CLAUDE_CODE_OAUTH_TOKEN'] ?? '').trim();
+  const apiKeyPresent = apiKey.length > 0;
+  const oauthPresent = authToken.length > 0;
+  const resolved = apiKey || authToken;
+  const mode: 'apiKey' | 'oauth' | 'none' = apiKey ? 'apiKey' : authToken ? 'oauth' : 'none';
+  // The prefix is everything up to (and including) the credential-type marker,
+  // e.g. `sk-ant-api03` / `sk-ant-oat01`; cap at 12 chars so no secret leaks.
+  const prefix = resolved ? resolved.slice(0, 12) : '';
+  return { mode, prefix, apiKeyPresent, oauthPresent };
+}

@@ -12,6 +12,7 @@ import { type OptionChainRow, type TradierOptionsClient, daysUntil } from '@trad
 import {
   runOptionsResearch,
   createAnthropicLlmClientFromEnv,
+  describeAnthropicCredFromEnv,
   type OptionsResearchCache,
   type OptionsResearchResult,
   type DayTradingGuardrail,
@@ -267,8 +268,16 @@ export async function buildIdeasFeed(opts: BuildIdeasOptions): Promise<OptionsId
     // failure (e.g. an Anthropic credential that is read but rejected at call
     // time) behind a transient-looking message, making it undiagnosable from
     // outside. The reason is truncated and carries no secrets.
+    //
+    // Also surface WHICH credential path resolved (TRA-714): a 429 on the API
+    // key means the key itself is rate-limited; a 429 while still on `oauth`
+    // means an empty/whitespace ANTHROPIC_API_KEY silently fell back to the
+    // rate-limited Max subscription token. The prefix (`sk-ant-api03` /
+    // `sk-ant-oat01`) identifies the credential kind without exposing the secret.
+    const cred = describeAnthropicCredFromEnv();
+    const credNote = ` [auth=${cred.mode} prefix=${cred.prefix || 'n/a'} apiKeyPresent=${cred.apiKeyPresent} oauthPresent=${cred.oauthPresent}]`;
     return nonLive(
-      `AI Options Ideas could not complete the research pass this cycle: ${reason.slice(0, 240)}`,
+      `AI Options Ideas could not complete the research pass this cycle: ${reason.slice(0, 200)}${credNote}`,
     );
   }
 
