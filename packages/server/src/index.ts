@@ -4195,7 +4195,10 @@ app.get('/api/health/quotes', async (_req, res) => {
   const now = Date.now();
   if (quotesHealthCache && now - quotesHealthCache.ts < QUOTES_HEALTH_TTL_MS) {
     const p = quotesHealthCache.payload;
-    res.status(p['ok'] ? 200 : 502).json({ ...p, cached: true });
+    // TRA-783 — a diagnostics endpoint that produced a payload returns HTTP 200;
+    // per-component health (ok/stocksOk/cryptoOk) lives in the body. A crypto-egress
+    // timeout (Coinbase IP-blocked on Render) must not page stock-only monitors.
+    res.status(200).json({ ...p, cached: true });
     return;
   }
   if (!quotesHealthInFlight) {
@@ -4214,7 +4217,8 @@ app.get('/api/health/quotes', async (_req, res) => {
       new Promise<null>((resolve) => setTimeout(() => resolve(null), QUOTES_HEALTH_BUILD_TIMEOUT_MS)),
     ]);
     if (payload) {
-      res.status(payload['ok'] ? 200 : 502).json(payload);
+      // TRA-783 — payload built successfully: HTTP 200, component flags in the body.
+      res.status(200).json(payload);
       return;
     }
     // Build is taking too long — serve the last good snapshot rather than hold
@@ -4222,16 +4226,20 @@ app.get('/api/health/quotes', async (_req, res) => {
     // refreshes the cache for the next caller.
     if (quotesHealthCache) {
       const p = quotesHealthCache.payload;
-      res.status(p['ok'] ? 200 : 502).json({ ...p, stale: true, note: 'probe build in progress' });
+      // TRA-783 — stale snapshot is still a produced payload: HTTP 200.
+      res.status(200).json({ ...p, stale: true, note: 'probe build in progress' });
       return;
     }
+    // No payload at all yet — could not assess. Keep 503 for the "still building" case.
     res.status(503).json({ ok: false, building: true, ts: new Date().toISOString() });
   } catch (err: unknown) {
     if (quotesHealthCache) {
       const p = quotesHealthCache.payload;
-      res.status(p['ok'] ? 200 : 502).json({ ...p, stale: true, buildError: err instanceof Error ? err.message : String(err) });
+      // TRA-783 — we still have a produced payload to serve: HTTP 200, error in body.
+      res.status(200).json({ ...p, stale: true, buildError: err instanceof Error ? err.message : String(err) });
       return;
     }
+    // Hard build error with no payload at all — could not assess: keep 502.
     res.status(502).json({ ok: false, error: err instanceof Error ? err.message : String(err), ts: new Date().toISOString() });
   }
 });
