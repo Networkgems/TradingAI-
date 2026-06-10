@@ -450,6 +450,140 @@ function IdeaCard({
   );
 }
 
+// ── Anthropic console API-key setup (TRA-714) ────────────────────────────────
+// The "another way" for a user with no server-env access (e.g. a Claude Max
+// plan): paste a pay-as-you-go console API key (`sk-ant-api03…`) right here and
+// it is stored with your account on the server's persistent disk — no Render
+// access required. A Claude subscription token will NOT work (Anthropic
+// rate-limits it for server use); the server rejects it with a clear message.
+function AnthropicKeySetup({ token, onSaved }: { token: string; onSaved: () => void }) {
+  const [status, setStatus] = useState<{ present: boolean; prefix: string } | null>(null);
+  const [value, setValue] = useState('');
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+
+  async function refresh() {
+    try {
+      const r = await fetch(`${HTTP_URL}/api/options/anthropic-key`, {
+        headers: { Authorization: `Bearer ${token}` },
+      });
+      if (r.ok) setStatus((await r.json()) as { present: boolean; prefix: string });
+    } catch {
+      /* best-effort status read */
+    }
+  }
+
+  useEffect(() => {
+    void refresh();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [token]);
+
+  async function save() {
+    setBusy(true);
+    setError(null);
+    try {
+      const r = await fetch(`${HTTP_URL}/api/options/anthropic-key`, {
+        method: 'PUT',
+        headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' },
+        body: JSON.stringify({ apiKey: value.trim() }),
+      });
+      if (!r.ok) {
+        const body = (await r.json().catch(() => ({}))) as { error?: string };
+        setError(body.error ?? `Could not save the key (HTTP ${r.status}).`);
+        return;
+      }
+      setValue('');
+      await refresh();
+      onSaved();
+    } catch {
+      setError('Could not reach the server to save the key.');
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function remove() {
+    setBusy(true);
+    setError(null);
+    try {
+      await fetch(`${HTTP_URL}/api/options/anthropic-key`, {
+        method: 'DELETE',
+        headers: { Authorization: `Bearer ${token}` },
+      });
+      await refresh();
+      onSaved();
+    } catch {
+      setError('Could not reach the server to remove the key.');
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  return (
+    <div
+      style={{
+        border: '1px solid var(--border, rgba(255,255,255,0.14))',
+        borderRadius: '8px',
+        padding: '0.75rem 0.9rem',
+        display: 'flex',
+        flexDirection: 'column',
+        gap: '0.5rem',
+        fontSize: '0.82rem',
+      }}
+    >
+      <strong style={{ fontSize: '0.86rem' }}>Activate AI Ideas with your own Anthropic key</strong>
+      <p style={{ margin: 0, lineHeight: 1.4, color: 'var(--muted)' }}>
+        Paste a pay-as-you-go console API key (starts with <code>sk-ant-api03…</code>) from{' '}
+        <a href="https://console.anthropic.com/settings/keys" target="_blank" rel="noreferrer">
+          console.anthropic.com → API keys
+        </a>
+        . It is stored with your account — no server/Render access needed. A Claude Pro/Max
+        subscription token will <strong>not</strong> work here (Anthropic rate-limits it for server use).
+        This feature is hard-capped at $2/month.
+      </p>
+      {status?.present && (
+        <div className="green" style={{ fontSize: '0.78rem' }}>
+          ✓ A console key is installed ({status.prefix}…). Replace it below, or remove it to fall back to
+          the server credential.
+        </div>
+      )}
+      <div style={{ display: 'flex', gap: '0.5rem', flexWrap: 'wrap', alignItems: 'center' }}>
+        <input
+          type="password"
+          value={value}
+          placeholder="sk-ant-api03-…"
+          onChange={(e) => setValue(e.target.value)}
+          autoComplete="off"
+          spellCheck={false}
+          style={{
+            flex: 1,
+            minWidth: '220px',
+            padding: '0.4rem 0.6rem',
+            borderRadius: '6px',
+            border: '1px solid var(--border, rgba(255,255,255,0.18))',
+            background: 'var(--panel, rgba(255,255,255,0.03))',
+            color: 'var(--text, inherit)',
+            fontFamily: 'monospace',
+          }}
+        />
+        <button className="btn-primary" disabled={busy || value.trim().length === 0} onClick={save}>
+          {busy ? 'Saving…' : status?.present ? 'Replace key' : 'Save key'}
+        </button>
+        {status?.present && (
+          <button className="btn-secondary" disabled={busy} onClick={remove}>
+            Remove
+          </button>
+        )}
+      </div>
+      {error && (
+        <div className="red" style={{ fontSize: '0.78rem', lineHeight: 1.35 }}>
+          {error}
+        </div>
+      )}
+    </div>
+  );
+}
+
 // ── Panel ────────────────────────────────────────────────────────────────────
 const POLL_MS = 60_000;
 
@@ -458,6 +592,9 @@ export function AiOptionsIdeasPanel({ token }: { token: string }) {
   const [loading, setLoading] = useState(true);
   const [entering, setEntering] = useState<Record<string, boolean>>({});
   const [toast, setToast] = useState<string | null>(null);
+  // TRA-714 — bump to force an immediate ideas re-fetch after the user saves or
+  // removes their console API key, so the banner clears without waiting a poll.
+  const [reloadTick, setReloadTick] = useState(0);
 
   useEffect(() => {
     let cancelled = false;
@@ -501,7 +638,7 @@ export function AiOptionsIdeasPanel({ token }: { token: string }) {
       cancelled = true;
       clearInterval(id);
     };
-  }, [token]);
+  }, [token, reloadTick]);
 
   const ideas = useMemo(
     () => (feed ? [...feed.ideas].sort((a, b) => a.rank - b.rank) : []),
@@ -571,6 +708,11 @@ export function AiOptionsIdeasPanel({ token }: { token: string }) {
           )}
         </div>
       )}
+
+      {/* TRA-714 — when the feed isn't live, offer the in-app console-key setup
+          so a user with no server/Render access (e.g. Claude Max) can activate
+          it themselves. */}
+      {!isLive && <AnthropicKeySetup token={token} onSaved={() => setReloadTick((t) => t + 1)} />}
 
       {/* C3 "no day trading" status — surfaced clearly per acceptance. */}
       {feed?.noDayTrading && (
