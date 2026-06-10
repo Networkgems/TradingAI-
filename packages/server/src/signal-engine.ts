@@ -203,14 +203,15 @@ function activeEquityDailyLimit(settings?: AccountSettings): number {
 // chain cache. RV is the *only* options strategy enabled for stock options
 // (TRA-191 directive); ATM auto-open and OTM scans are disabled below.
 const RV_SCAN_INTERVAL_MS = 5 * 60_000;
-// TRA-776 — the relative-value options engine is OFF. The board considers this
-// strategy retired ("I thought we removed it, why is it opening options"), so
-// the auto-open path must never route a new option ticket in any mode (demo or
-// live). This is a hard kill switch on the *opening* side only: existing option
-// positions still get marks via refreshOptionMarks() and can be exited
-// normally — same containment pattern as TRA-726 (stop NEW orders, never strand
-// open ones). Flip back to `true` only if the board re-enables the RV engine.
-const RV_ENGINE_ENABLED: boolean = false;
+// TRA-776 — master on/off switch for the relative-value options engine (the
+// sole strategy that auto-opens long-premium calls/puts). It was briefly killed
+// when the board thought RV had been removed, but on follow-up the board
+// confirmed those auto calls/puts are exactly what they want and chose to turn
+// it back ON (ask_user_questions 5a6ae457 → `turn_on`). Left as an explicit flag
+// (not deleted) so it stays a one-line kill switch. When false, the *opening*
+// side short-circuits; existing positions still get marks via
+// refreshOptionMarks() and exit normally (TRA-726 containment pattern).
+const RV_ENGINE_ENABLED: boolean = true;
 // TRA-451 — SMA-200 daily-bar scan cadence. The signals only change once per
 // daily close, so a 4-hour cadence is plenty: ~6 scans/day keeps the board
 // fresh without burning Yahoo quota on a per-tick (30s) daily-candle refresh.
