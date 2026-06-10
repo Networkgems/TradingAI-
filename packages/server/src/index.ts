@@ -40,6 +40,12 @@ import { scanStocksMarket, scanCryptoMarket } from './market-scanner.js';
 import { runPremarketForAllUsers } from './premarket-watchlist.js';
 import { recordOptionChains } from './options-chain-recorder.js';
 import { buildIdeasFeed, getEntryIntent } from './options-ideas-service.js';
+import {
+  getUserAnthropicApiKey,
+  setUserAnthropicApiKey,
+  clearUserAnthropicApiKey,
+  describeUserAnthropicApiKey,
+} from './anthropic-cred-store.js';
 import { optionsSpendStatus } from './options-spend-store.js';
 import { agentSpendAggregate } from './agent-spend-store.js';
 import { initIvRankStore } from './iv-rank-store.js';
@@ -1379,8 +1385,41 @@ app.get('/api/options/ideas', requireAuth, async (_req, res) => {
   const env = settings.liveTradierEnvOptions ?? 'sandbox';
   const client = buildTradierOptionsClientForEnv(settings, env);
   const symbols = getStocksWatchlistData(ctx.username).all;
-  const feed = await buildIdeasFeed({ client, symbols });
+  // TRA-714 — a user's app-installed console API key (if any) overrides the
+  // server env credential, so a Claude Max user can make the feed live without
+  // any Render access.
+  const anthropicApiKey = getUserAnthropicApiKey(ctx.username);
+  const feed = await buildIdeasFeed({ client, symbols, anthropicApiKey });
   res.json(feed);
+});
+
+// TRA-714 — per-user Anthropic console API-key management for the AI Ideas feed.
+// This is the "another way" for users with no env access (e.g. a Claude Max
+// plan): paste a pay-as-you-go console key (`sk-ant-api03…`) once and it is
+// stored with your account on the persistent disk. Each user manages only their
+// own key (requireAuth, scoped to the authed user) — never another user's.
+app.get('/api/options/anthropic-key', requireAuth, async (_req, res) => {
+  const ctx = await userCtx(res);
+  res.json(describeUserAnthropicApiKey(ctx.username));
+});
+
+app.put('/api/options/anthropic-key', requireAuth, async (req, res) => {
+  const ctx = await userCtx(res);
+  const body = (req.body ?? {}) as Record<string, unknown>;
+  const apiKey = typeof body['apiKey'] === 'string' ? body['apiKey'] : '';
+  try {
+    setUserAnthropicApiKey(ctx.username, apiKey);
+  } catch (err) {
+    res.status(400).json({ error: err instanceof Error ? err.message : 'Invalid API key.' });
+    return;
+  }
+  res.json({ ok: true, ...describeUserAnthropicApiKey(ctx.username) });
+});
+
+app.delete('/api/options/anthropic-key', requireAuth, async (_req, res) => {
+  const ctx = await userCtx(res);
+  clearUserAnthropicApiKey(ctx.username);
+  res.json({ ok: true, ...describeUserAnthropicApiKey(ctx.username) });
 });
 
 // TRA-604 (TRA-595 C4b) — route an accepted idea to the PAPER options account.

@@ -159,6 +159,14 @@ export interface BuildIdeasOptions {
   client: Pick<TradierOptionsClient, 'getExpirations' | 'getChainSnapshot'> | null;
   /** Live universe (resolved watchlist). */
   symbols: readonly string[];
+  /**
+   * TRA-714 — the caller's own console API key (`sk-ant-api…`), installed
+   * through the app and persisted per-user. When present it overrides the
+   * server env credential (including a rate-limited Max OAuth token), so a user
+   * on a Claude Max plan can make the feed live without any Render access. When
+   * absent the feed falls back to the server env credential as before.
+   */
+  anthropicApiKey?: string | null;
   /** Clock seam. */
   now?: number;
   /** Bypass the process feed cache (tests). */
@@ -178,7 +186,23 @@ export async function buildIdeasFeed(opts: BuildIdeasOptions): Promise<OptionsId
     log.info('options-ideas universe truncated', { requested: universe.length, used: MAX_SYMBOLS });
   }
   const symbols = universe.slice(0, MAX_SYMBOLS);
-  const cacheKey = symbols.slice().sort().join(',');
+
+  // TRA-714 — resolve the effective Anthropic credential. A user's app-installed
+  // console key (persisted per-user) overrides the server env credential, so a
+  // Claude Max user can make the feed live without any Render access. The env
+  // overlay is what both the client and the diagnostic read, so they always
+  // agree on which credential actually ran.
+  const userKey = (opts.anthropicApiKey ?? '').trim();
+  const credEnv: NodeJS.ProcessEnv = userKey
+    ? { ...process.env, ANTHROPIC_API_KEY: userKey }
+    : process.env;
+  const cred = describeAnthropicCredFromEnv(credEnv);
+
+  // Fold the resolved credential mode/prefix into the cache key: two callers
+  // with the same universe but different credentials (e.g. one with a console
+  // key, one falling back to the rate-limited env token) must not share a
+  // cached live-vs-non-live result. The prefix is a non-secret type marker.
+  const cacheKey = `${cred.mode}:${cred.prefix}|${symbols.slice().sort().join(',')}`;
 
   if (!opts.noCache && feedCache && feedCache.key === cacheKey && now - feedCache.builtAt < FEED_TTL_MS) {
     return feedCache.feed;
@@ -192,10 +216,10 @@ export async function buildIdeasFeed(opts: BuildIdeasOptions): Promise<OptionsId
     note,
   });
 
-  const llm = createAnthropicLlmClientFromEnv();
+  const llm = createAnthropicLlmClientFromEnv(credEnv);
   if (!llm) {
     return nonLive(
-      'AI Options Ideas is not live: no Anthropic credential is configured. Set ANTHROPIC_API_KEY, or — if you have no API key (e.g. a Claude Pro/Max plan) — set ANTHROPIC_AUTH_TOKEN to a Claude subscription OAuth token (run `claude setup-token`). The research pass and guardrails are wired; ideas and Paper entry activate once either is set.',
+      'AI Options Ideas is not live: no Anthropic credential is configured. The simplest fix (no API key needed elsewhere) is to open the AI Ideas tab settings and paste a pay-as-you-go console API key from console.anthropic.com → API keys (it starts with "sk-ant-api03…"); it is stored with your account and activates the feed immediately. A Claude Pro/Max subscription token will NOT work here — Anthropic rate-limits it for server use. (Server operators may instead set ANTHROPIC_API_KEY in the environment.) The research pass and guardrails are wired; ideas and Paper entry activate once a console key is set.',
     );
   }
   if (!opts.client) {
@@ -274,7 +298,8 @@ export async function buildIdeasFeed(opts: BuildIdeasOptions): Promise<OptionsId
     // means an empty/whitespace ANTHROPIC_API_KEY silently fell back to the
     // rate-limited Max subscription token. The prefix (`sk-ant-api03` /
     // `sk-ant-oat01`) identifies the credential kind without exposing the secret.
-    const cred = describeAnthropicCredFromEnv();
+    // Reuse the credential resolved at the top of this request (TRA-714): it
+    // already reflects a user's app-installed console key overriding the env.
     const credNote = ` [auth=${cred.mode} prefix=${cred.prefix || 'n/a'} apiKeyPresent=${cred.apiKeyPresent} oauthPresent=${cred.oauthPresent}]`;
     return nonLive(
       `AI Options Ideas could not complete the research pass this cycle: ${reason.slice(0, 200)}${credNote}`,

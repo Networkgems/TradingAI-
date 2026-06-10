@@ -69,6 +69,28 @@ describe('buildIdeasFeed non-live fallbacks', () => {
     }
   });
 
+  // TRA-714 — a per-user app-installed console key must satisfy the Anthropic
+  // credential gate even when the server env has NO key, so a Claude Max user
+  // can go live without any Render access. Proof: the feed gets PAST the
+  // "no Anthropic credential" gate and stops at the next (Tradier) gate.
+  it('uses a per-user anthropicApiKey when the env has no credential', async () => {
+    clearKeys();
+    try {
+      const feed = await buildIdeasFeed({
+        client: null,
+        symbols: ['MSFT'],
+        anthropicApiKey: 'sk-ant-api03-user-supplied-not-used',
+        noCache: true,
+      });
+      expect(feed.source).toBe('non_live');
+      // Passed the credential gate (else the note would mention the API key) and
+      // landed on the Tradier gate instead.
+      expect(feed.note).toMatch(/tradier/i);
+    } finally {
+      restoreKeys();
+    }
+  });
+
   // TRA-658 — CFO spend guardrail: once the monthly cap is reached, the feed
   // auto-degrades to non_live BEFORE any paid LLM call (the stub Tradier client
   // here proves we got past chain-pull but never reached the model).
