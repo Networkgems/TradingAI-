@@ -132,6 +132,11 @@ function PasswordInput({
           rows={rows ?? 6}
           spellCheck={false}
           data-cred-field={dataCredField}
+          // TRA-778 — stop Chromium / 1Password / LastPass from autofilling the
+          // app login (admin) username + password into broker credential fields.
+          data-1p-ignore
+          data-lpignore="true"
+          data-form-type="other"
           style={{
             paddingRight: '2.5rem',
             width: '100%',
@@ -153,6 +158,11 @@ function PasswordInput({
           required={required}
           minLength={minLength}
           data-cred-field={dataCredField}
+          // TRA-778 — stop Chromium / 1Password / LastPass from autofilling the
+          // app login (admin) username + password into broker credential fields.
+          data-1p-ignore
+          data-lpignore="true"
+          data-form-type="other"
           style={{ paddingRight: '2.5rem', width: '100%', boxSizing: 'border-box' }}
         />
       )}
@@ -1918,7 +1928,10 @@ export default function SettingsPage({ token, httpUrl, context, onModeChange, on
                       value={readLiveApiKeyOptions(settings, readLiveTradierEnvOptions(settings))}
                       onChange={v => set(liveApiKeyOptionsField(readLiveTradierEnvOptions(settings)), v)}
                       placeholder={'Tradier OAuth token (e.g. abc123XYZ…)'}
-                      autoComplete="off"
+                      // TRA-778 — "new-password" (not "off", which Chromium ignores
+                      // for password inputs) stops the browser from autofilling the
+                      // saved app-login password into the broker API token field.
+                      autoComplete="new-password"
                       dataCredField={liveApiKeyOptionsField(readLiveTradierEnvOptions(settings))}
                     />
                     <p className="field-hint">
@@ -1934,6 +1947,14 @@ export default function SettingsPage({ token, httpUrl, context, onModeChange, on
                     <input
                       id="set-liveAccountIdOptions"
                       type="text"
+                      // TRA-778 — without these, Chromium treats this text input
+                      // (it sits right before the password field) as a username
+                      // field and autofills the app-login "admin" username into it.
+                      name="tradier-account-id"
+                      autoComplete="off"
+                      data-1p-ignore
+                      data-lpignore="true"
+                      data-form-type="other"
                       placeholder="Tradier account number (e.g. VA1234567)"
                       value={readLiveAccountIdOptions(settings, readLiveTradierEnvOptions(settings))}
                       onChange={e => set(liveAccountIdOptionsField(readLiveTradierEnvOptions(settings)), e.target.value)}
