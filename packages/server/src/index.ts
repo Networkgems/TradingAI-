@@ -2229,6 +2229,60 @@ app.post('/api/admin/users/:username/reset-password', requireAuth, requireAdmin,
   res.json({ ok: true, message: `Reset code emailed to ${user.email}` });
 });
 
+// ── Admin: self-restart (TRA-793) ─────────────────────────────────────────────
+//
+// The agent fleet runs as the non-elevated user PRIMEROGA\eetienne, but the PM2
+// daemon + `trading-server` are launched at boot by the `PM2 Resurrect`
+// scheduled task as LOCAL_SYSTEM (ops/install-pm2-autostart.ps1, TRA-605). So a
+// fleet agent CANNOT `pm2 restart trading-server` (EPERM on the SYSTEM daemon
+// control pipe) to adopt a freshly built `dist` after a redeploy — that needs a
+// human/SYSTEM action (this is why TRA-792 stalled on an operator restart).
+//
+// This route makes redeploys self-serve: an authenticated admin POSTs here and
+// we run the EXACT same graceful shutdown SIGTERM triggers (stop the scheduler +
+// every engine, drain in-flight ticks bounded by SHUTDOWN_DRAIN_TIMEOUT_MS,
+// flush trade history + structured logs, then process.exit(0)). PM2
+// (autorestart:true, restart_delay 3s — ecosystem.config.cjs) then relaunches
+// the worker onto the current build with no elevated action required.
+//
+// It is a control surface on the live trading server, so it is admin-only
+// (requireAuth + requireAdmin) and every call is audit-logged with the
+// requesting user + reason before the process goes down.
+app.post('/api/admin/restart', requireAuth, requireAdmin, (req, res) => {
+  // `shuttingDown` (declared with the graceful-shutdown machinery below) is
+  // already true if a SIGTERM or a prior restart call is mid-flight; don't
+  // stack a second exit on top of it.
+  if (shuttingDown) {
+    res.status(409).json({ error: 'Server is already shutting down' });
+    return;
+  }
+  const authUser = res.locals['authUser'] as string;
+  const rawReason = (req.body as { reason?: unknown } | undefined)?.reason;
+  const reason =
+    typeof rawReason === 'string' && rawReason.trim()
+      ? rawReason.trim().slice(0, 500)
+      : 'unspecified';
+  // Audit BEFORE we go down — this line is flushed by gracefulShutdown's
+  // flushLogs() so it survives the exit.
+  log.warn('TRA-793 admin-restart requested — exiting for PM2 relaunch', {
+    user: authUser,
+    reason,
+  });
+  // Acknowledge first so the caller gets a clean 202 before the socket closes
+  // mid-shutdown; it should then poll GET /api/health until it returns 200.
+  res.status(202).json({
+    ok: true,
+    restarting: true,
+    restartDelayMs: 3000,
+    message: 'Server is restarting; poll GET /api/health until it returns 200.',
+  });
+  // Defer one tick so the response fully flushes to the client before the
+  // process begins draining and exits.
+  setTimeout(() => {
+    void gracefulShutdown('admin-restart');
+  }, 250).unref?.();
+});
+
 // ── News + research merge (TRA-227) ──────────────────────────────────────────
 //
 // Maps a research report into a NewsItem for the News tab and merges with the
