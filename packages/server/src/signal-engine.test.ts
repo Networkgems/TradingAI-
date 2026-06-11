@@ -1,5 +1,9 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
+import { tmpdir } from 'os';
+import { join } from 'path';
+import { rmSync } from 'fs';
 import { SignalEngine, sizeLiveEquityFromStop, shortBlockedOnCashAccount, gateSignalOnReview, describeGatedStrategies, shouldBootArmLiveEquity } from './signal-engine.js';
+import { setShadowLedgerFileForTests } from './shadow-signal-ledger.js';
 import { PaperAccount } from './paper-account.js';
 import type { RelativeValueScannerService, RelativeValueScanResult } from './relative-value-scanner.js';
 import type { RelativeValueCandidate, TradierAccountBalance, TradierOptionsClient, TradierOrderClient } from '@trading-app/engine';
@@ -3556,6 +3560,22 @@ describe('shouldBootArmLiveEquity — TRA-713 persistent live-equity boot-arm', 
 // shadow signal on the dedicated channel AND zero entries on the live order
 // path. The live strategies stay byte-for-byte identical (untouched here).
 describe('SignalEngine — SupertrendConfluence shadow channel (TRA-787)', () => {
+  // The shadow pass calls recordShadowSignal, which would otherwise append to the
+  // production data/shadow-signals.jsonl. Point the ledger at a throwaway temp
+  // file per test so these runs never pollute QuantTrader's validation dataset.
+  let ledgerFile: string;
+  let ledgerN = 0;
+  beforeEach(() => {
+    ledgerN += 1;
+    ledgerFile = join(tmpdir(), `signal-engine-shadow-${process.pid}-${ledgerN}.jsonl`);
+    try { rmSync(ledgerFile); } catch { /* fresh */ }
+    setShadowLedgerFileForTests(ledgerFile);
+  });
+  afterEach(() => {
+    setShadowLedgerFileForTests(null);
+    try { rmSync(ledgerFile); } catch { /* ignore */ }
+  });
+
   // 5-minute OHLCV from explicit closes: high/low straddle the running close,
   // open = prior close. 5m step so resampling to the strategy's 1h confirm fold
   // yields enough buckets for the higher-timeframe Supertrend.
