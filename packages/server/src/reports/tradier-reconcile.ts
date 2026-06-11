@@ -56,6 +56,96 @@ export function aggregateOptionCloses(
   return { realizedByDate, seenTransactionIds };
 }
 
+export interface RealizedBackfillTotals {
+  /** `YYYY-MM-DD` (close date) → realized options P&L for closes that day. */
+  realizedByDate: Map<string, number>;
+  /** `YYYY-MM-DD` (close date) → number of closing fills booked that day. */
+  closeCountByDate: Map<string, number>;
+}
+
+/**
+ * TRA-244 — broker-truth realized options P&L per close date, reconstructed
+ * from the Tradier trade-history fills by FIFO-matching each long close
+ * (cash IN, `amount > 0`) against the earliest unconsumed open (cash OUT,
+ * `amount < 0`) of the SAME OCC `symbol`.
+ *
+ * Open vs close is keyed off the sign of `amount`, NOT the `description`
+ * string: Tradier's history endpoint labels the same leg inconsistently
+ * ("Buy to Open" vs "UNSOLICITED, OPEN CONTRACT"), but a long open always
+ * debits cash and a long close always credits it. These live accounts trade
+ * long calls/puts only, so the sign convention is unambiguous.
+ *
+ * Unlike {@link aggregateRealizedOptionsPnl} (the live-reconcile path), this
+ * is *strict*: a closing fill with no matching open inside the window is
+ * skipped, NOT booked at gross proceeds. The gross-proceeds fallback is the
+ * exact bug that produced the bogus June Live calendar cells (a close of an
+ * imported position booked its whole proceeds as a "win"). For a one-shot
+ * historical backfill we'd rather under-report an un-reconstructable day as
+ * flat ($0) than re-introduce a phantom green day. Realized is attributed to
+ * the *close* date, and `amount` is Tradier's net cash for the leg (already
+ * nets commission), so per matched contract:
+ *
+ *   realized = (close proceeds / closeQty) − (open cost / openQty)
+ *
+ * summed over the matched quantity.
+ */
+export function realizedOptionsPnlByCloseDate(
+  fills: readonly TradierTradeHistoryFill[],
+): RealizedBackfillTotals {
+  const realizedByDate = new Map<string, number>();
+  const closeCountByDate = new Map<string, number>();
+
+  // Process opens before closes within the same date so a same-day round
+  // trip matches; otherwise sort by date ascending (Tradier returns newest
+  // first). `quantity` is already absolute in the parsed fill.
+  const ordered = [...fills]
+    .filter(f => f.tradeType === 'option')
+    .sort((a, b) => {
+      if (a.date !== b.date) return a.date < b.date ? -1 : 1;
+      const ao = a.amount < 0 ? 0 : 1; // opens (cash out) before closes
+      const bo = b.amount < 0 ? 0 : 1;
+      return ao - bo;
+    });
+
+  // Per-symbol FIFO queue of open long lots: cost is positive $/contract.
+  const openLots = new Map<string, Array<{ qty: number; costPerContract: number }>>();
+
+  for (const fill of ordered) {
+    if (fill.quantity <= 0 || fill.amount === 0) continue;
+    if (fill.amount < 0) {
+      // Long open: `amount` is negative — store cost as a positive number.
+      const costPerContract = Math.abs(fill.amount) / fill.quantity;
+      const queue = openLots.get(fill.symbol) ?? [];
+      queue.push({ qty: fill.quantity, costPerContract });
+      openLots.set(fill.symbol, queue);
+      continue;
+    }
+
+    // Long close: cash IN. FIFO-match against this symbol's open lots.
+    const queue = openLots.get(fill.symbol) ?? [];
+    const proceedsPerContract = fill.amount / fill.quantity; // positive for a sell
+    let remaining = fill.quantity;
+    let realized = 0;
+    let matchedAny = false;
+    while (remaining > 0 && queue.length > 0) {
+      const lot = queue[0];
+      const take = Math.min(remaining, lot.qty);
+      realized += take * (proceedsPerContract - lot.costPerContract);
+      lot.qty -= take;
+      remaining -= take;
+      matchedAny = true;
+      if (lot.qty <= 0) queue.shift();
+    }
+    // Unmatched portion (open outside the window): skip rather than book
+    // gross proceeds. If nothing matched at all, the day stays flat.
+    if (!matchedAny) continue;
+    realizedByDate.set(fill.date, (realizedByDate.get(fill.date) ?? 0) + realized);
+    closeCountByDate.set(fill.date, (closeCountByDate.get(fill.date) ?? 0) + 1);
+  }
+
+  return { realizedByDate, closeCountByDate };
+}
+
 /**
  * TRA-359 — per-day net cash flow into the Tradier account from
  * non-trade events (ACH / wire / journal / deposit / withdrawal /

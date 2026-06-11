@@ -13,6 +13,7 @@ import {
   aggregateRealizedOptionsPnl,
   computeBalanceDailyPnl,
   findPreviousBalanceSnapshot,
+  realizedOptionsPnlByCloseDate,
 } from './reports/tradier-reconcile.js';
 import { createToken, verifyToken, generateResetToken, consumeResetToken, initResetTokenStore } from './auth.js';
 import { checkThrottle, recordFailure, recordSuccess } from './auth-throttle.js';
@@ -996,6 +997,188 @@ async function reconcileTradierLiveCalendar(
     pnl: Number(pnl.toFixed(2)),
   });
   return { combinedPnl: pnl, prevDate: prev.date, prevBalance: prev.balance, netCashFlow };
+}
+
+// ── TRA-244: one-shot historical Live-calendar backfill from broker fills ─────
+//
+// The Live calendar's June rows pre-date the 9 PM EOD snapshot this ticket
+// added, so they were computed by the old engine path that booked a closing
+// fill's *gross proceeds* as P&L (an imported / out-of-window open had no cost
+// basis to net against). The board reconciled the rows against their Tradier
+// brokerage confirmations and chose "backfill from fills (realized P&L)".
+//
+// This pass pulls the broker trade history for the live/sandbox env and, for
+// the bounded historical June window below, rewrites each day's `combinedPnl`
+// to the FIFO-matched realized options P&L for trades that *closed* that day
+// (broker truth; un-reconstructable closes left flat — never gross proceeds).
+// Days on/after the cutoff are owned by the going-forward 9 PM snapshot path
+// and are left untouched, so this is stable under repeated (daily) runs.
+const LIVE_REALIZED_BACKFILL_FETCH_START = '2026-05-15'; // wide enough to capture the opens
+const LIVE_REALIZED_BACKFILL_WRITE_START = '2026-06-01'; // first artifact day (inclusive)
+const LIVE_REALIZED_BACKFILL_WRITE_END = '2026-06-10';   // cutoff (exclusive) — 9 PM snapshot owns this day on
+
+/**
+ * Build (or patch) an `EodReport` whose calendar figure is the broker-truth
+ * realized options P&L for `date`. Equity realized / unrealized are zeroed so
+ * the detail view stays internally consistent (`combinedPnl = realizedPnl +
+ * optionsPnl`). A prior backfill header is stripped first so re-runs don't
+ * stack headers. When `existing` is null a minimal report is synthesised so
+ * the day still appears as a calendar cell.
+ */
+function makeRealizedBackfillReport(
+  date: string,
+  dayRealized: number,
+  closeCount: number,
+  existing: ReturnType<typeof generateEodReport> | null,
+): ReturnType<typeof generateEodReport> {
+  const sign = (n: number) => (n >= 0 ? '+' : '') + n.toFixed(2);
+  const header = `> **Live calendar backfill (TRA-244).** ${date} P&L = Tradier broker-truth realized options P&L for contracts that *closed* this day = **$${sign(dayRealized)}**. Reconstructed from the Tradier account trade history by FIFO-matching each close to its open by OCC symbol; these rows pre-date the 9 PM EOD snapshot that records this going forward. Un-reconstructable closes (open outside the fetch window) are left flat rather than booked at gross proceeds.`;
+  const base: ReturnType<typeof generateEodReport> =
+    existing ?? {
+      date,
+      generatedAt: Date.now(),
+      realizedPnl: 0,
+      unrealizedPnl: 0,
+      totalPnl: 0,
+      optionsPnl: 0,
+      combinedPnl: 0,
+      realizedPnlPct: undefined,
+      optionsPnlPct: undefined,
+      combinedPnlPct: undefined,
+      totalEquity: 0,
+      managedEquity: 0,
+      availableCash: 0,
+      trades: [],
+      openPositionCount: 0,
+      winRate: 0,
+      avgRR: 0,
+      totalTrades: closeCount,
+      winners: 0,
+      losers: 0,
+      expectancy: 0,
+      maxDrawdown: 0,
+      sharpeRatio: 0,
+      top5Movers: [],
+      signalAccuracy: { totalSignals: 0, winningSignals: 0, winRate: 0, avgRR: 0 },
+      markdown: '',
+    };
+  const priorBody = base.markdown.replace(
+    /^> \*\*Live calendar backfill \(TRA-244\)\.\*\*[\s\S]*?\n\n/,
+    '',
+  );
+  return {
+    ...base,
+    date,
+    realizedPnl: 0,
+    unrealizedPnl: 0,
+    optionsPnl: dayRealized,
+    totalPnl: dayRealized,
+    combinedPnl: dayRealized,
+    markdown: `${header}\n\n${priorBody}`,
+  };
+}
+
+/**
+ * TRA-244 — rewrite a single live/sandbox user's historical June calendar
+ * cells from broker-truth realized options P&L. Idempotent: recomputes from
+ * the Tradier history each run and only touches the bounded historical window
+ * (never `latest.json`, the equity tracker, or the balance-snapshot series).
+ * Returns the per-date map that was written, or `null` when the user isn't on
+ * a Tradier-backed mode / has no client.
+ */
+async function backfillLiveRealizedCalendar(
+  ctx: UserContext,
+): Promise<Record<string, number> | null> {
+  const settings = getSettings(ctx.username);
+  const mode = stockModeKey(settings);
+  if (mode === 'demo') return null;
+  const env: TradierEnv = mode === 'live' ? 'production' : 'sandbox';
+  const client = buildTradierOptionsClientForEnv(settings, env);
+  if (!client) return null;
+
+  const end = new Date(Date.now()).toISOString().slice(0, 10);
+  let fills;
+  try {
+    fills = await client.listAccountHistory({
+      start: LIVE_REALIZED_BACKFILL_FETCH_START,
+      end,
+      type: 'trade',
+      limit: 2000,
+    });
+  } catch (err) {
+    log.warn('live realized backfill: history fetch failed', {
+      username: ctx.username,
+      env,
+      reason: err instanceof Error ? err.message : String(err),
+    });
+    return null;
+  }
+
+  const { realizedByDate, closeCountByDate } = realizedOptionsPnlByCloseDate(fills);
+  const dir = stockReportsDirFor(ctx, mode);
+
+  // Candidate days = existing report files in the bucket ∪ realized-close
+  // days, bounded to the historical write window. Existing artifact rows with
+  // no real close that day are zeroed; real-close days are set to broker truth.
+  const candidates = new Set<string>();
+  let existingDates: string[] = [];
+  try {
+    existingDates = (await readdir(dir))
+      .filter(f => /^\d{4}-\d{2}-\d{2}\.json$/.test(f))
+      .map(f => f.slice(0, 10));
+  } catch {
+    existingDates = [];
+  }
+  const inWindow = (d: string) =>
+    d >= LIVE_REALIZED_BACKFILL_WRITE_START && d < LIVE_REALIZED_BACKFILL_WRITE_END;
+  for (const d of existingDates) if (inWindow(d)) candidates.add(d);
+  for (const d of realizedByDate.keys()) if (inWindow(d)) candidates.add(d);
+  if (candidates.size === 0) return {};
+
+  const written: Record<string, number> = {};
+  for (const date of [...candidates].sort()) {
+    const dayRealized = Number((realizedByDate.get(date) ?? 0).toFixed(2));
+    const filePath = join(dir, `${date}.json`);
+    let existing: ReturnType<typeof generateEodReport> | null = null;
+    if (existsSync(filePath)) {
+      try {
+        existing = JSON.parse(await readFile(filePath, 'utf-8')) as ReturnType<
+          typeof generateEodReport
+        >;
+      } catch {
+        existing = null;
+      }
+    }
+    const report = makeRealizedBackfillReport(
+      date,
+      dayRealized,
+      closeCountByDate.get(date) ?? 0,
+      existing,
+    );
+    await writeFile(filePath, JSON.stringify(report, null, 2), 'utf-8');
+    await writeFile(join(dir, `${date}.md`), report.markdown, 'utf-8');
+    written[date] = dayRealized;
+  }
+  log.info('live realized calendar backfill complete', {
+    username: ctx.username,
+    env,
+    written,
+  });
+  return written;
+}
+
+/** TRA-244 — run the historical Live-calendar backfill for every user. */
+async function runLiveRealizedCalendarBackfill(): Promise<void> {
+  for (const ctx of getAllUserContexts()) {
+    try {
+      await backfillLiveRealizedCalendar(ctx);
+    } catch (err) {
+      log.error('live realized calendar backfill failed', {
+        username: ctx.username,
+        reason: err instanceof Error ? err.message : String(err),
+      });
+    }
+  }
 }
 
 
@@ -2619,6 +2802,26 @@ app.post('/api/reports/generate', requireAuth, async (_req, res) => {
     const ctx = await userCtx(res);
     await generateAndSaveReport(ctx);
     res.json({ ok: true, message: 'EOD report generated successfully' });
+  } catch (err) {
+    res.status(500).json({ error: String(err) });
+  }
+});
+
+// TRA-244 — manually re-run the historical Live-calendar realized-P&L backfill
+// for the current user (also runs automatically at startup). Returns the
+// per-date map that was rewritten so the board can confirm the broker-truth
+// values without restarting the server.
+app.post('/api/reports/backfill-realized', requireAuth, async (_req, res) => {
+  try {
+    const ctx = await userCtx(res);
+    const written = await backfillLiveRealizedCalendar(ctx);
+    if (written === null) {
+      res.status(400).json({
+        error: 'Backfill only applies to a Tradier-backed live/sandbox account.',
+      });
+      return;
+    }
+    res.json({ ok: true, written });
   } catch (err) {
     res.status(500).json({ error: String(err) });
   }
@@ -4480,6 +4683,15 @@ for (const ctx of getAllUserContexts()) {
 // than waiting for — and depending on — that night's archive tick.
 void catchUpMissedEodReports().catch(err =>
   log.warn('reports startup catch-up failed', {
+    reason: err instanceof Error ? err.message : String(err),
+  }),
+);
+
+// TRA-244 — on startup, rewrite the historical June Live-calendar cells from
+// broker-truth realized P&L (board chose "backfill from fills"). Idempotent
+// and bounded to the historical window, so it's safe to run every boot.
+void runLiveRealizedCalendarBackfill().catch(err =>
+  log.warn('live realized calendar backfill (startup) failed', {
     reason: err instanceof Error ? err.message : String(err),
   }),
 );

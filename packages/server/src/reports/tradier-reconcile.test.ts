@@ -7,6 +7,7 @@ import {
   computeBalanceDailyPnl,
   findPreviousBalanceSnapshot,
   isOptionCloseDescription,
+  realizedOptionsPnlByCloseDate,
 } from './tradier-reconcile.js';
 
 function fill(overrides: Partial<TradierTradeHistoryFill> = {}): TradierTradeHistoryFill {
@@ -276,5 +277,59 @@ describe('findPreviousBalanceSnapshot (TRA-359)', () => {
 
   it('returns null for an empty snapshots map', () => {
     expect(findPreviousBalanceSnapshot({}, '2026-05-13')).toBeNull();
+  });
+});
+
+describe('realizedOptionsPnlByCloseDate', () => {
+  // TRA-244 — the real ENOCK ETIENNE (#80154) June fills from the Tradier
+  // brokerage confirmations the board attached. Opens Jun 2/3, closes Jun 4.
+  // `amount` is signed broker net cash (buys negative, sells positive).
+  const juneFills: TradierTradeHistoryFill[] = [
+    // Jun 2 open: 1 NVDA $250 ADJ call
+    fill({ date: '2026-06-02', symbol: 'NVDA_250_ADJ', description: 'OPEN CONTRACT', quantity: 1, amount: -123.11, transactionId: 'o1' }),
+    // Jun 3 opens
+    fill({ date: '2026-06-03', symbol: 'NU_14', description: 'OPEN CONTRACT', quantity: 3, amount: -105.33, transactionId: 'o2' }),
+    fill({ date: '2026-06-03', symbol: 'NVDA_230', description: 'OPEN CONTRACT', quantity: 4, amount: -96.43, transactionId: 'o3' }),
+    fill({ date: '2026-06-03', symbol: 'NVDA_240_ADJ', description: 'OPEN CONTRACT', quantity: 1, amount: -124.11, transactionId: 'o4' }),
+    fill({ date: '2026-06-03', symbol: 'NVDA_250_ADJ', description: 'OPEN CONTRACT', quantity: 1, amount: -60.11, transactionId: 'o5' }),
+    // Jun 4 closes (Sell to Close everything)
+    fill({ date: '2026-06-04', symbol: 'NU_14', description: 'CLOSING CONTRACT', quantity: 3, amount: 173.65, transactionId: 'c1' }),
+    fill({ date: '2026-06-04', symbol: 'NVDA_230', description: 'CLOSING CONTRACT', quantity: 4, amount: 19.55, transactionId: 'c2' }),
+    fill({ date: '2026-06-04', symbol: 'NVDA_240_ADJ', description: 'CLOSING CONTRACT', quantity: 1, amount: 67.87, transactionId: 'c3' }),
+    fill({ date: '2026-06-04', symbol: 'NVDA_250_ADJ', description: 'CLOSING CONTRACT', quantity: 2, amount: 67.75, transactionId: 'c4' }),
+  ];
+
+  it('books the Jun 4 round-trip at broker-truth realized −$180.27, all other days flat', () => {
+    const { realizedByDate, closeCountByDate } = realizedOptionsPnlByCloseDate(juneFills);
+    expect(realizedByDate.get('2026-06-04')!).toBeCloseTo(-180.27, 2);
+    // Opens-only days are NOT realized P&L days.
+    expect(realizedByDate.has('2026-06-02')).toBe(false);
+    expect(realizedByDate.has('2026-06-03')).toBe(false);
+    expect(closeCountByDate.get('2026-06-04')).toBe(4);
+  });
+
+  it('matches a 2-contract close across two separate open lots (FIFO)', () => {
+    // NVDA_250_ADJ: opened 1 @ $123.11 (Jun 2) + 1 @ $60.11 (Jun 3) = $183.22
+    // cost; closed 2 @ $67.75 proceeds ⇒ 67.75 − 183.22 = −115.47.
+    const only250 = juneFills.filter(f => f.symbol === 'NVDA_250_ADJ');
+    const { realizedByDate } = realizedOptionsPnlByCloseDate(only250);
+    expect(realizedByDate.get('2026-06-04')!).toBeCloseTo(-115.47, 2);
+  });
+
+  it('skips an unmatched close instead of booking gross proceeds (the old bug)', () => {
+    const orphanClose: TradierTradeHistoryFill[] = [
+      fill({ date: '2026-06-05', symbol: 'IMPORTED', description: 'CLOSING CONTRACT', quantity: 1, amount: 79.5, transactionId: 'x1' }),
+    ];
+    const { realizedByDate } = realizedOptionsPnlByCloseDate(orphanClose);
+    expect(realizedByDate.has('2026-06-05')).toBe(false);
+  });
+
+  it('ignores equity legs (out of scope — long options only)', () => {
+    const withEquity: TradierTradeHistoryFill[] = [
+      ...juneFills,
+      fill({ date: '2026-06-08', symbol: 'LASE', tradeType: 'equity', description: 'Sell', quantity: 2, amount: 13.36, transactionId: 'e1' }),
+    ];
+    const { realizedByDate } = realizedOptionsPnlByCloseDate(withEquity);
+    expect(realizedByDate.has('2026-06-08')).toBe(false);
   });
 });
