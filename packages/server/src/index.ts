@@ -2567,6 +2567,36 @@ app.get('/api/research/shadow-signals', requireAuth, requireAdmin, async (req, r
   res.json({ signals });
 });
 
+// TRA-799 — public, read-only acceptance probe for the TRA-791 shadow ledger
+// (parity with the TRA-586 `/api/health/market-review` and TRA-580
+// `/api/health/live-equity` probes). Unauthenticated by design: the rows are
+// pure strategy telemetry (symbol, side, indicator booleans, the entry/stop/
+// target prices, and the realized outcome) — no PII, no user identity, no
+// account balances, and no real positions, the same non-sensitive class as the
+// other open health probes. It exists so QuantTrader can pull the live-tape
+// shadow signal->outcome dataset to drive the TRA-734 go/no-go *without*
+// shipping Render-specific admin credentials into the validator's harness env,
+// which Render's separate user store made impossible. Supertrend stays
+// router-gated OFF pending TRA-734; this only observes and labels. Same
+// `?from=`/`?to=` ms-epoch inclusive window as the admin research route, which
+// is left untouched for the authenticated desk UI.
+app.get('/api/health/shadow-signals', async (req, res) => {
+  const q = req.query as Record<string, unknown>;
+  const parseTs = (v: unknown): number | undefined => {
+    const n = Number(v);
+    return typeof v === 'string' && v !== '' && Number.isFinite(n) ? n : undefined;
+  };
+  try {
+    const signals = await listShadowSignals({ from: parseTs(q['from']), to: parseTs(q['to']) });
+    res.json({ issue: 'TRA-799', count: signals.length, signals });
+  } catch (err) {
+    log.error('shadow-signals health probe failed', {
+      reason: err instanceof Error ? err.message : String(err),
+    });
+    res.status(500).json({ error: 'Failed to read shadow ledger' });
+  }
+});
+
 app.get('/api/research/reports/:id', requireAuth, async (req, res) => {
   const id = (req.params as Record<string, string>)['id'];
   const report = await getResearchReport(id);
