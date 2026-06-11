@@ -7,10 +7,11 @@
 //   #4 aggregate    — recorded spend rolls into the daily aggregate readout.
 import { describe, it, expect, beforeEach } from 'vitest';
 import type { AgentGraphInput, LlmClient } from '@trading-app/agents';
-import type { Candle } from '@trading-app/shared';
+import type { Candle, NewsItem } from '@trading-app/shared';
 import {
   adviseSymbol,
   resolveTradingAgentsLlm,
+  buildNewsHeadlines,
 } from './trading-agents-advisory.js';
 import {
   agentSpendAggregate,
@@ -137,5 +138,44 @@ describe('adviseSymbol — aggregate accounting (acceptance #4)', () => {
     const agg = agentSpendAggregate(NOW);
     expect(agg.userCount).toBe(2);
     expect(agg.totalUsd).toBeCloseTo(0.2, 2);
+  });
+});
+
+// TRA-795 — the news feed the P1 stub left neutral (analysts.ts:129) is now
+// shaped into the news analyst's point-in-time headlines.
+describe('buildNewsHeadlines (TRA-795 news feed wiring)', () => {
+  const asOf = Date.parse('2026-06-09T16:00:00Z');
+  function item(over: Partial<NewsItem> & { title: string; publishedAt: string }): NewsItem {
+    return { url: 'http://x', source: 'wire', ...over };
+  }
+  const cache: NewsItem[] = [
+    item({ title: 'Apple crushes earnings', publishedAt: '2026-06-09T15:00:00Z', source: 'wire',
+      sentiment: { score: 0.7, label: 'positive', confidence: 0.8, method: 'lexicon-v1' } }),
+    item({ title: 'AAPL faces antitrust probe', publishedAt: '2026-06-09T15:30:00Z', source: 'reuters' }),
+    item({ title: 'Apple unveils next chip', publishedAt: '2026-06-09T17:00:00Z', source: 'wire' }), // AFTER asOf
+    item({ title: 'Tesla recalls vehicles', publishedAt: '2026-06-09T15:10:00Z', source: 'wire' }), // other symbol
+  ];
+
+  it('maps only symbol-matching, at/before-asOf articles, newest first', () => {
+    const out = buildNewsHeadlines(cache, 'AAPL', asOf);
+    expect(out.map(h => h.headline)).toEqual([
+      'AAPL faces antitrust probe', // 15:30, newest qualifying
+      'Apple crushes earnings',     // 15:00, matches by name alias
+    ]);
+    // The 17:00 article is dropped (look-ahead); Tesla is a different symbol.
+    expect(out.some(h => /next chip/.test(h.headline))).toBe(false);
+    expect(out.some(h => /Tesla/.test(h.headline))).toBe(false);
+  });
+
+  it('carries the pre-scored sentiment through, omits it when absent', () => {
+    const out = buildNewsHeadlines(cache, 'AAPL', asOf);
+    const beat = out.find(h => /crushes/.test(h.headline))!;
+    const probe = out.find(h => /antitrust/.test(h.headline))!;
+    expect(beat.sentiment).toBeCloseTo(0.7, 6);
+    expect(probe.sentiment).toBeUndefined();
+  });
+
+  it('returns [] when nothing matches (analyst then abstains)', () => {
+    expect(buildNewsHeadlines(cache, 'NVDA', asOf)).toEqual([]);
   });
 });

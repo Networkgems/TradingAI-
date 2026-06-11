@@ -8,7 +8,7 @@ import type { TradeSignal, RelativeValueSignal, Sma200Signal, Candle, OptionsAcc
 // trader/risk) behind the `adviseSymbol` seam, which enforces the $2/user/day cap
 // and both kill switches and accounts spend — advisor-only, no path to capital.
 import type { LlmClient } from '@trading-app/agents';
-import { adviseSymbol, resolveTradingAgentsLlm } from './trading-agents-advisory.js';
+import { adviseSymbol, resolveTradingAgentsLlm, buildNewsHeadlines } from './trading-agents-advisory.js';
 import { getLatestMarketReview } from './market-review.js';
 import { earningsInDaysSync } from './earnings-store.js';
 import { recordShadowSignal, resolveShadowSignal, resolveOutcome, openShadowSignalsSync } from './shadow-signal-ledger.js';
@@ -2795,9 +2795,13 @@ export class SignalEngine {
       const nextEarningsInDays = earningsInDaysSync(sym, asOf);
       const fundamentals =
         nextEarningsInDays !== null ? { nextEarningsInDays } : undefined;
+      // TRA-795 — wire the point-in-time news feed the P1 stub left neutral
+      // (analysts.ts:129). The news-sentiment analyst consumes these when the
+      // LLM path runs; empty → it abstains, so this stays additive.
+      const news = buildNewsHeadlines(this.newsCache, aliasWatchlistSymbol(sym), asOf);
       try {
         const { recommendation } = await adviseSymbol(
-          { symbol: sym, asOf, candles, candidateSignal: null, fundamentals },
+          { symbol: sym, asOf, candles, candidateSignal: null, fundamentals, news },
           { user: this.alertUsername, enabled: this.tradingAgentsEnabled, llm },
         );
         recos.push(recommendation);

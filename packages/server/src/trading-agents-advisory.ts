@@ -27,12 +27,51 @@ import {
   type AgentGraphDeps,
   type AgentGraphInput,
   type LlmClient,
+  type NewsHeadline,
 } from '@trading-app/agents';
-import type { AgentRecommendation } from '@trading-app/shared';
+import {
+  nameAliasesFor,
+  newsMentionsSymbol,
+  type AgentRecommendation,
+  type NewsItem,
+} from '@trading-app/shared';
 import {
   isOverUserDailyCap,
   recordAgentSpend,
 } from './agent-spend-store.js';
+
+/** Cap on point-in-time headlines fed to the news analyst — small + cheap. */
+const MAX_NEWS_HEADLINES = 12;
+
+/**
+ * TRA-795 — shape the engine's sentiment-scored news cache into the news analyst's
+ * point-in-time `NewsHeadline[]` for one symbol. Keeps only articles that mention
+ * the symbol (ticker or name alias) AND were published at/before `asOf` (the §3.1
+ * no-look-ahead contract), newest first, capped. Pure + side-effect-free so the
+ * filter is unit-testable without the engine; returns `[]` (analyst abstains)
+ * when nothing matches.
+ */
+export function buildNewsHeadlines(
+  newsCache: readonly NewsItem[],
+  symbol: string,
+  asOf: number,
+): NewsHeadline[] {
+  const sym = symbol.toUpperCase();
+  const names = nameAliasesFor(sym);
+  const out: NewsHeadline[] = [];
+  for (const n of newsCache) {
+    if (!newsMentionsSymbol(n, sym, names)) continue;
+    const ts = Date.parse(n.publishedAt);
+    if (!Number.isFinite(ts) || ts > asOf) continue;
+    out.push({
+      headline: n.title,
+      timestamp: ts,
+      source: n.source,
+      ...(typeof n.sentiment?.score === 'number' ? { sentiment: n.sentiment.score } : {}),
+    });
+  }
+  return out.sort((a, b) => b.timestamp - a.timestamp).slice(0, MAX_NEWS_HEADLINES);
+}
 
 /**
  * Explicit env kill switch (acceptance #3, second switch). When truthy the
