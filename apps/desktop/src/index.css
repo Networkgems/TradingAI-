@@ -3307,10 +3307,12 @@ tr:hover td { background: var(--bg-hover); }
 
   background: var(--lp-bg);
   color: var(--lp-text);
-  min-height: 100vh;
-  min-height: 100dvh;
+  height: 100vh;
+  height: 100dvh;            /* bounded so .lp owns its own scroll (mirrors .app); was min-height — that let .lp grow past the fixed, overflow:hidden body and clip everything below the fold on mobile */
   font-family: inherit;
   overflow-y: auto;
+  -webkit-overflow-scrolling: touch;   /* momentum scroll on touch devices */
+  overscroll-behavior: contain;
   -webkit-font-smoothing: antialiased;
 }
 
@@ -3760,7 +3762,7 @@ tr:hover td { background: var(--bg-hover); }
 .lp-cta-band-link { font-size: 1rem; }
 
 /* ── Footer wrapper (full disclaimer block above the footer bar) ────────── */
-.lp-footer-wrap { max-width: 1080px; margin: 2rem auto 0; padding: 0 1.5rem; }
+.lp-footer-wrap { max-width: 1080px; margin: 2rem auto 0; padding: 0 1.5rem calc(1.5rem + env(safe-area-inset-bottom)); }
 .lp-footer-wrap .lp-footer { padding-left: 0; padding-right: 0; }
 
 /* ── Full risk-disclosure block — body copy variant (Deck §5) ───────────── */
