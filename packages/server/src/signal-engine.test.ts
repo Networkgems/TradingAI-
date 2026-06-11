@@ -166,6 +166,16 @@ describe('SignalEngine — relative-value scanner bridge', () => {
   });
 });
 
+describe('SignalEngine — TRA-791 shadow channel state exposure', () => {
+  it('getState() always carries a supertrendShadowSignals array (served by /api/state + WS state)', () => {
+    // `GET /api/state` returns `ctx.engine.getState()` and the WS `state` frame
+    // broadcasts the same object, so asserting on getState() covers both surfaces.
+    const engine = new SignalEngine(undefined, undefined, undefined);
+    const state = engine.getState();
+    expect(Array.isArray(state.supertrendShadowSignals)).toBe(true);
+  });
+});
+
 describe('SignalEngine — Tradier live balance surfacing (TRA-226)', () => {
   it('surfaces total_equity / total_cash from the cached Tradier balance in live mode', async () => {
     const engine = new SignalEngine(undefined, undefined, undefined);

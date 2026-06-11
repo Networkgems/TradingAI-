@@ -11,6 +11,7 @@ import type { LlmClient } from '@trading-app/agents';
 import { adviseSymbol, resolveTradingAgentsLlm } from './trading-agents-advisory.js';
 import { getLatestMarketReview } from './market-review.js';
 import { earningsInDaysSync } from './earnings-store.js';
+import { recordShadowSignal, resolveShadowSignal, resolveOutcome, openShadowSignalsSync } from './shadow-signal-ledger.js';
 import { etDateString } from './scheduler.js';
 import { fetchMinuteBars, fetchDailyCandles, fetchQuotes, fetchStocksNews, isYahooBreakerOpen, setActiveInterestSymbols, setTradierStocksFeedClient } from './yahoo-feed.js';
 import { fetchStockTwitsStream, fetchStockTwitsUserStream, getCuratedStockTwitsAccounts } from './stocktwits-feed.js';
@@ -2603,8 +2604,57 @@ export class SignalEngine {
 
       emitted.unshift(signal);
       if (emitted.length > SUPERTREND_SHADOW_MAX_SIGNALS) emitted.pop();
+
+      // TRA-791 — durably capture each NEW shadow signal to the append-only
+      // signal->outcome ledger QuantTrader validates on TRA-789. Keyed on the
+      // signal bar so a per-tick re-fire on the same 5m bar dedupes. Best-effort
+      // and fire-and-forget: a ledger write never blocks or fails the tick.
+      const entryBarTs = fiveMin[fiveMin.length - 1]?.timestamp ?? signal.timestamp;
+      void recordShadowSignal({
+        id: `${sym}:${signal.side}:${entryBarTs}`,
+        ts: signal.timestamp,
+        symbol: sym,
+        side: signal.side,
+        entryRef: signal.entryPrice,
+        supertrendValue: stLine,
+        supertrendFlip: stFlipped,
+        maStack: decision?.reads.maStackAligned ?? null,
+        macd: decision?.reads.macdOk ?? null,
+        rsi: decision?.reads.rsiOk ?? null,
+        stopLoss: signal.stopLoss,
+        takeProfit: signal.takeProfit,
+      }).catch((err: unknown) => {
+        supertrendShadowLog.warn('shadow ledger append failed', {
+          symbol: sym, reason: err instanceof Error ? err.message : String(err),
+        });
+      });
     }
     this.supertrendShadowSignals = emitted;
+
+    // TRA-791 — label any still-OPEN ledger rows against the freshest 5m series.
+    // The horizon rule (intra-session TP/SL touch, TIMEOUT at session close)
+    // lives in `resolveOutcome`; we feed it the cached bars per symbol.
+    this.labelOpenShadowSignals();
+  }
+
+  /**
+   * TRA-791 — forward-label OPEN shadow ledger rows. For each open record we walk
+   * the symbol's cached 5m series past the signal bar and resolve it to
+   * TP_HIT | SL_HIT | TIMEOUT (see {@link resolveOutcome}). Best-effort and
+   * fire-and-forget so labelling never blocks the engine tick.
+   */
+  private labelOpenShadowSignals(): void {
+    for (const rec of openShadowSignalsSync()) {
+      const bars = this.shadowCandleCache.get(rec.symbol);
+      if (!bars || bars.length === 0) continue;
+      const res = resolveOutcome(rec, bars);
+      if (!res) continue;
+      void resolveShadowSignal(rec.id, res, Date.now()).catch((err: unknown) => {
+        supertrendShadowLog.warn('shadow ledger resolve failed', {
+          id: rec.id, reason: err instanceof Error ? err.message : String(err),
+        });
+      });
+    }
   }
 
   /**

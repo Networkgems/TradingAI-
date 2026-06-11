@@ -54,6 +54,7 @@ import { optionsSpendStatus } from './options-spend-store.js';
 import { agentSpendAggregate } from './agent-spend-store.js';
 import { initIvRankStore } from './iv-rank-store.js';
 import { initIdeaJournal, listJournalEntries } from './options-idea-journal.js';
+import { initShadowLedger, listShadowSignals } from './shadow-signal-ledger.js';
 import {
   forwardTestIdeas,
   buildForwardTestReport,
@@ -358,6 +359,12 @@ await initIvRankStore();
 // has the surfaced-idea history available right after boot. The journal is
 // appended to (deduped) every time the live ideas feed is built.
 await initIdeaJournal();
+
+// TRA-791 — warm the SupertrendConfluence shadow signal->outcome ledger so the
+// research read endpoint has the labelled history available right after boot.
+// The engine appends OPEN rows on each new shadow signal and RESOLVED rows as
+// the forward horizon labels them.
+await initShadowLedger();
 
 const app = express();
 // TRA-404 — behind Render's proxy the socket address is the proxy, not the
@@ -2489,6 +2496,21 @@ app.post('/api/research/reports', requireAuth, requireAdmin, async (req, res) =>
 
 app.get('/api/research/reports', requireAuth, async (_req, res) => {
   res.json(await listResearchReports());
+});
+
+// TRA-791 — labelled SupertrendConfluence shadow signal->outcome ledger. This
+// is the dataset TRA-789 (QuantTrader) validates: hit rate / R:R / false-signal
+// rate are computed against these rows. Admin-only, same pattern as the other
+// research routes. `?from=` / `?to=` are ms-epoch inclusive bounds on signal ts.
+// Read-only; supertrend stays router-gated OFF pending TRA-734.
+app.get('/api/research/shadow-signals', requireAuth, requireAdmin, async (req, res) => {
+  const q = req.query as Record<string, unknown>;
+  const parseTs = (v: unknown): number | undefined => {
+    const n = Number(v);
+    return typeof v === 'string' && v !== '' && Number.isFinite(n) ? n : undefined;
+  };
+  const signals = await listShadowSignals({ from: parseTs(q['from']), to: parseTs(q['to']) });
+  res.json({ signals });
 });
 
 app.get('/api/research/reports/:id', requireAuth, async (req, res) => {
