@@ -1,7 +1,7 @@
 import { describe, it, expect, beforeAll } from 'vitest';
 import { tmpdir } from 'os';
 import { join } from 'path';
-import { mkdtempSync } from 'fs';
+import { mkdtempSync, writeFileSync } from 'fs';
 import type { AccountSettings, Position } from '@trading-app/shared';
 import type { BacktestResult } from '@trading-app/backtest';
 
@@ -370,5 +370,58 @@ describe('TRA-801 SupertrendConfluence paper accrual — live stays gated', () =
     expect(rec?.decisions ?? []).toHaveLength(0);
     const status = await svc.buildPromotionStatus(ST_USER, STRATEGY);
     expect(status.canGoLive).toBe(false);
+  });
+});
+
+// TRA-803 — the tokenless public promotion probe (buildPublicPromotionProbe,
+// served at GET /api/health/promotion-gate/:strategyId) must surface the SAME
+// gate verdict as the authenticated per-user route, except it aggregates the
+// Stage-2 paper ledger across every registered user (no caller identity). The
+// invariant under test: it reports the accrued supertrend paper trades AND keeps
+// `canGoLive=false` while Stage 1/3 are unmet — so QuantTrader reading it
+// tokenless can never see a false "go".
+describe('TRA-803 public promotion probe — aggregates paper, keeps gate honest', () => {
+  const STRATEGY = 'supertrend_confluence';
+
+  beforeAll(async () => {
+    // The probe enumerates users via getAllUsers(); register the forward-test
+    // user (its stocks ledger was seeded with 60 supertrend paper trades by the
+    // TRA-801 block above) so the aggregation actually picks them up.
+    writeFileSync(
+      join(DATA_DIR, 'users.json'),
+      JSON.stringify([
+        {
+          username: 'supertrend-forward',
+          email: '',
+          passwordHash: 'x',
+          role: 'user',
+          createdAt: '2026-06-01T00:00:00.000Z',
+        },
+      ]),
+      'utf-8',
+    );
+    const users = await import('./users.js');
+    await users.loadUsers();
+  });
+
+  it('reports accrued paper trades for supertrend_confluence with canGoLive=false', async () => {
+    const status = await svc.buildPublicPromotionProbe(STRATEGY);
+    // Aggregated from the registered user's stocks ledger (60 trades seeded above).
+    expect(status.paper.tradeCount).toBe(60);
+    expect(status.paper.metrics?.tradeCount).toBe(60);
+    // Paper may fully pass, but Stage 1 (TRA-382-blocked backtest) is missing and
+    // Stage 3 sign-off is absent → the safety invariant must hold.
+    expect(status.backtest.state).toBe('missing');
+    expect(status.signoff).toBe('absent');
+    expect(status.canGoLive).toBe(false);
+    expect(status.blockedReasons.join(' ')).toMatch(/Stage 1/);
+  });
+
+  it('exposes only gate telemetry — no account internals or secrets', async () => {
+    const status = await svc.buildPublicPromotionProbe(STRATEGY);
+    const keys = Object.keys(status).sort();
+    expect(keys).toEqual(
+      ['backtest', 'blockedReasons', 'canGoLive', 'paper', 'signoff', 'strategyId'].sort(),
+    );
   });
 });

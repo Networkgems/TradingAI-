@@ -7,6 +7,7 @@ import {
 } from '@trading-app/shared';
 import { loadCryptoTradeSnapshot, loadStocksTradeSnapshot } from './trade-store.js';
 import { getStrategyRecord, getEffectiveThresholds } from './promotion-store.js';
+import { getAllUsers } from './users.js';
 import { logger } from './observability/index.js';
 
 const log = logger.child({ module: 'promotion-service' });
@@ -83,6 +84,41 @@ export async function buildPromotionStatus(username: string, strategyId: string)
   const backtestVerdict = rec?.backtest?.verdict ?? null;
 
   const paperTrades = await collectPaperTrades(username, strategyId);
+  const paper: PaperGateMetrics | null =
+    paperTrades.length > 0 ? computePaperGateMetrics(paperTrades.map(toSample)) : null;
+
+  const signoff = rec && rec.decisions.length > 0 ? 'present' : 'absent';
+
+  return evaluatePromotion({ strategyId, backtest, backtestVerdict, paper, signoff, thresholds });
+}
+
+/**
+ * TRA-803 — promotion-gate status for the PUBLIC, tokenless read-only probe
+ * (`GET /api/health/promotion-gate/:strategyId`), extending the TRA-799 pattern
+ * to the Stage-2 paper gate. Identical gate evaluation to
+ * {@link buildPromotionStatus}, with one difference: the Stage-2 paper ledger is
+ * aggregated across EVERY user rather than scoped to one authenticated caller,
+ * so the probe reports the TOTAL monitored paper trades accrued for the strategy
+ * — the figure the Stage-2 go/no-go is judged on — without needing a Render
+ * identity (QuantTrader has no working production creds; see TRA-799/TRA-802).
+ * Stage-1 backtest, Stage-3 sign-off, and the thresholds are already global per
+ * strategy. The returned {@link PromotionStatus} is pure gate telemetry: per-
+ * stage state, the computed metrics, `canGoLive`, and the blocked reasons — no
+ * per-user data, no account internals, no secrets. The gate logic is untouched,
+ * so `canGoLive` remains the same safety invariant the authenticated route
+ * reports.
+ */
+export async function buildPublicPromotionProbe(strategyId: string): Promise<PromotionStatus> {
+  const rec = await getStrategyRecord(strategyId);
+  const thresholds = await getEffectiveThresholds(strategyId);
+
+  const backtest = rec?.backtest?.metrics ?? null;
+  const backtestVerdict = rec?.backtest?.verdict ?? null;
+
+  const paperTrades: Position[] = [];
+  for (const u of getAllUsers()) {
+    paperTrades.push(...(await collectPaperTrades(u.username, strategyId)));
+  }
   const paper: PaperGateMetrics | null =
     paperTrades.length > 0 ? computePaperGateMetrics(paperTrades.map(toSample)) : null;
 

@@ -204,6 +204,7 @@ import {
 } from './promotion-store.js';
 import {
   buildPromotionStatus,
+  buildPublicPromotionProbe,
   snapshotPaperMetrics,
   evaluateLiveTransitionGate,
 } from './promotion-service.js';
@@ -2688,6 +2689,34 @@ app.post('/api/market-review/run', requireAuth, requireAdmin, async (req, res) =
 // paper and carries a sign-off (enforced in PUT /api/account/settings above).
 // These routes surface the per-stage status with metrics computed from data,
 // register a Stage-1 backtest report, and record the Stage-3 sign-off audit.
+
+// TRA-803 — PUBLIC, tokenless read-only probe for a strategy's promotion-gate
+// summary, extending the TRA-799 shadow-ledger pattern to the Stage-2 paper
+// gate. Unauthenticated by design and the same non-sensitive class as the other
+// open `/api/health/*` probes: it returns ONLY the promotion-gate telemetry —
+// per-stage state, the computed backtest/paper metrics, `canGoLive`, and the
+// blocked-reason strings — with no order/account internals, no PII, and no
+// secrets. It exists so QuantTrader can read `supertrend_confluence`
+// `paper.tradeCount` plus the gate metrics to drive the TRA-802 Stage-2 go/no-go
+// WITHOUT Render-specific admin creds (login + pre-minted token both 401 on
+// Render's separate user store). The paper ledger is aggregated across all users
+// so the count reflects the TOTAL monitored paper trades accrued. The gate logic
+// is untouched, so the `canGoLive` safety invariant it reports is identical to
+// the authenticated `/api/promotion/status/:strategyId` route — for the gated
+// supertrend strategy it stays `false` until Stage 1/2/3 all pass.
+app.get('/api/health/promotion-gate/:strategyId', async (req, res) => {
+  const strategyId = (req.params as Record<string, string>)['strategyId'] as string;
+  try {
+    const status = await buildPublicPromotionProbe(strategyId);
+    res.json({ issue: 'TRA-803', strategyId, canGoLive: status.canGoLive, status });
+  } catch (err) {
+    log.error('promotion-gate health probe failed', {
+      strategyId,
+      reason: err instanceof Error ? err.message : String(err),
+    });
+    res.status(500).json({ error: 'Failed to compute promotion-gate status' });
+  }
+});
 
 // Per-strategy promotion status (per-stage state + computed metrics + verdict).
 // Scoped to the caller's paper ledger; backtest/sign-off are global. Any
