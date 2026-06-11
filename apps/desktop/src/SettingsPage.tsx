@@ -106,6 +106,22 @@ function PasswordInput({
   dataCredField?: string;
 }) {
   const [show, setShow] = useState(false);
+  // TRA-798 — the `data-*-ignore` attrs below (TRA-778) stop 1Password /
+  // LastPass, but Chromium's BUILT-IN password manager still ignores
+  // `autoComplete="off"` on a `type="password"` field and prefills the saved
+  // app-login (admin) password before the user types. Two more defenses are
+  // needed and only for fields that want NO autofill (they pass `off` or omit
+  // autoComplete) — the password-change form opts into real autofill
+  // (`current-password` / `new-password`) and must keep it: (1) send
+  // `autocomplete="new-password"` so the manager treats it as a *new*
+  // credential and never injects the saved login; (2) render read-only until
+  // first focus so nothing can be filled on mount. Neither alone is reliable.
+  const suppressAutofill = !autoComplete || autoComplete === 'off';
+  const effectiveAutoComplete = suppressAutofill ? 'new-password' : autoComplete;
+  const [autofillGuard, setAutofillGuard] = useState(suppressAutofill);
+  const antiAutofillProps = suppressAutofill
+    ? { readOnly: autofillGuard, onFocus: () => setAutofillGuard(false) }
+    : {};
   // `-webkit-text-security: disc` is the only way to mask a textarea in
   // Chromium/Electron. Falls back to plain text on browsers that don't
   // support it, which is acceptable on a local desktop app.
@@ -124,7 +140,8 @@ function PasswordInput({
         <textarea
           value={value}
           onChange={e => onChange(e.target.value)}
-          autoComplete={autoComplete}
+          autoComplete={effectiveAutoComplete}
+          {...antiAutofillProps}
           placeholder={placeholder}
           disabled={disabled}
           required={required}
@@ -152,7 +169,8 @@ function PasswordInput({
           type={show ? 'text' : 'password'}
           value={value}
           onChange={e => onChange(e.target.value)}
-          autoComplete={autoComplete}
+          autoComplete={effectiveAutoComplete}
+          {...antiAutofillProps}
           placeholder={placeholder}
           disabled={disabled}
           required={required}

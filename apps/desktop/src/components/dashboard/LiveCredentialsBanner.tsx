@@ -18,14 +18,33 @@ const FIELD_LABELS: Record<LiveCredentialField, string> = {
   liveApiSecretCrypto: 'Coinbase API secret',
 };
 
+// TRA-798 — the Coinbase (crypto) credential fields. Used to scope the banner
+// to its host dashboard so the crypto "missing API key" warning shows on the
+// Crypto dashboard and the Tradier/options warning shows on the Stocks
+// dashboard, instead of every page surfacing every market's missing creds.
+const CRYPTO_FIELDS: readonly LiveCredentialField[] = [
+  'liveApiKeyCrypto',
+  'liveApiSecretCrypto',
+];
+
 interface Props {
   settings: AccountSettings | null;
   onOpenSettings: (focusField: LiveCredentialField) => void;
+  // TRA-798 — restrict the banner to one market's credentials. 'crypto' shows
+  // only Coinbase fields; 'stocks' shows everything else (Tradier). Omit to
+  // show all missing creds (legacy behaviour).
+  market?: 'stocks' | 'crypto';
 }
 
-export function LiveCredentialsBanner({ settings, onOpenSettings }: Props) {
+export function LiveCredentialsBanner({ settings, onOpenSettings, market }: Props) {
   if (!settings || settings.mode !== 'live') return null;
-  const missing = findMissingLiveCredentials(settings);
+  const allMissing = findMissingLiveCredentials(settings);
+  const missing =
+    market === 'crypto'
+      ? allMissing.filter(f => CRYPTO_FIELDS.includes(f))
+      : market === 'stocks'
+        ? allMissing.filter(f => !CRYPTO_FIELDS.includes(f))
+        : allMissing;
   if (missing.length === 0) return null;
   const firstMissing = missing[0]!;
   return (

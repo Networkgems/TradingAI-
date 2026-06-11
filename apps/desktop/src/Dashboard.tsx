@@ -118,6 +118,7 @@ export default function Dashboard({ token, onLogout, onGoHome, onActivity, theme
           required cred is filled. */}
       <LiveCredentialsBanner
         settings={accountSettings}
+        market="stocks"
         onOpenSettings={(field) => { setFocusCredField(field); setProfileModal('settings'); }}
       />
 

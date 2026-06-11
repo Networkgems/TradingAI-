@@ -4,7 +4,7 @@
 // wires the panels together. Behaviour (toast feedback, error surfacing, sort
 // hooks, backoff lib from TRA-419) carries through unchanged.
 import { useCallback, useEffect, useRef, useState } from 'react';
-import type { CryptoEngineState, NewsItem, AccountSettings } from '@trading-app/shared';
+import type { CryptoEngineState, NewsItem, AccountSettings, LiveCredentialField } from '@trading-app/shared';
 import { CalendarTab } from './CalendarTab.tsx';
 import { ErrorBoundary } from './ErrorBoundary.tsx';
 import { SERVER_URL, HTTP_URL } from './server-url';
@@ -13,6 +13,7 @@ import { createReconnectController } from './lib/backoff';
 import type { Theme } from './components/ThemeToggle';
 import { CryptoDashboardHeader } from './components/dashboard/CryptoDashboardHeader';
 import { HaltBanner } from './components/dashboard/HaltBanner';
+import { LiveCredentialsBanner } from './components/dashboard/LiveCredentialsBanner';
 import { ProfileModals } from './components/dashboard/ProfileModals';
 import type { ProfileModal } from './components/dashboard/ProfileModals';
 import { CryptoWatchlistPanel } from './components/dashboard/CryptoWatchlistPanel';
@@ -33,6 +34,11 @@ export default function CryptoDashboard({ token, onBack, onLogout, onActivity, t
   const [profileModal, setProfileModal] = useState<ProfileModal | null>(null);
   const [isAdmin, setIsAdmin] = useState(false);
   const [accountMode, setAccountMode] = useState<'demo' | 'live'>('demo');
+  // TRA-798 — full settings snapshot so the crypto dashboard can surface its
+  // own missing-Coinbase-creds banner (the warning used to only render on the
+  // Stocks dashboard). `focusCredField` deep-links the banner → Settings.
+  const [accountSettings, setAccountSettings] = useState<AccountSettings | null>(null);
+  const [focusCredField, setFocusCredField] = useState<LiveCredentialField | null>(null);
   // TRA-535 — the global kill switch is a single account-settings flag shared
   // with the stock engine. Crypto's WebSocket state has no `tradingHalted`
   // field, so this is seeded from the settings fetch below and updated
@@ -111,10 +117,13 @@ export default function CryptoDashboard({ token, onBack, onLogout, onActivity, t
 
   // TRA-327 — apply a fresh AccountSettings snapshot after the initial fetch
   // and after the SettingsPage `onSettingsSaved` callback so a save takes
-  // effect without a hard refresh. Crypto only cares about `mode` today.
+  // effect without a hard refresh.
+  // TRA-798 — also retain the merged snapshot so the missing-creds banner can
+  // tell whether the Coinbase key/secret are still blank.
   const applyAccountSettings = useCallback((s: Partial<AccountSettings> | null | undefined) => {
     if (!s) return;
     if (s.mode === 'demo' || s.mode === 'live') setAccountMode(s.mode);
+    setAccountSettings(prev => ({ ...(prev ?? {}), ...s } as AccountSettings));
   }, []);
 
   useEffect(() => {
@@ -167,6 +176,15 @@ export default function CryptoDashboard({ token, onBack, onLogout, onActivity, t
           straight from the engaged flag. */}
       <HaltBanner halted={killSwitchEngaged} reason={null} />
 
+      {/* TRA-798 — the missing-Coinbase-creds warning lives here on the Crypto
+          dashboard (it previously only rendered on the Stocks dashboard).
+          `market="crypto"` scopes it to the Coinbase key/secret. */}
+      <LiveCredentialsBanner
+        settings={accountSettings}
+        market="crypto"
+        onOpenSettings={(field) => { setFocusCredField(field); setProfileModal('settings'); }}
+      />
+
       {/* TRA-690 — grouped nav: core trading surfaces stay flat; the Promotion
           Gate and P&L Calendar collapse into a "More ▾" dropdown to keep the bar
           clean. */}
@@ -187,7 +205,7 @@ export default function CryptoDashboard({ token, onBack, onLogout, onActivity, t
 
       <ProfileModals
         which={profileModal}
-        onClose={() => setProfileModal(null)}
+        onClose={() => { setProfileModal(null); setFocusCredField(null); }}
         token={token}
         httpUrl={HTTP_URL}
         context="crypto"
@@ -195,6 +213,7 @@ export default function CryptoDashboard({ token, onBack, onLogout, onActivity, t
         onModeChange={setAccountMode}
         onSettingsSaved={applyAccountSettings}
         onLogout={onLogout}
+        focusCredField={focusCredField}
       />
 
       <main className="content">

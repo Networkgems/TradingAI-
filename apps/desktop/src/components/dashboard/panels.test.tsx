@@ -528,6 +528,47 @@ describe('LiveCredentialsBanner (TRA-506)', () => {
     expect(screen.getByText(/Coinbase API key/)).toBeInTheDocument();
     expect(screen.getByText(/Coinbase API secret/)).toBeInTheDocument();
   });
+
+  // TRA-798 — the banner is rendered on both dashboards; `market` scopes it so
+  // the crypto warning lives on the Crypto dashboard and the Tradier warning on
+  // the Stocks dashboard, instead of every page surfacing every market's creds.
+  it('market="crypto" surfaces only Coinbase fields, ignoring blank Tradier creds', () => {
+    const broken: AccountSettings = {
+      ...liveFullCreds(),
+      liveApiKeyOptionsProduction: '',
+      liveAccountIdOptionsProduction: '',
+      liveApiKeyCrypto: '',
+      liveApiSecretCrypto: '',
+    };
+    render(<LiveCredentialsBanner settings={broken} market="crypto" onOpenSettings={() => {}} />);
+    expect(screen.getByText(/Coinbase API key/)).toBeInTheDocument();
+    expect(screen.queryByText(/Tradier production API token/)).not.toBeInTheDocument();
+  });
+
+  it('market="stocks" surfaces only Tradier fields, ignoring blank Coinbase creds', () => {
+    const broken: AccountSettings = {
+      ...liveFullCreds(),
+      liveApiKeyOptionsProduction: '',
+      liveAccountIdOptionsProduction: '',
+      liveApiKeyCrypto: '',
+      liveApiSecretCrypto: '',
+    };
+    render(<LiveCredentialsBanner settings={broken} market="stocks" onOpenSettings={() => {}} />);
+    expect(screen.getByText(/Tradier production API token/)).toBeInTheDocument();
+    expect(screen.queryByText(/Coinbase API key/)).not.toBeInTheDocument();
+  });
+
+  it('market="crypto" renders nothing when only Tradier creds are blank', () => {
+    const broken: AccountSettings = {
+      ...liveFullCreds(),
+      liveApiKeyOptionsProduction: '',
+      liveAccountIdOptionsProduction: '',
+    };
+    const { container } = render(
+      <LiveCredentialsBanner settings={broken} market="crypto" onOpenSettings={() => {}} />,
+    );
+    expect(container).toBeEmptyDOMElement();
+  });
 });
 
 // TRA-535 — operator-facing surface for the TRA-526 global kill switch.
