@@ -19,6 +19,7 @@ import type {
   MarketReviewGates,
   MarketRegimeLabel,
   Position,
+  Candle,
 } from '@trading-app/shared';
 
 // Inside an ET trading window: 10:00 AM ET on a Tuesday → 14:00 UTC during EDT.
@@ -3537,5 +3538,78 @@ describe('shouldBootArmLiveEquity — TRA-713 persistent live-equity boot-arm', 
   it('respects an explicit liveTradeEquitiesTradier:false opt-out', () => {
     const s = { ...prodSettings(), liveTradeEquitiesTradier: false };
     expect(shouldBootArmLiveEquity(s, PIN, prodEnv())).toBe(false);
+  });
+});
+
+// ── TRA-787 — SupertrendConfluence SHADOW channel ────────────────────────────
+// Acceptance #5: a tick fed a synthetic uptrend-confluence window produces a
+// shadow signal on the dedicated channel AND zero entries on the live order
+// path. The live strategies stay byte-for-byte identical (untouched here).
+describe('SignalEngine — SupertrendConfluence shadow channel (TRA-787)', () => {
+  // 5-minute OHLCV from explicit closes: high/low straddle the running close,
+  // open = prior close. 5m step so resampling to the strategy's 1h confirm fold
+  // yields enough buckets for the higher-timeframe Supertrend.
+  function build5m(closes: number[], spread = 0.5): Candle[] {
+    const step = 5 * 60_000;
+    return closes.map((close, i) => ({
+      symbol: 'TEST',
+      timestamp: i * step,
+      open: i > 0 ? closes[i - 1] : close,
+      high: Math.max(close, i > 0 ? closes[i - 1] : close) + spread,
+      low: Math.min(close, i > 0 ? closes[i - 1] : close) - spread,
+      close,
+      volume: 1_000,
+    }));
+  }
+
+  // Sawtooth uptrend (pullback-inside-an-uptrend): periodic dips cool RSI into
+  // the [50,70] entry band while the net drift keeps the SMA stack aligned and
+  // MACD positive — the exact confluence the strategy is built to buy. Deep
+  // enough that the 1h confirm fold has ≥ period+1 bars.
+  function sawUp(n: number, u = 0.5, d = 1.0, k = 3): number[] {
+    const closes: number[] = [];
+    let p = 100;
+    let i = 0;
+    while (closes.length < n) {
+      const inUp = i % (k + 1) !== k;
+      closes.push(p);
+      p += inUp ? u : -d;
+      i++;
+    }
+    while (closes.length > 2 && closes[closes.length - 1] <= closes[closes.length - 2]) closes.pop();
+    return closes;
+  }
+
+  it('surfaces a shadow signal on the dedicated channel and opens NOTHING on the live path', () => {
+    const engine = new SignalEngine();
+    const candles = build5m(sawUp(240));
+    // Seed the shadow 5m series directly (the deep-pull refresh is feed-bound;
+    // the per-tick evaluation reads this cache).
+    (engine as unknown as { shadowCandleCache: Map<string, Candle[]> }).shadowCandleCache.set('TEST', candles);
+
+    (engine as unknown as { evaluateSupertrendShadow: (s: string[]) => void }).evaluateSupertrendShadow(['TEST']);
+
+    const state = engine.getState();
+    // Shadow channel carries the long signal …
+    expect(state.supertrendShadowSignals).toHaveLength(1);
+    expect(state.supertrendShadowSignals[0].type).toBe('supertrend_confluence');
+    expect(state.supertrendShadowSignals[0].side).toBe('buy');
+    expect(state.supertrendShadowSignals[0].symbol).toBe('TEST');
+    // … and NOTHING reached the live order path: no live signal, no position.
+    expect(state.signals).toHaveLength(0);
+    expect(state.account.openPositions).toHaveLength(0);
+  });
+
+  it('emits no shadow signal on a flat tape (and still touches no live path)', () => {
+    const engine = new SignalEngine();
+    const flat = build5m(Array.from({ length: 240 }, () => 100));
+    (engine as unknown as { shadowCandleCache: Map<string, Candle[]> }).shadowCandleCache.set('TEST', flat);
+
+    (engine as unknown as { evaluateSupertrendShadow: (s: string[]) => void }).evaluateSupertrendShadow(['TEST']);
+
+    const state = engine.getState();
+    expect(state.supertrendShadowSignals).toHaveLength(0);
+    expect(state.signals).toHaveLength(0);
+    expect(state.account.openPositions).toHaveLength(0);
   });
 });

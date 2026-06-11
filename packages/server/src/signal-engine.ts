@@ -1,4 +1,4 @@
-import { OrbStrategy, BbFadeStrategy, IchimokuStrategy, TradierOptionsClient, TradierOrderClient, TRADIER_REJECTED_STATUSES, evaluateSma200, SMA200_MIN_BARS, SMA200_DEBOUNCE_BARS, composeTechnicalSnapshot, resampleCandles, TF_BUCKET_MS } from '@trading-app/engine';
+import { OrbStrategy, BbFadeStrategy, IchimokuStrategy, SupertrendConfluenceStrategy, confluenceSide, supertrend, TradierOptionsClient, TradierOrderClient, TRADIER_REJECTED_STATUSES, evaluateSma200, SMA200_MIN_BARS, SMA200_DEBOUNCE_BARS, composeTechnicalSnapshot, resampleCandles, TF_BUCKET_MS } from '@trading-app/engine';
 import type { TradierAccountBalance } from '@trading-app/engine';
 import { WATCHLIST, MANAGED_ACCOUNT_RATIO, MAX_CONSECUTIVE_LOSSES, DAILY_DRAWDOWN_HALT_PCT, OPTIONS_PER_TICKET_DOLLAR_FLOOR, OPTIONS_POSITION_CAP_RATIO, aliasWatchlistSymbol, isLiveTradierOptionsEnabled, isStockMarketOpen, perPositionCap, resolveAutoManageImportedTradierOptions, resolveDemoCostModel, resolveHoldLiveOptionsOvernight, resolveLiveTradeEquitiesTradier, resolveManagedAccountRatio, resolveMarketReviewGatesEnabled, resolveRiskPerTrade, resolveRvDtePrefs, resolveTradierOptionsCreds, validateBracket, DEFAULT_RV_DTE_MIN, DEFAULT_RV_DTE_MAX, DEFAULT_RV_DTE_TARGET, scoreNewsSentiment, aggregateSymbolSentiment, aggregateFedSentiment, aggregateStockTwitsSentiment, dedupeStockTwitsMessages, mapCuratedMessagesBySymbol, nameAliasesFor } from '@trading-app/shared';
 import type { TradeSignal, RelativeValueSignal, Sma200Signal, Candle, OptionsAccountState, SignalType, Position, OptionPosition, AccountMode, AccountSettings, AccountState, NewsItem, SymbolSentiment, SocialSentiment, StockTwitsMessage, TechnicalSignalSnapshot, TradierEnv, MarketReview, MarketReviewGates, EngineMarketReviewState, GatedStrategyNote, AgentRecommendation } from '@trading-app/shared';
@@ -38,6 +38,12 @@ import { emitAlert } from './notifications/index.js';
 
 const balanceLog = logger.child({ module: 'signal-engine' });
 const log = logger.child({ module: 'signal-engine' });
+// TRA-787 — dedicated structured-logging child for the SupertrendConfluence
+// SHADOW channel. Every emitted shadow signal is logged here with its full
+// confluence read so QuantTrader can validate signal quality against the live
+// tape. This is observe-only telemetry — nothing on this logger ever routes an
+// order (live promotion is gated on the TRA-734 real-chain go/no-go).
+const supertrendShadowLog = logger.child({ module: 'supertrend-shadow' });
 
 export interface SymbolState {
   symbol: string;
@@ -57,6 +63,17 @@ export interface SymbolState {
 export interface EngineState {
   symbols: SymbolState[];
   signals: TradeSignal[];
+  /**
+   * TRA-787 — SupertrendConfluence SHADOW channel. Observe-only signals the
+   * supertrend engine computes off the live tape each tick. These are
+   * DELIBERATELY kept out of `signals[]` (which drives order placement): the
+   * shadow channel surfaces the strategy for QuantTrader to validate signal
+   * quality, but live capital routing for supertrend stays gated pending the
+   * TRA-734 real-chain go/no-go (Phase-2 synthetic verdict was CONDITIONAL
+   * NO-GO, TRA-729). The UI / News tab can read `payload.supertrendShadowSignals`
+   * off the WS `state` message. Empty until the first qualifying tick.
+   */
+  supertrendShadowSignals: TradeSignal[];
   account: AccountState;
   closedPositions: ReturnType<PaperAccount['checkExits']>;
   options: OptionsAccountState;
@@ -231,6 +248,30 @@ const SMA200_DAILY_BARS = SMA200_MIN_BARS + 30;
 const TECHNICAL_SNAPSHOT_REFRESH_MS = 5 * 60_000;
 const MTF_MINUTE_BARS = 2000;
 const MTF_DAILY_BARS = 260;
+
+/**
+ * TRA-787 — SupertrendConfluence SHADOW channel parameters.
+ *
+ * Primary intraday signal timeframe is 5m (board guidance, TRA-727). The
+ * minute-bar feed is resampled to {@link SUPERTREND_SHADOW_TF_MS} for the
+ * signal fold; the strategy then derives its higher-timeframe (1h) confirm by
+ * resampling those 5m bars internally (TRA-728 default), so the deep window must
+ * span enough sessions that the 1h Supertrend confirm has ≥ period+1 bars. The
+ * ORB/BB/Ichimoku cache (80 minute bars) is far too shallow for this slow
+ * multi-confirmation strategy, so the shadow path pulls its OWN deeper window
+ * from the same Tradier minute feed — leaving the existing strategies'
+ * candle cache byte-for-byte untouched (TRA-787 acceptance #5).
+ *
+ * The deep pull is throttled to once per minute ({@link SUPERTREND_SHADOW_REFRESH_MS}):
+ * minute bars are immutable within their own minute, and the per-minute upstream
+ * cache (TRA-552) de-dupes against the MTF snapshot's deeper pull. The shadow
+ * EVALUATION still runs every tick off the cached 5m series (TRA-787 acceptance #1).
+ */
+const SUPERTREND_SHADOW_TF_MS = 5 * 60_000;
+const SUPERTREND_SHADOW_MINUTE_BARS = 750;
+const SUPERTREND_SHADOW_REFRESH_MS = 60_000;
+/** Cap the surfaced shadow channel so a long session can't grow it unbounded. */
+const SUPERTREND_SHADOW_MAX_SIGNALS = MAX_SIGNALS;
 
 /**
  * TRA-389 — how often the engine re-reads the persisted premarket
@@ -420,6 +461,14 @@ export class SignalEngine {
   // mirrors the live crypto-engine roster).
   private readonly bbFade = new BbFadeStrategy();
   private readonly ichimoku = new IchimokuStrategy();
+  /**
+   * TRA-787 — SupertrendConfluence in SHADOW (observe-only) mode. Constructed
+   * with the TRA-728 shipped defaults (no invented params): 5m signal fold
+   * (resampled below) with the strategy's own 1h MTF confirm. SHADOW means it
+   * computes + surfaces signals but NEVER places an order — see
+   * {@link evaluateSupertrendShadow}.
+   */
+  private readonly supertrendShadow = new SupertrendConfluenceStrategy();
   private account: PaperAccount;
   /**
    * TRA-233 — per-env paper options accounts. Sandbox and production each
@@ -471,6 +520,23 @@ export class SignalEngine {
   private symbolState: Map<string, SymbolState> = new Map();
   private candleCache: Map<string, Candle[]> = new Map();
   private recentSignals: TradeSignal[] = [];
+  /**
+   * TRA-787 — per-symbol 5m candle series for the SupertrendConfluence shadow
+   * scan, resampled from a deeper minute-bar pull than the ORB cache. Refreshed
+   * on the {@link SUPERTREND_SHADOW_REFRESH_MS} cadence by
+   * {@link refreshSupertrendShadowSeries}; read every tick by
+   * {@link evaluateSupertrendShadow}. Kept separate from {@link candleCache} so
+   * the existing strategies' inputs stay byte-for-byte unchanged.
+   */
+  private shadowCandleCache: Map<string, Candle[]> = new Map();
+  /** TRA-787 — last successful shadow 5m-series refresh (gates the 60s cadence). */
+  private lastSupertrendShadowRefreshAt = 0;
+  /**
+   * TRA-787 — latest SupertrendConfluence shadow signals surfaced on
+   * EngineState.supertrendShadowSignals. Observe-only: never merged into
+   * {@link recentSignals} and never routed to an order path.
+   */
+  private supertrendShadowSignals: TradeSignal[] = [];
   /** TRA-451 — last SMA-200 daily-bar scan timestamp (gates the 4h cadence). */
   private lastSma200ScanAt = 0;
   /**
@@ -1617,6 +1683,29 @@ export class SignalEngine {
       }
     }
 
+    // TRA-787 — SupertrendConfluence SHADOW pass. Evaluates every watchlist
+    // symbol off the live tape and surfaces the result on the dedicated
+    // `supertrendShadowSignals` channel. This is OBSERVE-ONLY: it runs
+    // independently of the auto-trading flag / risk halt (those gate the live
+    // order paths, which this never touches) and only requires fresh data, so
+    // it is gated to regular market hours — outside RTH the minute feed is stale
+    // (no prints) and a shadow read would be off post-close noise. Live capital
+    // routing for supertrend stays OFF and is gated on the TRA-734 real-chain
+    // go/no-go; see {@link evaluateSupertrendShadow}.
+    if (isStockMarketOpen()) {
+      if (Date.now() - this.lastSupertrendShadowRefreshAt >= SUPERTREND_SHADOW_REFRESH_MS) {
+        this.lastSupertrendShadowRefreshAt = Date.now();
+        try {
+          await this.refreshSupertrendShadowSeries(activeSymbols);
+        } catch (err: unknown) {
+          supertrendShadowLog.warn('shadow 5m-series refresh threw', {
+            reason: err instanceof Error ? err.message : String(err),
+          });
+        }
+      }
+      this.evaluateSupertrendShadow(activeSymbols);
+    }
+
     // TRA-191: relative-value scanner — the sole stock-options strategy in
     // this iteration. Routes the highest-scoring `cheap` candidate per symbol
     // into the options account as a long premium ticket. Gated to market
@@ -2402,6 +2491,120 @@ export class SignalEngine {
   private async refreshCandles(symbol: string): Promise<void> {
     const bars = await fetchMinuteBars(symbol, 80);
     if (bars.length > 0) this.candleCache.set(symbol, bars);
+  }
+
+  /**
+   * TRA-787 — refresh the per-symbol 5m candle series that backs the
+   * SupertrendConfluence shadow scan. Pulls a deeper minute window than the ORB
+   * cache ({@link SUPERTREND_SHADOW_MINUTE_BARS}) so the strategy's 1h MTF
+   * confirm fold has enough history, then resamples to 5m. Best-effort and
+   * batched: a per-symbol failure is swallowed so a cold feed can't take down
+   * the shadow pass, and the last good 5m series stays cached for the next tick.
+   * Leaves {@link candleCache} (the live strategies' input) untouched.
+   */
+  private async refreshSupertrendShadowSeries(symbols: string[]): Promise<void> {
+    if (symbols.length === 0) return;
+    const BATCH = 5;
+    for (let i = 0; i < symbols.length; i += BATCH) {
+      await Promise.all(
+        symbols.slice(i, i + BATCH).map(async (sym) => {
+          let minuteBars: Candle[];
+          try {
+            minuteBars = await fetchMinuteBars(sym, SUPERTREND_SHADOW_MINUTE_BARS);
+          } catch (err: unknown) {
+            supertrendShadowLog.warn('shadow minute-bar fetch failed', {
+              symbol: sym, reason: err instanceof Error ? err.message : String(err),
+            });
+            return;
+          }
+          if (minuteBars.length === 0) return;
+          const fiveMin = resampleCandles(minuteBars, SUPERTREND_SHADOW_TF_MS);
+          if (fiveMin.length > 0) this.shadowCandleCache.set(sym, fiveMin);
+        }),
+      );
+    }
+  }
+
+  /**
+   * TRA-787 — SupertrendConfluence SHADOW evaluation. Runs every tick off the
+   * cached 5m series ({@link shadowCandleCache}) and rebuilds
+   * {@link supertrendShadowSignals}, the dedicated observe-only channel surfaced
+   * on EngineState / WS.
+   *
+   * ────────────────────────────────────────────────────────────────────────
+   *  LIVE ORDER ROUTING FOR SUPERTREND IS OFF.
+   *  This method computes and SURFACES signals only. It must NEVER call any
+   *  order-submission / bracket / paper-open path. Promoting supertrend to live
+   *  capital is gated on the TRA-734 real-chain go/no-go sign-off (the Phase-2
+   *  synthetic-chain verdict was CONDITIONAL NO-GO, TRA-729). Do not wire this
+   *  list into `recentSignals` / `signals[]` or any open-position call.
+   * ────────────────────────────────────────────────────────────────────────
+   *
+   * Each emitted signal is structured-logged on the `supertrend-shadow` child
+   * with its full confluence read (supertrend value + flip state, the
+   * MA-stack / MACD / RSI booleans) for QuantTrader's signal-quality review.
+   */
+  private evaluateSupertrendShadow(symbols: string[]): void {
+    const emitted: TradeSignal[] = [];
+    for (const sym of symbols) {
+      const fiveMin = this.shadowCandleCache.get(sym);
+      if (!fiveMin || fiveMin.length === 0) continue;
+      // Uses the TRA-728 shipped defaults end-to-end: confluenceSide for the
+      // signal-timeframe read + the strategy's own 1h confirm gate inside
+      // `evaluate`. No params are invented here.
+      const signal = this.supertrendShadow.evaluate(sym, fiveMin);
+      if (!signal) continue;
+      // Stamp the active mode for parity with the live signal panel, but this
+      // list is NEVER routed — it only feeds the shadow channel + telemetry.
+      signal.mode = this.mode;
+
+      // Pull the confluence booleans + raw Supertrend read for logging. The
+      // side matches the emitted signal, so the same-side reads describe it.
+      const decision = confluenceSide(fiveMin);
+      const stSeries = supertrend(fiveMin);
+      let stLine: number | null = null;
+      let stDirection: 'green' | 'red' | null = null;
+      let stFlipped = false;
+      for (let i = stSeries.length - 1; i >= 0; i--) {
+        const bar = stSeries[i];
+        if (!bar) continue;
+        stLine = bar.line;
+        stDirection = bar.direction;
+        // "Flip state": did the active Supertrend direction just change on the
+        // latest defined bar vs the previous defined bar?
+        for (let j = i - 1; j >= 0; j--) {
+          const prev = stSeries[j];
+          if (!prev) continue;
+          stFlipped = prev.direction !== bar.direction;
+          break;
+        }
+        break;
+      }
+
+      supertrendShadowLog.info('supertrend shadow signal', {
+        symbol: sym,
+        direction: signal.side,
+        timeframe: '5m',
+        supertrendLine: stLine,
+        supertrendDirection: stDirection,
+        supertrendFlipped: stFlipped,
+        maStackAligned: decision?.reads.maStackAligned ?? null,
+        macdOk: decision?.reads.macdOk ?? null,
+        rsiOk: decision?.reads.rsiOk ?? null,
+        supertrendGreen: decision?.reads.supertrendGreen ?? null,
+        entryPrice: signal.entryPrice,
+        stopLoss: signal.stopLoss,
+        takeProfit: signal.takeProfit,
+        timestamp: signal.timestamp,
+        // Explicit reminder in the log line itself: this never opened anything.
+        routed: false,
+        liveGatedOn: 'TRA-734',
+      });
+
+      emitted.unshift(signal);
+      if (emitted.length > SUPERTREND_SHADOW_MAX_SIGNALS) emitted.pop();
+    }
+    this.supertrendShadowSignals = emitted;
   }
 
   /**
@@ -3831,6 +4034,8 @@ export class SignalEngine {
       return {
         symbols,
         signals: scopedSignals,
+        // TRA-787 — observe-only supertrend shadow channel (never routed).
+        supertrendShadowSignals: this.supertrendShadowSignals,
         account: liveAccount,
         closedPositions: [],
         options: this.optionsAccount.getStateForMode('live'),
@@ -3847,6 +4052,8 @@ export class SignalEngine {
     return {
       symbols,
       signals: scopedSignals,
+      // TRA-787 — observe-only supertrend shadow channel (never routed).
+      supertrendShadowSignals: this.supertrendShadowSignals,
       account: this.buildAccountState(),
       closedPositions: this.allClosedPositions.filter(p => isMode(p.mode)).slice(-20),
       options: this.optionsAccount.getStateForMode('demo'),

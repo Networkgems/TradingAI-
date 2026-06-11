@@ -30,6 +30,7 @@ function makeEngineState(overrides: Partial<EngineState> = {}): EngineState {
       { symbol: 'AMD', price: 90, volume: 1_000_000, change: -2, changePct: -2.17, lastUpdated: Date.now() },
     ],
     signals: [],
+    supertrendShadowSignals: [],
     account: {
       totalEquity: 25_000,
       availableCash: 24_000,
