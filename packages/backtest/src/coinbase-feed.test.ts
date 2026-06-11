@@ -449,6 +449,35 @@ describe('paceCoinbaseFetch (TRA-329)', () => {
     expect(fetchMock.mock.calls.length).toBe(before);
   });
 
+  it('trips on slow failures spaced beyond the old 30s window (TRA-804)', async () => {
+    // Regression for the prod incident: when a Coinbase host hangs, each fetch
+    // aborts only at the multi-second per-fetch timeout, so 5 serialized
+    // failures span far longer than the legacy 30s sliding window. The old
+    // window-based counter aged the earliest failures out before the 5th
+    // landed, so the breaker never tripped and the dead host got hammered
+    // every tick. With consecutive-failure semantics the breaker must still
+    // trip even when each failure is >30s apart.
+    vi.stubGlobal('fetch', vi.fn(async (_url: string | URL, init?: RequestInit) => {
+      const sig = init?.signal ?? null;
+      return new Promise<Response>((_resolve, reject) => {
+        if (!sig) return;
+        const onAbort = () => reject(new DOMException('Aborted', 'AbortError'));
+        if (sig.aborted) onAbort();
+        else sig.addEventListener('abort', onAbort);
+      });
+    }));
+
+    expect(isCoinbaseBreakerOpen()).toBe(false);
+    for (let i = 0; i < 5; i++) {
+      const p = paceCoinbaseFetch(`https://x/slow${i}`, {}, { timeoutMs: 100 }).catch((e) => e);
+      await vi.runAllTimersAsync();
+      await p;
+      // Advance the clock well past the old 30s window between each failure.
+      await vi.advanceTimersByTimeAsync(31_000);
+    }
+    expect(isCoinbaseBreakerOpen()).toBe(true);
+  });
+
   it('resets the failure counter on a successful fetch', async () => {
     // Pattern: fail, fail, fail, fail, success — counter must reset so the
     // next 4 failures don't trip the breaker (threshold is 5).

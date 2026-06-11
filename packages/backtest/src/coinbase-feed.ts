@@ -60,7 +60,6 @@ const COINBASE_EXCHANGE_MIN_GAP_MS = 120;
 const COINBASE_ADVANCED_TRADE_MIN_GAP_MS = 150;
 const COINBASE_FETCH_TIMEOUT_MS = 7_000;
 const COINBASE_BREAKER_FAILURE_THRESHOLD = 5;
-const COINBASE_BREAKER_FAILURE_WINDOW_MS = 30_000;
 const COINBASE_BREAKER_COOLDOWN_MS = 60_000;
 
 interface HostPacer {
@@ -87,20 +86,26 @@ interface HostPacerOptions {
 function createHostPacer(opts: HostPacerOptions): HostPacer {
   let chain: Promise<unknown> = Promise.resolve();
   let lastRequestAt = 0;
-  let recentFailures: number[] = [];
+  // TRA-804 — count *consecutive* transport failures, not failures within a
+  // sliding time window. The earlier window-based counter (30s window, 5
+  // failures) was silently defeated by the dominant prod failure mode: when a
+  // Coinbase host hangs, each fetch aborts only at the ~7s per-fetch timeout,
+  // so 5 serialized failures span ~35s — and the oldest aged out of the 30s
+  // window before the 5th landed, so the breaker never tripped. The host then
+  // got hammered every tick (per-user crypto ticks spent minutes on dead
+  // Advanced Trade calls), starving the event loop and dropping sessions. A
+  // success resets the counter, so this is still robust against sporadic blips
+  // — it only trips on a genuine run of back-to-back failures.
+  let consecutiveFailures = 0;
   let breakerOpenUntil = 0;
 
   const isBreakerOpen = (): boolean => Date.now() < breakerOpenUntil;
 
   const recordFailure = (): void => {
-    const now = Date.now();
-    recentFailures.push(now);
-    while (recentFailures.length > 0 && recentFailures[0] < now - COINBASE_BREAKER_FAILURE_WINDOW_MS) {
-      recentFailures.shift();
-    }
-    if (recentFailures.length >= COINBASE_BREAKER_FAILURE_THRESHOLD) {
-      breakerOpenUntil = now + COINBASE_BREAKER_COOLDOWN_MS;
-      recentFailures = [];
+    consecutiveFailures += 1;
+    if (consecutiveFailures >= COINBASE_BREAKER_FAILURE_THRESHOLD) {
+      breakerOpenUntil = Date.now() + COINBASE_BREAKER_COOLDOWN_MS;
+      consecutiveFailures = 0;
       console.warn(
         `[coinbase-feed] ${opts.logLabel} circuit breaker tripped — skipping for ${COINBASE_BREAKER_COOLDOWN_MS / 1000}s after ${COINBASE_BREAKER_FAILURE_THRESHOLD} consecutive transport failures`,
       );
@@ -108,7 +113,7 @@ function createHostPacer(opts: HostPacerOptions): HostPacer {
   };
 
   const recordSuccess = (): void => {
-    recentFailures = [];
+    consecutiveFailures = 0;
   };
 
   const pace = async (
@@ -157,7 +162,7 @@ function createHostPacer(opts: HostPacerOptions): HostPacer {
   };
 
   const reset = (): void => {
-    recentFailures = [];
+    consecutiveFailures = 0;
     breakerOpenUntil = 0;
     chain = Promise.resolve();
     lastRequestAt = 0;
