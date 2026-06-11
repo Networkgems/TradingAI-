@@ -46,7 +46,15 @@ import type { OtmRiskParams, RvRiskParams } from '@trading-app/shared';
 import {
   OptionsReplayAccount,
   type ReplaySignalType,
+  type ReplaySpreadStrategy,
+  type SpreadRiskParams,
 } from './options-replay-account.js';
+import {
+  modelPutWrite,
+  modelCallDebitSpread,
+  DEFAULT_STRUCTURE_CONFIG,
+  type StructureModelConfig,
+} from './options-replay-structures.js';
 import {
   loadChainDays,
   estimateSpotFromChain,
@@ -66,7 +74,23 @@ export interface ReplayConfig {
   optionsDailyTradesLimit: number;
   otmRiskParams: OtmRiskParams;
   rvRiskParams: RvRiskParams;
+  /** TRA-800 — per-structure sizing knobs for the defined-risk combos. */
+  spreadRiskParams: Record<ReplaySpreadStrategy, SpreadRiskParams>;
+  /** TRA-800 — structure-modeler config (e.g. put-write OTM offset). */
+  structureConfig: StructureModelConfig;
 }
+
+/**
+ * TRA-800 — default per-structure budget ratios (fraction of managed equity
+ * reserved as capital-at-risk per lot). The cash-secured put-write reserves a
+ * far larger per-lot capital (≈ strike ×100) than the narrow call debit spread,
+ * so it gets a higher budget slice; both stay well under the live RV ticket
+ * budget (2%) scaled for their wider capital footprints.
+ */
+export const DEFAULT_SPREAD_RISK_PARAMS: Record<ReplaySpreadStrategy, SpreadRiskParams> = {
+  put_write: { budgetRatio: 0.5 },
+  call_debit_spread: { budgetRatio: 0.05 },
+};
 
 export const DEFAULT_REPLAY_CONFIG: ReplayConfig = {
   equityBuckets: [2000, 5000, 10000],
@@ -74,6 +98,8 @@ export const DEFAULT_REPLAY_CONFIG: ReplayConfig = {
   optionsDailyTradesLimit: 10,
   otmRiskParams: OTM_RISK_PARAMS,
   rvRiskParams: RV_RISK_PARAMS,
+  spreadRiskParams: DEFAULT_SPREAD_RISK_PARAMS,
+  structureConfig: DEFAULT_STRUCTURE_CONFIG,
 };
 
 /** Build an OCC-symbol → mid-mark map from a day's chains across all symbols. */
@@ -99,7 +125,31 @@ function resolveSpot(file: { spot: number | null; rows: OptionChainRow[] }): num
   return estimateSpotFromChain(file.rows);
 }
 
-/** Per-strategy trail / partial schedule — mirrors `PaperOptionsAccount.checkExits`. */
+/**
+ * TRA-800 — UPPER-CASE symbol → resolved spot for a day. Feeds the defined-risk
+ * combo settlement (leg-intrinsic payoff at expiry needs the underlying price).
+ */
+function spotsForDay(day: ChainDay): Map<string, number> {
+  const spots = new Map<string, number>();
+  for (const [sym, file] of day.bySymbol) {
+    const spot = resolveSpot(file);
+    if (spot != null && Number.isFinite(spot) && spot > 0) spots.set(sym.toUpperCase(), spot);
+  }
+  return spots;
+}
+
+/**
+ * Per-structure trail / partial schedule — mirrors `PaperOptionsAccount.checkExits`.
+ *
+ * TRA-800 — only the single-leg scanner structures are managed per tick, so
+ * those two branch to their own OTM / RV risk params. The two defined-risk
+ * combos (`put_write` / `call_debit_spread`) are NOT marked per tick (mirrors
+ * the live `checkExits` combo skip); their "risk schedule" is the per-structure
+ * sizing budget ratio (`cfg.spreadRiskParams`), wired into `openSpread`, and
+ * their exit is the leg-intrinsic settlement at expiry. This schedule is never
+ * invoked for a combo (markAndCheckExits skips them), but we branch the union
+ * exhaustively so a future per-tick combo manager has an obvious seam.
+ */
 function riskScheduleOf(cfg: ReplayConfig) {
   return (signalType: ReplaySignalType) => {
     const r = signalType === 'otm_mispricing' ? cfg.otmRiskParams : cfg.rvRiskParams;
@@ -122,23 +172,34 @@ export function replayBucket(days: readonly ChainDay[], startingEquity: number, 
     optionsDailyTradesLimit: cfg.optionsDailyTradesLimit,
     otmRiskParams: cfg.otmRiskParams,
     rvRiskParams: cfg.rvRiskParams,
+    spreadRiskParams: cfg.spreadRiskParams,
   });
   const riskOf = riskScheduleOf(cfg);
   let skippedZeroSize = 0;
+  // TRA-800 — prior-day spot per symbol drives the call-debit-spread trend gate
+  // (only enter the bull structure when the underlying is rising).
+  let prevSpotBySymbol = new Map<string, number>();
 
   for (const day of days) {
     account.startDay(day.date);
     const marks = marksForDay(day);
+    const spotBySymbol = spotsForDay(day);
 
-    // 1. Mark + exit open positions, then expire anything past its date.
+    // 1. Mark + exit single-leg positions, settle any expired defined-risk
+    //    combos at their leg-intrinsic payoff, then expire single-leg contracts.
     account.markAndCheckExits(day.date, marks, riskOf);
+    account.settleSpreads(day.date, spotBySymbol);
     account.expireOrForceCloseDueContracts(day.date, marks);
 
+    const nextPrevSpot = new Map<string, number>();
+
     // 2. Scan today's chains and open the strongest long-only candidate per
-    //    symbol per scanner.
+    //    symbol per scanner, plus the two defined-risk structures.
     for (const file of day.bySymbol.values()) {
       const spot = resolveSpot(file);
       if (spot == null || !Number.isFinite(spot) || spot <= 0) continue;
+      const sym = file.symbol.toUpperCase();
+      nextPrevSpot.set(sym, spot);
       const now = file.recordedAt;
 
       // OTM scanner — long-only entries on `cheap` mispricings.
@@ -175,14 +236,35 @@ export function replayBucket(days: readonly ChainDay[], startingEquity: number, 
         });
         if (outcome.reason === 'zero_size') skippedZeroSize += 1;
       }
+
+      // TRA-800 — defined-risk structures (held to expiry, settled at payoff).
+      //   • put-write: cash-secured short put, always modeled (credit primary).
+      //   • call debit spread: trend-filtered — only enter when the underlying
+      //     rose vs the prior recorded day for this symbol.
+      const putWrite = modelPutWrite(sym, spot, file.rows, now, cfg.structureConfig);
+      if (putWrite) {
+        const outcome = account.openSpread(putWrite);
+        if (outcome.reason === 'zero_size') skippedZeroSize += 1;
+      }
+
+      const prevSpot = prevSpotBySymbol.get(sym);
+      const trendOk = typeof prevSpot === 'number' && spot > prevSpot;
+      const callSpread = modelCallDebitSpread(sym, spot, file.rows, trendOk, now, cfg.structureConfig);
+      if (callSpread) {
+        const outcome = account.openSpread(callSpread);
+        if (outcome.reason === 'zero_size') skippedZeroSize += 1;
+      }
     }
 
     account.recordEquityForDay(day.date);
+    prevSpotBySymbol = nextPrevSpot;
   }
 
-  // Tail-close everything still open at the last day's marks.
+  // Tail-close everything still open at the last day's marks: settle any
+  // remaining defined-risk combos at the last spot, then tail-close single legs.
   const lastDay = days[days.length - 1];
   if (lastDay) {
+    account.settleSpreads(lastDay.date, spotsForDay(lastDay), { force: true });
     account.closeAllOpenAt(lastDay.date, marksForDay(lastDay));
   }
 

@@ -25,11 +25,29 @@
  * Pure / in-memory. No timers, no Tradier I/O.
  */
 
-import type { OptionType, OtmRiskParams, RvRiskParams } from '@trading-app/shared';
+import type { OptionLeg, OptionType, OtmRiskParams, RvRiskParams } from '@trading-app/shared';
 
 const CONTRACT_MULTIPLIER = 100;
 
-export type ReplaySignalType = 'otm_mispricing' | 'relative_value';
+/**
+ * TRA-800 — the structures the replay engine can model. The two single-leg
+ * scanner sources (`otm_mispricing` / `relative_value`) are managed per-tick by
+ * {@link OptionsReplayAccount.markAndCheckExits}; the two defined-risk
+ * structures (`put_write` / `call_debit_spread`) are entered as one combo row
+ * via {@link OptionsReplayAccount.openSpread}, held to expiry, and settled at
+ * their defined-risk payoff by {@link OptionsReplayAccount.settleSpreads} —
+ * exactly mirroring the live `PaperOptionsAccount.openDefinedRiskSpread`
+ * (combos are skipped by `checkExits` server-side and booked off the capped
+ * worst-case basis at close/expiry).
+ */
+export type ReplaySignalType =
+  | 'otm_mispricing'
+  | 'relative_value'
+  | 'put_write'
+  | 'call_debit_spread';
+
+/** TRA-800 — the two defined-risk structure ids (a strict subset of {@link ReplaySignalType}). */
+export type ReplaySpreadStrategy = 'put_write' | 'call_debit_spread';
 
 export interface ReplayPosition {
   id: string;
@@ -56,7 +74,31 @@ export interface ReplayPosition {
   /** Total realized P&L over the lifetime of this position (dollars). */
   pnl: number;
   /** Reason the last-closing leg fired. */
-  exitReason?: 'tp1_partial' | 'stop_loss' | 'trailing' | 'expired' | 'forced_close';
+  exitReason?:
+    | 'tp1_partial'
+    | 'stop_loss'
+    | 'trailing'
+    | 'expired'
+    | 'forced_close'
+    | 'settled';
+  // ── TRA-800 — defined-risk combo payload (only set when `signalType` is a
+  //    spread). Per-1-lot figures so {@link settleSpreads} can compute the
+  //    payoff then scale by `contracts`; mirrors the live combo's `legs` /
+  //    `netUsd` / `maxLossUsd` / `maxProfitUsd` / `breakevens`.
+  /** True for the two defined-risk structures (combo, held to expiry). */
+  isCombo?: boolean;
+  /** The full modeled structure (1 leg for put-write, 2 for the call debit spread). */
+  legs?: OptionLeg[];
+  /** + credit / − debit at entry, USD per 1-lot. */
+  netUsdPerLot?: number;
+  /** Capped capital-at-risk, USD per 1-lot. */
+  maxLossPerLot?: number;
+  /** Capped max profit, USD per 1-lot. */
+  maxProfitPerLot?: number;
+  /** Payoff breakeven underlying price(s). */
+  breakevens?: number[];
+  /** Structure id, e.g. `put_write` / `call_debit_spread`. */
+  spreadStrategy?: ReplaySpreadStrategy;
 }
 
 export interface OpenOtmCandidate {
@@ -80,12 +122,73 @@ export interface OpenRvCandidate {
   classification: 'cheap' | 'expensive' | 'monotonic_violation' | 'below_intrinsic' | 'fair';
 }
 
+/**
+ * TRA-800 — open a defined-risk structure as one combo row. Mirrors the
+ * `params` object of the live `PaperOptionsAccount.openDefinedRiskSpread`: the
+ * whole structure is sized off its capped per-lot capital-at-risk
+ * (`maxLossUsd`), entered for a uniform reserved-capital debit regardless of
+ * net credit / debit. All dollar figures are per 1-lot (×100).
+ */
+export interface OpenSpreadCandidate {
+  symbol: string;
+  strategy: ReplaySpreadStrategy;
+  legs: OptionLeg[];
+  /** + credit / − debit, USD per 1-lot. */
+  netUsd: number;
+  /** Capped capital-at-risk, USD per 1-lot. */
+  maxLossUsd: number;
+  /** Capped max profit, USD per 1-lot. */
+  maxProfitUsd: number;
+  breakevens: number[];
+  expiration: string;
+  /** Underlying spot at entry (recorded for the report; not used for cash). */
+  spot: number;
+  /** Stamped onto the position so the report can hit-rate by it. */
+  classification: string;
+}
+
+/** TRA-800 — per-structure sizing knob (fraction of managed equity reserved per lot). */
+export interface SpreadRiskParams {
+  budgetRatio: number;
+}
+
 export interface OptionsReplayAccountConfig {
   initialEquity: number;
   managedAccountRatio: number;
   optionsDailyTradesLimit: number;
   otmRiskParams: OtmRiskParams;
   rvRiskParams: RvRiskParams;
+  /** TRA-800 — per-structure budget ratios for the defined-risk combos. */
+  spreadRiskParams: Record<ReplaySpreadStrategy, SpreadRiskParams>;
+}
+
+/** TRA-800 — single-contract intrinsic value at `spot`, per share. */
+function intrinsic(optionType: OptionType, strike: number, spot: number): number {
+  return optionType === 'call' ? Math.max(0, spot - strike) : Math.max(0, strike - spot);
+}
+
+/**
+ * TRA-800 — total per-lot P&L of a defined-risk structure if it is closed at
+ * leg intrinsics for underlying `spot`. `netUsdPerLot` is the entry cash flow
+ * (+ credit / − debit); each leg is closed at intrinsic with the sign of the
+ * closing action (a bought leg is sold to close → + intrinsic; a sold leg is
+ * bought back → − intrinsic). Clamped to the defined-risk band
+ * `[−maxLossPerLot, +maxProfitPerLot]`.
+ */
+export function spreadPayoffPerLot(
+  legs: readonly OptionLeg[],
+  netUsdPerLot: number,
+  maxLossPerLot: number,
+  maxProfitPerLot: number,
+  spot: number,
+): number {
+  let closeCash = 0;
+  for (const leg of legs) {
+    const iv = intrinsic(leg.optionType, leg.strike, spot) * CONTRACT_MULTIPLIER;
+    closeCash += leg.action === 'buy' ? iv : -iv;
+  }
+  const raw = netUsdPerLot + closeCash;
+  return Math.min(maxProfitPerLot, Math.max(-maxLossPerLot, raw));
 }
 
 /**
@@ -269,6 +372,127 @@ export class OptionsReplayAccount {
     return { reason: 'opened', position };
   }
 
+  /** Stable combo key for dedup — mirrors the live `COMBO:…` synthetic symbol. */
+  private comboSymbolFor(symbol: string, strategy: ReplaySpreadStrategy, legs: readonly OptionLeg[]): string {
+    const legKey = legs
+      .map((l) => `${l.action[0]}${l.optionType[0]}${l.strike}@${l.expiration}`)
+      .join('+');
+    return `COMBO:${symbol.toUpperCase()}:${strategy}:${legKey}`;
+  }
+
+  /**
+   * TRA-800 — open a defined-risk structure as one combo position. This is the
+   * replay counterpart of `PaperOptionsAccount.openDefinedRiskSpread`: the
+   * uniform capital-at-risk model debits `maxLossUsd × contracts` from cash
+   * (credit netted into reserved capital, never freed as instant profit), and
+   * `premiumPaid` is the per-share reserved-capital basis so the close-path P&L
+   * math books the capped worst case as the cost basis. Sized off the
+   * per-structure budget ratio against the per-lot max loss; one lot is forced
+   * when a single defined-risk lot still fits cash (so a high-max-loss credit
+   * structure isn't silently rounded to zero).
+   */
+  openSpread(c: OpenSpreadCandidate): OpenOutcome {
+    if (!this.currentDay) throw new Error('startDay() must be called before openSpread()');
+    const maxLossPerLot = c.maxLossUsd;
+    if (!Number.isFinite(maxLossPerLot) || maxLossPerLot <= 0) return { reason: 'bad_mark', position: null };
+    if (!Array.isArray(c.legs) || c.legs.length < 1) return { reason: 'bad_mark', position: null };
+
+    const comboSymbol = this.comboSymbolFor(c.symbol, c.strategy, c.legs);
+    if (this.hasOpenForSymbol(comboSymbol)) return { reason: 'duplicate', position: null };
+
+    const budget = this.equity * this.cfg.managedAccountRatio * this.cfg.spreadRiskParams[c.strategy].budgetRatio;
+    let contracts = Math.floor(budget / maxLossPerLot);
+    if (contracts < 1 && maxLossPerLot <= this.cash) contracts = 1;
+    if (contracts < 1) return { reason: 'zero_size', position: null };
+
+    // Trim to whatever paper cash can actually reserve (the binding constraint).
+    let totalRisk = contracts * maxLossPerLot;
+    if (totalRisk > this.cash) {
+      contracts = Math.floor(this.cash / maxLossPerLot);
+      if (contracts < 1) return { reason: 'no_cash', position: null };
+      totalRisk = contracts * maxLossPerLot;
+    }
+
+    if (this.dailyCount >= this.cfg.optionsDailyTradesLimit) {
+      return { reason: 'daily_cap', position: null };
+    }
+
+    this.cash -= totalRisk;
+    this.dailyCount += 1;
+    this.idSeq += 1;
+
+    const premiumPaid = maxLossPerLot / CONTRACT_MULTIPLIER;
+    const position: ReplayPosition = {
+      id: `rp-${this.idSeq}`,
+      symbol: c.symbol.toUpperCase(),
+      optionSymbol: comboSymbol,
+      optionType: c.legs[0]!.optionType,
+      strike: c.legs[0]!.strike,
+      expiration: c.expiration,
+      contracts,
+      contractsRemaining: contracts,
+      premiumPaid,
+      currentPremium: premiumPaid,
+      // Combos are held to expiry; the per-tick SL/TP/trailing engine skips
+      // them (sentinels keep markAndCheckExits a no-op even if it sees one).
+      tp1Premium: Number.POSITIVE_INFINITY,
+      tp1Hit: false,
+      stopLossPremium: 0,
+      peakPremium: premiumPaid,
+      trailingActive: false,
+      trailingStopPremium: 0,
+      openedAtDay: this.currentDay,
+      signalType: c.strategy,
+      classification: c.classification,
+      pnl: 0,
+      isCombo: true,
+      legs: c.legs,
+      netUsdPerLot: c.netUsd,
+      maxLossPerLot,
+      maxProfitPerLot: c.maxProfitUsd,
+      breakevens: c.breakevens,
+      spreadStrategy: c.strategy,
+    };
+    this.open.set(position.id, position);
+    return { reason: 'opened', position };
+  }
+
+  /**
+   * TRA-800 — settle defined-risk combos at their leg-intrinsic payoff. Any
+   * open combo whose expiration is on/before `day` (or every open combo when
+   * `force` is set, for the tail of the window) is closed at the per-lot payoff
+   * for the underlying `spotBySymbol` value, clamped to its defined-risk band.
+   * When no spot is known the combo books its capped max loss (conservative).
+   * Single-leg scanner positions are untouched — they exit via the per-tick
+   * path / {@link expireOrForceCloseDueContracts}.
+   */
+  settleSpreads(
+    day: string,
+    spotBySymbol: ReadonlyMap<string, number>,
+    opts: { force?: boolean } = {},
+  ): void {
+    for (const [id, opt] of this.open) {
+      if (!opt.isCombo) continue;
+      if (!opts.force && opt.expiration > day) continue;
+      const spot = spotBySymbol.get(opt.symbol.toUpperCase());
+      const maxLossPerLot = opt.maxLossPerLot ?? opt.premiumPaid * CONTRACT_MULTIPLIER;
+      const pnlPerLot =
+        typeof spot === 'number' && Number.isFinite(spot) && spot > 0
+          ? spreadPayoffPerLot(
+              opt.legs ?? [],
+              opt.netUsdPerLot ?? 0,
+              maxLossPerLot,
+              opt.maxProfitPerLot ?? 0,
+              spot,
+            )
+          : -maxLossPerLot;
+      // Reserved-capital returned per share so closePosition books exactly
+      // `pnlPerLot × contracts` (premiumPaid basis === maxLossPerLot / 100).
+      const exitPremium = (maxLossPerLot + pnlPerLot) / CONTRACT_MULTIPLIER;
+      this.closePosition(id, exitPremium, day, opts.force ? 'forced_close' : 'settled');
+    }
+  }
+
   private recordOpen(p: {
     symbol: string;
     optionSymbol: string;
@@ -322,6 +546,9 @@ export class OptionsReplayAccount {
     riskOf: (signalType: ReplaySignalType) => { trailActivatePct: number; trailOffsetPct: number; partialExitRatio: number },
   ): void {
     for (const [id, opt] of this.open) {
+      // TRA-800 — defined-risk combos are held to expiry (settleSpreads), never
+      // managed per-tick. Mirrors the live `checkExits` combo skip.
+      if (opt.isCombo) continue;
       const mark = marksByOcc.get(opt.optionSymbol);
       if (typeof mark !== 'number' || mark <= 0) continue;
 
@@ -378,6 +605,7 @@ export class OptionsReplayAccount {
    */
   expireOrForceCloseDueContracts(day: string, marksByOcc: ReadonlyMap<string, number>): void {
     for (const [id, opt] of this.open) {
+      if (opt.isCombo) continue; // combos settle at intrinsic via settleSpreads
       if (opt.expiration > day) continue;
       const finalMark = marksByOcc.get(opt.optionSymbol);
       const exitPremium = typeof finalMark === 'number' && finalMark > 0 ? finalMark : 0;
@@ -392,6 +620,7 @@ export class OptionsReplayAccount {
    */
   forceCloseDelisted(day: string, isMissing: (optionSymbol: string) => boolean): void {
     for (const [id, opt] of this.open) {
+      if (opt.isCombo) continue; // synthetic combo symbols are never in the chain
       if (isMissing(opt.optionSymbol)) {
         this.closePosition(id, opt.currentPremium, day, 'forced_close');
       }
@@ -428,6 +657,9 @@ export class OptionsReplayAccount {
    */
   closeAllOpenAt(day: string, marksByOcc: ReadonlyMap<string, number>): void {
     for (const [id, opt] of this.open) {
+      // Combos are tail-settled by settleSpreads(force) at the window's last
+      // spot — they carry no chain mark to tail-close against here.
+      if (opt.isCombo) continue;
       const m = marksByOcc.get(opt.optionSymbol);
       const exit = typeof m === 'number' && m > 0 ? m : opt.currentPremium;
       this.closePosition(id, exit, day, 'forced_close');

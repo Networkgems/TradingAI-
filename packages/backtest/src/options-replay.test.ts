@@ -2,18 +2,28 @@ import { describe, it, expect } from 'vitest';
 import type { OptionChainRow } from '@trading-app/engine';
 import { findMispricedOtmContracts } from '@trading-app/engine';
 import { OTM_RISK_PARAMS, RV_RISK_PARAMS } from '@trading-app/shared';
-import { OptionsReplayAccount } from './options-replay-account.js';
+import {
+  OptionsReplayAccount,
+  spreadPayoffPerLot,
+  type OpenSpreadCandidate,
+} from './options-replay-account.js';
 import { estimateSpotFromChain, type ChainDay, type OptionChainSnapshotFile } from './options-chain-store.js';
-import { summarizeBucket, maxDrawdown, buildCsv, buildMarkdown } from './options-replay-report.js';
+import { summarizeBucket, summarizeByStructure, maxDrawdown, buildCsv, buildMarkdown } from './options-replay-report.js';
 import { replayBucket, runOptionsReplay, DEFAULT_REPLAY_CONFIG } from './run-options-replay.js';
 
 // ── OptionsReplayAccount ────────────────────────────────────────────────────
+
+const SPREAD_CFG = {
+  put_write: { budgetRatio: 0.5 },
+  call_debit_spread: { budgetRatio: 0.05 },
+} as const;
 
 const ACCT_CFG = {
   managedAccountRatio: 0.5,
   optionsDailyTradesLimit: 10,
   otmRiskParams: OTM_RISK_PARAMS,
   rvRiskParams: RV_RISK_PARAMS,
+  spreadRiskParams: SPREAD_CFG,
 };
 
 const otmRiskOf = () => ({
@@ -130,6 +140,186 @@ describe('OptionsReplayAccount exits', () => {
     expect(closed[0].exitReason).toBe('expired');
     expect(closed[0].pnl).toBeLessThan(0);
     expect(opened.contracts).toBeGreaterThan(0);
+  });
+});
+
+// ── TRA-800 defined-risk structures (put-write + call debit spread) ──────────
+
+describe('spreadPayoffPerLot', () => {
+  const putLeg = [{ action: 'sell' as const, optionType: 'put' as const, strike: 100, expiration: '2026-05-15' }];
+
+  it('put-write keeps the full credit above the strike (max profit)', () => {
+    // credit 300, maxLoss (100-3)*100 = 9700, maxProfit 300.
+    expect(spreadPayoffPerLot(putLeg, 300, 9700, 300, 110)).toBe(300);
+  });
+
+  it('put-write loses credit-minus-intrinsic when assigned ITM (partial loss)', () => {
+    // spot 98.5 → put intrinsic 1.5 → 300 − 150 = 150.
+    expect(spreadPayoffPerLot(putLeg, 300, 9700, 300, 98.5)).toBe(150);
+  });
+
+  it('put-write is clamped to its defined max loss at the floor', () => {
+    // spot 0 → intrinsic 100 → 300 − 10000 = −9700 (== −maxLoss, already at band).
+    expect(spreadPayoffPerLot(putLeg, 300, 9700, 300, 0)).toBe(-9700);
+  });
+
+  it('call debit spread caps profit at width − debit', () => {
+    const legs = [
+      { action: 'buy' as const, optionType: 'call' as const, strike: 100, expiration: '2026-05-15' },
+      { action: 'sell' as const, optionType: 'call' as const, strike: 105, expiration: '2026-05-15' },
+    ];
+    // debit 3 → netUsd −300, maxLoss 300, maxProfit 200.
+    expect(spreadPayoffPerLot(legs, -300, 300, 200, 110)).toBe(200); // both ITM → max profit
+    expect(spreadPayoffPerLot(legs, -300, 300, 200, 95)).toBe(-300); // both OTM → max loss
+    expect(spreadPayoffPerLot(legs, -300, 300, 200, 102)).toBe(-100); // long-only ITM → partial loss
+  });
+});
+
+function putWriteCandidate(over: Partial<OpenSpreadCandidate> = {}): OpenSpreadCandidate {
+  return {
+    symbol: 'XYZ',
+    strategy: 'put_write',
+    legs: [{ action: 'sell', optionType: 'put', strike: 100, expiration: '2026-05-15' }],
+    netUsd: 300,
+    maxLossUsd: 9700,
+    maxProfitUsd: 300,
+    breakevens: [97],
+    expiration: '2026-05-15',
+    spot: 105,
+    classification: 'put_write',
+    ...over,
+  };
+}
+
+function callDebitSpreadCandidate(over: Partial<OpenSpreadCandidate> = {}): OpenSpreadCandidate {
+  return {
+    symbol: 'XYZ',
+    strategy: 'call_debit_spread',
+    legs: [
+      { action: 'buy', optionType: 'call', strike: 100, expiration: '2026-05-15' },
+      { action: 'sell', optionType: 'call', strike: 105, expiration: '2026-05-15' },
+    ],
+    netUsd: -300,
+    maxLossUsd: 300,
+    maxProfitUsd: 200,
+    breakevens: [103],
+    expiration: '2026-05-15',
+    spot: 100,
+    classification: 'call_debit_spread',
+    ...over,
+  };
+}
+
+describe('OptionsReplayAccount put-write structure', () => {
+  it('sizes off the per-structure budget and reserves the capped capital-at-risk', () => {
+    // budget = 100000 × 0.5 × 0.5 = $25k; maxLoss/lot $9700 → 2 lots.
+    const acct = new OptionsReplayAccount({ initialEquity: 100_000, ...ACCT_CFG });
+    acct.startDay('2026-05-01');
+    const out = acct.openSpread(putWriteCandidate());
+    expect(out.reason).toBe('opened');
+    expect(out.position?.contracts).toBe(2);
+    expect(out.position?.isCombo).toBe(true);
+    // Reserved capital = 2 × 9700 = 19400 → equity unchanged, cash debited.
+    expect(acct.getRealizedPnl()).toBe(0);
+  });
+
+  it('settles at max profit when the put expires worthless above the strike', () => {
+    const acct = new OptionsReplayAccount({ initialEquity: 100_000, ...ACCT_CFG });
+    acct.startDay('2026-05-01');
+    acct.openSpread(putWriteCandidate());
+    acct.startDay('2026-05-15');
+    acct.settleSpreads('2026-05-15', new Map([['XYZ', 110]]));
+    const closed = acct.getClosedPositions();
+    expect(closed).toHaveLength(1);
+    expect(closed[0].exitReason).toBe('settled');
+    expect(closed[0].pnl).toBe(600); // 2 lots × $300 max profit
+    expect(acct.getRealizedPnl()).toBe(600);
+  });
+
+  it('books the capped max loss when no spot is known at expiry', () => {
+    const acct = new OptionsReplayAccount({ initialEquity: 100_000, ...ACCT_CFG });
+    acct.startDay('2026-05-01');
+    acct.openSpread(putWriteCandidate());
+    acct.startDay('2026-05-15');
+    acct.settleSpreads('2026-05-15', new Map()); // no spot → max loss
+    const closed = acct.getClosedPositions();
+    expect(closed[0].pnl).toBe(-19_400); // 2 lots × −$9700
+    expect(closed[0].exitReason).toBe('settled');
+  });
+
+  it('takes a partial profit when assigned slightly ITM', () => {
+    const acct = new OptionsReplayAccount({ initialEquity: 100_000, ...ACCT_CFG });
+    acct.startDay('2026-05-01');
+    acct.openSpread(putWriteCandidate());
+    acct.startDay('2026-05-15');
+    acct.settleSpreads('2026-05-15', new Map([['XYZ', 98.5]]));
+    expect(acct.getClosedPositions()[0].pnl).toBe(300); // 2 lots × $150
+  });
+
+  it('dedups an already-open structure key', () => {
+    const acct = new OptionsReplayAccount({ initialEquity: 100_000, ...ACCT_CFG });
+    acct.startDay('2026-05-01');
+    expect(acct.openSpread(putWriteCandidate()).reason).toBe('opened');
+    expect(acct.openSpread(putWriteCandidate()).reason).toBe('duplicate');
+  });
+});
+
+describe('OptionsReplayAccount call-debit-spread structure', () => {
+  it('sizes off the debit max-loss and settles at max profit deep ITM', () => {
+    // budget = 100000 × 0.5 × 0.05 = $2500; maxLoss/lot $300 → 8 lots.
+    const acct = new OptionsReplayAccount({ initialEquity: 100_000, ...ACCT_CFG });
+    acct.startDay('2026-05-01');
+    const out = acct.openSpread(callDebitSpreadCandidate());
+    expect(out.position?.contracts).toBe(8);
+    acct.startDay('2026-05-15');
+    acct.settleSpreads('2026-05-15', new Map([['XYZ', 110]]));
+    expect(acct.getClosedPositions()[0].pnl).toBe(1600); // 8 × $200 max profit
+  });
+
+  it('books max loss when both legs expire OTM', () => {
+    const acct = new OptionsReplayAccount({ initialEquity: 100_000, ...ACCT_CFG });
+    acct.startDay('2026-05-01');
+    acct.openSpread(callDebitSpreadCandidate());
+    acct.startDay('2026-05-15');
+    acct.settleSpreads('2026-05-15', new Map([['XYZ', 95]]));
+    expect(acct.getClosedPositions()[0].pnl).toBe(-2400); // 8 × −$300 debit
+  });
+
+  it('is never managed per tick (markAndCheckExits skips combos)', () => {
+    const acct = new OptionsReplayAccount({ initialEquity: 100_000, ...ACCT_CFG });
+    acct.startDay('2026-05-01');
+    const pos = acct.openSpread(callDebitSpreadCandidate()).position!;
+    // Even if a mark for the synthetic combo symbol leaks in, it is ignored.
+    acct.markAndCheckExits('2026-05-02', new Map([[pos.optionSymbol, 0.01]]), () => ({
+      trailActivatePct: 0.25,
+      trailOffsetPct: 0.15,
+      partialExitRatio: 0.5,
+    }));
+    expect(acct.getOpenPositions()).toHaveLength(1);
+    expect(acct.getClosedPositions()).toHaveLength(0);
+  });
+});
+
+describe('summarizeByStructure', () => {
+  it('reports expectancy, win-rate, Sharpe, and max-DD per structure', () => {
+    const closed = [
+      { signalType: 'put_write', pnl: 300, closedAtDay: '2026-05-15' },
+      { signalType: 'put_write', pnl: -100, closedAtDay: '2026-05-16' },
+      { signalType: 'put_write', pnl: 200, closedAtDay: '2026-05-17' },
+      { signalType: 'call_debit_spread', pnl: -300, closedAtDay: '2026-05-15' },
+    ] as unknown as Parameters<typeof summarizeByStructure>[0];
+    const stats = summarizeByStructure(closed);
+    const pw = stats.find((s) => s.structure === 'put_write')!;
+    expect(pw.trades).toBe(3);
+    expect(pw.winners).toBe(2);
+    expect(pw.winRate).toBeCloseTo(2 / 3, 5);
+    expect(pw.totalPnl).toBe(400);
+    expect(pw.expectancy).toBeCloseTo(400 / 3, 5);
+    expect(pw.maxDrawdown).toBe(100); // peak 300 → trough 200 after the −100 trade
+    expect(pw.sharpe).not.toBe(0);
+    const cds = stats.find((s) => s.structure === 'call_debit_spread')!;
+    expect(cds.trades).toBe(1);
+    expect(cds.sharpe).toBe(0); // < 2 trades → undefined Sharpe → 0
   });
 });
 
@@ -309,5 +499,83 @@ describe('runOptionsReplay end-to-end', () => {
 
   it('handles an empty data set without throwing', () => {
     expect(runOptionsReplay([], DEFAULT_REPLAY_CONFIG)).toHaveLength(3);
+  });
+});
+
+// ── TRA-800 end-to-end: structures replayed on a captured-chain fixture ───────
+
+/**
+ * A chain carrying priceable calls AND puts around `spot` so both the put-write
+ * and the call-debit-spread modelers can build a structure. Strikes step by 5.
+ */
+function structureChain(spot: number, expiration: string): OptionChainRow[] {
+  const rows: OptionChainRow[] = [];
+  for (const strike of [90, 95, 100, 105, 110]) {
+    // Crude monotone marks: deeper-ITM calls richer, deeper-ITM puts richer.
+    const callMid = Math.max(0.5, spot - strike + 3);
+    const putMid = Math.max(0.5, strike - spot + 3);
+    rows.push({
+      optionSymbol: `XYZ${expiration.replace(/-/g, '')}C${strike}`,
+      underlying: 'XYZ', optionType: 'call', strike, expiration,
+      bid: callMid - 0.1, ask: callMid + 0.1, last: callMid, volume: 200, openInterest: 400,
+    });
+    rows.push({
+      optionSymbol: `XYZ${expiration.replace(/-/g, '')}P${strike}`,
+      underlying: 'XYZ', optionType: 'put', strike, expiration,
+      bid: putMid - 0.1, ask: putMid + 0.1, last: putMid, volume: 200, openInterest: 400,
+    });
+  }
+  return rows;
+}
+
+function structureDay(date: string, spot: number, expiration: string, recordedAt: number): ChainDay {
+  const file: OptionChainSnapshotFile = {
+    symbol: 'XYZ', spot, recordedAt, expirations: [expiration], rows: structureChain(spot, expiration),
+  };
+  return { date, bySymbol: new Map([['XYZ', file]]) };
+}
+
+describe('runOptionsReplay structures end-to-end (TRA-800)', () => {
+  const exp = '2026-05-29';
+  const t0 = Date.parse('2026-05-15T19:55:00Z');
+
+  it('produces a per-structure BucketResult for put-write and call-debit-spread', () => {
+    const days: ChainDay[] = [
+      structureDay('2026-05-15', 100, exp, t0),               // put-write opens; no trend yet
+      structureDay('2026-05-18', 102, exp, t0 + 3 * 86_400_000), // rising → call spread opens
+      structureDay('2026-05-29', 108, exp, t0 + 14 * 86_400_000), // expiry → both settle
+    ];
+    const result = replayBucket(days, 100_000, DEFAULT_REPLAY_CONFIG);
+
+    const pw = result.byStructure.find((s) => s.structure === 'put_write');
+    const cds = result.byStructure.find((s) => s.structure === 'call_debit_spread');
+    expect(pw).toBeDefined();
+    expect(cds).toBeDefined();
+    // Both structures settled (no open combos left at the tail).
+    expect(pw!.trades).toBeGreaterThanOrEqual(1);
+    expect(cds!.trades).toBeGreaterThanOrEqual(1);
+    // Each BucketResult structure block carries the four required metrics.
+    for (const s of [pw!, cds!]) {
+      expect(Number.isFinite(s.expectancy)).toBe(true);
+      expect(Number.isFinite(s.winRate)).toBe(true);
+      expect(Number.isFinite(s.sharpe)).toBe(true);
+      expect(Number.isFinite(s.maxDrawdown)).toBe(true);
+    }
+    // Rising tape to expiry → both structures land profitable here.
+    expect(pw!.totalPnl).toBeGreaterThan(0);
+    expect(cds!.totalPnl).toBeGreaterThan(0);
+  });
+
+  it('gates the call debit spread on the rising-spot trend filter', () => {
+    // Falling tape on day 2 → trend filter fails → no call-debit-spread entry.
+    const days: ChainDay[] = [
+      structureDay('2026-05-15', 100, exp, t0),
+      structureDay('2026-05-18', 96, exp, t0 + 3 * 86_400_000), // falling
+      structureDay('2026-05-29', 96, exp, t0 + 14 * 86_400_000),
+    ];
+    const result = replayBucket(days, 100_000, DEFAULT_REPLAY_CONFIG);
+    expect(result.byStructure.find((s) => s.structure === 'call_debit_spread')).toBeUndefined();
+    // The put-write (no trend gate) still trades.
+    expect(result.byStructure.find((s) => s.structure === 'put_write')).toBeDefined();
   });
 });

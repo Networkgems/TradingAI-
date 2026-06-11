@@ -8,7 +8,7 @@
  * markdown summary.
  */
 
-import type { EquitySample, ReplayPosition } from './options-replay-account.js';
+import type { EquitySample, ReplayPosition, ReplaySignalType } from './options-replay-account.js';
 
 export interface ClassificationStat {
   classification: string;
@@ -16,6 +16,24 @@ export interface ClassificationStat {
   winners: number;
   hitRate: number;
   totalPnl: number;
+}
+
+/**
+ * TRA-800 — per-structure performance block. `expectancy` is the mean realized
+ * P&L per closed trade; `sharpe` is the per-trade Sharpe (mean / sample-stddev
+ * of per-trade P&L, 0 when < 2 trades or zero dispersion); `maxDrawdown` is the
+ * largest peak-to-trough drop (dollars) on the structure's cumulative
+ * realized-P&L curve, ordered by close day.
+ */
+export interface StructureStat {
+  structure: ReplaySignalType;
+  trades: number;
+  winners: number;
+  winRate: number;
+  totalPnl: number;
+  expectancy: number;
+  sharpe: number;
+  maxDrawdown: number;
 }
 
 export interface BucketResult {
@@ -34,9 +52,75 @@ export interface BucketResult {
   skippedZeroSize: number;
   /** Hit-rate broken out by scanner classification. */
   byClassification: ClassificationStat[];
-  /** OTM vs RV split. */
+  /** OTM vs RV split (single-leg scanner sources only). */
   otmTrades: number;
   rvTrades: number;
+  /**
+   * TRA-800 — per-structure BucketResult breakout (expectancy / win-rate /
+   * Sharpe / max-DD), keyed by structure. Carries the two defined-risk
+   * structures (`put_write`, `call_debit_spread`) alongside the single-leg
+   * scanner sources so the TRA-781 G0 gate can read each structure's edge.
+   */
+  byStructure: StructureStat[];
+}
+
+/** Max peak-to-trough drop (dollars) on a cumulative realized-P&L series. */
+function maxDrawdownOfCumulative(perTradePnl: readonly number[]): number {
+  let cum = 0;
+  let peak = 0;
+  let maxDd = 0;
+  for (const p of perTradePnl) {
+    cum += p;
+    if (cum > peak) peak = cum;
+    const dd = peak - cum;
+    if (dd > maxDd) maxDd = dd;
+  }
+  return maxDd;
+}
+
+/** Per-trade Sharpe — mean / sample-stddev of per-trade P&L. 0 when undefined. */
+function perTradeSharpe(perTradePnl: readonly number[]): number {
+  const n = perTradePnl.length;
+  if (n < 2) return 0;
+  const mean = perTradePnl.reduce((a, b) => a + b, 0) / n;
+  const variance = perTradePnl.reduce((a, b) => a + (b - mean) ** 2, 0) / (n - 1);
+  const std = Math.sqrt(variance);
+  return std > 0 ? mean / std : 0;
+}
+
+/**
+ * TRA-800 — break the closed-position log out by structure (`signalType`) into
+ * per-structure {@link StructureStat}s. Trades are ordered by close day so the
+ * per-structure max-drawdown walks the realized-P&L curve chronologically.
+ */
+export function summarizeByStructure(closed: readonly ReplayPosition[]): StructureStat[] {
+  const bySig = new Map<ReplaySignalType, ReplayPosition[]>();
+  for (const p of closed) {
+    const slot = bySig.get(p.signalType) ?? [];
+    slot.push(p);
+    bySig.set(p.signalType, slot);
+  }
+  const out: StructureStat[] = [];
+  for (const [structure, positions] of bySig) {
+    const ordered = [...positions].sort((a, b) =>
+      (a.closedAtDay ?? '').localeCompare(b.closedAtDay ?? ''),
+    );
+    const perTrade = ordered.map((p) => p.pnl);
+    const trades = perTrade.length;
+    const winners = perTrade.filter((p) => p > 0).length;
+    const totalPnl = perTrade.reduce((a, b) => a + b, 0);
+    out.push({
+      structure,
+      trades,
+      winners,
+      winRate: trades > 0 ? winners / trades : 0,
+      totalPnl,
+      expectancy: trades > 0 ? totalPnl / trades : 0,
+      sharpe: perTradeSharpe(perTrade),
+      maxDrawdown: maxDrawdownOfCumulative(perTrade),
+    });
+  }
+  return out.sort((a, b) => b.trades - a.trades);
 }
 
 /** Max peak-to-trough drawdown of an equity curve, in dollars and as a fraction of the peak. */
@@ -81,7 +165,7 @@ export function summarizeBucket(args: {
     totalPnl += p.pnl;
     if (p.pnl > 0) winners += 1;
     if (p.signalType === 'otm_mispricing') otmTrades += 1;
-    else rvTrades += 1;
+    else if (p.signalType === 'relative_value') rvTrades += 1;
 
     const cls = p.classification;
     const slot = byClass.get(cls) ?? { trades: 0, winners: 0, pnl: 0 };
@@ -120,6 +204,7 @@ export function summarizeBucket(args: {
     byClassification,
     otmTrades,
     rvTrades,
+    byStructure: summarizeByStructure(closed),
   };
 }
 
@@ -179,6 +264,30 @@ export function buildCsv(buckets: readonly BucketResult[]): string {
         ].join(','),
       );
     }
+    // TRA-800 — per-structure rows (expectancy / Sharpe / max-DD). The
+    // structure id rides the `classification` column; expectancy is stashed in
+    // pnlPct, Sharpe in maxDrawdownPct so no header change is needed.
+    for (const s of b.byStructure) {
+      lines.push(
+        [
+          'structure',
+          b.startingEquity,
+          b.managedAccountRatio,
+          s.structure,
+          s.trades,
+          s.winners,
+          s.trades - s.winners,
+          s.winRate.toFixed(4),
+          s.totalPnl.toFixed(2),
+          s.expectancy.toFixed(2),
+          s.maxDrawdown.toFixed(2),
+          s.sharpe.toFixed(4),
+          '',
+          '',
+          '',
+        ].join(','),
+      );
+    }
   }
   return lines.join('\n') + '\n';
 }
@@ -224,6 +333,28 @@ export function buildMarkdown(args: {
     );
   }
   md.push('');
+
+  // TRA-800 — per-structure performance (the TRA-781 G0 deliverable).
+  md.push('## Per-structure performance (expectancy / win-rate / Sharpe / max-DD)');
+  md.push('');
+  for (const b of buckets) {
+    md.push(`### ${dollars(b.startingEquity)} bucket`);
+    md.push('');
+    if (b.byStructure.length === 0) {
+      md.push('_No structures traded in this bucket._');
+      md.push('');
+      continue;
+    }
+    md.push('| Structure | Trades | Win rate | Total P&L | Expectancy/trade | Sharpe | Max DD |');
+    md.push('|---|---:|---:|---:|---:|---:|---:|');
+    for (const s of b.byStructure) {
+      md.push(
+        `| ${s.structure} | ${s.trades} | ${pct(s.winRate)} | ${dollars(s.totalPnl)} | ` +
+          `${dollars(s.expectancy)} | ${s.sharpe.toFixed(2)} | ${dollars(s.maxDrawdown)} |`,
+      );
+    }
+    md.push('');
+  }
 
   md.push('## Hit-rate by scanner classification');
   md.push('');
