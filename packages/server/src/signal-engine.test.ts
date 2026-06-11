@@ -3642,4 +3642,49 @@ describe('SignalEngine — SupertrendConfluence shadow channel (TRA-787)', () =>
     expect(state.signals).toHaveLength(0);
     expect(state.account.openPositions).toHaveLength(0);
   });
+
+  // TRA-801 — Stage-2 PAPER accrual. The shadow signal now ALSO opens a position
+  // in the dedicated forward-test paper book (distinct from the observe-only
+  // shadow log AND from the user's demo account), which closes at SL/TP and lands
+  // in the export snapshot's closedPositions stamped supertrend_confluence/demo.
+  it('opens a paper forward-test position on a shadow signal — isolated from the user demo book', () => {
+    const engine = new SignalEngine();
+    const candles = build5m(sawUp(240));
+    (engine as unknown as { shadowCandleCache: Map<string, Candle[]> }).shadowCandleCache.set('TEST', candles);
+
+    (engine as unknown as { evaluateSupertrendShadow: (s: string[]) => void }).evaluateSupertrendShadow(['TEST']);
+
+    // The forward-test book holds one open paper position …
+    const stPaper = (engine as unknown as { supertrendPaper: { getState(): { openPositions: Array<{ symbol: string; signalType: string }> } } }).supertrendPaper;
+    const open = stPaper.getState().openPositions;
+    expect(open).toHaveLength(1);
+    expect(open[0].symbol).toBe('TEST');
+    expect(open[0].signalType).toBe('supertrend_confluence');
+    // … while the user's demo account is untouched (isolation invariant).
+    expect(engine.getState().account.openPositions).toHaveLength(0);
+  });
+
+  it('closes the paper position at take-profit into closedPositions (supertrend_confluence/demo)', () => {
+    const engine = new SignalEngine();
+    const candles = build5m(sawUp(240));
+    (engine as unknown as { shadowCandleCache: Map<string, Candle[]> }).shadowCandleCache.set('TEST', candles);
+    (engine as unknown as { evaluateSupertrendShadow: (s: string[]) => void }).evaluateSupertrendShadow(['TEST']);
+
+    const stPaper = (engine as unknown as { supertrendPaper: { getState(): { openPositions: Array<{ takeProfit: number }> } } }).supertrendPaper;
+    const tp = stPaper.getState().openPositions[0].takeProfit;
+
+    // Drive the live price above the take-profit and run the forward-test exits.
+    const prices = new Map<string, number>([['TEST', tp + 5]]);
+    (engine as unknown as { runSupertrendPaperExits: (p: Map<string, number>) => void }).runSupertrendPaperExits(prices);
+
+    // The closed paper trade is recorded for the promotion service's Stage-2 ledger.
+    const snap = engine.exportTradeSnapshot();
+    const stClosed = snap.closedPositions.filter(p => p.signalType === 'supertrend_confluence');
+    expect(stClosed).toHaveLength(1);
+    expect(stClosed[0].mode).toBe('demo');
+    expect(stClosed[0].closedAt).toBeDefined();
+    expect(stClosed[0].pnl ?? 0).toBeGreaterThan(0); // exited at TP → winning paper trade
+    // The forward-test book is now flat again.
+    expect((engine as unknown as { supertrendPaper: { getState(): { openPositions: unknown[] } } }).supertrendPaper.getState().openPositions).toHaveLength(0);
+  });
 });

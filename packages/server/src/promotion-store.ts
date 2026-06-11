@@ -151,6 +151,29 @@ export async function getStrategyRecord(strategyId: string): Promise<StrategyPro
   return store.strategies[strategyId];
 }
 
+/**
+ * TRA-801 — ensure a strategy has a (possibly empty) promotion record so it
+ * surfaces on the `GET /api/promotion/status` overview list, which only iterates
+ * `listStrategyRecords()`. Creating a blank record registers NOTHING that could
+ * advance the gate: `backtest` stays null (Stage 1 `missing`) and `decisions`
+ * stays empty (sign-off `absent`), so `evaluatePromotion` still returns
+ * `canGoLive=false`. This is how the SupertrendConfluence Stage-2 paper accrual
+ * becomes visible on the overview while its real-chain backtest (TRA-382) and
+ * Stage-3 sign-off are still outstanding. Idempotent — never clobbers an
+ * existing record's backtest / decisions / overrides.
+ */
+export async function ensureStrategyRegistered(strategyId: string): Promise<StrategyPromotionRecord> {
+  if (!strategyId) throw new PromotionValidationError('strategyId is required');
+  const store = await ensureLoaded();
+  const existing = store.strategies[strategyId];
+  if (existing) return existing;
+  const rec = blankRecord(strategyId);
+  store.strategies[strategyId] = rec;
+  await persist();
+  log.info('ensured blank promotion record', { strategyId });
+  return rec;
+}
+
 export async function listStrategyRecords(): Promise<StrategyPromotionRecord[]> {
   const store = await ensureLoaded();
   return Object.values(store.strategies);

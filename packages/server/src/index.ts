@@ -199,6 +199,7 @@ import {
   recordSignoff,
   listStrategyRecords,
   getEffectiveThresholds,
+  ensureStrategyRegistered,
   PromotionValidationError,
 } from './promotion-store.js';
 import {
@@ -219,6 +220,17 @@ await checkDataDirHealth();
 // Load users and reset tokens from persistent storage.
 await loadUsers();
 initResetTokenStore(DATA_DIR);
+
+// TRA-801 — ensure SupertrendConfluence has a promotion record so its Stage-2
+// paper accrual surfaces on the `GET /api/promotion/status` overview list (which
+// iterates registered strategies). Creates an EMPTY record only — backtest stays
+// `missing` (Stage 1 blocked on TRA-382) and sign-off `absent`, so the gate keeps
+// `canGoLive=false`. Idempotent; never clobbers an existing record.
+await ensureStrategyRegistered('supertrend_confluence').catch(err =>
+  log.warn('TRA-801 ensureStrategyRegistered(supertrend_confluence) failed', {
+    reason: err instanceof Error ? err.message : String(err),
+  }),
+);
 
 // TRA-191 — server-side relative-value scanner. The only options strategy
 // active for stock options in this iteration; OTM mispricing and per-equity

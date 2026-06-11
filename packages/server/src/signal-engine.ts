@@ -275,6 +275,24 @@ const SUPERTREND_SHADOW_REFRESH_MS = 60_000;
 const SUPERTREND_SHADOW_MAX_SIGNALS = MAX_SIGNALS;
 
 /**
+ * TRA-801 — the strategyId under which SupertrendConfluence paper trades accrue
+ * to the Live-Trading Promotion Gate's Stage-2 ledger. It is the same value the
+ * strategy stamps on every emitted `TradeSignal.type`, so a closed paper
+ * position carries `signalType === SUPERTREND_STRATEGY_ID` automatically and the
+ * promotion service (`collectPaperTrades`) folds it in 1:1.
+ */
+const SUPERTREND_STRATEGY_ID: SignalType = 'supertrend_confluence';
+/**
+ * TRA-801 — fixed starting equity for the dedicated SupertrendConfluence PAPER
+ * forward-test book. Deliberately INDEPENDENT of the user's demo account so the
+ * forward test neither draws from nor perturbs the user's paper cash/equity/P&L,
+ * and so it runs identically whether the engine is in demo or live mode (the
+ * user demo book is masked in live mode; this book is not). Capital-safe by
+ * construction — this account only ever opens simulated paper positions.
+ */
+const SUPERTREND_PAPER_INITIAL_EQUITY = 25_000;
+
+/**
  * TRA-389 — how often the engine re-reads the persisted premarket
  * MarketReview. The review only changes twice a day (9 AM / 9 PM ET
  * scheduler hooks), so a 5-minute cache keeps the per-tick gate read off
@@ -470,6 +488,24 @@ export class SignalEngine {
    * {@link evaluateSupertrendShadow}.
    */
   private readonly supertrendShadow = new SupertrendConfluenceStrategy();
+  /**
+   * TRA-801 — dedicated PAPER (demo) forward-test book for SupertrendConfluence.
+   * The board (TRA-734) directed "go live and start testing Supertrend"; we honor
+   * that as a Stage-2 paper forward test ONLY — real capital stays hard-gated by
+   * the promotion gate (Stage-1 real-chain backtest is blocked on TRA-382, no
+   * Stage-3 sign-off). This account opens a simulated bracketed position whenever
+   * the shadow channel emits a qualifying signal and closes it at SL/TP on the
+   * live tape, producing real closed paper trades stamped
+   * `signalType: 'supertrend_confluence'` / `mode: 'demo'` that flow into
+   * {@link allClosedPositions} and thus the promotion service's Stage-2 ledger.
+   *
+   * It is kept SEPARATE from {@link account} (the user's demo book) so the
+   * forward test never touches the user's paper cash/equity/dailyPnl or the
+   * daily risk governor, and runs regardless of engine mode. The live router gate
+   * (`enableSupertrend` in packages/engine/src/router.ts) stays OFF — this is the
+   * paper path only, never live-capital routing.
+   */
+  private readonly supertrendPaper = new PaperAccount({ initialEquity: SUPERTREND_PAPER_INITIAL_EQUITY });
   private account: PaperAccount;
   /**
    * TRA-233 — per-env paper options accounts. Sandbox and production each
@@ -1704,6 +1740,11 @@ export class SignalEngine {
           });
         }
       }
+      // TRA-801 — close any touched SupertrendConfluence paper positions on the
+      // freshest tape BEFORE re-evaluating, so a symbol that exited at SL/TP this
+      // tick can re-enter on the same tick when its confluence still holds. The
+      // open side runs inside evaluateSupertrendShadow.
+      this.runSupertrendPaperExits(prices);
       this.evaluateSupertrendShadow(activeSymbols);
     }
 
@@ -2628,6 +2669,31 @@ export class SignalEngine {
           symbol: sym, reason: err instanceof Error ? err.message : String(err),
         });
       });
+
+      // TRA-801 — Stage-2 PAPER accrual (distinct from the observe-only shadow
+      // log above). Open a simulated bracketed position in the dedicated
+      // forward-test book when it is flat for this symbol, so the strategy
+      // produces real closed paper trades the promotion gate can read. One
+      // position per symbol at a time: the shadow signal re-fires every tick
+      // while its confluence holds, so the flat-guard collapses that into a
+      // single round-trip that exits at SL/TP (see {@link runSupertrendPaperExits}).
+      // This is PAPER ONLY — it never touches the live router or real capital.
+      if (!this.supertrendPaper.hasOpenPosition(sym)) {
+        const fillPrice = fiveMin[fiveMin.length - 1]?.close ?? signal.entryPrice;
+        const opened = this.supertrendPaper.openPosition(signal, fillPrice);
+        if (opened) {
+          // Stamp 'demo' unconditionally: these are forward-test paper trades by
+          // construction, independent of the engine's demo/live mode, so the
+          // promotion service's demo-only `collectPaperTrades` filter folds them
+          // in even while the user's account runs live.
+          opened.mode = 'demo';
+          supertrendShadowLog.info('supertrend paper open', {
+            symbol: sym, side: opened.side, entryPrice: opened.entryPrice,
+            quantity: opened.quantity, stopLoss: opened.stopLoss, takeProfit: opened.takeProfit,
+            strategyId: SUPERTREND_STRATEGY_ID, account: 'paper-forward-test',
+          });
+        }
+      }
     }
     this.supertrendShadowSignals = emitted;
 
@@ -2635,6 +2701,34 @@ export class SignalEngine {
     // The horizon rule (intra-session TP/SL touch, TIMEOUT at session close)
     // lives in `resolveOutcome`; we feed it the cached bars per symbol.
     this.labelOpenShadowSignals();
+  }
+
+  /**
+   * TRA-801 — close any SupertrendConfluence paper forward-test positions whose
+   * bracket has been touched on the live tape, and record the resulting closed
+   * paper trades into {@link allClosedPositions} so they persist and surface to
+   * the promotion service's Stage-2 ledger (filtered there by
+   * `signalType === 'supertrend_confluence'` + `mode === 'demo'`).
+   *
+   * Deliberately ISOLATED from the user demo book's exit path: it does NOT feed
+   * the daily risk governor, the user's `dailySignals`/accuracy, or the user's
+   * equity tracker — the forward test must not perturb the live account. Runs
+   * regardless of engine mode (the dedicated book is always paper).
+   */
+  private runSupertrendPaperExits(prices: Map<string, number>): void {
+    const closed = this.supertrendPaper.checkExits(prices);
+    for (const pos of closed) {
+      // checkExits returns a shallow copy; stamp the forward-test mode so the
+      // promotion service includes it and the live dashboard (mode-filtered)
+      // does not surface it in live view.
+      pos.mode = 'demo';
+      this.allClosedPositions.push(pos);
+      supertrendShadowLog.info('supertrend paper close', {
+        symbol: pos.symbol, side: pos.side, pnl: pos.pnl,
+        entryPrice: pos.entryPrice, exitPrice: pos.exitPrice,
+        strategyId: SUPERTREND_STRATEGY_ID, account: 'paper-forward-test',
+      });
+    }
   }
 
   /**
@@ -4348,6 +4442,12 @@ export class SignalEngine {
     options: ReturnType<PaperOptionsAccount['exportSnapshot']>;
     /** TRA-233 — per-env options snapshots (sandbox + production). */
     optionsByEnv: Record<TradierEnv, ReturnType<PaperOptionsAccount['exportSnapshot']>>;
+    /**
+     * TRA-801 — the SupertrendConfluence paper forward-test book. Persisted so a
+     * Render redeploy (which restarts the process) doesn't abandon the open
+     * forward-test positions and silently stall Stage-2 accrual.
+     */
+    supertrendPaper: ReturnType<PaperAccount['exportSnapshot']>;
   } {
     return {
       closedPositions: [...this.allClosedPositions],
@@ -4360,6 +4460,7 @@ export class SignalEngine {
         sandbox: this.optionsAccounts.sandbox.exportSnapshot(),
         production: this.optionsAccounts.production.exportSnapshot(),
       },
+      supertrendPaper: this.supertrendPaper.exportSnapshot(),
     };
   }
 
@@ -4379,14 +4480,19 @@ export class SignalEngine {
    * bucket, surfacing demo/sandbox P&L under the Live Production header even
    * though no Tradier production order had ever been placed.
    */
-  importTradeSnapshot(snap: Omit<ReturnType<SignalEngine['exportTradeSnapshot']>, 'optionsByEnv'> & {
+  importTradeSnapshot(snap: Omit<ReturnType<SignalEngine['exportTradeSnapshot']>, 'optionsByEnv' | 'supertrendPaper'> & {
     optionsByEnv?: Record<TradierEnv, ReturnType<PaperOptionsAccount['exportSnapshot']>>;
+    /** TRA-801 — optional so legacy snapshots written before the forward-test book still load. */
+    supertrendPaper?: ReturnType<PaperAccount['exportSnapshot']>;
   }): void {
     this.allClosedPositions = [...snap.closedPositions];
     this.recentSignals = [...snap.recentSignals];
     this.dailySignals = [...snap.dailySignals];
     this.positionSignalType = new Map(snap.positionSignalType);
     this.account.importSnapshot(snap.account);
+    // TRA-801 — restore the SupertrendConfluence paper forward-test book so open
+    // positions survive a redeploy; absent on legacy snapshots (starts empty).
+    if (snap.supertrendPaper) this.supertrendPaper.importSnapshot(snap.supertrendPaper);
     if (snap.optionsByEnv) {
       this.optionsAccounts.sandbox.importSnapshot(snap.optionsByEnv.sandbox);
       this.optionsAccounts.production.importSnapshot(snap.optionsByEnv.production);

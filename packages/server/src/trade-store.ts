@@ -124,6 +124,20 @@ export interface StocksTradeSnapshot {
     initialEquity: number;
     dailyPnl: number;
   };
+  /**
+   * TRA-801 — the SupertrendConfluence PAPER forward-test book. Optional for
+   * back-compat with snapshots written before the forward test existed; absent
+   * means "start the book empty". Closed forward-test trades live in
+   * `closedPositions` like any other paper trade — this only persists the OPEN
+   * positions (cash/equity/openPositions) so a redeploy doesn't abandon them.
+   */
+  supertrendPaper?: {
+    cash: number;
+    equity: number;
+    initialEquity: number;
+    dailyPnl: number;
+    openPositions: Position[];
+  };
 }
 
 export interface CryptoTradeSnapshot {

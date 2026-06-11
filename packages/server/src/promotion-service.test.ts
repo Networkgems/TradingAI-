@@ -291,3 +291,84 @@ describe('TRA-536 promotion gate — slippage check enforces once instrumented',
     expect(status.paper.state).toBe('pass');
   });
 });
+
+// TRA-801 — SupertrendConfluence is promoted to a monitored PAPER forward test
+// (Stage-2 accrual) while its real-chain backtest is still blocked on TRA-382 and
+// no Stage-3 sign-off exists. The SAFETY INVARIANT: no matter how strong the paper
+// metrics get, `evaluatePromotion` must keep `canGoLive=false` until a Stage-1
+// verdict AND a Stage-3 sign-off are on record. Paper trades for the strategy land
+// in the STOCKS ledger's `closedPositions` stamped `signalType:supertrend_confluence`.
+describe('TRA-801 SupertrendConfluence paper accrual — live stays gated', () => {
+  const ST_USER = 'supertrend-forward';
+  const STRATEGY = 'supertrend_confluence';
+
+  function stPaperTrade(pnl: number, i: number): Position {
+    // One trade per day so the ledger spans enough calendar days for the gate
+    // to annualize the paper Sharpe (mirrors the dca helper above).
+    return {
+      id: `st${i}`,
+      symbol: 'AAPL',
+      side: 'buy',
+      signalType: STRATEGY,
+      entryPrice: 100,
+      quantity: 1,
+      stopLoss: 99,
+      takeProfit: 103,
+      openedAt: i * DAY_MS,
+      closedAt: i * DAY_MS + 3_600_000,
+      pnl,
+      mode: 'demo',
+    };
+  }
+
+  async function seedStocksLedger(closed: Position[]): Promise<void> {
+    await tradeStore.saveStocksTradeSnapshot(ST_USER, {
+      version: 1,
+      savedAt: new Date().toISOString(),
+      openPositions: [],
+      closedPositions: closed,
+      recentSignals: [],
+      dailySignals: [],
+      positionSignalType: [],
+      options: {
+        openOptions: [], closedOptions: [], optionsPnl: 0,
+        dailyCount: 0, currentDayKey: '1970-01-01', cash: 25_000, equity: 25_000,
+      },
+      account: { cash: 25_000, equity: 25_000, initialEquity: 25_000, dailyPnl: 0 },
+    });
+  }
+
+  it('surfaces Stage-2 paper accruing from the stocks ledger for the supertrend strategyId', async () => {
+    // A handful of closed paper trades — count climbing, below the 50 threshold.
+    await seedStocksLedger(Array.from({ length: 12 }, (_, i) => stPaperTrade(i % 6 === 0 ? -0.5 : 1.5, i)));
+    const status = await svc.buildPromotionStatus(ST_USER, STRATEGY);
+    expect(status.paper.tradeCount).toBe(12);
+    expect(status.paper.metrics?.tradeCount).toBe(12);
+    // Below the 50-trade Stage-2 threshold → not yet a pass, but accruing.
+    expect(status.paper.state).toBe('fail');
+    expect(status.canGoLive).toBe(false);
+  });
+
+  it('keeps canGoLive=false even once paper metrics fully PASS (Stage 1 missing + no sign-off)', async () => {
+    // 60 monitored paper trades that clear count / expectancy / Sharpe.
+    await seedStocksLedger(Array.from({ length: 60 }, (_, i) => stPaperTrade(i % 6 === 0 ? -0.5 : 1.5, i)));
+    const status = await svc.buildPromotionStatus(ST_USER, STRATEGY);
+    expect(status.paper.state).toBe('pass'); // Stage 2 fully satisfied…
+    expect(status.backtest.state).toBe('missing'); // …but Stage 1 backtest blocked (TRA-382)
+    expect(status.signoff).toBe('absent'); // …and no Stage-3 sign-off
+    expect(status.canGoLive).toBe(false); // → SAFETY INVARIANT holds
+    expect(status.blockedReasons.join(' ')).toMatch(/Stage 1/);
+    expect(status.blockedReasons.join(' ')).toMatch(/sign-off/i);
+  });
+
+  it('an empty promotion record (ensureStrategyRegistered) does not advance the gate', async () => {
+    // Registering the strategy so it appears on the overview list must NOT clear
+    // any stage — Stage 1 stays `missing`, live stays refused.
+    await store.ensureStrategyRegistered(STRATEGY);
+    const rec = await store.getStrategyRecord(STRATEGY);
+    expect(rec?.backtest ?? null).toBeNull();
+    expect(rec?.decisions ?? []).toHaveLength(0);
+    const status = await svc.buildPromotionStatus(ST_USER, STRATEGY);
+    expect(status.canGoLive).toBe(false);
+  });
+});
