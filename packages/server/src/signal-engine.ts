@@ -27,6 +27,7 @@ import {
   submitSmartSellToClose,
 } from './tradier-smart-close.js';
 import { submitSmartBuyToOpen } from './tradier-smart-open.js';
+import { isLiveEntryGatePassed } from './capital-gate-manifest.js';
 import type { RelativeValueScannerService } from './relative-value-scanner.js';
 import type { DailySignalRecord } from './reports/eod-report.js';
 import type { PnlTracker } from './pnl-tracker.js';
@@ -1882,8 +1883,11 @@ export class SignalEngine {
    * bars. Fetches ≥ 250 daily candles per symbol, evaluates the spec's three
    * signals via {@link evaluateSma200}, applies the one-per-symbol-per-type +
    * 5-bar debounce guardrail, and pushes any fresh signals onto the display
-   * feed. TRA-460 — a fresh `sma200_pullback` also opens a position via
-   * {@link openSma200Pullback}; `sma200_reclaim` stays display-only.
+   * feed. TRA-819 — BOTH `sma200_pullback` and `sma200_reclaim` are now
+   * DISPLAY-ONLY: neither has passed the TRA-817 OOS capital gate, so neither
+   * opens a real position. {@link openSma200Pullback} is still called for a
+   * fresh pullback but no-ops behind the capital-gate manifest until the
+   * strategy is registered as gate-passed.
    */
   private async runSma200Scan(symbols: string[]): Promise<void> {
     if (symbols.length === 0) return;
@@ -1942,9 +1946,12 @@ export class SignalEngine {
             if (this.recentSignals.length > MAX_SIGNALS) this.recentSignals.pop();
             this.sma200LastFired.set(key, latestBarTs);
             fired++;
-            // TRA-460 — Signal 2 v2 (pullback) cleared the TRA-455 acceptance
-            // gate, so a fresh sma200_pullback now opens a live position.
-            // sma200_reclaim failed validation and stays display-only.
+            // TRA-819 — the display signal above is the deliverable for now.
+            // A fresh pullback still routes through openSma200Pullback, but
+            // that path no-ops behind the TRA-817 capital-gate manifest: the
+            // pullback's params were never validated out-of-sample (TRA-455
+            // FAIL; TRA-458 was an in-sample re-sweep). It opens NO position
+            // until registered as gate-passed. sma200_reclaim is display-only.
             if (result.kind === 'sma200_pullback') {
               await this.openSma200Pullback(signal);
             }
@@ -1958,18 +1965,37 @@ export class SignalEngine {
   }
 
   /**
-   * TRA-460 — open a position off a fresh `sma200_pullback` signal. Signal 2
-   * v2 cleared the TRA-455 acceptance gate (PF 1.93, MAR 0.61 vs SPY 0.41);
-   * `sma200_reclaim` failed validation (n=2–17) and never reaches here.
+   * Open a position off a fresh `sma200_pullback` signal.
    *
-   * Reuses the engine's existing equity entry path — a risk-sized paper open
-   * in demo, a Tradier OTOCO bracket plus local mirror in live — with entry =
-   * the signal's daily close and stop = its spec-defined suggested stop. The
-   * auto-trading-disabled and daily risk-halt gates are honoured exactly as
-   * the intraday ORB/BB path does; the display signal is still surfaced when
-   * those gates suppress the open.
+   * TRA-819 — GATED OFF. The earlier TRA-460 claim that this "cleared the
+   * TRA-455 acceptance gate" was misleading: TRA-455's verdict was a flat FAIL
+   * ("do not wire an entry path"; PF 1.18 < 1.3, MAR 0.09 vs SPY 0.41), and the
+   * PF 1.93 / MAR 0.61 figures came from TRA-458's IN-SAMPLE re-sweep on a
+   * single window — params tuned and graded on the same data, no out-of-sample
+   * / walk-forward split (neighboring configs flip pass/fail, an overfitting
+   * signature). The pullback is therefore NOT registered in the TRA-817
+   * capital-gate manifest, so this method opens NO real position — it bails at
+   * the manifest check below and the signal stays display-only, the same
+   * treatment as `sma200_reclaim`.
+   *
+   * The body is otherwise intact (reuses the engine's equity entry path — a
+   * risk-sized paper open in demo, a Tradier OTOCO bracket plus local mirror in
+   * live) so that once TRA-817's OOS gate registers the strategy as passed, the
+   * live entry re-enables with no further wiring. The auto-trading-disabled and
+   * daily risk-halt gates are still honoured below; the display signal is
+   * surfaced by the caller (runSma200Scan) regardless.
    */
   private async openSma200Pullback(signal: Sma200Signal): Promise<void> {
+    // TRA-819 (TRA-814 workstream D) — capital gate. The pullback's params were
+    // never validated out-of-sample, so it is not registered as a passed entry
+    // in the TRA-817 manifest. Open NO real position; stay display-only until a
+    // real OOS / walk-forward pass registers it. The display signal is already
+    // emitted by the caller before this point.
+    if (!isLiveEntryGatePassed(signal.type)) {
+      signal.liveSkipReason =
+        'display-only: sma200_pullback is not registered in the TRA-817 capital-gate manifest (no out-of-sample pass)';
+      return;
+    }
     // TRA-544: suspended when the agent layer owns the decision (§2B).
     if (!this.isDeterministicAutoTradingEnabled() || this.riskGovernor.isHalted()) return;
     // TRA-726: no day trading after the close — defer the SMA-200 pullback open
