@@ -61,15 +61,17 @@ function analystJson(kind: string): string {
 }
 
 describe('runAnalystsLlm', () => {
-  it('returns three schema-valid reports (one per kind) and sums cost', async () => {
+  it('returns four schema-valid reports (one per kind) and sums cost', async () => {
     const llm = fakeLlm((req) => analystJson(req.purpose.split(':')[1]!), 0.01);
     const { reports, costUsd } = await runAnalystsLlm(input, llm);
-    expect(reports.map((r) => r.kind)).toEqual(['technical', 'fundamental', 'news_sentiment']);
+    expect(reports.map((r) => r.kind)).toEqual([
+      'technical', 'fundamental', 'news_sentiment', 'social_sentiment',
+    ]);
     for (const r of reports) expect(validateAnalystReport(r)).toEqual([]);
-    expect(llm.calls).toHaveLength(3);
-    // All three analysts run on the cheap/fast (Haiku) tier (§6.6).
+    expect(llm.calls).toHaveLength(4);
+    // All four analysts run on the cheap/fast (Haiku) tier (§6.6).
     expect(llm.calls.every((c) => c.tier === 'fast')).toBe(true);
-    expect(costUsd).toBeCloseTo(0.03, 6);
+    expect(costUsd).toBeCloseTo(0.04, 6);
   });
 
   it('pins each report kind even if the model drifts it', async () => {

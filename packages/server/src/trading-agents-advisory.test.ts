@@ -62,12 +62,12 @@ function cannedLlm(costPerCall: number): LlmClient & { calls: number } {
 
 describe('adviseSymbol — cap hard-stop (acceptance #1)', () => {
   it('stops issuing paid calls once the user reaches the $2/day cap', async () => {
-    const llm = cannedLlm(0.5); // 5 calls/run → $2.50 per LLM run
+    const llm = cannedLlm(0.5); // 6 calls/run (4 analysts + trader + risk) → $3.00 per LLM run
 
-    // Run 1: user is under the cap → real LLM path, spend recorded (~$2.50).
+    // Run 1: user is under the cap → real LLM path, spend recorded (~$3.00).
     const r1 = await adviseSymbol(input, { user: 'alice', enabled: true, llm, now: NOW });
     expect(r1.llmUsed).toBe(true);
-    expect(r1.recommendation.costUsd).toBeCloseTo(2.5, 6);
+    expect(r1.recommendation.costUsd).toBeCloseTo(3.0, 6);
     expect(isOverUserDailyCap('alice', NOW)).toBe(true);
     const spentAfter1 = agentUserSpendStatus('alice', NOW).spentUsd;
     const callsAfter1 = llm.calls;
@@ -132,12 +132,12 @@ describe('resolveTradingAgentsLlm — env kill switch (acceptance #3, env side)'
 
 describe('adviseSymbol — aggregate accounting (acceptance #4)', () => {
   it('rolls recorded spend into the daily aggregate across users', async () => {
-    const llm = cannedLlm(0.02); // 5 calls → $0.10 per run
+    const llm = cannedLlm(0.02); // 6 calls → $0.12 per run
     await adviseSymbol(input, { user: 'alice', enabled: true, llm, now: NOW });
     await adviseSymbol(input, { user: 'bob', enabled: true, llm, now: NOW });
     const agg = agentSpendAggregate(NOW);
     expect(agg.userCount).toBe(2);
-    expect(agg.totalUsd).toBeCloseTo(0.2, 2);
+    expect(agg.totalUsd).toBeCloseTo(0.24, 2);
   });
 });
 

@@ -177,7 +177,47 @@ const NEWS_SPEC: AnalystSpec = {
   },
 };
 
-const ANALYST_SPECS: AnalystSpec[] = [TECHNICAL_SPEC, FUNDAMENTAL_SPEC, NEWS_SPEC];
+const SOCIAL_SPEC: AnalystSpec = {
+  kind: 'social_sentiment',
+  system: [
+    'You are the Social-Sentiment Analyst on a disciplined swing-trading desk.',
+    'You read ONLY the supplied StockTwits aggregate for this symbol: a recency-weighted net',
+    'bull/bear score, a gated tilt, tagged-message counts (with a curated/followed-account',
+    'subset), raw message buzz, and freshness. Crowd sentiment is noisy and reflexive: weight',
+    'curated signal above anonymous crowd, discount stale or thin reads, and NEVER let buzz',
+    'alone (untagged volume) move your stance. With no aggregate or a neutral/stale tilt,',
+    'abstain with a NEUTRAL stance and LOW confidence — never fabricate a crowd narrative.',
+    ANALYST_OUTPUT_CONTRACT,
+  ].join('\n'),
+  user: (input) => {
+    const s = input.social;
+    const payload = {
+      symbol: input.symbol,
+      asOf: new Date(input.asOf).toISOString(),
+      social: s
+        ? {
+            source: s.source,
+            window: s.window,
+            netScore: s.netScore,
+            tilt: s.tilt,
+            bullishCount: s.bullishCount,
+            bearishCount: s.bearishCount,
+            taggedCount: s.taggedCount,
+            curatedCount: s.curatedCount,
+            messageCount: s.messageCount,
+            freshnessMinutes: s.freshnessMinutes,
+          }
+        : null,
+      keyLevels: keyLevels(input.candles),
+    };
+    return (
+      `StockTwits social aggregate (JSON):\n${JSON.stringify(payload)}\n`
+      + 'Set "kind" to "social_sentiment". With no aggregate or a neutral tilt, return stance 0 and confidence ≤ 0.15.'
+    );
+  },
+};
+
+const ANALYST_SPECS: AnalystSpec[] = [TECHNICAL_SPEC, FUNDAMENTAL_SPEC, NEWS_SPEC, SOCIAL_SPEC];
 
 /** Validate an analyst payload AND pin its kind to the one we asked for. */
 function analystValidator(kind: AnalystKind): (v: unknown) => string[] {
@@ -192,9 +232,9 @@ function analystValidator(kind: AnalystKind): (v: unknown) => string[] {
 }
 
 /**
- * Run the three core analysts against the real model on the `fast` tier, fanned
+ * Run the core analysts against the real model on the `fast` tier, fanned
  * out in parallel. Returns the reports (oldest-defined order: technical,
- * fundamental, news_sentiment) plus the summed LLM cost across all three.
+ * fundamental, news_sentiment, social_sentiment) plus the summed LLM cost.
  */
 export async function runAnalystsLlm(
   input: AgentGraphInput,

@@ -1,7 +1,16 @@
 import { describe, it, expect } from 'vitest';
 import { validateAnalystReport, type Candle } from '@trading-app/shared';
-import { runAnalysts, technicalAnalyst, newsSentimentAnalyst } from './analysts.js';
+import { runAnalysts, technicalAnalyst, newsSentimentAnalyst, socialSentimentAnalyst } from './analysts.js';
 import type { AgentGraphInput } from './types.js';
+import type { SocialSentiment } from '@trading-app/shared';
+
+function social(overrides: Partial<SocialSentiment> = {}): SocialSentiment {
+  return {
+    symbol: 'AAA', asOf: new Date(asOf).toISOString(), window: '24h', source: 'stocktwits',
+    netScore: 0.6, bullishCount: 12, bearishCount: 2, taggedCount: 14, curatedCount: 3,
+    messageCount: 40, freshnessMinutes: 5, tilt: 'bullish', ...overrides,
+  };
+}
 
 function candles(closes: number[]): Candle[] {
   return closes.map((c, i) => ({
@@ -52,5 +61,34 @@ describe('analyst tier (TRA-529 §3.1 deterministic fakes)', () => {
     const [, fundamental, news] = runAnalysts({ symbol: 'AAA', asOf, candidateSignal: null, candles: candles([100, 101, 102]) });
     expect(fundamental.confidence).toBeLessThanOrEqual(0.1);
     expect(news.confidence).toBeLessThanOrEqual(0.1);
+  });
+
+  it('social analyst tracks a bullish StockTwits aggregate (TRA-813)', () => {
+    const r = socialSentimentAnalyst({
+      symbol: 'AAA', asOf, candidateSignal: null, candles: candles([100, 101, 102]),
+      social: social(),
+    });
+    expect(r.kind).toBe('social_sentiment');
+    expect(r.stance).toBeGreaterThan(0.1);
+    expect(r.confidence).toBeGreaterThan(0.3);
+    expect(validateAnalystReport(r)).toEqual([]);
+  });
+
+  it('social analyst stays flat on a gated-neutral tilt and discounts confidence', () => {
+    const r = socialSentimentAnalyst({
+      symbol: 'AAA', asOf, candidateSignal: null, candles: candles([100, 101, 102]),
+      // Strong raw score but tilt gated neutral (thin/stale) → stance forced flat.
+      social: social({ tilt: 'neutral', netScore: 0.8 }),
+    });
+    expect(r.stance).toBe(0);
+    expect(r.confidence).toBeLessThan(0.6);
+  });
+
+  it('social analyst abstains with low confidence when no aggregate is wired', () => {
+    const r = socialSentimentAnalyst({
+      symbol: 'AAA', asOf, candidateSignal: null, candles: candles([100, 101, 102]),
+    });
+    expect(r.stance).toBe(0);
+    expect(r.confidence).toBeLessThanOrEqual(0.1);
   });
 });

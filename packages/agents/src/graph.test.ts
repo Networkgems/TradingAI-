@@ -43,7 +43,7 @@ describe('runAgentGraph (TRA-544 stub orchestration)', () => {
       expect(reco.costUsd).toBe(0); // no LLM spend in P1
       expect(reco.symbol).toBe('AAA');
       expect(reco.asOf).toBe(asOf);
-      expect(reco.analystReports).toHaveLength(3);
+      expect(reco.analystReports).toHaveLength(4);
     }
   });
 
@@ -146,11 +146,11 @@ describe('runAgentGraph (TRA-747 LLM path)', () => {
     const llm = cannedLlm(0.01);
     const reco = await runAgentGraph(input(rising()), { llm });
     expect(validateAgentRecommendation(reco)).toEqual([]);
-    // 3 analysts (fast) + trader + risk (strong) = 5 calls → $0.05.
-    expect(llm.calls).toHaveLength(5);
-    expect(llm.calls.filter((c) => c.tier === 'fast')).toHaveLength(3);
+    // 4 analysts (fast) + trader + risk (strong) = 6 calls → $0.06.
+    expect(llm.calls).toHaveLength(6);
+    expect(llm.calls.filter((c) => c.tier === 'fast')).toHaveLength(4);
     expect(llm.calls.filter((c) => c.tier === 'strong')).toHaveLength(2);
-    expect(reco.costUsd).toBeCloseTo(0.05, 6);
+    expect(reco.costUsd).toBeCloseTo(0.06, 6);
     expect(reco.action).toBe('BUY');
     expect(reco.verdict).toBe('APPROVE');
     expect(reco.proposedSignal).not.toBeNull();

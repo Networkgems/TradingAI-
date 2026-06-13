@@ -2779,8 +2779,11 @@ export interface EodReport {
 /** Directional verb a trader/recommendation can emit (TRA-529 §3.3). */
 export type AgentAction = 'BUY' | 'SELL' | 'HOLD';
 
-/** The three core analysts shipped in P1 (TRA-529 §3.1). */
-export type AnalystKind = 'technical' | 'fundamental' | 'news_sentiment';
+/**
+ * The analyst tier. P1 (TRA-529 §3.1) shipped the first three; TRA-813 (P4) adds
+ * `social_sentiment`, which consumes the per-symbol StockTwits aggregate.
+ */
+export type AnalystKind = 'technical' | 'fundamental' | 'news_sentiment' | 'social_sentiment';
 
 /** Risk-manager verdict over a proposed TraderDecision (TRA-529 §3.4). */
 export type RiskVerdictKind = 'APPROVE' | 'REVISE' | 'VETO';
@@ -2935,8 +2938,13 @@ export function validateAnalystReport(value: unknown): string[] {
   const errors: string[] = [];
   const r = value as Partial<AnalystReport> | null | undefined;
   if (r == null || typeof r !== 'object') return ['report: not an object'];
-  if (r.kind !== 'technical' && r.kind !== 'fundamental' && r.kind !== 'news_sentiment') {
-    errors.push('kind: must be technical|fundamental|news_sentiment');
+  if (
+    r.kind !== 'technical'
+    && r.kind !== 'fundamental'
+    && r.kind !== 'news_sentiment'
+    && r.kind !== 'social_sentiment'
+  ) {
+    errors.push('kind: must be technical|fundamental|news_sentiment|social_sentiment');
   }
   if (!inRange(r.stance, -1, 1)) errors.push('stance: must be a number in [-1, 1]');
   if (!inRange(r.confidence, 0, 1)) errors.push('confidence: must be a number in [0, 1]');

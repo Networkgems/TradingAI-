@@ -147,11 +147,58 @@ export function newsSentimentAnalyst(input: AgentGraphInput): AnalystReport {
   };
 }
 
-/** Run the three core analysts (parallel-safe; pure functions, no shared state). */
+/**
+ * Social-sentiment analyst (TRA-813 P4 Piece 1) — stance from the StockTwits
+ * aggregate's recency-weighted `netScore`; confidence scales with how many
+ * directional (tagged) messages backed it, with a bonus for curated
+ * (followed-account) signal and a penalty when the tilt is gated neutral (thin
+ * or stale). Neutral/low-confidence when no aggregate is wired — the same
+ * abstain-don't-fabricate contract the news analyst follows. Deterministic fake;
+ * P2-style LLM body lives in llm-agents.ts.
+ */
+export function socialSentimentAnalyst(input: AgentGraphInput): AnalystReport {
+  const s = input.social;
+  if (!s || s.taggedCount === 0) {
+    return {
+      kind: 'social_sentiment',
+      stance: 0,
+      confidence: 0.1,
+      horizonDays: 2,
+      keyLevels: keyLevels(input.candles),
+      drivers: ['no StockTwits social signal available — abstaining with low confidence'],
+      notes: 'Social feed empty or untagged; returning a neutral, low-confidence read.',
+    };
+  }
+  // `netScore` is already a recency-weighted mean in [-1,1]; gate the directional
+  // read on the aggregate's own `tilt` so a sub-threshold/stale score stays flat.
+  const stance = round(clamp(s.tilt === 'neutral' ? 0 : s.netScore, -1, 1));
+  // Confidence earns with directional volume (capped), a curated bonus, and is
+  // halved when the tilt is gated neutral (thin/stale evidence).
+  const volumeFactor = clamp(Math.min(s.taggedCount, 20) / 20, 0, 1);
+  const curatedBonus = s.curatedCount > 0 ? 0.15 : 0;
+  let confidence = 0.2 + volumeFactor * 0.5 + curatedBonus;
+  if (s.tilt === 'neutral') confidence *= 0.5;
+  return {
+    kind: 'social_sentiment',
+    stance,
+    confidence: round(clamp(confidence, 0, 1)),
+    horizonDays: 2,
+    keyLevels: keyLevels(input.candles),
+    drivers: [
+      `StockTwits tilt ${s.tilt} (netScore ${s.netScore.toFixed(2)})`,
+      `${s.taggedCount} tagged of ${s.messageCount} messages${s.curatedCount > 0 ? `, ${s.curatedCount} curated` : ''}`,
+      `freshness ${s.freshnessMinutes}m`,
+    ],
+    notes: `${s.bullishCount} bull / ${s.bearishCount} bear over ${s.window}; source ${s.source}.`,
+  };
+}
+
+/** Run the four core analysts (parallel-safe; pure functions, no shared state). */
 export function runAnalysts(input: AgentGraphInput): AnalystReport[] {
   return [
     technicalAnalyst(input),
     fundamentalAnalyst(input),
     newsSentimentAnalyst(input),
+    socialSentimentAnalyst(input),
   ];
 }

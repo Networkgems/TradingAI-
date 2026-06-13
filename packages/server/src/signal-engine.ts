@@ -2926,9 +2926,14 @@ export class SignalEngine {
       // (analysts.ts:129). The news-sentiment analyst consumes these when the
       // LLM path runs; empty → it abstains, so this stays additive.
       const news = buildNewsHeadlines(this.newsCache, aliasWatchlistSymbol(sym), asOf);
+      // TRA-813 (P4 Piece 1) — wire the per-symbol StockTwits aggregate the P1
+      // stub left unset (analysts.ts socialSentimentAnalyst). `getSocialSentiment`
+      // reduces the live social caches and never throws; an empty/untagged read
+      // makes the analyst abstain, so this stays additive like the news feed.
+      const social = this.getSocialSentiment(sym);
       try {
         const { recommendation } = await adviseSymbol(
-          { symbol: sym, asOf, candles, candidateSignal: null, fundamentals, news },
+          { symbol: sym, asOf, candles, candidateSignal: null, fundamentals, news, social },
           { user: this.alertUsername, enabled: this.tradingAgentsEnabled, llm },
         );
         recos.push(recommendation);

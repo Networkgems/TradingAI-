@@ -2,7 +2,7 @@
 // contracts the graph *emits* (AnalystReport, TraderDecision, RiskVerdict,
 // AgentRecommendation) live in @trading-app/shared; these are the engine-side
 // inputs that never cross the WS boundary.
-import type { Candle, TradeSignal } from '@trading-app/shared';
+import type { Candle, SocialSentiment, TradeSignal } from '@trading-app/shared';
 
 /** Point-in-time fundamentals snapshot for the fundamental analyst (P2 fills). */
 export interface FundamentalSnapshot {
@@ -46,4 +46,13 @@ export interface AgentGraphInput {
   candidateSignal: TradeSignal | null;
   fundamentals?: FundamentalSnapshot;
   news?: NewsHeadline[];
+  /**
+   * TRA-813 (P4 Piece 1) — per-symbol StockTwits social-sentiment aggregate
+   * (TRA-602), read at the call site from `engine.getSocialSentiment(symbol)`.
+   * Consumed by the social-sentiment analyst. Optional + additive: when absent
+   * the analyst abstains (neutral, low confidence), exactly like the news feed.
+   * The aggregate is computed as-of the live cache read; the analyst still pins
+   * its horizon short because social buzz is a fast-decaying signal.
+   */
+  social?: SocialSentiment;
 }
