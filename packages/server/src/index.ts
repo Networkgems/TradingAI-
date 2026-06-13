@@ -40,6 +40,12 @@ import {
 import { scanStocksMarket, scanCryptoMarket } from './market-scanner.js';
 import { runPremarketForAllUsers } from './premarket-watchlist.js';
 import { recordOptionChains } from './options-chain-recorder.js';
+import { recordSentimentSnapshot } from './sentiment-snapshot-recorder.js';
+import {
+  fetchStockTwitsStream,
+  fetchStockTwitsUserStream,
+  getCuratedStockTwitsAccounts,
+} from './stocktwits-feed.js';
 // TRA-779 — replay smoke endpoint proves the captured chains are consumable by
 // the run-options-replay pipe. Server already depends on @trading-app/backtest.
 import { loadChainDays, runOptionsReplay, DEFAULT_REPLAY_CONFIG } from '@trading-app/backtest';
@@ -159,6 +165,10 @@ import {
   DEFAULT_STRATEGY_PRESET_ID,
   WATCHLIST,
   aliasWatchlistSymbol,
+  aggregateStockTwitsSentiment,
+  dedupeStockTwitsMessages,
+  mapCuratedMessagesBySymbol,
+  type StockTwitsMessage,
   validateLiveCredentials,
   validateProductionTradierKeys,
   type AccountSettings,
@@ -1413,6 +1423,74 @@ async function runChainRecord(): Promise<void> {
       errorMessage: s.errorMessage,
     });
   }
+}
+
+// TRA-822 (TRA-820 Step 1) — daily StockTwits sentiment-snapshot logger. Runs on
+// the SAME 3:55 PM ET hook as the chain recorder so the two snapshots
+// co-accumulate on the persistent disk (the IC/flow study joins them per
+// symbol-day). StockTwits sentiment is otherwise held only in-memory
+// (`SignalEngine.socialCache`), so without this logger there is no persisted
+// history to measure. Mirrors the engine read path: crowd stream + curated
+// followed-account lane, deduped by message id, reduced by
+// `aggregateStockTwitsSentiment`. The StockTwits endpoint is key-less, so this
+// needs no creds — a rate-limited/cold fetch records `no_data` for that
+// symbol-day rather than throwing. Universe is the equities WATCHLIST (the
+// TRA-820 §2 25-name study universe); `SENTIMENT_WATCHLIST` overrides.
+const SENTIMENT_RECORD_OUT_DIR =
+  process.env['SENTIMENT_OUT_DIR'] ?? join(DATA_DIR, 'sentiment-snapshots');
+
+async function runSentimentSnapshot(): Promise<void> {
+  const rawUniverse = (process.env['SENTIMENT_WATCHLIST'] ?? '').trim();
+  const symbols = rawUniverse
+    ? rawUniverse.split(',').map((s) => s.trim().toUpperCase()).filter(Boolean)
+    : [...WATCHLIST];
+
+  // Build the curated (followed-account) lane once for the whole sweep, mirroring
+  // SignalEngine.refreshCuratedSocialSentiment: pull each curated user stream,
+  // map messages onto every symbol they mention. Best-effort — a fully throttled
+  // pull just yields an empty curated map (crowd-only reads still record).
+  const curatedCollected: StockTwitsMessage[] = [];
+  for (const user of getCuratedStockTwitsAccounts()) {
+    try {
+      const messages = await fetchStockTwitsUserStream(user);
+      if (messages !== null) curatedCollected.push(...messages);
+    } catch (err) {
+      log.warn('sentiment-recorder curated fetch failed', {
+        account: user,
+        reason: err instanceof Error ? err.message : String(err),
+      });
+    }
+  }
+  const curatedBySymbol = mapCuratedMessagesBySymbol(curatedCollected);
+
+  log.info('sentiment-recorder starting', {
+    symbols: symbols.length,
+    universeSource: rawUniverse ? 'SENTIMENT_WATCHLIST' : 'WATCHLIST',
+    curatedSymbols: curatedBySymbol.size,
+    outDir: SENTIMENT_RECORD_OUT_DIR,
+  });
+
+  const result = await recordSentimentSnapshot({
+    symbols,
+    outDir: SENTIMENT_RECORD_OUT_DIR,
+    fetchSentiment: async (symbol) => {
+      const crowd = await fetchStockTwitsStream(symbol);
+      // Null = rate-limited / cold: no read for this symbol-day. An empty array
+      // is a genuine "no messages" read and still aggregates to a neutral row.
+      if (crowd === null) return null;
+      const curated = curatedBySymbol.get(symbol.toUpperCase()) ?? [];
+      const messages = dedupeStockTwitsMessages([...curated, ...crowd]);
+      return aggregateStockTwitsSentiment({ symbol, messages, now: Date.now() });
+    },
+  });
+
+  const recorded = result.symbols.filter((s) => s.outcome === 'recorded').length;
+  log.info('sentiment-recorder complete', {
+    date: result.date,
+    recorded,
+    total: result.symbols.length,
+    dir: result.outDir,
+  });
 }
 
 // TRA-596 (TRA-595 C1) — refresh the upcoming-earnings calendar for the active
@@ -4985,7 +5063,19 @@ scheduler.start({
   // TRA-380 — 3:55 PM ET option-chain recorder. Captures one Tradier chain
   // snapshot per trading day into the persistent disk for the TRA-379
   // replay backtest harness. Market days only; see `runChainRecord`.
-  onChainRecord: runChainRecord,
+  //
+  // TRA-822 — the StockTwits sentiment-snapshot logger rides the same hook so
+  // the sentiment + chain partitions co-accumulate per symbol-day for the
+  // TRA-820 IC/flow study. Isolated so a StockTwits failure can't drop the
+  // chain capture (or vice-versa).
+  onChainRecord: async () => {
+    await runChainRecord();
+    await runSentimentSnapshot().catch((err) =>
+      log.error('sentiment-recorder failed', {
+        reason: err instanceof Error ? err.message : String(err),
+      }),
+    );
+  },
   // TRA-406 — observability monitor on every 60s tick.
   onMonitor: runObservabilityMonitor,
 });

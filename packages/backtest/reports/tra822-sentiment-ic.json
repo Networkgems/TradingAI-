@@ -1,0 +1,193 @@
+{
+  "issue": "TRA-822",
+  "parent": "TRA-820",
+  "generatedAt": "2026-06-13T19:27:39.593Z",
+  "inputs": {
+    "sentimentDir": "C:\\Users\\eetienne\\.paperclip\\instances\\default\\projects\\fc64eaf4-0c08-4270-9a4c-31ee16594dec\\74473ac3-bd4b-470e-8bc3-5c558ad85d1e\\_default\\packages\\backtest\\data\\sentiment-snapshots",
+    "chainsDir": "C:\\Users\\eetienne\\.paperclip\\instances\\default\\projects\\fc64eaf4-0c08-4270-9a4c-31ee16594dec\\74473ac3-bd4b-470e-8bc3-5c558ad85d1e\\_default\\packages\\backtest\\data\\option-chains",
+    "sentimentDaysLoaded": 0,
+    "chainDaysLoaded": 0,
+    "studyUniverse": [
+      "AAPL",
+      "MSFT",
+      "NVDA",
+      "GOOGL",
+      "AMZN",
+      "META",
+      "TSLA",
+      "AMD",
+      "NFLX",
+      "ORCL",
+      "INTC",
+      "QCOM",
+      "AVGO",
+      "CRM",
+      "ADBE",
+      "PYPL",
+      "XYZ",
+      "SHOP",
+      "COIN",
+      "MSTR"
+    ],
+    "etfUniverse": [],
+    "noFetch": true
+  },
+  "study": {
+    "sample": {
+      "nSymbolDays": 0,
+      "nUsableSymbolDays": 0,
+      "nTradingDays": 0,
+      "nConfirmedSymbolDays": 0,
+      "nBuzzOnlySymbolDays": 0,
+      "perSymbol": {}
+    },
+    "s1Ic": {
+      "1d": {
+        "horizon": "1d",
+        "meanIC": 0,
+        "icStd": 0,
+        "icir": 0,
+        "nDays": 0,
+        "pooledIC": null,
+        "nPairs": 0
+      },
+      "5d": {
+        "horizon": "5d",
+        "meanIC": 0,
+        "icStd": 0,
+        "icir": 0,
+        "nDays": 0,
+        "pooledIC": null,
+        "nPairs": 0
+      },
+      "20d": {
+        "horizon": "20d",
+        "meanIC": 0,
+        "icStd": 0,
+        "icir": 0,
+        "nDays": 0,
+        "pooledIC": null,
+        "nPairs": 0
+      }
+    },
+    "s2Ic": {
+      "1d": {
+        "horizon": "1d",
+        "meanIC": 0,
+        "icStd": 0,
+        "icir": 0,
+        "nDays": 0,
+        "pooledIC": null,
+        "nPairs": 0
+      },
+      "5d": {
+        "horizon": "5d",
+        "meanIC": 0,
+        "icStd": 0,
+        "icir": 0,
+        "nDays": 0,
+        "pooledIC": null,
+        "nPairs": 0
+      },
+      "20d": {
+        "horizon": "20d",
+        "meanIC": 0,
+        "icStd": 0,
+        "icir": 0,
+        "nDays": 0,
+        "pooledIC": null,
+        "nPairs": 0
+      }
+    },
+    "confirmedVsAloneDelta": {
+      "1d": 0,
+      "5d": 0,
+      "20d": 0
+    },
+    "s1BucketsByQuintile": {
+      "1d": [],
+      "5d": [],
+      "20d": []
+    },
+    "s2BucketsByQuintile": {
+      "1d": [],
+      "5d": [],
+      "20d": []
+    },
+    "s2BucketsByTilt": {
+      "1d": [
+        {
+          "bucket": "bearish",
+          "n": 0,
+          "meanRet": 0,
+          "medianRet": 0,
+          "ci95": null
+        },
+        {
+          "bucket": "neutral",
+          "n": 0,
+          "meanRet": 0,
+          "medianRet": 0,
+          "ci95": null
+        },
+        {
+          "bucket": "bullish",
+          "n": 0,
+          "meanRet": 0,
+          "medianRet": 0,
+          "ci95": null
+        }
+      ],
+      "5d": [
+        {
+          "bucket": "bearish",
+          "n": 0,
+          "meanRet": 0,
+          "medianRet": 0,
+          "ci95": null
+        },
+        {
+          "bucket": "neutral",
+          "n": 0,
+          "meanRet": 0,
+          "medianRet": 0,
+          "ci95": null
+        },
+        {
+          "bucket": "bullish",
+          "n": 0,
+          "meanRet": 0,
+          "medianRet": 0,
+          "ci95": null
+        }
+      ],
+      "20d": [
+        {
+          "bucket": "bearish",
+          "n": 0,
+          "meanRet": 0,
+          "medianRet": 0,
+          "ci95": null
+        },
+        {
+          "bucket": "neutral",
+          "n": 0,
+          "meanRet": 0,
+          "medianRet": 0,
+          "ci95": null
+        },
+        {
+          "bucket": "bullish",
+          "n": 0,
+          "meanRet": 0,
+          "medianRet": 0,
+          "ci95": null
+        }
+      ]
+    },
+    "verdict": "INCONCLUSIVE",
+    "verdictReasons": [
+      "Sample below the §4 bar: 0/20 trading days, 0/300 usable symbol-days — keep collecting."
+    ]
+  }
+}
