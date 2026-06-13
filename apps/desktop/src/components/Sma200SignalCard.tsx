@@ -1,8 +1,9 @@
 // TRA-451 — card for the "SMA-200" Signals-tab category. Renders the spec UI
 // row: symbol, signal type, entry, suggested stop, RSI, dist_atr, and the
-// trend-quality badge. TRA-460 — pullbacks now open live positions and
-// reclaims stay display-only; the card intentionally omits the Target / R:R
-// chips the intraday trading signals carry for both types.
+// trend-quality badge. TRA-819 — pullback live entry is gated off pending an
+// OOS capital-gate pass, so both pullbacks and reclaims are display-only; the
+// card intentionally omits the Target / R:R chips the intraday trading signals
+// carry, and renders no position/order state for either type.
 import type { TradeSignal, Sma200Signal } from '@trading-app/shared';
 import { fmt, fmtPrice, formatTime, signalLabel } from '../lib/format';
 

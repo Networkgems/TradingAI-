@@ -105,15 +105,17 @@ export function StockSignalsPanel({
             </div>
           )}
           {/* TRA-451 — "SMA-200" category: daily-bar trend-filter signals.
-              TRA-460 — pullbacks cleared the backtest acceptance gate and now
-              open live positions; reclaims stay display-only. Rendered as a
-              separate category from the intraday strategy signals. */}
+              TRA-819 — pullback live entry is gated off (its params were never
+              validated out-of-sample, TRA-455 was a FAIL); both pullbacks and
+              reclaims are now DISPLAY-ONLY context until a strategy passes the
+              TRA-817 OOS capital gate. Rendered as a separate category from the
+              intraday strategy signals. */}
           {sma200Signals.length > 0 && (
             <div className="signal-category">
               <div className="signal-category-header">
                 <span className="signal-category-title">SMA-200</span>
                 <span className="signal-category-note">
-                  Daily trend filter — pullbacks are trade-enabled; reclaims are research-only
+                  Daily trend filter — display-only context; no position opens until the OOS capital gate passes
                 </span>
               </div>
               <div className="signal-list">

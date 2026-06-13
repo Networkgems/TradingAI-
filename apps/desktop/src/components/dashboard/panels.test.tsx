@@ -131,6 +131,43 @@ describe('StockSignalsPanel (TRA-422)', () => {
     expect(screen.getByText('NVDA')).toBeInTheDocument();
     expect(screen.getByText('BUY')).toBeInTheDocument();
   });
+
+  // TRA-819 — QADesigner Signals-tab smoke. The sma200_pullback live entry is
+  // gated off until it passes the TRA-817 OOS capital gate; it must still render
+  // as display-only context, and nothing in the SMA-200 category may imply it
+  // opens a position. Locks the corrected copy so the old "pullbacks are
+  // trade-enabled" claim can't silently come back.
+  it('renders sma200_pullback as display-only context with no trade-enabled / position language', () => {
+    const pullback: TradeSignal = {
+      ...signal({
+        id: 'sma1',
+        symbol: 'AAPL',
+        type: 'sma200_pullback',
+        context: 'continuation — pullback-to-200 bounce',
+      }),
+      rsi: 60,
+      distAtr: 1.5,
+      trendQuality: true,
+      goldenCross: true,
+      liveSkipReason:
+        'display-only: sma200_pullback is not registered in the TRA-817 capital-gate manifest (no out-of-sample pass)',
+    } as TradeSignal;
+
+    renderWithToast(
+      <StockSignalsPanel token="t" signals={[pullback]} symbols={[symbol({ symbol: 'AAPL' })]} marketReview={undefined} />,
+    );
+
+    // The display-only SMA-200 card still renders with its context label.
+    expect(screen.getByText('AAPL')).toBeInTheDocument();
+    expect(screen.getByText(/pullback-to-200 bounce/)).toBeInTheDocument();
+    // The category note states display-only, not trade-enabled.
+    expect(screen.getByText(/no position opens until the OOS capital gate passes/)).toBeInTheDocument();
+    // The old, now-false copy must NOT appear anywhere on the tab.
+    expect(screen.queryByText(/trade-enabled/)).not.toBeInTheDocument();
+    // The SMA-200 card carries no Target / R:R chips (a position would).
+    expect(screen.queryByText('Target')).not.toBeInTheDocument();
+    expect(screen.queryByText('R:R')).not.toBeInTheDocument();
+  });
 });
 
 describe('StockPositionsPanel (TRA-422)', () => {
