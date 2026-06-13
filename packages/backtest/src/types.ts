@@ -1,5 +1,5 @@
 import { Candle, Position } from '@trading-app/shared';
-import type { BreakoutVolOptions, CellExpectancy, CorrelationCapConfig, CostModel, IchimokuOptions, MeanReversionCryptoOptions, MomentumOptions, OrbOptions, RegimeDetectorOptions, ScalpingOptions, SwingOptions, VolKellySizerConfig } from '@trading-app/engine';
+import type { BreakoutVolOptions, CellExpectancy, CorrelationCapConfig, CostModel, IchimokuOptions, MeanReversionCryptoOptions, MomentumOptions, OrbOptions, RegimeDetectorOptions, ScalpingOptions, SwingOptions, TsmomMajorsParams, VolKellySizerConfig } from '@trading-app/engine';
 
 export interface BacktestReversalOpts {
   rsiPeriod?: number;
@@ -148,7 +148,8 @@ export interface BacktestConfig {
     | 'scalping'
     | 'swing'
     | 'breakout_vol'
-    | 'mean_reversion';
+    | 'mean_reversion'
+    | 'tsmom_majors';
   reversalOpts?: BacktestReversalOpts;
   macdBollingerOpts?: BacktestMacdBollingerOpts;
   ichimokuOpts?: BacktestIchimokuOpts;
@@ -158,6 +159,14 @@ export interface BacktestConfig {
   breakoutVolOpts?: BreakoutVolOptions;
   /** TRA-206: pass-through to MeanReversionCryptoStrategy. */
   meanReversionOpts?: MeanReversionCryptoOptions;
+  /**
+   * TRA-821 — the four frozen `tsmom_majors` params (lookbackDays, entryBandPct,
+   * exitBandPct, volTargetAnnualPct). Only consulted when
+   * `strategyType === 'tsmom_majors'`. The runner force-enables the VolKellySizer
+   * for that strategy and derives the sizer's vol anchor from `volTargetAnnualPct`
+   * (see runner), so no separate `volKellySizerOpts` is required for tsmom.
+   */
+  tsmomOpts?: TsmomMajorsParams;
   /**
    * TRA-211: per-strategy risk-budget override for mean-reversion entries —
    * spec §3 sizes mean reversion at 0.75% of equity (vs. the 1% default that

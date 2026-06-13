@@ -126,6 +126,7 @@ export function signalLabel(type: string) {
     case 'tradier_import': return 'Tradier Import';
     case 'sma200_pullback': return 'Pullback → 200';
     case 'sma200_reclaim': return '200-SMA Reclaim';
+    case 'tsmom_majors': return 'TS Momentum'; // TRA-821 — crypto time-series momentum (display-only pre-gate)
     default: return type;
   }
 }
@@ -137,6 +138,7 @@ export function exitReasonLabel(reason?: string) {
     case 'time_stop': return 'Time';
     case 'trailing': return 'Trail';
     case 'rsi_alt_exit': return 'RSI exit';
+    case 'tsmom_band_exit': return 'Momentum exit'; // TRA-821 — tsmom_majors long-or-flat band exit
     default: return reason ?? '—';
   }
 }

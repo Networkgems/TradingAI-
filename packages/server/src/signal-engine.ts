@@ -2033,6 +2033,37 @@ export class SignalEngine {
   }
 
   /**
+   * TRA-821 (TRA-817 workstream C) — capital gate for the `tsmom_majors` crypto
+   * candidate. This is the SANCTIONED live-entry chokepoint: any future crypto
+   * router that would open a real `tsmom_majors` position (demo OR live) must go
+   * through here, exactly like {@link openSma200Pullback} gates the equity path.
+   *
+   * It opens NOTHING until `tsmom_majors` is registered in the TRA-817 capital-
+   * gate manifest as having cleared the keeper gate — which is QuantTrader's call
+   * after grading the committed TRA-821 report, not something this code flips.
+   * Returns `true` only when the gate is open AND a position was opened; otherwise
+   * it stamps `liveSkipReason` and returns `false`, leaving the signal display-only.
+   *
+   * No live crypto scan calls this yet (crypto is research/display-only during the
+   * TRA-814 turnaround); the method exists so the gate is enforced the moment a
+   * live entry path is wired post-PASS, with no risk of a pre-validation open.
+   */
+  private maybeOpenTsmomMajorsEntry(signal: TradeSignal): boolean {
+    // Gate first, before any sizing or order placement — the same discipline as
+    // the sma200 path. `tsmom_majors` is intentionally absent from
+    // PASSED_LIVE_ENTRIES, so this short-circuits to display-only.
+    if (!isLiveEntryGatePassed('tsmom_majors')) {
+      signal.liveSkipReason =
+        'display-only: tsmom_majors is not registered in the TRA-817 capital-gate manifest (awaiting OOS keeper-gate PASS)';
+      return false;
+    }
+    // (Reached only once the quant registers a PASS.) A live crypto entry path
+    // would size + place the order here; until then this remains unreachable by
+    // construction and the candidate cannot open a real position.
+    return false;
+  }
+
+  /**
    * Look up live marks for every open RV / OTM position via the scanner's
    * cached chain snapshot (TRA-191). Also pulls marks for Tradier-imported
    * positions (TRA-351) so the dashboard's "Current Mark" and unrealized

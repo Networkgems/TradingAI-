@@ -1,12 +1,19 @@
-// TRA-819 (TRA-814 workstream D) — the stock-strategy LIVE-ENTRY capital-gate
+// TRA-819 (TRA-814 workstream D) — the strategy LIVE-ENTRY capital-gate
 // manifest.
 //
 // Codifies the discipline from `docs/strategy-turnaround-TRA-814.md` §4C: no
-// stock strategy may open a real (live OR demo) position until it is registered
+// strategy may open a real (live OR demo) position until it is registered
 // here as having PASSED the fixed out-of-sample keeper gate — pooled OOS
 // bootstrap p5 final-equity > 1.0 AND pooled OOS expectancy > 0 on the full
 // universe with the *fixed* fee-aware harness (TRA-818), PLUS a walk-forward
 // across >=2 regime cycles.
+//
+// TRA-821 (TRA-817 workstream C) — the gate is strategy-id generic and now also
+// covers crypto candidates. The `tsmom_majors` time-series-momentum candidate
+// (BTC/ETH/SOL, daily, long-or-flat) routes its live entry through
+// `isLiveEntryGatePassed('tsmom_majors')` exactly like the sma200 path. It is
+// NOT added to PASSED_LIVE_ENTRIES here — that is the quant's call after the
+// TRA-817 keeper-gate verdict — so it stays display-only until it clears the gate.
 //
 // This is a machine-checkable ALLOW-LIST, not a knob to flip a strategy on by
 // hand. An entry belongs here ONLY when TRA-817's capital gate emits a passing

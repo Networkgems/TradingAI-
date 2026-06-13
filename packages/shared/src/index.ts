@@ -34,6 +34,7 @@ export type SignalType =
   | 'sma200_pullback' // TRA-451: pullback-to-200 bounce (continuation long), daily bars
   | 'sma200_reclaim'  // TRA-451: 200-SMA reclaim reversal (trend-change swing), daily bars
   | 'supertrend_confluence' // TRA-728: Supertrend + MA-stack + MACD + RSI confluence (options, router-gated off in Phase 1)
+  | 'tsmom_majors' // TRA-821: time-series-momentum on BTC/ETH/SOL — daily, long-or-flat, band-exit (TRA-817 workstream C)
   | 'tradier_import'; // TRA-323: position imported from Tradier (opened directly on the broker, synced into TradeAI to be closed here)
 export type OptionType = 'call' | 'put';
 
@@ -257,6 +258,7 @@ export type ExitReason =
   | 'time_stop'
   | 'trailing'
   | 'rsi_alt_exit'
+  | 'tsmom_band_exit' // TRA-821: tsmom_majors long-or-flat exit when trailing L-day return crosses below -exitBandPct
   | 'invalid_bracket';
 
 export interface Position {
@@ -2632,7 +2634,8 @@ export interface EodTradeEntry {
     | 'Tradier'      // TRA-323 — imported from Tradier (never actually written to disk: imports don't trade through the EOD exporter)
     | 'Options'      // TRA-365 follow-up — option closes that arrived without a more specific signal mapping
     | 'SMA-200'      // TRA-451 — SMA-200 pullback/reclaim signals (display-only; never opens a position, so never reaches the EOD exporter)
-    | 'Supertrend';  // TRA-728 — Supertrend confluence (options, router-gated off in Phase 1; never reaches the EOD exporter, mapped for exhaustiveness)
+    | 'Supertrend'   // TRA-728 — Supertrend confluence (options, router-gated off in Phase 1; never reaches the EOD exporter, mapped for exhaustiveness)
+    | 'TSMOM';       // TRA-821 — tsmom_majors crypto candidate (display-only until the TRA-817 OOS gate passes; label reserved for the post-PASS crypto exporter)
   side: Side;
   entryPrice: number;
   exitPrice: number;

@@ -41,6 +41,19 @@ export type {
   SupertrendConfluenceParams,
   ConfluenceReads,
 } from './strategies/supertrend-confluence.js';
+export {
+  TsmomMajorsStrategy,
+  evaluateTsmomMajors,
+  tsmomExitToFlat,
+  trailingTotalReturn,
+  tsmomSizingStopFraction,
+  resolveTsmomMajorsParams,
+  TSMOM_BARS_PER_YEAR,
+} from './strategies/tsmom-majors.js';
+export type {
+  TsmomMajorsParams,
+  ResolvedTsmomMajorsParams,
+} from './strategies/tsmom-majors.js';
 export { RiskManager } from './risk.js';
 export type { RiskManagerOptions } from './risk.js';
 export {

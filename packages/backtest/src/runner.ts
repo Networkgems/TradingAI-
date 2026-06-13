@@ -13,6 +13,10 @@ import {
   MomentumStrategy,
   BreakoutVolStrategy,
   MeanReversionCryptoStrategy,
+  TsmomMajorsStrategy,
+  resolveTsmomMajorsParams,
+  tsmomExitToFlat,
+  TSMOM_BARS_PER_YEAR,
   IchimokuStrategy,
   ScalpingStrategy,
   SwingStrategy,
@@ -209,6 +213,11 @@ export class BacktestRunner {
       ...config.meanReversionOpts,
       regimeOptions: config.meanReversionOpts?.regimeOptions ?? config.regimeOpts,
     });
+    // TRA-821 — time-series-momentum on the crypto majors. Long-or-flat, band
+    // exit; sizing is the VolKellySizer's job (wired below). Stateless wrapper.
+    const tsmomParams = resolveTsmomMajorsParams(config.tsmomOpts);
+    const tsmom = new TsmomMajorsStrategy(config.tsmomOpts);
+    const isTsmom = config.strategyType === 'tsmom_majors';
 
     // TRA-169 / TRA-185 / TRA-203: per-fill cost model. Commission charged on
     // entry+exit notional, slippage applied adversely to fill prices. The
@@ -319,9 +328,30 @@ export class BacktestRunner {
     // flag defaults false → the sizer ships dark. `resolveVolKellySizerConfig`
     // asserts `riskPctFloor >= minTradeRiskPct` against the resolved cluster
     // cap floor (§5 floor coherence).
-    const volKellyEnabled = config.volKellySizerOpts?.enabled === true;
+    // TRA-821 — the sizer is intrinsic to `tsmom_majors` ("enabled for THIS
+    // strategy only"), so force it on and derive its config from the frozen 4
+    // params: `volTargetAnnualPct` is the annual vol anchor, risk is the 1%
+    // base clamped to [0.5%, 1.75%], and daily crypto bars annualise on √365.
+    // An explicit `volKellySizerOpts.config` (e.g. a sweep) still overrides.
+    // Omitting `expectancyByCell` leaves the Kelly cap inactive (vol-only) —
+    // the only honest choice in a backtest, since feeding OOS expectancy back
+    // into the same OOS trades would be look-ahead; live trading supplies the
+    // validated OOS net expectancy per the spec.
+    const tsmomVolKellyConfig = isTsmom
+      ? {
+          baseRiskPct: 0.01,
+          riskPctFloor: 0.005,
+          riskPctCeil: 0.0175,
+          volRefAnnual: tsmomParams.volTargetAnnualPct / 100,
+          barsPerYear: TSMOM_BARS_PER_YEAR,
+          volWindowBars: 30,
+        }
+      : undefined;
+    const volKellyEnabled = config.volKellySizerOpts?.enabled === true || isTsmom;
     const volKellyConfig = resolveVolKellySizerConfig(
-      config.volKellySizerOpts?.config,
+      isTsmom
+        ? { ...tsmomVolKellyConfig, ...(config.volKellySizerOpts?.config ?? {}) }
+        : config.volKellySizerOpts?.config,
       corrCapConfig.minTradeRiskPct,
     );
     const volKellyExpectancy = config.volKellySizerOpts?.expectancyByCell ?? {};
@@ -519,6 +549,25 @@ export class BacktestRunner {
 
       for (const pos of positions.getOpen()) {
         const ls = positions.getLifecycle(pos.id);
+
+        // TRA-821 — tsmom_majors is long-or-flat with a band exit, NOT a bracket
+        // strategy. Its on-signal stop is a sizing-only 1R unit (one daily
+        // vol-target σ) that would fire near-daily on crypto if armed, so we skip
+        // the hard stop / take-profit / time-stop entirely and exit only when the
+        // trailing L-day return crosses below -exitBandPct. Exit at this bar's
+        // close, mirroring the mean_reversion RSI alt-exit convention.
+        if (pos.signalType === 'tsmom_majors') {
+          if (tsmomExitToFlat(window, tsmomParams)) {
+            exitsThisBar.push({
+              pos,
+              rawExit: latest.close,
+              reason: 'tsmom_band_exit',
+              ambiguous: false,
+            });
+          }
+          continue;
+        }
+
         const hitsStop = pos.side === 'buy'
           ? latest.low <= pos.stopLoss
           : latest.high >= pos.stopLoss;
@@ -686,6 +735,12 @@ export class BacktestRunner {
       if (config.strategyType === 'mean_reversion' || config.strategyType === 'combined') {
         const m = meanReversion.evaluate(config.symbol, window);
         if (m) signals.push(m);
+      }
+      // TRA-821 — standalone crypto candidate; not part of the legacy `combined`
+      // equity bundle. The runner's `alreadyOpen` guard keeps it long-or-flat.
+      if (config.strategyType === 'tsmom_majors') {
+        const s = tsmom.evaluate(config.symbol, window);
+        if (s) signals.push(s);
       }
       if (config.strategyType === 'ichimoku' || config.strategyType === 'combined') {
         const s = ichimoku.evaluate(config.symbol, window);

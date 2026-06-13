@@ -90,6 +90,10 @@ function strategyLabel(t: SignalType): StrategyLabel {
     // off in Phase 1, and never reaches the crypto EOD exporter. Mapped only to
     // keep the switch exhaustive over the shared `SignalType` enum.
     case 'supertrend_confluence': return 'Supertrend';
+    // TRA-821 — tsmom_majors is a crypto candidate that stays display-only until
+    // it clears the TRA-817 OOS keeper gate, so it does not yet reach the crypto
+    // EOD exporter. The 'TSMOM' label is reserved here for the post-PASS path.
+    case 'tsmom_majors': return 'TSMOM';
   }
 }
 

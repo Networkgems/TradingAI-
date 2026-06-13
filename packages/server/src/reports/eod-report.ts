@@ -63,6 +63,9 @@ function strategyLabel(t: SignalType): EodTradeEntry['strategy'] {
     // Phase 1, so it never reaches the EOD trade exporter. Mapped here only to
     // keep the switch exhaustive over `SignalType`.
     case 'supertrend_confluence': return 'Supertrend';
+    // TRA-821 — tsmom_majors is a crypto signal; it never reaches the equity EOD
+    // exporter. Mapped only to keep the switch exhaustive over `SignalType`.
+    case 'tsmom_majors': return 'TSMOM';
   }
 }
 

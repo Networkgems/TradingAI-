@@ -1,0 +1,28 @@
+.                                        |  WARN  Unsupported engine: wanted: {"node":"20.x"} (current: {"node":"v22.14.0","pnpm":"10.33.1"})
+[tra817] tsmom_majors capital-gate validation — 3 symbols (daily), 2 cost arms
+[tra817] IS 2023-05-01..2024-12-31  |  OOS 2025-01-01..2026-06-13
+
+[BTC-USD] loading daily… [fetch-tra266-data] Fetching BTC-USD from Yahoo (2022-01-01 → 2026-06-13)…
+[fetch-tra266-data] BTC-USD: 1625 bars cached (2022-01-01 → 2026-06-13)
+1625 bars (4.45y)
+[ETH-USD] loading daily… [fetch-tra266-data] Fetching ETH-USD from Yahoo (2022-01-01 → 2026-06-13)…
+[fetch-tra266-data] ETH-USD: 1625 bars cached (2022-01-01 → 2026-06-13)
+1625 bars (4.45y)
+[SOL-USD] loading daily… [fetch-tra266-data] Fetching SOL-USD from Yahoo (2022-01-01 → 2026-06-13)…
+[fetch-tra266-data] SOL-USD: 1625 bars cached (2022-01-01 → 2026-06-13)
+1625 bars (4.45y)
+
+[tra817] IS-picked frozen config: L=150 entryBand=5% exitBand=3% volTarget=60%  (IS p5=1.389, expN=14.425, n=13)
+
+=== Pooled OOS by cost arm (frozen IS-picked config) ===
+arm           n     expN     PF      p5x     p50x    keeper
+maker_entry      9   -4.930  0.08    -      -    no
+taker_80         9   -5.157  0.07    -      -    no
+
+=== Walk-forward (maker_entry) ===
+  2022_bear      n=  2 expN=-1.834 PF=0.26 p5=n/a keeper=no
+  2023_recovery  n=  7 expN=-0.041 PF=0.98 p5=n/a keeper=no
+  2024_bull      n=  7 expN=3.469 PF=3.52 p5=n/a keeper=no
+  2025_chop      n=  9 expN=-4.930 PF=0.08 p5=n/a keeper=no
+
+[tra817] report written: C:\Users\eetienne\.paperclip\instances\default\projects\fc64eaf4-0c08-4270-9a4c-31ee16594dec\74473ac3-bd4b-470e-8bc3-5c558ad85d1e\_default\packages\backtest\reports\tra817-tsmom-majors.json

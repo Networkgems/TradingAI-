@@ -1,0 +1,592 @@
+{
+  "issue": "TRA-821",
+  "workstream": "TRA-817 workstream C",
+  "strategy": "tsmom_majors",
+  "generatedAt": "2026-06-13T19:13:58.853Z",
+  "universe": [
+    "BTC-USD",
+    "ETH-USD",
+    "SOL-USD"
+  ],
+  "barTimeframe": "1d",
+  "dataSource": "yahoo-daily",
+  "initialEquity": 25000,
+  "slippageBps": 3,
+  "riskPerTrade": 0.01,
+  "sizing": "VolKellySizer (vol-only; Kelly cap inactive in-backtest — feeding OOS expectancy into OOS sizing would be look-ahead. Live supplies validated OOS net expectancy per spec).",
+  "windows": {
+    "is": {
+      "start": "2023-05-01T00:00:00.000Z",
+      "end": "2024-12-31T23:59:59.999Z"
+    },
+    "oos": {
+      "start": "2025-01-01T00:00:00.000Z",
+      "end": "2026-06-13T00:00:00.000Z"
+    },
+    "warmupStart": "2022-01-01T00:00:00.000Z"
+  },
+  "costArms": [
+    {
+      "name": "maker_entry",
+      "feeBps": {
+        "maker": 25,
+        "taker": 60
+      },
+      "executionMode": "limit"
+    },
+    {
+      "name": "taker_80",
+      "feeBps": 80,
+      "executionMode": "market"
+    }
+  ],
+  "keeperGate": "pooled OOS block-bootstrap p5 final-equity multiple > 1.0 AND pooled OOS net expectancy > 0",
+  "paramGrid": {
+    "lookbackDays": [
+      50,
+      75,
+      100,
+      150,
+      200
+    ],
+    "entryBandPct": [
+      0,
+      3,
+      5
+    ],
+    "exitBandPct": [
+      0,
+      3,
+      5
+    ],
+    "selectionVolTargetPct": 60
+  },
+  "pickedConfig": {
+    "lookbackDays": 150,
+    "entryBandPct": 5,
+    "exitBandPct": 3,
+    "volTargetAnnualPct": 60
+  },
+  "isSelectionTable": [
+    {
+      "params": {
+        "lookbackDays": 150,
+        "entryBandPct": 5,
+        "exitBandPct": 3,
+        "volTargetAnnualPct": 60
+      },
+      "isTrades": 13,
+      "isP5": 1.3888292781735103,
+      "isExpectancyNet": 14.42478216017439
+    },
+    {
+      "params": {
+        "lookbackDays": 100,
+        "entryBandPct": 5,
+        "exitBandPct": 0,
+        "volTargetAnnualPct": 60
+      },
+      "isTrades": 20,
+      "isP5": 1.2854749396525185,
+      "isExpectancyNet": 12.141981040384929
+    },
+    {
+      "params": {
+        "lookbackDays": 100,
+        "entryBandPct": 0,
+        "exitBandPct": 5,
+        "volTargetAnnualPct": 60
+      },
+      "isTrades": 20,
+      "isP5": 1.278462263801122,
+      "isExpectancyNet": 10.94712022308601
+    },
+    {
+      "params": {
+        "lookbackDays": 150,
+        "entryBandPct": 5,
+        "exitBandPct": 0,
+        "volTargetAnnualPct": 60
+      },
+      "isTrades": 15,
+      "isP5": 1.2521820655975269,
+      "isExpectancyNet": 12.287153357654976
+    },
+    {
+      "params": {
+        "lookbackDays": 150,
+        "entryBandPct": 3,
+        "exitBandPct": 5,
+        "volTargetAnnualPct": 60
+      },
+      "isTrades": 12,
+      "isP5": 1.2371520410809882,
+      "isExpectancyNet": 14.092355620501236
+    },
+    {
+      "params": {
+        "lookbackDays": 150,
+        "entryBandPct": 3,
+        "exitBandPct": 3,
+        "volTargetAnnualPct": 60
+      },
+      "isTrades": 15,
+      "isP5": 1.2276167665281426,
+      "isExpectancyNet": 12.359103180070333
+    },
+    {
+      "params": {
+        "lookbackDays": 150,
+        "entryBandPct": 0,
+        "exitBandPct": 5,
+        "volTargetAnnualPct": 60
+      },
+      "isTrades": 16,
+      "isP5": 1.1996748689044905,
+      "isExpectancyNet": 10.837091604940728
+    },
+    {
+      "params": {
+        "lookbackDays": 100,
+        "entryBandPct": 5,
+        "exitBandPct": 5,
+        "volTargetAnnualPct": 60
+      },
+      "isTrades": 15,
+      "isP5": 1.1582424868235852,
+      "isExpectancyNet": 14.17144909753773
+    },
+    {
+      "params": {
+        "lookbackDays": 100,
+        "entryBandPct": 3,
+        "exitBandPct": 0,
+        "volTargetAnnualPct": 60
+      },
+      "isTrades": 29,
+      "isP5": 1.1236829014545942,
+      "isExpectancyNet": 8.154294758881344
+    },
+    {
+      "params": {
+        "lookbackDays": 200,
+        "entryBandPct": 0,
+        "exitBandPct": 3,
+        "volTargetAnnualPct": 60
+      },
+      "isTrades": 15,
+      "isP5": 1.1075295352867327,
+      "isExpectancyNet": 17.38825064981271
+    },
+    {
+      "params": {
+        "lookbackDays": 100,
+        "entryBandPct": 3,
+        "exitBandPct": 5,
+        "volTargetAnnualPct": 60
+      },
+      "isTrades": 18,
+      "isP5": 1.0960716160829118,
+      "isExpectancyNet": 11.810530726341888
+    },
+    {
+      "params": {
+        "lookbackDays": 150,
+        "entryBandPct": 0,
+        "exitBandPct": 3,
+        "volTargetAnnualPct": 60
+      },
+      "isTrades": 22,
+      "isP5": 1.0720247382240524,
+      "isExpectancyNet": 8.49010593479968
+    }
+  ],
+  "oos": [
+    {
+      "arm": "maker_entry",
+      "trades": 9,
+      "symbolsContributing": 3,
+      "expectancyNet": -4.930019463762456,
+      "profitFactor": 0.07558606816246936,
+      "bootstrap": null,
+      "keeper": false,
+      "perSymbol": [
+        {
+          "symbol": "BTC-USD",
+          "trades": 2,
+          "winRatePct": 0,
+          "expectancyR": -2.995230298481643,
+          "profitFactor": 0,
+          "sharpe": -0.4039637890240849,
+          "maxDdPct": 6.495111093307735,
+          "totalPnlUsd": -990.4159341720485,
+          "returnPct": -3.9616637366881946
+        },
+        {
+          "symbol": "ETH-USD",
+          "trades": 3,
+          "winRatePct": 33.33333333333333,
+          "expectancyR": -3.153813922205238,
+          "profitFactor": 0.31559985572125177,
+          "sharpe": -0.25572501512453,
+          "maxDdPct": 10.89665188065208,
+          "totalPnlUsd": -964.5139904702021,
+          "returnPct": -3.858055961880808
+        },
+        {
+          "symbol": "SOL-USD",
+          "trades": 4,
+          "winRatePct": 0,
+          "expectancyR": -7.229568202570775,
+          "profitFactor": 0,
+          "sharpe": -0.9992699186502365,
+          "maxDdPct": 15.06656160268206,
+          "totalPnlUsd": -2791.170847852535,
+          "returnPct": -11.16468339141014
+        }
+      ]
+    },
+    {
+      "arm": "taker_80",
+      "trades": 9,
+      "symbolsContributing": 3,
+      "expectancyNet": -5.157443602402651,
+      "profitFactor": 0.06793968366172619,
+      "bootstrap": null,
+      "keeper": false,
+      "perSymbol": [
+        {
+          "symbol": "BTC-USD",
+          "trades": 2,
+          "winRatePct": 0,
+          "expectancyR": -3.22658199371916,
+          "profitFactor": 0,
+          "sharpe": -0.4344369660454928,
+          "maxDdPct": 6.695756059020893,
+          "totalPnlUsd": -1065.006528993685,
+          "returnPct": -4.26002611597474
+        },
+        {
+          "symbol": "ETH-USD",
+          "trades": 3,
+          "winRatePct": 33.33333333333333,
+          "expectancyR": -3.384889846381706,
+          "profitFactor": 0.28491297774592267,
+          "sharpe": -0.2784818920250715,
+          "maxDdPct": 10.91585280180872,
+          "totalPnlUsd": -1041.050946623569,
+          "returnPct": -4.164203786494276
+        },
+        {
+          "symbol": "SOL-USD",
+          "trades": 4,
+          "winRatePct": 0,
+          "expectancyR": -7.452289723760104,
+          "profitFactor": 0,
+          "sharpe": -1.0274181772145448,
+          "maxDdPct": 15.397238711318314,
+          "totalPnlUsd": -2877.6379866945276,
+          "returnPct": -11.510551946778111
+        }
+      ]
+    }
+  ],
+  "walkForward": [
+    {
+      "fold": "2022_bear",
+      "window": {
+        "start": "2022-01-01T00:00:00.000Z",
+        "end": "2022-12-31T23:59:59.999Z"
+      },
+      "arm": "maker_entry",
+      "trades": 2,
+      "expectancyNet": -1.8341836667615867,
+      "profitFactor": 0.2592471522276234,
+      "p5": null,
+      "p50": null,
+      "keeper": false
+    },
+    {
+      "fold": "2022_bear",
+      "window": {
+        "start": "2022-01-01T00:00:00.000Z",
+        "end": "2022-12-31T23:59:59.999Z"
+      },
+      "arm": "taker_80",
+      "trades": 2,
+      "expectancyNet": -2.069280399562251,
+      "profitFactor": 0.20146721467510956,
+      "p5": null,
+      "p50": null,
+      "keeper": false
+    },
+    {
+      "fold": "2023_recovery",
+      "window": {
+        "start": "2023-01-01T00:00:00.000Z",
+        "end": "2023-12-31T23:59:59.999Z"
+      },
+      "arm": "maker_entry",
+      "trades": 7,
+      "expectancyNet": -0.041048389716596585,
+      "profitFactor": 0.9796296462529204,
+      "p5": null,
+      "p50": null,
+      "keeper": false
+    },
+    {
+      "fold": "2023_recovery",
+      "window": {
+        "start": "2023-01-01T00:00:00.000Z",
+        "end": "2023-12-31T23:59:59.999Z"
+      },
+      "arm": "taker_80",
+      "trades": 7,
+      "expectancyNet": -0.278177934875331,
+      "profitFactor": 0.8704091757502502,
+      "p5": null,
+      "p50": null,
+      "keeper": false
+    },
+    {
+      "fold": "2024_bull",
+      "window": {
+        "start": "2024-01-01T00:00:00.000Z",
+        "end": "2024-12-31T23:59:59.999Z"
+      },
+      "arm": "maker_entry",
+      "trades": 7,
+      "expectancyNet": 3.46937077238676,
+      "profitFactor": 3.5239930588754502,
+      "p5": null,
+      "p50": null,
+      "keeper": false
+    },
+    {
+      "fold": "2024_bull",
+      "window": {
+        "start": "2024-01-01T00:00:00.000Z",
+        "end": "2024-12-31T23:59:59.999Z"
+      },
+      "arm": "taker_80",
+      "trades": 7,
+      "expectancyNet": 3.226220625857215,
+      "profitFactor": 3.1404392229706573,
+      "p5": null,
+      "p50": null,
+      "keeper": false
+    },
+    {
+      "fold": "2025_chop",
+      "window": {
+        "start": "2025-01-01T00:00:00.000Z",
+        "end": "2026-06-13T00:00:00.000Z"
+      },
+      "arm": "maker_entry",
+      "trades": 9,
+      "expectancyNet": -4.930019463762456,
+      "profitFactor": 0.07558606816246936,
+      "p5": null,
+      "p50": null,
+      "keeper": false
+    },
+    {
+      "fold": "2025_chop",
+      "window": {
+        "start": "2025-01-01T00:00:00.000Z",
+        "end": "2026-06-13T00:00:00.000Z"
+      },
+      "arm": "taker_80",
+      "trades": 9,
+      "expectancyNet": -5.157443602402651,
+      "profitFactor": 0.06793968366172619,
+      "p5": null,
+      "p50": null,
+      "keeper": false
+    }
+  ],
+  "neighborStability": [
+    {
+      "params": {
+        "lookbackDays": 100,
+        "entryBandPct": 5,
+        "exitBandPct": 3,
+        "volTargetAnnualPct": 60
+      },
+      "arm": "maker_entry",
+      "trades": 13,
+      "expectancyNet": -0.7704520315870885,
+      "p5": 0.7217694884806801,
+      "keeper": false
+    },
+    {
+      "params": {
+        "lookbackDays": 100,
+        "entryBandPct": 5,
+        "exitBandPct": 3,
+        "volTargetAnnualPct": 60
+      },
+      "arm": "taker_80",
+      "trades": 13,
+      "expectancyNet": -1.0061193964965178,
+      "p5": 0.6997365330110462,
+      "keeper": false
+    },
+    {
+      "params": {
+        "lookbackDays": 200,
+        "entryBandPct": 5,
+        "exitBandPct": 3,
+        "volTargetAnnualPct": 60
+      },
+      "arm": "maker_entry",
+      "trades": 15,
+      "expectancyNet": -3.3911899979395135,
+      "p5": 0.4870587321759345,
+      "keeper": false
+    },
+    {
+      "params": {
+        "lookbackDays": 200,
+        "entryBandPct": 5,
+        "exitBandPct": 3,
+        "volTargetAnnualPct": 60
+      },
+      "arm": "taker_80",
+      "trades": 15,
+      "expectancyNet": -3.6214145966092617,
+      "p5": 0.46989052943992093,
+      "keeper": false
+    },
+    {
+      "params": {
+        "lookbackDays": 150,
+        "entryBandPct": 3,
+        "exitBandPct": 3,
+        "volTargetAnnualPct": 60
+      },
+      "arm": "maker_entry",
+      "trades": 10,
+      "expectancyNet": -4.365240591435427,
+      "p5": null,
+      "keeper": false
+    },
+    {
+      "params": {
+        "lookbackDays": 150,
+        "entryBandPct": 3,
+        "exitBandPct": 3,
+        "volTargetAnnualPct": 60
+      },
+      "arm": "taker_80",
+      "trades": 10,
+      "expectancyNet": -4.593759745093904,
+      "p5": null,
+      "keeper": false
+    },
+    {
+      "params": {
+        "lookbackDays": 150,
+        "entryBandPct": 5,
+        "exitBandPct": 0,
+        "volTargetAnnualPct": 60
+      },
+      "arm": "maker_entry",
+      "trades": 14,
+      "expectancyNet": -3.4971603134694,
+      "p5": 0.51766989269432,
+      "keeper": false
+    },
+    {
+      "params": {
+        "lookbackDays": 150,
+        "entryBandPct": 5,
+        "exitBandPct": 0,
+        "volTargetAnnualPct": 60
+      },
+      "arm": "taker_80",
+      "trades": 14,
+      "expectancyNet": -3.7274551299825793,
+      "p5": 0.5006089244301805,
+      "keeper": false
+    },
+    {
+      "params": {
+        "lookbackDays": 150,
+        "entryBandPct": 5,
+        "exitBandPct": 5,
+        "volTargetAnnualPct": 60
+      },
+      "arm": "maker_entry",
+      "trades": 8,
+      "expectancyNet": -5.388282735821543,
+      "p5": null,
+      "keeper": false
+    },
+    {
+      "params": {
+        "lookbackDays": 150,
+        "entryBandPct": 5,
+        "exitBandPct": 5,
+        "volTargetAnnualPct": 60
+      },
+      "arm": "taker_80",
+      "trades": 8,
+      "expectancyNet": -5.61479318786418,
+      "p5": null,
+      "keeper": false
+    },
+    {
+      "params": {
+        "lookbackDays": 150,
+        "entryBandPct": 5,
+        "exitBandPct": 3,
+        "volTargetAnnualPct": 40
+      },
+      "arm": "maker_entry",
+      "trades": 9,
+      "expectancyNet": -7.362974870614685,
+      "p5": null,
+      "keeper": false
+    },
+    {
+      "params": {
+        "lookbackDays": 150,
+        "entryBandPct": 5,
+        "exitBandPct": 3,
+        "volTargetAnnualPct": 40
+      },
+      "arm": "taker_80",
+      "trades": 9,
+      "expectancyNet": -7.702636708658677,
+      "p5": null,
+      "keeper": false
+    },
+    {
+      "params": {
+        "lookbackDays": 150,
+        "entryBandPct": 5,
+        "exitBandPct": 3,
+        "volTargetAnnualPct": 80
+      },
+      "arm": "maker_entry",
+      "trades": 9,
+      "expectancyNet": -3.705580878303603,
+      "p5": null,
+      "keeper": false
+    },
+    {
+      "params": {
+        "lookbackDays": 150,
+        "entryBandPct": 5,
+        "exitBandPct": 3,
+        "volTargetAnnualPct": 80
+      },
+      "arm": "taker_80",
+      "trades": 9,
+      "expectancyNet": -3.8765199897121443,
+      "p5": null,
+      "keeper": false
+    }
+  ]
+}
