@@ -272,6 +272,12 @@ export class BacktestRunner {
 
     const closedTrades: Position[] = [];
     const tradeRs: number[] = [];
+    // TRA-818 (fix for TRA-815): fee-aware per-trade R, run in parallel to the
+    // gross `tradeRs`. `optimisticPnl` already nets commission + slippage, so
+    // dividing by the same stop-distance denominator the gross R uses yields a
+    // net-of-cost R. Kept separate so live vol/Kelly sizing and validations that
+    // consume the gross `expectancy`/`tradeRs` are untouched.
+    const tradeRsNet: number[] = [];
     let ambiguousTrades = 0;
     let worstCaseTotalPnl = 0;
     /** Slippage-adjusted entry fill price keyed by position id. */
@@ -602,6 +608,13 @@ export class BacktestRunner {
         entryFills.delete(pos.id);
         closedTrades.push(closed);
         tradeRs.push(tradeR(pos.side, entryFill, optimisticFill, stopForR));
+        // TRA-818: net R uses the cost-inclusive `optimisticPnl` over the same
+        // stop-distance denominator the gross R uses (stopDistance * qty). With
+        // fee=0 this is byte-identical to the gross R above, since
+        // grossPnl/(stopDistance*qty) === (exitFill-entryFill)*dir/stopDistance.
+        const stopDistanceForR = Math.abs(entryFill - stopForR);
+        const denomNet = stopDistanceForR * pos.quantity;
+        tradeRsNet.push(denomNet > 0 ? optimisticPnl / denomNet : 0);
 
         if (ambiguous && pessimisticRawExit !== undefined) {
           ambiguousTrades += 1;
@@ -734,6 +747,12 @@ export class BacktestRunner {
     const expectancy = tradeRs.length > 0
       ? tradeRs.reduce((s, r) => s + r, 0) / tradeRs.length
       : 0;
+    // TRA-818: net-of-cost expectancy (commission + slippage). Strictly <=
+    // gross `expectancy`, and monotonically worse as fees rise. NOT wired into
+    // live sizing — pooled by TRA-523 for the per-arm cost-sensitivity table.
+    const expectancyNet = tradeRsNet.length > 0
+      ? tradeRsNet.reduce((s, r) => s + r, 0) / tradeRsNet.length
+      : 0;
 
     const avgRiskReward = closedTrades.length > 0
       ? closedTrades.reduce((s, t) => {
@@ -783,6 +802,8 @@ export class BacktestRunner {
       worstCaseTotalPnl,
       tradeRs,
       expectancy,
+      tradeRsNet,
+      expectancyNet,
       barIntervalMs,
     };
   }

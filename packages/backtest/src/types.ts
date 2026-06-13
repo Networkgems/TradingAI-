@@ -351,6 +351,21 @@ export interface BacktestResult {
    */
   expectancy: number;
   /**
+   * TRA-818 (fix for TRA-815): per-trade R multiples **net of commission +
+   * slippage**, computed as `optimisticPnl / (stopDistance * quantity)`. Runs
+   * in parallel to the fee-blind gross {@link tradeRs}; with `feeBps: 0` the two
+   * series are identical. Unlike {@link tradeRs}, this is NOT consumed by live
+   * vol/Kelly sizing — it exists so cost-sensitivity analysis (TRA-523) can pool
+   * a fee-aware expectancy that actually differs across cost arms.
+   */
+  tradeRsNet: number[];
+  /**
+   * TRA-818 (fix for TRA-815): average net-of-cost R per trade — mean of
+   * {@link tradeRsNet}. Strictly `<=` gross {@link expectancy} and monotonically
+   * worse as fees rise; equal to it at zero fees.
+   */
+  expectancyNet: number;
+  /**
    * TRA-203: bar interval in milliseconds inferred from candle timestamps,
    * used to annualize Sharpe. `null` when fewer than 2 candles were supplied
    * (Sharpe falls back to per-trade-return annualization).

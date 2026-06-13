@@ -337,6 +337,58 @@ describe('BacktestRunner TRA-203 fee + slippage + executionMode', () => {
     );
   });
 
+  // ── TRA-818 (fix for TRA-815): fee-aware net expectancy series ──────────────
+  // The per-trade gross R is fee-blind, so pooled expectancy was byte-identical
+  // across cost arms. `expectancyNet`/`tradeRsNet` net commission + slippage so
+  // cost sensitivity actually shows up, while gross `expectancy` is preserved
+  // for live vol/Kelly sizing consumers.
+  it('expectancyNet falls monotonically as fees rise while gross expectancy is fee-invariant', async () => {
+    // Use the planted-breakout fixture, which reliably fires a closed trade
+    // (nonzero turnover) — the ORB fixture above does not under this config.
+    const { candles } = buildPlantedBreakoutSeries();
+    const breakoutConfig = (over: Partial<BacktestConfig> = {}): BacktestConfig => ({
+      symbol: 'TEST',
+      startDate: 0,
+      endDate: Number.MAX_SAFE_INTEGER,
+      initialEquity: 100_000,
+      strategyType: 'breakout_vol',
+      ...over,
+    });
+    const ladder = [0, 10, 60, 80];
+    const results = await Promise.all(
+      ladder.map(feeBps => new BacktestRunner().run(breakoutConfig({ feeBps }), candles)),
+    );
+    // The fixture must actually trade for this regression to mean anything.
+    for (const r of results) expect(r.totalTrades).toBeGreaterThan(0);
+
+    const [zero, , , high] = results;
+
+    // 1) Identity at fee=0: net R equals gross R trade-for-trade.
+    expect(zero.tradeRsNet.length).toBe(zero.tradeRs.length);
+    for (let i = 0; i < zero.tradeRs.length; i++) {
+      expect(zero.tradeRsNet[i]).toBeCloseTo(zero.tradeRs[i], 9);
+    }
+    expect(zero.expectancyNet).toBeCloseTo(zero.expectancy, 9);
+
+    // 2) expectancyNet is the mean of tradeRsNet.
+    for (const r of results) {
+      expect(r.expectancyNet).toBeCloseTo(
+        r.tradeRsNet.reduce((s, x) => s + x, 0) / r.tradeRsNet.length,
+        9,
+      );
+    }
+
+    // 3) Gross expectancy is unchanged by fees (documents the gross/net split).
+    for (const r of results) expect(r.expectancy).toBeCloseTo(zero.expectancy, 9);
+
+    // 4) expectancyNet is monotonically non-increasing across the fee ladder,
+    //    and strictly lower at 80 bps than at 0 bps.
+    for (let i = 1; i < results.length; i++) {
+      expect(results[i].expectancyNet).toBeLessThanOrEqual(results[i - 1].expectancyNet + 1e-9);
+    }
+    expect(high.expectancyNet).toBeLessThan(zero.expectancyNet);
+  });
+
   it('infers a 60_000ms bar interval and annualizes Sharpe accordingly', async () => {
     const candles = orbFixtureCandles(60, 0.05);
     const result = await new BacktestRunner().run(baseConfig(), candles);
