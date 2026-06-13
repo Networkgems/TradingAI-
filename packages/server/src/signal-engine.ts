@@ -222,14 +222,41 @@ function activeEquityDailyLimit(settings?: AccountSettings): number {
 // (TRA-191 directive); ATM auto-open and OTM scans are disabled below.
 const RV_SCAN_INTERVAL_MS = 5 * 60_000;
 // TRA-776 — master on/off switch for the relative-value options engine (the
-// sole strategy that auto-opens long-premium calls/puts). It was briefly killed
-// when the board thought RV had been removed, but on follow-up the board
-// confirmed those auto calls/puts are exactly what they want and chose to turn
-// it back ON (ask_user_questions 5a6ae457 → `turn_on`). Left as an explicit flag
-// (not deleted) so it stays a one-line kill switch. When false, the *opening*
-// side short-circuits; existing positions still get marks via
+// sole strategy that auto-opens long-premium calls/puts). Left as an explicit
+// flag (not deleted) so it stays a one-line kill switch. When false, the
+// *opening* side short-circuits; existing positions still get marks via
 // refreshOptionMarks() and exit normally (TRA-726 containment pattern).
-const RV_ENGINE_ENABLED: boolean = true;
+// TRA-811 — board directive (parent TRA-810): RV is losing money, so the engine
+// is PAUSED — it must not open new option tickets in any mode (demo or live).
+// This is a compiled-in pause, so it survives a server restart with no reliance
+// on per-user persisted settings. Existing managed RV exits keep running; we do
+// NOT force-liquidate. Flip back to `true` to re-arm new entries.
+const RV_ENGINE_ENABLED: boolean = false;
+
+/**
+ * TRA-811 — the single gate that decides whether the per-tick loop arms a new
+ * relative-value scan/open. Factored out of the tick so the kill switch is
+ * unit-testable: `RV_ENGINE_ENABLED` dominates, so while RV is paused this
+ * returns `false` even when every other condition (auto-trading on, not halted,
+ * scanner wired, market open, options not opted out) is favorable. All other
+ * engines (SMA-200, supertrend shadow, agents) are unaffected.
+ */
+export function shouldRunRelativeValueScan(opts: {
+  autoTradingEnabled: boolean;
+  halted: boolean;
+  hasScanner: boolean;
+  marketOpen: boolean;
+  skipOptionsForLiveEquityOnly: boolean;
+}): boolean {
+  return (
+    RV_ENGINE_ENABLED &&
+    opts.autoTradingEnabled &&
+    !opts.halted &&
+    opts.hasScanner &&
+    opts.marketOpen &&
+    !opts.skipOptionsForLiveEquityOnly
+  );
+}
 // TRA-451 — SMA-200 daily-bar scan cadence. The signals only change once per
 // daily close, so a 4-hour cadence is plenty: ~6 scans/day keeps the board
 // fresh without burning Yahoo quota on a per-tick (30s) daily-candle refresh.
@@ -1765,7 +1792,13 @@ export class SignalEngine {
     // TRA-544: also suspended when the agent layer has taken over (§2B).
     // TRA-776: RV_ENGINE_ENABLED is the hard kill — the relative-value engine is
     // retired and must not open new option tickets in any mode.
-    if (RV_ENGINE_ENABLED && this.isDeterministicAutoTradingEnabled() && !this.riskGovernor.isHalted() && this.rvScanner && isStockMarketOpen() && !skipOptionsForLiveEquityOnly) {
+    if (shouldRunRelativeValueScan({
+      autoTradingEnabled: this.isDeterministicAutoTradingEnabled(),
+      halted: this.riskGovernor.isHalted(),
+      hasScanner: !!this.rvScanner,
+      marketOpen: isStockMarketOpen(),
+      skipOptionsForLiveEquityOnly,
+    })) {
       if (Date.now() - this.lastRvScanAt >= RV_SCAN_INTERVAL_MS) {
         this.lastRvScanAt = Date.now();
         await this.runRelativeValueScan(activeSymbols);

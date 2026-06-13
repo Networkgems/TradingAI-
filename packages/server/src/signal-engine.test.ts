@@ -2,7 +2,7 @@ import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import { tmpdir } from 'os';
 import { join } from 'path';
 import { rmSync } from 'fs';
-import { SignalEngine, sizeLiveEquityFromStop, shortBlockedOnCashAccount, gateSignalOnReview, describeGatedStrategies, shouldBootArmLiveEquity } from './signal-engine.js';
+import { SignalEngine, sizeLiveEquityFromStop, shortBlockedOnCashAccount, gateSignalOnReview, describeGatedStrategies, shouldBootArmLiveEquity, shouldRunRelativeValueScan } from './signal-engine.js';
 import { setShadowLedgerFileForTests } from './shadow-signal-ledger.js';
 import { PaperAccount } from './paper-account.js';
 import type { RelativeValueScannerService, RelativeValueScanResult } from './relative-value-scanner.js';
@@ -79,6 +79,24 @@ afterEach(() => {
 });
 
 describe('SignalEngine — relative-value scanner bridge', () => {
+  // TRA-811 — board directive (parent TRA-810): RV is paused, so the per-tick
+  // gate must NOT arm a new scan/open even when every other condition is
+  // favorable. The kill switch (RV_ENGINE_ENABLED) dominates the gate. This
+  // proves new RV entries are off in BOTH modes without depending on a live
+  // server. (Existing managed exits run elsewhere and are intentionally not
+  // gated here.)
+  it('shouldRunRelativeValueScan returns false while RV is paused, even with all other conditions favorable (TRA-811)', () => {
+    expect(
+      shouldRunRelativeValueScan({
+        autoTradingEnabled: true,
+        halted: false,
+        hasScanner: true,
+        marketOpen: true,
+        skipOptionsForLiveEquityOnly: false,
+      }),
+    ).toBe(false);
+  });
+
   it('runRelativeValueScan opens an RV position from a `cheap` candidate and records a signal', async () => {
     const scanner = new StubScanner();
     scanner.scan.mockResolvedValue({
