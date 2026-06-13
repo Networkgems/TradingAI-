@@ -1,17 +1,27 @@
+/*
+ * DORMANT / ARCHIVED — TRA-816 (TRA-814 workstream B cleanup).
+ * OOS-failed roster: 0 of 10 keeper-gate pools passed after costs (TRA-306, TRA-523).
+ * NOT wired into the live or demo crypto router — no selectable strategy preset
+ * enables it (packages/shared STRATEGY_PRESETS is DCA-only; live = no_trade).
+ * Kept here for research history; still reachable via the @trading-app/engine
+ * public API only for the backtest harnesses. Do NOT re-wire into a live/demo
+ * path until it clears the TRA-814 §4-C OOS keeper gate. See /TRA/issues/TRA-816.
+ */
+
 import { Candle, TradeSignal, Side } from '@trading-app/shared';
 import { randomUUID } from 'crypto';
-import { emaSeries } from '../indicators/ma.js';
-import { donchian } from '../indicators/donchian.js';
-import { atr } from '../indicators/atr.js';
-import type { AlpacaOrderClient } from '../alpaca/index.js';
-import type { RiskManager } from '../risk.js';
-import type { RegimeDetector, Regime } from '../regime.js';
+import { emaSeries } from '../../indicators/ma.js';
+import { donchian } from '../../indicators/donchian.js';
+import { atr } from '../../indicators/atr.js';
+import type { AlpacaOrderClient } from '../../alpaca/index.js';
+import type { RiskManager } from '../../risk.js';
+import type { RegimeDetector, Regime } from '../../regime.js';
 import {
   BtcRsiBracketOverride,
   ResolvedBtcRsiBracket,
   resolveBtcRsiBracket,
   tryBtcRsiBracketShort,
-} from './btc-rsi-bracket.js';
+} from '../btc-rsi-bracket.js';
 
 export interface MomentumOptions {
   /** Fast EMA period for the trend filter (default: 50). */

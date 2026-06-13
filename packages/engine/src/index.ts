@@ -2,14 +2,14 @@
 
 export { OrbStrategy } from './strategies/orb.js';
 export type { OrbOptions } from './strategies/orb.js';
-export { ReversalStrategy } from './strategies/reversal.js';
-export type { ReversalOptions } from './strategies/reversal.js';
-export { MacdTrendStrategy } from './strategies/macd-trend.js';
-export type { MacdTrendOptions } from './strategies/macd-trend.js';
+export { ReversalStrategy } from './strategies/archived/reversal.js';
+export type { ReversalOptions } from './strategies/archived/reversal.js';
+export { MacdTrendStrategy } from './strategies/archived/macd-trend.js';
+export type { MacdTrendOptions } from './strategies/archived/macd-trend.js';
 export { BbFadeStrategy } from './strategies/bb-fade.js';
 export type { BbFadeOptions } from './strategies/bb-fade.js';
-export { MomentumStrategy } from './strategies/momentum.js';
-export type { MomentumOptions } from './strategies/momentum.js';
+export { MomentumStrategy } from './strategies/archived/momentum.js';
+export type { MomentumOptions } from './strategies/archived/momentum.js';
 export {
   BTC_RSI_BRACKET_DEFAULTS,
   resolveBtcRsiBracket,
@@ -20,16 +20,16 @@ export type {
   ResolvedBtcRsiBracket,
   BtcRsiBracketEvalArgs,
 } from './strategies/btc-rsi-bracket.js';
-export { MeanReversionCryptoStrategy } from './strategies/mean-reversion-crypto.js';
-export type { MeanReversionCryptoOptions } from './strategies/mean-reversion-crypto.js';
-export { BreakoutVolStrategy } from './strategies/breakout-vol.js';
-export type { BreakoutVolOptions } from './strategies/breakout-vol.js';
+export { MeanReversionCryptoStrategy } from './strategies/archived/mean-reversion-crypto.js';
+export type { MeanReversionCryptoOptions } from './strategies/archived/mean-reversion-crypto.js';
+export { BreakoutVolStrategy } from './strategies/archived/breakout-vol.js';
+export type { BreakoutVolOptions } from './strategies/archived/breakout-vol.js';
 export { IchimokuStrategy } from './strategies/ichimoku-strategy.js';
 export type { IchimokuOptions } from './strategies/ichimoku-strategy.js';
-export { ScalpingStrategy } from './strategies/scalping-strategy.js';
-export type { ScalpingOptions } from './strategies/scalping-strategy.js';
-export { SwingStrategy } from './strategies/swing-strategy.js';
-export type { SwingOptions } from './strategies/swing-strategy.js';
+export { ScalpingStrategy } from './strategies/archived/scalping-strategy.js';
+export type { ScalpingOptions } from './strategies/archived/scalping-strategy.js';
+export { SwingStrategy } from './strategies/archived/swing-strategy.js';
+export type { SwingOptions } from './strategies/archived/swing-strategy.js';
 export { CryptoDcaStrategy } from './strategies/crypto-dca.js';
 export type { DcaOptions } from './strategies/crypto-dca.js';
 export {

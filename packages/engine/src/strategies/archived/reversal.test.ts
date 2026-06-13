@@ -1,7 +1,7 @@
 import { describe, it, expect } from 'vitest';
-import { rsi, rsiDivergence } from '../indicators/rsi.js';
-import { detectPattern, isBullishPattern, isBearishPattern } from '../indicators/patterns.js';
-import { VwapTracker } from '../indicators/vwap.js';
+import { rsi, rsiDivergence } from '../../indicators/rsi.js';
+import { detectPattern, isBullishPattern, isBearishPattern } from '../../indicators/patterns.js';
+import { VwapTracker } from '../../indicators/vwap.js';
 import { ReversalStrategy } from './reversal.js';
 import type { Candle } from '@trading-app/shared';
 

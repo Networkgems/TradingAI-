@@ -1,8 +1,8 @@
 import { describe, it, expect } from 'vitest';
 import type { Candle } from '@trading-app/shared';
 import { MomentumStrategy } from './momentum.js';
-import { RegimeDetector } from '../regime.js';
-import { atr } from '../indicators/atr.js';
+import { RegimeDetector } from '../../regime.js';
+import { atr } from '../../indicators/atr.js';
 
 /**
  * Sideways base with comparable bar-range to the subsequent trend phase.

@@ -1,7 +1,7 @@
 import { describe, it, expect } from 'vitest';
 import type { Candle } from '@trading-app/shared';
 import { MeanReversionCryptoStrategy } from './mean-reversion-crypto.js';
-import { classifyRegime } from '../regime.js';
+import { classifyRegime } from '../../regime.js';
 
 function bar(close: number, ts: number, opts: Partial<Candle> = {}): Candle {
   return {

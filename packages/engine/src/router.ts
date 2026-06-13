@@ -1,8 +1,19 @@
+/*
+ * DORMANT — TRA-816 (TRA-814 workstream B). This regime-aware crypto router
+ * (momentum / breakout_vol / mean_reversion) is OOS-failed (0/10 keeper-gate
+ * pools, TRA-306 / TRA-523) and is no longer instantiated by any production
+ * engine: TRA-699 removed it from the crypto engine, and no selectable strategy
+ * preset enables its strategies (packages/shared STRATEGY_PRESETS is DCA-only;
+ * live = no_trade). It survives only for the backtest research harnesses and its
+ * own unit tests. Its strategy sources live under ./strategies/archived/. Do NOT
+ * re-wire this router into a live/demo path until the TRA-814 §4-C OOS keeper
+ * gate passes. See /TRA/issues/TRA-816.
+ */
 import type { Candle, TradeSignal, SignalType } from '@trading-app/shared';
 import type { RegimeDetector, Regime } from './regime.js';
-import type { MomentumStrategy } from './strategies/momentum.js';
-import type { MeanReversionCryptoStrategy } from './strategies/mean-reversion-crypto.js';
-import type { BreakoutVolStrategy } from './strategies/breakout-vol.js';
+import type { MomentumStrategy } from './strategies/archived/momentum.js';
+import type { MeanReversionCryptoStrategy } from './strategies/archived/mean-reversion-crypto.js';
+import type { BreakoutVolStrategy } from './strategies/archived/breakout-vol.js';
 import type { SupertrendConfluenceStrategy } from './strategies/supertrend-confluence.js';
 
 /**

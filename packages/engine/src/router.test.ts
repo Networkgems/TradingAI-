@@ -1,9 +1,9 @@
 import { describe, it, expect } from 'vitest';
 import type { Candle, TradeSignal } from '@trading-app/shared';
 import { RegimeDetector, type Regime } from './regime.js';
-import { MomentumStrategy } from './strategies/momentum.js';
-import { MeanReversionCryptoStrategy } from './strategies/mean-reversion-crypto.js';
-import { BreakoutVolStrategy } from './strategies/breakout-vol.js';
+import { MomentumStrategy } from './strategies/archived/momentum.js';
+import { MeanReversionCryptoStrategy } from './strategies/archived/mean-reversion-crypto.js';
+import { BreakoutVolStrategy } from './strategies/archived/breakout-vol.js';
 import { StrategyRouter, DEFAULT_ROUTER_PRIORITY } from './router.js';
 import type { SupertrendConfluenceStrategy } from './strategies/supertrend-confluence.js';
 
