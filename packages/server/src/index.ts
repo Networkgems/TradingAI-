@@ -3698,6 +3698,35 @@ app.post('/api/trading/trading-agents', requireAuth, async (req, res) => {
   res.json({ ok: true, tradingAgentsEnabled: enabled });
 });
 
+// TRA-796 (TRA-529 P4) — flip gating mode. `enabled` lets an APPROVE
+// recommendation's proposedSignal actually route as a risk-checked order
+// (demo-first). `liveEnabled` is the SEPARATE board+CTO go-live flag that permits
+// routing in LIVE mode; it defaults to false and stays off unless this request
+// explicitly sets it, so demo gating can be turned on without ever arming live.
+// Routing never bypasses risk — every agent order still clears the deterministic
+// RiskManager hard caps and the TRA-526 kill switch overrides everything.
+// Persisted to settings so the choice survives a restart; the state push confirms
+// the new values to every client.
+app.post('/api/trading/trading-agents/gating', requireAuth, async (req, res) => {
+  const username = res.locals['authUser'] as string;
+  const ctx = await userCtx(res);
+  const settings = getSettings(username);
+  const body = req.body as { enabled?: unknown; liveEnabled?: unknown } | undefined;
+  const enabled = body?.enabled === true || body?.enabled === 'true';
+  const liveEnabled = body?.liveEnabled === true || body?.liveEnabled === 'true';
+
+  ctx.engine.setTradingAgentsGating(enabled, liveEnabled);
+
+  const updated: AccountSettings = {
+    ...settings,
+    tradingAgentsGatingEnabled: enabled,
+    tradingAgentsLiveGatingEnabled: liveEnabled,
+  };
+  await saveSettings(username, updated);
+  broadcastEngineState(ctx);
+  res.json({ ok: true, tradingAgentsGatingEnabled: enabled, tradingAgentsLiveGatingEnabled: liveEnabled });
+});
+
 // TRA-230: clear the displayed signal list without resetting positions or equity.
 app.post('/api/signals/reset', requireAuth, async (_req, res) => {
   const ctx = await userCtx(res);

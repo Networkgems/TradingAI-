@@ -92,9 +92,18 @@ export interface EngineState {
    */
   tradingAgentsEnabled: boolean;
   /**
+   * TRA-796 (TRA-529 P4) — gating mode flags, surfaced so the dashboard/QA can
+   * confirm true server state. `gatingEnabled` → APPROVE recommendations route as
+   * risk-checked orders; `liveGatingEnabled` → that routing is permitted in LIVE
+   * mode (board+CTO go-live gate). With gating on but liveGating off, demo routes
+   * and live is suppressed.
+   */
+  tradingAgentsGatingEnabled: boolean;
+  tradingAgentsLiveGatingEnabled: boolean;
+  /**
    * TRA-544 — latest advisory recommendations from the multi-agent layer (P1
-   * deterministic stub). Empty when the layer is off. Advisor-only: surfaced
-   * for display + audit, not routed (gating mode is P4).
+   * deterministic stub). Empty when the layer is off. In gating mode (TRA-796) an
+   * APPROVE entry's `proposedSignal` may be routed; HOLD/VETO never route.
    */
   agentRecommendations: AgentRecommendation[];
   /** True when US stock market is currently open (weekdays 9:30 AM–4 PM ET). */
@@ -667,6 +676,21 @@ export class SignalEngine {
   // applySettings so the choice survives a restart. P1 is advisor-only — the
   // stub never routes orders (gating mode is P4).
   private tradingAgentsEnabled = false;
+  // TRA-796 (TRA-529 P4) — gating mode. When BOTH tradingAgentsEnabled and
+  // tradingAgentsGatingEnabled are on, an APPROVE recommendation's proposedSignal
+  // is routed through the same risk-checked order path as the deterministic scan
+  // (routeEquitySignal). Demo-first: routing fires in demo regardless; LIVE
+  // routing additionally requires tradingAgentsLiveGatingEnabled (the board+CTO
+  // go-live flag, default OFF). Both persisted in AccountSettings and reconciled
+  // in applySettings so the choice survives a restart.
+  private tradingAgentsGatingEnabled = false;
+  private tradingAgentsLiveGatingEnabled = false;
+  // TRA-796 — idempotency guard: proposedSignal ids (agent-<symbol>-<asOf>) we
+  // have already opened a position for, so one recommendation cannot double-fire
+  // across ticks within the same bar. Bounded below; cleared when gating/agents
+  // are switched off. The deterministic open-position + 5-minute recent-signal
+  // dedup in routeEquitySignal is the primary guard; this is belt-and-suspenders.
+  private routedAgentSignalIds = new Set<string>();
   private latestAgentRecommendations: AgentRecommendation[] = [];
   /**
    * TRA-747 (P2) — the resolved advisory LlmClient, or null to run the
@@ -938,6 +962,10 @@ export class SignalEngine {
     this.autoTradingEnabledLive = settings.stocksAutoTradingEnabledLive ?? true;
     // TRA-544 — reconcile the multi-agent master switch from persisted settings.
     this.tradingAgentsEnabled = settings.tradingAgentsEnabled === true;
+    // TRA-796 — reconcile gating-mode flags. Live routing stays off unless the
+    // board+CTO go-live flag is explicitly persisted true.
+    this.tradingAgentsGatingEnabled = settings.tradingAgentsGatingEnabled === true;
+    this.tradingAgentsLiveGatingEnabled = settings.tradingAgentsLiveGatingEnabled === true;
     // TRA-526 — reconcile the global kill switch from persisted settings so an
     // operator halt survives a server restart instead of silently lifting.
     if (settings.globalKillSwitchEngaged) {
@@ -1611,136 +1639,11 @@ export class SignalEngine {
 
         for (const signal of [orbSignal, bbFadeSignal, ichimokuSignal]) {
           if (!signal) continue;
-          // Skip if an equity position for this symbol+strategy type is already open
-          if (this.account.hasOpenPositionForSignalType(sym, signal.type)) continue;
-          // TRA-335 — same dedup against the live mirror so we don't
-          // submit a second Tradier bracket for an already-open live row.
-          if (this.mode === 'live' && this.hasOpenLiveEquityPosition(sym, signal.type)) continue;
-          // Deduplicate: skip if same symbol+type signal emitted in last 5 minutes
-          const recent = this.recentSignals.find(
-            s => s.symbol === signal.symbol && s.type === signal.type && Date.now() - s.timestamp < 5 * 60_000
-          );
-          if (recent) continue;
-
-          // TRA-134: Don't dedup the signal until we know whether a quote was available.
-          // Without a quote we can't open a position; previously the signal was added to
-          // `recentSignals` anyway, then the 5-minute dedup blocked any retry, so the user
-          // saw the same signal fire every 5 minutes for hours with zero positions opened.
-          const price = prices.get(sym);
-          if (!price) {
-            log.warn('no quote in cache — skipping (will retry next tick)', { sym, signalType: signal.type });
-            continue;
-          }
-
-          // TRA-231 — stamp the active mode so the dashboard's Signals panel
-          // can scope this entry to the demo (or live) mode it fired under.
-          signal.mode = this.mode;
-
-          // TRA-520 — final position-creation guard, against the actual fill
-          // price, for every equity strategy (ORB / BB-fade / Ichimoku) and
-          // both modes. Per-strategy signal-gen guards should already reject a
-          // wrong-side bracket, but a non-positive or inverted stop/target must
-          // never reach the broker or the paper book — it disables the risk
-          // exits. Surface the suppressed signal with a reason instead of
-          // silently opening an unprotected position.
-          const equityBracket = validateBracket(signal.side, price, signal.stopLoss, signal.takeProfit);
-          if (!equityBracket.ok) {
-            signal.signalSkipReason = `invalid bracket: ${equityBracket.reason}`;
-            log.warn('equity signal suppressed: invalid stop/take bracket', {
-              component: 'equity-scan', sym, signalType: signal.type,
-              side: signal.side, price, stop: signal.stopLoss,
-              takeProfit: signal.takeProfit, reason: equityBracket.reason,
-            });
-            this.recentSignals.unshift(signal); this.emitSignalAlert(signal);
-            if (this.recentSignals.length > MAX_SIGNALS) this.recentSignals.pop();
-            continue;
-          }
-
-          // TRA-389 / TRA-474 — the market-review regime gate used to sit
-          // here. Removed: a (possibly wrong) premarket report must not be
-          // able to silently suppress every ORB ticket for the rest of the
-          // day. `gateSignalOnReview` is retained as a no-op so the contract
-          // and tests survive; the dashboard banner still renders the regime
-          // context, but it never decides whether a position opens.
-
-          // TRA-554 — daily equity trades gate. Count today's entries from the
-          // persisted dailySignals list (keyed by ET date so the reset is
-          // automatic at midnight ET without a separate day-roll counter).
-          // Checked here — before the broker order — so no Tradier OTOCO is
-          // submitted when the cap has already been reached.
-          const equityDayKey = etDateString(new Date());
-          const equityTradesOpenedToday = this.dailySignals.filter(
-            s => etDateString(new Date(s.firedAt)) === equityDayKey,
-          ).length;
-          if (equityTradesOpenedToday >= this.equityDailyTradesLimit) {
-            signal.liveSkipReason = `daily equity limit reached (${equityTradesOpenedToday}/${this.equityDailyTradesLimit})`;
-            this.recentSignals.unshift(signal); this.emitSignalAlert(signal);
-            if (this.recentSignals.length > MAX_SIGNALS) this.recentSignals.pop();
-            continue;
-          }
-
-          // TRA-335 — in live mode, mirror the equity entry as a Tradier
-          // OTOCO bracket order. We submit the broker order *first* so the
-          // local Position only mirrors a confirmed fill (or a synchronous
-          // live order — pending orders also leave the paper Position open
-          // because Tradier may still fill within the day). When the order
-          // is rejected/cancelled, stamp `signal.liveSkipReason` so the
-          // dashboard surfaces why nothing opened.
-          let liveOrderId: number | string | null = null;
-          if (this.mode === 'live') {
-            if (!this.tradierLiveEquityClient) {
-              signal.liveSkipReason = 'Tradier equity client not configured';
-              this.recentSignals.unshift(signal); this.emitSignalAlert(signal);
-              if (this.recentSignals.length > MAX_SIGNALS) this.recentSignals.pop();
-              continue;
-            }
-            const placement = await this.placeTradierEquityBracket(signal, price);
-            if (!placement.ok) {
-              signal.liveSkipReason = placement.reason;
-              this.recentSignals.unshift(signal); this.emitSignalAlert(signal);
-              if (this.recentSignals.length > MAX_SIGNALS) this.recentSignals.pop();
-              continue;
-            }
-            liveOrderId = placement.orderId;
-            // Refresh the Tradier balance so the dashboard immediately
-            // reflects the buying-power consumed (or, if the order is
-            // still pending, the user can spot drift on the next tick).
-            this.refreshTradierBalance().catch(() => {});
-          }
-
-          this.recentSignals.unshift(signal); this.emitSignalAlert(signal);
-          if (this.recentSignals.length > MAX_SIGNALS) this.recentSignals.pop();
-
-          // Auto-open equity paper position. Stock options for the same equity
-          // signal are NOT auto-opened anymore (TRA-191): the only enabled
-          // stock-options strategy is the relative-value scanner, which runs
-          // on its own 5-minute cadence below. Equity / share trading still
-          // fires off the established ORB/BB/Ichimoku signals.
-          // TRA-335 — in live mode, sizing is driven by `placeTradierEquityBracket`
-          // off the cached Tradier balance (not paper-account cash) so we pass
-          // the resolved qty into a thin local-mirror open instead of letting
-          // PaperAccount.openPosition re-size.
-          // TRA-389 — scale the paper open by the market-review position-size
-          // multiplier (1 when the regime-gate path is off). The live path
-          // applied the same scalar inside `placeTradierEquityBracket`.
-          const pos = this.mode === 'live'
-            ? this.openLiveEquityMirror(signal, price, liveOrderId!)
-            : this.account.openPosition(signal, price, this.activeSizingMultiplier());
-          if (pos) {
-            // TRA-231 — same rationale as the signal stamp above; the closed-
-            // positions list is filtered per-mode in getState().
-            pos.mode = this.mode;
-            this.positionSignalType.set(pos.id, signal.type);
-            this.emitFillAlert(pos, signal.type); // TRA-563 fill alert
-          }
-
-          // Record signal for daily accuracy tracking
-          this.dailySignals.push({
-            id: signal.id,
-            symbol: signal.symbol,
-            type: signal.type,
-            firedAt: signal.timestamp,
-          });
+          // TRA-796 — the per-signal entry guards + open were extracted into
+          // routeEquitySignal so the agent-gating path routes through the
+          // IDENTICAL risk-checked order path (dedup, bracket guard, daily cap,
+          // live OTOCO mirror vs paper open).
+          await this.routeEquitySignal(signal, prices.get(signal.symbol), 'deterministic');
         }
       }
       if (symbolsWithData === 0 && activeSymbols.length > 0) {
@@ -1813,6 +1716,13 @@ export class SignalEngine {
     // Advisor-only in P1 — the stub never routes orders (gating mode is P4).
     if (this.tradingAgentsEnabled && equityStrategiesActiveOnTick && !this.riskGovernor.isHalted()) {
       await this.runTradingAgentsAdvisory(activeSymbols);
+      // TRA-796 (TRA-529 P4) — gating mode. When the operator has additionally
+      // enabled gating, route each APPROVE recommendation's proposedSignal as a
+      // risk-checked order through the SAME path as the deterministic scan. No-op
+      // (advisor-only) when gating is off. Demo-first; live routing is separately
+      // gated. Already inside the halt/kill-switch guard above; routeAgentApprovals
+      // re-checks for defense-in-depth and direct unit-testing.
+      await this.routeAgentApprovals(prices);
     } else if (this.latestAgentRecommendations.length > 0) {
       // Clear stale recommendations once the layer is switched back off.
       this.latestAgentRecommendations = [];
@@ -2925,11 +2835,39 @@ export class SignalEngine {
    */
   setTradingAgents(enabled: boolean): void {
     this.tradingAgentsEnabled = enabled === true;
+    // TRA-796 — drop the routed-signal idempotency set when the layer is turned
+    // off so a later re-enable starts clean (ids are bar-scoped anyway).
+    if (!this.tradingAgentsEnabled) this.routedAgentSignalIds.clear();
   }
 
   /** TRA-544 — true when the multi-agent layer owns the trade decision. */
   isTradingAgentsEnabled(): boolean {
     return this.tradingAgentsEnabled;
+  }
+
+  /**
+   * TRA-796 (TRA-529 P4) — flip gating mode. `enabled` turns APPROVE-routing on
+   * (demo-first). `liveEnabled` is the separate board+CTO go-live flag that
+   * permits routing in LIVE mode; it stays off unless explicitly set. The
+   * persisted settings are written by the REST route so the choice survives a
+   * restart. Routing still clears the deterministic RiskManager caps + the
+   * TRA-526 kill switch; gating only decides whether an APPROVE reaches the order
+   * path at all.
+   */
+  setTradingAgentsGating(enabled: boolean, liveEnabled = false): void {
+    this.tradingAgentsGatingEnabled = enabled === true;
+    this.tradingAgentsLiveGatingEnabled = liveEnabled === true;
+    if (!this.tradingAgentsGatingEnabled) this.routedAgentSignalIds.clear();
+  }
+
+  /** TRA-796 — true when APPROVE recommendations route as risk-checked orders. */
+  isTradingAgentsGatingEnabled(): boolean {
+    return this.tradingAgentsGatingEnabled;
+  }
+
+  /** TRA-796 — true when gating may place LIVE orders (board+CTO go-live gate). */
+  isTradingAgentsLiveGatingEnabled(): boolean {
+    return this.tradingAgentsLiveGatingEnabled;
   }
 
   /**
@@ -2999,6 +2937,202 @@ export class SignalEngine {
       }
     }
     this.latestAgentRecommendations = recos;
+  }
+
+  /**
+   * TRA-796 (TRA-529 P4) — shared equity-signal routing used by BOTH the
+   * deterministic strategy scan and the agent-gating path. Applies the identical
+   * entry guards — open-position + live-mirror + 5-minute recent-signal dedup,
+   * quote presence, bracket validity (TRA-520), the TRA-554 daily-trades cap —
+   * and then opens the position (live Tradier OTOCO mirror or paper open), so an
+   * agent order can never bypass a risk control the deterministic path enforces.
+   *
+   * Returns the opened {@link Position} (or null when any guard suppressed the
+   * entry, including a null `openPosition`); the signal is stamped with the
+   * suppression reason and pushed onto `recentSignals` exactly as the inline path
+   * did, so the dashboard surfaces every outcome. `source` is purely for log
+   * provenance — the risk guards are identical for both callers.
+   */
+  private async routeEquitySignal(
+    signal: TradeSignal,
+    price: number | undefined,
+    source: 'deterministic' | 'agent-gating' = 'deterministic',
+  ): Promise<Position | null> {
+    const sym = signal.symbol;
+    // Skip if an equity position for this symbol+strategy type is already open
+    if (this.account.hasOpenPositionForSignalType(sym, signal.type)) return null;
+    // TRA-335 — same dedup against the live mirror so we don't
+    // submit a second Tradier bracket for an already-open live row.
+    if (this.mode === 'live' && this.hasOpenLiveEquityPosition(sym, signal.type)) return null;
+    // Deduplicate: skip if same symbol+type signal emitted in last 5 minutes
+    const recent = this.recentSignals.find(
+      s => s.symbol === signal.symbol && s.type === signal.type && Date.now() - s.timestamp < 5 * 60_000
+    );
+    if (recent) return null;
+
+    // TRA-134: Don't dedup the signal until we know whether a quote was available.
+    // Without a quote we can't open a position; previously the signal was added to
+    // `recentSignals` anyway, then the 5-minute dedup blocked any retry, so the user
+    // saw the same signal fire every 5 minutes for hours with zero positions opened.
+    if (!price) {
+      log.warn('no quote in cache — skipping (will retry next tick)', { sym, signalType: signal.type, via: source });
+      return null;
+    }
+
+    // TRA-231 — stamp the active mode so the dashboard's Signals panel
+    // can scope this entry to the demo (or live) mode it fired under.
+    signal.mode = this.mode;
+
+    // TRA-520 — final position-creation guard, against the actual fill
+    // price, for every equity strategy (ORB / BB-fade / Ichimoku) and
+    // both modes. Per-strategy signal-gen guards should already reject a
+    // wrong-side bracket, but a non-positive or inverted stop/target must
+    // never reach the broker or the paper book — it disables the risk
+    // exits. Surface the suppressed signal with a reason instead of
+    // silently opening an unprotected position.
+    const equityBracket = validateBracket(signal.side, price, signal.stopLoss, signal.takeProfit);
+    if (!equityBracket.ok) {
+      signal.signalSkipReason = `invalid bracket: ${equityBracket.reason}`;
+      log.warn('equity signal suppressed: invalid stop/take bracket', {
+        component: 'equity-scan', via: source, sym, signalType: signal.type,
+        side: signal.side, price, stop: signal.stopLoss,
+        takeProfit: signal.takeProfit, reason: equityBracket.reason,
+      });
+      this.recentSignals.unshift(signal); this.emitSignalAlert(signal);
+      if (this.recentSignals.length > MAX_SIGNALS) this.recentSignals.pop();
+      return null;
+    }
+
+    // TRA-389 / TRA-474 — the market-review regime gate used to sit
+    // here. Removed: a (possibly wrong) premarket report must not be
+    // able to silently suppress every ORB ticket for the rest of the
+    // day. `gateSignalOnReview` is retained as a no-op so the contract
+    // and tests survive; the dashboard banner still renders the regime
+    // context, but it never decides whether a position opens.
+
+    // TRA-554 — daily equity trades gate. Count today's entries from the
+    // persisted dailySignals list (keyed by ET date so the reset is
+    // automatic at midnight ET without a separate day-roll counter).
+    // Checked here — before the broker order — so no Tradier OTOCO is
+    // submitted when the cap has already been reached.
+    const equityDayKey = etDateString(new Date());
+    const equityTradesOpenedToday = this.dailySignals.filter(
+      s => etDateString(new Date(s.firedAt)) === equityDayKey,
+    ).length;
+    if (equityTradesOpenedToday >= this.equityDailyTradesLimit) {
+      signal.liveSkipReason = `daily equity limit reached (${equityTradesOpenedToday}/${this.equityDailyTradesLimit})`;
+      this.recentSignals.unshift(signal); this.emitSignalAlert(signal);
+      if (this.recentSignals.length > MAX_SIGNALS) this.recentSignals.pop();
+      return null;
+    }
+
+    // TRA-335 — in live mode, mirror the equity entry as a Tradier
+    // OTOCO bracket order. We submit the broker order *first* so the
+    // local Position only mirrors a confirmed fill (or a synchronous
+    // live order — pending orders also leave the paper Position open
+    // because Tradier may still fill within the day). When the order
+    // is rejected/cancelled, stamp `signal.liveSkipReason` so the
+    // dashboard surfaces why nothing opened.
+    let liveOrderId: number | string | null = null;
+    if (this.mode === 'live') {
+      if (!this.tradierLiveEquityClient) {
+        signal.liveSkipReason = 'Tradier equity client not configured';
+        this.recentSignals.unshift(signal); this.emitSignalAlert(signal);
+        if (this.recentSignals.length > MAX_SIGNALS) this.recentSignals.pop();
+        return null;
+      }
+      const placement = await this.placeTradierEquityBracket(signal, price);
+      if (!placement.ok) {
+        signal.liveSkipReason = placement.reason;
+        this.recentSignals.unshift(signal); this.emitSignalAlert(signal);
+        if (this.recentSignals.length > MAX_SIGNALS) this.recentSignals.pop();
+        return null;
+      }
+      liveOrderId = placement.orderId;
+      // Refresh the Tradier balance so the dashboard immediately
+      // reflects the buying-power consumed (or, if the order is
+      // still pending, the user can spot drift on the next tick).
+      this.refreshTradierBalance().catch(() => {});
+    }
+
+    this.recentSignals.unshift(signal); this.emitSignalAlert(signal);
+    if (this.recentSignals.length > MAX_SIGNALS) this.recentSignals.pop();
+
+    // Auto-open equity paper position. Stock options for the same equity
+    // signal are NOT auto-opened anymore (TRA-191): the only enabled
+    // stock-options strategy is the relative-value scanner, which runs
+    // on its own 5-minute cadence below. Equity / share trading still
+    // fires off the established ORB/BB/Ichimoku signals.
+    // TRA-335 — in live mode, sizing is driven by `placeTradierEquityBracket`
+    // off the cached Tradier balance (not paper-account cash) so we pass
+    // the resolved qty into a thin local-mirror open instead of letting
+    // PaperAccount.openPosition re-size.
+    // TRA-389 — scale the paper open by the market-review position-size
+    // multiplier (1 when the regime-gate path is off). The live path
+    // applied the same scalar inside `placeTradierEquityBracket`.
+    const pos = this.mode === 'live'
+      ? this.openLiveEquityMirror(signal, price, liveOrderId!)
+      : this.account.openPosition(signal, price, this.activeSizingMultiplier());
+    if (pos) {
+      // TRA-231 — same rationale as the signal stamp above; the closed-
+      // positions list is filtered per-mode in getState().
+      pos.mode = this.mode;
+      this.positionSignalType.set(pos.id, signal.type);
+      this.emitFillAlert(pos, signal.type); // TRA-563 fill alert
+    }
+
+    // Record signal for daily accuracy tracking
+    this.dailySignals.push({
+      id: signal.id,
+      symbol: signal.symbol,
+      type: signal.type,
+      firedAt: signal.timestamp,
+    });
+    return pos ?? null;
+  }
+
+  /**
+   * TRA-796 (TRA-529 P4) — gating mode. Route each APPROVE recommendation's
+   * `proposedSignal` (HOLD/VETO carry none, §4) through {@link routeEquitySignal},
+   * so an agent order inherits every deterministic risk control: the RiskManager
+   * hard caps + sizing, the daily-trades cap, the bracket guard, dedup, and — via
+   * the halt check below + the caller's gate — the daily circuit-breaker and the
+   * TRA-526 kill switch. No-op when gating is disabled (advisor-only).
+   *
+   * Demo-first: routing fires in demo whenever gating is on; LIVE routing
+   * additionally requires {@link tradingAgentsLiveGatingEnabled} (the board+CTO
+   * go-live flag). With gating on but live off, a live tick stamps each APPROVE
+   * signal with a skip reason and never reaches the broker.
+   *
+   * Idempotency: routeEquitySignal's open-position + 5-minute recent-signal dedup
+   * already prevents a re-fire; we additionally record each routed proposedSignal
+   * id (`agent-<symbol>-<asOf>`, stable within a bar) so the same recommendation
+   * cannot open twice across ticks. The id is recorded only once a position
+   * actually opened, preserving the deterministic "retry next tick" behaviour when
+   * a quote was momentarily missing.
+   */
+  private async routeAgentApprovals(prices: Map<string, number>): Promise<void> {
+    if (!this.tradingAgentsGatingEnabled) return;
+    // Kill switch / daily circuit-breaker overrides everything (TRA-526). The
+    // caller already gates on this; re-check so the method is safe in isolation.
+    if (this.riskGovernor.isHalted()) return;
+    const liveBlocked = this.mode === 'live' && !this.tradingAgentsLiveGatingEnabled;
+    for (const reco of this.latestAgentRecommendations) {
+      if (reco.verdict !== 'APPROVE' || !reco.proposedSignal) continue;
+      const signal = reco.proposedSignal;
+      if (this.routedAgentSignalIds.has(signal.id)) continue;
+      if (liveBlocked) {
+        // Surface why nothing routed; never reach the broker pre go-live gate.
+        signal.liveSkipReason = 'agent gating: live routing disabled until board+CTO go-live gate is cleared';
+        continue;
+      }
+      const pos = await this.routeEquitySignal(signal, prices.get(signal.symbol), 'agent-gating');
+      if (pos) this.routedAgentSignalIds.add(signal.id);
+    }
+    // Bound the idempotency set so a long-running process can't leak memory.
+    if (this.routedAgentSignalIds.size > 5000) {
+      this.routedAgentSignalIds = new Set([...this.routedAgentSignalIds].slice(-2000));
+    }
   }
 
   // ── TRA-563 (TRA-410 A1) alert hooks ──────────────────────────────────────
@@ -4287,6 +4421,8 @@ export class SignalEngine {
         haltReason: this.riskGovernor.getHaltReason(),
         autoTradingEnabled: this.isAutoTradingEnabled(),
         tradingAgentsEnabled: this.tradingAgentsEnabled,
+        tradingAgentsGatingEnabled: this.tradingAgentsGatingEnabled,
+        tradingAgentsLiveGatingEnabled: this.tradingAgentsLiveGatingEnabled,
         agentRecommendations: this.latestAgentRecommendations,
         marketOpen: isStockMarketOpen(),
         marketReview: this.buildMarketReviewState(),
@@ -4305,6 +4441,8 @@ export class SignalEngine {
       haltReason: this.riskGovernor.getHaltReason(),
       autoTradingEnabled: this.isAutoTradingEnabled(),
       tradingAgentsEnabled: this.tradingAgentsEnabled,
+      tradingAgentsGatingEnabled: this.tradingAgentsGatingEnabled,
+      tradingAgentsLiveGatingEnabled: this.tradingAgentsLiveGatingEnabled,
       agentRecommendations: this.latestAgentRecommendations,
       marketOpen: isStockMarketOpen(),
       marketReview: this.buildMarketReviewState(),

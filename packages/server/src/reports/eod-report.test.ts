@@ -50,6 +50,8 @@ function makeEngineState(overrides: Partial<EngineState> = {}): EngineState {
     haltReason: null,
     autoTradingEnabled: true,
     tradingAgentsEnabled: false,
+    tradingAgentsGatingEnabled: false,
+    tradingAgentsLiveGatingEnabled: false,
     agentRecommendations: [],
     marketOpen: false,
     marketReview: {
