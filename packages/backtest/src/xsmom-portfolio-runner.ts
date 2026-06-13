@@ -61,6 +61,14 @@ export interface XsmomParams {
   rebalanceBars: number;
   /** Annual vol target feeding the VolKellySizer + the 1R sizing stop. */
   volTargetAnnualPct: number;
+  /**
+   * TRA-828 §3.1 — optional aggregate-market trend regime SMA length (4h bars).
+   * When set, at each rebalance close the equal-weight universe close index `M_t`
+   * is compared to its trailing SMA of this length: `risk_on` iff `M_t > SMA`,
+   * else `risk_off` → the target book is forced to ∅ (all cash) for that
+   * rebalance. Undefined → NO regime gate (byte-for-byte the cycle-2 path).
+   */
+  regimeMA?: number;
 }
 
 export interface XsmomCostArm {
@@ -87,6 +95,11 @@ export interface XsmomRunResult {
   symbolsContributing: number;
   /** In-window rebalances that actually evaluated a ranking. */
   rebalancesEvaluated: number;
+  /**
+   * TRA-828 §3.1 — count of evaluated rebalances the regime gate forced to
+   * all-cash (`risk_off`). Always 0 when `params.regimeMA` is undefined.
+   */
+  rebalancesRiskOff: number;
   /**
    * Min names carrying a full `L`-bar lookback across the in-window rebalances
    * that evaluated a ranking (the §1 ≥ 8-retained cross-section check).
@@ -142,6 +155,16 @@ export interface XsmomRunArgs {
   slippageBps: number;
   /** Min names with `L`-history required to rank a rebalance (spec §1: 8). */
   minRetained?: number;
+  /**
+   * TRA-828 §3.2 — regime index definition. `equal_weight_universe` (default,
+   * the pre-registered primary used for selection/grading) takes the mean close
+   * over names with full `regimeMA` history; `btc_proxy` substitutes a single
+   * symbol's close (the §7 `regimeIndexVariant` robustness diagnostic — NOT
+   * graded). No-op unless `params.regimeMA` is set.
+   */
+  regimeIndexMode?: 'equal_weight_universe' | 'btc_proxy';
+  /** Symbol used as the close proxy when `regimeIndexMode==='btc_proxy'`. */
+  regimeProxySymbol?: string;
 }
 
 /**
@@ -205,6 +228,40 @@ export function runXsmomPortfolio(args: XsmomRunArgs): XsmomRunResult {
   }
   const timeline = [...tsSet].sort((a, b) => a - b);
 
+  // ── TRA-828 §3.1/§3.2 regime index. `closeIndexAt(j, ma)` returns the
+  // aggregate-market close level `M_{timeline[j]}` used by the trend gate:
+  //   • equal_weight_universe (primary): mean close over names carrying a full
+  //     `ma`-bar history at that bar (frozen for selection/grading).
+  //   • btc_proxy (diagnostic): the proxy symbol's own close at that bar, again
+  //     gated on a full `ma`-bar history.
+  // Returns null when no qualifying name has a bar there (the regime is then
+  // treated as risk_on, i.e. the gate is inert — cannot happen once warmup has
+  // accrued `ma` bars, which always precedes the first L-rankable rebalance).
+  const regimeIndexMode = args.regimeIndexMode ?? 'equal_weight_universe';
+  const regimeProxySymbol = args.regimeProxySymbol ?? 'BTC-USD';
+  const closeIndexAt = (j: number, ma: number): number | null => {
+    if (j < 0 || j >= timeline.length) return null;
+    const tj = timeline[j];
+    if (regimeIndexMode === 'btc_proxy') {
+      const s = series.get(regimeProxySymbol);
+      if (!s) return null;
+      const sidx = s.idxByTs.get(tj);
+      if (sidx === undefined || sidx < ma) return null;
+      const c = s.bars[sidx].close;
+      return c > 0 ? c : null;
+    }
+    let sum = 0;
+    let cnt = 0;
+    for (const symbol of symbols) {
+      const s = series.get(symbol)!;
+      const sidx = s.idxByTs.get(tj);
+      if (sidx === undefined || sidx < ma) continue; // needs full regimeMA history
+      const c = s.bars[sidx].close;
+      if (c > 0) { sum += c; cnt += 1; }
+    }
+    return cnt > 0 ? sum / cnt : null;
+  };
+
   const openBook = new Map<string, OpenLot>();
   const tradeRsNet: number[] = [];
   const roundTrips: XsmomRoundTrip[] = [];
@@ -213,6 +270,7 @@ export function runXsmomPortfolio(args: XsmomRunArgs): XsmomRunResult {
   const droppedForHistory: Record<string, number> = {};
   for (const s of symbols) droppedForHistory[s] = 0;
   let rebalancesEvaluated = 0;
+  let rebalancesRiskOff = 0;
   let minRetainedNames = Number.POSITIVE_INFINITY;
 
   // Close a held lot at `ts` using the symbol's NEXT bar open. Returns the net
@@ -291,11 +349,35 @@ export function runXsmomPortfolio(args: XsmomRunArgs): XsmomRunResult {
       if (!hasHistory.includes(symbol)) droppedForHistory[symbol] += 1;
     }
 
+    // ── TRA-828 §3.1 regime gate — evaluated BEFORE building the target book.
+    // risk_on iff M_t > trailing SMA(M, regimeMA)_t (window [t−ma+1 .. t],
+    // current bar included). risk_off forces the book to ∅ (all cash) for this
+    // rebalance; the unchanged exit loop below liquidates every held name and
+    // no new entries are made — NO new exit path. Inert when regimeMA unset.
+    let regimeRiskOff = false;
+    if (params.regimeMA && params.regimeMA > 0) {
+      const ma = params.regimeMA;
+      const mNow = closeIndexAt(r, ma);
+      let smaSum = 0;
+      let smaCnt = 0;
+      for (let j = r - ma + 1; j <= r; j++) {
+        const m = closeIndexAt(j, ma);
+        if (m !== null) { smaSum += m; smaCnt += 1; }
+      }
+      const sma = smaCnt > 0 ? smaSum / smaCnt : null;
+      const riskOn = mNow !== null && sma !== null ? mNow > sma : true;
+      if (!riskOn) regimeRiskOff = true;
+    }
+    if (regimeRiskOff) rebalancesRiskOff += 1;
+
     // Eligible-long set (dual-momentum floor), ranked desc; target = top-K.
+    // Forced empty when the regime gate is risk_off (all cash).
     const eligible = scored
       .filter((x) => x.r >= params.absFloorPct / 100)
       .sort((a, b) => b.r - a.r);
-    const target = new Set(eligible.slice(0, params.topK).map((x) => x.symbol));
+    const target = regimeRiskOff
+      ? new Set<string>()
+      : new Set(eligible.slice(0, params.topK).map((x) => x.symbol));
 
     // Exit held names no longer in target (closes round-trips at next open)…
     for (const lot of [...openBook.values()]) {
@@ -314,6 +396,7 @@ export function runXsmomPortfolio(args: XsmomRunArgs): XsmomRunResult {
     perSymbolRs,
     symbolsContributing,
     rebalancesEvaluated,
+    rebalancesRiskOff,
     minRetainedNames: Number.isFinite(minRetainedNames) ? minRetainedNames : 0,
     droppedForHistory,
   };

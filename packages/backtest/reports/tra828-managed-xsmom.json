@@ -1,0 +1,977 @@
+{
+  "issue": "TRA-829",
+  "parent": "TRA-828",
+  "program": "TRA-814",
+  "strategy": "managed_xsmom",
+  "generatedAt": "2026-06-13T20:20:17.921Z",
+  "universe": [
+    "BTC-USD",
+    "ETH-USD",
+    "SOL-USD",
+    "ADA-USD",
+    "AVAX-USD",
+    "LINK-USD",
+    "DOT-USD",
+    "LTC-USD",
+    "XRP-USD",
+    "DOGE-USD"
+  ],
+  "barTimeframe": "4h",
+  "dataSource": "coinbase-exchange",
+  "initialEquity": 25000,
+  "slippageBps": 3,
+  "riskPerTrade": 0.01,
+  "sizing": "VolKellySizer (vol-only; Kelly cap inactive in-backtest — OOS expectancy → OOS sizing is look-ahead. Live supplies validated OOS net expectancy per spec). Equal-weight top-K, each slot vol-targeted; risk clamped [0.5%, 1.75%].",
+  "roundTripDefinition": "A round-trip opens when a name enters the equal-weight top-K book (fill at next 4h bar open) and closes when a weekly rebalance drops it from the book — by rank/floor crossing OR a regime flip to risk_off forcing the book to all-cash (fill at next 4h bar open). Net-of-fee R = netPnl / (stopDistance × qty), stopDistance = one daily vol-target σ (sizing-only 1R).",
+  "regimeFilter": {
+    "definition": "At each weekly rebalance close, risk_on iff the equal-weight universe close index M_t = mean_i(close_{i,t}) (over names with full regimeMA history) exceeds its trailing SMA of length regimeMA (4h bars, current bar included); else risk_off → target book forced to ∅ (all cash), held names liquidated at next bar open via the unchanged exit path; re-entry rebuilds from fresh ranking on the next risk_on rebalance.",
+    "regimeIndex": "equal_weight_universe",
+    "regimeMA": 90,
+    "riskOffAction": "all_cash"
+  },
+  "windows": {
+    "is": {
+      "start": "2023-05-01T00:00:00.000Z",
+      "end": "2024-12-31T23:59:59.999Z"
+    },
+    "oos": {
+      "start": "2025-01-01T00:00:00.000Z",
+      "end": "2026-06-03T00:00:00.000Z"
+    },
+    "warmupStart": "2023-05-01T00:00:00.000Z",
+    "oosEndPinned": "2026-06-03 (default)"
+  },
+  "costArms": [
+    {
+      "name": "maker_entry",
+      "feeBps": {
+        "maker": 25,
+        "taker": 60
+      },
+      "executionMode": "limit"
+    },
+    {
+      "name": "taker_80",
+      "feeBps": 80,
+      "executionMode": "market"
+    }
+  ],
+  "keeperGate": "pooled OOS block-bootstrap p5 final-equity multiple > 1.0 AND pooled OOS net expectancy > 0, on BOTH cost arms; ≥ 12 pooled OOS round-trips WITH the regime filter active",
+  "paramGrid": {
+    "lookbackDays": [
+      60,
+      90,
+      120
+    ],
+    "topK": [
+      3,
+      4
+    ],
+    "absFloorPct": [
+      0,
+      5
+    ],
+    "regimeMA": [
+      30,
+      60,
+      90
+    ],
+    "rebalanceBars": 42,
+    "volTargetAnnualPct": 60
+  },
+  "selectionArm": "maker_entry",
+  "selectionRule": "Among IS configs with net expectancy > 0 AND ≥ 30 IS round-trips AND computable bootstrap p5 (≥ 12 IS round-trips), pick highest IS p5; tie-break higher round-trips. None qualify → FAIL_NO_IS_EDGE. (Identical to TRA-825 §4; regimeMA threaded through, rule unchanged.)",
+  "isFailNoEdge": false,
+  "pickedConfig": {
+    "lookbackDays": 120,
+    "topK": 4,
+    "absFloorPct": 5,
+    "rebalanceBars": 42,
+    "volTargetAnnualPct": 60,
+    "regimeMA": 90
+  },
+  "isSelectionTable": [
+    {
+      "lookbackDays": 120,
+      "topK": 4,
+      "absFloorPct": 5,
+      "regimeMA": 90,
+      "isRoundTrips": 56,
+      "isP5": 1.241611282188407,
+      "isExpectancyNet": 4.1802925593536076,
+      "isProfitFactor": 3.472679736856039,
+      "isPctTimeInCash": 0.34285714285714286,
+      "qualifies": true
+    },
+    {
+      "lookbackDays": 120,
+      "topK": 3,
+      "absFloorPct": 5,
+      "regimeMA": 90,
+      "isRoundTrips": 46,
+      "isP5": 1.0844895006681377,
+      "isExpectancyNet": 4.3668142217184664,
+      "isProfitFactor": 3.610263247088097,
+      "isPctTimeInCash": 0.34285714285714286,
+      "qualifies": true
+    },
+    {
+      "lookbackDays": 120,
+      "topK": 4,
+      "absFloorPct": 0,
+      "regimeMA": 90,
+      "isRoundTrips": 61,
+      "isP5": 0.9743094938644408,
+      "isExpectancyNet": 3.667904703116003,
+      "isProfitFactor": 3.0628482896873295,
+      "isPctTimeInCash": 0.34285714285714286,
+      "qualifies": true
+    },
+    {
+      "lookbackDays": 120,
+      "topK": 3,
+      "absFloorPct": 5,
+      "regimeMA": 30,
+      "isRoundTrips": 49,
+      "isP5": 0.950265654237781,
+      "isExpectancyNet": 3.4472418957451185,
+      "isProfitFactor": 3.2303803721809405,
+      "isPctTimeInCash": 0.44285714285714284,
+      "qualifies": true
+    },
+    {
+      "lookbackDays": 120,
+      "topK": 4,
+      "absFloorPct": 5,
+      "regimeMA": 30,
+      "isRoundTrips": 60,
+      "isP5": 0.9393284723256928,
+      "isExpectancyNet": 3.0439413160871,
+      "isProfitFactor": 2.8302645337421684,
+      "isPctTimeInCash": 0.44285714285714284,
+      "qualifies": true
+    },
+    {
+      "lookbackDays": 120,
+      "topK": 3,
+      "absFloorPct": 0,
+      "regimeMA": 90,
+      "isRoundTrips": 50,
+      "isP5": 0.8771974532705489,
+      "isExpectancyNet": 3.787563802532064,
+      "isProfitFactor": 3.0869306638827307,
+      "isPctTimeInCash": 0.34285714285714286,
+      "qualifies": true
+    },
+    {
+      "lookbackDays": 120,
+      "topK": 3,
+      "absFloorPct": 0,
+      "regimeMA": 30,
+      "isRoundTrips": 53,
+      "isP5": 0.7941410735369392,
+      "isExpectancyNet": 3.0436819568481757,
+      "isProfitFactor": 2.828037155091007,
+      "isPctTimeInCash": 0.44285714285714284,
+      "qualifies": true
+    },
+    {
+      "lookbackDays": 90,
+      "topK": 3,
+      "absFloorPct": 5,
+      "regimeMA": 90,
+      "isRoundTrips": 51,
+      "isP5": 0.7852560717933369,
+      "isExpectancyNet": 3.356343397213602,
+      "isProfitFactor": 2.8650425859470134,
+      "isPctTimeInCash": 0.37333333333333335,
+      "qualifies": true
+    },
+    {
+      "lookbackDays": 120,
+      "topK": 4,
+      "absFloorPct": 0,
+      "regimeMA": 30,
+      "isRoundTrips": 65,
+      "isP5": 0.7723732210904921,
+      "isExpectancyNet": 2.710428268082907,
+      "isProfitFactor": 2.5688382549936133,
+      "isPctTimeInCash": 0.44285714285714284,
+      "qualifies": true
+    },
+    {
+      "lookbackDays": 120,
+      "topK": 3,
+      "absFloorPct": 5,
+      "regimeMA": 60,
+      "isRoundTrips": 44,
+      "isP5": 0.7704224909079299,
+      "isExpectancyNet": 3.015228049922705,
+      "isProfitFactor": 2.653896063945119,
+      "isPctTimeInCash": 0.35714285714285715,
+      "qualifies": true
+    },
+    {
+      "lookbackDays": 120,
+      "topK": 4,
+      "absFloorPct": 5,
+      "regimeMA": 60,
+      "isRoundTrips": 54,
+      "isP5": 0.730510100894585,
+      "isExpectancyNet": 2.8587155995837357,
+      "isProfitFactor": 2.5409370559797444,
+      "isPctTimeInCash": 0.35714285714285715,
+      "qualifies": true
+    },
+    {
+      "lookbackDays": 90,
+      "topK": 3,
+      "absFloorPct": 0,
+      "regimeMA": 90,
+      "isRoundTrips": 53,
+      "isP5": 0.6971686891946716,
+      "isExpectancyNet": 3.055625456682498,
+      "isProfitFactor": 2.6253777743476423,
+      "isPctTimeInCash": 0.37333333333333335,
+      "qualifies": true
+    },
+    {
+      "lookbackDays": 90,
+      "topK": 4,
+      "absFloorPct": 5,
+      "regimeMA": 90,
+      "isRoundTrips": 68,
+      "isP5": 0.6949427578207017,
+      "isExpectancyNet": 2.7032926201154353,
+      "isProfitFactor": 2.5783250640112922,
+      "isPctTimeInCash": 0.37333333333333335,
+      "qualifies": true
+    },
+    {
+      "lookbackDays": 90,
+      "topK": 3,
+      "absFloorPct": 0,
+      "regimeMA": 30,
+      "isRoundTrips": 57,
+      "isP5": 0.6397965756616576,
+      "isExpectancyNet": 2.189736643242996,
+      "isProfitFactor": 2.249499329589431,
+      "isPctTimeInCash": 0.4666666666666667,
+      "qualifies": true
+    },
+    {
+      "lookbackDays": 120,
+      "topK": 3,
+      "absFloorPct": 0,
+      "regimeMA": 60,
+      "isRoundTrips": 48,
+      "isP5": 0.6344065314125649,
+      "isExpectancyNet": 2.524474377586516,
+      "isProfitFactor": 2.2890074210087223,
+      "isPctTimeInCash": 0.35714285714285715,
+      "qualifies": true
+    },
+    {
+      "lookbackDays": 90,
+      "topK": 3,
+      "absFloorPct": 5,
+      "regimeMA": 30,
+      "isRoundTrips": 54,
+      "isP5": 0.6254587013412457,
+      "isExpectancyNet": 2.1393119466020676,
+      "isProfitFactor": 2.2411671290173807,
+      "isPctTimeInCash": 0.4666666666666667,
+      "qualifies": true
+    },
+    {
+      "lookbackDays": 120,
+      "topK": 4,
+      "absFloorPct": 0,
+      "regimeMA": 60,
+      "isRoundTrips": 59,
+      "isP5": 0.6200353204357847,
+      "isExpectancyNet": 2.440956710911796,
+      "isProfitFactor": 2.2636423134936847,
+      "isPctTimeInCash": 0.35714285714285715,
+      "qualifies": true
+    },
+    {
+      "lookbackDays": 90,
+      "topK": 3,
+      "absFloorPct": 5,
+      "regimeMA": 60,
+      "isRoundTrips": 49,
+      "isP5": 0.600799816992764,
+      "isExpectancyNet": 2.231820590783611,
+      "isProfitFactor": 2.1576939667085715,
+      "isPctTimeInCash": 0.38666666666666666,
+      "qualifies": true
+    },
+    {
+      "lookbackDays": 90,
+      "topK": 4,
+      "absFloorPct": 0,
+      "regimeMA": 90,
+      "isRoundTrips": 69,
+      "isP5": 0.5846974392923826,
+      "isExpectancyNet": 2.476613527429214,
+      "isProfitFactor": 2.3305310994278075,
+      "isPctTimeInCash": 0.37333333333333335,
+      "qualifies": true
+    },
+    {
+      "lookbackDays": 90,
+      "topK": 3,
+      "absFloorPct": 0,
+      "regimeMA": 60,
+      "isRoundTrips": 53,
+      "isP5": 0.5076754944046536,
+      "isExpectancyNet": 1.859987863684124,
+      "isProfitFactor": 1.9441610516966552,
+      "isPctTimeInCash": 0.38666666666666666,
+      "qualifies": true
+    },
+    {
+      "lookbackDays": 90,
+      "topK": 4,
+      "absFloorPct": 5,
+      "regimeMA": 30,
+      "isRoundTrips": 71,
+      "isP5": 0.5075781257490063,
+      "isExpectancyNet": 1.5517648063644176,
+      "isProfitFactor": 1.9432565905778016,
+      "isPctTimeInCash": 0.4666666666666667,
+      "qualifies": true
+    },
+    {
+      "lookbackDays": 90,
+      "topK": 4,
+      "absFloorPct": 0,
+      "regimeMA": 30,
+      "isRoundTrips": 75,
+      "isP5": 0.506443385761857,
+      "isExpectancyNet": 1.6119618481904356,
+      "isProfitFactor": 1.97955457887666,
+      "isPctTimeInCash": 0.4666666666666667,
+      "qualifies": true
+    },
+    {
+      "lookbackDays": 60,
+      "topK": 3,
+      "absFloorPct": 5,
+      "regimeMA": 90,
+      "isRoundTrips": 51,
+      "isP5": 0.4944506185820199,
+      "isExpectancyNet": 2.7802059064156532,
+      "isProfitFactor": 2.2248380284536653,
+      "isPctTimeInCash": 0.3924050632911392,
+      "qualifies": true
+    },
+    {
+      "lookbackDays": 90,
+      "topK": 4,
+      "absFloorPct": 5,
+      "regimeMA": 60,
+      "isRoundTrips": 66,
+      "isP5": 0.4924333824762528,
+      "isExpectancyNet": 1.6668293256924822,
+      "isProfitFactor": 1.929734760739981,
+      "isPctTimeInCash": 0.38666666666666666,
+      "qualifies": true
+    },
+    {
+      "lookbackDays": 60,
+      "topK": 4,
+      "absFloorPct": 5,
+      "regimeMA": 90,
+      "isRoundTrips": 61,
+      "isP5": 0.4706265248933111,
+      "isExpectancyNet": 2.7764182764105687,
+      "isProfitFactor": 2.1869353271248415,
+      "isPctTimeInCash": 0.3924050632911392,
+      "qualifies": true
+    },
+    {
+      "lookbackDays": 60,
+      "topK": 3,
+      "absFloorPct": 0,
+      "regimeMA": 90,
+      "isRoundTrips": 59,
+      "isP5": 0.4549991800837732,
+      "isExpectancyNet": 2.299102916903624,
+      "isProfitFactor": 2.0804343879391283,
+      "isPctTimeInCash": 0.3924050632911392,
+      "qualifies": true
+    },
+    {
+      "lookbackDays": 60,
+      "topK": 3,
+      "absFloorPct": 5,
+      "regimeMA": 30,
+      "isRoundTrips": 56,
+      "isP5": 0.42669376748752613,
+      "isExpectancyNet": 1.594763336582074,
+      "isProfitFactor": 1.7464316431130815,
+      "isPctTimeInCash": 0.4810126582278481,
+      "qualifies": true
+    },
+    {
+      "lookbackDays": 60,
+      "topK": 3,
+      "absFloorPct": 0,
+      "regimeMA": 30,
+      "isRoundTrips": 64,
+      "isP5": 0.40489441497860346,
+      "isExpectancyNet": 1.2776062031994795,
+      "isProfitFactor": 1.6384438783289852,
+      "isPctTimeInCash": 0.4810126582278481,
+      "qualifies": true
+    },
+    {
+      "lookbackDays": 90,
+      "topK": 4,
+      "absFloorPct": 0,
+      "regimeMA": 60,
+      "isRoundTrips": 68,
+      "isP5": 0.4047474738511429,
+      "isExpectancyNet": 1.4093495515731997,
+      "isProfitFactor": 1.7256769224192203,
+      "isPctTimeInCash": 0.38666666666666666,
+      "qualifies": true
+    },
+    {
+      "lookbackDays": 60,
+      "topK": 4,
+      "absFloorPct": 0,
+      "regimeMA": 90,
+      "isRoundTrips": 70,
+      "isP5": 0.3967931000344454,
+      "isExpectancyNet": 2.2027085950861407,
+      "isProfitFactor": 1.984637216278536,
+      "isPctTimeInCash": 0.3924050632911392,
+      "qualifies": true
+    },
+    {
+      "lookbackDays": 60,
+      "topK": 4,
+      "absFloorPct": 5,
+      "regimeMA": 30,
+      "isRoundTrips": 67,
+      "isP5": 0.39667319157088815,
+      "isExpectancyNet": 1.5166430990356106,
+      "isProfitFactor": 1.7062811259991701,
+      "isPctTimeInCash": 0.4810126582278481,
+      "qualifies": true
+    },
+    {
+      "lookbackDays": 60,
+      "topK": 3,
+      "absFloorPct": 5,
+      "regimeMA": 60,
+      "isRoundTrips": 53,
+      "isP5": 0.3560862713081638,
+      "isExpectancyNet": 1.1887401514562348,
+      "isProfitFactor": 1.5084947856131043,
+      "isPctTimeInCash": 0.4050632911392405,
+      "qualifies": true
+    },
+    {
+      "lookbackDays": 60,
+      "topK": 4,
+      "absFloorPct": 0,
+      "regimeMA": 30,
+      "isRoundTrips": 77,
+      "isP5": 0.3495567459113773,
+      "isExpectancyNet": 1.159797546465313,
+      "isProfitFactor": 1.563760236265412,
+      "isPctTimeInCash": 0.4810126582278481,
+      "qualifies": true
+    },
+    {
+      "lookbackDays": 60,
+      "topK": 4,
+      "absFloorPct": 5,
+      "regimeMA": 60,
+      "isRoundTrips": 63,
+      "isP5": 0.32151824890091124,
+      "isExpectancyNet": 1.1762259683550718,
+      "isProfitFactor": 1.4970002157838904,
+      "isPctTimeInCash": 0.4050632911392405,
+      "qualifies": true
+    },
+    {
+      "lookbackDays": 60,
+      "topK": 3,
+      "absFloorPct": 0,
+      "regimeMA": 60,
+      "isRoundTrips": 62,
+      "isP5": 0.3175965879955529,
+      "isExpectancyNet": 0.8676548117486259,
+      "isProfitFactor": 1.3925579252983886,
+      "isPctTimeInCash": 0.4050632911392405,
+      "qualifies": true
+    },
+    {
+      "lookbackDays": 60,
+      "topK": 4,
+      "absFloorPct": 0,
+      "regimeMA": 60,
+      "isRoundTrips": 73,
+      "isP5": 0.2755200575693665,
+      "isExpectancyNet": 0.8127689474232034,
+      "isProfitFactor": 1.356659892857566,
+      "isPctTimeInCash": 0.4050632911392405,
+      "qualifies": true
+    }
+  ],
+  "droppedForNoHistory": [],
+  "oos": [
+    {
+      "arm": "maker_entry",
+      "trades": 37,
+      "symbolsContributing": 9,
+      "expectancyNet": -2.1703665969218897,
+      "profitFactor": 0.268672433278454,
+      "bootstrap": {
+        "n": 37,
+        "p5": 0.2284213139690947,
+        "p50": 0.43171443496379325,
+        "p95": 0.8039972125485388,
+        "worstDdPct": 87.43053006154965,
+        "blockLen": 5,
+        "iterations": 5000
+      },
+      "keeper": false,
+      "rebalancesEvaluated": 74,
+      "rebalancesRiskOff": 42,
+      "oosBarsRiskOff": 1764,
+      "pctTimeInCash": 0.5675675675675675,
+      "minRetainedNames": 10,
+      "droppedForHistory": {
+        "BTC-USD": 0,
+        "ETH-USD": 0,
+        "SOL-USD": 0,
+        "ADA-USD": 0,
+        "AVAX-USD": 0,
+        "LINK-USD": 0,
+        "DOT-USD": 0,
+        "LTC-USD": 0,
+        "XRP-USD": 0,
+        "DOGE-USD": 0
+      },
+      "perSymbol": [
+        {
+          "symbol": "BTC-USD",
+          "roundTrips": 3,
+          "expectancyNet": 0.20385730020472695,
+          "profitFactor": 1.312258788336217
+        },
+        {
+          "symbol": "ETH-USD",
+          "roundTrips": 5,
+          "expectancyNet": 1.1343727790895373,
+          "profitFactor": 1.7778851783002048
+        },
+        {
+          "symbol": "SOL-USD",
+          "roundTrips": 4,
+          "expectancyNet": -1.0405530093037532,
+          "profitFactor": 0.5723234518014997
+        },
+        {
+          "symbol": "ADA-USD",
+          "roundTrips": 3,
+          "expectancyNet": -5.698873114164484,
+          "profitFactor": 0
+        },
+        {
+          "symbol": "AVAX-USD",
+          "roundTrips": 2,
+          "expectancyNet": -3.3384203708767597,
+          "profitFactor": 0.2283533720887237
+        },
+        {
+          "symbol": "LINK-USD",
+          "roundTrips": 7,
+          "expectancyNet": -2.6419585935173133,
+          "profitFactor": 0.1629223544055973
+        },
+        {
+          "symbol": "DOT-USD",
+          "roundTrips": 0,
+          "expectancyNet": 0,
+          "profitFactor": 0
+        },
+        {
+          "symbol": "LTC-USD",
+          "roundTrips": 2,
+          "expectancyNet": -5.05865990588908,
+          "profitFactor": 0
+        },
+        {
+          "symbol": "XRP-USD",
+          "roundTrips": 7,
+          "expectancyNet": -1.9598705247530268,
+          "profitFactor": 0.17065418128982807
+        },
+        {
+          "symbol": "DOGE-USD",
+          "roundTrips": 4,
+          "expectancyNet": -4.080301030259815,
+          "profitFactor": 0
+        }
+      ]
+    },
+    {
+      "arm": "taker_80",
+      "trades": 37,
+      "symbolsContributing": 9,
+      "expectancyNet": -2.4031059266593933,
+      "profitFactor": 0.23497038018262956,
+      "bootstrap": {
+        "n": 37,
+        "p5": 0.2091092081917517,
+        "p50": 0.3952813981368307,
+        "p95": 0.7363578923285269,
+        "worstDdPct": 88.49785902535847,
+        "blockLen": 5,
+        "iterations": 5000
+      },
+      "keeper": false,
+      "rebalancesEvaluated": 74,
+      "rebalancesRiskOff": 42,
+      "oosBarsRiskOff": 1764,
+      "pctTimeInCash": 0.5675675675675675,
+      "minRetainedNames": 10,
+      "droppedForHistory": {
+        "BTC-USD": 0,
+        "ETH-USD": 0,
+        "SOL-USD": 0,
+        "ADA-USD": 0,
+        "AVAX-USD": 0,
+        "LINK-USD": 0,
+        "DOT-USD": 0,
+        "LTC-USD": 0,
+        "XRP-USD": 0,
+        "DOGE-USD": 0
+      },
+      "perSymbol": [
+        {
+          "symbol": "BTC-USD",
+          "roundTrips": 3,
+          "expectancyNet": -0.03351184902336701,
+          "profitFactor": 0.9585986381718784
+        },
+        {
+          "symbol": "ETH-USD",
+          "roundTrips": 5,
+          "expectancyNet": 0.894991725488752,
+          "profitFactor": 1.5440742795024869
+        },
+        {
+          "symbol": "SOL-USD",
+          "roundTrips": 4,
+          "expectancyNet": -1.2759740742372763,
+          "profitFactor": 0.4989916876248507
+        },
+        {
+          "symbol": "ADA-USD",
+          "roundTrips": 3,
+          "expectancyNet": -5.924584513928267,
+          "profitFactor": 0
+        },
+        {
+          "symbol": "AVAX-USD",
+          "roundTrips": 2,
+          "expectancyNet": -3.570076062277766,
+          "profitFactor": 0.19546591973052863
+        },
+        {
+          "symbol": "LINK-USD",
+          "roundTrips": 7,
+          "expectancyNet": -2.873817744409577,
+          "profitFactor": 0.1429640585604843
+        },
+        {
+          "symbol": "DOT-USD",
+          "roundTrips": 0,
+          "expectancyNet": 0,
+          "profitFactor": 0
+        },
+        {
+          "symbol": "LTC-USD",
+          "roundTrips": 2,
+          "expectancyNet": -5.283353644771767,
+          "profitFactor": 0
+        },
+        {
+          "symbol": "XRP-USD",
+          "roundTrips": 7,
+          "expectancyNet": -2.193127948095132,
+          "profitFactor": 0.12072300325643849
+        },
+        {
+          "symbol": "DOGE-USD",
+          "roundTrips": 4,
+          "expectancyNet": -4.309053316601318,
+          "profitFactor": 0
+        }
+      ]
+    }
+  ],
+  "walkForward": [
+    {
+      "fold": "2023_recovery",
+      "window": {
+        "start": "2023-05-01T00:00:00.000Z",
+        "end": "2023-12-31T23:59:59.999Z"
+      },
+      "arm": "maker_entry",
+      "roundTrips": 9,
+      "expectancyNet": 10.032015603043694,
+      "profitFactor": 16.04058057137436,
+      "p5": null,
+      "p50": null,
+      "keeper": false,
+      "rebalancesEvaluated": 17,
+      "rebalancesRiskOff": 5,
+      "oosBarsRiskOff": 210,
+      "pctTimeInCash": 0.29411764705882354
+    },
+    {
+      "fold": "2023_recovery",
+      "window": {
+        "start": "2023-05-01T00:00:00.000Z",
+        "end": "2023-12-31T23:59:59.999Z"
+      },
+      "arm": "taker_80",
+      "roundTrips": 9,
+      "expectancyNet": 9.773450410715673,
+      "profitFactor": 14.123853880802837,
+      "p5": null,
+      "p50": null,
+      "keeper": false,
+      "rebalancesEvaluated": 17,
+      "rebalancesRiskOff": 5,
+      "oosBarsRiskOff": 210,
+      "pctTimeInCash": 0.29411764705882354
+    },
+    {
+      "fold": "2024_bull",
+      "window": {
+        "start": "2024-01-01T00:00:00.000Z",
+        "end": "2024-12-31T23:59:59.999Z"
+      },
+      "arm": "maker_entry",
+      "roundTrips": 43,
+      "expectancyNet": 3.6000180860379825,
+      "profitFactor": 2.9928612992560875,
+      "p5": 0.791734249113174,
+      "p50": 3.5679364438673313,
+      "keeper": false,
+      "rebalancesEvaluated": 53,
+      "rebalancesRiskOff": 19,
+      "oosBarsRiskOff": 798,
+      "pctTimeInCash": 0.3584905660377358
+    },
+    {
+      "fold": "2024_bull",
+      "window": {
+        "start": "2024-01-01T00:00:00.000Z",
+        "end": "2024-12-31T23:59:59.999Z"
+      },
+      "arm": "taker_80",
+      "roundTrips": 43,
+      "expectancyNet": 3.3553319941985436,
+      "profitFactor": 2.748671635058399,
+      "p5": 0.714646255099902,
+      "p50": 3.222910757426866,
+      "keeper": false,
+      "rebalancesEvaluated": 53,
+      "rebalancesRiskOff": 19,
+      "oosBarsRiskOff": 798,
+      "pctTimeInCash": 0.3584905660377358
+    },
+    {
+      "fold": "2025_chop",
+      "window": {
+        "start": "2025-01-01T00:00:00.000Z",
+        "end": "2026-06-03T00:00:00.000Z"
+      },
+      "arm": "maker_entry",
+      "roundTrips": 37,
+      "expectancyNet": -2.1703665969218897,
+      "profitFactor": 0.268672433278454,
+      "p5": 0.2284213139690947,
+      "p50": 0.43171443496379325,
+      "keeper": false,
+      "rebalancesEvaluated": 74,
+      "rebalancesRiskOff": 42,
+      "oosBarsRiskOff": 1764,
+      "pctTimeInCash": 0.5675675675675675
+    },
+    {
+      "fold": "2025_chop",
+      "window": {
+        "start": "2025-01-01T00:00:00.000Z",
+        "end": "2026-06-03T00:00:00.000Z"
+      },
+      "arm": "taker_80",
+      "roundTrips": 37,
+      "expectancyNet": -2.4031059266593933,
+      "profitFactor": 0.23497038018262956,
+      "p5": 0.2091092081917517,
+      "p50": 0.3952813981368307,
+      "keeper": false,
+      "rebalancesEvaluated": 74,
+      "rebalancesRiskOff": 42,
+      "oosBarsRiskOff": 1764,
+      "pctTimeInCash": 0.5675675675675675
+    }
+  ],
+  "neighborStability": [
+    {
+      "params": {
+        "lookbackDays": 90,
+        "topK": 4,
+        "absFloorPct": 5,
+        "rebalanceBars": 42,
+        "volTargetAnnualPct": 60,
+        "regimeMA": 90
+      },
+      "arm": "maker_entry",
+      "roundTrips": 41,
+      "expectancyNet": -1.7720382082045305,
+      "p5": 0.2857670201513645,
+      "keeper": false,
+      "pctTimeInCash": 0.5675675675675675
+    },
+    {
+      "params": {
+        "lookbackDays": 90,
+        "topK": 4,
+        "absFloorPct": 5,
+        "rebalanceBars": 42,
+        "volTargetAnnualPct": 60,
+        "regimeMA": 90
+      },
+      "arm": "taker_80",
+      "roundTrips": 41,
+      "expectancyNet": -2.005593101559422,
+      "p5": 0.25911468532643284,
+      "keeper": false,
+      "pctTimeInCash": 0.5675675675675675
+    },
+    {
+      "params": {
+        "lookbackDays": 120,
+        "topK": 3,
+        "absFloorPct": 5,
+        "rebalanceBars": 42,
+        "volTargetAnnualPct": 60,
+        "regimeMA": 90
+      },
+      "arm": "maker_entry",
+      "roundTrips": 30,
+      "expectancyNet": -2.077171281163981,
+      "p5": 0.30617759134519956,
+      "keeper": false,
+      "pctTimeInCash": 0.5675675675675675
+    },
+    {
+      "params": {
+        "lookbackDays": 120,
+        "topK": 3,
+        "absFloorPct": 5,
+        "rebalanceBars": 42,
+        "volTargetAnnualPct": 60,
+        "regimeMA": 90
+      },
+      "arm": "taker_80",
+      "roundTrips": 30,
+      "expectancyNet": -2.309980235272404,
+      "p5": 0.284999175853763,
+      "keeper": false,
+      "pctTimeInCash": 0.5675675675675675
+    },
+    {
+      "params": {
+        "lookbackDays": 120,
+        "topK": 4,
+        "absFloorPct": 0,
+        "rebalanceBars": 42,
+        "volTargetAnnualPct": 60,
+        "regimeMA": 90
+      },
+      "arm": "maker_entry",
+      "roundTrips": 39,
+      "expectancyNet": -2.1486691375924267,
+      "p5": 0.21903046236587342,
+      "keeper": false,
+      "pctTimeInCash": 0.5675675675675675
+    },
+    {
+      "params": {
+        "lookbackDays": 120,
+        "topK": 4,
+        "absFloorPct": 0,
+        "rebalanceBars": 42,
+        "volTargetAnnualPct": 60,
+        "regimeMA": 90
+      },
+      "arm": "taker_80",
+      "roundTrips": 39,
+      "expectancyNet": -2.381447491730137,
+      "p5": 0.19953826258437024,
+      "keeper": false,
+      "pctTimeInCash": 0.5675675675675675
+    },
+    {
+      "params": {
+        "lookbackDays": 120,
+        "topK": 4,
+        "absFloorPct": 5,
+        "rebalanceBars": 42,
+        "volTargetAnnualPct": 60,
+        "regimeMA": 60
+      },
+      "arm": "maker_entry",
+      "roundTrips": 41,
+      "expectancyNet": -2.240919986859635,
+      "p5": 0.20227952094205015,
+      "keeper": false,
+      "pctTimeInCash": 0.527027027027027
+    },
+    {
+      "params": {
+        "lookbackDays": 120,
+        "topK": 4,
+        "absFloorPct": 5,
+        "rebalanceBars": 42,
+        "volTargetAnnualPct": 60,
+        "regimeMA": 60
+      },
+      "arm": "taker_80",
+      "roundTrips": 41,
+      "expectancyNet": -2.473478866505546,
+      "p5": 0.18338898407100918,
+      "keeper": false,
+      "pctTimeInCash": 0.527027027027027
+    }
+  ],
+  "regimeIndexVariant": {
+    "regimeIndex": "btc_close_proxy",
+    "proxySymbol": "BTC-USD",
+    "arm": "maker_entry",
+    "graded": false,
+    "roundTrips": 38,
+    "expectancyNet": -2.157644813679313,
+    "p5": 0.22600236268985296,
+    "pctTimeInCash": 0.5540540540540541
+  },
+  "thinnessCheck": {
+    "pooledOosRoundTrips": 37,
+    "ge12": true
+  },
+  "verdict": "FAIL_GATE"
+}
