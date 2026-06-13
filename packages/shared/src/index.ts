@@ -384,7 +384,7 @@ export interface Position {
  * for human-driven opens (admin tooling, reconciliation imports) and an
  * `'unknown'` back-fill for pre-TRA-338 snapshots.
  */
-export type PositionQuoteSource = 'coinbase' | 'yahoo' | 'cmc' | 'manual' | 'unknown';
+export type PositionQuoteSource = 'coinbase' | 'coingecko' | 'yahoo' | 'cmc' | 'manual' | 'unknown';
 
 export interface AccountState {
   totalEquity: number;
@@ -1093,6 +1093,25 @@ export interface AccountSettings {
    */
   tradingAgentsEnabled?: boolean;
   /**
+   * TRA-796 (TRA-529 P4) — gating mode. When `true` AND the agent layer is the
+   * active decision-maker ({@link tradingAgentsEnabled}), an APPROVE
+   * recommendation's `proposedSignal` is actually routed as an order through the
+   * SAME deterministic order path as the strategy scan — so it inherits the
+   * RiskManager hard caps, the daily-trades cap, the bracket guard, dedup, halts
+   * and the TRA-526 kill switch. `false` (default) keeps the layer advisor-only.
+   * Demo-first: gating routes in demo mode regardless of this pair; LIVE routing
+   * additionally requires {@link tradingAgentsLiveGatingEnabled}. Absent ↔ off.
+   */
+  tradingAgentsGatingEnabled?: boolean;
+  /**
+   * TRA-796 (TRA-529 P4) — the separate, board+CTO-gated live-routing flag.
+   * `false` (default) means agent gating NEVER places live orders even when
+   * {@link tradingAgentsGatingEnabled} is on — demo routes, live is suppressed
+   * with a skip reason. Only flipped on once the go-live gate is cleared. Absent
+   * ↔ off.
+   */
+  tradingAgentsLiveGatingEnabled?: boolean;
+  /**
    * TRA-563 (TRA-410 A1) — per-user notification/alert preferences. Optional
    * for back-compat with snapshots saved before TRA-563; absent ↔
    * {@link DEFAULT_ALERT_PREFERENCES}. Always resolve via
@@ -1220,6 +1239,11 @@ export const DEFAULT_ACCOUNT_SETTINGS: AccountSettings = {
   // TRA-544 — multi-agent layer defaults OFF; deterministic stack drives until
   // the operator opts in from the banner (advisory takeover, still risk-gated).
   tradingAgentsEnabled: false,
+  // TRA-796 — gating mode defaults OFF (advisor-only). Demo routing turns on with
+  // tradingAgentsGatingEnabled; live routing stays additionally gated on the
+  // board+CTO go-live flag below, which defaults OFF.
+  tradingAgentsGatingEnabled: false,
+  tradingAgentsLiveGatingEnabled: false,
   // TRA-563 — alert preferences default per the §1.3 mockup (risk_halt on every
   // channel; fills/exits on email+discord; signals on discord; quiet hours off).
   alertPreferences: DEFAULT_ALERT_PREFERENCES,

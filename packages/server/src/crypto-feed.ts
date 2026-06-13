@@ -67,7 +67,7 @@ export interface CryptoQuote {
   volume: number;
   change: number;
   changePct: number;
-  source: PositionQuoteSource; // 'coinbase' | 'yahoo' | 'cmc' (never 'manual'/'unknown' from this path)
+  source: PositionQuoteSource; // 'coinbase' | 'coingecko' | 'yahoo' | 'cmc' (never 'manual'/'unknown' from this path)
 }
 
 /**
@@ -519,6 +519,134 @@ async function fetchCMCBatchQuotes(
 }
 
 /**
+ * TRA-833 — CoinGecko spot-quote fallback.
+ *
+ * Both Coinbase hosts (`api.exchange.coinbase.com` and the keyless
+ * `api.coinbase.com/api/v3/brokerage/market/products`) time out / 451 from
+ * Render's datacenter egress IP, Yahoo's per-IP breaker sits open (429), and
+ * CMC's key returns no data for the major pairs. With every datacenter-capable
+ * provider down, the whole crypto universe ages to `quoteStatus: 'stale'` and
+ * open positions render "—" for Current / P&L (the bug in TRA-833).
+ *
+ * CoinGecko's public `/coins/markets` endpoint resolves from datacenter IPs,
+ * needs no key, and — critically — prices the WHOLE requested set in ONE call
+ * (`?symbols=btc,sol,…`, up to 250/page), returning `current_price`,
+ * `price_change_percentage_24h` and `total_volume`. That makes it the only
+ * source that can repopulate the universe when Coinbase is blocked without a
+ * per-symbol fan-out.
+ *
+ * Mapping: Coinbase product ids are `TICKER-USD`; CoinGecko keys on the bare
+ * lowercase ticker. The endpoint returns rows market-cap-descending, so for an
+ * ambiguous ticker (many tokens share e.g. "btc") we keep the FIRST row per
+ * ticker — the canonical, highest-cap coin — which is the right disambiguation
+ * for the majors users actually hold.
+ */
+const COINGECKO_BASE = 'https://api.coingecko.com/api/v3';
+const COINGECKO_API_KEY = process.env.COINGECKO_API_KEY ?? '';
+const COINGECKO_MARKETS_BATCH = 250; // endpoint per_page hard cap
+let coinGeckoBreakerOpenUntil = 0;
+const COINGECKO_BREAKER_MS = 60_000;
+
+export function isCoinGeckoBreakerOpen(): boolean {
+  return Date.now() < coinGeckoBreakerOpenUntil;
+}
+
+/** Test-only: clear the CoinGecko 429 breaker so a breaker-open test can't bleed
+ *  into a later test in the same run (the breaker is module-level state). */
+export function _resetCoinGeckoBreakerForTests(): void {
+  coinGeckoBreakerOpenUntil = 0;
+}
+
+function toCoinGeckoTicker(yahooSymbol: string): string {
+  return yahooSymbol.replace(/-(USD|USDT|USDC)$/i, '').toLowerCase();
+}
+
+export async function fetchCoinGeckoQuotes(
+  symbols: readonly string[],
+): Promise<Map<string, CryptoQuote>> {
+  const results = new Map<string, CryptoQuote>();
+  if (symbols.length === 0 || isCoinGeckoBreakerOpen()) return results;
+
+  // ticker → list of original symbols (a watchlist can hold both the spot pair
+  // and a legacy alias mapping to the same ticker).
+  const tickerToOriginals = new Map<string, string[]>();
+  for (const sym of symbols) {
+    const ticker = toCoinGeckoTicker(sym);
+    if (!ticker) continue;
+    const list = tickerToOriginals.get(ticker);
+    if (list) list.push(sym);
+    else tickerToOriginals.set(ticker, [sym]);
+  }
+  const tickers = [...tickerToOriginals.keys()];
+
+  for (let i = 0; i < tickers.length; i += COINGECKO_MARKETS_BATCH) {
+    const slice = tickers.slice(i, i + COINGECKO_MARKETS_BATCH);
+    try {
+      const params = new URLSearchParams({
+        vs_currency: 'usd',
+        symbols: slice.join(','),
+        per_page: String(COINGECKO_MARKETS_BATCH),
+        page: '1',
+      });
+      const headers: Record<string, string> = {
+        'User-Agent': 'TRA-833/1.0',
+        Accept: 'application/json',
+      };
+      // The free Demo plan keys on a header; absent key = public rate tier.
+      if (COINGECKO_API_KEY) headers['x-cg-demo-api-key'] = COINGECKO_API_KEY;
+      const resp = await withTimeout(
+        fetch(`${COINGECKO_BASE}/coins/markets?${params.toString()}`, { headers }),
+        FEED_CALL_TIMEOUT_MS,
+        'CoinGecko coins/markets',
+      );
+      if (!resp.ok) {
+        if (resp.status === 429) {
+          coinGeckoBreakerOpenUntil = Date.now() + COINGECKO_BREAKER_MS;
+          feedLog.warn('CoinGecko 429 — breaker open for 60s');
+        } else {
+          feedLog.warn('CoinGecko coins/markets failed', { status: resp.status });
+        }
+        continue;
+      }
+      const rows = (await resp.json()) as Array<{
+        symbol?: string;
+        current_price?: number;
+        price_change_percentage_24h?: number;
+        total_volume?: number;
+      }>;
+      if (!Array.isArray(rows)) continue;
+      for (const row of rows) {
+        const ticker = (row.symbol ?? '').toLowerCase();
+        const originals = tickerToOriginals.get(ticker);
+        if (!originals) continue;
+        const price = Number(row.current_price);
+        if (!Number.isFinite(price) || price <= 0) continue;
+        const changePct = Number(row.price_change_percentage_24h);
+        const safeChangePct = Number.isFinite(changePct) ? changePct : 0;
+        const volume = Number(row.total_volume);
+        for (const original of originals) {
+          // Market-cap-descending order → first row per ticker wins; don't let a
+          // lower-cap namesake later in the page clobber the canonical price.
+          if (results.has(original)) continue;
+          results.set(original, {
+            price,
+            volume: Number.isFinite(volume) ? volume : 0,
+            change: price * (safeChangePct / 100),
+            changePct: safeChangePct,
+            source: 'coingecko',
+          });
+        }
+      }
+    } catch (err: unknown) {
+      feedLog.warn('CoinGecko quote fetch failed', {
+        reason: err instanceof Error ? err.message : String(err),
+      });
+    }
+  }
+  return results;
+}
+
+/**
  * TRA-300 — daily bars from Coinbase Exchange (granularity=86400) with Yahoo
  * fallback for symbols Coinbase doesn't list. Same venue alignment as the
  * quote and 4H paths so signal/exit math matches execution prices.
@@ -825,6 +953,18 @@ export async function fetchCryptoQuotes(
     for (const [sym, quote] of cbResults) results.set(sym, quote);
   }
 
+  // TRA-833 — CoinGecko fills the residual BEFORE Yahoo. When Coinbase is blocked
+  // from the datacenter IP (the common Render case) the residual is the whole
+  // universe; CoinGecko prices it in one or two batched calls from a datacenter-
+  // reachable host, so open positions keep a live Current / P&L and we never enter
+  // the per-symbol Yahoo fan-out that just trips the 429 breaker. Yahoo / CMC below
+  // still mop up anything CoinGecko doesn't carry (Binance-only listings, etc.).
+  const needGecko = symbols.filter(s => !results.has(s));
+  if (needGecko.length > 0) {
+    const geckoResults = await fetchCoinGeckoQuotes(needGecko);
+    for (const [sym, quote] of geckoResults) results.set(sym, quote);
+  }
+
   // Yahoo backstops symbols Coinbase doesn't list (e.g. BNB-USD, VET-USD,
   // EGLD-USD, RUNE-USD — Binance/Cosmos-only assets). Same parallel-batch
   // shape as before so a slow YF response can't stall the tick, with the
@@ -984,6 +1124,19 @@ export async function testCoinMarketCap(): Promise<{ symbol: string; price: numb
   const results = await fetchCMCBatchQuotes(['BTC-USD']);
   const btc = results.get('BTC-USD');
   if (!btc) throw new Error('No BTC-USD data from CMC');
+  return { symbol: 'BTC-USD', price: btc.price };
+}
+
+/**
+ * TRA-833 — probe CoinGecko's `/coins/markets` host so `/api/health/quotes`
+ * shows whether the datacenter-reachable crypto fallback is live. This is the
+ * source that keeps Current / P&L flowing when both Coinbase hosts time out from
+ * the Render egress IP, so it counts toward `cryptoOk`.
+ */
+export async function testCoinGecko(): Promise<{ symbol: string; price: number }> {
+  const quotes = await fetchCoinGeckoQuotes(['BTC-USD']);
+  const btc = quotes.get('BTC-USD');
+  if (!btc) throw new Error('No BTC-USD data from CoinGecko');
   return { symbol: 'BTC-USD', price: btc.price };
 }
 

@@ -4,6 +4,9 @@ import {
   listTradableCoinbaseUsdSymbols,
   fetchCoinbaseAdvancedTradeQuotes,
   fetchCoinbaseAdvancedTradeCandles,
+  fetchCoinGeckoQuotes,
+  isCoinGeckoBreakerOpen,
+  _resetCoinGeckoBreakerForTests,
   _resetCoinbaseProductCatalogForTests,
   _seedCoinbaseProductCatalogForTests,
 } from './crypto-feed.js';
@@ -172,6 +175,106 @@ describe('fetchCoinbaseAdvancedTradeQuotes — keyless Advanced Trade fallback (
     const fetchMock = vi.fn(async () => { throw new Error('network down'); });
     globalThis.fetch = fetchMock as unknown as typeof fetch;
     const out = await fetchCoinbaseAdvancedTradeQuotes(['BTC-USD']);
+    expect(out.size).toBe(0);
+  });
+});
+
+describe('fetchCoinGeckoQuotes — datacenter-reachable crypto fallback (TRA-833)', () => {
+  const realFetch = globalThis.fetch;
+
+  afterEach(() => {
+    globalThis.fetch = realFetch;
+    _resetCoinGeckoBreakerForTests();
+    vi.restoreAllMocks();
+  });
+
+  it('returns an empty map without calling fetch for an empty symbol list', async () => {
+    const fetchMock = vi.fn();
+    globalThis.fetch = fetchMock as unknown as typeof fetch;
+    const out = await fetchCoinGeckoQuotes([]);
+    expect(out.size).toBe(0);
+    expect(fetchMock).not.toHaveBeenCalled();
+  });
+
+  it('maps TICKER-USD product ids to bare lowercase tickers in the symbols filter', async () => {
+    const fetchMock = vi.fn(async (url: string) => {
+      expect(url).toContain('https://api.coingecko.com/api/v3/coins/markets');
+      expect(url).toContain('vs_currency=usd');
+      // URLSearchParams encodes the comma in `btc,sol` as %2C.
+      expect(decodeURIComponent(url)).toContain('symbols=btc,sol');
+      return {
+        ok: true,
+        status: 200,
+        json: async () => [
+          { symbol: 'btc', current_price: 64000, price_change_percentage_24h: 1.5, total_volume: 100 },
+          { symbol: 'sol', current_price: 68.2, price_change_percentage_24h: -2, total_volume: 50 },
+        ],
+      };
+    });
+    globalThis.fetch = fetchMock as unknown as typeof fetch;
+
+    const out = await fetchCoinGeckoQuotes(['BTC-USD', 'SOL-USD']);
+
+    expect(out.get('BTC-USD')).toEqual({
+      price: 64000,
+      volume: 100,
+      change: 64000 * 0.015,
+      changePct: 1.5,
+      source: 'coingecko',
+    });
+    expect(out.get('SOL-USD')?.price).toBe(68.2);
+    expect(out.get('SOL-USD')?.changePct).toBe(-2);
+  });
+
+  it('keeps the first (highest-market-cap) row when a ticker is ambiguous', async () => {
+    // CoinGecko returns rows market-cap-descending; a lower-cap namesake later in
+    // the page must not clobber the canonical price.
+    const fetchMock = vi.fn(async () => ({
+      ok: true,
+      status: 200,
+      json: async () => [
+        { symbol: 'btc', current_price: 64000, price_change_percentage_24h: 0, total_volume: 1 },
+        { symbol: 'btc', current_price: 0.0001, price_change_percentage_24h: 99, total_volume: 1 },
+      ],
+    }));
+    globalThis.fetch = fetchMock as unknown as typeof fetch;
+    const out = await fetchCoinGeckoQuotes(['BTC-USD']);
+    expect(out.get('BTC-USD')?.price).toBe(64000);
+  });
+
+  it('drops rows with a non-positive or unparseable price', async () => {
+    const fetchMock = vi.fn(async () => ({
+      ok: true,
+      status: 200,
+      json: async () => [
+        { symbol: 'good', current_price: 5, price_change_percentage_24h: 0, total_volume: 1 },
+        { symbol: 'zero', current_price: 0 },
+        { symbol: 'nan', current_price: 'x' as unknown as number },
+      ],
+    }));
+    globalThis.fetch = fetchMock as unknown as typeof fetch;
+    const out = await fetchCoinGeckoQuotes(['GOOD-USD', 'ZERO-USD', 'NAN-USD']);
+    expect(out.size).toBe(1);
+    expect(out.get('GOOD-USD')?.price).toBe(5);
+  });
+
+  it('opens a 60s breaker on HTTP 429 and short-circuits subsequent calls', async () => {
+    const fetchMock = vi.fn(async () => ({ ok: false, status: 429, json: async () => ([]) }));
+    globalThis.fetch = fetchMock as unknown as typeof fetch;
+    const out = await fetchCoinGeckoQuotes(['BTC-USD']);
+    expect(out.size).toBe(0);
+    expect(isCoinGeckoBreakerOpen()).toBe(true);
+    // While the breaker is open the next call must not hit the network at all.
+    fetchMock.mockClear();
+    const out2 = await fetchCoinGeckoQuotes(['ETH-USD']);
+    expect(out2.size).toBe(0);
+    expect(fetchMock).not.toHaveBeenCalled();
+  });
+
+  it('returns an empty map (does not throw) when fetch rejects', async () => {
+    const fetchMock = vi.fn(async () => { throw new Error('network down'); });
+    globalThis.fetch = fetchMock as unknown as typeof fetch;
+    const out = await fetchCoinGeckoQuotes(['ADA-USD']);
     expect(out.size).toBe(0);
   });
 });

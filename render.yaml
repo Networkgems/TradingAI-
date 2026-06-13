@@ -75,6 +75,13 @@ services:
       # Yahoo Finance crypto path is rate-limited or returns no data.
       - key: CMC_API_KEY
         sync: false
+      # Crypto quote fallback (TRA-833) — CoinGecko `/coins/markets`. Resolves from
+      # the Render datacenter egress IP (both Coinbase hosts time out there), prices
+      # the whole universe in one batched call, and keeps Current / P&L flowing for
+      # open positions. Works keyless at the public rate tier; set a free Demo key
+      # here to raise the per-minute limit. Optional.
+      - key: COINGECKO_API_KEY
+        sync: false
       # Stocks minute-bar fallback (TRA-154) — when set, Twelve Data serves
       # consolidated 1-minute candles whenever Tradier (primary) and Yahoo
       # both miss for an "active interest" symbol (open position or recent

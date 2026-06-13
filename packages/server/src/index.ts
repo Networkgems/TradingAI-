@@ -4690,6 +4690,7 @@ async function buildQuotesHealthPayload(): Promise<Record<string, unknown>> {
     testCoinMarketCap,
     testCoinbase,
     testCoinbaseAdvancedTrade,
+    testCoinGecko,
     isCoinbaseBreakerOpen,
     fetchCryptoDailyBars,
   } = await import('./crypto-feed.js');
@@ -4705,12 +4706,13 @@ async function buildQuotesHealthPayload(): Promise<Record<string, unknown>> {
   //   • chartFallback (TRA-191 minute-bar path) and cryptoDailyBars (TRA-705
   //     daily OHLC candle cascade) preserve their full diagnostic shapes.
   const [
-    tradier, coinbase, coinbaseAdvancedTrade, yahooFinance, twelveData,
+    tradier, coinbase, coinbaseAdvancedTrade, coinGecko, yahooFinance, twelveData,
     coinMarketCap, chartFallback, cryptoDailyBars,
   ] = await Promise.all([
     runQuotesProbe(async () => (await testTradier()) ?? { skipped: 'TRADIER_*_API_TOKEN not set' }),
     runQuotesProbe(() => testCoinbase()),
     runQuotesProbe(() => testCoinbaseAdvancedTrade()),
+    runQuotesProbe(() => testCoinGecko()),
     runQuotesProbe(() => testYahooFinance()),
     runQuotesProbe(async () => (await testTwelveData()) ?? { skipped: 'TWELVE_DATA_API_KEY not set' }),
     runQuotesProbe(async () => (await testCoinMarketCap()) ?? { skipped: 'CMC_API_KEY not set' }),
@@ -4738,6 +4740,7 @@ async function buildQuotesHealthPayload(): Promise<Record<string, unknown>> {
   results['tradier'] = tradier;
   results['coinbase'] = coinbase;
   results['coinbaseAdvancedTrade'] = coinbaseAdvancedTrade;
+  results['coinGecko'] = coinGecko;
   results['yahooFinance'] = yahooFinance;
   results['twelveData'] = twelveData;
   results['coinMarketCap'] = coinMarketCap;
@@ -4793,7 +4796,8 @@ async function buildQuotesHealthPayload(): Promise<Record<string, unknown>> {
   // outage while the engine is happily pricing the universe through it.
   const cryptoOk =
     dailyBarsOk ||
-    ok('coinbaseAdvancedTrade') || ok('coinbase') || ok('yahooFinance') || ok('coinMarketCap');
+    ok('coinbaseAdvancedTrade') || ok('coinbase') || ok('coinGecko') ||
+    ok('yahooFinance') || ok('coinMarketCap');
   const allOk = stocksOk && cryptoOk;
   // TRA-572 diagnostic: report which boot-time env vars the process sees (boolean
   // presence only — no secret values). Lets ops confirm whether Render is actually
