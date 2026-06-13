@@ -3705,4 +3705,47 @@ describe('SignalEngine — SupertrendConfluence shadow channel (TRA-787)', () =>
     // The forward-test book is now flat again.
     expect((engine as unknown as { supertrendPaper: { getState(): { openPositions: unknown[] } } }).supertrendPaper.getState().openPositions).toHaveLength(0);
   });
+
+  // TRA-834 regression — the paper book stalled at tradeCount=0 because exits ran
+  // off a single point-sample tick quote, which misses a stop/target touched by a
+  // 5m WICK that the shadow ledger's intra-bar high/low walk (resolveOutcome)
+  // does count. With the one-position-per-symbol open guard, an unclosed position
+  // blocked all further accrual. Exits now share the bar-walk, so a wick-touch
+  // closes the position even when the latest quote never breached the bracket.
+  it('TRA-834: closes a paper position on an intra-bar 5m wick the tick quote misses', () => {
+    const engine = new SignalEngine();
+    const stPaper = (engine as unknown as { supertrendPaper: PaperAccount }).supertrendPaper;
+
+    // Open a long forward-test position directly: entry 100, stop 95, target 110.
+    const signal = {
+      id: 'sig-wick', symbol: 'WICK', side: 'buy', type: 'supertrend_confluence',
+      entryPrice: 100, stopLoss: 95, takeProfit: 110, timestamp: Date.now(),
+    } as unknown as TradeSignal;
+    const opened = stPaper.openPosition(signal, 100);
+    expect(opened).not.toBeNull();
+
+    // A later 5m bar wicks THROUGH the stop (low 94 ≤ 95) but its close recovers
+    // to 100 — a point-sample quote at the close never sees the breach, while the
+    // bar-walk resolver (low ≤ stop) records SL_HIT. Timestamp just after entry so
+    // it lands in the same ET session the resolver requires.
+    const after = (opened!.openedAt ?? Date.now()) + 60_000;
+    const wickBar: Candle = {
+      symbol: 'WICK', timestamp: after, open: 100, high: 101, low: 94, close: 100, volume: 1_000,
+    };
+    (engine as unknown as { shadowCandleCache: Map<string, Candle[]> }).shadowCandleCache.set('WICK', [wickBar]);
+
+    // EMPTY price map → the point-sample backstop cannot close anything; only the
+    // bar-walk can. Proves the wick-touch path is what drains the book.
+    (engine as unknown as { runSupertrendPaperExits: (p: Map<string, number>) => void })
+      .runSupertrendPaperExits(new Map());
+
+    const snap = engine.exportTradeSnapshot();
+    const stClosed = snap.closedPositions.filter(p => p.signalType === 'supertrend_confluence');
+    expect(stClosed).toHaveLength(1);
+    expect(stClosed[0].exitReason).toBe('stop');
+    expect(stClosed[0].exitPrice ?? 0).toBeCloseTo(95); // exited at the stop (−1R)
+    expect(stClosed[0].pnl ?? 0).toBeLessThan(0);
+    expect(stClosed[0].closedAt).toBeDefined();
+    expect(stPaper.getState().openPositions).toHaveLength(0);
+  });
 });

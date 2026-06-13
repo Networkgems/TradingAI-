@@ -11,7 +11,7 @@ import type { LlmClient } from '@trading-app/agents';
 import { adviseSymbol, resolveTradingAgentsLlm, buildNewsHeadlines } from './trading-agents-advisory.js';
 import { getLatestMarketReview } from './market-review.js';
 import { earningsInDaysSync } from './earnings-store.js';
-import { recordShadowSignal, resolveShadowSignal, resolveOutcome, openShadowSignalsSync } from './shadow-signal-ledger.js';
+import { recordShadowSignal, resolveShadowSignal, resolveOutcome, openShadowSignalsSync, type ShadowSignalRecord } from './shadow-signal-ledger.js';
 import { etDateString } from './scheduler.js';
 import { fetchMinuteBars, fetchDailyCandles, fetchQuotes, fetchStocksNews, isYahooBreakerOpen, setActiveInterestSymbols, setTradierStocksFeedClient } from './yahoo-feed.js';
 import { fetchStockTwitsStream, fetchStockTwitsUserStream, getCuratedStockTwitsAccounts } from './stocktwits-feed.js';
@@ -2716,14 +2716,60 @@ export class SignalEngine {
    * regardless of engine mode (the dedicated book is always paper).
    */
   private runSupertrendPaperExits(prices: Map<string, number>): void {
+    // TRA-834 — resolve open forward-test positions on the SAME intra-bar 5m
+    // high/low walk the shadow ledger uses (`resolveOutcome`), NOT a point-sample
+    // tick quote. Root cause of `paper.tradeCount=0` after 107 resolved shadow
+    // signals: the old `checkExits(prices)` path compared each bracket to a
+    // single latest quote captured per tick, so a stop/target touched by a 5m
+    // wick — exactly the touch the bar-walk resolver counts — was invisible to
+    // the quote sample and the position never closed. With the one-position-per-
+    // symbol open guard in `evaluateSupertrendShadow`, that left every symbol's
+    // book permanently stuck open: the shadow ledger filled (177 signals, 107
+    // resolved) while the Stage-2 paper book recorded nothing. Walking the same
+    // cached 5m series here makes paper accrual track shadow resolution 1:1.
+    for (const pos of this.supertrendPaper.getState().openPositions) {
+      const bars = this.shadowCandleCache.get(pos.symbol);
+      if (!bars || bars.length === 0) continue;
+      // Synthesize the minimal record `resolveOutcome` reads (entryRef/bracket/
+      // side/ts) from the paper position so the touch + horizon logic is shared
+      // verbatim with the ledger — no second, divergeable copy of the rule.
+      const rec: ShadowSignalRecord = {
+        id: pos.id, ts: pos.openedAt, symbol: pos.symbol, side: pos.side,
+        entryRef: pos.entryPrice, supertrendValue: null, supertrendFlip: false,
+        maStack: null, macd: null, rsi: null,
+        stopLoss: pos.stopLoss, takeProfit: pos.takeProfit, outcome: 'OPEN',
+      };
+      const res = resolveOutcome(rec, bars);
+      if (!res) continue; // still live this session
+      // Derive the exit price from the resolver's signed realized-R against this
+      // position's own risk leg, so the recorded P&L is exactly consistent with
+      // the shadow outcome: SL_HIT→stopLoss (−1R), TP_HIT→takeProfit, TIMEOUT→
+      // the last in-session close. (exit = entry + dir·R·|entry−stop|.)
+      const risk = Math.abs(pos.entryPrice - pos.stopLoss);
+      const dir = pos.side === 'buy' ? 1 : -1;
+      const exitPrice = pos.entryPrice + dir * res.realizedR * risk;
+      const closed = this.supertrendPaper.closePosition(pos.id, exitPrice);
+      if (!closed) continue;
+      closed.mode = 'demo';
+      closed.exitReason =
+        res.outcome === 'TP_HIT' ? 'target' : res.outcome === 'SL_HIT' ? 'stop' : 'time_stop';
+      this.allClosedPositions.push(closed);
+      supertrendShadowLog.info('supertrend paper close', {
+        symbol: closed.symbol, side: closed.side, pnl: closed.pnl,
+        entryPrice: closed.entryPrice, exitPrice: closed.exitPrice,
+        outcome: res.outcome, barsToResolution: res.barsToResolution,
+        strategyId: SUPERTREND_STRATEGY_ID, account: 'paper-forward-test',
+      });
+    }
+
+    // Backstop: point-sample exits for any open position whose 5m series is not
+    // cached this tick (so the book still drains if the shadow refresh stalls).
+    // Disjoint from the bar-walk above — a position closed there is already gone.
     const closed = this.supertrendPaper.checkExits(prices);
     for (const pos of closed) {
-      // checkExits returns a shallow copy; stamp the forward-test mode so the
-      // promotion service includes it and the live dashboard (mode-filtered)
-      // does not surface it in live view.
       pos.mode = 'demo';
       this.allClosedPositions.push(pos);
-      supertrendShadowLog.info('supertrend paper close', {
+      supertrendShadowLog.info('supertrend paper close (quote backstop)', {
         symbol: pos.symbol, side: pos.side, pnl: pos.pnl,
         entryPrice: pos.entryPrice, exitPrice: pos.exitPrice,
         strategyId: SUPERTREND_STRATEGY_ID, account: 'paper-forward-test',
