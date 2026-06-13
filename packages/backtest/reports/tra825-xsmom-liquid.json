@@ -1,0 +1,644 @@
+{
+  "issue": "TRA-827",
+  "parent": "TRA-825",
+  "strategy": "xsmom_liquid",
+  "generatedAt": "2026-06-13T20:00:57.066Z",
+  "universe": [
+    "BTC-USD",
+    "ETH-USD",
+    "SOL-USD",
+    "ADA-USD",
+    "AVAX-USD",
+    "LINK-USD",
+    "DOT-USD",
+    "LTC-USD",
+    "XRP-USD",
+    "DOGE-USD"
+  ],
+  "barTimeframe": "4h",
+  "dataSource": "coinbase-exchange",
+  "initialEquity": 25000,
+  "slippageBps": 3,
+  "riskPerTrade": 0.01,
+  "sizing": "VolKellySizer (vol-only; Kelly cap inactive in-backtest — OOS expectancy → OOS sizing is look-ahead. Live supplies validated OOS net expectancy per spec). Equal-weight top-K, each slot vol-targeted; risk clamped [0.5%, 1.75%].",
+  "roundTripDefinition": "A round-trip opens when a name enters the equal-weight top-K book (fill at next 4h bar open) and closes when a weekly rebalance drops it from the book (fill at next 4h bar open). Net-of-fee R = netPnl / (stopDistance × qty), stopDistance = one daily vol-target σ (sizing-only 1R).",
+  "windows": {
+    "is": {
+      "start": "2023-05-01T00:00:00.000Z",
+      "end": "2024-12-31T23:59:59.999Z"
+    },
+    "oos": {
+      "start": "2025-01-01T00:00:00.000Z",
+      "end": "2026-06-03T00:00:00.000Z"
+    },
+    "warmupStart": "2023-05-01T00:00:00.000Z",
+    "oosEndPinned": "2026-06-03"
+  },
+  "costArms": [
+    {
+      "name": "maker_entry",
+      "feeBps": {
+        "maker": 25,
+        "taker": 60
+      },
+      "executionMode": "limit"
+    },
+    {
+      "name": "taker_80",
+      "feeBps": 80,
+      "executionMode": "market"
+    }
+  ],
+  "keeperGate": "pooled OOS block-bootstrap p5 final-equity multiple > 1.0 AND pooled OOS net expectancy > 0, on BOTH cost arms; ≥ 12 pooled OOS round-trips",
+  "paramGrid": {
+    "lookbackDays": [
+      60,
+      90,
+      120
+    ],
+    "topK": [
+      3,
+      4
+    ],
+    "absFloorPct": [
+      0,
+      5
+    ],
+    "rebalanceBars": 42,
+    "volTargetAnnualPct": 60
+  },
+  "selectionArm": "maker_entry",
+  "selectionRule": "Among IS configs with net expectancy > 0 AND ≥ 30 IS round-trips AND computable bootstrap p5 (≥ 12 IS round-trips), pick highest IS p5; tie-break higher round-trips. None qualify → FAIL.",
+  "isFailNoEdge": false,
+  "pickedConfig": {
+    "lookbackDays": 90,
+    "topK": 4,
+    "absFloorPct": 5,
+    "rebalanceBars": 42,
+    "volTargetAnnualPct": 60
+  },
+  "isSelectionTable": [
+    {
+      "params": {
+        "lookbackDays": 90,
+        "topK": 4,
+        "absFloorPct": 5,
+        "rebalanceBars": 42,
+        "volTargetAnnualPct": 60
+      },
+      "isRoundTrips": 42,
+      "isP5": 1.2159814202127357,
+      "isExpectancyNet": 4.492675421507703,
+      "isProfitFactor": 3.829990137177042,
+      "qualifies": true
+    },
+    {
+      "params": {
+        "lookbackDays": 90,
+        "topK": 3,
+        "absFloorPct": 5,
+        "rebalanceBars": 42,
+        "volTargetAnnualPct": 60
+      },
+      "isRoundTrips": 32,
+      "isP5": 0.987730244967453,
+      "isExpectancyNet": 4.847471631218241,
+      "isProfitFactor": 3.803493716878181,
+      "qualifies": true
+    },
+    {
+      "params": {
+        "lookbackDays": 90,
+        "topK": 4,
+        "absFloorPct": 0,
+        "rebalanceBars": 42,
+        "volTargetAnnualPct": 60
+      },
+      "isRoundTrips": 45,
+      "isP5": 0.8825702154531813,
+      "isExpectancyNet": 4.3657053663473535,
+      "isProfitFactor": 3.333704170149274,
+      "qualifies": true
+    },
+    {
+      "params": {
+        "lookbackDays": 90,
+        "topK": 3,
+        "absFloorPct": 0,
+        "rebalanceBars": 42,
+        "volTargetAnnualPct": 60
+      },
+      "isRoundTrips": 37,
+      "isP5": 0.7994072570541843,
+      "isExpectancyNet": 4.415578714393699,
+      "isProfitFactor": 3.3766349024165723,
+      "qualifies": true
+    },
+    {
+      "params": {
+        "lookbackDays": 60,
+        "topK": 4,
+        "absFloorPct": 0,
+        "rebalanceBars": 42,
+        "volTargetAnnualPct": 60
+      },
+      "isRoundTrips": 56,
+      "isP5": 0.3147678832737505,
+      "isExpectancyNet": 1.578194720112693,
+      "isProfitFactor": 1.5805408428470482,
+      "qualifies": true
+    },
+    {
+      "params": {
+        "lookbackDays": 60,
+        "topK": 3,
+        "absFloorPct": 0,
+        "rebalanceBars": 42,
+        "volTargetAnnualPct": 60
+      },
+      "isRoundTrips": 51,
+      "isP5": 0.3034511349286772,
+      "isExpectancyNet": 1.2378040608939305,
+      "isProfitFactor": 1.4751559165447012,
+      "qualifies": true
+    },
+    {
+      "params": {
+        "lookbackDays": 60,
+        "topK": 3,
+        "absFloorPct": 5,
+        "rebalanceBars": 42,
+        "volTargetAnnualPct": 60
+      },
+      "isRoundTrips": 44,
+      "isP5": 0.2969726514395301,
+      "isExpectancyNet": 1.5253169421943154,
+      "isProfitFactor": 1.521909150046889,
+      "qualifies": true
+    },
+    {
+      "params": {
+        "lookbackDays": 60,
+        "topK": 4,
+        "absFloorPct": 5,
+        "rebalanceBars": 42,
+        "volTargetAnnualPct": 60
+      },
+      "isRoundTrips": 49,
+      "isP5": 0.2942502489314737,
+      "isExpectancyNet": 1.8931295352172053,
+      "isProfitFactor": 1.638552586437883,
+      "qualifies": true
+    },
+    {
+      "params": {
+        "lookbackDays": 120,
+        "topK": 4,
+        "absFloorPct": 5,
+        "rebalanceBars": 42,
+        "volTargetAnnualPct": 60
+      },
+      "isRoundTrips": 25,
+      "isP5": 2.0055129565678307,
+      "isExpectancyNet": 10.322792775938279,
+      "isProfitFactor": 10.330251040216924,
+      "qualifies": false
+    },
+    {
+      "params": {
+        "lookbackDays": 120,
+        "topK": 4,
+        "absFloorPct": 0,
+        "rebalanceBars": 42,
+        "volTargetAnnualPct": 60
+      },
+      "isRoundTrips": 26,
+      "isP5": 1.7144101772920843,
+      "isExpectancyNet": 9.925995036283458,
+      "isProfitFactor": 8.227101405398079,
+      "qualifies": false
+    },
+    {
+      "params": {
+        "lookbackDays": 120,
+        "topK": 3,
+        "absFloorPct": 5,
+        "rebalanceBars": 42,
+        "volTargetAnnualPct": 60
+      },
+      "isRoundTrips": 24,
+      "isP5": 0.9507347137339575,
+      "isExpectancyNet": 10.66639048507656,
+      "isProfitFactor": 9.183373734291182,
+      "qualifies": false
+    },
+    {
+      "params": {
+        "lookbackDays": 120,
+        "topK": 3,
+        "absFloorPct": 0,
+        "rebalanceBars": 42,
+        "volTargetAnnualPct": 60
+      },
+      "isRoundTrips": 25,
+      "isP5": 0.7770341031939391,
+      "isExpectancyNet": 10.130905807500087,
+      "isProfitFactor": 6.997081541934786,
+      "qualifies": false
+    }
+  ],
+  "droppedForNoHistory": [],
+  "oos": [
+    {
+      "arm": "maker_entry",
+      "trades": 32,
+      "symbolsContributing": 9,
+      "expectancyNet": -2.077447629950891,
+      "profitFactor": 0.38964303297997865,
+      "bootstrap": {
+        "n": 32,
+        "p5": 0.2913314569440529,
+        "p50": 0.49608065703357046,
+        "p95": 0.7664779126363264,
+        "worstDdPct": 85.98034328718991,
+        "blockLen": 5,
+        "iterations": 5000
+      },
+      "keeper": false,
+      "rebalancesEvaluated": 74,
+      "minRetainedNames": 10,
+      "droppedForHistory": {
+        "BTC-USD": 0,
+        "ETH-USD": 0,
+        "SOL-USD": 0,
+        "ADA-USD": 0,
+        "AVAX-USD": 0,
+        "LINK-USD": 0,
+        "DOT-USD": 0,
+        "LTC-USD": 0,
+        "XRP-USD": 0,
+        "DOGE-USD": 0
+      },
+      "perSymbol": [
+        {
+          "symbol": "BTC-USD",
+          "roundTrips": 1,
+          "expectancyNet": 4.019779033553393,
+          "profitFactor": null
+        },
+        {
+          "symbol": "ETH-USD",
+          "roundTrips": 2,
+          "expectancyNet": 5.327467945321744,
+          "profitFactor": 3.297734463940938
+        },
+        {
+          "symbol": "SOL-USD",
+          "roundTrips": 5,
+          "expectancyNet": -2.259156666047873,
+          "profitFactor": 0.4300272507530383
+        },
+        {
+          "symbol": "ADA-USD",
+          "roundTrips": 4,
+          "expectancyNet": -4.586879012088909,
+          "profitFactor": 0
+        },
+        {
+          "symbol": "AVAX-USD",
+          "roundTrips": 2,
+          "expectancyNet": -6.150082754006033,
+          "profitFactor": 0
+        },
+        {
+          "symbol": "LINK-USD",
+          "roundTrips": 4,
+          "expectancyNet": -3.3333846315615627,
+          "profitFactor": 0.11100550507570696
+        },
+        {
+          "symbol": "DOT-USD",
+          "roundTrips": 0,
+          "expectancyNet": 0,
+          "profitFactor": 0
+        },
+        {
+          "symbol": "LTC-USD",
+          "roundTrips": 5,
+          "expectancyNet": 0.6840986958630596,
+          "profitFactor": 2.2387666115830474
+        },
+        {
+          "symbol": "XRP-USD",
+          "roundTrips": 3,
+          "expectancyNet": -0.3436274376673712,
+          "profitFactor": 0.8180418408579302
+        },
+        {
+          "symbol": "DOGE-USD",
+          "roundTrips": 6,
+          "expectancyNet": -4.710941139347543,
+          "profitFactor": 0.06987339722437014
+        }
+      ]
+    },
+    {
+      "arm": "taker_80",
+      "trades": 32,
+      "symbolsContributing": 9,
+      "expectancyNet": -2.3104610651424835,
+      "profitFactor": 0.35192597286366156,
+      "bootstrap": {
+        "n": 32,
+        "p5": 0.26990257349363805,
+        "p50": 0.4596755766756495,
+        "p95": 0.7102597058620542,
+        "worstDdPct": 86.98292745497756,
+        "blockLen": 5,
+        "iterations": 5000
+      },
+      "keeper": false,
+      "rebalancesEvaluated": 74,
+      "minRetainedNames": 10,
+      "droppedForHistory": {
+        "BTC-USD": 0,
+        "ETH-USD": 0,
+        "SOL-USD": 0,
+        "ADA-USD": 0,
+        "AVAX-USD": 0,
+        "LINK-USD": 0,
+        "DOT-USD": 0,
+        "LTC-USD": 0,
+        "XRP-USD": 0,
+        "DOGE-USD": 0
+      },
+      "perSymbol": [
+        {
+          "symbol": "BTC-USD",
+          "roundTrips": 1,
+          "expectancyNet": 3.7751401259938837,
+          "profitFactor": null
+        },
+        {
+          "symbol": "ETH-USD",
+          "roundTrips": 2,
+          "expectancyNet": 5.079309395725063,
+          "profitFactor": 3.0881105711143224
+        },
+        {
+          "symbol": "SOL-USD",
+          "roundTrips": 5,
+          "expectancyNet": -2.491918284443578,
+          "profitFactor": 0.39192080055976597
+        },
+        {
+          "symbol": "ADA-USD",
+          "roundTrips": 4,
+          "expectancyNet": -4.815176947861573,
+          "profitFactor": 0
+        },
+        {
+          "symbol": "AVAX-USD",
+          "roundTrips": 2,
+          "expectancyNet": -6.37779517470313,
+          "profitFactor": 0
+        },
+        {
+          "symbol": "LINK-USD",
+          "roundTrips": 4,
+          "expectancyNet": -3.5635121864587243,
+          "profitFactor": 0.09087594835182616
+        },
+        {
+          "symbol": "DOT-USD",
+          "roundTrips": 0,
+          "expectancyNet": 0,
+          "profitFactor": 0
+        },
+        {
+          "symbol": "LTC-USD",
+          "roundTrips": 5,
+          "expectancyNet": 0.44572036818805894,
+          "profitFactor": 1.6563503699293782
+        },
+        {
+          "symbol": "XRP-USD",
+          "roundTrips": 3,
+          "expectancyNet": -0.5797522829163468,
+          "profitFactor": 0.716218994553244
+        },
+        {
+          "symbol": "DOGE-USD",
+          "roundTrips": 6,
+          "expectancyNet": -4.937986614214902,
+          "profitFactor": 0.05970733512665984
+        }
+      ]
+    }
+  ],
+  "walkForward": [
+    {
+      "fold": "2023_recovery",
+      "window": {
+        "start": "2023-05-01T00:00:00.000Z",
+        "end": "2023-12-31T23:59:59.999Z"
+      },
+      "arm": "maker_entry",
+      "roundTrips": 10,
+      "expectancyNet": 1.9189691513170104,
+      "profitFactor": 1.990932933477366,
+      "p5": null,
+      "p50": null,
+      "keeper": false
+    },
+    {
+      "fold": "2023_recovery",
+      "window": {
+        "start": "2023-05-01T00:00:00.000Z",
+        "end": "2023-12-31T23:59:59.999Z"
+      },
+      "arm": "taker_80",
+      "roundTrips": 10,
+      "expectancyNet": 1.6787274980027156,
+      "profitFactor": 1.8283210080813257,
+      "p5": null,
+      "p50": null,
+      "keeper": false
+    },
+    {
+      "fold": "2024_bull",
+      "window": {
+        "start": "2024-01-01T00:00:00.000Z",
+        "end": "2024-12-31T23:59:59.999Z"
+      },
+      "arm": "maker_entry",
+      "roundTrips": 31,
+      "expectancyNet": 0.7994313132964117,
+      "profitFactor": 1.5520817512502287,
+      "p5": 0.684188071452043,
+      "p50": 1.2340679037613453,
+      "keeper": false
+    },
+    {
+      "fold": "2024_bull",
+      "window": {
+        "start": "2024-01-01T00:00:00.000Z",
+        "end": "2024-12-31T23:59:59.999Z"
+      },
+      "arm": "taker_80",
+      "roundTrips": 31,
+      "expectancyNet": 0.5606686640203301,
+      "profitFactor": 1.3661724389572287,
+      "p5": 0.63540680226434,
+      "p50": 1.1465770957620398,
+      "keeper": false
+    },
+    {
+      "fold": "2025_chop",
+      "window": {
+        "start": "2025-01-01T00:00:00.000Z",
+        "end": "2026-06-03T00:00:00.000Z"
+      },
+      "arm": "maker_entry",
+      "roundTrips": 32,
+      "expectancyNet": -2.077447629950891,
+      "profitFactor": 0.38964303297997865,
+      "p5": 0.2913314569440529,
+      "p50": 0.49608065703357046,
+      "keeper": false
+    },
+    {
+      "fold": "2025_chop",
+      "window": {
+        "start": "2025-01-01T00:00:00.000Z",
+        "end": "2026-06-03T00:00:00.000Z"
+      },
+      "arm": "taker_80",
+      "roundTrips": 32,
+      "expectancyNet": -2.3104610651424835,
+      "profitFactor": 0.35192597286366156,
+      "p5": 0.26990257349363805,
+      "p50": 0.4596755766756495,
+      "keeper": false
+    }
+  ],
+  "neighborStability": [
+    {
+      "params": {
+        "lookbackDays": 60,
+        "topK": 4,
+        "absFloorPct": 5,
+        "rebalanceBars": 42,
+        "volTargetAnnualPct": 60
+      },
+      "arm": "maker_entry",
+      "roundTrips": 32,
+      "expectancyNet": -2.6515480336370327,
+      "p5": 0.24027710173451783,
+      "keeper": false
+    },
+    {
+      "params": {
+        "lookbackDays": 60,
+        "topK": 4,
+        "absFloorPct": 5,
+        "rebalanceBars": 42,
+        "volTargetAnnualPct": 60
+      },
+      "arm": "taker_80",
+      "roundTrips": 32,
+      "expectancyNet": -2.8833392282054855,
+      "p5": 0.2225922951696281,
+      "keeper": false
+    },
+    {
+      "params": {
+        "lookbackDays": 120,
+        "topK": 4,
+        "absFloorPct": 5,
+        "rebalanceBars": 42,
+        "volTargetAnnualPct": 60
+      },
+      "arm": "maker_entry",
+      "roundTrips": 29,
+      "expectancyNet": -2.701492828370056,
+      "p5": 0.24968558109388655,
+      "keeper": false
+    },
+    {
+      "params": {
+        "lookbackDays": 120,
+        "topK": 4,
+        "absFloorPct": 5,
+        "rebalanceBars": 42,
+        "volTargetAnnualPct": 60
+      },
+      "arm": "taker_80",
+      "roundTrips": 29,
+      "expectancyNet": -2.9327358367889973,
+      "p5": 0.23298440935400688,
+      "keeper": false
+    },
+    {
+      "params": {
+        "lookbackDays": 90,
+        "topK": 3,
+        "absFloorPct": 5,
+        "rebalanceBars": 42,
+        "volTargetAnnualPct": 60
+      },
+      "arm": "maker_entry",
+      "roundTrips": 24,
+      "expectancyNet": -2.198986866354994,
+      "p5": 0.3882735791590598,
+      "keeper": false
+    },
+    {
+      "params": {
+        "lookbackDays": 90,
+        "topK": 3,
+        "absFloorPct": 5,
+        "rebalanceBars": 42,
+        "volTargetAnnualPct": 60
+      },
+      "arm": "taker_80",
+      "roundTrips": 24,
+      "expectancyNet": -2.4318974713557155,
+      "p5": 0.3666141334966873,
+      "keeper": false
+    },
+    {
+      "params": {
+        "lookbackDays": 90,
+        "topK": 4,
+        "absFloorPct": 0,
+        "rebalanceBars": 42,
+        "volTargetAnnualPct": 60
+      },
+      "arm": "maker_entry",
+      "roundTrips": 36,
+      "expectancyNet": -2.397281149824316,
+      "p5": 0.23644663321048592,
+      "keeper": false
+    },
+    {
+      "params": {
+        "lookbackDays": 90,
+        "topK": 4,
+        "absFloorPct": 0,
+        "rebalanceBars": 42,
+        "volTargetAnnualPct": 60
+      },
+      "arm": "taker_80",
+      "roundTrips": 36,
+      "expectancyNet": -2.629640131269799,
+      "p5": 0.216970705315288,
+      "keeper": false
+    }
+  ],
+  "thinnessCheck": {
+    "pooledOosRoundTrips": 32,
+    "ge12": true
+  },
+  "verdict": "FAIL_GATE"
+}
