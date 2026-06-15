@@ -64,3 +64,15 @@ export type {
   RecommendationSummary,
   ActionResult,
 } from './inbound/command-router.js';
+
+// TRA-852 — Discord Interactions transport (Ed25519 verify + interaction map).
+export {
+  verifyDiscordRequest,
+  extractInteraction,
+  parseDiscordLinkToken,
+  ed25519PublicKeyFromHex,
+  DISCORD_INTERACTION_TYPE,
+  DISCORD_RESPONSE_TYPE,
+  DISCORD_EPHEMERAL_FLAG,
+} from './inbound/discord-interactions.js';
+export type { DiscordInteraction, ExtractedInteraction } from './inbound/discord-interactions.js';

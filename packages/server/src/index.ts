@@ -35,6 +35,12 @@ import {
   isValidDiscordWebhook,
   parseCommand,
   executeCommand,
+  verifyDiscordRequest,
+  extractInteraction,
+  parseDiscordLinkToken,
+  DISCORD_INTERACTION_TYPE,
+  DISCORD_RESPONSE_TYPE,
+  DISCORD_EPHEMERAL_FLAG,
   type CommandContext,
   type ChannelAdapter,
 } from './notifications/index.js';
@@ -443,7 +449,19 @@ app.use((req, res, next) => {
 // `X-Trace-Id` response header all correlate to the same request.
 app.use(traceMiddleware);
 
-app.use(express.json());
+// TRA-852 — stash the exact raw request bytes on the request during JSON
+// parsing. The Discord Interactions endpoint must verify the Ed25519 signature
+// against the byte-for-byte body Discord signed; re-serializing the parsed
+// object would not round-trip (key order, whitespace), so we capture the buffer
+// here. It is just a reference to the buffer express.json already holds — no
+// extra copy — and is read by exactly one route.
+app.use(
+  express.json({
+    verify: (req, _res, buf) => {
+      (req as unknown as { rawBody?: Buffer }).rawBody = buf;
+    },
+  }),
+);
 
 // ── Auth middleware ───────────────────────────────────────────────────────────
 
@@ -3630,6 +3648,25 @@ app.post('/api/notifications/telegram/link', requireAuth, (req, res) => {
   res.json({ ok: true, token, deepLink, botUsername: botUsername ?? null });
 });
 
+// TRA-852 — issue a single-use Discord link token. Discord has no payload deep
+// link for slash commands, so the user runs `/link <token>` in any channel the
+// bot can see; the interactions endpoint below consumes the token and records
+// their Discord user id. Reuses the channel-neutral link-token store. Requires a
+// configured public key so an unusable (verification-less) flow can't be linked.
+app.post('/api/notifications/discord/link', requireAuth, (req, res) => {
+  const username = res.locals['authUser'] as string;
+  if (!process.env['DISCORD_PUBLIC_KEY']) {
+    res.status(503).json({
+      ok: false,
+      code: 'discord_not_configured',
+      error: 'Discord is not enabled on this deployment (no DISCORD_PUBLIC_KEY).',
+    });
+    return;
+  }
+  const token = issueLinkToken(username);
+  res.json({ ok: true, token, command: `/link ${token}` });
+});
+
 // TRA-848 — true when the agent-layer kill switch (TRADING_AGENTS_LLM_DISABLED)
 // is engaged. Mirrors the truthy set used by the advisory layer; gates the
 // capital-affecting inbound verbs (approve/reject) without disabling reads.
@@ -3653,6 +3690,18 @@ function resolveUsernameByTelegramChat(chatId: string): string | undefined {
   return undefined;
 }
 
+// TRA-852 — Discord mirror of resolveUsernameByTelegramChat. A Discord user id
+// is the auth subject here: it is bound only via the single-use `/link <token>`
+// interaction flow, so a known id IS an authenticated user. Returns undefined
+// for any id we have not linked, so an unsolicited interaction is ignored.
+function resolveUsernameByDiscordUser(userId: string): string | undefined {
+  for (const ctx of getAllUserContexts()) {
+    const prefs = resolveAlertPreferences(getSettings(ctx.username));
+    if (prefs.channels.discord.discordUserId === userId) return ctx.username;
+  }
+  return undefined;
+}
+
 // TRA-848 — send one plain-text reply on the inbound Telegram chat. Fire-and-
 // forget: a failed reply must never 500 the webhook (Telegram expects a fast
 // 200 and retries on non-2xx).
@@ -3670,11 +3719,13 @@ async function sendTelegramReply(chatId: string, text: string): Promise<void> {
   }
 }
 
-// TRA-848 — assemble the injectable CommandContext the router runs against,
-// reading from this user's live engine state. Read renderers are deliberately
-// plain text (chat-friendly); approve/reject delegate to the engine's
-// human-in-the-loop methods, which keep every risk + live-gate control.
-function buildTelegramCommandContext(username: string): CommandContext {
+// TRA-848 / TRA-852 — assemble the injectable CommandContext the router runs
+// against, reading from this user's live engine state. Channel-neutral: the
+// Telegram webhook and the Discord interactions endpoint share it (the
+// channel-specific bit is only how the reply text is delivered). Read renderers
+// are deliberately plain text (chat-friendly); approve/reject delegate to the
+// engine's human-in-the-loop methods, which keep every risk + live-gate control.
+function buildCommandContext(username: string): CommandContext {
   const ctx = tryGetUserContext(username);
   const engine = ctx?.engine;
   const fmt = (n: number): string => (n >= 0 ? '+' : '') + n.toFixed(2);
@@ -3772,7 +3823,7 @@ app.post('/api/notifications/telegram/webhook', async (req, res) => {
           // Unlinked chat — do not act; nudge the user to link first.
           await sendTelegramReply(String(chatId), 'This chat is not linked. Use Settings → Notifications → Link to connect.');
         } else {
-          const reply = await executeCommand(cmd, buildTelegramCommandContext(username));
+          const reply = await executeCommand(cmd, buildCommandContext(username));
           await sendTelegramReply(String(chatId), reply);
         }
       }
@@ -3783,6 +3834,94 @@ app.post('/api/notifications/telegram/webhook', async (req, res) => {
     });
   }
   res.json({ ok: true });
+});
+
+// TRA-852 — Discord Interactions endpoint. The Discord transport for the inbound
+// conversational control shipped in TRA-848. Unauthenticated at the transport
+// (Discord calls it) but every request is verified by Ed25519 signature against
+// DISCORD_PUBLIC_KEY — an unsigned/forged request gets a 401 and never reaches
+// the command path. Like Telegram, command handling is further gated by
+// Discord-user↔app-user resolution (the link-token auth boundary) and the
+// TRADING_AGENTS_LLM_DISABLED kill switch (inside the shared router).
+//
+// Discord expects an INTERACTION RESPONSE in the HTTP reply itself (not a
+// follow-up call), so we answer synchronously: PONG to the PING handshake, and
+// an ephemeral CHANNEL_MESSAGE_WITH_SOURCE carrying the reply text otherwise.
+app.post('/api/notifications/discord/interactions', async (req, res) => {
+  const publicKey = process.env['DISCORD_PUBLIC_KEY'];
+  const rawBody = (req as unknown as { rawBody?: Buffer }).rawBody;
+  const ok = verifyDiscordRequest({
+    publicKey,
+    signature: req.header('x-signature-ed25519'),
+    timestamp: req.header('x-signature-timestamp'),
+    rawBody,
+  });
+  if (!ok) {
+    res.status(401).json({ error: 'invalid request signature' });
+    return;
+  }
+
+  const interaction = (req.body ?? {}) as { type?: number };
+  // PING handshake — Discord probes this on URL setup and on a schedule.
+  if (interaction.type === DISCORD_INTERACTION_TYPE.PING) {
+    res.json({ type: DISCORD_RESPONSE_TYPE.PONG });
+    return;
+  }
+
+  const reply = (text: string): void => {
+    res.json({
+      type: DISCORD_RESPONSE_TYPE.CHANNEL_MESSAGE_WITH_SOURCE,
+      data: { content: text, flags: DISCORD_EPHEMERAL_FLAG },
+    });
+  };
+
+  try {
+    const extracted = extractInteraction(interaction);
+    if (!extracted || !extracted.userId) {
+      reply('Could not read that interaction.');
+      return;
+    }
+    const { text, userId } = extracted;
+
+    // ── Account linking (mirror of Telegram's `/start <token>`) ──
+    const token = parseDiscordLinkToken(text);
+    if (token) {
+      const username = consumeLinkToken(token);
+      if (username) {
+        const current = await loadSettings(username);
+        const prefs = resolveAlertPreferences(current);
+        prefs.channels.discord.discordUserId = userId;
+        prefs.channels.discord.enabled = true;
+        await saveSettings(username, { ...current, alertPreferences: prefs });
+        log.info('discord user linked', { username });
+        reply('Linked. Use /status, /scan, /positions, /brief, /approve, /reject, or /help.');
+      } else {
+        log.debug('discord link token unknown/expired');
+        reply('That link code is invalid or expired. Generate a new one in Settings → Notifications.');
+      }
+      return;
+    }
+
+    // ── Inbound conversational control (TRA-848 command core) ──
+    const cmd = parseCommand(text);
+    if (!cmd) {
+      reply('Unrecognized command. Try /help.');
+      return;
+    }
+    const username = resolveUsernameByDiscordUser(userId);
+    if (!username) {
+      reply('This Discord account is not linked. Use Settings → Notifications → Link, then run /link <code>.');
+      return;
+    }
+    const replyText = await executeCommand(cmd, buildCommandContext(username));
+    reply(replyText);
+  } catch (err) {
+    log.warn('discord interaction handling failed', {
+      reason: err instanceof Error ? err.message : String(err),
+    });
+    // A signed request that blew up still gets a clean ephemeral reply.
+    reply('Something went wrong handling that command.');
+  }
 });
 
 // Per-market scope (TRA-192): Stockdashboard and Cryptodashboard each have

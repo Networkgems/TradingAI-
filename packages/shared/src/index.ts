@@ -720,8 +720,14 @@ export interface AlertChannelConfig {
   emailAddress?: string;
   /** Telegram chat id captured via the A2 `/start <token>` link flow. Inert until linked. */
   telegramChatId?: string;
-  /** Discord incoming-webhook URL. Inert until set. */
+  /** Discord incoming-webhook URL (outbound alerts). Inert until set. */
   discordWebhookUrl?: string;
+  /**
+   * Discord user id captured via the TRA-852 `/link <token>` interaction flow.
+   * The reverse of `discordWebhookUrl`: it identifies the inbound Discord user
+   * whose slash commands resolve back to this app user. Inert until linked.
+   */
+  discordUserId?: string;
 }
 
 /**
