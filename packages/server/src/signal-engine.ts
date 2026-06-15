@@ -242,7 +242,8 @@ const RV_SCAN_INTERVAL_MS = 5 * 60_000;
 // This is a compiled-in pause, so it survives a server restart with no reliance
 // on per-user persisted settings. Existing managed RV exits keep running; we do
 // NOT force-liquidate. Flip back to `true` to re-arm new entries.
-const RV_ENGINE_ENABLED: boolean = false;
+// TRA-895 — board accepted interaction 0b81d58e: re-enable RV for the 3-day demo test (Jun 15-18).
+const RV_ENGINE_ENABLED: boolean = true;
 
 /**
  * TRA-811 — the single gate that decides whether the per-tick loop arms a new
