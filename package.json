@@ -11,6 +11,7 @@
     "server:start": "pnpm --filter @trading-app/server start",
     "web:dev": "concurrently \"pnpm server:dev\" \"pnpm --filter desktop vite:dev\"",
     "web:build": "pnpm -r --filter './packages/**' build && pnpm --filter desktop vite:build",
+    "render:status": "node scripts/render-deploy-status.mjs",
     "typecheck": "pnpm -r --filter \"@trading-app/*\" build && pnpm -r typecheck",
     "lint": "eslint . --max-warnings 0",
     "pretest": "pnpm --filter @trading-app/shared build && pnpm --filter @trading-app/engine build && pnpm --filter @trading-app/backtest build",

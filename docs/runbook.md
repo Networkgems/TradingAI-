@@ -166,6 +166,40 @@ curl -s http://<host>/api/health/storage    # confirm dataDir_exists + backupsCo
 Then log into the dashboard and confirm a `state` snapshot arrives over the
 WebSocket (the UI populates).
 
+### Render deploy status & failed-build logs (TRA-893)
+
+The public backend (`tradingai-bqb1`, §1) auto-deploys on push to `main`. To
+check whether the latest deploy went live and — when it **failed** — pull the
+build/deploy logs automatically (instead of opening the dashboard):
+
+```bash
+RENDER_API_KEY=rnd_… pnpm run render:status
+```
+
+`scripts/render-deploy-status.mjs` resolves the service, reads the latest deploy,
+prints its status/commit/timings, and on a failed deploy
+(`build_failed` / `update_failed` / `pre_deploy_failed` / `canceled`) pulls the
+log window for that deploy and prints it. Exit codes: `0` succeeded, `1` failed
+(logs printed), `2` usage/auth error, `3` still in progress.
+
+- The **`RENDER_API_KEY`** is the only requirement — get it from the Render
+  dashboard → *Account Settings → API Keys*. Keep it in the environment; never
+  commit it (same rule as the `sync:false` secrets in `render.yaml`).
+- Override the target with `RENDER_SERVICE_ID=srv-…` (skips name lookup) or
+  `RENDER_SERVICE_NAME=…` (default `tradingai-bqb1`).
+- Set `RENDER_WATCH_MS=10000` to poll until the deploy reaches a terminal state —
+  handy right after a push.
+- Because it exits non-zero on a failed deploy, it can back a recurring
+  deploy-health gate (routine/CI step) that surfaces a broken `main` build
+  without anyone watching the dashboard.
+
+First triage when a Render build fails: the build command is
+`pnpm install --frozen-lockfile && pnpm run web:build` (`render.yaml`). The most
+common fresh-environment causes are (a) **pnpm version drift** — Render has no
+`packageManager` pin, so its pnpm may differ from the one that wrote
+`pnpm-lock.yaml` (lockfileVersion 9.0 → pnpm 9/10); and (b) a TS compile error in
+`packages/*` that didn't surface locally. Pull the logs above to see which.
+
 ### What a redeploy does to running state
 
 - A PM2 restart sends `SIGINT`/`SIGTERM`, which triggers `gracefulShutdown()` —
