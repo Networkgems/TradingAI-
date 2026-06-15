@@ -94,6 +94,21 @@ const before = signals.length;
 signals = signals.filter((s) => s && s.symbol !== 'TEST' && !String(s.id).startsWith('TEST:'));
 const dropped = before - signals.length;
 
+// TRA-842 re-baseline guard: if we have rows but NONE carry the `emitted` field,
+// the Render deploy has not yet booted with the TRA-840 rebaselineIfLegacy fix.
+// The legacy rows (emitted=undefined) are contaminated; abort rather than emit
+// misleading metrics to TRA-734.
+const rowsWithEmitField = signals.filter((s) => 'emitted' in s).length;
+if (signals.length > 0 && rowsWithEmitField === 0) {
+  process.stdout.write(
+    '# TRA-789 — Shadow-signal live-tape validation\n\n'
+    + `**ABORT: re-baseline not observed.** ${signals.length} rows in ledger but none carry the \`emitted\` field.`
+    + ' Render is still serving pre-TRA-840 legacy rows. Do not trust these metrics for TRA-734.'
+    + ' Re-run after the Render deploy boots and \`rebaselineIfLegacy\` archives the contaminated rows.\n'
+  );
+  process.exit(1);
+}
+
 // TRA-840 — split emitted signals from near-miss candidates. The go/no-go metrics
 // (hit rate, E[R], whipsaw, sample size) are the strategy's ACTUAL routable
 // signals, so they run on emitted rows only. Confluence attribution runs over ALL
