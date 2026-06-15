@@ -7,6 +7,14 @@ export { macd, macdCross } from './macd.js';
 export type { MacdResult } from './macd.js';
 export { bollinger, bollingerZone } from './bollinger.js';
 export type { BollingerState } from './bollinger.js';
+export { doubleBollinger, doubleBollingerSignal, DBB_DEFAULTS } from './double-bollinger.js';
+export type {
+  DoubleBollingerState,
+  DoubleBollingerOptions,
+  DbbSignal,
+  DbbSignalType,
+  BandSource,
+} from './double-bollinger.js';
 export { ichimoku, tkCross } from './ichimoku.js';
 export type { IchimokuState } from './ichimoku.js';
 export { adx } from './adx.js';
