@@ -39,6 +39,8 @@ const EVENT_LABELS: Record<AlertEventClass, string> = {
   exit: 'Position exited',
   signal: 'New signal',
   risk_halt: 'Risk halt',
+  briefing: 'Daily briefing',
+  routine: 'Scheduled routine',
 };
 
 const DIGEST_OPTIONS: { value: AlertDigestMode; label: string }[] = [
