@@ -80,6 +80,64 @@ export function blackScholesDelta(inputs: BlackScholesInputs): number {
     : Math.exp(-q * T) * (normCdf(d1) - 1);
 }
 
+/** Standard-normal probability density φ(x). */
+function normPdf(x: number): number {
+  return Math.exp(-0.5 * x * x) / Math.sqrt(2 * Math.PI);
+}
+
+/**
+ * TRA-844 — full first/second-order Greek bundle for a single contract, used by
+ * the portfolio Greeks rollup. Units are the analytic (textbook) conventions:
+ *
+ *   • `delta`  — ∂price/∂spot       (per $1 of underlying; sign-adjusted for puts)
+ *   • `gamma`  — ∂²price/∂spot²      (per $1 of underlying)
+ *   • `vega`   — ∂price/∂σ           (per 1.00 = 100 vol points of IV)
+ *   • `theta`  — ∂price/∂t           (per YEAR; negative for long premium)
+ *
+ * The portfolio rollup converts these to display units (vega per 1 vol point,
+ * theta per calendar day) and scales by contracts × 100, so this stays a pure
+ * analytic primitive that can be checked against textbook values in tests.
+ *
+ * Degenerate inputs (non-positive spot/strike, T ≤ 0, σ ≤ 0) return a Greek
+ * bundle with delta from the intrinsic-only fallback and the higher-order
+ * Greeks (gamma/vega/theta) zeroed — at/after expiry or with no vol there is no
+ * smooth sensitivity to report.
+ */
+export interface BlackScholesGreeks {
+  delta: number;
+  gamma: number;
+  vega: number;
+  theta: number;
+}
+
+export function blackScholesGreeks(inputs: BlackScholesInputs): BlackScholesGreeks {
+  const { spot, strike, timeToExpiryYears: T, riskFreeRate: r, volatility: sigma, optionType } = inputs;
+  const q = inputs.dividendYield ?? 0;
+
+  if (spot <= 0 || strike <= 0 || T <= 0 || sigma <= 0) {
+    return { delta: blackScholesDelta(inputs), gamma: 0, vega: 0, theta: 0 };
+  }
+
+  const sqrtT = Math.sqrt(T);
+  const d1 = (Math.log(spot / strike) + (r - q + 0.5 * sigma * sigma) * T) / (sigma * sqrtT);
+  const d2 = d1 - sigma * sqrtT;
+  const phi = normPdf(d1);
+  const discQ = Math.exp(-q * T);
+  const discR = Math.exp(-r * T);
+
+  const delta = optionType === 'call' ? discQ * normCdf(d1) : discQ * (normCdf(d1) - 1);
+  const gamma = (discQ * phi) / (spot * sigma * sqrtT);
+  const vega = spot * discQ * phi * sqrtT;
+
+  // Per-year theta = time-decay term − rate-carry term + dividend-carry term.
+  const decay = -(spot * discQ * phi * sigma) / (2 * sqrtT);
+  const theta = optionType === 'call'
+    ? decay - r * strike * discR * normCdf(d2) + q * spot * discQ * normCdf(d1)
+    : decay + r * strike * discR * normCdf(-d2) - q * spot * discQ * normCdf(-d1);
+
+  return { delta, gamma, vega, theta };
+}
+
 /** Calendar days between an ISO `YYYY-MM-DD` expiry and `now` (defaults to current ms). */
 export function daysToExpiration(expirationIsoDate: string, nowMs = Date.now()): number {
   const expMs = Date.parse(`${expirationIsoDate}T16:00:00-04:00`); // ~US market close ET

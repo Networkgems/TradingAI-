@@ -4416,6 +4416,20 @@ export class SignalEngine {
 
   getState(): EngineState {
     const symbols = Array.from(this.symbolState.values()).filter(s => !this.hiddenSymbols.has(s.symbol));
+    // TRA-844 — spot resolver for the portfolio Greeks rollup. The options
+    // account holds positions but not live underlying prices, so we hand it a
+    // lookup over the current symbol tape (applying the same rename map the
+    // watchlist uses so a legacy ticker still resolves a quote).
+    const spotBySymbol = new Map(
+      Array.from(this.symbolState.values()).map(s => [s.symbol.toUpperCase(), s.price] as const),
+    );
+    const resolveSpot = (symbol: string): number | undefined => {
+      const direct = spotBySymbol.get((symbol ?? '').toUpperCase());
+      if (Number.isFinite(direct) && (direct as number) > 0) return direct;
+      const aliased = aliasWatchlistSymbol((symbol ?? '').toUpperCase()).toUpperCase();
+      const viaAlias = spotBySymbol.get(aliased);
+      return Number.isFinite(viaAlias) && (viaAlias as number) > 0 ? viaAlias : undefined;
+    };
     // TRA-231 — scope signals + closed positions to the active mode so a flip
     // between Demo and Live shows each side's history independently. Legacy
     // entries persisted before TRA-231 have no `mode` stamp; route them to
@@ -4481,7 +4495,11 @@ export class SignalEngine {
         supertrendShadowSignals: this.supertrendShadowSignals,
         account: liveAccount,
         closedPositions: [],
-        options: this.optionsAccount.getStateForMode('live'),
+        options: {
+          ...this.optionsAccount.getStateForMode('live'),
+          // TRA-844 — net the open live book into portfolio Greeks + theta-$ bleed.
+          portfolioGreeks: this.optionsAccount.getPortfolioGreeks('live', resolveSpot),
+        },
         lastTick: Date.now(),
         tradingHalted: this.riskGovernor.isHalted(),
         haltReason: this.riskGovernor.getHaltReason(),
@@ -4501,7 +4519,11 @@ export class SignalEngine {
       supertrendShadowSignals: this.supertrendShadowSignals,
       account: this.buildAccountState(),
       closedPositions: this.allClosedPositions.filter(p => isMode(p.mode)).slice(-20),
-      options: this.optionsAccount.getStateForMode('demo'),
+      options: {
+        ...this.optionsAccount.getStateForMode('demo'),
+        // TRA-844 — net the open demo book into portfolio Greeks + theta-$ bleed.
+        portfolioGreeks: this.optionsAccount.getPortfolioGreeks('demo', resolveSpot),
+      },
       lastTick: Date.now(),
       tradingHalted: this.riskGovernor.isHalted(),
       haltReason: this.riskGovernor.getHaltReason(),

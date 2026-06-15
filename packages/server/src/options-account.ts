@@ -13,7 +13,10 @@ import type {
   TradierEnv,
   DayTradingGuardrailConfig,
   GuardrailVerdict,
+  PortfolioGreeks,
 } from '@trading-app/shared';
+import { computePortfolioGreeks } from './reports/portfolio-greeks.js';
+import type { SpotResolver, PortfolioGreeksOptions } from './reports/portfolio-greeks.js';
 import {
   DEFAULT_ACCOUNT_SETTINGS,
   OPTIONS_BUDGET_RATIO,
@@ -630,6 +633,23 @@ export class PaperOptionsAccount {
       demoSlippageCost: mode === 'demo' ? this.demoSlippageCost : 0,
       demoFeeCost: mode === 'demo' ? this.demoFeeCost : 0,
     };
+  }
+
+  /**
+   * TRA-844 — portfolio-level Greeks + theta-$ bleed + allocation-by-name/sector
+   * over the open options for `mode`. The account doesn't carry live underlying
+   * spots, so the caller (the engine, which does) passes a `resolveSpot` lookup;
+   * positions whose spot/IV can't be resolved still contribute premium notional
+   * to the allocation buckets but no Greeks. See {@link computePortfolioGreeks}
+   * for the valuation rules. Pure read — no mutation of account state.
+   */
+  getPortfolioGreeks(
+    mode: AccountMode,
+    resolveSpot: SpotResolver,
+    opts: PortfolioGreeksOptions = {},
+  ): PortfolioGreeks {
+    const open = Array.from(this.openOptions.values()).filter(p => (p.mode ?? 'demo') === mode);
+    return computePortfolioGreeks(open, resolveSpot, opts);
   }
 
   /**

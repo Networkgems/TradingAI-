@@ -244,8 +244,8 @@ export type {
   ShortBookCapInputs,
   ClosedShortTrade,
 } from './perp-shorts.js';
-export { blackScholesPrice, blackScholesDelta, bsImpliedVolatility, daysToExpiration } from './options/black-scholes.js';
-export type { BlackScholesInputs, ImpliedVolInputs } from './options/black-scholes.js';
+export { blackScholesPrice, blackScholesDelta, blackScholesGreeks, bsImpliedVolatility, daysToExpiration } from './options/black-scholes.js';
+export type { BlackScholesInputs, BlackScholesGreeks, ImpliedVolInputs } from './options/black-scholes.js';
 export {
   selectStructureByIv,
   selectExpiry,

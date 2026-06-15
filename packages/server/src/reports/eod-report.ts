@@ -4,11 +4,13 @@ import type {
   EodMover,
   EodSignalAccuracy,
   OptionPosition,
+  PortfolioGreeks,
   Position,
   SignalType,
 } from '@trading-app/shared';
 import { MANAGED_ACCOUNT_RATIO } from '@trading-app/shared';
 import type { EngineState, SymbolState } from '../signal-engine.js';
+import { computePortfolioGreeks } from './portfolio-greeks.js';
 
 /** Signals fired today, keyed by signal id */
 export interface DailySignalRecord {
@@ -161,13 +163,56 @@ function top5Movers(symbols: SymbolState[]): EodMover[] {
     .map(s => ({ symbol: s.symbol, price: s.price, changePct: s.changePct }));
 }
 
+/**
+ * TRA-844 — render the portfolio Greeks + theta-$ bleed + allocation rollup as
+ * Markdown sections for the EOD report. Returns an empty string when the book
+ * is empty (no open option positions) so a flat day doesn't add noise.
+ */
+function buildPortfolioGreeksMarkdown(g: PortfolioGreeks | undefined): string {
+  if (!g || g.positionsTotal === 0) return '';
+
+  const signed = (n: number, digits = 0) => (n >= 0 ? '+' : '') + n.toLocaleString('en-US', { minimumFractionDigits: digits, maximumFractionDigits: digits });
+  const usd = (n: number) => '$' + Math.abs(n).toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+  const usdSigned = (n: number) => (n >= 0 ? '+' : '-') + usd(n);
+  const pctOf = (f: number) => (f * 100).toFixed(1) + '%';
+
+  const nameRows = g.byName
+    .map(b => `| ${b.key} | ${usd(b.notional)} | ${pctOf(b.pctOfBook)} | ${b.positions} |`)
+    .join('\n');
+  const sectorRows = g.bySector
+    .map(b => `| ${b.key} | ${usd(b.notional)} | ${pctOf(b.pctOfBook)} | ${b.positions} |`)
+    .join('\n');
+
+  return `
+
+## Portfolio Greeks (Open Options)
+| Metric | Value |
+|--------|-------|
+| Net Delta (≈ shares) | ${signed(g.netDelta)} |
+| Net Gamma (Δshares / $1) | ${signed(g.netGamma)} |
+| Net Vega ($ / +1 vol pt) | ${usdSigned(g.netVega)} |
+| Theta Bleed ($ / day) | ${usdSigned(g.thetaDollarsPerDay)} |
+| Book Premium (notional) | ${usd(g.netNotional)} |
+| Greeks coverage | ${g.positionsValued}/${g.positionsTotal} positions |
+
+## Allocation by Name
+| Name | Notional | % Book | Positions |
+|------|----------|--------|-----------|
+${nameRows || '_No open option premium._'}
+
+## Allocation by Sector
+| Sector | Notional | % Book | Positions |
+|--------|----------|--------|-----------|
+${sectorRows || '_No open option premium._'}`;
+}
+
 function buildMarkdown(report: Omit<EodReport, 'markdown'>): string {
   const { date, realizedPnl, unrealizedPnl, optionsPnl, combinedPnl,
           totalEquity, managedEquity, availableCash,
           trades, openPositionCount,
           winRate, avgRR, totalTrades, winners, losers,
           expectancy, maxDrawdown, sharpeRatio,
-          top5Movers: movers, signalAccuracy } = report;
+          top5Movers: movers, signalAccuracy, portfolioGreeks } = report;
 
   const pnlSign = (n: number) => (n >= 0 ? '+' : '') + n.toFixed(2);
   const pct = (n: number) => (n * 100).toFixed(1) + '%';
@@ -224,7 +269,7 @@ ${moverRows || '_No data._'}
 | Winning Signals | ${signalAccuracy.winningSignals} |
 | Signal Win Rate | ${pct(signalAccuracy.winRate)} |
 | Avg R:R | 1:${signalAccuracy.avgRR.toFixed(2)} |
-`;
+${buildPortfolioGreeksMarkdown(portfolioGreeks)}`;
 }
 
 export interface ReportInput {
@@ -329,6 +374,16 @@ export function generateEodReport(input: ReportInput, asOfDate?: string): EodRep
   // Top 5 movers
   const movers = top5Movers(state.symbols);
 
+  // TRA-844 — portfolio Greeks + theta-$ bleed + allocation rollup over the
+  // open options book. Spot is resolved off the same symbol tape the report
+  // already carries; positions whose spot/IV can't be solved still contribute
+  // premium notional to the allocation buckets (just no Greeks).
+  const spotBySymbol = new Map(state.symbols.map(s => [s.symbol.toUpperCase(), s.price] as const));
+  const portfolioGreeks = computePortfolioGreeks(
+    state.options.openOptions,
+    (symbol: string) => spotBySymbol.get((symbol ?? '').toUpperCase()),
+  );
+
   // Signal accuracy
   const todaySignals = dailySignals.filter(s => dateString(s.firedAt) === today);
   const winningSignals = todaySignals.filter(s => s.outcome === 'win').length;
@@ -364,6 +419,7 @@ export function generateEodReport(input: ReportInput, asOfDate?: string): EodRep
     sharpeRatio,
     top5Movers: movers,
     signalAccuracy,
+    portfolioGreeks,
   };
 
   return { ...partial, markdown: buildMarkdown(partial) };

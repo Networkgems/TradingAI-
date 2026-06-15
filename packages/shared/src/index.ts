@@ -2087,6 +2087,68 @@ export interface OptionPosition {
   breakevens?: number[];
 }
 
+/**
+ * TRA-844 — one row of the portfolio allocation rollup (by underlying name or
+ * by sector). `notional` is the market value of open option premium attributed
+ * to the bucket (current mark × contracts × 100, falling back to premium paid
+ * when no live mark is available); `pctOfBook` is that as a fraction of the
+ * total valued premium in [0,1]. Buckets are returned sorted by `notional`
+ * descending so the dashboard panel and EOD markdown can render the
+ * concentration story top-down.
+ */
+export interface AllocationBucket {
+  /** Underlying ticker or sector name this bucket aggregates. */
+  key: string;
+  /** Market value of open option premium in this bucket, USD. */
+  notional: number;
+  /** `notional` as a fraction of the whole book's valued premium, [0,1]. */
+  pctOfBook: number;
+  /** How many open option positions rolled into this bucket. */
+  positions: number;
+}
+
+/**
+ * TRA-844 — portfolio-level aggregate Greeks, daily theta-$ bleed, and
+ * allocation-by-name/sector for the open options book. Closes the issue's
+ * "biggest risk blind spot": before this, the dashboard showed per-position
+ * marks but never the netted directional/convexity/vol exposure or how
+ * concentrated the book was.
+ *
+ * Greek aggregates are expressed in book dollar/share terms (already scaled by
+ * contracts × 100):
+ *   • `netDelta`  — equivalent shares of underlying exposure (Σ delta × qty × 100).
+ *   • `netGamma`  — Δdelta (shares) per $1 underlying move (Σ gamma × qty × 100).
+ *   • `netVega`   — $ P&L per +1 IV vol-point across the book.
+ *   • `thetaDollarsPerDay` — $ the book bleeds per calendar day from time decay
+ *     (negative for a net-long-premium book — the common case here).
+ *
+ * `positionsValued` / `positionsTotal` expose how many open positions had a
+ * usable spot+IV solve and contributed Greeks; the gap is combos / positions
+ * with no current mark or no resolvable spot, which still contribute notional
+ * to the allocation buckets but contribute zero Greeks (honest under-count
+ * rather than a fabricated number). Optional throughout for back-compat with
+ * persisted state / reports that predate the rollup.
+ */
+export interface PortfolioGreeks {
+  netDelta: number;
+  netGamma: number;
+  netVega: number;
+  /** Net daily time-decay in dollars (negative = the book bleeds theta). */
+  thetaDollarsPerDay: number;
+  /** Total market value of open option premium across the book, USD. */
+  netNotional: number;
+  /** Open positions that contributed Greeks (had a spot + IV solve). */
+  positionsValued: number;
+  /** Total open positions considered (valued + Greek-less notional-only). */
+  positionsTotal: number;
+  /** Allocation by underlying name, sorted by notional descending. */
+  byName: AllocationBucket[];
+  /** Allocation by sector bucket, sorted by notional descending. */
+  bySector: AllocationBucket[];
+  /** Unix ms the rollup was computed. */
+  asOf: number;
+}
+
 export interface OptionsAccountState {
   openOptions: OptionPosition[];
   closedOptions: OptionPosition[];
@@ -2115,6 +2177,14 @@ export interface OptionsAccountState {
    * {@link demoSlippageCost}.
    */
   demoFeeCost?: number;
+  /**
+   * TRA-844 — portfolio-level Greeks + theta-$ bleed + allocation rollup over
+   * `openOptions`. Computed by the engine (which has live underlying spots) and
+   * attached to the per-mode options state; absent when the engine couldn't
+   * resolve spots or on persisted state files that predate the rollup, so the
+   * dashboard panel must treat it as optional.
+   */
+  portfolioGreeks?: PortfolioGreeks;
 }
 
 export const WATCHLIST: readonly string[] = [
@@ -2132,6 +2202,40 @@ export const WATCHLIST: readonly string[] = [
 // to know that `WATCHLIST` is historically equities. Existing imports of
 // `WATCHLIST` keep working — additive only.
 export const EQUITIES_WATCHLIST = WATCHLIST;
+
+/**
+ * TRA-844 — coarse GICS-style sector buckets for the equity/options universe,
+ * used by the portfolio Greeks + allocation rollup to group exposure by sector
+ * (the "biggest risk blind spot" the issue closes — e.g. seeing that 70% of
+ * option premium sits in mega-cap Tech). Keyed by the underlying ticker an
+ * option is written on. Broad-market index ETFs (SPY/QQQ/…) bucket to `Index`
+ * and `*-USD` tickers to `Crypto`; anything unmapped falls through to `Other`
+ * via {@link sectorOf} so a newly-added symbol degrades gracefully rather than
+ * throwing. Deliberately hand-maintained (no live GICS feed) — it only needs to
+ * cover the {@link WATCHLIST} names the options scanners actually trade.
+ */
+export const SECTOR_BY_SYMBOL: Readonly<Record<string, string>> = {
+  AAPL: 'Technology', MSFT: 'Technology', NVDA: 'Technology', AMD: 'Technology',
+  AVGO: 'Technology', INTC: 'Technology', QCOM: 'Technology', ORCL: 'Technology',
+  CRM: 'Technology', ADBE: 'Technology',
+  GOOGL: 'Communication Services', META: 'Communication Services', NFLX: 'Communication Services',
+  AMZN: 'Consumer Discretionary', TSLA: 'Consumer Discretionary', SHOP: 'Consumer Discretionary',
+  PYPL: 'Financials', XYZ: 'Financials', COIN: 'Financials', MSTR: 'Financials', XLF: 'Financials',
+  SPY: 'Index', QQQ: 'Index', IWM: 'Index', DIA: 'Index',
+};
+
+/**
+ * TRA-844 — resolve a symbol's sector bucket for the portfolio rollup. Applies
+ * the {@link aliasWatchlistSymbol} rename map first (so a legacy `SQ` position
+ * resolves to `XYZ`'s Financials bucket), then `*-USD` → `Crypto`, the explicit
+ * {@link SECTOR_BY_SYMBOL} map, and finally `Other` for anything unmapped.
+ */
+export function sectorOf(symbol: string): string {
+  const upper = (symbol ?? '').toUpperCase();
+  if (/-USD$/i.test(upper)) return 'Crypto';
+  const aliased = aliasWatchlistSymbol(upper).toUpperCase();
+  return SECTOR_BY_SYMBOL[aliased] ?? 'Other';
+}
 
 /**
  * Map known stale tickers to their renamed equivalents at read time so users
@@ -2785,6 +2889,13 @@ export interface EodReport {
 
   // Signal accuracy
   signalAccuracy: EodSignalAccuracy;
+
+  /**
+   * TRA-844 — portfolio-level Greeks + theta-$ bleed + allocation-by-name/sector
+   * over the open options book at report time. Optional for back-compat with
+   * reports persisted before the rollup landed (readers render "—" when absent).
+   */
+  portfolioGreeks?: PortfolioGreeks;
 
   // Markdown report body
   markdown: string;
