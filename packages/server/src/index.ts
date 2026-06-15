@@ -9,6 +9,12 @@ import { MarketScheduler, isMarketDay, missedTradingDays } from './scheduler.js'
 import { generateEodReport } from './reports/eod-report.js';
 import { generateCryptoEodReport } from './reports/crypto-eod-report.js';
 import {
+  computeOptionsAlerts,
+  scanTargetStop,
+  diffChain,
+  toAlertEvents,
+} from './reports/options-alert-engine.js';
+import {
   aggregateCashFlowByDate,
   aggregateRealizedOptionsPnl,
   computeBalanceDailyPnl,
@@ -20,6 +26,7 @@ import { checkThrottle, recordFailure, recordSuccess } from './auth-throttle.js'
 import { getSettings, loadSettings, mergeScopedRiskSettings, saveSettings } from './account-settings.js';
 import {
   initNotificationDispatcher,
+  emitAlert,
   registerChannelAdapters,
   buildSampleAlertEvent,
   issueLinkToken,
@@ -1425,6 +1432,58 @@ async function runChainRecord(): Promise<void> {
   }
 }
 
+// TRA-845 — Layer-4 alert push. Runs right after the daily chain capture so it
+// diffs the freshly-written partition against yesterday's. Chain-diff + IV-move
+// alerts are global (same chain for everyone) and pushed to every user; the
+// target/stop scan is per-user over that user's active-mode open book. Each
+// alert is mapped onto an options `signal` event and handed to `emitAlert`,
+// which fans it through the existing dispatcher — so per-user channel/quiet-hour
+// prefs (and the dedup window) decide who actually gets pinged. Kill switch:
+// `OPTIONS_ALERT_PUSH=off`. Fully isolated: a failure here never affects the
+// capture (the caller wraps it) and a single user's error never aborts the loop.
+async function runOptionsAlertPush(): Promise<void> {
+  if ((process.env['OPTIONS_ALERT_PUSH'] ?? '').trim().toLowerCase() === 'off') {
+    log.info('options-alert push disabled (OPTIONS_ALERT_PUSH=off)');
+    return;
+  }
+  const days = await loadChainDays(CHAIN_RECORD_OUT_DIR);
+  if (days.length < 2) {
+    log.info('options-alert push skipped — need 2 chain partitions', { have: days.length });
+    return;
+  }
+  const prevDay = days[days.length - 2];
+  const todayDay = days[days.length - 1];
+
+  // Global chain-diff + IV-move alerts: computed once, shared across users.
+  const chainAlerts = [...todayDay.bySymbol.entries()]
+    .sort()
+    .flatMap(([symbol, today]) => {
+      const prev = prevDay.bySymbol.get(symbol);
+      return prev ? diffChain(prev, today) : [];
+    });
+
+  let pushed = 0;
+  for (const ctx of getAllUserContexts()) {
+    try {
+      const openOptions = ctx.engine.getState().options.openOptions ?? [];
+      const positionAlerts = scanTargetStop(openOptions);
+      const events = toAlertEvents([...positionAlerts, ...chainAlerts], ctx.username);
+      for (const ev of events) emitAlert(ev);
+      pushed += events.length;
+    } catch (err) {
+      log.warn('options-alert push failed for user', {
+        username: ctx.username,
+        reason: err instanceof Error ? err.message : String(err),
+      });
+    }
+  }
+  log.info('options-alert push complete', {
+    chainAlerts: chainAlerts.length,
+    eventsEmitted: pushed,
+    dates: [prevDay.date, todayDay.date],
+  });
+}
+
 // TRA-822 (TRA-820 Step 1) — daily StockTwits sentiment-snapshot logger. Runs on
 // the SAME 3:55 PM ET hook as the chain recorder so the two snapshots
 // co-accumulate on the persistent disk (the IC/flow study joins them per
@@ -1691,6 +1750,45 @@ app.get('/api/options/ideas', requireAuth, async (_req, res) => {
   const anthropicApiKey = getUserAnthropicApiKey(ctx.username);
   const feed = await buildIdeasFeed({ client, symbols, anthropicApiKey });
   res.json(feed);
+});
+
+// TRA-845 — Layer-4 options alert engine. Diffs the last two recorded chain
+// partitions (new strikes/expiries + big IV moves) and scans the authed user's
+// OPEN options book for target/stop hits. Read-only: it never mutates account
+// state and never pushes — the daily chain-record hook owns the optional push.
+// Returns `{ alerts, counts, symbolsDiffed, chainDates }`; degrades to an empty
+// alert set (never 500s) when fewer than two chain days are on disk.
+app.get('/api/options/alerts', requireAuth, async (_req, res) => {
+  const ctx = await userCtx(res);
+  try {
+    const days = await loadChainDays(CHAIN_RECORD_OUT_DIR);
+    const openOptions = ctx.engine.getState().options.openOptions ?? [];
+    if (days.length < 2) {
+      const positionAlerts = scanTargetStop(openOptions);
+      res.json({
+        issue: 'TRA-845',
+        chainDates: days.map((d) => d.date),
+        symbolsDiffed: [],
+        counts: { new_expiry: 0, new_strike: 0, iv_move: 0, target_hit: positionAlerts.filter((a) => a.kind === 'target_hit').length, stop_hit: positionAlerts.filter((a) => a.kind === 'stop_hit').length },
+        alerts: positionAlerts,
+        note: 'fewer than 2 chain partitions on disk — chain-diff skipped, target/stop only',
+      });
+      return;
+    }
+    const prevDay = days[days.length - 2];
+    const todayDay = days[days.length - 1];
+    const result = computeOptionsAlerts({
+      prevBySymbol: prevDay.bySymbol,
+      todayBySymbol: todayDay.bySymbol,
+      openOptions,
+    });
+    res.json({ issue: 'TRA-845', chainDates: [prevDay.date, todayDay.date], ...result });
+  } catch (err) {
+    log.error('options-alerts probe failed', {
+      reason: err instanceof Error ? err.message : String(err),
+    });
+    res.status(500).json({ error: 'options-alerts probe failed' });
+  }
 });
 
 // TRA-714 — per-user Anthropic console API-key management for the AI Ideas feed.
@@ -5105,6 +5203,13 @@ scheduler.start({
     await runChainRecord();
     await runSentimentSnapshot().catch((err) =>
       log.error('sentiment-recorder failed', {
+        reason: err instanceof Error ? err.message : String(err),
+      }),
+    );
+    // TRA-845 — diff the just-captured chain vs yesterday and push Layer-4 alerts.
+    // Isolated so a push failure can't drop the capture above (or vice-versa).
+    await runOptionsAlertPush().catch((err) =>
+      log.error('options-alert push failed', {
         reason: err instanceof Error ? err.message : String(err),
       }),
     );

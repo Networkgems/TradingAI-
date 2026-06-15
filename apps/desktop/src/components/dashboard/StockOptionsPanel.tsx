@@ -11,6 +11,7 @@ import { useStockOptionClose } from '../../hooks/useStockOptionClose';
 import { CloseOptionDrawer } from './CloseOptionDrawer';
 import { AccountSummaryCard } from './AccountSummaryCard';
 import { PortfolioGreeksPanel } from './PortfolioGreeksPanel';
+import { OptionsAlertsPanel } from './OptionsAlertsPanel';
 
 export function StockOptionsPanel({
   token,
@@ -51,6 +52,9 @@ export function StockOptionsPanel({
       {/* TRA-844 — portfolio Greeks + theta-$ bleed + allocation-by-name/sector
           over the open options book. Renders nothing when the book is empty. */}
       <PortfolioGreeksPanel greeks={optionsState?.portfolioGreeks} />
+      {/* TRA-845 — Layer-4 alert engine: new strikes/expiries + big IV moves
+          (chain-diff) and target/stop hits, from /api/options/alerts. */}
+      <OptionsAlertsPanel token={token} />
       {/* TRA-323 — pull open option positions from Tradier into TradeAI so they
           can be closed from here. The button targets the Tradier env selected
           in Settings; the toast that follows reports the count summary. */}
