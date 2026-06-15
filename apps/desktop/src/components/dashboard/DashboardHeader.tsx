@@ -15,6 +15,7 @@ import { startTour } from '../onboarding/tour';
 import { AccountModeSwitcher } from '../AccountModeSwitcher';
 import { KillSwitchButton } from './KillSwitchButton';
 import { TradingAgentsButton } from './TradingAgentsButton';
+import { AgentGatingButton } from './AgentGatingButton';
 import { VersionChip } from './VersionChip';
 import type { ProfileModal } from './ProfileModals';
 
@@ -30,6 +31,7 @@ export function DashboardHeader({
   autoTradingEnabled,
   killSwitchEngaged,
   tradingAgentsEnabled,
+  tradingAgentsGatingEnabled,
   accountMode,
   onAccountModeChange,
   theme,
@@ -52,6 +54,10 @@ export function DashboardHeader({
   /** TRA-544 — seed for the "Trading Agents" banner toggle (true ↔ the
    *  multi-agent layer is the active decision-maker). */
   tradingAgentsEnabled: boolean;
+  /** TRA-895 (TRA-796) — seed for the demo-only "Auto-Trade" gating toggle
+   *  (true ↔ agents auto-route paper orders). Optional so a pre-TRA-796 server
+   *  state still type-checks. */
+  tradingAgentsGatingEnabled?: boolean;
   accountMode: 'demo' | 'live';
   onAccountModeChange: (mode: 'demo' | 'live') => void;
   theme: Theme;
@@ -103,6 +109,18 @@ export function DashboardHeader({
             deterministic auto-router. */}
         <div className="trading-agents-group">
           <TradingAgentsButton token={token} enabled={tradingAgentsEnabled} />
+          {/* TRA-895 (TRA-796) — demo-only gating switch. Rendered only in demo
+              (paper) mode so it can never arm live routing; it turns the agents
+              from advisory-only into actually opening/monitoring/closing paper
+              trades. Live agent routing stays behind the API-only board+CTO
+              go-live gate. */}
+          {accountMode === 'demo' && (
+            <AgentGatingButton
+              token={token}
+              enabled={tradingAgentsGatingEnabled ?? false}
+              agentsEnabled={tradingAgentsEnabled}
+            />
+          )}
         </div>
         <div className="stat-divider" />
         {account && (

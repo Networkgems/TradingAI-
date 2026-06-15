@@ -25,6 +25,15 @@ export interface AppState {
   // decision-maker (deterministic auto-routing suspended). Optional so a
   // pre-TRA-544 server still type-checks against this state.
   tradingAgentsEnabled?: boolean;
+  // TRA-796 / TRA-895 — gating mode. When BOTH tradingAgentsEnabled and
+  // tradingAgentsGatingEnabled are on, an agent APPROVE recommendation is
+  // auto-routed as a risk-checked order. In demo mode that means the agents
+  // actually open/monitor/close paper trades (advisory-only when gating is
+  // off). LIVE routing additionally requires tradingAgentsLiveGatingEnabled —
+  // the board+CTO go-live gate. Optional so a pre-TRA-796 server still
+  // type-checks against this state.
+  tradingAgentsGatingEnabled?: boolean;
+  tradingAgentsLiveGatingEnabled?: boolean;
   // TRA-544 — latest advisory recommendations from the multi-agent layer (P1
   // deterministic stub). Empty/absent when the layer is off.
   agentRecommendations?: AgentRecommendation[];
