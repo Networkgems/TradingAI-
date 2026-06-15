@@ -2936,6 +2936,78 @@ export class SignalEngine {
     return this.tradingAgentsLiveGatingEnabled;
   }
 
+  /** TRA-848 — the pending advisory recommendations, for the inbound chat surface. */
+  getAgentRecommendations(): AgentRecommendation[] {
+    return this.latestAgentRecommendations;
+  }
+
+  /**
+   * TRA-848 — resolve a recommendation by the human's chat target. Matches the
+   * stable proposedSignal id (`agent-<symbol>-<asOf>`) first, then falls back to
+   * a case-insensitive symbol match (so "approve AAPL" works from a phone where
+   * the full id is awkward to type). Returns the newest match when a symbol has
+   * several open recommendations.
+   */
+  private findRecommendationByTarget(target: string): AgentRecommendation | undefined {
+    const t = target.trim();
+    const byId = this.latestAgentRecommendations.find(r => r.proposedSignal?.id === t);
+    if (byId) return byId;
+    const sym = t.toUpperCase();
+    const matches = this.latestAgentRecommendations.filter(r => r.symbol.toUpperCase() === sym);
+    return matches.length ? matches[matches.length - 1] : undefined;
+  }
+
+  /**
+   * TRA-848 — human-in-the-loop manual APPROVE of one advisory recommendation
+   * from the chat surface. This is the explicit human gate, so it routes the
+   * recommendation's proposedSignal even when the automatic TRA-796 gating toggle
+   * is OFF (the default display-only TRA-747 posture). It NEVER bypasses risk:
+   * the order still clears every RiskManager hard cap + the dedup in
+   * {@link routeEquitySignal}, the TRA-526 kill switch / daily circuit-breaker
+   * halts everything, and a LIVE route still requires the board+CTO go-live flag
+   * ({@link tradingAgentsLiveGatingEnabled}). The matched reco is dropped from the
+   * pending set on a successful open so a second tap can't double-fire.
+   */
+  async approveRecommendationById(
+    target: string,
+    price: number | undefined,
+  ): Promise<{ ok: boolean; reason: string }> {
+    const reco = this.findRecommendationByTarget(target);
+    if (!reco) return { ok: false, reason: `no pending recommendation for "${target}"` };
+    if (reco.verdict !== 'APPROVE' || !reco.proposedSignal) {
+      return { ok: false, reason: `${reco.symbol} is ${reco.verdict} — nothing routable to approve` };
+    }
+    if (this.riskGovernor.isHalted()) {
+      return { ok: false, reason: `trading halted: ${this.riskGovernor.getHaltReason() ?? 'risk circuit-breaker'}` };
+    }
+    if (this.mode === 'live' && !this.tradingAgentsLiveGatingEnabled) {
+      return { ok: false, reason: 'live routing disabled until the board+CTO go-live gate is cleared' };
+    }
+    const signal = reco.proposedSignal;
+    if (this.routedAgentSignalIds.has(signal.id)) {
+      return { ok: false, reason: `${reco.symbol} already routed` };
+    }
+    const pos = await this.routeEquitySignal(signal, price, 'agent-gating');
+    if (!pos) {
+      return { ok: false, reason: signal.signalSkipReason ?? `${reco.symbol} not opened (no quote / dedup / risk gate)` };
+    }
+    this.routedAgentSignalIds.add(signal.id);
+    // Drop the routed reco so it no longer shows as pending on the chat surface.
+    this.latestAgentRecommendations = this.latestAgentRecommendations.filter(r => r !== reco);
+    return { ok: true, reason: `routed ${signal.side} ${reco.symbol} (${this.mode})` };
+  }
+
+  /**
+   * TRA-848 — human REJECT: drop the matched recommendation from the pending set
+   * so it neither shows on the chat surface nor auto-routes under TRA-796 gating.
+   */
+  rejectRecommendationById(target: string): { ok: boolean; reason: string } {
+    const reco = this.findRecommendationByTarget(target);
+    if (!reco) return { ok: false, reason: `no pending recommendation for "${target}"` };
+    this.latestAgentRecommendations = this.latestAgentRecommendations.filter(r => r !== reco);
+    return { ok: true, reason: `rejected ${reco.symbol} (dropped)` };
+  }
+
   /**
    * TRA-544 — the gate the deterministic entry-routing paths consult. It is the
    * per-mode auto-trading flag AND-ed with "agents are OFF": when the operator

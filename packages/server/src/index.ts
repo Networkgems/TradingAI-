@@ -33,8 +33,12 @@ import {
   consumeLinkToken,
   parseStartCommand,
   isValidDiscordWebhook,
+  parseCommand,
+  executeCommand,
+  type CommandContext,
   type ChannelAdapter,
 } from './notifications/index.js';
+import { LLM_KILL_ENV_VAR } from './trading-agents-advisory.js';
 import {
   initWatchlistStore,
   getCryptoWatchlistData,
@@ -3582,10 +3586,111 @@ app.post('/api/notifications/telegram/link', requireAuth, (req, res) => {
   res.json({ ok: true, token, deepLink, botUsername: botUsername ?? null });
 });
 
+// TRA-848 — true when the agent-layer kill switch (TRADING_AGENTS_LLM_DISABLED)
+// is engaged. Mirrors the truthy set used by the advisory layer; gates the
+// capital-affecting inbound verbs (approve/reject) without disabling reads.
+function isAgentKillSwitchEngaged(): boolean {
+  const raw = process.env[LLM_KILL_ENV_VAR];
+  if (raw == null) return false;
+  return ['1', 'true', 'yes', 'on'].includes(raw.trim().toLowerCase());
+}
+
+// TRA-848 — reverse of account-linking: map an inbound Telegram chat id back to
+// the linked app user. The chat id is the auth token here — it was bound only
+// via the single-use `/start <token>` flow, so a known chat id IS an
+// authenticated user (the link-token auth boundary the issue calls for). Returns
+// undefined for any chat we have not linked, so an unsolicited message is
+// silently ignored rather than acted on.
+function resolveUsernameByTelegramChat(chatId: string): string | undefined {
+  for (const ctx of getAllUserContexts()) {
+    const prefs = resolveAlertPreferences(getSettings(ctx.username));
+    if (prefs.channels.telegram.telegramChatId === chatId) return ctx.username;
+  }
+  return undefined;
+}
+
+// TRA-848 — send one plain-text reply on the inbound Telegram chat. Fire-and-
+// forget: a failed reply must never 500 the webhook (Telegram expects a fast
+// 200 and retries on non-2xx).
+async function sendTelegramReply(chatId: string, text: string): Promise<void> {
+  const botToken = process.env['TELEGRAM_BOT_TOKEN'];
+  if (!botToken) return;
+  try {
+    await fetch(`https://api.telegram.org/bot${botToken}/sendMessage`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ chat_id: chatId, text, disable_web_page_preview: true }),
+    });
+  } catch (err) {
+    log.warn('telegram reply failed', { reason: err instanceof Error ? err.message : String(err) });
+  }
+}
+
+// TRA-848 — assemble the injectable CommandContext the router runs against,
+// reading from this user's live engine state. Read renderers are deliberately
+// plain text (chat-friendly); approve/reject delegate to the engine's
+// human-in-the-loop methods, which keep every risk + live-gate control.
+function buildTelegramCommandContext(username: string): CommandContext {
+  const ctx = tryGetUserContext(username);
+  const engine = ctx?.engine;
+  const fmt = (n: number): string => (n >= 0 ? '+' : '') + n.toFixed(2);
+  const priceFor = (symbol: string): number | undefined => {
+    const s = engine?.getState().symbols.find(x => x.symbol.toUpperCase() === symbol.toUpperCase());
+    return s?.price;
+  };
+  return {
+    killSwitchEngaged: isAgentKillSwitchEngaged(),
+    status: () => {
+      if (!engine) return 'No active session.';
+      const st = engine.getState();
+      const a = st.account;
+      return [
+        `Equity $${a.totalEquity.toFixed(2)}  Cash $${a.availableCash.toFixed(2)}`,
+        `Day P&L ${fmt(a.dailyPnl)}  Open ${a.openPositions.length}`,
+        `Market ${st.marketOpen ? 'OPEN' : 'closed'}  Auto ${st.autoTradingEnabled ? 'on' : 'off'}` +
+          `  Agents ${st.tradingAgentsEnabled ? 'on' : 'off'}` +
+          (st.tradingHalted ? `  HALTED (${st.haltReason ?? 'risk'})` : ''),
+      ].join('\n');
+    },
+    scan: () => {
+      if (!engine) return 'No active session.';
+      const sigs = engine.getState().signals.slice(-5);
+      if (sigs.length === 0) return 'Scan: no recent signals.';
+      return ['Recent signals:', ...sigs.map(s => `  ${s.symbol} ${s.side} ${s.type} @ ${s.entryPrice.toFixed(2)}`)].join('\n');
+    },
+    positions: () => {
+      if (!engine) return 'No active session.';
+      const pos = engine.getState().account.openPositions;
+      if (pos.length === 0) return 'No open positions.';
+      return ['Open positions:', ...pos.map(p => `  ${p.symbol} ${p.side} x${p.quantity} @ ${p.entryPrice.toFixed(2)}`)].join('\n');
+    },
+    pendingRecommendations: () =>
+      (engine?.getAgentRecommendations() ?? []).map(r => ({
+        id: r.proposedSignal?.id ?? `agent-${r.symbol}-${r.asOf}`,
+        symbol: r.symbol,
+        verdict: r.verdict,
+        action: r.action,
+        conviction: r.conviction,
+      })),
+    approve: async target => {
+      if (!engine) return { ok: false, message: 'No active session.' };
+      const r = await engine.approveRecommendationById(target, priceFor(target.toUpperCase()) ?? priceFor(target));
+      return { ok: r.ok, message: r.ok ? `APPROVED — ${r.reason}` : `Cannot approve: ${r.reason}` };
+    },
+    reject: target => {
+      if (!engine) return { ok: false, message: 'No active session.' };
+      const r = engine.rejectRecommendationById(target);
+      return { ok: r.ok, message: r.ok ? `REJECTED — ${r.reason}` : `Cannot reject: ${r.reason}` };
+    },
+  };
+}
+
 // Telegram webhook receiver — records the chat_id for a `/start <token>` deep
-// link. Unauthenticated (Telegram calls it) but gated by the secret token
-// configured via setWebhook (`TELEGRAM_WEBHOOK_SECRET`); without it the route
-// is closed so it can never be used to write arbitrary prefs.
+// link (account linking, TRA-566) AND, post-link, handles inbound conversational
+// control commands (TRA-848). Unauthenticated at the transport (Telegram calls
+// it) but gated by the secret token configured via setWebhook
+// (`TELEGRAM_WEBHOOK_SECRET`); without it the route is closed. Command handling
+// is further gated by chat-id↔user resolution (the link-token auth boundary).
 app.post('/api/notifications/telegram/webhook', async (req, res) => {
   const secret = process.env['TELEGRAM_WEBHOOK_SECRET'];
   if (!secret || req.header('x-telegram-bot-api-secret-token') !== secret) {
@@ -3601,6 +3706,7 @@ app.post('/api/notifications/telegram/webhook', async (req, res) => {
     const chatId = update?.message?.chat?.id;
     const token = parseStartCommand(text);
     if (token && chatId != null) {
+      // ── Account linking (TRA-566) ──
       const username = consumeLinkToken(token);
       if (username) {
         const current = await loadSettings(username);
@@ -3609,8 +3715,22 @@ app.post('/api/notifications/telegram/webhook', async (req, res) => {
         prefs.channels.telegram.enabled = true;
         await saveSettings(username, { ...current, alertPreferences: prefs });
         log.info('telegram chat linked', { username });
+        await sendTelegramReply(String(chatId), 'Linked. Send "help" for commands.');
       } else {
         log.debug('telegram link token unknown/expired');
+      }
+    } else if (text && chatId != null) {
+      // ── Inbound conversational control (TRA-848) ──
+      const cmd = parseCommand(text);
+      if (cmd) {
+        const username = resolveUsernameByTelegramChat(String(chatId));
+        if (!username) {
+          // Unlinked chat — do not act; nudge the user to link first.
+          await sendTelegramReply(String(chatId), 'This chat is not linked. Use Settings → Notifications → Link to connect.');
+        } else {
+          const reply = await executeCommand(cmd, buildTelegramCommandContext(username));
+          await sendTelegramReply(String(chatId), reply);
+        }
       }
     }
   } catch (err) {

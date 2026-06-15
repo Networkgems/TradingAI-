@@ -49,3 +49,13 @@ export {
   __resetLinkTokensForTest,
   LINK_TOKEN_TTL_MS,
 } from './telegram-link.js';
+
+// TRA-848 — inbound conversational-control (commands + approve/reject).
+export { parseCommand } from './inbound/command-parser.js';
+export type { InboundCommand } from './inbound/command-parser.js';
+export { executeCommand, HELP_TEXT, KILL_SWITCH_NOTICE } from './inbound/command-router.js';
+export type {
+  CommandContext,
+  RecommendationSummary,
+  ActionResult,
+} from './inbound/command-router.js';
