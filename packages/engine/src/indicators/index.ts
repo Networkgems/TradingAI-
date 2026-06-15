@@ -39,6 +39,19 @@ export type {
   OrbSignalType,
 } from './opening-range-box.js';
 export {
+  maPullbackScalp,
+  retracementWinRate,
+  SCALP_DEFAULTS,
+  SCALP_TIERS,
+} from './ma-pullback-scalp.js';
+export type {
+  PullbackScalpOptions,
+  PullbackScalpSignal,
+  RetracementLevel,
+  ScalpSetup,
+  MaType,
+} from './ma-pullback-scalp.js';
+export {
   composeTechnicalSnapshot,
   composeTimeframeSignal,
   resampleCandles,
