@@ -19,6 +19,7 @@ export type {
   SignalAlertEvent,
   RiskHaltAlertEvent,
   BriefingAlertEvent,
+  RoutineAlertEvent,
   BriefMacroIndex,
   BriefSetup,
   BriefPosition,
@@ -63,6 +64,7 @@ export type {
   CommandContext,
   RecommendationSummary,
   ActionResult,
+  RoutineSummary,
 } from './inbound/command-router.js';
 
 // TRA-852 — Discord Interactions transport (Ed25519 verify + interaction map).

@@ -139,6 +139,17 @@ function nowET(): { hour: number; minute: number; date: Date } {
 
 export type EodTriggerCallback = () => void | Promise<void>;
 
+/** ET wall-clock parts for the current scheduler tick. */
+export interface EtTick {
+  hour: number;
+  minute: number;
+  /** ET calendar date, `YYYY-MM-DD`. */
+  date: string;
+}
+
+/** TRA-851 — per-tick callback that receives the current ET time. */
+export type RoutineTickCallback = (et: EtTick) => void | Promise<void>;
+
 export interface ScheduleCallbacks {
   /** Fires at 4:05 PM ET on stock-market trading days (Mon–Fri, non-holiday). */
   onMarketClose?: EodTriggerCallback;
@@ -201,6 +212,13 @@ export interface ScheduleCallbacks {
    * alert checks own their throttling and thresholds.
    */
   onMonitor?: EodTriggerCallback;
+  /**
+   * TRA-851 — fires on every 60s scheduler tick with the current ET time so the
+   * routine runner can match user-defined fire times to the minute. Like
+   * `onMonitor` it is not time-gated here; the runner owns the per-routine
+   * time match, market-day gate, and per-ET-day dedup.
+   */
+  onRoutineTick?: RoutineTickCallback;
 }
 
 /**
@@ -368,6 +386,16 @@ export class MarketScheduler {
       if (cfg.onMonitor) {
         Promise.resolve(cfg.onMonitor()).catch(err =>
           log.error('monitor callback error', {
+            reason: err instanceof Error ? err.message : String(err),
+          }),
+        );
+      }
+
+      // TRA-851 — user-routine tick. Runs every tick with the ET time; the
+      // runner matches user-defined fire times + dedups per ET day.
+      if (cfg.onRoutineTick) {
+        Promise.resolve(cfg.onRoutineTick({ hour, minute, date: todayKey })).catch(err =>
+          log.error('routine tick error', {
             reason: err instanceof Error ? err.message : String(err),
           }),
         );

@@ -5,7 +5,7 @@ import { writeFile, readFile, readdir, stat } from 'fs/promises';
 import { existsSync } from 'fs';
 import { join, dirname } from 'path';
 import { fileURLToPath } from 'url';
-import { MarketScheduler, isMarketDay, missedTradingDays } from './scheduler.js';
+import { MarketScheduler, isMarketDay, isMarketDayIso, missedTradingDays, etDateString } from './scheduler.js';
 import { generateEodReport } from './reports/eod-report.js';
 import { generateCryptoEodReport } from './reports/crypto-eod-report.js';
 import {
@@ -41,8 +41,10 @@ import {
   DISCORD_INTERACTION_TYPE,
   DISCORD_RESPONSE_TYPE,
   DISCORD_EPHEMERAL_FLAG,
+  renderAlert,
   type CommandContext,
   type ChannelAdapter,
+  type RoutineSummary,
 } from './notifications/index.js';
 import { LLM_KILL_ENV_VAR } from './trading-agents-advisory.js';
 import {
@@ -56,7 +58,19 @@ import {
 } from './watchlist-store.js';
 import { scanStocksMarket, scanCryptoMarket } from './market-scanner.js';
 import { runPremarketForAllUsers } from './premarket-watchlist.js';
-import { runMorningBriefForAllUsers } from './morning-brief.js';
+import { runMorningBriefForAllUsers, buildBriefForUser, buildMacroSection } from './morning-brief.js';
+// TRA-851 — user-configurable natural-language routines.
+import {
+  loadRoutineStore,
+  listRoutinesSync,
+  usersWithRoutinesSync,
+  addRoutine as addRoutineToStore,
+  removeRoutine as removeRoutineFromStore,
+  setRoutineEnabled as setRoutineEnabledInStore,
+  type StoredRoutine,
+} from './routines/routine-store.js';
+import { parseRoutine, filterLabel, formatScan } from './routines/routine-spec.js';
+import { RoutineRunner, type RoutineRendered } from './routines/routine-runner.js';
 import { recordOptionChains } from './options-chain-recorder.js';
 import { recordSentimentSnapshot } from './sentiment-snapshot-recorder.js';
 import {
@@ -418,6 +432,11 @@ await initShadowLedger();
 // preferences immediately. Appended to as users state preferences or as
 // approve/reject interactions accrue.
 await loadUserMemoryStore();
+
+// TRA-851 — warm the per-user routine store so the synchronous reads the
+// scheduler's routine tick does (`listRoutinesSync`/`usersWithRoutinesSync`)
+// have each user's defined routines immediately, and they survive a restart.
+await loadRoutineStore();
 
 const app = express();
 // TRA-404 — behind Render's proxy the socket address is the proxy, not the
@@ -3777,7 +3796,87 @@ function buildCommandContext(username: string): CommandContext {
       const r = engine.rejectRecommendationById(target);
       return { ok: r.ok, message: r.ok ? `REJECTED — ${r.reason}` : `Cannot reject: ${r.reason}` };
     },
+    // TRA-851 — natural-language routine management. Read is synchronous (cache);
+    // mutations parse + persist through the routine store.
+    listRoutines: () => listRoutinesSync(username).map(toRoutineSummary),
+    addRoutine: async spec => {
+      const parsed = parseRoutine(spec);
+      if (!parsed.ok) return { ok: false, message: parsed.error };
+      const res = await addRoutineToStore(username, parsed.routine, spec);
+      if (!res.ok) return { ok: false, message: res.error };
+      return { ok: true, message: `Scheduled ${res.routine.id}: ${describeRoutine(res.routine)}` };
+    },
+    removeRoutine: async id => {
+      const removed = await removeRoutineFromStore(username, id);
+      return removed
+        ? { ok: true, message: `Removed routine ${id}.` }
+        : { ok: false, message: `No routine "${id}".` };
+    },
+    setRoutineEnabled: async (id, enabled) => {
+      const updated = await setRoutineEnabledInStore(username, id, enabled);
+      return updated
+        ? { ok: true, message: `Routine ${id} ${enabled ? 'enabled' : 'disabled'}.` }
+        : { ok: false, message: `No routine "${id}".` };
+    },
   };
+}
+
+// TRA-851 — flatten a stored routine for chat display.
+function toRoutineSummary(r: StoredRoutine): RoutineSummary {
+  return {
+    id: r.id,
+    action: r.action,
+    timeEt: r.timeEt,
+    filter: filterLabel(r.filter),
+    enabled: r.enabled,
+    marketDaysOnly: r.marketDaysOnly,
+  };
+}
+
+// TRA-851 — one-line confirmation of an added routine, e.g.
+// "scan semis @ 09:30 ET (market days)".
+function describeRoutine(r: StoredRoutine): string {
+  const scope = filterLabel(r.filter);
+  const scopeBit = scope !== 'all' ? ` ${scope}` : '';
+  const days = r.marketDaysOnly ? 'market days' : 'every day';
+  return `${r.action}${scopeBit} @ ${r.timeEt} ET (${days})`;
+}
+
+// TRA-851 — run one due routine for a user and produce the message to push.
+// Reuses the same read paths the chat commands use: status/positions go through
+// the command context, scan filters the engine's live signals, and brief reuses
+// the TRA-849 morning-brief builder + renderer. Returns null when there is no
+// active session for the user (nothing to send).
+async function executeRoutineForUser(
+  username: string,
+  routine: StoredRoutine,
+): Promise<RoutineRendered | null> {
+  const ctx = tryGetUserContext(username);
+  if (!ctx) return null;
+  const scope = filterLabel(routine.filter);
+  const scopeBit = scope !== 'all' ? ` (${scope})` : '';
+
+  switch (routine.action) {
+    case 'status':
+      return { title: 'Routine: status', body: buildCommandContext(username).status() };
+    case 'positions':
+      return { title: 'Routine: positions', body: buildCommandContext(username).positions() };
+    case 'scan': {
+      const signals = ctx.engine.getState().signals;
+      return { title: `Routine: scan${scopeBit}`, body: formatScan(signals, routine.filter) };
+    }
+    case 'brief': {
+      // Build a full morning brief for this user on demand and reuse the shared
+      // renderer's plain-text body so the routine push matches the 8:30 brief.
+      const macro = await buildMacroSection();
+      const now = new Date();
+      const event = buildBriefForUser(ctx, macro, etDateString(now), now.getTime());
+      const rendered = renderAlert(event, now.getTime());
+      return { title: 'Routine: morning brief', body: rendered.text };
+    }
+    default:
+      return null;
+  }
 }
 
 // Telegram webhook receiver — records the chat_id for a `/start <token>` deep
@@ -5450,6 +5549,9 @@ void recordBootAndCheckRestarts().catch(err =>
   logger.warn('boot-history check failed', { reason: err instanceof Error ? err.message : String(err) }),
 );
 
+// TRA-851 — owns the per-ET-day dedup for user routines across scheduler ticks.
+const routineRunner = new RoutineRunner();
+
 const scheduler = new MarketScheduler();
 scheduler.start({
   // TRA-244 — collapsed onto the 9 PM ET archive hook so the Calendar row
@@ -5526,6 +5628,28 @@ scheduler.start({
   },
   // TRA-406 — observability monitor on every 60s tick.
   onMonitor: runObservabilityMonitor,
+  // TRA-851 — user-routine tick on every 60s tick. The runner matches each
+  // user's defined routines to the current ET minute, runs the action, and
+  // pushes the result as a `routine` alert through the dispatcher (respecting
+  // the user's channel prefs + quiet hours). Per-ET-day dedup lives in the
+  // runner; the dispatcher dedups again by the same day key.
+  onRoutineTick: (et) =>
+    routineRunner.tick({
+      nowEt: et,
+      isMarketDay: (date) => isMarketDayIso(date),
+      users: () => usersWithRoutinesSync(),
+      listRoutines: (user) => listRoutinesSync(user),
+      execute: (user, routine) => executeRoutineForUser(user, routine),
+      emit: (user, routine, rendered) =>
+        emitAlert({
+          kind: 'routine',
+          username: user,
+          routineId: routine.id,
+          date: et.date,
+          title: rendered.title,
+          body: rendered.body,
+        }),
+    }),
 });
 
 httpServer.listen(PORT, () => {

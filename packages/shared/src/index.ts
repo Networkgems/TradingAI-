@@ -696,7 +696,7 @@ export const ALERT_CHANNELS: readonly AlertChannel[] = ['email', 'telegram', 'di
  * `risk_halt`) rather than the quietest defaults the high-frequency `signal`
  * class uses.
  */
-export type AlertEventClass = 'fill' | 'exit' | 'signal' | 'risk_halt' | 'briefing';
+export type AlertEventClass = 'fill' | 'exit' | 'signal' | 'risk_halt' | 'briefing' | 'routine';
 
 export const ALERT_EVENT_CLASSES: readonly AlertEventClass[] = [
   'fill',
@@ -704,6 +704,9 @@ export const ALERT_EVENT_CLASSES: readonly AlertEventClass[] = [
   'signal',
   'risk_halt',
   'briefing',
+  // TRA-851 — output of a user-defined natural-language routine (a scheduled
+  // brief/scan/status/positions push at a user-chosen time).
+  'routine',
 ];
 
 /** Batching mode for the high-frequency `signal` class (TRA-410 §1.3 "Digest"). */
@@ -785,6 +788,10 @@ export const DEFAULT_ALERT_PREFERENCES: AlertPreferences = {
     // TRA-849 — once-daily pre-market brief; on for every channel so a linked
     // Telegram/Discord receives it without a matrix edit.
     briefing: { email: true, telegram: true, discord: true },
+    // TRA-851 — user-defined routine pushes. Default to the chat surfaces the
+    // user manages them from (Telegram/Discord); email off so a frequent custom
+    // scan doesn't fill the inbox. The user can flip email on per the matrix.
+    routine: { email: false, telegram: true, discord: true },
   },
   quietHours: { enabled: false, start: '22:00', end: '07:00', timezone: 'America/New_York' },
   signalDigest: 'immediate',

@@ -150,12 +150,32 @@ export interface BriefingAlertEvent extends AlertEventBase {
   news: BriefHeadline[];
 }
 
+/**
+ * TRA-851 — output of a user-defined natural-language routine. Fired by the
+ * scheduler's routine loop at the user's chosen time, it carries an already-
+ * rendered `title` + `body` (built from the same read paths the chat commands
+ * use) so the renderer just frames it. `routineId` + `date` scope the per-day
+ * dedup key so a redeploy across the fire minute can't double-send.
+ */
+export interface RoutineAlertEvent extends AlertEventBase {
+  kind: 'routine';
+  /** Stable id of the routine that fired (`r1`, `r2`, …). */
+  routineId: string;
+  /** ET date the routine fired, `YYYY-MM-DD` — scopes the daily dedup key. */
+  date: string;
+  /** Headline, e.g. "Routine: scan (semis)". */
+  title: string;
+  /** Pre-rendered plain-text body (scan rows / status / positions / brief). */
+  body: string;
+}
+
 export type AlertEvent =
   | FillAlertEvent
   | ExitAlertEvent
   | SignalAlertEvent
   | RiskHaltAlertEvent
-  | BriefingAlertEvent;
+  | BriefingAlertEvent
+  | RoutineAlertEvent;
 
 /** A channel adapter rendered the event; shape is owned by A2's renderer. */
 export interface ChannelAdapter {
@@ -399,6 +419,10 @@ export class NotificationDispatcher {
         // One brief per user per trading day — a re-run (catch-up / restart)
         // inside the TTL window collapses to the single delivery.
         return `briefing:${event.username}:${event.date}`;
+      case 'routine':
+        // One fire per routine per ET day — a restart across the fire minute
+        // collapses to the single delivery (matches the runner's own dedup).
+        return `routine:${event.username}:${event.routineId}:${event.date}`;
     }
   }
 

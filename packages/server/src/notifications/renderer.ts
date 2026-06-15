@@ -24,11 +24,16 @@ import type {
   ExitAlertEvent,
   FillAlertEvent,
   RiskHaltAlertEvent,
+  RoutineAlertEvent,
   SignalAlertEvent,
 } from './dispatcher.js';
 
-/** Non-briefing events go through the compact single-context render path. */
-type SimpleAlertEvent = Exclude<AlertEvent, BriefingAlertEvent>;
+/**
+ * Events with their own multi-line render path (briefing's structured digest,
+ * routine's pre-rendered title+body); everything else uses the compact
+ * single-context path below.
+ */
+type SimpleAlertEvent = Exclude<AlertEvent, BriefingAlertEvent | RoutineAlertEvent>;
 
 export interface RenderedAlert {
   /** Headline incl. status emoji, e.g. "🟢 TradingAI — Position Exited". */
@@ -171,6 +176,8 @@ export function renderAlert(event: AlertEvent, now: number = Date.now()): Render
   // alert, so it gets its own render path rather than the compact context+lines
   // format shared by fill/exit/signal/risk_halt.
   if (event.kind === 'briefing') return renderBriefing(event, event.timestamp ?? now);
+  // TRA-851 — a routine carries an already-rendered title + body; just frame it.
+  if (event.kind === 'routine') return renderRoutine(event, event.timestamp ?? now);
 
   const r = renderBody(event);
   const ts = event.timestamp ?? now;
@@ -187,6 +194,35 @@ export function renderAlert(event: AlertEvent, now: number = Date.now()): Render
     `<div style="color:#8b949e;font-size:14px;margin-bottom:12px;">${esc(r.context)}</div>`,
     ...r.lines.map(
       (l) => `<div style="font-size:15px;margin:2px 0;">${esc(l)}</div>`,
+    ),
+    `<div style="color:#484f58;font-size:12px;margin-top:14px;">${esc(stamp)}</div>`,
+    `</div>`,
+  ].join('');
+
+  return { title, subject, text, html };
+}
+
+// ── TRA-851 routine rendering ────────────────────────────────────────────────
+
+/**
+ * Frame a user-defined routine's pre-rendered output into a channel-agnostic
+ * message. The body is already formatted by the routine executor (scan rows /
+ * status / positions / brief); this only adds the headline + timestamp and the
+ * email HTML wrapper, preserving the body's line breaks as separate rows.
+ */
+function renderRoutine(event: RoutineAlertEvent, ts: number): RenderedAlert {
+  const title = `⏰ TradingAI — ${event.title}`;
+  const subject = `TradingAI — ${event.title}`;
+  const stamp = fmtTimestamp(ts);
+  const bodyLines = event.body.split('\n');
+
+  const text = [title, '', ...bodyLines, '', stamp].join('\n');
+
+  const html = [
+    `<div style="font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Helvetica,Arial,sans-serif;color:#c9d1d9;background:#0d1117;padding:24px;border-radius:8px;max-width:560px;">`,
+    `<div style="font-size:18px;font-weight:600;margin-bottom:8px;">${esc(title)}</div>`,
+    ...bodyLines.map(
+      (l) => `<div style="font-size:14px;margin:2px 0;color:#c9d1d9;white-space:pre;">${esc(l)}</div>`,
     ),
     `<div style="color:#484f58;font-size:12px;margin-top:14px;">${esc(stamp)}</div>`,
     `</div>`,

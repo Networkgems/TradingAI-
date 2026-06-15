@@ -14,6 +14,13 @@
 //   positions               — open positions
 //   approve <id|symbol>     — APPROVE one advisory recommendation (route it)
 //   reject  <id|symbol>     — REJECT one advisory recommendation (drop it)
+//   routines                — list this user's scheduled routines (TRA-851)
+//   routine <nl|sub>        — manage natural-language routines (TRA-851):
+//        routine add <phrase>     define one ("brief me at 8:30")
+//        routine list             list them
+//        routine remove <id>      delete one
+//        routine on|off <id>      enable / disable one
+//        routine <phrase>         (bare) shorthand for `routine add <phrase>`
 //   help                    — command list
 //
 // `/start <token>` is intentionally NOT a command here: account linking
@@ -29,6 +36,10 @@ export type InboundCommand =
   | { kind: 'help' }
   | { kind: 'approve'; target: string }
   | { kind: 'reject'; target: string }
+  | { kind: 'routine_list' }
+  | { kind: 'routine_add'; spec: string }
+  | { kind: 'routine_remove'; target: string }
+  | { kind: 'routine_toggle'; target: string; enabled: boolean }
   | { kind: 'unknown'; verb: string };
 
 /**
@@ -83,7 +94,67 @@ export function parseCommand(text: string | undefined | null): InboundCommand | 
       const target = arg.split(/\s+/)[0] ?? '';
       return target ? { kind: 'reject', target } : { kind: 'unknown', verb };
     }
+    case 'routines':
+      // Bare plural is always "list"; a trailing arg is ignored.
+      return { kind: 'routine_list' };
+    case 'routine':
+    case 'schedule':
+      return parseRoutineSubcommand(arg);
+    case 'remind':
+    case 'every':
+      // NL shorthand — the whole phrase (incl. this verb's argument) is the
+      // routine spec. `remind me to brief at 8` / `every day at 8:30 brief me`.
+      return arg ? { kind: 'routine_add', spec: arg } : { kind: 'unknown', verb };
     default:
       return { kind: 'unknown', verb };
+  }
+}
+
+/**
+ * Parse the argument that follows `routine` / `schedule`. Recognises the
+ * `add | list | remove | on | off` subcommands; anything else (or a bare phrase)
+ * is treated as `routine add <phrase>` so a user can type `routine brief me at
+ * 8:30` directly. An empty argument lists.
+ */
+function parseRoutineSubcommand(arg: string): InboundCommand {
+  const trimmed = arg.trim();
+  if (trimmed === '') return { kind: 'routine_list' };
+
+  const sp = trimmed.search(/\s/);
+  const sub = (sp === -1 ? trimmed : trimmed.slice(0, sp)).toLowerCase();
+  const rest = sp === -1 ? '' : trimmed.slice(sp + 1).trim();
+
+  switch (sub) {
+    case 'list':
+    case 'ls':
+    case 'show':
+      return { kind: 'routine_list' };
+    case 'add':
+    case 'new':
+    case 'create':
+      return rest ? { kind: 'routine_add', spec: rest } : { kind: 'unknown', verb: 'routine add' };
+    case 'remove':
+    case 'rm':
+    case 'del':
+    case 'delete':
+    case 'cancel': {
+      const target = rest.split(/\s+/)[0] ?? '';
+      return target ? { kind: 'routine_remove', target } : { kind: 'unknown', verb: 'routine remove' };
+    }
+    case 'on':
+    case 'enable':
+    case 'resume': {
+      const target = rest.split(/\s+/)[0] ?? '';
+      return target ? { kind: 'routine_toggle', target, enabled: true } : { kind: 'unknown', verb: 'routine on' };
+    }
+    case 'off':
+    case 'disable':
+    case 'pause': {
+      const target = rest.split(/\s+/)[0] ?? '';
+      return target ? { kind: 'routine_toggle', target, enabled: false } : { kind: 'unknown', verb: 'routine off' };
+    }
+    default:
+      // Bare natural-language spec — "routine brief me at 8:30".
+      return { kind: 'routine_add', spec: trimmed };
   }
 }

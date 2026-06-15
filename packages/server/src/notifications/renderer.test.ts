@@ -5,6 +5,7 @@ import type {
   ExitAlertEvent,
   FillAlertEvent,
   RiskHaltAlertEvent,
+  RoutineAlertEvent,
   SignalAlertEvent,
 } from './dispatcher.js';
 
@@ -197,6 +198,41 @@ describe('renderAlert', () => {
     expect(r.html).toContain('&lt;script&gt;');
     expect(r.html).toContain('A&amp;B');
     expect(r.html).not.toContain('<script>x');
+  });
+
+  // ── TRA-851 routine ────────────────────────────────────────────────────────
+
+  it('frames a routine push with headline + body + timestamp', () => {
+    const e: RoutineAlertEvent = {
+      kind: 'routine',
+      username: 'alice',
+      timestamp: TS,
+      routineId: 'r1',
+      date: '2026-05-17',
+      title: 'Routine: scan (semis)',
+      body: 'Scan (semis) — 1 signal(s):\n  NVDA long orb @ 120.50',
+    };
+    const r = renderAlert(e);
+    expect(r.title).toBe('⏰ TradingAI — Routine: scan (semis)');
+    expect(r.subject).toBe('TradingAI — Routine: scan (semis)');
+    expect(r.text).toContain('NVDA long orb @ 120.50');
+    expect(r.text).toContain('2026-05-17 14:32 ET');
+    expect(r.html.length).toBeGreaterThan(0);
+  });
+
+  it('HTML-escapes a routine body', () => {
+    const e: RoutineAlertEvent = {
+      kind: 'routine',
+      username: 'alice',
+      timestamp: TS,
+      routineId: 'r1',
+      date: '2026-05-17',
+      title: 'Routine: status',
+      body: '<b>equity</b> & cash',
+    };
+    const r = renderAlert(e);
+    expect(r.html).toContain('&lt;b&gt;equity&lt;/b&gt; &amp; cash');
+    expect(r.html).not.toContain('<b>equity');
   });
 
   it('produces a non-empty html and a text/html pair for every kind', () => {

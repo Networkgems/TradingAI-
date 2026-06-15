@@ -42,6 +42,21 @@ export interface ActionResult {
   message: string;
 }
 
+/** TRA-851 — one scheduled routine, flattened for chat display. */
+export interface RoutineSummary {
+  /** Stable id used to remove / enable / disable (`r1`, `r2`, …). */
+  id: string;
+  /** brief / scan / status / positions. */
+  action: string;
+  /** Fire time in ET, `HH:MM`. */
+  timeEt: string;
+  /** Human filter label, e.g. "semis" / "AAPL, MSFT" / "all". */
+  filter: string;
+  enabled: boolean;
+  /** When false the routine also fires on weekends (24/7-market scans). */
+  marketDaysOnly: boolean;
+}
+
 /**
  * Thin accessors the server wires to the live per-user engine. Read methods
  * return ready-to-send text blocks; the action methods perform the routing /
@@ -57,6 +72,14 @@ export interface CommandContext {
   pendingRecommendations: () => RecommendationSummary[];
   approve: (target: string) => ActionResult | Promise<ActionResult>;
   reject: (target: string) => ActionResult | Promise<ActionResult>;
+  // TRA-851 — natural-language routine management. Optional: a channel wired
+  // without routine support (or a legacy test fake) cleanly replies "not
+  // available" rather than failing. The server always wires all four.
+  listRoutines?: () => RoutineSummary[] | Promise<RoutineSummary[]>;
+  /** Parse + persist a routine from a raw NL phrase; reports the interpretation. */
+  addRoutine?: (spec: string) => ActionResult | Promise<ActionResult>;
+  removeRoutine?: (id: string) => ActionResult | Promise<ActionResult>;
+  setRoutineEnabled?: (id: string, enabled: boolean) => ActionResult | Promise<ActionResult>;
 }
 
 const KILL_SWITCH_NOTICE =
@@ -71,8 +94,28 @@ const HELP_TEXT = [
   '  brief       status + scan + pending approvals',
   '  approve <id|symbol>   route an APPROVE recommendation',
   '  reject  <id|symbol>   drop a recommendation',
+  '  routines              list your scheduled routines',
+  '  routine <phrase>      schedule one, e.g. "routine brief me at 8:30"',
+  '  routine remove <id>   delete a routine',
+  '  routine on|off <id>   enable / disable a routine',
   '  help        this list',
 ].join('\n');
+
+const ROUTINES_UNAVAILABLE = 'Routines are not available on this session.';
+
+/** TRA-851 — render a user's scheduled routines for chat display. */
+function renderRoutines(routines: RoutineSummary[]): string {
+  if (routines.length === 0) {
+    return 'No routines. Add one, e.g. "routine brief me at 8:30".';
+  }
+  const lines = routines.map((r) => {
+    const days = r.marketDaysOnly ? 'market days' : 'every day';
+    const state = r.enabled ? '' : ' [off]';
+    const scope = r.filter && r.filter !== 'all' ? ` ${r.filter}` : '';
+    return `  ${r.id}  ${r.action}${scope} @ ${r.timeEt} ET (${days})${state}`;
+  });
+  return ['Routines:', ...lines].join('\n');
+}
 
 /** Render the pending-approvals section shared by `brief` and bad-target replies. */
 function renderApprovals(recos: RecommendationSummary[]): string {
@@ -114,6 +157,25 @@ export async function executeCommand(
       const res = await ctx.reject(cmd.target);
       return res.message;
     }
+    case 'routine_list': {
+      if (!ctx.listRoutines) return ROUTINES_UNAVAILABLE;
+      return renderRoutines(await ctx.listRoutines());
+    }
+    case 'routine_add': {
+      if (!ctx.addRoutine) return ROUTINES_UNAVAILABLE;
+      const res = await ctx.addRoutine(cmd.spec);
+      return res.message;
+    }
+    case 'routine_remove': {
+      if (!ctx.removeRoutine) return ROUTINES_UNAVAILABLE;
+      const res = await ctx.removeRoutine(cmd.target);
+      return res.message;
+    }
+    case 'routine_toggle': {
+      if (!ctx.setRoutineEnabled) return ROUTINES_UNAVAILABLE;
+      const res = await ctx.setRoutineEnabled(cmd.target, cmd.enabled);
+      return res.message;
+    }
     case 'unknown':
       return `Unknown command "${cmd.verb}".\n${HELP_TEXT}`;
     default: {
@@ -124,4 +186,4 @@ export async function executeCommand(
   }
 }
 
-export { HELP_TEXT, KILL_SWITCH_NOTICE, renderApprovals };
+export { HELP_TEXT, KILL_SWITCH_NOTICE, ROUTINES_UNAVAILABLE, renderApprovals, renderRoutines };

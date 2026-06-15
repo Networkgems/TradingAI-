@@ -64,3 +64,61 @@ describe('TRA-848 inbound command parser', () => {
     expect(parseCommand('/foo bar')).toEqual({ kind: 'unknown', verb: 'foo' });
   });
 });
+
+describe('TRA-851 routine commands', () => {
+  it('lists with the bare plural or "routine list"', () => {
+    expect(parseCommand('routines')).toEqual({ kind: 'routine_list' });
+    expect(parseCommand('routine')).toEqual({ kind: 'routine_list' });
+    expect(parseCommand('routine list')).toEqual({ kind: 'routine_list' });
+    expect(parseCommand('/routine ls')).toEqual({ kind: 'routine_list' });
+  });
+
+  it('adds via the explicit "add" subcommand', () => {
+    expect(parseCommand('routine add brief me at 8:30')).toEqual({
+      kind: 'routine_add',
+      spec: 'brief me at 8:30',
+    });
+  });
+
+  it('adds via a bare natural-language phrase after "routine"', () => {
+    expect(parseCommand('routine scan semis daily')).toEqual({
+      kind: 'routine_add',
+      spec: 'scan semis daily',
+    });
+  });
+
+  it('treats remind/every/schedule as NL routine adds', () => {
+    expect(parseCommand('schedule brief me at 8:30')).toEqual({
+      kind: 'routine_add',
+      spec: 'brief me at 8:30',
+    });
+    expect(parseCommand('every day at 8:30 brief me')).toEqual({
+      kind: 'routine_add',
+      spec: 'day at 8:30 brief me',
+    });
+    expect(parseCommand('remind me to scan semis at 9')).toEqual({
+      kind: 'routine_add',
+      spec: 'me to scan semis at 9',
+    });
+  });
+
+  it('removes / toggles by id', () => {
+    expect(parseCommand('routine remove r2')).toEqual({ kind: 'routine_remove', target: 'r2' });
+    expect(parseCommand('routine rm r2')).toEqual({ kind: 'routine_remove', target: 'r2' });
+    expect(parseCommand('routine off r1')).toEqual({
+      kind: 'routine_toggle',
+      target: 'r1',
+      enabled: false,
+    });
+    expect(parseCommand('routine on r1')).toEqual({
+      kind: 'routine_toggle',
+      target: 'r1',
+      enabled: true,
+    });
+  });
+
+  it('flags a remove/toggle with no id as unknown', () => {
+    expect(parseCommand('routine remove')).toEqual({ kind: 'unknown', verb: 'routine remove' });
+    expect(parseCommand('routine off')).toEqual({ kind: 'unknown', verb: 'routine off' });
+  });
+});
