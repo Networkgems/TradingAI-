@@ -1,7 +1,7 @@
 import { describe, it, expect } from 'vitest';
-import { validateAgentRecommendation, type Candle, type TradeSignal } from '@trading-app/shared';
-import { runAgentGraph } from './graph.js';
-import type { AgentGraphInput } from './types.js';
+import { validateAgentRecommendation, type Candle, type RiskVerdict, type TradeSignal } from '@trading-app/shared';
+import { runAgentGraph, personalizeRiskVerdict, memorySizingTilt } from './graph.js';
+import type { AgentGraphInput, UserTradingMemory } from './types.js';
 import type { LlmClient, LlmCompletionRequest } from './llm-client.js';
 
 function candles(closes: number[], symbol = 'AAA', startTs = 1_000): Candle[] {
@@ -159,5 +159,74 @@ describe('runAgentGraph (TRA-747 LLM path)', () => {
   it('with no llm runs the deterministic path at zero cost (P3 replay determinism)', async () => {
     const reco = await runAgentGraph(input(rising()));
     expect(reco.costUsd).toBe(0);
+  });
+});
+
+// TRA-850 — persistent per-user memory personalizes the advisory read.
+function withMemory(closes: number[], userMemory: UserTradingMemory): AgentGraphInput {
+  return { ...input(closes), userMemory };
+}
+
+function verdict(over: Partial<RiskVerdict> = {}): RiskVerdict {
+  return {
+    verdict: 'APPROVE',
+    sizeMultiplier: 0.8,
+    panel: [
+      { persona: 'aggressive', sizeMultiplier: 0.8, reasons: ['a'] },
+      { persona: 'neutral', sizeMultiplier: 0.6, reasons: ['n'] },
+      { persona: 'conservative', sizeMultiplier: 0.4, reasons: ['c'] },
+    ],
+    reasons: ['base'],
+    ...over,
+  };
+}
+
+describe('memorySizingTilt (TRA-850 de-risk preference)', () => {
+  it('absent memory or no preference ⇒ 1 (no change)', () => {
+    expect(memorySizingTilt(undefined)).toBe(1);
+    expect(memorySizingTilt({})).toBe(1);
+    expect(memorySizingTilt({ riskTolerance: 'moderate' })).toBe(1);
+    expect(memorySizingTilt({ riskTolerance: 'aggressive' })).toBe(1); // can only de-risk
+  });
+  it('explicit sizingMultiplier wins and is clamped to (0,1]', () => {
+    expect(memorySizingTilt({ sizingMultiplier: 0.5 })).toBe(0.5);
+    expect(memorySizingTilt({ sizingMultiplier: 2 })).toBe(1);
+    expect(memorySizingTilt({ sizingMultiplier: 0, riskTolerance: 'aggressive' })).toBe(0.01);
+  });
+  it('conservative tolerance halves when no explicit multiplier', () => {
+    expect(memorySizingTilt({ riskTolerance: 'conservative' })).toBe(0.5);
+  });
+});
+
+describe('personalizeRiskVerdict (TRA-850)', () => {
+  it('shrinks final + persona sizes by the tilt and records a reason', () => {
+    const out = personalizeRiskVerdict(verdict(), { sizingMultiplier: 0.5 });
+    expect(out.sizeMultiplier).toBe(0.4);
+    expect(out.panel.map((p) => p.sizeMultiplier)).toEqual([0.4, 0.3, 0.2]);
+    expect(out.reasons.at(-1)).toContain('Personalized');
+  });
+  it('never enlarges and never flips the verdict (preference is de-risk only)', () => {
+    const out = personalizeRiskVerdict(verdict(), { sizingMultiplier: 0.5 });
+    expect(out.verdict).toBe('APPROVE');
+    expect(out.sizeMultiplier).toBeLessThan(0.8);
+  });
+  it('is a no-op for a VETO/size-0 verdict (nothing to size)', () => {
+    const v = verdict({ verdict: 'VETO', sizeMultiplier: 0 });
+    expect(personalizeRiskVerdict(v, { sizingMultiplier: 0.3 })).toBe(v);
+  });
+  it('is a no-op when memory implies no shrink', () => {
+    const v = verdict();
+    expect(personalizeRiskVerdict(v, { riskTolerance: 'aggressive' })).toBe(v);
+    expect(personalizeRiskVerdict(v, undefined)).toBe(v);
+  });
+});
+
+describe('runAgentGraph honours user memory (TRA-850)', () => {
+  it('a conservative user gets a smaller size than the default, same verdict', async () => {
+    const plain = await runAgentGraph(input(rising()));
+    const personalized = await runAgentGraph(withMemory(rising(), { riskTolerance: 'conservative' }));
+    expect(personalized.verdict).toBe(plain.verdict);
+    expect(personalized.sizeMultiplier).toBeCloseTo(plain.sizeMultiplier * 0.5, 6);
+    expect(validateAgentRecommendation(personalized)).toEqual([]);
   });
 });

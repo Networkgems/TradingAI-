@@ -55,4 +55,49 @@ export interface AgentGraphInput {
    * its horizon short because social buzz is a fast-decaying signal.
    */
   social?: SocialSentiment;
+  /**
+   * TRA-850 — the owning user's persistent advisory PREFERENCES, read into the
+   * graph context so recommendations are personalized + consistent across
+   * sessions instead of stateless per tick. Strictly preferences (risk
+   * tolerance, preferred/avoided strategies, a sizing default, watchlist
+   * rationale) — NOT a self-modifying strategy: the backtest/calibration gate
+   * stays authoritative and the agent layer can still only DE-RISK. Optional +
+   * additive: absent ⇒ the graph behaves exactly as before.
+   */
+  userMemory?: UserTradingMemory;
+}
+
+/** Risk appetite the user has expressed. Coarse on purpose — it tilts tone + sizing, never the gate. */
+export type RiskTolerance = 'conservative' | 'moderate' | 'aggressive';
+
+/**
+ * TRA-850 — one user's persistent advisory preferences. Every field is OPTIONAL:
+ * the store starts empty and fills as the user states preferences or as
+ * approve/reject interactions accrue. PREFERENCES ONLY — nothing here changes a
+ * strategy's parameters or bypasses the promotion gate; it personalizes the
+ * advisory read (tone + a de-risk-only sizing tilt) so the desk feels consistent
+ * across sessions.
+ */
+export interface UserTradingMemory {
+  /** Stated risk appetite — tilts the advisory tone and the de-risk sizing default. */
+  riskTolerance?: RiskTolerance;
+  /**
+   * Strategy ids/types the user leans toward (e.g. 'momentum', 'orb'). Surfaced
+   * to the model as context; it never forces a trade the gate would not allow.
+   */
+  preferredStrategies?: string[];
+  /** Strategy ids/types the user has repeatedly rejected — the model de-emphasizes them. */
+  avoidedStrategies?: string[];
+  /**
+   * The user's default position-size tilt as a fraction in (0,1], applied as a
+   * deterministic DE-RISK shrink on the final size (1 = no shrink, 0.5 = half).
+   * Can only ever reduce size — it never enlarges past the risk panel's clamp.
+   */
+  sizingMultiplier?: number;
+  /** Per-symbol watchlist rationale (UPPERCASE symbol → why the user is watching it). */
+  watchlistRationale?: Record<string, string>;
+  /** Free-form notes the user asked the desk to remember. */
+  notes?: string;
+  /** ISO-8601 timestamp this memory was last updated (audit/freshness). */
+  updatedAt?: string;
 }

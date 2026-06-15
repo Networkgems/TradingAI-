@@ -9,6 +9,7 @@ import type { TradeSignal, RelativeValueSignal, Sma200Signal, Candle, OptionsAcc
 // and both kill switches and accounts spend — advisor-only, no path to capital.
 import type { LlmClient } from '@trading-app/agents';
 import { adviseSymbol, resolveTradingAgentsLlm, buildNewsHeadlines } from './trading-agents-advisory.js';
+import { getUserMemorySync, recordInteractionOutcome } from './user-trading-memory-store.js';
 import { getLatestMarketReview } from './market-review.js';
 import { earningsInDaysSync } from './earnings-store.js';
 import { recordShadowSignal, resolveShadowSignal, resolveOutcome, openShadowSignalsSync, type ShadowSignalRecord } from './shadow-signal-ledger.js';
@@ -2994,6 +2995,11 @@ export class SignalEngine {
     this.routedAgentSignalIds.add(signal.id);
     // Drop the routed reco so it no longer shows as pending on the chat surface.
     this.latestAgentRecommendations = this.latestAgentRecommendations.filter(r => r !== reco);
+    // TRA-850 — learn from the interaction: an approved recommendation tallies as
+    // a vote FOR its strategy type, feeding the user's preferred-strategies memory
+    // so future advisory reads lean the same way. Fire-and-forget (persists
+    // async); preferences only — it never alters strategy params or the gate.
+    void this.recordAgentInteraction(reco, true);
     return { ok: true, reason: `routed ${signal.side} ${reco.symbol} (${this.mode})` };
   }
 
@@ -3005,7 +3011,29 @@ export class SignalEngine {
     const reco = this.findRecommendationByTarget(target);
     if (!reco) return { ok: false, reason: `no pending recommendation for "${target}"` };
     this.latestAgentRecommendations = this.latestAgentRecommendations.filter(r => r !== reco);
+    // TRA-850 — learn from the rejection: tallies as a vote AGAINST the strategy
+    // type so a repeatedly-rejected strategy lands in the user's avoided memory.
+    void this.recordAgentInteraction(reco, false);
     return { ok: true, reason: `rejected ${reco.symbol} (dropped)` };
+  }
+
+  /**
+   * TRA-850 — fold one approve/reject interaction into the owning user's
+   * persistent advisory memory, keyed by the recommendation's strategy type
+   * (`proposedSignal.type`; HOLD/VETO carry no signal, so nothing to learn).
+   * Best-effort: a store write failure is logged and swallowed so it never
+   * breaks the chat-surface action. Preferences only — never a strategy change.
+   */
+  private async recordAgentInteraction(reco: AgentRecommendation, accepted: boolean): Promise<void> {
+    const strategyType = reco.proposedSignal?.type;
+    if (!strategyType) return;
+    try {
+      await recordInteractionOutcome(this.alertUsername, { strategyType, accepted });
+    } catch (err) {
+      logger.warn('failed to record advisory interaction into user memory', {
+        symbol: reco.symbol, accepted, err: String(err),
+      });
+    }
   }
 
   /**
@@ -3043,6 +3071,12 @@ export class SignalEngine {
    */
   private async runTradingAgentsAdvisory(symbols: string[]): Promise<void> {
     const llm = this.resolveAgentsLlm();
+    // TRA-850 — read the owning user's persistent advisory PREFERENCES once for
+    // the batch (risk tolerance, preferred/avoided strategies, a de-risk sizing
+    // default, per-symbol watchlist rationale). The synchronous accessor reads
+    // the boot-warmed cache; an empty memory leaves the graph unchanged, so this
+    // stays additive. Preferences only — never a self-modifying strategy.
+    const userMemory = getUserMemorySync(this.alertUsername);
     const recos: AgentRecommendation[] = [];
     for (const sym of symbols) {
       const candles = this.candleCache.get(sym) ?? [];
@@ -3066,7 +3100,7 @@ export class SignalEngine {
       const social = this.getSocialSentiment(sym);
       try {
         const { recommendation } = await adviseSymbol(
-          { symbol: sym, asOf, candles, candidateSignal: null, fundamentals, news, social },
+          { symbol: sym, asOf, candles, candidateSignal: null, fundamentals, news, social, userMemory },
           { user: this.alertUsername, enabled: this.tradingAgentsEnabled, llm },
         );
         recos.push(recommendation);

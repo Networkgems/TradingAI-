@@ -74,6 +74,12 @@ import { initIvRankStore } from './iv-rank-store.js';
 import { initIdeaJournal, listJournalEntries } from './options-idea-journal.js';
 import { initShadowLedger, listShadowSignals } from './shadow-signal-ledger.js';
 import {
+  loadUserMemoryStore,
+  getUserMemory,
+  setUserMemory,
+  getInteractionStats,
+} from './user-trading-memory-store.js';
+import {
   forwardTestIdeas,
   buildForwardTestReport,
   defaultChainsDir,
@@ -400,6 +406,12 @@ await initIdeaJournal();
 // The engine appends OPEN rows on each new shadow signal and RESOLVED rows as
 // the forward horizon labels them.
 await initShadowLedger();
+
+// TRA-850 — warm the persistent per-user trading-memory store from disk so the
+// synchronous `getUserMemorySync` read the advisory tick uses has each user's
+// preferences immediately. Appended to as users state preferences or as
+// approve/reject interactions accrue.
+await loadUserMemoryStore();
 
 const app = express();
 // TRA-404 — behind Render's proxy the socket address is the proxy, not the
@@ -3238,6 +3250,37 @@ app.get('/api/account/settings', requireAuth, async (_req, res, next) => {
   try {
     const settings = await loadSettings(username);
     res.json(settings);
+  } catch (err) {
+    next(err);
+  }
+});
+
+// TRA-850 — the authenticated user's persistent advisory trading memory
+// (preferences the agent graph reads into its context + the learned interaction
+// tally). Read-back for the settings UI; preferences only — nothing here changes
+// a strategy or the promotion gate.
+app.get('/api/account/trading-memory', requireAuth, async (_req, res, next) => {
+  const username = res.locals['authUser'] as string;
+  try {
+    const [memory, interactionStats] = await Promise.all([
+      getUserMemory(username),
+      getInteractionStats(username),
+    ]);
+    res.json({ memory, interactionStats });
+  } catch (err) {
+    next(err);
+  }
+});
+
+// TRA-850 — set the authenticated user's advisory preferences (risk tolerance,
+// preferred/avoided strategies, a de-risk sizing default, per-symbol watchlist
+// rationale, notes). The store sanitizes the patch (clamps sizing to [0,1],
+// drops invalid fields, merges watchlist rationale by symbol).
+app.put('/api/account/trading-memory', requireAuth, async (req, res, next) => {
+  const username = res.locals['authUser'] as string;
+  try {
+    const memory = await setUserMemory(username, (req.body ?? {}) as Parameters<typeof setUserMemory>[1]);
+    res.json({ memory });
   } catch (err) {
     next(err);
   }

@@ -7,6 +7,8 @@ export type {
   AgentGraphInput,
   FundamentalSnapshot,
   NewsHeadline,
+  UserTradingMemory,
+  RiskTolerance,
 } from './types.js';
 export {
   selectDecisionPath,
@@ -58,6 +60,8 @@ export {
 export {
   runAgentGraph,
   AgentGraphError,
+  personalizeRiskVerdict,
+  memorySizingTilt,
   type AgentGraphDeps,
 } from './graph.js';
 export {

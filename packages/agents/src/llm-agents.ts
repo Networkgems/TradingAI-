@@ -31,7 +31,7 @@ import {
   type RiskVerdict,
   type TraderDecision,
 } from '@trading-app/shared';
-import type { AgentGraphInput } from './types.js';
+import type { AgentGraphInput, UserTradingMemory } from './types.js';
 import { completeJson, type LlmClient, type LlmMessage } from './llm-client.js';
 
 const clamp = (v: number, lo: number, hi: number): number => Math.min(hi, Math.max(lo, v));
@@ -290,6 +290,29 @@ const TRADER_SYSTEM = [
   '(do not move them); otherwise propose a sensible band around the last close.',
 ].join('\n');
 
+/**
+ * TRA-850 — a compact, model-friendly digest of the user's persistent
+ * PREFERENCES for the trader/risk prompts. Returns null (no personalization)
+ * when memory is absent or carries nothing useful, so the prompt stays unchanged
+ * for users with no stored preferences. Symbol-scoped watchlist rationale is
+ * filtered to the symbol in play.
+ */
+function memoryDigest(
+  memory: UserTradingMemory | undefined,
+  symbol: string,
+): Record<string, unknown> | null {
+  if (!memory) return null;
+  const rationale = memory.watchlistRationale?.[symbol.toUpperCase()];
+  const digest: Record<string, unknown> = {};
+  if (memory.riskTolerance) digest['riskTolerance'] = memory.riskTolerance;
+  if (memory.preferredStrategies?.length) digest['preferredStrategies'] = memory.preferredStrategies;
+  if (memory.avoidedStrategies?.length) digest['avoidedStrategies'] = memory.avoidedStrategies;
+  if (typeof memory.sizingMultiplier === 'number') digest['sizingMultiplier'] = memory.sizingMultiplier;
+  if (rationale) digest['watchlistRationale'] = rationale;
+  if (memory.notes) digest['notes'] = memory.notes;
+  return Object.keys(digest).length ? digest : null;
+}
+
 function traderUser(input: AgentGraphInput, reports: AnalystReport[], debate: DebateTranscript): string {
   const payload = {
     symbol: input.symbol,
@@ -311,8 +334,15 @@ function traderUser(input: AgentGraphInput, reports: AnalystReport[], debate: De
       drivers: r.drivers,
     })),
     debate: { survivingThesis: debate.survivingThesis, netLean: debate.netLean },
+    // TRA-850 — the user's persistent preferences (advisory context only).
+    userPreferences: memoryDigest(input.userMemory, input.symbol),
   };
-  return `Decision context (JSON):\n${JSON.stringify(payload)}`;
+  return (
+    `Decision context (JSON):\n${JSON.stringify(payload)}\n`
+    + 'userPreferences (when present) are advisory: tailor your thesis + conviction to them, but '
+    + 'NEVER let a preference override the evidence or invent a trade the analysts do not support. '
+    + 'They tune HOW you frame the call, not WHETHER there is an edge.'
+  );
 }
 
 /**
@@ -402,13 +432,16 @@ const RISK_SYSTEM = [
   '"reasons": [str] }.',
 ].join('\n');
 
-function riskUser(decision: TraderDecision): string {
+function riskUser(decision: TraderDecision, riskTolerance?: UserTradingMemory['riskTolerance']): string {
   const payload = {
     action: decision.action,
     conviction: decision.conviction,
     riskRewardRatio: decision.riskRewardRatio,
     thesis: decision.thesis,
     dissent: decision.dissent,
+    // TRA-850 — the user's stated risk appetite (advisory: lean toward the
+    // matching persona; you can still only de-risk, never enlarge).
+    userRiskTolerance: riskTolerance ?? null,
   };
   return `Proposed trade (JSON):\n${JSON.stringify(payload)}`;
 }
@@ -417,6 +450,8 @@ export interface RiskPanelLlmConfig {
   /** Below this R:R the manager will not APPROVE (mirrors the trader gate). Default 1.5. */
   minRiskReward?: number;
   maxAttempts?: number;
+  /** TRA-850 — the user's stated risk appetite, surfaced to the risk manager as advisory context. */
+  riskTolerance?: UserTradingMemory['riskTolerance'];
 }
 
 /**
@@ -460,7 +495,7 @@ export async function runRiskPanelLlm(
 
   const messages: LlmMessage[] = [
     { role: 'system', content: RISK_SYSTEM },
-    { role: 'user', content: riskUser(decision) },
+    { role: 'user', content: riskUser(decision, config.riskTolerance) },
   ];
   const out = await completeJson<RiskVerdict>(
     llm,

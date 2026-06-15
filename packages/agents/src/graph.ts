@@ -14,10 +14,11 @@
 import {
   validateAgentRecommendation,
   type AgentRecommendation,
+  type RiskVerdict,
   type TradeSignal,
   type TraderDecision,
 } from '@trading-app/shared';
-import type { AgentGraphInput } from './types.js';
+import type { AgentGraphInput, UserTradingMemory } from './types.js';
 import type { LlmClient } from './llm-client.js';
 import { runAnalysts } from './analysts.js';
 import { runDebate } from './debate.js';
@@ -90,6 +91,7 @@ export async function runAgentGraph(
     // 4. Risk panel + manager (strong/Sonnet).
     const r = await runRiskPanelLlm(t.decision, deps.llm, {
       minRiskReward: deps.risk?.minRiskReward,
+      ...(input.userMemory?.riskTolerance ? { riskTolerance: input.userMemory.riskTolerance } : {}),
     });
     const costUsd = round6(a.costUsd + t.costUsd + r.costUsd);
     return assemble(input, now, startedAt, a.reports, debate, t.decision, r.verdict, costUsd);
@@ -105,6 +107,65 @@ export async function runAgentGraph(
 }
 
 const round6 = (v: number): number => Math.round(v * 1e6) / 1e6;
+const round4 = (v: number): number => Math.round(v * 1e4) / 1e4;
+
+/**
+ * TRA-850 — the deterministic DE-RISK sizing tilt the user's persistent memory
+ * implies, as a fraction in (0,1]. An explicit `sizingMultiplier` wins; otherwise
+ * a stated `riskTolerance` supplies a default (conservative halves, moderate is
+ * neutral, aggressive does NOT enlarge — the agent layer can only ever shrink, so
+ * 1 is the ceiling). Absent/blank memory ⇒ 1 (no change). Clamped to (0,1].
+ */
+export function memorySizingTilt(memory: UserTradingMemory | undefined): number {
+  if (!memory) return 1;
+  if (typeof memory.sizingMultiplier === 'number' && Number.isFinite(memory.sizingMultiplier)) {
+    return Math.min(1, Math.max(0.01, memory.sizingMultiplier));
+  }
+  switch (memory.riskTolerance) {
+    case 'conservative':
+      return 0.5;
+    case 'moderate':
+    case 'aggressive':
+    default:
+      return 1;
+  }
+}
+
+/**
+ * TRA-850 — apply the user's persistent PREFERENCES to the risk verdict, purely
+ * as a DE-RISK personalization: the final + every persona size multiplier is
+ * shrunk by {@link memorySizingTilt} (never enlarged — it is clamped at the
+ * incoming size), and a one-line reason records the tilt so the personalization
+ * is auditable. Verdict, panel personas, and the no-trade (VETO/size-0) case are
+ * untouched — this changes HOW BIG, never WHETHER. Preferences only; the
+ * promotion/calibration gate stays authoritative. Returns the verdict unchanged
+ * when memory is absent or implies no shrink.
+ */
+export function personalizeRiskVerdict(
+  verdict: RiskVerdict,
+  memory: UserTradingMemory | undefined,
+): RiskVerdict {
+  const tilt = memorySizingTilt(memory);
+  // Nothing to do when there is no tilt, no trade to size, or no memory at all.
+  if (!memory || tilt >= 1 || verdict.sizeMultiplier <= 0) return verdict;
+  const pct = Math.round(tilt * 100);
+  const why = memory.sizingMultiplier != null
+    ? `user sizing default ${pct}%`
+    : `${memory.riskTolerance} risk tolerance`;
+  return {
+    verdict: verdict.verdict,
+    sizeMultiplier: round4(verdict.sizeMultiplier * tilt),
+    panel: verdict.panel.map((p) => ({
+      persona: p.persona,
+      sizeMultiplier: round4(p.sizeMultiplier * tilt),
+      reasons: p.reasons,
+    })),
+    reasons: [
+      ...verdict.reasons,
+      `Personalized: shrunk size to ${pct}% per ${why} (preference only — de-risk, no gate change).`,
+    ],
+  };
+}
 
 /**
  * Assemble + self-validate the single AgentRecommendation. Shared by the LLM and
@@ -122,7 +183,13 @@ function assemble(
   costUsd: number,
 ): AgentRecommendation {
 
-  const routable = riskVerdict.verdict === 'APPROVE' && traderDecision.action !== 'HOLD';
+  // TRA-850 — personalize the verdict from the user's persistent preferences. A
+  // pure DE-RISK sizing tilt: it can shrink the size multiplier (never enlarge)
+  // and never flips the verdict or routability, so the additive invariant and the
+  // promotion gate are untouched.
+  const personalizedVerdict = personalizeRiskVerdict(riskVerdict, input.userMemory);
+
+  const routable = personalizedVerdict.verdict === 'APPROVE' && traderDecision.action !== 'HOLD';
   const proposedSignal = routable ? buildProposedSignal(input, traderDecision, input.asOf) : null;
 
   const recommendation: AgentRecommendation = {
@@ -130,13 +197,13 @@ function assemble(
     asOf: input.asOf,
     action: traderDecision.action,
     conviction: traderDecision.conviction,
-    sizeMultiplier: riskVerdict.sizeMultiplier,
+    sizeMultiplier: personalizedVerdict.sizeMultiplier,
     proposedSignal,
-    verdict: riskVerdict.verdict,
+    verdict: personalizedVerdict.verdict,
     analystReports,
     debateTranscript,
     traderDecision,
-    riskVerdict,
+    riskVerdict: personalizedVerdict,
     costUsd: round6(costUsd),
     latencyMs: Math.max(0, now() - startedAt),
   };
