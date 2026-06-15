@@ -31,6 +31,13 @@ export {
 export type { SupertrendBar, SupertrendDirection, SupertrendOptions } from './supertrend.js';
 export { donchian } from './donchian.js';
 export type { DonchianChannel } from './donchian.js';
+export { openingRangeBox, openingRangeBoxSignal, ORB_DEFAULTS } from './opening-range-box.js';
+export type {
+  OpeningRangeBox,
+  OpeningRangeOptions,
+  OrbSignal,
+  OrbSignalType,
+} from './opening-range-box.js';
 export {
   composeTechnicalSnapshot,
   composeTimeframeSignal,
