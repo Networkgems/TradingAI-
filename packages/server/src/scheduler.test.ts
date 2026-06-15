@@ -467,6 +467,98 @@ describe('MarketScheduler — TRA-368 onPremarket 9 AM ET hook', () => {
   });
 });
 
+describe('MarketScheduler — TRA-849 onMorningBrief 8:30 AM ET hook', () => {
+  let scheduler: MarketScheduler;
+
+  // 8:30 AM ET (EDT, UTC-4) → 12:30 UTC; back off 60 s for the first tick.
+  const at0830EDT = (yyyy: number, mm: number, dd: number) =>
+    new Date(Date.UTC(yyyy, mm - 1, dd, 12, 29, 0));
+  // 9:00 AM ET catch-up boundary → 13:00 UTC; back off 60 s.
+  const at0900EDT = (yyyy: number, mm: number, dd: number) =>
+    new Date(Date.UTC(yyyy, mm - 1, dd, 12, 59, 0));
+  // 8:00 AM ET (before the window opens) → 12:00 UTC; back off 60 s.
+  const at0800EDT = (yyyy: number, mm: number, dd: number) =>
+    new Date(Date.UTC(yyyy, mm - 1, dd, 11, 59, 0));
+
+  beforeEach(() => {
+    vi.useFakeTimers();
+    scheduler = new MarketScheduler();
+  });
+
+  afterEach(() => {
+    scheduler.stop();
+    vi.useRealTimers();
+  });
+
+  it('fires onMorningBrief once at 8:30 AM ET on a normal weekday', () => {
+    vi.setSystemTime(at0830EDT(2026, 4, 30)); // Thursday
+    const onMorningBrief = vi.fn();
+    scheduler.start({ onMorningBrief });
+
+    vi.advanceTimersByTime(60_000);
+    expect(onMorningBrief).toHaveBeenCalledTimes(1);
+  });
+
+  it('does not fire onMorningBrief before 8:30 ET', () => {
+    vi.setSystemTime(at0800EDT(2026, 4, 30));
+    const onMorningBrief = vi.fn();
+    scheduler.start({ onMorningBrief });
+
+    vi.advanceTimersByTime(60_000);
+    expect(onMorningBrief).not.toHaveBeenCalled();
+  });
+
+  it('does not fire onMorningBrief on a weekend or holiday', () => {
+    vi.setSystemTime(at0830EDT(2026, 5, 2)); // Saturday
+    const sat = vi.fn();
+    scheduler.start({ onMorningBrief: sat });
+    vi.advanceTimersByTime(60_000);
+    expect(sat).not.toHaveBeenCalled();
+    scheduler.stop();
+
+    const holiday = vi.fn();
+    const sched2 = new MarketScheduler();
+    vi.setSystemTime(at0830EDT(2026, 5, 25)); // Memorial Day
+    sched2.start({ onMorningBrief: holiday });
+    vi.advanceTimersByTime(60_000);
+    expect(holiday).not.toHaveBeenCalled();
+    sched2.stop();
+  });
+
+  it('fires once across the 8:30 → 9:00 window (catch-up does not double-fire)', () => {
+    vi.setSystemTime(at0830EDT(2026, 4, 30));
+    const onMorningBrief = vi.fn();
+    scheduler.start({ onMorningBrief });
+
+    // Tick every minute from 8:30 through past 9:00 — dedup keeps it to one.
+    for (let i = 0; i < 40; i++) vi.advanceTimersByTime(60_000);
+    expect(onMorningBrief).toHaveBeenCalledTimes(1);
+  });
+
+  it('catches up at the 9:00 boundary when the server missed 8:30', () => {
+    // Server first ticks at 9:00 ET (was redeploying across 8:30).
+    vi.setSystemTime(at0900EDT(2026, 4, 30));
+    const onMorningBrief = vi.fn();
+    scheduler.start({ onMorningBrief });
+
+    vi.advanceTimersByTime(60_000);
+    expect(onMorningBrief).toHaveBeenCalledTimes(1);
+  });
+
+  it('fires again on the next trading day', () => {
+    vi.setSystemTime(at0830EDT(2026, 4, 30));
+    const onMorningBrief = vi.fn();
+    scheduler.start({ onMorningBrief });
+
+    vi.advanceTimersByTime(60_000);
+    expect(onMorningBrief).toHaveBeenCalledTimes(1);
+
+    vi.setSystemTime(at0830EDT(2026, 5, 1)); // Friday
+    vi.advanceTimersByTime(60_000);
+    expect(onMorningBrief).toHaveBeenCalledTimes(2);
+  });
+});
+
 // ── TRA-388: archive fires at OR AFTER 21:00 ET ──────────────────────────────
 
 describe('MarketScheduler — TRA-388 archive window', () => {

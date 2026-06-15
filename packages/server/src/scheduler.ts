@@ -174,6 +174,18 @@ export interface ScheduleCallbacks {
    */
   onPremarket?: EodTriggerCallback;
   /**
+   * TRA-849 — fires at OR AFTER 8:30 AM ET (once per ET trading day) on stock-
+   * market trading days, ahead of the 9:00 ET pre-market watchlist build.
+   * Renders + pushes the per-user morning brief (macro gate + watchlist setups
+   * + open positions + overnight news) through the notification dispatcher.
+   * Fired at-or-after 8:30 rather than the exact minute (deduped per ET day) so
+   * a server restarting/redeploying across 8:30 ET still sends the brief later
+   * that morning instead of silently dropping the day — the same resilience the
+   * chain-recorder and archive hooks have. Capped to before the 9:00 bell by
+   * the gate below so it can't drift into the session.
+   */
+  onMorningBrief?: EodTriggerCallback;
+  /**
    * TRA-380 — fires at 3:55 PM ET on stock-market trading days, 5 minutes
    * before the closing bell. Drives the TRA-376 option-chain recorder so a
    * fresh date-partitioned chain snapshot lands once per trading day for the
@@ -242,6 +254,8 @@ export class MarketScheduler {
   private lastHourlyKey = '';
   /** TRA-368 — last ET date the 9 AM pre-market hook fired. Dedupes within the day. */
   private lastPremarketDate = '';
+  /** TRA-849 — last ET date the 8:30 AM morning-brief hook fired. Dedupes within the day. */
+  private lastMorningBriefDate = '';
   /** TRA-380 — last ET date the 3:55 PM option-chain recorder hook fired. Dedupes within the day. */
   private lastChainRecordDate = '';
 
@@ -272,6 +286,18 @@ export class MarketScheduler {
           this.lastDailyDate = todayKey;
           log.info('daily EOD trigger fired', { date: todayKey });
           runScheduled('daily EOD', cfg.onDaily);
+        }
+      }
+
+      // TRA-849 — morning-brief hook. Fire once per market day at OR AFTER
+      // 8:30 AM ET, with a 9:00-bell catch-up window, so a redeploy across the
+      // 8:30 minute still sends the brief later that pre-market window instead
+      // of dropping the day. Gated on market days; deduped per ET date.
+      if ((hour === 8 && minute >= 30) || (hour === 9 && minute === 0)) {
+        if (cfg.onMorningBrief && isMarketDay(date) && this.lastMorningBriefDate !== todayKey) {
+          this.lastMorningBriefDate = todayKey;
+          log.info('morning-brief trigger fired', { date: todayKey, etHour: hour, etMinute: minute });
+          runScheduled('morning-brief', cfg.onMorningBrief);
         }
       }
 
@@ -348,7 +374,7 @@ export class MarketScheduler {
       }
     }, 60_000);
 
-    log.info('EOD scheduler started (9:00 AM ET pre-market, 3:55 PM ET chain recorder, 4:05 PM ET reports, 9:00 PM ET archive)');
+    log.info('EOD scheduler started (8:30 AM ET morning brief, 9:00 AM ET pre-market, 3:55 PM ET chain recorder, 4:05 PM ET reports, 9:00 PM ET archive)');
   }
 
   stop(): void {

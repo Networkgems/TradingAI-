@@ -17,11 +17,18 @@
 
 import type {
   AlertEvent,
+  BriefingAlertEvent,
+  BriefMacroIndex,
+  BriefPosition,
+  BriefSetup,
   ExitAlertEvent,
   FillAlertEvent,
   RiskHaltAlertEvent,
   SignalAlertEvent,
 } from './dispatcher.js';
+
+/** Non-briefing events go through the compact single-context render path. */
+type SimpleAlertEvent = Exclude<AlertEvent, BriefingAlertEvent>;
 
 export interface RenderedAlert {
   /** Headline incl. status emoji, e.g. "🟢 TradingAI — Position Exited". */
@@ -143,7 +150,7 @@ function renderRiskHalt(e: RiskHaltAlertEvent): Rendered {
   };
 }
 
-function renderBody(event: AlertEvent): Rendered {
+function renderBody(event: SimpleAlertEvent): Rendered {
   switch (event.kind) {
     case 'fill':
       return renderFill(event);
@@ -160,6 +167,11 @@ function renderBody(event: AlertEvent): Rendered {
 
 /** Render a typed alert event into a channel-agnostic message. Pure. */
 export function renderAlert(event: AlertEvent, now: number = Date.now()): RenderedAlert {
+  // TRA-849 — the morning brief is a multi-section digest, not a single-line
+  // alert, so it gets its own render path rather than the compact context+lines
+  // format shared by fill/exit/signal/risk_halt.
+  if (event.kind === 'briefing') return renderBriefing(event, event.timestamp ?? now);
+
   const r = renderBody(event);
   const ts = event.timestamp ?? now;
   const stamp = fmtTimestamp(ts);
@@ -192,7 +204,7 @@ function joinContext(symbol: string, mode?: string, tag?: string): string {
 }
 
 /** A short symbol/mode tag for the email subject line. */
-function plainContext(event: AlertEvent): string {
+function plainContext(event: SimpleAlertEvent): string {
   switch (event.kind) {
     case 'fill':
     case 'exit':
@@ -206,4 +218,116 @@ function plainContext(event: AlertEvent): string {
 
 function capitalize(s: string): string {
   return s.length ? s[0]!.toUpperCase() + s.slice(1) : s;
+}
+
+// ── TRA-849 morning brief rendering ──────────────────────────────────────────
+
+const REGIME_EMOJI: Record<string, string> = { green: '🟢', yellow: '🟡', red: '🔴' };
+
+/** Format a macro-index reading: "VIX 18.4 — calm" / "Credit (HYG) — feed down". */
+function fmtMacroIndex(ix: BriefMacroIndex): string {
+  const val = ix.value != null && Number.isFinite(ix.value) ? fmtNum(ix.value) : '—';
+  const note = ix.note ? ` — ${ix.note}` : '';
+  return `${ix.label} ${val}${note}`;
+}
+
+/** Format one watchlist setup row: "AAPL · orb_long · buy · entry 150 · SL 147 · TP 156". */
+function fmtSetup(s: BriefSetup): string {
+  const bits = [s.symbol, s.signalType, s.side];
+  const levels: string[] = [];
+  if (s.entryPrice != null) levels.push(`entry ${fmtNum(s.entryPrice)}`);
+  if (s.stopLoss != null) levels.push(`SL ${fmtNum(s.stopLoss)}`);
+  if (s.takeProfit != null) levels.push(`TP ${fmtNum(s.takeProfit)}`);
+  return [bits.join(' · '), ...levels].join(' · ');
+}
+
+/** Format one open position row: "ETH-USD CRYPTO · long 2 @ 3,140 · P&L +$84.20". */
+function fmtPosition(p: BriefPosition): string {
+  const head = `${p.symbol} ${p.market.toUpperCase()}`;
+  const det = p.detail ? ` ${p.detail}` : '';
+  const core = `${p.side} ${fmtNum(p.quantity, 6)} @ ${fmtNum(p.entryPrice)}`;
+  const pnl = p.pnl != null ? ` · P&L ${fmtSignedUsd(p.pnl)}` : '';
+  return `${head}${det} · ${core}${pnl}`;
+}
+
+/**
+ * TRA-849 — render the multi-section morning brief into one channel-agnostic
+ * message. Pure. Empty sections render an explicit "none" line rather than being
+ * dropped, so the reader can tell "no open positions" from "section missing".
+ */
+function renderBriefing(event: BriefingAlertEvent, ts: number): RenderedAlert {
+  const emoji = REGIME_EMOJI[event.macro.regime.toLowerCase()] ?? '⚪';
+  const regimeLabel = event.macro.regime.toUpperCase();
+  const title = `${emoji} TradingAI — Morning Brief ${event.date}`;
+  const subject = `TradingAI — Morning Brief ${event.date} (regime ${regimeLabel})`;
+
+  // ── plain-text body ──
+  const lines: string[] = [title, ''];
+
+  lines.push(`📊 Macro gate: ${emoji} ${regimeLabel}`);
+  if (event.macro.rationale) lines.push(`   ${event.macro.rationale}`);
+  if (event.macro.indexes.length) {
+    for (const ix of event.macro.indexes) lines.push(`   • ${fmtMacroIndex(ix)}`);
+  }
+  lines.push('');
+
+  lines.push(`🎯 Watchlist setups (${event.setups.length})`);
+  if (event.setups.length) {
+    for (const s of event.setups) lines.push(`   • ${fmtSetup(s)}`);
+  } else {
+    lines.push('   • none');
+  }
+  lines.push('');
+
+  lines.push(`📁 Open positions (${event.positions.length})`);
+  if (event.positions.length) {
+    for (const p of event.positions) lines.push(`   • ${fmtPosition(p)}`);
+  } else {
+    lines.push('   • none');
+  }
+  lines.push('');
+
+  lines.push(`📰 Overnight news (${event.news.length})`);
+  if (event.news.length) {
+    for (const n of event.news) lines.push(`   • ${n.title} (${n.source})`);
+  } else {
+    lines.push('   • none');
+  }
+  lines.push('');
+
+  const stamp = fmtTimestamp(ts);
+  lines.push(stamp);
+  const text = lines.join('\n');
+
+  // ── HTML body ──
+  const section = (heading: string, rows: string[]): string =>
+    [
+      `<div style="font-size:15px;font-weight:600;margin:14px 0 4px;">${esc(heading)}</div>`,
+      ...rows.map(
+        (r) => `<div style="font-size:14px;margin:2px 0;color:#c9d1d9;">${esc(r)}</div>`,
+      ),
+    ].join('');
+
+  const macroRows = [
+    ...(event.macro.rationale ? [event.macro.rationale] : []),
+    ...event.macro.indexes.map(fmtMacroIndex),
+  ];
+  const setupRows = event.setups.length ? event.setups.map(fmtSetup) : ['none'];
+  const posRows = event.positions.length ? event.positions.map(fmtPosition) : ['none'];
+  const newsRows = event.news.length
+    ? event.news.map((n) => `${n.title} (${n.source})`)
+    : ['none'];
+
+  const html = [
+    `<div style="font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Helvetica,Arial,sans-serif;color:#c9d1d9;background:#0d1117;padding:24px;border-radius:8px;max-width:560px;">`,
+    `<div style="font-size:18px;font-weight:600;margin-bottom:8px;">${esc(title)}</div>`,
+    section(`Macro gate: ${regimeLabel}`, macroRows),
+    section(`Watchlist setups (${event.setups.length})`, setupRows),
+    section(`Open positions (${event.positions.length})`, posRows),
+    section(`Overnight news (${event.news.length})`, newsRows),
+    `<div style="color:#484f58;font-size:12px;margin-top:14px;">${esc(stamp)}</div>`,
+    `</div>`,
+  ].join('');
+
+  return { title, subject, text, html };
 }

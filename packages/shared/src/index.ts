@@ -687,14 +687,23 @@ export type AlertChannel = 'email' | 'telegram' | 'discord';
 
 export const ALERT_CHANNELS: readonly AlertChannel[] = ['email', 'telegram', 'discord'];
 
-/** The four event classes the dispatcher fans out (TRA-410 §1.1). */
-export type AlertEventClass = 'fill' | 'exit' | 'signal' | 'risk_halt';
+/**
+ * The event classes the dispatcher fans out (TRA-410 §1.1).
+ *
+ * TRA-849 — `briefing` is the scheduled once-per-trading-day pre-market morning
+ * brief (macro gate + watchlist setups + open positions + overnight news). It is
+ * low-frequency and high-value, so it routes to every channel by default (like
+ * `risk_halt`) rather than the quietest defaults the high-frequency `signal`
+ * class uses.
+ */
+export type AlertEventClass = 'fill' | 'exit' | 'signal' | 'risk_halt' | 'briefing';
 
 export const ALERT_EVENT_CLASSES: readonly AlertEventClass[] = [
   'fill',
   'exit',
   'signal',
   'risk_halt',
+  'briefing',
 ];
 
 /** Batching mode for the high-frequency `signal` class (TRA-410 §1.3 "Digest"). */
@@ -767,6 +776,9 @@ export const DEFAULT_ALERT_PREFERENCES: AlertPreferences = {
     exit: { email: true, telegram: false, discord: true },
     signal: { email: false, telegram: false, discord: true },
     risk_halt: { email: true, telegram: true, discord: true },
+    // TRA-849 — once-daily pre-market brief; on for every channel so a linked
+    // Telegram/Discord receives it without a matrix edit.
+    briefing: { email: true, telegram: true, discord: true },
   },
   quietHours: { enabled: false, start: '22:00', end: '07:00', timezone: 'America/New_York' },
   signalDigest: 'immediate',

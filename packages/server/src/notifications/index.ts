@@ -18,6 +18,11 @@ export type {
   ExitAlertEvent,
   SignalAlertEvent,
   RiskHaltAlertEvent,
+  BriefingAlertEvent,
+  BriefMacroIndex,
+  BriefSetup,
+  BriefPosition,
+  BriefHeadline,
   ChannelAdapter,
   DispatcherDeps,
 } from './dispatcher.js';

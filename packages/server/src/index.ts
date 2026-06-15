@@ -50,6 +50,7 @@ import {
 } from './watchlist-store.js';
 import { scanStocksMarket, scanCryptoMarket } from './market-scanner.js';
 import { runPremarketForAllUsers } from './premarket-watchlist.js';
+import { runMorningBriefForAllUsers } from './morning-brief.js';
 import { recordOptionChains } from './options-chain-recorder.js';
 import { recordSentimentSnapshot } from './sentiment-snapshot-recorder.js';
 import {
@@ -5289,6 +5290,13 @@ scheduler.start({
   // at minute=0 every ET hour; per-user trackers no-op when no perps are
   // open or the user is in demo mode.
   onHourly: runHourlyFundingForAllUsers,
+  // TRA-849 — 8:30 AM ET pre-market morning brief. Renders the macro gate +
+  // each user's watchlist setups, open book, and overnight news, then pushes
+  // it through the notification dispatcher. Runs ahead of the 9:00 watchlist
+  // build; market days only (gated in the scheduler).
+  onMorningBrief: async () => {
+    await runMorningBriefForAllUsers();
+  },
   // TRA-368 — 9:00 AM ET pre-market routine. Replays prior session's EOD
   // review + a fresh pre-market scan into each user's smart watchlist so
   // the SignalEngine starts the new session with curated symbols. Stocks

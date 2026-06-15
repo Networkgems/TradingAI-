@@ -1,6 +1,7 @@
 import { describe, it, expect } from 'vitest';
 import { renderAlert } from './renderer.js';
 import type {
+  BriefingAlertEvent,
   ExitAlertEvent,
   FillAlertEvent,
   RiskHaltAlertEvent,
@@ -118,6 +119,84 @@ describe('renderAlert', () => {
     expect(r.html).toContain('&lt;script&gt;');
     expect(r.html).toContain('x&amp;y');
     expect(r.html).not.toContain('<script>');
+  });
+
+  // ── TRA-849 morning brief ──────────────────────────────────────────────────
+
+  it('renders a full morning brief with all four sections', () => {
+    const e: BriefingAlertEvent = {
+      kind: 'briefing',
+      username: 'alice',
+      timestamp: TS,
+      date: '2026-05-17',
+      macro: {
+        regime: 'yellow',
+        rationale: 'VIX elevated at 24; breakouts gated.',
+        indexes: [
+          { label: 'VIX', value: 24.1, note: 'elevated' },
+          { label: '10Y Yield', value: 4.32 },
+          { label: 'Credit (HYG)', value: null, note: 'feed down' },
+        ],
+      },
+      setups: [
+        { symbol: 'AAPL', signalType: 'orb_long', side: 'buy', entryPrice: 150, stopLoss: 147, takeProfit: 156 },
+      ],
+      positions: [
+        { symbol: 'ETH-USD', market: 'crypto', side: 'long', quantity: 2, entryPrice: 3140, pnl: 84.2 },
+      ],
+      news: [{ title: 'Fed holds rates steady', source: 'Reuters' }],
+    };
+    const r = renderAlert(e);
+    expect(r.title).toBe('🟡 TradingAI — Morning Brief 2026-05-17');
+    expect(r.subject).toBe('TradingAI — Morning Brief 2026-05-17 (regime YELLOW)');
+    // Macro
+    expect(r.text).toContain('Macro gate: 🟡 YELLOW');
+    expect(r.text).toContain('VIX 24.1 — elevated');
+    expect(r.text).toContain('Credit (HYG) — — feed down');
+    // Setups
+    expect(r.text).toContain('AAPL · orb_long · buy · entry 150 · SL 147 · TP 156');
+    // Positions
+    expect(r.text).toContain('ETH-USD CRYPTO · long 2 @ 3,140 · P&L +$84.20');
+    // News
+    expect(r.text).toContain('Fed holds rates steady (Reuters)');
+    expect(r.text).toContain('2026-05-17 14:32 ET');
+    expect(r.html.length).toBeGreaterThan(0);
+  });
+
+  it('renders explicit "none" for empty brief sections', () => {
+    const e: BriefingAlertEvent = {
+      kind: 'briefing',
+      username: 'bob',
+      timestamp: TS,
+      date: '2026-05-17',
+      macro: { regime: 'green', rationale: '', indexes: [] },
+      setups: [],
+      positions: [],
+      news: [],
+    };
+    const r = renderAlert(e);
+    expect(r.title).toBe('🟢 TradingAI — Morning Brief 2026-05-17');
+    expect(r.text).toContain('Watchlist setups (0)');
+    expect(r.text).toContain('Open positions (0)');
+    expect(r.text).toContain('Overnight news (0)');
+    expect(r.text.match(/• none/g)?.length).toBe(3);
+  });
+
+  it('HTML-escapes brief news + setup strings', () => {
+    const e: BriefingAlertEvent = {
+      kind: 'briefing',
+      username: 'alice',
+      timestamp: TS,
+      date: '2026-05-17',
+      macro: { regime: 'green', rationale: '<b>ok</b>', indexes: [] },
+      setups: [],
+      positions: [],
+      news: [{ title: '<script>x</script>', source: 'A&B' }],
+    };
+    const r = renderAlert(e);
+    expect(r.html).toContain('&lt;script&gt;');
+    expect(r.html).toContain('A&amp;B');
+    expect(r.html).not.toContain('<script>x');
   });
 
   it('produces a non-empty html and a text/html pair for every kind', () => {

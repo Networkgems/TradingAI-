@@ -90,11 +90,72 @@ export interface RiskHaltAlertEvent extends AlertEventBase {
   reason: string;
 }
 
+/** One macro-index reading on the morning brief (VIX / breadth / credit / rates). */
+export interface BriefMacroIndex {
+  label: string;
+  value: number | null;
+  note?: string;
+}
+
+/** One candidate trade setup surfaced on the brief's watchlist. */
+export interface BriefSetup {
+  symbol: string;
+  signalType: string;
+  side: string;
+  entryPrice?: number;
+  stopLoss?: number;
+  takeProfit?: number;
+}
+
+/** One open position summarised on the brief. */
+export interface BriefPosition {
+  symbol: string;
+  market: AlertMarket;
+  side: string;
+  quantity: number;
+  entryPrice: number;
+  pnl?: number;
+  /** Optional extra qualifier, e.g. an options leg "call 150 2026-06-19". */
+  detail?: string;
+}
+
+/** One overnight headline on the brief. */
+export interface BriefHeadline {
+  title: string;
+  source: string;
+}
+
+/**
+ * TRA-849 — scheduled pre-market morning briefing. Fired once per trading day
+ * (~8:30 ET) by the scheduler's `onMorningBrief` hook and dispatched per user
+ * through the existing fan-out pipeline. Carries the four structured sections the
+ * shared renderer formats into a single channel-agnostic message: the macro gate
+ * (VIX / breadth / credit / rates), today's watchlist setups, the open book, and
+ * overnight news. Unlike `signal` it is never digest-batched (it is already a
+ * once-daily digest by construction).
+ */
+export interface BriefingAlertEvent extends AlertEventBase {
+  kind: 'briefing';
+  /** ET trading date the brief targets, `YYYY-MM-DD`. Scopes the daily dedup key. */
+  date: string;
+  macro: {
+    /** Regime label from the latest market review, e.g. 'green' | 'yellow' | 'red'. */
+    regime: string;
+    /** Human rationale for the regime. */
+    rationale: string;
+    indexes: BriefMacroIndex[];
+  };
+  setups: BriefSetup[];
+  positions: BriefPosition[];
+  news: BriefHeadline[];
+}
+
 export type AlertEvent =
   | FillAlertEvent
   | ExitAlertEvent
   | SignalAlertEvent
-  | RiskHaltAlertEvent;
+  | RiskHaltAlertEvent
+  | BriefingAlertEvent;
 
 /** A channel adapter rendered the event; shape is owned by A2's renderer. */
 export interface ChannelAdapter {
@@ -334,6 +395,10 @@ export class NotificationDispatcher {
         return `signal:${event.username}:${event.symbol}:${event.signalType}:${event.side}`;
       case 'risk_halt':
         return `risk_halt:${event.username}:${event.reason}`;
+      case 'briefing':
+        // One brief per user per trading day — a re-run (catch-up / restart)
+        // inside the TTL window collapses to the single delivery.
+        return `briefing:${event.username}:${event.date}`;
     }
   }
 
