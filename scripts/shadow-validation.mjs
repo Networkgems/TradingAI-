@@ -104,7 +104,7 @@ if (signals.length > 0 && rowsWithEmitField === 0) {
     '# TRA-789 — Shadow-signal live-tape validation\n\n'
     + `**ABORT: re-baseline not observed.** ${signals.length} rows in ledger but none carry the \`emitted\` field.`
     + ' Render is still serving pre-TRA-840 legacy rows. Do not trust these metrics for TRA-734.'
-    + ' Re-run after the Render deploy boots and \`rebaselineIfLegacy\` archives the contaminated rows.\n'
+    + ' Re-run after the Render deploy boots and `rebaselineIfLegacy` archives the contaminated rows.\n'
   );
   process.exit(1);
 }

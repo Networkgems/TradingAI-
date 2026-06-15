@@ -277,9 +277,9 @@ async function main() {
     qualifies: g.qualifies,
   }));
 
-  let oosByArm: Record<string, ReturnType<typeof pooledRun>> = {};
-  let walkForward: Array<Record<string, unknown>> = [];
-  let neighborStability: Array<Record<string, unknown>> = [];
+  const oosByArm: Record<string, ReturnType<typeof pooledRun>> = {};
+  const walkForward: Array<Record<string, unknown>> = [];
+  const neighborStability: Array<Record<string, unknown>> = [];
   let thinness = { pooledOosRoundTrips: 0, ge12: false };
   let regimeIndexVariant: Record<string, unknown> | null = null;
 
