@@ -111,6 +111,41 @@ describe('SignalEngine — TRA-848 manual approve/reject', () => {
     expect(res.reason).toMatch(/live routing disabled/);
   });
 
+  it('two concurrent approve taps of the same reco open exactly one position', async () => {
+    // TRA-848 — TOCTOU hardening: a double-tap (or Telegram redelivering the
+    // same update) fires approveRecommendationById twice before the first fill
+    // lands. The synchronous id-claim must let exactly one win.
+    const engine = await engineFor('demo');
+    setRecos(engine, [buildReco('AAPL', 1_000)]);
+
+    const [a, b] = await Promise.all([
+      engine.approveRecommendationById('AAPL', 100),
+      engine.approveRecommendationById('AAPL', 100),
+    ]);
+
+    const okCount = [a, b].filter(r => r.ok).length;
+    expect(okCount).toBe(1);
+    expect([a, b].find(r => !r.ok)!.reason).toMatch(/already routed|no pending recommendation/);
+    expect(engine.getState().account.openPositions.filter(p => p.symbol === 'AAPL')).toHaveLength(1);
+    expect(engine.getAgentRecommendations()).toHaveLength(0);
+  });
+
+  it('a skipped approve (no quote) releases the claim so a retry can route', async () => {
+    // The claim must roll back when routeEquitySignal opens nothing, otherwise a
+    // transient skip would permanently wedge the recommendation as "already routed".
+    const engine = await engineFor('demo');
+    setRecos(engine, [buildReco('AAPL', 1_000)]);
+
+    // No price + no live quote source -> routeEquitySignal opens nothing.
+    const skipped = await engine.approveRecommendationById('AAPL', undefined);
+    expect(skipped.ok).toBe(false);
+
+    // Retry with a valid in-bracket price now succeeds (claim was released).
+    const retry = await engine.approveRecommendationById('AAPL', 100);
+    expect(retry.ok).toBe(true);
+    expect(engine.getState().account.openPositions.some(p => p.symbol === 'AAPL')).toBe(true);
+  });
+
   it('reject drops the recommendation from the pending set without routing', async () => {
     const engine = await engineFor('demo');
     setRecos(engine, [buildReco('AAPL', 1_000), buildReco('TSLA', 1_000)]);

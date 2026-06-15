@@ -3003,11 +3003,25 @@ export class SignalEngine {
     if (this.routedAgentSignalIds.has(signal.id)) {
       return { ok: false, reason: `${reco.symbol} already routed` };
     }
-    const pos = await this.routeEquitySignal(signal, price, 'agent-gating');
+    // TRA-848 — claim the id SYNCHRONOUSLY before awaiting the route so two
+    // concurrent approve taps (a double-tap, or Telegram redelivering the same
+    // update) can't both clear the `.has()` guard and routeEquitySignal's own
+    // dedup before either fill lands — a TOCTOU double-fire window on a capital
+    // path. The loser of the race now sees the claim and bails. We roll the
+    // claim back below if the route doesn't actually open, so a transient
+    // skip (no quote / risk gate) stays retryable.
+    this.routedAgentSignalIds.add(signal.id);
+    let pos: Position | null;
+    try {
+      pos = await this.routeEquitySignal(signal, price, 'agent-gating');
+    } catch (err) {
+      this.routedAgentSignalIds.delete(signal.id);
+      throw err;
+    }
     if (!pos) {
+      this.routedAgentSignalIds.delete(signal.id);
       return { ok: false, reason: signal.signalSkipReason ?? `${reco.symbol} not opened (no quote / dedup / risk gate)` };
     }
-    this.routedAgentSignalIds.add(signal.id);
     // Drop the routed reco so it no longer shows as pending on the chat surface.
     this.latestAgentRecommendations = this.latestAgentRecommendations.filter(r => r !== reco);
     // TRA-850 — learn from the interaction: an approved recommendation tallies as
