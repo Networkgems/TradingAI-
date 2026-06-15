@@ -125,8 +125,20 @@ export default function Dashboard({ token, onLogout, onGoHome, onActivity, theme
 
       {/* TRA-535 — halt banner. `tradingHalted`/`haltReason` from /api/state
           reflect the TRA-526 kill switch (reason takes precedence over the
-          daily circuit-breakers) and update live over the WebSocket. */}
-      <HaltBanner halted={state?.tradingHalted ?? false} reason={state?.haltReason ?? null} />
+          daily circuit-breakers) and update live over the WebSocket.
+          TRA-895 — pass `isKillSwitch` so daily-circuit-breaker halts show
+          a "Clear halt" button while kill-switch halts do not. */}
+      <HaltBanner
+        halted={state?.tradingHalted ?? false}
+        reason={state?.haltReason ?? null}
+        isKillSwitch={accountSettings?.globalKillSwitchEngaged ?? false}
+        onClearHalt={async () => {
+          await fetch(`${HTTP_URL}/api/trading/reset-halt`, {
+            method: 'POST',
+            headers: { Authorization: `Bearer ${token}` },
+          });
+        }}
+      />
 
       {/* TRA-690 — grouped nav: the core trading workflow (Watchlist → Signals →
           Positions → Options → AI Ideas) stays flat; reference/utility surfaces

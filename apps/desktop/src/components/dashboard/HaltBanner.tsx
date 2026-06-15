@@ -5,7 +5,22 @@
 // `/api/state`, where the kill-switch reason already takes precedence over the
 // daily circuit-breakers (see DailyRiskGovernor.getHaltReason). The Crypto
 // dashboard drives it from the kill-switch engaged state, its only halt source.
-export function HaltBanner({ halted, reason }: { halted: boolean; reason: string | null }) {
+//
+// TRA-895 — when the halt is from the daily circuit-breaker (not the kill
+// switch), show a "Clear halt" button so an operator can resume without waiting
+// for the ET midnight day-roll. Kill-switch halts must be released via the
+// dedicated KillSwitchButton — not here.
+export function HaltBanner({
+  halted,
+  reason,
+  isKillSwitch = false,
+  onClearHalt,
+}: {
+  halted: boolean;
+  reason: string | null;
+  isKillSwitch?: boolean;
+  onClearHalt?: () => void;
+}) {
   if (!halted) return null;
   return (
     <div
@@ -26,10 +41,29 @@ export function HaltBanner({ halted, reason }: { halted: boolean; reason: string
       }}
     >
       <span aria-hidden="true" style={{ fontSize: '1.1rem' }}>🛑</span>
-      <span>
+      <span style={{ flex: 1 }}>
         Trading halted — no new entries.
         {reason ? <span style={{ fontWeight: 400 }}>{` ${reason}`}</span> : ' Global kill switch engaged.'}
       </span>
+      {!isKillSwitch && onClearHalt && (
+        <button
+          onClick={onClearHalt}
+          style={{
+            background: 'transparent',
+            border: '1px solid var(--red)',
+            color: 'var(--red-strong)',
+            borderRadius: '4px',
+            padding: '0.25rem 0.65rem',
+            fontSize: '0.8rem',
+            fontWeight: 600,
+            cursor: 'pointer',
+            whiteSpace: 'nowrap',
+            flexShrink: 0,
+          }}
+        >
+          Clear halt
+        </button>
+      )}
     </div>
   );
 }

@@ -466,6 +466,15 @@ export class DailyRiskGovernor {
     this.killSwitchReason = null;
   }
 
+  /** TRA-895 — operator reset of the daily circuit-breaker (consecutive-loss / drawdown halt).
+   *  Does NOT touch the kill switch — that requires a separate releaseKillSwitch() call. */
+  resetDailyCircuitBreaker(): void {
+    this.consecutiveLosses = 0;
+    this.dailyPnl = 0;
+    this.halted = false;
+    this.haltReason = null;
+  }
+
   /** TRA-526 — whether the manual global kill switch is currently engaged. */
   isKillSwitchEngaged(): boolean {
     return this.killSwitchEngaged;
@@ -3467,6 +3476,11 @@ export class SignalEngine {
   /** TRA-526 — release the global kill switch. Daily circuit-breakers still apply. */
   releaseKillSwitch(): void {
     this.riskGovernor.releaseKillSwitch();
+  }
+
+  /** TRA-895 — operator reset of the daily circuit-breaker without touching the kill switch. */
+  resetDailyCircuitBreaker(): void {
+    this.riskGovernor.resetDailyCircuitBreaker();
   }
 
   /** TRA-526 — whether the global kill switch is currently engaged. */

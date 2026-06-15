@@ -4174,6 +4174,16 @@ app.post('/api/trading/kill-switch', requireAuth, async (req, res) => {
   });
 });
 
+// TRA-895 — operator reset of the daily circuit-breaker (consecutive-loss / drawdown halt).
+// Clears the intraday halt so Trading Agents can open new entries again without waiting for
+// the ET midnight day-roll. Does NOT touch the kill switch. Demo-safe: no settings are mutated.
+app.post('/api/trading/reset-halt', requireAuth, async (_req, res) => {
+  const ctx = await userCtx(res);
+  ctx.engine.resetDailyCircuitBreaker();
+  broadcastEngineState(ctx);
+  res.json({ ok: true, tradingHalted: false });
+});
+
 // TRA-544 (TRA-529 §2B) — flip the runtime "Trading Agents" master switch from
 // the banner toggle. ON hands trade decisions to the advisory multi-agent layer
 // and SUSPENDS the deterministic auto-router; OFF restores the deterministic
