@@ -172,6 +172,7 @@ describe('buildOptionsIdeasFeed', () => {
         maxLossUsd: 380,
         dteDays: 35,
         eventContext: ['Fed in 4d'],
+        catalystHorizon: 'medium',
         rank: 1,
       },
     ],

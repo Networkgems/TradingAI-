@@ -45,6 +45,8 @@ export interface SymbolEventContext {
   macroEventsNearby?: string[];
   /** Recency-weighted aggregate news sentiment −1…+1. */
   newsSentiment?: number | null;
+  /** TRA-846 — coarse sector bucket for the diversification guardrail (e.g. "Technology"). */
+  sector?: string | null;
 }
 
 export interface FuseOptionsResearchOptions {
@@ -143,6 +145,7 @@ export function fuseOptionsResearchSymbol(
     daysToFOMC: ctx.daysToFOMC ?? null,
     macroEventsNearby: ctx.macroEventsNearby ?? [],
     newsSentiment: ctx.newsSentiment ?? null,
+    sector: ctx.sector ?? null,
     candidates,
   };
 }

@@ -17,7 +17,7 @@ import {
   type OptionsResearchResult,
   type DayTradingGuardrail,
 } from '@trading-app/agents';
-import { DAY_TRADING_GUARDRAIL } from '@trading-app/shared';
+import { DAY_TRADING_GUARDRAIL, sectorOf } from '@trading-app/shared';
 import {
   fuseOptionsResearchInput,
   type SymbolEventContext,
@@ -258,12 +258,17 @@ export async function buildIdeasFeed(opts: BuildIdeasOptions): Promise<OptionsId
   const contextFor = (symbol: string): SymbolEventContext => {
     const snap = snapshots.find((s) => s.symbol === symbol.toUpperCase());
     const atmIv = snap && snap.spot != null ? atmIvFromRows(snap.rows, snap.spot) : null;
+    // TRA-846 — resolve the sector from the existing hand-maintained map (TRA-844).
+    // 'Other'/unmapped → null so the ranker treats the name as its own bucket
+    // rather than clustering every unmapped ticker into one "Other" sector.
+    const sector = sectorOf(symbol);
     return {
       ivRank: atmIv != null ? ivRankSync(symbol, atmIv, now) : null,
       nextEarningsInDays: earningsInDaysSync(symbol, now),
       daysToFOMC: fomc,
       macroEventsNearby: macroNearby,
       newsSentiment: null,
+      sector: sector === 'Other' ? null : sector,
     };
   };
   const input = fuseOptionsResearchInput(snapshots, now, { contextFor, now });

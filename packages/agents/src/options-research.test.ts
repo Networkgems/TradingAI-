@@ -154,7 +154,12 @@ describe('runOptionsResearch', () => {
         ],
       }),
     );
-    const out = await runOptionsResearch(input({ maxIdeas: 10 }), { llm });
+    // No earnings event on the symbol so the TRA-846 earnings de-dupe doesn't
+    // collapse the two same-ticker survivors — this test is about the HARD guardrail.
+    const out = await runOptionsResearch(
+      input({ maxIdeas: 10, symbols: [symbol({ nextEarningsInDays: null })] }),
+      { llm },
+    );
     for (const idea of out.ideas) {
       expect(isDefinedRiskStrategy(idea.strategy)).toBe(true);
       expect(idea.dteDays).toBeGreaterThanOrEqual(DEFAULT_OPTIONS_GUARDRAIL.minDteDays);
@@ -172,11 +177,76 @@ describe('runOptionsResearch', () => {
         ],
       }),
     );
-    const out = await runOptionsResearch(input({ maxIdeas: 2 }), { llm });
+    // No earnings event → no de-dupe; same (unknown) sector so the per-sector cap
+    // (2) admits the top-2 by score, exercising pure ranking + truncation.
+    const out = await runOptionsResearch(
+      input({ maxIdeas: 2, symbols: [symbol({ nextEarningsInDays: null })] }),
+      { llm },
+    );
     expect(out.ideas).toHaveLength(2);
     // 0.8/150 beats 0.8/400 beats 0.55/200; top-2 kept.
     expect(out.ideas.map((i) => i.strategy)).toEqual(['bull_put_spread', 'iron_condor']);
     expect(out.ideas.map((i) => i.rank)).toEqual([1, 2]);
+  });
+
+  // ── TRA-846 diversification guardrail ──────────────────────────────────────
+  it('de-dupes multiple ideas riding the same earnings event, keeping the best', async () => {
+    // The default AAPL symbol has earnings in 18d; two AAPL ideas both ride it.
+    const llm = new StubLlmClient(() =>
+      JSON.stringify({
+        ideas: [
+          goodIdea({ strategy: 'iron_condor', pop: 0.6, maxLossUsd: 400 }),
+          goodIdea({ strategy: 'bull_put_spread', pop: 0.78, maxLossUsd: 300 }), // best
+        ],
+      }),
+    );
+    const out = await runOptionsResearch(input({ maxIdeas: 5 }), { llm });
+    expect(out.ideas).toHaveLength(1);
+    expect(out.ideas[0]!.strategy).toBe('bull_put_spread');
+    expect(out.rejected.some((r) => r.reasons.join(' ').includes('earnings event'))).toBe(true);
+  });
+
+  it('spreads the slate across catalyst horizons over raw score', async () => {
+    // ZNEAR: earnings in 3d (near). ZLONG: no catalyst, long-dated (long).
+    const symbols: OptionsResearchSymbol[] = [
+      symbol({ symbol: 'ZNEAR', nextEarningsInDays: 3, daysToFOMC: null, candidates: symbol().candidates }),
+      symbol({ symbol: 'ZLONG', nextEarningsInDays: null, daysToFOMC: null, candidates: symbol().candidates }),
+    ];
+    const llm = new StubLlmClient(() =>
+      JSON.stringify({
+        ideas: [
+          goodIdea({ ticker: 'ZNEAR', strategy: 'iron_condor', pop: 0.85, maxLossUsd: 200 }), // best, near
+          goodIdea({ ticker: 'ZLONG', strategy: 'long_call', pop: 0.6, maxLossUsd: 200 }), // long
+        ],
+      }),
+    );
+    const out = await runOptionsResearch(input({ maxIdeas: 2, symbols }), { llm });
+    expect(out.ideas.map((i) => i.catalystHorizon).sort()).toEqual(['long', 'near']);
+    expect(out.ideas[0]!.ticker).toBe('ZNEAR'); // best score still ranks first
+  });
+
+  it('caps ideas per sector when sectors are supplied', async () => {
+    const symbols: OptionsResearchSymbol[] = [
+      symbol({ symbol: 'TEC1', sector: 'Technology', nextEarningsInDays: null, candidates: symbol().candidates }),
+      symbol({ symbol: 'TEC2', sector: 'Technology', nextEarningsInDays: null, candidates: symbol().candidates }),
+      symbol({ symbol: 'TEC3', sector: 'Technology', nextEarningsInDays: null, candidates: symbol().candidates }),
+      symbol({ symbol: 'FIN1', sector: 'Financials', nextEarningsInDays: null, candidates: symbol().candidates }),
+    ];
+    const llm = new StubLlmClient(() =>
+      JSON.stringify({
+        ideas: [
+          goodIdea({ ticker: 'TEC1', strategy: 'long_call', pop: 0.9, maxLossUsd: 200 }),
+          goodIdea({ ticker: 'TEC2', strategy: 'long_call', pop: 0.88, maxLossUsd: 200 }),
+          goodIdea({ ticker: 'TEC3', strategy: 'long_call', pop: 0.86, maxLossUsd: 200 }),
+          goodIdea({ ticker: 'FIN1', strategy: 'long_call', pop: 0.5, maxLossUsd: 200 }),
+        ],
+      }),
+    );
+    const out = await runOptionsResearch(input({ maxIdeas: 3, symbols }), { llm });
+    const tech = out.ideas.filter((i) => ['TEC1', 'TEC2', 'TEC3'].includes(i.ticker));
+    expect(tech).toHaveLength(2); // per-sector cap = 2
+    // The lower-scored Financials idea is pulled in for sector spread.
+    expect(out.ideas.map((i) => i.ticker)).toContain('FIN1');
   });
 
   it('retries on a schema-invalid batch then succeeds', async () => {

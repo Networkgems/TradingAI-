@@ -52,6 +52,12 @@ export interface OptionsIdeaView {
   ivRank?: number;
   dte: number;
   events: IdeaEvent[];
+  /**
+   * TRA-846 — catalyst horizon bucket (near/medium/long) the diversification
+   * re-rank assigned this idea. Carried so the panel/audit can show the slate is
+   * spread across horizons. Optional for back-compat with non-live/preview views.
+   */
+  catalystHorizon?: 'near' | 'medium' | 'long';
   legs: IdeaLeg[];
   /**
    * TRA-678 (F2) — false when the payoff is a thin-chain fallback placeholder
@@ -472,6 +478,7 @@ export function buildOptionsIdeasFeed(args: BuildFeedArgs): BuiltFeed {
       ...(sym.ivRank != null ? { ivRank: sym.ivRank } : {}),
       dte: idea.dteDays,
       events: buildEventsForSymbol(sym),
+      catalystHorizon: idea.catalystHorizon,
       legs: structure.legs,
       priced: structure.priced,
     });

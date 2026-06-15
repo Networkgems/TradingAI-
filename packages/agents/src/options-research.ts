@@ -109,6 +109,13 @@ export interface OptionsResearchSymbol {
   macroEventsNearby: string[];
   /** Recency-weighted aggregate news sentiment −1…+1, or `null` with no feed. */
   newsSentiment: number | null;
+  /**
+   * TRA-846 — coarse sector bucket (e.g. "Technology", "Financials") for the
+   * diversification guardrail. `null`/absent when the caller can't resolve one;
+   * the ranker then treats the ticker as its own bucket (no false clustering) and
+   * leans on the model's own sector knowledge from the prompt instead.
+   */
+  sector?: string | null;
   /** Candidate contracts the scanners surfaced for this symbol. */
   candidates: OptionsScannerCandidate[];
 }
@@ -137,6 +144,45 @@ export const DEFAULT_OPTIONS_GUARDRAIL: DayTradingGuardrail = {
   definedRiskOnly: true,
 };
 
+/**
+ * TRA-846 — catalyst horizon a returned idea sits in, derived deterministically
+ * from the soonest scheduled catalyst (earnings/FOMC) for its underlying, or the
+ * idea's own DTE when there is no near catalyst:
+ *   • near   — catalyst within `nearMaxDays`
+ *   • medium — catalyst within `mediumMaxDays`
+ *   • long   — no near catalyst / longer-dated thesis
+ */
+export type CatalystHorizon = 'near' | 'medium' | 'long';
+
+/**
+ * TRA-846 — the idea-ranker diversification guardrail. Applied deterministically
+ * AFTER the defined-risk / DTE guardrail so the surfaced slate is spread across
+ * catalyst horizons and sectors rather than clustering (e.g. an all-earnings-week,
+ * all-mega-cap-Tech book). Pure re-ranking — no new infra, no new LLM call.
+ */
+export interface DiversificationPolicy {
+  /** Max ideas allowed to share one sector bucket in the returned slate. */
+  maxPerSector: number;
+  /** Collapse multiple ideas riding the SAME underlying's upcoming earnings to one (best-scored wins). */
+  dedupeEarningsEvent: boolean;
+  /** A catalyst ≤ this many days out is "near". */
+  nearMaxDays: number;
+  /** A catalyst ≤ this many days out (and > nearMaxDays) is "medium"; beyond is "long". */
+  mediumMaxDays: number;
+}
+
+/**
+ * Diversification defaults. Two ideas per sector, one per earnings event, and a
+ * near/medium/long split at 14d / 35d (the 35d upper edge ~ the live 21–60 DTE
+ * window midpoint, so a swing idea with no nearer catalyst reads as "long").
+ */
+export const DEFAULT_DIVERSIFICATION: DiversificationPolicy = {
+  maxPerSector: 2,
+  dedupeEarningsEvent: true,
+  nearMaxDays: 14,
+  mediumMaxDays: 35,
+};
+
 export interface OptionsResearchInput {
   /** Decision bar — every fused input is timestamped at/before this. */
   asOf: number;
@@ -145,6 +191,8 @@ export interface OptionsResearchInput {
   maxIdeas?: number;
   /** The C3 guardrail. Defaults to {@link DEFAULT_OPTIONS_GUARDRAIL}. */
   guardrail?: DayTradingGuardrail;
+  /** TRA-846 diversification guardrail. Defaults to {@link DEFAULT_DIVERSIFICATION}. */
+  diversification?: DiversificationPolicy;
 }
 
 export interface OptionsIdea {
@@ -159,6 +207,8 @@ export interface OptionsIdea {
   dteDays: number;
   /** Event-context badges for the UI, e.g. ["earnings in 3d", "FOMC in 1d"]. */
   eventContext: string[];
+  /** TRA-846 — catalyst horizon bucket this idea sits in (near/medium/long). */
+  catalystHorizon: CatalystHorizon;
   /** 1-based rank after deterministic re-sort (1 = best). */
   rank: number;
 }
@@ -209,6 +259,7 @@ function utcDay(asOf: number): string {
  */
 export function optionsResearchBatchKey(input: OptionsResearchInput): string {
   const g = input.guardrail ?? DEFAULT_OPTIONS_GUARDRAIL;
+  const d = input.diversification ?? DEFAULT_DIVERSIFICATION;
   const maxIdeas = input.maxIdeas ?? 5;
   const round = (v: number | null, dp = 2): string =>
     v == null || !Number.isFinite(v) ? '_' : (Math.round(v * 10 ** dp) / 10 ** dp).toString();
@@ -230,6 +281,7 @@ export function optionsResearchBatchKey(input: OptionsResearchInput): string {
         s.daysToFOMC ?? '_',
         s.macroEventsNearby.join('|'),
         round(s.newsSentiment, 3),
+        s.sector ?? '_',
         cands,
       ].join('#');
     })
@@ -240,6 +292,7 @@ export function optionsResearchBatchKey(input: OptionsResearchInput): string {
     `min${g.minDteDays}`,
     g.definedRiskOnly ? 'dr1' : 'dr0',
     `max${maxIdeas}`,
+    `div${d.maxPerSector}:${d.dedupeEarningsEvent ? 1 : 0}:${d.nearMaxDays}:${d.mediumMaxDays}`,
     symbols,
   ].join('|');
 }
@@ -323,6 +376,18 @@ const SYSTEM_PROMPT = [
   'capped wing). When IV-rank is LOW, prefer net-debit structures. Around earnings/FOMC,',
   'prefer spreads over long single options to blunt IV-crush.',
   '',
+  'DIVERSIFICATION — build a SPREAD slate, not a clustered one:',
+  '6. Spread ideas across catalyst horizons. Use the soonest scheduled catalyst for each name',
+  '   (earnings / FOMC / macro print) to gauge horizon: NEAR (catalyst within ~2 weeks),',
+  '   MEDIUM (~2–5 weeks), LONG (no near catalyst / a longer-dated thesis). Do NOT return an',
+  '   all-earnings-week book — mix the horizons when the data supports it.',
+  '7. Spread ideas across sectors. The `sector` field is given when known; otherwise use your own',
+  '   knowledge of each ticker. Avoid concentrating the slate in a single sector (e.g. all mega-cap Tech).',
+  '8. DE-DUPE earnings events: never return more than ONE idea riding the same underlying\'s upcoming',
+  '   earnings. Pick the single best structure for that event and drop the rest.',
+  'A diversification re-rank is applied deterministically after you answer, so a clustered slate',
+  'will be thinned — give a spread of your strongest distinct ideas, ranked best-first.',
+  '',
   'Return ONLY a JSON object, no prose, of the form:',
   '{ "ideas": [ { "ticker": str, "strategy": str, "thesis": str, "pop": num(0..1),',
   '  "maxLossUsd": num>0, "dteDays": int, "eventContext": [str] } ] }',
@@ -330,14 +395,26 @@ const SYSTEM_PROMPT = [
   'return { "ideas": [] }.',
 ].join('\n');
 
-function buildUserPrompt(input: OptionsResearchInput, guardrail: DayTradingGuardrail, maxIdeas: number): string {
+function buildUserPrompt(
+  input: OptionsResearchInput,
+  guardrail: DayTradingGuardrail,
+  maxIdeas: number,
+  diversification: DiversificationPolicy,
+): string {
   const universe = input.symbols.map((s) => s.symbol).join(', ');
   const payload = {
     asOf: new Date(input.asOf).toISOString(),
     minDteDays: guardrail.minDteDays,
     maxIdeas,
+    diversification: {
+      maxPerSector: diversification.maxPerSector,
+      nearMaxDays: diversification.nearMaxDays,
+      mediumMaxDays: diversification.mediumMaxDays,
+      dedupeEarningsEvent: diversification.dedupeEarningsEvent,
+    },
     universe: input.symbols.map((s) => ({
       symbol: s.symbol,
+      sector: s.sector ?? null,
       spot: s.spot,
       ivRank: s.ivRank,
       nextEarningsInDays: s.nextEarningsInDays,
@@ -362,6 +439,8 @@ function buildUserPrompt(input: OptionsResearchInput, guardrail: DayTradingGuard
   return [
     `Universe: ${universe}.`,
     `Minimum DTE (no day trading): ${guardrail.minDteDays}. Return at most ${maxIdeas} ranked ideas.`,
+    `Diversify: at most ${diversification.maxPerSector} ideas per sector, one idea per earnings event,`,
+    `and spread across near (<=${diversification.nearMaxDays}d) / medium (<=${diversification.mediumMaxDays}d) / long catalyst horizons.`,
     'Fused per-symbol data follows as JSON:',
     JSON.stringify(payload),
   ].join('\n');
@@ -380,21 +459,76 @@ interface RawIdea {
 }
 
 /**
- * Deterministic post-LLM gate. Drops any proposed idea that is not in the
- * defined-risk allowlist, falls below the C3 minimum DTE, or names a ticker
- * outside the supplied universe. Survivors are re-sorted best-first (POP desc,
- * then smaller max-loss) and renumbered, then truncated to `maxIdeas`. This is
- * the line that makes the acceptance guarantee — every RETURNED idea is
- * defined-risk and clears the guardrail — independent of what the model said.
+ * TRA-846 — classify an idea's catalyst horizon from its underlying's soonest
+ * scheduled catalyst (earnings or FOMC). With no near catalyst we fall back to
+ * the idea's own DTE, so a longer-dated swing thesis reads as "long".
+ */
+function classifyHorizon(
+  sym: OptionsResearchSymbol | undefined,
+  dteDays: number,
+  policy: DiversificationPolicy,
+): CatalystHorizon {
+  const catalysts: number[] = [];
+  if (sym) {
+    if (sym.nextEarningsInDays != null && sym.nextEarningsInDays >= 0) catalysts.push(sym.nextEarningsInDays);
+    if (sym.daysToFOMC != null && sym.daysToFOMC >= 0) catalysts.push(sym.daysToFOMC);
+  }
+  const ref = catalysts.length > 0 ? Math.min(...catalysts) : dteDays;
+  if (ref <= policy.nearMaxDays) return 'near';
+  if (ref <= policy.mediumMaxDays) return 'medium';
+  return 'long';
+}
+
+/**
+ * Sector bucket for the per-sector cap. A known sector groups names together; an
+ * unknown sector falls back to a per-ticker bucket so unmapped names are NOT
+ * falsely clustered into one giant "unknown" sector that the cap would over-thin.
+ */
+function sectorKeyFor(sym: OptionsResearchSymbol | undefined, ticker: string): string {
+  const sector = sym?.sector?.trim();
+  return sector ? `S:${sector.toUpperCase()}` : `U:${ticker}`;
+}
+
+/** Earnings-event key: the underlying, but only when it has an upcoming earnings to de-dupe on. */
+function earningsKeyFor(sym: OptionsResearchSymbol | undefined, ticker: string): string | null {
+  if (!sym || sym.nextEarningsInDays == null || sym.nextEarningsInDays < 0) return null;
+  return `E:${ticker}`;
+}
+
+interface ScoredIdea {
+  idea: OptionsIdea;
+  sectorKey: string;
+  horizon: CatalystHorizon;
+  earningsKey: string | null;
+}
+
+/**
+ * Deterministic post-LLM gate. Two stages:
+ *
+ *   1. HARD guardrail (the acceptance guarantee). Drops any proposed idea that
+ *      is not in the defined-risk allowlist, falls below the C3 minimum DTE, or
+ *      names a ticker outside the supplied universe. Every RETURNED idea is
+ *      defined-risk and clears the guardrail, independent of what the model said.
+ *
+ *   2. TRA-846 DIVERSIFICATION re-rank over the survivors (POP desc, then smaller
+ *      max-loss as the base score): de-dupe ideas riding the same earnings event,
+ *      then greedily select up to `maxIdeas` while covering near/medium/long
+ *      catalyst horizons and capping ideas per sector. Always takes the
+ *      best-scored eligible idea, so within a horizon/sector the ranking is still
+ *      score order. Ideas thinned by the re-rank are recorded in `rejected` for
+ *      audit. Pure re-ranking — no new infra, no extra LLM call.
  */
 function enforceGuardrail(
   raw: RawIdea[],
   input: OptionsResearchInput,
   guardrail: DayTradingGuardrail,
   maxIdeas: number,
+  policy: DiversificationPolicy,
 ): { ideas: OptionsIdea[]; rejected: RejectedIdea[] } {
-  const universe = new Set(input.symbols.map((s) => s.symbol.toUpperCase()));
-  const kept: OptionsIdea[] = [];
+  const symByTicker = new Map<string, OptionsResearchSymbol>();
+  for (const s of input.symbols) symByTicker.set(s.symbol.toUpperCase(), s);
+  const universe = new Set(symByTicker.keys());
+  const kept: ScoredIdea[] = [];
   const rejected: RejectedIdea[] = [];
 
   for (const r of raw) {
@@ -414,20 +548,87 @@ function enforceGuardrail(
       });
       continue;
     }
+    const sym = symByTicker.get(ticker);
+    const horizon = classifyHorizon(sym, r.dteDays, policy);
     kept.push({
-      ticker,
-      strategy: r.strategy as DefinedRiskStrategy,
-      thesis: r.thesis.trim(),
-      pop: r.pop,
-      maxLossUsd: r.maxLossUsd,
-      dteDays: r.dteDays,
-      eventContext: r.eventContext ?? [],
-      rank: 0,
+      idea: {
+        ticker,
+        strategy: r.strategy as DefinedRiskStrategy,
+        thesis: r.thesis.trim(),
+        pop: r.pop,
+        maxLossUsd: r.maxLossUsd,
+        dteDays: r.dteDays,
+        eventContext: r.eventContext ?? [],
+        catalystHorizon: horizon,
+        rank: 0,
+      },
+      sectorKey: sectorKeyFor(sym, ticker),
+      horizon,
+      earningsKey: earningsKeyFor(sym, ticker),
     });
   }
 
-  kept.sort((a, b) => (b.pop !== a.pop ? b.pop - a.pop : a.maxLossUsd - b.maxLossUsd));
-  const ideas = kept.slice(0, maxIdeas).map((idea, i) => ({ ...idea, rank: i + 1 }));
+  // Base score: POP desc, then smaller max-loss.
+  kept.sort((a, b) =>
+    b.idea.pop !== a.idea.pop ? b.idea.pop - a.idea.pop : a.idea.maxLossUsd - b.idea.maxLossUsd,
+  );
+
+  // Stage 2a — earnings-event de-dupe (best-scored idea per event wins).
+  const seenEarnings = new Set<string>();
+  const deduped: ScoredIdea[] = [];
+  for (const s of kept) {
+    if (policy.dedupeEarningsEvent && s.earningsKey) {
+      if (seenEarnings.has(s.earningsKey)) {
+        rejected.push({
+          idea: { ...s.idea, rank: 0 },
+          reasons: [`duplicate ${s.idea.ticker} earnings event (a higher-ranked idea already trades it)`],
+        });
+        continue;
+      }
+      seenEarnings.add(s.earningsKey);
+    }
+    deduped.push(s);
+  }
+
+  // Stage 2b — diversity-aware greedy selection (horizon spread + per-sector cap).
+  const used = new Array<boolean>(deduped.length).fill(false);
+  const sectorCount = new Map<string, number>();
+  const coveredHorizons = new Set<CatalystHorizon>();
+  const selected: ScoredIdea[] = [];
+  const underCap = (i: number): boolean =>
+    (sectorCount.get(deduped[i]!.sectorKey) ?? 0) < policy.maxPerSector;
+  const take = (i: number): void => {
+    used[i] = true;
+    const s = deduped[i]!;
+    sectorCount.set(s.sectorKey, (sectorCount.get(s.sectorKey) ?? 0) + 1);
+    coveredHorizons.add(s.horizon);
+    selected.push(s);
+  };
+  while (selected.length < maxIdeas) {
+    let pick = -1;
+    // A: best idea that opens a not-yet-covered horizon AND keeps its sector under cap.
+    for (let i = 0; i < deduped.length; i++) {
+      if (!used[i] && underCap(i) && !coveredHorizons.has(deduped[i]!.horizon)) { pick = i; break; }
+    }
+    // B: else best idea whose sector is still under cap.
+    if (pick < 0) for (let i = 0; i < deduped.length; i++) if (!used[i] && underCap(i)) { pick = i; break; }
+    // C: else best remaining (sector cap relaxed only to fill the slate).
+    if (pick < 0) for (let i = 0; i < deduped.length; i++) if (!used[i]) { pick = i; break; }
+    if (pick < 0) break;
+    take(pick);
+  }
+
+  // Audit: survivors thinned by the diversification re-rank (beyond maxIdeas / sector spread).
+  for (let i = 0; i < deduped.length; i++) {
+    if (!used[i]) {
+      rejected.push({
+        idea: { ...deduped[i]!.idea, rank: 0 },
+        reasons: ['dropped by diversification re-rank (beyond maxIdeas / sector spread)'],
+      });
+    }
+  }
+
+  const ideas = selected.map((s, i) => ({ ...s.idea, rank: i + 1 }));
   return { ideas, rejected };
 }
 
@@ -445,6 +646,7 @@ export async function runOptionsResearch(
   deps: OptionsResearchDeps,
 ): Promise<OptionsResearchResult> {
   const guardrail = input.guardrail ?? DEFAULT_OPTIONS_GUARDRAIL;
+  const diversification = input.diversification ?? DEFAULT_DIVERSIFICATION;
   const maxIdeas = Math.max(1, input.maxIdeas ?? 5);
 
   // Nothing to research → no spend, no call.
@@ -461,7 +663,7 @@ export async function runOptionsResearch(
 
   const messages: LlmMessage[] = [
     { role: 'system', content: SYSTEM_PROMPT },
-    { role: 'user', content: buildUserPrompt(input, guardrail, maxIdeas) },
+    { role: 'user', content: buildUserPrompt(input, guardrail, maxIdeas, diversification) },
   ];
 
   const completion: CompleteJsonResult<RawIdeaBatch> = await completeJson<RawIdeaBatch>(
@@ -475,6 +677,7 @@ export async function runOptionsResearch(
     input,
     guardrail,
     maxIdeas,
+    diversification,
   );
 
   const result: OptionsResearchResult = {
