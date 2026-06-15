@@ -690,6 +690,11 @@ async function createUserContext(username: string): Promise<UserContext> {
   // risk-halt) resolve this user's notification preferences.
   engine.setAlertUsername(username);
   const cryptoEngine = new CryptoSignalEngine(cryptoTracker, settings);
+  // TRA-857 — bind the owning user on the crypto engine too so its live-broker
+  // builder scopes the shared COINBASE_* env-cred fallback to the pinned
+  // operator. Without this, any new user flipping crypto to Live inherits the
+  // operator's Coinbase account (the TRA-856 multi-tenant data leak).
+  cryptoEngine.setOwnerUsername(username);
 
   // Restore trade history (TRA-140)
   try {

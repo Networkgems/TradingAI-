@@ -2,7 +2,7 @@ import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import { tmpdir } from 'os';
 import { join } from 'path';
 import { rmSync } from 'fs';
-import { SignalEngine, sizeLiveEquityFromStop, shortBlockedOnCashAccount, gateSignalOnReview, describeGatedStrategies, shouldBootArmLiveEquity, shouldRunRelativeValueScan } from './signal-engine.js';
+import { SignalEngine, sizeLiveEquityFromStop, shortBlockedOnCashAccount, gateSignalOnReview, describeGatedStrategies, shouldBootArmLiveEquity, shouldRunRelativeValueScan, isLiveBrokerOperator, resolveLiveBrokerOperator } from './signal-engine.js';
 import { setShadowLedgerFileForTests } from './shadow-signal-ledger.js';
 import { PaperAccount } from './paper-account.js';
 import type { RelativeValueScannerService, RelativeValueScanResult } from './relative-value-scanner.js';
@@ -3570,6 +3570,86 @@ describe('shouldBootArmLiveEquity — TRA-713 persistent live-equity boot-arm', 
   it('respects an explicit liveTradeEquitiesTradier:false opt-out', () => {
     const s = { ...prodSettings(), liveTradeEquitiesTradier: false };
     expect(shouldBootArmLiveEquity(s, PIN, prodEnv())).toBe(false);
+  });
+});
+
+describe('isLiveBrokerOperator — TRA-857 shared-env operator pin', () => {
+  it('matches the pinned operator', () => {
+    expect(isLiveBrokerOperator('admin', { LIVE_EQUITY_BOOT_USER: 'admin' })).toBe(true);
+  });
+
+  it('rejects every non-pinned user (multi-tenant leak guard)', () => {
+    expect(isLiveBrokerOperator('alice', { LIVE_EQUITY_BOOT_USER: 'admin' })).toBe(false);
+  });
+
+  it('rejects undefined / empty username', () => {
+    expect(isLiveBrokerOperator(undefined, { LIVE_EQUITY_BOOT_USER: 'admin' })).toBe(false);
+    expect(isLiveBrokerOperator('', { LIVE_EQUITY_BOOT_USER: 'admin' })).toBe(false);
+  });
+
+  it('unset pin ⇒ falls back to the committed "admin" default', () => {
+    expect(isLiveBrokerOperator('admin', {})).toBe(true);
+    expect(isLiveBrokerOperator('alice', {})).toBe(false);
+    expect(resolveLiveBrokerOperator({})).toBe('admin');
+  });
+
+  it('explicitly empty pin ⇒ disarms for everyone (no operator)', () => {
+    expect(isLiveBrokerOperator('admin', { LIVE_EQUITY_BOOT_USER: '' })).toBe(false);
+    expect(resolveLiveBrokerOperator({ LIVE_EQUITY_BOOT_USER: '' })).toBe('');
+  });
+});
+
+describe('buildTradierLiveEquityClient — TRA-857 operator-scoped env fallback', () => {
+  // A live user with NO per-user Tradier creds (the fresh-signup case). The only
+  // creds available are the shared server-env TRADIER_* values.
+  const envOnlyLiveSettings = (): AccountSettings => ({
+    ...DEFAULT_ACCOUNT_SETTINGS,
+    mode: 'live',
+    liveTradeEquitiesTradier: true,
+    liveTradierEnvOptions: 'production',
+    // no liveApiKeyOptionsProduction / liveAccountIdOptionsProduction
+  });
+  const readEquityClient = (e: SignalEngine): TradierOrderClient | null =>
+    (e as unknown as { tradierLiveEquityClient: TradierOrderClient | null }).tradierLiveEquityClient;
+
+  let saved: Record<string, string | undefined>;
+  beforeEach(() => {
+    saved = {
+      LIVE_EQUITY_BOOT_USER: process.env['LIVE_EQUITY_BOOT_USER'],
+      TRADIER_API_TOKEN: process.env['TRADIER_API_TOKEN'],
+      TRADIER_ACCOUNT_ID: process.env['TRADIER_ACCOUNT_ID'],
+    };
+    process.env['LIVE_EQUITY_BOOT_USER'] = 'admin';
+    process.env['TRADIER_API_TOKEN'] = 'shared-env-tok';
+    process.env['TRADIER_ACCOUNT_ID'] = 'shared-env-acct';
+  });
+  afterEach(() => {
+    for (const [k, v] of Object.entries(saved)) {
+      if (v === undefined) delete process.env[k];
+      else process.env[k] = v;
+    }
+  });
+
+  it('does NOT resolve the shared env account for a non-operator user (TRA-856 leak closed)', () => {
+    const engine = new SignalEngine(envOnlyLiveSettings());
+    engine.setAlertUsername('freshly-signed-up-user');
+    expect(readEquityClient(engine)).toBeNull();
+  });
+
+  it('still resolves the shared env account for the pinned operator', () => {
+    const engine = new SignalEngine(envOnlyLiveSettings());
+    engine.setAlertUsername('admin');
+    expect(readEquityClient(engine)).not.toBeNull();
+  });
+
+  it('per-user creds work for a non-operator (precedence unchanged)', () => {
+    const engine = new SignalEngine({
+      ...envOnlyLiveSettings(),
+      liveApiKeyOptionsProduction: 'her-own-tok',
+      liveAccountIdOptionsProduction: 'her-own-acct',
+    });
+    engine.setAlertUsername('alice');
+    expect(readEquityClient(engine)).not.toBeNull();
   });
 });
 

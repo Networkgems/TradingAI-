@@ -569,6 +569,14 @@ export class SignalEngine {
    */
   private alertUsername: string | undefined;
   /**
+   * TRA-857 — last settings snapshot the engine resolved its live broker
+   * clients from. Retained so {@link setAlertUsername} (which runs after the
+   * constructor, once the owning user is known) can rebuild the operator-scoped
+   * Tradier live clients without waiting for the next applySettings. Mirrors the
+   * crypto engine's `currentSettings`.
+   */
+  private lastSettings: AccountSettings | undefined;
+  /**
    * TRA-572 — unique key for this engine's slot in the process-global stock
    * quote feed registry (yahoo-feed). Keying per engine means a credential-less
    * context clearing its own Tradier token can never evict another engine's
@@ -907,11 +915,15 @@ export class SignalEngine {
         holdLiveOptionsOvernightForPdt,
       }),
     };
+    this.lastSettings = settings;
     if (settings) {
-      this.tradierLiveClient = buildTradierLiveClient(settings);
+      // TRA-857 — username is unknown at construction (setAlertUsername runs
+      // after `new`), so these resolve with no operator env fallback here; the
+      // operator's clients are (re)built in setAlertUsername once bound.
+      this.tradierLiveClient = buildTradierLiveClient(settings, this.alertUsername);
       this.tradierLiveOptionsEnabled = isLiveTradierOptionsEnabled(settings);
       this.liveTradeEquitiesTradier = resolveLiveTradeEquitiesTradier(settings);
-      this.tradierLiveEquityClient = buildTradierLiveEquityClient(settings);
+      this.tradierLiveEquityClient = buildTradierLiveEquityClient(settings, this.alertUsername);
       this.tradierOptionsClientByEnv = buildTradierOptionsClientsByEnv(settings);
       // TRA-505 — seed the watchlist quote feed from the saved Tradier creds at
       // boot so quotes use Tradier (not Yahoo's rate-limited free feed) from the
@@ -1020,10 +1032,13 @@ export class SignalEngine {
       demoFeePerContract: demoCost.feePerContract,
       holdLiveOptionsOvernightForPdt,
     });
+    // TRA-857 — keep the snapshot fresh so setAlertUsername can rebuild the
+    // operator-scoped live clients from the latest settings.
+    this.lastSettings = settings;
     // TRA-221 — re-resolve the Tradier live client whenever settings change
     // so toggling Live mode or editing the API token takes effect on the
     // next tick without requiring a server restart.
-    this.tradierLiveClient = buildTradierLiveClient(settings);
+    this.tradierLiveClient = buildTradierLiveClient(settings, this.alertUsername);
     // TRA-352 follow-up — same for the per-env clients used by the pending-
     // close reconciler, so a fresh token saved mid-session is picked up on
     // the next tick.
@@ -1036,7 +1051,7 @@ export class SignalEngine {
     // next tick without a server restart. TRA-370 — absent ↔ true so Live
     // mirrors Demo's signal flow out of the box.
     this.liveTradeEquitiesTradier = resolveLiveTradeEquitiesTradier(settings);
-    this.tradierLiveEquityClient = buildTradierLiveEquityClient(settings);
+    this.tradierLiveEquityClient = buildTradierLiveEquityClient(settings, this.alertUsername);
     // TRA-505 — re-point the watchlist quote feed at the user's saved Tradier
     // creds on every settings change so a freshly entered/rotated token takes
     // effect on the next tick. Without this the feed only ever sees the (usually
@@ -3315,7 +3330,19 @@ export class SignalEngine {
 
   /** TRA-563 — bind the owning user so emitted alerts resolve that user's prefs. */
   setAlertUsername(username: string): void {
+    const changed = this.alertUsername !== username;
     this.alertUsername = username;
+    // TRA-857 — the live Tradier order clients scope their shared `process.env`
+    // cred fallback to the pinned operator (isLiveBrokerOperator). The
+    // constructor runs before this binding, so for the operator those clients
+    // resolved with no env fallback (username unknown) and came back null.
+    // Rebuild from the retained settings now that the owning user is known so
+    // the operator's live broker comes online without waiting for a settings
+    // save — and, conversely, a non-operator can never resolve them via env.
+    if (changed && this.lastSettings) {
+      this.tradierLiveClient = buildTradierLiveClient(this.lastSettings, username);
+      this.tradierLiveEquityClient = buildTradierLiveEquityClient(this.lastSettings, username);
+    }
   }
 
   private alertMode(): AccountMode {
@@ -5189,7 +5216,10 @@ export class SignalEngine {
  * relative-value-scanner.ts so a working RV scanner pair also enables live
  * order placement without re-entering creds).
  */
-function buildTradierLiveClient(settings: AccountSettings): TradierOptionsClient | null {
+function buildTradierLiveClient(
+  settings: AccountSettings,
+  username: string | undefined,
+): TradierOptionsClient | null {
   if (settings.mode !== 'live') return null;
   // TRA-226 — sandbox/production credentials live on separate fields. The
   // shared resolver returns the pair matching the currently selected env; we
@@ -5197,18 +5227,28 @@ function buildTradierLiveClient(settings: AccountSettings): TradierOptionsClient
   // creds via env (TRADIER_*).
   const resolved = resolveTradierOptionsCreds(settings);
   const env = resolved.env;
+  // TRA-857 — like the equity client, this is a real-money LIVE order client.
+  // Scope the shared `process.env` TRADIER_* fallback to the pinned operator so
+  // a fresh non-operator Live user never inherits the operator's options
+  // account (same multi-tenant leak class as TRA-856). Per-user saved creds are
+  // unaffected and continue to work for any user.
+  const allowEnvFallback = isLiveBrokerOperator(username);
   const apiToken = (
     resolved.apiToken
-    || (env === 'production'
-      ? process.env['TRADIER_API_TOKEN']
-      : (process.env['TRADIER_SANDBOX_API_TOKEN'] ?? process.env['TRADIER_API_TOKEN']))
+    || (allowEnvFallback
+      ? (env === 'production'
+        ? process.env['TRADIER_API_TOKEN']
+        : (process.env['TRADIER_SANDBOX_API_TOKEN'] ?? process.env['TRADIER_API_TOKEN']))
+      : '')
     || ''
   ).trim();
   const accountId = (
     resolved.accountId
-    || (env === 'production'
-      ? process.env['TRADIER_ACCOUNT_ID']
-      : (process.env['TRADIER_SANDBOX_ACCOUNT_ID'] ?? process.env['TRADIER_ACCOUNT_ID']))
+    || (allowEnvFallback
+      ? (env === 'production'
+        ? process.env['TRADIER_ACCOUNT_ID']
+        : (process.env['TRADIER_SANDBOX_ACCOUNT_ID'] ?? process.env['TRADIER_ACCOUNT_ID']))
+      : '')
     || ''
   ).trim();
   if (!apiToken || !accountId) return null;
@@ -5323,13 +5363,41 @@ function buildTradierOptionsClientsByEnv(
  */
 export const BOOT_ARM_LIVE_EQUITY_USER_DEFAULT = 'admin';
 
+/**
+ * TRA-857 — resolve the operator pin that scopes shared-env live-broker creds.
+ * Single source of truth shared by {@link shouldBootArmLiveEquity} and
+ * {@link isLiveBrokerOperator}: `LIVE_EQUITY_BOOT_USER` with the board-ratified
+ * `admin` default (render.yaml, approval 979c77c1). An EXPLICITLY EMPTY value
+ * (`LIVE_EQUITY_BOOT_USER=""`) resolves to "" and disarms — preserving the
+ * documented "clear this value" kill-switch.
+ */
+export function resolveLiveBrokerOperator(env: NodeJS.ProcessEnv = process.env): string {
+  return (env['LIVE_EQUITY_BOOT_USER'] ?? BOOT_ARM_LIVE_EQUITY_USER_DEFAULT).trim();
+}
+
+/**
+ * TRA-857 — true when `username` is the pinned operator allowed to fall back to
+ * the shared `process.env` broker credentials (TRADIER_* / COINBASE_*). Every
+ * other user must rely on their own per-user Settings creds; otherwise the live
+ * broker stays empty so a brand-new signup flipping to Live never inherits the
+ * operator's broker account — the TRA-856 multi-tenant data leak. An unset /
+ * empty pin disarms the fallback for everyone (no user can be the operator).
+ */
+export function isLiveBrokerOperator(
+  username: string | undefined,
+  env: NodeJS.ProcessEnv = process.env,
+): boolean {
+  if (!username) return false;
+  const pin = resolveLiveBrokerOperator(env);
+  return pin.length > 0 && username === pin;
+}
+
 export function shouldBootArmLiveEquity(
   settings: AccountSettings,
   username: string,
   env: NodeJS.ProcessEnv = process.env,
 ): boolean {
-  const pinned = (env['LIVE_EQUITY_BOOT_USER'] ?? BOOT_ARM_LIVE_EQUITY_USER_DEFAULT).trim();
-  if (!pinned || pinned !== username) return false;
+  if (!isLiveBrokerOperator(username, env)) return false;
   if ((env['TRADIER_ENV'] ?? '') !== 'production') return false;
   if ((settings.liveTradierEnvOptions ?? 'sandbox') !== 'production') return false;
   if (!resolveLiveTradeEquitiesTradier(settings)) return false;
@@ -5339,24 +5407,37 @@ export function shouldBootArmLiveEquity(
   return apiToken.length > 0 && accountId.length > 0;
 }
 
-function buildTradierLiveEquityClient(settings: AccountSettings): TradierOrderClient | null {
+function buildTradierLiveEquityClient(
+  settings: AccountSettings,
+  username: string | undefined,
+): TradierOrderClient | null {
   if (settings.mode !== 'live') return null;
   // TRA-370 — absent ↔ true so Live opens equity brackets out of the box.
   if (!resolveLiveTradeEquitiesTradier(settings)) return null;
   const resolved = resolveTradierOptionsCreds(settings);
   const env = resolved.env;
+  // TRA-857 — per-user saved creds always apply, but the shared `process.env`
+  // TRADIER_* fallback is scoped to the pinned operator. Without this, every
+  // brand-new user who flips to Live would resolve the operator's broker and
+  // see its positions/equity (the TRA-856 multi-tenant leak). A non-operator
+  // with no saved creds resolves no token → null → empty live equity view.
+  const allowEnvFallback = isLiveBrokerOperator(username);
   const apiToken = (
     resolved.apiToken
-    || (env === 'production'
-      ? process.env['TRADIER_API_TOKEN']
-      : (process.env['TRADIER_SANDBOX_API_TOKEN'] ?? process.env['TRADIER_API_TOKEN']))
+    || (allowEnvFallback
+      ? (env === 'production'
+        ? process.env['TRADIER_API_TOKEN']
+        : (process.env['TRADIER_SANDBOX_API_TOKEN'] ?? process.env['TRADIER_API_TOKEN']))
+      : '')
     || ''
   ).trim();
   const accountId = (
     resolved.accountId
-    || (env === 'production'
-      ? process.env['TRADIER_ACCOUNT_ID']
-      : (process.env['TRADIER_SANDBOX_ACCOUNT_ID'] ?? process.env['TRADIER_ACCOUNT_ID']))
+    || (allowEnvFallback
+      ? (env === 'production'
+        ? process.env['TRADIER_ACCOUNT_ID']
+        : (process.env['TRADIER_SANDBOX_ACCOUNT_ID'] ?? process.env['TRADIER_ACCOUNT_ID']))
+      : '')
     || ''
   ).trim();
   if (!apiToken || !accountId) return null;

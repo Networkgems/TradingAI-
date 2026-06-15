@@ -43,6 +43,10 @@ import { evaluateFeedFreshness } from './feed-freshness.js';
 import { CryptoPaperAccount } from './crypto-account.js';
 import { CryptoLiveAccount } from './crypto-live-account.js';
 import { FundingRateTracker } from './funding-rate-tracker.js';
+// TRA-857 — operator pin so the shared COINBASE_* env-cred fallback below is
+// scoped to the pinned operator (mirrors the stock equity client). signal-engine
+// does not import this module, so this is a one-way dependency (no cycle).
+import { isLiveBrokerOperator } from './signal-engine.js';
 import type { PnlTracker } from './pnl-tracker.js';
 import { logger } from './observability/index.js';
 
@@ -297,6 +301,15 @@ export class CryptoSignalEngine {
   private fundingTracker: FundingRateTracker | null = null;
   /** Last settings snapshot — kept so applySettings can re-evaluate live broker creds. */
   private currentSettings: AccountSettings | undefined;
+  /**
+   * TRA-857 — owning username, bound by user-context after construction via
+   * {@link setOwnerUsername} (mirrors the stock engine's setAlertUsername). Used
+   * by {@link buildLiveBroker} to scope the shared COINBASE_* env-cred fallback
+   * to the pinned operator so a fresh signup flipping to Live never inherits the
+   * operator's Coinbase account. Undefined until bound → env fallback denied
+   * (the safe default for an unowned engine).
+   */
+  private ownerUsername: string | undefined;
 
   constructor(tracker?: PnlTracker, settings?: AccountSettings) {
     this.tracker = tracker;
@@ -331,6 +344,21 @@ export class CryptoSignalEngine {
   }
 
   /**
+   * TRA-857 — bind the owning user so {@link buildLiveBroker} can scope the
+   * shared COINBASE_* env-cred fallback to the pinned operator. Mirrors the
+   * stock engine's setAlertUsername; user-context wires both at boot. Because
+   * the constructor's live-broker init ran before the username was known (so an
+   * operator engine could not yet resolve the env fallback), re-init the live
+   * broker when the binding changes and we're in live mode. tryInitLiveBroker
+   * is a guarded no-op when a broker is already built or creds don't resolve.
+   */
+  setOwnerUsername(username: string): void {
+    if (this.ownerUsername === username) return;
+    this.ownerUsername = username;
+    if (this.mode === 'live') void this.tryInitLiveBroker();
+  }
+
+  /**
    * Build a CryptoLiveAccount from settings/env credentials. Returns null
    * when credentials are absent — callers fall back to the frozen demo view.
    *
@@ -351,16 +379,23 @@ export class CryptoSignalEngine {
     // entered on the Stocks dashboard never accidentally drives Coinbase.
     // Fall back to the legacy un-suffixed fields for users that saved before
     // the crypto/stocks split, then to env vars for single-user installs.
+    // TRA-857 — per-user crypto creds always apply, but the shared COINBASE_*
+    // env fallback is scoped to the pinned operator (LIVE_EQUITY_BOOT_USER,
+    // default 'admin'). Without this, ANY new user who flips crypto to Live
+    // resolves the operator's Coinbase account and sees its holdings (the
+    // reproduced TRA-856 leak: 85 Coinbase positions on a fresh crypto-Live
+    // account). A non-operator with no per-user creds → null → empty live view.
+    const allowEnvFallback = isLiveBrokerOperator(this.ownerUsername);
     const apiKey = (
       s?.liveApiKeyCrypto?.trim()
       || s?.liveApiKey?.trim()
-      || process.env.COINBASE_API_KEY
+      || (allowEnvFallback ? process.env.COINBASE_API_KEY : '')
       || ''
     ).trim();
     const apiSecret = (
       s?.liveApiSecretCrypto?.trim()
       || s?.liveApiSecret?.trim()
-      || process.env.COINBASE_API_SECRET
+      || (allowEnvFallback ? process.env.COINBASE_API_SECRET : '')
       || ''
     ).trim();
     if (!apiKey || !apiSecret) return null;

@@ -717,6 +717,73 @@ describe('CryptoSignalEngine — TRA-346 four-bucket sub-account wiring (TRA-349
   });
 });
 
+// TRA-857 — the shared COINBASE_* env-cred fallback must be scoped to the
+// pinned operator so a brand-new user flipping crypto to Live never inherits
+// the operator's Coinbase account (reproduced leak: 85 holdings on a fresh
+// crypto-Live signup). buildLiveBroker is called directly (mode='demo' so
+// setOwnerUsername never fires the HTTP-bound tryInitLiveBroker) to test the
+// scoping in isolation.
+describe('CryptoSignalEngine — TRA-857 operator-scoped COINBASE env fallback', () => {
+  interface OperatorScopeInternals {
+    buildLiveBroker: () => CryptoLiveAccountInternals | null;
+    setOwnerUsername: (u: string) => void;
+  }
+  // A live crypto user with NO per-user Coinbase creds (the fresh-signup case).
+  const envOnlySettings = (): AccountSettings => ({
+    ...DEFAULT_ACCOUNT_SETTINGS,
+    mode: 'demo', // demo so setOwnerUsername doesn't kick off the live broker init (HTTP)
+    // no liveApiKeyCrypto / liveApiSecretCrypto
+  });
+
+  let saved: Record<string, string | undefined>;
+  beforeEach(() => {
+    vi.spyOn(console, 'log').mockImplementation(() => {});
+    vi.spyOn(console, 'warn').mockImplementation(() => {});
+    saved = {
+      LIVE_EQUITY_BOOT_USER: process.env['LIVE_EQUITY_BOOT_USER'],
+      COINBASE_API_KEY: process.env['COINBASE_API_KEY'],
+      COINBASE_API_SECRET: process.env['COINBASE_API_SECRET'],
+    };
+    process.env['LIVE_EQUITY_BOOT_USER'] = 'admin';
+    // Raw HMAC-flavoured strings — buildLiveBroker accepts them without a network call.
+    process.env['COINBASE_API_KEY'] = 'shared-env-key';
+    process.env['COINBASE_API_SECRET'] = 'shared-env-secret';
+  });
+  afterEach(() => {
+    for (const [k, v] of Object.entries(saved)) {
+      if (v === undefined) delete process.env[k];
+      else process.env[k] = v;
+    }
+  });
+
+  it('does NOT build a broker from the shared env creds for a non-operator (TRA-856 leak closed)', () => {
+    const engine = new CryptoSignalEngine(undefined, envOnlySettings()) as unknown as OperatorScopeInternals;
+    engine.setOwnerUsername('freshly-signed-up-user');
+    expect(engine.buildLiveBroker()).toBeNull();
+  });
+
+  it('still builds a broker from the shared env creds for the pinned operator', () => {
+    const engine = new CryptoSignalEngine(undefined, envOnlySettings()) as unknown as OperatorScopeInternals;
+    engine.setOwnerUsername('admin');
+    expect(engine.buildLiveBroker()).not.toBeNull();
+  });
+
+  it('an unbound engine (no owner) never resolves the env creds', () => {
+    const engine = new CryptoSignalEngine(undefined, envOnlySettings()) as unknown as OperatorScopeInternals;
+    expect(engine.buildLiveBroker()).toBeNull();
+  });
+
+  it('per-user Coinbase creds work for a non-operator (precedence unchanged)', () => {
+    const engine = new CryptoSignalEngine(undefined, {
+      ...envOnlySettings(),
+      liveApiKeyCrypto: 'her-own-key',
+      liveApiSecretCrypto: 'her-own-secret',
+    }) as unknown as OperatorScopeInternals;
+    engine.setOwnerUsername('alice');
+    expect(engine.buildLiveBroker()).not.toBeNull();
+  });
+});
+
 // TRA-480 — parallel demo + live ticking. Before the fix the engine ran one
 // branch per tick: `tick()` checked `this.mode` and either ran the demo
 // paper-account branch OR the live broker branch, never both. That kept the
