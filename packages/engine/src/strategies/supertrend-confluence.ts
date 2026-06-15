@@ -1,6 +1,11 @@
 import { Candle, TradeSignal, Side } from '@trading-app/shared';
 import { randomUUID } from 'crypto';
-import { supertrendLatest, type SupertrendOptions } from '../indicators/supertrend.js';
+import {
+  supertrendLatest,
+  SUPERTREND_DEFAULT_PERIOD,
+  type SupertrendOptions,
+  type SupertrendBar,
+} from '../indicators/supertrend.js';
 import { smaSeries } from '../sma200-signals.js';
 import { macd, macdCross } from '../indicators/macd.js';
 import { rsi } from '../indicators/rsi.js';
@@ -124,13 +129,35 @@ export interface ConfluenceReads {
 }
 
 /**
- * Evaluate the long-side and short-side confluence on a single timeframe and
- * return the side that passes all four gates, or `null` when neither does. Pure.
+ * TRA-840 — minimum confirm-series length before the higher-timeframe Supertrend
+ * is trusted as an MTF gate. The ATR warm-up consumes `period`+1 bars and the
+ * seed direction needs a further run of real crosses to wash out; below this
+ * floor the confirm read is warm-up/seed-dominated (TRA-809 root cause: a ~13-bar
+ * confirm was deterministically `red` regardless of the real 1h trend, which
+ * rubber-stamped shorts). 30 bars is well past the default 10-period warm-up.
  */
-export function confluenceSide(
+export const SUPERTREND_MIN_CONFIRM_BARS = 30;
+
+function minConfirmBars(period: number): number {
+  return Math.max(SUPERTREND_MIN_CONFIRM_BARS, period + 1 + 10);
+}
+
+/** Both sides' raw reads plus the latest Supertrend bar, computed once. */
+interface ComputedReads {
+  st: SupertrendBar;
+  longReads: ConfluenceReads;
+  shortReads: ConfluenceReads;
+}
+
+/**
+ * Compute the latest Supertrend read and the per-component confluence booleans
+ * for BOTH sides in one pass. Returns `null` only when there is not enough data
+ * to define the indicators. Pure. Callers decide what counts as a pass.
+ */
+function computeReads(
   candles: Candle[],
-  params: SupertrendConfluenceParams = {},
-): { side: Side; reads: ConfluenceReads } | null {
+  params: SupertrendConfluenceParams,
+): ComputedReads | null {
   const p = resolve(params);
   const closes = candles.map(c => c.close);
 
@@ -138,7 +165,7 @@ export function confluenceSide(
     p.maLong,
     p.macdSlow + p.macdSignal + p.macdCrossLookback,
     p.rsiPeriod + 2,
-    (p.supertrend.period ?? 10) + 1,
+    (p.supertrend.period ?? SUPERTREND_DEFAULT_PERIOD) + 1,
   );
   if (candles.length < minBars) return null;
 
@@ -160,7 +187,6 @@ export function confluenceSide(
   const rsiPrev = rsi(closes.slice(0, -1), p.rsiPeriod);
   if (!Number.isFinite(rsiNow) || !Number.isFinite(rsiPrev)) return null;
 
-  // --- long reads ---
   const longReads: ConfluenceReads = {
     supertrendGreen: st.direction === 'green',
     maStackAligned: m5 > m10 && m10 > m20,
@@ -172,11 +198,7 @@ export function confluenceSide(
       rsiNow <= p.rsiLongBand[1] &&
       (!p.requireRsiSlope || rsiNow > rsiPrev),
   };
-  if (longReads.supertrendGreen && longReads.maStackAligned && longReads.macdOk && longReads.rsiOk) {
-    return { side: 'buy', reads: longReads };
-  }
 
-  // --- short reads (mirror) ---
   const shortReads: ConfluenceReads = {
     supertrendGreen: st.direction === 'green', // reported as-is; short wants red
     maStackAligned: m5 < m10 && m10 < m20,
@@ -188,11 +210,49 @@ export function confluenceSide(
       rsiNow <= p.rsiShortBand[1] &&
       (!p.requireRsiSlope || rsiNow < rsiPrev),
   };
+
+  return { st, longReads, shortReads };
+}
+
+/**
+ * Evaluate the long-side and short-side confluence on a single timeframe and
+ * return the side that passes all four gates, or `null` when neither does. Pure.
+ */
+export function confluenceSide(
+  candles: Candle[],
+  params: SupertrendConfluenceParams = {},
+): { side: Side; reads: ConfluenceReads } | null {
+  const r = computeReads(candles, params);
+  if (!r) return null;
+  const { st, longReads, shortReads } = r;
+
+  if (longReads.supertrendGreen && longReads.maStackAligned && longReads.macdOk && longReads.rsiOk) {
+    return { side: 'buy', reads: longReads };
+  }
   if (st.direction === 'red' && shortReads.maStackAligned && shortReads.macdOk && shortReads.rsiOk) {
     return { side: 'sell', reads: shortReads };
   }
-
   return null;
+}
+
+/**
+ * TRA-840 — raw per-component confluence reads for the side the Supertrend points
+ * at (`green` → buy, `red` → sell), computed INDEPENDENTLY of whether the emit
+ * gate passes. {@link confluenceSide} only ever returns reads on the all-true
+ * pass branch, so anything recorded from it is tautologically TRUE and carries
+ * zero attribution information (TRA-809 Anomaly 2). This variant returns the
+ * implied side's reads even when one or more components fail, so a ledger that
+ * records them has genuine variance (false-subset n>0). Returns `null` only when
+ * there is not enough data to define the indicators.
+ */
+export function confluenceReads(
+  candles: Candle[],
+  params: SupertrendConfluenceParams = {},
+): { side: Side; reads: ConfluenceReads } | null {
+  const r = computeReads(candles, params);
+  if (!r) return null;
+  const side: Side = r.st.direction === 'green' ? 'buy' : 'sell';
+  return { side, reads: side === 'buy' ? r.longReads : r.shortReads };
 }
 
 /**
@@ -219,6 +279,13 @@ export function evaluateSupertrendConfluence(
   // MTF gate: the higher timeframe's Supertrend must agree on direction.
   if (p.requireConfirmTrend) {
     if (!confirmCandles) return null;
+    // TRA-840 confirm-window length guard. A confirm series shorter than the
+    // seed-independence floor is warm-up/seed-pinned (TRA-809: a ~13-bar confirm
+    // read `red` regardless of the real 1h trend, rubber-stamping shorts). Emit
+    // nothing rather than trust a too-short confirm.
+    if (confirmCandles.length < minConfirmBars(p.supertrend.period ?? SUPERTREND_DEFAULT_PERIOD)) {
+      return null;
+    }
     const confirm = supertrendLatest(confirmCandles, p.supertrend);
     if (!confirm) return null;
     const wantGreen = side === 'buy';
@@ -249,6 +316,89 @@ export function evaluateSupertrendConfluence(
 }
 
 /**
+ * TRA-840 — one row of shadow-ledger telemetry for the Supertrend-implied side.
+ * Unlike a routed {@link TradeSignal} this is captured even on a NEAR-MISS (the
+ * Supertrend + MTF confirm agree on a side but one or more confluence components
+ * fail), distinguished by {@link emitted}. The bracket fields mirror the emit
+ * path so a near-miss resolves over the same forward horizon, giving the ledger
+ * attribution variance without ever routing capital.
+ */
+export interface SupertrendShadowRow {
+  side: Side;
+  reads: ConfluenceReads;
+  /** True iff all four confluence gates passed (a routable emit); false = near-miss. */
+  emitted: boolean;
+  entryPrice: number;
+  stopLoss: number;
+  takeProfit: number;
+  riskRewardRatio: number;
+  timestamp: number;
+  /** The active Supertrend line on the signal bar (the bracket's stop basis). */
+  supertrendLine: number;
+}
+
+/**
+ * TRA-840 — shadow-ledger row for the Supertrend-implied side, captured whenever
+ * the signal-timeframe read is defined AND the higher-timeframe confirm agrees
+ * (subject to the same length guard as the emit path). `emitted` is true only
+ * when every confluence component also passes — i.e. exactly when
+ * {@link evaluateSupertrendConfluence} would have routed. Near-miss rows
+ * (`emitted:false`) differ ONLY in their `maStack`/`macd`/`rsi` reads, so they
+ * supply the false-subset the attribution needs without polluting it with rows
+ * the trend filter would have blocked. Returns `null` when there is no defined
+ * read, the confirm is missing/too-short/disagrees, or the bracket is degenerate.
+ */
+export function evaluateSupertrendConfluenceRow(
+  symbol: string,
+  signalCandles: Candle[],
+  confirmCandles: Candle[] | null,
+  params: SupertrendConfluenceParams = {},
+): SupertrendShadowRow | null {
+  const p = resolve(params);
+  const r = computeReads(signalCandles, params);
+  if (!r) return null;
+  const side: Side = r.st.direction === 'green' ? 'buy' : 'sell';
+  const reads = side === 'buy' ? r.longReads : r.shortReads;
+
+  // Same MTF confirm gate (and TRA-840 length guard) as the emit path: only
+  // capture rows the trend filter would let through, so candidate ≈ emit minus
+  // the maStack/macd/rsi components.
+  if (p.requireConfirmTrend) {
+    if (!confirmCandles) return null;
+    if (confirmCandles.length < minConfirmBars(p.supertrend.period ?? SUPERTREND_DEFAULT_PERIOD)) {
+      return null;
+    }
+    const confirm = supertrendLatest(confirmCandles, p.supertrend);
+    if (!confirm) return null;
+    if ((confirm.direction === 'green') !== (side === 'buy')) return null;
+  }
+
+  // The Supertrend direction already matches the implied side, so the emit flag
+  // is just the remaining three components (mirrors confluenceSide's branches).
+  const emitted = reads.maStackAligned && reads.macdOk && reads.rsiOk;
+
+  const latest = signalCandles[signalCandles.length - 1];
+  const entryPrice = latest.close;
+  const stopDistance = Math.abs(entryPrice - r.st.line);
+  if (stopDistance <= 0) return null;
+  const tpDistance = stopDistance * p.rewardRiskRatio;
+  const stopLoss = side === 'buy' ? entryPrice - stopDistance : entryPrice + stopDistance;
+  const takeProfit = side === 'buy' ? entryPrice + tpDistance : entryPrice - tpDistance;
+
+  return {
+    side,
+    reads,
+    emitted,
+    entryPrice,
+    stopLoss,
+    takeProfit,
+    riskRewardRatio: p.rewardRiskRatio,
+    timestamp: latest.timestamp,
+    supertrendLine: r.st.line,
+  };
+}
+
+/**
  * Strategy wrapper for router compatibility. {@link evaluate} mirrors the other
  * strategies' `(symbol, candles)` shape: it treats the supplied candles as the
  * signal timeframe and derives the 60m confirm series by resampling them, so the
@@ -270,6 +420,16 @@ export class SupertrendConfluenceStrategy {
   evaluate(symbol: string, signalCandles: Candle[]): TradeSignal | null {
     const confirm = resampleCandles(signalCandles, TF_BUCKET_MS['1h']);
     return evaluateSupertrendConfluence(symbol, signalCandles, confirm, this.params);
+  }
+
+  /**
+   * TRA-840 — shadow-ledger row (emit OR near-miss) for the Supertrend-implied
+   * side, deriving the 1h confirm by resampling like {@link evaluate}. Observe-
+   * only: the caller records it for attribution and never routes a near-miss.
+   */
+  evaluateShadowRow(symbol: string, signalCandles: Candle[]): SupertrendShadowRow | null {
+    const confirm = resampleCandles(signalCandles, TF_BUCKET_MS['1h']);
+    return evaluateSupertrendConfluenceRow(symbol, signalCandles, confirm, this.params);
   }
 
   async evaluateAndOrder(

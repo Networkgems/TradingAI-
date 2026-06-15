@@ -294,7 +294,11 @@ const MTF_DAILY_BARS = 260;
  * minute-bar feed is resampled to {@link SUPERTREND_SHADOW_TF_MS} for the
  * signal fold; the strategy then derives its higher-timeframe (1h) confirm by
  * resampling those 5m bars internally (TRA-728 default), so the deep window must
- * span enough sessions that the 1h Supertrend confirm has ≥ period+1 bars. The
+ * span enough sessions that the 1h Supertrend confirm clears the TRA-840
+ * length guard (≥ {@link SUPERTREND_MIN_CONFIRM_BARS} = 30 hourly bars, ~5 RTH
+ * sessions). The old 750-bar window resampled to only ~12-13 hourly bars — below
+ * the warm-up, so the confirm was seed-pinned `red` and rubber-stamped shorts
+ * (TRA-809 root cause); 2400 minute bars span enough sessions to fix that. The
  * ORB/BB/Ichimoku cache (80 minute bars) is far too shallow for this slow
  * multi-confirmation strategy, so the shadow path pulls its OWN deeper window
  * from the same Tradier minute feed — leaving the existing strategies'
@@ -306,7 +310,8 @@ const MTF_DAILY_BARS = 260;
  * EVALUATION still runs every tick off the cached 5m series (TRA-787 acceptance #1).
  */
 const SUPERTREND_SHADOW_TF_MS = 5 * 60_000;
-const SUPERTREND_SHADOW_MINUTE_BARS = 750;
+// TRA-840 — deep enough that the resampled 1h confirm clears the 30-bar guard.
+const SUPERTREND_SHADOW_MINUTE_BARS = 2400;
 const SUPERTREND_SHADOW_REFRESH_MS = 60_000;
 /** Cap the surfaced shadow channel so a long session can't grow it unbounded. */
 const SUPERTREND_SHADOW_MAX_SIGNALS = MAX_SIGNALS;
@@ -2594,15 +2599,9 @@ export class SignalEngine {
       // Uses the TRA-728 shipped defaults end-to-end: confluenceSide for the
       // signal-timeframe read + the strategy's own 1h confirm gate inside
       // `evaluate`. No params are invented here.
-      const signal = this.supertrendShadow.evaluate(sym, fiveMin);
-      if (!signal) continue;
-      // Stamp the active mode for parity with the live signal panel, but this
-      // list is NEVER routed — it only feeds the shadow channel + telemetry.
-      signal.mode = this.mode;
-
-      // Pull the confluence booleans + raw Supertrend read for logging. The
-      // side matches the emitted signal, so the same-side reads describe it.
-      const decision = confluenceSide(fiveMin);
+      // TRA-840 — derive the raw Supertrend read (line + flip state) over the
+      // FULL 5m series first; both the ledger row (candidate or emit) and the
+      // emit log line below reuse it.
       const stSeries = supertrend(fiveMin);
       let stLine: number | null = null;
       let stDirection: 'green' | 'red' | null = null;
@@ -2622,6 +2621,51 @@ export class SignalEngine {
         }
         break;
       }
+
+      // TRA-840 — durably capture the shadow-ledger row BEFORE the emit gate.
+      // `evaluateShadowRow` returns the Supertrend-implied side's RAW reads (with
+      // an `emitted` flag) whenever the signal read is defined and the 1h confirm
+      // agrees — including NEAR-MISSES that failed one confluence component. This
+      // is what gives the ledger attribution variance (false-subset n>0); pre-fix
+      // we only ever recorded all-true pass rows (TRA-809 Anomaly 2). Keyed on the
+      // signal bar so a per-tick re-fire on the same 5m bar dedupes. Best-effort
+      // and fire-and-forget; near-miss rows are OBSERVE-ONLY — nothing here routes
+      // or opens a position.
+      const shadowRow = this.supertrendShadow.evaluateShadowRow(sym, fiveMin);
+      if (shadowRow) {
+        const entryBarTs = fiveMin[fiveMin.length - 1]?.timestamp ?? shadowRow.timestamp;
+        void recordShadowSignal({
+          id: `${sym}:${shadowRow.side}:${entryBarTs}`,
+          ts: shadowRow.timestamp,
+          symbol: sym,
+          side: shadowRow.side,
+          entryRef: shadowRow.entryPrice,
+          supertrendValue: stLine,
+          supertrendFlip: stFlipped,
+          maStack: shadowRow.reads.maStackAligned,
+          macd: shadowRow.reads.macdOk,
+          rsi: shadowRow.reads.rsiOk,
+          stopLoss: shadowRow.stopLoss,
+          takeProfit: shadowRow.takeProfit,
+          emitted: shadowRow.emitted,
+        }).catch((err: unknown) => {
+          supertrendShadowLog.warn('shadow ledger append failed', {
+            symbol: sym, reason: err instanceof Error ? err.message : String(err),
+          });
+        });
+      }
+
+      // Emit path: surface + paper ONLY on a full-confluence signal (unchanged
+      // routing semantics — Supertrend stays live-gated OFF on TRA-734).
+      const signal = this.supertrendShadow.evaluate(sym, fiveMin);
+      if (!signal) continue;
+      // Stamp the active mode for parity with the live signal panel, but this
+      // list is NEVER routed — it only feeds the shadow channel + telemetry.
+      signal.mode = this.mode;
+
+      // Pull the confluence booleans for logging. The side matches the emitted
+      // signal, so the same-side reads describe it.
+      const decision = confluenceSide(fiveMin);
 
       supertrendShadowLog.info('supertrend shadow signal', {
         symbol: sym,
@@ -2645,30 +2689,6 @@ export class SignalEngine {
 
       emitted.unshift(signal);
       if (emitted.length > SUPERTREND_SHADOW_MAX_SIGNALS) emitted.pop();
-
-      // TRA-791 — durably capture each NEW shadow signal to the append-only
-      // signal->outcome ledger QuantTrader validates on TRA-789. Keyed on the
-      // signal bar so a per-tick re-fire on the same 5m bar dedupes. Best-effort
-      // and fire-and-forget: a ledger write never blocks or fails the tick.
-      const entryBarTs = fiveMin[fiveMin.length - 1]?.timestamp ?? signal.timestamp;
-      void recordShadowSignal({
-        id: `${sym}:${signal.side}:${entryBarTs}`,
-        ts: signal.timestamp,
-        symbol: sym,
-        side: signal.side,
-        entryRef: signal.entryPrice,
-        supertrendValue: stLine,
-        supertrendFlip: stFlipped,
-        maStack: decision?.reads.maStackAligned ?? null,
-        macd: decision?.reads.macdOk ?? null,
-        rsi: decision?.reads.rsiOk ?? null,
-        stopLoss: signal.stopLoss,
-        takeProfit: signal.takeProfit,
-      }).catch((err: unknown) => {
-        supertrendShadowLog.warn('shadow ledger append failed', {
-          symbol: sym, reason: err instanceof Error ? err.message : String(err),
-        });
-      });
 
       // TRA-801 — Stage-2 PAPER accrual (distinct from the observe-only shadow
       // log above). Open a simulated bracketed position in the dedicated

@@ -2,7 +2,7 @@ import { describe, it, expect, beforeEach, afterEach } from 'vitest';
 import { tmpdir } from 'os';
 import { join } from 'path';
 import { rmSync } from 'fs';
-import { readFile } from 'fs/promises';
+import { readFile, writeFile } from 'fs/promises';
 import type { Candle } from '@trading-app/shared';
 import {
   setShadowLedgerFileForTests,
@@ -38,6 +38,7 @@ function openRec(over: Partial<ShadowSignalOpen> = {}): ShadowSignalOpen {
     maStack: true,
     macd: true,
     rsi: true,
+    emitted: true,
     stopLoss: 98,
     takeProfit: 104,
     ...over,
@@ -98,6 +99,31 @@ describe('shadow-signal-ledger — durable append-only store', () => {
     await initShadowLedger();
     const rows = await listShadowSignals();
     expect(rows[0].outcome).toBe('SL_HIT');
+  });
+
+  it('re-baselines (archives) a contaminated pre-TRA-840 ledger on init', async () => {
+    // A pre-fix row lacks the `emitted` field; write one directly to disk.
+    const legacy = {
+      kind: 'open',
+      rec: {
+        id: 'old:buy:1', ts: DAY, symbol: 'OLD', side: 'buy', entryRef: 10,
+        supertrendValue: 9, supertrendFlip: false, maStack: true, macd: true, rsi: true,
+        stopLoss: 9, takeProfit: 12,
+      },
+    };
+    await writeFile(file, `${JSON.stringify(legacy)}\n`, 'utf-8');
+    setShadowLedgerFileForTests(file); // drop cache so init reloads from disk
+    await initShadowLedger();
+    // Contaminated rows are archived away — the fresh capture starts empty.
+    expect(await listShadowSignals()).toHaveLength(0);
+    // A fixed-generator row carrying `emitted` survives a subsequent reload
+    // (the re-baseline is idempotent and does not fire again).
+    await recordShadowSignal(openRec({ id: 'new:buy:1', emitted: false }));
+    setShadowLedgerFileForTests(file);
+    await initShadowLedger();
+    const rows = await listShadowSignals();
+    expect(rows.map((r) => r.id)).toEqual(['new:buy:1']);
+    expect(rows[0].emitted).toBe(false);
   });
 
   it('windows by signal ts with from/to', async () => {

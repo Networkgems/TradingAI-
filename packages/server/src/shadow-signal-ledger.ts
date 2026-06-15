@@ -1,4 +1,4 @@
-import { appendFile, readFile, mkdir } from 'fs/promises';
+import { appendFile, readFile, mkdir, rename } from 'fs/promises';
 import { existsSync } from 'fs';
 import { dirname, join } from 'path';
 import { fileURLToPath } from 'url';
@@ -65,10 +65,18 @@ export interface ShadowSignalRecord {
   supertrendValue: number | null;
   /** Did the Supertrend direction just flip on the signal bar? */
   supertrendFlip: boolean;
-  /** Confluence booleans the strategy gated on. */
+  /** Confluence booleans — the RAW per-component reads for the Supertrend-implied
+   *  side (TRA-840), recorded independent of the emit gate so they carry variance. */
   maStack: boolean | null;
   macd: boolean | null;
   rsi: boolean | null;
+  /**
+   * TRA-840 — true iff all confluence gates passed (a routable emit); false for a
+   * near-miss candidate captured only so attribution has a false-subset. Optional
+   * for backward compatibility: pre-TRA-840 rows lack it and are treated as emits
+   * (and trigger the one-time re-baseline below).
+   */
+  emitted?: boolean;
   stopLoss: number;
   takeProfit: number;
   /** Forward outcome; `OPEN` until the horizon resolves it. */
@@ -151,9 +159,42 @@ async function appendLine(line: LedgerLine): Promise<void> {
   await appendFile(path, `${JSON.stringify(line)}\n`, 'utf-8');
 }
 
+/**
+ * TRA-840 — one-time ledger re-baseline. Every row produced before the
+ * SupertrendConfluence generator fixes (seed-pinned confirm + tautological
+ * booleans, TRA-809) is contaminated and must NOT feed the TRA-734 go/no-go.
+ * Pre-fix rows are detectable by the absence of the `emitted` field. On the first
+ * boot after the fix lands we archive the whole file and start a fresh capture;
+ * the heuristic is idempotent (fresh rows all carry `emitted`, so later boots are
+ * no-ops). Operates on whatever DATA_DIR file exists, so it re-baselines the live
+ * Render ledger automatically on deploy.
+ */
+async function rebaselineIfLegacy(): Promise<void> {
+  if (!cache || cache.size === 0) return;
+  const hasLegacy = [...cache.values()].some((r) => r.emitted === undefined);
+  if (!hasLegacy) return;
+  const path = storeFile();
+  if (existsSync(path)) {
+    const archive = `${path}.pre-tra840.${Date.now()}.jsonl`;
+    try {
+      await rename(path, archive);
+      log.info('shadow ledger re-baselined (TRA-840): archived contaminated pre-fix rows', {
+        archive, rows: cache.size,
+      });
+    } catch (err) {
+      log.error('shadow ledger re-baseline rename failed; keeping contaminated rows', {
+        reason: err instanceof Error ? err.message : String(err),
+      });
+      return;
+    }
+  }
+  cache = new Map();
+}
+
 /** Eagerly load the ledger so reads have data right after boot. */
 export async function initShadowLedger(): Promise<void> {
   await ensureLoaded();
+  await rebaselineIfLegacy();
 }
 
 /**

@@ -99,9 +99,15 @@ export function supertrend(
     // Direction flip: stop-and-reverse on a close through the active band.
     let direction: SupertrendDirection;
     if (prevDirection === null) {
-      // Seed: green when the first valid close sits above the upper band,
-      // otherwise red. Deterministic and self-correcting within a bar or two.
-      direction = c.close > finalUpper ? 'green' : 'red';
+      // TRA-840 seed correctness. The old seed compared the first close against
+      // the final UPPER band (`close > finalUpper` = hl2 + factor*ATR): a close
+      // can only clear that if the single bar's range exceeds ~2*factor*ATR, which
+      // essentially never happens on real data — so the seed was deterministically
+      // `red`, pinning the warm-up short (TRA-809 root cause). Seed instead from
+      // the bar's own midpoint: `green` when the close sits at/above hl2 (upward
+      // bias), `red` below. This is direction-neutral on real data and self-
+      // corrects to the true trend within a bar or two via the cross logic below.
+      direction = c.close >= mid ? 'green' : 'red';
     } else if (prevDirection === 'red') {
       direction = c.close > finalUpper ? 'green' : 'red';
     } else {

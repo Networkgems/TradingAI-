@@ -2,7 +2,9 @@ import { describe, it, expect } from 'vitest';
 import type { Candle } from '@trading-app/shared';
 import {
   confluenceSide,
+  confluenceReads,
   evaluateSupertrendConfluence,
+  evaluateSupertrendConfluenceRow,
   SupertrendConfluenceStrategy,
 } from './supertrend-confluence.js';
 import { rsi } from '../indicators/rsi.js';
@@ -116,6 +118,15 @@ describe('evaluateSupertrendConfluence (MTF gate + bracket)', () => {
     expect(evaluateSupertrendConfluence('AMD', longSignal, null)).toBeNull();
   });
 
+  it('skips when the confirm series is too short to be seed-independent (TRA-840)', () => {
+    // A ~20-bar confirm is below the warm-up + seed-washout floor, so its read is
+    // seed-pinned (TRA-809: deterministically red regardless of the real trend).
+    // The guard must emit nothing rather than let it rubber-stamp a side.
+    const shortConfirm = build(upCloses.slice(0, 20));
+    expect(shortConfirm.length).toBeLessThan(30);
+    expect(evaluateSupertrendConfluence('AMD', longSignal, shortConfirm)).toBeNull();
+  });
+
   it('honours requireConfirmTrend:false (no confirm series needed)', () => {
     const sig = evaluateSupertrendConfluence('AMD', longSignal, null, { requireConfirmTrend: false });
     expect(sig?.side).toBe('buy');
@@ -124,9 +135,10 @@ describe('evaluateSupertrendConfluence (MTF gate + bracket)', () => {
 
 describe('SupertrendConfluenceStrategy (router adapter)', () => {
   it('derives the 60m confirm by resampling and fires a buy on a 15m uptrend', () => {
-    // Enough 15m bars that the resampled 1h confirm clears the Supertrend warm-up.
+    // Enough 15m bars that the resampled 1h confirm clears the TRA-840 length
+    // guard (≥30 hourly bars): 160 × 15m → 40h → 40 hourly buckets.
     const strat = new SupertrendConfluenceStrategy();
-    const sig = strat.evaluate('AMD', build(sawUp(120)));
+    const sig = strat.evaluate('AMD', build(sawUp(160)));
     expect(sig?.type).toBe('supertrend_confluence');
     expect(sig?.side).toBe('buy');
   });
@@ -134,5 +146,41 @@ describe('SupertrendConfluenceStrategy (router adapter)', () => {
   it('returns null on a flat tape (no confluence)', () => {
     const flat = build(Array.from({ length: 120 }, (_, i) => 100 + Math.sin(i * 0.3) * 0.2));
     expect(new SupertrendConfluenceStrategy().evaluate('AMD', flat)).toBeNull();
+  });
+});
+
+describe('confluenceReads + evaluateSupertrendConfluenceRow (TRA-840 attribution)', () => {
+  // Steep monotonic ramp: ST green + MA stack aligned + MACD>0, but RSI pins at
+  // 100 (above the [50,70] band) so the emit gate fails — the canonical near-miss.
+  const steep = build(Array.from({ length: 80 }, (_, i) => 100 + i * 1.0));
+
+  it('confluenceReads returns the Supertrend-implied side reads even on a non-emit', () => {
+    expect(confluenceSide(steep)).toBeNull(); // no emit (RSI out of band)
+    const reads = confluenceReads(steep);
+    expect(reads).not.toBeNull();
+    expect(reads!.side).toBe('buy');
+    // The failing component is VISIBLE — this is the variance Anomaly 2 lacked.
+    expect(reads!.reads.rsiOk).toBe(false);
+    expect(reads!.reads.maStackAligned).toBe(true);
+  });
+
+  it('captures a near-miss row (emitted:false) with a resolvable bracket', () => {
+    const row = evaluateSupertrendConfluenceRow('AMD', steep, steep)!;
+    expect(row).not.toBeNull();
+    expect(row.side).toBe('buy');
+    expect(row.emitted).toBe(false); // near-miss, never routable
+    expect(row.reads.rsiOk).toBe(false);
+    expect(row.stopLoss).toBeLessThan(row.entryPrice);
+    expect(row.takeProfit).toBeGreaterThan(row.entryPrice);
+  });
+
+  it('marks a full-confluence pass emitted:true', () => {
+    const row = evaluateSupertrendConfluenceRow('AMD', longSignal, longSignal)!;
+    expect(row.emitted).toBe(true);
+    expect(row.side).toBe('buy');
+  });
+
+  it('respects the confirm length guard (no row when confirm too short)', () => {
+    expect(evaluateSupertrendConfluenceRow('AMD', longSignal, build(upCloses.slice(0, 20)))).toBeNull();
   });
 });

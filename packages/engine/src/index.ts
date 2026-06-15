@@ -35,11 +35,15 @@ export type { DcaOptions } from './strategies/crypto-dca.js';
 export {
   SupertrendConfluenceStrategy,
   evaluateSupertrendConfluence,
+  evaluateSupertrendConfluenceRow,
   confluenceSide,
+  confluenceReads,
+  SUPERTREND_MIN_CONFIRM_BARS,
 } from './strategies/supertrend-confluence.js';
 export type {
   SupertrendConfluenceParams,
   ConfluenceReads,
+  SupertrendShadowRow,
 } from './strategies/supertrend-confluence.js';
 export {
   TsmomMajorsStrategy,

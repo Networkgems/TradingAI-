@@ -3630,7 +3630,7 @@ describe('SignalEngine — SupertrendConfluence shadow channel (TRA-787)', () =>
 
   it('surfaces a shadow signal on the dedicated channel and opens NOTHING on the live path', () => {
     const engine = new SignalEngine();
-    const candles = build5m(sawUp(240));
+    const candles = build5m(sawUp(480));
     // Seed the shadow 5m series directly (the deep-pull refresh is feed-bound;
     // the per-tick evaluation reads this cache).
     (engine as unknown as { shadowCandleCache: Map<string, Candle[]> }).shadowCandleCache.set('TEST', candles);
@@ -3667,7 +3667,7 @@ describe('SignalEngine — SupertrendConfluence shadow channel (TRA-787)', () =>
   // in the export snapshot's closedPositions stamped supertrend_confluence/demo.
   it('opens a paper forward-test position on a shadow signal — isolated from the user demo book', () => {
     const engine = new SignalEngine();
-    const candles = build5m(sawUp(240));
+    const candles = build5m(sawUp(480));
     (engine as unknown as { shadowCandleCache: Map<string, Candle[]> }).shadowCandleCache.set('TEST', candles);
 
     (engine as unknown as { evaluateSupertrendShadow: (s: string[]) => void }).evaluateSupertrendShadow(['TEST']);
@@ -3684,7 +3684,7 @@ describe('SignalEngine — SupertrendConfluence shadow channel (TRA-787)', () =>
 
   it('closes the paper position at take-profit into closedPositions (supertrend_confluence/demo)', () => {
     const engine = new SignalEngine();
-    const candles = build5m(sawUp(240));
+    const candles = build5m(sawUp(480));
     (engine as unknown as { shadowCandleCache: Map<string, Candle[]> }).shadowCandleCache.set('TEST', candles);
     (engine as unknown as { evaluateSupertrendShadow: (s: string[]) => void }).evaluateSupertrendShadow(['TEST']);
 

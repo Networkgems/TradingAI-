@@ -66,8 +66,8 @@ describe('supertrend', () => {
     ];
     const series = supertrend(build(closes));
     const dirs = series.filter((b): b is NonNullable<typeof b> => b !== null).map(b => b.direction);
-    // The seed bar reads red until price first closes above the upper band
-    // (standard stop-and-reverse warm-up); the uptrend then turns it green.
+    // TRA-840: the midpoint seed reads green at the start of the uptrend (close
+    // sits above hl2); the later downtrend flips it red by the tail.
     expect(dirs).toContain('green');
     expect(dirs[dirs.length - 1]).toBe('red');
     const flips = dirs.slice(1).filter((d, i) => d !== dirs[i]).length;
@@ -81,6 +81,17 @@ describe('supertrend', () => {
     // Golden value pinned from a hand-verified run; guards against silent math
     // drift in the band-ratchet or ATR reuse.
     expect(last.line).toBeCloseTo(152.5, 6);
+  });
+
+  it('seeds direction from the bar midpoint, not a deterministic red (TRA-840)', () => {
+    // Regression for TRA-809/TRA-840: the old `close > hl2 + factor*ATR` seed was
+    // structurally always red on real data, pinning the warm-up short. The first
+    // defined bar must instead reflect the local trend — green at the start of a
+    // clean uptrend, red at the start of a clean downtrend.
+    const upFirst = supertrend(build(upCloses), { period: 10, factor: 3 }).find(b => b !== null)!;
+    expect(upFirst.direction).toBe('green');
+    const downFirst = supertrend(build(downCloses), { period: 10, factor: 3 }).find(b => b !== null)!;
+    expect(downFirst.direction).toBe('red');
   });
 
   it('honours the factor param: a wider factor places the line further from price', () => {

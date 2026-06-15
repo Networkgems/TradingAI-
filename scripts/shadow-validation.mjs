@@ -94,24 +94,33 @@ const before = signals.length;
 signals = signals.filter((s) => s && s.symbol !== 'TEST' && !String(s.id).startsWith('TEST:'));
 const dropped = before - signals.length;
 
-const overall = summarize(signals, 'ALL');
+// TRA-840 — split emitted signals from near-miss candidates. The go/no-go metrics
+// (hit rate, E[R], whipsaw, sample size) are the strategy's ACTUAL routable
+// signals, so they run on emitted rows only. Confluence attribution runs over ALL
+// rows (emit + near-miss) so the false-subset has data — pre-fix the ledger only
+// recorded all-true pass rows, making attribution vacuous (TRA-809 Anomaly 2).
+// Legacy rows lack `emitted`; treat them as emits for backward compatibility.
+const emittedRows = signals.filter((s) => s.emitted !== false);
+const candidateRows = signals.filter((s) => s.emitted === false);
+
+const overall = summarize(emittedRows, 'ALL');
 const out = [];
 out.push('# TRA-789 — Shadow-signal live-tape validation');
 out.push('');
-out.push(`Signals: ${signals.length} (dropped ${dropped} TEST rows). Generated from the TRA-791 ledger.`);
+out.push(`Emitted signals: ${emittedRows.length} (+ ${candidateRows.length} near-miss candidates for attribution; dropped ${dropped} TEST rows). Generated from the TRA-791 ledger.`);
 out.push('');
-out.push('## Overall');
+out.push('## Overall (emitted signals)');
 out.push(line(overall));
 out.push('');
-out.push('## By side');
-for (const side of ['buy', 'sell']) out.push(line(summarize(signals.filter((s) => s.side === side), side)));
+out.push('## By side (emitted signals)');
+for (const side of ['buy', 'sell']) out.push(line(summarize(emittedRows.filter((s) => s.side === side), side)));
 out.push('');
-out.push('## By symbol');
-for (const sym of [...new Set(signals.map((s) => s.symbol))].sort()) {
-  out.push(line(summarize(signals.filter((s) => s.symbol === sym), sym)));
+out.push('## By symbol (emitted signals)');
+for (const sym of [...new Set(emittedRows.map((s) => s.symbol))].sort()) {
+  out.push(line(summarize(emittedRows.filter((s) => s.symbol === sym), sym)));
 }
 out.push('');
-out.push('## Confluence attribution');
+out.push('## Confluence attribution (all rows: emit + near-miss)');
 for (const k of ['supertrendFlip', 'maStack', 'macd', 'rsi']) out.push(attribution(signals, k));
 out.push('');
 
