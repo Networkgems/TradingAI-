@@ -8,6 +8,7 @@ import {
   registerLiveHealthRoutes,
   runStaleStateCheck,
   aggregateLiveEquityAcceptance,
+  summarizeDemoBook,
   type HealthUserContext,
 } from './health-routes.js';
 import { checkStaleState } from './alerts.js';
@@ -228,6 +229,78 @@ describe('TRA-580 live-equity acceptance probe', () => {
       now: () => NOW,
     });
     expect(without.routes.get('/api/health/live-equity')).toBeUndefined();
+  });
+});
+
+describe('TRA-898 demo-book summary', () => {
+  function demoState(over: Partial<EngineState> = {}): EngineState {
+    return engineState({
+      account: { totalEquity: 25_500, availableCash: 18_000, dailyPnl: 500, openPositions: [{}, {}] },
+      closedPositions: [
+        { pnl: 300, closedAt: NOW - 60_000 },
+        { pnl: -120, closedAt: NOW - 2 * 24 * 60 * 60 * 1000 }, // older than 24h
+      ],
+      agentRecommendations: [
+        { action: 'BUY', proposedSignal: {} },
+        { action: 'HOLD', proposedSignal: null },
+        { action: 'SELL', proposedSignal: {} },
+      ],
+      tradingAgentsEnabled: true,
+      tradingAgentsGatingEnabled: true,
+      tradingAgentsLiveGatingEnabled: false,
+      autoTradingEnabled: false,
+      tradingHalted: false,
+      haltReason: null,
+      ...over,
+    } as unknown as EngineState);
+  }
+
+  it('summarizes equity, open/closed P&L, and agent decision activity for the caller', () => {
+    const report = summarizeDemoBook(demoState(), 'demo', NOW);
+    expect(report.mode).toBe('demo');
+    expect(report.equity).toEqual({ totalEquity: 25_500, availableCash: 18_000, dailyPnl: 500 });
+    expect(report.openPositionCount).toBe(2);
+    expect(report.closed.recentCount).toBe(2);
+    expect(report.closed.recentRealizedPnl).toBe(180);
+    expect(report.closed.recentCapped).toBe(false);
+    // Only the close within 24h counts toward the day window.
+    expect(report.closed.last24hCount).toBe(1);
+    expect(report.closed.last24hRealizedPnl).toBe(300);
+    expect(report.agentActivity).toEqual({
+      recommendationCount: 3,
+      byAction: { BUY: 1, SELL: 1, HOLD: 1 },
+      routableCount: 2,
+    });
+    expect(report.agents).toMatchObject({
+      tradingAgentsEnabled: true,
+      gatingEnabled: true,
+      liveGatingEnabled: false,
+    });
+  });
+
+  it('flags the closed buffer as capped at the 20-row getState() ceiling', () => {
+    const twenty = Array.from({ length: 20 }, () => ({ pnl: 10, closedAt: NOW }));
+    const report = summarizeDemoBook(demoState({ closedPositions: twenty as never }), 'demo', NOW);
+    expect(report.closed.recentCapped).toBe(true);
+    expect(report.closed.last24hCount).toBe(20);
+  });
+
+  it('mounts GET /api/health/demo-book auth-gated (requireAuth + handler)', async () => {
+    const { app, routes } = fakeApp();
+    registerLiveHealthRoutes(app, {
+      requireAuth: (() => undefined) as never,
+      userCtx: async () => ctx('admin', demoState()),
+      getSettings: () => settings(),
+      now: () => NOW,
+    });
+    const handlers = routes.get('/api/health/demo-book')!;
+    expect(handlers).toHaveLength(2); // requireAuth + handler
+    const res = fakeRes();
+    await handlers[1]!({}, res);
+    const body = res.body as { ok: boolean; equity: { totalEquity: number }; build: unknown };
+    expect(body.ok).toBe(true);
+    expect(body.equity.totalEquity).toBe(25_500);
+    expect(body.build).toBeDefined();
   });
 });
 

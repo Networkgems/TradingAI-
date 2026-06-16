@@ -138,6 +138,120 @@ export function aggregateLiveEquityAcceptance(
   };
 }
 
+/**
+ * TRA-898 — auth-gated demo paper-book summary for the TRA-895 3-day
+ * Trade-Agents test daily watch. Unlike the unauthenticated
+ * `/api/health/live-equity` probe (which deliberately carries NO balances —
+ * just booleans/counts proving the first live fill fired), the daily watch
+ * needs the actual demo equity / open positions / realized P&L / agent
+ * decision activity for ONE account. That is per-user state and includes
+ * balances, so this surface is auth-gated (parity with `/api/health/live`)
+ * and reports only the calling user's own demo book — never a fleet sum.
+ */
+export interface DemoBookReport {
+  ok: true;
+  time: string;
+  build: ReturnType<typeof resolveBuildInfo>;
+  /** Account mode at read time. The demo book is only meaningful in `demo`. */
+  mode: string;
+  /** Trading-agents layer + gating posture (TRA-544 / TRA-796). */
+  agents: {
+    tradingAgentsEnabled: boolean;
+    gatingEnabled: boolean;
+    liveGatingEnabled: boolean;
+    autoTradingEnabled: boolean;
+    tradingHalted: boolean;
+    haltReason: string | null;
+  };
+  /** Demo paper-book equity snapshot. */
+  equity: {
+    totalEquity: number;
+    availableCash: number;
+    dailyPnl: number;
+  };
+  /** Currently-open demo paper positions. */
+  openPositionCount: number;
+  /**
+   * Closed demo positions. `recent` covers the engine's last-20 closed buffer
+   * for this mode; `last24h` is the subset closed within 24h of the read.
+   * `recentCapped` is true when the 20-row buffer may be hiding older closes.
+   */
+  closed: {
+    recentCount: number;
+    recentRealizedPnl: number;
+    recentCapped: boolean;
+    last24hCount: number;
+    last24hRealizedPnl: number;
+  };
+  /**
+   * Latest multi-agent decision batch (open/monitor/close intent proxy):
+   * BUY/SELL = open intent, HOLD = monitor/stand-down; `routableCount` is how
+   * many carry a `proposedSignal` the gating layer could turn into an order.
+   */
+  agentActivity: {
+    recommendationCount: number;
+    byAction: { BUY: number; SELL: number; HOLD: number };
+    routableCount: number;
+  };
+}
+
+/**
+ * TRA-898 — fold one engine's `getState()` view into the demo-book report.
+ * Pure (clock injected) so it is unit-testable without a server. Reads the
+ * mode-masked `getState()`, so it must be called on a demo-mode engine to
+ * reflect the paper book.
+ */
+export function summarizeDemoBook(
+  state: EngineState,
+  mode: string,
+  now: number,
+): DemoBookReport {
+  const closed = state.closedPositions;
+  const dayAgo = now - 24 * 60 * 60 * 1000;
+  const realized = (p: { pnl?: number }): number => (Number.isFinite(p.pnl) ? (p.pnl as number) : 0);
+  const last24h = closed.filter(p => typeof p.closedAt === 'number' && p.closedAt >= dayAgo);
+  const recs = state.agentRecommendations;
+  const byAction = { BUY: 0, SELL: 0, HOLD: 0 };
+  let routableCount = 0;
+  for (const r of recs) {
+    if (r.action === 'BUY' || r.action === 'SELL' || r.action === 'HOLD') byAction[r.action] += 1;
+    if (r.proposedSignal !== null) routableCount += 1;
+  }
+  return {
+    ok: true,
+    time: new Date(now).toISOString(),
+    build: resolveBuildInfo(),
+    mode,
+    agents: {
+      tradingAgentsEnabled: state.tradingAgentsEnabled,
+      gatingEnabled: state.tradingAgentsGatingEnabled,
+      liveGatingEnabled: state.tradingAgentsLiveGatingEnabled,
+      autoTradingEnabled: state.autoTradingEnabled,
+      tradingHalted: state.tradingHalted,
+      haltReason: state.haltReason,
+    },
+    equity: {
+      totalEquity: state.account.totalEquity,
+      availableCash: state.account.availableCash,
+      dailyPnl: state.account.dailyPnl,
+    },
+    openPositionCount: state.account.openPositions.length,
+    closed: {
+      recentCount: closed.length,
+      recentRealizedPnl: closed.reduce((acc, p) => acc + realized(p), 0),
+      // getState() caps the closed buffer at the last 20 for this mode.
+      recentCapped: closed.length >= 20,
+      last24hCount: last24h.length,
+      last24hRealizedPnl: last24h.reduce((acc, p) => acc + realized(p), 0),
+    },
+    agentActivity: {
+      recommendationCount: recs.length,
+      byAction,
+      routableCount,
+    },
+  };
+}
+
 /** Build the consolidated live-health summary for one user context. */
 function summarizeForContext(
   ctx: HealthUserContext,
@@ -190,6 +304,16 @@ export function registerLiveHealthRoutes(app: Express, deps: LiveHealthDeps): vo
     const settings = deps.getSettings(ctx.username);
     const summary = summarizeForContext(ctx, settings, now());
     res.json({ ...summary, build: resolveBuildInfo(), time: new Date(now()).toISOString() });
+  });
+
+  // TRA-898 — auth-gated demo paper-book summary for the TRA-895 daily watch.
+  // Parity with `/api/health/live`: names balances, so it is auth-gated and
+  // scoped to the caller's own engine (never a fleet sum).
+  app.get('/api/health/demo-book', deps.requireAuth, async (_req, res) => {
+    const ctx = await deps.userCtx(res);
+    if (res.headersSent) return;
+    const settings = deps.getSettings(ctx.username);
+    res.json(summarizeDemoBook(ctx.engine.getState(), settings.mode, now()));
   });
 
   const liveEquityAcceptance = deps.liveEquityAcceptance;
