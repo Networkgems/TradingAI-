@@ -55,6 +55,22 @@ export interface LiveHealthDeps {
    * unauthenticated surface.
    */
   demoBooks?: () => Array<{ username: string; state: EngineState; mode: string }>;
+  /**
+   * TRA-895 — inputs for the UNAUTHENTICATED `GET /api/health/options-pipeline`
+   * probe. The 3-day demo test repeatedly reported "no option signals"; the
+   * gates that decide whether the RV options scanner can fire (and whether any
+   * option signal is on the board) were only visible behind a per-user login or
+   * the (often-unset) internal demo-book token, so the failure mode was
+   * undiagnosable from outside. This exposes ONLY booleans / counts / timestamps
+   * — no balances, symbols, theses, order ids, or PII — so it can back an
+   * unauthenticated probe (parity with `/api/health/version` + `/live-equity`).
+   * `engines` enumerates the demo-mode fleet. Only mounted when provided.
+   */
+  optionsPipeline?: () => {
+    rvScannerConfigured: boolean;
+    rvBreakerOpen: boolean;
+    engines: Array<{ state: EngineState; mode: string }>;
+  };
   /** Injectable clock for deterministic tests. Defaults to Date.now. */
   now?: () => number;
 }
@@ -301,6 +317,108 @@ export function summarizeDemoBooks(
   };
 }
 
+// ── TRA-895 options-signal pipeline probe ─────────────────────────────────────
+
+/**
+ * Per demo-engine view of every gate that determines whether OPTION signals can
+ * appear. Options come solely from the relative-value scanner (the agent layer
+ * proposes EQUITY trades, not options), so this captures the exact conjunction
+ * `shouldRunRelativeValueScan` checks plus what is currently on the board.
+ * Secrets-free: booleans + counts only.
+ */
+export interface OptionsPipelineEngineView {
+  mode: string;
+  /** Master per-mode auto-trade switch. The RV scan is gated on this — the
+   *  "🤖 Trading Agents" toggle alone does NOT arm the options scanner. */
+  autoTradingEnabled: boolean;
+  tradingAgentsEnabled: boolean;
+  gatingEnabled: boolean;
+  tradingHalted: boolean;
+  haltReason: string | null;
+  marketOpen: boolean;
+  watchlistSymbolCount: number;
+  /** Relative-value (the only options strategy) signals currently on the board. */
+  optionSignalCount: number;
+  totalSignalCount: number;
+  openOptionsCount: number;
+  /**
+   * True iff every gate the per-tick RV options scan needs is satisfied right
+   * now (scanner configured + breaker closed + auto-trade on + not halted +
+   * market open). When false, `blockedBy` names the first failing gate so the
+   * board can see in one read WHY no option signals are being generated.
+   */
+  rvScanArmed: boolean;
+  blockedBy: string | null;
+}
+
+export interface OptionsPipelineReport {
+  ok: true;
+  time: string;
+  build: ReturnType<typeof resolveBuildInfo>;
+  /** RV scanner has Tradier creds wired (otherwise it can never produce options). */
+  rvScannerConfigured: boolean;
+  /** RV scanner's Tradier rate-limit breaker is currently tripped open. */
+  rvBreakerOpen: boolean;
+  demoEngineCount: number;
+  engines: OptionsPipelineEngineView[];
+}
+
+/** First failing gate in the RV-scan conjunction, or null when fully armed. */
+function rvScanBlocker(
+  rvScannerConfigured: boolean,
+  rvBreakerOpen: boolean,
+  state: EngineState,
+): string | null {
+  if (!rvScannerConfigured) return 'rv_scanner_not_configured';
+  if (rvBreakerOpen) return 'rv_breaker_open';
+  if (!state.autoTradingEnabled) return 'auto_trading_off';
+  if (state.tradingHalted) return 'trading_halted';
+  if (!state.marketOpen) return 'market_closed';
+  return null;
+}
+
+/**
+ * TRA-895 — fold the demo-mode fleet + RV scanner status into the secrets-free
+ * options-pipeline report backing the unauthenticated probe. Pure (clock
+ * injected) so it is unit-testable without a server.
+ */
+export function summarizeOptionsPipeline(
+  input: {
+    rvScannerConfigured: boolean;
+    rvBreakerOpen: boolean;
+    engines: Array<{ state: EngineState; mode: string }>;
+  },
+  now: number,
+): OptionsPipelineReport {
+  const engines: OptionsPipelineEngineView[] = input.engines.map(({ state, mode }) => {
+    const blockedBy = rvScanBlocker(input.rvScannerConfigured, input.rvBreakerOpen, state);
+    return {
+      mode,
+      autoTradingEnabled: state.autoTradingEnabled,
+      tradingAgentsEnabled: state.tradingAgentsEnabled,
+      gatingEnabled: state.tradingAgentsGatingEnabled,
+      tradingHalted: state.tradingHalted,
+      haltReason: state.haltReason,
+      marketOpen: state.marketOpen,
+      watchlistSymbolCount: state.symbols.length,
+      optionSignalCount: state.signals.filter(s => s.type === 'relative_value').length,
+      totalSignalCount: state.signals.length,
+      openOptionsCount: state.options.openOptions?.length ?? 0,
+      rvScanArmed: blockedBy === null,
+      blockedBy,
+    };
+  });
+  return {
+    ok: true,
+    time: new Date(now).toISOString(),
+    build: resolveBuildInfo(),
+    rvScannerConfigured: input.rvScannerConfigured,
+    rvBreakerOpen: input.rvBreakerOpen,
+    demoEngineCount: engines.length,
+    engines,
+  };
+}
+
 /** Build the consolidated live-health summary for one user context. */
 function summarizeForContext(
   ctx: HealthUserContext,
@@ -407,6 +525,18 @@ export function registerLiveHealthRoutes(app: Express, deps: LiveHealthDeps): vo
   if (liveEquityAcceptance) {
     app.get('/api/health/live-equity', (_req, res) => {
       res.json(aggregateLiveEquityAcceptance(liveEquityAcceptance(), now()));
+    });
+  }
+
+  // TRA-895 — unauthenticated, secrets-free options-signal pipeline probe. Makes
+  // the recurring "no option signals" report diagnosable from one curl: it names
+  // whether the RV scanner is configured/breaker-open and, per demo engine, which
+  // gate (auto-trade off / halted / market closed / …) is blocking the scan and
+  // how many option signals are on the board. No balances, symbols, or PII.
+  const optionsPipeline = deps.optionsPipeline;
+  if (optionsPipeline) {
+    app.get('/api/health/options-pipeline', (_req, res) => {
+      res.json(summarizeOptionsPipeline(optionsPipeline(), now()));
     });
   }
 }

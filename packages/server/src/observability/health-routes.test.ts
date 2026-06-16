@@ -10,6 +10,7 @@ import {
   aggregateLiveEquityAcceptance,
   summarizeDemoBook,
   summarizeDemoBooks,
+  summarizeOptionsPipeline,
   type HealthUserContext,
 } from './health-routes.js';
 import { checkStaleState } from './alerts.js';
@@ -396,6 +397,105 @@ describe('TRA-898 demo-book summary', () => {
     gate({ headers: { 'x-internal-token': 'anything' } }, res, () => undefined);
     expect(requireAuthCalls).toBe(1);
     expect(res.locals['internalDemoAccess']).toBeUndefined();
+  });
+});
+
+describe('TRA-895 options-pipeline probe', () => {
+  function pipeState(over: Partial<EngineState> = {}): EngineState {
+    return engineState({
+      symbols: [
+        { symbol: 'AAPL', price: 1, volume: 1, change: 0, changePct: 0, lastUpdated: FRESH },
+        { symbol: 'MSFT', price: 1, volume: 1, change: 0, changePct: 0, lastUpdated: FRESH },
+      ],
+      signals: [
+        { type: 'relative_value', mode: 'demo' },
+        { type: 'sma200_pullback', mode: 'demo' },
+        { type: 'relative_value', mode: 'demo' },
+      ],
+      options: { openOptions: [{}, {}, {}] },
+      autoTradingEnabled: true,
+      tradingAgentsEnabled: true,
+      tradingAgentsGatingEnabled: true,
+      tradingHalted: false,
+      haltReason: null,
+      marketOpen: true,
+      ...over,
+    } as unknown as EngineState);
+  }
+
+  it('counts option signals + watchlist and reports the scan as armed when every gate passes', () => {
+    const report = summarizeOptionsPipeline(
+      { rvScannerConfigured: true, rvBreakerOpen: false, engines: [{ state: pipeState(), mode: 'demo' }] },
+      NOW,
+    );
+    expect(report.ok).toBe(true);
+    expect(report.rvScannerConfigured).toBe(true);
+    expect(report.demoEngineCount).toBe(1);
+    const e = report.engines[0]!;
+    expect(e.optionSignalCount).toBe(2);
+    expect(e.totalSignalCount).toBe(3);
+    expect(e.watchlistSymbolCount).toBe(2);
+    expect(e.openOptionsCount).toBe(3);
+    expect(e.rvScanArmed).toBe(true);
+    expect(e.blockedBy).toBeNull();
+    expect(report.build).toBeDefined();
+  });
+
+  it('names the first failing gate so "no option signals" is diagnosable', () => {
+    // Auto-trade off → the RV options scan can never fire even with agents on.
+    const offAuto = summarizeOptionsPipeline(
+      { rvScannerConfigured: true, rvBreakerOpen: false, engines: [{ state: pipeState({ autoTradingEnabled: false }), mode: 'demo' }] },
+      NOW,
+    );
+    expect(offAuto.engines[0]!.rvScanArmed).toBe(false);
+    expect(offAuto.engines[0]!.blockedBy).toBe('auto_trading_off');
+
+    // Scanner not configured (no Tradier creds) dominates.
+    const noScanner = summarizeOptionsPipeline(
+      { rvScannerConfigured: false, rvBreakerOpen: false, engines: [{ state: pipeState(), mode: 'demo' }] },
+      NOW,
+    );
+    expect(noScanner.engines[0]!.blockedBy).toBe('rv_scanner_not_configured');
+
+    // Market closed when everything else is green.
+    const closed = summarizeOptionsPipeline(
+      { rvScannerConfigured: true, rvBreakerOpen: false, engines: [{ state: pipeState({ marketOpen: false }), mode: 'demo' }] },
+      NOW,
+    );
+    expect(closed.engines[0]!.blockedBy).toBe('market_closed');
+  });
+
+  it('mounts GET /api/health/options-pipeline unauthenticated when wired', () => {
+    const { app, routes } = fakeApp();
+    registerLiveHealthRoutes(app, {
+      requireAuth: ((_q: unknown, _s: unknown, n: () => void) => n()) as never,
+      userCtx: async () => ctx('admin', pipeState()),
+      getSettings: () => settings(),
+      optionsPipeline: () => ({
+        rvScannerConfigured: true,
+        rvBreakerOpen: false,
+        engines: [{ state: pipeState(), mode: 'demo' }],
+      }),
+      now: () => NOW,
+    });
+    const handlers = routes.get('/api/health/options-pipeline')!;
+    expect(handlers).toHaveLength(1); // unauthenticated — handler only, no gate
+    const res = fakeRes();
+    handlers[0]!({}, res);
+    const body = res.body as { ok: boolean; engines: Array<{ optionSignalCount: number }> };
+    expect(body.ok).toBe(true);
+    expect(body.engines[0]!.optionSignalCount).toBe(2);
+  });
+
+  it('is not mounted when the dep is absent (surface stays unchanged)', () => {
+    const { app, routes } = fakeApp();
+    registerLiveHealthRoutes(app, {
+      requireAuth: ((_q: unknown, _s: unknown, n: () => void) => n()) as never,
+      userCtx: async () => ctx('admin', pipeState()),
+      getSettings: () => settings(),
+      now: () => NOW,
+    });
+    expect(routes.get('/api/health/options-pipeline')).toBeUndefined();
   });
 });
 

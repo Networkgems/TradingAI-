@@ -1680,6 +1680,19 @@ registerLiveHealthRoutes(app, {
     getAllUserContexts()
       .map(ctx => ({ username: ctx.username, state: ctx.engine.getState(), mode: getSettings(ctx.username).mode }))
       .filter(b => b.mode === 'demo'),
+  // TRA-895 — unauth options-signal pipeline probe. Enumerates demo-mode engines
+  // + the shared RV scanner status so "no option signals" is diagnosable without
+  // a login or the internal demo-book token. Secrets-free (booleans/counts only).
+  optionsPipeline: () => {
+    const diag = relativeValueScannerService.diagnostics();
+    return {
+      rvScannerConfigured: diag.configured,
+      rvBreakerOpen: diag.breakerOpen,
+      engines: getAllUserContexts()
+        .map(ctx => ({ state: ctx.engine.getState(), mode: getSettings(ctx.username).mode }))
+        .filter(e => e.mode === 'demo'),
+    };
+  },
 });
 
 // TRA-406 — observability surface. Returns the recent in-memory alerts and the
