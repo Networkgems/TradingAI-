@@ -9,6 +9,7 @@ import { readFileSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import { dirname, join } from 'node:path';
 import { StubLlmClient, runOptionsResearch, isDefinedRiskStrategy } from '@trading-app/agents';
+import { blackScholesPrice, type OptionChainRow } from '@trading-app/engine';
 import type { OptionChainSnapshotFile } from './options-chain-recorder.js';
 import {
   fuseOptionsResearchInput,
@@ -24,6 +25,50 @@ function loadSnapshot(): OptionChainSnapshotFile {
 }
 
 const ASOF = Date.parse('2026-06-08T13:30:00Z');
+
+/**
+ * TRA-895 — a CALM-day chain: every contract is priced exactly at its flat-IV
+ * Black-Scholes theo, so neither scanner flags an anomaly (all 'fair'). Liquid
+ * (OI 1000, ~2% spread) so the near-ATM seed is eligible. One ~35-DTE expiration.
+ */
+function calmChainSnapshot(): OptionChainSnapshotFile {
+  const spot = 100;
+  const sigma = 0.3;
+  const exp = '2026-07-13'; // ~35 DTE from ASOF
+  const T = (Date.parse(`${exp}T16:00:00-04:00`) - ASOF) / (365 * 86_400_000);
+  const rows: OptionChainRow[] = [];
+  for (let strike = 85; strike <= 115; strike += 5) {
+    for (const optionType of ['call', 'put'] as const) {
+      const theo = blackScholesPrice({
+        spot,
+        strike,
+        timeToExpiryYears: T,
+        riskFreeRate: 0.045,
+        volatility: sigma,
+        optionType,
+      });
+      // Price exactly at theo (flat IV ⇒ scanners see no mispricing). Skip any
+      // penny strike so a floor can't manufacture a fake mispricing ratio.
+      if (theo < 0.1) continue;
+      const mid = theo;
+      rows.push({
+        optionSymbol: `CALM${exp.replace(/-/g, '')}${optionType[0]!.toUpperCase()}${strike}`,
+        underlying: 'CALM',
+        optionType,
+        strike,
+        expiration: exp,
+        bid: mid * 0.99,
+        ask: mid * 1.01,
+        last: mid,
+        volume: 500,
+        openInterest: 1000,
+        midIv: sigma,
+        smvVol: sigma,
+      });
+    }
+  }
+  return { symbol: 'CALM', spot, recordedAt: ASOF, expirations: [exp], rows };
+}
 
 // Event/IV context the server would resolve from the C1/C2/sentiment stores.
 const context: Record<string, SymbolEventContext> = {
@@ -65,6 +110,49 @@ describe('fuseOptionsResearchSymbol (recorded chain snapshot)', () => {
     expect(fused!.ivRank).toBeNull();
     expect(fused!.newsSentiment).toBeNull();
     expect(fused!.macroEventsNearby).toEqual([]);
+  });
+});
+
+describe('TRA-895 — ATM seed on calm days (no scanner anomaly)', () => {
+  it('seeds near-ATM call + put anchors when no contract is flagged', () => {
+    const fused = fuseOptionsResearchSymbol(calmChainSnapshot(), { now: ASOF });
+    expect(fused).not.toBeNull();
+    expect(fused!.symbol).toBe('CALM');
+    // Exactly one near-ATM anchor per side, both honest non-anomalies.
+    expect(fused!.candidates).toHaveLength(2);
+    expect(new Set(fused!.candidates.map((c) => c.optionType))).toEqual(new Set(['call', 'put']));
+    for (const c of fused!.candidates) {
+      expect(c.source).toBe('atm_seed');
+      expect(c.classification).toBe('fair');
+      expect(c.mispricingPct).toBe(0);
+      expect(c.daysToExpiration).toBeGreaterThanOrEqual(21);
+      expect(c.daysToExpiration).toBeLessThanOrEqual(60);
+      // Nearest-ATM strike picked (spot = 100, 5-wide chain → 100).
+      expect(c.strike).toBe(100);
+      expect(c.mark).toBeGreaterThan(0);
+    }
+  });
+
+  it('restores anomaly-only behavior when seeding is disabled', () => {
+    const fused = fuseOptionsResearchSymbol(calmChainSnapshot(), {
+      now: ASOF,
+      seedAtmAnchorsWhenEmpty: false,
+    });
+    expect(fused).toBeNull();
+  });
+
+  it('does NOT seed illiquid names (open interest below the floor)', () => {
+    const snap = calmChainSnapshot();
+    for (const r of snap.rows) r.openInterest = 10; // below the 250 floor
+    const fused = fuseOptionsResearchSymbol(snap, { now: ASOF });
+    expect(fused).toBeNull();
+  });
+
+  it('does not override a genuine scanner anomaly with seeds', () => {
+    // The recorded fixture has deliberately-mispriced contracts → real anomalies.
+    const fused = fuseOptionsResearchSymbol(loadSnapshot(), { now: ASOF });
+    expect(fused).not.toBeNull();
+    expect(fused!.candidates.every((c) => c.source !== 'atm_seed')).toBe(true);
   });
 });
 

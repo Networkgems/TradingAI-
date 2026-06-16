@@ -439,6 +439,9 @@ describe('TRA-895 options-pipeline probe', () => {
     expect(e.rvScanArmed).toBe(true);
     expect(e.blockedBy).toBeNull();
     expect(report.build).toBeDefined();
+    // TRA-895 — AI Options Ideas generator is un-gated (seeds near-ATM anchors
+    // on calm days) so the demo watcher can confirm the ungated build is live.
+    expect(report.aiIdeasGeneratorUngated).toBe(true);
   });
 
   it('names the first failing gate so "no option signals" is diagnosable', () => {

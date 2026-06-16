@@ -11,6 +11,7 @@
 import {
   findRelativeValueOpportunities,
   findMispricedOtmContracts,
+  blackScholesDelta,
   type OptionChainRow,
   type RelativeValueCandidate,
   type OtmMispricingCandidate,
@@ -28,6 +29,27 @@ import type { OptionChainSnapshotFile } from './options-chain-recorder.js';
 const DEFAULT_MIN_DTE = 21;
 const DEFAULT_MAX_DTE = 60;
 const DEFAULT_MAX_CANDIDATES_PER_SYMBOL = 8;
+
+// ── TRA-895 ATM-seed defaults ────────────────────────────────────────────────
+// When neither scanner flags a mispricing, seed near-ATM anchors on LIQUID names
+// so the research pass can still propose event/IV-driven defined-risk ideas on
+// calm days (board decision on TRA-895: un-gate the AI Options Ideas generator).
+// Liquidity thresholds mirror the dashboard RV gate the board referenced
+// (OI ≥ 250, spread ≤ 10%) so we only seed genuinely tradeable contracts.
+/**
+ * TRA-895 — whether the ATM-seed un-gate is on by default. The live feed
+ * (`buildIdeasFeed`) calls the fusion without overriding the option, so this is
+ * the deployed behavior; the health probe surfaces it so the demo watcher can
+ * confirm the ungated build is live in one read.
+ */
+export const ATM_SEED_ENABLED_BY_DEFAULT = true;
+const DEFAULT_SEED_MIN_OPEN_INTEREST = 250;
+const DEFAULT_SEED_MAX_SPREAD_PCT = 0.1;
+const DEFAULT_SEED_MIN_MARK = 0.1;
+/** Annualized risk-free rate for the seed delta (matches the scanners' BS default). */
+const SEED_RISK_FREE_RATE = 0.045;
+/** Target DTE the seed expiration is chosen closest to — the medium-horizon midpoint. */
+const SEED_TARGET_DTE = 35;
 
 /**
  * Point-in-time event + IV context for one symbol, resolved by the caller from
@@ -65,6 +87,20 @@ export interface FuseOptionsResearchOptions {
   now?: number;
   rvOptions?: RelativeValueScannerOptions;
   otmOptions?: OtmScannerOptions;
+  /**
+   * TRA-895 — when both scanners flag nothing for a symbol, seed near-ATM call +
+   * put anchors on liquid contracts so the research pass still sees the name and
+   * can propose event/IV-driven defined-risk ideas on calm days. Defaults `true`
+   * (the board un-gated the AI Options Ideas generator). Set `false` to restore
+   * the old selective behavior (anomaly-only).
+   */
+  seedAtmAnchorsWhenEmpty?: boolean;
+  /** Min open interest for a contract to be seed-eligible (default 250). */
+  seedMinOpenInterest?: number;
+  /** Max (ask − bid)/mid for a contract to be seed-eligible (default 0.10). */
+  seedMaxSpreadPct?: number;
+  /** Min mid quote for a seed contract — drop penny strikes (default 0.10). */
+  seedMinMark?: number;
 }
 
 function rvToCandidate(c: RelativeValueCandidate): OptionsScannerCandidate {
@@ -97,6 +133,100 @@ function otmToCandidate(c: OtmMispricingCandidate): OptionsScannerCandidate {
     mispricingPct: c.mispricingPct,
     source: 'otm_mispricing',
   };
+}
+
+function rowMid(r: OptionChainRow): number | null {
+  if (typeof r.bid === 'number' && typeof r.ask === 'number' && r.bid >= 0 && r.ask > 0) {
+    return (r.bid + r.ask) / 2;
+  }
+  if (typeof r.last === 'number' && r.last > 0) return r.last;
+  return null;
+}
+
+function rowSpreadPct(r: OptionChainRow, mid: number): number | null {
+  if (typeof r.bid !== 'number' || typeof r.ask !== 'number' || r.ask <= 0 || mid <= 0) return null;
+  return (r.ask - r.bid) / mid;
+}
+
+/**
+ * TRA-895 — seed near-ATM call + put anchors for a symbol with no flagged
+ * scanner candidate, so the research pass still sees a liquid name on calm days.
+ *
+ * Picks the single in-window expiration closest to {@link SEED_TARGET_DTE}, then
+ * the liquid (OI / spread / mark thresholds) contract nearest ATM for each side.
+ * Seeds are honest non-anomalies: `classification: 'fair'`, `mispricingPct: 0`,
+ * `source: 'atm_seed'` — the model is instructed not to claim a mispricing edge
+ * from them and to lean on IV-rank / event proximity instead. Returns [] when no
+ * liquid near-ATM contract exists (thin name → still nothing to research).
+ */
+function buildAtmSeedCandidates(
+  rows: readonly OptionChainRow[],
+  spot: number,
+  now: number,
+  minDte: number,
+  maxDte: number,
+  opts: FuseOptionsResearchOptions,
+): OptionsScannerCandidate[] {
+  const minOi = opts.seedMinOpenInterest ?? DEFAULT_SEED_MIN_OPEN_INTEREST;
+  const maxSpread = opts.seedMaxSpreadPct ?? DEFAULT_SEED_MAX_SPREAD_PCT;
+  const minMark = opts.seedMinMark ?? DEFAULT_SEED_MIN_MARK;
+
+  // DTE per expiration (anchored to the 16:00 ET close, like the scanners).
+  const dteOf = (iso: string): number => {
+    const target = Date.parse(`${iso}T16:00:00-04:00`);
+    if (!Number.isFinite(target)) return -1;
+    return Math.round((target - now) / 86_400_000);
+  };
+
+  // Pick the in-window expiration whose DTE is closest to the target horizon.
+  const expirations = [...new Set(rows.map((r) => r.expiration))]
+    .map((iso) => ({ iso, dte: dteOf(iso) }))
+    .filter((e) => e.dte >= minDte && e.dte <= maxDte);
+  if (!expirations.length) return [];
+  expirations.sort((a, b) => Math.abs(a.dte - SEED_TARGET_DTE) - Math.abs(b.dte - SEED_TARGET_DTE));
+  const { iso: exp, dte } = expirations[0]!;
+
+  const seedFor = (optionType: 'call' | 'put'): OptionsScannerCandidate | null => {
+    let best: { row: OptionChainRow; mark: number; dist: number } | null = null;
+    for (const r of rows) {
+      if (r.optionType !== optionType || r.expiration !== exp) continue;
+      if (typeof r.openInterest !== 'number' || r.openInterest < minOi) continue;
+      const mark = rowMid(r);
+      if (mark == null || mark < minMark) continue;
+      const spread = rowSpreadPct(r, mark);
+      if (spread == null || spread > maxSpread) continue;
+      const dist = Math.abs(r.strike - spot);
+      if (!best || dist < best.dist) best = { row: r, mark, dist };
+    }
+    if (!best) return null;
+    const iv = best.row.smvVol ?? best.row.midIv ?? 0;
+    const delta =
+      iv > 0
+        ? blackScholesDelta({
+            spot,
+            strike: best.row.strike,
+            timeToExpiryYears: dte / 365,
+            riskFreeRate: SEED_RISK_FREE_RATE,
+            volatility: iv,
+            optionType,
+          })
+        : 0;
+    return {
+      optionSymbol: best.row.optionSymbol,
+      optionType,
+      strike: best.row.strike,
+      expiration: exp,
+      daysToExpiration: dte,
+      mark: best.mark,
+      ivUsed: iv,
+      delta,
+      classification: 'fair',
+      mispricingPct: 0,
+      source: 'atm_seed',
+    };
+  };
+
+  return [seedFor('call'), seedFor('put')].filter((c): c is OptionsScannerCandidate => c != null);
 }
 
 /**
@@ -134,7 +264,17 @@ export function fuseOptionsResearchSymbol(
     .sort((a, b) => Math.abs(b.mispricingPct) - Math.abs(a.mispricingPct))
     .slice(0, cap);
 
-  if (candidates.length === 0) return null;
+  // TRA-895 — no statistical anomaly today? Seed near-ATM anchors on this liquid
+  // name so the research pass still sees it and can propose event/IV-driven
+  // defined-risk ideas (board un-gated the AI Options Ideas generator). Disabled
+  // → restores the old anomaly-only behavior (symbol dropped on calm days).
+  if (candidates.length === 0) {
+    const seedEnabled = opts.seedAtmAnchorsWhenEmpty ?? ATM_SEED_ENABLED_BY_DEFAULT;
+    if (!seedEnabled) return null;
+    const seeded = buildAtmSeedCandidates(rows, spot, now, minDte, maxDte, opts);
+    if (seeded.length === 0) return null;
+    candidates.push(...seeded);
+  }
 
   const ctx = opts.contextFor?.(snapshot.symbol) ?? {};
   return {

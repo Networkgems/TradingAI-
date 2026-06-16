@@ -83,8 +83,15 @@ export interface OptionsScannerCandidate {
   classification: string;
   /** (mark − fair) / fair. Positive → rich, negative → cheap. */
   mispricingPct: number;
-  /** Which scanner surfaced it (provenance for the thesis). */
-  source: 'relative_value' | 'otm_mispricing';
+  /**
+   * Which scanner surfaced it (provenance for the thesis). `atm_seed` (TRA-895)
+   * is NOT a scanner anomaly: it is a near-ATM anchor seeded on liquid names when
+   * neither scanner flagged a mispricing, so the research pass can still propose
+   * event/thesis-driven defined-risk structures on calm days. A seed carries
+   * `classification: 'fair'` and `mispricingPct: 0` — the model must NOT claim a
+   * mispricing edge from it and must lean on IV-rank / event proximity instead.
+   */
+  source: 'relative_value' | 'otm_mispricing' | 'atm_seed';
 }
 
 /**
@@ -371,6 +378,14 @@ const SYSTEM_PROMPT = [
   '4. maxLossUsd is the DEFINED dollar loss per 1-lot (100 multiplier). It must be > 0.',
   '5. pop is your honest probability-of-profit estimate at expiry, 0..1, grounded in the',
   '   data given (delta, mispricing, IV-rank). When IV-rank is unknown, do not claim an IV edge.',
+  '',
+  'CANDIDATE PROVENANCE. Each candidate carries a `source`: `relative_value` / `otm_mispricing`',
+  'are real scanner anomalies (`mispricingPct` is meaningful). `source: "atm_seed"` is NOT an',
+  'anomaly — it is a near-ATM anchor we seeded on a liquid name because no mispricing was flagged.',
+  'For a seed, `mispricingPct` is 0 and `classification` is "fair": do NOT invent a mispricing edge',
+  'from it. You may still build a defined-risk idea around a seed when IV-rank and/or a scheduled',
+  'event (earnings/FOMC/macro) supports a thesis; otherwise leave that name out. Quality over',
+  'quantity — a thin or eventless name with only a seed and unknown IV-rank is a pass, not a forced idea.',
   '',
   'When IV-rank is HIGH, prefer net-credit defined-risk structures (sell rich premium with a',
   'capped wing). When IV-rank is LOW, prefer net-debit structures. Around earnings/FOMC,',

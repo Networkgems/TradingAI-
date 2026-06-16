@@ -13,6 +13,7 @@ import type { EngineState, LiveEquityAcceptance } from '../signal-engine.js';
 import { resolveBuildInfo } from './build-info.js';
 import { summarizeLiveHealth, summarizeFeed } from './live-health.js';
 import { checkStaleState } from './alerts.js';
+import { ATM_SEED_ENABLED_BY_DEFAULT } from '../options-research-input.js';
 
 /** Minimal shape this module needs from a per-user context. */
 export interface HealthEngineLike {
@@ -359,6 +360,14 @@ export interface OptionsPipelineReport {
   rvScannerConfigured: boolean;
   /** RV scanner's Tradier rate-limit breaker is currently tripped open. */
   rvBreakerOpen: boolean;
+  /**
+   * TRA-895 — true when the AI Options Ideas generator is un-gated from the
+   * mechanical-anomaly scanner: on a calm day (no ≥2σ mispricing) it seeds
+   * near-ATM anchors on liquid watchlist names so the research pass can still
+   * propose event/IV-driven defined-risk ideas. This is the surface the board
+   * un-gated; the dashboard RV signals above stay anomaly-only by design.
+   */
+  aiIdeasGeneratorUngated: boolean;
   demoEngineCount: number;
   engines: OptionsPipelineEngineView[];
 }
@@ -414,6 +423,7 @@ export function summarizeOptionsPipeline(
     build: resolveBuildInfo(),
     rvScannerConfigured: input.rvScannerConfigured,
     rvBreakerOpen: input.rvBreakerOpen,
+    aiIdeasGeneratorUngated: ATM_SEED_ENABLED_BY_DEFAULT,
     demoEngineCount: engines.length,
     engines,
   };
