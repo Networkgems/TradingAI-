@@ -1665,11 +1665,21 @@ app.get('/api/health', (_req, res) => {
 // counts / timestamps only — no trade specifics), so the first organic
 // production Tradier OTOCO fill can be verified against the live deployment
 // without shipping credentials into an agent env.
+// TRA-901 — also grant the unattended TRA-898 daily-watch routine token-gated
+// access to the (otherwise user-JWT-only) demo-book surface. `internalToken`
+// is the shared secret from env (rotation-tracking, empty disables internal
+// access); `demoBooks` enumerates the fleet's demo-mode engines so the routine
+// can read the $25k paper book without authenticating as that account.
 registerLiveHealthRoutes(app, {
   requireAuth,
   userCtx,
   getSettings,
   liveEquityAcceptance: () => getAllUserContexts().map(ctx => ctx.engine.getLiveEquityAcceptance()),
+  internalToken: () => (process.env['DEMO_BOOK_INTERNAL_TOKEN'] ?? '').trim() || undefined,
+  demoBooks: () =>
+    getAllUserContexts()
+      .map(ctx => ({ username: ctx.username, state: ctx.engine.getState(), mode: getSettings(ctx.username).mode }))
+      .filter(b => b.mode === 'demo'),
 });
 
 // TRA-406 — observability surface. Returns the recent in-memory alerts and the

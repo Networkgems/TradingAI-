@@ -6,6 +6,7 @@
 // call + one line in the monitor, and lets the whole surface be unit-tested
 // with a fake express app and fake user contexts — no live server required.
 
+import { timingSafeEqual } from 'node:crypto';
 import type { Express, Response, RequestHandler } from 'express';
 import { findMissingLiveCredentials, type AccountSettings } from '@trading-app/shared';
 import type { EngineState, LiveEquityAcceptance } from '../signal-engine.js';
@@ -36,6 +37,24 @@ export interface LiveHealthDeps {
    * working; the route is only mounted when this is provided.
    */
   liveEquityAcceptance?: () => LiveEquityAcceptance[];
+  /**
+   * TRA-901 — the shared secret that grants the unattended TRA-898 daily-watch
+   * routine access to the auth-gated `/api/health/demo-book` surface without a
+   * (short-lived, per-user, expiring) login JWT. Resolved per-call so it tracks
+   * env rotation. Returns undefined/empty to disable internal access entirely
+   * (the route then behaves exactly as before — user-JWT only). The watch sends
+   * it as the `x-internal-token` request header.
+   */
+  internalToken?: () => string | undefined;
+  /**
+   * TRA-901 — enumerate every demo-mode engine's paper book for the internal
+   * (token-gated) demo-book read. Unlike the user-JWT path (which is scoped to
+   * the caller's own engine via `userCtx`), the watch routine has no engine of
+   * its own, so internal access returns the fleet's demo books keyed by user.
+   * Only mounted behind a valid internal token, so it never widens the
+   * unauthenticated surface.
+   */
+  demoBooks?: () => Array<{ username: string; state: EngineState; mode: string }>;
   /** Injectable clock for deterministic tests. Defaults to Date.now. */
   now?: () => number;
 }
@@ -252,6 +271,36 @@ export function summarizeDemoBook(
   };
 }
 
+/**
+ * TRA-901 — the internal (token-gated) demo-book read returns EVERY demo-mode
+ * engine's book keyed by user, because the unattended watch routine has no
+ * engine of its own to scope to. For the TRA-895 3-day test this is normally a
+ * single $25k account, but enumerating the fleet keeps it correct if more than
+ * one demo trader is live.
+ */
+export interface DemoBookFleetReport {
+  ok: true;
+  time: string;
+  build: ReturnType<typeof resolveBuildInfo>;
+  /** Demo-mode engines enumerated this read. */
+  demoEngineCount: number;
+  books: Array<{ username: string; book: DemoBookReport }>;
+}
+
+/** Fold the fleet's demo-mode engines into one internal demo-book report. */
+export function summarizeDemoBooks(
+  engines: Array<{ username: string; state: EngineState; mode: string }>,
+  now: number,
+): DemoBookFleetReport {
+  return {
+    ok: true,
+    time: new Date(now).toISOString(),
+    build: resolveBuildInfo(),
+    demoEngineCount: engines.length,
+    books: engines.map(e => ({ username: e.username, book: summarizeDemoBook(e.state, e.mode, now) })),
+  };
+}
+
 /** Build the consolidated live-health summary for one user context. */
 function summarizeForContext(
   ctx: HealthUserContext,
@@ -291,8 +340,39 @@ function summarizeForContext(
  *    symbol, qty, price, order id, account id, or balance. Mounted only when
  *    `deps.liveEquityAcceptance` is provided.
  */
+/**
+ * Constant-time secret compare for the TRA-901 internal token. Short-circuits
+ * on length mismatch (timingSafeEqual throws on unequal-length buffers); the
+ * length of an internal shared secret is not itself sensitive.
+ */
+function tokenMatches(provided: string, expected: string): boolean {
+  const a = Buffer.from(provided);
+  const b = Buffer.from(expected);
+  return a.length === b.length && timingSafeEqual(a, b);
+}
+
 export function registerLiveHealthRoutes(app: Express, deps: LiveHealthDeps): void {
   const now = deps.now ?? Date.now;
+
+  // TRA-901 — accept EITHER a user-JWT (via the normal requireAuth) OR the
+  // configured internal token (`x-internal-token` header) so the unattended
+  // daily-watch routine can read the demo book without a per-user login. The
+  // internal path is only taken when a non-empty token is configured AND the
+  // header matches it under a constant-time compare; otherwise we fall straight
+  // through to requireAuth, so the surface never gets weaker than before.
+  const internalOrAuth: RequestHandler = (req, res, next) => {
+    const expected = deps.internalToken?.();
+    if (expected) {
+      const raw = req.headers['x-internal-token'];
+      const provided = Array.isArray(raw) ? raw[0] : raw;
+      if (provided && tokenMatches(provided, expected)) {
+        res.locals['internalDemoAccess'] = true;
+        next();
+        return;
+      }
+    }
+    deps.requireAuth(req, res, next);
+  };
 
   app.get('/api/health/version', (_req, res) => {
     res.json(resolveBuildInfo());
@@ -306,10 +386,17 @@ export function registerLiveHealthRoutes(app: Express, deps: LiveHealthDeps): vo
     res.json({ ...summary, build: resolveBuildInfo(), time: new Date(now()).toISOString() });
   });
 
-  // TRA-898 — auth-gated demo paper-book summary for the TRA-895 daily watch.
-  // Parity with `/api/health/live`: names balances, so it is auth-gated and
-  // scoped to the caller's own engine (never a fleet sum).
-  app.get('/api/health/demo-book', deps.requireAuth, async (_req, res) => {
+  // TRA-898 — demo paper-book summary for the TRA-895 daily watch. Names
+  // balances, so it is gated (parity with `/api/health/live`). TRA-901 widens
+  // the gate to accept the internal watch token in addition to a user JWT:
+  //  - user-JWT caller  → their OWN demo book (caller-scoped, never a sum).
+  //  - internal token   → the fleet's demo-mode books keyed by user, since the
+  //    unattended routine has no engine of its own to scope to.
+  app.get('/api/health/demo-book', internalOrAuth, async (_req, res) => {
+    if (res.locals['internalDemoAccess']) {
+      res.json(summarizeDemoBooks(deps.demoBooks?.() ?? [], now()));
+      return;
+    }
     const ctx = await deps.userCtx(res);
     if (res.headersSent) return;
     const settings = deps.getSettings(ctx.username);

@@ -9,6 +9,7 @@ import {
   runStaleStateCheck,
   aggregateLiveEquityAcceptance,
   summarizeDemoBook,
+  summarizeDemoBooks,
   type HealthUserContext,
 } from './health-routes.js';
 import { checkStaleState } from './alerts.js';
@@ -65,6 +66,13 @@ function fakeRes() {
       this.headersSent = true;
     },
   };
+  return res;
+}
+
+/** Like fakeRes but with a `locals` bag, as express provides to handlers. */
+function resWithLocals() {
+  const res = fakeRes() as ReturnType<typeof fakeRes> & { locals: Record<string, unknown> };
+  res.locals = {};
   return res;
 }
 
@@ -294,13 +302,100 @@ describe('TRA-898 demo-book summary', () => {
       now: () => NOW,
     });
     const handlers = routes.get('/api/health/demo-book')!;
-    expect(handlers).toHaveLength(2); // requireAuth + handler
-    const res = fakeRes();
+    expect(handlers).toHaveLength(2); // gate + handler
+    const res = resWithLocals();
     await handlers[1]!({}, res);
     const body = res.body as { ok: boolean; equity: { totalEquity: number }; build: unknown };
     expect(body.ok).toBe(true);
     expect(body.equity.totalEquity).toBe(25_500);
     expect(body.build).toBeDefined();
+  });
+
+  it('TRA-901 summarizeDemoBooks keys each demo engine book by user', () => {
+    const report = summarizeDemoBooks(
+      [{ username: 'demo-trader', state: demoState(), mode: 'demo' }],
+      NOW,
+    );
+    expect(report.ok).toBe(true);
+    expect(report.demoEngineCount).toBe(1);
+    expect(report.books).toHaveLength(1);
+    expect(report.books[0]!.username).toBe('demo-trader');
+    expect(report.books[0]!.book.equity.totalEquity).toBe(25_500);
+    expect(report.books[0]!.book.openPositionCount).toBe(2);
+    expect(report.build).toBeDefined();
+  });
+
+  it('TRA-901 internal token unlocks demo-book without a user JWT and returns the fleet books', async () => {
+    const { app, routes } = fakeApp();
+    let requireAuthCalled = false;
+    registerLiveHealthRoutes(app, {
+      requireAuth: (() => {
+        requireAuthCalled = true;
+      }) as never,
+      userCtx: async () => {
+        throw new Error('userCtx must not run on the internal path');
+      },
+      getSettings: () => settings(),
+      internalToken: () => 'watch-secret',
+      demoBooks: () => [{ username: 'demo-trader', state: demoState(), mode: 'demo' }],
+      now: () => NOW,
+    });
+    const [gate, handler] = routes.get('/api/health/demo-book')!;
+    // Valid token → gate sets res.locals and calls next(); requireAuth is skipped.
+    const res = resWithLocals();
+    let nexted = false;
+    gate({ headers: { 'x-internal-token': 'watch-secret' } }, res, () => {
+      nexted = true;
+    });
+    expect(nexted).toBe(true);
+    expect(requireAuthCalled).toBe(false);
+    expect(res.locals['internalDemoAccess']).toBe(true);
+    await handler!({ headers: { 'x-internal-token': 'watch-secret' } }, res);
+    const body = res.body as { demoEngineCount: number; books: Array<{ username: string }> };
+    expect(body.demoEngineCount).toBe(1);
+    expect(body.books[0]!.username).toBe('demo-trader');
+  });
+
+  it('TRA-901 a wrong/absent internal token falls through to requireAuth', () => {
+    const { app, routes } = fakeApp();
+    let requireAuthCalls = 0;
+    registerLiveHealthRoutes(app, {
+      requireAuth: (() => {
+        requireAuthCalls += 1;
+      }) as never,
+      userCtx: async () => ctx('admin', demoState()),
+      getSettings: () => settings(),
+      internalToken: () => 'watch-secret',
+      demoBooks: () => [],
+      now: () => NOW,
+    });
+    const [gate] = routes.get('/api/health/demo-book')!;
+    const res = resWithLocals();
+    gate({ headers: { 'x-internal-token': 'WRONG' } }, res, () => undefined); // wrong token
+    gate({ headers: {} }, res, () => undefined); // no token
+    expect(requireAuthCalls).toBe(2);
+    expect(res.locals['internalDemoAccess']).toBeUndefined();
+  });
+
+  it('TRA-901 internal access stays disabled when no token is configured', () => {
+    const { app, routes } = fakeApp();
+    let requireAuthCalls = 0;
+    registerLiveHealthRoutes(app, {
+      requireAuth: (() => {
+        requireAuthCalls += 1;
+      }) as never,
+      userCtx: async () => ctx('admin', demoState()),
+      getSettings: () => settings(),
+      internalToken: () => undefined, // disabled
+      demoBooks: () => [{ username: 'demo-trader', state: demoState(), mode: 'demo' }],
+      now: () => NOW,
+    });
+    const [gate] = routes.get('/api/health/demo-book')!;
+    const res = resWithLocals();
+    // Even a header present → ignored, falls through to requireAuth.
+    gate({ headers: { 'x-internal-token': 'anything' } }, res, () => undefined);
+    expect(requireAuthCalls).toBe(1);
+    expect(res.locals['internalDemoAccess']).toBeUndefined();
   });
 });
 
