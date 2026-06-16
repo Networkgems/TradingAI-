@@ -1724,11 +1724,13 @@ export class SignalEngine {
     // no paper opens (and no Tradier orders) fire. Demo mode is unaffected;
     // existing live option positions still get marks via refreshOptionMarks().
     const skipOptionsForLiveEquityOnly = this.mode === 'live' && !this.tradierLiveOptionsEnabled;
-    // TRA-544: also suspended when the agent layer has taken over (§2B).
     // TRA-776: RV_ENGINE_ENABLED is the hard kill — the relative-value engine is
     // retired and must not open new option tickets in any mode.
+    // TRA-895: RV is options-specific and independent of the equity agent layer.
+    // Pass isAutoTradingEnabled() (not isDeterministicAutoTradingEnabled()) so
+    // the options scanner still fires when the equity Trading-Agents mode is ON.
     if (shouldRunRelativeValueScan({
-      autoTradingEnabled: this.isDeterministicAutoTradingEnabled(),
+      autoTradingEnabled: this.isAutoTradingEnabled(),
       halted: this.riskGovernor.isHalted(),
       hasScanner: !!this.rvScanner,
       marketOpen: isStockMarketOpen(),
