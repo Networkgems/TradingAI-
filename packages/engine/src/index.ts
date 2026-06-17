@@ -276,6 +276,24 @@ export type {
   OptionSizingInputs,
   OptionSizingResult,
 } from './options/supertrend-options.js';
+export {
+  selectStrategyKind,
+  selectShadowOptionSignal,
+  isLiquid,
+  DEFAULT_SELECTOR_PARAMS,
+} from './options/strategy-selector.js';
+export type {
+  OptionTrend,
+  OptionStrategyKind,
+  ContractQuote,
+  StrategySelectorParams,
+  StrategySelectorInput,
+  LegAction,
+  OptionLeg,
+  ShadowOptionSignal,
+  StrategySelectorResult,
+  GateDecision,
+} from './options/strategy-selector.js';
 export { findMispricedOtmContracts } from './options/otm-mispricing.js';
 export type {
   OptionChainRow,

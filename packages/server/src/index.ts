@@ -93,6 +93,7 @@ import { agentSpendAggregate } from './agent-spend-store.js';
 import { initIvRankStore } from './iv-rank-store.js';
 import { initIdeaJournal, listJournalEntries } from './options-idea-journal.js';
 import { initShadowLedger, listShadowSignals } from './shadow-signal-ledger.js';
+import { initOptionShadowLedger, listOptionShadowSignals, isOptionShadowEnabled } from './option-shadow-ledger.js';
 import {
   loadUserMemoryStore,
   getUserMemory,
@@ -426,6 +427,12 @@ await initIdeaJournal();
 // The engine appends OPEN rows on each new shadow signal and RESOLVED rows as
 // the forward horizon labels them.
 await initShadowLedger();
+
+// TRA-911 (TRA-908 Phase A) — warm the flag-gated SHADOW option-trade signal
+// ledger so the read endpoint has history right after boot. The selector that
+// appends to it is observe-only and OFF unless ENABLE_OPTION_SHADOW_SELECTOR is
+// set; nothing here routes an order.
+await initOptionShadowLedger();
 
 // TRA-850 — warm the persistent per-user trading-memory store from disk so the
 // synchronous `getUserMemorySync` read the advisory tick uses has each user's
@@ -2860,6 +2867,28 @@ app.get('/api/health/shadow-signals', async (req, res) => {
       reason: err instanceof Error ? err.message : String(err),
     });
     res.status(500).json({ error: 'Failed to read shadow ledger' });
+  }
+});
+
+// TRA-911 (TRA-908 Phase A) — read-only probe over the shadow OPTION-trade
+// ledger. Open like the Supertrend shadow probe so QuantTrader (TRA-914) can
+// validate the gate matrix output without Render admin creds. Reports whether
+// the selector flag is enabled so a viewer can tell an empty ledger ("flag off")
+// from a live-but-silent one.
+app.get('/api/health/option-shadow-signals', async (_req, res) => {
+  try {
+    const signals = await listOptionShadowSignals();
+    res.json({
+      issue: 'TRA-911',
+      flagEnabled: isOptionShadowEnabled(),
+      count: signals.length,
+      signals,
+    });
+  } catch (err) {
+    log.error('option-shadow-signals health probe failed', {
+      reason: err instanceof Error ? err.message : String(err),
+    });
+    res.status(500).json({ error: 'Failed to read option shadow ledger' });
   }
 });
 
