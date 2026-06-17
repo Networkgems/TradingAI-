@@ -168,7 +168,24 @@ export class TradierStocksClient {
   async getMinuteBars(symbol: string, count: number): Promise<Candle[]> {
     if (!Number.isFinite(count) || count <= 0) return [];
     const end = new Date();
-    const start = new Date(end.getTime() - count * 60_000 * 2);
+    // TRA-934 — size the lookback off RTH density, not a flat 2×-minute window.
+    // `session_filter=open` returns only regular-session minutes (~390/day), so a
+    // flat `count×2` minute window silently under-covers multi-day pulls: a 2400-bar
+    // request spans ~3.3 calendar days ≈ 2.4 trading days ≈ 930 RTH minutes — far
+    // short of 2400. That starved the SupertrendConfluence 1h MTF confirm to ~15
+    // hourly bars, below the TRA-840 ≥30-bar floor, so `evaluateShadowRow` returned
+    // null every tick and the shadow ledger never accrued. For deep pulls (>1 day)
+    // widen the window to ~1.5 calendar days per trading day (weekend/holiday slack)
+    // so the trailing `count` RTH bars are actually present; the shallow hot-scan
+    // path (count<390) keeps the original flat window unchanged. Output is unchanged
+    // for any caller already getting its full `count` — we only add older history
+    // before the trailing `slice(-count)`, never remove bars.
+    const FLAT_WINDOW_MS = count * 60_000 * 2;
+    const RTH_MINUTES_PER_DAY = 390;
+    const rthAwareMs = (count / RTH_MINUTES_PER_DAY * 1.5 + 1) * 24 * 60 * 60 * 1000;
+    const start = new Date(
+      end.getTime() - (count >= RTH_MINUTES_PER_DAY ? Math.max(FLAT_WINDOW_MS, rthAwareMs) : FLAT_WINDOW_MS),
+    );
     const params = new URLSearchParams({
       symbol,
       interval: '1min',

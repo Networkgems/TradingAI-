@@ -155,6 +155,36 @@ describe('TradierStocksClient.getMinuteBars', () => {
     expect(url).toContain('interval=1min');
     expect(url).toContain('session_filter=open');
   });
+
+  // TRA-934 — `session_filter=open` returns only ~390 RTH min/day, so a deep pull
+  // needs a multi-day calendar window or the trailing `count` bars don't exist.
+  // The old flat `count×2`-minute window gave a 2400-bar request only ~3.3 calendar
+  // days (~930 RTH min), starving the 1h confirm to ~15 bars (< the 30-bar floor)
+  // and leaving the SupertrendConfluence shadow ledger permanently empty.
+  const spanCalendarDays = (url: string): number => {
+    const q = new URL(url).searchParams;
+    const day = (k: string): number => Date.parse(`${(q.get(k) ?? '').slice(0, 10)}T00:00:00Z`);
+    return (day('end') - day('start')) / 86_400_000;
+  };
+
+  it('widens a deep (multi-day) pull to an RTH-aware calendar window', async () => {
+    fetchMock.mockResolvedValueOnce(jsonResponse({ series: { data: [] } }));
+    const client = new TradierStocksClient('tok');
+    await client.getMinuteBars('AAPL', 2400); // ~6 RTH trading days requested
+    const span = spanCalendarDays(String(fetchMock.mock.calls[0][0]));
+    // Must cover well over a week of calendar days so ≥6 RTH sessions (≥2400 RTH
+    // minutes → ≥30 hourly confirm bars) are actually in range.
+    expect(span).toBeGreaterThanOrEqual(8);
+  });
+
+  it('leaves the shallow hot-scan pull on the original tight window', async () => {
+    fetchMock.mockResolvedValueOnce(jsonResponse({ series: { data: [] } }));
+    const client = new TradierStocksClient('tok');
+    await client.getMinuteBars('AAPL', 80); // intraday hot scan
+    const span = spanCalendarDays(String(fetchMock.mock.calls[0][0]));
+    // 80×2 minutes ≈ 0.11 days — same ET date (or one boundary crossing at most).
+    expect(span).toBeLessThanOrEqual(1);
+  });
 });
 
 describe('TradierStocksClient.getDailyBars (TRA-586)', () => {
