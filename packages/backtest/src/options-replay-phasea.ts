@@ -33,6 +33,7 @@
 import {
   blackScholesDelta,
   blackScholesGreeks,
+  blackScholesPrice,
   selectShadowOptionSignal,
   type ContractQuote,
   type OptionTrend,
@@ -247,6 +248,82 @@ function buildLegIvIndex(day: ChainDay): Map<string, number> {
     }
   }
   return idx;
+}
+
+/**
+ * TRA-926 — a per-day leg mark resolver with a Black-Scholes reprice fallback.
+ *
+ * It first returns the exact (symbol, leg) chain mid when the day quotes it. When
+ * the exact leg is NOT in the snapshot it reprices the leg from the day's spot +
+ * a nearest-strike chain IV via `blackScholesPrice` instead of returning null. A
+ * null mark would make {@link OptionsReplayAccount.markAndManageSpreads} treat
+ * the spread as unpriceable and (at the time stop) book `-maxLoss` — the artifact
+ * TRA-914 validation caught: a credit spread whose short strikes drifted deep OTM
+ * (so far that the synthetic generator drops them as sub-penny rows) is actually
+ * near MAX PROFIT, yet was being booked as a full max LOSS.
+ *
+ * Faithful: a deep-OTM leg reprices to ~0, so the spread marks near its true
+ * (winning) value and the 50%-take / continuous-loss behaviour the acceptance
+ * checks require both emerge. Returns null only when the symbol has neither a
+ * spot nor any IV to model from — i.e. genuinely nothing to mark against.
+ */
+export function buildLegRepricer(
+  day: ChainDay,
+  spotBySymbol: ReadonlyMap<string, number>,
+  riskFreeRate: number,
+): (symbol: string, leg: OptionLeg) => number | null {
+  const midIndex = buildLegMidIndex(day);
+  // sym|optionType → all quoted {strike, expiration, iv} for nearest-strike IV.
+  const ivRows = new Map<string, Array<{ strike: number; expiration: string; iv: number }>>();
+  for (const [sym, file] of day.bySymbol) {
+    for (const row of file.rows) {
+      const iv = row.smvVol ?? row.midIv;
+      if (typeof iv !== 'number' || !(iv > 0)) continue;
+      const key = `${sym.toUpperCase()}|${row.optionType}`;
+      const arr = ivRows.get(key) ?? [];
+      arr.push({ strike: row.strike, expiration: row.expiration, iv });
+      ivRows.set(key, arr);
+    }
+  }
+  const nowMs = dayMs(day.date);
+
+  return (symbol, leg) => {
+    const exact = midIndex.get(legKey(symbol, leg));
+    if (exact != null) return exact;
+
+    const sym = symbol.toUpperCase();
+    const spot = spotBySymbol.get(sym);
+    if (typeof spot !== 'number' || !(spot > 0)) return null;
+
+    const T = Math.max(0, dteFor(leg.expiration, nowMs)) / 365;
+    // Past expiry: per-share intrinsic value (the spread settles at intrinsic).
+    if (T <= 0) {
+      return leg.optionType === 'call' ? Math.max(0, spot - leg.strike) : Math.max(0, leg.strike - spot);
+    }
+
+    // Nearest-strike IV, preferring the leg's own expiration, else any of its type.
+    const rows = ivRows.get(`${sym}|${leg.optionType}`);
+    let iv = 0.3;
+    if (rows && rows.length > 0) {
+      const sameExp = rows.filter((r) => r.expiration === leg.expiration);
+      const pool = sameExp.length > 0 ? sameExp : rows;
+      let best = pool[0]!;
+      for (const r of pool) {
+        if (Math.abs(r.strike - leg.strike) < Math.abs(best.strike - leg.strike)) best = r;
+      }
+      iv = best.iv;
+    }
+
+    const price = blackScholesPrice({
+      spot,
+      strike: leg.strike,
+      timeToExpiryYears: T,
+      riskFreeRate,
+      volatility: iv,
+      optionType: leg.optionType,
+    });
+    return Number.isFinite(price) ? Math.max(0, price) : null;
+  };
 }
 
 /**
@@ -544,6 +621,15 @@ export interface PhaseABucketResult {
   unpriceableSignals: number;
   /** Selector calls that returned `signal` (entered or not). */
   signalCount: number;
+  /** TRA-926 — total managed-spread closes (take_profit / stop_loss / time_stop). */
+  managedExitsTotal: number;
+  /**
+   * TRA-926 — managed closes that booked the `-maxLoss` fallback for want of a
+   * priced mark. A large share means the chains drifted and the P&L is an
+   * artifact; the gate report surfaces it as `unpricedManagedExits` so it cannot
+   * be silently published (the failure mode TRA-914 validation caught).
+   */
+  unpricedManagedExits: number;
 }
 
 /**
@@ -580,19 +666,17 @@ export function replayPhaseABucket(
 
   for (const day of days) {
     account.startDay(day.date);
-    const midIndex = buildLegMidIndex(day);
     const halfSpreadIndex = buildLegHalfSpreadIndex(day);
     const ivIndex = buildLegIvIndex(day);
     const spotBySymbol = spotsForDay(day);
     const nowMs = dayMs(day.date);
+    // TRA-926 — mark open spreads with the exact chain mid when quoted, else a
+    // Black-Scholes reprice from spot + nearest-strike IV (no `-maxLoss` fallback
+    // for a leg the snapshot simply doesn't carry).
+    const legMid = buildLegRepricer(day, spotBySymbol, cfg.features.riskFreeRate);
 
     // 1. Mid-life management, then expiry settlement.
-    account.markAndManageSpreads(
-      day.date,
-      nowMs,
-      (sym, leg) => midIndex.get(legKey(sym, leg)) ?? null,
-      cfg.management,
-    );
+    account.markAndManageSpreads(day.date, nowMs, legMid, cfg.management);
     account.settleSpreads(day.date, spotBySymbol);
 
     // 2. Greeks snapshot of what is still open after management.
@@ -643,6 +727,8 @@ export function replayPhaseABucket(
     modeledSlippageTotal,
     unpriceableSignals,
     signalCount,
+    managedExitsTotal: account.getManagedExitsTotal(),
+    unpricedManagedExits: account.getUnpricedManagedExits(),
   };
 }
 
@@ -672,6 +758,18 @@ export interface PhaseAGateReport {
     summary: GreeksSummary;
   };
   modeledSlippageTotal: number;
+  /**
+   * TRA-926 — mark-to-market health of the replay. `unpricedManagedExits` is the
+   * count of managed-spread closes that fell back to `-maxLoss` for want of a
+   * priced mark; `managedExitsTotal` is all managed closes. A non-trivial
+   * `unpricedManagedExits / managedExitsTotal` share means the chains drifted off
+   * the opened legs and the metrics above are an artifact — the gate must reject
+   * such a report rather than trust it.
+   */
+  diagnostics: {
+    unpricedManagedExits: number;
+    managedExitsTotal: number;
+  };
 }
 
 /**
@@ -720,6 +818,10 @@ export function buildPhaseAGateReport(
       summary: summarizeGreeks(bucket.greeksSeries),
     },
     modeledSlippageTotal: bucket.modeledSlippageTotal,
+    diagnostics: {
+      unpricedManagedExits: bucket.unpricedManagedExits,
+      managedExitsTotal: bucket.managedExitsTotal,
+    },
   };
 }
 
@@ -813,7 +915,21 @@ export function buildPhaseAMarkdown(args: {
   md.push(`| Profit factor | ${m.profitFactor} |`);
   md.push(`| Max drawdown (frac) | ${m.maxDrawdown} |`);
   md.push(`| Modeled slippage ($) | ${report.modeledSlippageTotal} |`);
+  const dx = report.diagnostics;
+  const unpricedShare = dx.managedExitsTotal > 0 ? dx.unpricedManagedExits / dx.managedExitsTotal : 0;
+  md.push(
+    `| Unpriced managed exits | ${dx.unpricedManagedExits}/${dx.managedExitsTotal} ` +
+      `(${(unpricedShare * 100).toFixed(1)}%) |`,
+  );
   md.push('');
+  if (unpricedShare > 0.05) {
+    md.push(
+      `> **WARNING (TRA-926):** ${(unpricedShare * 100).toFixed(1)}% of managed exits booked the ` +
+        '`-maxLoss` fallback for want of a priced mark — the chains drifted off the opened legs and ' +
+        'these metrics are an ARTIFACT. Do NOT feed this report to the promotion gate.',
+    );
+    md.push('');
+  }
   md.push('## Per-strategy gate metrics');
   md.push('');
   const strategies = Object.keys(report.byStrategy);

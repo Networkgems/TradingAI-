@@ -32,7 +32,15 @@ import {
   type SupertrendReplayParams,
   type PortfolioReplayResult,
 } from './supertrend-confluence-replay.js';
-import { buildSyntheticChain, SYNTHETIC_TAG, type SyntheticChainFile } from './synthetic-chain.js';
+import {
+  buildSyntheticChain,
+  buildFixedStrikeGrid,
+  buildWeeklyExpirationCalendar,
+  DEFAULT_CHAIN_GEN,
+  DEFAULT_EMIT_DTE_RANGE,
+  SYNTHETIC_TAG,
+  type SyntheticChainFile,
+} from './synthetic-chain.js';
 import type { TradeMetrics } from './tra731-metrics.js';
 
 const HERE = dirname(fileURLToPath(import.meta.url));
@@ -73,11 +81,23 @@ function isoDate(ms: number): string {
   return new Date(ms).toISOString().slice(0, 10);
 }
 
+const DAY_MS = 24 * 60 * 60 * 1000;
+
 /**
  * Write a point-in-time synthetic chain per bar under
  * `<outDir>/synthetic-chains/<YYYY-MM-DD>/<SYMBOL>.json` in the recorder's
  * `OptionChainSnapshotFile` schema, so `run-options-replay --synthetic` (the OTM /
- * RV scanners) consumes them unchanged. Returns the count of files written.
+ * RV scanners AND the Phase-A signal harness) consume them unchanged. Returns
+ * the count of files written.
+ *
+ * TRA-926 — the chains are generated against a per-symbol FIXED strike ladder and
+ * FIXED weekly expiration calendar (spanning the whole window + a DTE buffer), so
+ * a leg opened on day T (its `(expiration, strike)`) is still present and
+ * priceable in every later daily snapshot until it expires. Previously the
+ * generator emitted a day-relative ladder/calendar centred on each day's spot, so
+ * an opened leg vanished from later chains, `legMid` returned null, and the
+ * Phase-D replay's time stop booked `-maxLoss` as a fallback — the artifact
+ * QuantTrader's TRA-914 validation surfaced.
  */
 async function writeSyntheticChains(
   barsBySymbol: ReadonlyMap<string, readonly Candle[]>,
@@ -87,8 +107,20 @@ async function writeSyntheticChains(
   const root = join(outDir, 'synthetic-chains');
   let written = 0;
   for (const [symbol, bars] of barsBySymbol) {
+    if (bars.length === 0) continue;
+    // Fixed grids derived once from the FULL window so every day's snapshot
+    // shares the same absolute strikes and calendar expirations.
+    const closes = bars.map((b) => b.close);
+    const strikeGrid = buildFixedStrikeGrid(closes);
+    const firstMs = bars[0].timestamp;
+    // Extend the calendar past the last bar by the max emitted DTE so positions
+    // opened near the window's end still have expirations to mark/settle against.
+    const lastMs = bars[bars.length - 1].timestamp + (DEFAULT_EMIT_DTE_RANGE[1] + 7) * DAY_MS;
+    const expirationCalendar = buildWeeklyExpirationCalendar(firstMs, lastMs);
+    const params = { ...DEFAULT_CHAIN_GEN, strikeGrid, expirationCalendar };
+
     for (let i = 0; i < bars.length; i += everyNBars) {
-      const file: SyntheticChainFile | null = buildSyntheticChain(symbol, bars.slice(0, i + 1));
+      const file: SyntheticChainFile | null = buildSyntheticChain(symbol, bars.slice(0, i + 1), params);
       if (!file) continue;
       const dir = join(root, isoDate(bars[i].timestamp));
       await mkdir(dir, { recursive: true });

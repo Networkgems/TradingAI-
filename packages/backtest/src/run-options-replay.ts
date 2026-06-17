@@ -345,11 +345,20 @@ async function runPhaseACli(
     await writeFile(mdPath, md, 'utf-8');
 
     const m = report.pooled;
+    const dx = report.diagnostics;
+    const unpricedShare = dx.managedExitsTotal > 0 ? dx.unpricedManagedExits / dx.managedExitsTotal : 0;
     console.log(
       `[TRA-918 phaseA] $${startingEquity}: ${m.tradeCount} trades, ` +
         `expectancy(R)=${m.expectancy}, sharpe=${m.sharpe}, PF=${m.profitFactor}, ` +
-        `maxDD=${m.maxDrawdown}, signals=${bucket.signalCount}, unpriceable=${bucket.unpriceableSignals}`,
+        `maxDD=${m.maxDrawdown}, signals=${bucket.signalCount}, unpriceable=${bucket.unpriceableSignals}, ` +
+        `unpricedManagedExits=${dx.unpricedManagedExits}/${dx.managedExitsTotal} (${(unpricedShare * 100).toFixed(1)}%)`,
     );
+    if (unpricedShare > 0.05) {
+      console.error(
+        `[TRA-918 phaseA] WARNING (TRA-926): ${(unpricedShare * 100).toFixed(1)}% of managed exits were ` +
+          'unpriceable -maxLoss fallbacks — metrics are an artifact; do NOT feed to the promotion gate.',
+      );
+    }
     console.log(`[TRA-918 phaseA] JSON → ${jsonPath}`);
     console.log(`[TRA-918 phaseA] MD   → ${mdPath}`);
   }

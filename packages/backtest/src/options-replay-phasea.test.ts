@@ -22,6 +22,7 @@ import { modelSignalStructure } from './options-replay-structures.js';
 import {
   replayPhaseABucket,
   buildPhaseAGateReport,
+  buildLegRepricer,
   validateGateReportShape,
   computeBacktestGateMetrics,
   portfolioGreeksForDay,
@@ -29,7 +30,14 @@ import {
   type PhaseABucketResult,
 } from './options-replay-phasea.js';
 import { DEFAULT_SPREAD_RISK_PARAMS } from './run-options-replay.js';
-import { buildSyntheticChain } from './synthetic-chain.js';
+import {
+  buildSyntheticChain,
+  buildFixedStrikeGrid,
+  buildWeeklyExpirationCalendar,
+  DEFAULT_CHAIN_GEN,
+  DEFAULT_EMIT_DTE_RANGE,
+  type ChainGenParams,
+} from './synthetic-chain.js';
 import type { ChainDay, OptionChainSnapshotFile } from './options-chain-store.js';
 
 const DAY_MS = 86_400_000;
@@ -349,6 +357,135 @@ function syntheticDays(): ChainDay[] {
   }
   return days;
 }
+
+// ── TRA-926 — mark-to-market gap fix: stable strike grid + expiration calendar ──
+
+const DTE_DAYS = (expiration: string, fromMs: number): number =>
+  Math.round((Date.parse(`${expiration}T00:00:00Z`) - fromMs) / DAY_MS);
+
+/**
+ * Deterministic trend-plus-oscillation bars: a mild drift with enough day-to-day
+ * range that the ATR-scaled spread widths span more than one strike (so the
+ * selector can build liquid verticals) while the net move stays inside the grid
+ * band. A pure monotone series collapses every spread to a single strike and the
+ * selector emits nothing — no use for a mark-to-market test.
+ */
+function trendyBars(n: number): Candle[] {
+  const baseMs = Date.parse('2026-01-01T00:00:00Z');
+  const bars: Candle[] = [];
+  for (let i = 0; i < n; i += 1) {
+    const close = 120 * (1 + 0.001 * i) + 8 * Math.sin(i / 3);
+    bars.push({ symbol: 'SPY', timestamp: baseMs + i * DAY_MS, open: close, high: close, low: close, close, volume: 1_000_000 });
+  }
+  return bars;
+}
+
+/** Stable-chain generation params built exactly as writeSyntheticChains does (TRA-926). */
+function stableParams(bars: readonly Candle[]): ChainGenParams {
+  const closes = bars.map((b) => b.close);
+  return {
+    ...DEFAULT_CHAIN_GEN,
+    strikeGrid: buildFixedStrikeGrid(closes),
+    expirationCalendar: buildWeeklyExpirationCalendar(
+      bars[0]!.timestamp,
+      bars[bars.length - 1]!.timestamp + (DEFAULT_EMIT_DTE_RANGE[1] + 7) * DAY_MS,
+    ),
+  };
+}
+
+/** Build a ChainDay series from per-bar snapshots (forcing high IV-rank so the short-premium gate engages). */
+function chainDaysFrom(bars: readonly Candle[], params: ChainGenParams, fromIndex = 21): ChainDay[] {
+  const days: ChainDay[] = [];
+  for (let i = fromIndex; i < bars.length; i += 1) {
+    const file = buildSyntheticChain('SPY', bars.slice(0, i + 1), params);
+    if (!file) continue;
+    (file as { ivRank: number | null }).ivRank = 60;
+    days.push({
+      date: new Date(file.recordedAt).toISOString().slice(0, 10),
+      bySymbol: new Map<string, OptionChainSnapshotFile>([['SPY', file as unknown as OptionChainSnapshotFile]]),
+    });
+  }
+  return days;
+}
+
+describe('TRA-926 — mark-to-market gap fix', () => {
+  const bars = trendyBars(150);
+  const params = stableParams(bars);
+
+  it('Fix A: an entry-window (expiration, strike) leg from day T is still present ~8 days later', () => {
+    const dayT = buildSyntheticChain('SPY', bars.slice(0, 30), params)!;
+    const dayTn = buildSyntheticChain('SPY', bars.slice(0, 38), params)!; // ~8 calendar days later
+    const laterSymbols = new Set(dayTn.rows.map((r) => r.optionSymbol));
+
+    // Legs the selector would open on day T sit in the 30–45 DTE entry window.
+    const entryLegs = dayT.rows.filter((r) => {
+      const dte = DTE_DAYS(r.expiration, dayT.recordedAt);
+      return dte >= 30 && dte <= 45;
+    });
+    expect(entryLegs.length).toBeGreaterThan(0);
+
+    // At least one such leg must persist into the later snapshot — under the OLD
+    // day-relative generator its (expiration, strike) would have drifted off the
+    // grid and vanished, forcing the -maxLoss fallback.
+    const persisted = entryLegs.filter((r) => laterSymbols.has(r.optionSymbol));
+    expect(persisted.length).toBeGreaterThan(0);
+    // And the survivor's DTE has genuinely shrunk below the entry window (it aged).
+    const aged = persisted.some((r) => DTE_DAYS(r.expiration, dayTn.recordedAt) < 30);
+    expect(aged).toBe(true);
+  });
+
+  it('Fix B: the leg repricer marks a leg absent from the snapshot (no -maxLoss fallback)', () => {
+    const file = buildSyntheticChain('SPY', bars.slice(0, 40), params)!;
+    const day: ChainDay = { date: new Date(file.recordedAt).toISOString().slice(0, 10), bySymbol: new Map([['SPY', file as unknown as OptionChainSnapshotFile]]) };
+    const spot = file.spot;
+    const repricer = buildLegRepricer(day, new Map([['SPY', spot]]), 0.045);
+
+    // A quoted leg resolves to its exact chain mid.
+    const quoted = file.rows.find((r) => r.optionType === 'put')!;
+    const exact = repricer('SPY', { action: 'sell', optionType: 'put', strike: quoted.strike, expiration: quoted.expiration });
+    expect(exact).toBeCloseTo(((quoted.bid ?? 0) + (quoted.ask ?? 0)) / 2, 6);
+
+    // A leg the snapshot does NOT carry (deep OTM, far below every emitted strike)
+    // reprices to a small positive value via Black-Scholes — NOT null. Under the
+    // old behaviour this null forced the spread to book its full -maxLoss.
+    const exp = quoted.expiration;
+    const lowestStrike = Math.min(...file.rows.filter((r) => r.expiration === exp && r.optionType === 'put').map((r) => r.strike));
+    const absentStrike = lowestStrike - 25; // well below the emitted ladder
+    expect(file.rows.some((r) => r.optionType === 'put' && r.expiration === exp && r.strike === absentStrike)).toBe(false);
+    const repriced = repricer('SPY', { action: 'sell', optionType: 'put', strike: absentStrike, expiration: exp });
+    expect(repriced).not.toBeNull();
+    expect(repriced!).toBeGreaterThanOrEqual(0);
+    expect(repriced!).toBeLessThan(exact!); // deeper OTM ⇒ cheaper than the nearer quoted put
+  });
+
+  it('end-to-end: stable-chain replay books ZERO unpriceable exits, fires take_profit, and losers are continuous', () => {
+    const cfg = defaultPhaseAConfig(DEFAULT_SELECTOR_PARAMS, DEFAULT_SPREAD_RISK_PARAMS, 250_000);
+    const bucket = replayPhaseABucket(chainDaysFrom(bars, params), 250_000, cfg);
+
+    // The harness actually managed spreads mid-life…
+    expect(bucket.managedExitsTotal).toBeGreaterThan(0);
+    // …and NONE of those closes was the -maxLoss fallback (acceptance #4).
+    expect(bucket.unpricedManagedExits).toBe(0);
+
+    // Acceptance #1 — the 50%-take demonstrably fires end-to-end.
+    const takeProfits = bucket.closed.filter((p) => p.exitReason === 'take_profit');
+    expect(takeProfits.length).toBeGreaterThan(0);
+
+    // Acceptance #3 — losers show a CONTINUOUS loss distribution, not a spike at
+    // exactly 1.00× max loss (the old fallback's signature).
+    const losers = bucket.closed.filter((p) => p.pnl < 0 && (p.maxLossPerLot ?? 0) > 0);
+    expect(losers.length).toBeGreaterThan(0);
+    const lossFractions = new Set(losers.map((p) => (-p.pnl / (p.maxLossPerLot! * p.contracts)).toFixed(2)));
+    expect(lossFractions.size).toBeGreaterThanOrEqual(3);
+    const allAtExactMax = losers.every((p) => -p.pnl / (p.maxLossPerLot! * p.contracts) > 0.999);
+    expect(allAtExactMax).toBe(false);
+
+    // Acceptance #4 — the diagnostic is carried on the report.
+    const report = buildPhaseAGateReport(bucket, 'synthetic');
+    expect(report.diagnostics.unpricedManagedExits).toBe(0);
+    expect(report.diagnostics.managedExitsTotal).toBe(bucket.managedExitsTotal);
+  });
+});
 
 describe('TRA-918 — Phase-A replay: deterministic + gate-report shape', () => {
   const days = syntheticDays();

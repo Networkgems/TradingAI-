@@ -312,6 +312,13 @@ export class OptionsReplayAccount {
   private readonly open = new Map<string, ReplayPosition>();
   private readonly closed: ReplayPosition[] = [];
   private readonly equityCurve: EquitySample[] = [];
+  // TRA-926 — diagnostics for the mark-to-market gap: how many managed-spread
+  // closes fired in total, and how many of those were unpriceable fallbacks
+  // (the time stop booking `-maxLoss` because no leg mark was available). A high
+  // `unpricedManagedExits / managedExitsTotal` share means the chains drifted and
+  // the P&L is an artifact — exactly the bug this issue fixes.
+  private managedExitsTotal = 0;
+  private unpricedManagedExits = 0;
 
   constructor(cfg: OptionsReplayAccountConfig) {
     this.cfg = cfg;
@@ -356,6 +363,16 @@ export class OptionsReplayAccount {
   /** Open positions still on the books — used at the tail of the replay window. */
   getOpenPositions(): readonly ReplayPosition[] {
     return Array.from(this.open.values());
+  }
+
+  /** TRA-926 — total managed-spread closes (take_profit / stop_loss / time_stop). */
+  getManagedExitsTotal(): number {
+    return this.managedExitsTotal;
+  }
+
+  /** TRA-926 — managed closes that booked the `-maxLoss` fallback for want of a priced mark. */
+  getUnpricedManagedExits(): number {
+    return this.unpricedManagedExits;
   }
 
   /** Pricier OTM /  RV sizing matches `PaperOptionsAccount.{otm,rv}BudgetPerTrade`. */
@@ -599,6 +616,7 @@ export class OptionsReplayAccount {
 
         // 1. Take profit — ≥ f × max profit.
         if (maxProfitPerLot > 0 && pnlPerLot >= params.takeProfitFraction * maxProfitPerLot) {
+          this.managedExitsTotal += 1;
           this.closeComboAtPnl(id, pnlPerLot, day, 'take_profit');
           continue;
         }
@@ -607,10 +625,12 @@ export class OptionsReplayAccount {
         if (isCredit) {
           const costToClose = -closeValuePerShare * CONTRACT_MULTIPLIER; // M (≥0) for a credit spread
           if (costToClose >= params.creditStopMultiple * netUsdPerLot) {
+            this.managedExitsTotal += 1;
             this.closeComboAtPnl(id, pnlPerLot, day, 'stop_loss');
             continue;
           }
         } else if (-pnlPerLot >= params.debitStopLossFraction * maxLossPerLot) {
+          this.managedExitsTotal += 1;
           this.closeComboAtPnl(id, pnlPerLot, day, 'stop_loss');
           continue;
         }
@@ -621,6 +641,11 @@ export class OptionsReplayAccount {
         const pnlPerLot = priced
           ? Math.min(maxProfitPerLot, Math.max(-maxLossPerLot, netUsdPerLot + closeValuePerShare * CONTRACT_MULTIPLIER))
           : -maxLossPerLot;
+        this.managedExitsTotal += 1;
+        // TRA-926 — diagnostic: a time stop that fires without a priced mark is
+        // the `-maxLoss` fallback the chain-drift bug abused. Count it so the
+        // report can flag an artifact rather than silently publishing one.
+        if (!priced) this.unpricedManagedExits += 1;
         this.closeComboAtPnl(id, pnlPerLot, day, 'time_stop');
       }
     }

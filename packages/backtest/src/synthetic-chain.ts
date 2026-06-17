@@ -158,6 +158,28 @@ export interface ChainGenParams {
   openInterest: number;
   volume: number;
   iv: IvModelParams;
+  /**
+   * TRA-926 — a FIXED absolute strike ladder (e.g. from {@link buildFixedStrikeGrid}).
+   * When supplied, the generator emits the grid strikes that fall within
+   * `strikeBand × spot` instead of the day-relative `strikeOffsets`, so a strike
+   * opened on day T is still present (and priceable) in every later day's
+   * snapshot. This is the faithful fix for the mark-to-market gap: the prior
+   * spot-relative ladder drifted day over day, so an opened leg vanished from
+   * later chains and the replay's time-stop booked `-maxLoss` as a fallback.
+   */
+  strikeGrid?: number[];
+  /**
+   * TRA-926 — a FIXED expiration calendar (ISO `YYYY-MM-DD`, e.g. from
+   * {@link buildWeeklyExpirationCalendar}). When supplied, the generator emits
+   * the calendar expirations whose DTE from the bar falls in `emitDteRange`
+   * instead of the day-relative `expiryDays`, so an opened expiration stays on
+   * the grid (its DTE just shrinks) until it passes.
+   */
+  expirationCalendar?: string[];
+  /** TRA-926 — [lo, hi] spot multiples bounding which fixed-grid strikes are emitted. Default [0.6, 1.4]. */
+  strikeBand: [number, number];
+  /** TRA-926 — [lo, hi] DTE window for which fixed-calendar expirations are emitted. Default [10, 56]. */
+  emitDteRange: [number, number];
 }
 
 function defaultStrikeOffsets(): number[] {
@@ -165,6 +187,17 @@ function defaultStrikeOffsets(): number[] {
   for (let off = 0.8; off <= 1.2001; off += 0.025) out.push(Math.round(off * 1000) / 1000);
   return out;
 }
+
+/** TRA-926 — default [lo, hi] spot multiples for which fixed-grid strikes are emitted. */
+export const DEFAULT_STRIKE_BAND: [number, number] = [0.6, 1.4];
+/**
+ * TRA-926 — default [lo, hi] DTE window for fixed-calendar expirations. The wide
+ * lower bound (10d) keeps an opened expiration emitted well past the selector's
+ * 21-DTE time stop / `minShortDte`, so the replay always has a real mark to book
+ * against rather than the `-maxLoss` fallback; the upper bound (56d) sits above
+ * the selector's 30–45 DTE entry window so entries always have coverage.
+ */
+export const DEFAULT_EMIT_DTE_RANGE: [number, number] = [10, 56];
 
 export const DEFAULT_CHAIN_GEN: ChainGenParams = {
   expiryDays: [7, 14, 21, 28, 35, 42],
@@ -175,6 +208,8 @@ export const DEFAULT_CHAIN_GEN: ChainGenParams = {
   openInterest: 1000,
   volume: 500,
   iv: DEFAULT_IV_MODEL,
+  strikeBand: DEFAULT_STRIKE_BAND,
+  emitDteRange: DEFAULT_EMIT_DTE_RANGE,
 };
 
 const DAY_MS = 24 * 60 * 60 * 1000;
@@ -184,10 +219,62 @@ export function isoDate(ms: number): string {
   return new Date(ms).toISOString().slice(0, 10);
 }
 
+/** Strike increment for a price level (0.5 / 1 / 2.5 / 5) — the exchange-style ladder. */
+export function strikeStep(priceLevel: number): number {
+  return priceLevel < 25 ? 0.5 : priceLevel < 100 ? 1 : priceLevel < 250 ? 2.5 : 5;
+}
+
 /** Round a strike to a sensible increment for the price level (0.5 / 1 / 2.5 / 5). */
 export function roundStrike(raw: number): number {
-  const step = raw < 25 ? 0.5 : raw < 100 ? 1 : raw < 250 ? 2.5 : 5;
+  const step = strikeStep(raw);
   return Math.round(raw / step) * step;
+}
+
+/**
+ * TRA-926 — a FIXED absolute strike ladder spanning the symbol's whole-window
+ * price range (× the [bandLo, bandHi] cushion), at a single uniform increment
+ * derived from the median close. Unlike the per-day spot-relative ladder, these
+ * strikes do not move day over day, so a strike opened on any day stays on the
+ * grid (and within `strikeBand` of spot) in every later snapshot. Returns `[]`
+ * when there are no positive closes.
+ */
+export function buildFixedStrikeGrid(
+  closes: readonly number[],
+  bandLo = DEFAULT_STRIKE_BAND[0],
+  bandHi = DEFAULT_STRIKE_BAND[1],
+): number[] {
+  const valid = closes.filter((c) => Number.isFinite(c) && c > 0);
+  if (valid.length === 0) return [];
+  const sorted = [...valid].sort((a, b) => a - b);
+  const median = sorted[Math.floor(sorted.length / 2)]!;
+  const step = strikeStep(median);
+  const lo = Math.min(...valid) * bandLo;
+  const hi = Math.max(...valid) * bandHi;
+  const start = Math.max(step, Math.floor(lo / step) * step);
+  const grid: number[] = [];
+  for (let k = start; k <= hi + step / 2; k += step) {
+    grid.push(Math.round(k * 1000) / 1000);
+  }
+  return grid;
+}
+
+/**
+ * TRA-926 — a FIXED weekly expiration calendar (every `weekday`, default Friday)
+ * spanning `[fromMs, toMs]` as ISO `YYYY-MM-DD` dates. An opened expiration is a
+ * fixed calendar date, so it remains a valid (DTE-shrinking) expiration in every
+ * later snapshot until it passes — the faithful counterpart to the fixed strike
+ * grid. `weekday` is 0=Sun..6=Sat (UTC).
+ */
+export function buildWeeklyExpirationCalendar(fromMs: number, toMs: number, weekday = 5): string[] {
+  if (!(toMs >= fromMs)) return [];
+  // Advance to the first `weekday` on/after fromMs.
+  let cur = fromMs;
+  const dow = new Date(cur).getUTCDay();
+  const delta = (weekday - dow + 7) % 7;
+  cur += delta * DAY_MS;
+  const out: string[] = [];
+  for (; cur <= toMs; cur += 7 * DAY_MS) out.push(isoDate(cur));
+  return out;
 }
 
 /** Build the OCC-style option symbol the recorder/replay uses for dedup/marks. */
@@ -227,19 +314,49 @@ export function buildSyntheticChain(
   const expirations: string[] = [];
   const rows: OptionChainRow[] = [];
 
-  for (const dte of params.expiryDays) {
-    const expMs = recordedAt + dte * DAY_MS;
-    const expiration = isoDate(expMs);
-    expirations.push(expiration);
-    const T = dte / 365;
-    const iv = syntheticIv(rv, dte, params.iv);
+  // TRA-926 — expirations: a FIXED calendar (faithful, persists day over day)
+  // when supplied, else the legacy day-relative offsets. Each entry carries its
+  // own DTE so pricing/IV reflect the real time to expiry on this bar.
+  const expEntries: Array<{ expiration: string; dteDays: number }> = [];
+  if (params.expirationCalendar && params.expirationCalendar.length > 0) {
+    const [dteLo, dteHi] = params.emitDteRange;
+    for (const expiration of params.expirationCalendar) {
+      const expMs = Date.parse(`${expiration}T00:00:00Z`);
+      if (!Number.isFinite(expMs)) continue;
+      const dteDays = Math.round((expMs - recordedAt) / DAY_MS);
+      if (dteDays < dteLo || dteDays > dteHi) continue;
+      expEntries.push({ expiration, dteDays });
+    }
+  } else {
+    for (const dte of params.expiryDays) {
+      expEntries.push({ expiration: isoDate(recordedAt + dte * DAY_MS), dteDays: dte });
+    }
+  }
 
+  // TRA-926 — strikes: a FIXED absolute grid (within `strikeBand × spot`) when
+  // supplied, else the legacy spot-relative offsets.
+  const strikeList: number[] = [];
+  if (params.strikeGrid && params.strikeGrid.length > 0) {
+    const [bandLo, bandHi] = params.strikeBand;
+    const lo = spot * bandLo;
+    const hi = spot * bandHi;
+    for (const k of params.strikeGrid) if (k > 0 && k >= lo && k <= hi) strikeList.push(k);
+  } else {
     const seenStrikes = new Set<number>();
     for (const off of params.strikeOffsets) {
       const strike = roundStrike(spot * off);
       if (strike <= 0 || seenStrikes.has(strike)) continue;
       seenStrikes.add(strike);
+      strikeList.push(strike);
+    }
+  }
 
+  for (const { expiration, dteDays } of expEntries) {
+    expirations.push(expiration);
+    const T = Math.max(dteDays, 0) / 365;
+    const iv = syntheticIv(rv, dteDays, params.iv);
+
+    for (const strike of strikeList) {
       for (const type of ['call', 'put'] as const) {
         const priceCtx = {
           spot,
