@@ -92,7 +92,31 @@ export interface RelativeValueScannerDiagnostics {
   expirationsCacheSize: number;
 }
 
+/**
+ * TRA-917 (TRA-908 Phase A) — a FULL chain snapshot for one symbol's nearest
+ * in-window expiration, used by the shadow option selector. Distinct from
+ * {@link RelativeValueScanResult}, which only surfaces the RV anomaly-flagged
+ * candidates: the strategy selector needs every liquid strike to ladder a
+ * defined-risk spread by delta, not just the mispriced outliers.
+ */
+export interface SelectorChainSnapshot {
+  symbol: string;
+  spot: number;
+  expiration: string;
+  /** Every call + put row for `expiration` (greeks-enriched where Tradier has them). */
+  rows: OptionChainRow[];
+}
+
 export interface RelativeValueScannerService {
+  /**
+   * TRA-917 — full chain snapshot (spot + nearest in-window expiration + ALL
+   * rows) for the shadow option selector. Reuses the same 60s chain cache and
+   * expiration auto-pick as {@link scan}, so when it runs right after an RV scan
+   * on the same symbol it rides the warm snapshot and costs zero extra Tradier
+   * calls. Returns `null` when uncredentialed, the breaker is open, or spot /
+   * expiration / chain are unavailable. Never trades.
+   */
+  getSelectorChain(symbol: string, dtePrefs?: DtePrefs): Promise<SelectorChainSnapshot | null>;
   /**
    * Scan a symbol for RV opportunities. `dtePrefs` lets callers override the
    * scanner's hardcoded DTE window per-call (TRA-373) — used by the signal
@@ -264,6 +288,42 @@ export class TradierRelativeValueScannerService implements RelativeValueScannerS
 
     const candidates = findRelativeValueOpportunities(chain, spot, { now: this.now(), ...opts });
     return { symbol: upper, spot, expiration, candidates, reason: 'ok' };
+  }
+
+  async getSelectorChain(
+    symbol: string,
+    dtePrefs: DtePrefs = {},
+  ): Promise<SelectorChainSnapshot | null> {
+    if (!this.client || this.isBreakerOpen()) return null;
+    const upper = symbol.trim().toUpperCase();
+
+    let spot: number | null;
+    try {
+      spot = await this.fetchSpot(upper);
+    } catch {
+      return null;
+    }
+    if (spot == null || !Number.isFinite(spot) || spot <= 0) return null;
+
+    let expiration: string | null;
+    try {
+      expiration = await this.pickExpiration(upper, dtePrefs);
+    } catch (err) {
+      this.tripBreaker(`getExpirations(${upper}) failed`, err);
+      return null;
+    }
+    if (!expiration) return null;
+
+    let rows: OptionChainRow[];
+    try {
+      rows = await this.fetchChain(upper, expiration);
+    } catch (err) {
+      this.tripBreaker(`getChainSnapshot(${upper},${expiration}) failed`, err);
+      return null;
+    }
+    if (rows.length === 0) return null;
+
+    return { symbol: upper, spot, expiration, rows };
   }
 
   async getOptionMark(

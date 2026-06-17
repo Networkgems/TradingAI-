@@ -1,11 +1,18 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import { tmpdir } from 'os';
 import { join } from 'path';
-import { rmSync } from 'fs';
+import { rmSync, writeFileSync } from 'fs';
 import { SignalEngine, sizeLiveEquityFromStop, shortBlockedOnCashAccount, gateSignalOnReview, describeGatedStrategies, shouldBootArmLiveEquity, shouldRunRelativeValueScan, isLiveBrokerOperator, resolveLiveBrokerOperator } from './signal-engine.js';
 import { setShadowLedgerFileForTests } from './shadow-signal-ledger.js';
+import {
+  setOptionShadowLedgerFileForTests,
+  initOptionShadowLedger,
+  listOptionShadowSignals,
+  OPTION_SHADOW_FLAG,
+} from './option-shadow-ledger.js';
+import { setIvStoreFileForTests, initIvRankStore } from './iv-rank-store.js';
 import { PaperAccount } from './paper-account.js';
-import type { RelativeValueScannerService, RelativeValueScanResult } from './relative-value-scanner.js';
+import type { RelativeValueScannerService, RelativeValueScanResult, SelectorChainSnapshot } from './relative-value-scanner.js';
 import type { RelativeValueCandidate, TradierAccountBalance, TradierOptionsClient, TradierOrderClient } from '@trading-app/engine';
 import {
   DEFAULT_ACCOUNT_SETTINGS,
@@ -59,6 +66,7 @@ function makeCandidate(overrides: Partial<RelativeValueCandidate> = {}): Relativ
 
 class StubScanner implements RelativeValueScannerService {
   scan = vi.fn<(symbol: string) => Promise<RelativeValueScanResult>>();
+  getSelectorChain = vi.fn<(symbol: string) => Promise<SelectorChainSnapshot | null>>(async () => null);
   getOptionMark = vi.fn<(symbol: string, expiration: string, optionSymbol: string) => Promise<number | null>>();
   diagnostics = vi.fn(() => ({
     configured: true,
@@ -3827,5 +3835,162 @@ describe('SignalEngine — SupertrendConfluence shadow channel (TRA-787)', () =>
     expect(stClosed[0].pnl ?? 0).toBeLessThan(0);
     expect(stClosed[0].closedAt).toBeDefined();
     expect(stPaper.getState().openPositions).toHaveLength(0);
+  });
+});
+
+// TRA-917 (TRA-908 Phase A) — live wiring of the SHADOW option-structure
+// selector. Proves the acceptance criterion end-to-end through the engine:
+// flag OFF = silent (no chain fetch, nothing written); flag ON = a well-formed
+// shadow option signal lands in the ledger, and NO order is ever routed.
+describe('SignalEngine — option-shadow selector wiring (TRA-917)', () => {
+  let ledgerFile: string;
+  let ivFile: string;
+  let n = 0;
+
+  // 5m OHLCV from explicit closes (open = prior close; high/low straddle close).
+  function build5m(closes: number[], spread = 0.5): Candle[] {
+    const step = 5 * 60_000;
+    return closes.map((close, i) => ({
+      symbol: 'TEST',
+      timestamp: i * step,
+      open: i > 0 ? closes[i - 1] : close,
+      high: Math.max(close, i > 0 ? closes[i - 1] : close) + spread,
+      low: Math.min(close, i > 0 ? closes[i - 1] : close) - spread,
+      close,
+      volume: 1_000,
+    }));
+  }
+
+  // Sawtooth uptrend — pullbacks cool RSI into the entry band while the net
+  // drift keeps the SMA stack aligned and MACD positive: the confluence the
+  // selector reads as trend 'up' (→ bull put spread under high IV-rank).
+  function sawUp(count: number, u = 0.5, d = 1.0, k = 3): number[] {
+    const closes: number[] = [];
+    let p = 100;
+    let i = 0;
+    while (closes.length < count) {
+      closes.push(p);
+      p += i % (k + 1) !== k ? u : -d;
+      i++;
+    }
+    while (closes.length > 2 && closes[closes.length - 1] <= closes[closes.length - 2]) closes.pop();
+    return closes;
+  }
+
+  // A full delta-laddered chain around `spot`, every leg liquid, constant IV so
+  // the ATM read is deterministic. Mirrors the option-shadow-ledger unit fixture.
+  function chainRows(spot: number, iv: number) {
+    const rows = [];
+    const extrinsic = (kStrike: number) => Math.max(0.3, 2.0 - 0.08 * Math.abs(kStrike - spot));
+    for (let kStrike = spot - 20; kStrike <= spot + 20; kStrike += 1) {
+      const putMid = Math.max(kStrike - spot, 0) + extrinsic(kStrike);
+      const callMid = Math.max(spot - kStrike, 0) + extrinsic(kStrike);
+      rows.push({
+        optionSymbol: `P${kStrike}`, underlying: 'TEST', optionType: 'put' as const, strike: kStrike,
+        expiration: '2024-07-19', bid: putMid * 0.98, ask: putMid * 1.02, openInterest: 1000, smvVol: iv,
+      });
+      rows.push({
+        optionSymbol: `C${kStrike}`, underlying: 'TEST', optionType: 'call' as const, strike: kStrike,
+        expiration: '2024-07-19', bid: callMid * 0.98, ask: callMid * 1.02, openInterest: 1000, smvVol: iv,
+      });
+    }
+    return rows;
+  }
+
+  // Seed a trailing-year IV window where `current` ranks high (≈88) so the
+  // selector's IVR≥50 short-premium branch fires. 30 daily samples 0.10→0.50.
+  function seedIvHistory(current: number): void {
+    const samples = Array.from({ length: 30 }, (_, i) => ({
+      day: new Date(TRADING_TIME - (i + 1) * 86_400_000).toISOString().slice(0, 10),
+      iv: 0.1 + (0.4 * i) / 29,
+    }));
+    void current; // current IV is carried on the chain (smvVol), ranked against these
+    writeFileSync(ivFile, JSON.stringify({ version: 1, updatedAt: TRADING_TIME, symbols: { TEST: samples } }));
+  }
+
+  function makeScanner(snapshot: SelectorChainSnapshot | null): {
+    svc: RelativeValueScannerService;
+    calls: { getSelectorChain: number };
+  } {
+    const calls = { getSelectorChain: 0 };
+    const svc: RelativeValueScannerService = {
+      scan: vi.fn(async () => ({ symbol: 'TEST', spot: null, expiration: null, candidates: [], reason: 'ok' as const })),
+      getSelectorChain: vi.fn(async () => {
+        calls.getSelectorChain += 1;
+        return snapshot;
+      }),
+      getOptionMark: vi.fn(async () => null),
+      diagnostics: vi.fn(() => ({ configured: true, breakerOpen: false, breakerOpenedAtMs: null, cacheSize: 0, expirationsCacheSize: 0 })),
+    };
+    return { svc, calls };
+  }
+
+  beforeEach(() => {
+    ledgerFile = join(tmpdir(), `opt-shadow-engine-${process.pid}-${n}.jsonl`);
+    ivFile = join(tmpdir(), `iv-engine-${process.pid}-${n}.json`);
+    n++;
+    setOptionShadowLedgerFileForTests(ledgerFile);
+    setIvStoreFileForTests(ivFile);
+    delete process.env[OPTION_SHADOW_FLAG];
+  });
+  afterEach(() => {
+    setOptionShadowLedgerFileForTests(null);
+    setIvStoreFileForTests(null);
+    delete process.env[OPTION_SHADOW_FLAG];
+    try { rmSync(ledgerFile); } catch { /* ignore */ }
+    try { rmSync(ivFile); } catch { /* ignore */ }
+  });
+
+  it('flag OFF — fetches no chain and writes nothing', async () => {
+    const { svc, calls } = makeScanner({ symbol: 'TEST', spot: 100, expiration: '2024-07-19', rows: chainRows(100, 0.45) });
+    const engine = new SignalEngine(undefined, undefined, svc);
+    (engine as unknown as { shadowCandleCache: Map<string, Candle[]> }).shadowCandleCache.set('TEST', build5m(sawUp(480)));
+    await initOptionShadowLedger();
+
+    await (engine as unknown as { evaluateOptionShadow: (s: string[]) => Promise<void> }).evaluateOptionShadow(['TEST']);
+
+    expect(calls.getSelectorChain).toBe(0); // flag gate short-circuits BEFORE any Tradier work
+    expect(await listOptionShadowSignals()).toHaveLength(0);
+  });
+
+  it('flag ON — writes a well-formed bull put spread and routes NOTHING', async () => {
+    process.env[OPTION_SHADOW_FLAG] = 'true';
+    seedIvHistory(0.45);
+    await initIvRankStore();
+
+    const { svc, calls } = makeScanner({ symbol: 'TEST', spot: 100, expiration: '2024-07-19', rows: chainRows(100, 0.45) });
+    const engine = new SignalEngine(undefined, undefined, svc);
+    (engine as unknown as { shadowCandleCache: Map<string, Candle[]> }).shadowCandleCache.set('TEST', build5m(sawUp(480)));
+    await initOptionShadowLedger();
+
+    await (engine as unknown as { evaluateOptionShadow: (s: string[]) => Promise<void> }).evaluateOptionShadow(['TEST']);
+
+    expect(calls.getSelectorChain).toBe(1);
+    const rows = await listOptionShadowSignals();
+    expect(rows).toHaveLength(1);
+    expect(rows[0].symbol).toBe('TEST');
+    expect(rows[0].strategy).toBe('bull_put_spread');
+    expect(rows[0].legs).toHaveLength(2);
+    expect(rows[0].expiration).toBe('2024-07-19');
+    // The selector ladders by a BS delta we synthesized from the chain IV.
+    expect(rows[0].shortDelta).toBeGreaterThan(0);
+    // Observe-only: nothing reached the live order path.
+    expect(engine.getState().signals).toHaveLength(0);
+    expect(engine.getState().account.openPositions).toHaveLength(0);
+  });
+
+  it('flag ON but IV history cold — IVR null → stands down, writes nothing', async () => {
+    process.env[OPTION_SHADOW_FLAG] = 'true';
+    // No seedIvHistory → ivRankSync returns null → gate stands down.
+    await initIvRankStore();
+
+    const { svc } = makeScanner({ symbol: 'TEST', spot: 100, expiration: '2024-07-19', rows: chainRows(100, 0.45) });
+    const engine = new SignalEngine(undefined, undefined, svc);
+    (engine as unknown as { shadowCandleCache: Map<string, Candle[]> }).shadowCandleCache.set('TEST', build5m(sawUp(480)));
+    await initOptionShadowLedger();
+
+    await (engine as unknown as { evaluateOptionShadow: (s: string[]) => Promise<void> }).evaluateOptionShadow(['TEST']);
+
+    expect(await listOptionShadowSignals()).toHaveLength(0);
   });
 });

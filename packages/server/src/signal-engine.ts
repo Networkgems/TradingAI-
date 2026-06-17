@@ -1,4 +1,5 @@
-import { OrbStrategy, BbFadeStrategy, IchimokuStrategy, SupertrendConfluenceStrategy, confluenceSide, supertrend, reversalChecklist, TradierOptionsClient, TradierOrderClient, TRADIER_REJECTED_STATUSES, evaluateSma200, SMA200_MIN_BARS, SMA200_DEBOUNCE_BARS, composeTechnicalSnapshot, resampleCandles, TF_BUCKET_MS } from '@trading-app/engine';
+import { OrbStrategy, BbFadeStrategy, IchimokuStrategy, SupertrendConfluenceStrategy, confluenceSide, supertrend, reversalChecklist, atr, donchian, supportResistance, blackScholesDelta, daysToExpiration, TradierOptionsClient, TradierOrderClient, TRADIER_REJECTED_STATUSES, evaluateSma200, SMA200_MIN_BARS, SMA200_DEBOUNCE_BARS, composeTechnicalSnapshot, resampleCandles, TF_BUCKET_MS } from '@trading-app/engine';
+import type { StrategySelectorInput, ContractQuote, OptionTrend } from '@trading-app/engine';
 import type { TradierAccountBalance } from '@trading-app/engine';
 import { WATCHLIST, MANAGED_ACCOUNT_RATIO, MAX_CONSECUTIVE_LOSSES, DAILY_DRAWDOWN_HALT_PCT, OPTIONS_PER_TICKET_DOLLAR_FLOOR, OPTIONS_POSITION_CAP_RATIO, aliasWatchlistSymbol, isLiveTradierOptionsEnabled, isStockMarketOpen, perPositionCap, resolveAutoManageImportedTradierOptions, resolveDemoCostModel, resolveHoldLiveOptionsOvernight, resolveLiveTradeEquitiesTradier, resolveManagedAccountRatio, resolveMarketReviewGatesEnabled, resolveRiskPerTrade, resolveRvDtePrefs, resolveTradierOptionsCreds, validateBracket, DEFAULT_RV_DTE_MIN, DEFAULT_RV_DTE_MAX, DEFAULT_RV_DTE_TARGET, scoreNewsSentiment, aggregateSymbolSentiment, aggregateFedSentiment, aggregateStockTwitsSentiment, dedupeStockTwitsMessages, mapCuratedMessagesBySymbol, nameAliasesFor } from '@trading-app/shared';
 import type { TradeSignal, RelativeValueSignal, Sma200Signal, Candle, OptionsAccountState, SignalType, Position, OptionPosition, AccountMode, AccountSettings, AccountState, NewsItem, SymbolSentiment, SocialSentiment, StockTwitsMessage, TechnicalSignalSnapshot, TradierEnv, MarketReview, MarketReviewGates, EngineMarketReviewState, GatedStrategyNote, AgentRecommendation } from '@trading-app/shared';
@@ -21,6 +22,8 @@ import {
   resolveReversalOutcome,
   openReversalShadowSignalsSync,
 } from './reversal-shadow-ledger.js';
+import { ivRankSync, atmIvFromRows } from './iv-rank-store.js';
+import { isOptionShadowEnabled, emitShadowOptionSignal } from './option-shadow-ledger.js';
 import { etDateString } from './scheduler.js';
 import { fetchMinuteBars, fetchDailyCandles, fetchQuotes, fetchStocksNews, isYahooBreakerOpen, setActiveInterestSymbols, setTradierStocksFeedClient } from './yahoo-feed.js';
 import { fetchStockTwitsStream, fetchStockTwitsUserStream, getCuratedStockTwitsAccounts } from './stocktwits-feed.js';
@@ -56,6 +59,17 @@ const log = logger.child({ module: 'signal-engine' });
 // order (live promotion is gated on the TRA-734 real-chain go/no-go).
 const supertrendShadowLog = logger.child({ module: 'supertrend-shadow' });
 const reversalShadowLog = logger.child({ module: 'reversal-shadow' });
+// TRA-917 (TRA-908 Phase A) — option-structure SHADOW selector channel. Wholly
+// observe-only: every emit is flag-gated (ENABLE_OPTION_SHADOW_SELECTOR, default
+// OFF) and goes to the option-shadow ledger, NEVER to an order path.
+const optionShadowLog = logger.child({ module: 'option-shadow' });
+// Annualized risk-free rate for the BS deltas we synthesize per chain row when
+// Tradier omits greeks. Matches the RV/OTM scanners' default (0.045).
+const OPTION_SHADOW_RISK_FREE_RATE = 0.045;
+// Min spacing between option-shadow passes — the underlying technicals turn over
+// on the 5m shadow series, and the chain ride-along is cache-bounded (60s), so a
+// 5-minute cadence keeps the sample fresh without burning Tradier budget.
+const OPTION_SHADOW_REFRESH_MS = 5 * 60_000;
 
 export interface SymbolState {
   symbol: string;
@@ -638,6 +652,8 @@ export class SignalEngine {
   private shadowCandleCache: Map<string, Candle[]> = new Map();
   /** TRA-787 — last successful shadow 5m-series refresh (gates the 60s cadence). */
   private lastSupertrendShadowRefreshAt = 0;
+  /** TRA-917 — last option-shadow selector pass (gates {@link OPTION_SHADOW_REFRESH_MS}). */
+  private lastOptionShadowRefreshAt = 0;
   /**
    * TRA-787 — latest SupertrendConfluence shadow signals surfaced on
    * EngineState.supertrendShadowSignals. Observe-only: never merged into
@@ -1751,6 +1767,26 @@ export class SignalEngine {
       if (Date.now() - this.lastRvScanAt >= RV_SCAN_INTERVAL_MS) {
         this.lastRvScanAt = Date.now();
         await this.runRelativeValueScan(activeSymbols);
+      }
+    }
+
+    // TRA-917 (TRA-908 Phase A) — option-structure SHADOW selector pass. Runs
+    // AFTER the RV scan so it rides the scanner's warm 60s chain cache for the
+    // same symbols (zero extra Tradier calls when the snapshot is fresh). Wholly
+    // flag-gated (ENABLE_OPTION_SHADOW_SELECTOR, default OFF) and observe-only:
+    // it accrues well-formed shadow option signals to the option-shadow ledger
+    // and NEVER routes an order. Gated to market hours (the 5m series is stale
+    // off-session) and throttled so it can't burn the Tradier budget.
+    if (isStockMarketOpen() && isOptionShadowEnabled()) {
+      if (Date.now() - this.lastOptionShadowRefreshAt >= OPTION_SHADOW_REFRESH_MS) {
+        this.lastOptionShadowRefreshAt = Date.now();
+        try {
+          await this.evaluateOptionShadow(activeSymbols);
+        } catch (err: unknown) {
+          optionShadowLog.warn('option shadow pass threw', {
+            reason: err instanceof Error ? err.message : String(err),
+          });
+        }
       }
     }
 
@@ -2902,6 +2938,165 @@ export class SignalEngine {
           id: rec.id, reason: err instanceof Error ? err.message : String(err),
         });
       });
+    }
+  }
+
+  /**
+   * TRA-917 (TRA-908 Phase A) — live wiring for the SHADOW option-structure
+   * selector. For each scanned symbol we assemble a {@link StrategySelectorInput}
+   * from existing infra and hand it to {@link emitShadowOptionSignal}, which
+   * re-checks the flag, runs the PURE selector (TRA-911) and appends a
+   * well-formed shadow option signal to its own ledger. Inputs:
+   *   • IV-rank   — ATM IV off the FULL chain ({@link atmIvFromRows}) ranked in
+   *                 the trailing-year store ({@link ivRankSync}).
+   *   • trend     — {@link confluenceSide} on the TRA-734 5m shadow series.
+   *   • breakout  — a Donchian close-break aligned with the confluence side.
+   *   • ATR / S-R — {@link atr} + {@link supportResistance} swing zones (TRA-920).
+   *   • reversal  — {@link reversalChecklist} regime bias (TRA-924).
+   *   • earnings  — {@link earningsInDaysSync} → earnings-before-expiry hard gate.
+   *   • contracts — every liquid chain row, delta-enriched via {@link blackScholesDelta}
+   *                 (OptionChainRow carries no greek delta).
+   *
+   * The whole pass is gated OFF by default and is fire-and-forget per symbol —
+   * one bad chain or earnings read can't take down the tick, and NOTHING here
+   * routes an order, opens a position, or touches capital. Order routing is
+   * Phase B (TRA-912); the advisory→capital bridge is Phase C (TRA-913).
+   */
+  private async evaluateOptionShadow(symbols: string[]): Promise<void> {
+    // Defense-in-depth: the caller already flag-gates, but re-check so a direct
+    // unit-test call also no-ops with the flag off and never hits Tradier.
+    if (!isOptionShadowEnabled() || !this.rvScanner) return;
+
+    const asOf = Date.now();
+    const dtePrefs = { min: this.rvDteMin, max: this.rvDteMax, target: this.rvDteTarget };
+
+    for (const sym of symbols) {
+      try {
+        // Underlying technicals come from the SAME TRA-734 5m shadow series the
+        // Supertrend/reversal shadow passes read, so trend / breakout / ATR /
+        // S-R stay consistent with the directional shadow ledgers.
+        const series = this.shadowCandleCache.get(sym);
+        if (!series || series.length === 0) continue;
+
+        // Full chain snapshot (NOT the RV anomaly-only candidates). Rides the
+        // scanner's warm 60s cache from the RV scan above when fresh.
+        const snap = await this.rvScanner.getSelectorChain(sym, dtePrefs);
+        if (!snap || !(snap.spot > 0) || snap.rows.length === 0) continue;
+        const { spot, expiration, rows } = snap;
+        const daysToExpiry = Math.round(daysToExpiration(expiration, asOf));
+
+        // IV-rank: ATM IV off the FULL chain, ranked in the trailing-year store.
+        // Honest unknown (null) when history is thin — the gate stands down.
+        const atmIv = atmIvFromRows(rows, spot);
+        const ivRank = atmIv == null ? null : ivRankSync(sym, atmIv, asOf);
+
+        // Trend from the confluence stack; breakout = a Donchian close-break on
+        // the SAME side. Only a confirmed-side break counts as high conviction.
+        const decision = confluenceSide(series);
+        const trend: OptionTrend =
+          decision?.side === 'buy' ? 'up' : decision?.side === 'sell' ? 'down' : 'range';
+        const lastClose = series[series.length - 1]?.close ?? spot;
+        const channel = donchian(series);
+        const highConvictionBreakout =
+          decision != null &&
+          channel != null &&
+          ((decision.side === 'buy' && lastClose > channel.upper) ||
+            (decision.side === 'sell' && lastClose < channel.lower));
+
+        const atrVal = atr(series) ?? 0;
+
+        // S/R swing zones (TRA-920) anchor the short strikes; reversal regime
+        // (TRA-924) biases the mid-IVR dead zone toward an aligned spread.
+        const sr = supportResistance(series);
+        const support = sr.support?.level ?? null;
+        const resistance = sr.resistance?.level ?? null;
+        const checklist = reversalChecklist(series);
+        const reversalSide = checklist.side;
+        const reversalScore = checklist.score;
+        const reversalConfirmed = checklist.confirmed;
+        const zoneTouches =
+          reversalSide === 'short'
+            ? sr.resistance?.touches ?? null
+            : sr.support?.touches ?? null;
+
+        // Earnings hard gate for long premium: an event on/before expiry.
+        const earningsInDays = earningsInDaysSync(sym, asOf);
+        const earningsBeforeExpiry =
+          earningsInDays != null && earningsInDays >= 0 && earningsInDays <= daysToExpiry;
+
+        // Chain rows → delta-enriched ContractQuote[]. OptionChainRow has no
+        // greek delta, so price BS delta off the row's own IV (smvVol ?? midIv).
+        // Rows missing a usable two-sided quote or IV are dropped — the selector's
+        // liquidity gate would reject them anyway.
+        const tYears = Math.max(daysToExpiry, 0) / 365;
+        const contracts: ContractQuote[] = [];
+        for (const r of rows) {
+          const iv = r.smvVol ?? r.midIv;
+          const bid = r.bid ?? 0;
+          const ask = r.ask ?? 0;
+          if (!(bid > 0) || !(ask > 0) || ask < bid) continue;
+          if (typeof iv !== 'number' || !(iv > 0)) continue;
+          contracts.push({
+            optionSymbol: r.optionSymbol,
+            optionType: r.optionType,
+            strike: r.strike,
+            delta: blackScholesDelta({
+              spot,
+              strike: r.strike,
+              timeToExpiryYears: tYears,
+              riskFreeRate: OPTION_SHADOW_RISK_FREE_RATE,
+              volatility: iv,
+              optionType: r.optionType,
+            }),
+            bid,
+            ask,
+            openInterest: r.openInterest ?? 0,
+          });
+        }
+        if (contracts.length === 0) continue;
+
+        const input: StrategySelectorInput = {
+          symbol: sym,
+          spot,
+          ivRank,
+          trend,
+          highConvictionBreakout,
+          atr: atrVal,
+          support,
+          resistance,
+          zoneTouches,
+          reversalScore,
+          reversalConfirmed,
+          reversalSide,
+          expiration,
+          daysToExpiry,
+          contracts,
+          earningsBeforeExpiry,
+          timestamp: asOf,
+        };
+
+        // Fire-and-forget: the emit seam re-checks the flag, runs the pure
+        // selector and appends to the shadow ledger. NEVER routes an order.
+        const res = await emitShadowOptionSignal(input);
+        if (res.emitted && res.result?.decision === 'signal') {
+          optionShadowLog.info('option shadow signal recorded', {
+            symbol: sym,
+            strategy: res.result.signal.strategy,
+            expiration,
+            daysToExpiry,
+            ivRank,
+            trend,
+            highConvictionBreakout,
+            shortDelta: res.result.signal.shortDelta,
+            routed: false,
+          });
+        }
+      } catch (err: unknown) {
+        optionShadowLog.warn('option shadow eval threw', {
+          symbol: sym,
+          reason: err instanceof Error ? err.message : String(err),
+        });
+      }
     }
   }
 
