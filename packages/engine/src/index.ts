@@ -302,6 +302,7 @@ export type {
   ShadowOptionSignal,
   StrategySelectorResult,
   GateDecision,
+  ReversalContext,
 } from './options/strategy-selector.js';
 export {
   evaluateMultiLegPreTrade,
@@ -311,6 +312,15 @@ export type {
   MultiLegPreTradeInput,
   MultiLegPreTradeVerdict,
 } from './options/multi-leg-gate.js';
+export {
+  evaluatePortfolioGreeksGate,
+  DEFAULT_PORTFOLIO_GREEKS_GATE,
+} from './options/portfolio-greeks-gate.js';
+export type {
+  PortfolioGreeksGateConfig,
+  PortfolioGreeksGateInput,
+  PortfolioGreeksGateVerdict,
+} from './options/portfolio-greeks-gate.js';
 export { findMispricedOtmContracts } from './options/otm-mispricing.js';
 export type {
   OptionChainRow,

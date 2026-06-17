@@ -65,6 +65,53 @@ describe('selectStrategyKind (gate matrix)', () => {
     expect(selectStrategyKind(15, 'up', true, p).kind).toBe('debit_spread');
     expect(selectStrategyKind(16, 'up', true, p).kind).toBe('stand_down');
   });
+
+  describe('TRA-924 reversal bias (mid-IVR dead zone + confirmed checklist)', () => {
+    it('overrides stand_down with bull_put_spread when long reversal confirms at support', () => {
+      // IVR 35 is in the mid-zone dead-band (> 25 low threshold, < 50 short threshold)
+      const r = selectStrategyKind(35, 'range', false, DEFAULT_SELECTOR_PARAMS, {
+        reversalConfirmed: true,
+        reversalSide: 'long',
+      });
+      expect(r.kind).toBe('bull_put_spread');
+      expect(r.rationale).toContain('confirmed_reversal');
+    });
+
+    it('overrides stand_down with bear_call_spread when short reversal confirms at resistance', () => {
+      const r = selectStrategyKind(35, 'range', false, DEFAULT_SELECTOR_PARAMS, {
+        reversalConfirmed: true,
+        reversalSide: 'short',
+      });
+      expect(r.kind).toBe('bear_call_spread');
+      expect(r.rationale).toContain('confirmed_reversal');
+    });
+
+    it('does NOT override when reversalConfirmed is false', () => {
+      const r = selectStrategyKind(35, 'range', false, DEFAULT_SELECTOR_PARAMS, {
+        reversalConfirmed: false,
+        reversalSide: 'long',
+      });
+      expect(r.kind).toBe('stand_down');
+    });
+
+    it('does NOT override when reversalSide is null', () => {
+      const r = selectStrategyKind(35, 'range', false, DEFAULT_SELECTOR_PARAMS, {
+        reversalConfirmed: true,
+        reversalSide: null,
+      });
+      expect(r.kind).toBe('stand_down');
+    });
+
+    it('high-IVR path is NOT overridden by reversal bias (IVR logic wins)', () => {
+      // High IVR already resolves to iron_condor for range; reversal should not
+      // change the outcome — IVR logic takes precedence.
+      const r = selectStrategyKind(60, 'range', false, DEFAULT_SELECTOR_PARAMS, {
+        reversalConfirmed: true,
+        reversalSide: 'long',
+      });
+      expect(r.kind).toBe('iron_condor');
+    });
+  });
 });
 
 // ---------------------------------------------------------------------------
@@ -243,5 +290,68 @@ describe('selectShadowOptionSignal', () => {
     // The result is a serialisable plain object; there is no execution handle.
     expect(() => JSON.stringify(r)).not.toThrow();
     expect(r.decision === 'signal' ? 'strategy' in r.signal : true).toBe(true);
+  });
+
+  it('records zoneTouches and reversalScore in the signal when provided', () => {
+    const r = selectShadowOptionSignal(
+      baseInput({ ivRank: 60, trend: 'up', zoneTouches: 3, reversalScore: 4 }),
+    );
+    expect(r.decision).toBe('signal');
+    if (r.decision !== 'signal') return;
+    expect(r.signal.zoneTouches).toBe(3);
+    expect(r.signal.reversalScore).toBe(4);
+  });
+
+  it('signals null zoneTouches/reversalScore when not provided (backward-compatible)', () => {
+    const r = selectShadowOptionSignal(baseInput({ ivRank: 60, trend: 'up' }));
+    expect(r.decision).toBe('signal');
+    if (r.decision !== 'signal') return;
+    expect(r.signal.zoneTouches).toBeNull();
+    expect(r.signal.reversalScore).toBeNull();
+  });
+
+  it('TRA-924: reversal bias — confirmed long in mid-IVR dead zone → bull put spread', () => {
+    // ivRank 35 is mid-zone (> 25, < 50); alone it would stand_down. A confirmed
+    // reversal at support should flip the selector to bull_put_spread.
+    const r = selectShadowOptionSignal(
+      baseInput({
+        ivRank: 35,
+        trend: 'range',
+        reversalConfirmed: true,
+        reversalSide: 'long',
+        reversalScore: 4,
+      }),
+    );
+    expect(r.decision).toBe('signal');
+    if (r.decision !== 'signal') return;
+    expect(r.signal.strategy).toBe('bull_put_spread');
+    expect(r.signal.rationale).toContain('confirmed_reversal');
+    expect(r.signal.reversalScore).toBe(4);
+  });
+
+  it('TRA-924: reversal bias — confirmed short in mid-IVR dead zone → bear call spread', () => {
+    const r = selectShadowOptionSignal(
+      baseInput({
+        ivRank: 35,
+        trend: 'range',
+        reversalConfirmed: true,
+        reversalSide: 'short',
+      }),
+    );
+    expect(r.decision).toBe('signal');
+    if (r.decision !== 'signal') return;
+    expect(r.signal.strategy).toBe('bear_call_spread');
+  });
+
+  it('TRA-924: without reversal confirmation the mid-IVR dead zone still stands down', () => {
+    const r = selectShadowOptionSignal(
+      baseInput({
+        ivRank: 35,
+        trend: 'range',
+        reversalConfirmed: false,
+        reversalSide: 'long',
+      }),
+    );
+    expect(r.decision).toBe('stand_down');
   });
 });

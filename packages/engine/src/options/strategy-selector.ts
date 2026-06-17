@@ -107,10 +107,41 @@ export interface StrategySelectorInput {
   highConvictionBreakout: boolean;
   /** ATR on the underlying — drives wing width. */
   atr: number;
-  /** Nearest support level, or null. */
+  /**
+   * Nearest support level (price), or null. Feed `supportResistance().support?.level`
+   * from TRA-920 Phase 1 — touch-counted swing zones are better anchors than a
+   * flat 20-bar min.
+   */
   support: number | null;
-  /** Nearest resistance level, or null. */
+  /**
+   * Nearest resistance level (price), or null. Feed `supportResistance().resistance?.level`
+   * from TRA-920 Phase 1.
+   */
   resistance: number | null;
+  /**
+   * Touch count of the S/R zone that anchors the primary short strike. Recorded
+   * in the shadow signal; does not affect the gate matrix. Source:
+   * `supportResistance().support?.touches` (long bias) or `.resistance?.touches` (short bias).
+   */
+  zoneTouches?: number | null;
+  /**
+   * Reversal-checklist score (0–4) at the current key zone (from `reversalChecklist()`).
+   * Used together with `reversalConfirmed` and `reversalSide` to bias the selector
+   * toward a directional premium-selling spread in the mid-IVR dead zone. Recorded
+   * in the shadow signal for learning; otherwise non-binding.
+   */
+  reversalScore?: number | null;
+  /**
+   * True when all four reversal-checklist legs confirmed (score === 4). When true
+   * AND `reversalSide` is set, the selector biases toward the aligned spread even
+   * in the mid-IVR dead zone where it would otherwise stand down.
+   */
+  reversalConfirmed?: boolean;
+  /**
+   * Direction the reversal checklist fired: `'long'` = bounce off support (→ bias
+   * bull put spread); `'short'` = rejection at resistance (→ bias bear call spread).
+   */
+  reversalSide?: 'long' | 'short' | null;
   /** Chosen expiration `YYYY-MM-DD`. */
   expiration: string;
   /** Calendar days to that expiration. */
@@ -158,6 +189,16 @@ export interface ShadowOptionSignal {
     riskFraction: number;
   };
   rationale: string;
+  /**
+   * Touch count of the S/R zone that anchored the primary short strike, or null
+   * when the caller did not provide zone context. Higher touches = stronger zone.
+   */
+  zoneTouches: number | null;
+  /**
+   * Reversal-checklist score (0–4) at evaluation time, or null when not provided.
+   * Used in the shadow ledger to learn how often high-score setups outperform.
+   */
+  reversalScore: number | null;
 }
 
 /**
@@ -179,17 +220,32 @@ export interface GateDecision {
   rationale: string;
 }
 
+/** Optional reversal-regime context for the gate matrix (TRA-924). */
+export interface ReversalContext {
+  /** True when all four checklist legs fired (`reversalChecklist().confirmed`). */
+  reversalConfirmed?: boolean;
+  /** Direction the checklist fired — determines which spread to bias toward. */
+  reversalSide?: 'long' | 'short' | null;
+}
+
 /**
- * Resolve the option structure from (IV-rank × trend × breakout) per the
- * board-approved plan. Pure and total — every input maps to a decision, with
+ * Resolve the option structure from (IV-rank × trend × breakout × reversal) per
+ * the board-approved plan. Pure and total — every input maps to a decision, with
  * `stand_down` as the safe default (including unknown IV-rank). This is the
  * function the gate-matrix unit tests pin down exhaustively.
+ *
+ * TRA-924 bias: when a reversal checklist confirms at a key zone AND IVR falls in
+ * the mid-zone dead-band (would otherwise stand down), the selector overrides to
+ * the directionally-aligned premium-selling spread:
+ *   confirmed long (support bounce) → bull put spread
+ *   confirmed short (resistance rejection) → bear call spread
  */
 export function selectStrategyKind(
   ivRank: number | null,
   trend: OptionTrend,
   highConvictionBreakout: boolean,
   params: StrategySelectorParams = DEFAULT_SELECTOR_PARAMS,
+  reversalCtx?: ReversalContext,
 ): GateDecision {
   if (ivRank === null || !Number.isFinite(ivRank)) {
     return { kind: 'stand_down', rationale: 'iv_rank_unknown' };
@@ -213,6 +269,25 @@ export function selectStrategyKind(
       kind: 'debit_spread',
       rationale: `ivr ${ivRank.toFixed(0)} <= ${params.longPremiumMaxIvr} & breakout`,
     };
+  }
+
+  // Reversal bias: mid-IVR dead zone + confirmed checklist at a key zone →
+  // aligned premium-selling spread. Models the desk "reversal off a key level"
+  // entry where the zone provides the directional edge that IV-rank alone lacks.
+  if (reversalCtx?.reversalConfirmed) {
+    const ivr = ivRank.toFixed(0);
+    if (reversalCtx.reversalSide === 'long') {
+      return {
+        kind: 'bull_put_spread',
+        rationale: `ivr ${ivr} mid-zone + confirmed_reversal at support`,
+      };
+    }
+    if (reversalCtx.reversalSide === 'short') {
+      return {
+        kind: 'bear_call_spread',
+        rationale: `ivr ${ivr} mid-zone + confirmed_reversal at resistance`,
+      };
+    }
   }
 
   // Mid-IVR dead-zone, or low IVR without a breakout → stand down.
@@ -401,7 +476,10 @@ export function selectShadowOptionSignal(
   input: StrategySelectorInput,
   params: StrategySelectorParams = DEFAULT_SELECTOR_PARAMS,
 ): StrategySelectorResult {
-  const gate = selectStrategyKind(input.ivRank, input.trend, input.highConvictionBreakout, params);
+  const gate = selectStrategyKind(input.ivRank, input.trend, input.highConvictionBreakout, params, {
+    reversalConfirmed: input.reversalConfirmed,
+    reversalSide: input.reversalSide,
+  });
   if (gate.kind === 'stand_down') {
     return { decision: 'stand_down', kind: 'stand_down', rationale: gate.rationale };
   }
@@ -490,6 +568,8 @@ export function selectShadowOptionSignal(
       riskFraction: params.riskFraction,
     },
     rationale: gate.rationale,
+    zoneTouches: input.zoneTouches ?? null,
+    reversalScore: input.reversalScore ?? null,
   };
 
   return { decision: 'signal', kind: gate.kind, signal };
