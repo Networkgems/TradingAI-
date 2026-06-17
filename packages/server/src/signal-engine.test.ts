@@ -282,6 +282,31 @@ describe('SignalEngine — mode-scoped dashboard state (TRA-231)', () => {
     expect(liveState.options.openOptions.map(o => o.id)).toEqual(['live-1']);
   });
 
+  it('TRA-931: getActiveSymbols() always includes open-option underlyings so their spot is quoted', () => {
+    const engine = new SignalEngine(
+      { ...DEFAULT_ACCOUNT_SETTINGS, mode: 'demo', liveTradierEnvOptions: 'sandbox' },
+    );
+    // An off-watchlist underlying (SPCX) that the RV scanner opened on. Without
+    // the fix it never enters the quote tape, so resolveSpot is blind and the
+    // portfolio-Greeks gate reads 0 delta on a tradeable position.
+    const spcxOpt = {
+      id: 'rv-1', symbol: 'SPCX', optionType: 'call' as const, contracts: 1, contractsRemaining: 1,
+      premiumPaid: 1.38, currentPremium: 1.38, tp1Premium: 1.7, tp1Hit: false, stopLossPremium: 1.0,
+      peakPremium: 1.38, trailingActive: false, trailingStopPremium: 1.2, underlyingEntryPrice: 370,
+      openedAt: Date.now(), signalId: 'sig-rv', signalType: 'relative_value' as const, mode: 'demo' as const,
+    };
+    const sandbox = (engine as unknown as {
+      optionsAccounts: Record<TradierEnv, { openOptions: Map<string, typeof spcxOpt> }>;
+    }).optionsAccounts.sandbox;
+    sandbox.openOptions.set('rv-1', spcxOpt);
+
+    const active = engine.getActiveSymbols();
+    expect(active).toContain('SPCX');
+    // Idempotent — the underlying appears exactly once even though it's not on
+    // the base watchlist.
+    expect(active.filter(s => s === 'SPCX')).toHaveLength(1);
+  });
+
   it('scopes recentSignals to the active mode so a flip back to demo hides live signals', () => {
     const engine = new SignalEngine(
       { ...DEFAULT_ACCOUNT_SETTINGS, mode: 'demo' },

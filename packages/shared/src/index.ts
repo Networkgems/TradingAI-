@@ -2170,9 +2170,39 @@ export interface PortfolioGreeks {
   byName: AllocationBucket[];
   /** Allocation by sector bucket, sorted by notional descending. */
   bySector: AllocationBucket[];
+  /**
+   * TRA-931 — diagnostic breakdown of WHY each notional-bearing position that
+   * did NOT contribute Greeks was skipped. Keyed by reason; values count
+   * positions. Lets the dashboard / a health probe distinguish a benign
+   * multi-leg-combo gap (expected: combos never solve a single-contract IV)
+   * from a real blind spot (`no_spot` / `no_iv_solve`) where the risk gate is
+   * flying blind on a tradeable single-leg position. Sums to
+   * `positionsTotal − positionsValued`. Optional/back-compat: absent on
+   * persisted state predating the field and when every position was valued.
+   */
+  greeksUnvaluedReasons?: Partial<Record<GreeksUnvaluedReason, number>>;
   /** Unix ms the rollup was computed. */
   asOf: number;
 }
+
+/**
+ * TRA-931 — why a single open option position contributed premium notional but
+ * no Greeks to the {@link PortfolioGreeks} rollup.
+ *   • `multi_leg_combo` — defined-risk combo; no single-contract mark to solve
+ *     an IV against (expected, benign).
+ *   • `no_spot`         — the underlying spot didn't resolve (not on the quote
+ *     tape and no entry-price fallback). The real blind spot this ticket fixes.
+ *   • `bad_strike`      — missing / non-positive strike (malformed position).
+ *   • `expired`         — time-to-expiry ≤ 0 (position past expiration).
+ *   • `no_iv_solve`     — spot + mark were present but the BS IV solve failed
+ *     (mark below intrinsic / outside the solver's bracket).
+ */
+export type GreeksUnvaluedReason =
+  | 'multi_leg_combo'
+  | 'no_spot'
+  | 'bad_strike'
+  | 'expired'
+  | 'no_iv_solve';
 
 export interface OptionsAccountState {
   openOptions: OptionPosition[];

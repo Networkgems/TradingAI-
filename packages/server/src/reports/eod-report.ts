@@ -193,7 +193,9 @@ function buildPortfolioGreeksMarkdown(g: PortfolioGreeks | undefined): string {
 | Net Vega ($ / +1 vol pt) | ${usdSigned(g.netVega)} |
 | Theta Bleed ($ / day) | ${usdSigned(g.thetaDollarsPerDay)} |
 | Book Premium (notional) | ${usd(g.netNotional)} |
-| Greeks coverage | ${g.positionsValued}/${g.positionsTotal} positions |
+| Greeks coverage | ${g.positionsValued}/${g.positionsTotal} positions |${g.greeksUnvaluedReasons && Object.keys(g.greeksUnvaluedReasons).length > 0
+  ? `\n| Greeks gaps (TRA-931) | ${Object.entries(g.greeksUnvaluedReasons).map(([r, n]) => `${r}: ${n}`).join(', ')} |`
+  : ''}
 
 ## Allocation by Name
 | Name | Notional | % Book | Positions |

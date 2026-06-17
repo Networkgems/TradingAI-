@@ -61,13 +61,39 @@ describe('computePortfolioGreeks', () => {
     expect(g.bySector[0]!.key).toBe('Technology');
   });
 
-  it('counts notional but no Greeks when the underlying spot is unresolved', () => {
-    const pos = mkOption({ symbol: 'AAPL' });
+  it('TRA-931: falls back to underlyingEntryPrice when the live spot resolver is blind', () => {
+    // SPCX-style: off-watchlist underlying never enters the quote tape, so the
+    // resolver returns nothing — but the position persisted an entry spot, so
+    // Greeks are still valued rather than reading a blind 0.
+    const pos = mkOption({ symbol: 'SPCX', underlyingEntryPrice: 100 });
+    const g = computePortfolioGreeks([pos], spot({}), { now: NOW });
+    expect(g.positionsTotal).toBe(1);
+    expect(g.positionsValued).toBe(1);
+    expect(g.netDelta).toBeGreaterThan(0);
+    expect(g.netVega).toBeGreaterThan(0);
+    expect(g.greeksUnvaluedReasons).toBeUndefined();
+  });
+
+  it('TRA-931: counts no_spot only when neither the resolver nor an entry price prices it', () => {
+    const pos = mkOption({ symbol: 'SPCX', underlyingEntryPrice: 0 });
     const g = computePortfolioGreeks([pos], spot({}), { now: NOW });
     expect(g.positionsTotal).toBe(1);
     expect(g.positionsValued).toBe(0);
     expect(g.netDelta).toBe(0);
     expect(g.netNotional).toBeCloseTo(688, 2);
+    expect(g.greeksUnvaluedReasons).toEqual({ no_spot: 1 });
+  });
+
+  it('TRA-931: prefers the live resolver over the entry-price fallback when both exist', () => {
+    // Entry spot 100 (ATM, delta ~0.55) vs live spot 90 (OTM call, lower delta).
+    // The mark still solves at 90 (intrinsic 0 < mark), so the live spot — not
+    // the stale entry spot — must drive a strictly smaller delta.
+    const atm = mkOption({ symbol: 'AAPL', underlyingEntryPrice: 100 });
+    const gEntry = computePortfolioGreeks([atm], spot({}), { now: NOW });
+    const gLive = computePortfolioGreeks([atm], spot({ AAPL: 90 }), { now: NOW });
+    expect(gEntry.netDelta).toBeGreaterThan(0);
+    expect(gLive.netDelta).toBeGreaterThan(0);
+    expect(gLive.netDelta).toBeLessThan(gEntry.netDelta);
   });
 
   it('counts a multi-leg combo as notional-only (capital at risk), no Greeks', () => {
@@ -88,6 +114,8 @@ describe('computePortfolioGreeks', () => {
     expect(g.positionsValued).toBe(0);
     expect(g.netNotional).toBeCloseTo(150, 2); // 1.5 × 1 × 100
     expect(g.bySector[0]!.key).toBe('Technology');
+    // TRA-931 — the combo gap is benign, not a spot/IV blind spot.
+    expect(g.greeksUnvaluedReasons).toEqual({ multi_leg_combo: 1 });
   });
 
   it('aggregates allocation by name and sector and sorts by notional desc', () => {

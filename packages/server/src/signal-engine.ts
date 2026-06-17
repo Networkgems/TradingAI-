@@ -3136,7 +3136,42 @@ export class SignalEngine {
       .map(aliasWatchlistSymbol)
       .filter(s => !this.hiddenSymbols.has(s));
     const dynamic = Array.from(this.dynamicSymbols).map(aliasWatchlistSymbol);
-    return [...base, ...dynamic.filter(s => !base.includes(s))];
+    // TRA-931 — always quote the underlyings of OPEN option positions, even when
+    // they're off-watchlist. The RV scanner can open on a small-cap (e.g. SPCX)
+    // whose option chain quotes (so the position has a live mark) while its
+    // underlying never enters the watchlist tape — leaving `resolveSpot` blind,
+    // so the portfolio-Greeks gate read 0 delta/vega on a tradeable position.
+    // Forcing the underlying into the quote set keeps the live spot fresh for
+    // both the Greeks rollup and the stale-mark exit backstop. Hidden symbols
+    // are NOT filtered here: an open position's risk must be priced regardless
+    // of whether the user hid that ticker from the watchlist view.
+    const optionUnderlyings = this.openOptionUnderlyings();
+    const merged = [...base, ...dynamic.filter(s => !base.includes(s))];
+    const seen = new Set(merged);
+    for (const sym of optionUnderlyings) {
+      if (!seen.has(sym)) {
+        merged.push(sym);
+        seen.add(sym);
+      }
+    }
+    return merged;
+  }
+
+  /**
+   * TRA-931 — distinct underlying tickers across every open option position in
+   * all env buckets, aliased to their live form. Used to guarantee the quote
+   * tape carries each tradeable position's underlying so its spot resolves for
+   * the portfolio-Greeks gate and exit backstops.
+   */
+  private openOptionUnderlyings(): string[] {
+    const out = new Set<string>();
+    for (const acct of this.allOptionsAccounts()) {
+      for (const o of acct.getState().openOptions) {
+        if (!o.symbol) continue;
+        out.add(aliasWatchlistSymbol(o.symbol.toUpperCase()));
+      }
+    }
+    return Array.from(out);
   }
 
   addSymbol(symbol: string): void {

@@ -13,7 +13,7 @@
 // can call. Implied vol is solved per contract from its current mark + the
 // resolved spot, so the Greeks reflect today's market rather than a stale
 // entry-time snapshot.
-import type { OptionPosition, PortfolioGreeks, AllocationBucket } from '@trading-app/shared';
+import type { OptionPosition, PortfolioGreeks, AllocationBucket, GreeksUnvaluedReason } from '@trading-app/shared';
 import { sectorOf } from '@trading-app/shared';
 import { blackScholesGreeks, bsImpliedVolatility, daysToExpiration } from '@trading-app/engine';
 
@@ -35,10 +35,36 @@ interface PositionValuation {
   symbol: string;
   notional: number;
   greeksValued: boolean;
+  /** TRA-931 — set when `greeksValued` is false so the rollup can tally WHY. */
+  unvaluedReason?: GreeksUnvaluedReason;
   deltaShares: number;     // Σ scaled to equivalent shares of underlying
   gammaShares: number;     // Δdelta (shares) per $1 underlying move
   vegaDollars: number;     // $ per +1 IV vol-point
   thetaDollarsDay: number; // $ per calendar day (negative for long premium)
+}
+
+/**
+ * TRA-931 — resolve an open position's underlying spot. Prefers the caller's
+ * live quote-tape resolver, but a tradeable single-leg position can have a live
+ * option mark (the chain quote resolves) while its underlying is absent from the
+ * watchlist tape (e.g. an RV scanner opened on an off-watchlist small-cap like
+ * SPCX). Rather than leave such a position blind to the risk gate, fall back to
+ * the entry-time `underlyingEntryPrice` the position persisted at open — stale,
+ * but every engine-opened position carries it, so a tradeable position is always
+ * priceable for Greeks. Returns undefined only when neither source yields a
+ * positive finite number (truly unpriceable → honest `no_spot` under-count).
+ */
+function resolvePositionSpot(opt: OptionPosition, resolveSpot: SpotResolver): number | undefined {
+  const live = resolveSpot(opt.symbol);
+  if (Number.isFinite(live) && (live as number) > 0) return live;
+  const entry = opt.underlyingEntryPrice;
+  if (Number.isFinite(entry) && entry > 0) return entry;
+  return undefined;
+}
+
+/** Tag an all-zero valuation with the reason Greeks were skipped. */
+function unvalued(base: PositionValuation, reason: GreeksUnvaluedReason): PositionValuation {
+  return { ...base, unvaluedReason: reason };
 }
 
 /**
@@ -69,22 +95,22 @@ function valuePosition(opt: OptionPosition, resolveSpot: SpotResolver, riskFreeR
     vegaDollars: 0,
     thetaDollarsDay: 0,
   };
-  if (notional <= 0) return base;
+  if (notional <= 0) return base; // dropped entirely upstream — no reason tag needed
 
   // Multi-leg combos are defined-risk and have no single-contract mark to solve
   // an IV against, so we count their capital-at-risk notional in the allocation
   // buckets but skip Greeks rather than fabricate them from a per-share basis.
-  if (Array.isArray(opt.legs) && opt.legs.length >= 2) return base;
+  if (Array.isArray(opt.legs) && opt.legs.length >= 2) return unvalued(base, 'multi_leg_combo');
 
   const qty = opt.contractsRemaining ?? opt.contracts;
-  const spot = resolveSpot(opt.symbol);
-  if (!Number.isFinite(spot) || (spot as number) <= 0) return base;
-  if (opt.strike == null || !Number.isFinite(opt.strike) || opt.strike <= 0) return base;
-  if (!opt.expiration) return base;
+  const spot = resolvePositionSpot(opt, resolveSpot);
+  if (!Number.isFinite(spot) || (spot as number) <= 0) return unvalued(base, 'no_spot');
+  if (opt.strike == null || !Number.isFinite(opt.strike) || opt.strike <= 0) return unvalued(base, 'bad_strike');
+  if (!opt.expiration) return unvalued(base, 'expired');
 
   const days = daysToExpiration(opt.expiration, now);
   const T = days / 365;
-  if (!Number.isFinite(T) || T <= 0) return base;
+  if (!Number.isFinite(T) || T <= 0) return unvalued(base, 'expired');
 
   // Solve IV from the current mark (per-share premium) so the Greeks track
   // today's market. The mark used for notional already prefers the live mark.
@@ -97,7 +123,7 @@ function valuePosition(opt: OptionPosition, resolveSpot: SpotResolver, riskFreeR
     optionType: opt.optionType,
     marketPrice: mark,
   });
-  if (iv == null || !Number.isFinite(iv) || iv <= 0) return base;
+  if (iv == null || !Number.isFinite(iv) || iv <= 0) return unvalued(base, 'no_iv_solve');
 
   const g = blackScholesGreeks({
     spot: spot as number,
@@ -145,7 +171,11 @@ function buildBuckets(
  * expired, or multi-leg combos) still contribute their premium notional to the
  * allocation buckets; `positionsValued < positionsTotal` surfaces that gap so a
  * consumer can show "Greeks cover N of M positions" rather than implying full
- * coverage.
+ * coverage. TRA-931 — `greeksUnvaluedReasons` tallies WHY each such gap exists
+ * (combo vs no_spot vs no_iv_solve …) so the blind-spot case is distinguishable
+ * from the benign combo case; single-leg positions fall back to their persisted
+ * `underlyingEntryPrice` when the live resolver is blind, so a tradeable
+ * position is priceable for Greeks even off the watchlist tape.
  */
 export function computePortfolioGreeks(
   openOptions: readonly OptionPosition[],
@@ -163,6 +193,10 @@ export function computePortfolioGreeks(
   let positionsValued = 0;
   let positionsTotal = 0;
 
+  // TRA-931 — tally why notional-bearing positions skipped Greeks so a consumer
+  // can tell a benign combo gap from a real spot/IV blind spot.
+  const unvaluedReasons: Partial<Record<GreeksUnvaluedReason, number>> = {};
+
   const byName = new Map<string, { notional: number; positions: number }>();
   const bySector = new Map<string, { notional: number; positions: number }>();
 
@@ -178,6 +212,8 @@ export function computePortfolioGreeks(
       netGamma += v.gammaShares;
       netVega += v.vegaDollars;
       thetaDollarsPerDay += v.thetaDollarsDay;
+    } else if (v.unvaluedReason) {
+      unvaluedReasons[v.unvaluedReason] = (unvaluedReasons[v.unvaluedReason] ?? 0) + 1;
     }
 
     const nameKey = (opt.symbol ?? 'UNKNOWN').toUpperCase();
@@ -203,6 +239,7 @@ export function computePortfolioGreeks(
     positionsTotal,
     byName: buildBuckets(byName, netNotional),
     bySector: buildBuckets(bySector, netNotional),
+    ...(Object.keys(unvaluedReasons).length > 0 ? { greeksUnvaluedReasons: unvaluedReasons } : {}),
     asOf: now,
   };
 }
