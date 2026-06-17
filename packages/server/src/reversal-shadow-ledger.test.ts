@@ -125,6 +125,9 @@ describe('reversal-shadow-ledger — buildReversalShadowOpen', () => {
     pattern: 'hammer',
     score: 3,
     confirmed: false,
+    // TRA-922 added this required field to ReversalChecklist; null = no
+    // timing-window context supplied (matches the indicator's default).
+    inTimingWindow: null,
     entry: 100,
     stop: 97,
     target: 106,

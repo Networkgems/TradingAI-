@@ -66,6 +66,10 @@ function signal(
     netDebit: null,
     widthPoints,
     sizingIntent: { maxLossPerSpread: 0, riskFraction: 0.02 },
+    // TRA-924 added these required reversal-context fields to ShadowOptionSignal;
+    // the modeler doesn't read them, so null keeps this fixture minimal.
+    zoneTouches: null,
+    reversalScore: null,
     rationale: 'test',
   };
 }

@@ -31,6 +31,8 @@ function signal(over: Partial<ShadowOptionSignal> = {}): ShadowOptionSignal {
     netDebit: null,
     widthPoints: 3,
     sizingIntent: { maxLossPerSpread: 276, riskFraction: 0.02 },
+    zoneTouches: null,
+    reversalScore: null,
     rationale: 'ivr 60 >= 50 & trend up',
     ...over,
   };

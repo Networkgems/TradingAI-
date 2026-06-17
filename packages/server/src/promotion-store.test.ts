@@ -13,6 +13,10 @@ import {
   getEffectiveThresholds,
   mergeThresholds,
   getStrategyRecord,
+  recordPaperAccrual,
+  settlePaperAccrual,
+  getPaperAccruals,
+  getStrategyPaperMetrics,
   PromotionValidationError,
 } from './promotion-store.js';
 import { DEFAULT_PROMOTION_THRESHOLDS, evaluateBacktestGate } from '@trading-app/shared';
@@ -192,5 +196,53 @@ describe('mergeThresholds', () => {
     });
     expect(merged.backtest.minSharpe).toBe(1.5);
     expect(merged.paper.minTradeCount).toBe(50);
+  });
+});
+
+// TRA-913 (TRA-908 Phase C) — options paper-accrual ledger.
+describe('paper accruals — Phase C options bridge Stage-2 source', () => {
+  const SID = 'option:bull_put_spread';
+
+  it('records an open accrual (no pnl) and surfaces it without minting metrics', async () => {
+    await recordPaperAccrual({ strategyId: SID, id: 'pos-1', openedAtMs: 1_000, entryRiskUsd: 320, note: 'bps' });
+    const accruals = await getPaperAccruals(SID);
+    expect(accruals).toHaveLength(1);
+    expect(accruals[0]!.pnl).toBeUndefined();
+    // Open accrual → no realized trade → Stage-2 metrics are null (missing).
+    expect(await getStrategyPaperMetrics(SID)).toBeNull();
+    // Recording also registers the strategy so it surfaces on the overview.
+    expect(await getStrategyRecord(SID)).toBeDefined();
+  });
+
+  it('settles an accrual with realized P&L and computes Stage-2 metrics (R = pnl / entryRisk)', async () => {
+    await recordPaperAccrual({ strategyId: SID, id: 'p1', openedAtMs: 0, entryRiskUsd: 100 });
+    await recordPaperAccrual({ strategyId: SID, id: 'p2', openedAtMs: 0, entryRiskUsd: 100 });
+    const oneYear = 365.25 * 24 * 60 * 60 * 1_000;
+    await settlePaperAccrual({ strategyId: SID, id: 'p1', pnl: 50, closedAtMs: oneYear * 0.5 });
+    await settlePaperAccrual({ strategyId: SID, id: 'p2', pnl: -30, closedAtMs: oneYear });
+
+    const m = await getStrategyPaperMetrics(SID);
+    expect(m).not.toBeNull();
+    expect(m!.tradeCount).toBe(2);
+    // R: +50/100 = +0.5 and −30/100 = −0.3 → expectancy = +0.1.
+    expect(m!.expectancy).toBeCloseTo(0.1, 6);
+    expect(m!.profitFactor).toBeCloseTo(50 / 30, 6);
+  });
+
+  it('is idempotent on re-recording the same opened position (no double count)', async () => {
+    await recordPaperAccrual({ strategyId: SID, id: 'p1', openedAtMs: 0, entryRiskUsd: 100 });
+    await settlePaperAccrual({ strategyId: SID, id: 'p1', pnl: 25, closedAtMs: 10 });
+    // A retry of the open record must NOT wipe the realized settlement.
+    await recordPaperAccrual({ strategyId: SID, id: 'p1', openedAtMs: 0, entryRiskUsd: 100 });
+    const accruals = await getPaperAccruals(SID);
+    expect(accruals).toHaveLength(1);
+    expect(accruals[0]!.pnl).toBe(25);
+  });
+
+  it('returns null settling an unknown accrual and rejects bad inputs', async () => {
+    expect(await settlePaperAccrual({ strategyId: SID, id: 'nope', pnl: 1, closedAtMs: 1 })).toBeNull();
+    await expect(
+      recordPaperAccrual({ strategyId: SID, id: 'x', openedAtMs: 0, entryRiskUsd: 0 }),
+    ).rejects.toThrow(PromotionValidationError);
   });
 });

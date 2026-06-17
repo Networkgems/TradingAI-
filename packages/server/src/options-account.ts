@@ -1064,6 +1064,21 @@ export class PaperOptionsAccount {
       signalId?: string;
     },
     mode: AccountMode = 'demo',
+    /**
+     * TRA-913 (TRA-908 Phase C) — optional portfolio-level pre-trade gate. The
+     * advisory -> capital bridge passes this so the structure is admitted only
+     * when the WHOLE book's post-trade Greeks/concentration stay inside their
+     * bands. Consulted AFTER sizing + the TRA-912 per-trade gate but BEFORE any
+     * cash is committed, so a portfolio-gate reject leaves the book untouched.
+     * Receives the actual sized lot count + capital-at-risk so the bridge can
+     * project the real exposure delta. Absent ↔ legacy callers (no portfolio
+     * gate); behaviour is unchanged for them.
+     */
+    portfolioGate?: (ctx: {
+      contracts: number;
+      maxLossPerLotUsd: number;
+      totalRiskUsd: number;
+    }) => { allowed: true } | { allowed: false; reason: string },
   ): OptionPosition | null {
     this.resetDayIfNeeded();
 
@@ -1143,6 +1158,23 @@ export class PaperOptionsAccount {
         reason: gate.reason,
       });
       return null;
+    }
+
+    // TRA-913 (Phase C) — portfolio-level gate on the fully-sized structure,
+    // BEFORE any cash leaves the book. The bridge supplies it; legacy callers
+    // pass nothing and skip straight through.
+    if (portfolioGate) {
+      const verdict = portfolioGate({ contracts, maxLossPerLotUsd: maxLossPerLot, totalRiskUsd: totalRisk });
+      if (!verdict.allowed) {
+        accountLog.warn('defined-risk spread rejected by portfolio gate', {
+          symbol: params.symbol,
+          strategy: params.strategy,
+          contracts,
+          totalRisk,
+          reason: verdict.reason,
+        });
+        return null;
+      }
     }
 
     this.cash -= totalRisk;

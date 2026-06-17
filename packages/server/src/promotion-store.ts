@@ -9,8 +9,9 @@ import type {
   PaperGateMetrics,
   PromotionDecision,
   PromotionThresholds,
+  PromotionTradeSample,
 } from '@trading-app/shared';
-import { DEFAULT_PROMOTION_THRESHOLDS } from '@trading-app/shared';
+import { DEFAULT_PROMOTION_THRESHOLDS, computePaperGateMetrics } from '@trading-app/shared';
 import type { BacktestResult, OptimizationVerdict } from '@trading-app/backtest';
 import { logger } from './observability/index.js';
 
@@ -59,6 +60,37 @@ export interface RegisteredBacktest {
   blessedParams?: Record<string, unknown>;
 }
 
+/**
+ * TRA-913 (TRA-908 Phase C) — one monitored PAPER accrual for the advisory ->
+ * capital bridge. The Phase-C bridge opens vetted, gate-passed ideas in the
+ * PAPER options book and records the accrual here so the shadow -> paper -> live
+ * promotion pipeline has a Stage-2 source for OPTIONS strategies (the
+ * crypto/stocks Stage-2 path recomputes from the trade ledger; options had no
+ * ledger source until now). Anti-gaming holds: the accrual is the real paper
+ * trade (its capital-at-risk + realized P&L), not a hand-entered headline
+ * metric, and `pnl` is filled only when the paper position actually closes via
+ * {@link settlePaperAccrual}. Open accruals (no realized `pnl`) contribute to
+ * neither the gate trade count nor the metrics.
+ */
+export interface PaperAccrualEntry {
+  /** Stable id (the opened paper position id, so a close can settle it). */
+  id: string;
+  /** Epoch ms the paper position was opened. */
+  openedAtMs: number;
+  /** Defined-risk capital-at-risk for the structure, USD (the R denominator). */
+  entryRiskUsd: number;
+  /** Realized net P&L once the paper position closes; undefined while open. */
+  pnl?: number;
+  /** Epoch ms the paper position closed; undefined while open. */
+  closedAtMs?: number;
+  /** Per-trade realized slippage cost (USD), if instrumented. */
+  realizedSlippage?: number;
+  /** Per-trade modeled slippage cost (USD), if instrumented. */
+  modeledSlippage?: number;
+  /** Free-form ASCII note (e.g. the structure kind / bridge rationale). */
+  note?: string;
+}
+
 export interface StrategyPromotionRecord {
   strategyId: string;
   backtest: RegisteredBacktest | null;
@@ -66,6 +98,24 @@ export interface StrategyPromotionRecord {
   decisions: PromotionDecision[];
   /** Per-strategy loosen-only threshold overrides (recorded with a rationale). */
   thresholdOverrides?: Partial<PromotionThresholds>;
+  /** TRA-913 — append-only monitored PAPER accruals (Phase C options bridge). */
+  paperAccruals?: PaperAccrualEntry[];
+}
+
+/** Map a stored accrual to the gate's per-trade sample. R = pnl / entryRiskUsd. */
+function accrualToSample(a: PaperAccrualEntry): PromotionTradeSample {
+  return {
+    pnl: a.pnl,
+    // entryPrice - stopLoss = entryRiskUsd, quantity = 1 → risk amount = entryRiskUsd,
+    // so R = pnl / entryRiskUsd (the same R-multiple basis the Phase-A harness uses).
+    entryPrice: a.entryRiskUsd,
+    stopLoss: 0,
+    quantity: 1,
+    openedAt: a.openedAtMs,
+    closedAt: a.closedAtMs,
+    realizedSlippage: a.realizedSlippage,
+    modeledSlippage: a.modeledSlippage,
+  };
 }
 
 interface StoreFile {
@@ -331,6 +381,107 @@ export async function recordSignoff(args: {
     override: !!args.thresholdOverrides,
   });
   return decision;
+}
+
+/**
+ * TRA-913 — record a monitored PAPER accrual for a strategy (Phase C bridge).
+ * Called when a vetted, gate-passed idea is OPENED in the paper book; `pnl` is
+ * left undefined until the position closes (see {@link settlePaperAccrual}).
+ * Idempotent on `id`: re-recording the same opened position updates the open
+ * accrual in place rather than duplicating it, so a retry can't inflate the
+ * Stage-2 trade count. Creates a blank promotion record if the strategy has
+ * none yet (so the accrual surfaces on the promotion overview).
+ */
+export async function recordPaperAccrual(args: {
+  strategyId: string;
+  id: string;
+  openedAtMs: number;
+  entryRiskUsd: number;
+  note?: string;
+}): Promise<PaperAccrualEntry> {
+  if (!args.strategyId) throw new PromotionValidationError('strategyId is required');
+  if (!args.id) throw new PromotionValidationError('accrual id is required');
+  if (!Number.isFinite(args.entryRiskUsd) || args.entryRiskUsd <= 0) {
+    throw new PromotionValidationError('entryRiskUsd must be a positive number');
+  }
+  const store = await ensureLoaded();
+  const rec = store.strategies[args.strategyId] ?? blankRecord(args.strategyId);
+  rec.paperAccruals = rec.paperAccruals ?? [];
+  const entry: PaperAccrualEntry = {
+    id: args.id,
+    openedAtMs: args.openedAtMs,
+    entryRiskUsd: args.entryRiskUsd,
+    ...(args.note ? { note: args.note } : {}),
+  };
+  const idx = rec.paperAccruals.findIndex((a) => a.id === args.id);
+  if (idx >= 0) {
+    // Preserve any already-settled realized fields on a re-open record.
+    rec.paperAccruals[idx] = { ...entry, ...pickSettled(rec.paperAccruals[idx]!) };
+  } else {
+    rec.paperAccruals.push(entry);
+  }
+  store.strategies[args.strategyId] = rec;
+  await persist();
+  log.info('recorded paper accrual', { strategyId: args.strategyId, id: args.id });
+  return rec.paperAccruals[idx >= 0 ? idx : rec.paperAccruals.length - 1]!;
+}
+
+function pickSettled(a: PaperAccrualEntry): Partial<PaperAccrualEntry> {
+  const out: Partial<PaperAccrualEntry> = {};
+  if (a.pnl !== undefined) out.pnl = a.pnl;
+  if (a.closedAtMs !== undefined) out.closedAtMs = a.closedAtMs;
+  if (a.realizedSlippage !== undefined) out.realizedSlippage = a.realizedSlippage;
+  if (a.modeledSlippage !== undefined) out.modeledSlippage = a.modeledSlippage;
+  return out;
+}
+
+/**
+ * TRA-913 — settle a previously-recorded paper accrual with its realized P&L
+ * when the paper position closes. Fills `pnl`/`closedAtMs` (and optional
+ * slippage) so the accrual now contributes to the Stage-2 paper metrics.
+ * Returns the updated entry, or null if no open accrual with that id exists.
+ */
+export async function settlePaperAccrual(args: {
+  strategyId: string;
+  id: string;
+  pnl: number;
+  closedAtMs: number;
+  realizedSlippage?: number;
+  modeledSlippage?: number;
+}): Promise<PaperAccrualEntry | null> {
+  if (!Number.isFinite(args.pnl)) throw new PromotionValidationError('pnl must be a finite number');
+  const store = await ensureLoaded();
+  const rec = store.strategies[args.strategyId];
+  const entry = rec?.paperAccruals?.find((a) => a.id === args.id);
+  if (!rec || !entry) return null;
+  entry.pnl = args.pnl;
+  entry.closedAtMs = args.closedAtMs;
+  if (args.realizedSlippage !== undefined) entry.realizedSlippage = args.realizedSlippage;
+  if (args.modeledSlippage !== undefined) entry.modeledSlippage = args.modeledSlippage;
+  await persist();
+  log.info('settled paper accrual', { strategyId: args.strategyId, id: args.id, pnl: args.pnl });
+  return entry;
+}
+
+/**
+ * TRA-913 — Stage-2 paper metrics for an OPTIONS strategy, computed from the
+ * recorded paper accruals (Phase C). Returns null when no accrual has realized
+ * P&L yet (mirrors the crypto/stocks "no monitored paper trades" → `missing`
+ * Stage-2). Open (unsettled) accruals are carried by `computePaperGateMetrics`
+ * but excluded from the count/metrics until they close.
+ */
+export async function getStrategyPaperMetrics(strategyId: string): Promise<PaperGateMetrics | null> {
+  const rec = await getStrategyRecord(strategyId);
+  const accruals = rec?.paperAccruals ?? [];
+  const realized = accruals.filter((a) => typeof a.pnl === 'number' && Number.isFinite(a.pnl));
+  if (realized.length === 0) return null;
+  return computePaperGateMetrics(accruals.map(accrualToSample));
+}
+
+/** TRA-913 — read a strategy's recorded paper accruals (introspection / tests). */
+export async function getPaperAccruals(strategyId: string): Promise<PaperAccrualEntry[]> {
+  const rec = await getStrategyRecord(strategyId);
+  return rec?.paperAccruals ? [...rec.paperAccruals] : [];
 }
 
 /** Test-only helper: reset in-memory cache and (optionally) override the on-disk path. */
