@@ -15,3 +15,15 @@ export type {
   MacroImportance,
   MacroWindowOptions,
 } from './macro-client.js';
+export {
+  getReversalTimingWindows,
+  isInReversalWindow,
+  isInNewsWindow,
+  dailyNewsSummary,
+} from './reversal-timing.js';
+export type {
+  ReversalWindow,
+  ReversalTimingOptions,
+  NewsWindowOptions,
+  DailyNewsSummary,
+} from './reversal-timing.js';

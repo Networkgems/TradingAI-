@@ -2,6 +2,8 @@ import type { Candle } from '@trading-app/shared';
 import { atr } from './atr.js';
 import { detectPattern, detectMultiBarPattern, isBullishPattern, isBearishPattern } from './patterns.js';
 import type { CandlePattern } from './patterns.js';
+import { isInReversalWindow } from '../macro/reversal-timing.js';
+import type { ReversalTimingOptions } from '../macro/reversal-timing.js';
 
 /**
  * Swing-based support/resistance levels and a reversal-confluence checklist.
@@ -146,7 +148,7 @@ export function supportResistance(
   return { zones, support, resistance };
 }
 
-export interface ReversalOptions extends SwingOptions {
+export interface ReversalOptions extends SwingOptions, ReversalTimingOptions {
   /** ATR period for distance/extension measurement. */
   atrPeriod?: number;
   /** How close (in ATR) price must be to a zone to count as "at the level". */
@@ -157,6 +159,18 @@ export interface ReversalOptions extends SwingOptions {
   unhealthyAtr?: number;
   /** Fraction of the target multiple R used when no opposing zone is in range. */
   targetRMultiple?: number;
+  /**
+   * Current epoch ms — used to check if the signal prints inside a post-open
+   * reversal timing window (15m / 30m after open). Defaults to the last bar's
+   * timestamp. Set to null to disable timing-window detection.
+   */
+  nowMs?: number | null;
+  /**
+   * Epoch ms of the session market open — required for timing window detection.
+   * Example: 13:30 UTC (9:30 ET under EDT). If not provided, inTimingWindow
+   * is always null.
+   */
+  marketOpenMs?: number | null;
 }
 
 export interface ReversalChecklist {
@@ -179,6 +193,12 @@ export interface ReversalChecklist {
   stop: number | null;
   target: number | null;
   riskReward: number | null;
+  /**
+   * Whether the signal printed inside a post-open reversal timing window
+   * (15m or 30m after session open, per Chapter 4 of the brief). Null when
+   * `marketOpenMs` was not provided to `reversalChecklist()`.
+   */
+  inTimingWindow: boolean | null;
 }
 
 const NO_SETUP: ReversalChecklist = {
@@ -194,6 +214,7 @@ const NO_SETUP: ReversalChecklist = {
   stop: null,
   target: null,
   riskReward: null,
+  inTimingWindow: null,
 };
 
 /**
@@ -305,6 +326,14 @@ export function reversalChecklist(
     riskReward = risk > 0 ? reward / risk : null;
   }
 
+  // Timing window — optional context from Chapter 4: reversals cluster 15m/30m
+  // after the session open. Null when marketOpenMs is not supplied.
+  const nowMs = opts.nowMs !== undefined ? opts.nowMs : last.timestamp;
+  const inTimingWindow =
+    opts.marketOpenMs != null && nowMs != null
+      ? isInReversalWindow(nowMs, opts.marketOpenMs, opts)
+      : null;
+
   return {
     side,
     zone,
@@ -318,5 +347,6 @@ export function reversalChecklist(
     stop,
     target,
     riskReward,
+    inTimingWindow,
   };
 }
