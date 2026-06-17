@@ -10,13 +10,16 @@ import type { AgentGraphInput, LlmClient } from '@trading-app/agents';
 import type { Candle, NewsItem } from '@trading-app/shared';
 import {
   adviseSymbol,
+  resolveApexNotionalUsd,
   resolveTradingAgentsLlm,
   buildNewsHeadlines,
+  OPUS_NOTIONAL_ENV_VAR,
 } from './trading-agents-advisory.js';
 import {
   agentSpendAggregate,
   agentUserSpendStatus,
   isOverUserDailyCap,
+  recordAgentSpend,
   resetAgentSpendForTests,
 } from './agent-spend-store.js';
 
@@ -33,14 +36,17 @@ function candles(n = 30, start = 100): Candle[] {
 
 const input: AgentGraphInput = { symbol: 'AAA', asOf: 5_000_000, candles: candles(), candidateSignal: null };
 
-/** Canned LlmClient: analysts→kind, trader→BUY, risk→APPROVE. Bills costPerCall per call. */
-function cannedLlm(costPerCall: number): LlmClient & { calls: number } {
+/** Canned LlmClient: analysts→kind, trader→BUY, risk→APPROVE. Bills costPerCall per call.
+ *  Records the tier used for each purpose so tests can assert on model-tier routing. */
+function cannedLlm(costPerCall: number): LlmClient & { calls: number; tierByPurpose: Record<string, string> } {
   const state = { calls: 0 };
-  const client: LlmClient & { calls: number } = {
+  const client: LlmClient & { calls: number; tierByPurpose: Record<string, string> } = {
     calls: 0,
+    tierByPurpose: {},
     async complete(req) {
       state.calls += 1;
       client.calls = state.calls;
+      client.tierByPurpose[req.purpose] = req.tier;
       const kind = req.purpose.startsWith('analyst:') ? req.purpose.split(':')[1] : null;
       let text: string;
       if (kind) {
@@ -60,14 +66,14 @@ function cannedLlm(costPerCall: number): LlmClient & { calls: number } {
   return client;
 }
 
-describe('adviseSymbol — cap hard-stop (acceptance #1)', () => {
-  it('stops issuing paid calls once the user reaches the $2/day cap', async () => {
-    const llm = cannedLlm(0.5); // 6 calls/run (4 analysts + trader + risk) → $3.00 per LLM run
+describe('adviseSymbol — cap hard-stop (acceptance #1, TRA-915 $10)', () => {
+  it('stops issuing paid calls once the user reaches the $10/day cap', async () => {
+    const llm = cannedLlm(2); // 6 calls/run (4 analysts + trader + risk) → $12.00 per LLM run
 
-    // Run 1: user is under the cap → real LLM path, spend recorded (~$3.00).
+    // Run 1: user is under the cap → real LLM path, spend recorded (~$12.00, over the $10 cap).
     const r1 = await adviseSymbol(input, { user: 'alice', enabled: true, llm, now: NOW });
     expect(r1.llmUsed).toBe(true);
-    expect(r1.recommendation.costUsd).toBeCloseTo(3.0, 6);
+    expect(r1.recommendation.costUsd).toBeCloseTo(12.0, 6);
     expect(isOverUserDailyCap('alice', NOW)).toBe(true);
     const spentAfter1 = agentUserSpendStatus('alice', NOW).spentUsd;
     const callsAfter1 = llm.calls;
@@ -138,6 +144,68 @@ describe('adviseSymbol — aggregate accounting (acceptance #4)', () => {
     const agg = agentSpendAggregate(NOW);
     expect(agg.userCount).toBe(2);
     expect(agg.totalUsd).toBeCloseTo(0.24, 2);
+  });
+});
+
+describe('adviseSymbol — company-wide daily ceiling (TRA-915)', () => {
+  it('falls back to the deterministic path once the company ceiling is breached', async () => {
+    // Push aggregate spend over the $100 company ceiling via other users first.
+    for (let i = 0; i < 12; i++) recordAgentSpend(`bot${i}`, 9, NOW); // $108 aggregate
+    const llm = cannedLlm(0.5);
+    // Alice is brand-new (well under her own $10 cap) but the company ceiling is hit.
+    const r = await adviseSymbol(input, { user: 'alice', enabled: true, llm, now: NOW });
+    expect(r.llmUsed).toBe(false);
+    expect(r.recommendation.costUsd).toBe(0);
+    expect(llm.calls).toBe(0);
+  });
+});
+
+describe('adviseSymbol — Opus apex-tier on high notional (TRA-915)', () => {
+  it('routes the final risk/decision step to apex (Opus) only above the threshold', async () => {
+    const llm = cannedLlm(0.01);
+    const big = { ...input, notionalUsd: 50_000 };
+    await adviseSymbol(big, {
+      user: 'alice',
+      enabled: true,
+      llm,
+      now: NOW,
+      graphDeps: { apexNotionalUsd: 25_000 },
+    });
+    // The final risk step escalated; routine screening stayed on fast/strong.
+    expect(llm.tierByPurpose['risk-manager']).toBe('apex');
+    expect(llm.tierByPurpose['trader']).toBe('strong');
+    expect(llm.tierByPurpose['analyst:technical']).toBe('fast');
+  });
+
+  it('keeps the routine strong (Sonnet) tier below the threshold', async () => {
+    const llm = cannedLlm(0.01);
+    const small = { ...input, notionalUsd: 5_000 };
+    await adviseSymbol(small, {
+      user: 'bob',
+      enabled: true,
+      llm,
+      now: NOW,
+      graphDeps: { apexNotionalUsd: 25_000 },
+    });
+    expect(llm.tierByPurpose['risk-manager']).toBe('strong');
+  });
+
+  it('never escalates when no threshold is configured (apex off by default)', async () => {
+    const llm = cannedLlm(0.01);
+    const big = { ...input, notionalUsd: 1_000_000 };
+    await adviseSymbol(big, { user: 'carol', enabled: true, llm, now: NOW, graphDeps: {} });
+    expect(llm.tierByPurpose['risk-manager']).toBe('strong');
+  });
+});
+
+describe('resolveApexNotionalUsd — env threshold (TRA-915)', () => {
+  it('parses a positive threshold and rejects empty/invalid/non-positive', () => {
+    expect(resolveApexNotionalUsd({ [OPUS_NOTIONAL_ENV_VAR]: '25000' })).toBe(25000);
+    expect(resolveApexNotionalUsd({})).toBeUndefined();
+    expect(resolveApexNotionalUsd({ [OPUS_NOTIONAL_ENV_VAR]: '' })).toBeUndefined();
+    expect(resolveApexNotionalUsd({ [OPUS_NOTIONAL_ENV_VAR]: 'abc' })).toBeUndefined();
+    expect(resolveApexNotionalUsd({ [OPUS_NOTIONAL_ENV_VAR]: '0' })).toBeUndefined();
+    expect(resolveApexNotionalUsd({ [OPUS_NOTIONAL_ENV_VAR]: '-5' })).toBeUndefined();
   });
 });
 

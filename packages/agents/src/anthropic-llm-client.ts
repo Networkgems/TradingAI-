@@ -43,13 +43,16 @@ export type TierModelMap = Record<LlmTier, string>;
 /**
  * Default tier→model map. `strong` is Sonnet 4.6 (strong reasoning, accepts the
  * `temperature` the options-research pass sends, far cheaper than Opus for a
- * triage layer); `fast` is Haiku 4.5. Ops can bump `strong` to an Opus tier via
- * env — but Opus 4.7+ reject `temperature`, which {@link modelAcceptsTemperature}
- * handles transparently.
+ * triage layer); `fast` is Haiku 4.5; `apex` is Opus 4.8 — the most capable
+ * Opus-tier model, reserved for the final risk/decision step on high-notional
+ * trades (TRA-915). Routine analyst + screening calls stay on fast/strong to
+ * control cost. Ops can override any tier via env — Opus 4.7+ reject `temperature`,
+ * which {@link modelAcceptsTemperature} handles transparently.
  */
 export const DEFAULT_TIER_MODELS: TierModelMap = {
   fast: 'claude-haiku-4-5',
   strong: 'claude-sonnet-4-6',
+  apex: 'claude-opus-4-8',
 };
 
 /**
@@ -188,7 +191,7 @@ const OAUTH_BETA_HEADER = 'oauth-2025-04-20';
  * If both are set the API key wins (a key is the simpler, longer-lived
  * credential and avoids the `x-api-key` + `Authorization` double-header that the
  * API rejects). Optional tier overrides come from `LLM_MODEL_FAST` /
- * `LLM_MODEL_STRONG`.
+ * `LLM_MODEL_STRONG` / `LLM_MODEL_APEX` (the high-notional decision tier, TRA-915).
  */
 export function createAnthropicLlmClientFromEnv(
   env: NodeJS.ProcessEnv = process.env,
@@ -200,8 +203,10 @@ export function createAnthropicLlmClientFromEnv(
   const models: Partial<TierModelMap> = {};
   const fast = env['LLM_MODEL_FAST']?.trim();
   const strong = env['LLM_MODEL_STRONG']?.trim();
+  const apex = env['LLM_MODEL_APEX']?.trim();
   if (fast) models.fast = fast;
   if (strong) models.strong = strong;
+  if (apex) models.apex = apex;
 
   // Prefer the API key when both are present: passing apiKey + authToken makes
   // the SDK send both `x-api-key` and `Authorization`, which the API 401s.

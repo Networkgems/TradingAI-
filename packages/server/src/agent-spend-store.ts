@@ -3,15 +3,22 @@
 // conditions; this module enforces the cost ones IN CODE so the layer can never
 // spend past them once the company Anthropic key is provisioned:
 //
-//   • a HARD per-user/day cap of $2.00 (acceptance #1) — every AgentRecommendation
-//     stamps its real costUsd, the day's running total per user is accumulated
-//     here, and `isOverUserDailyCap` halts that user/day at the cap. No untested cap.
+//   • a HARD per-user/day cap (acceptance #1) — every AgentRecommendation stamps its
+//     real costUsd, the day's running total per user is accumulated here, and
+//     `isOverUserDailyCap` halts that user/day at the cap. No untested cap. TRA-915
+//     raised the board-approved figure from $2 to $10/user/day.
+//   • a HARD company-wide daily ceiling (TRA-915, TRA-908 plan §4) — a second,
+//     aggregate-level kill so total spend across ALL users can never run away even
+//     if many users each stay under their per-user cap. `isOverCompanyDailyCap` halts
+//     every user/day once the aggregate reaches the ceiling, and `recordAgentSpend`
+//     fires a one-shot ALERT (error-level) the first time it is breached.
 //   • a DAILY AGGREGATE readout across ALL users (acceptance #4) — the CFO owns the
 //     P&L and wants the absolute number, not just the per-user bound. `agentSpendAggregate`
 //     returns it for `GET /api/health/agent-spend`, and a one-shot daily INFO log
 //     emits it for the record.
 //   • a re-review tripwire (FYI per the issue) — a one-shot WARN when aggregate spend
-//     first crosses ~$50/day, the level at which the CFO revisits the envelope.
+//     first crosses the review level, the point at which the CFO revisits the envelope
+//     BEFORE the hard ceiling stops spending.
 //
 // Pattern mirrors options-spend-store.ts (the TRA-658 monthly cap) but keyed by
 // (user, ET/UTC day) with an aggregate roll-up. In-memory + process-global so the
@@ -20,14 +27,26 @@ import { logger } from './observability/index.js';
 
 const log = logger.child({ module: 'agent-spend' });
 
-/** CFO-approved per-user/day cap (TRA-746/TRA-747 §6.5). Override via env. */
-export const DEFAULT_DAILY_USER_CAP_USD = 2;
+/**
+ * Per-user/day cap (TRA-746/TRA-747 §6.5; TRA-915 raised $2 → $10). Board-approved
+ * recommended figure from the TRA-908 confirmation. Override via env.
+ */
+export const DEFAULT_DAILY_USER_CAP_USD = 10;
 /** Aggregate level at which the CFO revisits the envelope (re-review tripwire, FYI). */
 export const DEFAULT_AGGREGATE_REVIEW_USD = 50;
+/**
+ * HARD company-wide daily ceiling (TRA-915). Total spend across all users hard-stops
+ * here regardless of per-user headroom — the runaway-spend backstop the board asked
+ * for alongside the per-user bump. Sits above the re-review level so the CFO is warned
+ * (review tripwire) before the ceiling actually cuts spend. Override via env.
+ */
+export const DEFAULT_COMPANY_DAILY_CAP_USD = 100;
 /** Env override for the per-user/day cap (USD). Empty/invalid → the default. */
 export const USER_CAP_ENV_VAR = 'TRADING_AGENTS_DAILY_USER_USD_CAP';
 /** Env override for the aggregate re-review level (USD). */
 export const AGGREGATE_REVIEW_ENV_VAR = 'TRADING_AGENTS_AGGREGATE_REVIEW_USD';
+/** Env override for the company-wide daily ceiling (USD). */
+export const COMPANY_CAP_ENV_VAR = 'TRADING_AGENTS_COMPANY_DAILY_USD_CAP';
 
 function envUsd(name: string, fallback: number): number {
   const raw = process.env[name];
@@ -36,7 +55,7 @@ function envUsd(name: string, fallback: number): number {
   return Number.isFinite(n) && n >= 0 ? n : fallback;
 }
 
-/** The enforced per-user/day cap in USD — env-configurable, defaulting to $2. */
+/** The enforced per-user/day cap in USD — env-configurable, defaulting to $10. */
 export function dailyUserCapUsd(): number {
   return envUsd(USER_CAP_ENV_VAR, DEFAULT_DAILY_USER_CAP_USD);
 }
@@ -44,6 +63,11 @@ export function dailyUserCapUsd(): number {
 /** The aggregate re-review level in USD — env-configurable, defaulting to $50. */
 export function aggregateReviewUsd(): number {
   return envUsd(AGGREGATE_REVIEW_ENV_VAR, DEFAULT_AGGREGATE_REVIEW_USD);
+}
+
+/** The enforced company-wide daily ceiling in USD — env-configurable, defaulting to $100. */
+export function companyDailyCapUsd(): number {
+  return envUsd(COMPANY_CAP_ENV_VAR, DEFAULT_COMPANY_DAILY_CAP_USD);
 }
 
 /** Calendar-day bucket key in UTC, e.g. "2026-06-09". */
@@ -57,6 +81,8 @@ interface DayBucket {
   perUser: Map<string, number>;
   /** One-shot: aggregate crossed the re-review level. */
   reviewAlerted: boolean;
+  /** One-shot: aggregate crossed the hard company-wide ceiling (TRA-915). */
+  ceilingAlerted: boolean;
 }
 
 // Process-wide accumulator. Resets automatically when the calendar day rolls.
@@ -68,7 +94,7 @@ function currentBucket(now: number): DayBucket {
     // On the day roll, emit the CLOSING aggregate readout for the day that just
     // ended (acceptance #4: a real end-of-day total, not a $0 start-of-day one).
     if (bucket) emitClosingReadout(bucket);
-    bucket = { day, perUser: new Map(), reviewAlerted: false };
+    bucket = { day, perUser: new Map(), reviewAlerted: false, ceilingAlerted: false };
   }
   return bucket;
 }
@@ -145,6 +171,20 @@ export function isOverUserDailyCap(user: string | undefined, now = Date.now()): 
   return (b.perUser.get(userKey(user)) ?? 0) >= dailyUserCapUsd();
 }
 
+/**
+ * Hard company-wide tripwire (TRA-915): true once the aggregate spend across ALL
+ * users has reached the company-wide daily ceiling. The advisory layer reads this
+ * BEFORE issuing a paid LLM call — alongside the per-user cap — and falls back to the
+ * deterministic (zero-cost) path when it is true, so total company spend can never run
+ * past the ceiling even when individual users still have per-user headroom.
+ */
+export function isOverCompanyDailyCap(now = Date.now()): boolean {
+  const b = currentBucket(now);
+  let total = 0;
+  for (const spent of b.perUser.values()) total += spent;
+  return total >= companyDailyCapUsd();
+}
+
 export interface AggregateSpendStatus {
   /** UTC calendar day this total covers. */
   day: string;
@@ -160,6 +200,10 @@ export interface AggregateSpendStatus {
   reviewUsd: number;
   /** True once aggregate spend has crossed the re-review level. */
   overReview: boolean;
+  /** The enforced company-wide daily ceiling, USD (TRA-915). */
+  companyCapUsd: number;
+  /** True once aggregate spend has reached the company-wide ceiling — the hard stop. */
+  overCompanyCap: boolean;
 }
 
 /**
@@ -176,6 +220,7 @@ export function agentSpendAggregate(now = Date.now()): AggregateSpendStatus {
   }
   perUser.sort((a, c) => c.spentUsd - a.spentUsd);
   const reviewUsd = aggregateReviewUsd();
+  const companyCapUsd = companyDailyCapUsd();
   return {
     day: b.day,
     totalUsd: round2(total),
@@ -184,13 +229,16 @@ export function agentSpendAggregate(now = Date.now()): AggregateSpendStatus {
     userCapUsd: dailyUserCapUsd(),
     reviewUsd,
     overReview: total >= reviewUsd,
+    companyCapUsd,
+    overCompanyCap: total >= companyCapUsd,
   };
 }
 
 /**
  * Record real (non-zero) LLM spend for a user against the current day. Emits a
- * one-shot WARN the first time the daily aggregate crosses the re-review level.
- * Non-positive or non-finite costs are ignored. Returns the user's new status.
+ * one-shot WARN the first time the daily aggregate crosses the re-review level, and a
+ * one-shot ERROR-level ALERT the first time it reaches the hard company-wide ceiling
+ * (TRA-915). Non-positive or non-finite costs are ignored. Returns the user's new status.
  */
 export function recordAgentSpend(
   user: string | undefined,
@@ -208,6 +256,17 @@ export function recordAgentSpend(
         day: agg.day,
         totalUsd: agg.totalUsd,
         reviewUsd: agg.reviewUsd,
+        userCount: agg.userCount,
+      });
+    }
+    // TRA-915 — hard ceiling alert: spend is now cut to zero company-wide for the rest
+    // of the day. Error-level so it pages, distinct from the FYI re-review WARN above.
+    if (!b.ceilingAlerted && agg.overCompanyCap) {
+      b.ceilingAlerted = true;
+      log.error('trading-agents aggregate LLM spend BREACHED the company-wide daily ceiling — LLM advisory now disabled until the day rolls', {
+        day: agg.day,
+        totalUsd: agg.totalUsd,
+        companyCapUsd: agg.companyCapUsd,
         userCount: agg.userCount,
       });
     }

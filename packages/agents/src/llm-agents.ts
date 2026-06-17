@@ -452,14 +452,22 @@ export interface RiskPanelLlmConfig {
   maxAttempts?: number;
   /** TRA-850 — the user's stated risk appetite, surfaced to the risk manager as advisory context. */
   riskTolerance?: UserTradingMemory['riskTolerance'];
+  /**
+   * TRA-915 — the model tier for THIS final risk/decision call. Defaults to `strong`
+   * (Sonnet) for routine screening; the graph passes `apex` (Opus) only when the
+   * trade's notional is at/above the configured threshold. Other tiers are unaffected.
+   */
+  tier?: 'strong' | 'apex';
 }
 
 /**
- * Risk panel + manager on the `strong` tier. A HOLD never reaches the model — it
+ * Risk panel + manager — the FINAL decision step. A HOLD never reaches the model — it
  * is forced to VETO/size-0 (there is no trade to size). For a live proposal the
  * model judges the verdict + persona sizing, then the result is deterministically
  * clamped so the layer can only de-risk: size ≤ conviction, size 0 on VETO, and a
- * sub-minimum reward:risk is vetoed regardless of what the model said.
+ * sub-minimum reward:risk is vetoed regardless of what the model said. Runs on the
+ * `strong` (Sonnet) tier by default; the caller may escalate to the `apex` (Opus)
+ * tier for high-notional trades (TRA-915) — routine screening stays on Sonnet.
  */
 export async function runRiskPanelLlm(
   decision: TraderDecision,
@@ -467,6 +475,7 @@ export async function runRiskPanelLlm(
   config: RiskPanelLlmConfig = {},
 ): Promise<{ verdict: RiskVerdict; costUsd: number }> {
   const minRr = config.minRiskReward ?? 1.5;
+  const tier = config.tier ?? 'strong';
 
   // HOLD ⇒ VETO by construction; no model call, no spend.
   if (decision.action === 'HOLD') {
@@ -500,7 +509,7 @@ export async function runRiskPanelLlm(
   const out = await completeJson<RiskVerdict>(
     llm,
     {
-      tier: 'strong',
+      tier,
       purpose: 'risk-manager',
       messages,
       temperature: TEMPERATURE,

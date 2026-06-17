@@ -2,9 +2,10 @@
 // place where the four CFO operating conditions are enforced before a single
 // dollar of real LLM spend can flow:
 //
-//   #1 cap   — per-user/day spend hard-stops at $2.00 (agent-spend-store). When a
-//              user has reached the cap, this falls back to the deterministic
-//              (zero-cost) graph instead of issuing another paid call.
+//   #1 cap   — per-user/day spend hard-stops at the configured cap ($10/user/day per
+//              TRA-915, agent-spend-store) AND a company-wide daily ceiling hard-stops
+//              aggregate spend. When either is reached, this falls back to the
+//              deterministic (zero-cost) graph instead of issuing another paid call.
 //   #2 advisor-mode — this module has ZERO path to capital. It takes no broker /
 //              account / order client, performs no routing, and returns the
 //              recommendation as DATA with `routedToCapital: false` (always). Even
@@ -36,6 +37,7 @@ import {
   type NewsItem,
 } from '@trading-app/shared';
 import {
+  isOverCompanyDailyCap,
   isOverUserDailyCap,
   recordAgentSpend,
 } from './agent-spend-store.js';
@@ -96,6 +98,22 @@ export function resolveTradingAgentsLlm(env: NodeJS.ProcessEnv = process.env): L
   return createAnthropicLlmClientFromEnv(env);
 }
 
+/**
+ * TRA-915 — env override for the notional threshold (USD) at/above which the FINAL
+ * risk/decision step escalates to the Opus `apex` tier. Empty/invalid/non-positive ⇒
+ * undefined, which leaves apex OFF (the graph never escalates), so Opus-tier cost is
+ * incurred only once ops sets a real threshold. Routine screening always stays on
+ * Haiku/Sonnet.
+ */
+export const OPUS_NOTIONAL_ENV_VAR = 'TRADING_AGENTS_OPUS_NOTIONAL_USD';
+
+export function resolveApexNotionalUsd(env: NodeJS.ProcessEnv = process.env): number | undefined {
+  const raw = env[OPUS_NOTIONAL_ENV_VAR];
+  if (raw == null || raw.trim() === '') return undefined;
+  const n = Number(raw);
+  return Number.isFinite(n) && n > 0 ? n : undefined;
+}
+
 export interface AdviseOptions {
   /** Owning user for the per-user/day cap + aggregate attribution. */
   user: string | undefined;
@@ -122,11 +140,14 @@ export interface AdviseResult {
 }
 
 /**
- * Produce one advisory AgentRecommendation for a symbol, enforcing the cap + both
- * kill switches before any paid call. Runs the real LlmClient-backed graph only
- * when the layer is enabled (banner), a model is wired (env), AND the user is
- * under the daily cap; otherwise falls back to the deterministic zero-cost graph.
- * Records real spend against the per-user/day ledger. Never routes to capital.
+ * Produce one advisory AgentRecommendation for a symbol, enforcing the per-user cap,
+ * the company-wide daily ceiling (TRA-915), and both kill switches before any paid
+ * call. Runs the real LlmClient-backed graph only when the layer is enabled (banner),
+ * a model is wired (env), the user is under the per-user daily cap, AND aggregate
+ * company spend is under the daily ceiling; otherwise falls back to the deterministic
+ * zero-cost graph. The final risk/decision step escalates to the Opus `apex` tier only
+ * for trades whose notional is at/above the configured threshold (env-driven, off by
+ * default). Records real spend against the per-user/day ledger. Never routes to capital.
  */
 export async function adviseSymbol(
   input: AgentGraphInput,
@@ -134,10 +155,16 @@ export async function adviseSymbol(
 ): Promise<AdviseResult> {
   const now = opts.now ?? Date.now();
   const underCap = !isOverUserDailyCap(opts.user, now);
-  const useLlm = opts.enabled && opts.llm != null && underCap;
+  const underCompanyCap = !isOverCompanyDailyCap(now);
+  const useLlm = opts.enabled && opts.llm != null && underCap && underCompanyCap;
+
+  // TRA-915 — the Opus-escalation threshold comes from env unless the caller pinned one
+  // explicitly on graphDeps (tests/overrides win).
+  const apexNotionalUsd = opts.graphDeps?.apexNotionalUsd ?? resolveApexNotionalUsd();
 
   const deps: AgentGraphDeps = {
     ...opts.graphDeps,
+    ...(apexNotionalUsd != null ? { apexNotionalUsd } : {}),
     ...(useLlm ? { llm: opts.llm! } : {}),
   };
 

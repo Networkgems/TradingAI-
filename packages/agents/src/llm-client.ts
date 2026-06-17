@@ -6,10 +6,12 @@
 // the real agents will route every call through — so flipping to a live model
 // in P2 needs zero graph changes. No real LLM calls and zero spend in P1.
 
-/** Logical model tier — cheap/fast for the analysts, stronger for trader +
- *  risk manager (the §6.6 tiered-model cost control). The concrete model each
- *  tier maps to is an LlmClient implementation detail. */
-export type LlmTier = 'fast' | 'strong';
+/** Logical model tier — cheap/fast for the analysts (`fast`), stronger for routine
+ *  trader synthesis + risk screening (`strong`), and a top `apex` tier reserved for
+ *  the final risk/decision step on high-notional trades (TRA-915, §6.6 tiered-model
+ *  cost control). The concrete model each tier maps to is an LlmClient implementation
+ *  detail; routine screening stays on fast/strong to control cost. */
+export type LlmTier = 'fast' | 'strong' | 'apex';
 
 export interface LlmMessage {
   role: 'system' | 'user' | 'assistant';

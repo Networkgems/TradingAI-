@@ -62,6 +62,7 @@ export {
   AgentGraphError,
   personalizeRiskVerdict,
   memorySizingTilt,
+  riskDecisionTier,
   type AgentGraphDeps,
 } from './graph.js';
 export {

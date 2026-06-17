@@ -46,6 +46,13 @@ export interface AgentGraphDeps {
   debateRounds?: number;
   trader?: TraderConfig;
   risk?: RiskPanelConfig;
+  /**
+   * TRA-915 — notional (USD) at/above which the FINAL risk/decision step escalates to
+   * the Opus `apex` tier; trades below it keep the routine `strong` (Sonnet) tier.
+   * Undefined ⇒ never escalate (apex stays off until ops configures the threshold),
+   * so the deterministic and low-notional paths can never silently incur Opus cost.
+   */
+  apexNotionalUsd?: number;
 }
 
 /** Build the routable TradeSignal an APPROVE recommendation carries (§4). */
@@ -88,9 +95,11 @@ export async function runAgentGraph(
     const debate = runDebate(a.reports, deps.debateRounds ?? 2);
     // 3. Trader synthesis (strong/Sonnet).
     const t = await runTraderLlm(input, a.reports, debate, deps.llm);
-    // 4. Risk panel + manager (strong/Sonnet).
+    // 4. Risk panel + manager — the FINAL decision step. Escalates to the Opus `apex`
+    //    tier only for high-notional trades (TRA-915); routine screening stays on Sonnet.
     const r = await runRiskPanelLlm(t.decision, deps.llm, {
       minRiskReward: deps.risk?.minRiskReward,
+      tier: riskDecisionTier(input.notionalUsd, deps.apexNotionalUsd),
       ...(input.userMemory?.riskTolerance ? { riskTolerance: input.userMemory.riskTolerance } : {}),
     });
     const costUsd = round6(a.costUsd + t.costUsd + r.costUsd);
@@ -108,6 +117,29 @@ export async function runAgentGraph(
 
 const round6 = (v: number): number => Math.round(v * 1e6) / 1e6;
 const round4 = (v: number): number => Math.round(v * 1e4) / 1e4;
+
+/**
+ * TRA-915 — pick the model tier for the FINAL risk/decision step. Returns `apex`
+ * (Opus) only when a finite, positive trade notional is at/above the configured
+ * threshold; otherwise `strong` (Sonnet) for routine screening. An undefined or
+ * non-positive threshold disables escalation entirely (apex never fires), so Opus
+ * cost is only ever incurred for genuinely high-stakes trades once ops opts in.
+ */
+export function riskDecisionTier(
+  notionalUsd: number | undefined,
+  apexNotionalUsd: number | undefined,
+): 'strong' | 'apex' {
+  if (
+    typeof apexNotionalUsd === 'number' &&
+    apexNotionalUsd > 0 &&
+    typeof notionalUsd === 'number' &&
+    Number.isFinite(notionalUsd) &&
+    notionalUsd >= apexNotionalUsd
+  ) {
+    return 'apex';
+  }
+  return 'strong';
+}
 
 /**
  * TRA-850 — the deterministic DE-RISK sizing tilt the user's persistent memory

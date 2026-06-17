@@ -44,6 +44,14 @@ export interface AgentGraphInput {
    * or veto the strategy's idea, never invent a richer one).
    */
   candidateSignal: TradeSignal | null;
+  /**
+   * TRA-915 — the proposed trade's notional exposure in USD (entry price ×
+   * intended position size), supplied by the call site when known. The graph routes
+   * the FINAL risk/decision step to the Opus `apex` tier only when this is at/above
+   * the configured threshold (`AgentGraphDeps.risk.apexNotionalUsd`); routine
+   * screening stays on Haiku/Sonnet. Absent/0 ⇒ never apex (cost-safe default).
+   */
+  notionalUsd?: number;
   fundamentals?: FundamentalSnapshot;
   news?: NewsHeadline[];
   /**
