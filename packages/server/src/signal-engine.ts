@@ -1,4 +1,4 @@
-import { OrbStrategy, BbFadeStrategy, IchimokuStrategy, SupertrendConfluenceStrategy, confluenceSide, supertrend, TradierOptionsClient, TradierOrderClient, TRADIER_REJECTED_STATUSES, evaluateSma200, SMA200_MIN_BARS, SMA200_DEBOUNCE_BARS, composeTechnicalSnapshot, resampleCandles, TF_BUCKET_MS } from '@trading-app/engine';
+import { OrbStrategy, BbFadeStrategy, IchimokuStrategy, SupertrendConfluenceStrategy, confluenceSide, supertrend, reversalChecklist, TradierOptionsClient, TradierOrderClient, TRADIER_REJECTED_STATUSES, evaluateSma200, SMA200_MIN_BARS, SMA200_DEBOUNCE_BARS, composeTechnicalSnapshot, resampleCandles, TF_BUCKET_MS } from '@trading-app/engine';
 import type { TradierAccountBalance } from '@trading-app/engine';
 import { WATCHLIST, MANAGED_ACCOUNT_RATIO, MAX_CONSECUTIVE_LOSSES, DAILY_DRAWDOWN_HALT_PCT, OPTIONS_PER_TICKET_DOLLAR_FLOOR, OPTIONS_POSITION_CAP_RATIO, aliasWatchlistSymbol, isLiveTradierOptionsEnabled, isStockMarketOpen, perPositionCap, resolveAutoManageImportedTradierOptions, resolveDemoCostModel, resolveHoldLiveOptionsOvernight, resolveLiveTradeEquitiesTradier, resolveManagedAccountRatio, resolveMarketReviewGatesEnabled, resolveRiskPerTrade, resolveRvDtePrefs, resolveTradierOptionsCreds, validateBracket, DEFAULT_RV_DTE_MIN, DEFAULT_RV_DTE_MAX, DEFAULT_RV_DTE_TARGET, scoreNewsSentiment, aggregateSymbolSentiment, aggregateFedSentiment, aggregateStockTwitsSentiment, dedupeStockTwitsMessages, mapCuratedMessagesBySymbol, nameAliasesFor } from '@trading-app/shared';
 import type { TradeSignal, RelativeValueSignal, Sma200Signal, Candle, OptionsAccountState, SignalType, Position, OptionPosition, AccountMode, AccountSettings, AccountState, NewsItem, SymbolSentiment, SocialSentiment, StockTwitsMessage, TechnicalSignalSnapshot, TradierEnv, MarketReview, MarketReviewGates, EngineMarketReviewState, GatedStrategyNote, AgentRecommendation } from '@trading-app/shared';
@@ -13,6 +13,14 @@ import { getUserMemorySync, recordInteractionOutcome } from './user-trading-memo
 import { getLatestMarketReview } from './market-review.js';
 import { earningsInDaysSync } from './earnings-store.js';
 import { recordShadowSignal, resolveShadowSignal, resolveOutcome, openShadowSignalsSync, type ShadowSignalRecord } from './shadow-signal-ledger.js';
+import {
+  isReversalShadowEnabled,
+  buildReversalShadowOpen,
+  recordReversalShadowSignal,
+  resolveReversalShadowSignal,
+  resolveReversalOutcome,
+  openReversalShadowSignalsSync,
+} from './reversal-shadow-ledger.js';
 import { etDateString } from './scheduler.js';
 import { fetchMinuteBars, fetchDailyCandles, fetchQuotes, fetchStocksNews, isYahooBreakerOpen, setActiveInterestSymbols, setTradierStocksFeedClient } from './yahoo-feed.js';
 import { fetchStockTwitsStream, fetchStockTwitsUserStream, getCuratedStockTwitsAccounts } from './stocktwits-feed.js';
@@ -47,6 +55,7 @@ const log = logger.child({ module: 'signal-engine' });
 // tape. This is observe-only telemetry — nothing on this logger ever routes an
 // order (live promotion is gated on the TRA-734 real-chain go/no-go).
 const supertrendShadowLog = logger.child({ module: 'supertrend-shadow' });
+const reversalShadowLog = logger.child({ module: 'reversal-shadow' });
 
 export interface SymbolState {
   symbol: string;
@@ -1708,6 +1717,9 @@ export class SignalEngine {
       // open side runs inside evaluateSupertrendShadow.
       this.runSupertrendPaperExits(prices);
       this.evaluateSupertrendShadow(activeSymbols);
+      // TRA-921 (TRA-920 B) — OBSERVE-ONLY reversal-checklist shadow capture.
+      // OFF unless ENABLE_REVERSAL_SHADOW is set; nothing here routes or opens.
+      this.evaluateReversalShadow(activeSymbols);
     }
 
     // TRA-191: relative-value scanner — the sole stock-options strategy in
@@ -2839,6 +2851,54 @@ export class SignalEngine {
       if (!res) continue;
       void resolveShadowSignal(rec.id, res, Date.now()).catch((err: unknown) => {
         supertrendShadowLog.warn('shadow ledger resolve failed', {
+          id: rec.id, reason: err instanceof Error ? err.message : String(err),
+        });
+      });
+    }
+  }
+
+  /**
+   * TRA-921 (TRA-920 B) — OBSERVE-ONLY reversal-checklist shadow capture. On each
+   * tick we evaluate {@link reversalChecklist} over the cached 5m series per
+   * symbol and, when a bracketed setup prints (price AT a key swing zone), append
+   * an OPEN row to the reversal shadow ledger carrying the four checklist legs,
+   * the score, and the zone touch-count. Then we forward-label any still-OPEN
+   * rows the same way the Supertrend ledger does. Gated OFF by default
+   * (ENABLE_REVERSAL_SHADOW); NOTHING here routes an order or opens a position.
+   */
+  private evaluateReversalShadow(symbols: string[]): void {
+    if (!isReversalShadowEnabled()) return;
+    for (const sym of symbols) {
+      const fiveMin = this.shadowCandleCache.get(sym);
+      if (!fiveMin || fiveMin.length === 0) continue;
+      const lastBar = fiveMin[fiveMin.length - 1];
+      if (!lastBar) continue;
+      const checklist = reversalChecklist(fiveMin);
+      const open = buildReversalShadowOpen(sym, checklist, lastBar.timestamp);
+      if (!open) continue;
+      void recordReversalShadowSignal(open).catch((err: unknown) => {
+        reversalShadowLog.warn('reversal shadow ledger append failed', {
+          symbol: sym, reason: err instanceof Error ? err.message : String(err),
+        });
+      });
+    }
+    this.labelOpenReversalShadowSignals();
+  }
+
+  /**
+   * TRA-921 — forward-label OPEN reversal shadow rows against the freshest cached
+   * 5m series, reusing the shared intra-session TP/SL/TIMEOUT horizon rule
+   * ({@link resolveReversalOutcome}). Best-effort and fire-and-forget so
+   * labelling never blocks the engine tick.
+   */
+  private labelOpenReversalShadowSignals(): void {
+    for (const rec of openReversalShadowSignalsSync()) {
+      const bars = this.shadowCandleCache.get(rec.symbol);
+      if (!bars || bars.length === 0) continue;
+      const res = resolveReversalOutcome(rec, bars);
+      if (!res) continue;
+      void resolveReversalShadowSignal(rec.id, res, Date.now()).catch((err: unknown) => {
+        reversalShadowLog.warn('reversal shadow ledger resolve failed', {
           id: rec.id, reason: err instanceof Error ? err.message : String(err),
         });
       });

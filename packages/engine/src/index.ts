@@ -159,6 +159,12 @@ export type {
 } from './coinbase/index.js';
 export { rsi, rsiDivergence, VwapTracker, detectPattern, isBullishPattern, isBearishPattern, adx, ema, emaCross, emaSeries, maSlope, atr, atrPct, supertrend, supertrendLatest, SUPERTREND_DEFAULT_PERIOD, SUPERTREND_DEFAULT_FACTOR, donchian, ichimoku, tkCross, composeTechnicalSnapshot, composeTimeframeSignal, resampleCandles, mtfBiasOf, MTF_CHOP_ADX, MTF_TF_WEIGHTS, TF_BUCKET_MS } from './indicators/index.js';
 export type { VwapState, CandlePattern, AdxResult, DonchianChannel, IchimokuState, TimeframeCandles, SupertrendBar, SupertrendDirection, SupertrendOptions } from './indicators/index.js';
+// TRA-920 — swing-based S/R zones + reversal-confluence checklist (TRA-921 wires
+// these into the OBSERVE-ONLY reversal shadow ledger).
+export { findSwings, supportResistance, reversalChecklist } from './indicators/index.js';
+// NOTE: SwingOptions / ReversalOptions are already exported above from the
+// archived strategies, so they are intentionally NOT re-exported here.
+export type { SwingPoint, SrZone, SrLevels, ReversalChecklist } from './indicators/index.js';
 export {
   evaluateSma200,
   smaSeries,

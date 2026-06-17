@@ -95,6 +95,12 @@ import { initIdeaJournal, listJournalEntries } from './options-idea-journal.js';
 import { initShadowLedger, listShadowSignals } from './shadow-signal-ledger.js';
 import { initOptionShadowLedger, listOptionShadowSignals, isOptionShadowEnabled } from './option-shadow-ledger.js';
 import {
+  initReversalShadowLedger,
+  listReversalShadowSignals,
+  isReversalShadowEnabled,
+  reversalHitRateByScore,
+} from './reversal-shadow-ledger.js';
+import {
   loadUserMemoryStore,
   getUserMemory,
   setUserMemory,
@@ -433,6 +439,11 @@ await initShadowLedger();
 // appends to it is observe-only and OFF unless ENABLE_OPTION_SHADOW_SELECTOR is
 // set; nothing here routes an order.
 await initOptionShadowLedger();
+
+// TRA-921 (TRA-920 B) — warm the OBSERVE-ONLY reversal-checklist shadow ledger so
+// the read endpoint has history right after boot. The signal-engine tick appends
+// rows when ENABLE_REVERSAL_SHADOW is set; nothing here routes an order.
+await initReversalShadowLedger();
 
 // TRA-850 — warm the persistent per-user trading-memory store from disk so the
 // synchronous `getUserMemorySync` read the advisory tick uses has each user's
@@ -2889,6 +2900,37 @@ app.get('/api/health/option-shadow-signals', async (_req, res) => {
       reason: err instanceof Error ? err.message : String(err),
     });
     res.status(500).json({ error: 'Failed to read option shadow ledger' });
+  }
+});
+
+// TRA-921 (TRA-920 B) — read-only probe over the OBSERVE-ONLY reversal-checklist
+// shadow ledger, open like the Supertrend/option shadow probes so the daily
+// learning loop (TRA-920 A) can pull the live-tape setup->outcome dataset
+// without Render admin creds. Returns the recent rows plus the N-of-4 hit-rate
+// breakdown (how often 4-of-4 vs 3-of-4 setups actually hit target) and whether
+// the capture flag is enabled, so an empty ledger ("flag off") is distinguishable
+// from a live-but-silent one. `?from=`/`?to=` are ms-epoch inclusive bounds on
+// the setup ts. No capital path — observe-only.
+app.get('/api/health/reversal-shadow-signals', async (req, res) => {
+  const q = req.query as Record<string, unknown>;
+  const parseTs = (v: unknown): number | undefined => {
+    const n = Number(v);
+    return typeof v === 'string' && v !== '' && Number.isFinite(n) ? n : undefined;
+  };
+  try {
+    const signals = await listReversalShadowSignals({ from: parseTs(q['from']), to: parseTs(q['to']) });
+    res.json({
+      issue: 'TRA-921',
+      flagEnabled: isReversalShadowEnabled(),
+      count: signals.length,
+      hitRateByScore: reversalHitRateByScore(signals),
+      signals,
+    });
+  } catch (err) {
+    log.error('reversal-shadow-signals health probe failed', {
+      reason: err instanceof Error ? err.message : String(err),
+    });
+    res.status(500).json({ error: 'Failed to read reversal shadow ledger' });
   }
 });
 
