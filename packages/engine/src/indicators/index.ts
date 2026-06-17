@@ -31,6 +31,15 @@ export {
 export type { SupertrendBar, SupertrendDirection, SupertrendOptions } from './supertrend.js';
 export { donchian } from './donchian.js';
 export type { DonchianChannel } from './donchian.js';
+export { findSwings, supportResistance, reversalChecklist } from './support-resistance.js';
+export type {
+  SwingPoint,
+  SrZone,
+  SrLevels,
+  SwingOptions,
+  ReversalOptions,
+  ReversalChecklist,
+} from './support-resistance.js';
 export { openingRangeBox, openingRangeBoxSignal, ORB_DEFAULTS } from './opening-range-box.js';
 export type {
   OpeningRangeBox,
