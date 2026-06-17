@@ -100,6 +100,7 @@ import {
   isReversalShadowEnabled,
   reversalHitRateByScore,
 } from './reversal-shadow-ledger.js';
+import { computeLearnedWeights } from './learned-signal-weights.js';
 import {
   loadUserMemoryStore,
   getUserMemory,
@@ -2931,6 +2932,35 @@ app.get('/api/health/reversal-shadow-signals', async (req, res) => {
       reason: err instanceof Error ? err.message : String(err),
     });
     res.status(500).json({ error: 'Failed to read reversal shadow ledger' });
+  }
+});
+
+// TRA-925 (TRA-920 A) — the daily learning loop, exposed as a read-time digest.
+// Folds the durable reversal shadow ledger into learned, min-sample-guarded
+// scoring multipliers (by checklist score, reversal pattern, and symbol) so the
+// agents "get better each day" as outcomes accrue. Computed live from the ledger
+// on every call, so the weights can never drift from the source of truth and no
+// separate persisted snapshot is needed. Scoring-only, no capital path; the same
+// `?from=`/`?to=` ms-epoch inclusive window as the other shadow probes.
+app.get('/api/health/learned-weights', async (req, res) => {
+  const q = req.query as Record<string, unknown>;
+  const parseTs = (v: unknown): number | undefined => {
+    const n = Number(v);
+    return typeof v === 'string' && v !== '' && Number.isFinite(n) ? n : undefined;
+  };
+  try {
+    const signals = await listReversalShadowSignals({ from: parseTs(q['from']), to: parseTs(q['to']) });
+    res.json({
+      issue: 'TRA-925',
+      flagEnabled: isReversalShadowEnabled(),
+      count: signals.length,
+      weights: computeLearnedWeights(signals),
+    });
+  } catch (err) {
+    log.error('learned-weights health probe failed', {
+      reason: err instanceof Error ? err.message : String(err),
+    });
+    res.status(500).json({ error: 'Failed to compute learned weights' });
   }
 });
 
