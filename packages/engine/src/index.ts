@@ -136,6 +136,9 @@ export type {
   TradierOpenEquityPosition,
   TradierTradeHistoryFill,
   TradierCashEvent,
+  TradierMultilegSide,
+  TradierMultilegLeg,
+  TradierMultilegPricing,
 } from './tradier/index.js';
 export { CoinbaseOrderClient } from './coinbase/index.js';
 export type {
@@ -294,6 +297,14 @@ export type {
   StrategySelectorResult,
   GateDecision,
 } from './options/strategy-selector.js';
+export {
+  evaluateMultiLegPreTrade,
+  DEFAULT_MAX_LOSS_PCT_CAP,
+} from './options/multi-leg-gate.js';
+export type {
+  MultiLegPreTradeInput,
+  MultiLegPreTradeVerdict,
+} from './options/multi-leg-gate.js';
 export { findMispricedOtmContracts } from './options/otm-mispricing.js';
 export type {
   OptionChainRow,

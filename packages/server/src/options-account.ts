@@ -1,5 +1,6 @@
 import { randomUUID } from 'crypto';
 import type { TradierOpenOptionPosition } from '@trading-app/engine';
+import { evaluateMultiLegPreTrade, DEFAULT_MAX_LOSS_PCT_CAP } from '@trading-app/engine';
 import type {
   AccountMode,
   TradeSignal,
@@ -44,6 +45,8 @@ import { logger } from './observability/index.js';
 // keep their `null`-on-reject contract; this surfaces *why* an entry was
 // refused to the logs (and gives tests / callers a programmatic read).
 const guardLog = logger.child({ module: 'day-trading-guardrail' });
+// TRA-912 — surfaces *why* a defined-risk multi-leg open was refused (pre-trade gate).
+const accountLog = logger.child({ module: 'options-account' });
 
 /**
  * TRA-462 — RV stop-loss premium with the dollar-distance floor. The stop
@@ -1104,6 +1107,13 @@ export class PaperOptionsAccount {
     if (contracts < 1 && maxLossPerLot <= this.cash) contracts = 1;
     if (contracts < 1) return null;
 
+    // TRA-912 (TRA-908 Phase B) — per-trade max-loss ceiling: never reserve
+    // capital-at-risk above 1% of equity on a single combo. Trim down to the
+    // cap; a single lot that already busts the cap can't be trimmed and is
+    // rejected below by the pre-trade gate.
+    const capLots = Math.floor((this.equity * DEFAULT_MAX_LOSS_PCT_CAP) / maxLossPerLot);
+    if (capLots >= 1 && contracts > capLots) contracts = capLots;
+
     let totalRisk = contracts * maxLossPerLot;
     // Trim to whatever paper cash can actually reserve (paper book is the
     // binding constraint here — there is no live buying-power mirror).
@@ -1111,6 +1121,28 @@ export class PaperOptionsAccount {
       contracts = Math.floor(this.cash / maxLossPerLot);
       if (contracts < 1) return null;
       totalRisk = contracts * maxLossPerLot;
+    }
+
+    // TRA-912 — authoritative pre-trade gate (max-loss <=1% equity + buying
+    // power). `optionBuyingPower: null` because the paper book has no live hold
+    // to mirror; the cash reserve above is the binding constraint. The gate is
+    // the explicitly-tested artifact that rejects oversized orders (e.g. a
+    // single defined-risk lot whose max loss already exceeds 1% of equity).
+    const gate = evaluateMultiLegPreTrade({
+      accountEquity: this.equity,
+      optionBuyingPower: null,
+      maxLossPerLot,
+      contracts,
+    });
+    if (!gate.allowed) {
+      accountLog.warn('defined-risk spread rejected by pre-trade gate', {
+        symbol: params.symbol,
+        strategy: params.strategy,
+        maxLossPerLot,
+        contracts,
+        reason: gate.reason,
+      });
+      return null;
     }
 
     this.cash -= totalRisk;

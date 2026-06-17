@@ -28,6 +28,9 @@ export type {
   TradierOpenOptionPosition,
   TradierTradeHistoryFill,
   TradierCashEvent,
+  TradierMultilegSide,
+  TradierMultilegLeg,
+  TradierMultilegPricing,
 } from './options-client.js';
 export { TradierStocksClient } from './stocks-client.js';
 export type { TradierEquityQuote } from './stocks-client.js';

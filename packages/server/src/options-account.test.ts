@@ -2469,10 +2469,10 @@ describe('PaperOptionsAccount.openDefinedRiskSpread', () => {
   });
 
   it('opens a multi-leg combo, reserving capped max-loss from paper cash', () => {
-    // initialEquity 1_000 → demo RV budget ≈ $150 (per-ticket floor). maxLoss
-    // $320 > budget so the floor-divide is 0, but $320 ≤ cash so exactly one
-    // lot is forced. $320 reserved → $680 cash left.
-    const acct = new PaperOptionsAccount({ initialEquity: 1_000, managedAccountRatio: 0.5 });
+    // $50k equity → demo RV budget = $500 (2% of managed equity). maxLoss $320
+    // ≤ budget → exactly one lot, and $320 is 0.64% of equity so it clears the
+    // TRA-912 per-trade 1% max-loss gate. $320 reserved → $49,680 cash left.
+    const acct = new PaperOptionsAccount({ initialEquity: 50_000, managedAccountRatio: 0.5 });
     const pos = acct.openDefinedRiskSpread(spreadParams());
 
     expect(pos).not.toBeNull();
@@ -2485,40 +2485,67 @@ describe('PaperOptionsAccount.openDefinedRiskSpread', () => {
     expect(pos!.breakevens).toEqual([93.2]);
     expect(pos!.optionSymbol).toContain('COMBO:AAPL:bull_put_spread');
     // Capital-at-risk reserved uniformly (credit netted into the hold).
-    expect(acct.getState().optionsCash).toBe(680);
+    expect(acct.getState().optionsCash).toBe(49_680);
     expect(acct.getState().dailyOptionsCount).toBe(1);
     // premiumPaid carries the per-share reserved basis for the close-path math.
     expect(pos!.premiumPaid).toBeCloseTo(3.2, 5);
   });
 
   it('refuses a second identical combo (dedup by structure key)', () => {
-    const acct = new PaperOptionsAccount({ initialEquity: 1_000, managedAccountRatio: 0.5 });
+    const acct = new PaperOptionsAccount({ initialEquity: 50_000, managedAccountRatio: 0.5 });
     expect(acct.openDefinedRiskSpread(spreadParams())).not.toBeNull();
     expect(acct.openDefinedRiskSpread(spreadParams())).toBeNull();
     // Only the first entry consumed cash / a daily slot.
-    expect(acct.getState().optionsCash).toBe(680);
+    expect(acct.getState().optionsCash).toBe(49_680);
     expect(acct.getState().dailyOptionsCount).toBe(1);
   });
 
-  it('honors the C3 entry-DTE guard (sub-floor expiration is refused)', () => {
+  // TRA-912 (TRA-908 Phase B) — the pre-trade gate (buying-power + per-trade
+  // max-loss ≤ 1% of equity) rejects oversized orders BEFORE any cash is
+  // reserved or a daily slot consumed.
+  it('rejects an oversized spread whose single-lot max loss exceeds 1% of equity', () => {
+    // $1k equity → 1% cap = $10. A single $320 max-loss lot can't be trimmed
+    // below one lot and busts the cap, so the open is refused outright.
     const acct = new PaperOptionsAccount({ initialEquity: 1_000, managedAccountRatio: 0.5 });
-    const nearLegs = bullPutLegs.map((l) => ({ ...l, expiration: '2024-06-06' })); // 2 DTE
-    const pos = acct.openDefinedRiskSpread(spreadParams({ legs: nearLegs }));
+    const pos = acct.openDefinedRiskSpread(spreadParams());
     expect(pos).toBeNull();
-    // Nothing consumed.
     expect(acct.getState().optionsCash).toBe(1_000);
     expect(acct.getState().dailyOptionsCount).toBe(0);
   });
 
+  it('trims lots so reserved capital-at-risk stays inside the 1% cap', () => {
+    // $50k equity → 1% cap = $500. managed=1.0 → RV budget = $1,000, which
+    // would size a $180 max-loss lot to floor(1000/180)=5 lots. The cap
+    // (floor(500/180)=2) binds first → 2 lots, $360 reserved (still ≤ cap).
+    const acct = new PaperOptionsAccount({ initialEquity: 50_000, managedAccountRatio: 1.0 });
+    const pos = acct.openDefinedRiskSpread(
+      spreadParams({ maxLossUsd: 180, netUsd: 60, maxProfitUsd: 60 }),
+    );
+    expect(pos).not.toBeNull();
+    expect(pos!.contracts).toBe(2);
+    expect(pos!.maxLossUsd).toBe(360);
+    expect(acct.getState().optionsCash).toBe(49_640);
+  });
+
+  it('honors the C3 entry-DTE guard (sub-floor expiration is refused)', () => {
+    const acct = new PaperOptionsAccount({ initialEquity: 50_000, managedAccountRatio: 0.5 });
+    const nearLegs = bullPutLegs.map((l) => ({ ...l, expiration: '2024-06-06' })); // 2 DTE
+    const pos = acct.openDefinedRiskSpread(spreadParams({ legs: nearLegs }));
+    expect(pos).toBeNull();
+    // Nothing consumed.
+    expect(acct.getState().optionsCash).toBe(50_000);
+    expect(acct.getState().dailyOptionsCount).toBe(0);
+  });
+
   it('rejects malformed structures (single leg / mispriced max-loss)', () => {
-    const acct = new PaperOptionsAccount({ initialEquity: 1_000, managedAccountRatio: 0.5 });
+    const acct = new PaperOptionsAccount({ initialEquity: 50_000, managedAccountRatio: 0.5 });
     expect(acct.openDefinedRiskSpread(spreadParams({ legs: [bullPutLegs[0]] }))).toBeNull();
     expect(acct.openDefinedRiskSpread(spreadParams({ maxLossUsd: 0 }))).toBeNull();
-    expect(acct.getState().optionsCash).toBe(1_000);
+    expect(acct.getState().optionsCash).toBe(50_000);
   });
 
   it('is skipped by the per-tick exit engine (defined-risk, held to manual close)', () => {
-    const acct = new PaperOptionsAccount({ initialEquity: 1_000, managedAccountRatio: 0.5 });
+    const acct = new PaperOptionsAccount({ initialEquity: 50_000, managedAccountRatio: 0.5 });
     const pos = acct.openDefinedRiskSpread(spreadParams());
     expect(pos).not.toBeNull();
     // A tick with a wildly adverse underlying must NOT close the combo.

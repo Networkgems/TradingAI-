@@ -749,6 +749,109 @@ export class TradierOptionsClient extends TradierOrderClient {
     }
     return new URLSearchParams(params);
   }
+
+  /**
+   * TRA-912 (TRA-908 Phase B) — submit a defined-risk MULTI-LEG options order
+   * (vertical spread, iron condor, …) as a single Tradier `class=multileg`
+   * ticket. This is the broker-side counterpart to the paper account's
+   * {@link PaperOptionsAccount.openDefinedRiskSpread}: the selector emits a
+   * structure with two or four legs (each `buy_to_open` / `sell_to_open` at
+   * entry, or `buy_to_close` / `sell_to_close` at exit) and the whole combo is
+   * priced as one net debit / credit so the broker fills (or rejects) it
+   * atomically rather than legging in one contract at a time.
+   *
+   * Pricing model — Tradier `multileg` carries the net at the TOP level, not
+   * per leg: `type` is `debit` (you pay), `credit` (you receive), `even`
+   * (scratch) or `market`, and `price` is the absolute net per share. Per-leg
+   * fields are `option_symbol[n]` / `side[n]` / `quantity[n]` only — there is
+   * no per-leg `price`/`type` (contrast the OTOCO bracket, where every field is
+   * per-leg). A sub-cent `price` is rounded to the nearest cent because Tradier
+   * rejects sub-cent limits on equity options.
+   *
+   * Paper-only by construction in Phase B: the only callers are the paper
+   * smart-fill helper and tests. No live-capital path invokes this yet — the
+   * advisory->capital bridge is Phase C and real-chain live is gated by
+   * TRA-382. The method itself is env-agnostic (the client's base URL decides
+   * sandbox vs. production), so wiring it to live later needs an explicit gate,
+   * not a code change here.
+   */
+  async submitMultilegOrder(
+    underlying: string,
+    legs: readonly TradierMultilegLeg[],
+    pricing: TradierMultilegPricing = { type: 'market' },
+  ): Promise<TradierOrderResponse> {
+    return this.postOrder(this.multilegOrderBody(underlying, legs, pricing));
+  }
+
+  /**
+   * TRA-912 — build the `class=multileg` order body. Exposed as a private
+   * helper (unit-tested through {@link submitMultilegOrder} + a fetch mock, the
+   * same way the OTOCO bracket body is). Throws on a structurally invalid order
+   * (fewer than two legs, or a debit/credit with a non-positive net) BEFORE any
+   * network call so a malformed combo can never reach the broker.
+   */
+  private multilegOrderBody(
+    underlying: string,
+    legs: readonly TradierMultilegLeg[],
+    pricing: TradierMultilegPricing,
+  ): URLSearchParams {
+    if (!Array.isArray(legs) || legs.length < 2) {
+      throw new Error('multileg order requires at least two legs');
+    }
+    const params: Record<string, string> = {
+      class: 'multileg',
+      symbol: underlyingFromOcc(underlying.toUpperCase()),
+      type: pricing.type,
+      duration: pricing.duration ?? 'day',
+    };
+    if (pricing.type === 'debit' || pricing.type === 'credit') {
+      if (!Number.isFinite(pricing.price as number) || (pricing.price as number) <= 0) {
+        throw new Error(`multileg ${pricing.type} order requires a positive net price`);
+      }
+      params['price'] = roundToCent(pricing.price as number).toFixed(2);
+    }
+    legs.forEach((leg, i) => {
+      if (!Number.isFinite(leg.quantity) || leg.quantity <= 0) {
+        throw new Error(`multileg leg ${i} requires a positive quantity`);
+      }
+      params[`option_symbol[${i}]`] = leg.optionSymbol;
+      params[`side[${i}]`] = leg.side;
+      params[`quantity[${i}]`] = String(leg.quantity);
+    });
+    return new URLSearchParams(params);
+  }
+}
+
+/**
+ * TRA-912 — the four option-leg sides Tradier accepts on a `multileg` ticket.
+ * Entry structures use the `*_to_open` pair (a defined-risk spread always pairs
+ * a long and a short leg); exits use the `*_to_close` pair to flatten them.
+ */
+export type TradierMultilegSide =
+  | 'buy_to_open'
+  | 'sell_to_open'
+  | 'buy_to_close'
+  | 'sell_to_close';
+
+export interface TradierMultilegLeg {
+  /** OCC option symbol for this leg. */
+  optionSymbol: string;
+  side: TradierMultilegSide;
+  /** Contracts for this leg (per combo lot — usually 1 for a 1-wide vertical). */
+  quantity: number;
+}
+
+export interface TradierMultilegPricing {
+  /**
+   * `debit` = net amount paid (long premium dominates), `credit` = net amount
+   * received (short premium dominates), `even` = scratch, `market` = no limit
+   * (used only as a last-resort; the smart-fill helper always supplies a limit).
+   */
+  type: 'debit' | 'credit' | 'even' | 'market';
+  /** Absolute net per share. Required (and must be > 0) for `debit` / `credit`. */
+  price?: number;
+  /** Time in force. Defaults to `day`. */
+  duration?: TradierOrderDuration;
 }
 
 /**

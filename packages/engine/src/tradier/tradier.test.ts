@@ -1320,3 +1320,126 @@ describe('TradierOptionsClient.listAccountCashEvents (TRA-359)', () => {
     expect(await client.listAccountCashEvents({ start: '2026-05-01', end: '2026-05-08' })).toEqual([]);
   });
 });
+
+// ─── TradierOptionsClient.submitMultilegOrder (TRA-912) ─────────────────────
+
+describe('TradierOptionsClient.submitMultilegOrder', () => {
+  // A bull put spread: sell the higher-strike put (short), buy the lower-strike
+  // put (long protection) — a net-credit, defined-risk two-legger.
+  const SHORT_PUT = 'AAPL260918P00190000';
+  const LONG_PUT = 'AAPL260918P00185000';
+
+  it('builds a class=multileg CREDIT order with per-leg sides (sell_to_open + buy_to_open)', async () => {
+    fetchMock.mockResolvedValueOnce(jsonResponse({ order: { id: 77, status: 'ok' } }));
+    const client = new TradierOptionsClient('tok', 'ACCT1');
+
+    const order = await client.submitMultilegOrder(
+      'AAPL',
+      [
+        { optionSymbol: SHORT_PUT, side: 'sell_to_open', quantity: 1 },
+        { optionSymbol: LONG_PUT, side: 'buy_to_open', quantity: 1 },
+      ],
+      { type: 'credit', price: 1.234 },
+    );
+
+    expect(order).toEqual({ id: 77, status: 'ok' });
+    expect(callUrl(0)).toBe('https://sandbox.tradier.com/v1/accounts/ACCT1/orders');
+    expect(callInit(0).method).toBe('POST');
+
+    const params = new URLSearchParams(callInit(0).body as string);
+    expect(params.get('class')).toBe('multileg');
+    // Net price + type are TOP-level on multileg (contrast OTOCO's per-leg price).
+    expect(params.get('symbol')).toBe('AAPL');
+    expect(params.get('type')).toBe('credit');
+    expect(params.get('duration')).toBe('day');
+    expect(params.get('price')).toBe('1.23'); // rounded to the cent
+    // Leg 0 — short put
+    expect(params.get('option_symbol[0]')).toBe(SHORT_PUT);
+    expect(params.get('side[0]')).toBe('sell_to_open');
+    expect(params.get('quantity[0]')).toBe('1');
+    // Leg 1 — long put
+    expect(params.get('option_symbol[1]')).toBe(LONG_PUT);
+    expect(params.get('side[1]')).toBe('buy_to_open');
+    expect(params.get('quantity[1]')).toBe('1');
+  });
+
+  it('builds a CLOSE order with *_to_close sides and a DEBIT net', async () => {
+    fetchMock.mockResolvedValueOnce(jsonResponse({ order: { id: 78, status: 'ok' } }));
+    const client = new TradierOptionsClient('tok', 'ACCT1');
+
+    await client.submitMultilegOrder(
+      'AAPL',
+      [
+        { optionSymbol: SHORT_PUT, side: 'buy_to_close', quantity: 2 },
+        { optionSymbol: LONG_PUT, side: 'sell_to_close', quantity: 2 },
+      ],
+      { type: 'debit', price: 0.4 },
+    );
+
+    const params = new URLSearchParams(callInit(0).body as string);
+    expect(params.get('type')).toBe('debit');
+    expect(params.get('price')).toBe('0.40');
+    expect(params.get('side[0]')).toBe('buy_to_close');
+    expect(params.get('side[1]')).toBe('sell_to_close');
+    expect(params.get('quantity[0]')).toBe('2');
+  });
+
+  it('omits price for an EVEN (scratch) net', async () => {
+    fetchMock.mockResolvedValueOnce(jsonResponse({ order: { id: 79, status: 'ok' } }));
+    const client = new TradierOptionsClient('tok', 'ACCT1');
+    await client.submitMultilegOrder(
+      'AAPL',
+      [
+        { optionSymbol: SHORT_PUT, side: 'sell_to_open', quantity: 1 },
+        { optionSymbol: LONG_PUT, side: 'buy_to_open', quantity: 1 },
+      ],
+      { type: 'even' },
+    );
+    const params = new URLSearchParams(callInit(0).body as string);
+    expect(params.get('type')).toBe('even');
+    expect(params.get('price')).toBeNull();
+  });
+
+  it('rejects a structurally invalid order (fewer than two legs) BEFORE any network call', async () => {
+    const client = new TradierOptionsClient('tok', 'ACCT1');
+    await expect(
+      client.submitMultilegOrder('AAPL', [{ optionSymbol: SHORT_PUT, side: 'sell_to_open', quantity: 1 }], {
+        type: 'credit',
+        price: 1,
+      }),
+    ).rejects.toThrow(/at least two legs/);
+    expect(fetchMock).not.toHaveBeenCalled();
+  });
+
+  it('rejects a debit/credit order with a non-positive net BEFORE any network call', async () => {
+    const client = new TradierOptionsClient('tok', 'ACCT1');
+    await expect(
+      client.submitMultilegOrder(
+        'AAPL',
+        [
+          { optionSymbol: SHORT_PUT, side: 'sell_to_open', quantity: 1 },
+          { optionSymbol: LONG_PUT, side: 'buy_to_open', quantity: 1 },
+        ],
+        { type: 'credit', price: 0 },
+      ),
+    ).rejects.toThrow(/positive net price/);
+    expect(fetchMock).not.toHaveBeenCalled();
+  });
+
+  it('propagates a broker reject envelope (insufficient buying power)', async () => {
+    fetchMock.mockResolvedValueOnce(
+      jsonResponse({ errors: { error: 'insufficient buying power' } }),
+    );
+    const client = new TradierOptionsClient('tok', 'ACCT1');
+    await expect(
+      client.submitMultilegOrder(
+        'AAPL',
+        [
+          { optionSymbol: SHORT_PUT, side: 'sell_to_open', quantity: 1 },
+          { optionSymbol: LONG_PUT, side: 'buy_to_open', quantity: 1 },
+        ],
+        { type: 'credit', price: 1 },
+      ),
+    ).rejects.toThrow(/insufficient buying power/);
+  });
+});
