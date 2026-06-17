@@ -60,6 +60,14 @@ import {
   estimateSpotFromChain,
   type ChainDay,
 } from './options-chain-store.js';
+import { DEFAULT_SELECTOR_PARAMS } from '@trading-app/engine';
+import {
+  replayPhaseABucket,
+  buildPhaseAGateReport,
+  buildPhaseAMarkdown,
+  validateGateReportShape,
+  defaultPhaseAConfig,
+} from './options-replay-phasea.js';
 import {
   summarizeBucket,
   buildCsv,
@@ -90,6 +98,13 @@ export interface ReplayConfig {
 export const DEFAULT_SPREAD_RISK_PARAMS: Record<ReplaySpreadStrategy, SpreadRiskParams> = {
   put_write: { budgetRatio: 0.5 },
   call_debit_spread: { budgetRatio: 0.05 },
+  // TRA-918 — the four TRA-911 Phase-A structures are defined-risk verticals /
+  // condors sized off their per-lot capped loss; a single 2%-of-managed-equity
+  // ticket budget mirrors the selector's advisory `riskFraction` (0.02).
+  bull_put_spread: { budgetRatio: 0.02 },
+  bear_call_spread: { budgetRatio: 0.02 },
+  iron_condor: { budgetRatio: 0.02 },
+  debit_spread: { budgetRatio: 0.02 },
 };
 
 export const DEFAULT_REPLAY_CONFIG: ReplayConfig = {
@@ -285,8 +300,59 @@ export function runOptionsReplay(days: readonly ChainDay[], cfg: ReplayConfig): 
 // ── CLI ─────────────────────────────────────────────────────────────────────
 
 function parseArg(name: string): string | undefined {
+  // Support both `--name value` and `--name=value` forms.
+  const eq = process.argv.find((a) => a.startsWith(`--${name}=`));
+  if (eq) return eq.slice(`--${name}=`.length);
   const idx = process.argv.indexOf(`--${name}`);
   return idx >= 0 && idx + 1 < process.argv.length ? process.argv[idx + 1] : undefined;
+}
+
+/**
+ * TRA-918 — the `--source=phaseA` CLI path: replay the TRA-911 Phase-A selector
+ * across the loaded chain days and emit a markdown + a promotion-gate-consumable
+ * JSON report per equity bucket. `mode` tags every report so a synthetic
+ * backtest is never mistaken for real-chain paper accrual.
+ */
+async function runPhaseACli(
+  days: readonly ChainDay[],
+  cfg: ReplayConfig,
+  outDir: string,
+  mode: 'synthetic' | 'recorded',
+  symbolsCount: number,
+): Promise<void> {
+  await mkdir(outDir, { recursive: true });
+  const generatedAt = Date.now();
+  const stamp = new Date(generatedAt).toISOString().slice(0, 19).replace(/[:T]/g, '-');
+
+  for (const startingEquity of cfg.equityBuckets) {
+    const phaseCfg = defaultPhaseAConfig(DEFAULT_SELECTOR_PARAMS, cfg.spreadRiskParams, startingEquity);
+    phaseCfg.managedAccountRatio = cfg.managedAccountRatio;
+    phaseCfg.optionsDailyTradesLimit = cfg.optionsDailyTradesLimit;
+
+    const bucket = replayPhaseABucket(days, startingEquity, phaseCfg);
+    const report = buildPhaseAGateReport(bucket, mode);
+    const shapeErrors = validateGateReportShape(report);
+    if (shapeErrors.length) {
+      console.error('[TRA-918 phaseA] gate-report shape validation FAILED:', shapeErrors);
+      process.exit(3);
+    }
+
+    const md = buildPhaseAMarkdown({ report, daysReplayed: days.length, symbolsCount, generatedAt });
+    const base = `options-phasea-${mode}-eq${startingEquity}-${stamp}`;
+    const jsonPath = join(outDir, `${base}.json`);
+    const mdPath = join(outDir, `${base}.md`);
+    await writeFile(jsonPath, JSON.stringify({ generatedAt: new Date(generatedAt).toISOString(), ...report }, null, 2), 'utf-8');
+    await writeFile(mdPath, md, 'utf-8');
+
+    const m = report.pooled;
+    console.log(
+      `[TRA-918 phaseA] $${startingEquity}: ${m.tradeCount} trades, ` +
+        `expectancy(R)=${m.expectancy}, sharpe=${m.sharpe}, PF=${m.profitFactor}, ` +
+        `maxDD=${m.maxDrawdown}, signals=${bucket.signalCount}, unpriceable=${bucket.unpriceableSignals}`,
+    );
+    console.log(`[TRA-918 phaseA] JSON → ${jsonPath}`);
+    console.log(`[TRA-918 phaseA] MD   → ${mdPath}`);
+  }
 }
 
 async function main(): Promise<void> {
@@ -337,6 +403,14 @@ async function main(): Promise<void> {
     `[TRA-376 replay] ${days.length} day(s), ${symbolsCount} symbol(s), ` +
       `${days[0].date} → ${days[days.length - 1].date}`,
   );
+
+  // TRA-918 — Phase-A signal-driven harness (`--source=phaseA`). Replaces the
+  // OTM/RV scanner entry path with the TRA-911 selector; emits gate-consumable JSON.
+  const source = parseArg('source');
+  if (source === 'phaseA') {
+    await runPhaseACli(days, cfg, outDir, synthetic ? 'synthetic' : 'recorded', symbolsCount);
+    return;
+  }
 
   const buckets = runOptionsReplay(days, cfg);
 

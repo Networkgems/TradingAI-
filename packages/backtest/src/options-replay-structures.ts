@@ -19,7 +19,7 @@
  * depends on @trading-app/backtest). All dollar figures are per 1-lot (×100).
  */
 
-import type { OptionChainRow } from '@trading-app/engine';
+import type { OptionChainRow, ShadowOptionSignal } from '@trading-app/engine';
 import type { OptionLeg } from '@trading-app/shared';
 import type { OpenSpreadCandidate, ReplaySpreadStrategy } from './options-replay-account.js';
 
@@ -215,3 +215,124 @@ export function modelCallDebitSpread(
 
 /** The structure ids this modeler can build (order matters only for display). */
 export const REPLAY_SPREAD_STRATEGIES: readonly ReplaySpreadStrategy[] = ['put_write', 'call_debit_spread'];
+
+// ───────────────────────────────────────────────────────────────────────────
+// TRA-918 (TRA-908 Phase D, G2) — map a TRA-911 Phase-A `ShadowOptionSignal`
+// onto the account's `OpenSpreadCandidate` so the modeled structure IS the
+// signalled structure (legs/strikes/marks taken straight from the signal — no
+// re-selection in the backtest). Covers the four Phase-A structures:
+//
+//   • bull_put_spread  — short put + long lower put (credit).
+//       max loss = (width − credit)×100;  max profit = credit×100.
+//   • bear_call_spread — short call + long higher call (credit). symmetric.
+//   • iron_condor      — bull put + bear call, one combo (credit = sum of both);
+//       max loss = (widest wing − total credit)×100 (only one side can lose).
+//   • debit_spread     — directional debit vertical (call up / put down).
+//       max loss = debit×100;  max profit = (width − debit)×100.
+// ───────────────────────────────────────────────────────────────────────────
+
+/** TRA-918 — fill-realism knobs applied when mapping a signal to a tradeable structure. */
+export interface SignalFillParams {
+  /** Per-leg slippage haircut, $/contract (default 0.02 — or the chain half-spread if larger). */
+  perLegSlippage: number;
+  /** Commission, $/contract/leg (default 0.65). */
+  commissionPerContract: number;
+}
+
+export const DEFAULT_SIGNAL_FILL: SignalFillParams = {
+  perLegSlippage: 0.02,
+  commissionPerContract: 0.65,
+};
+
+/** The four Phase-A structures map to a credit/debit cash sign. */
+function isCreditStrategy(strategy: ShadowOptionSignal['strategy']): boolean {
+  return (
+    strategy === 'bull_put_spread' ||
+    strategy === 'bear_call_spread' ||
+    strategy === 'iron_condor'
+  );
+}
+
+/** Strike width of a same-type leg pair (for verticals / each condor side). */
+function pairWidth(legs: readonly { optionType: 'call' | 'put'; strike: number }[], optionType: 'call' | 'put'): number {
+  const strikes = legs.filter((l) => l.optionType === optionType).map((l) => l.strike);
+  if (strikes.length < 2) return 0;
+  return Math.max(...strikes) - Math.min(...strikes);
+}
+
+/**
+ * TRA-918 — build an {@link OpenSpreadCandidate} from a Phase-A signal. Fills
+ * each leg at its signalled mid minus/plus a per-leg slippage haircut
+ * (`max(perLegSlippage, chain half-spread)`), nets commissions in, and derives
+ * the defined-risk band per the structure rules above. Returns null when the
+ * structure can't be priced into a positive defined risk.
+ *
+ * `halfSpreadOf(leg)` optionally supplies the current chain half-spread for a
+ * leg so the haircut is `max(perLegSlippage, halfSpread)`; omit it to use the
+ * flat `perLegSlippage` floor.
+ */
+export function modelSignalStructure(
+  signal: ShadowOptionSignal,
+  fill: SignalFillParams = DEFAULT_SIGNAL_FILL,
+  halfSpreadOf?: (leg: ShadowOptionSignal['legs'][number]) => number | null,
+): OpenSpreadCandidate | null {
+  if (!Array.isArray(signal.legs) || signal.legs.length < 2) return null;
+
+  // Net entry cash (+received / −paid) per share, after the slippage haircut,
+  // plus the modeled slippage + commission dollars per lot.
+  let entryCashPerShare = 0;
+  let modeledSlippageUsd = 0;
+  for (const l of signal.legs) {
+    if (!(l.mark > 0)) return null;
+    const half = Math.max(fill.perLegSlippage, halfSpreadOf?.(l) ?? 0);
+    const fillPrice = l.action === 'sell' ? l.mark - half : l.mark + half;
+    entryCashPerShare += l.action === 'sell' ? fillPrice : -fillPrice;
+    modeledSlippageUsd += half * CONTRACT + fill.commissionPerContract;
+  }
+  // Commissions are a cash cost: net them out of the per-share entry cash.
+  const commissionPerShare = (signal.legs.length * fill.commissionPerContract) / CONTRACT;
+  const netCashPerShare = entryCashPerShare - commissionPerShare;
+  const netUsd = r2(netCashPerShare * CONTRACT);
+
+  const credit = isCreditStrategy(signal.strategy);
+  const width = signal.widthPoints > 0 ? signal.widthPoints : Math.max(
+    pairWidth(signal.legs, 'put'),
+    pairWidth(signal.legs, 'call'),
+  );
+  if (!(width > 0)) return null;
+
+  let maxLossUsd: number;
+  let maxProfitUsd: number;
+  if (credit) {
+    const creditPerShare = netCashPerShare; // > 0 for a well-formed credit structure
+    if (!(creditPerShare > 0)) return null;
+    maxLossUsd = r2(Math.max(0.01, width - creditPerShare) * CONTRACT);
+    maxProfitUsd = r2(creditPerShare * CONTRACT);
+  } else {
+    const debitPerShare = -netCashPerShare; // > 0 for a well-formed debit structure
+    if (!(debitPerShare > 0)) return null;
+    maxLossUsd = r2(debitPerShare * CONTRACT);
+    maxProfitUsd = r2(Math.max(0.01, width - debitPerShare) * CONTRACT);
+  }
+
+  const legs: OptionLeg[] = signal.legs.map((l) => ({
+    action: l.action,
+    optionType: l.optionType,
+    strike: l.strike,
+    expiration: signal.expiration,
+  }));
+
+  return {
+    symbol: signal.symbol,
+    strategy: signal.strategy,
+    legs,
+    netUsd,
+    maxLossUsd,
+    maxProfitUsd,
+    breakevens: [],
+    expiration: signal.expiration,
+    spot: 0,
+    classification: signal.strategy,
+    modeledSlippageUsd: r2(modeledSlippageUsd),
+  };
+}

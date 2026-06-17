@@ -30,6 +30,51 @@ import type { OptionLeg, OptionType, OtmRiskParams, RvRiskParams } from '@tradin
 const CONTRACT_MULTIPLIER = 100;
 
 /**
+ * TRA-918 — the four TRA-911 Phase-A signal structures get mid-life management
+ * (50%-profit take / credit stop / 21-DTE time stop) via
+ * {@link OptionsReplayAccount.markAndManageSpreads}. The two TRA-800 structures
+ * (`put_write` / `call_debit_spread`) are deliberately NOT in this set — they
+ * stay on the hold-to-expiry {@link OptionsReplayAccount.settleSpreads} path so
+ * the existing TRA-800 replay behaviour is unchanged.
+ */
+const MANAGED_SPREAD_STRATEGIES: ReadonlySet<ReplaySpreadStrategy> = new Set([
+  'bull_put_spread',
+  'bear_call_spread',
+  'iron_condor',
+  'debit_spread',
+]);
+
+/** TRA-918 (plan §1.6) — mid-life spread-management thresholds. All sweepable. */
+export interface SpreadManagementParams {
+  /** Take profit at this fraction of max profit (default 0.5 — the 50% rule). */
+  takeProfitFraction: number;
+  /** Credit-structure stop: close when spread mark ≥ this × entry credit (default 2). */
+  creditStopMultiple: number;
+  /** Debit-structure stop: close when this fraction of the debit is lost (default 0.5). */
+  debitStopLossFraction: number;
+  /** Close (no roll) at/under this DTE if neither TP nor stop fired (default 21). */
+  timeStopDte: number;
+}
+
+export const DEFAULT_SPREAD_MANAGEMENT: SpreadManagementParams = {
+  takeProfitFraction: 0.5,
+  creditStopMultiple: 2,
+  debitStopLossFraction: 0.5,
+  timeStopDte: 21,
+};
+
+/**
+ * Whole calendar days from `now` (ms) to an expiration date (UTC midnight).
+ * Local copy so the account does not depend on `options-replay-structures.ts`
+ * (which already depends on this module — importing back would cycle).
+ */
+function comboDteDays(expiration: string, now: number): number {
+  const expMs = Date.parse(`${expiration}T00:00:00Z`);
+  if (!Number.isFinite(expMs)) return Number.NEGATIVE_INFINITY;
+  return Math.floor((expMs - now) / 86_400_000);
+}
+
+/**
  * TRA-800 — the structures the replay engine can model. The two single-leg
  * scanner sources (`otm_mispricing` / `relative_value`) are managed per-tick by
  * {@link OptionsReplayAccount.markAndCheckExits}; the two defined-risk
@@ -43,11 +88,27 @@ const CONTRACT_MULTIPLIER = 100;
 export type ReplaySignalType =
   | 'otm_mispricing'
   | 'relative_value'
-  | 'put_write'
-  | 'call_debit_spread';
+  | ReplaySpreadStrategy;
 
-/** TRA-800 — the two defined-risk structure ids (a strict subset of {@link ReplaySignalType}). */
-export type ReplaySpreadStrategy = 'put_write' | 'call_debit_spread';
+/**
+ * The defined-risk structure ids the replay can enter as a combo (a strict
+ * subset of {@link ReplaySignalType}).
+ *
+ *   • TRA-800 — `put_write` / `call_debit_spread` (the OTM/RV scanner-fed
+ *     structures, held to expiry).
+ *   • TRA-918 (TRA-908 Phase D) — the four TRA-911 Phase-A signal structures
+ *     (`bull_put_spread`, `bear_call_spread`, `iron_condor`, `debit_spread`),
+ *     entered from a `ShadowOptionSignal` and managed mid-life by
+ *     {@link OptionsReplayAccount.markAndManageSpreads} (50%-profit take, credit
+ *     stop, 21-DTE time stop) rather than held to expiry.
+ */
+export type ReplaySpreadStrategy =
+  | 'put_write'
+  | 'call_debit_spread'
+  | 'bull_put_spread'
+  | 'bear_call_spread'
+  | 'iron_condor'
+  | 'debit_spread';
 
 export interface ReplayPosition {
   id: string;
@@ -80,7 +141,10 @@ export interface ReplayPosition {
     | 'trailing'
     | 'expired'
     | 'forced_close'
-    | 'settled';
+    | 'settled'
+    // TRA-918 — Phase-D mid-life spread management exits.
+    | 'take_profit'
+    | 'time_stop';
   // ── TRA-800 — defined-risk combo payload (only set when `signalType` is a
   //    spread). Per-1-lot figures so {@link settleSpreads} can compute the
   //    payoff then scale by `contracts`; mirrors the live combo's `legs` /
@@ -99,6 +163,13 @@ export interface ReplayPosition {
   breakevens?: number[];
   /** Structure id, e.g. `put_write` / `call_debit_spread`. */
   spreadStrategy?: ReplaySpreadStrategy;
+  /**
+   * TRA-918 — total modeled slippage + commission charged at entry for this
+   * position (dollars, across all lots). Recorded so the report can publish a
+   * modeled-slippage figure against which forward paper `slippageRatio` is
+   * computed once real paper data exists.
+   */
+  modeledSlippage?: number;
 }
 
 export interface OpenOtmCandidate {
@@ -145,6 +216,11 @@ export interface OpenSpreadCandidate {
   spot: number;
   /** Stamped onto the position so the report can hit-rate by it. */
   classification: string;
+  /**
+   * TRA-918 — modeled slippage + commission charged at entry, USD per 1-lot.
+   * Scaled by `contracts` and recorded on the opened {@link ReplayPosition}.
+   */
+  modeledSlippageUsd?: number;
 }
 
 /** TRA-800 — per-structure sizing knob (fraction of managed equity reserved per lot). */
@@ -158,9 +234,18 @@ export interface OptionsReplayAccountConfig {
   optionsDailyTradesLimit: number;
   otmRiskParams: OtmRiskParams;
   rvRiskParams: RvRiskParams;
-  /** TRA-800 — per-structure budget ratios for the defined-risk combos. */
-  spreadRiskParams: Record<ReplaySpreadStrategy, SpreadRiskParams>;
+  /**
+   * Per-structure budget ratios for the defined-risk combos. Partial: a
+   * structure absent from the map falls back to {@link DEFAULT_SPREAD_BUDGET_RATIO}
+   * in {@link OptionsReplayAccount.openSpread} (TRA-918 — the four Phase-A
+   * structures are optional so a TRA-800-era config with only the two original
+   * structures still type-checks).
+   */
+  spreadRiskParams: Partial<Record<ReplaySpreadStrategy, SpreadRiskParams>>;
 }
+
+/** Fallback per-lot budget ratio when a structure is absent from `spreadRiskParams`. */
+export const DEFAULT_SPREAD_BUDGET_RATIO = 0.02;
 
 /** TRA-800 — single-contract intrinsic value at `spot`, per share. */
 function intrinsic(optionType: OptionType, strike: number, spot: number): number {
@@ -400,7 +485,8 @@ export class OptionsReplayAccount {
     const comboSymbol = this.comboSymbolFor(c.symbol, c.strategy, c.legs);
     if (this.hasOpenForSymbol(comboSymbol)) return { reason: 'duplicate', position: null };
 
-    const budget = this.equity * this.cfg.managedAccountRatio * this.cfg.spreadRiskParams[c.strategy].budgetRatio;
+    const budgetRatio = this.cfg.spreadRiskParams[c.strategy]?.budgetRatio ?? DEFAULT_SPREAD_BUDGET_RATIO;
+    const budget = this.equity * this.cfg.managedAccountRatio * budgetRatio;
     let contracts = Math.floor(budget / maxLossPerLot);
     if (contracts < 1 && maxLossPerLot <= this.cash) contracts = 1;
     if (contracts < 1) return { reason: 'zero_size', position: null };
@@ -452,9 +538,106 @@ export class OptionsReplayAccount {
       maxProfitPerLot: c.maxProfitUsd,
       breakevens: c.breakevens,
       spreadStrategy: c.strategy,
+      modeledSlippage: (c.modeledSlippageUsd ?? 0) * contracts,
     };
     this.open.set(position.id, position);
     return { reason: 'opened', position };
+  }
+
+  /**
+   * TRA-918 (TRA-908 Phase D, plan §1.6) — mid-life management for the Phase-A
+   * signal structures. The two TRA-800 structures are held to expiry via
+   * {@link settleSpreads}; the four Phase-A structures are instead marked to the
+   * day's chain mids and closed early, in priority order, on:
+   *
+   *   1. **Take profit** — unrealized P&L ≥ `takeProfitFraction` × max profit
+   *      (credit structures: bought back at ≤ (1−f)× entry credit; debit: mark
+   *      ≥ entry debit + f×(width−debit)). The dominant, plan-required exit.
+   *   2. **Stop** — credit structures at a `creditStopMultiple`×-credit spread
+   *      mark (default 2× → a full-credit loss); debit structures at
+   *      `debitStopLossFraction` of the debit lost (default 50%).
+   *   3. **Time stop** — at/under `timeStopDte` (default 21) calendar DTE, close
+   *      at the current mark (NO roll in backtest) — mirrors the selector's
+   *      `minShortDte` floor.
+   *
+   * `legMid` resolves a per-share mid for one structure leg from the current
+   * day's chain (null when unpriceable). When a structure can't be priced this
+   * tick only the time stop can fire (booked at its capped max loss — the
+   * conservative defined-risk floor). Single-leg scanner positions and the two
+   * TRA-800 hold-to-expiry combos are untouched.
+   */
+  markAndManageSpreads(
+    day: string,
+    nowMs: number,
+    legMid: (symbol: string, leg: OptionLeg) => number | null,
+    params: SpreadManagementParams = DEFAULT_SPREAD_MANAGEMENT,
+  ): void {
+    for (const [id, opt] of this.open) {
+      if (!opt.isCombo || !opt.legs) continue;
+      if (!MANAGED_SPREAD_STRATEGIES.has(opt.spreadStrategy as ReplaySpreadStrategy)) continue;
+
+      const netUsdPerLot = opt.netUsdPerLot ?? 0;
+      const maxProfitPerLot = opt.maxProfitPerLot ?? 0;
+      const maxLossPerLot = opt.maxLossPerLot ?? opt.premiumPaid * CONTRACT_MULTIPLIER;
+      const isCredit = netUsdPerLot > 0;
+
+      // Per-share liquidation value: sell longs (+mid), buy back shorts (−mid).
+      let closeValuePerShare = 0;
+      let priced = true;
+      for (const leg of opt.legs) {
+        const m = legMid(opt.symbol, leg);
+        if (m == null || !Number.isFinite(m) || m < 0) {
+          priced = false;
+          break;
+        }
+        closeValuePerShare += leg.action === 'buy' ? m : -m;
+      }
+
+      if (priced) {
+        const rawPnl = netUsdPerLot + closeValuePerShare * CONTRACT_MULTIPLIER;
+        const pnlPerLot = Math.min(maxProfitPerLot, Math.max(-maxLossPerLot, rawPnl));
+
+        // 1. Take profit — ≥ f × max profit.
+        if (maxProfitPerLot > 0 && pnlPerLot >= params.takeProfitFraction * maxProfitPerLot) {
+          this.closeComboAtPnl(id, pnlPerLot, day, 'take_profit');
+          continue;
+        }
+
+        // 2. Stop.
+        if (isCredit) {
+          const costToClose = -closeValuePerShare * CONTRACT_MULTIPLIER; // M (≥0) for a credit spread
+          if (costToClose >= params.creditStopMultiple * netUsdPerLot) {
+            this.closeComboAtPnl(id, pnlPerLot, day, 'stop_loss');
+            continue;
+          }
+        } else if (-pnlPerLot >= params.debitStopLossFraction * maxLossPerLot) {
+          this.closeComboAtPnl(id, pnlPerLot, day, 'stop_loss');
+          continue;
+        }
+      }
+
+      // 3. Time stop at/under the DTE floor.
+      if (comboDteDays(opt.expiration, nowMs) <= params.timeStopDte) {
+        const pnlPerLot = priced
+          ? Math.min(maxProfitPerLot, Math.max(-maxLossPerLot, netUsdPerLot + closeValuePerShare * CONTRACT_MULTIPLIER))
+          : -maxLossPerLot;
+        this.closeComboAtPnl(id, pnlPerLot, day, 'time_stop');
+      }
+    }
+  }
+
+  /** Close a managed combo booking exactly `pnlPerLot × contracts` (see {@link settleSpreads}). */
+  private closeComboAtPnl(
+    id: string,
+    pnlPerLot: number,
+    day: string,
+    reason: NonNullable<ReplayPosition['exitReason']>,
+  ): void {
+    const opt = this.open.get(id);
+    if (!opt) return;
+    const maxLossPerLot = opt.maxLossPerLot ?? opt.premiumPaid * CONTRACT_MULTIPLIER;
+    const exitPremium = (maxLossPerLot + pnlPerLot) / CONTRACT_MULTIPLIER;
+    this.closePosition(id, exitPremium, day, reason);
   }
 
   /**

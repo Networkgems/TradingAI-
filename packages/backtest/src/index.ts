@@ -129,8 +129,49 @@ export {
   replayBucket,
   runOptionsReplay,
   DEFAULT_REPLAY_CONFIG,
+  DEFAULT_SPREAD_RISK_PARAMS,
 } from './run-options-replay.js';
 export type { ReplayConfig } from './run-options-replay.js';
+// TRA-918 (TRA-908 Phase D) — Phase-A signal-driven backtest + gate-consumable report.
+export {
+  modelSignalStructure,
+  DEFAULT_SIGNAL_FILL,
+} from './options-replay-structures.js';
+export type { SignalFillParams } from './options-replay-structures.js';
+export {
+  DEFAULT_SPREAD_MANAGEMENT,
+} from './options-replay-account.js';
+export type {
+  ReplaySpreadStrategy,
+  SpreadRiskParams,
+  SpreadManagementParams,
+  OpenSpreadCandidate,
+} from './options-replay-account.js';
+export {
+  replayPhaseABucket,
+  buildSelectorInput,
+  buildPhaseAGateReport,
+  buildPhaseAMarkdown,
+  validateGateReportShape,
+  computeBacktestGateMetrics,
+  emptyPaperGateMetrics,
+  portfolioGreeksForDay,
+  summarizeGreeks,
+  trendLabel,
+  atrProxy,
+  highConvictionBreakout,
+  defaultPhaseAConfig,
+  DEFAULT_PHASEA_FEATURES,
+} from './options-replay-phasea.js';
+export type {
+  PhaseAReplayConfig,
+  PhaseABucketResult,
+  PhaseAGateReport,
+  PhaseAFeatureParams,
+  PortfolioGreeksSample,
+  GreeksSummary,
+  ReplayMode,
+} from './options-replay-phasea.js';
 // TRA-546 (TRA-529 P3) — advisory multi-agent validation harness: point-in-time
 // replay (as-of clock, no look-ahead) → scoring → calibration + net-of-cost
 // edge. Drives the P1 stub graph; NO LLM spend.
