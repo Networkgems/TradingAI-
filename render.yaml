@@ -128,6 +128,27 @@ services:
       # actually want to route real orders.
       - key: TRADIER_ENV
         sync: false
+      # TRA-928 / TRA-911 (TRA-908 Phase A) — turn the OPTIONS shadow selector ON.
+      # Until this is set, `isOptionShadowEnabled()` is false, the per-tick option-
+      # structure pass in `signal-engine.ts` (gated at L1780) never runs, and
+      # `GET /api/health/option-shadow-signals` reports `flagEnabled:false, count:0`
+      # — i.e. the agents that pick call/put spreads emit NOTHING and the
+      # live-capital gate accrues zero evidence (sample_size:0). This is the lever
+      # the board's "nothing firing on options" report traces to.
+      #
+      # SAFETY — Phase A is observe-only: the pass APPENDS well-formed shadow
+      # signals to an append-only JSONL ledger and NEVER routes an order or commits
+      # capital (`option-shadow-ledger.ts` L19-22). It is gated to market hours and
+      # rides the RV scanner's warm chain cache (no extra Tradier budget). Turning
+      # it off again is just clearing this value.
+      #
+      # NOTE — necessary but not alone sufficient for visible call/put ideas:
+      #   • the RV scanner must exist (needs the TRADIER_* prod creds above), else
+      #     the shadow pass early-returns (`signal-engine.ts` L2968);
+      #   • the AI options-ideas feed stays in non-live preview until
+      #     ANTHROPIC_API_KEY (above) is set in the dashboard.
+      - key: ENABLE_OPTION_SHADOW_SELECTOR
+        value: "true"
       # TRA-713 — persistent live-equity boot-arm (board-ratified approval
       # 979c77c1). FIX for "prod equity Live reverts to demo on restart": the
       # original arm lived only in the running engine's in-memory `mode`, so every
