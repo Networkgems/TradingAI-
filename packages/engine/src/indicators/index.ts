@@ -1,8 +1,8 @@
 export { rsi, rsiDivergence } from './rsi.js';
 export { VwapTracker } from './vwap.js';
 export type { VwapState } from './vwap.js';
-export { detectPattern, isBullishPattern, isBearishPattern } from './patterns.js';
-export type { CandlePattern } from './patterns.js';
+export { detectPattern, detectMultiBarPattern, isBullishPattern, isBearishPattern } from './patterns.js';
+export type { CandlePattern, MultiBarPatternOptions } from './patterns.js';
 export { macd, macdCross } from './macd.js';
 export type { MacdResult } from './macd.js';
 export { bollinger, bollingerZone } from './bollinger.js';

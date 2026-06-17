@@ -128,7 +128,9 @@ describe('reversalChecklist', () => {
     expect(r.atKeyLevel).toBe(true);
     expect(r.unhealthyMove).toBe(true);
     expect(r.trendBreak).toBe(true);
-    expect(r.pattern).toBe('bullish_engulfing');
+    // Multi-bar swing-failure fires first: bar undercuts the prior 90 swing low
+    // but closes back above it — stronger signal than single-bar engulfing.
+    expect(r.pattern).toBe('swing_failure');
     expect(r.confirmed).toBe(true);
     expect(r.score).toBe(4);
     // Bracket sanity: long entry above the reclaim, stop below the zone, positive R:R.

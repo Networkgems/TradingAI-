@@ -1,6 +1,6 @@
 import type { Candle } from '@trading-app/shared';
 import { atr } from './atr.js';
-import { detectPattern, isBullishPattern, isBearishPattern } from './patterns.js';
+import { detectPattern, detectMultiBarPattern, isBullishPattern, isBearishPattern } from './patterns.js';
 import type { CandlePattern } from './patterns.js';
 
 /**
@@ -260,12 +260,18 @@ export function reversalChecklist(
   const trendBreak =
     side === 'long' ? last.close > prev.high : last.close < prev.low;
 
-  // Reversal candlestick in the trade direction.
-  const raw = detectPattern(candles);
-  const pattern =
+  // Reversal pattern in the trade direction: try multi-bar (H&S, double top/bottom,
+  // swing-failure) first, fall back to single-bar candlestick patterns.
+  const swings = findSwings(candles, opts.lookback ?? DEFAULT_LOOKBACK);
+  const multiBar = detectMultiBarPattern(candles, swings, side, {
+    clusterPct: opts.clusterPct,
+  });
+  const singleBar = detectPattern(candles);
+  const directedSingle =
     side === 'long'
-      ? isBullishPattern(raw) ? raw : null
-      : isBearishPattern(raw) ? raw : null;
+      ? isBullishPattern(singleBar) ? singleBar : null
+      : isBearishPattern(singleBar) ? singleBar : null;
+  const pattern = multiBar ?? directedSingle;
 
   const score =
     (atKeyLevel ? 1 : 0) +
