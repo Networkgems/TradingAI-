@@ -63,7 +63,7 @@ export function PendingProposalsPanel({ token, accountMode }: { token: string; a
     return () => clearInterval(id);
   }, [load]);
 
-  const proposals = data?.proposals ?? [];
+  const proposals = useMemo(() => data?.proposals ?? [], [data]);
   const caps = data?.caps;
   const killSwitchEngaged = data?.killSwitchEngaged ?? false;
   const agentsOff = !(data?.tradingAgentsEnabled ?? false);
