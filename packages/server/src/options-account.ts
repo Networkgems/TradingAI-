@@ -570,12 +570,17 @@ export class PaperOptionsAccount {
    * realized P&L forward forever.
    *
    * Pure read — does not mutate `currentDayKey` / `openingOptionsPnlByMode`.
-   * The opening baseline only rolls forward when an entry path fires
-   * {@link resetDayIfNeeded}; on a day-crossed read with no new entries we
-   * still want the pill to display 0 (today started at the prior cumulative),
-   * so we short-circuit the realized delta to 0 when the stored day key is
-   * stale. The unrealized MTM term keeps tracking live mark drift either
-   * way — that's the part the user notices first after midnight.
+   * The opening baseline rolls forward when ANY realized-P&L path fires
+   * {@link resetDayIfNeeded} — every entry path AND, since TRA-949, every
+   * close/exit path ({@link checkExits}, {@link closeOption},
+   * {@link finalizePendingExit}, {@link recordImportedFill},
+   * {@link bookPartialClose}). So whenever today has booked realized P&L the
+   * stored day key already equals today and the delta below is accurate. A
+   * stale day key therefore means NOTHING realized today (no entry, no close),
+   * in which case the realized delta is genuinely 0 and we short-circuit to 0
+   * (today started at the prior cumulative). The unrealized MTM term keeps
+   * tracking live mark drift either way — that's the part the user notices
+   * first after midnight.
    */
   private dailyOptionsPnlForMode(mode: AccountMode): number {
     const today = toDateKey(Date.now());
@@ -636,6 +641,36 @@ export class PaperOptionsAccount {
       demoSlippageCost: mode === 'demo' ? this.demoSlippageCost : 0,
       demoFeeCost: mode === 'demo' ? this.demoFeeCost : 0,
     };
+  }
+
+  /**
+   * TRA-949 — per-mode option market-value breakdown for the Account Summary
+   * card. In demo/paper mode the live Tradier broker balance is never fetched,
+   * so the card's Long/Short Option Value tiles sourced from it rendered '—'.
+   * Derive them instead from the paper book's OPEN options for `mode`:
+   *   • `longValue`  — Σ `currentPremium × contractsRemaining × 100` over the
+   *     long single-leg positions and defined-risk combos (held long; their
+   *     capital-at-risk is reserved at entry). This mirrors the per-row market
+   *     value the Options panel renders so the card and the panel agree.
+   *   • `shortValue` — net-short single-leg positions. The demo book is
+   *     long-only today (RV / OTM long calls/puts + defined-risk debit combos),
+   *     so this is 0; the field is kept for live parity / future short
+   *     structures.
+   * Positions without a fresh mark (`currentPremium ≤ 0`) contribute 0 —
+   * matches the panel's "no mark, no value" rendering rather than synthesising
+   * value from stale data. Pure read — no mutation of account state.
+   */
+  getOptionMarketValueForMode(mode: AccountMode): { longValue: number; shortValue: number } {
+    let longValue = 0;
+    const shortValue = 0;
+    for (const opt of this.openOptions.values()) {
+      if ((opt.mode ?? 'demo') !== mode) continue;
+      const remaining = opt.contractsRemaining ?? opt.contracts;
+      if (!Number.isFinite(remaining) || remaining <= 0) continue;
+      if (!Number.isFinite(opt.currentPremium) || opt.currentPremium <= 0) continue;
+      longValue += opt.currentPremium * remaining * 100;
+    }
+    return { longValue, shortValue };
   }
 
   /**
@@ -1329,6 +1364,15 @@ export class PaperOptionsAccount {
   ): OptionPosition[] {
     const closed: OptionPosition[] = [];
     const waitAndHold = options.waitAndHold === true;
+    // TRA-949 — roll the ET-day before any auto-exit books realized P&L. The
+    // opening baseline (openingOptionsPnlByMode) previously only advanced on an
+    // ENTRY path; a day whose only options activity is a CLOSE (the demo
+    // always-on auto-trade exiting a prior-day position with Trading Agents off)
+    // left `currentDayKey` stale, so `dailyOptionsPnlForMode` short-circuited
+    // today's realized close to $0 even though "Closed Today" showed the loss.
+    // Snapshotting here captures the prior cumulative as today's baseline before
+    // the close lands, so the daily pill reconciles with the Closed-Today total.
+    this.resetDayIfNeeded();
 
     for (const [id, opt] of this.openOptions) {
       if (mode !== undefined && (opt.mode ?? 'demo') !== mode) continue;
@@ -1663,6 +1707,9 @@ export class PaperOptionsAccount {
   ): OptionPosition | null {
     const opt = this.openOptions.get(optionId);
     if (!opt || !opt.pendingExit) return null;
+    // TRA-949 — roll the ET-day before booking this fill's realized P&L so the
+    // daily opening baseline reflects today's start even on a close-only day.
+    this.resetDayIfNeeded();
     // TRA-450 — a fill is a successful close: reset the rejection counter so
     // a future exit on the remainder (TP1 / manual partial) starts fresh and
     // the circuit breaker only ever counts *consecutive* failures.
@@ -2023,6 +2070,9 @@ export class PaperOptionsAccount {
     const opt = this.openOptions.get(optionId);
     if (!opt) return null;
     if (!opt.importedFromTradier) return null;
+    // TRA-949 — roll the ET-day before booking this fill's realized P&L so the
+    // daily opening baseline reflects today's start even on a close-only day.
+    this.resetDayIfNeeded();
     const remainingContracts = opt.contractsRemaining;
     const pnl = (avgFillPrice - opt.premiumPaid) * remainingContracts * 100;
     opt.pnl = (opt.pnl ?? 0) + pnl;
@@ -2085,6 +2135,9 @@ export class PaperOptionsAccount {
     // `exec_quantity` at / above the remainder is treated as a full close.
     const slice = Math.min(Math.floor(filledQty), opt.contractsRemaining);
     if (slice <= 0) return null;
+    // TRA-949 — roll the ET-day before booking this slice's realized P&L so the
+    // daily opening baseline reflects today's start even on a close-only day.
+    this.resetDayIfNeeded();
 
     const pnl = (avgFillPrice - opt.premiumPaid) * slice * 100;
     if (!opt.importedFromTradier) {
@@ -2262,6 +2315,10 @@ export class PaperOptionsAccount {
     // `dropImportedPosition` after submitting a real `sell_to_close`
     // order to Tradier; refusing here is a defensive guard.
     if (opt.importedFromTradier) return null;
+    // TRA-949 — see `checkExits`: roll the ET-day before this manual close books
+    // realized P&L so today's opening baseline is captured first and the daily
+    // pill reconciles with the Closed-Today total on a close-only day.
+    this.resetDayIfNeeded();
     // TRA-352 — engine-opened live closes pass the broker's actual avg fill
     // price (from `waitForOrderTerminalStatus`) so the paper cash credit
     // matches what Tradier actually deposited. Without the override we'd

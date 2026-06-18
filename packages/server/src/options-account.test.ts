@@ -1028,6 +1028,65 @@ describe('PaperOptionsAccount.getStateForMode — per-mode P&L (TRA-246)', () =>
       // is 0, and realized hasn't moved since the roll — daily pill = 0.
       expect(b.getStateForMode('live').dailyOptionsPnl).toBe(0);
     });
+
+    it('TRA-949 — a close on a day with NO entries surfaces in the daily pill (demo auto-trade, agents off)', () => {
+      const acct = new PaperOptionsAccount({ initialEquity: 50_000, managedAccountRatio: 0.5 });
+      // Open a demo position on day one.
+      const pos = acct.openOptionFromCandidate(buildSignal({ mark: 1.0 }), 'demo');
+      expect(pos).not.toBeNull();
+
+      // Advance to the next ET day. NO new entry happens today (Daily Trades
+      // stays 0/N), so only an entry path would previously have rolled the day.
+      vi.setSystemTime(TRADING_TIME + 24 * 60 * 60 * 1000);
+
+      // The demo always-on auto-trade exits the prior-day position today via
+      // checkExits (SL fill) — booking a realized loss with today's date.
+      const exited = acct.checkExits(new Map(), new Map([[pos!.optionSymbol!, 0.60]]), 'demo');
+      expect(exited.length).toBe(1);
+
+      const demo = acct.getStateForMode('demo');
+      // Cumulative reflects the loss…
+      expect(demo.optionsPnl).toBeLessThan(0);
+      // …and so must today's daily pill: pre-TRA-949 the stale `currentDayKey`
+      // short-circuited the realized delta to $0 (the "DAILY OPTS P&L +$0.00
+      // while Closed Today shows −$40" defect). Now the close rolls the day
+      // first, so the pill reconciles with the Closed-Today total.
+      expect(demo.dailyOptionsPnl).toBeCloseTo(demo.optionsPnl, 5);
+      expect(demo.dailyOptionsPnl).toBeLessThan(0);
+    });
+  });
+
+  describe('PaperOptionsAccount — getOptionMarketValueForMode (TRA-949)', () => {
+    it('returns 0/0 on an empty book', () => {
+      const acct = new PaperOptionsAccount({ initialEquity: 50_000, managedAccountRatio: 0.5 });
+      expect(acct.getOptionMarketValueForMode('demo')).toEqual({ longValue: 0, shortValue: 0 });
+    });
+
+    it('sums long market value (currentPremium × contractsRemaining × 100) for the mode', () => {
+      const acct = new PaperOptionsAccount({ initialEquity: 50_000, managedAccountRatio: 0.5 });
+      const pos = acct.openOptionFromCandidate(buildSignal({ mark: 1.0 }), 'demo');
+      expect(pos).not.toBeNull();
+      // Mark the demo position up; the tile reflects the live mark, not entry.
+      acct.getStateForMode('demo').openOptions[0].currentPremium = 1.25;
+      const mv = acct.getOptionMarketValueForMode('demo');
+      const remaining = pos!.contractsRemaining;
+      expect(mv.longValue).toBeCloseTo(1.25 * remaining * 100, 5);
+      expect(mv.shortValue).toBe(0);
+    });
+
+    it('is mode-scoped — a live position does not leak into the demo breakdown', () => {
+      const acct = new PaperOptionsAccount({ initialEquity: 50_000, managedAccountRatio: 0.5 });
+      acct.openOptionFromCandidate(buildSignal({ mark: 1.0 }), 'live');
+      expect(acct.getOptionMarketValueForMode('demo').longValue).toBe(0);
+      expect(acct.getOptionMarketValueForMode('live').longValue).toBeGreaterThan(0);
+    });
+
+    it('a position without a fresh mark (currentPremium = 0) contributes 0 — no stale value', () => {
+      const acct = new PaperOptionsAccount({ initialEquity: 50_000, managedAccountRatio: 0.5 });
+      acct.openOptionFromCandidate(buildSignal({ mark: 1.0 }), 'demo');
+      acct.getStateForMode('demo').openOptions[0].currentPremium = 0;
+      expect(acct.getOptionMarketValueForMode('demo')).toEqual({ longValue: 0, shortValue: 0 });
+    });
   });
 
   it('round-trips per-mode P&L via export/import', () => {

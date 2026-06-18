@@ -248,6 +248,37 @@ describe('SignalEngine — Tradier live balance surfacing (TRA-226)', () => {
   });
 });
 
+describe('SignalEngine — demo Account Summary breakdown (TRA-949)', () => {
+  it('derives numeric stock/option value tiles in demo so the card reconciles instead of "—"', () => {
+    const engine = new SignalEngine({ ...DEFAULT_ACCOUNT_SETTINGS, mode: 'demo' });
+
+    // Flat book: the three breakdown tiles are numbers (0), not undefined, so
+    // the Account Summary card renders "$0.00" rather than "—" in demo/paper.
+    let state = engine.getState();
+    expect(state.account.stockLongValue).toBe(0);
+    expect(state.account.optionLongValue).toBe(0);
+    expect(state.account.optionShortValue).toBe(0);
+
+    // Open a demo long stock position straight on the paper book.
+    const acct = (engine as unknown as {
+      account: { openPosition: (s: TradeSignal, p: number) => unknown };
+    }).account;
+    const opened = acct.openPosition(
+      { id: 's1', symbol: 'AAPL', type: 'orb_breakout', side: 'buy', entryPrice: 100, stopLoss: 95, takeProfit: 110, riskRewardRatio: 2, timestamp: Date.now() },
+      100,
+    );
+    expect(opened).not.toBeNull();
+
+    state = engine.getState();
+    // Long Stock Value now reflects the capital held in the open position…
+    expect(state.account.stockLongValue!).toBeGreaterThan(0);
+    // …and reconciles exactly: Long Stock Value + Cash = Total Value (demo
+    // equity is cost-basis), which is the core Defect-1 acceptance.
+    expect(state.account.stockLongValue! + state.account.availableCash)
+      .toBeCloseTo(state.account.totalEquity, 6);
+  });
+});
+
 describe('SignalEngine — mode-scoped dashboard state (TRA-231)', () => {
   it('hides demo-mode options from the live dashboard view and vice versa', () => {
     const engine = new SignalEngine(

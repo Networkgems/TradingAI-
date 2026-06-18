@@ -5266,12 +5266,32 @@ export class SignalEngine {
         marketReview: this.buildMarketReviewState(),
       };
     }
+    // TRA-949 — demo/paper Account Summary breakdown. The live broker balance
+    // (the only source for stock/option market-value tiles) is never fetched in
+    // demo, so the card rendered '—' for ~$14k held in open stock positions.
+    // Derive the breakdown from the paper book so the tiles reconcile with
+    // TOTAL VALUE: Long Stock Value is the cost-basis capital held in open long
+    // equity positions — which is exactly `totalEquity − availableCash` for the
+    // demo PaperAccount (equity isn't marked to market; an open debits cash by
+    // cost and leaves equity unchanged), so Long Stock Value + Cash = Total
+    // Value. Option long/short value come from the demo options paper book.
+    const demoAccount = this.buildAccountState();
+    const stockLongValue = demoAccount.openPositions
+      .filter(p => p.side === 'buy')
+      .reduce((sum, p) => sum + p.entryPrice * p.quantity, 0);
+    const demoOptionMv = this.optionsAccount.getOptionMarketValueForMode('demo');
+    const demoAccountWithBreakdown: AccountState = {
+      ...demoAccount,
+      stockLongValue,
+      optionLongValue: demoOptionMv.longValue,
+      optionShortValue: demoOptionMv.shortValue,
+    };
     return {
       symbols,
       signals: scopedSignals,
       // TRA-787 — observe-only supertrend shadow channel (never routed).
       supertrendShadowSignals: this.supertrendShadowSignals,
-      account: this.buildAccountState(),
+      account: demoAccountWithBreakdown,
       closedPositions: this.allClosedPositions.filter(p => isMode(p.mode)).slice(-20),
       options: {
         ...this.optionsAccount.getStateForMode('demo'),
