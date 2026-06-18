@@ -114,6 +114,15 @@ export function resolveApexNotionalUsd(env: NodeJS.ProcessEnv = process.env): nu
   return Number.isFinite(n) && n > 0 ? n : undefined;
 }
 
+/**
+ * TRA-941 — true when the env kill switch (TRADING_AGENTS_LLM_DISABLED) is set.
+ * Piece 3 makes this gate EXECUTION too, not just LLM spend, so the engine reads
+ * it before placing any agent order. Independent of the per-user banner toggle.
+ */
+export function isTradingAgentsLlmDisabled(env: NodeJS.ProcessEnv = process.env): boolean {
+  return isTruthy(env[LLM_KILL_ENV_VAR]);
+}
+
 export interface AdviseOptions {
   /** Owning user for the per-user/day cap + aggregate attribution. */
   user: string | undefined;

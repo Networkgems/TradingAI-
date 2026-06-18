@@ -3111,6 +3111,140 @@ export function resolveTradingAgentsEnabled(s: AccountSettings): boolean {
   return s.tradingAgentsEnabled === true;
 }
 
+// ── TRA-941 (TRA-813 P2/3) — trade-proposal queue + execution wiring ─────────
+//
+// Pieces 2 + 3 of the board-approved TRA-813 plan. An APPROVE AgentRecommendation
+// no longer routes straight to capital (the old TRA-796 demo-first auto-route):
+// it becomes a *pending proposal* that an operator confirms (or that the demo
+// auto-confirm rule clears), and ONLY a confirmed proposal reaches the broker.
+// The threshold/cap numbers below are QuantTrader's ratified TRA-939 values.
+
+/** Lifecycle of one queued trade proposal. */
+export type ProposalStatus =
+  | 'pending' // awaiting confirmation (manual, or demo auto-confirm)
+  | 'approved' // confirmed; an order placement was attempted
+  | 'executed' // confirmed AND the broker/paper book accepted the order
+  | 'rejected' // operator rejected with a reason (audit trail)
+  | 'expired'; // aged past the store TTL before anyone acted
+
+/**
+ * A pending trade proposal derived from an APPROVE {@link AgentRecommendation}
+ * with a routable `proposedSignal`. This is the unit the desktop pending-
+ * proposals panel (TRA-940) renders and the operator confirms/rejects. `size`
+ * (share count) and `notional` (size × reference price, USD) are snapshotted at
+ * creation from the engine's risk sizing so the auto-confirm + daily-cap gates
+ * have a stable number to test against.
+ */
+export interface TradeProposal {
+  id: string;
+  /** Stable id of the source recommendation's proposedSignal (`agent-<sym>-<asOf>`). */
+  recommendationId: string;
+  symbol: string;
+  side: Side;
+  /** Planned share quantity at creation time. */
+  size: number;
+  /** size × reference price in USD at creation time. */
+  notional: number;
+  mode: AccountMode;
+  /** Source recommendation conviction on [0,1] (== AgentRecommendation.conviction). */
+  conviction: number;
+  verdict: RiskVerdictKind;
+  /** Short analyst note surfaced on the proposal card. */
+  note?: string;
+  createdAt: number;
+  status: ProposalStatus;
+  /** Operator's required reason when status === 'rejected' (TRA-940 §6). */
+  rejectionReason?: string;
+  /** When the proposal left `pending` (approved/rejected/executed/expired). */
+  resolvedAt?: number;
+}
+
+/**
+ * Immutable audit record for one agent-placed order (TRA-941 Piece 3). Emitted
+ * the moment a confirmed proposal's order is accepted, so every real-money (and
+ * paper) agent order is traceable back to its recommendation + proposal.
+ */
+export interface AgentOrderAudit {
+  agentId: string;
+  recommendationId: string;
+  proposalId: string;
+  symbol: string;
+  side: Side;
+  size: number;
+  notional: number;
+  mode: AccountMode;
+  /** Broker order id when live (Tradier/Coinbase); null for paper opens. */
+  orderId?: string | number | null;
+  timestamp: number;
+}
+
+// ── Ratified TRA-939 thresholds & caps (final v1 values) ─────────────────────
+
+/** Auto-confirm gate: minimum conviction (inclusive). */
+export const AUTO_CONFIRM_MIN_CONVICTION = 0.70;
+/** Auto-confirm gate: maximum per-order notional, USD (inclusive). */
+export const AUTO_CONFIRM_MAX_NOTIONAL_USD = 250;
+/** Daily execution cap — max LIVE agent orders per user per ET day. */
+export const LIVE_MAX_ORDERS_PER_DAY = 5;
+/** Daily execution cap — max LIVE agent notional per user per ET day, USD. */
+export const LIVE_MAX_NOTIONAL_PER_DAY_USD = 1_000;
+/** Per-order LIVE notional ceiling, USD (TRA-939 §B, NEW). */
+export const LIVE_MAX_NOTIONAL_PER_ORDER_USD = 250;
+/** Demo runaway ops-guard: soft cap on demo agent orders per user per ET day. */
+export const DEMO_RUNAWAY_SOFT_CAP_PER_DAY = 50;
+
+/** Inputs to the pure auto-confirm decision (all runtime state passed in). */
+export interface AutoConfirmInput {
+  mode: AccountMode;
+  /** AgentRecommendation.conviction on [0,1]. */
+  conviction: number;
+  /** Snapshotted proposal notional in USD. */
+  notional: number;
+  /** Per-mode auto-trade toggle is ON (setAutoTrading for that mode). */
+  autoTradeEnabled: boolean;
+  /** Kill switch is CLEAR: banner toggle not disabled AND env kill not set. */
+  killSwitchClear: boolean;
+}
+
+export interface AutoConfirmDecision {
+  autoConfirm: boolean;
+  /** Human-readable reason the proposal did / did not auto-confirm. */
+  reason: string;
+}
+
+/**
+ * TRA-939 Section A — decide whether a proposal auto-confirms. Pure + total so
+ * the threshold boundaries are unit-testable in isolation. Auto-confirm fires
+ * ONLY when ALL hold: demo mode (live NEVER auto-confirms in v1), conviction
+ * >= 0.70, notional <= $250, the per-mode auto-trade toggle is ON, and the kill
+ * switch is clear. Otherwise the proposal stays pending for manual confirmation
+ * (never silently dropped).
+ */
+export function shouldAutoConfirm(input: AutoConfirmInput): AutoConfirmDecision {
+  if (input.mode === 'live') {
+    return { autoConfirm: false, reason: 'live never auto-confirms in v1 (manual board-confirm only)' };
+  }
+  if (!input.killSwitchClear) {
+    return { autoConfirm: false, reason: 'kill switch engaged — execution gated to zero' };
+  }
+  if (!input.autoTradeEnabled) {
+    return { autoConfirm: false, reason: 'per-mode auto-trade toggle is OFF' };
+  }
+  if (!(input.conviction >= AUTO_CONFIRM_MIN_CONVICTION)) {
+    return {
+      autoConfirm: false,
+      reason: `conviction ${input.conviction.toFixed(2)} < ${AUTO_CONFIRM_MIN_CONVICTION} — queued for manual approval`,
+    };
+  }
+  if (!(input.notional <= AUTO_CONFIRM_MAX_NOTIONAL_USD)) {
+    return {
+      autoConfirm: false,
+      reason: `notional $${input.notional.toFixed(2)} > $${AUTO_CONFIRM_MAX_NOTIONAL_USD} — queued for manual approval`,
+    };
+  }
+  return { autoConfirm: true, reason: 'auto-confirmed: demo, conviction & notional within ratified gate' };
+}
+
 // --- Runtime schema validators (TRA-529 §3: "schema-validated, retried on
 // malformed output"). Hand-written guards — the repo carries no zod. Each
 // returns the field-paths that failed so the LLM-client retry loop can feed a

@@ -21,6 +21,7 @@ import { ProfileModals } from './components/dashboard/ProfileModals';
 import type { ProfileModal } from './components/dashboard/ProfileModals';
 import { StockWatchlistPanel } from './components/dashboard/StockWatchlistPanel';
 import { StockSignalsPanel } from './components/dashboard/StockSignalsPanel';
+import { PendingProposalsPanel } from './components/dashboard/PendingProposalsPanel';
 import { StockPositionsPanel } from './components/dashboard/StockPositionsPanel';
 import { StockOptionsPanel } from './components/dashboard/StockOptionsPanel';
 import { AiOptionsIdeasPanel } from './components/dashboard/AiOptionsIdeasPanel';
@@ -32,7 +33,7 @@ import { DashboardTour } from './components/onboarding/CoachMarkTour';
 import { useStockEngine } from './hooks/useStockEngine';
 
 // TRA-600 — 'ideas' is the new "AI Options Ideas" surface (Phase 3 of TRA-595).
-type StockTab = 'watchlist' | 'signals' | 'positions' | 'options' | 'ideas' | 'news' | 'calendar' | 'health';
+type StockTab = 'watchlist' | 'signals' | 'proposals' | 'positions' | 'options' | 'ideas' | 'news' | 'calendar' | 'health';
 
 export default function Dashboard({ token, onLogout, onGoHome, onActivity, theme, onToggleTheme }: { token: string; onLogout: () => void; onGoHome: () => void; onActivity?: () => void; theme: Theme; onToggleTheme: () => void }) {
   const [tab, setTab] = useState<StockTab>('watchlist');
@@ -154,6 +155,7 @@ export default function Dashboard({ token, onLogout, onGoHome, onActivity, theme
           // TRA-569 — Signals/Positions coach-mark anchors point at their tabs.
           { id: 'watchlist', label: `Watchlist (${symbols.length})` },
           { id: 'signals', label: `Signals (${signals.length})`, dataTour: 'signals' },
+          { id: 'proposals', label: 'Proposals' },
           { id: 'positions', label: `Positions (${openPositions.length})`, dataTour: 'positions' },
           { id: 'options', label: `Options (${openOptions.length})` },
           // TRA-600 — event-aware "AI Options Ideas" surface (Phase 3 of TRA-595).
@@ -184,6 +186,10 @@ export default function Dashboard({ token, onLogout, onGoHome, onActivity, theme
 
         {state && tab === 'signals' && (
           <StockSignalsPanel token={token} signals={signals} symbols={symbols} marketReview={state.marketReview} />
+        )}
+
+        {state && tab === 'proposals' && (
+          <PendingProposalsPanel token={token} accountMode={accountMode} />
         )}
 
         {state && tab === 'positions' && (

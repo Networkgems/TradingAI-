@@ -90,6 +90,7 @@ import {
 } from './anthropic-cred-store.js';
 import { optionsSpendStatus } from './options-spend-store.js';
 import { agentSpendAggregate } from './agent-spend-store.js';
+import { executionCapStatus } from './agent-execution-caps-store.js';
 import { initIvRankStore } from './iv-rank-store.js';
 import { initIdeaJournal, listJournalEntries } from './options-idea-journal.js';
 import { initShadowLedger, listShadowSignals } from './shadow-signal-ledger.js';
@@ -4375,6 +4376,47 @@ app.post('/api/trading/trading-agents/gating', requireAuth, async (req, res) => 
   await saveSettings(username, updated);
   broadcastEngineState(ctx);
   res.json({ ok: true, tradingAgentsGatingEnabled: enabled, tradingAgentsLiveGatingEnabled: liveEnabled });
+});
+
+// TRA-941 (TRA-813 P2) — pending-proposals queue. The desktop panel (TRA-940)
+// reads the queue + the live daily-cap usage from here, and confirms/rejects per
+// proposal. Only a confirmed proposal routes to capital (Piece 3); rejection
+// captures a required reason for the audit trail.
+app.get('/api/proposals', requireAuth, async (_req, res) => {
+  const username = res.locals['authUser'] as string;
+  const ctx = await userCtx(res);
+  res.json({
+    proposals: ctx.engine.getPendingProposals(),
+    caps: executionCapStatus(username),
+    killSwitchEngaged: ctx.engine.isKillSwitchEngaged(),
+    tradingAgentsEnabled: ctx.engine.isTradingAgentsEnabled(),
+  });
+});
+
+app.post('/api/proposals/:id/approve', requireAuth, async (req, res) => {
+  const ctx = await userCtx(res);
+  const { id } = req.params as Record<string, string>;
+  const proposal = ctx.engine.getPendingProposals().find(p => p.id === id);
+  // Resolve the current quote for the proposal's symbol so routing sizes/fills
+  // against a real price (mirrors the position-close route's price lookup).
+  let price: number | undefined;
+  if (proposal) {
+    const sym = ctx.engine.getState().symbols.find(s => s.symbol === proposal.symbol);
+    price = sym?.price;
+  }
+  const result = await ctx.engine.confirmProposalById(id, price);
+  broadcastEngineState(ctx);
+  res.status(result.ok ? 200 : 409).json(result);
+});
+
+app.post('/api/proposals/:id/reject', requireAuth, async (req, res) => {
+  const ctx = await userCtx(res);
+  const { id } = req.params as Record<string, string>;
+  const body = req.body as { reason?: unknown } | undefined;
+  const reason = typeof body?.reason === 'string' ? body.reason : '';
+  const result = ctx.engine.rejectProposalById(id, reason);
+  broadcastEngineState(ctx);
+  res.status(result.ok ? 200 : 400).json(result);
 });
 
 // TRA-230: clear the displayed signal list without resetting positions or equity.

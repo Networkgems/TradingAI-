@@ -2,14 +2,30 @@ import { OrbStrategy, BbFadeStrategy, IchimokuStrategy, SupertrendConfluenceStra
 import type { StrategySelectorInput, ContractQuote, OptionTrend } from '@trading-app/engine';
 import type { TradierAccountBalance } from '@trading-app/engine';
 import { WATCHLIST, MANAGED_ACCOUNT_RATIO, MAX_CONSECUTIVE_LOSSES, DAILY_DRAWDOWN_HALT_PCT, OPTIONS_PER_TICKET_DOLLAR_FLOOR, OPTIONS_POSITION_CAP_RATIO, aliasWatchlistSymbol, isLiveTradierOptionsEnabled, isStockMarketOpen, perPositionCap, resolveAutoManageImportedTradierOptions, resolveDemoCostModel, resolveHoldLiveOptionsOvernight, resolveLiveTradeEquitiesTradier, resolveManagedAccountRatio, resolveMarketReviewGatesEnabled, resolveRiskPerTrade, resolveRvDtePrefs, resolveTradierOptionsCreds, validateBracket, DEFAULT_RV_DTE_MIN, DEFAULT_RV_DTE_MAX, DEFAULT_RV_DTE_TARGET, scoreNewsSentiment, aggregateSymbolSentiment, aggregateFedSentiment, aggregateStockTwitsSentiment, dedupeStockTwitsMessages, mapCuratedMessagesBySymbol, nameAliasesFor } from '@trading-app/shared';
-import type { TradeSignal, RelativeValueSignal, Sma200Signal, Candle, OptionsAccountState, SignalType, Position, OptionPosition, AccountMode, AccountSettings, AccountState, NewsItem, SymbolSentiment, SocialSentiment, StockTwitsMessage, TechnicalSignalSnapshot, TradierEnv, MarketReview, MarketReviewGates, EngineMarketReviewState, GatedStrategyNote, AgentRecommendation } from '@trading-app/shared';
+import type { TradeSignal, RelativeValueSignal, Sma200Signal, Candle, OptionsAccountState, SignalType, Position, OptionPosition, AccountMode, AccountSettings, AccountState, NewsItem, SymbolSentiment, SocialSentiment, StockTwitsMessage, TechnicalSignalSnapshot, TradierEnv, MarketReview, MarketReviewGates, EngineMarketReviewState, GatedStrategyNote, AgentRecommendation, TradeProposal, AgentOrderAudit } from '@trading-app/shared';
+import { shouldAutoConfirm } from '@trading-app/shared';
 // TRA-544 (TRA-529 P1) / TRA-747 (P2) — advisory multi-agent layer. ON suspends
 // deterministic auto-routing and the engine surfaces the recommendations on the
 // WS state. P2 wires the REAL LlmClient-backed agents (Haiku analysts + Sonnet
 // trader/risk) behind the `adviseSymbol` seam, which enforces the $2/user/day cap
 // and both kill switches and accounts spend — advisor-only, no path to capital.
 import type { LlmClient } from '@trading-app/agents';
-import { adviseSymbol, resolveTradingAgentsLlm, buildNewsHeadlines } from './trading-agents-advisory.js';
+import { adviseSymbol, resolveTradingAgentsLlm, buildNewsHeadlines, isTradingAgentsLlmDisabled } from './trading-agents-advisory.js';
+// TRA-941 (TRA-813 P2/3) — the proposal queue + execution wiring. An APPROVE
+// recommendation becomes a pending proposal (proposal-store); only a CONFIRMED
+// proposal (manual, or the demo auto-confirm rule) routes to capital through the
+// execution gate (kill switches + per-mode toggle + ratified daily caps) with an
+// audit trail.
+import {
+  createProposal,
+  getProposal,
+  listProposals,
+  setProposalStatus,
+  expireStaleProposals,
+  isStale,
+} from './proposal-store.js';
+import { evaluateExecutionGate, buildOrderAudit, killSwitchClear } from './agent-execution.js';
+import { recordExecutedOrder } from './agent-execution-caps-store.js';
 import { getUserMemorySync, recordInteractionOutcome } from './user-trading-memory-store.js';
 import { getLatestMarketReview } from './market-review.js';
 import { earningsInDaysSync } from './earnings-store.js';
@@ -770,6 +786,13 @@ export class SignalEngine {
   // dedup in routeEquitySignal is the primary guard; this is belt-and-suspenders.
   private routedAgentSignalIds = new Set<string>();
   private latestAgentRecommendations: AgentRecommendation[] = [];
+  // TRA-941 (TRA-813 P3) — append-only audit trail of agent-placed orders, one
+  // entry per CONFIRMED proposal whose order was accepted. Bounded so a long-
+  // running process can't leak. Surfaced via getAgentOrderAudit() for the health
+  // probe / QA sign-off.
+  private agentOrderAudit: AgentOrderAudit[] = [];
+  /** Stable id for the multi-agent decision layer in the order audit trail. */
+  private readonly tradingAgentsAgentId = 'trading-agents';
   /**
    * TRA-747 (P2) — the resolved advisory LlmClient, or null to run the
    * deterministic zero-spend fallback (no Anthropic credential / env kill).
@@ -1829,13 +1852,14 @@ export class SignalEngine {
     // Advisor-only in P1 — the stub never routes orders (gating mode is P4).
     if (this.tradingAgentsEnabled && equityStrategiesActiveOnTick && !this.riskGovernor.isHalted()) {
       await this.runTradingAgentsAdvisory(activeSymbols);
-      // TRA-796 (TRA-529 P4) — gating mode. When the operator has additionally
-      // enabled gating, route each APPROVE recommendation's proposedSignal as a
-      // risk-checked order through the SAME path as the deterministic scan. No-op
-      // (advisor-only) when gating is off. Demo-first; live routing is separately
-      // gated. Already inside the halt/kill-switch guard above; routeAgentApprovals
-      // re-checks for defense-in-depth and direct unit-testing.
-      await this.routeAgentApprovals(prices);
+      // TRA-941 (TRA-813 P2/3) — proposal queue. Each APPROVE recommendation
+      // becomes a PENDING proposal (never an immediate order); the demo auto-
+      // confirm rule (conviction ≥ 0.70 AND notional ≤ $250 AND toggles on)
+      // confirms-and-routes eligible demo proposals, while everything else —
+      // and ALL live proposals — waits for a manual operator confirm via the
+      // pending-proposals panel. This replaces the TRA-796 blanket auto-route so
+      // a confirmed proposal is the ONLY thing that reaches capital.
+      await this.processAgentProposals(prices);
     } else if (this.latestAgentRecommendations.length > 0) {
       // Clear stale recommendations once the layer is switched back off.
       this.latestAgentRecommendations = [];
@@ -3686,6 +3710,232 @@ export class SignalEngine {
     if (this.routedAgentSignalIds.size > 5000) {
       this.routedAgentSignalIds = new Set([...this.routedAgentSignalIds].slice(-2000));
     }
+  }
+
+  // ── TRA-941 (TRA-813 P2/3) — proposal queue + execution wiring ────────────
+
+  /**
+   * TRA-941 — true when neither kill switch is engaged for THIS engine: the
+   * per-user "Trading Agents" banner toggle is ON and the env kill
+   * (TRADING_AGENTS_LLM_DISABLED) is not set. Kill switches gate EXECUTION, not
+   * just LLM spend (Piece 3), so this is read before any confirmed proposal can
+   * place an order.
+   */
+  private killSwitchClearForExecution(): boolean {
+    return killSwitchClear(this.tradingAgentsEnabled, isTradingAgentsLlmDisabled());
+  }
+
+  /**
+   * TRA-941 — snapshot the share count + USD notional a proposal would carry if
+   * routed now, using the SAME paper-account risk sizing the open path uses
+   * (sizeFromStop, capped at managed equity, trimmed by the active sizing
+   * multiplier). Live mode sizes off the cached Tradier balance at fill time;
+   * the paper estimate is a faithful upper bound for the auto-confirm + daily-cap
+   * gates (which only ever shrink it). Returns { size: 0 } when nothing routable.
+   */
+  private estimateSignalNotional(signal: TradeSignal, price: number | undefined): { size: number; notional: number } {
+    const ref = price ?? signal.entryPrice;
+    if (!Number.isFinite(ref) || ref <= 0) return { size: 0, notional: 0 };
+    let qty = this.account.sizeFromStop(signal.entryPrice, signal.stopLoss);
+    const maxQtyForEquity = Math.floor(this.account.managedEquity() / ref);
+    qty = Math.min(qty, Math.max(0, maxQtyForEquity));
+    const mult = this.activeSizingMultiplier();
+    if (Number.isFinite(mult) && mult > 0 && mult < 1) qty = Math.floor(qty * mult);
+    if (qty <= 0) return { size: 0, notional: 0 };
+    return { size: qty, notional: qty * ref };
+  }
+
+  /**
+   * TRA-941 (Piece 2) — turn each APPROVE recommendation into a PENDING proposal,
+   * then auto-confirm the eligible demo ones (TRA-939 §A). Live proposals never
+   * auto-confirm in v1 — they sit pending for a manual board confirm. Idempotent
+   * per recommendation (the store dedupes an open proposal for the same
+   * recommendationId), so re-running across ticks does not duplicate the queue.
+   * Expires stale pending proposals first so a confirm can never act on one.
+   */
+  private async processAgentProposals(prices: Map<string, number>): Promise<void> {
+    const now = Date.now();
+    expireStaleProposals(now);
+    for (const reco of this.latestAgentRecommendations) {
+      if (reco.verdict !== 'APPROVE' || !reco.proposedSignal) continue;
+      const signal = reco.proposedSignal;
+      if (this.routedAgentSignalIds.has(signal.id)) continue;
+      const price = prices.get(signal.symbol);
+      const { size, notional } = this.estimateSignalNotional(signal, price);
+      if (size <= 0) continue; // nothing sizable to propose this tick; retry later
+      const proposal = createProposal({
+        user: this.alertUsername,
+        recommendationId: signal.id,
+        symbol: reco.symbol,
+        side: signal.side,
+        size,
+        notional,
+        mode: this.mode,
+        conviction: reco.conviction,
+        verdict: reco.verdict,
+        ...(reco.traderDecision?.thesis ? { note: reco.traderDecision.thesis } : {}),
+        createdAt: now,
+      });
+      if (proposal.status !== 'pending') continue;
+      // Auto-confirm eligible demo proposals (live never auto-confirms in v1).
+      const decision = shouldAutoConfirm({
+        mode: this.mode,
+        conviction: reco.conviction,
+        notional: proposal.notional,
+        autoTradeEnabled: this.isAutoTradingEnabled(),
+        killSwitchClear: this.killSwitchClearForExecution(),
+      });
+      if (decision.autoConfirm) {
+        await this.confirmProposalById(proposal.id, price);
+      }
+    }
+  }
+
+  /**
+   * TRA-941 (Piece 3) — confirm one pending proposal and route it to capital.
+   * This is the ONLY path from an agent recommendation to a real order. It runs
+   * the full execution gate (both kill switches, the per-mode auto-trade toggle,
+   * the live board+CTO gate, the halt circuit-breaker, and the ratified TRA-939
+   * daily caps) BEFORE touching the broker. On a successful open it records cap
+   * usage (only broker-accepted orders count), emits the audit-trail entry, and
+   * marks the proposal executed. On any gate failure the proposal stays PENDING
+   * with a reason (orders are never silently dropped); on a routing skip (no
+   * quote / dedup / risk gate) it also stays pending and is retryable.
+   */
+  async confirmProposalById(
+    id: string,
+    price: number | undefined,
+  ): Promise<{ ok: boolean; reason: string }> {
+    const now = Date.now();
+    const proposal = getProposal(id);
+    if (!proposal) return { ok: false, reason: `no proposal "${id}"` };
+    if (proposal.status !== 'pending') return { ok: false, reason: `proposal ${id} is ${proposal.status}` };
+    if (isStale(proposal, now)) {
+      setProposalStatus(id, 'expired', now);
+      return { ok: false, reason: `proposal ${id} is stale — re-request` };
+    }
+    if (proposal.mode !== this.mode) {
+      // The engine routes/sizes/caps against its active mode; refuse to confirm a
+      // proposal raised in the other mode rather than route it under the wrong one.
+      return { ok: false, reason: `switch to ${proposal.mode} mode to confirm this ${proposal.mode} proposal` };
+    }
+    const reco = this.latestAgentRecommendations.find(r => r.proposedSignal?.id === proposal.recommendationId);
+    const signal = reco?.proposedSignal;
+    if (!reco || !signal) {
+      // The source recommendation has aged out of the pending set — nothing to route.
+      return { ok: false, reason: `source recommendation for ${proposal.symbol} no longer pending — re-request` };
+    }
+    if (this.routedAgentSignalIds.has(signal.id)) {
+      return { ok: false, reason: `${proposal.symbol} already routed` };
+    }
+    // Execution gate — kill switches, per-mode toggle, live gate, halt, caps.
+    const gate = evaluateExecutionGate({
+      mode: this.mode,
+      bannerEnabled: this.tradingAgentsEnabled,
+      envKill: isTradingAgentsLlmDisabled(),
+      halted: this.riskGovernor.isHalted(),
+      autoTradeEnabled: this.isAutoTradingEnabled(),
+      liveGateCleared: this.tradingAgentsLiveGatingEnabled,
+      user: this.alertUsername,
+      notional: proposal.notional,
+      now,
+    });
+    if (!gate.allowed) {
+      signal.liveSkipReason = gate.reason;
+      return { ok: false, reason: gate.reason }; // proposal stays pending
+    }
+    // Claim the id synchronously before the await so a double-confirm can't both
+    // pass the dedup guard (TOCTOU on a capital path). Roll back on a non-open.
+    this.routedAgentSignalIds.add(signal.id);
+    let pos: Position | null;
+    try {
+      pos = await this.routeEquitySignal(signal, price, 'agent-gating');
+    } catch (err) {
+      this.routedAgentSignalIds.delete(signal.id);
+      throw err;
+    }
+    if (!pos) {
+      this.routedAgentSignalIds.delete(signal.id);
+      return { ok: false, reason: signal.signalSkipReason ?? signal.liveSkipReason ?? `${proposal.symbol} not opened (no quote / dedup / risk gate)` };
+    }
+    // Order accepted: count it against the daily caps (only accepted orders do),
+    // emit the audit-trail entry, mark the proposal executed, and drop the reco.
+    recordExecutedOrder({ user: this.alertUsername, mode: this.mode, notional: proposal.notional, now });
+    this.recordAgentOrderAudit({
+      recommendationId: proposal.recommendationId,
+      proposalId: proposal.id,
+      symbol: proposal.symbol,
+      side: proposal.side,
+      size: proposal.size,
+      notional: proposal.notional,
+      orderId: this.mode === 'live' ? (this.liveEquityOrderIds.get(pos.id) ?? null) : null,
+      now,
+    });
+    setProposalStatus(id, 'executed', now);
+    this.latestAgentRecommendations = this.latestAgentRecommendations.filter(r => r !== reco);
+    void this.recordAgentInteraction(reco, true);
+    return { ok: true, reason: `routed ${signal.side} ${proposal.symbol} (${this.mode})` };
+  }
+
+  /**
+   * TRA-941 (Piece 2) — operator REJECT of a pending proposal. Captures the
+   * required reason for the audit trail (TRA-940 §6), drops the source
+   * recommendation from the pending set, and tallies a vote against the strategy
+   * (TRA-850). The order path is never touched.
+   */
+  rejectProposalById(id: string, reason: string): { ok: boolean; reason: string } {
+    const now = Date.now();
+    const proposal = getProposal(id);
+    if (!proposal) return { ok: false, reason: `no proposal "${id}"` };
+    if (proposal.status !== 'pending') return { ok: false, reason: `proposal ${id} is ${proposal.status}` };
+    const trimmed = (reason ?? '').trim();
+    if (trimmed === '') return { ok: false, reason: 'a rejection reason is required' };
+    setProposalStatus(id, 'rejected', now, trimmed);
+    const reco = this.latestAgentRecommendations.find(r => r.proposedSignal?.id === proposal.recommendationId);
+    if (reco) {
+      this.latestAgentRecommendations = this.latestAgentRecommendations.filter(r => r !== reco);
+      void this.recordAgentInteraction(reco, false);
+    }
+    return { ok: true, reason: `rejected ${proposal.symbol}` };
+  }
+
+  /** TRA-941 — append one audit entry, bounded to the most recent 1,000. */
+  private recordAgentOrderAudit(args: {
+    recommendationId: string;
+    proposalId: string;
+    symbol: string;
+    side: TradeSignal['side'];
+    size: number;
+    notional: number;
+    orderId: string | number | null;
+    now: number;
+  }): void {
+    this.agentOrderAudit.push(
+      buildOrderAudit({
+        agentId: this.tradingAgentsAgentId,
+        recommendationId: args.recommendationId,
+        proposalId: args.proposalId,
+        symbol: args.symbol,
+        side: args.side,
+        size: args.size,
+        notional: args.notional,
+        mode: this.mode,
+        orderId: args.orderId,
+        now: args.now,
+      }),
+    );
+    if (this.agentOrderAudit.length > 1000) this.agentOrderAudit = this.agentOrderAudit.slice(-1000);
+  }
+
+  /** TRA-941 — pending proposals for this engine's owner + active mode (panel feed). */
+  getPendingProposals(): TradeProposal[] {
+    expireStaleProposals();
+    return listProposals({ user: this.alertUsername, status: 'pending' });
+  }
+
+  /** TRA-941 — the agent-placed-order audit trail (newest last). */
+  getAgentOrderAudit(): AgentOrderAudit[] {
+    return this.agentOrderAudit;
   }
 
   // ── TRA-563 (TRA-410 A1) alert hooks ──────────────────────────────────────
