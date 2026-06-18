@@ -29,9 +29,17 @@ interface ProposalsResponse {
   caps: CapStatus;
   killSwitchEngaged: boolean;
   tradingAgentsEnabled: boolean;
+  /** TRA-945 §2 — store TTL (ms); a proposal nearing it greys out (§6). Older
+   *  servers omit it, so the staleness treatment is feature-detected. */
+  proposalTtlMs?: number;
 }
 
 const POLL_MS = 5_000;
+
+// TRA-945 §2 — how long before the store TTL a pending proposal starts showing
+// the "about to expire" treatment. Capped at 20% of the TTL so a short test/env
+// TTL still has a pre-expiry window rather than flagging everything stale.
+const STALE_WARN_MS = 120_000; // 2 minutes
 
 function relAge(createdAt: number, now: number): string {
   const s = Math.max(0, Math.floor((now - createdAt) / 1000));
@@ -63,11 +71,19 @@ export function PendingProposalsPanel({ token, accountMode }: { token: string; a
     return () => clearInterval(id);
   }, [load]);
 
+  const [enablingAgents, setEnablingAgents] = useState(false);
+
   const proposals = useMemo(() => data?.proposals ?? [], [data]);
   const caps = data?.caps;
   const killSwitchEngaged = data?.killSwitchEngaged ?? false;
   const agentsOff = !(data?.tradingAgentsEnabled ?? false);
   const liveCapMaxed = caps ? (caps.live.orders >= caps.live.ordersCap || caps.live.notionalUsd >= caps.live.notionalCap) : false;
+  // TRA-945 §2 — a proposal within this window of the store TTL greys out with a
+  // disabled Approve + "stale — re-request" hint. Feature-detected: when the
+  // server doesn't report a TTL we keep the prior disappear-on-expiry behavior.
+  const staleWarnAfterMs = data?.proposalTtlMs != null
+    ? data.proposalTtlMs - Math.min(STALE_WARN_MS, data.proposalTtlMs * 0.2)
+    : undefined;
 
   const counts = useMemo(() => ({
     total: proposals.length,
@@ -120,6 +136,31 @@ export function PendingProposalsPanel({ token, accountMode }: { token: string; a
     }
   }
 
+  // TRA-945 §1 — empty-state-B CTA: re-enable agent trading without leaving the
+  // panel. Hits the same master-switch route the header TradingAgentsButton uses
+  // (POST /api/trading/trading-agents); on success a poll repopulates the queue.
+  async function enableAgents() {
+    setEnablingAgents(true);
+    try {
+      const r = await fetch(`${HTTP_URL}/api/trading/trading-agents`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${token}` },
+        body: JSON.stringify({ enabled: true }),
+      });
+      if (r.ok) {
+        toast.success('Trading Agents ON — agents will start queuing proposals');
+        void load();
+      } else {
+        toast.error(`Could not turn on agent trading (HTTP ${r.status})`);
+      }
+    } catch (err) {
+      logger.error('proposals', 'enable agents failed', err);
+      toast.error('Could not turn on agent trading — network error');
+    } finally {
+      setEnablingAgents(false);
+    }
+  }
+
   return (
     <div className="signals-panel" data-testid="pending-proposals-panel">
       {/* Header */}
@@ -157,6 +198,7 @@ export function PendingProposalsPanel({ token, accountMode }: { token: string; a
           tone="red"
           title="KILL SWITCH OFF"
           body="Agent trading is paused — it won't queue new proposals."
+          cta={{ label: 'Turn on agent trading', busy: enablingAgents, onClick: () => void enableAgents() }}
         />
       ) : proposals.length === 0 ? (
         <EmptyState
@@ -171,6 +213,7 @@ export function PendingProposalsPanel({ token, accountMode }: { token: string; a
               key={p.id}
               p={p}
               now={now}
+              staleWarnAfterMs={staleWarnAfterMs}
               busy={!!busy[p.id]}
               liveCapMaxed={liveCapMaxed}
               liveConfirmed={!!liveConfirmed[p.id]}
@@ -229,7 +272,12 @@ function ModeCell({ label, color, killOn, children }: {
   );
 }
 
-function EmptyState({ tone, title, body }: { tone: 'red' | 'neutral'; title: string; body: string }) {
+function EmptyState({ tone, title, body, cta }: {
+  tone: 'red' | 'neutral';
+  title: string;
+  body: string;
+  cta?: { label: string; busy: boolean; onClick: () => void };
+}) {
   return (
     <div style={{ textAlign: 'center', padding: '32px 12px', color: 'var(--text-dim)' }}>
       <div
@@ -243,15 +291,37 @@ function EmptyState({ tone, title, body }: { tone: 'red' | 'neutral'; title: str
         {title}
       </div>
       <p style={{ margin: 0 }}>{body}</p>
+      {cta && (
+        <button
+          type="button"
+          className="btn-link"
+          onClick={cta.onClick}
+          disabled={cta.busy}
+          style={{
+            marginTop: 10,
+            background: 'none',
+            border: 'none',
+            padding: 0,
+            color: 'var(--blue)',
+            font: 'inherit',
+            cursor: cta.busy ? 'default' : 'pointer',
+            textDecoration: 'underline',
+            opacity: cta.busy ? 0.6 : 1,
+          }}
+        >
+          {cta.busy ? 'Turning on…' : cta.label}
+        </button>
+      )}
     </div>
   );
 }
 
 function ProposalCard({
-  p, now, busy, liveCapMaxed, liveConfirmed, activeMode, onToggleLiveConfirm, onApprove, onReject,
+  p, now, staleWarnAfterMs, busy, liveCapMaxed, liveConfirmed, activeMode, onToggleLiveConfirm, onApprove, onReject,
 }: {
   p: TradeProposal;
   now: number;
+  staleWarnAfterMs: number | undefined;
   busy: boolean;
   liveCapMaxed: boolean;
   liveConfirmed: boolean;
@@ -263,16 +333,24 @@ function ProposalCard({
   const isLive = p.mode === 'live';
   const convPct = Math.round(p.conviction * 100);
   const convOk = p.conviction >= AUTO_CONFIRM_MIN_CONVICTION;
+  // TRA-945 §2 — near-TTL staleness: once a pending proposal ages into the warn
+  // window the server reported (proposalTtlMs), grey it out and disable Approve
+  // with a "stale — re-request" hint, rather than letting it silently vanish at
+  // the TTL. The server still drops it from the pending list once fully expired.
+  const nearStale = staleWarnAfterMs != null && now - p.createdAt >= staleWarnAfterMs;
   // Approve is blocked when the engine's active mode differs from the proposal's
-  // mode (the server refuses a cross-mode confirm), when busy, or — for live —
-  // until the checkbox is ticked and the daily cap has headroom.
+  // mode (the server refuses a cross-mode confirm), when busy, when near-stale,
+  // or — for live — until the checkbox is ticked and the daily cap has headroom.
   const wrongMode = p.mode !== activeMode;
-  const approveDisabled = busy || wrongMode || (isLive && (!liveConfirmed || liveCapMaxed));
+  const approveDisabled = busy || wrongMode || nearStale || (isLive && (!liveConfirmed || liveCapMaxed));
 
   return (
     <div
       className={`signal-card ${p.side === 'sell' ? 'sell' : 'buy'}`}
-      style={isLive ? { borderLeft: '3px solid var(--green)', boxShadow: '0 0 0 1px var(--red-soft)' } : { borderLeft: '3px solid var(--blue)' }}
+      style={{
+        ...(isLive ? { borderLeft: '3px solid var(--green)', boxShadow: '0 0 0 1px var(--red-soft)' } : { borderLeft: '3px solid var(--blue)' }),
+        ...(nearStale ? { opacity: 0.55, filter: 'grayscale(0.7)' } : {}),
+      }}
     >
       <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
         <strong>{p.symbol}</strong>
@@ -288,6 +366,11 @@ function ProposalCard({
         {isLive && (
           <span className="signal-side" style={{ background: 'var(--red-soft)', color: 'var(--red)', fontWeight: 700 }}>
             REAL MONEY
+          </span>
+        )}
+        {nearStale && (
+          <span className="signal-side" style={{ background: 'var(--surface)', color: 'var(--orange)', border: '1px solid var(--orange)' }}>
+            STALE
           </span>
         )}
         <span style={{ marginLeft: 'auto', fontSize: 11, color: 'var(--text-dim)' }}>
@@ -317,6 +400,12 @@ function ProposalCard({
       {wrongMode && (
         <p style={{ margin: '0 0 6px', fontSize: 11, color: 'var(--orange)' }}>
           Switch to {p.mode} mode to confirm this proposal.
+        </p>
+      )}
+
+      {nearStale && (
+        <p style={{ margin: '0 0 6px', fontSize: 11, color: 'var(--orange)' }}>
+          stale — re-request. This proposal is about to expire and can no longer be confirmed.
         </p>
       )}
 

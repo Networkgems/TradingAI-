@@ -91,6 +91,7 @@ import {
 import { optionsSpendStatus } from './options-spend-store.js';
 import { agentSpendAggregate } from './agent-spend-store.js';
 import { executionCapStatus } from './agent-execution-caps-store.js';
+import { proposalTtlMs } from './proposal-store.js';
 import { initIvRankStore } from './iv-rank-store.js';
 import { initIdeaJournal, listJournalEntries } from './options-idea-journal.js';
 import { initShadowLedger, listShadowSignals } from './shadow-signal-ledger.js';
@@ -4390,6 +4391,9 @@ app.get('/api/proposals', requireAuth, async (_req, res) => {
     caps: executionCapStatus(username),
     killSwitchEngaged: ctx.engine.isKillSwitchEngaged(),
     tradingAgentsEnabled: ctx.engine.isTradingAgentsEnabled(),
+    // TRA-945 §2 — the store TTL (env-overridable) so the panel can grey out a
+    // proposal nearing expiry instead of having it silently vanish at the TTL.
+    proposalTtlMs: proposalTtlMs(),
   });
 });
 
