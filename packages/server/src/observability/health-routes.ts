@@ -318,6 +318,40 @@ export function summarizeDemoBooks(
   };
 }
 
+/**
+ * TRA-901 — the NO-AUTH fleet demo-book view for the unattended TRA-898 daily
+ * watch. The token-gated `/api/health/demo-book` path is unreachable for an
+ * agent on Render (it needs a shared `DEMO_BOOK_INTERNAL_TOKEN` env var, which
+ * can only be set via the Render dashboard / API — no agent has that access,
+ * and committing a literal secret to this public repo would defeat the gate).
+ * The TRA-901 issue itself sanctions this: "expose a no-auth internal summary
+ * route". Safe to expose unauthenticated because it carries ONLY demo (paper-
+ * money) state — no secrets, no live balances — and usernames are anonymized to
+ * stable `demo-N` labels so the public surface leaks no account identity.
+ */
+export interface DemoBookPublicReport {
+  ok: true;
+  time: string;
+  build: ReturnType<typeof resolveBuildInfo>;
+  demoEngineCount: number;
+  books: Array<{ label: string; book: DemoBookReport }>;
+}
+
+/** Anonymized, no-auth fleet demo-book summary (usernames → `demo-N`). */
+export function summarizeDemoBooksPublic(
+  engines: Array<{ username: string; state: EngineState; mode: string }>,
+  now: number,
+): DemoBookPublicReport {
+  const fleet = summarizeDemoBooks(engines, now);
+  return {
+    ok: true,
+    time: fleet.time,
+    build: fleet.build,
+    demoEngineCount: fleet.demoEngineCount,
+    books: fleet.books.map((b, i) => ({ label: `demo-${i + 1}`, book: b.book })),
+  };
+}
+
 // ── TRA-895 options-signal pipeline probe ─────────────────────────────────────
 
 /**
@@ -529,6 +563,15 @@ export function registerLiveHealthRoutes(app: Express, deps: LiveHealthDeps): vo
     if (res.headersSent) return;
     const settings = deps.getSettings(ctx.username);
     res.json(summarizeDemoBook(ctx.engine.getState(), settings.mode, now()));
+  });
+
+  // TRA-901 — NO-AUTH anonymized fleet demo-book for the unattended daily watch.
+  // The token-gated route above cannot be reached by an agent on Render (env-var
+  // only the dashboard can set; a committed secret would be public anyway), so
+  // the watch reads this surface instead. Paper-money state only, no secrets,
+  // usernames stripped to `demo-N` — see summarizeDemoBooksPublic.
+  app.get('/api/health/demo-book-public', (_req, res) => {
+    res.json(summarizeDemoBooksPublic(deps.demoBooks?.() ?? [], now()));
   });
 
   const liveEquityAcceptance = deps.liveEquityAcceptance;

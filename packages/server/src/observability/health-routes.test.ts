@@ -10,6 +10,7 @@ import {
   aggregateLiveEquityAcceptance,
   summarizeDemoBook,
   summarizeDemoBooks,
+  summarizeDemoBooksPublic,
   summarizeOptionsPipeline,
   type HealthUserContext,
 } from './health-routes.js';
@@ -397,6 +398,52 @@ describe('TRA-898 demo-book summary', () => {
     gate({ headers: { 'x-internal-token': 'anything' } }, res, () => undefined);
     expect(requireAuthCalls).toBe(1);
     expect(res.locals['internalDemoAccess']).toBeUndefined();
+  });
+
+  it('TRA-901 summarizeDemoBooksPublic anonymizes usernames to demo-N labels', () => {
+    const report = summarizeDemoBooksPublic(
+      [
+        { username: 'demo-trader', state: demoState(), mode: 'demo' },
+        { username: 'second-trader', state: demoState(), mode: 'demo' },
+      ],
+      NOW,
+    );
+    expect(report.ok).toBe(true);
+    expect(report.demoEngineCount).toBe(2);
+    expect(report.books.map(b => b.label)).toEqual(['demo-1', 'demo-2']);
+    // No username field leaks onto the public surface.
+    expect(report.books.every(b => !('username' in b))).toBe(true);
+    // Paper P&L / activity is preserved for the watch.
+    expect(report.books[0]!.book.equity.totalEquity).toBe(25_500);
+    expect(report.books[0]!.book.openPositionCount).toBe(2);
+  });
+
+  it('TRA-901 mounts GET /api/health/demo-book-public NO-AUTH (single handler)', async () => {
+    const { app, routes } = fakeApp();
+    registerLiveHealthRoutes(app, {
+      requireAuth: (() => {
+        throw new Error('requireAuth must not run on the public path');
+      }) as never,
+      userCtx: async () => {
+        throw new Error('userCtx must not run on the public path');
+      },
+      getSettings: () => settings(),
+      demoBooks: () => [{ username: 'demo-trader', state: demoState(), mode: 'demo' }],
+      now: () => NOW,
+    });
+    const handlers = routes.get('/api/health/demo-book-public')!;
+    expect(handlers).toHaveLength(1); // no gate — public
+    const res = resWithLocals();
+    await handlers[0]!({}, res);
+    const body = res.body as {
+      ok: boolean;
+      demoEngineCount: number;
+      books: Array<{ label: string; book: { equity: { totalEquity: number } } }>;
+    };
+    expect(body.ok).toBe(true);
+    expect(body.demoEngineCount).toBe(1);
+    expect(body.books[0]!.label).toBe('demo-1');
+    expect(body.books[0]!.book.equity.totalEquity).toBe(25_500);
   });
 });
 
