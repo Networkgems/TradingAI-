@@ -44,6 +44,7 @@ import {
   getFreshMarketReview,
   isReviewStale,
   defaultReviewKind,
+  computeWeekendGapRisk,
   __resetMarketReviewStoreForTests,
   MA_PERIOD,
   TREND_HYSTERESIS,
@@ -476,6 +477,15 @@ describe('defaultReviewKind (TRA-589)', () => {
     // 13:00Z = 09:00 ET → premarket; 21:00Z = 17:00 ET → postmarket.
     expect(defaultReviewKind(new Date('2026-06-04T13:00:00.000Z'))).toBe('premarket');
     expect(defaultReviewKind(new Date('2026-06-04T21:00:00.000Z'))).toBe('postmarket');
+  });
+});
+
+describe('computeWeekendGapRisk (TRA-950)', () => {
+  it('flags a Friday review (weekend gap ahead) and not a mid-week one', () => {
+    // 2026-06-19 is a Friday; 14:00Z = 10:00 ET keeps the ET date on Friday.
+    expect(computeWeekendGapRisk(new Date('2026-06-19T14:00:00.000Z'))).toBe(true);
+    // 2026-06-17 is a Wednesday.
+    expect(computeWeekendGapRisk(new Date('2026-06-17T14:00:00.000Z'))).toBe(false);
   });
 });
 

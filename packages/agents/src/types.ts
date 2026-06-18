@@ -2,7 +2,7 @@
 // contracts the graph *emits* (AnalystReport, TraderDecision, RiskVerdict,
 // AgentRecommendation) live in @trading-app/shared; these are the engine-side
 // inputs that never cross the WS boundary.
-import type { Candle, SocialSentiment, TradeSignal } from '@trading-app/shared';
+import type { Candle, SocialSentiment, TradeSignal, ReviewBlock } from '@trading-app/shared';
 
 /** Point-in-time fundamentals snapshot for the fundamental analyst (P2 fills). */
 export interface FundamentalSnapshot {
@@ -63,6 +63,15 @@ export interface AgentGraphInput {
    * its horizon short because social buzz is a fast-decaying signal.
    */
   social?: SocialSentiment;
+  /**
+   * TRA-950 — the latest desk review's structured block (regime, leaders,
+   * invalidation levels, gap risk), injected by the call site ONLY when the
+   * Trading Agents layer is enabled. It is desk-level context the analysts read
+   * so the LLM sees the same structured read the deterministic watchlist seed
+   * used. Optional + additive: absent ⇒ the graph behaves exactly as before, and
+   * the default-OFF state never populates it.
+   */
+  reviewBlock?: ReviewBlock;
   /**
    * TRA-850 — the owning user's persistent advisory PREFERENCES, read into the
    * graph context so recommendations are personalized + consistent across

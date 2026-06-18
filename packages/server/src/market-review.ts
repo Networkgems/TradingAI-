@@ -657,6 +657,16 @@ export async function generateMarketReview(
     indexes: readings,
     gates,
     source: 'auto',
+    // TRA-950 — structured block alongside the regime. The auto review reuses
+    // the existing classification for `regimeLabel` (never recomputed) and
+    // derives a deterministic weekend gap flag; the leader list / invalidation
+    // levels stay empty (those come from a QuantTrader review, not the feed).
+    reviewBlock: {
+      leaders: [],
+      invalidationLevels: {},
+      gapRisk: computeWeekendGapRisk(now),
+      regimeLabel: regime,
+    },
   };
 
   // Persist the structured review (upsert by id).
@@ -740,6 +750,18 @@ export function defaultReviewKind(now: Date = new Date()): 'premarket' | 'postma
   // `hour` is 0–24 (some runtimes print "24" at midnight); treat the cash-close
   // boundary (16:00 ET) onward as post-market.
   return Number.isFinite(hour) && hour >= 16 && hour < 24 ? 'postmarket' : 'premarket';
+}
+
+/**
+ * TRA-950 — deterministic weekend-gap proxy for the auto review's structured
+ * block. The auto path has no holiday calendar, so it flags the one gap it can
+ * derive without one: a Friday review faces a closed Sat/Sun before the next
+ * cash session. A QuantTrader review that knows about a holiday / scheduled
+ * event can publish a richer `gapRisk` via `/api/research/reports`.
+ */
+export function computeWeekendGapRisk(now: Date = new Date()): boolean {
+  const weekday = now.toLocaleString('en-US', { timeZone: 'America/New_York', weekday: 'short' });
+  return weekday === 'Fri';
 }
 
 /**

@@ -74,11 +74,32 @@ function keyLevels(candles: Candle[], lookback = 20): { support: number; resista
   };
 }
 
+/**
+ * TRA-950 — a compact, symbol-scoped digest of the latest desk review block for
+ * the analyst/trader prompts. Returns null (no desk context) when the layer is
+ * OFF or no review block was injected, so the prompt is unchanged in the default
+ * state. Surfaces the regime + gap risk, whether THIS symbol is a desk leader,
+ * and its advisory invalidation level (when the review supplied one).
+ */
+function reviewDigest(input: AgentGraphInput): Record<string, unknown> | null {
+  const block = input.reviewBlock;
+  if (!block) return null;
+  const sym = input.symbol.toUpperCase();
+  const digest: Record<string, unknown> = {
+    regimeLabel: block.regimeLabel,
+    gapRisk: block.gapRisk,
+    isLeader: block.leaders.includes(sym),
+  };
+  const invalidation = block.invalidationLevels[sym];
+  if (typeof invalidation === 'number') digest['invalidationLevel'] = invalidation;
+  return digest;
+}
+
 /** A small, model-friendly digest of the price action for the technical analyst. */
 function priceDigest(input: AgentGraphInput): Record<string, unknown> {
   const { candles } = input;
   const closes = candles.slice(-10).map((c) => round(c.close, 2));
-  return {
+  const digest: Record<string, unknown> = {
     symbol: input.symbol,
     asOf: new Date(input.asOf).toISOString(),
     lastClose: round(lastClose(candles), 2),
@@ -88,6 +109,11 @@ function priceDigest(input: AgentGraphInput): Record<string, unknown> {
     recentCloses: closes,
     keyLevels: keyLevels(candles),
   };
+  // TRA-950 — surface the desk review (regime / leader / invalidation) as
+  // advisory context. Only present when the Trading Agents layer injected a block.
+  const desk = reviewDigest(input);
+  if (desk) digest['deskReview'] = desk;
+  return digest;
 }
 
 // ── analyst tier (fast / Haiku) ───────────────────────────────────────────────
@@ -336,12 +362,18 @@ function traderUser(input: AgentGraphInput, reports: AnalystReport[], debate: De
     debate: { survivingThesis: debate.survivingThesis, netLean: debate.netLean },
     // TRA-850 — the user's persistent preferences (advisory context only).
     userPreferences: memoryDigest(input.userMemory, input.symbol),
+    // TRA-950 — the latest desk review block (regime / leader / invalidation /
+    // gap risk), advisory context only — present only when the layer is ON.
+    deskReview: reviewDigest(input),
   };
   return (
     `Decision context (JSON):\n${JSON.stringify(payload)}\n`
     + 'userPreferences (when present) are advisory: tailor your thesis + conviction to them, but '
     + 'NEVER let a preference override the evidence or invent a trade the analysts do not support. '
-    + 'They tune HOW you frame the call, not WHETHER there is an edge.'
+    + 'They tune HOW you frame the call, not WHETHER there is an edge.\n'
+    + 'deskReview (when present) is the desk\'s latest structured read: the market regime, whether '
+    + 'this symbol is a desk leader, its advisory invalidation level, and gap risk. Treat it as '
+    + 'context — it never overrides the analysts\' evidence or the candidate signal\'s levels.'
   );
 }
 

@@ -11,6 +11,7 @@ import {
   validateTraderDecision,
   type Candle,
   type DebateTranscript,
+  type ReviewBlock,
   type TradeSignal,
   type TraderDecision,
 } from '@trading-app/shared';
@@ -129,6 +130,51 @@ describe('runTraderLlm', () => {
       action: 'BUY', conviction: 0.5, proposedEntry: 1, proposedStop: 1, proposedTarget: 1,
       riskRewardRatio: 1, thesis: 't', dissent: '   ',
     })).toContain('dissent: must be a non-empty string (mandatory opposing point)');
+  });
+});
+
+// TRA-950 (Part C) — the desk review block is injected into the analysts' +
+// trader's context ONLY when present (the layer is ON). Default OFF ⇒ unchanged.
+describe('review-block context injection', () => {
+  const block: ReviewBlock = {
+    leaders: ['AAA', 'NVDA'],
+    invalidationLevels: { AAA: 195 },
+    gapRisk: true,
+    regimeLabel: 'green',
+  };
+
+  function userMsg(req: LlmCompletionRequest): string {
+    return req.messages.find((m) => m.role === 'user')?.content ?? '';
+  }
+
+  it('surfaces deskReview (regime / isLeader / invalidation / gapRisk) to the technical analyst', async () => {
+    const llm = fakeLlm((req) => analystJson(req.purpose.split(':')[1]!), 0);
+    await runAnalystsLlm({ ...input, reviewBlock: block }, llm);
+    const technical = llm.calls.find((c) => c.purpose === 'analyst:technical')!;
+    const body = userMsg(technical);
+    expect(body).toContain('"deskReview"');
+    expect(body).toContain('"regimeLabel":"green"');
+    expect(body).toContain('"isLeader":true');
+    expect(body).toContain('"invalidationLevel":195');
+    expect(body).toContain('"gapRisk":true');
+  });
+
+  it('surfaces deskReview to the trader synthesis', async () => {
+    const llm = fakeLlm(() => JSON.stringify({
+      action: 'BUY', conviction: 0.6, proposedEntry: 100, proposedStop: 98,
+      proposedTarget: 106, riskRewardRatio: 3, thesis: 't', dissent: 'd',
+    }), 0);
+    await runTraderLlm({ ...input, reviewBlock: block }, [], debate, llm);
+    const body = userMsg(llm.calls[0]!);
+    expect(body).toContain('"deskReview":{"regimeLabel":"green"');
+    expect(body).toContain('"isLeader":true');
+  });
+
+  it('omits deskReview entirely when no block is injected (default OFF unchanged)', async () => {
+    const llm = fakeLlm((req) => analystJson(req.purpose.split(':')[1]!), 0);
+    await runAnalystsLlm(input, llm); // no reviewBlock
+    const technical = llm.calls.find((c) => c.purpose === 'analyst:technical')!;
+    expect(userMsg(technical)).not.toContain('deskReview');
   });
 });
 

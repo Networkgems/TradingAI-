@@ -28,6 +28,7 @@ import { evaluateExecutionGate, buildOrderAudit, killSwitchClear } from './agent
 import { recordExecutedOrder } from './agent-execution-caps-store.js';
 import { getUserMemorySync, recordInteractionOutcome } from './user-trading-memory-store.js';
 import { getLatestMarketReview } from './market-review.js';
+import { getLatestReviewBlock } from './research-store.js';
 import { earningsInDaysSync } from './earnings-store.js';
 import { recordShadowSignal, resolveShadowSignal, resolveOutcome, openShadowSignalsSync, type ShadowSignalRecord } from './shadow-signal-ledger.js';
 import {
@@ -3482,6 +3483,14 @@ export class SignalEngine {
     // the boot-warmed cache; an empty memory leaves the graph unchanged, so this
     // stays additive. Preferences only — never a self-modifying strategy.
     const userMemory = getUserMemorySync(this.alertUsername);
+    // TRA-950 (Part C) — inject the latest desk review block into the agents'
+    // context, ONLY when the layer is enabled (default-OFF state untouched). Read
+    // once per batch from the in-process research-store cache; absent ⇒ undefined,
+    // so the graph is unchanged. The deterministic graph ignores it; only the LLM
+    // analysts/trader surface it as advisory context.
+    const reviewBlock = this.tradingAgentsEnabled
+      ? (await getLatestReviewBlock()) ?? undefined
+      : undefined;
     const recos: AgentRecommendation[] = [];
     for (const sym of symbols) {
       const candles = this.candleCache.get(sym) ?? [];
@@ -3505,7 +3514,7 @@ export class SignalEngine {
       const social = this.getSocialSentiment(sym);
       try {
         const { recommendation } = await adviseSymbol(
-          { symbol: sym, asOf, candles, candidateSignal: null, fundamentals, news, social, userMemory },
+          { symbol: sym, asOf, candles, candidateSignal: null, fundamentals, news, social, userMemory, reviewBlock },
           { user: this.alertUsername, enabled: this.tradingAgentsEnabled, llm },
         );
         recos.push(recommendation);

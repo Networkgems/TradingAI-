@@ -3,7 +3,8 @@ import { existsSync } from 'fs';
 import { dirname, join } from 'path';
 import { fileURLToPath } from 'url';
 import { randomUUID } from 'crypto';
-import type { ResearchReport, ResearchReportKind } from '@trading-app/shared';
+import type { ResearchReport, ResearchReportKind, ReviewBlock } from '@trading-app/shared';
+import { validateReviewBlock, coerceReviewBlock } from '@trading-app/shared';
 import { logger } from './observability/index.js';
 
 const log = logger.child({ module: 'research-store' });
@@ -74,6 +75,20 @@ export async function getResearchReport(id: string): Promise<ResearchReport | un
   return all.find(r => r.id === id);
 }
 
+/**
+ * TRA-950 — the structured review block from the most recently published report
+ * that carries one, or `null` when no review has attached a block yet. The
+ * deterministic boot path reads this to seed the watchlist; the Trading Agents
+ * path reads it to inject desk context. Auto market-review research reports do
+ * NOT attach a block (the block they need lives on the `MarketReview` itself),
+ * so this always returns a QuantTrader-curated block and never a stale empty one.
+ */
+export async function getLatestReviewBlock(): Promise<ReviewBlock | null> {
+  const all = await listResearchReports(); // newest-first
+  const withBlock = all.find(r => r.reviewBlock !== undefined);
+  return withBlock?.reviewBlock ?? null;
+}
+
 export interface ResearchReportInput {
   id?: string;
   kind: ResearchReportKind;
@@ -81,6 +96,8 @@ export interface ResearchReportInput {
   bodyMarkdown: string;
   publishedAt?: string;
   tickers?: string[];
+  /** TRA-950 — optional structured read (leaders / invalidation / gapRisk / regime). */
+  reviewBlock?: ReviewBlock;
 }
 
 export class ResearchValidationError extends Error {
@@ -121,6 +138,14 @@ function validateInput(input: unknown): ResearchReportInput {
   if (o['id'] !== undefined && typeof o['id'] !== 'string') {
     throw new ResearchValidationError('id must be a string');
   }
+  let reviewBlock: ReviewBlock | undefined;
+  if (o['reviewBlock'] !== undefined) {
+    const errs = validateReviewBlock(o['reviewBlock']);
+    if (errs.length) {
+      throw new ResearchValidationError(`reviewBlock invalid: ${errs.join('; ')}`);
+    }
+    reviewBlock = coerceReviewBlock(o['reviewBlock']);
+  }
   return {
     id: o['id'] as string | undefined,
     kind: o['kind'] as ResearchReportKind,
@@ -128,6 +153,7 @@ function validateInput(input: unknown): ResearchReportInput {
     bodyMarkdown: o['bodyMarkdown'] as string,
     publishedAt: o['publishedAt'] as string | undefined,
     tickers: o['tickers'] as string[] | undefined,
+    reviewBlock,
   };
 }
 
@@ -147,6 +173,7 @@ export async function saveResearchReport(input: unknown): Promise<ResearchReport
     publishedAt: v.publishedAt ?? new Date().toISOString(),
     source: 'QuantTrader',
     ...(v.tickers ? { tickers: v.tickers } : {}),
+    ...(v.reviewBlock ? { reviewBlock: v.reviewBlock } : {}),
   };
   const existingIdx = all.findIndex(r => r.id === report.id);
   if (existingIdx >= 0) {

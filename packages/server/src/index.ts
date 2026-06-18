@@ -55,6 +55,7 @@ import {
   removeCryptoSymbol,
   addStocksSymbol,
   removeStocksSymbol,
+  seedReviewLeaders,
 } from './watchlist-store.js';
 import { scanStocksMarket, scanCryptoMarket } from './market-scanner.js';
 import { runPremarketForAllUsers } from './premarket-watchlist.js';
@@ -235,6 +236,7 @@ import {
   saveResearchReport,
   listResearchReports,
   getResearchReport,
+  getLatestReviewBlock,
   seedSampleResearchReportIfEmpty,
   ResearchValidationError,
 } from './research-store.js';
@@ -407,6 +409,37 @@ void getLatestMarketReview().then(existing => {
     }),
   );
 });
+
+// TRA-950 (Part B) — auto-seed the active watchlist from the latest desk review
+// block's leaders, for every user, at boot. De-duped + capped + tagged
+// review-sourced inside `seedReviewLeaders` (advisory invalidation levels are
+// recorded as metadata; no new order behavior). Non-blocking: a missing/empty
+// block is a no-op, and a slow disk read must not delay startup.
+void getLatestReviewBlock()
+  .then(async block => {
+    if (!block || block.leaders.length === 0) return;
+    let seededUsers = 0;
+    for (const ctx of getAllUserContexts()) {
+      try {
+        const { reviewSourced } = await seedReviewLeaders(ctx.username, block);
+        if (reviewSourced.length) seededUsers += 1;
+      } catch (err) {
+        log.warn('review-leader watchlist seed failed', {
+          username: ctx.username,
+          reason: err instanceof Error ? err.message : String(err),
+        });
+      }
+    }
+    log.info('seeded review leaders into watchlists', {
+      leaders: block.leaders.length,
+      seededUsers,
+    });
+  })
+  .catch(err =>
+    log.error('review-leader boot seed failed', {
+      reason: err instanceof Error ? err.message : String(err),
+    }),
+  );
 
 // TRA-596 (TRA-595 C1) — warm the earnings-calendar cache from disk so the
 // synchronous accessor (`earningsInDaysSync`) the engine reads each tick has

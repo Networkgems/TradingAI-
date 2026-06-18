@@ -14,6 +14,11 @@ export * from './social-sentiment.js';
 // + pure decision helpers shared by idea-gen and the order-time paths.
 export * from './day-trading-guardrail.js';
 
+// TRA-950 — structured review block (leaders / invalidation / gapRisk / regime)
+// persisted with each pre/post-market review and wired into both decision paths.
+export * from './review-block.js';
+import type { ReviewBlock } from './review-block.js';
+
 export type Side = 'buy' | 'sell';
 export type OrderStatus = 'pending' | 'filled' | 'cancelled' | 'rejected';
 export type SignalType =
@@ -2566,6 +2571,14 @@ export interface ResearchReport {
   publishedAt: string; // ISO
   source: 'QuantTrader';
   tickers?: string[];
+  /**
+   * TRA-950 — optional structured read attached to a desk review. When a
+   * QuantTrader review carries one, the deterministic boot path seeds its
+   * `leaders` into the watchlist and the Trading Agents path injects the whole
+   * block into the analysts' context. Additive: existing reports + the News-tab
+   * UI ignore it.
+   */
+  reviewBlock?: ReviewBlock;
 }
 
 /**
@@ -2645,6 +2658,15 @@ export interface MarketReview {
   gates: MarketReviewGates;
   /** Always `auto` — distinguishes from a hand-written QuantTrader review. */
   source: 'auto';
+  /**
+   * TRA-950 — structured review block persisted alongside the regime. The auto
+   * review fills `regimeLabel` (reused from `regime`, never recomputed) and a
+   * deterministic `gapRisk`; `leaders`/`invalidationLevels` stay empty here (the
+   * auto review can't curate a leader list — those come from a QuantTrader
+   * review published via `/api/research/reports`). Optional so reviews persisted
+   * before TRA-950 still deserialise.
+   */
+  reviewBlock?: ReviewBlock;
 }
 
 /** TRA-389 — one strategy the regime gates suppress, plus the reason why. */

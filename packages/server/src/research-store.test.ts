@@ -6,6 +6,7 @@ import {
   saveResearchReport,
   listResearchReports,
   getResearchReport,
+  getLatestReviewBlock,
   seedSampleResearchReportIfEmpty,
   ResearchValidationError,
   __resetResearchStoreForTests,
@@ -137,6 +138,59 @@ describe('research-store', () => {
       if (prev === undefined) delete process.env['SEED_SAMPLE_RESEARCH'];
       else process.env['SEED_SAMPLE_RESEARCH'] = prev;
     }
+  });
+
+  // TRA-950 — structured review block persistence + latest-block lookup.
+  it('persists a valid reviewBlock (uppercased + de-duped) and round-trips it', async () => {
+    const saved = await saveResearchReport({
+      kind: 'premarket',
+      title: 'with block',
+      bodyMarkdown: 'x',
+      reviewBlock: {
+        leaders: ['pltr', 'PLTR', 'sofi'],
+        invalidationLevels: { pltr: 20.5 },
+        gapRisk: true,
+        regimeLabel: 'yellow',
+      },
+    });
+    expect(saved.reviewBlock).toEqual({
+      leaders: ['PLTR', 'SOFI'],
+      invalidationLevels: { PLTR: 20.5 },
+      gapRisk: true,
+      regimeLabel: 'yellow',
+    });
+    __resetResearchStoreForTests(join(tmpRoot, 'research-reports.json'));
+    const reloaded = await getResearchReport(saved.id);
+    expect(reloaded?.reviewBlock?.leaders).toEqual(['PLTR', 'SOFI']);
+  });
+
+  it('rejects a malformed reviewBlock', async () => {
+    await expect(saveResearchReport({
+      kind: 'premarket',
+      title: 't',
+      bodyMarkdown: 'b',
+      reviewBlock: { leaders: 'AAPL', invalidationLevels: {}, gapRisk: false, regimeLabel: 'green' },
+    })).rejects.toBeInstanceOf(ResearchValidationError);
+  });
+
+  it('getLatestReviewBlock returns the newest block-bearing report, skipping blockless ones', async () => {
+    expect(await getLatestReviewBlock()).toBeNull();
+    await saveResearchReport({
+      kind: 'premarket',
+      title: 'has block',
+      bodyMarkdown: 'x',
+      publishedAt: '2026-05-01T08:00:00Z',
+      reviewBlock: { leaders: ['NVDA'], invalidationLevels: {}, gapRisk: false, regimeLabel: 'green' },
+    });
+    // A newer report WITHOUT a block must not mask the curated one.
+    await saveResearchReport({
+      kind: 'postmarket',
+      title: 'no block',
+      bodyMarkdown: 'y',
+      publishedAt: '2026-05-02T20:00:00Z',
+    });
+    const block = await getLatestReviewBlock();
+    expect(block?.leaders).toEqual(['NVDA']);
   });
 
   it('seed does not overwrite existing reports', async () => {
