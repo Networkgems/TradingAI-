@@ -39,24 +39,31 @@ const __dirname = dirname(fileURLToPath(import.meta.url));
  */
 export const OPTION_SHADOW_FLAG = 'ENABLE_OPTION_SHADOW_SELECTOR';
 
-// TRA-937 (2026-06-18) — EMERGENCY OUTAGE MITIGATION. prod `tradingai-bqb1` was
-// crash-looping during RTH (all routes 502; ~2h-stable-then-crash = OOM signature
-// on the 512MB `starter` plan). The expanded per-tick option-shadow pass
-// (TRA-908/917 et al.) is the leading memory-footprint driver, and env-only gating
-// needs a human Render Blueprint sync that wasn't available, so this code-level
-// hard off-switch lets a plain `git push` auto-deploy a lighter build that drops
-// the per-tick option-structure pass and recovers memory while the durable fix
-// (plan bump and/or a log-confirmed footprint profile via RENDER_API_KEY) is
-// arranged.
+// TRA-937 (2026-06-18) — EMERGENCY OUTAGE MITIGATION (now REVERTED, see TRA-942).
+// prod `tradingai-bqb1` was crash-looping during RTH (all routes 502;
+// ~2h-stable-then-crash = OOM signature on the 512MB `starter` plan; confirmed via
+// Render events: repeated `server_failed nonZeroExit:134` SIGABRT/OOM aborts until
+// the gate deploy stabilized it). The expanded per-tick option-shadow pass
+// (TRA-908/917 et al.) is the leading memory-footprint driver, so this code-level
+// hard off-switch let a plain `git push` auto-deploy a lighter build that dropped
+// the per-tick option-structure pass and recovered memory while the durable fix
+// was arranged.
+//
+// TRA-942 (2026-06-18, board approval `8fb26954`) — DURABLE FIX APPLIED, gate
+// reverted to `false`. The Render plan was bumped `starter` (512MB) -> `standard`
+// (2GB) via the management API (4x memory headroom), and `ENABLE_OPTION_SHADOW_
+// SELECTOR=true` was synced into the live service env (the blueprint value had
+// never been applied, so it read `false` live). With headroom proven, Phase-A
+// shadow-evidence accrual is restored: the per-tick pass runs again only when the
+// env flag is on AND market hours, gated/throttled as before.
 //
 // Consumed at the engine hot-loop call site (`signal-engine.ts` per-tick pass)
 // and the `/api/health/option-shadow-signals` readout — NOT inside
 // `isOptionShadowEnabled` itself, so the pure flag logic and the ledger
-// emit-path unit tests stay intact. Phase A is observe-only: disabling it routes
-// NO order and cannot affect live trading; the only cost is paused shadow-evidence
-// accrual. REVERT (flip to `false`) once the plan is bumped or the footprint is
-// profiled. Tracking: TRA-937.
-export const OPTION_SHADOW_EMERGENCY_OFF = true;
+// emit-path unit tests stay intact. Phase A is observe-only: it routes NO order
+// and cannot affect live trading. If prod memory pressure ever returns, flip this
+// back to `true` for an instant `git push` recovery while re-profiling.
+export const OPTION_SHADOW_EMERGENCY_OFF = false;
 
 export function isOptionShadowEnabled(env: NodeJS.ProcessEnv = process.env): boolean {
   const raw = env[OPTION_SHADOW_FLAG];
