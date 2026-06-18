@@ -74,6 +74,8 @@ class StubScanner implements RelativeValueScannerService {
     breakerOpenedAtMs: null,
     cacheSize: 0,
     expirationsCacheSize: 0,
+    chainCacheMaxEntries: 64,
+    expirationsCacheMaxEntries: 64,
   }));
 }
 
@@ -3985,7 +3987,7 @@ describe('SignalEngine — option-shadow selector wiring (TRA-917)', () => {
         return snapshot;
       }),
       getOptionMark: vi.fn(async () => null),
-      diagnostics: vi.fn(() => ({ configured: true, breakerOpen: false, breakerOpenedAtMs: null, cacheSize: 0, expirationsCacheSize: 0 })),
+      diagnostics: vi.fn(() => ({ configured: true, breakerOpen: false, breakerOpenedAtMs: null, cacheSize: 0, expirationsCacheSize: 0, chainCacheMaxEntries: 64, expirationsCacheMaxEntries: 64 })),
     };
     return { svc, calls };
   }

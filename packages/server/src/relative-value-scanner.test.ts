@@ -288,4 +288,51 @@ describe('TradierRelativeValueScannerService', () => {
       expect(t1).toBe(NOW_BASE + 1_000);
     });
   });
+
+  // TRA-943 (TRA-908 Phase A) — the per-tick option-shadow pass fans
+  // `getSelectorChain` across the full active-symbol roster, and the in-window
+  // expiration rotates over days. Before the fix both caches were write-only
+  // (stale entries never deleted, only overwritten on a same-key refetch), so
+  // the retained working set grew without bound — the leading footprint driver
+  // behind the TRA-937 OOM. These tests pin the bound so a regression trips CI,
+  // not prod.
+  describe('bounded cache working set (TRA-943)', () => {
+    it('caps the chain + expirations caches no matter how many distinct symbols are scanned', async () => {
+      const { svc, client } = makeService();
+      client.getExpirations.mockResolvedValue([EXP]);
+      client.getChainSnapshot.mockResolvedValue([row(100, 'call', 0.3), row(105, 'call', 0.3)]);
+
+      const { chainCacheMaxEntries, expirationsCacheMaxEntries } = svc.diagnostics();
+      // Scan far more distinct symbols than either cap. With the old write-only
+      // caches `cacheSize` would equal the symbol count; with the bound it stays
+      // pinned at the cap (time does not advance here, so every entry is fresh
+      // and it is the size cap — oldest-first eviction — that holds the line).
+      const symbols = chainCacheMaxEntries * 3;
+      for (let i = 0; i < symbols; i++) {
+        await svc.getSelectorChain(`SYM${i}`);
+      }
+
+      const diag = svc.diagnostics();
+      expect(diag.cacheSize).toBeLessThanOrEqual(chainCacheMaxEntries);
+      expect(diag.expirationsCacheSize).toBeLessThanOrEqual(expirationsCacheMaxEntries);
+      // Sanity: we genuinely pushed past the cap, so the assertion has teeth.
+      expect(symbols).toBeGreaterThan(chainCacheMaxEntries);
+    });
+
+    it('sweeps TTL-expired chain snapshots on the next write instead of retaining them', async () => {
+      const { svc, client, advance } = makeService();
+      client.getExpirations.mockResolvedValue([EXP]);
+      client.getChainSnapshot.mockResolvedValue([row(100, 'call', 0.3)]);
+
+      await svc.getSelectorChain('AAA');
+      await svc.getSelectorChain('BBB');
+      expect(svc.diagnostics().cacheSize).toBe(2);
+
+      // Age both chain entries past the 60s chain TTL, then write a third. The
+      // stale AAA/BBB snapshots are evicted on that write, so only CCC remains.
+      advance(61_000);
+      await svc.getSelectorChain('CCC');
+      expect(svc.diagnostics().cacheSize).toBe(1);
+    });
+  });
 });

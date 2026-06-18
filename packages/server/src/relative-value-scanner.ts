@@ -11,6 +11,23 @@ const log = logger.child({ module: 'relative-value-scanner' });
 
 const CHAIN_CACHE_TTL_MS = 60_000;
 const EXPIRATIONS_CACHE_TTL_MS = 6 * 60 * 60_000;
+
+// TRA-943 (TRA-908 Phase A) — bound the retained working set of these caches.
+// Both maps were previously write-only: a stale entry (past its TTL) was never
+// deleted, only overwritten when the SAME (symbol|expiration) key was re-fetched.
+// The per-tick option-shadow pass (`evaluateOptionShadow`) calls `getSelectorChain`
+// across the full active-symbol roster, and the in-window expiration rotates as
+// days pass, so the keyspace grows without bound over a long-lived process — every
+// combo ever scanned pins a full `OptionChainRow[]` (hundreds of rows) on the heap.
+// That unbounded growth is the leading retained-footprint driver behind the
+// TRA-937 OOM. Capping both caches to a fixed number of live entries (with
+// TTL-expiry + oldest-first eviction on every write) holds the working set flat
+// regardless of how many symbol/expiration combos the pass touches. The caps are
+// generous vs. the realistic active roster (~15–30 symbols × 1 in-window
+// expiration) so steady-state cache hits are unaffected; they only bite the
+// long-tail accumulation of dead entries.
+const MAX_CHAIN_CACHE_ENTRIES = 64;
+const MAX_EXPIRATIONS_CACHE_ENTRIES = 64;
 // TRA-417 — replaced the flat 1h cooldown with discriminated cooldowns.
 // Tradier's rate limit is a ~60s sliding window (60/min sandbox, 120/min
 // prod); a 1h breaker over-suppressed scanning by ~60x on any transient
@@ -90,6 +107,9 @@ export interface RelativeValueScannerDiagnostics {
   breakerOpenedAtMs: number | null;
   cacheSize: number;
   expirationsCacheSize: number;
+  /** TRA-943 — hard caps the retained working set is bounded to (live entries). */
+  chainCacheMaxEntries: number;
+  expirationsCacheMaxEntries: number;
 }
 
 /**
@@ -229,6 +249,8 @@ export class TradierRelativeValueScannerService implements RelativeValueScannerS
       breakerOpenedAtMs: this.breakerState?.openedAt ?? null,
       cacheSize: this.chainCache.size,
       expirationsCacheSize: this.expirationsCache.size,
+      chainCacheMaxEntries: MAX_CHAIN_CACHE_ENTRIES,
+      expirationsCacheMaxEntries: MAX_EXPIRATIONS_CACHE_ENTRIES,
     };
   }
 
@@ -402,6 +424,38 @@ export class TradierRelativeValueScannerService implements RelativeValueScannerS
     }
   }
 
+  /**
+   * TRA-943 — insert into a TTL cache while keeping its retained working set
+   * bounded. On every write we (1) drop the key first so a refresh re-inserts at
+   * the tail (Map preserves insertion order, so the tail is the most-recently
+   * written), (2) sweep out every entry already past its TTL — a stale snapshot
+   * is never served again (`fetchChain`/`pickExpiration` re-fetch on a miss), so
+   * retaining it only wastes heap, and (3) if still over the hard cap, evict
+   * oldest-inserted first until we fit. The result: the cache holds at most
+   * `maxEntries` live snapshots no matter how many distinct keys are scanned over
+   * the process lifetime, which is what bounds the per-tick option-shadow
+   * footprint (TRA-937).
+   */
+  private putBounded<K extends string, T>(
+    cache: Map<K, CacheEntry<T>>,
+    key: K,
+    value: T,
+    ttlMs: number,
+    maxEntries: number,
+  ): void {
+    const now = this.now();
+    cache.delete(key);
+    for (const [k, entry] of cache) {
+      if (now - entry.at >= ttlMs) cache.delete(k);
+    }
+    cache.set(key, { value, at: now });
+    while (cache.size > maxEntries) {
+      const oldest = cache.keys().next().value as K | undefined;
+      if (oldest === undefined) break;
+      cache.delete(oldest);
+    }
+  }
+
   private async pickExpiration(symbol: string, dtePrefs: DtePrefs = {}): Promise<string | null> {
     const cached = this.expirationsCache.get(symbol);
     let expirations: string[];
@@ -410,7 +464,13 @@ export class TradierRelativeValueScannerService implements RelativeValueScannerS
     } else {
       expirations = await this.client!.getExpirations(symbol);
       this.noteUpstreamSuccess();
-      this.expirationsCache.set(symbol, { value: expirations, at: this.now() });
+      this.putBounded(
+        this.expirationsCache,
+        symbol,
+        expirations,
+        EXPIRATIONS_CACHE_TTL_MS,
+        MAX_EXPIRATIONS_CACHE_ENTRIES,
+      );
     }
     if (expirations.length === 0) return null;
 
@@ -468,7 +528,7 @@ export class TradierRelativeValueScannerService implements RelativeValueScannerS
     }
     const rows = await this.client!.getChainSnapshot(symbol, expiration);
     this.noteUpstreamSuccess();
-    this.chainCache.set(key, { value: rows, at: this.now() });
+    this.putBounded(this.chainCache, key, rows, CHAIN_CACHE_TTL_MS, MAX_CHAIN_CACHE_ENTRIES);
     return rows;
   }
 }
