@@ -93,7 +93,7 @@ import { agentSpendAggregate } from './agent-spend-store.js';
 import { initIvRankStore } from './iv-rank-store.js';
 import { initIdeaJournal, listJournalEntries } from './options-idea-journal.js';
 import { initShadowLedger, listShadowSignals } from './shadow-signal-ledger.js';
-import { initOptionShadowLedger, listOptionShadowSignals, isOptionShadowEnabled } from './option-shadow-ledger.js';
+import { initOptionShadowLedger, listOptionShadowSignals, isOptionShadowEnabled, OPTION_SHADOW_EMERGENCY_OFF } from './option-shadow-ledger.js';
 import {
   initReversalShadowLedger,
   listReversalShadowSignals,
@@ -2892,7 +2892,10 @@ app.get('/api/health/option-shadow-signals', async (_req, res) => {
     const signals = await listOptionShadowSignals();
     res.json({
       issue: 'TRA-911',
-      flagEnabled: isOptionShadowEnabled(),
+      flagEnabled: isOptionShadowEnabled() && !OPTION_SHADOW_EMERGENCY_OFF,
+      // TRA-937 — emergency OOM mitigation: the per-tick pass is hard-off even if
+      // ENABLE_OPTION_SHADOW_SELECTOR is set, so a silent ledger here is expected.
+      emergencyDisabled: OPTION_SHADOW_EMERGENCY_OFF,
       count: signals.length,
       signals,
     });

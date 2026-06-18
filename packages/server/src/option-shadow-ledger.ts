@@ -39,6 +39,25 @@ const __dirname = dirname(fileURLToPath(import.meta.url));
  */
 export const OPTION_SHADOW_FLAG = 'ENABLE_OPTION_SHADOW_SELECTOR';
 
+// TRA-937 (2026-06-18) — EMERGENCY OUTAGE MITIGATION. prod `tradingai-bqb1` was
+// crash-looping during RTH (all routes 502; ~2h-stable-then-crash = OOM signature
+// on the 512MB `starter` plan). The expanded per-tick option-shadow pass
+// (TRA-908/917 et al.) is the leading memory-footprint driver, and env-only gating
+// needs a human Render Blueprint sync that wasn't available, so this code-level
+// hard off-switch lets a plain `git push` auto-deploy a lighter build that drops
+// the per-tick option-structure pass and recovers memory while the durable fix
+// (plan bump and/or a log-confirmed footprint profile via RENDER_API_KEY) is
+// arranged.
+//
+// Consumed at the engine hot-loop call site (`signal-engine.ts` per-tick pass)
+// and the `/api/health/option-shadow-signals` readout — NOT inside
+// `isOptionShadowEnabled` itself, so the pure flag logic and the ledger
+// emit-path unit tests stay intact. Phase A is observe-only: disabling it routes
+// NO order and cannot affect live trading; the only cost is paused shadow-evidence
+// accrual. REVERT (flip to `false`) once the plan is bumped or the footprint is
+// profiled. Tracking: TRA-937.
+export const OPTION_SHADOW_EMERGENCY_OFF = true;
+
 export function isOptionShadowEnabled(env: NodeJS.ProcessEnv = process.env): boolean {
   const raw = env[OPTION_SHADOW_FLAG];
   if (typeof raw !== 'string') return false;

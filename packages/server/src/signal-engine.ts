@@ -23,7 +23,7 @@ import {
   openReversalShadowSignalsSync,
 } from './reversal-shadow-ledger.js';
 import { ivRankSync, atmIvFromRows } from './iv-rank-store.js';
-import { isOptionShadowEnabled, emitShadowOptionSignal } from './option-shadow-ledger.js';
+import { isOptionShadowEnabled, emitShadowOptionSignal, OPTION_SHADOW_EMERGENCY_OFF } from './option-shadow-ledger.js';
 import { etDateString } from './scheduler.js';
 import { fetchMinuteBars, fetchDailyCandles, fetchQuotes, fetchStocksNews, isYahooBreakerOpen, setActiveInterestSymbols, setTradierStocksFeedClient } from './yahoo-feed.js';
 import { fetchStockTwitsStream, fetchStockTwitsUserStream, getCuratedStockTwitsAccounts } from './stocktwits-feed.js';
@@ -1806,7 +1806,10 @@ export class SignalEngine {
     // it accrues well-formed shadow option signals to the option-shadow ledger
     // and NEVER routes an order. Gated to market hours (the 5m series is stale
     // off-session) and throttled so it can't burn the Tradier budget.
-    if (isStockMarketOpen() && isOptionShadowEnabled()) {
+    // TRA-937 — emergency hard-off (OOM crash-loop mitigation): skip the per-tick
+    // option-structure pass entirely when the kill switch is engaged so the
+    // heavy shadow accrual stops driving memory growth on the 512MB starter plan.
+    if (!OPTION_SHADOW_EMERGENCY_OFF && isStockMarketOpen() && isOptionShadowEnabled()) {
       if (Date.now() - this.lastOptionShadowRefreshAt >= OPTION_SHADOW_REFRESH_MS) {
         this.lastOptionShadowRefreshAt = Date.now();
         try {
