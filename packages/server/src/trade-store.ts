@@ -138,6 +138,15 @@ export interface StocksTradeSnapshot {
     dailyPnl: number;
     openPositions: Position[];
   };
+  /**
+   * TRA-936 — DURABLE cumulative closed SupertrendConfluence paper forward-test
+   * trades. Persisted separately from `closedPositions` because the latter is
+   * wiped nightly by the TRA-219 UI archive; this list is not, so the promotion
+   * gate's Stage-2 `paper.tradeCount` accumulates across sessions and survives a
+   * redeploy. Optional for back-compat with snapshots written before TRA-936
+   * (absent ⇒ the ledger starts empty and re-accrues forward).
+   */
+  supertrendPaperClosed?: Position[];
 }
 
 export interface CryptoTradeSnapshot {

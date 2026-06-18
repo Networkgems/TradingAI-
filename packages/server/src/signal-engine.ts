@@ -360,6 +360,14 @@ const SUPERTREND_STRATEGY_ID: SignalType = 'supertrend_confluence';
 const SUPERTREND_PAPER_INITIAL_EQUITY = 25_000;
 
 /**
+ * TRA-936 — cap on the durable cumulative forward-test closed-trade ledger
+ * ({@link SignalEngine.supertrendPaperClosed}). Bounds the persisted snapshot
+ * size while staying far above any Stage-2 paper-gate trade-count threshold, so
+ * the promotion gate always has the full recent history it needs.
+ */
+const SUPERTREND_PAPER_CLOSED_MAX = 10_000;
+
+/**
  * TRA-389 — how often the engine re-reads the persisted premarket
  * MarketReview. The review only changes twice a day (9 AM / 9 PM ET
  * scheduler hooks), so a 5-minute cache keeps the per-tick gate read off
@@ -670,6 +678,27 @@ export class SignalEngine {
    */
   private sma200LastFired: Map<string, number> = new Map();
   private allClosedPositions: Position[] = [];
+  /**
+   * TRA-936 — DURABLE cumulative ledger of closed SupertrendConfluence paper
+   * forward-test trades, kept SEPARATE from {@link allClosedPositions}.
+   *
+   * Root cause this fixes: forward-test closes were only recorded into
+   * `allClosedPositions`, which the TRA-219 nightly 9 PM ET archive
+   * ({@link archiveClosedTrades}) clears to blank the UI Positions page each
+   * session. So the promotion gate's Stage-2 `paper.tradeCount` (read from the
+   * persisted `closedPositions`) reset to 0 every night and on any restart that
+   * landed after an archive — re-accruing intraday but never accumulating the
+   * cumulative history Stage-2 needs, and spawning duplicate verify issues
+   * (TRA-896 / TRA-905 / TRA-929).
+   *
+   * This list is NOT touched by the archive, IS persisted in the trade snapshot,
+   * and IS restored on boot, so the count survives both the nightly archive and a
+   * Render redeploy. De-duplicated by position id and capped at
+   * {@link SUPERTREND_PAPER_CLOSED_MAX} most-recent trades to bound file growth
+   * (far above any Stage-2 threshold). The promotion service reads Stage-2
+   * supertrend_confluence trades from here (see `collectPaperTrades`).
+   */
+  private supertrendPaperClosed: Position[] = [];
   private newsCache: NewsItem[] = [];
   private lastNewsRefresh = 0;
   /**
@@ -2850,6 +2879,7 @@ export class SignalEngine {
       closed.exitReason =
         res.outcome === 'TP_HIT' ? 'target' : res.outcome === 'SL_HIT' ? 'stop' : 'time_stop';
       this.allClosedPositions.push(closed);
+      this.recordSupertrendPaperClosed(closed);
       supertrendShadowLog.info('supertrend paper close', {
         symbol: closed.symbol, side: closed.side, pnl: closed.pnl,
         entryPrice: closed.entryPrice, exitPrice: closed.exitPrice,
@@ -2865,12 +2895,29 @@ export class SignalEngine {
     for (const pos of closed) {
       pos.mode = 'demo';
       this.allClosedPositions.push(pos);
+      this.recordSupertrendPaperClosed(pos);
       supertrendShadowLog.info('supertrend paper close (quote backstop)', {
         symbol: pos.symbol, side: pos.side, pnl: pos.pnl,
         entryPrice: pos.entryPrice, exitPrice: pos.exitPrice,
         strategyId: SUPERTREND_STRATEGY_ID, account: 'paper-forward-test',
       });
     }
+  }
+
+  /**
+   * TRA-936 — append a closed forward-test paper trade to the DURABLE cumulative
+   * ledger ({@link supertrendPaperClosed}). De-duped by position id (the backstop
+   * and bar-walk close paths are disjoint, but a re-import could otherwise
+   * double-count) and capped at {@link SUPERTREND_PAPER_CLOSED_MAX} most-recent
+   * trades. Unlike {@link allClosedPositions}, this list is never cleared by the
+   * nightly {@link archiveClosedTrades}, so the promotion gate's Stage-2 paper
+   * count accumulates across sessions and survives a redeploy.
+   */
+  private recordSupertrendPaperClosed(pos: Position): void {
+    if (this.supertrendPaperClosed.some(p => p.id === pos.id)) return;
+    this.supertrendPaperClosed.push(pos);
+    const overflow = this.supertrendPaperClosed.length - SUPERTREND_PAPER_CLOSED_MAX;
+    if (overflow > 0) this.supertrendPaperClosed.splice(0, overflow);
   }
 
   /**
@@ -5223,6 +5270,11 @@ export class SignalEngine {
      * forward-test positions and silently stall Stage-2 accrual.
      */
     supertrendPaper: ReturnType<PaperAccount['exportSnapshot']>;
+    /**
+     * TRA-936 — durable cumulative closed forward-test paper trades, persisted
+     * so the Stage-2 paper count survives the nightly archive and a redeploy.
+     */
+    supertrendPaperClosed: Position[];
   } {
     return {
       closedPositions: [...this.allClosedPositions],
@@ -5236,6 +5288,7 @@ export class SignalEngine {
         production: this.optionsAccounts.production.exportSnapshot(),
       },
       supertrendPaper: this.supertrendPaper.exportSnapshot(),
+      supertrendPaperClosed: [...this.supertrendPaperClosed],
     };
   }
 
@@ -5255,10 +5308,12 @@ export class SignalEngine {
    * bucket, surfacing demo/sandbox P&L under the Live Production header even
    * though no Tradier production order had ever been placed.
    */
-  importTradeSnapshot(snap: Omit<ReturnType<SignalEngine['exportTradeSnapshot']>, 'optionsByEnv' | 'supertrendPaper'> & {
+  importTradeSnapshot(snap: Omit<ReturnType<SignalEngine['exportTradeSnapshot']>, 'optionsByEnv' | 'supertrendPaper' | 'supertrendPaperClosed'> & {
     optionsByEnv?: Record<TradierEnv, ReturnType<PaperOptionsAccount['exportSnapshot']>>;
     /** TRA-801 — optional so legacy snapshots written before the forward-test book still load. */
     supertrendPaper?: ReturnType<PaperAccount['exportSnapshot']>;
+    /** TRA-936 — optional so legacy snapshots written before the durable forward-test ledger still load. */
+    supertrendPaperClosed?: Position[];
   }): void {
     this.allClosedPositions = [...snap.closedPositions];
     this.recentSignals = [...snap.recentSignals];
@@ -5268,6 +5323,10 @@ export class SignalEngine {
     // TRA-801 — restore the SupertrendConfluence paper forward-test book so open
     // positions survive a redeploy; absent on legacy snapshots (starts empty).
     if (snap.supertrendPaper) this.supertrendPaper.importSnapshot(snap.supertrendPaper);
+    // TRA-936 — restore the durable cumulative closed forward-test ledger so the
+    // Stage-2 paper count survives the nightly archive and a redeploy; absent on
+    // legacy snapshots (starts empty and re-accrues forward).
+    this.supertrendPaperClosed = snap.supertrendPaperClosed ? [...snap.supertrendPaperClosed] : [];
     if (snap.optionsByEnv) {
       this.optionsAccounts.sandbox.importSnapshot(snap.optionsByEnv.sandbox);
       this.optionsAccounts.production.importSnapshot(snap.optionsByEnv.production);

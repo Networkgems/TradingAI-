@@ -50,22 +50,34 @@ function toSample(p: Position): PromotionTradeSample {
  * trades in the stocks snapshot's `closedPositions`. Filtered to the strategy
  * by `signalType` (crypto strategy ids ARE signal types) and to Demo by `mode`
  * (absent `mode` ↔ legacy demo, included).
+ *
+ * TRA-936 — the SupertrendConfluence forward-test book additionally lands its
+ * closed trades in the DURABLE `supertrendPaperClosed` ledger, which (unlike
+ * `closedPositions`) is not wiped by the nightly TRA-219 archive. We union both
+ * lists and de-dupe by position id so the Stage-2 count is cumulative and
+ * restart-stable: within a session a trade appears in both lists (same id ⇒
+ * counted once); after the nightly archive `closedPositions` is empty and the
+ * durable ledger carries the history forward.
  */
 export async function collectPaperTrades(username: string, strategyId: string): Promise<Position[]> {
-  const out: Position[] = [];
   const isDemo = (p: Position): boolean => p.mode === 'demo' || p.mode === undefined;
   const matches = (p: Position): boolean => p.signalType === strategyId && isDemo(p) && p.closedAt !== undefined;
+
+  // De-dupe by position id across the (possibly overlapping) source lists.
+  const byId = new Map<string, Position>();
+  const add = (p: Position): void => { if (matches(p)) byId.set(p.id, p); };
 
   const crypto = await loadCryptoTradeSnapshot(username);
   if (crypto) {
     const closed = crypto.demoClosedPositions ?? crypto.closedPositions ?? [];
-    out.push(...closed.filter(matches));
+    closed.forEach(add);
   }
   const stocks = await loadStocksTradeSnapshot(username);
   if (stocks) {
-    out.push(...(stocks.closedPositions ?? []).filter(matches));
+    (stocks.closedPositions ?? []).forEach(add);
+    (stocks.supertrendPaperClosed ?? []).forEach(add);
   }
-  return out;
+  return [...byId.values()];
 }
 
 /**

@@ -744,6 +744,9 @@ async function createUserContext(username: string): Promise<UserContext> {
         // TRA-801 — restore the SupertrendConfluence paper forward-test book
         // when present (absent on legacy snapshots → book starts empty).
         ...(stocksSnap.supertrendPaper ? { supertrendPaper: stocksSnap.supertrendPaper } : {}),
+        // TRA-936 — restore the durable cumulative closed forward-test ledger so
+        // the Stage-2 paper count survives the nightly archive and a redeploy.
+        ...(stocksSnap.supertrendPaperClosed ? { supertrendPaperClosed: stocksSnap.supertrendPaperClosed } : {}),
       });
       log.info('Restored stocks trade history', {
         username,
@@ -927,6 +930,9 @@ export async function persistStocksNow(ctx: UserContext): Promise<void> {
       // TRA-801 — persist the SupertrendConfluence paper forward-test book so a
       // redeploy doesn't abandon its open positions and stall Stage-2 accrual.
       supertrendPaper: snap.supertrendPaper,
+      // TRA-936 — persist the durable cumulative closed forward-test ledger so
+      // the Stage-2 paper count survives the nightly archive and a redeploy.
+      supertrendPaperClosed: snap.supertrendPaperClosed,
     });
   } catch (err: unknown) {
     log.warn('stocks persist failed', { username: ctx.username, reason: err instanceof Error ? err.message : String(err) });

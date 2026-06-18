@@ -3062,7 +3062,20 @@ app.get('/api/health/promotion-gate/:strategyId', async (req, res) => {
   const strategyId = (req.params as Record<string, string>)['strategyId'] as string;
   try {
     const status = await buildPublicPromotionProbe(strategyId);
-    res.json({ issue: 'TRA-803', strategyId, canGoLive: status.canGoLive, status });
+    res.json({
+      issue: 'TRA-803',
+      strategyId,
+      canGoLive: status.canGoLive,
+      status,
+      // TRA-936 — the Stage-2 paper count is now a DURABLE cumulative ledger
+      // (`supertrendPaperClosed`) that survives the nightly TRA-219 archive and a
+      // Render redeploy, so a post-deploy reading is NO LONGER expected to reset
+      // to 0. A genuine 0 means no forward-test trades have ever resolved (e.g. a
+      // brand-new deploy onto a fresh data disk), not a lost book — do not open a
+      // duplicate verify task on a 0 alone; confirm against the shadow-signals
+      // ledger (`/api/health/shadow-signals`) first.
+      paperLedger: 'durable-cumulative (TRA-936)',
+    });
   } catch (err) {
     log.error('promotion-gate health probe failed', {
       strategyId,

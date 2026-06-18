@@ -361,6 +361,36 @@ describe('TRA-801 SupertrendConfluence paper accrual — live stays gated', () =
     expect(status.blockedReasons.join(' ')).toMatch(/sign-off/i);
   });
 
+  // TRA-936 — the durable cumulative ledger (`supertrendPaperClosed`) is the
+  // restart/archive-stable source for Stage-2: trades counted from it even when
+  // the nightly archive has blanked `closedPositions`, and a trade present in
+  // BOTH lists (same id, e.g. mid-session) is counted exactly once.
+  it('counts Stage-2 paper trades from the durable supertrendPaperClosed ledger (archive-stable, de-duped)', async () => {
+    // Distinct user so this does not clobber ST_USER's 60-trade seed that the
+    // TRA-803 probe block below depends on.
+    const DURABLE_USER = 'supertrend-durable';
+    const durable = Array.from({ length: 12 }, (_, i) => stPaperTrade(i % 6 === 0 ? -0.5 : 1.5, i));
+    await tradeStore.saveStocksTradeSnapshot(DURABLE_USER, {
+      version: 1,
+      savedAt: new Date().toISOString(),
+      openPositions: [],
+      // `closedPositions` blanked by the nightly archive; the first two trades
+      // are ALSO still present here (overlap) to prove de-dupe by id.
+      closedPositions: durable.slice(0, 2),
+      recentSignals: [],
+      dailySignals: [],
+      positionSignalType: [],
+      options: {
+        openOptions: [], closedOptions: [], optionsPnl: 0,
+        dailyCount: 0, currentDayKey: '1970-01-01', cash: 25_000, equity: 25_000,
+      },
+      account: { cash: 25_000, equity: 25_000, initialEquity: 25_000, dailyPnl: 0 },
+      supertrendPaperClosed: durable,
+    });
+    const status = await svc.buildPromotionStatus(DURABLE_USER, STRATEGY);
+    expect(status.paper.tradeCount).toBe(12); // 12 durable ∪ 2 overlapping = 12, not 14
+  });
+
   it('an empty promotion record (ensureStrategyRegistered) does not advance the gate', async () => {
     // Registering the strategy so it appears on the overview list must NOT clear
     // any stage — Stage 1 stays `missing`, live stays refused.

@@ -3861,6 +3861,46 @@ describe('SignalEngine — SupertrendConfluence shadow channel (TRA-787)', () =>
     expect(stClosed[0].closedAt).toBeDefined();
     expect(stPaper.getState().openPositions).toHaveLength(0);
   });
+
+  // TRA-936 — a closed forward-test trade must ALSO land in the durable
+  // cumulative ledger (`supertrendPaperClosed`), survive the nightly TRA-219
+  // archive (which clears the UI `closedPositions`), and round-trip through the
+  // trade snapshot so the Stage-2 paper count survives a redeploy.
+  it('TRA-936: durable forward-test ledger survives the nightly archive and an export/import round-trip', () => {
+    const engine = new SignalEngine();
+    const candles = build5m(sawUp(480));
+    (engine as unknown as { shadowCandleCache: Map<string, Candle[]> }).shadowCandleCache.set('TEST', candles);
+    (engine as unknown as { evaluateSupertrendShadow: (s: string[]) => void }).evaluateSupertrendShadow(['TEST']);
+    const stPaper = (engine as unknown as { supertrendPaper: { getState(): { openPositions: Array<{ takeProfit: number }> } } }).supertrendPaper;
+    const tp = stPaper.getState().openPositions[0].takeProfit;
+    (engine as unknown as { runSupertrendPaperExits: (p: Map<string, number>) => void })
+      .runSupertrendPaperExits(new Map<string, number>([['TEST', tp + 5]]));
+
+    // The closed trade is in BOTH the transient UI list and the durable ledger.
+    const before = engine.exportTradeSnapshot();
+    expect(before.closedPositions.filter(p => p.signalType === 'supertrend_confluence')).toHaveLength(1);
+    expect(before.supertrendPaperClosed).toHaveLength(1);
+
+    // The nightly 9 PM ET archive blanks the UI list but NOT the durable ledger.
+    engine.archiveClosedTrades();
+    const afterArchive = engine.exportTradeSnapshot();
+    expect(afterArchive.closedPositions.filter(p => p.signalType === 'supertrend_confluence')).toHaveLength(0);
+    expect(afterArchive.supertrendPaperClosed).toHaveLength(1);
+
+    // The durable ledger round-trips through a redeploy (export → import).
+    const restored = new SignalEngine();
+    restored.importTradeSnapshot({
+      closedPositions: afterArchive.closedPositions,
+      recentSignals: afterArchive.recentSignals,
+      dailySignals: afterArchive.dailySignals,
+      positionSignalType: afterArchive.positionSignalType,
+      account: afterArchive.account,
+      options: afterArchive.options,
+      supertrendPaper: afterArchive.supertrendPaper,
+      supertrendPaperClosed: afterArchive.supertrendPaperClosed,
+    });
+    expect(restored.exportTradeSnapshot().supertrendPaperClosed).toHaveLength(1);
+  });
 });
 
 // TRA-917 (TRA-908 Phase A) — live wiring of the SHADOW option-structure
