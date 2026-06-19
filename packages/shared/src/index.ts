@@ -385,6 +385,23 @@ export interface Position {
    * {@link realizedSlippage}.
    */
   modeledSlippage?: number;
+  /**
+   * TRA-961 — DCA accumulation hold flag. When true this position is a held DCA
+   * accumulation: the per-leg take-profit is NOT enforced on exit (a 4R TP would
+   * close the position and defeat "hold and accumulate"), so the only automatic
+   * exit is the catastrophe stop (or a future portfolio-level rule). Set on the
+   * initial DCA entry when accumulation mode is on and re-affirmed on every add.
+   * Absent → legacy per-leg TP behavior (every non-DCA path serializes
+   * byte-identically). See {@link dcaFills}.
+   */
+  dcaHold?: boolean;
+  /**
+   * TRA-961 — number of fills (initial entry + accumulation adds) blended into
+   * this DCA position. 1 at entry, incremented on each add. Drives the
+   * "multiple fills averaging one growing position" acceptance evidence and the
+   * dashboard's accumulation badge. Absent on legacy / non-DCA positions.
+   */
+  dcaFills?: number;
 }
 
 /**

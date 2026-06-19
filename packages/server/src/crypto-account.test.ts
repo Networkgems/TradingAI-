@@ -94,6 +94,81 @@ describe('CryptoPaperAccount short cash flow (TRA-330)', () => {
   });
 });
 
+describe('CryptoPaperAccount.addToPosition — DCA accumulation (TRA-961)', () => {
+  function openDca(acct: CryptoPaperAccount) {
+    // A held DCA bracket: wide catastrophe stop, 4R-ish TP.
+    const entry = buildSignal({ type: 'dca', side: 'buy', entryPrice: 100, stopLoss: 70, takeProfit: 220 });
+    const pos = acct.openPosition(entry, 100, 'coinbase');
+    expect(pos).not.toBeNull();
+    return pos!;
+  }
+
+  it('blends the average entry and grows quantity, keeping the stop FIXED', () => {
+    const acct = new CryptoPaperAccount(25_000);
+    const pos = openDca(acct);
+    const origStop = pos.stopLoss;
+    const q0 = pos.quantity;
+    // Add the same qty at a lower price → blended avg below the original entry.
+    const updated = acct.addToPosition(pos.id, q0, 80, { holdNoTakeProfit: true });
+    expect(updated).not.toBeNull();
+    expect(updated!.quantity).toBeCloseTo(q0 * 2, 6);
+    // Blended avg of equal-qty fills at 100 and 80 is 90.
+    expect(updated!.entryPrice).toBeCloseTo(90, 6);
+    // We average SIZE, never the STOP (the core invariant).
+    expect(updated!.stopLoss).toBe(origStop);
+    expect(updated!.dcaFills).toBe(2);
+    expect(updated!.dcaHold).toBe(true);
+  });
+
+  it('charges the Coinbase taker fee on the add leg (cash debited by notional + fee)', () => {
+    const acct = new CryptoPaperAccount(25_000);
+    const pos = openDca(acct);
+    const cashBefore = acct.getState().availableCash;
+    const addQty = 1;
+    const addPrice = 90;
+    acct.addToPosition(pos.id, addQty, addPrice);
+    const spent = cashBefore - acct.getState().availableCash;
+    expect(spent).toBeCloseTo(addPrice * addQty * (1 + 40 / 10_000), 6); // CRYPTO_FEE_BPS = 40
+  });
+
+  it('rejects bad inputs and an add larger than available cash', () => {
+    const acct = new CryptoPaperAccount(25_000);
+    const pos = openDca(acct);
+    expect(acct.addToPosition('nope', 1, 90)).toBeNull();
+    expect(acct.addToPosition(pos.id, 0, 90)).toBeNull();
+    expect(acct.addToPosition(pos.id, -2, 90)).toBeNull();
+    expect(acct.addToPosition(pos.id, 1, 0)).toBeNull();
+    expect(acct.addToPosition(pos.id, 1_000_000, 90)).toBeNull(); // 90M notional vs 25k cash
+  });
+
+  it('held DCA position is NOT closed by the per-leg take-profit, only by the stop', () => {
+    const acct = new CryptoPaperAccount(25_000);
+    const pos = openDca(acct);
+    acct.addToPosition(pos.id, pos.quantity, 100, { holdNoTakeProfit: true });
+    // Price blows through the 4R take-profit (220) — a held DCA must keep holding.
+    expect(acct.checkExits(new Map([['BTC-USD', 250]]))).toHaveLength(0);
+    // Price hits the catastrophe stop (70) — that DOES close it.
+    expect(acct.checkExits(new Map([['BTC-USD', 65]]))).toHaveLength(1);
+  });
+
+  it('without holdNoTakeProfit the per-leg take-profit still fires (back-compat)', () => {
+    const acct = new CryptoPaperAccount(25_000);
+    const pos = openDca(acct);
+    acct.addToPosition(pos.id, 1, 100); // no hold flag → legacy TP behavior
+    expect(acct.checkExits(new Map([['BTC-USD', 250]]))).toHaveLength(1);
+  });
+
+  it('getOpenPositionForSignalType returns the live DCA position reference', () => {
+    const acct = new CryptoPaperAccount(25_000);
+    const pos = openDca(acct);
+    const found = acct.getOpenPositionForSignalType('BTC-USD', 'dca');
+    expect(found).not.toBeNull();
+    expect(found!.id).toBe(pos.id);
+    expect(acct.getOpenPositionForSignalType('BTC-USD', 'breakout_vol')).toBeNull();
+    expect(acct.getOpenPositionForSignalType('ETH-USD', 'dca')).toBeNull();
+  });
+});
+
 describe('CryptoPaperAccount mark-to-market reconciliation (TRA-703)', () => {
   it('keeps marked equity >= cash for a long-only book (the regression invariant)', () => {
     const acct = new CryptoPaperAccount(25_000);

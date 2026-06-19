@@ -204,6 +204,44 @@ const DCA_PARAMS = {
   targetRR: 4,
 } as const;
 
+/**
+ * TRA-961 — additive DCA accumulation config.
+ *
+ * Board finding (from TRA-951): the crypto "DCA" never DCAs. Once one bracket is
+ * open for a symbol the per-tick guard (`hasOpenPositionForSignalType`) drops
+ * every subsequent weekly DCA buy, so it is a one-shot trend-long bracket, not
+ * dollar-cost averaging. This block turns the repeat-buy path on: when a DCA
+ * position is already open, the demo engine ADDS to / averages it (capped)
+ * instead of skipping.
+ *
+ * Ships **opt-in (`enabled: false`)** mirroring the equity conviction-DCA
+ * (`CONVICTION_DCA.enabled=false`): promotion is gated on QuantTrader setting
+ * the caps and confirming the exit behavior (TRA-961 asks #2 + #3). The cadence
+ * is unchanged — `CryptoDcaStrategy.lastFireTs` still paces one accumulation per
+ * `cadenceMs` (weekly) per symbol, and the 5-minute `recentSignals` window still
+ * dedups within a cadence, so accumulation fires once per cadence, not per candle.
+ */
+const CRYPTO_DCA_ACCUMULATION = {
+  /** Master opt-in. Demo accumulation is inert until QuantTrader flips this on. */
+  enabled: false,
+  /**
+   * Per-symbol size cap (TRA-961 ask #2): total accumulated notional for one DCA
+   * symbol may not exceed this fraction of managed equity. Bounds averaging-in so
+   * one name can't pyramid past position limits. PLACEHOLDER — QuantTrader to set.
+   */
+  maxSymbolNotionalFracOfManagedEquity: 0.15,
+  /**
+   * Exit behavior for accumulated DCA positions (TRA-961 ask #3). `'hold'` drops
+   * the per-leg take-profit (catastrophe stop only); a 4R TP on each leg would
+   * close the position and defeat hold-and-accumulate. Ships `'hold'` per the
+   * issue's stated preference; QuantTrader to confirm vs a portfolio-level exit.
+   */
+  exitMode: 'hold' as 'hold' | 'portfolio',
+  // Per-cluster cap (TRA-961 ask #2) reuses the existing TRA-423 correlation /
+  // concentration machinery (`clusterCapMultiplier`): an add is trimmed or
+  // skipped if it would breach the cluster notional cap, same as a fresh entry.
+} as const;
+
 export class CryptoSignalEngine {
   // TRA-699: the legacy bb_fade / swing direct strategies and the per-symbol
   // momentum / mean_reversion / breakout_vol StrategyRouter were retired here
@@ -1323,7 +1361,18 @@ export class CryptoSignalEngine {
         // dashboard with `signalSkipReason`, so the user knows the strategy
         // fired and was deliberately blocked.
         this.applyShortGates(signal, 'demo');
-        if (this.account.hasOpenPositionForSignalType(sym, signal.type)) continue;
+        // TRA-961 — additive DCA accumulation. Pre-fix this guard dropped EVERY
+        // repeat DCA buy once a bracket was open, making "DCA" a one-shot entry.
+        // When accumulation is enabled and a DCA position is already open for the
+        // symbol, capture it and ADD to it below instead of skipping. Every other
+        // signal type (and DCA when accumulation is off) keeps the single-position
+        // guard. The cadence / dedup windows below still apply, so an add fires at
+        // most once per cadence window — not once per candle.
+        const accumulateInto =
+          signal.type === 'dca' && CRYPTO_DCA_ACCUMULATION.enabled && signal.side === 'buy'
+            ? this.account.getOpenPositionForSignalType(sym, 'dca')
+            : null;
+        if (!accumulateInto && this.account.hasOpenPositionForSignalType(sym, signal.type)) continue;
         // TRA-480 — dedup against the demo branch only. Pre-TRA-480 the engine
         // ran one branch at a time so a single `recentSignals` window served
         // both modes; now that both branches can tick on the same minute, a
@@ -1398,13 +1447,96 @@ export class CryptoSignalEngine {
           clusterCapMultiplier = mult;
         }
 
+        // TRA-961 — accumulate into the held DCA position instead of opening a
+        // second bracket. The cluster cap (clusterCapMultiplier) and the
+        // per-symbol notional cap both bound the add so averaging-in can't blow
+        // past position limits; `'hold'` exit mode drops the per-leg TP so the
+        // growing position is held to the catastrophe stop.
+        if (accumulateInto) {
+          this.accumulateDca(accumulateInto, signal, price, clusterCapMultiplier);
+          continue;
+        }
+
         const opened = this.account.openPosition(signal, price, source, clusterCapMultiplier);
-        if (opened) opened.mode = 'demo';
+        if (opened) {
+          opened.mode = 'demo';
+          // TRA-961 — the first DCA tranche is also a held accumulation: stamp it
+          // so subsequent cadence windows average into THIS position and the
+          // per-leg TP is not enforced (exit on the catastrophe stop only).
+          if (signal.type === 'dca' && CRYPTO_DCA_ACCUMULATION.enabled && signal.side === 'buy') {
+            opened.dcaFills = 1;
+            if (CRYPTO_DCA_ACCUMULATION.exitMode === 'hold') opened.dcaHold = true;
+          }
+        }
       }
     }
     if (symbolsSkipped > 0) {
       log.warn('tick: symbols skipped (no candle data)', { symbolsEvaluated, symbolsSkipped });
     }
+  }
+
+  /**
+   * TRA-961 — add to / average a held DCA position on a fresh cadence window.
+   *
+   * Sizes the add the same way a fresh entry sizes (risk-from-stop × the TRA-423
+   * cluster-cap multiplier), then bounds it by the per-symbol notional cap so the
+   * accumulated position can never pyramid past `maxSymbolNotionalFracOfManagedEquity`
+   * of managed equity. The catastrophe stop is held fixed by `addToPosition` (we
+   * average size, never the stop); `'hold'` exit mode drops the per-leg TP so the
+   * growing position is not auto-closed before it can accumulate. A blocked add
+   * stamps `signalSkipReason` so the dashboard shows the strategy fired and why
+   * the add was capped, mirroring the entry-path skip reasons.
+   */
+  private accumulateDca(
+    pos: Position,
+    signal: TradeSignal,
+    price: number,
+    clusterCapMultiplier: number,
+  ): void {
+    // Per-symbol notional cap (ask #2): total accumulated notional ≤ frac × managed equity.
+    const capNotional = this.account.managedEquity() * CRYPTO_DCA_ACCUMULATION.maxSymbolNotionalFracOfManagedEquity;
+    const currentNotional = pos.quantity * price;
+    const headroomNotional = capNotional - currentNotional;
+    if (headroomNotional <= 0) {
+      signal.signalSkipReason = `${signal.symbol} DCA accumulation at per-symbol cap (${currentNotional.toFixed(0)} >= ${capNotional.toFixed(0)}) — holding, no add`;
+      log.warn('DCA add skipped: per-symbol cap reached', {
+        sym: signal.symbol,
+        currentNotional: currentNotional.toFixed(2),
+        capNotional: capNotional.toFixed(2),
+      });
+      return;
+    }
+
+    // Size the add like a fresh entry (risk-from-stop), apply the cluster cap,
+    // then clamp to the per-symbol notional headroom and to available cash.
+    let addQty = this.account.sizeFromStop(signal.entryPrice, signal.stopLoss);
+    if (Number.isFinite(clusterCapMultiplier) && clusterCapMultiplier > 0 && clusterCapMultiplier < 1) {
+      addQty *= clusterCapMultiplier;
+    }
+    const maxAddQtyBySymbolCap = headroomNotional / price;
+    addQty = Math.min(addQty, maxAddQtyBySymbolCap);
+    addQty = Math.round(addQty * 1_000_000) / 1_000_000;
+    if (addQty <= 0) {
+      signal.signalSkipReason = `${signal.symbol} DCA add rounds to 0 within caps — no add this cadence`;
+      return;
+    }
+
+    const updated = this.account.addToPosition(pos.id, addQty, price, {
+      holdNoTakeProfit: CRYPTO_DCA_ACCUMULATION.exitMode === 'hold',
+    });
+    if (!updated) return; // addToPosition logged the reason (cash / invalid)
+    updated.mode = 'demo';
+    // TRA-961 acceptance evidence — one growing position, multiple fills, blended avg.
+    log.info('DCA accumulation add', {
+      sym: signal.symbol,
+      fills: updated.dcaFills,
+      addQty,
+      blendedEntry: updated.entryPrice.toFixed(6),
+      totalQty: updated.quantity,
+      notional: (updated.quantity * price).toFixed(2),
+      capNotional: capNotional.toFixed(2),
+      held: updated.dcaHold === true,
+    });
   }
 
   /**

@@ -280,6 +280,54 @@ export class CryptoPaperAccount {
     return position;
   }
 
+  /**
+   * TRA-961 — additive DCA accumulation. Blend `addQty` units bought at
+   * `addPrice` into the existing position, averaging the entry while keeping the
+   * catastrophe stop FIXED — we average *size*, never the *stop* (the classic
+   * DCA failure mode of widening the stop "to give it room" is forbidden, same
+   * invariant as the equity scale-in in PaperAccount.addToPosition / TRA-954).
+   *
+   * `holdNoTakeProfit` flags the position so {@link checkExits} stops honoring
+   * the per-leg take-profit: a 4R TP on each leg would close the position and
+   * defeat "hold and accumulate" (TRA-961 ask #3). The Coinbase taker fee is
+   * charged on the add leg, mirroring {@link openPosition}.
+   *
+   * Returns the updated Position, or `null` when the position is absent, the add
+   * size/price is non-positive, or available cash can't cover the add (incl. fee).
+   */
+  addToPosition(
+    positionId: string,
+    addQty: number,
+    addPrice: number,
+    opts: { holdNoTakeProfit?: boolean } = {},
+  ): Position | null {
+    const pos = this.positions.get(positionId);
+    if (!pos) return null;
+    if (!Number.isFinite(addQty) || addQty <= 0) return null;
+    if (!Number.isFinite(addPrice) || addPrice <= 0) return null;
+    const notional = addPrice * addQty;
+    const entryFee = notional * FEE_RATE;
+    const cost = notional + entryFee;
+    if (cost > this.cash) {
+      log.warn('skip DCA add: cost exceeds cash', {
+        positionId,
+        symbol: pos.symbol,
+        cost: cost.toFixed(2),
+        cash: this.cash.toFixed(2),
+      });
+      return null;
+    }
+    const newQty = pos.quantity + addQty;
+    // Blend the average entry; the protective stop is intentionally left as-is.
+    pos.entryPrice = (pos.entryPrice * pos.quantity + addPrice * addQty) / newQty;
+    pos.quantity = newQty;
+    this.cash -= cost;
+    pos.dcaFills = (pos.dcaFills ?? 1) + 1;
+    if (opts.holdNoTakeProfit) pos.dcaHold = true;
+    this.positions.set(positionId, pos);
+    return pos;
+  }
+
   checkExits(prices: Map<string, number>): Position[] {
     const closed: Position[] = [];
     for (const [id, pos] of this.positions) {
@@ -287,11 +335,15 @@ export class CryptoPaperAccount {
       if (price == null) continue;
 
       let hit: 'tp' | 'sl' | null = null;
+      // TRA-961 — a held DCA accumulation has no per-leg take-profit; only the
+      // catastrophe stop (or a portfolio-level rule) closes it. Skip the TP arm
+      // so averaging-in is not unwound by a 4R target on the first up-move.
+      const honorTakeProfit = !pos.dcaHold;
       if (pos.side === 'buy') {
-        if (price >= pos.takeProfit) hit = 'tp';
+        if (honorTakeProfit && price >= pos.takeProfit) hit = 'tp';
         else if (price <= pos.stopLoss) hit = 'sl';
       } else {
-        if (price <= pos.takeProfit) hit = 'tp';
+        if (honorTakeProfit && price <= pos.takeProfit) hit = 'tp';
         else if (price >= pos.stopLoss) hit = 'sl';
       }
 
@@ -359,6 +411,19 @@ export class CryptoPaperAccount {
     return Array.from(this.positions.values()).some(
       p => p.symbol === symbol && p.signalType === signalType,
     );
+  }
+
+  /**
+   * TRA-961 — the open position (if any) for `(symbol, signalType)`. Returns the
+   * live reference (not a copy) so the DCA accumulation path in the engine can
+   * size an add against the current blended entry / quantity and then mutate it
+   * via {@link addToPosition}. Returns `null` when nothing is open for the pair.
+   */
+  getOpenPositionForSignalType(symbol: string, signalType: SignalType): Position | null {
+    for (const pos of this.positions.values()) {
+      if (pos.symbol === symbol && pos.signalType === signalType) return pos;
+    }
+    return null;
   }
 
   /**
