@@ -149,6 +149,24 @@ services:
       #     ANTHROPIC_API_KEY (above) is set in the dashboard.
       - key: ENABLE_OPTION_SHADOW_SELECTOR
         value: "true"
+      # TRA-967 / TRA-953 (TRA-908 Phase B) — turn OPTIONS PHASE-B PAPER
+      # EXECUTION ON. Board-approved (approval c10b717e-294f-4718-8a7c-11a2cd18875f,
+      # parallel to the shadow-flag approval 8fb26954 in TRA-942). Until this is
+      # set, `isOptionPhaseBEnabled()` is false and the shadow selector's
+      # per-tick `decision:'signal'` structures are observed-only (appended to the
+      # JSONL ledger) and never routed into the paper options book —
+      # `GET /api/health/options-pipeline` reports `phaseBPaperExecutionEnabled:false`.
+      #
+      # SAFETY — PAPER-ONLY. This is strictly subordinate to
+      # ENABLE_OPTION_SHADOW_SELECTOR (above): with the shadow flag off this does
+      # nothing. When on, each selected defined-risk structure routes into
+      # `PaperOptionsAccount.openDefinedRiskSpread` with mode:'demo' — NO Tradier
+      # mirror, NO live capital. It is gated to market hours and rides the RV
+      # scanner's warm chain cache (no extra Tradier budget). Revert = clear this
+      # value (flip the flag off). Closing TRA-967 unblocks TRA-953, which then
+      # accrues demo option fills during the next RTH.
+      - key: ENABLE_OPTION_PHASE_B_PAPER
+        value: "true"
       # TRA-713 — persistent live-equity boot-arm (board-ratified approval
       # 979c77c1). FIX for "prod equity Live reverts to demo on restart": the
       # original arm lived only in the running engine's in-memory `mode`, so every
