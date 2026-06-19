@@ -2264,6 +2264,61 @@ export const WATCHLIST: readonly string[] = [
 export const EQUITIES_WATCHLIST = WATCHLIST;
 
 /**
+ * TRA-952 — curated LIQUID swing-trade universe for the equity engine.
+ *
+ * Live evidence (2026-06-18) showed the demo equity engine day-trading thin
+ * small-caps (RKLB, RDW, UMAC, MNTS, SPCE, …) where intraday slippage eats the
+ * swing edge. The swing conversion restricts equity *entries* to liquid
+ * large-caps + the liquid crypto-proxy names so a 2–10 trading-day hold isn't
+ * bled out by spread/slippage. This is the curatable allow-list: QuantTrader
+ * owns the exact membership and can override it at runtime via the
+ * `EQUITY_SWING_UNIVERSE` env (comma/space-separated tickers) without a
+ * redeploy — see {@link resolveEquitySwingUniverse}.
+ *
+ * Deliberately a SUBSET of {@link WATCHLIST}: the thinnest single-stock names
+ * are dropped; deep-book mega-caps and broad-market ETFs stay. `*-USD` crypto
+ * majors are handled by {@link CRYPTO_WATCHLIST} on the crypto engine and are
+ * always swing-eligible (see {@link isLiquidSwingSymbol}).
+ */
+export const EQUITY_SWING_UNIVERSE: readonly string[] = [
+  // Mega-cap tech / deep single-stock books
+  'AAPL', 'MSFT', 'NVDA', 'GOOGL', 'AMZN', 'META', 'TSLA', 'AMD',
+  'NFLX', 'ORCL', 'AVGO', 'CRM', 'ADBE', 'QCOM',
+  // Liquid crypto-proxy large-caps
+  'COIN', 'MSTR',
+  // Broad-market index ETFs (deepest books on the tape)
+  'SPY', 'QQQ', 'IWM', 'DIA', 'XLF',
+] as const;
+
+/**
+ * TRA-952 — resolve the active equity swing universe. Honors the
+ * `EQUITY_SWING_UNIVERSE` env override (comma/space-separated tickers) so
+ * QuantTrader can curate the allow-list at runtime; falls back to the shipped
+ * {@link EQUITY_SWING_UNIVERSE} default. Tickers are upper-cased and aliased.
+ */
+export function resolveEquitySwingUniverse(): readonly string[] {
+  const raw = (typeof process !== 'undefined' ? process.env?.EQUITY_SWING_UNIVERSE : undefined) ?? '';
+  const parsed = raw.split(/[,\s]+/).map(s => s.trim().toUpperCase()).filter(Boolean);
+  const list = parsed.length > 0 ? parsed : EQUITY_SWING_UNIVERSE;
+  return list.map(s => aliasWatchlistSymbol(s).toUpperCase());
+}
+
+/**
+ * TRA-952 — true when `symbol` is eligible for a swing-trade equity entry:
+ * either an explicit member of the curated liquid universe, or a `*-USD`
+ * crypto major (those route through the crypto engine's own Coinbase-strict
+ * universe and are always swing-eligible here). Aliases legacy tickers first.
+ */
+export function isLiquidSwingSymbol(
+  symbol: string,
+  universe: readonly string[] = resolveEquitySwingUniverse(),
+): boolean {
+  const upper = (symbol ?? '').toUpperCase();
+  if (/-USD$/i.test(upper)) return true;
+  return universe.includes(aliasWatchlistSymbol(upper).toUpperCase());
+}
+
+/**
  * TRA-844 — coarse GICS-style sector buckets for the equity/options universe,
  * used by the portfolio Greeks + allocation rollup to group exposure by sector
  * (the "biggest risk blind spot" the issue closes — e.g. seeing that 70% of

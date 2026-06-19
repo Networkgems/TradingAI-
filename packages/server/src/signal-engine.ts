@@ -1,8 +1,8 @@
 import { OrbStrategy, BbFadeStrategy, IchimokuStrategy, SupertrendConfluenceStrategy, confluenceSide, supertrend, reversalChecklist, atr, donchian, supportResistance, blackScholesDelta, daysToExpiration, TradierOptionsClient, TradierOrderClient, TRADIER_REJECTED_STATUSES, evaluateSma200, SMA200_MIN_BARS, SMA200_DEBOUNCE_BARS, composeTechnicalSnapshot, resampleCandles, TF_BUCKET_MS } from '@trading-app/engine';
 import type { StrategySelectorInput, ContractQuote, OptionTrend } from '@trading-app/engine';
 import type { TradierAccountBalance } from '@trading-app/engine';
-import { WATCHLIST, MANAGED_ACCOUNT_RATIO, MAX_CONSECUTIVE_LOSSES, DAILY_DRAWDOWN_HALT_PCT, OPTIONS_PER_TICKET_DOLLAR_FLOOR, OPTIONS_POSITION_CAP_RATIO, aliasWatchlistSymbol, isLiveTradierOptionsEnabled, isStockMarketOpen, perPositionCap, resolveAutoManageImportedTradierOptions, resolveDemoCostModel, resolveHoldLiveOptionsOvernight, resolveLiveTradeEquitiesTradier, resolveManagedAccountRatio, resolveMarketReviewGatesEnabled, resolveRiskPerTrade, resolveRvDtePrefs, resolveTradierOptionsCreds, validateBracket, DEFAULT_RV_DTE_MIN, DEFAULT_RV_DTE_MAX, DEFAULT_RV_DTE_TARGET, scoreNewsSentiment, aggregateSymbolSentiment, aggregateFedSentiment, aggregateStockTwitsSentiment, dedupeStockTwitsMessages, mapCuratedMessagesBySymbol, nameAliasesFor } from '@trading-app/shared';
-import type { TradeSignal, RelativeValueSignal, Sma200Signal, Candle, OptionsAccountState, SignalType, Position, OptionPosition, AccountMode, AccountSettings, AccountState, NewsItem, SymbolSentiment, SocialSentiment, StockTwitsMessage, TechnicalSignalSnapshot, TradierEnv, MarketReview, MarketReviewGates, EngineMarketReviewState, GatedStrategyNote, AgentRecommendation, TradeProposal, AgentOrderAudit } from '@trading-app/shared';
+import { WATCHLIST, isLiquidSwingSymbol, checkEquitySwingClose, MANAGED_ACCOUNT_RATIO, MAX_CONSECUTIVE_LOSSES, DAILY_DRAWDOWN_HALT_PCT, OPTIONS_PER_TICKET_DOLLAR_FLOOR, OPTIONS_POSITION_CAP_RATIO, aliasWatchlistSymbol, isLiveTradierOptionsEnabled, isStockMarketOpen, perPositionCap, resolveAutoManageImportedTradierOptions, resolveDemoCostModel, resolveHoldLiveOptionsOvernight, resolveLiveTradeEquitiesTradier, resolveManagedAccountRatio, resolveMarketReviewGatesEnabled, resolveRiskPerTrade, resolveRvDtePrefs, resolveTradierOptionsCreds, validateBracket, DEFAULT_RV_DTE_MIN, DEFAULT_RV_DTE_MAX, DEFAULT_RV_DTE_TARGET, scoreNewsSentiment, aggregateSymbolSentiment, aggregateFedSentiment, aggregateStockTwitsSentiment, dedupeStockTwitsMessages, mapCuratedMessagesBySymbol, nameAliasesFor } from '@trading-app/shared';
+import type { TradeSignal, RelativeValueSignal, Sma200Signal, Candle, OptionsAccountState, SignalType, Position, OptionPosition, AccountMode, AccountSettings, AccountState, NewsItem, SymbolSentiment, SocialSentiment, StockTwitsMessage, TechnicalSignalSnapshot, TradierEnv, MarketReview, MarketReviewGates, EngineMarketReviewState, GatedStrategyNote, AgentRecommendation, TradeProposal, AgentOrderAudit, GuardrailVerdict } from '@trading-app/shared';
 import { shouldAutoConfirm } from '@trading-app/shared';
 // TRA-544 (TRA-529 P1) / TRA-747 (P2) — advisory multi-agent layer. ON suspends
 // deterministic auto-routing and the engine surfaces the recommendations on the
@@ -1729,10 +1729,15 @@ export class SignalEngine {
       // (no new prints), so the gate only applies while the market is open.
       const equityFeedGateActive = isStockMarketOpen();
       const freshnessNow = Date.now();
+      // TRA-952 — in swing mode, only the curated liquid universe is tradable;
+      // skip strategy evaluation entirely on off-universe (thin small-cap) names
+      // so the intraday churners never even fire on them.
+      const swingMode = this.equitySwingModeEnabled();
       // Run strategies and collect new signals
       for (const sym of activeSymbols) {
         const candles = this.candleCache.get(sym) ?? [];
         if (candles.length < 15) continue;
+        if (swingMode && !isLiquidSwingSymbol(sym)) continue;
         if (equityFeedGateActive) {
           const verdict = evaluateFeedFreshness({ candles }, freshnessNow);
           if (verdict.stale) {
@@ -1742,8 +1747,14 @@ export class SignalEngine {
         }
         symbolsWithData++;
 
-        const orbSignal = this.orb.evaluate(sym, candles);
-        const bbFadeSignal = this.bbFade.evaluate(sym, candles);
+        // TRA-952 — swing cadence: disable the intraday churners (ORB
+        // opening-range breakout and the 1h-bar BbFade) whose tight intraday
+        // targets produce sub-session scalps that violate the 2-trading-day
+        // swing floor. Ichimoku (Kumo-breakout trend follower) stays as the
+        // intraday router; the daily SMA200 reclaim/pullback path runs on its
+        // own daily cadence below and remains the primary swing router.
+        const orbSignal = swingMode ? null : this.orb.evaluate(sym, candles);
+        const bbFadeSignal = swingMode ? null : this.bbFade.evaluate(sym, candles);
         const ichimokuSignal = this.ichimoku.evaluate(sym, candles);
 
         for (const signal of [orbSignal, bbFadeSignal, ichimokuSignal]) {
@@ -3539,12 +3550,36 @@ export class SignalEngine {
    * did, so the dashboard surfaces every outcome. `source` is purely for log
    * provenance — the risk guards are identical for both callers.
    */
+  /**
+   * TRA-952 — swing-trade conversion master switch. ON (the default) restricts
+   * equity entries to the curated liquid universe, disables the intraday
+   * churners (ORB + 1h BbFade), and enforces the swing holding-period floor on
+   * discretionary closes. Set `EQUITY_SWING_MODE=off` (or `0`/`false`) to revert
+   * to the legacy intraday day-trading behavior — the owner (QuantTrader) wants
+   * the swing conversion on, so the kill switch is opt-OUT.
+   */
+  private equitySwingModeEnabled(): boolean {
+    const v = (process.env.EQUITY_SWING_MODE ?? '').trim().toLowerCase();
+    return !(v === 'off' || v === '0' || v === 'false' || v === 'no');
+  }
+
   private async routeEquitySignal(
     signal: TradeSignal,
     price: number | undefined,
     source: 'deterministic' | 'agent-gating' = 'deterministic',
   ): Promise<Position | null> {
     const sym = signal.symbol;
+    // TRA-952 — swing universe gate (backstop for the agent-gating path; the
+    // deterministic scan already skips off-universe symbols before evaluation).
+    // Block equity entries on names outside the curated liquid universe (thin
+    // small-caps where slippage eats the swing edge). `*-USD` crypto majors pass.
+    if (this.equitySwingModeEnabled() && !isLiquidSwingSymbol(sym)) {
+      signal.signalSkipReason = `outside swing universe (illiquid for swing): ${sym}`;
+      log.info('equity signal suppressed: symbol outside liquid swing universe', {
+        component: 'equity-scan', via: source, sym, signalType: signal.type,
+      });
+      return null;
+    }
     // Skip if an equity position for this symbol+strategy type is already open
     if (this.account.hasOpenPositionForSignalType(sym, signal.type)) return null;
     // TRA-335 — same dedup against the live mirror so we don't
@@ -4090,7 +4125,34 @@ export class SignalEngine {
     return this.riskGovernor.isKillSwitchEngaged();
   }
 
+  /**
+   * TRA-952 — equity swing-trade close guard. Mirrors the options account's
+   * `checkDayTradingClose`: a *discretionary* (manual / user-initiated) close of
+   * an equity opened too recently is refused so the book honors the 2-trading-day
+   * swing floor. Risk-driven exits (SL/TP/trailing) do NOT call this — they run
+   * through the account's auto-exit path, never `manualClosePosition`, so a hard
+   * stop always fires regardless. Returns `{ allowed:true }` when swing mode is
+   * off, the position isn't found, or the holding floor is satisfied.
+   */
+  checkEquityDayTradingClose(positionId: string, now: number = Date.now()): GuardrailVerdict {
+    if (!this.equitySwingModeEnabled()) return { allowed: true };
+    const open =
+      this.liveEquityPositions.get(positionId) ??
+      this.account.getState().openPositions.find(p => p.id === positionId);
+    if (!open) return { allowed: true };
+    return checkEquitySwingClose(open.openedAt, now);
+  }
+
   manualClosePosition(positionId: string, currentPrice: number): Position | null {
+    // TRA-952 — refuse a same-session / sub-swing-floor discretionary close so the
+    // demo (and live) equity book stops day-trading. Risk exits bypass this path.
+    const swingVerdict = this.checkEquityDayTradingClose(positionId);
+    if (!swingVerdict.allowed) {
+      log.warn('equity manual close blocked by swing holding-period floor', {
+        positionId, reason: swingVerdict.reason,
+      });
+      return null;
+    }
     // TRA-335 — when the position lives in the live equity store, route a
     // real Tradier sell instead of mutating demo paper-account cash. The
     // OTOCO entry leg automatically attaches OCO TP/SL legs; closing

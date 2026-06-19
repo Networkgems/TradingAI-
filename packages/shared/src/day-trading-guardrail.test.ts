@@ -8,6 +8,9 @@ import {
   checkEntryDte,
   checkIdeaDte,
   checkDiscretionaryClose,
+  checkEquitySwingClose,
+  tradingDaysBetween,
+  EQUITY_SWING_GUARDRAIL,
   dteFromExpiration,
   isSameSession,
   sessionDayKey,
@@ -100,6 +103,45 @@ describe('checkDiscretionaryClose (same-session round-trip block)', () => {
     const openedAt = Date.parse('2026-06-08T13:35:00Z');
     const closeAt = Date.parse('2026-06-08T19:50:00Z');
     expect(checkDiscretionaryClose(openedAt, closeAt, cfg).allowed).toBe(true);
+  });
+});
+
+describe('TRA-952 equity swing holding-period floor', () => {
+  it('ships the documented defaults: same-session block + 2-trading-day floor', () => {
+    expect(EQUITY_SWING_GUARDRAIL.blockSameSessionRoundTrip).toBe(true);
+    expect(EQUITY_SWING_GUARDRAIL.minHoldingTradingDays).toBe(2);
+  });
+
+  it('counts trading days excluding weekends (Fri-open / Mon-close = 1)', () => {
+    const friOpen = Date.parse('2026-06-12T14:00:00Z'); // Friday
+    const monClose = Date.parse('2026-06-15T14:00:00Z'); // Monday
+    expect(tradingDaysBetween(friOpen, monClose)).toBe(1);
+  });
+
+  it('counts a full Mon→Thu hold as 3 trading days', () => {
+    const monOpen = Date.parse('2026-06-08T14:00:00Z'); // Monday
+    const thuClose = Date.parse('2026-06-11T14:00:00Z'); // Thursday
+    expect(tradingDaysBetween(monOpen, thuClose)).toBe(3);
+  });
+
+  it('blocks a same-session equity round trip', () => {
+    const openedAt = Date.parse('2026-06-08T13:35:00Z');
+    const closeAt = Date.parse('2026-06-08T19:50:00Z'); // same UTC day
+    const v = checkEquitySwingClose(openedAt, closeAt);
+    expect(v.allowed).toBe(false);
+    expect(v.reason).toMatch(/no day trading/i);
+  });
+
+  it('blocks a discretionary close inside the 2-trading-day floor (next-session close)', () => {
+    const monOpen = Date.parse('2026-06-08T14:00:00Z'); // Monday
+    const tueClose = Date.parse('2026-06-09T14:00:00Z'); // Tuesday — only 1 trading day
+    expect(checkEquitySwingClose(monOpen, tueClose).allowed).toBe(false);
+  });
+
+  it('allows a close once the 2-trading-day floor is met', () => {
+    const monOpen = Date.parse('2026-06-08T14:00:00Z'); // Monday
+    const wedClose = Date.parse('2026-06-10T14:00:00Z'); // Wednesday — 2 trading days
+    expect(checkEquitySwingClose(monOpen, wedClose).allowed).toBe(true);
   });
 });
 

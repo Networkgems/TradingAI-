@@ -181,3 +181,78 @@ export function checkDiscretionaryClose(
   }
   return ALLOWED;
 }
+
+// ── TRA-952 — equity swing-trade holding-period floor ──────────────────────
+//
+// The options layer above blocks 0DTE/short-dated entries + same-session round
+// trips. Equities have no DTE, so the swing-conversion analog is a *holding-
+// period* floor expressed in TRADING days (weekends don't count toward the
+// scalp window). A discretionary close is refused until the position has been
+// held the minimum number of trading days. Risk-driven exits (stop-loss /
+// take-profit / trailing) are NOT discretionary and bypass this entirely — a
+// hard stop can always fire same-session, exactly as the acceptance allows.
+
+/** Central config for the equity swing-trade holding-period floor (TRA-952). */
+export interface EquitySwingGuardrailConfig {
+  /** Refuse a discretionary close opened+closed in the same UTC session. Default true. */
+  blockSameSessionRoundTrip: boolean;
+  /** Minimum *trading* days held before a discretionary close is allowed. Default 2. */
+  minHoldingTradingDays: number;
+}
+
+/** Shipped defaults: no same-session round trips, ≥2 trading-day swing floor. */
+export const EQUITY_SWING_GUARDRAIL: EquitySwingGuardrailConfig = {
+  blockSameSessionRoundTrip: true,
+  minHoldingTradingDays: 2,
+};
+
+/**
+ * Count whole TRADING days (Mon–Fri, UTC) strictly between the open session and
+ * the close instant. Weekend days are not counted, so a Friday-open /
+ * Monday-close is 1 trading day, not 3. Deliberately calendar-weekday based (no
+ * exchange-holiday calendar) — it only needs to gate the intraday-scalp window,
+ * where holiday precision is immaterial and erring toward "held fewer days"
+ * keeps the floor conservative.
+ */
+export function tradingDaysBetween(openedAtMs: number, nowMs: number): number {
+  if (!(nowMs > openedAtMs)) return 0;
+  const startDay = Math.floor(Date.parse(`${sessionDayKey(openedAtMs)}T00:00:00Z`) / 86_400_000);
+  const endDay = Math.floor(Date.parse(`${sessionDayKey(nowMs)}T00:00:00Z`) / 86_400_000);
+  let count = 0;
+  for (let d = startDay + 1; d <= endDay; d += 1) {
+    const dow = new Date(d * 86_400_000).getUTCDay(); // 0 Sun … 6 Sat
+    if (dow !== 0 && dow !== 6) count += 1;
+  }
+  return count;
+}
+
+/**
+ * Equity discretionary-close gate: refuse a voluntary close that would complete
+ * a same-session round trip or fall short of the swing holding floor. This is
+ * the equity-engine analog of {@link checkDiscretionaryClose} (options). Risk
+ * exits do NOT call this — they are always allowed.
+ *
+ * @param openedAtMs when the position was opened (ms epoch).
+ * @param nowMs      the close instant (ms epoch).
+ */
+export function checkEquitySwingClose(
+  openedAtMs: number,
+  nowMs: number,
+  cfg: EquitySwingGuardrailConfig = EQUITY_SWING_GUARDRAIL,
+): GuardrailVerdict {
+  if (cfg.blockSameSessionRoundTrip && isSameSession(openedAtMs, nowMs)) {
+    return {
+      allowed: false,
+      reason:
+        'no day trading: opening and closing this equity in one session is not allowed — close it on a later session or let it auto-exit at its stop',
+    };
+  }
+  const held = tradingDaysBetween(openedAtMs, nowMs);
+  if (cfg.minHoldingTradingDays > 0 && held < cfg.minHoldingTradingDays) {
+    return {
+      allowed: false,
+      reason: `no day trading: equity held ${held} trading day(s), below the ${cfg.minHoldingTradingDays}-trading-day swing minimum`,
+    };
+  }
+  return ALLOWED;
+}
