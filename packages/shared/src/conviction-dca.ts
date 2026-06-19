@@ -80,6 +80,27 @@ export interface ConvictionDcaConfig {
   respectDailyLossLimit: boolean;
   /** No add inside the last N minutes of the session. Default 30. */
   noAddLastMinutes: number;
+  /**
+   * Options conviction floor (TRA-958 gate A): the add contract must carry real
+   * directional exposure — `|delta| >= this`. Averaging into a far-OTM (low-delta)
+   * contract is averaging into a decay machine, the opposite of a conviction add.
+   * No upper cap — deep-ITM behaves like stock and is fine. Default 0.35.
+   */
+  optionMinAddDelta: number;
+  /**
+   * Event blackout (TRA-958 gate B): no ADD within this many trading days before a
+   * scheduled underlying earnings date (equities + options). Conviction can
+   * evaporate on a binary event; we never pyramid into one. The initial entry is
+   * unaffected — adds only. Default 2.
+   */
+  earningsBlackoutTradingDays: number;
+  /**
+   * Per-name daily add cap (TRA-958 gate C): hard cap on adds for a single symbol
+   * per session. `minSpacingBars=1` covers swing (1 daily bar = 1 day) but on an
+   * intraday path it would permit stacking both adds in one ugly session; this
+   * forbids that. Default 1.
+   */
+  maxAddsPerNamePerDay: number;
 }
 
 /** Documented shipped defaults. Changing the product stance is a one-line edit here. */
@@ -94,6 +115,9 @@ export const CONVICTION_DCA: ConvictionDcaConfig = {
   optionMaxSpreadWidthPct: 0.1,
   respectDailyLossLimit: true,
   noAddLastMinutes: 30,
+  optionMinAddDelta: 0.35, // TRA-958 gate A
+  earningsBlackoutTradingDays: 2, // TRA-958 gate B
+  maxAddsPerNamePerDay: 1, // TRA-958 gate C
 };
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -216,12 +240,47 @@ export interface EquityAddContext {
   grossExposureBreached: boolean;
   /** Daily-loss limit already tripped → block (when `respectDailyLossLimit`). */
   dailyLossLimitBreached: boolean;
+  /**
+   * Trading days until this name's next scheduled earnings, or `null` when none is
+   * scheduled/known. An add inside `earningsBlackoutTradingDays` is blocked (gate B).
+   */
+  tradingDaysToEarnings: number | null;
+  /** Adds already executed for THIS name during the current session (gate C). */
+  addsToday: number;
 }
 
 const MIN_EQUITY_UNIT = 1; // one share — the smallest add we will place
 
 function skip(reason: string, riskBudget: number): DcaVerdict {
   return { action: 'skip', qty: 0, reason, riskBudget };
+}
+
+/**
+ * Shared event + cadence hard gates (TRA-958 gates C and B) used by both the
+ * equity and options evaluators. Returns a `skip` verdict when an add is blocked
+ * by the per-name daily add cap or the earnings blackout, else `null`.
+ *
+ * `tradingDaysToEarnings` is `null` when no earnings is scheduled/known — the
+ * blackout only fires against a known event (the caller owns supplying it).
+ */
+function eventCadenceSkip(
+  addsToday: number,
+  tradingDaysToEarnings: number | null,
+  R: number,
+  config: ConvictionDcaConfig,
+): DcaVerdict | null {
+  // ── Gate C: max adds per name per session ──
+  if (addsToday >= config.maxAddsPerNamePerDay) {
+    return skip(`already added ${addsToday}x today (max ${config.maxAddsPerNamePerDay}/name/day)`, R);
+  }
+  // ── Gate B: earnings/event blackout (adds only; initial entry is unaffected) ──
+  if (tradingDaysToEarnings !== null && tradingDaysToEarnings <= config.earningsBlackoutTradingDays) {
+    return skip(
+      `earnings in ${tradingDaysToEarnings} trading day(s) — inside ${config.earningsBlackoutTradingDays}-day blackout, no add`,
+      R,
+    );
+  }
+  return null;
 }
 
 /**
@@ -245,6 +304,10 @@ export function evaluateEquityDcaAdd(
   if (ctx.grossExposureBreached) {
     return skip('portfolio gross-exposure cap breached — add blocked', R);
   }
+
+  // ── Event + cadence hard gates (TRA-958 gates C + B) ──
+  const eventSkip = eventCadenceSkip(ctx.addsToday, ctx.tradingDaysToEarnings, R, config);
+  if (eventSkip) return eventSkip;
 
   // ── Tranche budget ──
   const addsUsed = Math.max(0, ctx.tranches.length - 1);
@@ -360,6 +423,12 @@ export interface OptionAddContext {
   addDebitPerContract: number;
   /** Remaining days-to-expiration. Adding into < `optionMinDTE` is refused (theta). */
   dte: number;
+  /**
+   * Signed delta of the proposed ADD contract (calls positive, puts negative). The
+   * add must carry `|delta| >= optionMinAddDelta` (gate A) — real directional
+   * exposure, not a far-OTM lottery leg. No upper cap.
+   */
+  addDelta: number;
   /** Underlying still confirms the directional thesis (same SMA-50 / signal check as equities). */
   underlyingThesisConfirmed: boolean;
   /** Spread bid/ask width as a fraction of mid — liquidity guard. */
@@ -370,6 +439,13 @@ export interface OptionAddContext {
   dailyLossLimitBreached: boolean;
   /** Portfolio gross-exposure cap breached → block. */
   grossExposureBreached: boolean;
+  /**
+   * Trading days until the underlying's next scheduled earnings, or `null` when
+   * none is scheduled/known. An add inside `earningsBlackoutTradingDays` is blocked (gate B).
+   */
+  tradingDaysToEarnings: number | null;
+  /** Adds already executed for THIS name during the current session (gate C). */
+  addsToday: number;
 }
 
 const MIN_OPTION_UNIT = 1; // one contract
@@ -399,6 +475,10 @@ export function evaluateOptionDcaAdd(
     return skip('portfolio gross-exposure cap breached — add blocked', R);
   }
 
+  // ── Event + cadence hard gates (TRA-958 gates C + B) ──
+  const eventSkip = eventCadenceSkip(ctx.addsToday, ctx.tradingDaysToEarnings, R, config);
+  if (eventSkip) return eventSkip;
+
   // ── Tranche budget ──
   const addsUsed = Math.max(0, ctx.tranches.length - 1);
   if (addsUsed >= config.maxAdds) {
@@ -408,6 +488,14 @@ export function evaluateOptionDcaAdd(
   // ── DTE gate (acceptance #4) ──
   if (ctx.dte < config.optionMinDTE) {
     return skip(`DTE ${ctx.dte} < ${config.optionMinDTE} — theta-dominated, no add`, R);
+  }
+
+  // ── Conviction delta floor (TRA-958 gate A): no averaging into a far-OTM decay leg ──
+  if (Math.abs(ctx.addDelta) < config.optionMinAddDelta) {
+    return skip(
+      `add |delta| ${Math.abs(ctx.addDelta).toFixed(2)} < floor ${config.optionMinAddDelta} — too far OTM for a conviction add`,
+      R,
+    );
   }
 
   // ── Thesis gate (acceptance #4): the UNDERLYING must still confirm, not IV crush ──

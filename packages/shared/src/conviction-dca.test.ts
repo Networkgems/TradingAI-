@@ -34,6 +34,8 @@ function baseEquity(over: Partial<EquityAddContext> = {}): EquityAddContext {
     minutesToSessionClose: 120,
     grossExposureBreached: false,
     dailyLossLimitBreached: false,
+    tradingDaysToEarnings: null, // no earnings scheduled → blackout inert
+    addsToday: 0,
     ...over,
   };
 }
@@ -45,11 +47,14 @@ function baseOption(over: Partial<OptionAddContext> = {}): OptionAddContext {
     riskBudget: 500,
     addDebitPerContract: 200,
     dte: 40,
+    addDelta: 0.5, // comfortably above the 0.35 conviction floor
     underlyingThesisConfirmed: true,
     spreadWidthPct: 0.05,
     atMaxContracts: false,
     dailyLossLimitBreached: false,
     grossExposureBreached: false,
+    tradingDaysToEarnings: null,
+    addsToday: 0,
     ...over,
   };
 }
@@ -65,6 +70,10 @@ describe('CONVICTION_DCA defaults', () => {
     expect(CONVICTION_DCA.optionMinDTE).toBe(21);
     expect(CONVICTION_DCA.respectDailyLossLimit).toBe(true);
     expect(CONVICTION_DCA.noAddLastMinutes).toBe(30);
+    // TRA-958 live-flip gates A/B/C
+    expect(CONVICTION_DCA.optionMinAddDelta).toBe(0.35);
+    expect(CONVICTION_DCA.earningsBlackoutTradingDays).toBe(2);
+    expect(CONVICTION_DCA.maxAddsPerNamePerDay).toBe(1);
   });
 });
 
@@ -287,6 +296,74 @@ describe('acceptance #5 — portfolio hard gates block all adds', () => {
   it('respectDailyLossLimit=false lets the daily-loss breach pass (config-gated)', () => {
     const cfg: ConvictionDcaConfig = { ...ON, respectDailyLossLimit: false };
     const v = evaluateEquityDcaAdd(baseEquity({ dailyLossLimitBreached: true }), cfg);
+    expect(v.action).not.toBe('skip');
+  });
+});
+
+// ── TRA-958 live-flip gates A/B/C (required before dca.enabled=true for live) ──
+describe('TRA-958 gate A — option conviction delta floor (|delta| >= 0.35)', () => {
+  it('blocks a far-OTM call add below the delta floor', () => {
+    const v = evaluateOptionDcaAdd(baseOption({ addDelta: 0.2 }), ON);
+    expect(v.action).toBe('skip');
+    expect(v.reason).toMatch(/delta.*floor 0.35|too far OTM/);
+  });
+
+  it('blocks a far-OTM put add below the floor (sign-agnostic)', () => {
+    const v = evaluateOptionDcaAdd(baseOption({ addDelta: -0.2 }), ON);
+    expect(v.action).toBe('skip');
+    expect(v.reason).toMatch(/too far OTM/);
+  });
+
+  it('allows a put add with delta at/below −0.35', () => {
+    const v = evaluateOptionDcaAdd(baseOption({ addDelta: -0.45 }), ON);
+    expect(v.action).not.toBe('skip');
+  });
+
+  it('no upper delta cap — deep-ITM (delta ~0.9) still allowed', () => {
+    const v = evaluateOptionDcaAdd(baseOption({ addDelta: 0.9 }), ON);
+    expect(v.action).not.toBe('skip');
+  });
+});
+
+describe('TRA-958 gate B — earnings/event blackout (no add within 2 trading days)', () => {
+  it('equity: blocks an add when earnings is inside the blackout window', () => {
+    const v = evaluateEquityDcaAdd(baseEquity({ tradingDaysToEarnings: 1 }), ON);
+    expect(v.action).toBe('skip');
+    expect(v.reason).toMatch(/blackout/);
+  });
+
+  it('equity: allows the add when earnings is outside the window', () => {
+    const v = evaluateEquityDcaAdd(baseEquity({ tradingDaysToEarnings: 3 }), ON);
+    expect(v.action).not.toBe('skip');
+  });
+
+  it('equity: null (no earnings scheduled) leaves the blackout inert', () => {
+    const v = evaluateEquityDcaAdd(baseEquity({ tradingDaysToEarnings: null }), ON);
+    expect(v.action).not.toBe('skip');
+  });
+
+  it('option: blocks an add the trading day before earnings (boundary = 2)', () => {
+    const v = evaluateOptionDcaAdd(baseOption({ tradingDaysToEarnings: 2 }), ON);
+    expect(v.action).toBe('skip');
+    expect(v.reason).toMatch(/blackout/);
+  });
+});
+
+describe('TRA-958 gate C — max 1 add per name per day', () => {
+  it('equity: blocks a second add once one has fired today', () => {
+    const v = evaluateEquityDcaAdd(baseEquity({ addsToday: 1 }), ON);
+    expect(v.action).toBe('skip');
+    expect(v.reason).toMatch(/max 1\/name\/day/);
+  });
+
+  it('option: blocks a second add once one has fired today', () => {
+    const v = evaluateOptionDcaAdd(baseOption({ addsToday: 1 }), ON);
+    expect(v.action).toBe('skip');
+    expect(v.reason).toMatch(/name\/day/);
+  });
+
+  it('equity: the first add of the day (addsToday=0) is allowed', () => {
+    const v = evaluateEquityDcaAdd(baseEquity({ addsToday: 0 }), ON);
     expect(v.action).not.toBe('skip');
   });
 });
