@@ -18,7 +18,7 @@ export function DashboardSelector({ onSelect, onLogout, theme, onToggleTheme }: 
         <button className="selector-card stocks" onClick={() => onSelect('stocks')}>
           <div className="selector-card-icon"><CandlestickIcon /></div>
           <div className="selector-card-title">Stocks Trading</div>
-          <div className="selector-card-desc">Trade US equities with ORB, Reversal, MACD, and Ichimoku strategies</div>
+          <div className="selector-card-desc">Trade US equities &amp; options with ORB, Ichimoku, Bollinger-Band Fade, and more</div>
         </button>
         <button className="selector-card crypto" onClick={() => onSelect('crypto')}>
           <div className="selector-card-icon"><BitcoinIcon /></div>
