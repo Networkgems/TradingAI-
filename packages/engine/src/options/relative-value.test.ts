@@ -489,4 +489,54 @@ describe('selectRvLongCandidate (TRA-968)', () => {
       ).toBe('C25');
     });
   });
+
+  // TRA-972 — far-OTM |delta| floor (0.45) on the midpoint fallback: stand down
+  // rather than open a deep-OTM cheap strike tagged sleeve:'directional'.
+  describe('TRA-972 — far-OTM |delta| floor on the fallback', () => {
+    it('stands down when the only trend-aligned, in-window cheap strike is far-OTM (|delta| 0.20)', () => {
+      const cands = ranked(
+        mkCand({ optionSymbol: 'C20', optionType: 'call', delta: 0.2, score: 9 }),
+      );
+      expect(selectRvLongCandidate(cands, { trendSide: 'call' })).toBeNull();
+    });
+
+    it('opens a near-ATM survivor below the band but above the floor (|delta| 0.48)', () => {
+      const cands = ranked(
+        mkCand({ optionSymbol: 'C48', optionType: 'call', delta: 0.48, score: 5 }),
+      );
+      expect(selectRvLongCandidate(cands, { trendSide: 'call' })?.optionSymbol).toBe('C48');
+    });
+
+    it('floor boundary: |delta| exactly 0.45 opens, 0.44 stands down', () => {
+      expect(
+        selectRvLongCandidate(
+          ranked(mkCand({ optionSymbol: 'C45', optionType: 'call', delta: 0.45, score: 5 })),
+          { trendSide: 'call' },
+        )?.optionSymbol,
+      ).toBe('C45');
+      expect(
+        selectRvLongCandidate(
+          ranked(mkCand({ optionSymbol: 'C44', optionType: 'call', delta: 0.44, score: 5 })),
+          { trendSide: 'call' },
+        ),
+      ).toBeNull();
+    });
+
+    it('applies on the put side too — far-OTM put in a downtrend stands down', () => {
+      const cands = ranked(
+        mkCand({ optionSymbol: 'P20', optionType: 'put', delta: -0.2, score: 9 }),
+      );
+      expect(selectRvLongCandidate(cands, { trendSide: 'put' })).toBeNull();
+    });
+
+    it('honours a caller-supplied floor override', () => {
+      // Lower the floor to 0.15 so a |delta| 0.20 far-OTM strike is admitted.
+      const cands = ranked(
+        mkCand({ optionSymbol: 'C20', optionType: 'call', delta: 0.2, score: 5 }),
+      );
+      expect(
+        selectRvLongCandidate(cands, { trendSide: 'call', deltaFloor: 0.15 })?.optionSymbol,
+      ).toBe('C20');
+    });
+  });
 });

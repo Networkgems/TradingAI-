@@ -504,6 +504,20 @@ export const RV_LONG_DELTA_TARGET_MIN = 0.55;
 export const RV_LONG_DELTA_TARGET_MAX = 0.65;
 
 /**
+ * TRA-972 — hard far-OTM |delta| floor for the midpoint fallback. When no
+ * candidate sits inside the [0.55, 0.65] band, the selector falls back to the
+ * survivor whose |delta| is closest to the band midpoint — but a deep-OTM cheap
+ * strike (e.g. |delta| 0.20 screening `cheap` on IV z ≤ −2σ) is a vol-mispricing
+ * bet, not a directional swing entry, and opening it tagged `sleeve:'directional'`
+ * muddies exactly the grading TRA-957 cleaned up. The floor is set ~0.10 below
+ * the band's lower edge: it still admits a near-ATM strike that sits just under
+ * the band (a fine slightly-OTM swing entry) but rejects genuine far-OTM strikes,
+ * so the directional sleeve stands down (returns `null`) rather than open one.
+ * No symmetric deep-ITM ceiling — high-|delta| longs are stock-like and fine.
+ */
+export const RV_LONG_DELTA_FLOOR = 0.45;
+
+/**
  * TRA-970 — DTE entry window for *new* directional single-leg long entries,
  * per the QuantTrader decision on TRA-957. The swing spec says "buy 30-45 DTE",
  * so new entries are post-filtered to **[30, 45]**. This is deliberately
@@ -538,6 +552,14 @@ export interface RvLongSelectionOptions {
    * (default 45 — `RV_LONG_DTE_ENTRY_MAX`, TRA-970).
    */
   dteEntryMax?: number;
+  /**
+   * Far-OTM |delta| floor applied to the midpoint fallback only
+   * (default 0.45 — `RV_LONG_DELTA_FLOOR`, TRA-972). When no candidate is
+   * in-band, the closest-to-midpoint survivor is rejected (selector returns
+   * `null`) if its |delta| is strictly below this floor, so a deep-OTM cheap
+   * strike never opens as a directional long.
+   */
+  deltaFloor?: number;
 }
 
 /**
@@ -562,7 +584,10 @@ export interface RvLongSelectionOptions {
  *      it keeps the scanner's own ranking (candidates arrive sorted by score,
  *      best first); with none in-band it falls back to the strike whose |delta|
  *      is *closest* to the band midpoint rather than taking the cheapest-IV
- *      strike regardless of moneyness.
+ *      strike regardless of moneyness — but only down to a hard far-OTM floor
+ *      ({@link RV_LONG_DELTA_FLOOR}, TRA-972): if even the closest survivor is
+ *      below the floor it stands down (returns `null`) rather than open a
+ *      deep-OTM cheap strike as a "directional" long.
  *
  * Long-only: only `cheap` and `below_intrinsic` rows are eligible (taking the
  * short leg of an `expensive` / `monotonic_violation` needs a defined-risk
@@ -584,6 +609,8 @@ export function selectRvLongCandidate(
   const dteLo = options.dteEntryMin ?? RV_LONG_DTE_ENTRY_MIN;
   const dteHi = options.dteEntryMax ?? RV_LONG_DTE_ENTRY_MAX;
 
+  const deltaFloor = options.deltaFloor ?? RV_LONG_DELTA_FLOOR;
+
   const eligible = candidates.filter(
     (c) =>
       (c.classification === 'cheap' || c.classification === 'below_intrinsic') &&
@@ -601,10 +628,16 @@ export function selectRvLongCandidate(
   });
   if (inBand) return inBand;
 
-  // … otherwise the strike whose |delta| is closest to the band midpoint.
-  return eligible.reduce((best, c) =>
+  // … otherwise the strike whose |delta| is closest to the band midpoint …
+  const fallback = eligible.reduce((best, c) =>
     Math.abs(Math.abs(c.delta) - mid) < Math.abs(Math.abs(best.delta) - mid)
       ? c
       : best,
   );
+
+  // … but stand down rather than open a genuine far-OTM cheap strike: a survivor
+  // whose |delta| is below the floor is a vol-mispricing bet, not a directional
+  // swing entry, and must not land tagged `sleeve:'directional'` (TRA-972).
+  if (Math.abs(fallback.delta) < deltaFloor) return null;
+  return fallback;
 }
