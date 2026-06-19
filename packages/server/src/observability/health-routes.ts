@@ -14,6 +14,11 @@ import { resolveBuildInfo } from './build-info.js';
 import { summarizeLiveHealth, summarizeFeed } from './live-health.js';
 import { checkStaleState } from './alerts.js';
 import { ATM_SEED_ENABLED_BY_DEFAULT } from '../options-research-input.js';
+import {
+  isOptionShadowEnabled,
+  isOptionPhaseBEnabled,
+  OPTION_SHADOW_EMERGENCY_OFF,
+} from '../option-shadow-ledger.js';
 
 /** Minimal shape this module needs from a per-user context. */
 export interface HealthEngineLike {
@@ -402,6 +407,21 @@ export interface OptionsPipelineReport {
    * un-gated; the dashboard RV signals above stay anomaly-only by design.
    */
   aiIdeasGeneratorUngated: boolean;
+  /**
+   * TRA-953 — true when the deterministic strategy-selector's per-tick shadow
+   * pass is enabled (`ENABLE_OPTION_SHADOW_SELECTOR` on AND the emergency hard-
+   * off disengaged). Phase-B routing is subordinate to this: with shadow off,
+   * the selector never runs so nothing can route regardless of the Phase-B flag.
+   */
+  shadowSelectorEnabled: boolean;
+  /**
+   * TRA-953 — true when selected structures are PROMOTED from observe-only to
+   * demo paper execution (`ENABLE_OPTION_PHASE_B_PAPER` on). The acceptance
+   * curl reads this with `shadowSelectorEnabled` to confirm calls/puts can fill
+   * in the demo book without a per-user login. Routing still needs the RV
+   * scanner configured (chains loading) — `rvScannerConfigured` above.
+   */
+  phaseBPaperExecutionEnabled: boolean;
   demoEngineCount: number;
   engines: OptionsPipelineEngineView[];
 }
@@ -458,6 +478,11 @@ export function summarizeOptionsPipeline(
     rvScannerConfigured: input.rvScannerConfigured,
     rvBreakerOpen: input.rvBreakerOpen,
     aiIdeasGeneratorUngated: ATM_SEED_ENABLED_BY_DEFAULT,
+    // TRA-953 — surface the shadow + Phase-B promotion gates so acceptance is
+    // verifiable from the unauthenticated probe. Shadow is the parent gate
+    // (selector pass must run); Phase-B promotes its output to paper fills.
+    shadowSelectorEnabled: !OPTION_SHADOW_EMERGENCY_OFF && isOptionShadowEnabled(),
+    phaseBPaperExecutionEnabled: isOptionPhaseBEnabled(),
     demoEngineCount: engines.length,
     engines,
   };

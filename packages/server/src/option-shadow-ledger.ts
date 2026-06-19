@@ -9,6 +9,7 @@ import {
   type StrategySelectorParams,
   type StrategySelectorResult,
 } from '@trading-app/engine';
+import type { OptionLeg } from '@trading-app/shared';
 import { logger } from './observability/index.js';
 
 // TRA-911 (TRA-908 Phase A) — flag-gated SHADOW option-trade signal ledger.
@@ -69,6 +70,93 @@ export function isOptionShadowEnabled(env: NodeJS.ProcessEnv = process.env): boo
   const raw = env[OPTION_SHADOW_FLAG];
   if (typeof raw !== 'string') return false;
   return ['1', 'true', 'yes', 'on'].includes(raw.trim().toLowerCase());
+}
+
+/**
+ * TRA-953 (TRA-908 Phase B) — promote the deterministic strategy selector from
+ * Phase-A shadow (observe-only ledger) to Phase-B PAPER execution: when this is
+ * on, every `decision: 'signal'` the selector produces is also routed to the
+ * demo paper book ({@link PaperOptionsAccount.openDefinedRiskSpread}) so calls/
+ * puts actually fill and we accrue gradeable demo data.
+ *
+ * Subordinate to {@link OPTION_SHADOW_FLAG}: the per-tick selector pass only runs
+ * when shadow is enabled, so Phase-B needs BOTH flags on. Kept as its own switch
+ * (rather than folding into the shadow flag) so promotion is a deliberate,
+ * independently-revertible step — flip it off for an instant `git push` rollback
+ * to observe-only without losing the shadow-evidence accrual. Paper-only by
+ * construction: the routed structures open in `mode: 'demo'` with NO Tradier
+ * mirror, so there is no live-capital path here.
+ */
+export const OPTION_PHASE_B_FLAG = 'ENABLE_OPTION_PHASE_B_PAPER';
+
+export function isOptionPhaseBEnabled(env: NodeJS.ProcessEnv = process.env): boolean {
+  const raw = env[OPTION_PHASE_B_FLAG];
+  if (typeof raw !== 'string') return false;
+  return ['1', 'true', 'yes', 'on'].includes(raw.trim().toLowerCase());
+}
+
+/** Per-share → per-lot dollar multiplier for an equity option contract. */
+const CONTRACT_MULTIPLIER = 100;
+
+/** The defined-risk-spread open params derived from a shadow selector signal. */
+export interface ShadowSpreadParams {
+  symbol: string;
+  strategy: string;
+  legs: OptionLeg[];
+  /** + credit / − debit, USD per 1-lot. */
+  netUsd: number;
+  /** Capped max loss (capital at risk), USD per 1-lot. */
+  maxLossUsd: number;
+  /** Capped max profit, USD per 1-lot. */
+  maxProfitUsd: number;
+  breakevens: number[];
+  spot: number;
+}
+
+/**
+ * TRA-953 — pure mapper from the engine's {@link ShadowOptionSignal} (legs carry
+ * per-share quotes/deltas but no expiration) to the server paper book's
+ * {@link PaperOptionsAccount.openDefinedRiskSpread} params (legs carry the shared
+ * expiration but no quotes). All payoff totals are modeled per 1-lot:
+ *
+ *   • `netUsd`       — `+netCredit×100` for credit structures, `−netDebit×100`
+ *                      for debit structures.
+ *   • `maxLossUsd`   — the selector's already-×100 `sizingIntent.maxLossPerSpread`.
+ *   • `maxProfitUsd` — credit verticals / iron condors keep the full credit
+ *                      (`netCredit×100`); a debit vertical's ceiling is
+ *                      `(width − debit)×100`.
+ *
+ * Breakevens are left empty (display-only on the combo row; the account stores
+ * but does not act on them) to keep the mapper total and side-effect free.
+ */
+export function shadowSignalToSpreadParams(
+  signal: ShadowOptionSignal,
+  spot: number,
+): ShadowSpreadParams {
+  const legs: OptionLeg[] = signal.legs.map((l) => ({
+    action: l.action,
+    optionType: l.optionType,
+    strike: l.strike,
+    expiration: signal.expiration,
+  }));
+  const netUsd =
+    signal.netCredit !== null
+      ? signal.netCredit * CONTRACT_MULTIPLIER
+      : -(signal.netDebit ?? 0) * CONTRACT_MULTIPLIER;
+  const maxProfitUsd =
+    signal.netCredit !== null
+      ? signal.netCredit * CONTRACT_MULTIPLIER
+      : Math.max(0, (signal.widthPoints - (signal.netDebit ?? 0)) * CONTRACT_MULTIPLIER);
+  return {
+    symbol: signal.symbol,
+    strategy: signal.strategy,
+    legs,
+    netUsd,
+    maxLossUsd: signal.sizingIntent.maxLossPerSpread,
+    maxProfitUsd,
+    breakevens: [],
+    spot,
+  };
 }
 
 function defaultStoreFile(): string {

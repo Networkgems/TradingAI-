@@ -40,7 +40,7 @@ import {
   openReversalShadowSignalsSync,
 } from './reversal-shadow-ledger.js';
 import { ivRankSync, atmIvFromRows } from './iv-rank-store.js';
-import { isOptionShadowEnabled, emitShadowOptionSignal, OPTION_SHADOW_EMERGENCY_OFF } from './option-shadow-ledger.js';
+import { isOptionShadowEnabled, isOptionPhaseBEnabled, emitShadowOptionSignal, shadowSignalToSpreadParams, OPTION_SHADOW_EMERGENCY_OFF } from './option-shadow-ledger.js';
 import { etDateString } from './scheduler.js';
 import { fetchMinuteBars, fetchDailyCandles, fetchQuotes, fetchStocksNews, isYahooBreakerOpen, setActiveInterestSymbols, setTradierStocksFeedClient } from './yahoo-feed.js';
 import { fetchStockTwitsStream, fetchStockTwitsUserStream, getCuratedStockTwitsAccounts } from './stocktwits-feed.js';
@@ -3044,9 +3044,13 @@ export class SignalEngine {
    *                 (OptionChainRow carries no greek delta).
    *
    * The whole pass is gated OFF by default and is fire-and-forget per symbol —
-   * one bad chain or earnings read can't take down the tick, and NOTHING here
-   * routes an order, opens a position, or touches capital. Order routing is
-   * Phase B (TRA-912); the advisory→capital bridge is Phase C (TRA-913).
+   * one bad chain or earnings read can't take down the tick. By default it is
+   * observe-only: it appends a well-formed shadow signal to the ledger and
+   * routes nothing. TRA-953 — when {@link OPTION_PHASE_B_FLAG} is ALSO on, each
+   * selected structure is additionally opened in the DEMO paper book
+   * ({@link PaperOptionsAccount.openDefinedRiskSpread}); that path is paper-only
+   * (`mode: 'demo'`, no equity override → no Tradier mirror), so even here no
+   * live capital is touched. The advisory→capital bridge is Phase C (TRA-913).
    */
   private async evaluateOptionShadow(symbols: string[]): Promise<void> {
     // Defense-in-depth: the caller already flag-gates, but re-check so a direct
@@ -3161,21 +3165,46 @@ export class SignalEngine {
           timestamp: asOf,
         };
 
-        // Fire-and-forget: the emit seam re-checks the flag, runs the pure
-        // selector and appends to the shadow ledger. NEVER routes an order.
+        // The emit seam re-checks the flag, runs the pure selector and appends
+        // to the shadow ledger (Phase A, observe-only). TRA-953 — when Phase-B
+        // is ALSO enabled, route the same selected structure to the demo paper
+        // book so calls/puts actually fill and we accrue gradeable data. The
+        // open is paper-only (`mode: 'demo'`, no equity override → no Tradier
+        // mirror) and dedup/window/DTE/daily-cap gates live inside the account,
+        // so re-firing on the same structure each tick is a cheap no-op.
         const res = await emitShadowOptionSignal(input);
-        if (res.emitted && res.result?.decision === 'signal') {
-          optionShadowLog.info('option shadow signal recorded', {
-            symbol: sym,
-            strategy: res.result.signal.strategy,
-            expiration,
-            daysToExpiry,
-            ivRank,
-            trend,
-            highConvictionBreakout,
-            shortDelta: res.result.signal.shortDelta,
-            routed: false,
-          });
+        if (res.result?.decision === 'signal') {
+          const sig = res.result.signal;
+          let routed = false;
+          if (isOptionPhaseBEnabled()) {
+            const opened = this.optionsAccount.openDefinedRiskSpread(
+              shadowSignalToSpreadParams(sig, spot),
+              'demo',
+            );
+            if (opened) {
+              routed = true;
+              this.emitOptionFillAlert(opened);
+              this.tracker?.saveEquity(
+                this.account.getState().totalEquity,
+                this.optionsAccount.getState().optionsPnl,
+              );
+            }
+          }
+          // Log on a fresh ledger write OR an actual paper fill (a duplicate
+          // ledger row that still routed a first fill is worth surfacing).
+          if (res.emitted || routed) {
+            optionShadowLog.info('option shadow signal recorded', {
+              symbol: sym,
+              strategy: sig.strategy,
+              expiration,
+              daysToExpiry,
+              ivRank,
+              trend,
+              highConvictionBreakout,
+              shortDelta: sig.shortDelta,
+              routed,
+            });
+          }
         }
       } catch (err: unknown) {
         optionShadowLog.warn('option shadow eval threw', {

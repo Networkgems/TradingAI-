@@ -9,8 +9,11 @@ import {
   recordOptionShadowSignal,
   listOptionShadowSignals,
   isOptionShadowEnabled,
+  isOptionPhaseBEnabled,
   emitShadowOptionSignal,
+  shadowSignalToSpreadParams,
   OPTION_SHADOW_FLAG,
+  OPTION_PHASE_B_FLAG,
 } from './option-shadow-ledger.js';
 
 const TS = Date.UTC(2026, 5, 16, 15, 0); // 2026-06-16 mid-RTH
@@ -48,6 +51,59 @@ describe('isOptionShadowEnabled (flag gate)', () => {
     for (const v of ['1', 'true', 'yes', 'on', 'TRUE', ' On ']) {
       expect(isOptionShadowEnabled({ [OPTION_SHADOW_FLAG]: v })).toBe(true);
     }
+  });
+});
+
+describe('isOptionPhaseBEnabled (TRA-953 promotion gate)', () => {
+  it('is off when the flag is unset or falsy', () => {
+    expect(isOptionPhaseBEnabled({})).toBe(false);
+    expect(isOptionPhaseBEnabled({ [OPTION_PHASE_B_FLAG]: 'false' })).toBe(false);
+    expect(isOptionPhaseBEnabled({ [OPTION_PHASE_B_FLAG]: '0' })).toBe(false);
+  });
+  it('is on for the usual truthy spellings', () => {
+    for (const v of ['1', 'true', 'yes', 'on', 'TRUE', ' On ']) {
+      expect(isOptionPhaseBEnabled({ [OPTION_PHASE_B_FLAG]: v })).toBe(true);
+    }
+  });
+  it('is independent of the shadow flag (Phase-B is its own switch)', () => {
+    expect(isOptionShadowEnabled({ [OPTION_PHASE_B_FLAG]: 'true' })).toBe(false);
+    expect(isOptionPhaseBEnabled({ [OPTION_SHADOW_FLAG]: 'true' })).toBe(false);
+  });
+});
+
+describe('shadowSignalToSpreadParams (TRA-953 Phase-B mapper)', () => {
+  it('maps a credit vertical: legs gain the shared expiration, totals ×100', () => {
+    const p = shadowSignalToSpreadParams(signal(), 95);
+    expect(p.symbol).toBe('SPY');
+    expect(p.strategy).toBe('bull_put_spread');
+    expect(p.spot).toBe(95);
+    // legs carry the shared expiration; per-share quote/delta fields are dropped.
+    expect(p.legs).toEqual([
+      { action: 'sell', optionType: 'put', strike: 93, expiration: '2026-08-21' },
+      { action: 'buy', optionType: 'put', strike: 90, expiration: '2026-08-21' },
+    ]);
+    // credit structure: netUsd = +credit×100, maxProfit = credit×100.
+    expect(p.netUsd).toBeCloseTo(24, 6);
+    expect(p.maxProfitUsd).toBeCloseTo(24, 6);
+    // maxLoss passes through the selector's already-×100 figure.
+    expect(p.maxLossUsd).toBe(276);
+    expect(p.breakevens).toEqual([]);
+  });
+
+  it('maps a debit vertical: netUsd is negative, maxProfit = (width − debit)×100', () => {
+    const p = shadowSignalToSpreadParams(
+      signal({
+        strategy: 'debit_spread',
+        netCredit: null,
+        netDebit: 1.1,
+        widthPoints: 3,
+        sizingIntent: { maxLossPerSpread: 110, riskFraction: 0.02 },
+      }),
+      100,
+    );
+    expect(p.netUsd).toBeCloseTo(-110, 6);
+    expect(p.maxLossUsd).toBe(110);
+    expect(p.maxProfitUsd).toBeCloseTo(190, 6); // (3 − 1.1) × 100
   });
 });
 
