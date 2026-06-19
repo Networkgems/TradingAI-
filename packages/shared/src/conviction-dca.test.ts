@@ -60,8 +60,8 @@ function baseOption(over: Partial<OptionAddContext> = {}): OptionAddContext {
 }
 
 describe('CONVICTION_DCA defaults', () => {
-  it('ships the documented config surface, disabled by default (opt-in, sign-off gated)', () => {
-    expect(CONVICTION_DCA.enabled).toBe(false);
+  it('ships the documented config surface, enabled for the demo/paper book (board approval 23e87348)', () => {
+    expect(CONVICTION_DCA.enabled).toBe(true);
     expect(CONVICTION_DCA.maxAdds).toBe(2);
     expect(CONVICTION_DCA.trancheSplit).toEqual([0.5, 0.3, 0.2]);
     expect(CONVICTION_DCA.equityAddSpacingATR).toBe(1.0);
@@ -370,7 +370,8 @@ describe('TRA-958 gate C — max 1 add per name per day', () => {
 
 describe('master switch', () => {
   it('disabled config skips every add (equity + option)', () => {
-    expect(evaluateEquityDcaAdd(baseEquity(), CONVICTION_DCA).action).toBe('skip');
-    expect(evaluateOptionDcaAdd(baseOption(), CONVICTION_DCA).action).toBe('skip');
+    const OFF: ConvictionDcaConfig = { ...CONVICTION_DCA, enabled: false };
+    expect(evaluateEquityDcaAdd(baseEquity(), OFF).action).toBe('skip');
+    expect(evaluateOptionDcaAdd(baseOption(), OFF).action).toBe('skip');
   });
 });

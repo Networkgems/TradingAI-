@@ -105,7 +105,7 @@ export interface ConvictionDcaConfig {
 
 /** Documented shipped defaults. Changing the product stance is a one-line edit here. */
 export const CONVICTION_DCA: ConvictionDcaConfig = {
-  enabled: false, // opt-IN; promotion to live is gated on QuantTrader sign-off (acceptance #6)
+  enabled: true, // DEMO/PAPER promotion approved (board approval 23e87348, TRA-954). Adds route through the 5-layer risk gate; live Tradier add-order path stays shadow-logged and is a separate live-flip gate.
   maxAdds: 2,
   trancheSplit: [0.5, 0.3, 0.2],
   equityAddSpacingATR: 1.0,
