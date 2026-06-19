@@ -1,7 +1,7 @@
 import { OrbStrategy, BbFadeStrategy, IchimokuStrategy, SupertrendConfluenceStrategy, confluenceSide, supertrend, reversalChecklist, atr, donchian, supportResistance, blackScholesDelta, daysToExpiration, TradierOptionsClient, TradierOrderClient, TRADIER_REJECTED_STATUSES, evaluateSma200, SMA200_MIN_BARS, SMA200_DEBOUNCE_BARS, composeTechnicalSnapshot, resampleCandles, TF_BUCKET_MS } from '@trading-app/engine';
 import type { StrategySelectorInput, ContractQuote, OptionTrend } from '@trading-app/engine';
 import type { TradierAccountBalance } from '@trading-app/engine';
-import { WATCHLIST, isLiquidSwingSymbol, checkEquitySwingClose, MANAGED_ACCOUNT_RATIO, MAX_CONSECUTIVE_LOSSES, DAILY_DRAWDOWN_HALT_PCT, OPTIONS_PER_TICKET_DOLLAR_FLOOR, OPTIONS_POSITION_CAP_RATIO, aliasWatchlistSymbol, isLiveTradierOptionsEnabled, isStockMarketOpen, perPositionCap, resolveAutoManageImportedTradierOptions, resolveDemoCostModel, resolveHoldLiveOptionsOvernight, resolveLiveTradeEquitiesTradier, resolveManagedAccountRatio, resolveMarketReviewGatesEnabled, resolveRiskPerTrade, resolveRvDtePrefs, resolveTradierOptionsCreds, validateBracket, DEFAULT_RV_DTE_MIN, DEFAULT_RV_DTE_MAX, DEFAULT_RV_DTE_TARGET, scoreNewsSentiment, aggregateSymbolSentiment, aggregateFedSentiment, aggregateStockTwitsSentiment, dedupeStockTwitsMessages, mapCuratedMessagesBySymbol, nameAliasesFor, evaluateEquityDcaAdd, CONVICTION_DCA, blendedAverage, positionRiskDollars, minutesToSessionClose, getEasternUtcOffset } from '@trading-app/shared';
+import { WATCHLIST, isLiquidSwingSymbol, checkEquitySwingClose, MANAGED_ACCOUNT_RATIO, MAX_CONSECUTIVE_LOSSES, DAILY_DRAWDOWN_HALT_PCT, OPTIONS_PER_TICKET_DOLLAR_FLOOR, OPTIONS_POSITION_CAP_RATIO, aliasWatchlistSymbol, isLiveTradierOptionsEnabled, isStockMarketOpen, perPositionCap, resolveAutoManageImportedTradierOptions, resolveDemoCostModel, resolveHoldLiveOptionsOvernight, resolveLiveTradeEquitiesTradier, resolveManagedAccountRatio, resolveMarketReviewGatesEnabled, resolveRiskPerTrade, resolveRvDtePrefs, resolveTradierOptionsCreds, validateBracket, DEFAULT_RV_DTE_MIN, DEFAULT_RV_DTE_MAX, DEFAULT_RV_DTE_TARGET, scoreNewsSentiment, aggregateSymbolSentiment, aggregateFedSentiment, aggregateStockTwitsSentiment, dedupeStockTwitsMessages, mapCuratedMessagesBySymbol, nameAliasesFor, evaluateEquityDcaAdd, evaluateOptionDcaAdd, CONVICTION_DCA, blendedAverage, positionRiskDollars, minutesToSessionClose, getEasternUtcOffset } from '@trading-app/shared';
 import type { TradeSignal, RelativeValueSignal, Sma200Signal, Candle, OptionsAccountState, SignalType, Position, OptionPosition, AccountMode, AccountSettings, AccountState, NewsItem, SymbolSentiment, SocialSentiment, StockTwitsMessage, TechnicalSignalSnapshot, TradierEnv, MarketReview, MarketReviewGates, EngineMarketReviewState, GatedStrategyNote, AgentRecommendation, TradeProposal, AgentOrderAudit, GuardrailVerdict } from '@trading-app/shared';
 import { shouldAutoConfirm } from '@trading-app/shared';
 // TRA-544 (TRA-529 P1) / TRA-747 (P2) — advisory multi-agent layer. ON suspends
@@ -899,6 +899,11 @@ export class SignalEngine {
   private dcaLastFillAt: Map<string, number> = new Map();
   // TRA-954 — adds executed per name in the current ET session (gate C cap).
   private dcaAddsToday: Map<string, { etDay: string; count: number }> = new Map();
+  // TRA-964 — options conviction-DCA per-position premium-at-risk ledger
+  // (entry first, per-contract debit), seeded lazily from the open option.
+  private dcaOptionTranches: Map<string, { qty: number; price: number }[]> = new Map();
+  // TRA-964 — options adds executed per name in the current ET session (gate C).
+  private dcaOptionAddsToday: Map<string, { etDay: string; count: number }> = new Map();
   /** TRA-335 — Tradier order id (entry leg) → local Position id, used for reconcile. */
   private liveEquityOrderIds: Map<string, number | string> = new Map();
   /**
@@ -1782,6 +1787,10 @@ export class SignalEngine {
       // TRA-958 sign-off). Shares this block's gates: deterministic
       // auto-trading on, not halted, market open.
       this.evaluateConvictionDcaAdds(prices);
+      // TRA-964 — options conviction-DCA scale-in pass (same gate: hard no-op
+      // unless CONVICTION_DCA.enabled). Scales open demo defined-risk options
+      // up toward the per-position premium cap under the same R invariant.
+      this.evaluateOptionDcaAdds(prices);
     }
 
     // TRA-787 — SupertrendConfluence SHADOW pass. Evaluates every watchlist
@@ -3720,6 +3729,167 @@ export class SignalEngine {
         withinBudget: realizedRisk <= R + 1e-6, reason: verdict.reason,
       });
     }
+  }
+
+  /**
+   * TRA-964 (TRA-954 follow-up) — risk-capped conviction-DCA scale-in pass for
+   * the OPTIONS book. The options analogue of {@link evaluateConvictionDcaAdds}.
+   *
+   * OFF by default: gated on `CONVICTION_DCA.enabled` (ships `false`). While
+   * disabled this is a hard no-op. For each open DEMO defined-risk option (long
+   * call/put, or a debit combo) it builds the `OptionAddContext` from live
+   * engine state and runs the SHIPPED pure core `evaluateOptionDcaAdd` (TRA-958
+   * gates A/B/C included). On an `add`/`shrink` it executes the tranche on the
+   * paper book via {@link PaperOptionsAccount.addToOptionPosition} (averaging the
+   * premium basis, never the loss bound) and logs the per-fill blended
+   * premium-at-risk vs R — acceptance #1 (options) evidence from the real
+   * engine. LIVE mode logs the add *intent* only; the live add-order (Tradier)
+   * path is a gated follow-up.
+   *
+   * The defined-risk premium IS the dollar risk, so the cap is simply
+   * `total_premium ≤ R` where R is the per-position premium budget
+   * ({@link PaperOptionsAccount.riskBudgetPerPosition}). Short premium is refused
+   * by the core (`definedRisk=false`).
+   */
+  private evaluateOptionDcaAdds(prices: Map<string, number>): void {
+    if (!CONVICTION_DCA.enabled) return;
+    const now = Date.now();
+    const acct = this.optionsAccount;
+    const R = acct.riskBudgetPerPosition();
+    if (!(R > 0)) return;
+
+    const demoOpen = acct.getStateForMode('demo').openOptions;
+    if (demoOpen.length === 0) return;
+
+    // Prune the per-position ledger for options that have since closed.
+    const openIds = new Set(demoOpen.map(o => o.id));
+    for (const id of this.dcaOptionTranches.keys()) if (!openIds.has(id)) this.dcaOptionTranches.delete(id);
+
+    // Gross-exposure proxy (acceptance #5): total open premium-at-risk vs the
+    // options book's managed equity. A breach blocks ALL adds.
+    let grossPremiumAtRisk = 0;
+    for (const o of demoOpen) grossPremiumAtRisk += o.premiumPaid * 100 * o.contractsRemaining;
+    const managedEq = acct.managedEquity();
+    const grossExposureBreached = managedEq > 0 && grossPremiumAtRisk > managedEq;
+    const dailyLossLimitBreached = this.riskGovernor.isHalted();
+    const etDay = new Date(now + getEasternUtcOffset(now) * 3600 * 1000).toISOString().slice(0, 10);
+
+    for (const o of demoOpen) {
+      // Imported (Tradier) rows are the user's external book — out of scope.
+      if (o.importedFromTradier) continue;
+
+      const underlyingPrice = prices.get(o.symbol);
+      if (underlyingPrice == null || !Number.isFinite(underlyingPrice)) continue;
+      const candles = this.candleCache.get(o.symbol) ?? [];
+      if (candles.length < 50) continue; // need the SMA-50 thesis window
+      const sma50 = candles.slice(-50).reduce((s, c) => s + c.close, 0) / 50;
+
+      const isCombo = Array.isArray(o.legs) && o.legs.length >= 2;
+      // Defined-risk: single-leg longs always; combos only when a NET DEBIT was
+      // paid (a credit structure is short premium — the core refuses it anyway).
+      const definedRisk = isCombo ? typeof o.netUsd === 'number' && o.netUsd < 0 : true;
+
+      // Per-contract premium basis (reserved capital). For single-leg the live
+      // add cost uses the current mark; combos have no per-tick mark, so the add
+      // reserves capital at the per-lot basis.
+      const basisPerContract = o.premiumPaid * 100;
+      if (!(basisPerContract > 0)) continue;
+      const addDebitPerContract = isCombo
+        ? basisPerContract
+        : (o.currentPremium > 0 ? o.currentPremium : o.premiumPaid) * 100;
+
+      const dte = Math.round(daysToExpiration(o.expiration ?? '', now));
+      const addDelta = this.estimateOptionAddDelta(o, underlyingPrice, dte, isCombo);
+      // Same SMA-50 directional check as equities — no averaging into IV crush.
+      const bullish = o.optionType === 'call';
+      const underlyingThesisConfirmed = bullish ? underlyingPrice > sma50 : underlyingPrice < sma50;
+
+      // Seed the per-position premium ledger from the open book on first sight.
+      let tranches = this.dcaOptionTranches.get(o.id);
+      if (!tranches) {
+        tranches = [{ qty: o.contractsRemaining, price: basisPerContract }];
+        this.dcaOptionTranches.set(o.id, tranches);
+      }
+      const premiumSoFar = tranches.reduce((s, t) => s + t.qty * t.price, 0);
+
+      const todayRec = this.dcaOptionAddsToday.get(o.symbol);
+      const addsToday = todayRec && todayRec.etDay === etDay ? todayRec.count : 0;
+
+      const verdict = evaluateOptionDcaAdd({
+        definedRisk,
+        tranches,
+        riskBudget: R,
+        addDebitPerContract,
+        dte,
+        addDelta,
+        underlyingThesisConfirmed,
+        // The entry already cleared the RV scanner's liquidity gate; the live
+        // per-add spread re-check is a gated follow-up (no per-tick combo mark).
+        spreadWidthPct: 0,
+        atMaxContracts: premiumSoFar >= R,
+        dailyLossLimitBreached,
+        grossExposureBreached,
+        tradingDaysToEarnings: earningsInDaysSync(o.symbol, now),
+        addsToday,
+      });
+      if (verdict.action === 'skip' || verdict.qty <= 0) continue;
+
+      if (this.mode === 'live') {
+        log.info('TRA-964 options conviction-DCA add intent (live shadow — order path gated)', {
+          symbol: o.symbol, optionId: o.id, optionSymbol: o.optionSymbol, action: verdict.action,
+          addContracts: verdict.qty, addDebitPerContract,
+          projectedRisk: verdict.projectedRisk, riskBudget: R,
+        });
+        continue;
+      }
+
+      const updated = acct.addToOptionPosition(o.id, verdict.qty, addDebitPerContract);
+      if (!updated) continue;
+      tranches.push({ qty: verdict.qty, price: addDebitPerContract });
+      this.dcaOptionAddsToday.set(o.symbol, { etDay, count: addsToday + 1 });
+
+      // Per-fill premium-at-risk evidence (acceptance #1, options): Σ premium ≤ R.
+      const premiumAtRisk = tranches.reduce((s, t) => s + t.qty * t.price, 0);
+      log.info('TRA-964 options conviction-DCA add filled (demo)', {
+        symbol: o.symbol, optionId: o.id, optionSymbol: o.optionSymbol, action: verdict.action,
+        addContracts: verdict.qty, addDebitPerContract,
+        dte, addDelta: Number(addDelta.toFixed(4)), totalContracts: updated.contracts,
+        premiumAtRiskDollars: Number(premiumAtRisk.toFixed(2)), riskBudget: Number(R.toFixed(2)),
+        withinBudget: premiumAtRisk <= R + 1e-6, reason: verdict.reason,
+      });
+    }
+  }
+
+  /**
+   * TRA-964 — best-effort signed delta of a conviction-DCA add contract for the
+   * gate-A conviction floor (`|delta| >= optionMinAddDelta`). Single-leg longs
+   * use the scanner delta captured at entry when present; otherwise (and for the
+   * long anchor leg of a debit combo) we price a Black-Scholes delta off the
+   * strike with a fallback IV. Gate A reads only `|delta|`, so the fallback IV
+   * affects magnitude, not sign. Returns 0 when the inputs can't be priced — the
+   * core then skips the add (we never average into something we can't measure).
+   */
+  private estimateOptionAddDelta(
+    o: OptionPosition,
+    spot: number,
+    dte: number,
+    isCombo: boolean,
+  ): number {
+    if (!isCombo && Number.isFinite(o.entryDelta)) return o.entryDelta as number;
+    const leg = isCombo && Array.isArray(o.legs)
+      ? o.legs.find(l => l.action === 'buy') ?? o.legs[0]
+      : null;
+    const strike = leg?.strike ?? o.strike ?? 0;
+    const optionType = leg?.optionType ?? o.optionType;
+    if (!(spot > 0) || !(strike > 0) || !(dte > 0)) return 0;
+    return blackScholesDelta({
+      spot,
+      strike,
+      timeToExpiryYears: dte / 365,
+      riskFreeRate: OPTION_SHADOW_RISK_FREE_RATE,
+      volatility: 0.3, // fallback IV; gate A reads |delta| only
+      optionType,
+    });
   }
 
   private async routeEquitySignal(

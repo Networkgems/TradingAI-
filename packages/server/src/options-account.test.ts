@@ -2614,3 +2614,85 @@ describe('PaperOptionsAccount.openDefinedRiskSpread', () => {
     expect(acct.getState().openOptions[0].id).toBe(pos!.id);
   });
 });
+
+// TRA-964 (TRA-954 follow-up) — conviction-DCA scale-in book mutation for the
+// options book. addToOptionPosition blends the per-share premium basis, bumps
+// contracts, and keeps the protective loss bound FIXED (average size, never the
+// stop). It is the demo-book primitive the engine's options DCA pass calls once
+// the pure `evaluateOptionDcaAdd` core returns an add/shrink verdict.
+describe('PaperOptionsAccount.addToOptionPosition — conviction DCA scale-in (TRA-964)', () => {
+  it('blends the premium basis and increases contracts while keeping the stop fixed (single-leg)', () => {
+    const acct = new PaperOptionsAccount({ initialEquity: 50_000, managedAccountRatio: 0.5 });
+    // Open 6 contracts @ mark 1.00 (premiumPaid 1.0, stopLossPremium 0.80).
+    const pos = acct.openOptionFromCandidate(buildSignal({ mark: 1.0 }))!;
+    expect(pos.contracts).toBe(6);
+    const stopBefore = pos.stopLossPremium;
+    const cashBefore = acct.getState().optionsCash;
+
+    // Add 4 contracts at a per-contract debit of $120 (mark 1.20).
+    const updated = acct.addToOptionPosition(pos.id, 4, 120)!;
+
+    expect(updated).not.toBeNull();
+    // blended per-share basis = (1.0*6 + 1.20*4) / 10 = 1.08
+    expect(updated.premiumPaid).toBeCloseTo(1.08, 9);
+    expect(updated.contracts).toBe(10);
+    expect(updated.contractsRemaining).toBe(10);
+    expect(updated.stopLossPremium).toBe(stopBefore); // unchanged — never widen the loss bound
+    // cash debited by the add cost only (4 × $120).
+    expect(acct.getState().optionsCash).toBeCloseTo(cashBefore - 480, 6);
+  });
+
+  it('keeps total premium-at-risk = Σ contracts × per-contract basis (the R invariant input)', () => {
+    const acct = new PaperOptionsAccount({ initialEquity: 50_000, managedAccountRatio: 0.5 });
+    const pos = acct.openOptionFromCandidate(buildSignal({ mark: 1.0 }))!; // 6 @ $100
+    const updated = acct.addToOptionPosition(pos.id, 4, 120)!;
+    // premium-at-risk = 1.08 × 100 × 10 = $1,080 = entry $600 + add $480.
+    const premiumAtRisk = updated.premiumPaid * 100 * updated.contracts;
+    expect(premiumAtRisk).toBeCloseTo(1_080, 6);
+  });
+
+  it('scales a debit combo: reserved maxLoss + display totals grow with the added lots', () => {
+    const acct = new PaperOptionsAccount({ initialEquity: 50_000, managedAccountRatio: 0.5 });
+    // Bull CALL debit spread: buy 100C / sell 105C (width 5 → $500/lot value),
+    // net debit $400/lot, maxLoss = debit = $400 (sized to 1 lot under the cap).
+    const debitLegs = [
+      { action: 'buy' as const, optionType: 'call' as const, strike: 100, expiration: '2024-07-05' },
+      { action: 'sell' as const, optionType: 'call' as const, strike: 105, expiration: '2024-07-05' },
+    ];
+    const combo = acct.openDefinedRiskSpread({
+      symbol: 'AAPL', strategy: 'bull_call_spread', legs: debitLegs,
+      netUsd: -400, maxLossUsd: 400, maxProfitUsd: 100, breakevens: [104], spot: 100,
+    })!;
+    expect(combo.contracts).toBe(1);
+    expect(combo.maxLossUsd).toBe(400);
+
+    // Add 1 lot at the same per-lot reserved capital ($400).
+    const updated = acct.addToOptionPosition(combo.id, 1, 400)!;
+    expect(updated.contracts).toBe(2);
+    expect(updated.premiumPaid).toBeCloseTo(4.0, 9);   // 400/100 per share, unchanged blend
+    expect(updated.maxLossUsd).toBeCloseTo(800, 6);     // reserved capital doubles
+    expect(updated.netUsd).toBeCloseTo(-800, 6);        // display debit scales with lots
+    expect(updated.maxProfitUsd).toBeCloseTo(200, 6);
+  });
+
+  it('refuses an add it cannot afford and leaves the book intact', () => {
+    const acct = new PaperOptionsAccount({ initialEquity: 50_000, managedAccountRatio: 0.5 });
+    const pos = acct.openOptionFromCandidate(buildSignal({ mark: 1.0 }))!;
+    const contractsBefore = pos.contracts;
+    const basisBefore = pos.premiumPaid;
+    // Add cost = 10_000 × $100 = $1M, far beyond paper cash.
+    expect(acct.addToOptionPosition(pos.id, 10_000, 100)).toBeNull();
+    const after = acct.getState().openOptions.find(o => o.id === pos.id)!;
+    expect(after.contracts).toBe(contractsBefore);
+    expect(after.premiumPaid).toBe(basisBefore);
+  });
+
+  it('returns null for an unknown option or a non-positive add', () => {
+    const acct = new PaperOptionsAccount({ initialEquity: 50_000, managedAccountRatio: 0.5 });
+    const pos = acct.openOptionFromCandidate(buildSignal({ mark: 1.0 }))!;
+    expect(acct.addToOptionPosition('nope', 1, 100)).toBeNull();
+    expect(acct.addToOptionPosition(pos.id, 0, 100)).toBeNull();
+    expect(acct.addToOptionPosition(pos.id, -2, 100)).toBeNull();
+    expect(acct.addToOptionPosition(pos.id, 1, 0)).toBeNull();
+  });
+});

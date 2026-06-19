@@ -1258,6 +1258,91 @@ export class PaperOptionsAccount {
     return position;
   }
 
+  /**
+   * TRA-964 (TRA-954 follow-up) — per-position premium-at-risk budget R for the
+   * conviction-DCA scale-in pass. The hard per-position ceiling
+   * ({@link perPositionCap}) — `max($150, 15% × equity)` — is the most capital a
+   * single options ticket is ever allowed to put at risk, and it is already the
+   * binding cap the open paths size against. The DCA core caps *total* premium
+   * across all tranches at this R, so a winner opened at the smaller per-ticket
+   * budget can scale UP toward the per-position cap as conviction confirms, but
+   * never beyond it. Demo book sizes off `this.equity` (the paper equity).
+   */
+  riskBudgetPerPosition(): number {
+    return perPositionCap(this.equity);
+  }
+
+  /**
+   * TRA-964 (TRA-954 follow-up) — managed-equity ceiling for the conviction-DCA
+   * gross-exposure gate (acceptance #5): the slice of book equity the strategy
+   * is allowed to deploy. Total open premium-at-risk above this blocks ALL adds.
+   */
+  managedEquity(): number {
+    return this.equity * this.managedAccountRatio;
+  }
+
+  /**
+   * TRA-964 (TRA-954 follow-up) — conviction-DCA scale-in book mutation. Add
+   * `addContracts` to an open DEFINED-RISK position at `addDebitPerContract`
+   * (per-contract premium at risk, USD), blending the premium cost basis while
+   * keeping the protective loss bound FIXED — we average *size*, never the
+   * *stop* (the core invariant; widening the loss "to give it room" is
+   * forbidden). The R-cap arithmetic lives in the pure `evaluateOptionDcaAdd`
+   * core; this method is just the book mutation, the options analogue of
+   * {@link PaperAccount.addToPosition}.
+   *
+   * Single-leg long calls/puts: blend `premiumPaid`, bump contracts. Defined-
+   * risk debit combos: blend the per-share reserved-capital basis, scale the
+   * reserved `maxLossUsd` by the added lots, and scale the display `netUsd` /
+   * `maxProfitUsd` proportionally — the per-lot defined-risk bound is unchanged,
+   * we never widen it.
+   *
+   * Returns the updated position, or `null` when the position is absent, the add
+   * size/debit is non-positive, or paper cash can't cover the add.
+   */
+  addToOptionPosition(
+    optionId: string,
+    addContracts: number,
+    addDebitPerContract: number,
+  ): OptionPosition | null {
+    const opt = this.openOptions.get(optionId);
+    if (!opt) return null;
+    if (!Number.isFinite(addContracts) || addContracts <= 0) return null;
+    if (!Number.isFinite(addDebitPerContract) || addDebitPerContract <= 0) return null;
+    const cost = addContracts * addDebitPerContract;
+    if (cost > this.cash) {
+      accountLog.warn('skip conviction-DCA option add: cost exceeds paper cash', {
+        optionId,
+        symbol: opt.symbol,
+        cost: cost.toFixed(2),
+        cash: this.cash.toFixed(2),
+      });
+      return null;
+    }
+    const newContracts = opt.contracts + addContracts;
+    const addPricePerShare = addDebitPerContract / 100;
+    // Blend the per-share basis: (Σ existing + add) / total contracts.
+    opt.premiumPaid = (opt.premiumPaid * opt.contracts + addPricePerShare * addContracts) / newContracts;
+
+    // Defined-risk combo: scale the reserved capital + display totals. The
+    // per-lot defined-risk bound is unchanged; we only add lots.
+    if (Array.isArray(opt.legs) && opt.legs.length >= 2) {
+      const ratio = newContracts / opt.contracts;
+      if (typeof opt.netUsd === 'number') opt.netUsd = r2(opt.netUsd * ratio);
+      if (typeof opt.maxProfitUsd === 'number') opt.maxProfitUsd = r2(opt.maxProfitUsd * ratio);
+      // Reserved capital tracks the blended per-share basis exactly so it stays
+      // in lock-step with `premiumPaid` (the close-path cost basis).
+      opt.maxLossUsd = r2(opt.premiumPaid * 100 * newContracts);
+    }
+
+    opt.contracts = newContracts;
+    opt.contractsRemaining += addContracts;
+    // The protective loss bound (`stopLossPremium`) is intentionally left as-is.
+    this.cash -= cost;
+    this.openOptions.set(optionId, opt);
+    return opt;
+  }
+
   /** TRA-231 — see {@link openOptionFromCandidate} for the `mode` stamp rationale. */
   openOption(signal: TradeSignal, underlyingPrice: number, mode: AccountMode = 'demo'): OptionPosition | null {
     this.resetDayIfNeeded();

@@ -1,0 +1,134 @@
+{
+  "generatedFor": "TRA-964 acceptance #1 + #4 (options conviction-DCA)",
+  "core": "@trading-app/shared/conviction-dca evaluateOptionDcaAdd (TRA-958 gates A/B/C)",
+  "riskBudgetR": 7500,
+  "config": {
+    "maxAdds": 2,
+    "trancheSplit": [
+      0.5,
+      0.3,
+      0.2
+    ],
+    "optionMinDTE": 21,
+    "optionMinAddDelta": 0.35,
+    "earningsBlackoutTradingDays": 2,
+    "maxAddsPerNamePerDay": 1
+  },
+  "totals": {
+    "rows": 9,
+    "adds": 3,
+    "skips": 6,
+    "riskBudgetBreaches": 0
+  },
+  "invariantHeld": true,
+  "ledger": [
+    {
+      "scenario": "A long call",
+      "step": 1,
+      "event": "add @ $1.40 mark, delta 0.55",
+      "action": "add",
+      "qty": 15,
+      "totalContracts": 19,
+      "premiumAtRisk": 2700,
+      "riskBudget": 7500,
+      "withinBudget": true,
+      "reason": "add 15 contract(s); total premium 2700.00 <= R=7500"
+    },
+    {
+      "scenario": "A long call",
+      "step": 2,
+      "event": "add same session",
+      "action": "skip",
+      "qty": 0,
+      "totalContracts": null,
+      "premiumAtRisk": null,
+      "riskBudget": 7500,
+      "withinBudget": true,
+      "reason": "already added 1x today (max 1/name/day)"
+    },
+    {
+      "scenario": "A long call",
+      "step": 3,
+      "event": "add @ $1.30 mark next day",
+      "action": "add",
+      "qty": 11,
+      "totalContracts": 30,
+      "premiumAtRisk": 4130,
+      "riskBudget": 7500,
+      "withinBudget": true,
+      "reason": "add 11 contract(s); total premium 4130.00 <= R=7500"
+    },
+    {
+      "scenario": "A long call",
+      "step": 4,
+      "event": "add @ DTE 18 (fresh)",
+      "action": "skip",
+      "qty": 0,
+      "totalContracts": null,
+      "premiumAtRisk": null,
+      "riskBudget": 7500,
+      "withinBudget": true,
+      "reason": "DTE 18 < 21 — theta-dominated, no add"
+    },
+    {
+      "scenario": "A long call",
+      "step": 5,
+      "event": "add with thesis broken (fresh)",
+      "action": "skip",
+      "qty": 0,
+      "totalContracts": null,
+      "premiumAtRisk": null,
+      "riskBudget": 7500,
+      "withinBudget": true,
+      "reason": "underlying no longer confirms thesis — no averaging down on IV crush"
+    },
+    {
+      "scenario": "A long call",
+      "step": 6,
+      "event": "add @ delta 0.20 (fresh)",
+      "action": "skip",
+      "qty": 0,
+      "totalContracts": null,
+      "premiumAtRisk": null,
+      "riskBudget": 7500,
+      "withinBudget": true,
+      "reason": "add |delta| 0.20 < floor 0.35 — too far OTM for a conviction add"
+    },
+    {
+      "scenario": "B debit spread",
+      "step": 1,
+      "event": "add 1 lot @ $400 reserved",
+      "action": "add",
+      "qty": 5,
+      "totalContracts": 6,
+      "premiumAtRisk": 2400,
+      "riskBudget": 7500,
+      "withinBudget": true,
+      "reason": "add 5 contract(s); total premium 2400.00 <= R=7500"
+    },
+    {
+      "scenario": "B debit spread",
+      "step": 2,
+      "event": "add with daily-loss halt",
+      "action": "skip",
+      "qty": 0,
+      "totalContracts": null,
+      "premiumAtRisk": null,
+      "riskBudget": 7500,
+      "withinBudget": true,
+      "reason": "daily-loss limit tripped — all adds blocked"
+    },
+    {
+      "scenario": "B debit spread",
+      "step": 3,
+      "event": "add to short premium",
+      "action": "skip",
+      "qty": 0,
+      "totalContracts": null,
+      "premiumAtRisk": null,
+      "riskBudget": 7500,
+      "withinBudget": true,
+      "reason": "not defined-risk (short premium) — DCA refused"
+    }
+  ]
+}
