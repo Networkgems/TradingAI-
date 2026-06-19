@@ -159,6 +159,13 @@ export interface RelativeValueSignal extends TradeSignal {
   delta: number;
   /** Free-text reason mirrored from the scanner — surfaces in the UI feed. */
   reason: string;
+  /**
+   * TRA-957/TRA-970 — grading sleeve. Under Option A the RV single-leg path is
+   * folded into the directional swing sleeve (trend-gated, delta-targeted,
+   * 30–45 DTE), so its fills grade as `'directional'` against the swing spec —
+   * unambiguously, not blended with the separate vol-mispricing book.
+   */
+  sleeve?: 'directional';
 }
 
 /**

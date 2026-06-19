@@ -2419,7 +2419,10 @@ export class SignalEngine {
         // ({@link shadowCandleCache}, the source `evaluateOptionShadow` uses).
         // With no confluence (range / cold series) we stand down rather than
         // open a trend-blind long. `selectRvLongCandidate` then prefers a
-        // ~0.55–0.65-delta (slightly-ITM/ATM) strike over the cheapest-IV one.
+        // ~0.55–0.65-delta (slightly-ITM/ATM) strike over the cheapest-IV one
+        // and post-filters new entries to the 30–45-DTE swing window (TRA-970 —
+        // the scanner's 21-DTE floor is short-premium management, not an entry
+        // window, so a 21–30-DTE theta-bleeding long never opens here).
         const trendSeries = this.shadowCandleCache.get(sym);
         const trendDecision =
           trendSeries && trendSeries.length > 0 ? confluenceSide(trendSeries) : null;
@@ -2456,6 +2459,10 @@ export class SignalEngine {
           ivUsed: cheap.ivUsed,
           delta: cheap.delta,
           reason: cheap.reason,
+          // TRA-957/TRA-970 (Option A) — folded into the directional swing
+          // sleeve: trend-gated, delta-targeted, 30–45 DTE. Tag it so the demo
+          // book grades these fills against the swing spec unambiguously.
+          sleeve: 'directional',
         };
 
         // Dedup: same OCC fired in the last hour — avoid re-spamming the feed

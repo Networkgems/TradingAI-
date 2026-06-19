@@ -503,6 +503,18 @@ export type RvLongTrendSide = 'call' | 'put';
 export const RV_LONG_DELTA_TARGET_MIN = 0.55;
 export const RV_LONG_DELTA_TARGET_MAX = 0.65;
 
+/**
+ * TRA-970 — DTE entry window for *new* directional single-leg long entries,
+ * per the QuantTrader decision on TRA-957. The swing spec says "buy 30-45 DTE",
+ * so new entries are post-filtered to **[30, 45]**. This is deliberately
+ * tighter than the scanner's 21-DTE floor: that 21d floor is a *short-premium
+ * management* never-below inherited from the selector and must NOT widen the
+ * long-entry window — opening a directional long at 21–30 DTE eats theta and
+ * cuts swing runway, exactly what a trend-following long should avoid.
+ */
+export const RV_LONG_DTE_ENTRY_MIN = 30;
+export const RV_LONG_DTE_ENTRY_MAX = 45;
+
 export interface RvLongSelectionOptions {
   /**
    * Daily-trend direction from the confluence stack (Supertrend / MA-stack /
@@ -516,6 +528,16 @@ export interface RvLongSelectionOptions {
   deltaTargetMin?: number;
   /** Upper bound of the directional delta target band (default 0.65). */
   deltaTargetMax?: number;
+  /**
+   * Lower bound of the DTE entry window for new directional entries
+   * (default 30 — `RV_LONG_DTE_ENTRY_MIN`, TRA-970).
+   */
+  dteEntryMin?: number;
+  /**
+   * Upper bound of the DTE entry window for new directional entries
+   * (default 45 — `RV_LONG_DTE_ENTRY_MAX`, TRA-970).
+   */
+  dteEntryMax?: number;
 }
 
 /**
@@ -531,6 +553,10 @@ export interface RvLongSelectionOptions {
  *   1. Drops candidates whose side opposes the daily trend — calls only in an
  *      uptrend, puts only in a downtrend. With no trend (`trendSide == null`)
  *      it returns `null` so the caller stands down rather than open blind.
+ *   1b. Drops candidates outside the DTE entry window ([30, 45] by default,
+ *      TRA-970) — new directional longs buy 30–45 DTE per the swing spec; the
+ *      scanner's 21-DTE floor is a short-premium management never-below, not an
+ *      entry window, so it must not slip a 21–30-DTE theta-bleeding long through.
  *   2. Among the survivors it prefers a strike whose |delta| sits inside the
  *      directional target band (~0.55–0.65, slightly-ITM/ATM). Inside the band
  *      it keeps the scanner's own ranking (candidates arrive sorted by score,
@@ -555,10 +581,15 @@ export function selectRvLongCandidate(
   const hi = options.deltaTargetMax ?? RV_LONG_DELTA_TARGET_MAX;
   const mid = (lo + hi) / 2;
 
+  const dteLo = options.dteEntryMin ?? RV_LONG_DTE_ENTRY_MIN;
+  const dteHi = options.dteEntryMax ?? RV_LONG_DTE_ENTRY_MAX;
+
   const eligible = candidates.filter(
     (c) =>
       (c.classification === 'cheap' || c.classification === 'below_intrinsic') &&
-      c.optionType === trendSide,
+      c.optionType === trendSide &&
+      c.daysToExpiration >= dteLo &&
+      c.daysToExpiration <= dteHi,
   );
   if (eligible.length === 0) return null;
 

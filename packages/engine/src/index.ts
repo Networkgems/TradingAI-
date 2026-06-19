@@ -333,6 +333,8 @@ export {
   selectRvLongCandidate,
   RV_LONG_DELTA_TARGET_MIN,
   RV_LONG_DELTA_TARGET_MAX,
+  RV_LONG_DTE_ENTRY_MIN,
+  RV_LONG_DTE_ENTRY_MAX,
 } from './options/relative-value.js';
 export type {
   RelativeValueCandidate,

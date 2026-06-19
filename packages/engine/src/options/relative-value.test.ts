@@ -437,4 +437,56 @@ describe('selectRvLongCandidate (TRA-968)', () => {
     });
     expect(pick?.optionSymbol).toBe('C40');
   });
+
+  // TRA-970 — DTE entry window [30, 45] for new directional single-leg longs.
+  describe('TRA-970 — DTE entry window [30, 45]', () => {
+    it('rejects a sub-30-DTE strike (21d floor is management-only, not an entry window)', () => {
+      // A perfect in-band-delta, top-score candidate that's still too near-dated
+      // for a swing entry must NOT be opened — it bleeds theta and cuts runway.
+      const cands = ranked(
+        mkCand({ optionSymbol: 'C21', optionType: 'call', delta: 0.6, score: 9, daysToExpiration: 21 }),
+      );
+      expect(selectRvLongCandidate(cands, { trendSide: 'call' })).toBeNull();
+    });
+
+    it('rejects a strike beyond 45 DTE', () => {
+      const cands = ranked(
+        mkCand({ optionSymbol: 'C50', optionType: 'call', delta: 0.6, score: 9, daysToExpiration: 50 }),
+      );
+      expect(selectRvLongCandidate(cands, { trendSide: 'call' })).toBeNull();
+    });
+
+    it('accepts the window boundaries (30 and 45 DTE inclusive)', () => {
+      expect(
+        selectRvLongCandidate(
+          ranked(mkCand({ optionSymbol: 'C30', optionType: 'call', delta: 0.6, score: 5, daysToExpiration: 30 })),
+          { trendSide: 'call' },
+        )?.optionSymbol,
+      ).toBe('C30');
+      expect(
+        selectRvLongCandidate(
+          ranked(mkCand({ optionSymbol: 'C45', optionType: 'call', delta: 0.6, score: 5, daysToExpiration: 45 })),
+          { trendSide: 'call' },
+        )?.optionSymbol,
+      ).toBe('C45');
+    });
+
+    it('picks the in-window strike over a higher-scoring out-of-window one', () => {
+      const cands = ranked(
+        mkCand({ optionSymbol: 'C25', optionType: 'call', delta: 0.6, score: 9, daysToExpiration: 25 }), // top score, too short
+        mkCand({ optionSymbol: 'C38', optionType: 'call', delta: 0.6, score: 4, daysToExpiration: 38 }), // in-window
+      );
+      expect(selectRvLongCandidate(cands, { trendSide: 'call' })?.optionSymbol).toBe('C38');
+    });
+
+    it('honours caller-supplied DTE entry-window overrides', () => {
+      const cands = ranked(
+        mkCand({ optionSymbol: 'C25', optionType: 'call', delta: 0.6, score: 5, daysToExpiration: 25 }),
+      );
+      // Default [30,45] would reject 25 DTE; widening to [21,45] admits it.
+      expect(
+        selectRvLongCandidate(cands, { trendSide: 'call', dteEntryMin: 21, dteEntryMax: 45 })?.optionSymbol,
+      ).toBe('C25');
+    });
+  });
 });
