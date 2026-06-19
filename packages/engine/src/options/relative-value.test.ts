@@ -1,6 +1,7 @@
 import { describe, it, expect } from 'vitest';
 import {
   findRelativeValueOpportunities,
+  selectRvLongCandidate,
   type RelativeValueCandidate,
 } from './relative-value.js';
 import type { OptionChainRow } from './otm-mispricing.js';
@@ -311,5 +312,129 @@ describe('findRelativeValueOpportunities', () => {
       const overridden = findRelativeValueOpportunities(calls, SPOT, { ...SCAN_OPTS, minDaysToExpiry: 3 });
       expect(overridden.length).toBeGreaterThan(0);
     });
+  });
+});
+
+describe('selectRvLongCandidate (TRA-968)', () => {
+  // Minimal candidate — only the fields the selector reads carry meaning; the
+  // rest are filled to satisfy the type. `score` is what the scanner sorts on
+  // (callers pass an already-ranked, descending list).
+  function mkCand(
+    over: Partial<RelativeValueCandidate> &
+      Pick<RelativeValueCandidate, 'optionSymbol' | 'optionType' | 'delta' | 'score'>,
+  ): RelativeValueCandidate {
+    return {
+      underlying: 'AAPL',
+      strike: 100,
+      expiration: EXP,
+      daysToExpiration: 31,
+      mark: 1.2,
+      bid: 1.18,
+      ask: 1.22,
+      spreadPct: 0.03,
+      volume: 200,
+      openInterest: 800,
+      ivUsed: 0.22,
+      ivFitted: 0.3,
+      ivResidual: -0.08,
+      zScore: -2.4,
+      fairPrice: 1.5,
+      mispricingPct: -0.2,
+      classification: 'cheap',
+      reason: '',
+      ...over,
+    };
+  }
+
+  // candidates are passed in scanner-rank order (best score first).
+  function ranked(...cs: RelativeValueCandidate[]): RelativeValueCandidate[] {
+    return [...cs].sort((a, b) => b.score - a.score);
+  }
+
+  it('stands down (returns null) when the daily trend is unknown — no trend-blind long', () => {
+    const cands = ranked(mkCand({ optionSymbol: 'C60', optionType: 'call', delta: 0.6, score: 9 }));
+    expect(selectRvLongCandidate(cands, { trendSide: null })).toBeNull();
+  });
+
+  it('opens only calls in an uptrend — rejects the higher-scoring put', () => {
+    const cands = ranked(
+      mkCand({ optionSymbol: 'P60', optionType: 'put', delta: -0.6, score: 9 }), // best score, wrong side
+      mkCand({ optionSymbol: 'C60', optionType: 'call', delta: 0.6, score: 4 }),
+    );
+    const pick = selectRvLongCandidate(cands, { trendSide: 'call' });
+    expect(pick?.optionSymbol).toBe('C60');
+    expect(pick?.optionType).toBe('call');
+  });
+
+  it('opens only puts in a downtrend — rejects the higher-scoring call', () => {
+    const cands = ranked(
+      mkCand({ optionSymbol: 'C60', optionType: 'call', delta: 0.6, score: 9 }),
+      mkCand({ optionSymbol: 'P58', optionType: 'put', delta: -0.58, score: 4 }),
+    );
+    const pick = selectRvLongCandidate(cands, { trendSide: 'put' });
+    expect(pick?.optionSymbol).toBe('P58');
+    expect(pick?.optionType).toBe('put');
+  });
+
+  it('returns null when no eligible candidate matches the trend side', () => {
+    const cands = ranked(mkCand({ optionSymbol: 'P60', optionType: 'put', delta: -0.6, score: 9 }));
+    expect(selectRvLongCandidate(cands, { trendSide: 'call' })).toBeNull();
+  });
+
+  it('prefers an in-band (~0.55–0.65 delta) strike over a higher-scoring deep-OTM one', () => {
+    const cands = ranked(
+      mkCand({ optionSymbol: 'C18', optionType: 'call', delta: 0.18, score: 9 }), // top score, deep OTM
+      mkCand({ optionSymbol: 'C60', optionType: 'call', delta: 0.6, score: 3 }), // in-band
+    );
+    const pick = selectRvLongCandidate(cands, { trendSide: 'call' });
+    expect(pick?.optionSymbol).toBe('C60');
+  });
+
+  it('keeps the scanner ranking among in-band strikes (highest score wins)', () => {
+    const cands = ranked(
+      mkCand({ optionSymbol: 'C55', optionType: 'call', delta: 0.55, score: 7 }),
+      mkCand({ optionSymbol: 'C63', optionType: 'call', delta: 0.63, score: 5 }),
+    );
+    const pick = selectRvLongCandidate(cands, { trendSide: 'call' });
+    expect(pick?.optionSymbol).toBe('C55');
+  });
+
+  it('falls back to the |delta| closest to the band midpoint when none are in-band', () => {
+    const cands = ranked(
+      mkCand({ optionSymbol: 'C20', optionType: 'call', delta: 0.2, score: 9 }), // |0.20-0.60|=0.40
+      mkCand({ optionSymbol: 'C45', optionType: 'call', delta: 0.45, score: 8 }), // |0.45-0.60|=0.15 (closest)
+      mkCand({ optionSymbol: 'C90', optionType: 'call', delta: 0.9, score: 8 }), // |0.90-0.60|=0.30
+    );
+    const pick = selectRvLongCandidate(cands, { trendSide: 'call' });
+    expect(pick?.optionSymbol).toBe('C45');
+  });
+
+  it('treats below_intrinsic rows as eligible long-only candidates', () => {
+    const cands = ranked(
+      mkCand({ optionSymbol: 'C60', optionType: 'call', delta: 0.6, score: 5, classification: 'below_intrinsic' }),
+    );
+    expect(selectRvLongCandidate(cands, { trendSide: 'call' })?.optionSymbol).toBe('C60');
+  });
+
+  it('ignores expensive / monotonic_violation rows (short-leg structures, out of scope)', () => {
+    const cands = ranked(
+      mkCand({ optionSymbol: 'C60e', optionType: 'call', delta: 0.6, score: 9, classification: 'expensive' }),
+      mkCand({ optionSymbol: 'C60m', optionType: 'call', delta: 0.6, score: 8, classification: 'monotonic_violation' }),
+    );
+    expect(selectRvLongCandidate(cands, { trendSide: 'call' })).toBeNull();
+  });
+
+  it('honours caller-supplied delta band overrides', () => {
+    const cands = ranked(
+      mkCand({ optionSymbol: 'C40', optionType: 'call', delta: 0.4, score: 5 }),
+      mkCand({ optionSymbol: 'C60', optionType: 'call', delta: 0.6, score: 4 }),
+    );
+    // Widen the band to [0.35, 0.45]; only C40 sits inside it now.
+    const pick = selectRvLongCandidate(cands, {
+      trendSide: 'call',
+      deltaTargetMin: 0.35,
+      deltaTargetMax: 0.45,
+    });
+    expect(pick?.optionSymbol).toBe('C40');
   });
 });

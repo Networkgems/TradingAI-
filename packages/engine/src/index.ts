@@ -328,11 +328,18 @@ export type {
   OtmScannerOptions,
   Mispricing,
 } from './options/otm-mispricing.js';
-export { findRelativeValueOpportunities } from './options/relative-value.js';
+export {
+  findRelativeValueOpportunities,
+  selectRvLongCandidate,
+  RV_LONG_DELTA_TARGET_MIN,
+  RV_LONG_DELTA_TARGET_MAX,
+} from './options/relative-value.js';
 export type {
   RelativeValueCandidate,
   RelativeValueScannerOptions,
   RelativeValueClassification,
+  RvLongTrendSide,
+  RvLongSelectionOptions,
 } from './options/relative-value.js';
 export {
   EarningsCalendarClient,

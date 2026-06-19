@@ -495,3 +495,85 @@ export function findRelativeValueOpportunities(
   allCandidates.sort((a, b) => b.score - a.score);
   return allCandidates;
 }
+
+/** Option side the RV single-leg long is permitted to open (TRA-968). */
+export type RvLongTrendSide = 'call' | 'put';
+
+/** TRA-968 — directional delta band (slightly-ITM/ATM) per the swing spec. */
+export const RV_LONG_DELTA_TARGET_MIN = 0.55;
+export const RV_LONG_DELTA_TARGET_MAX = 0.65;
+
+export interface RvLongSelectionOptions {
+  /**
+   * Daily-trend direction from the confluence stack (Supertrend / MA-stack /
+   * MACD / RSI), mapped to the option side it permits: `'call'` in an uptrend,
+   * `'put'` in a downtrend. `null` (range / trend unknown) makes the selector
+   * return `null` so the caller opens nothing — a trend-blind long is exactly
+   * the entry the swing spec forbids.
+   */
+  trendSide: RvLongTrendSide | null;
+  /** Lower bound of the directional delta target band (default 0.55). */
+  deltaTargetMin?: number;
+  /** Upper bound of the directional delta target band (default 0.65). */
+  deltaTargetMax?: number;
+}
+
+/**
+ * TRA-968 — choose the single-leg long to open from the RV scanner's candidates,
+ * gated on the daily-trend side and a directional delta target (swing spec).
+ *
+ * The bare scanner ({@link findRelativeValueOpportunities}) ranks every
+ * cheap / below-intrinsic outlier purely by IV edge + liquidity, so its top
+ * pick can be a long *put* while the daily trend is *up*, or a deep-OTM lottery
+ * strike — both contradict the swing spec's "align option direction to the
+ * daily-trend signal" rule and would muddy Phase-B grading. This selector:
+ *
+ *   1. Drops candidates whose side opposes the daily trend — calls only in an
+ *      uptrend, puts only in a downtrend. With no trend (`trendSide == null`)
+ *      it returns `null` so the caller stands down rather than open blind.
+ *   2. Among the survivors it prefers a strike whose |delta| sits inside the
+ *      directional target band (~0.55–0.65, slightly-ITM/ATM). Inside the band
+ *      it keeps the scanner's own ranking (candidates arrive sorted by score,
+ *      best first); with none in-band it falls back to the strike whose |delta|
+ *      is *closest* to the band midpoint rather than taking the cheapest-IV
+ *      strike regardless of moneyness.
+ *
+ * Long-only: only `cheap` and `below_intrinsic` rows are eligible (taking the
+ * short leg of an `expensive` / `monotonic_violation` needs a defined-risk
+ * spread, out of scope for this single-leg path). Returns `null` when nothing
+ * qualifies. Pure — the caller supplies the trend side from its own confluence
+ * read so this stays free of candle/indicator I/O.
+ */
+export function selectRvLongCandidate(
+  candidates: RelativeValueCandidate[],
+  options: RvLongSelectionOptions,
+): RelativeValueCandidate | null {
+  const { trendSide } = options;
+  if (trendSide == null) return null;
+
+  const lo = options.deltaTargetMin ?? RV_LONG_DELTA_TARGET_MIN;
+  const hi = options.deltaTargetMax ?? RV_LONG_DELTA_TARGET_MAX;
+  const mid = (lo + hi) / 2;
+
+  const eligible = candidates.filter(
+    (c) =>
+      (c.classification === 'cheap' || c.classification === 'below_intrinsic') &&
+      c.optionType === trendSide,
+  );
+  if (eligible.length === 0) return null;
+
+  // Candidates arrive ranked by composite score (desc). Prefer the
+  // highest-scoring strike already inside the delta target band …
+  const inBand = eligible.find((c) => {
+    const ad = Math.abs(c.delta);
+    return ad >= lo && ad <= hi;
+  });
+  if (inBand) return inBand;
+
+  // … otherwise the strike whose |delta| is closest to the band midpoint.
+  return eligible.reduce((best, c) =>
+    Math.abs(Math.abs(c.delta) - mid) < Math.abs(Math.abs(best.delta) - mid)
+      ? c
+      : best,
+  );
+}

@@ -1,5 +1,5 @@
-import { OrbStrategy, BbFadeStrategy, IchimokuStrategy, SupertrendConfluenceStrategy, confluenceSide, supertrend, reversalChecklist, atr, donchian, supportResistance, blackScholesDelta, daysToExpiration, TradierOptionsClient, TradierOrderClient, TRADIER_REJECTED_STATUSES, evaluateSma200, SMA200_MIN_BARS, SMA200_DEBOUNCE_BARS, composeTechnicalSnapshot, resampleCandles, TF_BUCKET_MS } from '@trading-app/engine';
-import type { StrategySelectorInput, ContractQuote, OptionTrend } from '@trading-app/engine';
+import { OrbStrategy, BbFadeStrategy, IchimokuStrategy, SupertrendConfluenceStrategy, confluenceSide, supertrend, reversalChecklist, atr, donchian, supportResistance, blackScholesDelta, daysToExpiration, selectRvLongCandidate, TradierOptionsClient, TradierOrderClient, TRADIER_REJECTED_STATUSES, evaluateSma200, SMA200_MIN_BARS, SMA200_DEBOUNCE_BARS, composeTechnicalSnapshot, resampleCandles, TF_BUCKET_MS } from '@trading-app/engine';
+import type { StrategySelectorInput, ContractQuote, OptionTrend, RvLongTrendSide } from '@trading-app/engine';
 import type { TradierAccountBalance } from '@trading-app/engine';
 import { WATCHLIST, isLiquidSwingSymbol, checkEquitySwingClose, MANAGED_ACCOUNT_RATIO, MAX_CONSECUTIVE_LOSSES, DAILY_DRAWDOWN_HALT_PCT, OPTIONS_PER_TICKET_DOLLAR_FLOOR, OPTIONS_POSITION_CAP_RATIO, aliasWatchlistSymbol, isLiveTradierOptionsEnabled, isStockMarketOpen, perPositionCap, resolveAutoManageImportedTradierOptions, resolveDemoCostModel, resolveHoldLiveOptionsOvernight, resolveLiveTradeEquitiesTradier, resolveManagedAccountRatio, resolveMarketReviewGatesEnabled, resolveRiskPerTrade, resolveRvDtePrefs, resolveTradierOptionsCreds, validateBracket, DEFAULT_RV_DTE_MIN, DEFAULT_RV_DTE_MAX, DEFAULT_RV_DTE_TARGET, scoreNewsSentiment, aggregateSymbolSentiment, aggregateFedSentiment, aggregateStockTwitsSentiment, dedupeStockTwitsMessages, mapCuratedMessagesBySymbol, nameAliasesFor, evaluateEquityDcaAdd, evaluateOptionDcaAdd, CONVICTION_DCA, blendedAverage, positionRiskDollars, minutesToSessionClose, getEasternUtcOffset } from '@trading-app/shared';
 import type { TradeSignal, RelativeValueSignal, Sma200Signal, Candle, OptionsAccountState, SignalType, Position, OptionPosition, AccountMode, AccountSettings, AccountState, NewsItem, SymbolSentiment, SocialSentiment, StockTwitsMessage, TechnicalSignalSnapshot, TradierEnv, MarketReview, MarketReviewGates, EngineMarketReviewState, GatedStrategyNote, AgentRecommendation, TradeProposal, AgentOrderAudit, GuardrailVerdict } from '@trading-app/shared';
@@ -2386,11 +2386,14 @@ export class SignalEngine {
 
   /**
    * Scan each active-interest symbol for relative-value mispricings and route
-   * the highest-scoring `cheap` candidate per symbol into the options account
-   * as a long-premium `relative_value` ticket. Expensive candidates are
-   * ignored — short legs require a defined-risk-spread model that's
-   * deliberately out of scope for this iteration. Errors per-symbol are
-   * swallowed so one Tradier hiccup doesn't take down the whole tick.
+   * the best trend-aligned `cheap` candidate per symbol into the options
+   * account as a long-premium `relative_value` ticket. TRA-968 — the entry is
+   * gated on the daily-trend confluence (calls only in an uptrend, puts only in
+   * a downtrend) and biased to a ~0.55–0.65-delta slightly-ITM/ATM strike via
+   * {@link selectRvLongCandidate}; with no confluence the symbol stands down.
+   * Expensive candidates are ignored — short legs require a defined-risk-spread
+   * model that's deliberately out of scope for this iteration. Errors per-symbol
+   * are swallowed so one Tradier hiccup doesn't take down the whole tick.
    */
   private async runRelativeValueScan(activeSymbols: string[]): Promise<void> {
     if (!this.rvScanner) return;
@@ -2404,14 +2407,29 @@ export class SignalEngine {
         const result = await this.rvScanner.scan(sym, undefined, dtePrefs);
         if (result.reason !== 'ok' || result.candidates.length === 0) continue;
 
-        // The scanner already ranks by composite score — pick the strongest
-        // long-only opportunity. We accept `cheap` IV outliers and
-        // `below_intrinsic` no-arb errors (also a cheap-vs-fair signal). We
-        // skip `expensive` and `monotonic_violation` here since taking the
-        // short leg requires a defined-risk spread.
-        const cheap = result.candidates.find(
-          (c) => c.classification === 'cheap' || c.classification === 'below_intrinsic',
-        );
+        // TRA-968 — gate the single-leg long on the daily-trend confluence and
+        // a directional delta target (swing spec). The bare scanner ranks
+        // candidates purely on IV edge + liquidity, so its top `cheap` /
+        // `below_intrinsic` pick can be a long put into an uptrend, or a
+        // deep-OTM lottery strike — both contradict the swing spec's "align
+        // option direction to the daily-trend signal" rule and would muddy
+        // Phase-B grading (QuantTrader finding on TRA-953). Trend comes from the
+        // SAME confluence stack (Supertrend / MA-stack / MACD / RSI) the
+        // deterministic spread selector reads, off the cached 5m shadow series
+        // ({@link shadowCandleCache}, the source `evaluateOptionShadow` uses).
+        // With no confluence (range / cold series) we stand down rather than
+        // open a trend-blind long. `selectRvLongCandidate` then prefers a
+        // ~0.55–0.65-delta (slightly-ITM/ATM) strike over the cheapest-IV one.
+        const trendSeries = this.shadowCandleCache.get(sym);
+        const trendDecision =
+          trendSeries && trendSeries.length > 0 ? confluenceSide(trendSeries) : null;
+        const trendSide: RvLongTrendSide | null =
+          trendDecision?.side === 'buy'
+            ? 'call'
+            : trendDecision?.side === 'sell'
+              ? 'put'
+              : null;
+        const cheap = selectRvLongCandidate(result.candidates, { trendSide });
         if (!cheap) continue;
 
         const stopLoss = cheap.mark * 0.75;

@@ -64,6 +64,43 @@ function makeCandidate(overrides: Partial<RelativeValueCandidate> = {}): Relativ
   };
 }
 
+// TRA-968 — the RV single-leg long now gates on the daily-trend confluence
+// (the SAME Supertrend/MA-stack/MACD/RSI stack the spread selector reads),
+// computed off the engine's cached 5m shadow series. Build a clean
+// pullback-inside-an-uptrend tape so `confluenceSide` resolves `buy` → the
+// default `call` candidate clears the gate. Mirrors the sawUp+build5m fixtures
+// used by the SupertrendConfluence shadow tests below. Seed it before driving
+// `runRelativeValueScan`; without a trend the scanner stands down (no entry).
+function rvUptrend5m(): Candle[] {
+  const closes: number[] = [];
+  let p = 100;
+  let i = 0;
+  while (closes.length < 480) {
+    const inUp = i % 4 !== 3; // 3 up-steps then 1 deeper dip — cools RSI, keeps drift up
+    closes.push(p);
+    p += inUp ? 0.5 : -1.0;
+    i += 1;
+  }
+  while (closes.length > 2 && closes[closes.length - 1] <= closes[closes.length - 2]) closes.pop();
+  const step = 5 * 60_000;
+  return closes.map((close, idx) => ({
+    symbol: 'AAPL',
+    timestamp: idx * step,
+    open: idx > 0 ? closes[idx - 1] : close,
+    high: Math.max(close, idx > 0 ? closes[idx - 1] : close) + 0.5,
+    low: Math.min(close, idx > 0 ? closes[idx - 1] : close) - 0.5,
+    close,
+    volume: 1_000,
+  }));
+}
+
+function seedRvTrend(engine: SignalEngine, symbol = 'AAPL'): void {
+  (engine as unknown as { shadowCandleCache: Map<string, Candle[]> }).shadowCandleCache.set(
+    symbol,
+    rvUptrend5m(),
+  );
+}
+
 class StubScanner implements RelativeValueScannerService {
   scan = vi.fn<(symbol: string) => Promise<RelativeValueScanResult>>();
   getSelectorChain = vi.fn<(symbol: string) => Promise<SelectorChainSnapshot | null>>(async () => null);
@@ -118,6 +155,7 @@ describe('SignalEngine — relative-value scanner bridge', () => {
     });
 
     const engine = new SignalEngine(undefined, undefined, scanner);
+    seedRvTrend(engine);
     await (engine as unknown as { runRelativeValueScan: (s: string[]) => Promise<void> }).runRelativeValueScan(['AAPL']);
 
     const state = engine.getState();
@@ -142,6 +180,7 @@ describe('SignalEngine — relative-value scanner bridge', () => {
       reason: 'ok',
     });
     const engine = new SignalEngine(undefined, undefined, scanner);
+    seedRvTrend(engine);
     await (engine as unknown as { runRelativeValueScan: (s: string[]) => Promise<void> }).runRelativeValueScan(['AAPL']);
     expect(engine.getState().options.openOptions).toHaveLength(1);
   });
@@ -155,6 +194,7 @@ describe('SignalEngine — relative-value scanner bridge', () => {
     });
 
     const engine = new SignalEngine(undefined, undefined, scanner);
+    seedRvTrend(engine); // trend present → the skip is genuinely the expensive classification, not the gate
     await (engine as unknown as { runRelativeValueScan: (s: string[]) => Promise<void> }).runRelativeValueScan(['AAPL']);
 
     expect(engine.getState().options.openOptions).toHaveLength(0);
@@ -171,6 +211,7 @@ describe('SignalEngine — relative-value scanner bridge', () => {
     scanner.getOptionMark.mockResolvedValue(0.85);
 
     const engine = new SignalEngine(undefined, undefined, scanner);
+    seedRvTrend(engine);
     await (engine as unknown as { runRelativeValueScan: (s: string[]) => Promise<void> }).runRelativeValueScan(['AAPL']);
     expect(engine.getState().options.openOptions).toHaveLength(1);
 
@@ -188,6 +229,7 @@ describe('SignalEngine — relative-value scanner bridge', () => {
     });
 
     const engine = new SignalEngine(undefined, undefined, scanner);
+    seedRvTrend(engine);
     await (engine as unknown as { runRelativeValueScan: (s: string[]) => Promise<void> }).runRelativeValueScan(['AAPL']);
     expect(engine.getState().signals).toHaveLength(1);
 
@@ -195,6 +237,48 @@ describe('SignalEngine — relative-value scanner bridge', () => {
     await (engine as unknown as { runRelativeValueScan: (s: string[]) => Promise<void> }).runRelativeValueScan(['AAPL']);
     expect(engine.getState().signals).toHaveLength(1);
     expect(engine.getState().options.openOptions).toHaveLength(1);
+  });
+
+  // TRA-968 — the single-leg long is gated on the daily-trend confluence. With
+  // no cached trend series the scanner must stand down rather than open a
+  // trend-blind long (the QuantTrader finding on TRA-953).
+  it('stands down (no open) when there is no daily-trend confluence (TRA-968)', async () => {
+    const scanner = new StubScanner();
+    scanner.scan.mockResolvedValue({
+      symbol: 'AAPL', spot: 195, expiration: '2024-07-05',
+      candidates: [makeCandidate()],
+      reason: 'ok',
+    });
+
+    const engine = new SignalEngine(undefined, undefined, scanner);
+    // Deliberately DO NOT seed shadowCandleCache → trend unknown.
+    await (engine as unknown as { runRelativeValueScan: (s: string[]) => Promise<void> }).runRelativeValueScan(['AAPL']);
+
+    expect(engine.getState().options.openOptions).toHaveLength(0);
+    expect(engine.getState().signals).toHaveLength(0);
+  });
+
+  // TRA-968 — in an uptrend the scanner may open calls but NOT a long put,
+  // even when the put is the only (highest-scoring) cheap candidate.
+  it('rejects a long put when the daily trend is up (TRA-968)', async () => {
+    const scanner = new StubScanner();
+    scanner.scan.mockResolvedValue({
+      symbol: 'AAPL', spot: 195, expiration: '2024-07-05',
+      candidates: [makeCandidate({
+        optionSymbol: 'AAPL240705P00190000',
+        optionType: 'put',
+        strike: 190,
+        delta: -0.6,
+      })],
+      reason: 'ok',
+    });
+
+    const engine = new SignalEngine(undefined, undefined, scanner);
+    seedRvTrend(engine); // confluence resolves `buy` → calls only
+    await (engine as unknown as { runRelativeValueScan: (s: string[]) => Promise<void> }).runRelativeValueScan(['AAPL']);
+
+    expect(engine.getState().options.openOptions).toHaveLength(0);
+    expect(engine.getState().signals).toHaveLength(0);
   });
 });
 
@@ -464,6 +548,7 @@ describe('SignalEngine — TRA-319 live RV mirror reconciliation', () => {
     const engine = new SignalEngine(undefined, undefined, scanner);
     (engine as unknown as { tradierLiveClient: unknown }).tradierLiveClient = stub;
     (engine as unknown as { mode: 'demo' | 'live' }).mode = 'live';
+    seedRvTrend(engine); // TRA-968 — the RV long now needs a confirmed daily uptrend to fire
     return engine;
   }
 
@@ -815,6 +900,7 @@ describe('SignalEngine — TRA-332 live sizing uses real Tradier equity', () => 
     const engine = new SignalEngine(undefined, undefined, scanner);
     (engine as unknown as { tradierLiveClient: unknown }).tradierLiveClient = stub;
     (engine as unknown as { mode: 'demo' | 'live' }).mode = 'live';
+    seedRvTrend(engine); // TRA-968 — the RV long now needs a confirmed daily uptrend to fire
     return engine;
   }
 
@@ -3339,7 +3425,7 @@ describe('SignalEngine — TRA-495 live stocks + options coexistence', () => {
   }
 
   function buildEngine(scanner: StubScanner): SignalEngine {
-    return new SignalEngine({
+    const engine = new SignalEngine({
       ...DEFAULT_ACCOUNT_SETTINGS,
       mode: 'live',
       stocksAutoTradingEnabledLive: true,
@@ -3354,6 +3440,8 @@ describe('SignalEngine — TRA-495 live stocks + options coexistence', () => {
       managedAccountRatio: 0.5,
       riskPerTrade: 0.01,
     }, undefined, scanner);
+    seedRvTrend(engine); // TRA-968 — the RV long now needs a confirmed daily uptrend to fire
+    return engine;
   }
 
   function freshScanner(mark = 1.0): StubScanner {
