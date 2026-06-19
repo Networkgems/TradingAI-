@@ -14,6 +14,10 @@ export * from './social-sentiment.js';
 // + pure decision helpers shared by idea-gen and the order-time paths.
 export * from './day-trading-guardrail.js';
 
+// TRA-954 — risk-capped conviction DCA (scale-in) sizing layer for equities +
+// options: config surface + the exact R-cap solver and the equity/option gates.
+export * from './conviction-dca.js';
+
 // TRA-950 — structured review block (leaders / invalidation / gapRisk / regime)
 // persisted with each pre/post-market review and wired into both decision paths.
 export * from './review-block.js';
