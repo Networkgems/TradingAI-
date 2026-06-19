@@ -222,19 +222,30 @@ const DCA_PARAMS = {
  * dedups within a cadence, so accumulation fires once per cadence, not per candle.
  */
 const CRYPTO_DCA_ACCUMULATION = {
-  /** Master opt-in. Demo accumulation is inert until QuantTrader flips this on. */
-  enabled: false,
+  /**
+   * Master opt-in. Flipped on by LeadDev per QuantTrader's TRA-965 sign-off
+   * (caps set below). Accumulation is demo-paper only (`accumulateDca` stamps
+   * `mode='demo'`); live-money trading awaits QuantTrader's final live-flip nod
+   * once the demo acceptance is green (TRA-961 Coinbase sandbox credential).
+   */
+  enabled: true,
   /**
    * Per-symbol size cap (TRA-961 ask #2): total accumulated notional for one DCA
    * symbol may not exceed this fraction of managed equity. Bounds averaging-in so
-   * one name can't pyramid past position limits. PLACEHOLDER — QuantTrader to set.
+   * one name can't pyramid past position limits. Set to 0.10 by QuantTrader
+   * (TRA-965): ~5% of total equity per name at the 0.5 managed-sleeve ratio;
+   * with hold-mode's wide catastrophe stop the single-name tail is ~2% of total
+   * equity, and it seats under the TRA-423 0.40 cluster notional cap so ~4 names
+   * can diversify a BTC-beta cluster before that cap binds.
    */
-  maxSymbolNotionalFracOfManagedEquity: 0.15,
+  maxSymbolNotionalFracOfManagedEquity: 0.1,
   /**
    * Exit behavior for accumulated DCA positions (TRA-961 ask #3). `'hold'` drops
    * the per-leg take-profit (catastrophe stop only); a 4R TP on each leg would
-   * close the position and defeat hold-and-accumulate. Ships `'hold'` per the
-   * issue's stated preference; QuantTrader to confirm vs a portfolio-level exit.
+   * close the position and defeat hold-and-accumulate. Confirmed `'hold'` by
+   * QuantTrader (TRA-965): we average SIZE, never the STOP — the catastrophe
+   * stop stays the only auto-exit, while daily-loss / gross-exposure / TRA-423
+   * cluster-risk gates still block adds, so the loss-side protection is intact.
    */
   exitMode: 'hold' as 'hold' | 'portfolio',
   // Per-cluster cap (TRA-961 ask #2) reuses the existing TRA-423 correlation /
