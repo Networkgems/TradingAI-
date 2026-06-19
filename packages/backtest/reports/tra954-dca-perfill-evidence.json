@@ -1,0 +1,129 @@
+{
+  "generatedFor": "TRA-954 acceptance #1",
+  "core": "@trading-app/shared/conviction-dca (commits 0d56029 + d305bfb)",
+  "config": {
+    "maxAdds": 2,
+    "trancheSplit": [
+      0.5,
+      0.3,
+      0.2
+    ],
+    "optionMinAddDelta": 0.35,
+    "earningsBlackoutTradingDays": 2,
+    "maxAddsPerNamePerDay": 1,
+    "optionMinDTE": 21
+  },
+  "totals": {
+    "rows": 8,
+    "adds": 3,
+    "skips": 5,
+    "riskBudgetBreaches": 0
+  },
+  "invariantHeld": true,
+  "ledger": [
+    {
+      "scenario": "E equity ladder",
+      "step": 1,
+      "kind": "add@97 (1.5 ATR pullback)",
+      "note": "first add of day",
+      "action": "add",
+      "qty": 3,
+      "blendedAvg": 98.875,
+      "projectedRisk": 71,
+      "riskBudget": 100,
+      "withinBudget": true,
+      "reason": "add 3; blended risk 71.00 <= R=100"
+    },
+    {
+      "scenario": "E equity ladder",
+      "step": 2,
+      "kind": "add@95 same session",
+      "note": "gate C: 2nd add same day",
+      "action": "skip",
+      "qty": 0,
+      "blendedAvg": null,
+      "projectedRisk": null,
+      "riskBudget": 100,
+      "withinBudget": true,
+      "reason": "already added 1x today (max 1/name/day)"
+    },
+    {
+      "scenario": "E equity ladder",
+      "step": 3,
+      "kind": "add@94.5 next day",
+      "note": "ladder add #2, R cap re-verified",
+      "action": "add",
+      "qty": 2,
+      "blendedAvg": 98,
+      "projectedRisk": 80,
+      "riskBudget": 100,
+      "withinBudget": true,
+      "reason": "add 2; blended risk 80.00 <= R=100"
+    },
+    {
+      "scenario": "E equity ladder",
+      "step": 4,
+      "kind": "add@93 pre-earnings",
+      "note": "gate B: earnings blackout",
+      "action": "skip",
+      "qty": 0,
+      "blendedAvg": null,
+      "projectedRisk": null,
+      "riskBudget": 100,
+      "withinBudget": true,
+      "reason": "earnings in 1 trading day(s) — inside 2-day blackout, no add"
+    },
+    {
+      "scenario": "E equity ladder",
+      "step": 5,
+      "kind": "add@91 below SMA-50",
+      "note": "acceptance #3: trend break is an exit",
+      "action": "skip",
+      "qty": 0,
+      "blendedAvg": null,
+      "projectedRisk": null,
+      "riskBudget": 100,
+      "withinBudget": true,
+      "reason": "price below trend reference (95) — trend break is an exit, not an add"
+    },
+    {
+      "scenario": "O option call",
+      "step": 1,
+      "kind": "add 1x @ delta 0.55",
+      "note": "conviction add within premium R",
+      "action": "add",
+      "qty": 1,
+      "blendedAvg": null,
+      "projectedRisk": 300,
+      "riskBudget": 500,
+      "withinBudget": true,
+      "reason": "add 1 contract(s); total premium 300.00 <= R=500"
+    },
+    {
+      "scenario": "O option call",
+      "step": 2,
+      "kind": "add @ delta 0.20",
+      "note": "gate A: |delta| < 0.35 floor",
+      "action": "skip",
+      "qty": 0,
+      "blendedAvg": null,
+      "projectedRisk": null,
+      "riskBudget": 500,
+      "withinBudget": true,
+      "reason": "add |delta| 0.20 < floor 0.35 — too far OTM for a conviction add"
+    },
+    {
+      "scenario": "O option call",
+      "step": 3,
+      "kind": "add @ DTE 18",
+      "note": "acceptance #4: DTE < 21",
+      "action": "skip",
+      "qty": 0,
+      "blendedAvg": null,
+      "projectedRisk": null,
+      "riskBudget": 500,
+      "withinBudget": true,
+      "reason": "DTE 18 < 21 — theta-dominated, no add"
+    }
+  ]
+}
