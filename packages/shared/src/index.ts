@@ -1868,6 +1868,24 @@ export function isStockMarketOpen(utcMs: number = Date.now()): boolean {
   return etMinutes >= 9 * 60 + 30 && etMinutes < 16 * 60;
 }
 
+/**
+ * Minutes remaining until the 4:00 PM ET regular-session close. Returns 0 on
+ * weekends, before 9:30 AM ET, and at/after the close. DST-aware via
+ * {@link getEasternUtcOffset}. Used by the conviction-DCA session gate (TRA-954)
+ * — no add inside the last `noAddLastMinutes` of the session.
+ */
+export function minutesToSessionClose(utcMs: number = Date.now()): number {
+  const offsetHours = getEasternUtcOffset(utcMs);
+  const etMs = utcMs + offsetHours * 60 * 60 * 1000;
+  const etDate = new Date(etMs);
+  const dayOfWeek = etDate.getUTCDay(); // 0=Sun, 6=Sat
+  if (dayOfWeek === 0 || dayOfWeek === 6) return 0;
+  const etMinutes = etDate.getUTCHours() * 60 + etDate.getUTCMinutes();
+  const closeEt = 16 * 60;
+  if (etMinutes < 9 * 60 + 30 || etMinutes >= closeEt) return 0;
+  return closeEt - etMinutes;
+}
+
 // Crypto trading windows (UTC minutes) — skip dead zone 04:00–07:59
 // Based on academic analysis: peak volume/volatility 12:00–17:00, secondary peaks at 00:00 and 08:00.
 export const CRYPTO_TRADING_WINDOWS: readonly [number, number][] = [

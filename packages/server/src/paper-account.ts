@@ -200,6 +200,41 @@ export class PaperAccount {
     return position;
   }
 
+  /**
+   * TRA-954 — conviction DCA scale-in. Add `addQty` shares to an existing open
+   * position at `addPrice`, blending the average entry while keeping the
+   * original protective stop FIXED — we average *size*, never the *stop* (the
+   * classic DCA failure mode of widening the stop "to give it room" is
+   * forbidden by the issue's core invariant). The R-cap arithmetic lives in the
+   * pure `evaluateEquityDcaAdd` core; this method is just the book mutation.
+   *
+   * Returns the updated Position, or `null` when the position is absent, the
+   * add size/price is non-positive, or available cash can't cover the add.
+   */
+  addToPosition(positionId: string, addQty: number, addPrice: number): Position | null {
+    const pos = this.positions.get(positionId);
+    if (!pos) return null;
+    if (!Number.isFinite(addQty) || addQty <= 0) return null;
+    if (!Number.isFinite(addPrice) || addPrice <= 0) return null;
+    const cost = addPrice * addQty;
+    if (cost > this.cash) {
+      log.warn('skip DCA add: cost exceeds cash', {
+        positionId,
+        symbol: pos.symbol,
+        cost: cost.toFixed(2),
+        cash: this.cash.toFixed(2),
+      });
+      return null;
+    }
+    const newQty = pos.quantity + addQty;
+    // Blend the average entry; the protective stop is intentionally left as-is.
+    pos.entryPrice = (pos.entryPrice * pos.quantity + addPrice * addQty) / newQty;
+    pos.quantity = newQty;
+    this.cash -= cost;
+    this.positions.set(positionId, pos);
+    return pos;
+  }
+
   checkExits(prices: Map<string, number>): Position[] {
     const closed: Position[] = [];
     for (const [id, pos] of this.positions) {

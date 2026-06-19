@@ -93,6 +93,76 @@ describe('PaperAccount.checkExits — invalid-bracket self-heal (TRA-518)', () =
   });
 });
 
+// TRA-954 — conviction-DCA scale-in book mutation. addToPosition blends the
+// average entry, increases qty, and keeps the protective stop FIXED (average
+// size, never the stop). It is the demo-book primitive the engine's DCA pass
+// calls once the pure `evaluateEquityDcaAdd` core returns an add/shrink verdict.
+describe('PaperAccount.addToPosition — conviction DCA scale-in (TRA-954)', () => {
+  function openLong(): { acc: PaperAccount; id: string } {
+    const acc = new PaperAccount({ initialEquity: 100_000 });
+    acc.importSnapshot({
+      cash: 100_000,
+      equity: 100_000,
+      initialEquity: 100_000,
+      dailyPnl: 0,
+      openPositions: [{
+        id: 'p1', symbol: 'AAPL', side: 'buy', signalType: 'orb_breakout',
+        entryPrice: 100, quantity: 10, stopLoss: 90, takeProfit: 130,
+        openedAt: 1, mode: 'demo',
+      }],
+    });
+    return { acc, id: 'p1' };
+  }
+
+  it('blends the average entry and increases qty while keeping the stop fixed', () => {
+    const { acc, id } = openLong();
+    const cashBefore = acc.getState().availableCash;
+
+    const updated = acc.addToPosition(id, 5, 97);
+
+    expect(updated).not.toBeNull();
+    // blended avg = (100*10 + 97*5) / 15 = 99
+    expect(updated!.entryPrice).toBeCloseTo(99, 9);
+    expect(updated!.quantity).toBe(15);
+    expect(updated!.stopLoss).toBe(90); // unchanged — we average size, never the stop
+    // cash debited by the add cost only
+    expect(acc.getState().availableCash).toBeCloseTo(cashBefore - 97 * 5, 6);
+  });
+
+  it('preserves the R invariant: blended (avg-stop)*qty stays bounded', () => {
+    const { acc, id } = openLong();
+    // entry risk = (100-90)*10 = 100. Add 5 @ 97 → blended (99-90)*15 = 135.
+    const updated = acc.addToPosition(id, 5, 97)!;
+    const blendedRisk = (updated.entryPrice - updated.stopLoss) * updated.quantity;
+    expect(blendedRisk).toBeCloseTo(135, 6);
+    // The pure core owns shrink/skip to keep this ≤ R; here we only assert the
+    // mutation reports the exact blended risk the engine logs as evidence.
+  });
+
+  it('refuses an add it cannot afford (cost exceeds cash) and leaves the book intact', () => {
+    const acc = new PaperAccount({ initialEquity: 100_000 });
+    acc.importSnapshot({
+      cash: 100, equity: 100, initialEquity: 100, dailyPnl: 0,
+      openPositions: [{
+        id: 'p2', symbol: 'AAPL', side: 'buy', signalType: 'orb_breakout',
+        entryPrice: 100, quantity: 1, stopLoss: 90, takeProfit: 130, openedAt: 1, mode: 'demo',
+      }],
+    });
+    expect(acc.addToPosition('p2', 1000, 100)).toBeNull(); // 100k cost vs 100 cash
+    const pos = acc.getState().openPositions[0];
+    expect(pos.quantity).toBe(1);
+    expect(pos.entryPrice).toBe(100);
+  });
+
+  it('returns null for an unknown position or a non-positive add', () => {
+    const { acc, id } = openLong();
+    expect(acc.addToPosition('nope', 5, 97)).toBeNull();
+    expect(acc.addToPosition(id, 0, 97)).toBeNull();
+    expect(acc.addToPosition(id, -3, 97)).toBeNull();
+    expect(acc.addToPosition(id, 5, 0)).toBeNull();
+  });
+});
+
 // TRA-536 — the stocks paper fill path stamps realized (live-fill drift from the
 // strategy's intended entry) and modeled (5 bps budget) slippage so the Stage-2
 // promotion gate can enforce its realized-≤-1.5×-modeled check.

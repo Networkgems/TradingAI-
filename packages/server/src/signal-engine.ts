@@ -1,7 +1,7 @@
 import { OrbStrategy, BbFadeStrategy, IchimokuStrategy, SupertrendConfluenceStrategy, confluenceSide, supertrend, reversalChecklist, atr, donchian, supportResistance, blackScholesDelta, daysToExpiration, TradierOptionsClient, TradierOrderClient, TRADIER_REJECTED_STATUSES, evaluateSma200, SMA200_MIN_BARS, SMA200_DEBOUNCE_BARS, composeTechnicalSnapshot, resampleCandles, TF_BUCKET_MS } from '@trading-app/engine';
 import type { StrategySelectorInput, ContractQuote, OptionTrend } from '@trading-app/engine';
 import type { TradierAccountBalance } from '@trading-app/engine';
-import { WATCHLIST, isLiquidSwingSymbol, checkEquitySwingClose, MANAGED_ACCOUNT_RATIO, MAX_CONSECUTIVE_LOSSES, DAILY_DRAWDOWN_HALT_PCT, OPTIONS_PER_TICKET_DOLLAR_FLOOR, OPTIONS_POSITION_CAP_RATIO, aliasWatchlistSymbol, isLiveTradierOptionsEnabled, isStockMarketOpen, perPositionCap, resolveAutoManageImportedTradierOptions, resolveDemoCostModel, resolveHoldLiveOptionsOvernight, resolveLiveTradeEquitiesTradier, resolveManagedAccountRatio, resolveMarketReviewGatesEnabled, resolveRiskPerTrade, resolveRvDtePrefs, resolveTradierOptionsCreds, validateBracket, DEFAULT_RV_DTE_MIN, DEFAULT_RV_DTE_MAX, DEFAULT_RV_DTE_TARGET, scoreNewsSentiment, aggregateSymbolSentiment, aggregateFedSentiment, aggregateStockTwitsSentiment, dedupeStockTwitsMessages, mapCuratedMessagesBySymbol, nameAliasesFor } from '@trading-app/shared';
+import { WATCHLIST, isLiquidSwingSymbol, checkEquitySwingClose, MANAGED_ACCOUNT_RATIO, MAX_CONSECUTIVE_LOSSES, DAILY_DRAWDOWN_HALT_PCT, OPTIONS_PER_TICKET_DOLLAR_FLOOR, OPTIONS_POSITION_CAP_RATIO, aliasWatchlistSymbol, isLiveTradierOptionsEnabled, isStockMarketOpen, perPositionCap, resolveAutoManageImportedTradierOptions, resolveDemoCostModel, resolveHoldLiveOptionsOvernight, resolveLiveTradeEquitiesTradier, resolveManagedAccountRatio, resolveMarketReviewGatesEnabled, resolveRiskPerTrade, resolveRvDtePrefs, resolveTradierOptionsCreds, validateBracket, DEFAULT_RV_DTE_MIN, DEFAULT_RV_DTE_MAX, DEFAULT_RV_DTE_TARGET, scoreNewsSentiment, aggregateSymbolSentiment, aggregateFedSentiment, aggregateStockTwitsSentiment, dedupeStockTwitsMessages, mapCuratedMessagesBySymbol, nameAliasesFor, evaluateEquityDcaAdd, CONVICTION_DCA, blendedAverage, positionRiskDollars, minutesToSessionClose, getEasternUtcOffset } from '@trading-app/shared';
 import type { TradeSignal, RelativeValueSignal, Sma200Signal, Candle, OptionsAccountState, SignalType, Position, OptionPosition, AccountMode, AccountSettings, AccountState, NewsItem, SymbolSentiment, SocialSentiment, StockTwitsMessage, TechnicalSignalSnapshot, TradierEnv, MarketReview, MarketReviewGates, EngineMarketReviewState, GatedStrategyNote, AgentRecommendation, TradeProposal, AgentOrderAudit, GuardrailVerdict } from '@trading-app/shared';
 import { shouldAutoConfirm } from '@trading-app/shared';
 // TRA-544 (TRA-529 P1) / TRA-747 (P2) — advisory multi-agent layer. ON suspends
@@ -891,6 +891,14 @@ export class SignalEngine {
    * Keyed by Position.id (a uuid stamped at open time).
    */
   private liveEquityPositions: Map<string, Position> = new Map();
+  // TRA-954 — conviction-DCA per-position fill ledger (entry first), seeded
+  // lazily from the open position on first add-eval and appended on each add.
+  private dcaTranches: Map<string, { qty: number; price: number }[]> = new Map();
+  // TRA-954 — epoch ms of the most recent fill (entry or add) per position, for
+  // the inter-add bar-spacing gate.
+  private dcaLastFillAt: Map<string, number> = new Map();
+  // TRA-954 — adds executed per name in the current ET session (gate C cap).
+  private dcaAddsToday: Map<string, { etDay: string; count: number }> = new Map();
   /** TRA-335 — Tradier order id (entry leg) → local Position id, used for reconcile. */
   private liveEquityOrderIds: Map<string, number | string> = new Map();
   /**
@@ -1769,6 +1777,11 @@ export class SignalEngine {
       if (symbolsWithData === 0 && activeSymbols.length > 0) {
         log.warn('tick: no symbols had sufficient candle data (market closed or data unavailable)');
       }
+      // TRA-954 — conviction-DCA scale-in pass. Hard no-op unless
+      // CONVICTION_DCA.enabled (ships false; live promotion gated on the
+      // TRA-958 sign-off). Shares this block's gates: deterministic
+      // auto-trading on, not halted, market open.
+      this.evaluateConvictionDcaAdds(prices);
     }
 
     // TRA-787 — SupertrendConfluence SHADOW pass. Evaluates every watchlist
@@ -3590,6 +3603,123 @@ export class SignalEngine {
   private equitySwingModeEnabled(): boolean {
     const v = (process.env.EQUITY_SWING_MODE ?? '').trim().toLowerCase();
     return !(v === 'off' || v === '0' || v === 'false' || v === 'no');
+  }
+
+  /**
+   * TRA-954 — risk-capped conviction DCA (scale-in) pass for the equity book.
+   *
+   * OFF by default: the whole pass is gated on `CONVICTION_DCA.enabled`, which
+   * ships `false` (opt-in). While disabled this is a hard no-op — zero behavior
+   * change for the live/demo books. Live promotion (`dca.enabled=true`) is
+   * separately gated on QuantTrader's TRA-958 sign-off (gates A/B/C, already in
+   * the pure core).
+   *
+   * For each open *demo* equity position it builds the `EquityAddContext` from
+   * live engine state and runs the SHIPPED pure core `evaluateEquityDcaAdd`. On
+   * an `add`/`shrink` verdict it executes the tranche on the paper book via
+   * `PaperAccount.addToPosition` (averaging size, never the stop) and logs the
+   * per-fill blended `(avg−stop)·qty` vs R — acceptance #1 evidence, now sourced
+   * from the real engine rather than the synthetic harness. In LIVE mode it logs
+   * the add *intent* only; the live add-order (Tradier) path is a gated
+   * follow-up — the demo path proves the R invariant first.
+   */
+  private evaluateConvictionDcaAdds(prices: Map<string, number>): void {
+    if (!CONVICTION_DCA.enabled) return;
+    const now = Date.now();
+    const R = this.account.maxRiskPerTrade();
+    if (!(R > 0)) return;
+
+    const demoOpen = this.account.getState().openPositions;
+    if (demoOpen.length === 0) return;
+
+    // Prune per-position state for positions that have since closed so the
+    // fill-ledger / last-fill maps don't accumulate stale ids over time.
+    const openIds = new Set(demoOpen.map(p => p.id));
+    for (const id of this.dcaTranches.keys()) if (!openIds.has(id)) this.dcaTranches.delete(id);
+    for (const id of this.dcaLastFillAt.keys()) if (!openIds.has(id)) this.dcaLastFillAt.delete(id);
+
+    // Gross-exposure proxy (acceptance #5): long notional vs managed equity
+    // (the demo equity book is unlevered). A breach blocks ALL adds.
+    const managedEq = this.account.managedEquity();
+    let grossNotional = 0;
+    for (const p of demoOpen) grossNotional += Math.abs(p.entryPrice * p.quantity);
+    const grossExposureBreached = managedEq > 0 && grossNotional > managedEq;
+    const dailyLossLimitBreached = this.riskGovernor.isHalted();
+    const minsToClose = minutesToSessionClose(now);
+    const etDay = new Date(now + getEasternUtcOffset(now) * 3600 * 1000).toISOString().slice(0, 10);
+
+    for (const pos of demoOpen) {
+      const side = pos.side === 'buy' ? 'long' : 'short';
+      const price = prices.get(pos.symbol);
+      if (price == null || !Number.isFinite(price)) continue;
+      const candles = this.candleCache.get(pos.symbol) ?? [];
+      if (candles.length < 50) continue; // need SMA-50 window + ATR(14)
+      const atrVal = atr(candles, 14);
+      if (atrVal == null || !(atrVal > 0)) continue;
+      const sma50 = candles.slice(-50).reduce((s, c) => s + c.close, 0) / 50;
+
+      // Seed the per-position fill ledger from the current book state on first
+      // sight, then keep it as the source of truth for blended risk.
+      let tranches = this.dcaTranches.get(pos.id);
+      if (!tranches) {
+        tranches = [{ qty: pos.quantity, price: pos.entryPrice }];
+        this.dcaTranches.set(pos.id, tranches);
+      }
+      const lastFillAt = this.dcaLastFillAt.get(pos.id) ?? pos.openedAt;
+      const barsSinceLastFill = candles.filter(c => c.timestamp > lastFillAt).length;
+
+      const todayRec = this.dcaAddsToday.get(pos.symbol);
+      const addsToday = todayRec && todayRec.etDay === etDay ? todayRec.count : 0;
+
+      const verdict = evaluateEquityDcaAdd({
+        side,
+        tranches,
+        stop: pos.stopLoss,
+        riskBudget: R,
+        addPrice: price,
+        atr: atrVal,
+        trendRef: sma50,
+        // Open and not flagged for exit; the trend-reference gate (price vs
+        // SMA-50) and the fixed stop carry the thesis check here. A flipped
+        // signal closes the position via the exit path, removing it from this
+        // loop before any add can fire.
+        signalStillValid: true,
+        barsSinceLastFill,
+        minutesToSessionClose: minsToClose,
+        grossExposureBreached,
+        dailyLossLimitBreached,
+        tradingDaysToEarnings: earningsInDaysSync(pos.symbol, now),
+        addsToday,
+      });
+      if (verdict.action === 'skip' || verdict.qty <= 0) continue;
+
+      if (this.mode === 'live') {
+        // Live add-order path is a gated follow-up — record intent only.
+        log.info('TRA-954 conviction-DCA add intent (live shadow — order path gated)', {
+          symbol: pos.symbol, positionId: pos.id, action: verdict.action,
+          addQty: verdict.qty, addPrice: price,
+          blendedAvg: verdict.blendedAvg, projectedRisk: verdict.projectedRisk, riskBudget: R,
+        });
+        continue;
+      }
+
+      const updated = this.account.addToPosition(pos.id, verdict.qty, price);
+      if (!updated) continue;
+      tranches.push({ qty: verdict.qty, price });
+      this.dcaLastFillAt.set(pos.id, now);
+      this.dcaAddsToday.set(pos.symbol, { etDay, count: addsToday + 1 });
+
+      // Per-fill R evidence (acceptance #1): blended (avg−stop)·qty ≤ R.
+      const blended = blendedAverage(tranches);
+      const realizedRisk = positionRiskDollars(blended, updated.stopLoss, updated.quantity, side);
+      log.info('TRA-954 conviction-DCA add filled (demo)', {
+        symbol: pos.symbol, positionId: pos.id, action: verdict.action,
+        addQty: verdict.qty, addPrice: price,
+        blendedAvg: Number(blended.toFixed(4)), stop: updated.stopLoss, totalQty: updated.quantity,
+        realizedRiskDollars: Number(realizedRisk.toFixed(2)), riskBudget: Number(R.toFixed(2)),
+        withinBudget: realizedRisk <= R + 1e-6, reason: verdict.reason,
+      });
+    }
   }
 
   private async routeEquitySignal(
