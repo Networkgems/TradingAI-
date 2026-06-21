@@ -40,6 +40,7 @@ import {
   openReversalShadowSignalsSync,
 } from './reversal-shadow-ledger.js';
 import { ivRankSync, atmIvFromRows } from './iv-rank-store.js';
+import type { SentimentIcBand } from './option-trade-journal.js';
 import { isOptionShadowEnabled, isOptionPhaseBEnabled, emitShadowOptionSignal, shadowSignalToSpreadParams, OPTION_SHADOW_EMERGENCY_OFF } from './option-shadow-ledger.js';
 import { etDateString } from './scheduler.js';
 import { fetchMinuteBars, fetchDailyCandles, fetchQuotes, fetchStocksNews, isYahooBreakerOpen, setActiveInterestSymbols, setTradierStocksFeedClient } from './yahoo-feed.js';
@@ -3247,6 +3248,11 @@ export class SignalEngine {
                 trend: trend === 'up' || trend === 'down' ? trend : 'sideways',
                 entryDelta: sig.shortDelta,
                 sentiment: null,
+                // TRA-993 — record the TRA-820 sentiment-IC GRADE band (signal
+                // skill, not the raw number) for this symbol at open, captured
+                // from row #1 so the `bySentimentIc` fold has the field. null
+                // when no grade is available; never blocks the open.
+                sentimentIcBand: this.sentimentIcBandFor(sym),
                 agentConviction: null,
               },
             );
@@ -3282,6 +3288,24 @@ export class SignalEngine {
         });
       }
     }
+  }
+
+  /**
+   * TRA-993 — the TRA-820 sentiment-IC GRADE band for `symbol` at open time: the
+   * measured skill/quality of the sentiment signal (`strong` / `weak` / `none`),
+   * NOT the raw sentiment number ({@link OptionTradeJournalSetup.sentiment}). The
+   * option-trade journal records it so `learned-option-weights.bySentimentIc` can
+   * fold realized P&L by signal quality.
+   *
+   * The TRA-820 study (`sentiment-ic-harness.ts`) is still accruing toward its §4
+   * sample bar and emits no per-symbol live grade yet, so this returns `null`
+   * today — the honest "no grade available" value. Per the issue an open is NEVER
+   * blocked on a missing grade. This is the single join point: once TRA-820
+   * publishes a per-symbol daily grade, populate it here and every row from that
+   * point captures the band.
+   */
+  private sentimentIcBandFor(_symbol: string): SentimentIcBand {
+    return null;
   }
 
   /**

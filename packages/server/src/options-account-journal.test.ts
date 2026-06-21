@@ -23,6 +23,7 @@ const setup: OptionTradeJournalSetup = {
   ivRank: 62,
   trend: 'up',
   sentiment: 0.3,
+  sentimentIcBand: 'strong', // TRA-993 — sentiment-IC GRADE band (signal skill)
   agentConviction: 0.8,
   entryDelta: 0.22,
 };
@@ -105,6 +106,7 @@ describe('PaperOptionsAccount option-trade journal emit (TRA-991)', () => {
     expect(rows[0]!.ivRank).toBe(62);
     expect(rows[0]!.trend).toBe('up');
     expect(rows[0]!.sentiment).toBe(0.3);
+    expect(rows[0]!.sentimentIcBand).toBe('strong'); // TRA-993 grade band recorded at open
     expect(rows[0]!.agentConviction).toBe(0.8);
     expect(rows[0]!.atRiskUsd).toBe(320); // reserved capital at risk per lot
     expect(rows[0]!.entryDelta).toBeCloseTo(0.22, 5);

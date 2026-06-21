@@ -50,6 +50,17 @@ export function isOptionTradeJournalEnabled(env: NodeJS.ProcessEnv = process.env
 /** Coarse trend regime the structure was opened into. */
 export type JournalTrend = 'up' | 'down' | 'sideways';
 
+/**
+ * TRA-993 — the *grade/skill* band of the sentiment signal at entry, sourced from
+ * the TRA-820 sentiment-IC study (`sentiment-ic-harness.ts` verdict / daily
+ * snapshot grade), NOT the raw sentiment number. `strong` = the IC study graded
+ * the signal as carrying edge, `weak` = measured but inconclusive, `none` = no
+ * measurable skill. `null` when no grade is available — an open is NEVER blocked
+ * on a missing grade. Distinct from {@link OptionTradeJournalOpen.sentiment},
+ * which is the raw net news+social number.
+ */
+export type SentimentIcBand = 'strong' | 'weak' | 'none' | null;
+
 /** Realized verdict for a closed option trade. */
 export type OptionTradeOutcome = 'WIN' | 'LOSS' | 'SCRATCH';
 
@@ -74,6 +85,13 @@ export interface OptionTradeJournalOpen {
   trend: JournalTrend;
   /** Net news+social sentiment at entry, clamped [-1, +1]; null if unknown. */
   sentiment: number | null;
+  /**
+   * TRA-993 — TRA-820 sentiment-IC grade BAND for the symbol at entry (the
+   * skill/quality of the sentiment signal, not its raw value). `null` when no
+   * grade is available; never blocks the open. Optional on the line shape so
+   * pre-TRA-993 rows fold back as `null`.
+   */
+  sentimentIcBand?: SentimentIcBand;
   /** Net |delta| of the position at entry (directional exposure). */
   entryDelta: number;
   /** Days-to-expiration at entry. */

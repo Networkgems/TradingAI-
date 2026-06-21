@@ -5,6 +5,7 @@ import {
 import type {
   JournalTrend,
   OptionTradeJournalRecord,
+  SentimentIcBand,
 } from './option-trade-journal.js';
 
 // TRA-990 (Learning B) — fold the option-trade journal into learned, bounded
@@ -56,6 +57,14 @@ export interface OptionLearnedWeights {
   byTrend: OptionLearnedStat[];
   bySentiment: OptionLearnedStat[];
   byDte: OptionLearnedStat[];
+  /**
+   * TRA-993 — 6th fold: by TRA-820 sentiment-IC grade band (`strong` / `weak` /
+   * `none`, plus `unknown` for rows with no grade). The skill/quality of the
+   * sentiment signal, distinct from {@link bySentiment} (the raw net number).
+   * Observe-only: produced for the QuantTrader validation read but deliberately
+   * held OUT of {@link optionSetupMultiplier} until TRA-992 Step 3 clears.
+   */
+  bySentimentIc: OptionLearnedStat[];
 }
 
 function clamp(x: number, lo: number, hi: number): number {
@@ -82,6 +91,15 @@ export function dteBand(dte: number): 'lt30' | '30to45' | 'gt45' {
   if (dte < 30) return 'lt30';
   if (dte > 45) return 'gt45';
   return '30to45';
+}
+
+/**
+ * TRA-993 — sentiment-IC grade band → fold key. A missing grade (`null`/absent)
+ * buckets under `unknown` so ungraded rows are counted separately and never
+ * pollute the graded `strong` / `weak` / `none` buckets.
+ */
+export function sentimentIcBandKey(band: SentimentIcBand | undefined): string {
+  return band ?? 'unknown';
 }
 
 /**
@@ -156,6 +174,7 @@ export function computeOptionLearnedWeights(
     byTrend: fold((r) => r.trend),
     bySentiment: fold((r) => sentimentBand(r.sentiment)),
     byDte: fold((r) => dteBand(r.entryDte)),
+    bySentimentIc: fold((r) => sentimentIcBandKey(r.sentimentIcBand)),
   };
 }
 
@@ -174,6 +193,10 @@ export interface OptionSetupKey {
  * DTE) and clamps the product back into [floor, ceil]. Dimensions still inside
  * the min-sample guard contribute 1.0, so a brand-new structure or rare regime
  * never distorts the weight until it has earned a track record.
+ *
+ * TRA-993 — the `bySentimentIc` fold is intentionally NOT one of these factors:
+ * it is observe-only and stays out of the combined multiplier until TRA-992
+ * Step 3 (gated on QuantTrader's validation read) wires it into a decision.
  */
 export function optionSetupMultiplier(
   weights: OptionLearnedWeights,

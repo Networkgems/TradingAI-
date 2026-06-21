@@ -239,6 +239,7 @@ function buildOptionJournalMarkdown(
         ...weights.byTrend,
         ...weights.bySentiment,
         ...weights.byDte,
+        ...weights.bySentimentIc,
       ].filter(s => s.confident && s.multiplier !== 1)
     : [];
   const weightRows = movedWeights

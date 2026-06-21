@@ -48,6 +48,7 @@ import {
   outcomeForR,
   type JournalTrend,
   type OptionTradeJournalOpen,
+  type SentimentIcBand,
 } from './option-trade-journal.js';
 
 // TRA-991 — the selector-computed setup the journal pairs with the realized
@@ -63,6 +64,12 @@ export interface OptionTradeJournalSetup {
   trend: JournalTrend;
   /** Net news+social sentiment [-1,+1]; null/omitted when unavailable. */
   sentiment?: number | null;
+  /**
+   * TRA-993 — TRA-820 sentiment-IC grade band for the symbol at entry (signal
+   * skill, not the raw number). null/omitted when no grade is available; the
+   * open is never blocked on it.
+   */
+  sentimentIcBand?: SentimentIcBand;
   /** Agent conviction [0,1] from the advisory recommendation; null when none. */
   agentConviction?: number | null;
   /**
@@ -474,6 +481,7 @@ export class PaperOptionsAccount {
       ivRank: setup.ivRank,
       trend: setup.trend,
       sentiment: setup.sentiment ?? null,
+      sentimentIcBand: setup.sentimentIcBand ?? null,
       entryDelta,
       entryDte,
       atRiskUsd,
