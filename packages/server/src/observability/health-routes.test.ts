@@ -12,8 +12,10 @@ import {
   summarizeDemoBooks,
   summarizeDemoBooksPublic,
   summarizeOptionsPipeline,
+  buildOptionJournalReport,
   type HealthUserContext,
 } from './health-routes.js';
+import type { OptionTradeJournalRecord } from '../option-trade-journal.js';
 import { checkStaleState } from './alerts.js';
 import { getRecentAlerts, __resetAlertsForTest } from './alerts.js';
 import type { EngineState, LiveEquityAcceptance } from '../signal-engine.js';
@@ -594,5 +596,50 @@ describe('runStaleStateCheck', () => {
     const contexts = [ctx('admin', engineState())];
     expect(runStaleStateCheck(contexts, () => settings({ mode: 'live' }), NOW)).toBe(false);
     expect(getRecentAlerts()).toHaveLength(0);
+  });
+});
+
+// TRA-991 — option-trade journal readout builder.
+describe('buildOptionJournalReport', () => {
+  const closedRow: OptionTradeJournalRecord = {
+    id: 'p1',
+    openTs: NOW - 86_400_000,
+    symbol: 'AAPL',
+    structure: 'bull_put',
+    mode: 'demo',
+    ivRank: 60,
+    trend: 'up',
+    sentiment: 0.2,
+    entryDelta: 0.2,
+    entryDte: 35,
+    atRiskUsd: 320,
+    agentConviction: 0.7,
+    outcome: 'WIN',
+    closeTs: NOW,
+    realizedPnlUsd: 320,
+    realizedR: 1,
+    exitReason: 'manual',
+    holdDays: 1,
+  };
+
+  it('folds rows into the summary + learned weights and reflects the flag', () => {
+    const report = buildOptionJournalReport([closedRow], NOW, true);
+    expect(report.ok).toBe(true);
+    expect(report.enabled).toBe(true);
+    expect(report.summary.total).toBe(1);
+    expect(report.summary.closed).toBe(1);
+    expect(report.summary.win).toBe(1);
+    expect(report.summary.realizedPnlUsd).toBe(320);
+    expect(report.summary.byStructure[0]?.structure).toBe('bull_put');
+    // Learned weights present (neutral until min-sample, but the digest exists).
+    expect(report.weights.generatedFrom.rows).toBe(1);
+    expect(report.weights.generatedFrom.resolved).toBe(1);
+  });
+
+  it('serves an empty (disabled) readout without rows', () => {
+    const report = buildOptionJournalReport([], NOW, false);
+    expect(report.enabled).toBe(false);
+    expect(report.summary.total).toBe(0);
+    expect(report.summary.byStructure).toHaveLength(0);
   });
 });

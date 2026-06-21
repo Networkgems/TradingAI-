@@ -475,4 +475,43 @@ describe('generateEodReport — TRA-594 calendar aggregation', () => {
     expect(onUtc16.totalTrades).toBe(0);
     expect(onUtc16.realizedPnl).toBe(0);
   });
+
+  // TRA-991 — option-trade journal P&L / learned-weights section.
+  it('renders the option-trade journal section when a summary is supplied', () => {
+    const report = generateEodReport({
+      state: makeEngineState(),
+      allClosedPositions: [],
+      dailySignals: [],
+      signalTypeMap: new Map(),
+      optionJournal: {
+        total: 2,
+        open: 1,
+        closed: 1,
+        win: 1,
+        loss: 0,
+        scratch: 0,
+        winRate: 1,
+        realizedPnlUsd: 320,
+        avgR: 1,
+        byStructure: [
+          { structure: 'bull_put', closed: 1, realizedPnlUsd: 320, winRate: 1, avgR: 1 },
+        ],
+      },
+    });
+
+    expect(report.markdown).toContain('Option-Trade Journal');
+    expect(report.markdown).toContain('Journal P&L by Structure');
+    expect(report.markdown).toContain('bull_put');
+    expect(report.markdown).toContain('+$320.00');
+  });
+
+  it('omits the journal section entirely when no summary is supplied', () => {
+    const report = generateEodReport({
+      state: makeEngineState(),
+      allClosedPositions: [],
+      dailySignals: [],
+      signalTypeMap: new Map(),
+    });
+    expect(report.markdown).not.toContain('Option-Trade Journal');
+  });
 });

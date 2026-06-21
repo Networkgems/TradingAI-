@@ -9,6 +9,12 @@ import { MarketScheduler, isMarketDay, isMarketDayIso, missedTradingDays, etDate
 import { generateEodReport } from './reports/eod-report.js';
 import { generateCryptoEodReport } from './reports/crypto-eod-report.js';
 import {
+  listOptionTradeJournal,
+  summarizeOptionTradeJournal,
+  isOptionTradeJournalEnabled,
+} from './option-trade-journal.js';
+import { computeOptionLearnedWeights } from './learned-option-weights.js';
+import {
   computeOptionsAlerts,
   scanTargetStop,
   diffChain,
@@ -634,6 +640,23 @@ async function generateAndSaveReport(
   // reflects any Tradier-side closes we just merged (the dashboard pill
   // reads the same aggregate).
   const finalSnapshot = ctx.engine.getReportSnapshot();
+  // TRA-991 — fold the demo option-trade journal (TRA-990) into the report so
+  // the EOD markdown carries the journal P&L + learned-weights section. The
+  // journal is demo-only and observe-only; gate the read on the flag so a
+  // disabled journal adds no section and no I/O surprise.
+  if (isOptionTradeJournalEnabled()) {
+    try {
+      await ctx.engine.flushOptionTradeJournal?.();
+      const journalRows = await listOptionTradeJournal({ mode: 'demo' });
+      finalSnapshot.optionJournal = summarizeOptionTradeJournal(journalRows);
+      finalSnapshot.optionLearnedWeights = computeOptionLearnedWeights(journalRows);
+    } catch (err) {
+      log.warn('option-trade-journal EOD fold failed', {
+        username: ctx.username,
+        reason: err instanceof Error ? err.message : String(err),
+      });
+    }
+  }
   let finalReport = generateEodReport(finalSnapshot, opts.asOfDate);
 
   // TRA-359 — in live mode, override the report's `combinedPnl` with the

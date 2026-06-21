@@ -19,6 +19,16 @@ import {
   isOptionPhaseBEnabled,
   OPTION_SHADOW_EMERGENCY_OFF,
 } from '../option-shadow-ledger.js';
+import {
+  listOptionTradeJournal,
+  summarizeOptionTradeJournal,
+  isOptionTradeJournalEnabled,
+  type OptionTradeJournalSummary,
+} from '../option-trade-journal.js';
+import {
+  computeOptionLearnedWeights,
+  type OptionLearnedWeights,
+} from '../learned-option-weights.js';
 
 /** Minimal shape this module needs from a per-user context. */
 export interface HealthEngineLike {
@@ -488,6 +498,44 @@ export function summarizeOptionsPipeline(
   };
 }
 
+// ── TRA-991 option-trade journal readout ─────────────────────────────────────
+
+/**
+ * Shape returned by `GET /api/health/option-journal`. The journal is a
+ * process-global, demo-only, observe-only ledger (no per-user balances, no
+ * secrets), so the readout is unauthenticated — parity with
+ * `/api/health/options-pipeline`. `enabled` mirrors the
+ * `ENABLE_OPTION_TRADE_JOURNAL` flag so the board can see at a glance whether
+ * accrual is even armed; when off the summary is still served (empty) so the
+ * route never 404s mid-rollout. `weights` is the bounded learned multipliers the
+ * fold derives — surfaced for visibility only; nothing here feeds a decision.
+ */
+export interface OptionJournalReport {
+  ok: true;
+  time: string;
+  build: ReturnType<typeof resolveBuildInfo>;
+  /** `ENABLE_OPTION_TRADE_JOURNAL` is on (accrual armed). */
+  enabled: boolean;
+  summary: OptionTradeJournalSummary;
+  weights: OptionLearnedWeights;
+}
+
+/** Fold the journal rows into the readout report. Pure beyond the clock. */
+export function buildOptionJournalReport(
+  rows: Parameters<typeof summarizeOptionTradeJournal>[0],
+  now: number,
+  enabled: boolean,
+): OptionJournalReport {
+  return {
+    ok: true,
+    time: new Date(now).toISOString(),
+    build: resolveBuildInfo(),
+    enabled,
+    summary: summarizeOptionTradeJournal(rows),
+    weights: computeOptionLearnedWeights(rows),
+  };
+}
+
 /** Build the consolidated live-health summary for one user context. */
 function summarizeForContext(
   ctx: HealthUserContext,
@@ -617,6 +665,16 @@ export function registerLiveHealthRoutes(app: Express, deps: LiveHealthDeps): vo
       res.json(summarizeOptionsPipeline(optionsPipeline(), now()));
     });
   }
+
+  // TRA-991 — unauthenticated, secrets-free option-trade-journal readout. The
+  // journal is a process-global, demo-only setup→outcome ledger, so this carries
+  // no balances/PII (parity with /options-pipeline). Surfaces the headline
+  // summary + the bounded learned weights so the board can confirm accrual is
+  // working after the first closed demo trade without a per-user login.
+  app.get('/api/health/option-journal', async (_req, res) => {
+    const rows = await listOptionTradeJournal();
+    res.json(buildOptionJournalReport(rows, now(), isOptionTradeJournalEnabled()));
+  });
 }
 
 /**

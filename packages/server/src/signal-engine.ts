@@ -58,7 +58,7 @@ import {
 import { submitSmartBuyToOpen } from './tradier-smart-open.js';
 import { isLiveEntryGatePassed } from './capital-gate-manifest.js';
 import type { RelativeValueScannerService } from './relative-value-scanner.js';
-import type { DailySignalRecord } from './reports/eod-report.js';
+import type { DailySignalRecord, ReportInput } from './reports/eod-report.js';
 import type { PnlTracker } from './pnl-tracker.js';
 import { randomUUID } from 'crypto';
 import { logger } from './observability/index.js';
@@ -1052,6 +1052,16 @@ export class SignalEngine {
   /** TRA-233 — iterate over both env buckets when the action applies to all. */
   private allOptionsAccounts(): PaperOptionsAccount[] {
     return [this.optionsAccounts.sandbox, this.optionsAccounts.production];
+  }
+
+  /**
+   * TRA-991 — await any in-flight option-trade-journal appends across both env
+   * books so the EOD report reads the journal after the day's last fill landed.
+   * Observe-only; safe to call when the journal flag is off (the account chain
+   * is just an already-resolved promise).
+   */
+  async flushOptionTradeJournal(): Promise<void> {
+    await Promise.all(this.allOptionsAccounts().map((a) => a.flushOptionTradeJournal()));
   }
 
   /**
@@ -3227,6 +3237,18 @@ export class SignalEngine {
             const opened = this.optionsAccount.openDefinedRiskSpread(
               shadowSignalToSpreadParams(sig, spot),
               'demo',
+              undefined,
+              // TRA-991 — pair the structure with the setup the selector just
+              // computed (IV-rank, trend, short-leg |delta|) so the option-trade
+              // journal can attribute its realized P&L back to the decision.
+              // Sentiment/conviction aren't on this deterministic path → null.
+              {
+                ivRank: ivRank ?? Number.NaN,
+                trend: trend === 'up' || trend === 'down' ? trend : 'sideways',
+                entryDelta: sig.shortDelta,
+                sentiment: null,
+                agentConviction: null,
+              },
             );
             if (opened) {
               routed = true;
@@ -5932,7 +5954,7 @@ export class SignalEngine {
     return this.getTechnicalSnapshot(symbol) ?? this.refreshTechnicalSnapshot(symbol);
   }
 
-  getReportSnapshot() {
+  getReportSnapshot(): ReportInput {
     return {
       state: this.getState(),
       allClosedPositions: [...this.allClosedPositions],

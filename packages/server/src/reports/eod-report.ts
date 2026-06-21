@@ -11,6 +11,8 @@ import type {
 import { MANAGED_ACCOUNT_RATIO } from '@trading-app/shared';
 import type { EngineState, SymbolState } from '../signal-engine.js';
 import { computePortfolioGreeks } from './portfolio-greeks.js';
+import type { OptionTradeJournalSummary } from '../option-trade-journal.js';
+import type { OptionLearnedWeights } from '../learned-option-weights.js';
 
 /** Signals fired today, keyed by signal id */
 export interface DailySignalRecord {
@@ -208,7 +210,68 @@ ${nameRows || '_No open option premium._'}
 ${sectorRows || '_No open option premium._'}`;
 }
 
-function buildMarkdown(report: Omit<EodReport, 'markdown'>): string {
+/**
+ * TRA-991 — render the option-trade journal P&L + learned-weights section.
+ * Returns '' when there is no journal data (flag off / nothing accrued yet) so a
+ * day with no option-trade learning adds no noise. Observe-only: the weights are
+ * shown for visibility; they don't influence any decision.
+ */
+function buildOptionJournalMarkdown(
+  summary: OptionTradeJournalSummary | undefined,
+  weights: OptionLearnedWeights | undefined,
+): string {
+  if (!summary || summary.total === 0) return '';
+
+  const usd = (n: number) => (n >= 0 ? '+' : '-') + '$' + Math.abs(n).toFixed(2);
+  const pct = (f: number | null) => (f == null ? '—' : (f * 100).toFixed(1) + '%');
+  const r = (n: number | null) => (n == null ? '—' : n.toFixed(2) + 'R');
+
+  const structureRows = summary.byStructure
+    .map(s => `| ${s.structure} | ${s.closed} | ${usd(s.realizedPnlUsd)} | ${pct(s.winRate)} | ${r(s.avgR)} |`)
+    .join('\n');
+
+  // Only surface CONFIDENT learned multipliers (a dimension value that cleared
+  // the min-sample guard and moved off 1.0) — the rest are still neutral.
+  const movedWeights = weights
+    ? [
+        ...weights.byStructure,
+        ...weights.byIvRank,
+        ...weights.byTrend,
+        ...weights.bySentiment,
+        ...weights.byDte,
+      ].filter(s => s.confident && s.multiplier !== 1)
+    : [];
+  const weightRows = movedWeights
+    .map(s => `| ${s.key} | ${s.multiplier.toFixed(3)} | ${s.resolved} | ${pct(s.winRate)} |`)
+    .join('\n');
+
+  return `
+
+## Option-Trade Journal (TRA-990, observe-only)
+| Metric | Value |
+|--------|-------|
+| Rows (open / closed) | ${summary.open} / ${summary.closed} |
+| Realized P&L | ${usd(summary.realizedPnlUsd)} |
+| Win / Loss / Scratch | ${summary.win} / ${summary.loss} / ${summary.scratch} |
+| Win Rate (closed) | ${pct(summary.winRate)} |
+| Avg R (closed) | ${r(summary.avgR)} |
+
+## Journal P&L by Structure
+| Structure | Closed | Realized P&L | Win Rate | Avg R |
+|-----------|--------|--------------|----------|-------|
+${structureRows || '_No closed option trades yet._'}
+
+## Learned Option Weights (confident, off-neutral)
+| Dimension | Multiplier | Resolved | Win Rate |
+|-----------|-----------|----------|----------|
+${weightRows || '_No dimension has cleared the min-sample guard yet — all neutral (1.0)._'}`;
+}
+
+function buildMarkdown(
+  report: Omit<EodReport, 'markdown'>,
+  optionJournal?: OptionTradeJournalSummary,
+  optionLearnedWeights?: OptionLearnedWeights,
+): string {
   const { date, realizedPnl, unrealizedPnl, optionsPnl, combinedPnl,
           totalEquity, managedEquity, availableCash,
           trades, openPositionCount,
@@ -271,7 +334,7 @@ ${moverRows || '_No data._'}
 | Winning Signals | ${signalAccuracy.winningSignals} |
 | Signal Win Rate | ${pct(signalAccuracy.winRate)} |
 | Avg R:R | 1:${signalAccuracy.avgRR.toFixed(2)} |
-${buildPortfolioGreeksMarkdown(portfolioGreeks)}`;
+${buildPortfolioGreeksMarkdown(portfolioGreeks)}${buildOptionJournalMarkdown(optionJournal, optionLearnedWeights)}`;
 }
 
 export interface ReportInput {
@@ -292,6 +355,14 @@ export interface ReportInput {
   dailySignals: DailySignalRecord[];
   /** Map from signal id → SignalType for strategy tagging */
   signalTypeMap: Map<string, SignalType>;
+  /**
+   * TRA-991 — option-trade-journal rollup + learned weights for the demo book,
+   * computed by the (async) caller from `listOptionTradeJournal()` /
+   * `computeOptionLearnedWeights()`. Optional so legacy/crypto callers (and the
+   * existing test surface) keep type-checking; absent ↔ no journal section.
+   */
+  optionJournal?: OptionTradeJournalSummary;
+  optionLearnedWeights?: OptionLearnedWeights;
 }
 
 /**
@@ -306,7 +377,8 @@ export interface ReportInput {
  * the missed date reconstructs that day's realized P&L accurately.
  */
 export function generateEodReport(input: ReportInput, asOfDate?: string): EodReport {
-  const { state, allClosedPositions, closedOptions = [], dailySignals, signalTypeMap } = input;
+  const { state, allClosedPositions, closedOptions = [], dailySignals, signalTypeMap,
+          optionJournal, optionLearnedWeights } = input;
   const today = asOfDate ?? new Date().toLocaleDateString('en-CA', { timeZone: 'America/New_York' });
 
   // Closed trades for today only
@@ -424,5 +496,5 @@ export function generateEodReport(input: ReportInput, asOfDate?: string): EodRep
     portfolioGreeks,
   };
 
-  return { ...partial, markdown: buildMarkdown(partial) };
+  return { ...partial, markdown: buildMarkdown(partial, optionJournal, optionLearnedWeights) };
 }

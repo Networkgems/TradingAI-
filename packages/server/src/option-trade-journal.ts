@@ -250,3 +250,93 @@ export async function listOptionTradeJournal(
     )
     .sort((a, b) => a.openTs - b.openTs);
 }
+
+/**
+ * TRA-991 — the folded record for one id (or undefined if never opened). The
+ * close emitter reads it to recover the SAME `atRiskUsd` captured at OPEN, so
+ * `realizedR = realizedPnlUsd / atRiskUsd` divides by the entry basis even after
+ * a DCA scale-in mutated the live position. Reads the in-memory fold, so it sees
+ * an open row appended earlier in the same process without a disk round-trip.
+ */
+export async function getOptionTradeJournalRecord(
+  id: string,
+): Promise<OptionTradeJournalRecord | undefined> {
+  const map = await ensureLoaded();
+  return map.get(id);
+}
+
+/** TRA-991 — per-structure rollup row in {@link OptionTradeJournalSummary}. */
+export interface OptionTradeJournalStructureStat {
+  structure: string;
+  closed: number;
+  realizedPnlUsd: number;
+  winRate: number | null;
+  avgR: number | null;
+}
+
+/**
+ * TRA-991 — headline rollup over journal rows, shared by the
+ * `/api/health/option-journal` readout and the EOD report section. Counts cover
+ * all rows (open + closed); P&L / win-rate / avg-R are over RESOLVED (closed)
+ * rows only, so a book full of still-open trades reads as 0 realized, not a
+ * misleading win rate.
+ */
+export interface OptionTradeJournalSummary {
+  total: number;
+  open: number;
+  closed: number;
+  win: number;
+  loss: number;
+  scratch: number;
+  /** WIN / closed over resolved rows; null when none resolved. */
+  winRate: number | null;
+  /** Σ realizedPnlUsd over resolved rows. */
+  realizedPnlUsd: number;
+  /** Mean realizedR over resolved rows; null when none resolved. */
+  avgR: number | null;
+  /** Per-structure rollup, descending by closed count then |P&L|. */
+  byStructure: OptionTradeJournalStructureStat[];
+}
+
+/** TRA-991 — fold journal rows into the headline summary. Pure. */
+export function summarizeOptionTradeJournal(
+  rows: OptionTradeJournalRecord[],
+): OptionTradeJournalSummary {
+  const closedRows = rows.filter((r) => r.outcome !== 'OPEN');
+  const closed = closedRows.length;
+  const win = closedRows.filter((r) => r.outcome === 'WIN').length;
+  const loss = closedRows.filter((r) => r.outcome === 'LOSS').length;
+  const scratch = closedRows.filter((r) => r.outcome === 'SCRATCH').length;
+  const realizedPnlUsd = closedRows.reduce((acc, r) => acc + (r.realizedPnlUsd ?? 0), 0);
+  const avgR =
+    closed > 0 ? closedRows.reduce((acc, r) => acc + (r.realizedR ?? 0), 0) / closed : null;
+
+  const byKey = new Map<string, OptionTradeJournalRecord[]>();
+  for (const r of closedRows) {
+    const list = byKey.get(r.structure) ?? [];
+    list.push(r);
+    byKey.set(r.structure, list);
+  }
+  const byStructure: OptionTradeJournalStructureStat[] = [...byKey.entries()]
+    .map(([structure, list]) => {
+      const c = list.length;
+      const wins = list.filter((r) => r.outcome === 'WIN').length;
+      const pnl = list.reduce((acc, r) => acc + (r.realizedPnlUsd ?? 0), 0);
+      const r = c > 0 ? list.reduce((acc, x) => acc + (x.realizedR ?? 0), 0) / c : null;
+      return { structure, closed: c, realizedPnlUsd: pnl, winRate: c > 0 ? wins / c : null, avgR: r };
+    })
+    .sort((a, b) => b.closed - a.closed || Math.abs(b.realizedPnlUsd) - Math.abs(a.realizedPnlUsd));
+
+  return {
+    total: rows.length,
+    open: rows.length - closed,
+    closed,
+    win,
+    loss,
+    scratch,
+    winRate: closed > 0 ? win / closed : null,
+    realizedPnlUsd,
+    avgR,
+    byStructure,
+  };
+}

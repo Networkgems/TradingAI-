@@ -167,6 +167,21 @@ services:
       # accrues demo option fills during the next RTH.
       - key: ENABLE_OPTION_PHASE_B_PAPER
         value: "true"
+      # TRA-991 / TRA-990 — turn ON the OPTION-TRADE JOURNAL (observe-only). The
+      # journal (`option-trade-journal.ts`) is a durable, append-only setup→outcome
+      # ledger: when a Phase-B demo structure opens/closes it records the setup
+      # (IV-rank, trend, sentiment, entry delta/DTE, capital-at-risk) paired with
+      # the realized P&L / R-multiple, and `learned-option-weights.ts` folds that
+      # into bounded scoring weights. Until this is set, `recordOptionTradeOpen/
+      # Close` no-op and `/api/health/option-journal` reports `enabled:false`.
+      #
+      # SAFETY — DEMO-ONLY, OBSERVE-ONLY, NO CAPITAL PATH. It only RECORDS what the
+      # paper book already did; nothing here routes an order, and feeding the
+      # learned weights back into decisions is explicitly OUT OF SCOPE (Child B,
+      # TRA-991). Subordinate to the Phase-B paper flag above (no demo option
+      # opens → nothing to journal). Revert = clear this value.
+      - key: ENABLE_OPTION_TRADE_JOURNAL
+        value: "true"
       # TRA-713 — persistent live-equity boot-arm (board-ratified approval
       # 979c77c1). FIX for "prod equity Live reverts to demo on restart": the
       # original arm lived only in the running engine's in-memory `mode`, so every

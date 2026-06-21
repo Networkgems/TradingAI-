@@ -40,6 +40,53 @@ import {
   dteFromExpiration,
 } from '@trading-app/shared';
 import { logger } from './observability/index.js';
+import {
+  isOptionTradeJournalEnabled,
+  recordOptionTradeOpen,
+  recordOptionTradeClose,
+  getOptionTradeJournalRecord,
+  outcomeForR,
+  type JournalTrend,
+  type OptionTradeJournalOpen,
+} from './option-trade-journal.js';
+
+// TRA-991 — the selector-computed setup the journal pairs with the realized
+// outcome. The account already knows the structure, entry delta, DTE, and
+// capital-at-risk from the position it just opened; these are the fields only
+// the caller (selector / advisory) can supply. Optional throughout: when the
+// caller omits it (or the journal flag is off) the open path simply records
+// nothing, so journaling never changes execution.
+export interface OptionTradeJournalSetup {
+  /** IV-rank at entry, 0–100. */
+  ivRank: number;
+  /** Daily-trend regime the trend gate saw at entry. */
+  trend: JournalTrend;
+  /** Net news+social sentiment [-1,+1]; null/omitted when unavailable. */
+  sentiment?: number | null;
+  /** Agent conviction [0,1] from the advisory recommendation; null when none. */
+  agentConviction?: number | null;
+  /**
+   * Net |delta| of the position at entry. For single-leg opens this defaults to
+   * the position's persisted `entryDelta`; spreads pass the short-leg |delta|.
+   */
+  entryDelta?: number | null;
+}
+
+const MS_PER_DAY = 86_400_000;
+
+/**
+ * TRA-991 — canonicalise a defined-risk strategy id to the journal's structure
+ * vocabulary (bull_put / bear_call / iron_condor / debit_spread). Unknown ids
+ * fall through lower-cased so a new structure still buckets under a stable key.
+ */
+function journalStructureForSpread(strategy: string): string {
+  const s = strategy.toLowerCase();
+  if (s.includes('bull_put') || s.includes('bull put')) return 'bull_put';
+  if (s.includes('bear_call') || s.includes('bear call')) return 'bear_call';
+  if (s.includes('iron_condor') || s.includes('iron condor')) return 'iron_condor';
+  if (s.includes('debit')) return 'debit_spread';
+  return s;
+}
 
 // TRA-598 (C3) — clear-reason channel for guardrail rejections. The open paths
 // keep their `null`-on-reject contract; this surfaces *why* an entry was
@@ -339,6 +386,16 @@ export class PaperOptionsAccount {
   /** TRA-598 (C3) — resolved no-day-trading thresholds; see {@link OptionsAccountConfig.dayTradingGuardrail}. */
   private dayTradingGuardrail: DayTradingGuardrailConfig;
   private currentDayKey = toDateKey(Date.now());
+  /**
+   * TRA-991 — serialized tail of pending option-trade-journal appends. The
+   * open/close paths are synchronous, but the journal is async (append-only
+   * JSONL); chaining every write onto this promise keeps OPEN-before-CLOSE
+   * append order intact and gives {@link flushOptionTradeJournal} one await
+   * point for read-after-write (tests, the health readout, the EOD section).
+   * Observe-only: a write failure is logged and swallowed, never surfaced into
+   * the execution path.
+   */
+  private journalWrites: Promise<unknown> = Promise.resolve();
 
   constructor(config: OptionsAccountConfig = {}) {
     this.initialEquity = config.initialEquity ?? DEFAULT_ACCOUNT_SETTINGS.demoEquity;
@@ -374,6 +431,100 @@ export class PaperOptionsAccount {
   /** TRA-361 — read the auto-manage-imports flag (tests / introspection). */
   isAutoManagingImportedTradierOptions(): boolean {
     return this.autoManageImportedTradierOptions;
+  }
+
+  /**
+   * TRA-991 — await every pending option-trade-journal append. The open/close
+   * paths fire-and-forget through {@link journalWrites}; callers that need to
+   * read the journal right after a book mutation (the integration tests, the
+   * health readout, the EOD report) await this first so they never observe a
+   * half-written ledger.
+   */
+  async flushOptionTradeJournal(): Promise<void> {
+    await this.journalWrites;
+  }
+
+  /**
+   * TRA-991 — queue an OPEN row for a freshly opened position. No-op (returns
+   * synchronously) unless the journal flag is on AND the caller supplied the
+   * selector setup, so journaling can never run without an explicit opt-in and
+   * never records a setup-less row the learner couldn't attribute. The append is
+   * chained onto {@link journalWrites} and deduped by position id inside
+   * {@link recordOptionTradeOpen}.
+   */
+  private queueJournalOpen(
+    position: OptionPosition,
+    structure: string,
+    atRiskUsd: number,
+    setup: OptionTradeJournalSetup,
+  ): void {
+    if (!isOptionTradeJournalEnabled()) return;
+    const entryDte = position.expiration
+      ? dteFromExpiration(position.expiration, position.openedAt) ?? 0
+      : 0;
+    const entryDelta = Math.abs(
+      setup.entryDelta ?? position.entryDelta ?? 0,
+    );
+    const open: OptionTradeJournalOpen = {
+      id: position.id,
+      openTs: position.openedAt,
+      symbol: position.symbol,
+      structure,
+      mode: (position.mode ?? 'demo') as 'demo' | 'live',
+      ivRank: setup.ivRank,
+      trend: setup.trend,
+      sentiment: setup.sentiment ?? null,
+      entryDelta,
+      entryDte,
+      atRiskUsd,
+      agentConviction: setup.agentConviction ?? null,
+    };
+    this.journalWrites = this.journalWrites
+      .then(() => recordOptionTradeOpen(open))
+      .catch((err) => {
+        accountLog.warn('option trade journal open emit failed', {
+          id: open.id,
+          symbol: open.symbol,
+          reason: err instanceof Error ? err.message : String(err),
+        });
+      });
+  }
+
+  /**
+   * TRA-991 — queue a CLOSE row when a position fully closes. Recovers the
+   * entry-time `atRiskUsd` from the stored OPEN record so
+   * `realizedR = realizedPnlUsd / atRiskUsd` divides by the same basis the open
+   * captured. No-op when the flag is off, the trade was never journalled (e.g.
+   * an imported row, or opened before the flag flipped on), or it is already
+   * closed. `realizedPnlUsd` is the position's cumulative realized P&L (`pnl`),
+   * which already folds any partial exits.
+   */
+  private queueJournalClose(position: OptionPosition, exitReason: string): void {
+    if (!isOptionTradeJournalEnabled()) return;
+    const id = position.id;
+    const realizedPnlUsd = position.pnl ?? 0;
+    const closeTs = position.closedAt ?? Date.now();
+    this.journalWrites = this.journalWrites
+      .then(async () => {
+        const rec = await getOptionTradeJournalRecord(id);
+        if (!rec || rec.outcome !== 'OPEN') return;
+        const realizedR = rec.atRiskUsd > 0 ? realizedPnlUsd / rec.atRiskUsd : 0;
+        const holdDays = Math.max(0, (closeTs - rec.openTs) / MS_PER_DAY);
+        await recordOptionTradeClose(id, {
+          closeTs,
+          outcome: outcomeForR(realizedR),
+          realizedPnlUsd,
+          realizedR,
+          exitReason,
+          holdDays,
+        });
+      })
+      .catch((err) => {
+        accountLog.warn('option trade journal close emit failed', {
+          id,
+          reason: err instanceof Error ? err.message : String(err),
+        });
+      });
   }
 
   reset(config: OptionsAccountConfig = {}): void {
@@ -867,6 +1018,8 @@ export class PaperOptionsAccount {
      * backstop simply won't engage usefully for that position.
      */
     underlyingSpot?: number,
+    /** TRA-991 — selector setup for the option-trade journal (observe-only). */
+    journalSetup?: OptionTradeJournalSetup,
   ): OptionPosition | null {
     this.resetDayIfNeeded();
 
@@ -954,6 +1107,8 @@ export class PaperOptionsAccount {
     };
 
     this.openOptions.set(position.id, position);
+    // TRA-991 — journal the OTM single-leg setup (observe-only, behind the flag).
+    if (journalSetup) this.queueJournalOpen(position, 'single_leg_otm', totalCost, journalSetup);
     return position;
   }
 
@@ -977,6 +1132,8 @@ export class PaperOptionsAccount {
     equityOverride?: number,
     /** TRA-384 — see {@link openOptionFromCandidate} for the underlying-spot rationale. */
     underlyingSpot?: number,
+    /** TRA-991 — selector setup for the option-trade journal (observe-only). */
+    journalSetup?: OptionTradeJournalSetup,
   ): OptionPosition | null {
     this.resetDayIfNeeded();
 
@@ -1050,6 +1207,8 @@ export class PaperOptionsAccount {
     };
 
     this.openOptions.set(position.id, position);
+    // TRA-991 — journal the RV single-leg setup (observe-only, behind the flag).
+    if (journalSetup) this.queueJournalOpen(position, 'single_leg_rv', totalCost, journalSetup);
     return position;
   }
 
@@ -1114,6 +1273,8 @@ export class PaperOptionsAccount {
       maxLossPerLotUsd: number;
       totalRiskUsd: number;
     }) => { allowed: true } | { allowed: false; reason: string },
+    /** TRA-991 — selector setup for the option-trade journal (observe-only). */
+    journalSetup?: OptionTradeJournalSetup,
   ): OptionPosition | null {
     this.resetDayIfNeeded();
 
@@ -1255,6 +1416,18 @@ export class PaperOptionsAccount {
     };
 
     this.openOptions.set(position.id, position);
+    // TRA-991 — journal the defined-risk structure's setup. Capital-at-risk is
+    // the reserved `totalRisk` (= maxLossUsd); structure is canonicalised from
+    // the strategy id. Observe-only, behind the flag, and only when the caller
+    // (selector / advisory) supplied the setup.
+    if (journalSetup) {
+      this.queueJournalOpen(
+        position,
+        journalStructureForSpread(params.strategy),
+        totalRisk,
+        journalSetup,
+      );
+    }
     return position;
   }
 
@@ -1733,6 +1906,8 @@ export class PaperOptionsAccount {
 
         this.openOptions.delete(id);
         this.closedOptions.push({ ...opt });
+        // TRA-991 — fold the realized outcome onto this trade's journal row.
+        this.queueJournalClose(opt, exitKind);
         closed.push({ ...opt });
       }
     }
@@ -1863,6 +2038,8 @@ export class PaperOptionsAccount {
     delete opt.exitErrorReason;
     this.openOptions.delete(optionId);
     this.closedOptions.push({ ...opt });
+    // TRA-991 — fold the realized outcome onto this trade's journal row.
+    this.queueJournalClose(opt, pending.kind);
     return { ...opt };
   }
 
@@ -2169,6 +2346,9 @@ export class PaperOptionsAccount {
     delete opt.pendingCloseRepriceSteps;
     this.openOptions.delete(optionId);
     this.closedOptions.push({ ...opt });
+    // TRA-991 — fold the realized outcome onto this trade's journal row. Imported
+    // rows are never journalled at open, so this no-ops for them in practice.
+    this.queueJournalClose(opt, 'imported_fill');
     // TRA-367 — surface realised P&L immediately on the Live pill instead
     // of waiting for the EOD Tradier-history reconcile. The reconciler
     // drains `realtimeImportedPnlByDate` so the same close isn't counted
@@ -2250,6 +2430,8 @@ export class PaperOptionsAccount {
       opt.closedAt = Date.now();
       this.openOptions.delete(optionId);
       this.closedOptions.push({ ...opt });
+      // TRA-991 — the partial drained the position; fold the realized outcome.
+      this.queueJournalClose(opt, 'partial_drain');
     }
     return { ...opt };
   }
@@ -2442,6 +2624,8 @@ export class PaperOptionsAccount {
     }
     this.openOptions.delete(optionId);
     this.closedOptions.push({ ...opt });
+    // TRA-991 — fold the realized outcome onto this trade's journal row.
+    this.queueJournalClose(opt, 'manual');
     return { ...opt };
   }
 
