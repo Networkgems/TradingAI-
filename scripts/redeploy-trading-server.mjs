@@ -56,6 +56,20 @@ if (!NO_BUILD) {
     shell: process.platform === 'win32',
   });
   if (build.status !== 0) fail(2, `build failed (exit ${build.status})`);
+
+  // TRA-959: also rebuild the served web bundle (apps/desktop). The server
+  // serves apps/desktop/dist as its static frontend, and that dist is
+  // git-ignored (built per-clone). Without this step a redeploy adopts fresh
+  // BACKEND code but strands the OLD frontend bundle — which is exactly how the
+  // TRA-974 marketing-copy fix (e0a6b96) shipped to source yet kept advertising
+  // archived "Reversal, MACD" strategies on the live Stocks card. Keep this in
+  // lockstep with the server build so source UI fixes actually reach users.
+  console.log('[redeploy] building desktop web bundle (apps/desktop dist)…');
+  const webBuild = spawnSync('pnpm', ['--filter', 'desktop', 'vite:build'], {
+    stdio: 'inherit',
+    shell: process.platform === 'win32',
+  });
+  if (webBuild.status !== 0) fail(2, `web bundle build failed (exit ${webBuild.status})`);
 } else {
   console.log('[redeploy] --no-build: skipping build, restarting onto existing dist.');
 }
