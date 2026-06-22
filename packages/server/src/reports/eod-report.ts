@@ -16,6 +16,7 @@ import type { OptionLearnedWeights } from '../learned-option-weights.js';
 import type { SourceQualityWeights } from '../source-quality-scorer.js';
 import type { IntrospectionReadout } from '../strategy-introspection.js';
 import type { AutopilotAction } from '../risk-autopilot.js';
+import type { AutonomousDemoLoopReport } from '../autonomous-demo-loop.js';
 
 /** Signals fired today, keyed by signal id */
 export interface DailySignalRecord {
@@ -301,6 +302,43 @@ ${rows}`;
 }
 
 /**
+ * TRA-1004 — render the autonomous demo-loop status: cadence, ticks run, books
+ * driven, and any autopilot halts / throttles from the most recent tick. Returns
+ * '' when the loop is disabled (a firm not running it adds no section). DEMO
+ * ONLY — the conductor never touches a live book, and the section says so.
+ */
+function buildAutonomousDemoLoopMarkdown(loop: AutonomousDemoLoopReport | undefined): string {
+  if (!loop || !loop.enabled) return '';
+
+  const haltRows = loop.halts
+    .map(h => `| ${h.username} | ${h.reason ?? '—'} |`)
+    .join('\n');
+  const throttleRows = loop.throttles
+    .map(t => `| ${t.username} | ${(t.riskThrottle * 100).toFixed(0)}% |`)
+    .join('\n');
+
+  return `
+
+## Autonomous Demo Loop (TRA-1004, demo sandbox only)
+_The in-app conductor self-runs the demo book on a ${(loop.intervalMs / 1000).toFixed(0)}s cadence — no human in the daily loop. The TRA-995 risk autopilot stays in-loop as the guard: a halted book is skipped. No live-capital path._
+| Metric | Value |
+|--------|-------|
+| Ticks run (this process) | ${loop.ticksRun} |
+| Last tick | ${loop.lastTickAt ?? '—'} |
+| Books driven (last tick) | ${loop.lastBooksDriven} |
+
+### Autopilot Halts (last tick)
+| Book | Reason |
+|------|--------|
+${haltRows || '_No halted books — the loop is driving every demo book._'}
+
+### Active Throttles (last tick)
+| Book | Risk Size |
+|------|-----------|
+${throttleRows || '_No throttles — risk at full size._'}`;
+}
+
+/**
  * TRA-995 — render the firm-health INTROSPECTION readout (per-strategy
  * attribution + edge-decay flags) and the risk-AUTOPILOT action log. Returns ''
  * when there is nothing to show (no attributed strategies and no autopilot
@@ -374,6 +412,7 @@ function buildMarkdown(
   introspection?: IntrospectionReadout,
   autopilotActions?: AutopilotAction[],
   sourceQualityWeights?: SourceQualityWeights,
+  autonomousDemoLoop?: AutonomousDemoLoopReport,
 ): string {
   const { date, realizedPnl, unrealizedPnl, optionsPnl, combinedPnl,
           totalEquity, managedEquity, availableCash,
@@ -437,7 +476,7 @@ ${moverRows || '_No data._'}
 | Winning Signals | ${signalAccuracy.winningSignals} |
 | Signal Win Rate | ${pct(signalAccuracy.winRate)} |
 | Avg R:R | 1:${signalAccuracy.avgRR.toFixed(2)} |
-${buildPortfolioGreeksMarkdown(portfolioGreeks)}${buildOptionJournalMarkdown(optionJournal, optionLearnedWeights)}${buildIntrospectionMarkdown(introspection, autopilotActions)}${buildSourceQualityMarkdown(sourceQualityWeights)}`;
+${buildPortfolioGreeksMarkdown(portfolioGreeks)}${buildOptionJournalMarkdown(optionJournal, optionLearnedWeights)}${buildIntrospectionMarkdown(introspection, autopilotActions)}${buildSourceQualityMarkdown(sourceQualityWeights)}${buildAutonomousDemoLoopMarkdown(autonomousDemoLoop)}`;
 }
 
 export interface ReportInput {
@@ -485,6 +524,13 @@ export interface ReportInput {
    * not running external intel has nothing graded). Advisory only.
    */
   sourceQualityWeights?: SourceQualityWeights;
+  /**
+   * TRA-1004 — the autonomous demo-loop status (cadence, ticks, books driven,
+   * autopilot halts / throttles), folded by the caller from
+   * `buildAutonomousDemoLoopReport()`. Optional ↔ no loop section (the loop is
+   * off, or the report is for a live book). DEMO ONLY.
+   */
+  autonomousDemoLoop?: AutonomousDemoLoopReport;
 }
 
 /**
@@ -501,7 +547,7 @@ export interface ReportInput {
 export function generateEodReport(input: ReportInput, asOfDate?: string): EodReport {
   const { state, allClosedPositions, closedOptions = [], dailySignals, signalTypeMap,
           optionJournal, optionLearnedWeights, introspection, autopilotActions,
-          sourceQualityWeights } = input;
+          sourceQualityWeights, autonomousDemoLoop } = input;
   const today = asOfDate ?? new Date().toLocaleDateString('en-CA', { timeZone: 'America/New_York' });
 
   // Closed trades for today only
@@ -628,6 +674,7 @@ export function generateEodReport(input: ReportInput, asOfDate?: string): EodRep
       introspection,
       autopilotActions,
       sourceQualityWeights,
+      autonomousDemoLoop,
     ),
   };
 }

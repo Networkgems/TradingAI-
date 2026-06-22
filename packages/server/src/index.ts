@@ -5,7 +5,7 @@ import { writeFile, readFile, readdir, stat } from 'fs/promises';
 import { existsSync } from 'fs';
 import { join, dirname } from 'path';
 import { fileURLToPath } from 'url';
-import { MarketScheduler, isMarketDay, isMarketDayIso, missedTradingDays, etDateString } from './scheduler.js';
+import { MarketScheduler, isMarketDay, isMarketDayIso, missedTradingDays, etDateString, isMarketOpen } from './scheduler.js';
 import { generateEodReport } from './reports/eod-report.js';
 import { generateCryptoEodReport } from './reports/crypto-eod-report.js';
 import {
@@ -22,6 +22,14 @@ import { loadSourceQualityWeights } from './source-quality-scorer.js';
 // No-op tick while ENABLE_EXTERNAL_INTEL is off (deps aren't even built), so it
 // is safe to arm at boot regardless of the flag.
 import { startExternalIntelSchedule } from './external-intel-scheduler.js';
+import {
+  startAutonomousDemoSchedule,
+  getAutonomousDemoStatus,
+  isAutonomousDemoLoopEnabled,
+  buildAutonomousDemoLoopReport,
+  type DemoBookEngine,
+  type AutonomousDemoLoopDeps,
+} from './autonomous-demo-loop.js';
 // TRA-995 — self-awareness introspection (per-strategy attribution + edge-decay)
 // folded from the same closed-trade journal that feeds the learned weights.
 import {
@@ -689,6 +697,14 @@ async function generateAndSaveReport(
         reason: err instanceof Error ? err.message : String(err),
       });
     }
+  }
+  // TRA-1004 — fold the autonomous demo-loop status into the report so the EOD
+  // markdown shows the loop's activity (ticks, books driven, autopilot halts /
+  // throttles) for the demo book. Gated on ENABLE_AUTONOMOUS_DEMO_LOOP so a firm
+  // not running the loop adds no section. Status is firm-wide (the conductor
+  // drives every demo book), surfaced on each demo book's report for visibility.
+  if (isAutonomousDemoLoopEnabled() && settings.mode === 'demo') {
+    finalSnapshot.autonomousDemoLoop = buildAutonomousDemoLoopReport();
   }
   let finalReport = generateEodReport(finalSnapshot, opts.asOfDate);
 
@@ -1803,6 +1819,16 @@ registerLiveHealthRoutes(app, {
         .filter(e => e.mode === 'demo'),
     };
   },
+});
+
+// TRA-1004 — autonomous demo-loop status. Unauthenticated by design (parity with
+// the other `/api/health/*` probes): the snapshot carries only the flag state,
+// cadence, tick counters, and per-book decision summaries (booleans / counts /
+// usernames / halt reasons) — no trade specifics, prices, or credentials. Lets
+// QA / ops confirm the demo book is self-driving (and see autopilot halts /
+// throttles) without a login. Flag off ⇒ `enabled:false` and zero recent ticks.
+app.get('/api/health/autonomous-demo', (_req, res) => {
+  res.json(getAutonomousDemoStatus());
 });
 
 // TRA-406 — observability surface. Returns the recent in-memory alerts and the
@@ -5841,6 +5867,49 @@ const routineRunner = new RoutineRunner();
 // sets ENABLE_EXTERNAL_INTEL (the activation gate is a separate board decision).
 const externalIntelSchedule = startExternalIntelSchedule();
 
+// TRA-1004 — arm the autonomous demo-trading loop. Cheap no-op tick until an
+// operator sets ENABLE_AUTONOMOUS_DEMO_LOOP (a demo-sandbox decision — no board
+// gate, no live-capital path). When on, each tick drives the existing brain
+// unattended on every DEMO-mode book: it enables demo auto-trading and forces a
+// decision cycle (analysts→trader→risk + strategy selector across
+// stocks/options/crypto), with the TRA-995 autopilot kept in-loop as the guard.
+// A halted book is skipped, so an autopilot halt demonstrably stops the loop.
+//
+// The driver below only ever touches the *demo* book (`setAutoTrading(true,
+// 'demo')`); the `listBooks` enumerator filters to `mode === 'demo'` first, so a
+// user in live mode is never enrolled — there is no live-trade path here.
+function makeDemoBookEngine(ctx: UserContext): DemoBookEngine {
+  return {
+    username: ctx.username,
+    isHalted: () =>
+      ctx.engine.getState().tradingHalted || ctx.cryptoEngine.isKillSwitchEngaged(),
+    haltReason: () =>
+      ctx.engine.getState().haltReason ??
+      (ctx.cryptoEngine.isKillSwitchEngaged() ? 'Crypto kill switch engaged' : null),
+    riskThrottle: () => ctx.engine.getRiskThrottle(),
+    regime: () => ctx.engine.getState().marketReview.regime,
+    recentAutopilotActions: () => ctx.engine.getAutopilotActions(),
+    openStocks: () => ctx.engine.getState().account.openPositions.length,
+    openCrypto: () => ctx.cryptoEngine.getReportSnapshot('demo').accountState.openPositions.length,
+    driveStocks: () => {
+      ctx.engine.setAutoTrading(true, 'demo');
+      ctx.engine.refresh();
+    },
+    driveCrypto: () => {
+      ctx.cryptoEngine.setAutoTrading(true, 'demo');
+      ctx.cryptoEngine.refresh();
+    },
+  };
+}
+const autonomousDemoLoopDeps: AutonomousDemoLoopDeps = {
+  listBooks: () =>
+    getAllUserContexts()
+      .filter(ctx => getSettings(ctx.username).mode === 'demo')
+      .map(makeDemoBookEngine),
+  isStocksMarketOpen: () => isMarketOpen(),
+};
+const autonomousDemoSchedule = startAutonomousDemoSchedule({ deps: autonomousDemoLoopDeps });
+
 const scheduler = new MarketScheduler();
 scheduler.start({
   // TRA-244 — collapsed onto the 9 PM ET archive hook so the Calendar row
@@ -5964,6 +6033,7 @@ async function gracefulShutdown(signal: string): Promise<void> {
   log.info('shutdown received — draining ticks, recording in-flight orders, flushing trade history', { signal });
   scheduler.stop();
   externalIntelSchedule.stop();
+  autonomousDemoSchedule.stop();
   const all = getAllUserContexts();
   // Clear each engine's tick timer first so no new tick starts; the in-flight
   // tick (if any) keeps running and is drained next.
