@@ -18,6 +18,10 @@ import { computeOptionLearnedWeights } from './learned-option-weights.js';
 // folded from the attribution log × hypothesis-queue gate outcomes.
 import { isExternalIntelEnabled } from './external-intel.js';
 import { loadSourceQualityWeights } from './source-quality-scorer.js';
+// TRA-1003 — the scheduled trigger that actually FEEDS the external-intel queue.
+// No-op tick while ENABLE_EXTERNAL_INTEL is off (deps aren't even built), so it
+// is safe to arm at boot regardless of the flag.
+import { startExternalIntelSchedule } from './external-intel-scheduler.js';
 // TRA-995 — self-awareness introspection (per-strategy attribution + edge-decay)
 // folded from the same closed-trade journal that feeds the learned weights.
 import {
@@ -5833,6 +5837,10 @@ void recordBootAndCheckRestarts().catch(err =>
 // TRA-851 — owns the per-ET-day dedup for user routines across scheduler ticks.
 const routineRunner = new RoutineRunner();
 
+// TRA-1003 — arm the external-intel trigger. Cheap no-op tick until an operator
+// sets ENABLE_EXTERNAL_INTEL (the activation gate is a separate board decision).
+const externalIntelSchedule = startExternalIntelSchedule();
+
 const scheduler = new MarketScheduler();
 scheduler.start({
   // TRA-244 — collapsed onto the 9 PM ET archive hook so the Calendar row
@@ -5955,6 +5963,7 @@ async function gracefulShutdown(signal: string): Promise<void> {
   shuttingDown = true;
   log.info('shutdown received — draining ticks, recording in-flight orders, flushing trade history', { signal });
   scheduler.stop();
+  externalIntelSchedule.stop();
   const all = getAllUserContexts();
   // Clear each engine's tick timer first so no new tick starts; the in-flight
   // tick (if any) keeps running and is drained next.
