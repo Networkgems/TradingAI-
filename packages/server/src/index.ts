@@ -14,6 +14,10 @@ import {
   isOptionTradeJournalEnabled,
 } from './option-trade-journal.js';
 import { computeOptionLearnedWeights } from './learned-option-weights.js';
+// TRA-1000 — external-intel source-quality scorer: per-source advisory weights
+// folded from the attribution log × hypothesis-queue gate outcomes.
+import { isExternalIntelEnabled } from './external-intel.js';
+import { loadSourceQualityWeights } from './source-quality-scorer.js';
 // TRA-995 — self-awareness introspection (per-strategy attribution + edge-decay)
 // folded from the same closed-trade journal that feeds the learned weights.
 import {
@@ -663,6 +667,20 @@ async function generateAndSaveReport(
       );
     } catch (err) {
       log.warn('option-trade-journal EOD fold failed', {
+        username: ctx.username,
+        reason: err instanceof Error ? err.message : String(err),
+      });
+    }
+  }
+  // TRA-1000 — fold the external-intel source-quality scorer into the report so
+  // the EOD markdown carries per-source advisory weights. Gate the read on
+  // ENABLE_EXTERNAL_INTEL so a firm not running intel adds no section/I/O. The
+  // weights are advisory only — they never size capital or gate promotion.
+  if (isExternalIntelEnabled()) {
+    try {
+      finalSnapshot.sourceQualityWeights = await loadSourceQualityWeights();
+    } catch (err) {
+      log.warn('source-quality EOD fold failed', {
         username: ctx.username,
         reason: err instanceof Error ? err.message : String(err),
       });

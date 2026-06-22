@@ -29,6 +29,11 @@ import {
   computeOptionLearnedWeights,
   type OptionLearnedWeights,
 } from '../learned-option-weights.js';
+import { isExternalIntelEnabled } from '../external-intel.js';
+import {
+  loadSourceQualityWeights,
+  type SourceQualityWeights,
+} from '../source-quality-scorer.js';
 
 /** Minimal shape this module needs from a per-user context. */
 export interface HealthEngineLike {
@@ -524,6 +529,37 @@ export interface OptionJournalReport {
   weights: OptionLearnedWeights;
 }
 
+// ── TRA-1000 external-intel source-quality readout ──────────────────────────
+
+/**
+ * Shape returned by `GET /api/health/source-quality`. `enabled` mirrors
+ * `ENABLE_EXTERNAL_INTEL`; `weights` is the per-source advisory weights folded
+ * from the attribution log × hypothesis-queue gate outcomes. Advisory only —
+ * nothing here sizes capital or gates promotion (TRA-990 invariants 1 & 2).
+ */
+export interface SourceQualityReport {
+  ok: true;
+  time: string;
+  build: ReturnType<typeof resolveBuildInfo>;
+  /** `ENABLE_EXTERNAL_INTEL` is on (ingestion/extraction armed). */
+  enabled: boolean;
+  weights: SourceQualityWeights;
+}
+
+/** Load both logs and fold them into the readout. Pure beyond the clock + I/O. */
+export async function buildSourceQualityReport(
+  now: number,
+  enabled: boolean,
+): Promise<SourceQualityReport> {
+  return {
+    ok: true,
+    time: new Date(now).toISOString(),
+    build: resolveBuildInfo(),
+    enabled,
+    weights: await loadSourceQualityWeights(),
+  };
+}
+
 /** Fold the journal rows into the readout report. Pure beyond the clock. */
 export function buildOptionJournalReport(
   rows: Parameters<typeof summarizeOptionTradeJournal>[0],
@@ -681,6 +717,17 @@ export function registerLiveHealthRoutes(app: Express, deps: LiveHealthDeps): vo
   app.get('/api/health/option-journal', async (_req, res) => {
     const rows = await listOptionTradeJournal();
     res.json(buildOptionJournalReport(rows, now(), isOptionTradeJournalEnabled()));
+  });
+
+  // TRA-1000 — external-intel source-quality scorer readout. Folds the
+  // attribution log against the hypothesis-queue gate outcomes into per-source
+  // ADVISORY weights (who to listen to). Like /option-journal it carries no
+  // balances/PII — just source keys + gate-pass stats — so it is unauthenticated
+  // and is always served (empty when no intel has been ingested). `enabled`
+  // mirrors ENABLE_EXTERNAL_INTEL so the board can see whether ingestion is armed.
+  // The weights are advisory only: they never size capital or gate promotion.
+  app.get('/api/health/source-quality', async (_req, res) => {
+    res.json(await buildSourceQualityReport(now(), isExternalIntelEnabled()));
   });
 }
 

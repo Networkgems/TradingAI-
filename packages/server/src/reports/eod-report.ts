@@ -13,6 +13,7 @@ import type { EngineState, SymbolState } from '../signal-engine.js';
 import { computePortfolioGreeks } from './portfolio-greeks.js';
 import type { OptionTradeJournalSummary } from '../option-trade-journal.js';
 import type { OptionLearnedWeights } from '../learned-option-weights.js';
+import type { SourceQualityWeights } from '../source-quality-scorer.js';
 import type { IntrospectionReadout } from '../strategy-introspection.js';
 import type { AutopilotAction } from '../risk-autopilot.js';
 
@@ -271,6 +272,35 @@ ${weightRows || '_No dimension has cleared the min-sample guard yet — all neut
 }
 
 /**
+ * TRA-1000 — render the external-intel source-quality scorer: per-source ADVISORY
+ * weights folded from the attribution log × hypothesis-queue G0-gate outcomes.
+ * Returns '' when no source has been graded yet, so a firm not running external
+ * intel adds no noise. Advisory only — these weights prioritize WHO to listen to
+ * for ingestion/extraction effort; they never size capital or gate promotion.
+ */
+function buildSourceQualityMarkdown(weights: SourceQualityWeights | undefined): string {
+  if (!weights || weights.bySource.length === 0) return '';
+
+  const pct = (f: number | null) => (f == null ? '—' : (f * 100).toFixed(1) + '%');
+  const est = (f: number | null) => (f == null ? '—' : f.toFixed(3));
+
+  const rows = weights.bySource
+    .map(
+      s =>
+        `| ${s.sourceKey} | ${s.weight.toFixed(3)}${s.confident ? '' : ' _(neutral)_'} | ${s.graded} | ${s.g0Pass}/${s.g0Fail} | ${pct(s.gatePassRate)} | ${est(s.passRateEstimate)} | ${s.ratified}/${s.rejected} |`,
+    )
+    .join('\n');
+
+  return `
+
+## External-Intel Source Quality (TRA-1000, advisory only)
+_Per-source weights learned from backtest-gate outcomes — they prioritize WHO to listen to for ingestion/extraction. They NEVER size capital or gate promotion; every hypothesis still clears the same G0 gate + board ratification regardless of source._
+| Source | Weight | Graded | G0 Pass/Fail | Pass Rate | Est. (Beta) | Ratified/Rejected |
+|--------|--------|--------|--------------|-----------|-------------|-------------------|
+${rows}`;
+}
+
+/**
  * TRA-995 — render the firm-health INTROSPECTION readout (per-strategy
  * attribution + edge-decay flags) and the risk-AUTOPILOT action log. Returns ''
  * when there is nothing to show (no attributed strategies and no autopilot
@@ -343,6 +373,7 @@ function buildMarkdown(
   optionLearnedWeights?: OptionLearnedWeights,
   introspection?: IntrospectionReadout,
   autopilotActions?: AutopilotAction[],
+  sourceQualityWeights?: SourceQualityWeights,
 ): string {
   const { date, realizedPnl, unrealizedPnl, optionsPnl, combinedPnl,
           totalEquity, managedEquity, availableCash,
@@ -406,7 +437,7 @@ ${moverRows || '_No data._'}
 | Winning Signals | ${signalAccuracy.winningSignals} |
 | Signal Win Rate | ${pct(signalAccuracy.winRate)} |
 | Avg R:R | 1:${signalAccuracy.avgRR.toFixed(2)} |
-${buildPortfolioGreeksMarkdown(portfolioGreeks)}${buildOptionJournalMarkdown(optionJournal, optionLearnedWeights)}${buildIntrospectionMarkdown(introspection, autopilotActions)}`;
+${buildPortfolioGreeksMarkdown(portfolioGreeks)}${buildOptionJournalMarkdown(optionJournal, optionLearnedWeights)}${buildIntrospectionMarkdown(introspection, autopilotActions)}${buildSourceQualityMarkdown(sourceQualityWeights)}`;
 }
 
 export interface ReportInput {
@@ -447,6 +478,13 @@ export interface ReportInput {
    * Optional ↔ no autopilot-actions section.
    */
   autopilotActions?: AutopilotAction[];
+  /**
+   * TRA-1000 — external-intel source-quality weights, folded by the caller from
+   * the attribution log × hypothesis-queue gate outcomes via
+   * `loadSourceQualityWeights()`. Optional ↔ no source-quality section (a firm
+   * not running external intel has nothing graded). Advisory only.
+   */
+  sourceQualityWeights?: SourceQualityWeights;
 }
 
 /**
@@ -462,7 +500,8 @@ export interface ReportInput {
  */
 export function generateEodReport(input: ReportInput, asOfDate?: string): EodReport {
   const { state, allClosedPositions, closedOptions = [], dailySignals, signalTypeMap,
-          optionJournal, optionLearnedWeights, introspection, autopilotActions } = input;
+          optionJournal, optionLearnedWeights, introspection, autopilotActions,
+          sourceQualityWeights } = input;
   const today = asOfDate ?? new Date().toLocaleDateString('en-CA', { timeZone: 'America/New_York' });
 
   // Closed trades for today only
@@ -588,6 +627,7 @@ export function generateEodReport(input: ReportInput, asOfDate?: string): EodRep
       optionLearnedWeights,
       introspection,
       autopilotActions,
+      sourceQualityWeights,
     ),
   };
 }
