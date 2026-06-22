@@ -103,6 +103,7 @@ export {
   cachePathFor4h,
   loadOrFetchDailyBars,
   loadOrFetch4hBars,
+  DEFAULT_4H_SYMBOLS,
 } from './fetch-tra266-data.js';
 export type { CacheEntry } from './fetch-tra266-data.js';
 // TRA-376 — historical option-chain replay backtest harness.
