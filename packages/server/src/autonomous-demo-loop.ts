@@ -343,6 +343,15 @@ export interface AutonomousDemoSchedule {
 
 export interface StartAutonomousDemoScheduleOpts {
   env?: NodeJS.ProcessEnv;
+  /**
+   * TRA-1008 — optional per-tick env resolver. When provided, the EFFECTIVE env
+   * for every tick (and the cheap-off gate) is re-resolved on each fire instead
+   * of captured once at arm time. This is how the file-backed demo-flag override
+   * (`<DATA_DIR>/demo-flags.json`) flips the loop on/off without a restart on a
+   * host where the PM2 daemon is unreachable to a non-admin user. Falls back to
+   * `env` when omitted (the unit-test path).
+   */
+  resolveEnv?: () => NodeJS.ProcessEnv;
   intervalMs?: number;
   now?: () => number;
   /** Required in prod: the book enumerator + market-open check. */
@@ -362,7 +371,8 @@ export interface StartAutonomousDemoScheduleOpts {
 export function startAutonomousDemoSchedule(
   opts: StartAutonomousDemoScheduleOpts = {},
 ): AutonomousDemoSchedule {
-  const env = opts.env ?? process.env;
+  const resolveEnv = opts.resolveEnv ?? (() => opts.env ?? process.env);
+  const env = resolveEnv();
   const intervalMs = opts.intervalMs ?? resolveAutonomousLoopIntervalMs(env);
   const now = opts.now ?? (() => Date.now());
   const tick = opts.tick ?? runAutonomousDemoTick;
@@ -370,7 +380,9 @@ export function startAutonomousDemoSchedule(
   status.intervalMs = intervalMs;
 
   const fire = (): void => {
-    void tick(now(), env, deps)
+    // Re-resolve per tick so a file-backed demo-flag flip (TRA-1008) takes
+    // effect without a restart; defaults to the arm-time env in unit tests.
+    void tick(now(), resolveEnv(), deps)
       .then((outcome) => {
         if (outcome.ran) {
           log.info('autonomous demo loop tick', {

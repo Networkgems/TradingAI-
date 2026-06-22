@@ -1,0 +1,82 @@
+// TRA-1008 — the file-backed demo-flag override. The contract: a non-admin
+// operator can flip a non-secret DEMO toggle (e.g. ENABLE_AUTONOMOUS_DEMO_LOOP)
+// by writing `<DATA_DIR>/demo-flags.json`, WITHOUT reaching the SYSTEM-owned PM2
+// daemon. Guardrails that matter: an absent/malformed file is a no-op (never
+// crashes the loop), only allowlisted keys are honored (a secret in the file is
+// ignored), and the file value wins over the base env.
+
+import { describe, it, expect, beforeEach, afterEach } from 'vitest';
+import { mkdtempSync, rmSync, writeFileSync } from 'fs';
+import { tmpdir } from 'os';
+import { join } from 'path';
+import {
+  loadDemoFlagFile,
+  resolveDemoFlagEnv,
+  DEMO_FLAGS_FILENAME,
+} from './demo-flags.js';
+import { isAutonomousDemoLoopEnabled } from './autonomous-demo-loop.js';
+
+let dir: string;
+
+beforeEach(() => {
+  dir = mkdtempSync(join(tmpdir(), 'tra1008-demoflags-'));
+});
+afterEach(() => {
+  rmSync(dir, { recursive: true, force: true });
+});
+
+function writeFlags(obj: unknown): void {
+  writeFileSync(join(dir, DEMO_FLAGS_FILENAME), JSON.stringify(obj), 'utf8');
+}
+
+describe('loadDemoFlagFile', () => {
+  it('returns {} when the file is absent (the default zero-override path)', () => {
+    expect(loadDemoFlagFile(dir)).toEqual({});
+  });
+
+  it('returns {} for malformed JSON rather than throwing', () => {
+    writeFileSync(join(dir, DEMO_FLAGS_FILENAME), '{ not json', 'utf8');
+    expect(loadDemoFlagFile(dir)).toEqual({});
+  });
+
+  it('returns {} for non-object JSON (array / scalar)', () => {
+    writeFlags(['ENABLE_AUTONOMOUS_DEMO_LOOP']);
+    expect(loadDemoFlagFile(dir)).toEqual({});
+  });
+
+  it('reads allowlisted keys and coerces values to strings', () => {
+    writeFlags({ ENABLE_AUTONOMOUS_DEMO_LOOP: 1, AUTONOMOUS_DEMO_LOOP_INTERVAL_MS: '30000' });
+    expect(loadDemoFlagFile(dir)).toEqual({
+      ENABLE_AUTONOMOUS_DEMO_LOOP: '1',
+      AUTONOMOUS_DEMO_LOOP_INTERVAL_MS: '30000',
+    });
+  });
+
+  it('ignores non-allowlisted keys (a secret in the file is never honored)', () => {
+    writeFlags({ ENABLE_AUTONOMOUS_DEMO_LOOP: 'true', ADMIN_PASSWORD: 'leak', TRADIER_ENV: 'production' });
+    expect(loadDemoFlagFile(dir)).toEqual({ ENABLE_AUTONOMOUS_DEMO_LOOP: 'true' });
+  });
+});
+
+describe('resolveDemoFlagEnv', () => {
+  it('returns the base env unchanged when no file overrides exist', () => {
+    const base = { FOO: 'bar' } as NodeJS.ProcessEnv;
+    expect(resolveDemoFlagEnv(dir, base)).toBe(base);
+  });
+
+  it('layers the file over the base env (file wins)', () => {
+    writeFlags({ ENABLE_AUTONOMOUS_DEMO_LOOP: '1' });
+    const base = { ENABLE_AUTONOMOUS_DEMO_LOOP: '0', FOO: 'bar' } as NodeJS.ProcessEnv;
+    const eff = resolveDemoFlagEnv(dir, base);
+    expect(eff['ENABLE_AUTONOMOUS_DEMO_LOOP']).toBe('1');
+    expect(eff['FOO']).toBe('bar');
+    expect(base['ENABLE_AUTONOMOUS_DEMO_LOOP']).toBe('0'); // base not mutated
+  });
+
+  it('end-to-end: a file flip enables the loop gate without any env var set', () => {
+    const base = {} as NodeJS.ProcessEnv;
+    expect(isAutonomousDemoLoopEnabled(resolveDemoFlagEnv(dir, base))).toBe(false);
+    writeFlags({ ENABLE_AUTONOMOUS_DEMO_LOOP: '1' });
+    expect(isAutonomousDemoLoopEnabled(resolveDemoFlagEnv(dir, base))).toBe(true);
+  });
+});

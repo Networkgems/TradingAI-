@@ -30,6 +30,11 @@ import {
   type DemoBookEngine,
   type AutonomousDemoLoopDeps,
 } from './autonomous-demo-loop.js';
+// TRA-1008 — file-backed override for non-secret DEMO flags. Lets a non-admin
+// operator/agent flip ENABLE_AUTONOMOUS_DEMO_LOOP via <DATA_DIR>/demo-flags.json
+// on a host where the SYSTEM-owned PM2 daemon is unreachable (no dotenv loader,
+// env lives only in the saved process env). Secrets are never read from it.
+import { resolveDemoFlagEnv } from './demo-flags.js';
 // TRA-1006 — automated pre/post-market analyst agent. Tick fns are flag-checked
 // before any deps are built (zero cost while ENABLE_ANALYST_AGENT is off) and are
 // hooked onto the existing onPremarket / onArchive market-scheduler ticks.
@@ -315,6 +320,11 @@ const log = logger.child({ module: 'index' });
 const PORT = Number(process.env.PORT ?? 4242);
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const DATA_DIR = process.env.DATA_DIR ?? join(__dirname, '..', 'data');
+
+// TRA-1008 — effective env for demo-loop flags: process.env with the
+// allowlisted <DATA_DIR>/demo-flags.json values layered on top. Re-read on each
+// call so an operator's file flip is picked up on the next tick / probe.
+const demoFlagEnv = (): NodeJS.ProcessEnv => resolveDemoFlagEnv(DATA_DIR);
 
 // TRA-140 — log DATA_DIR and warn loudly if it's ephemeral.
 await checkDataDirHealth();
@@ -716,8 +726,8 @@ async function generateAndSaveReport(
   // throttles) for the demo book. Gated on ENABLE_AUTONOMOUS_DEMO_LOOP so a firm
   // not running the loop adds no section. Status is firm-wide (the conductor
   // drives every demo book), surfaced on each demo book's report for visibility.
-  if (isAutonomousDemoLoopEnabled() && settings.mode === 'demo') {
-    finalSnapshot.autonomousDemoLoop = buildAutonomousDemoLoopReport();
+  if (isAutonomousDemoLoopEnabled(demoFlagEnv()) && settings.mode === 'demo') {
+    finalSnapshot.autonomousDemoLoop = buildAutonomousDemoLoopReport(demoFlagEnv());
   }
   // TRA-1006 — fold the analyst agent's pre-market plan + post-market review into
   // the EOD markdown (demo book only). Gated on ENABLE_ANALYST_AGENT; reads the
@@ -1859,7 +1869,7 @@ registerLiveHealthRoutes(app, {
 // QA / ops confirm the demo book is self-driving (and see autopilot halts /
 // throttles) without a login. Flag off ⇒ `enabled:false` and zero recent ticks.
 app.get('/api/health/autonomous-demo', (_req, res) => {
-  res.json(getAutonomousDemoStatus());
+  res.json(getAutonomousDemoStatus(demoFlagEnv()));
 });
 
 // TRA-406 — observability surface. Returns the recent in-memory alerts and the
@@ -5939,7 +5949,11 @@ const autonomousDemoLoopDeps: AutonomousDemoLoopDeps = {
       .map(makeDemoBookEngine),
   isStocksMarketOpen: () => isMarketOpen(),
 };
-const autonomousDemoSchedule = startAutonomousDemoSchedule({ deps: autonomousDemoLoopDeps });
+const autonomousDemoSchedule = startAutonomousDemoSchedule({
+  deps: autonomousDemoLoopDeps,
+  // TRA-1008 — re-resolve env per tick so a file-backed flag flip is honored.
+  resolveEnv: demoFlagEnv,
+});
 
 const scheduler = new MarketScheduler();
 scheduler.start({
