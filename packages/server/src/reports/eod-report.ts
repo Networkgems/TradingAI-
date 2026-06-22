@@ -13,6 +13,8 @@ import type { EngineState, SymbolState } from '../signal-engine.js';
 import { computePortfolioGreeks } from './portfolio-greeks.js';
 import type { OptionTradeJournalSummary } from '../option-trade-journal.js';
 import type { OptionLearnedWeights } from '../learned-option-weights.js';
+import type { IntrospectionReadout } from '../strategy-introspection.js';
+import type { AutopilotAction } from '../risk-autopilot.js';
 
 /** Signals fired today, keyed by signal id */
 export interface DailySignalRecord {
@@ -268,10 +270,79 @@ ${structureRows || '_No closed option trades yet._'}
 ${weightRows || '_No dimension has cleared the min-sample guard yet — all neutral (1.0)._'}`;
 }
 
+/**
+ * TRA-995 — render the firm-health INTROSPECTION readout (per-strategy
+ * attribution + edge-decay flags) and the risk-AUTOPILOT action log. Returns ''
+ * when there is nothing to show (no attributed strategies and no autopilot
+ * actions) so a quiet, full-size day adds no noise. Observe-and-tighten only:
+ * the autopilot never raises a limit, and that is stated in the readout.
+ */
+function buildIntrospectionMarkdown(
+  introspection: IntrospectionReadout | undefined,
+  autopilotActions: AutopilotAction[] | undefined,
+): string {
+  const hasStrategies = !!introspection && introspection.strategies.length > 0;
+  const hasActions = !!autopilotActions && autopilotActions.length > 0;
+  if (!hasStrategies && !hasActions) return '';
+
+  const usd = (n: number) => (n >= 0 ? '+' : '-') + '$' + Math.abs(n).toFixed(2);
+  const pct = (f: number | null) => (f == null ? '—' : (f * 100).toFixed(1) + '%');
+  const r = (n: number | null) => (n == null ? '—' : n.toFixed(2) + 'R');
+  const sharpe = (n: number | null) => (n == null ? '—' : n.toFixed(2));
+
+  const attributionRows = hasStrategies
+    ? introspection!.strategies
+        .map(
+          (s) =>
+            `| ${s.strategy} | ${s.trades} | ${usd(s.realizedPnlUsd)} | ${pct(s.winRate)} | ${r(s.expectancy)} | ${sharpe(s.sharpe)} |`,
+        )
+        .join('\n')
+    : '';
+
+  // Only surface strategies with a decided edge-decay verdict (enough trades to
+  // judge), degrading first so a problem leads the section.
+  const decayRows = hasStrategies
+    ? introspection!.edgeDecay
+        .filter((e) => e.recentTrades > 0 && e.baselineTrades > 0)
+        .sort((a, b) => Number(b.degrading) - Number(a.degrading))
+        .map(
+          (e) =>
+            `| ${e.strategy} | ${e.degrading ? '⚠️ DECAYING' : 'ok'} | ${r(e.baselineExpectancy)} | ${r(e.recentExpectancy)} | ${e.reason} |`,
+        )
+        .join('\n')
+    : '';
+
+  const actionRows = hasActions
+    ? autopilotActions!
+        .map((a) => `| ${a.kind.toUpperCase()} | ${a.trigger} | ${a.reason} |`)
+        .join('\n')
+    : '';
+
+  return `
+
+## Firm Introspection — Per-Strategy Attribution (TRA-995)
+| Strategy | Trades | Realized P&L | Win Rate | Expectancy | Sharpe |
+|----------|--------|--------------|----------|------------|--------|
+${attributionRows || '_No closed trades attributed yet._'}
+
+## Edge-Decay Detector (TRA-995)
+| Strategy | Status | Baseline | Recent | Note |
+|----------|--------|----------|--------|------|
+${decayRows || '_Not enough trades in any strategy to judge edge decay yet._'}
+
+## Risk Autopilot Actions (TRA-995, observe-and-tighten only)
+_The autopilot may only tighten risk autonomously (halt / throttle / de-risk); raising any limit requires board ratification._
+| Action | Trigger | Reason |
+|--------|---------|--------|
+${actionRows || '_No autopilot actions today — risk at full size._'}`;
+}
+
 function buildMarkdown(
   report: Omit<EodReport, 'markdown'>,
   optionJournal?: OptionTradeJournalSummary,
   optionLearnedWeights?: OptionLearnedWeights,
+  introspection?: IntrospectionReadout,
+  autopilotActions?: AutopilotAction[],
 ): string {
   const { date, realizedPnl, unrealizedPnl, optionsPnl, combinedPnl,
           totalEquity, managedEquity, availableCash,
@@ -335,7 +406,7 @@ ${moverRows || '_No data._'}
 | Winning Signals | ${signalAccuracy.winningSignals} |
 | Signal Win Rate | ${pct(signalAccuracy.winRate)} |
 | Avg R:R | 1:${signalAccuracy.avgRR.toFixed(2)} |
-${buildPortfolioGreeksMarkdown(portfolioGreeks)}${buildOptionJournalMarkdown(optionJournal, optionLearnedWeights)}`;
+${buildPortfolioGreeksMarkdown(portfolioGreeks)}${buildOptionJournalMarkdown(optionJournal, optionLearnedWeights)}${buildIntrospectionMarkdown(introspection, autopilotActions)}`;
 }
 
 export interface ReportInput {
@@ -364,6 +435,18 @@ export interface ReportInput {
    */
   optionJournal?: OptionTradeJournalSummary;
   optionLearnedWeights?: OptionLearnedWeights;
+  /**
+   * TRA-995 — the self-awareness introspection readout (per-strategy attribution
+   * + edge-decay flags), computed by the caller from the closed-trade journal.
+   * Optional ↔ no introspection section.
+   */
+  introspection?: IntrospectionReadout;
+  /**
+   * TRA-995 — the risk-autopilot action log for the day (halts / throttles with
+   * their trigger + reason), read from `DailyRiskGovernor.getAutopilotActions()`.
+   * Optional ↔ no autopilot-actions section.
+   */
+  autopilotActions?: AutopilotAction[];
 }
 
 /**
@@ -379,7 +462,7 @@ export interface ReportInput {
  */
 export function generateEodReport(input: ReportInput, asOfDate?: string): EodReport {
   const { state, allClosedPositions, closedOptions = [], dailySignals, signalTypeMap,
-          optionJournal, optionLearnedWeights } = input;
+          optionJournal, optionLearnedWeights, introspection, autopilotActions } = input;
   const today = asOfDate ?? new Date().toLocaleDateString('en-CA', { timeZone: 'America/New_York' });
 
   // Closed trades for today only
@@ -497,5 +580,14 @@ export function generateEodReport(input: ReportInput, asOfDate?: string): EodRep
     portfolioGreeks,
   };
 
-  return { ...partial, markdown: buildMarkdown(partial, optionJournal, optionLearnedWeights) };
+  return {
+    ...partial,
+    markdown: buildMarkdown(
+      partial,
+      optionJournal,
+      optionLearnedWeights,
+      introspection,
+      autopilotActions,
+    ),
+  };
 }

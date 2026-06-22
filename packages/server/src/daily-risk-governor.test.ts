@@ -129,3 +129,54 @@ describe('DailyRiskGovernor — TRA-526 global kill switch', () => {
     expect(gov.getHaltReason()).toMatch(/consecutive losses/i);
   });
 });
+
+// TRA-995 — the risk autopilot consumed through the governor. The governor is
+// the mutation boundary that enforces TIGHTEN-ONLY: it ratchets the throttle
+// down, sets (never clears) a halt, and can never autonomously raise risk.
+describe('DailyRiskGovernor — TRA-995 risk autopilot (tighten-only)', () => {
+  it('throttles risk on a high-vol regime without halting, and surfaces the action', () => {
+    const gov = new DailyRiskGovernor(() => new Date('2026-06-02T15:00:00Z'));
+    expect(gov.getRiskThrottle()).toBe(1);
+    const d = gov.runAutopilot({ managedEquity: 100_000, regime: 'high_vol' });
+    expect(d.halt).toBe(false);
+    expect(gov.isHalted()).toBe(false);
+    expect(gov.getRiskThrottle()).toBeLessThan(1);
+    expect(gov.getAutopilotActions().some((a) => a.trigger === 'regime_shift')).toBe(true);
+  });
+
+  it('halts on a stale feed and fires the halt listener exactly once', () => {
+    const gov = new DailyRiskGovernor(() => new Date('2026-06-02T15:00:00Z'));
+    const reasons: string[] = [];
+    gov.setHaltListener((r) => reasons.push(r));
+    gov.runAutopilot({ managedEquity: 100_000, feedStale: true });
+    gov.runAutopilot({ managedEquity: 100_000, feedStale: true }); // still stale
+    expect(gov.isHalted()).toBe(true);
+    expect(gov.getHaltReason()).toMatch(/feed stale/i);
+    expect(reasons).toHaveLength(1); // false→true transition only
+  });
+
+  it('only ratchets the throttle DOWN within a day (never loosens autonomously)', () => {
+    const gov = new DailyRiskGovernor(() => new Date('2026-06-02T15:00:00Z'));
+    gov.runAutopilot({ managedEquity: 100_000, decayingStrategies: ['a', 'b'] }); // 0.25
+    const tightened = gov.getRiskThrottle();
+    expect(tightened).toBeLessThan(0.5);
+    // A subsequent benign evaluation must NOT raise the throttle back up.
+    gov.runAutopilot({ managedEquity: 100_000 });
+    expect(gov.getRiskThrottle()).toBe(tightened);
+  });
+
+  it('resets the throttle on the ET day roll (a daily breaker clearing, not a raise)', () => {
+    let now = new Date('2026-06-02T15:00:00Z');
+    const gov = new DailyRiskGovernor(() => now);
+    gov.runAutopilot({ managedEquity: 100_000, regime: 'high_vol' });
+    expect(gov.getRiskThrottle()).toBeLessThan(1);
+    now = new Date('2026-06-03T15:00:00Z'); // next ET day
+    expect(gov.getRiskThrottle()).toBe(1);
+  });
+
+  it('flags an edge-decaying strategy as throttled + queued for review', () => {
+    const gov = new DailyRiskGovernor(() => new Date('2026-06-02T15:00:00Z'));
+    const d = gov.runAutopilot({ managedEquity: 100_000, decayingStrategies: ['bull_put'] });
+    expect(d.actions.find((a) => a.trigger === 'edge_decay')!.reason).toMatch(/queued for review/i);
+  });
+});

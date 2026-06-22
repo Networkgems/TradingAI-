@@ -514,4 +514,66 @@ describe('generateEodReport — TRA-594 calendar aggregation', () => {
     });
     expect(report.markdown).not.toContain('Option-Trade Journal');
   });
+
+  // TRA-995 — the self-awareness introspection + risk-autopilot sections.
+  it('renders per-strategy attribution, an edge-decay flag, and autopilot actions', () => {
+    const report = generateEodReport({
+      state: makeEngineState(),
+      allClosedPositions: [],
+      dailySignals: [],
+      signalTypeMap: new Map(),
+      introspection: {
+        strategies: [
+          {
+            strategy: 'bull_put',
+            trades: 12,
+            realizedPnlUsd: 540,
+            winRate: 0.66,
+            expectancy: 0.42,
+            sharpe: 1.1,
+            byRegime: [],
+          },
+        ],
+        edgeDecay: [
+          {
+            strategy: 'single_leg_rv',
+            degrading: true,
+            baselineExpectancy: 1.2,
+            recentExpectancy: -0.3,
+            baselineTrades: 8,
+            recentTrades: 6,
+            reason: 'Edge turned negative: baseline expectancy +1.20R → recent -0.30R',
+          },
+        ],
+        degradingStrategies: ['single_leg_rv'],
+      },
+      autopilotActions: [
+        {
+          kind: 'throttle',
+          trigger: 'edge_decay',
+          reason: 'Strategy "single_leg_rv" flagged edge-decaying — autopilot throttled risk to 50% and queued for review',
+          throttleMultiplier: 0.5,
+        },
+      ],
+    });
+    expect(report.markdown).toContain('Per-Strategy Attribution');
+    expect(report.markdown).toContain('bull_put');
+    expect(report.markdown).toContain('Edge-Decay Detector');
+    expect(report.markdown).toContain('⚠️ DECAYING');
+    expect(report.markdown).toContain('Risk Autopilot Actions');
+    expect(report.markdown).toContain('queued for review');
+    // Invariant 4 statement must be present in the readout.
+    expect(report.markdown).toContain('requires board ratification');
+  });
+
+  it('omits the introspection + autopilot sections when neither is supplied', () => {
+    const report = generateEodReport({
+      state: makeEngineState(),
+      allClosedPositions: [],
+      dailySignals: [],
+      signalTypeMap: new Map(),
+    });
+    expect(report.markdown).not.toContain('Per-Strategy Attribution');
+    expect(report.markdown).not.toContain('Risk Autopilot Actions');
+  });
 });

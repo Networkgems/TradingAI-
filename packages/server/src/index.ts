@@ -14,6 +14,12 @@ import {
   isOptionTradeJournalEnabled,
 } from './option-trade-journal.js';
 import { computeOptionLearnedWeights } from './learned-option-weights.js';
+// TRA-995 — self-awareness introspection (per-strategy attribution + edge-decay)
+// folded from the same closed-trade journal that feeds the learned weights.
+import {
+  computeStrategyIntrospection,
+  optionJournalToStrategyRows,
+} from './strategy-introspection.js';
 import {
   computeOptionsAlerts,
   scanTargetStop,
@@ -650,6 +656,11 @@ async function generateAndSaveReport(
       const journalRows = await listOptionTradeJournal({ mode: 'demo' });
       finalSnapshot.optionJournal = summarizeOptionTradeJournal(journalRows);
       finalSnapshot.optionLearnedWeights = computeOptionLearnedWeights(journalRows);
+      // TRA-995 — the self-awareness readout off the same journal: per-strategy
+      // attribution + the edge-decay flag the autopilot throttles on.
+      finalSnapshot.introspection = computeStrategyIntrospection(
+        optionJournalToStrategyRows(journalRows),
+      );
     } catch (err) {
       log.warn('option-trade-journal EOD fold failed', {
         username: ctx.username,

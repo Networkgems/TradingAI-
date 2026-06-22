@@ -41,8 +41,25 @@ import {
 } from './reversal-shadow-ledger.js';
 import { ivRankSync, atmIvFromRows } from './iv-rank-store.js';
 import type { SentimentIcBand } from './option-trade-journal.js';
+import { listOptionTradeJournal } from './option-trade-journal.js';
+import {
+  computeStrategyIntrospection,
+  optionJournalToStrategyRows,
+} from './strategy-introspection.js';
 import { isOptionShadowEnabled, isOptionPhaseBEnabled, emitShadowOptionSignal, shadowSignalToSpreadParams, OPTION_SHADOW_EMERGENCY_OFF } from './option-shadow-ledger.js';
 import { etDateString } from './scheduler.js';
+// TRA-995 (epic-C, self-regulation) — the standing risk autopilot. A pure
+// tighten-only decision module; the governor below is its mutation boundary and
+// enforces the "may only tighten autonomously" invariant a second time.
+import {
+  type AutopilotAction,
+  type RiskAutopilotDecision,
+  assertTightenOnly,
+  clampThrottle,
+  evaluateRiskAutopilot,
+  MIN_RISK_THROTTLE,
+} from './risk-autopilot.js';
+import type { Regime } from '@trading-app/engine';
 import { fetchMinuteBars, fetchDailyCandles, fetchQuotes, fetchStocksNews, isYahooBreakerOpen, setActiveInterestSymbols, setTradierStocksFeedClient } from './yahoo-feed.js';
 import { fetchStockTwitsStream, fetchStockTwitsUserStream, getCuratedStockTwitsAccounts } from './stocktwits-feed.js';
 import { evaluateFeedFreshness } from './feed-freshness.js';
@@ -392,6 +409,10 @@ const SUPERTREND_PAPER_CLOSED_MAX = 10_000;
  * disk while still picking up a fresh review well within the trading day.
  */
 const MARKET_REVIEW_REFRESH_MS = 5 * 60_000;
+// TRA-995 — how often the risk autopilot re-folds the journal for edge-decay.
+// The fold is async I/O over the whole journal, so refresh it on a slow cadence
+// (15 min) rather than every 30s tick; the per-tick consult reuses the cache.
+const AUTOPILOT_DECAY_REFRESH_MS = 15 * 60_000;
 
 /**
  * TRA-389 / TRA-469 / TRA-472 / TRA-474 — strategy suppression reason for
@@ -479,6 +500,20 @@ export class DailyRiskGovernor {
    */
   private haltListener: ((reason: string) => void) | null = null;
 
+  /**
+   * TRA-995 — the risk-autopilot throttle. A tighten-only per-trade risk
+   * multiplier in [MIN_RISK_THROTTLE, 1]: the autopilot may lower it (de-risk)
+   * within a trading day but may NEVER raise it autonomously — every
+   * {@link applyAutopilotDecision} only ratchets it DOWN. It resets to 1 on the
+   * ET day roll exactly as the daily circuit-breaker halt does (a daily breaker
+   * clearing on a fresh day is not an autonomous limit increase).
+   */
+  private riskThrottle = 1;
+  /** TRA-995 — rolling log of autopilot tightenings, surfaced in health + EOD. */
+  private autopilotActions: AutopilotAction[] = [];
+  /** Cap the in-memory action log so a long degraded session can't grow it unbounded. */
+  private static readonly MAX_AUTOPILOT_ACTIONS = 50;
+
   constructor(private readonly now: () => Date = () => new Date()) {
     this.currentDay = etDateString(this.now());
   }
@@ -496,6 +531,12 @@ export class DailyRiskGovernor {
       this.halted = false;
       this.haltReason = null;
       this.currentDay = today;
+      // TRA-995 — the autopilot throttle is a DAILY breaker like the halt: it
+      // clears on the fresh ET day. This is not an "autonomous limit increase"
+      // (Invariant 4) any more than the loss-streak halt lifting is — both are
+      // the day rolling. The throttle can only be RAISED mid-day via the
+      // ratification path; within a day applyAutopilotDecision only ratchets down.
+      this.riskThrottle = 1;
       // NOTE: killSwitchEngaged is deliberately preserved across the day roll.
     }
   }
@@ -573,6 +614,97 @@ export class DailyRiskGovernor {
     // TRA-526 — surface the kill-switch reason first; it is the master override.
     if (this.killSwitchEngaged) return this.killSwitchReason;
     return this.haltReason;
+  }
+
+  /**
+   * TRA-995 — apply a risk-autopilot decision. TIGHTEN-ONLY by construction:
+   *   • a halt only ever sets the breaker (it never clears one);
+   *   • the throttle only ever ratchets DOWN (`min` of current and proposed),
+   *     so a decision can never autonomously raise risk within the day.
+   * `assertTightenOnly` is a defence-in-depth guard that throws if a decision
+   * ever carries a loosening — a coding regression fails loud rather than
+   * silently un-de-risking the book. Returns the actions actually newly logged.
+   */
+  applyAutopilotDecision(decision: RiskAutopilotDecision): AutopilotAction[] {
+    this.resetIfNewDay();
+    assertTightenOnly(decision);
+
+    const wasHalted = this.halted;
+
+    // Throttle: ratchet DOWN only. min() guarantees we never loosen mid-day.
+    const proposed = clampThrottle(decision.riskThrottle);
+    if (proposed < this.riskThrottle) {
+      this.riskThrottle = Math.max(MIN_RISK_THROTTLE, proposed);
+    }
+
+    // Halt: set (never clear) the daily breaker on a halting decision.
+    if (decision.halt && !this.halted) {
+      this.halted = true;
+      this.haltReason = decision.haltReason ?? 'Risk autopilot halted new entries';
+    }
+
+    // Record the actions for health + EOD surfacing (capped, newest last).
+    if (decision.actions.length > 0) {
+      this.autopilotActions.push(...decision.actions);
+      if (this.autopilotActions.length > DailyRiskGovernor.MAX_AUTOPILOT_ACTIONS) {
+        this.autopilotActions = this.autopilotActions.slice(
+          -DailyRiskGovernor.MAX_AUTOPILOT_ACTIONS,
+        );
+      }
+    }
+
+    // Fire the risk_halt alert on the false→true transition only (mirrors the
+    // automatic breaker path), so an autopilot halt is surfaced like any other.
+    if (!wasHalted && this.halted && this.haltListener) {
+      try {
+        this.haltListener(this.haltReason ?? 'Risk autopilot halted new entries');
+      } catch {
+        // A notification failure must never break the governor accounting.
+      }
+    }
+
+    return decision.actions;
+  }
+
+  /**
+   * TRA-995 — the current tighten-only risk multiplier in (0, 1]. Sizing paths
+   * multiply per-trade risk by this so an autopilot throttle de-risks every new
+   * entry without halting outright.
+   */
+  getRiskThrottle(): number {
+    this.resetIfNewDay();
+    return this.riskThrottle;
+  }
+
+  /** TRA-995 — the rolling autopilot action log (oldest first), for health + EOD. */
+  getAutopilotActions(): AutopilotAction[] {
+    return [...this.autopilotActions];
+  }
+
+  /**
+   * TRA-995 — run the standing autopilot from the governor's own daily counters
+   * (P&L, loss streak) plus the external standing signals the governor can't see
+   * on its own: the active regime, feed staleness, and the self-awareness layer's
+   * edge-decaying strategy list. Evaluates the pure autopilot, applies the
+   * tighten-only decision, and returns it so callers can surface the actions.
+   */
+  runAutopilot(signals: {
+    managedEquity: number;
+    regime?: Regime | null;
+    feedStale?: boolean;
+    decayingStrategies?: string[];
+  }): RiskAutopilotDecision {
+    this.resetIfNewDay();
+    const decision = evaluateRiskAutopilot({
+      dailyPnl: this.dailyPnl,
+      managedEquity: signals.managedEquity,
+      consecutiveLosses: this.consecutiveLosses,
+      regime: signals.regime ?? null,
+      feedStale: signals.feedStale ?? false,
+      decayingStrategies: signals.decayingStrategies ?? [],
+    });
+    this.applyAutopilotDecision(decision);
+    return decision;
   }
 }
 
@@ -943,6 +1075,15 @@ export class SignalEngine {
    */
   private cachedMarketReview: MarketReview | null = null;
   private lastMarketReviewFetchAt = 0;
+
+  /**
+   * TRA-995 — strategies the self-awareness layer last flagged as edge-decaying.
+   * Refreshed off the demo option-trade journal on a slow cadence (it is async
+   * I/O, not something to recompute every 30s tick) and fed to the per-tick
+   * risk-autopilot consult so a degrading strategy auto-throttles risk.
+   */
+  private autopilotDecayingStrategies: string[] = [];
+  private lastAutopilotDecayRefreshAt = 0;
 
   constructor(settings?: AccountSettings, tracker?: PnlTracker, rvScanner?: RelativeValueScannerService) {
     this.tracker = tracker;
@@ -1447,6 +1588,25 @@ export class SignalEngine {
       this.cachedMarketReview = await getLatestMarketReview('premarket').catch(() => null);
       this.lastMarketReviewFetchAt = Date.now();
     }
+
+    // TRA-995 — refresh the edge-decay watch list on a slow cadence (async fold
+    // over the demo option-trade journal), then run the standing risk autopilot
+    // for this tick. The autopilot is TIGHTEN-ONLY: it can halt or throttle but
+    // never raises a limit (DailyRiskGovernor enforces that at the boundary).
+    if (Date.now() - this.lastAutopilotDecayRefreshAt > AUTOPILOT_DECAY_REFRESH_MS) {
+      this.lastAutopilotDecayRefreshAt = Date.now();
+      try {
+        const rows = await listOptionTradeJournal({ mode: 'demo' });
+        this.autopilotDecayingStrategies = computeStrategyIntrospection(
+          optionJournalToStrategyRows(rows),
+        ).degradingStrategies;
+      } catch (err: unknown) {
+        log.warn('autopilot edge-decay refresh threw', {
+          reason: err instanceof Error ? err.message : String(err),
+        });
+      }
+    }
+    this.runRiskAutopilot();
 
     // TRA-226 — keep the live Tradier equity figure fresh while in live mode.
     // applySettings does an immediate fetch when creds change so the user
@@ -5990,7 +6150,20 @@ export class SignalEngine {
       closedOptions: this.optionsAccount.getClosedOptionsForMode(this.mode),
       dailySignals: [...this.dailySignals],
       signalTypeMap: new Map(this.positionSignalType),
+      // TRA-995 — the risk-autopilot action log so the EOD report surfaces every
+      // halt/throttle with its trigger reason (observe-and-tighten only).
+      autopilotActions: this.riskGovernor.getAutopilotActions(),
     };
+  }
+
+  /** TRA-995 — the current tighten-only risk throttle (1 ⇒ full size). */
+  getRiskThrottle(): number {
+    return this.riskGovernor.getRiskThrottle();
+  }
+
+  /** TRA-995 — the rolling risk-autopilot action log, for health surfaces. */
+  getAutopilotActions(): AutopilotAction[] {
+    return this.riskGovernor.getAutopilotActions();
   }
 
   /** Snapshot trade history + accounts for durable storage (TRA-140). */
@@ -6097,6 +6270,56 @@ export class SignalEngine {
    */
   private activeSizingMultiplier(): number {
     return 1;
+  }
+
+  /**
+   * TRA-995 — run the standing risk autopilot for this tick. Feeds the governor
+   * the three standing signals it can't see from its own trade counters:
+   *   • feed staleness — during market hours, true when NO active symbol carries
+   *     a fresh candle (the firm-wide "data feed is down" signal);
+   *   • regime — a `red` premarket market-review risk label is treated as a
+   *     high-volatility regime that throttles size (the review's green/yellow/red
+   *     is a risk posture, not the engine's trend label);
+   *   • edge-decay — the strategies the self-awareness layer last flagged.
+   * The governor applies the decision TIGHTEN-ONLY (halt or throttle, never a
+   * raise) and records the actions for health + EOD. A failure here must never
+   * break the tick.
+   */
+  private runRiskAutopilot(): void {
+    try {
+      const marketOpen = isStockMarketOpen();
+      let feedStale = false;
+      if (marketOpen) {
+        const active = this.getActiveSymbols();
+        const now = Date.now();
+        let anyFresh = false;
+        let tracked = 0;
+        for (const sym of active) {
+          const candles = this.candleCache.get(sym) ?? [];
+          if (candles.length === 0) continue;
+          tracked++;
+          if (!evaluateFeedFreshness({ candles }, now).stale) {
+            anyFresh = true;
+            break;
+          }
+        }
+        feedStale = tracked > 0 && !anyFresh;
+      }
+
+      const reviewRegime = this.cachedMarketReview?.regime;
+      const regime: Regime | null = reviewRegime === 'red' ? 'high_vol' : null;
+
+      this.riskGovernor.runAutopilot({
+        managedEquity: this.account.managedEquity(),
+        regime,
+        feedStale,
+        decayingStrategies: this.autopilotDecayingStrategies,
+      });
+    } catch (err: unknown) {
+      log.warn('risk autopilot tick threw', {
+        reason: err instanceof Error ? err.message : String(err),
+      });
+    }
   }
 
   /**

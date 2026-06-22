@@ -33,6 +33,10 @@ import {
 /** Minimal shape this module needs from a per-user context. */
 export interface HealthEngineLike {
   getState(): EngineState;
+  /** TRA-995 — current tighten-only risk multiplier (1 ⇒ full size). */
+  getRiskThrottle?(): number;
+  /** TRA-995 — the rolling risk-autopilot action log. */
+  getAutopilotActions?(): import('../risk-autopilot.js').AutopilotAction[];
 }
 export interface HealthUserContext {
   username: string;
@@ -554,6 +558,9 @@ function summarizeForContext(
     symbols: state.symbols,
     lastTick: state.lastTick,
     now,
+    // TRA-995 — surface the risk-autopilot's tighten-only state in live health.
+    riskThrottle: ctx.engine.getRiskThrottle?.(),
+    autopilotActions: ctx.engine.getAutopilotActions?.(),
   });
 }
 

@@ -15,6 +15,7 @@
 
 import type { AccountMode, TradierEnv } from '@trading-app/shared';
 import { MAX_QUOTE_AGE_MS } from '../feed-freshness.js';
+import type { AutopilotAction } from '../risk-autopilot.js';
 
 export type HealthStatus = 'green' | 'yellow' | 'red';
 
@@ -42,6 +43,14 @@ export interface LiveHealthInput {
   now: number;
   maxQuoteAgeMs?: number;
   maxTickAgeMs?: number;
+  /**
+   * TRA-995 — the risk-autopilot's current tighten-only risk multiplier in
+   * (0, 1]; 1 ⇒ full size. < 1 means the autopilot has de-risked. Optional so
+   * callers (and existing tests) that don't supply it default to 1 / no actions.
+   */
+  riskThrottle?: number;
+  /** TRA-995 — the rolling autopilot action log (halts/throttles + reasons). */
+  autopilotActions?: AutopilotAction[];
 }
 
 export interface FeedHealth {
@@ -70,6 +79,17 @@ export interface LiveHealthSummary {
   feed: FeedHealth;
   /** Human-readable problems, worst first. Empty ⇒ all green. */
   issues: string[];
+  /**
+   * TRA-995 — the risk autopilot's current state. `riskThrottle` < 1 means it
+   * has autonomously de-risked; `actions` lists every halt/throttle with its
+   * trigger reason. Observe-and-tighten only — never a limit increase.
+   */
+  autopilot: {
+    riskThrottle: number;
+    /** True when the autopilot has tightened risk below full size. */
+    throttled: boolean;
+    actions: AutopilotAction[];
+  };
 }
 
 /** Per-feed health from an engine's symbol snapshot. Pure. */
@@ -170,6 +190,20 @@ export function summarizeLiveHealth(input: LiveHealthInput): LiveHealthSummary {
     escalate('yellow');
   }
 
+  // TRA-995 — an active autopilot throttle is a degraded-but-deliberate state:
+  // the firm is intentionally trading smaller. Surface it as YELLOW (worth a
+  // look, not an outage) with the most recent trigger reason.
+  const riskThrottle = input.riskThrottle ?? 1;
+  const autopilotActions = input.autopilotActions ?? [];
+  const throttled = riskThrottle < 1;
+  if (throttled && !input.tradingHalted) {
+    const lastThrottle = [...autopilotActions].reverse().find((a) => a.kind === 'throttle');
+    issues.push(
+      `Risk autopilot throttled to ${(riskThrottle * 100).toFixed(0)}%${lastThrottle ? ` — ${lastThrottle.reason}` : ''}`,
+    );
+    escalate('yellow');
+  }
+
   return {
     status,
     mode: input.mode,
@@ -180,5 +214,6 @@ export function summarizeLiveHealth(input: LiveHealthInput): LiveHealthSummary {
     marketOpen: input.marketOpen,
     feed,
     issues,
+    autopilot: { riskThrottle, throttled, actions: autopilotActions },
   };
 }
