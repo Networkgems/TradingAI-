@@ -30,6 +30,7 @@ import {
   type OptionLearnedWeights,
 } from '../learned-option-weights.js';
 import { isExternalIntelEnabled } from '../external-intel.js';
+import { isAnalystAgentEnabled, buildAnalystHealth } from '../analyst-agent.js';
 import {
   loadSourceQualityWeights,
   type SourceQualityWeights,
@@ -728,6 +729,15 @@ export function registerLiveHealthRoutes(app: Express, deps: LiveHealthDeps): vo
   // The weights are advisory only: they never size capital or gate promotion.
   app.get('/api/health/source-quality', async (_req, res) => {
     res.json(await buildSourceQualityReport(now(), isExternalIntelEnabled()));
+  });
+
+  // TRA-1006 — automated analyst-agent readout. Reports whether the agent is
+  // armed and the freshness of its pre-market plan / post-market review plus how
+  // many hypotheses it queued today. Reads only the agent's own state file — no
+  // balances/PII — so it is unauthenticated and always served (zeros when the
+  // agent has never run). `enabled` mirrors ENABLE_ANALYST_AGENT.
+  app.get('/api/health/analyst', async (_req, res) => {
+    res.json(await buildAnalystHealth(now(), isAnalystAgentEnabled()));
   });
 }
 

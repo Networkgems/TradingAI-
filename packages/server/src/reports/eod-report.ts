@@ -17,6 +17,7 @@ import type { SourceQualityWeights } from '../source-quality-scorer.js';
 import type { IntrospectionReadout } from '../strategy-introspection.js';
 import type { AutopilotAction } from '../risk-autopilot.js';
 import type { AutonomousDemoLoopReport } from '../autonomous-demo-loop.js';
+import type { AnalystPlan, AnalystReview } from '../analyst-agent.js';
 
 /** Signals fired today, keyed by signal id */
 export interface DailySignalRecord {
@@ -405,6 +406,63 @@ _The autopilot may only tighten risk autonomously (halt / throttle / de-risk); r
 ${actionRows || '_No autopilot actions today — risk at full size._'}`;
 }
 
+/**
+ * TRA-1006 — render the analyst agent's pre-market plan (top ranked watchlist
+ * symbols) + post-market reflection (closed-trade rollup + the hypotheses queued).
+ * Returns '' when neither artifact is present (a firm not running the analyst adds
+ * no section). Advisory surfacing only — queued hypotheses still clear G0 + board
+ * ratification, and there is no live-capital path.
+ */
+function buildAnalystMarkdown(plan: AnalystPlan | undefined, review: AnalystReview | undefined): string {
+  if (!plan && !review) return '';
+
+  let out = `
+
+## Analyst Agent (TRA-1006, demo sandbox only)
+_Automated pre/post-market analyst. The plan is advisory; emitted hypotheses enter the TRA-994 queue as \`pending_ratification\` and never size capital before G0 + board ratification. No live-capital path._`;
+
+  if (plan) {
+    const rows = plan.watchlist
+      .slice(0, 10)
+      .map(
+        (w) =>
+          `| ${w.symbol} | ${w.rank.toFixed(3)} | ${w.reversal.side ?? '—'}${w.reversal.confirmed ? ' ✓' : ''} | ${w.nearestKeyLevel == null ? '—' : w.nearestKeyLevel.toFixed(2)} |`,
+      )
+      .join('\n');
+    out += `
+
+### Pre-market plan — ${plan.date} (${plan.regime}${plan.gapRisk ? ', gap-risk' : ''})
+| Symbol | Rank | Setup | Key level |
+|--------|------|-------|-----------|
+${rows || '_No ranked symbols._'}`;
+  }
+
+  if (review) {
+    const r = review.reflection;
+    const setupRows = r.bySetup
+      .map((s) => `| ${s.key} | ${s.trades} | ${(s.winRate * 100).toFixed(0)}% | ${s.expectancy.toFixed(2)}R |`)
+      .join('\n');
+    const hypRows = review.hypotheses
+      .map((h) => `| ${h.rule} | ${h.path} | ${h.op} ${h.value} |`)
+      .join('\n');
+    out += `
+
+### Post-market review — ${review.date}
+${r.narrative}
+
+| Setup | Trades | Win-rate | Expectancy |
+|-------|--------|----------|------------|
+${setupRows || '_No closed demo trades today._'}
+
+**Hypotheses queued (pending_ratification):**
+| Rule | Target | Delta |
+|------|--------|-------|
+${hypRows || '_None._'}`;
+  }
+
+  return out;
+}
+
 function buildMarkdown(
   report: Omit<EodReport, 'markdown'>,
   optionJournal?: OptionTradeJournalSummary,
@@ -413,6 +471,8 @@ function buildMarkdown(
   autopilotActions?: AutopilotAction[],
   sourceQualityWeights?: SourceQualityWeights,
   autonomousDemoLoop?: AutonomousDemoLoopReport,
+  analystPlan?: AnalystPlan,
+  analystReview?: AnalystReview,
 ): string {
   const { date, realizedPnl, unrealizedPnl, optionsPnl, combinedPnl,
           totalEquity, managedEquity, availableCash,
@@ -476,7 +536,7 @@ ${moverRows || '_No data._'}
 | Winning Signals | ${signalAccuracy.winningSignals} |
 | Signal Win Rate | ${pct(signalAccuracy.winRate)} |
 | Avg R:R | 1:${signalAccuracy.avgRR.toFixed(2)} |
-${buildPortfolioGreeksMarkdown(portfolioGreeks)}${buildOptionJournalMarkdown(optionJournal, optionLearnedWeights)}${buildIntrospectionMarkdown(introspection, autopilotActions)}${buildSourceQualityMarkdown(sourceQualityWeights)}${buildAutonomousDemoLoopMarkdown(autonomousDemoLoop)}`;
+${buildPortfolioGreeksMarkdown(portfolioGreeks)}${buildOptionJournalMarkdown(optionJournal, optionLearnedWeights)}${buildIntrospectionMarkdown(introspection, autopilotActions)}${buildSourceQualityMarkdown(sourceQualityWeights)}${buildAutonomousDemoLoopMarkdown(autonomousDemoLoop)}${buildAnalystMarkdown(analystPlan, analystReview)}`;
 }
 
 export interface ReportInput {
@@ -531,6 +591,14 @@ export interface ReportInput {
    * off, or the report is for a live book). DEMO ONLY.
    */
   autonomousDemoLoop?: AutonomousDemoLoopReport;
+  /**
+   * TRA-1006 — the analyst agent's persisted pre-market plan + post-market review
+   * for the day, read by the caller from `readAnalystPlan` / `readAnalystReview`.
+   * Optional ↔ no analyst section (the agent is off, or no artifact for the day).
+   * DEMO ONLY.
+   */
+  analystPlan?: AnalystPlan;
+  analystReview?: AnalystReview;
 }
 
 /**
@@ -547,7 +615,7 @@ export interface ReportInput {
 export function generateEodReport(input: ReportInput, asOfDate?: string): EodReport {
   const { state, allClosedPositions, closedOptions = [], dailySignals, signalTypeMap,
           optionJournal, optionLearnedWeights, introspection, autopilotActions,
-          sourceQualityWeights, autonomousDemoLoop } = input;
+          sourceQualityWeights, autonomousDemoLoop, analystPlan, analystReview } = input;
   const today = asOfDate ?? new Date().toLocaleDateString('en-CA', { timeZone: 'America/New_York' });
 
   // Closed trades for today only
@@ -675,6 +743,8 @@ export function generateEodReport(input: ReportInput, asOfDate?: string): EodRep
       autopilotActions,
       sourceQualityWeights,
       autonomousDemoLoop,
+      analystPlan,
+      analystReview,
     ),
   };
 }

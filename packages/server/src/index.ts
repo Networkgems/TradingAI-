@@ -30,6 +30,19 @@ import {
   type DemoBookEngine,
   type AutonomousDemoLoopDeps,
 } from './autonomous-demo-loop.js';
+// TRA-1006 — automated pre/post-market analyst agent. Tick fns are flag-checked
+// before any deps are built (zero cost while ENABLE_ANALYST_AGENT is off) and are
+// hooked onto the existing onPremarket / onArchive market-scheduler ticks.
+import {
+  isAnalystAgentEnabled,
+  analystEtDate,
+  readAnalystPlan,
+  readAnalystReview,
+} from './analyst-agent.js';
+import {
+  runAnalystPremarketTick,
+  runAnalystPostmarketTick,
+} from './analyst-scheduler.js';
 // TRA-995 — self-awareness introspection (per-strategy attribution + edge-decay)
 // folded from the same closed-trade journal that feeds the learned weights.
 import {
@@ -705,6 +718,24 @@ async function generateAndSaveReport(
   // drives every demo book), surfaced on each demo book's report for visibility.
   if (isAutonomousDemoLoopEnabled() && settings.mode === 'demo') {
     finalSnapshot.autonomousDemoLoop = buildAutonomousDemoLoopReport();
+  }
+  // TRA-1006 — fold the analyst agent's pre-market plan + post-market review into
+  // the EOD markdown (demo book only). Gated on ENABLE_ANALYST_AGENT; reads the
+  // persisted artifacts for the day (absent ↔ no section). Advisory surfacing only
+  // — emitted hypotheses still clear G0 + board ratification before any effect.
+  if (isAnalystAgentEnabled() && settings.mode === 'demo') {
+    try {
+      const analystDate = opts.asOfDate ?? analystEtDate(Date.now());
+      const analystPlan = await readAnalystPlan(analystDate);
+      if (analystPlan) finalSnapshot.analystPlan = analystPlan;
+      const analystReview = await readAnalystReview(analystDate);
+      if (analystReview) finalSnapshot.analystReview = analystReview;
+    } catch (err) {
+      log.warn('analyst EOD fold failed', {
+        username: ctx.username,
+        reason: err instanceof Error ? err.message : String(err),
+      });
+    }
   }
   let finalReport = generateEodReport(finalSnapshot, opts.asOfDate);
 
@@ -5927,6 +5958,14 @@ scheduler.start({
         reason: err instanceof Error ? err.message : String(err),
       }),
     );
+    // TRA-1006 — automated post-market analyst review: fold the day's demo
+    // journal + enqueue ≥1 hypothesis into the TRA-994 pipeline. No-op + zero
+    // cost while ENABLE_ANALYST_AGENT is off (flag checked before any deps).
+    await runAnalystPostmarketTick(Date.now()).catch(err =>
+      log.error('analyst post-market tick failed', {
+        reason: err instanceof Error ? err.message : String(err),
+      }),
+    );
   },
   // TRA-249-D — hourly funding accrual on open Coinbase INTX perps. Fires
   // at minute=0 every ET hour; per-user trackers no-op when no perps are
@@ -5960,6 +5999,14 @@ scheduler.start({
     // TRA-597 — refresh the macro/Fed economic calendar (FOMC + CPI/NFP/PCE)
     // pre-bell so daysToNextFOMC()/eventsNearDate() are current for the session.
     await runMacroRefresh();
+    // TRA-1006 — automated pre-market analyst plan: rank the watchlist (S/R +
+    // reversal + trend) and publish a ReviewBlock the demo loop consumes. No-op +
+    // zero cost while ENABLE_ANALYST_AGENT is off (flag checked before any deps).
+    await runAnalystPremarketTick(Date.now()).catch(err =>
+      log.error('analyst pre-market tick failed', {
+        reason: err instanceof Error ? err.message : String(err),
+      }),
+    );
   },
   // TRA-380 — 3:55 PM ET option-chain recorder. Captures one Tradier chain
   // snapshot per trading day into the persistent disk for the TRA-379
