@@ -1,4 +1,4 @@
-import { OrbStrategy, BbFadeStrategy, IchimokuStrategy, SupertrendConfluenceStrategy, confluenceSide, supertrend, reversalChecklist, atr, donchian, supportResistance, blackScholesDelta, daysToExpiration, selectRvLongCandidate, TradierOptionsClient, TradierOrderClient, TRADIER_REJECTED_STATUSES, evaluateSma200, SMA200_MIN_BARS, SMA200_DEBOUNCE_BARS, composeTechnicalSnapshot, resampleCandles, TF_BUCKET_MS, OptionsRiskBreaker, DEFAULT_OPTIONS_BREAKER_PARAMS } from '@trading-app/engine';
+import { OrbStrategy, BbFadeStrategy, IchimokuStrategy, SupertrendConfluenceStrategy, confluenceSide, supertrend, reversalChecklist, atr, donchian, supportResistance, blackScholesDelta, daysToExpiration, selectRvLongCandidate, selectShadowOptionSignal, TradierOptionsClient, TradierOrderClient, TRADIER_REJECTED_STATUSES, evaluateSma200, SMA200_MIN_BARS, SMA200_DEBOUNCE_BARS, composeTechnicalSnapshot, resampleCandles, TF_BUCKET_MS, OptionsRiskBreaker, DEFAULT_OPTIONS_BREAKER_PARAMS } from '@trading-app/engine';
 import type { StrategySelectorInput, ContractQuote, OptionTrend, RvLongTrendSide } from '@trading-app/engine';
 import type { TradierAccountBalance } from '@trading-app/engine';
 import { WATCHLIST, isLiquidSwingSymbol, checkEquitySwingClose, MANAGED_ACCOUNT_RATIO, MAX_CONSECUTIVE_LOSSES, DAILY_DRAWDOWN_HALT_PCT, OPTIONS_PER_TICKET_DOLLAR_FLOOR, OPTIONS_POSITION_CAP_RATIO, aliasWatchlistSymbol, isLiveTradierOptionsEnabled, isStockMarketOpen, perPositionCap, resolveAutoManageImportedTradierOptions, resolveDemoCostModel, resolveHoldLiveOptionsOvernight, resolveLiveTradeEquitiesTradier, resolveManagedAccountRatio, resolveMarketReviewGatesEnabled, resolveRiskPerTrade, resolveRvDtePrefs, resolveTradierOptionsCreds, validateBracket, DEFAULT_RV_DTE_MIN, DEFAULT_RV_DTE_MAX, DEFAULT_RV_DTE_TARGET, scoreNewsSentiment, aggregateSymbolSentiment, aggregateFedSentiment, aggregateStockTwitsSentiment, dedupeStockTwitsMessages, mapCuratedMessagesBySymbol, nameAliasesFor, evaluateEquityDcaAdd, evaluateOptionDcaAdd, CONVICTION_DCA, blendedAverage, positionRiskDollars, minutesToSessionClose, getEasternUtcOffset } from '@trading-app/shared';
@@ -2648,6 +2648,122 @@ export class SignalEngine {
               : null;
         const cheap = selectRvLongCandidate(result.candidates, { trendSide });
         if (!cheap) continue;
+
+        // TRA-1024 (TRA-1023 items 1–3) — IVR ceiling, high-IVR spread routing,
+        // and hard earnings gate for long premium. All gated behind the exec flag
+        // so prod behaviour is unchanged until QuantTrader signs off.
+        //
+        // Gate matrix:
+        //   IVR > 25  → bare long is contraindicated; attempt a defined-risk
+        //               spread via the Phase-A selector when Phase B is enabled,
+        //               then skip the bare long regardless.
+        //   IVR ≤ 25 (or honest-unknown null)
+        //             → bare long is permitted, BUT hard-abort when an earnings
+        //               event lands on or before the candidate's expiry (vol
+        //               crush / thesis-break risk).
+        //
+        // OI ≥ 250 and spread ≤ 10 % are already enforced by the scanner's
+        // DEFAULTS.minOpenInterest / DEFAULTS.maxSpreadPct on every chain row
+        // before candidates are produced; no redundant re-check needed here.
+        if (isOptionExecEnabled()) {
+          const asOf = Date.now();
+          // Full-chain snapshot — the scanner's 60 s warm cache makes this
+          // essentially free after the `scan()` call above on the same tick.
+          const snap = this.rvScanner
+            ? await this.rvScanner.getSelectorChain(sym, dtePrefs)
+            : null;
+          const atmIv = snap ? atmIvFromRows(snap.rows, snap.spot) : null;
+          const ivRank = atmIv != null ? ivRankSync(sym, atmIv, asOf) : null;
+
+          if (ivRank !== null && ivRank > 25) {
+            // Mid/high IVR — route to a defined-risk spread when Phase B is
+            // enabled and the gate matrix fires; otherwise stand down silently.
+            if (isOptionPhaseBEnabled() && snap && trendSeries && trendSeries.length > 0) {
+              const execTrend: OptionTrend =
+                trendDecision?.side === 'buy' ? 'up'
+                  : trendDecision?.side === 'sell' ? 'down' : 'range';
+              const execAtr = atr(trendSeries) ?? 0;
+              const execSr = supportResistance(trendSeries);
+              const execLastClose = trendSeries[trendSeries.length - 1]?.close ?? snap.spot;
+              const execChannel = donchian(trendSeries);
+              const execBreakout =
+                trendDecision != null && execChannel != null &&
+                ((trendDecision.side === 'buy' && execLastClose > execChannel.upper) ||
+                  (trendDecision.side === 'sell' && execLastClose < execChannel.lower));
+              const execDte = Math.round(daysToExpiration(snap.expiration, asOf));
+              const execEarnings = earningsInDaysSync(sym, asOf);
+              const execEarningsBeforeExpiry =
+                execEarnings != null && execEarnings >= 0 && execEarnings <= execDte;
+              // Map full chain rows to delta-enriched ContractQuote[]. Rows
+              // missing a valid two-sided quote or IV are skipped — the
+              // selector's liquidity gate rejects them anyway.
+              const tYears = Math.max(execDte, 0) / 365;
+              const execContracts: ContractQuote[] = [];
+              for (const r of snap.rows) {
+                const iv = r.smvVol ?? r.midIv;
+                const bid = r.bid ?? 0;
+                const ask = r.ask ?? 0;
+                if (!(bid > 0) || !(ask > 0) || ask < bid) continue;
+                if (typeof iv !== 'number' || !(iv > 0)) continue;
+                execContracts.push({
+                  optionSymbol: r.optionSymbol,
+                  optionType: r.optionType,
+                  strike: r.strike,
+                  delta: blackScholesDelta({
+                    spot: snap.spot,
+                    strike: r.strike,
+                    timeToExpiryYears: tYears,
+                    riskFreeRate: 0.045,
+                    volatility: iv,
+                    optionType: r.optionType,
+                  }),
+                  bid,
+                  ask,
+                  openInterest: r.openInterest ?? 0,
+                });
+              }
+              if (execContracts.length > 0) {
+                const selectorResult = selectShadowOptionSignal({
+                  symbol: sym,
+                  spot: snap.spot,
+                  ivRank,
+                  trend: execTrend,
+                  highConvictionBreakout: execBreakout,
+                  atr: execAtr,
+                  support: execSr.support?.level ?? null,
+                  resistance: execSr.resistance?.level ?? null,
+                  expiration: snap.expiration,
+                  daysToExpiry: execDte,
+                  contracts: execContracts,
+                  earningsBeforeExpiry: execEarningsBeforeExpiry,
+                  timestamp: asOf,
+                });
+                if (selectorResult.decision === 'signal') {
+                  const opened = this.optionsAccount.openDefinedRiskSpread(
+                    shadowSignalToSpreadParams(selectorResult.signal, snap.spot),
+                    this.mode,
+                  );
+                  if (opened) {
+                    log.info('RV spread opened via high-IVR routing (TRA-1024)', {
+                      sym,
+                      strategy: selectorResult.signal.strategy,
+                      ivRank: ivRank.toFixed(1),
+                    });
+                  }
+                }
+              }
+            }
+            continue; // Always skip the bare long when IVR > 25
+          }
+
+          // IVR ≤ 25 (or honest-unknown null) — bare long is permitted.
+          // Hard earnings-before-expiry gate: no long premium through an
+          // earnings event (vol crush + thesis-break risk).
+          const earningsDays = earningsInDaysSync(sym, asOf);
+          if (earningsDays != null && earningsDays >= 0 && earningsDays <= cheap.daysToExpiration) {
+            continue;
+          }
+        }
 
         const stopLoss = cheap.mark * 0.75;
         const takeProfit = cheap.mark * 1.5;
