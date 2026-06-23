@@ -1,4 +1,4 @@
-import { OrbStrategy, BbFadeStrategy, IchimokuStrategy, SupertrendConfluenceStrategy, confluenceSide, supertrend, reversalChecklist, atr, donchian, supportResistance, blackScholesDelta, daysToExpiration, selectRvLongCandidate, selectShadowOptionSignal, TradierOptionsClient, TradierOrderClient, TRADIER_REJECTED_STATUSES, evaluateSma200, SMA200_MIN_BARS, SMA200_DEBOUNCE_BARS, composeTechnicalSnapshot, resampleCandles, TF_BUCKET_MS, OptionsRiskBreaker, DEFAULT_OPTIONS_BREAKER_PARAMS } from '@trading-app/engine';
+import { OrbStrategy, BbFadeStrategy, IchimokuStrategy, SupertrendConfluenceStrategy, confluenceSide, supertrend, reversalChecklist, atr, donchian, supportResistance, blackScholesDelta, daysToExpiration, selectRvLongCandidate, selectShadowOptionSignal, emaPullbackTrigger, volumeConfirmedBreakout, TradierOptionsClient, TradierOrderClient, TRADIER_REJECTED_STATUSES, evaluateSma200, SMA200_MIN_BARS, SMA200_DEBOUNCE_BARS, composeTechnicalSnapshot, resampleCandles, TF_BUCKET_MS, OptionsRiskBreaker, DEFAULT_OPTIONS_BREAKER_PARAMS } from '@trading-app/engine';
 import type { StrategySelectorInput, ContractQuote, OptionTrend, RvLongTrendSide, ExitState } from '@trading-app/engine';
 import type { TradierAccountBalance } from '@trading-app/engine';
 import { WATCHLIST, isLiquidSwingSymbol, checkEquitySwingClose, MANAGED_ACCOUNT_RATIO, MAX_CONSECUTIVE_LOSSES, DAILY_DRAWDOWN_HALT_PCT, OPTIONS_PER_TICKET_DOLLAR_FLOOR, OPTIONS_POSITION_CAP_RATIO, aliasWatchlistSymbol, isLiveTradierOptionsEnabled, isStockMarketOpen, perPositionCap, resolveAutoManageImportedTradierOptions, resolveDemoCostModel, resolveHoldLiveOptionsOvernight, resolveLiveTradeEquitiesTradier, resolveManagedAccountRatio, resolveMarketReviewGatesEnabled, resolveRiskPerTrade, resolveRvDtePrefs, resolveTradierOptionsCreds, validateBracket, DEFAULT_RV_DTE_MIN, DEFAULT_RV_DTE_MAX, DEFAULT_RV_DTE_TARGET, scoreNewsSentiment, aggregateSymbolSentiment, aggregateFedSentiment, aggregateStockTwitsSentiment, dedupeStockTwitsMessages, mapCuratedMessagesBySymbol, nameAliasesFor, evaluateEquityDcaAdd, evaluateOptionDcaAdd, CONVICTION_DCA, blendedAverage, positionRiskDollars, minutesToSessionClose, getEasternUtcOffset } from '@trading-app/shared';
@@ -47,7 +47,7 @@ import {
   optionJournalToStrategyRows,
 } from './strategy-introspection.js';
 import { isOptionShadowEnabled, isOptionPhaseBEnabled, emitShadowOptionSignal, shadowSignalToSpreadParams, OPTION_SHADOW_EMERGENCY_OFF } from './option-shadow-ledger.js';
-import { isOptionExecEnabled } from './option-exec-flag.js';
+import { isOptionExecEnabled, isOptionEmaPullbackEnabled, isOptionVolumeBreakoutEnabled, resolveRvLongDteOverride } from './option-exec-flag.js';
 import { etDateString } from './scheduler.js';
 // TRA-995 (epic-C, self-regulation) — the standing risk autopilot. A pure
 // tighten-only decision module; the governor below is its mutation boundary and
@@ -2688,8 +2688,38 @@ export class SignalEngine {
             : trendDecision?.side === 'sell'
               ? 'put'
               : null;
-        const cheap = selectRvLongCandidate(result.candidates, { trendSide });
+        // TRA-1028 item 3 — DTE-window tunable. The engine selector defaults to
+        // the 30–45 swing window (RV_LONG_DTE_ENTRY_*); QuantTrader can widen it
+        // toward the playbook's 45–90 pullback window via env overrides without a
+        // code change. Absent/invalid overrides pass `undefined` and the 30/45
+        // default stands, so current behaviour is unchanged until tuned.
+        const dteOverride = resolveRvLongDteOverride();
+        const cheap = selectRvLongCandidate(result.candidates, {
+          trendSide,
+          dteEntryMin: dteOverride.min,
+          dteEntryMax: dteOverride.max,
+        });
         if (!cheap) continue;
+
+        // TRA-1028 item 1 — EMA-pullback (Trend-Pullback) entry archetype. When
+        // the sub-flag is on (exec flag must also be on), the bare RV long
+        // additionally requires a Trend-Pullback confirmation on the trend side:
+        // uptrend above the 21 EMA + pullback to the 9 EMA + bullish reversal
+        // candle (mirror inverse for puts), off the same cached 5m shadow series
+        // the trend confluence reads. OFF by default, so the baseline exec path
+        // is unchanged; recorded via the signal reason for the ledger readout.
+        let emaPullbackReason: string | null = null;
+        if (isOptionEmaPullbackEnabled()) {
+          if (!trendSeries || trendSeries.length === 0 || trendSide == null) continue;
+          const pullback = emaPullbackTrigger(trendSeries, trendSide);
+          if (!pullback.fired) continue;
+          emaPullbackReason = pullback.reason;
+          log.info('RV long admitted by EMA-pullback archetype (TRA-1028)', {
+            sym,
+            side: trendSide,
+            reason: pullback.reason,
+          });
+        }
 
         // TRA-1024 (TRA-1023 items 1–3) — IVR ceiling, high-IVR spread routing,
         // and hard earnings gate for long premium. All gated behind the exec flag
@@ -2727,11 +2757,19 @@ export class SignalEngine {
               const execAtr = atr(trendSeries) ?? 0;
               const execSr = supportResistance(trendSeries);
               const execLastClose = trendSeries[trendSeries.length - 1]?.close ?? snap.spot;
+              // TRA-1028 item 2 — volume-confirmed breakout. When the sub-flag
+              // is on, a high-conviction breakout requires a close beyond the
+              // Donchian channel AND above-average volume; otherwise it falls
+              // back to the volume-blind Donchian close (current behaviour).
               const execChannel = donchian(trendSeries);
-              const execBreakout =
+              const bareBreakout =
                 trendDecision != null && execChannel != null &&
                 ((trendDecision.side === 'buy' && execLastClose > execChannel.upper) ||
                   (trendDecision.side === 'sell' && execLastClose < execChannel.lower));
+              const execBreakout =
+                isOptionVolumeBreakoutEnabled() && trendSide != null
+                  ? volumeConfirmedBreakout(trendSeries, trendSide).fired
+                  : bareBreakout;
               const execDte = Math.round(daysToExpiration(snap.expiration, asOf));
               const execEarnings = earningsInDaysSync(sym, asOf);
               const execEarningsBeforeExpiry =
@@ -2830,7 +2868,9 @@ export class SignalEngine {
           ivFitted: cheap.ivFitted,
           ivUsed: cheap.ivUsed,
           delta: cheap.delta,
-          reason: cheap.reason,
+          // TRA-1028 item 1 — tag the archetype on the reason so the shadow/paper
+          // ledger readout can attribute fills to the EMA-pullback trigger.
+          reason: emaPullbackReason ? `${cheap.reason} | ema-pullback: ${emaPullbackReason}` : cheap.reason,
           // TRA-957/TRA-970 (Option A) — folded into the directional swing
           // sleeve: trend-gated, delta-targeted, 30–45 DTE. Tag it so the demo
           // book grades these fills against the swing spec unambiguously.

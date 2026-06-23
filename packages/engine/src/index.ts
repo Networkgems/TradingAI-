@@ -353,6 +353,19 @@ export type {
   RvLongSelectionOptions,
 } from './options/relative-value.js';
 export {
+  emaPullbackTrigger,
+  volumeConfirmedBreakout,
+  EMA_PULLBACK_DEFAULTS,
+  VOLUME_BREAKOUT_DEFAULTS,
+} from './options/swing-entries.js';
+export type {
+  SwingSide,
+  EmaPullbackOptions,
+  EmaPullbackResult,
+  VolumeBreakoutOptions,
+  VolumeBreakoutResult,
+} from './options/swing-entries.js';
+export {
   EarningsCalendarClient,
   parseFinnhubEarnings,
   daysUntil,

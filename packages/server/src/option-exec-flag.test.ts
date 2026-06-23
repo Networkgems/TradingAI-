@@ -1,0 +1,77 @@
+import { describe, it, expect } from 'vitest';
+import {
+  isOptionExecEnabled,
+  isOptionEmaPullbackEnabled,
+  isOptionVolumeBreakoutEnabled,
+  resolveRvLongDteOverride,
+  OPTION_EXEC_FLAG,
+  OPTION_EMA_PULLBACK_FLAG,
+  OPTION_VOLUME_BREAKOUT_FLAG,
+  OPTION_RV_LONG_DTE_MIN_VAR,
+  OPTION_RV_LONG_DTE_MAX_VAR,
+} from './option-exec-flag.js';
+
+const ON = '1';
+
+describe('isOptionExecEnabled', () => {
+  it('is off when unset and on for truthy values', () => {
+    expect(isOptionExecEnabled({})).toBe(false);
+    expect(isOptionExecEnabled({ [OPTION_EXEC_FLAG]: 'true' })).toBe(true);
+    expect(isOptionExecEnabled({ [OPTION_EXEC_FLAG]: 'off' })).toBe(false);
+  });
+});
+
+describe('TRA-1028 sub-flags require the exec flag too', () => {
+  it('EMA-pullback sub-flag is inert without the exec flag', () => {
+    expect(isOptionEmaPullbackEnabled({ [OPTION_EMA_PULLBACK_FLAG]: ON })).toBe(false);
+    expect(
+      isOptionEmaPullbackEnabled({ [OPTION_EXEC_FLAG]: ON, [OPTION_EMA_PULLBACK_FLAG]: ON }),
+    ).toBe(true);
+    // exec on but sub-flag off -> off
+    expect(isOptionEmaPullbackEnabled({ [OPTION_EXEC_FLAG]: ON })).toBe(false);
+  });
+
+  it('volume-breakout sub-flag is inert without the exec flag', () => {
+    expect(isOptionVolumeBreakoutEnabled({ [OPTION_VOLUME_BREAKOUT_FLAG]: ON })).toBe(false);
+    expect(
+      isOptionVolumeBreakoutEnabled({ [OPTION_EXEC_FLAG]: ON, [OPTION_VOLUME_BREAKOUT_FLAG]: ON }),
+    ).toBe(true);
+  });
+});
+
+describe('resolveRvLongDteOverride (item 3)', () => {
+  it('returns undefined bounds when unset (engine 30/45 default stands)', () => {
+    expect(resolveRvLongDteOverride({})).toEqual({ min: undefined, max: undefined });
+  });
+
+  it('parses positive integer overrides', () => {
+    expect(
+      resolveRvLongDteOverride({
+        [OPTION_RV_LONG_DTE_MIN_VAR]: '45',
+        [OPTION_RV_LONG_DTE_MAX_VAR]: '90',
+      }),
+    ).toEqual({ min: 45, max: 90 });
+  });
+
+  it('ignores non-positive / non-finite values', () => {
+    expect(
+      resolveRvLongDteOverride({ [OPTION_RV_LONG_DTE_MIN_VAR]: '0', [OPTION_RV_LONG_DTE_MAX_VAR]: 'abc' }),
+    ).toEqual({ min: undefined, max: undefined });
+  });
+
+  it('rejects an inverted pair as a unit (both fall back)', () => {
+    expect(
+      resolveRvLongDteOverride({
+        [OPTION_RV_LONG_DTE_MIN_VAR]: '90',
+        [OPTION_RV_LONG_DTE_MAX_VAR]: '45',
+      }),
+    ).toEqual({ min: undefined, max: undefined });
+  });
+
+  it('allows a one-sided override (min only)', () => {
+    expect(resolveRvLongDteOverride({ [OPTION_RV_LONG_DTE_MIN_VAR]: '45' })).toEqual({
+      min: 45,
+      max: undefined,
+    });
+  });
+});
