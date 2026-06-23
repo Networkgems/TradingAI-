@@ -8,6 +8,7 @@ import {
   requestsInWindow,
   canReuseCachedTradierBars,
   getTradierBarPullRateState,
+  chartQuoteFromResult,
 } from './yahoo-feed.js';
 
 const Q = (price: number) => ({ price, volume: 0, change: 0, changePct: 0 });
@@ -314,5 +315,57 @@ describe('getTradierBarPullRateState (TRA-739 bar-pull req/min meter)', () => {
     expect(state.windowSec).toBe(60);
     expect(typeof state.requestsLastMin).toBe('number');
     expect(state.requestsLastMin).toBeGreaterThanOrEqual(0);
+  });
+});
+
+// TRA-1035 — the keyless Yahoo chart-quote fallback. When the Yahoo quote
+// endpoint fails closed without a crumb but the chart endpoint still resolves
+// (the demo trading-server's egress), a quote is synthesised from the chart
+// result's `meta`, falling back to the latest non-null bar close.
+describe('chartQuoteFromResult (TRA-1035 keyless chart-quote)', () => {
+  it('builds a quote from meta.regularMarketPrice with change vs chartPreviousClose', () => {
+    const q = chartQuoteFromResult({
+      meta: { regularMarketPrice: 105, chartPreviousClose: 100, regularMarketVolume: 4200 },
+      quotes: [],
+    });
+    expect(q).not.toBeNull();
+    expect(q!.price).toBe(105);
+    expect(q!.volume).toBe(4200);
+    expect(q!.change).toBe(5);
+    expect(q!.changePct).toBeCloseTo(5, 6);
+  });
+
+  it('falls back to previousClose when chartPreviousClose is absent', () => {
+    const q = chartQuoteFromResult({ meta: { regularMarketPrice: 50, previousClose: 40 } });
+    expect(q!.change).toBe(10);
+    expect(q!.changePct).toBeCloseTo(25, 6);
+  });
+
+  it('uses the latest non-null bar close when meta has no live price', () => {
+    const q = chartQuoteFromResult({
+      meta: { previousClose: 9 },
+      quotes: [
+        { close: 8, volume: 1 },
+        { close: 10, volume: 7 },
+        { close: null, volume: null },
+      ],
+    });
+    expect(q!.price).toBe(10);
+    expect(q!.volume).toBe(7);
+    expect(q!.change).toBe(1);
+  });
+
+  it('reports zero change when no previous close is available', () => {
+    const q = chartQuoteFromResult({ meta: { regularMarketPrice: 12 } });
+    expect(q!.price).toBe(12);
+    expect(q!.change).toBe(0);
+    expect(q!.changePct).toBe(0);
+  });
+
+  it('returns null when no usable price exists (null result, no price, non-positive)', () => {
+    expect(chartQuoteFromResult(null)).toBeNull();
+    expect(chartQuoteFromResult(undefined)).toBeNull();
+    expect(chartQuoteFromResult({ meta: {}, quotes: [{ close: null, volume: null }] })).toBeNull();
+    expect(chartQuoteFromResult({ meta: { regularMarketPrice: 0 }, quotes: [{ close: 0 }] })).toBeNull();
   });
 });

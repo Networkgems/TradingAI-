@@ -34,10 +34,13 @@ export const CRYPTO_FEED_FAILOVER_ORDER = ['coinbase', 'yahoo', 'cmc'] as const;
 
 /**
  * Equity quote failover order. Tradier is primary (same venue as the live
- * equity broker); Yahoo and then Stooq (delayed, key-less CSV) backstop it.
+ * equity broker); the Yahoo quote endpoint is second; the Yahoo *chart*
+ * endpoint is third (TRA-1035 — keyless, and survives when the quote endpoint
+ * fails closed without a crumb while the chart endpoint still resolves); Stooq
+ * (delayed, key-less CSV) is the last-resort backstop.
  * Implemented by `yahoo-feed.ts` `fetchQuote` / `fetchQuotes`.
  */
-export const EQUITY_QUOTE_FAILOVER_ORDER = ['tradier', 'yahoo', 'stooq'] as const;
+export const EQUITY_QUOTE_FAILOVER_ORDER = ['tradier', 'yahoo', 'yahooChart', 'stooq'] as const;
 
 /**
  * Equity minute-bar (candle) failover order. Tradier timesales is primary,

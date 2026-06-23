@@ -998,13 +998,87 @@ export async function fetchMinuteBarsWithSource(
 type QuoteResult = { price: number; volume: number; change: number; changePct: number };
 
 /**
+ * TRA-1035 — pure: synthesise a spot quote from a Yahoo *chart* result's `meta`
+ * block (falling back to the most recent non-null bar close). Extracted so the
+ * field-precedence logic is unit-testable without a live feed.
+ *
+ * Yahoo's quote endpoint (`yf.quote` → v7 `/finance/quote`) requires an
+ * authenticated crumb and fails closed ("fetch failed") on some shared egress
+ * IPs (e.g. the demo trading-server), while the chart endpoint
+ * (`yf.chart` → v8 `/finance/chart`) needs no crumb and keeps working. The chart
+ * response's `meta` carries `regularMarketPrice` / `previousClose` /
+ * `regularMarketVolume`, so we can build a usable quote from the SAME working
+ * endpoint that already powers the minute-bar fallback — no API key or secret
+ * token required.
+ */
+export function chartQuoteFromResult(result: {
+  meta?: {
+    regularMarketPrice?: number;
+    chartPreviousClose?: number;
+    previousClose?: number;
+    regularMarketVolume?: number;
+  };
+  quotes?: ReadonlyArray<{ close?: number | null; volume?: number | null }>;
+} | null | undefined): QuoteResult | null {
+  if (!result) return null;
+  const meta = result.meta ?? {};
+  const finite = (n: unknown): n is number => typeof n === 'number' && Number.isFinite(n);
+
+  let price = finite(meta.regularMarketPrice) && meta.regularMarketPrice > 0 ? meta.regularMarketPrice : NaN;
+  let volume = finite(meta.regularMarketVolume) ? meta.regularMarketVolume : 0;
+
+  // Fall back to the latest non-null chart bar close when meta has no live price
+  // (can happen pre-open or for thin symbols).
+  if (!(Number.isFinite(price) && price > 0)) {
+    const bars = result.quotes ?? [];
+    for (let i = bars.length - 1; i >= 0; i--) {
+      const c = bars[i]?.close;
+      if (finite(c) && c > 0) {
+        price = c;
+        const v = bars[i]?.volume;
+        if (volume === 0 && finite(v)) volume = v;
+        break;
+      }
+    }
+  }
+  if (!(Number.isFinite(price) && price > 0)) return null;
+
+  const prevClose = finite(meta.chartPreviousClose) && meta.chartPreviousClose > 0
+    ? meta.chartPreviousClose
+    : (finite(meta.previousClose) && meta.previousClose > 0 ? meta.previousClose : NaN);
+  const change = Number.isFinite(prevClose) ? price - prevClose : 0;
+  const changePct = Number.isFinite(prevClose) && prevClose > 0 ? (change / prevClose) * 100 : 0;
+  return { price, volume, change, changePct };
+}
+
+/**
+ * TRA-1035 — derive a live(-ish) quote for a symbol from Yahoo's chart endpoint.
+ * This is the keyless source that keeps the equity feed (and the demo swing
+ * book) alive when Tradier is unconfigured and the Yahoo quote endpoint is dark.
+ * Honors the shared Yahoo rate-limit breaker via {@link withRetry}.
+ */
+export async function fetchYahooChartQuote(symbol: string): Promise<QuoteResult | null> {
+  const now = new Date();
+  // A 2-day window at 1-minute granularity yields a current `meta.regularMarketPrice`
+  // plus recent bars to back-fill from; short enough to keep the payload small.
+  const from = new Date(now.getTime() - 2 * 24 * 60 * 60 * 1000);
+  const result = await withRetry(
+    () => yf.chart(symbol, { period1: from, period2: now, interval: '1m' }),
+    `chartQuote(${symbol})`,
+  );
+  return chartQuoteFromResult(result as Parameters<typeof chartQuoteFromResult>[0]);
+}
+
+/**
  * Fetch the current quote for a single symbol.
  *
- * Ordered failover (TRA-418) — `tradier → yahoo → stooq` (see
- * `EQUITY_QUOTE_FAILOVER_ORDER` in `feed-freshness.ts`). Tradier is the primary
- * source; when its breaker is open or it returns no quote we cascade through
- * Yahoo and then Stooq. Stooq stays last-resort so the watchlist always has
- * *something* to render even when both primary and Yahoo are unreachable.
+ * Ordered failover (TRA-418, TRA-1035) — `tradier → yahoo → yahooChart → stooq`
+ * (see `EQUITY_QUOTE_FAILOVER_ORDER` in `feed-freshness.ts`). Tradier is the
+ * primary source; when its breaker is open or it returns no quote we cascade
+ * through the Yahoo quote endpoint, then the Yahoo *chart* endpoint (keyless,
+ * survives a crumb-less quote-endpoint outage), then Stooq. Stooq stays
+ * last-resort so the watchlist always has *something* to render even when every
+ * Yahoo path is unreachable.
  */
 export async function fetchQuote(symbol: string): Promise<QuoteResult | null> {
   // Primary: Tradier. (Single-symbol path — `fetchQuotes` uses the multi-symbol
@@ -1033,9 +1107,18 @@ export async function fetchQuote(symbol: string): Promise<QuoteResult | null> {
       changePct: q.regularMarketChangePercent ?? 0,
     };
   }
-  if (q) console.warn(`[yahoo-feed] quote(${symbol}) returned no regularMarketPrice — trying Stooq fallback`);
+  if (q) console.warn(`[yahoo-feed] quote(${symbol}) returned no regularMarketPrice — trying Yahoo chart-quote fallback`);
 
-  // Fallback 2: Stooq (delayed but free, no API key).
+  // Fallback 2: Yahoo chart endpoint (TRA-1035). Keyless, and survives when the
+  // quote endpoint fails closed without a crumb while the chart endpoint still
+  // resolves (the demo trading-server's egress).
+  const chartQuote = await fetchYahooChartQuote(symbol);
+  if (chartQuote) {
+    console.info(`[yahoo-feed] ${symbol}: served from Yahoo chart-quote fallback`);
+    return chartQuote;
+  }
+
+  // Fallback 3: Stooq (delayed but free, no API key).
   const stooq = await fetchStooqQuote(symbol);
   if (stooq) {
     console.info(`[yahoo-feed] ${symbol}: served from Stooq fallback (delayed)`);
@@ -1156,6 +1239,11 @@ async function fetchSecondaryQuote(symbol: string): Promise<QuoteResult | null> 
       changePct: q.regularMarketChangePercent ?? 0,
     };
   }
+  // TRA-1035 — keyless Yahoo chart-quote before Stooq, mirroring fetchQuote's
+  // cascade so the multi-symbol watchlist path also recovers when the quote
+  // endpoint is crumb-broken but the chart endpoint works.
+  const chartQuote = await fetchYahooChartQuote(symbol);
+  if (chartQuote) return chartQuote;
   const stooq = await fetchStooqQuote(symbol);
   if (stooq) return stooq;
   return null;
@@ -1225,6 +1313,19 @@ export async function testYahooFinance(): Promise<{ symbol: string; price: numbe
   const q = await withTimeout(yf.quote('AAPL'), YF_CALL_TIMEOUT_MS, 'quote(AAPL) health-check');
   if (q.regularMarketPrice == null) throw new Error('regularMarketPrice is null');
   return { symbol: 'AAPL', price: q.regularMarketPrice };
+}
+
+/**
+ * TRA-1035 — test the keyless Yahoo *chart-quote* path (the failover that keeps
+ * stocks live when the Yahoo quote endpoint is crumb-broken). Surfaced as its
+ * own `/api/health/quotes` probe and counted toward `stocksOk`, so the gauge
+ * reports the truth (the equity engine can still price the universe) instead of
+ * a false outage when only the quote endpoint is down.
+ */
+export async function testYahooChartQuote(): Promise<{ symbol: string; price: number }> {
+  const q = await fetchYahooChartQuote('AAPL');
+  if (!q) throw new Error('Yahoo chart-quote returned no price for AAPL');
+  return { symbol: 'AAPL', price: q.price };
 }
 
 /** Test Tradier connectivity — returns a quote or throws / returns null when unconfigured. */

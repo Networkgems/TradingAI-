@@ -5556,6 +5556,7 @@ app.get('/api/health/quotes', async (_req, res) => {
 async function buildQuotesHealthPayload(): Promise<Record<string, unknown>> {
   const {
     testYahooFinance,
+    testYahooChartQuote,
     testTradier,
     testTwelveData,
     isYahooBreakerOpen,
@@ -5587,7 +5588,7 @@ async function buildQuotesHealthPayload(): Promise<Record<string, unknown>> {
   //   • chartFallback (TRA-191 minute-bar path) and cryptoDailyBars (TRA-705
   //     daily OHLC candle cascade) preserve their full diagnostic shapes.
   const [
-    tradier, coinbase, coinbaseAdvancedTrade, coinGecko, yahooFinance, twelveData,
+    tradier, coinbase, coinbaseAdvancedTrade, coinGecko, yahooFinance, yahooChartQuote, twelveData,
     coinMarketCap, chartFallback, cryptoDailyBars,
   ] = await Promise.all([
     runQuotesProbe(async () => (await testTradier()) ?? { skipped: 'TRADIER_*_API_TOKEN not set' }),
@@ -5595,6 +5596,7 @@ async function buildQuotesHealthPayload(): Promise<Record<string, unknown>> {
     runQuotesProbe(() => testCoinbaseAdvancedTrade()),
     runQuotesProbe(() => testCoinGecko()),
     runQuotesProbe(() => testYahooFinance()),
+    runQuotesProbe(() => testYahooChartQuote()),
     runQuotesProbe(async () => (await testTwelveData()) ?? { skipped: 'TWELVE_DATA_API_KEY not set' }),
     runQuotesProbe(async () => (await testCoinMarketCap()) ?? { skipped: 'CMC_API_KEY not set' }),
     runQuotesProbe(async () => {
@@ -5623,6 +5625,7 @@ async function buildQuotesHealthPayload(): Promise<Record<string, unknown>> {
   results['coinbaseAdvancedTrade'] = coinbaseAdvancedTrade;
   results['coinGecko'] = coinGecko;
   results['yahooFinance'] = yahooFinance;
+  results['yahooChartQuote'] = yahooChartQuote;
   results['twelveData'] = twelveData;
   results['coinMarketCap'] = coinMarketCap;
   results['chartFallback'] = chartFallback;
@@ -5669,7 +5672,13 @@ async function buildQuotesHealthPayload(): Promise<Record<string, unknown>> {
   // truth (engine can trade) rather than a false outage (quote endpoint down).
   const dailyBarsResult = results['cryptoDailyBars'] as { bars?: number } | undefined;
   const dailyBarsOk = typeof dailyBarsResult?.bars === 'number' && dailyBarsResult.bars > 0;
-  const stocksOk = ok('tradier') || ok('yahooFinance');
+  // TRA-1035 — `yahooChartQuote` is the keyless chart-endpoint quote path. It
+  // counts toward `stocksOk` because the equity engine prices the universe
+  // through the same `fetchQuote`/`fetchQuotes` cascade (tradier → yahoo quote →
+  // yahoo chart → stooq): when only the Yahoo *quote* endpoint is crumb-broken,
+  // the chart path still serves live prices, so the gauge must report stocks as
+  // up rather than a false outage.
+  const stocksOk = ok('tradier') || ok('yahooFinance') || ok('yahooChartQuote');
   // TRA-331 / TRA-705 — Coinbase is primary for crypto; YF/CMC are fallbacks
   // only. `coinbaseAdvancedTrade` (keyless `api.coinbase.com`) is the engine's
   // real primary and the one source that resolves from the Render egress IP, so

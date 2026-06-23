@@ -100,8 +100,8 @@ describe('feed failover order constants (TRA-418)', () => {
     expect(CRYPTO_FEED_FAILOVER_ORDER).toEqual(['coinbase', 'yahoo', 'cmc']);
   });
 
-  it('equity quotes fail over tradier → yahoo → stooq', () => {
-    expect(EQUITY_QUOTE_FAILOVER_ORDER).toEqual(['tradier', 'yahoo', 'stooq']);
+  it('equity quotes fail over tradier → yahoo → yahooChart → stooq', () => {
+    expect(EQUITY_QUOTE_FAILOVER_ORDER).toEqual(['tradier', 'yahoo', 'yahooChart', 'stooq']);
   });
 
   it('equity candles fail over tradier → yahoo → twelvedata (no stooq — EOD only)', () => {
