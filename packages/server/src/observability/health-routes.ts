@@ -20,6 +20,11 @@ import {
   OPTION_SHADOW_EMERGENCY_OFF,
 } from '../option-shadow-ledger.js';
 import {
+  isOptionExecEnabled,
+  isOptionEmaPullbackEnabled,
+  isOptionVolumeBreakoutEnabled,
+} from '../option-exec-flag.js';
+import {
   listOptionTradeJournal,
   summarizeOptionTradeJournal,
   isOptionTradeJournalEnabled,
@@ -442,6 +447,22 @@ export interface OptionsPipelineReport {
    * scanner configured (chains loading) — `rvScannerConfigured` above.
    */
   phaseBPaperExecutionEnabled: boolean;
+  /**
+   * TRA-1032 (TRA-1029 Step 1) — true when `ENABLE_OPTION_EXEC_SELECTOR` is on,
+   * i.e. the disciplined selection-quality / IVR-ceiling / spread-routing /
+   * structure-exit logic (TRA-1023/1024/1025) is allowed to influence the
+   * EXECUTING options path. This is the flag the forward-validation gate flips on
+   * a demo book; surfacing it here is what makes the flip verifiable from the
+   * unauthenticated probe (Step 4's "confirm exec selector reflected"). NOTE: the
+   * flag is read from `process.env` (process-global) — it cannot be scoped to a
+   * single demo engine; on this single-service deploy it arms all demo engines at
+   * once. Live-capital promotion stays gated on TRA-382 regardless of this flag.
+   * `optionExecEmaPullbackEnabled` / `optionExecVolumeBreakoutEnabled` are the
+   * TRA-1028 sub-flags, each effective only when this parent flag is also on.
+   */
+  optionExecSelectorEnabled: boolean;
+  optionExecEmaPullbackEnabled: boolean;
+  optionExecVolumeBreakoutEnabled: boolean;
   demoEngineCount: number;
   engines: OptionsPipelineEngineView[];
 }
@@ -503,6 +524,11 @@ export function summarizeOptionsPipeline(
     // (selector pass must run); Phase-B promotes its output to paper fills.
     shadowSelectorEnabled: !OPTION_SHADOW_EMERGENCY_OFF && isOptionShadowEnabled(),
     phaseBPaperExecutionEnabled: isOptionPhaseBEnabled(),
+    // TRA-1032 — surface the executing-path selector gate (+ TRA-1028 sub-flags)
+    // so the forward-validation flip is verifiable from the unauthenticated probe.
+    optionExecSelectorEnabled: isOptionExecEnabled(),
+    optionExecEmaPullbackEnabled: isOptionEmaPullbackEnabled(),
+    optionExecVolumeBreakoutEnabled: isOptionVolumeBreakoutEnabled(),
     demoEngineCount: engines.length,
     engines,
   };

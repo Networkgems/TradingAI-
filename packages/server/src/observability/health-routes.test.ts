@@ -491,6 +491,12 @@ describe('TRA-895 options-pipeline probe', () => {
     // TRA-895 — AI Options Ideas generator is un-gated (seeds near-ATM anchors
     // on calm days) so the demo watcher can confirm the ungated build is live.
     expect(report.aiIdeasGeneratorUngated).toBe(true);
+    // TRA-1032 — exec-selector gate (+ TRA-1028 sub-flags) is surfaced so the
+    // forward-validation flip is verifiable from the probe. Off by default in the
+    // unit env, mirroring prod until the flag is set on the demo deploy.
+    expect(report.optionExecSelectorEnabled).toBe(false);
+    expect(report.optionExecEmaPullbackEnabled).toBe(false);
+    expect(report.optionExecVolumeBreakoutEnabled).toBe(false);
   });
 
   it('names the first failing gate so "no option signals" is diagnosable', () => {
