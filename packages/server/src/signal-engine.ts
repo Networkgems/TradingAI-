@@ -1,4 +1,4 @@
-import { OrbStrategy, BbFadeStrategy, IchimokuStrategy, SupertrendConfluenceStrategy, confluenceSide, supertrend, reversalChecklist, atr, donchian, supportResistance, blackScholesDelta, daysToExpiration, selectRvLongCandidate, TradierOptionsClient, TradierOrderClient, TRADIER_REJECTED_STATUSES, evaluateSma200, SMA200_MIN_BARS, SMA200_DEBOUNCE_BARS, composeTechnicalSnapshot, resampleCandles, TF_BUCKET_MS } from '@trading-app/engine';
+import { OrbStrategy, BbFadeStrategy, IchimokuStrategy, SupertrendConfluenceStrategy, confluenceSide, supertrend, reversalChecklist, atr, donchian, supportResistance, blackScholesDelta, daysToExpiration, selectRvLongCandidate, TradierOptionsClient, TradierOrderClient, TRADIER_REJECTED_STATUSES, evaluateSma200, SMA200_MIN_BARS, SMA200_DEBOUNCE_BARS, composeTechnicalSnapshot, resampleCandles, TF_BUCKET_MS, OptionsRiskBreaker, DEFAULT_OPTIONS_BREAKER_PARAMS } from '@trading-app/engine';
 import type { StrategySelectorInput, ContractQuote, OptionTrend, RvLongTrendSide } from '@trading-app/engine';
 import type { TradierAccountBalance } from '@trading-app/engine';
 import { WATCHLIST, isLiquidSwingSymbol, checkEquitySwingClose, MANAGED_ACCOUNT_RATIO, MAX_CONSECUTIVE_LOSSES, DAILY_DRAWDOWN_HALT_PCT, OPTIONS_PER_TICKET_DOLLAR_FLOOR, OPTIONS_POSITION_CAP_RATIO, aliasWatchlistSymbol, isLiveTradierOptionsEnabled, isStockMarketOpen, perPositionCap, resolveAutoManageImportedTradierOptions, resolveDemoCostModel, resolveHoldLiveOptionsOvernight, resolveLiveTradeEquitiesTradier, resolveManagedAccountRatio, resolveMarketReviewGatesEnabled, resolveRiskPerTrade, resolveRvDtePrefs, resolveTradierOptionsCreds, validateBracket, DEFAULT_RV_DTE_MIN, DEFAULT_RV_DTE_MAX, DEFAULT_RV_DTE_TARGET, scoreNewsSentiment, aggregateSymbolSentiment, aggregateFedSentiment, aggregateStockTwitsSentiment, dedupeStockTwitsMessages, mapCuratedMessagesBySymbol, nameAliasesFor, evaluateEquityDcaAdd, evaluateOptionDcaAdd, CONVICTION_DCA, blendedAverage, positionRiskDollars, minutesToSessionClose, getEasternUtcOffset } from '@trading-app/shared';
@@ -47,6 +47,7 @@ import {
   optionJournalToStrategyRows,
 } from './strategy-introspection.js';
 import { isOptionShadowEnabled, isOptionPhaseBEnabled, emitShadowOptionSignal, shadowSignalToSpreadParams, OPTION_SHADOW_EMERGENCY_OFF } from './option-shadow-ledger.js';
+import { isOptionExecEnabled } from './option-exec-flag.js';
 import { etDateString } from './scheduler.js';
 // TRA-995 (epic-C, self-regulation) — the standing risk autopilot. A pure
 // tighten-only decision module; the governor below is its mutation boundary and
@@ -753,6 +754,21 @@ export class SignalEngine {
   private tradierEnv: TradierEnv = 'sandbox';
   private readonly riskGovernor = new DailyRiskGovernor();
   /**
+   * TRA-1023 (TRA-1022 audit, work-item 5) — options-sleeve circuit-breaker,
+   * decoupled from the equity {@link riskGovernor}. Option closes feed it via
+   * {@link recordTrade}-adjacent wiring at the options-exit site; the
+   * option-open gate ({@link runRelativeValueScan}) consults {@link isHalted}.
+   * Rolls on the SAME ET calendar day as the equity governor (`etDateString`).
+   * Recording is always on (observational); halt ENFORCEMENT on the open path is
+   * gated behind {@link isOptionExecEnabled} so prod behaviour is unchanged until
+   * QuantTrader signs off (TRA-1023 acceptance).
+   */
+  private readonly optionsBreaker = new OptionsRiskBreaker(
+    DEFAULT_OPTIONS_BREAKER_PARAMS,
+    () => new Date(),
+    (d) => etDateString(d),
+  );
+  /**
    * TRA-563 — owning username for alert routing. Set by the per-user context
    * after construction via {@link setAlertUsername}. When unset (e.g. a bare
    * engine in a unit test) every alert hook is a no-op, so the engine has no
@@ -1092,6 +1108,9 @@ export class SignalEngine {
     // TRA-563 — bridge the risk-governor circuit-breaker transition to a
     // risk_halt alert. Fire-and-forget; never blocks the governor.
     this.riskGovernor.setHaltListener((reason) => this.emitRiskHaltAlert(reason));
+    // TRA-1023 — same bridge for the options-sleeve breaker so a sleeve halt
+    // (cumulative −2R / −5% sleeve drawdown) surfaces a risk_halt alert too.
+    this.optionsBreaker.setHaltListener((reason) => this.emitRiskHaltAlert(reason));
     // Demo state is always loaded internally so a live → demo switch can
     // restore positions, equity, and dailyPnl without rebasing to the default
     // starting balance. Live mode masks this state via getState().
@@ -1835,7 +1854,23 @@ export class SignalEngine {
         this.optionsAccount.getState().optionsPnl,
       );
       // TRA-563 — exit alert per closed option contract.
-      for (const opt of optsClosed) this.emitOptionExitAlert(opt);
+      // TRA-1023 (work-item 5) — feed each realized close into the options-sleeve
+      // breaker so consecutive/aggregate option losses can halt the OPTIONS sleeve
+      // independently of the equity governor. Recording is unconditional
+      // (observational); the breaker's halt only affects the open path when
+      // `isOptionExecEnabled()` is on. `riskUsd` is the position's defined risk:
+      // a spread's `maxLossUsd`, else the long leg's premium-at-risk. The
+      // drawdown denominator is the demo book equity the paper options account
+      // sizes against (no separate sleeve-equity field exists).
+      const sleeveEquity = this.account.getState().totalEquity;
+      for (const opt of optsClosed) {
+        this.emitOptionExitAlert(opt);
+        const riskUsd =
+          typeof opt.maxLossUsd === 'number' && opt.maxLossUsd > 0
+            ? opt.maxLossUsd
+            : (opt.premiumPaid ?? 0) * (opt.contracts ?? 0) * 100;
+        this.optionsBreaker.recordClose({ pnl: opt.pnl ?? 0, riskUsd }, sleeveEquity);
+      }
     }
 
     // TRA-154: tag symbols that have an open position or a recent signal as
@@ -2568,6 +2603,14 @@ export class SignalEngine {
    */
   private async runRelativeValueScan(activeSymbols: string[]): Promise<void> {
     if (!this.rvScanner) return;
+
+    // TRA-1023 (work-item 5) — options-sleeve breaker gate. When the execution
+    // flag is on and the sleeve has tripped its cumulative-R / daily-drawdown
+    // limit for the day, open NO new option tickets (exits still run — the
+    // breaker only gates new entries, like the equity governor). Gated behind
+    // `isOptionExecEnabled()` so prod behaviour is unchanged until QuantTrader
+    // signs off; the breaker still RECORDS closes regardless (see the exit site).
+    if (isOptionExecEnabled() && this.optionsBreaker.isHalted()) return;
 
     // TRA-373 — per-user DTE window overrides the shared scanner singleton's
     // defaults on every call so a settings edit takes effect on the next
@@ -4701,6 +4744,21 @@ export class SignalEngine {
       this.account.getState().openPositions.find(p => p.id === positionId);
     if (!open) return { allowed: true };
     return checkEquitySwingClose(open.openedAt, now);
+  }
+
+  /**
+   * TRA-1023 (work-item 5) — options-sleeve breaker diagnostics (halt state,
+   * cumulative R, sleeve daily P&L). Decoupled from {@link isKillSwitchEngaged}
+   * and the equity governor's halt. Read by the options-pipeline health probe /
+   * a follow-up dashboard so the sleeve halt is observable independently.
+   */
+  getOptionsBreakerSnapshot(): ReturnType<OptionsRiskBreaker['snapshot']> {
+    return this.optionsBreaker.snapshot();
+  }
+
+  /** TRA-1023 — operator reset of the options-sleeve breaker for the current day. */
+  resetOptionsBreaker(): void {
+    this.optionsBreaker.reset();
   }
 
   manualClosePosition(positionId: string, currentPrice: number): Position | null {

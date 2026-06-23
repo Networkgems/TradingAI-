@@ -291,6 +291,15 @@ export {
   isLiquid,
   DEFAULT_SELECTOR_PARAMS,
 } from './options/strategy-selector.js';
+export {
+  OptionsRiskBreaker,
+  DEFAULT_OPTIONS_BREAKER_PARAMS,
+} from './options/options-risk-breaker.js';
+export type {
+  OptionsBreakerParams,
+  OptionCloseRecord,
+  OptionsBreakerSnapshot,
+} from './options/options-risk-breaker.js';
 export type {
   OptionTrend,
   OptionStrategyKind,
