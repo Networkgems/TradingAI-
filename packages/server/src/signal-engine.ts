@@ -1,5 +1,5 @@
 import { OrbStrategy, BbFadeStrategy, IchimokuStrategy, SupertrendConfluenceStrategy, confluenceSide, supertrend, reversalChecklist, atr, donchian, supportResistance, blackScholesDelta, daysToExpiration, selectRvLongCandidate, selectShadowOptionSignal, TradierOptionsClient, TradierOrderClient, TRADIER_REJECTED_STATUSES, evaluateSma200, SMA200_MIN_BARS, SMA200_DEBOUNCE_BARS, composeTechnicalSnapshot, resampleCandles, TF_BUCKET_MS, OptionsRiskBreaker, DEFAULT_OPTIONS_BREAKER_PARAMS } from '@trading-app/engine';
-import type { StrategySelectorInput, ContractQuote, OptionTrend, RvLongTrendSide } from '@trading-app/engine';
+import type { StrategySelectorInput, ContractQuote, OptionTrend, RvLongTrendSide, ExitState } from '@trading-app/engine';
 import type { TradierAccountBalance } from '@trading-app/engine';
 import { WATCHLIST, isLiquidSwingSymbol, checkEquitySwingClose, MANAGED_ACCOUNT_RATIO, MAX_CONSECUTIVE_LOSSES, DAILY_DRAWDOWN_HALT_PCT, OPTIONS_PER_TICKET_DOLLAR_FLOOR, OPTIONS_POSITION_CAP_RATIO, aliasWatchlistSymbol, isLiveTradierOptionsEnabled, isStockMarketOpen, perPositionCap, resolveAutoManageImportedTradierOptions, resolveDemoCostModel, resolveHoldLiveOptionsOvernight, resolveLiveTradeEquitiesTradier, resolveManagedAccountRatio, resolveMarketReviewGatesEnabled, resolveRiskPerTrade, resolveRvDtePrefs, resolveTradierOptionsCreds, validateBracket, DEFAULT_RV_DTE_MIN, DEFAULT_RV_DTE_MAX, DEFAULT_RV_DTE_TARGET, scoreNewsSentiment, aggregateSymbolSentiment, aggregateFedSentiment, aggregateStockTwitsSentiment, dedupeStockTwitsMessages, mapCuratedMessagesBySymbol, nameAliasesFor, evaluateEquityDcaAdd, evaluateOptionDcaAdd, CONVICTION_DCA, blendedAverage, positionRiskDollars, minutesToSessionClose, getEasternUtcOffset } from '@trading-app/shared';
 import type { TradeSignal, RelativeValueSignal, Sma200Signal, Candle, OptionsAccountState, SignalType, Position, OptionPosition, AccountMode, AccountSettings, AccountState, NewsItem, SymbolSentiment, SocialSentiment, StockTwitsMessage, TechnicalSignalSnapshot, TradierEnv, MarketReview, MarketReviewGates, EngineMarketReviewState, GatedStrategyNote, AgentRecommendation, TradeProposal, AgentOrderAudit, GuardrailVerdict } from '@trading-app/shared';
@@ -1831,6 +1831,47 @@ export class SignalEngine {
     // 1,476 rejected/9 filled history), and the user's directive is to defer the
     // close/hold/DCA decision to the next regular session. Demo (paper) is left
     // simulating so the forward-test book is unaffected.
+    // TRA-1025 (TRA-1023 item 4) — build per-position ExitState for single-leg
+    // RV positions when the exec flag is on. The options account uses this to
+    // fire structure-aware exits (supertrend-flip / MA20-close-through /
+    // time-stop) before the hard SL backstop fires. Only built when the flag is
+    // on; undefined → options-account skips the structural path entirely so
+    // prod behaviour is unchanged until QuantTrader signs off.
+    let rvStructuralExitStates: Map<string, ExitState> | undefined;
+    if (isOptionExecEnabled()) {
+      const openRvPositions = this.optionsAccount.getState().openOptions.filter(
+        (p) => p.signalType === 'relative_value' && !p.legs && (p.mode ?? 'demo') === this.mode,
+      );
+      if (openRvPositions.length > 0) {
+        const stateMap = new Map<string, ExitState>();
+        for (const opt of openRvPositions) {
+          const series = this.shadowCandleCache.get(opt.symbol);
+          if (!series || series.length < 5) continue;
+          const stBars = supertrend(series);
+          const lastSt = [...stBars].reverse().find((b): b is NonNullable<(typeof stBars)[0]> => b != null);
+          if (!lastSt) continue;
+          const lastCandle = series[series.length - 1];
+          const ma20Window = series.slice(-20);
+          const ma20 = ma20Window.reduce((s, c) => s + c.close, 0) / ma20Window.length;
+          // 5-minute bars — approximate bar count from elapsed wall-clock time.
+          const barsHeld = Math.floor((Date.now() - opt.openedAt) / (5 * 60_000));
+          // Had follow-through if the premium has peaked >5% above entry.
+          const hadFollowThrough = opt.peakPremium > opt.premiumPaid * 1.05;
+          stateMap.set(opt.id, {
+            side: 'buy',
+            supertrendDirection: lastSt.direction,
+            underlyingClose: lastCandle.close,
+            ma20,
+            entryPremium: opt.premiumPaid,
+            currentPremium: opt.currentPremium,
+            barsHeld,
+            hadFollowThrough,
+          });
+        }
+        if (stateMap.size > 0) rvStructuralExitStates = stateMap;
+      }
+    }
+
     const optionsExitsActive = this.mode === 'demo' || isStockMarketOpen();
     const optsClosed = optionsExitsActive
       ? this.optionsAccount.checkExits(
@@ -1838,6 +1879,7 @@ export class SignalEngine {
           optionMarks,
           this.mode,
           { waitAndHold: liveOptionsMirroring },
+          rvStructuralExitStates,
         )
       : [];
     if (liveOptionsMirroring && optsClosed.length > 0) {

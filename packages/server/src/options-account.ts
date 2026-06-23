@@ -1,6 +1,6 @@
 import { randomUUID } from 'crypto';
-import type { TradierOpenOptionPosition } from '@trading-app/engine';
-import { evaluateMultiLegPreTrade, DEFAULT_MAX_LOSS_PCT_CAP } from '@trading-app/engine';
+import type { TradierOpenOptionPosition, ExitState } from '@trading-app/engine';
+import { evaluateMultiLegPreTrade, DEFAULT_MAX_LOSS_PCT_CAP, evaluateExit, DEFAULT_EXIT_PARAMS } from '@trading-app/engine';
 import type {
   AccountMode,
   TradeSignal,
@@ -1627,6 +1627,15 @@ export class PaperOptionsAccount {
      * callers should not push these into `closedOptions`.
      */
     options: { waitAndHold?: boolean } = {},
+    /**
+     * TRA-1025 (TRA-1023 item 4) — per-position {@link ExitState} for single-leg
+     * RV options, keyed by `position.id`. When present and the position matches
+     * (single-leg RV, exec flag on in the caller), structural exits
+     * (supertrend-flip / MA20-close-through / time-stop) fire BEFORE the hard
+     * `stopLossPremium` backstop. The backstop still runs if structural exits
+     * produce no trigger. Absent → legacy behaviour unchanged.
+     */
+    structuralExitStates?: Map<string, ExitState>,
   ): OptionPosition[] {
     const closed: OptionPosition[] = [];
     const waitAndHold = options.waitAndHold === true;
@@ -1792,6 +1801,58 @@ export class PaperOptionsAccount {
         && toDateKey(opt.openedAt) === toDateKey(Date.now())
       ) {
         continue;
+      }
+
+      // TRA-1025 (TRA-1023 item 4) — structure-aware exits for single-leg RV
+      // positions. Fires BEFORE the hard SL backstop below so a supertrend-flip,
+      // MA20-close-through, or time-stop closes the position at the current mark
+      // when the thesis breaks — even while the hard SL hasn't been reached.
+      // The hard stopLossPremium is retained as a final net for gap-downs and
+      // cold-series cases (structuralExitStates absent or entry missing).
+      if (!opt.legs && opt.signalType === 'relative_value' && structuralExitStates) {
+        const exitState = structuralExitStates.get(opt.id);
+        if (exitState) {
+          const reason = evaluateExit(
+            { ...exitState, currentPremium: mark, entryPremium: opt.premiumPaid },
+            DEFAULT_EXIT_PARAMS,
+          );
+          if (reason === 'supertrend_flip' || reason === 'ma20_close_through' || reason === 'time_stop') {
+            if (waitAndHold) {
+              opt.pendingExit = {
+                tradierOrderId: '',
+                qty: opt.contractsRemaining,
+                limitPrice: mark,
+                submittedAt: Date.now(),
+                pricing: 'limit',
+                kind: 'sl',
+              };
+              delete opt.exitErrorReason;
+              closed.push({ ...opt });
+              continue;
+            }
+            const positionMode = opt.mode ?? 'demo';
+            const effectiveExit = positionMode === 'demo' ? mark * (1 - this.demoSlippagePct) : mark;
+            const remainingContracts = opt.contractsRemaining;
+            const exitFee = positionMode === 'demo' ? remainingContracts * this.demoFeePerContract : 0;
+            const pnl = (effectiveExit - opt.premiumPaid) * remainingContracts * 100;
+            opt.pnl = (opt.pnl ?? 0) + pnl - exitFee;
+            opt.closedAt = Date.now();
+            opt.currentPremium = effectiveExit;
+            opt.contractsRemaining = 0;
+            this.cash += effectiveExit * remainingContracts * 100 - exitFee;
+            this.equity += pnl - exitFee;
+            this.optionsPnlByMode[positionMode] += pnl - exitFee;
+            if (positionMode === 'demo') {
+              this.demoSlippageCost += (mark - effectiveExit) * remainingContracts * 100;
+              this.demoFeeCost += exitFee;
+            }
+            this.openOptions.delete(id);
+            this.closedOptions.push({ ...opt });
+            this.queueJournalClose(opt, 'sl');
+            closed.push({ ...opt });
+            continue;
+          }
+        }
       }
 
       // Partial exit at TP1: sell `partialExitRatio` of contracts, trail the rest
