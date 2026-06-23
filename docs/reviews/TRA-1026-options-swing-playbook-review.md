@@ -121,3 +121,44 @@ Legend: ALIGNED / PARTIAL / GAP. "Owner" is the issue that closes the gap.
   blocked on TRA-1024 so it cannot start before the foundational IV/structure
   wiring lands.
 - TRA-1026 (review) closed as done with this document as the work product.
+
+## Addendum - Schwab "Swing Trading" webcast (Mike Fairbourn), board follow-up 2026-06-23
+
+The board reopened TRA-1026 with a Charles Schwab webcast ("anything we can learn
+from this?"). Distinctive, implementable content beyond the original playbook:
+
+1. TTM Squeeze as the consolidation/breakout detector. Bollinger Bands compressing
+   INSIDE the Keltner Channel = volatility compression; the longer the squeeze
+   (filter used: >= 3 consecutive squeeze days), the larger the expected breakout
+   magnitude. This operationalizes the Breakout SETUP far more precisely than our
+   range-based Donchian path, and gives a magnitude prior, not just a level break.
+   - What we have: Bollinger Bands exist only in the equity/crypto mean-reversion
+     backtests (macd_bollinger, bb_fade). We have NO Keltner Channel, NO BB-in-KC
+     squeeze test, NO squeeze-duration counter, and the options breakout path uses
+     Donchian, not the squeeze.
+   - Learnable (NET-NEW): add Keltner + the BB-in-KC compression boolean +
+     squeeze-days counter as a scan/gate for the options breakout archetype. This
+     is the one genuinely new capability in the webcast. Folded into TRA-1028 item 2.
+
+2. Longer-dated options to suppress theta: the webcast buys 4-6 month (~120-180
+   DTE) calls even though the move is expected in 3-20 days ("put time on our
+   side"). This pushes the DTE-window review past the playbook's 45-90 toward a
+   120-180 DTE upper bound. Reinforces TRA-1028 item 3.
+
+3. Delta selection: 0.6-0.7 (slightly-ITM) calls for near dollar-for-dollar
+   movement and lower relative theta. This VALIDATES our current strike band
+   (delta 0.55-0.65, floor 0.45) - corroboration, no change needed.
+
+4. Defined risk + measured-move targets via bracket orders: stop below the
+   flag/breakout level, take-profit at the projected measured move (flag/range
+   height projected off the breakout, e.g. the T1/T2 the presenter hit on KMI).
+   A concrete underlying-structure target method that feeds TRA-1025
+   (structure-aware exits).
+
+Net learning: one new concrete capability worth building - the TTM Squeeze
+detector (we already have BB; add Keltner + compression test + squeeze-days) as
+the breakout-archetype trigger, with measured-move targets. Everything else
+either reinforces existing backlog items (extended DTE, measured-move exits) or
+validates current behavior (high-delta ITM strikes). No change to the IV-control
+(TRA-1024) priority - the webcast is consistent with it (long premium, defined
+risk, low theta).
