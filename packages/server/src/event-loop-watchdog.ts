@@ -48,6 +48,7 @@ export const WATCHDOG_SAMPLE_MS_VAR = 'WATCHDOG_SAMPLE_MS';
 export const WATCHDOG_HEAP_PCT_VAR = 'WATCHDOG_HEAP_PCT';
 export const WATCHDOG_LAG_MS_VAR = 'WATCHDOG_LAG_MS';
 export const WATCHDOG_BREACH_SAMPLES_VAR = 'WATCHDOG_BREACH_SAMPLES';
+export const WATCHDOG_BLOCK_MS_VAR = 'WATCHDOG_BLOCK_MS';
 
 export interface WatchdogConfig {
   /** Master switch. When false, the watchdog never starts (zero overhead). */
@@ -62,6 +63,16 @@ export interface WatchdogConfig {
   lagMs: number;
   /** Consecutive breached samples required before a restart trips. */
   breachSamples: number;
+  /**
+   * TRA-1082 — acute single-block trip. A single sample whose *max* event-loop
+   * lag exceeds this trips a clean self-restart IMMEDIATELY (no consecutive
+   * requirement), because one block this large means the HTTP listener already
+   * missed Render's 5s health-check window. Set below Render's 5s timeout so the
+   * watchdog's clean exit beats Render's hard restart. The sustained mean-lag
+   * trip above stays the slow-burn backstop; this catches the acute stall the
+   * loose sustained threshold (10s of >2s mean lag) was a no-op against.
+   */
+  lagMaxMs: number;
 }
 
 /** Defaults chosen so a restart only fires on unambiguous pathology. */
@@ -72,6 +83,11 @@ export const DEFAULT_WATCHDOG: WatchdogConfig = {
   heapPct: 0.92,
   lagMs: 2_000,
   breachSamples: 10,
+  // 4s: a single loop block this long has already blown Render's 5s health
+  // check budget, so trip a clean restart now rather than wait for the
+  // platform's hard kill. A 4s+ stall on a healthy box is itself pathology
+  // (a full GC near the 1.5GB ceiling is ~1-2s), so a false trip is implausible.
+  lagMaxMs: 4_000,
 };
 
 function envBool(raw: string | undefined, fallback: boolean): boolean {
@@ -96,6 +112,7 @@ export function resolveConfig(env: NodeJS.ProcessEnv = process.env): WatchdogCon
     heapPct: envNum(env[WATCHDOG_HEAP_PCT_VAR], DEFAULT_WATCHDOG.heapPct, 0.5, 0.99),
     lagMs: envNum(env[WATCHDOG_LAG_MS_VAR], DEFAULT_WATCHDOG.lagMs, 100, 600_000),
     breachSamples: Math.floor(envNum(env[WATCHDOG_BREACH_SAMPLES_VAR], DEFAULT_WATCHDOG.breachSamples, 1, 600)),
+    lagMaxMs: envNum(env[WATCHDOG_BLOCK_MS_VAR], DEFAULT_WATCHDOG.lagMaxMs, 500, 600_000),
   };
 }
 
@@ -121,7 +138,7 @@ export interface WatchdogState {
 
 export interface TripDecision {
   trip: boolean;
-  reason?: 'heap' | 'lag';
+  reason?: 'heap' | 'lag' | 'block';
   detail?: string;
 }
 
@@ -148,6 +165,20 @@ export function evaluateSample(
         `(${(sample.heapUsedBytes / 1e6).toFixed(0)}MB / ${(sample.heapLimitBytes / 1e6).toFixed(0)}MB)`,
     };
   }
+  // TRA-1082 — acute single-block trip. One sample window with a max lag this
+  // large means a single synchronous tick blocked the loop past Render's 5s
+  // health-check budget; restart cleanly NOW rather than wait breachSamples
+  // windows (the sustained trip below) for a stall the platform already kills.
+  if (sample.lagMaxMs >= cfg.lagMaxMs) {
+    return {
+      trip: true,
+      reason: 'block',
+      detail:
+        `single event-loop block: max lag ${sample.lagMaxMs.toFixed(0)}ms >= ${cfg.lagMaxMs}ms ` +
+        `in one ${cfg.sampleMs}ms window (mean ${sample.lagMeanMs.toFixed(0)}ms) — ` +
+        `exceeds Render's 5s health-check budget, self-restarting before the platform hard-kill`,
+    };
+  }
   if (state.consecutiveLagBreaches >= cfg.breachSamples) {
     return {
       trip: true,
@@ -164,14 +195,14 @@ export function evaluateSample(
 export interface WatchdogStatus {
   enabled: boolean;
   restartEnabled: boolean;
-  config: { sampleMs: number; heapPct: number; lagMs: number; breachSamples: number };
+  config: { sampleMs: number; heapPct: number; lagMs: number; breachSamples: number; lagMaxMs: number };
   /** Most recent sample, or null before the first evaluation. */
   lastSample: (WatchdogSample & { atMs: number }) | null;
   consecutiveHeapBreaches: number;
   consecutiveLagBreaches: number;
   /** True once a trip has fired (process is exiting). */
   tripped: boolean;
-  trippedReason: 'heap' | 'lag' | null;
+  trippedReason: 'heap' | 'lag' | 'block' | null;
 }
 
 export interface WatchdogHandle {
@@ -250,13 +281,13 @@ export function startEventLoopWatchdog(opts: StartWatchdogOptions = {}): Watchdo
   histogram.enable();
 
   let tripped = false;
-  let trippedReason: 'heap' | 'lag' | null = null;
+  let trippedReason: 'heap' | 'lag' | 'block' | null = null;
 
   function publish(sample: WatchdogSample): void {
     lastStatus = {
       enabled: cfg.enabled,
       restartEnabled: cfg.restartEnabled,
-      config: { sampleMs: cfg.sampleMs, heapPct: cfg.heapPct, lagMs: cfg.lagMs, breachSamples: cfg.breachSamples },
+      config: { sampleMs: cfg.sampleMs, heapPct: cfg.heapPct, lagMs: cfg.lagMs, breachSamples: cfg.breachSamples, lagMaxMs: cfg.lagMaxMs },
       lastSample: { ...sample, atMs: Date.now() },
       consecutiveHeapBreaches: state.consecutiveHeapBreaches,
       consecutiveLagBreaches: state.consecutiveLagBreaches,
@@ -320,6 +351,7 @@ export function startEventLoopWatchdog(opts: StartWatchdogOptions = {}): Watchdo
     sampleMs: cfg.sampleMs,
     heapPct: cfg.heapPct,
     lagMs: cfg.lagMs,
+    lagMaxMs: cfg.lagMaxMs,
     breachSamples: cfg.breachSamples,
     restartEnabled: cfg.restartEnabled,
   });
@@ -335,7 +367,7 @@ export function startEventLoopWatchdog(opts: StartWatchdogOptions = {}): Watchdo
         lastStatus ?? {
           enabled: cfg.enabled,
           restartEnabled: cfg.restartEnabled,
-          config: { sampleMs: cfg.sampleMs, heapPct: cfg.heapPct, lagMs: cfg.lagMs, breachSamples: cfg.breachSamples },
+          config: { sampleMs: cfg.sampleMs, heapPct: cfg.heapPct, lagMs: cfg.lagMs, breachSamples: cfg.breachSamples, lagMaxMs: cfg.lagMaxMs },
           lastSample: null,
           consecutiveHeapBreaches: 0,
           consecutiveLagBreaches: 0,

@@ -58,6 +58,21 @@ export type CryptoEngineEventHandler = (state: CryptoEngineState) => void;
 const MAX_SIGNALS = 50;
 const NEWS_REFRESH_MS = 5 * 60_000;
 
+// TRA-1082 — yield to the libuv event loop between batches of the per-symbol
+// signal evaluation loop. The demo + live ticks each iterate the full active
+// universe (~495 symbols on bqb1) running DCA `evaluate()` (synchronous indicator
+// math over the daily candle series) with no await inside the loop body — a
+// single uninterrupted synchronous burst. At full breadth that burst exceeded
+// Render's 5s HTTP health-check budget, so `http.accept` never got a turn and
+// Render hard-restarted the instance (~90s flap loop, root cause of TRA-1082).
+// Awaiting a `setImmediate` every EVAL_YIELD_EVERY symbols hands control back to
+// the event loop so the HTTP listener answers the health probe between chunks,
+// keeping any single synchronous span well under ~1s. `setImmediate` (vs
+// `setTimeout(0)`/microtask) runs after pending I/O callbacks, so queued HTTP
+// accepts are serviced before the next chunk resumes.
+const EVAL_YIELD_EVERY = 25;
+const yieldToEventLoop = (): Promise<void> => new Promise<void>(resolve => setImmediate(resolve));
+
 // TRA-693 — shared across all CryptoSignalEngine instances (one per demo user).
 // Without sharing, each engine independently fetches the same daily candles on
 // every tick, saturating the shared AT pacer (150ms/req × 16 candles/tick × N
@@ -1427,7 +1442,12 @@ export class CryptoSignalEngine {
     const strategyEnabled = (s: CryptoStrategyType) => preset.enabledStrategies.includes(s);
     let symbolsEvaluated = 0;
     let symbolsSkipped = 0;
-    for (const sym of activeSymbols) {
+    for (let symIdx = 0; symIdx < activeSymbols.length; symIdx++) {
+      const sym = activeSymbols[symIdx];
+      // TRA-1082 — yield to the event loop every EVAL_YIELD_EVERY symbols so the
+      // HTTP health probe is serviced mid-tick instead of starving for the whole
+      // ~495-symbol synchronous sweep (Render's 5s health check killed the box).
+      if (symIdx > 0 && symIdx % EVAL_YIELD_EVERY === 0) await yieldToEventLoop();
       // TRA-418 — a stale feed must never produce a new entry signal. Skip
       // strategy evaluation entirely so no signal is even generated.
       if (staleSymbols.has(sym)) {
@@ -1721,7 +1741,11 @@ export class CryptoSignalEngine {
     const preset = this.resolvePreset('live');
     const strategyEnabled = (s: CryptoStrategyType) => preset.enabledStrategies.includes(s);
 
-    for (const sym of activeSymbols) {
+    for (let symIdx = 0; symIdx < activeSymbols.length; symIdx++) {
+      const sym = activeSymbols[symIdx];
+      // TRA-1082 — yield mid-sweep (see runDemoTick) so the HTTP listener isn't
+      // starved by the full-universe synchronous evaluation pass.
+      if (symIdx > 0 && symIdx % EVAL_YIELD_EVERY === 0) await yieldToEventLoop();
       // TRA-418 — skip stale-feed symbols before any strategy runs.
       if (staleSymbols.has(sym)) continue;
       const dailyCandles = sharedDailyCandleCache.get(sym) ?? [];

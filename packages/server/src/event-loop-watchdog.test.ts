@@ -48,6 +48,12 @@ describe('resolveConfig', () => {
     expect(resolveConfig({ WATCHDOG_BREACH_SAMPLES: '3.9' }).breachSamples).toBe(3);
     expect(resolveConfig({ WATCHDOG_SAMPLE_MS: 'abc' }).sampleMs).toBe(DEFAULT_WATCHDOG.sampleMs);
   });
+
+  it('TRA-1082 — block trip defaults to 4s and is env-tunable / clamped', () => {
+    expect(resolveConfig({}).lagMaxMs).toBe(4_000);
+    expect(resolveConfig({ WATCHDOG_BLOCK_MS: '3000' }).lagMaxMs).toBe(3_000);
+    expect(resolveConfig({ WATCHDOG_BLOCK_MS: '100' }).lagMaxMs).toBe(500); // clamped up
+  });
 });
 
 describe('evaluateSample — heap trip', () => {
@@ -77,14 +83,38 @@ describe('evaluateSample — heap trip', () => {
 
 describe('evaluateSample — lag trip', () => {
   it('trips on sustained event-loop lag independent of heap', () => {
-    const c = cfg({ breachSamples: 2, lagMs: 2000 });
+    const c = cfg({ breachSamples: 2, lagMs: 2000, lagMaxMs: 600_000 });
     const state = freshState();
-    const laggy = sample({ lagMeanMs: 3500, lagMaxMs: 9000, heapPct: 0.1 });
+    // lagMaxMs kept below the (disabled-high) block threshold so this exercises
+    // the SUSTAINED mean-lag path, not the new acute single-block trip.
+    const laggy = sample({ lagMeanMs: 3500, lagMaxMs: 3900, heapPct: 0.1 });
     expect(evaluateSample(laggy, state, c).trip).toBe(false);
     const d: TripDecision = evaluateSample(laggy, state, c);
     expect(d.trip).toBe(true);
     expect(d.reason).toBe('lag');
     expect(d.detail).toContain('event-loop');
+  });
+});
+
+describe('evaluateSample — TRA-1082 acute single-block trip', () => {
+  it('trips IMMEDIATELY on one window whose max lag exceeds the block threshold', () => {
+    const c = cfg({ lagMaxMs: 4000, breachSamples: 10 });
+    const state = freshState();
+    // A single 6s block: max lag ~6000ms in one window, mean still modest. The
+    // sustained trip (breachSamples=10) would need 10 windows; the block trip
+    // fires on the first so a clean restart beats Render's 5s health-check kill.
+    const blocked = sample({ lagMeanMs: 800, lagMaxMs: 6000, heapPct: 0.2 });
+    const d = evaluateSample(blocked, state, c);
+    expect(d.trip).toBe(true);
+    expect(d.reason).toBe('block');
+    expect(d.detail).toContain('single event-loop block');
+  });
+
+  it('does not trip on a sub-threshold spike (one normal slow tick)', () => {
+    const c = cfg({ lagMaxMs: 4000, breachSamples: 10 });
+    const state = freshState();
+    const spike = sample({ lagMeanMs: 200, lagMaxMs: 3500, heapPct: 0.2 });
+    expect(evaluateSample(spike, state, c).trip).toBe(false);
   });
 });
 

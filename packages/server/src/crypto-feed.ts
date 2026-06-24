@@ -26,7 +26,18 @@ const sleep = (ms: number) => new Promise(resolve => setTimeout(resolve, ms));
 
 // Per-call timeout. Yahoo and CMC occasionally hang; without a timeout the 60-second
 // crypto tick blocks indefinitely, leaving the watchlist stuck "Loading…".
-const FEED_CALL_TIMEOUT_MS = 8_000;
+//
+// TRA-1082 — cut from 8000ms to 3000ms. The old budget was LARGER than Render's
+// 5s HTTP health-check timeout, so a single slow upstream batch (the 419/419
+// Yahoo + 429 CMC storm seen on bqb1) could keep the tick's awaited work in
+// flight long enough that the health probe timed out and Render hard-restarted
+// the instance. 3s keeps every upstream call comfortably inside the 5s budget;
+// a provider that hasn't answered in 3s is treated as a miss and the cascade
+// falls through to the next source (env-tunable via FEED_CALL_TIMEOUT_MS).
+const FEED_CALL_TIMEOUT_MS = (() => {
+  const raw = Number(process.env.FEED_CALL_TIMEOUT_MS);
+  return Number.isFinite(raw) && raw >= 500 && raw <= 30_000 ? raw : 3_000;
+})();
 
 function withTimeout<T>(p: Promise<T>, ms: number, label: string): Promise<T> {
   return new Promise<T>((resolve, reject) => {
