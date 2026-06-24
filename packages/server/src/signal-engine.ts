@@ -219,6 +219,25 @@ export interface LiveEquityAcceptance {
 export type EngineEventHandler = (state: EngineState) => void;
 
 const MAX_SIGNALS = 50;
+
+// TRA-1082 — yield to the libuv event loop between batches of the full-universe
+// equity sweeps. Each engine tick iterates the ENTIRE active/watchlist universe
+// running synchronous indicator math (adx/orb/bbFade/ichimoku in the main pass,
+// supertrend()/confluenceSide()/reversalChecklist() in the shadow passes) with
+// no await inside the loop body when nothing fires — one uninterrupted
+// synchronous burst. At full breadth on bqb1 that burst exceeded Render's 5s
+// HTTP health-check budget (logs showed silent 5-8s gaps between `supertrend
+// shadow signal` lines), so `http.accept` never got a turn and Render
+// hard-restarted the instance (~90s flap loop, residual TRA-1082 root cause the
+// crypto fix at 28af16b did NOT cover — that only chunked crypto-engine). This
+// mirrors the crypto-engine treatment verbatim: awaiting a `setImmediate` every
+// EQUITY_EVAL_YIELD_EVERY symbols hands control back so the HTTP listener answers
+// the health probe between chunks, keeping any single synchronous span well
+// under ~1s. `setImmediate` (vs `setTimeout(0)`/microtask) runs after pending
+// I/O callbacks, so queued HTTP accepts are serviced before the next chunk.
+const EQUITY_EVAL_YIELD_EVERY = 25;
+const yieldToEventLoop = (): Promise<void> => new Promise<void>(resolve => setImmediate(resolve));
+
 // TRA-1053 (TRA-1045 R3) — cap on the closed-position history rehydrated into
 // engine memory at boot. The nightly archive (archiveClosedTrades) clears
 // `allClosedPositions`, so in normal operation a snapshot holds at most one
@@ -2096,7 +2115,14 @@ export class SignalEngine {
       // so the intraday churners never even fire on them.
       const swingMode = this.equitySwingModeEnabled();
       // Run strategies and collect new signals
-      for (const sym of activeSymbols) {
+      for (let symIdx = 0; symIdx < activeSymbols.length; symIdx++) {
+        const sym = activeSymbols[symIdx];
+        // TRA-1082 — yield to the event loop every EQUITY_EVAL_YIELD_EVERY symbols
+        // so the HTTP health probe is serviced mid-tick. This pass only awaits
+        // when a signal actually fires (routeEquitySignal below); in a flat
+        // market the whole universe runs as one synchronous burst with no yield,
+        // which is exactly what starved Render's 5s health check.
+        if (symIdx > 0 && symIdx % EQUITY_EVAL_YIELD_EVERY === 0) await yieldToEventLoop();
         const candles = this.candleCache.get(sym) ?? [];
         if (candles.length < 15) continue;
         if (swingMode && !isLiquidSwingSymbol(sym)) continue;
@@ -2176,10 +2202,13 @@ export class SignalEngine {
       // tick can re-enter on the same tick when its confluence still holds. The
       // open side runs inside evaluateSupertrendShadow.
       this.runSupertrendPaperExits(prices);
-      this.evaluateSupertrendShadow(activeSymbols);
+      // TRA-1082 — awaited: both shadow passes now yield to the event loop
+      // mid-sweep so the full-universe synchronous indicator burst can't starve
+      // Render's 5s health check (the silent 5-8s log gaps the CTO traced).
+      await this.evaluateSupertrendShadow(activeSymbols);
       // TRA-921 (TRA-920 B) — OBSERVE-ONLY reversal-checklist shadow capture.
       // OFF unless ENABLE_REVERSAL_SHADOW is set; nothing here routes or opens.
-      this.evaluateReversalShadow(activeSymbols);
+      await this.evaluateReversalShadow(activeSymbols);
     }
 
     // TRA-191: relative-value scanner — the sole stock-options strategy in
@@ -3339,9 +3368,14 @@ export class SignalEngine {
    * with its full confluence read (supertrend value + flip state, the
    * MA-stack / MACD / RSI booleans) for QuantTrader's signal-quality review.
    */
-  private evaluateSupertrendShadow(symbols: string[]): void {
+  private async evaluateSupertrendShadow(symbols: string[]): Promise<void> {
     const emitted: TradeSignal[] = [];
-    for (const sym of symbols) {
+    for (let symIdx = 0; symIdx < symbols.length; symIdx++) {
+      const sym = symbols[symIdx];
+      // TRA-1082 — yield mid-sweep so the per-symbol supertrend()/confluenceSide()
+      // indicator math over the full watchlist doesn't run as one synchronous
+      // burst that blows Render's 5s health check.
+      if (symIdx > 0 && symIdx % EQUITY_EVAL_YIELD_EVERY === 0) await yieldToEventLoop();
       const fiveMin = this.shadowCandleCache.get(sym);
       if (!fiveMin || fiveMin.length === 0) continue;
       // Uses the TRA-728 shipped defaults end-to-end: confluenceSide for the
@@ -3592,9 +3626,14 @@ export class SignalEngine {
    * rows the same way the Supertrend ledger does. Gated OFF by default
    * (ENABLE_REVERSAL_SHADOW); NOTHING here routes an order or opens a position.
    */
-  private evaluateReversalShadow(symbols: string[]): void {
+  private async evaluateReversalShadow(symbols: string[]): Promise<void> {
     if (!isReversalShadowEnabled()) return;
-    for (const sym of symbols) {
+    for (let symIdx = 0; symIdx < symbols.length; symIdx++) {
+      const sym = symbols[symIdx];
+      // TRA-1082 — yield mid-sweep so the per-symbol reversalChecklist() pass
+      // over the full watchlist doesn't starve the event loop. ENABLE_REVERSAL_
+      // SHADOW is ON in prod (TRA-1064), so this loop runs the full universe.
+      if (symIdx > 0 && symIdx % EQUITY_EVAL_YIELD_EVERY === 0) await yieldToEventLoop();
       const fiveMin = this.shadowCandleCache.get(sym);
       if (!fiveMin || fiveMin.length === 0) continue;
       const lastBar = fiveMin[fiveMin.length - 1];

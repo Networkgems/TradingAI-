@@ -4022,6 +4022,44 @@ describe('SignalEngine — SupertrendConfluence shadow channel (TRA-787)', () =>
     });
     expect(restored.exportTradeSnapshot().supertrendPaperClosed).toHaveLength(1);
   });
+
+  // TRA-1082 — the full-universe shadow sweep must YIELD to the libuv event loop
+  // mid-pass so the per-symbol supertrend()/confluenceSide() indicator math can't
+  // run as one uninterrupted synchronous burst (the residual root cause of the
+  // bqb1 502 flap: silent 5-8s loop blocks that blew Render's 5s health check).
+  // A self-rescheduling setImmediate probe counts macrotask boundaries: if the
+  // sweep ran fully synchronously the probe never gets a turn during it (ticks 0);
+  // because the sweep awaits a setImmediate every EQUITY_EVAL_YIELD_EVERY (25)
+  // symbols, a >25-symbol universe interleaves the probe at least once.
+  it('TRA-1082: yields to the event loop mid-sweep so the universe is not one synchronous burst', async () => {
+    // Real timers: the sweep (and the probe below) await a REAL setImmediate.
+    // The global beforeEach fakes timers, which would stall both. afterEach
+    // restores fake timers for the rest of the suite.
+    vi.useRealTimers();
+    const engine = new SignalEngine();
+    const flat = build5m(Array.from({ length: 240 }, () => 100));
+    const universe = Array.from({ length: 60 }, (_, i) => `SYM${i}`);
+    const cache = (engine as unknown as { shadowCandleCache: Map<string, Candle[]> }).shadowCandleCache;
+    for (const sym of universe) cache.set(sym, flat);
+
+    let ticks = 0;
+    let running = true;
+    const probe = (): void => {
+      if (!running) return;
+      ticks++;
+      setImmediate(probe);
+    };
+    setImmediate(probe);
+
+    await (engine as unknown as { evaluateSupertrendShadow: (s: string[]) => Promise<void> })
+      .evaluateSupertrendShadow(universe);
+    running = false;
+
+    // The sweep handed control back to the loop at least once (2 yields at idx
+    // 25 and 50). A single-symbol call would leave this at 0 — exactly the
+    // pre-fix synchronous-burst behaviour this guards against.
+    expect(ticks).toBeGreaterThan(0);
+  });
 });
 
 // TRA-1053 (TRA-1045 R3) — bound in-memory growth: per-day ledgers are released
