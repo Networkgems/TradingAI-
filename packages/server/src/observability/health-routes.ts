@@ -34,6 +34,7 @@ import {
   computeOptionLearnedWeights,
   type OptionLearnedWeights,
 } from '../learned-option-weights.js';
+import { isLearnedShrinkageEnabled } from '../learned-shrinkage-flag.js';
 import {
   optionWeightsCache,
   type CachedOptionWeights,
@@ -557,6 +558,13 @@ export interface OptionJournalReport {
   build: ReturnType<typeof resolveBuildInfo>;
   /** `ENABLE_OPTION_TRADE_JOURNAL` is on (accrual armed). */
   enabled: boolean;
+  /**
+   * TRA-1056 — `ENABLE_LEARNED_WEIGHT_SHRINKAGE` state. Each stat in `weights`
+   * carries multiplierHardGate + multiplierShrunk for the QuantTrader A/B diff;
+   * this flag says which one `optionSetupMultiplier` currently reads (default OFF
+   * = hard-gate).
+   */
+  shrinkageEnabled: boolean;
   summary: OptionTradeJournalSummary;
   weights: OptionLearnedWeights;
   /**
@@ -617,6 +625,7 @@ export function buildOptionJournalReport(
     time: new Date(now).toISOString(),
     build: resolveBuildInfo(),
     enabled,
+    shrinkageEnabled: isLearnedShrinkageEnabled(),
     summary: summarizeOptionTradeJournal(rows),
     weights: cached?.weights ?? computeOptionLearnedWeights(rows),
     ...(cached ? { weightsFreshness: cached.freshness } : {}),

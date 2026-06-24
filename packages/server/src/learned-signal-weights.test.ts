@@ -3,6 +3,10 @@ import type { ReversalShadowRecord } from './reversal-shadow-ledger.js';
 import {
   computeLearnedWeights,
   reversalSignalMultiplier,
+  hardGateMultiplier,
+  shrunkMultiplier,
+  globalPriorRate,
+  THIN_BUCKET_CEIL,
   DEFAULT_LEARNED_PARAMS,
 } from './learned-signal-weights.js';
 
@@ -106,5 +110,111 @@ describe('reversalSignalMultiplier', () => {
     const w = computeLearnedWeights(bucket(5, 5)); // below min-sample -> neutral
     const m = reversalSignalMultiplier(w, { score: 4, pattern: 'doji', symbol: 'QQQ' });
     expect(m).toBe(1);
+  });
+});
+
+// ── TRA-1056 (TRA-1041c L3) cold-start weak-prior shrinkage ──────────────────
+
+const P = DEFAULT_LEARNED_PARAMS;
+
+describe('hardGateMultiplier', () => {
+  it('is neutral below the min-sample guard regardless of record', () => {
+    expect(hardGateMultiplier({ resolved: 9, hits: 9, rate: 1, avgR: 3 }, P)).toBe(1);
+  });
+
+  it('reproduces the legacy hit-rate driver once confident', () => {
+    // 1 + 1.0*(0.8 - 0.5) = 1.3, no negative-R penalty.
+    expect(hardGateMultiplier({ resolved: 20, hits: 16, rate: 0.8, avgR: 2.2 }, P)).toBeCloseTo(1.3, 5);
+  });
+});
+
+describe('globalPriorRate', () => {
+  const isResolved = (r: ReversalShadowRecord) => r.outcome !== 'OPEN';
+  const isHit = (r: ReversalShadowRecord) => r.outcome === 'TP_HIT';
+
+  it('is null when the global pool itself is below the min-sample guard', () => {
+    expect(globalPriorRate(bucket(9, 9), isResolved, isHit, P)).toBeNull();
+  });
+
+  it('is the pooled hit-rate once the pool clears the guard', () => {
+    expect(globalPriorRate(bucket(20, 14), isResolved, isHit, P)).toBeCloseTo(0.7, 5);
+  });
+});
+
+describe('shrunkMultiplier', () => {
+  it('falls back to neutral 1.0 when there is no reliable prior (no prior-on-prior)', () => {
+    expect(shrunkMultiplier({ resolved: 5, hits: 5, rate: 1, avgR: 3 }, null, P)).toBe(1);
+  });
+
+  it('a confident bucket (resolved >> k) converges to the empirical hard-gate value', () => {
+    const stats = { resolved: 1000, hits: 800, rate: 0.8, avgR: 2.2 };
+    const shrunk = shrunkMultiplier(stats, 0.5, P); // prior far from empirical
+    const hard = hardGateMultiplier(stats, P);
+    // posterior = (10*0.5 + 800)/1010 = 0.79703 -> 1.297, within 0.01 of hard 1.3.
+    expect(shrunk).toBeCloseTo(1.297, 3);
+    expect(Math.abs(shrunk - hard)).toBeLessThan(0.01);
+  });
+
+  it('tapers the ceil to 1.25 while the bucket is thin, even on a perfect prior', () => {
+    // posterior = (10*1 + 3)/13 = 1.0 -> raw 1.5, but resolved 3 < minSamples.
+    expect(shrunkMultiplier({ resolved: 3, hits: 3, rate: 1, avgR: 3 }, 1.0, P)).toBe(THIN_BUCKET_CEIL);
+  });
+
+  it('lifts the ceil back to the full 1.5 once the bucket is confident', () => {
+    // posterior = (10*1 + 10)/20 = 1.0 -> raw 1.5, resolved 10 >= minSamples.
+    expect(shrunkMultiplier({ resolved: 10, hits: 10, rate: 1, avgR: 3 }, 1.0, P)).toBe(P.ceil);
+  });
+
+  it('keeps the avgR expectancy penalty bucket-local (empirical, never shrunk)', () => {
+    // posterior = (10*0.6 + 14)/30 = 0.6667; rGuard = 0.1*(-0.5) = -0.05.
+    // 1 + (0.6667 - 0.5) - 0.05 = 1.1167, using the bucket's OWN negative avgR.
+    expect(shrunkMultiplier({ resolved: 20, hits: 14, rate: 0.7, avgR: -0.5 }, 0.6, P)).toBeCloseTo(1.1167, 4);
+  });
+});
+
+describe('computeLearnedWeights — shrinkage wiring', () => {
+  it('exposes the global prior and BOTH multipliers per bucket', () => {
+    const w = computeLearnedWeights(bucket(20, 14));
+    expect(w.generatedFrom.priorRate).toBeCloseTo(0.7, 5);
+    const s4 = w.byScore.find((s) => s.key === '4')!;
+    // multiplier mirrors the hard gate (deterministic, flag-independent fold).
+    expect(s4.multiplier).toBe(s4.multiplierHardGate);
+    expect(s4.multiplierHardGate).toBeCloseTo(1.2, 5); // 1 + (0.7-0.5)
+    expect(s4.multiplierShrunk).toBeGreaterThan(0);
+  });
+
+  it('reports a null prior when the whole ledger is below the guard', () => {
+    const w = computeLearnedWeights(bucket(5, 5));
+    expect(w.generatedFrom.priorRate).toBeNull();
+    // No reliable prior -> every shrunk multiplier is neutral.
+    expect(w.byScore.every((s) => s.multiplierShrunk === 1)).toBe(true);
+  });
+
+  it('is deterministic — same rows in, same weights out', () => {
+    const rows = [...bucket(20, 14), ...bucket(7, 5, { score: 3 })];
+    expect(computeLearnedWeights(rows)).toEqual(computeLearnedWeights(rows));
+  });
+});
+
+describe('reversalSignalMultiplier — flag-gated shrinkage switch', () => {
+  // A confident score=3 pool provides the prior; a thin score=4 bucket is gated to
+  // neutral under the hard gate but earns a shrunk weight under the prior.
+  const rows = [
+    ...bucket(20, 14, { score: 3, symbol: 'OTHER', patternName: 'hammer' }),
+    ...bucket(4, 4, { score: 4, symbol: 'OTHER', patternName: 'doji' }),
+  ];
+  const w = computeLearnedWeights(rows);
+  // Query isolates the score dim: pattern/symbol are absent -> skipped both ways.
+  const sig = { score: 4, pattern: null, symbol: 'NOPE' };
+
+  it('hard-gate (flag OFF) leaves a thin bucket neutral', () => {
+    expect(reversalSignalMultiplier(w, sig, false)).toBe(1);
+  });
+
+  it('shrinkage (flag ON) lets the thin bucket contribute its shrunk weight', () => {
+    const s4 = w.byScore.find((s) => s.key === '4')!;
+    expect(s4.confident).toBe(false);
+    expect(s4.multiplierShrunk).toBeGreaterThan(1);
+    expect(reversalSignalMultiplier(w, sig, true)).toBe(s4.multiplierShrunk);
   });
 });

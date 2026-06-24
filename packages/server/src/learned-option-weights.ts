@@ -1,7 +1,12 @@
 import {
   DEFAULT_LEARNED_PARAMS,
   type LearnedWeightsParams,
+  type BucketStats,
+  hardGateMultiplier,
+  shrunkMultiplier,
+  globalPriorRate,
 } from './learned-signal-weights.js';
+import { isLearnedShrinkageEnabled } from './learned-shrinkage-flag.js';
 import type {
   JournalTrend,
   OptionTradeJournalRecord,
@@ -43,14 +48,31 @@ export interface OptionLearnedStat {
   winRate: number | null;
   /** Mean realized R over resolved rows; null when none resolved. */
   avgR: number | null;
-  /** Learned scoring multiplier in [floor, ceil]; 1.0 until `confident`. */
+  /**
+   * Hard-gate multiplier, kept as `multiplier` for backward-compat (eod-report,
+   * etc.). Always equals {@link multiplierHardGate}; the flag-gated switch to the
+   * shrunk estimate lives in {@link optionSetupMultiplier}, not in this pure fold.
+   */
   multiplier: number;
-  /** True once `resolved >= minSamples` — the multiplier is allowed to move. */
+  /** TRA-1056 — today's behavior: neutral (1.0) until `resolved >= minSamples`. */
+  multiplierHardGate: number;
+  /**
+   * TRA-1056 — Beta-Binomial cold-start estimate: win-rate pulled toward the
+   * learner's global pooled `priorRate` (k=minSamples), ceil-tapered to 1.25 while
+   * thin, neutral when there is no reliable prior. Surfaced for the QuantTrader A/B
+   * diff; feeds the combined multiplier only when the shrinkage flag is on.
+   */
+  multiplierShrunk: number;
+  /** True once `resolved >= minSamples` — the hard-gate multiplier may move. */
   confident: boolean;
 }
 
 export interface OptionLearnedWeights {
-  generatedFrom: { rows: number; resolved: number };
+  /**
+   * `priorRate` is the global pooled win-rate fed to the shrinkage estimate, or
+   * null when the global pool itself has not cleared `minSamples`.
+   */
+  generatedFrom: { rows: number; resolved: number; priorRate: number | null };
   params: LearnedWeightsParams;
   byStructure: OptionLearnedStat[];
   byIvRank: OptionLearnedStat[];
@@ -112,6 +134,7 @@ export function sentimentIcBandKey(band: SentimentIcBand | undefined): string {
 function statFor(
   key: string,
   rows: OptionTradeJournalRecord[],
+  priorRate: number | null,
   p: LearnedWeightsParams,
 ): OptionLearnedStat {
   const resolvedRows = rows.filter((r) => r.outcome !== 'OPEN');
@@ -126,14 +149,25 @@ function statFor(
       : null;
 
   const confident = resolved >= p.minSamples;
-  let multiplier = 1;
-  if (confident && winRate !== null) {
-    const hrTerm = p.sensitivity * (winRate - p.baselineHitRate);
-    const rGuard = avgR !== null && avgR < 0 ? p.expectancyPenalty * avgR : 0; // negative only
-    multiplier = clamp(1 + hrTerm + rGuard, p.floor, p.ceil);
-  }
+  const stats: BucketStats = { resolved, hits: win, rate: winRate, avgR };
+  const multiplierHardGate = hardGateMultiplier(stats, p);
+  const multiplierShrunk = shrunkMultiplier(stats, priorRate, p);
+  const multiplier = multiplierHardGate; // live switch lives in the combined fn
 
-  return { key, total: rows.length, resolved, win, loss, scratch, winRate, avgR, multiplier, confident };
+  return {
+    key,
+    total: rows.length,
+    resolved,
+    win,
+    loss,
+    scratch,
+    winRate,
+    avgR,
+    multiplier,
+    multiplierHardGate,
+    multiplierShrunk,
+    confident,
+  };
 }
 
 function groupBy<T>(
@@ -161,13 +195,20 @@ export function computeOptionLearnedWeights(
 ): OptionLearnedWeights {
   const sortStat = (a: OptionLearnedStat, b: OptionLearnedStat) =>
     a.key.localeCompare(b.key, undefined, { numeric: true });
+
+  // Global pooled win-rate is the prior the shrinkage estimate pulls toward, the
+  // same across all folds. The fold stays pure (carries both multipliers, reads no
+  // flag); the live switch is applied in `optionSetupMultiplier`.
+  const isResolved = (r: OptionTradeJournalRecord) => r.outcome !== 'OPEN';
+  const priorRate = globalPriorRate(rows, isResolved, (r) => r.outcome === 'WIN', params);
+
   const fold = (keyOf: (r: OptionTradeJournalRecord) => string): OptionLearnedStat[] =>
     [...groupBy(rows, keyOf).entries()]
-      .map(([key, list]) => statFor(key, list, params))
+      .map(([key, list]) => statFor(key, list, priorRate, params))
       .sort(sortStat);
 
   return {
-    generatedFrom: { rows: rows.length, resolved: rows.filter((r) => r.outcome !== 'OPEN').length },
+    generatedFrom: { rows: rows.length, resolved: rows.filter(isResolved).length, priorRate },
     params,
     byStructure: fold((r) => r.structure),
     byIvRank: fold((r) => ivRankBand(r.ivRank)),
@@ -197,10 +238,16 @@ export interface OptionSetupKey {
  * TRA-993 — the `bySentimentIc` fold is intentionally NOT one of these factors:
  * it is observe-only and stays out of the combined multiplier until TRA-992
  * Step 3 (gated on QuantTrader's validation read) wires it into a decision.
+ *
+ * TRA-1056 — default (`ENABLE_LEARNED_WEIGHT_SHRINKAGE` OFF) is the hard-gate path
+ * (confident dims only). With the flag on, every dimension contributes its
+ * `multiplierShrunk` (cold-start Beta-Binomial posterior, neutral when no reliable
+ * prior). `useShrinkage` defaults to the live flag but is injectable for tests.
  */
 export function optionSetupMultiplier(
   weights: OptionLearnedWeights,
   setup: OptionSetupKey,
+  useShrinkage: boolean = isLearnedShrinkageEnabled(),
 ): number {
   const find = (list: OptionLearnedStat[], key: string): OptionLearnedStat | undefined =>
     list.find((s) => s.key === key);
@@ -213,7 +260,9 @@ export function optionSetupMultiplier(
   ];
   let m = 1;
   for (const d of dims) {
-    if (d && d.confident) m *= d.multiplier;
+    if (!d) continue;
+    if (useShrinkage) m *= d.multiplierShrunk; // neutral 1.0 when no reliable prior
+    else if (d.confident) m *= d.multiplier; // hard-gate: confident dims only
   }
   return clamp(m, weights.params.floor, weights.params.ceil);
 }

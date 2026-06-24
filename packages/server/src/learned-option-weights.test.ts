@@ -189,3 +189,62 @@ describe('optionSetupMultiplier', () => {
     expect(m).toBe(1);
   });
 });
+
+// ── TRA-1056 (TRA-1041c L3) cold-start weak-prior shrinkage ──────────────────
+
+describe('computeOptionLearnedWeights — shrinkage wiring', () => {
+  it('exposes the global win-rate prior and BOTH multipliers per bucket', () => {
+    const w = computeOptionLearnedWeights(bucket(20, 16));
+    expect(w.generatedFrom.priorRate).toBeCloseTo(0.8, 5);
+    const s = w.byStructure.find((x) => x.key === 'bull_put')!;
+    expect(s.multiplier).toBe(s.multiplierHardGate);
+    expect(s.multiplierHardGate).toBeCloseTo(1.3, 5);
+    expect(s.multiplierShrunk).toBeGreaterThan(0);
+  });
+
+  it('reports a null prior (no prior-on-prior) when the journal is below the guard', () => {
+    const w = computeOptionLearnedWeights(bucket(5, 5));
+    expect(w.generatedFrom.priorRate).toBeNull();
+    expect(w.byStructure.every((x) => x.multiplierShrunk === 1)).toBe(true);
+  });
+
+  it('is deterministic — same rows in, same weights out', () => {
+    const rows = [...bucket(20, 16), ...bucket(7, 5, { structure: 'iron_condor' })];
+    expect(computeOptionLearnedWeights(rows)).toEqual(computeOptionLearnedWeights(rows));
+  });
+});
+
+describe('optionSetupMultiplier — flag-gated shrinkage switch', () => {
+  // Confident bull_put pool provides the prior; a thin iron_condor bucket on an
+  // ISOLATED regime (low IVR / down / bearish / gt45) is gated to neutral under the
+  // hard gate but earns a shrunk weight once the prior exists.
+  const rows = [
+    ...bucket(20, 16), // bull_put / high / up / bullish / 30to45, confident
+    ...bucket(4, 4, {
+      structure: 'iron_condor',
+      ivRank: 10, // low
+      trend: 'down',
+      sentiment: -0.5, // bearish
+      entryDte: 60, // gt45
+    }),
+  ];
+  const w = computeOptionLearnedWeights(rows);
+  const setup = { structure: 'iron_condor', ivRank: 10, trend: 'down' as const, sentiment: -0.5, dte: 60 };
+
+  it('hard-gate (flag OFF) leaves the thin regime neutral', () => {
+    expect(optionSetupMultiplier(w, setup, false)).toBe(1);
+  });
+
+  it('shrinkage (flag ON) lets the thin regime contribute its shrunk weight', () => {
+    const ic = w.byStructure.find((x) => x.key === 'iron_condor')!;
+    expect(ic.confident).toBe(false);
+    expect(ic.multiplierShrunk).toBeGreaterThan(1);
+    // structure × ivRank(low) × trend(down) × sentiment(bearish) × dte(gt45) are all
+    // the SAME thin iron_condor bucket, each at the tapered shrunk weight.
+    const each = ic.multiplierShrunk;
+    expect(optionSetupMultiplier(w, setup, true)).toBeCloseTo(
+      Math.min(each * each * each * each * each, DEFAULT_LEARNED_PARAMS.ceil),
+      5,
+    );
+  });
+});

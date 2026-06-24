@@ -165,6 +165,7 @@ import {
   reversalHitRateByScore,
 } from './reversal-shadow-ledger.js';
 import { computeLearnedWeights } from './learned-signal-weights.js';
+import { isLearnedShrinkageEnabled } from './learned-shrinkage-flag.js';
 import {
   loadUserMemoryStore,
   getUserMemory,
@@ -3286,6 +3287,10 @@ app.get('/api/health/learned-weights', async (req, res) => {
     res.json({
       issue: 'TRA-925',
       flagEnabled: isReversalShadowEnabled(),
+      // TRA-1056 — the A/B switch state. Each stat carries multiplierHardGate +
+      // multiplierShrunk so QuantTrader can diff them; this says which one the live
+      // `reversalSignalMultiplier` currently reads (default: hard-gate).
+      shrinkageFlagEnabled: isLearnedShrinkageEnabled(),
       count: signals.length,
       weights: computeLearnedWeights(signals),
     });
