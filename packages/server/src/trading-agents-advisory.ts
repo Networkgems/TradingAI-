@@ -37,9 +37,9 @@ import {
   type NewsItem,
 } from '@trading-app/shared';
 import {
-  isOverCompanyDailyCap,
-  isOverUserDailyCap,
-  recordAgentSpend,
+  commitReservation,
+  releaseReservation,
+  tryReserveAgentSpend,
 } from './agent-spend-store.js';
 
 /** Cap on point-in-time headlines fed to the news analyst — small + cheap. */
@@ -163,9 +163,14 @@ export async function adviseSymbol(
   opts: AdviseOptions,
 ): Promise<AdviseResult> {
   const now = opts.now ?? Date.now();
-  const underCap = !isOverUserDailyCap(opts.user, now);
-  const underCompanyCap = !isOverCompanyDailyCap(now);
-  const useLlm = opts.enabled && opts.llm != null && underCap && underCompanyCap;
+  // TRA-1045 R2 — admit the paid path with an ATOMIC reserve-or-deny instead of a
+  // read-then-write cap check. tryReserveAgentSpend checks the per-user cap AND the
+  // company ceiling and books an in-flight reservation in one synchronous step, so two
+  // concurrent adviseSymbol calls for the same user can no longer both slip under the
+  // cap across the awaited model round-trip. A null return means no headroom → take the
+  // deterministic zero-cost path, exactly as the old `!isOverUserDailyCap` gate did.
+  const reservation = opts.enabled && opts.llm != null ? tryReserveAgentSpend(opts.user, now) : null;
+  const useLlm = reservation != null;
 
   // TRA-915 — the Opus-escalation threshold comes from env unless the caller pinned one
   // explicitly on graphDeps (tests/overrides win).
@@ -177,12 +182,18 @@ export async function adviseSymbol(
     ...(useLlm ? { llm: opts.llm! } : {}),
   };
 
-  const recommendation = await runAgentGraph(input, deps);
-
-  // Only real, non-cached spend is accounted (the deterministic path stamps 0).
-  if (useLlm && recommendation.costUsd > 0) {
-    recordAgentSpend(opts.user, recommendation.costUsd, now);
+  try {
+    const recommendation = await runAgentGraph(input, deps);
+    if (reservation) {
+      // Reconcile the in-flight hold to the call's real cost. Only real, non-cached
+      // spend is booked (the deterministic path stamps 0 → the hold is just released).
+      commitReservation(reservation, recommendation.costUsd, now);
+    }
+    return { recommendation, llmUsed: useLlm, routedToCapital: false };
+  } catch (err) {
+    // The paid call threw — release the hold so a transient failure can't leak budget
+    // and permanently shrink the user's daily headroom.
+    if (reservation) releaseReservation(reservation, now);
+    throw err;
   }
-
-  return { recommendation, llmUsed: useLlm, routedToCapital: false };
 }

@@ -41,8 +41,22 @@ export const DEFAULT_AGGREGATE_REVIEW_USD = 50;
  * (review tripwire) before the ceiling actually cuts spend. Override via env.
  */
 export const DEFAULT_COMPANY_DAILY_CAP_USD = 100;
+/**
+ * TRA-1045 R2 — conservative upper-bound estimate of a single advisory run's LLM
+ * cost, RESERVED against the per-user/company ledgers the instant a paid call is
+ * admitted (before the awaited model round-trip) and reconciled to the real cost
+ * once it returns. This is what closes the read-then-write TOCTOU window: two
+ * concurrent advisory calls for the same user can no longer both observe headroom
+ * across the `await`, because the first call's reservation is already counted
+ * toward the cap when the second checks. Default covers a typical 6-call run on the
+ * cheap tiers (apex escalation is off by default); tune via env. Larger = more
+ * conservative (fewer concurrent paid calls admitted near the boundary).
+ */
+export const DEFAULT_CALL_COST_ESTIMATE_USD = 2;
 /** Env override for the per-user/day cap (USD). Empty/invalid → the default. */
 export const USER_CAP_ENV_VAR = 'TRADING_AGENTS_DAILY_USER_USD_CAP';
+/** Env override for the in-flight per-call reservation estimate (USD). */
+export const CALL_COST_ESTIMATE_ENV_VAR = 'TRADING_AGENTS_CALL_COST_ESTIMATE_USD';
 /** Env override for the aggregate re-review level (USD). */
 export const AGGREGATE_REVIEW_ENV_VAR = 'TRADING_AGENTS_AGGREGATE_REVIEW_USD';
 /** Env override for the company-wide daily ceiling (USD). */
@@ -70,6 +84,11 @@ export function companyDailyCapUsd(): number {
   return envUsd(COMPANY_CAP_ENV_VAR, DEFAULT_COMPANY_DAILY_CAP_USD);
 }
 
+/** The in-flight per-call reservation estimate in USD — env-configurable, default $2. */
+export function callCostEstimateUsd(): number {
+  return envUsd(CALL_COST_ESTIMATE_ENV_VAR, DEFAULT_CALL_COST_ESTIMATE_USD);
+}
+
 /** Calendar-day bucket key in UTC, e.g. "2026-06-09". */
 export function dayKey(now: number): string {
   return new Date(now).toISOString().slice(0, 10);
@@ -77,8 +96,15 @@ export function dayKey(now: number): string {
 
 interface DayBucket {
   day: string;
-  /** Per-user spend for the day, USD. */
+  /** Recorded (committed, real-money) per-user spend for the day, USD. */
   perUser: Map<string, number>;
+  /**
+   * TRA-1045 R2 — in-flight per-user RESERVATIONS for paid calls that have been
+   * admitted but not yet reconciled. Counted toward the caps so concurrent calls
+   * see the headroom a sibling call already claimed. Always reconciled (committed
+   * into `perUser` or released) when the call settles, so it nets to 0 at rest.
+   */
+  reserved: Map<string, number>;
   /** One-shot: aggregate crossed the re-review level. */
   reviewAlerted: boolean;
   /** One-shot: aggregate crossed the hard company-wide ceiling (TRA-915). */
@@ -94,9 +120,22 @@ function currentBucket(now: number): DayBucket {
     // On the day roll, emit the CLOSING aggregate readout for the day that just
     // ended (acceptance #4: a real end-of-day total, not a $0 start-of-day one).
     if (bucket) emitClosingReadout(bucket);
-    bucket = { day, perUser: new Map(), reviewAlerted: false, ceilingAlerted: false };
+    bucket = { day, perUser: new Map(), reserved: new Map(), reviewAlerted: false, ceilingAlerted: false };
   }
   return bucket;
+}
+
+/** Committed + in-flight reserved spend for a user — what the caps actually gate on. */
+function effectiveUserSpend(b: DayBucket, u: string): number {
+  return (b.perUser.get(u) ?? 0) + (b.reserved.get(u) ?? 0);
+}
+
+/** Committed + in-flight reserved spend across ALL users — the company-cap gate input. */
+function effectiveCompanySpend(b: DayBucket): number {
+  let total = 0;
+  for (const spent of b.perUser.values()) total += spent;
+  for (const r of b.reserved.values()) total += r;
+  return total;
 }
 
 function emitClosingReadout(b: DayBucket): void {
@@ -168,7 +207,9 @@ export function agentUserSpendStatus(user: string | undefined, now = Date.now())
  */
 export function isOverUserDailyCap(user: string | undefined, now = Date.now()): boolean {
   const b = currentBucket(now);
-  return (b.perUser.get(userKey(user)) ?? 0) >= dailyUserCapUsd();
+  // TRA-1045 R2 — gate on committed + in-flight reserved spend so a sibling call's
+  // not-yet-reconciled reservation counts here (closes the read-then-write TOCTOU).
+  return effectiveUserSpend(b, userKey(user)) >= dailyUserCapUsd();
 }
 
 /**
@@ -180,9 +221,8 @@ export function isOverUserDailyCap(user: string | undefined, now = Date.now()): 
  */
 export function isOverCompanyDailyCap(now = Date.now()): boolean {
   const b = currentBucket(now);
-  let total = 0;
-  for (const spent of b.perUser.values()) total += spent;
-  return total >= companyDailyCapUsd();
+  // TRA-1045 R2 — include in-flight reservations (see isOverUserDailyCap).
+  return effectiveCompanySpend(b) >= companyDailyCapUsd();
 }
 
 export interface AggregateSpendStatus {
@@ -249,29 +289,110 @@ export function recordAgentSpend(
   const u = userKey(user);
   if (Number.isFinite(costUsd) && costUsd > 0) {
     b.perUser.set(u, (b.perUser.get(u) ?? 0) + costUsd);
-    const agg = agentSpendAggregate(now);
-    if (!b.reviewAlerted && agg.totalUsd >= aggregateReviewUsd()) {
-      b.reviewAlerted = true;
-      log.warn('trading-agents aggregate LLM spend crossed the CFO re-review level', {
-        day: agg.day,
-        totalUsd: agg.totalUsd,
-        reviewUsd: agg.reviewUsd,
-        userCount: agg.userCount,
-      });
-    }
-    // TRA-915 — hard ceiling alert: spend is now cut to zero company-wide for the rest
-    // of the day. Error-level so it pages, distinct from the FYI re-review WARN above.
-    if (!b.ceilingAlerted && agg.overCompanyCap) {
-      b.ceilingAlerted = true;
-      log.error('trading-agents aggregate LLM spend BREACHED the company-wide daily ceiling — LLM advisory now disabled until the day rolls', {
-        day: agg.day,
-        totalUsd: agg.totalUsd,
-        companyCapUsd: agg.companyCapUsd,
-        userCount: agg.userCount,
-      });
-    }
+    maybeEmitAggregateAlerts(b, now);
   }
   return agentUserSpendStatus(u, now);
+}
+
+/**
+ * One-shot WARN when the daily aggregate first crosses the CFO re-review level, and a
+ * one-shot ERROR-level ALERT the first time it reaches the hard company-wide ceiling
+ * (TRA-915). Driven by COMMITTED spend (the real-money readout), shared by every path
+ * that books spend (direct record + reservation commit, TRA-1045 R2).
+ */
+function maybeEmitAggregateAlerts(b: DayBucket, now: number): void {
+  const agg = agentSpendAggregate(now);
+  if (!b.reviewAlerted && agg.totalUsd >= aggregateReviewUsd()) {
+    b.reviewAlerted = true;
+    log.warn('trading-agents aggregate LLM spend crossed the CFO re-review level', {
+      day: agg.day,
+      totalUsd: agg.totalUsd,
+      reviewUsd: agg.reviewUsd,
+      userCount: agg.userCount,
+    });
+  }
+  // TRA-915 — hard ceiling alert: spend is now cut to zero company-wide for the rest
+  // of the day. Error-level so it pages, distinct from the FYI re-review WARN above.
+  if (!b.ceilingAlerted && agg.overCompanyCap) {
+    b.ceilingAlerted = true;
+    log.error('trading-agents aggregate LLM spend BREACHED the company-wide daily ceiling — LLM advisory now disabled until the day rolls', {
+      day: agg.day,
+      totalUsd: agg.totalUsd,
+      companyCapUsd: agg.companyCapUsd,
+      userCount: agg.userCount,
+    });
+  }
+}
+
+/**
+ * A claim on a slice of a user's daily budget for one in-flight paid advisory call
+ * (TRA-1045 R2). Hold it across the awaited model call, then exactly one of
+ * {@link commitReservation} (reconcile to the real cost) or {@link releaseReservation}
+ * (the call ended up free / failed) settles it. Idempotent: a second settle is a no-op.
+ */
+export interface SpendReservation {
+  user: string;
+  /** Reserved estimate, USD — what currently counts toward the caps for this claim. */
+  amountUsd: number;
+  /** Day bucket key the reservation belongs to (guards against a day-roll race). */
+  day: string;
+  settled: boolean;
+}
+
+/**
+ * Atomically admit one in-flight paid advisory call (TRA-1045 R2). This runs the cap
+ * check AND books the reservation in a single synchronous step — with no `await`
+ * between them — so two concurrent callers can never both pass the gate on stale
+ * headroom. Returns a {@link SpendReservation} when the user is under the per-user cap
+ * AND the company is under the daily ceiling (counting already-reserved in-flight
+ * spend); returns null otherwise, signalling the caller to take the deterministic
+ * zero-cost path. Always pair a non-null return with commit/release.
+ */
+export function tryReserveAgentSpend(user: string | undefined, now = Date.now()): SpendReservation | null {
+  const b = currentBucket(now);
+  const u = userKey(user);
+  if (effectiveUserSpend(b, u) >= dailyUserCapUsd()) return null;
+  if (effectiveCompanySpend(b) >= companyDailyCapUsd()) return null;
+  const amountUsd = callCostEstimateUsd();
+  b.reserved.set(u, (b.reserved.get(u) ?? 0) + amountUsd);
+  return { user: u, amountUsd, day: b.day, settled: false };
+}
+
+/** Drop a reservation's hold without booking spend (no-op if already settled or day-rolled). */
+function dropReservation(res: SpendReservation, now: number): DayBucket | null {
+  if (res.settled) return null;
+  res.settled = true;
+  const b = currentBucket(now);
+  // If the day rolled while the call was in flight, the old bucket is gone and its
+  // reservations went with it — nothing to unwind.
+  if (b.day !== res.day) return null;
+  const remaining = (b.reserved.get(res.user) ?? 0) - res.amountUsd;
+  if (remaining > 1e-9) b.reserved.set(res.user, remaining);
+  else b.reserved.delete(res.user);
+  return b;
+}
+
+/**
+ * Reconcile a reservation to the call's REAL cost (TRA-1045 R2): release the in-flight
+ * hold and book the actual committed spend, firing the aggregate alerts on the real
+ * number. Non-positive / non-finite costs book nothing (the hold is simply released).
+ */
+export function commitReservation(
+  res: SpendReservation,
+  actualCostUsd: number,
+  now = Date.now(),
+): void {
+  const b = dropReservation(res, now);
+  if (!b) return;
+  if (Number.isFinite(actualCostUsd) && actualCostUsd > 0) {
+    b.perUser.set(res.user, (b.perUser.get(res.user) ?? 0) + actualCostUsd);
+    maybeEmitAggregateAlerts(b, now);
+  }
+}
+
+/** Release a reservation that booked no spend — the call was free, deferred, or failed. */
+export function releaseReservation(res: SpendReservation, now = Date.now()): void {
+  dropReservation(res, now);
 }
 
 /**

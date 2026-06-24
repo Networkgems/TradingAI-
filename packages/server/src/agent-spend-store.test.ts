@@ -14,6 +14,9 @@ import {
   isOverUserDailyCap,
   recordAgentSpend,
   resetAgentSpendForTests,
+  tryReserveAgentSpend,
+  commitReservation,
+  releaseReservation,
 } from './agent-spend-store.js';
 
 // Two arbitrary days (epoch ms) that fall in different UTC calendar dates.
@@ -86,6 +89,63 @@ describe('company-wide daily ceiling (TRA-915)', () => {
     // New calendar day → aggregate resets, ceiling not breached.
     expect(isOverCompanyDailyCap(DAY2)).toBe(false);
     expect(agentSpendAggregate(DAY2).totalUsd).toBe(0);
+  });
+});
+
+describe('spend reservation — TOCTOU fix (TRA-1045 R2)', () => {
+  it('counts an in-flight reservation toward the per-user cap', () => {
+    recordAgentSpend('alice', 9, DAY1); // $9 committed, $1 headroom
+    expect(isOverUserDailyCap('alice', DAY1)).toBe(false);
+
+    // One in-flight call reserves the default $2 estimate → effective $11 ≥ $10.
+    const res = tryReserveAgentSpend('alice', DAY1);
+    expect(res).not.toBeNull();
+    // A concurrent caller now sees the cap as reached and is denied.
+    expect(isOverUserDailyCap('alice', DAY1)).toBe(true);
+    expect(tryReserveAgentSpend('alice', DAY1)).toBeNull();
+
+    // Reconcile to the real cost → reservation cleared, only the real spend booked.
+    commitReservation(res!, 0.4, DAY1);
+    expect(agentUserSpendStatus('alice', DAY1).spentUsd).toBeCloseTo(9.4, 4);
+    expect(isOverUserDailyCap('alice', DAY1)).toBe(false);
+  });
+
+  it('denies a reservation once the user is already at the cap', () => {
+    recordAgentSpend('alice', 10, DAY1);
+    expect(tryReserveAgentSpend('alice', DAY1)).toBeNull();
+  });
+
+  it('denies a reservation once the company ceiling is reached (counting reservations)', () => {
+    // 11 users committed at $9 each = $99 (< $100); each under their own $10 cap.
+    for (let i = 0; i < 11; i++) recordAgentSpend(`u${i}`, 9, DAY1);
+    expect(isOverCompanyDailyCap(DAY1)).toBe(false);
+    // A $2 reservation tips effective company spend to $101 ≥ $100…
+    const res = tryReserveAgentSpend('u0', DAY1);
+    expect(res).not.toBeNull();
+    // …so the next admitted call (a different user, still under their own cap) is denied.
+    expect(tryReserveAgentSpend('u5', DAY1)).toBeNull();
+    releaseReservation(res!, DAY1);
+    // Released → headroom restored, ledger nets back to committed-only.
+    expect(isOverCompanyDailyCap(DAY1)).toBe(false);
+    expect(tryReserveAgentSpend('u5', DAY1)).not.toBeNull();
+  });
+
+  it('release books no spend; commit with a non-positive cost books nothing', () => {
+    const res1 = tryReserveAgentSpend('alice', DAY1);
+    releaseReservation(res1!, DAY1);
+    expect(agentUserSpendStatus('alice', DAY1).spentUsd).toBe(0);
+
+    const res2 = tryReserveAgentSpend('alice', DAY1);
+    commitReservation(res2!, 0, DAY1);
+    expect(agentUserSpendStatus('alice', DAY1).spentUsd).toBe(0);
+  });
+
+  it('is idempotent — a second settle on the same reservation is a no-op', () => {
+    const res = tryReserveAgentSpend('alice', DAY1);
+    commitReservation(res!, 1, DAY1);
+    commitReservation(res!, 1, DAY1); // ignored
+    releaseReservation(res!, DAY1); // ignored
+    expect(agentUserSpendStatus('alice', DAY1).spentUsd).toBeCloseTo(1, 4);
   });
 });
 

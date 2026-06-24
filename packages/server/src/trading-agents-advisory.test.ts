@@ -92,6 +92,46 @@ describe('adviseSymbol — cap hard-stop (acceptance #1, TRA-915 $10)', () => {
   });
 });
 
+describe('adviseSymbol — concurrent cap holds (TRA-1045 R2 TOCTOU)', () => {
+  it('admits only the calls that fit under the cap when many run in parallel', async () => {
+    const llm = cannedLlm(0.5); // 6 calls/run → $3.00 per real LLM run
+
+    // Seed the user to $9.00 committed — $1.00 of headroom under the $10/day cap, less
+    // than even a single run. Pre-fix, every concurrent caller would read $9 < $10 and
+    // all fire a paid run (TOCTOU); the atomic reservation must admit just one.
+    recordAgentSpend('carol', 9, NOW);
+
+    const results = await Promise.all(
+      Array.from({ length: 6 }, () => adviseSymbol(input, { user: 'carol', enabled: true, llm, now: NOW })),
+    );
+
+    const paid = results.filter(r => r.llmUsed).length;
+    expect(paid).toBe(1); // exactly one in-flight reservation claimed the headroom
+    // Committed spend = $9 seed + one $3 run = $12; it never compounded to $9 + 6×$3.
+    expect(agentUserSpendStatus('carol', NOW).spentUsd).toBeCloseTo(12, 6);
+    expect(isOverUserDailyCap('carol', NOW)).toBe(true);
+    // Every denied call still returns a usable deterministic advisory (no throw, $0).
+    for (const r of results) {
+      expect(r.recommendation.symbol).toBe('AAA');
+      if (!r.llmUsed) expect(r.recommendation.costUsd).toBe(0);
+    }
+  });
+
+  it('reconciles each reservation so headroom is not permanently consumed', async () => {
+    const llm = cannedLlm(0.1); // $0.60 per run — well under the cap
+
+    // Three sequential runs for a fresh user each book only their real cost; the
+    // in-flight reservations ($2 estimate each) must be released, not leaked.
+    await adviseSymbol(input, { user: 'dave', enabled: true, llm, now: NOW });
+    await adviseSymbol(input, { user: 'dave', enabled: true, llm, now: NOW });
+    await adviseSymbol(input, { user: 'dave', enabled: true, llm, now: NOW });
+
+    // 3 × $0.60 = $1.80 committed, far below the cap — proof reservations net to zero.
+    expect(agentUserSpendStatus('dave', NOW).spentUsd).toBeCloseTo(1.8, 6);
+    expect(isOverUserDailyCap('dave', NOW)).toBe(false);
+  });
+});
+
 describe('adviseSymbol — advisor-mode invariant (acceptance #2)', () => {
   it('produces an APPROVE recommendation but NEVER routes it to capital', async () => {
     const llm = cannedLlm(0.01);
