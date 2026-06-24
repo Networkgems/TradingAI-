@@ -211,6 +211,25 @@ services:
       # truthy spellings (1/true/yes/on).
       - key: ENABLE_REVERSAL_SHADOW
         value: "true"
+      # TRA-1060 / TRA-1058 (TRA-1051 F2) — turn ON the COLD-START DAILY-CANDLE
+      # PREFETCH warmer on this demo book for the QuantTrader soak. The warmer
+      # (`crypto-engine.ts warmDailyCandlesOnBoot`) is an async one-shot at boot
+      # that front-loads the daily-candle cache through the SAME paced fetch path
+      # the steady-state tick loop uses (shared Coinbase/Tradier pacer + breaker +
+      # the 1h fetch-gate in `refreshDailyCandles`), self-throttled to
+      # COLD_START_DAILY_PREFETCH_PER_MIN (default 48/min, hard-clamped to 120/min).
+      # Until this is set, `isColdStartDailyPrefetchEnabled()` is false, the warmer
+      # never runs, and `/api/health/cold-start-prefetch` reports `enabled:false,
+      # lastRun:null` — prod behaviour byte-for-byte unchanged.
+      #
+      # SAFETY — NO CAPITAL PATH, NO NEW PROVIDER LOAD CEILING. It only re-uses the
+      # existing paced candle fetchers to warm the cache earlier; it shares the same
+      # rolling req/min meter (`coinbaseBarPullRate` / `tradierBarPullRate` on
+      # `/api/health/quotes`) the soak watches against the ~200/min per-IP ceiling,
+      # and cannot double-fetch a symbol the tick already warmed. Revert = clear this
+      # value (flip the flag off). Accepts the usual truthy spellings (1/true/yes/on).
+      - key: ENABLE_COLD_START_DAILY_PREFETCH
+        value: "true"
       # TRA-713 — persistent live-equity boot-arm (board-ratified approval
       # 979c77c1). FIX for "prod equity Live reverts to demo on restart": the
       # original arm lived only in the running engine's in-memory `mode`, so every
