@@ -409,22 +409,27 @@ const SUPERTREND_SHADOW_REFRESH_MS = 60_000;
 const SUPERTREND_SHADOW_MAX_SIGNALS = MAX_SIGNALS;
 
 /**
- * TRA-1084 — ops kill switch for the OBSERVE-ONLY SupertrendConfluence shadow
- * pass. Parity with `ENABLE_REVERSAL_SHADOW` for ops leverage, but DEFAULT-ON:
- * the supertrend shadow has always run (gated only by market hours), so the flag
- * is a kill, not an opt-in. Set `ENABLE_SUPERTREND_SHADOW=false|off|0|no` to shed
- * its full-universe per-tick supertrend()/confluence eval (the heaviest steady-
- * state shadow load) without shipping code, exactly the leverage the CTO used on
- * the reversal side during the bqb1 502 fire. Any other value (or unset) keeps it
- * on. NOTE: this gates only the supertrend EVAL + paper book — the shared 5m
- * series refresh still runs whenever the reversal shadow is enabled, since
- * reversal capture reads the same `shadowCandleCache` (TRA-1064 accrual).
+ * TRA-1084 / TRA-1082 — ops switch for the OBSERVE-ONLY SupertrendConfluence
+ * shadow pass. Originally DEFAULT-ON, but flipped to DEFAULT-OFF (opt-in) during
+ * the bqb1 502 fire: the full-universe per-tick supertrend()/confluence eval is
+ * the heaviest steady-state shadow load, and even after the per-book boot
+ * stagger + per-25-symbol setImmediate yields + once-per-series-refresh gating,
+ * N demo books each running it once/min kept saturating the single libuv loop
+ * past Render's 5s health-check budget -> restart-loop. The supertrend shadow
+ * evidence has been net-negative/insufficient (TRA-734) and routes no live
+ * capital, so shedding it is capital- and research-safe. Make it OPT-IN
+ * (`ENABLE_SUPERTREND_SHADOW=true|on|1|yes`) so a plain redeploy of HEAD sheds
+ * the load with NO Render env dependency — the render.yaml/Render env divergence
+ * that has repeatedly bitten us (TRA-1064/TRA-1028) cannot silently re-arm it.
+ * NOTE: this gates only the supertrend EVAL + paper book — the shared 5m series
+ * refresh still runs whenever the reversal shadow is enabled, since reversal
+ * capture reads the same `shadowCandleCache` (TRA-1064 accrual, ON via render.yaml).
  */
 const SUPERTREND_SHADOW_FLAG = 'ENABLE_SUPERTREND_SHADOW';
 export function isSupertrendShadowEnabled(env: NodeJS.ProcessEnv = process.env): boolean {
   const raw = env[SUPERTREND_SHADOW_FLAG];
-  if (typeof raw !== 'string') return true;
-  return !['0', 'false', 'no', 'off'].includes(raw.trim().toLowerCase());
+  if (typeof raw !== 'string') return false;
+  return ['1', 'true', 'yes', 'on'].includes(raw.trim().toLowerCase());
 }
 
 /**
