@@ -2,7 +2,7 @@ import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import { tmpdir } from 'os';
 import { join } from 'path';
 import { rmSync, writeFileSync } from 'fs';
-import { SignalEngine, sizeLiveEquityFromStop, shortBlockedOnCashAccount, gateSignalOnReview, describeGatedStrategies, shouldBootArmLiveEquity, shouldRunRelativeValueScan, isLiveBrokerOperator, resolveLiveBrokerOperator } from './signal-engine.js';
+import { SignalEngine, sizeLiveEquityFromStop, shortBlockedOnCashAccount, gateSignalOnReview, describeGatedStrategies, shouldBootArmLiveEquity, shouldRunRelativeValueScan, isLiveBrokerOperator, resolveLiveBrokerOperator, _resetSharedShadowForTests } from './signal-engine.js';
 import { setShadowLedgerFileForTests } from './shadow-signal-ledger.js';
 import {
   setOptionShadowLedgerFileForTests,
@@ -35,6 +35,14 @@ import type {
 
 // Inside an ET trading window: 10:00 AM ET on a Tuesday → 14:00 UTC during EDT.
 const TRADING_TIME = Date.parse('2024-06-04T14:00:00Z');
+
+// TRA-1089 — the shadow 5m candle cache is now module-shared across engines, so
+// it must be cleared between tests or a symbol seeded by one test leaks into a
+// later test that relies on an empty cache (e.g. the "DO NOT seed → trend
+// unknown" RV cases). Resets the fleet-wide window latches too.
+afterEach(() => {
+  _resetSharedShadowForTests();
+});
 
 function makeCandidate(overrides: Partial<RelativeValueCandidate> = {}): RelativeValueCandidate {
   return {

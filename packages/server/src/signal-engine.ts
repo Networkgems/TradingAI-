@@ -238,6 +238,55 @@ const MAX_SIGNALS = 50;
 const EQUITY_EVAL_YIELD_EVERY = 25;
 const yieldToEventLoop = (): Promise<void> => new Promise<void>(resolve => setImmediate(resolve));
 
+// ─────────────────────────────────────────────────────────────────────────────
+// TRA-1089 — shared per-tick shadow research pass.
+//
+// Every per-book SignalEngine computes the IDENTICAL full-universe shadow
+// research each tick (the 5m-series refresh + supertrend/reversal/option-shadow
+// MATH). That work reads only market series + global lookups (earnings, IV
+// history) and writes to global, dedup'd, observe-only ledgers — it carries no
+// per-user/account state, so running it once per engine is pure redundant CPU.
+// With N demo books on bqb1 that is an N-fold synchronous event-loop block on
+// the single libuv loop (the residual TRA-1084 502 driver TRA-1087's fetch
+// dedupe did not cover — that deduped the crypto FETCH, this dedupes the heavy
+// per-book MATH).
+//
+// This module-level coordinator lets exactly ONE engine perform the refresh +
+// eval per refresh window across the whole fleet; the others skip, an ~Nx
+// reduction in the heaviest synchronous leg. The 5m candle cache is module-
+// shared so the single refresh also serves every engine's per-symbol readers
+// (paper exits, option-position trend) and collapses N cache copies to one (a
+// memory win on the constrained box).
+//
+// Flag-gated for an instant ops revert WITHOUT a redeploy: set
+// ENABLE_SHARED_SHADOW_PASS=false on Render to fall back to per-engine behaviour
+// (each engine refreshes + evals its own pass off the same shared cache).
+const sharedShadowCandleCache = new Map<string, Candle[]>();
+/** Window start (ms) of the last fleet-wide shadow 5m-series refresh. */
+let sharedShadowRefreshAt = 0;
+/** The {@link sharedShadowRefreshAt} value at which the eval passes last ran. */
+let sharedShadowEvalAt = 0;
+/** True while one engine is mid-refresh so concurrent ticks skip and don't double-fetch. */
+let sharedShadowRefreshInFlight = false;
+/** Window start (ms) of the last fleet-wide option-shadow selector pass. */
+let sharedOptionShadowAt = 0;
+
+export function isSharedShadowPassEnabled(env: NodeJS.ProcessEnv = process.env): boolean {
+  // Default ON; explicit falsey value reverts to per-engine behaviour.
+  const raw = env.ENABLE_SHARED_SHADOW_PASS;
+  if (raw == null || raw.trim() === '') return true;
+  return !['0', 'false', 'no', 'off'].includes(raw.trim().toLowerCase());
+}
+
+/** Test seam — reset the module-shared shadow cache + window latches between tests. */
+export function _resetSharedShadowForTests(): void {
+  sharedShadowCandleCache.clear();
+  sharedShadowRefreshAt = 0;
+  sharedShadowEvalAt = 0;
+  sharedShadowRefreshInFlight = false;
+  sharedOptionShadowAt = 0;
+}
+
 // TRA-1053 (TRA-1045 R3) — cap on the closed-position history rehydrated into
 // engine memory at boot. The nightly archive (archiveClosedTrades) clears
 // `allClosedPositions`, so in normal operation a snapshot holds at most one
@@ -943,7 +992,15 @@ export class SignalEngine {
    * {@link evaluateSupertrendShadow}. Kept separate from {@link candleCache} so
    * the existing strategies' inputs stay byte-for-byte unchanged.
    */
-  private shadowCandleCache: Map<string, Candle[]> = new Map();
+  // TRA-1089 — module-shared (was a per-instance Map). The 5m series is pure
+  // market data, identical across books, so one fleet-wide copy is both correct
+  // and an N-fold memory saving; the shared per-tick refresh (see
+  // {@link isSharedShadowPassEnabled}) populates it once for every engine's
+  // readers. A getter (not a field) so the existing `this.shadowCandleCache`
+  // call sites are untouched.
+  private get shadowCandleCache(): Map<string, Candle[]> {
+    return sharedShadowCandleCache;
+  }
   /** TRA-787 — last successful shadow 5m-series refresh (gates the 60s cadence). */
   private lastSupertrendShadowRefreshAt = 0;
   /**
@@ -2251,15 +2308,34 @@ export class SignalEngine {
     // reversal capture (TRA-1064), which reads the same `shadowCandleCache`.
     const supertrendShadowOn = isSupertrendShadowEnabled();
     const reversalShadowOn = isReversalShadowEnabled();
+    // TRA-1089 — when the shared pass is ON, the refresh + eval below run at most
+    // once per window across the WHOLE fleet (the first engine to reach this
+    // window claims it; the rest skip), instead of N-fold per engine. When OFF,
+    // each engine falls back to its own per-instance cadence latches. Both modes
+    // read/write the same module-shared `shadowCandleCache`.
+    const sharedShadow = isSharedShadowPassEnabled();
     if (isStockMarketOpen() && (supertrendShadowOn || reversalShadowOn)) {
-      if (Date.now() - this.lastSupertrendShadowRefreshAt >= SUPERTREND_SHADOW_REFRESH_MS) {
-        this.lastSupertrendShadowRefreshAt = Date.now();
+      const nowMs = Date.now();
+      const refreshDue = sharedShadow
+        ? (!sharedShadowRefreshInFlight && nowMs - sharedShadowRefreshAt >= SUPERTREND_SHADOW_REFRESH_MS)
+        : (nowMs - this.lastSupertrendShadowRefreshAt >= SUPERTREND_SHADOW_REFRESH_MS);
+      if (refreshDue) {
+        // Claim the window BEFORE the await so a concurrent engine tick can't
+        // also enter and double-fetch the full universe while this one is mid-
+        // flight (the in-flight latch + advanced timestamp both gate it out).
+        if (sharedShadow) {
+          sharedShadowRefreshAt = nowMs;
+          sharedShadowRefreshInFlight = true;
+        }
+        this.lastSupertrendShadowRefreshAt = nowMs;
         try {
           await this.refreshSupertrendShadowSeries(activeSymbols);
         } catch (err: unknown) {
           supertrendShadowLog.warn('shadow 5m-series refresh threw', {
             reason: err instanceof Error ? err.message : String(err),
           });
+        } finally {
+          if (sharedShadow) sharedShadowRefreshInFlight = false;
         }
       }
       // TRA-801 — close any touched SupertrendConfluence paper positions on the
@@ -2270,12 +2346,17 @@ export class SignalEngine {
       // TRA-1082 — the shadow 5m-series only changes on a refresh (once/min), but
       // `refresh()` is driven back-to-back by the autonomous-demo schedule. Gate
       // the full-universe EVAL passes so they run at most once per new series
-      // (when lastSupertrendShadowRefreshAt advanced since the last eval) instead
-      // of recomputing supertrend()/reversalChecklist() over byte-identical cached
+      // (when the refresh window advanced since the last eval) instead of
+      // recomputing supertrend()/reversalChecklist() over byte-identical cached
       // bars on every sweep — the ~14-sweeps/2s burn that tripped the watchdog.
-      // The per-25-symbol yields below remain the in-sweep backstop. The paper-exit
-      // pass above still runs every tick (its price backstop changes each tick).
-      if (this.lastSupertrendShadowRefreshAt !== this.lastShadowEvalRefreshAt) {
+      // TRA-1089 — under the shared pass the eval gate is fleet-wide (one eval
+      // per refreshed series, not one per engine); the in-flight check stops a
+      // late-arriving engine from eval'ing against a half-populated cache.
+      const evalDue = sharedShadow
+        ? (sharedShadowRefreshAt !== 0 && sharedShadowRefreshAt !== sharedShadowEvalAt && !sharedShadowRefreshInFlight)
+        : (this.lastSupertrendShadowRefreshAt !== this.lastShadowEvalRefreshAt);
+      if (evalDue) {
+        if (sharedShadow) sharedShadowEvalAt = sharedShadowRefreshAt;
         this.lastShadowEvalRefreshAt = this.lastSupertrendShadowRefreshAt;
         // TRA-1082 — awaited: both shadow passes yield to the event loop mid-sweep
         // so the full-universe synchronous indicator burst can't starve Render's 5s
@@ -2333,8 +2414,18 @@ export class SignalEngine {
     // option-structure pass entirely when the kill switch is engaged so the
     // heavy shadow accrual stops driving memory growth on the 512MB starter plan.
     if (!OPTION_SHADOW_EMERGENCY_OFF && isStockMarketOpen() && isOptionShadowEnabled()) {
-      if (Date.now() - this.lastOptionShadowRefreshAt >= OPTION_SHADOW_REFRESH_MS) {
-        this.lastOptionShadowRefreshAt = Date.now();
+      // TRA-1089 — the option-shadow selector is also a global, dedup'd research
+      // pass (reads the module-shared 5m cache + the shared rvScanner, writes the
+      // global option-shadow ledger). Gate it fleet-wide so one engine runs it
+      // per window instead of N; fall back to the per-engine latch when the
+      // shared pass is disabled.
+      const nowMs = Date.now();
+      const optDue = sharedShadow
+        ? (nowMs - sharedOptionShadowAt >= OPTION_SHADOW_REFRESH_MS)
+        : (nowMs - this.lastOptionShadowRefreshAt >= OPTION_SHADOW_REFRESH_MS);
+      if (optDue) {
+        if (sharedShadow) sharedOptionShadowAt = nowMs;
+        this.lastOptionShadowRefreshAt = nowMs;
         try {
           await this.evaluateOptionShadow(activeSymbols);
         } catch (err: unknown) {
