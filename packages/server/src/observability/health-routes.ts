@@ -34,6 +34,11 @@ import {
   computeOptionLearnedWeights,
   type OptionLearnedWeights,
 } from '../learned-option-weights.js';
+import {
+  optionWeightsCache,
+  type CachedOptionWeights,
+  type WeightsFreshness,
+} from '../learned-weights-cache.js';
 import { isExternalIntelEnabled } from '../external-intel.js';
 import { isAnalystAgentEnabled, buildAnalystHealth } from '../analyst-agent.js';
 import {
@@ -554,6 +559,13 @@ export interface OptionJournalReport {
   enabled: boolean;
   summary: OptionTradeJournalSummary;
   weights: OptionLearnedWeights;
+  /**
+   * TRA-1046 (TRA-1041c L1) — freshness of the learned-weights fold. `generation`
+   * bumps on each recompute (a close event or TTL lapse), so a probe can confirm
+   * the weights refreshed intraday after a demo trade closed rather than only at
+   * the EOD snapshot. Present when the report is built through the refresh cache.
+   */
+  weightsFreshness?: WeightsFreshness;
 }
 
 // ── TRA-1000 external-intel source-quality readout ──────────────────────────
@@ -587,11 +599,18 @@ export async function buildSourceQualityReport(
   };
 }
 
-/** Fold the journal rows into the readout report. Pure beyond the clock. */
+/**
+ * Fold the journal rows into the readout report. Pure beyond the clock. When the
+ * caller passes a `cached` fold (TRA-1046) the weights + freshness come from the
+ * intraday refresh cache instead of being recomputed inline, so the readout shows
+ * the same weights live selection would read and a `weightsFreshness.generation`
+ * a probe can watch tick after a demo close.
+ */
 export function buildOptionJournalReport(
   rows: Parameters<typeof summarizeOptionTradeJournal>[0],
   now: number,
   enabled: boolean,
+  cached?: CachedOptionWeights,
 ): OptionJournalReport {
   return {
     ok: true,
@@ -599,7 +618,8 @@ export function buildOptionJournalReport(
     build: resolveBuildInfo(),
     enabled,
     summary: summarizeOptionTradeJournal(rows),
-    weights: computeOptionLearnedWeights(rows),
+    weights: cached?.weights ?? computeOptionLearnedWeights(rows),
+    ...(cached ? { weightsFreshness: cached.freshness } : {}),
   };
 }
 
@@ -743,7 +763,11 @@ export function registerLiveHealthRoutes(app: Express, deps: LiveHealthDeps): vo
   // working after the first closed demo trade without a per-user login.
   app.get('/api/health/option-journal', async (_req, res) => {
     const rows = await listOptionTradeJournal();
-    res.json(buildOptionJournalReport(rows, now(), isOptionTradeJournalEnabled()));
+    // TRA-1046 — serve weights through the intraday refresh cache so the readout
+    // shows the same fold live selection reads, plus a freshness generation a
+    // probe can watch tick after a demo close.
+    const cached = await optionWeightsCache().get();
+    res.json(buildOptionJournalReport(rows, now(), isOptionTradeJournalEnabled(), cached));
   });
 
   // TRA-1000 — external-intel source-quality scorer readout. Folds the

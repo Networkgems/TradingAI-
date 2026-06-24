@@ -14,6 +14,15 @@ import {
   isOptionTradeJournalEnabled,
 } from './option-trade-journal.js';
 import { computeOptionLearnedWeights } from './learned-option-weights.js';
+// TRA-1046 (TRA-1041c L2) — synchronous on-demand hypothesis backtest behind
+// POST /api/backtest, reusing the audited apply→backtest→G0-grade pipeline.
+import {
+  runOnDemandBacktest,
+  validateBacktestRequest,
+  OnDemandBacktestBadRequest,
+  type OnDemandBacktestRequest,
+} from './backtest-on-demand.js';
+import { makeBacktestExecutor, RV_CRYPTO_MAJORS_BASE_CONFIG } from './backtest-executor.js';
 // TRA-1000 — external-intel source-quality scorer: per-source advisory weights
 // folded from the attribution log × hypothesis-queue gate outcomes.
 import { isExternalIntelEnabled } from './external-intel.js';
@@ -3135,6 +3144,38 @@ app.get('/api/health/learned-weights', async (req, res) => {
       reason: err instanceof Error ? err.message : String(err),
     });
     res.status(500).json({ error: 'Failed to compute learned weights' });
+  }
+});
+
+// TRA-1046 (TRA-1041c L2) — on-demand hypothesis backtest. Validates a single
+// param-change hypothesis SYNCHRONOUSLY through the same apply→backtest→G0-grade
+// pipeline the analyst's EOD reflect routine uses, returning the graded result in
+// one round-trip so a param can be checked without overnight latency. Read-only:
+// it never enqueues a ratification item or touches demo/live config — the only
+// path that lands a change stays the board-ratified queue, and live promotion is
+// gated on TRA-382. Auth-gated because a backtest is non-trivial compute.
+const onDemandBacktestExecutor = makeBacktestExecutor();
+app.post('/api/backtest', requireAuth, async (req, res) => {
+  const problem = validateBacktestRequest(req.body);
+  if (problem) {
+    res.status(400).json({ error: problem });
+    return;
+  }
+  try {
+    const result = await runOnDemandBacktest(req.body as OnDemandBacktestRequest, {
+      baseConfig: RV_CRYPTO_MAJORS_BASE_CONFIG,
+      runBacktest: onDemandBacktestExecutor,
+    });
+    res.json({ issue: 'TRA-1046', ...result });
+  } catch (err) {
+    if (err instanceof OnDemandBacktestBadRequest) {
+      res.status(400).json({ error: err.message });
+      return;
+    }
+    log.error('on-demand backtest failed', {
+      reason: err instanceof Error ? err.message : String(err),
+    });
+    res.status(500).json({ error: 'Failed to run backtest' });
   }
 });
 

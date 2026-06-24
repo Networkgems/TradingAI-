@@ -209,6 +209,39 @@ export async function initOptionTradeJournal(): Promise<void> {
   await ensureLoaded();
 }
 
+// TRA-1046 (TRA-1041c L1) — trade-close event hook. The learned-weights fold is
+// recomputed on each close so live selection weights refresh intraday instead of
+// only at the EOD snapshot. To keep this module dependency-free (the learner
+// imports the journal, not the other way round) the close path NOTIFIES a list of
+// subscribers rather than calling the cache directly. Subscribers must be cheap +
+// non-throwing; a thrown listener is swallowed so a bad subscriber can never break
+// the (capital-adjacent) close-recording path.
+type CloseListener = (id: string, close: OptionTradeJournalClose) => void;
+const closeListeners: CloseListener[] = [];
+
+/** Register a listener fired after every successful CLOSE append. */
+export function onOptionTradeClose(fn: CloseListener): void {
+  closeListeners.push(fn);
+}
+
+/** Test seam — drop all close subscribers so tests don't leak across files. */
+export function clearOptionTradeCloseListenersForTests(): void {
+  closeListeners.length = 0;
+}
+
+function notifyClose(id: string, close: OptionTradeJournalClose): void {
+  for (const fn of closeListeners) {
+    try {
+      fn(id, close);
+    } catch (err) {
+      log.warn('option trade close listener threw (ignored)', {
+        id,
+        reason: err instanceof Error ? err.message : String(err),
+      });
+    }
+  }
+}
+
 /**
  * Append an OPEN row for a freshly opened option position. Deduped by `id`: a
  * re-record of an already-open position is a no-op. Returns true iff a new row
@@ -244,6 +277,10 @@ export async function recordOptionTradeClose(
   log.info('option trade journal closed', {
     id, outcome: close.outcome, realizedR: close.realizedR, pnl: close.realizedPnlUsd,
   });
+  // TRA-1046 — a realized close changes the learned-weights fold; notify the
+  // refresh subscribers so the next selection read recomputes (intraday) rather
+  // than waiting for the EOD snapshot.
+  notifyClose(id, close);
 }
 
 /** Classify a signed R-multiple into a WIN/LOSS/SCRATCH verdict. */
