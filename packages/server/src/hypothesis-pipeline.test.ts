@@ -27,11 +27,18 @@ import {
   DEFAULT_BACKTEST_WINDOW,
   type ConfigSnapshot,
   type Hypothesis,
-  type ParamDelta,
   type BacktestExecutor,
 } from './hypothesis-pipeline.js';
 
 // A small config snapshot standing in for the real strategy config tree.
+// Narrow view of the test config tree, used to read nested numbers in assertions
+// without resorting to `any` (which trips eslint's no-explicit-any under the
+// render-build `--max-warnings 0` lint gate).
+type TestConfigShape = {
+  RV_GATE: { minTrendConfluence: number };
+  sleeves: { options: { managedRatio: number } };
+};
+
 function baseConfig(): ConfigSnapshot {
   return {
     CONVICTION_DCA: { optionMinAddDelta: 0.35, maxAdds: 2 },
@@ -130,9 +137,9 @@ describe('param-delta application', () => {
 
     expect(applied.baseline).toBe(0.55);
     expect(applied.applied).toBeCloseTo(0.6, 10);
-    expect((applied.config as any).RV_GATE.minTrendConfluence).toBeCloseTo(0.6, 10);
+    expect((applied.config as unknown as TestConfigShape).RV_GATE.minTrendConfluence).toBeCloseTo(0.6, 10);
     // Base is pristine.
-    expect((base as any).RV_GATE.minTrendConfluence).toBe(0.55);
+    expect((base as unknown as TestConfigShape).RV_GATE.minTrendConfluence).toBe(0.55);
   });
 
   it('reaches nested paths', () => {
@@ -142,7 +149,7 @@ describe('param-delta application', () => {
     });
     const applied = applyHypothesis(baseConfig(), h);
     expect(applied.baseline).toBe(0.5);
-    expect((applied.config as any).sleeves.options.managedRatio).toBe(0.4);
+    expect((applied.config as unknown as TestConfigShape).sleeves.options.managedRatio).toBe(0.4);
   });
 
   it('throws loudly on a target path that is not a finite number', () => {
