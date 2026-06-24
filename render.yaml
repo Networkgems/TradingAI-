@@ -190,6 +190,27 @@ services:
       # opens → nothing to journal). Revert = clear this value.
       - key: ENABLE_OPTION_TRADE_JOURNAL
         value: "true"
+      # TRA-1064 / TRA-921 (TRA-920 desk reversal) — turn ON the REVERSAL-SHADOW
+      # signal ledger (observe-only). The capture (`reversal-shadow-ledger.ts`) is
+      # a durable, append-only JSONL: when the desk S/R-reversal checklist prints a
+      # setup it records the four scored legs + bracket, then resolves TP/SL over a
+      # forward horizon (shared VERBATIM with the Supertrend ledger). Those resolved
+      # rows feed `learned-weights` byScore/byPattern/bySymbol AND give the cold-
+      # start shrinkage estimator (TRA-1056) its non-null global `priorRate`. Until
+      # this is set, `isReversalShadowEnabled()` is false, the pipeline appends
+      # nothing, and `/api/health/reversal-shadow-signals` reports
+      # `flagEnabled:false, count:0` → `learned-weights.priorRate:null` → the
+      # ENABLE_LEARNED_WEIGHT_SHRINKAGE estimate is a literal no-op (shrunk falls
+      # back to neutral 1.0). Populating this is the gating dependency for the
+      # TRA-1062 shrinkage A/B sign-off.
+      #
+      # SAFETY — SCORING-only research accrual, NO CAPITAL PATH. It only RECORDS the
+      # checklist setups the desk reversal agent already evaluates; nothing here
+      # routes an order. Live-capital promotion stays independently gated on
+      # TRA-382. Revert = clear this value (flip the flag off). Accepts the usual
+      # truthy spellings (1/true/yes/on).
+      - key: ENABLE_REVERSAL_SHADOW
+        value: "true"
       # TRA-713 — persistent live-equity boot-arm (board-ratified approval
       # 979c77c1). FIX for "prod equity Live reverts to demo on restart": the
       # original arm lived only in the running engine's in-memory `mode`, so every
