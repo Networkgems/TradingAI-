@@ -39,6 +39,7 @@ import {
   listTradableCoinbaseUsdSymbols,
 } from './crypto-feed.js';
 import { isYahooBreakerOpen } from './yahoo-feed.js';
+import { isColdStartDailyPrefetchEnabled, resolveColdStartPrefetchPerMin } from './daily-prefetch-flag.js';
 import { evaluateFeedFreshness } from './feed-freshness.js';
 import { CryptoPaperAccount } from './crypto-account.js';
 import { CryptoLiveAccount } from './crypto-live-account.js';
@@ -66,6 +67,14 @@ const NEWS_REFRESH_MS = 5 * 60_000;
 // concurrent Map access is safe.
 const sharedDailyCandleCache = new Map<string, Candle[]>();
 const sharedDailyFetchAt = new Map<string, number>();
+// TRA-1051 — in-flight dedup. `sharedDailyFetchAt` is only stamped AFTER the
+// await in `refreshDailyCandles`, so two callers that read it inside the same
+// pre-fetch window (the steady-state tick loop and the cold-start boot warmer)
+// could both miss the 1h gate and double-fetch the same symbol. This set claims
+// a symbol for the duration of its fetch so the second caller early-exits — a
+// strictly protective guard (in steady state symbols are never fetched
+// concurrently, so it's a no-op there).
+const dailyFetchInFlight = new Set<string>();
 
 /**
  * TRA-325 — forced strategy preset override for the LIVE engine. When set in
@@ -306,6 +315,9 @@ export class CryptoSignalEngine {
 
   private tickTimer: ReturnType<typeof setInterval> | null = null;
   private tickRunning = false;
+  // TRA-1051 — one-shot guard so the cold-start daily-candle warmer fires at
+  // most once per process even though `start()`/`refresh()` may be called again.
+  private dailyPrefetchStarted = false;
   /**
    * TRA-407 (C5) — the in-progress tick's promise (resolved when idle).
    * `drain()` awaits this so a graceful shutdown finishes the current tick.
@@ -765,8 +777,67 @@ export class CryptoSignalEngine {
         this.symbolState.set(sym, { symbol: sym, price: 0, volume: 0, change: 0, changePct: 0, lastUpdated: 0 });
       }
     }
+    // TRA-1051 — kick off the one-shot cold-start daily-candle warmer (flag-OFF
+    // by default → no-op). Fire-and-forget so it can't delay the first tick; it
+    // shares `refreshDailyCandles`'s pacer + breaker + 1h fetch-gate, so it can
+    // only front-load the same fetches the tick loop would make, never duplicate
+    // or out-pace the meter beyond its own self-throttled per-minute budget.
+    void this.warmDailyCandlesOnBoot();
     this.tick();
     this.tickTimer = setInterval(() => this.tick(), 60_000);
+  }
+
+  /**
+   * TRA-1051 (TRA-1044 F2) — async, paced, one-shot cold-start prefetch of the
+   * daily-candle cache. At full Coinbase breadth (~395 symbols) a cold cache
+   * means the steady-state tick warms only DAILY_REFRESH_PER_TICK (16) due
+   * symbols per 60s tick, so DCA/swing signals no-data-skip for ~25 min while
+   * the cache fills. This warms the active universe in the background through
+   * the SAME `refreshDailyCandles` path (shared pacer + breaker + 1h gate),
+   * self-throttled to a configurable per-minute budget that is independent of —
+   * and can exceed — the per-tick cap WITHOUT permanently raising the
+   * steady-state burst. OFF by default; gated on a 429-free soak with
+   * QuantTrader sign-off before flag-on (see daily-prefetch-flag.ts).
+   */
+  private async warmDailyCandlesOnBoot(): Promise<void> {
+    if (!isColdStartDailyPrefetchEnabled()) return;
+    if (this.dailyPrefetchStarted) return;
+    this.dailyPrefetchStarted = true;
+
+    const symbols = this.getActiveSymbols();
+    if (symbols.length === 0) return;
+    const perMin = resolveColdStartPrefetchPerMin();
+    const CANDLE_BATCH = 5;
+    // Inter-batch delay that holds the warmer's fetch rate to `perMin`/min.
+    const interBatchDelayMs = Math.ceil((CANDLE_BATCH / perMin) * 60_000);
+    const sleep = (ms: number) => new Promise<void>(resolve => setTimeout(resolve, ms));
+    const startedAt = Date.now();
+    log.info('cold-start daily prefetch starting', {
+      component: 'crypto-daily-prefetch',
+      symbols: symbols.length, perMin, batch: CANDLE_BATCH, interBatchDelayMs,
+    });
+    let warmed = 0;
+    try {
+      for (let i = 0; i < symbols.length; i += CANDLE_BATCH) {
+        // Stop if the engine was torn down mid-warmup.
+        if (this.tickTimer === null && i > 0) break;
+        const slice = symbols.slice(i, i + CANDLE_BATCH);
+        // refreshDailyCandles early-exits on the 1h gate + in-flight guard, so a
+        // symbol the tick loop already warmed costs nothing here.
+        await Promise.all(slice.map(sym => this.refreshDailyCandles(sym)));
+        warmed += slice.length;
+        if (i + CANDLE_BATCH < symbols.length) await sleep(interBatchDelayMs);
+      }
+    } catch (err: unknown) {
+      log.warn('cold-start daily prefetch threw', {
+        component: 'crypto-daily-prefetch',
+        reason: err instanceof Error ? err.message : String(err),
+      });
+    }
+    log.info('cold-start daily prefetch done', {
+      component: 'crypto-daily-prefetch',
+      warmed, elapsedMs: Date.now() - startedAt,
+    });
   }
 
   stop(): void {
@@ -1807,15 +1878,23 @@ export class CryptoSignalEngine {
     const hourMs = 60 * 60 * 1000;
     const lastFetch = sharedDailyFetchAt.get(symbol) ?? 0;
     if (Date.now() - lastFetch < hourMs) return;
-    const bars = await fetchCryptoDailyBars(symbol, 260);
-    // On success gate the next fetch a full hour out; on an empty/rate-limited
-    // result back off only ~5 min so a transient 429 retries soon instead of
-    // leaving the symbol bar-less (and DCA-silent) for a whole hour.
-    sharedDailyFetchAt.set(symbol, bars.length > 0 ? Date.now() : Date.now() - (hourMs - 5 * 60 * 1000));
-    // TRA-593 / TRA-699 — merge so a rate-limited partial daily fetch can't
-    // drop the DCA strategy's 200-day-EMA history below threshold and silence it.
-    if (bars.length > 0) {
-      sharedDailyCandleCache.set(symbol, mergeCandles(sharedDailyCandleCache.get(symbol), bars, 260));
+    // TRA-1051 — claim the symbol so a concurrent caller (cold-start warmer vs
+    // tick loop) can't double-fetch in the pre-stamp window. Released in finally.
+    if (dailyFetchInFlight.has(symbol)) return;
+    dailyFetchInFlight.add(symbol);
+    try {
+      const bars = await fetchCryptoDailyBars(symbol, 260);
+      // On success gate the next fetch a full hour out; on an empty/rate-limited
+      // result back off only ~5 min so a transient 429 retries soon instead of
+      // leaving the symbol bar-less (and DCA-silent) for a whole hour.
+      sharedDailyFetchAt.set(symbol, bars.length > 0 ? Date.now() : Date.now() - (hourMs - 5 * 60 * 1000));
+      // TRA-593 / TRA-699 — merge so a rate-limited partial daily fetch can't
+      // drop the DCA strategy's 200-day-EMA history below threshold and silence it.
+      if (bars.length > 0) {
+        sharedDailyCandleCache.set(symbol, mergeCandles(sharedDailyCandleCache.get(symbol), bars, 260));
+      }
+    } finally {
+      dailyFetchInFlight.delete(symbol);
     }
   }
 
