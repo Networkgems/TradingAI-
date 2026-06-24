@@ -5783,6 +5783,7 @@ async function buildQuotesHealthPayload(): Promise<Record<string, unknown>> {
     testCoinbaseAdvancedTrade,
     testCoinGecko,
     isCoinbaseBreakerOpen,
+    getCoinbaseBarPullRateState,
     fetchCryptoDailyBars,
   } = await import('./crypto-feed.js');
   const results: Record<string, unknown> = {};
@@ -5859,6 +5860,16 @@ async function buildQuotesHealthPayload(): Promise<Record<string, unknown>> {
   // on restart) can't be differenced for a rate.
   try { results['tradierBarPullRate'] = getTradierBarPullRateState(); }
   catch (err) { results['tradierBarPullRate'] = { error: err instanceof Error ? err.message : String(err) }; }
+
+  // TRA-1059 — rolling Coinbase request rate (req/min, 60s window) per host. The
+  // crypto candle cascade (cold-start daily warmer + steady-state tick loop) hits
+  // the Exchange host first and falls back to keyless Advanced Trade, so the load
+  // spans both pacers; `requestsLastMin` is the combined total that must stay
+  // under the ~200/min per-IP ceiling. Companion to the coarse `coinbaseBreakerOpen`
+  // bool below — makes the cold-start-prefetch soak's criterion-2 directly
+  // measurable instead of Render-log-only.
+  try { results['coinbaseBarPullRate'] = getCoinbaseBarPullRateState(); }
+  catch (err) { results['coinbaseBarPullRate'] = { error: err instanceof Error ? err.message : String(err) }; }
 
   // TRA-439 — Twelve Data quota guard: how much of the daily budget is spent
   // and whether the credit/rate-limit breaker is open. Lets QA confirm a

@@ -60,3 +60,55 @@ export function resolveColdStartPrefetchPerMin(env: NodeJS.ProcessEnv = process.
   if (!Number.isFinite(n) || n <= 0) return DEFAULT_PREFETCH_PER_MIN;
   return Math.min(Math.floor(n), MAX_PREFETCH_PER_MIN);
 }
+
+// ── TRA-1059: last-run status for the boot warmer ────────────────────────────
+// `warmDailyCandlesOnBoot` only logged its start/done lines, which are
+// Render-log-only on prod. QuantTrader needs to confirm from an HTTP probe that
+// (a) the flag is actually set on the demo book and (b) what the warm produced,
+// without log access. This in-memory singleton holds the most recent run so
+// `/api/health/cold-start-prefetch` can surface it. Process-global (the warmer is
+// a one-shot per boot) and resets with the process — no persistence needed.
+
+/** Most-recent cold-start prefetch run, as surfaced by the health probe. */
+export interface ColdStartPrefetchRun {
+  /** ISO-8601 start time of the run. */
+  startedAt: string;
+  /** Active-symbol universe size the warmer set out to warm. */
+  symbols: number;
+  /** Resolved per-minute fetch budget for this run. */
+  perMin: number;
+  /** Symbols warmed so far (== `symbols` once `completed`). */
+  warmed: number;
+  /** Wall-clock ms elapsed (final once `completed`, in-progress otherwise). */
+  elapsedMs: number;
+  /** False while the warmer loop is still running; true once it finished. */
+  completed: boolean;
+}
+
+let lastColdStartPrefetchRun: ColdStartPrefetchRun | null = null;
+
+/** Record (or update) the current/last warmer run. Called by the warmer at
+ *  start (completed=false) and on completion (completed=true). */
+export function recordColdStartPrefetchRun(run: ColdStartPrefetchRun): void {
+  lastColdStartPrefetchRun = run;
+}
+
+/** Read-only snapshot for `/api/health/cold-start-prefetch`: the flag/budget the
+ *  process currently sees plus the most-recent run (null if the warmer never ran
+ *  this boot — i.e. flag OFF or no active symbols). */
+export function getColdStartPrefetchStatus(env: NodeJS.ProcessEnv = process.env): {
+  enabled: boolean;
+  perMin: number;
+  lastRun: ColdStartPrefetchRun | null;
+} {
+  return {
+    enabled: isColdStartDailyPrefetchEnabled(env),
+    perMin: resolveColdStartPrefetchPerMin(env),
+    lastRun: lastColdStartPrefetchRun,
+  };
+}
+
+/** Test seam — clear the recorded run between unit tests. */
+export function _resetColdStartPrefetchRunForTests(): void {
+  lastColdStartPrefetchRun = null;
+}

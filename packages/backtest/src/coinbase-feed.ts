@@ -69,8 +69,19 @@ interface HostPacer {
     options?: { timeoutMs?: number },
   ) => Promise<Response>;
   isBreakerOpen: () => boolean;
+  /**
+   * TRA-1059 — rolling count of upstream fetches this pacer actually dispatched
+   * within the trailing {@link COINBASE_RATE_WINDOW_MS}. Counts only requests that
+   * cleared the breaker and were sent (breaker-skipped calls are not load), so it
+   * is the candle/quote req/min headroom gauge against Coinbase's per-IP ceiling.
+   */
+  requestsLastMin: (now: number) => number;
   reset: () => void;
 }
+
+// TRA-1059 — window for the per-host rolling request-rate meter (mirrors the
+// Tradier bar-pull meter in `yahoo-feed.ts`).
+const COINBASE_RATE_WINDOW_MS = 60_000;
 
 interface HostPacerOptions {
   /** Label inserted into log lines (e.g. "exchange" / "advanced-trade"). */
@@ -98,6 +109,27 @@ function createHostPacer(opts: HostPacerOptions): HostPacer {
   // — it only trips on a genuine run of back-to-back failures.
   let consecutiveFailures = 0;
   let breakerOpenUntil = 0;
+
+  // TRA-1059 — timestamps (epoch-ms) of upstream fetches this pacer dispatched,
+  // pruned to the trailing window. Restart-resilient by construction (in-memory,
+  // resets with the process) and mirrors the Tradier bar-pull meter.
+  const reqTimestamps: number[] = [];
+  const recordRequest = (now: number): void => {
+    reqTimestamps.push(now);
+    const cutoff = now - COINBASE_RATE_WINDOW_MS;
+    let drop = 0;
+    while (drop < reqTimestamps.length && reqTimestamps[drop] <= cutoff) drop += 1;
+    if (drop > 0) reqTimestamps.splice(0, drop);
+  };
+  const requestsLastMin = (now: number): number => {
+    const cutoff = now - COINBASE_RATE_WINDOW_MS;
+    let count = 0;
+    for (let i = reqTimestamps.length - 1; i >= 0; i -= 1) {
+      if (reqTimestamps[i] > cutoff) count += 1;
+      else break;
+    }
+    return count;
+  };
 
   const isBreakerOpen = (): boolean => Date.now() < breakerOpenUntil;
 
@@ -135,6 +167,11 @@ function createHostPacer(opts: HostPacerOptions): HostPacer {
         await sleep(opts.minGapMs - elapsed);
       }
       lastRequestAt = Date.now();
+      // TRA-1059 — meter the actual dispatched upstream request (post-pacing,
+      // pre-fetch). Records every call that cleared the breaker, regardless of
+      // whether the fetch later succeeds, since the upstream load is incurred
+      // the moment the request goes out.
+      recordRequest(lastRequestAt);
 
       // TRA-329 — the AbortController is the load-bearing piece. Without it,
       // a slow fetch would leave the chain link open even after the outer
@@ -166,9 +203,10 @@ function createHostPacer(opts: HostPacerOptions): HostPacer {
     breakerOpenUntil = 0;
     chain = Promise.resolve();
     lastRequestAt = 0;
+    reqTimestamps.length = 0;
   };
 
-  return { pace, isBreakerOpen, reset };
+  return { pace, isBreakerOpen, requestsLastMin, reset };
 }
 
 const exchangePacer = createHostPacer({
@@ -196,6 +234,32 @@ export function isCoinbaseBreakerOpen(): boolean {
  */
 export function isCoinbaseAdvancedTradeBreakerOpen(): boolean {
   return advancedTradePacer.isBreakerOpen();
+}
+
+/**
+ * TRA-1059 — rolling per-host Coinbase request-rate meter for `/api/health/quotes`.
+ * Mirrors `getTradierBarPullRateState` in `yahoo-feed.ts`. The crypto candle
+ * cascade (daily warmer + tick loop) hits the Exchange host first
+ * (`api.exchange.coinbase.com`) and falls back to the keyless Advanced Trade host
+ * (`api.coinbase.com`), so the candle load spans BOTH pacers — this surfaces each
+ * separately plus the combined total, the number that must stay under the
+ * ~200/min per-IP ceiling. Counts only requests that cleared the breaker and were
+ * dispatched; breaker-skipped calls are not load and are not counted.
+ */
+export function getCoinbaseBarPullRateState(now: number = Date.now()): {
+  requestsLastMin: number;
+  windowSec: number;
+  exchange: number;
+  advancedTrade: number;
+} {
+  const exchange = exchangePacer.requestsLastMin(now);
+  const advancedTrade = advancedTradePacer.requestsLastMin(now);
+  return {
+    requestsLastMin: exchange + advancedTrade,
+    windowSec: COINBASE_RATE_WINDOW_MS / 1000,
+    exchange,
+    advancedTrade,
+  };
 }
 
 /** Test seam — reset Exchange-pacer breaker / chain state between unit tests. */

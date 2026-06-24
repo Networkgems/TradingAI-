@@ -41,6 +41,7 @@ import {
   type WeightsFreshness,
 } from '../learned-weights-cache.js';
 import { isExternalIntelEnabled } from '../external-intel.js';
+import { getColdStartPrefetchStatus } from '../daily-prefetch-flag.js';
 import { isAnalystAgentEnabled, buildAnalystHealth } from '../analyst-agent.js';
 import {
   loadSourceQualityWeights,
@@ -797,6 +798,24 @@ export function registerLiveHealthRoutes(app: Express, deps: LiveHealthDeps): vo
   // agent has never run). `enabled` mirrors ENABLE_ANALYST_AGENT.
   app.get('/api/health/analyst', async (_req, res) => {
     res.json(await buildAnalystHealth(now(), isAnalystAgentEnabled()));
+  });
+
+  // TRA-1059 — unauthenticated, secrets-free cold-start daily-prefetch warmer
+  // probe. Surfaces the `ENABLE_COLD_START_DAILY_PREFETCH` flag + resolved
+  // per-minute budget and the most-recent `CryptoEngine.warmDailyCandlesOnBoot`
+  // run ({ warmed, elapsedMs, startedAt, completed }). Lets QuantTrader confirm
+  // from one curl that the flag is actually set on the demo book and read the
+  // warm result without Render-log access; `lastRun` is null when the warmer
+  // never ran this boot (flag OFF or no active symbols). No balances/PII —
+  // parity with the other /api/health/* probes.
+  app.get('/api/health/cold-start-prefetch', (_req, res) => {
+    const status = getColdStartPrefetchStatus();
+    res.json({
+      ok: true,
+      time: new Date(now()).toISOString(),
+      build: resolveBuildInfo(),
+      ...status,
+    });
   });
 }
 

@@ -39,7 +39,7 @@ import {
   listTradableCoinbaseUsdSymbols,
 } from './crypto-feed.js';
 import { isYahooBreakerOpen } from './yahoo-feed.js';
-import { isColdStartDailyPrefetchEnabled, resolveColdStartPrefetchPerMin } from './daily-prefetch-flag.js';
+import { isColdStartDailyPrefetchEnabled, resolveColdStartPrefetchPerMin, recordColdStartPrefetchRun } from './daily-prefetch-flag.js';
 import { evaluateFeedFreshness } from './feed-freshness.js';
 import { CryptoPaperAccount } from './crypto-account.js';
 import { CryptoLiveAccount } from './crypto-live-account.js';
@@ -812,9 +812,17 @@ export class CryptoSignalEngine {
     const interBatchDelayMs = Math.ceil((CANDLE_BATCH / perMin) * 60_000);
     const sleep = (ms: number) => new Promise<void>(resolve => setTimeout(resolve, ms));
     const startedAt = Date.now();
+    const startedAtIso = new Date(startedAt).toISOString();
     log.info('cold-start daily prefetch starting', {
       component: 'crypto-daily-prefetch',
       symbols: symbols.length, perMin, batch: CANDLE_BATCH, interBatchDelayMs,
+    });
+    // TRA-1059 — publish the run to the health-probe singleton so QuantTrader can
+    // confirm the flag is set and watch warm progress without Render logs. Marked
+    // completed=false until the loop finishes.
+    recordColdStartPrefetchRun({
+      startedAt: startedAtIso, symbols: symbols.length, perMin,
+      warmed: 0, elapsedMs: 0, completed: false,
     });
     let warmed = 0;
     try {
@@ -826,6 +834,12 @@ export class CryptoSignalEngine {
         // symbol the tick loop already warmed costs nothing here.
         await Promise.all(slice.map(sym => this.refreshDailyCandles(sym)));
         warmed += slice.length;
+        // TRA-1059 — refresh the probe snapshot so an in-flight soak shows live
+        // progress, not just the terminal count.
+        recordColdStartPrefetchRun({
+          startedAt: startedAtIso, symbols: symbols.length, perMin,
+          warmed, elapsedMs: Date.now() - startedAt, completed: false,
+        });
         if (i + CANDLE_BATCH < symbols.length) await sleep(interBatchDelayMs);
       }
     } catch (err: unknown) {
@@ -834,9 +848,14 @@ export class CryptoSignalEngine {
         reason: err instanceof Error ? err.message : String(err),
       });
     }
+    const elapsedMs = Date.now() - startedAt;
     log.info('cold-start daily prefetch done', {
       component: 'crypto-daily-prefetch',
-      warmed, elapsedMs: Date.now() - startedAt,
+      warmed, elapsedMs,
+    });
+    recordColdStartPrefetchRun({
+      startedAt: startedAtIso, symbols: symbols.length, perMin,
+      warmed, elapsedMs, completed: true,
     });
   }
 

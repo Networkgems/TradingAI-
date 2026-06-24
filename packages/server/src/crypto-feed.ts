@@ -5,13 +5,14 @@ import {
   fetchCoinbaseDailyBars,
   fetchCoinbaseMinuteBars,
   isCoinbaseBreakerOpen,
+  getCoinbaseBarPullRateState,
   paceCoinbaseFetch,
   paceCoinbaseAdvancedTradeFetch,
   aggregate1hTo4h,
   fillGrid4h,
 } from '@trading-app/backtest';
 
-export { isCoinbaseBreakerOpen };
+export { isCoinbaseBreakerOpen, getCoinbaseBarPullRateState };
 import { isYahooBreakerOpen, toIsoTime, tripYahooBreakerFromExternal } from './yahoo-feed.js';
 import { logger } from './observability/index.js';
 

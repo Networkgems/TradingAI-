@@ -20,6 +20,7 @@ import {
   fetchCoinbaseHourlyBars,
   fetchCoinbase4hBars,
   fillGrid4h,
+  getCoinbaseBarPullRateState,
   isCoinbaseAdvancedTradeBreakerOpen,
   isCoinbaseBreakerOpen,
   paceCoinbaseAdvancedTradeFetch,
@@ -722,5 +723,85 @@ describe('paceCoinbaseAdvancedTradeFetch (TRA-484)', () => {
 
     expect(stamps).toHaveLength(2);
     expect(stamps[1] - stamps[0]).toBeGreaterThanOrEqual(150);
+  });
+});
+
+describe('getCoinbaseBarPullRateState (TRA-1059)', () => {
+  beforeEach(() => {
+    vi.useFakeTimers();
+    _resetCoinbaseBreakerForTests();
+    _resetCoinbaseAdvancedTradeBreakerForTests();
+  });
+  afterEach(() => {
+    vi.useRealTimers();
+    vi.unstubAllGlobals();
+    _resetCoinbaseBreakerForTests();
+    _resetCoinbaseAdvancedTradeBreakerForTests();
+  });
+
+  it('counts dispatched requests per host and as a combined total', async () => {
+    vi.stubGlobal('fetch', vi.fn(async () => new Response(JSON.stringify({}), { status: 200 })));
+
+    // Two Exchange-host fetches + one Advanced Trade fetch.
+    const calls = [
+      paceCoinbaseFetch('https://api.exchange.coinbase.com/products/BTC-USD/candles', {}, { timeoutMs: 1_000 }),
+      paceCoinbaseFetch('https://api.exchange.coinbase.com/products/ETH-USD/candles', {}, { timeoutMs: 1_000 }),
+      paceCoinbaseAdvancedTradeFetch('https://api.coinbase.com/api/v3/brokerage/market/products/BTC-USD/candles', {}, { timeoutMs: 1_000 }),
+    ];
+    await vi.runAllTimersAsync();
+    await Promise.all(calls);
+
+    const state = getCoinbaseBarPullRateState(Date.now());
+    expect(state.exchange).toBe(2);
+    expect(state.advancedTrade).toBe(1);
+    expect(state.requestsLastMin).toBe(3);
+    expect(state.windowSec).toBe(60);
+  });
+
+  it('prunes requests older than the 60s rolling window', async () => {
+    vi.stubGlobal('fetch', vi.fn(async () => new Response(JSON.stringify({}), { status: 200 })));
+
+    const first = paceCoinbaseFetch('https://api.exchange.coinbase.com/products/BTC-USD/candles', {}, { timeoutMs: 1_000 });
+    await vi.runAllTimersAsync();
+    await first;
+    expect(getCoinbaseBarPullRateState(Date.now()).requestsLastMin).toBe(1);
+
+    // Advance past the window — the recorded timestamp should age out.
+    vi.advanceTimersByTime(61_000);
+    expect(getCoinbaseBarPullRateState(Date.now()).requestsLastMin).toBe(0);
+  });
+
+  it('does not count breaker-skipped calls (no upstream load incurred)', async () => {
+    // Trip the Advanced Trade breaker with 5 hung+aborted fetches.
+    vi.stubGlobal('fetch', vi.fn(async (_url: string | URL, init?: RequestInit) => {
+      const sig = init?.signal ?? null;
+      return new Promise<Response>((_resolve, reject) => {
+        if (!sig) return;
+        const onAbort = () => reject(new DOMException('Aborted', 'AbortError'));
+        if (sig.aborted) onAbort();
+        else sig.addEventListener('abort', onAbort);
+      });
+    }));
+    const failures: Promise<unknown>[] = [];
+    for (let i = 0; i < 5; i++) {
+      failures.push(
+        paceCoinbaseAdvancedTradeFetch(`https://api.coinbase.com/api/v3/brokerage/market/products/SYM${i}/candles`, {}, { timeoutMs: 100 })
+          .catch((e) => e),
+      );
+    }
+    await vi.runAllTimersAsync();
+    await Promise.all(failures);
+    expect(isCoinbaseAdvancedTradeBreakerOpen()).toBe(true);
+
+    const dispatched = getCoinbaseBarPullRateState(Date.now()).advancedTrade;
+    // The 5 dispatched (and failed) calls ARE counted — load was incurred.
+    expect(dispatched).toBe(5);
+
+    // A 6th call fast-fails on the open breaker and is NOT dispatched, so the
+    // meter must not advance.
+    await expect(
+      paceCoinbaseAdvancedTradeFetch('https://api.coinbase.com/api/v3/brokerage/market/products/BTC-USD/candles', {}, { timeoutMs: 5_000 }),
+    ).rejects.toThrow(/advanced-trade breaker open/);
+    expect(getCoinbaseBarPullRateState(Date.now()).advancedTrade).toBe(5);
   });
 });

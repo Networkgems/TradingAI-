@@ -96,6 +96,7 @@ export {
   paceCoinbaseAdvancedTradeFetch,
   isCoinbaseBreakerOpen,
   isCoinbaseAdvancedTradeBreakerOpen,
+  getCoinbaseBarPullRateState,
 } from './coinbase-feed.js';
 export type { GridGap } from './coinbase-feed.js';
 export {
