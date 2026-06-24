@@ -49,6 +49,7 @@ export const WATCHDOG_HEAP_PCT_VAR = 'WATCHDOG_HEAP_PCT';
 export const WATCHDOG_LAG_MS_VAR = 'WATCHDOG_LAG_MS';
 export const WATCHDOG_BREACH_SAMPLES_VAR = 'WATCHDOG_BREACH_SAMPLES';
 export const WATCHDOG_BLOCK_MS_VAR = 'WATCHDOG_BLOCK_MS';
+export const WATCHDOG_BOOT_GRACE_MS_VAR = 'WATCHDOG_BOOT_GRACE_MS';
 
 export interface WatchdogConfig {
   /** Master switch. When false, the watchdog never starts (zero overhead). */
@@ -73,6 +74,20 @@ export interface WatchdogConfig {
    * loose sustained threshold (10s of >2s mean lag) was a no-op against.
    */
   lagMaxMs: number;
+  /**
+   * TRA-1084 — boot/warmup grace. The watchdog measures from process start, but
+   * RESTART trips are suppressed until the process has been up this long. During
+   * warmup the per-book engines synchronously load candle history for the full
+   * watchlist; that legitimately blocks the loop past the acute `lagMaxMs`
+   * threshold for a few seconds. Without a grace the acute trip fires DURING
+   * warmup and self-restarts the box, which re-enters the same warmup — an
+   * infinite restart loop that never reaches steady state (observed bqb1 502:
+   * server_available -> nonZeroExit:1 every ~20s). The grace lets warmup finish;
+   * the steady-state protection (the whole point of TRA-1080) is unaffected
+   * because the real serving-layer death happens ~1h in, far past any grace.
+   * Suppressed trips still log + publish for observability. Set to 0 to disable.
+   */
+  bootGraceMs: number;
 }
 
 /** Defaults chosen so a restart only fires on unambiguous pathology. */
@@ -88,6 +103,12 @@ export const DEFAULT_WATCHDOG: WatchdogConfig = {
   // platform's hard kill. A 4s+ stall on a healthy box is itself pathology
   // (a full GC near the 1.5GB ceiling is ~1-2s), so a false trip is implausible.
   lagMaxMs: 4_000,
+  // 120s: warmup's synchronous candle-load across N per-book engines blocks the
+  // loop past lagMaxMs for a few seconds and was self-restarting the box mid-
+  // warmup in an infinite loop. Trips are suppressed (but still logged) for the
+  // first 2 min so warmup completes; the real serving-layer death this watchdog
+  // exists to catch happens ~1h in, far past this window.
+  bootGraceMs: 120_000,
 };
 
 function envBool(raw: string | undefined, fallback: boolean): boolean {
@@ -113,6 +134,7 @@ export function resolveConfig(env: NodeJS.ProcessEnv = process.env): WatchdogCon
     lagMs: envNum(env[WATCHDOG_LAG_MS_VAR], DEFAULT_WATCHDOG.lagMs, 100, 600_000),
     breachSamples: Math.floor(envNum(env[WATCHDOG_BREACH_SAMPLES_VAR], DEFAULT_WATCHDOG.breachSamples, 1, 600)),
     lagMaxMs: envNum(env[WATCHDOG_BLOCK_MS_VAR], DEFAULT_WATCHDOG.lagMaxMs, 500, 600_000),
+    bootGraceMs: envNum(env[WATCHDOG_BOOT_GRACE_MS_VAR], DEFAULT_WATCHDOG.bootGraceMs, 0, 1_800_000),
   };
 }
 
@@ -195,11 +217,13 @@ export function evaluateSample(
 export interface WatchdogStatus {
   enabled: boolean;
   restartEnabled: boolean;
-  config: { sampleMs: number; heapPct: number; lagMs: number; breachSamples: number; lagMaxMs: number };
+  config: { sampleMs: number; heapPct: number; lagMs: number; breachSamples: number; lagMaxMs: number; bootGraceMs: number };
   /** Most recent sample, or null before the first evaluation. */
   lastSample: (WatchdogSample & { atMs: number }) | null;
   consecutiveHeapBreaches: number;
   consecutiveLagBreaches: number;
+  /** True while still inside the boot/warmup grace window (restart trips suppressed). */
+  inBootGrace: boolean;
   /** True once a trip has fired (process is exiting). */
   tripped: boolean;
   trippedReason: 'heap' | 'lag' | 'block' | null;
@@ -221,6 +245,8 @@ export interface StartWatchdogOptions {
   onTrip?: (decision: TripDecision, sample: WatchdogSample) => void;
   /** Heap reader seam (defaults to V8 + process.memoryUsage). */
   readHeap?: () => { usedBytes: number; limitBytes: number };
+  /** Clock seam for the boot-grace window (defaults to Date.now). */
+  now?: () => number;
 }
 
 let lastStatus: WatchdogStatus | null = null;
@@ -273,6 +299,8 @@ export function startEventLoopWatchdog(opts: StartWatchdogOptions = {}): Watchdo
 
   const readHeap = opts.readHeap ?? defaultReadHeap;
   const onTrip = opts.onTrip ?? defaultOnTrip;
+  const now = opts.now ?? Date.now;
+  const startedAtMs = now();
   const state: WatchdogState = { consecutiveHeapBreaches: 0, consecutiveLagBreaches: 0 };
 
   // ns-resolution event-loop delay histogram. Reset each window so lag reflects
@@ -287,10 +315,11 @@ export function startEventLoopWatchdog(opts: StartWatchdogOptions = {}): Watchdo
     lastStatus = {
       enabled: cfg.enabled,
       restartEnabled: cfg.restartEnabled,
-      config: { sampleMs: cfg.sampleMs, heapPct: cfg.heapPct, lagMs: cfg.lagMs, breachSamples: cfg.breachSamples, lagMaxMs: cfg.lagMaxMs },
+      config: { sampleMs: cfg.sampleMs, heapPct: cfg.heapPct, lagMs: cfg.lagMs, breachSamples: cfg.breachSamples, lagMaxMs: cfg.lagMaxMs, bootGraceMs: cfg.bootGraceMs },
       lastSample: { ...sample, atMs: Date.now() },
       consecutiveHeapBreaches: state.consecutiveHeapBreaches,
       consecutiveLagBreaches: state.consecutiveLagBreaches,
+      inBootGrace: now() - startedAtMs < cfg.bootGraceMs,
       tripped,
       trippedReason,
     };
@@ -328,6 +357,23 @@ export function startEventLoopWatchdog(opts: StartWatchdogOptions = {}): Watchdo
     publish(sample);
 
     if (decision.trip) {
+      // TRA-1084 — suppress (but still surface) trips during the boot/warmup
+      // grace window. Warmup's synchronous candle-load legitimately blocks the
+      // loop past lagMaxMs; restarting there only re-enters warmup -> infinite
+      // restart loop. Reset the sustained counters so a warmup breach never
+      // carries straight into a post-grace trip on the first steady-state sample.
+      if (now() - startedAtMs < cfg.bootGraceMs) {
+        log.warn('watchdog trip suppressed during boot grace — warmup loop block, not steady-state pathology', {
+          reason: decision.reason,
+          detail: decision.detail,
+          graceMsRemaining: Math.max(0, cfg.bootGraceMs - (now() - startedAtMs)),
+          var: WATCHDOG_BOOT_GRACE_MS_VAR,
+        });
+        state.consecutiveHeapBreaches = 0;
+        state.consecutiveLagBreaches = 0;
+        publish(sample);
+        return decision;
+      }
       tripped = true;
       trippedReason = decision.reason ?? null;
       publish(sample);
@@ -353,6 +399,7 @@ export function startEventLoopWatchdog(opts: StartWatchdogOptions = {}): Watchdo
     lagMs: cfg.lagMs,
     lagMaxMs: cfg.lagMaxMs,
     breachSamples: cfg.breachSamples,
+    bootGraceMs: cfg.bootGraceMs,
     restartEnabled: cfg.restartEnabled,
   });
 
@@ -367,10 +414,11 @@ export function startEventLoopWatchdog(opts: StartWatchdogOptions = {}): Watchdo
         lastStatus ?? {
           enabled: cfg.enabled,
           restartEnabled: cfg.restartEnabled,
-          config: { sampleMs: cfg.sampleMs, heapPct: cfg.heapPct, lagMs: cfg.lagMs, breachSamples: cfg.breachSamples, lagMaxMs: cfg.lagMaxMs },
+          config: { sampleMs: cfg.sampleMs, heapPct: cfg.heapPct, lagMs: cfg.lagMs, breachSamples: cfg.breachSamples, lagMaxMs: cfg.lagMaxMs, bootGraceMs: cfg.bootGraceMs },
           lastSample: null,
           consecutiveHeapBreaches: 0,
           consecutiveLagBreaches: 0,
+          inBootGrace: now() - startedAtMs < cfg.bootGraceMs,
           tripped: false,
           trippedReason: null,
         }

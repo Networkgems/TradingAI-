@@ -54,6 +54,13 @@ describe('resolveConfig', () => {
     expect(resolveConfig({ WATCHDOG_BLOCK_MS: '3000' }).lagMaxMs).toBe(3_000);
     expect(resolveConfig({ WATCHDOG_BLOCK_MS: '100' }).lagMaxMs).toBe(500); // clamped up
   });
+
+  it('TRA-1084 — boot grace defaults to 120s and is env-tunable / clamped', () => {
+    expect(resolveConfig({}).bootGraceMs).toBe(120_000);
+    expect(resolveConfig({ WATCHDOG_BOOT_GRACE_MS: '0' }).bootGraceMs).toBe(0); // disable allowed
+    expect(resolveConfig({ WATCHDOG_BOOT_GRACE_MS: '30000' }).bootGraceMs).toBe(30_000);
+    expect(resolveConfig({ WATCHDOG_BOOT_GRACE_MS: '9999999' }).bootGraceMs).toBe(1_800_000); // clamped down
+  });
 });
 
 describe('evaluateSample — heap trip', () => {
@@ -127,7 +134,7 @@ describe('startEventLoopWatchdog', () => {
   it('fires onTrip with a clean exit reason when heap is pinned high', () => {
     const trips: TripDecision[] = [];
     const handle = startEventLoopWatchdog({
-      env: { WATCHDOG_BREACH_SAMPLES: '2', WATCHDOG_HEAP_PCT: '0.9' },
+      env: { WATCHDOG_BREACH_SAMPLES: '2', WATCHDOG_HEAP_PCT: '0.9', WATCHDOG_BOOT_GRACE_MS: '0' },
       readHeap: () => ({ usedBytes: 1500e6, limitBytes: 1536e6 }),
       onTrip: d => trips.push(d),
     });
@@ -148,13 +155,56 @@ describe('startEventLoopWatchdog', () => {
   it('observe-only mode surfaces the trip but never calls onTrip', () => {
     const trips: TripDecision[] = [];
     const handle = startEventLoopWatchdog({
-      env: { WATCHDOG_BREACH_SAMPLES: '1', WATCHDOG_HEAP_PCT: '0.9', WATCHDOG_RESTART_ENABLED: 'false' },
+      env: { WATCHDOG_BREACH_SAMPLES: '1', WATCHDOG_HEAP_PCT: '0.9', WATCHDOG_RESTART_ENABLED: 'false', WATCHDOG_BOOT_GRACE_MS: '0' },
       readHeap: () => ({ usedBytes: 1500e6, limitBytes: 1536e6 }),
       onTrip: d => trips.push(d),
     });
     handle!.sampleNow();
     expect(trips).toHaveLength(0); // restart disabled ⇒ onTrip not invoked
     expect(handle!.status().tripped).toBe(true);
+    handle!.stop();
+  });
+
+  it('TRA-1084 — suppresses the restart trip during the boot grace, then arms after it elapses', () => {
+    const trips: TripDecision[] = [];
+    let clock = 1_000_000;
+    const handle = startEventLoopWatchdog({
+      // Heap pinned high so a single sample breaches (breachSamples=1); grace 120s.
+      env: { WATCHDOG_BREACH_SAMPLES: '1', WATCHDOG_HEAP_PCT: '0.9', WATCHDOG_BOOT_GRACE_MS: '120000' },
+      readHeap: () => ({ usedBytes: 1500e6, limitBytes: 1536e6 }),
+      now: () => clock,
+      onTrip: d => trips.push(d),
+    });
+
+    // 30s in — within the grace window: the breach is evaluated but the restart
+    // is suppressed, and the sustained counter is reset so it can't carry over.
+    clock = 1_000_000 + 30_000;
+    handle!.sampleNow();
+    expect(trips).toHaveLength(0);
+    expect(handle!.status().tripped).toBe(false);
+    expect(handle!.status().inBootGrace).toBe(true);
+    expect(handle!.status().consecutiveHeapBreaches).toBe(0); // reset on suppressed trip
+
+    // 130s in — past the grace window: the same breach now fires the restart.
+    clock = 1_000_000 + 130_000;
+    handle!.sampleNow();
+    expect(trips).toHaveLength(1);
+    expect(trips[0]?.reason).toBe('heap');
+    expect(handle!.status().tripped).toBe(true);
+    expect(handle!.status().inBootGrace).toBe(false);
+    handle!.stop();
+  });
+
+  it('TRA-1084 — boot-grace=0 arms immediately (parity with pre-grace behavior)', () => {
+    const trips: TripDecision[] = [];
+    const handle = startEventLoopWatchdog({
+      env: { WATCHDOG_BREACH_SAMPLES: '1', WATCHDOG_HEAP_PCT: '0.9', WATCHDOG_BOOT_GRACE_MS: '0' },
+      readHeap: () => ({ usedBytes: 1500e6, limitBytes: 1536e6 }),
+      onTrip: d => trips.push(d),
+    });
+    handle!.sampleNow();
+    expect(trips).toHaveLength(1);
+    expect(handle!.status().inBootGrace).toBe(false);
     handle!.stop();
   });
 
