@@ -219,6 +219,18 @@ export interface LiveEquityAcceptance {
 export type EngineEventHandler = (state: EngineState) => void;
 
 const MAX_SIGNALS = 50;
+// TRA-1053 (TRA-1045 R3) — cap on the closed-position history rehydrated into
+// engine memory at boot. The nightly archive (archiveClosedTrades) clears
+// `allClosedPositions`, so in normal operation a snapshot holds at most one
+// trading day's closes — far under this cap. The cap is a backstop for an
+// abnormal snapshot (e.g. a process that ran for many days without the 9 PM ET
+// archive firing) so boot memory cannot scale with unbounded accumulated
+// history. It only ever drops the OLDEST rows beyond the cap; closed positions
+// never feed trading decisions (signals/sizing read open positions + candles),
+// and the dashboard surfaces only the most recent ~20, so a generous cap is
+// invisible in normal use. On-disk export/calendar history is unaffected — it
+// is sourced from per-day EOD report files, not this in-memory list.
+const MAX_RESTORED_CLOSED_POSITIONS = 2_000;
 const NEWS_REFRESH_MS = 5 * 60_000;
 // TRA-602 — StockTwits social-sentiment refresh cadence. Matches the news
 // refresh; the feed's own rate-limit breaker is the harder backstop. Capped to a
@@ -1396,6 +1408,30 @@ export class SignalEngine {
     if (this.tracker) {
       this.tracker.syncOpeningEquity(this.account.getState().totalEquity, 0);
     }
+  }
+
+  /**
+   * TRA-1053 (TRA-1045 R3) — release per-day in-memory ledgers at the nightly
+   * session close so they do not accumulate across trading days (the previous
+   * behaviour left {@link dailySignals} growing without bound for the life of
+   * the process). MUST be called AFTER the EOD report is generated, because the
+   * report reads {@link dailySignals} via {@link getReportSnapshot}.
+   *
+   * No behaviour change to trading decisions:
+   *   • the daily-equity-trades gate filters `dailySignals` by ET date
+   *     (`etDateString(firedAt) === today`), so prior-day records were never
+   *     counted — clearing them only frees memory;
+   *   • the conviction-DCA add-count maps are day-stamped and a record whose
+   *     `etDay` is not today already resolves to 0 adds, so clearing them is a
+   *     no-op for the next day's gate.
+   * The only observable effect is that a position spanning the session close no
+   * longer back-annotates a win/loss `outcome` onto a prior day's signal record
+   * — that record belonged to a report already written, so nothing is lost.
+   */
+  clearDailySessionState(): void {
+    this.dailySignals = [];
+    this.dcaAddsToday.clear();
+    this.dcaOptionAddsToday.clear();
   }
 
   /**
@@ -6516,7 +6552,21 @@ export class SignalEngine {
     /** TRA-936 — optional so legacy snapshots written before the durable forward-test ledger still load. */
     supertrendPaperClosed?: Position[];
   }): void {
-    this.allClosedPositions = [...snap.closedPositions];
+    // TRA-1053 (TRA-1045 R3) — bound the closed-position history rehydrated at
+    // boot so engine memory cannot scale with an abnormally large snapshot.
+    // Keep the most-recent rows (the array is append-ordered by close time, and
+    // getState()/the nightly archive only ever read the tail).
+    if (snap.closedPositions.length > MAX_RESTORED_CLOSED_POSITIONS) {
+      const dropped = snap.closedPositions.length - MAX_RESTORED_CLOSED_POSITIONS;
+      this.allClosedPositions = snap.closedPositions.slice(-MAX_RESTORED_CLOSED_POSITIONS);
+      log.warn('TRA-1053: truncated oversized closed-position history at boot', {
+        restored: this.allClosedPositions.length,
+        dropped,
+        cap: MAX_RESTORED_CLOSED_POSITIONS,
+      });
+    } else {
+      this.allClosedPositions = [...snap.closedPositions];
+    }
     this.recentSignals = [...snap.recentSignals];
     this.dailySignals = [...snap.dailySignals];
     this.positionSignalType = new Map(snap.positionSignalType);

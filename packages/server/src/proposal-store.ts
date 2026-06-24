@@ -111,8 +111,22 @@ export function createProposal(input: CreateProposalInput): TradeProposal {
   return proposal;
 }
 
-/** Drop the oldest non-pending records first, then oldest overall, to stay bounded. */
+// TRA-1053 (TRA-1045 R3) — one-shot guard so the unbounded-growth alert fires
+// once per breach episode (not every tick). Re-armed as soon as a reclaim frees
+// space, so a later breach alerts again.
+let capLeakAlerted = false;
+
+/**
+ * Drop the oldest non-pending records first to stay under the cap.
+ *
+ * TRA-1053 (TRA-1045 R3) — when the cap is hit but EVERY record is still
+ * pending, there is nothing to reclaim. We deliberately do NOT drop pending
+ * proposals to make room: they are in-flight operator-confirmation/audit
+ * records, and silently dropping them would lose audit history. Instead fire a
+ * one-shot ERROR so the unbounded growth is visible rather than a silent leak.
+ */
 function evictOldestResolved(): void {
+  const before = proposals.size;
   const entries = [...proposals.values()].sort((a, b) => a.createdAt - b.createdAt);
   for (const p of entries) {
     if (proposals.size <= MAX_PROPOSALS - 500) break;
@@ -120,6 +134,19 @@ function evictOldestResolved(): void {
       proposals.delete(p.id);
       ownerOf.delete(p.id);
     }
+  }
+  if (proposals.size < before) {
+    // Space was freed — re-arm the alert for the next breach episode.
+    capLeakAlerted = false;
+    return;
+  }
+  // Cap exceeded and nothing reclaimable (all pending). Alert once.
+  if (!capLeakAlerted) {
+    capLeakAlerted = true;
+    log.error(
+      'proposal store at cap with no resolved records to reclaim — store is growing unbounded (all pending); NOT dropping pending audit records',
+      { size: proposals.size, cap: MAX_PROPOSALS },
+    );
   }
 }
 
@@ -194,4 +221,5 @@ export function resetProposalStoreForTests(): void {
   proposals.clear();
   ownerOf.clear();
   seq = 0;
+  capLeakAlerted = false;
 }

@@ -1576,6 +1576,12 @@ async function runDailyCloseForAllUsers(): Promise<void> {
       ctx.engine.resetDailyPnl();
       ctx.cryptoEngine.resetDailyPnl();
 
+      // 2b. TRA-1053 (TRA-1045 R3) — release per-day in-memory ledgers so they
+      // do not accumulate across trading days. Runs AFTER step 1 (the EOD report
+      // reads dailySignals). Stocks-only: CryptoSignalEngine has no dailySignals
+      // / conviction-DCA maps.
+      ctx.engine.clearDailySessionState();
+
       // 3. Archive closed trades.
       const stocks = ctx.engine.archiveClosedTrades();
       const crypto = ctx.cryptoEngine.archiveClosedTrades();

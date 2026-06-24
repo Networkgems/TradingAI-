@@ -4024,6 +4024,83 @@ describe('SignalEngine — SupertrendConfluence shadow channel (TRA-787)', () =>
   });
 });
 
+// TRA-1053 (TRA-1045 R3) — bound in-memory growth: per-day ledgers are released
+// at the session close, and the closed-position history rehydrated at boot is
+// capped so an abnormally large snapshot can't blow up boot memory.
+describe('SignalEngine — TRA-1053 memory bounding', () => {
+  function closedPos(id: string, closedAt: number): Position {
+    return {
+      id,
+      symbol: 'AAPL',
+      side: 'buy',
+      quantity: 1,
+      entryPrice: 100,
+      stopLoss: 99,
+      takeProfit: 102,
+      openedAt: closedAt - 1,
+      closedAt,
+      pnl: 1,
+      mode: 'demo',
+      signalType: 'orb',
+    } as unknown as Position;
+  }
+
+  it('clearDailySessionState() empties dailySignals without touching closed history or the account', () => {
+    const engine = new SignalEngine();
+    engine.importTradeSnapshot({
+      closedPositions: [closedPos('c-1', 1_000), closedPos('c-2', 2_000)],
+      recentSignals: [],
+      dailySignals: [
+        { id: 's1', symbol: 'AAPL', type: 'orb', firedAt: 1_000 },
+        { id: 's2', symbol: 'MSFT', type: 'orb', firedAt: 2_000 },
+      ] as unknown as Parameters<typeof engine.importTradeSnapshot>[0]['dailySignals'],
+      positionSignalType: [],
+      account: { cash: 25_000, equity: 25_000, initialEquity: 25_000, dailyPnl: 0, openPositions: [] },
+      options: { openOptions: [], closedOptions: [], optionsPnl: 0, dailyCount: 0, currentDayKey: '2026-06-23', cash: 25_000, equity: 25_000 },
+    });
+    expect(engine.getReportSnapshot().dailySignals).toHaveLength(2);
+
+    engine.clearDailySessionState();
+
+    expect(engine.getReportSnapshot().dailySignals).toHaveLength(0);
+    // Closed-position history and the account are untouched (no decision impact).
+    expect(engine.exportTradeSnapshot().closedPositions).toHaveLength(2);
+    expect(engine.getState().account.totalEquity).toBe(25_000);
+  });
+
+  it('caps the closed-position history rehydrated at boot to the most-recent rows', () => {
+    const engine = new SignalEngine();
+    const huge = Array.from({ length: 2_001 }, (_, i) => closedPos(`c-${i}`, 1_000 + i));
+    engine.importTradeSnapshot({
+      closedPositions: huge,
+      recentSignals: [],
+      dailySignals: [],
+      positionSignalType: [],
+      account: { cash: 25_000, equity: 25_000, initialEquity: 25_000, dailyPnl: 0, openPositions: [] },
+      options: { openOptions: [], closedOptions: [], optionsPnl: 0, dailyCount: 0, currentDayKey: '2026-06-23', cash: 25_000, equity: 25_000 },
+    });
+    const restored = engine.exportTradeSnapshot().closedPositions;
+    // Bounded to the 2_000 cap, keeping the newest rows (oldest c-0 dropped).
+    expect(restored).toHaveLength(2_000);
+    expect(restored[0]!.id).toBe('c-1');
+    expect(restored.at(-1)!.id).toBe('c-2000');
+  });
+
+  it('leaves a normally-sized closed-position snapshot fully intact at boot', () => {
+    const engine = new SignalEngine();
+    const day = Array.from({ length: 50 }, (_, i) => closedPos(`c-${i}`, 1_000 + i));
+    engine.importTradeSnapshot({
+      closedPositions: day,
+      recentSignals: [],
+      dailySignals: [],
+      positionSignalType: [],
+      account: { cash: 25_000, equity: 25_000, initialEquity: 25_000, dailyPnl: 0, openPositions: [] },
+      options: { openOptions: [], closedOptions: [], optionsPnl: 0, dailyCount: 0, currentDayKey: '2026-06-23', cash: 25_000, equity: 25_000 },
+    });
+    expect(engine.exportTradeSnapshot().closedPositions).toHaveLength(50);
+  });
+});
+
 // TRA-917 (TRA-908 Phase A) — live wiring of the SHADOW option-structure
 // selector. Proves the acceptance criterion end-to-end through the engine:
 // flag OFF = silent (no chain fetch, nothing written); flag ON = a well-formed
