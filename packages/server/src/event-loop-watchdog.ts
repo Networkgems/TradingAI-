@@ -220,6 +220,22 @@ export interface WatchdogStatus {
   config: { sampleMs: number; heapPct: number; lagMs: number; breachSamples: number; lagMaxMs: number; bootGraceMs: number };
   /** Most recent sample, or null before the first evaluation. */
   lastSample: (WatchdogSample & { atMs: number }) | null;
+  /**
+   * TRA-1089 — steady-state high-water mark of `lagMaxMs` across all post-
+   * boot-grace sample windows since this process started. The pathological
+   * tick blocks are 1-window spikes (every 1-2 min), so a single `lastSample`
+   * read almost never catches one; this running peak makes the steady-state
+   * worst case observable from a single poll, which is what the < 4s done
+   * criterion is actually measured against. Null until the first steady-state
+   * sample (warmup samples are excluded so they never pollute the peak).
+   */
+  peakSinceBoot: { lagMaxMs: number; lagMeanMs: number; atMs: number } | null;
+  /**
+   * Ring of the most recent steady-state samples whose `lagMaxMs` cleared the
+   * high-lag record threshold, newest last. Gives the distribution of heavy
+   * ticks over a session without needing Render logs (which only record trips).
+   */
+  recentHighLag: Array<{ lagMaxMs: number; lagMeanMs: number; atMs: number }>;
   consecutiveHeapBreaches: number;
   consecutiveLagBreaches: number;
   /** True while still inside the boot/warmup grace window (restart trips suppressed). */
@@ -311,12 +327,36 @@ export function startEventLoopWatchdog(opts: StartWatchdogOptions = {}): Watchdo
   let tripped = false;
   let trippedReason: 'heap' | 'lag' | 'block' | null = null;
 
+  // TRA-1089 — steady-state lag observability. Peak excludes warmup so a boot
+  // spike never masquerades as a steady-state regression; the ring keeps the
+  // last HIGH_LAG_RING_MAX heavy windows for distribution evidence over a
+  // session. Both are plain in-loop accounting — no extra timers or async, and
+  // the health probe only reads the already-published snapshot.
+  const HIGH_LAG_RECORD_MS = 1_000;
+  const HIGH_LAG_RING_MAX = 32;
+  let peakSinceBoot: { lagMaxMs: number; lagMeanMs: number; atMs: number } | null = null;
+  const recentHighLag: Array<{ lagMaxMs: number; lagMeanMs: number; atMs: number }> = [];
+
   function publish(sample: WatchdogSample): void {
+    const atMs = Date.now();
+    // Only fold steady-state (post-grace) samples into the peak/ring so warmup's
+    // legitimate synchronous candle-load blocks don't pollute the evidence.
+    if (now() - startedAtMs >= cfg.bootGraceMs) {
+      if (!peakSinceBoot || sample.lagMaxMs > peakSinceBoot.lagMaxMs) {
+        peakSinceBoot = { lagMaxMs: sample.lagMaxMs, lagMeanMs: sample.lagMeanMs, atMs };
+      }
+      if (sample.lagMaxMs >= HIGH_LAG_RECORD_MS) {
+        recentHighLag.push({ lagMaxMs: sample.lagMaxMs, lagMeanMs: sample.lagMeanMs, atMs });
+        if (recentHighLag.length > HIGH_LAG_RING_MAX) recentHighLag.shift();
+      }
+    }
     lastStatus = {
       enabled: cfg.enabled,
       restartEnabled: cfg.restartEnabled,
       config: { sampleMs: cfg.sampleMs, heapPct: cfg.heapPct, lagMs: cfg.lagMs, breachSamples: cfg.breachSamples, lagMaxMs: cfg.lagMaxMs, bootGraceMs: cfg.bootGraceMs },
-      lastSample: { ...sample, atMs: Date.now() },
+      lastSample: { ...sample, atMs },
+      peakSinceBoot,
+      recentHighLag: recentHighLag.slice(),
       consecutiveHeapBreaches: state.consecutiveHeapBreaches,
       consecutiveLagBreaches: state.consecutiveLagBreaches,
       inBootGrace: now() - startedAtMs < cfg.bootGraceMs,
@@ -416,6 +456,8 @@ export function startEventLoopWatchdog(opts: StartWatchdogOptions = {}): Watchdo
           restartEnabled: cfg.restartEnabled,
           config: { sampleMs: cfg.sampleMs, heapPct: cfg.heapPct, lagMs: cfg.lagMs, breachSamples: cfg.breachSamples, lagMaxMs: cfg.lagMaxMs, bootGraceMs: cfg.bootGraceMs },
           lastSample: null,
+          peakSinceBoot: null,
+          recentHighLag: [],
           consecutiveHeapBreaches: 0,
           consecutiveLagBreaches: 0,
           inBootGrace: now() - startedAtMs < cfg.bootGraceMs,

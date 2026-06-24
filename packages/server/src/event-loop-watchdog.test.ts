@@ -208,6 +208,31 @@ describe('startEventLoopWatchdog', () => {
     handle!.stop();
   });
 
+  it('TRA-1089 — peakSinceBoot/recentHighLag stay empty during boot grace, then populate after it', () => {
+    let clock = 1_000_000;
+    const handle = startEventLoopWatchdog({
+      env: { WATCHDOG_BREACH_SAMPLES: '5', WATCHDOG_HEAP_PCT: '0.95', WATCHDOG_BOOT_GRACE_MS: '120000' },
+      readHeap: () => ({ usedBytes: 100e6, limitBytes: 1536e6 }),
+      now: () => clock,
+      onTrip: () => {},
+    });
+
+    // 30s in — within grace: warmup samples must never seed the steady-state peak.
+    clock = 1_000_000 + 30_000;
+    handle!.sampleNow();
+    expect(handle!.status().peakSinceBoot).toBeNull();
+    expect(handle!.status().recentHighLag).toEqual([]);
+
+    // 130s in — past grace: the peak now folds in steady-state samples.
+    clock = 1_000_000 + 130_000;
+    handle!.sampleNow();
+    const status = handle!.status();
+    expect(status.peakSinceBoot).not.toBeNull();
+    expect(typeof status.peakSinceBoot?.lagMaxMs).toBe('number');
+    expect(Array.isArray(status.recentHighLag)).toBe(true);
+    handle!.stop();
+  });
+
   it('publishes a snapshot with heap % and breach counters for the health probe', () => {
     const handle = startEventLoopWatchdog({
       env: { WATCHDOG_BREACH_SAMPLES: '5', WATCHDOG_HEAP_PCT: '0.95' },
