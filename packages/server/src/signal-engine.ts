@@ -287,6 +287,37 @@ export function _resetSharedShadowForTests(): void {
   sharedOptionShadowAt = 0;
 }
 
+// TRA-1089 / TRA-1088 — fleet-wide shared shadow-pass coordinator predicates.
+// These are the SINGLE source of truth `refresh()` calls when the shared pass is
+// ON: the first per-book engine to cross a 5m-series window claims the refresh and
+// the eval; the rest skip. Exported so the TRA-1088 double-count guard test can
+// drive N simulated engines through the EXACT same claim logic the engine uses,
+// proving the GLOBAL reversal/option shadow ledger append runs ONCE per window
+// (not N-fold) so the TRA-1064 accrual trajectory QuantTrader is validating
+// (TRA-1062) is byte-identical to a single-engine run. The `_`-prefixed helpers
+// mutate module state and must only be used by `refresh()` and tests.
+/** A new fleet-wide 5m shadow-series refresh is due (and none is in flight). */
+export function _sharedShadowRefreshDue(nowMs: number): boolean {
+  return !sharedShadowRefreshInFlight && nowMs - sharedShadowRefreshAt >= SUPERTREND_SHADOW_REFRESH_MS;
+}
+/** Claim the refresh window BEFORE the await so a concurrent tick can't double-fetch. */
+export function _claimSharedShadowRefresh(nowMs: number): void {
+  sharedShadowRefreshAt = nowMs;
+  sharedShadowRefreshInFlight = true;
+}
+/** Release the in-flight latch once the shared refresh settles (success or throw). */
+export function _endSharedShadowRefresh(): void {
+  sharedShadowRefreshInFlight = false;
+}
+/** The eval passes are due once per FRESH series (refresh advanced, none in flight). */
+export function _sharedShadowEvalDue(): boolean {
+  return sharedShadowRefreshAt !== 0 && sharedShadowRefreshAt !== sharedShadowEvalAt && !sharedShadowRefreshInFlight;
+}
+/** Claim the eval window so subsequent engines in the SAME series skip the pass. */
+export function _claimSharedShadowEval(): void {
+  sharedShadowEvalAt = sharedShadowRefreshAt;
+}
+
 // TRA-1053 (TRA-1045 R3) — cap on the closed-position history rehydrated into
 // engine memory at boot. The nightly archive (archiveClosedTrades) clears
 // `allClosedPositions`, so in normal operation a snapshot holds at most one
@@ -2317,16 +2348,13 @@ export class SignalEngine {
     if (isStockMarketOpen() && (supertrendShadowOn || reversalShadowOn)) {
       const nowMs = Date.now();
       const refreshDue = sharedShadow
-        ? (!sharedShadowRefreshInFlight && nowMs - sharedShadowRefreshAt >= SUPERTREND_SHADOW_REFRESH_MS)
+        ? _sharedShadowRefreshDue(nowMs)
         : (nowMs - this.lastSupertrendShadowRefreshAt >= SUPERTREND_SHADOW_REFRESH_MS);
       if (refreshDue) {
         // Claim the window BEFORE the await so a concurrent engine tick can't
         // also enter and double-fetch the full universe while this one is mid-
         // flight (the in-flight latch + advanced timestamp both gate it out).
-        if (sharedShadow) {
-          sharedShadowRefreshAt = nowMs;
-          sharedShadowRefreshInFlight = true;
-        }
+        if (sharedShadow) _claimSharedShadowRefresh(nowMs);
         this.lastSupertrendShadowRefreshAt = nowMs;
         try {
           await this.refreshSupertrendShadowSeries(activeSymbols);
@@ -2335,7 +2363,7 @@ export class SignalEngine {
             reason: err instanceof Error ? err.message : String(err),
           });
         } finally {
-          if (sharedShadow) sharedShadowRefreshInFlight = false;
+          if (sharedShadow) _endSharedShadowRefresh();
         }
       }
       // TRA-801 — close any touched SupertrendConfluence paper positions on the
@@ -2353,10 +2381,10 @@ export class SignalEngine {
       // per refreshed series, not one per engine); the in-flight check stops a
       // late-arriving engine from eval'ing against a half-populated cache.
       const evalDue = sharedShadow
-        ? (sharedShadowRefreshAt !== 0 && sharedShadowRefreshAt !== sharedShadowEvalAt && !sharedShadowRefreshInFlight)
+        ? _sharedShadowEvalDue()
         : (this.lastSupertrendShadowRefreshAt !== this.lastShadowEvalRefreshAt);
       if (evalDue) {
-        if (sharedShadow) sharedShadowEvalAt = sharedShadowRefreshAt;
+        if (sharedShadow) _claimSharedShadowEval();
         this.lastShadowEvalRefreshAt = this.lastSupertrendShadowRefreshAt;
         // TRA-1082 — awaited: both shadow passes yield to the event loop mid-sweep
         // so the full-universe synchronous indicator burst can't starve Render's 5s

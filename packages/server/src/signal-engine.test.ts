@@ -2,8 +2,15 @@ import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import { tmpdir } from 'os';
 import { join } from 'path';
 import { rmSync, writeFileSync } from 'fs';
-import { SignalEngine, sizeLiveEquityFromStop, shortBlockedOnCashAccount, gateSignalOnReview, describeGatedStrategies, shouldBootArmLiveEquity, shouldRunRelativeValueScan, isLiveBrokerOperator, resolveLiveBrokerOperator, _resetSharedShadowForTests } from './signal-engine.js';
+import { SignalEngine, sizeLiveEquityFromStop, shortBlockedOnCashAccount, gateSignalOnReview, describeGatedStrategies, shouldBootArmLiveEquity, shouldRunRelativeValueScan, isLiveBrokerOperator, resolveLiveBrokerOperator, _resetSharedShadowForTests, _sharedShadowRefreshDue, _claimSharedShadowRefresh, _endSharedShadowRefresh, _sharedShadowEvalDue, _claimSharedShadowEval } from './signal-engine.js';
 import { setShadowLedgerFileForTests } from './shadow-signal-ledger.js';
+import {
+  setReversalShadowLedgerFileForTests,
+  buildReversalShadowOpen,
+  recordReversalShadowSignal,
+  resolveReversalShadowSignal,
+  listReversalShadowSignals,
+} from './reversal-shadow-ledger.js';
 import {
   setOptionShadowLedgerFileForTests,
   initOptionShadowLedger,
@@ -13,7 +20,7 @@ import {
 import { setIvStoreFileForTests, initIvRankStore } from './iv-rank-store.js';
 import { PaperAccount } from './paper-account.js';
 import type { RelativeValueScannerService, RelativeValueScanResult, SelectorChainSnapshot } from './relative-value-scanner.js';
-import type { RelativeValueCandidate, TradierAccountBalance, TradierOptionsClient, TradierOrderClient } from '@trading-app/engine';
+import type { RelativeValueCandidate, TradierAccountBalance, TradierOptionsClient, TradierOrderClient, ReversalChecklist, SrZone } from '@trading-app/engine';
 import {
   DEFAULT_ACCOUNT_SETTINGS,
   isLiveTradierEquityEnabled,
@@ -4301,5 +4308,140 @@ describe('SignalEngine — option-shadow selector wiring (TRA-917)', () => {
     await (engine as unknown as { evaluateOptionShadow: (s: string[]) => Promise<void> }).evaluateOptionShadow(['TEST']);
 
     expect(await listOptionShadowSignals()).toHaveLength(0);
+  });
+});
+
+// ── TRA-1088 — shared shadow pass double-count guard ─────────────────────────
+// TRA-1089 hoisted the per-book reversal/supertrend/option shadow research to a
+// single fleet-wide pass per 5m series. The reversal shadow ledger is a GLOBAL
+// file, so the deferred risk (TRA-1087 item 1) was that hoisting could change
+// the OPEN/RESOLVE row COUNTS feeding the TRA-1064 priorRate accrual QuantTrader
+// is validating (TRA-1062). These tests pin the coordinator invariant: across N
+// simulated engines crossing the SAME window, the eval pass — and therefore the
+// GLOBAL ledger append — runs exactly ONCE, not N-fold.
+describe('SignalEngine — TRA-1088 shared shadow pass double-count guard', () => {
+  const LEDGER_FILE = join(tmpdir(), 'tra1088-reversal-shadow.jsonl');
+
+  beforeEach(() => {
+    rmSync(LEDGER_FILE, { force: true });
+    setReversalShadowLedgerFileForTests(LEDGER_FILE);
+    _resetSharedShadowForTests();
+  });
+
+  afterEach(() => {
+    setReversalShadowLedgerFileForTests(null);
+    rmSync(LEDGER_FILE, { force: true });
+  });
+
+  // A finished checklist with a full bracket → buildReversalShadowOpen yields a
+  // recordable OPEN (all of side/zone/entry/stop/target non-null; see the guard
+  // in reversal-shadow-ledger.ts). Hand-built so the test is independent of the
+  // exact tape that fires reversalChecklist() — we are pinning the COORDINATOR,
+  // not the indicator (the latter is covered by the TRA-921 reversal tests).
+  function bracketChecklist(side: 'long' | 'short'): ReversalChecklist {
+    const zone: SrZone = {
+      kind: side === 'long' ? 'support' : 'resistance',
+      level: 100,
+      lower: 99.5,
+      upper: 100.5,
+      touches: 3,
+      lastTouchIndex: 40,
+    };
+    return {
+      side,
+      zone,
+      atKeyLevel: true,
+      trendBreak: true,
+      unhealthyMove: true,
+      pattern: null,
+      score: 3,
+      confirmed: false,
+      entry: 100,
+      stop: side === 'long' ? 99 : 101,
+      target: side === 'long' ? 103 : 97,
+      riskReward: 3,
+      inTimingWindow: null,
+    };
+  }
+
+  // Drive one fleet-wide tick through the EXACT refresh()/eval gate (the exported
+  // coordinator predicates the engine calls): the refresh claim wraps the (here
+  // synchronous) series refresh, then the eval claim gates the body. Returns
+  // whether THIS engine ran the eval body.
+  async function fleetTick(nowMs: number, evalBody: () => Promise<void>): Promise<boolean> {
+    if (_sharedShadowRefreshDue(nowMs)) {
+      _claimSharedShadowRefresh(nowMs);
+      _endSharedShadowRefresh();
+    }
+    if (_sharedShadowEvalDue()) {
+      _claimSharedShadowEval();
+      await evalBody();
+      return true;
+    }
+    return false;
+  }
+
+  it('N=3 engines over one series → exactly ONE OPEN row; a later series → exactly ONE RESOLVE row', async () => {
+    const N = 3;
+    const open = buildReversalShadowOpen('TEST', bracketChecklist('long'), TRADING_TIME);
+    expect(open).not.toBeNull();
+
+    // Window 1 — the setup prints on a fresh 5m series; all N engines tick.
+    const w1 = TRADING_TIME;
+    let openEvalRuns = 0;
+    for (let i = 0; i < N; i++) {
+      const ran = await fleetTick(w1, async () => {
+        await recordReversalShadowSignal(open!); // the GLOBAL ledger append
+      });
+      if (ran) openEvalRuns += 1;
+    }
+    // The hoist guarantee: the append path executed once, not N times.
+    expect(openEvalRuns).toBe(1);
+    const afterOpen = await listReversalShadowSignals();
+    expect(afterOpen.filter((r) => r.outcome === 'OPEN')).toHaveLength(1);
+
+    // Window 2 — a NEW series advances the refresh window; the forward bars now
+    // resolve the open setup. Again all N engines tick; only one resolves it.
+    const w2 = w1 + 60_000;
+    let resolveEvalRuns = 0;
+    for (let i = 0; i < N; i++) {
+      const ran = await fleetTick(w2, async () => {
+        await resolveReversalShadowSignal(
+          open!.id,
+          { outcome: 'TP_HIT', realizedR: 1.5, barsToResolution: 4 },
+          w2,
+        );
+      });
+      if (ran) resolveEvalRuns += 1;
+    }
+    expect(resolveEvalRuns).toBe(1);
+
+    const final = await listReversalShadowSignals();
+    expect(final).toHaveLength(1); // still one row — open folded into resolved
+    expect(final[0].outcome).toBe('TP_HIT');
+    expect(final[0].resolvedAt).toBe(w2);
+  });
+
+  it('control: without the coordinator gate, N direct appends collapse to one row only via the dedup id — which is why we pin eval invocations, not row counts', async () => {
+    // The parent (TRA-1087 item 1) flagged that the dedup id masks the
+    // duplication: even an un-hoisted N-fold append yields one OPEN row because
+    // `${symbol}:${side}:${entryBarTs}` collapses repeats. Document that here so
+    // the guarantee above is understood to be about the EVAL/append count, not
+    // the post-dedup row count.
+    const N = 3;
+    const open = buildReversalShadowOpen('TEST', bracketChecklist('short'), TRADING_TIME);
+    expect(open).not.toBeNull();
+
+    let appendedTrue = 0;
+    for (let i = 0; i < N; i++) {
+      // No fleetTick gate — every "engine" appends, mimicking per-engine behaviour.
+      if (await recordReversalShadowSignal(open!)) appendedTrue += 1;
+    }
+    // recordReversalShadowSignal returns true only on the FIRST insert; the
+    // ledger still holds exactly one row. The hoist's win is eliminating the N-1
+    // redundant append ATTEMPTS (and the N-fold reversalChecklist() CPU), which
+    // the first test pins via the eval-invocation count.
+    expect(appendedTrue).toBe(1);
+    expect((await listReversalShadowSignals()).filter((r) => r.outcome === 'OPEN')).toHaveLength(1);
   });
 });
