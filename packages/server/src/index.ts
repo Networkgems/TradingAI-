@@ -137,7 +137,12 @@ import {
 } from './stocktwits-feed.js';
 // TRA-779 — replay smoke endpoint proves the captured chains are consumable by
 // the run-options-replay pipe. Server already depends on @trading-app/backtest.
-import { loadChainDays, runOptionsReplay, DEFAULT_REPLAY_CONFIG } from '@trading-app/backtest';
+import {
+  loadChainDays,
+  runOptionsReplay,
+  DEFAULT_REPLAY_CONFIG,
+  estimateSpotFromChain,
+} from '@trading-app/backtest';
 import { buildIdeasFeed, getEntryIntent } from './options-ideas-service.js';
 import {
   getUserAnthropicApiKey,
@@ -149,7 +154,7 @@ import { optionsSpendStatus } from './options-spend-store.js';
 import { agentSpendAggregate } from './agent-spend-store.js';
 import { executionCapStatus } from './agent-execution-caps-store.js';
 import { proposalTtlMs } from './proposal-store.js';
-import { initIvRankStore } from './iv-rank-store.js';
+import { initIvRankStore, recordDailyIv, ivRankSync, atmIvFromRows } from './iv-rank-store.js';
 import { initIdeaJournal, listJournalEntries } from './options-idea-journal.js';
 import { initShadowLedger, listShadowSignals } from './shadow-signal-ledger.js';
 import { initOptionShadowLedger, listOptionShadowSignals, isOptionShadowEnabled, OPTION_SHADOW_EMERGENCY_OFF } from './option-shadow-ledger.js';
@@ -1668,6 +1673,72 @@ async function runChainRecord(): Promise<void> {
       errorMessage: s.errorMessage,
     });
   }
+
+  // TRA-1049 — enrich the freshly-written partition with a stamped `spot` and
+  // `ivRank` so the recorded dataset is non-degenerate for TRA-1047's IVR-floor
+  // sweep (the synthetic TRA-731 set carried ivRank=null, which is exactly the
+  // variable the long-IVR gate reads). The recorder itself is a pure Tradier
+  // data layer with no quote feed or IV store, so we do the enrichment here in
+  // the server where both are available, as a best-effort post-pass:
+  //   spot   — backed out of the chain via put-call parity (estimateSpotFromChain).
+  //   ivRank — atmIvFromRows → recordDailyIv (warms the trailing-year store over
+  //            the recorder's full universe, a superset of the ideas-service feed)
+  //            → ivRankSync against that store. Honest-null until the store has
+  //            >= MIN_IV_SAMPLES, so a cold store never fabricates a rank.
+  // The replay loader reads these top-level file fields (loadChainDays /
+  // options-replay-phasea `readIvRank`). Per-symbol failures are isolated and
+  // never abort the capture.
+  await enrichChainPartition(result.date);
+}
+
+// TRA-1049 — post-pass that stamps `spot` + `ivRank` onto each per-symbol file
+// of the given date partition. Idempotent: re-reads the file the recorder just
+// wrote, adds the two fields, rewrites. Pure best-effort — any error per symbol
+// is logged and skipped.
+async function enrichChainPartition(date: string): Promise<void> {
+  const dir = join(CHAIN_RECORD_OUT_DIR, date);
+  let files: string[];
+  try {
+    files = (await readdir(dir)).filter((f) => f.endsWith('.json') && f !== '_meta.json');
+  } catch {
+    return;
+  }
+  const recordedAt = Date.parse(`${date}T20:00:00Z`); // ~3:55 PM ET capture instant for ranking asOf.
+  let stamped = 0;
+  for (const f of files) {
+    const path = join(dir, f);
+    try {
+      const snap = JSON.parse(await readFile(path, 'utf-8')) as {
+        symbol: string;
+        spot: number | null;
+        recordedAt?: number;
+        rows: import('@trading-app/engine').OptionChainRow[];
+        ivRank?: number | null;
+      };
+      if (!snap || !Array.isArray(snap.rows) || typeof snap.symbol !== 'string') continue;
+      const spot =
+        snap.spot != null && Number.isFinite(snap.spot) && snap.spot > 0
+          ? snap.spot
+          : estimateSpotFromChain(snap.rows);
+      const asOf = typeof snap.recordedAt === 'number' ? snap.recordedAt : recordedAt;
+      const atmIv = spot != null ? atmIvFromRows(snap.rows, spot) : null;
+      if (atmIv != null) {
+        // Warm the trailing-year IV store with this capture, then rank against it.
+        await recordDailyIv(snap.symbol, atmIv, asOf);
+      }
+      const ivRank = atmIv != null ? ivRankSync(snap.symbol, atmIv, asOf) : null;
+      snap.spot = spot ?? null;
+      snap.ivRank = ivRank;
+      await writeFile(path, JSON.stringify(snap), 'utf-8');
+      stamped += 1;
+    } catch (err) {
+      log.warn('chain-recorder enrich failed', {
+        file: f,
+        errorMessage: err instanceof Error ? err.message : String(err),
+      });
+    }
+  }
+  log.info('chain-recorder enriched partition', { date, stamped, total: files.length });
 }
 
 // TRA-845 — Layer-4 alert push. Runs right after the daily chain capture so it
@@ -2343,6 +2414,51 @@ app.get('/api/health/chain-capture', async (_req, res) => {
       covered: baselineCovered,
       missing: PHASE2_BASELINE.filter((s) => !baselineCovered.includes(s)),
     },
+  });
+});
+
+// TRA-1049 — recorded-partition export. The chains live only on the Render
+// persistent disk (`/data/option-chains`); QuantTrader's backtest box has no
+// shell/disk access to it, so the recorder dataset cannot be consumed off-box
+// without a transport. This bounded read-only endpoint streams one date
+// partition's per-symbol snapshots (the same JSON `loadChainDays` reads) so the
+// backtest box can mirror the dataset locally and run the TRA-1047 T2/T3 sweeps.
+// `scripts/pull-recorded-chains.mjs` walks `chain-capture`'s date list and pulls
+// each partition through here. One date per request keeps the payload bounded;
+// the `:date` param is regex-validated to block path traversal.
+app.get('/api/health/chain-capture/partition/:date', async (req, res) => {
+  const DATE_PARTITION = /^\d{4}-\d{2}-\d{2}$/;
+  const date = String(req.params.date ?? '');
+  if (!DATE_PARTITION.test(date)) {
+    res.status(400).json({ error: 'date must be YYYY-MM-DD' });
+    return;
+  }
+  const dir = join(CHAIN_RECORD_OUT_DIR, date);
+  let files: string[];
+  try {
+    files = (await readdir(dir)).filter((f) => f.endsWith('.json'));
+  } catch {
+    res.status(404).json({ error: 'partition not found', date });
+    return;
+  }
+  const symbols: unknown[] = [];
+  let meta: unknown = null;
+  for (const f of files) {
+    try {
+      const parsed = JSON.parse(await readFile(join(dir, f), 'utf-8'));
+      if (f === '_meta.json') meta = parsed;
+      else symbols.push(parsed);
+    } catch {
+      // Skip a corrupt file rather than failing the whole partition.
+    }
+  }
+  res.json({
+    issue: 'TRA-1049',
+    date,
+    outDir: CHAIN_RECORD_OUT_DIR,
+    symbolCount: symbols.length,
+    meta,
+    symbols,
   });
 });
 
