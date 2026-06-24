@@ -81,6 +81,17 @@ export interface RelativeValueScannerOptions {
   /** Reject rows with open interest below this (default 250). */
   minOpenInterest?: number;
   /**
+   * TRA-1057 (TRA-1047 sign-off) — reject rows whose *today's* traded volume
+   * falls below this floor. A liquidity gate complementary to `minOpenInterest`:
+   * OI is the resting book, volume is whether the contract actually trades today
+   * (so a fill is realistic and the mark is fresh). DEFAULT 0 = OFF, so prod
+   * behaviour is unchanged until the executing path opts in behind
+   * `isOptionExecEnabled()`. The T2/T3 sweep on the recorded Tradier chains
+   * (TRA-1049 data) found floor=25 flips the 25-day book P&L −163 → +99 and
+   * halves maxDD 1.77% → 0.95%; see docs/reviews/tra1047-options-trade-quality-readout.md.
+   */
+  minDailyVolume?: number;
+  /**
    * Reject rows whose mark falls below this dollar floor (default 0.40 —
    * `RV_MIN_MARK_FLOOR`, the TRA-461 sub-tick / penny-option guard).
    */
@@ -112,6 +123,9 @@ const DEFAULTS: Required<Omit<RelativeValueScannerOptions, 'now'>> = {
   dividendYield: 0,
   maxSpreadPct: 0.10,
   minOpenInterest: 250,
+  // TRA-1057 — default OFF (0): a volume floor of 0 rejects nothing, so prod
+  // behaviour is unchanged until the executing path passes a positive floor.
+  minDailyVolume: 0,
   minMark: RV_MIN_MARK_FLOOR,
   minGroupSize: 5,
   zScoreThreshold: 2.0,
@@ -382,6 +396,11 @@ export function findRelativeValueOpportunities(
       if (spreadPct > opts.maxSpreadPct) continue;
       const oi = row.openInterest ?? 0;
       if (oi < opts.minOpenInterest) continue;
+      // TRA-1057 — today-volume liquidity floor (default 0 = off). Complements
+      // the resting-book OI gate above: rejects rows that aren't actually
+      // trading today so a fill is realistic and the mark is fresh.
+      const vol = row.volume ?? 0;
+      if (vol < opts.minDailyVolume) continue;
 
       const dte = daysToExpiration(row.expiration, now);
       if (dte <= 0) continue;

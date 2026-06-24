@@ -4,11 +4,13 @@ import {
   isOptionEmaPullbackEnabled,
   isOptionVolumeBreakoutEnabled,
   resolveRvLongDteOverride,
+  resolveRvMinDailyVolume,
   OPTION_EXEC_FLAG,
   OPTION_EMA_PULLBACK_FLAG,
   OPTION_VOLUME_BREAKOUT_FLAG,
   OPTION_RV_LONG_DTE_MIN_VAR,
   OPTION_RV_LONG_DTE_MAX_VAR,
+  OPTION_RV_MIN_DAILY_VOLUME_VAR,
 } from './option-exec-flag.js';
 
 const ON = '1';
@@ -73,5 +75,21 @@ describe('resolveRvLongDteOverride (item 3)', () => {
       min: 45,
       max: undefined,
     });
+  });
+});
+
+describe('resolveRvMinDailyVolume (TRA-1057)', () => {
+  it('defaults to 0 (off) when unset so the scanner volume gate is a no-op', () => {
+    expect(resolveRvMinDailyVolume({})).toBe(0);
+  });
+
+  it('parses a positive floor (recommended 25 per the recorded-chain sweep)', () => {
+    expect(resolveRvMinDailyVolume({ [OPTION_RV_MIN_DAILY_VOLUME_VAR]: '25' })).toBe(25);
+  });
+
+  it('falls back to 0 for non-positive / non-finite values', () => {
+    expect(resolveRvMinDailyVolume({ [OPTION_RV_MIN_DAILY_VOLUME_VAR]: '0' })).toBe(0);
+    expect(resolveRvMinDailyVolume({ [OPTION_RV_MIN_DAILY_VOLUME_VAR]: '-5' })).toBe(0);
+    expect(resolveRvMinDailyVolume({ [OPTION_RV_MIN_DAILY_VOLUME_VAR]: 'abc' })).toBe(0);
   });
 });

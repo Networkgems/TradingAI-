@@ -1,5 +1,5 @@
 import { OrbStrategy, BbFadeStrategy, IchimokuStrategy, SupertrendConfluenceStrategy, confluenceSide, supertrend, reversalChecklist, adx, atr, donchian, supportResistance, blackScholesDelta, daysToExpiration, selectRvLongCandidate, selectShadowOptionSignal, emaPullbackTrigger, volumeConfirmedBreakout, TradierOptionsClient, TradierOrderClient, TRADIER_REJECTED_STATUSES, evaluateSma200, SMA200_MIN_BARS, SMA200_DEBOUNCE_BARS, composeTechnicalSnapshot, resampleCandles, TF_BUCKET_MS, OptionsRiskBreaker, DEFAULT_OPTIONS_BREAKER_PARAMS } from '@trading-app/engine';
-import type { StrategySelectorInput, ContractQuote, OptionTrend, RvLongTrendSide, ExitState, SharedTickIndicators } from '@trading-app/engine';
+import type { StrategySelectorInput, ContractQuote, OptionTrend, RvLongTrendSide, ExitState, SharedTickIndicators, RelativeValueScannerOptions } from '@trading-app/engine';
 import type { TradierAccountBalance } from '@trading-app/engine';
 import { WATCHLIST, isLiquidSwingSymbol, checkEquitySwingClose, MANAGED_ACCOUNT_RATIO, MAX_CONSECUTIVE_LOSSES, DAILY_DRAWDOWN_HALT_PCT, OPTIONS_PER_TICKET_DOLLAR_FLOOR, OPTIONS_POSITION_CAP_RATIO, aliasWatchlistSymbol, isLiveTradierOptionsEnabled, isStockMarketOpen, perPositionCap, resolveAutoManageImportedTradierOptions, resolveDemoCostModel, resolveHoldLiveOptionsOvernight, resolveLiveTradeEquitiesTradier, resolveManagedAccountRatio, resolveMarketReviewGatesEnabled, resolveRiskPerTrade, resolveRvDtePrefs, resolveTradierOptionsCreds, validateBracket, DEFAULT_RV_DTE_MIN, DEFAULT_RV_DTE_MAX, DEFAULT_RV_DTE_TARGET, scoreNewsSentiment, aggregateSymbolSentiment, aggregateFedSentiment, aggregateStockTwitsSentiment, dedupeStockTwitsMessages, mapCuratedMessagesBySymbol, nameAliasesFor, evaluateEquityDcaAdd, evaluateOptionDcaAdd, CONVICTION_DCA, blendedAverage, positionRiskDollars, minutesToSessionClose, getEasternUtcOffset } from '@trading-app/shared';
 import type { TradeSignal, RelativeValueSignal, Sma200Signal, Candle, OptionsAccountState, SignalType, Position, OptionPosition, AccountMode, AccountSettings, AccountState, NewsItem, SymbolSentiment, SocialSentiment, StockTwitsMessage, TechnicalSignalSnapshot, TradierEnv, MarketReview, MarketReviewGates, EngineMarketReviewState, GatedStrategyNote, AgentRecommendation, TradeProposal, AgentOrderAudit, GuardrailVerdict } from '@trading-app/shared';
@@ -47,7 +47,7 @@ import {
   optionJournalToStrategyRows,
 } from './strategy-introspection.js';
 import { isOptionShadowEnabled, isOptionPhaseBEnabled, emitShadowOptionSignal, shadowSignalToSpreadParams, OPTION_SHADOW_EMERGENCY_OFF } from './option-shadow-ledger.js';
-import { isOptionExecEnabled, isOptionEmaPullbackEnabled, isOptionVolumeBreakoutEnabled, resolveRvLongDteOverride } from './option-exec-flag.js';
+import { isOptionExecEnabled, isOptionEmaPullbackEnabled, isOptionVolumeBreakoutEnabled, resolveRvLongDteOverride, resolveRvMinDailyVolume } from './option-exec-flag.js';
 import { etDateString } from './scheduler.js';
 // TRA-995 (epic-C, self-regulation) — the standing risk autopilot. A pure
 // tighten-only decision module; the governor below is its mutation boundary and
@@ -2722,9 +2722,20 @@ export class SignalEngine {
     // defaults on every call so a settings edit takes effect on the next
     // scan tick.
     const dtePrefs = { min: this.rvDteMin, max: this.rvDteMax, target: this.rvDteTarget };
+
+    // TRA-1057 (TRA-1047 sign-off) — today-volume liquidity floor on the
+    // EXECUTING RV long path only. Gated behind `isOptionExecEnabled()` so the
+    // default prod scan is unchanged: when the exec flag is off we pass no opts
+    // and the scanner's volume gate stays at its 0/off default. The floor itself
+    // also defaults to 0 (off) until QuantTrader sets `OPTION_RV_MIN_DAILY_VOLUME`
+    // after a longer forward window (recommended 25 per the recorded-chain sweep).
+    const scanOpts: RelativeValueScannerOptions | undefined = isOptionExecEnabled()
+      ? { minDailyVolume: resolveRvMinDailyVolume() }
+      : undefined;
+
     for (const sym of activeSymbols) {
       try {
-        const result = await this.rvScanner.scan(sym, undefined, dtePrefs);
+        const result = await this.rvScanner.scan(sym, scanOpts, dtePrefs);
         if (result.reason !== 'ok' || result.candidates.length === 0) continue;
 
         // TRA-968 — gate the single-leg long on the daily-trend confluence and
@@ -2811,6 +2822,11 @@ export class SignalEngine {
           const atmIv = snap ? atmIvFromRows(snap.rows, snap.spot) : null;
           const ivRank = atmIv != null ? ivRankSync(sym, atmIv, asOf) : null;
 
+          // TRA-1057 (TRA-1047 sign-off) — AFFIRMED, no change. The recorded-chain
+          // T2/T3 sweep validated this IVR ≤ 25 long-premium floor as the single
+          // strongest selection lever (A7: halves entries, lowest drawdown). The
+          // demo bleed was the IVR-blind legacy/RV path, not this threshold, so the
+          // 25 cutoff stands as-is. See docs/reviews/tra1047-options-trade-quality-readout.md.
           if (ivRank !== null && ivRank > 25) {
             // Mid/high IVR — route to a defined-risk spread when Phase B is
             // enabled and the gate matrix fires; otherwise stand down silently.

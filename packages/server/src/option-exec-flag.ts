@@ -108,3 +108,29 @@ export function resolveRvLongDteOverride(env: NodeJS.ProcessEnv = process.env): 
   }
   return { min, max };
 }
+
+// --------------------------------------------------------------------------
+// TRA-1057 (TRA-1047 sign-off) — RV scanner today-volume liquidity floor.
+//
+// The T2/T3 sweep on the recorded Tradier chains (TRA-1049 data) found a
+// minDailyVolume floor of 25 flips the 25-day book P&L −163 → +99 and halves
+// maxDD 1.77% → 0.95%. This exposes the floor as an env override so QuantTrader
+// can enable it on the executing RV long path (behind `isOptionExecEnabled()`)
+// after a longer forward window WITHOUT a code change. DEFAULT 0 = OFF, so the
+// scanner rejects nothing on volume and prod behaviour is unchanged until set.
+// A non-finite / non-positive value falls back to 0 (off). Live-capital
+// promotion stays gated on TRA-382 regardless.
+// --------------------------------------------------------------------------
+
+export const OPTION_RV_MIN_DAILY_VOLUME_VAR = 'OPTION_RV_MIN_DAILY_VOLUME';
+
+/**
+ * Resolve the RV scanner's today-volume floor for the executing long path.
+ * Returns 0 (off) when unset/invalid so the scanner's volume gate is a no-op
+ * and prod behaviour is unchanged; returns the positive floor (e.g. 25) when
+ * QuantTrader sets the env var. The caller only wires this in when
+ * `isOptionExecEnabled()` is true.
+ */
+export function resolveRvMinDailyVolume(env: NodeJS.ProcessEnv = process.env): number {
+  return parsePositiveInt(env[OPTION_RV_MIN_DAILY_VOLUME_VAR]) ?? 0;
+}

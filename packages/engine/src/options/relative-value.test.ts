@@ -162,6 +162,54 @@ describe('findRelativeValueOpportunities', () => {
     expect(result.find((r) => r.strike === 105)).toBeUndefined();
   });
 
+  // TRA-1057 (TRA-1047 sign-off) — today-volume liquidity floor. DEFAULT 0 = off
+  // (prod unchanged); the executing path opts in to a positive floor (recommended
+  // 25 per the recorded-chain sweep) behind isOptionExecEnabled().
+  describe('TRA-1057 — minDailyVolume gate', () => {
+    it('rejects a row trading below the volume floor when the floor is set', () => {
+      const strikes = [90, 95, 100, 105, 110, 115];
+      const overrides = new Map<number, Partial<OptionChainRow>>([
+        [105, { volume: 5 }], // below a floor of 25
+      ]);
+      const calls = buildChain(strikes, 'call', 0.30, undefined, overrides);
+
+      const result = findRelativeValueOpportunities(calls, SPOT, {
+        ...SCAN_OPTS,
+        minDailyVolume: 25,
+      });
+      expect(result.find((r) => r.strike === 105)).toBeUndefined();
+      // Every other strike (volume 500) clears the floor.
+      expect(result.length).toBe(strikes.length - 1);
+    });
+
+    it('admits the same low-volume row when the floor is left at its 0/off default', () => {
+      const strikes = [90, 95, 100, 105, 110, 115];
+      const overrides = new Map<number, Partial<OptionChainRow>>([
+        [105, { volume: 5 }],
+      ]);
+      const calls = buildChain(strikes, 'call', 0.30, undefined, overrides);
+
+      // No minDailyVolume override → default 0 → gate is a no-op.
+      const result = findRelativeValueOpportunities(calls, SPOT, SCAN_OPTS);
+      expect(result.find((r) => r.strike === 105)).toBeDefined();
+      expect(result.length).toBe(strikes.length);
+    });
+
+    it('treats a missing volume field as 0 and rejects it under a positive floor', () => {
+      const strikes = [90, 95, 100, 105, 110, 115];
+      const overrides = new Map<number, Partial<OptionChainRow>>([
+        [105, { volume: undefined }],
+      ]);
+      const calls = buildChain(strikes, 'call', 0.30, undefined, overrides);
+
+      const result = findRelativeValueOpportunities(calls, SPOT, {
+        ...SCAN_OPTS,
+        minDailyVolume: 25,
+      });
+      expect(result.find((r) => r.strike === 105)).toBeUndefined();
+    });
+  });
+
   it('skips groups smaller than minGroupSize', () => {
     const calls = buildChain([95, 100, 105], 'call', 0.30); // 3 < default 5
     const result = findRelativeValueOpportunities(calls, SPOT, SCAN_OPTS);

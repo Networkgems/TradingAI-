@@ -128,6 +128,30 @@ Caveat carried on both: **26 trading days is a small, calm sample.** The T2 read
 T3 because the gates act at *entry* (independent of the holding window), whereas the breaker needs a
 loss event the window lacks. None of this flips prod; recommendations are flag-gated and forward-gated.
 
+## 4b. Implementation (TRA-1057 — LeadDev, flag-gated OFF)
+
+T2 implemented net-new, prod behaviour unchanged:
+- **`minDailyVolume` knob** on the RV scanner — `RelativeValueScannerOptions.minDailyVolume`,
+  `DEFAULTS.minDailyVolume = 0` (off; rejects nothing). Applied in the per-row prepared-rows loop
+  in `packages/engine/src/options/relative-value.ts` alongside the existing `minOpenInterest` gate
+  (`vol = row.volume ?? 0; if (vol < opts.minDailyVolume) continue`).
+- **Wired into the executing RV long path** in `packages/server/src/signal-engine.ts`
+  (`runRelativeValueScan`) ONLY when `isOptionExecEnabled()` is true; the floor itself reads env
+  `OPTION_RV_MIN_DAILY_VOLUME` via `resolveRvMinDailyVolume()` (`packages/server/src/option-exec-flag.ts`,
+  default 0 = off). When the exec flag is off the scan passes no opts → identical to prior prod path.
+  Recommended floor when enabled: **25**.
+- **IVR≤25 long-premium floor AFFIRMED, no change** — comment cross-reference added at the gate in
+  `signal-engine.ts`; the sweep validated it as the strongest selection lever (A7).
+- **Not done, by design** (sweep-validated no-change): no separate entry slippage reject (half-spread
+  == 0.5·relSpread, already covered by the 10% relative cap); breaker held at 2R/5%; vol-Kelly stays
+  `enabled:false`.
+- Unit tests: `relative-value.test.ts` (gate rejects below-floor + missing-volume rows; off-by-default
+  admits them) and `option-exec-flag.test.ts` (`resolveRvMinDailyVolume`).
+
+Enable gate: QuantTrader forward-validates on a ≥~3-month recorded window (must include a drawdown day
+for any breaker re-look) before flipping `OPTION_RV_MIN_DAILY_VOLUME` on a demo book. Live still gated
+on TRA-382.
+
 ## 5. Files
 - Sweep driver: `packages/backtest/tra1047-sweep.mjs` (run from `packages/backtest`,
   `DATA=../../data/option-chains`).
