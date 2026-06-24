@@ -69,6 +69,30 @@ export function modelAcceptsTemperature(model: string): boolean {
   return true;
 }
 
+/**
+ * TRA-1042 — true when the model supports adaptive thinking + the `effort`
+ * control: Opus 4.6 and later, and Sonnet 4.6. Haiku 4.5 rejects `effort` (and
+ * has no adaptive thinking), so the `fast` analyst tier never gets thinking even
+ * if a caller asks. Sonnet/Opus below 4.6 predate adaptive thinking and are
+ * excluded too, so an env override to an older model degrades safely (no
+ * thinking) rather than 400-ing.
+ */
+export function modelSupportsAdaptiveThinking(model: string): boolean {
+  const opus = /^claude-opus-4-(\d+)/.exec(model);
+  if (opus) return Number(opus[1]) >= 6;
+  const sonnet = /^claude-sonnet-4-(\d+)/.exec(model);
+  if (sonnet) return Number(sonnet[1]) >= 6;
+  return false;
+}
+
+/**
+ * Floor on `max_tokens` when adaptive thinking is on: reasoning tokens count
+ * against `max_tokens`, so the analyst/trader/risk caps (700–900) would starve
+ * the visible answer. Lift to this floor so the model has room to think *and*
+ * emit the JSON verdict.
+ */
+const THINKING_MIN_MAX_TOKENS = 2500;
+
 /** Minimal slice of the Anthropic SDK client this adapter depends on (test seam). */
 export interface AnthropicMessagesApi {
   create(body: Anthropic.Messages.MessageCreateParamsNonStreaming): Promise<Anthropic.Messages.Message>;
@@ -119,13 +143,24 @@ export class AnthropicLlmClient implements LlmClient {
       .filter((m): m is LlmMessage & { role: 'user' | 'assistant' } => m.role !== 'system')
       .map((m) => ({ role: m.role, content: m.content }));
 
+    // TRA-1042 — adaptive thinking is applied only when the caller asked AND the
+    // mapped model supports it. When on, `temperature` is dropped (the API rejects
+    // sampling params alongside thinking) and `max_tokens` is lifted to the floor
+    // so reasoning doesn't crowd out the answer.
+    const useThinking = req.thinking != null && modelSupportsAdaptiveThinking(model);
+    const maxTokens = req.maxTokens ?? this.defaultMaxTokens;
+
     const body: Anthropic.Messages.MessageCreateParamsNonStreaming = {
       model,
-      max_tokens: req.maxTokens ?? this.defaultMaxTokens,
+      max_tokens: useThinking ? Math.max(maxTokens, THINKING_MIN_MAX_TOKENS) : maxTokens,
       messages,
       ...(system ? { system } : {}),
-      ...(req.temperature != null && modelAcceptsTemperature(model)
+      ...(req.temperature != null && modelAcceptsTemperature(model) && !useThinking
         ? { temperature: req.temperature }
+        : {}),
+      ...(useThinking ? { thinking: { type: 'adaptive' } } : {}),
+      ...(useThinking && req.thinking?.effort
+        ? { output_config: { effort: req.thinking.effort } }
         : {}),
     };
 

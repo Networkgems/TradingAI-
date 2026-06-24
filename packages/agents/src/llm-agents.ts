@@ -32,7 +32,12 @@ import {
   type TraderDecision,
 } from '@trading-app/shared';
 import type { AgentGraphInput, UserTradingMemory } from './types.js';
-import { completeJson, type LlmClient, type LlmMessage } from './llm-client.js';
+import {
+  completeJson,
+  type LlmClient,
+  type LlmMessage,
+  type LlmThinkingOptions,
+} from './llm-client.js';
 
 const clamp = (v: number, lo: number, hi: number): number => Math.min(hi, Math.max(lo, v));
 const round = (v: number, dp = 4): number => Math.round(v * 10 ** dp) / 10 ** dp;
@@ -389,7 +394,7 @@ export async function runTraderLlm(
   reports: AnalystReport[],
   debate: DebateTranscript,
   llm: LlmClient,
-  opts: { maxAttempts?: number } = {},
+  opts: { maxAttempts?: number; thinking?: LlmThinkingOptions } = {},
 ): Promise<{ decision: TraderDecision; costUsd: number }> {
   const messages: LlmMessage[] = [
     { role: 'system', content: TRADER_SYSTEM },
@@ -403,6 +408,9 @@ export async function runTraderLlm(
       messages,
       temperature: TEMPERATURE,
       maxTokens: TRADER_MAX_TOKENS,
+      // TRA-1042 — adaptive thinking when activated; the client drops temperature
+      // and lifts max_tokens on supporting models, and ignores it otherwise.
+      ...(opts.thinking ? { thinking: opts.thinking } : {}),
     },
     { validate: validateTraderDecision, maxAttempts: opts.maxAttempts ?? MAX_ATTEMPTS },
   );
@@ -490,6 +498,12 @@ export interface RiskPanelLlmConfig {
    * trade's notional is at/above the configured threshold. Other tiers are unaffected.
    */
   tier?: 'strong' | 'apex';
+  /**
+   * TRA-1042 — when set, requests adaptive thinking on this final risk/decision
+   * call. Applied only on models that support it (the strong Sonnet + apex Opus
+   * tiers both do); off by default.
+   */
+  thinking?: LlmThinkingOptions;
 }
 
 /**
@@ -546,6 +560,8 @@ export async function runRiskPanelLlm(
       messages,
       temperature: TEMPERATURE,
       maxTokens: RISK_MAX_TOKENS,
+      // TRA-1042 — adaptive thinking on the final risk verdict when activated.
+      ...(config.thinking ? { thinking: config.thinking } : {}),
     },
     { validate: validateRiskVerdict, maxAttempts: config.maxAttempts ?? MAX_ATTEMPTS },
   );

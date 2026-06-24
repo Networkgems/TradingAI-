@@ -19,7 +19,7 @@ import {
   type TraderDecision,
 } from '@trading-app/shared';
 import type { AgentGraphInput, UserTradingMemory } from './types.js';
-import type { LlmClient } from './llm-client.js';
+import type { LlmClient, LlmThinkingOptions } from './llm-client.js';
 import { runAnalysts } from './analysts.js';
 import { runDebate } from './debate.js';
 import { runTrader, type TraderConfig } from './trader.js';
@@ -53,6 +53,14 @@ export interface AgentGraphDeps {
    * so the deterministic and low-notional paths can never silently incur Opus cost.
    */
   apexNotionalUsd?: number;
+  /**
+   * TRA-1042 — when set, the judgment tiers (trader synthesis + the final risk
+   * verdict) run with adaptive thinking at this effort. Off by default (the
+   * analyst fan-out on Haiku never gets thinking — it would 400 on `effort`). The
+   * advisory layer sources this from an env flag; the client applies it only on
+   * supporting models and lifts `max_tokens` / drops `temperature` accordingly.
+   */
+  thinking?: LlmThinkingOptions;
 }
 
 /** Build the routable TradeSignal an APPROVE recommendation carries (§4). */
@@ -94,13 +102,16 @@ export async function runAgentGraph(
     // 2. Bull/bear debate + judge (deterministic, derived from the reports).
     const debate = runDebate(a.reports, deps.debateRounds ?? 2);
     // 3. Trader synthesis (strong/Sonnet).
-    const t = await runTraderLlm(input, a.reports, debate, deps.llm);
+    const t = await runTraderLlm(input, a.reports, debate, deps.llm, {
+      ...(deps.thinking ? { thinking: deps.thinking } : {}),
+    });
     // 4. Risk panel + manager — the FINAL decision step. Escalates to the Opus `apex`
     //    tier only for high-notional trades (TRA-915); routine screening stays on Sonnet.
     const r = await runRiskPanelLlm(t.decision, deps.llm, {
       minRiskReward: deps.risk?.minRiskReward,
       tier: riskDecisionTier(input.notionalUsd, deps.apexNotionalUsd),
       ...(input.userMemory?.riskTolerance ? { riskTolerance: input.userMemory.riskTolerance } : {}),
+      ...(deps.thinking ? { thinking: deps.thinking } : {}),
     });
     const costUsd = round6(a.costUsd + t.costUsd + r.costUsd);
     return assemble(input, now, startedAt, a.reports, debate, t.decision, r.verdict, costUsd);

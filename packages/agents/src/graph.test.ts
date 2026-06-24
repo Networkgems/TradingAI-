@@ -160,6 +160,24 @@ describe('runAgentGraph (TRA-747 LLM path)', () => {
     const reco = await runAgentGraph(input(rising()));
     expect(reco.costUsd).toBe(0);
   });
+
+  it('TRA-1042 — deps.thinking propagates to the judgment tiers only, not the analysts', async () => {
+    const llm = cannedLlm(0.01);
+    await runAgentGraph(input(rising()), { llm, thinking: { effort: 'high' } });
+    const trader = llm.calls.find((c) => c.purpose === 'trader');
+    const risk = llm.calls.find((c) => c.purpose === 'risk-manager');
+    const analysts = llm.calls.filter((c) => c.purpose.startsWith('analyst:'));
+    expect(trader?.thinking).toEqual({ effort: 'high' });
+    expect(risk?.thinking).toEqual({ effort: 'high' });
+    // The Haiku analyst fan-out must NOT carry thinking (effort would 400 there).
+    expect(analysts.every((c) => c.thinking === undefined)).toBe(true);
+  });
+
+  it('TRA-1042 — without deps.thinking, no call carries a thinking knob (default off)', async () => {
+    const llm = cannedLlm(0.01);
+    await runAgentGraph(input(rising()), { llm });
+    expect(llm.calls.every((c) => c.thinking === undefined)).toBe(true);
+  });
 });
 
 // TRA-850 — persistent per-user memory personalizes the advisory read.

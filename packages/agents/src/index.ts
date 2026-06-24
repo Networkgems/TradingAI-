@@ -26,6 +26,7 @@ export {
   type LlmMessage,
   type LlmCompletionRequest,
   type LlmCompletionResponse,
+  type LlmThinkingOptions,
   type CompleteJsonOptions,
   type CompleteJsonResult,
 } from './llm-client.js';
@@ -34,6 +35,7 @@ export {
   createAnthropicLlmClientFromEnv,
   describeAnthropicCredFromEnv,
   modelAcceptsTemperature,
+  modelSupportsAdaptiveThinking,
   DEFAULT_TIER_MODELS,
   DEFAULT_MODEL_PRICING,
   type AnthropicLlmClientOptions,

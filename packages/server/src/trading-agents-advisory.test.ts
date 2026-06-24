@@ -11,9 +11,11 @@ import type { Candle, NewsItem } from '@trading-app/shared';
 import {
   adviseSymbol,
   resolveApexNotionalUsd,
+  resolveThinkingEffort,
   resolveTradingAgentsLlm,
   buildNewsHeadlines,
   OPUS_NOTIONAL_ENV_VAR,
+  THINKING_EFFORT_ENV_VAR,
 } from './trading-agents-advisory.js';
 import {
   agentSpendAggregate,
@@ -246,6 +248,18 @@ describe('resolveApexNotionalUsd — env threshold (TRA-915)', () => {
     expect(resolveApexNotionalUsd({ [OPUS_NOTIONAL_ENV_VAR]: 'abc' })).toBeUndefined();
     expect(resolveApexNotionalUsd({ [OPUS_NOTIONAL_ENV_VAR]: '0' })).toBeUndefined();
     expect(resolveApexNotionalUsd({ [OPUS_NOTIONAL_ENV_VAR]: '-5' })).toBeUndefined();
+  });
+});
+
+describe('resolveThinkingEffort — env activation (TRA-1042)', () => {
+  it('accepts low/medium/high (case-insensitive) and is off otherwise', () => {
+    expect(resolveThinkingEffort({ [THINKING_EFFORT_ENV_VAR]: 'high' })).toBe('high');
+    expect(resolveThinkingEffort({ [THINKING_EFFORT_ENV_VAR]: 'MEDIUM' })).toBe('medium');
+    expect(resolveThinkingEffort({ [THINKING_EFFORT_ENV_VAR]: ' low ' })).toBe('low');
+    expect(resolveThinkingEffort({})).toBeUndefined();
+    expect(resolveThinkingEffort({ [THINKING_EFFORT_ENV_VAR]: '' })).toBeUndefined();
+    expect(resolveThinkingEffort({ [THINKING_EFFORT_ENV_VAR]: 'max' })).toBeUndefined();
+    expect(resolveThinkingEffort({ [THINKING_EFFORT_ENV_VAR]: 'on' })).toBeUndefined();
   });
 });
 

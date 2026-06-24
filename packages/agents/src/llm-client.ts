@@ -18,6 +18,17 @@ export interface LlmMessage {
   content: string;
 }
 
+/**
+ * TRA-1042 — adaptive-thinking knob carried on a completion request and threaded
+ * through the graph. Presence (non-null) means "think on this call"; the concrete
+ * client applies it only on models that support adaptive thinking + effort
+ * (Opus 4.6+/Sonnet 4.6) and ignores it elsewhere.
+ */
+export interface LlmThinkingOptions {
+  /** Reasoning-depth control; maps to `output_config.effort`. */
+  effort?: 'low' | 'medium' | 'high';
+}
+
 export interface LlmCompletionRequest {
   tier: LlmTier;
   /** Caller label for cost attribution + logging, e.g. 'analyst:technical'. */
@@ -25,6 +36,17 @@ export interface LlmCompletionRequest {
   messages: LlmMessage[];
   maxTokens?: number;
   temperature?: number;
+  /**
+   * TRA-1042 — request adaptive extended thinking for this call. When set AND the
+   * mapped model supports it (Opus 4.6+ / Sonnet 4.6 — NOT Haiku 4.5, which
+   * rejects effort), the client adds `thinking: { type: 'adaptive' }` plus an
+   * optional `output_config.effort`, drops `temperature` (the API rejects sampling
+   * params alongside thinking on these models), and raises `max_tokens` to a floor
+   * so reasoning tokens don't crowd out the answer. Omitted ⇒ no thinking (current
+   * behavior); ignored on models without adaptive-thinking support. Reserved for
+   * the judgment tiers (trader synthesis, high-notional risk decision).
+   */
+  thinking?: LlmThinkingOptions;
 }
 
 export interface LlmCompletionResponse {

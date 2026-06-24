@@ -115,6 +115,23 @@ export function resolveApexNotionalUsd(env: NodeJS.ProcessEnv = process.env): nu
 }
 
 /**
+ * TRA-1042 — env flag activating adaptive thinking on the judgment tiers (trader
+ * synthesis + the final risk verdict). Set to one of `low` / `medium` / `high` to
+ * turn it on at that effort; empty/unset/invalid ⇒ undefined ⇒ OFF (current
+ * behavior, no thinking). Default-off keeps live cost and behavior unchanged until
+ * an operator opts in. The analyst fan-out (Haiku) is never affected — Haiku
+ * rejects `effort`, and the client only applies thinking on supporting models.
+ */
+export const THINKING_EFFORT_ENV_VAR = 'TRADING_AGENTS_THINKING_EFFORT';
+
+export function resolveThinkingEffort(
+  env: NodeJS.ProcessEnv = process.env,
+): 'low' | 'medium' | 'high' | undefined {
+  const raw = env[THINKING_EFFORT_ENV_VAR]?.trim().toLowerCase();
+  return raw === 'low' || raw === 'medium' || raw === 'high' ? raw : undefined;
+}
+
+/**
  * TRA-941 — true when the env kill switch (TRADING_AGENTS_LLM_DISABLED) is set.
  * Piece 3 makes this gate EXECUTION too, not just LLM spend, so the engine reads
  * it before placing any agent order. Independent of the per-user banner toggle.
@@ -175,10 +192,14 @@ export async function adviseSymbol(
   // TRA-915 — the Opus-escalation threshold comes from env unless the caller pinned one
   // explicitly on graphDeps (tests/overrides win).
   const apexNotionalUsd = opts.graphDeps?.apexNotionalUsd ?? resolveApexNotionalUsd();
+  // TRA-1042 — adaptive thinking on the judgment tiers; env-driven, off by default,
+  // and only meaningful on the LLM path (the deterministic fallback ignores it).
+  const thinkingEffort = opts.graphDeps?.thinking?.effort ?? resolveThinkingEffort();
 
   const deps: AgentGraphDeps = {
     ...opts.graphDeps,
     ...(apexNotionalUsd != null ? { apexNotionalUsd } : {}),
+    ...(useLlm && thinkingEffort ? { thinking: { effort: thinkingEffort } } : {}),
     ...(useLlm ? { llm: opts.llm! } : {}),
   };
 

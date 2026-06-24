@@ -2,6 +2,7 @@ import { describe, it, expect, vi } from 'vitest';
 import {
   AnthropicLlmClient,
   modelAcceptsTemperature,
+  modelSupportsAdaptiveThinking,
   createAnthropicLlmClientFromEnv,
   type AnthropicLike,
 } from './anthropic-llm-client.js';
@@ -45,6 +46,17 @@ describe('modelAcceptsTemperature', () => {
   });
 });
 
+describe('modelSupportsAdaptiveThinking', () => {
+  it('is true for Opus 4.6+ and Sonnet 4.6, false for Haiku and older', () => {
+    expect(modelSupportsAdaptiveThinking('claude-opus-4-8')).toBe(true);
+    expect(modelSupportsAdaptiveThinking('claude-opus-4-6')).toBe(true);
+    expect(modelSupportsAdaptiveThinking('claude-sonnet-4-6')).toBe(true);
+    expect(modelSupportsAdaptiveThinking('claude-opus-4-5')).toBe(false);
+    expect(modelSupportsAdaptiveThinking('claude-sonnet-4-5')).toBe(false);
+    expect(modelSupportsAdaptiveThinking('claude-haiku-4-5')).toBe(false);
+  });
+});
+
 describe('AnthropicLlmClient.complete', () => {
   it('folds system messages into the system param and passes user/assistant turns', async () => {
     const create = vi.fn().mockResolvedValue(fakeMessage('{"ok":true}'));
@@ -67,6 +79,38 @@ describe('AnthropicLlmClient.complete', () => {
     });
     await llm.complete(req);
     expect(create.mock.calls[0]![0].temperature).toBeUndefined();
+  });
+
+  it('applies adaptive thinking on a supporting model: thinking+effort on, temperature dropped, max_tokens lifted to the floor', async () => {
+    const create = vi.fn().mockResolvedValue(fakeMessage('{}'));
+    const llm = new AnthropicLlmClient({ client: stubClient(create) }); // strong → sonnet-4-6
+    await llm.complete({ ...req, maxTokens: 900, thinking: { effort: 'high' } });
+    const body = create.mock.calls[0]![0];
+    expect(body.thinking).toEqual({ type: 'adaptive' });
+    expect(body.output_config).toEqual({ effort: 'high' });
+    expect(body.temperature).toBeUndefined(); // dropped even though sonnet accepts it
+    expect(body.max_tokens).toBe(2500); // lifted from 900 to the thinking floor
+  });
+
+  it('does NOT apply thinking on the fast/Haiku tier (effort would 400) and keeps temperature', async () => {
+    const create = vi.fn().mockResolvedValue(fakeMessage('{}'));
+    const llm = new AnthropicLlmClient({ client: stubClient(create) });
+    await llm.complete({ ...req, tier: 'fast', maxTokens: 700, thinking: { effort: 'high' } });
+    const body = create.mock.calls[0]![0];
+    expect(body.thinking).toBeUndefined();
+    expect(body.output_config).toBeUndefined();
+    expect(body.temperature).toBe(0.2); // haiku accepts temperature → still forwarded
+    expect(body.max_tokens).toBe(700); // floor not applied when thinking is off
+  });
+
+  it('omits thinking entirely when the caller does not request it (default behavior unchanged)', async () => {
+    const create = vi.fn().mockResolvedValue(fakeMessage('{}'));
+    const llm = new AnthropicLlmClient({ client: stubClient(create) });
+    await llm.complete(req);
+    const body = create.mock.calls[0]![0];
+    expect(body.thinking).toBeUndefined();
+    expect(body.output_config).toBeUndefined();
+    expect(body.temperature).toBe(0.2);
   });
 
   it('computes costUsd from usage at the model price', async () => {
