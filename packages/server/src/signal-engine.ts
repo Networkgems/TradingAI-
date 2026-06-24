@@ -1,5 +1,5 @@
-import { OrbStrategy, BbFadeStrategy, IchimokuStrategy, SupertrendConfluenceStrategy, confluenceSide, supertrend, reversalChecklist, atr, donchian, supportResistance, blackScholesDelta, daysToExpiration, selectRvLongCandidate, selectShadowOptionSignal, emaPullbackTrigger, volumeConfirmedBreakout, TradierOptionsClient, TradierOrderClient, TRADIER_REJECTED_STATUSES, evaluateSma200, SMA200_MIN_BARS, SMA200_DEBOUNCE_BARS, composeTechnicalSnapshot, resampleCandles, TF_BUCKET_MS, OptionsRiskBreaker, DEFAULT_OPTIONS_BREAKER_PARAMS } from '@trading-app/engine';
-import type { StrategySelectorInput, ContractQuote, OptionTrend, RvLongTrendSide, ExitState } from '@trading-app/engine';
+import { OrbStrategy, BbFadeStrategy, IchimokuStrategy, SupertrendConfluenceStrategy, confluenceSide, supertrend, reversalChecklist, adx, atr, donchian, supportResistance, blackScholesDelta, daysToExpiration, selectRvLongCandidate, selectShadowOptionSignal, emaPullbackTrigger, volumeConfirmedBreakout, TradierOptionsClient, TradierOrderClient, TRADIER_REJECTED_STATUSES, evaluateSma200, SMA200_MIN_BARS, SMA200_DEBOUNCE_BARS, composeTechnicalSnapshot, resampleCandles, TF_BUCKET_MS, OptionsRiskBreaker, DEFAULT_OPTIONS_BREAKER_PARAMS } from '@trading-app/engine';
+import type { StrategySelectorInput, ContractQuote, OptionTrend, RvLongTrendSide, ExitState, SharedTickIndicators } from '@trading-app/engine';
 import type { TradierAccountBalance } from '@trading-app/engine';
 import { WATCHLIST, isLiquidSwingSymbol, checkEquitySwingClose, MANAGED_ACCOUNT_RATIO, MAX_CONSECUTIVE_LOSSES, DAILY_DRAWDOWN_HALT_PCT, OPTIONS_PER_TICKET_DOLLAR_FLOOR, OPTIONS_POSITION_CAP_RATIO, aliasWatchlistSymbol, isLiveTradierOptionsEnabled, isStockMarketOpen, perPositionCap, resolveAutoManageImportedTradierOptions, resolveDemoCostModel, resolveHoldLiveOptionsOvernight, resolveLiveTradeEquitiesTradier, resolveManagedAccountRatio, resolveMarketReviewGatesEnabled, resolveRiskPerTrade, resolveRvDtePrefs, resolveTradierOptionsCreds, validateBracket, DEFAULT_RV_DTE_MIN, DEFAULT_RV_DTE_MAX, DEFAULT_RV_DTE_TARGET, scoreNewsSentiment, aggregateSymbolSentiment, aggregateFedSentiment, aggregateStockTwitsSentiment, dedupeStockTwitsMessages, mapCuratedMessagesBySymbol, nameAliasesFor, evaluateEquityDcaAdd, evaluateOptionDcaAdd, CONVICTION_DCA, blendedAverage, positionRiskDollars, minutesToSessionClose, getEasternUtcOffset } from '@trading-app/shared';
 import type { TradeSignal, RelativeValueSignal, Sma200Signal, Candle, OptionsAccountState, SignalType, Position, OptionPosition, AccountMode, AccountSettings, AccountState, NewsItem, SymbolSentiment, SocialSentiment, StockTwitsMessage, TechnicalSignalSnapshot, TradierEnv, MarketReview, MarketReviewGates, EngineMarketReviewState, GatedStrategyNote, AgentRecommendation, TradeProposal, AgentOrderAudit, GuardrailVerdict } from '@trading-app/shared';
@@ -2014,8 +2014,17 @@ export class SignalEngine {
         // swing floor. Ichimoku (Kumo-breakout trend follower) stays as the
         // intraday router; the daily SMA200 reclaim/pullback path runs on its
         // own daily cadence below and remains the primary swing router.
-        const orbSignal = swingMode ? null : this.orb.evaluate(sym, candles);
-        const bbFadeSignal = swingMode ? null : this.bbFade.evaluate(sym, candles);
+        // TRA-1044 (F1) — build one shared per-symbol indicator snapshot per
+        // tick and hand it to every strategy that reads the same series, so
+        // ADX (used by BOTH ORB and BbFade) is computed once instead of twice.
+        // Only needed when at least one of the ADX consumers runs this tick;
+        // in swing mode both are disabled, so skip the work entirely. Computed
+        // with the strategies' default period, so signals are unchanged.
+        const shared: SharedTickIndicators | undefined = swingMode
+          ? undefined
+          : { adx: adx(candles) };
+        const orbSignal = swingMode ? null : this.orb.evaluate(sym, candles, undefined, shared);
+        const bbFadeSignal = swingMode ? null : this.bbFade.evaluate(sym, candles, shared);
         const ichimokuSignal = this.ichimoku.evaluate(sym, candles);
 
         for (const signal of [orbSignal, bbFadeSignal, ichimokuSignal]) {
@@ -2436,13 +2445,32 @@ export class SignalEngine {
     }
     if (open.length === 0) return marks;
 
+    // TRA-1044 (F3) — group open positions by their (symbol, expiration) chain.
+    // getOptionMark() fetches the whole chain and reads one row from it, backed
+    // by the scanner's 60s chain cache. With the previous flat Promise.all the
+    // calls fired concurrently, so two positions sharing a chain BOTH missed the
+    // cold cache and issued duplicate getChainSnapshot fetches for the same
+    // chain. Here the first position in each group warms the cache and the rest
+    // hit it, so we issue exactly one chain fetch per (symbol, expiration) per
+    // tick. Distinct chains still run concurrently. The mark values are
+    // identical — same getOptionMark, same cached rows — so signals/exits are
+    // unchanged; this only removes redundant Tradier calls.
+    const chains = new Map<string, typeof open>();
+    for (const o of open) {
+      const key = `${o.symbol}|${o.expiration}`;
+      const group = chains.get(key);
+      if (group) group.push(o);
+      else chains.set(key, [o]);
+    }
     await Promise.all(
-      open.map(async (o) => {
-        try {
-          const mark = await this.rvScanner!.getOptionMark(o.symbol, o.expiration!, o.optionSymbol!);
-          if (mark != null && mark > 0) marks.set(o.optionSymbol!, mark);
-        } catch (err: unknown) {
-          log.warn('getOptionMark failed', { optionSymbol: o.optionSymbol, reason: err instanceof Error ? err.message : String(err) });
+      [...chains.values()].map(async (group) => {
+        for (const o of group) {
+          try {
+            const mark = await this.rvScanner!.getOptionMark(o.symbol, o.expiration!, o.optionSymbol!);
+            if (mark != null && mark > 0) marks.set(o.optionSymbol!, mark);
+          } catch (err: unknown) {
+            log.warn('getOptionMark failed', { optionSymbol: o.optionSymbol, reason: err instanceof Error ? err.message : String(err) });
+          }
         }
       }),
     );

@@ -2,6 +2,7 @@
 
 export { OrbStrategy } from './strategies/orb.js';
 export type { OrbOptions } from './strategies/orb.js';
+export type { SharedTickIndicators } from './strategies/shared-indicators.js';
 export { ReversalStrategy } from './strategies/archived/reversal.js';
 export type { ReversalOptions } from './strategies/archived/reversal.js';
 export { MacdTrendStrategy } from './strategies/archived/macd-trend.js';

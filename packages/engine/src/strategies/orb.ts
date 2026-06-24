@@ -1,6 +1,7 @@
 import { Candle, MarketQuote, TradeSignal, Side, ADX_RANGING_THRESHOLD, isValidTradingWindow, getEasternUtcOffset, validateBracket } from '@trading-app/shared';
 import { randomUUID } from 'crypto';
 import { adx } from '../indicators/adx.js';
+import type { SharedTickIndicators } from './shared-indicators.js';
 import type { AlpacaOrderClient } from '../alpaca/index.js';
 import type { RiskManager } from '../risk.js';
 
@@ -52,6 +53,7 @@ export class OrbStrategy {
     symbol: string,
     candles: Candle[],
     latestQuote?: MarketQuote,
+    shared?: SharedTickIndicators,
   ): TradeSignal | null {
     if (candles.length < 2) return null;
 
@@ -96,8 +98,12 @@ export class OrbStrategy {
       }
     }
 
-    // ADX regime filter: ORB only works in trending markets (ADX ≥ 20)
-    const adxResult = adx(candles);
+    // ADX regime filter: ORB only works in trending markets (ADX ≥ 20).
+    // TRA-1044 (F1) — reuse the per-tick snapshot's ADX when the caller has
+    // already computed it for this symbol/series (shared with BbFade); the
+    // snapshot is computed with the same default period so the value is
+    // identical to recomputing here.
+    const adxResult = shared ? shared.adx : adx(candles);
     if (adxResult && adxResult.adx < ADX_RANGING_THRESHOLD) return null;
 
     const rangeHigh = Math.max(...rangeCandles.map(c => c.high));

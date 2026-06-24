@@ -4,6 +4,7 @@ import { bollinger } from '../indicators/bollinger.js';
 import { rsi } from '../indicators/rsi.js';
 import { adx } from '../indicators/adx.js';
 import { atr } from '../indicators/atr.js';
+import type { SharedTickIndicators } from './shared-indicators.js';
 import type { AlpacaOrderClient } from '../alpaca/index.js';
 import type { RiskManager } from '../risk.js';
 
@@ -66,7 +67,7 @@ export class BbFadeStrategy {
     this.volatilityFloorPct = opts.volatilityFloorPct ?? 0.003;
   }
 
-  evaluate(symbol: string, candles: Candle[]): TradeSignal | null {
+  evaluate(symbol: string, candles: Candle[], shared?: SharedTickIndicators): TradeSignal | null {
     if (candles.length < Math.max(this.bbPeriod, this.rsiPeriod + 1, 28)) return null;
 
     const closes = candles.map(c => c.close);
@@ -78,7 +79,10 @@ export class BbFadeStrategy {
     if (!bands) return null;
 
     // Range regime gate — pure mean-reversion only fires in chop, not trend.
-    const adxResult = adx(candles);
+    // TRA-1044 (F1) — reuse the per-tick snapshot's ADX when the caller has
+    // already computed it (shared with ORB); same default period, so the
+    // value is identical to recomputing it here.
+    const adxResult = shared ? shared.adx : adx(candles);
     if (adxResult && adxResult.adx > ADX_RANGING_THRESHOLD) return null;
 
     // Price has tagged the lower band (touch or break).
