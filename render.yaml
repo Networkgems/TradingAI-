@@ -63,6 +63,19 @@ services:
         value: production
       - key: NODE_VERSION
         value: 20.19.0
+      # TRA-1080 — pin the V8 old-space ceiling. The service runs `standard`
+      # (2 GB RAM); without this, V8 auto-sizes the old-space heap and on a 2 GB
+      # box GC only gets aggressive very late, so the per-tick growth during RTH
+      # drives back-to-back full GCs near the ceiling (the "GC thrash" that
+      # starves the event loop and kills the HTTP listener). Pinning to 1536 MB
+      # leaves ~512 MB headroom for RSS/native/buffers (24h peak ~1.53 GB total
+      # per the `plan: standard` note above) and makes the heap watchdog's
+      # `heap_size_limit` deterministic. Lower this if the box is ever moved to a
+      # smaller plan. `--max-semi-space-size=64` enlarges the young generation so
+      # short-lived per-tick allocations are collected by cheap scavenges instead
+      # of being promoted into old space and amplifying the thrash.
+      - key: NODE_OPTIONS
+        value: --max-old-space-size=1536 --max-semi-space-size=64
       - key: DATA_DIR
         value: /data
       - key: APP_URL
@@ -230,6 +243,27 @@ services:
       # value (flip the flag off). Accepts the usual truthy spellings (1/true/yes/on).
       - key: ENABLE_COLD_START_DAILY_PREFETCH
         value: "true"
+      # TRA-1080 — event-loop/heap starvation watchdog. The watchdog itself is
+      # ON by default in code (no env needed); these knobs are declared
+      # `sync: false` so an operator can DISABLE or RETUNE it from the dashboard
+      # during an incident without a redeploy. Leave unset for the safe defaults:
+      #   WATCHDOG_ENABLED=true, WATCHDOG_RESTART_ENABLED=true,
+      #   WATCHDOG_HEAP_PCT=0.92, WATCHDOG_LAG_MS=2000, WATCHDOG_BREACH_SAMPLES=10
+      #   (10 consecutive 1s samples ⇒ a trip needs ~10s of SUSTAINED >2s lag or
+      #   >92% heap, so a single GC pause / slow tick never restarts a healthy
+      #   box). Set WATCHDOG_RESTART_ENABLED=false to observe-only (metrics on
+      #   /api/health/watchdog, no exit), or WATCHDOG_ENABLED=false to fully
+      #   disable. The self-restart converts the bqb1 502 hang into a ~30s blip.
+      - key: WATCHDOG_ENABLED
+        sync: false
+      - key: WATCHDOG_RESTART_ENABLED
+        sync: false
+      - key: WATCHDOG_HEAP_PCT
+        sync: false
+      - key: WATCHDOG_LAG_MS
+        sync: false
+      - key: WATCHDOG_BREACH_SAMPLES
+        sync: false
       # TRA-713 — persistent live-equity boot-arm (board-ratified approval
       # 979c77c1). FIX for "prod equity Live reverts to demo on restart": the
       # original arm lived only in the running engine's in-memory `mode`, so every

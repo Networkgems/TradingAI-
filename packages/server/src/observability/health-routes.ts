@@ -42,6 +42,7 @@ import {
 } from '../learned-weights-cache.js';
 import { isExternalIntelEnabled } from '../external-intel.js';
 import { getColdStartPrefetchStatus } from '../daily-prefetch-flag.js';
+import { getWatchdogStatus } from '../event-loop-watchdog.js';
 import { isAnalystAgentEnabled, buildAnalystHealth } from '../analyst-agent.js';
 import {
   loadSourceQualityWeights,
@@ -815,6 +816,25 @@ export function registerLiveHealthRoutes(app: Express, deps: LiveHealthDeps): vo
       time: new Date(now()).toISOString(),
       build: resolveBuildInfo(),
       ...status,
+    });
+  });
+
+  // TRA-1080 — unauthenticated, secrets-free event-loop/heap watchdog probe.
+  // Surfaces the watchdog config (thresholds, restart-enabled) and the most
+  // recent sample (heap %, mean/max event-loop lag, consecutive breach
+  // counters). Two purposes: (1) confirm the watchdog is armed on prod from one
+  // curl, and (2) give the bqb1 502 monitoring a direct read on how close the
+  // box is to the starvation watermark BEFORE it trips a restart. `watchdog` is
+  // null when the watchdog is disabled via env (WATCHDOG_ENABLED=false). The
+  // fact that THIS route answers <500ms is itself the live "event loop is not
+  // starved" signal the ticket's acceptance asks for.
+  app.get('/api/health/watchdog', (_req, res) => {
+    const watchdog = getWatchdogStatus();
+    res.json({
+      ok: true,
+      time: new Date(now()).toISOString(),
+      build: resolveBuildInfo(),
+      watchdog,
     });
   });
 }

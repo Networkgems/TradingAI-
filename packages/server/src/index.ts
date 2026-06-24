@@ -201,6 +201,7 @@ import {
   setUserLocked,
 } from './users.js';
 import { sendPasswordResetEmail } from './email.js';
+import { startEventLoopWatchdog, type WatchdogHandle } from './event-loop-watchdog.js';
 import {
   logger,
   flushLogs,
@@ -6312,6 +6313,13 @@ httpServer.listen(PORT, () => {
   console.log(`WebSocket endpoint: ws://localhost:${PORT}`);
 });
 
+// TRA-1080 — event-loop/heap starvation watchdog. Detects the bqb1 "HTTP
+// listener dead while worker timers live" state from inside the process and
+// exits(1) for a clean Render restart, instead of hanging indefinitely in 502
+// limbo. Monitoring is cheap and on by default; restart action is on by default
+// (env-disableable). Started AFTER listen so a slow boot never trips it.
+const eventLoopWatchdog: WatchdogHandle | null = startEventLoopWatchdog();
+
 /**
  * TRA-407 (C5) — upper bound on how long shutdown waits for in-progress ticks
  * to drain. A tick that ignores the timer (e.g. a wedged socket) must not
@@ -6329,6 +6337,7 @@ async function gracefulShutdown(signal: string): Promise<void> {
   scheduler.stop();
   externalIntelSchedule.stop();
   autonomousDemoSchedule.stop();
+  eventLoopWatchdog?.stop();
   const all = getAllUserContexts();
   // Clear each engine's tick timer first so no new tick starts; the in-flight
   // tick (if any) keeps running and is drained next.
