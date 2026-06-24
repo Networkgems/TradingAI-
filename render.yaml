@@ -36,7 +36,15 @@ services:
   - type: web
     name: tradingai-bqb1
     runtime: node
-    plan: starter
+    # TRA-1038 — MUST be `standard` (2 GB), NOT `starter` (512 MB). The live
+    # service `srv-d7mb7rr7uimc73ev0chg` runs `standard` and its 24 h memory
+    # peak is ~1.53 GB (avg ~0.7 GB) — well above starter's 512 MB ceiling, so a
+    # blueprint re-apply at `starter` would OOM the public demo on boot. This
+    # line previously read `starter` and was a latent footgun; do not revert it
+    # without first trimming steady-state memory below 512 MB (tracked as a
+    # cost-optimization follow-up). CPU avg ~0.28 / peak ~0.96 of 1 vCPU is fine
+    # on standard.
+    plan: standard
     buildCommand: pnpm install --frozen-lockfile && pnpm run web:build
     startCommand: node packages/server/dist/index.js
     healthCheckPath: /api/health
