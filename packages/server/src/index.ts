@@ -68,7 +68,7 @@ import {
   realizedOptionsPnlByCloseDate,
 } from './reports/tradier-reconcile.js';
 import { createToken, verifyToken, generateResetToken, consumeResetToken, initResetTokenStore } from './auth.js';
-import { initStateDb } from './sqlite.js'; // TRA-1052 — durable hot-state SQLite store
+import { initStateDb, getStateDb } from './sqlite.js'; // TRA-1052 — durable hot-state SQLite store
 import { checkThrottle, recordFailure, recordSuccess } from './auth-throttle.js';
 import { getSettings, loadSettings, mergeScopedRiskSettings, saveSettings } from './account-settings.js';
 import {
@@ -2129,7 +2129,12 @@ app.get('/api/health/options-spend', (_req, res) => {
 // /api/health/options-spend) — it exposes only spend totals + usernames, no trade
 // detail. Wires NO capital; the layer is advisor-only in P2.
 app.get('/api/health/agent-spend', (_req, res) => {
-  res.json(agentSpendAggregate());
+  // TRA-1052 — `durable:true` confirms the SQLite committed-ledger mirror is live
+  // (the daily cap survives a redeploy). `false` means the fail-soft fallback is
+  // active (native binary unavailable) and the ledger is in-memory only — the one
+  // read-only signal an operator/probe has that durability is actually engaged on
+  // Render, since no agent can read the boot log directly.
+  res.json({ ...agentSpendAggregate(), durable: getStateDb() !== null });
 });
 
 // TRA-601 (TRA-595 C6) — the forward-test report. Re-prices every surfaced idea
