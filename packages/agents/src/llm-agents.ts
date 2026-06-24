@@ -21,6 +21,9 @@
 //     ≤ the trader's conviction, a HOLD is forced to VETO/size-0, and a
 //     sub-minimum reward:risk is vetoed — independent of what the model returned.
 import {
+  ANALYST_REPORT_JSON_SCHEMA,
+  RISK_VERDICT_JSON_SCHEMA,
+  TRADER_DECISION_JSON_SCHEMA,
   validateAnalystReport,
   validateRiskVerdict,
   validateTraderDecision,
@@ -28,6 +31,7 @@ import {
   type AnalystReport,
   type Candle,
   type DebateTranscript,
+  type JsonSchema,
   type RiskVerdict,
   type TraderDecision,
 } from '@trading-app/shared';
@@ -250,6 +254,20 @@ const SOCIAL_SPEC: AnalystSpec = {
 
 const ANALYST_SPECS: AnalystSpec[] = [TECHNICAL_SPEC, FUNDAMENTAL_SPEC, NEWS_SPEC, SOCIAL_SPEC];
 
+/**
+ * TRA-1043 — the structured-output schema for ONE analyst, with `kind` narrowed
+ * to a `const` so the model is constrained to the exact kind we asked for (the
+ * shared schema carries the full enum). Pins kind on the first shot so the
+ * {@link analystValidator} kind-check virtually never triggers a retry.
+ */
+function analystSchemaForKind(kind: AnalystKind): JsonSchema {
+  const props = ANALYST_REPORT_JSON_SCHEMA['properties'] as Record<string, unknown>;
+  return {
+    ...ANALYST_REPORT_JSON_SCHEMA,
+    properties: { ...props, kind: { type: 'string', const: kind } },
+  };
+}
+
 /** Validate an analyst payload AND pin its kind to the one we asked for. */
 function analystValidator(kind: AnalystKind): (v: unknown) => string[] {
   return (value) => {
@@ -287,6 +305,10 @@ export async function runAnalystsLlm(
           messages,
           temperature: TEMPERATURE,
           maxTokens: ANALYST_MAX_TOKENS,
+          // TRA-1043 — structured outputs (kind pinned to this analyst) so the
+          // report is schema-valid first-shot on Haiku 4.5; the validator stays
+          // the bound/kind safety net for the rare degraded path.
+          outputSchema: analystSchemaForKind(spec.kind),
         },
         { validate: analystValidator(spec.kind), maxAttempts },
       );
@@ -408,6 +430,9 @@ export async function runTraderLlm(
       messages,
       temperature: TEMPERATURE,
       maxTokens: TRADER_MAX_TOKENS,
+      // TRA-1043 — structured outputs so the decision is schema-valid first-shot
+      // on Sonnet 4.6; the validator still enforces the mandatory dissent + bounds.
+      outputSchema: TRADER_DECISION_JSON_SCHEMA,
       // TRA-1042 — adaptive thinking when activated; the client drops temperature
       // and lifts max_tokens on supporting models, and ignores it otherwise.
       ...(opts.thinking ? { thinking: opts.thinking } : {}),
@@ -560,6 +585,9 @@ export async function runRiskPanelLlm(
       messages,
       temperature: TEMPERATURE,
       maxTokens: RISK_MAX_TOKENS,
+      // TRA-1043 — structured outputs so the verdict + panel are schema-valid
+      // first-shot on Sonnet/Opus; the de-risk clamp + bound checks still apply.
+      outputSchema: RISK_VERDICT_JSON_SCHEMA,
       // TRA-1042 — adaptive thinking on the final risk verdict when activated.
       ...(config.thinking ? { thinking: config.thinking } : {}),
     },

@@ -47,6 +47,18 @@ export interface LlmCompletionRequest {
    * the judgment tiers (trader synthesis, high-notional risk decision).
    */
   thinking?: LlmThinkingOptions;
+  /**
+   * TRA-1043 — a JSON schema to constrain the response via Anthropic structured
+   * outputs. When set AND the mapped model supports structured outputs
+   * (Opus 4.8 / Sonnet 4.6 / Haiku 4.5), the client adds
+   * `output_config.format = { type: 'json_schema', schema }` so the payload is
+   * schema-valid on the first shot — collapsing the {@link completeJson}
+   * extract-parse-retry loop on the happy path. Ignored on models without
+   * support (the request degrades to the validate-and-retry fallback). The
+   * schema constrains SHAPE only; value bounds stay enforced by the caller's
+   * `validate` (defence in depth). Threads through {@link completeJson} unchanged.
+   */
+  outputSchema?: Record<string, unknown>;
 }
 
 export interface LlmCompletionResponse {

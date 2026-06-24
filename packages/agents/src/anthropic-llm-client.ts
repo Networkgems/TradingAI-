@@ -86,6 +86,26 @@ export function modelSupportsAdaptiveThinking(model: string): boolean {
 }
 
 /**
+ * TRA-1043 — true when the model supports Anthropic structured outputs
+ * (`output_config.format` with a `json_schema`): Opus 4.5 and later, Sonnet 4.6,
+ * Haiku 4.5, and Fable 5. The three tiers we map to (Haiku 4.5 / Sonnet 4.6 /
+ * Opus 4.8) all qualify. Anything older — or an unknown env override — returns
+ * false, so the request degrades safely to the `completeJson` validate-and-retry
+ * fallback (no 400, just no first-shot guarantee). Kept deliberately conservative:
+ * a model we don't recognise never gets the `format` param.
+ */
+export function modelSupportsStructuredOutputs(model: string): boolean {
+  if (model === 'claude-fable-5' || model === 'claude-mythos-5') return true;
+  const opus = /^claude-opus-4-(\d+)/.exec(model);
+  if (opus) return Number(opus[1]) >= 5;
+  const sonnet = /^claude-sonnet-4-(\d+)/.exec(model);
+  if (sonnet) return Number(sonnet[1]) >= 6;
+  const haiku = /^claude-haiku-4-(\d+)/.exec(model);
+  if (haiku) return Number(haiku[1]) >= 5;
+  return false;
+}
+
+/**
  * Floor on `max_tokens` when adaptive thinking is on: reasoning tokens count
  * against `max_tokens`, so the analyst/trader/risk caps (700–900) would starve
  * the visible answer. Lift to this floor so the model has room to think *and*
@@ -150,6 +170,18 @@ export class AnthropicLlmClient implements LlmClient {
     const useThinking = req.thinking != null && modelSupportsAdaptiveThinking(model);
     const maxTokens = req.maxTokens ?? this.defaultMaxTokens;
 
+    // TRA-1043 — structured outputs when the caller supplied a schema AND the
+    // mapped model supports it. `output_config` carries BOTH `effort` (from
+    // thinking) and `format` (structured outputs) — they compose, so assemble one
+    // object and only attach it when non-empty. When `format` is on, the model is
+    // constrained to the schema and the JSON comes back valid first-shot, so
+    // `completeJson`'s correction retries fire only on a value-bound miss.
+    const useStructured = req.outputSchema != null && modelSupportsStructuredOutputs(model);
+    const outputConfig: Anthropic.Messages.OutputConfig = {
+      ...(useThinking && req.thinking?.effort ? { effort: req.thinking.effort } : {}),
+      ...(useStructured ? { format: { type: 'json_schema', schema: req.outputSchema! } } : {}),
+    };
+
     const body: Anthropic.Messages.MessageCreateParamsNonStreaming = {
       model,
       max_tokens: useThinking ? Math.max(maxTokens, THINKING_MIN_MAX_TOKENS) : maxTokens,
@@ -159,9 +191,7 @@ export class AnthropicLlmClient implements LlmClient {
         ? { temperature: req.temperature }
         : {}),
       ...(useThinking ? { thinking: { type: 'adaptive' } } : {}),
-      ...(useThinking && req.thinking?.effort
-        ? { output_config: { effort: req.thinking.effort } }
-        : {}),
+      ...(Object.keys(outputConfig).length > 0 ? { output_config: outputConfig } : {}),
     };
 
     const res = await this.client.messages.create(body);

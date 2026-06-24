@@ -3456,6 +3456,110 @@ export function validateRiskVerdict(value: unknown): string[] {
   return errors;
 }
 
+// --- TRA-1043 — Anthropic structured-outputs schemas. These mirror the
+// hand-written validators above so an agent payload comes back schema-valid on
+// the FIRST shot (the model is constrained to the schema by `output_config.format`),
+// removing the JSON-extract-and-retry round-trips on the happy path. The
+// validators stay the source of truth and the defence-in-depth fallback:
+// structured outputs guarantee SHAPE (the required keys, their types, no extras),
+// but NOT value bounds — e.g. `stance ∈ [-1,1]`, a non-empty `dissent`, or the
+// per-call analyst `kind` pin are still enforced by the validator + `completeJson`
+// retry. The structured-outputs JSON-schema dialect is restrictive: every object
+// MUST set `additionalProperties:false` and list every property in `required`,
+// and numeric/length bounds (`minimum`/`maxLength`/…) are unsupported — so the
+// bounds live only in the validators, by design. ---
+
+/** A JSON Schema object passed to Anthropic `output_config.format`. */
+export type JsonSchema = Record<string, unknown>;
+
+/**
+ * Structured-output schema for {@link AnalystReport}, matching
+ * {@link validateAnalystReport}. `kind` is the full enum here; the per-call
+ * "must be exactly this kind" pin is applied by the caller (it narrows `kind`
+ * to a `const`) and, failing that, by the validator.
+ */
+export const ANALYST_REPORT_JSON_SCHEMA: JsonSchema = {
+  type: 'object',
+  additionalProperties: false,
+  required: ['kind', 'stance', 'confidence', 'horizonDays', 'keyLevels', 'drivers', 'notes'],
+  properties: {
+    kind: { type: 'string', enum: ['technical', 'fundamental', 'news_sentiment', 'social_sentiment'] },
+    stance: { type: 'number' },
+    confidence: { type: 'number' },
+    horizonDays: { type: 'number' },
+    keyLevels: {
+      type: 'object',
+      additionalProperties: false,
+      required: ['support', 'resistance'],
+      properties: {
+        support: { type: 'number' },
+        resistance: { type: 'number' },
+      },
+    },
+    drivers: { type: 'array', items: { type: 'string' } },
+    notes: { type: 'string' },
+  },
+};
+
+/**
+ * Structured-output schema for {@link TraderDecision}, matching
+ * {@link validateTraderDecision}. The mandatory non-empty `dissent` and the
+ * numeric bounds on `conviction` remain validator-enforced (the schema dialect
+ * can't express "non-empty string" or "[0,1]").
+ */
+export const TRADER_DECISION_JSON_SCHEMA: JsonSchema = {
+  type: 'object',
+  additionalProperties: false,
+  required: [
+    'action',
+    'conviction',
+    'proposedEntry',
+    'proposedStop',
+    'proposedTarget',
+    'riskRewardRatio',
+    'thesis',
+    'dissent',
+  ],
+  properties: {
+    action: { type: 'string', enum: ['BUY', 'SELL', 'HOLD'] },
+    conviction: { type: 'number' },
+    proposedEntry: { type: 'number' },
+    proposedStop: { type: 'number' },
+    proposedTarget: { type: 'number' },
+    riskRewardRatio: { type: 'number' },
+    thesis: { type: 'string' },
+    dissent: { type: 'string' },
+  },
+};
+
+/**
+ * Structured-output schema for {@link RiskVerdict}, matching
+ * {@link validateRiskVerdict}, including the nested {@link RiskPersonaView} panel.
+ */
+export const RISK_VERDICT_JSON_SCHEMA: JsonSchema = {
+  type: 'object',
+  additionalProperties: false,
+  required: ['verdict', 'sizeMultiplier', 'panel', 'reasons'],
+  properties: {
+    verdict: { type: 'string', enum: ['APPROVE', 'REVISE', 'VETO'] },
+    sizeMultiplier: { type: 'number' },
+    panel: {
+      type: 'array',
+      items: {
+        type: 'object',
+        additionalProperties: false,
+        required: ['persona', 'sizeMultiplier', 'reasons'],
+        properties: {
+          persona: { type: 'string', enum: ['aggressive', 'neutral', 'conservative'] },
+          sizeMultiplier: { type: 'number' },
+          reasons: { type: 'array', items: { type: 'string' } },
+        },
+      },
+    },
+    reasons: { type: 'array', items: { type: 'string' } },
+  },
+};
+
 export function validateAgentRecommendation(value: unknown): string[] {
   const errors: string[] = [];
   const r = value as Partial<AgentRecommendation> | null | undefined;

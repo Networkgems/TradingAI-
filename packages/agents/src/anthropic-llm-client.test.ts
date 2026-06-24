@@ -3,10 +3,18 @@ import {
   AnthropicLlmClient,
   modelAcceptsTemperature,
   modelSupportsAdaptiveThinking,
+  modelSupportsStructuredOutputs,
   createAnthropicLlmClientFromEnv,
   type AnthropicLike,
 } from './anthropic-llm-client.js';
 import { completeJson, type LlmCompletionRequest } from './llm-client.js';
+
+const TINY_SCHEMA = {
+  type: 'object',
+  additionalProperties: false,
+  required: ['ok'],
+  properties: { ok: { type: 'boolean' } },
+} as const;
 
 function fakeMessage(text: string, usage: Record<string, number> = {}) {
   return {
@@ -54,6 +62,92 @@ describe('modelSupportsAdaptiveThinking', () => {
     expect(modelSupportsAdaptiveThinking('claude-opus-4-5')).toBe(false);
     expect(modelSupportsAdaptiveThinking('claude-sonnet-4-5')).toBe(false);
     expect(modelSupportsAdaptiveThinking('claude-haiku-4-5')).toBe(false);
+  });
+});
+
+describe('modelSupportsStructuredOutputs', () => {
+  it('is true for Opus 4.5+, Sonnet 4.6, Haiku 4.5, Fable 5; false for older/unknown', () => {
+    expect(modelSupportsStructuredOutputs('claude-opus-4-8')).toBe(true);
+    expect(modelSupportsStructuredOutputs('claude-opus-4-5')).toBe(true);
+    expect(modelSupportsStructuredOutputs('claude-sonnet-4-6')).toBe(true);
+    expect(modelSupportsStructuredOutputs('claude-haiku-4-5')).toBe(true);
+    expect(modelSupportsStructuredOutputs('claude-fable-5')).toBe(true);
+    expect(modelSupportsStructuredOutputs('claude-sonnet-4-5')).toBe(false);
+    expect(modelSupportsStructuredOutputs('claude-opus-4-1')).toBe(false);
+    expect(modelSupportsStructuredOutputs('some-local-model')).toBe(false);
+  });
+});
+
+describe('AnthropicLlmClient.complete — structured outputs (TRA-1043)', () => {
+  it('passes output_config.format when the model supports it and a schema is supplied', async () => {
+    const create = vi.fn().mockResolvedValue(fakeMessage('{"ok":true}'));
+    const llm = new AnthropicLlmClient({ client: stubClient(create) }); // strong → sonnet-4-6
+    await llm.complete({ ...req, outputSchema: TINY_SCHEMA });
+    const body = create.mock.calls[0]![0];
+    expect(body.output_config).toEqual({ format: { type: 'json_schema', schema: TINY_SCHEMA } });
+  });
+
+  it('does NOT pass format on a model without structured-output support', async () => {
+    const create = vi.fn().mockResolvedValue(fakeMessage('{"ok":true}'));
+    const llm = new AnthropicLlmClient({
+      client: stubClient(create),
+      models: { strong: 'claude-sonnet-4-5' }, // no structured-output support
+    });
+    await llm.complete({ ...req, outputSchema: TINY_SCHEMA });
+    expect(create.mock.calls[0]![0].output_config).toBeUndefined();
+  });
+
+  it('merges format AND effort into one output_config when thinking + schema are both on', async () => {
+    const create = vi.fn().mockResolvedValue(fakeMessage('{"ok":true}'));
+    const llm = new AnthropicLlmClient({ client: stubClient(create) }); // sonnet-4-6
+    await llm.complete({
+      ...req,
+      maxTokens: 900,
+      thinking: { effort: 'high' },
+      outputSchema: TINY_SCHEMA,
+    });
+    const body = create.mock.calls[0]![0];
+    expect(body.output_config).toEqual({
+      effort: 'high',
+      format: { type: 'json_schema', schema: TINY_SCHEMA },
+    });
+    expect(body.thinking).toEqual({ type: 'adaptive' });
+  });
+
+  it('omits output_config entirely when no schema and no thinking', async () => {
+    const create = vi.fn().mockResolvedValue(fakeMessage('{"ok":true}'));
+    const llm = new AnthropicLlmClient({ client: stubClient(create) });
+    await llm.complete(req);
+    expect(create.mock.calls[0]![0].output_config).toBeUndefined();
+  });
+
+  it('happy path: schema-valid first response ⇒ exactly ONE create() call, zero retries', async () => {
+    const create = vi.fn().mockResolvedValue(fakeMessage('{"ok":true}'));
+    const llm = new AnthropicLlmClient({ client: stubClient(create) });
+    const out = await completeJson<{ ok: boolean }>(
+      llm,
+      { ...req, outputSchema: TINY_SCHEMA },
+      { validate: (v) => (typeof (v as { ok?: unknown }).ok === 'boolean' ? [] : ['ok required']) },
+    );
+    expect(out.value.ok).toBe(true);
+    expect(out.attempts).toBe(1);
+    expect(create).toHaveBeenCalledTimes(1); // no correction round-trips on the happy path
+  });
+
+  it('degraded path: malformed output still recovers via the completeJson fallback', async () => {
+    let n = 0;
+    const create = vi
+      .fn()
+      .mockImplementation(async () => fakeMessage(n++ === 0 ? 'not json at all' : '{"ok":true}'));
+    const llm = new AnthropicLlmClient({ client: stubClient(create) });
+    const out = await completeJson<{ ok: boolean }>(
+      llm,
+      { ...req, outputSchema: TINY_SCHEMA },
+      { validate: (v) => (typeof (v as { ok?: unknown }).ok === 'boolean' ? [] : ['ok required']) },
+    );
+    expect(out.value.ok).toBe(true);
+    expect(out.attempts).toBe(2); // fallback retry kicked in
+    expect(create).toHaveBeenCalledTimes(2);
   });
 });
 

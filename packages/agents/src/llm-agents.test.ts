@@ -178,6 +178,53 @@ describe('review-block context injection', () => {
   });
 });
 
+// TRA-1043 — every judgment call carries an Anthropic structured-output schema so
+// the payload is schema-valid first-shot; on a valid response there is exactly ONE
+// model call (no completeJson correction round-trips).
+describe('structured outputs (TRA-1043)', () => {
+  it('analysts request a kind-pinned schema and make a single call each on valid output', async () => {
+    const llm = fakeLlm((req) => analystJson(req.purpose.split(':')[1]!), 0);
+    await runAnalystsLlm(input, llm);
+    expect(llm.calls).toHaveLength(4); // one call per analyst, zero retries
+    for (const c of llm.calls) {
+      const schema = c.outputSchema as { properties?: { kind?: { const?: string } } } | undefined;
+      // kind is pinned to a const matching the analyst's purpose.
+      expect(schema?.properties?.kind?.const).toBe(c.purpose.split(':')[1]);
+    }
+  });
+
+  it('the trader requests the TraderDecision schema and makes a single call on valid output', async () => {
+    const llm = fakeLlm(() => JSON.stringify({
+      action: 'BUY', conviction: 0.6, proposedEntry: 100, proposedStop: 98,
+      proposedTarget: 106, riskRewardRatio: 3, thesis: 't', dissent: 'd',
+    }), 0);
+    await runTraderLlm(input, [], debate, llm);
+    expect(llm.calls).toHaveLength(1);
+    const schema = llm.calls[0]!.outputSchema as { required?: string[] } | undefined;
+    expect(schema?.required).toContain('dissent');
+  });
+
+  it('the risk manager requests the RiskVerdict schema on a live proposal', async () => {
+    const buy: TraderDecision = {
+      action: 'BUY', conviction: 0.3, proposedEntry: 100, proposedStop: 98,
+      proposedTarget: 106, riskRewardRatio: 3, thesis: 't', dissent: 'd',
+    };
+    const llm = fakeLlm(() => JSON.stringify({
+      verdict: 'APPROVE', sizeMultiplier: 0.2,
+      panel: [
+        { persona: 'aggressive', sizeMultiplier: 0.2, reasons: ['a'] },
+        { persona: 'neutral', sizeMultiplier: 0.1, reasons: ['n'] },
+        { persona: 'conservative', sizeMultiplier: 0.05, reasons: ['c'] },
+      ],
+      reasons: ['ok'],
+    }), 0);
+    await runRiskPanelLlm(buy, llm);
+    expect(llm.calls).toHaveLength(1);
+    const schema = llm.calls[0]!.outputSchema as { required?: string[] } | undefined;
+    expect(schema?.required).toEqual(['verdict', 'sizeMultiplier', 'panel', 'reasons']);
+  });
+});
+
 describe('runRiskPanelLlm', () => {
   function riskJson(verdict: string, size: number): string {
     return JSON.stringify({
