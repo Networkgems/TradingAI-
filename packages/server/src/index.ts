@@ -1716,6 +1716,9 @@ async function enrichChainPartition(date: string): Promise<void> {
         ivRank?: number | null;
       };
       if (!snap || !Array.isArray(snap.rows) || typeof snap.symbol !== 'string') continue;
+      // Idempotent: a file already carrying `ivRank` was enriched on a prior
+      // run (today's post-pass or the boot backfill) — leave its as-of rank.
+      if (snap.ivRank !== undefined) continue;
       const spot =
         snap.spot != null && Number.isFinite(snap.spot) && snap.spot > 0
           ? snap.spot
@@ -1740,6 +1743,31 @@ async function enrichChainPartition(date: string): Promise<void> {
   }
   log.info('chain-recorder enriched partition', { date, stamped, total: files.length });
 }
+
+// TRA-1049 — one-shot backfill so the ~26 partitions captured before this change
+// shipped become IVR-bearing without waiting a month for forward captures. Walks
+// every date partition ascending; `enrichChainPartition` warms `recordDailyIv`
+// as it goes and skips already-stamped files, so the IV store accrues history
+// and the earliest days honestly stay `ivRank: null` until the trailing window
+// reaches MIN_IV_SAMPLES, then later days rank against it. Idempotent and
+// best-effort — runs once at boot, a no-op on every boot thereafter.
+async function backfillChainEnrichment(): Promise<void> {
+  const DATE_PARTITION = /^\d{4}-\d{2}-\d{2}$/;
+  let dates: string[];
+  try {
+    dates = (await readdir(CHAIN_RECORD_OUT_DIR)).filter((d) => DATE_PARTITION.test(d)).sort();
+  } catch {
+    return;
+  }
+  if (dates.length === 0) return;
+  log.info('chain-recorder backfill enrich starting', { partitions: dates.length });
+  for (const date of dates) {
+    await enrichChainPartition(date);
+  }
+  log.info('chain-recorder backfill enrich complete', { partitions: dates.length });
+}
+// Fire-and-forget at boot — never blocks startup; the IV store was warmed above.
+void backfillChainEnrichment();
 
 // TRA-845 — Layer-4 alert push. Runs right after the daily chain capture so it
 // diffs the freshly-written partition against yesterday's. Chain-diff + IV-move
