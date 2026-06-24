@@ -48,6 +48,26 @@ const __dirname = dirname(fileURLToPath(import.meta.url));
 const DATA_DIR = process.env.DATA_DIR ?? join(__dirname, '..', 'data');
 const PERSIST_DEBOUNCE_MS = 1000;
 
+// TRA-1084 — boot-herd mitigation. Each per-user engine creates its OWN
+// SignalEngine + CryptoSignalEngine, and each `.start()` fires an immediate
+// full-universe tick. With N demo books that is N engines sweeping the SAME
+// watchlist + N crypto feeds (~495 symbols, Coinbase timeouts) ALIGNED at
+// `server_available`, saturating the single libuv loop for >5s so `/api/health`
+// can't answer inside Render's 5s budget → Render kills the box mid-warmup →
+// restart-loop (the bqb1 502 root cause, TRA-1082 forensics). Staggering the
+// boot tick by a per-engine step spreads that herd across the warmup so no
+// single synchronous window blows the 5s budget; the staggered start also
+// phase-offsets the steady-state 30s/60s intervals so they don't re-align into
+// periodic tick storms. Tunable via env for ops; 0 disables the stagger.
+const ENGINE_BOOT_STAGGER_MS = Math.max(0, Number(process.env.ENGINE_BOOT_STAGGER_MS ?? 1500) || 0);
+
+export interface EngineStartStagger {
+  /** Delay before the stocks SignalEngine fires its first tick. */
+  engineDelayMs?: number;
+  /** Delay before the CryptoSignalEngine fires its first tick. */
+  cryptoDelayMs?: number;
+}
+
 export interface UserContext {
   username: string;
   /** Per-user data root: DATA_DIR/users/<username>. */
@@ -96,12 +116,16 @@ export function userDataDir(username: string): string {
  * provisioning failed, or initAllUserContexts skipped a user). For known-new
  * users the caller should prefer `initUserContext` so failures surface.
  */
-export async function ensureUserContext(username: string): Promise<UserContext> {
+export async function ensureUserContext(
+  username: string,
+  stagger?: EngineStartStagger,
+): Promise<UserContext> {
   const existing = contexts.get(username);
   if (existing) return existing;
   const ctx = await createUserContext(username);
-  ctx.engine.start();
-  ctx.cryptoEngine.start();
+  // TRA-1084 — stagger the boot tick so N per-user engines don't sweep at once.
+  ctx.engine.start({ initialDelayMs: stagger?.engineDelayMs });
+  ctx.cryptoEngine.start({ initialDelayMs: stagger?.cryptoDelayMs });
   return ctx;
 }
 
@@ -869,10 +893,17 @@ async function createUserContext(username: string): Promise<UserContext> {
  * existing user, and immediately on signup so newly created users have a
  * ticking engine without waiting for their first request.
  */
-export async function initUserContext(username: string): Promise<UserContext> {
-  const ctx = await ensureUserContext(username);
-  ctx.engine.start();
-  ctx.cryptoEngine.start();
+export async function initUserContext(
+  username: string,
+  stagger?: EngineStartStagger,
+): Promise<UserContext> {
+  const ctx = await ensureUserContext(username, stagger);
+  // `start()` is idempotent (TRA-1084): for a freshly-created context
+  // ensureUserContext already armed the staggered boot; this call is a no-op
+  // (it used to leak a second interval + boot tick). For a pre-existing context
+  // it ensures the engines are ticking.
+  ctx.engine.start({ initialDelayMs: stagger?.engineDelayMs });
+  ctx.cryptoEngine.start({ initialDelayMs: stagger?.cryptoDelayMs });
   return ctx;
 }
 
@@ -967,11 +998,35 @@ export async function persistCryptoNow(ctx: UserContext): Promise<void> {
 
 /** Bootstrap contexts for every existing user in users.json. */
 export async function initAllUserContexts(): Promise<void> {
-  for (const u of getAllUsers()) {
+  const users = getAllUsers();
+  // TRA-1084 — assign each user an incremental boot-tick delay so the N engine
+  // pairs don't all sweep the full universe simultaneously at `server_available`.
+  // The crypto engine is offset half a step from the same user's stock engine so
+  // a single user's two heavy first ticks (full watchlist + ~495-symbol feed)
+  // also don't land together. `await initUserContext` only blocks on the
+  // synchronous context build (restore + persist); the boot tick itself is
+  // deferred by the stagger, so the loop still finishes provisioning every
+  // context promptly and the spread is applied to the *ticks*, not the loop.
+  let idx = 0;
+  for (const u of users) {
+    const stagger: EngineStartStagger = ENGINE_BOOT_STAGGER_MS > 0
+      ? {
+        engineDelayMs: idx * ENGINE_BOOT_STAGGER_MS,
+        cryptoDelayMs: idx * ENGINE_BOOT_STAGGER_MS + Math.floor(ENGINE_BOOT_STAGGER_MS / 2),
+      }
+      : {};
     try {
-      await initUserContext(u.username);
+      await initUserContext(u.username, stagger);
     } catch (err: unknown) {
       log.warn('failed to init user context', { username: u.username, reason: err instanceof Error ? err.message : String(err) });
     }
+    idx += 1;
+  }
+  if (ENGINE_BOOT_STAGGER_MS > 0 && users.length > 1) {
+    log.info('TRA-1084 boot stagger applied', {
+      users: users.length,
+      stepMs: ENGINE_BOOT_STAGGER_MS,
+      spanMs: (users.length - 1) * ENGINE_BOOT_STAGGER_MS,
+    });
   }
 }

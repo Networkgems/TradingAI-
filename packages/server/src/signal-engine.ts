@@ -409,6 +409,25 @@ const SUPERTREND_SHADOW_REFRESH_MS = 60_000;
 const SUPERTREND_SHADOW_MAX_SIGNALS = MAX_SIGNALS;
 
 /**
+ * TRA-1084 — ops kill switch for the OBSERVE-ONLY SupertrendConfluence shadow
+ * pass. Parity with `ENABLE_REVERSAL_SHADOW` for ops leverage, but DEFAULT-ON:
+ * the supertrend shadow has always run (gated only by market hours), so the flag
+ * is a kill, not an opt-in. Set `ENABLE_SUPERTREND_SHADOW=false|off|0|no` to shed
+ * its full-universe per-tick supertrend()/confluence eval (the heaviest steady-
+ * state shadow load) without shipping code, exactly the leverage the CTO used on
+ * the reversal side during the bqb1 502 fire. Any other value (or unset) keeps it
+ * on. NOTE: this gates only the supertrend EVAL + paper book — the shared 5m
+ * series refresh still runs whenever the reversal shadow is enabled, since
+ * reversal capture reads the same `shadowCandleCache` (TRA-1064 accrual).
+ */
+const SUPERTREND_SHADOW_FLAG = 'ENABLE_SUPERTREND_SHADOW';
+export function isSupertrendShadowEnabled(env: NodeJS.ProcessEnv = process.env): boolean {
+  const raw = env[SUPERTREND_SHADOW_FLAG];
+  if (typeof raw !== 'string') return true;
+  return !['0', 'false', 'no', 'off'].includes(raw.trim().toLowerCase());
+}
+
+/**
  * TRA-801 — the strategyId under which SupertrendConfluence paper trades accrue
  * to the Live-Trading Promotion Gate's Stage-2 ledger. It is the same value the
  * strategy stamps on every emitted `TradeSignal.type`, so a closed paper
@@ -1604,7 +1623,12 @@ export class SignalEngine {
     this.handlers.push(handler);
   }
 
-  start(): void {
+  start(opts?: { initialDelayMs?: number }): void {
+    // TRA-1084 — idempotent: a running engine (timer set) is a no-op. `initUserContext`
+    // calls `ensureUserContext` (which already starts a fresh context) and then calls
+    // `start()` again, so without this guard every boot leaked a second interval AND a
+    // second staggered boot tick. Re-arming after `stop()` (which nulls the timer) still works.
+    if (this.tickTimer) return;
     // Pre-seed symbolState so clients that connect before the first tick see all expected symbols.
     // Entries with lastUpdated=0 signal "loading" to the UI.
     for (const sym of this.getActiveSymbols()) {
@@ -1612,8 +1636,25 @@ export class SignalEngine {
         this.symbolState.set(sym, { symbol: sym, price: 0, volume: 0, change: 0, changePct: 0, lastUpdated: 0 });
       }
     }
-    this.tick();
-    this.tickTimer = setInterval(() => this.tick(), 30_000);
+    // TRA-1084 — stagger the boot tick across per-user engines so N engines don't
+    // all sweep the full watchlist (supertrend/shadow math) simultaneously at
+    // `server_available` and saturate the single libuv loop past Render's 5s
+    // health-check budget — the root cause of the bqb1 502 warmup restart-loop.
+    // The staggered start also phase-offsets the 30s interval, so the herd stays
+    // spread for the life of the process instead of re-aligning every 30s.
+    const beginTicking = (): void => {
+      this.tick();
+      this.tickTimer = setInterval(() => this.tick(), 30_000);
+    };
+    const initialDelayMs = Math.max(0, opts?.initialDelayMs ?? 0);
+    if (initialDelayMs === 0) {
+      beginTicking();
+    } else {
+      // Reuse `tickTimer` to hold the pending boot timeout so `stop()` can cancel
+      // it (clearInterval cancels a Timeout handle in Node). `beginTicking`
+      // overwrites it with the real interval once it fires.
+      this.tickTimer = setTimeout(beginTicking, initialDelayMs);
+    }
   }
 
   stop(): void {
@@ -2198,7 +2239,14 @@ export class SignalEngine {
     // (no prints) and a shadow read would be off post-close noise. Live capital
     // routing for supertrend stays OFF and is gated on the TRA-734 real-chain
     // go/no-go; see {@link evaluateSupertrendShadow}.
-    if (isStockMarketOpen()) {
+    // TRA-1084 — resolve both shadow kill switches once per tick. The shared 5m
+    // series refresh (the heaviest I/O leg) only runs when at least one consumer
+    // is enabled, and the per-consumer EVAL passes are gated independently so the
+    // supertrend kill flag can shed its full-universe load WITHOUT starving the
+    // reversal capture (TRA-1064), which reads the same `shadowCandleCache`.
+    const supertrendShadowOn = isSupertrendShadowEnabled();
+    const reversalShadowOn = isReversalShadowEnabled();
+    if (isStockMarketOpen() && (supertrendShadowOn || reversalShadowOn)) {
       if (Date.now() - this.lastSupertrendShadowRefreshAt >= SUPERTREND_SHADOW_REFRESH_MS) {
         this.lastSupertrendShadowRefreshAt = Date.now();
         try {
@@ -2213,7 +2261,7 @@ export class SignalEngine {
       // freshest tape BEFORE re-evaluating, so a symbol that exited at SL/TP this
       // tick can re-enter on the same tick when its confluence still holds. The
       // open side runs inside evaluateSupertrendShadow.
-      this.runSupertrendPaperExits(prices);
+      if (supertrendShadowOn) this.runSupertrendPaperExits(prices);
       // TRA-1082 — the shadow 5m-series only changes on a refresh (once/min), but
       // `refresh()` is driven back-to-back by the autonomous-demo schedule. Gate
       // the full-universe EVAL passes so they run at most once per new series
@@ -2227,10 +2275,13 @@ export class SignalEngine {
         // TRA-1082 — awaited: both shadow passes yield to the event loop mid-sweep
         // so the full-universe synchronous indicator burst can't starve Render's 5s
         // health check (the silent 5-8s log gaps the CTO traced).
-        await this.evaluateSupertrendShadow(activeSymbols);
+        // TRA-1084 — each gated by its own kill switch (supertrend DEFAULT-ON;
+        // reversal opt-in via ENABLE_REVERSAL_SHADOW). evaluateReversalShadow also
+        // self-checks the flag, so the guard here just avoids the call overhead.
+        if (supertrendShadowOn) await this.evaluateSupertrendShadow(activeSymbols);
         // TRA-921 (TRA-920 B) — OBSERVE-ONLY reversal-checklist shadow capture.
         // OFF unless ENABLE_REVERSAL_SHADOW is set; nothing here routes or opens.
-        await this.evaluateReversalShadow(activeSymbols);
+        if (reversalShadowOn) await this.evaluateReversalShadow(activeSymbols);
       }
     }
 

@@ -733,7 +733,11 @@ export class CryptoSignalEngine {
     this.handlers.push(handler);
   }
 
-  start(): void {
+  start(opts?: { initialDelayMs?: number }): void {
+    // TRA-1084 — idempotent (parity with SignalEngine.start): a running engine is
+    // a no-op so the `ensureUserContext`+`initUserContext` double-call can't leak a
+    // second 60s interval or a second staggered boot tick.
+    if (this.tickTimer) return;
     // TRA-345 — one-shot startup observability for the pinned strategy preset.
     // Prints the resolved preset id, enabled strategies, symbol filter, and the
     // raw `LIVE_STRATEGY_PRESET` env value the process actually saw. This is
@@ -792,14 +796,29 @@ export class CryptoSignalEngine {
         this.symbolState.set(sym, { symbol: sym, price: 0, volume: 0, change: 0, changePct: 0, lastUpdated: 0 });
       }
     }
-    // TRA-1051 — kick off the one-shot cold-start daily-candle warmer (flag-OFF
-    // by default → no-op). Fire-and-forget so it can't delay the first tick; it
-    // shares `refreshDailyCandles`'s pacer + breaker + 1h fetch-gate, so it can
-    // only front-load the same fetches the tick loop would make, never duplicate
-    // or out-pace the meter beyond its own self-throttled per-minute budget.
-    void this.warmDailyCandlesOnBoot();
-    this.tick();
-    this.tickTimer = setInterval(() => this.tick(), 60_000);
+    // TRA-1084 — stagger the boot tick (and the crypto cold-start warmer) across
+    // per-user engines so N crypto feeds of ~495 symbols don't all fire at
+    // `server_available` and saturate the libuv loop past Render's 5s health
+    // check. The staggered start phase-offsets the 60s interval for the life of
+    // the process. Crypto is offset from this user's stock engine by the caller
+    // so a single user's two engines don't sweep together either.
+    const beginTicking = (): void => {
+      // TRA-1051 — kick off the one-shot cold-start daily-candle warmer (flag-OFF
+      // by default → no-op). Fire-and-forget so it can't delay the first tick; it
+      // shares `refreshDailyCandles`'s pacer + breaker + 1h fetch-gate, so it can
+      // only front-load the same fetches the tick loop would make, never duplicate
+      // or out-pace the meter beyond its own self-throttled per-minute budget.
+      void this.warmDailyCandlesOnBoot();
+      this.tick();
+      this.tickTimer = setInterval(() => this.tick(), 60_000);
+    };
+    const initialDelayMs = Math.max(0, opts?.initialDelayMs ?? 0);
+    if (initialDelayMs === 0) {
+      beginTicking();
+    } else {
+      // Reuse `tickTimer` to hold the pending boot timeout so `stop()` can cancel it.
+      this.tickTimer = setTimeout(beginTicking, initialDelayMs);
+    }
   }
 
   /**
