@@ -1067,6 +1067,117 @@ export async function fetchCryptoQuotes(
   return results;
 }
 
+// ─────────────────────────────────────────────────────────────────────────────
+// TRA-1087 — shared per-tick crypto quote cache (dedupe the feed across engines).
+//
+// Every per-user `CryptoSignalEngine` calls `fetchCryptoQuotes(activeSymbols)`
+// once per 60s tick over the SAME venue-wide universe (~495 symbols on bqb1).
+// With N demo books that is N identical fan-outs per minute — N × (4 Coinbase
+// Advanced Trade batch calls + residual /stats + CoinGecko + Yahoo + CMC) all
+// queued through the shared 10 req/s Coinbase pacer. That queue depth is the
+// dominant remaining contributor to the bqb1 event-loop pressure behind the 502
+// flap (TRA-1082 lineage): daily candles are already deduped by the TRA-693
+// `sharedDailyCandleCache`, but quotes were not.
+//
+// This wrapper caches quotes module-level keyed by symbol with a short TTL. The
+// boot stagger (TRA-1084) phase-offsets each engine's tick, so within one 60s
+// round the engines tick spread across ~N × ENGINE_BOOT_STAGGER_MS. A TTL set
+// just under the 60s tick means the FIRST engine each minute does the one real
+// fetch and every other engine in that round reads the cache (0 network), then
+// the next minute's leader refreshes — collapsing N × 495 fetches to 1 × 495.
+//
+// Freshness: a quote up to TTL old feeds symbolState (display) and the DCA/swing
+// `evaluate()` price. These strategies trade on daily/5m bars, so a sub-minute
+// stale current price is well within tolerance and far fresher than the 1h-gated
+// daily candle cache it sits beside. The live engine on bqb1 is pinned to
+// `no_trade` (LIVE_STRATEGY_PRESET stand-down), so no live fill reads a stale
+// price today; ops can still tighten the window or kill the cache without a
+// redeploy via the env knobs below.
+const CRYPTO_QUOTE_CACHE_TTL_MS = (() => {
+  const raw = Number(process.env.CRYPTO_QUOTE_CACHE_TTL_MS);
+  // Default 45s: < the 60s tick (one real fetch/round) and > the per-engine boot
+  // stagger spread for realistic book counts (so the whole cohort reuses).
+  return Number.isFinite(raw) && raw >= 0 && raw <= 300_000 ? raw : 45_000;
+})();
+// Kill switch: any truthy value falls back to the legacy per-engine fetch so
+// ops can revert the dedupe live if a stale-price regression is ever suspected.
+const SHARED_CRYPTO_QUOTE_CACHE_DISABLED =
+  /^(1|true|yes|on)$/i.test((process.env.DISABLE_SHARED_CRYPTO_QUOTE_CACHE ?? '').trim());
+
+interface CachedCryptoQuote {
+  quote: CryptoQuote;
+  fetchedAt: number;
+}
+const sharedQuoteCache = new Map<string, CachedCryptoQuote>();
+// Coalesce the boot-herd: when N engines all miss the cache at once (cold start,
+// or the first tick of a new round), only the first becomes the leader and runs
+// the real cascade; the rest await its in-flight promise instead of launching N
+// parallel fan-outs (which is exactly the storm we're removing).
+let sharedQuoteRefresh: Promise<void> | null = null;
+
+async function refreshSharedQuotes(symbols: readonly string[]): Promise<void> {
+  const fresh = await fetchCryptoQuotes(symbols);
+  const stamp = Date.now();
+  for (const [sym, quote] of fresh) sharedQuoteCache.set(sym, { quote, fetchedAt: stamp });
+}
+
+/**
+ * TRA-1087 — drop-in replacement for {@link fetchCryptoQuotes} that dedupes the
+ * fetch across the N per-user crypto engines via a short-TTL module-level cache.
+ * Returns the same `Map<symbol, CryptoQuote>` shape; a symbol is omitted when no
+ * provider in the cascade carried it (unchanged from `fetchCryptoQuotes`).
+ */
+export async function fetchCryptoQuotesShared(
+  symbols: readonly string[],
+): Promise<Map<string, CryptoQuote>> {
+  if (SHARED_CRYPTO_QUOTE_CACHE_DISABLED) return fetchCryptoQuotes(symbols);
+
+  const out = new Map<string, CryptoQuote>();
+  if (symbols.length === 0) return out;
+
+  const now = Date.now();
+  const isFresh = (sym: string): boolean => {
+    const c = sharedQuoteCache.get(sym);
+    return c != null && now - c.fetchedAt < CRYPTO_QUOTE_CACHE_TTL_MS;
+  };
+  const missing = symbols.filter(s => !isFresh(s));
+
+  if (missing.length > 0) {
+    // Become the leader if no refresh is in flight; otherwise join the existing
+    // one. The leader fetches the full requested universe so the common case (all
+    // engines share the venue-wide allowlist) needs exactly one cascade.
+    if (!sharedQuoteRefresh) {
+      sharedQuoteRefresh = refreshSharedQuotes(symbols).finally(() => {
+        sharedQuoteRefresh = null;
+      });
+    }
+    try {
+      await sharedQuoteRefresh;
+    } catch (err: unknown) {
+      // A failed leader fetch must not strand joiners; fall back to serving any
+      // still-warm cache entries below (the cascade itself already logs causes).
+      feedLog.warn('shared crypto quote refresh failed', {
+        reason: err instanceof Error ? err.message : String(err),
+      });
+    }
+    // A joiner whose universe is a strict superset of the leader's may still have
+    // symbols the leader didn't price (rare — per-user watchlist divergence). Top
+    // those up with a bounded residual fetch rather than serving them stale/absent.
+    const residual = symbols.filter(s => !sharedQuoteCache.has(s));
+    if (residual.length > 0 && residual.length < symbols.length) {
+      const extra = await fetchCryptoQuotes(residual);
+      const stamp = Date.now();
+      for (const [sym, quote] of extra) sharedQuoteCache.set(sym, { quote, fetchedAt: stamp });
+    }
+  }
+
+  for (const sym of symbols) {
+    const c = sharedQuoteCache.get(sym);
+    if (c) out.set(sym, c.quote);
+  }
+  return out;
+}
+
 // TRA-196 — per-symbol crypto news aggregation.
 //
 // The previous broad query ('crypto bitcoin ethereum') hit Yahoo's search

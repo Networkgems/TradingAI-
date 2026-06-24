@@ -31,7 +31,7 @@ import {
   fetchCryptoMinuteBars,
   fetchCryptoDailyBars,
   fetchCrypto4hBars,
-  fetchCryptoQuotes,
+  fetchCryptoQuotesShared,
   fetchCoinbaseAdvancedTradeQuotes,
   fetchCryptoNews,
   refreshCoinbaseProductCatalog,
@@ -1180,7 +1180,10 @@ export class CryptoSignalEngine {
     // already knows which symbols are tradable on Coinbase before the entry
     // gate runs below.
     await refreshCoinbaseProductCatalog();
-    const quotes = await fetchCryptoQuotes(activeSymbols);
+    // TRA-1087 — shared per-tick quote cache dedupes this fetch across the N
+    // per-user crypto engines (was N identical ~495-symbol fan-outs/minute
+    // through the shared Coinbase pacer; now one fetch per round, the rest cached).
+    const quotes = await fetchCryptoQuotesShared(activeSymbols);
 
     const prices = new Map<string, number>();
     // TRA-338 — parallel map keyed by symbol of which provider supplied the
