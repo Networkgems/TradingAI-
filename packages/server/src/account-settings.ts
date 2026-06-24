@@ -5,11 +5,39 @@ import { fileURLToPath } from 'url';
 import type { AccountSettings } from '@trading-app/shared';
 import { DEFAULT_ACCOUNT_SETTINGS } from '@trading-app/shared';
 import { logger } from './observability/index.js';
+import { getStateDb, type StateDb } from './sqlite.js';
 
 const log = logger.child({ module: 'account-settings' });
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const DATA_DIR = process.env.DATA_DIR ?? join(__dirname, '..', 'data');
+
+// ─── TRA-1052 (TRA-1045 R1) durable settings store ──────────────────────────
+// Per-user settings persist as a single JSON blob row keyed by username, so the
+// write is a transactional, crash-durable single-row upsert (WAL) instead of a
+// full-file JSON rewrite that can tear on a crash. Storing the blob (rather than
+// a column-per-field schema) keeps zero schema-migration coupling as
+// AccountSettings evolves. The legacy per-user JSON file is read ONCE as a
+// first-boot importer and never written again while the db is available.
+// Fail-soft: when the db is unavailable every path falls back to the prior JSON
+// file behaviour unchanged.
+const settingsTableReady = new WeakSet<object>();
+function settingsDb(): StateDb | null {
+  const db = getStateDb();
+  if (!db) return null;
+  if (!settingsTableReady.has(db)) {
+    db.exec('CREATE TABLE IF NOT EXISTS account_settings (username TEXT PRIMARY KEY, settings_json TEXT NOT NULL)');
+    settingsTableReady.add(db);
+  }
+  return db;
+}
+
+function writeSettingsRow(db: StateDb, username: string, settings: AccountSettings): void {
+  db.prepare(
+    `INSERT INTO account_settings (username, settings_json) VALUES (?, ?)
+     ON CONFLICT(username) DO UPDATE SET settings_json = excluded.settings_json`,
+  ).run(username, JSON.stringify(settings));
+}
 
 // TRA-142 — settings, watchlist, equity, and trades are now per-user. Each
 // user gets a directory under DATA_DIR/users/<username>/ and an in-memory
@@ -128,6 +156,74 @@ async function persistMigrated(username: string, settings: AccountSettings): Pro
 export async function loadSettings(username: string): Promise<AccountSettings> {
   const cached = cache.get(username);
   if (cached) return cached;
+
+  // TRA-1052 — durable path: a SQLite row wins. On a miss, import the legacy JSON
+  // file ONCE into the db (idempotent — the next load finds the row). Any db error
+  // falls through to the legacy JSON read path below, so behaviour never regresses.
+  const db = settingsDb();
+  if (db) {
+    try {
+      const settings = await loadSettingsViaDb(db, username);
+      cache.set(username, settings);
+      return settings;
+    } catch (err) {
+      log.warn('loadSettings: SQLite path failed, falling back to JSON file', {
+        username,
+        reason: err instanceof Error ? err.message : String(err),
+      });
+    }
+  }
+
+  return loadSettingsFromJsonFile(username);
+}
+
+/**
+ * Read settings from SQLite, importing the legacy JSON file on a first-boot miss.
+ * Throws on a genuine db error (the caller then falls back to the JSON path).
+ */
+async function loadSettingsViaDb(db: StateDb, username: string): Promise<AccountSettings> {
+  const row = db.prepare('SELECT settings_json FROM account_settings WHERE username = ?').get(username) as
+    | { settings_json: string }
+    | undefined;
+  if (row) {
+    const parsed = JSON.parse(row.settings_json) as Partial<AccountSettings>;
+    return { ...DEFAULT_ACCOUNT_SETTINGS, ...parsed } as AccountSettings;
+  }
+  // No row yet — ONE-TIME import from the legacy per-user JSON file, if present.
+  const imported = await readMigratedJsonFile(username);
+  if (imported) {
+    writeSettingsRow(db, username, imported);
+    log.info('TRA-1052 one-time import: migrated per-user settings JSON → SQLite', { username });
+    return imported;
+  }
+  // Nothing persisted anywhere — return defaults without writing a row (a row is
+  // created lazily on the first saveSettings).
+  return { ...DEFAULT_ACCOUNT_SETTINGS };
+}
+
+/**
+ * Read the legacy per-user JSON file and apply the in-place legacy migrations,
+ * returning the migrated settings — or null when no file exists. Does NOT write
+ * anything (the importer's job is to read once; the db write happens in
+ * {@link loadSettingsViaDb}).
+ */
+async function readMigratedJsonFile(username: string): Promise<AccountSettings | null> {
+  const file = userSettingsFile(username);
+  if (!existsSync(file)) return null;
+  const raw = await readFile(file, 'utf-8');
+  const parsed = JSON.parse(raw) as Partial<AccountSettings>;
+  const merged = { ...DEFAULT_ACCOUNT_SETTINGS, ...parsed } as AccountSettings;
+  const credsResult = migrateLegacyLiveCredentials(merged);
+  const flagsResult = migrateLegacyAutoTradingFlags(credsResult.settings);
+  const cryptoLiveResult = migrateLegacyCryptoLiveDefault(
+    flagsResult.settings,
+    parsed.cryptoLiveDefaultMigratedTra587 === true,
+  );
+  return cryptoLiveResult.settings;
+}
+
+/** Legacy JSON read path (used only when SQLite is unavailable). Unchanged behaviour. */
+async function loadSettingsFromJsonFile(username: string): Promise<AccountSettings> {
   const file = userSettingsFile(username);
   if (!existsSync(file)) {
     const fresh = { ...DEFAULT_ACCOUNT_SETTINGS };
@@ -223,6 +319,25 @@ function summarizeCredentialPresence(settings: AccountSettings): {
 }
 
 export async function saveSettings(username: string, settings: AccountSettings): Promise<void> {
+  // TRA-1052 — durable path: a single transactional row upsert (WAL, crash-safe)
+  // replaces the full-file JSON rewrite. Persist BEFORE mutating the cache so a
+  // failed write leaves the in-memory state matching what's actually persisted
+  // (the TRA-511 invariant). Fail-soft to the legacy JSON write below on db error.
+  const db = settingsDb();
+  if (db) {
+    try {
+      writeSettingsRow(db, username, settings);
+      cache.set(username, { ...settings });
+      logSavePersisted(username, settings);
+      return;
+    } catch (err) {
+      log.warn('saveSettings: SQLite write failed, falling back to JSON file', {
+        username,
+        reason: err instanceof Error ? err.message : String(err),
+      });
+    }
+  }
+
   const dir = dirname(userSettingsFile(username));
   if (!existsSync(dir)) {
     await mkdir(dir, { recursive: true });
@@ -236,6 +351,11 @@ export async function saveSettings(username: string, settings: AccountSettings):
   const file = userSettingsFile(username);
   await writeFile(file, JSON.stringify(settings, null, 2), 'utf-8');
   cache.set(username, { ...settings });
+  logSavePersisted(username, settings);
+}
+
+/** TRA-511 — audit which credential fields were present in the saved payload. */
+function logSavePersisted(username: string, settings: AccountSettings): void {
   const presence = summarizeCredentialPresence(settings);
   log.info('saveSettings: persisted', {
     username,

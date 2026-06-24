@@ -23,9 +23,77 @@
 // Pattern mirrors options-spend-store.ts (the TRA-658 monthly cap) but keyed by
 // (user, ET/UTC day) with an aggregate roll-up. In-memory + process-global so the
 // aggregate spans every per-user engine in the process; resets when the day rolls.
+//
+// TRA-1052 (TRA-1045 R1) — the COMMITTED per-user/day ledger is now mirrored to
+// SQLite on the Render disk so the daily cap is not silently reset by a redeploy
+// mid-day: each day-bucket hydrates its committed totals from the db on creation,
+// and every commit upserts the new total. Fail-soft — when the db is unavailable
+// the store behaves exactly as before (pure in-memory). The in-flight `reserved`
+// map (R2) is intentionally NOT persisted: it nets to 0 at rest and a restart
+// correctly forgets any call that was in flight when the process died.
 import { logger } from './observability/index.js';
+import { getStateDb, type StateDb } from './sqlite.js';
 
 const log = logger.child({ module: 'agent-spend' });
+
+// ─── TRA-1052 durable committed-ledger mirror ────────────────────────────────
+// Table per (utc-day, user) holding ONLY committed (real-money) spend. Keyed so
+// a day's totals are a single indexed range read on bucket hydration.
+const spendTableReady = new WeakSet<object>();
+function spendDb(): StateDb | null {
+  const db = getStateDb();
+  if (!db) return null;
+  if (!spendTableReady.has(db)) {
+    db.exec(
+      `CREATE TABLE IF NOT EXISTS agent_spend (
+         day TEXT NOT NULL,
+         user TEXT NOT NULL,
+         spent_usd REAL NOT NULL,
+         PRIMARY KEY (day, user)
+       )`,
+    );
+    spendTableReady.add(db);
+  }
+  return db;
+}
+
+/** Load a day's committed per-user totals from the db into a fresh bucket. */
+function hydrateBucket(b: DayBucket): void {
+  const db = spendDb();
+  if (!db) return;
+  try {
+    const rows = db.prepare('SELECT user, spent_usd FROM agent_spend WHERE day = ?').all(b.day) as Array<{
+      user: string;
+      spent_usd: number;
+    }>;
+    for (const r of rows) {
+      if (Number.isFinite(r.spent_usd) && r.spent_usd > 0) b.perUser.set(r.user, r.spent_usd);
+    }
+    if (rows.length > 0) log.info('hydrated committed agent-spend ledger from SQLite', { day: b.day, users: rows.length });
+  } catch (err) {
+    log.warn('agent-spend: SQLite hydrate failed, continuing in-memory only', {
+      day: b.day,
+      reason: err instanceof Error ? err.message : String(err),
+    });
+  }
+}
+
+/** Persist a user's new committed running total for the day (idempotent upsert). */
+function persistUserSpend(day: string, user: string, total: number): void {
+  const db = spendDb();
+  if (!db) return;
+  try {
+    db.prepare(
+      `INSERT INTO agent_spend (day, user, spent_usd) VALUES (?, ?, ?)
+       ON CONFLICT(day, user) DO UPDATE SET spent_usd = excluded.spent_usd`,
+    ).run(day, user, total);
+  } catch (err) {
+    log.warn('agent-spend: SQLite persist failed, in-memory total still updated', {
+      day,
+      reason: err instanceof Error ? err.message : String(err),
+    });
+  }
+}
 
 /**
  * Per-user/day cap (TRA-746/TRA-747 §6.5; TRA-915 raised $2 → $10). Board-approved
@@ -121,6 +189,9 @@ function currentBucket(now: number): DayBucket {
     // ended (acceptance #4: a real end-of-day total, not a $0 start-of-day one).
     if (bucket) emitClosingReadout(bucket);
     bucket = { day, perUser: new Map(), reserved: new Map(), reviewAlerted: false, ceilingAlerted: false };
+    // TRA-1052 — rehydrate the day's committed totals so a mid-day redeploy does
+    // not reset the per-user cap (the in-flight `reserved` map is left empty).
+    hydrateBucket(bucket);
   }
   return bucket;
 }
@@ -288,7 +359,9 @@ export function recordAgentSpend(
   const b = currentBucket(now);
   const u = userKey(user);
   if (Number.isFinite(costUsd) && costUsd > 0) {
-    b.perUser.set(u, (b.perUser.get(u) ?? 0) + costUsd);
+    const total = (b.perUser.get(u) ?? 0) + costUsd;
+    b.perUser.set(u, total);
+    persistUserSpend(b.day, u, total); // TRA-1052 — durable committed ledger
     maybeEmitAggregateAlerts(b, now);
   }
   return agentUserSpendStatus(u, now);
@@ -385,7 +458,9 @@ export function commitReservation(
   const b = dropReservation(res, now);
   if (!b) return;
   if (Number.isFinite(actualCostUsd) && actualCostUsd > 0) {
-    b.perUser.set(res.user, (b.perUser.get(res.user) ?? 0) + actualCostUsd);
+    const total = (b.perUser.get(res.user) ?? 0) + actualCostUsd;
+    b.perUser.set(res.user, total);
+    persistUserSpend(b.day, res.user, total); // TRA-1052 — durable committed ledger
     maybeEmitAggregateAlerts(b, now);
   }
 }

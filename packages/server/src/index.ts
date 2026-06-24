@@ -68,6 +68,7 @@ import {
   realizedOptionsPnlByCloseDate,
 } from './reports/tradier-reconcile.js';
 import { createToken, verifyToken, generateResetToken, consumeResetToken, initResetTokenStore } from './auth.js';
+import { initStateDb } from './sqlite.js'; // TRA-1052 — durable hot-state SQLite store
 import { checkThrottle, recordFailure, recordSuccess } from './auth-throttle.js';
 import { getSettings, loadSettings, mergeScopedRiskSettings, saveSettings } from './account-settings.js';
 import {
@@ -332,6 +333,13 @@ await checkDataDirHealth();
 // Load users and reset tokens from persistent storage.
 await loadUsers();
 initResetTokenStore(DATA_DIR);
+
+// TRA-1052 (TRA-1045 R1) — open the durable hot-state SQLite store on the Render
+// disk (DATA_DIR) BEFORE any per-user context boots, so the agent-spend committed
+// ledger rehydrates and account-settings reads hit the db. Fail-soft: if the
+// native binary is unavailable this disables durable hot-state and logs, but the
+// server still boots (stores fall back to in-memory/JSON).
+initStateDb(DATA_DIR);
 
 // TRA-801 — ensure SupertrendConfluence has a promotion record so its Stage-2
 // paper accrual surfaces on the `GET /api/promotion/status` overview list (which

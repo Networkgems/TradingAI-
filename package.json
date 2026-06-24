@@ -29,5 +29,11 @@
   "engines": {
     "node": "20.x",
     "pnpm": ">=9"
+  },
+  "pnpm": {
+    "//": "TRA-1052 — .npmrc sets approve-builds=false, so pnpm skips dependency install/build scripts unless allowlisted here. better-sqlite3 is a native module that relies on prebuild-install (an install script) to fetch its prebuilt binary; WITHOUT this entry the binary is silently absent and the server crashes on require. Listed explicitly so `pnpm install --frozen-lockfile` on Render fetches the prebuilt .node (no compilation, so no render-build OOM regression — TRA-1037/1038).",
+    "onlyBuiltDependencies": [
+      "better-sqlite3"
+    ]
   }
 }

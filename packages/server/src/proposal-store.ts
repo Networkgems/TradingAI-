@@ -6,9 +6,19 @@
 // desktop pending-proposals panel (TRA-940) renders.
 //
 // In-memory + process-global, keyed by proposal id, partitioned per (user, mode)
-// for listing. Mirrors agent-spend-store.ts's storage style (no DB dependency;
-// proposals are short-lived and TTL-expired). A stale proposal greys out in the
-// UI and can no longer be confirmed.
+// for listing. A stale proposal greys out in the UI and can no longer be confirmed.
+//
+// TRA-1052 (TRA-1045 R1) — DECISION: proposals are deliberately NOT made
+// restart-durable. They are short-lived (15-min TTL), represent an in-flight
+// operator-confirmation intent, and the engine re-proposes the same setup on the
+// next tick (idempotent per recommendationId). A redeploy mid-confirmation simply
+// drops the pending queue; the operator sees a fresh proposal on the next bar
+// rather than a stale one they must reason about. Persisting them would require
+// serialising the full AgentRecommendation/proposedSignal payload for negligible
+// benefit, so this store stays in-memory while agent-spend and account-settings
+// move to SQLite (see sqlite.ts). Revisit only if an audit-retention requirement
+// (not restart-durability) emerges — a lightweight append-only table would then
+// suffice without changing this hot path.
 import {
   type AccountMode,
   type AgentRecommendation,
