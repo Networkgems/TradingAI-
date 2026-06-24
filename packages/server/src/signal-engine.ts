@@ -922,6 +922,18 @@ export class SignalEngine {
   private shadowCandleCache: Map<string, Candle[]> = new Map();
   /** TRA-787 — last successful shadow 5m-series refresh (gates the 60s cadence). */
   private lastSupertrendShadowRefreshAt = 0;
+  /**
+   * TRA-1082 — the {@link lastSupertrendShadowRefreshAt} value at which the
+   * shadow EVAL passes (Supertrend + reversal) last ran. The 5m shadow series
+   * only changes on a refresh (once/min per {@link SUPERTREND_SHADOW_REFRESH_MS}),
+   * but `refresh()` is driven back-to-back by the autonomous-demo schedule, so
+   * without this gate the full-universe `supertrend()`/`reversalChecklist()` math
+   * re-ran ~14x in ~2s over byte-identical cached bars — relentless event-loop
+   * burn that tripped the bqb1 watchdog every ~40s (502 flap). Gating the eval to
+   * "only when the series advanced since the last eval" collapses that to one pass
+   * per new bar. Observe-only paths: no live-capital routing is affected.
+   */
+  private lastShadowEvalRefreshAt = 0;
   /** TRA-917 — last option-shadow selector pass (gates {@link OPTION_SHADOW_REFRESH_MS}). */
   private lastOptionShadowRefreshAt = 0;
   /**
@@ -2202,13 +2214,24 @@ export class SignalEngine {
       // tick can re-enter on the same tick when its confluence still holds. The
       // open side runs inside evaluateSupertrendShadow.
       this.runSupertrendPaperExits(prices);
-      // TRA-1082 — awaited: both shadow passes now yield to the event loop
-      // mid-sweep so the full-universe synchronous indicator burst can't starve
-      // Render's 5s health check (the silent 5-8s log gaps the CTO traced).
-      await this.evaluateSupertrendShadow(activeSymbols);
-      // TRA-921 (TRA-920 B) — OBSERVE-ONLY reversal-checklist shadow capture.
-      // OFF unless ENABLE_REVERSAL_SHADOW is set; nothing here routes or opens.
-      await this.evaluateReversalShadow(activeSymbols);
+      // TRA-1082 — the shadow 5m-series only changes on a refresh (once/min), but
+      // `refresh()` is driven back-to-back by the autonomous-demo schedule. Gate
+      // the full-universe EVAL passes so they run at most once per new series
+      // (when lastSupertrendShadowRefreshAt advanced since the last eval) instead
+      // of recomputing supertrend()/reversalChecklist() over byte-identical cached
+      // bars on every sweep — the ~14-sweeps/2s burn that tripped the watchdog.
+      // The per-25-symbol yields below remain the in-sweep backstop. The paper-exit
+      // pass above still runs every tick (its price backstop changes each tick).
+      if (this.lastSupertrendShadowRefreshAt !== this.lastShadowEvalRefreshAt) {
+        this.lastShadowEvalRefreshAt = this.lastSupertrendShadowRefreshAt;
+        // TRA-1082 — awaited: both shadow passes yield to the event loop mid-sweep
+        // so the full-universe synchronous indicator burst can't starve Render's 5s
+        // health check (the silent 5-8s log gaps the CTO traced).
+        await this.evaluateSupertrendShadow(activeSymbols);
+        // TRA-921 (TRA-920 B) — OBSERVE-ONLY reversal-checklist shadow capture.
+        // OFF unless ENABLE_REVERSAL_SHADOW is set; nothing here routes or opens.
+        await this.evaluateReversalShadow(activeSymbols);
+      }
     }
 
     // TRA-191: relative-value scanner — the sole stock-options strategy in
