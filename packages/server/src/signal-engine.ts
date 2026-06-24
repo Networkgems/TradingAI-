@@ -492,6 +492,21 @@ export class DailyRiskGovernor {
   private halted = false;
   private haltReason: string | null = null;
   /**
+   * TRA-1072 — the TRANSIENT feed-stale gate, kept deliberately SEPARATE from the
+   * day-latched {@link halted} breaker. `feed_stale` is a data-availability
+   * condition, not a daily risk-budget breach: it is recomputed every autopilot
+   * tick and SELF-CLEARS the moment a fresh candle returns, so a momentary feed
+   * gap no longer freezes the equity/options book for the rest of the session.
+   * It is asset-class-scoped — it gates equity/options entries (via
+   * {@link isHalted}) but NOT the crypto leg (see {@link isHaltedExcludingFeedStale}),
+   * because crypto runs on the independent Coinbase feed with its own freshness
+   * gate. Auto-clearing this does not violate Invariant 4 (it restores normal
+   * operation once a precondition clears; it does not raise a risk limit) — the
+   * loss-streak / drawdown / kill-switch breakers all stay latched.
+   */
+  private feedStaleGate = false;
+  private feedStaleReason: string | null = null;
+  /**
    * TRA-526 — global kill switch. A manual, operator-engaged master stop that
    * overrides every new-entry path (the engine's three entry gates all check
    * `isHalted()`). Unlike the automatic daily circuit-breakers above, the kill
@@ -543,6 +558,11 @@ export class DailyRiskGovernor {
       this.dailyPnl = 0;
       this.halted = false;
       this.haltReason = null;
+      // TRA-1072 — the feed-stale gate is transient (recomputed each tick), but
+      // clear it on the day roll too so a stale gate carried across a quiet
+      // overnight can't surface on the fresh day before the first autopilot tick.
+      this.feedStaleGate = false;
+      this.feedStaleReason = null;
       this.currentDay = today;
       // TRA-995 — the autopilot throttle is a DAILY breaker like the halt: it
       // clears on the fresh ET day. This is not an "autonomous limit increase"
@@ -620,13 +640,38 @@ export class DailyRiskGovernor {
   isHalted(): boolean {
     this.resetIfNewDay();
     // TRA-526 — the kill switch overrides regardless of the daily counters.
+    // TRA-1072 — the transient feed-stale gate halts the EQUITY/OPTIONS entry
+    // paths exactly as before, but it now self-clears (it is no longer latched
+    // into `halted`). Every equity entry gate already consults this method, so
+    // equity/options behaviour is unchanged except for the latching duration.
+    return this.killSwitchEngaged || this.halted || this.feedStaleGate;
+  }
+
+  /**
+   * TRA-1072 — the halt state EXCLUDING the transient equity feed-stale gate.
+   * The crypto leg consults this so an equity-feed staleness never freezes
+   * crypto (which runs on its own Coinbase feed gate). Genuine latched breakers
+   * (loss-streak / drawdown / kill switch) still halt the whole book.
+   */
+  isHaltedExcludingFeedStale(): boolean {
+    this.resetIfNewDay();
     return this.killSwitchEngaged || this.halted;
+  }
+
+  /** TRA-1072 — whether the transient equity/options feed-stale gate is active. */
+  isFeedStale(): boolean {
+    this.resetIfNewDay();
+    return this.feedStaleGate;
   }
 
   getHaltReason(): string | null {
     // TRA-526 — surface the kill-switch reason first; it is the master override.
     if (this.killSwitchEngaged) return this.killSwitchReason;
-    return this.haltReason;
+    // TRA-995 — then the day-latched breaker (loss-streak / drawdown).
+    if (this.halted) return this.haltReason;
+    // TRA-1072 — finally the transient feed-stale gate, with its freshness detail.
+    if (this.feedStaleGate) return this.feedStaleReason;
+    return null;
   }
 
   /**
@@ -643,6 +688,7 @@ export class DailyRiskGovernor {
     assertTightenOnly(decision);
 
     const wasHalted = this.halted;
+    const wasFeedStale = this.feedStaleGate;
 
     // Throttle: ratchet DOWN only. min() guarantees we never loosen mid-day.
     const proposed = clampThrottle(decision.riskThrottle);
@@ -650,11 +696,21 @@ export class DailyRiskGovernor {
       this.riskThrottle = Math.max(MIN_RISK_THROTTLE, proposed);
     }
 
-    // Halt: set (never clear) the daily breaker on a halting decision.
+    // Halt: set (never clear) the daily breaker on a latched halting decision
+    // (loss-streak / daily-drawdown). feed_stale is intentionally NOT here.
     if (decision.halt && !this.halted) {
       this.halted = true;
       this.haltReason = decision.haltReason ?? 'Risk autopilot halted new entries';
     }
+
+    // TRA-1072 — the TRANSIENT feed-stale gate: ASSIGN it every tick (set AND
+    // clear), the opposite of the latched breaker above. When the feed freshens,
+    // `decision.feedStale` is false and the gate self-clears — equity/options
+    // entries resume with no manual Clear-halt. This is not an Invariant-4
+    // loosening: it restores normal operation once a data-availability
+    // precondition clears, it does not raise a risk limit.
+    this.feedStaleGate = decision.feedStale;
+    this.feedStaleReason = decision.feedStale ? decision.feedStaleReason : null;
 
     // Record the actions for health + EOD surfacing (capped, newest last).
     if (decision.actions.length > 0) {
@@ -668,9 +724,15 @@ export class DailyRiskGovernor {
 
     // Fire the risk_halt alert on the false→true transition only (mirrors the
     // automatic breaker path), so an autopilot halt is surfaced like any other.
-    if (!wasHalted && this.halted && this.haltListener) {
+    // A latched halt takes precedence; otherwise a fresh feed-stale transition
+    // alerts once (it won't re-fire while the feed stays stale tick after tick).
+    if (this.haltListener) {
       try {
-        this.haltListener(this.haltReason ?? 'Risk autopilot halted new entries');
+        if (!wasHalted && this.halted) {
+          this.haltListener(this.haltReason ?? 'Risk autopilot halted new entries');
+        } else if (!wasFeedStale && this.feedStaleGate) {
+          this.haltListener(this.feedStaleReason ?? 'Market-data feed stale during market hours');
+        }
       } catch {
         // A notification failure must never break the governor accounting.
       }
@@ -705,6 +767,8 @@ export class DailyRiskGovernor {
     managedEquity: number;
     regime?: Regime | null;
     feedStale?: boolean;
+    /** TRA-1072 — freshness detail surfaced in the feed-stale banner. */
+    feedStaleReason?: string;
     decayingStrategies?: string[];
   }): RiskAutopilotDecision {
     this.resetIfNewDay();
@@ -714,6 +778,7 @@ export class DailyRiskGovernor {
       consecutiveLosses: this.consecutiveLosses,
       regime: signals.regime ?? null,
       feedStale: signals.feedStale ?? false,
+      feedStaleReason: signals.feedStaleReason,
       decayingStrategies: signals.decayingStrategies ?? [],
     });
     this.applyAutopilotDecision(decision);
@@ -6497,6 +6562,17 @@ export class SignalEngine {
     return this.riskGovernor.getRiskThrottle();
   }
 
+  /**
+   * TRA-1072 — the book's halt state EXCLUDING the transient equity feed-stale
+   * gate. The autonomous-demo-loop crypto leg consults this so an equity-feed
+   * staleness (which halts the equity/options leg via {@link getState}.tradingHalted)
+   * does NOT freeze the crypto leg; crypto remains gated by its own Coinbase feed
+   * freshness. Latched breakers (loss-streak / drawdown / kill switch) still halt.
+   */
+  isHaltedExcludingFeedStale(): boolean {
+    return this.riskGovernor.isHaltedExcludingFeedStale();
+  }
+
   /** TRA-995 — the rolling risk-autopilot action log, for health surfaces. */
   getAutopilotActions(): AutopilotAction[] {
     return this.riskGovernor.getAutopilotActions();
@@ -6639,21 +6715,30 @@ export class SignalEngine {
     try {
       const marketOpen = isStockMarketOpen();
       let feedStale = false;
+      // TRA-1072 — capture the freshness detail of the stalest tracked symbol so
+      // the surfaced banner says e.g. "latest candle 940s old (> 720s threshold)"
+      // and operators can tell a real outage from ordinary provider jitter.
+      let feedStaleReason: string | undefined;
       if (marketOpen) {
         const active = this.getActiveSymbols();
         const now = Date.now();
         let anyFresh = false;
         let tracked = 0;
+        let staleReason: string | undefined;
         for (const sym of active) {
           const candles = this.candleCache.get(sym) ?? [];
           if (candles.length === 0) continue;
           tracked++;
-          if (!evaluateFeedFreshness({ candles }, now).stale) {
+          const verdict = evaluateFeedFreshness({ candles }, now);
+          if (!verdict.stale) {
             anyFresh = true;
             break;
           }
+          // Remember a representative stale reason in case no symbol is fresh.
+          if (!staleReason && verdict.reason) staleReason = verdict.reason;
         }
         feedStale = tracked > 0 && !anyFresh;
+        if (feedStale) feedStaleReason = staleReason;
       }
 
       const reviewRegime = this.cachedMarketReview?.regime;
@@ -6663,6 +6748,7 @@ export class SignalEngine {
         managedEquity: this.account.managedEquity(),
         regime,
         feedStale,
+        feedStaleReason,
         decayingStrategies: this.autopilotDecayingStrategies,
       });
     } catch (err: unknown) {

@@ -80,6 +80,12 @@ export interface RiskAutopilotInput {
    */
   feedStale?: boolean;
   /**
+   * TRA-1072 — the human-readable freshness detail from `evaluateFeedFreshness`
+   * (e.g. `latest candle 940s old (> 720s threshold)`), surfaced verbatim in the
+   * halt/banner text so operators can distinguish a real outage from jitter.
+   */
+  feedStaleReason?: string;
+  /**
    * Names of strategies the self-awareness layer flagged as edge-decaying. Each
    * one throttles (and is separately queued for review via the epic-A pipeline).
    */
@@ -127,10 +133,26 @@ export const DEFAULT_AUTOPILOT_THRESHOLDS: AutopilotThresholds = {
  * floored), applied to per-trade risk sizing. `halt` stops all new entries.
  */
 export interface RiskAutopilotDecision {
-  /** True ⇒ stop all new entries (the hard breaker). */
+  /**
+   * True ⇒ the DAY-LATCHED hard breaker is tripped (loss-streak / daily
+   * drawdown): stop all new entries for the rest of the ET day. Does NOT include
+   * `feed_stale` — that is a transient, self-clearing data-availability gate
+   * carried separately in {@link feedStale} (TRA-1072).
+   */
   halt: boolean;
-  /** First halting reason, surfaced as the governor halt reason. Null if !halt. */
+  /** First latched-halt reason, surfaced as the governor halt reason. Null if !halt. */
   haltReason: string | null;
+  /**
+   * TRA-1072 — transient, self-clearing gate: the equity/options market-data
+   * feed is stale during market hours. Unlike {@link halt} this is recomputed
+   * every tick and clears automatically when the feed recovers — it must NEVER
+   * be routed through the day-latched breaker, because a momentary feed gap must
+   * not freeze the book for the rest of the session. Asset-class-scoped: it gates
+   * equity/options entries only; the crypto leg runs on its own feed gate.
+   */
+  feedStale: boolean;
+  /** Human-readable feed-stale reason (incl. the freshness detail). Null if !feedStale. */
+  feedStaleReason: string | null;
   /** Combined throttle multiplier in (0, 1]; 1 ⇒ no de-risking. */
   riskThrottle: number;
   /** Every tightening this evaluation produced, in trigger order. */
@@ -215,12 +237,25 @@ export function evaluateRiskAutopilot(input: RiskAutopilotInput): RiskAutopilotD
       `High-volatility regime — autopilot throttled risk to ${(t.highVolThrottle * 100).toFixed(0)}%`,
     );
   }
+  // TRA-1072 — feed staleness is a TRANSIENT data-availability gate, NOT a
+  // day-latched risk-budget breach. We record it as an action and expose it on
+  // its own `feedStale`/`feedStaleReason` channel, but we deliberately do NOT
+  // route it through `recordHalt` (the day-latched breaker). Why this does not
+  // violate Invariant 4: auto-clearing the feed gate when fresh candles return
+  // is RESTORING normal operation once a data-availability precondition clears —
+  // it is not autonomously raising a risk limit. The loss-streak / daily-drawdown
+  // breakers above stay sticky + board-gated; only this one transient gate
+  // self-clears. The reason carries the freshness detail so an operator can tell
+  // a real outage from provider jitter.
+  let feedStale = false;
+  let feedStaleReason: string | null = null;
   if (input.feedStale) {
-    // A stale feed during market hours: we can't trust prices, so stop opening.
-    recordHalt(
-      'feed_stale',
-      'Market-data feed stale during market hours — autopilot halted new entries',
-    );
+    feedStale = true;
+    const detail = input.feedStaleReason ? ` (${input.feedStaleReason})` : '';
+    feedStaleReason =
+      `Market-data feed stale during market hours${detail} — autopilot paused new equity/options entries; ` +
+      `auto-resumes when the feed recovers (crypto unaffected)`;
+    actions.push({ kind: 'halt', trigger: 'feed_stale', reason: feedStaleReason });
   }
   for (const strat of input.decayingStrategies ?? []) {
     recordThrottle(
@@ -236,7 +271,7 @@ export function evaluateRiskAutopilot(input: RiskAutopilotInput): RiskAutopilotD
     .reduce((acc, a) => acc * (a.throttleMultiplier ?? 1), 1);
   const riskThrottle = halt ? riskThrottleWhenHalted() : clampThrottle(combined);
 
-  return { halt, haltReason, riskThrottle, actions };
+  return { halt, haltReason, feedStale, feedStaleReason, riskThrottle, actions };
 }
 
 /** When halted there are no new entries, so the surfaced throttle is the floor. */

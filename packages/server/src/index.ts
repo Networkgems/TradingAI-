@@ -6153,6 +6153,11 @@ function makeDemoBookEngine(ctx: UserContext): DemoBookEngine {
     username: ctx.username,
     isHalted: () =>
       ctx.engine.getState().tradingHalted || ctx.cryptoEngine.isKillSwitchEngaged(),
+    // TRA-1072 — the crypto leg ignores the equity feed-stale gate (an equity
+    // feed gap must not freeze crypto); it still honours the crypto kill switch
+    // and the equity latched breakers (loss-streak / drawdown / equity kill).
+    isCryptoHalted: () =>
+      ctx.engine.isHaltedExcludingFeedStale() || ctx.cryptoEngine.isKillSwitchEngaged(),
     haltReason: () =>
       ctx.engine.getState().haltReason ??
       (ctx.cryptoEngine.isKillSwitchEngaged() ? 'Crypto kill switch engaged' : null),

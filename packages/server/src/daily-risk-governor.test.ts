@@ -144,7 +144,7 @@ describe('DailyRiskGovernor — TRA-995 risk autopilot (tighten-only)', () => {
     expect(gov.getAutopilotActions().some((a) => a.trigger === 'regime_shift')).toBe(true);
   });
 
-  it('halts on a stale feed and fires the halt listener exactly once', () => {
+  it('gates the equity leg on a stale feed and fires the halt listener exactly once', () => {
     const gov = new DailyRiskGovernor(() => new Date('2026-06-02T15:00:00Z'));
     const reasons: string[] = [];
     gov.setHaltListener((r) => reasons.push(r));
@@ -153,6 +153,51 @@ describe('DailyRiskGovernor — TRA-995 risk autopilot (tighten-only)', () => {
     expect(gov.isHalted()).toBe(true);
     expect(gov.getHaltReason()).toMatch(/feed stale/i);
     expect(reasons).toHaveLength(1); // false→true transition only
+  });
+
+  // TRA-1072 AC1 — feed_stale is TRANSIENT + self-clearing, NOT day-latched. A
+  // momentary feed gap must not freeze the equity book for the rest of the
+  // session: once fresh candles return, entries resume with no manual Clear-halt.
+  it('AC1: feed_stale auto-clears when the feed freshens, while loss-streak / drawdown stay latched', () => {
+    const gov = new DailyRiskGovernor(() => new Date('2026-06-02T15:00:00Z'));
+
+    // Feed goes stale during market hours → equity leg halted.
+    gov.runAutopilot({
+      managedEquity: 100_000,
+      feedStale: true,
+      feedStaleReason: 'latest candle 940s old (> 720s threshold)',
+    });
+    expect(gov.isHalted()).toBe(true);
+    expect(gov.isFeedStale()).toBe(true);
+    expect(gov.getHaltReason()).toMatch(/940s old/); // freshness detail surfaced
+
+    // Feed recovers on the next tick → the gate self-clears, no manual reset.
+    gov.runAutopilot({ managedEquity: 100_000, feedStale: false });
+    expect(gov.isHalted()).toBe(false);
+    expect(gov.isFeedStale()).toBe(false);
+    expect(gov.getHaltReason()).toBeNull();
+
+    // Contrast: a loss-streak halt is a genuine daily breach — it LATCHES and a
+    // benign autopilot tick (fresh feed) must NOT lift it.
+    gov.recordTrade(-100, 10_000);
+    gov.recordTrade(-100, 10_000);
+    gov.recordTrade(-100, 10_000); // trips the 3-loss breaker
+    expect(gov.isHalted()).toBe(true);
+    gov.runAutopilot({ managedEquity: 100_000, feedStale: false });
+    expect(gov.isHalted()).toBe(true); // stays latched
+    expect(gov.getHaltReason()).toMatch(/consecutive losses/i);
+    // And isHaltedExcludingFeedStale agrees — the latched breaker halts both legs.
+    expect(gov.isHaltedExcludingFeedStale()).toBe(true);
+  });
+
+  // TRA-1072 AC2 (governor seam) — an equity feed_stale halts the equity leg but
+  // NOT the crypto leg: isHaltedExcludingFeedStale() stays false so the crypto
+  // conductor keeps driving.
+  it('AC2: an equity feed_stale does not show up in isHaltedExcludingFeedStale (crypto leg)', () => {
+    const gov = new DailyRiskGovernor(() => new Date('2026-06-02T15:00:00Z'));
+    gov.runAutopilot({ managedEquity: 100_000, feedStale: true });
+    expect(gov.isHalted()).toBe(true); // equity leg halted
+    expect(gov.isHaltedExcludingFeedStale()).toBe(false); // crypto leg free
   });
 
   it('only ratchets the throttle DOWN within a day (never loosens autonomously)', () => {

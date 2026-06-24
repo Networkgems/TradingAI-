@@ -24,6 +24,9 @@ function fakeBook(over: Partial<DemoBookEngine> & { username: string }): DemoBoo
   return {
     username: over.username,
     isHalted: over.isHalted ?? (() => false),
+    // TRA-1072 — defaults to the equity halt so existing "halted book" tests
+    // still skip both legs unless a test explicitly scopes the crypto leg.
+    isCryptoHalted: over.isCryptoHalted ?? over.isHalted ?? (() => false),
     haltReason: over.haltReason ?? (() => null),
     riskThrottle: over.riskThrottle ?? (() => 1),
     regime: over.regime ?? (() => null),
@@ -135,6 +138,59 @@ describe('runAutonomousDemoTick — driving', () => {
       droveStocks: false,
       droveCrypto: false,
     });
+  });
+
+  it('AC2: an equity feed_stale halts the stocks leg but NOT the crypto leg', async () => {
+    // The equity feed is stale → isHalted() true (stocks gated), but the crypto
+    // feed is fine → isCryptoHalted() false. Crypto must still drive (TRA-1072).
+    const driveStocks = vi.fn();
+    const driveCrypto = vi.fn();
+    const book = fakeBook({
+      username: 'feedstale',
+      isHalted: () => true,
+      isCryptoHalted: () => false,
+      haltReason: () => 'Market-data feed stale during market hours — auto-resumes',
+      driveStocks,
+      driveCrypto,
+    });
+    const deps: AutonomousDemoLoopDeps = {
+      listBooks: () => [book],
+      isStocksMarketOpen: () => true,
+    };
+
+    const outcome = await runAutonomousDemoTick(1, ON, deps);
+
+    expect(driveCrypto).toHaveBeenCalledTimes(1); // crypto unaffected by equity feed gap
+    expect(driveStocks).not.toHaveBeenCalled(); // stocks leg gated
+    expect(outcome.booksDriven).toBe(1);
+    expect(outcome.decisions[0]).toMatchObject({
+      droveStocks: false,
+      droveCrypto: true,
+      halted: true,
+    });
+  });
+
+  it('a genuine latched halt (loss-streak/drawdown) still stops BOTH legs', async () => {
+    const driveStocks = vi.fn();
+    const driveCrypto = vi.fn();
+    const book = fakeBook({
+      username: 'latched',
+      isHalted: () => true,
+      isCryptoHalted: () => true, // latched breaker halts the crypto leg too
+      haltReason: () => 'daily drawdown −8% — autopilot halted',
+      driveStocks,
+      driveCrypto,
+    });
+    const deps: AutonomousDemoLoopDeps = {
+      listBooks: () => [book],
+      isStocksMarketOpen: () => true,
+    };
+
+    const outcome = await runAutonomousDemoTick(1, ON, deps);
+
+    expect(driveStocks).not.toHaveBeenCalled();
+    expect(driveCrypto).not.toHaveBeenCalled();
+    expect(outcome.booksDriven).toBe(0);
   });
 
   it('a throwing drive is contained — other books still run, loop never rejects', async () => {

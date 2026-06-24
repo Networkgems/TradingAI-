@@ -86,8 +86,20 @@ export interface DemoLoopGates {
  */
 export interface DemoBookEngine {
   username: string;
-  /** Autopilot/kill halt state — true ⇒ this book is skipped this tick. */
+  /**
+   * Equity/options halt state — true ⇒ the STOCKS leg is skipped this tick.
+   * Includes the transient equity feed-stale gate (latched breakers + kill +
+   * feed_stale). This is the book-wide "halted" flag surfaced for health/EOD.
+   */
   isHalted(): boolean;
+  /**
+   * TRA-1072 — the CRYPTO-leg halt state: the book's halt EXCLUDING the equity
+   * feed-stale gate (plus the crypto kill switch). An equity-feed staleness must
+   * NOT freeze crypto, which runs on the independent Coinbase feed with its own
+   * freshness gate. Genuine latched breakers (loss-streak / drawdown / kill
+   * switch) still halt both legs.
+   */
+  isCryptoHalted(): boolean;
   /** Human-readable halt reason, surfaced when halted. */
   haltReason(): string | null;
   /** Tighten-only risk multiplier in (0, 1]; 1 ⇒ full size. */
@@ -187,25 +199,36 @@ export async function runAutonomousDemoTick(
   let booksDriven = 0;
 
   for (const book of books) {
+    // TRA-1072 — the two legs are gated SEPARATELY. `isHalted()` carries the
+    // equity/options halt (latched breakers + kill + the transient equity
+    // feed-stale gate); `isCryptoHalted()` excludes the equity feed-stale gate so
+    // an equity-feed staleness does NOT freeze crypto (which runs on its own
+    // Coinbase feed gate). A genuine latched breaker still halts both legs.
     const halted = book.isHalted();
+    const cryptoHalted = book.isCryptoHalted();
     let droveStocks = false;
     let droveCrypto = false;
 
-    // The autopilot halt is the guard: a halted book is skipped entirely — the
-    // loop forces NO new entries on it. (The engine would refuse entries anyway,
-    // but skipping here makes the "halt stops the loop" contract explicit.)
-    if (!halted) {
+    // Crypto trades 24/7 and is gated by its OWN halt state only.
+    if (!cryptoHalted) {
       try {
-        // Crypto trades 24/7.
         await book.driveCrypto();
         droveCrypto = true;
-        // Stocks/options only when the equity market is open.
-        if (stocksMarketOpen) {
-          await book.driveStocks();
-          droveStocks = true;
-        }
       } catch (err) {
-        log.error('autonomous demo book drive failed', {
+        log.error('autonomous demo book crypto drive failed', {
+          username: book.username,
+          reason: err instanceof Error ? err.message : String(err),
+        });
+      }
+    }
+    // Stocks/options only when the equity market is open AND the equity leg is
+    // not halted (a halted book forces NO new equity entries).
+    if (!halted && stocksMarketOpen) {
+      try {
+        await book.driveStocks();
+        droveStocks = true;
+      } catch (err) {
+        log.error('autonomous demo book stocks drive failed', {
           username: book.username,
           reason: err instanceof Error ? err.message : String(err),
         });

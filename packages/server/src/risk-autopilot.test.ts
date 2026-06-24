@@ -45,10 +45,26 @@ describe('evaluateRiskAutopilot — HALT triggers', () => {
     expect(d.actions.some((a) => a.trigger === 'daily_drawdown' && a.kind === 'halt')).toBe(true);
   });
 
-  it('halts on a stale feed during market hours', () => {
+  // TRA-1072 — feed staleness is NO LONGER routed through the day-latched halt:
+  // it is a transient, self-clearing data-availability gate carried on its own
+  // `feedStale`/`feedStaleReason` channel, so a momentary gap can't freeze the
+  // book for the rest of the session.
+  it('gates (transient) on a stale feed during market hours — NOT via the latched halt', () => {
     const d = evaluateRiskAutopilot({ ...base, feedStale: true });
-    expect(d.halt).toBe(true);
-    expect(d.haltReason).toMatch(/feed stale/i);
+    expect(d.halt).toBe(false); // not the day-latched breaker
+    expect(d.haltReason).toBeNull();
+    expect(d.feedStale).toBe(true); // the transient gate instead
+    expect(d.feedStaleReason).toMatch(/feed stale/i);
+    expect(d.actions.some((a) => a.trigger === 'feed_stale' && a.kind === 'halt')).toBe(true);
+  });
+
+  it('folds the freshness detail into the feed-stale reason (outage vs jitter)', () => {
+    const d = evaluateRiskAutopilot({
+      ...base,
+      feedStale: true,
+      feedStaleReason: 'latest candle 940s old (> 720s threshold)',
+    });
+    expect(d.feedStaleReason).toMatch(/940s old/);
   });
 
   it('reports the throttle at the floor when halted (no new entries anyway)', () => {
@@ -132,7 +148,14 @@ describe('Invariant 4 — tighten-only', () => {
 
   it('assertTightenOnly throws if a decision smuggles a loosening', () => {
     expect(() =>
-      assertTightenOnly({ halt: false, haltReason: null, riskThrottle: 1.5, actions: [] }),
+      assertTightenOnly({
+        halt: false,
+        haltReason: null,
+        feedStale: false,
+        feedStaleReason: null,
+        riskThrottle: 1.5,
+        actions: [],
+      }),
     ).toThrow(/invariant violated/i);
   });
 });
