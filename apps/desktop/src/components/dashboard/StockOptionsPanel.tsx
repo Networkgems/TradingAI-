@@ -48,34 +48,13 @@ export function StockOptionsPanel({
 
   return (
     <div className="positions-panel">
-      <AccountSummaryCard account={account} accountMode={accountMode} />
-      {/* TRA-844 — portfolio Greeks + theta-$ bleed + allocation-by-name/sector
-          over the open options book. Renders nothing when the book is empty. */}
-      <PortfolioGreeksPanel greeks={optionsState?.portfolioGreeks} />
-      {/* TRA-845 — Layer-4 alert engine: new strikes/expiries + big IV moves
-          (chain-diff) and target/stop hits, from /api/options/alerts. */}
-      <OptionsAlertsPanel token={token} />
-      {/* TRA-323 — pull open option positions from Tradier into TradeAI so they
-          can be closed from here. The button targets the Tradier env selected
-          in Settings; the toast that follows reports the count summary. */}
-      {showTradierSync && (
-        <div style={{ display: 'flex', alignItems: 'center', gap: '0.75rem', marginBottom: '0.75rem', flexWrap: 'wrap' }}>
-          <button
-            className="btn-secondary"
-            onClick={syncTradierPositions}
-            disabled={tradierSyncing}
-            title={`Pull open option positions from Tradier ${tradierEnv} into TradeAI`}
-          >
-            {tradierSyncing ? 'Syncing…' : `Sync Tradier ${tradierEnv} positions`}
-          </button>
-          {tradierSyncStatus && (
-            <span className="muted" style={{ fontSize: '0.85rem' }}>{tradierSyncStatus}</span>
-          )}
-        </div>
-      )}
+      {/* TRA-1125 — Open Option Positions hoisted to the top of the Options tab
+          so the live book is the first thing the user sees. The account summary,
+          portfolio Greeks and the (now collapsed-by-default) Options Alerts
+          panel follow below. */}
       {openOptions.length > 0 && (
         <>
-          <h3>Open Option Positions</h3>
+          <h3 style={{ marginTop: 0 }}>Open Option Positions</h3>
           <table>
             <thead>
               <tr>
@@ -222,9 +201,36 @@ export function StockOptionsPanel({
         </>
       )}
 
+      <AccountSummaryCard account={account} accountMode={accountMode} />
+      {/* TRA-844 — portfolio Greeks + theta-$ bleed + allocation-by-name/sector
+          over the open options book. Renders nothing when the book is empty. */}
+      <PortfolioGreeksPanel greeks={optionsState?.portfolioGreeks} />
+      {/* TRA-845 — Layer-4 alert engine: new strikes/expiries + big IV moves
+          (chain-diff) and target/stop hits, from /api/options/alerts. TRA-1125:
+          collapsed by default to cut the noise on the tab. */}
+      <OptionsAlertsPanel token={token} />
+      {/* TRA-323 — pull open option positions from Tradier into TradeAI so they
+          can be closed from here. The button targets the Tradier env selected
+          in Settings; the toast that follows reports the count summary. */}
+      {showTradierSync && (
+        <div style={{ display: 'flex', alignItems: 'center', gap: '0.75rem', marginBottom: '0.75rem', flexWrap: 'wrap' }}>
+          <button
+            className="btn-secondary"
+            onClick={syncTradierPositions}
+            disabled={tradierSyncing}
+            title={`Pull open option positions from Tradier ${tradierEnv} into TradeAI`}
+          >
+            {tradierSyncing ? 'Syncing…' : `Sync Tradier ${tradierEnv} positions`}
+          </button>
+          {tradierSyncStatus && (
+            <span className="muted" style={{ fontSize: '0.85rem' }}>{tradierSyncStatus}</span>
+          )}
+        </div>
+      )}
+
       {closedOptions.length > 0 && (
         <>
-          <h3 style={{ marginTop: openOptions.length > 0 ? '1.5rem' : 0 }}>
+          <h3 style={{ marginTop: '1.5rem' }}>
             Closed Today ({closedOptions.length})
           </h3>
           <table>

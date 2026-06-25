@@ -3,7 +3,7 @@
 // isolation; panels that call useToast are wrapped in <ToastProvider>. fetch is
 // stubbed so the watchlist/close mutations never hit the network.
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
-import { render, screen, act } from '@testing-library/react';
+import { render, screen, act, waitFor } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
 import type { ReactElement } from 'react';
 import type {
@@ -17,6 +17,7 @@ import { StockWatchlistPanel } from './StockWatchlistPanel';
 import { StockSignalsPanel } from './StockSignalsPanel';
 import { StockPositionsPanel } from './StockPositionsPanel';
 import { StockOptionsPanel } from './StockOptionsPanel';
+import { OptionsAlertsPanel } from './OptionsAlertsPanel';
 import { CryptoWatchlistPanel } from './CryptoWatchlistPanel';
 import { CryptoSignalsPanel } from './CryptoSignalsPanel';
 import { CryptoPositionsPanel } from './CryptoPositionsPanel';
@@ -304,6 +305,53 @@ describe('StockOptionsPanel (TRA-422)', () => {
     expect(screen.getByText(/\+\$41\.50/)).toBeInTheDocument();
     // The stale cumulative number must NOT appear in the footer.
     expect(screen.queryByText(/-\$79\.50|−\$79\.50/)).not.toBeInTheDocument();
+  });
+
+  // TRA-1125 — Open Option Positions is hoisted to the top of the tab so the
+  // live book is the first thing the user sees, above the Closed Today table.
+  it('renders Open Option Positions above the Closed Today table', () => {
+    renderWithToast(
+      <StockOptionsPanel
+        token="t" tradierEnv="sandbox" accountMode="demo" account={undefined}
+        optionsState={undefined}
+        openOptions={[optionPos({ id: 'o1', symbol: 'RIOT', optionType: 'call', premiumPaid: 1.51, currentPremium: 1.85, contracts: 1, contractsRemaining: 1 })]}
+        closedOptions={[optionPos({ id: 'o3', symbol: 'AAPL', optionType: 'put', premiumPaid: 0.50, currentPremium: 0.95, contracts: 1, contractsRemaining: 0, pnl: 22.50, closedAt: Date.now() })]}
+        optionsDailyLimit={5}
+      />,
+    );
+    const open = screen.getByText('Open Option Positions');
+    const closed = screen.getByText(/Closed Today/);
+    // DOCUMENT_POSITION_FOLLOWING (4) means `closed` comes after `open`.
+    expect(open.compareDocumentPosition(closed) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
+  });
+});
+
+describe('OptionsAlertsPanel (TRA-1125)', () => {
+  const alertsBody = JSON.stringify({
+    chainDates: ['2026-06-24', '2026-06-25'],
+    symbolsDiffed: ['NVDA'],
+    counts: { new_expiry: 0, new_strike: 0, iv_move: 1, target_hit: 0, stop_hit: 0 },
+    alerts: [{ kind: 'iv_move', severity: 'info', symbol: 'NVDA', message: 'IV +12% vs prior chain', dedupKey: 'k1' }],
+  });
+
+  // The alert table is noisy, so it must start collapsed: the heading shows but
+  // the per-alert detail stays hidden until the user expands it.
+  it('collapses the alert table by default and shows a count badge', async () => {
+    vi.stubGlobal('fetch', vi.fn(() => Promise.resolve(new Response(alertsBody, { status: 200 }))));
+    renderWithToast(<OptionsAlertsPanel token="t" />);
+    // Header renders once the first load resolves.
+    await waitFor(() => expect(screen.getByText('Options Alerts')).toBeInTheDocument());
+    // Collapsed: the count badge is visible but the alert detail row is not.
+    expect(screen.getByText('(1)')).toBeInTheDocument();
+    expect(screen.queryByText(/IV \+12% vs prior chain/)).not.toBeInTheDocument();
+  });
+
+  it('reveals the alert table when the expand chevron is clicked', async () => {
+    vi.stubGlobal('fetch', vi.fn(() => Promise.resolve(new Response(alertsBody, { status: 200 }))));
+    renderWithToast(<OptionsAlertsPanel token="t" />);
+    await waitFor(() => expect(screen.getByText('Options Alerts')).toBeInTheDocument());
+    await userEvent.click(screen.getByTitle('Expand options alerts'));
+    expect(screen.getByText(/IV \+12% vs prior chain/)).toBeInTheDocument();
   });
 });
 

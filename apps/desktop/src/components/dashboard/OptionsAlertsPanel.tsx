@@ -46,6 +46,10 @@ export function OptionsAlertsPanel({ token }: { token: string }) {
   const [data, setData] = useState<AlertsResponse | null>(null);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  // TRA-1125 — the alert table is noisy (every new strike/expiry/IV-move), so
+  // collapse it by default and let the user expand it on demand. The header
+  // still carries a live alert count so collapsed state isn't blind.
+  const [collapsed, setCollapsed] = useState(true);
 
   const load = useCallback(async () => {
     setLoading(true);
@@ -77,8 +81,23 @@ export function OptionsAlertsPanel({ token }: { token: string }) {
       className="positions-panel"
       style={{ marginBottom: '1rem', padding: '0.85rem 1rem', border: '1px solid var(--border, #2a2a2a)', borderRadius: '8px' }}
     >
-      <h3 style={{ marginTop: 0, marginBottom: '0.6rem', display: 'flex', alignItems: 'center', gap: '0.6rem' }}>
+      <h3 style={{ marginTop: 0, marginBottom: collapsed ? 0 : '0.6rem', display: 'flex', alignItems: 'center', gap: '0.6rem' }}>
+        {/* TRA-1125 — chevron toggles the alert table; collapsed by default. */}
+        <button
+          className="btn-secondary"
+          style={{ padding: '0.1rem 0.45rem', fontSize: '0.75rem', minWidth: '1.6rem' }}
+          onClick={() => setCollapsed((c) => !c)}
+          aria-expanded={!collapsed}
+          title={collapsed ? 'Expand options alerts' : 'Collapse options alerts'}
+        >
+          {collapsed ? '▸' : '▾'}
+        </button>
         Options Alerts
+        {collapsed && alerts.length > 0 && (
+          <span className="muted" style={{ fontWeight: 600, fontSize: '0.78rem' }}>
+            ({alerts.length})
+          </span>
+        )}
         <span className="muted" style={{ fontWeight: 'normal', fontSize: '0.78rem' }}>
           chain-diff · target/stop · IV-move
           {data?.chainDates?.length === 2 ? ` · ${data.chainDates[0]} → ${data.chainDates[1]}` : ''}
@@ -94,23 +113,23 @@ export function OptionsAlertsPanel({ token }: { token: string }) {
         </button>
       </h3>
 
-      {error && (
+      {!collapsed && error && (
         <div className="muted" style={{ fontSize: '0.82rem', color: 'var(--red, #d66)' }}>
           Could not load alerts: {error}
         </div>
       )}
 
-      {data?.note && (
+      {!collapsed && data?.note && (
         <div className="muted" style={{ fontSize: '0.78rem', marginBottom: '0.5rem' }}>{data.note}</div>
       )}
 
-      {!error && alerts.length === 0 && (
+      {!collapsed && !error && alerts.length === 0 && (
         <div className="muted" style={{ fontSize: '0.85rem' }}>
           No alerts. No new strikes/expiries, no big IV moves, and no open position at its target or stop.
         </div>
       )}
 
-      {alerts.length > 0 && (
+      {!collapsed && alerts.length > 0 && (
         <table>
           <thead>
             <tr>
