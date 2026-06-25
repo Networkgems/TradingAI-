@@ -196,3 +196,32 @@ export const OPTIONS_PROPOSAL_RAIL_FLAG = 'ENABLE_OPTIONS_PROPOSAL_RAIL';
 export function isOptionsProposalRailEnabled(env: NodeJS.ProcessEnv = process.env): boolean {
   return flagOn(env[OPTIONS_PROPOSAL_RAIL_FLAG]);
 }
+
+// --------------------------------------------------------------------------
+// TRA-1142 (TRA-1139 board-approved direction; rides TRA-1140's rail) — demo
+// AUTO-CONFIRM for accepted AI-Ideas options.
+//
+// TRA-1140 gave AI Ideas a MANUAL shared-rail entry (the click IS the approval).
+// This flag adds the SAME demo auto-confirm path Proposals already have: when ON
+// and the shared rail is ON, each surfaced+enterable idea is run through
+// `shouldAutoConfirm` with options-appropriate gates (demo/paper only,
+// defined-risk only, POP floor, single-lot max-loss cap, kill-switch clear,
+// demo auto-trade ON) and — only if it passes — entered through the shared
+// proposal queue WITHOUT a click, so the paper book starts accruing real
+// auto-trade evidence for the scorecard (TRA-1141).
+//
+// Layered ON TOP OF the rail flag: it only takes effect when
+// `isOptionsProposalRailEnabled()` is also true, so auto-confirm can never
+// diverge from the manual rail path. OFF by default ⇒ no idea is ever entered
+// without a click unless an operator sets BOTH env vars. Paper-only by
+// construction (the entry path is `mode:'demo'`); live options auto-confirm is a
+// hard NO inside `shouldAutoConfirm` regardless. Forward-test sign-off / enable
+// decision is QuantTrader's, gated on accrued evidence.
+// --------------------------------------------------------------------------
+
+export const OPTION_DEMO_AUTO_CONFIRM_FLAG = 'ENABLE_OPTION_DEMO_AUTO_CONFIRM';
+
+/** True iff the shared rail AND the demo options auto-confirm sub-flag are both on. */
+export function isOptionDemoAutoConfirmEnabled(env: NodeJS.ProcessEnv = process.env): boolean {
+  return isOptionsProposalRailEnabled(env) && flagOn(env[OPTION_DEMO_AUTO_CONFIRM_FLAG]);
+}

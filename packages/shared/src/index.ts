@@ -3402,6 +3402,32 @@ export const LIVE_MAX_NOTIONAL_PER_ORDER_USD = 250;
 /** Demo runaway ops-guard: soft cap on demo agent orders per user per ET day. */
 export const DEMO_RUNAWAY_SOFT_CAP_PER_DAY = 50;
 
+// ── TRA-1142 options auto-confirm gates (demo/paper only) ────────────────────
+// Options proposals ride the SAME pending-queue + kill-switch + per-mode toggle
+// + daily-cap rail equity proposals use, but the conviction/notional gates are
+// replaced by options-appropriate ones: defined-risk only, a probability-of-
+// profit floor, and a single-lot max-loss cap. Live options auto-confirm stays a
+// hard NO (same invariant as live equity proposals — enforced first in the fn).
+
+/** Options auto-confirm gate: minimum probability-of-profit (inclusive). */
+export const AUTO_CONFIRM_OPTIONS_MIN_POP = 0.55;
+/** Options auto-confirm gate: maximum single-lot max loss, USD (inclusive). */
+export const AUTO_CONFIRM_OPTIONS_MAX_LOSS_USD = 250;
+
+/**
+ * TRA-1142 — options-specific auto-confirm criteria, present iff the proposal is
+ * a `kind:'options'` proposal. Carries the POP + single-lot max-loss the gate
+ * tests against and whether the structure is defined-risk (bounded max loss).
+ */
+export interface AutoConfirmOptionInput {
+  /** Probability of profit on [0,1] (== OptionProposalDetail.pop). */
+  pop: number;
+  /** Capped single-lot max loss in USD (the capital-at-risk number). */
+  maxLossUsd: number;
+  /** True iff the structure has a bounded (defined) max loss — naked/undefined ⇒ false. */
+  definedRisk: boolean;
+}
+
 /** Inputs to the pure auto-confirm decision (all runtime state passed in). */
 export interface AutoConfirmInput {
   mode: AccountMode;
@@ -3413,6 +3439,13 @@ export interface AutoConfirmInput {
   autoTradeEnabled: boolean;
   /** Kill switch is CLEAR: banner toggle not disabled AND env kill not set. */
   killSwitchClear: boolean;
+  /**
+   * TRA-1142 — present iff this is an OPTIONS proposal. When set, the
+   * options-appropriate gates (defined-risk only, POP floor, single-lot
+   * max-loss cap) REPLACE the equity conviction/notional gates. Absent ⇒ legacy
+   * equity proposal. Live still returns NO before this is ever read.
+   */
+  option?: AutoConfirmOptionInput;
 }
 
 export interface AutoConfirmDecision {
@@ -3423,11 +3456,20 @@ export interface AutoConfirmDecision {
 
 /**
  * TRA-939 Section A — decide whether a proposal auto-confirms. Pure + total so
- * the threshold boundaries are unit-testable in isolation. Auto-confirm fires
- * ONLY when ALL hold: demo mode (live NEVER auto-confirms in v1), conviction
- * >= 0.70, notional <= $250, the per-mode auto-trade toggle is ON, and the kill
- * switch is clear. Otherwise the proposal stays pending for manual confirmation
- * (never silently dropped).
+ * the threshold boundaries are unit-testable in isolation.
+ *
+ * EQUITY proposals auto-confirm ONLY when ALL hold: demo mode (live NEVER
+ * auto-confirms in v1), conviction >= 0.70, notional <= $250, the per-mode
+ * auto-trade toggle is ON, and the kill switch is clear.
+ *
+ * TRA-1142 — OPTIONS proposals (`input.option` present) share the demo/live,
+ * kill-switch and per-mode-toggle gates, but swap the equity conviction/notional
+ * gates for options-appropriate ones: defined-risk only, POP >= 0.55, and a
+ * single-lot max-loss <= $250. Live options auto-confirm is a hard NO (the live
+ * branch returns first, before `option` is read).
+ *
+ * Otherwise the proposal stays pending for manual confirmation (never silently
+ * dropped).
  */
 export function shouldAutoConfirm(input: AutoConfirmInput): AutoConfirmDecision {
   if (input.mode === 'live') {
@@ -3438,6 +3480,30 @@ export function shouldAutoConfirm(input: AutoConfirmInput): AutoConfirmDecision 
   }
   if (!input.autoTradeEnabled) {
     return { autoConfirm: false, reason: 'per-mode auto-trade toggle is OFF' };
+  }
+  // TRA-1142 — options proposals: defined-risk only, POP floor, single-lot
+  // max-loss cap. Demo/paper only (live already returned above).
+  if (input.option) {
+    const { pop, maxLossUsd, definedRisk } = input.option;
+    if (!definedRisk) {
+      return { autoConfirm: false, reason: 'undefined-risk options structure — manual approval only' };
+    }
+    if (!(maxLossUsd > 0)) {
+      return { autoConfirm: false, reason: 'options max-loss not priced (<= $0) — queued for manual approval' };
+    }
+    if (!(pop >= AUTO_CONFIRM_OPTIONS_MIN_POP)) {
+      return {
+        autoConfirm: false,
+        reason: `POP ${pop.toFixed(2)} < ${AUTO_CONFIRM_OPTIONS_MIN_POP} — queued for manual approval`,
+      };
+    }
+    if (!(maxLossUsd <= AUTO_CONFIRM_OPTIONS_MAX_LOSS_USD)) {
+      return {
+        autoConfirm: false,
+        reason: `max loss $${maxLossUsd.toFixed(2)} > $${AUTO_CONFIRM_OPTIONS_MAX_LOSS_USD} — queued for manual approval`,
+      };
+    }
+    return { autoConfirm: true, reason: 'auto-confirmed: demo options, defined-risk, POP & max-loss within gate' };
   }
   if (!(input.conviction >= AUTO_CONFIRM_MIN_CONVICTION)) {
     return {

@@ -5628,6 +5628,64 @@ export class SignalEngine {
     return { ...result, proposalId: proposal.id };
   }
 
+  /**
+   * TRA-1142 — demo AUTO-CONFIRM for an accepted AI-Idea option. Runs the shared
+   * `shouldAutoConfirm` decision with options-appropriate criteria BEFORE
+   * touching the rail: demo/paper only (live is a hard NO inside the decision),
+   * defined-risk only, POP floor, single-lot max-loss cap, kill-switch clear,
+   * and the demo auto-trade toggle ON. ONLY when that passes is the idea entered
+   * through the SAME shared proposal queue the manual click uses
+   * ({@link enterOptionsIdeaViaProposal}); an idea that fails the gate is LEFT
+   * for manual approval (never silently dropped and never force-entered). The
+   * caller is flag-gated by `isOptionDemoAutoConfirmEnabled` (OFF by default).
+   *
+   * Returns `autoConfirmed:false` + the gate reason when the idea was not
+   * eligible (no order placed), or the entry result when it was routed.
+   */
+  async autoConfirmOptionsIdea(intent: {
+    ticker: string;
+    optionSymbol: string;
+    optionType: import('@trading-app/shared').OptionType;
+    strike: number;
+    expiration: string;
+    mark: number;
+    delta: number;
+    spot: number;
+    strategy: string;
+    legs: import('@trading-app/shared').OptionLeg[];
+    netUsd: number;
+    maxLossUsd: number;
+    maxProfitUsd: number;
+    breakevens: number[];
+    pop: number;
+    ideaId: string;
+  }): Promise<{ autoConfirmed: boolean; reason: string; proposalId?: string; position?: OptionPosition | null }> {
+    // Single-lot max loss is the capital-at-risk the cap tests against; a
+    // finite, positive value is also our defined-risk proxy (the AI-Ideas feed
+    // is defined-risk-only by construction, but we re-assert it here so an
+    // unpriced / unbounded structure can never auto-enter).
+    const maxLoss = Math.max(0, intent.maxLossUsd);
+    const definedRisk = Number.isFinite(intent.maxLossUsd) && intent.maxLossUsd > 0;
+    const decision = shouldAutoConfirm({
+      mode: 'demo', // paper-options book is mode:'demo'; live auto-confirm is a hard NO
+      conviction: intent.pop,
+      notional: maxLoss,
+      autoTradeEnabled: this.autoTradingEnabledDemo,
+      killSwitchClear: this.killSwitchClearForExecution(),
+      option: { pop: intent.pop, maxLossUsd: maxLoss, definedRisk },
+    });
+    if (!decision.autoConfirm) {
+      return { autoConfirmed: false, reason: decision.reason };
+    }
+    const result = await this.enterOptionsIdeaViaProposal(intent);
+    return {
+      autoConfirmed: result.ok,
+      reason: result.reason,
+      proposalId: result.proposalId,
+      position: result.position,
+    };
+  }
+
   /** TRA-941 — the agent-placed-order audit trail (newest last). */
   getAgentOrderAudit(): AgentOrderAudit[] {
     return this.agentOrderAudit;

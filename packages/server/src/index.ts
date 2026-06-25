@@ -144,7 +144,7 @@ import {
   estimateSpotFromChain,
 } from '@trading-app/backtest';
 import { buildIdeasFeed, getEntryIntent } from './options-ideas-service.js';
-import { isOptionsProposalRailEnabled } from './option-exec-flag.js';
+import { isOptionsProposalRailEnabled, isOptionDemoAutoConfirmEnabled } from './option-exec-flag.js';
 import {
   getUserAnthropicApiKey,
   setUserAnthropicApiKey,
@@ -2139,6 +2139,37 @@ app.get('/api/options/ideas', requireAuth, async (_req, res) => {
   // of surfacing a `Paper entry` button that always 409s.
   const accountEquityUsd = ctx.engine.getOptionsAccountEquity();
   const feed = await buildIdeasFeed({ client, symbols, anthropicApiKey, accountEquityUsd });
+  // TRA-1142 — demo auto-confirm for AI Ideas options. OFF by default (requires
+  // BOTH the shared-rail flag and this sub-flag). When ON, every surfaced,
+  // enterable idea is run through the engine's options-aware `shouldAutoConfirm`
+  // gate (demo/paper only, defined-risk, POP floor, single-lot max-loss cap,
+  // kill-switch clear, demo auto-trade ON) and — only if it passes — entered via
+  // the SAME shared proposal queue the manual click uses, so the paper book
+  // accrues real auto-trade evidence for the scorecard (TRA-1141). The surfaced
+  // ideas are already journaled by `buildIdeasFeed`, so the scorecard's AI-Ideas
+  // forward-test side picks these entries up with no extra write. Per-idea
+  // failures (gate-blocked or open-refused) leave the idea for manual approval
+  // and never break the feed read. Idempotent across the 60s poll: the proposal
+  // store dedupes a pending options proposal per (user, ideaId) and the paper
+  // book rejects a duplicate open for an already-open contract.
+  if (isOptionDemoAutoConfirmEnabled()) {
+    let entered = 0;
+    for (const idea of feed.ideas) {
+      if (idea.enterable === false) continue;
+      const intent = getEntryIntent(idea.id);
+      if (!intent) continue;
+      try {
+        const r = await ctx.engine.autoConfirmOptionsIdea({ ...intent, ideaId: idea.id });
+        if (r.autoConfirmed) entered += 1;
+      } catch (err) {
+        log.warn('options auto-confirm failed for idea', {
+          ideaId: idea.id,
+          reason: err instanceof Error ? err.message : String(err),
+        });
+      }
+    }
+    if (entered > 0) broadcastEngineState(ctx);
+  }
   res.json(feed);
 });
 
