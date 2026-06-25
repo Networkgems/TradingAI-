@@ -497,6 +497,9 @@ describe('TRA-895 options-pipeline probe', () => {
     expect(report.optionExecSelectorEnabled).toBe(false);
     expect(report.optionExecEmaPullbackEnabled).toBe(false);
     expect(report.optionExecVolumeBreakoutEnabled).toBe(false);
+    // TRA-1114 — demo-only directional-entry gate is surfaced so the board can
+    // verify the flip drives real demo fills from the probe. Off by default.
+    expect(report.optionDemoDirectionalEnabled).toBe(false);
   });
 
   it('names the first failing gate so "no option signals" is diagnosable', () => {

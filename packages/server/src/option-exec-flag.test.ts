@@ -3,11 +3,13 @@ import {
   isOptionExecEnabled,
   isOptionEmaPullbackEnabled,
   isOptionVolumeBreakoutEnabled,
+  isOptionDemoDirectionalEnabled,
   resolveRvLongDteOverride,
   resolveRvMinDailyVolume,
   OPTION_EXEC_FLAG,
   OPTION_EMA_PULLBACK_FLAG,
   OPTION_VOLUME_BREAKOUT_FLAG,
+  OPTION_DEMO_DIRECTIONAL_FLAG,
   OPTION_RV_LONG_DTE_MIN_VAR,
   OPTION_RV_LONG_DTE_MAX_VAR,
   OPTION_RV_MIN_DAILY_VOLUME_VAR,
@@ -20,6 +22,20 @@ describe('isOptionExecEnabled', () => {
     expect(isOptionExecEnabled({})).toBe(false);
     expect(isOptionExecEnabled({ [OPTION_EXEC_FLAG]: 'true' })).toBe(true);
     expect(isOptionExecEnabled({ [OPTION_EXEC_FLAG]: 'off' })).toBe(false);
+  });
+});
+
+describe('isOptionDemoDirectionalEnabled (TRA-1114)', () => {
+  it('is off when unset and on for truthy values', () => {
+    expect(isOptionDemoDirectionalEnabled({})).toBe(false);
+    expect(isOptionDemoDirectionalEnabled({ [OPTION_DEMO_DIRECTIONAL_FLAG]: 'true' })).toBe(true);
+    expect(isOptionDemoDirectionalEnabled({ [OPTION_DEMO_DIRECTIONAL_FLAG]: 'on' })).toBe(true);
+    expect(isOptionDemoDirectionalEnabled({ [OPTION_DEMO_DIRECTIONAL_FLAG]: 'off' })).toBe(false);
+  });
+
+  it('is independent of the exec-selector flag (own switch)', () => {
+    expect(isOptionDemoDirectionalEnabled({ [OPTION_EXEC_FLAG]: ON })).toBe(false);
+    expect(isOptionExecEnabled({ [OPTION_DEMO_DIRECTIONAL_FLAG]: ON })).toBe(false);
   });
 });
 

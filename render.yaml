@@ -203,6 +203,28 @@ services:
       # opens → nothing to journal). Revert = clear this value.
       - key: ENABLE_OPTION_TRADE_JOURNAL
         value: "true"
+      # TRA-1114 / TRA-1113 (board escalation, 3rd time) — turn ON the DEMO-ONLY
+      # DETERMINISTIC DIRECTIONAL call/put entry so the board can SEE calls AND
+      # puts executing in the demo paper book. Root cause of the prior "config is
+      # live but nothing fires" closes: the only enabled idea source on the
+      # executing single-leg path is the legacy RV ANOMALY scanner, which surfaces
+      # nothing on calm days (TRA-592), and the Phase-A/B spread selector stands
+      # DOWN whenever the trailing-year IV-rank store is thin (`ivRank === null`),
+      # which it is on this demo — so Phase-B paper execution is on but has nothing
+      # to execute. When this is set, each tick reads the SAME TRA-734 confluence
+      # trend the rest of the option stack uses and opens ONE near-ATM single-leg
+      # long — a call on uptrend symbols, a put on downtrend ones — directly off
+      # the live selector chain via `openOptionFromRvCandidate`. Across the equity
+      # watchlist both calls and puts fill. `/api/health/options-pipeline` reports
+      # `optionDemoDirectionalEnabled:true` and `openOptionsCount > 0` during RTH.
+      #
+      # SAFETY — DEMO/PAPER ONLY. The engine hard-gates this on `mode === 'demo'`;
+      # the open is `mode:'demo'` with no equity override → NO Tradier mirror, NO
+      # live capital. OFF by default (prod/live byte-for-byte unchanged when unset).
+      # Live-capital promotion stays independently gated on TRA-382. Revert = clear
+      # this value. Accepts the usual truthy spellings (1/true/yes/on).
+      - key: ENABLE_OPTION_DEMO_DIRECTIONAL
+        value: "true"
       # TRA-1064 / TRA-921 (TRA-920 desk reversal) — turn ON the REVERSAL-SHADOW
       # signal ledger (observe-only). The capture (`reversal-shadow-ledger.ts`) is
       # a durable, append-only JSONL: when the desk S/R-reversal checklist prints a

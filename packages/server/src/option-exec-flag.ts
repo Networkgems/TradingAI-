@@ -31,6 +31,39 @@ export function isOptionExecEnabled(env: NodeJS.ProcessEnv = process.env): boole
 }
 
 // --------------------------------------------------------------------------
+// TRA-1114 — demo-only deterministic directional call/put entry.
+//
+// Board escalation (3rd time: TRA-1021 → TRA-1113). The board keeps reporting
+// that calls/puts never fire in the DEMO paper book, yet prior tickets were
+// closed on "config is live". Root cause (verified TRA-1114): the only enabled
+// idea source on the EXECUTING single-leg path is the legacy RV anomaly scanner,
+// which surfaces nothing on calm days (long-known, TRA-592); and the
+// deterministic shadow / Phase-B spread selector stands DOWN whenever the
+// trailing-year IV-rank store is thin (`ivRank === null` → stand_down), which it
+// is on a fresh demo. Phase-B paper execution is on but has nothing to execute.
+//
+// This flag turns on a DEMO-ONLY path that builds a near-ATM, trend-aligned
+// single-leg long call (uptrend) / put (downtrend) directly from the live
+// selector chain and opens it in the paper book via
+// `PaperOptionsAccount.openOptionFromRvCandidate(…, 'demo')`. It is:
+//   • demo/paper only  — the caller hard-gates on `mode === 'demo'`; the open is
+//     `mode:'demo'` with no equity override → no Tradier mirror, no live capital;
+//   • OFF by default   — prod and live paths are byte-for-byte unchanged unset;
+//   • an idea source   — it only produces entries; the account's existing
+//     trading-window / dedup / daily-cap / sizing gates still bound it.
+// Its sole purpose is to give the board the OBSERVABLE evidence the prior
+// config-only closes never produced. Live-capital promotion stays gated on
+// TRA-382 regardless; this path can never touch the live book.
+// --------------------------------------------------------------------------
+
+export const OPTION_DEMO_DIRECTIONAL_FLAG = 'ENABLE_OPTION_DEMO_DIRECTIONAL';
+
+/** True iff the demo-only deterministic directional-entry flag is on. */
+export function isOptionDemoDirectionalEnabled(env: NodeJS.ProcessEnv = process.env): boolean {
+  return flagOn(env[OPTION_DEMO_DIRECTIONAL_FLAG]);
+}
+
+// --------------------------------------------------------------------------
 // TRA-1028 — net-new options swing-entry enhancements (TRA-1026 follow-up).
 //
 // Each lands AFTER TRA-1024/1025 (IV-aware + structure-exit-aware exec path) and

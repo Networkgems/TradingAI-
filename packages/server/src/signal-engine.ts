@@ -1,8 +1,8 @@
 import { OrbStrategy, BbFadeStrategy, IchimokuStrategy, SupertrendConfluenceStrategy, confluenceSide, supertrend, reversalChecklist, adx, atr, donchian, supportResistance, blackScholesDelta, daysToExpiration, selectRvLongCandidate, selectShadowOptionSignal, emaPullbackTrigger, volumeConfirmedBreakout, TradierOptionsClient, TradierOrderClient, TRADIER_REJECTED_STATUSES, evaluateSma200, SMA200_MIN_BARS, SMA200_DEBOUNCE_BARS, composeTechnicalSnapshot, resampleCandles, TF_BUCKET_MS, OptionsRiskBreaker, DEFAULT_OPTIONS_BREAKER_PARAMS } from '@trading-app/engine';
-import type { StrategySelectorInput, ContractQuote, OptionTrend, RvLongTrendSide, ExitState, SharedTickIndicators, RelativeValueScannerOptions } from '@trading-app/engine';
+import type { StrategySelectorInput, ContractQuote, OptionTrend, RvLongTrendSide, ExitState, SharedTickIndicators, RelativeValueScannerOptions, OptionChainRow } from '@trading-app/engine';
 import type { TradierAccountBalance } from '@trading-app/engine';
 import { WATCHLIST, isLiquidSwingSymbol, checkEquitySwingClose, MANAGED_ACCOUNT_RATIO, MAX_CONSECUTIVE_LOSSES, DAILY_DRAWDOWN_HALT_PCT, OPTIONS_PER_TICKET_DOLLAR_FLOOR, OPTIONS_POSITION_CAP_RATIO, aliasWatchlistSymbol, isLiveTradierOptionsEnabled, isStockMarketOpen, perPositionCap, resolveAutoManageImportedTradierOptions, resolveDemoCostModel, resolveHoldLiveOptionsOvernight, resolveLiveTradeEquitiesTradier, resolveManagedAccountRatio, resolveMarketReviewGatesEnabled, resolveRiskPerTrade, resolveRvDtePrefs, resolveTradierOptionsCreds, validateBracket, DEFAULT_RV_DTE_MIN, DEFAULT_RV_DTE_MAX, DEFAULT_RV_DTE_TARGET, scoreNewsSentiment, aggregateSymbolSentiment, aggregateFedSentiment, aggregateStockTwitsSentiment, dedupeStockTwitsMessages, mapCuratedMessagesBySymbol, nameAliasesFor, evaluateEquityDcaAdd, evaluateOptionDcaAdd, CONVICTION_DCA, blendedAverage, positionRiskDollars, minutesToSessionClose, getEasternUtcOffset } from '@trading-app/shared';
-import type { TradeSignal, RelativeValueSignal, Sma200Signal, Candle, OptionsAccountState, SignalType, Position, OptionPosition, AccountMode, AccountSettings, AccountState, NewsItem, SymbolSentiment, SocialSentiment, StockTwitsMessage, TechnicalSignalSnapshot, TradierEnv, MarketReview, MarketReviewGates, EngineMarketReviewState, GatedStrategyNote, AgentRecommendation, TradeProposal, AgentOrderAudit, GuardrailVerdict } from '@trading-app/shared';
+import type { TradeSignal, RelativeValueSignal, Sma200Signal, Candle, OptionsAccountState, SignalType, Position, OptionPosition, AccountMode, AccountSettings, AccountState, NewsItem, SymbolSentiment, SocialSentiment, StockTwitsMessage, TechnicalSignalSnapshot, TradierEnv, MarketReview, MarketReviewGates, EngineMarketReviewState, GatedStrategyNote, AgentRecommendation, TradeProposal, AgentOrderAudit, GuardrailVerdict, OptionType } from '@trading-app/shared';
 import { shouldAutoConfirm } from '@trading-app/shared';
 // TRA-544 (TRA-529 P1) / TRA-747 (P2) — advisory multi-agent layer. ON suspends
 // deterministic auto-routing and the engine surfaces the recommendations on the
@@ -47,7 +47,7 @@ import {
   optionJournalToStrategyRows,
 } from './strategy-introspection.js';
 import { isOptionShadowEnabled, isOptionPhaseBEnabled, emitShadowOptionSignal, shadowSignalToSpreadParams, OPTION_SHADOW_EMERGENCY_OFF } from './option-shadow-ledger.js';
-import { isOptionExecEnabled, isOptionEmaPullbackEnabled, isOptionVolumeBreakoutEnabled, resolveRvLongDteOverride, resolveRvMinDailyVolume } from './option-exec-flag.js';
+import { isOptionExecEnabled, isOptionEmaPullbackEnabled, isOptionVolumeBreakoutEnabled, resolveRvLongDteOverride, resolveRvMinDailyVolume, isOptionDemoDirectionalEnabled } from './option-exec-flag.js';
 import { etDateString } from './scheduler.js';
 // TRA-995 (epic-C, self-regulation) — the standing risk autopilot. A pure
 // tighten-only decision module; the governor below is its mutation boundary and
@@ -1061,6 +1061,8 @@ export class SignalEngine {
   private lastShadowEvalRefreshAt = 0;
   /** TRA-917 — last option-shadow selector pass (gates {@link OPTION_SHADOW_REFRESH_MS}). */
   private lastOptionShadowRefreshAt = 0;
+  /** TRA-1114 — last demo-only directional entry pass (reuses {@link RV_SCAN_INTERVAL_MS}). */
+  private lastDemoDirectionalAt = 0;
   /**
    * TRA-787 — latest SupertrendConfluence shadow signals surfaced on
    * EngineState.supertrendShadowSignals. Observe-only: never merged into
@@ -2471,6 +2473,35 @@ export class SignalEngine {
           await this.evaluateOptionShadow(activeSymbols);
         } catch (err: unknown) {
           optionShadowLog.warn('option shadow pass threw', {
+            reason: err instanceof Error ? err.message : String(err),
+          });
+        }
+      }
+    }
+
+    // TRA-1114 — demo-only deterministic directional call/put entry. Board
+    // escalation (3rd time): plumbing is ON but no calls/puts ever fill in the
+    // demo paper book because the executing RV-anomaly path surfaces nothing
+    // (TRA-592) and the spread selector stands down when the demo IV-rank store
+    // is thin (`ivRank === null`). When the flag is on AND this is the demo book,
+    // open a near-ATM, trend-aligned single-leg long directly off the live chain
+    // so the board can SEE fills. Demo/paper only (no Tradier mirror, no live
+    // capital); gated to market hours and throttled on the RV cadence. Wholly
+    // skipped when the flag is off, so prod/live behaviour is unchanged.
+    if (
+      this.mode === 'demo'
+      && isStockMarketOpen()
+      && isOptionDemoDirectionalEnabled()
+      && this.isAutoTradingEnabled()
+      && !this.riskGovernor.isHalted()
+      && !!this.rvScanner
+    ) {
+      if (Date.now() - this.lastDemoDirectionalAt >= RV_SCAN_INTERVAL_MS) {
+        this.lastDemoDirectionalAt = Date.now();
+        try {
+          await this.evaluateDemoDirectional(activeSymbols);
+        } catch (err: unknown) {
+          log.warn('demo directional pass threw', {
             reason: err instanceof Error ? err.message : String(err),
           });
         }
@@ -3925,6 +3956,159 @@ export class SignalEngine {
    * (`mode: 'demo'`, no equity override → no Tradier mirror), so even here no
    * live capital is touched. The advisory→capital bridge is Phase C (TRA-913).
    */
+  /**
+   * TRA-1114 — DEMO-ONLY deterministic directional call/put entry.
+   *
+   * The board's prior escalations (TRA-1021 → TRA-1113) were closed on "config
+   * is live" while the observable outcome — calls/puts executing in the demo
+   * paper book — never changed, because every enabled idea source on the
+   * EXECUTING path is conditional and surfaces nothing on a fresh/calm demo:
+   *   • the legacy RV anomaly scanner produces no candidates on calm days (TRA-592);
+   *   • the Phase-A/B spread selector stands down whenever the trailing-year
+   *     IV-rank store is thin (`ivRank === null`), which it is in demo.
+   *
+   * This pass closes that gap with a SIMPLE, deterministic rule: for each scanned
+   * symbol read the SAME TRA-734 confluence trend the rest of the option stack
+   * uses; pick the nearest-the-money LIQUID call (uptrend) or put (downtrend)
+   * from the live selector chain, and open ONE single-leg long in the DEMO paper
+   * book via {@link PaperOptionsAccount.openOptionFromRvCandidate} (`mode:'demo'`,
+   * no equity override → NO Tradier mirror, no live capital). Across the equity
+   * watchlist some symbols trend up and some down, so the book reliably shows
+   * BOTH a call and a put — the evidence the board has been asking for.
+   *
+   * The account's own trading-window / dedup / daily-cap / sizing gates still
+   * bound how many open; this method only feeds it directional entries. It is
+   * fire-and-forget per symbol — one bad chain can't take down the tick — and is
+   * caller-gated to `mode === 'demo'` + the flag, so live capital is never
+   * reachable from here. Live promotion stays gated on TRA-382 regardless.
+   */
+  private async evaluateDemoDirectional(symbols: string[]): Promise<void> {
+    // Defense-in-depth: the caller flag-/mode-gates, but re-check so a direct
+    // unit-test call also no-ops with the flag off and never touches Tradier or
+    // the live book.
+    if (!isOptionDemoDirectionalEnabled() || this.mode !== 'demo' || !this.rvScanner) return;
+
+    const asOf = Date.now();
+    const dtePrefs = { min: this.rvDteMin, max: this.rvDteMax, target: this.rvDteTarget };
+
+    for (const sym of symbols) {
+      try {
+        // Trend from the SAME confluence stack the RV-long + shadow selectors
+        // read, off the cached 5m shadow series. No confluence (range / cold
+        // series) → stand down rather than open a trend-blind long.
+        const series = this.shadowCandleCache.get(sym);
+        if (!series || series.length === 0) continue;
+        const decision = confluenceSide(series);
+        const wantType: OptionType | null =
+          decision?.side === 'buy' ? 'call' : decision?.side === 'sell' ? 'put' : null;
+        if (wantType === null) continue;
+
+        // Live chain (rides the scanner's warm 60s cache). Picks the nearest-
+        // the-money liquid contract of the wanted type: a two-sided quote and a
+        // positive mid, preferring real open interest so the fill is realistic.
+        const snap = await this.rvScanner.getSelectorChain(sym, dtePrefs);
+        if (!snap || !(snap.spot > 0) || snap.rows.length === 0) continue;
+        const { spot, expiration, rows } = snap;
+
+        let best: { row: OptionChainRow; mark: number } | null = null;
+        for (const r of rows) {
+          if (r.optionType !== wantType) continue;
+          const bid = r.bid ?? 0;
+          const ask = r.ask ?? 0;
+          if (!(bid > 0) || !(ask > 0) || ask < bid) continue;
+          const mid = (bid + ask) / 2;
+          if (!(mid > 0)) continue;
+          if (best === null || Math.abs(r.strike - spot) < Math.abs(best.row.strike - spot)) {
+            best = { row: r, mark: mid };
+          }
+        }
+        if (best === null) continue;
+
+        const iv = best.row.smvVol ?? best.row.midIv;
+        const delta = typeof iv === 'number' && iv > 0
+          ? blackScholesDelta({
+              spot,
+              strike: best.row.strike,
+              timeToExpiryYears: Math.max(Math.round(daysToExpiration(expiration, asOf)), 0) / 365,
+              riskFreeRate: OPTION_SHADOW_RISK_FREE_RATE,
+              volatility: iv,
+              optionType: best.row.optionType,
+            })
+          : (wantType === 'call' ? 0.5 : -0.5);
+
+        const signal: RelativeValueSignal = {
+          id: randomUUID(),
+          symbol: sym,
+          type: 'relative_value',
+          side: 'buy',
+          entryPrice: best.mark,
+          stopLoss: 0,
+          takeProfit: 0,
+          riskRewardRatio: 2,
+          timestamp: asOf,
+          optionSymbol: best.row.optionSymbol,
+          optionType: best.row.optionType,
+          strike: best.row.strike,
+          expiration,
+          mark: best.mark,
+          // Deterministic ATM directional entry — no skew-fit fields apply; report
+          // the chosen mark as the reference so the journal/feed render cleanly.
+          fairPrice: best.mark,
+          mispricingPct: 0,
+          zScore: 0,
+          ivFitted: typeof iv === 'number' ? iv : 0,
+          ivUsed: typeof iv === 'number' ? iv : 0,
+          delta,
+          reason: `demo directional (TRA-1114): near-ATM ${wantType} on ${decision?.side === 'buy' ? 'uptrend' : 'downtrend'} confluence`,
+          sleeve: 'directional',
+        };
+
+        // Dedup: same OCC opened/fired in the last hour — don't re-spam the feed
+        // when the chain stays selected across multiple passes.
+        const recentDup = this.recentSignals.find(
+          (s) => s.type === 'relative_value'
+            && (s as RelativeValueSignal).optionSymbol === signal.optionSymbol
+            && asOf - s.timestamp < 60 * 60_000,
+        );
+        if (recentDup) continue;
+
+        // Demo/paper open ONLY — `this.mode` is 'demo' (caller-gated), no equity
+        // override → no Tradier mirror. Account window/dedup/cap/sizing bound it.
+        const opened = this.optionsAccount.openOptionFromRvCandidate(
+          signal,
+          this.mode,
+          undefined,
+          spot,
+        );
+        if (!opened) continue;
+
+        this.emitOptionFillAlert(opened);
+        signal.mode = this.mode;
+        this.recentSignals.unshift(signal);
+        this.emitSignalAlert(signal);
+        if (this.recentSignals.length > MAX_SIGNALS) this.recentSignals.pop();
+        this.dailySignals.push({
+          id: signal.id,
+          symbol: signal.symbol,
+          type: 'relative_value',
+          firedAt: signal.timestamp,
+        });
+        log.info('demo directional option opened (TRA-1114)', {
+          symbol: sym,
+          optionType: signal.optionType,
+          strike: signal.strike,
+          expiration,
+          mark: signal.mark,
+        });
+      } catch (err: unknown) {
+        log.warn('demo directional eval threw', {
+          symbol: sym,
+          reason: err instanceof Error ? err.message : String(err),
+        });
+      }
+    }
+  }
+
   private async evaluateOptionShadow(symbols: string[]): Promise<void> {
     // Defense-in-depth: the caller already flag-gates, but re-check so a direct
     // unit-test call also no-ops with the flag off and never hits Tradier.

@@ -23,6 +23,7 @@ import {
   isOptionExecEnabled,
   isOptionEmaPullbackEnabled,
   isOptionVolumeBreakoutEnabled,
+  isOptionDemoDirectionalEnabled,
 } from '../option-exec-flag.js';
 import {
   listOptionTradeJournal,
@@ -471,6 +472,16 @@ export interface OptionsPipelineReport {
   optionExecSelectorEnabled: boolean;
   optionExecEmaPullbackEnabled: boolean;
   optionExecVolumeBreakoutEnabled: boolean;
+  /**
+   * TRA-1114 — true when `ENABLE_OPTION_DEMO_DIRECTIONAL` is on: the demo-only
+   * deterministic near-ATM directional call/put entry path. This is the idea
+   * source that actually makes calls AND puts fill in the demo paper book when
+   * the legacy RV anomaly scanner is empty and the spread selector stands down
+   * on a thin IV-rank store. Demo/paper only (no Tradier mirror, no live
+   * capital); surfaced here so the board can confirm the flip from the
+   * unauthenticated probe alongside `openOptionsCount`.
+   */
+  optionDemoDirectionalEnabled: boolean;
   demoEngineCount: number;
   engines: OptionsPipelineEngineView[];
 }
@@ -537,6 +548,9 @@ export function summarizeOptionsPipeline(
     optionExecSelectorEnabled: isOptionExecEnabled(),
     optionExecEmaPullbackEnabled: isOptionEmaPullbackEnabled(),
     optionExecVolumeBreakoutEnabled: isOptionVolumeBreakoutEnabled(),
+    // TRA-1114 — surface the demo-only directional-entry gate so the board can
+    // verify the flip drives real demo fills from the unauthenticated probe.
+    optionDemoDirectionalEnabled: isOptionDemoDirectionalEnabled(),
     demoEngineCount: engines.length,
     engines,
   };

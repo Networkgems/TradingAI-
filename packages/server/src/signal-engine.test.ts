@@ -22,6 +22,7 @@ import {
   setOptionTradeJournalFileForTests,
   listOptionTradeJournal,
 } from './option-trade-journal.js';
+import { OPTION_DEMO_DIRECTIONAL_FLAG } from './option-exec-flag.js';
 import { PaperAccount } from './paper-account.js';
 import type { RelativeValueScannerService, RelativeValueScanResult, SelectorChainSnapshot } from './relative-value-scanner.js';
 import type { RelativeValueCandidate, TradierAccountBalance, TradierOptionsClient, TradierOrderClient, ReversalChecklist, SrZone } from '@trading-app/engine';
@@ -4550,5 +4551,121 @@ describe('SignalEngine — TRA-1088 shared shadow pass double-count guard', () =
     // the first test pins via the eval-invocation count.
     expect(appendedTrue).toBe(1);
     expect((await listReversalShadowSignals()).filter((r) => r.outcome === 'OPEN')).toHaveLength(1);
+  });
+});
+
+// TRA-1114 — demo-only deterministic directional call/put entry. Board
+// escalation (3rd time): plumbing ON but no calls/puts ever fill in the demo
+// paper book. Proves the new path opens REAL near-ATM single-leg longs in the
+// demo book WITHOUT any IV-rank history (the exact condition that makes the
+// spread selector stand down), a call on an uptrend symbol and a put on a
+// downtrend one, and stays wholly inert when the flag is off.
+describe('SignalEngine — demo directional option entry (TRA-1114)', () => {
+  // 5m OHLCV from explicit closes (open = prior close; high/low straddle close).
+  function build5m(closes: number[], spread = 0.5): Candle[] {
+    const step = 5 * 60_000;
+    return closes.map((close, i) => ({
+      symbol: 'TEST', timestamp: i * step,
+      open: i > 0 ? closes[i - 1] : close,
+      high: Math.max(close, i > 0 ? closes[i - 1] : close) + spread,
+      low: Math.min(close, i > 0 ? closes[i - 1] : close) - spread,
+      close, volume: 1_000,
+    }));
+  }
+  // Sawtooth drift the confluence stack reads as 'up' (calls) / 'down' (puts).
+  function sawUp(count: number, u = 0.5, d = 1.0, k = 3): number[] {
+    const closes: number[] = []; let p = 100; let i = 0;
+    while (closes.length < count) { closes.push(p); p += i % (k + 1) !== k ? u : -d; i++; }
+    while (closes.length > 2 && closes[closes.length - 1] <= closes[closes.length - 2]) closes.pop();
+    return closes;
+  }
+  function sawDown(count: number, d = 0.5, u = 1.0, k = 3): number[] {
+    const closes: number[] = []; let p = 300; let i = 0;
+    while (closes.length < count) { closes.push(p); p -= i % (k + 1) !== k ? d : -u; i++; }
+    while (closes.length > 2 && closes[closes.length - 1] >= closes[closes.length - 2]) closes.pop();
+    return closes;
+  }
+  // Liquid delta-laddered chain around `spot`, ~45 DTE from the trading clock.
+  function chainRows(sym: string, spot: number, iv = 0.45) {
+    const rows = [];
+    const extrinsic = (kStrike: number) => Math.max(0.3, 2.0 - 0.08 * Math.abs(kStrike - spot));
+    for (let kStrike = spot - 20; kStrike <= spot + 20; kStrike += 1) {
+      const putMid = Math.max(kStrike - spot, 0) + extrinsic(kStrike);
+      const callMid = Math.max(spot - kStrike, 0) + extrinsic(kStrike);
+      rows.push({ optionSymbol: `${sym}P${kStrike}`, underlying: sym, optionType: 'put' as const, strike: kStrike, expiration: '2024-07-19', bid: putMid * 0.98, ask: putMid * 1.02, openInterest: 1000, smvVol: iv });
+      rows.push({ optionSymbol: `${sym}C${kStrike}`, underlying: sym, optionType: 'call' as const, strike: kStrike, expiration: '2024-07-19', bid: callMid * 0.98, ask: callMid * 1.02, openInterest: 1000, smvVol: iv });
+    }
+    return rows;
+  }
+  function scannerFor(snaps: Record<string, SelectorChainSnapshot>): RelativeValueScannerService {
+    return {
+      scan: vi.fn(async () => ({ symbol: '', spot: null, expiration: null, candidates: [], reason: 'ok' as const })),
+      getSelectorChain: vi.fn(async (sym: string) => snaps[sym] ?? null),
+      getOptionMark: vi.fn(async () => null),
+      diagnostics: vi.fn(() => ({ configured: true, breakerOpen: false, breakerOpenedAtMs: null, cacheSize: 0, expirationsCacheSize: 0, chainCacheMaxEntries: 64, expirationsCacheMaxEntries: 64 })),
+    };
+  }
+
+  beforeEach(() => {
+    vi.useFakeTimers();
+    vi.setSystemTime(TRADING_TIME); // 10:00 ET — inside the options trading window
+    delete process.env[OPTION_DEMO_DIRECTIONAL_FLAG];
+  });
+  afterEach(() => {
+    delete process.env[OPTION_DEMO_DIRECTIONAL_FLAG];
+    vi.useRealTimers();
+  });
+
+  function run(engine: SignalEngine, syms: string[]): Promise<void> {
+    return (engine as unknown as { evaluateDemoDirectional: (s: string[]) => Promise<void> })
+      .evaluateDemoDirectional(syms);
+  }
+  function seedTrend(engine: SignalEngine, sym: string, closes: number[]): void {
+    (engine as unknown as { shadowCandleCache: Map<string, Candle[]> }).shadowCandleCache.set(sym, build5m(closes));
+  }
+
+  it('flag OFF — opens nothing (prod/live path unchanged)', async () => {
+    const svc = scannerFor({ UPP: { symbol: 'UPP', spot: 100, expiration: '2024-07-19', rows: chainRows('UPP', 100) } });
+    const engine = new SignalEngine(undefined, undefined, svc);
+    seedTrend(engine, 'UPP', sawUp(480));
+    await run(engine, ['UPP']);
+    expect(engine.getState().options.openOptions).toHaveLength(0);
+  });
+
+  it('flag ON, NO IV history — still fills a call on uptrend and a put on downtrend', async () => {
+    process.env[OPTION_DEMO_DIRECTIONAL_FLAG] = 'true';
+    // Deliberately NO IV-rank history seeded: this is the exact condition that
+    // makes the spread selector stand down. The directional path must NOT need it.
+    const svc = scannerFor({
+      UPP: { symbol: 'UPP', spot: 100, expiration: '2024-07-19', rows: chainRows('UPP', 100) },
+      DWN: { symbol: 'DWN', spot: 300, expiration: '2024-07-19', rows: chainRows('DWN', 300) },
+    });
+    const engine = new SignalEngine(undefined, undefined, svc);
+    seedTrend(engine, 'UPP', sawUp(480));
+    seedTrend(engine, 'DWN', sawDown(480));
+
+    await run(engine, ['UPP', 'DWN']);
+
+    const open = engine.getState().options.openOptions;
+    const call = open.find(o => o.optionType === 'call');
+    const put = open.find(o => o.optionType === 'put');
+    expect(call).toBeDefined();
+    expect(put).toBeDefined();
+    expect(call!.symbol).toBe('UPP');
+    expect(put!.symbol).toBe('DWN');
+    // Near-the-money strikes (closest liquid strike to spot).
+    expect(Math.abs(call!.strike - 100)).toBeLessThanOrEqual(1);
+    expect(Math.abs(put!.strike - 300)).toBeLessThanOrEqual(1);
+    // Surfaced in the signals feed so the probe's optionSignalCount reflects it.
+    expect(engine.getState().signals.filter(s => s.type === 'relative_value').length).toBe(2);
+  });
+
+  it('flag ON but no confluence trend (range/cold series) — stands down', async () => {
+    process.env[OPTION_DEMO_DIRECTIONAL_FLAG] = 'true';
+    const svc = scannerFor({ FLAT: { symbol: 'FLAT', spot: 100, expiration: '2024-07-19', rows: chainRows('FLAT', 100) } });
+    const engine = new SignalEngine(undefined, undefined, svc);
+    seedTrend(engine, 'FLAT', build5m(Array.from({ length: 480 }, () => 100)).map(c => c.close));
+    await run(engine, ['FLAT']);
+    expect(engine.getState().options.openOptions).toHaveLength(0);
   });
 });
