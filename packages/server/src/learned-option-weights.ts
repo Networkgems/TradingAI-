@@ -228,10 +228,38 @@ export function computeOptionLearnedWeights(
 /** The prospective setup a multiplier is requested for. */
 export interface OptionSetupKey {
   structure: string;
-  ivRank: number;
+  /**
+   * IV-rank 0–100, or `null` for the TRA-1103 honest-unknown RV path (buckets
+   * under the fold's `unknown` band via {@link ivRankBand}). Widened from `number`
+   * so a journal row's null IV-rank can be scored without being mis-bucketed as
+   * `mid`.
+   */
+  ivRank: number | null;
   trend: JournalTrend;
   sentiment: number | null;
   dte: number;
+}
+
+/**
+ * TRA-1133 — canonical mapping from a journalled trade back to the prospective
+ * setup key the multiplier is scored on. Kept here (next to {@link OptionSetupKey})
+ * so the OOS validation harness scores rows on EXACTLY the dimensions the live
+ * selector reads, with no parallel mapping to drift.
+ */
+export function setupKeyFromRow(row: {
+  structure: string;
+  ivRank: number | null;
+  trend: JournalTrend;
+  sentiment: number | null;
+  entryDte: number;
+}): OptionSetupKey {
+  return {
+    structure: row.structure,
+    ivRank: row.ivRank,
+    trend: row.trend,
+    sentiment: row.sentiment,
+    dte: row.entryDte,
+  };
 }
 
 /**

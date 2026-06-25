@@ -786,13 +786,23 @@ export function registerLiveHealthRoutes(app: Express, deps: LiveHealthDeps): vo
   // no balances/PII (parity with /options-pipeline). Surfaces the headline
   // summary + the bounded learned weights so the board can confirm accrual is
   // working after the first closed demo trade without a per-user login.
-  app.get('/api/health/option-journal', async (_req, res) => {
+  app.get('/api/health/option-journal', async (req, res) => {
     const rows = await listOptionTradeJournal();
     // TRA-1046 — serve weights through the intraday refresh cache so the readout
     // shows the same fold live selection reads, plus a freshness generation a
     // probe can watch tick after a demo close.
     const cached = await optionWeightsCache().get();
-    res.json(buildOptionJournalReport(rows, now(), isOptionTradeJournalEnabled(), cached));
+    const report = buildOptionJournalReport(rows, now(), isOptionTradeJournalEnabled(), cached);
+    // TRA-1133 — opt-in row-level dump for the OOS validation harness (TRA-992 Step
+    // 1). `?rows=demo` appends the RESOLVED demo rows (setup key + realizedR +
+    // outcome) so an offline run can fold the journal leave-one-out. Same demo-only,
+    // secrets-free basis the route already documents — rows carry no balances/PII.
+    if (req.query['rows'] === 'demo') {
+      const demoResolved = rows.filter((r) => r.mode === 'demo' && r.outcome !== 'OPEN');
+      res.json({ ...report, rows: demoResolved });
+      return;
+    }
+    res.json(report);
   });
 
   // TRA-1000 — external-intel source-quality scorer readout. Folds the
