@@ -17,7 +17,7 @@ import {
   listOptionShadowSignals,
   OPTION_SHADOW_FLAG,
 } from './option-shadow-ledger.js';
-import { setIvStoreFileForTests, initIvRankStore } from './iv-rank-store.js';
+import { setIvStoreFileForTests, initIvRankStore, recordDailyIv, ivRankSync } from './iv-rank-store.js';
 import {
   setOptionTradeJournalFileForTests,
   listOptionTradeJournal,
@@ -4796,6 +4796,55 @@ describe('SignalEngine — demo directional option entry (TRA-1114)', () => {
       delete process.env['ENABLE_OPTION_TRADE_JOURNAL'];
       setOptionTradeJournalFileForTests(null);
       rmSync(journalFile, { force: true });
+    }
+  });
+
+  // TRA-1153 — the directional path already holds the chain, so when the
+  // trailing-year IV store is WARM (>= MIN_IV_SAMPLES) the journal row must carry
+  // a real, non-null IV-rank that buckets into a learnable band instead of the
+  // single `unknown` bucket that made the TRA-992 OOS cohort split degenerate.
+  // Proves acceptance #1: new demo rows carry a non-null ivRank.
+  it('flag ON + journal ON + WARM IV store — directional open journals a non-null banded ivRank', async () => {
+    process.env[OPTION_DEMO_DIRECTIONAL_FLAG] = 'true';
+    process.env['ENABLE_OPTION_TRADE_JOURNAL'] = '1';
+    const journalFile = join(tmpdir(), `tra1153-journal-${process.pid}.jsonl`);
+    const ivStoreFile = join(tmpdir(), `tra1153-iv-${process.pid}.json`);
+    setOptionTradeJournalFileForTests(journalFile);
+    setIvStoreFileForTests(ivStoreFile);
+    try {
+      // Warm the store with > MIN_IV_SAMPLES (20) distinct prior-day ATM-IV
+      // samples spanning 0.22..0.66 so the chain's 0.45 ranks mid-window (a real
+      // percentile, max != min). Seeded BEFORE the run so the synchronous
+      // ivRankSync inside the directional path observes a warm store.
+      for (let n = 1; n <= 22; n++) {
+        await recordDailyIv('UPP', 0.20 + n * 0.02, TRADING_TIME - n * 86_400_000);
+      }
+      expect(ivRankSync('UPP', 0.45, TRADING_TIME)).not.toBeNull(); // store is warm
+
+      const svc = scannerFor({
+        UPP: { symbol: 'UPP', spot: 100, expiration: '2024-07-19', rows: chainRows('UPP', 100, 0.45) },
+      });
+      const engine = new SignalEngine(undefined, undefined, svc);
+      seedTrend(engine, 'UPP', sawUp(480));
+
+      await run(engine, ['UPP']);
+      await engine.flushOptionTradeJournal();
+
+      const rows = await listOptionTradeJournal();
+      const upRow = rows.find(r => r.symbol === 'UPP');
+      expect(upRow).toBeDefined();
+      expect(upRow!.structure).toBe('single_leg_rv');
+      // The journaled IV-rank is a real percentile, NOT the legacy hardcoded null.
+      expect(upRow!.ivRank).not.toBeNull();
+      expect(Number.isFinite(upRow!.ivRank!)).toBe(true);
+      expect(upRow!.ivRank!).toBeGreaterThanOrEqual(0);
+      expect(upRow!.ivRank!).toBeLessThanOrEqual(100);
+    } finally {
+      delete process.env['ENABLE_OPTION_TRADE_JOURNAL'];
+      setOptionTradeJournalFileForTests(null);
+      setIvStoreFileForTests(null);
+      rmSync(journalFile, { force: true });
+      rmSync(ivStoreFile, { force: true });
     }
   });
 });

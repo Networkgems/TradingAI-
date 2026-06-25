@@ -40,7 +40,7 @@ import {
   resolveReversalOutcome,
   openReversalShadowSignalsSync,
 } from './reversal-shadow-ledger.js';
-import { ivRankSync, atmIvFromRows } from './iv-rank-store.js';
+import { ivRankSync, atmIvFromRows, recordDailyIv } from './iv-rank-store.js';
 import type { SentimentIcBand } from './option-trade-journal.js';
 import { listOptionTradeJournal } from './option-trade-journal.js';
 import {
@@ -4058,6 +4058,28 @@ export class SignalEngine {
         }
         if (best === null) continue;
 
+        // TRA-1153 — populate the option-journal IV regime from THIS path. The
+        // chain (`snap`) is already in hand here, so deriving ATM IV + IV-rank is
+        // free and does NOT re-introduce the per-tick per-symbol chain fetch the
+        // RV-long path (~:3423) avoids (TRA-1082/1087/1089) — that path has no
+        // chain in scope; this one does. Two journaling-only effects (no sizing,
+        // no entry/exit, no contract-selection change):
+        //   1. Warm the trailing-year IV store from this keyless demo chain.
+        //      NOTHING else warms it on the keyless bqb1 demo book — both the
+        //      Tradier chain-recorder (index.ts) and the ideas-service warmer
+        //      (options-ideas-service.ts:~240) are Tradier-gated and stand down
+        //      here, so the store stayed empty and `ivRankSync` returned null on
+        //      EVERY journal row. `recordDailyIv` dedups per UTC day; the store
+        //      crosses MIN_IV_SAMPLES (20) after ~20 sessions, at which point a
+        //      real per-symbol IV-rank percentile emerges.
+        //   2. Stamp the resulting IV-rank on the journal setup below so
+        //      `computeOptionLearnedWeights.byIvRank` can bucket by IV regime
+        //      instead of collapsing every row to a single `unknown` bucket
+        //      (the TRA-992 OOS degeneracy this issue resolves).
+        const atmIv = atmIvFromRows(rows, spot);
+        if (atmIv != null) void recordDailyIv(sym, atmIv, asOf).catch(() => {});
+        const ivRank = atmIv != null ? ivRankSync(sym, atmIv, asOf) : null;
+
         const iv = best.row.smvVol ?? best.row.midIv;
         const delta = typeof iv === 'number' && iv > 0
           ? blackScholesDelta({
@@ -4114,14 +4136,13 @@ export class SignalEngine {
         // rows and never a `single_leg_*` row. Without that, the option side can
         // never reach `closed>0` (combos are mark-managed only at close/expiry —
         // `checkExits` skips them — so they sit OPEN; single-legs auto-close on
-        // SL/trail and DO emit a journal CLOSE). `ivRank: null` mirrors the
-        // RV-long path's honest-unknown (IV-rank is only computed inside the
-        // exec-gated block; lifting it here would re-introduce the per-tick
-        // chain fetch that starved the bqb1 loop — TRA-1082/1087/1089). `trend`
-        // comes from the confluence side that picked the contract; `entryDelta`
-        // is the Black-Scholes delta computed just above.
+        // SL/trail and DO emit a journal CLOSE). `ivRank` is the real trailing-
+        // year IV-rank computed above (TRA-1153) — honest-null only until the
+        // store warms past MIN_IV_SAMPLES, not a hardcoded null. `trend` comes
+        // from the confluence side that picked the contract; `entryDelta` is the
+        // Black-Scholes delta computed just above.
         const directionalJournalSetup: OptionTradeJournalSetup = {
-          ivRank: null,
+          ivRank,
           trend: wantType === 'call' ? 'up' : 'down',
           entryDelta: delta,
           sentiment: null,
