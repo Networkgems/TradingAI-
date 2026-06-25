@@ -4668,4 +4668,42 @@ describe('SignalEngine — demo directional option entry (TRA-1114)', () => {
     await run(engine, ['FLAT']);
     expect(engine.getState().options.openOptions).toHaveLength(0);
   });
+
+  // TRA-1123 — the directional path is the ONLY single-leg demo open that fires
+  // on a calm tape, but it previously passed no journalSetup, so the option
+  // journal accrued only combo rows and never a single_leg_* row → could never
+  // reach closed>0. Prove the directional open now journals as `single_leg_rv`
+  // with the honest-unknown ivRank and the confluence-derived trend.
+  it('flag ON + journal ON — directional open journals a single_leg_rv OPEN row', async () => {
+    process.env[OPTION_DEMO_DIRECTIONAL_FLAG] = 'true';
+    process.env['ENABLE_OPTION_TRADE_JOURNAL'] = '1';
+    const journalFile = join(tmpdir(), `tra1123-journal-${process.pid}.jsonl`);
+    setOptionTradeJournalFileForTests(journalFile);
+    try {
+      const svc = scannerFor({
+        UPP: { symbol: 'UPP', spot: 100, expiration: '2024-07-19', rows: chainRows('UPP', 100) },
+        DWN: { symbol: 'DWN', spot: 300, expiration: '2024-07-19', rows: chainRows('DWN', 300) },
+      });
+      const engine = new SignalEngine(undefined, undefined, svc);
+      seedTrend(engine, 'UPP', sawUp(480));
+      seedTrend(engine, 'DWN', sawDown(480));
+
+      await run(engine, ['UPP', 'DWN']);
+      await engine.flushOptionTradeJournal();
+
+      const rows = await listOptionTradeJournal();
+      expect(rows.length).toBeGreaterThanOrEqual(2);
+      expect(rows.every(r => r.structure === 'single_leg_rv')).toBe(true);
+      expect(rows.every(r => r.outcome === 'OPEN')).toBe(true);
+      expect(rows.every(r => r.ivRank === null)).toBe(true); // honest-unknown, no per-tick chain fetch
+      const upRow = rows.find(r => r.symbol === 'UPP');
+      const downRow = rows.find(r => r.symbol === 'DWN');
+      expect(upRow!.trend).toBe('up'); // call ⇒ uptrend confluence
+      expect(downRow!.trend).toBe('down'); // put ⇒ downtrend confluence
+    } finally {
+      delete process.env['ENABLE_OPTION_TRADE_JOURNAL'];
+      setOptionTradeJournalFileForTests(null);
+      rmSync(journalFile, { force: true });
+    }
+  });
 });

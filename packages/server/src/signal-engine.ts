@@ -4072,6 +4072,28 @@ export class SignalEngine {
         );
         if (recentDup) continue;
 
+        // TRA-1123 — journal the directional single-leg open (observe-only,
+        // behind ENABLE_OPTION_TRADE_JOURNAL). This is the ONLY single-leg demo
+        // open path that actually fires on a calm tape (the legacy RV anomaly
+        // scanner is empty — TRA-592), yet it was the one open path NOT passing
+        // a `journalSetup`, so the demo journal accrued only `iron_condor` combo
+        // rows and never a `single_leg_*` row. Without that, the option side can
+        // never reach `closed>0` (combos are mark-managed only at close/expiry —
+        // `checkExits` skips them — so they sit OPEN; single-legs auto-close on
+        // SL/trail and DO emit a journal CLOSE). `ivRank: null` mirrors the
+        // RV-long path's honest-unknown (IV-rank is only computed inside the
+        // exec-gated block; lifting it here would re-introduce the per-tick
+        // chain fetch that starved the bqb1 loop — TRA-1082/1087/1089). `trend`
+        // comes from the confluence side that picked the contract; `entryDelta`
+        // is the Black-Scholes delta computed just above.
+        const directionalJournalSetup: OptionTradeJournalSetup = {
+          ivRank: null,
+          trend: wantType === 'call' ? 'up' : 'down',
+          entryDelta: delta,
+          sentiment: null,
+          sentimentIcBand: null,
+          agentConviction: null,
+        };
         // Demo/paper open ONLY — `this.mode` is 'demo' (caller-gated), no equity
         // override → no Tradier mirror. Account window/dedup/cap/sizing bound it.
         const opened = this.optionsAccount.openOptionFromRvCandidate(
@@ -4079,6 +4101,7 @@ export class SignalEngine {
           this.mode,
           undefined,
           spot,
+          directionalJournalSetup,
         );
         if (!opened) continue;
 
