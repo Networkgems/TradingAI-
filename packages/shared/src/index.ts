@@ -1935,6 +1935,31 @@ export function minutesToSessionClose(utcMs: number = Date.now()): number {
   return closeEt - etMinutes;
 }
 
+/**
+ * TRA-1157 — agent activity window. Returns true only when the regular US equity
+ * session is open AND we are `bufferMinutes` past the open and `bufferMinutes`
+ * before the close (default 15: 9:45 AM–3:45 PM ET, Mon–Fri). This narrows the
+ * window in which the multi-agent advisory layer is allowed to fire its Anthropic
+ * calls so the API bill is not spent overnight, on the open/close auction churn,
+ * or on weekends. Weekends and the 9:30/16:00 edges return false. Holidays are
+ * not modelled here (same limitation as {@link isStockMarketOpen}) — a holiday
+ * still reads as "closed enough" because the deeper signal feeds are also dark.
+ */
+export function isAgentTradingWindowOpen(
+  utcMs: number = Date.now(),
+  bufferMinutes = 15,
+): boolean {
+  const offsetHours = getEasternUtcOffset(utcMs);
+  const etMs = utcMs + offsetHours * 60 * 60 * 1000;
+  const etDate = new Date(etMs);
+  const dayOfWeek = etDate.getUTCDay(); // 0=Sun, 6=Sat
+  if (dayOfWeek === 0 || dayOfWeek === 6) return false;
+  const etMinutes = etDate.getUTCHours() * 60 + etDate.getUTCMinutes();
+  const openEt = 9 * 60 + 30 + bufferMinutes;
+  const closeEt = 16 * 60 - bufferMinutes;
+  return etMinutes >= openEt && etMinutes < closeEt;
+}
+
 // Crypto trading windows (UTC minutes) — skip dead zone 04:00–07:59
 // Based on academic analysis: peak volume/volatility 12:00–17:00, secondary peaks at 00:00 and 08:00.
 export const CRYPTO_TRADING_WINDOWS: readonly [number, number][] = [

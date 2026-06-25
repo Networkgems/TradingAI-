@@ -140,6 +140,22 @@ export function isTradingAgentsLlmDisabled(env: NodeJS.ProcessEnv = process.env)
   return isTruthy(env[LLM_KILL_ENV_VAR]);
 }
 
+/**
+ * TRA-1157 — env escape hatch that restores 24/7 agent operation. By default the
+ * engine only fires the advisory layer inside the regular-session window (15 min
+ * after the open until 15 min before the close, weekdays) via
+ * {@link isAgentTradingWindowOpen}, so the Anthropic bill is not spent overnight
+ * or on weekends. Set TRADING_AGENTS_IGNORE_MARKET_HOURS=1 to opt back into the
+ * old always-on behaviour (e.g. for an off-hours research/backfill run).
+ */
+export const IGNORE_MARKET_HOURS_ENV_VAR = 'TRADING_AGENTS_IGNORE_MARKET_HOURS';
+
+export function isAgentMarketHoursGateDisabled(
+  env: NodeJS.ProcessEnv = process.env,
+): boolean {
+  return isTruthy(env[IGNORE_MARKET_HOURS_ENV_VAR]);
+}
+
 export interface AdviseOptions {
   /** Owning user for the per-user/day cap + aggregate attribution. */
   user: string | undefined;

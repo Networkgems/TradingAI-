@@ -1,7 +1,7 @@
 import { OrbStrategy, BbFadeStrategy, IchimokuStrategy, SupertrendConfluenceStrategy, confluenceSide, supertrend, reversalChecklist, adx, atr, donchian, supportResistance, blackScholesDelta, daysToExpiration, selectRvLongCandidate, selectShadowOptionSignal, emaPullbackTrigger, volumeConfirmedBreakout, TradierOptionsClient, TradierOrderClient, TRADIER_REJECTED_STATUSES, evaluateSma200, SMA200_MIN_BARS, SMA200_DEBOUNCE_BARS, composeTechnicalSnapshot, resampleCandles, TF_BUCKET_MS, OptionsRiskBreaker, DEFAULT_OPTIONS_BREAKER_PARAMS } from '@trading-app/engine';
 import type { StrategySelectorInput, ContractQuote, OptionTrend, RvLongTrendSide, ExitState, SharedTickIndicators, RelativeValueScannerOptions, OptionChainRow } from '@trading-app/engine';
 import type { TradierAccountBalance } from '@trading-app/engine';
-import { WATCHLIST, isLiquidSwingSymbol, checkEquitySwingClose, MANAGED_ACCOUNT_RATIO, MAX_CONSECUTIVE_LOSSES, DAILY_DRAWDOWN_HALT_PCT, OPTIONS_PER_TICKET_DOLLAR_FLOOR, OPTIONS_POSITION_CAP_RATIO, aliasWatchlistSymbol, isLiveTradierOptionsEnabled, isStockMarketOpen, perPositionCap, resolveAutoManageImportedTradierOptions, resolveDemoCostModel, resolveHoldLiveOptionsOvernight, resolveSwingHoldOptions, resolveLiveTradeEquitiesTradier, resolveManagedAccountRatio, resolveMarketReviewGatesEnabled, resolveRiskPerTrade, resolveRvDtePrefs, resolveTradierOptionsCreds, validateBracket, DEFAULT_RV_DTE_MIN, DEFAULT_RV_DTE_MAX, DEFAULT_RV_DTE_TARGET, scoreNewsSentiment, aggregateSymbolSentiment, aggregateFedSentiment, aggregateStockTwitsSentiment, dedupeStockTwitsMessages, mapCuratedMessagesBySymbol, nameAliasesFor, evaluateEquityDcaAdd, evaluateOptionDcaAdd, CONVICTION_DCA, blendedAverage, positionRiskDollars, minutesToSessionClose, getEasternUtcOffset } from '@trading-app/shared';
+import { WATCHLIST, isLiquidSwingSymbol, checkEquitySwingClose, MANAGED_ACCOUNT_RATIO, MAX_CONSECUTIVE_LOSSES, DAILY_DRAWDOWN_HALT_PCT, OPTIONS_PER_TICKET_DOLLAR_FLOOR, OPTIONS_POSITION_CAP_RATIO, aliasWatchlistSymbol, isLiveTradierOptionsEnabled, isStockMarketOpen, perPositionCap, resolveAutoManageImportedTradierOptions, resolveDemoCostModel, resolveHoldLiveOptionsOvernight, resolveSwingHoldOptions, resolveLiveTradeEquitiesTradier, resolveManagedAccountRatio, resolveMarketReviewGatesEnabled, resolveRiskPerTrade, resolveRvDtePrefs, resolveTradierOptionsCreds, validateBracket, DEFAULT_RV_DTE_MIN, DEFAULT_RV_DTE_MAX, DEFAULT_RV_DTE_TARGET, scoreNewsSentiment, aggregateSymbolSentiment, aggregateFedSentiment, aggregateStockTwitsSentiment, dedupeStockTwitsMessages, mapCuratedMessagesBySymbol, nameAliasesFor, evaluateEquityDcaAdd, evaluateOptionDcaAdd, CONVICTION_DCA, blendedAverage, positionRiskDollars, minutesToSessionClose, getEasternUtcOffset, isAgentTradingWindowOpen } from '@trading-app/shared';
 import type { TradeSignal, RelativeValueSignal, Sma200Signal, Candle, OptionsAccountState, SignalType, Position, OptionPosition, AccountMode, AccountSettings, AccountState, NewsItem, SymbolSentiment, SocialSentiment, StockTwitsMessage, TechnicalSignalSnapshot, TradierEnv, MarketReview, MarketReviewGates, EngineMarketReviewState, GatedStrategyNote, AgentRecommendation, TradeProposal, AgentOrderAudit, GuardrailVerdict, OptionType } from '@trading-app/shared';
 import { shouldAutoConfirm } from '@trading-app/shared';
 // TRA-544 (TRA-529 P1) / TRA-747 (P2) — advisory multi-agent layer. ON suspends
@@ -10,7 +10,7 @@ import { shouldAutoConfirm } from '@trading-app/shared';
 // trader/risk) behind the `adviseSymbol` seam, which enforces the $2/user/day cap
 // and both kill switches and accounts spend — advisor-only, no path to capital.
 import type { LlmClient } from '@trading-app/agents';
-import { adviseSymbol, resolveTradingAgentsLlm, buildNewsHeadlines, isTradingAgentsLlmDisabled } from './trading-agents-advisory.js';
+import { adviseSymbol, resolveTradingAgentsLlm, buildNewsHeadlines, isTradingAgentsLlmDisabled, isAgentMarketHoursGateDisabled } from './trading-agents-advisory.js';
 // TRA-941 (TRA-813 P2/3) — the proposal queue + execution wiring. An APPROVE
 // recommendation becomes a pending proposal (proposal-store); only a CONFIRMED
 // proposal (manual, or the demo auto-confirm rule) routes to capital through the
@@ -2581,7 +2581,15 @@ export class SignalEngine {
     // advisory STUB graph runs instead, surfacing its recommendations on state.
     // Risk-gated like every entry path: a halt / kill switch suppresses it.
     // Advisor-only in P1 — the stub never routes orders (gating mode is P4).
-    if (this.tradingAgentsEnabled && equityStrategiesActiveOnTick && !this.riskGovernor.isHalted()) {
+    //
+    // TRA-1157 — the multi-agent advisory layer is the dominant Anthropic spend.
+    // Confine it to the regular-session window (15 min after the open until 15 min
+    // before the close, weekdays) so the API key is not billed overnight, across
+    // the open/close auction churn, or on weekends. Set
+    // TRADING_AGENTS_IGNORE_MARKET_HOURS=1 to restore the old always-on behaviour.
+    // Outside the window we fall through to the stale-recommendation clear below.
+    const agentMarketWindowOpen = isAgentMarketHoursGateDisabled() || isAgentTradingWindowOpen();
+    if (this.tradingAgentsEnabled && equityStrategiesActiveOnTick && !this.riskGovernor.isHalted() && agentMarketWindowOpen) {
       await this.runTradingAgentsAdvisory(activeSymbols);
       // TRA-941 (TRA-813 P2/3) — proposal queue. Each APPROVE recommendation
       // becomes a PENDING proposal (never an immediate order); the demo auto-
