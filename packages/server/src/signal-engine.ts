@@ -48,7 +48,8 @@ import {
   optionJournalToStrategyRows,
 } from './strategy-introspection.js';
 import { isOptionShadowEnabled, isOptionPhaseBEnabled, emitShadowOptionSignal, shadowSignalToSpreadParams, OPTION_SHADOW_EMERGENCY_OFF, DEMO_SPREAD_MAX_LOSS_PCT_CAP } from './option-shadow-ledger.js';
-import { isOptionExecEnabled, isOptionEmaPullbackEnabled, isOptionVolumeBreakoutEnabled, resolveRvLongDteOverride, resolveRvMinDailyVolume, isOptionDemoDirectionalEnabled } from './option-exec-flag.js';
+import { isOptionExecEnabled, isOptionEmaPullbackEnabled, isOptionVolumeBreakoutEnabled, resolveRvLongDteOverride, resolveRvMinDailyVolume, isOptionDemoDirectionalEnabled, isOptionIvRvScannerEnabled } from './option-exec-flag.js';
+import { scanIvRvFromSnapshot, recordIvRvScan } from './iv-rv-scanner.js';
 import { etDateString } from './scheduler.js';
 // TRA-995 (epic-C, self-regulation) — the standing risk autopilot. A pure
 // tighten-only decision module; the governor below is its mutation boundary and
@@ -1069,6 +1070,14 @@ export class SignalEngine {
   private lastOptionShadowRefreshAt = 0;
   /** TRA-1114 — last demo-only directional entry pass (reuses {@link RV_SCAN_INTERVAL_MS}). */
   private lastDemoDirectionalAt = 0;
+  /** TRA-1156 — last observe-only IV-vs-RV scanner pass (reuses {@link RV_SCAN_INTERVAL_MS}). */
+  private lastIvRvScanAt = 0;
+  /**
+   * TRA-1156 — per-symbol trailing daily closes, stashed from the SAME
+   * `fetchDailyCandles` pull {@link refreshTechnicalSnapshot} already makes, so
+   * the IV-vs-RV scan reads realised-vol history without a second feed call.
+   */
+  private dailyCloseCache: Map<string, number[]> = new Map();
   /**
    * TRA-787 — latest SupertrendConfluence shadow signals surfaced on
    * EngineState.supertrendShadowSignals. Observe-only: never merged into
@@ -2536,6 +2545,31 @@ export class SignalEngine {
           await this.evaluateDemoDirectional(activeSymbols);
         } catch (err: unknown) {
           log.warn('demo directional pass threw', {
+            reason: err instanceof Error ? err.message : String(err),
+          });
+        }
+      }
+    }
+
+    // TRA-1156 — observe-only IV-vs-realised-vol mispricing scan (TRA-1155 engine).
+    // Demo-first, flag-gated, NEVER routes into the paper book this iteration — it
+    // only records candidates to the in-memory store backing GET /api/health/iv-rv
+    // so the board can watch the vol-risk-premium read before QuantTrader signs off
+    // on thresholds. Rides the warm RV-scanner chain cache + the daily closes the
+    // technical-snapshot pass already loaded, so the only ON-flag cost is the pure
+    // engine math; wholly skipped (zero cost/IO) when the flag is off.
+    if (
+      this.mode === 'demo'
+      && isStockMarketOpen()
+      && isOptionIvRvScannerEnabled()
+      && !!this.rvScanner
+    ) {
+      if (Date.now() - this.lastIvRvScanAt >= RV_SCAN_INTERVAL_MS) {
+        this.lastIvRvScanAt = Date.now();
+        try {
+          await this.evaluateIvRvScan(activeSymbols);
+        } catch (err: unknown) {
+          log.warn('iv-rv scan pass threw', {
             reason: err instanceof Error ? err.message : String(err),
           });
         }
@@ -4180,6 +4214,56 @@ export class SignalEngine {
         });
       } catch (err: unknown) {
         log.warn('demo directional eval threw', {
+          symbol: sym,
+          reason: err instanceof Error ? err.message : String(err),
+        });
+      }
+    }
+  }
+
+  /**
+   * TRA-1156 — observe-only IV-vs-realised-vol mispricing scan (TRA-1155 engine).
+   *
+   * For each active symbol it pulls the SAME warm selector chain the
+   * directional/shadow passes already fetched this tick (rides the scanner's 60s
+   * cache → no extra Tradier call), reads the underlying's daily closes off the
+   * {@link dailyCloseCache} the technical-snapshot pass populated, runs
+   * {@link scanIvRvFromSnapshot}, and records the result into the in-memory store
+   * backing `GET /api/health/iv-rv`. It places NO orders and touches no account —
+   * routing into the paper book waits on QuantTrader's threshold sign-off
+   * (parent TRA-1155). Defense-in-depth: re-checks the flag + demo mode + scanner
+   * so a direct unit-test call also no-ops with the flag off and never trades.
+   */
+  private async evaluateIvRvScan(symbols: string[]): Promise<void> {
+    if (!isOptionIvRvScannerEnabled() || this.mode !== 'demo' || !this.rvScanner) return;
+
+    const asOf = Date.now();
+    const dtePrefs = { min: this.rvDteMin, max: this.rvDteMax, target: this.rvDteTarget };
+
+    for (const sym of symbols) {
+      try {
+        const snap = await this.rvScanner.getSelectorChain(sym, dtePrefs);
+        if (!snap || !(snap.spot > 0) || snap.rows.length === 0) continue;
+
+        const dailyCloses = this.dailyCloseCache.get(sym) ?? [];
+        const result = scanIvRvFromSnapshot(
+          { symbol: snap.symbol, spot: snap.spot, expiration: snap.expiration, rows: snap.rows },
+          dailyCloses,
+        );
+        recordIvRvScan(result, asOf);
+
+        if (result.candidates.length > 0) {
+          log.info('iv-rv mispricing candidates (TRA-1156, observe-only)', {
+            symbol: result.symbol,
+            expiration: result.expiration,
+            realizedVol: result.realizedVol,
+            candidateCount: result.candidates.length,
+            top: result.candidates[0]?.optionSymbol,
+            topAction: result.candidates[0]?.action,
+          });
+        }
+      } catch (err: unknown) {
+        log.warn('iv-rv scan eval threw', {
           symbol: sym,
           reason: err instanceof Error ? err.message : String(err),
         });
@@ -7345,6 +7429,13 @@ export class SignalEngine {
         '1d': dailyBars,
       });
       this.technicalSnapshots.set(sym, snap);
+      // TRA-1156 — stash the underlying's daily closes off the SAME pull so the
+      // observe-only IV-vs-RV scan can derive realised vol without a second feed
+      // call. Only update on a non-empty pull so a transient cold feed keeps the
+      // last good series.
+      if (dailyBars.length > 0) {
+        this.dailyCloseCache.set(sym, dailyBars.map((b) => b.close));
+      }
       return snap;
     } catch (err: unknown) {
       log.warn('technical snapshot refresh failed', {

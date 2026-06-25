@@ -24,7 +24,9 @@ import {
   isOptionEmaPullbackEnabled,
   isOptionVolumeBreakoutEnabled,
   isOptionDemoDirectionalEnabled,
+  isOptionIvRvScannerEnabled,
 } from '../option-exec-flag.js';
+import { summarizeIvRvScans } from '../iv-rv-scanner.js';
 import {
   listOptionTradeJournal,
   summarizeOptionTradeJournal,
@@ -780,6 +782,24 @@ export function registerLiveHealthRoutes(app: Express, deps: LiveHealthDeps): vo
       res.json(summarizeOptionsPipeline(optionsPipeline(), now()));
     });
   }
+
+  // TRA-1156 — unauthenticated, secrets-free IV-vs-realised-vol mispricing
+  // readout. The scan is a process-global, demo-only, OBSERVE-ONLY pass (no
+  // balances/PII — just contract symbols, IV/RV ratios, and mispricing scores),
+  // so this is unauthenticated (parity with /options-pipeline + /option-journal).
+  // `enabled` mirrors ENABLE_OPTION_IV_RV_SCANNER so the board can see at a glance
+  // whether the scanner is armed; when off the store is empty so the surface is
+  // an honest zero rather than a 404. Always read-only: NO order is ever placed
+  // off these candidates — routing waits on QuantTrader's threshold sign-off.
+  app.get('/api/health/iv-rv', (_req, res) => {
+    res.json({
+      ok: true,
+      time: new Date(now()).toISOString(),
+      build: resolveBuildInfo(),
+      enabled: isOptionIvRvScannerEnabled(),
+      ...summarizeIvRvScans(now()),
+    });
+  });
 
   // TRA-991 — unauthenticated, secrets-free option-trade-journal readout. The
   // journal is a process-global, demo-only setup→outcome ledger, so this carries

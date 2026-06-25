@@ -64,6 +64,32 @@ export function isOptionDemoDirectionalEnabled(env: NodeJS.ProcessEnv = process.
 }
 
 // --------------------------------------------------------------------------
+// TRA-1156 (TRA-1155 follow-up) — IV-vs-realised-vol mispricing scanner wiring.
+//
+// TRA-1155 landed the PURE engine (`findIvRvMispricings` +
+// `realizedVolFromDailyCloses`) — the volatility-risk-premium read the existing
+// own-IV / skew scanners miss — but nothing calls it. This flag turns on an
+// OBSERVE-ONLY demo pass that, per tick, pulls the SAME warm selector chain the
+// directional/shadow passes already fetched, computes realised vol from the
+// underlying's already-loaded daily closes, runs the engine, and records the
+// candidates to an in-memory store surfaced read-only at
+// `GET /api/health/iv-rv`.
+//
+// OFF by default ⇒ zero cost/IO (the engine pass early-returns and the store
+// stays empty). When ON it NEVER routes into the paper book — no order is ever
+// placed off these candidates this iteration; routing waits on QuantTrader's
+// threshold sign-off (parent TRA-1155). Demo-first: the engine pass hard-gates
+// on `mode === 'demo'`, so prod/live paths are byte-for-byte unchanged.
+// --------------------------------------------------------------------------
+
+export const OPTION_IV_RV_SCANNER_FLAG = 'ENABLE_OPTION_IV_RV_SCANNER';
+
+/** True iff the observe-only IV-vs-RV mispricing scanner flag is on. */
+export function isOptionIvRvScannerEnabled(env: NodeJS.ProcessEnv = process.env): boolean {
+  return flagOn(env[OPTION_IV_RV_SCANNER_FLAG]);
+}
+
+// --------------------------------------------------------------------------
 // TRA-1028 — net-new options swing-entry enhancements (TRA-1026 follow-up).
 //
 // Each lands AFTER TRA-1024/1025 (IV-aware + structure-exit-aware exec path) and
