@@ -4654,8 +4654,8 @@ describe('SignalEngine — demo directional option entry (TRA-1114)', () => {
     expect(call!.symbol).toBe('UPP');
     expect(put!.symbol).toBe('DWN');
     // Near-the-money strikes (closest liquid strike to spot).
-    expect(Math.abs(call!.strike - 100)).toBeLessThanOrEqual(1);
-    expect(Math.abs(put!.strike - 300)).toBeLessThanOrEqual(1);
+    expect(Math.abs((call!.strike ?? 0) - 100)).toBeLessThanOrEqual(1);
+    expect(Math.abs((put!.strike ?? 0) - 300)).toBeLessThanOrEqual(1);
     // Surfaced in the signals feed so the probe's optionSignalCount reflects it.
     expect(engine.getState().signals.filter(s => s.type === 'relative_value').length).toBe(2);
   });
