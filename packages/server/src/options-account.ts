@@ -1198,7 +1198,7 @@ export class PaperOptionsAccount {
     this.resetDayIfNeeded();
     this.lastEntryRejection = null;
 
-    if (!isValidTradingWindow(Date.now()))
+    if (mode !== 'demo' && !isValidTradingWindow(Date.now()))
       return this.rejectEntry('market is closed — options paper entries fill only during US market hours');
     if (this.dailyOptionsTotal() >= this.optionsDailyTradesLimit)
       return this.rejectEntry(
