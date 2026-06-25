@@ -339,6 +339,15 @@ export type {
   Mispricing,
 } from './options/otm-mispricing.js';
 export {
+  findIvRvMispricings,
+  realizedVolFromDailyCloses,
+} from './options/iv-rv-mispricing.js';
+export type {
+  IvRvMispricingCandidate,
+  IvRvScannerOptions,
+  IvRvAction,
+} from './options/iv-rv-mispricing.js';
+export {
   findRelativeValueOpportunities,
   selectRvLongCandidate,
   RV_LONG_DELTA_TARGET_MIN,
