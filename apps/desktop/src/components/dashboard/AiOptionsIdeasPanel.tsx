@@ -456,14 +456,38 @@ function IdeaCard({
               ? idea.entryBlockedReason ?? 'This idea exceeds the per-trade max-loss cap for the current paper book.'
               : 'Place a PAPER order for this defined-risk idea through the options account';
           return (
-            <button
-              className="btn-primary"
-              disabled={!canTrade || blocked || entering}
-              onClick={() => onPaperEnter(idea)}
-              title={title}
-            >
-              {entering ? 'Placing…' : blocked ? 'Paper entry blocked' : 'Paper entry'}
-            </button>
+            <>
+              {/* TRA-1131 — surface the gate's verbatim reject reason INLINE,
+                  not just as a hover tooltip. The per-trade max-loss cap is a
+                  different gate from the daily-trade limit, so a user who raised
+                  the daily limit (and sees it climb in the header) was left
+                  guessing why entry stayed dead. Showing "max loss $X exceeds
+                  1.00% cap $Y" right on the card makes it clear the block is the
+                  per-trade risk cap, not the daily count. */}
+              {blocked && idea.entryBlockedReason && (
+                <span
+                  className="muted"
+                  style={{
+                    fontSize: '0.72rem',
+                    color: 'var(--danger, #d64545)',
+                    maxWidth: '22rem',
+                    textAlign: 'right',
+                    lineHeight: 1.3,
+                  }}
+                  title={title}
+                >
+                  {idea.entryBlockedReason}
+                </span>
+              )}
+              <button
+                className="btn-primary"
+                disabled={!canTrade || blocked || entering}
+                onClick={() => onPaperEnter(idea)}
+                title={title}
+              >
+                {entering ? 'Placing…' : blocked ? 'Paper entry blocked' : 'Paper entry'}
+              </button>
+            </>
           );
         })()}
       </div>
