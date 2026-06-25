@@ -180,6 +180,12 @@ import {
 } from './options-forward-test.js';
 import { evaluateLiveCapitalGate, LIVE_CAPITAL_GATE } from './live-capital-gate.js';
 import {
+  loadProposalsScorecard,
+  buildAiIdeasScorecard,
+  buildEngineScorecard,
+} from './engine-scorecard.js';
+import { resolveBuildInfo } from './observability/build-info.js';
+import {
   generateMarketReview,
   getLatestMarketReview,
   getFreshMarketReview,
@@ -2354,6 +2360,38 @@ app.get('/api/health/live-capital-gate', async (_req, res) => {
       reason: err instanceof Error ? err.message : String(err),
     });
     res.status(500).json({ error: 'Failed to evaluate the live-capital gate.' });
+  }
+});
+
+// TRA-1141 (TRA-1139) — combined accuracy scorecard: both idea engines side by
+// side on out-of-sample data, so the board can compare them honestly instead of
+// guessing "which is more accurate". Read-only; wires no capital. Unauthenticated
+// and secrets-free (parity with the other /api/health/* probes): the AI Ideas
+// side is the global TRA-601 forward-test (no per-user P&L/PII) and the Proposals
+// side is the offline TRA-797 A/B OOS study (win-rate / avg-R / agent-vs-baseline
+// — no idea text, no balances). Each side carries an explicit sample-size verdict;
+// small/insufficient samples are labelled and NO winner is implied before the data
+// clears. This route only RE-SHAPES the two existing computations — it does not
+// change how either ledger is computed (out of scope).
+app.get('/api/health/engine-scorecard', async (_req, res) => {
+  try {
+    const entries = await listJournalEntries();
+    const outcomes = await forwardTestIdeas(entries);
+    const ideasReport = buildForwardTestReport(outcomes, { chainsDir: defaultChainsDir() });
+    const aiIdeas = buildAiIdeasScorecard(ideasReport);
+    const proposals = await loadProposalsScorecard();
+    const scorecard = buildEngineScorecard(proposals, aiIdeas);
+    res.json({
+      ok: true,
+      time: new Date().toISOString(),
+      build: resolveBuildInfo(),
+      ...scorecard,
+    });
+  } catch (err) {
+    log.error('engine-scorecard probe failed', {
+      reason: err instanceof Error ? err.message : String(err),
+    });
+    res.status(500).json({ error: 'Failed to build the engine scorecard.' });
   }
 });
 

@@ -13,6 +13,7 @@ import type { AccountMode, TradierEnv } from '@trading-app/shared';
 import { HTTP_URL } from '../../server-url';
 import { logger } from '../../lib/logger';
 import { formatUptime, type BuildInfo } from './VersionChip';
+import { EngineScorecardPanel } from './EngineScorecardPanel';
 
 type HealthStatus = 'green' | 'yellow' | 'red';
 
@@ -235,6 +236,10 @@ export function HealthPanel({ token }: { token: string }) {
           <Row label="Node / pid" value={`${h.build.nodeVersion} · ${h.build.pid}`} />
         </Panel>
       </div>
+
+      {/* TRA-1141 — combined accuracy scorecard: both idea engines side by side
+          on out-of-sample data. Auxiliary, self-fetching, winner-free. */}
+      <EngineScorecardPanel />
     </div>
   );
 }
