@@ -1176,6 +1176,19 @@ export class SignalEngine {
   // dedup in routeEquitySignal is the primary guard; this is belt-and-suspenders.
   private routedAgentSignalIds = new Set<string>();
   private latestAgentRecommendations: AgentRecommendation[] = [];
+  // TRA-1138 — pinned source recommendations for OPEN proposals. The advisory
+  // tick wholesale-REPLACES `latestAgentRecommendations` every run, and the
+  // proposedSignal id (`agent-<symbol>-<asOf>`) changes on every new bar, but a
+  // pending proposal lives for the full 15-min TTL (proposal-store). Without a
+  // pin, a proposal raised on an earlier bar lost its backing reco the moment the
+  // next bar's advisory ran, so confirm/reject failed with "source recommendation
+  // … no longer pending — re-request" even though the proposal was well inside its
+  // TTL and the panel still rendered it as approvable. We snapshot the source reco
+  // here when the proposal is queued so confirm/reject can always route it, and
+  // prune entries whose proposal is no longer pending. Keyed by recommendationId
+  // (= proposedSignal.id). In-memory only — proposals are deliberately not made
+  // restart-durable (proposal-store TRA-1052), and this pin shares that lifetime.
+  private pinnedProposalRecos = new Map<string, AgentRecommendation>();
   // TRA-941 (TRA-813 P3) — append-only audit trail of agent-placed orders, one
   // entry per CONFIRMED proposal whose order was accepted. Bounded so a long-
   // running process can't leak. Surfaced via getAgentOrderAudit() for the health
@@ -5237,6 +5250,7 @@ export class SignalEngine {
   private async processAgentProposals(prices: Map<string, number>): Promise<void> {
     const now = Date.now();
     expireStaleProposals(now);
+    this.prunePinnedProposalRecos();
     for (const reco of this.latestAgentRecommendations) {
       if (reco.verdict !== 'APPROVE' || !reco.proposedSignal) continue;
       const signal = reco.proposedSignal;
@@ -5258,6 +5272,10 @@ export class SignalEngine {
         createdAt: now,
       });
       if (proposal.status !== 'pending') continue;
+      // TRA-1138 — pin the source reco so a later confirm/reject can still route
+      // it after the advisory tick replaces `latestAgentRecommendations`. Keyed by
+      // recommendationId; re-pinning across same-bar ticks just refreshes it.
+      this.pinnedProposalRecos.set(proposal.recommendationId, reco);
       // Auto-confirm eligible demo proposals (live never auto-confirms in v1).
       const decision = shouldAutoConfirm({
         mode: this.mode,
@@ -5300,10 +5318,13 @@ export class SignalEngine {
       // proposal raised in the other mode rather than route it under the wrong one.
       return { ok: false, reason: `switch to ${proposal.mode} mode to confirm this ${proposal.mode} proposal` };
     }
-    const reco = this.latestAgentRecommendations.find(r => r.proposedSignal?.id === proposal.recommendationId);
+    const reco = this.resolveProposalReco(proposal.recommendationId);
     const signal = reco?.proposedSignal;
     if (!reco || !signal) {
-      // The source recommendation has aged out of the pending set — nothing to route.
+      // The source recommendation aged out of BOTH the latest advisory set and the
+      // pinned-proposal map — nothing to route (should only happen post-restart,
+      // since proposals aren't restart-durable; TRA-1138 keeps it routable otherwise).
+      this.pinnedProposalRecos.delete(proposal.recommendationId);
       return { ok: false, reason: `source recommendation for ${proposal.symbol} no longer pending — re-request` };
     }
     if (this.routedAgentSignalIds.has(signal.id)) {
@@ -5354,6 +5375,7 @@ export class SignalEngine {
     });
     setProposalStatus(id, 'executed', now);
     this.latestAgentRecommendations = this.latestAgentRecommendations.filter(r => r !== reco);
+    this.pinnedProposalRecos.delete(proposal.recommendationId);
     void this.recordAgentInteraction(reco, true);
     return { ok: true, reason: `routed ${signal.side} ${proposal.symbol} (${this.mode})` };
   }
@@ -5372,12 +5394,43 @@ export class SignalEngine {
     const trimmed = (reason ?? '').trim();
     if (trimmed === '') return { ok: false, reason: 'a rejection reason is required' };
     setProposalStatus(id, 'rejected', now, trimmed);
-    const reco = this.latestAgentRecommendations.find(r => r.proposedSignal?.id === proposal.recommendationId);
+    // TRA-1138 — resolve via the pin too, so the TRA-850 vote-against still lands
+    // when the source reco has already aged out of the latest advisory set.
+    const reco = this.resolveProposalReco(proposal.recommendationId);
+    this.pinnedProposalRecos.delete(proposal.recommendationId);
     if (reco) {
       this.latestAgentRecommendations = this.latestAgentRecommendations.filter(r => r !== reco);
       void this.recordAgentInteraction(reco, false);
     }
     return { ok: true, reason: `rejected ${proposal.symbol}` };
+  }
+
+  /**
+   * TRA-1138 — resolve the source recommendation backing a pending proposal.
+   * Prefers the live advisory set (freshest skip-reason/quote state) and falls
+   * back to the pinned snapshot captured when the proposal was queued, so a
+   * confirm/reject still routes after the advisory tick replaced the set or the
+   * bar rolled over and changed the proposedSignal id.
+   */
+  private resolveProposalReco(recommendationId: string): AgentRecommendation | undefined {
+    return (
+      this.latestAgentRecommendations.find(r => r.proposedSignal?.id === recommendationId) ??
+      this.pinnedProposalRecos.get(recommendationId)
+    );
+  }
+
+  /**
+   * TRA-1138 — drop pinned recos whose proposal is no longer pending (executed /
+   * rejected / expired), keeping the map bounded to in-flight confirmations.
+   */
+  private prunePinnedProposalRecos(): void {
+    if (this.pinnedProposalRecos.size === 0) return;
+    const stillPending = new Set(
+      listProposals({ user: this.alertUsername, status: 'pending' }).map(p => p.recommendationId),
+    );
+    for (const recommendationId of this.pinnedProposalRecos.keys()) {
+      if (!stillPending.has(recommendationId)) this.pinnedProposalRecos.delete(recommendationId);
+    }
   }
 
   /** TRA-941 — append one audit entry, bounded to the most recent 1,000. */

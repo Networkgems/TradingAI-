@@ -139,6 +139,44 @@ describe('SignalEngine — TRA-941 proposal queue + execution', () => {
     expect(engine.getAgentOrderAudit().length).toBe(0);
   });
 
+  it('TRA-1138: a pending proposal still confirms after the advisory set is replaced (new bar)', async () => {
+    // Queue a proposal on bar A (large notional → stays pending for a manual confirm).
+    const engine = await demoEngine();
+    engine.setTradingAgents(true);
+    priv(engine).latestAgentRecommendations = [buildApprove('AAPL', 1_000)];
+    await priv(engine).processAgentProposals(new Map([['AAPL', 100]]));
+    const pending = engine.getPendingProposals();
+    expect(pending.length).toBe(1);
+
+    // A later advisory tick rolls to a NEW bar: the set is wholesale-replaced and
+    // the proposedSignal id changes (agent-AAPL-2000), so the bar-A reco is gone.
+    // Pre-fix this made the proposal unconfirmable ("source recommendation … no
+    // longer pending — re-request") even though it was well inside its 15-min TTL.
+    priv(engine).latestAgentRecommendations = [buildApprove('MSFT', 2_000)];
+
+    const res = await engine.confirmProposalById((pending[0] as TradeProposal).id, 100);
+    expect(res.ok).toBe(true);
+    expect(res.reason).not.toMatch(/no longer pending/i);
+    expect(engine.getState().account.openPositions.some(p => p.symbol === 'AAPL')).toBe(true);
+    expect(engine.getAgentOrderAudit().length).toBe(1);
+  });
+
+  it('TRA-1138: a pending proposal still rejects after the advisory set is cleared', async () => {
+    const engine = await demoEngine();
+    engine.setTradingAgents(true);
+    priv(engine).latestAgentRecommendations = [buildApprove('NEXR', 1_000)];
+    await priv(engine).processAgentProposals(new Map([['NEXR', 100]]));
+    const pending = engine.getPendingProposals();
+    expect(pending.length).toBe(1);
+
+    priv(engine).latestAgentRecommendations = []; // advisory set wiped (layer churn)
+
+    const res = engine.rejectProposalById((pending[0] as TradeProposal).id, 'changed my mind');
+    expect(res.ok).toBe(true);
+    expect(engine.getPendingProposals().length).toBe(0);
+    expect(engine.getState().account.openPositions.length).toBe(0);
+  });
+
   it('reject captures a reason and drops the proposal without routing', async () => {
     const engine = await demoEngine();
     engine.setTradingAgents(true);
