@@ -417,7 +417,9 @@ describe('DashboardHeader (TRA-422)', () => {
         onOpenProfileModal={() => {}} onGoHome={() => {}} onLogout={() => {}}
       />,
     );
-    expect(screen.getByText('Equity')).toBeInTheDocument();
+    // TRA-725 — equity/Daily P&L moved to the DashboardFooter; the header's
+    // account stat group now leads with the open-Positions count.
+    expect(screen.getByText('Positions')).toBeInTheDocument();
     // TRA-704 — connection badge reads "CONNECTED" (was "LIVE") so it can't be
     // confused with the DEMO/LIVE real-money account-mode toggle.
     expect(screen.getByText('CONNECTED')).toBeInTheDocument();
@@ -446,7 +448,7 @@ describe('DashboardHeader (TRA-422)', () => {
     expect(screen.queryByText('Daily P&L')).not.toBeInTheDocument();
     expect(screen.queryByText('Daily Opts P&L')).not.toBeInTheDocument();
     // The non-P&L stats stay in the header.
-    expect(screen.getByText('Equity')).toBeInTheDocument();
+    expect(screen.getByText('Positions')).toBeInTheDocument();
     expect(screen.getByText('Options')).toBeInTheDocument();
   });
 });
@@ -512,11 +514,14 @@ describe('AccountSummaryCard (TRA-725)', () => {
       />,
     );
     expect(screen.getByText('Account Summary')).toBeInTheDocument();
-    expect(screen.getByText('Settled Funds')).toBeInTheDocument();
+    // TRA-949 — the card reconciles to Total Value and reads buying power off
+    // the broker balance ("Available Funds"), with per-asset-class market values.
+    expect(screen.getByText('Total Value')).toBeInTheDocument();
+    expect(screen.getByText('Available Funds')).toBeInTheDocument();
     expect(screen.getByText('Long Option Value')).toBeInTheDocument();
+    // $816.35 Total Value and $590.00 Long Option Value come straight off the snapshot.
+    expect(screen.getByText('$816.35')).toBeInTheDocument();
     expect(screen.getByText('$590.00')).toBeInTheDocument();
-    // Settled Funds + Settled Cash share the same $200.06 source.
-    expect(screen.getAllByText('$200.06')).toHaveLength(2);
   });
 
   it('degrades live-only fields to "—" in demo (no broker balance)', () => {
@@ -526,9 +531,10 @@ describe('AccountSummaryCard (TRA-725)', () => {
         accountMode="demo"
       />,
     );
-    // Total Value / Cash still render; the four live-only rows show "—".
+    // Total Value / Cash still render; the live-only per-asset-class rows
+    // (Long Stock, Long Option, Short Option Value) degrade to "—" in demo.
     expect(screen.getByText('Long Stock Value')).toBeInTheDocument();
-    expect(screen.getAllByText('—').length).toBeGreaterThanOrEqual(4);
+    expect(screen.getAllByText('—').length).toBeGreaterThanOrEqual(3);
   });
 
   it('renders nothing without an account snapshot', () => {
