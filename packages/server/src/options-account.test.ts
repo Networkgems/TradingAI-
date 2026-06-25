@@ -269,33 +269,105 @@ describe('PaperOptionsAccount.checkExits — TRA-483 overnight hold for live (PD
   });
 });
 
+function buildRvSignal(overrides: Partial<RelativeValueSignal> = {}): RelativeValueSignal {
+  return {
+    id: 'rv-1',
+    symbol: 'AAPL',
+    type: 'relative_value',
+    side: 'buy',
+    entryPrice: 1.0,
+    stopLoss: 0.75,
+    takeProfit: 1.5,
+    riskRewardRatio: 2,
+    timestamp: TRADING_TIME,
+    optionSymbol: 'AAPL240705C00200000',
+    optionType: 'call',
+    strike: 200,
+    expiration: '2024-07-05',
+    mark: 1.0,
+    fairPrice: 1.30,
+    mispricingPct: -0.23,
+    zScore: -2.1,
+    ivFitted: 0.32,
+    ivUsed: 0.28,
+    delta: 0.18,
+    reason: 'cheap-vs-curve',
+    ...overrides,
+  };
+}
+
+describe('PaperOptionsAccount.checkExits — TRA-1136 swing-hold (demo RV)', () => {
+  // The legacy demo behaviour: a same-day RV stop-loss fires (no swing-hold).
+  it('closes a same-day demo RV position when swing-hold is OFF (legacy default)', () => {
+    const acct = new PaperOptionsAccount({ initialEquity: 50_000, managedAccountRatio: 0.5 });
+    const pos = acct.openOptionFromRvCandidate(buildRvSignal({ mark: 1.0 }), 'demo');
+    expect(pos).not.toBeNull();
+    expect(pos!.mode).toBe('demo');
+
+    // Mark crashes through the RV stop — with swing-hold off, the SL fires today.
+    const marks = new Map<string, number>([[pos!.optionSymbol!, 0.30]]);
+    const closed = acct.checkExits(new Map(), marks);
+
+    expect(closed).toHaveLength(1);
+    expect(closed[0].pnl).toBeLessThan(0);
+    expect(acct.getState().openOptions).toHaveLength(0);
+  });
+
+  it('holds a same-day demo RV position when swing-hold is ON', () => {
+    const acct = new PaperOptionsAccount({
+      initialEquity: 50_000,
+      managedAccountRatio: 0.5,
+      swingHoldOptions: true,
+    });
+    const pos = acct.openOptionFromRvCandidate(buildRvSignal({ mark: 1.0 }), 'demo');
+    expect(pos).not.toBeNull();
+    expect(pos!.mode).toBe('demo');
+
+    // Same crashing mark — swing-hold suppresses the same-session exit so the
+    // position stays open and can swing into the next session.
+    const marks = new Map<string, number>([[pos!.optionSymbol!, 0.30]]);
+    const closed = acct.checkExits(new Map(), marks);
+
+    expect(closed).toHaveLength(0);
+    expect(acct.getState().openOptions).toHaveLength(1);
+    // The dashboard mark still tracks live — the gate must not freeze it.
+    expect(acct.getState().openOptions[0].currentPremium).toBe(0.30);
+  });
+
+  it('releases the held demo RV exit on the next trading session', () => {
+    const acct = new PaperOptionsAccount({
+      initialEquity: 50_000,
+      managedAccountRatio: 0.5,
+      swingHoldOptions: true,
+    });
+    const pos = acct.openOptionFromRvCandidate(buildRvSignal({ mark: 1.0 }), 'demo');
+    expect(pos).not.toBeNull();
+
+    // Advance past today — the same-session gate releases and the SL fires.
+    vi.setSystemTime(TRADING_TIME + 24 * 60 * 60 * 1000);
+    const marks = new Map<string, number>([[pos!.optionSymbol!, 0.30]]);
+    const closed = acct.checkExits(new Map(), marks);
+
+    expect(closed).toHaveLength(1);
+    expect(closed[0].pnl).toBeLessThan(0);
+    expect(acct.getState().openOptions).toHaveLength(0);
+  });
+
+  it('updateConfig({swingHoldOptions:true}) flips the demo gate on at runtime', () => {
+    const acct = new PaperOptionsAccount({ initialEquity: 50_000, managedAccountRatio: 0.5 });
+    const pos = acct.openOptionFromRvCandidate(buildRvSignal({ mark: 1.0 }), 'demo');
+    expect(pos).not.toBeNull();
+
+    acct.updateConfig({ swingHoldOptions: true });
+    const marks = new Map<string, number>([[pos!.optionSymbol!, 0.30]]);
+    const closed = acct.checkExits(new Map(), marks);
+
+    expect(closed).toHaveLength(0);
+    expect(acct.getState().openOptions).toHaveLength(1);
+  });
+});
+
 describe('PaperOptionsAccount.voidOpenOption (TRA-319)', () => {
-  function buildRvSignal(overrides: Partial<RelativeValueSignal> = {}): RelativeValueSignal {
-    return {
-      id: 'rv-1',
-      symbol: 'AAPL',
-      type: 'relative_value',
-      side: 'buy',
-      entryPrice: 1.0,
-      stopLoss: 0.75,
-      takeProfit: 1.5,
-      riskRewardRatio: 2,
-      timestamp: TRADING_TIME,
-      optionSymbol: 'AAPL240705C00200000',
-      optionType: 'call',
-      strike: 200,
-      expiration: '2024-07-05',
-      mark: 1.0,
-      fairPrice: 1.30,
-      mispricingPct: -0.23,
-      zScore: -2.1,
-      ivFitted: 0.32,
-      ivUsed: 0.28,
-      delta: 0.18,
-      reason: 'cheap-vs-curve',
-      ...overrides,
-    };
-  }
 
   it('refunds cash and reverts the daily counter when an RV open is voided', () => {
     const acct = new PaperOptionsAccount({ initialEquity: 50_000, managedAccountRatio: 0.5 });

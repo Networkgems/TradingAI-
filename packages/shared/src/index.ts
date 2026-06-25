@@ -1125,6 +1125,18 @@ export interface AccountSettings {
    */
   holdLiveOptionsOvernightForPdt?: boolean;
   /**
+   * TRA-1136 — swing-hold for the user's options book. When `true`, `checkExits`
+   * suppresses same-session engine exits (structural thesis-break, hard SL, TP1
+   * partial, trailing) for RV positions in BOTH demo and live, holding them to
+   * the next trading session so the user can swing-trade and let the trailing
+   * stop run instead of getting booked out the same day. The existing live-only
+   * TRA-495 gate is a subset of this; flipping it on extends that swing behaviour
+   * to the demo book too. Defaults `false` so the demo exit-mechanic test suite
+   * and every user who hasn't opted in keep the legacy same-day behaviour.
+   * Resolve via {@link resolveSwingHoldOptions}.
+   */
+  swingHoldOptions?: boolean;
+  /**
    * TRA-526 — global kill switch (deterministic risk layer master override).
    * When `true`, the engine engages {@link DailyRiskGovernor}'s kill switch on
    * load and every new-entry path is halted regardless of auto-trading flags or
@@ -1294,6 +1306,9 @@ export const DEFAULT_ACCOUNT_SETTINGS: AccountSettings = {
   marketReviewGatesEnabled: false,
   // TRA-483 — PDT-aware overnight hold defaults ON for live positions.
   holdLiveOptionsOvernightForPdt: true,
+  // TRA-1136 — swing-hold the options book defaults OFF; opt-in per user so the
+  // demo same-day exit behaviour (and its test suite) is unchanged by default.
+  swingHoldOptions: false,
   // TRA-544 — multi-agent layer defaults OFF; deterministic stack drives until
   // the operator opts in from the banner (advisory takeover, still risk-gated).
   tradingAgentsEnabled: false,
@@ -1423,6 +1438,16 @@ export function resolveMarketReviewGatesEnabled(s: AccountSettings): boolean {
  */
 export function resolveHoldLiveOptionsOvernight(s: AccountSettings): boolean {
   return s.holdLiveOptionsOvernightForPdt !== false;
+}
+
+/**
+ * TRA-1136 — resolve the swing-hold-options opt-in. Defaults `false`: only an
+ * explicit `true` extends the same-session exit suppression to the demo RV book
+ * (live RV is already swing-gated by TRA-495). Keeps legacy same-day demo exits
+ * for every user who hasn't turned this on.
+ */
+export function resolveSwingHoldOptions(s: AccountSettings): boolean {
+  return s.swingHoldOptions === true;
 }
 
 /**

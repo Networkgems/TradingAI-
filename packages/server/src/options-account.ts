@@ -290,6 +290,14 @@ interface OptionsAccountConfig {
    */
   holdLiveOptionsOvernightForPdt?: boolean;
   /**
+   * TRA-1136 — swing-hold opt-in. When `true`, the same-session RV exit
+   * suppression (TRA-495) is extended to demo positions too, so the user can
+   * swing-trade RV options (hold to the next session, let trailing run) instead
+   * of being booked out the same day. Default `false` preserves legacy demo
+   * behaviour. See {@link AccountSettings.swingHoldOptions}.
+   */
+  swingHoldOptions?: boolean;
+  /**
    * TRA-598 (C3) — the first-class "no day trading" guardrail config. Drives the
    * order-time entry-DTE floor and the same-session round-trip block. Optional;
    * defaults to the shipped {@link DAY_TRADING_GUARDRAIL}. Tests pass an override
@@ -408,6 +416,8 @@ export class PaperOptionsAccount {
    * when the user toggles the matching AccountSettings field.
    */
   private holdLiveOptionsOvernightForPdt: boolean;
+  /** TRA-1136 — swing-hold opt-in; extends the TRA-495 same-session RV exit suppression to demo. */
+  private swingHoldOptions: boolean;
   /** TRA-598 (C3) — resolved no-day-trading thresholds; see {@link OptionsAccountConfig.dayTradingGuardrail}. */
   private dayTradingGuardrail: DayTradingGuardrailConfig;
   private currentDayKey = toDateKey(Date.now());
@@ -443,6 +453,7 @@ export class PaperOptionsAccount {
     // {@link resolveHoldLiveOptionsOvernight}, which defaults to ON and
     // matches the issue's wake-comment requirement.
     this.holdLiveOptionsOvernightForPdt = config.holdLiveOptionsOvernightForPdt ?? false;
+    this.swingHoldOptions = config.swingHoldOptions ?? false;
     this.dayTradingGuardrail = config.dayTradingGuardrail ?? DAY_TRADING_GUARDRAIL;
     this.equity = this.initialEquity;
     this.cash = this.initialEquity;
@@ -575,6 +586,9 @@ export class PaperOptionsAccount {
     if (config.holdLiveOptionsOvernightForPdt !== undefined) {
       this.holdLiveOptionsOvernightForPdt = config.holdLiveOptionsOvernightForPdt;
     }
+    if (config.swingHoldOptions !== undefined) {
+      this.swingHoldOptions = config.swingHoldOptions;
+    }
     if (config.dayTradingGuardrail !== undefined) {
       this.dayTradingGuardrail = config.dayTradingGuardrail;
     }
@@ -629,6 +643,9 @@ export class PaperOptionsAccount {
     }
     if (config.holdLiveOptionsOvernightForPdt !== undefined) {
       this.holdLiveOptionsOvernightForPdt = config.holdLiveOptionsOvernightForPdt;
+    }
+    if (config.swingHoldOptions !== undefined) {
+      this.swingHoldOptions = config.swingHoldOptions;
     }
     if (config.dayTradingGuardrail !== undefined) {
       this.dayTradingGuardrail = config.dayTradingGuardrail;
@@ -1877,9 +1894,16 @@ export class PaperOptionsAccount {
       // so it still kicks in if a user explicitly disables that knob.
       // Manual closes (`stageManualPendingExit`, `closeOption`) don't flow
       // through this branch and stay available to the user.
+      //
+      // TRA-1136 — when the user opts into `swingHoldOptions`, extend the same
+      // suppression to the DEMO book so they can swing-trade RV options (hold to
+      // the next session, let the trailing stop run) instead of being booked out
+      // the same day by a structural thesis-break / hard SL. Default-off, so the
+      // legacy demo same-day behaviour (and its test suite) is unchanged unless
+      // the user turns this on.
       if (
         opt.signalType === 'relative_value'
-        && (opt.mode ?? 'demo') === 'live'
+        && ((opt.mode ?? 'demo') === 'live' || this.swingHoldOptions)
         && toDateKey(opt.openedAt) === toDateKey(Date.now())
       ) {
         continue;

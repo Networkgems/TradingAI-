@@ -2057,6 +2057,33 @@ export default function SettingsPage({ token, httpUrl, context, onModeChange, on
                   </label>
                 </div>
 
+                {/* TRA-1136 — swing-hold options. Opt-in (default off). When on,
+                    the same-session exit suppression that already protects the
+                    live RV book (TRA-495) is extended to the demo book too, so
+                    RV option positions are held to the next trading session
+                    instead of being booked out the same day — letting the
+                    trailing stop run. Manual closes are unaffected. */}
+                <div className="settings-field" style={{ marginTop: '1rem' }}>
+                  <label className="checkbox-option">
+                    <input
+                      type="checkbox"
+                      checked={settings.swingHoldOptions === true}
+                      onChange={e => set('swingHoldOptions', e.target.checked)}
+                    />
+                    <span>
+                      <strong>Swing-hold options (hold to next session)</strong>
+                      <p className="field-hint">
+                        Let Relative Value option positions swing-trade: skip automatic
+                        structural / stop-loss / partial-take-profit / trailing-stop exits on
+                        positions opened earlier the same trading day so they aren't closed out
+                        on intraday noise. Auto-exits — including the trailing stop that lets
+                        winners run — resume on the next session. Applies to both demo and live;
+                        manual closes from the dashboard always fire regardless of this setting.
+                      </p>
+                    </span>
+                  </label>
+                </div>
+
                 {/* TRA-506 — two env-pinned probes. Each button targets its
                     own saved cred pair so a user can verify Production
                     buying power before flipping the env over. The saved
