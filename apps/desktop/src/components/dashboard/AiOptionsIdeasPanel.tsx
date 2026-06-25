@@ -656,7 +656,18 @@ export function AiOptionsIdeasPanel({ token }: { token: string }) {
         headers: { Authorization: `Bearer ${token}` },
       });
       if (!r.ok) {
-        setToast(`Could not place paper order (HTTP ${r.status}).`);
+        // TRA-1117 — surface the server's specific reason (e.g. "max loss
+        // exceeds the per-trade cap") rather than a bare HTTP code, so the user
+        // understands WHY an idea didn't open instead of misreading the green
+        // "No day trading" status badge as the cause.
+        let detail = '';
+        try {
+          const body = (await r.json()) as { error?: string };
+          if (body?.error) detail = ` ${body.error}`;
+        } catch {
+          /* non-JSON body — fall back to the status code */
+        }
+        setToast(detail ? detail.trim() : `Could not place paper order (HTTP ${r.status}).`);
       } else {
         setToast(`Paper order placed for ${idea.ticker} ${idea.strategy}. See the Options tab.`);
       }

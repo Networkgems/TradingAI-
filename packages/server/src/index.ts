@@ -2214,9 +2214,15 @@ app.post('/api/options/ideas/:id/paper-enter', requireAuth, async (req, res) => 
   }
   const opened = ctx.engine.enterPaperOptionsIdea(intent);
   if (!opened) {
+    // TRA-1117 — surface the SPECIFIC reason the open path bailed instead of a
+    // generic catch-all. The most common real cause (seen on a $25k demo book)
+    // is a defined-risk spread whose single-lot max loss busts the 1%-of-equity
+    // per-trade cap — previously indistinguishable from "market closed".
+    const reason = ctx.engine.takeLastIdeaEntryRejection();
     res.status(409).json({
-      error:
-        'Could not place the paper order — the market may be closed, the daily options cap reached, a position for this contract already open, or the idea fell below the no-day-trading DTE floor.',
+      error: reason
+        ? `Could not place the paper order — ${reason}.`
+        : 'Could not place the paper order — the market may be closed, the daily options cap reached, a position for this contract already open, or the idea fell below the no-day-trading DTE floor.',
     });
     return;
   }

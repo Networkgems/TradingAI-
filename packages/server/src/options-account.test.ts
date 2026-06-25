@@ -2570,6 +2570,14 @@ describe('PaperOptionsAccount.openDefinedRiskSpread', () => {
     expect(pos).toBeNull();
     expect(acct.getState().optionsCash).toBe(1_000);
     expect(acct.getState().dailyOptionsCount).toBe(0);
+    // TRA-1117 — the reject now leaves a SPECIFIC, surfaceable reason (this is
+    // the exact case the QQQ bull-put-spread idea hit on the $25k demo book):
+    // the per-trade max-loss cap, not "market closed" or a mystery 409.
+    const reason = acct.takeLastEntryRejection();
+    expect(reason).toMatch(/exceeds 1\.00% cap/);
+    expect(reason).toMatch(/too large for the per-trade risk budget/);
+    // "take" semantics — clear-on-read so it can't leak onto a later open.
+    expect(acct.takeLastEntryRejection()).toBeNull();
   });
 
   it('trims lots so reserved capital-at-risk stays inside the 1% cap', () => {
@@ -2594,6 +2602,15 @@ describe('PaperOptionsAccount.openDefinedRiskSpread', () => {
     // Nothing consumed.
     expect(acct.getState().optionsCash).toBe(50_000);
     expect(acct.getState().dailyOptionsCount).toBe(0);
+    // TRA-1117 — DTE-floor reject also surfaces a specific reason.
+    expect(acct.takeLastEntryRejection()).toMatch(/no day trading/i);
+  });
+
+  it('clears the rejection reason on a successful open (TRA-1117)', () => {
+    const acct = new PaperOptionsAccount({ initialEquity: 50_000, managedAccountRatio: 0.5 });
+    expect(acct.openDefinedRiskSpread(spreadParams())).not.toBeNull();
+    // A clean open leaves no stale reason behind for the endpoint to surface.
+    expect(acct.takeLastEntryRejection()).toBeNull();
   });
 
   it('rejects malformed structures (single leg / mispriced max-loss)', () => {

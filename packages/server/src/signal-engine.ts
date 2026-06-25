@@ -5837,6 +5837,18 @@ export class SignalEngine {
   }
 
   /**
+   * TRA-1117 — read + clear the reason the last {@link enterPaperOptionsIdea}
+   * attempt returned `null`. Routed off the SAME account
+   * (`optionsAccounts[tradierEnv]`) the open path targets, so the
+   * `…/paper-enter` endpoint can turn a generic 409 into a specific, honest
+   * explanation (e.g. "max loss exceeds the per-trade cap" vs "market closed").
+   * Clear-on-read so a stale reason can't leak onto a later open.
+   */
+  takeLastIdeaEntryRejection(): string | null {
+    return this.optionsAccounts[this.tradierEnv].takeLastEntryRejection();
+  }
+
+  /**
    * TRA-598 (C3) — no-day-trading discretionary-close gate for a user-initiated
    * option close. Runs the owning account's {@link PaperOptionsAccount.checkDayTradingClose}
    * across both env buckets so the `/api/options/:id/close` handler can refuse a

@@ -321,6 +321,18 @@ export class PaperOptionsAccount {
   private openOptions: Map<string, OptionPosition> = new Map();
   private closedOptions: OptionPosition[] = [];
   /**
+   * TRA-1117 — the reason the most recent user-initiated open path bailed,
+   * recorded so the `…/paper-enter` endpoint can surface a SPECIFIC 409 reason
+   * instead of a generic "could not place order". The single-leg
+   * ({@link openOptionFromRvCandidate}) and multi-leg
+   * ({@link openDefinedRiskSpread}) open paths return `null` for ~6 distinct
+   * reasons (market closed, daily cap, duplicate, DTE floor, mispriced, or — the
+   * case the user actually hit — a single defined-risk lot whose max loss busts
+   * the per-trade risk cap). Cleared at the top of each open attempt and on
+   * success; read via {@link takeLastEntryRejection} right after a `null`.
+   */
+  private lastEntryRejection: string | null = null;
+  /**
    * TRA-246 — realized options P&L split per account mode. Replaces the
    * single bucket-wide `optionsPnl` so `getStateForMode('demo')` no longer
    * surfaces P&L accrued by live-mode trades on the Demo dashboard. Every
@@ -666,9 +678,32 @@ export class PaperOptionsAccount {
         minEntryDteDays: this.dayTradingGuardrail.minEntryDteDays,
         reason: verdict.reason,
       });
+      this.lastEntryRejection = verdict.reason ?? 'entry blocked by the no-day-trading DTE floor';
       return false;
     }
     return true;
+  }
+
+  /**
+   * TRA-1117 — record a user-facing rejection reason and return `null`, so the
+   * open paths keep their `null`-on-reject contract while still leaving a
+   * specific, ASCII-safe explanation for the `…/paper-enter` endpoint to surface.
+   */
+  private rejectEntry(reason: string): null {
+    this.lastEntryRejection = reason;
+    return null;
+  }
+
+  /**
+   * TRA-1117 — read and clear the reason the last open attempt bailed. Returns
+   * `null` when the last open succeeded or no reason was recorded. "Take"
+   * semantics (clear-on-read) so a stale reason can't leak onto a later,
+   * unrelated success.
+   */
+  takeLastEntryRejection(): string | null {
+    const r = this.lastEntryRejection;
+    this.lastEntryRejection = null;
+    return r;
   }
 
   /** Current options daily cap — exposed so the UI can render a count badge. */
@@ -1150,32 +1185,44 @@ export class PaperOptionsAccount {
     journalSetup?: OptionTradeJournalSetup,
   ): OptionPosition | null {
     this.resetDayIfNeeded();
+    this.lastEntryRejection = null;
 
-    if (!isValidTradingWindow(Date.now())) return null;
-    if (this.dailyOptionsTotal() >= this.optionsDailyTradesLimit) return null;
+    if (!isValidTradingWindow(Date.now()))
+      return this.rejectEntry('market is closed — options paper entries fill only during US market hours');
+    if (this.dailyOptionsTotal() >= this.optionsDailyTradesLimit)
+      return this.rejectEntry(
+        `daily options trade cap reached (${this.dailyOptionsTotal()}/${this.optionsDailyTradesLimit}) — try again next session`,
+      );
 
     const existing = Array.from(this.openOptions.values()).find(
       o => o.optionSymbol === signal.optionSymbol,
     );
-    if (existing) return null;
+    if (existing) return this.rejectEntry('a paper position for this exact contract is already open');
 
     // TRA-598 (C3) — no-day-trading entry gate: refuse sub-threshold-DTE entries.
     if (!this.passesEntryDteGuard(signal.optionSymbol, signal.expiration, Date.now())) return null;
 
     // TRA-374 — see `openOptionFromCandidate` for the demo cost-model rationale.
     const rawMark = signal.mark;
-    if (!Number.isFinite(rawMark) || rawMark <= 0) return null;
+    if (!Number.isFinite(rawMark) || rawMark <= 0)
+      return this.rejectEntry('no usable option mark/quote for this contract right now');
     const premiumPaid = mode === 'demo' ? rawMark * (1 + this.demoSlippagePct) : rawMark;
 
     const budget = this.rvBudgetPerTrade(equityOverride);
     const costPerContract = premiumPaid * 100;
     // TRA-378 — `sizeContracts` applies the forced 1-contract floor (live).
     const contracts = this.sizeContracts(budget, costPerContract, equityOverride);
-    if (contracts <= 0) return null;
+    if (contracts <= 0)
+      return this.rejectEntry(
+        `contract premium $${(costPerContract).toFixed(2)} exceeds the per-trade options budget — too large for this account`,
+      );
 
     const totalCost = contracts * costPerContract;
     const demoFee = mode === 'demo' ? contracts * this.demoFeePerContract : 0;
-    if (equityOverride === undefined && totalCost + demoFee > this.cash) return null;
+    if (equityOverride === undefined && totalCost + demoFee > this.cash)
+      return this.rejectEntry(
+        `insufficient paper cash ($${this.cash.toFixed(2)}) to cover the $${(totalCost + demoFee).toFixed(2)} entry`,
+      );
 
     this.cash -= totalCost + demoFee;
     this.dailyRvCount += 1;
@@ -1291,12 +1338,18 @@ export class PaperOptionsAccount {
     journalSetup?: OptionTradeJournalSetup,
   ): OptionPosition | null {
     this.resetDayIfNeeded();
+    this.lastEntryRejection = null;
 
-    if (!isValidTradingWindow(Date.now())) return null;
-    if (this.dailyOptionsTotal() >= this.optionsDailyTradesLimit) return null;
+    if (!isValidTradingWindow(Date.now()))
+      return this.rejectEntry('market is closed — options paper entries fill only during US market hours');
+    if (this.dailyOptionsTotal() >= this.optionsDailyTradesLimit)
+      return this.rejectEntry(
+        `daily options trade cap reached (${this.dailyOptionsTotal()}/${this.optionsDailyTradesLimit}) — try again next session`,
+      );
 
     const legs = params.legs;
-    if (!Array.isArray(legs) || legs.length < 2) return null;
+    if (!Array.isArray(legs) || legs.length < 2)
+      return this.rejectEntry('idea is not a valid multi-leg defined-risk structure');
 
     // The structure's expiration is the (single) shared expiration across legs;
     // calendars (two expirations) take the soonest leg as the DTE basis — the
@@ -1315,13 +1368,14 @@ export class PaperOptionsAccount {
     const existing = Array.from(this.openOptions.values()).find(
       (o) => o.optionSymbol === comboSymbol,
     );
-    if (existing) return null;
+    if (existing) return this.rejectEntry('a paper position for this exact structure is already open');
 
     // TRA-598 (C3) — no-day-trading entry gate on the structure's expiration.
     if (!this.passesEntryDteGuard(comboSymbol, expiration, Date.now())) return null;
 
     const maxLossPerLot = params.maxLossUsd;
-    if (!Number.isFinite(maxLossPerLot) || maxLossPerLot <= 0) return null;
+    if (!Number.isFinite(maxLossPerLot) || maxLossPerLot <= 0)
+      return this.rejectEntry('structure is mispriced (non-positive max loss) — refresh the feed');
 
     // Size off the RV ticket budget against the capital-at-risk per lot. Demo
     // (no equity override) keeps the legacy floor-divide; we force at least one
@@ -1330,7 +1384,10 @@ export class PaperOptionsAccount {
     const budget = this.rvBudgetPerTrade();
     let contracts = Math.floor(budget / maxLossPerLot);
     if (contracts < 1 && maxLossPerLot <= this.cash) contracts = 1;
-    if (contracts < 1) return null;
+    if (contracts < 1)
+      return this.rejectEntry(
+        `single-lot max loss $${maxLossPerLot.toFixed(2)} exceeds available paper cash $${this.cash.toFixed(2)}`,
+      );
 
     // TRA-912 (TRA-908 Phase B) — per-trade max-loss ceiling: never reserve
     // capital-at-risk above 1% of equity on a single combo. Trim down to the
@@ -1344,7 +1401,10 @@ export class PaperOptionsAccount {
     // binding constraint here — there is no live buying-power mirror).
     if (totalRisk > this.cash) {
       contracts = Math.floor(this.cash / maxLossPerLot);
-      if (contracts < 1) return null;
+      if (contracts < 1)
+        return this.rejectEntry(
+          `single-lot max loss $${maxLossPerLot.toFixed(2)} exceeds available paper cash $${this.cash.toFixed(2)}`,
+        );
       totalRisk = contracts * maxLossPerLot;
     }
 
@@ -1367,7 +1427,12 @@ export class PaperOptionsAccount {
         contracts,
         reason: gate.reason,
       });
-      return null;
+      // TRA-1117 — the case the user actually hit: a single defined-risk lot
+      // whose max loss already busts the 1%-of-equity per-trade cap. Surface the
+      // exact figures so "Paper entry" no longer fails with a mystery 409.
+      return this.rejectEntry(
+        `${gate.reason} — this defined-risk structure is too large for the per-trade risk budget on a $${this.equity.toFixed(0)} account`,
+      );
     }
 
     // TRA-913 (Phase C) — portfolio-level gate on the fully-sized structure,
@@ -1383,7 +1448,7 @@ export class PaperOptionsAccount {
           totalRisk,
           reason: verdict.reason,
         });
-        return null;
+        return this.rejectEntry(verdict.reason);
       }
     }
 
