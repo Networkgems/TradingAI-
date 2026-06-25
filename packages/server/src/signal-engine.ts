@@ -391,7 +391,10 @@ function trendFromSpreadStrategy(strategy: string): OptionTradeJournalSetup['tre
   return 'sideways';
 }
 
-function activeOptionsDailyLimit(settings?: AccountSettings): number | undefined {
+// TRA-327 — exported for the regression test that locks the demo↔live
+// daily-limit isolation contract (the engine must never read the demo cap
+// while in live mode, only fall back to it when no live value was saved).
+export function activeOptionsDailyLimit(settings?: AccountSettings): number | undefined {
   if (!settings) return undefined;
   if (settings.mode === 'live') {
     return settings.optionsDailyTradesLimitLive ?? settings.optionsDailyTradesLimit;
@@ -399,8 +402,10 @@ function activeOptionsDailyLimit(settings?: AccountSettings): number | undefined
   return settings.optionsDailyTradesLimit;
 }
 
-/** TRA-554 — pick the equity daily-trades cap that matches the active mode. */
-function activeEquityDailyLimit(settings?: AccountSettings): number {
+/** TRA-554 — pick the equity daily-trades cap that matches the active mode.
+ *  TRA-327 — exported alongside {@link activeOptionsDailyLimit} so the
+ *  demo↔live isolation regression test can pin both caps. */
+export function activeEquityDailyLimit(settings?: AccountSettings): number {
   if (!settings) return 10;
   if (settings.mode === 'live') {
     return settings.dailyTradesLimitLive ?? settings.dailyTradesLimit;

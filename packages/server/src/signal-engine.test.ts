@@ -2,7 +2,7 @@ import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import { tmpdir } from 'os';
 import { join } from 'path';
 import { rmSync, writeFileSync } from 'fs';
-import { SignalEngine, sizeLiveEquityFromStop, shortBlockedOnCashAccount, gateSignalOnReview, describeGatedStrategies, shouldBootArmLiveEquity, shouldRunRelativeValueScan, isLiveBrokerOperator, resolveLiveBrokerOperator, _resetSharedShadowForTests, _sharedShadowRefreshDue, _claimSharedShadowRefresh, _endSharedShadowRefresh, _sharedShadowEvalDue, _claimSharedShadowEval } from './signal-engine.js';
+import { SignalEngine, sizeLiveEquityFromStop, shortBlockedOnCashAccount, gateSignalOnReview, describeGatedStrategies, shouldBootArmLiveEquity, shouldRunRelativeValueScan, isLiveBrokerOperator, resolveLiveBrokerOperator, activeOptionsDailyLimit, activeEquityDailyLimit, _resetSharedShadowForTests, _sharedShadowRefreshDue, _claimSharedShadowRefresh, _endSharedShadowRefresh, _sharedShadowEvalDue, _claimSharedShadowEval } from './signal-engine.js';
 import { setShadowLedgerFileForTests } from './shadow-signal-ledger.js';
 import {
   setReversalShadowLedgerFileForTests,
@@ -4705,5 +4705,80 @@ describe('SignalEngine — demo directional option entry (TRA-1114)', () => {
       setOptionTradeJournalFileForTests(null);
       rmSync(journalFile, { force: true });
     }
+  });
+});
+
+// TRA-327 — regression-lock the demo↔live daily-trade-limit isolation contract.
+// The reporter's symptom was that editing the Demo "Stock/Options Daily Trades
+// Limit" dragged the Live caps along, because the engine read the single
+// un-suffixed field in both modes. The fix split each cap into a `*Live`
+// counterpart and routes the engine through `activeEquityDailyLimit` /
+// `activeOptionsDailyLimit`, which select by `settings.mode` and fall back to
+// the legacy demo field ONLY when the live value was never saved (back-compat).
+//
+// These tests fail if the selector is ever rewired to read the demo field in
+// live mode, or to stop falling back for pre-TRA-327 saved settings.
+describe('activeEquityDailyLimit / activeOptionsDailyLimit mode isolation (TRA-327)', () => {
+  it('demo mode reads the un-suffixed demo caps and ignores the live caps entirely', () => {
+    const s: AccountSettings = {
+      ...DEFAULT_ACCOUNT_SETTINGS,
+      mode: 'demo',
+      dailyTradesLimit: 5,
+      optionsDailyTradesLimit: 3,
+      dailyTradesLimitLive: 99,
+      optionsDailyTradesLimitLive: 88,
+    };
+    expect(activeEquityDailyLimit(s)).toBe(5);
+    expect(activeOptionsDailyLimit(s)).toBe(3);
+  });
+
+  it('live mode reads the *Live caps and ignores the demo caps entirely', () => {
+    const s: AccountSettings = {
+      ...DEFAULT_ACCOUNT_SETTINGS,
+      mode: 'live',
+      dailyTradesLimit: 5,
+      optionsDailyTradesLimit: 3,
+      dailyTradesLimitLive: 12,
+      optionsDailyTradesLimitLive: 7,
+    };
+    expect(activeEquityDailyLimit(s)).toBe(12);
+    expect(activeOptionsDailyLimit(s)).toBe(7);
+  });
+
+  it('editing the demo caps does not change what live mode resolves (the reporter symptom)', () => {
+    // Same saved live caps; only the demo caps differ between the two snapshots.
+    // The live-resolved value must be identical — proving a Demo edit can never
+    // drag the Live cap along.
+    const base: AccountSettings = {
+      ...DEFAULT_ACCOUNT_SETTINGS,
+      mode: 'live',
+      dailyTradesLimitLive: 20,
+      optionsDailyTradesLimitLive: 9,
+    };
+    const beforeDemoEdit: AccountSettings = { ...base, dailyTradesLimit: 10, optionsDailyTradesLimit: 10 };
+    const afterDemoEdit: AccountSettings = { ...base, dailyTradesLimit: 1, optionsDailyTradesLimit: 2 };
+    expect(activeEquityDailyLimit(afterDemoEdit)).toBe(activeEquityDailyLimit(beforeDemoEdit));
+    expect(activeOptionsDailyLimit(afterDemoEdit)).toBe(activeOptionsDailyLimit(beforeDemoEdit));
+    expect(activeEquityDailyLimit(afterDemoEdit)).toBe(20);
+    expect(activeOptionsDailyLimit(afterDemoEdit)).toBe(9);
+  });
+
+  it('live mode falls back to the demo cap for settings saved before TRA-327 (no *Live value)', () => {
+    // A pre-TRA-327 file only carried the un-suffixed fields. Stripping the
+    // `*Live` keys must surface the legacy demo cap instead of undefined, so an
+    // existing live user keeps a sane limit rather than losing their cap.
+    const legacy = { ...DEFAULT_ACCOUNT_SETTINGS, mode: 'live', dailyTradesLimit: 15, optionsDailyTradesLimit: 6 } as AccountSettings;
+    delete (legacy as Partial<AccountSettings>).dailyTradesLimitLive;
+    delete (legacy as Partial<AccountSettings>).optionsDailyTradesLimitLive;
+    expect(activeEquityDailyLimit(legacy)).toBe(15);
+    expect(activeOptionsDailyLimit(legacy)).toBe(6);
+  });
+
+  it('options selector returns undefined and equity selector defaults to 10 when no settings exist', () => {
+    // Defensive: the engine constructs accounts before settings load on cold
+    // boot. The options cap is optional (undefined ⇒ PaperOptionsAccount uses
+    // its own default); the equity cap must never be undefined.
+    expect(activeOptionsDailyLimit(undefined)).toBeUndefined();
+    expect(activeEquityDailyLimit(undefined)).toBe(10);
   });
 });
