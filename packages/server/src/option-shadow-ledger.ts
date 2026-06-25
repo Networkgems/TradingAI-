@@ -98,6 +98,18 @@ export function isOptionPhaseBEnabled(env: NodeJS.ProcessEnv = process.env): boo
 /** Per-share → per-lot dollar multiplier for an equity option contract. */
 const CONTRACT_MULTIPLIER = 100;
 
+/**
+ * TRA-1145 — per-trade max-loss cap (fraction of equity) applied at the paper
+ * book's pre-trade gate for the DEMO spread-routing paths, aligned with the
+ * selector's default advisory `riskFraction`. The engine gate's strict 1%
+ * default ({@link DEFAULT_MAX_LOSS_PCT_CAP}) rejects a single one-ATR-wing
+ * vertical on a high-priced index ETF (~1.3% defined risk on the $25k demo
+ * book), so bull-put / bear-call / debit verticals never reached the OOS
+ * journal even when the selector fired them. The live-capital advisory→capital
+ * bridge does NOT use this — it keeps the strict 1% default.
+ */
+export const DEMO_SPREAD_MAX_LOSS_PCT_CAP = 0.02;
+
 /** The defined-risk-spread open params derived from a shadow selector signal. */
 export interface ShadowSpreadParams {
   symbol: string;
@@ -111,6 +123,16 @@ export interface ShadowSpreadParams {
   maxProfitUsd: number;
   breakevens: number[];
   spot: number;
+  /**
+   * TRA-1145 — per-trade max-loss cap (fraction of equity) to apply at the
+   * paper book's pre-trade gate, set from the selector's own advisory
+   * `riskFraction`. Without this the gate's 1% default rejects a single
+   * one-ATR-wing vertical on a high-priced index ETF (~1.3% defined risk on the
+   * $25k demo book), so bull-put / bear-call / debit verticals never reach the
+   * OOS journal even when the selector fires them. Optional — the live-capital
+   * advisory→capital bridge omits it and keeps the strict 1% engine default.
+   */
+  maxLossPctCap?: number;
 }
 
 /**
@@ -156,6 +178,14 @@ export function shadowSignalToSpreadParams(
     maxProfitUsd,
     breakevens: [],
     spot,
+    // TRA-1145 — admit the structure at the selector's advisory risk fraction
+    // (default 2%) rather than the gate's strict 1% default, so single-lot
+    // index-ETF verticals enter the demo OOS journal. Fall back to the shared
+    // demo cap when the signal carries no positive risk fraction.
+    maxLossPctCap:
+      signal.sizingIntent.riskFraction > 0
+        ? signal.sizingIntent.riskFraction
+        : DEMO_SPREAD_MAX_LOSS_PCT_CAP,
   };
 }
 

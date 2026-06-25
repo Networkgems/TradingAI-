@@ -2652,6 +2652,29 @@ describe('PaperOptionsAccount.openDefinedRiskSpread', () => {
     expect(acct.takeLastEntryRejection()).toBeNull();
   });
 
+  // TRA-1145 — the deterministic DEMO spread-routing paths pass the selector's
+  // own advisory riskFraction (2%) as `maxLossPctCap` so a single one-ATR-wing
+  // index-ETF vertical (the QQQ bull put live: $324 max loss = 1.30% of the $25k
+  // demo book) is ADMITTED to the OOS journal instead of silently rejected by
+  // the gate's strict 1% default. Without the override the same structure is
+  // rejected; with it, it opens.
+  it('admits a single-lot vertical over the 1% default when maxLossPctCap=2%', () => {
+    const params = spreadParams({ maxLossUsd: 324, netUsd: 76, maxProfitUsd: 76 });
+
+    // Strict 1% default on $25k → cap $250; $324 lot busts it → rejected.
+    const strict = new PaperOptionsAccount({ initialEquity: 25_000, managedAccountRatio: 0.5 });
+    expect(strict.openDefinedRiskSpread(params)).toBeNull();
+    expect(strict.takeLastEntryRejection()).toMatch(/exceeds 1\.00% cap/);
+
+    // Same book, same structure, with the selector's 2% advisory cap → admitted.
+    const relaxed = new PaperOptionsAccount({ initialEquity: 25_000, managedAccountRatio: 0.5 });
+    const pos = relaxed.openDefinedRiskSpread({ ...params, maxLossPctCap: 0.02 });
+    expect(pos).not.toBeNull();
+    expect(pos!.contracts).toBe(1);
+    expect(pos!.maxLossUsd).toBe(324);
+    expect(relaxed.getState().optionsCash).toBe(24_676);
+  });
+
   it('trims lots so reserved capital-at-risk stays inside the 1% cap', () => {
     // $50k equity → 1% cap = $500. managed=1.0 → RV budget = $1,000, which
     // would size a $180 max-loss lot to floor(1000/180)=5 lots. The cap

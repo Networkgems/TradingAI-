@@ -1345,6 +1345,17 @@ export class PaperOptionsAccount {
       /** Underlying spot at entry (for the position's underlyingEntryPrice). */
       spot: number;
       signalId?: string;
+      /**
+       * TRA-1145 — per-trade max-loss cap as a fraction of equity for the
+       * pre-trade gate. Absent → the engine default ({@link DEFAULT_MAX_LOSS_PCT_CAP},
+       * 1%). The deterministic DEMO spread-routing paths pass the selector's own
+       * advisory `riskFraction` (2%) here so a single defined-risk vertical on a
+       * high-priced index ETF — whose one-ATR wing defines ~1.3% risk on the $25k
+       * demo book — clears the gate and enters the OOS journal instead of being
+       * silently rejected. The live-capital advisory→capital bridge omits it and
+       * keeps the strict 1% default.
+       */
+      maxLossPctCap?: number;
     },
     mode: AccountMode = 'demo',
     /**
@@ -1418,10 +1429,17 @@ export class PaperOptionsAccount {
       );
 
     // TRA-912 (TRA-908 Phase B) — per-trade max-loss ceiling: never reserve
-    // capital-at-risk above 1% of equity on a single combo. Trim down to the
-    // cap; a single lot that already busts the cap can't be trimmed and is
-    // rejected below by the pre-trade gate.
-    const capLots = Math.floor((this.equity * DEFAULT_MAX_LOSS_PCT_CAP) / maxLossPerLot);
+    // capital-at-risk above the per-trade cap of equity on a single combo. Trim
+    // down to the cap; a single lot that already busts the cap can't be trimmed
+    // and is rejected below by the pre-trade gate.
+    // TRA-1145 — honour the caller's `maxLossPctCap` override (the demo
+    // spread-routing paths pass the selector's 2% advisory) so the trim and the
+    // gate below agree on the same ceiling; default stays the strict 1%.
+    const maxLossPctCap =
+      typeof params.maxLossPctCap === 'number' && params.maxLossPctCap > 0
+        ? params.maxLossPctCap
+        : DEFAULT_MAX_LOSS_PCT_CAP;
+    const capLots = Math.floor((this.equity * maxLossPctCap) / maxLossPerLot);
     if (capLots >= 1 && contracts > capLots) contracts = capLots;
 
     let totalRisk = contracts * maxLossPerLot;
@@ -1446,6 +1464,7 @@ export class PaperOptionsAccount {
       optionBuyingPower: null,
       maxLossPerLot,
       contracts,
+      maxLossPctCap,
     });
     if (!gate.allowed) {
       accountLog.warn('defined-risk spread rejected by pre-trade gate', {

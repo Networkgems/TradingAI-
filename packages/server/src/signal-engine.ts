@@ -47,7 +47,7 @@ import {
   computeStrategyIntrospection,
   optionJournalToStrategyRows,
 } from './strategy-introspection.js';
-import { isOptionShadowEnabled, isOptionPhaseBEnabled, emitShadowOptionSignal, shadowSignalToSpreadParams, OPTION_SHADOW_EMERGENCY_OFF } from './option-shadow-ledger.js';
+import { isOptionShadowEnabled, isOptionPhaseBEnabled, emitShadowOptionSignal, shadowSignalToSpreadParams, OPTION_SHADOW_EMERGENCY_OFF, DEMO_SPREAD_MAX_LOSS_PCT_CAP } from './option-shadow-ledger.js';
 import { isOptionExecEnabled, isOptionEmaPullbackEnabled, isOptionVolumeBreakoutEnabled, resolveRvLongDteOverride, resolveRvMinDailyVolume, isOptionDemoDirectionalEnabled } from './option-exec-flag.js';
 import { etDateString } from './scheduler.js';
 // TRA-995 (epic-C, self-regulation) — the standing risk autopilot. A pure
@@ -6022,6 +6022,14 @@ export class SignalEngine {
           maxProfitUsd: intent.maxProfitUsd,
           breakevens: intent.breakevens ?? [],
           spot: intent.spot,
+          // TRA-1145 — admit the structure at the selector's advisory risk
+          // fraction (2%) rather than the gate's strict 1% default. A normal
+          // one-wing index-ETF vertical (e.g. the QQB bull put: ~$320 max loss
+          // = 1.3% of the $25k demo book) otherwise busts the 1% per-trade cap
+          // as a single un-trimmable lot and the "Paper entry" silently fails.
+          // Demo-only path (no live capital); the live-capital advisory→capital
+          // bridge keeps the strict 1% default.
+          maxLossPctCap: DEMO_SPREAD_MAX_LOSS_PCT_CAP,
         },
         'demo',
         undefined,
