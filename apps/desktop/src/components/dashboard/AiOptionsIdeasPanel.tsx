@@ -72,6 +72,16 @@ interface OptionsIdea {
   dte: number;
   events: IdeaEvent[];
   legs: IdeaLeg[];
+  /**
+   * TRA-1121 — false when this idea's single-lot max loss busts the per-trade
+   * cap and the open path would 409 it. The card stays visible as research but
+   * `Paper entry` renders disabled with {@link entryBlockedReason} as tooltip.
+   * Absent on preview/non-live feeds (no account equity to gate against) ⇒
+   * treated as enterable.
+   */
+  enterable?: boolean;
+  /** TRA-1121 — the gate's verbatim reject reason when `enterable === false`. */
+  entryBlockedReason?: string;
 }
 
 interface OptionsIdeasFeed {
@@ -433,18 +443,29 @@ function IdeaCard({
             .join('  ')}
         </span>
         <span style={{ flex: 1 }} />
-        <button
-          className="btn-primary"
-          disabled={!canTrade || entering}
-          onClick={() => onPaperEnter(idea)}
-          title={
-            canTrade
-              ? 'Place a PAPER order for this defined-risk idea through the options account'
-              : 'Paper entry activates when the live AI Options Ideas feed lands (C4 / TRA-599)'
-          }
-        >
-          {entering ? 'Placing…' : 'Paper entry'}
-        </button>
+        {(() => {
+          // TRA-1121 — an idea the server flagged un-enterable (single-lot max
+          // loss busts the per-trade cap) keeps its card but its `Paper entry`
+          // button is dead, with the gate's verbatim reason as the tooltip —
+          // never a live button the gate would 409. `enterable === false` is the
+          // only blocked state; absent/true = enterable (preview/back-compat).
+          const blocked = idea.enterable === false;
+          const title = !canTrade
+            ? 'Paper entry activates when the live AI Options Ideas feed lands (C4 / TRA-599)'
+            : blocked
+              ? idea.entryBlockedReason ?? 'This idea exceeds the per-trade max-loss cap for the current paper book.'
+              : 'Place a PAPER order for this defined-risk idea through the options account';
+          return (
+            <button
+              className="btn-primary"
+              disabled={!canTrade || blocked || entering}
+              onClick={() => onPaperEnter(idea)}
+              title={title}
+            >
+              {entering ? 'Placing…' : blocked ? 'Paper entry blocked' : 'Paper entry'}
+            </button>
+          );
+        })()}
       </div>
     </div>
   );

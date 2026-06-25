@@ -706,6 +706,17 @@ export class PaperOptionsAccount {
     return r;
   }
 
+  /**
+   * TRA-1121 — current paper-book equity the per-trade max-loss cap is measured
+   * against. This is the SAME `this.equity` the pre-trade gate reads on the
+   * paper-enter open path (see {@link evaluateMultiLegPreTrade} call below), so
+   * the ideas feed can pre-flight an idea through the identical gate and disable
+   * `Paper entry` for un-enterable ideas instead of dangling a click that 409s.
+   */
+  getEquity(): number {
+    return this.equity;
+  }
+
   /** Current options daily cap — exposed so the UI can render a count badge. */
   getOptionsDailyTradesLimit(): number {
     return this.optionsDailyTradesLimit;

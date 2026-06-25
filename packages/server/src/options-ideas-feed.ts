@@ -19,6 +19,7 @@ import type {
   OptionsScannerCandidate,
 } from '@trading-app/agents';
 import type { OptionChainRow } from '@trading-app/engine';
+import { evaluateMultiLegPreTrade, DEFAULT_MAX_LOSS_PCT_CAP } from '@trading-app/engine';
 import type { DayTradingGuardrailConfig } from '@trading-app/shared';
 
 // ── UI contract (mirrors AiOptionsIdeasPanel.tsx) ────────────────────────────
@@ -66,6 +67,23 @@ export interface OptionsIdeaView {
    * for back-compat with non-live/preview views that don't model a structure.
    */
   priced?: boolean;
+  /**
+   * TRA-1121 (TRA-1118 "Flag" policy) — false when this idea's single-lot
+   * `maxLossUsd` busts the per-trade max-loss cap (`equity × maxLossPctCap`) and
+   * the open path would reject it. The panel keeps the card visible as research
+   * but renders `Paper entry` disabled. Computed through the SAME TRA-912 gate
+   * (`evaluateMultiLegPreTrade`) the paper-enter path uses, so the button's
+   * enabled state can never disagree with what a click would do. Optional and
+   * defaults to `true` for back-compat with preview/non-live views that have no
+   * account equity to gate against.
+   */
+  enterable?: boolean;
+  /**
+   * TRA-1121 — the gate's reject reason verbatim when `enterable === false`
+   * (e.g. `"max loss $2435.00 (9.74%) exceeds 1.00% cap $250.00"`), surfaced as
+   * the disabled `Paper entry` tooltip. Absent when the idea is enterable.
+   */
+  entryBlockedReason?: string;
 }
 
 export interface OptionsIdeasFeed {
@@ -418,6 +436,19 @@ export interface BuildFeedArgs {
   rowsBySymbol: Map<string, OptionChainRow[]>;
   guardrail: DayTradingGuardrailConfig;
   generatedAt: number;
+  /**
+   * TRA-1121 — the paper-options book equity to pre-flight each idea's
+   * single-lot max loss against (the SAME `equity` the open path's TRA-912 gate
+   * reads). When omitted (preview / non-live builds with no account), every idea
+   * is left `enterable: true` for back-compat — the open path's own gate still
+   * protects live entries.
+   */
+  accountEquityUsd?: number;
+  /**
+   * TRA-1121 — per-trade max-loss cap as a fraction of equity. Defaults to
+   * {@link DEFAULT_MAX_LOSS_PCT_CAP} (1%), matching the open-path gate default.
+   */
+  maxLossPctCap?: number;
 }
 
 export interface BuiltFeed {
@@ -445,7 +476,11 @@ export function noDayTradingBlock(guardrail: DayTradingGuardrailConfig): Options
  * anchor candidate are dropped (nothing to enter / price against).
  */
 export function buildOptionsIdeasFeed(args: BuildFeedArgs): BuiltFeed {
-  const { research, input, rowsBySymbol, guardrail, generatedAt } = args;
+  const { research, input, rowsBySymbol, guardrail, generatedAt, accountEquityUsd, maxLossPctCap } = args;
+  // TRA-1121 — only gate enterability when we actually have an account equity to
+  // measure the per-trade cap against. Preview / non-live builds pass none, and
+  // every idea stays `enterable` (the open path's own gate still protects them).
+  const gateEnterability = typeof accountEquityUsd === 'number' && Number.isFinite(accountEquityUsd);
   const symByTicker = new Map<string, OptionsResearchSymbol>();
   for (const s of input.symbols) symByTicker.set(s.symbol.toUpperCase(), s);
 
@@ -462,6 +497,30 @@ export function buildOptionsIdeasFeed(args: BuildFeedArgs): BuiltFeed {
 
     const structure = modelStructure(idea.strategy, anchor, sym.spot, rows, idea.maxLossUsd);
     const id = `live-${ticker.toLowerCase()}-${idea.strategy}-${idea.rank}`;
+
+    // TRA-1121 (TRA-1118 "Flag") — run the structure's SINGLE-LOT max loss
+    // through the SAME pre-trade gate the paper-enter path uses. A defined-risk
+    // combo can't be fractionally trimmed, so if one lot already busts the cap
+    // the open path hard-rejects it; the feed must flag it (not filter, not
+    // re-derive the inequality) so the panel disables `Paper entry` with the
+    // gate's verbatim reason. Skipped when no account equity was threaded.
+    let enterable = true;
+    let entryBlockedReason: string | undefined;
+    if (gateEnterability) {
+      const verdict = evaluateMultiLegPreTrade({
+        accountEquity: accountEquityUsd as number,
+        // The paper book has no live broker hold to mirror — same as the open
+        // path; the per-trade max-loss cap is the binding feed constraint.
+        optionBuyingPower: null,
+        maxLossPerLot: structure.maxLossUsd,
+        contracts: 1,
+        ...(maxLossPctCap != null ? { maxLossPctCap } : {}),
+      });
+      if (!verdict.allowed) {
+        enterable = false;
+        entryBlockedReason = verdict.reason;
+      }
+    }
 
     ideas.push({
       id,
@@ -481,7 +540,18 @@ export function buildOptionsIdeasFeed(args: BuildFeedArgs): BuiltFeed {
       catalystHorizon: idea.catalystHorizon,
       legs: structure.legs,
       priced: structure.priced,
+      // Only stamp enterability when we actually gated (back-compat: preview /
+      // non-live views omit it and the panel treats the idea as enterable).
+      ...(gateEnterability ? { enterable } : {}),
+      ...(entryBlockedReason ? { entryBlockedReason } : {}),
     });
+
+    // TRA-1121 — guard the entry intent: an un-enterable idea registers NO
+    // intent, so even a stale panel click on a (disabled) button or a direct
+    // POST …/paper-enter is rejected as "idea not found" rather than reaching
+    // the open path. The button is the user-facing guard; this is defense in
+    // depth so the feed flag and the entry surface can't drift.
+    if (!enterable) continue;
 
     intents.set(id, {
       ticker,

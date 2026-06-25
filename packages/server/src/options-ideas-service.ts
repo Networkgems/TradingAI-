@@ -171,6 +171,14 @@ export interface BuildIdeasOptions {
   now?: number;
   /** Bypass the process feed cache (tests). */
   noCache?: boolean;
+  /**
+   * TRA-1121 — the authed user's paper-options book equity. Threaded into the
+   * feed builder so each idea's single-lot max loss is pre-flighted through the
+   * same TRA-912 gate the paper-enter path uses; ideas that bust the per-trade
+   * cap come back `enterable:false` with the gate's reason. Omitted → ideas are
+   * left enterable (the open path's own gate still protects entries).
+   */
+  accountEquityUsd?: number;
 }
 
 /**
@@ -202,7 +210,13 @@ export async function buildIdeasFeed(opts: BuildIdeasOptions): Promise<OptionsId
   // with the same universe but different credentials (e.g. one with a console
   // key, one falling back to the rate-limited env token) must not share a
   // cached live-vs-non-live result. The prefix is a non-secret type marker.
-  const cacheKey = `${cred.mode}:${cred.prefix}|${symbols.slice().sort().join(',')}`;
+  // TRA-1121 — fold the gating equity into the key: the feed cache is
+  // process-wide (shared across users), and enterability is a function of book
+  // equity. Two callers with the same universe but different equity must not
+  // share a feed whose `enterable` flags were computed against the other's cap.
+  // Bucket to whole dollars so sub-dollar mark drift doesn't thrash the cache.
+  const equityKey = typeof opts.accountEquityUsd === 'number' ? Math.round(opts.accountEquityUsd) : 'na';
+  const cacheKey = `${cred.mode}:${cred.prefix}|eq=${equityKey}|${symbols.slice().sort().join(',')}`;
 
   if (!opts.noCache && feedCache && feedCache.key === cacheKey && now - feedCache.builtAt < FEED_TTL_MS) {
     return feedCache.feed;
@@ -318,6 +332,8 @@ export async function buildIdeasFeed(opts: BuildIdeasOptions): Promise<OptionsId
     rowsBySymbol,
     guardrail,
     generatedAt: now,
+    // TRA-1121 — pre-flight enterability against the user's paper book equity.
+    ...(typeof opts.accountEquityUsd === 'number' ? { accountEquityUsd: opts.accountEquityUsd } : {}),
   });
   entryIntents.clear();
   for (const [id, intent] of intents) entryIntents.set(id, intent);

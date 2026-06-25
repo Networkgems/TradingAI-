@@ -1,5 +1,6 @@
 import { describe, it, expect } from 'vitest';
 import type { OptionChainRow } from '@trading-app/engine';
+import { evaluateMultiLegPreTrade } from '@trading-app/engine';
 import type {
   OptionsResearchResult,
   OptionsResearchInput,
@@ -232,5 +233,95 @@ describe('buildOptionsIdeasFeed', () => {
       generatedAt: 1,
     });
     expect(feed.ideas).toHaveLength(0);
+  });
+
+  // TRA-1121 (TRA-1118 "Flag" policy) — the modeled bull put spread above has a
+  // single-lot max loss of $380. At a $25k book (1% cap = $250) that busts the
+  // per-trade cap; at a $100k book (1% cap = $1000) it fits.
+  describe('enterability gate (TRA-1121)', () => {
+    it('flags an idea whose single-lot max loss busts the per-trade cap: enterable:false + reason + intent guarded', () => {
+      const { feed, intents } = buildOptionsIdeasFeed({
+        research,
+        input,
+        rowsBySymbol,
+        guardrail: DAY_TRADING_GUARDRAIL,
+        generatedAt: 1,
+        accountEquityUsd: 25_000, // 1% cap = $250 < $380 max loss
+      });
+      const idea = feed.ideas[0]!;
+      expect(idea.maxLossUsd).toBeCloseTo(380, 4);
+      expect(idea.enterable).toBe(false);
+      expect(idea.entryBlockedReason).toBeTruthy();
+      // No enabled-button path: the intent is omitted so a direct POST is a 404,
+      // not a reach into the open path that the gate would 409.
+      expect(intents.has(idea.id)).toBe(false);
+    });
+
+    it('leaves an idea within the cap enterable:true with its intent intact', () => {
+      const { feed, intents } = buildOptionsIdeasFeed({
+        research,
+        input,
+        rowsBySymbol,
+        guardrail: DAY_TRADING_GUARDRAIL,
+        generatedAt: 1,
+        accountEquityUsd: 100_000, // 1% cap = $1000 > $380 max loss
+      });
+      const idea = feed.ideas[0]!;
+      expect(idea.enterable).toBe(true);
+      expect(idea.entryBlockedReason).toBeUndefined();
+      expect(intents.has(idea.id)).toBe(true);
+    });
+
+    it('omits enterable for back-compat when no account equity is threaded', () => {
+      const { feed, intents } = buildOptionsIdeasFeed({
+        research,
+        input,
+        rowsBySymbol,
+        guardrail: DAY_TRADING_GUARDRAIL,
+        generatedAt: 1,
+      });
+      const idea = feed.ideas[0]!;
+      expect(idea.enterable).toBeUndefined();
+      expect(idea.entryBlockedReason).toBeUndefined();
+      expect(intents.has(idea.id)).toBe(true);
+    });
+
+    it('feed enterability equals the gate result (one source of truth, no re-derived threshold)', () => {
+      const accountEquityUsd = 25_000;
+      const { feed } = buildOptionsIdeasFeed({
+        research,
+        input,
+        rowsBySymbol,
+        guardrail: DAY_TRADING_GUARDRAIL,
+        generatedAt: 1,
+        accountEquityUsd,
+      });
+      const idea = feed.ideas[0]!;
+      // Independently run the SAME gate the open path uses; the feed flag and the
+      // reason must match it verbatim — never an independently-derived inequality.
+      const verdict = evaluateMultiLegPreTrade({
+        accountEquity: accountEquityUsd,
+        optionBuyingPower: null,
+        maxLossPerLot: idea.maxLossUsd,
+        contracts: 1,
+      });
+      expect(verdict.allowed).toBe(false);
+      expect(idea.enterable).toBe(false);
+      if (!verdict.allowed) expect(idea.entryBlockedReason).toBe(verdict.reason);
+    });
+
+    it('honors a custom maxLossPctCap', () => {
+      // A 2% cap on $25k = $500 > $380 → now enterable.
+      const { feed } = buildOptionsIdeasFeed({
+        research,
+        input,
+        rowsBySymbol,
+        guardrail: DAY_TRADING_GUARDRAIL,
+        generatedAt: 1,
+        accountEquityUsd: 25_000,
+        maxLossPctCap: 0.02,
+      });
+      expect(feed.ideas[0]!.enterable).toBe(true);
+    });
   });
 });

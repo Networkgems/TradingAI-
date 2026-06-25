@@ -5849,6 +5849,18 @@ export class SignalEngine {
   }
 
   /**
+   * TRA-1121 — the active paper-options book equity the per-trade max-loss cap
+   * is measured against. Routed off the SAME account (`optionsAccounts[tradierEnv]`)
+   * the {@link enterPaperOptionsIdea} open path targets, so the ideas feed can
+   * pre-flight each idea's single-lot max loss through the identical TRA-912
+   * gate and flag un-enterable ideas (`enterable:false` + reason) instead of
+   * surfacing a `Paper entry` button that always 409s.
+   */
+  getOptionsAccountEquity(): number {
+    return this.optionsAccounts[this.tradierEnv].getEquity();
+  }
+
+  /**
    * TRA-598 (C3) — no-day-trading discretionary-close gate for a user-initiated
    * option close. Runs the owning account's {@link PaperOptionsAccount.checkDayTradingClose}
    * across both env buckets so the `/api/options/:id/close` handler can refuse a

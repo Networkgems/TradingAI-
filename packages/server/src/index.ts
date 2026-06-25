@@ -2126,7 +2126,12 @@ app.get('/api/options/ideas', requireAuth, async (_req, res) => {
   // server env credential, so a Claude Max user can make the feed live without
   // any Render access.
   const anthropicApiKey = getUserAnthropicApiKey(ctx.username);
-  const feed = await buildIdeasFeed({ client, symbols, anthropicApiKey });
+  // TRA-1121 — thread the paper-options book equity so the feed pre-flights each
+  // idea's single-lot max loss through the same TRA-912 gate the paper-enter
+  // path uses, flagging un-enterable ideas (`enterable:false` + reason) instead
+  // of surfacing a `Paper entry` button that always 409s.
+  const accountEquityUsd = ctx.engine.getOptionsAccountEquity();
+  const feed = await buildIdeasFeed({ client, symbols, anthropicApiKey, accountEquityUsd });
   res.json(feed);
 });
 
