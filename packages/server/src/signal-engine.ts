@@ -2118,8 +2118,18 @@ export class SignalEngine {
     // time-stop) before the hard SL backstop fires. Only built when the flag is
     // on; undefined → options-account skips the structural path entirely so
     // prod behaviour is unchanged until QuantTrader signs off.
+    //
+    // TRA-1123 — ALSO build it unconditionally for the DEMO book. Demo is the
+    // research/scoring journal (no live capital, independent of TRA-382): its
+    // single-leg directional opens are the cheap path to organic closed>0, but
+    // on a calm tape they never hit the hard SL / TP1 and would otherwise sit
+    // OPEN until 30-45 DTE expiry. The time-stop (barsHeld>=5 with no >5%
+    // follow-through) and supertrend/MA20 structure exits are exactly what folds
+    // a resolved row so the option journal can reach closed>0. Scoped to
+    // `this.mode === 'demo'` so the LIVE exec gate stays untouched (the filter
+    // below already restricts to positions of `this.mode`).
     let rvStructuralExitStates: Map<string, ExitState> | undefined;
-    if (isOptionExecEnabled()) {
+    if (isOptionExecEnabled() || this.mode === 'demo') {
       const openRvPositions = this.optionsAccount.getState().openOptions.filter(
         (p) => p.signalType === 'relative_value' && !p.legs && (p.mode ?? 'demo') === this.mode,
       );
