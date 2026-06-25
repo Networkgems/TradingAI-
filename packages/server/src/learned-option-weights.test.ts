@@ -50,6 +50,7 @@ describe('bucket helpers', () => {
     expect(ivRankBand(60)).toBe('high');
     expect(ivRankBand(40)).toBe('mid');
     expect(ivRankBand(10)).toBe('low');
+    expect(ivRankBand(null)).toBe('unknown'); // TRA-1103 honest-unknown RV/AI-ideas rows
     expect(sentimentBand(0.4)).toBe('bullish');
     expect(sentimentBand(-0.4)).toBe('bearish');
     expect(sentimentBand(0)).toBe('neutral');
@@ -127,6 +128,19 @@ describe('computeOptionLearnedWeights', () => {
     expect(w.byTrend.find((x) => x.key === 'up')!.confident).toBe(true);
     expect(w.bySentiment.find((x) => x.key === 'bullish')!.confident).toBe(true);
     expect(w.byDte.find((x) => x.key === '30to45')!.confident).toBe(true);
+  });
+
+  it('buckets TRA-1103 null-ivRank rows under unknown, away from the graded IV bands', () => {
+    // 20 graded `high`-IV rows + 8 honest-unknown (ivRank: null) RV/AI-ideas rows.
+    const rows = [
+      ...bucket(20, 16), // ivRank 60 -> 'high'
+      ...bucket(8, 6, { ivRank: null }), // TRA-1103 -> 'unknown'
+    ];
+    const w = computeOptionLearnedWeights(rows);
+    const high = w.byIvRank.find((x) => x.key === 'high')!;
+    expect(high.resolved).toBe(20); // null rows did NOT contaminate the graded band
+    const unknown = w.byIvRank.find((x) => x.key === 'unknown')!;
+    expect(unknown.resolved).toBe(8);
   });
 
   it('folds the TRA-993 sentiment-IC band as a 6th dimension; ungraded rows bucket under unknown', () => {

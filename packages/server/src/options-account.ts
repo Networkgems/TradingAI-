@@ -58,8 +58,14 @@ import {
 // caller omits it (or the journal flag is off) the open path simply records
 // nothing, so journaling never changes execution.
 export interface OptionTradeJournalSetup {
-  /** IV-rank at entry, 0–100. */
-  ivRank: number;
+  /**
+   * IV-rank at entry, 0–100, or `null` for the honest-unknown case. The
+   * high-volume RV single-leg path (TRA-1103) journals with `null` rather than
+   * lifting a per-symbol ATM-IV chain fetch out of the exec-gated block just to
+   * record an IV band (the bqb1 event-loop risk, TRA-1082/TRA-1087). Null folds
+   * into the learner's `unknown` IV-rank bucket.
+   */
+  ivRank: number | null;
   /** Daily-trend regime the trend gate saw at entry. */
   trend: JournalTrend;
   /** Net news+social sentiment [-1,+1]; null/omitted when unavailable. */

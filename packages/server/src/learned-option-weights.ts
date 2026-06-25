@@ -93,8 +93,14 @@ function clamp(x: number, lo: number, hi: number): number {
   return Math.min(hi, Math.max(lo, x));
 }
 
-/** IV-rank (0–100) → coarse band the selector's premium gate cares about. */
-export function ivRankBand(ivRank: number): 'low' | 'mid' | 'high' {
+/**
+ * IV-rank (0–100) → coarse band the selector's premium gate cares about. A `null`
+ * IV-rank (the TRA-1103 honest-unknown RV path, which deliberately does not pay
+ * for an ATM-IV chain fetch just to journal) buckets under `unknown`, kept out of
+ * the graded low/mid/high buckets — the same pattern as {@link sentimentIcBandKey}.
+ */
+export function ivRankBand(ivRank: number | null): 'low' | 'mid' | 'high' | 'unknown' {
+  if (ivRank === null) return 'unknown';
   if (ivRank >= 50) return 'high';
   if (ivRank <= 25) return 'low';
   return 'mid';

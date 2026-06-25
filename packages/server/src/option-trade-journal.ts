@@ -79,8 +79,15 @@ export interface OptionTradeJournalOpen {
   structure: string;
   /** Book the trade lives in (keeps demo learning from contaminating live). */
   mode: 'demo' | 'live';
-  /** IV-rank at entry, 0–100 (the selector's core premium gate). */
-  ivRank: number;
+  /**
+   * IV-rank at entry, 0–100 (the selector's core premium gate). `null` is the
+   * honest-unknown value: the high-volume RV single-leg path (TRA-1103) journals
+   * without an IV-rank rather than lifting a per-symbol ATM-IV chain fetch out of
+   * the exec-gated block (the bqb1 event-loop-starvation risk in TRA-1082 /
+   * TRA-1087). Null rows bucket under the fold's `unknown` IV-rank band and never
+   * pollute the low/mid/high learned buckets.
+   */
+  ivRank: number | null;
   /** Daily-trend regime the trend gate saw at entry. */
   trend: JournalTrend;
   /** Net news+social sentiment at entry, clamped [-1, +1]; null if unknown. */

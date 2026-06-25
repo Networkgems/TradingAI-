@@ -65,7 +65,7 @@ import { fetchMinuteBars, fetchDailyCandles, fetchQuotes, fetchStocksNews, isYah
 import { fetchStockTwitsStream, fetchStockTwitsUserStream, getCuratedStockTwitsAccounts } from './stocktwits-feed.js';
 import { evaluateFeedFreshness } from './feed-freshness.js';
 import { PaperAccount } from './paper-account.js';
-import { PaperOptionsAccount } from './options-account.js';
+import { PaperOptionsAccount, type OptionTradeJournalSetup } from './options-account.js';
 import {
   PENDING_CLOSE_MAX_REPRICE_STEPS,
   PENDING_CLOSE_REPRICE_STALENESS_MS,
@@ -378,6 +378,19 @@ const SMA200_SIGNAL_VALID_MS = 5 * 24 * 60 * 60_000;
  * Live falls back to the demo field when the live counterpart is absent so
  * settings saved before TRA-327 still surface a cap instead of `undefined`.
  */
+/**
+ * TRA-1103 — coarse trend regime for an AI-ideas defined-risk spread, derived
+ * from the strategy id alone (no chain fetch). Bull structures journal as `up`,
+ * bear as `down`, everything else (iron condors, ambiguous debit spreads) as the
+ * honest `sideways`. Observe-only; this never gates an open.
+ */
+function trendFromSpreadStrategy(strategy: string): OptionTradeJournalSetup['trend'] {
+  const s = strategy.toLowerCase();
+  if (s.includes('bull')) return 'up';
+  if (s.includes('bear')) return 'down';
+  return 'sideways';
+}
+
 function activeOptionsDailyLimit(settings?: AccountSettings): number | undefined {
   if (!settings) return undefined;
   if (settings.mode === 'live') {
@@ -3356,11 +3369,30 @@ export class SignalEngine {
         // signal's `entryPrice` is the option mark, not the underlying).
         const underlyingSpot =
           typeof result.spot === 'number' && result.spot > 0 ? result.spot : undefined;
+        // TRA-1103 — journal the RV single-leg open (observe-only, behind
+        // ENABLE_OPTION_TRADE_JOURNAL). This is the high-volume demo fill path
+        // that previously recorded nothing (only the Phase-B spread path did),
+        // so the journal read `total=0` after a full RTH session even while the
+        // book traded. `ivRank: null` is the deliberate honest-unknown value:
+        // IV-rank is only computed inside the exec-gated block at ~:3115, and
+        // lifting `getSelectorChain`/ATM-IV out of that gate just to journal
+        // would re-introduce the per-tick per-symbol chain fetch that starved
+        // the bqb1 event loop (TRA-1082 / TRA-1087 / TRA-1089). `trend` is read
+        // from the already-computed `trendSide` (call→up, put→down, null→sideways).
+        const rvJournalSetup: OptionTradeJournalSetup = {
+          ivRank: null,
+          trend: trendSide === 'call' ? 'up' : trendSide === 'put' ? 'down' : 'sideways',
+          entryDelta: cheap.delta,
+          sentiment: null,
+          sentimentIcBand: null,
+          agentConviction: null,
+        };
         const opened = this.optionsAccount.openOptionFromRvCandidate(
           signal,
           this.mode,
           liveEquity,
           underlyingSpot,
+          rvJournalSetup,
         );
         if (!opened) continue;
 
@@ -5531,10 +5563,23 @@ export class SignalEngine {
       typeof intent.maxLossUsd === 'number' &&
       typeof intent.maxProfitUsd === 'number'
     ) {
+      // TRA-1103 — journal the AI-ideas defined-risk spread open (observe-only,
+      // behind ENABLE_OPTION_TRADE_JOURNAL). `ivRank: null` (no IV-rank rides on
+      // the idea intent and the no-cost rule applies — see the RV path above);
+      // trend is read from the strategy's directional bias.
+      const spreadStrategy = intent.strategy ?? 'defined_risk_spread';
+      const spreadJournalSetup: OptionTradeJournalSetup = {
+        ivRank: null,
+        trend: trendFromSpreadStrategy(spreadStrategy),
+        entryDelta: intent.delta,
+        sentiment: null,
+        sentimentIcBand: null,
+        agentConviction: null,
+      };
       const combo = acct.openDefinedRiskSpread(
         {
           symbol: intent.ticker,
-          strategy: intent.strategy ?? 'defined_risk_spread',
+          strategy: spreadStrategy,
           legs,
           netUsd: intent.netUsd,
           maxLossUsd: intent.maxLossUsd,
@@ -5543,6 +5588,8 @@ export class SignalEngine {
           spot: intent.spot,
         },
         'demo',
+        undefined,
+        spreadJournalSetup,
       );
       if (combo) {
         this.tracker?.saveEquity(
@@ -5577,11 +5624,24 @@ export class SignalEngine {
       delta: intent.delta,
       reason: 'AI Options Ideas paper entry',
     };
+    // TRA-1103 — journal the AI-ideas single-leg open (observe-only, behind
+    // ENABLE_OPTION_TRADE_JOURNAL). `ivRank: null` (no IV-rank on the idea intent,
+    // no-cost rule); trend from the contract direction (call→up, put→down);
+    // entryDelta from the anchor contract delta.
+    const singleLegJournalSetup: OptionTradeJournalSetup = {
+      ivRank: null,
+      trend: intent.optionType === 'call' ? 'up' : 'down',
+      entryDelta: intent.delta,
+      sentiment: null,
+      sentimentIcBand: null,
+      agentConviction: null,
+    };
     const opened = acct.openOptionFromRvCandidate(
       signal,
       'demo',
       undefined,
       intent.spot,
+      singleLegJournalSetup,
     );
     if (opened) {
       this.tracker?.saveEquity(

@@ -18,6 +18,10 @@ import {
   OPTION_SHADOW_FLAG,
 } from './option-shadow-ledger.js';
 import { setIvStoreFileForTests, initIvRankStore } from './iv-rank-store.js';
+import {
+  setOptionTradeJournalFileForTests,
+  listOptionTradeJournal,
+} from './option-trade-journal.js';
 import { PaperAccount } from './paper-account.js';
 import type { RelativeValueScannerService, RelativeValueScanResult, SelectorChainSnapshot } from './relative-value-scanner.js';
 import type { RelativeValueCandidate, TradierAccountBalance, TradierOptionsClient, TradierOrderClient, ReversalChecklist, SrZone } from '@trading-app/engine';
@@ -3675,6 +3679,109 @@ describe('SignalEngine.enterPaperOptionsIdea — single vs multi-leg routing (TR
     expect(pos).not.toBeNull();
     expect(pos!.optionSymbol).toBe('AAPL240705P00095000');
     expect(pos!.legs).toBeUndefined();
+  });
+});
+
+// TRA-1103 — the AI-ideas demo open paths now pass a `journalSetup` so the
+// high-volume fills actually land in the option-trade journal (root cause of
+// `option-journal total=0` on bqb1: only the Phase-B spread path journalled).
+// The RV single-leg scan call site (signal-engine.ts:~3359) is structurally
+// identical — same `openOptionFromRvCandidate(..., journalSetup)` call with the
+// same honest-unknown `ivRank: null` — and the account-side emit is covered by
+// options-account-journal.test.ts; here we lock the engine wiring end-to-end.
+describe('SignalEngine.enterPaperOptionsIdea — option-trade journal wiring (TRA-1103)', () => {
+  const baseIntent = {
+    ticker: 'AAPL',
+    optionSymbol: 'AAPL240705C00105000',
+    optionType: 'call' as const,
+    strike: 105,
+    expiration: '2024-07-05',
+    mark: 1.5,
+    delta: 0.32,
+    spot: 100,
+  };
+  const spreadIntent = {
+    ...baseIntent,
+    optionSymbol: 'AAPL240705P00095000',
+    optionType: 'put' as const,
+    strike: 95,
+    strategy: 'bull_put_spread',
+    legs: [
+      { action: 'sell' as const, optionType: 'put' as const, strike: 95, expiration: '2024-07-05' },
+      { action: 'buy' as const, optionType: 'put' as const, strike: 94, expiration: '2024-07-05' },
+    ],
+    // Per-lot max loss kept under the demo book's ~1%-of-equity per-trade cap
+    // (~$250 on the default $25k managed book) so the spread actually opens and
+    // we can assert it journalled — the wiring under test, not the sizing gate.
+    netUsd: 60,
+    maxLossUsd: 40,
+    maxProfitUsd: 60,
+    breakevens: [94.4],
+  };
+
+  let journalFile: string;
+  let counter = 0;
+
+  beforeEach(() => {
+    process.env['ENABLE_OPTION_TRADE_JOURNAL'] = '1';
+    journalFile = join(tmpdir(), `tra1103-journal-${process.pid}-${counter++}.jsonl`);
+    setOptionTradeJournalFileForTests(journalFile);
+  });
+  afterEach(() => {
+    delete process.env['ENABLE_OPTION_TRADE_JOURNAL'];
+    setOptionTradeJournalFileForTests(null);
+    rmSync(journalFile, { force: true });
+  });
+
+  function demoEngine(): SignalEngine {
+    return new SignalEngine({ ...DEFAULT_ACCOUNT_SETTINGS, mode: 'demo', liveTradierEnvOptions: 'sandbox' });
+  }
+
+  it('single-leg AI idea writes exactly one OPEN row then a folded CLOSE (flag on)', async () => {
+    const engine = demoEngine();
+    const pos = engine.enterPaperOptionsIdea({ ...baseIntent });
+    expect(pos).not.toBeNull();
+    await engine.flushOptionTradeJournal();
+
+    let rows = await listOptionTradeJournal();
+    expect(rows).toHaveLength(1);
+    expect(rows[0]!.id).toBe(pos!.id);
+    expect(rows[0]!.structure).toBe('single_leg_rv');
+    expect(rows[0]!.outcome).toBe('OPEN');
+    expect(rows[0]!.ivRank).toBeNull(); // TRA-1103 honest-unknown (no per-tick chain fetch)
+    expect(rows[0]!.trend).toBe('up'); // call ⇒ up
+    expect(rows[0]!.entryDelta).toBeCloseTo(0.32, 5);
+
+    // Round-trip → the close folds onto the same id (proves summary.closed > 0).
+    engine.manualCloseOption(pos!.id, 3.0);
+    await engine.flushOptionTradeJournal();
+    rows = await listOptionTradeJournal();
+    expect(rows).toHaveLength(1);
+    expect(rows[0]!.outcome).not.toBe('OPEN');
+    expect(rows[0]!.closeTs).toBeDefined();
+  });
+
+  it('multi-leg AI idea writes one OPEN row with the canonical spread structure (flag on)', async () => {
+    const engine = demoEngine();
+    const pos = engine.enterPaperOptionsIdea({ ...spreadIntent });
+    expect(pos).not.toBeNull();
+    await engine.flushOptionTradeJournal();
+
+    const rows = await listOptionTradeJournal();
+    expect(rows).toHaveLength(1);
+    expect(rows[0]!.structure).toBe('bull_put'); // canonicalised from bull_put_spread
+    expect(rows[0]!.trend).toBe('up'); // bull strategy ⇒ up
+    expect(rows[0]!.ivRank).toBeNull();
+  });
+
+  it('writes nothing when the journal flag is off', async () => {
+    delete process.env['ENABLE_OPTION_TRADE_JOURNAL'];
+    const engine = demoEngine();
+    const pos = engine.enterPaperOptionsIdea({ ...baseIntent });
+    expect(pos).not.toBeNull();
+    engine.manualCloseOption(pos!.id, 3.0);
+    await engine.flushOptionTradeJournal();
+    expect(await listOptionTradeJournal()).toHaveLength(0);
   });
 });
 
