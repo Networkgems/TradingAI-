@@ -22,6 +22,7 @@
 import {
   type AccountMode,
   type AgentRecommendation,
+  type OptionProposalDetail,
   type ProposalStatus,
   type Side,
   type TradeProposal,
@@ -101,6 +102,56 @@ export function createProposal(input: CreateProposalInput): TradeProposal {
     mode: input.mode,
     conviction: input.conviction,
     verdict: input.verdict,
+    ...(input.note ? { note: input.note } : {}),
+    createdAt: input.createdAt,
+    status: 'pending',
+  };
+  proposals.set(proposal.id, proposal);
+  ownerOf.set(proposal.id, owner);
+  if (proposals.size > MAX_PROPOSALS) evictOldestResolved();
+  return proposal;
+}
+
+export interface CreateOptionsProposalInput {
+  user: string | undefined;
+  /** The accepted AI-idea's defined-risk structure + anchor contract. */
+  option: OptionProposalDetail;
+  createdAt: number;
+  /** Optional short analyst note surfaced on the proposal card. */
+  note?: string;
+}
+
+/**
+ * TRA-1140 — queue a pending `kind:'options'` proposal from an accepted AI Idea
+ * so it flows through the SAME approve/reject + caps/kill-switch rail equity
+ * proposals use. Idempotent per (user, ideaId): an OPEN options proposal for the
+ * same idea is returned unchanged rather than duplicated across clicks/ticks.
+ *
+ * The base {@link TradeProposal} fields are snapshotted from the option so the
+ * shared listing/caps code needs no special-casing: `symbol`=underlying ticker,
+ * `side`='buy', `size`=1 lot, `notional`=capped single-lot max loss (the
+ * capital-at-risk number the daily caps test against), `conviction`=POP,
+ * `mode`='demo' (paper-only), `verdict`='APPROVE'. `recommendationId`=ideaId.
+ */
+export function createOptionsProposal(input: CreateOptionsProposalInput): TradeProposal {
+  const owner = userKey(input.user);
+  const existing = listProposals({ user: input.user, status: 'pending' }).find(
+    p => p.kind === 'options' && p.option?.ideaId === input.option.ideaId,
+  );
+  if (existing) return existing;
+
+  const proposal: TradeProposal = {
+    id: nextProposalId(input.option.ideaId),
+    recommendationId: input.option.ideaId,
+    symbol: input.option.ticker,
+    side: 'buy',
+    size: 1,
+    notional: Math.max(0, input.option.maxLossUsd),
+    mode: 'demo',
+    conviction: input.option.pop,
+    verdict: 'APPROVE',
+    kind: 'options',
+    option: input.option,
     ...(input.note ? { note: input.note } : {}),
     createdAt: input.createdAt,
     status: 'pending',

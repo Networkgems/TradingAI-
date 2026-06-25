@@ -145,6 +145,8 @@ export interface IdeaEntryIntent {
   maxProfitUsd: number;
   /** TRA-613 — payoff breakeven underlying price(s). */
   breakevens: number[];
+  /** TRA-1140 — probability of profit on [0,1] (carried onto the options proposal). */
+  pop: number;
 }
 
 // ── event badges ─────────────────────────────────────────────────────────────
@@ -570,6 +572,7 @@ export function buildOptionsIdeasFeed(args: BuildFeedArgs): BuiltFeed {
       maxLossUsd: structure.maxLossUsd,
       maxProfitUsd: structure.maxProfitUsd,
       breakevens: structure.breakevens,
+      pop: idea.pop,
     });
   }
 

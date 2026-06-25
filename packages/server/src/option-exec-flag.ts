@@ -167,3 +167,32 @@ export const OPTION_RV_MIN_DAILY_VOLUME_VAR = 'OPTION_RV_MIN_DAILY_VOLUME';
 export function resolveRvMinDailyVolume(env: NodeJS.ProcessEnv = process.env): number {
   return parsePositiveInt(env[OPTION_RV_MIN_DAILY_VOLUME_VAR]) ?? 0;
 }
+
+// --------------------------------------------------------------------------
+// TRA-1140 (TRA-1139 board-approved unification) — route an accepted AI Idea
+// onto the SHARED proposal/execution rail (proposal-store + approve/reject +
+// caps + kill-switch) as a typed `options` proposal, instead of the bespoke
+// `POST …/paper-enter` direct open path.
+//
+// OFF by default. When OFF, `POST /api/options/ideas/:id/paper-enter` opens the
+// idea directly on the paper book exactly as before (byte-for-byte unchanged).
+// When ON, the same click instead queues a `kind:'options'` TradeProposal and
+// confirms it through the engine's shared execution gate, so both the Proposals
+// and AI-Ideas engines share ONE review/execution rail. Paper-only by
+// construction on BOTH branches (the open path is `mode:'demo'`); live-capital
+// wiring stays gated on TRA-382 regardless of this flag.
+//
+// NOTE: routing through the shared gate means the SAME kill-switches that gate
+// equity proposals now gate an AI-idea entry on this path — the env kill
+// (TRADING_AGENTS_LLM_DISABLED), the per-user Trading-Agents banner toggle, the
+// risk circuit-breaker halt, the demo auto-trade toggle, and the demo daily
+// caps. A blocked confirm leaves the proposal pending and returns the gate's
+// verbatim reason (orders are never silently dropped).
+// --------------------------------------------------------------------------
+
+export const OPTIONS_PROPOSAL_RAIL_FLAG = 'ENABLE_OPTIONS_PROPOSAL_RAIL';
+
+/** True iff the AI-Ideas → shared-proposal-rail flag is enabled (1/true/yes/on). */
+export function isOptionsProposalRailEnabled(env: NodeJS.ProcessEnv = process.env): boolean {
+  return flagOn(env[OPTIONS_PROPOSAL_RAIL_FLAG]);
+}

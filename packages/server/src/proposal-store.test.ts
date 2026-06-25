@@ -12,6 +12,7 @@ vi.mock('./observability/index.js', () => ({
 
 import {
   createProposal,
+  createOptionsProposal,
   getProposal,
   listProposals,
   setProposalStatus,
@@ -20,7 +21,9 @@ import {
   proposalTtlMs,
   resetProposalStoreForTests,
   type CreateProposalInput,
+  type CreateOptionsProposalInput,
 } from './proposal-store.js';
+import type { OptionProposalDetail } from '@trading-app/shared';
 
 const T0 = Date.parse('2026-06-18T16:00:00Z');
 
@@ -102,6 +105,79 @@ describe('proposal-store — TRA-941 Piece 2 queue', () => {
     const p = createProposal(input());
     expireStaleProposals(T0 + 1);
     expect(getProposal(p.id)?.status).toBe('pending');
+  });
+});
+
+// TRA-1140 — an accepted AI Idea queues a typed `options` proposal on the SAME
+// store, so it shares the pending-queue + approve/reject + caps rail.
+describe('proposal-store — TRA-1140 options proposals', () => {
+  beforeEach(() => resetProposalStoreForTests());
+  beforeEach(() => errorSpy.mockClear());
+
+  function optionDetail(overrides: Partial<OptionProposalDetail> = {}): OptionProposalDetail {
+    return {
+      ideaId: 'live-aapl-bull_put_spread-1',
+      ticker: 'AAPL',
+      strategy: 'Bull Put Spread',
+      legs: [
+        { action: 'sell', optionType: 'put', strike: 95, expiration: '2026-07-17' },
+        { action: 'buy', optionType: 'put', strike: 90, expiration: '2026-07-17' },
+      ],
+      pop: 0.72,
+      riskReward: 0.5625,
+      maxLossUsd: 320,
+      maxProfitUsd: 180,
+      netUsd: 180,
+      breakevens: [93.2],
+      optionSymbol: 'AAPL260717P00095000',
+      optionType: 'put',
+      strike: 95,
+      expiration: '2026-07-17',
+      mark: 1.8,
+      delta: -0.3,
+      spot: 96.4,
+      ...overrides,
+    };
+  }
+
+  function optInput(overrides: Partial<CreateOptionsProposalInput> = {}): CreateOptionsProposalInput {
+    return { user: 'alice', option: optionDetail(), createdAt: T0, ...overrides };
+  }
+
+  it('snapshots the base fields from the option (kind=options, demo, 1-lot, maxLoss notional)', () => {
+    const p = createOptionsProposal(optInput());
+    expect(p.kind).toBe('options');
+    expect(p.status).toBe('pending');
+    expect(p.mode).toBe('demo');
+    expect(p.side).toBe('buy');
+    expect(p.size).toBe(1);
+    expect(p.symbol).toBe('AAPL');
+    expect(p.notional).toBe(320); // capped single-lot max loss
+    expect(p.conviction).toBe(0.72); // POP
+    expect(p.recommendationId).toBe('live-aapl-bull_put_spread-1');
+    expect(p.option?.legs.length).toBe(2);
+  });
+
+  it('is idempotent per (user, ideaId) while pending', () => {
+    const a = createOptionsProposal(optInput());
+    const b = createOptionsProposal(optInput()); // same ideaId, still pending
+    expect(b.id).toBe(a.id);
+    expect(listProposals({ user: 'alice', status: 'pending' }).length).toBe(1);
+  });
+
+  it('re-proposes once the prior options proposal is resolved', () => {
+    const a = createOptionsProposal(optInput());
+    setProposalStatus(a.id, 'executed', T0 + 1);
+    const b = createOptionsProposal(optInput());
+    expect(b.id).not.toBe(a.id);
+    expect(b.status).toBe('pending');
+  });
+
+  it('does not collide with an equity proposal sharing an id space', () => {
+    createProposal(input({ user: 'alice', recommendationId: 'agent-AAPL-1' }));
+    const opt = createOptionsProposal(optInput());
+    expect(opt.kind).toBe('options');
+    expect(listProposals({ user: 'alice', status: 'pending' }).length).toBe(2);
   });
 });
 

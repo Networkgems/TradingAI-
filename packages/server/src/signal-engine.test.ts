@@ -23,6 +23,7 @@ import {
   listOptionTradeJournal,
 } from './option-trade-journal.js';
 import { OPTION_DEMO_DIRECTIONAL_FLAG } from './option-exec-flag.js';
+import { resetProposalStoreForTests, listProposals, getProposal } from './proposal-store.js';
 import { PaperAccount } from './paper-account.js';
 import type { RelativeValueScannerService, RelativeValueScanResult, SelectorChainSnapshot } from './relative-value-scanner.js';
 import type { RelativeValueCandidate, TradierAccountBalance, TradierOptionsClient, TradierOrderClient, ReversalChecklist, SrZone } from '@trading-app/engine';
@@ -3680,6 +3681,97 @@ describe('SignalEngine.enterPaperOptionsIdea — single vs multi-leg routing (TR
     expect(pos).not.toBeNull();
     expect(pos!.optionSymbol).toBe('AAPL240705P00095000');
     expect(pos!.legs).toBeUndefined();
+  });
+});
+
+// TRA-1140 — an accepted AI Idea routes onto the SHARED proposal/execution rail
+// (typed `options` proposal → shared execution gate → paper open) instead of the
+// bespoke direct open. Same fake-clock pin (TRADING_TIME) so the C3 DTE floor
+// passes; the proposal store is process-global so we reset it per test.
+describe('SignalEngine.enterOptionsIdeaViaProposal — shared proposal rail (TRA-1140)', () => {
+  const baseIntent = {
+    ticker: 'AAPL',
+    optionSymbol: 'AAPL240705P00095000',
+    optionType: 'put' as const,
+    strike: 95,
+    expiration: '2024-07-05',
+    mark: 1.5,
+    delta: -0.3,
+    spot: 100,
+    strategy: 'long_put',
+    legs: [] as { action: 'buy' | 'sell'; optionType: 'call' | 'put'; strike: number; expiration: string }[],
+    netUsd: -150,
+    maxLossUsd: 150,
+    maxProfitUsd: 400,
+    breakevens: [93.5],
+    pop: 0.55,
+    ideaId: 'live-aapl-long_put-1',
+  };
+
+  function demoEngine(): SignalEngine {
+    return new SignalEngine({ ...DEFAULT_ACCOUNT_SETTINGS, mode: 'demo', liveTradierEnvOptions: 'sandbox' });
+  }
+
+  beforeEach(() => resetProposalStoreForTests());
+
+  it('queues an options proposal and opens it through the shared gate when the kill-switch is clear', async () => {
+    const engine = demoEngine();
+    engine.setTradingAgents(true); // banner kill-switch clear (shared gate requirement)
+
+    const result = await engine.enterOptionsIdeaViaProposal({ ...baseIntent });
+
+    expect(result.ok).toBe(true);
+    expect(result.position).not.toBeNull();
+    expect(result.proposalId).toContain('prop-live-aapl-long_put-1');
+    // The proposal it created is marked executed (not left pending).
+    expect(getProposal(result.proposalId)?.status).toBe('executed');
+    expect(getProposal(result.proposalId)?.kind).toBe('options');
+    // And the paper book actually holds the opened position.
+    const open = engine.getState().options.openOptions;
+    expect(open.some(o => o.id === result.position!.id)).toBe(true);
+  });
+
+  it('leaves the proposal PENDING with the kill-switch reason when the banner toggle is OFF', async () => {
+    const engine = demoEngine();
+    engine.setTradingAgents(false); // banner OFF → shared kill-switch blocks execution
+
+    const result = await engine.enterOptionsIdeaViaProposal({ ...baseIntent });
+
+    expect(result.ok).toBe(false);
+    expect(result.position).toBeNull();
+    expect(result.reason).toContain('banner toggle is OFF');
+    // Order is never silently dropped: the proposal is still pending in the queue.
+    expect(getProposal(result.proposalId)?.status).toBe('pending');
+    expect(listProposals({ status: 'pending' }).some(p => p.id === result.proposalId)).toBe(true);
+    // Nothing opened.
+    expect(engine.getState().options.openOptions).toHaveLength(0);
+  });
+
+  it('does not double-open on a re-click after the idea already filled', async () => {
+    const engine = demoEngine();
+    engine.setTradingAgents(true);
+
+    const first = await engine.enterOptionsIdeaViaProposal({ ...baseIntent });
+    const second = await engine.enterOptionsIdeaViaProposal({ ...baseIntent });
+
+    expect(first.ok).toBe(true);
+    // The paper book's own already-open guard refuses the second open, so the
+    // re-click never double-opens (the meaningful safety guarantee).
+    expect(second.ok).toBe(false);
+    expect(engine.getState().options.openOptions).toHaveLength(1);
+  });
+
+  it('dedupes concurrent pending duplicates before either resolves (store idempotency)', async () => {
+    const engine = demoEngine();
+    engine.setTradingAgents(false); // block at the gate so the first stays PENDING
+
+    const first = await engine.enterOptionsIdeaViaProposal({ ...baseIntent });
+    const second = await engine.enterOptionsIdeaViaProposal({ ...baseIntent });
+
+    // Both blocked + pending → the store returns the SAME pending proposal, so a
+    // rapid double-click queues exactly one.
+    expect(first.proposalId).toBe(second.proposalId);
+    expect(listProposals({ status: 'pending' }).filter(p => p.kind === 'options')).toHaveLength(1);
   });
 });
 

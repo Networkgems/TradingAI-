@@ -18,6 +18,7 @@ import { adviseSymbol, resolveTradingAgentsLlm, buildNewsHeadlines, isTradingAge
 // audit trail.
 import {
   createProposal,
+  createOptionsProposal,
   getProposal,
   listProposals,
   setProposalStatus,
@@ -5318,6 +5319,15 @@ export class SignalEngine {
       setProposalStatus(id, 'expired', now);
       return { ok: false, reason: `proposal ${id} is stale — re-request` };
     }
+    if (proposal.kind === 'options') {
+      // TRA-1140 — options proposals are paper-only (`mode:'demo'`, separate
+      // book) and carry their full open intent on `proposal.option`, so they
+      // route through the paper-options open path rather than the equity signal
+      // path. They are NOT gated on `proposal.mode === this.mode`: the paper
+      // options book is independent of the engine's active equity mode.
+      const result = await this.routeOptionsProposal(proposal, now);
+      return { ok: result.ok, reason: result.reason };
+    }
     if (proposal.mode !== this.mode) {
       // The engine routes/sizes/caps against its active mode; refuse to confirm a
       // proposal raised in the other mode rather than route it under the wrong one.
@@ -5470,6 +5480,152 @@ export class SignalEngine {
   getPendingProposals(): TradeProposal[] {
     expireStaleProposals();
     return listProposals({ user: this.alertUsername, status: 'pending' });
+  }
+
+  /**
+   * TRA-1140 — confirm one pending OPTIONS proposal and open it on the paper
+   * options book. Runs the SAME shared execution gate equity proposals use
+   * (env kill, the Trading-Agents banner toggle, the risk-circuit-breaker halt,
+   * the demo auto-trade toggle, and the demo daily caps) BEFORE touching the
+   * book, evaluated against `mode:'demo'` since the book is paper-only. On a
+   * gate block the proposal stays PENDING with the gate reason; on an open
+   * refusal it stays pending with the account's specific reason (never silently
+   * dropped). On a fill it records cap usage + the audit entry and marks the
+   * proposal executed. Returns the opened position so the entry endpoint can
+   * surface the same payload the bespoke path did.
+   */
+  private async routeOptionsProposal(
+    proposal: TradeProposal,
+    now: number,
+  ): Promise<{ ok: boolean; reason: string; position: OptionPosition | null }> {
+    const detail = proposal.option;
+    if (!detail) return { ok: false, reason: `proposal ${proposal.id} has no options payload`, position: null };
+    // Shared execution gate, evaluated for the paper (demo) book. liveGateCleared
+    // is irrelevant in demo; notional is the capped single-lot max loss.
+    const gate = evaluateExecutionGate({
+      mode: 'demo',
+      bannerEnabled: this.tradingAgentsEnabled,
+      envKill: isTradingAgentsLlmDisabled(),
+      halted: this.riskGovernor.isHalted(),
+      autoTradeEnabled: this.autoTradingEnabledDemo,
+      liveGateCleared: true,
+      user: this.alertUsername,
+      notional: proposal.notional,
+      now,
+    });
+    if (!gate.allowed) {
+      return { ok: false, reason: gate.reason, position: null }; // proposal stays pending
+    }
+    // Reconstruct the open intent from the snapshotted structure and route it
+    // through the existing paper-options open path (single- vs multi-leg branch).
+    const pos = this.enterPaperOptionsIdea({
+      ticker: detail.ticker,
+      optionSymbol: detail.optionSymbol,
+      optionType: detail.optionType,
+      strike: detail.strike,
+      expiration: detail.expiration,
+      mark: detail.mark,
+      delta: detail.delta,
+      spot: detail.spot,
+      strategy: detail.strategy,
+      legs: detail.legs,
+      netUsd: detail.netUsd,
+      maxLossUsd: detail.maxLossUsd,
+      maxProfitUsd: detail.maxProfitUsd,
+      breakevens: detail.breakevens,
+    });
+    if (!pos) {
+      const reason = this.takeLastIdeaEntryRejection();
+      return {
+        ok: false,
+        reason:
+          reason ??
+          `${detail.ticker} not opened (market closed / daily cap / duplicate / DTE floor)`,
+        position: null,
+      };
+    }
+    // Filled: count it against the demo daily caps, emit the audit entry, mark
+    // the proposal executed. Paper book ⇒ no broker order id.
+    recordExecutedOrder({ user: this.alertUsername, mode: 'demo', notional: proposal.notional, now });
+    this.recordAgentOrderAudit({
+      recommendationId: proposal.recommendationId,
+      proposalId: proposal.id,
+      symbol: proposal.symbol,
+      side: proposal.side,
+      size: proposal.size,
+      notional: proposal.notional,
+      orderId: null,
+      now,
+    });
+    setProposalStatus(proposal.id, 'executed', now);
+    return { ok: true, reason: `opened ${detail.strategy} on ${detail.ticker} (paper)`, position: pos };
+  }
+
+  /**
+   * TRA-1140 — the AI-Ideas → shared-proposal-rail entry point (flag-gated by
+   * the caller). Queues a `kind:'options'` proposal for the accepted idea, then
+   * confirms it immediately (the click IS the operator approval) through the
+   * shared execution gate. Idempotent per (user, ideaId) at the store layer, so
+   * a double-click can't double-open. Returns the proposal id + the opened
+   * position (or the gate/open reason when it stays pending) so the endpoint can
+   * mirror the bespoke path's response.
+   */
+  async enterOptionsIdeaViaProposal(intent: {
+    ticker: string;
+    optionSymbol: string;
+    optionType: import('@trading-app/shared').OptionType;
+    strike: number;
+    expiration: string;
+    mark: number;
+    delta: number;
+    spot: number;
+    strategy: string;
+    legs: import('@trading-app/shared').OptionLeg[];
+    netUsd: number;
+    maxLossUsd: number;
+    maxProfitUsd: number;
+    breakevens: number[];
+    pop: number;
+    ideaId: string;
+  }): Promise<{ ok: boolean; reason: string; proposalId: string; position: OptionPosition | null }> {
+    const now = Date.now();
+    const maxLoss = Math.max(0, intent.maxLossUsd);
+    const riskReward = maxLoss > 0 ? intent.maxProfitUsd / maxLoss : 0;
+    const detail: import('@trading-app/shared').OptionProposalDetail = {
+      ideaId: intent.ideaId,
+      ticker: intent.ticker,
+      strategy: intent.strategy,
+      legs: intent.legs,
+      pop: intent.pop,
+      riskReward,
+      maxLossUsd: intent.maxLossUsd,
+      maxProfitUsd: intent.maxProfitUsd,
+      netUsd: intent.netUsd,
+      breakevens: intent.breakevens,
+      optionSymbol: intent.optionSymbol,
+      optionType: intent.optionType,
+      strike: intent.strike,
+      expiration: intent.expiration,
+      mark: intent.mark,
+      delta: intent.delta,
+      spot: intent.spot,
+    };
+    const note =
+      `${intent.strategy} · POP ${(intent.pop * 100).toFixed(0)}% · ` +
+      `R/R ${riskReward.toFixed(2)} · maxLoss $${maxLoss.toFixed(0)}`;
+    const proposal = createOptionsProposal({ user: this.alertUsername, option: detail, createdAt: now, note });
+    // Already resolved (idempotent return of a prior executed/expired proposal):
+    // surface its terminal state rather than re-confirming.
+    if (proposal.status !== 'pending') {
+      return {
+        ok: proposal.status === 'executed',
+        reason: `proposal ${proposal.id} is ${proposal.status}`,
+        proposalId: proposal.id,
+        position: null,
+      };
+    }
+    const result = await this.routeOptionsProposal(proposal, now);
+    return { ...result, proposalId: proposal.id };
   }
 
   /** TRA-941 — the agent-placed-order audit trail (newest last). */

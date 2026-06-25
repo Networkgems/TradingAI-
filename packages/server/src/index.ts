@@ -144,6 +144,7 @@ import {
   estimateSpotFromChain,
 } from '@trading-app/backtest';
 import { buildIdeasFeed, getEntryIntent } from './options-ideas-service.js';
+import { isOptionsProposalRailEnabled } from './option-exec-flag.js';
 import {
   getUserAnthropicApiKey,
   setUserAnthropicApiKey,
@@ -2214,6 +2215,31 @@ app.post('/api/options/ideas/:id/paper-enter', requireAuth, async (req, res) => 
   if (!intent) {
     res.status(404).json({
       error: 'Idea not found or expired — refresh the AI Options Ideas feed and try again.',
+    });
+    return;
+  }
+  // TRA-1140 — when the shared-rail flag is ON, route the accepted idea through
+  // the unified pending-proposal queue (typed `options` proposal) + shared
+  // approve/execution gate instead of the bespoke direct open. OFF by default,
+  // so the direct path below stays byte-for-byte unchanged when unset. Both are
+  // paper-only.
+  if (isOptionsProposalRailEnabled()) {
+    const result = await ctx.engine.enterOptionsIdeaViaProposal({ ...intent, ideaId: id });
+    if (!result.ok || !result.position) {
+      res.status(409).json({
+        error: `Could not place the paper order — ${result.reason}.`,
+        proposalId: result.proposalId,
+      });
+      return;
+    }
+    broadcastEngineState(ctx);
+    res.json({
+      ok: true,
+      proposalId: result.proposalId,
+      positionId: result.position.id,
+      optionSymbol: result.position.optionSymbol,
+      contracts: result.position.contracts,
+      premiumPaid: result.position.premiumPaid,
     });
     return;
   }

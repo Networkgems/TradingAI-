@@ -3276,6 +3276,55 @@ export type ProposalStatus =
   | 'expired'; // aged past the store TTL before anyone acted
 
 /**
+ * TRA-1140 — discriminates an equity-share proposal from a defined-risk options
+ * proposal. Absent on a {@link TradeProposal} ↔ legacy `'equity'` (the only kind
+ * before TRA-1140), so every persisted/in-flight proposal stays backward-compatible.
+ */
+export type ProposalKind = 'equity' | 'options';
+
+/**
+ * TRA-1140 — the options-specific payload carried by a `kind:'options'`
+ * {@link TradeProposal}. Snapshots an accepted AI-idea's defined-risk structure
+ * (legs + POP + reward/risk + capped max loss) plus the anchor contract fields
+ * the paper-options open path needs, so an options proposal flows through the
+ * SAME pending-queue + approve/reject + caps/kill-switch rail Proposals use.
+ * Paper-only by construction (no live-capital path).
+ */
+export interface OptionProposalDetail {
+  /** Source AI-idea feed id (idempotency key + traceability back to the feed). */
+  ideaId: string;
+  /** Underlying symbol (== TradeProposal.symbol). */
+  ticker: string;
+  /** Display strategy, e.g. "Bull Put Spread". */
+  strategy: string;
+  /** Full modeled structure (≥ 2 legs ⇒ defined-risk spread combo). */
+  legs: OptionLeg[];
+  /** Probability of profit on [0,1] (== OptionsIdeaView.pop). */
+  pop: number;
+  /** Reward/risk ratio (maxProfit ÷ maxLoss), snapshotted for the card. */
+  riskReward: number;
+  /** Capped capital at risk, USD per 1-lot. */
+  maxLossUsd: number;
+  /** Capped max profit, USD per 1-lot. */
+  maxProfitUsd: number;
+  /** Net premium at entry, + credit / − debit, USD per 1-lot. */
+  netUsd: number;
+  /** Payoff breakeven underlying price(s). */
+  breakevens: number[];
+  /** Anchor (scanner-surfaced) contract — drives the single-leg long open path. */
+  optionSymbol: string;
+  optionType: OptionType;
+  strike: number;
+  expiration: string;
+  /** Per-share mark used as the single-leg entry premium. */
+  mark: number;
+  /** Sign-adjusted Black-Scholes delta from the scanner. */
+  delta: number;
+  /** Underlying spot at build time. */
+  spot: number;
+}
+
+/**
  * A pending trade proposal derived from an APPROVE {@link AgentRecommendation}
  * with a routable `proposedSignal`. This is the unit the desktop pending-
  * proposals panel (TRA-940) renders and the operator confirms/rejects. `size`
@@ -3305,6 +3354,18 @@ export interface TradeProposal {
   rejectionReason?: string;
   /** When the proposal left `pending` (approved/rejected/executed/expired). */
   resolvedAt?: number;
+  /**
+   * TRA-1140 — proposal variant. Absent ↔ legacy `'equity'` share proposal (the
+   * only kind before TRA-1140). `'options'` carries {@link option} with the
+   * defined-risk structure and routes through the paper-options open path on
+   * confirm. For an options proposal the base fields are snapshotted as:
+   * `symbol`=underlying ticker, `side`='buy', `size`=1 (lot), `notional`=capped
+   * single-lot max loss (the capital-at-risk number the daily caps test against),
+   * `conviction`=POP, `mode`='demo' (paper-only).
+   */
+  kind?: ProposalKind;
+  /** Present iff `kind === 'options'` — the defined-risk options payload. */
+  option?: OptionProposalDetail;
 }
 
 /**
