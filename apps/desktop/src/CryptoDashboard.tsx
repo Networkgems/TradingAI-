@@ -186,8 +186,9 @@ export default function CryptoDashboard({ token, onBack, onLogout, onActivity, t
       />
 
       {/* TRA-690 — grouped nav: core trading surfaces stay flat; the Promotion
-          Gate and P&L Calendar collapse into a "More ▾" dropdown to keep the bar
-          clean. */}
+          Gate collapses into a "More ▾" dropdown to keep the bar clean.
+          TRA-1158 — P&L Calendar promoted out of "More" to a primary tab so the
+          daily P&L history is one click away and easy to read. */}
       <TabBar
         active={tab}
         onSelect={setTab}
@@ -196,10 +197,10 @@ export default function CryptoDashboard({ token, onBack, onLogout, onActivity, t
           { id: 'signals', label: `Signals (${signals.length})` },
           { id: 'positions', label: `Positions (${openPositions.length})` },
           { id: 'news', label: `News (${news.length})` },
+          { id: 'calendar', label: 'P&L Calendar', title: 'Daily P&L calendar and per-day EOD reports' },
         ]}
         more={[
           { id: 'gate', label: 'Gate', title: 'Crypto → real-capital promotion gate status' },
-          { id: 'calendar', label: 'P&L Calendar' },
         ]}
       />
 

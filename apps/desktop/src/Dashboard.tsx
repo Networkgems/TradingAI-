@@ -143,14 +143,16 @@ export default function Dashboard({ token, onLogout, onGoHome, onActivity, theme
 
       {/* TRA-690 — grouped nav: the core trading workflow (Watchlist → Signals →
           Positions → Options → AI Ideas) stays flat; reference/utility surfaces
-          (News, Calendar, Health) collapse into a "More ▾" dropdown so the bar
-          stays clean as features are added. The Calendar coach-mark anchor
-          (TRA-569 design §3.3) rides on the More trigger so the tour's last stop
-          still resolves to a visible element. */}
+          (News, Health) collapse into a "More ▾" dropdown so the bar stays clean
+          as features are added.
+          TRA-1158 — Calendar promoted out of "More" to a primary tab so the P&L
+          history is one click away and easy to scan. Its coach-mark anchor
+          (TRA-569 design §3.3) now rides on the Calendar tab itself; `moreTour`
+          falls back to the More trigger for any tour stop still inside it. */}
       <TabBar
         active={tab}
         onSelect={setTab}
-        moreTour="calendar"
+        moreTour="news"
         primary={[
           // TRA-569 — Signals/Positions coach-mark anchors point at their tabs.
           { id: 'watchlist', label: `Watchlist (${symbols.length})` },
@@ -160,10 +162,11 @@ export default function Dashboard({ token, onLogout, onGoHome, onActivity, theme
           { id: 'options', label: `Options (${openOptions.length})` },
           // TRA-600 — event-aware "AI Options Ideas" surface (Phase 3 of TRA-595).
           { id: 'ideas', label: 'AI Ideas', title: 'Ranked, defined-risk options ideas with earnings/Fed event context — paper entry only' },
+          // TRA-1158 — Calendar surfaced as a top-level tab (was under "More").
+          { id: 'calendar', label: 'Calendar', dataTour: 'calendar', title: 'Daily P&L calendar and per-day EOD reports' },
         ]}
         more={[
           { id: 'news', label: `News (${news.length})` },
-          { id: 'calendar', label: 'Calendar' },
           // TRA-539 — live reliability dashboard (TRA-528 /api/health/live).
           { id: 'health', label: 'Health' },
         ]}

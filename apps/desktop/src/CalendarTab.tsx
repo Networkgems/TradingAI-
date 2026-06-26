@@ -403,6 +403,13 @@ export function CalendarTab({ token, httpUrl, reportsPath = '/api/reports', mode
   const [detailLoading, setDetailLoading] = useState(false);
   // TRA-568 — trade-history export modal (design §2.2 toolbar control).
   const [exportOpen, setExportOpen] = useState(false);
+  // TRA-1158 — manual refresh tick. The reports list is fetched once on mount,
+  // so an open calendar never picks up today's EOD report after the market
+  // closes (the scheduler writes it at the close, after this load ran). Bumping
+  // this re-runs the load effect so the post-close P&L appears without a full
+  // app reload. Read-only: it only re-fetches saved reports, it does not
+  // regenerate them (avoids writing into the wrong per-account bucket).
+  const [refreshTick, setRefreshTick] = useState(0);
 
   // TRA-244 — append `?mode=<bucket>` so server reads from the matching
   // per-account folder (or omit when no mode is supplied).
@@ -456,7 +463,7 @@ export function CalendarTab({ token, httpUrl, reportsPath = '/api/reports', mode
     }
     load();
     return () => { cancelled = true; };
-  }, [token, httpUrl, reportsPath, modeQuery, market]);
+  }, [token, httpUrl, reportsPath, modeQuery, market, refreshTick]);
 
   // TRA-219 — fetch a fresh copy of the selected day's report so the detail
   // view picks up trades that closed after the initial month load.
@@ -526,6 +533,17 @@ export function CalendarTab({ token, httpUrl, reportsPath = '/api/reports', mode
             <span className="cal-period-label">{periodLabel}</span>
             <button className="cal-nav-btn" onClick={nextPeriod}>&#8250;</button>
           </div>
+          {/* TRA-1158 — pull in today's EOD report after the market closes
+              without a full app reload. */}
+          <button
+            type="button"
+            className="cal-export-btn"
+            onClick={() => { setSelectedDate(null); setRefreshTick(t => t + 1); }}
+            disabled={loading}
+            title="Refresh — pull in today's P&L after the market closes"
+          >
+            &#8635; Refresh
+          </button>
           {/* TRA-568 — trade-history export (CSV/JSON) for the current user. */}
           <button
             type="button"
