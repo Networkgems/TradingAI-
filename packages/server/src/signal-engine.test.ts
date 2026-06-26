@@ -77,10 +77,20 @@ function makeCandidate(overrides: Partial<RelativeValueCandidate> = {}): Relativ
     zScore: -2.4,
     fairPrice: 1.55,
     mispricingPct: -0.226,
-    delta: 0.18,
     classification: 'cheap',
     score: 5.6,
     reason: 'IV residual 2.40σ below fitted skew',
+    // TRA-1159 — the default RV candidate must carry a *directional* delta (in the
+    // 0.55–0.65 swing band) so `selectRvLongCandidate` admits it. TRA-972 added a
+    // hard far-OTM |delta| floor (0.45, `RV_LONG_DELTA_FLOOR`): a deep-OTM cheap
+    // strike (the old 0.18 default) is a pure vol-mispricing bet, not a directional
+    // swing entry, so the selector now stands it down and no RV position opens. The
+    // 0.18 fixture predated that floor; until the engine `dist` was rebuilt by the
+    // TRA-1158 full-regression sweep the stale build masked it. These bridge/live
+    // tests exercise RV open/sizing/mirror *mechanics*, not the OTM-rejection
+    // policy, so the fixture now uses a 0.60 (in-band) delta. Tests that assert the
+    // floor's stand-down override `delta` explicitly.
+    delta: 0.60,
     ...overrides,
   };
 }
@@ -1790,6 +1800,16 @@ describe('SignalEngine — TRA-335 live equity bracket placement', () => {
   });
 
   it('manualClosePosition on a live equity position drops the position locally, marks pnl, and kicks off the Tradier OCO cancel for the entry order', async () => {
+    // TRA-1159 — this test exercises the manual-close → Tradier OCO-cancel
+    // *mechanics*, not the TRA-952 swing holding-period policy. TRA-952 added a
+    // day-trade-close guard (`checkEquityDayTradingClose`) that is ON by default
+    // (`EQUITY_SWING_MODE` ≠ off) and refuses a same-session discretionary close —
+    // so opening and immediately closing here returns null. Opt this mechanics test
+    // out of swing mode so the close path runs; a dedicated TRA-952 test covers the
+    // holding-period block itself.
+    const prevSwing = process.env.EQUITY_SWING_MODE;
+    process.env.EQUITY_SWING_MODE = 'off';
+    try {
     const stub: TradierEquityStub = {
       submitBracketOrder: vi.fn(),
       waitForOrderTerminalStatus: vi.fn(),
@@ -1822,6 +1842,10 @@ describe('SignalEngine — TRA-335 live equity bracket placement', () => {
     await Promise.resolve();
     await Promise.resolve();
     expect(stub.cancelOrder).toHaveBeenCalledWith(42);
+    } finally {
+      if (prevSwing === undefined) delete process.env.EQUITY_SWING_MODE;
+      else process.env.EQUITY_SWING_MODE = prevSwing;
+    }
   });
 });
 
