@@ -157,22 +157,34 @@ afterEach(() => {
 });
 
 describe('SignalEngine — relative-value scanner bridge', () => {
-  // TRA-811 — board directive (parent TRA-810): RV is paused, so the per-tick
-  // gate must NOT arm a new scan/open even when every other condition is
-  // favorable. The kill switch (RV_ENGINE_ENABLED) dominates the gate. This
-  // proves new RV entries are off in BOTH modes without depending on a live
-  // server. (Existing managed exits run elsewhere and are intentionally not
-  // gated here.)
-  it('shouldRunRelativeValueScan returns false while RV is paused, even with all other conditions favorable (TRA-811)', () => {
-    expect(
-      shouldRunRelativeValueScan({
-        autoTradingEnabled: true,
-        halted: false,
-        hasScanner: true,
-        marketOpen: true,
-        skipOptionsForLiveEquityOnly: false,
-      }),
-    ).toBe(false);
+  // TRA-811 history: the board originally PAUSED RV (kill switch
+  // `RV_ENGINE_ENABLED=false`), so the gate stood down even with everything else
+  // favorable. TRA-895 re-enabled it for the Jun 15-18 demo, and on the TRA-1158
+  // regression the board chose **defer** (interaction 8cf2bbdd: "leave as-is,
+  // revisit after the tests are fixed") — so `RV_ENGINE_ENABLED` stays `true`.
+  // This test is realigned to that decision (TRA-1159/TRA-1160): with the kill
+  // switch ON, all-favorable conditions ARM the scan, and each individual gate
+  // input still dominates to false. (Existing managed exits run elsewhere and are
+  // intentionally not gated here.) If the board later re-pauses RV
+  // (`RV_ENGINE_ENABLED=false`) the all-favorable case flips back to false.
+  const favorable = {
+    autoTradingEnabled: true,
+    halted: false,
+    hasScanner: true,
+    marketOpen: true,
+    skipOptionsForLiveEquityOnly: false,
+  };
+
+  it('shouldRunRelativeValueScan arms when RV is enabled and every condition is favorable (TRA-895/TRA-1158 defer)', () => {
+    expect(shouldRunRelativeValueScan(favorable)).toBe(true);
+  });
+
+  it('shouldRunRelativeValueScan stands down whenever any single gate input is unfavorable', () => {
+    expect(shouldRunRelativeValueScan({ ...favorable, autoTradingEnabled: false })).toBe(false);
+    expect(shouldRunRelativeValueScan({ ...favorable, halted: true })).toBe(false);
+    expect(shouldRunRelativeValueScan({ ...favorable, hasScanner: false })).toBe(false);
+    expect(shouldRunRelativeValueScan({ ...favorable, marketOpen: false })).toBe(false);
+    expect(shouldRunRelativeValueScan({ ...favorable, skipOptionsForLiveEquityOnly: true })).toBe(false);
   });
 
   it('runRelativeValueScan opens an RV position from a `cheap` candidate and records a signal', async () => {
