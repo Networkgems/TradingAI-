@@ -168,11 +168,15 @@ describe('bucketByQuintile + monotonicity', () => {
 });
 
 describe('runSentimentStudy + §4 gate', () => {
-  it('returns INCONCLUSIVE on an empty / too-small sample', () => {
+  it('returns PENDING_FLOW on an empty sample (0 chain-days dominates; never a spurious FAIL)', () => {
+    // TRA-1182: with no flow data captured the gate cannot be FAIL; an empty
+    // sample is the degenerate case of "S2 unmeasured" + S1 below the bar.
     const report = runSentimentStudy([]);
-    expect(report.verdict).toBe('INCONCLUSIVE');
+    expect(report.verdict).toBe('PENDING_FLOW');
     expect(report.sample.nTradingDays).toBe(0);
-    expect(report.verdictReasons[0]).toMatch(/Sample below the §4 bar/);
+    expect(report.sample.nChainDays).toBe(0);
+    expect(report.verdictReasons[0]).toMatch(/S2 \(flow-confirmed\) unmeasured/);
+    expect(report.verdictReasons.join(' ')).toMatch(/S1 \(sentiment-alone\).*INCONCLUSIVE/);
   });
 
   it('counts usable vs buzz-only cohorts and never throws on a thin real-ish sample', () => {
@@ -183,6 +187,92 @@ describe('runSentimentStudy + §4 gate', () => {
     const report = runSentimentStudy(days);
     expect(report.sample.nUsableSymbolDays).toBe(1);
     expect(report.sample.nBuzzOnlySymbolDays).toBe(1);
-    expect(report.verdict).toBe('INCONCLUSIVE');
+    expect(report.verdict).toBe('PENDING_FLOW'); // 0 chain-days ⇒ S2 unmeasured (TRA-1182)
+  });
+});
+
+// ── TRA-1182: S1-only safe grading so the gate can't spuriously FAIL on absent flow ──
+describe('TRA-1182 — flow-coverage guard (PENDING_FLOW vs spurious FAIL)', () => {
+  /**
+   * Build a sample that clears the §4 bar (≥20 trading days, ≥300 usable
+   * symbol-days). `flow` controls whether option-chain (S2) data is present.
+   */
+  function bulkDays(opts: {
+    nDays: number;
+    nSymbols: number;
+    netScore: (sym: number, day: number) => number;
+    fwd: (sym: number, day: number) => number | null;
+    flow?: (sym: number, day: number) => number | null;
+  }): SentimentSymbolDay[] {
+    const out: SentimentSymbolDay[] = [];
+    for (let d = 0; d < opts.nDays; d++) {
+      const date = `2026-03-${String(d + 1).padStart(2, '0')}`;
+      for (let s = 0; s < opts.nSymbols; s++) {
+        const f = opts.fwd(s, d);
+        out.push(
+          symbolDay({
+            date,
+            symbol: `S${s}`,
+            netScore: opts.netScore(s, d),
+            netOTMflow: opts.flow ? opts.flow(s, d) : null,
+            usable: true,
+            fwd: { '1d': f, '5d': f, '20d': f },
+          }),
+        );
+      }
+    }
+    return out;
+  }
+
+  it('returns PENDING_FLOW (not FAIL) when the sample bar is met but 0 chain-days are captured', () => {
+    // Bar met (20 × 16 = 320 usable, 20 trading days), S1 dead (flat fwd), NO flow.
+    const days = bulkDays({
+      nDays: 20,
+      nSymbols: 16,
+      netScore: (s) => (s + 1) / 16,
+      fwd: () => 0.01, // zero cross-sectional variance ⇒ dead IC
+      // no flow ⇒ 0 chain-days
+    });
+    const report = runSentimentStudy(days);
+    expect(report.sample.nUsableSymbolDays).toBe(320);
+    expect(report.sample.nTradingDays).toBe(20);
+    expect(report.sample.nChainDays).toBe(0);
+    expect(report.verdict).toBe('PENDING_FLOW');
+    expect(report.verdict).not.toBe('FAIL');
+    // An S1-graded PASS/FAIL/INCONCLUSIVE line is emitted alongside the PENDING note.
+    expect(report.verdictReasons.join(' ')).toMatch(/S1 \(sentiment-alone\).*(PASS|FAIL|INCONCLUSIVE)/);
+    // It must NOT have killed the direction off absent flow data.
+    expect(report.verdictReasons.join(' ')).not.toMatch(/kill the direction/);
+  });
+
+  it('spot check on the accruing sample (8 sentiment days, 0 chain-days) is PENDING_FLOW, not FAIL', () => {
+    const days = bulkDays({
+      nDays: 8,
+      nSymbols: 6,
+      netScore: (s) => (s + 1) / 6,
+      fwd: (s) => (s + 1) / 6, // some signal, but sample below the §4 bar
+    });
+    const report = runSentimentStudy(days);
+    expect(report.sample.nChainDays).toBe(0);
+    expect(report.verdict).toBe('PENDING_FLOW');
+    // Below the bar ⇒ the S1 grade is INCONCLUSIVE (keep collecting), not a FAIL.
+    expect(report.verdictReasons.join(' ')).toMatch(/S1 \(sentiment-alone\).*INCONCLUSIVE/);
+  });
+
+  it('still fires the S2-driven FAIL once chain-days are present and S2 IC is dead (no regression)', () => {
+    // Bar met, flow present on every usable day (≥1 chain-day), but netScore below
+    // the confirmation floor ⇒ no confirmed S2 days ⇒ S2 IC measured as zero ⇒ FAIL.
+    const days = bulkDays({
+      nDays: 20,
+      nSymbols: 16,
+      netScore: () => 0, // below NETSCORE_FLOOR ⇒ never confirmed
+      fwd: () => 0.01,
+      flow: () => 0.3, // chain data IS captured
+    });
+    const report = runSentimentStudy(days);
+    expect(report.sample.nChainDays).toBe(20);
+    expect(report.sample.nConfirmedSymbolDays).toBe(0);
+    expect(report.verdict).toBe('FAIL');
+    expect(report.verdictReasons.join(' ')).toMatch(/kill the direction/);
   });
 });

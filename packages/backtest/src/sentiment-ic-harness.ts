@@ -36,6 +36,13 @@ export const FLOW_MAX_DTE = 35;
 /** §4 sample bar. */
 export const MIN_TRADING_DAYS = 20;
 export const MIN_USABLE_SYMBOL_DAYS = 300;
+/**
+ * TRA-1182 — minimum option-chain days before S2 (flow-confirmed) can be graded
+ * at all. With ZERO captured chain-days the S2 IC is *unmeasured* (TRA-826 has
+ * not provisioned `TRADIER_API_TOKEN`), not "measured and dead", so the gate must
+ * return PENDING_FLOW rather than killing the direction off absent flow data.
+ */
+export const MIN_CHAIN_DAYS = 1;
 /** §4 S2 thresholds. */
 export const IC_FLOOR = 0.03;
 export const ICIR_FLOOR = 0.3;
@@ -408,13 +415,20 @@ export function isMonotoneIncreasing(buckets: readonly BucketStat[]): boolean {
 
 // ── study + §4 gate ──────────────────────────────────────────────────────────
 
-export type Verdict = 'PASS' | 'FAIL' | 'INCONCLUSIVE';
+/**
+ * Gate verdict. `PENDING_FLOW` (TRA-1182) is distinct from `FAIL`: it means the
+ * flow-confirmed (S2) leg could not be measured because no option-chain days were
+ * captured yet — NOT that the signal was measured and found dead.
+ */
+export type Verdict = 'PASS' | 'FAIL' | 'INCONCLUSIVE' | 'PENDING_FLOW';
 
 export interface StudyReport {
   sample: {
     nSymbolDays: number;
     nUsableSymbolDays: number;
     nTradingDays: number;
+    /** Distinct trading days with at least one joined option-chain (flow) snapshot. */
+    nChainDays: number;
     nConfirmedSymbolDays: number;
     nBuzzOnlySymbolDays: number;
     perSymbol: Record<string, number>;
@@ -444,6 +458,9 @@ export function runSentimentStudy(days: readonly SentimentSymbolDay[]): StudyRep
   const confirmed = usable.filter(isConfirmed);
 
   const tradingDays = new Set(usable.map((d) => d.date));
+  // §4 / TRA-1182 — option-chain (flow) coverage: distinct days where a chain
+  // snapshot joined (netOTMflow present). 0 ⇒ S2 is unmeasured, not dead.
+  const chainDays = new Set(days.filter((d) => d.netOTMflow != null).map((d) => d.date));
   const perSymbol: Record<string, number> = {};
   for (const d of usable) perSymbol[d.symbol] = (perSymbol[d.symbol] ?? 0) + 1;
 
@@ -466,6 +483,7 @@ export function runSentimentStudy(days: readonly SentimentSymbolDay[]): StudyRep
     nSymbolDays: days.length,
     nUsableSymbolDays: usable.length,
     nTradingDays: tradingDays.size,
+    nChainDays: chainDays.size,
     nConfirmedSymbolDays: confirmed.length,
     nBuzzOnlySymbolDays: buzzOnly.length,
     perSymbol,
@@ -473,8 +491,10 @@ export function runSentimentStudy(days: readonly SentimentSymbolDay[]): StudyRep
 
   const { verdict, verdictReasons } = gradeGate({
     sample,
+    s1Ic,
     s2Ic,
     confirmedVsAloneDelta,
+    s1BucketsByQuintile,
     s2BucketsByQuintile,
   });
 
@@ -492,17 +512,91 @@ export function runSentimentStudy(days: readonly SentimentSymbolDay[]): StudyRep
 }
 
 /**
+ * TRA-1182 — grade ONE signal's IC set (here S1, sentiment-alone) against the §4
+ * thresholds, standalone (no "beats S1" leg, which only applies to S2). Returns a
+ * real PASS/FAIL/INCONCLUSIVE so the study still produces a usable verdict while
+ * S2 flow data is absent. Mirrors the S2 logic minus the flow-edge comparison.
+ */
+function gradeSignalAlone(
+  label: string,
+  sample: { nTradingDays: number; nUsableSymbolDays: number },
+  ic: Record<Horizon, IcStat>,
+  bucketsByQuintile: Record<Horizon, BucketStat[]>,
+): { verdict: Verdict; reason: string } {
+  if (sample.nTradingDays < MIN_TRADING_DAYS || sample.nUsableSymbolDays < MIN_USABLE_SYMBOL_DAYS) {
+    return {
+      verdict: 'INCONCLUSIVE',
+      reason:
+        `${label} sample below the §4 bar (${sample.nTradingDays}/${MIN_TRADING_DAYS} trading days, ` +
+        `${sample.nUsableSymbolDays}/${MIN_USABLE_SYMBOL_DAYS} usable symbol-days) — ${label} INCONCLUSIVE, keep collecting.`,
+    };
+  }
+  const passing = HORIZONS.filter((h) => Math.abs(ic[h].meanIC) >= IC_FLOOR && ic[h].icir >= ICIR_FLOOR);
+  const signs = new Set(passing.map((h) => Math.sign(ic[h].meanIC)));
+  const consistentSign = passing.length >= 2 && signs.size === 1;
+  const monotone =
+    isMonotoneIncreasing(bucketsByQuintile['5d']) || isMonotoneIncreasing(bucketsByQuintile['20d']);
+
+  if (consistentSign && monotone) {
+    return {
+      verdict: 'PASS',
+      reason:
+        `${label} clears the §4 bar on horizons [${passing.join(', ')}] ` +
+        `(|IC|≥${IC_FLOOR}, ICIR≥${ICIR_FLOOR}, consistent sign, monotone buckets) — ${label} PASS.`,
+    };
+  }
+  const anySignal = HORIZONS.some((h) => Math.abs(ic[h].meanIC) >= IC_FLOOR);
+  if (!anySignal) {
+    return {
+      verdict: 'FAIL',
+      reason: `${label} IC indistinguishable from zero on every horizon — ${label} FAIL (dead signal).`,
+    };
+  }
+  return {
+    verdict: 'INCONCLUSIVE',
+    reason:
+      `${label} shows IC but not decisively (passing [${passing.join(', ') || 'none'}], ` +
+      `consistentSign=${consistentSign}, monotone=${monotone}) — ${label} INCONCLUSIVE, keep collecting.`,
+  };
+}
+
+/**
  * §4 pre-registered verdict gate. The thresholds are fixed in the study doc so a
  * result can't be rationalised after the fact.
+ *
+ * TRA-1182: before grading S2, guard on flow coverage. With ZERO captured
+ * option-chain days the S2 IC is *unmeasured* (TRA-826 has not provisioned
+ * `TRADIER_API_TOKEN`), so returning a FAIL here would kill the direction off
+ * absent flow data — a structural false negative. Instead the verdict is
+ * `PENDING_FLOW` and S1 (sentiment-alone) is graded so the run is still usable.
  */
 export function gradeGate(args: {
-  sample: { nTradingDays: number; nUsableSymbolDays: number };
+  sample: { nTradingDays: number; nUsableSymbolDays: number; nChainDays: number };
+  s1Ic: Record<Horizon, IcStat>;
   s2Ic: Record<Horizon, IcStat>;
   confirmedVsAloneDelta: Record<Horizon, number>;
+  s1BucketsByQuintile: Record<Horizon, BucketStat[]>;
   s2BucketsByQuintile: Record<Horizon, BucketStat[]>;
 }): { verdict: Verdict; verdictReasons: string[] } {
-  const { sample, s2Ic, confirmedVsAloneDelta, s2BucketsByQuintile } = args;
+  const { sample, s1Ic, s2Ic, confirmedVsAloneDelta, s1BucketsByQuintile, s2BucketsByQuintile } = args;
   const reasons: string[] = [];
+
+  // ── TRA-1182 flow-coverage guard ────────────────────────────────────────────
+  // No option-chain days ⇒ S2 cannot be measured. Do NOT fall through to the
+  // S2-driven FAIL path (which would fire on `anyS2Signal=false` = absent data).
+  // Return PENDING_FLOW + a real S1-only grade. Takes precedence over the sample
+  // bar so the accruing sentiment-only sample reports PENDING, never a spurious
+  // FAIL, before TRA-826 lands.
+  if (sample.nChainDays < MIN_CHAIN_DAYS) {
+    const s1 = gradeSignalAlone('S1 (sentiment-alone)', sample, s1Ic, s1BucketsByQuintile);
+    reasons.push(
+      `S2 (flow-confirmed) unmeasured: ${sample.nChainDays} option-chain day(s) captured ` +
+        `(< ${MIN_CHAIN_DAYS}; TRA-826 TRADIER_API_TOKEN not yet provisioned) — verdict PENDING_FLOW, ` +
+        `not FAIL (S2 is unmeasured, not a measured-dead signal).`,
+    );
+    reasons.push(s1.reason);
+    return { verdict: 'PENDING_FLOW', verdictReasons: reasons };
+  }
 
   // Sample bar first — too small ⇒ INCONCLUSIVE regardless of point estimates.
   if (sample.nTradingDays < MIN_TRADING_DAYS || sample.nUsableSymbolDays < MIN_USABLE_SYMBOL_DAYS) {
@@ -539,9 +633,15 @@ export function gradeGate(args: {
   }
 
   // Distinguish a clean FAIL (signal is dead / no flow edge) from INCONCLUSIVE.
+  // Reachable only with ≥1 captured chain-day (the TRA-1182 guard returns
+  // PENDING_FLOW above when flow data is absent), so this is a *measured* dead
+  // signal, not a false negative off missing data.
   const anyS2Signal = HORIZONS.some((h) => Math.abs(s2Ic[h].meanIC) >= IC_FLOOR);
   if (!anyS2Signal) {
-    reasons.push('S2 confirmed IC indistinguishable from zero on every horizon — FAIL (kill the direction).');
+    reasons.push(
+      `S2 confirmed IC indistinguishable from zero on every horizon over ` +
+        `${sample.nChainDays} captured chain-day(s) — FAIL (kill the direction).`,
+    );
     return { verdict: 'FAIL', verdictReasons: reasons };
   }
   if (passingHorizons.length >= 2 && consistentSign && !beatsS1) {

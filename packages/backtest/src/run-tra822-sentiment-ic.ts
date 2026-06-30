@@ -219,6 +219,7 @@ function renderMarkdown(report: {
   L.push(`- Chain days loaded: ${report.inputs.chainDaysLoaded}`);
   L.push(`- Symbol-days (total / usable / buzz-only): ${s.sample.nSymbolDays} / ${s.sample.nUsableSymbolDays} / ${s.sample.nBuzzOnlySymbolDays}`);
   L.push(`- Trading days: ${s.sample.nTradingDays}`);
+  L.push(`- Chain days joined (S2 flow coverage): ${s.sample.nChainDays}`);
   L.push(`- Confirmed (S2) symbol-days: ${s.sample.nConfirmedSymbolDays}`);
   L.push(`- Study universe (single names): ${report.inputs.studyUniverse.join(', ') || '(none recorded yet)'}`);
   L.push('');
