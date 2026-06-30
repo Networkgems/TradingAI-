@@ -3125,6 +3125,21 @@ export interface EodReport {
    */
   portfolioGreeks?: PortfolioGreeks;
 
+  /**
+   * TRA-1192 — provenance of the calendar `combinedPnl` figure so the
+   * historical backfill never clobbers a real snapshot and the UI/server can
+   * tell an intraday live estimate from a settled EOD value:
+   *   - `engine`           — engine-computed realized + options (demo, or live
+   *                          before a broker-balance anchor exists);
+   *   - `tradier-balance`  — broker-truth daily balance delta (TRA-359 live EOD);
+   *   - `realized-backfill`— FIFO realized-options P&L reconstructed from broker
+   *                          fills for a pre-snapshot historical day (TRA-244);
+   *   - `live-intraday`    — today's running broker-balance delta computed on the
+   *                          fly (not yet settled by the 9 PM EOD snapshot).
+   * Optional for back-compat with reports persisted before the field existed.
+   */
+  pnlSource?: 'engine' | 'tradier-balance' | 'realized-backfill' | 'live-intraday';
+
   // Markdown report body
   markdown: string;
 }

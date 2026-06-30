@@ -75,6 +75,7 @@ import {
   aggregateRealizedOptionsPnl,
   computeBalanceDailyPnl,
   findPreviousBalanceSnapshot,
+  liveBackfillWriteWindow,
   realizedOptionsPnlByCloseDate,
 } from './reports/tradier-reconcile.js';
 import { createToken, verifyToken, generateResetToken, consumeResetToken, initResetTokenStore } from './auth.js';
@@ -1204,6 +1205,9 @@ function applyTradierBalanceOverride(
     ...report,
     combinedPnl: override.combinedPnl,
     totalEquity: todayBalance,
+    // TRA-1192 — tag the broker-truth source so the historical realized-fill
+    // backfill never overwrites a settled balance-delta cell.
+    pnlSource: 'tradier-balance' as const,
     markdown: `${header}\n\n${report.markdown}`,
   };
 }
@@ -1312,15 +1316,24 @@ async function reconcileTradierLiveCalendar(
 // basis to net against). The board reconciled the rows against their Tradier
 // brokerage confirmations and chose "backfill from fills (realized P&L)".
 //
-// This pass pulls the broker trade history for the live/sandbox env and, for
-// the bounded historical June window below, rewrites each day's `combinedPnl`
-// to the FIFO-matched realized options P&L for trades that *closed* that day
-// (broker truth; un-reconstructable closes left flat — never gross proceeds).
-// Days on/after the cutoff are owned by the going-forward 9 PM snapshot path
-// and are left untouched, so this is stable under repeated (daily) runs.
-const LIVE_REALIZED_BACKFILL_FETCH_START = '2026-05-15'; // wide enough to capture the opens
-const LIVE_REALIZED_BACKFILL_WRITE_START = '2026-06-01'; // first artifact day (inclusive)
-const LIVE_REALIZED_BACKFILL_WRITE_END = '2026-06-10';   // cutoff (exclusive) — 9 PM snapshot owns this day on
+// This pass pulls the broker trade history for the live/sandbox env and, over a
+// rolling trailing window, GAP-FILLS each calendar day that has no real EOD
+// snapshot with the FIFO-matched realized options P&L for trades that *closed*
+// that day (broker truth; un-reconstructable closes left flat — never gross
+// proceeds).
+//
+// TRA-1192 — generalised from the original hardcoded 2026-06-01..2026-06-10
+// window (which only ever fixed the board's own account) to a dynamic
+// current-plus-previous-month window so a NEW live account (e.g. opened
+// mid-month) gets its earlier days reported, not just the days after the 9 PM
+// snapshot started running. Clobber-safety: a day whose report came from a real
+// snapshot — a broker-balance override (`pnlSource: 'tradier-balance'`) or an
+// engine EOD row — is NEVER overwritten; only days with no file, or a prior
+// realized-backfill row, are (re)written. This keeps it stable under repeated
+// (daily/startup) runs and prevents a day's settled equity P&L from being
+// downgraded to options-only.
+const LIVE_REALIZED_BACKFILL_FETCH_LOOKBACK_DAYS = 31; // before the write window — wide enough to capture the opens
+const LIVE_REALIZED_BACKFILL_MAX_MONTHS_BACK = 1;      // write window start = first of (this − N) month
 
 /**
  * Build (or patch) an `EodReport` whose calendar figure is the broker-truth
@@ -1379,6 +1392,9 @@ function makeRealizedBackfillReport(
     optionsPnl: dayRealized,
     totalPnl: dayRealized,
     combinedPnl: dayRealized,
+    // TRA-1192 — mark as a reconstructed historical cell so re-runs recompute it
+    // (and never treat it as a real snapshot to be preserved).
+    pnlSource: 'realized-backfill' as const,
     markdown: `${header}\n\n${priorBody}`,
   };
 }
@@ -1401,12 +1417,23 @@ async function backfillLiveRealizedCalendar(
   const client = buildTradierOptionsClientForEnv(settings, env);
   if (!client) return null;
 
-  const end = new Date(Date.now()).toISOString().slice(0, 10);
+  // TRA-1192 — dynamic rolling write window: from the first of the month
+  // `LIVE_REALIZED_BACKFILL_MAX_MONTHS_BACK` months back up to (but excluding)
+  // today. Today is owned by the live-intraday cell + the 9 PM snapshot, so we
+  // never backfill it here.
+  const today = etDateString();
+  const { writeStart, fetchStart } = liveBackfillWriteWindow(
+    today,
+    LIVE_REALIZED_BACKFILL_MAX_MONTHS_BACK,
+    LIVE_REALIZED_BACKFILL_FETCH_LOOKBACK_DAYS,
+  );
+  const inWindow = (d: string) => d >= writeStart && d < today;
+
   let fills;
   try {
     fills = await client.listAccountHistory({
-      start: LIVE_REALIZED_BACKFILL_FETCH_START,
-      end,
+      start: fetchStart,
+      end: today,
       type: 'trade',
       limit: 2000,
     });
@@ -1422,9 +1449,16 @@ async function backfillLiveRealizedCalendar(
   const { realizedByDate, closeCountByDate } = realizedOptionsPnlByCloseDate(fills);
   const dir = stockReportsDirFor(ctx, mode);
 
-  // Candidate days = existing report files in the bucket ∪ realized-close
-  // days, bounded to the historical write window. Existing artifact rows with
-  // no real close that day are zeroed; real-close days are set to broker truth.
+  // A day already owned by a *real* snapshot (broker-balance override or an
+  // engine EOD row) is authoritative and must never be downgraded to
+  // options-only realized. Only days with no report file, or a prior
+  // realized-backfill row, are (re)written from broker fills.
+  const isBackfillRow = (r: ReturnType<typeof generateEodReport>): boolean =>
+    r.pnlSource === 'realized-backfill' ||
+    /Live calendar backfill \(TRA-244\)/.test(r.markdown ?? '');
+
+  // Candidate days = existing report files in the bucket ∪ realized-close days,
+  // bounded to the rolling write window.
   const candidates = new Set<string>();
   let existingDates: string[] = [];
   try {
@@ -1434,8 +1468,6 @@ async function backfillLiveRealizedCalendar(
   } catch {
     existingDates = [];
   }
-  const inWindow = (d: string) =>
-    d >= LIVE_REALIZED_BACKFILL_WRITE_START && d < LIVE_REALIZED_BACKFILL_WRITE_END;
   for (const d of existingDates) if (inWindow(d)) candidates.add(d);
   for (const d of realizedByDate.keys()) if (inWindow(d)) candidates.add(d);
   if (candidates.size === 0) return {};
@@ -1454,6 +1486,13 @@ async function backfillLiveRealizedCalendar(
         existing = null;
       }
     }
+    // Never clobber a real snapshot row (balance-truth or engine EOD).
+    if (existing && !isBackfillRow(existing)) continue;
+    // Nothing to write for a no-activity day that has no existing artifact —
+    // leave it absent so the calendar renders it flat ("--").
+    if (!existing && dayRealized === 0 && (closeCountByDate.get(date) ?? 0) === 0) {
+      continue;
+    }
     const report = makeRealizedBackfillReport(
       date,
       dayRealized,
@@ -1470,6 +1509,82 @@ async function backfillLiveRealizedCalendar(
     written,
   });
   return written;
+}
+
+/**
+ * TRA-1192 — build today's *running* Live calendar cell on the fly so the
+ * current day's P&L shows in the calendar before the 9 PM EOD snapshot settles
+ * it (the recurring "today shows --" complaint). Computed exactly like the EOD
+ * broker-balance override — `current Tradier equity − prev balance snapshot −
+ * today's net cash flow` — but READ-ONLY: it never writes the balance-snapshot
+ * series (so it can't corrupt tomorrow's prev anchor) and never fetches new
+ * cash events. Returns `null` for demo, when there's no current equity, or when
+ * no prior balance anchor exists yet (a brand-new account's first day has no
+ * baseline to diff against — the cell stays "--" rather than showing a bogus
+ * full-equity "gain").
+ */
+async function buildLiveTodayCellReport(
+  ctx: UserContext,
+  mode: StockModeKey,
+): Promise<ReturnType<typeof generateEodReport> | null> {
+  if (mode === 'demo') return null;
+  // The engine's live equity reflects its *active* mode only. If the calendar is
+  // browsing a different bucket than the account is currently running, we have no
+  // matching current balance — fall through to "--" rather than diff a live
+  // equity against a sandbox anchor (or vice-versa).
+  if (mode !== stockModeKey(getSettings(ctx.username))) return null;
+  const env: TradierEnv = mode === 'live' ? 'production' : 'sandbox';
+  const todayBalance = ctx.engine.getEquitySnapshot().equity;
+  if (!Number.isFinite(todayBalance) || todayBalance <= 0) return null;
+
+  const today = etDateString();
+  const snapshots = await loadTradierBalanceSnapshots(ctx, env);
+  const prev = findPreviousBalanceSnapshot(
+    Object.fromEntries(Object.entries(snapshots).filter(([d]) => d !== today)),
+    today,
+  );
+  if (!prev) return null;
+
+  const cashFlow = await loadTradierCashFlow(ctx, env);
+  const netCashFlow = cashFlow.netByDate[today] ?? 0;
+  const pnl = computeBalanceDailyPnl(todayBalance, prev.balance, netCashFlow);
+  if (pnl === null) return null;
+  const combinedPnl = Number(pnl.toFixed(2));
+
+  const sign = (n: number) => (n >= 0 ? '+' : '') + n.toFixed(2);
+  const usd = (n: number) =>
+    '$' + Math.abs(n).toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+  const header = `> **Live P&L (running, intraday — TRA-1192).** Today's P&L for ${today} = current Tradier equity (${usd(todayBalance)}) − prev snapshot ${prev.date} (${usd(prev.balance)}) − net cash flow (${sign(netCashFlow)}) = **${sign(combinedPnl)}**. This is a live estimate that updates through the session; the 9 PM EOD snapshot settles the final value.`;
+
+  return {
+    date: today,
+    generatedAt: Date.now(),
+    realizedPnl: 0,
+    unrealizedPnl: 0,
+    totalPnl: combinedPnl,
+    optionsPnl: 0,
+    combinedPnl,
+    realizedPnlPct: undefined,
+    optionsPnlPct: undefined,
+    combinedPnlPct: undefined,
+    totalEquity: todayBalance,
+    managedEquity: 0,
+    availableCash: 0,
+    trades: [],
+    openPositionCount: 0,
+    winRate: 0,
+    avgRR: 0,
+    totalTrades: 0,
+    winners: 0,
+    losers: 0,
+    expectancy: 0,
+    maxDrawdown: 0,
+    sharpeRatio: 0,
+    top5Movers: [],
+    signalAccuracy: { totalSignals: 0, winningSignals: 0, winRate: 0, avgRR: 0 },
+    pnlSource: 'live-intraday',
+    markdown: header,
+  };
 }
 
 /** TRA-244 — run the historical Live-calendar backfill for every user. */
@@ -3770,17 +3885,32 @@ app.get('/api/reports/latest', requireAuth, async (req, res) => {
 app.get('/api/reports', requireAuth, async (req, res) => {
   const ctx = await userCtx(res);
   const mode = resolveStockReportMode(req, ctx.username);
+  let dates: string[] = [];
   try {
     const files = await readdir(stockReportsDirFor(ctx, mode));
-    const dates = files
+    dates = files
       .filter(f => /^\d{4}-\d{2}-\d{2}\.json$/.test(f))
-      .map(f => f.replace('.json', ''))
-      .sort()
-      .reverse();
-    res.json({ dates });
+      .map(f => f.replace('.json', ''));
   } catch {
-    res.json({ dates: [] });
+    dates = [];
   }
+  // TRA-1192 — surface today's running Live cell so the current day's P&L shows
+  // before the 9 PM EOD snapshot writes a file for it. Only when a live anchor
+  // makes the cell computable (buildLiveTodayCellReport returns non-null) and
+  // no settled file already exists for today.
+  try {
+    const today = etDateString();
+    if (!dates.includes(today)) {
+      const liveToday = await buildLiveTodayCellReport(ctx, mode);
+      if (liveToday) dates.push(today);
+    }
+  } catch (err) {
+    log.warn('live-today calendar cell list failed', {
+      username: ctx.username,
+      reason: err instanceof Error ? err.message : String(err),
+    });
+  }
+  res.json({ dates: [...new Set(dates)].sort().reverse() });
 });
 
 app.get('/api/reports/:date', requireAuth, async (req, res) => {
@@ -3793,6 +3923,22 @@ app.get('/api/reports/:date', requireAuth, async (req, res) => {
   const mode = resolveStockReportMode(req, ctx.username);
   const filePath = join(stockReportsDirFor(ctx, mode), `${date}.json`);
   if (!existsSync(filePath)) {
+    // TRA-1192 — no settled file for today yet: serve the running intraday Live
+    // cell so the current day's P&L renders before the 9 PM EOD snapshot.
+    if (date === etDateString()) {
+      try {
+        const liveToday = await buildLiveTodayCellReport(ctx, mode);
+        if (liveToday) {
+          res.json(liveToday);
+          return;
+        }
+      } catch (err) {
+        log.warn('live-today calendar cell read failed', {
+          username: ctx.username,
+          reason: err instanceof Error ? err.message : String(err),
+        });
+      }
+    }
     res.status(404).json({ error: `No report for ${date}` });
     return;
   }

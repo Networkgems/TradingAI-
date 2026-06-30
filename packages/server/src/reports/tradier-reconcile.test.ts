@@ -7,6 +7,7 @@ import {
   computeBalanceDailyPnl,
   findPreviousBalanceSnapshot,
   isOptionCloseDescription,
+  liveBackfillWriteWindow,
   realizedOptionsPnlByCloseDate,
 } from './tradier-reconcile.js';
 
@@ -331,5 +332,35 @@ describe('realizedOptionsPnlByCloseDate', () => {
     ];
     const { realizedByDate } = realizedOptionsPnlByCloseDate(withEquity);
     expect(realizedByDate.has('2026-06-08')).toBe(false);
+  });
+});
+
+describe('liveBackfillWriteWindow (TRA-1192)', () => {
+  it('spans first-of-(this-N)-month through today (exclusive) + a fetch lookback', () => {
+    const { writeStart, fetchStart, end } = liveBackfillWriteWindow('2026-06-30', 1, 31);
+    expect(writeStart).toBe('2026-05-01'); // first of the previous month
+    expect(end).toBe('2026-06-30');        // today is the exclusive upper bound
+    expect(fetchStart).toBe('2026-03-31'); // 31 days before the write start
+  });
+
+  it('covers the whole current month with monthsBack=0 anchored at the 1st', () => {
+    const { writeStart, end } = liveBackfillWriteWindow('2026-06-15', 0, 31);
+    expect(writeStart).toBe('2026-06-01');
+    expect(end).toBe('2026-06-15');
+    expect(writeStart < end).toBe(true);
+  });
+
+  it('normalises across the year boundary (January → previous year)', () => {
+    const { writeStart, fetchStart } = liveBackfillWriteWindow('2026-01-10', 1, 31);
+    expect(writeStart).toBe('2025-12-01');
+    expect(fetchStart).toBe('2025-10-31');
+  });
+
+  it('window math is stable for a NEW account opened mid-month', () => {
+    // Account opened 2026-06-15; today 2026-06-30. The window must reach back to
+    // 2026-05-01 so June 1-14 (pre-snapshot) days are inside it and reconstructable.
+    const { writeStart } = liveBackfillWriteWindow('2026-06-30', 1, 31);
+    expect('2026-06-01' >= writeStart).toBe(true);
+    expect('2026-06-14' < '2026-06-30').toBe(true);
   });
 });

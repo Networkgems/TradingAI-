@@ -185,6 +185,38 @@ export function aggregateCashFlowByDate(
 }
 
 /**
+ * TRA-1192 — compute the rolling write/fetch window for the historical
+ * Live-calendar realized-P&L backfill. The write window spans the first of the
+ * month `monthsBack` months before `today` up to (but excluding) `today` —
+ * today is owned by the live-intraday cell + the 9 PM EOD snapshot, never the
+ * backfill. The fetch window starts `fetchLookbackDays` earlier so opens that
+ * pair with in-window closes are captured for FIFO matching.
+ *
+ * Replaces the original hardcoded `2026-06-01..2026-06-10` constants so a
+ * NEW live account opened mid-month still gets its earlier days reconstructed
+ * from broker fills, not just the days after its 9 PM snapshot first ran.
+ *
+ * @param today  ET calendar date `YYYY-MM-DD` (exclusive upper bound).
+ */
+export function liveBackfillWriteWindow(
+  today: string,
+  monthsBack: number,
+  fetchLookbackDays: number,
+): { writeStart: string; fetchStart: string; end: string } {
+  const [ty, tm] = today.split('-').map(Number); // tm is 1-based
+  // monthIndex for this month is tm-1; go `monthsBack` months earlier.
+  // Date.UTC normalises a negative month index across the year boundary.
+  const writeStartDate = new Date(Date.UTC(ty, tm - 1 - monthsBack, 1));
+  const writeStart = writeStartDate.toISOString().slice(0, 10);
+  const fetchStart = new Date(
+    writeStartDate.getTime() - fetchLookbackDays * 86_400_000,
+  )
+    .toISOString()
+    .slice(0, 10);
+  return { writeStart, fetchStart, end: today };
+}
+
+/**
  * TRA-359 — return the most recent balance snapshot strictly earlier
  * than `targetDate` (`YYYY-MM-DD`). Markets close Sat/Sun and holidays
  * so "yesterday" may be 1–3 calendar days back; we walk through the
