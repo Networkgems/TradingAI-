@@ -187,4 +187,50 @@ describe('PaperOptionsAccount option-trade journal emit (TRA-991)', () => {
     expect(summary.byStructure[0]!.structure).toBe('bull_put');
     expect(summary.byStructure[0]!.closed).toBe(1);
   });
+
+  // TRA-1183 — ema-pullback single-leg fills must be countable distinctly from
+  // bare single_leg_rv: the archetype tag rides the open row through to the
+  // journal and into the per-archetype rollup (which counts open rows too).
+  it('persists entryArchetype on the RV open row and counts it in byArchetype', async () => {
+    const acct = new PaperOptionsAccount({ initialEquity: 50_000, managedAccountRatio: 0.5 });
+
+    // An ema-pullback-admitted RV long (carries the archetype tag)...
+    const tagged = acct.openOptionFromRvCandidate(
+      buildRvSignal({ id: 'rv-ema', optionSymbol: 'MSFT240705C00400000' }),
+      'demo',
+      undefined,
+      undefined,
+      { ivRank: null, trend: 'up', entryDelta: 0.35, entryArchetype: 'ema-pullback' },
+    );
+    expect(tagged).not.toBeNull();
+    // ...and a bare RV long on a different OCC (no archetype → unspecified).
+    const bare = acct.openOptionFromRvCandidate(
+      buildRvSignal({ id: 'rv-bare', optionSymbol: 'MSFT240705C00410000', strike: 410 }),
+      'demo',
+      undefined,
+      undefined,
+      { ivRank: null, trend: 'up', entryDelta: 0.35 },
+    );
+    expect(bare).not.toBeNull();
+    await acct.flushOptionTradeJournal();
+
+    const rows = await listOptionTradeJournal();
+    expect(rows).toHaveLength(2);
+    const taggedRow = rows.find((r) => r.id === tagged!.id)!;
+    const bareRow = rows.find((r) => r.id === bare!.id)!;
+    expect(taggedRow.entryArchetype).toBe('ema-pullback');
+    // The bare RV open carries no archetype field at all (folds back as undefined).
+    expect(bareRow.entryArchetype).toBeUndefined();
+    // Both are the same structure — only the archetype distinguishes them.
+    expect(taggedRow.structure).toBe('single_leg_rv');
+    expect(bareRow.structure).toBe('single_leg_rv');
+
+    // The rollup counts the still-open fills per archetype (total counts opens too).
+    const summary = summarizeOptionTradeJournal(rows);
+    const ema = summary.byArchetype.find((a) => a.archetype === 'ema-pullback')!;
+    const unspec = summary.byArchetype.find((a) => a.archetype === 'unspecified')!;
+    expect(ema.total).toBe(1);
+    expect(ema.closed).toBe(0);
+    expect(unspec.total).toBe(1);
+  });
 });

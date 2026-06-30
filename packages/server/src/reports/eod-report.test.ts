@@ -496,6 +496,7 @@ describe('generateEodReport — TRA-594 calendar aggregation', () => {
         byStructure: [
           { structure: 'bull_put', closed: 1, realizedPnlUsd: 320, winRate: 1, avgR: 1 },
         ],
+        byArchetype: [],
       },
     });
 

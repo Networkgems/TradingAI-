@@ -107,6 +107,15 @@ export interface OptionTradeJournalOpen {
   atRiskUsd: number;
   /** Agent conviction [0,1] when an LLM advisory approved it; null otherwise. */
   agentConviction?: number | null;
+  /**
+   * TRA-1183 — the entry archetype that admitted this fill, e.g. `ema-pullback`
+   * (Trend-Pullback) or `volume-breakout`, sourced from the live signal reason in
+   * `signal-engine.ts`. Optional so pre-TRA-1183 rows (and every open that wasn't
+   * gated by a swing archetype) fold back as `undefined` rather than a synthetic
+   * label. Lets the fold count ema-pullback fills distinctly instead of burying
+   * them in bare `single_leg_rv`. Observe-only; never gates routing.
+   */
+  entryArchetype?: string;
 }
 
 /** The realized outcome, appended when the position closes. */
@@ -337,6 +346,25 @@ export interface OptionTradeJournalStructureStat {
 }
 
 /**
+ * TRA-1183 — per-archetype rollup row in {@link OptionTradeJournalSummary}.
+ * Unlike {@link OptionTradeJournalStructureStat}, `total` counts ALL rows (open +
+ * closed) for the archetype so the ema-pullback go/no-go ("fill count vs bare
+ * single_leg_rv rate") is measurable from the first fill, before any trade
+ * resolves. P&L / win-rate / avg-R remain over RESOLVED rows only. Rows with no
+ * archetype tag bucket under `unspecified` (the bare-RV baseline to compare
+ * against).
+ */
+export interface OptionTradeJournalArchetypeStat {
+  archetype: string;
+  /** All rows (open + closed) carrying this archetype — the headline count. */
+  total: number;
+  closed: number;
+  realizedPnlUsd: number;
+  winRate: number | null;
+  avgR: number | null;
+}
+
+/**
  * TRA-991 — headline rollup over journal rows, shared by the
  * `/api/health/option-journal` readout and the EOD report section. Counts cover
  * all rows (open + closed); P&L / win-rate / avg-R are over RESOLVED (closed)
@@ -358,6 +386,12 @@ export interface OptionTradeJournalSummary {
   avgR: number | null;
   /** Per-structure rollup, descending by closed count then |P&L|. */
   byStructure: OptionTradeJournalStructureStat[];
+  /**
+   * TRA-1183 — per-entry-archetype rollup, descending by total fills then
+   * |P&L|. Counts all fills (open + closed) per archetype so ema-pullback is
+   * countable distinctly from the bare-RV `unspecified` baseline.
+   */
+  byArchetype: OptionTradeJournalArchetypeStat[];
 }
 
 /** TRA-991 — fold journal rows into the headline summary. Pure. */
@@ -389,6 +423,35 @@ export function summarizeOptionTradeJournal(
     })
     .sort((a, b) => b.closed - a.closed || Math.abs(b.realizedPnlUsd) - Math.abs(a.realizedPnlUsd));
 
+  // TRA-1183 — per-archetype rollup. Buckets over ALL rows (open + closed) so a
+  // fresh, still-open ema-pullback fill is counted immediately; the bare-RV
+  // baseline (no archetype tag) folds under `unspecified`. Resolved-only stats
+  // mirror byStructure.
+  const byArch = new Map<string, OptionTradeJournalRecord[]>();
+  for (const r of rows) {
+    const key = r.entryArchetype ?? 'unspecified';
+    const list = byArch.get(key) ?? [];
+    list.push(r);
+    byArch.set(key, list);
+  }
+  const byArchetype: OptionTradeJournalArchetypeStat[] = [...byArch.entries()]
+    .map(([archetype, list]) => {
+      const resolved = list.filter((r) => r.outcome !== 'OPEN');
+      const c = resolved.length;
+      const wins = resolved.filter((r) => r.outcome === 'WIN').length;
+      const pnl = resolved.reduce((acc, r) => acc + (r.realizedPnlUsd ?? 0), 0);
+      const r = c > 0 ? resolved.reduce((acc, x) => acc + (x.realizedR ?? 0), 0) / c : null;
+      return {
+        archetype,
+        total: list.length,
+        closed: c,
+        realizedPnlUsd: pnl,
+        winRate: c > 0 ? wins / c : null,
+        avgR: r,
+      };
+    })
+    .sort((a, b) => b.total - a.total || Math.abs(b.realizedPnlUsd) - Math.abs(a.realizedPnlUsd));
+
   return {
     total: rows.length,
     open: rows.length - closed,
@@ -400,5 +463,6 @@ export function summarizeOptionTradeJournal(
     realizedPnlUsd,
     avgR,
     byStructure,
+    byArchetype,
   };
 }

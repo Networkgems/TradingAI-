@@ -3493,6 +3493,12 @@ export class SignalEngine {
           sentiment: null,
           sentimentIcBand: null,
           agentConviction: null,
+          // TRA-1183 — tag ema-pullback (Trend-Pullback) single-leg fills so they
+          // are countable distinctly from bare single_leg_rv in the journal
+          // rollup. `emaPullbackReason` is non-null only when the EMA-pullback
+          // sub-flag admitted this long (computed at ~:3156); a bare RV long
+          // leaves it undefined and folds under the `unspecified` baseline.
+          ...(emaPullbackReason ? { entryArchetype: 'ema-pullback' } : {}),
         };
         const opened = this.optionsAccount.openOptionFromRvCandidate(
           signal,

@@ -83,6 +83,13 @@ export interface OptionTradeJournalSetup {
    * the position's persisted `entryDelta`; spreads pass the short-leg |delta|.
    */
   entryDelta?: number | null;
+  /**
+   * TRA-1183 — entry archetype that admitted the fill (e.g. `ema-pullback`,
+   * `volume-breakout`), forwarded verbatim onto the journal open row so the
+   * ema-pullback fill count is distinguishable from bare `single_leg_rv`.
+   * Omitted/undefined for opens that weren't gated by a swing archetype.
+   */
+  entryArchetype?: string;
 }
 
 const MS_PER_DAY = 86_400_000;
@@ -515,6 +522,9 @@ export class PaperOptionsAccount {
       entryDte,
       atRiskUsd,
       agentConviction: setup.agentConviction ?? null,
+      // TRA-1183 — only stamp the archetype when the caller supplied one, so
+      // untagged opens omit the field entirely (folds back as undefined).
+      ...(setup.entryArchetype ? { entryArchetype: setup.entryArchetype } : {}),
     };
     this.journalWrites = this.journalWrites
       .then(() => recordOptionTradeOpen(open))
