@@ -22,7 +22,12 @@ function isWeekendIso(dateIso: string): boolean {
 
 // Compact P&L format matching the Webull reference: +$1.00K, -$234.56, --
 function fmtCompact(value: number): string {
-  if (value === 0) return '--';
+  // TRA-1192 — a day that HAS a report but netted zero realized P&L is still a
+  // *reported* day; render it as "$0.00", not "--". Only a date with no report
+  // at all renders "--" (handled at the call site by the `report ? … : --`
+  // guard). Conflating the two made every flat/in-progress day — and today's
+  // running cell before any close — look like missing data on the calendar.
+  if (value === 0) return '$0.00';
   const sign = value > 0 ? '+' : '-';
   const abs  = Math.abs(value);
   if (abs >= 1000) return `${sign}$${(abs / 1000).toFixed(2)}K`;
@@ -113,7 +118,7 @@ function MonthGrid({ year, month, reports, onSelectDate, cols }: {
 
             let cls = 'cal-cell';
             if (isToday)                               cls += ' cal-cell--today';
-            if (report && report.combinedPnl >= 0)     cls += ' cal-cell--win';
+            if (report && report.combinedPnl > 0)      cls += ' cal-cell--win';
             if (report && report.combinedPnl < 0)      cls += ' cal-cell--loss';
             if (clickable)                             cls += ' cal-cell--clickable';
 
