@@ -1983,7 +1983,14 @@ export class PaperOptionsAccount {
             }
             this.openOptions.delete(id);
             this.closedOptions.push({ ...opt });
-            this.queueJournalClose(opt, 'sl');
+            // TRA-1187 — journal the ACTUAL structural exit (`supertrend_flip` /
+            // `ma20_close_through` / `time_stop`) rather than the blanket `sl`.
+            // The broker order kind stays `sl` (above), but collapsing all three
+            // structural reasons to `sl` in the journal made the scratch
+            // population unattributable (every close read as `sl`). The hard
+            // premium-stop / trailing close path keeps its own `exitKind`
+            // (`sl` / `trail`) below, so the four exits are now distinguishable.
+            this.queueJournalClose(opt, reason);
             closed.push({ ...opt });
             continue;
           }

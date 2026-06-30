@@ -10,6 +10,7 @@ import {
   type OptionTradeJournalRecord,
 } from './option-trade-journal.js';
 import type { RelativeValueSignal } from '@trading-app/shared';
+import type { ExitState } from '@trading-app/engine';
 
 // TRA-991 — wiring test for the option-trade-journal emit (open + close). The
 // foundation (record/list/fold) is exercised by learned-option-weights.test.ts;
@@ -154,6 +155,46 @@ describe('PaperOptionsAccount option-trade journal emit (TRA-991)', () => {
     rows = await listOptionTradeJournal();
     expect(rows[0]!.outcome).toBe('LOSS');
     expect(rows[0]!.realizedR).toBeLessThan(0);
+  });
+
+  // TRA-1187 — a structural RV exit must journal its ACTUAL reason
+  // (supertrend_flip / ma20_close_through / time_stop), not the blanket `sl`.
+  // Before the fix every structural close folded under `sl`, which made the 83%
+  // scratch population unattributable on /api/health/option-journal.
+  it('journals the real structural exit reason (supertrend_flip), not the blanket sl', async () => {
+    const acct = new PaperOptionsAccount({ initialEquity: 50_000, managedAccountRatio: 0.5 });
+    const pos = acct.openOptionFromRvCandidate(buildRvSignal(), 'demo', undefined, undefined, {
+      ivRank: 30,
+      trend: 'up',
+      sentiment: null,
+    });
+    expect(pos).not.toBeNull();
+    await acct.flushOptionTradeJournal();
+
+    // A supertrend flip against a long call: side 'buy' + supertrendDirection
+    // 'red'. Mark 0.95 vs entry ~1.0 keeps it inside the scratch band and clear
+    // of the -50% premium stop, so the STRUCTURAL exit (not the hard SL) fires.
+    const exitState: ExitState = {
+      side: 'buy',
+      supertrendDirection: 'red',
+      underlyingClose: 400,
+      ma20: 399, // for a long, ma20-close-through needs close < ma20; 400 !< 399
+      entryPremium: pos!.premiumPaid,
+      currentPremium: 0.95,
+      barsHeld: 1,
+      hadFollowThrough: false,
+    };
+    const structuralExitStates = new Map<string, ExitState>([[pos!.id, exitState]]);
+    const optionMarks = new Map<string, number>([['MSFT240705C00400000', 0.95]]);
+
+    const closed = acct.checkExits(new Map([['MSFT', 400]]), optionMarks, 'demo', {}, structuralExitStates);
+    expect(closed).toHaveLength(1);
+    await acct.flushOptionTradeJournal();
+
+    const rows = await listOptionTradeJournal();
+    expect(rows[0]!.outcome).not.toBe('OPEN');
+    expect(rows[0]!.exitReason).toBe('supertrend_flip');
+    expect(rows[0]!.exitReason).not.toBe('sl');
   });
 
   it('no-ops when the journal flag is off (no setup-less or disabled writes)', async () => {
