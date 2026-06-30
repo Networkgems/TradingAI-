@@ -306,6 +306,24 @@ export function outcomeForR(realizedR: number, scratchBand = 0.1): OptionTradeOu
   return 'SCRATCH';
 }
 
+/** The DTE bands the close-row rollup splits on. */
+export type EntryDteBand = 'lt30' | '30to45' | 'gt45';
+
+/**
+ * TRA-1200 — entry-DTE → band around the engine's [30,45] preferred entry
+ * window. `30to45` is the current executing window; `gt45` isolates the wider
+ * TRA-1028 item-3 DTE-window swing fills (45–90 DTE) so the theta-vs-realized
+ * trade-off between the two can be measured per closed cohort. Canonical home
+ * for the band vocabulary — `learned-option-weights.ts` re-exports this as
+ * `dteBand` so the journal summary and the learned-weights fold can never split
+ * DTE on different thresholds.
+ */
+export function entryDteBand(dte: number): EntryDteBand {
+  if (dte < 30) return 'lt30';
+  if (dte > 45) return 'gt45';
+  return '30to45';
+}
+
 /** Journalled trades, ascending by open time, optionally windowed by open ts. */
 export async function listOptionTradeJournal(
   opts: { from?: number; to?: number; mode?: 'demo' | 'live' } = {},
@@ -359,9 +377,43 @@ export interface OptionTradeJournalArchetypeStat {
   /** All rows (open + closed) carrying this archetype — the headline count. */
   total: number;
   closed: number;
+  /**
+   * TRA-1200 — WIN/LOSS/SCRATCH split over this archetype's RESOLVED rows, the
+   * same columns `byExitReason` carries. Lets the per-item A/B re-test of the
+   * TRA-1028 sub-flags read win/loss/scratch by archetype (ema-pullback vs the
+   * bare `unspecified` baseline) instead of only a blended avg-R.
+   */
+  win: number;
+  loss: number;
+  scratch: number;
+  /** scratch / closed for this archetype; null when none closed. */
+  scratchRate: number | null;
   realizedPnlUsd: number;
   winRate: number | null;
   avgR: number | null;
+}
+
+/**
+ * TRA-1200 — per-entry-DTE-band rollup over RESOLVED rows. Splits closed trades
+ * on {@link entryDteBand} (`lt30` / `30to45` / `gt45`) so the DTE-window
+ * sub-flag's theta-vs-realized trade-off — the wider `gt45` swing window vs the
+ * `30to45` default — is measurable per closed cohort rather than blended into
+ * one book number. Same WIN/LOSS/SCRATCH/avgR/P&L columns as `byExitReason`;
+ * `avgEntryDte` exposes where inside each band the fills actually clustered.
+ * Observe-only.
+ */
+export interface OptionTradeJournalDteBandStat {
+  band: EntryDteBand;
+  closed: number;
+  win: number;
+  loss: number;
+  scratch: number;
+  scratchRate: number | null;
+  winRate: number | null;
+  avgR: number | null;
+  realizedPnlUsd: number;
+  /** Mean days-to-expiration at entry across this band's closed rows. */
+  avgEntryDte: number | null;
 }
 
 /**
@@ -427,6 +479,48 @@ export interface OptionTradeJournalSummary {
    * surface the hold-time-vs-DTE mismatch behind it.
    */
   byExitReason: OptionTradeJournalExitReasonStat[];
+  /**
+   * TRA-1200 — per-entry-DTE-band rollup over resolved rows, in canonical band
+   * order (lt30, 30to45, gt45). Quantifies the DTE-window sub-flag's trade-off
+   * so the wider swing window can earn (or fail) a promote-to-default verdict on
+   * attributed outcomes instead of a single blended book number.
+   */
+  byDte: OptionTradeJournalDteBandStat[];
+}
+
+/**
+ * TRA-1200 — the WIN/LOSS/SCRATCH/avgR/P&L columns over a set of already
+ * RESOLVED rows. byArchetype, byExitReason, and byDte all need the identical
+ * resolved-row columns; folding them here is the single source so the three
+ * rollups can never drift on how a scratch rate or avg-R is computed.
+ */
+interface ResolvedRollup {
+  closed: number;
+  win: number;
+  loss: number;
+  scratch: number;
+  scratchRate: number | null;
+  winRate: number | null;
+  avgR: number | null;
+  realizedPnlUsd: number;
+}
+function rollupResolved(resolved: OptionTradeJournalRecord[]): ResolvedRollup {
+  const c = resolved.length;
+  const win = resolved.filter((r) => r.outcome === 'WIN').length;
+  const loss = resolved.filter((r) => r.outcome === 'LOSS').length;
+  const scratch = resolved.filter((r) => r.outcome === 'SCRATCH').length;
+  const realizedPnlUsd = resolved.reduce((acc, r) => acc + (r.realizedPnlUsd ?? 0), 0);
+  const avgR = c > 0 ? resolved.reduce((acc, r) => acc + (r.realizedR ?? 0), 0) / c : null;
+  return {
+    closed: c,
+    win,
+    loss,
+    scratch,
+    scratchRate: c > 0 ? scratch / c : null,
+    winRate: c > 0 ? win / c : null,
+    avgR,
+    realizedPnlUsd,
+  };
 }
 
 /** TRA-991 — fold journal rows into the headline summary. Pure. */
@@ -472,18 +566,9 @@ export function summarizeOptionTradeJournal(
   const byArchetype: OptionTradeJournalArchetypeStat[] = [...byArch.entries()]
     .map(([archetype, list]) => {
       const resolved = list.filter((r) => r.outcome !== 'OPEN');
-      const c = resolved.length;
-      const wins = resolved.filter((r) => r.outcome === 'WIN').length;
-      const pnl = resolved.reduce((acc, r) => acc + (r.realizedPnlUsd ?? 0), 0);
-      const r = c > 0 ? resolved.reduce((acc, x) => acc + (x.realizedR ?? 0), 0) / c : null;
-      return {
-        archetype,
-        total: list.length,
-        closed: c,
-        realizedPnlUsd: pnl,
-        winRate: c > 0 ? wins / c : null,
-        avgR: r,
-      };
+      // TRA-1200 — same WIN/LOSS/SCRATCH/avgR/P&L columns as byExitReason so the
+      // per-item A/B re-test reads archetype outcomes, not just a blended avg-R.
+      return { archetype, total: list.length, ...rollupResolved(resolved) };
     })
     .sort((a, b) => b.total - a.total || Math.abs(b.realizedPnlUsd) - Math.abs(a.realizedPnlUsd));
 
@@ -504,28 +589,34 @@ export function summarizeOptionTradeJournal(
     return vals.length > 0 ? vals.reduce((a, v) => a + v, 0) / vals.length : null;
   };
   const byExitReason: OptionTradeJournalExitReasonStat[] = [...byReason.entries()]
-    .map(([exitReason, list]) => {
-      const c = list.length;
-      const wins = list.filter((r) => r.outcome === 'WIN').length;
-      const losses = list.filter((r) => r.outcome === 'LOSS').length;
-      const scratches = list.filter((r) => r.outcome === 'SCRATCH').length;
-      const pnl = list.reduce((acc, r) => acc + (r.realizedPnlUsd ?? 0), 0);
-      const r = c > 0 ? list.reduce((acc, x) => acc + (x.realizedR ?? 0), 0) / c : null;
-      return {
-        exitReason,
-        closed: c,
-        win: wins,
-        loss: losses,
-        scratch: scratches,
-        scratchRate: c > 0 ? scratches / c : null,
-        winRate: c > 0 ? wins / c : null,
-        avgR: r,
-        realizedPnlUsd: pnl,
-        avgHoldDays: meanOf(list, (x) => x.holdDays),
-        avgEntryDte: meanOf(list, (x) => x.entryDte),
-      };
-    })
+    .map(([exitReason, list]) => ({
+      exitReason,
+      ...rollupResolved(list),
+      avgHoldDays: meanOf(list, (x) => x.holdDays),
+      avgEntryDte: meanOf(list, (x) => x.entryDte),
+    }))
     .sort((a, b) => b.closed - a.closed || b.scratch - a.scratch);
+
+  // TRA-1200 — per-entry-DTE-band rollup over RESOLVED rows. Splits the closed
+  // book on `entryDteBand` so the DTE-window sub-flag's wider `gt45` swing
+  // window can be measured against the `30to45` default instead of blended into
+  // one number. Emitted in canonical band order (lt30, 30to45, gt45) so the
+  // readout reads ascending in DTE rather than by count.
+  const byDteMap = new Map<EntryDteBand, OptionTradeJournalRecord[]>();
+  for (const r of closedRows) {
+    const band = entryDteBand(r.entryDte);
+    const list = byDteMap.get(band) ?? [];
+    list.push(r);
+    byDteMap.set(band, list);
+  }
+  const dteBandOrder: EntryDteBand[] = ['lt30', '30to45', 'gt45'];
+  const byDte: OptionTradeJournalDteBandStat[] = [...byDteMap.entries()]
+    .map(([band, list]) => ({
+      band,
+      ...rollupResolved(list),
+      avgEntryDte: meanOf(list, (x) => x.entryDte),
+    }))
+    .sort((a, b) => dteBandOrder.indexOf(a.band) - dteBandOrder.indexOf(b.band));
 
   return {
     total: rows.length,
@@ -540,5 +631,6 @@ export function summarizeOptionTradeJournal(
     byStructure,
     byArchetype,
     byExitReason,
+    byDte,
   };
 }

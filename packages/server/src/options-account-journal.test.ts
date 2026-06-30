@@ -324,4 +324,59 @@ describe('PaperOptionsAccount option-trade journal emit (TRA-991)', () => {
     const scratchAcrossReasons = summary.byExitReason.reduce((acc, r) => acc + r.scratch, 0);
     expect(scratchAcrossReasons).toBe(summary.scratch);
   });
+
+  // TRA-1200 — closed-row attribution must split per entry-DTE band AND carry
+  // the full WIN/LOSS/SCRATCH columns per archetype, so the three TRA-1028
+  // sub-flags can earn a per-item promote/fail verdict on real outcomes.
+  it('splits closed rows by DTE band and reports per-archetype win/loss/scratch', () => {
+    const base = {
+      symbol: 'MSFT',
+      structure: 'single_leg_rv',
+      mode: 'demo' as const,
+      ivRank: null,
+      trend: 'up' as const,
+      sentiment: null,
+      entryDelta: 0.35,
+      atRiskUsd: 100,
+    };
+    const rows: OptionTradeJournalRecord[] = [
+      // 30to45 band: one ema-pullback win + one bare scratch.
+      { ...base, id: 'a', openTs: 0, entryDte: 35, entryArchetype: 'ema-pullback',
+        outcome: 'WIN', realizedPnlUsd: 30, realizedR: 0.3, exitReason: 'tp1', holdDays: 3 },
+      { ...base, id: 'b', openTs: 0, entryDte: 40, outcome: 'SCRATCH',
+        realizedPnlUsd: 1, realizedR: 0.01, exitReason: 'time_stop', holdDays: 1 },
+      // gt45 band: one volume-breakout loss (the wider DTE window cohort).
+      { ...base, id: 'c', openTs: 0, entryDte: 55, entryArchetype: 'volume-breakout',
+        structure: 'bull_put', outcome: 'LOSS', realizedPnlUsd: -50, realizedR: -0.5,
+        exitReason: 'sl', holdDays: 4 },
+      // lt30 band, still OPEN — excluded from every resolved rollup.
+      { ...base, id: 'd', openTs: 0, entryDte: 20, outcome: 'OPEN' },
+    ];
+
+    const summary = summarizeOptionTradeJournal(rows);
+
+    // byDte: three closed rows split lt30/30to45/gt45, emitted in band order.
+    expect(summary.byDte.map((d) => d.band)).toEqual(['30to45', 'gt45']);
+    const mid = summary.byDte.find((d) => d.band === '30to45')!;
+    expect(mid.closed).toBe(2);
+    expect(mid.win).toBe(1);
+    expect(mid.scratch).toBe(1);
+    expect(mid.avgEntryDte).toBeCloseTo(37.5, 5);
+    const wide = summary.byDte.find((d) => d.band === 'gt45')!;
+    expect(wide.closed).toBe(1);
+    expect(wide.loss).toBe(1);
+    expect(wide.realizedPnlUsd).toBe(-50);
+    // Closed counts reconcile across bands to the headline closed total.
+    expect(summary.byDte.reduce((acc, d) => acc + d.closed, 0)).toBe(summary.closed);
+
+    // byArchetype now carries the win/loss/scratch columns over resolved rows.
+    const vol = summary.byArchetype.find((x) => x.archetype === 'volume-breakout')!;
+    expect(vol.total).toBe(1);
+    expect(vol.closed).toBe(1);
+    expect(vol.loss).toBe(1);
+    expect(vol.scratchRate).toBe(0);
+    const ema = summary.byArchetype.find((x) => x.archetype === 'ema-pullback')!;
+    expect(ema.win).toBe(1);
+    expect(ema.winRate).toBe(1);
+  });
 });

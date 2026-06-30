@@ -498,6 +498,7 @@ describe('generateEodReport — TRA-594 calendar aggregation', () => {
         ],
         byArchetype: [],
         byExitReason: [],
+        byDte: [],
       },
     });
 

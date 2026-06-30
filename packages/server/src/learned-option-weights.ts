@@ -12,6 +12,11 @@ import type {
   OptionTradeJournalRecord,
   SentimentIcBand,
 } from './option-trade-journal.js';
+// TRA-1200 — single home for the DTE band vocabulary lives in the journal
+// module (the base layer); re-export it as `dteBand` so the learned-weights
+// fold and the journal summary can never split DTE on different thresholds.
+import { entryDteBand as dteBand } from './option-trade-journal.js';
+export { dteBand };
 
 // TRA-990 (Learning B) — fold the option-trade journal into learned, bounded
 // scoring weights, the options analog of `learned-signal-weights.ts`.
@@ -114,12 +119,6 @@ export function sentimentBand(sentiment: number | null): 'bearish' | 'neutral' |
   return 'neutral';
 }
 
-/** Entry DTE → band around the engine's [30,45] preferred entry window. */
-export function dteBand(dte: number): 'lt30' | '30to45' | 'gt45' {
-  if (dte < 30) return 'lt30';
-  if (dte > 45) return 'gt45';
-  return '30to45';
-}
 
 /**
  * TRA-993 — sentiment-IC grade band → fold key. A missing grade (`null`/absent)

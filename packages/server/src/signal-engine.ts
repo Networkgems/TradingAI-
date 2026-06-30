@@ -3311,9 +3311,31 @@ export class SignalEngine {
                   timestamp: asOf,
                 });
                 if (selectorResult.decision === 'signal') {
+                  // TRA-1200 — journal the high-IVR breakout spread open
+                  // (previously this path passed NO journalSetup, so the spread
+                  // never journalled: byStructure read 0 spreads and the
+                  // volume-breakout archetype was invisible on closed rows). Tag
+                  // `volume-breakout` ONLY when the sub-flag admitted it via the
+                  // volume-confirmed gate (mirrors how the RV long tags
+                  // ema-pullback only when its sub-flag fired); a bare Donchian
+                  // breakout folds under the `unspecified` baseline. `ivRank` is
+                  // known here (>25), so unlike the RV-long path this row carries
+                  // a real IV band.
+                  const breakoutJournalSetup: OptionTradeJournalSetup = {
+                    ivRank,
+                    trend: execTrend === 'up' ? 'up' : execTrend === 'down' ? 'down' : 'sideways',
+                    sentiment: null,
+                    sentimentIcBand: null,
+                    agentConviction: null,
+                    ...(isOptionVolumeBreakoutEnabled()
+                      ? { entryArchetype: 'volume-breakout' }
+                      : {}),
+                  };
                   const opened = this.optionsAccount.openDefinedRiskSpread(
                     shadowSignalToSpreadParams(selectorResult.signal, snap.spot),
                     this.mode,
+                    undefined,
+                    breakoutJournalSetup,
                   );
                   if (opened) {
                     log.info('RV spread opened via high-IVR routing (TRA-1024)', {
