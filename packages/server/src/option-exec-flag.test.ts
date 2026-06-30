@@ -6,6 +6,9 @@ import {
   isOptionDemoDirectionalEnabled,
   resolveRvLongDteOverride,
   resolveRvMinDailyVolume,
+  isOptionIvRvScannerEnabled,
+  isOptionIvRvRoutingEnabled,
+  resolveIvRvRoutingOverride,
   OPTION_EXEC_FLAG,
   OPTION_EMA_PULLBACK_FLAG,
   OPTION_VOLUME_BREAKOUT_FLAG,
@@ -13,6 +16,10 @@ import {
   OPTION_RV_LONG_DTE_MIN_VAR,
   OPTION_RV_LONG_DTE_MAX_VAR,
   OPTION_RV_MIN_DAILY_VOLUME_VAR,
+  OPTION_IV_RV_SCANNER_FLAG,
+  OPTION_IV_RV_ROUTING_FLAG,
+  OPTION_IV_RV_BUY_RATIO_VAR,
+  OPTION_IV_RV_MISPRICING_PCT_VAR,
 } from './option-exec-flag.js';
 
 const ON = '1';
@@ -107,5 +114,47 @@ describe('resolveRvMinDailyVolume (TRA-1057)', () => {
     expect(resolveRvMinDailyVolume({ [OPTION_RV_MIN_DAILY_VOLUME_VAR]: '0' })).toBe(0);
     expect(resolveRvMinDailyVolume({ [OPTION_RV_MIN_DAILY_VOLUME_VAR]: '-5' })).toBe(0);
     expect(resolveRvMinDailyVolume({ [OPTION_RV_MIN_DAILY_VOLUME_VAR]: 'abc' })).toBe(0);
+  });
+});
+
+describe('isOptionIvRvRoutingEnabled (TRA-1203)', () => {
+  it('requires the IV-RV scanner flag too — inert on its own', () => {
+    // routing sub-flag alone does nothing without the scanner flag
+    expect(isOptionIvRvRoutingEnabled({ [OPTION_IV_RV_ROUTING_FLAG]: ON })).toBe(false);
+    // scanner on but routing off -> still observe-only
+    expect(isOptionIvRvRoutingEnabled({ [OPTION_IV_RV_SCANNER_FLAG]: ON })).toBe(false);
+    // both on -> routing live
+    expect(
+      isOptionIvRvRoutingEnabled({ [OPTION_IV_RV_SCANNER_FLAG]: ON, [OPTION_IV_RV_ROUTING_FLAG]: ON }),
+    ).toBe(true);
+  });
+
+  it('does not flip the observe-only scanner flag', () => {
+    expect(isOptionIvRvScannerEnabled({ [OPTION_IV_RV_ROUTING_FLAG]: ON })).toBe(false);
+  });
+});
+
+describe('resolveIvRvRoutingOverride (TRA-1203)', () => {
+  it('defaults to undefined bounds so the engine 0.70/0.25 defaults stand', () => {
+    expect(resolveIvRvRoutingOverride({})).toEqual({
+      buyIvRvRatio: undefined,
+      mispricingThresholdPct: undefined,
+    });
+  });
+
+  it('parses positive float overrides', () => {
+    expect(
+      resolveIvRvRoutingOverride({
+        [OPTION_IV_RV_BUY_RATIO_VAR]: '0.85',
+        [OPTION_IV_RV_MISPRICING_PCT_VAR]: '0.15',
+      }),
+    ).toEqual({ buyIvRvRatio: 0.85, mispricingThresholdPct: 0.15 });
+  });
+
+  it('rejects a buy ratio >= 1 (would fire on rich premium) and non-positive/non-finite values', () => {
+    expect(resolveIvRvRoutingOverride({ [OPTION_IV_RV_BUY_RATIO_VAR]: '1' }).buyIvRvRatio).toBeUndefined();
+    expect(resolveIvRvRoutingOverride({ [OPTION_IV_RV_BUY_RATIO_VAR]: '1.4' }).buyIvRvRatio).toBeUndefined();
+    expect(resolveIvRvRoutingOverride({ [OPTION_IV_RV_MISPRICING_PCT_VAR]: '0' }).mispricingThresholdPct).toBeUndefined();
+    expect(resolveIvRvRoutingOverride({ [OPTION_IV_RV_MISPRICING_PCT_VAR]: 'abc' }).mispricingThresholdPct).toBeUndefined();
   });
 });

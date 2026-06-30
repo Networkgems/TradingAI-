@@ -1,5 +1,5 @@
 import { OrbStrategy, BbFadeStrategy, IchimokuStrategy, SupertrendConfluenceStrategy, confluenceSide, supertrend, reversalChecklist, adx, atr, donchian, supportResistance, blackScholesDelta, daysToExpiration, selectRvLongCandidate, selectShadowOptionSignal, emaPullbackTrigger, volumeConfirmedBreakout, TradierOptionsClient, TradierOrderClient, TRADIER_REJECTED_STATUSES, evaluateSma200, SMA200_MIN_BARS, SMA200_DEBOUNCE_BARS, composeTechnicalSnapshot, resampleCandles, TF_BUCKET_MS, OptionsRiskBreaker, DEFAULT_OPTIONS_BREAKER_PARAMS } from '@trading-app/engine';
-import type { StrategySelectorInput, ContractQuote, OptionTrend, RvLongTrendSide, ExitState, SharedTickIndicators, RelativeValueScannerOptions, OptionChainRow } from '@trading-app/engine';
+import type { StrategySelectorInput, ContractQuote, OptionTrend, RvLongTrendSide, ExitState, SharedTickIndicators, RelativeValueScannerOptions, OptionChainRow, IvRvScannerOptions, IvRvMispricingCandidate } from '@trading-app/engine';
 import type { TradierAccountBalance } from '@trading-app/engine';
 import { WATCHLIST, isLiquidSwingSymbol, checkEquitySwingClose, MANAGED_ACCOUNT_RATIO, MAX_CONSECUTIVE_LOSSES, DAILY_DRAWDOWN_HALT_PCT, OPTIONS_PER_TICKET_DOLLAR_FLOOR, OPTIONS_POSITION_CAP_RATIO, aliasWatchlistSymbol, isLiveTradierOptionsEnabled, isStockMarketOpen, perPositionCap, resolveAutoManageImportedTradierOptions, resolveDemoCostModel, resolveHoldLiveOptionsOvernight, resolveSwingHoldOptions, resolveLiveTradeEquitiesTradier, resolveManagedAccountRatio, resolveMarketReviewGatesEnabled, resolveRiskPerTrade, resolveRvDtePrefs, resolveTradierOptionsCreds, validateBracket, DEFAULT_RV_DTE_MIN, DEFAULT_RV_DTE_MAX, DEFAULT_RV_DTE_TARGET, scoreNewsSentiment, aggregateSymbolSentiment, aggregateFedSentiment, aggregateStockTwitsSentiment, dedupeStockTwitsMessages, mapCuratedMessagesBySymbol, nameAliasesFor, evaluateEquityDcaAdd, evaluateOptionDcaAdd, CONVICTION_DCA, blendedAverage, positionRiskDollars, minutesToSessionClose, getEasternUtcOffset, isAgentTradingWindowOpen } from '@trading-app/shared';
 import type { TradeSignal, RelativeValueSignal, Sma200Signal, Candle, OptionsAccountState, SignalType, Position, OptionPosition, AccountMode, AccountSettings, AccountState, NewsItem, SymbolSentiment, SocialSentiment, StockTwitsMessage, TechnicalSignalSnapshot, TradierEnv, MarketReview, MarketReviewGates, EngineMarketReviewState, GatedStrategyNote, AgentRecommendation, TradeProposal, AgentOrderAudit, GuardrailVerdict, OptionType } from '@trading-app/shared';
@@ -48,7 +48,7 @@ import {
   optionJournalToStrategyRows,
 } from './strategy-introspection.js';
 import { isOptionShadowEnabled, isOptionPhaseBEnabled, emitShadowOptionSignal, shadowSignalToSpreadParams, OPTION_SHADOW_EMERGENCY_OFF, DEMO_SPREAD_MAX_LOSS_PCT_CAP } from './option-shadow-ledger.js';
-import { isOptionExecEnabled, isOptionEmaPullbackEnabled, isOptionVolumeBreakoutEnabled, resolveRvLongDteOverride, resolveRvMinDailyVolume, isOptionDemoDirectionalEnabled, isOptionIvRvScannerEnabled } from './option-exec-flag.js';
+import { isOptionExecEnabled, isOptionEmaPullbackEnabled, isOptionVolumeBreakoutEnabled, resolveRvLongDteOverride, resolveRvMinDailyVolume, isOptionDemoDirectionalEnabled, isOptionIvRvScannerEnabled, isOptionIvRvRoutingEnabled, resolveIvRvRoutingOverride } from './option-exec-flag.js';
 import { scanIvRvFromSnapshot, recordIvRvScan } from './iv-rv-scanner.js';
 import { etDateString } from './scheduler.js';
 // TRA-995 (epic-C, self-regulation) — the standing risk autopilot. A pure
@@ -4265,16 +4265,41 @@ export class SignalEngine {
    * cache → no extra Tradier call), reads the underlying's daily closes off the
    * {@link dailyCloseCache} the technical-snapshot pass populated, runs
    * {@link scanIvRvFromSnapshot}, and records the result into the in-memory store
-   * backing `GET /api/health/iv-rv`. It places NO orders and touches no account —
-   * routing into the paper book waits on QuantTrader's threshold sign-off
-   * (parent TRA-1155). Defense-in-depth: re-checks the flag + demo mode + scanner
-   * so a direct unit-test call also no-ops with the flag off and never trades.
+   * backing `GET /api/health/iv-rv`.
+   *
+   * TRA-1203 — when `ENABLE_OPTION_IV_RV_ROUTING` is ALSO on (board: "try
+   * mispriced options for the rest of the week instead of relative value"), the
+   * scan stops being observe-only and the top BUY_PREMIUM candidate per symbol
+   * (IV cheap vs realised → premium underpriced) is opened on the DEMO paper book
+   * via {@link PaperOptionsAccount.openOptionFromRvCandidate} (`mode:'demo'`, no
+   * equity override → no Tradier mirror, no live capital), journal-tagged
+   * `entryArchetype:'iv-rv-buy-premium'` so TRA-1200's byArchetype rollup
+   * attributes it separately from bare `single_leg_rv`. SELL_PREMIUM (IV rich)
+   * candidates are logged but NOT routed — the demo single-leg book is long-only,
+   * so shorting premium would need a defined-risk spread (future work).
+   *
+   * Defense-in-depth: re-checks the flag + demo mode + scanner so a direct
+   * unit-test call also no-ops with the flag off and never trades. Live promotion
+   * stays gated on TRA-382 regardless.
    */
   private async evaluateIvRvScan(symbols: string[]): Promise<void> {
     if (!isOptionIvRvScannerEnabled() || this.mode !== 'demo' || !this.rvScanner) return;
 
     const asOf = Date.now();
     const dtePrefs = { min: this.rvDteMin, max: this.rvDteMax, target: this.rvDteTarget };
+
+    // TRA-1203 — routing layered on the scanner flag. When off the pass stays
+    // observe-only (scanOptions empty ⇒ the documented 0.70/0.25 engine defaults
+    // back the diagnostics store, unchanged). When on, optional env thresholds
+    // tune what routes so a calm tape can still produce observable fills.
+    const routingEnabled = isOptionIvRvRoutingEnabled();
+    const routeOverride = routingEnabled ? resolveIvRvRoutingOverride() : { buyIvRvRatio: undefined, mispricingThresholdPct: undefined };
+    const scanOptions: IvRvScannerOptions = routingEnabled
+      ? {
+          ...(routeOverride.buyIvRvRatio !== undefined ? { buyIvRvRatio: routeOverride.buyIvRvRatio } : {}),
+          ...(routeOverride.mispricingThresholdPct !== undefined ? { mispricingThresholdPct: routeOverride.mispricingThresholdPct } : {}),
+        }
+      : {};
 
     for (const sym of symbols) {
       try {
@@ -4285,18 +4310,27 @@ export class SignalEngine {
         const result = scanIvRvFromSnapshot(
           { symbol: snap.symbol, spot: snap.spot, expiration: snap.expiration, rows: snap.rows },
           dailyCloses,
+          scanOptions,
         );
         recordIvRvScan(result, asOf);
 
         if (result.candidates.length > 0) {
-          log.info('iv-rv mispricing candidates (TRA-1156, observe-only)', {
+          log.info('iv-rv mispricing candidates (TRA-1156)', {
             symbol: result.symbol,
             expiration: result.expiration,
             realizedVol: result.realizedVol,
             candidateCount: result.candidates.length,
             top: result.candidates[0]?.optionSymbol,
             topAction: result.candidates[0]?.action,
+            routing: routingEnabled,
           });
+        }
+
+        // TRA-1203 — route the strongest BUY_PREMIUM (underpriced) candidate onto
+        // the demo paper book. Candidates are already score-sorted (strongest edge
+        // first); take the first BUY_PREMIUM. SELL_PREMIUM is observe-only here.
+        if (routingEnabled) {
+          this.routeIvRvBuyPremium(sym, snap, result, asOf);
         }
       } catch (err: unknown) {
         log.warn('iv-rv scan eval threw', {
@@ -4305,6 +4339,105 @@ export class SignalEngine {
         });
       }
     }
+  }
+
+  /**
+   * TRA-1203 — open the strongest BUY_PREMIUM IV-RV candidate for one symbol on
+   * the demo paper book (the "mispriced value" entry). Mirrors the demo
+   * directional open path: dedup the OCC within the hour, stamp the trailing-year
+   * IV-rank (warming the store like TRA-1153), journal-tag `iv-rv-buy-premium`,
+   * and open via the single-leg `openOptionFromRvCandidate` (`mode:'demo'`, no
+   * equity override → no Tradier mirror). The account's window/dedup/daily-cap/
+   * sizing gates still bound it. Caller-gated to routing-on + demo mode.
+   */
+  private routeIvRvBuyPremium(
+    sym: string,
+    snap: { spot: number; expiration: string; rows: OptionChainRow[] },
+    result: { candidates: IvRvMispricingCandidate[] },
+    asOf: number,
+  ): void {
+    const buy = result.candidates.find((c) => c.action === 'BUY_PREMIUM');
+    if (!buy) return;
+
+    // Dedup: same OCC opened/fired in the last hour — don't re-enter the same
+    // contract on every pass while it stays the strongest candidate.
+    const recentDup = this.recentSignals.find(
+      (s) => s.type === 'relative_value'
+        && (s as RelativeValueSignal).optionSymbol === buy.optionSymbol
+        && asOf - s.timestamp < 60 * 60_000,
+    );
+    if (recentDup) return;
+
+    const spot = snap.spot;
+    // Warm the trailing-year IV store + stamp the journal IV-rank (TRA-1153), the
+    // chain is already in hand so this adds no per-symbol fetch.
+    const atmIv = atmIvFromRows(snap.rows, spot);
+    if (atmIv != null) void recordDailyIv(sym, atmIv, asOf).catch(() => {});
+    const ivRank = atmIv != null ? ivRankSync(sym, atmIv, asOf) : null;
+
+    const signal: RelativeValueSignal = {
+      id: randomUUID(),
+      symbol: sym,
+      type: 'relative_value',
+      side: 'buy',
+      entryPrice: buy.mark,
+      stopLoss: 0,
+      takeProfit: 0,
+      riskRewardRatio: 2,
+      timestamp: asOf,
+      optionSymbol: buy.optionSymbol,
+      optionType: buy.optionType,
+      strike: buy.strike,
+      expiration: buy.expiration,
+      mark: buy.mark,
+      // Mispriced-value reference is the realised-vol BS fair value, not a skew
+      // fit — report it as `fairPrice` so the journal/feed render cleanly.
+      fairPrice: buy.fairValue,
+      mispricingPct: buy.mispricingPct,
+      zScore: 0,
+      ivFitted: buy.impliedVol,
+      ivUsed: buy.impliedVol,
+      delta: buy.delta,
+      reason: `iv-rv mispriced (TRA-1203): ${buy.reason}`,
+      sleeve: 'directional',
+    };
+
+    const journalSetup: OptionTradeJournalSetup = {
+      ivRank,
+      trend: buy.optionType === 'call' ? 'up' : 'down',
+      entryDelta: buy.delta,
+      sentiment: null,
+      sentimentIcBand: null,
+      agentConviction: null,
+      // Attribution hook: separates these fills from bare single_leg_rv in the
+      // TRA-1200 byArchetype rollup — how the board reads "mispriced vs RV".
+      entryArchetype: 'iv-rv-buy-premium',
+    };
+
+    const opened = this.optionsAccount.openOptionFromRvCandidate(
+      signal,
+      this.mode,
+      undefined,
+      spot,
+      journalSetup,
+    );
+    if (!opened) return;
+
+    this.emitOptionFillAlert(opened);
+    signal.mode = this.mode;
+    this.recentSignals.unshift(signal);
+    this.emitSignalAlert(signal);
+    if (this.recentSignals.length > MAX_SIGNALS) this.recentSignals.pop();
+    this.dailySignals.push({ id: signal.id, symbol: signal.symbol, type: 'relative_value', firedAt: signal.timestamp });
+    log.info('iv-rv mispriced option opened (TRA-1203)', {
+      symbol: sym,
+      optionType: signal.optionType,
+      strike: signal.strike,
+      expiration: signal.expiration,
+      mark: signal.mark,
+      ivRvRatio: buy.ivRvRatio,
+      mispricingPct: buy.mispricingPct,
+    });
   }
 
   private async evaluateOptionShadow(symbols: string[]): Promise<void> {

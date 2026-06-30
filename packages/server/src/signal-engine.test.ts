@@ -21,8 +21,13 @@ import { setIvStoreFileForTests, initIvRankStore, recordDailyIv, ivRankSync } fr
 import {
   setOptionTradeJournalFileForTests,
   listOptionTradeJournal,
+  OPTION_TRADE_JOURNAL_FLAG,
 } from './option-trade-journal.js';
-import { OPTION_DEMO_DIRECTIONAL_FLAG } from './option-exec-flag.js';
+import {
+  OPTION_DEMO_DIRECTIONAL_FLAG,
+  OPTION_IV_RV_SCANNER_FLAG,
+  OPTION_IV_RV_ROUTING_FLAG,
+} from './option-exec-flag.js';
 import { resetProposalStoreForTests, listProposals, getProposal } from './proposal-store.js';
 import { PaperAccount } from './paper-account.js';
 import type { RelativeValueScannerService, RelativeValueScanResult, SelectorChainSnapshot } from './relative-value-scanner.js';
@@ -4957,5 +4962,119 @@ describe('activeEquityDailyLimit / activeOptionsDailyLimit mode isolation (TRA-3
     // its own default); the equity cap must never be undefined.
     expect(activeOptionsDailyLimit(undefined)).toBeUndefined();
     expect(activeEquityDailyLimit(undefined)).toBe(10);
+  });
+});
+
+// TRA-1203 — board: "try mispriced options for the rest of the week instead of
+// relative value". The TRA-1156 IV-vs-realised-vol scan was observe-only; this
+// proves the new routing sub-flag turns the strongest BUY_PREMIUM (IV cheap vs
+// realised → premium underpriced) candidate into a REAL demo paper open,
+// journal-tagged `iv-rv-buy-premium` so it attributes separately from bare
+// `single_leg_rv`, and stays wholly observe-only (no fills) when routing is off.
+describe('SignalEngine — IV-RV mispriced routing (TRA-1203)', () => {
+  // A liquid chain whose contracts carry a DELIBERATELY LOW implied vol (smvVol),
+  // so against a high realised vol they price as BUY_PREMIUM (cheap premium).
+  function cheapVolChain(sym: string, spot: number, iv = 0.18) {
+    const rows = [];
+    const extrinsic = (kStrike: number) => Math.max(0.3, 2.0 - 0.08 * Math.abs(kStrike - spot));
+    for (let kStrike = spot - 5; kStrike <= spot + 5; kStrike += 1) {
+      const callMid = Math.max(spot - kStrike, 0) + extrinsic(kStrike);
+      const putMid = Math.max(kStrike - spot, 0) + extrinsic(kStrike);
+      rows.push({ optionSymbol: `${sym}C${kStrike}`, underlying: sym, optionType: 'call' as const, strike: kStrike, expiration: '2024-07-19', bid: callMid * 0.99, ask: callMid * 1.01, openInterest: 5000, volume: 800, smvVol: iv });
+      rows.push({ optionSymbol: `${sym}P${kStrike}`, underlying: sym, optionType: 'put' as const, strike: kStrike, expiration: '2024-07-19', bid: putMid * 0.99, ask: putMid * 1.01, openInterest: 5000, volume: 800, smvVol: iv });
+    }
+    return rows;
+  }
+  // Daily closes alternating ±5% → high realised vol (~0.79 annualised), so the
+  // 0.18 contract IV is well under realised → BUY_PREMIUM with a deep negative
+  // mispricingPct (mark far below the realised-vol BS fair value).
+  function highRvCloses(n = 40): number[] {
+    const closes: number[] = [];
+    for (let i = 0; i < n; i++) closes.push(i % 2 === 0 ? 100 : 105);
+    return closes;
+  }
+  function scannerFor(snaps: Record<string, SelectorChainSnapshot>): RelativeValueScannerService {
+    return {
+      scan: vi.fn(async () => ({ symbol: '', spot: null, expiration: null, candidates: [], reason: 'ok' as const })),
+      getSelectorChain: vi.fn(async (sym: string) => snaps[sym] ?? null),
+      getOptionMark: vi.fn(async () => null),
+      diagnostics: vi.fn(() => ({ configured: true, breakerOpen: false, breakerOpenedAtMs: null, cacheSize: 0, expirationsCacheSize: 0, chainCacheMaxEntries: 64, expirationsCacheMaxEntries: 64 })),
+    };
+  }
+  function runScan(engine: SignalEngine, syms: string[]): Promise<void> {
+    return (engine as unknown as { evaluateIvRvScan: (s: string[]) => Promise<void> }).evaluateIvRvScan(syms);
+  }
+  function seedCloses(engine: SignalEngine, sym: string, closes: number[]): void {
+    (engine as unknown as { dailyCloseCache: Map<string, number[]> }).dailyCloseCache.set(sym, closes);
+  }
+
+  beforeEach(() => {
+    vi.useFakeTimers();
+    vi.setSystemTime(TRADING_TIME);
+    delete process.env[OPTION_IV_RV_SCANNER_FLAG];
+    delete process.env[OPTION_IV_RV_ROUTING_FLAG];
+  });
+  afterEach(() => {
+    delete process.env[OPTION_IV_RV_SCANNER_FLAG];
+    delete process.env[OPTION_IV_RV_ROUTING_FLAG];
+    vi.useRealTimers();
+  });
+
+  it('scanner ON, routing OFF — observe-only, opens nothing', async () => {
+    process.env[OPTION_IV_RV_SCANNER_FLAG] = '1';
+    const svc = scannerFor({ AAA: { symbol: 'AAA', spot: 100, expiration: '2024-07-19', rows: cheapVolChain('AAA', 100) } });
+    const engine = new SignalEngine(undefined, undefined, svc);
+    seedCloses(engine, 'AAA', highRvCloses());
+    await runScan(engine, ['AAA']);
+    expect(engine.getState().options.openOptions).toHaveLength(0);
+  });
+
+  it('scanner + routing ON — opens the BUY_PREMIUM contract on the demo book', async () => {
+    process.env[OPTION_IV_RV_SCANNER_FLAG] = '1';
+    process.env[OPTION_IV_RV_ROUTING_FLAG] = '1';
+    const svc = scannerFor({ AAA: { symbol: 'AAA', spot: 100, expiration: '2024-07-19', rows: cheapVolChain('AAA', 100) } });
+    const engine = new SignalEngine(undefined, undefined, svc);
+    seedCloses(engine, 'AAA', highRvCloses());
+    await runScan(engine, ['AAA']);
+    const open = engine.getState().options.openOptions;
+    expect(open.length).toBeGreaterThanOrEqual(1);
+    expect(open[0].symbol).toBe('AAA');
+    // Surfaced in the signals feed (reflected in the probe's optionSignalCount).
+    const sigs = engine.getState().signals.filter(s => s.type === 'relative_value');
+    expect(sigs.length).toBeGreaterThanOrEqual(1);
+    expect((sigs[0] as { reason?: string }).reason).toContain('iv-rv mispriced');
+  });
+
+  it('routing ON + journal ON — open is tagged entryArchetype iv-rv-buy-premium', async () => {
+    process.env[OPTION_IV_RV_SCANNER_FLAG] = '1';
+    process.env[OPTION_IV_RV_ROUTING_FLAG] = '1';
+    process.env[OPTION_TRADE_JOURNAL_FLAG] = '1';
+    const journalFile = join(tmpdir(), `tra1203-journal-${process.pid}.jsonl`);
+    setOptionTradeJournalFileForTests(journalFile);
+    try {
+      const svc = scannerFor({ AAA: { symbol: 'AAA', spot: 100, expiration: '2024-07-19', rows: cheapVolChain('AAA', 100) } });
+      const engine = new SignalEngine(undefined, undefined, svc);
+      seedCloses(engine, 'AAA', highRvCloses());
+      await runScan(engine, ['AAA']);
+      await engine.flushOptionTradeJournal();
+      const rows = await listOptionTradeJournal();
+      expect(rows.length).toBeGreaterThanOrEqual(1);
+      expect(rows.every(r => r.entryArchetype === 'iv-rv-buy-premium')).toBe(true);
+      expect(rows.every(r => r.outcome === 'OPEN')).toBe(true);
+    } finally {
+      delete process.env[OPTION_TRADE_JOURNAL_FLAG];
+      setOptionTradeJournalFileForTests(null);
+      rmSync(journalFile, { force: true });
+    }
+  });
+
+  it('routing ON but realised vol uncomputable (no closes) — stands down, opens nothing', async () => {
+    process.env[OPTION_IV_RV_SCANNER_FLAG] = '1';
+    process.env[OPTION_IV_RV_ROUTING_FLAG] = '1';
+    const svc = scannerFor({ AAA: { symbol: 'AAA', spot: 100, expiration: '2024-07-19', rows: cheapVolChain('AAA', 100) } });
+    const engine = new SignalEngine(undefined, undefined, svc);
+    // No daily closes seeded ⇒ realizedVol null ⇒ no candidates ⇒ no route.
+    await runScan(engine, ['AAA']);
+    expect(engine.getState().options.openOptions).toHaveLength(0);
   });
 });

@@ -90,6 +90,75 @@ export function isOptionIvRvScannerEnabled(env: NodeJS.ProcessEnv = process.env)
 }
 
 // --------------------------------------------------------------------------
+// TRA-1203 (board: "try mispriced options for the rest of the week instead of
+// relative value") — turn the TRA-1156 OBSERVE-ONLY IV-vs-RV scan into an
+// EXECUTING demo paper-routing path.
+//
+// "Mispriced value" here is the volatility-risk-premium read the scanner already
+// computes: fair value priced off the underlying's REALISED vol (what actually
+// happened), independent of the peer/skew comparison the relative-value path
+// uses. When ON, each demo tick's top BUY_PREMIUM candidate per symbol (IV cheap
+// vs realised → premium underpriced → buy it) is opened on the demo paper book
+// via the same `openOptionFromRvCandidate` single-leg path the directional/RV
+// fills use, journal-tagged `entryArchetype:'iv-rv-buy-premium'` so the TRA-1200
+// byArchetype rollup attributes it SEPARATELY from bare `single_leg_rv` — that
+// per-archetype split is how the board reads "mispriced vs relative value".
+//
+// SELL_PREMIUM (IV rich) candidates are surfaced/logged but NOT routed: the demo
+// single-leg book is long-only, so shorting premium would need a defined-risk
+// spread (future work) — never a naked short.
+//
+// Layered ON TOP OF the scanner flag (mirrors the TRA-1028 sub-flag pattern): it
+// only takes effect when `isOptionIvRvScannerEnabled()` is ALSO true, so the
+// observe-only ledger and the routing path can never diverge, and turning the
+// scanner off kills routing too. OFF by default ⇒ the IV-RV pass stays exactly
+// observe-only and prod/live paths are byte-for-byte unchanged. Demo-only: the
+// engine pass hard-gates on `mode === 'demo'`. Live-capital promotion stays
+// gated on TRA-382 regardless of this flag.
+// --------------------------------------------------------------------------
+
+export const OPTION_IV_RV_ROUTING_FLAG = 'ENABLE_OPTION_IV_RV_ROUTING';
+
+/** True iff the scanner flag AND the IV-RV demo-routing sub-flag are both on. */
+export function isOptionIvRvRoutingEnabled(env: NodeJS.ProcessEnv = process.env): boolean {
+  return isOptionIvRvScannerEnabled(env) && flagOn(env[OPTION_IV_RV_ROUTING_FLAG]);
+}
+
+// Optional threshold overrides for the routing path so QuantTrader/the operator
+// can loosen or tighten what counts as actionably-mispriced WITHOUT a code change
+// (a calm tape can otherwise yield zero BUY_PREMIUM candidates at the strict
+// 0.70 / 25% engine defaults, and the board wants observable fills this week).
+// Both default to undefined ⇒ the engine's `IvRvScannerOptions` defaults stand.
+export const OPTION_IV_RV_BUY_RATIO_VAR = 'OPTION_IV_RV_BUY_RATIO';
+export const OPTION_IV_RV_MISPRICING_PCT_VAR = 'OPTION_IV_RV_MISPRICING_PCT';
+
+export interface IvRvRoutingOverride {
+  /** IV/RV ratio at or below which a contract is BUY_PREMIUM, or undefined for the engine default (0.70). */
+  buyIvRvRatio: number | undefined;
+  /** |mispricingPct| (as a fraction, e.g. 0.25) gate, or undefined for the engine default (0.25). */
+  mispricingThresholdPct: number | undefined;
+}
+
+function parsePositiveFloat(raw: string | undefined): number | undefined {
+  if (typeof raw !== 'string') return undefined;
+  const n = Number(raw.trim());
+  return Number.isFinite(n) && n > 0 ? n : undefined;
+}
+
+/**
+ * Resolve the optional IV-RV routing threshold overrides. Returns undefined
+ * bounds when unset/invalid so the caller passes nothing to the engine and the
+ * 0.70 / 0.25 defaults stand. A buy ratio ≥ 1 is rejected (a BUY_PREMIUM gate
+ * must sit below parity or it would fire on rich premium) and falls back.
+ */
+export function resolveIvRvRoutingOverride(env: NodeJS.ProcessEnv = process.env): IvRvRoutingOverride {
+  let buyIvRvRatio = parsePositiveFloat(env[OPTION_IV_RV_BUY_RATIO_VAR]);
+  if (buyIvRvRatio !== undefined && buyIvRvRatio >= 1) buyIvRvRatio = undefined;
+  const mispricingThresholdPct = parsePositiveFloat(env[OPTION_IV_RV_MISPRICING_PCT_VAR]);
+  return { buyIvRvRatio, mispricingThresholdPct };
+}
+
+// --------------------------------------------------------------------------
 // TRA-1028 — net-new options swing-entry enhancements (TRA-1026 follow-up).
 //
 // Each lands AFTER TRA-1024/1025 (IV-aware + structure-exit-aware exec path) and
