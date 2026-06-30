@@ -126,6 +126,41 @@ services:
       # preview mode.
       - key: ANTHROPIC_API_KEY
         sync: false
+      # ───────────────────────────────────────────────────────────────────────
+      # TRA-1202 — Anthropic bill cap to the owner's ~$5/week budget.
+      #
+      # Live readout showed the spend is the TRADING-AGENTS ADVISORY layer (the
+      # "Proposals" path: per-30s-tick analyst/trader/risk LLM calls when the
+      # per-user Trading-Agents banner is ON), NOT the AI Options Ideas tab
+      # (`/api/health/options-spend` = $0/mo). On 2026-06-30 user `admin` had
+      # already hit the OLD $10/user/day advisory cap by mid-session — i.e. up to
+      # ~$70/week — which matches the ~$20/week invoices. Neither tab places
+      # orders; this is generation cost, not execution.
+      #
+      # Three levers, all enforced in code (agent-spend-store / options-spend-store /
+      # anthropic-llm-client) and overridable here without a code change:
+      #   1) Advisory per-user/day cap $10 → $0.50  (~$3.50/wk worst case).
+      #   2) Advisory company/day ceiling $100 → $0.50 (single-user demo; matches #1).
+      #   3) AI Options Ideas monthly cap $50 → $5   (~$1.15/wk; currently $0 spend).
+      #   Worst-case sum ≈ $4.65/wk < the $5/wk target. When a cap is reached the
+      #   feature degrades to the deterministic ZERO-cost path (advisory) or a
+      #   labelled non-live feed (ideas) — no user-facing break, no capital impact.
+      #
+      # 4) Strong tier Sonnet-4.6 → Haiku-4.5 for the trader/risk synthesis steps:
+      #   ~3x cheaper input AND output, so the SAME $0.50/day buys ~3x more
+      #   LLM-authored proposals before the cap trips. Haiku 4.5 keeps structured
+      #   outputs (JSON schema) and temperature; it has no adaptive thinking, which
+      #   is OFF by default here anyway. Analysts already run on Haiku (`fast`).
+      #   Revert any line below to restore the prior cost/quality point.
+      - key: TRADING_AGENTS_DAILY_USER_USD_CAP
+        value: "0.50"
+      - key: TRADING_AGENTS_COMPANY_DAILY_USD_CAP
+        value: "0.50"
+      - key: OPTIONS_IDEAS_MONTHLY_USD_CAP
+        value: "5"
+      - key: LLM_MODEL_STRONG
+        value: claude-haiku-4-5
+      # ───────────────────────────────────────────────────────────────────────
       # Tradier API credentials (TRA-191) — required for the options-chain
       # relative-value scanner to fetch live chains. With these unset the
       # scanner reports `no_credentials` and the engine simply skips options
