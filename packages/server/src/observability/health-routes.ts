@@ -51,6 +51,8 @@ import {
   loadSourceQualityWeights,
   type SourceQualityWeights,
 } from '../source-quality-scorer.js';
+import { buildHypothesisQueueHealth } from '../ratification-bridge.js';
+import { ratifyHypothesis } from '../hypothesis-pipeline.js';
 
 /** Minimal shape this module needs from a per-user context. */
 export interface HealthEngineLike {
@@ -843,6 +845,59 @@ export function registerLiveHealthRoutes(app: Express, deps: LiveHealthDeps): vo
   // agent has never run). `enabled` mirrors ENABLE_ANALYST_AGENT.
   app.get('/api/health/analyst', async (_req, res) => {
     res.json(await buildAnalystHealth(now(), isAnalystAgentEnabled()));
+  });
+
+  // TRA-998 — the live cross-producer hypothesis ratification queue + ratified
+  // demo overrides (hypothesis-pipeline.ts). Read-only and secrets-free (config
+  // paths, numeric metrics, flag names — no balances/PII), so it is served
+  // unauthenticated like the other /api/health/* probes. The board-ratification
+  // routine reads this to know which items to raise a `request_confirmation` card
+  // for on TRA-994 (each item carries its stable card idempotencyKey + demoFlag).
+  app.get('/api/health/hypothesis-queue', async (_req, res) => {
+    res.json({
+      ok: true,
+      time: new Date(now()).toISOString(),
+      build: resolveBuildInfo(),
+      ...(await buildHypothesisQueueHealth()),
+    });
+  });
+
+  // TRA-998 — apply a BOARD ratification decision to a staged hypothesis. This is
+  // the accept/reject half of the board edge: the routine raises the confirmation
+  // card on TRA-994 and, once a human accepts, POSTs the decision here so the
+  // change lands in DEMO config behind its OFF-by-default flag (or is closed out
+  // on reject). `ratifyHypothesis` enforces invariant 2 — only a still-pending,
+  // gate-passing item can be ratified — and there is NO live path: accept only
+  // stages a demo override that a human must still flip the flag to activate.
+  // Mutating, so it requires the internal token OR a user JWT (internalOrAuth).
+  app.post('/api/hypothesis/:id/ratify', internalOrAuth, async (req, res) => {
+    const rawId = req.params['id'];
+    const id = Array.isArray(rawId) ? rawId[0] ?? '' : rawId;
+    const body = (req.body ?? {}) as { decision?: unknown; decidedBy?: unknown };
+    const decision = body.decision;
+    if (decision !== 'accept' && decision !== 'reject') {
+      res.status(400).json({ ok: false, error: 'decision must be "accept" or "reject"' });
+      return;
+    }
+    const decidedBy =
+      typeof body.decidedBy === 'string' && body.decidedBy.trim()
+        ? body.decidedBy.trim()
+        : res.locals['internalDemoAccess']
+          ? 'board-ratification-routine'
+          : 'board';
+    try {
+      const result = await ratifyHypothesis({
+        hypothesisId: id,
+        decision,
+        decidedBy,
+        decidedAt: now(),
+      });
+      res.json({ ok: true, decision, item: result.item, override: result.override ?? null });
+    } catch (err) {
+      // Unknown id or not-pending (already decided / gate-failed) — a conflict,
+      // not a server fault. Surface the guard message verbatim for the routine.
+      res.status(409).json({ ok: false, error: err instanceof Error ? err.message : String(err) });
+    }
   });
 
   // TRA-1059 — unauthenticated, secrets-free cold-start daily-prefetch warmer

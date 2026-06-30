@@ -27,6 +27,7 @@ import { makeBacktestExecutor, RV_CRYPTO_MAJORS_BASE_CONFIG } from './backtest-e
 // folded from the attribution log × hypothesis-queue gate outcomes.
 import { isExternalIntelEnabled } from './external-intel.js';
 import { loadSourceQualityWeights } from './source-quality-scorer.js';
+import { buildHypothesisQueueHealth } from './ratification-bridge.js';
 // TRA-1003 — the scheduled trigger that actually FEEDS the external-intel queue.
 // No-op tick while ENABLE_EXTERNAL_INTEL is off (deps aren't even built), so it
 // is safe to arm at boot regardless of the flag.
@@ -773,6 +774,21 @@ async function generateAndSaveReport(
       if (analystReview) finalSnapshot.analystReview = analystReview;
     } catch (err) {
       log.warn('analyst EOD fold failed', {
+        username: ctx.username,
+        reason: err instanceof Error ? err.message : String(err),
+      });
+    }
+  }
+  // TRA-998 — fold the live cross-producer hypothesis ratification queue + the
+  // ratified demo overrides into the EOD markdown (demo book only) so the board
+  // sees what is staged for confirmation and what has landed behind a flag. The
+  // queue read is cheap (empty map when no producer has ever enqueued) and the
+  // section self-suppresses when nothing is staged AND nothing ratified.
+  if (settings.mode === 'demo') {
+    try {
+      finalSnapshot.hypothesisQueue = await buildHypothesisQueueHealth();
+    } catch (err) {
+      log.warn('hypothesis-queue EOD fold failed', {
         username: ctx.username,
         reason: err instanceof Error ? err.message : String(err),
       });

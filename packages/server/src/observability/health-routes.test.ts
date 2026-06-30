@@ -3,7 +3,15 @@
 // Exercises the HTTP surface with a fake express app and fake user contexts so
 // the wiring is verified without booting the real server.
 
-import { describe, it, expect, beforeEach } from 'vitest';
+import { describe, it, expect, beforeEach, afterEach } from 'vitest';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+import { rm } from 'node:fs/promises';
+import {
+  makeHypothesis,
+  runHypothesis,
+  setHypothesisQueueFileForTests,
+} from '../hypothesis-pipeline.js';
 import {
   registerLiveHealthRoutes,
   runStaleStateCheck,
@@ -52,22 +60,36 @@ type FakeHandler = (req: unknown, res: unknown, next?: () => void) => unknown;
 /** Capture routes registered on a fake express app. */
 function fakeApp() {
   const routes = new Map<string, FakeHandler[]>();
+  const postRoutes = new Map<string, FakeHandler[]>();
   const app = {
     get(path: string, ...handlers: FakeHandler[]) {
       routes.set(path, handlers);
     },
+    post(path: string, ...handlers: FakeHandler[]) {
+      postRoutes.set(path, handlers);
+    },
   };
-  return { app: app as never, routes };
+  return { app: app as never, routes, postRoutes };
 }
 
 function fakeRes() {
-  const res: { statusCode: number; body: unknown; headersSent: boolean; json: (b: unknown) => void } = {
+  const res: {
+    statusCode: number;
+    body: unknown;
+    headersSent: boolean;
+    json: (b: unknown) => void;
+    status: (code: number) => typeof res;
+  } = {
     statusCode: 200,
     body: undefined,
     headersSent: false,
     json(b: unknown) {
       this.body = b;
       this.headersSent = true;
+    },
+    status(code: number) {
+      this.statusCode = code;
+      return this;
     },
   };
   return res;
@@ -557,6 +579,99 @@ describe('TRA-895 options-pipeline probe', () => {
       now: () => NOW,
     });
     expect(routes.get('/api/health/options-pipeline')).toBeUndefined();
+  });
+});
+
+describe('TRA-998 hypothesis ratification routes', () => {
+  const tmpFile = join(tmpdir(), `health-ratify-${process.pid}.jsonl`);
+
+  function register(internalToken?: string) {
+    const fa = fakeApp();
+    registerLiveHealthRoutes(fa.app, {
+      requireAuth: ((_q: unknown, _s: unknown, n: () => void) => n()) as never,
+      userCtx: async () => ctx('admin', engineState()),
+      getSettings: () => settings(),
+      now: () => NOW,
+      ...(internalToken ? { internalToken: () => internalToken } : {}),
+    });
+    return fa;
+  }
+
+  beforeEach(() => setHypothesisQueueFileForTests(tmpFile));
+  afterEach(async () => {
+    setHypothesisQueueFileForTests(null);
+    await rm(tmpFile, { force: true });
+  });
+
+  async function seedPending(): Promise<string> {
+    const h = makeHypothesis({
+      target: { kind: 'gate', path: 'RV_GATE.minTrendConfluence' },
+      proposedDelta: { op: 'set', value: 0.6 },
+      rationale: 'reflect routine flagged weak trend confluence',
+      source: 'reflection',
+      createdAt: 1_700_000_000_000,
+    });
+    await runHypothesis(
+      h,
+      {
+        baseConfig: { RV_GATE: { minTrendConfluence: 0.55 } },
+        runBacktest: async () => ({
+          sharpe: 1.4,
+          expectancy: 0.22,
+          profitFactor: 1.6,
+          maxDrawdown: 0.12,
+          tradeCount: 180,
+        }),
+      },
+      1_700_000_100_000,
+    );
+    return h.id;
+  }
+
+  it('GET /api/health/hypothesis-queue lists the live queue (unauthenticated)', async () => {
+    const id = await seedPending();
+    const { routes } = register();
+    const handlers = routes.get('/api/health/hypothesis-queue')!;
+    expect(handlers).toHaveLength(1); // unauthenticated, like the other probes
+    const res = fakeRes();
+    await handlers[0]!({}, res);
+    const body = res.body as { ok: boolean; counts: { pending: number }; pendingRatification: { id: string }[] };
+    expect(body.ok).toBe(true);
+    expect(body.counts.pending).toBe(1);
+    expect(body.pendingRatification[0].id).toBe(id);
+  });
+
+  it('POST /api/hypothesis/:id/ratify (accept) lands a demo override behind a flag', async () => {
+    const id = await seedPending();
+    const { postRoutes } = register('sekret');
+    const handlers = postRoutes.get('/api/hypothesis/:id/ratify')!;
+    expect(handlers).toHaveLength(2); // internalOrAuth gate + handler
+    const res = resWithLocals();
+    res.locals['internalDemoAccess'] = true;
+    await handlers[1]!({ params: { id }, body: { decision: 'accept' } }, res);
+    const body = res.body as { ok: boolean; override: { flag: string; mode: string } | null };
+    expect(body.ok).toBe(true);
+    expect(body.override?.mode).toBe('demo');
+    expect(body.override?.flag).toMatch(/^ENABLE_HYP_/);
+  });
+
+  it('POST ratify rejects a bad decision with 400', async () => {
+    const id = await seedPending();
+    const { postRoutes } = register('sekret');
+    const handler = postRoutes.get('/api/hypothesis/:id/ratify')![1]!;
+    const res = resWithLocals();
+    await handler({ params: { id }, body: { decision: 'maybe' } }, res);
+    expect(res.statusCode).toBe(400);
+    expect((res.body as { ok: boolean }).ok).toBe(false);
+  });
+
+  it('POST ratify returns 409 for an unknown / non-pending id', async () => {
+    const { postRoutes } = register('sekret');
+    const handler = postRoutes.get('/api/hypothesis/:id/ratify')![1]!;
+    const res = resWithLocals();
+    await handler({ params: { id: 'hyp-deadbeef' }, body: { decision: 'accept' } }, res);
+    expect(res.statusCode).toBe(409);
+    expect((res.body as { error: string }).error).toMatch(/unknown hypothesis/);
   });
 });
 

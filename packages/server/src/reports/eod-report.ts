@@ -18,6 +18,10 @@ import type { IntrospectionReadout } from '../strategy-introspection.js';
 import type { AutopilotAction } from '../risk-autopilot.js';
 import type { AutonomousDemoLoopReport } from '../autonomous-demo-loop.js';
 import type { AnalystPlan, AnalystReview } from '../analyst-agent.js';
+import {
+  buildRatificationQueueMarkdown,
+  type HypothesisQueueHealth,
+} from '../ratification-bridge.js';
 
 /** Signals fired today, keyed by signal id */
 export interface DailySignalRecord {
@@ -473,6 +477,7 @@ function buildMarkdown(
   autonomousDemoLoop?: AutonomousDemoLoopReport,
   analystPlan?: AnalystPlan,
   analystReview?: AnalystReview,
+  hypothesisQueue?: HypothesisQueueHealth,
 ): string {
   const { date, realizedPnl, unrealizedPnl, optionsPnl, combinedPnl,
           totalEquity, managedEquity, availableCash,
@@ -536,7 +541,7 @@ ${moverRows || '_No data._'}
 | Winning Signals | ${signalAccuracy.winningSignals} |
 | Signal Win Rate | ${pct(signalAccuracy.winRate)} |
 | Avg R:R | 1:${signalAccuracy.avgRR.toFixed(2)} |
-${buildPortfolioGreeksMarkdown(portfolioGreeks)}${buildOptionJournalMarkdown(optionJournal, optionLearnedWeights)}${buildIntrospectionMarkdown(introspection, autopilotActions)}${buildSourceQualityMarkdown(sourceQualityWeights)}${buildAutonomousDemoLoopMarkdown(autonomousDemoLoop)}${buildAnalystMarkdown(analystPlan, analystReview)}`;
+${buildPortfolioGreeksMarkdown(portfolioGreeks)}${buildOptionJournalMarkdown(optionJournal, optionLearnedWeights)}${buildIntrospectionMarkdown(introspection, autopilotActions)}${buildSourceQualityMarkdown(sourceQualityWeights)}${buildAutonomousDemoLoopMarkdown(autonomousDemoLoop)}${buildAnalystMarkdown(analystPlan, analystReview)}${hypothesisQueue ? buildRatificationQueueMarkdown(hypothesisQueue) : ''}`;
 }
 
 export interface ReportInput {
@@ -599,6 +604,13 @@ export interface ReportInput {
    */
   analystPlan?: AnalystPlan;
   analystReview?: AnalystReview;
+  /**
+   * TRA-998 — the live cross-producer hypothesis ratification queue + ratified
+   * demo overrides, folded by the caller from `buildHypothesisQueueHealth()`.
+   * Distinct from the analyst section (one producer's emit) — this is the whole
+   * pipeline's staged/ratified view. Optional ↔ no section. DEMO ONLY.
+   */
+  hypothesisQueue?: HypothesisQueueHealth;
 }
 
 /**
@@ -615,7 +627,8 @@ export interface ReportInput {
 export function generateEodReport(input: ReportInput, asOfDate?: string): EodReport {
   const { state, allClosedPositions, closedOptions = [], dailySignals, signalTypeMap,
           optionJournal, optionLearnedWeights, introspection, autopilotActions,
-          sourceQualityWeights, autonomousDemoLoop, analystPlan, analystReview } = input;
+          sourceQualityWeights, autonomousDemoLoop, analystPlan, analystReview,
+          hypothesisQueue } = input;
   const today = asOfDate ?? new Date().toLocaleDateString('en-CA', { timeZone: 'America/New_York' });
 
   // Closed trades for today only
@@ -745,6 +758,7 @@ export function generateEodReport(input: ReportInput, asOfDate?: string): EodRep
       autonomousDemoLoop,
       analystPlan,
       analystReview,
+      hypothesisQueue,
     ),
   };
 }
