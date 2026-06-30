@@ -1518,21 +1518,33 @@ async function backfillLiveRealizedCalendar(
  * broker-balance override — `current Tradier equity − prev balance snapshot −
  * today's net cash flow` — but READ-ONLY: it never writes the balance-snapshot
  * series (so it can't corrupt tomorrow's prev anchor) and never fetches new
- * cash events. Returns `null` for demo, when there's no current equity, or when
- * no prior balance anchor exists yet (a brand-new account's first day has no
- * baseline to diff against — the cell stays "--" rather than showing a bogus
- * full-equity "gain").
+ * cash events.
+ *
+ * TRA-1192 (board follow-up: "same for admin account, all accounts") — demo
+ * accounts get the same running cell, computed from the engine's *own* current
+ * snapshot exactly as the 9 PM EOD write would (read-only, never saved), since a
+ * demo book has no broker balance series to diff. Returns `null` only when there
+ * is no current equity, or (live/sandbox) when no prior balance anchor exists yet
+ * (a brand-new account's first day has no baseline to diff against — the cell
+ * stays "--" rather than showing a bogus full-equity "gain").
  */
 async function buildLiveTodayCellReport(
   ctx: UserContext,
   mode: StockModeKey,
 ): Promise<ReturnType<typeof generateEodReport> | null> {
-  if (mode === 'demo') return null;
-  // The engine's live equity reflects its *active* mode only. If the calendar is
+  // The engine's equity/state reflects its *active* mode only. If the calendar is
   // browsing a different bucket than the account is currently running, we have no
   // matching current balance — fall through to "--" rather than diff a live
-  // equity against a sandbox anchor (or vice-versa).
+  // equity against a sandbox/demo anchor (or vice-versa).
   if (mode !== stockModeKey(getSettings(ctx.username))) return null;
+  // Demo: no broker balance series — compute the running cell straight from the
+  // engine snapshot (same path the nightly EOD write uses), tagged intraday so it
+  // never settles a stored row.
+  if (mode === 'demo') {
+    const snapshot = ctx.engine.getReportSnapshot();
+    if (!Number.isFinite(snapshot.state.account.totalEquity)) return null;
+    return { ...generateEodReport(snapshot), pnlSource: 'live-intraday' as const };
+  }
   const env: TradierEnv = mode === 'live' ? 'production' : 'sandbox';
   const todayBalance = ctx.engine.getEquitySnapshot().equity;
   if (!Number.isFinite(todayBalance) || todayBalance <= 0) return null;
