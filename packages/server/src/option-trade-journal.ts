@@ -365,6 +365,34 @@ export interface OptionTradeJournalArchetypeStat {
 }
 
 /**
+ * TRA-1187 — per-exit-reason rollup over RESOLVED rows. The book's headline
+ * scratch rate (closes that land inside the ±scratchBand R window) is diluting
+ * a thin positive edge; this bucketing pins WHICH exit closes the scratches
+ * (`time_stop` vs `supertrend_flip` / `ma20_close_through` structural vs hard
+ * `stop` / `expired`) so an exit-tuning change can target the right lever
+ * instead of guessing. `scratchRate` is the share of this reason's closes that
+ * scratched; `avgHoldDays` / `avgEntryDte` expose the hold-time-vs-DTE mismatch
+ * (a multi-week-DTE thesis force-closed after a few bars is the structural
+ * scratch driver). Observe-only — does not gate any routing or exit.
+ */
+export interface OptionTradeJournalExitReasonStat {
+  exitReason: string;
+  closed: number;
+  win: number;
+  loss: number;
+  scratch: number;
+  /** scratch / closed for this reason; null when none closed. */
+  scratchRate: number | null;
+  winRate: number | null;
+  avgR: number | null;
+  realizedPnlUsd: number;
+  /** Mean calendar days held under this exit reason; null when unknown. */
+  avgHoldDays: number | null;
+  /** Mean days-to-expiration at entry for rows closed by this reason. */
+  avgEntryDte: number | null;
+}
+
+/**
  * TRA-991 — headline rollup over journal rows, shared by the
  * `/api/health/option-journal` readout and the EOD report section. Counts cover
  * all rows (open + closed); P&L / win-rate / avg-R are over RESOLVED (closed)
@@ -392,6 +420,13 @@ export interface OptionTradeJournalSummary {
    * countable distinctly from the bare-RV `unspecified` baseline.
    */
   byArchetype: OptionTradeJournalArchetypeStat[];
+  /**
+   * TRA-1187 — per-exit-reason rollup over resolved rows, descending by closed
+   * count then scratch count. Lets the readout attribute the headline scratch
+   * population to its closing exit (time_stop vs structural vs hard stop) and
+   * surface the hold-time-vs-DTE mismatch behind it.
+   */
+  byExitReason: OptionTradeJournalExitReasonStat[];
 }
 
 /** TRA-991 — fold journal rows into the headline summary. Pure. */
@@ -452,6 +487,46 @@ export function summarizeOptionTradeJournal(
     })
     .sort((a, b) => b.total - a.total || Math.abs(b.realizedPnlUsd) - Math.abs(a.realizedPnlUsd));
 
+  // TRA-1187 — per-exit-reason rollup over RESOLVED rows. Unlabelled closes fold
+  // under `unknown` rather than being dropped, so the bucket counts reconcile to
+  // `closed`. `avgHoldDays` / `avgEntryDte` are averaged only over rows that
+  // carry the field (pre-instrumentation rows fold back as null without skewing
+  // the mean toward zero).
+  const byReason = new Map<string, OptionTradeJournalRecord[]>();
+  for (const r of closedRows) {
+    const key = r.exitReason ?? 'unknown';
+    const list = byReason.get(key) ?? [];
+    list.push(r);
+    byReason.set(key, list);
+  }
+  const meanOf = (list: OptionTradeJournalRecord[], pick: (r: OptionTradeJournalRecord) => number | undefined) => {
+    const vals = list.map(pick).filter((v): v is number => typeof v === 'number' && Number.isFinite(v));
+    return vals.length > 0 ? vals.reduce((a, v) => a + v, 0) / vals.length : null;
+  };
+  const byExitReason: OptionTradeJournalExitReasonStat[] = [...byReason.entries()]
+    .map(([exitReason, list]) => {
+      const c = list.length;
+      const wins = list.filter((r) => r.outcome === 'WIN').length;
+      const losses = list.filter((r) => r.outcome === 'LOSS').length;
+      const scratches = list.filter((r) => r.outcome === 'SCRATCH').length;
+      const pnl = list.reduce((acc, r) => acc + (r.realizedPnlUsd ?? 0), 0);
+      const r = c > 0 ? list.reduce((acc, x) => acc + (x.realizedR ?? 0), 0) / c : null;
+      return {
+        exitReason,
+        closed: c,
+        win: wins,
+        loss: losses,
+        scratch: scratches,
+        scratchRate: c > 0 ? scratches / c : null,
+        winRate: c > 0 ? wins / c : null,
+        avgR: r,
+        realizedPnlUsd: pnl,
+        avgHoldDays: meanOf(list, (x) => x.holdDays),
+        avgEntryDte: meanOf(list, (x) => x.entryDte),
+      };
+    })
+    .sort((a, b) => b.closed - a.closed || b.scratch - a.scratch);
+
   return {
     total: rows.length,
     open: rows.length - closed,
@@ -464,5 +539,6 @@ export function summarizeOptionTradeJournal(
     avgR,
     byStructure,
     byArchetype,
+    byExitReason,
   };
 }

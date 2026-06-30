@@ -7,6 +7,7 @@ import {
   listOptionTradeJournal,
   setOptionTradeJournalFileForTests,
   summarizeOptionTradeJournal,
+  type OptionTradeJournalRecord,
 } from './option-trade-journal.js';
 import type { RelativeValueSignal } from '@trading-app/shared';
 
@@ -232,5 +233,54 @@ describe('PaperOptionsAccount option-trade journal emit (TRA-991)', () => {
     expect(ema.total).toBe(1);
     expect(ema.closed).toBe(0);
     expect(unspec.total).toBe(1);
+  });
+
+  // TRA-1187 — the scratch population must be attributable to its closing exit
+  // reason so an exit-tuning change targets the right lever. byExitReason buckets
+  // resolved rows by exitReason with per-reason scratch counts + hold/DTE means;
+  // unlabelled closes fold under `unknown` so the buckets reconcile to `closed`.
+  it('buckets resolved rows by exit reason with scratch counts and hold/DTE means', () => {
+    const base = {
+      symbol: 'MSFT',
+      structure: 'single_leg_rv',
+      mode: 'demo' as const,
+      ivRank: null,
+      trend: 'up' as const,
+      sentiment: null,
+      entryDelta: 0.35,
+      atRiskUsd: 100,
+    };
+    const rows: OptionTradeJournalRecord[] = [
+      // Two time_stop closes, both scratches (|R| <= 0.1), short holds vs 35 DTE.
+      { ...base, id: 'a', openTs: 0, entryDte: 35, outcome: 'SCRATCH',
+        realizedPnlUsd: 2, realizedR: 0.02, exitReason: 'time_stop', holdDays: 0.02 },
+      { ...base, id: 'b', openTs: 0, entryDte: 35, outcome: 'SCRATCH',
+        realizedPnlUsd: -3, realizedR: -0.03, exitReason: 'time_stop', holdDays: 0.04 },
+      // One supertrend_flip win.
+      { ...base, id: 'c', openTs: 0, entryDte: 20, outcome: 'WIN',
+        realizedPnlUsd: 40, realizedR: 0.4, exitReason: 'supertrend_flip', holdDays: 1 },
+      // One hard stop loss.
+      { ...base, id: 'd', openTs: 0, entryDte: 40, outcome: 'LOSS',
+        realizedPnlUsd: -50, realizedR: -0.5, exitReason: 'sl', holdDays: 2 },
+      // A still-open row must be excluded from the resolved rollup entirely.
+      { ...base, id: 'e', openTs: 0, entryDte: 35, outcome: 'OPEN' },
+    ];
+
+    const summary = summarizeOptionTradeJournal(rows);
+    expect(summary.closed).toBe(4);
+
+    const ts = summary.byExitReason.find((r) => r.exitReason === 'time_stop')!;
+    expect(ts.closed).toBe(2);
+    expect(ts.scratch).toBe(2);
+    expect(ts.scratchRate).toBe(1);
+    expect(ts.avgEntryDte).toBe(35);
+    expect(ts.avgHoldDays).toBeCloseTo(0.03, 5);
+
+    // time_stop is the largest closed bucket → sorts first.
+    expect(summary.byExitReason[0]!.exitReason).toBe('time_stop');
+
+    // Scratch counts reconcile across reasons to the headline scratch total.
+    const scratchAcrossReasons = summary.byExitReason.reduce((acc, r) => acc + r.scratch, 0);
+    expect(scratchAcrossReasons).toBe(summary.scratch);
   });
 });
