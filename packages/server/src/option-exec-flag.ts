@@ -320,3 +320,47 @@ export const OPTION_DEMO_AUTO_CONFIRM_FLAG = 'ENABLE_OPTION_DEMO_AUTO_CONFIRM';
 export function isOptionDemoAutoConfirmEnabled(env: NodeJS.ProcessEnv = process.env): boolean {
   return isOptionsProposalRailEnabled(env) && flagOn(env[OPTION_DEMO_AUTO_CONFIRM_FLAG]);
 }
+
+// --------------------------------------------------------------------------
+// TRA-1205 (TRA-1202 follow-up) — auto-execute the TOP N ranked AI option
+// ideas into the DEMO paper book without a manual "Paper entry" click.
+//
+// This is a SEPARATE path from TRA-1142's `ENABLE_OPTION_DEMO_AUTO_CONFIRM`
+// (which rides the shared proposal rail and auto-confirms EVERY enterable idea
+// through `shouldAutoConfirm`). This flag turns on a simpler, self-contained
+// post-feed-refresh hook that picks only the TOP N (default 3) enterable ideas,
+// dedups by (symbol + structure + expiry) so a re-run of the same cached feed
+// can't double-enter, and opens each through the SAME direct
+// `enterPaperOptionsIdea` path the manual click uses.
+//
+// OFF by default ⇒ the feed read is byte-for-byte unchanged. When ON it is
+// hard-gated demo-only by the caller (`settings.mode === 'demo'`) AND again
+// inside the runner, so live-capital is never touched; live promotion stays
+// gated on TRA-382 regardless. Activity is surfaced read-only at
+// `GET /api/health/options-ideas-auto-execute`.
+// --------------------------------------------------------------------------
+
+export const OPTION_IDEAS_AUTO_EXECUTE_FLAG = 'ENABLE_OPTION_IDEAS_AUTO_EXECUTE';
+export const OPTION_IDEAS_AUTO_EXECUTE_TOP_N_VAR = 'OPTION_IDEAS_AUTO_EXECUTE_TOP_N';
+
+/** Default count of top-ranked enterable ideas to auto-execute per refresh cycle. */
+export const OPTION_IDEAS_AUTO_EXECUTE_DEFAULT_TOP_N = 3;
+/** Hard ceiling so a fat-finger env can't fan out the whole feed into the book. */
+const OPTION_IDEAS_AUTO_EXECUTE_MAX_TOP_N = 25;
+
+/** True iff the AI-Ideas demo auto-execute flag is on (accepts 1/true/yes/on). */
+export function isOptionIdeasAutoExecuteEnabled(env: NodeJS.ProcessEnv = process.env): boolean {
+  return flagOn(env[OPTION_IDEAS_AUTO_EXECUTE_FLAG]);
+}
+
+/**
+ * Resolve the configured top-N (default {@link OPTION_IDEAS_AUTO_EXECUTE_DEFAULT_TOP_N}).
+ * A non-finite, non-positive, or fractional value falls back to the default so a
+ * malformed env can't silently disable (0) or over-fan-out the auto-executor;
+ * the result is clamped to [1, {@link OPTION_IDEAS_AUTO_EXECUTE_MAX_TOP_N}].
+ */
+export function resolveOptionIdeasAutoExecuteTopN(env: NodeJS.ProcessEnv = process.env): number {
+  const n = parsePositiveInt(env[OPTION_IDEAS_AUTO_EXECUTE_TOP_N_VAR]);
+  if (n === undefined) return OPTION_IDEAS_AUTO_EXECUTE_DEFAULT_TOP_N;
+  return Math.min(n, OPTION_IDEAS_AUTO_EXECUTE_MAX_TOP_N);
+}

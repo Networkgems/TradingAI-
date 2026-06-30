@@ -146,7 +146,12 @@ import {
   estimateSpotFromChain,
 } from '@trading-app/backtest';
 import { buildIdeasFeed, getEntryIntent } from './options-ideas-service.js';
-import { isOptionsProposalRailEnabled, isOptionDemoAutoConfirmEnabled } from './option-exec-flag.js';
+import {
+  isOptionsProposalRailEnabled,
+  isOptionDemoAutoConfirmEnabled,
+  isOptionIdeasAutoExecuteEnabled,
+} from './option-exec-flag.js';
+import { runIdeasAutoExecute } from './options-ideas-auto-execute.js';
 import {
   getUserAnthropicApiKey,
   setUserAnthropicApiKey,
@@ -2312,6 +2317,26 @@ app.get('/api/options/ideas', requireAuth, async (_req, res) => {
       }
     }
     if (entered > 0) broadcastEngineState(ctx);
+  }
+  // TRA-1205 (TRA-1202 follow-up) — auto-execute the TOP N (default 3) ranked
+  // enterable ideas into the DEMO paper book without a manual click. SEPARATE,
+  // independently-flagged path from TRA-1142's auto-confirm: it picks only the
+  // top N (not every enterable idea), dedups by (symbol+structure+expiry) so the
+  // 10-min-cached feed can't double-enter across the 60s poll, and opens through
+  // the SAME direct `enterPaperOptionsIdea` path the manual click uses. OFF by
+  // default ⇒ this block is skipped entirely. Hard-gated demo-only: the caller
+  // checks `settings.mode === 'demo'` AND the runner re-checks, so live capital
+  // is never touched (live promotion stays gated on TRA-382). Activity surfaces
+  // read-only at GET /api/health/options-ideas-auto-execute.
+  if (isOptionIdeasAutoExecuteEnabled() && settings.mode === 'demo') {
+    const summary = runIdeasAutoExecute({
+      feed,
+      mode: settings.mode,
+      scope: ctx.username,
+      getIntent: getEntryIntent,
+      enter: (intent) => ctx.engine.enterPaperOptionsIdea(intent),
+    });
+    if (summary.submitted > 0) broadcastEngineState(ctx);
   }
   res.json(feed);
 });

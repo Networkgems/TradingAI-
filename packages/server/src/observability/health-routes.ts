@@ -27,6 +27,7 @@ import {
   isOptionIvRvScannerEnabled,
 } from '../option-exec-flag.js';
 import { summarizeIvRvScans } from '../iv-rv-scanner.js';
+import { optionsIdeasAutoExecuteHealth } from '../options-ideas-auto-execute.js';
 import {
   listOptionTradeJournal,
   summarizeOptionTradeJournal,
@@ -800,6 +801,21 @@ export function registerLiveHealthRoutes(app: Express, deps: LiveHealthDeps): vo
       build: resolveBuildInfo(),
       enabled: isOptionIvRvScannerEnabled(),
       ...summarizeIvRvScans(now()),
+    });
+  });
+
+  // TRA-1205 — unauthenticated, secrets-free readout for the AI-Ideas demo
+  // auto-executor. The state is process-global, demo-only, and carries no
+  // balances/PII — only the flag state, the configured top-N, lifetime submit
+  // count, dedup-set size, and the last-run summary — so this is unauthenticated
+  // (parity with /iv-rv + /option-journal). `enabled`/`topN` mirror the env so
+  // the board can confirm at a glance whether top-3 auto-execution is armed.
+  app.get('/api/health/options-ideas-auto-execute', (_req, res) => {
+    res.json({
+      ok: true,
+      time: new Date(now()).toISOString(),
+      build: resolveBuildInfo(),
+      ...optionsIdeasAutoExecuteHealth(),
     });
   });
 
