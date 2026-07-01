@@ -587,6 +587,17 @@ export function CalendarTab({ token, httpUrl, reportsPath = '/api/reports', mode
             cols={market === 'stocks' ? 5 : 7}
           />
           <MonthSummary year={year} month={month} reports={reports} />
+          {/* TRA-1228 — the board asked why "today" reads low / flat vs the
+              "Daily Opts P&L" figure in the footer. Spell out that each cell is
+              a *realized* per-day P&L (closed trades only); open-position gains
+              are excluded until the position is closed, so unrealized MTM shown
+              elsewhere on the dashboard will not appear here. */}
+          <p className="cal-note muted" style={{ fontSize: '0.8rem', marginTop: '0.75rem' }}>
+            Each day shows <strong>realized</strong> P&amp;L only — closed stock trades plus
+            options closed that day. Open-position gains (unrealized mark-to-market) are
+            excluded until you close the position, so this view will differ from the
+            “Daily Opts P&amp;L” figure in the footer, which includes open MTM.
+          </p>
         </>
       )}
       {!selectedDate && !loading && view === 'year' && (

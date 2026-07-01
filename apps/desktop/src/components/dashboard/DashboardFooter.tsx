@@ -40,7 +40,16 @@ export function DashboardFooter({
         </span>
       </div>
       {optionsState && (
-        <div className="dashboard-footer__pnl">
+        <div
+          className="dashboard-footer__pnl"
+          title={
+            "Today's options P&L: realized P&L booked since midnight ET plus the "
+            + 'current unrealized mark-to-market on every open contract. Resets '
+            + 'each day. Differs from the Options tab’s “Total Options '
+            + 'P&L,” which counts unrealized MTM plus only the contracts '
+            + 'closed today (not the running daily realized delta).'
+          }
+        >
           <span className="dashboard-footer__label">Daily Opts P&amp;L</span>
           {(() => {
             const dailyOptsPnl = optionsState.dailyOptionsPnl ?? optionsState.optionsPnl;

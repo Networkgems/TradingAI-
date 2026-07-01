@@ -339,7 +339,14 @@ export function StockOptionsPanel({
                 </strong>
               </span>
             ) : null}
-            <span>Total Options P&amp;L: <strong className={totalOptionsPnl >= 0 ? 'green' : 'red'}>{fmtDollar(totalOptionsPnl)}</strong></span>
+            <span title={
+              'P&L of the positions shown on this tab: unrealized mark-to-market on '
+              + 'every open contract (mark − entry) plus the realized P&L of the '
+              + 'contracts in “Closed Today.” This is NOT the same as the bottom bar’s '
+              + '“Daily Opts P&L,” which uses the running daily realized delta (since '
+              + 'midnight ET) instead of the closed-today rows — so the two figures '
+              + 'legitimately differ.'
+            }>Total Options P&amp;L: <strong className={totalOptionsPnl >= 0 ? 'green' : 'red'}>{fmtDollar(totalOptionsPnl)}</strong></span>
             <span>Daily Trades: <strong className={optionsState.dailyOptionsCount >= optionsDailyLimit ? 'red' : ''}>{optionsState.dailyOptionsCount}/{optionsDailyLimit}</strong></span>
             {/* TRA-374 — surface the demo cost-model drag (slippage + per-contract
                 fee). Hidden in live and when both buckets are 0. */}
