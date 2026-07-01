@@ -2,7 +2,7 @@ import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import { tmpdir } from 'os';
 import { join } from 'path';
 import { rmSync, writeFileSync } from 'fs';
-import { SignalEngine, sizeLiveEquityFromStop, shortBlockedOnCashAccount, gateSignalOnReview, describeGatedStrategies, shouldBootArmLiveEquity, shouldRunRelativeValueScan, isLiveBrokerOperator, resolveLiveBrokerOperator, activeOptionsDailyLimit, activeEquityDailyLimit, _resetSharedShadowForTests, _sharedShadowRefreshDue, _claimSharedShadowRefresh, _endSharedShadowRefresh, _sharedShadowEvalDue, _claimSharedShadowEval } from './signal-engine.js';
+import { SignalEngine, sizeLiveEquityFromStop, shortBlockedOnCashAccount, gateSignalOnReview, describeGatedStrategies, shouldBootArmLiveEquity, shouldRunRelativeValueScan, shouldRunOtmScan, isLiveBrokerOperator, resolveLiveBrokerOperator, activeOptionsDailyLimit, activeEquityDailyLimit, _resetSharedShadowForTests, _sharedShadowRefreshDue, _claimSharedShadowRefresh, _endSharedShadowRefresh, _sharedShadowEvalDue, _claimSharedShadowEval } from './signal-engine.js';
 import { setShadowLedgerFileForTests } from './shadow-signal-ledger.js';
 import {
   setReversalShadowLedgerFileForTests,
@@ -30,8 +30,8 @@ import {
 } from './option-exec-flag.js';
 import { resetProposalStoreForTests, listProposals, getProposal } from './proposal-store.js';
 import { PaperAccount } from './paper-account.js';
-import type { RelativeValueScannerService, RelativeValueScanResult, SelectorChainSnapshot } from './relative-value-scanner.js';
-import type { RelativeValueCandidate, TradierAccountBalance, TradierOptionsClient, TradierOrderClient, ReversalChecklist, SrZone } from '@trading-app/engine';
+import type { RelativeValueScannerService, RelativeValueScanResult, OtmMispricingScanResult, SelectorChainSnapshot } from './relative-value-scanner.js';
+import type { RelativeValueCandidate, OtmMispricingCandidate, TradierAccountBalance, TradierOptionsClient, TradierOrderClient, ReversalChecklist, SrZone } from '@trading-app/engine';
 import {
   DEFAULT_ACCOUNT_SETTINGS,
   isLiveTradierEquityEnabled,
@@ -137,8 +137,36 @@ function seedRvTrend(engine: SignalEngine, symbol = 'AAPL'): void {
   );
 }
 
+// TRA-1207 — OTM-mispricing candidate fixture (mirrors `makeCandidate` for the
+// RV path). A cheap far-OTM call: mark below the BS theo built off smoothed IV.
+function makeOtmCandidate(overrides: Partial<OtmMispricingCandidate> = {}): OtmMispricingCandidate {
+  return {
+    optionSymbol: 'AAPL240705C00210000',
+    underlying: 'AAPL',
+    optionType: 'call',
+    strike: 210,
+    expiration: '2024-07-05',
+    daysToExpiration: 31,
+    mark: 0.80,
+    theo: 1.10,
+    mispricingPct: -0.27,
+    classification: 'cheap',
+    bid: 0.78,
+    ask: 0.82,
+    spreadPct: 0.05,
+    openInterest: 600,
+    volume: 150,
+    ivUsed: 0.28,
+    delta: 0.12,
+    ...overrides,
+  };
+}
+
 class StubScanner implements RelativeValueScannerService {
   scan = vi.fn<(symbol: string) => Promise<RelativeValueScanResult>>();
+  scanOtm = vi.fn<(symbol: string) => Promise<OtmMispricingScanResult>>(async (symbol: string) => ({
+    symbol, spot: null, expiration: null, candidates: [], reason: 'unavailable' as const,
+  }));
   getSelectorChain = vi.fn<(symbol: string) => Promise<SelectorChainSnapshot | null>>(async () => null);
   getOptionMark = vi.fn<(symbol: string, expiration: string, optionSymbol: string) => Promise<number | null>>();
   diagnostics = vi.fn(() => ({
@@ -190,6 +218,72 @@ describe('SignalEngine — relative-value scanner bridge', () => {
     expect(shouldRunRelativeValueScan({ ...favorable, hasScanner: false })).toBe(false);
     expect(shouldRunRelativeValueScan({ ...favorable, marketOpen: false })).toBe(false);
     expect(shouldRunRelativeValueScan({ ...favorable, skipOptionsForLiveEquityOnly: true })).toBe(false);
+  });
+
+  // TRA-1207 — board directive (local-board): "OTM Mispricing back on and turn
+  // off Relative Value." RV is now paused (asserted above) and the OTM engine
+  // is armed, so its per-tick gate must return true when all conditions are
+  // favorable — the mirror image of the RV gate now being off.
+  it('shouldRunOtmScan returns true when armed and all conditions favorable (TRA-1207)', () => {
+    expect(
+      shouldRunOtmScan({
+        autoTradingEnabled: true,
+        halted: false,
+        hasScanner: true,
+        marketOpen: true,
+        skipOptionsForLiveEquityOnly: false,
+      }),
+    ).toBe(true);
+  });
+
+  it('shouldRunOtmScan returns false when auto-trading is off (TRA-1207)', () => {
+    expect(
+      shouldRunOtmScan({
+        autoTradingEnabled: false,
+        halted: false,
+        hasScanner: true,
+        marketOpen: true,
+        skipOptionsForLiveEquityOnly: false,
+      }),
+    ).toBe(false);
+  });
+
+  it('runOtmScan opens an OTM-mispricing position from a `cheap` candidate and records a signal (TRA-1207)', async () => {
+    const scanner = new StubScanner();
+    scanner.scanOtm.mockResolvedValue({
+      symbol: 'AAPL',
+      spot: 195,
+      expiration: '2024-07-05',
+      candidates: [makeOtmCandidate()],
+      reason: 'ok',
+    });
+
+    const engine = new SignalEngine(undefined, undefined, scanner);
+    await (engine as unknown as { runOtmScan: (s: string[]) => Promise<void> }).runOtmScan(['AAPL']);
+
+    const state = engine.getState();
+    expect(state.options.openOptions).toHaveLength(1);
+    const opened = state.options.openOptions[0];
+    expect(opened.optionSymbol).toBe('AAPL240705C00210000');
+    expect(opened.signalType).toBe('otm_mispricing');
+
+    expect(state.signals).toHaveLength(1);
+    expect(state.signals[0].type).toBe('otm_mispricing');
+    expect(state.signals[0].symbol).toBe('AAPL');
+  });
+
+  it('runOtmScan ignores `expensive` OTM candidates (long-only path) (TRA-1207)', async () => {
+    const scanner = new StubScanner();
+    scanner.scanOtm.mockResolvedValue({
+      symbol: 'AAPL',
+      spot: 195,
+      expiration: '2024-07-05',
+      candidates: [makeOtmCandidate({ classification: 'expensive', mispricingPct: 0.30 })],
+      reason: 'ok',
+    });
+    const engine = new SignalEngine(undefined, undefined, scanner);
+    await (engine as unknown as { runOtmScan: (s: string[]) => Promise<void> }).runOtmScan(['AAPL']);
+    expect(engine.getState().options.openOptions).toHaveLength(0);
   });
 
   it('runRelativeValueScan opens an RV position from a `cheap` candidate and records a signal', async () => {
@@ -4472,6 +4566,7 @@ describe('SignalEngine — option-shadow selector wiring (TRA-917)', () => {
     const calls = { getSelectorChain: 0 };
     const svc: RelativeValueScannerService = {
       scan: vi.fn(async () => ({ symbol: 'TEST', spot: null, expiration: null, candidates: [], reason: 'ok' as const })),
+      scanOtm: vi.fn(async () => ({ symbol: 'TEST', spot: null, expiration: null, candidates: [], reason: 'unavailable' as const })),
       getSelectorChain: vi.fn(async () => {
         calls.getSelectorChain += 1;
         return snapshot;

@@ -1,8 +1,11 @@
 import {
   TradierOptionsClient,
   findRelativeValueOpportunities,
+  findMispricedOtmContracts,
   type OptionChainRow,
   type RelativeValueCandidate,
+  type OtmMispricingCandidate,
+  type OtmScannerOptions,
   type RelativeValueScannerOptions,
 } from '@trading-app/engine';
 import { logger } from './observability/index.js';
@@ -101,6 +104,20 @@ export interface RelativeValueScanResult {
   errorMessage?: string;
 }
 
+/**
+ * TRA-1207 — OTM-mispricing scan result. Mirrors {@link RelativeValueScanResult}
+ * but surfaces {@link OtmMispricingCandidate}s. `scanOtm` reuses the SAME warm
+ * chain cache / circuit breaker / DTE picker as `scan`, so when the OTM engine
+ * runs it costs zero extra Tradier calls versus the RV path it replaces.
+ */
+export interface OtmMispricingScanResult {
+  symbol: string;
+  spot: number | null;
+  expiration: string | null;
+  candidates: OtmMispricingCandidate[];
+  reason?: 'ok' | 'unavailable';
+}
+
 export interface RelativeValueScannerDiagnostics {
   configured: boolean;
   breakerOpen: boolean;
@@ -149,6 +166,20 @@ export interface RelativeValueScannerService {
     opts?: RelativeValueScannerOptions,
     dtePrefs?: DtePrefs,
   ): Promise<RelativeValueScanResult>;
+  /**
+   * TRA-1207 — scan a symbol for mispriced OUT-OF-THE-MONEY contracts (the
+   * original TRA-158/TRA-159 options strategy the board re-enabled in place of
+   * RV). Rides the same 60s chain snapshot cache + circuit breaker + DTE
+   * auto-pick as {@link scan} / {@link getSelectorChain}, so it never adds
+   * Tradier load beyond what a same-symbol RV scan would. Returns
+   * `reason: 'unavailable'` (empty candidates) when uncredentialed, the breaker
+   * is open, or spot / expiration / chain can't be resolved. Never trades.
+   */
+  scanOtm(
+    symbol: string,
+    opts?: OtmScannerOptions,
+    dtePrefs?: DtePrefs,
+  ): Promise<OtmMispricingScanResult>;
   /**
    * Look up the current per-share mark for a contract belonging to `symbol`'s
    * `expiration` chain. Reads from the same cached snapshot used by `scan()`
@@ -310,6 +341,22 @@ export class TradierRelativeValueScannerService implements RelativeValueScannerS
 
     const candidates = findRelativeValueOpportunities(chain, spot, { now: this.now(), ...opts });
     return { symbol: upper, spot, expiration, candidates, reason: 'ok' };
+  }
+
+  async scanOtm(
+    symbol: string,
+    opts: OtmScannerOptions = {},
+    dtePrefs: DtePrefs = {},
+  ): Promise<OtmMispricingScanResult> {
+    const upper = symbol.trim().toUpperCase();
+    // Reuse the hardened snapshot path (spot + DTE-picked expiration + full
+    // cached chain, breaker-guarded) so OTM rides the same 60s cache as RV.
+    const snap = await this.getSelectorChain(upper, dtePrefs);
+    if (!snap) {
+      return { symbol: upper, spot: null, expiration: null, candidates: [], reason: 'unavailable' };
+    }
+    const candidates = findMispricedOtmContracts(snap.rows, snap.spot, { now: this.now(), ...opts });
+    return { symbol: snap.symbol, spot: snap.spot, expiration: snap.expiration, candidates, reason: 'ok' };
   }
 
   async getSelectorChain(

@@ -2,7 +2,7 @@ import { OrbStrategy, BbFadeStrategy, IchimokuStrategy, SupertrendConfluenceStra
 import type { StrategySelectorInput, ContractQuote, OptionTrend, RvLongTrendSide, ExitState, SharedTickIndicators, RelativeValueScannerOptions, OptionChainRow, IvRvScannerOptions, IvRvMispricingCandidate } from '@trading-app/engine';
 import type { TradierAccountBalance } from '@trading-app/engine';
 import { WATCHLIST, isLiquidSwingSymbol, checkEquitySwingClose, MANAGED_ACCOUNT_RATIO, MAX_CONSECUTIVE_LOSSES, DAILY_DRAWDOWN_HALT_PCT, OPTIONS_PER_TICKET_DOLLAR_FLOOR, OPTIONS_POSITION_CAP_RATIO, aliasWatchlistSymbol, isLiveTradierOptionsEnabled, isStockMarketOpen, perPositionCap, resolveAutoManageImportedTradierOptions, resolveDemoCostModel, resolveHoldLiveOptionsOvernight, resolveSwingHoldOptions, resolveLiveTradeEquitiesTradier, resolveManagedAccountRatio, resolveMarketReviewGatesEnabled, resolveRiskPerTrade, resolveRvDtePrefs, resolveTradierOptionsCreds, validateBracket, DEFAULT_RV_DTE_MIN, DEFAULT_RV_DTE_MAX, DEFAULT_RV_DTE_TARGET, scoreNewsSentiment, aggregateSymbolSentiment, aggregateFedSentiment, aggregateStockTwitsSentiment, dedupeStockTwitsMessages, mapCuratedMessagesBySymbol, nameAliasesFor, evaluateEquityDcaAdd, evaluateOptionDcaAdd, CONVICTION_DCA, blendedAverage, positionRiskDollars, minutesToSessionClose, getEasternUtcOffset, isAgentTradingWindowOpen } from '@trading-app/shared';
-import type { TradeSignal, RelativeValueSignal, Sma200Signal, Candle, OptionsAccountState, SignalType, Position, OptionPosition, AccountMode, AccountSettings, AccountState, NewsItem, SymbolSentiment, SocialSentiment, StockTwitsMessage, TechnicalSignalSnapshot, TradierEnv, MarketReview, MarketReviewGates, EngineMarketReviewState, GatedStrategyNote, AgentRecommendation, TradeProposal, AgentOrderAudit, GuardrailVerdict, OptionType } from '@trading-app/shared';
+import type { TradeSignal, RelativeValueSignal, OtmMispricingSignal, Sma200Signal, Candle, OptionsAccountState, SignalType, Position, OptionPosition, AccountMode, AccountSettings, AccountState, NewsItem, SymbolSentiment, SocialSentiment, StockTwitsMessage, TechnicalSignalSnapshot, TradierEnv, MarketReview, MarketReviewGates, EngineMarketReviewState, GatedStrategyNote, AgentRecommendation, TradeProposal, AgentOrderAudit, GuardrailVerdict, OptionType } from '@trading-app/shared';
 import { shouldAutoConfirm } from '@trading-app/shared';
 // TRA-544 (TRA-529 P1) / TRA-747 (P2) — advisory multi-agent layer. ON suspends
 // deterministic auto-routing and the engine surfaces the recommendations on the
@@ -433,7 +433,23 @@ const RV_SCAN_INTERVAL_MS = 5 * 60_000;
 // on per-user persisted settings. Existing managed RV exits keep running; we do
 // NOT force-liquidate. Flip back to `true` to re-arm new entries.
 // TRA-895 — board accepted interaction 0b81d58e: re-enable RV for the 3-day demo test (Jun 15-18).
-const RV_ENGINE_ENABLED: boolean = true;
+// TRA-1207 — board directive (local-board, 2026-06-30): "OTM Mispricing back on
+// and turn off Relative Value." RV is PAUSED again (no new RV entries in any
+// mode); the OTM-mispricing engine below is re-armed in its place. Existing RV
+// positions still get marks via refreshOptionMarks() and exit normally.
+const RV_ENGINE_ENABLED: boolean = false;
+
+// TRA-1207 — master on/off switch for the OTM-mispricing options engine (the
+// original TRA-158/TRA-159 strategy: long-only far-OTM contracts trading cheap
+// vs. a Black-Scholes theo off Tradier's smoothed IV). Retired when RV replaced
+// it (TRA-191); re-armed here at the board's request. Mirrors RV_ENGINE_ENABLED
+// as a one-line compiled kill switch so it survives a restart with no reliance
+// on persisted settings. When false the OTM *opening* side short-circuits;
+// existing OTM positions still mark + exit via the shared exit path.
+const OTM_ENGINE_ENABLED: boolean = true;
+// Periodic OTM scan cadence — same 5-minute throttle as RV (identical Tradier
+// rate-limit math; OTM rides the SAME warm 60s chain cache via `scanOtm`).
+const OTM_SCAN_INTERVAL_MS = 5 * 60_000;
 
 /**
  * TRA-811 — the single gate that decides whether the per-tick loop arms a new
@@ -452,6 +468,31 @@ export function shouldRunRelativeValueScan(opts: {
 }): boolean {
   return (
     RV_ENGINE_ENABLED &&
+    opts.autoTradingEnabled &&
+    !opts.halted &&
+    opts.hasScanner &&
+    opts.marketOpen &&
+    !opts.skipOptionsForLiveEquityOnly
+  );
+}
+
+/**
+ * TRA-1207 — the OTM-mispricing analogue of {@link shouldRunRelativeValueScan}.
+ * `OTM_ENGINE_ENABLED` dominates, so while the OTM engine is off this returns
+ * `false` even when every other condition is favorable. Same conditions as the
+ * RV gate (auto-trading on, not halted, scanner wired, market open, options not
+ * opted out) since both open long-premium single-leg option tickets and share
+ * the same Tradier-backed scanner service.
+ */
+export function shouldRunOtmScan(opts: {
+  autoTradingEnabled: boolean;
+  halted: boolean;
+  hasScanner: boolean;
+  marketOpen: boolean;
+  skipOptionsForLiveEquityOnly: boolean;
+}): boolean {
+  return (
+    OTM_ENGINE_ENABLED &&
     opts.autoTradingEnabled &&
     !opts.halted &&
     opts.hasScanner &&
@@ -1021,6 +1062,8 @@ export class SignalEngine {
   private readonly rvScanner: RelativeValueScannerService | undefined;
   /** Last successful RV scan timestamp — gates the 5-minute cadence. */
   private lastRvScanAt = 0;
+  /** TRA-1207 — last OTM-mispricing scan timestamp; gates the 5-minute cadence. */
+  private lastOtmScanAt = 0;
   /**
    * TRA-373 — per-user RV scanner DTE window. The scanner is a shared
    * singleton (`relativeValueScannerService` in index.ts), so per-user
@@ -2489,6 +2532,23 @@ export class SignalEngine {
       }
     }
 
+    // TRA-1207 — OTM-mispricing scanner (board re-enabled it in place of RV).
+    // Same gate/cadence as the RV scan above; reuses the SAME rvScanner
+    // singleton (its warm 60s chain cache) via `scanOtm`, so with RV paused
+    // this is the sole options-opening path and adds no extra Tradier load.
+    if (shouldRunOtmScan({
+      autoTradingEnabled: this.isAutoTradingEnabled(),
+      halted: this.riskGovernor.isHalted(),
+      hasScanner: !!this.rvScanner,
+      marketOpen: isStockMarketOpen(),
+      skipOptionsForLiveEquityOnly,
+    })) {
+      if (Date.now() - this.lastOtmScanAt >= OTM_SCAN_INTERVAL_MS) {
+        this.lastOtmScanAt = Date.now();
+        await this.runOtmScan(activeSymbols);
+      }
+    }
+
     // TRA-917 (TRA-908 Phase A) — option-structure SHADOW selector pass. Runs
     // AFTER the RV scan so it rides the scanner's warm 60s chain cache for the
     // same symbols (zero extra Tradier calls when the snapshot is fresh). Wholly
@@ -3659,6 +3719,126 @@ export class SignalEngine {
         });
       } catch (err: unknown) {
         log.warn('RV scan failed', { sym, reason: err instanceof Error ? err.message : String(err) });
+      }
+    }
+  }
+
+  /**
+   * TRA-1207 — scan each active-interest symbol for cheap OUT-OF-THE-MONEY
+   * contracts (the original TRA-158/TRA-159 strategy the board re-enabled in
+   * place of RV) and route the most-mispriced `cheap` candidate per symbol into
+   * the options account as a long-premium `otm_mispricing` ticket. Long-only —
+   * `expensive` needs a short leg / defined-risk spread that's out of scope.
+   * Reuses the RV scanner's warm chain cache via `scanOtm`, so with RV paused
+   * this adds no Tradier load beyond what the retired RV scan already cost.
+   * Errors per-symbol are swallowed so one Tradier hiccup can't take down the
+   * whole tick.
+   */
+  private async runOtmScan(activeSymbols: string[]): Promise<void> {
+    if (!this.rvScanner) return;
+
+    // Same options-sleeve breaker gate as RV — when exec is on and the sleeve
+    // tripped its daily-drawdown / cumulative-R limit, open NO new tickets
+    // (exits still run). No-op in the default prod config where exec is off.
+    if (isOptionExecEnabled() && this.optionsBreaker.isHalted()) return;
+
+    // Per-user DTE window (TRA-373) flows through the shared scanner singleton
+    // on every call, identical to the RV path.
+    const dtePrefs = { min: this.rvDteMin, max: this.rvDteMax, target: this.rvDteTarget };
+
+    for (const sym of activeSymbols) {
+      try {
+        const result = await this.rvScanner.scanOtm(sym, undefined, dtePrefs);
+        if (result.reason !== 'ok' || result.candidates.length === 0) continue;
+
+        // The scanner sorts by |mispricingPct|, so the first `cheap` candidate
+        // is the strongest long-only read for this symbol/scan.
+        const cheap = result.candidates.find((c) => c.classification === 'cheap');
+        if (!cheap) continue;
+
+        // Dedup: same OCC fired in the last hour — avoid re-spamming the feed
+        // when the chain stays cheap across multiple scans.
+        const recentDup = this.recentSignals.find(
+          (s) => s.type === 'otm_mispricing'
+            && (s as OtmMispricingSignal).optionSymbol === cheap.optionSymbol
+            && Date.now() - s.timestamp < 60 * 60_000,
+        );
+        if (recentDup) continue;
+
+        const stopLoss = cheap.mark * 0.75;
+        const takeProfit = cheap.mark * 1.5;
+        const signal: OtmMispricingSignal = {
+          id: randomUUID(),
+          symbol: sym,
+          type: 'otm_mispricing',
+          side: 'buy',
+          entryPrice: cheap.mark,
+          stopLoss,
+          takeProfit,
+          riskRewardRatio: 2,
+          timestamp: Date.now(),
+          optionSymbol: cheap.optionSymbol,
+          optionType: cheap.optionType,
+          strike: cheap.strike,
+          expiration: cheap.expiration,
+          mark: cheap.mark,
+          theo: cheap.theo,
+          mispricingPct: cheap.mispricingPct,
+          delta: cheap.delta,
+        };
+
+        // TRA-1207 — the live single-leg broker mirror (buy_to_open + DTBP
+        // pre-check stack at ~:3400) is RV-specific and lives inside
+        // `runRelativeValueScan`. The OTM engine is a demo/paper strategy; to
+        // avoid opening an un-mirrored phantom on a live-options account, in
+        // live+options mode we surface the signal with a skip reason and DON'T
+        // open a paper position. Demo — the active book — opens normally.
+        // (Live-equity-only was already filtered by the shouldRunOtmScan gate.)
+        if (this.mode === 'live' && this.tradierLiveOptionsEnabled) {
+          signal.mode = 'live';
+          signal.liveSkipReason = 'OTM live broker mirror not wired (demo/paper only)';
+          this.recentSignals.unshift(signal); this.emitSignalAlert(signal);
+          if (this.recentSignals.length > MAX_SIGNALS) this.recentSignals.pop();
+          this.dailySignals.push({
+            id: signal.id, symbol: signal.symbol, type: 'otm_mispricing', firedAt: signal.timestamp,
+          });
+          log.warn('live OTM signal suppressed', { optionSymbol: cheap.optionSymbol });
+          continue;
+        }
+
+        // TRA-991/TRA-1103 — journal the OTM open (observe-only, behind
+        // ENABLE_OPTION_TRADE_JOURNAL) so the demo book's OTM fills are captured
+        // like the RV path. `ivRank` is the honest-unknown null (not computed on
+        // this lean path — same rationale as the RV note at ~:3372); OTM is
+        // direction-agnostic so `trend` is 'sideways'.
+        const underlyingSpot =
+          typeof result.spot === 'number' && result.spot > 0 ? result.spot : undefined;
+        const otmJournalSetup: OptionTradeJournalSetup = {
+          ivRank: null,
+          trend: 'sideways',
+          entryDelta: cheap.delta,
+          sentiment: null,
+          sentimentIcBand: null,
+          agentConviction: null,
+        };
+        const opened = this.optionsAccount.openOptionFromCandidate(
+          signal,
+          this.mode,
+          undefined,
+          underlyingSpot,
+          otmJournalSetup,
+        );
+        if (!opened) continue;
+
+        this.emitOptionFillAlert(opened);
+        signal.mode = this.mode;
+        this.recentSignals.unshift(signal); this.emitSignalAlert(signal);
+        if (this.recentSignals.length > MAX_SIGNALS) this.recentSignals.pop();
+        this.dailySignals.push({
+          id: signal.id, symbol: signal.symbol, type: 'otm_mispricing', firedAt: signal.timestamp,
+        });
+      } catch (err: unknown) {
+        log.warn('OTM scan failed', { sym, reason: err instanceof Error ? err.message : String(err) });
       }
     }
   }
