@@ -1,4 +1,16 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
+// TRA-1226 — evaluateIvRvScan now backfills the underlying's daily closes from
+// the equity feed when the in-process dailyCloseCache is cold (the iv-rv option
+// universe is NOT the set the TRA-533 technical-snapshot pass warms). Stub the
+// feed so these unit tests stay hermetic: no network, and no real-timer
+// retry/backoff hanging under vi.useFakeTimers(). Tests that need realised vol
+// seed dailyCloseCache via seedCloses(); the dedicated backfill test overrides
+// this mock per-case.
+vi.mock('./yahoo-feed.js', async (importActual) => {
+  const actual = await importActual<typeof import('./yahoo-feed.js')>();
+  return { ...actual, fetchDailyCandles: vi.fn(async () => []) };
+});
+import { fetchDailyCandles } from './yahoo-feed.js';
 import { tmpdir } from 'os';
 import { join } from 'path';
 import { rmSync, writeFileSync } from 'fs';
@@ -5165,13 +5177,42 @@ describe('SignalEngine — IV-RV mispriced routing (TRA-1203)', () => {
     }
   });
 
-  it('routing ON but realised vol uncomputable (no closes) — stands down, opens nothing', async () => {
+  it('routing ON but realised vol uncomputable (no closes + cold feed) — stands down, opens nothing', async () => {
     process.env[OPTION_IV_RV_SCANNER_FLAG] = '1';
     process.env[OPTION_IV_RV_ROUTING_FLAG] = '1';
     const svc = scannerFor({ AAA: { symbol: 'AAA', spot: 100, expiration: '2024-07-19', rows: cheapVolChain('AAA', 100) } });
     const engine = new SignalEngine(undefined, undefined, svc);
-    // No daily closes seeded ⇒ realizedVol null ⇒ no candidates ⇒ no route.
+    // No daily closes seeded AND the backfill feed is cold (mock → []) ⇒
+    // realizedVol null ⇒ no candidates ⇒ no route.
+    vi.mocked(fetchDailyCandles).mockResolvedValueOnce([]);
     await runScan(engine, ['AAA']);
     expect(engine.getState().options.openOptions).toHaveLength(0);
+  });
+
+  // TRA-1226 — the fix under test: when dailyCloseCache is cold for an iv-rv scan
+  // symbol (the common case — the 128-symbol option universe is not the set the
+  // technical-snapshot pass warms), the scan backfills daily closes directly from
+  // the equity feed so realizedVol is non-null and candidates can flow. Without
+  // this the whole book short-circuits at `no_realized_vol` and 0 candidates.
+  it('cold cache — backfills daily closes from the feed so RV is non-null and it routes', async () => {
+    process.env[OPTION_IV_RV_SCANNER_FLAG] = '1';
+    process.env[OPTION_IV_RV_ROUTING_FLAG] = '1';
+    const svc = scannerFor({ AAA: { symbol: 'AAA', spot: 100, expiration: '2024-07-19', rows: cheapVolChain('AAA', 100) } });
+    const engine = new SignalEngine(undefined, undefined, svc);
+    // Cache intentionally NOT seeded. The feed returns a high-RV close series so
+    // the 0.18 contract IV prices as BUY_PREMIUM.
+    const bars: Candle[] = highRvCloses().map((c, i) => ({
+      symbol: 'AAA', timestamp: i * 86_400_000, open: c, high: c, low: c, close: c, volume: 0,
+    }));
+    vi.mocked(fetchDailyCandles).mockResolvedValueOnce(bars);
+    await runScan(engine, ['AAA']);
+    expect(fetchDailyCandles).toHaveBeenCalledWith('AAA', expect.any(Number));
+    const open = engine.getState().options.openOptions;
+    expect(open.length).toBeGreaterThanOrEqual(1);
+    expect(open[0].symbol).toBe('AAA');
+    // And the backfilled series is now cached so the next pass rides it (no re-fetch).
+    vi.mocked(fetchDailyCandles).mockClear();
+    await runScan(engine, ['AAA']);
+    expect(fetchDailyCandles).not.toHaveBeenCalled();
   });
 });

@@ -4486,7 +4486,26 @@ export class SignalEngine {
         const snap = await this.rvScanner.getSelectorChain(sym, dtePrefs);
         if (!snap || !(snap.spot > 0) || snap.rows.length === 0) continue;
 
-        const dailyCloses = this.dailyCloseCache.get(sym) ?? [];
+        // TRA-1226 — the IV-RV scan universe (the option-chain symbols
+        // getSelectorChain resolves, ~128 names) is NOT the same set the
+        // TRA-533 technical-snapshot pass warms into `dailyCloseCache`: that
+        // pass runs market-hours-only, throttled, and over the active-interest
+        // equity subset, so most iv-rv underlyings arrive here with zero
+        // daily-close history and short-circuit at `no_realized_vol` (0
+        // candidates for the whole book — the TRA-1204 forward-test can never
+        // start). Backfill the underlying's daily closes directly from the same
+        // daily feed when the cache is cold, then prime `dailyCloseCache` so the
+        // next pass is warm. Shares the feed client's retry/breaker; a cold pull
+        // is swallowed and just leaves this symbol at `no_realized_vol` for the
+        // pass, exactly as before.
+        let dailyCloses = this.dailyCloseCache.get(sym) ?? [];
+        if (dailyCloses.length === 0) {
+          const bars = await fetchDailyCandles(sym, MTF_DAILY_BARS).catch(() => [] as Candle[]);
+          if (bars.length > 0) {
+            dailyCloses = bars.map((b) => b.close);
+            this.dailyCloseCache.set(sym, dailyCloses);
+          }
+        }
         const result = scanIvRvFromSnapshot(
           { symbol: snap.symbol, spot: snap.spot, expiration: snap.expiration, rows: snap.rows },
           dailyCloses,
