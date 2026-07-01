@@ -750,6 +750,17 @@ export class PaperOptionsAccount {
   }
 
   /**
+   * TRA-1231 — remaining daily options-cap headroom (cap minus the summed
+   * source counters, floored at 0). Exposed so the tick can reserve slots for
+   * the iv-rv routing pass, which runs LAST in the tick and would otherwise be
+   * starved of cap by the earlier RV/OTM entry scans (they share this cap via
+   * {@link dailyOptionsTotal}).
+   */
+  optionsDailyRemaining(): number {
+    return Math.max(0, this.optionsDailyTradesLimit - this.dailyOptionsTotal());
+  }
+
+  /**
    * TRA-195 — unified total options-trades cap. The previous design gated each
    * source (ATM `dailyCount`, OTM `dailyOtmCount`, RV `dailyRvCount`) against a
    * separate constant, which meant changing the user-facing setting only moved

@@ -324,6 +324,67 @@ describe('SignalEngine — relative-value scanner bridge', () => {
     expect(state.signals[0].symbol).toBe('AAPL');
   });
 
+  // TRA-1231 — the iv-rv routing pass runs LAST in the demo tick and shares the
+  // single `optionsDailyTradesLimit` with the RV/OTM entry scans that run first.
+  // When routing is enabled the RV scan must leave `IV_RV_RESERVED_CAP_SLOTS`
+  // of headroom so the iv-rv route isn't silently starved (the bug: zero
+  // `iv-rv-buy-premium` rows despite live candidates). With the cap already at
+  // the reservation floor, the RV scan stands down and opens nothing.
+  it('runRelativeValueScan reserves cap headroom for iv-rv routing when routing is ON', async () => {
+    const scanner = new StubScanner();
+    scanner.scan.mockResolvedValue({
+      symbol: 'AAPL',
+      spot: 195,
+      expiration: '2024-07-05',
+      candidates: [makeCandidate()],
+      reason: 'ok',
+    });
+    const engine = new SignalEngine(undefined, undefined, scanner);
+    seedRvTrend(engine);
+    // Cap == reserved slots ⇒ remaining (2) <= IV_RV_RESERVED_CAP_SLOTS (2) ⇒
+    // the RV loop must break before entering, preserving the slots for iv-rv.
+    const accts = (engine as unknown as {
+      optionsAccounts: Record<string, { updateConfig: (c: { optionsDailyTradesLimit: number }) => void; optionsDailyRemaining: () => number }>;
+    }).optionsAccounts;
+    Object.values(accts).forEach(a => a.updateConfig({ optionsDailyTradesLimit: 2 }));
+
+    // Routing is gated on BOTH flags (scanner ∧ routing), see isOptionIvRvRoutingEnabled.
+    process.env[OPTION_IV_RV_SCANNER_FLAG] = '1';
+    process.env[OPTION_IV_RV_ROUTING_FLAG] = '1';
+    try {
+      await (engine as unknown as { runRelativeValueScan: (s: string[]) => Promise<void> }).runRelativeValueScan(['AAPL']);
+    } finally {
+      delete process.env[OPTION_IV_RV_SCANNER_FLAG];
+      delete process.env[OPTION_IV_RV_ROUTING_FLAG];
+    }
+    // Stood down — no RV entry consumed the reserved headroom.
+    expect(engine.getState().options.openOptions).toHaveLength(0);
+    Object.values(accts).forEach(a => expect(a.optionsDailyRemaining()).toBe(2));
+  });
+
+  // Control: with routing OFF there is no reservation, so the same near-floor cap
+  // still admits an RV entry (unchanged prod/live behaviour).
+  it('runRelativeValueScan does NOT reserve headroom when iv-rv routing is OFF', async () => {
+    const scanner = new StubScanner();
+    scanner.scan.mockResolvedValue({
+      symbol: 'AAPL',
+      spot: 195,
+      expiration: '2024-07-05',
+      candidates: [makeCandidate()],
+      reason: 'ok',
+    });
+    const engine = new SignalEngine(undefined, undefined, scanner);
+    seedRvTrend(engine);
+    const accts = (engine as unknown as {
+      optionsAccounts: Record<string, { updateConfig: (c: { optionsDailyTradesLimit: number }) => void }>;
+    }).optionsAccounts;
+    Object.values(accts).forEach(a => a.updateConfig({ optionsDailyTradesLimit: 2 }));
+
+    // Routing flag left unset ⇒ the reservation guard is inert.
+    await (engine as unknown as { runRelativeValueScan: (s: string[]) => Promise<void> }).runRelativeValueScan(['AAPL']);
+    expect(engine.getState().options.openOptions).toHaveLength(1);
+  });
+
   it('also opens RV positions on below-intrinsic no-arb violations (a long-only signal)', async () => {
     const scanner = new StubScanner();
     scanner.scan.mockResolvedValue({

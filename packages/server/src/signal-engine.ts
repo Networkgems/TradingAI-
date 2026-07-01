@@ -422,6 +422,16 @@ export function activeEquityDailyLimit(settings?: AccountSettings): number {
 // chain cache. RV is the *only* options strategy enabled for stock options
 // (TRA-191 directive); ATM auto-open and OTM scans are disabled below.
 const RV_SCAN_INTERVAL_MS = 5 * 60_000;
+// TRA-1231 — reserved daily-options-cap headroom for the iv-rv routing pass.
+// The iv-rv mispricing scan runs LAST in the demo tick (after the RV + OTM
+// entry scans) and shares the single `optionsDailyTradesLimit`. Without a
+// reservation the earlier scans exhaust the cap and the iv-rv route silently
+// gets `daily options trade cap reached`, producing zero `iv-rv-buy-premium`
+// journal rows despite live candidates. When routing is enabled on the demo
+// book, the RV/OTM entry loops stand down once they'd cross into this headroom.
+// iv-rv candidates are rare (typically 0–1/scan), so 2 slots suffice without
+// materially starving the RV/OTM sleeves.
+const IV_RV_RESERVED_CAP_SLOTS = 2;
 // TRA-776 — master on/off switch for the relative-value options engine (the
 // sole strategy that auto-opens long-premium calls/puts). Left as an explicit
 // flag (not deleted) so it stays a one-line kill switch. When false, the
@@ -3206,6 +3216,14 @@ export class SignalEngine {
       : undefined;
 
     for (const sym of activeSymbols) {
+      // TRA-1231 — leave cap headroom for the iv-rv routing pass (runs last in
+      // the demo tick, shares this cap). Only bites when routing is enabled on
+      // the demo book, so prod/live entry behaviour is unchanged.
+      if (
+        this.mode === 'demo'
+        && isOptionIvRvRoutingEnabled()
+        && this.optionsAccount.optionsDailyRemaining() <= IV_RV_RESERVED_CAP_SLOTS
+      ) break;
       try {
         const result = await this.rvScanner.scan(sym, scanOpts, dtePrefs);
         if (result.reason !== 'ok' || result.candidates.length === 0) continue;
@@ -3747,6 +3765,13 @@ export class SignalEngine {
     const dtePrefs = { min: this.rvDteMin, max: this.rvDteMax, target: this.rvDteTarget };
 
     for (const sym of activeSymbols) {
+      // TRA-1231 — same iv-rv cap reservation as the RV scan above. The OTM
+      // scan also runs before the iv-rv routing pass and shares the cap.
+      if (
+        this.mode === 'demo'
+        && isOptionIvRvRoutingEnabled()
+        && this.optionsAccount.optionsDailyRemaining() <= IV_RV_RESERVED_CAP_SLOTS
+      ) break;
       try {
         const result = await this.rvScanner.scanOtm(sym, undefined, dtePrefs);
         if (result.reason !== 'ok' || result.candidates.length === 0) continue;
