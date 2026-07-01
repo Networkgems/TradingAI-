@@ -13,6 +13,7 @@ function hotFundamentals(over: Partial<ShortInterestFundamentals> = {}): ShortIn
     sharesOutstanding: 55_000_000,
     marketCap: 2_500_000_000,
     averageDailyVolume: 3_000_000,
+    shortInterestAsOf: null,
     asOf: 0,
     ...over,
   };

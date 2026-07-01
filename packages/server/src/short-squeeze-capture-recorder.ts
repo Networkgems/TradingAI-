@@ -41,15 +41,79 @@ import type {
 import { etDateKey } from './options-chain-recorder.js';
 import type { ShortSqueezeScanResult } from './short-squeeze-scanner.js';
 
+/**
+ * The raw engine legs for a captured symbol-day, surfaced as discrete fields so
+ * the Step-2 grader (TRA-1208) does not have to reach into `filters[]` for each
+ * datum. These are POINT-IN-TIME values that cannot be reconstructed later —
+ * `price` in particular is the entry close the forward MFE is measured against,
+ * and `shortInterestAsOf` is the FINRA settlement date the squeeze move must be
+ * graded relative to (short interest is bi-monthly / stale). All null-tolerant.
+ */
+export interface ShortSqueezeCaptureRawInputs {
+  shortPercentOfFloat: number | null;
+  sharesShort: number | null;
+  daysToCover: number | null;
+  floatShares: number | null;
+  sharesOutstanding: number | null;
+  marketCap: number | null;
+  avgDailyVolume: number | null;
+  rvol: number | null;
+  /** Entry close — the denominator for the forward return / MFE. */
+  price: number | null;
+  sma50: number | null;
+  /** FINRA settlement / as-of date of the short-interest datum (epoch ms). */
+  shortInterestAsOf: number | null;
+}
+
+/**
+ * Forward outcome, appended on resolution (mirrors the reversal / IV-RV shadow
+ * ledgers). Computed by {@link resolveShortSqueezeForwardOutcomes} once the
+ * post-scan sessions have closed: it never exists at capture time. The label the
+ * Step-2 grader scores each qualifier on.
+ */
+export interface ShortSqueezeForwardOutcome {
+  /** Entry close the returns are measured from (copied from rawInputs.price). */
+  entryClose: number;
+  /** ms-epoch of the last session folded into this resolution. */
+  resolvedAt: number;
+  /** Close return at +1 / +3 / +5 sessions (fraction; null until that session closes). */
+  ret1d: number | null;
+  ret3d: number | null;
+  ret5d: number | null;
+  /**
+   * Max favorable excursion over the next ≤5 sessions = highest high ÷ entry
+   * close − 1. The squeeze label: how far the name ran, not just where it closed.
+   */
+  mfe5d: number | null;
+  /** Number of post-entry sessions actually observed (0–5); <5 ⇒ still resolving. */
+  sessionsForward: number;
+}
+
 export interface ShortSqueezeCaptureRow {
   /** Underlying ticker (uppercased). */
   symbol: string;
+  /**
+   * ms-epoch the scan sweep ran (mirrors the file-level `recordedAt`). Stamped
+   * per-row so a single row is self-contained for JSONL-style grading and so the
+   * forward resolver can anchor the +1d/+3d/+5d window without the file header.
+   */
+  scanTs: number;
   /**
    * `ok` — the screener produced an evaluation for this symbol-day;
    * `no_data` — neither fundamentals nor daily bars were available;
    * `fetch_error` — a feed threw. The last two carry null qualifier fields.
    */
   outcome: 'ok' | 'no_data' | 'fetch_error';
+  /**
+   * Raw engine legs (discrete fields) — point-in-time, non-reconstructable.
+   * Null when not `ok`.
+   */
+  rawInputs: ShortSqueezeCaptureRawInputs | null;
+  /**
+   * Forward outcome — null until {@link resolveShortSqueezeForwardOutcomes}
+   * appends it once the post-scan sessions close. This is the graded label.
+   */
+  forward: ShortSqueezeForwardOutcome | null;
   /** 0–100 composite score (null when not `ok`). */
   score: number | null;
   classification: ShortSqueezeClassification | null;
@@ -113,14 +177,17 @@ export interface ShortSqueezeCaptureRecorderOptions {
 }
 
 /** Map a scanner result onto the persisted capture row (observe-only projection). */
-function toRow(result: ShortSqueezeScanResult): ShortSqueezeCaptureRow {
+function toRow(result: ShortSqueezeScanResult, scanTs: number): ShortSqueezeCaptureRow {
   const evaluation = result.evaluation;
   if (result.reason !== 'ok' || !evaluation) {
     // `no_data` / `fetch_error` — no qualifier reading for this symbol-day.
     // Preserve the outcome (fail-closed: absence is recorded, never a pass).
     return {
       symbol: result.symbol,
+      scanTs,
       outcome: result.reason === 'fetch_error' ? 'fetch_error' : 'no_data',
+      rawInputs: null,
+      forward: null,
       score: null,
       classification: null,
       qualifies: null,
@@ -131,9 +198,27 @@ function toRow(result: ShortSqueezeScanResult): ShortSqueezeCaptureRow {
       ...(result.errorMessage ? { errorMessage: result.errorMessage } : {}),
     };
   }
+  const f = result.fundamentals;
+  const p = result.priceStats;
+  const rawInputs: ShortSqueezeCaptureRawInputs = {
+    shortPercentOfFloat: f?.shortPercentOfFloat ?? null,
+    sharesShort: f?.sharesShort ?? null,
+    daysToCover: f?.daysToCover ?? null,
+    floatShares: f?.floatShares ?? null,
+    sharesOutstanding: f?.sharesOutstanding ?? null,
+    marketCap: f?.marketCap ?? null,
+    avgDailyVolume: p?.avgDailyVolume ?? null,
+    rvol: p?.rvol ?? null,
+    price: p?.price ?? null,
+    sma50: p?.sma50 ?? null,
+    shortInterestAsOf: f?.shortInterestAsOf ?? null,
+  };
   return {
     symbol: result.symbol,
+    scanTs,
     outcome: 'ok',
+    rawInputs,
+    forward: null,
     score: evaluation.score,
     classification: evaluation.classification,
     qualifies: evaluation.qualifies,
@@ -160,7 +245,7 @@ export async function recordShortSqueezeCapture(
 
   const requested = [...new Set(options.symbols.map((s) => s.trim().toUpperCase()))].filter(Boolean);
   const results = await options.scanUniverse(requested);
-  const symbols = results.map(toRow);
+  const symbols = results.map((r) => toRow(r, now));
 
   const file: ShortSqueezeCaptureFile = {
     date,

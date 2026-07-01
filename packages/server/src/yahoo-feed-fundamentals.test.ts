@@ -10,6 +10,8 @@ describe('parseShortInterestFundamentals', () => {
         shortRatio: 6.4,
         floatShares: 41_000_000,
         sharesOutstanding: 60_000_000,
+        // Yahoo epoch-SECONDS FINRA settlement date → normalized to ms below.
+        dateShortInterest: 1_749_600_000,
       },
       summaryDetail: {
         marketCap: 2_400_000_000,
@@ -27,6 +29,7 @@ describe('parseShortInterestFundamentals', () => {
       sharesOutstanding: 60_000_000,
       marketCap: 2_400_000_000,
       averageDailyVolume: 2_750_000,
+      shortInterestAsOf: 1_749_600_000_000,
       asOf: 1234,
     });
   });
@@ -61,6 +64,7 @@ describe('parseShortInterestFundamentals', () => {
       sharesOutstanding: null,
       marketCap: null,
       averageDailyVolume: null,
+      shortInterestAsOf: null,
       asOf: 42,
     });
   });

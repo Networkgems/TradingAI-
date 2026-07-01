@@ -837,6 +837,13 @@ export interface ShortInterestFundamentals {
   marketCap: number | null;
   /** 10-day (fallback: general) average daily volume, for RVOL context. */
   averageDailyVolume: number | null;
+  /**
+   * FINRA settlement / as-of date of the short-interest datum (epoch ms), from
+   * Yahoo `dateShortInterest`. Short interest is exchange-reported bi-monthly and
+   * lags by ~1–2 weeks, so a forward squeeze move must NOT be graded against a
+   * short-int reading that post-dates the entry. Null when Yahoo omits it.
+   */
+  shortInterestAsOf: number | null;
   /** Epoch ms the snapshot was taken. */
   asOf: number;
 }
@@ -885,6 +892,12 @@ export function parseShortInterestFundamentals(
       qsNum(sd, 'averageDailyVolume10Day') ??
       qsNum(sd, 'averageVolume10days') ??
       qsNum(sd, 'averageVolume'),
+    // `dateShortInterest` is a Yahoo epoch-SECONDS timestamp — normalize to ms so
+    // it is directly comparable to the capture `scanTs`.
+    shortInterestAsOf: (() => {
+      const secs = qsNum(dks, 'dateShortInterest');
+      return secs != null ? secs * 1000 : null;
+    })(),
     asOf,
   };
 }

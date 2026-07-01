@@ -260,6 +260,10 @@ import {
   type ShortSqueezeCaptureRow,
 } from './short-squeeze-capture-recorder.js';
 import {
+  resolveShortSqueezeForwardOutcomes,
+  SHORT_SQUEEZE_FORWARD_SESSIONS,
+} from './short-squeeze-forward-resolver.js';
+import {
   CoinbaseOrderClient,
   tradierBaseUrl,
   TradierOptionsClient,
@@ -2150,6 +2154,26 @@ async function runShortSqueezeCapture(): Promise<void> {
   });
 }
 
+// TRA-1209 — append/advance the forward outcome (+1d/+3d/+5d close return + the
+// 5-session MFE) on already-captured qualifier rows once the post-scan sessions
+// have closed. This is the label QuantTrader's Step-2 sign-off (TRA-1208) grades
+// on. Observe-only, idempotent, and reconstructable from historical bars, so it
+// runs on the same daily hook right after the capture and only rewrites a
+// partition when it folds in genuinely new sessions. Gated by the same flag.
+async function runShortSqueezeForwardResolve(): Promise<void> {
+  if (!shortSqueezeCaptureEnabled()) return;
+  const res = await resolveShortSqueezeForwardOutcomes({
+    outDir: SHORT_SQUEEZE_CAPTURE_OUT_DIR,
+    fetchDailyBars: async (symbol, count) => fetchDailyCandles(symbol, count),
+  });
+  log.info('short-squeeze forward-resolve complete', {
+    partitions: res.partitions,
+    filesUpdated: res.filesUpdated,
+    rowsResolved: res.rowsResolved,
+    rowsComplete: res.rowsComplete,
+  });
+}
+
 // TRA-596 (TRA-595 C1) — refresh the upcoming-earnings calendar for the active
 // stock universe. Runs on boot and on the 9 AM ET pre-market hook. Skips (with
 // a warning) when FINNHUB_API_TOKEN is unset, and isolates provider failures so
@@ -2439,6 +2463,14 @@ async function buildShortSqueezeCaptureSummary() {
       atOrAbove1_0: number;
       atOrAbove1_5: number;
     };
+    // TRA-1209 — forward-outcome resolution on this partition's `ok` rows. The
+    // +1d/+3d/+5d return + 5-session MFE label QuantTrader's Step-2 grades on.
+    forward: {
+      okRows: number;
+      resolved: number;
+      complete: number;
+      pending: number;
+    };
     perSymbol: { symbol: string; outcome: string; score: number | null; qualifies: boolean | null; rvol: number | null }[];
   } | null = null;
 
@@ -2451,6 +2483,11 @@ async function buildShortSqueezeCaptureSummary() {
       const rows = Array.isArray(file.symbols) ? file.symbols : [];
       const eligible = rows.filter(rowShortFloatEligible);
       const eligibleRvols = eligible.map((r) => ({ symbol: r.symbol, rvol: rowRvol(r) }));
+      const okRows = rows.filter((r) => r.outcome === 'ok');
+      const forwardComplete = okRows.filter(
+        (r) => (r.forward?.sessionsForward ?? 0) >= SHORT_SQUEEZE_FORWARD_SESSIONS,
+      ).length;
+      const forwardResolved = okRows.filter((r) => r.forward != null).length;
       latest = {
         date: file.date ?? last,
         recordedAt: typeof file.recordedAt === 'number' ? file.recordedAt : null,
@@ -2467,6 +2504,12 @@ async function buildShortSqueezeCaptureSummary() {
             .sort((a, b) => (b.rvol ?? -1) - (a.rvol ?? -1)),
           atOrAbove1_0: eligibleRvols.filter((v) => (v.rvol ?? 0) >= 1.0).length,
           atOrAbove1_5: eligibleRvols.filter((v) => (v.rvol ?? 0) >= 1.5).length,
+        },
+        forward: {
+          okRows: okRows.length,
+          resolved: forwardResolved,
+          complete: forwardComplete,
+          pending: okRows.length - forwardResolved,
         },
         perSymbol: rows.map((r) => ({
           symbol: r.symbol,
@@ -6842,6 +6885,13 @@ scheduler.start({
     // captures above (or vice-versa).
     await runShortSqueezeCapture().catch((err) =>
       log.error('short-squeeze capture failed', {
+        reason: err instanceof Error ? err.message : String(err),
+      }),
+    );
+    // TRA-1209 — resolve forward outcomes on prior captures (the graded label).
+    // Isolated so a bar-feed failure can't drop the captures above.
+    await runShortSqueezeForwardResolve().catch((err) =>
+      log.error('short-squeeze forward-resolve failed', {
         reason: err instanceof Error ? err.message : String(err),
       }),
     );

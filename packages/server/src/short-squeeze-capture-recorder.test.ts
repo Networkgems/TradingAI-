@@ -10,6 +10,7 @@ import {
 } from '@trading-app/engine';
 import { recordShortSqueezeCapture } from './short-squeeze-capture-recorder.js';
 import type { ShortSqueezeScanResult } from './short-squeeze-scanner.js';
+import type { ShortInterestFundamentals } from './yahoo-feed.js';
 
 let tmpRoot: string;
 
@@ -42,7 +43,21 @@ function okResult(symbol: string, over: Partial<ShortSqueezePriceStats> = {}): S
     ...over,
   };
   const evaluation = evaluateShortSqueeze(symbol, fundamentals, priceStats);
-  return { symbol, evaluation, fundamentals: null, priceStats, reason: 'ok' };
+  // The scan result carries the raw ShortInterestFundamentals so the recorder can
+  // project the discrete rawInputs legs (incl. the FINRA as-of date).
+  const rawFundamentals: ShortInterestFundamentals = {
+    symbol,
+    shortPercentOfFloat: 0.32,
+    sharesShort: 12_000_000,
+    daysToCover: 7.5,
+    floatShares: 40_000_000,
+    sharesOutstanding: 55_000_000,
+    marketCap: 2_500_000_000,
+    averageDailyVolume: 1_000_000,
+    shortInterestAsOf: Date.parse('2026-06-15T00:00:00Z'),
+    asOf: NOW(),
+  };
+  return { symbol, evaluation, fundamentals: rawFundamentals, priceStats, reason: 'ok' };
 }
 
 describe('recordShortSqueezeCapture', () => {
@@ -77,6 +92,19 @@ describe('recordShortSqueezeCapture', () => {
     expect(typeof gme.passedCount).toBe('number');
     expect(typeof gme.applicableCount).toBe('number');
     expect(Array.isArray(gme.missingInputs)).toBe(true);
+
+    // Discrete raw legs (point-in-time, non-reconstructable) are surfaced for the
+    // Step-2 grader — incl. the entry close (forward-MFE denominator) and the
+    // FINRA short-interest as-of date.
+    expect(gme.scanTs).toBe(NOW());
+    expect(gme.rawInputs.price).toBe(11);
+    expect(gme.rawInputs.rvol).toBe(3.0);
+    expect(gme.rawInputs.sma50).toBe(9.5);
+    expect(gme.rawInputs.shortPercentOfFloat).toBe(0.32);
+    expect(gme.rawInputs.sharesShort).toBe(12_000_000);
+    expect(gme.rawInputs.shortInterestAsOf).toBe(Date.parse('2026-06-15T00:00:00Z'));
+    // Forward outcome is unset at capture time — the resolver appends it later.
+    expect(gme.forward).toBeNull();
   });
 
   it('records a no_data result fail-closed with null qualifier fields', async () => {
