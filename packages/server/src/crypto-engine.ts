@@ -2156,6 +2156,19 @@ export class CryptoSignalEngine {
   }
 
   /**
+   * TRA-1216 — expose the live Coinbase client for the OBSERVE-ONLY perp
+   * funding-carry watchlist fetch (funding rates + mark prices for the whole
+   * watchlist, regardless of open positions). Returns null in demo / keyless
+   * mode (no live broker), so the caller writes nothing and pays zero IO. The
+   * narrowed return type only permits the two read-only lookups this observe
+   * path uses — no order/entry surface leaks through.
+   */
+  getPerpFundingClient(): Pick<CoinbaseOrderClient, 'getFundingRates' | 'getProductPrices'> | null {
+    if (this.mode !== 'live' || !this.liveAccount) return null;
+    return this.liveAccount.getCoinbaseClient();
+  }
+
+  /**
    * TRA-320 — await the broker close in live mode and let errors propagate so
    * the route can surface a 502 + reason to the dashboard. Pre-fix this fired
    * `liveAccount.closePosition` and immediately returned an optimistic snapshot

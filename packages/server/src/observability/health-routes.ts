@@ -27,6 +27,8 @@ import {
   isOptionIvRvScannerEnabled,
 } from '../option-exec-flag.js';
 import { summarizeIvRvScans } from '../iv-rv-scanner.js';
+import { isPerpFundingCarryEnabled } from '../perp-funding-carry-flag.js';
+import { summarizeFundingCarryScans } from '../perp-funding-carry-scanner.js';
 import { optionsIdeasAutoExecuteHealth } from '../options-ideas-auto-execute.js';
 import {
   listOptionTradeJournal,
@@ -801,6 +803,25 @@ export function registerLiveHealthRoutes(app: Express, deps: LiveHealthDeps): vo
       build: resolveBuildInfo(),
       enabled: isOptionIvRvScannerEnabled(),
       ...summarizeIvRvScans(now()),
+    });
+  });
+
+  // TRA-1216 — unauthenticated, secrets-free perp funding-carry readout. The
+  // scan is a process-global, OBSERVE-ONLY pass (no balances/PII — just perp
+  // product ids, funding rates, and net-APR) so this is unauthenticated (parity
+  // with /iv-rv). `enabled` mirrors ENABLE_PERP_FUNDING_CARRY_OBSERVE so the
+  // board can see at a glance whether the scanner + funding-history accrual are
+  // armed; when off the store is empty so the surface is a fail-closed
+  // `enabled:false` with `scans:[]` rather than a 404. Always read-only: NO order
+  // is ever placed off these candidates — the short-perp leg carries a
+  // liquidation note but is never sized.
+  app.get('/api/health/perp-funding-carry', (_req, res) => {
+    res.json({
+      ok: true,
+      time: new Date(now()).toISOString(),
+      build: resolveBuildInfo(),
+      enabled: isPerpFundingCarryEnabled(),
+      ...summarizeFundingCarryScans(now()),
     });
   });
 

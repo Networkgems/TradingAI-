@@ -30,6 +30,10 @@ import { join } from 'path';
 export const DEMO_FLAG_ALLOWLIST = [
   'ENABLE_AUTONOMOUS_DEMO_LOOP',
   'AUTONOMOUS_DEMO_LOOP_INTERVAL_MS',
+  // TRA-1216 — observe-only perp funding-carry scanner + forward funding-history
+  // accrual. Non-secret, read-only, no order path — safe for the file override so
+  // a non-admin operator can arm the forward series on the self-hosted host.
+  'ENABLE_PERP_FUNDING_CARRY_OBSERVE',
 ] as const;
 
 export const DEMO_FLAGS_FILENAME = 'demo-flags.json';

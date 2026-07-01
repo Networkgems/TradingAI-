@@ -45,6 +45,21 @@ import {
 // on a host where the SYSTEM-owned PM2 daemon is unreachable (no dotenv loader,
 // env lives only in the saved process env). Secrets are never read from it.
 import { resolveDemoFlagEnv } from './demo-flags.js';
+// TRA-1216 — observe-only perp funding-carry scanner + forward funding-history
+// accrual. Flag-checked before any fetch so ENABLE_PERP_FUNDING_CARRY_OBSERVE
+// off ⇒ zero cost/IO. Read-only: no order/entry/sizing path.
+import {
+  isPerpFundingCarryEnabled,
+  resolvePerpCarryConfig,
+  resolvePerpCarryWatchlist,
+} from './perp-funding-carry-flag.js';
+import {
+  scanFundingCarry,
+  recordFundingCarryScan,
+  type FundingObservation,
+} from './perp-funding-carry-scanner.js';
+import { appendFundingHistory, type FundingHistoryEntry } from './perp-funding-history.js';
+import type { CryptoSignalEngine } from './crypto-engine.js';
 // TRA-1006 — automated pre/post-market analyst agent. Tick fns are flag-checked
 // before any deps are built (zero cost while ENABLE_ANALYST_AGENT is off) and are
 // hooked onto the existing onPremarket / onArchive market-scheduler ticks.
@@ -1722,6 +1737,80 @@ async function runHourlyFundingForAllUsers(): Promise<void> {
       });
     }
   }
+}
+
+// TRA-1216 — observe-only perp funding-carry pass, fired off the SAME hourly hook
+// as the funding accrual above. When ENABLE_PERP_FUNDING_CARRY_OBSERVE is OFF this
+// returns before any work ⇒ zero cost/IO. When ON it fetches funding + mark price
+// for EVERY watchlist perp (regardless of open positions), records the ranked
+// observe-only carry candidates into the in-memory store backing
+// `GET /api/health/perp-funding-carry`, and appends the observations to the
+// forward funding-history JSONL under DATA_DIR (the sole persisted artifact — it
+// unblocks a future carry backtest). Read-only throughout: NO order/entry/sizing.
+//
+// The fetch is done ONCE per hour off any live Coinbase client in the fleet
+// (funding is venue-global, not per-user). Demo/keyless fleets have no live
+// client ⇒ no fetch, no writes. Coinbase INTX funds hourly ⇒ intervalHours = 1;
+// the scanner annualizes off that per-observation interval, not a hardcoded 8h.
+async function runHourlyPerpFundingCarry(): Promise<void> {
+  if (!isPerpFundingCarryEnabled()) return; // flag OFF ⇒ zero cost/IO
+  const watchlist = resolvePerpCarryWatchlist();
+  if (watchlist.length === 0) return;
+
+  let client: ReturnType<CryptoSignalEngine['getPerpFundingClient']> = null;
+  for (const ctx of getAllUserContexts()) {
+    client = ctx.cryptoEngine.getPerpFundingClient();
+    if (client) break;
+  }
+  if (!client) return; // no live client (demo/keyless) ⇒ no fetch, no writes
+
+  let rates: Map<string, { rate: number }>;
+  let prices: Map<string, number>;
+  try {
+    [rates, prices] = await Promise.all([
+      client.getFundingRates(watchlist),
+      client.getProductPrices(watchlist).catch(() => new Map<string, number>()),
+    ]);
+  } catch (err) {
+    log.warn('perp funding-carry fetch failed (TRA-1216)', {
+      reason: err instanceof Error ? err.message : String(err),
+    });
+    return;
+  }
+
+  const asOf = Date.now();
+  const observations: FundingObservation[] = watchlist.map((productId) => {
+    const fr = rates.get(productId);
+    const mark = prices.get(productId);
+    return {
+      productId,
+      fundingRate: fr && Number.isFinite(fr.rate) ? fr.rate : null,
+      intervalHours: 1, // Coinbase INTX funding cadence
+      markPrice: mark != null && Number.isFinite(mark) ? mark : null,
+      ts: asOf,
+    };
+  });
+
+  const candidates = scanFundingCarry(observations, resolvePerpCarryConfig(), asOf);
+  recordFundingCarryScan(candidates, asOf);
+
+  const history: FundingHistoryEntry[] = observations
+    .filter((o): o is FundingObservation & { fundingRate: number } => o.fundingRate != null)
+    .map((o) => ({
+      ts: o.ts ?? asOf,
+      productId: o.productId,
+      fundingRate: o.fundingRate,
+      intervalHours: o.intervalHours,
+      markPrice: o.markPrice ?? null,
+    }));
+  const rows = appendFundingHistory(DATA_DIR, history);
+
+  log.info('perp funding-carry observe pass (TRA-1216)', {
+    watchlist: watchlist.length,
+    eligible: candidates.filter((c) => c.eligible).length,
+    missing: candidates.filter((c) => c.reason === 'funding_data_missing').length,
+    historyRows: rows,
+  });
 }
 
 async function runDailyCloseForAllUsers(): Promise<void> {
@@ -6831,8 +6920,12 @@ scheduler.start({
   },
   // TRA-249-D — hourly funding accrual on open Coinbase INTX perps. Fires
   // at minute=0 every ET hour; per-user trackers no-op when no perps are
-  // open or the user is in demo mode.
-  onHourly: runHourlyFundingForAllUsers,
+  // open or the user is in demo mode. TRA-1216 — the same tick also drives the
+  // observe-only perp funding-carry pass (flag-gated ⇒ zero cost/IO when off).
+  onHourly: async () => {
+    await runHourlyFundingForAllUsers();
+    await runHourlyPerpFundingCarry();
+  },
   // TRA-849 — 8:30 AM ET pre-market morning brief. Renders the macro gate +
   // each user's watchlist setups, open book, and overnight news, then pushes
   // it through the notification dispatcher. Runs ahead of the 9:00 watchlist
