@@ -467,9 +467,36 @@ describe('DashboardFooter (TRA-725)', () => {
     expect(screen.getByText(/\+0\.42%\) Today/)).toBeInTheDocument();
   });
 
-  // TRA-475 contract carried over: the options figure prefers `dailyOptionsPnl`
-  // over the cumulative `optionsPnl` and never renders the cumulative number.
-  it('renders Daily Opts P&L from dailyOptionsPnl, not cumulative optionsPnl', () => {
+  // TRA-1228 — the realized figure prefers the row-summed `dailyRealizedOptionsPnl`
+  // (never the cumulative `optionsPnl`), and the open MTM shows as a SEPARATE
+  // "Open Opts P&L (unrealized)" figure so the two are no longer conflated.
+  it('renders realized (row-sum) and unrealized options P&L as distinct figures', () => {
+    render(
+      <DashboardFooter
+        account={account}
+        optionsState={{
+          openOptions: [], closedOptions: [],
+          optionsPnl: -19_471, dailyOptionsPnl: -91.99,
+          dailyRealizedOptionsPnl: 58.39, openOptionsUnrealizedPnl: -150.38,
+          optionsCash: 64_224.32, dailyOptionsCount: 1,
+        }}
+      />,
+    );
+    // Realized pill reads the row-sum, not the blended dailyOptionsPnl and not
+    // the cumulative optionsPnl.
+    expect(screen.getByText('Daily Opts P&L (realized)')).toBeInTheDocument();
+    expect(screen.getByText(/\+\$58\.39/)).toBeInTheDocument();
+    // Unrealized shows separately.
+    expect(screen.getByText('Open Opts P&L (unrealized)')).toBeInTheDocument();
+    expect(screen.getByText(/-\$150\.38/)).toBeInTheDocument();
+    // Neither the blended pill value nor the cumulative total leaks in.
+    expect(screen.queryByText(/-\$91\.99/)).not.toBeInTheDocument();
+    expect(screen.queryByText(/19,471/)).not.toBeInTheDocument();
+  });
+
+  // Back-compat: state without the split figures falls back to dailyOptionsPnl
+  // for the realized pill and hides the unrealized figure entirely.
+  it('falls back to dailyOptionsPnl and hides the unrealized pill for legacy state', () => {
     render(
       <DashboardFooter
         account={account}
@@ -480,9 +507,9 @@ describe('DashboardFooter (TRA-725)', () => {
         }}
       />,
     );
-    expect(screen.getByText('Daily Opts P&L')).toBeInTheDocument();
+    expect(screen.getByText('Daily Opts P&L (realized)')).toBeInTheDocument();
     expect(screen.getByText(/-\$91\.99/)).toBeInTheDocument();
-    expect(screen.queryByText(/19,471/)).not.toBeInTheDocument();
+    expect(screen.queryByText('Open Opts P&L (unrealized)')).not.toBeInTheDocument();
   });
 
   // Back-compat: a legacy snapshot without `dailyOptionsPnl` falls back to the

@@ -1101,7 +1101,55 @@ describe('PaperOptionsAccount.getStateForMode — per-mode P&L (TRA-246)', () =>
       expect(b.getStateForMode('live').dailyOptionsPnl).toBe(0);
     });
 
-    it('TRA-949 — a close on a day with NO entries surfaces in the daily pill (demo auto-trade, agents off)', () => {
+    it('TRA-1228 — dailyRealizedOptionsPnl row-sums today\'s closes and stays split from open MTM', () => {
+    const acct = new PaperOptionsAccount({ initialEquity: 50_000, managedAccountRatio: 0.5 });
+    // Fully close one live position today (mark 0.75 = −25% ⇒ stop-loss full
+    // exit; a take-profit mark only partial-exits, so use the SL to force a
+    // clean closed row — the sign of the realized P&L is irrelevant here).
+    const closer = acct.openOptionFromCandidate(buildSignal({ mark: 1.0 }), 'live');
+    acct.checkExits(new Map(), new Map([[closer!.optionSymbol!, 0.75]]), 'live');
+    const closedRow = acct.getStateForMode('live').closedOptions[0];
+    expect(closedRow.pnl ?? 0).not.toBe(0);
+    // Open a second position and mark it up — unrealized only.
+    acct.openOptionFromCandidate(
+      buildSignal({ id: 's-open', optionSymbol: 'MSFT240712C00400000', mark: 1.0 }), 'live');
+    const opened = acct.getStateForMode('live').openOptions[0];
+    opened.currentPremium = 1.25;
+
+    const live = acct.getStateForMode('live');
+    // Realized = the closed row only (row-sum), NOT the blended delta+MTM.
+    expect(live.dailyRealizedOptionsPnl).toBeCloseTo(closedRow.pnl ?? 0, 5);
+    // Unrealized = the open MTM only.
+    const expectedUnreal = (1.25 - 1.0) * opened.contractsRemaining * 100;
+    expect(live.openOptionsUnrealizedPnl).toBeCloseTo(expectedUnreal, 5);
+    // The blended legacy pill still equals their sum (back-compat).
+    expect(live.dailyOptionsPnl).toBeCloseTo((closedRow.pnl ?? 0) + expectedUnreal, 5);
+  });
+
+  it('TRA-1228 — realized row-sum survives a restart that re-seeds the opening baseline', () => {
+    const acct = new PaperOptionsAccount({ initialEquity: 50_000, managedAccountRatio: 0.5 });
+    const closer = acct.openOptionFromCandidate(buildSignal({ mark: 1.0 }), 'live');
+    acct.checkExits(new Map(), new Map([[closer!.optionSymbol!, 0.75]]), 'live');
+    const realizedToday = acct.getStateForMode('live').dailyRealizedOptionsPnl!;
+    expect(realizedToday).not.toBe(0);
+
+    // Simulate a mid-session restart whose last persisted snapshot post-dated
+    // today's close, so the opening baseline was advanced PAST it. The delta
+    // pill then loses today's earlier realized; the row-sum figure does not.
+    const snap = acct.exportSnapshot();
+    const restarted = new PaperOptionsAccount({ initialEquity: 50_000, managedAccountRatio: 0.5 });
+    restarted.importSnapshot({
+      ...snap,
+      openingOptionsPnlByMode: { demo: 0, live: snap.optionsPnlByMode!.live ?? 0 },
+    });
+    // Delta method now understates today (baseline == current cumulative ⇒ 0)…
+    expect(restarted.getStateForMode('live').dailyOptionsPnl).toBeCloseTo(0, 5);
+    // …but the row-sum realized figure still equals today's closed rows, so the
+    // footer + Calendar + "Closed Today" table stay reconciled after a restart.
+    expect(restarted.getStateForMode('live').dailyRealizedOptionsPnl).toBeCloseTo(realizedToday, 5);
+  });
+
+  it('TRA-949 — a close on a day with NO entries surfaces in the daily pill (demo auto-trade, agents off)', () => {
       const acct = new PaperOptionsAccount({ initialEquity: 50_000, managedAccountRatio: 0.5 });
       // Open a demo position on day one.
       const pos = acct.openOptionFromCandidate(buildSignal({ mark: 1.0 }), 'demo');

@@ -2318,6 +2318,23 @@ export interface OptionsAccountState {
    * realized P&L. Optional for back-compat with older persisted state files.
    */
   dailyOptionsPnl?: number;
+  /**
+   * TRA-1228 — today's *realized* options P&L for the mode, summed directly
+   * from the contracts that closed today (row-sum), NOT the opening-baseline
+   * delta {@link dailyOptionsPnl} uses. This is the figure that matches the P&L
+   * Calendar's per-day cell and the "Closed Today" table, so the dashboard can
+   * show a realized number that reconciles across surfaces even after a
+   * mid-session restart re-seeds the opening baseline. Optional for back-compat.
+   */
+  dailyRealizedOptionsPnl?: number;
+  /**
+   * TRA-1228 — current unrealized mark-to-market on the mode's OPEN contracts
+   * ((mark − entry) × contractsRemaining × 100). Surfaced separately from the
+   * realized figure so the dashboard can distinguish "banked today" from
+   * "open-book paper gains" instead of conflating them in one pill. Optional
+   * for back-compat.
+   */
+  openOptionsUnrealizedPnl?: number;
   optionsCash: number;
   dailyOptionsCount: number;  // number of options opened today (resets at market open)
   /**

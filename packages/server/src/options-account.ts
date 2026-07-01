@@ -839,6 +839,33 @@ export class PaperOptionsAccount {
     return realizedDelta + this.unrealizedPnlForMode(mode);
   }
 
+  /**
+   * TRA-1228 — today's *realized* options P&L for a mode, summed directly from
+   * the contracts that closed today (ET), NOT the opening-baseline delta that
+   * {@link dailyOptionsPnlForMode} uses. This matches the P&L Calendar cell
+   * ({@link generateEodReport} sums the same rows by ET close date) and the
+   * dashboard "Closed Today" table, so the three surfaces reconcile. It also
+   * survives a mid-session restart that re-seeds `openingOptionsPnlByMode`: the
+   * closed-row P&L is read directly rather than differenced against a baseline
+   * that a restart may have advanced past today's earlier closes.
+   *
+   * ET (not `toDateKey`'s UTC) so the day boundary lines up with the Calendar.
+   * The closed list is cleared by the 9 PM ET archive, so this is the
+   * intraday figure the footer/calendar need; after the archive the settled
+   * report file on disk carries the day's realized total instead.
+   */
+  private dailyRealizedOptionsPnlForMode(mode: AccountMode): number {
+    const today = new Date().toLocaleDateString('en-CA', { timeZone: 'America/New_York' });
+    let total = 0;
+    for (const opt of this.closedOptions) {
+      if ((opt.mode ?? 'demo') !== mode) continue;
+      if (opt.closedAt == null) continue;
+      if (new Date(opt.closedAt).toLocaleDateString('en-CA', { timeZone: 'America/New_York' }) !== today) continue;
+      total += opt.pnl ?? 0;
+    }
+    return total;
+  }
+
   getState(): OptionsAccountState {
     return {
       openOptions: Array.from(this.openOptions.values()),
@@ -847,6 +874,11 @@ export class PaperOptionsAccount {
       // TRA-475 — bucket-wide daily P&L: sum of per-mode daily deltas + MTM.
       dailyOptionsPnl:
         this.dailyOptionsPnlForMode('demo') + this.dailyOptionsPnlForMode('live'),
+      // TRA-1228 — bucket-wide split figures (both modes).
+      dailyRealizedOptionsPnl:
+        this.dailyRealizedOptionsPnlForMode('demo') + this.dailyRealizedOptionsPnlForMode('live'),
+      openOptionsUnrealizedPnl:
+        this.unrealizedPnlForMode('demo') + this.unrealizedPnlForMode('live'),
       optionsCash: this.cash,
       dailyOptionsCount: this.dailyCount + this.dailyOtmCount + this.dailyRvCount,
       // TRA-374 — surface the cumulative demo cost-model drag so the dashboard
@@ -880,8 +912,14 @@ export class PaperOptionsAccount {
       openOptions: Array.from(this.openOptions.values()).filter(matches),
       closedOptions: this.closedOptions.filter(matches).slice(-20),
       optionsPnl: this.optionsPnlByMode[mode],
-      // TRA-475 — per-mode daily P&L drives the dashboard "Daily Opts P&L" pill.
+      // TRA-475 — per-mode daily P&L (realized delta + open MTM). Kept for
+      // back-compat; the dashboard now prefers the split figures below.
       dailyOptionsPnl: this.dailyOptionsPnlForMode(mode),
+      // TRA-1228 — split "banked today" (realized, row-sum) from "open book"
+      // (unrealized MTM) so the two dashboard figures are unambiguous and the
+      // realized one reconciles with the Calendar + "Closed Today" table.
+      dailyRealizedOptionsPnl: this.dailyRealizedOptionsPnlForMode(mode),
+      openOptionsUnrealizedPnl: this.unrealizedPnlForMode(mode),
       optionsCash: mode === 'demo' ? 0 : this.cash,
       dailyOptionsCount: this.dailyCount + this.dailyOtmCount + this.dailyRvCount,
       // TRA-374 — the cost model is demo-only by construction; live mode
