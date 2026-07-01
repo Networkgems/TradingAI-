@@ -29,6 +29,8 @@ import {
 import { summarizeIvRvScans } from '../iv-rv-scanner.js';
 import { isPerpFundingCarryEnabled } from '../perp-funding-carry-flag.js';
 import { summarizeFundingCarryScans } from '../perp-funding-carry-scanner.js';
+import { isCryptoRegimeEnabled } from '../crypto-regime-flag.js';
+import { summarizeCryptoRegimeScans } from '../crypto-regime-scanner.js';
 import { optionsIdeasAutoExecuteHealth } from '../options-ideas-auto-execute.js';
 import {
   listOptionTradeJournal,
@@ -822,6 +824,23 @@ export function registerLiveHealthRoutes(app: Express, deps: LiveHealthDeps): vo
       build: resolveBuildInfo(),
       enabled: isPerpFundingCarryEnabled(),
       ...summarizeFundingCarryScans(now()),
+    });
+  });
+
+  // TRA-1220 — unauthenticated, secrets-free crypto regime-overlay readout
+  // (parity with /perp-funding-carry). The scan is a process-global, OBSERVE-ONLY
+  // pass carrying no balances/PII — just symbols, regime labels, confidence, and
+  // the ADX/CHOP/ER values. `enabled` mirrors ENABLE_CRYPTO_REGIME_OVERLAY so the
+  // board can see at a glance whether the classifier is armed; when off the store
+  // is empty so the surface is a fail-closed `enabled:false` with `scans:[]`
+  // rather than a 404. Always read-only: NO order is ever placed off these labels.
+  app.get('/api/health/crypto-regime', (_req, res) => {
+    res.json({
+      ok: true,
+      time: new Date(now()).toISOString(),
+      build: resolveBuildInfo(),
+      enabled: isCryptoRegimeEnabled(),
+      ...summarizeCryptoRegimeScans(now()),
     });
   });
 

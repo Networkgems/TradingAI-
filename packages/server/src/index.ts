@@ -59,6 +59,20 @@ import {
   type FundingObservation,
 } from './perp-funding-carry-scanner.js';
 import { appendFundingHistory, type FundingHistoryEntry } from './perp-funding-history.js';
+// TRA-1220 — observe-only crypto regime-filter overlay (ADX/CHOP/ER classifier).
+// Flag-checked before any 4H candle fetch so ENABLE_CRYPTO_REGIME_OVERLAY off ⇒
+// zero cost/IO. Read-only: emits regime labels only, no order/entry/sizing path.
+import {
+  isCryptoRegimeEnabled,
+  resolveCryptoRegimeConfig,
+  resolveCryptoRegimeWatchlist,
+} from './crypto-regime-flag.js';
+import {
+  observeCryptoRegime,
+  summarizeCryptoRegimeScans,
+  buildCryptoRegimeEodSection,
+} from './crypto-regime-scanner.js';
+import { fetchCrypto4hBars } from './crypto-feed.js';
 import type { CryptoSignalEngine } from './crypto-engine.js';
 // TRA-1006 — automated pre/post-market analyst agent. Tick fns are flag-checked
 // before any deps are built (zero cost while ENABLE_ANALYST_AGENT is off) and are
@@ -1667,7 +1681,15 @@ async function generateAndSaveCryptoReport(ctx: UserContext): Promise<void> {
   // pre-fix the snapshot was always Demo even when written under live/.
   const mode = cryptoModeKey(getSettings(ctx.username));
   const snapshot = ctx.cryptoEngine.getReportSnapshot(mode);
-  const report = generateCryptoEodReport(snapshot);
+  const baseReport = generateCryptoEodReport(snapshot);
+  // TRA-1220 — append the observe-only "Crypto Regime Overlay" section, folding
+  // the forward regime labels captured this session (empty/disabled fallback when
+  // the overlay flag is off). Read-only: no orders, no fetch here.
+  const regimeSection = buildCryptoRegimeEodSection(
+    isCryptoRegimeEnabled(),
+    summarizeCryptoRegimeScans(),
+  );
+  const report = { ...baseReport, markdown: `${baseReport.markdown}\n${regimeSection}\n` };
   const targetDir = cryptoReportsDirFor(ctx, mode);
   const datePath = join(targetDir, `${report.date}.json`);
   const mdPath = join(targetDir, `${report.date}.md`);
@@ -1811,6 +1833,48 @@ async function runHourlyPerpFundingCarry(): Promise<void> {
     missing: candidates.filter((c) => c.reason === 'funding_data_missing').length,
     historyRows: rows,
   });
+}
+
+// TRA-1220 — per-symbol dedupe so we re-classify at most once per newly-closed 4H
+// bar (spec §6): keyed on the ISO of the last CLOSED bar we last classified.
+const lastCryptoRegimeBarBySymbol = new Map<string, string>();
+
+// TRA-1220 — observe-only crypto regime-overlay pass, fired off the SAME hourly
+// hook as the funding-carry pass above. The core logic lives in the scanner
+// module's dependency-injected `observeCryptoRegime` (so the zero-IO-when-off
+// invariant is unit-testable). When ENABLE_CRYPTO_REGIME_OVERLAY is OFF it returns
+// before ANY fetch ⇒ provably zero cost/IO. When ON it pulls CLOSED 4H bars for
+// each watchlist major (keyless public Coinbase candles — the perp-shorts 4H cache
+// only covers 5 of the 12 majors, so a shared reuse isn't possible; this mirrors
+// funding-carry's own hourly fetch), drops the forming bar (invariant #3 — no
+// lookahead), classifies via the pure engine substrate, and records the ranked
+// labels into the store backing GET /api/health/crypto-regime. Read-only: NO
+// order/entry/sizing path. 4H bars roll every 4h so the hourly cadence + the
+// lastBarTime dedupe re-classify a symbol at most once per new bar.
+async function runHourlyCryptoRegime(): Promise<void> {
+  if (!isCryptoRegimeEnabled()) return; // fast-path: skip resolving deps when off
+  const result = await observeCryptoRegime({
+    enabled: true,
+    watchlist: resolveCryptoRegimeWatchlist(),
+    cfg: resolveCryptoRegimeConfig(),
+    fetch4h: (symbol) => fetchCrypto4hBars(symbol, 260),
+    lastBarBySymbol: lastCryptoRegimeBarBySymbol,
+    onError: (symbol, err) =>
+      log.warn('crypto regime 4H fetch failed (TRA-1220)', {
+        symbol,
+        reason: err instanceof Error ? err.message : String(err),
+      }),
+  });
+  if (result.recorded > 0) {
+    log.info('crypto regime observe pass (TRA-1220)', {
+      fetched: result.fetched,
+      classified: result.recorded,
+      trend: result.readings.filter(
+        (r) => r.regime === 'trend_up' || r.regime === 'trend_down',
+      ).length,
+      chop: result.readings.filter((r) => r.regime === 'chop').length,
+    });
+  }
 }
 
 async function runDailyCloseForAllUsers(): Promise<void> {
@@ -6925,6 +6989,9 @@ scheduler.start({
   onHourly: async () => {
     await runHourlyFundingForAllUsers();
     await runHourlyPerpFundingCarry();
+    // TRA-1220 — observe-only crypto regime-overlay classification (flag-gated ⇒
+    // zero cost/IO when off). Read-only: emits labels only, no order path.
+    await runHourlyCryptoRegime();
   },
   // TRA-849 — 8:30 AM ET pre-market morning brief. Renders the macro gate +
   // each user's watchlist setups, open book, and overnight news, then pushes

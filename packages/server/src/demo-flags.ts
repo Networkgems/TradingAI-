@@ -34,6 +34,11 @@ export const DEMO_FLAG_ALLOWLIST = [
   // accrual. Non-secret, read-only, no order path — safe for the file override so
   // a non-admin operator can arm the forward series on the self-hosted host.
   'ENABLE_PERP_FUNDING_CARRY_OBSERVE',
+  // TRA-1220 — observe-only crypto regime-filter overlay (ADX/CHOP/ER classifier).
+  // Non-secret, read-only, no order path — emits regime labels only. Safe for the
+  // file override so a non-admin operator can arm the forward label stream on the
+  // self-hosted host.
+  'ENABLE_CRYPTO_REGIME_OVERLAY',
 ] as const;
 
 export const DEMO_FLAGS_FILENAME = 'demo-flags.json';

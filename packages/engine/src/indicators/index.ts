@@ -19,6 +19,8 @@ export { ichimoku, tkCross } from './ichimoku.js';
 export type { IchimokuState } from './ichimoku.js';
 export { adx } from './adx.js';
 export type { AdxResult } from './adx.js';
+export { choppinessIndex } from './choppiness.js';
+export { efficiencyRatio } from './efficiency-ratio.js';
 export { ema, emaCross } from './ema.js';
 export { emaSeries, maSlope } from './ma.js';
 export { atr, atrPct } from './atr.js';

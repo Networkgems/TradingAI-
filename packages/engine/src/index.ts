@@ -158,7 +158,7 @@ export type {
   MarketOrderParams as CoinbaseMarketOrderParams,
   LimitOrderParams as CoinbaseLimitOrderParams,
 } from './coinbase/index.js';
-export { rsi, rsiDivergence, VwapTracker, detectPattern, isBullishPattern, isBearishPattern, adx, ema, emaCross, emaSeries, maSlope, atr, atrPct, supertrend, supertrendLatest, SUPERTREND_DEFAULT_PERIOD, SUPERTREND_DEFAULT_FACTOR, donchian, ichimoku, tkCross, composeTechnicalSnapshot, composeTimeframeSignal, resampleCandles, mtfBiasOf, MTF_CHOP_ADX, MTF_TF_WEIGHTS, TF_BUCKET_MS } from './indicators/index.js';
+export { rsi, rsiDivergence, VwapTracker, detectPattern, isBullishPattern, isBearishPattern, adx, choppinessIndex, efficiencyRatio, ema, emaCross, emaSeries, maSlope, atr, atrPct, supertrend, supertrendLatest, SUPERTREND_DEFAULT_PERIOD, SUPERTREND_DEFAULT_FACTOR, donchian, ichimoku, tkCross, composeTechnicalSnapshot, composeTimeframeSignal, resampleCandles, mtfBiasOf, MTF_CHOP_ADX, MTF_TF_WEIGHTS, TF_BUCKET_MS } from './indicators/index.js';
 export type { VwapState, CandlePattern, AdxResult, DonchianChannel, IchimokuState, TimeframeCandles, SupertrendBar, SupertrendDirection, SupertrendOptions } from './indicators/index.js';
 // TRA-920 — swing-based S/R zones + reversal-confluence checklist (TRA-921 wires
 // these into the OBSERVE-ONLY reversal shadow ledger).
@@ -193,6 +193,15 @@ export type {
 } from './short-squeeze/short-squeeze.js';
 export { RegimeDetector, classifyRegime } from './regime.js';
 export type { Regime, RegimeDetectorOptions } from './regime.js';
+// TRA-1220 (parent TRA-1218) — crypto ADX/CHOP/ER regime classifier. DISTINCT
+// from `classifyRegime` above; the shared substrate rec #2 (regime-gated TSMOM)
+// imports.
+export { classifyCryptoRegime, CRYPTO_REGIME_DEFAULTS } from './crypto-regime-classifier.js';
+export type {
+  CryptoRegimeConfig,
+  CryptoRegimeReading,
+  CryptoRegimeLabel,
+} from './crypto-regime-classifier.js';
 export { StrategyRouter, DEFAULT_ROUTER_PRIORITY } from './router.js';
 export type {
   StrategyRouterOptions,
