@@ -255,9 +255,15 @@ import {
 import { TradierRelativeValueScannerService } from './relative-value-scanner.js';
 import { ShortSqueezeScannerService } from './short-squeeze-scanner.js';
 import {
+  recordShortSqueezeCapture,
+  type ShortSqueezeCaptureFile,
+  type ShortSqueezeCaptureRow,
+} from './short-squeeze-capture-recorder.js';
+import {
   CoinbaseOrderClient,
   tradierBaseUrl,
   TradierOptionsClient,
+  DEFAULT_SHORT_SQUEEZE_THRESHOLDS,
 } from '@trading-app/engine';
 import { submitSmartSellToClose } from './tradier-smart-close.js';
 import type { TradierEnv } from '@trading-app/shared';
@@ -2066,6 +2072,84 @@ async function runSentimentSnapshot(): Promise<void> {
   });
 }
 
+// TRA-1209 (TRA-1208 Phase-2 Step 1) — short-squeeze observe-capture loop. Rides
+// the SAME 3:55 PM ET `onChainRecord` hook as the chain + sentiment recorders so
+// one qualifier reading per trading day co-accumulates on the persistent disk.
+// OBSERVE-ONLY and default-OFF: gated behind `SHORT_SQUEEZE_CAPTURE`
+// (on/true/1/yes to enable), records what the screener sees, never sizes or
+// places an order. Short interest is bi-monthly and RVOL is a daily reading, so
+// once/session is ample.
+//
+// Universe mirrors the scan route: the resolved demo watchlist
+// (`getStocksWatchlistData(<demo user>).all`), with a `SHORT_SQUEEZE_WATCHLIST`
+// comma-separated override for pinning — same convention as `CHAINS_WATCHLIST`.
+//
+// Capture is taken at the SHIPPED PERMISSIVE thresholds (RVOL > 1.0) — the
+// scanner service is constructed with no threshold override, so it scores at the
+// engine spec defaults. This is intentional: we want the full RVOL distribution
+// across short-float-eligible names to ratify QuantTrader's provisional 1.5 cut
+// empirically, so the recommended tightening is NOT pre-applied at capture time.
+const SHORT_SQUEEZE_CAPTURE_OUT_DIR =
+  process.env['SHORT_SQUEEZE_OUT_DIR'] ?? join(DATA_DIR, 'short-squeeze-capture');
+
+function shortSqueezeCaptureEnabled(): boolean {
+  const flag = (process.env['SHORT_SQUEEZE_CAPTURE'] ?? '').trim().toLowerCase();
+  return flag === 'on' || flag === 'true' || flag === '1' || flag === 'yes';
+}
+
+/**
+ * Resolve the demo watchlist for the capture. Prefers the first demo-mode user's
+ * watchlist (the $25k paper book the screener grades against), falling back to
+ * any user context, then the `admin` namespace — `getStocksWatchlistData` returns
+ * the base WATCHLIST for an unknown user, so this always yields a sane universe.
+ */
+function resolveShortSqueezeUniverse(): { symbols: string[]; source: string } {
+  const raw = (process.env['SHORT_SQUEEZE_WATCHLIST'] ?? '').trim();
+  if (raw) {
+    return {
+      symbols: raw.split(',').map((s) => s.trim().toUpperCase()).filter(Boolean),
+      source: 'SHORT_SQUEEZE_WATCHLIST',
+    };
+  }
+  const contexts = getAllUserContexts();
+  const demoUser = contexts.find((ctx) => getSettings(ctx.username).mode === 'demo')?.username;
+  const user = demoUser ?? contexts[0]?.username ?? 'admin';
+  return { symbols: getStocksWatchlistData(user).all, source: `demo-watchlist:${user}` };
+}
+
+async function runShortSqueezeCapture(): Promise<void> {
+  if (!shortSqueezeCaptureEnabled()) {
+    log.info('short-squeeze capture disabled (SHORT_SQUEEZE_CAPTURE off)');
+    return;
+  }
+  const { symbols, source } = resolveShortSqueezeUniverse();
+  if (symbols.length === 0) {
+    log.warn('short-squeeze capture — empty universe, skipping', { source });
+    return;
+  }
+  log.info('short-squeeze capture starting', {
+    symbols: symbols.length,
+    universeSource: source,
+    outDir: SHORT_SQUEEZE_CAPTURE_OUT_DIR,
+  });
+  const result = await recordShortSqueezeCapture({
+    symbols,
+    scanUniverse: (syms) => shortSqueezeScannerService.scanUniverse(syms),
+    outDir: SHORT_SQUEEZE_CAPTURE_OUT_DIR,
+    thresholds: DEFAULT_SHORT_SQUEEZE_THRESHOLDS,
+    universeSource: source,
+  });
+  const ok = result.symbols.filter((s) => s.outcome === 'ok').length;
+  const qualifiers = result.symbols.filter((s) => s.qualifies === true).length;
+  log.info('short-squeeze capture complete', {
+    date: result.date,
+    ok,
+    qualifiers,
+    total: result.symbols.length,
+    dir: result.outDir,
+  });
+}
+
 // TRA-596 (TRA-595 C1) — refresh the upcoming-earnings calendar for the active
 // stock universe. Runs on boot and on the 9 AM ET pre-market hook. Skips (with
 // a warning) when FINNHUB_API_TOKEN is unset, and isolates provider failures so
@@ -2305,8 +2389,140 @@ app.get('/api/screeners/short-squeeze/scan', requireAuth, async (req, res) => {
   });
 });
 
-app.get('/api/health/short-squeeze', (_req, res) => {
-  res.json(shortSqueezeScannerService.diagnostics());
+// TRA-1209 — tokenless short-squeeze diagnostics + observe-capture summary.
+// Surfaces the live scanner diagnostics (unchanged `lastScan`) PLUS a rolling
+// summary of the TRA-1209 observe-capture accrual so QuantTrader can grade the
+// Step-2 ratification gate without a bearer token (AUTH_SECRET rotation has
+// bitten cross-agent reads before). The full per-symbol-day rows (including the
+// complete `filters` array) are pulled one partition at a time from
+// `/api/health/short-squeeze/capture/partition/:date` below.
+const SS_CAPTURE_DATE_PARTITION = /^\d{4}-\d{2}-\d{2}$/;
+const SS_CAPTURE_TARGET_SESSIONS = 10;
+
+/** The RVOL reading for a captured row (null when the criterion wasn't judged). */
+function rowRvol(row: ShortSqueezeCaptureRow): number | null {
+  const f = row.filters?.find((x) => x.key === 'rvol');
+  return f && f.applicable && typeof f.value === 'number' ? f.value : null;
+}
+
+/** True when the row cleared the short-float cut — the population we grade RVOL over. */
+function rowShortFloatEligible(row: ShortSqueezeCaptureRow): boolean {
+  const f = row.filters?.find((x) => x.key === 'short_float');
+  return !!f && f.applicable && f.pass;
+}
+
+async function buildShortSqueezeCaptureSummary() {
+  const outDir = SHORT_SQUEEZE_CAPTURE_OUT_DIR;
+  let dates: string[] = [];
+  try {
+    dates = (await readdir(outDir)).filter((d) => SS_CAPTURE_DATE_PARTITION.test(d)).sort();
+  } catch {
+    dates = [];
+  }
+  const { symbols: configuredUniverse, source: universeSource } = resolveShortSqueezeUniverse();
+
+  let latest: {
+    date: string;
+    recordedAt: number | null;
+    symbolCount: number;
+    ok: number;
+    qualifiers: number;
+    noData: number;
+    errored: number;
+    thresholds: ShortSqueezeCaptureFile['thresholds'] | null;
+    // RVOL distribution across short-float-eligible names — the reading the 1.5
+    // ratification cut is judged against, surfaced as the raw sorted values plus
+    // how many clear the shipped 1.0 vs QuantTrader's provisional 1.5.
+    rvolAcrossShortFloatEligible: {
+      eligibleNames: number;
+      values: { symbol: string; rvol: number | null }[];
+      atOrAbove1_0: number;
+      atOrAbove1_5: number;
+    };
+    perSymbol: { symbol: string; outcome: string; score: number | null; qualifies: boolean | null; rvol: number | null }[];
+  } | null = null;
+
+  if (dates.length > 0) {
+    const last = dates[dates.length - 1];
+    try {
+      const file = JSON.parse(
+        await readFile(join(outDir, last, 'short-squeeze.json'), 'utf-8'),
+      ) as ShortSqueezeCaptureFile;
+      const rows = Array.isArray(file.symbols) ? file.symbols : [];
+      const eligible = rows.filter(rowShortFloatEligible);
+      const eligibleRvols = eligible.map((r) => ({ symbol: r.symbol, rvol: rowRvol(r) }));
+      latest = {
+        date: file.date ?? last,
+        recordedAt: typeof file.recordedAt === 'number' ? file.recordedAt : null,
+        symbolCount: rows.length,
+        ok: rows.filter((r) => r.outcome === 'ok').length,
+        qualifiers: rows.filter((r) => r.qualifies === true).length,
+        noData: rows.filter((r) => r.outcome === 'no_data').length,
+        errored: rows.filter((r) => r.outcome === 'fetch_error').length,
+        thresholds: file.thresholds ?? null,
+        rvolAcrossShortFloatEligible: {
+          eligibleNames: eligible.length,
+          values: eligibleRvols
+            .slice()
+            .sort((a, b) => (b.rvol ?? -1) - (a.rvol ?? -1)),
+          atOrAbove1_0: eligibleRvols.filter((v) => (v.rvol ?? 0) >= 1.0).length,
+          atOrAbove1_5: eligibleRvols.filter((v) => (v.rvol ?? 0) >= 1.5).length,
+        },
+        perSymbol: rows.map((r) => ({
+          symbol: r.symbol,
+          outcome: r.outcome,
+          score: r.score,
+          qualifies: r.qualifies,
+          rvol: rowRvol(r),
+        })),
+      };
+    } catch {
+      latest = null;
+    }
+  }
+
+  return {
+    issue: 'TRA-1209',
+    enabled: shortSqueezeCaptureEnabled(),
+    observeOnly: true,
+    outDir,
+    universeSource,
+    configuredUniverse,
+    // Capture is taken at the shipped permissive cut; the 1.5 tightening is a
+    // grading-time question, NOT pre-applied here.
+    captureThresholds: DEFAULT_SHORT_SQUEEZE_THRESHOLDS,
+    tradingSessionsCaptured: dates.length,
+    progressToRatificationGate: { captured: dates.length, target: SS_CAPTURE_TARGET_SESSIONS },
+    readyForRatification: dates.length >= SS_CAPTURE_TARGET_SESSIONS,
+    firstDate: dates[0] ?? null,
+    lastDate: dates[dates.length - 1] ?? null,
+    allDates: dates,
+    latest,
+  };
+}
+
+app.get('/api/health/short-squeeze', async (_req, res) => {
+  const capture = await buildShortSqueezeCaptureSummary();
+  res.json({ ...shortSqueezeScannerService.diagnostics(), capture });
+});
+
+// TRA-1209 — full per-symbol-day capture export. The rows (with the complete
+// per-criterion `filters` array) live only on the Render persistent disk, so this
+// bounded, tokenless read streams one date partition's short-squeeze.json for
+// off-box grading. One date per request keeps the payload bounded; `:date` is
+// regex-validated to block path traversal.
+app.get('/api/health/short-squeeze/capture/partition/:date', async (req, res) => {
+  const date = String(req.params.date ?? '');
+  if (!SS_CAPTURE_DATE_PARTITION.test(date)) {
+    res.status(400).json({ error: 'date must be YYYY-MM-DD' });
+    return;
+  }
+  try {
+    const raw = await readFile(join(SHORT_SQUEEZE_CAPTURE_OUT_DIR, date, 'short-squeeze.json'), 'utf-8');
+    res.type('application/json').send(raw);
+  } catch {
+    res.status(404).json({ error: `no capture partition for ${date}` });
+  }
 });
 
 // TRA-604 (TRA-595 C4b) — live "AI Options Ideas" feed. Resolves the user's
@@ -6618,6 +6834,14 @@ scheduler.start({
     await runChainRecord();
     await runSentimentSnapshot().catch((err) =>
       log.error('sentiment-recorder failed', {
+        reason: err instanceof Error ? err.message : String(err),
+      }),
+    );
+    // TRA-1209 — short-squeeze observe-capture (default-OFF, observe-only).
+    // Isolated so a screener/feed failure can't drop the chain/sentiment
+    // captures above (or vice-versa).
+    await runShortSqueezeCapture().catch((err) =>
+      log.error('short-squeeze capture failed', {
         reason: err instanceof Error ? err.message : String(err),
       }),
     );
