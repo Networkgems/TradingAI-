@@ -8,9 +8,9 @@ import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 // this mock per-case.
 vi.mock('./yahoo-feed.js', async (importActual) => {
   const actual = await importActual<typeof import('./yahoo-feed.js')>();
-  return { ...actual, fetchDailyCandles: vi.fn(async () => []) };
+  return { ...actual, fetchDailyCandles: vi.fn(async () => []), fetchTradierDailyCandles: vi.fn(async () => []) };
 });
-import { fetchDailyCandles } from './yahoo-feed.js';
+import { fetchDailyCandles, fetchTradierDailyCandles } from './yahoo-feed.js';
 import { tmpdir } from 'os';
 import { join } from 'path';
 import { rmSync, writeFileSync } from 'fs';
@@ -5214,5 +5214,34 @@ describe('SignalEngine — IV-RV mispriced routing (TRA-1203)', () => {
     vi.mocked(fetchDailyCandles).mockClear();
     await runScan(engine, ['AAA']);
     expect(fetchDailyCandles).not.toHaveBeenCalled();
+  });
+
+  // TRA-1230 — on Render, Yahoo's per-IP feed 429s ~permanently so `fetchDailyCandles`
+  // returns [] every pass and the backfill never fills. The scan must fall back to
+  // Tradier daily history (the reliable Render source) so RV is still non-null and
+  // candidates flow. Without the fallback the whole book stays at no_realized_vol.
+  it('Yahoo cold — falls back to Tradier daily history so RV is non-null and it routes', async () => {
+    process.env[OPTION_IV_RV_SCANNER_FLAG] = '1';
+    process.env[OPTION_IV_RV_ROUTING_FLAG] = '1';
+    const svc = scannerFor({ AAA: { symbol: 'AAA', spot: 100, expiration: '2024-07-19', rows: cheapVolChain('AAA', 100) } });
+    const engine = new SignalEngine(undefined, undefined, svc);
+    const bars: Candle[] = highRvCloses().map((c, i) => ({
+      symbol: 'AAA', timestamp: i * 86_400_000, open: c, high: c, low: c, close: c, volume: 0,
+    }));
+    // Yahoo returns nothing (breaker open); Tradier serves the series.
+    vi.mocked(fetchDailyCandles).mockResolvedValueOnce([]);
+    vi.mocked(fetchTradierDailyCandles).mockResolvedValueOnce(bars);
+    await runScan(engine, ['AAA']);
+    expect(fetchDailyCandles).toHaveBeenCalledWith('AAA', expect.any(Number));
+    expect(fetchTradierDailyCandles).toHaveBeenCalledWith('AAA', expect.any(Number));
+    const open = engine.getState().options.openOptions;
+    expect(open.length).toBeGreaterThanOrEqual(1);
+    expect(open[0].symbol).toBe('AAA');
+    // Cached now → next pass hits neither feed.
+    vi.mocked(fetchDailyCandles).mockClear();
+    vi.mocked(fetchTradierDailyCandles).mockClear();
+    await runScan(engine, ['AAA']);
+    expect(fetchDailyCandles).not.toHaveBeenCalled();
+    expect(fetchTradierDailyCandles).not.toHaveBeenCalled();
   });
 });

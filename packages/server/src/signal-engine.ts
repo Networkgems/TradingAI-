@@ -63,7 +63,7 @@ import {
   MIN_RISK_THROTTLE,
 } from './risk-autopilot.js';
 import type { Regime } from '@trading-app/engine';
-import { fetchMinuteBars, fetchDailyCandles, fetchQuotes, fetchStocksNews, isYahooBreakerOpen, setActiveInterestSymbols, setTradierStocksFeedClient } from './yahoo-feed.js';
+import { fetchMinuteBars, fetchDailyCandles, fetchTradierDailyCandles, fetchQuotes, fetchStocksNews, isYahooBreakerOpen, setActiveInterestSymbols, setTradierStocksFeedClient } from './yahoo-feed.js';
 import { fetchStockTwitsStream, fetchStockTwitsUserStream, getCuratedStockTwitsAccounts } from './stocktwits-feed.js';
 import { evaluateFeedFreshness } from './feed-freshness.js';
 import { PaperAccount } from './paper-account.js';
@@ -4498,9 +4498,19 @@ export class SignalEngine {
         // next pass is warm. Shares the feed client's retry/breaker; a cold pull
         // is swallowed and just leaves this symbol at `no_realized_vol` for the
         // pass, exactly as before.
+        //
+        // TRA-1230 — `fetchDailyCandles` is Yahoo-only and Yahoo's free per-IP
+        // feed 429s ~permanently on Render (`yahooBreakerOpen` stays true), so on
+        // prod the Yahoo pull returns [] every pass and coverage never fills — the
+        // exact symptom TRA-1204 hit. Fall back to Tradier daily history (the sole
+        // reliable Render stock source, its own breaker) when Yahoo is empty, so
+        // the backfill is session- and Yahoo-breaker-independent.
         let dailyCloses = this.dailyCloseCache.get(sym) ?? [];
         if (dailyCloses.length === 0) {
-          const bars = await fetchDailyCandles(sym, MTF_DAILY_BARS).catch(() => [] as Candle[]);
+          let bars = await fetchDailyCandles(sym, MTF_DAILY_BARS).catch(() => [] as Candle[]);
+          if (bars.length === 0) {
+            bars = await fetchTradierDailyCandles(sym, MTF_DAILY_BARS).catch(() => [] as Candle[]);
+          }
           if (bars.length > 0) {
             dailyCloses = bars.map((b) => b.close);
             this.dailyCloseCache.set(sym, dailyCloses);
