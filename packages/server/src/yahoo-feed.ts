@@ -813,6 +813,99 @@ export async function fetchDailyCandles(symbol: string, count = 30): Promise<Can
 }
 
 /**
+ * TRA-1207 — short-interest / float / market-cap fundamentals for the
+ * short-squeeze screener. Yahoo's `quoteSummary` carries the short-interest set
+ * (`defaultKeyStatistics`) and the size/liquidity fields (`summaryDetail` /
+ * `price`) that the quote and bar feeds do not expose. Borrow-fee rate is NOT
+ * available from Yahoo (no free feed carries it) and is intentionally omitted —
+ * the screener treats that criterion as not-applicable unless a paid provider
+ * is wired in later.
+ */
+export interface ShortInterestFundamentals {
+  symbol: string;
+  /** Fraction of float sold short (0.24 = 24%). */
+  shortPercentOfFloat: number | null;
+  /** Shares sold short (absolute count). */
+  sharesShort: number | null;
+  /** Days-to-cover (Yahoo `shortRatio`). */
+  daysToCover: number | null;
+  /** Free-float share count. */
+  floatShares: number | null;
+  /** Shares outstanding. */
+  sharesOutstanding: number | null;
+  /** Market cap in dollars. */
+  marketCap: number | null;
+  /** 10-day (fallback: general) average daily volume, for RVOL context. */
+  averageDailyVolume: number | null;
+  /** Epoch ms the snapshot was taken. */
+  asOf: number;
+}
+
+type QuoteSummaryModule = Record<string, unknown> | null | undefined;
+type QuoteSummaryLike = {
+  defaultKeyStatistics?: QuoteSummaryModule;
+  summaryDetail?: QuoteSummaryModule;
+  price?: QuoteSummaryModule;
+} | null | undefined;
+
+/** Read a numeric field, tolerating yahoo-finance2's `{ raw: number }` shape. */
+function qsNum(mod: QuoteSummaryModule, key: string): number | null {
+  if (!mod) return null;
+  const v = mod[key];
+  if (typeof v === 'number' && Number.isFinite(v)) return v;
+  if (v && typeof v === 'object' && 'raw' in v) {
+    const raw = (v as { raw?: unknown }).raw;
+    if (typeof raw === 'number' && Number.isFinite(raw)) return raw;
+  }
+  return null;
+}
+
+/**
+ * Pure parse of a Yahoo `quoteSummary` payload into {@link ShortInterestFundamentals}.
+ * Exported so the mapping is unit-testable without a live Yahoo call. Every
+ * field degrades to `null` when absent so the screener can mark it unknown.
+ */
+export function parseShortInterestFundamentals(
+  symbol: string,
+  qs: QuoteSummaryLike,
+  asOf: number,
+): ShortInterestFundamentals {
+  const dks = qs?.defaultKeyStatistics ?? null;
+  const sd = qs?.summaryDetail ?? null;
+  const price = qs?.price ?? null;
+  return {
+    symbol,
+    shortPercentOfFloat: qsNum(dks, 'shortPercentOfFloat'),
+    sharesShort: qsNum(dks, 'sharesShort'),
+    daysToCover: qsNum(dks, 'shortRatio'),
+    floatShares: qsNum(dks, 'floatShares'),
+    sharesOutstanding: qsNum(dks, 'sharesOutstanding') ?? qsNum(dks, 'impliedSharesOutstanding'),
+    marketCap: qsNum(sd, 'marketCap') ?? qsNum(price, 'marketCap'),
+    averageDailyVolume:
+      qsNum(sd, 'averageDailyVolume10Day') ??
+      qsNum(sd, 'averageVolume10days') ??
+      qsNum(sd, 'averageVolume'),
+    asOf,
+  };
+}
+
+/**
+ * Fetch short-interest fundamentals for one symbol via Yahoo `quoteSummary`.
+ * Honors the same 429 breaker + timeout + retry as the other Yahoo calls and
+ * returns `null` on any failure so callers tolerate a cold feed.
+ */
+export async function fetchShortInterestFundamentals(
+  symbol: string,
+): Promise<ShortInterestFundamentals | null> {
+  const result = await withRetry(
+    () => yf.quoteSummary(symbol, { modules: ['defaultKeyStatistics', 'summaryDetail', 'price'] }),
+    `quoteSummary(${symbol})`,
+  );
+  if (!result) return null;
+  return parseShortInterestFundamentals(symbol, result as QuoteSummaryLike, Date.now());
+}
+
+/**
  * TRA-586 — fetch daily candles via the Tradier `/markets/history` feed.
  *
  * `fetchDailyCandles` above is Yahoo-only, so when Yahoo's chart breaker is open

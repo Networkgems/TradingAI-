@@ -180,6 +180,17 @@ export type {
   Sma200SignalKind,
   Sma200Evaluation,
 } from './sma200-signals.js';
+export { evaluateShortSqueeze, DEFAULT_SHORT_SQUEEZE_THRESHOLDS } from './short-squeeze/short-squeeze.js';
+export type {
+  ShortSqueezeFundamentals,
+  ShortSqueezePriceStats,
+  ShortSqueezeThresholds,
+  ShortSqueezeFilterKey,
+  ShortSqueezeFilterResult,
+  ShortSqueezeClassification,
+  ShortSqueezeResult,
+  EvaluateShortSqueezeOptions,
+} from './short-squeeze/short-squeeze.js';
 export { RegimeDetector, classifyRegime } from './regime.js';
 export type { Regime, RegimeDetectorOptions } from './regime.js';
 export { StrategyRouter, DEFAULT_ROUTER_PRIORITY } from './router.js';

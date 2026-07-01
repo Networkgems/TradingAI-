@@ -253,6 +253,7 @@ import {
   type ExportMarket,
 } from './export.js';
 import { TradierRelativeValueScannerService } from './relative-value-scanner.js';
+import { ShortSqueezeScannerService } from './short-squeeze-scanner.js';
 import {
   CoinbaseOrderClient,
   tradierBaseUrl,
@@ -260,7 +261,7 @@ import {
 } from '@trading-app/engine';
 import { submitSmartSellToClose } from './tradier-smart-close.js';
 import type { TradierEnv } from '@trading-app/shared';
-import { fetchQuotes } from './yahoo-feed.js';
+import { fetchQuotes, fetchDailyCandles, fetchTradierDailyCandles, fetchShortInterestFundamentals } from './yahoo-feed.js';
 import {
   runFirstBootMigration,
   runTra237OptionsReset,
@@ -427,6 +428,19 @@ setRvScanner(
 log.info('rv-scanner initialized', {
   env: tradierEnv,
   configured: relativeValueScannerService.diagnostics().configured,
+});
+
+// TRA-1207 — short-squeeze screener. Read-only: it screens the watchlist for
+// short-squeeze setups (short float / days-to-cover / float / market cap /
+// avg volume / RVOL / above-50d-SMA) and never places an order. Fundamentals
+// come from Yahoo quoteSummary; daily bars from the shared daily-candle feed
+// (Yahoo primary, Tradier fallback when Yahoo's breaker is open).
+const shortSqueezeScannerService = new ShortSqueezeScannerService({
+  fetchFundamentals: (symbol) => fetchShortInterestFundamentals(symbol),
+  fetchDailyBars: async (symbol, count) => {
+    const bars = await fetchDailyCandles(symbol, count);
+    return bars.length > 0 ? bars : fetchTradierDailyCandles(symbol, count);
+  },
 });
 
 // TRA-563 (TRA-410 A1) — install the notification dispatcher. Preferences are
@@ -2263,6 +2277,36 @@ app.get('/api/options/relative-value', requireAuth, async (req, res) => {
 
 app.get('/api/health/options-mispricing', (_req, res) => {
   res.json(relativeValueScannerService.diagnostics());
+});
+
+// TRA-1207 — short-squeeze screener routes (read-only). The single-symbol route
+// returns the full per-criterion breakdown; the scan route screens the user's
+// watchlist and returns candidates ranked qualifiers-first.
+app.get('/api/screeners/short-squeeze', requireAuth, async (req, res) => {
+  const symbol = typeof req.query['symbol'] === 'string' ? req.query['symbol'] : '';
+  if (!symbol) {
+    res.status(400).json({ error: 'symbol query parameter is required' });
+    return;
+  }
+  const result = await shortSqueezeScannerService.scan(symbol);
+  res.json({ ...result, diagnostics: shortSqueezeScannerService.diagnostics() });
+});
+
+app.get('/api/screeners/short-squeeze/scan', requireAuth, async (req, res) => {
+  const ctx = await userCtx(res);
+  const symbols = getStocksWatchlistData(ctx.username).all;
+  const results = await shortSqueezeScannerService.scanUniverse(symbols);
+  res.json({
+    scannedAt: Date.now(),
+    universeSize: symbols.length,
+    candidates: results.filter((r) => r.evaluation?.qualifies),
+    all: results,
+    diagnostics: shortSqueezeScannerService.diagnostics(),
+  });
+});
+
+app.get('/api/health/short-squeeze', (_req, res) => {
+  res.json(shortSqueezeScannerService.diagnostics());
 });
 
 // TRA-604 (TRA-595 C4b) — live "AI Options Ideas" feed. Resolves the user's

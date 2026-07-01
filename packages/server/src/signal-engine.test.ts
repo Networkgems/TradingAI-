@@ -4828,6 +4828,7 @@ describe('SignalEngine — demo directional option entry (TRA-1114)', () => {
   function scannerFor(snaps: Record<string, SelectorChainSnapshot>): RelativeValueScannerService {
     return {
       scan: vi.fn(async () => ({ symbol: '', spot: null, expiration: null, candidates: [], reason: 'ok' as const })),
+      scanOtm: vi.fn(async () => ({ symbol: '', spot: null, expiration: null, candidates: [], reason: 'unavailable' as const })),
       getSelectorChain: vi.fn(async (sym: string) => snaps[sym] ?? null),
       getOptionMark: vi.fn(async () => null),
       diagnostics: vi.fn(() => ({ configured: true, breakerOpen: false, breakerOpenedAtMs: null, cacheSize: 0, expirationsCacheSize: 0, chainCacheMaxEntries: 64, expirationsCacheMaxEntries: 64 })),
@@ -5091,6 +5092,7 @@ describe('SignalEngine — IV-RV mispriced routing (TRA-1203)', () => {
   function scannerFor(snaps: Record<string, SelectorChainSnapshot>): RelativeValueScannerService {
     return {
       scan: vi.fn(async () => ({ symbol: '', spot: null, expiration: null, candidates: [], reason: 'ok' as const })),
+      scanOtm: vi.fn(async () => ({ symbol: '', spot: null, expiration: null, candidates: [], reason: 'unavailable' as const })),
       getSelectorChain: vi.fn(async (sym: string) => snaps[sym] ?? null),
       getOptionMark: vi.fn(async () => null),
       diagnostics: vi.fn(() => ({ configured: true, breakerOpen: false, breakerOpenedAtMs: null, cacheSize: 0, expirationsCacheSize: 0, chainCacheMaxEntries: 64, expirationsCacheMaxEntries: 64 })),
