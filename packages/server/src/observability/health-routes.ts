@@ -31,6 +31,8 @@ import { isPerpFundingCarryEnabled } from '../perp-funding-carry-flag.js';
 import { summarizeFundingCarryScans } from '../perp-funding-carry-scanner.js';
 import { isCryptoRegimeEnabled } from '../crypto-regime-flag.js';
 import { summarizeCryptoRegimeScans } from '../crypto-regime-scanner.js';
+import { isRegimeTsmomEnabled } from '../crypto-regime-tsmom-flag.js';
+import { summarizeRegimeTsmomScans } from '../crypto-regime-tsmom-scanner.js';
 import { optionsIdeasAutoExecuteHealth } from '../options-ideas-auto-execute.js';
 import {
   listOptionTradeJournal,
@@ -841,6 +843,23 @@ export function registerLiveHealthRoutes(app: Express, deps: LiveHealthDeps): vo
       build: resolveBuildInfo(),
       enabled: isCryptoRegimeEnabled(),
       ...summarizeCryptoRegimeScans(now()),
+    });
+  });
+
+  // TRA-1221 — unauthenticated, secrets-free regime-gated TSMOM readout (parity
+  // with /crypto-regime). Process-global, OBSERVE-ONLY: carries no balances/PII —
+  // just symbols, would-be actions, regime@bar, r_L, and rolling would-be turnover
+  // + net-of-taker expectancy R. `enabled` mirrors ENABLE_CRYPTO_REGIME_TSMOM so
+  // the board sees at a glance whether the scanner is armed; when off the store is
+  // empty ⇒ fail-closed `enabled:false` with `scans:[]`. Always read-only: NO order
+  // is placed off these signals — the short_observe leg is never sized.
+  app.get('/api/health/crypto-regime-tsmom', (_req, res) => {
+    res.json({
+      ok: true,
+      time: new Date(now()).toISOString(),
+      build: resolveBuildInfo(),
+      enabled: isRegimeTsmomEnabled(),
+      ...summarizeRegimeTsmomScans(now()),
     });
   });
 

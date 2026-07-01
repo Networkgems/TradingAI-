@@ -72,6 +72,21 @@ import {
   summarizeCryptoRegimeScans,
   buildCryptoRegimeEodSection,
 } from './crypto-regime-scanner.js';
+// TRA-1221 — observe-only regime-gated TSMOM crypto scanner (widen bands + bear
+// short/flat gate over the TRA-1220 regime label). Flag-checked before any 4H
+// fetch so ENABLE_CRYPTO_REGIME_TSMOM off ⇒ zero cost/IO. Read-only: emits would-
+// be long/exit/short-observe SIGNALS + forward net-of-fee evidence, no order path.
+import {
+  isRegimeTsmomEnabled,
+  resolveRegimeTsmomConfig,
+  resolveRegimeTsmomWatchlist,
+} from './crypto-regime-tsmom-flag.js';
+import {
+  observeRegimeTsmom,
+  summarizeRegimeTsmomScans,
+  buildRegimeTsmomEodSection,
+  type RegimeTsmomState,
+} from './crypto-regime-tsmom-scanner.js';
 import { fetchCrypto4hBars } from './crypto-feed.js';
 import type { CryptoSignalEngine } from './crypto-engine.js';
 // TRA-1006 — automated pre/post-market analyst agent. Tick fns are flag-checked
@@ -1689,7 +1704,17 @@ async function generateAndSaveCryptoReport(ctx: UserContext): Promise<void> {
     isCryptoRegimeEnabled(),
     summarizeCryptoRegimeScans(),
   );
-  const report = { ...baseReport, markdown: `${baseReport.markdown}\n${regimeSection}\n` };
+  // TRA-1221 — append the observe-only "Crypto Regime-Gated TSMOM" section, folding
+  // the forward would-be signals + net-of-taker round-trip evidence captured this
+  // session (empty/disabled fallback when the scanner flag is off). Read-only.
+  const regimeTsmomSection = buildRegimeTsmomEodSection(
+    isRegimeTsmomEnabled(),
+    summarizeRegimeTsmomScans(),
+  );
+  const report = {
+    ...baseReport,
+    markdown: `${baseReport.markdown}\n${regimeSection}\n${regimeTsmomSection}\n`,
+  };
   const targetDir = cryptoReportsDirFor(ctx, mode);
   const datePath = join(targetDir, `${report.date}.json`);
   const mdPath = join(targetDir, `${report.date}.md`);
@@ -1874,6 +1899,55 @@ async function runHourlyCryptoRegime(): Promise<void> {
       ).length,
       chop: result.readings.filter((r) => r.regime === 'chop').length,
     });
+  }
+}
+
+// TRA-1221 — carried state for the regime-gated TSMOM scanner (TSMOM is stateful:
+// a would-be position persists between passes so entries/exits + turnover count
+// correctly). Both maps are process-global and mutated in place by the observe
+// routine; they stay empty while ENABLE_CRYPTO_REGIME_TSMOM is off (no pass runs).
+const lastRegimeTsmomBarBySymbol = new Map<string, string>();
+const regimeTsmomStateBySymbol = new Map<string, RegimeTsmomState>();
+
+// TRA-1221 — observe-only regime-gated TSMOM pass, fired off the SAME hourly hook
+// as the funding-carry and regime-overlay passes above. When ENABLE_CRYPTO_REGIME_TSMOM
+// is OFF it returns before ANY fetch ⇒ provably zero cost/IO. When ON it pulls
+// CLOSED 4H bars for each watchlist major, drops the forming bar (invariant #3 —
+// no lookahead), classifies the regime AND computes r_L off the SAME closed series
+// (no double fetch / time-skew), runs the pure regime gate (§3), and records the
+// would-be signals + completed round trips into the store backing
+// GET /api/health/crypto-regime-tsmom. Read-only: NO order/entry/sizing path — the
+// short_observe leg is never sized (invariant #4). 4H bars roll every 4h so the
+// hourly cadence + the lastBarTime dedupe scan a symbol at most once per new bar.
+async function runHourlyCryptoRegimeTsmom(): Promise<void> {
+  if (!isRegimeTsmomEnabled()) return; // fast-path: skip resolving deps when off
+  const result = await observeRegimeTsmom({
+    enabled: true,
+    watchlist: resolveRegimeTsmomWatchlist(),
+    regimeCfg: resolveCryptoRegimeConfig(),
+    cfg: resolveRegimeTsmomConfig(),
+    fetch4h: (symbol) => fetchCrypto4hBars(symbol, 260),
+    lastBarBySymbol: lastRegimeTsmomBarBySymbol,
+    stateBySymbol: regimeTsmomStateBySymbol,
+    onError: (symbol, err) =>
+      log.warn('crypto regime-tsmom 4H fetch failed (TRA-1221)', {
+        symbol,
+        reason: err instanceof Error ? err.message : String(err),
+      }),
+  });
+  if (result.scanned > 0) {
+    const signals = result.results.filter(
+      (r) => r.action === 'enter_long' || r.action === 'short_observe',
+    ).length;
+    const exits = result.results.filter((r) => r.action === 'exit_long' || r.roundTrip).length;
+    if (signals > 0 || exits > 0) {
+      log.info('crypto regime-tsmom observe pass (TRA-1221)', {
+        fetched: result.fetched,
+        scanned: result.scanned,
+        newSignals: signals,
+        roundTrips: result.results.filter((r) => r.roundTrip).length,
+      });
+    }
   }
 }
 
@@ -6992,6 +7066,9 @@ scheduler.start({
     // TRA-1220 — observe-only crypto regime-overlay classification (flag-gated ⇒
     // zero cost/IO when off). Read-only: emits labels only, no order path.
     await runHourlyCryptoRegime();
+    // TRA-1221 — observe-only regime-gated TSMOM scan over the same regime label
+    // (flag-gated ⇒ zero cost/IO when off). Read-only: would-be signals only.
+    await runHourlyCryptoRegimeTsmom();
   },
   // TRA-849 — 8:30 AM ET pre-market morning brief. Renders the macro gate +
   // each user's watchlist setups, open book, and overnight news, then pushes
