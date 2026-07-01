@@ -143,9 +143,27 @@ export interface ShortSqueezeCaptureFile {
   universeSource: string;
   /** Effective thresholds the capture was scored at (the permissive RVOL>1.0 cut). */
   thresholds: ShortSqueezeThresholds;
+  /** Self-documenting entry/return convention for the Step-2 grader (TRA-1208). */
+  entryConvention: string;
   /** One row per requested symbol. */
   symbols: ShortSqueezeCaptureRow[];
 }
+
+/**
+ * The entry/return convention, stamped into every partition + `_meta.json` so the
+ * Step-2 ratification P&L (TRA-1208) is unambiguous. The capture rides the
+ * 3:55 PM ET `onChainRecord` hook, so `entryClose` = `rawInputs.price` = the last
+ * daily bar's close at that instant (the scan-day ~3:55 PM close, NOT next-day
+ * open). `ret{1,3,5}d` and `mfe5d` are measured off daily bars whose ET date is
+ * STRICTLY AFTER the scan date — so `ret1d` is the NEXT session's close ÷
+ * entryClose − 1. A signal firing at 3:55 PM realistically fills next-day open, so
+ * treat `ret1d` as the realizable first-bar proxy when grading a tradable entry.
+ */
+export const SHORT_SQUEEZE_ENTRY_CONVENTION =
+  'entryClose=scan-day 3:55PM ET close (last daily bar at capture instant); ' +
+  'ret{1,3,5}d & mfe5d measured off daily bars strictly after scan date ' +
+  '(ret1d = next-session close ÷ entryClose − 1); realizable entry ≈ next-day open, ' +
+  'so treat ret1d as the realizable first-bar proxy.';
 
 export interface ShortSqueezeCaptureRecorderResult {
   symbols: ShortSqueezeCaptureRow[];
@@ -252,6 +270,7 @@ export async function recordShortSqueezeCapture(
     recordedAt: now,
     universeSource: options.universeSource,
     thresholds: options.thresholds,
+    entryConvention: SHORT_SQUEEZE_ENTRY_CONVENTION,
     symbols,
   };
   const filePath = join(outDir, 'short-squeeze.json');
@@ -261,6 +280,7 @@ export async function recordShortSqueezeCapture(
     date,
     recordedAt: now,
     universeSource: options.universeSource,
+    entryConvention: SHORT_SQUEEZE_ENTRY_CONVENTION,
     symbolCount: symbols.length,
     ok: symbols.filter((s) => s.outcome === 'ok').length,
     qualifiers: symbols.filter((s) => s.qualifies === true).length,

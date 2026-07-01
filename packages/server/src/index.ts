@@ -256,6 +256,7 @@ import { TradierRelativeValueScannerService } from './relative-value-scanner.js'
 import { ShortSqueezeScannerService } from './short-squeeze-scanner.js';
 import {
   recordShortSqueezeCapture,
+  SHORT_SQUEEZE_ENTRY_CONVENTION,
   type ShortSqueezeCaptureFile,
   type ShortSqueezeCaptureRow,
 } from './short-squeeze-capture-recorder.js';
@@ -2534,6 +2535,10 @@ async function buildShortSqueezeCaptureSummary() {
     // Capture is taken at the shipped permissive cut; the 1.5 tightening is a
     // grading-time question, NOT pre-applied here.
     captureThresholds: DEFAULT_SHORT_SQUEEZE_THRESHOLDS,
+    // Entry/return convention for the Step-2 grader (TRA-1208): entryClose = scan-day
+    // 3:55 PM ET close; ret1d = next-session close ÷ entryClose − 1; realizable entry
+    // ≈ next-day open, so ret1d is the realizable first-bar proxy.
+    entryConvention: SHORT_SQUEEZE_ENTRY_CONVENTION,
     tradingSessionsCaptured: dates.length,
     progressToRatificationGate: { captured: dates.length, target: SS_CAPTURE_TARGET_SESSIONS },
     readyForRatification: dates.length >= SS_CAPTURE_TARGET_SESSIONS,
