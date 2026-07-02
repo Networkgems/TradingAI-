@@ -4494,23 +4494,37 @@ app.get('/api/reports/:date', requireAuth, async (req, res) => {
   }
   const mode = resolveStockReportMode(req, ctx.username);
   const filePath = join(stockReportsDirFor(ctx, mode), `${date}.json`);
-  if (!existsSync(filePath)) {
-    // TRA-1192 — no settled file for today yet: serve the running intraday Live
-    // cell so the current day's P&L renders before the 9 PM EOD snapshot.
-    if (date === etDateString()) {
-      try {
-        const liveToday = await buildLiveTodayCellReport(ctx, mode);
-        if (liveToday) {
-          res.json(liveToday);
-          return;
-        }
-      } catch (err) {
-        log.warn('live-today calendar cell read failed', {
-          username: ctx.username,
-          reason: err instanceof Error ? err.message : String(err),
-        });
+  const fileExists = existsSync(filePath);
+  const isToday = date === etDateString();
+  // TRA-1228 — for TODAY the running intraday cell is authoritative UNTIL the
+  // 9 PM ET archive settles the day. Previously any today-file already on disk
+  // was served in preference to the live cell, so a file written earlier in the
+  // session (a startup/backfill pass, or the live realized-calendar backfill,
+  // when no trades had booked yet) FROZE the calendar at a stale value — the
+  // "footer shows +$483.52 realized but the calendar reads $0.00" divergence the
+  // board hit on Richard's demo account (the footer reads the live book; the
+  // calendar was reading the stale file). Prefer the live cell pre-archive; the
+  // settled 9 PM file wins afterward (by then the in-memory closes are cleared,
+  // so the live cell would under-report).
+  const etHour = Number(
+    new Date().toLocaleString('en-US', { timeZone: 'America/New_York', hour: '2-digit', hour12: false }),
+  );
+  const archiveSettled = etHour >= 21; // matches the 21:00 ET EOD archive boundary
+  if (isToday && (!fileExists || !archiveSettled)) {
+    try {
+      const liveToday = await buildLiveTodayCellReport(ctx, mode);
+      if (liveToday) {
+        res.json(liveToday);
+        return;
       }
+    } catch (err) {
+      log.warn('live-today calendar cell read failed', {
+        username: ctx.username,
+        reason: err instanceof Error ? err.message : String(err),
+      });
     }
+  }
+  if (!fileExists) {
     res.status(404).json({ error: `No report for ${date}` });
     return;
   }
