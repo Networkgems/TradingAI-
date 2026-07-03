@@ -29,6 +29,8 @@
 // would-be round trips (for turnover / net-of-taker expectancy) — nothing is
 // realized to any book.
 
+import { appendFileSync, mkdirSync, readFileSync, renameSync, statSync, writeFileSync } from 'fs';
+import { dirname, join } from 'path';
 import {
   trailingTotalReturn,
   tsmomSizingStopFraction,
@@ -39,6 +41,9 @@ import {
 import type { Candle } from '@trading-app/shared';
 import { scanCryptoRegime } from './crypto-regime-scanner.js';
 import type { RegimeTsmomConfig } from './crypto-regime-tsmom-flag.js';
+import { logger } from './observability/index.js';
+
+const persistLog = logger.child({ module: 'crypto-regime-tsmom-persistence' });
 
 /** The would-be position a symbol holds between passes (never sized to a book). */
 export type RegimeTsmomPosition = 'flat' | 'long' | 'short_observe';
@@ -403,6 +408,251 @@ export function clearRegimeTsmomScans(): void {
   roundTrips.length = 0;
   totalRoundTrips = 0;
   firstRecordedAt = null;
+}
+
+// ── Disk persistence (TRA-1264) ──────────────────────────────────────────────
+//
+// The in-memory store above is wiped by any restart/redeploy, which resets the
+// completed-round-trip accrual `n` to 0. But the TRA-1229 gate needs n ≥ 20 and
+// the accrual is multi-week (10% bands ⇒ low turnover), so a single restart
+// inside that window resets the count before it can land. We therefore persist,
+// mirroring the TRA-1216 funding-history JSONL pattern:
+//   • completed round trips → append-only JSONL (the accrual evidence itself),
+//   • the elapsed-time anchor + monotonic total + per-symbol OPEN-position state
+//     and the last-scanned-bar map → a small JSON snapshot (so an in-flight trip
+//     and the turnover denominator both survive a restart).
+// Both are hydrated on boot. Observe-only throughout: read/write of forward
+// evidence only, NO order/entry/sizing path is touched.
+
+export const REGIME_TSMOM_ROUNDTRIPS_FILENAME = 'crypto-regime-tsmom-roundtrips.jsonl';
+export const REGIME_TSMOM_STATE_FILENAME = 'crypto-regime-tsmom-state.json';
+
+/** Roll the round-trip JSONL to a single `.1` backup past ~8 MB (as funding-history). */
+export const REGIME_TSMOM_ROUNDTRIPS_MAX_BYTES = 8 * 1024 * 1024;
+
+/** A completed round trip as written to disk — the pure trip plus its capture wall-clock. */
+export interface PersistedRegimeTsmomRoundTrip extends RegimeTsmomRoundTrip {
+  /** Wall-clock ms the trip was recorded (used to rebuild the turnover anchor on hydrate). */
+  recordedAt: number;
+}
+
+/** The snapshot JSON persisted alongside the JSONL (latest-wins, rewritten each pass). */
+export interface RegimeTsmomStateSnapshot {
+  version: 1;
+  /** Turnover anchor — wall-clock ms of the first recorded scan, or null before any. */
+  firstRecordedAt: number | null;
+  /** Monotonic count of every completed round trip ever recorded (drives turnover). */
+  totalRoundTrips: number;
+  /** Per-symbol carried TSMOM state (position/entry) so an in-flight trip survives. */
+  stateBySymbol: Record<string, RegimeTsmomState>;
+  /** Per-symbol last-scanned CLOSED-bar ISO (the dedupe key) so it isn't re-scanned. */
+  lastBarBySymbol: Record<string, string>;
+  updatedAt: number;
+}
+
+export function regimeTsmomRoundTripsPath(dataDir: string): string {
+  return join(dataDir, REGIME_TSMOM_ROUNDTRIPS_FILENAME);
+}
+
+export function regimeTsmomStatePath(dataDir: string): string {
+  return join(dataDir, REGIME_TSMOM_STATE_FILENAME);
+}
+
+function stateFromMapLike(
+  m: ReadonlyMap<string, RegimeTsmomState> | Record<string, RegimeTsmomState>,
+): Record<string, RegimeTsmomState> {
+  const out: Record<string, RegimeTsmomState> = {};
+  const entries = m instanceof Map ? [...m.entries()] : Object.entries(m);
+  for (const [k, v] of entries) out[k] = v;
+  return out;
+}
+
+function barMapFromMapLike(
+  m: ReadonlyMap<string, string> | Record<string, string>,
+): Record<string, string> {
+  const out: Record<string, string> = {};
+  const entries = m instanceof Map ? [...m.entries()] : Object.entries(m);
+  for (const [k, v] of entries) out[k] = v;
+  return out;
+}
+
+/**
+ * Persist one observe pass: append its completed round trips to the JSONL and
+ * rewrite the state snapshot (carried per-symbol state + last-bar dedupe map +
+ * the turnover anchor/total read straight from this module's live store).
+ *
+ * Best-effort — an I/O failure logs and is swallowed. This rides an observe-only
+ * accrual and must NEVER break the hourly scan (mirror funding-history). Returns
+ * the number of round-trip rows written.
+ */
+export function persistRegimeTsmomPass(
+  dataDir: string,
+  results: readonly RegimeTsmomResult[],
+  stateBySymbol: ReadonlyMap<string, RegimeTsmomState> | Record<string, RegimeTsmomState>,
+  lastBarBySymbol: ReadonlyMap<string, string> | Record<string, string>,
+  now: number = Date.now(),
+  maxBytes: number = REGIME_TSMOM_ROUNDTRIPS_MAX_BYTES,
+): number {
+  const trips = results
+    .map((r) => r.roundTrip)
+    .filter((t): t is RegimeTsmomRoundTrip => t != null);
+
+  const rtPath = regimeTsmomRoundTripsPath(dataDir);
+  const statePath = regimeTsmomStatePath(dataDir);
+  try {
+    mkdirSync(dirname(rtPath), { recursive: true });
+  } catch {
+    // directory already exists / unwritable — the writes below surface the error
+  }
+
+  let written = 0;
+  if (trips.length > 0) {
+    try {
+      let size = 0;
+      try {
+        size = statSync(rtPath).size;
+      } catch {
+        size = 0; // file absent ⇒ fresh
+      }
+      if (size >= maxBytes) {
+        try {
+          renameSync(rtPath, `${rtPath}.1`);
+        } catch (err) {
+          persistLog.warn('regime-tsmom round-trip rotate failed', {
+            reason: err instanceof Error ? err.message : String(err),
+          });
+        }
+      }
+      const rows: PersistedRegimeTsmomRoundTrip[] = trips.map((t) => ({ ...t, recordedAt: now }));
+      appendFileSync(rtPath, rows.map((r) => JSON.stringify(r)).join('\n') + '\n', 'utf8');
+      written = rows.length;
+    } catch (err) {
+      persistLog.warn('regime-tsmom round-trip append failed', {
+        reason: err instanceof Error ? err.message : String(err),
+      });
+    }
+  }
+
+  // Rewrite the snapshot every pass so an in-flight position + the turnover anchor
+  // survive a restart even in a pass that closes no round trip.
+  const snapshot: RegimeTsmomStateSnapshot = {
+    version: 1,
+    firstRecordedAt,
+    totalRoundTrips,
+    stateBySymbol: stateFromMapLike(stateBySymbol),
+    lastBarBySymbol: barMapFromMapLike(lastBarBySymbol),
+    updatedAt: now,
+  };
+  try {
+    writeFileSync(statePath, JSON.stringify(snapshot), 'utf8');
+  } catch (err) {
+    persistLog.warn('regime-tsmom state snapshot write failed', {
+      reason: err instanceof Error ? err.message : String(err),
+    });
+  }
+  return written;
+}
+
+/** What {@link hydrateRegimeTsmomFromDisk} recovers so the caller can restore its own maps. */
+export interface RegimeTsmomHydration {
+  /** Completed round trips seeded back into the in-memory store (post-cap). */
+  roundTripsLoaded: number;
+  /** Monotonic total restored (may exceed {@link roundTripsLoaded} after a JSONL roll). */
+  totalRoundTrips: number;
+  /** Turnover anchor restored, or null when nothing had been recorded yet. */
+  firstRecordedAt: number | null;
+  /** Per-symbol carried TSMOM state to re-seed the caller's `stateBySymbol` map. */
+  stateBySymbol: Map<string, RegimeTsmomState>;
+  /** Per-symbol last-bar dedupe map to re-seed the caller's `lastBarBySymbol` map. */
+  lastBarBySymbol: Map<string, string>;
+}
+
+function readRoundTripJsonl(path: string): PersistedRegimeTsmomRoundTrip[] {
+  let raw: string;
+  try {
+    raw = readFileSync(path, 'utf8');
+  } catch {
+    return []; // file absent ⇒ nothing to hydrate
+  }
+  const out: PersistedRegimeTsmomRoundTrip[] = [];
+  for (const line of raw.split('\n')) {
+    const trimmed = line.trim();
+    if (trimmed === '') continue;
+    try {
+      const row = JSON.parse(trimmed) as PersistedRegimeTsmomRoundTrip;
+      if (row && Number.isFinite(row.netR)) out.push(row);
+    } catch {
+      // skip a torn/partial trailing line rather than abort the whole hydrate
+    }
+  }
+  return out;
+}
+
+/**
+ * Rebuild the in-memory round-trip accrual (and hand back the caller's per-symbol
+ * state/dedupe maps) from disk on boot. Idempotent: it CLEARS the in-memory store
+ * first, so it is safe to call exactly once at startup before any live pass.
+ *
+ * The JSONL is the accrual evidence (seeded into the capped rolling list, so `n`
+ * is preserved across a restart); the snapshot supplies the monotonic total + the
+ * turnover anchor (both authoritative over the JSONL after a roll) plus the
+ * per-symbol open-position and last-bar maps. Best-effort — a missing/corrupt file
+ * yields an empty hydration rather than throwing.
+ */
+export function hydrateRegimeTsmomFromDisk(dataDir: string): RegimeTsmomHydration {
+  clearRegimeTsmomScans();
+
+  const persistedTrips = readRoundTripJsonl(regimeTsmomRoundTripsPath(dataDir));
+  // Seed the rolling list post-cap (keep the most recent, as the live path does).
+  const seed = persistedTrips.slice(-MAX_ROUND_TRIPS);
+  for (const t of seed) {
+    const { recordedAt: _drop, ...trip } = t;
+    void _drop;
+    roundTrips.push(trip);
+  }
+
+  let snapshot: RegimeTsmomStateSnapshot | null = null;
+  try {
+    snapshot = JSON.parse(readFileSync(regimeTsmomStatePath(dataDir), 'utf8')) as RegimeTsmomStateSnapshot;
+  } catch {
+    snapshot = null; // absent/corrupt ⇒ fall back to the JSONL below
+  }
+
+  // Total + anchor: prefer the snapshot (authoritative once the JSONL has rolled),
+  // else reconstruct from the JSONL rows we could read.
+  if (snapshot && Number.isFinite(snapshot.totalRoundTrips)) {
+    totalRoundTrips = Math.max(snapshot.totalRoundTrips, persistedTrips.length);
+  } else {
+    totalRoundTrips = persistedTrips.length;
+  }
+  if (snapshot && (snapshot.firstRecordedAt == null || Number.isFinite(snapshot.firstRecordedAt))) {
+    firstRecordedAt = snapshot.firstRecordedAt;
+  } else if (persistedTrips.length > 0) {
+    const earliest = persistedTrips.reduce(
+      (min, t) => (Number.isFinite(t.recordedAt) && t.recordedAt < min ? t.recordedAt : min),
+      persistedTrips[0].recordedAt,
+    );
+    firstRecordedAt = Number.isFinite(earliest) ? earliest : null;
+  }
+
+  const stateBySymbol = new Map<string, RegimeTsmomState>();
+  const lastBarBySymbol = new Map<string, string>();
+  if (snapshot) {
+    for (const [k, v] of Object.entries(snapshot.stateBySymbol ?? {})) {
+      if (v && typeof v.position === 'string') stateBySymbol.set(k, v);
+    }
+    for (const [k, v] of Object.entries(snapshot.lastBarBySymbol ?? {})) {
+      if (typeof v === 'string') lastBarBySymbol.set(k, v);
+    }
+  }
+
+  return {
+    roundTripsLoaded: roundTrips.length,
+    totalRoundTrips,
+    firstRecordedAt,
+    stateBySymbol,
+    lastBarBySymbol,
+  };
 }
 
 /** One symbol's most-recent scan view, plus when it was recorded. */

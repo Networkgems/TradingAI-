@@ -85,6 +85,8 @@ import {
   observeRegimeTsmom,
   summarizeRegimeTsmomScans,
   buildRegimeTsmomEodSection,
+  persistRegimeTsmomPass,
+  hydrateRegimeTsmomFromDisk,
   type RegimeTsmomState,
 } from './crypto-regime-tsmom-scanner.js';
 import { fetchCrypto4hBars } from './crypto-feed.js';
@@ -1909,6 +1911,26 @@ async function runHourlyCryptoRegime(): Promise<void> {
 const lastRegimeTsmomBarBySymbol = new Map<string, string>();
 const regimeTsmomStateBySymbol = new Map<string, RegimeTsmomState>();
 
+// TRA-1264 — hydrate the accrual on boot so a restart/redeploy inside the multi-
+// week n≥20 window doesn't reset the completed-round-trip count to 0. Rebuilds the
+// in-memory round-trip store from the persisted JSONL, restores the turnover
+// anchor/total, and re-seeds the carried per-symbol state + last-bar dedupe maps.
+// Best-effort (a missing/corrupt file yields an empty hydration). Runs even when
+// the flag is off — reading two small files at boot is cheap and keeps the accrual
+// intact if the flag is later toggled on.
+{
+  const h = hydrateRegimeTsmomFromDisk(DATA_DIR);
+  for (const [k, v] of h.stateBySymbol) regimeTsmomStateBySymbol.set(k, v);
+  for (const [k, v] of h.lastBarBySymbol) lastRegimeTsmomBarBySymbol.set(k, v);
+  if (h.totalRoundTrips > 0 || h.stateBySymbol.size > 0) {
+    log.info('crypto regime-tsmom accrual hydrated (TRA-1264)', {
+      roundTripsLoaded: h.roundTripsLoaded,
+      totalRoundTrips: h.totalRoundTrips,
+      carriedSymbols: h.stateBySymbol.size,
+    });
+  }
+}
+
 // TRA-1221 — observe-only regime-gated TSMOM pass, fired off the SAME hourly hook
 // as the funding-carry and regime-overlay passes above. When ENABLE_CRYPTO_REGIME_TSMOM
 // is OFF it returns before ANY fetch ⇒ provably zero cost/IO. When ON it pulls
@@ -1935,7 +1957,18 @@ async function runHourlyCryptoRegimeTsmom(): Promise<void> {
         reason: err instanceof Error ? err.message : String(err),
       }),
   });
+  // TRA-1264 — persist the pass so the completed-round-trip accrual and any
+  // in-flight would-be position survive a restart/redeploy. Best-effort inside
+  // the scanner module (an I/O failure never breaks the observe pass). Runs only
+  // when a scan actually happened (a new closed bar advanced) so an idle pass
+  // doesn't rewrite the snapshot needlessly.
   if (result.scanned > 0) {
+    persistRegimeTsmomPass(
+      DATA_DIR,
+      result.results,
+      regimeTsmomStateBySymbol,
+      lastRegimeTsmomBarBySymbol,
+    );
     const signals = result.results.filter(
       (r) => r.action === 'enter_long' || r.action === 'short_observe',
     ).length;
