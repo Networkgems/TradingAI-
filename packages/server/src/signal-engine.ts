@@ -1,7 +1,7 @@
-import { OrbStrategy, BbFadeStrategy, IchimokuStrategy, SupertrendConfluenceStrategy, confluenceSide, supertrend, reversalChecklist, adx, atr, donchian, supportResistance, blackScholesDelta, daysToExpiration, selectRvLongCandidate, selectShadowOptionSignal, emaPullbackTrigger, volumeConfirmedBreakout, TradierOptionsClient, TradierOrderClient, TRADIER_REJECTED_STATUSES, evaluateSma200, SMA200_MIN_BARS, SMA200_DEBOUNCE_BARS, composeTechnicalSnapshot, resampleCandles, TF_BUCKET_MS, OptionsRiskBreaker, DEFAULT_OPTIONS_BREAKER_PARAMS } from '@trading-app/engine';
+import { OrbStrategy, BbFadeStrategy, IchimokuStrategy, SupertrendConfluenceStrategy, confluenceSide, supertrend, reversalChecklist, adx, atr, donchian, supportResistance, blackScholesDelta, daysToExpiration, bookGiveBackDecision, selectRvLongCandidate, selectShadowOptionSignal, emaPullbackTrigger, volumeConfirmedBreakout, TradierOptionsClient, TradierOrderClient, TRADIER_REJECTED_STATUSES, evaluateSma200, SMA200_MIN_BARS, SMA200_DEBOUNCE_BARS, composeTechnicalSnapshot, resampleCandles, TF_BUCKET_MS, OptionsRiskBreaker, DEFAULT_OPTIONS_BREAKER_PARAMS } from '@trading-app/engine';
 import type { StrategySelectorInput, ContractQuote, OptionTrend, RvLongTrendSide, ExitState, SharedTickIndicators, RelativeValueScannerOptions, OptionChainRow, IvRvScannerOptions, IvRvMispricingCandidate } from '@trading-app/engine';
 import type { TradierAccountBalance } from '@trading-app/engine';
-import { WATCHLIST, isLiquidSwingSymbol, checkEquitySwingClose, MANAGED_ACCOUNT_RATIO, MAX_CONSECUTIVE_LOSSES, DAILY_DRAWDOWN_HALT_PCT, OPTIONS_PER_TICKET_DOLLAR_FLOOR, OPTIONS_POSITION_CAP_RATIO, aliasWatchlistSymbol, isLiveTradierOptionsEnabled, isStockMarketOpen, perPositionCap, resolveAutoManageImportedTradierOptions, resolveDemoCostModel, resolveHoldLiveOptionsOvernight, resolveSwingHoldOptions, resolveLiveTradeEquitiesTradier, resolveManagedAccountRatio, resolveMarketReviewGatesEnabled, resolveRiskPerTrade, resolveRvDtePrefs, resolveTradierOptionsCreds, validateBracket, DEFAULT_RV_DTE_MIN, DEFAULT_RV_DTE_MAX, DEFAULT_RV_DTE_TARGET, scoreNewsSentiment, aggregateSymbolSentiment, aggregateFedSentiment, aggregateStockTwitsSentiment, dedupeStockTwitsMessages, mapCuratedMessagesBySymbol, nameAliasesFor, evaluateEquityDcaAdd, evaluateOptionDcaAdd, CONVICTION_DCA, blendedAverage, positionRiskDollars, minutesToSessionClose, getEasternUtcOffset, isAgentTradingWindowOpen } from '@trading-app/shared';
+import { WATCHLIST, isLiquidSwingSymbol, checkEquitySwingClose, MANAGED_ACCOUNT_RATIO, MAX_CONSECUTIVE_LOSSES, DAILY_DRAWDOWN_HALT_PCT, BOOK_SESSION_STOP_R, BOOK_GIVEBACK_CAP_PCT, DEFAULT_RISK_PER_TRADE, OPTIONS_PER_TICKET_DOLLAR_FLOOR, OPTIONS_POSITION_CAP_RATIO, aliasWatchlistSymbol, isLiveTradierOptionsEnabled, isStockMarketOpen, perPositionCap, resolveAutoManageImportedTradierOptions, resolveDemoCostModel, resolveHoldLiveOptionsOvernight, resolveSwingHoldOptions, resolveLiveTradeEquitiesTradier, resolveManagedAccountRatio, resolveMarketReviewGatesEnabled, resolveRiskPerTrade, resolveRvDtePrefs, resolveTradierOptionsCreds, validateBracket, DEFAULT_RV_DTE_MIN, DEFAULT_RV_DTE_MAX, DEFAULT_RV_DTE_TARGET, scoreNewsSentiment, aggregateSymbolSentiment, aggregateFedSentiment, aggregateStockTwitsSentiment, dedupeStockTwitsMessages, mapCuratedMessagesBySymbol, nameAliasesFor, evaluateEquityDcaAdd, evaluateOptionDcaAdd, CONVICTION_DCA, blendedAverage, positionRiskDollars, minutesToSessionClose, getEasternUtcOffset, isAgentTradingWindowOpen } from '@trading-app/shared';
 import type { TradeSignal, RelativeValueSignal, OtmMispricingSignal, Sma200Signal, Candle, OptionsAccountState, SignalType, Position, OptionPosition, AccountMode, AccountSettings, AccountState, NewsItem, SymbolSentiment, SocialSentiment, StockTwitsMessage, TechnicalSignalSnapshot, TradierEnv, MarketReview, MarketReviewGates, EngineMarketReviewState, GatedStrategyNote, AgentRecommendation, TradeProposal, AgentOrderAudit, GuardrailVerdict, OptionType } from '@trading-app/shared';
 import { shouldAutoConfirm } from '@trading-app/shared';
 // TRA-544 (TRA-529 P1) / TRA-747 (P2) — advisory multi-agent layer. ON suspends
@@ -50,6 +50,7 @@ import {
 import { isOptionShadowEnabled, isOptionPhaseBEnabled, emitShadowOptionSignal, shadowSignalToSpreadParams, OPTION_SHADOW_EMERGENCY_OFF, DEMO_SPREAD_MAX_LOSS_PCT_CAP } from './option-shadow-ledger.js';
 import { isOptionExecEnabled, isOptionEmaPullbackEnabled, isOptionVolumeBreakoutEnabled, resolveRvLongDteOverride, resolveRvMinDailyVolume, isOptionDemoDirectionalEnabled, isOptionIvRvScannerEnabled, isOptionIvRvRoutingEnabled, resolveIvRvRoutingOverride } from './option-exec-flag.js';
 import { scanIvRvFromSnapshot, recordIvRvScan } from './iv-rv-scanner.js';
+import { isExitRiskRulesEnabled } from './exit-risk-rules-flag.js';
 import { etDateString } from './scheduler.js';
 // TRA-995 (epic-C, self-regulation) — the standing risk autopilot. A pure
 // tighten-only decision module; the governor below is its mutation boundary and
@@ -713,6 +714,24 @@ export class DailyRiskGovernor {
   private killSwitchReason: string | null = null;
 
   /**
+   * TRA-1267 (TRA-1250 Rule 3) — book-level daily give-back cap + session stop.
+   *
+   * `peakOpenGain` is the monotonic intraday high-water mark of (realized + open)
+   * book P&L this session, floored at 0. It is fed each tick via {@link markBook}
+   * and — like `dailyPnl` and the daily breaker — resets on the ET day roll
+   * (`resetIfNewDay`). `sessionHalted` is a DAY-LATCHED flag set once the book
+   * surrenders >40% of that peak (give-back cap) OR goes net-negative after being
+   * up ≥ 0.5R of book equity (session stop). It gates BOTH the equity entry path
+   * (folded into {@link isHalted}) and the options entry path (via
+   * {@link isBookHalted}, checked explicitly in `runRelativeValueScan`). It stays
+   * dark until `EXIT_RISK_RULES_ENABLED` is set — the caller only invokes
+   * `markBook` behind that flag, so `sessionHalted` never latches when off.
+   */
+  private peakOpenGain = 0;
+  private sessionHalted = false;
+  private sessionHaltReason: string | null = null;
+
+  /**
    * TRA-563 — optional listener fired exactly once when the governor TRANSITIONS
    * into the halted state from a recorded trade (loss-streak / daily-drawdown
    * circuit breaker). Wired by SignalEngine to emit a risk_halt alert. Kept as a
@@ -757,6 +776,17 @@ export class DailyRiskGovernor {
       // overnight can't surface on the fresh day before the first autopilot tick.
       this.feedStaleGate = false;
       this.feedStaleReason = null;
+      // TRA-1267 — the book give-back peak + session halt are DAILY state: they
+      // reset on the same ET day roll that clears `dailyPnl`, so the peak is
+      // rebuilt from zero each session and yesterday's give-back halt never
+      // carries into a fresh day. Keyed off `etDateString` exactly like the
+      // realized `dailyPnl` above, so the peak resets once per ET session in
+      // lockstep with realized P&L (reconciling the governor's `etDateString`
+      // day key with the `PnlTracker` `todayKey` — both use en-CA/America/
+      // New_York and produce the identical YYYY-MM-DD string).
+      this.peakOpenGain = 0;
+      this.sessionHalted = false;
+      this.sessionHaltReason = null;
       this.currentDay = today;
       // TRA-995 — the autopilot throttle is a DAILY breaker like the halt: it
       // clears on the fresh ET day. This is not an "autonomous limit increase"
@@ -831,6 +861,87 @@ export class DailyRiskGovernor {
     }
   }
 
+  /**
+   * TRA-1267 — the running REALIZED daily P&L (closed-trade sum for the current
+   * ET session). The book-mark caller adds open equity + open options MTM to
+   * this to form the (realized + open) figure it feeds {@link markBook}.
+   */
+  getRealizedDailyPnl(): number {
+    this.resetIfNewDay();
+    return this.dailyPnl;
+  }
+
+  /**
+   * TRA-1267 (TRA-1250 Rule 3) — mark the book each tick and latch the
+   * day-level give-back / session-stop halt.
+   *
+   * `realizedPlusOpen` is the current (realized + open) book P&L; `bookEquity`
+   * is the managed book equity used only to size the session-stop arm gain
+   * (`BOOK_SESSION_STOP_R × 1R`, where 1R = `DEFAULT_RISK_PER_TRADE` of book
+   * equity — the same risk unit the sizers use). Maintains the monotonic
+   * `peakOpenGain` (floored at 0) and, once {@link bookGiveBackDecision} says to
+   * flatten-and-halt, LATCHES `sessionHalted` for the rest of the ET session and
+   * fires the risk_halt listener exactly once on the false→true transition.
+   *
+   * Returns whether the halt JUST tripped this call so the engine can flatten
+   * the discretionary book on the transition (idempotent thereafter). Callers
+   * MUST gate invocation behind `EXIT_RISK_RULES_ENABLED`; when off this is
+   * never called and `sessionHalted` stays false.
+   */
+  markBook(realizedPlusOpen: number, bookEquity: number): { tripped: boolean } {
+    this.resetIfNewDay();
+
+    // Monotonic intraday high-water mark of book gain, floored at 0.
+    this.peakOpenGain = Math.max(this.peakOpenGain, realizedPlusOpen, 0);
+
+    // 0.5R of book equity, where 1R = DEFAULT_RISK_PER_TRADE (1%) of equity —
+    // the standard per-trade risk unit. Non-positive equity ⇒ arm disabled (0).
+    const bookRiskUnit = Math.max(0, bookEquity) * DEFAULT_RISK_PER_TRADE;
+    const sessionStopArmGain = BOOK_SESSION_STOP_R * bookRiskUnit;
+
+    const decision = bookGiveBackDecision({
+      peakOpenGain: this.peakOpenGain,
+      currentTotalPnl: realizedPlusOpen,
+      sessionStopArmGain,
+    });
+
+    if (!decision.shouldFlattenAndHalt || this.sessionHalted) {
+      return { tripped: false };
+    }
+
+    // False→true transition: latch for the session and alert once.
+    this.sessionHalted = true;
+    this.sessionHaltReason =
+      decision.reason === 'session_net_negative'
+        ? `Book session stop — net-negative after being up ≥ ${(BOOK_SESSION_STOP_R * DEFAULT_RISK_PER_TRADE * 100).toFixed(2)}% of book equity; no new entries for the day`
+        : `Book give-back cap — surrendered >${(BOOK_GIVEBACK_CAP_PCT * 100).toFixed(0)}% of the day's +$${this.peakOpenGain.toFixed(0)} peak (floor +$${decision.retainedFloor.toFixed(0)}); no new entries for the day`;
+    if (this.haltListener) {
+      try {
+        this.haltListener(this.sessionHaltReason);
+      } catch {
+        // A notification failure must never break the risk-governor accounting.
+      }
+    }
+    return { tripped: true };
+  }
+
+  /**
+   * TRA-1267 — whether the book-level give-back / session-stop halt is latched
+   * for the current ET session. Consulted EXPLICITLY by the options entry gate
+   * (`runRelativeValueScan`), which checks the options-sleeve breaker rather than
+   * this governor; the equity path gets it for free via {@link isHalted}.
+   */
+  isBookHalted(): boolean {
+    this.resetIfNewDay();
+    return this.sessionHalted;
+  }
+
+  /** TRA-1267 — the latched book give-back / session-stop halt reason, if any. */
+  getBookHaltReason(): string | null {
+    this.resetIfNewDay();
+    return this.sessionHaltReason;
+  }
+
   isHalted(): boolean {
     this.resetIfNewDay();
     // TRA-526 — the kill switch overrides regardless of the daily counters.
@@ -838,7 +949,11 @@ export class DailyRiskGovernor {
     // paths exactly as before, but it now self-clears (it is no longer latched
     // into `halted`). Every equity entry gate already consults this method, so
     // equity/options behaviour is unchanged except for the latching duration.
-    return this.killSwitchEngaged || this.halted || this.feedStaleGate;
+    // TRA-1267 — the book-level give-back / session-stop halt is a day-latched
+    // breaker like `halted`; it gates the equity entry path here (options gets
+    // it via `isBookHalted` in `runRelativeValueScan`). Stays false unless the
+    // book give-back rules are enabled (markBook is only called behind the flag).
+    return this.killSwitchEngaged || this.halted || this.sessionHalted || this.feedStaleGate;
   }
 
   /**
@@ -863,6 +978,8 @@ export class DailyRiskGovernor {
     if (this.killSwitchEngaged) return this.killSwitchReason;
     // TRA-995 — then the day-latched breaker (loss-streak / drawdown).
     if (this.halted) return this.haltReason;
+    // TRA-1267 — then the day-latched book give-back / session-stop halt.
+    if (this.sessionHalted) return this.sessionHaltReason;
     // TRA-1072 — finally the transient feed-stale gate, with its freshness detail.
     if (this.feedStaleGate) return this.feedStaleReason;
     return null;
@@ -2292,6 +2409,22 @@ export class SignalEngine {
       }
     }
 
+    // TRA-1267 (TRA-1250 Rule 3) — book-level daily give-back cap + session
+    // stop. Mark the whole (realized + open) book each tick and latch the
+    // day-level halt via the governor. Runs AFTER the exit passes above so the
+    // mark reflects positions that just closed this tick, and BEFORE the entry
+    // gates below so a fresh trip blocks new opens the same tick. Dark until
+    // `EXIT_RISK_RULES_ENABLED` — see markBook's contract. On the false→true
+    // transition we flatten the discretionary paper book (live rides its resting
+    // broker legs; new opens are blocked at both entry chokepoints regardless).
+    if (isExitRiskRulesEnabled()) {
+      const { realizedPlusOpen, bookEquity } = this.computeBookMark(prices);
+      const { tripped } = this.riskGovernor.markBook(realizedPlusOpen, bookEquity);
+      if (tripped) {
+        this.flattenOnBookHalt(prices, this.riskGovernor.getBookHaltReason() ?? 'book give-back halt');
+      }
+    }
+
     // TRA-154: tag symbols that have an open position or a recent signal as
     // "active interest". The Twelve Data candle fallback (800/day cap) is gated
     // to this set so we don't burn the daily budget on watchlist-wide refreshes.
@@ -3200,6 +3333,15 @@ export class SignalEngine {
     // signs off; the breaker still RECORDS closes regardless (see the exit site).
     if (isOptionExecEnabled() && this.optionsBreaker.isHalted()) return;
 
+    // TRA-1267 (TRA-1250 Rule 3) — book-level give-back / session-stop halt.
+    // The options entry path checks the options-sleeve breaker above, NOT the
+    // equity risk governor, so the book halt must be gated EXPLICITLY here (the
+    // equity path gets it for free via `riskGovernor.isHalted()`). When the
+    // whole book has tripped the daily give-back cap we open NO new option
+    // tickets for the session; exits still run. Dark until the rules flag is on
+    // (markBook never latches `sessionHalted` otherwise), so prod is unchanged.
+    if (isExitRiskRulesEnabled() && this.riskGovernor.isBookHalted()) return;
+
     // TRA-373 — per-user DTE window overrides the shared scanner singleton's
     // defaults on every call so a settings edit takes effect on the next
     // scan tick.
@@ -3760,6 +3902,12 @@ export class SignalEngine {
     // (exits still run). No-op in the default prod config where exec is off.
     if (isOptionExecEnabled() && this.optionsBreaker.isHalted()) return;
 
+    // TRA-1267 (TRA-1250 Rule 3) — book-level give-back / session-stop halt,
+    // gated explicitly here for the same reason as the RV scan: the options
+    // paths consult the sleeve breaker, not the equity risk governor. Dark
+    // until the rules flag is on.
+    if (isExitRiskRulesEnabled() && this.riskGovernor.isBookHalted()) return;
+
     // Per-user DTE window (TRA-373) flows through the shared scanner singleton
     // on every call, identical to the RV path.
     const dtePrefs = { min: this.rvDteMin, max: this.rvDteMax, target: this.rvDteTarget };
@@ -3880,6 +4028,96 @@ export class SignalEngine {
       yearlyPnl: stats.yearlyPnl,
       allTimePnl: stats.allTimePnl,
     };
+  }
+
+  /**
+   * TRA-1267 (TRA-1250 Rule 3) — compute the whole-book (realized + open) P&L
+   * mark for the current ET session, plus the managed book equity used to size
+   * the session-stop arm gain.
+   *
+   * Book P&L = today's realized EQUITY P&L (the governor's `dailyPnl`, fed by
+   * `recordTrade`) + open-equity unrealized `(price − entry)·qty` over the
+   * active book (live mirror in live mode, paper book in demo) + the options
+   * account's daily P&L for the mode (which already combines options realized-
+   * today AND open-premium MTM). `bookEquity` is the paper managed equity — a
+   * stable, always-available basis for the 0.5R session-stop arm; refining it to
+   * the live account balance in live mode is deferred to the live-equity risk
+   * work (TRA-1269/TRA-1270), and only shifts the SECONDARY session-stop arm
+   * threshold (the headline give-back cap uses peak/current only, not equity).
+   */
+  private computeBookMark(prices: Map<string, number>): { realizedPlusOpen: number; bookEquity: number } {
+    const realizedEquity = this.riskGovernor.getRealizedDailyPnl();
+
+    const equityPositions =
+      this.mode === 'live'
+        ? Array.from(this.liveEquityPositions.values())
+        : this.account.getState().openPositions;
+    let openEquity = 0;
+    for (const pos of equityPositions) {
+      const px = prices.get(pos.symbol);
+      if (typeof px !== 'number' || !Number.isFinite(px)) continue;
+      openEquity += (pos.side === 'buy' ? px - pos.entryPrice : pos.entryPrice - px) * pos.quantity;
+    }
+
+    // Options daily P&L for the active mode already = realized-today + open MTM.
+    const optionsDaily = this.optionsAccount.getStateForMode(this.mode).dailyOptionsPnl ?? 0;
+
+    return {
+      realizedPlusOpen: realizedEquity + openEquity + optionsDaily,
+      bookEquity: this.account.managedEquity(),
+    };
+  }
+
+  /**
+   * TRA-1267 (TRA-1250 Rule 3) — flatten the DISCRETIONARY paper book when the
+   * book give-back / session-stop halt trips, locking in the retained gains.
+   * LIVE positions ride their resting broker exit legs (Tradier OTOCO/OCO)
+   * untouched per the board directive — we only block NEW opens there (both
+   * entry chokepoints consult the latched halt). Demo/paper equity + options
+   * have no broker-side resting legs, so we flatten them at the current mark and
+   * feed the closes through the same governor / breaker / alert bookkeeping the
+   * normal exit passes use. Idempotent: markBook only reports `tripped` once.
+   */
+  private flattenOnBookHalt(prices: Map<string, number>, reason: string): void {
+    let flatEq = 0;
+    let flatOpt = 0;
+
+    // Paper equity book (demo). In live mode this map is empty (equity lives on
+    // the Tradier mirror with its own resting legs), so this loop no-ops there.
+    const managedEquity = this.account.getState().totalEquity * MANAGED_ACCOUNT_RATIO;
+    for (const pos of [...this.account.getState().openPositions]) {
+      const px = prices.get(pos.symbol);
+      if (typeof px !== 'number' || !Number.isFinite(px)) continue;
+      const closed = this.account.closePosition(pos.id, px);
+      if (!closed) continue;
+      this.allClosedPositions.push(closed);
+      this.riskGovernor.recordTrade(closed.pnl ?? 0, managedEquity);
+      this.emitExitAlert(closed);
+      flatEq++;
+    }
+
+    // Paper options book (demo). Leave live/imported options — they carry their
+    // own resting exit legs (or are broker-mirrored) — untouched.
+    const sleeveEquity = this.account.getState().totalEquity;
+    for (const opt of [...this.optionsAccount.getStateForMode('demo').openOptions]) {
+      const closed = this.optionsAccount.closeOption(opt.id);
+      if (!closed) continue;
+      const riskUsd =
+        typeof closed.maxLossUsd === 'number' && closed.maxLossUsd > 0
+          ? closed.maxLossUsd
+          : (closed.premiumPaid ?? 0) * (closed.contracts ?? 0) * 100;
+      this.optionsBreaker.recordClose({ pnl: closed.pnl ?? 0, riskUsd }, sleeveEquity);
+      this.emitOptionExitAlert(closed);
+      flatOpt++;
+    }
+
+    log.warn('book give-back halt — flattened discretionary paper book', {
+      component: 'risk-governor',
+      reason,
+      flattenedEquity: flatEq,
+      flattenedOptions: flatOpt,
+      mode: this.mode,
+    });
   }
 
   private async refreshCandles(symbol: string): Promise<void> {

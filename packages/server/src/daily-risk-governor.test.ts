@@ -225,3 +225,118 @@ describe('DailyRiskGovernor — TRA-995 risk autopilot (tighten-only)', () => {
     expect(d.actions.find((a) => a.trigger === 'edge_decay')!.reason).toMatch(/queued for review/i);
   });
 });
+
+// TRA-1267 (TRA-1250 Rule 3) — book-level daily give-back cap + session stop.
+// The governor owns the running peak-open-gain (monotonic, ET-day-scoped) and
+// latches a session halt via the pure `bookGiveBackDecision`. With bookEquity
+// = $100k: 1R = DEFAULT_RISK_PER_TRADE (1%) = $1,000, so the session-stop arm
+// gain = BOOK_SESSION_STOP_R (0.5) × $1,000 = $500. Give-back cap = 40%.
+describe('DailyRiskGovernor — TRA-1267 book give-back cap (Rule 3)', () => {
+  const EQ = 100_000; // → floor = peak × 0.60, session-stop arm = $500
+
+  it('latches the give-back halt once the book surrenders >40% of its peak', () => {
+    const gov = new DailyRiskGovernor(() => new Date('2026-06-02T15:00:00Z'));
+
+    // Book climbs to +$1,000 peak — floor sits at +$600. Still well above it.
+    expect(gov.markBook(1_000, EQ).tripped).toBe(false);
+    expect(gov.isBookHalted()).toBe(false);
+    expect(gov.isHalted()).toBe(false);
+
+    // A shallow give-back to +$700 (> +$600 floor) does NOT trip.
+    expect(gov.markBook(700, EQ).tripped).toBe(false);
+    expect(gov.isBookHalted()).toBe(false);
+
+    // Give back past 40% of the peak → below +$600 floor → halt latches.
+    const trip = gov.markBook(500, EQ);
+    expect(trip.tripped).toBe(true);
+    expect(gov.isBookHalted()).toBe(true);
+    // Folded into isHalted() so the EQUITY entry gate blocks too.
+    expect(gov.isHalted()).toBe(true);
+    expect(gov.getHaltReason()).toMatch(/give-back/i);
+    expect(gov.getBookHaltReason()).toMatch(/give-back/i);
+  });
+
+  it('reports `tripped` exactly once (idempotent latch) — flatten fires a single time', () => {
+    const gov = new DailyRiskGovernor(() => new Date('2026-06-02T15:00:00Z'));
+    gov.markBook(1_000, EQ);
+    expect(gov.markBook(500, EQ).tripped).toBe(true); // false→true transition
+    expect(gov.markBook(400, EQ).tripped).toBe(false); // already latched
+    expect(gov.markBook(300, EQ).tripped).toBe(false);
+    expect(gov.isBookHalted()).toBe(true);
+  });
+
+  it('fires the risk_halt listener exactly once on the book-halt transition', () => {
+    const gov = new DailyRiskGovernor(() => new Date('2026-06-02T15:00:00Z'));
+    const reasons: string[] = [];
+    gov.setHaltListener((r) => reasons.push(r));
+    gov.markBook(1_000, EQ);
+    gov.markBook(500, EQ); // trip
+    gov.markBook(400, EQ); // still halted — must not re-alert
+    expect(reasons).toHaveLength(1);
+    expect(reasons[0]).toMatch(/give-back/i);
+  });
+
+  it('keeps a MONOTONIC peak — a dip then a higher high raises the floor, not lowers it', () => {
+    const gov = new DailyRiskGovernor(() => new Date('2026-06-02T15:00:00Z'));
+    gov.markBook(1_000, EQ); // peak 1000, floor 600
+    gov.markBook(800, EQ); // dip — floor unchanged at 600 (no halt: 800 > 600)
+    gov.markBook(1_200, EQ); // higher high — peak 1200, floor now 720
+    expect(gov.isBookHalted()).toBe(false);
+    // +$700 is above the OLD 600 floor but below the NEW 720 floor → halt.
+    expect(gov.markBook(700, EQ).tripped).toBe(true);
+    expect(gov.getHaltReason()).toMatch(/give-back/i);
+  });
+
+  it('applies the hard session stop when the book goes net-negative after being up ≥ 0.5R', () => {
+    const gov = new DailyRiskGovernor(() => new Date('2026-06-02T15:00:00Z'));
+    // Up +$600 (> the $500 = 0.5R arm) — no halt yet (floor 360, current 600).
+    expect(gov.markBook(600, EQ).tripped).toBe(false);
+    // Flip net-negative → session stop latches (takes precedence over give-back).
+    const trip = gov.markBook(-50, EQ);
+    expect(trip.tripped).toBe(true);
+    expect(gov.isBookHalted()).toBe(true);
+    expect(gov.getHaltReason()).toMatch(/session stop/i);
+  });
+
+  it('does NOT session-stop on a net-negative book that never reached the 0.5R arm', () => {
+    const gov = new DailyRiskGovernor(() => new Date('2026-06-02T15:00:00Z'));
+    gov.markBook(300, EQ); // peak +$300 — below the $500 arm
+    // Net-negative, but the book was never up enough to arm the session stop,
+    // and peak×0.6 = $180 floor is only breached below +$180 — a small −$50 dip
+    // that never armed and whose peak floor is $180 must not halt at −$50? It is
+    // below $180 → the give-back cap DOES apply once there was any positive peak.
+    // Assert the give-back branch (not the session-stop branch) fires here.
+    const trip = gov.markBook(-50, EQ);
+    expect(trip.tripped).toBe(true);
+    expect(gov.getHaltReason()).toMatch(/give-back/i); // NOT session stop
+  });
+
+  it('resets the peak + book halt on the ET day roll (fresh session rebuilds from zero)', () => {
+    let now = new Date('2026-06-02T15:00:00Z');
+    const gov = new DailyRiskGovernor(() => now);
+    gov.markBook(1_000, EQ);
+    gov.markBook(500, EQ); // trip on day 1
+    expect(gov.isBookHalted()).toBe(true);
+
+    // Next ET trading day — the daily book state clears alongside dailyPnl.
+    now = new Date('2026-06-03T15:00:00Z');
+    expect(gov.isBookHalted()).toBe(false);
+    expect(gov.getBookHaltReason()).toBeNull();
+    // Peak rebuilt from zero: a +$700 → +$500 give-back is only 28%, no halt.
+    gov.markBook(700, EQ);
+    expect(gov.markBook(500, EQ).tripped).toBe(false);
+  });
+
+  it('the kill switch still takes precedence over a book halt in getHaltReason', () => {
+    const gov = new DailyRiskGovernor(() => new Date('2026-06-02T15:00:00Z'));
+    gov.markBook(1_000, EQ);
+    gov.markBook(500, EQ); // book halt latched
+    expect(gov.getHaltReason()).toMatch(/give-back/i);
+    gov.engageKillSwitch('operator override');
+    expect(gov.getHaltReason()).toBe('operator override');
+    gov.releaseKillSwitch();
+    // Releasing reveals the still-latched book halt underneath.
+    expect(gov.isHalted()).toBe(true);
+    expect(gov.getHaltReason()).toMatch(/give-back/i);
+  });
+});
