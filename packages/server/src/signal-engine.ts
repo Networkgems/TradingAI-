@@ -1,7 +1,7 @@
-import { OrbStrategy, BbFadeStrategy, IchimokuStrategy, SupertrendConfluenceStrategy, confluenceSide, supertrend, reversalChecklist, adx, atr, atrPct, donchian, supportResistance, blackScholesDelta, daysToExpiration, bookGiveBackDecision, selectRvLongCandidate, selectShadowOptionSignal, emaPullbackTrigger, volumeConfirmedBreakout, TradierOptionsClient, TradierOrderClient, TRADIER_REJECTED_STATUSES, evaluateSma200, SMA200_MIN_BARS, SMA200_DEBOUNCE_BARS, composeTechnicalSnapshot, resampleCandles, TF_BUCKET_MS, OptionsRiskBreaker, DEFAULT_OPTIONS_BREAKER_PARAMS } from '@trading-app/engine';
+import { OrbStrategy, BbFadeStrategy, IchimokuStrategy, SupertrendConfluenceStrategy, confluenceSide, supertrend, reversalChecklist, adx, atr, atrPct, donchian, supportResistance, blackScholesDelta, daysToExpiration, bookGiveBackDecision, chandelierStop, stopModifyDecision, selectRvLongCandidate, selectShadowOptionSignal, emaPullbackTrigger, volumeConfirmedBreakout, TradierOptionsClient, TradierOrderClient, TRADIER_REJECTED_STATUSES, TRADIER_TERMINAL_STATUSES, evaluateSma200, SMA200_MIN_BARS, SMA200_DEBOUNCE_BARS, composeTechnicalSnapshot, resampleCandles, TF_BUCKET_MS, OptionsRiskBreaker, DEFAULT_OPTIONS_BREAKER_PARAMS } from '@trading-app/engine';
 import type { StrategySelectorInput, ContractQuote, OptionTrend, RvLongTrendSide, ExitState, SharedTickIndicators, RelativeValueScannerOptions, OptionChainRow, IvRvScannerOptions, IvRvMispricingCandidate } from '@trading-app/engine';
 import type { TradierAccountBalance } from '@trading-app/engine';
-import { WATCHLIST, isLiquidSwingSymbol, checkEquitySwingClose, MANAGED_ACCOUNT_RATIO, MAX_CONSECUTIVE_LOSSES, DAILY_DRAWDOWN_HALT_PCT, BOOK_SESSION_STOP_R, BOOK_GIVEBACK_CAP_PCT, DEFAULT_RISK_PER_TRADE, OPTIONS_PER_TICKET_DOLLAR_FLOOR, OPTIONS_POSITION_CAP_RATIO, aliasWatchlistSymbol, isLiveTradierOptionsEnabled, isStockMarketOpen, perPositionCap, resolveAutoManageImportedTradierOptions, resolveDemoCostModel, resolveHoldLiveOptionsOvernight, resolveSwingHoldOptions, resolveLiveTradeEquitiesTradier, resolveManagedAccountRatio, resolveMarketReviewGatesEnabled, resolveRiskPerTrade, resolveRvDtePrefs, resolveTradierOptionsCreds, validateBracket, DEFAULT_RV_DTE_MIN, DEFAULT_RV_DTE_MAX, DEFAULT_RV_DTE_TARGET, scoreNewsSentiment, aggregateSymbolSentiment, aggregateFedSentiment, aggregateStockTwitsSentiment, dedupeStockTwitsMessages, mapCuratedMessagesBySymbol, nameAliasesFor, evaluateEquityDcaAdd, evaluateOptionDcaAdd, CONVICTION_DCA, blendedAverage, positionRiskDollars, minutesToSessionClose, getEasternUtcOffset, isAgentTradingWindowOpen } from '@trading-app/shared';
+import { WATCHLIST, isLiquidSwingSymbol, checkEquitySwingClose, MANAGED_ACCOUNT_RATIO, MAX_CONSECUTIVE_LOSSES, DAILY_DRAWDOWN_HALT_PCT, BOOK_SESSION_STOP_R, BOOK_GIVEBACK_CAP_PCT, LIVE_EQUITY_STOP_MODIFY_MIN_TICK_PCT, LIVE_EQUITY_STOP_MODIFY_MIN_TICK_ABS, LIVE_EQUITY_STOP_MODIFY_COOLDOWN_MS, DEFAULT_RISK_PER_TRADE, OPTIONS_PER_TICKET_DOLLAR_FLOOR, OPTIONS_POSITION_CAP_RATIO, aliasWatchlistSymbol, isLiveTradierOptionsEnabled, isStockMarketOpen, perPositionCap, resolveAutoManageImportedTradierOptions, resolveDemoCostModel, resolveHoldLiveOptionsOvernight, resolveSwingHoldOptions, resolveLiveTradeEquitiesTradier, resolveManagedAccountRatio, resolveMarketReviewGatesEnabled, resolveRiskPerTrade, resolveRvDtePrefs, resolveTradierOptionsCreds, validateBracket, DEFAULT_RV_DTE_MIN, DEFAULT_RV_DTE_MAX, DEFAULT_RV_DTE_TARGET, scoreNewsSentiment, aggregateSymbolSentiment, aggregateFedSentiment, aggregateStockTwitsSentiment, dedupeStockTwitsMessages, mapCuratedMessagesBySymbol, nameAliasesFor, evaluateEquityDcaAdd, evaluateOptionDcaAdd, CONVICTION_DCA, blendedAverage, positionRiskDollars, minutesToSessionClose, getEasternUtcOffset, isAgentTradingWindowOpen } from '@trading-app/shared';
 import type { TradeSignal, RelativeValueSignal, OtmMispricingSignal, Sma200Signal, Candle, OptionsAccountState, SignalType, Position, OptionPosition, AccountMode, AccountSettings, AccountState, NewsItem, SymbolSentiment, SocialSentiment, StockTwitsMessage, TechnicalSignalSnapshot, TradierEnv, MarketReview, MarketReviewGates, EngineMarketReviewState, GatedStrategyNote, AgentRecommendation, TradeProposal, AgentOrderAudit, GuardrailVerdict, OptionType } from '@trading-app/shared';
 import { shouldAutoConfirm } from '@trading-app/shared';
 // TRA-544 (TRA-529 P1) / TRA-747 (P2) — advisory multi-agent layer. ON suspends
@@ -50,7 +50,7 @@ import {
 import { isOptionShadowEnabled, isOptionPhaseBEnabled, emitShadowOptionSignal, shadowSignalToSpreadParams, OPTION_SHADOW_EMERGENCY_OFF, DEMO_SPREAD_MAX_LOSS_PCT_CAP } from './option-shadow-ledger.js';
 import { isOptionExecEnabled, isOptionEmaPullbackEnabled, isOptionVolumeBreakoutEnabled, resolveRvLongDteOverride, resolveRvMinDailyVolume, isOptionDemoDirectionalEnabled, isOptionIvRvScannerEnabled, isOptionIvRvRoutingEnabled, resolveIvRvRoutingOverride } from './option-exec-flag.js';
 import { scanIvRvFromSnapshot, recordIvRvScan } from './iv-rv-scanner.js';
-import { isExitRiskRulesEnabled } from './exit-risk-rules-flag.js';
+import { isExitRiskRulesEnabled, isLiveEquityStopModifyEnabled } from './exit-risk-rules-flag.js';
 import { etDateString } from './scheduler.js';
 // TRA-995 (epic-C, self-regulation) — the standing risk autopilot. A pure
 // tighten-only decision module; the governor below is its mutation boundary and
@@ -1271,6 +1271,142 @@ export class SignalEngine {
     if (underlyingAtrBySymbol.size === 0) return undefined;
     return { underlyingAtrBySymbol, underlyingAtrPctBySymbol };
   }
+
+  /**
+   * TRA-1269 (TRA-1250 Rule 1, LIVE-equity path) — trail each engine-opened live
+   * Tradier equity position's broker-resting OCO STOP leg with the ATR
+   * chandelier, by MODIFYING the stop trigger in place. This is the one exit
+   * path with no engine-driven `checkExits` loop: the TP/SL legs live on the
+   * broker (the OTOCO's OCO pair), so to trail we cancel/replace nothing — we
+   * `PUT` a new stop price on the stop leg only. Invariants (enforced across
+   * {@link stopModifyDecision} + this method):
+   *   • never loosen — the stop only ratchets toward price (up for a long, down
+   *     for a short), floored at the entry hard stop via {@link chandelierStop};
+   *   • never touch the take-profit leg — we resolve and modify ONLY the `stop`
+   *     leg id;
+   *   • one modify per ratchet, throttled per-position ({@link LIVE_EQUITY_STOP_MODIFY_COOLDOWN_MS})
+   *     and gated on a minimum favorable move so we don't churn Tradier;
+   *   • idempotent with broker-side stop hits / partial fills — trail state is
+   *     pruned when the mirror row disappears (the reconcile sweep drops it once
+   *     Tradier no longer reports the position), and a failed modify drops the
+   *     cached leg id (so a re-armed OCO re-resolves) and leaves `brokerStop`
+   *     unchanged so we retry the same tighten, never advancing on failure.
+   *
+   * Only ever called behind {@link isLiveEquityStopModifyEnabled} in live mode
+   * during regular hours. Imported (out-of-band) rows are skipped — they carry
+   * sentinel legs the engine doesn't own. Best-effort per position: a per-symbol
+   * broker error is logged and skipped so one bad leg can't stall the rest.
+   */
+  private async trailLiveEquityStops(prices: Map<string, number>): Promise<void> {
+    const client = this.tradierLiveEquityClient;
+    if (!client) return;
+
+    // Prune trail state for mirror rows that closed since the last pass (stop
+    // hit, manual close, reconcile drop) so a stale stop-leg id is never reused.
+    for (const id of [...this.liveEquityTrailState.keys()]) {
+      if (!this.liveEquityPositions.has(id)) this.liveEquityTrailState.delete(id);
+    }
+
+    const now = Date.now();
+    for (const [id, pos] of this.liveEquityPositions) {
+      // Imported rows carry sentinel TP/SL and no engine-managed OTOCO leg.
+      if (pos.importedFromTradier) continue;
+      const side = pos.side;
+      const price = prices.get(pos.symbol);
+      if (typeof price !== 'number' || !Number.isFinite(price) || price <= 0) continue;
+      const candles = this.candleCache.get(pos.symbol);
+      if (!candles || candles.length < 15) continue;
+      const a = atr(candles);
+      if (a == null || !(a > 0)) continue;
+      const ap = atrPct(candles);
+
+      let state = this.liveEquityTrailState.get(id);
+      if (!state) {
+        // Seed the running extreme at the current price and the never-loosen
+        // floor at the entry hard stop (what the OTOCO stop leg is resting at).
+        state = { extreme: price, brokerStop: pos.stopLoss, lastModifyAt: 0 };
+        this.liveEquityTrailState.set(id, state);
+      }
+      // Ratchet the favorable extreme (highest-high long / lowest-low short).
+      state.extreme = side === 'buy' ? Math.max(state.extreme, price) : Math.min(state.extreme, price);
+
+      const desired = chandelierStop({
+        side,
+        initialStop: pos.stopLoss,
+        extremeSinceEntry: state.extreme,
+        atr: a,
+        atrPct: ap != null && Number.isFinite(ap) ? ap : undefined,
+        prevTrailStop: state.brokerStop,
+      });
+      const minTick = Math.max(
+        LIVE_EQUITY_STOP_MODIFY_MIN_TICK_ABS,
+        price * LIVE_EQUITY_STOP_MODIFY_MIN_TICK_PCT,
+      );
+      const decision = stopModifyDecision({ side, brokerStop: state.brokerStop, desiredStop: desired, minTick });
+      if (!decision.shouldModify) continue;
+
+      // Per-position throttle — a fast tick must never machine-gun Tradier.
+      if (now - state.lastModifyAt < LIVE_EQUITY_STOP_MODIFY_COOLDOWN_MS) continue;
+
+      // Resolve the OCO STOP-leg order id off the OTOCO parent (cached once).
+      let stopLegOrderId = state.stopLegOrderId;
+      if (stopLegOrderId === undefined) {
+        const parentId = this.liveEquityOrderIds.get(id);
+        if (parentId === undefined) continue;
+        let legs;
+        try {
+          legs = await client.getOrderLegs(parentId);
+        } catch (err: unknown) {
+          log.warn('Tradier live-equity leg lookup failed', {
+            component: 'live-equity-trail',
+            symbol: pos.symbol,
+            reason: err instanceof Error ? err.message : String(err),
+          });
+          continue;
+        }
+        // Only a WORKING stop leg is modifiable; a filled/canceled one means the
+        // OCO already resolved (the position is closing) — skip and let reconcile
+        // drop the row.
+        const stopLeg = legs.find(l => l.type === 'stop' && !TRADIER_TERMINAL_STATUSES.has(l.status));
+        if (!stopLeg) continue;
+        stopLegOrderId = stopLeg.id;
+        state.stopLegOrderId = stopLegOrderId;
+      }
+
+      // Stamp the throttle BEFORE the await so a slow round-trip can't let the
+      // next tick double-fire the same ratchet.
+      state.lastModifyAt = now;
+      try {
+        await client.changeStopPrice(stopLegOrderId, decision.nextStop);
+      } catch (err: unknown) {
+        // Modify failed — the OCO may have just filled, or Tradier throttled.
+        // Drop the cached leg id so we re-resolve next attempt, and DO NOT
+        // advance `brokerStop` (retry the same tighten later; never loosen).
+        state.stopLegOrderId = undefined;
+        log.warn('Tradier live-equity stop-modify failed', {
+          component: 'live-equity-trail',
+          symbol: pos.symbol,
+          stopLegOrderId,
+          newStop: decision.nextStop,
+          reason: err instanceof Error ? err.message : String(err),
+        });
+        continue;
+      }
+      // Success — advance the never-loosen floor and mirror the tighter stop so
+      // getState()/the dashboard reflects the ratchet.
+      state.brokerStop = decision.nextStop;
+      pos.stopLoss = decision.nextStop;
+      log.info('tradier live-equity chandelier ratchet', {
+        component: 'live-equity-trail',
+        symbol: pos.symbol,
+        side,
+        stopLegOrderId,
+        newStop: decision.nextStop,
+        extreme: state.extreme,
+      });
+    }
+  }
+
   /** TRA-787 — last successful shadow 5m-series refresh (gates the 60s cadence). */
   private lastSupertrendShadowRefreshAt = 0;
   /**
@@ -1537,6 +1673,18 @@ export class SignalEngine {
   private dcaOptionAddsToday: Map<string, { etDay: string; count: number }> = new Map();
   /** TRA-335 — Tradier order id (entry leg) → local Position id, used for reconcile. */
   private liveEquityOrderIds: Map<string, number | string> = new Map();
+  /**
+   * TRA-1269 (TRA-1250 Rule 1, live path) — per-live-equity-position running
+   * state for the broker-side chandelier trail. Keyed by Position.id. Holds the
+   * running favorable extreme, the last stop we pushed to Tradier (`brokerStop`,
+   * the never-loosen floor), the resolved OCO STOP-leg order id (looked up lazily
+   * off the OTOCO parent and cached), and the last-modify timestamp for the
+   * per-position throttle. Pruned when the mirror row disappears (reconcile).
+   */
+  private liveEquityTrailState: Map<
+    string,
+    { extreme: number; brokerStop: number; stopLegOrderId?: number; lastModifyAt: number }
+  > = new Map();
   /**
    * TRA-415 — last successful (or attempted) Tradier live-equity reconcile.
    * Compared against `TRADIER_PORTFOLIO_RECONCILE_MS` to gate the per-tick
@@ -1954,6 +2102,7 @@ export class SignalEngine {
     // must close them in Tradier or re-import via reconciliation.
     this.liveEquityPositions.clear();
     this.liveEquityOrderIds.clear();
+    this.liveEquityTrailState.clear(); // TRA-1269 — drop broker-trail state with the mirror
     // TRA-415 — re-arm the forced boot sweep so the next tick re-imports any
     // equity positions still open on Tradier (the reset wiped the mirror but
     // not the broker-side positions).
@@ -2536,6 +2685,25 @@ export class SignalEngine {
             symbolsToFetch.slice(i, i + CANDLE_BATCH).map(sym => this.refreshCandles(sym)),
           );
         }
+      }
+    }
+
+    // TRA-1269 (TRA-1250 Rule 1, LIVE path) — ratchet the broker-resting OCO
+    // stop leg on each live equity mirror position via a Tradier stop-modify.
+    // Runs AFTER the candle refresh (fresh ATR) and the equity reconcile (fresh
+    // mirror). Dark unless BOTH the master exit-risk switch and the live-equity
+    // sub-flag are on (this path carries the most broker-execution risk, so it
+    // is isolated). RTH-only: Tradier equity legs only work in regular hours and
+    // an off-session ratchet would be a decision off stale bars. Best-effort —
+    // a throw here can't take down the rest of the tick.
+    if (this.mode === 'live' && isLiveEquityStopModifyEnabled() && isStockMarketOpen()) {
+      try {
+        await this.trailLiveEquityStops(prices);
+      } catch (err: unknown) {
+        log.warn('live-equity chandelier trail sweep threw', {
+          component: 'live-equity-trail',
+          reason: err instanceof Error ? err.message : String(err),
+        });
       }
     }
 

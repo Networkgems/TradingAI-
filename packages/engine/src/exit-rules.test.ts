@@ -3,6 +3,7 @@ import {
   chandelierMultiplier,
   chandelierStop,
   chandelierExitTriggered,
+  stopModifyDecision,
   profitLockDecision,
   bookGiveBackDecision,
 } from './exit-rules.js';
@@ -55,6 +56,43 @@ describe('Rule 1 — ATR chandelier trailing stop', () => {
     expect(chandelierExitTriggered('buy', 115, 114)).toBe(false);
     expect(chandelierExitTriggered('sell', 87, 86)).toBe(true);
     expect(chandelierExitTriggered('sell', 85, 86)).toBe(false);
+  });
+});
+
+// TRA-1269 — broker stop-leg modify gate (live-equity chandelier path).
+describe('Rule 1 (live path) — stopModifyDecision', () => {
+  it('long: modifies only when the stop tightens (rises) by ≥ minTick', () => {
+    // Rises 2.0 ≥ minTick 0.5 → modify to the higher stop.
+    expect(stopModifyDecision({ side: 'buy', brokerStop: 100, desiredStop: 102, minTick: 0.5 }))
+      .toEqual({ shouldModify: true, nextStop: 102 });
+    // Rises only 0.3 < minTick 0.5 → hold; keep the resting stop.
+    expect(stopModifyDecision({ side: 'buy', brokerStop: 100, desiredStop: 100.3, minTick: 0.5 }))
+      .toEqual({ shouldModify: false, nextStop: 100 });
+    // Desired is LOWER (would loosen) → never modify a long's stop down.
+    expect(stopModifyDecision({ side: 'buy', brokerStop: 100, desiredStop: 98, minTick: 0.5 }))
+      .toEqual({ shouldModify: false, nextStop: 100 });
+    // Equal → no-op.
+    expect(stopModifyDecision({ side: 'buy', brokerStop: 100, desiredStop: 100, minTick: 0.5 }).shouldModify)
+      .toBe(false);
+  });
+
+  it('short: modifies only when the stop tightens (falls) by ≥ minTick', () => {
+    // Falls 2.0 ≥ minTick 0.5 → modify to the lower stop.
+    expect(stopModifyDecision({ side: 'sell', brokerStop: 100, desiredStop: 98, minTick: 0.5 }))
+      .toEqual({ shouldModify: true, nextStop: 98 });
+    // Falls only 0.3 < minTick → hold.
+    expect(stopModifyDecision({ side: 'sell', brokerStop: 100, desiredStop: 99.7, minTick: 0.5 }))
+      .toEqual({ shouldModify: false, nextStop: 100 });
+    // Desired is HIGHER (would loosen) → never modify a short's stop up.
+    expect(stopModifyDecision({ side: 'sell', brokerStop: 100, desiredStop: 102, minTick: 0.5 }))
+      .toEqual({ shouldModify: false, nextStop: 100 });
+  });
+
+  it('fails safe on a degenerate minTick (never loosens/churns)', () => {
+    expect(stopModifyDecision({ side: 'buy', brokerStop: 100, desiredStop: 105, minTick: 0 }).shouldModify)
+      .toBe(false);
+    expect(stopModifyDecision({ side: 'buy', brokerStop: 100, desiredStop: 105, minTick: NaN }).shouldModify)
+      .toBe(false);
   });
 });
 

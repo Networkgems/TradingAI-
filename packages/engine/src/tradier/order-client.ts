@@ -165,6 +165,71 @@ export function parseTradierEquityPositions(
   return out;
 }
 
+/**
+ * TRA-1269 — a single child leg of an OTOCO/OCO order as returned by
+ * `/accounts/{id}/orders/{order_id}`. Once an OTOCO's entry fills, Tradier
+ * exposes the take-profit and stop-loss as `leg[]` entries, each with its OWN
+ * order `id`. To trail a live equity stop we must modify the STOP leg by its
+ * leg id (not the OTOCO parent id), so we surface the minimum needed to pick it.
+ */
+export interface TradierOrderLeg {
+  /** The leg's own order id — the handle used to cancel/modify just this leg. */
+  id: number;
+  /** `limit` (take-profit), `stop` (stop-loss), `market`, … */
+  type: string;
+  /** Close side of the leg (`buy`/`sell`); undefined when Tradier omits it. */
+  side?: string;
+  /** Leg lifecycle: `open`/`pending`/`filled`/`canceled`/… (lowercased). */
+  status: string;
+  /** Resting stop price on a `stop`/`stop_limit` leg, when present. */
+  stopPrice?: number;
+}
+
+interface TradierRawLeg {
+  id?: unknown;
+  type?: unknown;
+  side?: unknown;
+  status?: unknown;
+  stop_price?: unknown;
+}
+
+interface TradierOrderWithLegsEnvelope {
+  order?: {
+    id?: unknown;
+    leg?: TradierRawLeg | TradierRawLeg[];
+  };
+}
+
+/**
+ * TRA-1269 — normalise the `leg[]` array off a Tradier order-status envelope
+ * into typed legs. Exported so the stop-leg picker is unit-testable without
+ * mocking `fetch`. Tradier returns `leg` as a single object when there is one
+ * leg and an array when there are several; rows whose `id` can't be coerced are
+ * dropped (we'd rather omit a leg than modify the wrong order id).
+ */
+export function parseTradierOrderLegs(
+  envelope: TradierOrderWithLegsEnvelope | null,
+): TradierOrderLeg[] {
+  const raw = envelope?.order?.leg;
+  if (raw == null) return [];
+  const rows = Array.isArray(raw) ? raw : [raw];
+  const out: TradierOrderLeg[] = [];
+  for (const row of rows) {
+    if (typeof row.id !== 'number' || !Number.isFinite(row.id)) continue;
+    out.push({
+      id: row.id,
+      type: typeof row.type === 'string' ? row.type.toLowerCase() : '',
+      side: typeof row.side === 'string' ? row.side.toLowerCase() : undefined,
+      status: typeof row.status === 'string' ? row.status.toLowerCase() : '',
+      stopPrice:
+        typeof row.stop_price === 'number' && Number.isFinite(row.stop_price)
+          ? row.stop_price
+          : undefined,
+    });
+  }
+  return out;
+}
+
 const SANDBOX_BASE = 'https://sandbox.tradier.com/v1';
 const PROD_BASE = 'https://api.tradier.com/v1';
 
@@ -238,6 +303,61 @@ export class TradierOrderClient {
     if (!resp.ok && resp.status !== 422 && resp.status !== 404) {
       throw new Error(`Tradier cancel failed (${resp.status})`);
     }
+  }
+
+  /**
+   * TRA-1269 — fetch an order's child legs (`leg[]`). Used by the live-equity
+   * chandelier trail to resolve the OTOCO's STOP-loss leg order id so it can be
+   * modified in place. Returns `[]` on a non-2xx or leg-less envelope so a
+   * transient failure can't be mistaken for "no stop leg to trail".
+   */
+  async getOrderLegs(orderId: string | number): Promise<TradierOrderLeg[]> {
+    const resp = await fetch(
+      `${this.baseUrl}/accounts/${encodeURIComponent(this.accountId)}/orders/${encodeURIComponent(String(orderId))}`,
+      { method: 'GET', headers: { Authorization: this.headers.Authorization, Accept: 'application/json' } },
+    );
+    if (!resp.ok) return [];
+    const data = (await resp.json()) as TradierOrderWithLegsEnvelope;
+    return parseTradierOrderLegs(data);
+  }
+
+  /**
+   * TRA-1269 — modify the resting STOP price of an existing stop leg in place
+   * (`PUT /accounts/{id}/orders/{order_id}`). This is how the live-equity
+   * chandelier ratchets the broker's OCO stop leg WITHOUT cancel+replace, so the
+   * OCO pairing (stop ↔ take-profit) stays intact and the TP leg is never
+   * touched. Only the stop trigger and duration are sent; `type` stays `stop`.
+   * Throws on a non-2xx or a Tradier `errors` payload so the caller can log and
+   * leave the prior (tighter-or-equal) stop resting.
+   */
+  async changeStopPrice(
+    legOrderId: string | number,
+    newStopPrice: number,
+    duration: 'day' | 'gtc' = 'gtc',
+  ): Promise<TradierOrderResponse> {
+    const body = new URLSearchParams({
+      type: 'stop',
+      duration,
+      stop: newStopPrice.toFixed(2),
+    });
+    const resp = await fetch(
+      `${this.baseUrl}/accounts/${encodeURIComponent(this.accountId)}/orders/${encodeURIComponent(String(legOrderId))}`,
+      { method: 'PUT', headers: this.headers, body: body.toString() },
+    );
+    if (!resp.ok) {
+      const text = await resp.text();
+      throw new Error(`Tradier stop-modify failed (${resp.status}): ${text}`);
+    }
+    const data = (await resp.json()) as TradierOrderEnvelope;
+    const errors = data.errors?.error ?? data.order?.errors?.error;
+    if (errors) {
+      const msg = Array.isArray(errors) ? errors.join('; ') : errors;
+      throw new Error(`Tradier stop-modify rejected: ${msg}`);
+    }
+    if (!data.order) {
+      throw new Error('Tradier stop-modify response missing order payload');
+    }
+    return data.order;
   }
 
   /**

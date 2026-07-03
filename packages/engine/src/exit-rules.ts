@@ -100,6 +100,53 @@ export function chandelierExitTriggered(
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
+// Rule 1 (live-equity path, TRA-1269) — broker stop-leg modify gate
+// ─────────────────────────────────────────────────────────────────────────────
+
+export interface StopModifyParams {
+  side: Side;
+  /** The stop currently resting on the broker (last value we sent / know). */
+  brokerStop: number;
+  /** The freshly-computed chandelier stop for this tick. */
+  desiredStop: number;
+  /**
+   * Minimum favorable move (in price) required before we spend a broker
+   * order-modify round-trip. Guards against churning Tradier with sub-tick
+   * ratchets and tripping its throttle.
+   */
+  minTick: number;
+}
+
+export interface StopModifyDecision {
+  /** True ⇒ issue a broker order-modify to `nextStop`. */
+  shouldModify: boolean;
+  /** The stop to send. Always in the tighten-only direction; else `brokerStop`. */
+  nextStop: number;
+}
+
+/**
+ * Decide whether a live-equity chandelier ratchet warrants a broker stop-leg
+ * modify. The stop may ONLY tighten — raise for a long, lower for a short — and
+ * only when it has moved by at least `minTick`. A loosening or too-small
+ * `desiredStop` is a no-op that leaves the broker's resting stop untouched.
+ * This is the single choke point that enforces "never loosen; never touch the
+ * TP leg" for the live path; the caller does the I/O.
+ */
+export function stopModifyDecision(p: StopModifyParams): StopModifyDecision {
+  const tightens =
+    p.side === 'buy' ? p.desiredStop > p.brokerStop : p.desiredStop < p.brokerStop;
+  if (!tightens) return { shouldModify: false, nextStop: p.brokerStop };
+
+  const move = Math.abs(p.desiredStop - p.brokerStop);
+  // `>=` with a strictly-positive floor: a NaN/degenerate minTick can never
+  // admit a modify (NaN comparisons are false), failing safe to "don't touch".
+  if (!(p.minTick > 0) || !(move >= p.minTick)) {
+    return { shouldModify: false, nextStop: p.brokerStop };
+  }
+  return { shouldModify: true, nextStop: p.desiredStop };
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
 // Rule 2 — trade-level profit-lock (give-back cap per position)
 // ─────────────────────────────────────────────────────────────────────────────
 

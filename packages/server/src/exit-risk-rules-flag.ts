@@ -24,3 +24,22 @@ function flagOn(raw: string | undefined): boolean {
 export function isExitRiskRulesEnabled(env: NodeJS.ProcessEnv = process.env): boolean {
   return flagOn(env[EXIT_RISK_RULES_FLAG]);
 }
+
+// TRA-1269 (TRA-1250 Rule 1, live-equity path) — a SEPARATE sub-flag for the
+// one path with real broker-execution risk: trailing a live Tradier equity stop
+// by modifying its resting OCO stop leg. It is deliberately gated by BOTH the
+// master switch AND its own flag so the board can enable the demo/options
+// chandelier + book give-back cap (TRA-1267/1268) in production while the live
+// stop-modify stays dark — and can flip only this one on for the small
+// board-placed verification position without touching everything else. OFF
+// unless `EXIT_RISK_RULES_ENABLED` AND `LIVE_EQUITY_STOP_MODIFY_ENABLED` are
+// both truthy (1/true/yes/on).
+export const LIVE_EQUITY_STOP_MODIFY_FLAG = 'LIVE_EQUITY_STOP_MODIFY_ENABLED';
+
+/**
+ * True iff the live-equity chandelier stop-modify path is enabled. Requires the
+ * master exit-risk switch on as well — the sub-flag alone does nothing.
+ */
+export function isLiveEquityStopModifyEnabled(env: NodeJS.ProcessEnv = process.env): boolean {
+  return isExitRiskRulesEnabled(env) && flagOn(env[LIVE_EQUITY_STOP_MODIFY_FLAG]);
+}

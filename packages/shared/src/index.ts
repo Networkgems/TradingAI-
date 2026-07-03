@@ -1861,6 +1861,16 @@ export const PROFIT_LOCK_TIGHTEN_GIVEBACK_R = 0.5;    // … tighten the give-ba
 export const BOOK_GIVEBACK_CAP_PCT = 0.40;            // flatten + halt after surrendering >40% of the day's peak open gain
 export const BOOK_SESSION_STOP_R = 0.5;               // hard session stop if net-negative after being up > +0.5R of book equity
 
+// TRA-1269 (TRA-1250 Rule 1, live-equity path) — the live equity chandelier
+// trails a *broker-resting* OCO stop leg by cancel/replace, which costs a
+// Tradier order-modify round-trip and risks throttling. So we only spend a
+// modify when the ratcheted stop has tightened by a meaningful amount, and we
+// rate-limit modifies per position. These knobs gate that (never loosen — the
+// tighten-only direction is enforced in `stopModifyDecision`, not here).
+export const LIVE_EQUITY_STOP_MODIFY_MIN_TICK_PCT = 0.0015; // min favorable stop move to justify a modify = 0.15% of price
+export const LIVE_EQUITY_STOP_MODIFY_MIN_TICK_ABS = 0.02;   // …but never smaller than 2¢ (sub-penny moves aren't worth a round-trip)
+export const LIVE_EQUITY_STOP_MODIFY_COOLDOWN_MS = 60_000;  // ≥60s between modifies on the same position (Tradier throttle guard)
+
 /**
  * TRA-526 — deterministic per-trade risk ceiling ("the math disposes" layer).
  *

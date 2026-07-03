@@ -2,6 +2,7 @@ export {
   TradierOrderClient,
   tradierBaseUrl,
   parseTradierEquityPositions,
+  parseTradierOrderLegs,
   TRADIER_TERMINAL_STATUSES,
   TRADIER_REJECTED_STATUSES,
 } from './order-client.js';
@@ -11,6 +12,7 @@ export type {
   TradierOrderResponse,
   TradierOrderDetail,
   TradierOpenEquityPosition,
+  TradierOrderLeg,
 } from './order-client.js';
 export {
   TradierOptionsClient,

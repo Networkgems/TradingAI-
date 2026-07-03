@@ -1,5 +1,5 @@
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
-import { TradierOrderClient, tradierBaseUrl, parseTradierEquityPositions } from './order-client.js';
+import { TradierOrderClient, tradierBaseUrl, parseTradierEquityPositions, parseTradierOrderLegs } from './order-client.js';
 import {
   TradierOptionsClient,
   underlyingFromOcc,
@@ -1441,5 +1441,79 @@ describe('TradierOptionsClient.submitMultilegOrder', () => {
         { type: 'credit', price: 1 },
       ),
     ).rejects.toThrow(/insufficient buying power/);
+  });
+});
+
+// ─── TRA-1269 — live-equity chandelier stop-modify plumbing ─────────────────
+
+describe('parseTradierOrderLegs (TRA-1269)', () => {
+  it('parses a multi-leg OTOCO envelope and lowercases type/status', () => {
+    const legs = parseTradierOrderLegs({
+      order: {
+        id: 100,
+        leg: [
+          { id: 101, type: 'LIMIT', side: 'sell', status: 'Open' },
+          { id: 102, type: 'STOP', side: 'sell', status: 'open', stop_price: 94.5 },
+        ],
+      },
+    });
+    expect(legs).toHaveLength(2);
+    const stop = legs.find(l => l.type === 'stop');
+    expect(stop).toMatchObject({ id: 102, type: 'stop', status: 'open', stopPrice: 94.5 });
+  });
+
+  it('accepts a single-object leg (Tradier one-leg shape) and drops id-less rows', () => {
+    expect(parseTradierOrderLegs({ order: { leg: { id: 7, type: 'stop', status: 'open' } } }))
+      .toEqual([{ id: 7, type: 'stop', side: undefined, status: 'open', stopPrice: undefined }]);
+    expect(parseTradierOrderLegs({ order: { leg: [{ type: 'stop', status: 'open' }] } })).toEqual([]);
+    expect(parseTradierOrderLegs(null)).toEqual([]);
+    expect(parseTradierOrderLegs({ order: {} })).toEqual([]);
+  });
+});
+
+describe('TradierOrderClient.getOrderLegs (TRA-1269)', () => {
+  it('GETs the order and returns its parsed legs', async () => {
+    fetchMock.mockResolvedValueOnce(
+      jsonResponse({ order: { id: 5, leg: [{ id: 6, type: 'stop', status: 'open', stop_price: 90 }] } }),
+    );
+    const client = new TradierOrderClient('tok', 'A1', 'production');
+    const legs = await client.getOrderLegs(5);
+    expect(callUrl(0)).toBe('https://api.tradier.com/v1/accounts/A1/orders/5');
+    expect(callInit(0).method).toBe('GET');
+    expect(legs).toEqual([{ id: 6, type: 'stop', side: undefined, status: 'open', stopPrice: 90 }]);
+  });
+
+  it('returns [] on a non-2xx', async () => {
+    fetchMock.mockResolvedValueOnce(textResponse('nope', 500));
+    const client = new TradierOrderClient('tok', 'A1');
+    expect(await client.getOrderLegs(5)).toEqual([]);
+  });
+});
+
+describe('TradierOrderClient.changeStopPrice (TRA-1269)', () => {
+  it('PUTs type=stop with the new stop price and default gtc duration', async () => {
+    fetchMock.mockResolvedValueOnce(jsonResponse({ order: { id: 102, status: 'ok' } }));
+    const client = new TradierOrderClient('tok', 'A1', 'production');
+    const resp = await client.changeStopPrice(102, 96.128);
+    expect(callUrl(0)).toBe('https://api.tradier.com/v1/accounts/A1/orders/102');
+    const init = callInit(0);
+    expect(init.method).toBe('PUT');
+    const body = String(init.body);
+    expect(body).toContain('type=stop');
+    expect(body).toContain('duration=gtc');
+    expect(body).toContain('stop=96.13'); // rounded to cents
+    expect(resp).toEqual({ id: 102, status: 'ok' });
+  });
+
+  it('throws on a Tradier errors payload (never advances the stop on reject)', async () => {
+    fetchMock.mockResolvedValueOnce(jsonResponse({ errors: { error: 'order not modifiable' } }));
+    const client = new TradierOrderClient('tok', 'A1');
+    await expect(client.changeStopPrice(102, 96)).rejects.toThrow(/order not modifiable/);
+  });
+
+  it('throws on a non-2xx', async () => {
+    fetchMock.mockResolvedValueOnce(textResponse('boom', 400));
+    const client = new TradierOrderClient('tok', 'A1');
+    await expect(client.changeStopPrice(102, 96)).rejects.toThrow(/stop-modify failed \(400\)/);
   });
 });
