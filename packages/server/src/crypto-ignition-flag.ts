@@ -86,7 +86,11 @@ export const IGNITION_DEFAULTS: IgnitionConfig = {
   rvolMin: 6.0,
   squeezePct: 0.08,
   donchLen: 30,
-  squeezeLen: 30,
+  // squeezeLen = 20 (NOT 30): matches the backtested strict-conviction row
+  // (run-tra1217-ignition.ts SIGNAL.squeezeLen=20). QuantTrader §2 sign-off
+  // (TRA-1271) — the strict row overrode only rvolMin/squeezePct/donchLen, so
+  // the +0.328R maker edge was measured at squeezeLen=20. Keep live == backtest.
+  squeezeLen: 20,
   volLen: 30,
   trendLen: 50,
   bullOnly: true,

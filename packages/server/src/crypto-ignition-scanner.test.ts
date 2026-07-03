@@ -35,7 +35,7 @@ function bar(i: number, o: number, h: number, l: number, c: number, v: number): 
 
 /**
  * 60-bar coiled→breakout bull series that FIRES: 59 tight bars at 100 (channel
- * width 1.0), then a breakout close 103 on 6× volume. need = max(30,30,30,50)+1 = 51.
+ * width 1.0), then a breakout close 103 on 6× volume. need = max(30,20,30,50)+1 = 51.
  */
 function firingBars(): Candle[] {
   const out: Candle[] = [];
@@ -78,7 +78,7 @@ describe('scanIgnition — §2 five-condition trigger', () => {
   });
 
   it('does NOT fire when the close is below the EMA50 trend', () => {
-    // A far-back 10000 plateau (outside the 30-bar donch/squeeze/vol window but
+    // A far-back 10000 plateau (outside the donch/squeeze/vol windows but
     // inside the 50-bar EMA window) lifts EMA50 far above the breakout close.
     const out: Candle[] = [];
     for (let i = 0; i < 29; i++) out.push(bar(i, 10000, 10000, 10000, 10000, 1));
