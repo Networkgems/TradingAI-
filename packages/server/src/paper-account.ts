@@ -1,7 +1,23 @@
-import type { AccountState, Position, TradeSignal, SignalType } from '@trading-app/shared';
+import type { AccountState, ExitReason, Position, TradeSignal, SignalType } from '@trading-app/shared';
 import { DEFAULT_ACCOUNT_SETTINGS, validateBracket } from '@trading-app/shared';
+import { chandelierStop, chandelierExitTriggered, profitLockDecision } from '@trading-app/engine';
 import { randomUUID } from 'crypto';
 import { logger } from './observability/index.js';
+
+/**
+ * TRA-1268 (TRA-1250 Rules 1-2) — per-tick inputs the demo-equity exit loop
+ * needs to evaluate the ATR chandelier trail (Rule 1) and the trade-level
+ * profit-lock give-back cap (Rule 2). The caller (signal-engine) computes the
+ * live ATR(14) on minute bars per symbol and only supplies this object when
+ * `EXIT_RISK_RULES_ENABLED` is on, so the rules ship dark and `checkExits`
+ * behaviour is byte-for-byte unchanged when it is absent.
+ */
+export interface EquityExitRiskInput {
+  /** Live ATR(14) on the position's minute-bar timeframe, keyed by symbol. */
+  atrBySymbol: Map<string, number>;
+  /** ATR / price by symbol — picks the high-beta chandelier multiplier. Optional. */
+  atrPctBySymbol?: Map<string, number>;
+}
 
 const log = logger.child({ module: 'paper-account' });
 
@@ -33,6 +49,15 @@ export class PaperAccount {
   private cash: number;
   private positions: Map<string, Position> = new Map();
   private dailyPnl = 0;
+  /**
+   * TRA-1268 — per-position running state for the exit-risk rules, keyed by
+   * position id: the favorable `extremeSinceEntry` (peak for longs / trough for
+   * shorts) and the last chandelier `prevTrailStop` (so the trail only ratchets
+   * one way). Seeded lazily on first `checkExits` sighting and dropped when the
+   * position closes. Not persisted — it re-seeds from the entry price on the
+   * next tick after a restart, which is conservative (a wider initial trail).
+   */
+  private exitRiskState: Map<string, { extremeSinceEntry: number; prevTrailStop?: number }> = new Map();
 
   constructor(config: PaperAccountConfig = {}) {
     this.initialEquity = config.initialEquity ?? DEFAULT_ACCOUNT_SETTINGS.demoEquity;
@@ -50,6 +75,7 @@ export class PaperAccount {
     this.equity = this.initialEquity;
     this.cash = this.initialEquity;
     this.positions.clear();
+    this.exitRiskState.clear();
     this.dailyPnl = 0;
   }
 
@@ -235,7 +261,7 @@ export class PaperAccount {
     return pos;
   }
 
-  checkExits(prices: Map<string, number>): Position[] {
+  checkExits(prices: Map<string, number>, exitRisk?: EquityExitRiskInput): Position[] {
     const closed: Position[] = [];
     for (const [id, pos] of this.positions) {
       const price = prices.get(pos.symbol);
@@ -269,25 +295,77 @@ export class PaperAccount {
         continue;
       }
 
-      let hit: 'tp' | 'sl' | null = null;
+      // Hard bracket first — the take-profit target and the initial hard stop
+      // are the position's contractual exits and take precedence over the
+      // discretionary give-back rules below.
+      let exitReason: ExitReason | null = null;
+      let exitPrice = price;
       if (pos.side === 'buy') {
-        if (price >= pos.takeProfit) hit = 'tp';
-        else if (price <= pos.stopLoss) hit = 'sl';
+        if (price >= pos.takeProfit) { exitReason = 'target'; exitPrice = pos.takeProfit; }
+        else if (price <= pos.stopLoss) { exitReason = 'stop'; exitPrice = pos.stopLoss; }
       } else {
-        if (price <= pos.takeProfit) hit = 'tp';
-        else if (price >= pos.stopLoss) hit = 'sl';
+        if (price <= pos.takeProfit) { exitReason = 'target'; exitPrice = pos.takeProfit; }
+        else if (price >= pos.stopLoss) { exitReason = 'stop'; exitPrice = pos.stopLoss; }
       }
 
-      if (hit) {
-        const exitPrice = hit === 'tp' ? pos.takeProfit : pos.stopLoss;
+      // TRA-1268 (TRA-1250 Rules 1-2) — when the exit-risk rules are enabled the
+      // caller passes a live ATR per symbol. Layer the ATR chandelier trail and
+      // the trade-level profit-lock on top of the hard bracket: whichever of
+      // {hard stop, chandelier, profit-lock} triggers first exits (the hard TP
+      // still wins outright — it's the good outcome). Both fire at the live
+      // price. Kept OFF unless `exitRisk` is supplied so demo behaviour is
+      // unchanged when the flag is dark.
+      if (exitReason !== 'target' && exitRisk) {
+        const atr = exitRisk.atrBySymbol.get(pos.symbol);
+        if (atr !== undefined && atr > 0) {
+          const st = this.exitRiskState.get(id) ?? { extremeSinceEntry: pos.entryPrice };
+          st.extremeSinceEntry = pos.side === 'buy'
+            ? Math.max(st.extremeSinceEntry, price)
+            : Math.min(st.extremeSinceEntry, price);
+          const atrPct = exitRisk.atrPctBySymbol?.get(pos.symbol);
+          // Rule 1 — ATR chandelier trail (ratchets against the initial hard stop).
+          const trail = chandelierStop({
+            side: pos.side,
+            initialStop: pos.stopLoss,
+            extremeSinceEntry: st.extremeSinceEntry,
+            atr,
+            atrPct,
+            prevTrailStop: st.prevTrailStop,
+          });
+          st.prevTrailStop = trail;
+          this.exitRiskState.set(id, st);
+          if (exitReason == null && chandelierExitTriggered(pos.side, price, trail)) {
+            exitReason = 'chandelier';
+            exitPrice = price;
+          } else if (exitReason == null) {
+            // Rule 2 — trade-level profit-lock give-back cap.
+            const lock = profitLockDecision({
+              side: pos.side,
+              entry: pos.entryPrice,
+              initialStop: pos.stopLoss,
+              peakPrice: st.extremeSinceEntry,
+              currentPrice: price,
+            });
+            if (lock.shouldExit) {
+              exitReason = 'profit_lock';
+              exitPrice = price;
+            }
+          }
+        }
+      }
+
+      if (exitReason) {
         const multiplier = pos.side === 'buy' ? 1 : -1;
         const pnl = (exitPrice - pos.entryPrice) * pos.quantity * multiplier;
         pos.pnl = pnl;
+        pos.exitPrice = exitPrice;
+        pos.exitReason = exitReason;
         pos.closedAt = Date.now();
         this.cash += exitPrice * pos.quantity;
         this.equity += pnl;
         this.dailyPnl += pnl;
         this.positions.delete(id);
+        this.exitRiskState.delete(id);
         closed.push({ ...pos });
       }
     }
@@ -306,6 +384,7 @@ export class PaperAccount {
     this.equity += pnl;
     this.dailyPnl += pnl;
     this.positions.delete(positionId);
+    this.exitRiskState.delete(positionId);
     return { ...pos };
   }
 
@@ -353,6 +432,7 @@ export class PaperAccount {
     this.initialEquity = snap.initialEquity;
     this.dailyPnl = snap.dailyPnl;
     this.positions.clear();
+    this.exitRiskState.clear();
     for (const p of snap.openPositions) {
       this.positions.set(p.id, p);
     }

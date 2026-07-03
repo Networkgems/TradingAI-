@@ -2856,3 +2856,97 @@ describe('PaperOptionsAccount.addToOptionPosition — conviction DCA scale-in (T
     expect(acct.addToOptionPosition(pos.id, 1, 0)).toBeNull();
   });
 });
+
+// TRA-1268 (TRA-1250 Rules 1-2) — the options exit loop runs the ATR chandelier
+// on the UNDERLYING (Rule 1) and the profit-lock give-back cap on premium-derived
+// R (Rule 2). Both fire ONLY when the caller supplies `OptionExitRiskInput`
+// (gated behind `EXIT_RISK_RULES_ENABLED`); absent → legacy behaviour unchanged.
+// demoSlippagePct/fee default to 0 here, so exits book at exactly the mark.
+describe('PaperOptionsAccount.checkExits — chandelier + profit-lock (TRA-1268)', () => {
+  // Open an OTM call: underlyingEntryPrice 200, premiumPaid 1.0, SL 0.80,
+  // TP1 1.50, 6 contracts. Marks are supplied per tick via `optionMarks`.
+  function openCall(): { acct: PaperOptionsAccount; sym: string } {
+    const acct = new PaperOptionsAccount({ initialEquity: 50_000, managedAccountRatio: 0.5 });
+    const pos = acct.openOptionFromCandidate(buildSignal({ mark: 1.0 }), 'demo', undefined, 200);
+    expect(pos).not.toBeNull();
+    return { acct, sym: pos!.optionSymbol! };
+  }
+
+  it('trails the underlying chandelier and exits the call when the trail breaks', () => {
+    const { acct, sym } = openCall();
+    // Underlying ATR 4 → trail width 3×4 = 12 below the running high.
+    const risk = { underlyingAtrBySymbol: new Map([['AAPL', 4]]) };
+    const marks = new Map([[sym, 1.0]]);
+
+    // Underlying rallies to 210 (mark flat 1.0): peakUnderlying 210, chandelier
+    // stop 198; underlying still above → no exit, but state is armed.
+    expect(acct.checkExits(new Map([['AAPL', 210]]), marks, 'demo', {}, undefined, risk)).toHaveLength(0);
+    const open = acct.getState().openOptions[0];
+    expect(open.peakUnderlying).toBe(210);
+    expect(open.chandelierStop).toBeCloseTo(198, 6);
+
+    // Underlying pulls back to 197 (< 198 trail) → chandelier exits at the mark
+    // (1.0), well ABOVE the 0.80 premium stop, proving it's the trail not the SL.
+    const closed = acct.checkExits(new Map([['AAPL', 197]]), marks, 'demo', {}, undefined, risk);
+    expect(closed).toHaveLength(1);
+    expect(closed[0].currentPremium).toBeCloseTo(1.0, 6);
+    expect(closed[0].pnl).toBeCloseTo(0, 6); // exited at basis — no premium loss
+    expect(acct.getState().openOptions).toHaveLength(0);
+  });
+
+  it('does NOT exit the call on the same underlying pullback when risk inputs are absent', () => {
+    const { acct, sym } = openCall();
+    const marks = new Map([[sym, 1.0]]);
+    // Same 210→197 underlying path, but no OptionExitRiskInput → mark 1.0 is
+    // above the 0.80 SL and trailing never armed, so the position stays open.
+    expect(acct.checkExits(new Map([['AAPL', 210]]), marks, 'demo')).toHaveLength(0);
+    expect(acct.checkExits(new Map([['AAPL', 197]]), marks, 'demo')).toHaveLength(0);
+    expect(acct.getState().openOptions).toHaveLength(1);
+  });
+
+  it('exits on the premium profit-lock give-back before the hard SL', () => {
+    const { acct, sym } = openCall();
+    // Empty ATR map → chandelier is skipped; isolate the premium profit-lock.
+    // R = premiumPaid − stopLossPremium = 1.0 − 0.80 = 0.20.
+    const risk = { underlyingAtrBySymbol: new Map<string, number>() };
+
+    // Mark runs to 1.45 = +2.25R peak (arms + tightens give-back to 0.5R). Below
+    // TP1 (1.50) so no partial fires.
+    expect(
+      acct.checkExits(new Map(), new Map([[sym, 1.45]]), 'demo', {}, undefined, risk),
+    ).toHaveLength(0);
+
+    // Mark retraces to 1.30 = +1.5R (past peakR−0.5R = 1.75R) → profit-lock exits
+    // at 1.30, locking a gain. The 0.80 hard SL is nowhere near.
+    const closed = acct.checkExits(new Map(), new Map([[sym, 1.30]]), 'demo', {}, undefined, risk);
+    expect(closed).toHaveLength(1);
+    expect(closed[0].currentPremium).toBeCloseTo(1.30, 6);
+    // Realized gain = (1.30 − 1.0) × 6 × 100 = +$180.
+    expect(closed[0].pnl).toBeCloseTo(180, 6);
+  });
+
+  it('mirrors the chandelier on a put (trails the lowest low, exits on rebound)', () => {
+    const acct = new PaperOptionsAccount({ initialEquity: 50_000, managedAccountRatio: 0.5 });
+    // Put: gains when the underlying falls, so the chandelier trails the trough.
+    const pos = acct.openOptionFromCandidate(
+      buildSignal({ mark: 1.0, optionType: 'put', optionSymbol: 'AAPL240705P00200000', strike: 200, delta: -0.18 }),
+      'demo', undefined, 200,
+    );
+    expect(pos).not.toBeNull();
+    const sym = pos!.optionSymbol!;
+    const risk = { underlyingAtrBySymbol: new Map([['AAPL', 4]]) };
+    const marks = new Map([[sym, 1.0]]);
+
+    // Underlying drops to 190: trough 190, chandelier stop 190+12 = 202; still
+    // below → no exit.
+    expect(acct.checkExits(new Map([['AAPL', 190]]), marks, 'demo', {}, undefined, risk)).toHaveLength(0);
+    const open = acct.getState().openOptions[0];
+    expect(open.peakUnderlying).toBe(190);
+    expect(open.chandelierStop).toBeCloseTo(202, 6);
+
+    // Underlying rebounds to 203 (≥ 202 trail) → chandelier exits the put.
+    const closed = acct.checkExits(new Map([['AAPL', 203]]), marks, 'demo', {}, undefined, risk);
+    expect(closed).toHaveLength(1);
+    expect(closed[0].currentPremium).toBeCloseTo(1.0, 6);
+  });
+});

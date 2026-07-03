@@ -198,3 +198,91 @@ describe('PaperAccount slippage instrumentation (TRA-536)', () => {
     expect(closed[0].modeledSlippage).toBeCloseTo(opened!.modeledSlippage!, 9);
   });
 });
+
+// TRA-1268 (TRA-1250 Rules 1-2) — the demo-equity exit loop layers an ATR
+// chandelier trail (Rule 1) and a trade-level profit-lock give-back cap
+// (Rule 2) on top of the hard bracket. Both fire ONLY when the caller supplies
+// the `EquityExitRiskInput` (gated behind `EXIT_RISK_RULES_ENABLED`), so the
+// legacy behaviour is unchanged when it is absent.
+describe('PaperAccount.checkExits — ATR chandelier + profit-lock (TRA-1268)', () => {
+  function seedLong(overrides: Partial<Position> = {}): { acc: PaperAccount; id: string } {
+    const acc = new PaperAccount({ initialEquity: 100_000 });
+    acc.importSnapshot({
+      cash: 100_000, equity: 100_000, initialEquity: 100_000, dailyPnl: 0,
+      openPositions: [{
+        id: 'p1', symbol: 'AAPL', side: 'buy', signalType: 'orb_breakout',
+        entryPrice: 100, quantity: 10, stopLoss: 90, takeProfit: 200,
+        openedAt: 1, mode: 'demo', ...overrides,
+      }],
+    });
+    return { acc, id: 'p1' };
+  }
+
+  it('ratchets the chandelier up on a rally and exits when the trail breaks (long)', () => {
+    const { acc } = seedLong();
+    // ATR 2 → trail width 3×2 = 6 below the running high.
+    const risk = { atrBySymbol: new Map([['AAPL', 2]]) };
+
+    // Rally to 120: trail ratchets to 120−6 = 114; still above → no exit.
+    expect(acc.checkExits(new Map([['AAPL', 120]]), risk)).toHaveLength(0);
+
+    // Pull back to 113 (< 114 trail) → chandelier fires at the live price.
+    const closed = acc.checkExits(new Map([['AAPL', 113]]), risk);
+    expect(closed).toHaveLength(1);
+    expect(closed[0].exitReason).toBe('chandelier');
+    expect(closed[0].exitPrice).toBe(113);
+    expect(closed[0].pnl).toBeCloseTo((113 - 100) * 10, 6);
+    expect(acc.getState().openPositions).toHaveLength(0);
+  });
+
+  it('exits on the trade-level profit-lock give-back before the hard stop (long)', () => {
+    // Wide ATR (3) keeps the chandelier trail well below the give-back level so
+    // the profit-lock is the rule that actually fires. R = entry−stop = 10.
+    const { acc } = seedLong({ stopLoss: 90, takeProfit: 500 });
+    const risk = { atrBySymbol: new Map([['AAPL', 3]]) };
+
+    // Run to +3R (price 130): armed, peakR 3.0, tightened give-back 0.5R.
+    expect(acc.checkExits(new Map([['AAPL', 130]]), risk)).toHaveLength(0);
+
+    // Retrace to +2.5R (price 125 = peakR−0.5R) → profit-lock exit; chandelier
+    // trail (130−9 = 121) has NOT been hit, proving it's the give-back cap.
+    const closed = acc.checkExits(new Map([['AAPL', 125]]), risk);
+    expect(closed).toHaveLength(1);
+    expect(closed[0].exitReason).toBe('profit_lock');
+    expect(closed[0].exitPrice).toBe(125);
+  });
+
+  it('mirrors the chandelier for a short (trail ratchets down, exit on rebound)', () => {
+    const { acc } = seedLong({ side: 'sell', entryPrice: 100, stopLoss: 110, takeProfit: 50 });
+    const risk = { atrBySymbol: new Map([['AAPL', 2]]) };
+
+    // Drop to 80: trail ratchets to 80+6 = 86; still below → no exit.
+    expect(acc.checkExits(new Map([['AAPL', 80]]), risk)).toHaveLength(0);
+
+    // Rebound to 87 (≥ 86 trail) → chandelier fires.
+    const closed = acc.checkExits(new Map([['AAPL', 87]]), risk);
+    expect(closed).toHaveLength(1);
+    expect(closed[0].exitReason).toBe('chandelier');
+    expect(closed[0].exitPrice).toBe(87);
+    // Short P&L = (87−100)×10×−1 = +130.
+    expect(closed[0].pnl).toBeCloseTo((87 - 100) * 10 * -1, 6);
+  });
+
+  it('is a no-op when the caller does not pass the exit-risk inputs (flag dark)', () => {
+    const { acc } = seedLong();
+    // Same rally + pullback that tripped the chandelier above — with no risk
+    // input the position stays open (price is between the hard stop and target).
+    expect(acc.checkExits(new Map([['AAPL', 120]]))).toHaveLength(0);
+    expect(acc.checkExits(new Map([['AAPL', 113]]))).toHaveLength(0);
+    expect(acc.getState().openPositions).toHaveLength(1);
+  });
+
+  it('still honours the hard take-profit ahead of the give-back rules', () => {
+    const { acc } = seedLong({ takeProfit: 118 });
+    const risk = { atrBySymbol: new Map([['AAPL', 2]]) };
+    const closed = acc.checkExits(new Map([['AAPL', 118]]), risk);
+    expect(closed).toHaveLength(1);
+    expect(closed[0].exitReason).toBe('target');
+    expect(closed[0].exitPrice).toBe(118);
+  });
+});

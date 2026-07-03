@@ -275,6 +275,8 @@ export type ExitReason =
   | 'trailing'
   | 'rsi_alt_exit'
   | 'tsmom_band_exit' // TRA-821: tsmom_majors long-or-flat exit when trailing L-day return crosses below -exitBandPct
+  | 'chandelier'  // TRA-1268: ATR chandelier trailing-stop ratchet exit (Rule 1)
+  | 'profit_lock' // TRA-1268: trade-level profit-lock give-back-cap exit (Rule 2)
   | 'invalid_bracket';
 
 export interface Position {
@@ -2236,6 +2238,22 @@ export interface OptionPosition {
   maxProfitUsd?: number;
   /** TRA-613 — payoff breakeven underlying price(s). */
   breakevens?: number[];
+  /**
+   * TRA-1268 (TRA-1250 Rule 1) — favorable extreme of the UNDERLYING since
+   * entry, used to drive the ATR chandelier trailing stop on the underlying
+   * (a call trails the highest high; a put trails the lowest low). Seeded from
+   * {@link underlyingEntryPrice} on first evaluation and ratcheted each tick.
+   * Only maintained when the exit-risk rules are enabled; absent ↔ legacy /
+   * rules-off snapshot.
+   */
+  peakUnderlying?: number;
+  /**
+   * TRA-1268 (TRA-1250 Rule 1) — last computed chandelier trail-stop level in
+   * UNDERLYING price space. Persisted as the `prevTrailStop` so the trail only
+   * ratchets in the favorable direction (never loosens) across ticks/restarts.
+   * Absent ↔ chandelier not yet armed / rules-off snapshot.
+   */
+  chandelierStop?: number;
 }
 
 /**

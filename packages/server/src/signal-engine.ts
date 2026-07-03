@@ -1,4 +1,4 @@
-import { OrbStrategy, BbFadeStrategy, IchimokuStrategy, SupertrendConfluenceStrategy, confluenceSide, supertrend, reversalChecklist, adx, atr, donchian, supportResistance, blackScholesDelta, daysToExpiration, bookGiveBackDecision, selectRvLongCandidate, selectShadowOptionSignal, emaPullbackTrigger, volumeConfirmedBreakout, TradierOptionsClient, TradierOrderClient, TRADIER_REJECTED_STATUSES, evaluateSma200, SMA200_MIN_BARS, SMA200_DEBOUNCE_BARS, composeTechnicalSnapshot, resampleCandles, TF_BUCKET_MS, OptionsRiskBreaker, DEFAULT_OPTIONS_BREAKER_PARAMS } from '@trading-app/engine';
+import { OrbStrategy, BbFadeStrategy, IchimokuStrategy, SupertrendConfluenceStrategy, confluenceSide, supertrend, reversalChecklist, adx, atr, atrPct, donchian, supportResistance, blackScholesDelta, daysToExpiration, bookGiveBackDecision, selectRvLongCandidate, selectShadowOptionSignal, emaPullbackTrigger, volumeConfirmedBreakout, TradierOptionsClient, TradierOrderClient, TRADIER_REJECTED_STATUSES, evaluateSma200, SMA200_MIN_BARS, SMA200_DEBOUNCE_BARS, composeTechnicalSnapshot, resampleCandles, TF_BUCKET_MS, OptionsRiskBreaker, DEFAULT_OPTIONS_BREAKER_PARAMS } from '@trading-app/engine';
 import type { StrategySelectorInput, ContractQuote, OptionTrend, RvLongTrendSide, ExitState, SharedTickIndicators, RelativeValueScannerOptions, OptionChainRow, IvRvScannerOptions, IvRvMispricingCandidate } from '@trading-app/engine';
 import type { TradierAccountBalance } from '@trading-app/engine';
 import { WATCHLIST, isLiquidSwingSymbol, checkEquitySwingClose, MANAGED_ACCOUNT_RATIO, MAX_CONSECUTIVE_LOSSES, DAILY_DRAWDOWN_HALT_PCT, BOOK_SESSION_STOP_R, BOOK_GIVEBACK_CAP_PCT, DEFAULT_RISK_PER_TRADE, OPTIONS_PER_TICKET_DOLLAR_FLOOR, OPTIONS_POSITION_CAP_RATIO, aliasWatchlistSymbol, isLiveTradierOptionsEnabled, isStockMarketOpen, perPositionCap, resolveAutoManageImportedTradierOptions, resolveDemoCostModel, resolveHoldLiveOptionsOvernight, resolveSwingHoldOptions, resolveLiveTradeEquitiesTradier, resolveManagedAccountRatio, resolveMarketReviewGatesEnabled, resolveRiskPerTrade, resolveRvDtePrefs, resolveTradierOptionsCreds, validateBracket, DEFAULT_RV_DTE_MIN, DEFAULT_RV_DTE_MAX, DEFAULT_RV_DTE_TARGET, scoreNewsSentiment, aggregateSymbolSentiment, aggregateFedSentiment, aggregateStockTwitsSentiment, dedupeStockTwitsMessages, mapCuratedMessagesBySymbol, nameAliasesFor, evaluateEquityDcaAdd, evaluateOptionDcaAdd, CONVICTION_DCA, blendedAverage, positionRiskDollars, minutesToSessionClose, getEasternUtcOffset, isAgentTradingWindowOpen } from '@trading-app/shared';
@@ -67,8 +67,8 @@ import type { Regime } from '@trading-app/engine';
 import { fetchMinuteBars, fetchDailyCandles, fetchTradierDailyCandles, fetchQuotes, fetchStocksNews, isYahooBreakerOpen, setActiveInterestSymbols, setTradierStocksFeedClient } from './yahoo-feed.js';
 import { fetchStockTwitsStream, fetchStockTwitsUserStream, getCuratedStockTwitsAccounts } from './stocktwits-feed.js';
 import { evaluateFeedFreshness } from './feed-freshness.js';
-import { PaperAccount } from './paper-account.js';
-import { PaperOptionsAccount, type OptionTradeJournalSetup } from './options-account.js';
+import { PaperAccount, type EquityExitRiskInput } from './paper-account.js';
+import { PaperOptionsAccount, type OptionTradeJournalSetup, type OptionExitRiskInput } from './options-account.js';
 import {
   PENDING_CLOSE_MAX_REPRICE_STEPS,
   PENDING_CLOSE_REPRICE_STALENESS_MS,
@@ -1222,6 +1222,55 @@ export class SignalEngine {
   private get shadowCandleCache(): Map<string, Candle[]> {
     return sharedShadowCandleCache;
   }
+
+  /**
+   * TRA-1268 (TRA-1250 Rules 1-2) — build the {@link EquityExitRiskInput} for
+   * the demo-equity exit loop: live ATR(14) + ATR% on the minute-bar cache,
+   * one entry per open symbol. Symbols without enough cached bars are omitted;
+   * the exit loop then falls back to the hard bracket for them. Only called
+   * when `EXIT_RISK_RULES_ENABLED` is on.
+   */
+  private buildEquityExitRisk(): EquityExitRiskInput | undefined {
+    const atrBySymbol = new Map<string, number>();
+    const atrPctBySymbol = new Map<string, number>();
+    for (const pos of this.account.getState().openPositions) {
+      if (atrBySymbol.has(pos.symbol)) continue;
+      const candles = this.candleCache.get(pos.symbol);
+      if (!candles || candles.length < 15) continue;
+      const a = atr(candles);
+      if (a == null || !(a > 0)) continue;
+      atrBySymbol.set(pos.symbol, a);
+      const ap = atrPct(candles);
+      if (ap != null && Number.isFinite(ap)) atrPctBySymbol.set(pos.symbol, ap);
+    }
+    if (atrBySymbol.size === 0) return undefined;
+    return { atrBySymbol, atrPctBySymbol };
+  }
+
+  /**
+   * TRA-1268 (TRA-1250 Rule 1) — build the {@link OptionExitRiskInput}: ATR(14)
+   * of the UNDERLYING on the 5m shadow-candle cache, one entry per open
+   * option's underlying. Underlyings without enough cached bars are omitted.
+   * Multi-leg combos are skipped (they're held to expiry/manual close). Only
+   * called when `EXIT_RISK_RULES_ENABLED` is on.
+   */
+  private buildOptionExitRisk(): OptionExitRiskInput | undefined {
+    const underlyingAtrBySymbol = new Map<string, number>();
+    const underlyingAtrPctBySymbol = new Map<string, number>();
+    for (const opt of this.optionsAccount.getState().openOptions) {
+      if (opt.legs && opt.legs.length > 1) continue;
+      if (underlyingAtrBySymbol.has(opt.symbol)) continue;
+      const series = this.shadowCandleCache.get(opt.symbol);
+      if (!series || series.length < 15) continue;
+      const a = atr(series);
+      if (a == null || !(a > 0)) continue;
+      underlyingAtrBySymbol.set(opt.symbol, a);
+      const ap = atrPct(series);
+      if (ap != null && Number.isFinite(ap)) underlyingAtrPctBySymbol.set(opt.symbol, ap);
+    }
+    if (underlyingAtrBySymbol.size === 0) return undefined;
+    return { underlyingAtrBySymbol, underlyingAtrPctBySymbol };
+  }
   /** TRA-787 — last successful shadow 5m-series refresh (gates the 60s cadence). */
   private lastSupertrendShadowRefreshAt = 0;
   /**
@@ -2181,7 +2230,13 @@ export class SignalEngine {
     //     configured.
 
     if (this.mode === 'demo') {
-      const closed = this.account.checkExits(prices);
+      // TRA-1268 (TRA-1250 Rules 1-2) — feed the demo-equity exit loop live
+      // ATR(14) per open symbol so it can run the ATR chandelier trail +
+      // profit-lock. Dark unless `EXIT_RISK_RULES_ENABLED` is on.
+      const equityExitRisk = isExitRiskRulesEnabled()
+        ? this.buildEquityExitRisk()
+        : undefined;
+      const closed = this.account.checkExits(prices, equityExitRisk);
       if (closed.length > 0) {
         this.allClosedPositions.push(...closed);
         const accountState = this.account.getState();
@@ -2366,6 +2421,12 @@ export class SignalEngine {
       }
     }
 
+    // TRA-1268 (TRA-1250 Rules 1-2) — underlying ATR(14) on 5m bars for the
+    // options ATR chandelier trail + premium-R profit-lock. Dark unless
+    // `EXIT_RISK_RULES_ENABLED` is on.
+    const optionExitRisk = isExitRiskRulesEnabled()
+      ? this.buildOptionExitRisk()
+      : undefined;
     const optionsExitsActive = this.mode === 'demo' || isStockMarketOpen();
     const optsClosed = optionsExitsActive
       ? this.optionsAccount.checkExits(
@@ -2374,6 +2435,7 @@ export class SignalEngine {
           this.mode,
           { waitAndHold: liveOptionsMirroring },
           rvStructuralExitStates,
+          optionExitRisk,
         )
       : [];
     if (liveOptionsMirroring && optsClosed.length > 0) {

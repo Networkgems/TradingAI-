@@ -1,6 +1,7 @@
 import { randomUUID } from 'crypto';
 import type { TradierOpenOptionPosition, ExitState } from '@trading-app/engine';
-import { evaluateMultiLegPreTrade, DEFAULT_MAX_LOSS_PCT_CAP, evaluateExit, DEFAULT_EXIT_PARAMS } from '@trading-app/engine';
+import { evaluateMultiLegPreTrade, DEFAULT_MAX_LOSS_PCT_CAP, evaluateExit, DEFAULT_EXIT_PARAMS, chandelierStop, chandelierExitTriggered, profitLockDecision } from '@trading-app/engine';
+import type { Side } from '@trading-app/engine';
 import type {
   AccountMode,
   TradeSignal,
@@ -144,6 +145,23 @@ const r2 = (v: number): number => Math.round(v * 100) / 100;
  * of grace for a transient chain-fetch blip before the backstop engages.
  */
 const STALE_MARK_BACKSTOP_TICKS = 3;
+
+/**
+ * TRA-1268 (TRA-1250 Rules 1-2) — per-tick inputs the options exit loop needs
+ * to evaluate the ATR chandelier trail on the UNDERLYING (Rule 1) and the
+ * trade-level profit-lock on premium-derived R (Rule 2). The caller
+ * (signal-engine) computes the underlying's ATR(14) on 5m bars per symbol and
+ * only supplies this object when `EXIT_RISK_RULES_ENABLED` is on, so the rules
+ * ship dark and `checkExits` behaviour is unchanged when it is absent. Because
+ * the options path already stages a live Tradier `sell_to_close` under
+ * wait-and-hold, wiring the rules here covers demo AND live automatically.
+ */
+export interface OptionExitRiskInput {
+  /** ATR(14) of the UNDERLYING on 5m bars, keyed by underlying symbol. */
+  underlyingAtrBySymbol: Map<string, number>;
+  /** Underlying ATR / price by symbol — picks the high-beta multiplier. Optional. */
+  underlyingAtrPctBySymbol?: Map<string, number>;
+}
 
 /**
  * TRA-450 — circuit breaker for the engine's auto-close retry loop. Each tick
@@ -1813,6 +1831,16 @@ export class PaperOptionsAccount {
      * produce no trigger. Absent → legacy behaviour unchanged.
      */
     structuralExitStates?: Map<string, ExitState>,
+    /**
+     * TRA-1268 (TRA-1250 Rules 1-2) — underlying ATR inputs for the ATR
+     * chandelier trail + trade-level profit-lock. Present ⇔ the board flipped
+     * `EXIT_RISK_RULES_ENABLED`; absent → legacy behaviour unchanged. Fires
+     * AFTER the PDT overnight-hold (~L1949) and RV swing-hold (~L1982)
+     * suppressions (they `continue` above this) and BEFORE the hard premium
+     * stop / trailing backstop, so a give-back or thesis-break exits at the
+     * live mark before the hard stop is reached.
+     */
+    exitRisk?: OptionExitRiskInput,
   ): OptionPosition[] {
     const closed: OptionPosition[] = [];
     const waitAndHold = options.waitAndHold === true;
@@ -1912,6 +1940,38 @@ export class PaperOptionsAccount {
       opt.currentPremium = mark;
 
       if (mark > opt.peakPremium) opt.peakPremium = mark;
+
+      // TRA-1268 (TRA-1250 Rule 1) — maintain the underlying-space chandelier
+      // trail every tick (even while a PDT / swing-hold suppression would defer
+      // the exit below), mirroring how the premium peak/trailing state above
+      // keeps tracking during a hold. The favorable direction on the UNDERLYING
+      // is long for a call (trail the highest high) and short for a put (trail
+      // the lowest low); the initial stop is left open (±∞) because the option's
+      // hard stop lives in premium space (`stopLossPremium`, evaluated below) —
+      // the chandelier here is a pure trailing exit on the underlying thesis.
+      // The trigger itself fires in the exit-decision block below so the
+      // suppressions still gate it.
+      let chandelierUSide: Side | null = null;
+      let chandelierUnderlying: number | undefined;
+      if (exitRisk && !opt.legs) {
+        const uatr = exitRisk.underlyingAtrBySymbol.get(opt.symbol);
+        chandelierUnderlying = underlyingPrices.get(opt.symbol);
+        if (chandelierUnderlying != null && uatr !== undefined && uatr > 0) {
+          chandelierUSide = opt.optionType === 'call' ? 'buy' : 'sell';
+          if (opt.peakUnderlying === undefined) opt.peakUnderlying = opt.underlyingEntryPrice;
+          opt.peakUnderlying = chandelierUSide === 'buy'
+            ? Math.max(opt.peakUnderlying, chandelierUnderlying)
+            : Math.min(opt.peakUnderlying, chandelierUnderlying);
+          opt.chandelierStop = chandelierStop({
+            side: chandelierUSide,
+            initialStop: chandelierUSide === 'buy' ? Number.NEGATIVE_INFINITY : Number.POSITIVE_INFINITY,
+            extremeSinceEntry: opt.peakUnderlying,
+            atr: uatr,
+            atrPct: exitRisk.underlyingAtrPctBySymbol?.get(opt.symbol),
+            prevTrailStop: opt.chandelierStop,
+          });
+        }
+      }
 
       // Activate trailing once position reaches the per-strategy threshold.
       if (!opt.trailingActive && mark >= opt.premiumPaid * (1 + trailActivatePct)) {
@@ -2098,16 +2158,58 @@ export class PaperOptionsAccount {
         }
       }
 
-      // Determine full exit: hard SL or trailing stop breach
+      // Determine full exit: hard SL, trailing stop, or (TRA-1268) an ATR
+      // chandelier / profit-lock give-back exit. `exitJournalReason` carries the
+      // TRUE reason onto the journal row while `exitKind` stays a broker-valid
+      // pendingExit kind (the Tradier order pricing / deep-underwater escalation
+      // only cares about sl vs trail).
       let exitPremium: number | null = null;
       let exitKind: 'sl' | 'trail' | null = null;
+      let exitJournalReason: string | null = null;
 
-      if (mark <= opt.stopLossPremium) {
-        exitPremium = opt.stopLossPremium;
-        exitKind = 'sl';
-      } else if (opt.trailingActive && mark <= opt.trailingStopPremium) {
-        exitPremium = opt.trailingStopPremium;
-        exitKind = 'trail';
+      // TRA-1268 (TRA-1250 Rules 1-2) — evaluate the give-back rules first so a
+      // ratchet-trail break or a profit give-back exits at the live mark BEFORE
+      // the hard premium stop is reached. Both close the full remaining position
+      // at the current mark; the underlying-space chandelier state was already
+      // ratcheted above.
+      if (exitRisk && !opt.legs) {
+        if (
+          chandelierUSide !== null
+          && chandelierUnderlying != null
+          && opt.chandelierStop !== undefined
+          && chandelierExitTriggered(chandelierUSide, chandelierUnderlying, opt.chandelierStop)
+        ) {
+          exitPremium = mark;
+          exitKind = 'trail';
+          exitJournalReason = 'chandelier';
+        } else {
+          // Rule 2 — trade-level profit-lock on premium-derived R (we are always
+          // LONG the premium, so entry = premiumPaid, stop = stopLossPremium).
+          const lock = profitLockDecision({
+            side: 'buy',
+            entry: opt.premiumPaid,
+            initialStop: opt.stopLossPremium,
+            peakPrice: opt.peakPremium,
+            currentPrice: mark,
+          });
+          if (lock.shouldExit) {
+            exitPremium = mark;
+            exitKind = 'trail';
+            exitJournalReason = 'profit_lock';
+          }
+        }
+      }
+
+      if (exitPremium === null) {
+        if (mark <= opt.stopLossPremium) {
+          exitPremium = opt.stopLossPremium;
+          exitKind = 'sl';
+          exitJournalReason = 'sl';
+        } else if (opt.trailingActive && mark <= opt.trailingStopPremium) {
+          exitPremium = opt.trailingStopPremium;
+          exitKind = 'trail';
+          exitJournalReason = 'trail';
+        }
       }
 
       if (exitPremium !== null && exitKind !== null) {
@@ -2167,7 +2269,9 @@ export class PaperOptionsAccount {
         this.openOptions.delete(id);
         this.closedOptions.push({ ...opt });
         // TRA-991 — fold the realized outcome onto this trade's journal row.
-        this.queueJournalClose(opt, exitKind);
+        // TRA-1268 — journal the TRUE reason (chandelier / profit_lock) rather
+        // than the broker-facing `exitKind` when a give-back rule fired.
+        this.queueJournalClose(opt, exitJournalReason ?? exitKind);
         closed.push({ ...opt });
       }
     }
