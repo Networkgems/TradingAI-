@@ -33,6 +33,8 @@ import { isCryptoRegimeEnabled } from '../crypto-regime-flag.js';
 import { summarizeCryptoRegimeScans } from '../crypto-regime-scanner.js';
 import { isRegimeTsmomEnabled } from '../crypto-regime-tsmom-flag.js';
 import { summarizeRegimeTsmomScans } from '../crypto-regime-tsmom-scanner.js';
+import { isCryptoIgnitionEnabled, resolveIgnitionWatchlist } from '../crypto-ignition-flag.js';
+import { summarizeIgnitionScans } from '../crypto-ignition-scanner.js';
 import { optionsIdeasAutoExecuteHealth } from '../options-ideas-auto-execute.js';
 import {
   listOptionTradeJournal,
@@ -860,6 +862,26 @@ export function registerLiveHealthRoutes(app: Express, deps: LiveHealthDeps): vo
       build: resolveBuildInfo(),
       enabled: isRegimeTsmomEnabled(),
       ...summarizeRegimeTsmomScans(now()),
+    });
+  });
+
+  // TRA-1271 — unauthenticated, secrets-free crypto ignition readout (parity with
+  // /crypto-regime-tsmom). Process-global, OBSERVE-ONLY, ZERO capital: carries no
+  // balances/PII — just watchlist size, open/resolved forward-record counts, per-arm
+  // net-of-fee expectancy R (maker vs taker), hit%, and the ★ would-a-limit-fill
+  // rate that confirms-or-kills the maker-fill edge. `enabled` mirrors
+  // ENABLE_CRYPTO_IGNITION_SCANNER so the board sees at a glance whether capture is
+  // armed; when off the store is empty ⇒ fail-closed `enabled:false`. Always
+  // read-only: NO order is ever placed off these signals (graduation is a separate,
+  // board-visible decision — taker-cost CI must clear 0 first).
+  app.get('/api/health/crypto-ignition', (_req, res) => {
+    const enabled = isCryptoIgnitionEnabled();
+    res.json({
+      ok: true,
+      time: new Date(now()).toISOString(),
+      build: resolveBuildInfo(),
+      enabled,
+      ...summarizeIgnitionScans(now(), enabled ? resolveIgnitionWatchlist().length : 0),
     });
   });
 

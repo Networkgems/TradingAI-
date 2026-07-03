@@ -89,6 +89,19 @@ import {
   hydrateRegimeTsmomFromDisk,
   type RegimeTsmomState,
 } from './crypto-regime-tsmom-scanner.js';
+// TRA-1271 — observe-only crypto ignition scanner (strict RVOL>=6 Donchian
+// breakout + squeeze + EMA50 trend, bull-only). Flag-checked before any 4H fetch so
+// ENABLE_CRYPTO_IGNITION_SCANNER off => zero cost/IO. Read-only, ZERO capital:
+// emits would-be forward records + the would-a-limit-fill instrument only, no order path.
+import {
+  isCryptoIgnitionEnabled,
+  resolveIgnitionConfig,
+  resolveIgnitionWatchlist,
+} from './crypto-ignition-flag.js';
+import {
+  observeIgnition,
+  hydrateIgnitionFromDisk,
+} from './crypto-ignition-scanner.js';
 import { fetchCrypto4hBars } from './crypto-feed.js';
 import type { CryptoSignalEngine } from './crypto-engine.js';
 // TRA-1006 — automated pre/post-market analyst agent. Tick fns are flag-checked
@@ -1981,6 +1994,60 @@ async function runHourlyCryptoRegimeTsmom(): Promise<void> {
         roundTrips: result.results.filter((r) => r.roundTrip).length,
       });
     }
+  }
+}
+
+// TRA-1271 — hydrate the ignition forward-capture accrual on boot so a
+// restart/redeploy inside the multi-week taker-CI window doesn't reset the
+// resolved-record count to 0. Rebuilds the in-memory resolved list from the JSONL
+// close-lines, restores the turnover anchor/totals, and re-seeds the open fires +
+// dedupe maps. Best-effort (a missing/corrupt file yields an empty hydration).
+// Runs even when the flag is off — reading two small files at boot is cheap and
+// keeps the accrual intact if the flag is later toggled on.
+{
+  const h = hydrateIgnitionFromDisk(DATA_DIR);
+  if (h.totalResolved > 0 || h.openRecords > 0) {
+    log.info('crypto ignition accrual hydrated (TRA-1271)', {
+      resolvedLoaded: h.resolvedLoaded,
+      totalResolved: h.totalResolved,
+      openRecords: h.openRecords,
+    });
+  }
+}
+
+// TRA-1271 — observe-only crypto ignition pass, fired off the SAME hourly hook as
+// the funding-carry / regime-overlay / regime-TSMOM passes above. When
+// ENABLE_CRYPTO_IGNITION_SCANNER is OFF it returns before ANY fetch => provably
+// zero cost/IO. When ON it pulls CLOSED 4H bars for each watchlist name, drops the
+// forming bar (no lookahead), classifies the regime off the SAME closed series,
+// resolves any open fire forward (pessimistic TP/stop/timeout), then evaluates a
+// fresh fire on the last bar, recording the would-be forward records + the
+// would-a-limit-fill flag into the store backing GET /api/health/crypto-ignition
+// and persisting them to the JSONL/snapshot under DATA_DIR. Read-only, ZERO
+// capital: NO order/entry/sizing path (invariant #1). 4H bars roll every 4h so the
+// hourly cadence + the lastBarTime dedupe scan a symbol at most once per new bar.
+async function runHourlyCryptoIgnition(): Promise<void> {
+  if (!isCryptoIgnitionEnabled()) return; // fast-path: skip resolving deps when off
+  const result = await observeIgnition({
+    enabled: true,
+    watchlist: resolveIgnitionWatchlist(),
+    regimeCfg: resolveCryptoRegimeConfig(),
+    cfg: resolveIgnitionConfig(),
+    fetch4h: (symbol) => fetchCrypto4hBars(symbol, 260),
+    dataDir: DATA_DIR,
+    onError: (symbol, err) =>
+      log.warn('crypto ignition 4H fetch failed (TRA-1271)', {
+        symbol,
+        reason: err instanceof Error ? err.message : String(err),
+      }),
+  });
+  if (result.opened.length > 0 || result.resolved.length > 0) {
+    log.info('crypto ignition observe pass (TRA-1271)', {
+      fetched: result.fetched,
+      scanned: result.scanned,
+      opened: result.opened.length,
+      resolved: result.resolved.length,
+    });
   }
 }
 
@@ -7116,6 +7183,9 @@ scheduler.start({
     // TRA-1221 — observe-only regime-gated TSMOM scan over the same regime label
     // (flag-gated ⇒ zero cost/IO when off). Read-only: would-be signals only.
     await runHourlyCryptoRegimeTsmom();
+    // TRA-1271 — observe-only crypto ignition scan (flag-gated ⇒ zero cost/IO when
+    // off). Read-only, ZERO capital: would-be forward records + fill instrument only.
+    await runHourlyCryptoIgnition();
   },
   // TRA-849 — 8:30 AM ET pre-market morning brief. Renders the macro gate +
   // each user's watchlist setups, open book, and overnight news, then pushes

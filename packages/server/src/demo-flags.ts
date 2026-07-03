@@ -44,6 +44,12 @@ export const DEMO_FLAG_ALLOWLIST = [
   // override so a non-admin operator can arm the forward capture on the self-hosted
   // host.
   'ENABLE_CRYPTO_REGIME_TSMOM',
+  // TRA-1271 - observe-only crypto ignition scanner (strict RVOL>=6 breakout).
+  // Non-secret, read-only, ZERO capital / no order path - emits would-be forward
+  // records + the would-a-limit-fill instrument only. Safe for the file override
+  // so a non-admin operator can arm the demo forward capture on the self-hosted
+  // host (this is how we activate demo capture - no PM2/admin).
+  'ENABLE_CRYPTO_IGNITION_SCANNER',
 ] as const;
 
 export const DEMO_FLAGS_FILENAME = 'demo-flags.json';
