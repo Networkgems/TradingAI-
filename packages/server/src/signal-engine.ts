@@ -51,6 +51,7 @@ import { isOptionShadowEnabled, isOptionPhaseBEnabled, emitShadowOptionSignal, s
 import { isOptionExecEnabled, isOptionEmaPullbackEnabled, isOptionVolumeBreakoutEnabled, resolveRvLongDteOverride, resolveRvMinDailyVolume, isOptionDemoDirectionalEnabled, isOptionIvRvScannerEnabled, isOptionIvRvRoutingEnabled, resolveIvRvRoutingOverride } from './option-exec-flag.js';
 import { scanIvRvFromSnapshot, recordIvRvScan } from './iv-rv-scanner.js';
 import { isExitRiskRulesEnabled, isLiveEquityStopModifyEnabled } from './exit-risk-rules-flag.js';
+import { recordConvictionDcaFill } from './conviction-dca-ledger.js';
 import { etDateString } from './scheduler.js';
 // TRA-995 (epic-C, self-regulation) — the standing risk autopilot. A pure
 // tighten-only decision module; the governor below is its mutation boundary and
@@ -5831,6 +5832,16 @@ export class SignalEngine {
         realizedRiskDollars: Number(realizedRisk.toFixed(2)), riskBudget: Number(R.toFixed(2)),
         withinBudget: realizedRisk <= R + 1e-6, reason: verdict.reason,
       });
+      // TRA-1278 — durable write-through of the SAME per-fill R evidence so the
+      // TRA-971 gate can pull it across restarts (observe-only; nothing above changes).
+      recordConvictionDcaFill({
+        ts: now, mode: this.mode, assetClass: 'equity',
+        symbol: pos.symbol, positionId: pos.id, action: verdict.action,
+        addQty: verdict.qty, addPrice: price,
+        blendedAvg: Number(blended.toFixed(4)), stop: updated.stopLoss, totalQty: updated.quantity,
+        realizedRiskDollars: Number(realizedRisk.toFixed(2)), riskBudget: Number(R.toFixed(2)),
+        withinBudget: realizedRisk <= R + 1e-6, reason: verdict.reason,
+      });
     }
   }
 
@@ -5958,6 +5969,18 @@ export class SignalEngine {
         addContracts: verdict.qty, addDebitPerContract,
         dte, addDelta: Number(addDelta.toFixed(4)), totalContracts: updated.contracts,
         premiumAtRiskDollars: Number(premiumAtRisk.toFixed(2)), riskBudget: Number(R.toFixed(2)),
+        withinBudget: premiumAtRisk <= R + 1e-6, reason: verdict.reason,
+      });
+      // TRA-1278 — durable write-through (options). Defined-risk premium IS the
+      // dollar risk, so realizedRiskDollars = Σ premium and there is no stop; the
+      // blended basis is the per-contract premium. Observe-only.
+      recordConvictionDcaFill({
+        ts: now, mode: this.mode, assetClass: 'option',
+        symbol: o.symbol, positionId: o.id, action: verdict.action,
+        addQty: verdict.qty, addPrice: Number(addDebitPerContract.toFixed(2)),
+        blendedAvg: updated.contracts > 0 ? Number((premiumAtRisk / updated.contracts).toFixed(2)) : 0,
+        stop: null, totalQty: updated.contracts,
+        realizedRiskDollars: Number(premiumAtRisk.toFixed(2)), riskBudget: Number(R.toFixed(2)),
         withinBudget: premiumAtRisk <= R + 1e-6, reason: verdict.reason,
       });
     }

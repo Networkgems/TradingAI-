@@ -35,6 +35,8 @@ import { isRegimeTsmomEnabled } from '../crypto-regime-tsmom-flag.js';
 import { summarizeRegimeTsmomScans } from '../crypto-regime-tsmom-scanner.js';
 import { isCryptoIgnitionEnabled, resolveIgnitionWatchlist } from '../crypto-ignition-flag.js';
 import { summarizeIgnitionScans } from '../crypto-ignition-scanner.js';
+import { summarizeConvictionDca, resolveConvictionDcaDeployAnchor } from '../conviction-dca-ledger.js';
+import { CONVICTION_DCA } from '@trading-app/shared';
 import { optionsIdeasAutoExecuteHealth } from '../options-ideas-auto-execute.js';
 import {
   listOptionTradeJournal,
@@ -882,6 +884,26 @@ export function registerLiveHealthRoutes(app: Express, deps: LiveHealthDeps): vo
       build: resolveBuildInfo(),
       enabled,
       ...summarizeIgnitionScans(now(), enabled ? resolveIgnitionWatchlist().length : 0),
+    });
+  });
+
+  // TRA-1278 — unauthenticated, secrets-free conviction-DCA add-ledger readout
+  // (parity with /demo-book-public + /crypto-ignition). This is the durable data
+  // source the TRA-971 weekly forward-evidence gate (TRA-1276) pulls: it exposes
+  // the demo/paper scale-in add fills accrued since the a255c2d deploy anchor —
+  // addCount, the R-cap breachCount (fills where realizedRiskDollars > R + ε),
+  // lastAddAt, and a small recent-fills tail — all rebuilt from the JSONL under
+  // DATA_DIR on boot so the counts survive the ~daily demo-host restart instead of
+  // reading a structural 0. `enabled` mirrors CONVICTION_DCA.enabled. Carries no
+  // balances/PII beyond symbol + per-fill R math. Always read-only: pure accounting,
+  // NO entry/exit/scale-in path is touched.
+  app.get('/api/health/conviction-dca', (_req, res) => {
+    res.json({
+      ok: true,
+      time: new Date(now()).toISOString(),
+      build: resolveBuildInfo(),
+      enabled: CONVICTION_DCA.enabled,
+      ...summarizeConvictionDca(resolveConvictionDcaDeployAnchor()),
     });
   });
 

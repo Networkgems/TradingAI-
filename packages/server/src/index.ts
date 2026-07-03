@@ -102,6 +102,7 @@ import {
   observeIgnition,
   hydrateIgnitionFromDisk,
 } from './crypto-ignition-scanner.js';
+import { hydrateConvictionDcaFromDisk } from './conviction-dca-ledger.js';
 import { fetchCrypto4hBars } from './crypto-feed.js';
 import type { CryptoSignalEngine } from './crypto-engine.js';
 // TRA-1006 — automated pre/post-market analyst agent. Tick fns are flag-checked
@@ -2011,6 +2012,22 @@ async function runHourlyCryptoRegimeTsmom(): Promise<void> {
       resolvedLoaded: h.resolvedLoaded,
       totalResolved: h.totalResolved,
       openRecords: h.openRecords,
+    });
+  }
+}
+
+// TRA-1278 — hydrate the conviction-DCA add ledger on boot and remember DATA_DIR
+// for subsequent appends, so the TRA-971 forward-evidence gate's addCount/breachCount
+// survive the ~daily demo-host restart instead of resetting to a structural 0.
+// Best-effort (a missing/corrupt file yields an empty hydration); runs regardless
+// of CONVICTION_DCA.enabled — reading one small file at boot is cheap.
+{
+  const h = hydrateConvictionDcaFromDisk(DATA_DIR);
+  if (h.addCount > 0) {
+    log.info('conviction-DCA add ledger hydrated (TRA-1278)', {
+      addCount: h.addCount,
+      breachCount: h.breachCount,
+      lastAddAt: h.lastAddAt,
     });
   }
 }
