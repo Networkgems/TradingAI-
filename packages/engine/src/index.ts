@@ -99,6 +99,22 @@ export type {
   CellExpectancy,
 } from './vol-kelly-sizer.js';
 export { PositionManager } from './positions.js';
+export {
+  chandelierMultiplier,
+  chandelierStop,
+  chandelierExitTriggered,
+  profitLockDecision,
+  bookGiveBackDecision,
+} from './exit-rules.js';
+export type {
+  Side,
+  ChandelierParams,
+  ProfitLockParams,
+  ProfitLockDecision,
+  BookGiveBackParams,
+  BookHaltReason,
+  BookGiveBackDecision,
+} from './exit-rules.js';
 export { AlpacaFeed } from './feed/index.js';
 export type { AlpacaFeedEvents } from './feed/index.js';
 export { CoinbaseFeed } from './feed/index.js';

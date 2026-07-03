@@ -1835,6 +1835,31 @@ export const MAX_CONSECUTIVE_LOSSES = 3;     // halt new entries after 3 consecu
 export const DAILY_DRAWDOWN_HALT_PCT = 0.08; // halt if daily P&L < −8% of managed equity
 
 /**
+ * TRA-1250 — exit-side loss-control rule parameters (board-approved via
+ * TRA-1249 analysis, request_confirmation `d7175f7e`, 2026-07-02).
+ *
+ * Phase-1 is EXIT-side only: an ATR chandelier trail + a per-trade profit-lock
+ * (give-back cap) + a book-level daily give-back cap. These are the numeric
+ * thresholds; the pure decision logic lives in `@trading-app/engine`
+ * (`exit-rules.ts`) and is wired into the exit/entry paths behind a flag so it
+ * can ship dark and be tuned/reverted. Backtest justification (41 large-caps,
+ * ~2020–2026): rules 1+2 cut give-back trades 15.9% → 4.6%; rule 3 floors the
+ * "+$1,599 → +$483" tail near +$960.
+ */
+// Rule 1 — ATR chandelier trailing stop
+export const EXIT_CHANDELIER_ATR_MULT = 3.0;          // default trail width = 3.0 × ATR14 from the running extreme
+export const EXIT_CHANDELIER_ATR_MULT_HIGHBETA = 3.5; // widen for high-beta names to avoid noise stop-outs
+export const EXIT_CHANDELIER_HIGHBETA_ATRPCT = 0.05;  // ATR/price above ~5% ⇒ treat as high-beta
+// Rule 2 — trade-level profit-lock (give-back cap per position)
+export const PROFIT_LOCK_ARM_R = 1.0;                 // arm once peak favorable excursion ≥ 1.0R
+export const PROFIT_LOCK_GIVEBACK_R = 1.0;            // exit if open R retraces 1.0R from peak
+export const PROFIT_LOCK_TIGHTEN_PEAK_R = 2.0;        // once peakR ≥ 2.0R …
+export const PROFIT_LOCK_TIGHTEN_GIVEBACK_R = 0.5;    // … tighten the give-back to 0.5R (lock more of a big winner)
+// Rule 3 — book-level daily give-back cap (the board's headline ask)
+export const BOOK_GIVEBACK_CAP_PCT = 0.40;            // flatten + halt after surrendering >40% of the day's peak open gain
+export const BOOK_SESSION_STOP_R = 0.5;               // hard session stop if net-negative after being up > +0.5R of book equity
+
+/**
  * TRA-526 — deterministic per-trade risk ceiling ("the math disposes" layer).
  *
  * The per-(mode×market) `riskPerTrade` knobs are operator-tunable and the route
