@@ -300,6 +300,25 @@ services:
       # value (flip the flag off). Accepts the usual truthy spellings (1/true/yes/on).
       - key: ENABLE_COLD_START_DAILY_PREFETCH
         value: "true"
+      # TRA-1271 (parent TRA-1266 → TRA-1210) — turn ON the OBSERVE-ONLY CRYPTO
+      # IGNITION SCANNER so the demo book accrues the forward sample that
+      # confirms-or-kills the strict RVOL≥6 breakout edge. Same shape as the other
+      # observe-only demo flags above (shadow selector / reversal shadow / journal):
+      # until this is set, `isCryptoIgnitionEnabled()` is false, the hourly pass
+      # returns before ANY 4H candle fetch (zero cost/IO), and
+      # `/api/health/crypto-ignition` reports `enabled:false`. When set, each hour it
+      # pulls CLOSED 4H bars for the TRA-1217 42-name universe, classifies the regime,
+      # records would-be ignition fires + their forward TP/stop/timeout resolution
+      # (net-R for maker vs taker) and the ★ would-a-limit-fill flag into
+      # `/api/health/crypto-ignition` + a JSONL forward log under DATA_DIR.
+      #
+      # SAFETY — OBSERVE-ONLY, ZERO CAPITAL, NO ORDER/SIZING/ACCOUNT PATH anywhere
+      # off this flag (it is a capture harness, not a trading path). Graduation to
+      # live sizing is a separate board-visible decision (taker-cost CI must clear 0
+      # first — currently straddles it, P≈0.81). Revert = clear this value. Accepts
+      # the usual truthy spellings (1/true/yes/on).
+      - key: ENABLE_CRYPTO_IGNITION_SCANNER
+        value: "true"
       # TRA-1080 — event-loop/heap starvation watchdog. The watchdog itself is
       # ON by default in code (no env needed); these knobs are declared
       # `sync: false` so an operator can DISABLE or RETUNE it from the dashboard
