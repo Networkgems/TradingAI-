@@ -48,8 +48,9 @@ import {
   optionJournalToStrategyRows,
 } from './strategy-introspection.js';
 import { isOptionShadowEnabled, isOptionPhaseBEnabled, emitShadowOptionSignal, shadowSignalToSpreadParams, OPTION_SHADOW_EMERGENCY_OFF, DEMO_SPREAD_MAX_LOSS_PCT_CAP } from './option-shadow-ledger.js';
-import { isOptionExecEnabled, isOptionEmaPullbackEnabled, isOptionVolumeBreakoutEnabled, resolveRvLongDteOverride, resolveRvMinDailyVolume, isOptionDemoDirectionalEnabled, isOptionIvRvScannerEnabled, isOptionIvRvRoutingEnabled, resolveIvRvRoutingOverride } from './option-exec-flag.js';
+import { isOptionExecEnabled, isOptionEmaPullbackEnabled, isOptionVolumeBreakoutEnabled, resolveRvLongDteOverride, resolveRvMinDailyVolume, isOptionDemoDirectionalEnabled, isOptionIvRvScannerEnabled, isOptionIvRvRoutingEnabled, resolveIvRvRoutingOverride, isOptionShortPremiumScannerEnabled } from './option-exec-flag.js';
 import { scanIvRvFromSnapshot, recordIvRvScan } from './iv-rv-scanner.js';
+import { scanShortPremiumFromSnapshot, recordShortPremiumScan } from './short-premium-scanner.js';
 import { isExitRiskRulesEnabled, isLiveEquityStopModifyEnabled, isTakeProfitEarlyEnabled } from './exit-risk-rules-flag.js';
 import { recordConvictionDcaFill } from './conviction-dca-ledger.js';
 import { etDateString } from './scheduler.js';
@@ -1439,6 +1440,8 @@ export class SignalEngine {
   private lastDemoDirectionalAt = 0;
   /** TRA-1156 — last observe-only IV-vs-RV scanner pass (reuses {@link RV_SCAN_INTERVAL_MS}). */
   private lastIvRvScanAt = 0;
+  /** TRA-1292 — last observe-only short-premium scanner pass (reuses {@link RV_SCAN_INTERVAL_MS}). */
+  private lastShortPremiumScanAt = 0;
   /**
    * TRA-1156 — per-symbol trailing daily closes, stashed from the SAME
    * `fetchDailyCandles` pull {@link refreshTechnicalSnapshot} already makes, so
@@ -3015,6 +3018,31 @@ export class SignalEngine {
           await this.evaluateIvRvScan(activeSymbols);
         } catch (err: unknown) {
           log.warn('iv-rv scan pass threw', {
+            reason: err instanceof Error ? err.message : String(err),
+          });
+        }
+      }
+    }
+
+    // TRA-1292 — observe-only defined-risk SHORT-PREMIUM scan (credit spreads /
+    // iron condors). Same demo-first, flag-gated, market-hours cadence as the
+    // IV-RV pass and rides the SAME warm RV chain + daily-close cache. NEVER
+    // routes into the paper book this iteration — it only records assembled
+    // structures to the store backing GET /api/health/short-premium so the board
+    // can watch the theta-positive read before a graduation decision. Wholly
+    // skipped (zero cost/IO) when the flag is off.
+    if (
+      this.mode === 'demo'
+      && isStockMarketOpen()
+      && isOptionShortPremiumScannerEnabled()
+      && !!this.rvScanner
+    ) {
+      if (Date.now() - this.lastShortPremiumScanAt >= RV_SCAN_INTERVAL_MS) {
+        this.lastShortPremiumScanAt = Date.now();
+        try {
+          await this.evaluateShortPremiumScan(activeSymbols);
+        } catch (err: unknown) {
+          log.warn('short-premium scan pass threw', {
             reason: err instanceof Error ? err.message : String(err),
           });
         }
@@ -5094,6 +5122,81 @@ export class SignalEngine {
         }
       } catch (err: unknown) {
         log.warn('iv-rv scan eval threw', {
+          symbol: sym,
+          reason: err instanceof Error ? err.message : String(err),
+        });
+      }
+    }
+  }
+
+  /**
+   * TRA-1292 — observe-only defined-risk SHORT-PREMIUM scan (credit spreads /
+   * iron condors). Mirrors {@link evaluateIvRvScan}: for each active symbol it
+   * rides the SAME warm selector chain, backfills the underlying's daily closes
+   * (Yahoo → Tradier fallback) to compute realised vol (the VRP baseline), stamps
+   * the trailing-year IV-rank (TRA-1153, warming the store like the IV-RV pass),
+   * runs {@link scanShortPremiumFromSnapshot}, and records the assembled
+   * structures into the store backing `GET /api/health/short-premium`.
+   *
+   * Purely observe-only: it NEVER routes into the paper book — the desk gate is
+   * ivRank >= 50 + VRP-positive + short-strike delta ~0.15–0.30, and any demo
+   * routing / graduation is a separate board decision. Defense-in-depth: re-checks
+   * the flag + demo mode + scanner so a direct unit-test call also no-ops with the
+   * flag off. Live promotion stays gated on TRA-382 regardless.
+   */
+  private async evaluateShortPremiumScan(symbols: string[]): Promise<void> {
+    if (!isOptionShortPremiumScannerEnabled() || this.mode !== 'demo' || !this.rvScanner) return;
+
+    const asOf = Date.now();
+    const dtePrefs = { min: this.rvDteMin, max: this.rvDteMax, target: this.rvDteTarget };
+
+    for (const sym of symbols) {
+      try {
+        const snap = await this.rvScanner.getSelectorChain(sym, dtePrefs);
+        if (!snap || !(snap.spot > 0) || snap.rows.length === 0) continue;
+
+        // Same daily-close backfill as the IV-RV pass (TRA-1226/1230): the scan
+        // universe isn't the technical-snapshot warm set, so most underlyings
+        // arrive cold; pull daily bars directly (Yahoo → Tradier fallback) and
+        // prime the cache so the next pass is warm.
+        let dailyCloses = this.dailyCloseCache.get(sym) ?? [];
+        if (dailyCloses.length === 0) {
+          let bars = await fetchDailyCandles(sym, MTF_DAILY_BARS).catch(() => [] as Candle[]);
+          if (bars.length === 0) {
+            bars = await fetchTradierDailyCandles(sym, MTF_DAILY_BARS).catch(() => [] as Candle[]);
+          }
+          if (bars.length > 0) {
+            dailyCloses = bars.map((b) => b.close);
+            this.dailyCloseCache.set(sym, dailyCloses);
+          }
+        }
+
+        // Stamp the trailing-year IV-rank off the chain in hand (the desk's sell
+        // gate) — warms the store like TRA-1153, no extra per-symbol fetch.
+        const atmIv = atmIvFromRows(snap.rows, snap.spot);
+        if (atmIv != null) void recordDailyIv(sym, atmIv, asOf).catch(() => {});
+        const ivRank = atmIv != null ? ivRankSync(sym, atmIv, asOf) : null;
+
+        const result = scanShortPremiumFromSnapshot(
+          { symbol: snap.symbol, spot: snap.spot, expiration: snap.expiration, rows: snap.rows },
+          dailyCloses,
+          ivRank,
+        );
+        recordShortPremiumScan(result, asOf);
+
+        if (result.candidates.length > 0) {
+          log.info('short-premium structures (TRA-1292)', {
+            symbol: result.symbol,
+            expiration: result.expiration,
+            realizedVol: result.realizedVol,
+            ivRank: result.ivRank,
+            candidateCount: result.candidates.length,
+            top: result.candidates[0]?.structure,
+            topScore: result.candidates[0]?.score,
+          });
+        }
+      } catch (err: unknown) {
+        log.warn('short-premium scan eval threw', {
           symbol: sym,
           reason: err instanceof Error ? err.message : String(err),
         });

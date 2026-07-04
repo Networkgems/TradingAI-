@@ -25,8 +25,10 @@ import {
   isOptionVolumeBreakoutEnabled,
   isOptionDemoDirectionalEnabled,
   isOptionIvRvScannerEnabled,
+  isOptionShortPremiumScannerEnabled,
 } from '../option-exec-flag.js';
 import { summarizeIvRvScans } from '../iv-rv-scanner.js';
+import { summarizeShortPremiumScans } from '../short-premium-scanner.js';
 import { isPerpFundingCarryEnabled } from '../perp-funding-carry-flag.js';
 import { summarizeFundingCarryScans } from '../perp-funding-carry-scanner.js';
 import { isCryptoRegimeEnabled } from '../crypto-regime-flag.js';
@@ -816,6 +818,25 @@ export function registerLiveHealthRoutes(app: Express, deps: LiveHealthDeps): vo
       build: resolveBuildInfo(),
       enabled: isOptionIvRvScannerEnabled(),
       ...summarizeIvRvScans(now()),
+    });
+  });
+
+  // TRA-1292 — unauthenticated, secrets-free defined-risk SHORT-PREMIUM readout
+  // (credit spreads / iron condors). Process-global, demo-only, OBSERVE-ONLY (no
+  // balances/PII — just structure legs, credit/width/PoP, IV/RV, IV-rank, and
+  // scores), so this is unauthenticated (parity with /iv-rv). `enabled` mirrors
+  // ENABLE_OPTION_SHORT_PREMIUM_SCANNER so the board can see at a glance whether
+  // the theta-positive scanner is armed; when off the store is empty so the
+  // surface is an honest zero rather than a 404. Always read-only: NO order is
+  // ever placed off these structures — demo routing / graduation is a separate
+  // board decision.
+  app.get('/api/health/short-premium', (_req, res) => {
+    res.json({
+      ok: true,
+      time: new Date(now()).toISOString(),
+      build: resolveBuildInfo(),
+      enabled: isOptionShortPremiumScannerEnabled(),
+      ...summarizeShortPremiumScans(now()),
     });
   });
 

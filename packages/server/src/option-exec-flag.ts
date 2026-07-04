@@ -90,6 +90,33 @@ export function isOptionIvRvScannerEnabled(env: NodeJS.ProcessEnv = process.env)
 }
 
 // --------------------------------------------------------------------------
+// TRA-1292 — defined-risk SHORT-PREMIUM scanner (credit spreads / iron condors).
+//
+// The desk is structurally LONG premium (every executing option path buys a
+// contract → theta-negative). This flag turns on an OBSERVE-ONLY demo pass that,
+// per tick, pulls the SAME warm selector chain the directional/IV-RV passes
+// already fetched, computes realised vol from the underlying's daily closes,
+// stamps the trailing-year IV-rank (TRA-1153), and runs the short-premium engine
+// (`findShortPremiumStructures`) — assembling put/call credit spreads and iron
+// condors gated on ivRank >= 50 + VRP-positive (IV/RV >= 1) + short-strike delta
+// ~0.15–0.30. Results are recorded to an in-memory store surfaced read-only at
+// `GET /api/health/short-premium`.
+//
+// OFF by default ⇒ zero cost/IO (the pass early-returns, store stays empty).
+// When ON it NEVER routes into the paper book — no order is ever placed off these
+// structures this iteration; demo routing / graduation is a SEPARATE board
+// decision. Demo-first: the pass hard-gates on `mode === 'demo'`, so prod/live
+// paths are byte-for-byte unchanged. Live promotion stays gated on TRA-382.
+// --------------------------------------------------------------------------
+
+export const OPTION_SHORT_PREMIUM_SCANNER_FLAG = 'ENABLE_OPTION_SHORT_PREMIUM_SCANNER';
+
+/** True iff the observe-only defined-risk short-premium scanner flag is on. */
+export function isOptionShortPremiumScannerEnabled(env: NodeJS.ProcessEnv = process.env): boolean {
+  return flagOn(env[OPTION_SHORT_PREMIUM_SCANNER_FLAG]);
+}
+
+// --------------------------------------------------------------------------
 // TRA-1203 (board: "try mispriced options for the rest of the week instead of
 // relative value") — turn the TRA-1156 OBSERVE-ONLY IV-vs-RV scan into an
 // EXECUTING demo paper-routing path.

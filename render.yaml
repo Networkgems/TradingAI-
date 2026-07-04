@@ -260,6 +260,24 @@ services:
       # this value. Accepts the usual truthy spellings (1/true/yes/on).
       - key: ENABLE_OPTION_DEMO_DIRECTIONAL
         value: "true"
+      # TRA-1292 — arm the OBSERVE-ONLY defined-risk SHORT-PREMIUM scanner (credit
+      # spreads / iron condors) on the demo book. Each demo tick (market hours)
+      # rides the SAME warm RV selector chain, computes realised vol from the
+      # underlying's daily closes (the VRP baseline), stamps the trailing-year
+      # IV-rank (TRA-1153), and assembles put/call credit spreads + iron condors
+      # gated on ivRank>=50 + VRP-positive (IV/RV>=1) + short-strike delta
+      # ~0.15-0.30 (~60-70% PoP). Surfaced read-only at
+      # `/api/health/short-premium` (`enabled:true`).
+      #
+      # SAFETY — DEMO/PAPER, OBSERVE-ONLY. The pass hard-gates on `mode==='demo'`
+      # and NEVER routes into the paper book (no order is ever placed off these
+      # structures); it only records candidates for the board to watch. OFF by
+      # default (prod/live byte-for-byte unchanged when unset). Demo routing /
+      # graduation + live promotion (TRA-382) are separate decisions. NOTE:
+      # blueprint sync ≠ autoDeploy on bqb1 (TRA-1289) — a redeploy is needed for
+      # this var to take effect on the running service. Accepts 1/true/yes/on.
+      - key: ENABLE_OPTION_SHORT_PREMIUM_SCANNER
+        value: "true"
       # TRA-1064 / TRA-921 (TRA-920 desk reversal) — turn ON the REVERSAL-SHADOW
       # signal ledger (observe-only). The capture (`reversal-shadow-ledger.ts`) is
       # a durable, append-only JSONL: when the desk S/R-reversal checklist prints a

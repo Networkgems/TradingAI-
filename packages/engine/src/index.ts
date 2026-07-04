@@ -391,6 +391,13 @@ export type {
   IvRvScannerOptions,
   IvRvAction,
 } from './options/iv-rv-mispricing.js';
+export { findShortPremiumStructures } from './options/short-premium-scanner.js';
+export type {
+  ShortPremiumCandidate,
+  ShortPremiumLeg,
+  ShortPremiumScannerOptions,
+  ShortPremiumStructure,
+} from './options/short-premium-scanner.js';
 export {
   findRelativeValueOpportunities,
   selectRvLongCandidate,
