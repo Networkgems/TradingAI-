@@ -1,6 +1,6 @@
 import { randomUUID } from 'crypto';
 import type { TradierOpenOptionPosition, ExitState } from '@trading-app/engine';
-import { evaluateMultiLegPreTrade, DEFAULT_MAX_LOSS_PCT_CAP, evaluateExit, DEFAULT_EXIT_PARAMS, chandelierStop, chandelierExitTriggered, profitLockDecision } from '@trading-app/engine';
+import { evaluateMultiLegPreTrade, DEFAULT_MAX_LOSS_PCT_CAP, evaluateExit, DEFAULT_EXIT_PARAMS, chandelierStop, chandelierExitTriggered, profitLockDecision, takeProfitEarlyDecision } from '@trading-app/engine';
 import type { Side } from '@trading-app/engine';
 import type {
   AccountMode,
@@ -161,6 +161,15 @@ export interface OptionExitRiskInput {
   underlyingAtrBySymbol: Map<string, number>;
   /** Underlying ATR / price by symbol — picks the high-beta multiplier. Optional. */
   underlyingAtrPctBySymbol?: Map<string, number>;
+  /**
+   * TRA-1294 — take-profit-early capture fraction (0.50–0.70). Present ⇔ the
+   * board also flipped `TAKE_PROFIT_EARLY_ENABLED` (a sub-flag under the master
+   * exit-risk switch); absent → the take-profit-early branch is skipped and the
+   * loss-side rules run unchanged. The symmetric PROFIT-side mirror of the
+   * give-back cap: auto-close once the position has captured this fraction of
+   * its available profit.
+   */
+  takeProfitEarlyCaptureFrac?: number;
 }
 
 /**
@@ -2173,8 +2182,31 @@ export class PaperOptionsAccount {
       // at the current mark; the underlying-space chandelier state was already
       // ratcheted above.
       if (exitRisk && !opt.legs) {
+        // TRA-1294 — take-profit-early (PROFIT-side mirror of Rules 1-2). Bank the
+        // win once we've captured the target fraction of available profit BEFORE
+        // the give-back trail/lock even engages. We are always LONG the premium
+        // here (single-leg), so entry = premiumPaid and the max-profit reference
+        // is the position's TP1 target (`tp1Premium`); an infinite/absent target
+        // yields a degenerate span and the helper defers (no-op). Only active
+        // when the caller attached `takeProfitEarlyCaptureFrac` (both flags on).
+        if (exitRisk.takeProfitEarlyCaptureFrac !== undefined) {
+          const tp = takeProfitEarlyDecision({
+            side: 'buy',
+            entry: opt.premiumPaid,
+            currentPrice: mark,
+            maxProfitPrice: opt.tp1Premium,
+            captureFrac: exitRisk.takeProfitEarlyCaptureFrac,
+          });
+          if (tp.shouldExit) {
+            exitPremium = mark;
+            exitKind = 'trail';
+            exitJournalReason = 'take_profit_early';
+          }
+        }
+
         if (
-          chandelierUSide !== null
+          exitPremium === null
+          && chandelierUSide !== null
           && chandelierUnderlying != null
           && opt.chandelierStop !== undefined
           && chandelierExitTriggered(chandelierUSide, chandelierUnderlying, opt.chandelierStop)
@@ -2182,7 +2214,7 @@ export class PaperOptionsAccount {
           exitPremium = mark;
           exitKind = 'trail';
           exitJournalReason = 'chandelier';
-        } else {
+        } else if (exitPremium === null) {
           // Rule 2 — trade-level profit-lock on premium-derived R (we are always
           // LONG the premium, so entry = premiumPaid, stop = stopLossPremium).
           const lock = profitLockDecision({

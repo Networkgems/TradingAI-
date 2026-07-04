@@ -6,6 +6,7 @@ import {
   stopModifyDecision,
   profitLockDecision,
   bookGiveBackDecision,
+  takeProfitEarlyDecision,
 } from './exit-rules.js';
 
 // TRA-1250 — exit-side loss-control rules (board-approved TRA-1249 params).
@@ -177,5 +178,52 @@ describe('Rule 3 — book-level daily give-back cap', () => {
     const d = bookGiveBackDecision({ peakOpenGain: 1000, currentTotalPnl: 800, sessionStopArmGain: 100, giveBackCapPct: 0.25 });
     expect(d.retainedFloor).toBe(750);
     expect(d.shouldFlattenAndHalt).toBe(false);
+  });
+});
+
+describe('Rule 4 (TRA-1294) — take-profit-early', () => {
+  it('long: holds below the capture threshold and banks once it is reached', () => {
+    // Entry 1.00, target 2.00 ⇒ available profit 1.00. Default capture = 0.60.
+    const below = takeProfitEarlyDecision({ side: 'buy', entry: 1, currentPrice: 1.5, maxProfitPrice: 2 });
+    expect(below.capturedFrac).toBeCloseTo(0.5, 6);
+    expect(below.shouldExit).toBe(false);
+
+    const above = takeProfitEarlyDecision({ side: 'buy', entry: 1, currentPrice: 1.7, maxProfitPrice: 2 });
+    expect(above.capturedFrac).toBeCloseTo(0.7, 6);
+    expect(above.shouldExit).toBe(true);
+  });
+
+  it('short: banks 50–70% of the credit as price falls toward zero', () => {
+    // Sold a spread for 1.00 credit; max profit at price 0. Buy back at 0.30 ⇒
+    // captured 70% of the credit (past the 60% default).
+    const d = takeProfitEarlyDecision({ side: 'sell', entry: 1, currentPrice: 0.3, maxProfitPrice: 0 });
+    expect(d.availableProfit).toBeCloseTo(1, 6);
+    expect(d.currentProfit).toBeCloseTo(0.7, 6);
+    expect(d.capturedFrac).toBeCloseTo(0.7, 6);
+    expect(d.shouldExit).toBe(true);
+  });
+
+  it('honors a custom capture fraction (board 50–70% range)', () => {
+    const loose = takeProfitEarlyDecision({ side: 'buy', entry: 1, currentPrice: 1.5, maxProfitPrice: 2, captureFrac: 0.5 });
+    expect(loose.shouldExit).toBe(true);
+    const tight = takeProfitEarlyDecision({ side: 'buy', entry: 1, currentPrice: 1.65, maxProfitPrice: 2, captureFrac: 0.7 });
+    expect(tight.shouldExit).toBe(false);
+  });
+
+  it('defers (no-op) on a non-finite target — e.g. an un-set TP1 of +∞', () => {
+    const d = takeProfitEarlyDecision({ side: 'buy', entry: 1, currentPrice: 5, maxProfitPrice: Number.POSITIVE_INFINITY });
+    expect(d.availableProfit).toBe(0);
+    expect(d.shouldExit).toBe(false);
+  });
+
+  it('defers on a degenerate / inverted runway (target ≤ entry for a long)', () => {
+    const d = takeProfitEarlyDecision({ side: 'buy', entry: 2, currentPrice: 2.5, maxProfitPrice: 2 });
+    expect(d.shouldExit).toBe(false);
+  });
+
+  it('a losing open position never banks (captured fraction floored at 0)', () => {
+    const d = takeProfitEarlyDecision({ side: 'buy', entry: 1, currentPrice: 0.7, maxProfitPrice: 2 });
+    expect(d.capturedFrac).toBe(0);
+    expect(d.shouldExit).toBe(false);
   });
 });

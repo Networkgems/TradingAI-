@@ -106,6 +106,7 @@ export {
   stopModifyDecision,
   profitLockDecision,
   bookGiveBackDecision,
+  takeProfitEarlyDecision,
 } from './exit-rules.js';
 export type {
   Side,
@@ -117,6 +118,8 @@ export type {
   BookGiveBackParams,
   BookHaltReason,
   BookGiveBackDecision,
+  TakeProfitEarlyParams,
+  TakeProfitEarlyDecision,
 } from './exit-rules.js';
 export { AlpacaFeed } from './feed/index.js';
 export type { AlpacaFeedEvents } from './feed/index.js';

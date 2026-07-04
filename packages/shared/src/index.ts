@@ -1880,6 +1880,13 @@ export const PROFIT_LOCK_TIGHTEN_GIVEBACK_R = 0.5;    // … tighten the give-ba
 export const BOOK_GIVEBACK_CAP_PCT = 0.40;            // flatten + halt after surrendering >40% of the day's peak open gain
 export const BOOK_SESSION_STOP_R = 0.5;               // hard session stop if net-negative after being up > +0.5R of book equity
 
+// TRA-1294 — take-profit-early: the symmetric PROFIT-side mirror of the give-back
+// cap. Bank the win once a position has captured this fraction of its available
+// profit (long) / max credit (short). Board range 50–70%; default to the
+// midpoint. Ships DARK behind TAKE_PROFIT_EARLY_ENABLED (itself under the
+// EXIT_RISK_RULES_ENABLED master switch).
+export const TAKE_PROFIT_EARLY_CAPTURE_PCT = 0.60;    // auto-close at 60% of available profit / max credit
+
 // TRA-1269 (TRA-1250 Rule 1, live-equity path) — the live equity chandelier
 // trails a *broker-resting* OCO stop leg by cancel/replace, which costs a
 // Tradier order-modify round-trip and risks throttling. So we only spend a

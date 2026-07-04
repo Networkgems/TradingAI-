@@ -7,6 +7,7 @@ import {
   PROFIT_LOCK_TIGHTEN_PEAK_R,
   PROFIT_LOCK_TIGHTEN_GIVEBACK_R,
   BOOK_GIVEBACK_CAP_PCT,
+  TAKE_PROFIT_EARLY_CAPTURE_PCT,
 } from '@trading-app/shared';
 
 /**
@@ -266,4 +267,71 @@ export function bookGiveBackDecision(p: BookGiveBackParams): BookGiveBackDecisio
   }
 
   return { retainedFloor, shouldFlattenAndHalt: false, reason: null };
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Rule 4 (TRA-1294) — take-profit-early (the PROFIT-side mirror of Rule 2)
+// ─────────────────────────────────────────────────────────────────────────────
+
+export interface TakeProfitEarlyParams {
+  side: Side;
+  /** Entry price/premium. For a short this is the credit received. */
+  entry: number;
+  /** Current mark. */
+  currentPrice: number;
+  /**
+   * Price at which 100% of the position's available profit is realized:
+   *   - long  (`side: 'buy'`):  the profit target / max-value price (available
+   *     profit = maxProfitPrice − entry).
+   *   - short (`side: 'sell'`): the price at which the full credit is captured
+   *     (0 for a naked short — the option/spread expires worthless; the
+   *     structure's floor value otherwise; available profit = entry −
+   *     maxProfitPrice).
+   * A non-finite or unfavorable value yields a degenerate span and the rule
+   * defers to the other exits.
+   */
+  maxProfitPrice: number;
+  /** Fraction of available profit to bank (default 0.60; board range 0.50–0.70). */
+  captureFrac?: number;
+}
+
+export interface TakeProfitEarlyDecision {
+  /** Favorable span from entry to the max-profit price (available profit, price terms). */
+  availableProfit: number;
+  /** Current open profit (price terms). */
+  currentProfit: number;
+  /** currentProfit / availableProfit, floored at 0. */
+  capturedFrac: number;
+  /** The capture threshold in force. */
+  captureFrac: number;
+  /** True ⇒ auto-close now (captured ≥ threshold). */
+  shouldExit: boolean;
+}
+
+/**
+ * Take-profit-early: bank the win once the position has captured `captureFrac`
+ * (50–70%) of its available profit. This is the symmetric PROFIT-side mirror of
+ * the per-trade give-back cap (Rule 2): where the give-back cap trails from the
+ * peak to protect an open gain, this fires on an ABSOLUTE capture level to take
+ * a large fraction of the target off the table before the market can hand it
+ * back. A level trigger, so it needs no peak-tracking. Long and short share one
+ * implementation via the `maxProfitPrice` reference (see the param docs).
+ */
+export function takeProfitEarlyDecision(p: TakeProfitEarlyParams): TakeProfitEarlyDecision {
+  const captureFrac = p.captureFrac ?? TAKE_PROFIT_EARLY_CAPTURE_PCT;
+  const availableProfit =
+    p.side === 'buy' ? p.maxProfitPrice - p.entry : p.entry - p.maxProfitPrice;
+
+  // Degenerate / undefined runway (non-finite target, or an inverted
+  // maxProfitPrice that implies no profit to bank): can't form a capture
+  // fraction, so defer to the other exits.
+  if (!(availableProfit > 0) || !Number.isFinite(availableProfit)) {
+    return { availableProfit: 0, currentProfit: 0, capturedFrac: 0, captureFrac, shouldExit: false };
+  }
+
+  const currentProfit = p.side === 'buy' ? p.currentPrice - p.entry : p.entry - p.currentPrice;
+  const capturedFrac = Math.max(0, currentProfit / availableProfit);
+  const shouldExit = capturedFrac >= captureFrac;
+
+  return { availableProfit, currentProfit, capturedFrac, captureFrac, shouldExit };
 }

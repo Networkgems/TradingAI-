@@ -1,7 +1,7 @@
 import { OrbStrategy, BbFadeStrategy, IchimokuStrategy, SupertrendConfluenceStrategy, confluenceSide, supertrend, reversalChecklist, adx, atr, atrPct, donchian, supportResistance, blackScholesDelta, daysToExpiration, bookGiveBackDecision, chandelierStop, stopModifyDecision, selectRvLongCandidate, selectShadowOptionSignal, emaPullbackTrigger, volumeConfirmedBreakout, TradierOptionsClient, TradierOrderClient, TRADIER_REJECTED_STATUSES, TRADIER_TERMINAL_STATUSES, evaluateSma200, SMA200_MIN_BARS, SMA200_DEBOUNCE_BARS, composeTechnicalSnapshot, resampleCandles, TF_BUCKET_MS, OptionsRiskBreaker, DEFAULT_OPTIONS_BREAKER_PARAMS } from '@trading-app/engine';
 import type { StrategySelectorInput, ContractQuote, OptionTrend, RvLongTrendSide, ExitState, SharedTickIndicators, RelativeValueScannerOptions, OptionChainRow, IvRvScannerOptions, IvRvMispricingCandidate } from '@trading-app/engine';
 import type { TradierAccountBalance } from '@trading-app/engine';
-import { WATCHLIST, isLiquidSwingSymbol, checkEquitySwingClose, MANAGED_ACCOUNT_RATIO, MAX_CONSECUTIVE_LOSSES, DAILY_DRAWDOWN_HALT_PCT, BOOK_SESSION_STOP_R, BOOK_GIVEBACK_CAP_PCT, LIVE_EQUITY_STOP_MODIFY_MIN_TICK_PCT, LIVE_EQUITY_STOP_MODIFY_MIN_TICK_ABS, LIVE_EQUITY_STOP_MODIFY_COOLDOWN_MS, DEFAULT_RISK_PER_TRADE, OPTIONS_PER_TICKET_DOLLAR_FLOOR, OPTIONS_POSITION_CAP_RATIO, aliasWatchlistSymbol, isLiveTradierOptionsEnabled, isStockMarketOpen, perPositionCap, resolveAutoManageImportedTradierOptions, resolveDemoCostModel, resolveHoldLiveOptionsOvernight, resolveSwingHoldOptions, resolveLiveTradeEquitiesTradier, resolveManagedAccountRatio, resolveMarketReviewGatesEnabled, resolveRiskPerTrade, resolveRvDtePrefs, resolveTradierOptionsCreds, validateBracket, DEFAULT_RV_DTE_MIN, DEFAULT_RV_DTE_MAX, DEFAULT_RV_DTE_TARGET, scoreNewsSentiment, aggregateSymbolSentiment, aggregateFedSentiment, aggregateStockTwitsSentiment, dedupeStockTwitsMessages, mapCuratedMessagesBySymbol, nameAliasesFor, evaluateEquityDcaAdd, evaluateOptionDcaAdd, CONVICTION_DCA, blendedAverage, positionRiskDollars, minutesToSessionClose, getEasternUtcOffset, isAgentTradingWindowOpen } from '@trading-app/shared';
+import { WATCHLIST, isLiquidSwingSymbol, checkEquitySwingClose, MANAGED_ACCOUNT_RATIO, MAX_CONSECUTIVE_LOSSES, DAILY_DRAWDOWN_HALT_PCT, BOOK_SESSION_STOP_R, BOOK_GIVEBACK_CAP_PCT, TAKE_PROFIT_EARLY_CAPTURE_PCT, LIVE_EQUITY_STOP_MODIFY_MIN_TICK_PCT, LIVE_EQUITY_STOP_MODIFY_MIN_TICK_ABS, LIVE_EQUITY_STOP_MODIFY_COOLDOWN_MS, DEFAULT_RISK_PER_TRADE, OPTIONS_PER_TICKET_DOLLAR_FLOOR, OPTIONS_POSITION_CAP_RATIO, aliasWatchlistSymbol, isLiveTradierOptionsEnabled, isStockMarketOpen, perPositionCap, resolveAutoManageImportedTradierOptions, resolveDemoCostModel, resolveHoldLiveOptionsOvernight, resolveSwingHoldOptions, resolveLiveTradeEquitiesTradier, resolveManagedAccountRatio, resolveMarketReviewGatesEnabled, resolveRiskPerTrade, resolveRvDtePrefs, resolveTradierOptionsCreds, validateBracket, DEFAULT_RV_DTE_MIN, DEFAULT_RV_DTE_MAX, DEFAULT_RV_DTE_TARGET, scoreNewsSentiment, aggregateSymbolSentiment, aggregateFedSentiment, aggregateStockTwitsSentiment, dedupeStockTwitsMessages, mapCuratedMessagesBySymbol, nameAliasesFor, evaluateEquityDcaAdd, evaluateOptionDcaAdd, CONVICTION_DCA, blendedAverage, positionRiskDollars, minutesToSessionClose, getEasternUtcOffset, isAgentTradingWindowOpen } from '@trading-app/shared';
 import type { TradeSignal, RelativeValueSignal, OtmMispricingSignal, Sma200Signal, Candle, OptionsAccountState, SignalType, Position, OptionPosition, AccountMode, AccountSettings, AccountState, NewsItem, SymbolSentiment, SocialSentiment, StockTwitsMessage, TechnicalSignalSnapshot, TradierEnv, MarketReview, MarketReviewGates, EngineMarketReviewState, GatedStrategyNote, AgentRecommendation, TradeProposal, AgentOrderAudit, GuardrailVerdict, OptionType } from '@trading-app/shared';
 import { shouldAutoConfirm } from '@trading-app/shared';
 // TRA-544 (TRA-529 P1) / TRA-747 (P2) — advisory multi-agent layer. ON suspends
@@ -50,7 +50,7 @@ import {
 import { isOptionShadowEnabled, isOptionPhaseBEnabled, emitShadowOptionSignal, shadowSignalToSpreadParams, OPTION_SHADOW_EMERGENCY_OFF, DEMO_SPREAD_MAX_LOSS_PCT_CAP } from './option-shadow-ledger.js';
 import { isOptionExecEnabled, isOptionEmaPullbackEnabled, isOptionVolumeBreakoutEnabled, resolveRvLongDteOverride, resolveRvMinDailyVolume, isOptionDemoDirectionalEnabled, isOptionIvRvScannerEnabled, isOptionIvRvRoutingEnabled, resolveIvRvRoutingOverride } from './option-exec-flag.js';
 import { scanIvRvFromSnapshot, recordIvRvScan } from './iv-rv-scanner.js';
-import { isExitRiskRulesEnabled, isLiveEquityStopModifyEnabled } from './exit-risk-rules-flag.js';
+import { isExitRiskRulesEnabled, isLiveEquityStopModifyEnabled, isTakeProfitEarlyEnabled } from './exit-risk-rules-flag.js';
 import { recordConvictionDcaFill } from './conviction-dca-ledger.js';
 import { etDateString } from './scheduler.js';
 // TRA-995 (epic-C, self-regulation) — the standing risk autopilot. A pure
@@ -1271,8 +1271,17 @@ export class SignalEngine {
       const ap = atrPct(series);
       if (ap != null && Number.isFinite(ap)) underlyingAtrPctBySymbol.set(opt.symbol, ap);
     }
-    if (underlyingAtrBySymbol.size === 0) return undefined;
-    return { underlyingAtrBySymbol, underlyingAtrPctBySymbol };
+    // TRA-1294 — take-profit-early is premium-space only (no underlying ATR
+    // needed); attach its capture fraction when the sub-flag is on so the branch
+    // activates even for underlyings without enough cached bars for the
+    // chandelier. Requires the master `EXIT_RISK_RULES_ENABLED` too (this method
+    // is only called under it) — the give-back cap and the profit mirror can be
+    // flipped independently within that family.
+    const takeProfitEarlyCaptureFrac = isTakeProfitEarlyEnabled()
+      ? TAKE_PROFIT_EARLY_CAPTURE_PCT
+      : undefined;
+    if (underlyingAtrBySymbol.size === 0 && takeProfitEarlyCaptureFrac === undefined) return undefined;
+    return { underlyingAtrBySymbol, underlyingAtrPctBySymbol, takeProfitEarlyCaptureFrac };
   }
 
   /**

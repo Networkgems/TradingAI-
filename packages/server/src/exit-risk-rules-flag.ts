@@ -43,3 +43,20 @@ export const LIVE_EQUITY_STOP_MODIFY_FLAG = 'LIVE_EQUITY_STOP_MODIFY_ENABLED';
 export function isLiveEquityStopModifyEnabled(env: NodeJS.ProcessEnv = process.env): boolean {
   return isExitRiskRulesEnabled(env) && flagOn(env[LIVE_EQUITY_STOP_MODIFY_FLAG]);
 }
+
+// TRA-1294 — take-profit-early (the PROFIT-side mirror of the give-back cap /
+// chandelier loss-control). A SEPARATE sub-flag so the board can run the shipped
+// exit-side loss rules (TRA-1267/1268) without auto-banking wins, and can enable
+// early profit-taking independently once it's validated. Deliberately gated by
+// BOTH the master switch AND its own flag: it auto-CLOSES positions, so it stays
+// dark unless `EXIT_RISK_RULES_ENABLED` AND `TAKE_PROFIT_EARLY_ENABLED` are both
+// truthy (1/true/yes/on).
+export const TAKE_PROFIT_EARLY_FLAG = 'TAKE_PROFIT_EARLY_ENABLED';
+
+/**
+ * True iff take-profit-early is enabled. Requires the master exit-risk switch on
+ * as well — the sub-flag alone does nothing.
+ */
+export function isTakeProfitEarlyEnabled(env: NodeJS.ProcessEnv = process.env): boolean {
+  return isExitRiskRulesEnabled(env) && flagOn(env[TAKE_PROFIT_EARLY_FLAG]);
+}

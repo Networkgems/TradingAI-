@@ -2949,4 +2949,37 @@ describe('PaperOptionsAccount.checkExits — chandelier + profit-lock (TRA-1268)
     expect(closed).toHaveLength(1);
     expect(closed[0].currentPremium).toBeCloseTo(1.0, 6);
   });
+
+  // TRA-1294 — take-profit-early: the PROFIT-side mirror. Fires ONLY when the
+  // caller attaches `takeProfitEarlyCaptureFrac` (both EXIT_RISK_RULES_ENABLED
+  // and TAKE_PROFIT_EARLY_ENABLED on). The long book's available profit is
+  // measured to the TP1 target: entry 1.0, TP1 1.50 ⇒ span 0.50, so 60% capture
+  // ⇒ auto-close at mark 1.30 (before TP1's own partial at 1.50).
+  it('auto-closes at 60% of available profit (before the TP1 target)', () => {
+    const { acct, sym } = openCall();
+    const risk = { underlyingAtrBySymbol: new Map<string, number>(), takeProfitEarlyCaptureFrac: 0.60 };
+
+    // Mark 1.29 = 58% of the 0.50 span → holds.
+    expect(
+      acct.checkExits(new Map(), new Map([[sym, 1.29]]), 'demo', {}, undefined, risk),
+    ).toHaveLength(0);
+
+    // Mark 1.30 = 60% captured → banks the win at the mark.
+    const closed = acct.checkExits(new Map(), new Map([[sym, 1.30]]), 'demo', {}, undefined, risk);
+    expect(closed).toHaveLength(1);
+    expect(closed[0].currentPremium).toBeCloseTo(1.30, 6);
+    // Realized gain = (1.30 − 1.0) × 6 × 100 = +$180.
+    expect(closed[0].pnl).toBeCloseTo(180, 6);
+  });
+
+  it('does NOT auto-bank when the take-profit-early frac is absent (loss-side only)', () => {
+    const { acct, sym } = openCall();
+    // Chandelier map empty AND no takeProfitEarlyCaptureFrac → neither the trail
+    // nor the profit mirror fires; 1.30 is above the 0.80 SL so the row stays open.
+    const risk = { underlyingAtrBySymbol: new Map<string, number>() };
+    expect(
+      acct.checkExits(new Map(), new Map([[sym, 1.30]]), 'demo', {}, undefined, risk),
+    ).toHaveLength(0);
+    expect(acct.getState().openOptions).toHaveLength(1);
+  });
 });
