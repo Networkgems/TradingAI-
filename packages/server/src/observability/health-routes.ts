@@ -37,6 +37,11 @@ import { isCryptoIgnitionEnabled, resolveIgnitionWatchlist } from '../crypto-ign
 import { summarizeIgnitionScans } from '../crypto-ignition-scanner.js';
 import { summarizeConvictionDca, resolveConvictionDcaDeployAnchor } from '../conviction-dca-ledger.js';
 import { CONVICTION_DCA } from '@trading-app/shared';
+import { resolveDemoFlagEnv } from '../demo-flags.js';
+import {
+  isSma200DemoForwardTestEnabled,
+  SMA200_DEMO_FORWARD_TEST_FLAG,
+} from '../sma200-forward-test-flag.js';
 import { optionsIdeasAutoExecuteHealth } from '../options-ideas-auto-execute.js';
 import {
   listOptionTradeJournal,
@@ -904,6 +909,38 @@ export function registerLiveHealthRoutes(app: Express, deps: LiveHealthDeps): vo
       build: resolveBuildInfo(),
       enabled: CONVICTION_DCA.enabled,
       ...summarizeConvictionDca(resolveConvictionDcaDeployAnchor()),
+    });
+  });
+
+  // TRA-1289 (parent TRA-1288 → TRA-955/1242) — unauthenticated, secrets-free
+  // readout of whether the demo-only, manifest-exempt `sma200_pullback`
+  // forward-test fill path is ARMED in this running process. The arm commit set
+  // ENABLE_SMA200_DEMO_FORWARD_TEST=true via render.yaml (env), but a Render
+  // blueprint env sync is distinct from a code autoDeploy — so without this
+  // surface the TRA-1242 accrual monitor (routine c60c98a2) cannot tell "armed,
+  // no swing signal yet" from "never armed". We resolve the flag through the
+  // SAME path the router consults (process.env layered with the DATA_DIR
+  // demo-flags.json overlay, file wins) so `enabled` reflects the EFFECTIVE
+  // switch, not just the raw env. Read-only, no order path, demo-only flag —
+  // structurally incapable of touching live capital (the live branch stays
+  // hard-gated by the empty TRA-817 manifest regardless of this flag).
+  app.get('/api/health/sma200-forward-test', (_req, res) => {
+    const dir = process.env.DATA_DIR;
+    const env = dir ? resolveDemoFlagEnv(dir) : process.env;
+    const enabled = isSma200DemoForwardTestEnabled(env);
+    res.json({
+      ok: true,
+      time: new Date(now()).toISOString(),
+      build: resolveBuildInfo(),
+      flag: SMA200_DEMO_FORWARD_TEST_FLAG,
+      enabled,
+      // Demo forward-test validates SIGNAL ACCURACY ONLY. Live promotion still
+      // requires clearing the OOS keeper gate (TRA-455/817); this flag can never
+      // open real capital.
+      liveCapitalReachable: false,
+      note: enabled
+        ? 'ARMED: sma200_pullback opens demo-only forward-test (forwardTestOnly) paper fills; live stays hard-gated.'
+        : 'DISARMED: sma200_pullback stays display-only in demo. Set ENABLE_SMA200_DEMO_FORWARD_TEST=true (render.yaml env or DATA_DIR/demo-flags.json) to arm.',
     });
   });
 
