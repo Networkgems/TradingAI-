@@ -50,6 +50,14 @@ export const DEMO_FLAG_ALLOWLIST = [
   // so a non-admin operator can arm the demo forward capture on the self-hosted
   // host (this is how we activate demo capture - no PM2/admin).
   'ENABLE_CRYPTO_IGNITION_SCANNER',
+  // TRA-1289 (parent TRA-1288 → TRA-955/1242) — demo-only, manifest-exempt,
+  // default-OFF paper fill path for the primary swing router `sma200_pullback`
+  // so TRA-955 can forward-test signal accuracy. Non-secret DEMO toggle; the
+  // router only consults it on the demo branch and the live path stays hard-
+  // gated by the TRA-817 capital-gate manifest, so it is structurally incapable
+  // of opening real capital. Safe for the file override so a non-admin operator
+  // can arm the demo forward-test on the self-hosted host (no PM2/admin).
+  'ENABLE_SMA200_DEMO_FORWARD_TEST',
 ] as const;
 
 export const DEMO_FLAGS_FILENAME = 'demo-flags.json';

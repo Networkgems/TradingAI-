@@ -80,6 +80,8 @@ import {
 } from './tradier-smart-close.js';
 import { submitSmartBuyToOpen } from './tradier-smart-open.js';
 import { isLiveEntryGatePassed } from './capital-gate-manifest.js';
+import { isSma200DemoForwardTestEnabled } from './sma200-forward-test-flag.js';
+import { resolveDemoFlagEnv } from './demo-flags.js';
 import type { RelativeValueScannerService } from './relative-value-scanner.js';
 import type { DailySignalRecord, ReportInput } from './reports/eod-report.js';
 import type { PnlTracker } from './pnl-tracker.js';
@@ -3198,6 +3200,14 @@ export class SignalEngine {
    * the manifest check below and the signal stays display-only, the same
    * treatment as `sma200_reclaim`.
    *
+   * TRA-1289 (TRA-1288 Option A) — the SINGLE, demo-only exception: when
+   * `this.mode !== 'live'` AND `ENABLE_SMA200_DEMO_FORWARD_TEST` is on, the
+   * manifest bail is skipped and a `forwardTestOnly`-tagged PAPER position is
+   * opened so TRA-955 can forward-test signal accuracy (unblocking TRA-1242
+   * accrual). The live path stays unconditionally manifest-gated — this flag
+   * can never open real capital — and live promotion still requires clearing
+   * the OOS keeper gate (TRA-455/817).
+   *
    * The body is otherwise intact (reuses the engine's equity entry path — a
    * risk-sized paper open in demo, a Tradier OTOCO bracket plus local mirror in
    * live) so that once TRA-817's OOS gate registers the strategy as passed, the
@@ -3211,10 +3221,31 @@ export class SignalEngine {
     // in the TRA-817 manifest. Open NO real position; stay display-only until a
     // real OOS / walk-forward pass registers it. The display signal is already
     // emitted by the caller before this point.
+    //
+    // TRA-1289 (TRA-1288 Option A) — the ONE exception: a DEMO-ONLY, flag-gated
+    // forward-test paper fill so TRA-955 can validate signal accuracy and
+    // TRA-1242's leaf accrual can resume. This is a router-level exemption ONLY:
+    // it proceeds past the manifest bail below solely when `this.mode !== 'live'`
+    // AND `ENABLE_SMA200_DEMO_FORWARD_TEST` is on. The `this.mode === 'live'`
+    // path stays unconditionally blocked here — `isLiveEntryGatePassed` remains
+    // the sole live authority and the flag is structurally incapable of opening
+    // real capital (the live branch below is never reached when this returns).
+    // NOTE: live promotion still requires clearing the OOS keeper gate
+    // (TRA-455/817); this path validates demo signal accuracy only.
     if (!isLiveEntryGatePassed(signal.type)) {
-      signal.liveSkipReason =
-        'display-only: sma200_pullback is not registered in the TRA-817 capital-gate manifest (no out-of-sample pass)';
-      return;
+      const demoForwardTest =
+        this.mode !== 'live'
+        && isSma200DemoForwardTestEnabled(this.resolveDemoFlagEnv());
+      if (!demoForwardTest) {
+        signal.liveSkipReason =
+          'display-only: sma200_pullback is not registered in the TRA-817 capital-gate manifest (no out-of-sample pass)';
+        return;
+      }
+      // Demo forward-test open. Tag the signal so the paper fill below is stamped
+      // `forwardTestOnly` — TRA-1242 accrual / promotion logic must never read it
+      // as OOS-gate evidence. Fall through to the demo paper-open path; the live
+      // branch is unreachable here because `this.mode !== 'live'`.
+      signal.forwardTestOnly = true;
     }
     // TRA-544: suspended when the agent layer owns the decision (§2B).
     if (!this.isDeterministicAutoTradingEnabled() || this.riskGovernor.isHalted()) return;
@@ -3247,9 +3278,26 @@ export class SignalEngine {
       : this.account.openPosition(signal, price, this.activeSizingMultiplier());
     if (pos) {
       pos.mode = this.mode;
+      // TRA-1289 — carry the demo forward-test marker onto the position so
+      // TRA-1242 accrual can distinguish these from gate-passed fills.
+      if (signal.forwardTestOnly) pos.forwardTestOnly = true;
       this.positionSignalType.set(pos.id, signal.type);
       this.emitFillAlert(pos, signal.type); // TRA-563 fill alert
     }
+  }
+
+  /**
+   * TRA-1289 — effective env for DEMO-sandbox flag resolution: `process.env`
+   * with the allowlisted `<DATA_DIR>/demo-flags.json` values layered on top
+   * (file wins), mirroring index.ts's `demoFlagEnv()`. Re-read on each call so
+   * an operator's file flip is picked up on the next tick with no PM2/admin —
+   * the only writable switch a non-admin agent has on the self-hosted host.
+   * When `DATA_DIR` is unset (unit tests / CLI) there is no canonical file
+   * location, so `process.env` is used directly.
+   */
+  private resolveDemoFlagEnv(): NodeJS.ProcessEnv {
+    const dir = process.env.DATA_DIR;
+    return dir ? resolveDemoFlagEnv(dir) : process.env;
   }
 
   /**

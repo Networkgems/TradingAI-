@@ -100,6 +100,16 @@ export interface TradeSignal {
    * declined to route it. Absent on signals that proceed normally.
    */
   signalSkipReason?: string;
+  /**
+   * TRA-1289 (TRA-1288 Option A) — marks a fill that opened via the DEMO-ONLY,
+   * flag-gated forward-test path for an un-gate-passed router (today only the
+   * primary swing router `sma200_pullback` under `ENABLE_SMA200_DEMO_FORWARD_TEST`).
+   * These paper fills exist purely to forward-test signal accuracy (TRA-955)
+   * and MUST NOT be read as OOS-keeper-gate evidence: TRA-1242 accrual and any
+   * promotion logic use this flag to distinguish them from real gate-passed
+   * fills. Absent on every normal signal; only ever set in demo mode.
+   */
+  forwardTestOnly?: boolean;
 }
 
 /**
@@ -320,6 +330,15 @@ export interface Position {
    * the field existed; absent ↔ legacy demo (live equity wasn't wired yet).
    */
   mode?: AccountMode;
+  /**
+   * TRA-1289 (TRA-1288 Option A) — set on a demo paper position opened via the
+   * flag-gated forward-test path for an un-gate-passed router (`sma200_pullback`
+   * under `ENABLE_SMA200_DEMO_FORWARD_TEST`). Stamped from `signal.forwardTestOnly`
+   * so TRA-1242 accrual / any promotion logic can tell these signal-accuracy
+   * paper fills apart from real gate-passed fills and never treat them as OOS
+   * keeper-gate evidence. Absent on every non-forward-test position; demo-only.
+   */
+  forwardTestOnly?: boolean;
   /**
    * TRA-249-C — instrument family the position was opened against. Spot
    * positions (the default and only kind pre-TRA-249) keep the field absent

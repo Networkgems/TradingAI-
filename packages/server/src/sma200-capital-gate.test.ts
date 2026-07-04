@@ -117,3 +117,71 @@ describe('TRA-819 — sma200_pullback live entry is gated off', () => {
     expect(state.account.openPositions).toHaveLength(0);
   });
 });
+
+describe('TRA-1289 — demo-only, flag-gated sma200_pullback forward-test fill', () => {
+  const FLAG = 'ENABLE_SMA200_DEMO_FORWARD_TEST';
+
+  afterEach(() => {
+    delete process.env[FLAG];
+  });
+
+  it('LIVE mode: opens NO position and stamps liveSkipReason even with the flag ON', async () => {
+    process.env[FLAG] = 'true';
+    const engine = new SignalEngine();
+    (engine as unknown as { mode: 'demo' | 'live' }).mode = 'live';
+
+    const placeBracket = vi.spyOn(
+      engine as unknown as { placeTradierEquityBracket: (...a: unknown[]) => Promise<unknown> },
+      'placeTradierEquityBracket',
+    );
+
+    const signal = makePullbackSignal({ mode: 'live' });
+    await (engine as unknown as {
+      openSma200Pullback: (s: Sma200Signal) => Promise<void>;
+    }).openSma200Pullback(signal);
+
+    // The flag is structurally incapable of touching live capital: the live
+    // branch stays hard-gated by the manifest.
+    expect(placeBracket).not.toHaveBeenCalled();
+    expect(signal.liveSkipReason).toMatch(/capital-gate manifest/);
+    expect(signal.forwardTestOnly).toBeUndefined();
+  });
+
+  it('DEMO mode: stays display-only (NO position) when the flag is OFF', async () => {
+    delete process.env[FLAG]; // explicit: default OFF
+    const engine = new SignalEngine(); // demo by default
+    vi.spyOn(yahooFeed, 'fetchDailyCandles').mockResolvedValue(pullbackSeries());
+
+    await (engine as unknown as {
+      runSma200Scan: (symbols: string[]) => Promise<void>;
+    }).runSma200Scan(['TEST']);
+
+    const state = engine.getState();
+    const pullback = state.signals.find((s) => s.type === 'sma200_pullback');
+    expect(pullback?.liveSkipReason).toMatch(/capital-gate manifest/);
+    expect(pullback?.forwardTestOnly).toBeUndefined();
+    expect(state.account.openPositions).toHaveLength(0);
+  });
+
+  it('DEMO mode: opens a forwardTestOnly-tagged paper position when the flag is ON', async () => {
+    process.env[FLAG] = 'true';
+    const engine = new SignalEngine(); // demo by default; auto-trading on
+    vi.spyOn(yahooFeed, 'fetchDailyCandles').mockResolvedValue(pullbackSeries());
+
+    await (engine as unknown as {
+      runSma200Scan: (symbols: string[]) => Promise<void>;
+    }).runSma200Scan(['TEST']);
+
+    const state = engine.getState();
+    // A real demo paper fill lands …
+    expect(state.account.openPositions).toHaveLength(1);
+    const pos = state.account.openPositions[0];
+    expect(pos.signalType).toBe('sma200_pullback');
+    // … tagged forward-test-only so TRA-1242 accrual never reads it as OOS
+    // keeper-gate evidence.
+    expect(pos.forwardTestOnly).toBe(true);
+    // The manifest allow-list is still empty — this path did NOT gate-pass.
+    expect(PASSED_LIVE_ENTRIES).toHaveLength(0);
+    expect(isLiveEntryGatePassed('sma200_pullback')).toBe(false);
+  });
+});
