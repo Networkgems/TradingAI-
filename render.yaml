@@ -319,6 +319,22 @@ services:
       # the usual truthy spellings (1/true/yes/on).
       - key: ENABLE_CRYPTO_IGNITION_SCANNER
         value: "true"
+      # TRA-1289 (parent TRA-1288 Option A → TRA-955/1242) — turn ON the
+      # DEMO-ONLY, flag-gated forward-test fill path for the primary swing router
+      # `sma200_pullback` so the demo paper book accrues signal-accuracy evidence
+      # (TRA-955) and TRA-1242's leaf accrual (routine c60c98a2) can resume. bqb1
+      # runs in DEMO mode, so this opens PAPER positions only.
+      #
+      # SAFETY — this is a ROUTER-LEVEL exemption, NOT a live-gate change. The
+      # engine consults this flag ONLY on the `mode !== 'live'` branch; the live
+      # path stays unconditionally blocked by the TRA-817 capital-gate manifest
+      # (`isLiveEntryGatePassed`, which stays empty), so the flag is structurally
+      # incapable of opening real capital. Fills are tagged `forwardTestOnly` so
+      # accrual/promotion logic never read them as OOS keeper-gate evidence; live
+      # promotion still requires clearing the OOS keeper gate (TRA-455/817).
+      # Revert = clear this value. Accepts the usual truthy spellings.
+      - key: ENABLE_SMA200_DEMO_FORWARD_TEST
+        value: "true"
       # TRA-1080 — event-loop/heap starvation watchdog. The watchdog itself is
       # ON by default in code (no env needed); these knobs are declared
       # `sync: false` so an operator can DISABLE or RETUNE it from the dashboard
