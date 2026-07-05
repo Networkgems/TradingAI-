@@ -1,0 +1,288 @@
+{
+  "issue": "TRA-1308",
+  "phase": "A (edge evidence / GO-NO-GO)",
+  "generatedAt": "2026-07-04T00:00:00Z",
+  "method": {
+    "engine": "findShortPremiumStructures (packages/engine) — live scanner code",
+    "dataDir": "C:\\Users\\eetienne\\.paperclip\\instances\\default\\projects\\fc64eaf4-0c08-4270-9a4c-31ee16594dec\\74473ac3-bd4b-470e-8bc3-5c558ad85d1e\\_default\\data\\option-chains",
+    "days": 32,
+    "dateRange": "2026-05-15..2026-07-02",
+    "rvLookback": 20,
+    "minCloses": 10,
+    "settleToleranceDays": 4,
+    "tpFraction": 0.5,
+    "gates": "ivRank>=50, short|Δ|0.15-0.30, IV/RV>=1, credit/width>=0.10, DTE 7-60, liquidity OI>=500/vol>=100",
+    "settlement": "leg-intrinsic at expiry, terminal spot = captured snapshot within ±4d of expiry",
+    "fills": "maker=mid credit; taker=sell@bid/buy@ask credit; managed exit closes maker@mid / taker@ask-bid"
+  },
+  "coverage": {
+    "symbolDaysScanned": 547,
+    "symbolDaysWithCandidate": 135,
+    "skippedNoIvRank": 225,
+    "skippedNoRv": 0,
+    "tradesOpened": 403,
+    "routedTrades": 13,
+    "unsettleableTopEntries": 109
+  },
+  "routingProxy": {
+    "hold": {
+      "maker": {
+        "n": 13,
+        "expectancyR": -0.09763473933646384,
+        "medianR": 0.12688753662384492,
+        "winRate": 0.7692307692307693,
+        "profitFactor": 0.5769161295419899,
+        "worstR": -1,
+        "bestR": 0.4705882352941177,
+        "p05R": -1,
+        "p95R": 0.1846001974333662,
+        "maxLossHitFreq": 0.23076923076923078,
+        "avgEstPoP": 0.7896370756085747,
+        "realizedWinRateVsEstPoP": {
+          "realized": 0.7692307692307693,
+          "predicted": 0.7896370756085747
+        },
+        "avgCreditToWidth": 0.16476153846153851,
+        "avgDte": 17.28691099804131
+      },
+      "taker": {
+        "n": 12,
+        "expectancyR": -0.15013321416952582,
+        "medianR": 0.0989010989010989,
+        "winRate": 0.75,
+        "profitFactor": 0.39946714332189664,
+        "worstR": -1.0000000000000002,
+        "bestR": 0.36054421768707484,
+        "p05R": -1.0000000000000002,
+        "p95R": 0.13421550094517962,
+        "maxLossHitFreq": 0.25,
+        "avgEstPoP": 0.7872964413397,
+        "realizedWinRateVsEstPoP": {
+          "realized": 0.75,
+          "predicted": 0.7872964413397
+        },
+        "avgCreditToWidth": 0.16875833333333334,
+        "avgDte": 17.5605341714892
+      }
+    },
+    "managed": {
+      "maker": {
+        "n": 13,
+        "expectancyR": -0.040822452159608454,
+        "medianR": 0.11940018744142453,
+        "winRate": 0.8461538461538461,
+        "profitFactor": 0.7346540609625448,
+        "worstR": -0.9999999999999998,
+        "bestR": 0.24779411764705886,
+        "p05R": -0.9999999999999998,
+        "p95R": 0.16550116550116553,
+        "maxLossHitFreq": 0.15384615384615385,
+        "avgEstPoP": 0.7896370756085747,
+        "realizedWinRateVsEstPoP": {
+          "realized": 0.8461538461538461,
+          "predicted": 0.7896370756085747
+        },
+        "avgCreditToWidth": 0.16476153846153851,
+        "avgDte": 17.28691099804131
+      },
+      "taker": {
+        "n": 12,
+        "expectancyR": -0.16566605059960238,
+        "medianR": 0.06192406929598231,
+        "winRate": 0.75,
+        "profitFactor": 0.3373357976015906,
+        "worstR": -1.0000000000000002,
+        "bestR": 0.36054421768707484,
+        "p05R": -1.0000000000000002,
+        "p95R": 0.13122171945701358,
+        "maxLossHitFreq": 0.25,
+        "avgEstPoP": 0.7872964413397,
+        "realizedWinRateVsEstPoP": {
+          "realized": 0.75,
+          "predicted": 0.7872964413397
+        },
+        "avgCreditToWidth": 0.16875833333333334,
+        "avgDte": 17.5605341714892
+      }
+    },
+    "byStructureTakerManaged": {
+      "put_credit_spread": {
+        "n": 9,
+        "expectancyR": -0.2454424205204895,
+        "medianR": 0.06192406929598231,
+        "winRate": 0.6666666666666666,
+        "profitFactor": 0.26367273843853145,
+        "worstR": -1.0000000000000002,
+        "bestR": 0.36054421768707484,
+        "p05R": -1.0000000000000002,
+        "p95R": 0.13122171945701358,
+        "maxLossHitFreq": 0.3333333333333333,
+        "avgEstPoP": 0.7876021808139583,
+        "realizedWinRateVsEstPoP": {
+          "realized": 0.6666666666666666,
+          "predicted": 0.7876021808139583
+        },
+        "avgCreditToWidth": 0.185962962962963,
+        "avgDte": 17.86562894290124
+      },
+      "call_credit_spread": {
+        "n": 3,
+        "expectancyR": 0.07366305916305917,
+        "medianR": 0.08225108225108227,
+        "winRate": 1,
+        "profitFactor": null,
+        "worstR": 0.05607142857142857,
+        "bestR": 0.08266666666666667,
+        "p05R": 0.05607142857142857,
+        "p95R": 0.08225108225108227,
+        "maxLossHitFreq": 0,
+        "avgEstPoP": 0.7863792229169256,
+        "realizedWinRateVsEstPoP": {
+          "realized": 1,
+          "predicted": 0.7863792229169256
+        },
+        "avgCreditToWidth": 0.11714444444444444,
+        "avgDte": 16.645249857253088
+      },
+      "iron_condor": {
+        "n": 0
+      }
+    },
+    "byStructureTakerHold": {
+      "put_credit_spread": {
+        "n": 9,
+        "expectancyR": -0.2295988149805638,
+        "medianR": 0.10294117647058826,
+        "winRate": 0.6666666666666666,
+        "profitFactor": 0.3112035550583084,
+        "worstR": -1.0000000000000002,
+        "bestR": 0.36054421768707484,
+        "p05R": -1.0000000000000002,
+        "p95R": 0.13421550094517962,
+        "maxLossHitFreq": 0.3333333333333333,
+        "avgEstPoP": 0.7876021808139583,
+        "realizedWinRateVsEstPoP": {
+          "realized": 0.6666666666666666,
+          "predicted": 0.7876021808139583
+        },
+        "avgCreditToWidth": 0.185962962962963,
+        "avgDte": 17.86562894290124
+      },
+      "call_credit_spread": {
+        "n": 3,
+        "expectancyR": 0.08826358826358827,
+        "medianR": 0.08225108225108227,
+        "winRate": 1,
+        "profitFactor": null,
+        "worstR": 0.07142857142857142,
+        "bestR": 0.1111111111111111,
+        "p05R": 0.07142857142857142,
+        "p95R": 0.08225108225108227,
+        "maxLossHitFreq": 0,
+        "avgEstPoP": 0.7863792229169256,
+        "realizedWinRateVsEstPoP": {
+          "realized": 1,
+          "predicted": 0.7863792229169256
+        },
+        "avgCreditToWidth": 0.11714444444444444,
+        "avgDte": 16.645249857253088
+      },
+      "iron_condor": {
+        "n": 0
+      }
+    }
+  },
+  "allCandidates": {
+    "hold": {
+      "maker": {
+        "n": 403,
+        "expectancyR": 0.03951303487174651,
+        "medianR": 0.1332728921124207,
+        "winRate": 0.8064516129032258,
+        "profitFactor": 1.3212743292580138,
+        "worstR": -1.0000000000000004,
+        "bestR": 0.805054151624549,
+        "p05R": -0.9999999999999998,
+        "p95R": 0.42687277051129613,
+        "maxLossHitFreq": 0.062034739454094295,
+        "avgEstPoP": 0.7182855497034873,
+        "realizedWinRateVsEstPoP": {
+          "realized": 0.8064516129032258,
+          "predicted": 0.7182855497034873
+        },
+        "avgCreditToWidth": 0.17486573349825052,
+        "avgDte": 16.854131669079077
+      },
+      "taker": {
+        "n": 401,
+        "expectancyR": 0.0009427280415915087,
+        "medianR": 0.11558723272389215,
+        "winRate": 0.8029925187032418,
+        "profitFactor": 1.007488004435604,
+        "worstR": -1.0000000000000004,
+        "bestR": 0.48809523809523797,
+        "p05R": -0.9999999999999998,
+        "p95R": 0.31926121372031663,
+        "maxLossHitFreq": 0.06234413965087282,
+        "avgEstPoP": 0.7180269019466904,
+        "realizedWinRateVsEstPoP": {
+          "realized": 0.8029925187032418,
+          "predicted": 0.7180269019466904
+        },
+        "avgCreditToWidth": 0.1751411236902618,
+        "avgDte": 16.833436899764425
+      }
+    },
+    "managed": {
+      "maker": {
+        "n": 403,
+        "expectancyR": 0.038425072946962006,
+        "medianR": 0.11585014409221915,
+        "winRate": 0.8511166253101737,
+        "profitFactor": 1.3756795900439736,
+        "worstR": -1.0000000000000002,
+        "bestR": 0.7241379310344828,
+        "p05R": -0.9870298313878088,
+        "p95R": 0.3736263736263736,
+        "maxLossHitFreq": 0.04714640198511166,
+        "avgEstPoP": 0.7182855497034873,
+        "realizedWinRateVsEstPoP": {
+          "realized": 0.8511166253101737,
+          "predicted": 0.7182855497034873
+        },
+        "avgCreditToWidth": 0.17486573349825052,
+        "avgDte": 16.854131669079077
+      },
+      "taker": {
+        "n": 401,
+        "expectancyR": -0.0037004334630775667,
+        "medianR": 0.09537389100126742,
+        "winRate": 0.8354114713216958,
+        "profitFactor": 0.9681595768961465,
+        "worstR": -1.0000000000000002,
+        "bestR": 0.48809523809523797,
+        "p05R": -0.9999999999999997,
+        "p95R": 0.2934220251293423,
+        "maxLossHitFreq": 0.057356608478802994,
+        "avgEstPoP": 0.7180269019466904,
+        "realizedWinRateVsEstPoP": {
+          "realized": 0.8354114713216958,
+          "predicted": 0.7180269019466904
+        },
+        "avgCreditToWidth": 0.1751411236902618,
+        "avgDte": 16.833436899764425
+      }
+    }
+  },
+  "verdict": {
+    "routedTakerManaged": {
+      "call": "INSUFFICIENT",
+      "why": "n=12 < 20"
+    },
+    "routedTakerHold": {
+      "call": "INSUFFICIENT",
+      "why": "n=12 < 20"
+    },
+    "note": "Primary bar = routed / taker / managed (what demo routing would actually earn). GO requires taker expectancy >=0.05R and PF >=1.2 at n>=20."
+  }
+}
