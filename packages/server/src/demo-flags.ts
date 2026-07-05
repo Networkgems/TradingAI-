@@ -84,6 +84,15 @@ export const DEMO_FLAG_ALLOWLIST = [
   // live breaker. On the self-host TRADIER_ENV=sandbox, so the guard only ever
   // flattens/halts the PAPER book.
   'EXIT_RISK_RULES_ENABLED',
+  // TRA-1317 (parent TRA-1316, board interaction `7042a614` = demo) — arm DEMO
+  // paper routing of the regime-gated TSMOM scanner. STANDALONE flag (not under the
+  // ENABLE_CRYPTO_REGIME_TSMOM observe master), and the route book is a dedicated
+  // CryptoPaperAccount with NO live path, so arming it can never touch real capital.
+  // Routes enter_long/exit_long transitions into the demo book so the crypto
+  // dashboard shows movement + accrues forward round-trip evidence. Safe for the
+  // file override so a non-admin operator can arm the demo routing on the
+  // self-hosted host (no PM2/admin).
+  'CRYPTO_REGIME_TSMOM_DEMO_ROUTE_ENABLED',
 ] as const;
 
 export const DEMO_FLAGS_FILENAME = 'demo-flags.json';

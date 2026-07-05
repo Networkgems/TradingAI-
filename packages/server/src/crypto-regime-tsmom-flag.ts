@@ -31,6 +31,23 @@ export function isRegimeTsmomEnabled(env: NodeJS.ProcessEnv = process.env): bool
   return flagOn(env[CRYPTO_REGIME_TSMOM_FLAG]);
 }
 
+// TRA-1317 (parent TRA-1316, board interaction `7042a614` answer = demo) —
+// STANDALONE, DEMO-scoped flag that promotes the observe-only regime-gated TSMOM
+// scanner from would-be signals to DEMO PAPER routing so the crypto dashboard
+// shows movement and we accrue forward round-trip evidence at ZERO real-capital
+// risk. Mirrors the TRA-1294 take-profit-early rollout: it is NOT under the
+// ENABLE_CRYPTO_REGIME_TSMOM master (that flag arms the observe capture; this one
+// arms the paper book independently), and the route book is a dedicated
+// CryptoPaperAccount with NO live-broker path — so arming this on bqb1 (the single
+// production instance) is structurally incapable of touching live/real capital.
+// OFF by default (1/true/yes/on). Live promotion remains a separate board decision.
+export const CRYPTO_REGIME_TSMOM_DEMO_ROUTE_FLAG = 'CRYPTO_REGIME_TSMOM_DEMO_ROUTE_ENABLED';
+
+/** True iff the DEMO paper-routing of regime-gated TSMOM transitions is armed. */
+export function isRegimeTsmomDemoRouteEnabled(env: NodeJS.ProcessEnv = process.env): boolean {
+  return flagOn(env[CRYPTO_REGIME_TSMOM_DEMO_ROUTE_FLAG]);
+}
+
 // ── Tunable bands / fees (QuantTrader sign-off — spec §4) ─────────────────────
 //
 // Every knob is env-overridable so QuantTrader / the operator can run the offline

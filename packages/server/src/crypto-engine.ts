@@ -399,6 +399,22 @@ export class CryptoSignalEngine {
    */
   private ownerUsername: string | undefined;
 
+  /**
+   * TRA-1317 — optional provider of EXTERNAL demo paper positions to surface on the
+   * Crypto dashboard's Demo view alongside this engine's own book. Injected by
+   * index.ts on the demo context so the regime-gated TSMOM demo-route book's open
+   * longs (an isolated CryptoPaperAccount with NO live path) appear as the
+   * "movement" the board asked for. Read-only: buildState only READS these in the
+   * demo branch and never routes/mutates them here; the live branch never consults
+   * it, so real capital is untouched. Null until bound.
+   */
+  private externalDemoPositionsProvider: (() => Position[]) | null = null;
+
+  /** TRA-1317 — bind the external demo-positions provider (see the field doc). */
+  setExternalDemoPositionsProvider(fn: (() => Position[]) | null): void {
+    this.externalDemoPositionsProvider = fn;
+  }
+
   constructor(tracker?: PnlTracker, settings?: AccountSettings) {
     this.tracker = tracker;
     this.currentSettings = settings;
@@ -2384,6 +2400,19 @@ export class CryptoSignalEngine {
     // TRA-231 — same idempotent stamp as the live branch above so demo open
     // positions carry an explicit mode tag through to the UI.
     for (const p of accountBase.openPositions) p.mode = 'demo';
+    // TRA-1317 — surface EXTERNAL demo paper positions (the regime-gated TSMOM
+    // demo-route book) alongside this engine's own demo book so the dashboard shows
+    // the routed "movement". Demo-only (this branch never runs for live) and
+    // read-only — a defensive copy is appended; the route book owns their lifecycle.
+    if (this.externalDemoPositionsProvider) {
+      try {
+        for (const p of this.externalDemoPositionsProvider()) {
+          accountBase.openPositions.push({ ...p, mode: 'demo' });
+        }
+      } catch {
+        // a provider failure must never break the dashboard state broadcast
+      }
+    }
     const account: AccountState = {
       ...accountBase,
       weeklyPnl: stats?.weeklyPnl ?? 0,

@@ -78,6 +78,7 @@ import {
 // be long/exit/short-observe SIGNALS + forward net-of-fee evidence, no order path.
 import {
   isRegimeTsmomEnabled,
+  isRegimeTsmomDemoRouteEnabled,
   resolveRegimeTsmomConfig,
   resolveRegimeTsmomWatchlist,
 } from './crypto-regime-tsmom-flag.js';
@@ -89,6 +90,17 @@ import {
   hydrateRegimeTsmomFromDisk,
   type RegimeTsmomState,
 } from './crypto-regime-tsmom-scanner.js';
+// TRA-1317 — DEMO paper routing for the regime-gated TSMOM scanner (board
+// interaction 7042a614 = demo). Standalone, demo-scoped: an isolated CryptoPaperAccount
+// route book with NO live path, so arming can never touch real capital. Routes on
+// enter_long/exit_long transitions, persists a restart-safe JSONL + snapshot, and
+// surfaces its open longs to the crypto dashboard for the "movement" the board wants.
+import {
+  routeRegimeTsmomResults,
+  hydrateRegimeTsmomDemoRouteFromDisk,
+  summarizeRegimeTsmomDemoRoute,
+  getRegimeTsmomDemoRoutePositions,
+} from './crypto-regime-tsmom-demo-route.js';
 // TRA-1271 — observe-only crypto ignition scanner (strict RVOL>=6 Donchian
 // breakout + squeeze + EMA50 trend, bull-only). Flag-checked before any 4H fetch so
 // ENABLE_CRYPTO_IGNITION_SCANNER off => zero cost/IO. Read-only, ZERO capital:
@@ -1729,9 +1741,18 @@ async function generateAndSaveCryptoReport(ctx: UserContext): Promise<void> {
     isRegimeTsmomEnabled(),
     summarizeRegimeTsmomScans(),
   );
+  // TRA-1317 — append a one-line DEMO-route rollup under the observe-only section:
+  // whether paper routing is armed + the accrued open/fill/realized-R evidence. Kept
+  // out of buildRegimeTsmomEodSection (scanner module) to avoid a scanner→route
+  // import cycle. Read-only: folds the route ledger, places no order.
+  const demoRoute = summarizeRegimeTsmomDemoRoute();
+  const demoRouteEnabled = isRegimeTsmomDemoRouteEnabled(demoFlagEnv());
+  const regimeTsmomDemoRouteLine = demoRouteEnabled
+    ? `\n_DEMO paper routing **armed** — open ${demoRoute.openPositions} · fills ${demoRoute.fillCount} · closed ${demoRoute.closeCount} · realized ${demoRoute.realizedR}R (paper, zero real capital)._`
+    : `\n_DEMO paper routing disarmed (CRYPTO_REGIME_TSMOM_DEMO_ROUTE_ENABLED off)._`;
   const report = {
     ...baseReport,
-    markdown: `${baseReport.markdown}\n${regimeSection}\n${regimeTsmomSection}\n`,
+    markdown: `${baseReport.markdown}\n${regimeSection}\n${regimeTsmomSection}${regimeTsmomDemoRouteLine}\n`,
   };
   const targetDir = cryptoReportsDirFor(ctx, mode);
   const datePath = join(targetDir, `${report.date}.json`);
@@ -1947,6 +1968,24 @@ const regimeTsmomStateBySymbol = new Map<string, RegimeTsmomState>();
   }
 }
 
+// TRA-1317 — hydrate the DEMO paper-route book on boot so an open routed long and
+// the realized-R accrual survive the ~daily Render demo (`tradingai-bqb1`) reboot.
+// Restores the isolated CryptoPaperAccount route book + counters from the state
+// snapshot under DATA_DIR (the JSONL is the append-only audit). Runs even when the
+// route flag is off — reading one small file at boot is cheap and keeps the ledger
+// intact if the flag is later armed. NO live path is touched (the route book has none).
+{
+  const h = hydrateRegimeTsmomDemoRouteFromDisk(DATA_DIR);
+  if (h.fillCount > 0 || h.openPositions > 0) {
+    log.info('crypto regime-tsmom demo-route hydrated (TRA-1317)', {
+      openPositions: h.openPositions,
+      fillCount: h.fillCount,
+      closeCount: h.closeCount,
+      realizedR: h.realizedR,
+    });
+  }
+}
+
 // TRA-1221 — observe-only regime-gated TSMOM pass, fired off the SAME hourly hook
 // as the funding-carry and regime-overlay passes above. When ENABLE_CRYPTO_REGIME_TSMOM
 // is OFF it returns before ANY fetch ⇒ provably zero cost/IO. When ON it pulls
@@ -1996,6 +2035,22 @@ async function runHourlyCryptoRegimeTsmom(): Promise<void> {
         newSignals: signals,
         roundTrips: result.results.filter((r) => r.roundTrip).length,
       });
+    }
+
+    // TRA-1317 — DEMO paper routing. When the standalone, demo-scoped route flag
+    // is armed (resolved through the SAME demo-flags overlay the engine consults,
+    // so a non-admin operator can arm it via DATA_DIR/demo-flags.json), route this
+    // pass's enter_long/exit_long transitions into the isolated CryptoPaperAccount
+    // route book. Structurally DEMO-only: that book has no live path, so this can
+    // never touch real capital regardless of the host. Off by default ⇒ no-op.
+    if (isRegimeTsmomDemoRouteEnabled(demoFlagEnv())) {
+      const routed = routeRegimeTsmomResults(result.results, resolveRegimeTsmomConfig());
+      if (routed.opened > 0 || routed.closed > 0) {
+        log.info('crypto regime-tsmom demo-route fills (TRA-1317)', {
+          opened: routed.opened,
+          closed: routed.closed,
+        });
+      }
     }
   }
 }
@@ -7018,6 +7073,10 @@ wss.on('connection', async (ws) => {
 function attachBroadcastHandlers(ctx: UserContext): void {
   const equityAudit = new TradeAuditTracker(ctx.username, 'equity');
   const cryptoAudit = new TradeAuditTracker(ctx.username, 'crypto');
+  // TRA-1317 — surface the process-global regime-gated TSMOM demo-route book's open
+  // paper longs on this engine's Demo dashboard view. Consulted only in buildState's
+  // demo branch, so a live-mode context never renders them (real capital untouched).
+  ctx.cryptoEngine.setExternalDemoPositionsProvider(getRegimeTsmomDemoRoutePositions);
   ctx.engine.onTick((state) => {
     try { equityAudit.observe(state as unknown as Parameters<typeof equityAudit.observe>[0]); } catch { /* audit must never break broadcast */ }
     broadcastToUser(ctx.username, JSON.stringify({ type: 'state', payload: state }));

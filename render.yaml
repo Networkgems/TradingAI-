@@ -401,6 +401,22 @@ services:
       # effect on the running service. Accepts 1/true/yes/on.
       - key: TAKE_PROFIT_EARLY_ENABLED
         value: "true"
+      # TRA-1317 (parent TRA-1316, board interaction `7042a614` answer = demo) —
+      # arm DEMO PAPER routing of the regime-gated TSMOM scanner so the crypto
+      # dashboard shows movement and we accrue forward round-trip evidence at ZERO
+      # real-capital risk. STANDALONE flag, deliberately NOT under the
+      # ENABLE_CRYPTO_REGIME_TSMOM observe master: that flag arms the observe
+      # capture; this one arms the DEMO paper book independently. The route book is
+      # a DEDICATED CryptoPaperAccount with NO live-broker path, so setting this can
+      # NEVER touch the live/real-capital book regardless of host. On the demo book
+      # it opens/closes paper longs on the scanner's enter_long/exit_long
+      # transitions. Readout: `GET /api/health/crypto-regime-tsmom`
+      # (`demoRoute.enabled:true`). NOTE: blueprint sync ≠ autoDeploy on bqb1
+      # (TRA-1289) — a redeploy (or the DATA_DIR/demo-flags.json override) is needed
+      # for this var to take effect on the running service. Live promotion remains a
+      # separate board decision. Accepts 1/true/yes/on.
+      - key: CRYPTO_REGIME_TSMOM_DEMO_ROUTE_ENABLED
+        value: "1"
       # TRA-1080 — event-loop/heap starvation watchdog. The watchdog itself is
       # ON by default in code (no env needed); these knobs are declared
       # `sync: false` so an operator can DISABLE or RETUNE it from the dashboard

@@ -33,8 +33,9 @@ import { isPerpFundingCarryEnabled } from '../perp-funding-carry-flag.js';
 import { summarizeFundingCarryScans } from '../perp-funding-carry-scanner.js';
 import { isCryptoRegimeEnabled } from '../crypto-regime-flag.js';
 import { summarizeCryptoRegimeScans } from '../crypto-regime-scanner.js';
-import { isRegimeTsmomEnabled } from '../crypto-regime-tsmom-flag.js';
+import { isRegimeTsmomEnabled, isRegimeTsmomDemoRouteEnabled } from '../crypto-regime-tsmom-flag.js';
 import { summarizeRegimeTsmomScans } from '../crypto-regime-tsmom-scanner.js';
+import { summarizeRegimeTsmomDemoRoute } from '../crypto-regime-tsmom-demo-route.js';
 import { isCryptoIgnitionEnabled, resolveIgnitionWatchlist } from '../crypto-ignition-flag.js';
 import { summarizeIgnitionScans } from '../crypto-ignition-scanner.js';
 import { summarizeConvictionDca, resolveConvictionDcaDeployAnchor } from '../conviction-dca-ledger.js';
@@ -888,12 +889,34 @@ export function registerLiveHealthRoutes(app: Express, deps: LiveHealthDeps): vo
   // empty ⇒ fail-closed `enabled:false` with `scans:[]`. Always read-only: NO order
   // is placed off these signals — the short_observe leg is never sized.
   app.get('/api/health/crypto-regime-tsmom', (_req, res) => {
+    // TRA-1317 — the DEMO paper-route block. `enabled` mirrors the standalone,
+    // demo-scoped CRYPTO_REGIME_TSMOM_DEMO_ROUTE_ENABLED resolved through the SAME
+    // demo-flags overlay the engine consults (process.env layered with the DATA_DIR
+    // demo-flags.json, file wins) so it reflects the EFFECTIVE switch. The route book
+    // has no live path (liveCapitalReachable:false) — arming it can never touch real
+    // capital. openPositions/fillCount/realizedR are the forward evidence the future
+    // live-promotion decision reads; all rebuilt from the snapshot under DATA_DIR on boot.
+    const dir = process.env.DATA_DIR;
+    const routeEnv = dir ? resolveDemoFlagEnv(dir) : process.env;
+    const demo = summarizeRegimeTsmomDemoRoute();
     res.json({
       ok: true,
       time: new Date(now()).toISOString(),
       build: resolveBuildInfo(),
       enabled: isRegimeTsmomEnabled(),
       ...summarizeRegimeTsmomScans(now()),
+      demoRoute: {
+        enabled: isRegimeTsmomDemoRouteEnabled(routeEnv),
+        demoOnly: true,
+        liveCapitalReachable: false,
+        openPositions: demo.openPositions,
+        fillCount: demo.fillCount,
+        closeCount: demo.closeCount,
+        lastFillAt: demo.lastFillAt,
+        realizedR: demo.realizedR,
+        realizedPnl: demo.realizedPnl,
+        recent: demo.recent,
+      },
     });
   });
 
