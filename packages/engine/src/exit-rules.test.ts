@@ -7,7 +7,10 @@ import {
   profitLockDecision,
   bookGiveBackDecision,
   takeProfitEarlyDecision,
+  correlatedExposureDecision,
+  buildExposureBuckets,
 } from './exit-rules.js';
+import type { ExposurePositionRisk } from './exit-rules.js';
 
 // TRA-1250 — exit-side loss-control rules (board-approved TRA-1249 params).
 
@@ -225,5 +228,143 @@ describe('Rule 4 (TRA-1294) — take-profit-early', () => {
     const d = takeProfitEarlyDecision({ side: 'buy', entry: 1, currentPrice: 0.7, maxProfitPrice: 2 });
     expect(d.capturedFrac).toBe(0);
     expect(d.shouldExit).toBe(false);
+  });
+});
+
+// TRA-1295 — Rule 5, the "7%" leg of the 3-5-7 governor: the correlated-exposure
+// cap. Aggregate open per-trade $risk in one correlated group (underlying /
+// sector / asset-class) may not exceed 7% of managed equity; a candidate that
+// would breach a group is scaled to headroom, or rejected below the min floor.
+describe('Rule 5 — correlated-exposure cap (TRA-1295)', () => {
+  const EQ = 100_000; // 7% cap ⇒ $7,000 per group; 0.25% floor ⇒ $250
+
+  it('admits at full size when every group has room for the candidate', () => {
+    const d = correlatedExposureDecision({
+      candidateRisk: 1_000,
+      managedEquity: EQ,
+      buckets: [{ level: 'assetClass', key: 'equity', openRisk: 2_000 }], // 2k + 1k = 3k < 7k
+    });
+    expect(d.admitted).toBe(true);
+    expect(d.scale).toBe(1);
+    expect(d.bindingBucket).toBeNull();
+    expect(d.headroom).toBe(Number.POSITIVE_INFINITY);
+  });
+
+  it('scales the candidate DOWN to the most-binding group headroom', () => {
+    // asset-class already holds $6,500 → only $500 headroom for a $1,000 candidate.
+    const d = correlatedExposureDecision({
+      candidateRisk: 1_000,
+      managedEquity: EQ,
+      buckets: [
+        { level: 'underlying', key: 'AAPL', openRisk: 0 },
+        { level: 'assetClass', key: 'equity', openRisk: 6_500 },
+      ],
+    });
+    expect(d.admitted).toBe(true);
+    expect(d.scale).toBeCloseTo(0.5, 9); // 500 / 1000
+    expect(d.headroom).toBeCloseTo(500, 6);
+    expect(d.bindingBucket).toEqual({ level: 'assetClass', key: 'equity' });
+  });
+
+  it('takes the SMALLEST headroom across grains (underlying binds before asset-class)', () => {
+    const d = correlatedExposureDecision({
+      candidateRisk: 1_000,
+      managedEquity: EQ,
+      buckets: [
+        { level: 'underlying', key: 'AAPL', openRisk: 6_600 }, // 400 room — tightest (still above the $250 floor)
+        { level: 'sector', key: 'tech', openRisk: 5_000 }, // 2,000 room
+        { level: 'assetClass', key: 'equity', openRisk: 3_000 }, // 4,000 room
+      ],
+    });
+    expect(d.scale).toBeCloseTo(0.4, 9); // 400 / 1000
+    expect(d.bindingBucket).toEqual({ level: 'underlying', key: 'AAPL' });
+  });
+
+  it('rejects when the binding headroom falls below the min-trade-risk floor', () => {
+    // $6,900 already committed → $100 headroom < the $250 (0.25%) floor.
+    const d = correlatedExposureDecision({
+      candidateRisk: 1_000,
+      managedEquity: EQ,
+      buckets: [{ level: 'assetClass', key: 'crypto', openRisk: 6_900 }],
+    });
+    expect(d.admitted).toBe(false);
+    expect(d.scale).toBe(0);
+    expect(d.reason).toBe('below_min_trade_risk');
+    expect(d.bindingBucket).toEqual({ level: 'assetClass', key: 'crypto' });
+  });
+
+  it('rejects when a group is already at/over the cap (no negative headroom)', () => {
+    const d = correlatedExposureDecision({
+      candidateRisk: 500,
+      managedEquity: EQ,
+      buckets: [{ level: 'sector', key: 'energy', openRisk: 7_500 }], // over the $7k cap
+    });
+    expect(d.admitted).toBe(false);
+    expect(d.reason).toBe('below_min_trade_risk');
+    expect(d.headroom).toBe(0); // clamped, never negative
+  });
+
+  it('rejects a candidate with no measurable risk instead of dividing by zero', () => {
+    const d = correlatedExposureDecision({
+      candidateRisk: 0,
+      managedEquity: EQ,
+      buckets: [{ level: 'assetClass', key: 'equity', openRisk: 0 }],
+    });
+    expect(d.admitted).toBe(false);
+    expect(d.reason).toBe('non_positive_risk');
+  });
+
+  it('honors a per-bucket capPct override (tighten one grain below the 7% default)', () => {
+    // underlying capped at 2% ($2,000); $1,500 open ⇒ $500 headroom binds.
+    const d = correlatedExposureDecision({
+      candidateRisk: 1_000,
+      managedEquity: EQ,
+      buckets: [{ level: 'underlying', key: 'TSLA', openRisk: 1_500, capPct: 0.02 }],
+    });
+    expect(d.scale).toBeCloseTo(0.5, 9);
+    expect(d.bindingBucket).toEqual({ level: 'underlying', key: 'TSLA' });
+  });
+
+  it('admits full size on an exact fit (headroom === candidate risk)', () => {
+    const d = correlatedExposureDecision({
+      candidateRisk: 1_000,
+      managedEquity: EQ,
+      buckets: [{ level: 'assetClass', key: 'equity', openRisk: 6_000 }], // exactly $1,000 room
+    });
+    expect(d.admitted).toBe(true);
+    expect(d.scale).toBe(1);
+    expect(d.bindingBucket).toBeNull(); // an exact fit is not "bound"
+  });
+
+  describe('buildExposureBuckets', () => {
+    const candidate: ExposurePositionRisk = { underlying: 'AAPL', sector: 'tech', assetClass: 'equity', risk: 1_000 };
+    const open: ExposurePositionRisk[] = [
+      { underlying: 'AAPL', sector: 'tech', assetClass: 'equity', risk: 400 }, // same underlying
+      { underlying: 'MSFT', sector: 'tech', assetClass: 'equity', risk: 600 }, // same sector, diff underlying
+      { underlying: 'XOM', sector: 'energy', assetClass: 'equity', risk: 800 }, // same asset-class only
+      { underlying: 'BTC-USD', sector: undefined, assetClass: 'crypto', risk: 999 }, // shares nothing
+    ];
+
+    it('sums OPEN risk per grain the candidate shares, excluding its own risk', () => {
+      const buckets = buildExposureBuckets(candidate, open);
+      const byLevel = Object.fromEntries(buckets.map((b) => [b.level, b]));
+      expect(byLevel.underlying).toMatchObject({ key: 'AAPL', openRisk: 400 });
+      expect(byLevel.sector).toMatchObject({ key: 'tech', openRisk: 1_000 }); // 400 + 600
+      expect(byLevel.assetClass).toMatchObject({ key: 'equity', openRisk: 1_800 }); // 400 + 600 + 800
+    });
+
+    it('skips a grain the candidate has no key for (missing sector), never a catch-all', () => {
+      const noSector: ExposurePositionRisk = { underlying: 'BTC-USD', assetClass: 'crypto', risk: 500 };
+      const buckets = buildExposureBuckets(noSector, open);
+      expect(buckets.map((b) => b.level)).toEqual(['underlying', 'assetClass']);
+    });
+
+    it('feeds straight into the decision — a crowded sector scales the candidate down', () => {
+      const buckets = buildExposureBuckets(candidate, open, { sector: 0.015 }); // sector cap 1.5% = $1,500
+      const d = correlatedExposureDecision({ candidateRisk: 1_000, managedEquity: 100_000, buckets });
+      // sector already holds $1,000 → $500 headroom under the tightened 1.5% cap.
+      expect(d.scale).toBeCloseTo(0.5, 9);
+      expect(d.bindingBucket).toEqual({ level: 'sector', key: 'tech' });
+    });
   });
 });

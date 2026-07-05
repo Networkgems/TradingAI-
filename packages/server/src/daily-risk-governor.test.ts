@@ -340,3 +340,54 @@ describe('DailyRiskGovernor — TRA-1267 book give-back cap (Rule 3)', () => {
     expect(gov.getHaltReason()).toMatch(/give-back/i);
   });
 });
+
+// TRA-1295 — Rule 5, the "7%" leg of the 3-5-7 governor: the correlated-exposure
+// cap surfaced on the governor as a per-entry ADMISSION cap (not a day-latched
+// halt). It delegates to the pure `correlatedExposureDecision` with the
+// governor's shared 7% cap / 0.25% floor defaults.
+describe('DailyRiskGovernor — TRA-1295 correlated-exposure cap (Rule 5)', () => {
+  const EQ = 100_000; // 7% cap ⇒ $7,000 per correlated group
+
+  it('admits a candidate at full size when its correlated group has room', () => {
+    const gov = new DailyRiskGovernor(() => new Date('2026-06-02T15:00:00Z'));
+    const d = gov.admitCorrelatedExposure(1_000, EQ, [
+      { level: 'assetClass', key: 'equity', openRisk: 3_000 },
+    ]);
+    expect(d.admitted).toBe(true);
+    expect(d.scale).toBe(1);
+  });
+
+  it('scales a candidate down to the correlated group headroom (uses the 7% default)', () => {
+    const gov = new DailyRiskGovernor(() => new Date('2026-06-02T15:00:00Z'));
+    // $6,500 already in the equity asset-class ⇒ $500 headroom under the 7% cap.
+    const d = gov.admitCorrelatedExposure(1_000, EQ, [
+      { level: 'assetClass', key: 'equity', openRisk: 6_500 },
+    ]);
+    expect(d.admitted).toBe(true);
+    expect(d.scale).toBeCloseTo(0.5, 9);
+    expect(d.bindingBucket).toEqual({ level: 'assetClass', key: 'equity' });
+  });
+
+  it('rejects below the governor min-trade-risk floor (0.25% of equity)', () => {
+    const gov = new DailyRiskGovernor(() => new Date('2026-06-02T15:00:00Z'));
+    const d = gov.admitCorrelatedExposure(1_000, EQ, [
+      { level: 'underlying', key: 'AAPL', openRisk: 6_900 }, // $100 headroom < $250 floor
+    ]);
+    expect(d.admitted).toBe(false);
+    expect(d.reason).toBe('below_min_trade_risk');
+  });
+
+  it('is a per-entry admission, NOT a halt — it never sets isHalted()', () => {
+    const gov = new DailyRiskGovernor(() => new Date('2026-06-02T15:00:00Z'));
+    gov.admitCorrelatedExposure(1_000, EQ, [
+      { level: 'assetClass', key: 'crypto', openRisk: 9_999 }, // way over the cap
+    ]);
+    expect(gov.isHalted()).toBe(false);
+    expect(gov.getHaltReason()).toBeNull();
+  });
+
+  it('surfaces the enforced cap config for the health readout', () => {
+    const gov = new DailyRiskGovernor(() => new Date('2026-06-02T15:00:00Z'));
+    expect(gov.describeCorrelatedExposureCap()).toEqual({ capPct: 0.07, minTradeRiskPct: 0.0025 });
+  });
+});

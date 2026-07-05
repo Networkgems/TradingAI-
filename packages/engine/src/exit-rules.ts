@@ -8,6 +8,8 @@ import {
   PROFIT_LOCK_TIGHTEN_GIVEBACK_R,
   BOOK_GIVEBACK_CAP_PCT,
   TAKE_PROFIT_EARLY_CAPTURE_PCT,
+  CORRELATED_EXPOSURE_CAP_PCT,
+  CORRELATED_EXPOSURE_MIN_TRADE_RISK_PCT,
 } from '@trading-app/shared';
 
 /**
@@ -334,4 +336,176 @@ export function takeProfitEarlyDecision(p: TakeProfitEarlyParams): TakeProfitEar
   const shouldExit = capturedFrac >= captureFrac;
 
   return { availableProfit, currentProfit, capturedFrac, captureFrac, shouldExit };
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Rule 5 (TRA-1295) — correlated-exposure cap (the "7%" leg of the 3-5-7 governor)
+// ─────────────────────────────────────────────────────────────────────────────
+
+/** The grain at which a correlated group is formed. */
+export type ExposureLevel = 'underlying' | 'sector' | 'assetClass';
+
+/**
+ * One correlated group the candidate belongs to, carrying the Σ open per-trade
+ * dollar risk already committed to it. The candidate is evaluated against ALL of
+ * its buckets (underlying, sector, asset-class); the most-binding one governs.
+ */
+export interface ExposureBucket {
+  /** Which grain this bucket is (for the surfaced reason / logging). */
+  level: ExposureLevel;
+  /** The group value at that grain, e.g. `'AAPL'` / `'technology'` / `'equity'`. */
+  key: string;
+  /** Sum of OPEN per-trade dollar risk already committed to this group. */
+  openRisk: number;
+  /** Per-bucket cap fraction of managed equity; defaults to `capPct` / 7%. */
+  capPct?: number;
+}
+
+export interface CorrelatedExposureParams {
+  /** The candidate entry's per-trade dollar risk = `|entry − stop| × qty`. */
+  candidateRisk: number;
+  /** Managed book equity the cap is expressed as a fraction of. */
+  managedEquity: number;
+  /** The correlated groups the candidate lands in (underlying / sector / asset-class). */
+  buckets: readonly ExposureBucket[];
+  /** Fallback cap fraction for buckets without their own `capPct` (default 7%). */
+  capPct?: number;
+  /** Reject rather than scale a candidate below this fraction of equity (default 0.25%). */
+  minTradeRiskPct?: number;
+}
+
+/** Which bucket bound the candidate's size, if any. */
+export interface CorrelatedExposureBinding {
+  level: ExposureLevel;
+  key: string;
+}
+
+export interface CorrelatedExposureDecision {
+  /** True ⇒ the trade may open (possibly scaled down). */
+  admitted: boolean;
+  /**
+   * Position-size multiplier in (0, 1]. `1` ⇒ full size; `< 1` ⇒ scaled down to
+   * the most-binding bucket's exact headroom; `0` ⇒ rejected (see `reason`).
+   */
+  scale: number;
+  /** The bucket that bound the candidate's size, or `null` when none did. */
+  bindingBucket: CorrelatedExposureBinding | null;
+  /** Dollar headroom in the binding bucket (floored at 0), or +∞ when unbound. */
+  headroom: number;
+  /** Set when `admitted` is false. */
+  reason: 'below_min_trade_risk' | 'non_positive_risk' | null;
+}
+
+/**
+ * Correlated-exposure cap admission for a new entry.
+ *
+ * Each bucket is a correlated group the candidate belongs to (its underlying,
+ * its sector, its asset-class), carrying the Σ open per-trade dollar risk already
+ * in that group. The cap on each is `capPct × managedEquity`; the candidate is
+ * scaled down to the SMALLEST headroom across its buckets (the most-binding
+ * grain wins), and rejected outright if that headroom falls below the
+ * `minTradeRiskPct` floor — a token-sized correlated add is not worth the ticket.
+ *
+ * Pure: the caller owns the open-book snapshot (it computes each bucket's
+ * `openRisk` from live positions) exactly as `markBook`'s caller owns the running
+ * book P&L. Complements — does not replace — the per-trade breaker and the book
+ * give-back cap. A candidate with no measurable risk cannot be scaled and is
+ * rejected rather than dividing by zero.
+ */
+export function correlatedExposureDecision(
+  p: CorrelatedExposureParams,
+): CorrelatedExposureDecision {
+  if (!(p.candidateRisk > 0)) {
+    return { admitted: false, scale: 0, bindingBucket: null, headroom: 0, reason: 'non_positive_risk' };
+  }
+
+  const fallbackCapPct = p.capPct ?? CORRELATED_EXPOSURE_CAP_PCT;
+  const equity = Math.max(0, p.managedEquity);
+
+  // riskAllowed = min headroom across every bucket, never above the candidate's
+  // intended risk. Track the bucket that bound it for the surfaced reason.
+  let riskAllowed = p.candidateRisk;
+  let bindingBucket: CorrelatedExposureBinding | null = null;
+  for (const b of p.buckets) {
+    const capPct = b.capPct ?? fallbackCapPct;
+    const headroom = capPct * equity - Math.max(0, b.openRisk);
+    if (headroom < riskAllowed) {
+      riskAllowed = headroom;
+      bindingBucket = { level: b.level, key: b.key };
+    }
+  }
+
+  // No bucket bound the candidate — admit at full size.
+  if (bindingBucket === null) {
+    return { admitted: true, scale: 1, bindingBucket: null, headroom: Number.POSITIVE_INFINITY, reason: null };
+  }
+
+  const floor = (p.minTradeRiskPct ?? CORRELATED_EXPOSURE_MIN_TRADE_RISK_PCT) * equity;
+  // Below the floor (which also catches a fully-exhausted or over-committed
+  // group where riskAllowed ≤ 0), reject instead of shrinking to a token size.
+  if (riskAllowed < floor) {
+    return {
+      admitted: false,
+      scale: 0,
+      bindingBucket,
+      headroom: Math.max(0, riskAllowed),
+      reason: 'below_min_trade_risk',
+    };
+  }
+
+  return {
+    admitted: true,
+    scale: riskAllowed / p.candidateRisk,
+    bindingBucket,
+    headroom: riskAllowed,
+    reason: null,
+  };
+}
+
+/**
+ * A position/candidate reduced to the fields the correlated-exposure cap groups
+ * on: its correlated keys at each grain plus its per-trade dollar risk. The
+ * caller resolves the keys (for an option, the `underlying` is the underlier's
+ * ticker; `assetClass` is e.g. `'equity'` / `'crypto'`; `sector` is optional —
+ * omit it and the sector grain is simply not evaluated for that name).
+ */
+export interface ExposurePositionRisk {
+  underlying: string;
+  sector?: string;
+  assetClass: string;
+  /** Per-trade dollar risk = `|entry − stop| × qty`. */
+  risk: number;
+}
+
+/**
+ * Build the candidate's correlated-exposure buckets from an open-position
+ * snapshot: for each grain (underlying / sector / asset-class) the candidate has
+ * a key for, sum the OPEN per-trade risk sharing that key. The candidate's own
+ * risk is deliberately excluded — the cap compares it against the group's
+ * existing commitment. A grain the candidate has no key for (e.g. missing
+ * sector) is skipped, never treated as a catch-all bucket. `capPctByLevel` lets
+ * the caller tighten an individual grain; unspecified grains fall back to the
+ * decision's default cap.
+ */
+export function buildExposureBuckets(
+  candidate: ExposurePositionRisk,
+  open: readonly ExposurePositionRisk[],
+  capPctByLevel?: Partial<Record<ExposureLevel, number>>,
+): ExposureBucket[] {
+  const grains: Array<{ level: ExposureLevel; keyOf: (p: ExposurePositionRisk) => string | undefined }> = [
+    { level: 'underlying', keyOf: (p) => p.underlying },
+    { level: 'sector', keyOf: (p) => p.sector },
+    { level: 'assetClass', keyOf: (p) => p.assetClass },
+  ];
+  const out: ExposureBucket[] = [];
+  for (const { level, keyOf } of grains) {
+    const key = keyOf(candidate);
+    if (!key) continue;
+    const openRisk = open.reduce(
+      (s, p) => (keyOf(p) === key ? s + Math.max(0, p.risk) : s),
+      0,
+    );
+    out.push({ level, key, openRisk, capPct: capPctByLevel?.[level] });
+  }
+  return out;
 }

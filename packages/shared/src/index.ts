@@ -1887,6 +1887,17 @@ export const BOOK_SESSION_STOP_R = 0.5;               // hard session stop if ne
 // EXIT_RISK_RULES_ENABLED master switch).
 export const TAKE_PROFIT_EARLY_CAPTURE_PCT = 0.60;    // auto-close at 60% of available profit / max credit
 
+// Rule 5 (TRA-1295) — the "7%" leg of the board's 3-5-7 governor: a correlated-
+// exposure cap. The sum of OPEN per-trade dollar risk within any one correlated
+// group (the candidate's underlying, its sector, and its asset-class — evaluated
+// at all three grains, most-binding wins) may not exceed this fraction of managed
+// book equity. Complements the per-trade breaker (loss-streak / drawdown, the
+// "3") and the book give-back cap (Rule 3, the "5"). A new entry that would push
+// a group over the cap is SCALED DOWN to the exact headroom, or rejected below
+// the min-trade-risk floor. Ships DARK behind CORRELATED_EXPOSURE_CAP_ENABLED.
+export const CORRELATED_EXPOSURE_CAP_PCT = 0.07;      // max Σ open risk in one correlated group = 7% of managed equity
+export const CORRELATED_EXPOSURE_MIN_TRADE_RISK_PCT = 0.0025; // reject rather than scale a candidate below 0.25% of equity
+
 // TRA-1269 (TRA-1250 Rule 1, live-equity path) — the live equity chandelier
 // trails a *broker-resting* OCO stop leg by cancel/replace, which costs a
 // Tradier order-modify round-trip and risks throttling. So we only spend a

@@ -60,3 +60,20 @@ export const TAKE_PROFIT_EARLY_FLAG = 'TAKE_PROFIT_EARLY_ENABLED';
 export function isTakeProfitEarlyEnabled(env: NodeJS.ProcessEnv = process.env): boolean {
   return isExitRiskRulesEnabled(env) && flagOn(env[TAKE_PROFIT_EARLY_FLAG]);
 }
+
+// TRA-1295 — the "7%" leg of the 3-5-7 governor: the correlated-exposure cap. A
+// SEPARATE sub-flag so the board can run the shipped loss-control rules
+// (TRA-1267/1268) and independently arm the correlated-exposure admission gate
+// once it's validated. Deliberately gated by BOTH the master switch AND its own
+// flag: it can REJECT / scale down new entries, so it stays dark unless
+// `EXIT_RISK_RULES_ENABLED` AND `CORRELATED_EXPOSURE_CAP_ENABLED` are both truthy
+// (1/true/yes/on).
+export const CORRELATED_EXPOSURE_CAP_FLAG = 'CORRELATED_EXPOSURE_CAP_ENABLED';
+
+/**
+ * True iff the correlated-exposure cap (Rule 5) is enabled. Requires the master
+ * exit-risk switch on as well — the sub-flag alone does nothing.
+ */
+export function isCorrelatedExposureCapEnabled(env: NodeJS.ProcessEnv = process.env): boolean {
+  return isExitRiskRulesEnabled(env) && flagOn(env[CORRELATED_EXPOSURE_CAP_FLAG]);
+}
