@@ -65,6 +65,15 @@ export const DEMO_FLAG_ALLOWLIST = [
   // so a non-admin operator can arm the demo forward capture on the self-hosted
   // host (no PM2/admin).
   'ENABLE_SCALEOUT_LADDER',
+  // TRA-1294 (parent TRA-1290, board confirmation `73ef18b0`) — arm the
+  // take-profit-early auto-close (PROFIT-side mirror of the give-back cap) on the
+  // DEMO book only. STANDALONE flag (not under the EXIT_RISK_RULES_ENABLED
+  // master), and the signal-engine only attaches it on the `mode === 'demo'`
+  // branch, so the live options path is untouched. On the demo book it auto-
+  // closes paper positions once they capture 60% of available profit / max
+  // credit. Safe for the file override so a non-admin operator can arm the demo
+  // forward evidence on the self-hosted host (no PM2/admin).
+  'TAKE_PROFIT_EARLY_ENABLED',
 ] as const;
 
 export const DEMO_FLAGS_FILENAME = 'demo-flags.json';

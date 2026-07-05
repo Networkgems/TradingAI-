@@ -40,9 +40,9 @@ import { summarizeIgnitionScans } from '../crypto-ignition-scanner.js';
 import { summarizeConvictionDca, resolveConvictionDcaDeployAnchor } from '../conviction-dca-ledger.js';
 import { isScaleoutLadderEnabled } from '../scaleout-ladder-flag.js';
 import { summarizeScaleoutLadder } from '../scaleout-ladder-ledger.js';
-import { isCorrelatedExposureCapEnabled, CORRELATED_EXPOSURE_CAP_FLAG } from '../exit-risk-rules-flag.js';
+import { isCorrelatedExposureCapEnabled, CORRELATED_EXPOSURE_CAP_FLAG, isTakeProfitEarlyEnabled, TAKE_PROFIT_EARLY_FLAG } from '../exit-risk-rules-flag.js';
 import { summarizeCorrelatedExposureBindings } from '../correlated-exposure-ledger.js';
-import { CONVICTION_DCA, CORRELATED_EXPOSURE_CAP_PCT, CORRELATED_EXPOSURE_MIN_TRADE_RISK_PCT } from '@trading-app/shared';
+import { CONVICTION_DCA, CORRELATED_EXPOSURE_CAP_PCT, CORRELATED_EXPOSURE_MIN_TRADE_RISK_PCT, TAKE_PROFIT_EARLY_CAPTURE_PCT } from '@trading-app/shared';
 import { resolveDemoFlagEnv } from '../demo-flags.js';
 import {
   isSma200DemoForwardTestEnabled,
@@ -954,6 +954,35 @@ export function registerLiveHealthRoutes(app: Express, deps: LiveHealthDeps): vo
       build: resolveBuildInfo(),
       enabled: isScaleoutLadderEnabled(),
       ...summarizeScaleoutLadder(),
+    });
+  });
+
+  // TRA-1294 (parent TRA-1290, board confirmation `73ef18b0`) — unauthenticated,
+  // secrets-free readout of whether the take-profit-early auto-close (the PROFIT-
+  // side mirror of the give-back cap) is ARMED in this running process. STANDALONE
+  // + DEMO-ONLY: decoupled from EXIT_RISK_RULES_ENABLED, and the signal-engine only
+  // attaches its capture-fraction on the `mode === 'demo'` options exit branch — so
+  // an `enabled:true` here NEVER changes the live options path (bqb1 is the single
+  // production instance). We resolve the flag through the SAME path the engine
+  // consults (process.env layered with the DATA_DIR demo-flags.json overlay, file
+  // wins) so `enabled` reflects the EFFECTIVE switch. No balances/PII — just the
+  // flag + capture threshold — parity with the other /api/health/* rule readouts.
+  app.get('/api/health/take-profit-early', (_req, res) => {
+    const dir = process.env.DATA_DIR;
+    const env = dir ? resolveDemoFlagEnv(dir) : process.env;
+    const enabled = isTakeProfitEarlyEnabled(env);
+    res.json({
+      ok: true,
+      time: new Date(now()).toISOString(),
+      build: resolveBuildInfo(),
+      flag: TAKE_PROFIT_EARLY_FLAG,
+      enabled,
+      demoOnly: true,
+      liveCapitalReachable: false,
+      config: { captureFrac: TAKE_PROFIT_EARLY_CAPTURE_PCT },
+      note: enabled
+        ? 'ARMED (demo-only): banks a demo option position once it captures 60% of available profit / max credit; live options path unchanged.'
+        : 'DISARMED: set TAKE_PROFIT_EARLY_ENABLED=true (render.yaml env or DATA_DIR/demo-flags.json) to arm on the demo book.',
     });
   });
 

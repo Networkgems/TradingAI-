@@ -386,6 +386,21 @@ services:
       # needed for this to take effect on the running service. Accepts 1/true/yes/on.
       - key: EXIT_RISK_RULES_ENABLED
         value: "1"
+      # TRA-1294 (parent TRA-1290, board confirmation `73ef18b0`) — arm the
+      # TAKE-PROFIT-EARLY auto-close (the PROFIT-side mirror of the give-back cap)
+      # on the DEMO book. STANDALONE flag, deliberately NOT under
+      # EXIT_RISK_RULES_ENABLED (above): TRA-1270 arms that master service-wide for
+      # BOTH demo and the live book, but the board scoped take-profit-early to the
+      # DEMO book only (interaction `73ef18b0`). The signal-engine attaches this
+      # flag's 60%-capture fraction ONLY on the `mode === 'demo'` options exit
+      # branch, so setting it here can NEVER touch the live options path regardless
+      # of the master. On the demo book it banks a paper option once it captures
+      # 60% of available profit (to the TP1 target) / max credit. Readout:
+      # `GET /api/health/take-profit-early` (`enabled:true`). NOTE: blueprint sync ≠
+      # autoDeploy on bqb1 (TRA-1289) — a redeploy is needed for this var to take
+      # effect on the running service. Accepts 1/true/yes/on.
+      - key: TAKE_PROFIT_EARLY_ENABLED
+        value: "true"
       # TRA-1080 — event-loop/heap starvation watchdog. The watchdog itself is
       # ON by default in code (no env needed); these knobs are declared
       # `sync: false` so an operator can DISABLE or RETUNE it from the dashboard

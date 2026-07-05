@@ -1364,14 +1364,17 @@ export class SignalEngine {
       if (ap != null && Number.isFinite(ap)) underlyingAtrPctBySymbol.set(opt.symbol, ap);
     }
     // TRA-1294 — take-profit-early is premium-space only (no underlying ATR
-    // needed); attach its capture fraction when the sub-flag is on so the branch
-    // activates even for underlyings without enough cached bars for the
-    // chandelier. Requires the master `EXIT_RISK_RULES_ENABLED` too (this method
-    // is only called under it) — the give-back cap and the profit mirror can be
-    // flipped independently within that family.
-    const takeProfitEarlyCaptureFrac = isTakeProfitEarlyEnabled()
-      ? TAKE_PROFIT_EARLY_CAPTURE_PCT
-      : undefined;
+    // needed); attach its capture fraction so the branch activates even for
+    // underlyings without enough cached bars for the chandelier. STANDALONE +
+    // DEMO-ONLY: decoupled from the `EXIT_RISK_RULES_ENABLED` master and scoped to
+    // `this.mode === 'demo'`, read through the `<DATA_DIR>/demo-flags.json`
+    // override — so the board's demo rollout (interaction `73ef18b0`) arms the
+    // profit mirror on the demo book with ZERO change to the live options path
+    // (bqb1 is the single production instance). See {@link isTakeProfitEarlyEnabled}.
+    const takeProfitEarlyCaptureFrac =
+      this.mode === 'demo' && isTakeProfitEarlyEnabled(this.resolveDemoFlagEnv())
+        ? TAKE_PROFIT_EARLY_CAPTURE_PCT
+        : undefined;
     if (underlyingAtrBySymbol.size === 0 && takeProfitEarlyCaptureFrac === undefined) return undefined;
     return { underlyingAtrBySymbol, underlyingAtrPctBySymbol, takeProfitEarlyCaptureFrac };
   }
@@ -2693,8 +2696,12 @@ export class SignalEngine {
 
     // TRA-1268 (TRA-1250 Rules 1-2) — underlying ATR(14) on 5m bars for the
     // options ATR chandelier trail + premium-R profit-lock. Dark unless
-    // `EXIT_RISK_RULES_ENABLED` is on.
-    const optionExitRisk = isExitRiskRulesEnabled()
+    // `EXIT_RISK_RULES_ENABLED` is on. TRA-1294 — also build it when the
+    // standalone demo-only take-profit-early flag is armed on the demo book, so
+    // its capture-fraction can ride the same input without the loss-side master.
+    const takeProfitEarlyArmed =
+      this.mode === 'demo' && isTakeProfitEarlyEnabled(this.resolveDemoFlagEnv());
+    const optionExitRisk = isExitRiskRulesEnabled() || takeProfitEarlyArmed
       ? this.buildOptionExitRisk()
       : undefined;
     const optionsExitsActive = this.mode === 'demo' || isStockMarketOpen();

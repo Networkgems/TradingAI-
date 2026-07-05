@@ -703,6 +703,35 @@ describe('TRA-1301 correlated-exposure cap health route', () => {
     expect(body.config.minTradeRiskPct).toBeCloseTo(0.0025, 9);
     expect(typeof body.bindingCount).toBe('number');
   });
+
+  it('serves GET /api/health/take-profit-early unauthenticated, DARK + demo-only by default (TRA-1294)', () => {
+    const { app, routes } = fakeApp();
+    registerLiveHealthRoutes(app, {
+      requireAuth: ((_q: unknown, _s: unknown, n: () => void) => n()) as never,
+      userCtx: async () => ctx('admin', engineState()),
+      getSettings: () => settings(),
+      now: () => NOW,
+    });
+    const handlers = routes.get('/api/health/take-profit-early')!;
+    expect(handlers).toHaveLength(1); // unauthenticated, like the other rule probes
+    const res = fakeRes();
+    handlers[0]!({}, res);
+    const body = res.body as {
+      ok: boolean;
+      flag: string;
+      enabled: boolean;
+      demoOnly: boolean;
+      liveCapitalReachable: boolean;
+      config: { captureFrac: number };
+    };
+    expect(body.ok).toBe(true);
+    expect(body.flag).toBe('TAKE_PROFIT_EARLY_ENABLED');
+    // DARK by default (no env flag set in the test process).
+    expect(body.enabled).toBe(false);
+    expect(body.demoOnly).toBe(true);
+    expect(body.liveCapitalReachable).toBe(false);
+    expect(body.config.captureFrac).toBeCloseTo(0.6, 9);
+  });
 });
 
 describe('checkStaleState', () => {

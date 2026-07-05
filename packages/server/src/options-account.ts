@@ -163,11 +163,12 @@ export interface OptionExitRiskInput {
   underlyingAtrPctBySymbol?: Map<string, number>;
   /**
    * TRA-1294 — take-profit-early capture fraction (0.50–0.70). Present ⇔ the
-   * board also flipped `TAKE_PROFIT_EARLY_ENABLED` (a sub-flag under the master
-   * exit-risk switch); absent → the take-profit-early branch is skipped and the
-   * loss-side rules run unchanged. The symmetric PROFIT-side mirror of the
-   * give-back cap: auto-close once the position has captured this fraction of
-   * its available profit.
+   * caller armed the STANDALONE, DEMO-ONLY `TAKE_PROFIT_EARLY_ENABLED` flag
+   * (decoupled from the exit-risk master; the signal-engine only attaches it on
+   * the `mode === 'demo'` branch). Absent → the take-profit-early branch is
+   * skipped and the loss-side rules run unchanged. The symmetric PROFIT-side
+   * mirror of the give-back cap: auto-close once the position has captured this
+   * fraction of its available profit.
    */
   takeProfitEarlyCaptureFrac?: number;
 }

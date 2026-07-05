@@ -56,6 +56,11 @@ describe('loadDemoFlagFile', () => {
     writeFlags({ ENABLE_AUTONOMOUS_DEMO_LOOP: 'true', ADMIN_PASSWORD: 'leak', TRADIER_ENV: 'production' });
     expect(loadDemoFlagFile(dir)).toEqual({ ENABLE_AUTONOMOUS_DEMO_LOOP: 'true' });
   });
+
+  it('honors the TRA-1294 take-profit-early demo flag (the demo-only arm lever)', () => {
+    writeFlags({ TAKE_PROFIT_EARLY_ENABLED: 'true' });
+    expect(loadDemoFlagFile(dir)).toEqual({ TAKE_PROFIT_EARLY_ENABLED: 'true' });
+  });
 });
 
 describe('resolveDemoFlagEnv', () => {

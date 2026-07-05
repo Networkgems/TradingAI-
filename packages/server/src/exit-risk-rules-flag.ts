@@ -45,20 +45,22 @@ export function isLiveEquityStopModifyEnabled(env: NodeJS.ProcessEnv = process.e
 }
 
 // TRA-1294 — take-profit-early (the PROFIT-side mirror of the give-back cap /
-// chandelier loss-control). A SEPARATE sub-flag so the board can run the shipped
-// exit-side loss rules (TRA-1267/1268) without auto-banking wins, and can enable
-// early profit-taking independently once it's validated. Deliberately gated by
-// BOTH the master switch AND its own flag: it auto-CLOSES positions, so it stays
-// dark unless `EXIT_RISK_RULES_ENABLED` AND `TAKE_PROFIT_EARLY_ENABLED` are both
-// truthy (1/true/yes/on).
+// chandelier loss-control). A STANDALONE flag, deliberately NOT gated under the
+// `EXIT_RISK_RULES_ENABLED` master. The board approved arming take-profit-early
+// on the DEMO book only (interaction `73ef18b0`, parent TRA-1290). bqb1 is the
+// SINGLE production instance (it also owns the live Tradier creds), so flipping
+// the process-wide master there would enable the loss-side rules (TRA-1267/1268)
+// on the LIVE options path too — that is NOT demo-only and is a separate
+// TRA-1270 decision. Decoupling lets the demo rollout arm the profit mirror with
+// zero live-path change. The caller additionally scopes the attach to
+// `mode === 'demo'` and reads the flag through the `<DATA_DIR>/demo-flags.json`
+// override (see DEMO_FLAG_ALLOWLIST), matching the scale-out-ladder / sma200
+// forward-test observe-only rollout pattern. OFF by default (1/true/yes/on).
 export const TAKE_PROFIT_EARLY_FLAG = 'TAKE_PROFIT_EARLY_ENABLED';
 
-/**
- * True iff take-profit-early is enabled. Requires the master exit-risk switch on
- * as well — the sub-flag alone does nothing.
- */
+/** True iff take-profit-early is enabled (standalone; accepts 1/true/yes/on). */
 export function isTakeProfitEarlyEnabled(env: NodeJS.ProcessEnv = process.env): boolean {
-  return isExitRiskRulesEnabled(env) && flagOn(env[TAKE_PROFIT_EARLY_FLAG]);
+  return flagOn(env[TAKE_PROFIT_EARLY_FLAG]);
 }
 
 // TRA-1295 — the "7%" leg of the 3-5-7 governor: the correlated-exposure cap. A

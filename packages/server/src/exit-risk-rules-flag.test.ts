@@ -31,19 +31,19 @@ describe('isLiveEquityStopModifyEnabled (TRA-1269)', () => {
 });
 
 describe('isTakeProfitEarlyEnabled (TRA-1294)', () => {
-  it('requires BOTH the master switch AND the sub-flag', () => {
-    // Sub-flag alone does nothing — the master must also be on.
-    expect(isTakeProfitEarlyEnabled({ TAKE_PROFIT_EARLY_ENABLED: 'true' })).toBe(false);
-    // Master alone does not auto-bank wins.
+  it('is STANDALONE — not gated under the exit-risk master (demo-only rollout)', () => {
+    // Off by default; accepts the usual truthy spellings on its own.
+    expect(isTakeProfitEarlyEnabled({})).toBe(false);
+    for (const v of ['1', 'true', 'YES', ' on ']) {
+      expect(isTakeProfitEarlyEnabled({ TAKE_PROFIT_EARLY_ENABLED: v })).toBe(true);
+    }
+    // Deliberately decoupled from the master: the master alone does NOT enable it,
+    // and it does NOT require the master (so arming it on demo never turns on the
+    // loss-side rules on the live options path).
     expect(isTakeProfitEarlyEnabled({ EXIT_RISK_RULES_ENABLED: 'true' })).toBe(false);
-    // Both on → enabled.
     expect(
-      isTakeProfitEarlyEnabled({ EXIT_RISK_RULES_ENABLED: 'true', TAKE_PROFIT_EARLY_ENABLED: '1' }),
+      isTakeProfitEarlyEnabled({ EXIT_RISK_RULES_ENABLED: 'off', TAKE_PROFIT_EARLY_ENABLED: '1' }),
     ).toBe(true);
-    // Master off wins even if the sub-flag is on.
-    expect(
-      isTakeProfitEarlyEnabled({ EXIT_RISK_RULES_ENABLED: 'off', TAKE_PROFIT_EARLY_ENABLED: 'yes' }),
-    ).toBe(false);
   });
 });
 
