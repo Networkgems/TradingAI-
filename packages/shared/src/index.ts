@@ -18,6 +18,11 @@ export * from './day-trading-guardrail.js';
 // options: config surface + the exact R-cap solver and the equity/option gates.
 export * from './conviction-dca.js';
 
+// TRA-1303 — Position Advisor readout data contract (next DCA add + sell plan
+// per held demo-book symbol). Types only; the server fills it by re-running the
+// shipped engine cores read-only.
+export * from './position-advisor.js';
+
 // TRA-950 — structured review block (leaders / invalidation / gapRisk / regime)
 // persisted with each pre/post-market review and wired into both decision paths.
 export * from './review-block.js';

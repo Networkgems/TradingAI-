@@ -381,6 +381,7 @@ import {
   resolveAlertPreferences,
   type AlertChannel,
   type AlertPreferences,
+  type PositionAdvisorReadout,
 } from '@trading-app/shared';
 import {
   saveResearchReport,
@@ -4022,6 +4023,31 @@ app.get('/api/state', requireAuth, async (_req, res) => {
 app.get('/api/crypto/state', requireAuth, async (_req, res) => {
   const ctx = await userCtx(res);
   res.json(ctx.cryptoEngine.getState());
+});
+
+// TRA-1303 — Position Advisor readout: per held DEMO-book symbol, the next DCA
+// add (size + trigger price) and the current sell plan (SL / TP / trailing).
+// Read-only — it re-runs the SHIPPED engine cores (conviction-dca / crypto-dca /
+// the exit engines) against the demo book and never places or mutates an order.
+// This is the smallest surface that lets a user actually SEE the guidance the
+// parent TRA-1302 asks for. Live positions are never surfaced.
+app.get('/api/advisor/positions', requireAuth, async (_req, res) => {
+  const ctx = await userCtx(res);
+  const rows = [
+    ...ctx.engine.getPositionAdvisor(),
+    ...ctx.cryptoEngine.getPositionAdvisor(),
+  ];
+  const countIn = (book: string) => rows.filter(r => r.book === book).length;
+  const readout: PositionAdvisorReadout = {
+    asOf: new Date().toISOString(),
+    mode: 'demo',
+    rows,
+    notes: [
+      `${countIn('equity')} equity, ${countIn('options')} options, ${countIn('crypto')} crypto held position(s)`,
+      "Read-only advisory (demo book, no live orders). DCA sizes/triggers and sell plans are the engine's own outputs.",
+    ],
+  };
+  res.json(readout);
 });
 
 app.get('/api/crypto/news', requireAuth, async (_req, res) => {

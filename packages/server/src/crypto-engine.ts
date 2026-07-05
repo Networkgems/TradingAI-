@@ -1,5 +1,6 @@
 import {
   CryptoDcaStrategy,
+  ema,
   CoinbaseOrderClient,
   CorrelationMatrix,
   admitUnderClusterCap,
@@ -29,6 +30,9 @@ import type {
   CryptoStrategyType,
   StrategyPreset,
   StrategyPresetId,
+  PositionAdvisorRow,
+  AdvisorDcaPlan,
+  AdvisorSellPlan,
 } from '@trading-app/shared';
 import {
   fetchCryptoMinuteBars,
@@ -1767,6 +1771,106 @@ export class CryptoSignalEngine {
       capNotional: capNotional.toFixed(2),
       held: updated.dcaHold === true,
     });
+  }
+
+  /**
+   * TRA-1303 — Position Advisor readout (READ-ONLY) for the crypto demo book.
+   * The crypto analogue of `SignalEngine.getPositionAdvisor`: for each held DEMO
+   * position it surfaces the sell plan (the position's own SL/TP bracket) and
+   * the next DCA accumulation — re-deriving the size the SHIPPED
+   * {@link accumulateDca} path would add (risk-from-stop, clamped to the
+   * per-symbol notional cap) and the {@link CryptoDcaStrategy} trend gate —
+   * WITHOUT firing an order or touching cadence state. Demo book only.
+   */
+  getPositionAdvisor(): PositionAdvisorRow[] {
+    const rows: PositionAdvisorRow[] = [];
+    const demoOpen = this.account.getState().openPositions;
+    if (demoOpen.length === 0) return rows;
+
+    const managedEq = this.account.managedEquity();
+    const capFrac = CRYPTO_DCA_ACCUMULATION.maxSymbolNotionalFracOfManagedEquity;
+    const R = this.account.maxRiskPerTrade();
+    const trendBars = DCA_PARAMS.trendEmaPeriod + 1;
+
+    for (const pos of demoOpen) {
+      const side: 'long' | 'short' = pos.side === 'buy' ? 'long' : 'short';
+      const state = this.symbolState.get(pos.symbol);
+      const price = state && state.price > 0 ? state.price : null;
+      const candles = this.candleCache.get(pos.symbol) ?? [];
+
+      const sell: AdvisorSellPlan = {
+        unit: 'price',
+        stopLoss: pos.stopLoss,
+        takeProfit: pos.takeProfit,
+        trailingStop: null,
+        trailingActive: false,
+        method: pos.dcaHold
+          ? `${DCA_PARAMS.atrStopMultiplier}×ATR catastrophe stop (hold mode — per-leg TP dropped)`
+          : `${DCA_PARAMS.atrStopMultiplier}×ATR catastrophe stop, ${DCA_PARAMS.targetRR}R target`,
+      };
+
+      const isDca = pos.signalType === 'dca';
+      let dca: AdvisorDcaPlan = {
+        enabled: CRYPTO_DCA_ACCUMULATION.enabled,
+        action: 'skip', qty: 0, triggerPrice: null, eligibleNow: false,
+        blendedAvgAfter: null, projectedRisk: null, riskBudget: R,
+        reason: !CRYPTO_DCA_ACCUMULATION.enabled
+          ? 'crypto DCA accumulation disabled (opt-in)'
+          : !isDca
+            ? `${pos.signalType} position — DCA accumulation applies to the dca strategy only`
+            : price == null || candles.length < trendBars
+              ? `insufficient data (need quote + ${trendBars} daily bars for the trend gate)`
+              : 'no add projected',
+      };
+
+      if (CRYPTO_DCA_ACCUMULATION.enabled && isDca && price != null && candles.length >= trendBars) {
+        const trendEma = ema(candles.map(c => c.close), DCA_PARAMS.trendEmaPeriod);
+        const trendGatePasses = Number.isFinite(trendEma) && price > trendEma;
+        const capNotional = managedEq * capFrac;
+        const currentNotional = pos.quantity * price;
+        const headroomNotional = capNotional - currentNotional;
+
+        // Size the next add exactly like accumulateDca: risk-from-stop clamped to
+        // the per-symbol notional headroom (cluster cap omitted — best-effort read).
+        let addQty = this.account.sizeFromStop(price, pos.stopLoss);
+        addQty = Math.min(addQty, headroomNotional > 0 ? headroomNotional / price : 0);
+        addQty = Math.round(addQty * 1_000_000) / 1_000_000;
+
+        let action: AdvisorDcaPlan['action'] = 'skip';
+        let reason: string;
+        if (!trendGatePasses) {
+          reason = `below ${DCA_PARAMS.trendEmaPeriod}-EMA trend gate — accumulation paused (weekly cadence)`;
+        } else if (headroomNotional <= 0) {
+          reason = `per-symbol notional cap reached (${currentNotional.toFixed(0)} >= ${capNotional.toFixed(0)}) — holding`;
+        } else if (addQty <= 0) {
+          reason = 'add rounds to 0 within caps — no add this cadence';
+        } else {
+          action = 'add';
+          reason = `weekly cadence, trend-gated: add ~${addQty} while price holds above the ${DCA_PARAMS.trendEmaPeriod}-EMA`;
+        }
+
+        dca = {
+          enabled: true,
+          action,
+          qty: action === 'add' ? addQty : 0,
+          triggerPrice: Number.isFinite(trendEma) ? Number(trendEma.toFixed(6)) : null,
+          eligibleNow: action === 'add',
+          blendedAvgAfter: action === 'add'
+            ? Number(((pos.entryPrice * pos.quantity + price * addQty) / (pos.quantity + addQty)).toFixed(6))
+            : null,
+          projectedRisk: null,
+          riskBudget: R,
+          reason,
+        };
+      }
+
+      rows.push({
+        book: 'crypto', symbol: pos.symbol, side, signalType: pos.signalType,
+        quantity: pos.quantity, avgEntry: pos.entryPrice, currentPrice: price, dca, sell,
+      });
+    }
+
+    return rows;
   }
 
   /**

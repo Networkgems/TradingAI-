@@ -3,7 +3,7 @@ import { buildExposureBuckets } from '@trading-app/engine';
 import type { StrategySelectorInput, ContractQuote, OptionTrend, RvLongTrendSide, ExitState, SharedTickIndicators, RelativeValueScannerOptions, OptionChainRow, IvRvScannerOptions, IvRvMispricingCandidate, ExposureBucket, ExposurePositionRisk, CorrelatedExposureDecision } from '@trading-app/engine';
 import type { TradierAccountBalance } from '@trading-app/engine';
 import { WATCHLIST, isLiquidSwingSymbol, resolveEquitySwingModeEnabled, checkEquitySwingClose, MANAGED_ACCOUNT_RATIO, MAX_CONSECUTIVE_LOSSES, DAILY_DRAWDOWN_HALT_PCT, BOOK_SESSION_STOP_R, BOOK_GIVEBACK_CAP_PCT, TAKE_PROFIT_EARLY_CAPTURE_PCT, CORRELATED_EXPOSURE_CAP_PCT, CORRELATED_EXPOSURE_MIN_TRADE_RISK_PCT, LIVE_EQUITY_STOP_MODIFY_MIN_TICK_PCT, LIVE_EQUITY_STOP_MODIFY_MIN_TICK_ABS, LIVE_EQUITY_STOP_MODIFY_COOLDOWN_MS, DEFAULT_RISK_PER_TRADE, OPTIONS_PER_TICKET_DOLLAR_FLOOR, OPTIONS_POSITION_CAP_RATIO, aliasWatchlistSymbol, isLiveTradierOptionsEnabled, isStockMarketOpen, perPositionCap, resolveAutoManageImportedTradierOptions, resolveDemoCostModel, resolveHoldLiveOptionsOvernight, resolveSwingHoldOptions, resolveLiveTradeEquitiesTradier, resolveManagedAccountRatio, resolveMarketReviewGatesEnabled, resolveRiskPerTrade, resolveRvDtePrefs, resolveTradierOptionsCreds, validateBracket, DEFAULT_RV_DTE_MIN, DEFAULT_RV_DTE_MAX, DEFAULT_RV_DTE_TARGET, scoreNewsSentiment, aggregateSymbolSentiment, aggregateFedSentiment, aggregateStockTwitsSentiment, dedupeStockTwitsMessages, mapCuratedMessagesBySymbol, nameAliasesFor, evaluateEquityDcaAdd, evaluateOptionDcaAdd, CONVICTION_DCA, blendedAverage, positionRiskDollars, minutesToSessionClose, getEasternUtcOffset, isAgentTradingWindowOpen } from '@trading-app/shared';
-import type { TradeSignal, RelativeValueSignal, OtmMispricingSignal, Sma200Signal, Candle, OptionsAccountState, SignalType, Position, OptionPosition, AccountMode, AccountSettings, AccountState, NewsItem, SymbolSentiment, SocialSentiment, StockTwitsMessage, TechnicalSignalSnapshot, TradierEnv, MarketReview, MarketReviewGates, EngineMarketReviewState, GatedStrategyNote, AgentRecommendation, TradeProposal, AgentOrderAudit, GuardrailVerdict, OptionType } from '@trading-app/shared';
+import type { TradeSignal, RelativeValueSignal, OtmMispricingSignal, Sma200Signal, Candle, OptionsAccountState, SignalType, Position, OptionPosition, AccountMode, AccountSettings, AccountState, NewsItem, SymbolSentiment, SocialSentiment, StockTwitsMessage, TechnicalSignalSnapshot, TradierEnv, MarketReview, MarketReviewGates, EngineMarketReviewState, GatedStrategyNote, AgentRecommendation, TradeProposal, AgentOrderAudit, GuardrailVerdict, OptionType, PositionAdvisorRow, AdvisorSellPlan, AdvisorDcaPlan } from '@trading-app/shared';
 import { shouldAutoConfirm } from '@trading-app/shared';
 // TRA-544 (TRA-529 P1) / TRA-747 (P2) — advisory multi-agent layer. ON suspends
 // deterministic auto-routing and the engine surfaces the recommendations on the
@@ -6492,6 +6492,202 @@ export class SignalEngine {
       managedEquity,
       (reason) => { signal.signalSkipReason = reason; },
     );
+  }
+
+  /**
+   * TRA-1303 — Position Advisor readout (READ-ONLY). Answers the parent
+   * TRA-1302 question — "how much do I add next (DCA), and how do I sell?" —
+   * for every open DEMO equity and option position by re-running the SHIPPED
+   * conviction-DCA cores ({@link evaluateEquityDcaAdd} / {@link
+   * evaluateOptionDcaAdd}) and reading each position's own bracket / TP1 exit
+   * schedule.
+   *
+   * It mirrors {@link evaluateConvictionDcaAdds} / {@link evaluateOptionDcaAdds}
+   * exactly (identical context construction, same gates) but NEVER executes an
+   * order and NEVER mutates the book, the per-position fill ledgers, or the
+   * per-day add counters — every ledger read is `.slice()`-copied locally. No
+   * new sizing logic: the numbers are the engine's own. Demo book only; live
+   * positions are never surfaced.
+   */
+  getPositionAdvisor(): PositionAdvisorRow[] {
+    const rows: PositionAdvisorRow[] = [];
+    const now = Date.now();
+    const etDay = new Date(now + getEasternUtcOffset(now) * 3600 * 1000).toISOString().slice(0, 10);
+
+    // ── Equity ─────────────────────────────────────────────────────────────
+    const R = this.account.maxRiskPerTrade();
+    const demoOpen = this.account.getState().openPositions;
+    if (demoOpen.length > 0 && R > 0) {
+      const managedEq = this.account.managedEquity();
+      let grossNotional = 0;
+      for (const p of demoOpen) grossNotional += Math.abs(p.entryPrice * p.quantity);
+      const grossExposureBreached = managedEq > 0 && grossNotional > managedEq;
+      const dailyLossLimitBreached = this.riskGovernor.isHalted();
+      const minsToClose = minutesToSessionClose(now);
+
+      for (const pos of demoOpen) {
+        const side: 'long' | 'short' = pos.side === 'buy' ? 'long' : 'short';
+        const price = this.symbolState.get(pos.symbol)?.price ?? null;
+        const candles = this.candleCache.get(pos.symbol) ?? [];
+        const atrVal = candles.length >= 50 ? atr(candles, 14) : null;
+
+        const sell: AdvisorSellPlan = {
+          unit: 'price',
+          stopLoss: pos.stopLoss,
+          takeProfit: pos.takeProfit,
+          trailingStop: null,
+          trailingActive: false,
+          method: `static bracket (SL/TP) — ${pos.signalType}`,
+        };
+
+        let dca: AdvisorDcaPlan = {
+          enabled: CONVICTION_DCA.enabled,
+          action: 'skip',
+          qty: 0,
+          triggerPrice: null,
+          eligibleNow: false,
+          blendedAvgAfter: null,
+          projectedRisk: null,
+          riskBudget: R,
+          reason: !CONVICTION_DCA.enabled
+            ? 'conviction-DCA disabled (opt-in)'
+            : price == null || atrVal == null || !(atrVal > 0)
+              ? 'insufficient data to project add (need quote + 50 bars for ATR/SMA-50)'
+              : 'no add projected',
+        };
+
+        if (CONVICTION_DCA.enabled && price != null && atrVal != null && atrVal > 0) {
+          const sma50 = candles.slice(-50).reduce((s, c) => s + c.close, 0) / 50;
+          // LOCAL copy of the fill ledger — read-only, never mutate the engine's.
+          const tranches = (this.dcaTranches.get(pos.id) ?? [{ qty: pos.quantity, price: pos.entryPrice }]).slice();
+          const lastFill = tranches[tranches.length - 1];
+          const lastFillAt = this.dcaLastFillAt.get(pos.id) ?? pos.openedAt;
+          const barsSinceLastFill = candles.filter(c => c.timestamp > lastFillAt).length;
+          const todayRec = this.dcaAddsToday.get(pos.symbol);
+          const addsToday = todayRec && todayRec.etDay === etDay ? todayRec.count : 0;
+
+          // Next pullback-ladder trigger the engine already uses: −1 ATR from the
+          // prior fill for a long, +1 ATR for a short.
+          const triggerPrice = side === 'long'
+            ? lastFill.price - CONVICTION_DCA.equityAddSpacingATR * atrVal
+            : lastFill.price + CONVICTION_DCA.equityAddSpacingATR * atrVal;
+
+          const commonCtx = {
+            side, tranches, stop: pos.stopLoss, riskBudget: R, atr: atrVal, trendRef: sma50,
+            signalStillValid: true, barsSinceLastFill, minutesToSessionClose: minsToClose,
+            grossExposureBreached, dailyLossLimitBreached,
+            tradingDaysToEarnings: earningsInDaysSync(pos.symbol, now), addsToday,
+          };
+          const nowVerdict = evaluateEquityDcaAdd({ ...commonCtx, addPrice: price });
+          const triggerVerdict = evaluateEquityDcaAdd({ ...commonCtx, addPrice: triggerPrice });
+          // Report the live add if one fires now, else the next planned add at the trigger.
+          const planVerdict = nowVerdict.action !== 'skip' ? nowVerdict : triggerVerdict;
+
+          dca = {
+            enabled: true,
+            action: planVerdict.action,
+            qty: planVerdict.qty,
+            triggerPrice: Number(triggerPrice.toFixed(4)),
+            eligibleNow: nowVerdict.action !== 'skip' && nowVerdict.qty > 0,
+            blendedAvgAfter: planVerdict.blendedAvg ?? null,
+            projectedRisk: planVerdict.projectedRisk ?? null,
+            riskBudget: R,
+            reason: planVerdict.reason,
+          };
+        }
+
+        rows.push({
+          book: 'equity', symbol: pos.symbol, side, signalType: pos.signalType,
+          quantity: pos.quantity, avgEntry: pos.entryPrice, currentPrice: price, dca, sell,
+        });
+      }
+    }
+
+    // ── Options ────────────────────────────────────────────────────────────
+    const acct = this.optionsAccount;
+    const optR = acct.riskBudgetPerPosition();
+    const demoOptions = acct.getStateForMode('demo').openOptions;
+    if (demoOptions.length > 0 && optR > 0) {
+      let grossPremiumAtRisk = 0;
+      for (const o of demoOptions) grossPremiumAtRisk += o.premiumPaid * 100 * o.contractsRemaining;
+      const managedEq = acct.managedEquity();
+      const grossExposureBreached = managedEq > 0 && grossPremiumAtRisk > managedEq;
+      const dailyLossLimitBreached = this.riskGovernor.isHalted();
+
+      for (const o of demoOptions) {
+        const side: 'long' | 'short' = o.optionType === 'call' ? 'long' : 'short';
+        const underlyingPrice = this.symbolState.get(o.symbol)?.price ?? null;
+        const candles = this.candleCache.get(o.symbol) ?? [];
+
+        // Options sell plan — the TP1 partial / SL / trailing schedule already on the row.
+        const sell: AdvisorSellPlan = {
+          unit: 'premium',
+          stopLoss: o.stopLossPremium,
+          takeProfit: o.tp1Premium,
+          trailingStop: o.trailingActive ? o.trailingStopPremium : null,
+          trailingActive: o.trailingActive,
+          method: o.tp1Hit
+            ? 'TP1 hit (50% out) — remainder trails 12% off peak; SL floor'
+            : 'TP1 +25% partial (50%), then trail 12% off peak after +20%; SL',
+        };
+
+        let dca: AdvisorDcaPlan = {
+          enabled: CONVICTION_DCA.enabled,
+          action: 'skip', qty: 0, triggerPrice: null, eligibleNow: false,
+          blendedAvgAfter: null, projectedRisk: null, riskBudget: optR,
+          reason: !CONVICTION_DCA.enabled
+            ? 'conviction-DCA disabled (opt-in)'
+            : o.importedFromTradier
+              ? 'imported (Tradier) position — out of scope for DCA'
+              : underlyingPrice == null || candles.length < 50
+                ? 'insufficient data (need quote + 50 bars)'
+                : 'no add projected',
+        };
+
+        if (CONVICTION_DCA.enabled && !o.importedFromTradier && underlyingPrice != null && candles.length >= 50) {
+          const sma50 = candles.slice(-50).reduce((s, c) => s + c.close, 0) / 50;
+          const isCombo = Array.isArray(o.legs) && o.legs.length >= 2;
+          const definedRisk = isCombo ? typeof o.netUsd === 'number' && o.netUsd < 0 : true;
+          const basisPerContract = o.premiumPaid * 100;
+          if (basisPerContract > 0) {
+            const addDebitPerContract = isCombo
+              ? basisPerContract
+              : (o.currentPremium > 0 ? o.currentPremium : o.premiumPaid) * 100;
+            const dte = Math.round(daysToExpiration(o.expiration ?? '', now));
+            const addDelta = this.estimateOptionAddDelta(o, underlyingPrice, dte, isCombo);
+            const bullish = o.optionType === 'call';
+            const underlyingThesisConfirmed = bullish ? underlyingPrice > sma50 : underlyingPrice < sma50;
+            const tranches = (this.dcaOptionTranches.get(o.id) ?? [{ qty: o.contractsRemaining, price: basisPerContract }]).slice();
+            const premiumSoFar = tranches.reduce((s, t) => s + t.qty * t.price, 0);
+            const todayRec = this.dcaOptionAddsToday.get(o.symbol);
+            const addsToday = todayRec && todayRec.etDay === etDay ? todayRec.count : 0;
+
+            const verdict = evaluateOptionDcaAdd({
+              definedRisk, tranches, riskBudget: optR, addDebitPerContract, dte, addDelta,
+              underlyingThesisConfirmed, spreadWidthPct: 0, atMaxContracts: premiumSoFar >= optR,
+              dailyLossLimitBreached, grossExposureBreached,
+              tradingDaysToEarnings: earningsInDaysSync(o.symbol, now), addsToday,
+            });
+            dca = {
+              enabled: true, action: verdict.action, qty: verdict.qty,
+              triggerPrice: null, // options adds are thesis/DTE-gated, not price-laddered
+              eligibleNow: verdict.action !== 'skip' && verdict.qty > 0,
+              blendedAvgAfter: verdict.blendedAvg ?? null,
+              projectedRisk: verdict.projectedRisk ?? null,
+              riskBudget: optR, reason: verdict.reason,
+            };
+          }
+        }
+
+        rows.push({
+          book: 'options', symbol: o.symbol, side, signalType: o.signalType,
+          quantity: o.contractsRemaining, avgEntry: o.premiumPaid,
+          currentPrice: Number.isFinite(o.currentPremium) ? o.currentPremium : null, dca, sell,
+        });
+      }
+    }
+
+    return rows;
   }
 
   private async routeEquitySignal(
