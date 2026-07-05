@@ -2983,3 +2983,65 @@ describe('PaperOptionsAccount.checkExits — chandelier + profit-lock (TRA-1268)
     expect(acct.getState().openOptions).toHaveLength(1);
   });
 });
+
+// TRA-1301 (parent TRA-1295, Rule 5) — the option-side wiring for the
+// correlated-exposure cap: the pre-open contract-count estimate, the size
+// multiplier the cap folds into the open, and the open-book exposure snapshot.
+describe('PaperOptionsAccount — TRA-1301 correlated-exposure cap wiring', () => {
+  function rv(overrides: Partial<RelativeValueSignal> = {}): RelativeValueSignal {
+    return {
+      id: 'rv-cap', symbol: 'AAPL', type: 'relative_value', side: 'buy',
+      entryPrice: 1.0, stopLoss: 0.75, takeProfit: 1.5, riskRewardRatio: 2,
+      timestamp: TRADING_TIME, optionSymbol: 'AAPL240705C00200000', optionType: 'call',
+      strike: 200, expiration: '2024-07-05', mark: 1.0, fairPrice: 1.3,
+      mispricingPct: -0.23, zScore: -2.1, ivFitted: 0.32, ivUsed: 0.28,
+      delta: 0.18, reason: 'cheap-vs-curve', ...overrides,
+    };
+  }
+
+  it('getRvContractsForCandidate matches the demo open sizing (zero slippage)', () => {
+    const acct = new PaperOptionsAccount({ initialEquity: 50_000, managedAccountRatio: 0.5 });
+    const n = acct.getRvContractsForCandidate(1.0);
+    const pos = acct.openOptionFromRvCandidate(rv({ mark: 1.0 }), 'demo');
+    expect(pos).not.toBeNull();
+    expect(pos!.contracts).toBe(n);
+  });
+
+  it('a size multiplier <1 trims the contract count (floored)', () => {
+    const acct = new PaperOptionsAccount({ initialEquity: 50_000, managedAccountRatio: 0.5 });
+    const full = acct.getRvContractsForCandidate(1.0);
+    expect(full).toBeGreaterThan(1);
+    const pos = acct.openOptionFromRvCandidate(rv({ mark: 1.0 }), 'demo', undefined, undefined, undefined, 0.5);
+    expect(pos).not.toBeNull();
+    expect(pos!.contracts).toBe(Math.floor(full * 0.5));
+  });
+
+  it('rejects the entry when the cap trims the size below one contract', () => {
+    const acct = new PaperOptionsAccount({ initialEquity: 50_000, managedAccountRatio: 0.5 });
+    // Find a mark rich enough to size to exactly one contract; a 0.5 multiplier
+    // then floors it to zero and the open must reject rather than open nothing.
+    let mark = 1;
+    while (acct.getRvContractsForCandidate(mark) > 1 && mark < 1e6) mark *= 2;
+    expect(acct.getRvContractsForCandidate(mark)).toBe(1);
+    const pos = acct.openOptionFromRvCandidate(
+      rv({ mark, optionSymbol: 'ZZZ240705C00200000' }), 'demo', undefined, undefined, undefined, 0.5,
+    );
+    expect(pos).toBeNull();
+    expect(acct.takeLastEntryRejection() ?? '').toMatch(/correlated-exposure cap/i);
+  });
+
+  it('exposureSnapshotForMode reduces the open book to underlying/assetClass risk rows, scoped by mode', () => {
+    const acct = new PaperOptionsAccount({ initialEquity: 50_000, managedAccountRatio: 0.5 });
+    const pos = acct.openOptionFromRvCandidate(rv({ mark: 1.0 }), 'demo');
+    expect(pos).not.toBeNull();
+    const snap = acct.exposureSnapshotForMode('demo');
+    expect(snap).toHaveLength(1);
+    expect(snap[0].underlying).toBe('AAPL');
+    expect(snap[0].assetClass).toBe('equity');
+    expect(snap[0].sector).toBeUndefined();
+    // premium-at-risk = (premiumPaid − stopLossPremium) × contractsRemaining × 100 > 0
+    expect(snap[0].risk).toBeGreaterThan(0);
+    // The position is demo-stamped, so the live-mode snapshot is empty.
+    expect(acct.exposureSnapshotForMode('live')).toHaveLength(0);
+  });
+});

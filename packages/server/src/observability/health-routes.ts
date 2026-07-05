@@ -40,7 +40,9 @@ import { summarizeIgnitionScans } from '../crypto-ignition-scanner.js';
 import { summarizeConvictionDca, resolveConvictionDcaDeployAnchor } from '../conviction-dca-ledger.js';
 import { isScaleoutLadderEnabled } from '../scaleout-ladder-flag.js';
 import { summarizeScaleoutLadder } from '../scaleout-ladder-ledger.js';
-import { CONVICTION_DCA } from '@trading-app/shared';
+import { isCorrelatedExposureCapEnabled, CORRELATED_EXPOSURE_CAP_FLAG } from '../exit-risk-rules-flag.js';
+import { summarizeCorrelatedExposureBindings } from '../correlated-exposure-ledger.js';
+import { CONVICTION_DCA, CORRELATED_EXPOSURE_CAP_PCT, CORRELATED_EXPOSURE_MIN_TRADE_RISK_PCT } from '@trading-app/shared';
 import { resolveDemoFlagEnv } from '../demo-flags.js';
 import {
   isSma200DemoForwardTestEnabled,
@@ -952,6 +954,31 @@ export function registerLiveHealthRoutes(app: Express, deps: LiveHealthDeps): vo
       build: resolveBuildInfo(),
       enabled: isScaleoutLadderEnabled(),
       ...summarizeScaleoutLadder(),
+    });
+  });
+
+  // TRA-1301 (parent TRA-1295, Rule 5) — unauthenticated, secrets-free readout of
+  // the correlated-exposure cap ("7%" leg of the 3-5-7 governor): the config it
+  // enforces (cap %, min-trade-risk floor) + a session-scoped rollup of how often
+  // it bound (scaled) or rejected an entry, and which grain bound it. `enabled`
+  // mirrors CORRELATED_EXPOSURE_CAP_ENABLED (under EXIT_RISK_RULES_ENABLED) so an
+  // operator can see whether the cap is armed before / after the board flip.
+  // OBSERVE-ONLY: the ledger is an in-memory diagnostic (session-scoped, reset on
+  // reboot); the cap itself scales/rejects at each entry chokepoint. No PII / no
+  // balances — just thresholds + binding counts — so this is unauthenticated,
+  // parity with the other /api/health/* rule readouts.
+  app.get('/api/health/correlated-exposure-cap', (_req, res) => {
+    res.json({
+      ok: true,
+      time: new Date(now()).toISOString(),
+      build: resolveBuildInfo(),
+      flag: CORRELATED_EXPOSURE_CAP_FLAG,
+      enabled: isCorrelatedExposureCapEnabled(),
+      config: {
+        capPct: CORRELATED_EXPOSURE_CAP_PCT,
+        minTradeRiskPct: CORRELATED_EXPOSURE_MIN_TRADE_RISK_PCT,
+      },
+      ...summarizeCorrelatedExposureBindings(),
     });
   });
 

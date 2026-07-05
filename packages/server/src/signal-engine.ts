@@ -1,5 +1,6 @@
 import { OrbStrategy, BbFadeStrategy, IchimokuStrategy, SupertrendConfluenceStrategy, confluenceSide, supertrend, reversalChecklist, adx, atr, atrPct, donchian, supportResistance, blackScholesDelta, blackScholesGreeks, daysToExpiration, bookGiveBackDecision, correlatedExposureDecision, entryGreeksGateDecision, chandelierStop, stopModifyDecision, selectRvLongCandidate, selectShadowOptionSignal, emaPullbackTrigger, volumeConfirmedBreakout, TradierOptionsClient, TradierOrderClient, TRADIER_REJECTED_STATUSES, TRADIER_TERMINAL_STATUSES, evaluateSma200, SMA200_MIN_BARS, SMA200_DEBOUNCE_BARS, composeTechnicalSnapshot, resampleCandles, TF_BUCKET_MS, OptionsRiskBreaker, DEFAULT_OPTIONS_BREAKER_PARAMS } from '@trading-app/engine';
-import type { StrategySelectorInput, ContractQuote, OptionTrend, RvLongTrendSide, ExitState, SharedTickIndicators, RelativeValueScannerOptions, OptionChainRow, IvRvScannerOptions, IvRvMispricingCandidate, ExposureBucket, CorrelatedExposureDecision } from '@trading-app/engine';
+import { buildExposureBuckets } from '@trading-app/engine';
+import type { StrategySelectorInput, ContractQuote, OptionTrend, RvLongTrendSide, ExitState, SharedTickIndicators, RelativeValueScannerOptions, OptionChainRow, IvRvScannerOptions, IvRvMispricingCandidate, ExposureBucket, ExposurePositionRisk, CorrelatedExposureDecision } from '@trading-app/engine';
 import type { TradierAccountBalance } from '@trading-app/engine';
 import { WATCHLIST, isLiquidSwingSymbol, checkEquitySwingClose, MANAGED_ACCOUNT_RATIO, MAX_CONSECUTIVE_LOSSES, DAILY_DRAWDOWN_HALT_PCT, BOOK_SESSION_STOP_R, BOOK_GIVEBACK_CAP_PCT, TAKE_PROFIT_EARLY_CAPTURE_PCT, CORRELATED_EXPOSURE_CAP_PCT, CORRELATED_EXPOSURE_MIN_TRADE_RISK_PCT, LIVE_EQUITY_STOP_MODIFY_MIN_TICK_PCT, LIVE_EQUITY_STOP_MODIFY_MIN_TICK_ABS, LIVE_EQUITY_STOP_MODIFY_COOLDOWN_MS, DEFAULT_RISK_PER_TRADE, OPTIONS_PER_TICKET_DOLLAR_FLOOR, OPTIONS_POSITION_CAP_RATIO, aliasWatchlistSymbol, isLiveTradierOptionsEnabled, isStockMarketOpen, perPositionCap, resolveAutoManageImportedTradierOptions, resolveDemoCostModel, resolveHoldLiveOptionsOvernight, resolveSwingHoldOptions, resolveLiveTradeEquitiesTradier, resolveManagedAccountRatio, resolveMarketReviewGatesEnabled, resolveRiskPerTrade, resolveRvDtePrefs, resolveTradierOptionsCreds, validateBracket, DEFAULT_RV_DTE_MIN, DEFAULT_RV_DTE_MAX, DEFAULT_RV_DTE_TARGET, scoreNewsSentiment, aggregateSymbolSentiment, aggregateFedSentiment, aggregateStockTwitsSentiment, dedupeStockTwitsMessages, mapCuratedMessagesBySymbol, nameAliasesFor, evaluateEquityDcaAdd, evaluateOptionDcaAdd, CONVICTION_DCA, blendedAverage, positionRiskDollars, minutesToSessionClose, getEasternUtcOffset, isAgentTradingWindowOpen } from '@trading-app/shared';
 import type { TradeSignal, RelativeValueSignal, OtmMispricingSignal, Sma200Signal, Candle, OptionsAccountState, SignalType, Position, OptionPosition, AccountMode, AccountSettings, AccountState, NewsItem, SymbolSentiment, SocialSentiment, StockTwitsMessage, TechnicalSignalSnapshot, TradierEnv, MarketReview, MarketReviewGates, EngineMarketReviewState, GatedStrategyNote, AgentRecommendation, TradeProposal, AgentOrderAudit, GuardrailVerdict, OptionType } from '@trading-app/shared';
@@ -51,7 +52,8 @@ import { isOptionShadowEnabled, isOptionPhaseBEnabled, emitShadowOptionSignal, s
 import { isOptionExecEnabled, isOptionEmaPullbackEnabled, isOptionVolumeBreakoutEnabled, resolveRvLongDteOverride, resolveRvMinDailyVolume, isOptionDemoDirectionalEnabled, isOptionIvRvScannerEnabled, isOptionIvRvRoutingEnabled, resolveIvRvRoutingOverride, isOptionShortPremiumScannerEnabled } from './option-exec-flag.js';
 import { scanIvRvFromSnapshot, recordIvRvScan } from './iv-rv-scanner.js';
 import { scanShortPremiumFromSnapshot, recordShortPremiumScan } from './short-premium-scanner.js';
-import { isExitRiskRulesEnabled, isLiveEquityStopModifyEnabled, isTakeProfitEarlyEnabled, isEntryGreeksGateEnabled } from './exit-risk-rules-flag.js';
+import { isExitRiskRulesEnabled, isLiveEquityStopModifyEnabled, isTakeProfitEarlyEnabled, isEntryGreeksGateEnabled, isCorrelatedExposureCapEnabled } from './exit-risk-rules-flag.js';
+import { recordCorrelatedExposureBinding, type CorrelatedExposureVenue } from './correlated-exposure-ledger.js';
 import { recordConvictionDcaFill } from './conviction-dca-ledger.js';
 import { isScaleoutLadderEnabled } from './scaleout-ladder-flag.js';
 import { evaluateAndRecordScaleout } from './scaleout-ladder-ledger.js';
@@ -3401,9 +3403,15 @@ export class SignalEngine {
     // Entry = the signal's daily close (carried on `entryPrice`).
     const price = signal.entryPrice;
 
+    // TRA-1301 (Rule 5) — correlated-exposure cap on the SMA-200 pullback swing
+    // entry, consulted before the broker order (shares the equity chokepoint
+    // helper). DARK until CORRELATED_EXPOSURE_CAP_ENABLED is armed.
+    const correlatedCapScale = this.applyEquityCorrelatedCap(signal, price);
+    if (correlatedCapScale === null) return;
+
     let liveOrderId: number | string | null = null;
     if (this.mode === 'live') {
-      const placement = await this.placeTradierEquityBracket(signal, price);
+      const placement = await this.placeTradierEquityBracket(signal, price, correlatedCapScale);
       if (!placement.ok) {
         signal.liveSkipReason = placement.reason;
         return;
@@ -3415,8 +3423,8 @@ export class SignalEngine {
     }
 
     const pos = this.mode === 'live'
-      ? this.openLiveEquityMirror(signal, price, liveOrderId!)
-      : this.account.openPosition(signal, price, this.activeSizingMultiplier());
+      ? this.openLiveEquityMirror(signal, price, liveOrderId!, correlatedCapScale)
+      : this.account.openPosition(signal, price, this.activeSizingMultiplier() * correlatedCapScale);
     if (pos) {
       pos.mode = this.mode;
       // TRA-1289 — carry the demo forward-test marker onto the position so
@@ -4202,12 +4210,47 @@ export class SignalEngine {
           }
         }
 
+        // TRA-1301 (parent TRA-1295, Rule 5) — correlated-exposure cap on the
+        // option entry. Groups on the UNDERLIER ticker + `equity` asset-class (an
+        // option on an equity carries that name's directional risk), summing the
+        // premium-at-risk already committed on the open option book. Trims the
+        // sized contract count (or rejects a token add) via the size multiplier
+        // passed into the open. DARK until CORRELATED_EXPOSURE_CAP_ENABLED, so the
+        // baseline exec path is unchanged. Mirrors the entryGreeksGate seam above
+        // (silent `continue` on reject with a surfaced reason + info log).
+        let optionCapScale = 1;
+        if (isCorrelatedExposureCapEnabled()) {
+          const contracts = this.optionsAccount.getRvContractsForCandidate(cheap.mark, liveEquity);
+          const perContractRisk = Math.max(0, signal.entryPrice - signal.stopLoss) * 100;
+          const candidateRisk = perContractRisk * contracts;
+          const managedEquity = typeof liveEquity === 'number' && liveEquity > 0
+            ? liveEquity
+            : this.optionsAccount.managedEquity();
+          if (candidateRisk > 0 && managedEquity > 0) {
+            const scale = this.consultCorrelatedExposureCap(
+              'option',
+              { underlying: signal.symbol, assetClass: 'equity', risk: candidateRisk },
+              this.optionsAccount.exposureSnapshotForMode(this.mode === 'live' ? 'live' : 'demo'),
+              managedEquity,
+              (reason) => { signal.signalSkipReason = reason; },
+            );
+            if (scale === null) {
+              log.info('RV long rejected by correlated-exposure cap (TRA-1301)', {
+                sym, reason: signal.signalSkipReason,
+              });
+              continue;
+            }
+            optionCapScale = scale;
+          }
+        }
+
         const opened = this.optionsAccount.openOptionFromRvCandidate(
           signal,
           this.mode,
           liveEquity,
           underlyingSpot,
           rvJournalSetup,
+          optionCapScale,
         );
         if (!opened) continue;
 
@@ -6322,6 +6365,127 @@ export class SignalEngine {
     });
   }
 
+  /**
+   * TRA-1301 (parent TRA-1295, Rule 5) — consult the correlated-exposure cap for
+   * a candidate entry at one of the entry chokepoints. Given the candidate's
+   * correlated keys + per-trade $risk and the open-book snapshot, returns the
+   * position-size multiplier to apply (`1` = full size, `<1` = trim to the
+   * most-binding bucket's headroom) or `null` when the entry is REJECTED (its
+   * headroom fell below the min-trade-risk floor — a token correlated add).
+   *
+   * On a binding (scale `<1`) or reject it records the event for the
+   * `/api/health/correlated-exposure-cap` + EOD readout; on reject it invokes
+   * `onReject(reason)` so the caller can stamp `signalSkipReason` exactly as the
+   * crypto `clusterCapMultiplier` seam does. Callers MUST gate the call behind
+   * {@link isCorrelatedExposureCapEnabled} — this is a no-op-free consult that
+   * assumes the flag is on.
+   */
+  private consultCorrelatedExposureCap(
+    venue: CorrelatedExposureVenue,
+    candidate: ExposurePositionRisk,
+    open: readonly ExposurePositionRisk[],
+    managedEquity: number,
+    onReject: (reason: string) => void,
+  ): number | null {
+    const buckets = buildExposureBuckets(candidate, open);
+    const decision = this.riskGovernor.admitCorrelatedExposure(
+      candidate.risk,
+      managedEquity,
+      buckets,
+    );
+    const cfg = this.riskGovernor.describeCorrelatedExposureCap();
+    const mode: 'demo' | 'live' = this.mode === 'live' ? 'live' : 'demo';
+    if (!decision.admitted) {
+      const b = decision.bindingBucket;
+      const reason = b
+        ? `correlated-exposure cap (Rule 5) — {${b.key}} would scale below the `
+          + `${(cfg.minTradeRiskPct * 100).toFixed(2)}% min-trade-risk floor `
+          + `(${b.level} group over the ${(cfg.capPct * 100).toFixed(0)}% cap)`
+        : `correlated-exposure cap (Rule 5) — non-positive candidate risk`;
+      onReject(reason);
+      if (b) {
+        recordCorrelatedExposureBinding({
+          venue, mode, level: b.level, key: b.key,
+          scale: 0, action: 'rejected', symbol: candidate.underlying,
+        });
+      }
+      return null;
+    }
+    if (decision.scale < 1 && decision.bindingBucket) {
+      recordCorrelatedExposureBinding({
+        venue, mode,
+        level: decision.bindingBucket.level,
+        key: decision.bindingBucket.key,
+        scale: decision.scale, action: 'scaled', symbol: candidate.underlying,
+      });
+    }
+    return decision.scale;
+  }
+
+  /**
+   * TRA-1301 — build the open EQUITY book into `ExposurePositionRisk[]` for the
+   * correlated-exposure cap. Underlying = the symbol, asset-class = `equity`
+   * (sector omitted until a sector source exists — the underlying + asset-class
+   * grains always apply). Per-trade $risk = `|entry − stop| × qty`.
+   */
+  private equityExposureSnapshot(): ExposurePositionRisk[] {
+    const positions = this.mode === 'live'
+      ? Array.from(this.liveEquityPositions.values())
+      : this.account.getState().openPositions;
+    return positions.map((p) => ({
+      underlying: p.symbol,
+      assetClass: 'equity',
+      risk: Math.abs(p.entryPrice - p.stopLoss) * p.quantity,
+    }));
+  }
+
+  /**
+   * TRA-1301 — the equity-side correlated-exposure cap consult shared by both
+   * equity entry chokepoints (the intraday ORB/BB/Ichimoku router and the SMA-200
+   * pullback). Sizes the candidate's per-trade $risk the same way the open path
+   * sizes (risk-from-stop × the active regime multiplier, off the live Tradier
+   * balance in live mode / the paper account in demo), then consults the cap.
+   * Returns the position-size multiplier to fold into the sized qty (`1` when the
+   * cap is off or abstains on a data gap), or `null` when the cap REJECTS the
+   * entry (with `signal.signalSkipReason` stamped).
+   */
+  private applyEquityCorrelatedCap(signal: TradeSignal, price: number): number | null {
+    if (!isCorrelatedExposureCapEnabled()) return 1;
+    const dist = Math.abs(signal.entryPrice - signal.stopLoss);
+    const baseMult = this.activeSizingMultiplier();
+    let sizedQty = 0;
+    let managedEquity = 0;
+    if (this.mode === 'live') {
+      const balance = this.liveTradierBalance;
+      if (balance) {
+        sizedQty = sizeLiveEquityFromStop({
+          balance,
+          managedAccountRatio: this.managedAccountRatio,
+          riskPerTrade: this.riskPerTrade,
+          entryPrice: signal.entryPrice,
+          stopPrice: signal.stopLoss,
+          currentPrice: price,
+          sizeMultiplier: baseMult,
+        });
+        managedEquity = balance.totalEquity * this.managedAccountRatio;
+      }
+    } else {
+      sizedQty = this.account.sizeFromStop(signal.entryPrice, signal.stopLoss) * baseMult;
+      managedEquity = this.account.managedEquity();
+    }
+    const candidateRisk = dist * sizedQty;
+    // Abstain (no cap) when we can't measure the candidate's risk or equity — a
+    // data gap must never silently reject an otherwise-valid entry.
+    if (!(candidateRisk > 0) || !(managedEquity > 0)) return 1;
+    return this.consultCorrelatedExposureCap(
+      'equity',
+      { underlying: signal.symbol, assetClass: 'equity', risk: candidateRisk },
+      this.equityExposureSnapshot(),
+      managedEquity,
+      (reason) => { signal.signalSkipReason = reason; },
+    );
+  }
+
   private async routeEquitySignal(
     signal: TradeSignal,
     price: number | undefined,
@@ -6406,6 +6570,18 @@ export class SignalEngine {
       return null;
     }
 
+    // TRA-1301 (parent TRA-1295, Rule 5) — correlated-exposure cap. Consulted
+    // BEFORE the broker order so a reject never reaches Tradier; scales the sized
+    // qty down to the most-binding bucket's (underlying / asset-class) headroom, or
+    // rejects below the min-trade-risk floor and surfaces the reason. DARK until
+    // the board arms CORRELATED_EXPOSURE_CAP_ENABLED, so prod is unchanged.
+    const correlatedCapScale = this.applyEquityCorrelatedCap(signal, price);
+    if (correlatedCapScale === null) {
+      this.recentSignals.unshift(signal); this.emitSignalAlert(signal);
+      if (this.recentSignals.length > MAX_SIGNALS) this.recentSignals.pop();
+      return null;
+    }
+
     // TRA-335 — in live mode, mirror the equity entry as a Tradier
     // OTOCO bracket order. We submit the broker order *first* so the
     // local Position only mirrors a confirmed fill (or a synchronous
@@ -6421,7 +6597,7 @@ export class SignalEngine {
         if (this.recentSignals.length > MAX_SIGNALS) this.recentSignals.pop();
         return null;
       }
-      const placement = await this.placeTradierEquityBracket(signal, price);
+      const placement = await this.placeTradierEquityBracket(signal, price, correlatedCapScale);
       if (!placement.ok) {
         signal.liveSkipReason = placement.reason;
         this.recentSignals.unshift(signal); this.emitSignalAlert(signal);
@@ -6450,9 +6626,10 @@ export class SignalEngine {
     // TRA-389 — scale the paper open by the market-review position-size
     // multiplier (1 when the regime-gate path is off). The live path
     // applied the same scalar inside `placeTradierEquityBracket`.
+    // TRA-1301 — also fold in the correlated-exposure cap scale (both modes).
     const pos = this.mode === 'live'
-      ? this.openLiveEquityMirror(signal, price, liveOrderId!)
-      : this.account.openPosition(signal, price, this.activeSizingMultiplier());
+      ? this.openLiveEquityMirror(signal, price, liveOrderId!, correlatedCapScale)
+      : this.account.openPosition(signal, price, this.activeSizingMultiplier() * correlatedCapScale);
     if (pos) {
       // TRA-231 — same rationale as the signal stamp above; the closed-
       // positions list is filtered per-mode in getState().
@@ -8944,6 +9121,13 @@ export class SignalEngine {
   private async placeTradierEquityBracket(
     signal: TradeSignal,
     currentPrice: number,
+    /**
+     * TRA-1301 — the correlated-exposure cap scale (Rule 5), folded into the
+     * regime sizing scalar so the live broker order is trimmed to the binding
+     * bucket's headroom. Defaults to 1 (no trim) for callers that don't apply
+     * the cap.
+     */
+    capScale = 1,
   ): Promise<{ ok: true; orderId: number | string } | { ok: false; reason: string }> {
     // TRA-726 — no day trading after the close. Never submit a live equity
     // bracket outside regular US market hours (9:30–16:00 ET, weekdays). A
@@ -8975,7 +9159,8 @@ export class SignalEngine {
       stopPrice: signal.stopLoss,
       currentPrice,
       // TRA-389 — trim the live order by the regime position-size scalar.
-      sizeMultiplier: this.activeSizingMultiplier(),
+      // TRA-1301 — and by the correlated-exposure cap scale (Rule 5).
+      sizeMultiplier: this.activeSizingMultiplier() * capScale,
     });
     if (qty <= 0) {
       return {
@@ -9034,6 +9219,8 @@ export class SignalEngine {
     signal: TradeSignal,
     currentPrice: number,
     tradierOrderId: number | string,
+    /** TRA-1301 — correlated-exposure cap scale, kept in lockstep with the broker order. */
+    capScale = 1,
   ): Position | null {
     const balance = this.liveTradierBalance;
     if (!balance) return null;
@@ -9046,7 +9233,8 @@ export class SignalEngine {
       currentPrice,
       // TRA-389 — keep the local mirror's qty in lockstep with the broker
       // order placed by `placeTradierEquityBracket` (same regime scalar).
-      sizeMultiplier: this.activeSizingMultiplier(),
+      // TRA-1301 — and the same correlated-exposure cap scale.
+      sizeMultiplier: this.activeSizingMultiplier() * capScale,
     });
     if (qty <= 0) return null;
     const position: Position = {

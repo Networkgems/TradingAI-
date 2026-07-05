@@ -3,6 +3,8 @@ import {
   CoinbaseOrderClient,
   CorrelationMatrix,
   admitUnderClusterCap,
+  correlatedExposureDecision,
+  buildExposureBuckets,
   resolveCorrelationCapConfig,
   evaluateShortFilters,
   evaluateShortBookCaps,
@@ -12,6 +14,7 @@ import {
   type ShortFilterContext,
   type ClosedShortTrade,
   type CorrelationCapConfig,
+  type ExposurePositionRisk,
 } from '@trading-app/engine';
 import { CRYPTO_WATCHLIST, isCryptoSymbolBlocked, aliasCryptoSymbol, resolveManagedAccountRatio, resolveRiskPerTrade, resolveStrategyPreset, presetAllowsStrategySymbol } from '@trading-app/shared';
 import type {
@@ -48,6 +51,8 @@ import { FundingRateTracker } from './funding-rate-tracker.js';
 // scoped to the pinned operator (mirrors the stock equity client). signal-engine
 // does not import this module, so this is a one-way dependency (no cycle).
 import { isLiveBrokerOperator } from './signal-engine.js';
+import { isCorrelatedExposureCapEnabled } from './exit-risk-rules-flag.js';
+import { recordCorrelatedExposureBinding } from './correlated-exposure-ledger.js';
 import type { PnlTracker } from './pnl-tracker.js';
 import { logger } from './observability/index.js';
 
@@ -1046,6 +1051,75 @@ export class CryptoSignalEngine {
   }
 
   /**
+   * TRA-1301 (parent TRA-1295, Rule 5) — the correlated-exposure cap ("7%" leg of
+   * the 3-5-7 governor), consulted beside the TRA-423 statistical cluster cap on a
+   * long entry. Groups the candidate on its symbol (underlying) + the `crypto`
+   * asset-class and caps the Σ open per-trade $risk per group at 7% of managed
+   * equity — an independent, correlation-matrix-free concentration cap that
+   * complements the statistical cluster cap. Returns the position-size multiplier
+   * (`1` = full size, `<1` = trim to the binding bucket's headroom) or `null` when
+   * the entry is REJECTED below the min-trade-risk floor (with
+   * `signal.signalSkipReason` stamped). DARK behind CORRELATED_EXPOSURE_CAP_ENABLED
+   * — a no-op returning `1` until the board arms it.
+   *
+   * `sizedQty` is the candidate quantity AFTER the statistical cluster cap trim, so
+   * the two caps compose multiplicatively on the final size. Observe-only: records
+   * a binding for the health / EOD readout; never opens or mutates anything.
+   */
+  private correlatedExposureCapMultiplier(
+    signal: TradeSignal,
+    sizedQty: number,
+    managedEquity: number,
+    openPositions: ReadonlyArray<Position>,
+  ): number | null {
+    if (!isCorrelatedExposureCapEnabled()) return 1;
+    if (!(sizedQty > 0)) return 1;
+    const stopDistance = Math.abs(signal.entryPrice - signal.stopLoss);
+    const candidateRisk = stopDistance * sizedQty;
+    if (!(candidateRisk > 0) || !(managedEquity > 0)) return 1;
+    const open: ExposurePositionRisk[] = openPositions.map(p => ({
+      underlying: p.symbol,
+      assetClass: 'crypto',
+      risk: Math.abs(p.entryPrice - p.stopLoss) * p.quantity,
+    }));
+    const candidate: ExposurePositionRisk = {
+      underlying: signal.symbol,
+      assetClass: 'crypto',
+      risk: candidateRisk,
+    };
+    // Defaults (7% cap / 0.25% floor) match the governor's — the pure decision
+    // falls back to the same CORRELATED_EXPOSURE_* constants when unspecified.
+    const decision = correlatedExposureDecision({
+      candidateRisk,
+      managedEquity,
+      buckets: buildExposureBuckets(candidate, open),
+    });
+    const mode: 'demo' | 'live' = this.mode === 'live' ? 'live' : 'demo';
+    if (!decision.admitted) {
+      const b = decision.bindingBucket;
+      signal.signalSkipReason = b
+        ? `correlated-exposure cap (Rule 5) — {${b.key}} would scale below the min-trade-risk floor (${b.level} group over the 7% cap)`
+        : 'correlated-exposure cap (Rule 5) — non-positive candidate risk';
+      if (b) {
+        recordCorrelatedExposureBinding({
+          venue: 'crypto', mode, level: b.level, key: b.key,
+          scale: 0, action: 'rejected', symbol: signal.symbol,
+        });
+      }
+      return null;
+    }
+    if (decision.scale < 1 && decision.bindingBucket) {
+      recordCorrelatedExposureBinding({
+        venue: 'crypto', mode,
+        level: decision.bindingBucket.level,
+        key: decision.bindingBucket.key,
+        scale: decision.scale, action: 'scaled', symbol: signal.symbol,
+      });
+    }
+    return decision.scale;
+  }
+
+  /**
    * TRA-261 — apply the perp shorts universe constraint and the §5
    * multiplicative short filters in priority order. Mutates the signal in
    * place by stamping `signalSkipReason` when a gate fails and returns the
@@ -1588,6 +1662,19 @@ export class CryptoSignalEngine {
             continue;
           }
           clusterCapMultiplier = mult;
+          // TRA-1301 (Rule 5) — correlated-exposure cap beside the statistical
+          // cluster cap; composes multiplicatively on the post-cluster qty.
+          const capMult = this.correlatedExposureCapMultiplier(
+            signal,
+            sizedQty * mult,
+            this.account.managedEquity(),
+            this.account.getState().openPositions,
+          );
+          if (capMult === null) {
+            log.warn('signal skipped', { sym, signalType: signal.type, reason: signal.signalSkipReason });
+            continue;
+          }
+          clusterCapMultiplier *= capMult;
         }
 
         // TRA-961 — accumulate into the held DCA position instead of opening a
@@ -1855,6 +1942,19 @@ export class CryptoSignalEngine {
             continue;
           }
           clusterCapMultiplier = mult;
+          // TRA-1301 (Rule 5) — correlated-exposure cap beside the statistical
+          // cluster cap; composes multiplicatively on the post-cluster qty.
+          const capMult = this.correlatedExposureCapMultiplier(
+            signal,
+            sizedQty * mult,
+            live.managedEquity(),
+            live.getState().openPositions,
+          );
+          if (capMult === null) {
+            log.warn('signal skipped', { sym, signalType: signal.type, reason: signal.signalSkipReason });
+            continue;
+          }
+          clusterCapMultiplier *= capMult;
         }
 
         try {

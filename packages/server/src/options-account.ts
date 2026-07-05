@@ -1,5 +1,5 @@
 import { randomUUID } from 'crypto';
-import type { TradierOpenOptionPosition, ExitState } from '@trading-app/engine';
+import type { TradierOpenOptionPosition, ExitState, ExposurePositionRisk } from '@trading-app/engine';
 import { evaluateMultiLegPreTrade, DEFAULT_MAX_LOSS_PCT_CAP, evaluateExit, DEFAULT_EXIT_PARAMS, chandelierStop, chandelierExitTriggered, profitLockDecision, takeProfitEarlyDecision } from '@trading-app/engine';
 import type { Side } from '@trading-app/engine';
 import type {
@@ -1113,6 +1113,37 @@ export class PaperOptionsAccount {
   }
 
   /**
+   * TRA-1301 — how many contracts an RV candidate at `mark` sizes to, for the
+   * correlated-exposure cap's pre-open risk estimate. Mirrors the sizing inside
+   * {@link openOptionFromRvCandidate}: demo (no `equityOverride`) sizes off the
+   * paper equity via `rvBudgetPerTrade`; live passes the real Tradier equity as
+   * the override (same forced-1-contract floor + 15% cap the open path applies).
+   */
+  getRvContractsForCandidate(mark: number, equityOverride?: number): number {
+    return this.sizeContracts(this.rvBudgetPerTrade(equityOverride), mark * 100, equityOverride);
+  }
+
+  /**
+   * TRA-1301 (parent TRA-1295, Rule 5) — the open OPTION book reduced to
+   * correlated-exposure risk rows for the cap. Each open option groups on its
+   * UNDERLIER ticker + the `equity` asset-class (an option on an equity carries
+   * that underlying's directional risk); per-trade $risk is the premium-at-risk
+   * `(premiumPaid − stopLossPremium) × contractsRemaining × 100`, floored at 0.
+   * Sector is omitted (no source yet) so only the underlying + asset-class grains
+   * apply. Scoped to `mode` so the demo book's cap sees only demo positions.
+   */
+  exposureSnapshotForMode(mode: AccountMode): ExposurePositionRisk[] {
+    const out: ExposurePositionRisk[] = [];
+    for (const o of this.openOptions.values()) {
+      if ((o.mode ?? 'demo') !== mode) continue;
+      const remaining = o.contractsRemaining ?? o.contracts;
+      const perContract = Math.max(0, o.premiumPaid - (o.stopLossPremium ?? 0));
+      out.push({ underlying: o.symbol, assetClass: 'equity', risk: perContract * remaining * 100 });
+    }
+    return out;
+  }
+
+  /**
    * TRA-378 — OTM equivalent of {@link getRvContractsForEquity}. Returns 0
    * below {@link OPTIONS_OTM_MIN_EQUITY} because OTM is gated off for small
    * live accounts (see {@link openOptionFromCandidate}).
@@ -1297,6 +1328,13 @@ export class PaperOptionsAccount {
     underlyingSpot?: number,
     /** TRA-991 — selector setup for the option-trade journal (observe-only). */
     journalSetup?: OptionTradeJournalSetup,
+    /**
+     * TRA-1301 (Rule 5) — correlated-exposure cap scale in (0,1]. Applied to the
+     * sized contract count (floored); a scale that rounds contracts below 1
+     * rejects the entry rather than opening a sub-contract ticket. Defaults to 1
+     * (no trim) for callers that don't apply the cap.
+     */
+    sizeMultiplier = 1,
   ): OptionPosition | null {
     this.resetDayIfNeeded();
     this.lastEntryRejection = null;
@@ -1325,7 +1363,17 @@ export class PaperOptionsAccount {
     const budget = this.rvBudgetPerTrade(equityOverride);
     const costPerContract = premiumPaid * 100;
     // TRA-378 — `sizeContracts` applies the forced 1-contract floor (live).
-    const contracts = this.sizeContracts(budget, costPerContract, equityOverride);
+    const sizedContracts = this.sizeContracts(budget, costPerContract, equityOverride);
+    // TRA-1301 (Rule 5) — trim the sized count by the correlated-exposure cap
+    // scale (floored). A scale that rounds the count below 1 rejects the entry:
+    // a token sub-contract correlated add is not worth the ticket.
+    const contracts = sizeMultiplier < 1
+      ? Math.floor(sizedContracts * sizeMultiplier)
+      : sizedContracts;
+    if (sizedContracts > 0 && contracts <= 0)
+      return this.rejectEntry(
+        `correlated-exposure cap (Rule 5) trimmed the size below one contract — token correlated add skipped`,
+      );
     if (contracts <= 0)
       return this.rejectEntry(
         `contract premium $${(costPerContract).toFixed(2)} exceeds the per-trade options budget — too large for this account`,

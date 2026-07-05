@@ -8,7 +8,9 @@ import type {
   Position,
   SignalType,
 } from '@trading-app/shared';
-import { MANAGED_ACCOUNT_RATIO } from '@trading-app/shared';
+import { MANAGED_ACCOUNT_RATIO, CORRELATED_EXPOSURE_CAP_PCT, CORRELATED_EXPOSURE_MIN_TRADE_RISK_PCT } from '@trading-app/shared';
+import { isCorrelatedExposureCapEnabled } from '../exit-risk-rules-flag.js';
+import { summarizeCorrelatedExposureBindings } from '../correlated-exposure-ledger.js';
 import type { EngineState, SymbolState } from '../signal-engine.js';
 import { computePortfolioGreeks } from './portfolio-greeks.js';
 import type { OptionTradeJournalSummary } from '../option-trade-journal.js';
@@ -467,6 +469,40 @@ ${hypRows || '_None._'}`;
   return out;
 }
 
+/**
+ * TRA-1301 (parent TRA-1295, Rule 5) — render the correlated-exposure cap ("7%"
+ * leg) config + a session-scoped rollup of how often it bound (scaled) or rejected
+ * an entry, and which grain bound it. Observe-only: the ledger is an in-memory
+ * diagnostic reset on reboot; the cap itself scales/rejects at each entry
+ * chokepoint. Renders whether the cap is armed so the board can see the state
+ * around the enable flip. Always renders (unlike the demo-only sections) — the cap
+ * governs the whole book — but stays terse when disarmed with no bindings.
+ */
+function buildCorrelatedExposureCapMarkdown(): string {
+  const enabled = isCorrelatedExposureCapEnabled();
+  const s = summarizeCorrelatedExposureBindings();
+  const capPctStr = (CORRELATED_EXPOSURE_CAP_PCT * 100).toFixed(0);
+  const floorStr = (CORRELATED_EXPOSURE_MIN_TRADE_RISK_PCT * 100).toFixed(2);
+  const recentRows = s.recent
+    .slice(0, 10)
+    .map(e =>
+      `| ${new Date(e.ts).toISOString()} | ${e.venue} | ${e.mode} | ${e.symbol} | ${e.level} {${e.key}} | ${e.action} | ${(e.scale * 100).toFixed(0)}% |`,
+    )
+    .join('\n');
+  return `
+
+## Correlated-Exposure Cap (TRA-1295 Rule 5, ${enabled ? 'ARMED' : 'DARK'})
+_The "7%" leg of the 3-5-7 governor: per-entry, Σ open per-trade risk in any correlated group (underlying / asset-class) is capped at ${capPctStr}% of managed equity; a candidate is scaled to the binding group's headroom or rejected below the ${floorStr}% min-trade-risk floor. ${enabled ? 'Live at every entry chokepoint (equity / crypto / options).' : 'Observe-only until the board arms CORRELATED_EXPOSURE_CAP_ENABLED — currently a no-op.'} Counts are session-scoped (reset on reboot)._
+| Metric | Value |
+|--------|-------|
+| Bindings (scaled + rejected) | ${s.bindingCount} |
+| Scaled | ${s.scaledCount} |
+| Rejected | ${s.rejectedCount} |
+${s.recent.length > 0
+  ? `\n### Recent Bindings\n| Time | Venue | Mode | Symbol | Binding group | Action | Scale |\n|------|-------|------|--------|---------------|--------|-------|\n${recentRows}`
+  : ''}`;
+}
+
 function buildMarkdown(
   report: Omit<EodReport, 'markdown'>,
   optionJournal?: OptionTradeJournalSummary,
@@ -541,7 +577,7 @@ ${moverRows || '_No data._'}
 | Winning Signals | ${signalAccuracy.winningSignals} |
 | Signal Win Rate | ${pct(signalAccuracy.winRate)} |
 | Avg R:R | 1:${signalAccuracy.avgRR.toFixed(2)} |
-${buildPortfolioGreeksMarkdown(portfolioGreeks)}${buildOptionJournalMarkdown(optionJournal, optionLearnedWeights)}${buildIntrospectionMarkdown(introspection, autopilotActions)}${buildSourceQualityMarkdown(sourceQualityWeights)}${buildAutonomousDemoLoopMarkdown(autonomousDemoLoop)}${buildAnalystMarkdown(analystPlan, analystReview)}${hypothesisQueue ? buildRatificationQueueMarkdown(hypothesisQueue) : ''}`;
+${buildPortfolioGreeksMarkdown(portfolioGreeks)}${buildOptionJournalMarkdown(optionJournal, optionLearnedWeights)}${buildIntrospectionMarkdown(introspection, autopilotActions)}${buildSourceQualityMarkdown(sourceQualityWeights)}${buildAutonomousDemoLoopMarkdown(autonomousDemoLoop)}${buildAnalystMarkdown(analystPlan, analystReview)}${hypothesisQueue ? buildRatificationQueueMarkdown(hypothesisQueue) : ''}${buildCorrelatedExposureCapMarkdown()}`;
 }
 
 export interface ReportInput {
