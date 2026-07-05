@@ -103,6 +103,7 @@ import {
   hydrateIgnitionFromDisk,
 } from './crypto-ignition-scanner.js';
 import { hydrateConvictionDcaFromDisk } from './conviction-dca-ledger.js';
+import { hydrateScaleoutLadderFromDisk } from './scaleout-ladder-ledger.js';
 import { fetchCrypto4hBars } from './crypto-feed.js';
 import type { CryptoSignalEngine } from './crypto-engine.js';
 // TRA-1006 — automated pre/post-market analyst agent. Tick fns are flag-checked
@@ -2028,6 +2029,23 @@ async function runHourlyCryptoRegimeTsmom(): Promise<void> {
       addCount: h.addCount,
       breachCount: h.breachCount,
       lastAddAt: h.lastAddAt,
+    });
+  }
+}
+
+// TRA-1300 — hydrate the observe-only scale-out ladder ledger on boot and remember
+// DATA_DIR for subsequent appends, so the QuantTrader forward-validation trim counts
+// and the per-position fired-rung set survive the ~daily demo-host restart (a rung
+// trims once across restarts). Best-effort; runs regardless of the flag — reading one
+// small file at boot is cheap.
+{
+  const h = hydrateScaleoutLadderFromDisk(DATA_DIR);
+  if (h.trimCount > 0) {
+    log.info('scale-out ladder ledger hydrated (TRA-1300)', {
+      trimCount: h.trimCount,
+      fullExitCount: h.fullExitCount,
+      positionCount: h.positionCount,
+      lastTrimAt: h.lastTrimAt,
     });
   }
 }

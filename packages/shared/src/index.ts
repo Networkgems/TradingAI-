@@ -1924,6 +1924,35 @@ export const LIVE_EQUITY_STOP_MODIFY_MIN_TICK_PCT = 0.0015; // min favorable sto
 export const LIVE_EQUITY_STOP_MODIFY_MIN_TICK_ABS = 0.02;   // …but never smaller than 2¢ (sub-penny moves aren't worth a round-trip)
 export const LIVE_EQUITY_STOP_MODIFY_COOLDOWN_MS = 60_000;  // ≥60s between modifies on the same position (Tradier throttle guard)
 
+// TRA-1300 (parent TRA-1290, board confirmation `38a50f39`) — the observe-only
+// scale-out (take-profit) ladder. The board REJECTED the finfluencer add-down /
+// averaging-down ladder (TRA-1291 verdict: NO-GO — it blows the account up) and
+// GREENLIT only this scale-out side: trim an EXISTING position on moves ABOVE the
+// average entry. There is deliberately NO add-down rung here. Sell % is of the
+// ORIGINAL (base) position size — the same reference the TRA-1291 fee-aware harness
+// fixed. The downside is NOT governed here at all: it hands off to the shipped
+// chandelier trail + give-back cap (TRA-1267/1268). Ships DARK behind the
+// standalone observe-only flag `ENABLE_SCALEOUT_LADDER` (a scanner-style flag, not
+// under the EXIT_RISK_RULES master — it places no orders, so it is not an exit-risk
+// mutation). `remainder` sells whatever base fraction is left (full exit).
+export interface ScaleOutLadderRung {
+  /** Favorable move from average entry that arms this rung (0.25 = +25%). */
+  up: number;
+  /** Base-size fraction to trim, or `'remainder'` to exit the rest. */
+  sellPctBase: number | 'remainder';
+}
+export const SCALE_OUT_LADDER_RUNGS: readonly ScaleOutLadderRung[] = [
+  { up: 0.25, sellPctBase: 0.10 }, // +25% → sell 10% of base
+  { up: 0.35, sellPctBase: 0.20 }, // +35% → sell 20% of base
+  { up: 0.45, sellPctBase: 0.30 }, // +45% → sell 30% of base
+  { up: 0.60, sellPctBase: 0.40 }, // +60% → sell 40% of base
+  { up: 1.00, sellPctBase: 'remainder' }, // +100% → exit remainder
+];
+// Per-side TAKER fee rates (the live engine submits market orders), matching the
+// TRA-1291 harness cost model so the observe-only net proceeds are apples-to-apples.
+export const SCALE_OUT_TAKER_FEE_EQUITY = (2 + 3) / 10_000; // 5 bps
+export const SCALE_OUT_TAKER_FEE_CRYPTO = (60 + 3) / 10_000; // 63 bps
+
 /**
  * TRA-526 — deterministic per-trade risk ceiling ("the math disposes" layer).
  *

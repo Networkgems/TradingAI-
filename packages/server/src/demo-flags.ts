@@ -58,6 +58,13 @@ export const DEMO_FLAG_ALLOWLIST = [
   // of opening real capital. Safe for the file override so a non-admin operator
   // can arm the demo forward-test on the self-hosted host (no PM2/admin).
   'ENABLE_SMA200_DEMO_FORWARD_TEST',
+  // TRA-1300 (parent TRA-1290, board confirmation `38a50f39`) — observe-only
+  // scale-out (take-profit) ladder overlay. Non-secret, read-only, ZERO capital /
+  // no order path — LOGS intended trims into a durable ledger only; the downside
+  // is owned by the shipped chandelier + give-back cap. Safe for the file override
+  // so a non-admin operator can arm the demo forward capture on the self-hosted
+  // host (no PM2/admin).
+  'ENABLE_SCALEOUT_LADDER',
 ] as const;
 
 export const DEMO_FLAGS_FILENAME = 'demo-flags.json';

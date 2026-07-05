@@ -38,6 +38,8 @@ import { summarizeRegimeTsmomScans } from '../crypto-regime-tsmom-scanner.js';
 import { isCryptoIgnitionEnabled, resolveIgnitionWatchlist } from '../crypto-ignition-flag.js';
 import { summarizeIgnitionScans } from '../crypto-ignition-scanner.js';
 import { summarizeConvictionDca, resolveConvictionDcaDeployAnchor } from '../conviction-dca-ledger.js';
+import { isScaleoutLadderEnabled } from '../scaleout-ladder-flag.js';
+import { summarizeScaleoutLadder } from '../scaleout-ladder-ledger.js';
 import { CONVICTION_DCA } from '@trading-app/shared';
 import { resolveDemoFlagEnv } from '../demo-flags.js';
 import {
@@ -930,6 +932,26 @@ export function registerLiveHealthRoutes(app: Express, deps: LiveHealthDeps): vo
       build: resolveBuildInfo(),
       enabled: CONVICTION_DCA.enabled,
       ...summarizeConvictionDca(resolveConvictionDcaDeployAnchor()),
+    });
+  });
+
+  // TRA-1300 (parent TRA-1290, board confirmation `38a50f39`) — unauthenticated,
+  // secrets-free scale-out (take-profit) ladder readout (parity with /conviction-dca).
+  // The overlay is process-global, demo-only, OBSERVE-ONLY (no balances/PII — just
+  // the intended-trim rung / fee-aware net proceeds / gainPct per position), so this
+  // is unauthenticated. `enabled` mirrors ENABLE_SCALEOUT_LADDER so QuantTrader can
+  // see at a glance whether the forward capture is armed; when off the ledger is
+  // empty ⇒ an honest zero rather than a 404. Counts are rebuilt from the JSONL under
+  // DATA_DIR on boot so trimCount/fullExitCount/positionCount survive the ~daily demo
+  // reboot. Always read-only: NO order is ever placed off these trims — the board
+  // REJECTED the add-down ladder, and demo→routing graduation is a separate decision.
+  app.get('/api/health/scaleout-ladder', (_req, res) => {
+    res.json({
+      ok: true,
+      time: new Date(now()).toISOString(),
+      build: resolveBuildInfo(),
+      enabled: isScaleoutLadderEnabled(),
+      ...summarizeScaleoutLadder(),
     });
   });
 

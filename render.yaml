@@ -353,6 +353,19 @@ services:
       # Revert = clear this value. Accepts the usual truthy spellings.
       - key: ENABLE_SMA200_DEMO_FORWARD_TEST
         value: "true"
+      # TRA-1300 (parent TRA-1290, board confirmation `38a50f39`) — arm the
+      # OBSERVE-ONLY scale-out (take-profit) ladder overlay on the demo host so the
+      # forward capture QuantTrader signs off can accrue. Trims an existing LONG
+      # position on moves ABOVE the average entry (+25/35/45/60% ladder, +100% exit
+      # remainder); the board REJECTED the add-down ladder (TRA-1291 NO-GO), so there
+      # is NO averaging-down path. LOGS intended fee-aware trims into the durable
+      # ledger backing GET /api/health/scaleout-ladder — it places NO order and
+      # mutates NO book; the downside stays owned by the chandelier + give-back cap.
+      # NOTE: blueprint sync ≠ autoDeploy on bqb1 (TRA-1289) — a redeploy (or the
+      # DATA_DIR demo-flags.json override) is needed for this to take effect on the
+      # running service. Accepts 1/true/yes/on.
+      - key: ENABLE_SCALEOUT_LADDER
+        value: "true"
       # TRA-1080 — event-loop/heap starvation watchdog. The watchdog itself is
       # ON by default in code (no env needed); these knobs are declared
       # `sync: false` so an operator can DISABLE or RETUNE it from the dashboard

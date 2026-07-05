@@ -53,6 +53,8 @@ import { scanIvRvFromSnapshot, recordIvRvScan } from './iv-rv-scanner.js';
 import { scanShortPremiumFromSnapshot, recordShortPremiumScan } from './short-premium-scanner.js';
 import { isExitRiskRulesEnabled, isLiveEquityStopModifyEnabled, isTakeProfitEarlyEnabled, isEntryGreeksGateEnabled } from './exit-risk-rules-flag.js';
 import { recordConvictionDcaFill } from './conviction-dca-ledger.js';
+import { isScaleoutLadderEnabled } from './scaleout-ladder-flag.js';
+import { evaluateAndRecordScaleout } from './scaleout-ladder-ledger.js';
 import { etDateString } from './scheduler.js';
 // TRA-995 (epic-C, self-regulation) — the standing risk autopilot. A pure
 // tighten-only decision module; the governor below is its mutation boundary and
@@ -1296,6 +1298,49 @@ export class SignalEngine {
   }
 
   /**
+   * TRA-1300 — observe-only scale-out (take-profit) ladder pass over the open
+   * demo-equity positions. For each LONG position above its average entry it
+   * evaluates the ladder against the live price and records any newly-crossed
+   * rung's intended trim into the durable ledger (backs GET /api/health/scaleout-
+   * ladder). OBSERVE-ONLY: it reads `openPositions` and the price map and writes
+   * only the ledger — it places NO order and mutates NO account. The downside is
+   * deliberately untouched (the ledger's `downsideDeferred` no-op leaves it to the
+   * chandelier + give-back cap). Only called when `ENABLE_SCALEOUT_LADDER` is on.
+   */
+  private evaluateScaleoutLadder(prices: Map<string, number>): void {
+    for (const pos of this.account.getState().openPositions) {
+      const mark = prices.get(pos.symbol);
+      if (mark == null || !(mark > 0)) continue;
+      // Base size = current quantity of the (possibly scaled-in) position; the
+      // ladder trims a fraction OF this. The observe book never partially closes,
+      // so the current qty is the position's size for this forward sample.
+      const decision = evaluateAndRecordScaleout({
+        positionId: pos.id,
+        symbol: pos.symbol,
+        side: pos.side,
+        avgEntry: pos.entryPrice,
+        markPrice: mark,
+        baseQty: pos.quantity,
+        // -USD pairs are the crypto sleeve; everything else is equity (fee-rate pick).
+        assetClass: pos.symbol.toUpperCase().endsWith('-USD') ? 'crypto' : 'equity',
+        mode: 'demo',
+      });
+      for (const trim of decision.triggered) {
+        log.info('scale-out ladder intended trim (TRA-1300, observe-only)', {
+          symbol: pos.symbol,
+          positionId: pos.id,
+          gainPct: Number(decision.gainPct.toFixed(4)),
+          rungUp: trim.up,
+          sellPctBase: trim.sellPctBase,
+          trimQty: trim.trimQty,
+          netProceeds: Number(trim.netProceeds.toFixed(2)),
+          isFullExit: trim.isFullExit,
+        });
+      }
+    }
+  }
+
+  /**
    * TRA-1268 (TRA-1250 Rule 1) — build the {@link OptionExitRiskInput}: ATR(14)
    * of the UNDERLYING on the 5m shadow-candle cache, one entry per open
    * option's underlying. Underlyings without enough cached bars are omitted.
@@ -2467,6 +2512,21 @@ export class SignalEngine {
           this.account.getState().totalEquity,
           this.optionsAccount.getState().optionsPnl,
         );
+      }
+
+      // TRA-1300 — observe-only scale-out (take-profit) ladder pass over the open
+      // demo positions. Records intended UPSIDE trims into the durable ledger for
+      // QuantTrader's forward validation; NEVER routes an order. Dark unless
+      // `ENABLE_SCALEOUT_LADDER` is on. The downside is untouched here — it stays
+      // owned by the chandelier + give-back cap (run above via `equityExitRisk`).
+      if (isScaleoutLadderEnabled()) {
+        try {
+          this.evaluateScaleoutLadder(prices);
+        } catch (err) {
+          log.warn('scale-out ladder observe pass threw', {
+            reason: err instanceof Error ? err.message : String(err),
+          });
+        }
       }
     }
 
