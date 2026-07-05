@@ -277,10 +277,29 @@ describe('Strategy presets — TRA-325', () => {
     }
   });
 
-  it('TRA-697 — the surviving preset library is exactly { no_trade, crypto_core }', () => {
+  it('TRA-697 / TRA-1304 — the preset library is exactly { no_trade, crypto_core, crypto_core_live_majors }', () => {
     // The OOS-failed legacy roster (legacy_5 / bb_fade_sol_doge / tra405_validated)
-    // was retired; only the live stand-down and the go-forward DCA roster remain.
-    expect(Object.keys(STRATEGY_PRESETS).sort()).toEqual(['crypto_core', 'no_trade']);
+    // was retired; the live stand-down + the go-forward DCA demo roster remain,
+    // and TRA-1304 added the majors-pinned LIVE DCA preset.
+    expect(Object.keys(STRATEGY_PRESETS).sort()).toEqual([
+      'crypto_core',
+      'crypto_core_live_majors',
+      'no_trade',
+    ]);
+  });
+
+  // TRA-1304 — the live-money DCA preset is DCA-only and hard-pinned to the
+  // OOS-validated majors via BOTH the preset-wide symbolFilter AND the
+  // per-strategy universe (defense in depth), so a real-money flip can never
+  // route DCA at the full ~395-pair crypto_core universe.
+  it('TRA-1304 — crypto_core_live_majors pins DCA to BTC/ETH/SOL (both gates)', () => {
+    const p = STRATEGY_PRESETS.crypto_core_live_majors;
+    expect(p.enabledStrategies).toEqual(['dca']);
+    expect([...(p.symbolFilter ?? [])].sort()).toEqual(['BTC-USD', 'ETH-USD', 'SOL-USD']);
+    expect([...(p.strategyUniverse?.dca ?? [])].sort()).toEqual(['BTC-USD', 'ETH-USD', 'SOL-USD']);
+    // A non-major (e.g. an illiquid alt) is admitted by neither gate.
+    expect(presetAllowsStrategySymbol(p, 'dca', 'DOGE-USD')).toBe(false);
+    expect(presetAllowsStrategySymbol(p, 'dca', 'BTC-USD')).toBe(true);
   });
 
   // TRA-698 — the go-forward roster: DCA only on the OOS-survivable majors.

@@ -257,9 +257,12 @@ const DCA_PARAMS = {
 const CRYPTO_DCA_ACCUMULATION = {
   /**
    * Master opt-in. Flipped on by LeadDev per QuantTrader's TRA-965 sign-off
-   * (caps set below). Accumulation is demo-paper only (`accumulateDca` stamps
-   * `mode='demo'`); live-money trading awaits QuantTrader's final live-flip nod
-   * once the demo acceptance is green (TRA-961 Coinbase sandbox credential).
+   * (caps set below). TRA-1304 wired the live-money accumulation path
+   * (`accumulateDcaLive` stamps `mode='live'`, `CryptoLiveAccount.addToPosition`
+   * places the real add and holds the stop fixed); it only fires when the live
+   * engine is armed — `LIVE_STRATEGY_PRESET` off `no_trade` (majors-pinned
+   * `crypto_core_live_majors`) AND operator-enabled live auto-trading. Demo keeps
+   * its own accumulation via `accumulateDca` (`mode='demo'`).
    */
   enabled: true,
   /**
@@ -1979,7 +1982,19 @@ export class CryptoSignalEngine {
         // signals still flow to the dashboard's Signals panel with the
         // pre-route reason instead of being silently dropped.
         this.applyShortGates(signal, 'live');
-        if (live.hasOpenPositionForSignalType(sym, signal.type)) continue;
+        // TRA-1304 — additive DCA accumulation on the LIVE book, mirroring the
+        // demo path (runDemoTick). Pre-TRA-1304 the live tick only ever opened a
+        // single tranche per symbol (`hasOpenPositionForSignalType` blocked every
+        // repeat DCA buy), so "flip DCA accumulation live" would not actually
+        // accumulate. When accumulation is enabled and a DCA position is already
+        // open for the symbol, capture it and ADD to it below (bounded by the
+        // per-symbol notional cap + TRA-423 cluster cap) instead of skipping.
+        // Every other signal type keeps the single-position guard.
+        const accumulateInto =
+          signal.type === 'dca' && CRYPTO_DCA_ACCUMULATION.enabled && signal.side === 'buy'
+            ? live.getOpenPositionForSignalType(sym, 'dca')
+            : null;
+        if (!accumulateInto && live.hasOpenPositionForSignalType(sym, signal.type)) continue;
         // TRA-480 — dedup against live-mode signals only; the demo branch
         // maintains its own recent-signal window in the same buffer.
         const recent = this.recentSignals.find(
@@ -2061,12 +2076,94 @@ export class CryptoSignalEngine {
           clusterCapMultiplier *= capMult;
         }
 
+        // TRA-1304 — accumulate into the held live DCA position instead of
+        // opening a second bracket. The cluster cap and the per-symbol notional
+        // cap both bound the add (see accumulateDcaLive); `'hold'` exit mode
+        // drops the per-leg TP so the growing position is held to the
+        // catastrophe stop (enforced by CryptoLiveAccount.checkExits' dcaHold
+        // guard). Live adds stamp mode='live' so they land on the live book.
+        if (accumulateInto) {
+          await this.accumulateDcaLive(accumulateInto, signal, price, clusterCapMultiplier);
+          continue;
+        }
+
         try {
-          await live.openPosition(signal, price, source, clusterCapMultiplier);
+          const opened = await live.openPosition(signal, price, source, clusterCapMultiplier);
+          if (opened) {
+            opened.mode = 'live';
+            // TRA-1304 — the first live DCA tranche is also a held accumulation:
+            // stamp it so subsequent cadence windows average into THIS position
+            // and the per-leg TP is not enforced (exit on the catastrophe stop
+            // only). Mirrors the demo path's first-tranche stamp.
+            if (signal.type === 'dca' && CRYPTO_DCA_ACCUMULATION.enabled && signal.side === 'buy') {
+              opened.dcaFills = 1;
+              if (CRYPTO_DCA_ACCUMULATION.exitMode === 'hold') opened.dcaHold = true;
+            }
+          }
         } catch (err: unknown) {
           log.warn('live open failed', { sym, reason: err instanceof Error ? err.message : String(err) });
         }
       }
+    }
+  }
+
+  /**
+   * TRA-1304 — add to / average a held DCA position on the LIVE (real-money)
+   * book. The live-money analogue of {@link accumulateDca}: sizes the add the
+   * same way (risk-from-stop × the TRA-423 cluster-cap multiplier), bounds it by
+   * the per-symbol notional cap so the accumulated position can never pyramid
+   * past `maxSymbolNotionalFracOfManagedEquity` of managed equity, then routes
+   * the add through {@link CryptoLiveAccount.addToPosition} (real Coinbase market
+   * BUY, Coinbase-strict quantization + min-notional + cash preflight). The
+   * catastrophe stop is held fixed by `addToPosition` (we average size, never the
+   * stop); `'hold'` exit mode drops the per-leg TP. A blocked add stamps
+   * `signalSkipReason` so the dashboard shows the strategy fired and why the add
+   * was capped, mirroring the demo entry-path skip reasons.
+   */
+  private async accumulateDcaLive(
+    pos: Position,
+    signal: TradeSignal,
+    price: number,
+    clusterCapMultiplier: number,
+  ): Promise<void> {
+    const live = this.liveAccount;
+    if (!live) return;
+    // Per-symbol notional cap: total accumulated notional ≤ frac × managed equity.
+    const capNotional = live.managedEquity() * CRYPTO_DCA_ACCUMULATION.maxSymbolNotionalFracOfManagedEquity;
+    const currentNotional = pos.quantity * price;
+    const headroomNotional = capNotional - currentNotional;
+    if (headroomNotional <= 0) {
+      signal.signalSkipReason = `${signal.symbol} DCA accumulation at per-symbol cap (${currentNotional.toFixed(0)} >= ${capNotional.toFixed(0)}) — holding, no add`;
+      log.warn('live DCA add skipped: per-symbol cap reached', {
+        sym: signal.symbol,
+        currentNotional: currentNotional.toFixed(2),
+        capNotional: capNotional.toFixed(2),
+      });
+      return;
+    }
+
+    // Size the add like a fresh entry (risk-from-stop), apply the cluster cap,
+    // then clamp to the per-symbol notional headroom. addToPosition applies the
+    // Coinbase-specific quantization + min-notional + cash preflight.
+    let addQty = live.sizeFromStop(signal.entryPrice, signal.stopLoss);
+    if (Number.isFinite(clusterCapMultiplier) && clusterCapMultiplier > 0 && clusterCapMultiplier < 1) {
+      addQty *= clusterCapMultiplier;
+    }
+    const maxAddQtyBySymbolCap = headroomNotional / price;
+    addQty = Math.min(addQty, maxAddQtyBySymbolCap);
+    if (addQty <= 0) {
+      signal.signalSkipReason = `${signal.symbol} DCA add rounds to 0 within caps — no add this cadence`;
+      return;
+    }
+
+    try {
+      const updated = await live.addToPosition(pos.id, addQty, price, {
+        holdNoTakeProfit: CRYPTO_DCA_ACCUMULATION.exitMode === 'hold',
+      });
+      if (!updated) return; // addToPosition logged the reason (cash / min notional)
+      updated.mode = 'live';
+    } catch (err: unknown) {
+      log.warn('live DCA add failed', { sym: signal.symbol, reason: err instanceof Error ? err.message : String(err) });
     }
   }
 

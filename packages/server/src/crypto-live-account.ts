@@ -1141,6 +1141,132 @@ export class CryptoLiveAccount {
   }
 
   /**
+   * TRA-961 / TRA-1304 — the open position (if any) for `(symbol, signalType)`.
+   * Mirrors {@link CryptoPaperAccount.getOpenPositionForSignalType}: returns the
+   * live reference (not a copy) so the DCA accumulation path in the engine can
+   * size an add against the current blended entry / quantity and then mutate it
+   * via {@link addToPosition}. Returns `null` when nothing is open for the pair.
+   */
+  getOpenPositionForSignalType(symbol: string, signalType: SignalType): Position | null {
+    for (const pos of this.positions.values()) {
+      if (pos.symbol === symbol && pos.signalType === signalType) return pos;
+    }
+    return null;
+  }
+
+  /**
+   * TRA-1304 — additive DCA accumulation on the LIVE (real-money) book. The
+   * live-money analogue of {@link CryptoPaperAccount.addToPosition}: submits an
+   * additional Coinbase market BUY for `addQty` and, on fill, blends it into the
+   * held position while keeping the catastrophe stop FIXED (we average *size*,
+   * never the *stop* — the classic DCA failure mode of widening the stop "to
+   * give it room" is forbidden). `holdNoTakeProfit` flags the position so
+   * {@link checkExits} stops honoring the per-leg take-profit, leaving the
+   * catastrophe stop as the only auto-exit (guardrail #3).
+   *
+   * Reuses the same order-placement guard sequence as {@link openPosition}
+   * (balance preflight, Coinbase base-increment quantization, $MIN_NOTIONAL_USD
+   * floor, cash + fee-buffer preflight) so an add can never spend past available
+   * cash or ship a size Coinbase rejects. The caller (engine `accumulateDcaLive`)
+   * has already bounded `addQty` by the per-symbol notional cap and the TRA-423
+   * cluster cap. Returns the updated Position, or `null` when the add is skipped
+   * before order submission (size too small, below min notional, insufficient
+   * cash). Throws if Coinbase rejects the order (mirrors openPosition).
+   */
+  async addToPosition(
+    positionId: string,
+    addQty: number,
+    addPrice: number,
+    opts: { holdNoTakeProfit?: boolean } = {},
+  ): Promise<Position | null> {
+    const pos = this.positions.get(positionId);
+    if (!pos) return null;
+    if (!Number.isFinite(addQty) || addQty <= 0) return null;
+    if (!Number.isFinite(addPrice) || addPrice <= 0) return null;
+
+    // TRA-285 — refresh available balance right before sizing the add so a
+    // hold/withdrawal since the last dashboard refresh doesn't have us submit
+    // a buy guaranteed to fail with INSUFFICIENT_FUND.
+    if (Date.now() - this.lastBalanceRefresh > BALANCE_PREFLIGHT_MAX_AGE_MS) {
+      await this.refreshBalance();
+    }
+
+    // Quantize to Coinbase's per-product base_increment (fall back to legacy
+    // 6-decimal rounding when the /products lookup never succeeded), then apply
+    // the same min-notional + cash-with-fee-buffer preflight the open path uses.
+    const productInfo = this.tradableProducts?.get(pos.symbol);
+    let qty = productInfo
+      ? quantizeBaseSize(addQty, productInfo.baseIncrement)
+      : Math.round(addQty * 1_000_000) / 1_000_000;
+    // Never let one add push USD spend past the fee-buffered cash on hand.
+    const maxQtyForCash = (this.cashUsd * CASH_FEE_BUFFER) / addPrice;
+    qty = Math.min(qty, productInfo ? quantizeBaseSize(maxQtyForCash, productInfo.baseIncrement) : maxQtyForCash);
+    if (qty <= 0) {
+      log.warn('skip DCA add: no spendable cash', {
+        symbol: pos.symbol,
+        cashUsd: this.cashUsd.toFixed(2),
+      });
+      return null;
+    }
+    const cost = addPrice * qty;
+    if (cost < MIN_NOTIONAL_USD) {
+      log.warn('skip DCA add: below Coinbase min notional', {
+        symbol: pos.symbol,
+        cost: cost.toFixed(2),
+        min: MIN_NOTIONAL_USD,
+      });
+      return null;
+    }
+    if (cost > this.cashUsd * CASH_FEE_BUFFER) {
+      log.warn('skip DCA add: cost exceeds available cash', {
+        symbol: pos.symbol,
+        cost: cost.toFixed(2),
+        cashUsd: this.cashUsd.toFixed(2),
+      });
+      return null;
+    }
+
+    let resp: CoinbaseOrderSuccessResponse;
+    try {
+      resp = await this.coinbase.placeMarketOrder({
+        productId: pos.symbol,
+        side: 'buy',
+        baseSize: qty,
+      });
+    } catch (err: unknown) {
+      const msg = err instanceof Error ? err.message : String(err);
+      log.error('DCA add failed', { symbol: pos.symbol, reason: msg });
+      throw err;
+    }
+
+    // Reconcile against the real fill so the blended entry reflects what
+    // Coinbase actually executed; fall back to the quote price / requested qty
+    // if the API hasn't settled yet (refreshBalance smooths any drift).
+    const fill = await this.awaitFill(resp.order_id, pos.symbol);
+    const fillPrice = fill?.price ?? addPrice;
+    const filledQty = fill?.size ?? qty;
+
+    const newQty = pos.quantity + filledQty;
+    // Blend the average entry; the protective stop is intentionally left as-is.
+    pos.entryPrice = (pos.entryPrice * pos.quantity + fillPrice * filledQty) / newQty;
+    pos.quantity = newQty;
+    // Optimistic cash debit; refreshBalance() reconciles from Coinbase.
+    this.cashUsd -= fillPrice * filledQty;
+    pos.dcaFills = (pos.dcaFills ?? 1) + 1;
+    if (opts.holdNoTakeProfit) pos.dcaHold = true;
+    this.positions.set(pos.id, pos);
+    log.info('DCA ADD', {
+      symbol: pos.symbol,
+      fills: pos.dcaFills,
+      addQty: filledQty,
+      blendedEntry: pos.entryPrice.toFixed(6),
+      totalQty: pos.quantity,
+      coinbaseOrderId: resp.order_id,
+    });
+    return pos;
+  }
+
+  /**
    * Submit a market order to Coinbase and, on success, record the resulting
    * position locally. Returns null if the trade was skipped before order
    * submission (qty too small, insufficient cash, spot-only SELL). Throws if
@@ -1557,11 +1683,18 @@ export class CryptoLiveAccount {
       }
 
       let hit: 'tp' | 'sl' | null = null;
+      // TRA-961 / TRA-1304 — a held DCA accumulation has no per-leg take-profit;
+      // only the catastrophe stop (or a portfolio-level rule) closes it. Skip
+      // the TP arm so averaging-in is not unwound by a 4R target on the first
+      // up-move. Mirrors CryptoPaperAccount.checkExits so the ratified hold-mode
+      // guardrail — catastrophe stop is the ONLY auto-exit — holds on the live
+      // book exactly as it does in demo.
+      const honorTakeProfit = !pos.dcaHold;
       if (pos.side === 'buy') {
-        if (price >= pos.takeProfit) hit = 'tp';
+        if (honorTakeProfit && price >= pos.takeProfit) hit = 'tp';
         else if (price <= pos.stopLoss) hit = 'sl';
       } else {
-        if (price <= pos.takeProfit) hit = 'tp';
+        if (honorTakeProfit && price <= pos.takeProfit) hit = 'tp';
         else if (price >= pos.stopLoss) hit = 'sl';
       }
       if (!hit) continue;

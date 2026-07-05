@@ -515,7 +515,7 @@ export const MANAGED_ACCOUNT_RATIO = 0.5;   // 50% of total account auto-managed
  * forward paper leg instead. Only the live-relevant presets survive: `no_trade`
  * (the live stand-down) and `crypto_core` (the go-forward DCA-only roster).
  */
-export type StrategyPresetId = 'no_trade' | 'crypto_core';
+export type StrategyPresetId = 'no_trade' | 'crypto_core' | 'crypto_core_live_majors';
 
 /** Crypto-strategy SignalTypes routable by the engine. Subset of {@link SignalType}. */
 export type CryptoStrategyType =
@@ -633,6 +633,31 @@ export const STRATEGY_PRESETS: Readonly<Record<StrategyPresetId, StrategyPreset>
     // stays null so the preset-wide gate is open and breadth is governed by the
     // engine's active-symbol universe (sourced from the Coinbase product catalog).
     symbolFilter: null,
+  },
+  // TRA-1304 — LIVE-MONEY DCA preset, universe pinned to the OOS-validated
+  // liquid majors. QuantTrader's live-money sign-off (CONDITIONAL GO) blocks
+  // flipping DCA live against `crypto_core`'s full ~395-pair `symbolFilter: null`
+  // universe: only BTC/ETH/SOL carry OOS validation (TRA-695 found BTC-USD +
+  // SOL-USD OOS-survivable through the 2025-26 deep-bear drawdowns), and the
+  // 25% fallback stop that engages when ATR is unavailable (thin/young listings)
+  // is a tail a microcap can gap straight through. This preset is the
+  // majors-pinned target `LIVE_STRATEGY_PRESET` must point at BEFORE any real
+  // order fires — it keeps DCA-only, hard-restricts emission to the three
+  // majors via BOTH the preset-wide `symbolFilter` and the per-strategy
+  // `strategyUniverse` whitelist (defense in depth), and never widens. Demo
+  // keeps its broad `crypto_core`. First live window: majors only, no cap
+  // increases, ≥30 days of live fills, then a fresh sign-off before any
+  // expansion. See [TRA-1304].
+  crypto_core_live_majors: {
+    id: 'crypto_core_live_majors',
+    displayName: 'Crypto Core (Live) — DCA on BTC/ETH/SOL majors only',
+    description:
+      'TRA-1304 live-money DCA preset. Dollar-cost-averaging accumulation (long-only, EMA-200 trend-gated, cadence-paced, hold-to-catastrophe-stop) pinned to the OOS-validated liquid majors BTC-USD / ETH-USD / SOL-USD. This is the ONLY preset LIVE_STRATEGY_PRESET may point at when routing real Coinbase orders — QuantTrader’s sign-off is NO-GO on the full ~395-pair crypto_core universe. Guardrails unchanged: 10% per-symbol notional cap, EMA-200 daily gate, 6×ATR(14) catastrophe stop as the only auto-exit under hold-mode. Both symbolFilter and the dca strategyUniverse pin to the same three majors (defense in depth).',
+    enabledStrategies: ['dca'] as const,
+    symbolFilter: ['BTC-USD', 'ETH-USD', 'SOL-USD'] as const,
+    strategyUniverse: {
+      dca: ['BTC-USD', 'ETH-USD', 'SOL-USD'] as const,
+    },
   },
 };
 

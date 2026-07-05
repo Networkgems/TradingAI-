@@ -2240,3 +2240,81 @@ describe('CryptoLiveAccount spot wallet reconciliation (TRA-318)', () => {
     expect(remaining).toHaveLength(0);
   });
 });
+
+// TRA-1304 — live-money DCA accumulation invariants. The live-money analogue of
+// the TRA-965 demo acceptance: prove the three named guardrails hold on the LIVE
+// book — the per-symbol cap binds via caller-supplied addQty, the catastrophe
+// stop is held FIXED across adds (we average SIZE, never the STOP), and hold-mode
+// makes the catastrophe stop the ONLY auto-exit (checkExits skips the per-leg TP).
+describe('CryptoLiveAccount live DCA accumulation (TRA-1304)', () => {
+  async function openDcaTranche(balanceUsd = 50_000) {
+    const { account, coinbase } = buyAccount(balanceUsd);
+    await account.refreshBalance();
+    coinbase.placeMarketOrder.mockResolvedValueOnce(orderSuccess('o-open'));
+    coinbase.getOrder.mockResolvedValueOnce(
+      orderDetails({ order_id: 'o-open', status: 'FILLED', average_filled_price: '30000', filled_size: '0.001' }),
+    );
+    const pos = await account.openPosition(buildSignal({ type: 'dca' }), 30_000);
+    expect(pos).not.toBeNull();
+    return { account, coinbase, pos: pos! };
+  }
+
+  it('getOpenPositionForSignalType returns the live reference (and null when absent)', async () => {
+    const { account, pos } = await openDcaTranche();
+    expect(account.getOpenPositionForSignalType('BTC-USD', 'dca')).toBe(pos);
+    expect(account.getOpenPositionForSignalType('BTC-USD', 'reversal')).toBeNull();
+    expect(account.getOpenPositionForSignalType('ETH-USD', 'dca')).toBeNull();
+  });
+
+  it('addToPosition blends the entry, holds the stop FIXED, and flags dcaHold', async () => {
+    const { account, coinbase, pos } = await openDcaTranche();
+    const stopBefore = pos.stopLoss;
+
+    coinbase.placeMarketOrder.mockResolvedValueOnce(orderSuccess('o-add'));
+    coinbase.getOrder.mockResolvedValueOnce(
+      orderDetails({ order_id: 'o-add', status: 'FILLED', average_filled_price: '31000', filled_size: '0.001' }),
+    );
+
+    const updated = await account.addToPosition(pos.id, 0.001, 31_000, { holdNoTakeProfit: true });
+    expect(updated).not.toBeNull();
+    // Blended entry = (30000*0.001 + 31000*0.001) / 0.002 = 30500.
+    expect(updated!.entryPrice).toBeCloseTo(30_500, 6);
+    expect(updated!.quantity).toBeCloseTo(0.002, 9);
+    // The classic DCA failure mode — widening the stop "to give it room" — is forbidden.
+    expect(updated!.stopLoss).toBe(stopBefore);
+    expect(updated!.dcaFills).toBe(2);
+    expect(updated!.dcaHold).toBe(true);
+  });
+
+  it('hold-mode makes the catastrophe stop the ONLY auto-exit (checkExits skips the per-leg TP)', async () => {
+    const { account, coinbase, pos } = await openDcaTranche();
+    coinbase.placeMarketOrder.mockResolvedValueOnce(orderSuccess('o-add'));
+    coinbase.getOrder.mockResolvedValueOnce(
+      orderDetails({ order_id: 'o-add', status: 'FILLED', average_filled_price: '30000', filled_size: '0.001' }),
+    );
+    await account.addToPosition(pos.id, 0.001, 30_000, { holdNoTakeProfit: true });
+
+    // Price blows through the per-leg take-profit (30_900): a held DCA position
+    // must NOT close — no sell order should be sent to Coinbase.
+    const closedOnTp = await account.checkExits(new Map([['BTC-USD', 31_500]]));
+    expect(closedOnTp).toHaveLength(0);
+    expect(coinbase.placeMarketOrder).toHaveBeenCalledTimes(2); // open + add only, no exit
+
+    // Price collapses to the catastrophe stop (29_700): THIS closes it.
+    coinbase.placeMarketOrder.mockResolvedValueOnce(orderSuccess('o-exit', 'SELL'));
+    coinbase.getOrder.mockResolvedValueOnce(
+      orderDetails({ order_id: 'o-exit', side: 'SELL', status: 'FILLED', average_filled_price: '29650', filled_size: '0.002' }),
+    );
+    const closedOnStop = await account.checkExits(new Map([['BTC-USD', 29_600]]));
+    expect(closedOnStop).toHaveLength(1);
+  });
+
+  it('addToPosition skips (returns null) when the add falls below Coinbase min notional', async () => {
+    const { account, coinbase, pos } = await openDcaTranche();
+    // 0.00001 BTC × $30k = $0.30, below the $1 MIN_NOTIONAL_USD floor.
+    const updated = await account.addToPosition(pos.id, 0.00001, 30_000, { holdNoTakeProfit: true });
+    expect(updated).toBeNull();
+    // No add order was sent (only the original open).
+    expect(coinbase.placeMarketOrder).toHaveBeenCalledTimes(1);
+  });
+});
