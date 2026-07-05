@@ -366,6 +366,26 @@ services:
       # running service. Accepts 1/true/yes/on.
       - key: ENABLE_SCALEOUT_LADDER
         value: "true"
+      # TRA-1270 (parent TRA-1250) — ENABLE the board-approved exit-side
+      # loss-control rules on bqb1: the ATR chandelier trailing stop + per-trade
+      # profit-lock (Rules 1-2) AND the book-level daily give-back cap / hard
+      # session stop (Rule 3, the board's headline "+$1,599 → +$483" fix). The
+      # rules were approved via TRA-1249 (request_confirmation `d7175f7e`) and
+      # QuantTrader signed off on threshold parity vs Appendix A (TRA-1307). The
+      # replay against the board's own cached day floors it at +$950 (the +$959 =
+      # 60%-retained give-back floor) and latches the entry halt — proof the guard
+      # fires (TRA-1250 "demonstrably fires").
+      #
+      # SCOPE — this is a SERVICE-WIDE flag: it arms the give-back guard for BOTH
+      # the demo paper book AND the live $550 Tradier book that bqb1 owns. The
+      # book-halt blocks NEW opens for the session and the per-position trails
+      # TIGHTEN-ONLY (never loosen; live stop-modify stays separately gated behind
+      # LIVE_EQUITY_STOP_MODIFY_ENABLED). Existing resting broker legs are left in
+      # place. Revert = clear this value (flip off) + redeploy.
+      # NOTE: blueprint sync ≠ autoDeploy on bqb1 (TRA-1289) — a redeploy is
+      # needed for this to take effect on the running service. Accepts 1/true/yes/on.
+      - key: EXIT_RISK_RULES_ENABLED
+        value: "1"
       # TRA-1080 — event-loop/heap starvation watchdog. The watchdog itself is
       # ON by default in code (no env needed); these knobs are declared
       # `sync: false` so an operator can DISABLE or RETUNE it from the dashboard

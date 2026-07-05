@@ -42,6 +42,17 @@ module.exports = {
         // here — if you ever need the self-host to own live trading instead,
         // first de-credential Render bqb1 (see render.yaml header / runbook §1).
         TRADIER_ENV: 'sandbox',
+        // TRA-1270 (parent TRA-1250) — enable the board-approved exit-side
+        // loss-control rules (ATR chandelier + per-trade profit-lock + book
+        // give-back cap / session stop). Rules approved via TRA-1249
+        // (request_confirmation `d7175f7e`); threshold parity signed off by
+        // QuantTrader (TRA-1307). This self-host is TRADIER_ENV=sandbox, so the
+        // give-back guard only ever flattens/halts the PAPER book here.
+        // NOTE: the SYSTEM-owned PM2 daemon reads this env only on a fresh
+        // `pm2 start ecosystem.config.cjs` (delete+start or reboot→resurrect);
+        // a plain restart / `/api/admin/restart` re-execs with the SAVED env and
+        // will NOT pick this up. Accepts 1/true/yes/on.
+        EXIT_RISK_RULES_ENABLED: '1',
       },
     },
   ],
