@@ -2567,6 +2567,24 @@ export function isLiquidSwingSymbol(
 }
 
 /**
+ * TRA-952 — resolve the EFFECTIVE equity swing-mode master switch. ON (the
+ * default) restricts equity entries to the curated liquid universe, disables the
+ * intraday churners (ORB + 1h BbFade), and enforces the swing holding-period
+ * floor on discretionary closes. It is an opt-OUT kill switch: only an explicit
+ * `EQUITY_SWING_MODE=off` (or `0`/`false`/`no`) reverts to the legacy intraday
+ * day-trading behavior. Single source of truth so the router (signal-engine
+ * `equitySwingModeEnabled`) and the `/api/health/equity-swing` readout resolve
+ * the flag through the exact same path — the health probe therefore reflects the
+ * EFFECTIVE runtime switch, not just what the IaC declares (TRA-1306).
+ */
+export function resolveEquitySwingModeEnabled(
+  env: { EQUITY_SWING_MODE?: string } = typeof process !== 'undefined' ? process.env : {},
+): boolean {
+  const v = (env.EQUITY_SWING_MODE ?? '').trim().toLowerCase();
+  return !(v === 'off' || v === '0' || v === 'false' || v === 'no');
+}
+
+/**
  * TRA-844 — coarse GICS-style sector buckets for the equity/options universe,
  * used by the portfolio Greeks + allocation rollup to group exposure by sector
  * (the "biggest risk blind spot" the issue closes — e.g. seeing that 70% of

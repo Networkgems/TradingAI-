@@ -42,7 +42,7 @@ import { isScaleoutLadderEnabled } from '../scaleout-ladder-flag.js';
 import { summarizeScaleoutLadder } from '../scaleout-ladder-ledger.js';
 import { isCorrelatedExposureCapEnabled, CORRELATED_EXPOSURE_CAP_FLAG, isTakeProfitEarlyEnabled, TAKE_PROFIT_EARLY_FLAG } from '../exit-risk-rules-flag.js';
 import { summarizeCorrelatedExposureBindings } from '../correlated-exposure-ledger.js';
-import { CONVICTION_DCA, CORRELATED_EXPOSURE_CAP_PCT, CORRELATED_EXPOSURE_MIN_TRADE_RISK_PCT, TAKE_PROFIT_EARLY_CAPTURE_PCT } from '@trading-app/shared';
+import { CONVICTION_DCA, CORRELATED_EXPOSURE_CAP_PCT, CORRELATED_EXPOSURE_MIN_TRADE_RISK_PCT, TAKE_PROFIT_EARLY_CAPTURE_PCT, resolveEquitySwingModeEnabled, resolveEquitySwingUniverse, EQUITY_SWING_UNIVERSE, EQUITY_SWING_GUARDRAIL } from '@trading-app/shared';
 import { resolveDemoFlagEnv } from '../demo-flags.js';
 import {
   isSma200DemoForwardTestEnabled,
@@ -1008,6 +1008,51 @@ export function registerLiveHealthRoutes(app: Express, deps: LiveHealthDeps): vo
         minTradeRiskPct: CORRELATED_EXPOSURE_MIN_TRADE_RISK_PCT,
       },
       ...summarizeCorrelatedExposureBindings(),
+    });
+  });
+
+  // TRA-1306 (parent TRA-952, sign-off TRA-955) — unauthenticated, secrets-free
+  // readout proving the equity swing-trade conversion is EFFECTIVE on this
+  // running process. The swing master switch is opt-OUT (default ON) and read
+  // only from `process.env.EQUITY_SWING_MODE`; a board GO-LIVE flip means "do NOT
+  // set that env to off". But the IaC declaring the default is distinct from the
+  // running process's effective value (an out-of-band dashboard `EQUITY_SWING_MODE=off`
+  // would silently revert to legacy day-trading), so — mirroring the TRA-1289
+  // pattern — this resolves the flag through the SAME helper the router consults
+  // (`resolveEquitySwingModeEnabled`) and echoes the RESOLVED universe + guardrail
+  // floor. Read-only, no order path, no balances/PII (parity with the other
+  // /api/health/* rule readouts). For a REAL-capital flip this is the durable,
+  // dashboard-independent proof QuantTrader/the board can re-check any time.
+  app.get('/api/health/equity-swing', (_req, res) => {
+    const enabled = resolveEquitySwingModeEnabled(process.env);
+    const universe = resolveEquitySwingUniverse();
+    const universeOverridden =
+      universe.length !== EQUITY_SWING_UNIVERSE.length ||
+      universe.some((s, i) => s !== EQUITY_SWING_UNIVERSE[i]);
+    res.json({
+      ok: true,
+      time: new Date(now()).toISOString(),
+      build: resolveBuildInfo(),
+      flag: 'EQUITY_SWING_MODE',
+      // `enabled` reflects the EFFECTIVE opt-out switch, not just the IaC default.
+      enabled,
+      // The curated liquid universe entries are restricted to when swing mode is
+      // on (off-universe thin small-caps are skipped before strategy evaluation).
+      universe,
+      universeCount: universe.length,
+      // false ⇒ the locked TRA-955 default list is in force with no runtime
+      // `EQUITY_SWING_UNIVERSE` override — the state the owner signed off.
+      universeOverridden,
+      // The holding-period guardrail enforced on discretionary equity closes.
+      // Risk-driven exits (SL/TP/trailing) bypass this floor and always fire.
+      guardrail: {
+        blockSameSessionRoundTrip: EQUITY_SWING_GUARDRAIL.blockSameSessionRoundTrip,
+        minHoldingTradingDays: EQUITY_SWING_GUARDRAIL.minHoldingTradingDays,
+        intradayChurnersDisabled: enabled ? ['orb', 'bbFade_1h'] : [],
+      },
+      note: enabled
+        ? 'ACTIVE: equity entries restricted to the curated liquid swing universe; intraday churners (ORB + 1h BbFade) disabled; discretionary closes honor the ≥2-trading-day floor (hard stops bypass).'
+        : 'OPTED OUT: EQUITY_SWING_MODE is off — legacy intraday day-trading behavior is in force. Unset the env (or set true) to restore the swing conversion.',
     });
   });
 
