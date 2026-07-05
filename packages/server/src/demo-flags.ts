@@ -74,6 +74,16 @@ export const DEMO_FLAG_ALLOWLIST = [
   // credit. Safe for the file override so a non-admin operator can arm the demo
   // forward evidence on the self-hosted host (no PM2/admin).
   'TAKE_PROFIT_EARLY_ENABLED',
+  // TRA-1270 (parent TRA-1250, board confirmation `b032a145`) — the board-approved
+  // exit-side loss-control master switch (ATR chandelier + per-trade profit-lock +
+  // book give-back cap / session stop). Added so the self-hosted DEMO engine can
+  // arm the guard daemon-free (the SYSTEM PM2 daemon is unreachable to the fleet
+  // user — the TRA-1008 wall). DEMO-scoped by construction: the signal-engine
+  // consults this override ONLY on the `mode !== 'live'` branch — the live book
+  // always reads process.env directly, so a demo-flags.json can never weaken the
+  // live breaker. On the self-host TRADIER_ENV=sandbox, so the guard only ever
+  // flattens/halts the PAPER book.
+  'EXIT_RISK_RULES_ENABLED',
 ] as const;
 
 export const DEMO_FLAGS_FILENAME = 'demo-flags.json';

@@ -2511,7 +2511,7 @@ export class SignalEngine {
       // TRA-1268 (TRA-1250 Rules 1-2) — feed the demo-equity exit loop live
       // ATR(14) per open symbol so it can run the ATR chandelier trail +
       // profit-lock. Dark unless `EXIT_RISK_RULES_ENABLED` is on.
-      const equityExitRisk = isExitRiskRulesEnabled()
+      const equityExitRisk = isExitRiskRulesEnabled(this.resolveDemoFlagEnv())
         ? this.buildEquityExitRisk()
         : undefined;
       const closed = this.account.checkExits(prices, equityExitRisk);
@@ -2721,7 +2721,7 @@ export class SignalEngine {
     // its capture-fraction can ride the same input without the loss-side master.
     const takeProfitEarlyArmed =
       this.mode === 'demo' && isTakeProfitEarlyEnabled(this.resolveDemoFlagEnv());
-    const optionExitRisk = isExitRiskRulesEnabled() || takeProfitEarlyArmed
+    const optionExitRisk = isExitRiskRulesEnabled(this.mode === 'live' ? process.env : this.resolveDemoFlagEnv()) || takeProfitEarlyArmed
       ? this.buildOptionExitRisk()
       : undefined;
     const optionsExitsActive = this.mode === 'demo' || isStockMarketOpen();
@@ -2776,7 +2776,7 @@ export class SignalEngine {
     // `EXIT_RISK_RULES_ENABLED` — see markBook's contract. On the false→true
     // transition we flatten the discretionary paper book (live rides its resting
     // broker legs; new opens are blocked at both entry chokepoints regardless).
-    if (isExitRiskRulesEnabled()) {
+    if (isExitRiskRulesEnabled(this.mode === 'live' ? process.env : this.resolveDemoFlagEnv())) {
       const { realizedPlusOpen, bookEquity } = this.computeBookMark(prices);
       const { tripped } = this.riskGovernor.markBook(realizedPlusOpen, bookEquity);
       if (tripped) {
@@ -3802,7 +3802,7 @@ export class SignalEngine {
     // whole book has tripped the daily give-back cap we open NO new option
     // tickets for the session; exits still run. Dark until the rules flag is on
     // (markBook never latches `sessionHalted` otherwise), so prod is unchanged.
-    if (isExitRiskRulesEnabled() && this.riskGovernor.isBookHalted()) return;
+    if (isExitRiskRulesEnabled(this.mode === 'live' ? process.env : this.resolveDemoFlagEnv()) && this.riskGovernor.isBookHalted()) return;
 
     // TRA-373 — per-user DTE window overrides the shared scanner singleton's
     // defaults on every call so a settings edit takes effect on the next
@@ -4443,7 +4443,7 @@ export class SignalEngine {
     // gated explicitly here for the same reason as the RV scan: the options
     // paths consult the sleeve breaker, not the equity risk governor. Dark
     // until the rules flag is on.
-    if (isExitRiskRulesEnabled() && this.riskGovernor.isBookHalted()) return;
+    if (isExitRiskRulesEnabled(this.mode === 'live' ? process.env : this.resolveDemoFlagEnv()) && this.riskGovernor.isBookHalted()) return;
 
     // Per-user DTE window (TRA-373) flows through the shared scanner singleton
     // on every call, identical to the RV path.
