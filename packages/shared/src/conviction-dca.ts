@@ -408,6 +408,46 @@ function rBudgetedFullSize(
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
+// Live equity per-symbol notional cap (TRA-1305)
+// ─────────────────────────────────────────────────────────────────────────────
+
+/**
+ * TRA-1305 — per-symbol GROSS-NOTIONAL cap for the LIVE equity conviction-DCA
+ * add path, pinned by QuantTrader's sign-off to mirror the crypto sibling
+ * (TRA-1304) at 10% of managed equity per name. This is a SECOND, independent
+ * cap layered on top of the per-position R cap the evaluators already enforce:
+ * R bounds dollar-RISK-to-the-stop; this bounds how much of the book a single
+ * name can concentrate. First live window holds this fixed — no increase for
+ * >= 30 days of live fills, then a fresh sign-off.
+ */
+export const EQUITY_DCA_MAX_SYMBOL_NOTIONAL_FRAC = 0.1;
+
+/**
+ * TRA-1305 — trim a proposed equity DCA add so the POST-ADD gross notional for
+ * the symbol (addPrice × total shares held after the add) stays within
+ * `fracCap × managedEquity`. Pure + deterministic. Returns the largest whole-
+ * share add that fits, or 0 when the existing position already meets/exceeds the
+ * cap or any input is non-positive. Never returns more than `requestedQty`.
+ */
+export function capEquityAddQtyToSymbolNotional(args: {
+  existingQty: number;
+  addPrice: number;
+  requestedQty: number;
+  managedEquity: number;
+  fracCap?: number;
+}): number {
+  const fracCap = args.fracCap ?? EQUITY_DCA_MAX_SYMBOL_NOTIONAL_FRAC;
+  if (!(args.addPrice > 0) || !(args.managedEquity > 0) || !(args.requestedQty > 0) || !(fracCap > 0)) {
+    return 0;
+  }
+  const notionalCap = args.managedEquity * fracCap;
+  const maxTotalShares = Math.floor(notionalCap / args.addPrice);
+  const headroomShares = maxTotalShares - Math.max(0, args.existingQty);
+  if (headroomShares < 1) return 0;
+  return Math.min(Math.floor(args.requestedQty), headroomShares);
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
 // Options scale-in (defined-risk only)
 // ─────────────────────────────────────────────────────────────────────────────
 

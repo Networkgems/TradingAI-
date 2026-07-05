@@ -1103,6 +1103,17 @@ export interface AccountSettings {
    */
   liveTradeEquitiesTradier?: boolean;
   /**
+   * TRA-1305 — opt-in for the LIVE Tradier equity conviction-DCA ADD-order path
+   * (50/30/20 tranche scale-ins on the ATR pullback ladder, max 2 adds, earnings
+   * blackout; averages SIZE, never the STOP). Independent of
+   * {@link liveTradeEquitiesTradier} (which governs live ENTRIES): a user can run
+   * live equity entries with add-orders still shadow-logged. Ships `false` — the
+   * live add path is INERT until QuantTrader's TRA-1305 pre-flip checklist is
+   * GREEN and an operator explicitly arms it. The OPTIONS add path stays
+   * shadow-only regardless (TRA-1305 NO-GO); there is no live-options equivalent.
+   */
+  liveEquityDcaAddsTradier?: boolean;
+  /**
    * TRA-361 — when `true`, Tradier-imported option positions (synced via
    * TRA-323 or the TRA-356 periodic reconcile) flow through the same engine
    * SL / TP1-partial / trailing-stop pipeline as engine-opened positions.
@@ -1342,6 +1353,7 @@ export const DEFAULT_ACCOUNT_SETTINGS: AccountSettings = {
   // 'options' or 'equity' in Settings.
   liveTradierMarkets: 'both',
   liveTradeEquitiesTradier: true,
+  liveEquityDcaAddsTradier: false, // TRA-1305 — live equity add-order path OFF by default (shadow-log only)
   autoManageImportedTradierOptions: true,
   activeStrategyPreset: DEFAULT_STRATEGY_PRESET_ID,
   // TRA-373 — RV scanner DTE window. 21–60d (target 35d) replaces the
@@ -1430,6 +1442,19 @@ export function isLiveTradierEquityEnabled(s: AccountSettings): boolean {
  */
 export function resolveLiveTradeEquitiesTradier(s: AccountSettings): boolean {
   return s.liveTradeEquitiesTradier !== false;
+}
+
+/**
+ * TRA-1305 — resolve the LIVE equity conviction-DCA add-order opt-in. Unlike
+ * {@link resolveLiveTradeEquitiesTradier} (absent ↔ true), this is a STRICT
+ * opt-in: only an explicit `true` arms the live add path; `undefined`/`false`
+ * both keep adds shadow-logged. The live flip additionally requires
+ * `mode === 'live'`, a bound equity client, the conviction-watchlist pin, and
+ * the per-symbol notional cap — this flag is just the master arm switch, and it
+ * is the arming surface for the TRA-1305 pre-flip checklist.
+ */
+export function resolveLiveEquityDcaAddsTradier(s: AccountSettings): boolean {
+  return s.liveEquityDcaAddsTradier === true;
 }
 
 /**

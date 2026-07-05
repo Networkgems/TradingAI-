@@ -14,7 +14,7 @@ import { fetchDailyCandles, fetchTradierDailyCandles } from './yahoo-feed.js';
 import { tmpdir } from 'os';
 import { join } from 'path';
 import { rmSync, writeFileSync } from 'fs';
-import { SignalEngine, sizeLiveEquityFromStop, shortBlockedOnCashAccount, gateSignalOnReview, describeGatedStrategies, shouldBootArmLiveEquity, shouldRunRelativeValueScan, shouldRunOtmScan, isLiveBrokerOperator, resolveLiveBrokerOperator, activeOptionsDailyLimit, activeEquityDailyLimit, _resetSharedShadowForTests, _sharedShadowRefreshDue, _claimSharedShadowRefresh, _endSharedShadowRefresh, _sharedShadowEvalDue, _claimSharedShadowEval } from './signal-engine.js';
+import { SignalEngine, sizeLiveEquityFromStop, shortBlockedOnCashAccount, isOccOptionSymbol, gateSignalOnReview, describeGatedStrategies, shouldBootArmLiveEquity, shouldRunRelativeValueScan, shouldRunOtmScan, isLiveBrokerOperator, resolveLiveBrokerOperator, activeOptionsDailyLimit, activeEquityDailyLimit, _resetSharedShadowForTests, _sharedShadowRefreshDue, _claimSharedShadowRefresh, _endSharedShadowRefresh, _sharedShadowEvalDue, _claimSharedShadowEval } from './signal-engine.js';
 import { setShadowLedgerFileForTests } from './shadow-signal-ledger.js';
 import {
   setReversalShadowLedgerFileForTests,
@@ -1447,6 +1447,23 @@ describe('shortBlockedOnCashAccount (TRA-724)', () => {
   it('stays permissive when the account type is indeterminate (null / undefined)', () => {
     expect(shortBlockedOnCashAccount('sell', { accountType: null })).toBe(false);
     expect(shortBlockedOnCashAccount('sell', {})).toBe(false);
+  });
+});
+
+describe('isOccOptionSymbol (TRA-1305 — options hard-exclude, checklist item 4)', () => {
+  it('matches OCC option contract symbols', () => {
+    expect(isOccOptionSymbol('AAPL260117C00150000')).toBe(true);
+    expect(isOccOptionSymbol('SPY260320P00450000')).toBe(true);
+    expect(isOccOptionSymbol('spy260320p00450000')).toBe(true); // case-insensitive
+  });
+  it('does NOT match plain equity tickers (the live add fast-path)', () => {
+    for (const sym of ['AAPL', 'MSFT', 'NVDA', 'SPY', 'BRK.B', 'COIN', 'MSTR', 'GOOGL']) {
+      expect(isOccOptionSymbol(sym)).toBe(false);
+    }
+  });
+  it('is null/undefined safe', () => {
+    expect(isOccOptionSymbol('')).toBe(false);
+    expect(isOccOptionSymbol(undefined as unknown as string)).toBe(false);
   });
 });
 

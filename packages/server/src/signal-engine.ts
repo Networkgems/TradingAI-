@@ -2,7 +2,7 @@ import { OrbStrategy, BbFadeStrategy, IchimokuStrategy, SupertrendConfluenceStra
 import { buildExposureBuckets } from '@trading-app/engine';
 import type { StrategySelectorInput, ContractQuote, OptionTrend, RvLongTrendSide, ExitState, SharedTickIndicators, RelativeValueScannerOptions, OptionChainRow, IvRvScannerOptions, IvRvMispricingCandidate, ExposureBucket, ExposurePositionRisk, CorrelatedExposureDecision } from '@trading-app/engine';
 import type { TradierAccountBalance } from '@trading-app/engine';
-import { WATCHLIST, isLiquidSwingSymbol, resolveEquitySwingModeEnabled, checkEquitySwingClose, MANAGED_ACCOUNT_RATIO, MAX_CONSECUTIVE_LOSSES, DAILY_DRAWDOWN_HALT_PCT, BOOK_SESSION_STOP_R, BOOK_GIVEBACK_CAP_PCT, TAKE_PROFIT_EARLY_CAPTURE_PCT, CORRELATED_EXPOSURE_CAP_PCT, CORRELATED_EXPOSURE_MIN_TRADE_RISK_PCT, LIVE_EQUITY_STOP_MODIFY_MIN_TICK_PCT, LIVE_EQUITY_STOP_MODIFY_MIN_TICK_ABS, LIVE_EQUITY_STOP_MODIFY_COOLDOWN_MS, DEFAULT_RISK_PER_TRADE, OPTIONS_PER_TICKET_DOLLAR_FLOOR, OPTIONS_POSITION_CAP_RATIO, aliasWatchlistSymbol, isLiveTradierOptionsEnabled, isStockMarketOpen, perPositionCap, resolveAutoManageImportedTradierOptions, resolveDemoCostModel, resolveHoldLiveOptionsOvernight, resolveSwingHoldOptions, resolveLiveTradeEquitiesTradier, resolveManagedAccountRatio, resolveMarketReviewGatesEnabled, resolveRiskPerTrade, resolveRvDtePrefs, resolveTradierOptionsCreds, validateBracket, DEFAULT_RV_DTE_MIN, DEFAULT_RV_DTE_MAX, DEFAULT_RV_DTE_TARGET, scoreNewsSentiment, aggregateSymbolSentiment, aggregateFedSentiment, aggregateStockTwitsSentiment, dedupeStockTwitsMessages, mapCuratedMessagesBySymbol, nameAliasesFor, evaluateEquityDcaAdd, evaluateOptionDcaAdd, CONVICTION_DCA, blendedAverage, positionRiskDollars, minutesToSessionClose, getEasternUtcOffset, isAgentTradingWindowOpen } from '@trading-app/shared';
+import { WATCHLIST, isLiquidSwingSymbol, resolveEquitySwingModeEnabled, checkEquitySwingClose, MANAGED_ACCOUNT_RATIO, MAX_CONSECUTIVE_LOSSES, DAILY_DRAWDOWN_HALT_PCT, BOOK_SESSION_STOP_R, BOOK_GIVEBACK_CAP_PCT, TAKE_PROFIT_EARLY_CAPTURE_PCT, CORRELATED_EXPOSURE_CAP_PCT, CORRELATED_EXPOSURE_MIN_TRADE_RISK_PCT, LIVE_EQUITY_STOP_MODIFY_MIN_TICK_PCT, LIVE_EQUITY_STOP_MODIFY_MIN_TICK_ABS, LIVE_EQUITY_STOP_MODIFY_COOLDOWN_MS, DEFAULT_RISK_PER_TRADE, OPTIONS_PER_TICKET_DOLLAR_FLOOR, OPTIONS_POSITION_CAP_RATIO, aliasWatchlistSymbol, isLiveTradierOptionsEnabled, isStockMarketOpen, perPositionCap, resolveAutoManageImportedTradierOptions, resolveDemoCostModel, resolveHoldLiveOptionsOvernight, resolveSwingHoldOptions, resolveLiveTradeEquitiesTradier, resolveLiveEquityDcaAddsTradier, resolveManagedAccountRatio, resolveMarketReviewGatesEnabled, resolveRiskPerTrade, resolveRvDtePrefs, resolveTradierOptionsCreds, validateBracket, DEFAULT_RV_DTE_MIN, DEFAULT_RV_DTE_MAX, DEFAULT_RV_DTE_TARGET, scoreNewsSentiment, aggregateSymbolSentiment, aggregateFedSentiment, aggregateStockTwitsSentiment, dedupeStockTwitsMessages, mapCuratedMessagesBySymbol, nameAliasesFor, evaluateEquityDcaAdd, evaluateOptionDcaAdd, CONVICTION_DCA, EQUITY_DCA_MAX_SYMBOL_NOTIONAL_FRAC, capEquityAddQtyToSymbolNotional, blendedAverage, positionRiskDollars, minutesToSessionClose, getEasternUtcOffset, isAgentTradingWindowOpen } from '@trading-app/shared';
 import type { TradeSignal, RelativeValueSignal, OtmMispricingSignal, Sma200Signal, Candle, OptionsAccountState, SignalType, Position, OptionPosition, AccountMode, AccountSettings, AccountState, NewsItem, SymbolSentiment, SocialSentiment, StockTwitsMessage, TechnicalSignalSnapshot, TradierEnv, MarketReview, MarketReviewGates, EngineMarketReviewState, GatedStrategyNote, AgentRecommendation, TradeProposal, AgentOrderAudit, GuardrailVerdict, OptionType, PositionAdvisorRow, AdvisorSellPlan, AdvisorDcaPlan } from '@trading-app/shared';
 import { shouldAutoConfirm } from '@trading-app/shared';
 // TRA-544 (TRA-529 P1) / TRA-747 (P2) — advisory multi-agent layer. ON suspends
@@ -1729,6 +1729,24 @@ export class SignalEngine {
    */
   private liveTradeEquitiesTradier = false;
   /**
+   * TRA-1305 — strict opt-in for the LIVE equity conviction-DCA add-order path
+   * (independent of entry mirroring above). Defaults `false`: adds shadow-log
+   * until an operator arms `liveEquityDcaAddsTradier` AND QuantTrader's TRA-1305
+   * pre-flip checklist is GREEN. Re-read on every `applySettings` so a Settings
+   * flip takes effect on the next tick without a restart.
+   */
+  private liveEquityDcaAddsEnabled = false;
+  /**
+   * TRA-1305 — per-position ledgers for the LIVE equity add path. Kept SEPARATE
+   * from the demo `dcaTranches` (which {@link evaluateConvictionDcaAdds} prunes
+   * against the demo book and would otherwise wipe these in live mode). Seeded
+   * from the live mirror on first sight, then the source of truth for blended
+   * risk + the ATR spacing ladder across live adds.
+   */
+  private dcaLiveEquityTranches = new Map<string, { qty: number; price: number }[]>();
+  private dcaLiveEquityLastFillAt = new Map<string, number>();
+  private dcaLiveEquityAddsToday = new Map<string, { etDay: string; count: number }>();
+  /**
    * TRA-335 — cached risk knobs used to size live equity orders against the
    * Tradier balance instead of the (preserved) demo paper account. Re-read
    * on every `applySettings` call so the next tick picks up the user's edits.
@@ -1924,6 +1942,7 @@ export class SignalEngine {
       this.tradierLiveClient = buildTradierLiveClient(settings, this.alertUsername);
       this.tradierLiveOptionsEnabled = isLiveTradierOptionsEnabled(settings);
       this.liveTradeEquitiesTradier = resolveLiveTradeEquitiesTradier(settings);
+      this.liveEquityDcaAddsEnabled = resolveLiveEquityDcaAddsTradier(settings); // TRA-1305 (OFF by default)
       this.tradierLiveEquityClient = buildTradierLiveEquityClient(settings, this.alertUsername);
       this.tradierOptionsClientByEnv = buildTradierOptionsClientsByEnv(settings);
       // TRA-505 — seed the watchlist quote feed from the saved Tradier creds at
@@ -2067,6 +2086,7 @@ export class SignalEngine {
     // next tick without a server restart. TRA-370 — absent ↔ true so Live
     // mirrors Demo's signal flow out of the box.
     this.liveTradeEquitiesTradier = resolveLiveTradeEquitiesTradier(settings);
+    this.liveEquityDcaAddsEnabled = resolveLiveEquityDcaAddsTradier(settings); // TRA-1305 (OFF by default)
     this.tradierLiveEquityClient = buildTradierLiveEquityClient(settings, this.alertUsername);
     // TRA-505 — re-point the watchlist quote feed at the user's saved Tradier
     // creds on every settings change so a freshly entered/rotated token takes
@@ -2923,6 +2943,13 @@ export class SignalEngine {
       // unless CONVICTION_DCA.enabled). Scales open demo defined-risk options
       // up toward the per-position premium cap under the same R invariant.
       this.evaluateOptionDcaAdds(prices);
+      // TRA-1305 — LIVE equity conviction-DCA add-order pass. Places REAL Tradier
+      // add-orders on the live equity book (distinct from the demo shadow-log in
+      // evaluateConvictionDcaAdds). Hard no-op unless mode==='live' AND the
+      // operator armed `liveEquityDcaAddsTradier` AND CONVICTION_DCA.enabled;
+      // every add is pinned to the conviction watchlist, hard-excludes options,
+      // and holds the per-symbol notional cap + the fixed-stop R invariant.
+      await this.evaluateLiveConvictionDcaAdds(prices);
     }
 
     // TRA-787 — SupertrendConfluence SHADOW pass. Evaluates every watchlist
@@ -6198,6 +6225,215 @@ export class SignalEngine {
         withinBudget: realizedRisk <= R + 1e-6, reason: verdict.reason,
       });
     }
+  }
+
+  /**
+   * TRA-1305 — LIVE equity conviction-DCA add-order pass (the live-money sibling
+   * of {@link evaluateConvictionDcaAdds}, which only shadow-logs on the live
+   * path). Places REAL Tradier add-orders that scale an open live equity position
+   * up the 50/30/20 tranche ladder, holding the position stop FIXED (average
+   * SIZE, never the STOP). Enforces every guardrail QuantTrader pinned in the
+   * TRA-1305 sign-off:
+   *
+   *   • OFF by default — hard no-op unless `mode==='live'`, the operator armed
+   *     `liveEquityDcaAddsTradier`, and `CONVICTION_DCA.enabled`. Until all three
+   *     hold this returns immediately (INERT), so shipping it changes nothing.
+   *   • Item 2 — universe pinned to the named conviction watchlist
+   *     ({@link isLiquidSwingSymbol} / EQUITY_SWING_UNIVERSE, the same override
+   *     table the pre/post-market routine reads). No open-universe adds.
+   *   • Item 3 — the four design guardrails (50/30/20, max 2 adds, ATR pullback
+   *     ladder, earnings blackout) come straight from the shipped pure core
+   *     {@link evaluateEquityDcaAdd}, unchanged from the accepted demo path.
+   *   • Item 4 — OPTIONS ARE HARD-EXCLUDED: this loop only iterates the equity
+   *     `liveEquityPositions` book and only submits a plain equity bracket (no
+   *     option_symbol leg). An OCC-shaped symbol is skipped defensively.
+   *   • Per-symbol notional cap — mirrors the crypto rule at 10% of managed
+   *     equity ({@link EQUITY_DCA_MAX_SYMBOL_NOTIONAL_FRAC}), layered ON TOP of
+   *     the per-position R cap the core already enforces.
+   */
+  private async evaluateLiveConvictionDcaAdds(prices: Map<string, number>): Promise<void> {
+    if (!CONVICTION_DCA.enabled) return;
+    // ── OFF gate — INERT until an operator arms the live add path in live mode. ──
+    if (this.mode !== 'live' || !this.liveEquityDcaAddsEnabled) return;
+    if (!this.tradierLiveEquityClient) return;
+    const live = Array.from(this.liveEquityPositions.values());
+    if (live.length === 0) return;
+
+    // Managed equity + per-position R budget from the live Tradier balance
+    // (mirrors sizeLiveEquityFromStop: managedEquity = (cash+LMV)·ratio, R = ·riskPerTrade).
+    const bal = this.liveTradierBalance;
+    if (!bal) return;
+    const baseEquity = (bal.totalCash ?? 0) + (bal.longMarketValue ?? 0);
+    const managedEquity = baseEquity * this.managedAccountRatio;
+    const R = managedEquity * this.riskPerTrade;
+    if (!(R > 0) || !(managedEquity > 0)) return;
+
+    const now = Date.now();
+    // Prune the live per-position ledgers against the live book so ids don't leak.
+    const openIds = new Set(live.map(p => p.id));
+    for (const id of this.dcaLiveEquityTranches.keys()) if (!openIds.has(id)) this.dcaLiveEquityTranches.delete(id);
+    for (const id of this.dcaLiveEquityLastFillAt.keys()) if (!openIds.has(id)) this.dcaLiveEquityLastFillAt.delete(id);
+
+    // Gross-exposure proxy (acceptance #5): long notional vs managed equity.
+    let grossNotional = 0;
+    for (const p of live) grossNotional += Math.abs(p.entryPrice * p.quantity);
+    const grossExposureBreached = managedEquity > 0 && grossNotional > managedEquity;
+    const dailyLossLimitBreached = this.riskGovernor.isHalted();
+    const minsToClose = minutesToSessionClose(now);
+    const etDay = new Date(now + getEasternUtcOffset(now) * 3600 * 1000).toISOString().slice(0, 10);
+
+    for (const pos of live) {
+      // ── Item 4: hard-exclude options. The live equity book is equity-only by
+      // construction; this guards defensively against an OCC option symbol.
+      if (isOccOptionSymbol(pos.symbol)) continue;
+      // ── Item 2: conviction-watchlist pin (open-universe adds are NO-GO).
+      if (!isLiquidSwingSymbol(pos.symbol)) continue;
+
+      const side = pos.side === 'buy' ? 'long' : 'short';
+      const price = prices.get(pos.symbol);
+      if (price == null || !Number.isFinite(price)) continue;
+      const candles = this.candleCache.get(pos.symbol) ?? [];
+      if (candles.length < 50) continue; // need SMA-50 window + ATR(14)
+      const atrVal = atr(candles, 14);
+      if (atrVal == null || !(atrVal > 0)) continue;
+      const sma50 = candles.slice(-50).reduce((s, c) => s + c.close, 0) / 50;
+
+      let tranches = this.dcaLiveEquityTranches.get(pos.id);
+      if (!tranches) {
+        tranches = [{ qty: pos.quantity, price: pos.entryPrice }];
+        this.dcaLiveEquityTranches.set(pos.id, tranches);
+      }
+      const lastFillAt = this.dcaLiveEquityLastFillAt.get(pos.id) ?? pos.openedAt;
+      const barsSinceLastFill = candles.filter(c => c.timestamp > lastFillAt).length;
+      const todayRec = this.dcaLiveEquityAddsToday.get(pos.symbol);
+      const addsToday = todayRec && todayRec.etDay === etDay ? todayRec.count : 0;
+
+      const verdict = evaluateEquityDcaAdd({
+        side,
+        tranches,
+        stop: pos.stopLoss, // the FIXED position stop — adds never move it
+        riskBudget: R,
+        addPrice: price,
+        atr: atrVal,
+        trendRef: sma50,
+        signalStillValid: true,
+        barsSinceLastFill,
+        minutesToSessionClose: minsToClose,
+        grossExposureBreached,
+        dailyLossLimitBreached,
+        tradingDaysToEarnings: earningsInDaysSync(pos.symbol, now),
+        addsToday,
+      });
+      if (verdict.action === 'skip' || verdict.qty <= 0) continue;
+
+      // ── Per-symbol notional cap (10% of managed equity) — trim the core's qty. ──
+      const existingQty = tranches.reduce((s, t) => s + t.qty, 0);
+      const cappedQty = capEquityAddQtyToSymbolNotional({
+        existingQty,
+        addPrice: price,
+        requestedQty: verdict.qty,
+        managedEquity,
+        fracCap: EQUITY_DCA_MAX_SYMBOL_NOTIONAL_FRAC,
+      });
+      if (cappedQty < 1) {
+        log.info('TRA-1305 live equity DCA add skipped — per-symbol notional cap', {
+          symbol: pos.symbol, positionId: pos.id, requestedQty: verdict.qty, existingQty,
+          addPrice: price, managedEquity: Number(managedEquity.toFixed(2)),
+          notionalCapFrac: EQUITY_DCA_MAX_SYMBOL_NOTIONAL_FRAC,
+        });
+        continue;
+      }
+
+      // ── Place the REAL Tradier add-order (same fixed stop + TP as the position). ──
+      const result = await this.placeTradierEquityAdd(pos, cappedQty, price);
+      if (!result.ok) {
+        log.warn('TRA-1305 live equity DCA add-order not placed', {
+          symbol: pos.symbol, positionId: pos.id, addQty: cappedQty, addPrice: price, reason: result.reason,
+        });
+        continue;
+      }
+
+      // ── Update the live mirror: blend entry, grow qty, hold the stop FIXED. ──
+      tranches.push({ qty: cappedQty, price });
+      const blended = blendedAverage(tranches);
+      const totalQ = tranches.reduce((s, t) => s + t.qty, 0);
+      const updated: Position = { ...pos, entryPrice: blended, quantity: totalQ };
+      this.liveEquityPositions.set(pos.id, updated);
+      this.liveEquityOrderIds.set(pos.id, result.orderId);
+      this.dcaLiveEquityLastFillAt.set(pos.id, now);
+      this.dcaLiveEquityAddsToday.set(pos.symbol, { etDay, count: addsToday + 1 });
+
+      const realizedRisk = positionRiskDollars(blended, pos.stopLoss, totalQ, side);
+      log.info('TRA-1305 conviction-DCA add filled (live equity)', {
+        symbol: pos.symbol, positionId: pos.id, action: verdict.action,
+        addQty: cappedQty, addPrice: price, tradierOrderId: result.orderId,
+        blendedAvg: Number(blended.toFixed(4)), stop: pos.stopLoss, totalQty: totalQ,
+        realizedRiskDollars: Number(realizedRisk.toFixed(2)), riskBudget: Number(R.toFixed(2)),
+        symbolNotional: Number((blended * totalQ).toFixed(2)),
+        notionalCapDollars: Number((managedEquity * EQUITY_DCA_MAX_SYMBOL_NOTIONAL_FRAC).toFixed(2)),
+        withinBudget: realizedRisk <= R + 1e-6, reason: verdict.reason,
+      });
+      // Durable write-through — SAME per-fill R evidence as the demo path, now
+      // stamped mode:'live' so the TRA-1305 acceptance readout counts live fills.
+      recordConvictionDcaFill({
+        ts: now, mode: 'live', assetClass: 'equity',
+        symbol: pos.symbol, positionId: pos.id, action: verdict.action,
+        addQty: cappedQty, addPrice: price,
+        blendedAvg: Number(blended.toFixed(4)), stop: pos.stopLoss, totalQty: totalQ,
+        realizedRiskDollars: Number(realizedRisk.toFixed(2)), riskBudget: Number(R.toFixed(2)),
+        withinBudget: realizedRisk <= R + 1e-6, reason: verdict.reason,
+      });
+    }
+  }
+
+  /**
+   * TRA-1305 — submit a Tradier equity add-order for a conviction-DCA tranche.
+   * Places a fresh OTOCO bracket for the ADD shares at the SAME stop and take-
+   * profit as the open position, so the added size is protected by the identical
+   * fixed stop (the DCA invariant: average SIZE, never the STOP). Mirrors the
+   * guards of {@link placeTradierEquityBracket}: regular-hours only, cash-account
+   * short block, and a terminal-status wait that treats rejects/cancels as failed.
+   */
+  private async placeTradierEquityAdd(
+    pos: Position,
+    addQty: number,
+    currentPrice: number,
+  ): Promise<{ ok: true; orderId: number | string } | { ok: false; reason: string }> {
+    if (!isStockMarketOpen()) {
+      return { ok: false, reason: 'market closed — equity add-orders only placed during regular hours (9:30–16:00 ET)' };
+    }
+    const client = this.tradierLiveEquityClient;
+    if (!client) return { ok: false, reason: 'Tradier equity client not configured' };
+    const balance = this.liveTradierBalance;
+    if (!balance) return { ok: false, reason: 'Tradier balance not yet fetched — try again next tick' };
+    if (shortBlockedOnCashAccount(pos.side, balance)) {
+      return { ok: false, reason: 'short not supported on a cash account' };
+    }
+    if (!(addQty > 0)) return { ok: false, reason: `non-positive add qty (${addQty})` };
+    let resp;
+    try {
+      resp = await client.submitBracketOrder({
+        symbol: pos.symbol,
+        qty: addQty,
+        side: pos.side,
+        limitPrice: currentPrice,
+        takeProfitPrice: pos.takeProfit,
+        stopLossPrice: pos.stopLoss, // fixed position stop — unchanged by the add
+      });
+    } catch (err: unknown) {
+      const reason = err instanceof Error ? err.message : String(err);
+      log.warn('Tradier equity add-order threw', { symbol: pos.symbol, reason });
+      return { ok: false, reason: `Tradier rejected add-order: ${reason.slice(0, 200)}` };
+    }
+    log.info('tradier live equity DCA add-order', {
+      symbol: pos.symbol, qty: addQty, order: resp.id, status: resp.status,
+    });
+    const detail = await client.waitForOrderTerminalStatus(resp.id);
+    if (detail && TRADIER_REJECTED_STATUSES.has(detail.status)) {
+      const reasonSuffix = detail.reason_description ? `: ${detail.reason_description}` : '';
+      return { ok: false, reason: `Tradier add-order ${resp.id} ${detail.status}${reasonSuffix}` };
+    }
+    return { ok: true, orderId: resp.id };
   }
 
   /**
@@ -9771,6 +10007,18 @@ export function shortBlockedOnCashAccount(
   balance: Pick<TradierAccountBalance, 'accountType'>,
 ): boolean {
   return side === 'sell' && balance.accountType === 'cash';
+}
+
+/**
+ * TRA-1305 — true when `symbol` has the OCC option-contract shape (root +
+ * `YYMMDD` + `C`/`P` + 8-digit strike, e.g. `AAPL260117C00150000`). Used to
+ * defensively HARD-EXCLUDE any option contract from the LIVE equity conviction-
+ * DCA add path (sign-off checklist item 4): the OPTIONS add path stays
+ * shadow-log-only and must never reach an equity broker submission. Plain equity
+ * tickers never match, so a false here is the equity fast-path.
+ */
+export function isOccOptionSymbol(symbol: string): boolean {
+  return /\d{6}[CP]\d{8}$/.test((symbol ?? '').toUpperCase());
 }
 
 /**

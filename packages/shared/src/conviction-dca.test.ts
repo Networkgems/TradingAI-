@@ -10,6 +10,8 @@ import {
   maxAddQtyWithinRisk,
   evaluateEquityDcaAdd,
   evaluateOptionDcaAdd,
+  capEquityAddQtyToSymbolNotional,
+  EQUITY_DCA_MAX_SYMBOL_NOTIONAL_FRAC,
   type ConvictionDcaConfig,
   type EquityAddContext,
   type OptionAddContext,
@@ -373,5 +375,66 @@ describe('master switch', () => {
     const OFF: ConvictionDcaConfig = { ...CONVICTION_DCA, enabled: false };
     expect(evaluateEquityDcaAdd(baseEquity(), OFF).action).toBe('skip');
     expect(evaluateOptionDcaAdd(baseOption(), OFF).action).toBe('skip');
+  });
+});
+
+// ── TRA-1305 — LIVE equity per-symbol notional cap (10% of managed equity) ────
+describe('capEquityAddQtyToSymbolNotional (TRA-1305)', () => {
+  it('ships the 10%-of-managed-equity fraction, mirroring the crypto sibling', () => {
+    expect(EQUITY_DCA_MAX_SYMBOL_NOTIONAL_FRAC).toBe(0.1);
+  });
+
+  it('passes the requested qty through when the notional cap is not binding', () => {
+    // cap = 100k × 0.10 = $10k → 103 shares @ 97; 5 held → 98 headroom > 30.
+    const q = capEquityAddQtyToSymbolNotional({
+      existingQty: 5,
+      addPrice: 97,
+      requestedQty: 30,
+      managedEquity: 100_000,
+    });
+    expect(q).toBe(30);
+  });
+
+  it('trims the add down to the notional headroom when it binds', () => {
+    // cap = 10k × 0.10 = $1k → 10 shares @ 100; 5 held → 5 headroom < 30.
+    const q = capEquityAddQtyToSymbolNotional({
+      existingQty: 5,
+      addPrice: 100,
+      requestedQty: 30,
+      managedEquity: 10_000,
+    });
+    expect(q).toBe(5);
+  });
+
+  it('returns 0 when the position already meets or exceeds the cap', () => {
+    expect(
+      capEquityAddQtyToSymbolNotional({
+        existingQty: 90,
+        addPrice: 100,
+        requestedQty: 30,
+        managedEquity: 10_000, // cap 10 shares, already at 90
+      }),
+    ).toBe(0);
+  });
+
+  it('is defensive on non-positive / degenerate inputs', () => {
+    const base = { existingQty: 0, addPrice: 100, requestedQty: 10, managedEquity: 100_000 };
+    expect(capEquityAddQtyToSymbolNotional({ ...base, addPrice: 0 })).toBe(0);
+    expect(capEquityAddQtyToSymbolNotional({ ...base, managedEquity: 0 })).toBe(0);
+    expect(capEquityAddQtyToSymbolNotional({ ...base, requestedQty: 0 })).toBe(0);
+    expect(capEquityAddQtyToSymbolNotional({ ...base, fracCap: 0 })).toBe(0);
+  });
+
+  it('honors a custom fracCap override', () => {
+    // cap = 100k × 0.05 = $5k → 50 shares @ 100; 0 held → min(30,50)=30.
+    expect(
+      capEquityAddQtyToSymbolNotional({
+        existingQty: 0,
+        addPrice: 100,
+        requestedQty: 30,
+        managedEquity: 100_000,
+        fracCap: 0.05,
+      }),
+    ).toBe(30);
   });
 });
