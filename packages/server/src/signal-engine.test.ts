@@ -203,15 +203,14 @@ afterEach(() => {
 
 describe('SignalEngine — relative-value scanner bridge', () => {
   // TRA-811 history: the board originally PAUSED RV (kill switch
-  // `RV_ENGINE_ENABLED=false`), so the gate stood down even with everything else
-  // favorable. TRA-895 re-enabled it for the Jun 15-18 demo, and on the TRA-1158
-  // regression the board chose **defer** (interaction 8cf2bbdd: "leave as-is,
-  // revisit after the tests are fixed") — so `RV_ENGINE_ENABLED` stays `true`.
-  // This test is realigned to that decision (TRA-1159/TRA-1160): with the kill
-  // switch ON, all-favorable conditions ARM the scan, and each individual gate
-  // input still dominates to false. (Existing managed exits run elsewhere and are
-  // intentionally not gated here.) If the board later re-pauses RV
-  // (`RV_ENGINE_ENABLED=false`) the all-favorable case flips back to false.
+  // `RV_ENGINE_ENABLED=false`). TRA-895 re-enabled it for the Jun 15-18 demo, and
+  // on the TRA-1158 regression the board chose **defer** (RV stayed `true`).
+  // TRA-1207 (board directive, 2026-06-30) SUPERSEDES that: "OTM Mispricing back
+  // on and turn off Relative Value." `RV_ENGINE_ENABLED` is now the compiled
+  // `false` kill switch (signal-engine.ts), so even with every other condition
+  // favorable the RV gate stands down — no new RV option tickets in any mode.
+  // The OTM engine below is armed in its place (see `shouldRunOtmScan` tests).
+  // Existing managed RV exits run elsewhere and are intentionally not gated here.
   const favorable = {
     autoTradingEnabled: true,
     halted: false,
@@ -220,8 +219,8 @@ describe('SignalEngine — relative-value scanner bridge', () => {
     skipOptionsForLiveEquityOnly: false,
   };
 
-  it('shouldRunRelativeValueScan arms when RV is enabled and every condition is favorable (TRA-895/TRA-1158 defer)', () => {
-    expect(shouldRunRelativeValueScan(favorable)).toBe(true);
+  it('shouldRunRelativeValueScan stays down even when every condition is favorable — RV paused (TRA-1207)', () => {
+    expect(shouldRunRelativeValueScan(favorable)).toBe(false);
   });
 
   it('shouldRunRelativeValueScan stands down whenever any single gate input is unfavorable', () => {
