@@ -1898,6 +1898,22 @@ export const TAKE_PROFIT_EARLY_CAPTURE_PCT = 0.60;    // auto-close at 60% of av
 export const CORRELATED_EXPOSURE_CAP_PCT = 0.07;      // max Σ open risk in one correlated group = 7% of managed equity
 export const CORRELATED_EXPOSURE_MIN_TRADE_RISK_PCT = 0.0025; // reject rather than scale a candidate below 0.25% of equity
 
+// TRA-1293 — PoP / delta entry gate + Delta/Theta ratio floor. Operationalizes
+// the board's Greeks guidance on the option entry side: (a) a HARD short-strike
+// |delta| band so we only sell/buy strikes with a sane probability-of-profit
+// (0.30–0.40 |Δ| ≈ ~60–70% PoP on the short side), and (b) a |delta|/|theta|
+// ratio floor so a name only enters when its directional sensitivity is large
+// enough relative to its daily time-decay — i.e. so decay "works for us" instead
+// of bleeding a low-delta position. Theta is expressed in per-DAY premium terms
+// (BS per-year theta ÷ 365) so the floor reads intuitively as "units of |delta|
+// per dollar/day of decay". Ships DARK behind ENTRY_GREEKS_GATE_ENABLED (itself
+// under the EXIT_RISK_RULES_ENABLED master switch); the exact ratio floor is a
+// QuantTrader/board tuning input pending a forward-sample, so the default below
+// is a conservative starting value, not a ratified threshold.
+export const ENTRY_SHORT_DELTA_MIN = 0.30;            // hard lower bound of the admissible short-strike |delta| band
+export const ENTRY_SHORT_DELTA_MAX = 0.40;            // hard upper bound of the admissible short-strike |delta| band
+export const ENTRY_DELTA_THETA_RATIO_FLOOR = 6.0;     // min |delta| / |theta_per_day|; provisional, tune before enabling
+
 // TRA-1269 (TRA-1250 Rule 1, live-equity path) — the live equity chandelier
 // trails a *broker-resting* OCO stop leg by cancel/replace, which costs a
 // Tradier order-modify round-trip and risks throttling. So we only spend a

@@ -77,3 +77,20 @@ export const CORRELATED_EXPOSURE_CAP_FLAG = 'CORRELATED_EXPOSURE_CAP_ENABLED';
 export function isCorrelatedExposureCapEnabled(env: NodeJS.ProcessEnv = process.env): boolean {
   return isExitRiskRulesEnabled(env) && flagOn(env[CORRELATED_EXPOSURE_CAP_FLAG]);
 }
+
+// TRA-1293 — PoP / delta entry gate + Delta/Theta ratio floor. A SEPARATE
+// sub-flag so the board can run the shipped loss-control / take-profit rules and
+// independently arm the Greeks entry gate once its thresholds are tuned.
+// Deliberately gated by BOTH the master switch AND its own flag: it is a HARD
+// entry filter that can REJECT new option opens, so it stays dark unless
+// `EXIT_RISK_RULES_ENABLED` AND `ENTRY_GREEKS_GATE_ENABLED` are both truthy
+// (1/true/yes/on).
+export const ENTRY_GREEKS_GATE_FLAG = 'ENTRY_GREEKS_GATE_ENABLED';
+
+/**
+ * True iff the PoP / delta entry gate (TRA-1293) is enabled. Requires the master
+ * exit-risk switch on as well — the sub-flag alone does nothing.
+ */
+export function isEntryGreeksGateEnabled(env: NodeJS.ProcessEnv = process.env): boolean {
+  return isExitRiskRulesEnabled(env) && flagOn(env[ENTRY_GREEKS_GATE_FLAG]);
+}

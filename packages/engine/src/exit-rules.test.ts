@@ -9,6 +9,7 @@ import {
   takeProfitEarlyDecision,
   correlatedExposureDecision,
   buildExposureBuckets,
+  entryGreeksGateDecision,
 } from './exit-rules.js';
 import type { ExposurePositionRisk } from './exit-rules.js';
 
@@ -366,5 +367,76 @@ describe('Rule 5 — correlated-exposure cap (TRA-1295)', () => {
       expect(d.scale).toBeCloseTo(0.5, 9);
       expect(d.bindingBucket).toEqual({ level: 'sector', key: 'tech' });
     });
+  });
+});
+
+describe('PoP / delta entry gate + Delta/Theta ratio floor (TRA-1293)', () => {
+  // A comfortably-passing baseline: 0.35 |delta| in-band, plenty of delta per
+  // dollar/day of decay (0.35 / 0.02 = 17.5 ≥ 6.0 floor).
+  const base = { shortDelta: 0.35, delta: 0.35, thetaPerDay: -0.02 };
+
+  it('admits a strike in the delta band with an ample delta/theta ratio', () => {
+    const g = entryGreeksGateDecision(base);
+    expect(g.admitted).toBe(true);
+    expect(g.reason).toBeNull();
+    expect(g.shortDelta).toBe(0.35);
+    expect(g.deltaThetaRatio).toBeCloseTo(17.5, 6);
+  });
+
+  it('uses |·| so a short (negative-delta) leg is judged on magnitude', () => {
+    const g = entryGreeksGateDecision({ shortDelta: -0.35, delta: -0.35, thetaPerDay: 0.02 });
+    expect(g.admitted).toBe(true);
+    expect(g.shortDelta).toBe(0.35);
+  });
+
+  it('rejects a strike below the delta band (far-OTM lottery ticket)', () => {
+    const g = entryGreeksGateDecision({ ...base, shortDelta: 0.20, delta: 0.20 });
+    expect(g.admitted).toBe(false);
+    expect(g.reason).toBe('delta_out_of_band');
+  });
+
+  it('rejects a strike above the delta band (deep-ITM, too much premium at risk)', () => {
+    const g = entryGreeksGateDecision({ ...base, shortDelta: 0.55, delta: 0.55 });
+    expect(g.admitted).toBe(false);
+    expect(g.reason).toBe('delta_out_of_band');
+  });
+
+  it('admits exactly at both band edges (inclusive bounds)', () => {
+    expect(entryGreeksGateDecision({ ...base, shortDelta: 0.30, delta: 0.30 }).admitted).toBe(true);
+    expect(entryGreeksGateDecision({ ...base, shortDelta: 0.40, delta: 0.40 }).admitted).toBe(true);
+  });
+
+  it('rejects when the delta/theta ratio is below the floor (decay bleeds the delta)', () => {
+    // in-band delta but heavy decay: 0.35 / 0.10 = 3.5 < 6.0 floor.
+    const g = entryGreeksGateDecision({ shortDelta: 0.35, delta: 0.35, thetaPerDay: -0.10 });
+    expect(g.admitted).toBe(false);
+    expect(g.reason).toBe('delta_theta_ratio_too_low');
+    expect(g.deltaThetaRatio).toBeCloseTo(3.5, 6);
+  });
+
+  it('treats ~zero theta as no decay to fight (ratio = +∞, passes)', () => {
+    const g = entryGreeksGateDecision({ shortDelta: 0.35, delta: 0.35, thetaPerDay: 0 });
+    expect(g.admitted).toBe(true);
+    expect(g.deltaThetaRatio).toBe(Number.POSITIVE_INFINITY);
+  });
+
+  it('honors caller overrides for the band and ratio floor', () => {
+    const g = entryGreeksGateDecision({
+      shortDelta: 0.50,
+      delta: 0.50,
+      thetaPerDay: -0.02,
+      deltaBandMin: 0.45,
+      deltaBandMax: 0.55,
+      ratioFloor: 10,
+    });
+    expect(g.admitted).toBe(true);
+    expect(g.deltaBandMin).toBe(0.45);
+    expect(g.ratioFloor).toBe(10);
+  });
+
+  it('rejects non-finite Greeks rather than silently admitting', () => {
+    const g = entryGreeksGateDecision({ shortDelta: NaN, delta: 0.35, thetaPerDay: -0.02 });
+    expect(g.admitted).toBe(false);
+    expect(g.reason).toBe('non_finite_greeks');
   });
 });

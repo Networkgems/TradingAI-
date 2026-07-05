@@ -10,6 +10,9 @@ import {
   TAKE_PROFIT_EARLY_CAPTURE_PCT,
   CORRELATED_EXPOSURE_CAP_PCT,
   CORRELATED_EXPOSURE_MIN_TRADE_RISK_PCT,
+  ENTRY_SHORT_DELTA_MIN,
+  ENTRY_SHORT_DELTA_MAX,
+  ENTRY_DELTA_THETA_RATIO_FLOOR,
 } from '@trading-app/shared';
 
 /**
@@ -508,4 +511,128 @@ export function buildExposureBuckets(
     out.push({ level, key, openRisk, capPct: capPctByLevel?.[level] });
   }
   return out;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// TRA-1293 — PoP / delta entry gate + Delta/Theta ratio floor (entry-side)
+// ─────────────────────────────────────────────────────────────────────────────
+
+export interface EntryGreeksGateParams {
+  /**
+   * The short-strike |delta| the PoP band is enforced on. For a defined-risk
+   * spread this is the short leg's |delta|; for a single-leg position it is the
+   * traded strike's |delta|. Sign is irrelevant — the gate takes |·|.
+   */
+  shortDelta: number;
+  /**
+   * The position |delta| used for the delta/theta ratio (usually the same strike
+   * as `shortDelta` on a single leg; the position net |delta| on a spread).
+   */
+  delta: number;
+  /**
+   * Position theta in per-DAY premium terms (negative for long premium, positive
+   * when short premium). The ratio uses |·|, so the sign only documents intent.
+   * Callers holding BS per-YEAR theta must divide by 365 before passing it here.
+   */
+  thetaPerDay: number;
+  /** Lower bound of the admissible short-strike |delta| band (default 0.30). */
+  deltaBandMin?: number;
+  /** Upper bound of the admissible short-strike |delta| band (default 0.40). */
+  deltaBandMax?: number;
+  /** Minimum admissible |delta| / |thetaPerDay| ratio (default 6.0). */
+  ratioFloor?: number;
+}
+
+export interface EntryGreeksGateDecision {
+  /** True ⇒ the candidate clears both the PoP band and the D/T ratio floor. */
+  admitted: boolean;
+  /** |shortDelta| the band was checked against. */
+  shortDelta: number;
+  deltaBandMin: number;
+  deltaBandMax: number;
+  /** |delta| / |thetaPerDay|; `+∞` when |thetaPerDay| ≈ 0 (no decay to fight). */
+  deltaThetaRatio: number;
+  ratioFloor: number;
+  /** Set when `admitted` is false; identifies which gate rejected the candidate. */
+  reason: 'delta_out_of_band' | 'delta_theta_ratio_too_low' | 'non_finite_greeks' | null;
+}
+
+/**
+ * PoP / delta entry gate (TRA-1293): a HARD pre-open filter operationalizing the
+ * board's Greeks guidance from the Greeks already captured at entry.
+ *
+ * Two independent gates, both must pass:
+ *   1. Short-strike |delta| band — a probability-of-profit proxy. Only admit
+ *      strikes whose |delta| sits in [deltaBandMin, deltaBandMax] (default
+ *      0.30–0.40, i.e. ~60–70% PoP on the short side), rejecting deep-ITM (too
+ *      much premium at risk) and far-OTM (lottery-ticket) strikes.
+ *   2. Delta/Theta ratio floor — require |delta| / |thetaPerDay| ≥ ratioFloor so
+ *      a position's directional sensitivity is large enough relative to its daily
+ *      decay: time decay only "works for us" when we aren't paying (or granting)
+ *      an outsized theta for the delta on the ticket. A position with ~zero theta
+ *      has no decay to fight and clears the ratio unconditionally (ratio = +∞).
+ *
+ * Pure: the caller supplies the entry Greeks (from the option journal / a BS
+ * greeks call at the gate site) and owns the open decision. Complements — does
+ * not replace — the IVR ceiling, earnings gate, and correlated-exposure cap.
+ * Non-finite Greeks are rejected rather than silently admitted.
+ */
+export function entryGreeksGateDecision(p: EntryGreeksGateParams): EntryGreeksGateDecision {
+  const deltaBandMin = p.deltaBandMin ?? ENTRY_SHORT_DELTA_MIN;
+  const deltaBandMax = p.deltaBandMax ?? ENTRY_SHORT_DELTA_MAX;
+  const ratioFloor = p.ratioFloor ?? ENTRY_DELTA_THETA_RATIO_FLOOR;
+
+  const shortDelta = Math.abs(p.shortDelta);
+  const delta = Math.abs(p.delta);
+  const theta = Math.abs(p.thetaPerDay);
+
+  // Any non-finite Greek ⇒ we can't reason about PoP or decay; reject.
+  if (!Number.isFinite(shortDelta) || !Number.isFinite(delta) || !Number.isFinite(theta)) {
+    return {
+      admitted: false,
+      shortDelta,
+      deltaBandMin,
+      deltaBandMax,
+      deltaThetaRatio: NaN,
+      ratioFloor,
+      reason: 'non_finite_greeks',
+    };
+  }
+
+  // Gate 1 — short-strike |delta| PoP band.
+  if (shortDelta < deltaBandMin || shortDelta > deltaBandMax) {
+    return {
+      admitted: false,
+      shortDelta,
+      deltaBandMin,
+      deltaBandMax,
+      deltaThetaRatio: theta > 0 ? delta / theta : Number.POSITIVE_INFINITY,
+      ratioFloor,
+      reason: 'delta_out_of_band',
+    };
+  }
+
+  // Gate 2 — delta/theta ratio floor. Zero decay ⇒ nothing to fight ⇒ pass.
+  const deltaThetaRatio = theta > 0 ? delta / theta : Number.POSITIVE_INFINITY;
+  if (deltaThetaRatio < ratioFloor) {
+    return {
+      admitted: false,
+      shortDelta,
+      deltaBandMin,
+      deltaBandMax,
+      deltaThetaRatio,
+      ratioFloor,
+      reason: 'delta_theta_ratio_too_low',
+    };
+  }
+
+  return {
+    admitted: true,
+    shortDelta,
+    deltaBandMin,
+    deltaBandMax,
+    deltaThetaRatio,
+    ratioFloor,
+    reason: null,
+  };
 }

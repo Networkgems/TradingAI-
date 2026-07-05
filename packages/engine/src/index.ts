@@ -109,6 +109,7 @@ export {
   takeProfitEarlyDecision,
   correlatedExposureDecision,
   buildExposureBuckets,
+  entryGreeksGateDecision,
 } from './exit-rules.js';
 export type {
   Side,
@@ -128,6 +129,8 @@ export type {
   CorrelatedExposureParams,
   CorrelatedExposureBinding,
   CorrelatedExposureDecision,
+  EntryGreeksGateParams,
+  EntryGreeksGateDecision,
 } from './exit-rules.js';
 export { AlpacaFeed } from './feed/index.js';
 export type { AlpacaFeedEvents } from './feed/index.js';
