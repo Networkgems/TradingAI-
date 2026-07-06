@@ -19,6 +19,7 @@ import {
   summarizeDemoBook,
   summarizeDemoBooks,
   summarizeDemoBooksPublic,
+  summarizeSma200ForwardTestFills,
   summarizeOptionsPipeline,
   buildOptionJournalReport,
   type HealthUserContext,
@@ -263,6 +264,64 @@ describe('TRA-580 live-equity acceptance probe', () => {
       now: () => NOW,
     });
     expect(without.routes.get('/api/health/live-equity')).toBeUndefined();
+  });
+});
+
+describe('TRA-1289 sma200 forward-test fill evidence', () => {
+  function fleetState(
+    open: Array<Record<string, unknown>>,
+    closed: Array<Record<string, unknown>>,
+  ): { state: EngineState; mode: string } {
+    return {
+      mode: 'demo',
+      state: engineState({
+        account: { totalEquity: 25_000, availableCash: 25_000, dailyPnl: 0, openPositions: open },
+        closedPositions: closed,
+      } as unknown as Partial<EngineState>),
+    };
+  }
+
+  it('reports zero fills when no position carries the forwardTestOnly marker', () => {
+    const report = summarizeSma200ForwardTestFills([
+      fleetState([{ id: 'a', openedAt: NOW }], [{ pnl: 50, openedAt: NOW - 1000, closedAt: NOW }]),
+    ]);
+    expect(report.fillCount).toBe(0);
+    expect(report.openPositions).toBe(0);
+    expect(report.closedCount).toBe(0);
+    expect(report.lastFillAt).toBeNull();
+    expect(report.realizedPnl).toBe(0);
+  });
+
+  it('counts open + closed forwardTestOnly fills and folds realized P&L / last-fill time', () => {
+    const report = summarizeSma200ForwardTestFills([
+      fleetState(
+        [
+          { id: 'ft-open', openedAt: NOW - 5_000, forwardTestOnly: true },
+          { id: 'normal-open', openedAt: NOW }, // not forward-test → ignored
+        ],
+        [
+          { pnl: 120, openedAt: NOW - 20_000, closedAt: NOW - 1_000, forwardTestOnly: true },
+          { pnl: -40, openedAt: NOW - 10_000, closedAt: NOW, forwardTestOnly: true },
+          { pnl: 999, openedAt: NOW, closedAt: NOW }, // not forward-test → ignored
+        ],
+      ),
+    ]);
+    expect(report.openPositions).toBe(1);
+    expect(report.closedCount).toBe(2);
+    expect(report.fillCount).toBe(3); // >= 1 ⇒ monitor closes done
+    expect(report.realizedPnl).toBe(80); // 120 - 40, excludes the non-FT 999
+    // Most-recent forwardTestOnly open time (the open fill at NOW - 5_000).
+    expect(report.lastFillAt).toBe(new Date(NOW - 5_000).toISOString());
+  });
+
+  it('aggregates forwardTestOnly fills across every demo engine in the fleet', () => {
+    const report = summarizeSma200ForwardTestFills([
+      fleetState([{ id: 'e1', openedAt: NOW, forwardTestOnly: true }], []),
+      fleetState([], [{ pnl: 10, openedAt: NOW - 1, closedAt: NOW, forwardTestOnly: true }]),
+    ]);
+    expect(report.fillCount).toBe(2);
+    expect(report.openPositions).toBe(1);
+    expect(report.closedCount).toBe(1);
   });
 });
 

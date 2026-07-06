@@ -418,6 +418,72 @@ export function summarizeDemoBooksPublic(
   };
 }
 
+// ── TRA-1289 sma200_pullback demo forward-test fill evidence ──────────────────
+
+/**
+ * Forward evidence the TRA-1242 accrual monitor reads to tell "armed, no swing
+ * signal yet" from "a demo forward-test fill landed". The `forwardTestOnly`
+ * marker is the UNIQUE fingerprint of this path — only `openSma200Pullback`'s
+ * demo-only, flag-gated branch ever stamps it — so counting positions that
+ * carry it exactly counts sma200_pullback forward-test fills, with no need to
+ * re-thread the signal type. Demo-money only; no secrets, no live capital.
+ */
+export interface Sma200ForwardTestFillReport {
+  /** Open + recent-closed forwardTestOnly fills — `>= 1` ⇒ first fill observed. */
+  fillCount: number;
+  /** Currently-open forwardTestOnly paper positions (survive reboot via snapshot). */
+  openPositions: number;
+  /** forwardTestOnly positions in the fleet's recent-closed buffer. */
+  closedCount: number;
+  /** ISO time of the most-recent forwardTestOnly fill, or null if none yet. */
+  lastFillAt: string | null;
+  /** Σ realized P&L over the recent-closed forwardTestOnly fills. */
+  realizedPnl: number;
+}
+
+/**
+ * Fold the demo fleet's paper books into the forward-test fill tally. Pure
+ * (clock injected) so it is unit-testable without a server. Open positions are
+ * rebuilt from the DATA_DIR snapshot on boot, so an open swing hold stays
+ * visible across the ~daily bqb1 reboot; the closed buffer is getState()-capped
+ * at the last 20 per mode, which is why `fillCount` also folds open positions.
+ */
+export function summarizeSma200ForwardTestFills(
+  engines: Array<{ state: EngineState; mode: string }>,
+): Sma200ForwardTestFillReport {
+  let openPositions = 0;
+  let closedCount = 0;
+  let realizedPnl = 0;
+  let lastFillTs: number | null = null;
+  const considerFill = (openedAt?: number): void => {
+    if (typeof openedAt === 'number' && (lastFillTs === null || openedAt > lastFillTs)) {
+      lastFillTs = openedAt;
+    }
+  };
+  for (const { state } of engines) {
+    for (const p of state.account.openPositions) {
+      if ((p as { forwardTestOnly?: boolean }).forwardTestOnly) {
+        openPositions += 1;
+        considerFill(p.openedAt);
+      }
+    }
+    for (const p of state.closedPositions) {
+      if ((p as { forwardTestOnly?: boolean }).forwardTestOnly) {
+        closedCount += 1;
+        realizedPnl += Number.isFinite(p.pnl) ? (p.pnl as number) : 0;
+        considerFill((p as { openedAt?: number }).openedAt);
+      }
+    }
+  }
+  return {
+    fillCount: openPositions + closedCount,
+    openPositions,
+    closedCount,
+    lastFillAt: lastFillTs === null ? null : new Date(lastFillTs).toISOString(),
+    realizedPnl,
+  };
+}
+
 // ── TRA-895 options-signal pipeline probe ─────────────────────────────────────
 
 /**
@@ -1127,6 +1193,12 @@ export function registerLiveHealthRoutes(app: Express, deps: LiveHealthDeps): vo
     const dir = process.env.DATA_DIR;
     const env = dir ? resolveDemoFlagEnv(dir) : process.env;
     const enabled = isSma200DemoForwardTestEnabled(env);
+    // TRA-1289 — fill evidence for the TRA-1242 accrual monitor. Without a
+    // countable signal, "armed, no swing yet" is indistinguishable from "a fill
+    // landed", so the monitor could never close on first fill. Sourced from the
+    // demo fleet's paper books (forwardTestOnly marker = this path's unique
+    // fingerprint); demo-money only, no secrets, no live capital.
+    const fills = summarizeSma200ForwardTestFills(deps.demoBooks?.() ?? []);
     res.json({
       ok: true,
       time: new Date(now()).toISOString(),
@@ -1137,6 +1209,11 @@ export function registerLiveHealthRoutes(app: Express, deps: LiveHealthDeps): vo
       // requires clearing the OOS keeper gate (TRA-455/817); this flag can never
       // open real capital.
       liveCapitalReachable: false,
+      fillCount: fills.fillCount,
+      openPositions: fills.openPositions,
+      closedCount: fills.closedCount,
+      lastFillAt: fills.lastFillAt,
+      realizedPnl: fills.realizedPnl,
       note: enabled
         ? 'ARMED: sma200_pullback opens demo-only forward-test (forwardTestOnly) paper fills; live stays hard-gated.'
         : 'DISARMED: sma200_pullback stays display-only in demo. Set ENABLE_SMA200_DEMO_FORWARD_TEST=true (render.yaml env or DATA_DIR/demo-flags.json) to arm.',
