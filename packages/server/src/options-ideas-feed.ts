@@ -384,7 +384,20 @@ export function modelStructure(
     case 'bear_put_spread': {
       const ot = strategy === 'bull_call_spread' ? 'call' : 'put';
       const strikes = ot === 'call' ? callStrikes : putStrikes;
-      const kLong = nearestStrike(strikes, anchor.strike) ?? anchor.strike;
+      // TRA-1363 — extend the TRA-1360 not-ITM clamp to DEBIT verticals. The
+      // anchor (max |mispricing| across ALL of a symbol's candidates) can land
+      // deep ITM, which for a debit spread is a degenerate structure: both legs
+      // are already ~fully valued, so you pay ~full width for ~zero reward (live
+      // NVDA buy 90C/sell 95C at spot 196.9 → maxProfit $5 vs maxLoss $495, a
+      // near-guaranteed loss) while POP/thesis describe an OTM directional bet.
+      // Clamp the LONG leg to the not-ITM side of spot (call ≥ spot, put ≤ spot)
+      // then snap to the chain, so the vertical is a genuine at/OTM directional
+      // structure with sane reward:risk. An already-ATM/OTM anchor is honored.
+      const notItmTarget = ot === 'call' ? Math.max(anchor.strike, spot) : Math.min(anchor.strike, spot);
+      const kLong =
+        nearestNonItmStrike(strikes, ot, spot, notItmTarget) ??
+        nearestStrike(strikes, notItmTarget) ??
+        anchor.strike;
       const kShort = ot === 'call' ? kLong + step : kLong - step;
       const longMid = midAt(rows, ot, exp, kLong);
       const shortMid = midAt(rows, ot, exp, kShort);
@@ -507,9 +520,10 @@ export function modelStructure(
  * defense-in-depth: any future path (thin chain, mis-mapped anchor) that still
  * produces an ITM-short credit spread with a high POP is dropped, never rendered.
  *
- * Scoped to the two credit verticals (bull_put / bear_call). Debit verticals and
- * the four-leg condor/butterfly straddle spot by construction and are not the
- * reported defect; returning `true` for them avoids false drops.
+ * Scoped to the two credit verticals (bull_put / bear_call) and — since TRA-1363
+ * — the two debit verticals (bull_call / bear_put). The four-leg condor/butterfly
+ * straddle spot by construction and are not the reported defect; returning `true`
+ * for them avoids false drops.
  */
 export function ideaPopPlacementCoherent(
   strategy: EmittableStrategy,
@@ -518,16 +532,119 @@ export function ideaPopPlacementCoherent(
   pop: number,
 ): boolean {
   const isCreditVertical = strategy === 'bull_put_spread' || strategy === 'bear_call_spread';
-  if (!isCreditVertical) return true;
-  const short = structure.legs.find((l) => l.action === 'sell');
-  if (!short) return true;
-  // ITM short leg = the option already has intrinsic value (call strike < spot,
-  // put strike > spot). ATM (strike == spot) is treated as not-ITM, matching the
-  // strike-selection boundary — the reported defect is a DEEP-ITM short leg.
-  const shortItm = short.optionType === 'call' ? short.strike < spot : short.strike > spot;
-  // A credit spread with an ITM short leg is ~certain max loss; a POP above a
-  // coin-flip contradicts that placement.
-  return !shortItm || pop <= 0.5;
+  if (isCreditVertical) {
+    const short = structure.legs.find((l) => l.action === 'sell');
+    if (!short) return true;
+    // ITM short leg = the option already has intrinsic value (call strike < spot,
+    // put strike > spot). ATM (strike == spot) is treated as not-ITM, matching the
+    // strike-selection boundary — the reported defect is a DEEP-ITM short leg.
+    const shortItm = short.optionType === 'call' ? short.strike < spot : short.strike > spot;
+    // A credit spread with an ITM short leg is ~certain max loss; a POP above a
+    // coin-flip contradicts that placement.
+    return !shortItm || pop <= 0.5;
+  }
+  // TRA-1363 — debit verticals. A directional debit spread only makes sense as an
+  // at/OTM structure the underlying has room to run into. When BOTH legs are ITM
+  // it is the degenerate deep-ITM structure the ticket flags: the spread is
+  // already ~fully valued, so it pays ~full width for ~zero reward (live NVDA buy
+  // 90C/sell 95C at spot 196.9 → maxProfit $5 vs maxLoss $495) — incoherent with a
+  // priced, enterable, > 0.5-POP directional idea. A merely ITM long paired with
+  // an OTM short is a legitimate conservative spread and is NOT dropped. The
+  // strike-selection clamp above already keeps both legs not-ITM, so this is
+  // defense-in-depth for any residual path (thin chain, mis-mapped anchor).
+  const isDebitVertical = strategy === 'bull_call_spread' || strategy === 'bear_put_spread';
+  if (!isDebitVertical) return true;
+  const legItm = (l: IdeaLeg): boolean => (l.optionType === 'call' ? l.strike < spot : l.strike > spot);
+  const allLegsItm = structure.legs.length >= 2 && structure.legs.every(legItm);
+  return !allLegsItm;
+}
+
+// ── thesis reconciliation (TRA-1363) ─────────────────────────────────────────
+
+/**
+ * Deterministic, strike-free rationale per strategy — the single source of truth
+ * for a card's strikes/expiration is its reconciled `legs` array (rendered
+ * authoritatively in the panel's legs row), so this describes the structure's
+ * direction/edge without naming any specific strike or date.
+ */
+const STRUCTURE_RATIONALE: Record<EmittableStrategy, string> = {
+  long_call: 'Directional defined-risk long call — upside exposure with loss capped at the debit paid.',
+  long_put: 'Directional defined-risk long put — downside exposure with loss capped at the debit paid.',
+  bull_call_spread:
+    'Bullish defined-risk debit spread — profits as the underlying rises toward the short call by expiry, loss capped at the net debit.',
+  bear_put_spread:
+    'Bearish defined-risk debit spread — profits as the underlying falls toward the short put by expiry, loss capped at the net debit.',
+  bull_put_spread:
+    'Bullish defined-risk credit spread — collects net premium and profits while the underlying holds above the short put through expiry.',
+  bear_call_spread:
+    'Bearish defined-risk credit spread — collects net premium and profits while the underlying stays below the short call through expiry.',
+  iron_condor:
+    'Neutral defined-risk credit structure — collects premium and profits while the underlying stays between the short strikes through expiry.',
+  iron_butterfly:
+    'Neutral defined-risk credit structure — collects premium and profits if the underlying pins near the short strikes at expiry.',
+  call_calendar:
+    'Defined-risk call calendar — profits from time-decay / IV differential between the near and far expirations.',
+  put_calendar:
+    'Defined-risk put calendar — profits from time-decay / IV differential between the near and far expirations.',
+};
+
+// A strike token: a number immediately trailed by a call/put marker (185C,
+// 172.5P, "220 puts"). The leading digit is required so a bare "call"/"put" word
+// or "bull call spread" is never scrubbed.
+const STRIKE_TOKEN = String.raw`\$?\d+(?:\.\d+)?\s*(?:c|p|calls?|puts?)\b`;
+// An expiration token: US numeric month/day (8/21, 8/7/26 — month 1-12, day 1-31,
+// so ratios like "50/50" are NOT dates) or ISO (2026-07-31), optionally introduced
+// by exp / expiring / for / on / dated.
+const DATE_TOKEN =
+  String.raw`(?:\b(?:exp(?:iration|iry|\.)?|expiring|expires?|dated|for|on)\s+)?` +
+  String.raw`(?:(?:1[0-2]|0?[1-9])/(?:3[01]|[12]?\d)(?:/\d{2,4})?|\d{4}-\d{2}-\d{2})\b`;
+// A leg phrase: an optional action verb + a strike token + an optional trailing
+// expiration. The optional verb also sweeps up standalone strike mentions.
+const LEG_PHRASE = new RegExp(
+  String.raw`\b(?:(?:buy|sell|buying|selling|bought|sold|long|short|write|writing|wrote)\s+(?:the\s+)?)?` +
+    `(?:${STRIKE_TOKEN})` +
+    String.raw`(?:\s+${DATE_TOKEN})?`,
+  'gi',
+);
+const STANDALONE_DATE = new RegExp(DATE_TOKEN, 'gi');
+
+/** Collapse the whitespace / orphan-punctuation artifacts a scrub leaves behind. */
+function tidyProse(s: string): string {
+  return s
+    .replace(/\s+\/\s+/g, ' ') // orphan slashes (spaces both sides) from removed multi-leg runs
+    .replace(/\s+([,;.:])/g, '$1') // space before punctuation
+    .replace(/([,;:])(?:\s*[,;:])+/g, '$1') // collapse punctuation runs
+    .replace(/(^|[.;])\s*[,;:]+/g, '$1') // orphan punctuation after a break
+    .replace(/\s{2,}/g, ' ')
+    .replace(/^[\s,;:./-]+/, '') // trim leading junk
+    .replace(/[\s,;:]+$/, '') // trim trailing separators
+    .trim();
+}
+
+/**
+ * TRA-1363 — the LLM `OptionsIdea.thesis` names the strikes/expiration the model
+ * *intended* (its anchor), but the executed legs are reconciled server-side
+ * (TRA-1360 not-ITM clamp, chain snapping, and this ticket's debit clamp), so the
+ * prose can name strikes/dates that diverge from the legs the card actually shows
+ * (live COIN bear call: thesis "Sell 170C 8/21" vs executed sell 172.5C / buy
+ * 177.5C exp 7/31). The panel already renders the reconciled legs + expiration
+ * authoritatively, so the thesis only needs the model's qualitative rationale.
+ *
+ * Strip the strike/expiration SPECIFICS (and their leg-action clause) from the
+ * prose so it can never contradict the executed legs; the model's real reasoning
+ * (IV-rank, events, support levels) survives untouched. When scrubbing leaves
+ * nothing substantive — a thesis that was only a leg recital — fall back to a
+ * deterministic, strike-free structure description. Either way the single source
+ * of truth for strikes/expiration stays the reconciled `legs` array.
+ */
+export function reconcileThesis(thesis: string, strategy: EmittableStrategy): string {
+  const scrubbed = tidyProse((thesis ?? '').replace(LEG_PHRASE, ' ').replace(STANDALONE_DATE, ' '));
+  // "Substantive" = enough letters left to be a real rationale, not a comma-and-
+  // conjunction husk of a removed leg recital.
+  const substantive = scrubbed.replace(/[^a-z]/gi, '').length >= 12;
+  if (!substantive) return STRUCTURE_RATIONALE[strategy];
+  const capped = scrubbed.charAt(0).toUpperCase() + scrubbed.slice(1);
+  return /[.!?]$/.test(capped) ? capped : `${capped}.`;
 }
 
 // ── feed assembly ─────────────────────────────────────────────────────────────
@@ -736,7 +853,12 @@ export function buildOptionsIdeasFeed(args: BuildFeedArgs): BuiltFeed {
       ticker,
       underlyingPrice: sym.spot,
       strategy: STRATEGY_DISPLAY[idea.strategy],
-      thesis: idea.thesis,
+      // TRA-1363 — reconcile the thesis prose against the executed legs: strip any
+      // strike/expiration the LLM named from its intended anchor (which the
+      // server-side clamps/snapping have since diverged from) so the card's thesis
+      // can never contradict the legs row it renders beside. The legs array is the
+      // single source of truth for strikes/expiration.
+      thesis: reconcileThesis(idea.thesis, idea.strategy),
       pop: idea.pop,
       maxLossUsd: sizedMaxLossUsd,
       maxProfitUsd: sizedMaxProfitUsd,

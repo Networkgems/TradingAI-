@@ -13,6 +13,7 @@ import {
   buildEventsForSymbol,
   modelStructure,
   ideaPopPlacementCoherent,
+  reconcileThesis,
   sizeSpreadContractsToCap,
   STRATEGY_DISPLAY,
 } from './options-ideas-feed.js';
@@ -148,6 +149,33 @@ describe('modelStructure', () => {
     expect(s.priced).toBe(true);
   });
 
+  // TRA-1363 — the same anchor mis-map hits DEBIT verticals: a deep-ITM anchor
+  // snaps a bull call spread onto both-ITM legs (live NVDA buy 90C/sell 95C at
+  // spot 196.9), a degenerate structure that pays ~full width for ~zero reward.
+  // The long leg must be clamped to the not-ITM side of spot so the vertical is a
+  // genuine at/OTM directional bet coherent with its POP/thesis.
+  it('places a debit bull-call long leg at/OTM even when the scanner anchor is deep ITM', () => {
+    const debitCalls: OptionChainRow[] = [
+      callRow(90, 107.0, 107.2), // deep-ITM anchor strike (spot 196.9)
+      callRow(192, 8.9, 9.1), // uniform 5-wide chain around the money → step = 5
+      callRow(197, 5.9, 6.1), // mid 6.0 — first strike at/above spot
+      callRow(202, 3.9, 4.1), // mid 4.0
+      callRow(207, 2.4, 2.6),
+    ];
+    const s = modelStructure('bull_call_spread', candidate({ strike: 90, optionType: 'call' }), 196.9, debitCalls, 999);
+    expect(s.legs).toEqual([
+      { action: 'buy', optionType: 'call', strike: 197, expiration: EXP }, // clamped, not 90
+      { action: 'sell', optionType: 'call', strike: 202, expiration: EXP },
+    ]);
+    // Both legs sit at/above spot — a coherent OTM debit spread with sane R:R.
+    expect(s.legs[0]!.strike).toBeGreaterThanOrEqual(196.9);
+    // debit = 6.0 - 4.0 = 2.0 → net -200, maxLoss 200; width 5 → maxProfit 300.
+    expect(s.netUsd).toBeCloseTo(-200, 4);
+    expect(s.maxLossUsd).toBeCloseTo(200, 4);
+    expect(s.maxProfitUsd).toBeCloseTo(300, 4);
+    expect(s.priced).toBe(true);
+  });
+
   it('honors an already-OTM bull-put anchor unchanged (short put stays below spot)', () => {
     const s = modelStructure('bull_put_spread', candidate({ strike: 420, optionType: 'put' }), 430, rows, 999);
     expect(s.legs[0]).toEqual({ action: 'sell', optionType: 'put', strike: 420, expiration: EXP });
@@ -218,8 +246,83 @@ describe('ideaPopPlacementCoherent (TRA-1360)', () => {
     expect(ideaPopPlacementCoherent('bear_call_spread', structFor({ optionType: 'call', strike: 270 }), 386, 0.2)).toBe(true);
   });
 
-  it('does not gate debit verticals (not the reported defect)', () => {
-    expect(ideaPopPlacementCoherent('bull_call_spread', structFor({ optionType: 'call', strike: 270 }), 386, 0.9)).toBe(true);
+  // TRA-1363 — the guard now also covers DEBIT verticals. A debit spread with a
+  // long leg + a step-away short leg; both ITM is the degenerate deep-ITM
+  // structure (pay ~full width for ~zero reward).
+  const debitFor = (long: { optionType: 'call' | 'put'; strike: number }) => ({
+    legs: [
+      { action: 'buy' as const, ...long, expiration: EXP },
+      {
+        action: 'sell' as const,
+        optionType: long.optionType,
+        strike: long.optionType === 'call' ? long.strike + 5 : long.strike - 5,
+        expiration: EXP,
+      },
+    ],
+    breakevens: [long.strike],
+    maxLossUsd: 495,
+    maxProfitUsd: 5,
+    netUsd: -495,
+    priced: true,
+  });
+
+  it('rejects a deep-ITM bull-call debit spread with both legs ITM (the live NVDA defect)', () => {
+    // buy 90C / sell 95C at spot 196.9 → both ITM; POP 0.62 on a pay-495-make-5 structure.
+    expect(ideaPopPlacementCoherent('bull_call_spread', debitFor({ optionType: 'call', strike: 90 }), 196.9, 0.62)).toBe(false);
+  });
+
+  it('rejects a deep-ITM bear-put debit spread with both legs ITM', () => {
+    // buy 300P / sell 295P at spot 196.9 → both ITM for a put.
+    expect(ideaPopPlacementCoherent('bear_put_spread', debitFor({ optionType: 'put', strike: 300 }), 196.9, 0.62)).toBe(false);
+  });
+
+  it('accepts an at/OTM debit vertical (a genuine directional spread)', () => {
+    // buy 197C / sell 202C at spot 196.9 → both OTM; a real bullish debit bet.
+    expect(ideaPopPlacementCoherent('bull_call_spread', debitFor({ optionType: 'call', strike: 197 }), 196.9, 0.45)).toBe(true);
+  });
+
+  it('accepts a conservative ITM-long / OTM-short debit vertical (not ALL legs ITM)', () => {
+    // buy 195C / sell 200C at spot 196.9 → long ITM, short OTM; a legitimate higher-POP spread.
+    expect(ideaPopPlacementCoherent('bull_call_spread', debitFor({ optionType: 'call', strike: 195 }), 196.9, 0.55)).toBe(true);
+  });
+});
+
+describe('reconcileThesis (TRA-1363)', () => {
+  it('drops a strike/expiration-only leg recital to a deterministic structure rationale', () => {
+    // The live COIN bear call: thesis names 170C/185C 8/21, executed legs differ.
+    expect(reconcileThesis('Sell 170C 8/21, buy 185C 8/21', 'bear_call_spread')).toBe(
+      'Bearish defined-risk credit spread — collects net premium and profits while the underlying stays below the short call through expiry.',
+    );
+    expect(reconcileThesis('Buy 85C, sell 100C 8/21', 'bull_call_spread')).toBe(
+      'Bullish defined-risk debit spread — profits as the underlying rises toward the short call by expiry, loss capped at the net debit.',
+    );
+    // ISO-dated recital falls back too.
+    expect(reconcileThesis('Sell 220P 2026-08-07, buy 205P 2026-08-07', 'bull_put_spread')).toBe(
+      'Bullish defined-risk credit spread — collects net premium and profits while the underlying holds above the short put through expiry.',
+    );
+  });
+
+  it('keeps qualitative rationale, stripping only the conflicting strike/date specifics', () => {
+    expect(
+      reconcileThesis('Constructive trend with moderate IV; buy the 200C / sell 205C for 7/24 to ride the move.', 'bull_call_spread'),
+    ).toBe('Constructive trend with moderate IV; to ride the move.');
+  });
+
+  it('leaves a strike-free thesis untouched (nothing to reconcile)', () => {
+    const t = 'Elevated IV-rank into a quiet window; sell defined-risk premium below support.';
+    expect(reconcileThesis(t, 'bull_put_spread')).toBe(t);
+  });
+
+  it('does not mistake price levels or ratios for strikes/dates', () => {
+    // "420" (no C/P) is a support level; "50/50" is a ratio, not a date — both kept.
+    const t = 'Range-bound near 420 support; a 50/50 pin keeps theta working.';
+    expect(reconcileThesis(t, 'iron_condor')).toBe(t);
+  });
+
+  it('falls back for an empty thesis', () => {
+    expect(reconcileThesis('', 'long_call')).toBe(
+      'Directional defined-risk long call — upside exposure with loss capped at the debit paid.',
+    );
   });
 });
 
@@ -350,6 +453,59 @@ describe('buildOptionsIdeasFeed', () => {
     });
     expect(feed.ideas).toHaveLength(0);
     expect(intents.size).toBe(0);
+  });
+
+  // TRA-1363 — end-to-end debit-vertical coherence. When the chain lists only
+  // deep-ITM call strikes, a bull call spread can't be placed at/OTM and models
+  // both-ITM (the live NVDA buy 90C/sell 95C-vs-196.9 shape). The guard drops it
+  // rather than rendering a priced, enterable card that pays ~full width for ~zero
+  // reward. No idea, no intent.
+  it('drops an incoherent deep-ITM debit spread (both legs ITM)', () => {
+    const nvdaSym: OptionsResearchSymbol = {
+      ...sym,
+      spot: 196.9,
+      candidates: [candidate({ optionSymbol: 'NVDA260717C00090000', strike: 90, optionType: 'call', mispricingPct: 0.5 })],
+    };
+    const nvdaInput: OptionsResearchInput = { asOf: input.asOf, symbols: [nvdaSym] };
+    const nvdaResearch: OptionsResearchResult = {
+      ...research,
+      ideas: [{ ...research.ideas[0]!, ticker: 'MSFT', strategy: 'bull_call_spread', pop: 0.62 }],
+    };
+    // Only deep-ITM call strikes are listed — no at/OTM strike to clamp the long to.
+    const itmOnly = new Map<string, OptionChainRow[]>([
+      ['MSFT', [callRow(90, 107.0, 107.2), callRow(95, 102.1, 102.3)]],
+    ]);
+    const { feed, intents } = buildOptionsIdeasFeed({
+      research: nvdaResearch,
+      input: nvdaInput,
+      rowsBySymbol: itmOnly,
+      guardrail: DAY_TRADING_GUARDRAIL,
+      generatedAt: 1,
+    });
+    expect(feed.ideas).toHaveLength(0);
+    expect(intents.size).toBe(0);
+  });
+
+  // TRA-1363 — the displayed thesis is reconciled against the executed legs: the
+  // LLM prose named no strikes here, so it survives; a strike-naming prose would
+  // be stripped (covered in the reconcileThesis unit above).
+  it('reconciles the idea thesis against the executed legs', () => {
+    const strikeNaming: OptionsResearchResult = {
+      ...research,
+      ideas: [{ ...research.ideas[0]!, thesis: 'Sell 999P 1/1, buy 900P 1/1' }],
+    };
+    const { feed } = buildOptionsIdeasFeed({
+      research: strikeNaming,
+      input,
+      rowsBySymbol,
+      guardrail: DAY_TRADING_GUARDRAIL,
+      generatedAt: 1,
+    });
+    // The bogus 999/900 strikes never reach the card; a deterministic rationale does.
+    expect(feed.ideas[0]!.thesis).not.toMatch(/999|900/);
+    expect(feed.ideas[0]!.thesis).toBe(
+      'Bullish defined-risk credit spread — collects net premium and profits while the underlying holds above the short put through expiry.',
+    );
   });
 
   it('drops ideas whose symbol has no anchor candidate', () => {
