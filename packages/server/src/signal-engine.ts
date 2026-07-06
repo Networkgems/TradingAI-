@@ -4220,7 +4220,7 @@ export class SignalEngine {
         // here via BS greeks (the RV candidate carries only delta); a missing
         // underlying spot leaves thetaPerDay=0 so the ratio gate abstains (data
         // gap must not silently reject) and only the delta band applies.
-        if (this.mode === 'demo' && isEntryGreeksGateEnabled()) {
+        if (this.mode === 'demo' && isEntryGreeksGateEnabled(this.resolveDemoFlagEnv())) {
           let thetaPerDay = 0;
           if (typeof underlyingSpot === 'number' && underlyingSpot > 0) {
             const greeks = blackScholesGreeks({
