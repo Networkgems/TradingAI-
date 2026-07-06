@@ -277,13 +277,21 @@ const BASELINE_SPEC: ShortSpec = {
     volumeMultiplier: 1.10,
     volumeSmaPeriod: 20,
     cascadeLeg4h: true,
-    // TRA-1325 / TRA-255 §4.4 v3 — route BTC-USD shorts to the bearish
-    // momentum-divergence trigger; the v2 RSI-extreme bracket list is vacated
-    // to `[]` (v3 de-routes v2, mirroring the r9 de-route pattern — the code
-    // path stays available for future re-enablement). Alts (ETH / SOL / XRP /
-    // DOGE) keep the cascade-leg trigger unchanged.
+    // TRA-1325 / TRA-255 §4.4 v3 — the §8 4H sweep de-routes BTC-USD from the
+    // momentum-divergence trigger back to parked. Post-wiring sweep result:
+    // the v3 trigger emitted ZERO BTC signals across 2023-2026 4H bars
+    // (btc-momentum-divergence-emitted counter never bumped), so BTC density
+    // was 0/10 windows — below the >=3/9 acceptance bar. Per the ticket's
+    // "BTC density misses (<3/9)" branch this is a STRUCTURAL confirmation
+    // (the trigger unit-tests green, so it fires on qualifying inputs — the
+    // pure-price fractal+RSI/MACD-divergence conjunction is simply never
+    // satisfied on real BTC 4H data). v3 stays on main (engine trigger,
+    // routing predicate, and tests all retained); routing is de-activated by
+    // vacating `momentumDivergenceSymbols` to `[]` (mirrors the r9 v2
+    // de-route). Escalation: OI-delta v3 spike. Alts keep the cascade-leg
+    // trigger unchanged.
     lowCascadeDensitySymbols: [],
-    momentumDivergenceSymbols: ['BTC-USD'],
+    momentumDivergenceSymbols: [],
   },
   breakout: {
     volumeMultiplier: 1.5,
@@ -296,11 +304,13 @@ const BASELINE_SPEC: ShortSpec = {
   },
   byTimeframe: {
     '4h': {
-      // TRA-1325 / TRA-255 §8.3 re-enablement clause 2 — BTC re-included in
-      // the 4H routing universe so it reaches the v3 divergence trigger
-      // instead of parking with SKIP_PARKED_4H_R9. ETH-USD / XRP-USD stay
-      // parked pending their own Phase-1.2 spikes.
-      universe: ['BTC-USD', 'SOL-USD', 'DOGE-USD'],
+      // TRA-1325 / TRA-255 §4.4 v3 — BTC-USD removed from the 4H routing
+      // universe after the post-wiring §8 sweep found the v3 divergence
+      // trigger structurally silent on BTC (0 emissions, 0 trades, density
+      // 0/10 < 3/9). BTC returns to parking with SKIP_PARKED_4H_R9 (the r9
+      // baseline state), pending the OI-delta v3 spike. SOL/DOGE keep firing;
+      // ETH-USD / XRP-USD stay parked pending their own Phase-1.2 spikes.
+      universe: ['SOL-USD', 'DOGE-USD'],
       lowCascadeDensitySymbols: [],
     },
   },
@@ -1281,7 +1291,7 @@ function buildReport(
       const fundingNote = fundingActive
         ? 'The §5.1 funding gate is wired against the Binance USD-M futures funding history (cached locally, ~8h resolution / ÷ 8 → per-hour) — see `packages/backtest/src/funding-feed.ts` for the Coinbase INTX vs Binance basis rationale.'
         : '**Funding gate skipped on this run** — the public Binance USD-M `fundingRate` endpoint returns HTTP 451 from US-based IPs (geoblocked per Binance ToS §b). The harness handles this gracefully (empty history → `lookupFundingPerHour` returns undefined → `evaluateShortFilters` treats the gate as best-effort skipped per TRA-255 §5). Skip-reason histogram tells the truth: zero funding-gate skips. Use the OKX-sourced funding feed (TRA-287 follow-up) when the funding-active acceptance bar matters.';
-      lines.push(`> **v3 universe (TRA-1325).** 4H routing is \`${r9.universe.join(', ')}\` per TRA-255 §4.4 v3 / §8.3 re-enablement clause 2. BTC-USD routes to the momentum-divergence trigger (\`momentumDivergenceSymbols: ['BTC-USD']\`); ETH-USD / XRP-USD stay parked with \`parked — failed §8 4H r9\`. ${fundingNote}\n`);
+      lines.push(`> **v3 universe (TRA-1325).** 4H routing is \`${r9.universe.join(', ')}\`. BTC-USD is DE-ROUTED (\`momentumDivergenceSymbols: []\`) after the post-wiring §8 sweep found the v3 momentum-divergence trigger structurally silent on BTC (0 emissions / 0 trades / density 0-of-10 windows < 3/9 bar) — BTC returns to \`parked — failed §8 4H r9\` pending the OI-delta v3 spike. The v3 engine trigger + routing predicate stay on main for re-enablement. ETH-USD / XRP-USD also parked. ${fundingNote}\n`);
     }
   }
 
@@ -1491,6 +1501,77 @@ async function main() {
   });
 
   console.log(`[run-tra261-sweep] ${baselineWf.windows.length} windows produced, running sensitivity sweep…`);
+
+  // TRA-1325 — fast branch-decision path. The section 8 acceptance verdict and
+  // the v3 branch criteria (BTC density, universe rollup, per-window pass,
+  // alt-cluster non-regression) are all derivable from `baselineWf` alone; the
+  // sensitivity sweep below only feeds the report's sensitivity section. When
+  // SKIP_SENSITIVITY is set we emit a machine-readable acceptance block and
+  // exit before the (multi-minute) grid so the CTO heartbeat can apply the
+  // branch decision without waiting on the full report. Normal (unset) runs are
+  // byte-unchanged.
+  if (process.env.SKIP_SENSITIVITY && granularity === '4h') {
+    const rollupSymbols = ['BTC-USD', 'SOL-USD', 'DOGE-USD'];
+    const per = baselineWf.perWindow.map((w) => {
+      const bySym = (s: string) => w.perSymbol.find((p) => p.symbol === s);
+      return {
+        index: w.index,
+        passes: w.metrics.passes,
+        reasons: w.metrics.reasons,
+        universe: {
+          trades: w.metrics.trades,
+          expectancyR: Number(w.metrics.expectancyR.toFixed(3)),
+          hitRatePct: Number(w.metrics.hitRatePct.toFixed(1)),
+          rollingDdPct: Number(w.metrics.rollingMaxDrawdownPct.toFixed(2)),
+        },
+        btcTrades: bySym('BTC-USD')?.trades ?? 0,
+        rollup: rollupSymbols.map((s) => ({
+          symbol: s,
+          trades: bySym(s)?.trades ?? 0,
+          expectancyR: Number((bySym(s)?.expectancyR ?? 0).toFixed(3)),
+          hitRatePct: Number((bySym(s)?.hitRatePct ?? 0).toFixed(1)),
+        })),
+      };
+    });
+    const totalWindows = per.length;
+    const passingCount = per.filter((w) => w.passes).length;
+    const quorum = Math.ceil((2 / 3) * totalWindows);
+    const btcDensityWindows = per.filter((w) => w.btcTrades >= 1).length;
+    const btcTotalTrades = per.reduce((s, w) => s + w.btcTrades, 0);
+    const agg = (sym: string) => {
+      const rows = per.flatMap((w) => w.rollup.filter((r) => r.symbol === sym));
+      const trades = rows.reduce((s, r) => s + r.trades, 0);
+      return { symbol: sym, totalTrades: trades };
+    };
+    // Aggregate the sim's skip-reason histogram across every window. This
+    // surfaces the v3 divergence-emission counters (raw trigger activity) and
+    // any BTC park/filter reasons — the definitive structural-vs-routing-bug
+    // signal for the branch decision.
+    const skipReasonTotals: Record<string, number> = {};
+    for (const w of baselineWf.windows) {
+      for (const [k, v] of w.skipReasons) skipReasonTotals[k] = (skipReasonTotals[k] ?? 0) + v;
+    }
+    const summary = {
+      granularity,
+      routingUniverse: BASELINE_SPEC.byTimeframe?.['4h']?.universe ?? null,
+      totalWindows,
+      passingCount,
+      quorum,
+      perWindowPass: passingCount >= quorum,
+      btcDensityWindows,
+      btcDensityBar: btcDensityWindows >= 3,
+      btcTotalTrades,
+      rollupTotals: ['BTC-USD', 'SOL-USD', 'DOGE-USD'].map(agg),
+      skipReasonTotals,
+      perWindow: per,
+    };
+    console.log('\n=== TRA-1325 FAST ACCEPTANCE (baseline-only, sensitivity skipped) ===');
+    console.log('<<<TRA1325_JSON');
+    console.log(JSON.stringify(summary, null, 2));
+    console.log('TRA1325_JSON>>>');
+    return;
+  }
+
   const sweep = summariseSweep({
     spec: BASELINE_SPEC,
     fullByPair,
