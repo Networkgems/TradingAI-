@@ -18,6 +18,7 @@ const FOUR_H = 4 * 60 * 60 * 1000;
 /** Build 4H candles from a closes array (high = close, so fractal-on-high == fractal-on-close). */
 function mk(closes: number[]): Candle[] {
   return closes.map((c, idx) => ({
+    symbol: 'BTC-USD',
     timestamp: 1_700_000_000_000 + idx * FOUR_H,
     open: c,
     high: c,
