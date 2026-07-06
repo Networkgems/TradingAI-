@@ -259,9 +259,7 @@ export interface StockTwitsProbeResult {
  */
 export async function probeStockTwits(symbol = 'AAPL'): Promise<StockTwitsProbeResult> {
   const now = Date.now();
-  if (isStockTwitsBreakerOpen(now)) {
-    return { ok: false, status: null, messageCount: null, breakerOpen: true, reason: 'rate-limit breaker open' };
-  }
+  const breakerOpen = isStockTwitsBreakerOpen(now);
   const sym = symbol.toUpperCase();
   const url = `https://api.stocktwits.com/api/2/streams/symbol/${encodeURIComponent(sym)}.json`;
   try {
@@ -271,13 +269,13 @@ export async function probeStockTwits(symbol = 'AAPL'): Promise<StockTwitsProbeR
       `stocktwits-probe(${sym})`,
     );
     if (!resp.ok) {
-      return { ok: false, status: resp.status, messageCount: null, breakerOpen: false, reason: `non-OK status ${resp.status}` };
+      return { ok: false, status: resp.status, messageCount: null, breakerOpen, reason: `non-OK status ${resp.status}` };
     }
     const body = (await resp.json()) as RawStockTwitsStream;
     const count = Array.isArray(body?.messages) ? body.messages.length : 0;
-    return { ok: true, status: resp.status, messageCount: count, breakerOpen: false, reason: null };
+    return { ok: true, status: resp.status, messageCount: count, breakerOpen, reason: null };
   } catch (err: unknown) {
     const msg = err instanceof Error ? err.message : String(err);
-    return { ok: false, status: null, messageCount: null, breakerOpen: false, reason: msg };
+    return { ok: false, status: null, messageCount: null, breakerOpen, reason: msg };
   }
 }
