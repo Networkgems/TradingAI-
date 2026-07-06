@@ -9957,6 +9957,57 @@ export function shouldBootArmLiveEquity(
   return apiToken.length > 0 && accountId.length > 0;
 }
 
+/**
+ * TRA-1340 — decide whether the production crypto engine should boot with LIVE
+ * Coinbase auto-trading armed for the pinned operator, so a plain redeploy
+ * activates the board-approved live crypto DCA arm WITHOUT an ADMIN_PASSWORD API
+ * flip. This mirrors {@link shouldBootArmLiveEquity} (TRA-713): the board answered
+ * YES on issue-thread interaction 4caaa410 (override TRA-314) to enable live
+ * Coinbase crypto auto-trading, and the TRA-532 promotion gate is satisfied — but
+ * `cryptoAutoTradingEnabledLive` is a persisted per-account setting that only the
+ * admin-authenticated PUT /api/account/settings or POST /api/crypto/trading/start
+ * can flip, and neither is reachable by an agent on a redeploy-only deployment.
+ *
+ * REAL-money and deliberately SINGLE-USER scoped — every condition must hold:
+ *   • `LIVE_EQUITY_BOOT_USER` names THIS user (operator pin, default "admin" per
+ *     render.yaml / TRA-716). A fleet-wide arm would let any user resolve the
+ *     shared `COINBASE_*` env creds and trade the operator's Coinbase account
+ *     (the TRA-856 multi-tenant leak class).
+ *   • the account is in Live mode — live crypto auto-trading is meaningful only in
+ *     `mode: 'live'` (mirrors promotion-service's live-crypto predicate). On bqb1
+ *     the TRA-713 equity boot-arm forces the operator to Live first, so this holds
+ *     at boot.
+ *   • resolvable Coinbase creds — per-user crypto creds, or the shared `COINBASE_*`
+ *     env fallback scoped to the operator — mirroring
+ *     `crypto-engine.buildLiveBroker`, so we never arm live crypto with no broker
+ *     attached.
+ *
+ * Ongoing per-trade risk gates (10%-of-equity notional cap, EMA-200 trend gate,
+ * catastrophe stop, Coinbase $1 min-notional, funding) still apply, so an unfunded
+ * sleeve places no order even when this arms. `env` is injectable for tests.
+ */
+export function shouldBootArmLiveCrypto(
+  settings: AccountSettings,
+  username: string,
+  env: NodeJS.ProcessEnv = process.env,
+): boolean {
+  if (!isLiveBrokerOperator(username, env)) return false;
+  if ((settings.mode ?? 'demo') !== 'live') return false;
+  const apiKey = (
+    settings.liveApiKeyCrypto?.trim()
+    || settings.liveApiKey?.trim()
+    || (env['COINBASE_API_KEY'] ?? '')
+    || ''
+  ).trim();
+  const apiSecret = (
+    settings.liveApiSecretCrypto?.trim()
+    || settings.liveApiSecret?.trim()
+    || (env['COINBASE_API_SECRET'] ?? '')
+    || ''
+  ).trim();
+  return apiKey.length > 0 && apiSecret.length > 0;
+}
+
 function buildTradierLiveEquityClient(
   settings: AccountSettings,
   username: string | undefined,

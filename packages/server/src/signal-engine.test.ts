@@ -14,7 +14,7 @@ import { fetchDailyCandles, fetchTradierDailyCandles } from './yahoo-feed.js';
 import { tmpdir } from 'os';
 import { join } from 'path';
 import { rmSync, writeFileSync } from 'fs';
-import { SignalEngine, sizeLiveEquityFromStop, shortBlockedOnCashAccount, isOccOptionSymbol, gateSignalOnReview, describeGatedStrategies, shouldBootArmLiveEquity, shouldRunRelativeValueScan, shouldRunOtmScan, isLiveBrokerOperator, resolveLiveBrokerOperator, activeOptionsDailyLimit, activeEquityDailyLimit, _resetSharedShadowForTests, _sharedShadowRefreshDue, _claimSharedShadowRefresh, _endSharedShadowRefresh, _sharedShadowEvalDue, _claimSharedShadowEval } from './signal-engine.js';
+import { SignalEngine, sizeLiveEquityFromStop, shortBlockedOnCashAccount, isOccOptionSymbol, gateSignalOnReview, describeGatedStrategies, shouldBootArmLiveEquity, shouldBootArmLiveCrypto, shouldRunRelativeValueScan, shouldRunOtmScan, isLiveBrokerOperator, resolveLiveBrokerOperator, activeOptionsDailyLimit, activeEquityDailyLimit, _resetSharedShadowForTests, _sharedShadowRefreshDue, _claimSharedShadowRefresh, _endSharedShadowRefresh, _sharedShadowEvalDue, _claimSharedShadowEval } from './signal-engine.js';
 import { setShadowLedgerFileForTests } from './shadow-signal-ledger.js';
 import {
   setReversalShadowLedgerFileForTests,
@@ -4163,6 +4163,55 @@ describe('shouldBootArmLiveEquity — TRA-713 persistent live-equity boot-arm', 
   it('respects an explicit liveTradeEquitiesTradier:false opt-out', () => {
     const s = { ...prodSettings(), liveTradeEquitiesTradier: false };
     expect(shouldBootArmLiveEquity(s, PIN, prodEnv())).toBe(false);
+  });
+});
+
+describe('shouldBootArmLiveCrypto — TRA-1340 persistent live-crypto boot-arm', () => {
+  const PIN = 'admin';
+  // A live, broker-attached operator snapshot: Live mode + per-user Coinbase creds.
+  const liveSettings = (): AccountSettings => ({
+    ...DEFAULT_ACCOUNT_SETTINGS,
+    mode: 'live',
+    liveApiKeyCrypto: 'cb-key',
+    liveApiSecretCrypto: 'cb-secret',
+  });
+  const env = (over: Record<string, string> = {}): NodeJS.ProcessEnv => ({
+    LIVE_EQUITY_BOOT_USER: PIN,
+    ...over,
+  });
+
+  it('arms the pinned operator in Live mode with per-user Coinbase creds', () => {
+    expect(shouldBootArmLiveCrypto(liveSettings(), PIN, env())).toBe(true);
+  });
+
+  it('arms via shared COINBASE_* env fallback when per-user creds are blank', () => {
+    const s = { ...liveSettings(), liveApiKeyCrypto: '', liveApiSecretCrypto: '' };
+    expect(
+      shouldBootArmLiveCrypto(s, PIN, env({ COINBASE_API_KEY: 'env-key', COINBASE_API_SECRET: 'env-secret' })),
+    ).toBe(true);
+  });
+
+  it('never arms a non-pinned user (shared Coinbase account blast-radius guard)', () => {
+    expect(shouldBootArmLiveCrypto(liveSettings(), 'someone-else', env())).toBe(false);
+  });
+
+  it('refuses to arm when the operator is not in Live mode', () => {
+    const s = { ...liveSettings(), mode: 'demo' as const };
+    expect(shouldBootArmLiveCrypto(s, PIN, env())).toBe(false);
+  });
+
+  it('refuses to arm when no Coinbase creds resolve anywhere (no naked live arm)', () => {
+    const s = { ...liveSettings(), liveApiKeyCrypto: '', liveApiSecretCrypto: '' };
+    expect(shouldBootArmLiveCrypto(s, PIN, env())).toBe(false);
+  });
+
+  it('TRA-716: unset pin ⇒ falls back to committed default "admin" and arms', () => {
+    const e = env(); delete e['LIVE_EQUITY_BOOT_USER'];
+    expect(shouldBootArmLiveCrypto(liveSettings(), 'admin', e)).toBe(true);
+  });
+
+  it('TRA-716: explicitly empty pin ⇒ disarms (clear-this-value kill-switch)', () => {
+    expect(shouldBootArmLiveCrypto(liveSettings(), PIN, env({ LIVE_EQUITY_BOOT_USER: '' }))).toBe(false);
   });
 });
 

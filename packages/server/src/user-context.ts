@@ -3,7 +3,7 @@ import { existsSync } from 'fs';
 import { join, dirname } from 'path';
 import { fileURLToPath } from 'url';
 
-import { SignalEngine, shouldBootArmLiveEquity } from './signal-engine.js';
+import { SignalEngine, shouldBootArmLiveEquity, shouldBootArmLiveCrypto } from './signal-engine.js';
 import { CryptoSignalEngine } from './crypto-engine.js';
 import { PnlTracker } from './pnl-tracker.js';
 import type { RelativeValueScannerService } from './relative-value-scanner.js';
@@ -694,6 +694,36 @@ async function createUserContext(username: string): Promise<UserContext> {
       });
     } catch (err: unknown) {
       log.warn('TRA-713 boot-arm: failed to persist forced live mode (engine still boots Live in-memory)', {
+        username,
+        reason: err instanceof Error ? err.message : String(err),
+      });
+    }
+  }
+
+  // TRA-1340 — persistent live-crypto DCA boot-arm (scoped, default-OFF,
+  // board-ratified: issue-thread interaction 4caaa410 answered YES to overriding
+  // TRA-314 and enabling live Coinbase crypto auto-trading; the TRA-532 promotion
+  // gate is satisfied). Mirrors the TRA-713 equity boot-arm above: because
+  // `cryptoAutoTradingEnabledLive` is a persisted per-account setting that only an
+  // admin-authenticated settings PUT / crypto-start POST can flip — neither
+  // reachable on a redeploy-only deployment — persist the approved flag at boot for
+  // the single pinned operator so a plain `git push` activates it. Runs AFTER the
+  // equity boot-arm so `settings.mode` is already `live` for the operator. Gated on
+  // Live mode + resolvable Coinbase creds (`shouldBootArmLiveCrypto`), so it arms
+  // nothing fleet-wide and never arms with no broker attached. Per-trade risk gates
+  // (10% notional cap, EMA-200 trend gate, catastrophe stop, $1 Coinbase
+  // min-notional, funding) still apply — an unfunded sleeve places no order. No-op
+  // for every non-operator user.
+  if (settings.cryptoAutoTradingEnabledLive !== true && shouldBootArmLiveCrypto(settings, username)) {
+    settings.cryptoAutoTradingEnabledLive = true;
+    try {
+      await saveSettings(username, settings);
+      log.info('TRA-1340 boot-arm: enabled live crypto auto-trading at boot for operator', {
+        username,
+        mode: settings.mode,
+      });
+    } catch (err: unknown) {
+      log.warn('TRA-1340 boot-arm: failed to persist live crypto flag (engine still arms live in-memory)', {
         username,
         reason: err instanceof Error ? err.message : String(err),
       });

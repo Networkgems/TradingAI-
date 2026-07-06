@@ -155,6 +155,7 @@ import { createToken, verifyToken, generateResetToken, consumeResetToken, initRe
 import { initStateDb, getStateDb } from './sqlite.js'; // TRA-1052 — durable hot-state SQLite store
 import { checkThrottle, recordFailure, recordSuccess } from './auth-throttle.js';
 import { getSettings, loadSettings, mergeScopedRiskSettings, saveSettings } from './account-settings.js';
+import { resolveLiveBrokerOperator } from './signal-engine.js';
 import {
   initNotificationDispatcher,
   emitAlert,
@@ -4583,6 +4584,50 @@ app.get('/api/health/market-review', async (_req, res) => {
       reason: err instanceof Error ? err.message : String(err),
     });
     res.status(500).json({ error: 'Failed to compute market regime' });
+  }
+});
+
+// TRA-1340 — PUBLIC, tokenless read-only probe confirming whether the pinned
+// operator's LIVE Coinbase crypto auto-trading flag is armed. Same non-sensitive
+// class as the other open `/api/health/*` probes: booleans only (presence, never
+// key values or balances), so the board/desk and the TRA-1304 canary monitor can
+// confirm the board-approved `cryptoAutoTradingEnabledLive` flip took effect on
+// bqb1 WITHOUT admin creds (login + pre-minted token both 401 on Render's separate
+// user store). `liveCryptoActive` mirrors promotion-service's live-crypto
+// predicate (`mode === 'live' && cryptoAutoTradingEnabledLive === true`). Reports
+// the operator resolved from `LIVE_EQUITY_BOOT_USER` (default "admin", TRA-716).
+app.get('/api/health/crypto-live', async (_req, res) => {
+  try {
+    const operator = resolveLiveBrokerOperator();
+    const settings = await loadSettings(operator);
+    const mode = settings.mode === 'live' ? 'live' : 'demo';
+    const liveCryptoAutoTradingEnabled = settings.cryptoAutoTradingEnabledLive === true;
+    const brokerConfigured =
+      (settings.liveApiKeyCrypto?.trim()
+        || settings.liveApiKey?.trim()
+        || process.env['COINBASE_API_KEY']
+        || '').trim().length > 0
+      && (settings.liveApiSecretCrypto?.trim()
+        || settings.liveApiSecret?.trim()
+        || process.env['COINBASE_API_SECRET']
+        || '').trim().length > 0;
+    res.json({
+      ok: true,
+      issue: 'TRA-1340',
+      time: new Date().toISOString(),
+      build: resolveBuildInfo(),
+      operator,
+      mode,
+      liveCryptoActive: mode === 'live' && liveCryptoAutoTradingEnabled,
+      liveCryptoAutoTradingEnabled,
+      liveCryptoBrokerConfigured: brokerConfigured,
+      bootArmPinConfigured: (process.env['LIVE_EQUITY_BOOT_USER'] ?? '').trim().length > 0,
+    });
+  } catch (err) {
+    log.error('crypto-live health probe failed', {
+      reason: err instanceof Error ? err.message : String(err),
+    });
+    res.status(500).json({ ok: false, error: 'Failed to read crypto-live status' });
   }
 });
 
