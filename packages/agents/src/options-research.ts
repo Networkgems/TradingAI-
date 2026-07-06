@@ -20,14 +20,25 @@ import { DAY_TRADING_GUARDRAIL, type OptionType } from '@trading-app/shared';
 import { completeJson, type CompleteJsonResult, type LlmClient, type LlmMessage } from './llm-client.js';
 
 /**
- * The capped-loss strategies the pass is allowed to emit. Anything outside this
- * allowlist (naked/short single legs, short straddles/strangles, ratio spreads)
- * is rejected by the guardrail — the whole product is defined-risk only.
+ * The capped-loss strategies. Anything outside this allowlist (naked/short single
+ * legs, short straddles/strangles, ratio spreads) is rejected by the guardrail —
+ * the whole product is defined-risk only.
+ *
+ * Two ways a strategy can be capped-loss:
+ *   (a) defined by an offsetting long option / net debit (the long-premium and
+ *       spread families — what the LLM ideas pass may EMIT), and
+ *   (b) TRA-1322 — defined by COLLATERAL: cash-secured / stock-covered short
+ *       legs. These are covered, NOT naked, and are managed by the put-write
+ *       sleeve; they are classified defined-risk here but are NOT surfaced as
+ *       LLM ideas (see `COVERED_STRATEGIES` / the ideas-feed gate below).
+ *
  *   • long_call / long_put — debit, max loss = premium paid.
  *   • bull_call_spread / bear_put_spread — debit vertical, max loss = net debit.
  *   • bull_put_spread / bear_call_spread — credit vertical, max loss = width − credit.
  *   • iron_condor / iron_butterfly — two credit verticals, max loss = wing width − credit.
  *   • call_calendar / put_calendar — debit calendar, max loss = net debit.
+ *   • cash_secured_put — short put, fully cash-collateralized; max loss = (strike − credit) × 100.
+ *   • covered_call — short call against owned/assigned stock; the stock covers assignment.
  */
 export type DefinedRiskStrategy =
   | 'long_call'
@@ -39,9 +50,24 @@ export type DefinedRiskStrategy =
   | 'iron_condor'
   | 'iron_butterfly'
   | 'call_calendar'
-  | 'put_calendar';
+  | 'put_calendar'
+  | CoveredStrategy;
 
-export const DEFINED_RISK_STRATEGIES: ReadonlySet<string> = new Set<DefinedRiskStrategy>([
+/**
+ * TRA-1322 — the wheel / put-write sleeve's collateral-covered short legs. These
+ * are defined-risk by construction (cash-secured put: cash held against the
+ * strike; covered call: stock held against assignment) — the "not naked"
+ * distinction item 5 requires. They are sleeve-managed, not LLM-emittable.
+ */
+export type CoveredStrategy = 'cash_secured_put' | 'covered_call';
+
+export const COVERED_STRATEGIES: ReadonlySet<string> = new Set<CoveredStrategy>([
+  'cash_secured_put',
+  'covered_call',
+]);
+
+/** The long-premium / spread families the LLM ideas pass is allowed to EMIT. */
+export const LLM_EMITTABLE_STRATEGIES: ReadonlySet<string> = new Set<Exclude<DefinedRiskStrategy, CoveredStrategy>>([
   'long_call',
   'long_put',
   'bull_call_spread',
@@ -53,6 +79,22 @@ export const DEFINED_RISK_STRATEGIES: ReadonlySet<string> = new Set<DefinedRiskS
   'call_calendar',
   'put_calendar',
 ]);
+
+/**
+ * Every defined-risk strategy has a finite, known max loss by construction —
+ * whether by an offsetting long leg (the emittable families) or by collateral
+ * (the covered families). This is the classifier item 5 asks to "treat the
+ * CSP + covered-call pair as defined-risk".
+ */
+export const DEFINED_RISK_STRATEGIES: ReadonlySet<string> = new Set<string>([
+  ...LLM_EMITTABLE_STRATEGIES,
+  ...COVERED_STRATEGIES,
+]);
+
+/** True for collateral-covered short legs (cash-secured put / covered call). */
+export function isCoveredStrategy(strategy: string): strategy is CoveredStrategy {
+  return COVERED_STRATEGIES.has(strategy);
+}
 
 /** Every defined-risk strategy has a finite, known max loss by construction. */
 export function isDefinedRiskStrategy(strategy: string): strategy is DefinedRiskStrategy {
@@ -552,6 +594,14 @@ function enforceGuardrail(
     if (!universe.has(ticker)) reasons.push(`ticker ${ticker} not in universe`);
     if (guardrail.definedRiskOnly && !isDefinedRiskStrategy(r.strategy)) {
       reasons.push(`strategy "${r.strategy}" is not defined-risk`);
+    }
+    // TRA-1322 — covered structures (cash_secured_put / covered_call) are
+    // defined-risk by collateral but are managed by the put-write sleeve, not
+    // surfaced as LLM ideas. Keep the ideas feed to the long-premium/spread
+    // families so widening the defined-risk classifier can't leak a short leg
+    // into the (paper-only) ideas → paper-enter path.
+    else if (guardrail.definedRiskOnly && isCoveredStrategy(r.strategy)) {
+      reasons.push(`strategy "${r.strategy}" is sleeve-managed, not an LLM idea`);
     }
     if (r.dteDays < guardrail.minDteDays) {
       reasons.push(`dteDays ${r.dteDays} < minDteDays ${guardrail.minDteDays} (day-trade guardrail)`);

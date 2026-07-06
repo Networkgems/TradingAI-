@@ -13,11 +13,21 @@
 // "What-If" preview); the thesis/POP/ranking carry the model's actual reasoning.
 import type {
   DefinedRiskStrategy,
+  CoveredStrategy,
   OptionsResearchResult,
   OptionsResearchInput,
   OptionsResearchSymbol,
   OptionsScannerCandidate,
 } from '@trading-app/agents';
+import { isCoveredStrategy } from '@trading-app/agents';
+
+/**
+ * The long-premium / spread families the ideas feed models and displays. The
+ * TRA-1322 covered families (cash_secured_put / covered_call) are defined-risk
+ * but sleeve-managed — they are gated out of the ideas pass, never reach this
+ * module, and so are excluded from its structure/display maps.
+ */
+type EmittableStrategy = Exclude<DefinedRiskStrategy, CoveredStrategy>;
 import type { OptionChainRow } from '@trading-app/engine';
 import { evaluateMultiLegPreTrade, DEFAULT_MAX_LOSS_PCT_CAP } from '@trading-app/engine';
 import type { DayTradingGuardrailConfig } from '@trading-app/shared';
@@ -96,7 +106,7 @@ export interface OptionsIdeasFeed {
 }
 
 /** Engine strategy id → human display string the panel renders. */
-export const STRATEGY_DISPLAY: Record<DefinedRiskStrategy, string> = {
+export const STRATEGY_DISPLAY: Record<EmittableStrategy, string> = {
   long_call: 'Long Call',
   long_put: 'Long Put',
   bull_call_spread: 'Bull Call Spread',
@@ -266,7 +276,7 @@ const r2 = (v: number): number => Math.round(v * 100) / 100;
  * max and the same 2×-debit sketch.
  */
 export function modelStructure(
-  strategy: DefinedRiskStrategy,
+  strategy: EmittableStrategy,
   anchor: OptionsScannerCandidate,
   spot: number,
   rows: readonly OptionChainRow[],
@@ -496,6 +506,12 @@ export function buildOptionsIdeasFeed(args: BuildFeedArgs): BuiltFeed {
     const anchor = anchorCandidate(sym);
     if (!anchor) continue;
     const rows = rowsBySymbol.get(ticker) ?? [];
+
+    // TRA-1322 defensive belt-and-suspenders: covered legs are gated out of the
+    // ideas pass upstream and should never arrive here; if one ever did, skip it
+    // rather than model/display a sleeve-managed short leg. Also narrows
+    // idea.strategy to EmittableStrategy for the structure/display maps below.
+    if (isCoveredStrategy(idea.strategy)) continue;
 
     const structure = modelStructure(idea.strategy, anchor, sym.spot, rows, idea.maxLossUsd);
     const id = `live-${ticker.toLowerCase()}-${idea.strategy}-${idea.rank}`;

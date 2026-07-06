@@ -10,6 +10,8 @@ import {
   optionsResearchBatchKey,
   validateOptionsIdeaBatch,
   isDefinedRiskStrategy,
+  isCoveredStrategy,
+  LLM_EMITTABLE_STRATEGIES,
   DEFAULT_OPTIONS_GUARDRAIL,
   type OptionsResearchInput,
   type OptionsResearchSymbol,
@@ -91,6 +93,25 @@ describe('isDefinedRiskStrategy', () => {
     expect(isDefinedRiskStrategy('naked_put')).toBe(false);
     expect(isDefinedRiskStrategy('short_strangle')).toBe(false);
   });
+
+  // TRA-1322 item 5 — the CSP + covered-call pair is defined-risk by COLLATERAL
+  // (covered, not naked). The classifier must treat both as defined-risk.
+  it('treats the wheel/put-write covered legs as defined-risk (not naked)', () => {
+    expect(isDefinedRiskStrategy('cash_secured_put')).toBe(true);
+    expect(isDefinedRiskStrategy('covered_call')).toBe(true);
+    expect(isCoveredStrategy('cash_secured_put')).toBe(true);
+    expect(isCoveredStrategy('covered_call')).toBe(true);
+    // ...but a genuinely naked short is still rejected.
+    expect(isCoveredStrategy('naked_put')).toBe(false);
+    expect(isDefinedRiskStrategy('naked_call')).toBe(false);
+  });
+
+  it('keeps covered legs out of the LLM-emittable allowlist', () => {
+    // covered structures are sleeve-managed, never proposed by the ideas pass
+    expect(LLM_EMITTABLE_STRATEGIES.has('cash_secured_put')).toBe(false);
+    expect(LLM_EMITTABLE_STRATEGIES.has('covered_call')).toBe(false);
+    expect(LLM_EMITTABLE_STRATEGIES.has('bull_put_spread')).toBe(true);
+  });
 });
 
 describe('runOptionsResearch', () => {
@@ -131,6 +152,29 @@ describe('runOptionsResearch', () => {
     expect(reasonBlob).toMatch(/not defined-risk/);
     expect(reasonBlob).toMatch(/day-trade guardrail/);
     expect(reasonBlob).toMatch(/not in universe/);
+  });
+
+  // TRA-1322 item 5 — covered legs are defined-risk but sleeve-managed: even
+  // though the classifier now admits them, the ideas pass must NOT surface a
+  // covered_call / cash_secured_put into the (paper-only) ideas → paper-enter
+  // path (PaperOptionsAccount can't book a short leg).
+  it('rejects covered legs from the LLM ideas feed even though they are defined-risk', async () => {
+    const llm = new StubLlmClient(() =>
+      JSON.stringify({
+        ideas: [
+          goodIdea(), // keep
+          goodIdea({ strategy: 'covered_call', dteDays: 45 }),
+          goodIdea({ strategy: 'cash_secured_put', dteDays: 45 }),
+        ],
+      }),
+    );
+    const out = await runOptionsResearch(input(), { llm });
+    expect(out.ideas).toHaveLength(1);
+    expect(out.ideas[0]!.strategy).toBe('bull_put_spread');
+    const reasonBlob = out.rejected.flatMap((r) => r.reasons).join(' ');
+    expect(reasonBlob).toMatch(/sleeve-managed/);
+    // and it was NOT rejected as "not defined-risk" — the classifier admits it
+    expect(reasonBlob).not.toMatch(/covered_call" is not defined-risk/);
   });
 
   // TRA-598 (C3) acceptance — a 0DTE idea must never be surfaced.

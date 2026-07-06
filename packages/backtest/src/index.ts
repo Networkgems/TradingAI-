@@ -263,3 +263,21 @@ export type {
   BuyHoldStat,
 } from './tra731-track-a.js';
 export { TRA731_UNIVERSE, lookbackWindow, fetchUniverse } from './run-tra731-fetch.js';
+
+// TRA-1322 — guarded covered-call recovery branch on the put-write sleeve (paper/backtest).
+export type {
+  PriceSeries,
+  WheelGuards,
+  WheelParams,
+  WheelCycle,
+  WheelRunResult,
+  WheelMetrics,
+} from './wheel-recovery.js';
+export {
+  runWheel,
+  metrics as wheelMetrics,
+  pickStrike as wheelPickStrike,
+  restrictUniverse,
+  WHEEL_FULL_UNIVERSE,
+  WHEEL_QUALITY_UNIVERSE,
+} from './wheel-recovery.js';

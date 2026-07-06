@@ -1,0 +1,246 @@
+{
+  "params": {
+    "universe": [
+      "AAPL",
+      "MSFT",
+      "NVDA",
+      "GOOGL",
+      "AMZN",
+      "META",
+      "TSLA",
+      "AMD",
+      "NFLX",
+      "ORCL",
+      "INTC",
+      "QCOM",
+      "AVGO",
+      "CRM",
+      "ADBE",
+      "PYPL",
+      "XYZ",
+      "SHOP",
+      "COIN",
+      "MSTR",
+      "SPY",
+      "QQQ",
+      "IWM",
+      "DIA",
+      "XLF"
+    ],
+    "period": [
+      "2023-06-01",
+      "2026-06-05"
+    ],
+    "riskFree": 0.045,
+    "slippagePerShare": 0.01,
+    "putDelta": 0.25,
+    "putDTE": 30,
+    "ccDelta": 0.3,
+    "ccDTE": 30,
+    "ccStrikeFloor": "cost_basis",
+    "putManage": "50% credit buyback, else accept assignment (no 2.5x stop)"
+  },
+  "byVrpFactor": {
+    "1": {
+      "n": 450,
+      "winRate": 0.98,
+      "avgRetColl": 0.008802904151884427,
+      "annRetColl": 0.11988102928109691,
+      "medRetColl": 0.008097782662312217,
+      "sharpe": 0.6353358279401109,
+      "pf": 2.413373993216298,
+      "maxDD": 0.9366410052344869,
+      "avgHold": 18.504444444444445,
+      "tpy": 13.618349945958927,
+      "worst": -0.5816766775435853,
+      "best": 0.36724970289469827,
+      "assignedCount": 47,
+      "calledAwayCount": 36,
+      "ccSold": 171,
+      "cyclesWithCC": 47,
+      "assignRate": 0.10444444444444445
+    },
+    "1.1": {
+      "n": 444,
+      "winRate": 0.9797297297297297,
+      "avgRetColl": 0.010783205576352373,
+      "annRetColl": 0.146226070237173,
+      "medRetColl": 0.008198575717340754,
+      "sharpe": 0.759752374438881,
+      "pf": 2.918740017851596,
+      "maxDD": 0.920022184367381,
+      "avgHold": 18.583333333333332,
+      "tpy": 13.560538116591928,
+      "worst": -0.5667958434925238,
+      "best": 0.4189042705184648,
+      "assignedCount": 45,
+      "calledAwayCount": 34,
+      "ccSold": 171,
+      "cyclesWithCC": 45,
+      "assignRate": 0.10135135135135136
+    },
+    "1.2": {
+      "n": 433,
+      "winRate": 0.9838337182448037,
+      "avgRetColl": 0.014916102326692606,
+      "annRetColl": 0.2092012109870682,
+      "medRetColl": 0.009142623165520966,
+      "sharpe": 1.1089075616786,
+      "pf": 4.22892896159784,
+      "maxDD": 0.8121264352796523,
+      "avgHold": 17.967667436489606,
+      "tpy": 14.025192802056557,
+      "worst": -0.5510883043748521,
+      "best": 0.457037374163496,
+      "assignedCount": 43,
+      "calledAwayCount": 34,
+      "ccSold": 161,
+      "cyclesWithCC": 43,
+      "assignRate": 0.09930715935334873
+    }
+  },
+  "byYear_f110": {
+    "2024": {
+      "n": 188,
+      "winRate": 1,
+      "sumRetColl": 2.4902911002871493
+    },
+    "2025": {
+      "n": 185,
+      "winRate": 1,
+      "sumRetColl": 3.495332197242778
+    },
+    "2026": {
+      "n": 71,
+      "winRate": 0.8732394366197183,
+      "sumRetColl": -1.1978800216294672
+    }
+  },
+  "byName_f110": {
+    "PYPL": {
+      "n": 14,
+      "winRate": 0.9285714285714286,
+      "sumRetColl": -0.316471030933713
+    },
+    "COIN": {
+      "n": 11,
+      "winRate": 0.9090909090909091,
+      "sumRetColl": -0.12521006991441147
+    },
+    "NFLX": {
+      "n": 19,
+      "winRate": 0.9473684210526315,
+      "sumRetColl": -0.055161377486276975
+    },
+    "MSTR": {
+      "n": 16,
+      "winRate": 0.9375,
+      "sumRetColl": -0.049426464522996705
+    },
+    "ADBE": {
+      "n": 1,
+      "winRate": 1,
+      "sumRetColl": 0.0036681855241063946
+    },
+    "MSFT": {
+      "n": 12,
+      "winRate": 0.9166666666666666,
+      "sumRetColl": 0.04077473182832708
+    },
+    "AMD": {
+      "n": 5,
+      "winRate": 1,
+      "sumRetColl": 0.1212287845945491
+    },
+    "QCOM": {
+      "n": 15,
+      "winRate": 1,
+      "sumRetColl": 0.16953017156287528
+    },
+    "CRM": {
+      "n": 3,
+      "winRate": 1,
+      "sumRetColl": 0.16998894717204022
+    },
+    "ORCL": {
+      "n": 13,
+      "winRate": 0.9230769230769231,
+      "sumRetColl": 0.17112325286465374
+    },
+    "XYZ": {
+      "n": 9,
+      "winRate": 1,
+      "sumRetColl": 0.20527390451718852
+    },
+    "XLF": {
+      "n": 21,
+      "winRate": 0.9523809523809523,
+      "sumRetColl": 0.21250031964074217
+    },
+    "QQQ": {
+      "n": 34,
+      "winRate": 1,
+      "sumRetColl": 0.21908413634715349
+    },
+    "AAPL": {
+      "n": 15,
+      "winRate": 1,
+      "sumRetColl": 0.2214715371873664
+    },
+    "DIA": {
+      "n": 39,
+      "winRate": 1,
+      "sumRetColl": 0.22230078666262582
+    },
+    "INTC": {
+      "n": 5,
+      "winRate": 1,
+      "sumRetColl": 0.22943243363513072
+    },
+    "SPY": {
+      "n": 35,
+      "winRate": 1,
+      "sumRetColl": 0.2295495113132017
+    },
+    "GOOGL": {
+      "n": 19,
+      "winRate": 1,
+      "sumRetColl": 0.23070731498088592
+    },
+    "META": {
+      "n": 17,
+      "winRate": 0.9411764705882353,
+      "sumRetColl": 0.28042723727730395
+    },
+    "IWM": {
+      "n": 32,
+      "winRate": 1,
+      "sumRetColl": 0.3280176180130592
+    },
+    "AMZN": {
+      "n": 27,
+      "winRate": 1,
+      "sumRetColl": 0.40376551608743977
+    },
+    "TSLA": {
+      "n": 9,
+      "winRate": 1,
+      "sumRetColl": 0.4158002867318763
+    },
+    "SHOP": {
+      "n": 16,
+      "winRate": 0.9375,
+      "sumRetColl": 0.42172319704016314
+    },
+    "NVDA": {
+      "n": 32,
+      "winRate": 1,
+      "sumRetColl": 0.4865597313675232
+    },
+    "AVGO": {
+      "n": 25,
+      "winRate": 1,
+      "sumRetColl": 0.5510846144096445
+    }
+  }
+}
