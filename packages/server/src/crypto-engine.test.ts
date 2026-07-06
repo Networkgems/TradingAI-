@@ -167,6 +167,17 @@ async function freshFundedLiveAccount(usd = '100000'): Promise<{
   return { account, coinbase };
 }
 
+// The FakeCoinbaseClient types placeMarketOrder with no args (`() => Promise`),
+// so `mock.calls[0]` is a 0-length tuple under strict tsc; cast to read the
+// actual placed order the engine sent (productId / side / baseSize).
+function firstPlacedOrder(coinbase: FakeCoinbaseClient): { productId: string; side: string; baseSize: number } {
+  const calls = coinbase.placeMarketOrder.mock.calls as unknown as Array<
+    [{ productId: string; side: string; baseSize: number }]
+  >;
+  if (calls.length === 0) throw new Error('test: placeMarketOrder was never called');
+  return calls[0][0];
+}
+
 describe('CryptoLiveAccount.openPosition — TRA-1304 canary notional clamp', () => {
   it('clamps the entry order to the absolute per-symbol notional ceiling when supplied', async () => {
     const { account, coinbase } = await freshFundedLiveAccount();
@@ -177,7 +188,7 @@ describe('CryptoLiveAccount.openPosition — TRA-1304 canary notional clamp', ()
     // Canary ceiling = $25. sizeMultiplier=1, cap=25.
     const opened = await account.openPosition(buildSignal(), 60_000, 'coinbase', 1, 25);
     expect(opened).not.toBeNull();
-    const placed = coinbase.placeMarketOrder.mock.calls[0][0];
+    const placed = firstPlacedOrder(coinbase);
     const placedNotional = placed.baseSize * 60_000;
     // The clamp binds near the ceiling (within one quantization step), not to zero.
     expect(placedNotional).toBeLessThanOrEqual(25 * 1.01);
@@ -192,7 +203,7 @@ describe('CryptoLiveAccount.openPosition — TRA-1304 canary notional clamp', ()
     );
     const opened = await account.openPosition(buildSignal(), 60_000);
     expect(opened).not.toBeNull();
-    const placed = coinbase.placeMarketOrder.mock.calls[0][0];
+    const placed = firstPlacedOrder(coinbase);
     // Risk-sized entry is far above the $25 canary ceiling — proving the clamp is
     // opt-in and the ratified path is unchanged when no cap is passed.
     expect(placed.baseSize * 60_000).toBeGreaterThan(25);
