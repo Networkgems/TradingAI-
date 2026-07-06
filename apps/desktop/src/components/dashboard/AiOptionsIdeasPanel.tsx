@@ -23,7 +23,7 @@
 // HealthPanel / PromotionGatePanel / VersionChip) rather than imported from
 // @trading-app/shared, to avoid colliding with C4's in-flight ownership of the
 // server-side shape. C4 should implement against the shape documented here.
-import { useEffect, useMemo, useState } from 'react';
+import { useEffect, useMemo, useRef, useState } from 'react';
 import { HTTP_URL } from '../../server-url';
 import { logger } from '../../lib/logger';
 import { fmt, fmtDollar } from '../../lib/format';
@@ -277,6 +277,12 @@ function PayoffPreview({ idea }: { idea: OptionsIdea }) {
   const padX = 6;
   const padY = 8;
 
+  // TRA-1349 — the live feed is trusted to send `breakevens`, but a defined-risk
+  // idea with an unusual/legless shape could arrive with it absent or empty.
+  // Normalise defensively so a bad idea can't throw during render and blank the
+  // whole tab (which read to the user as the tab being "stuck").
+  const breakevens = Array.isArray(idea.breakevens) ? idea.breakevens : [];
+
   const maxLoss = Math.max(1, idea.maxLossUsd);
   const maxProfit = Math.max(1, idea.maxProfitUsd);
 
@@ -293,10 +299,13 @@ function PayoffPreview({ idea }: { idea: OptionsIdea }) {
   // breakeven(s) and underlying so the kink lands inside the frame.
   const anchors = [
     ...(idea.underlyingPrice != null ? [idea.underlyingPrice] : []),
-    ...idea.breakevens,
+    ...breakevens,
   ];
-  const lo = Math.min(...anchors) * 0.94;
-  const hi = Math.max(...anchors) * 1.06;
+  // Fall back to a sane frame when the idea carries no price anchors at all, so
+  // Math.min([]) === Infinity can't poison the coordinate math into NaN.
+  const base = anchors.length ? anchors : [idea.underlyingPrice ?? 100];
+  const lo = Math.min(...base) * 0.94;
+  const hi = Math.max(...base) * 1.06;
   const span = Math.max(1e-6, hi - lo);
   const xFor = (price: number) => padX + ((price - lo) / span) * (W - 2 * padX);
 
@@ -304,7 +313,7 @@ function PayoffPreview({ idea }: { idea: OptionsIdea }) {
   // monotonic ramp from one cap to the other; two-breakeven (condors) is a
   // tent: floor → peak between the breakevens → floor.
   const points = useMemo(() => {
-    const bes = [...idea.breakevens].sort((a, b) => a - b);
+    const bes = [...breakevens].sort((a, b) => a - b);
     const isCredit = idea.netUsd >= 0;
     if (bes.length >= 2) {
       // Range strategy: profit between the breakevens, loss outside.
@@ -347,14 +356,14 @@ function PayoffPreview({ idea }: { idea: OptionsIdea }) {
         {/* payoff curve */}
         <polyline points={poly} fill="none" stroke="var(--accent, #60a5fa)" strokeWidth={2} strokeLinejoin="round" />
         {/* breakeven markers */}
-        {idea.breakevens.map((be) => (
+        {breakevens.map((be) => (
           <circle key={be} cx={xFor(be)} cy={zeroY} r={2.5} fill="var(--accent, #60a5fa)" />
         ))}
       </svg>
       <div style={{ display: 'flex', justifyContent: 'space-between', gap: '0.5rem', fontSize: '0.68rem', color: 'var(--muted)', whiteSpace: 'nowrap' }}>
         <span className="green" title="Defined maximum profit">Max +{fmtDollar(idea.maxProfitUsd)}</span>
         <span title="Underlying break-even price(s)">
-          B/E {idea.breakevens.map((b) => `$${fmt(b)}`).join(' / ')}
+          B/E {breakevens.map((b) => `$${fmt(b)}`).join(' / ')}
         </span>
         <span className="red" title="Defined maximum loss — your risk is capped at this">Max −{fmtDollar(idea.maxLossUsd)}</span>
       </div>
@@ -631,29 +640,69 @@ function AnthropicKeySetup({ token, onSaved }: { token: string; onSaved: () => v
 
 // ── Panel ────────────────────────────────────────────────────────────────────
 const POLL_MS = 60_000;
+// TRA-1349 — the feed is built server-side with a live LLM pass on a cold cache,
+// and Render's free dyno can cold-start; a plain `fetch` has no timeout, so a
+// slow/stalled request left the panel on the spinner forever ("stuck on Loading
+// AI options ideas…"). Bound every request so a stall becomes an explicit,
+// retryable error state instead of an infinite spinner.
+const FETCH_TIMEOUT_MS = 25_000;
 
 export function AiOptionsIdeasPanel({ token }: { token: string }) {
   const [feed, setFeed] = useState<OptionsIdeasFeed | null>(null);
   const [loading, setLoading] = useState(true);
+  // TRA-1349 — a first-class error state. Previously EVERY failure (non-ok,
+  // network, parse, stall) silently fell back to the illustrative PREVIEW feed,
+  // so a real backend problem was indistinguishable from the pre-C4 preview and,
+  // when the request simply hung, `loading` never cleared at all. We now: keep
+  // the preview fallback ONLY for a true 404 (endpoint genuinely absent), and
+  // surface anything else as an error with a Retry button — never an endless
+  // spinner. Transient poll failures that arrive AFTER we already have a good
+  // feed are logged and ignored (the last good feed stays on screen).
+  const [error, setError] = useState<string | null>(null);
   const [entering, setEntering] = useState<Record<string, boolean>>({});
   const [toast, setToast] = useState<string | null>(null);
   // TRA-714 — bump to force an immediate ideas re-fetch after the user saves or
   // removes their console API key, so the banner clears without waiting a poll.
+  // Also drives the TRA-1349 "Retry" button.
   const [reloadTick, setReloadTick] = useState(0);
+  // Mirror `feed` in a ref so the polling loop can tell "initial load" from "a
+  // refresh poll" without re-subscribing the interval every time the feed
+  // updates (which is what adding `feed` to the effect deps would do).
+  const feedRef = useRef<OptionsIdeasFeed | null>(null);
+  useEffect(() => {
+    feedRef.current = feed;
+  }, [feed]);
 
   useEffect(() => {
     let cancelled = false;
     async function load() {
+      // A failing poll must not blow away a feed we already have on screen.
+      const hasFeed = feedRef.current != null;
+      const controller = new AbortController();
+      const timer = setTimeout(() => controller.abort(), FETCH_TIMEOUT_MS);
       try {
         const r = await fetch(`${HTTP_URL}/api/options/ideas`, {
           headers: { Authorization: `Bearer ${token}` },
+          signal: controller.signal,
         });
         if (!r.ok) {
-          // Endpoint not deployed yet (404 until C4) → fall back to preview.
-          if (!cancelled) {
+          if (cancelled) return;
+          // Endpoint not deployed yet (404 → C4 not shipped) is the ONE case we
+          // still soften into the illustrative preview. Any other status is a
+          // real failure the user should see, not a spinner or a fake preview.
+          if (r.status === 404) {
             setFeed(PREVIEW_FEED);
-            setLoading(false);
+            setError(null);
+          } else if (!hasFeed) {
+            setError(
+              r.status === 401
+                ? 'Your session has expired. Sign in again to load AI options ideas.'
+                : `The AI options ideas service returned an error (HTTP ${r.status}).`,
+            );
+          } else {
+            logger.warn('options-ideas', `poll returned HTTP ${r.status}; keeping last feed`);
           }
+          setLoading(false);
           return;
         }
         const data = (await r.json()) as OptionsIdeasFeed;
@@ -668,13 +717,24 @@ export function AiOptionsIdeasPanel({ token }: { token: string }) {
             ? { ...data, source: 'live' }
             : { ...PREVIEW_FEED, source: data.source ?? 'preview', note: data.note },
         );
+        setError(null);
         setLoading(false);
       } catch (err) {
-        logger.warn('options-ideas', 'ideas fetch failed; showing preview', err);
-        if (!cancelled) {
-          setFeed(PREVIEW_FEED);
-          setLoading(false);
+        if (cancelled) return;
+        const aborted = err instanceof DOMException && err.name === 'AbortError';
+        logger.warn('options-ideas', aborted ? 'ideas fetch timed out' : 'ideas fetch failed', err);
+        // Only surface an error screen on the INITIAL load; a transient poll
+        // failure keeps the last good feed rather than yanking it away.
+        if (!hasFeed) {
+          setError(
+            aborted
+              ? 'The AI options ideas service took too long to respond. Check your connection and retry.'
+              : 'Could not reach the AI options ideas service. Check your connection and retry.',
+          );
         }
+        setLoading(false);
+      } finally {
+        clearTimeout(timer);
       }
     }
     load();
@@ -723,11 +783,43 @@ export function AiOptionsIdeasPanel({ token }: { token: string }) {
     }
   }
 
-  if (loading) {
+  function retry() {
+    setError(null);
+    setLoading(true);
+    setReloadTick((t) => t + 1);
+  }
+
+  if (loading && feed == null) {
     return (
       <div className="loading">
         <div className="spinner" />
         <p>Loading AI options ideas…</p>
+      </div>
+    );
+  }
+
+  // TRA-1349 — a real fetch failure now lands here (never an endless spinner and
+  // never a silent illustrative preview): show what went wrong and a Retry.
+  if (error && feed == null) {
+    return (
+      <div className="positions-panel" style={{ display: 'flex', flexDirection: 'column', gap: '1rem' }}>
+        <div
+          className="empty"
+          role="alert"
+          style={{
+            borderColor: 'var(--danger, #d64545)',
+            display: 'flex',
+            flexDirection: 'column',
+            gap: '0.75rem',
+            alignItems: 'flex-start',
+          }}
+        >
+          <strong>Couldn’t load AI options ideas</strong>
+          <span style={{ color: 'var(--muted)' }}>{error}</span>
+          <button className="btn-primary" onClick={retry}>
+            Retry
+          </button>
+        </div>
       </div>
     );
   }
