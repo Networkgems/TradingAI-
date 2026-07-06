@@ -506,6 +506,21 @@ export function modelStructure(
 // ── coherence guard (TRA-1360) ───────────────────────────────────────────────
 
 /**
+ * TRA-1366 — the minimum cost ratio (`maxLoss / (maxLoss + maxProfit)` =
+ * `debit / width`) a DEBIT vertical carrying a > 0.5 POP must clear to be
+ * coherent. The cost ratio is the breakeven win-rate the structure prices in:
+ * paying a tiny fraction of the width (a deep-OTM long leg) implies a near-zero
+ * win rate, so a reported POP above a coin-flip is internally contradictory. A
+ * deep-OTM debit spread whose per-lot loss rounds to a few dollars is then scaled
+ * by the TRA-1356 cap-sizing into hundreds of lots and an absurd max-profit
+ * display (live 2026-07-06T18:07Z: bear put buy 175P / sell 170P vs spot 416 —
+ * ~$2/lot loss, ~$498/lot profit, 250 lots, POP 0.75). 0.25 cleanly separates a
+ * legitimate at/OTM directional debit (cost ratio ~0.4) from the deep-OTM
+ * lottery (cost ratio < 0.05).
+ */
+export const MIN_DEBIT_COST_RATIO = 0.25;
+
+/**
  * TRA-1360 — reject a modeled idea whose reported POP is inconsistent with where
  * its legs actually sit versus spot. The canonical failure (live 2026-07-06) was
  * a deep-ITM MSFT bear call (sell 270C / buy 275C, spot 386) rendered with
@@ -556,7 +571,19 @@ export function ideaPopPlacementCoherent(
   if (!isDebitVertical) return true;
   const legItm = (l: IdeaLeg): boolean => (l.optionType === 'call' ? l.strike < spot : l.strike > spot);
   const allLegsItm = structure.legs.length >= 2 && structure.legs.every(legItm);
-  return !allLegsItm;
+  if (allLegsItm) return false;
+  // TRA-1366 — the mirror-image defect: a deep-OTM debit vertical. The TRA-1363
+  // clamp keeps the long leg out of the ITM side but does not bound how far OTM a
+  // mispricing anchor can land, so a long leg far below/above spot (live bear put
+  // 175P/170P vs spot 416) renders a near-worthless spread — tiny debit, ~full
+  // width of "profit" — that the reported POP > 0.5 contradicts and the TRA-1356
+  // cap-sizing amplifies into a hundreds-of-lots, six-figure-max-profit card.
+  // Reject on the structure's own arithmetic: paying under MIN_DEBIT_COST_RATIO of
+  // the width for a better-than-coin-flip claim is a free-money inconsistency.
+  const denom = structure.maxLossUsd + structure.maxProfitUsd;
+  const costRatio = denom > 0 ? structure.maxLossUsd / denom : 1;
+  if (pop > 0.5 && costRatio < MIN_DEBIT_COST_RATIO) return false;
+  return true;
 }
 
 // ── thesis reconciliation (TRA-1363) ─────────────────────────────────────────

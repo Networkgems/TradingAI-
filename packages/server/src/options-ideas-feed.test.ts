@@ -285,6 +285,40 @@ describe('ideaPopPlacementCoherent (TRA-1360)', () => {
     // buy 195C / sell 200C at spot 196.9 → long ITM, short OTM; a legitimate higher-POP spread.
     expect(ideaPopPlacementCoherent('bull_call_spread', debitFor({ optionType: 'call', strike: 195 }), 196.9, 0.55)).toBe(true);
   });
+
+  // TRA-1366 — the mirror-image defect: a DEEP-OTM debit vertical. The long leg
+  // sits far OTM (a mispricing anchor the TRA-1363 clamp doesn't bound), so the
+  // spread is near-worthless: a few dollars of debit for ~full-width "profit". A
+  // reported POP > 0.5 contradicts that ~zero-probability payoff, and the TRA-1356
+  // sizing amplifies it into a hundreds-of-lots six-figure card.
+  const deepOtmDebit = (long: { optionType: 'call' | 'put'; strike: number }) => ({
+    legs: [
+      { action: 'buy' as const, ...long, expiration: EXP },
+      {
+        action: 'sell' as const,
+        optionType: long.optionType,
+        strike: long.optionType === 'call' ? long.strike + 5 : long.strike - 5,
+        expiration: EXP,
+      },
+    ],
+    breakevens: [long.strike],
+    maxLossUsd: 2, // ~$2/lot debit on a $5-wide spread → cost ratio 0.004
+    maxProfitUsd: 498,
+    netUsd: -2,
+    priced: true,
+  });
+
+  it('rejects a deep-OTM debit vertical carrying a > 0.5 POP (the live bear-put defect)', () => {
+    // buy 175P / sell 170P at spot 416 → deep OTM; $2 loss vs $498 profit is a
+    // ~zero-POP lottery, so POP 0.75 is incoherent.
+    expect(ideaPopPlacementCoherent('bear_put_spread', deepOtmDebit({ optionType: 'put', strike: 175 }), 416, 0.75)).toBe(false);
+    expect(ideaPopPlacementCoherent('bull_call_spread', deepOtmDebit({ optionType: 'call', strike: 650 }), 416, 0.7)).toBe(false);
+  });
+
+  it('accepts a deep-OTM debit vertical when its POP is honestly low (<= 0.5)', () => {
+    // A far-OTM lottery is coherent iff the card reports a low POP to match.
+    expect(ideaPopPlacementCoherent('bear_put_spread', deepOtmDebit({ optionType: 'put', strike: 175 }), 416, 0.1)).toBe(true);
+  });
 });
 
 describe('reconcileThesis (TRA-1363)', () => {
@@ -481,6 +515,39 @@ describe('buildOptionsIdeasFeed', () => {
       rowsBySymbol: itmOnly,
       guardrail: DAY_TRADING_GUARDRAIL,
       generatedAt: 1,
+    });
+    expect(feed.ideas).toHaveLength(0);
+    expect(intents.size).toBe(0);
+  });
+
+  // TRA-1366 — end-to-end deep-OTM debit coherence. A mispricing anchor far OTM
+  // (bear put long 175P vs spot 416, the live 2026-07-06T18:07Z shape) models a
+  // near-worthless spread — ~$2/lot debit for ~full-width "profit" — which the
+  // TRA-1356 cap-sizing would blow up into a hundreds-of-lots six-figure card.
+  // The guard drops it on cost-ratio-vs-POP: no idea, no intent.
+  it('drops an incoherent deep-OTM debit spread (cost ratio contradicts POP)', () => {
+    const otmSym: OptionsResearchSymbol = {
+      ...sym,
+      spot: 416,
+      candidates: [candidate({ optionSymbol: 'X260717P00175000', strike: 175, optionType: 'put', mispricingPct: 0.6 })],
+    };
+    const otmInput: OptionsResearchInput = { asOf: input.asOf, symbols: [otmSym] };
+    const otmResearch: OptionsResearchResult = {
+      ...research,
+      ideas: [{ ...research.ideas[0]!, ticker: 'MSFT', strategy: 'bear_put_spread', pop: 0.75 }],
+    };
+    // Deep-OTM put strikes only (spot 416): the long 175P prices at pennies, so the
+    // debit rounds to a few dollars vs a ~full-width $498 "profit" — cost ratio ~0.
+    const otmPuts = new Map<string, OptionChainRow[]>([
+      ['MSFT', [putRow(170, 0.01, 0.03), putRow(175, 0.03, 0.05)]],
+    ]);
+    const { feed, intents } = buildOptionsIdeasFeed({
+      research: otmResearch,
+      input: otmInput,
+      rowsBySymbol: otmPuts,
+      guardrail: DAY_TRADING_GUARDRAIL,
+      generatedAt: 1,
+      accountEquityUsd: 25_000,
     });
     expect(feed.ideas).toHaveLength(0);
     expect(intents.size).toBe(0);
