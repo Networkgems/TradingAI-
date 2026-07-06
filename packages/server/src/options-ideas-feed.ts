@@ -594,6 +594,24 @@ export function sizeSpreadContractsToCap(maxLossPerLotUsd: number, capUsd: numbe
   return Math.max(1, Math.floor(capUsd / maxLossPerLotUsd));
 }
 
+/**
+ * TRA-1361 — minimum notional for a single-leg long-option (debit) idea,
+ * expressed as a fraction of the per-trade risk cap. Unlike a defined-risk
+ * spread, a single-leg long is deliberately NOT upsized toward the cap
+ * ({@link sizeSpreadContractsToCap} only scales multi-leg lots): long premium is
+ * a low-POP / high-theta bet, so scaling it up just multiplies expected decay.
+ * The real failure mode is the opposite — a trivially-thin long debit (e.g. a
+ * $6.50 max loss against a $500 cap ≈ 1.3%) sits below the actionable noise
+ * floor and clutters the feed without moving the P&L needle. Any single-leg long
+ * whose debit (its max loss) is below this fraction of the cap is suppressed.
+ */
+export const MIN_LONG_NOTIONAL_PCT_OF_CAP = 0.15;
+
+/** The single-leg long-debit strategies the {@link MIN_LONG_NOTIONAL_PCT_OF_CAP} floor applies to. */
+function isSingleLegLong(strategy: EmittableStrategy): boolean {
+  return strategy === 'long_call' || strategy === 'long_put';
+}
+
 /** The C3 "no day trading" status block, surfaced verbatim to the panel. */
 export function noDayTradingBlock(guardrail: DayTradingGuardrailConfig): OptionsIdeasFeed['noDayTrading'] {
   return {
@@ -656,13 +674,28 @@ export function buildOptionsIdeasFeed(args: BuildFeedArgs): BuiltFeed {
     // only when we have an account equity to measure the cap against. The lot
     // count rides on the view + intent so the entered position matches the card.
     const isMultiLeg = structure.legs.length >= 2;
+
+    // The per-trade risk cap (TRA-1348 governor) drives both the TRA-1361
+    // min-notional floor below and the TRA-1356 spread sizing; compute it once
+    // when we have an account equity to measure it against.
+    const capUsd = gateEnterability
+      ? maxLossCapUsd(accountEquityUsd as number, maxLossPctCap ?? DEFAULT_MAX_LOSS_PCT_CAP)
+      : undefined;
+
+    // TRA-1361 — minimum-notional display floor for single-leg long-option
+    // (debit) ideas. Drop any long call/put whose debit (its max loss) sits below
+    // MIN_LONG_NOTIONAL_PCT_OF_CAP of the per-trade cap: it's below the actionable
+    // noise floor and only clutters the feed. Do NOT resize it upward — long
+    // premium scaled to the cap just multiplies expected decay (see the constant
+    // doc). Registers no idea and no intent, so a sub-floor card never renders and
+    // can't be entered. Multi-leg spreads keep the TRA-1356 sizing behavior.
+    if (capUsd != null && isSingleLegLong(idea.strategy) && structure.maxLossUsd < capUsd * MIN_LONG_NOTIONAL_PCT_OF_CAP) {
+      continue;
+    }
+
     let contracts = 1;
     if (gateEnterability && isMultiLeg) {
-      const capUsd = maxLossCapUsd(
-        accountEquityUsd as number,
-        maxLossPctCap ?? DEFAULT_MAX_LOSS_PCT_CAP,
-      );
-      contracts = sizeSpreadContractsToCap(structure.maxLossUsd, capUsd);
+      contracts = sizeSpreadContractsToCap(structure.maxLossUsd, capUsd as number);
     }
     // Sized totals for display: per-lot × lot count. Per-lot figures on the
     // intent stay per-lot (the open path multiplies by the lot count itself).

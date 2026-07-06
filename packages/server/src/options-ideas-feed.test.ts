@@ -526,4 +526,86 @@ describe('buildOptionsIdeasFeed', () => {
       expect(feed.ideas[0]!.enterable).toBe(true);
     });
   });
+
+  // TRA-1361 — minimum-notional display floor for single-leg long-option (debit)
+  // ideas. sizeSpreadContractsToCap() only scales multi-leg spreads, so a
+  // single-leg long is deliberately never upsized (scaling low-POP/high-theta
+  // long premium toward the cap just multiplies expected decay). The failure mode
+  // is the opposite — a trivially-thin long debit clutters the feed without moving
+  // P&L — so any long below 15% of the per-trade cap is suppressed, not resized.
+  describe('single-leg long min-notional floor (TRA-1361)', () => {
+    const longResearch: OptionsResearchResult = {
+      ...research,
+      ideas: [{ ...research.ideas[0]!, strategy: 'long_put', pop: 0.4, maxLossUsd: 65 }],
+    };
+
+    it('suppresses a sub-floor long debit (max loss below 15% of the cap)', () => {
+      // $0.65 debit → $65 max loss = 13% of the $500 cap (25k book) < the $75 floor.
+      const thinRows = new Map<string, OptionChainRow[]>([
+        ['MSFT', [putRow(420, 0.64, 0.66)]], // mid 0.65 → $65 debit
+      ]);
+      const { feed, intents } = buildOptionsIdeasFeed({
+        research: longResearch,
+        input,
+        rowsBySymbol: thinRows,
+        guardrail: DAY_TRADING_GUARDRAIL,
+        generatedAt: 1,
+        accountEquityUsd: 25_000, // cap = $500 → floor = $75
+      });
+      // No idea, no intent — a sub-floor card never renders and can't be entered.
+      expect(feed.ideas).toHaveLength(0);
+      expect(intents.size).toBe(0);
+    });
+
+    it('keeps a long debit at or above the floor and never resizes it upward', () => {
+      // $1.50 debit → $150 max loss = 30% of the $500 cap ≥ the $75 floor.
+      const okRows = new Map<string, OptionChainRow[]>([
+        ['MSFT', [putRow(420, 1.49, 1.51)]], // mid 1.50 → $150 debit
+      ]);
+      const { feed, intents } = buildOptionsIdeasFeed({
+        research: longResearch,
+        input,
+        rowsBySymbol: okRows,
+        guardrail: DAY_TRADING_GUARDRAIL,
+        generatedAt: 1,
+        accountEquityUsd: 25_000,
+      });
+      expect(feed.ideas).toHaveLength(1);
+      const idea = feed.ideas[0]!;
+      expect(idea.strategy).toBe(STRATEGY_DISPLAY.long_put);
+      expect(idea.maxLossUsd).toBeCloseTo(150, 4); // NOT upsized toward the cap
+      expect(idea.contracts).toBeUndefined(); // single-leg longs are never sized
+      expect(intents.has(idea.id)).toBe(true);
+    });
+
+    it('never suppresses a single-leg long in a preview build (no account equity → no cap)', () => {
+      const thinRows = new Map<string, OptionChainRow[]>([
+        ['MSFT', [putRow(420, 0.64, 0.66)]], // $65 debit — sub-floor if gated
+      ]);
+      const { feed } = buildOptionsIdeasFeed({
+        research: longResearch,
+        input,
+        rowsBySymbol: thinRows,
+        guardrail: DAY_TRADING_GUARDRAIL,
+        generatedAt: 1,
+        // no accountEquityUsd → nothing to measure the floor against
+      });
+      expect(feed.ideas).toHaveLength(1);
+    });
+
+    it('does not apply the long floor to a defined-risk spread (multi-leg exempt)', () => {
+      // The multi-leg bull put spread is governed by TRA-1356 sizing, never the
+      // long floor: it surfaces and carries a sized lot count even on a small book.
+      const { feed } = buildOptionsIdeasFeed({
+        research,
+        input,
+        rowsBySymbol,
+        guardrail: DAY_TRADING_GUARDRAIL,
+        generatedAt: 1,
+        accountEquityUsd: 25_000, // cap $500; per-lot $380 → 1 lot, still surfaced
+      });
+      expect(feed.ideas).toHaveLength(1);
+      expect(feed.ideas[0]!.contracts).toBe(1); // sized path ran; floor never applied
+    });
+  });
 });
