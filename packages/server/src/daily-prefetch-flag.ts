@@ -24,6 +24,32 @@
 
 export const COLD_START_DAILY_PREFETCH_FLAG = 'ENABLE_COLD_START_DAILY_PREFETCH';
 export const COLD_START_DAILY_PREFETCH_PER_MIN_VAR = 'COLD_START_DAILY_PREFETCH_PER_MIN';
+export const COLD_START_DAILY_PREFETCH_BOOT_DELAY_MS_VAR = 'COLD_START_DAILY_PREFETCH_BOOT_DELAY_MS';
+
+/**
+ * TRA-1391 — how long after `start()` the boot warmer waits before its first
+ * fetch. Default 150s, deliberately just past the watchdog's 120s bootGrace
+ * window (see WATCHDOG_* in render.yaml).
+ *
+ * Root cause it addresses (bqb1 ~3-min health-check-timeout restart loop): the
+ * warmer previously fired the instant the engine began ticking, so on a cold
+ * cache its paced fetch fan-out ran CONCURRENTLY with the first (heaviest)
+ * ticks — two paced storms through one Coinbase pacer + two sets of in-flight
+ * `withTimeout` timers, exactly during the fragile boot window where the
+ * internal event-loop watchdog is muzzled (bootGrace) but Render's 5s HTTP
+ * probe is NOT. Any transient >5s loop stall there is an ungraceful Render
+ * restart, which re-cold-starts the cache and re-arms the same storm — the
+ * self-perpetuating TRA-1374 loop. Deferring the warmer until AFTER bootGrace
+ * lets the first ticks run alone and clear the window; if the warmer then does
+ * cause a stall, the now-armed watchdog converts it into a CLEAN self-restart
+ * instead of a probe timeout. The warmer still front-loads the same cache
+ * (feature unchanged), just ~2.5 min later.
+ */
+export const DEFAULT_PREFETCH_BOOT_DELAY_MS = 150_000;
+
+/** Hard ceiling on the boot delay so a fat-finger env can't defer the warmer
+ *  effectively forever (e.g. past a demo session). */
+export const MAX_PREFETCH_BOOT_DELAY_MS = 600_000;
 
 /**
  * Default per-minute fetch budget for the boot warmer when enabled. Chosen
@@ -59,6 +85,20 @@ export function resolveColdStartPrefetchPerMin(env: NodeJS.ProcessEnv = process.
   const n = typeof raw === 'string' ? Number(raw.trim()) : NaN;
   if (!Number.isFinite(n) || n <= 0) return DEFAULT_PREFETCH_PER_MIN;
   return Math.min(Math.floor(n), MAX_PREFETCH_PER_MIN);
+}
+
+/**
+ * TRA-1391 — resolve the boot warmer's start delay in ms. Falls back to
+ * {@link DEFAULT_PREFETCH_BOOT_DELAY_MS} when unset/invalid and is clamped to
+ * [0, {@link MAX_PREFETCH_BOOT_DELAY_MS}]. `0` restores the pre-TRA-1391
+ * fire-immediately behaviour (opt-in for ops during a controlled test).
+ */
+export function resolveColdStartPrefetchBootDelayMs(env: NodeJS.ProcessEnv = process.env): number {
+  const raw = env[COLD_START_DAILY_PREFETCH_BOOT_DELAY_MS_VAR];
+  if (typeof raw !== 'string' || raw.trim() === '') return DEFAULT_PREFETCH_BOOT_DELAY_MS;
+  const n = Number(raw.trim());
+  if (!Number.isFinite(n) || n < 0) return DEFAULT_PREFETCH_BOOT_DELAY_MS;
+  return Math.min(Math.floor(n), MAX_PREFETCH_BOOT_DELAY_MS);
 }
 
 // ── TRA-1059: last-run status for the boot warmer ────────────────────────────
