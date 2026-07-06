@@ -1,6 +1,6 @@
 import { randomUUID } from 'crypto';
 import type { TradierOpenOptionPosition, ExitState, ExposurePositionRisk } from '@trading-app/engine';
-import { evaluateMultiLegPreTrade, DEFAULT_MAX_LOSS_PCT_CAP, evaluateExit, DEFAULT_EXIT_PARAMS, chandelierStop, chandelierExitTriggered, profitLockDecision, takeProfitEarlyDecision } from '@trading-app/engine';
+import { evaluateMultiLegPreTrade, DEFAULT_MAX_LOSS_PCT_CAP, maxLossCapUsd, evaluateExit, DEFAULT_EXIT_PARAMS, chandelierStop, chandelierExitTriggered, profitLockDecision, takeProfitEarlyDecision } from '@trading-app/engine';
 import type { Side } from '@trading-app/engine';
 import type {
   AccountMode,
@@ -1483,12 +1483,14 @@ export class PaperOptionsAccount {
       /**
        * TRA-1145 — per-trade max-loss cap as a fraction of equity for the
        * pre-trade gate. Absent → the engine default ({@link DEFAULT_MAX_LOSS_PCT_CAP},
-       * 1%). The deterministic DEMO spread-routing paths pass the selector's own
-       * advisory `riskFraction` (2%) here so a single defined-risk vertical on a
+       * 2%, plus the TRA-1348 $500 absolute floor governor). The deterministic
+       * DEMO spread-routing paths may still pass the selector's own advisory
+       * `riskFraction` here; both the trim and the gate route it through the same
+       * {@link maxLossCapUsd} governor so a single defined-risk vertical on a
        * high-priced index ETF — whose one-ATR wing defines ~1.3% risk on the $25k
        * demo book — clears the gate and enters the OOS journal instead of being
        * silently rejected. The live-capital advisory→capital bridge omits it and
-       * keeps the strict 1% default.
+       * keeps the default governor.
        */
       maxLossPctCap?: number;
     },
@@ -1568,13 +1570,18 @@ export class PaperOptionsAccount {
     // down to the cap; a single lot that already busts the cap can't be trimmed
     // and is rejected below by the pre-trade gate.
     // TRA-1145 — honour the caller's `maxLossPctCap` override (the demo
-    // spread-routing paths pass the selector's 2% advisory) so the trim and the
-    // gate below agree on the same ceiling; default stays the strict 1%.
+    // spread-routing paths pass the selector's advisory) so the trim and the
+    // gate below agree on the same ceiling; default is the engine governor.
+    // TRA-1348 — the ceiling is now the governor `max(equity x cap,
+    // min($500, 5% x equity))`, not a flat pct, so the trim uses the SAME
+    // {@link maxLossCapUsd} the gate applies (the $500 floor lets a $25k demo
+    // book enter one standard $5-wide vertical instead of rejecting 100%).
     const maxLossPctCap =
       typeof params.maxLossPctCap === 'number' && params.maxLossPctCap > 0
         ? params.maxLossPctCap
         : DEFAULT_MAX_LOSS_PCT_CAP;
-    const capLots = Math.floor((this.equity * maxLossPctCap) / maxLossPerLot);
+    const capUsd = maxLossCapUsd(this.equity, maxLossPctCap);
+    const capLots = Math.floor(capUsd / maxLossPerLot);
     if (capLots >= 1 && contracts > capLots) contracts = capLots;
 
     let totalRisk = contracts * maxLossPerLot;
@@ -1589,11 +1596,12 @@ export class PaperOptionsAccount {
       totalRisk = contracts * maxLossPerLot;
     }
 
-    // TRA-912 — authoritative pre-trade gate (max-loss <=1% equity + buying
-    // power). `optionBuyingPower: null` because the paper book has no live hold
-    // to mirror; the cash reserve above is the binding constraint. The gate is
-    // the explicitly-tested artifact that rejects oversized orders (e.g. a
-    // single defined-risk lot whose max loss already exceeds 1% of equity).
+    // TRA-912 / TRA-1348 — authoritative pre-trade gate (max-loss <= governor
+    // ceiling + buying power). `optionBuyingPower: null` because the paper book
+    // has no live hold to mirror; the cash reserve above is the binding
+    // constraint. The gate is the explicitly-tested artifact that rejects
+    // oversized orders (e.g. a single defined-risk lot whose max loss already
+    // exceeds the per-trade governor ceiling of equity).
     const gate = evaluateMultiLegPreTrade({
       accountEquity: this.equity,
       optionBuyingPower: null,
@@ -1610,7 +1618,7 @@ export class PaperOptionsAccount {
         reason: gate.reason,
       });
       // TRA-1117 — the case the user actually hit: a single defined-risk lot
-      // whose max loss already busts the 1%-of-equity per-trade cap. Surface the
+      // whose max loss already busts the per-trade governor ceiling. Surface the
       // exact figures so "Paper entry" no longer fails with a mystery 409.
       return this.rejectEntry(
         `${gate.reason} — this defined-risk structure is too large for the per-trade risk budget on a $${this.equity.toFixed(0)} account`,

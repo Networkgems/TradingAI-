@@ -387,7 +387,10 @@ export type {
 } from './options/strategy-selector.js';
 export {
   evaluateMultiLegPreTrade,
+  maxLossCapUsd,
   DEFAULT_MAX_LOSS_PCT_CAP,
+  DEFAULT_MAX_LOSS_ABS_FLOOR,
+  DEFAULT_MAX_LOSS_FLOOR_EQUITY_FRAC,
 } from './options/multi-leg-gate.js';
 export type {
   MultiLegPreTradeInput,

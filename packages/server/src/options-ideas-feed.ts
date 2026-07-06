@@ -79,7 +79,8 @@ export interface OptionsIdeaView {
   priced?: boolean;
   /**
    * TRA-1121 (TRA-1118 "Flag" policy) — false when this idea's single-lot
-   * `maxLossUsd` busts the per-trade max-loss cap (`equity × maxLossPctCap`) and
+   * `maxLossUsd` busts the per-trade max-loss governor ceiling (TRA-1348:
+   * `max(equity × cap, min($500, 5% × equity))`) and
    * the open path would reject it. The panel keeps the card visible as research
    * but renders `Paper entry` disabled. Computed through the SAME TRA-912 gate
    * (`evaluateMultiLegPreTrade`) the paper-enter path uses, so the button's
@@ -90,7 +91,7 @@ export interface OptionsIdeaView {
   enterable?: boolean;
   /**
    * TRA-1121 — the gate's reject reason verbatim when `enterable === false`
-   * (e.g. `"max loss $2435.00 (9.74%) exceeds 1.00% cap $250.00"`), surfaced as
+   * (e.g. `"max loss $2435.00 (9.74%) exceeds per-trade cap $500.00"`), surfaced as
    * the disabled `Paper entry` tooltip. Absent when the idea is enterable.
    */
   entryBlockedReason?: string;
@@ -458,7 +459,8 @@ export interface BuildFeedArgs {
   accountEquityUsd?: number;
   /**
    * TRA-1121 — per-trade max-loss cap as a fraction of equity. Defaults to
-   * {@link DEFAULT_MAX_LOSS_PCT_CAP} (1%), matching the open-path gate default.
+   * {@link DEFAULT_MAX_LOSS_PCT_CAP} (2%), matching the open-path gate default.
+   * The TRA-1348 $500 absolute floor + 5%-equity clamp apply on top via the gate.
    */
   maxLossPctCap?: number;
 }

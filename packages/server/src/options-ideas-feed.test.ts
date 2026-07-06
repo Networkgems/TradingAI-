@@ -235,18 +235,19 @@ describe('buildOptionsIdeasFeed', () => {
     expect(feed.ideas).toHaveLength(0);
   });
 
-  // TRA-1121 (TRA-1118 "Flag" policy) — the modeled bull put spread above has a
-  // single-lot max loss of $380. At a $25k book (1% cap = $250) that busts the
-  // per-trade cap; at a $100k book (1% cap = $1000) it fits.
-  describe('enterability gate (TRA-1121)', () => {
-    it('flags an idea whose single-lot max loss busts the per-trade cap: enterable:false + reason + intent guarded', () => {
+  // TRA-1121 (TRA-1118 "Flag" policy) / TRA-1348 governor — the modeled bull put
+  // spread above has a single-lot max loss of $380. On a $6k book the 5% clamp
+  // caps the ceiling at $300 (< $380) so it busts; on a $25k+ book the default
+  // 2% cap / $500 floor governor admits it.
+  describe('enterability gate (TRA-1121 / TRA-1348)', () => {
+    it('flags an idea whose single-lot max loss busts the governor ceiling: enterable:false + reason + intent guarded', () => {
       const { feed, intents } = buildOptionsIdeasFeed({
         research,
         input,
         rowsBySymbol,
         guardrail: DAY_TRADING_GUARDRAIL,
         generatedAt: 1,
-        accountEquityUsd: 25_000, // 1% cap = $250 < $380 max loss
+        accountEquityUsd: 6_000, // 5% clamp -> $300 ceiling < $380 max loss
       });
       const idea = feed.ideas[0]!;
       expect(idea.maxLossUsd).toBeCloseTo(380, 4);
@@ -264,7 +265,7 @@ describe('buildOptionsIdeasFeed', () => {
         rowsBySymbol,
         guardrail: DAY_TRADING_GUARDRAIL,
         generatedAt: 1,
-        accountEquityUsd: 100_000, // 1% cap = $1000 > $380 max loss
+        accountEquityUsd: 100_000, // 2% cap = $2000 > $380 max loss
       });
       const idea = feed.ideas[0]!;
       expect(idea.enterable).toBe(true);
@@ -287,7 +288,7 @@ describe('buildOptionsIdeasFeed', () => {
     });
 
     it('feed enterability equals the gate result (one source of truth, no re-derived threshold)', () => {
-      const accountEquityUsd = 25_000;
+      const accountEquityUsd = 6_000; // 5% clamp -> $300 ceiling < $380 -> blocked
       const { feed } = buildOptionsIdeasFeed({
         research,
         input,
@@ -310,16 +311,31 @@ describe('buildOptionsIdeasFeed', () => {
       if (!verdict.allowed) expect(idea.entryBlockedReason).toBe(verdict.reason);
     });
 
-    it('honors a custom maxLossPctCap', () => {
-      // A 2% cap on $25k = $500 > $380 → now enterable.
+    it('the $500 absolute floor admits a standard lot on a mid-size book (TRA-1348)', () => {
+      // $15k book: 2% cap = $300 < $380 max loss, but the $500 absolute floor
+      // (min($500, 5%×$15k=$750) = $500) lifts the ceiling → enterable.
       const { feed } = buildOptionsIdeasFeed({
         research,
         input,
         rowsBySymbol,
         guardrail: DAY_TRADING_GUARDRAIL,
         generatedAt: 1,
-        accountEquityUsd: 25_000,
-        maxLossPctCap: 0.02,
+        accountEquityUsd: 15_000,
+      });
+      expect(feed.ideas[0]!.enterable).toBe(true);
+    });
+
+    it('honors a custom maxLossPctCap above the default', () => {
+      // $100k book, $380 lot. A tight 0.001 cap = $100; but the $500 floor still
+      // admits it. Raising the cap to 5% ($5000) keeps it enterable regardless.
+      const { feed } = buildOptionsIdeasFeed({
+        research,
+        input,
+        rowsBySymbol,
+        guardrail: DAY_TRADING_GUARDRAIL,
+        generatedAt: 1,
+        accountEquityUsd: 100_000,
+        maxLossPctCap: 0.05,
       });
       expect(feed.ideas[0]!.enterable).toBe(true);
     });

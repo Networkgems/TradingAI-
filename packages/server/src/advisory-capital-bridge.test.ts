@@ -188,9 +188,10 @@ describe('routeVettedIdeaToPaper — rejected by portfolio-Greeks gate', () => {
 });
 
 describe('routeVettedIdeaToPaper — executor declines for a non-portfolio reason', () => {
-  it('surfaces execution_rejected when the structure busts the TRA-912 1% per-trade gate', async () => {
-    // $1k equity → 1% cap = $10; a single $320 max-loss lot can't be trimmed
-    // below one and is refused by the executor's own pre-trade gate.
+  it('surfaces execution_rejected when the structure busts the per-trade gate', async () => {
+    // $1k equity → TRA-1348 governor = max(2%×1k=$20, min($500, 5%×1k=$50)) = $50;
+    // a single $320 max-loss lot can't be trimmed below one and is refused by the
+    // executor's own pre-trade gate.
     const acct = new PaperOptionsAccount({ initialEquity: 1_000, managedAccountRatio: 0.5 });
     const out = await routeVettedIdeaToPaper(idea(), acct, resolveSpot, ENABLED);
     expect(out.status).toBe('execution_rejected');

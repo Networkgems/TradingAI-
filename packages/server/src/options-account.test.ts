@@ -2679,57 +2679,60 @@ describe('PaperOptionsAccount.openDefinedRiskSpread', () => {
     expect(acct.getState().dailyOptionsCount).toBe(1);
   });
 
-  // TRA-912 (TRA-908 Phase B) — the pre-trade gate (buying-power + per-trade
-  // max-loss ≤ 1% of equity) rejects oversized orders BEFORE any cash is
-  // reserved or a daily slot consumed.
-  it('rejects an oversized spread whose single-lot max loss exceeds 1% of equity', () => {
-    // $1k equity → 1% cap = $10. A single $320 max-loss lot can't be trimmed
-    // below one lot and busts the cap, so the open is refused outright.
+  // TRA-912 (TRA-908 Phase B) / TRA-1348 — the pre-trade gate (buying-power +
+  // per-trade max-loss ≤ the governor ceiling) rejects oversized orders BEFORE
+  // any cash is reserved or a daily slot consumed.
+  it('rejects an oversized spread whose single-lot max loss exceeds the governor ceiling', () => {
+    // $1k equity → governor = max(2%×1k=$20, min($500, 5%×1k=$50)) = $50 (the
+    // 5% clamp binds on a tiny book). A single $320 max-loss lot can't be
+    // trimmed below one lot and busts the ceiling, so the open is refused.
     const acct = new PaperOptionsAccount({ initialEquity: 1_000, managedAccountRatio: 0.5 });
     const pos = acct.openDefinedRiskSpread(spreadParams());
     expect(pos).toBeNull();
     expect(acct.getState().optionsCash).toBe(1_000);
     expect(acct.getState().dailyOptionsCount).toBe(0);
-    // TRA-1117 — the reject now leaves a SPECIFIC, surfaceable reason (this is
-    // the exact case the QQQ bull-put-spread idea hit on the $25k demo book):
-    // the per-trade max-loss cap, not "market closed" or a mystery 409.
+    // TRA-1117 — the reject leaves a SPECIFIC, surfaceable reason: the
+    // per-trade max-loss cap, not "market closed" or a mystery 409.
     const reason = acct.takeLastEntryRejection();
-    expect(reason).toMatch(/exceeds 1\.00% cap/);
+    expect(reason).toMatch(/exceeds per-trade cap \$50\.00/);
     expect(reason).toMatch(/too large for the per-trade risk budget/);
     // "take" semantics — clear-on-read so it can't leak onto a later open.
     expect(acct.takeLastEntryRejection()).toBeNull();
   });
 
-  // TRA-1145 — the deterministic DEMO spread-routing paths pass the selector's
-  // own advisory riskFraction (2%) as `maxLossPctCap` so a single one-ATR-wing
-  // index-ETF vertical (the QQQ bull put live: $324 max loss = 1.30% of the $25k
-  // demo book) is ADMITTED to the OOS journal instead of silently rejected by
-  // the gate's strict 1% default. Without the override the same structure is
-  // rejected; with it, it opens.
-  it('admits a single-lot vertical over the 1% default when maxLossPctCap=2%', () => {
-    const params = spreadParams({ maxLossUsd: 324, netUsd: 76, maxProfitUsd: 76 });
-
-    // Strict 1% default on $25k → cap $250; $324 lot busts it → rejected.
-    const strict = new PaperOptionsAccount({ initialEquity: 25_000, managedAccountRatio: 0.5 });
-    expect(strict.openDefinedRiskSpread(params)).toBeNull();
-    expect(strict.takeLastEntryRejection()).toMatch(/exceeds 1\.00% cap/);
-
-    // Same book, same structure, with the selector's 2% advisory cap → admitted.
-    const relaxed = new PaperOptionsAccount({ initialEquity: 25_000, managedAccountRatio: 0.5 });
-    const pos = relaxed.openDefinedRiskSpread({ ...params, maxLossPctCap: 0.02 });
+  // TRA-1348 ACCEPTANCE — on the $25k demo book, a single $5-wide vertical
+  // (max loss ≤ $500) now clears the default governor (2% × $25k = $500) with
+  // NO per-call override, while a $10-wide spread (> $500) still correctly
+  // blocks. This is the exact case the QQQ bull-put-spread idea hit: 100% of
+  // ideas were returning enterable:false under the old flat 1% cap ($250).
+  it('admits a $5-wide vertical and blocks a $10-wide spread on the $25k demo book', () => {
+    // $5-wide vertical, $324 max loss ≤ $500 governor → admitted at the default.
+    const fits = new PaperOptionsAccount({ initialEquity: 25_000, managedAccountRatio: 0.5 });
+    const pos = fits.openDefinedRiskSpread(
+      spreadParams({ maxLossUsd: 324, netUsd: 76, maxProfitUsd: 76 }),
+    );
     expect(pos).not.toBeNull();
     expect(pos!.contracts).toBe(1);
     expect(pos!.maxLossUsd).toBe(324);
-    expect(relaxed.getState().optionsCash).toBe(24_676);
+    expect(fits.getState().optionsCash).toBe(24_676);
+
+    // $10-wide vertical, $620 max loss > $500 governor → still rejected.
+    const busts = new PaperOptionsAccount({ initialEquity: 25_000, managedAccountRatio: 0.5 });
+    expect(
+      busts.openDefinedRiskSpread(spreadParams({ maxLossUsd: 620, netUsd: 380, maxProfitUsd: 380 })),
+    ).toBeNull();
+    expect(busts.takeLastEntryRejection()).toMatch(/exceeds per-trade cap \$500\.00/);
   });
 
-  it('trims lots so reserved capital-at-risk stays inside the 1% cap', () => {
-    // $50k equity → 1% cap = $500. managed=1.0 → RV budget = $1,000, which
-    // would size a $180 max-loss lot to floor(1000/180)=5 lots. The cap
-    // (floor(500/180)=2) binds first → 2 lots, $360 reserved (still ≤ cap).
+  it('trims lots so reserved capital-at-risk stays inside the cap', () => {
+    // $50k equity, explicit 1% cap → governor = max(1%×50k=$500,
+    // min($500, 5%×50k=$2500)) = $500 (the floor doesn't bind here). managed=1.0
+    // → RV budget = $1,000, which would size a $180 max-loss lot to
+    // floor(1000/180)=5 lots. The cap (floor(500/180)=2) binds first → 2 lots,
+    // $360 reserved (still ≤ cap).
     const acct = new PaperOptionsAccount({ initialEquity: 50_000, managedAccountRatio: 1.0 });
     const pos = acct.openDefinedRiskSpread(
-      spreadParams({ maxLossUsd: 180, netUsd: 60, maxProfitUsd: 60 }),
+      spreadParams({ maxLossUsd: 180, netUsd: 60, maxProfitUsd: 60, maxLossPctCap: 0.01 }),
     );
     expect(pos).not.toBeNull();
     expect(pos!.contracts).toBe(2);
