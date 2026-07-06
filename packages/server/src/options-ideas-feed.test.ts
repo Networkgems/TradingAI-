@@ -654,6 +654,28 @@ describe('buildOptionsIdeasFeed', () => {
       expect(intent.contracts).toBe(5);
     });
 
+    // TRA-1367 — a priced:false structure is the thin-chain fallback (fabricated
+    // 1:1 payoff basis). It must never be enterable: no real fill basis exists, so
+    // entering would open a position on fabricated marks. Flagged non-enterable
+    // with a reason and no entry intent, exactly like a cap-busting idea.
+    it('flags a priced:false (thin-chain fallback) idea as non-enterable with no intent', () => {
+      // No chain rows for MSFT → modelStructure can't price the legs → priced:false.
+      const noRows = new Map<string, OptionChainRow[]>();
+      const { feed, intents } = buildOptionsIdeasFeed({
+        research,
+        input,
+        rowsBySymbol: noRows,
+        guardrail: DAY_TRADING_GUARDRAIL,
+        generatedAt: 1,
+        accountEquityUsd: 100_000, // gate active; $380 fallback loss is within the cap
+      });
+      const idea = feed.ideas[0]!;
+      expect(idea.priced).toBe(false);
+      expect(idea.enterable).toBe(false);
+      expect(idea.entryBlockedReason).toMatch(/could not be priced/i);
+      expect(intents.has(idea.id)).toBe(false);
+    });
+
     // TRA-1356 acceptance (b): a thin per-lot spread that would otherwise risk a
     // rounding error is scaled so its sized max loss clears 50% of the cap.
     it('scales a thin per-lot spread above 50% of the cap', () => {

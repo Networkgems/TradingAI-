@@ -859,18 +859,30 @@ export function buildOptionsIdeasFeed(args: BuildFeedArgs): BuiltFeed {
     let enterable = true;
     let entryBlockedReason: string | undefined;
     if (gateEnterability) {
-      const verdict = evaluateMultiLegPreTrade({
-        accountEquity: accountEquityUsd as number,
-        // The paper book has no live broker hold to mirror — same as the open
-        // path; the per-trade max-loss cap is the binding feed constraint.
-        optionBuyingPower: null,
-        maxLossPerLot: structure.maxLossUsd,
-        contracts,
-        ...(maxLossPctCap != null ? { maxLossPctCap } : {}),
-      });
-      if (!verdict.allowed) {
+      if (!structure.priced) {
+        // TRA-1367 — a priced:false structure is the thin-chain FALLBACK: its legs
+        // could not be priced off real chain marks, so the payoff is a fabricated
+        // 1:1 placeholder (netUsd = ±maxLoss), not a real fill basis. Such an idea
+        // must never be enterable — entering would open a position on a fabricated
+        // basis. Flag it non-enterable with a reason and register no intent (the
+        // `if (!enterable) continue` below), so the card renders as research but
+        // `Paper entry` is disabled and a direct POST 404s.
         enterable = false;
-        entryBlockedReason = verdict.reason;
+        entryBlockedReason = 'structure could not be priced off live chain marks — refresh the feed';
+      } else {
+        const verdict = evaluateMultiLegPreTrade({
+          accountEquity: accountEquityUsd as number,
+          // The paper book has no live broker hold to mirror — same as the open
+          // path; the per-trade max-loss cap is the binding feed constraint.
+          optionBuyingPower: null,
+          maxLossPerLot: structure.maxLossUsd,
+          contracts,
+          ...(maxLossPctCap != null ? { maxLossPctCap } : {}),
+        });
+        if (!verdict.allowed) {
+          enterable = false;
+          entryBlockedReason = verdict.reason;
+        }
       }
     }
 
