@@ -12,6 +12,7 @@ import {
   buildOptionsIdeasFeed,
   buildEventsForSymbol,
   modelStructure,
+  ideaPopPlacementCoherent,
   sizeSpreadContractsToCap,
   STRATEGY_DISPLAY,
 } from './options-ideas-feed.js';
@@ -120,6 +121,39 @@ describe('modelStructure', () => {
     expect(s.netUsd).toBeCloseTo(-300, 4);
   });
 
+  // TRA-1360 — the reported live defect: the scanner anchor is picked by
+  // |mispricing| across ALL of a symbol's candidates, so a bear call spread
+  // could snap its short call onto a deep-ITM anchor strike (270) far below spot
+  // (386), pricing an ITM spread as if it were the OTM one the thesis intended.
+  // The short leg must be pulled to the OTM side of spot so strikes/credit/
+  // breakeven are coherent with the reported (OTM, > 0.5 POP) idea.
+  it('places a credit bear-call short leg OTM even when the scanner anchor is deep ITM', () => {
+    const otmCalls: OptionChainRow[] = [
+      callRow(390, 5.9, 6.1), // mid 6.0 — first OTM above spot 386
+      callRow(395, 3.9, 4.1), // mid 4.0
+      callRow(400, 1.9, 2.1), // mid 2.0
+    ];
+    // Anchor is a deep-ITM call at 270 (spot 386) — the exact live mis-map.
+    const s = modelStructure('bear_call_spread', candidate({ strike: 270, optionType: 'call' }), 386, otmCalls, 999);
+    expect(s.legs).toEqual([
+      { action: 'sell', optionType: 'call', strike: 390, expiration: EXP }, // OTM, not 270
+      { action: 'buy', optionType: 'call', strike: 395, expiration: EXP },
+    ]);
+    // Short strike is strictly above spot — a coherent OTM credit spread.
+    expect(s.legs[0]!.strike).toBeGreaterThan(386);
+    // credit = 6.0 - 4.0 = 2.0 → net +200, maxProfit 200; width 5 → maxLoss 300.
+    expect(s.netUsd).toBeCloseTo(200, 4);
+    expect(s.maxLossUsd).toBeCloseTo(300, 4);
+    expect(s.breakevens).toEqual([392]); // 390 + 2
+    expect(s.priced).toBe(true);
+  });
+
+  it('honors an already-OTM bull-put anchor unchanged (short put stays below spot)', () => {
+    const s = modelStructure('bull_put_spread', candidate({ strike: 420, optionType: 'put' }), 430, rows, 999);
+    expect(s.legs[0]).toEqual({ action: 'sell', optionType: 'put', strike: 420, expiration: EXP });
+    expect(s.legs[0]!.strike).toBeLessThan(430);
+  });
+
   it('prices an iron condor by snapping long wings to the chain when the increment != median step', () => {
     // Put increments tighten in (5) but the long wing falls on an unlisted
     // arithmetic strike (425 - 5 = 420 not listed); call increments are uneven.
@@ -149,6 +183,43 @@ describe('modelStructure', () => {
     // width = max(442 - 435, 425 - 415) = 10 → maxLoss (10 - 4.5)*100 = 550
     expect(s.maxLossUsd).toBeCloseTo(550, 4);
     expect(s.breakevens).toEqual([420.5, 439.5]); // [425 - 4.5, 435 + 4.5]
+  });
+});
+
+describe('ideaPopPlacementCoherent (TRA-1360)', () => {
+  const structFor = (short: { optionType: 'call' | 'put'; strike: number }) => ({
+    legs: [
+      { action: 'sell' as const, ...short, expiration: EXP },
+      { action: 'buy' as const, optionType: short.optionType, strike: short.strike + 5, expiration: EXP },
+    ],
+    breakevens: [short.strike],
+    maxLossUsd: 300,
+    maxProfitUsd: 200,
+    netUsd: 200,
+    priced: true,
+  });
+
+  it('rejects a deep-ITM bear-call credit spread carrying a > 0.5 POP (the live defect)', () => {
+    // sell 270C with spot 386 is ~116 pts ITM → ~certain max loss; POP 0.72 is incoherent.
+    expect(ideaPopPlacementCoherent('bear_call_spread', structFor({ optionType: 'call', strike: 270 }), 386, 0.72)).toBe(false);
+  });
+
+  it('rejects an ITM bull-put credit spread carrying a > 0.5 POP', () => {
+    // sell 420P with spot 386 is ITM for a put → ~certain max loss.
+    expect(ideaPopPlacementCoherent('bull_put_spread', structFor({ optionType: 'put', strike: 420 }), 386, 0.72)).toBe(false);
+  });
+
+  it('accepts an OTM credit spread with a > 0.5 POP (coherent)', () => {
+    expect(ideaPopPlacementCoherent('bear_call_spread', structFor({ optionType: 'call', strike: 400 }), 386, 0.72)).toBe(true);
+    expect(ideaPopPlacementCoherent('bull_put_spread', structFor({ optionType: 'put', strike: 370 }), 386, 0.72)).toBe(true);
+  });
+
+  it('accepts an ITM-short credit spread when its POP is honestly low (<= 0.5)', () => {
+    expect(ideaPopPlacementCoherent('bear_call_spread', structFor({ optionType: 'call', strike: 270 }), 386, 0.2)).toBe(true);
+  });
+
+  it('does not gate debit verticals (not the reported defect)', () => {
+    expect(ideaPopPlacementCoherent('bull_call_spread', structFor({ optionType: 'call', strike: 270 }), 386, 0.9)).toBe(true);
   });
 });
 
@@ -249,6 +320,36 @@ describe('buildOptionsIdeasFeed', () => {
     expect(intent.maxLossUsd).toBe(idea.maxLossUsd);
     expect(intent.maxProfitUsd).toBe(idea.maxProfitUsd);
     expect(intent.breakevens).toEqual(idea.breakevens);
+  });
+
+  // TRA-1360 — end-to-end coherence guard. When the chain can only place the
+  // credit short leg ITM (no OTM strikes listed), the modeled deep-ITM bear call
+  // is incoherent with the LLM's POP 0.72, so the feed drops it entirely rather
+  // than rendering the live 270/275-vs-386 card. No idea, no intent.
+  it('drops an incoherent deep-ITM credit spread (POP contradicts strike placement)', () => {
+    const bearSym: OptionsResearchSymbol = {
+      ...sym,
+      spot: 386,
+      candidates: [candidate({ optionSymbol: 'MSFT260717C00270000', strike: 270, optionType: 'call', mispricingPct: 0.4 })],
+    };
+    const bearInput: OptionsResearchInput = { asOf: input.asOf, symbols: [bearSym] };
+    const bearResearch: OptionsResearchResult = {
+      ...research,
+      ideas: [{ ...research.ideas[0]!, strategy: 'bear_call_spread', pop: 0.72 }],
+    };
+    // Only deep-ITM call strikes are listed — no OTM strike to pull the short to.
+    const itmOnly = new Map<string, OptionChainRow[]>([
+      ['MSFT', [callRow(270, 116.9, 117.1), callRow(275, 111.9, 112.1)]],
+    ]);
+    const { feed, intents } = buildOptionsIdeasFeed({
+      research: bearResearch,
+      input: bearInput,
+      rowsBySymbol: itmOnly,
+      guardrail: DAY_TRADING_GUARDRAIL,
+      generatedAt: 1,
+    });
+    expect(feed.ideas).toHaveLength(0);
+    expect(intents.size).toBe(0);
   });
 
   it('drops ideas whose symbol has no anchor candidate', () => {

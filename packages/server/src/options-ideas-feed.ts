@@ -255,6 +255,25 @@ function nearestStrike(strikes: number[], target: number): number | null {
   return strikes.reduce((best, s) => (Math.abs(s - target) < Math.abs(best - target) ? s : best), strikes[0]!);
 }
 
+/**
+ * TRA-1360 — nearest chain strike to `target` that is NOT ITM for `ot`
+ * (put: strike ≤ spot; call: strike ≥ spot). Returns null when the chain has no
+ * such strike on that side, so the caller can fall back to the plain nearest
+ * strike. Used to keep a credit vertical's short leg off the ITM side of spot
+ * (where its reported POP/credit would be incoherent) while still honoring an
+ * ATM/OTM anchor unchanged. ATM (strike == spot) is treated as acceptable — the
+ * reported defect is a DEEP-ITM short leg, not a coin-flip ATM one.
+ */
+function nearestNonItmStrike(
+  strikes: number[],
+  ot: 'call' | 'put',
+  spot: number,
+  target: number,
+): number | null {
+  const nonItm = strikes.filter((s) => (ot === 'put' ? s <= spot : s >= spot));
+  return nearestStrike(nonItm, target);
+}
+
 function midAt(
   rows: readonly OptionChainRow[],
   optionType: 'call' | 'put',
@@ -387,7 +406,21 @@ export function modelStructure(
     case 'bear_call_spread': {
       const ot = strategy === 'bull_put_spread' ? 'put' : 'call';
       const strikes = ot === 'put' ? putStrikes : callStrikes;
-      const kShort = nearestStrike(strikes, anchor.strike) ?? anchor.strike;
+      // TRA-1360 — a credit vertical's SHORT leg must be OTM (put below spot,
+      // call above spot): the whole premise is that the underlying has to travel
+      // THROUGH the short strike to lose, which is exactly what a > 0.5 POP and a
+      // credit < width describe. The scanner anchor is picked by |mispricing|
+      // across ALL of a symbol's candidates, so it can land deep ITM or on the
+      // wrong side of spot (the live 2026-07-06 MSFT 270/275 deep-ITM bear call
+      // vs spot 386). Clamp the short-leg target to the OTM side of spot, then
+      // snap to the nearest strictly-OTM chain strike, so the rendered legs are
+      // coherent with the reported POP/credit instead of pricing an ITM spread
+      // as if it were OTM. An already-OTM anchor is honored unchanged.
+      const otmTarget = ot === 'put' ? Math.min(anchor.strike, spot) : Math.max(anchor.strike, spot);
+      const kShort =
+        nearestNonItmStrike(strikes, ot, spot, otmTarget) ??
+        nearestStrike(strikes, otmTarget) ??
+        anchor.strike;
       const kLong = ot === 'put' ? kShort - step : kShort + step;
       const shortMid = midAt(rows, ot, exp, kShort);
       const longMid = midAt(rows, ot, exp, kLong);
@@ -455,6 +488,46 @@ export function modelStructure(
       return fallback([leg('buy', ot, k)], [k]);
     }
   }
+}
+
+// ── coherence guard (TRA-1360) ───────────────────────────────────────────────
+
+/**
+ * TRA-1360 — reject a modeled idea whose reported POP is inconsistent with where
+ * its legs actually sit versus spot. The canonical failure (live 2026-07-06) was
+ * a deep-ITM MSFT bear call (sell 270C / buy 275C, spot 386) rendered with
+ * POP 0.72 and a near-full-width credit — numbers that describe a comfortably
+ * OTM spread, not the ITM legs shown.
+ *
+ * The invariant for a credit vertical: a > 0.5 POP is only possible when the
+ * SHORT leg is OTM, because the underlying must move THROUGH the short strike for
+ * the position to lose. A short leg at or through spot (call ≤ spot, put ≥ spot)
+ * is ~certain max loss, so a POP > 0.5 there is incoherent by construction.
+ * TRA-1360's strike-selection fix keeps credit shorts OTM, so this guard is
+ * defense-in-depth: any future path (thin chain, mis-mapped anchor) that still
+ * produces an ITM-short credit spread with a high POP is dropped, never rendered.
+ *
+ * Scoped to the two credit verticals (bull_put / bear_call). Debit verticals and
+ * the four-leg condor/butterfly straddle spot by construction and are not the
+ * reported defect; returning `true` for them avoids false drops.
+ */
+export function ideaPopPlacementCoherent(
+  strategy: EmittableStrategy,
+  structure: ModeledStructure,
+  spot: number,
+  pop: number,
+): boolean {
+  const isCreditVertical = strategy === 'bull_put_spread' || strategy === 'bear_call_spread';
+  if (!isCreditVertical) return true;
+  const short = structure.legs.find((l) => l.action === 'sell');
+  if (!short) return true;
+  // ITM short leg = the option already has intrinsic value (call strike < spot,
+  // put strike > spot). ATM (strike == spot) is treated as not-ITM, matching the
+  // strike-selection boundary — the reported defect is a DEEP-ITM short leg.
+  const shortItm = short.optionType === 'call' ? short.strike < spot : short.strike > spot;
+  // A credit spread with an ITM short leg is ~certain max loss; a POP above a
+  // coin-flip contradicts that placement.
+  return !shortItm || pop <= 0.5;
 }
 
 // ── feed assembly ─────────────────────────────────────────────────────────────
@@ -566,6 +639,14 @@ export function buildOptionsIdeasFeed(args: BuildFeedArgs): BuiltFeed {
     if (isCoveredStrategy(idea.strategy)) continue;
 
     const structure = modelStructure(idea.strategy, anchor, sym.spot, rows, idea.maxLossUsd);
+
+    // TRA-1360 — coherence guard: drop any idea whose reported POP contradicts
+    // where its modeled legs sit vs spot (a deep-ITM credit spread can't carry a
+    // > 0.5 POP). Registers no idea and no intent, so an incoherent card never
+    // renders and can't be entered. Belt-and-suspenders to the strike-selection
+    // fix above, which already keeps credit shorts OTM.
+    if (!ideaPopPlacementCoherent(idea.strategy, structure, sym.spot, idea.pop)) continue;
+
     const id = `live-${ticker.toLowerCase()}-${idea.strategy}-${idea.rank}`;
 
     // TRA-1356 — size defined-risk spreads toward the per-trade cap so an idea's
