@@ -775,6 +775,15 @@ export async function fetchCryptoDailyBars(symbol: string, count = 260): Promise
   }
 
   // Fallback: Yahoo Finance.
+  // TRA-1391 — skip the Yahoo daily fallback while the shared Yahoo breaker is
+  // open. On Render's egress IP Yahoo bulk-429s the crypto crumb, so at cold
+  // start every symbol in the ~500-name universe otherwise stampedes yf.chart
+  // and each pays a "Failed to get crumb" 429 — the per-symbol churn that (with
+  // the Coinbase egress timeouts) starves the event loop past Render's 5s health
+  // probe and drives the ~3-min restart loop (TRA-1374/TRA-1391). Returning []
+  // fast is the SAME empty result the 429 would yield, minus the loop-starving
+  // storm — and the trip below opens the breaker so the rest short-circuit here.
+  if (isYahooBreakerOpen()) return [];
   try {
     const fromDate = new Date(fromMs);
     const nowDate = new Date(now);
@@ -798,7 +807,13 @@ export async function fetchCryptoDailyBars(symbol: string, count = 260): Promise
       }))
       .slice(-count);
   } catch (err: unknown) {
-    console.error(`[crypto-feed] fetchCryptoDailyBars(${symbol}):`, err instanceof Error ? err.message : String(err));
+    const msg = err instanceof Error ? err.message : String(err);
+    // TRA-1391 — a 429/crumb failure means Yahoo has rate-limited this IP; trip
+    // the shared breaker so the remaining universe short-circuits at the guard
+    // above instead of each symbol re-hammering yf.chart (eager fan-out beats
+    // the breaker — same shape as the c76398a /stats fix).
+    if (isYahooRateLimitError(msg)) tripYahooBreakerFromExternal(`chart-1d(${symbol})`, msg);
+    else console.error(`[crypto-feed] fetchCryptoDailyBars(${symbol}):`, msg);
     return [];
   }
 }
@@ -907,6 +922,10 @@ export async function fetchCryptoMinuteBars(symbol: string, count = 60): Promise
   }
 
   // Fallback: Yahoo Finance.
+  // TRA-1391 — same breaker gate as fetchCryptoDailyBars: skip the futile
+  // yf.chart minute call while the shared Yahoo breaker is open so the cold-start
+  // universe can't stampede the crumb-429 path and starve the event loop.
+  if (isYahooBreakerOpen()) return [];
   try {
     const fromDate = new Date(fromMs);
     const nowDate = new Date(now);
@@ -931,7 +950,11 @@ export async function fetchCryptoMinuteBars(symbol: string, count = 60): Promise
       }))
       .slice(-count);
   } catch (err: unknown) {
-    console.error(`[crypto-feed] fetchCryptoMinuteBars(${symbol}):`, err instanceof Error ? err.message : String(err));
+    const msg = err instanceof Error ? err.message : String(err);
+    // TRA-1391 — trip the shared breaker on a 429/crumb so the rest of the
+    // universe short-circuits at the guard above.
+    if (isYahooRateLimitError(msg)) tripYahooBreakerFromExternal(`chart-1m(${symbol})`, msg);
+    else console.error(`[crypto-feed] fetchCryptoMinuteBars(${symbol}):`, msg);
     return [];
   }
 }
