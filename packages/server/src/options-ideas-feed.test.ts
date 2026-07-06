@@ -12,6 +12,7 @@ import {
   buildOptionsIdeasFeed,
   buildEventsForSymbol,
   modelStructure,
+  sizeSpreadContractsToCap,
   STRATEGY_DISPLAY,
 } from './options-ideas-feed.js';
 
@@ -151,6 +152,33 @@ describe('modelStructure', () => {
   });
 });
 
+describe('sizeSpreadContractsToCap (TRA-1356)', () => {
+  it('fills the largest whole-lot count that still fits under the cap', () => {
+    expect(sizeSpreadContractsToCap(18, 500)).toBe(27); // floor(500/18)
+    expect(sizeSpreadContractsToCap(232, 500)).toBe(2); // floor(500/232)
+    expect(sizeSpreadContractsToCap(498, 500)).toBe(1); // floor(500/498)
+  });
+
+  it('never returns below 1, even when a single lot already busts the cap', () => {
+    expect(sizeSpreadContractsToCap(568, 500)).toBe(1); // 1 lot > cap → gate flags it
+  });
+
+  it('every enterable fill lands above 50% of the cap', () => {
+    // For any per-lot loss <= cap, floor(cap/perLot)*perLot > cap/2.
+    for (const perLot of [10, 49, 130, 251, 300, 460, 499]) {
+      const lots = sizeSpreadContractsToCap(perLot, 500);
+      expect(lots * perLot).toBeGreaterThan(250);
+    }
+  });
+
+  it('guards non-finite / non-positive inputs to a single lot', () => {
+    expect(sizeSpreadContractsToCap(0, 500)).toBe(1);
+    expect(sizeSpreadContractsToCap(-5, 500)).toBe(1);
+    expect(sizeSpreadContractsToCap(NaN, 500)).toBe(1);
+    expect(sizeSpreadContractsToCap(100, 0)).toBe(1);
+  });
+});
+
 describe('buildOptionsIdeasFeed', () => {
   const sym: OptionsResearchSymbol = {
     symbol: 'MSFT',
@@ -271,6 +299,63 @@ describe('buildOptionsIdeasFeed', () => {
       expect(idea.enterable).toBe(true);
       expect(idea.entryBlockedReason).toBeUndefined();
       expect(intents.has(idea.id)).toBe(true);
+    });
+
+    // TRA-1356 — the spread is sized toward the per-trade cap so its displayed
+    // max loss targets a consistent fraction of the risk budget instead of a
+    // single trivially-thin lot. $380/lot vs a $2000 cap (2% of $100k) → 5 lots
+    // ($1900), the largest count that still fits under the governor ceiling.
+    it('sizes a defined-risk spread toward the per-trade cap (contracts + sized totals)', () => {
+      const { feed, intents } = buildOptionsIdeasFeed({
+        research,
+        input,
+        rowsBySymbol,
+        guardrail: DAY_TRADING_GUARDRAIL,
+        generatedAt: 1,
+        accountEquityUsd: 100_000, // cap = max(2%*100k, min(500, 5%*100k)) = $2000
+      });
+      const idea = feed.ideas[0]!;
+      expect(idea.contracts).toBe(5); // floor(2000 / 380)
+      // Displayed dollar figures are the SIZED totals (per-lot × contracts).
+      expect(idea.maxLossUsd).toBeCloseTo(1900, 4); // 380 * 5
+      expect(idea.maxProfitUsd).toBeCloseTo(600, 4); // 120 * 5
+      expect(idea.netUsd).toBeCloseTo(600, 4); // +120 credit * 5
+      expect(idea.enterable).toBe(true);
+      // The sized position stays under the cap (5*380=1900 <= 2000).
+      expect(idea.maxLossUsd).toBeLessThanOrEqual(2000);
+      // The intent keeps PER-LOT payoff (the open path multiplies by contracts)
+      // and carries the sized lot count so entry matches the card.
+      const intent = intents.get(idea.id)!;
+      expect(intent.maxLossUsd).toBeCloseTo(380, 4);
+      expect(intent.contracts).toBe(5);
+    });
+
+    // TRA-1356 acceptance (b): a thin per-lot spread that would otherwise risk a
+    // rounding error is scaled so its sized max loss clears 50% of the cap.
+    it('scales a thin per-lot spread above 50% of the cap', () => {
+      // Thin 1-wide credit spread (~$82/lot max loss); cap $500 on a $25k book →
+      // floor(500/82)=6 lots → ~$492 (98% of cap), well above the 50% floor a
+      // single trivially-thin lot would miss. The median strike step is 1 here so
+      // the modeled width stays thin.
+      const thinRows = new Map<string, OptionChainRow[]>([
+        ['MSFT', [putRow(419, 4.02, 4.04), putRow(420, 4.2, 4.22)]],
+      ]);
+      const thinSym: OptionsResearchSymbol = { ...sym, spot: 420 };
+      const thinInput: OptionsResearchInput = { asOf: input.asOf, symbols: [thinSym] };
+      const { feed } = buildOptionsIdeasFeed({
+        research,
+        input: thinInput,
+        rowsBySymbol: thinRows,
+        guardrail: DAY_TRADING_GUARDRAIL,
+        generatedAt: 1,
+        accountEquityUsd: 25_000, // cap = max(500, min(500,1250)) = $500
+      });
+      const idea = feed.ideas[0]!;
+      expect(idea.enterable).toBe(true);
+      // Sized max loss must clear 50% of the $500 cap and never exceed it.
+      expect(idea.maxLossUsd).toBeGreaterThanOrEqual(250);
+      expect(idea.maxLossUsd).toBeLessThanOrEqual(500);
+      expect(idea.contracts).toBeGreaterThan(1);
     });
 
     it('omits enterable for back-compat when no account equity is threaded', () => {

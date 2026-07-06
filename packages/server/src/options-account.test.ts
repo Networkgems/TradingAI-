@@ -2740,6 +2740,37 @@ describe('PaperOptionsAccount.openDefinedRiskSpread', () => {
     expect(acct.getState().optionsCash).toBe(49_640);
   });
 
+  // TRA-1356 — the AI-ideas feed sizes a spread toward the per-trade cap and
+  // passes the chosen lot count as `targetContracts`; the open path enters that
+  // count (instead of the legacy RV-budget floor-divide) so the paper position
+  // matches the sized max loss shown on the card.
+  it('enters the caller-supplied targetContracts instead of the RV-budget count', () => {
+    // $50k equity, managed 0.5 → RV budget = $500 → legacy would size a $100
+    // max-loss lot to floor(500/100)=5 lots. targetContracts=8 (≤ cap-lots 10,
+    // since the $1,000 governor / $100 = 10) is honored → 8 lots, $800 reserved.
+    const acct = new PaperOptionsAccount({ initialEquity: 50_000, managedAccountRatio: 0.5 });
+    const pos = acct.openDefinedRiskSpread(
+      spreadParams({ maxLossUsd: 100, netUsd: 40, maxProfitUsd: 40, targetContracts: 8 }),
+    );
+    expect(pos).not.toBeNull();
+    expect(pos!.contracts).toBe(8);
+    expect(pos!.maxLossUsd).toBe(800); // 100 × 8
+    expect(pos!.netUsd).toBe(320); // 40 × 8
+    expect(acct.getState().optionsCash).toBe(49_200);
+  });
+
+  it('clamps an over-target lot count down to the per-trade cap', () => {
+    // Same $100 max-loss lot, cap = $1,000 (2% × $50k) → floor(1000/100)=10 lots.
+    // A greedy targetContracts=20 is trimmed to the 10 the governor allows.
+    const acct = new PaperOptionsAccount({ initialEquity: 50_000, managedAccountRatio: 0.5 });
+    const pos = acct.openDefinedRiskSpread(
+      spreadParams({ maxLossUsd: 100, netUsd: 40, maxProfitUsd: 40, targetContracts: 20 }),
+    );
+    expect(pos).not.toBeNull();
+    expect(pos!.contracts).toBe(10);
+    expect(pos!.maxLossUsd).toBe(1_000);
+  });
+
   it('honors the C3 entry-DTE guard (sub-floor expiration is refused)', () => {
     const acct = new PaperOptionsAccount({ initialEquity: 50_000, managedAccountRatio: 0.5 });
     const nearLegs = bullPutLegs.map((l) => ({ ...l, expiration: '2024-06-06' })); // 2 DTE

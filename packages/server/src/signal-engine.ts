@@ -7476,6 +7476,8 @@ export class SignalEngine {
       maxLossUsd: detail.maxLossUsd,
       maxProfitUsd: detail.maxProfitUsd,
       breakevens: detail.breakevens,
+      // TRA-1356 — enter the feed-sized lot count (per-lot payoff above × this).
+      ...(typeof detail.contracts === 'number' ? { contracts: detail.contracts } : {}),
     });
     if (!pos) {
       const reason = this.takeLastIdeaEntryRejection();
@@ -7530,6 +7532,8 @@ export class SignalEngine {
     breakevens: number[];
     pop: number;
     ideaId: string;
+    /** TRA-1356 — feed-sized combo-lot count (defined-risk spreads); default 1. */
+    contracts?: number;
   }): Promise<{ ok: boolean; reason: string; proposalId: string; position: OptionPosition | null }> {
     const now = Date.now();
     const maxLoss = Math.max(0, intent.maxLossUsd);
@@ -7545,6 +7549,9 @@ export class SignalEngine {
       maxProfitUsd: intent.maxProfitUsd,
       netUsd: intent.netUsd,
       breakevens: intent.breakevens,
+      // TRA-1356 — carry the sized lot count so the rail's notional/size + the
+      // reconstructed open intent match the sized card (default 1 lot).
+      ...(typeof intent.contracts === 'number' ? { contracts: intent.contracts } : {}),
       optionSymbol: intent.optionSymbol,
       optionType: intent.optionType,
       strike: intent.strike,
@@ -7602,12 +7609,20 @@ export class SignalEngine {
     breakevens: number[];
     pop: number;
     ideaId: string;
+    /** TRA-1356 — feed-sized combo-lot count (defined-risk spreads); default 1. */
+    contracts?: number;
   }): Promise<{ autoConfirmed: boolean; reason: string; proposalId?: string; position?: OptionPosition | null }> {
-    // Single-lot max loss is the capital-at-risk the cap tests against; a
-    // finite, positive value is also our defined-risk proxy (the AI-Ideas feed
-    // is defined-risk-only by construction, but we re-assert it here so an
-    // unpriced / unbounded structure can never auto-enter).
-    const maxLoss = Math.max(0, intent.maxLossUsd);
+    // The capital-at-risk the auto-confirm cap tests against is the SIZED
+    // position's max loss (per-lot × the feed's lot count, TRA-1356), NOT a
+    // single lot — otherwise a thin per-lot loss could auto-confirm a position
+    // whose sized risk busts the cap. A finite, positive per-lot value is also
+    // our defined-risk proxy (the AI-Ideas feed is defined-risk-only by
+    // construction, but we re-assert it so an unpriced / unbounded structure can
+    // never auto-enter).
+    const lots = Number.isInteger(intent.contracts) && (intent.contracts as number) >= 1
+      ? (intent.contracts as number)
+      : 1;
+    const maxLoss = Math.max(0, intent.maxLossUsd) * lots;
     const definedRisk = Number.isFinite(intent.maxLossUsd) && intent.maxLossUsd > 0;
     const decision = shouldAutoConfirm({
       mode: 'demo', // paper-options book is mode:'demo'; live auto-confirm is a hard NO
@@ -7986,6 +8001,8 @@ export class SignalEngine {
     maxLossUsd?: number;
     maxProfitUsd?: number;
     breakevens?: number[];
+    /** TRA-1356 — feed-sized combo-lot count; the spread open path enters this many. */
+    contracts?: number;
   }): import('@trading-app/shared').OptionPosition | null {
     const acct = this.optionsAccounts[this.tradierEnv];
 
@@ -8023,6 +8040,10 @@ export class SignalEngine {
           maxProfitUsd: intent.maxProfitUsd,
           breakevens: intent.breakevens ?? [],
           spot: intent.spot,
+          // TRA-1356 — enter the feed-sized lot count so the paper position
+          // matches the card's sized max loss. Still clamped by the cap-lot +
+          // cash trims inside openDefinedRiskSpread; absent → legacy RV sizing.
+          ...(typeof intent.contracts === 'number' ? { targetContracts: intent.contracts } : {}),
           // TRA-1145 — admit the structure at the selector's advisory risk
           // fraction (2%) rather than the gate's strict 1% default. A normal
           // one-wing index-ETF vertical (e.g. the QQB bull put: ~$320 max loss

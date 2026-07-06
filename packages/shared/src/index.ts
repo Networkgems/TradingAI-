@@ -3625,6 +3625,14 @@ export interface OptionProposalDetail {
   netUsd: number;
   /** Payoff breakeven underlying price(s). */
   breakevens: number[];
+  /**
+   * TRA-1356 — feed-sized combo-lot count for a defined-risk spread (the feed
+   * sizes toward the per-trade cap). The `maxLossUsd` / `maxProfitUsd` / `netUsd`
+   * above stay per-lot; the proposal's `notional` + `size` scale by this count so
+   * the daily caps account for the real capital at risk and the entered position
+   * matches the card. Absent ⇒ 1 lot (legacy behaviour).
+   */
+  contracts?: number;
   /** Anchor (scanner-surfaced) contract — drives the single-leg long open path. */
   optionSymbol: string;
   optionType: OptionType;

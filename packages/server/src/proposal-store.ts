@@ -140,13 +140,19 @@ export function createOptionsProposal(input: CreateOptionsProposalInput): TradeP
   );
   if (existing) return existing;
 
+  // TRA-1356 — a defined-risk spread the feed sized to N lots reserves N × the
+  // per-lot max loss; snapshot `size`/`notional` at the sized count so the daily
+  // caps test against the real capital at risk (default 1 lot for legacy ideas).
+  const lots = Number.isInteger(input.option.contracts) && (input.option.contracts as number) >= 1
+    ? (input.option.contracts as number)
+    : 1;
   const proposal: TradeProposal = {
     id: nextProposalId(input.option.ideaId),
     recommendationId: input.option.ideaId,
     symbol: input.option.ticker,
     side: 'buy',
-    size: 1,
-    notional: Math.max(0, input.option.maxLossUsd),
+    size: lots,
+    notional: Math.max(0, input.option.maxLossUsd) * lots,
     mode: 'demo',
     conviction: input.option.pop,
     verdict: 'APPROVE',

@@ -58,12 +58,24 @@ interface OptionsIdea {
   thesis: string;
   /** Probability of profit in [0,1]. */
   pop: number;
-  /** Defined max loss in USD (positive number = dollars at risk). */
+  /**
+   * Defined max loss in USD (positive number = dollars at risk). TRA-1356 — this
+   * is the SIZED total for the whole position (per-lot × {@link contracts}), not
+   * a single lot, so the number reflects the position the open path enters.
+   */
   maxLossUsd: number;
-  /** Defined max profit in USD. */
+  /** Defined max profit in USD (sized total; TRA-1356). */
   maxProfitUsd: number;
-  /** Net premium: positive = credit received, negative = debit paid. */
+  /** Net premium: positive = credit received, negative = debit paid (sized total; TRA-1356). */
   netUsd: number;
+  /**
+   * TRA-1356 — the number of defined-risk combo lots this idea is sized to (the
+   * feed sizes spreads toward the per-trade cap so an idea targets a consistent
+   * fraction of the risk budget instead of a trivially-thin single lot). The
+   * dollar figures above are the full sized totals. Absent on preview / non-live
+   * views and for single-leg longs ⇒ treated as 1 lot (no badge shown).
+   */
+  contracts?: number;
   /** Underlying breakeven price(s). */
   breakevens: number[];
   /** IV rank [0,100], if available. */
@@ -365,7 +377,17 @@ function PayoffPreview({ idea }: { idea: OptionsIdea }) {
         <span title="Underlying break-even price(s)">
           B/E {breakevens.map((b) => `$${fmt(b)}`).join(' / ')}
         </span>
-        <span className="red" title="Defined maximum loss — your risk is capped at this">Max −{fmtDollar(idea.maxLossUsd)}</span>
+        <span
+          className="red"
+          title={
+            idea.contracts && idea.contracts > 1
+              ? `Defined maximum loss for the sized position (${idea.contracts} lots) — your risk is capped at this`
+              : 'Defined maximum loss — your risk is capped at this'
+          }
+        >
+          Max −{fmtDollar(idea.maxLossUsd)}
+          {idea.contracts && idea.contracts > 1 ? ` ·${idea.contracts}×` : ''}
+        </span>
       </div>
     </div>
   );

@@ -29,7 +29,7 @@ import { isCoveredStrategy } from '@trading-app/agents';
  */
 type EmittableStrategy = Exclude<DefinedRiskStrategy, CoveredStrategy>;
 import type { OptionChainRow } from '@trading-app/engine';
-import { evaluateMultiLegPreTrade, DEFAULT_MAX_LOSS_PCT_CAP } from '@trading-app/engine';
+import { evaluateMultiLegPreTrade, DEFAULT_MAX_LOSS_PCT_CAP, maxLossCapUsd } from '@trading-app/engine';
 import type { DayTradingGuardrailConfig } from '@trading-app/shared';
 
 // ── UI contract (mirrors AiOptionsIdeasPanel.tsx) ────────────────────────────
@@ -70,6 +70,19 @@ export interface OptionsIdeaView {
    */
   catalystHorizon?: 'near' | 'medium' | 'long';
   legs: IdeaLeg[];
+  /**
+   * TRA-1356 — the number of defined-risk combo lots this idea is sized to. The
+   * displayed `maxLossUsd` / `maxProfitUsd` / `netUsd` are the FULL sized totals
+   * (per-lot × `contracts`), not a single lot, so a thin $18/lot spread reads as
+   * the ~$486 (27-lot) position the open path actually enters rather than a
+   * rounding-error single lot. Sizing targets the per-trade cap (TRA-1348
+   * governor): the largest whole-lot count whose total max loss still fits under
+   * the ceiling, so every enterable spread lands above ~50% of the cap. Only
+   * multi-leg defined-risk spreads scale (single-leg longs keep their RV sizing);
+   * absent on preview / non-live views (no account equity to size against) and
+   * defaults to 1.
+   */
+  contracts?: number;
   /**
    * TRA-678 (F2) — false when the payoff is a thin-chain fallback placeholder
    * (legs could not be priced off real marks). The forward-test journal carries
@@ -158,6 +171,16 @@ export interface IdeaEntryIntent {
   breakevens: number[];
   /** TRA-1140 — probability of profit on [0,1] (carried onto the options proposal). */
   pop: number;
+  /**
+   * TRA-1356 — the sized combo-lot count the feed picked to target the per-trade
+   * cap (defined-risk spreads only). The paper open path enters exactly this many
+   * lots (still clamped by its own cap + cash trims) so the entered position
+   * matches the sized `maxLossUsd` shown on the card. `maxLossUsd` / `netUsd` /
+   * `maxProfitUsd` on THIS intent stay PER-LOT (the open path multiplies by the
+   * lot count itself); the feed view carries the sized totals. Absent for
+   * single-leg longs, which keep their existing RV budget sizing.
+   */
+  contracts?: number;
 }
 
 // ── event badges ─────────────────────────────────────────────────────────────
@@ -471,6 +494,33 @@ export interface BuiltFeed {
   intents: Map<string, IdeaEntryIntent>;
 }
 
+/**
+ * TRA-1356 — how many defined-risk combo lots to size a spread idea to so its
+ * capital-at-risk targets the per-trade risk cap instead of a single, often
+ * trivially-thin, lot.
+ *
+ * A defined-risk spread has a bounded loss, so the honest way to "target a
+ * consistent fraction of the risk cap" is to open the largest whole-lot count
+ * whose TOTAL max loss still fits under the TRA-1348 governor ceiling
+ * (`capUsd`). Flooring lands every enterable idea in `(capUsd − maxLossPerLot,
+ * capUsd]`; because a single lot must already fit the cap to be enterable, that
+ * range is always above 50% of the cap — which closes the capital-efficiency
+ * gap where a $18/lot spread counted as "enterable" while risking a rounding
+ * error on a $25k book.
+ *
+ * Scaling contract COUNT (not strike width) keeps the per-lot risk/reward
+ * intact — POP, credit-to-max-loss, and breakevens are unchanged, only the size
+ * scales — so a wider position can never silently degrade the idea's edge.
+ *
+ * Returns >= 1. A single lot that already busts the cap returns 1 and is caught
+ * by the same pre-trade gate that flags it un-enterable, exactly as before.
+ */
+export function sizeSpreadContractsToCap(maxLossPerLotUsd: number, capUsd: number): number {
+  if (!Number.isFinite(maxLossPerLotUsd) || maxLossPerLotUsd <= 0) return 1;
+  if (!Number.isFinite(capUsd) || capUsd <= 0) return 1;
+  return Math.max(1, Math.floor(capUsd / maxLossPerLotUsd));
+}
+
 /** The C3 "no day trading" status block, surfaced verbatim to the panel. */
 export function noDayTradingBlock(guardrail: DayTradingGuardrailConfig): OptionsIdeasFeed['noDayTrading'] {
   return {
@@ -518,12 +568,36 @@ export function buildOptionsIdeasFeed(args: BuildFeedArgs): BuiltFeed {
     const structure = modelStructure(idea.strategy, anchor, sym.spot, rows, idea.maxLossUsd);
     const id = `live-${ticker.toLowerCase()}-${idea.strategy}-${idea.rank}`;
 
-    // TRA-1121 (TRA-1118 "Flag") — run the structure's SINGLE-LOT max loss
-    // through the SAME pre-trade gate the paper-enter path uses. A defined-risk
-    // combo can't be fractionally trimmed, so if one lot already busts the cap
-    // the open path hard-rejects it; the feed must flag it (not filter, not
-    // re-derive the inequality) so the panel disables `Paper entry` with the
-    // gate's verbatim reason. Skipped when no account equity was threaded.
+    // TRA-1356 — size defined-risk spreads toward the per-trade cap so an idea's
+    // capital-at-risk is a consistent fraction of the risk budget instead of a
+    // single trivially-thin lot. Only multi-leg defined-risk structures scale
+    // here (single-leg longs keep the RV sizing on their own open path), and
+    // only when we have an account equity to measure the cap against. The lot
+    // count rides on the view + intent so the entered position matches the card.
+    const isMultiLeg = structure.legs.length >= 2;
+    let contracts = 1;
+    if (gateEnterability && isMultiLeg) {
+      const capUsd = maxLossCapUsd(
+        accountEquityUsd as number,
+        maxLossPctCap ?? DEFAULT_MAX_LOSS_PCT_CAP,
+      );
+      contracts = sizeSpreadContractsToCap(structure.maxLossUsd, capUsd);
+    }
+    // Sized totals for display: per-lot × lot count. Per-lot figures on the
+    // intent stay per-lot (the open path multiplies by the lot count itself).
+    const sizedMaxLossUsd = r2(structure.maxLossUsd * contracts);
+    const sizedMaxProfitUsd = r2(structure.maxProfitUsd * contracts);
+    const sizedNetUsd = r2(structure.netUsd * contracts);
+
+    // TRA-1121 (TRA-1118 "Flag") / TRA-1356 — run the structure's SIZED max loss
+    // through the SAME pre-trade gate the paper-enter path uses (per-lot max loss
+    // × the sized lot count). A defined-risk combo can't be fractionally trimmed,
+    // so if the sized position busts the cap the open path hard-rejects it; the
+    // feed must flag it (not filter, not re-derive the inequality) so the panel
+    // disables `Paper entry` with the gate's verbatim reason. Because the lot
+    // count is floored to the cap, an enterable spread is always admitted; a
+    // single lot that already busts the cap stays flagged exactly as before.
+    // Skipped when no account equity was threaded.
     let enterable = true;
     let entryBlockedReason: string | undefined;
     if (gateEnterability) {
@@ -533,7 +607,7 @@ export function buildOptionsIdeasFeed(args: BuildFeedArgs): BuiltFeed {
         // path; the per-trade max-loss cap is the binding feed constraint.
         optionBuyingPower: null,
         maxLossPerLot: structure.maxLossUsd,
-        contracts: 1,
+        contracts,
         ...(maxLossPctCap != null ? { maxLossPctCap } : {}),
       });
       if (!verdict.allowed) {
@@ -550,15 +624,18 @@ export function buildOptionsIdeasFeed(args: BuildFeedArgs): BuiltFeed {
       strategy: STRATEGY_DISPLAY[idea.strategy],
       thesis: idea.thesis,
       pop: idea.pop,
-      maxLossUsd: structure.maxLossUsd,
-      maxProfitUsd: structure.maxProfitUsd,
-      netUsd: structure.netUsd,
+      maxLossUsd: sizedMaxLossUsd,
+      maxProfitUsd: sizedMaxProfitUsd,
+      netUsd: sizedNetUsd,
       breakevens: structure.breakevens,
       ...(sym.ivRank != null ? { ivRank: sym.ivRank } : {}),
       dte: idea.dteDays,
       events: buildEventsForSymbol(sym),
       catalystHorizon: idea.catalystHorizon,
       legs: structure.legs,
+      // TRA-1356 — surface the sized lot count only when we actually sized a
+      // multi-leg spread against account equity (preview / single-leg omit it).
+      ...(gateEnterability && isMultiLeg ? { contracts } : {}),
       priced: structure.priced,
       // Only stamp enterability when we actually gated (back-compat: preview /
       // non-live views omit it and the panel treats the idea as enterable).
@@ -591,6 +668,10 @@ export function buildOptionsIdeasFeed(args: BuildFeedArgs): BuiltFeed {
       maxProfitUsd: structure.maxProfitUsd,
       breakevens: structure.breakevens,
       pop: idea.pop,
+      // TRA-1356 — carry the sized lot count so the paper open path enters the
+      // same size the card shows. Per-lot payoff fields above stay per-lot; the
+      // open path multiplies by this count (clamped by its own cap + cash).
+      ...(gateEnterability && isMultiLeg ? { contracts } : {}),
     });
   }
 

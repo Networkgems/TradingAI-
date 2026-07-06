@@ -192,6 +192,15 @@ function toEntry(
   const expiration = idea.legs[0]?.expiration;
   if (!expiration) return null;
   const surfacedDate = etDateKey(surfacedAt);
+  // TRA-1356 — the panel view now carries SIZED dollar totals (per-lot × the
+  // sized lot count). The forward-test scores structure P/L PER 1-LOT against
+  // these as the risk denominator, so divide back to per-lot before journaling
+  // (lot count defaults to 1 for preview / single-leg / legacy views).
+  const lots =
+    Number.isInteger(idea.contracts) && (idea.contracts as number) >= 1
+      ? (idea.contracts as number)
+      : 1;
+  const perLot = (usd: number): number => Math.round((usd / lots) * 100) / 100;
   return {
     key: journalKey(surfacedDate, idea.ticker, strategy, expiration),
     surfacedAt,
@@ -204,9 +213,9 @@ function toEntry(
     dte: idea.dte,
     expiration,
     legs: idea.legs,
-    entryNetUsd: idea.netUsd,
-    maxLossUsd: idea.maxLossUsd,
-    maxProfitUsd: idea.maxProfitUsd,
+    entryNetUsd: perLot(idea.netUsd),
+    maxLossUsd: perLot(idea.maxLossUsd),
+    maxProfitUsd: perLot(idea.maxProfitUsd),
     breakevens: idea.breakevens,
     spotAtEntry: idea.underlyingPrice ?? null,
     ivRank: idea.ivRank ?? null,

@@ -158,6 +158,16 @@ describe('proposal-store — TRA-1140 options proposals', () => {
     expect(p.option?.legs.length).toBe(2);
   });
 
+  // TRA-1356 — a feed-sized spread reserves N × the per-lot max loss; the
+  // proposal snapshots `size`/`notional` at the sized count so the daily caps
+  // test against the real capital at risk (per-lot payoff fields stay per-lot).
+  it('scales size + notional by the sized contract count', () => {
+    const p = createOptionsProposal(optInput({ option: optionDetail({ contracts: 3 }) }));
+    expect(p.size).toBe(3);
+    expect(p.notional).toBe(960); // 320 per-lot × 3
+    expect(p.option?.maxLossUsd).toBe(320); // detail stays per-lot
+  });
+
   it('is idempotent per (user, ideaId) while pending', () => {
     const a = createOptionsProposal(optInput());
     const b = createOptionsProposal(optInput()); // same ideaId, still pending

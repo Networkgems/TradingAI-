@@ -1493,6 +1493,16 @@ export class PaperOptionsAccount {
        * keeps the default governor.
        */
       maxLossPctCap?: number;
+      /**
+       * TRA-1356 — the caller's target combo-lot count (the AI-ideas feed sizes
+       * the spread toward the per-trade cap and passes the chosen count here so
+       * the entered position matches the card's sized max loss). Used as the
+       * starting lot count instead of the legacy RV-budget floor-divide; the
+       * existing cap-lot + paper-cash trims and the pre-trade gate still apply on
+       * top, so an over-target count can never exceed the governor ceiling or the
+       * book's cash. Absent → legacy RV-budget sizing (unchanged).
+       */
+      targetContracts?: number;
     },
     mode: AccountMode = 'demo',
     /**
@@ -1557,8 +1567,16 @@ export class PaperOptionsAccount {
     // (no equity override) keeps the legacy floor-divide; we force at least one
     // lot when a single defined-risk lot still fits paper cash so a high
     // max-loss spread isn't silently rejected for rounding to zero contracts.
+    // TRA-1356 — when the caller supplies a `targetContracts` (the AI-ideas feed
+    // sized the spread toward the per-trade cap), start from that count instead
+    // so the entered position matches the sized max loss shown on the card. The
+    // cap-lot + cash trims + pre-trade gate below still bind, so the target can
+    // never exceed the governor ceiling or the book's cash.
     const budget = this.rvBudgetPerTrade();
-    let contracts = Math.floor(budget / maxLossPerLot);
+    let contracts =
+      Number.isInteger(params.targetContracts) && (params.targetContracts as number) >= 1
+        ? (params.targetContracts as number)
+        : Math.floor(budget / maxLossPerLot);
     if (contracts < 1 && maxLossPerLot <= this.cash) contracts = 1;
     if (contracts < 1)
       return this.rejectEntry(
