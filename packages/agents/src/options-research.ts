@@ -519,8 +519,13 @@ interface RawIdea {
  * TRA-846 — classify an idea's catalyst horizon from its underlying's soonest
  * scheduled catalyst (earnings or FOMC). With no near catalyst we fall back to
  * the idea's own DTE, so a longer-dated swing thesis reads as "long".
+ *
+ * TRA-1368 — exported so the server feed can re-derive the DISPLAYED horizon
+ * against the executed leg DTE (the horizon is capped at the option's actual
+ * life: an option expiring in 25 days can't reach a catalyst 40 days out, so
+ * `min(catalyst, legDte)` is the coherent bucket the card should show).
  */
-function classifyHorizon(
+export function classifyHorizon(
   sym: OptionsResearchSymbol | undefined,
   dteDays: number,
   policy: DiversificationPolicy,

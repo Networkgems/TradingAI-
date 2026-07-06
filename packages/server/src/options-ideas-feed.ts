@@ -14,12 +14,13 @@
 import type {
   DefinedRiskStrategy,
   CoveredStrategy,
+  CatalystHorizon,
   OptionsResearchResult,
   OptionsResearchInput,
   OptionsResearchSymbol,
   OptionsScannerCandidate,
 } from '@trading-app/agents';
-import { isCoveredStrategy } from '@trading-app/agents';
+import { isCoveredStrategy, classifyHorizon, DEFAULT_DIVERSIFICATION } from '@trading-app/agents';
 
 /**
  * The long-premium / spread families the ideas feed models and displays. The
@@ -634,6 +635,16 @@ const LEG_PHRASE = new RegExp(
   'gi',
 );
 const STANDALONE_DATE = new RegExp(DATE_TOKEN, 'gi');
+// TRA-1368 — a DTE / option-tenor figure the LLM keyed to its INTENDED
+// expiration (e.g. "46-DTE OTM calls", "46-day spread"). The executed legs carry
+// the authoritative expiration (and the card shows the derived `dte`), so — like
+// the strike/date specifics above — strip the prose figure rather than let a
+// stale "46-DTE" contradict a 25-DTE leg. Matches "<N>DTE" / "<N> DTE" /
+// "<N>-DTE" (DTE is unambiguously an option tenor) and the hyphenated
+// "<N>-day(s)" tenor idiom; a bare spaced "in 3 days" catalyst reference (no
+// hyphen, no DTE) is deliberately NOT matched so real catalyst timing survives.
+const DTE_TOKEN = String.raw`\b\d+(?:[- ]?DTE|-days?)\b`;
+const STANDALONE_DTE = new RegExp(DTE_TOKEN, 'gi');
 
 /** Collapse the whitespace / orphan-punctuation artifacts a scrub leaves behind. */
 function tidyProse(s: string): string {
@@ -657,15 +668,19 @@ function tidyProse(s: string): string {
  * 177.5C exp 7/31). The panel already renders the reconciled legs + expiration
  * authoritatively, so the thesis only needs the model's qualitative rationale.
  *
- * Strip the strike/expiration SPECIFICS (and their leg-action clause) from the
- * prose so it can never contradict the executed legs; the model's real reasoning
- * (IV-rank, events, support levels) survives untouched. When scrubbing leaves
- * nothing substantive — a thesis that was only a leg recital — fall back to a
- * deterministic, strike-free structure description. Either way the single source
- * of truth for strikes/expiration stays the reconciled `legs` array.
+ * Strip the strike/expiration SPECIFICS (and their leg-action clause), plus any
+ * DTE / option-tenor figure (TRA-1368: "46-DTE OTM calls" on a 25-DTE leg), from
+ * the prose so it can never contradict the executed legs; the model's real
+ * reasoning (IV-rank, events, support levels) survives untouched. When scrubbing
+ * leaves nothing substantive — a thesis that was only a leg recital — fall back
+ * to a deterministic, strike-free structure description. Either way the single
+ * source of truth for strikes/expiration/DTE stays the reconciled `legs` array
+ * (and the derived `dte`).
  */
 export function reconcileThesis(thesis: string, strategy: EmittableStrategy): string {
-  const scrubbed = tidyProse((thesis ?? '').replace(LEG_PHRASE, ' ').replace(STANDALONE_DATE, ' '));
+  const scrubbed = tidyProse(
+    (thesis ?? '').replace(LEG_PHRASE, ' ').replace(STANDALONE_DATE, ' ').replace(STANDALONE_DTE, ' '),
+  );
   // "Substantive" = enough letters left to be a real rationale, not a comma-and-
   // conjunction husk of a removed leg recital.
   const substantive = scrubbed.replace(/[^a-z]/gi, '').length >= 12;
@@ -675,6 +690,28 @@ export function reconcileThesis(thesis: string, strategy: EmittableStrategy): st
 }
 
 // ── feed assembly ─────────────────────────────────────────────────────────────
+
+/**
+ * TRA-1368 — whole calendar days from the feed's generation DATE to the executed
+ * leg's expiration, the SINGLE SOURCE OF TRUTH for the card's `dte`. The LLM's
+ * `idea.dteDays` is keyed to the expiration the model *intended*; the executed
+ * legs use the anchor/reconciled expiration, which the server-side clamps/snaps
+ * (TRA-1360/1363) can push onto a different chain — leaving the model's DTE (and
+ * the thesis "<N>-DTE" figure + catalyst horizon it drives) contradicting the
+ * legs the card renders.
+ *
+ * Counted DATE-to-DATE at UTC midnight (not from the intraday `generatedAt`
+ * instant) so it matches the engine/LLM convention: 2026-07-31 is 25 days from a
+ * 2026-07-06 generation regardless of the hour it ran. Returns 0 on an
+ * unparseable expiration rather than a nonsense negative/`NaN` DTE.
+ */
+const DAY_MS = 86_400_000;
+export function dteFromExpiration(expiration: string, generatedAt: number): number {
+  const expMs = Date.parse(`${expiration}T00:00:00Z`);
+  if (!Number.isFinite(expMs)) return 0;
+  const genDateMs = Math.floor(generatedAt / DAY_MS) * DAY_MS;
+  return Math.max(0, Math.round((expMs - genDateMs) / DAY_MS));
+}
 
 /** Pick the anchor (highest |mispricing|) candidate for a symbol. */
 function anchorCandidate(sym: OptionsResearchSymbol): OptionsScannerCandidate | null {
@@ -780,6 +817,11 @@ export function buildOptionsIdeasFeed(args: BuildFeedArgs): BuiltFeed {
   // measure the per-trade cap against. Preview / non-live builds pass none, and
   // every idea stays `enterable` (the open path's own gate still protects them).
   const gateEnterability = typeof accountEquityUsd === 'number' && Number.isFinite(accountEquityUsd);
+  // TRA-1368 — the SAME diversification policy the research pass ran under (it
+  // reads `input.diversification`, defaulting to DEFAULT_DIVERSIFICATION), so the
+  // horizon we re-derive against the executed leg DTE below uses the identical
+  // near/medium bucket thresholds the ranker did.
+  const diversification = input.diversification ?? DEFAULT_DIVERSIFICATION;
   const symByTicker = new Map<string, OptionsResearchSymbol>();
   for (const s of input.symbols) symByTicker.set(s.symbol.toUpperCase(), s);
 
@@ -808,6 +850,21 @@ export function buildOptionsIdeasFeed(args: BuildFeedArgs): BuiltFeed {
     // renders and can't be entered. Belt-and-suspenders to the strike-selection
     // fix above, which already keeps credit shorts OTM.
     if (!ideaPopPlacementCoherent(idea.strategy, structure, sym.spot, idea.pop)) continue;
+
+    // TRA-1368 — derive the DTE + catalyst horizon from the EXECUTED legs, not the
+    // model's intended `idea.dteDays`. The legs are the single source of truth for
+    // the time axis (as they already are for strikes/POP post TRA-1360/1363); the
+    // model's DTE can diverge once the server clamps/snaps the legs onto a different
+    // expiration chain, leaving a "46-DTE"/long-horizon narrative on a 25-DTE spread.
+    // All legs of a modeled structure share one expiration (calendars collapse to
+    // their near leg), so legs[0] is representative; fall back to the anchor exp.
+    const legExpiration = structure.legs[0]?.expiration ?? anchor.expiration;
+    const legDte = dteFromExpiration(legExpiration, generatedAt);
+    // Re-bucket the horizon against the actual leg DTE: an option can't reach a
+    // catalyst beyond its own expiration, so classifyHorizon's min(catalyst, dte)
+    // caps the displayed horizon at the position's real life (long → medium when
+    // the intended 46-DTE collapses to a 25-DTE leg with no nearer catalyst).
+    const catalystHorizon: CatalystHorizon = classifyHorizon(sym, legDte, diversification);
 
     const id = `live-${ticker.toLowerCase()}-${idea.strategy}-${idea.rank}`;
 
@@ -904,9 +961,11 @@ export function buildOptionsIdeasFeed(args: BuildFeedArgs): BuiltFeed {
       netUsd: sizedNetUsd,
       breakevens: structure.breakevens,
       ...(sym.ivRank != null ? { ivRank: sym.ivRank } : {}),
-      dte: idea.dteDays,
+      // TRA-1368 — DTE + horizon derived from the executed leg expiration (the
+      // single source of truth for the time axis), not the model's intended DTE.
+      dte: legDte,
       events: buildEventsForSymbol(sym),
-      catalystHorizon: idea.catalystHorizon,
+      catalystHorizon,
       legs: structure.legs,
       // TRA-1356 — surface the sized lot count only when we actually sized a
       // multi-leg spread against account equity (preview / single-leg omit it).

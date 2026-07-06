@@ -78,6 +78,7 @@ export {
   LLM_EMITTABLE_STRATEGIES,
   DEFAULT_OPTIONS_GUARDRAIL,
   DEFAULT_DIVERSIFICATION,
+  classifyHorizon,
   type DefinedRiskStrategy,
   type CoveredStrategy,
   type OptionsScannerCandidate,

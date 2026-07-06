@@ -14,11 +14,16 @@ import {
   modelStructure,
   ideaPopPlacementCoherent,
   reconcileThesis,
+  dteFromExpiration,
   sizeSpreadContractsToCap,
   STRATEGY_DISPLAY,
 } from './options-ideas-feed.js';
 
 const EXP = '2026-07-17';
+// TRA-1368 — a realistic generation instant 35 calendar days before EXP, so a
+// leg-derived DTE lands on 35 (the feed now keys `dte` to the executed legs, not
+// the model's intended `dteDays`, so tests must generate near the leg's date).
+const GEN = Date.parse('2026-06-12T14:00:00Z');
 
 function candidate(part: Partial<OptionsScannerCandidate>): OptionsScannerCandidate {
   return {
@@ -358,6 +363,45 @@ describe('reconcileThesis (TRA-1363)', () => {
       'Directional defined-risk long call — upside exposure with loss capped at the debit paid.',
     );
   });
+
+  // TRA-1368 — strip the DTE / option-tenor figure the model keyed to its INTENDED
+  // expiration so a stale "46-DTE" can't contradict a 25-DTE executed leg. The
+  // qualitative rationale survives; the card shows the derived `dte` authoritatively.
+  it('strips a stale DTE / option-tenor figure, keeping the rationale (TRA-1368)', () => {
+    // The live NVDA defect: "46-DTE" prose on a spread that actually expires in 25 days.
+    expect(reconcileThesis('NVDA 46-DTE OTM calls show 3% mispricing into strength.', 'long_call')).toBe(
+      'NVDA OTM calls show 3% mispricing into strength.',
+    );
+    // "<N> DTE", "<N>DTE", and the hyphenated "<N>-day(s)" tenor idiom all go.
+    expect(reconcileThesis('Elevated IV-rank; a 46 DTE swing rides the trend.', 'long_call')).toBe(
+      'Elevated IV-rank; a swing rides the trend.',
+    );
+    expect(reconcileThesis('Buy a 30-day debit vertical while IV is cheap.', 'bull_call_spread')).toBe(
+      'Buy a debit vertical while IV is cheap.',
+    );
+  });
+
+  it('does NOT strip a bare spaced "in N days" catalyst reference (TRA-1368)', () => {
+    // No hyphen, no "DTE" marker → a real catalyst-timing phrase, kept intact.
+    const t = 'Earnings in 3 days should lift IV; hold the defined-risk premium into the print.';
+    expect(reconcileThesis(t, 'bull_put_spread')).toBe(t);
+  });
+});
+
+describe('dteFromExpiration (TRA-1368)', () => {
+  it('counts whole calendar days DATE-to-DATE, ignoring the intraday generation hour', () => {
+    // The live defect window: 2026-07-31 is 25 days from a 2026-07-06 generation,
+    // regardless of the 18:39Z hour it ran (the LLM/engine convention).
+    expect(dteFromExpiration('2026-07-31', Date.parse('2026-07-06T18:39:19Z'))).toBe(25);
+    expect(dteFromExpiration('2026-07-31', Date.parse('2026-07-06T00:00:00Z'))).toBe(25);
+    expect(dteFromExpiration('2026-08-21', Date.parse('2026-07-06T18:39:19Z'))).toBe(46);
+  });
+
+  it('guards an unparseable expiration to 0 rather than NaN/negative', () => {
+    expect(dteFromExpiration('not-a-date', Date.parse('2026-07-06T00:00:00Z'))).toBe(0);
+    // A past expiration floors at 0, never negative.
+    expect(dteFromExpiration('2026-07-01', Date.parse('2026-07-06T00:00:00Z'))).toBe(0);
+  });
 });
 
 describe('sizeSpreadContractsToCap (TRA-1356)', () => {
@@ -428,10 +472,10 @@ describe('buildOptionsIdeasFeed', () => {
       input,
       rowsBySymbol,
       guardrail: DAY_TRADING_GUARDRAIL,
-      generatedAt: 123,
+      generatedAt: GEN,
     });
     expect(feed.source).toBe('live');
-    expect(feed.generatedAt).toBe(123);
+    expect(feed.generatedAt).toBe(GEN);
     expect(feed.noDayTrading.enforced).toBe(true);
     expect(feed.ideas).toHaveLength(1);
     const idea = feed.ideas[0]!;
@@ -439,7 +483,10 @@ describe('buildOptionsIdeasFeed', () => {
     expect(idea.strategy).toBe(STRATEGY_DISPLAY.bull_put_spread);
     expect(idea.underlyingPrice).toBe(430);
     expect(idea.ivRank).toBe(64);
+    // TRA-1368 — dte is DERIVED from the executed leg expiration (EXP = 2026-07-17,
+    // 35 days after GEN), not read off the model's idea.dteDays.
     expect(idea.dte).toBe(35);
+    expect(idea.dte).toBe(dteFromExpiration(idea.legs[0]!.expiration, GEN));
     expect(idea.pop).toBe(0.72);
     expect(idea.legs.length).toBe(2);
     expect(idea.events.map((e) => e.kind)).toEqual(['fomc']);
@@ -573,6 +620,110 @@ describe('buildOptionsIdeasFeed', () => {
     expect(feed.ideas[0]!.thesis).toBe(
       'Bullish defined-risk credit spread — collects net premium and profits while the underlying holds above the short put through expiry.',
     );
+  });
+
+  // TRA-1368 — end-to-end DTE/horizon/thesis coherence on the expiration axis. The
+  // live NVDA defect: the model keyed dte=46 / catalystHorizon='long' / a "46-DTE"
+  // thesis to its INTENDED ~08-21 expiration, but the executed legs landed on the
+  // 07-31 chain (25 days out). The feed now derives all three from the leg
+  // expiration, so the card can never show a 46-DTE narrative on a 25-DTE spread.
+  it('derives dte / horizon / thesis-DTE from the executed leg expiration, not the stale model DTE', () => {
+    const GEN_NVDA = Date.parse('2026-07-06T18:39:19Z');
+    const EXP_LEG = '2026-07-31'; // 25 days from GEN_NVDA — NOT the model's intended 46
+    // No scheduled catalyst → the horizon falls back to the DTE, exposing the desync.
+    const nvdaSym: OptionsResearchSymbol = {
+      symbol: 'MSFT',
+      spot: 200,
+      ivRank: 55,
+      nextEarningsInDays: null,
+      daysToFOMC: null,
+      macroEventsNearby: [],
+      newsSentiment: 0.1,
+      candidates: [
+        candidate({ optionSymbol: 'MSFT260731C00200000', optionType: 'call', strike: 200, expiration: EXP_LEG, mispricingPct: 0.3 }),
+      ],
+    };
+    const nvdaInput: OptionsResearchInput = { asOf: GEN_NVDA, symbols: [nvdaSym] };
+    const nvdaResearch: OptionsResearchResult = {
+      ...research,
+      ideas: [
+        {
+          ...research.ideas[0]!,
+          ticker: 'MSFT',
+          strategy: 'long_call',
+          thesis: 'Momentum OTM calls show 3% mispricing into strength on a 46-DTE swing.',
+          pop: 0.45,
+          maxLossUsd: 800,
+          dteDays: 46, // stale — the model's intended expiration
+          catalystHorizon: 'long', // stale — keyed to the 46-DTE intent
+        },
+      ],
+    };
+    const nvdaRows = new Map<string, OptionChainRow[]>([
+      ['MSFT', [{ optionSymbol: 'C200', underlying: 'MSFT', optionType: 'call', strike: 200, expiration: EXP_LEG, bid: 7.9, ask: 8.1 }]],
+    ]);
+    const { feed } = buildOptionsIdeasFeed({
+      research: nvdaResearch,
+      input: nvdaInput,
+      rowsBySymbol: nvdaRows,
+      guardrail: DAY_TRADING_GUARDRAIL,
+      generatedAt: GEN_NVDA,
+    });
+    expect(feed.ideas).toHaveLength(1);
+    const idea = feed.ideas[0]!;
+    // dte tracks the executed leg (25), not the model's stale 46.
+    expect(idea.legs[0]!.expiration).toBe(EXP_LEG);
+    expect(idea.dte).toBe(25);
+    expect(idea.dte).toBe(dteFromExpiration(idea.legs[0]!.expiration, GEN_NVDA));
+    // horizon re-bucketed against the 25-DTE leg: 'long' → 'medium' (25 ≤ 35 medium max).
+    expect(idea.catalystHorizon).toBe('medium');
+    // the "46-DTE" prose figure is scrubbed so it can't contradict the 25-DTE leg.
+    expect(idea.thesis).not.toMatch(/46|DTE/);
+    expect(idea.thesis).toBe('Momentum OTM calls show 3% mispricing into strength on a swing.');
+  });
+
+  // TRA-1368 — the coherence INVARIANT the fix guarantees: across a mixed slate,
+  // every rendered idea's dte equals the whole-day count to its own leg expiration.
+  it('holds dte == daysBetween(generatedAt, legs[0].expiration) for every rendered idea', () => {
+    const GEN_MIX = Date.parse('2026-07-06T12:00:00Z');
+    const mkSym = (symbol: string, exp: string): OptionsResearchSymbol => ({
+      symbol,
+      spot: 200,
+      ivRank: 50,
+      nextEarningsInDays: null,
+      daysToFOMC: null,
+      macroEventsNearby: [],
+      newsSentiment: 0,
+      candidates: [candidate({ optionSymbol: `${symbol}C200`, optionType: 'call', strike: 200, expiration: exp, mispricingPct: 0.3 })],
+    });
+    const symA = mkSym('AAA', '2026-07-31'); // 25 DTE
+    const symB = mkSym('BBB', '2026-08-21'); // 46 DTE
+    const mixInput: OptionsResearchInput = { asOf: GEN_MIX, symbols: [symA, symB] };
+    const mixResearch: OptionsResearchResult = {
+      ...research,
+      ideas: [
+        { ...research.ideas[0]!, ticker: 'AAA', strategy: 'long_call', pop: 0.45, dteDays: 999, catalystHorizon: 'long', rank: 1 },
+        { ...research.ideas[0]!, ticker: 'BBB', strategy: 'long_call', pop: 0.45, dteDays: 1, catalystHorizon: 'near', rank: 2 },
+      ],
+    };
+    const call200 = (underlying: string, exp: string): OptionChainRow => ({ optionSymbol: `${underlying}C200`, underlying, optionType: 'call', strike: 200, expiration: exp, bid: 7.9, ask: 8.1 });
+    const mixRows = new Map<string, OptionChainRow[]>([
+      ['AAA', [call200('AAA', '2026-07-31')]],
+      ['BBB', [call200('BBB', '2026-08-21')]],
+    ]);
+    const { feed } = buildOptionsIdeasFeed({
+      research: mixResearch,
+      input: mixInput,
+      rowsBySymbol: mixRows,
+      guardrail: DAY_TRADING_GUARDRAIL,
+      generatedAt: GEN_MIX,
+    });
+    expect(feed.ideas.length).toBeGreaterThan(0);
+    for (const idea of feed.ideas) {
+      expect(idea.dte).toBe(dteFromExpiration(idea.legs[0]!.expiration, GEN_MIX));
+    }
+    expect(feed.ideas.find((i) => i.ticker === 'AAA')!.dte).toBe(25);
+    expect(feed.ideas.find((i) => i.ticker === 'BBB')!.dte).toBe(46);
   });
 
   it('drops ideas whose symbol has no anchor candidate', () => {
