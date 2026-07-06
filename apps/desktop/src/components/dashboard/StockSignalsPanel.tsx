@@ -15,13 +15,28 @@ export function StockSignalsPanel({
   signals,
   symbols,
   marketReview,
+  lastScanAt,
+  marketOpen,
 }: {
   token: string;
   signals: TradeSignal[];
   symbols: SymbolState[];
   marketReview: EngineMarketReviewState | undefined;
+  // TRA-1350 — last completed engine scan (ms) + session state, so the tab can
+  // tell "scanned, nothing qualified" apart from "engine dead".
+  lastScanAt?: number;
+  marketOpen?: boolean;
 }) {
   const toast = useToast();
+
+  // TRA-1350 — scan-status line. `0 signals` on a closed market is EXPECTED
+  // (the intraday strategies only fire in-session), so the tab needs to show
+  // the engine is alive and scanned, not silently render an empty list.
+  const marketLabel = marketOpen === false ? 'Market closed' : marketOpen === true ? 'Market open' : null;
+  const setupCount = `${signals.length} setup${signals.length === 1 ? '' : 's'} qualified`;
+  const scanStatus = lastScanAt && lastScanAt > 0
+    ? `${marketLabel ? marketLabel + ' · ' : ''}Last scan ${formatTime(lastScanAt)} — ${setupCount}`
+    : `${marketLabel ? marketLabel + ' · ' : ''}Waiting for first scan…`;
 
   async function resetSignals() {
     try {
@@ -48,6 +63,11 @@ export function StockSignalsPanel({
           market-review gating, explains why a strategy is gated off. */}
       <RegimeBanner review={marketReview} />
       <div className="signals-toolbar">
+        {/* TRA-1350 — always-visible scan status so an empty list reads as
+            "scanned, nothing qualified" rather than "engine dead". */}
+        <span className="scan-status" title="Timestamp of the last completed engine scan tick">
+          {scanStatus}
+        </span>
         <button
           className="btn-secondary btn-sm"
           onClick={resetSignals}

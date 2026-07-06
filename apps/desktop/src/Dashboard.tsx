@@ -188,7 +188,7 @@ export default function Dashboard({ token, onLogout, onGoHome, onActivity, theme
         )}
 
         {state && tab === 'signals' && (
-          <StockSignalsPanel token={token} signals={signals} symbols={symbols} marketReview={state.marketReview} />
+          <StockSignalsPanel token={token} signals={signals} symbols={symbols} marketReview={state.marketReview} lastScanAt={state.lastScanAt} marketOpen={state.marketOpen} />
         )}
 
         {state && tab === 'proposals' && (

@@ -151,6 +151,14 @@ export interface EngineState {
   closedPositions: ReturnType<PaperAccount['checkExits']>;
   options: OptionsAccountState;
   lastTick: number;
+  /**
+   * TRA-1350 — wall-clock (ms) of the last COMPLETED engine scan tick, or 0
+   * before the first tick finishes. Distinct from `lastTick` (serialization
+   * time): the Signals tab renders it as a "Last scan HH:MM — N setups" status
+   * line so an empty list on a closed market reads as "scanned, nothing
+   * qualified" rather than "engine dead".
+   */
+  lastScanAt: number;
   /** True when the daily risk circuit-breaker has halted new entries. */
   tradingHalted: boolean;
   haltReason: string | null;
@@ -1613,6 +1621,12 @@ export class SignalEngine {
 
   private tickTimer: ReturnType<typeof setInterval> | null = null;
   private tickRunning = false;
+  // TRA-1350 — wall-clock (ms) of the last COMPLETED scan tick. Unlike
+  // `lastTick` (stamped `Date.now()` at getState() serialization time, so it
+  // always reads "now"), this only advances when `doTick()` actually finishes a
+  // watchlist pass. The Signals tab uses it to distinguish "scanned, nothing
+  // qualified" from "engine stalled". 0 until the first tick completes.
+  private lastScanAt = 0;
   private candleScanTickCount = 0;
   /**
    * TRA-407 (C5) — the in-progress tick's promise (or a resolved promise when
@@ -3274,6 +3288,9 @@ export class SignalEngine {
       }
     }
 
+    // TRA-1350 — mark the tick complete before pushing state so getState()
+    // (and the WS `state` frame) carry a fresh scan timestamp on this cycle.
+    this.lastScanAt = Date.now();
     for (const h of this.handlers) h(this.getState());
   }
 
@@ -9036,6 +9053,7 @@ export class SignalEngine {
           portfolioGreeks: this.optionsAccount.getPortfolioGreeks('live', resolveSpot),
         },
         lastTick: Date.now(),
+        lastScanAt: this.lastScanAt,
         tradingHalted: this.riskGovernor.isHalted(),
         haltReason: this.riskGovernor.getHaltReason(),
         autoTradingEnabled: this.isAutoTradingEnabled(),
@@ -9080,6 +9098,7 @@ export class SignalEngine {
         portfolioGreeks: this.optionsAccount.getPortfolioGreeks('demo', resolveSpot),
       },
       lastTick: Date.now(),
+      lastScanAt: this.lastScanAt,
       tradingHalted: this.riskGovernor.isHalted(),
       haltReason: this.riskGovernor.getHaltReason(),
       autoTradingEnabled: this.isAutoTradingEnabled(),

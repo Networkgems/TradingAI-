@@ -42,7 +42,21 @@ export function AgentGatingButton({
   // Re-seed from the authoritative snapshot when it arrives/changes.
   useEffect(() => { setLocalEnabled(enabled); }, [enabled]);
 
+  // TRA-1350 — when the agent layer is OFF the control can't be armed, but a
+  // plain `disabled` button gives no clue what unlocks it (a `title` tooltip
+  // doesn't render on a disabled element in Chrome/Safari). Keep the button
+  // clickable while locked and, on click, surface the exact enable path as a
+  // toast instead of silently doing nothing.
+  const locked = !agentsEnabled;
+
   async function toggle() {
+    if (locked) {
+      toast.info(
+        'Auto-Trade is locked. Turn Trading Agents ON first — gating only '
+        + 'routes while the agent layer is the active decision-maker.',
+      );
+      return;
+    }
     const next = !localEnabled;
     const ok = window.confirm(
       next
@@ -85,21 +99,31 @@ export function AgentGatingButton({
     }
   }
 
-  const hint = !agentsEnabled
-    ? 'Turn Trading Agents ON first — gating only has effect while the agent layer is the active decision-maker.'
+  const hint = locked
+    ? 'Locked — turn Trading Agents ON first. Gating only routes while the agent layer is the active decision-maker.'
     : localEnabled
       ? 'Demo gating is ARMED — agents auto-open/monitor/close paper trades (still behind the risk caps + kill switch). Click to go advisory-only.'
       : 'Arm demo gating so the agents auto-open paper trades from their APPROVE recommendations (paper only — never live).';
 
   return (
-    <button
-      type="button"
-      className={`logout-btn agent-gating-btn${localEnabled ? ' active' : ''}`}
-      onClick={toggle}
-      disabled={busy || !agentsEnabled}
-      title={hint}
-    >
-      {localEnabled ? '⚡ Auto-Trade ON (demo)' : '⚡ Auto-Trade (demo)'}
-    </button>
+    <span className="agent-gating-wrap">
+      <button
+        type="button"
+        className={`logout-btn agent-gating-btn${localEnabled ? ' active' : ''}${locked ? ' locked' : ''}`}
+        onClick={toggle}
+        // Stay clickable while locked so the click can explain the enable path;
+        // only a genuine in-flight request disables it.
+        disabled={busy}
+        aria-disabled={locked}
+        title={hint}
+      >
+        {locked
+          ? '🔒 Auto-Trade (demo)'
+          : localEnabled ? '⚡ Auto-Trade ON (demo)' : '⚡ Auto-Trade (demo)'}
+      </button>
+      {locked && (
+        <span className="agent-gating-note">Turn Trading Agents ON to enable</span>
+      )}
+    </span>
   );
 }

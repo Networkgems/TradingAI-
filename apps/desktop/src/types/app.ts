@@ -18,6 +18,12 @@ export interface AppState {
   closedPositions: Position[];
   options: OptionsAccountState;
   lastTick: number;
+  // TRA-1350 — ms timestamp of the last completed engine scan tick (0 before
+  // the first tick). Optional so a pre-TRA-1350 server still type-checks.
+  lastScanAt?: number;
+  // TRA-1350 — true when the US equities session is open. Surfaced by the
+  // server (`isStockMarketOpen()`); optional for pre-TRA-1350 compatibility.
+  marketOpen?: boolean;
   tradingHalted: boolean;
   haltReason: string | null;
   autoTradingEnabled: boolean;

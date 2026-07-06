@@ -879,6 +879,18 @@ tr:hover td { background: var(--bg-hover); }
 }
 .trading-agents-btn.active:hover:not(:disabled) { background: var(--blue); border-color: var(--text); }
 
+/* TRA-1350 — the demo Auto-Trade (agent-gating) control. When the agent layer
+   is OFF the button reads as locked (dimmed, lock glyph) but stays clickable so
+   a click surfaces the enable path; an inline note spells it out without relying
+   on a tooltip that disabled elements never fire. */
+.agent-gating-wrap { display: inline-flex; align-items: center; gap: 6px; }
+.agent-gating-btn.locked { opacity: 0.55; cursor: help; }
+.agent-gating-note {
+  font-size: 11px;
+  color: var(--text-muted, #8a8f98);
+  white-space: nowrap;
+}
+
 .btn-close-pos {
   background: none;
   border: 1px solid var(--red);
@@ -2576,11 +2588,20 @@ tr:hover td { background: var(--bg-hover); }
 
 .signals-toolbar {
   display: flex;
-  justify-content: flex-end;
+  justify-content: space-between;
+  align-items: center;
   gap: 0.5rem;
   padding: 0.6rem 0.75rem;
   border-bottom: 1px solid var(--border);
   background: var(--surface);
+}
+
+/* TRA-1350 — last-scan status line on the Signals tab. Muted so it reads as
+   context, not an alert; 0 setups on a closed market is the expected steady
+   state. */
+.signals-toolbar .scan-status {
+  font-size: 12px;
+  color: var(--text-muted, #8a8f98);
 }
 
 .watchlist-add-input {
