@@ -3498,6 +3498,138 @@ app.get('/api/health/chain-capture/partition/:date', async (req, res) => {
   });
 });
 
+// TRA-1324 (TRA-820 Step 1) — sentiment-capture liveness. The daily
+// StockTwits sentiment recorder (TRA-822) writes to the SAME persistent disk as
+// the chain recorder (`DATA_DIR/sentiment-snapshots`), but until now had no
+// read-only export — so the TRA-820 IC/flow harness could only read whatever
+// local partition its grading box happened to hold (the disk-full PG-DEVOPS14
+// ~8-day partition), while ~33 days co-accrued unreachable on bqb1. This mirrors
+// `/api/health/chain-capture` exactly: open (no auth), read-only, counts the
+// accumulated daily partitions and reports the latest partition's coverage from
+// the cheap per-date `_meta.json` — it never loads the full sentiment rows.
+app.get('/api/health/sentiment-capture', async (_req, res) => {
+  const DATE_PARTITION = /^\d{4}-\d{2}-\d{2}$/;
+  const outDir = SENTIMENT_RECORD_OUT_DIR;
+  const rawUniverse = (process.env['SENTIMENT_WATCHLIST'] ?? '').trim();
+  const configuredUniverse = rawUniverse
+    ? rawUniverse.split(',').map((s) => s.trim().toUpperCase()).filter(Boolean)
+    : [...WATCHLIST];
+
+  let dates: string[] = [];
+  try {
+    dates = (await readdir(outDir)).filter((d) => DATE_PARTITION.test(d)).sort();
+  } catch {
+    dates = [];
+  }
+
+  let latest:
+    | {
+        date: string;
+        recordedAt: number | null;
+        symbolCount: number | null;
+        recorded: number | null;
+        noData: number | null;
+        errored: number | null;
+      }
+    | null = null;
+  if (dates.length > 0) {
+    const last = dates[dates.length - 1];
+    const dir = join(outDir, last);
+    let recordedAt: number | null = null;
+    let symbolCount: number | null = null;
+    let recorded: number | null = null;
+    let noData: number | null = null;
+    let errored: number | null = null;
+    try {
+      const meta = JSON.parse(await readFile(join(dir, '_meta.json'), 'utf-8')) as {
+        recordedAt?: number;
+        symbolCount?: number;
+        recorded?: number;
+        noData?: number;
+        errored?: number;
+      };
+      recordedAt = meta.recordedAt ?? null;
+      symbolCount = meta.symbolCount ?? null;
+      recorded = meta.recorded ?? null;
+      noData = meta.noData ?? null;
+      errored = meta.errored ?? null;
+    } catch {
+      // _meta.json absent/corrupt — fall back to counting rows in sentiment.json.
+      try {
+        const file = JSON.parse(await readFile(join(dir, 'sentiment.json'), 'utf-8')) as {
+          recordedAt?: number;
+          symbols?: { outcome?: string }[];
+        };
+        recordedAt = file.recordedAt ?? null;
+        const syms = Array.isArray(file.symbols) ? file.symbols : [];
+        symbolCount = syms.length;
+        recorded = syms.filter((s) => s.outcome === 'recorded').length;
+        noData = syms.filter((s) => s.outcome === 'no_data').length;
+        errored = syms.filter((s) => s.outcome === 'error').length;
+      } catch {
+        // partition unreadable — leave the counts null.
+      }
+    }
+    latest = { date: last, recordedAt, symbolCount, recorded, noData, errored };
+  }
+
+  res.json({
+    issue: 'TRA-1324',
+    outDir,
+    capturing: dates.length > 0,
+    tradingDaysCaptured: dates.length,
+    firstDate: dates[0] ?? null,
+    lastDate: dates[dates.length - 1] ?? null,
+    universeSource: rawUniverse ? 'SENTIMENT_WATCHLIST' : 'WATCHLIST',
+    configuredUniverse,
+    latest,
+  });
+});
+
+// TRA-1324 — recorded sentiment-partition export. The daily StockTwits
+// snapshots live only on the Render persistent disk
+// (`DATA_DIR/sentiment-snapshots/<YYYY-MM-DD>/sentiment.json`), which the TRA-820
+// grading box cannot reach. This bounded read-only endpoint streams one date
+// partition's `sentiment.json` (the same rows `loadSentimentDays` reads) plus its
+// `_meta.json` so the harness can mirror the dataset locally.
+// `scripts/pull-recorded-sentiment.mjs` walks `sentiment-capture`'s date range
+// and pulls each partition through here. One date per request keeps the payload
+// bounded; the `:date` param is regex-validated to block path traversal.
+app.get('/api/health/sentiment-capture/partition/:date', async (req, res) => {
+  const DATE_PARTITION = /^\d{4}-\d{2}-\d{2}$/;
+  const date = String(req.params.date ?? '');
+  if (!DATE_PARTITION.test(date)) {
+    res.status(400).json({ error: 'date must be YYYY-MM-DD' });
+    return;
+  }
+  const dir = join(SENTIMENT_RECORD_OUT_DIR, date);
+  let sentiment: unknown = null;
+  try {
+    sentiment = JSON.parse(await readFile(join(dir, 'sentiment.json'), 'utf-8'));
+  } catch {
+    res.status(404).json({ error: 'partition not found', date });
+    return;
+  }
+  let meta: unknown = null;
+  try {
+    meta = JSON.parse(await readFile(join(dir, '_meta.json'), 'utf-8'));
+  } catch {
+    // _meta.json is optional — the sentiment.json rows are the durable artifact.
+  }
+  const symbolCount =
+    sentiment && Array.isArray((sentiment as { symbols?: unknown[] }).symbols)
+      ? (sentiment as { symbols: unknown[] }).symbols.length
+      : 0;
+  res.json({
+    issue: 'TRA-1324',
+    date,
+    outDir: SENTIMENT_RECORD_OUT_DIR,
+    symbolCount,
+    meta,
+    sentiment,
+  });
+});
+
 // TRA-779 — replay smoke proof. Runs the real `run-options-replay` pure pipe
 // (`loadChainDays` → `runOptionsReplay`) against the on-disk captured chains and
 // returns the summarized buckets, proving the persisted partitions are
