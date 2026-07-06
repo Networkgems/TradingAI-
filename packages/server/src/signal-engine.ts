@@ -4208,13 +4208,19 @@ export class SignalEngine {
         // TRA-1293 — PoP / delta entry gate + Delta/Theta ratio floor. HARD
         // pre-open filter on the selected strike's |delta| (0.30–0.40 PoP band)
         // and its |delta|/|theta_per_day| ratio, so time decay works for us
-        // rather than bleeding a low-delta long. Ships DARK behind
-        // ENTRY_GREEKS_GATE_ENABLED (under the EXIT_RISK_RULES_ENABLED master),
-        // so the baseline path is unchanged until the board arms it. Theta is
-        // computed here via BS greeks (the RV candidate carries only delta); a
-        // missing underlying spot leaves thetaPerDay=0 so the ratio gate abstains
-        // (data gap must not silently reject) and only the delta band applies.
-        if (isEntryGreeksGateEnabled()) {
+        // rather than bleeding a low-delta long. Ships behind
+        // ENTRY_GREEKS_GATE_ENABLED (under the EXIT_RISK_RULES_ENABLED master).
+        // DEMO-SCOPED: the board accepted arming this on the DEMO book only
+        // (parent TRA-1290, confirmation `99fbaa0d`) so the provisional 6.0
+        // ratio floor forward-samples its rejection rate at zero real-capital
+        // risk before any live promotion (a separate board decision). The
+        // `mode === 'demo'` guard makes the flag structurally incapable of
+        // rejecting a live option open regardless of the service-wide master —
+        // the same containment TAKE_PROFIT_EARLY_ENABLED uses. Theta is computed
+        // here via BS greeks (the RV candidate carries only delta); a missing
+        // underlying spot leaves thetaPerDay=0 so the ratio gate abstains (data
+        // gap must not silently reject) and only the delta band applies.
+        if (this.mode === 'demo' && isEntryGreeksGateEnabled()) {
           let thetaPerDay = 0;
           if (typeof underlyingSpot === 'number' && underlyingSpot > 0) {
             const greeks = blackScholesGreeks({

@@ -41,9 +41,9 @@ import { summarizeIgnitionScans } from '../crypto-ignition-scanner.js';
 import { summarizeConvictionDca, resolveConvictionDcaDeployAnchor } from '../conviction-dca-ledger.js';
 import { isScaleoutLadderEnabled } from '../scaleout-ladder-flag.js';
 import { summarizeScaleoutLadder } from '../scaleout-ladder-ledger.js';
-import { isCorrelatedExposureCapEnabled, CORRELATED_EXPOSURE_CAP_FLAG, isTakeProfitEarlyEnabled, TAKE_PROFIT_EARLY_FLAG } from '../exit-risk-rules-flag.js';
+import { isCorrelatedExposureCapEnabled, CORRELATED_EXPOSURE_CAP_FLAG, isTakeProfitEarlyEnabled, TAKE_PROFIT_EARLY_FLAG, isEntryGreeksGateEnabled, ENTRY_GREEKS_GATE_FLAG } from '../exit-risk-rules-flag.js';
 import { summarizeCorrelatedExposureBindings } from '../correlated-exposure-ledger.js';
-import { CONVICTION_DCA, CORRELATED_EXPOSURE_CAP_PCT, CORRELATED_EXPOSURE_MIN_TRADE_RISK_PCT, TAKE_PROFIT_EARLY_CAPTURE_PCT, resolveEquitySwingModeEnabled, resolveEquitySwingUniverse, EQUITY_SWING_UNIVERSE, EQUITY_SWING_GUARDRAIL } from '@trading-app/shared';
+import { CONVICTION_DCA, CORRELATED_EXPOSURE_CAP_PCT, CORRELATED_EXPOSURE_MIN_TRADE_RISK_PCT, TAKE_PROFIT_EARLY_CAPTURE_PCT, ENTRY_SHORT_DELTA_MIN, ENTRY_SHORT_DELTA_MAX, ENTRY_DELTA_THETA_RATIO_FLOOR, resolveEquitySwingModeEnabled, resolveEquitySwingUniverse, EQUITY_SWING_UNIVERSE, EQUITY_SWING_GUARDRAIL } from '@trading-app/shared';
 import { resolveDemoFlagEnv } from '../demo-flags.js';
 import {
   isSma200DemoForwardTestEnabled,
@@ -1006,6 +1006,38 @@ export function registerLiveHealthRoutes(app: Express, deps: LiveHealthDeps): vo
       note: enabled
         ? 'ARMED (demo-only): banks a demo option position once it captures 60% of available profit / max credit; live options path unchanged.'
         : 'DISARMED: set TAKE_PROFIT_EARLY_ENABLED=true (render.yaml env or DATA_DIR/demo-flags.json) to arm on the demo book.',
+    });
+  });
+
+  // TRA-1293 (parent TRA-1290, board confirmation `99fbaa0d` = accepted) —
+  // unauthenticated, secrets-free readout of whether the PoP / delta entry gate
+  // (short-strike |Δ| PoP band + |Δ|/|θ_per_day| ratio floor) is ARMED in this
+  // running process. DEMO-ONLY: the signal-engine only consults the gate on the
+  // `mode === 'demo'` RV-long entry branch, so an `enabled:true` here can NEVER
+  // reject a live option open regardless of the service-wide EXIT_RISK_RULES
+  // master — the same containment take-profit-early uses. We resolve the flag
+  // through the SAME path the engine consults (process.env layered with the
+  // DATA_DIR demo-flags.json overlay, file wins) so `enabled` reflects the
+  // EFFECTIVE switch. No balances/PII — just the flag + band/ratio thresholds.
+  app.get('/api/health/entry-greeks-gate', (_req, res) => {
+    const dir = process.env.DATA_DIR;
+    const env = dir ? resolveDemoFlagEnv(dir) : process.env;
+    const enabled = isEntryGreeksGateEnabled(env);
+    res.json({
+      ok: true,
+      time: new Date(now()).toISOString(),
+      build: resolveBuildInfo(),
+      flag: ENTRY_GREEKS_GATE_FLAG,
+      enabled,
+      demoOnly: true,
+      liveCapitalReachable: false,
+      config: {
+        shortDeltaBand: [ENTRY_SHORT_DELTA_MIN, ENTRY_SHORT_DELTA_MAX],
+        deltaThetaRatioFloor: ENTRY_DELTA_THETA_RATIO_FLOOR,
+      },
+      note: enabled
+        ? 'ARMED (demo-only): rejects a demo RV-long entry whose short-strike |Δ| is outside 0.30–0.40 or whose |Δ|/|θ_per_day| is below the 6.0 floor (provisional); live options path unchanged.'
+        : 'DISARMED: set ENTRY_GREEKS_GATE_ENABLED=1 (render.yaml env or DATA_DIR/demo-flags.json) AND the EXIT_RISK_RULES_ENABLED master to arm on the demo book.',
     });
   });
 

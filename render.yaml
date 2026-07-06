@@ -401,6 +401,22 @@ services:
       # effect on the running service. Accepts 1/true/yes/on.
       - key: TAKE_PROFIT_EARLY_ENABLED
         value: "true"
+      # TRA-1293 (parent TRA-1290, board confirmation `99fbaa0d` = accepted) — arm
+      # the PoP / DELTA ENTRY GATE + Delta/Theta ratio floor on the DEMO book. HARD
+      # pre-open filter: rejects an RV-long whose short-strike |Δ| is outside the
+      # 0.30–0.40 PoP band (spec) or whose |Δ|/|θ_per_day| ratio is below the 6.0
+      # floor (PROVISIONAL — forward-sampling its rejection rate before any live
+      # promotion, a separate board decision). Gated by BOTH the master
+      # EXIT_RISK_RULES_ENABLED (above, already "1") AND this sub-flag. DEMO-SCOPED
+      # in code: the signal-engine only consults the gate on the `mode === 'demo'`
+      # RV-long branch, so setting this can NEVER reject a live option open
+      # regardless of the service-wide master (same containment as
+      # TAKE_PROFIT_EARLY_ENABLED). Readout: `GET /api/health/entry-greeks-gate`
+      # (`enabled:true`, `demoOnly:true`). Revert = clear this value + redeploy.
+      # NOTE: blueprint sync ≠ autoDeploy on bqb1 (TRA-1289) — a redeploy (or the
+      # DATA_DIR/demo-flags.json override) is needed to take effect. Accepts 1/true/yes/on.
+      - key: ENTRY_GREEKS_GATE_ENABLED
+        value: "1"
       # TRA-1301 (parent TRA-1295, board confirmation `49eeae3c` = accepted) — arm
       # the CORRELATED-EXPOSURE CAP (Rule 5, the "7%" leg of the 3-5-7 governor) on
       # the LIVE entry paths. Gated by BOTH the master EXIT_RISK_RULES_ENABLED
