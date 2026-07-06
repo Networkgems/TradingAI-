@@ -210,5 +210,7 @@ export function tryBtcRsiBracketShort(args: BtcRsiBracketEvalArgs): TradeSignal 
     takeProfit: entryPrice - tpDistance,
     riskRewardRatio: tpDistance / stopDistance,
     timestamp: latest.timestamp,
+    // TRA-1325 — trigger-family diagnostic tag (§4.4 v2 RSI-extreme bracket).
+    trigger: 'rsi-bracket',
   };
 }

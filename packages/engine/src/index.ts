@@ -21,6 +21,16 @@ export type {
   ResolvedBtcRsiBracket,
   BtcRsiBracketEvalArgs,
 } from './strategies/btc-rsi-bracket.js';
+export {
+  BTC_MOMENTUM_DIVERGENCE_DEFAULTS,
+  resolveBtcMomentumDivergence,
+  tryBtcMomentumDivergenceShort,
+} from './strategies/btc-momentum-divergence.js';
+export type {
+  BtcMomentumDivergenceOverride,
+  ResolvedBtcMomentumDivergence,
+  BtcMomentumDivergenceEvalArgs,
+} from './strategies/btc-momentum-divergence.js';
 export { MeanReversionCryptoStrategy } from './strategies/archived/mean-reversion-crypto.js';
 export type { MeanReversionCryptoOptions } from './strategies/archived/mean-reversion-crypto.js';
 export { BreakoutVolStrategy } from './strategies/archived/breakout-vol.js';

@@ -33,6 +33,7 @@ import {
   SKIP_MAX_CONCURRENT_SHORTS,
   SKIP_PARKED_1D_DAILY,
   SKIP_PARKED_4H_LAYER12,
+  SKIP_PARKED_4H_R9,
   isPerpShortSymbol,
   isTier2PerpShort,
   perpShortRiskFraction,
@@ -88,6 +89,9 @@ describe('perp shorts spec wiring (TRA-261)', () => {
       expect(SKIP_PARKED_1D_DAILY).toBe('parked — failed §8 daily');
       // TRA-255 §4.4 r6 — 4H Layer 1+2 parked pending Layer 3 cascade-leg trigger.
       expect(SKIP_PARKED_4H_LAYER12).toBe('parked — failed §8 4H Layer 1+2');
+      // TRA-255 §4.4 r9 / TRA-1325 v3 — 4H r9 park. Byte-unchanged under v3;
+      // BTC-USD no longer fires it (routed to momentum-divergence), ETH/XRP do.
+      expect(SKIP_PARKED_4H_R9).toBe('parked — failed §8 4H r9');
     });
   });
 

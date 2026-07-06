@@ -154,6 +154,25 @@ const SKIP_DIAGNOSTIC_LONG_EMISSION = 'diagnostic — router emitted a long sign
 const DIAGNOSTIC_BTC_RSI_BRACKET_EMITTED = 'diagnostic — btc-rsi-bracket emitted';
 
 /**
+ * TRA-1325 / TRA-255 §4.4 v3 — momentum-divergence emission counters. Bumped
+ * every time `MomentumStrategy` emits a short on a 4H bar for a symbol routed
+ * to the v3 divergence trigger (`signal.symbol ∈
+ * spec.momentum.momentumDivergenceSymbols`), split by the `divergenceFamily`
+ * the engine tagged on the signal (`'rsi' | 'macd' | 'both'`). Surfaced as
+ * three rows in the §8 sweep report's skip-reason histogram so BTC-side
+ * divergence density is inspectable by sub-family independent of the alt-
+ * cluster cascade-leg density — the v3 §8 acceptance bar requires "≥ 1 BTC
+ * trade in ≥ 3 of 9 windows" (TRA-288 v3-spec §8) and the family split lets a
+ * future numeric retune promote the RSI-OR-MACD disjunction to AND if
+ * per-trade quality misses.
+ */
+const DIAGNOSTIC_BTC_MOMENTUM_DIVERGENCE_EMITTED: Record<'rsi' | 'macd' | 'both', string> = {
+  rsi: 'diagnostic — btc-momentum-divergence emitted (rsi)',
+  macd: 'diagnostic — btc-momentum-divergence emitted (macd)',
+  both: 'diagnostic — btc-momentum-divergence emitted (both)',
+};
+
+/**
  * Spec values for §4 short overrides. These mirror `crypto-engine.getRouter`
  * exactly — the harness reads from this single record so a sensitivity
  * perturbation can override one knob without forking the router config.
@@ -184,9 +203,19 @@ interface ShortSpec {
      * TRA-284 / TRA-255 §4.4 v2 — symbols routed to the BTC RSI-extreme
      * bracket trigger instead of the cascade-leg trigger when the cascade
      * family is active on 4H. Empty / undefined = cascade-leg fires for
-     * every symbol (pre-v2 routing). Spec r8 ships `['BTC-USD']`.
+     * every symbol (pre-v2 routing). Spec r8 ships `['BTC-USD']`; v3 vacates
+     * it to `[]` (BTC re-routed to the momentum-divergence family below).
      */
     lowCascadeDensitySymbols?: readonly string[];
+    /**
+     * TRA-1325 / TRA-255 §4.4 v3 — symbols routed to the BTC bearish
+     * momentum-divergence trigger instead of the cascade-leg (r7) or
+     * RSI-extreme bracket (v2) triggers when the cascade family is active on
+     * 4H. Empty / undefined = no divergence routing (pre-v3). Spec v3
+     * baseline ships `['BTC-USD']`. Must be disjoint from
+     * `lowCascadeDensitySymbols` (engine throws at construction otherwise).
+     */
+    momentumDivergenceSymbols?: readonly string[];
   };
   breakout: {
     volumeMultiplier: number;
@@ -248,10 +277,13 @@ const BASELINE_SPEC: ShortSpec = {
     volumeMultiplier: 1.10,
     volumeSmaPeriod: 20,
     cascadeLeg4h: true,
-    // TRA-284 / TRA-255 §4.4 v2 — route BTC-USD shorts to the RSI-extreme
-    // bracket trigger; alts (ETH / SOL / XRP / DOGE) keep the cascade-leg
-    // trigger unchanged. r8 spec `lowCascadeDensitySymbols: ['BTC-USD']`.
-    lowCascadeDensitySymbols: ['BTC-USD'],
+    // TRA-1325 / TRA-255 §4.4 v3 — route BTC-USD shorts to the bearish
+    // momentum-divergence trigger; the v2 RSI-extreme bracket list is vacated
+    // to `[]` (v3 de-routes v2, mirroring the r9 de-route pattern — the code
+    // path stays available for future re-enablement). Alts (ETH / SOL / XRP /
+    // DOGE) keep the cascade-leg trigger unchanged.
+    lowCascadeDensitySymbols: [],
+    momentumDivergenceSymbols: ['BTC-USD'],
   },
   breakout: {
     volumeMultiplier: 1.5,
@@ -264,7 +296,11 @@ const BASELINE_SPEC: ShortSpec = {
   },
   byTimeframe: {
     '4h': {
-      universe: ['SOL-USD', 'DOGE-USD'],
+      // TRA-1325 / TRA-255 §8.3 re-enablement clause 2 — BTC re-included in
+      // the 4H routing universe so it reaches the v3 divergence trigger
+      // instead of parking with SKIP_PARKED_4H_R9. ETH-USD / XRP-USD stay
+      // parked pending their own Phase-1.2 spikes.
+      universe: ['BTC-USD', 'SOL-USD', 'DOGE-USD'],
       lowCascadeDensitySymbols: [],
     },
   },
@@ -283,7 +319,9 @@ function buildShortRouter(spec: ShortSpec): StrategyRouter {
   // `consolidationBars` flows through to BreakoutVolOptions on its own.
   // TRA-284 / TRA-255 §4.4 v2 — `lowCascadeDensitySymbols` likewise lifts
   // off the harness spec into the strategy short overrides directly.
-  const { cascadeLeg4h, lowCascadeDensitySymbols, ...momentumFlat } = spec.momentum;
+  const {
+    cascadeLeg4h, lowCascadeDensitySymbols, momentumDivergenceSymbols, ...momentumFlat
+  } = spec.momentum;
   return new StrategyRouter({
     regime,
     momentum: new MomentumStrategy(regime, {
@@ -294,6 +332,12 @@ function buildShortRouter(spec: ShortSpec): StrategyRouter {
               byTimeframe: { '4h': {} },
               ...(lowCascadeDensitySymbols !== undefined
                 ? { lowCascadeDensitySymbols }
+                : {}),
+              // TRA-1325 / TRA-255 §4.4 v3 — lift the divergence routing list
+              // off the harness spec into the strategy short overrides, same
+              // as `lowCascadeDensitySymbols`.
+              ...(momentumDivergenceSymbols !== undefined
+                ? { momentumDivergenceSymbols }
                 : {}),
             }
           : { ...momentumFlat },
@@ -572,6 +616,25 @@ function runShortSim(input: SimInput): SimReport {
         && (input.spec.momentum.lowCascadeDensitySymbols ?? []).includes(signal.symbol)
       ) {
         bumpSkip(DIAGNOSTIC_BTC_RSI_BRACKET_EMITTED);
+      }
+
+      // TRA-1325 / TRA-255 §4.4 v3 — momentum-divergence emission counter,
+      // split by the engine-tagged `divergenceFamily`. Same emission boundary
+      // as the bracket counter (post-universe, pre-§5 / §6 / caps) so it
+      // reflects raw trigger activity, not post-gate fills. Routing predicate
+      // matches `MomentumStrategy` exactly: 4H bars, momentum signal type, and
+      // symbol matched by the spec's `momentumDivergenceSymbols`. Routing is
+      // exclusive on symbol (the engine throws on any v2/v3 overlap), so this
+      // counter cleanly isolates v3 emissions.
+      if (
+        input.granularity === '4h'
+        && signal.type === 'momentum'
+        && (input.spec.momentum.momentumDivergenceSymbols ?? []).includes(signal.symbol)
+      ) {
+        const family = signal.divergenceFamily;
+        if (family === 'rsi' || family === 'macd' || family === 'both') {
+          bumpSkip(DIAGNOSTIC_BTC_MOMENTUM_DIVERGENCE_EMITTED[family]);
+        }
       }
 
       // TRA-255 r3 §8.1 — Phase-1 1D timeframe is parked. Every short
@@ -1218,7 +1281,7 @@ function buildReport(
       const fundingNote = fundingActive
         ? 'The §5.1 funding gate is wired against the Binance USD-M futures funding history (cached locally, ~8h resolution / ÷ 8 → per-hour) — see `packages/backtest/src/funding-feed.ts` for the Coinbase INTX vs Binance basis rationale.'
         : '**Funding gate skipped on this run** — the public Binance USD-M `fundingRate` endpoint returns HTTP 451 from US-based IPs (geoblocked per Binance ToS §b). The harness handles this gracefully (empty history → `lookupFundingPerHour` returns undefined → `evaluateShortFilters` treats the gate as best-effort skipped per TRA-255 §5). Skip-reason histogram tells the truth: zero funding-gate skips. Use the OKX-sourced funding feed (TRA-287 follow-up) when the funding-active acceptance bar matters.';
-      lines.push(`> **r9 universe (TRA-287).** 4H routing reduced to \`${r9.universe.join(', ')}\` per TRA-255 r9 §4.4 Layer 3 v3. BTC-USD / ETH-USD / XRP-USD are parked with \`parked — failed §8 4H r9\`. ${fundingNote}\n`);
+      lines.push(`> **v3 universe (TRA-1325).** 4H routing is \`${r9.universe.join(', ')}\` per TRA-255 §4.4 v3 / §8.3 re-enablement clause 2. BTC-USD routes to the momentum-divergence trigger (\`momentumDivergenceSymbols: ['BTC-USD']\`); ETH-USD / XRP-USD stay parked with \`parked — failed §8 4H r9\`. ${fundingNote}\n`);
     }
   }
 
@@ -1440,12 +1503,13 @@ async function main() {
 
   const report = buildReport(baselineWf, sweep, symbols, fullByPair, granularity, fundingBySymbol);
   mkdirSync(REPORT_DIR, { recursive: true });
-  // TRA-287 — 4H sidecar uses the `tra261-sweep-4h-r9` filename per the
-  // ticket; the v2 file (`tra266-sweep-4h.md`) stays on disk as the historical
-  // failed-baseline record so QuantTrader can diff r9 against it.
+  // TRA-1325 — 4H sidecar uses the `tra261-sweep-4h-v3` filename per the
+  // ticket's sweep-sidecar precedent (`tra261-sweep-4h-v2.md`); the r9 file
+  // stays on disk as the historical BTC-parked baseline so QuantTrader can
+  // diff v3 against it (alt-cluster non-regression bar).
   const reportName = granularity === '1d'
     ? 'tra266-sweep.md'
-    : 'tra261-sweep-4h-r9.md';
+    : 'tra261-sweep-4h-v3.md';
   const outPath = resolve(REPORT_DIR, reportName);
   writeFileSync(outPath, report);
   console.log(`\n[run-tra261-sweep] Report written: ${outPath}`);
@@ -1461,14 +1525,14 @@ async function main() {
   if (granularity === '1d') {
     console.log('Parked baseline run: every short suppressed with SKIP_PARKED_1D_DAILY. §8 numbers reflect zero opens — see TRA-255 r3 §8.1.');
   } else {
-    const r9Universe = BASELINE_SPEC.byTimeframe?.['4h']?.universe ?? [];
-    console.log(`r9 routing universe: ${r9Universe.join(', ')} (BTC/ETH/XRP parked with SKIP_PARKED_4H_R9).`);
+    const v3Universe = BASELINE_SPEC.byTimeframe?.['4h']?.universe ?? [];
+    console.log(`v3 routing universe: ${v3Universe.join(', ')} (BTC → momentum-divergence trigger; ETH/XRP parked with SKIP_PARKED_4H_R9).`);
   }
-  console.log(`Windows passing all bars: ${passingCount} / ${totalWindows}${granularity === '4h' ? ` (r9 quorum ${r9PassQuorum})` : ''}`);
+  console.log(`Windows passing all bars: ${passingCount} / ${totalWindows}${granularity === '4h' ? ` (v3 quorum ${r9PassQuorum})` : ''}`);
   if (granularity === '1d') {
     console.log('Decision: PARKED — TRA-255 r3 §8.1 baseline. The 4H run (TRA-267) is the live evaluation track.');
   } else {
-    console.log(`Decision: ${passAll ? 'PASS — TRA-287 → TRA-255 (QuantTrader sign-off)' : 'FAIL — TRA-287 → TRA-255 (Phase-1.2 escalation)'}`);
+    console.log(`Decision: ${passAll ? 'PASS — TRA-1325 → TRA-255 (QuantTrader sign-off)' : 'FAIL — TRA-1325 → TRA-255 (Phase-1.2 escalation)'}`);
   }
 
   // Emit a JSON sidecar for downstream automation (TRA-261 update, etc.).

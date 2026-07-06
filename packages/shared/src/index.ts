@@ -106,6 +106,28 @@ export interface TradeSignal {
    */
   signalSkipReason?: string;
   /**
+   * TRA-1325 / TRA-255 §4.4 — trigger-family diagnostic tag on crypto perp
+   * short entries emitted by `MomentumStrategy` on 4H bars. Distinguishes the
+   * three entry-rule families that can produce a short on the same router:
+   * `'cascade-leg'` (§4.4 r7 alt-cluster default), `'rsi-bracket'` (§4.4 v2
+   * BTC RSI-extreme bracket), and `'momentum-divergence'` (§4.4 v3 BTC
+   * bearish momentum-divergence). Absent on long-side and non-4H short
+   * emissions (those never route through a trigger family) so a downstream
+   * reader can treat an undefined tag as "not a 4H trigger-family short".
+   */
+  trigger?: 'cascade-leg' | 'rsi-bracket' | 'momentum-divergence';
+  /**
+   * TRA-1325 / TRA-255 §4.4 v3 — divergence sub-family on a
+   * `trigger === 'momentum-divergence'` emission. `'rsi'` ↔ only the bearish
+   * RSI(14) divergence held; `'macd'` ↔ only the bearish MACD-line divergence
+   * held; `'both'` ↔ both held; `null` ↔ never set on a v3 fire (a v3 signal
+   * always carries one of the three non-null values because the disjunction
+   * is a fire precondition). Only ever present alongside `trigger ===
+   * 'momentum-divergence'`; the §8 sweep splits BTC divergence density by
+   * this field.
+   */
+  divergenceFamily?: 'rsi' | 'macd' | 'both' | null;
+  /**
    * TRA-1289 (TRA-1288 Option A) — marks a fill that opened via the DEMO-ONLY,
    * flag-gated forward-test path for an un-gate-passed router (today only the
    * primary swing router `sma200_pullback` under `ENABLE_SMA200_DEMO_FORWARD_TEST`).

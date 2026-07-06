@@ -22,6 +22,12 @@ import {
   resolveBtcRsiBracket,
   tryBtcRsiBracketShort,
 } from '../btc-rsi-bracket.js';
+import {
+  BtcMomentumDivergenceOverride,
+  ResolvedBtcMomentumDivergence,
+  resolveBtcMomentumDivergence,
+  tryBtcMomentumDivergenceShort,
+} from '../btc-momentum-divergence.js';
 
 export interface MomentumOptions {
   /** Fast EMA period for the trend filter (default: 50). */
@@ -117,6 +123,23 @@ export interface MomentumOptions {
        * (`RSI(14) ≥ 70`, `0.98 × max(high, 20)`, lower-half close).
        */
       btcRsiBracket?: BtcRsiBracketOverride;
+      /**
+       * TRA-1325 / TRA-255 §4.4 v3 — symbols routed to the BTC bearish
+       * momentum-divergence trigger instead of the cascade-leg (r7) or
+       * RSI-extreme bracket (v2) triggers when `byTimeframe['4h']` is active.
+       * Default empty; spec v3 baseline ships `['BTC-USD']`. Introduced in
+       * parallel with `lowCascadeDensitySymbols` (not overloaded onto it)
+       * because the two lists route to structurally different trigger
+       * families. Config-time validation throws if the two lists intersect —
+       * a symbol cannot route to two BTC-specific trigger families at once.
+       */
+      momentumDivergenceSymbols?: readonly string[];
+      /**
+       * TRA-1325 / TRA-255 §4.4 v3 — overrides for the momentum-divergence
+       * numeric primitives (fractal `n = 3`, pair window `6..30`, RSI(14),
+       * MACD(12,26)). Defaults to the spec v3 baseline values.
+       */
+      btcMomentumDivergence?: BtcMomentumDivergenceOverride;
     };
   };
 }
@@ -219,6 +242,22 @@ interface ResolvedOptions {
    * its byte-identical behaviour for callers that haven't opted into v2).
    */
   lowCascadeDensitySymbols: ReadonlySet<string>;
+  /**
+   * TRA-1325 / TRA-255 §4.4 v3 — resolved momentum-divergence numeric
+   * primitives. Always defined (spec defaults) so reading
+   * `opt.btcMomentumDivergence` is type-safe; the v3 trigger only runs on the
+   * short side under `cascadeShortActive` AND
+   * `momentumDivergenceSymbols.has(symbol)`.
+   */
+  btcMomentumDivergence: ResolvedBtcMomentumDivergence;
+  /**
+   * TRA-1325 / TRA-255 §4.4 v3 — symbols routed to the momentum-divergence
+   * trigger. Always defined (defaults to an empty Set so the cascade-leg /
+   * bracket paths keep byte-identical behaviour for callers that haven't
+   * opted into v3). Guaranteed disjoint from `lowCascadeDensitySymbols` by
+   * the constructor's config-time overlap validation.
+   */
+  momentumDivergenceSymbols: ReadonlySet<string>;
 }
 
 interface ResolvedCascadeLeg {
@@ -253,6 +292,7 @@ const FOUR_HOUR_INTERVAL_MIN_MS = 3.5 * 60 * 60 * 1000;
 const FOUR_HOUR_INTERVAL_MAX_MS = 4.5 * 60 * 60 * 1000;
 
 const EMPTY_LOW_CASCADE_DENSITY_SYMBOLS: ReadonlySet<string> = new Set<string>();
+const EMPTY_MOMENTUM_DIVERGENCE_SYMBOLS: ReadonlySet<string> = new Set<string>();
 
 const DEFAULTS: Omit<ResolvedOptions, 'rearmBars'> = {
   fastMaPeriod: 50,
@@ -281,6 +321,19 @@ const DEFAULTS: Omit<ResolvedOptions, 'rearmBars'> = {
     bearishRejectionRangeRatio: 0.50,
   },
   lowCascadeDensitySymbols: EMPTY_LOW_CASCADE_DENSITY_SYMBOLS,
+  // TRA-1325 / TRA-255 §4.4 v3 — divergence defaults filled even on the
+  // long-side resolved set so reading `opt.btcMomentumDivergence` is always
+  // type-safe; the v3 trigger only runs on the short side under
+  // `cascadeShortActive` AND `momentumDivergenceSymbols.has(symbol)`.
+  btcMomentumDivergence: {
+    swingLookback: 3,
+    pairWindowMinBars: 6,
+    pairWindowMaxBars: 30,
+    rsiPeriod: 14,
+    macdFastPeriod: 12,
+    macdSlowPeriod: 26,
+  },
+  momentumDivergenceSymbols: EMPTY_MOMENTUM_DIVERGENCE_SYMBOLS,
 };
 
 /**
@@ -362,9 +415,14 @@ export class MomentumStrategy {
       byTimeframe?: MomentumByTimeframeOverrides;
       lowCascadeDensitySymbols?: readonly string[];
       btcRsiBracket?: BtcRsiBracketOverride;
+      momentumDivergenceSymbols?: readonly string[];
+      btcMomentumDivergence?: BtcMomentumDivergenceOverride;
     },
   ): Partial<ResolvedOptions> {
-    const { byTimeframe, lowCascadeDensitySymbols, btcRsiBracket, ...flat } = raw;
+    const {
+      byTimeframe, lowCascadeDensitySymbols, btcRsiBracket,
+      momentumDivergenceSymbols, btcMomentumDivergence, ...flat
+    } = raw;
     const out: Partial<ResolvedOptions> = { ...flat };
     if (raw.donchianPeriod !== undefined && raw.rearmBars === undefined) {
       out.rearmBars = raw.donchianPeriod;
@@ -390,6 +448,31 @@ export class MomentumStrategy {
     }
     if (lowCascadeDensitySymbols !== undefined) {
       out.lowCascadeDensitySymbols = new Set(lowCascadeDensitySymbols);
+    }
+    // TRA-1325 / TRA-255 §4.4 v3 — resolve the divergence override + routing
+    // list. Always overlay the divergence defaults so the resolved short
+    // overrides carries the spec numerics even when the caller only wires the
+    // symbol list; the cascade-leg vs bracket vs divergence routing is decided
+    // per-evaluate so the resolution itself is symbol-agnostic.
+    if (btcMomentumDivergence !== undefined) {
+      out.btcMomentumDivergence = resolveBtcMomentumDivergence(btcMomentumDivergence);
+    }
+    if (momentumDivergenceSymbols !== undefined) {
+      out.momentumDivergenceSymbols = new Set(momentumDivergenceSymbols);
+    }
+    // TRA-1325 / TRA-255 §4.4 v3 — config-time validation: a symbol cannot be
+    // routed to two BTC-specific trigger families at once. Throw on any
+    // overlap between the divergence (v3) and bracket (v2) routing lists so a
+    // mis-wired preset fails at construction, not silently at fire time.
+    if (momentumDivergenceSymbols !== undefined && lowCascadeDensitySymbols !== undefined) {
+      const bracketSet = new Set(lowCascadeDensitySymbols);
+      const overlap = momentumDivergenceSymbols.filter((s) => bracketSet.has(s));
+      if (overlap.length > 0) {
+        throw new Error(
+          `MomentumStrategy: momentumDivergenceSymbols and lowCascadeDensitySymbols must be disjoint `
+          + `(TRA-255 §4.4 v3 routing predicate); overlapping symbols: ${overlap.join(', ')}`,
+        );
+      }
     }
     return out;
   }
@@ -444,8 +527,26 @@ export class MomentumStrategy {
       && this.isFourHourBars(candles);
     if (cascadeShortActive) {
       const shortOpt = this.optFor('sell');
-      const useBracket = shortOpt.lowCascadeDensitySymbols.has(symbol);
-      const sig = useBracket
+      // TRA-1325 / TRA-255 §4.4 v3 — fall-through routing predicate:
+      //   momentumDivergenceSymbols -> v3 divergence trigger;
+      //   lowCascadeDensitySymbols  -> v2 RSI-extreme bracket;
+      //   else                      -> cascade-leg r7.
+      // The three lists are guaranteed disjoint (v3/v2 by the constructor's
+      // overlap validation) so at most one family fires on any bar.
+      const useDivergence = shortOpt.momentumDivergenceSymbols.has(symbol);
+      const useBracket = !useDivergence && shortOpt.lowCascadeDensitySymbols.has(symbol);
+      const sig = useDivergence
+        ? tryBtcMomentumDivergenceShort({
+            symbol,
+            candles,
+            divergence: shortOpt.btcMomentumDivergence,
+            atrPeriod: shortOpt.atrPeriod,
+            atrStopMultiplier: shortOpt.atrStopMultiplier,
+            atrTpMultiplier: shortOpt.atrTpMultiplier,
+            rearmBars: shortOpt.rearmBars,
+            lastFireTs: this.lastFireTs,
+          })
+        : useBracket
         ? tryBtcRsiBracketShort({
             symbol,
             candles,
@@ -678,6 +779,8 @@ export class MomentumStrategy {
       takeProfit,
       riskRewardRatio: tpDistance / stopDistance,
       timestamp: latest.timestamp,
+      // TRA-1325 — trigger-family diagnostic tag (§4.4 r7 cascade-leg).
+      trigger: 'cascade-leg',
     };
   }
 
