@@ -515,7 +515,11 @@ export const MANAGED_ACCOUNT_RATIO = 0.5;   // 50% of total account auto-managed
  * forward paper leg instead. Only the live-relevant presets survive: `no_trade`
  * (the live stand-down) and `crypto_core` (the go-forward DCA-only roster).
  */
-export type StrategyPresetId = 'no_trade' | 'crypto_core' | 'crypto_core_live_majors';
+export type StrategyPresetId =
+  | 'no_trade'
+  | 'crypto_core'
+  | 'crypto_core_live_majors'
+  | 'crypto_core_live_canary_btc';
 
 /** Crypto-strategy SignalTypes routable by the engine. Subset of {@link SignalType}. */
 export type CryptoStrategyType =
@@ -657,6 +661,29 @@ export const STRATEGY_PRESETS: Readonly<Record<StrategyPresetId, StrategyPreset>
     symbolFilter: ['BTC-USD', 'ETH-USD', 'SOL-USD'] as const,
     strategyUniverse: {
       dca: ['BTC-USD', 'ETH-USD', 'SOL-USD'] as const,
+    },
+  },
+  // TRA-1304 canary — QuantTrader's redefined item-5 (comment 4436ec31): before
+  // any full-cap scaling, prove real Coinbase execution once with a single live
+  // DCA ENTRY at a canary-tight notional on the single most-liquid major. This
+  // preset is a strictly SMALLER subset of `crypto_core_live_majors` (BTC-USD
+  // only, everything else identical) — it is the ONLY change to symbol scope for
+  // the canary; the tight per-symbol notional ceiling is applied separately via
+  // the `CRYPTO_DCA_MAX_SYMBOL_NOTIONAL_USD` env (see crypto-engine.ts). ETH-USD
+  // is the sanctioned substitute if BTC-USD sits below its 200-day EMA for the
+  // whole window (swap the dca universe to ['ETH-USD'] and note it in-thread).
+  // On canary PASS the step-up is env-only, no code change and no re-gate: point
+  // LIVE_STRATEGY_PRESET back at `crypto_core_live_majors` and clear the notional
+  // env to restore the ratified BTC/ETH/SOL majors set at the 0.10 cap.
+  crypto_core_live_canary_btc: {
+    id: 'crypto_core_live_canary_btc',
+    displayName: 'Crypto Core (Live canary) — DCA entry proof on BTC-USD only',
+    description:
+      'TRA-1304 live-money CANARY preset. A strictly-smaller subset of crypto_core_live_majors pinned to BTC-USD alone, used once to prove a real Coinbase DCA entry places and fills before scaling to the ratified majors/cap. Guardrails unchanged from the majors preset (EMA-200 daily gate, 6×ATR(14) catastrophe stop, hold-mode); the canary-tight per-symbol notional ceiling min($25, 0.10-of-managed) is applied via CRYPTO_DCA_MAX_SYMBOL_NOTIONAL_USD. Not a widening of any authorization — QuantTrader adjudicated it inside the existing sign-off (comment 4436ec31).',
+    enabledStrategies: ['dca'] as const,
+    symbolFilter: ['BTC-USD'] as const,
+    strategyUniverse: {
+      dca: ['BTC-USD'] as const,
     },
   },
 };

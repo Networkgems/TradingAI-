@@ -289,6 +289,41 @@ const CRYPTO_DCA_ACCUMULATION = {
   // skipped if it would breach the cluster notional cap, same as a fresh entry.
 } as const;
 
+/**
+ * TRA-1304 canary — optional ABSOLUTE per-symbol notional ceiling (USD).
+ *
+ * QuantTrader's redefined item-5 (comment 4436ec31) requires proving real
+ * Coinbase execution once with a single live DCA ENTRY at a canary-tight notional
+ * before scaling to the ratified caps. When `CRYPTO_DCA_MAX_SYMBOL_NOTIONAL_USD`
+ * is set (>0), the effective per-symbol cap becomes
+ * `min(this, maxSymbolNotionalFracOfManagedEquity × managedEquity)` — clamping
+ * BOTH the first live entry tranche and every accumulation add for the DCA symbol.
+ * Unset (the ratified config) → `null` → no absolute ceiling, the frac-of-equity
+ * cap governs exactly as before (behavioural no-op off the canary path).
+ *
+ * Canary value per the item-5 spec: `min($25, ratified 0.10-of-managed)` on
+ * BTC-USD only (paired with `LIVE_STRATEGY_PRESET=crypto_core_live_canary_btc`).
+ * The PASS step-up is env-only — clear this var and repoint LIVE_STRATEGY_PRESET
+ * at `crypto_core_live_majors` — so no code change and no re-gate is needed.
+ */
+const CANARY_MAX_SYMBOL_NOTIONAL_USD: number | null = (() => {
+  const raw = Number((process.env.CRYPTO_DCA_MAX_SYMBOL_NOTIONAL_USD ?? '').trim());
+  return Number.isFinite(raw) && raw > 0 ? raw : null;
+})();
+
+/**
+ * Effective per-symbol DCA notional cap for the live book: the ratified
+ * frac-of-managed-equity cap, tightened to the canary absolute ceiling when
+ * {@link CANARY_MAX_SYMBOL_NOTIONAL_USD} is armed. Used to bound both the first
+ * live entry tranche and every accumulation add.
+ */
+function effectiveMaxSymbolNotionalUsd(managedEquity: number): number {
+  const fracCap = managedEquity * CRYPTO_DCA_ACCUMULATION.maxSymbolNotionalFracOfManagedEquity;
+  return CANARY_MAX_SYMBOL_NOTIONAL_USD !== null
+    ? Math.min(CANARY_MAX_SYMBOL_NOTIONAL_USD, fracCap)
+    : fracCap;
+}
+
 export class CryptoSignalEngine {
   // TRA-699: the legacy bb_fade / swing direct strategies and the per-symbol
   // momentum / mean_reversion / breakout_vol StrategyRouter were retired here
@@ -2103,8 +2138,16 @@ export class CryptoSignalEngine {
           continue;
         }
 
+        // TRA-1304 canary — clamp the first live entry tranche to the effective
+        // per-symbol notional ceiling ONLY when the canary env is armed. Off the
+        // canary path this is `undefined`, so the ratified entry sizing is
+        // untouched (the frac cap continues to bind only the accumulated total).
+        const entryMaxNotionalUsd =
+          CANARY_MAX_SYMBOL_NOTIONAL_USD !== null
+            ? effectiveMaxSymbolNotionalUsd(live.managedEquity())
+            : undefined;
         try {
-          const opened = await live.openPosition(signal, price, source, clusterCapMultiplier);
+          const opened = await live.openPosition(signal, price, source, clusterCapMultiplier, entryMaxNotionalUsd);
           if (opened) {
             opened.mode = 'live';
             // TRA-1304 — the first live DCA tranche is also a held accumulation:
@@ -2144,8 +2187,9 @@ export class CryptoSignalEngine {
   ): Promise<void> {
     const live = this.liveAccount;
     if (!live) return;
-    // Per-symbol notional cap: total accumulated notional ≤ frac × managed equity.
-    const capNotional = live.managedEquity() * CRYPTO_DCA_ACCUMULATION.maxSymbolNotionalFracOfManagedEquity;
+    // Per-symbol notional cap: total accumulated notional ≤ frac × managed equity,
+    // tightened to the TRA-1304 canary absolute ceiling when it is armed.
+    const capNotional = effectiveMaxSymbolNotionalUsd(live.managedEquity());
     const currentNotional = pos.quantity * price;
     const headroomNotional = capNotional - currentNotional;
     if (headroomNotional <= 0) {
@@ -2533,6 +2577,81 @@ export class CryptoSignalEngine {
 
   getState(): CryptoEngineState {
     return this.buildState();
+  }
+
+  /**
+   * TRA-1304 — redacted, secrets-free acceptance readout for the item-5 live DCA
+   * canary (QuantTrader comment 4436ec31). Mirrors {@link SignalEngine.getLiveEquityAcceptance}:
+   * booleans / counts / ids only — no keys, prices, or order specifics beyond
+   * aggregate notional — so the canary arm state and the four PASS criteria can
+   * be verified against the live deployment via the tokenless
+   * `GET /api/health/crypto-dca-canary` probe, no credentials shipped into an
+   * agent env. Reports both the ARMED posture (preset + notional ceiling +
+   * operator-enable) and, once a real entry fills, the PASS-relevant shape of the
+   * live DCA position(s).
+   */
+  getCryptoDcaCanaryAcceptance() {
+    const livePreset = this.resolvePreset('live');
+    const armedDcaUniverse = livePreset.strategyUniverse?.dca
+      ? [...livePreset.strategyUniverse.dca]
+      : livePreset.symbolFilter
+        ? [...livePreset.symbolFilter]
+        : null;
+    const live = this.liveAccount;
+    const managedEquity = live ? live.managedEquity() : 0;
+    const liveDca = (live?.getState().openPositions ?? []).filter(p => p.signalType === 'dca');
+    let maxNotionalUsd = 0;
+    let lastEntryAt = 0;
+    for (const p of liveDca) {
+      const notional = p.quantity * p.entryPrice;
+      if (notional > maxNotionalUsd) maxNotionalUsd = notional;
+      if (p.openedAt > lastEntryAt) lastEntryAt = p.openedAt;
+    }
+    const effectiveCap = live ? effectiveMaxSymbolNotionalUsd(managedEquity) : null;
+    const positionsModeLive = liveDca.filter(p => (p.mode ?? 'demo') === 'live').length;
+    const positionsWithStop = liveDca.filter(p => Number.isFinite(p.stopLoss)).length;
+    const positionsHoldNoTp = liveDca.filter(
+      p => p.dcaHold === true && !Number.isFinite(p.takeProfit as number),
+    ).length;
+    // Cap-breach check with a small tolerance for quantization rounding.
+    const capBreached =
+      effectiveCap !== null && maxNotionalUsd > effectiveCap * 1.02;
+    return {
+      mode: this.mode,
+      // ARMED posture — all operator-controlled gates the canary cannot fire without.
+      liveBrokerConfigured: live !== null, // Coinbase creds bound (engine publishes liveAccount only when authed)
+      liveAutoTradingEnabled: this.autoTradingEnabledLive, // cryptoAutoTradingEnabledLive
+      resolvedLivePresetId: livePreset.id,
+      armedDcaUniverse,
+      canaryPresetPinned: livePreset.id === 'crypto_core_live_canary_btc',
+      canaryNotionalCeilingUsd: CANARY_MAX_SYMBOL_NOTIONAL_USD,
+      effectiveMaxSymbolNotionalUsd: effectiveCap,
+      canaryArmed:
+        livePreset.id === 'crypto_core_live_canary_btc'
+        && CANARY_MAX_SYMBOL_NOTIONAL_USD !== null,
+      canaryReadyToFire:
+        this.mode === 'live'
+        && live !== null
+        && this.autoTradingEnabledLive
+        && livePreset.id === 'crypto_core_live_canary_btc'
+        && CANARY_MAX_SYMBOL_NOTIONAL_USD !== null,
+      // PASS evidence — populated once a real entry fills on the live book.
+      liveDcaPositionCount: liveDca.length,
+      liveDcaPositionsModeLive: positionsModeLive,
+      liveDcaPositionsWithStop: positionsWithStop,
+      liveDcaPositionsHoldNoTakeProfit: positionsHoldNoTp,
+      maxLiveDcaPositionNotionalUsd: liveDca.length > 0 ? Number(maxNotionalUsd.toFixed(2)) : 0,
+      capBreached,
+      // Item-5 PASS #1–#2 in one flag: a live-mode DCA entry with a catastrophe
+      // stop, held (no per-leg TP), and within the effective cap.
+      firstLiveDcaEntryConfirmed:
+        liveDca.length > 0
+        && positionsModeLive === liveDca.length
+        && positionsWithStop === liveDca.length
+        && positionsHoldNoTp === liveDca.length
+        && !capBreached,
+      lastLiveDcaEntryAt: lastEntryAt > 0 ? new Date(lastEntryAt).toISOString() : null,
+    };
   }
 
   getNews(): NewsItem[] {

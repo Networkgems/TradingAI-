@@ -2693,6 +2693,23 @@ app.get('/api/health/autonomous-demo', (_req, res) => {
   res.json(getAutonomousDemoStatus(demoFlagEnv()));
 });
 
+// TRA-1304 — tokenless acceptance probe for the item-5 live DCA canary
+// (QuantTrader comment 4436ec31). Enumerates every engine's redacted canary
+// readout (booleans / counts / ids / aggregate notional only — no keys, prices,
+// or order specifics) so the canary ARM state and the four PASS criteria can be
+// verified against the live deployment without shipping Coinbase credentials
+// into an agent env. Unauthenticated by design, matching the other health
+// probes. Canary off / demo-only ⇒ canaryArmed:false and empty PASS evidence.
+app.get('/api/health/crypto-dca-canary', (_req, res) => {
+  res.json({
+    time: new Date().toISOString(),
+    engines: getAllUserContexts().map(ctx => ({
+      username: ctx.username,
+      ...ctx.cryptoEngine.getCryptoDcaCanaryAcceptance(),
+    })),
+  });
+});
+
 // TRA-406 — observability surface. Returns the recent in-memory alerts and the
 // 15-minute captured-error count so QA / ops can see incident state without
 // shelling into the box. Gated by auth — alert detail can carry path/host info.

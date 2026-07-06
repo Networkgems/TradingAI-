@@ -1282,6 +1282,7 @@ export class CryptoLiveAccount {
     currentPrice: number,
     quoteSource?: PositionQuoteSource,
     sizeMultiplier = 1,
+    maxNotionalUsd?: number,
   ): Promise<Position | null> {
     // TRA-264 — SELL-side fork. Symbols inside the Phase-1 perp shorts
     // universe (TRA-261 / TRA-255 §2: BTC, ETH, SOL, XRP, DOGE) route to
@@ -1368,6 +1369,14 @@ export class CryptoLiveAccount {
     // `openPerpShort`, which is governed by the TRA-261 short notional caps.
     if (Number.isFinite(sizeMultiplier) && sizeMultiplier > 0 && sizeMultiplier < 1) {
       qty *= sizeMultiplier;
+    }
+    // TRA-1304 canary — clamp the entry to an absolute per-symbol notional
+    // ceiling when the caller supplies one (the engine passes it only while the
+    // canary env is armed; see effectiveMaxSymbolNotionalUsd). Sizes DOWN only,
+    // so the min-notional/cash gates below still apply. Off the canary path the
+    // arg is undefined and this is a no-op.
+    if (typeof maxNotionalUsd === 'number' && Number.isFinite(maxNotionalUsd) && maxNotionalUsd > 0) {
+      qty = Math.min(qty, maxNotionalUsd / currentPrice);
     }
     // TRA-243 — Coinbase enforces a per-product `base_increment` (e.g.
     // `0.00000001` for BTC, `1` for SHIB). Sending finer-grained sizes

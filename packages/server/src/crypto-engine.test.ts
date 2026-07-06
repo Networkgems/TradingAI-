@@ -148,6 +148,69 @@ beforeEach(() => {
   vi.spyOn(console, 'warn').mockImplementation(() => {});
 });
 
+async function freshFundedLiveAccount(usd = '100000'): Promise<{
+  account: CryptoLiveAccount;
+  coinbase: FakeCoinbaseClient;
+}> {
+  const coinbase = new FakeCoinbaseClient();
+  coinbase.listAccounts.mockResolvedValue([
+    {
+      uuid: 'usd',
+      name: 'USD',
+      currency: 'USD',
+      available_balance: { value: usd, currency: 'USD' },
+      hold: { value: '0', currency: 'USD' },
+    },
+  ]);
+  const account = new CryptoLiveAccount(asClient(coinbase), { sleep: async () => {} });
+  await account.refreshBalance();
+  return { account, coinbase };
+}
+
+describe('CryptoLiveAccount.openPosition — TRA-1304 canary notional clamp', () => {
+  it('clamps the entry order to the absolute per-symbol notional ceiling when supplied', async () => {
+    const { account, coinbase } = await freshFundedLiveAccount();
+    coinbase.placeMarketOrder.mockResolvedValueOnce(orderSuccess('o-buy', 'BUY'));
+    coinbase.getOrder.mockResolvedValueOnce(
+      orderDetails({ order_id: 'o-buy', side: 'BUY', status: 'FILLED', average_filled_price: '60000', filled_size: '0.0004' }),
+    );
+    // Canary ceiling = $25. sizeMultiplier=1, cap=25.
+    const opened = await account.openPosition(buildSignal(), 60_000, 'coinbase', 1, 25);
+    expect(opened).not.toBeNull();
+    const placed = coinbase.placeMarketOrder.mock.calls[0][0];
+    const placedNotional = placed.baseSize * 60_000;
+    // The clamp binds near the ceiling (within one quantization step), not to zero.
+    expect(placedNotional).toBeLessThanOrEqual(25 * 1.01);
+    expect(placedNotional).toBeGreaterThan(20);
+  });
+
+  it('leaves entry sizing untouched when no ceiling is supplied (ratified path)', async () => {
+    const { account, coinbase } = await freshFundedLiveAccount();
+    coinbase.placeMarketOrder.mockResolvedValueOnce(orderSuccess('o-buy', 'BUY'));
+    coinbase.getOrder.mockResolvedValueOnce(
+      orderDetails({ order_id: 'o-buy', side: 'BUY', status: 'FILLED', average_filled_price: '60000', filled_size: '0.5' }),
+    );
+    const opened = await account.openPosition(buildSignal(), 60_000);
+    expect(opened).not.toBeNull();
+    const placed = coinbase.placeMarketOrder.mock.calls[0][0];
+    // Risk-sized entry is far above the $25 canary ceiling — proving the clamp is
+    // opt-in and the ratified path is unchanged when no cap is passed.
+    expect(placed.baseSize * 60_000).toBeGreaterThan(25);
+  });
+});
+
+describe('CryptoSignalEngine.getCryptoDcaCanaryAcceptance — TRA-1304 item-5 readout', () => {
+  it('reports disarmed on a default demo engine (no live account, no canary env)', () => {
+    const engine = new CryptoSignalEngine();
+    const readout = engine.getCryptoDcaCanaryAcceptance();
+    expect(readout.canaryArmed).toBe(false);
+    expect(readout.canaryReadyToFire).toBe(false);
+    expect(readout.liveBrokerConfigured).toBe(false);
+    expect(readout.liveDcaPositionCount).toBe(0);
+    expect(readout.firstLiveDcaEntryConfirmed).toBe(false);
+  });
+});
+
 describe('CryptoSignalEngine.manualClosePosition — live mode wiring (TRA-320)', () => {
   it('routes the close through Coinbase and records the live closed position on success', async () => {
     const { account, coinbase, positionId } = await liveAccountWithOpenSpot();
@@ -277,15 +340,33 @@ describe('Strategy presets — TRA-325', () => {
     }
   });
 
-  it('TRA-697 / TRA-1304 — the preset library is exactly { no_trade, crypto_core, crypto_core_live_majors }', () => {
+  it('TRA-697 / TRA-1304 — the preset library is exactly { no_trade, crypto_core, crypto_core_live_majors, crypto_core_live_canary_btc }', () => {
     // The OOS-failed legacy roster (legacy_5 / bb_fade_sol_doge / tra405_validated)
     // was retired; the live stand-down + the go-forward DCA demo roster remain,
-    // and TRA-1304 added the majors-pinned LIVE DCA preset.
+    // TRA-1304 added the majors-pinned LIVE DCA preset, and the item-5 canary
+    // adjudication (QuantTrader comment 4436ec31) added the BTC-only canary subset.
     expect(Object.keys(STRATEGY_PRESETS).sort()).toEqual([
       'crypto_core',
+      'crypto_core_live_canary_btc',
       'crypto_core_live_majors',
       'no_trade',
     ]);
+  });
+
+  // TRA-1304 item-5 canary — the canary preset is a strictly-SMALLER subset of
+  // crypto_core_live_majors: DCA-only, BTC-USD alone via both gates. A widening
+  // to any non-BTC major (or alt) is admitted by neither gate, so the canary can
+  // never route an entry off BTC-USD.
+  it('TRA-1304 — crypto_core_live_canary_btc pins DCA to BTC-USD only (both gates)', () => {
+    const p = STRATEGY_PRESETS.crypto_core_live_canary_btc;
+    expect(p.enabledStrategies).toEqual(['dca']);
+    expect([...(p.symbolFilter ?? [])]).toEqual(['BTC-USD']);
+    expect([...(p.strategyUniverse?.dca ?? [])]).toEqual(['BTC-USD']);
+    expect(presetAllowsStrategySymbol(p, 'dca', 'BTC-USD')).toBe(true);
+    // ETH/SOL are ratified majors but OUT of scope during the canary.
+    expect(presetAllowsStrategySymbol(p, 'dca', 'ETH-USD')).toBe(false);
+    expect(presetAllowsStrategySymbol(p, 'dca', 'SOL-USD')).toBe(false);
+    expect(presetAllowsStrategySymbol(p, 'dca', 'DOGE-USD')).toBe(false);
   });
 
   // TRA-1304 — the live-money DCA preset is DCA-only and hard-pinned to the
