@@ -24,6 +24,62 @@ const yf = new YahooFinance({
 });
 const sleep = (ms: number) => new Promise(resolve => setTimeout(resolve, ms));
 
+/**
+ * TRA-1387 — bounded-concurrency async map. Runs `fn` over `items` with at most
+ * `limit` invocations in flight at once, preserving input order in the result.
+ *
+ * Root cause it addresses (root of the bqb1 137 OOM): the per-symbol Coinbase
+ * `/stats` fan-out ({@link fetchCoinbaseStatsQuotes}) previously used
+ * `Promise.all(items.map(fn))`, which EAGERLY constructs one `withTimeout`
+ * wrapper (a live `setTimeout` + rejection promise) plus one fetch/response
+ * object per symbol the instant the map runs — ~400 of them at full Coinbase
+ * breadth. When the Render egress IP is degraded/blocked by Coinbase every one of
+ * those requests hangs to its 3s timeout, so ~400 request wrappers and their
+ * native response buffers are all resident at once — the sub-minute RSS burst
+ * that spikes past the 2 GB ceiling and drives the cgroup OOM-137 (TRA-1374 /
+ * TRA-1387). The host pacer already serialises DISPATCH (one upstream fetch per
+ * host at a time), so a small `limit` here costs ZERO extra upstream rate and
+ * yields byte-identical results — it only caps how many in-flight wrappers /
+ * response buffers exist simultaneously, converting the eager ~400-wide
+ * allocation into a bounded sliding window.
+ *
+ * Exported so a unit test can assert the peak-in-flight bound directly.
+ */
+export async function mapWithConcurrency<T, R>(
+  items: readonly T[],
+  limit: number,
+  fn: (item: T, index: number) => Promise<R>,
+): Promise<R[]> {
+  const results = new Array<R>(items.length);
+  if (items.length === 0) return results;
+  const cap = Math.max(1, Math.min(Math.floor(limit), items.length));
+  let cursor = 0;
+  const worker = async (): Promise<void> => {
+    for (;;) {
+      const i = cursor;
+      cursor += 1;
+      if (i >= items.length) return;
+      results[i] = await fn(items[i], i);
+    }
+  };
+  await Promise.all(Array.from({ length: cap }, () => worker()));
+  return results;
+}
+
+/**
+ * TRA-1387 — max simultaneously-constructed per-symbol Coinbase `/stats`
+ * requests. The Exchange host pacer serialises actual dispatch, so this does not
+ * change the upstream request rate; it only bounds how many in-flight request
+ * wrappers + native response buffers are resident at once, killing the
+ * full-universe fan-out's native-memory burst. Env-tunable; defaulted low
+ * because a healthy `/stats` residual is small anyway (Advanced Trade prices the
+ * bulk in one batched call — see {@link fetchCryptoQuotes}).
+ */
+const STATS_FETCH_CONCURRENCY = (() => {
+  const raw = Number(process.env.CRYPTO_STATS_FETCH_CONCURRENCY);
+  return Number.isFinite(raw) && raw >= 1 && raw <= 64 ? Math.floor(raw) : 6;
+})();
+
 // Per-call timeout. Yahoo and CMC occasionally hang; without a timeout the 60-second
 // crypto tick blocks indefinitely, leaving the watchlist stuck "Loading…".
 //
@@ -233,10 +289,18 @@ async function fetchCoinbaseStatsQuotes(
   if (symbols.length === 0) return results;
   // All requests route through `paceCoinbaseFetch` so they share the same
   // 10 req/s/IP budget as the candle fetchers (TRA-300 — see scheduler doc
-  // in `coinbase-feed.ts`). Promise.all on the full list is safe because
-  // the scheduler serialises with a 120 ms min gap; inflating concurrency
-  // here just queues, it never bursts.
-  const settled = await Promise.all(symbols.map(async sym => {
+  // in `coinbase-feed.ts`). The host pacer serialises DISPATCH (120 ms min
+  // gap, one upstream fetch at a time), so this never bursts the rate.
+  //
+  // TRA-1387 — but a bare `Promise.all(symbols.map(...))` still EAGERLY
+  // constructs one `withTimeout` wrapper + fetch/response object per symbol the
+  // instant it runs. At full Coinbase breadth with a blocked Render egress IP,
+  // all ~400 hang to their 3s timeout at once, so ~400 request wrappers + their
+  // native response buffers sit resident simultaneously — the sub-minute RSS
+  // burst behind the bqb1 137 OOM. `mapWithConcurrency` bounds the in-flight
+  // wrappers to a sliding window without changing the (pacer-serialised) rate or
+  // the result, so the fan-out can no longer pile the native-memory spike.
+  const settled = await mapWithConcurrency(symbols, STATS_FETCH_CONCURRENCY, async sym => {
     try {
       const resp = await withTimeout(
         paceCoinbaseFetch(`${COINBASE_BASE}/products/${encodeURIComponent(sym)}/stats`, {
@@ -263,7 +327,7 @@ async function fetchCoinbaseStatsQuotes(
       });
       return [sym, null] as const;
     }
-  }));
+  });
   for (const [sym, q] of settled) {
     if (q) results.set(sym, q);
   }

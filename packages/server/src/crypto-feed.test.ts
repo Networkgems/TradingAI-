@@ -6,10 +6,51 @@ import {
   fetchCoinbaseAdvancedTradeCandles,
   fetchCoinGeckoQuotes,
   isCoinGeckoBreakerOpen,
+  mapWithConcurrency,
   _resetCoinGeckoBreakerForTests,
   _resetCoinbaseProductCatalogForTests,
   _seedCoinbaseProductCatalogForTests,
 } from './crypto-feed.js';
+
+// TRA-1387 — the bounded-concurrency map that caps how many per-symbol Coinbase
+// `/stats` request wrappers + native response buffers are in flight at once.
+// The full-universe fan-out hanging on a blocked Render egress IP was the
+// sub-minute RSS burst behind the bqb1 137 OOM; this helper is the fix, so the
+// two invariants that make it safe — a hard cap on peak concurrency and
+// order-preserving, complete results — are pinned here.
+describe('mapWithConcurrency — bounded per-symbol fan-out (TRA-1387)', () => {
+  it('never exceeds the concurrency cap and preserves input order', async () => {
+    const items = Array.from({ length: 40 }, (_, i) => i);
+    let inFlight = 0;
+    let peak = 0;
+    const out = await mapWithConcurrency(items, 6, async n => {
+      inFlight += 1;
+      peak = Math.max(peak, inFlight);
+      // Yield so multiple workers genuinely overlap before any resolves.
+      await new Promise(resolve => setTimeout(resolve, 1));
+      inFlight -= 1;
+      return n * 2;
+    });
+    expect(peak).toBeLessThanOrEqual(6);
+    expect(peak).toBeGreaterThan(1); // the pool actually parallelises
+    expect(out).toEqual(items.map(n => n * 2));
+  });
+
+  it('handles an empty list and a cap larger than the item count', async () => {
+    expect(await mapWithConcurrency([], 6, async () => 1)).toEqual([]);
+    let peak = 0;
+    let inFlight = 0;
+    const out = await mapWithConcurrency([1, 2, 3], 100, async n => {
+      inFlight += 1;
+      peak = Math.max(peak, inFlight);
+      await new Promise(resolve => setTimeout(resolve, 1));
+      inFlight -= 1;
+      return n;
+    });
+    expect(out).toEqual([1, 2, 3]);
+    expect(peak).toBeLessThanOrEqual(3); // capped to item count, never over-spawns
+  });
+});
 
 // TRA-338 — the Coinbase product allowlist is the gate the crypto engine uses
 // to decide whether to even consider opening a position on a symbol. Tests
