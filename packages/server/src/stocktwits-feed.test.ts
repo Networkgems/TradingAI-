@@ -6,6 +6,8 @@ import {
   DEFAULT_CURATED_STOCKTWITS_ACCOUNTS,
   isStockTwitsBreakerOpen,
   resetStockTwitsBreaker,
+  tripStockTwitsBreaker,
+  probeStockTwits,
 } from './stocktwits-feed.js';
 
 function jsonResponse(body: unknown, init: { status?: number; headers?: Record<string, string> } = {}): Response {
@@ -45,7 +47,11 @@ describe('fetchStockTwitsStream', () => {
     const fetchMock = vi.fn(async () => jsonResponse(STREAM_FIXTURE));
     vi.stubGlobal('fetch', fetchMock);
     await fetchStockTwitsStream('nvda');
-    expect(fetchMock).toHaveBeenCalledWith(expect.stringContaining('/symbol/NVDA.json'));
+    expect(fetchMock).toHaveBeenCalledWith(
+      expect.stringContaining('/symbol/NVDA.json'),
+      // TRA-1330 — browser-like header fingerprint to clear Cloudflare on datacenter egress.
+      expect.objectContaining({ headers: expect.objectContaining({ 'User-Agent': expect.any(String) }) }),
+    );
   });
 
   it('returns null and trips the breaker on a 429', async () => {
@@ -132,7 +138,10 @@ describe('fetchStockTwitsUserStream (TRA-603)', () => {
     const fetchMock = vi.fn(async () => jsonResponse(USER_STREAM_FIXTURE));
     vi.stubGlobal('fetch', fetchMock);
     await fetchStockTwitsUserStream('howardlindzon');
-    expect(fetchMock).toHaveBeenCalledWith(expect.stringContaining('/user/howardlindzon.json'));
+    expect(fetchMock).toHaveBeenCalledWith(
+      expect.stringContaining('/user/howardlindzon.json'),
+      expect.objectContaining({ headers: expect.objectContaining({ 'User-Agent': expect.any(String) }) }),
+    );
   });
 
   it('returns null and trips the shared breaker on a 429', async () => {
@@ -151,6 +160,40 @@ describe('fetchStockTwitsUserStream (TRA-603)', () => {
   it('returns null (not throw) when fetch rejects', async () => {
     vi.stubGlobal('fetch', vi.fn(async () => { throw new Error('network down'); }));
     expect(await fetchStockTwitsUserStream('JFDI')).toBeNull();
+  });
+});
+
+describe('probeStockTwits (TRA-1330)', () => {
+  beforeEach(() => resetStockTwitsBreaker());
+  afterEach(() => { vi.unstubAllGlobals(); resetStockTwitsBreaker(); });
+
+  it('sends the browser header fingerprint and reports ok + message count on 200', async () => {
+    const fetchMock = vi.fn(async () => jsonResponse(STREAM_FIXTURE));
+    vi.stubGlobal('fetch', fetchMock);
+    const out = await probeStockTwits('aapl');
+    expect(out).toEqual({ ok: true, status: 200, messageCount: 5, breakerOpen: false, reason: null });
+    expect(fetchMock).toHaveBeenCalledWith(
+      expect.stringContaining('/symbol/AAPL.json'),
+      expect.objectContaining({ headers: expect.objectContaining({ 'User-Agent': expect.any(String) }) }),
+    );
+  });
+
+  it('surfaces the raw HTTP status on a Cloudflare block (403) without tripping the breaker', async () => {
+    vi.stubGlobal('fetch', vi.fn(async () => jsonResponse({}, { status: 403 })));
+    const out = await probeStockTwits('AAPL');
+    expect(out.ok).toBe(false);
+    expect(out.status).toBe(403);
+    expect(out.reason).toContain('403');
+    expect(isStockTwitsBreakerOpen()).toBe(false); // a probe must not stall the real recorder
+  });
+
+  it('reports breakerOpen without hitting the network when the breaker is open', async () => {
+    tripStockTwitsBreaker(Date.parse('2099-01-01T00:00:00Z'));
+    const fetchMock = vi.fn(async () => jsonResponse(STREAM_FIXTURE));
+    vi.stubGlobal('fetch', fetchMock);
+    const out = await probeStockTwits('AAPL');
+    expect(out).toEqual({ ok: false, status: null, messageCount: null, breakerOpen: true, reason: 'rate-limit breaker open' });
+    expect(fetchMock).not.toHaveBeenCalled();
   });
 });
 

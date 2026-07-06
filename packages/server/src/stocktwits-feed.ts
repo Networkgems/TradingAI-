@@ -31,6 +31,27 @@ const DEFAULT_COOLDOWN_MS = 5 * 60_000;
 /** Cap the per-symbol message pull — the engine only needs a recent window. */
 const MAX_MESSAGES = 30;
 
+/**
+ * TRA-1330 — the StockTwits stream endpoint is keyless but sits behind
+ * Cloudflare, which bot-challenges/blocks requests that don't look like a real
+ * browser. undici's default `fetch()` sends no `User-Agent`/`Accept` at all, so
+ * every anonymous datacenter hit from Render egress cleanly degraded to null →
+ * the TRA-822 recorder wrote `no_data` on every symbol-day (0 usable reads over
+ * 13 captured days). Presenting a browser-like header fingerprint is the
+ * zero-secret first mitigation: it addresses the request-fingerprint half of
+ * Cloudflare's decision (the IP-reputation half is out of our hands, but many
+ * datacenter blocks are fingerprint-only). Overridable via `STOCKTWITS_USER_AGENT`.
+ */
+const BROWSER_HEADERS: Readonly<Record<string, string>> = {
+  'User-Agent':
+    process.env['STOCKTWITS_USER_AGENT']?.trim() ||
+    'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36',
+  Accept: 'application/json, text/plain, */*',
+  'Accept-Language': 'en-US,en;q=0.9',
+  Referer: 'https://stocktwits.com/',
+  Origin: 'https://stocktwits.com',
+};
+
 function withTimeout<T>(p: Promise<T>, ms: number, label: string): Promise<T> {
   return new Promise<T>((resolve, reject) => {
     const timer = setTimeout(() => reject(new Error(`${label} timed out after ${ms}ms`)), ms);
@@ -124,7 +145,7 @@ async function fetchStreamMessages(
     return null;
   }
   try {
-    const resp = await withTimeout(fetch(url), ST_CALL_TIMEOUT_MS, label);
+    const resp = await withTimeout(fetch(url, { headers: BROWSER_HEADERS }), ST_CALL_TIMEOUT_MS, label);
     if (resp.status === 429) {
       const until = resetDeadlineFrom(resp, now);
       tripStockTwitsBreaker(until);
@@ -212,4 +233,51 @@ export async function testStockTwits(): Promise<{ symbol: string; messages: numb
     throw new Error(isStockTwitsBreakerOpen() ? 'rate-limit breaker open' : 'StockTwits returned no stream for AAPL');
   }
   return { symbol: 'AAPL', messages: stream.length };
+}
+
+/** TRA-1330 — live-connectivity diagnostics for one symbol probe. */
+export interface StockTwitsProbeResult {
+  /** True only when the endpoint returned HTTP 200 with a parseable body. */
+  ok: boolean;
+  /** The raw HTTP status (surfaces a Cloudflare 403/429/503 vs a network error). */
+  status: number | null;
+  /** Message count in the returned stream (0 = reached but empty). */
+  messageCount: number | null;
+  /** Whether the process-wide rate-limit breaker was open when probed. */
+  breakerOpen: boolean;
+  /** Human-readable failure reason, or null on success. */
+  reason: string | null;
+}
+
+/**
+ * TRA-1330 — a live one-shot connectivity probe that surfaces the actual HTTP
+ * status (unlike {@link fetchStockTwitsStream}, which degrades everything to
+ * null). Used by `/api/health/sentiment-probe` to verify from bqb1's Render
+ * egress whether the browser-header fingerprint now clears Cloudflare — without
+ * waiting for the daily TRA-822 sweep. Deliberately does NOT trip the production
+ * breaker on a 429, so a manual probe can't stall the real recorder.
+ */
+export async function probeStockTwits(symbol = 'AAPL'): Promise<StockTwitsProbeResult> {
+  const now = Date.now();
+  if (isStockTwitsBreakerOpen(now)) {
+    return { ok: false, status: null, messageCount: null, breakerOpen: true, reason: 'rate-limit breaker open' };
+  }
+  const sym = symbol.toUpperCase();
+  const url = `https://api.stocktwits.com/api/2/streams/symbol/${encodeURIComponent(sym)}.json`;
+  try {
+    const resp = await withTimeout(
+      fetch(url, { headers: BROWSER_HEADERS }),
+      ST_CALL_TIMEOUT_MS,
+      `stocktwits-probe(${sym})`,
+    );
+    if (!resp.ok) {
+      return { ok: false, status: resp.status, messageCount: null, breakerOpen: false, reason: `non-OK status ${resp.status}` };
+    }
+    const body = (await resp.json()) as RawStockTwitsStream;
+    const count = Array.isArray(body?.messages) ? body.messages.length : 0;
+    return { ok: true, status: resp.status, messageCount: count, breakerOpen: false, reason: null };
+  } catch (err: unknown) {
+    const msg = err instanceof Error ? err.message : String(err);
+    return { ok: false, status: null, messageCount: null, breakerOpen: false, reason: msg };
+  }
 }

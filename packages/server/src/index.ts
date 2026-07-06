@@ -209,6 +209,7 @@ import {
   fetchStockTwitsStream,
   fetchStockTwitsUserStream,
   getCuratedStockTwitsAccounts,
+  probeStockTwits,
 } from './stocktwits-feed.js';
 // TRA-779 — replay smoke endpoint proves the captured chains are consumable by
 // the run-options-replay pipe. Server already depends on @trading-app/backtest.
@@ -3583,6 +3584,25 @@ app.get('/api/health/sentiment-capture', async (_req, res) => {
     universeSource: rawUniverse ? 'SENTIMENT_WATCHLIST' : 'WATCHLIST',
     configuredUniverse,
     latest,
+  });
+});
+
+// TRA-1330 — live StockTwits connectivity probe. The TRA-822 recorder captured
+// 0 usable reads on bqb1 because the keyless StockTwits stream sits behind
+// Cloudflare, which blocks anonymous datacenter egress (every fetch → null →
+// `no_data`). The fetch now presents a browser-like header fingerprint
+// (`stocktwits-feed.ts`); this endpoint does a live one-shot AAPL pull from
+// wherever the server runs and surfaces the ACTUAL HTTP status so we can verify
+// from bqb1's Render egress whether the fingerprint clears Cloudflare — without
+// waiting for the daily sweep. Read-only; never trips the production breaker.
+app.get('/api/health/sentiment-probe', async (req, res) => {
+  const rawSym = String(req.query.symbol ?? 'AAPL').toUpperCase();
+  const symbol = /^[A-Z.]{1,10}$/.test(rawSym) ? rawSym : 'AAPL';
+  const result = await probeStockTwits(symbol);
+  res.json({
+    issue: 'TRA-1330',
+    symbol,
+    ...result,
   });
 });
 
