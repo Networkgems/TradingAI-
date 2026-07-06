@@ -401,6 +401,21 @@ services:
       # effect on the running service. Accepts 1/true/yes/on.
       - key: TAKE_PROFIT_EARLY_ENABLED
         value: "true"
+      # TRA-1301 (parent TRA-1295, board confirmation `49eeae3c` = accepted) — arm
+      # the CORRELATED-EXPOSURE CAP (Rule 5, the "7%" leg of the 3-5-7 governor) on
+      # the LIVE entry paths. Gated by BOTH the master EXIT_RISK_RULES_ENABLED
+      # (above, already "1") AND this sub-flag, so it stays dark until both are on.
+      # Once armed it consults DailyRiskGovernor.admitCorrelatedExposure at every
+      # entry chokepoint (equity signal-engine, crypto-engine beside the TRA-423
+      # cluster cap, options runRelativeValueScan) and SCALES DOWN or REJECTS a new
+      # entry whose per-group (underlying / asset-class) Σrisk would exceed 7% of
+      # managed equity — a purely defensive admission gate; it never adds exposure.
+      # Readout: `GET /api/health/correlated-exposure-cap` (`enabled:true`). Revert =
+      # clear this value (flip off) + redeploy. NOTE: blueprint sync ≠ autoDeploy on
+      # bqb1 (TRA-1289) — a redeploy is needed for this to take effect. Accepts
+      # 1/true/yes/on.
+      - key: CORRELATED_EXPOSURE_CAP_ENABLED
+        value: "1"
       # TRA-1317 (parent TRA-1316, board interaction `7042a614` answer = demo) —
       # arm DEMO PAPER routing of the regime-gated TSMOM scanner so the crypto
       # dashboard shows movement and we accrue forward round-trip evidence at ZERO
