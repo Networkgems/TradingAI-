@@ -14,6 +14,9 @@ import {
   bootstrapGap,
   gradeVerdict,
   renderOosReport,
+  expectancyCohortOf,
+  decisiveWinRate,
+  calibrateBaseline,
 } from './oos-option-weights-harness.js';
 
 // ── synthetic-row factory ──────────────────────────────────────────────────────
@@ -210,6 +213,139 @@ describe('oos-option-weights-harness', () => {
       expect(text).toContain(`VERDICT: ${report.verdict}`);
       expect(text).toContain('TRA-992 Step 2 read');
       expect(text).toContain('bySentimentIc');
+    });
+  });
+
+  // ── TRA-1321 protocol v2 (expectancy mode) ────────────────────────────────────
+  // A trend-bucketed factory: a single structure so the per-structure baseline
+  // equals the pooled one, and the WIN/LOSS mix within each `trend` bucket carries
+  // the signal (above the family baseline → up-weight, below → down-weight).
+  function trendBucket(
+    trend: 'up' | 'down' | 'sideways',
+    wins: number,
+    losses: number,
+    winR: number,
+    lossR: number,
+    scratches = 0,
+  ): OptionTradeJournalRecord[] {
+    const out: OptionTradeJournalRecord[] = [];
+    for (let i = 0; i < wins; i++) out.push(row('s', 'WIN', winR, { trend }));
+    for (let i = 0; i < losses; i++) out.push(row('s', 'LOSS', lossR, { trend }));
+    for (let i = 0; i < scratches; i++) out.push(row('s', 'SCRATCH', 0, { trend }));
+    return out;
+  }
+
+  describe('decisiveWinRate', () => {
+    it('is WIN/(WIN+LOSS) and excludes SCRATCH from the denominator', () => {
+      const rows = [...bucket('s', 3, 2, 1, -1), row('s', 'SCRATCH', 0)];
+      // 3 WIN, 2 LOSS, 1 SCRATCH → 3/5 decisive, scratch ignored.
+      expect(decisiveWinRate(rows)).toBeCloseTo(0.6, 10);
+    });
+    it('is null with no decisive rows', () => {
+      expect(decisiveWinRate([row('s', 'SCRATCH', 0)])).toBeNull();
+    });
+  });
+
+  describe('calibrateBaseline', () => {
+    it('pools the decisive rate and only forms a per-structure baseline past the guard', () => {
+      // structure A: 20 decisive (10W/10L → 0.5); structure B: 6 decisive (below the
+      // MIN_DECISIVE_PER_STRUCTURE=12 guard → no per-structure baseline for B).
+      const rows = [...bucket('A', 10, 10, 1, -1), ...bucket('B', 3, 3, 1, -1)];
+      const calib = calibrateBaseline(resolvedRows(rows));
+      expect(calib.pooled).toBeCloseTo(13 / 26, 10); // 13W / 26 decisive
+      expect(calib.perStructure.A).toBeCloseTo(0.5, 10);
+      expect(calib.perStructure.B).toBeUndefined();
+      expect(calib.usedPerStructure).toBe(true);
+      expect(calib.decisiveResolved).toBe(26);
+    });
+  });
+
+  describe('expectancyCohortOf', () => {
+    it('splits at the recalibrated null of 1.0', () => {
+      expect(expectancyCohortOf(1.01)).toBe('up');
+      expect(expectancyCohortOf(1.0)).toBe('neutral');
+      expect(expectancyCohortOf(0.99)).toBe('down');
+    });
+  });
+
+  describe('expectancy mode verdicts', () => {
+    it('REAL — recalibrated cohorts form with a positive CI-clean expectancy gap', () => {
+      // One structure, two trend buckets. Pooled decisive rate = 15/30 = 0.5. The
+      // `up` trend wins 0.8 (big winners), the `down` trend wins 0.2 (bleeds), so the
+      // decisive-basis fold pushes them either side of 1.0 and the realized-R gap is
+      // large and clean. The legacy 0.5-floor path could never form the up-cohort.
+      const rows = [
+        ...trendBucket('up', 12, 3, 2.0, -1.0),
+        ...trendBucket('down', 3, 12, 1.0, -1.0),
+      ];
+      const report = buildOosReport(rows, { expectancy: true });
+      expect(report.expectancy?.enabled).toBe(true);
+      expect(report.expectancy?.cohortBasis).toBe('absolute');
+      expect(report.expectancy?.baseline.pooled).toBeCloseTo(0.5, 10);
+      expect(report.cohorts.up.n).toBeGreaterThanOrEqual(12);
+      expect(report.cohorts.down.n).toBeGreaterThanOrEqual(12);
+      expect(report.gap.gap ?? 0).toBeGreaterThan(0);
+      expect(report.gap.ciLower ?? -1).toBeGreaterThan(0);
+      expect(report.verdict).toBe('REAL');
+    });
+
+    it('falls back to a median split when the absolute 1.0 split degenerates', () => {
+      // 11 up-weighted rows (still below the per-cohort bar of 12, so the absolute
+      // split degenerates) + 20 down-weighted rows. Buckets are >=11 so leave-one-out
+      // keeps them confident (>=10). Median split rebalances the 31 rows into halves
+      // by composite multiplier.
+      const rows = [
+        ...trendBucket('up', 9, 2, 2.0, -1.0), // 11 rows, rate 0.82 → mult > 1.0
+        ...trendBucket('down', 4, 16, 1.0, -1.0), // 20 rows, rate 0.20 → mult < 1.0
+      ];
+      const report = buildOosReport(rows, { expectancy: true });
+      expect(report.expectancy?.cohortBasis).toBe('median');
+      expect(report.expectancy?.distinctMultipliers ?? 0).toBeGreaterThan(1);
+      expect(report.cohorts.up.n).toBeGreaterThanOrEqual(12);
+      expect(report.cohorts.down.n).toBeGreaterThanOrEqual(12);
+      expect(report.cohorts.up.n + report.cohorts.down.n).toBe(31);
+    });
+
+    it('INCONCLUSIVE when every scored row shares one setup (no signal to split on)', () => {
+      // time-split with a single setup across all late (scored) rows → they all get
+      // the same OOS multiplier → distinctMultipliers === 1 → cohorts cannot form on
+      // any basis. The distinct-value guard fires before the sample bar.
+      const early = trendBucket('up', 8, 4, 1.0, -1.0); // train
+      const late = trendBucket('up', 9, 6, 1.0, -1.0); // scored, identical setup
+      const splitTs = late[0]!.closeTs!;
+      const report = buildOosReport([...early, ...late], {
+        expectancy: true,
+        mode: 'time-split',
+        splitTs,
+      });
+      expect(report.expectancy?.distinctMultipliers).toBe(1);
+      expect(report.verdict).toBe('INCONCLUSIVE');
+      expect(report.verdictReasons.join(' ')).toContain('no variation');
+    });
+
+    it('renders the recalibration block and protocol-v2 marker', () => {
+      const rows = [
+        ...trendBucket('up', 12, 3, 2.0, -1.0),
+        ...trendBucket('down', 3, 12, 1.0, -1.0),
+      ];
+      const report = buildOosReport(rows, { expectancy: true });
+      const text = renderOosReport(report, '2026-07-05T00:00:00Z');
+      expect(text).toContain('Protocol:** v2 expectancy');
+      expect(text).toContain('Recalibration (protocol v2)');
+      expect(text).toContain('family decisive');
+    });
+
+    it('leaves the legacy default path unchanged (still INCONCLUSIVE on the sub-baseline family)', () => {
+      // The exact pathology TRA-1321 fixes: every bucket wins < 50%, so the legacy
+      // 0.5-baseline path floors all rows into `down` and the up-cohort is un-formable.
+      const rows = [
+        ...trendBucket('up', 4, 11, 2.0, -1.0),
+        ...trendBucket('down', 3, 12, 1.0, -1.0),
+      ];
+      const legacy = buildOosReport(rows); // no expectancy flag
+      expect(legacy.expectancy).toBeUndefined();
+      expect(legacy.cohorts.up.n).toBe(0); // floored — cannot form
+      expect(legacy.verdict).toBe('INCONCLUSIVE');
     });
   });
 });

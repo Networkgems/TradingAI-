@@ -50,6 +50,26 @@ export const BOOTSTRAP_ITERATIONS = 2000;
 /** Bootstrap RNG seed — fixed so the CI is deterministic across runs. */
 export const BOOTSTRAP_SEED = 0x1133;
 
+// ── TRA-1321 protocol v2 (expectancy mode) constants ────────────────────────────
+// The legacy path scores every row against a fixed `baselineHitRate = 0.5`. In the
+// single-leg long-option family every confident bucket wins < 50% (best 35.5%), so
+// every dimension multiplier lands < 1.0 and the composite clamps to the 0.50 floor
+// for ALL rows — the up-cohort is mathematically un-formable (`up.n = 0`) at any
+// sample size. Protocol v2 (TRA-1284 Option A) recalibrates the null to the family's
+// own realized base rate and compares cohorts on realized-R expectancy, not hit-rate.
+
+/**
+ * In expectancy mode the cohort split is around a multiplier of exactly 1.0 (recalibrated
+ * "no edge vs the family's own average"), not the legacy ±0.05 dead-band — the whole
+ * point of the recalibration is that 1.0 is the economically meaningful null.
+ */
+export const EXPECTANCY_COHORT_THRESHOLD = 1.0;
+/**
+ * A per-structure baseline is only used when that structure carries at least this many
+ * DECISIVE (WIN+LOSS) rows; thinner structures fall back to the pooled family baseline.
+ */
+export const MIN_DECISIVE_PER_STRUCTURE = 12;
+
 export type Cohort = 'up' | 'down' | 'neutral';
 
 /** A resolved journal row scored with its out-of-sample multiplier. */
@@ -121,6 +141,39 @@ export interface OosHarnessOptions {
   bootstrapIterations?: number;
   bootstrapSeed?: number;
   ciLevel?: number;
+  /**
+   * TRA-1321 — protocol v2. When true the harness recalibrates the neutral baseline
+   * from the fixed 0.5 to the family's own decisive base rate, scores rows on a
+   * decisive-basis fold, and grades the up-vs-down realized-R expectancy gap with a
+   * median-split fallback. Legacy path (`false`, the default) is untouched.
+   */
+  expectancy?: boolean;
+}
+
+/** TRA-1321 — the recalibrated null the expectancy mode scores against. */
+export interface BaselineCalibration {
+  /** Pooled decisive win-rate WIN/(WIN+LOSS) over the resolved set; null when no decisive rows. */
+  pooled: number | null;
+  /** Per-structure decisive win-rate, only for structures with >= MIN_DECISIVE_PER_STRUCTURE decisive rows. */
+  perStructure: Record<string, number>;
+  /** True when at least one structure qualified for its own baseline. */
+  usedPerStructure: boolean;
+  /** Count of DECISIVE (WIN+LOSS) rows the baseline was formed over. */
+  decisiveResolved: number;
+}
+
+/** TRA-1321 — the expectancy-mode read attached to the report when `expectancy` is on. */
+export interface ExpectancyRead {
+  enabled: true;
+  baseline: BaselineCalibration;
+  /**
+   * `absolute` — cohorts split at multiplier 1.0. `median` — the absolute split
+   * degenerated (a cohort under the per-cohort bar) so rows were split into
+   * bottom-half / top-half by the median composite multiplier instead.
+   */
+  cohortBasis: 'absolute' | 'median';
+  /** Distinct OOS multiplier values across scored rows — 1 means no signal to split on. */
+  distinctMultipliers: number;
 }
 
 export interface OosReport {
@@ -151,6 +204,8 @@ export interface OosReport {
   dimensions: DimensionDiagnostic[];
   /** TRA-992 Step 2 read: the `bySentimentIc` fold in isolation. */
   sentimentIcRead: DimensionDiagnostic;
+  /** TRA-1321 — present only when protocol-v2 expectancy mode is on. */
+  expectancy?: ExpectancyRead;
 }
 
 // ── helpers ──────────────────────────────────────────────────────────────────
@@ -166,21 +221,93 @@ export function cohortOf(multiplier: number): Cohort {
   return 'neutral';
 }
 
+/** TRA-1321 — expectancy-mode cohort split around the recalibrated null of 1.0. */
+export function expectancyCohortOf(multiplier: number): Cohort {
+  if (multiplier > EXPECTANCY_COHORT_THRESHOLD) return 'up';
+  if (multiplier < EXPECTANCY_COHORT_THRESHOLD) return 'down';
+  return 'neutral';
+}
+
+/** True for a row that resolved decisively (WIN or LOSS — a SCRATCH is not decisive). */
+function isDecisive(r: OptionTradeJournalRecord): boolean {
+  return r.outcome === 'WIN' || r.outcome === 'LOSS';
+}
+
+/**
+ * TRA-1321 — pooled decisive win-rate WIN/(WIN+LOSS) over `rows`, excluding SCRATCH
+ * from the denominator. Null when there are no decisive rows. This is the family's
+ * own realized base rate: the economically meaningful null the recalibrated
+ * multiplier centers on (1.0 = "no edge vs the family's own average").
+ */
+export function decisiveWinRate(rows: OptionTradeJournalRecord[]): number | null {
+  let win = 0;
+  let decisive = 0;
+  for (const r of rows) {
+    if (r.outcome === 'WIN') {
+      win += 1;
+      decisive += 1;
+    } else if (r.outcome === 'LOSS') {
+      decisive += 1;
+    }
+  }
+  return decisive > 0 ? win / decisive : null;
+}
+
+/**
+ * TRA-1321 — recalibrate the neutral baseline from the fixed 0.5 to the family's own
+ * decisive base rate. Computes the pooled rate and, for each structure carrying at
+ * least {@link MIN_DECISIVE_PER_STRUCTURE} decisive rows, that structure's own rate.
+ */
+export function calibrateBaseline(resolved: OptionTradeJournalRecord[]): BaselineCalibration {
+  const pooled = decisiveWinRate(resolved);
+  const byStructure = new Map<string, OptionTradeJournalRecord[]>();
+  for (const r of resolved) {
+    const list = byStructure.get(r.structure) ?? [];
+    list.push(r);
+    byStructure.set(r.structure, list);
+  }
+  const perStructure: Record<string, number> = {};
+  for (const [structure, list] of byStructure) {
+    const decisive = list.filter(isDecisive).length;
+    const rate = decisiveWinRate(list);
+    if (decisive >= MIN_DECISIVE_PER_STRUCTURE && rate !== null) perStructure[structure] = rate;
+  }
+  return {
+    pooled,
+    perStructure,
+    usedPerStructure: Object.keys(perStructure).length > 0,
+    decisiveResolved: resolved.filter(isDecisive).length,
+  };
+}
+
 /**
  * The out-of-sample multiplier for one resolved row. In leave-one-out the training
  * fold is every OTHER row (the scored row is excluded — that is the whole point).
  * In time-split the training fold is every row closed strictly before `splitTs`.
  * The multiplier itself comes from the real `optionSetupMultiplier`.
+ *
+ * TRA-1321 — `decisiveFold` restricts the training fold to decisive (WIN/LOSS) rows so
+ * each bucket's win-rate is measured on the SAME decisive basis as the recalibrated
+ * baseline carried in `params.baselineHitRate`. Without it, SCRATCH rows inflate the
+ * denominator and every bucket rate collapses far below any plausible baseline,
+ * re-floor­ing the composite regardless of recalibration.
  */
 export function oosMultiplierForRow(
   allRows: OptionTradeJournalRecord[],
   row: OptionTradeJournalRecord,
-  opts: { mode: SplitMode; splitTs?: number; useShrinkage: boolean; params: LearnedWeightsParams },
+  opts: {
+    mode: SplitMode;
+    splitTs?: number;
+    useShrinkage: boolean;
+    params: LearnedWeightsParams;
+    decisiveFold?: boolean;
+  },
 ): number {
-  const train =
+  let train =
     opts.mode === 'time-split'
       ? allRows.filter((r) => r.outcome !== 'OPEN' && (r.closeTs ?? Infinity) < (opts.splitTs ?? 0))
       : allRows.filter((r) => r.id !== row.id);
+  if (opts.decisiveFold) train = train.filter(isDecisive);
   const weights = computeOptionLearnedWeights(train, opts.params);
   return optionSetupMultiplier(weights, setupKeyFromRow(row), opts.useShrinkage);
 }
@@ -321,6 +448,7 @@ export function buildOosReport(
   rows: OptionTradeJournalRecord[],
   options: OosHarnessOptions = {},
 ): OosReport {
+  if (options.expectancy) return buildExpectancyReport(rows, options);
   const mode: SplitMode = options.mode ?? 'loo';
   const useShrinkage = options.useShrinkage ?? false;
   const params = options.params ?? DEFAULT_LEARNED_PARAMS;
@@ -405,6 +533,161 @@ export function buildOosReport(
   };
 }
 
+// ── TRA-1321 expectancy mode (protocol v2) ──────────────────────────────────────
+
+/**
+ * Protocol-v2 OOS validation. Same report shape as the legacy path (so downstream
+ * readers and the render are unchanged) but with three amendments:
+ *   1. the neutral baseline is recalibrated to the family's own decisive base rate
+ *      (pooled, or per-structure when a structure carries >= MIN_DECISIVE_PER_STRUCTURE
+ *      decisive rows), so multiplier=1.0 means "no edge vs the family's own average";
+ *   2. rows are scored on a DECISIVE-basis fold so bucket win-rate and baseline share
+ *      the same denominator — the fix that lets the composite spread around 1.0 at all;
+ *   3. cohorts split at 1.0 and are compared on realized-R EXPECTANCY. When the absolute
+ *      split degenerates (a cohort under the per-cohort bar) rows are split top/bottom by
+ *      the MEDIAN composite multiplier instead. Verdict follows the amended rules.
+ * Diagnostics + the Step-2 `bySentimentIc` read are computed exactly as the legacy path
+ * (over the full resolved set, default params) — left untouched per protocol point 5.
+ */
+function buildExpectancyReport(
+  rows: OptionTradeJournalRecord[],
+  options: OosHarnessOptions,
+): OosReport {
+  const mode: SplitMode = options.mode ?? 'loo';
+  const useShrinkage = options.useShrinkage ?? false;
+  const baseParams = options.params ?? DEFAULT_LEARNED_PARAMS;
+  const bootstrapIterations = options.bootstrapIterations ?? BOOTSTRAP_ITERATIONS;
+  const bootstrapSeed = options.bootstrapSeed ?? BOOTSTRAP_SEED;
+  const ciLevel = options.ciLevel ?? CI_LEVEL;
+  const splitTs = options.splitTs ?? null;
+
+  const resolved = resolvedRows(rows);
+  const baseline = calibrateBaseline(resolved);
+  const baselineFor = (structure: string): number =>
+    baseline.perStructure[structure] ?? baseline.pooled ?? baseParams.baselineHitRate;
+
+  const scorable =
+    mode === 'time-split'
+      ? resolved.filter((r) => (r.closeTs ?? Infinity) >= (splitTs ?? 0))
+      : resolved;
+
+  let scoredRows: ScoredRow[] = scorable.map((r) => {
+    const params: LearnedWeightsParams = { ...baseParams, baselineHitRate: baselineFor(r.structure) };
+    const oosMultiplier = oosMultiplierForRow(rows, r, {
+      mode,
+      splitTs: splitTs ?? undefined,
+      useShrinkage,
+      params,
+      decisiveFold: true,
+    });
+    return {
+      id: r.id,
+      symbol: r.symbol,
+      structure: r.structure,
+      outcome: r.outcome as OptionTradeOutcome,
+      realizedR: r.realizedR as number,
+      oosMultiplier,
+      cohort: expectancyCohortOf(oosMultiplier),
+    };
+  });
+
+  const distinctMultipliers = new Set(scoredRows.map((r) => r.oosMultiplier.toFixed(6))).size;
+
+  // Absolute split at 1.0 first; fall back to the median split only when it degenerates.
+  let cohortBasis: 'absolute' | 'median' = 'absolute';
+  let up = cohortStat('up', scoredRows.filter((r) => r.cohort === 'up'));
+  let down = cohortStat('down', scoredRows.filter((r) => r.cohort === 'down'));
+  let neutral = cohortStat('neutral', scoredRows.filter((r) => r.cohort === 'neutral'));
+
+  const absoluteDegenerate = up.n < MIN_PER_COHORT || down.n < MIN_PER_COHORT;
+  if (absoluteDegenerate && distinctMultipliers > 1) {
+    cohortBasis = 'median';
+    const sorted = [...scoredRows].sort((a, b) => a.oosMultiplier - b.oosMultiplier);
+    const mid = Math.floor(sorted.length / 2);
+    const bottomIds = new Set(sorted.slice(0, mid).map((r) => r.id));
+    // bottom-half (lower multiplier) → down; top-half → up. On odd counts the median
+    // row rides with the top half.
+    scoredRows = scoredRows.map((r) => ({ ...r, cohort: bottomIds.has(r.id) ? 'down' : 'up' }));
+    up = cohortStat('up', scoredRows.filter((r) => r.cohort === 'up'));
+    down = cohortStat('down', scoredRows.filter((r) => r.cohort === 'down'));
+    neutral = cohortStat('neutral', []);
+  }
+
+  const gap = bootstrapGap(
+    scoredRows.filter((r) => r.cohort === 'up').map((r) => r.realizedR),
+    scoredRows.filter((r) => r.cohort === 'down').map((r) => r.realizedR),
+    { level: ciLevel, iterations: bootstrapIterations, seed: bootstrapSeed },
+  );
+
+  let verdict: Verdict;
+  let reasons: string[];
+  if (distinctMultipliers <= 1) {
+    // Even after recalibration every row carries the same multiplier — there is no
+    // signal to split on, absolute OR median. Genuinely INCONCLUSIVE, not NOISE.
+    verdict = 'INCONCLUSIVE';
+    const only = scoredRows[0]?.oosMultiplier;
+    reasons = [
+      `OOS multipliers show no variation${only !== undefined ? ` (all = ${only.toFixed(3)})` : ''} even after recalibrating the baseline — cohorts cannot form on any basis`,
+    ];
+  } else {
+    const graded = gradeVerdict(scoredRows.length, up, down, gap);
+    verdict = graded.verdict;
+    reasons = [
+      `expectancy mode: baseline recalibrated to family decisive rate ${fmtRate(baseline.pooled)}${baseline.usedPerStructure ? ` (per-structure: ${fmtPerStructure(baseline.perStructure)})` : ''}; cohort basis = ${cohortBasis}${cohortBasis === 'median' ? ' (absolute up/down split degenerated → median split)' : ' (split at multiplier 1.0)'}; gap = up−down mean realized R`,
+      ...graded.reasons,
+    ];
+  }
+
+  const diagWeights = computeOptionLearnedWeights(resolved, baseParams);
+  const dimensions = dimensionDiagnostics(diagWeights);
+  const sentimentIcRead =
+    dimensions.find((d) => d.dimension === 'sentimentIcBand') ??
+    ({ dimension: 'sentimentIcBand', buckets: [] } as DimensionDiagnostic);
+
+  return {
+    issue: 'TRA-1133',
+    parent: 'TRA-992',
+    mode,
+    splitTs,
+    useShrinkage,
+    params: baseParams,
+    thresholds: {
+      up: EXPECTANCY_COHORT_THRESHOLD,
+      down: EXPECTANCY_COHORT_THRESHOLD,
+      minResolvedTotal: MIN_RESOLVED_TOTAL,
+      minPerCohort: MIN_PER_COHORT,
+      ciLevel,
+    },
+    sample: {
+      rowsTotal: rows.length,
+      resolvedTotal: scoredRows.length,
+      scored: scoredRows.length,
+    },
+    cohorts: { up, down, neutral },
+    gap,
+    verdict,
+    verdictReasons: reasons,
+    scoredRows,
+    dimensions,
+    sentimentIcRead,
+    expectancy: {
+      enabled: true,
+      baseline,
+      cohortBasis,
+      distinctMultipliers,
+    },
+  };
+}
+
+function fmtRate(x: number | null): string {
+  return x === null ? 'n/a' : x.toFixed(3);
+}
+function fmtPerStructure(m: Record<string, number>): string {
+  return Object.entries(m)
+    .map(([k, v]) => `${k}=${v.toFixed(3)}`)
+    .join(', ');
+}
+
 // ── text report (compact, headless-capturable — mirrors the TRA-822 harness) ────
 
 function fmtR(x: number | null, dp = 3): string {
@@ -420,19 +703,48 @@ export function renderOosReport(report: OosReport, generatedAt: string): string 
   L.push('');
   L.push(`**Generated:** ${generatedAt} · **Parent:** TRA-992 Step 1`);
   L.push(
-    `**Mode:** ${report.mode}${report.mode === 'time-split' ? ` (splitTs=${report.splitTs})` : ''} · **Shrinkage:** ${report.useShrinkage ? 'on' : 'off (hard-gate)'}`,
+    `**Mode:** ${report.mode}${report.mode === 'time-split' ? ` (splitTs=${report.splitTs})` : ''} · **Shrinkage:** ${report.useShrinkage ? 'on' : 'off (hard-gate)'}${report.expectancy ? ' · **Protocol:** v2 expectancy (TRA-1321)' : ''}`,
   );
   L.push('');
   L.push(`**VERDICT: ${report.verdict}**`);
   for (const r of report.verdictReasons) L.push(`- ${r}`);
   L.push('');
-  L.push('## Cohorts (by OOS multiplier)');
+  if (report.expectancy) {
+    const e = report.expectancy;
+    L.push('## Recalibration (protocol v2)');
+    L.push('');
+    L.push(
+      `- baseline (family decisive win-rate WIN/(WIN+LOSS)): pooled = ${fmtRate(e.baseline.pooled)} over ${e.baseline.decisiveResolved} decisive rows`,
+    );
+    if (e.baseline.usedPerStructure) {
+      L.push(`- per-structure baseline: ${fmtPerStructure(e.baseline.perStructure)}`);
+    } else {
+      L.push(`- per-structure baseline: none qualified (need >=${MIN_DECISIVE_PER_STRUCTURE} decisive rows each)`);
+    }
+    L.push(
+      `- cohort basis: **${e.cohortBasis}**${e.cohortBasis === 'median' ? ' (absolute 1.0 split degenerated → median composite-multiplier split)' : ' (split at recalibrated multiplier 1.0)'} · distinct OOS multipliers: ${e.distinctMultipliers}`,
+    );
+    L.push('');
+  }
+  const upLabel = report.expectancy
+    ? report.expectancy.cohortBasis === 'median'
+      ? 'top-half'
+      : '> 1.0'
+    : `> ${UP_THRESHOLD}`;
+  const downLabel = report.expectancy
+    ? report.expectancy.cohortBasis === 'median'
+      ? 'bottom-half'
+      : '< 1.0'
+    : `< ${DOWN_THRESHOLD}`;
+  const labelFor = (c: Cohort): string =>
+    c === 'up' ? upLabel : c === 'down' ? downLabel : cohortLabel('neutral');
+  L.push(`## Cohorts (by ${report.expectancy ? 'recalibrated ' : ''}OOS multiplier)`);
   L.push('');
   L.push('| Cohort | n | mean R | hit-rate |');
   L.push('|---|---|---|---|');
   for (const c of ['up', 'down', 'neutral'] as const) {
     const s = report.cohorts[c];
-    L.push(`| ${c} (${cohortLabel(c)}) | ${s.n} | ${fmtR(s.meanR)} | ${fmtPct(s.hitRate)} |`);
+    L.push(`| ${c} (${labelFor(c)}) | ${s.n} | ${fmtR(s.meanR)} | ${fmtPct(s.hitRate)} |`);
   }
   L.push('');
   L.push('## Up − Down expectancy gap');

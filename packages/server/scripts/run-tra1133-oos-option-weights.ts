@@ -16,6 +16,11 @@
  *                        (default leave-one-out).
  *   --shrinkage          use the Beta-Binomial shrinkage multiplier (default hard-gate).
  *   --mode demo|live     journal mode to load when reading the on-disk journal (default demo).
+ *   --expectancy         TRA-1321 protocol v2: recalibrate the neutral baseline to the
+ *                        family's own decisive win-rate, score on a decisive-basis fold,
+ *                        and grade the up-vs-down realized-R expectancy gap (median-split
+ *                        fallback). Writes tra1321-oos-option-weights-expectancy.{json,md}.
+ *                        Legacy default path is unchanged.
  *
  * Env:
  *   DATA_DIR   journal root holding option-trade-journal.jsonl (server default otherwise).
@@ -66,13 +71,15 @@ async function main(): Promise<void> {
     throw new Error(`--time-split expects a numeric ms-epoch, got: ${splitRaw}`);
   }
   const useShrinkage = hasFlag('--shrinkage');
+  const expectancy = hasFlag('--expectancy');
 
-  const report = buildOosReport(rows, { mode, splitTs, useShrinkage });
+  const report = buildOosReport(rows, { mode, splitTs, useShrinkage, expectancy });
   const text = renderOosReport(report, generatedAt);
 
   mkdirSync(REPORT_DIR, { recursive: true });
-  const jsonPath = resolve(REPORT_DIR, 'tra1133-oos-option-weights.json');
-  const mdPath = resolve(REPORT_DIR, 'tra1133-oos-option-weights.md');
+  const stem = expectancy ? 'tra1321-oos-option-weights-expectancy' : 'tra1133-oos-option-weights';
+  const jsonPath = resolve(REPORT_DIR, `${stem}.json`);
+  const mdPath = resolve(REPORT_DIR, `${stem}.md`);
   writeFileSync(jsonPath, JSON.stringify({ generatedAt, ...report }, null, 2), 'utf-8');
   writeFileSync(mdPath, text, 'utf-8');
 
