@@ -10298,11 +10298,23 @@ export function shouldBootArmLiveEquity(
 ): boolean {
   if (!isLiveBrokerOperator(username, env)) return false;
   if ((env['TRADIER_ENV'] ?? '') !== 'production') return false;
-  if ((settings.liveTradierEnvOptions ?? 'sandbox') !== 'production') return false;
+  // TRA-1411 — prod intent is derived from the SERVICE-level `TRADIER_ENV` above,
+  // NOT from a persisted `liveTradierEnvOptions === 'production'`. That per-account
+  // setting is only reachable via an admin-authenticated PUT /api/account/settings,
+  // which is unreachable on the redeploy-only bqb1 deployment — so gating the arm on
+  // it left the board-ratified boot-arm (approval 979c77c1, 411c0c5a) permanently
+  // inert: `liveEquityClientConfigured:false`, 62 live signals / 0 fills. The
+  // boot-arm block in user-context then persists `liveTradierEnvOptions:'production'`
+  // alongside `mode:'live'`, so {@link buildTradierLiveEquityClient} constructs the
+  // PRODUCTION Tradier client (not sandbox). Operator scope (isLiveBrokerOperator)
+  // and service prod-env still bound this to only the pinned `admin` engine on bqb1.
   if (!resolveLiveTradeEquitiesTradier(settings)) return false;
-  const resolved = resolveTradierOptionsCreds(settings);
-  const apiToken = (resolved.apiToken || (env['TRADIER_API_TOKEN'] ?? '')).trim();
-  const accountId = (resolved.accountId || (env['TRADIER_ACCOUNT_ID'] ?? '')).trim();
+  // Prod creds must resolve — per-user PRODUCTION creds OR the operator's shared-env
+  // `TRADIER_API_TOKEN`/`TRADIER_ACCOUNT_ID` fallback. Read the production fields
+  // directly (not via resolveTradierOptionsCreds, whose env may still read 'sandbox'
+  // here — the boot-arm block forces it to 'production' immediately after this).
+  const apiToken = ((settings.liveApiKeyOptionsProduction ?? '') || (env['TRADIER_API_TOKEN'] ?? '')).trim();
+  const accountId = ((settings.liveAccountIdOptionsProduction ?? '') || (env['TRADIER_ACCOUNT_ID'] ?? '')).trim();
   return apiToken.length > 0 && accountId.length > 0;
 }
 

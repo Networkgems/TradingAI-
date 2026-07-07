@@ -686,9 +686,18 @@ async function createUserContext(username: string): Promise<UserContext> {
   // keeps cache, disk, and engine in agreement.
   if (settings.mode !== 'live' && shouldBootArmLiveEquity(settings, username)) {
     settings.mode = 'live';
+    // TRA-1411 — also persist production Tradier env so buildTradierLiveEquityClient
+    // constructs the PRODUCTION order client (not sandbox). The persisted setting is
+    // only reachable via an admin-authed settings PUT (unreachable on redeploy-only
+    // bqb1), so forcing it here is what lets a plain `git push` actually configure the
+    // live-equity broker — resolving the board-approved arm (411c0c5a) that was inert
+    // as `liveEquityClientConfigured:false` / 62 signals / 0 fills. Scope is unchanged:
+    // shouldBootArmLiveEquity already restricts this to the pinned operator on the prod
+    // (TRADIER_ENV=production) service, so no non-operator / sandbox engine is affected.
+    settings.liveTradierEnvOptions = 'production';
     try {
       await saveSettings(username, settings);
-      log.info('TRA-713 boot-arm: forced production stocks engine to Live at boot', {
+      log.info('TRA-713/TRA-1411 boot-arm: forced production stocks engine to Live at boot', {
         username,
         liveTradierEnvOptions: settings.liveTradierEnvOptions,
       });

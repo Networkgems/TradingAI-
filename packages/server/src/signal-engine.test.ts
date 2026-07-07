@@ -4150,9 +4150,24 @@ describe('shouldBootArmLiveEquity — TRA-713 persistent live-equity boot-arm', 
     expect(shouldBootArmLiveEquity(prodSettings(), PIN, prodEnv({ TRADIER_ENV: 'sandbox' }))).toBe(false);
   });
 
-  it('refuses to arm a user routing options at the sandbox env', () => {
+  it('TRA-1411: arms even when the persisted env still reads sandbox, when service is prod + prod creds resolve', () => {
+    // The persisted `liveTradierEnvOptions` can only be flipped via an admin-authed
+    // settings PUT (unreachable on redeploy-only bqb1). Prod intent must therefore come
+    // from the SERVICE-level TRADIER_ENV, not the stale per-account setting — otherwise
+    // the board-ratified arm is permanently inert. Per-user production creds still resolve.
     const s = { ...prodSettings(), liveTradierEnvOptions: 'sandbox' as const };
-    expect(shouldBootArmLiveEquity(s, PIN, prodEnv())).toBe(false);
+    expect(shouldBootArmLiveEquity(s, PIN, prodEnv())).toBe(true);
+  });
+
+  it('TRA-1411: arms a sandbox-persisted operator via the server-env prod cred fallback', () => {
+    const s = {
+      ...prodSettings(),
+      liveTradierEnvOptions: 'sandbox' as const,
+      liveApiKeyOptionsProduction: '',
+      liveAccountIdOptionsProduction: '',
+    };
+    const env = prodEnv({ TRADIER_API_TOKEN: 'env-tok', TRADIER_ACCOUNT_ID: 'env-acct' });
+    expect(shouldBootArmLiveEquity(s, PIN, env)).toBe(true);
   });
 
   it('refuses to arm when no production creds resolve anywhere', () => {
