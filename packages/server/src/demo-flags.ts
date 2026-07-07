@@ -112,6 +112,16 @@ export const DEMO_FLAG_ALLOWLIST = [
   // daemon-free on the self-hosted host after QuantTrader forward-validates.
   'ENABLE_CHURN_LOSS_BRAKE',
   'CHURN_SAME_SESSION_OPEN_CAP',
+  // TRA-1410 (parent TRA-1406 "less noise, more quality") — the multi-leg
+  // (IC / verticals) demo-open PAUSE guard. Every combo the demo book opens
+  // closes at exactly $0 (100% scratch) because its synthetic combo symbol is
+  // never mark-managed per tick — un-manageable noise until the durable
+  // defined-risk exit policy lands. STANDALONE flag consulted ONLY on the demo
+  // combo-open chokepoints, so it can never pause a live open. Non-secret,
+  // demo-only — safe for the file override so the board can arm the
+  // retire-short-term daemon-free on the self-hosted host (no PM2/admin) the
+  // moment QuantTrader confirms the $0 closes are dead weight vs a fixable bug.
+  'ENABLE_OPTION_MULTILEG_PAUSE',
 ] as const;
 
 export const DEMO_FLAGS_FILENAME = 'demo-flags.json';

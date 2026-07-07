@@ -55,6 +55,7 @@ import { scanShortPremiumFromSnapshot, recordShortPremiumScan } from './short-pr
 import { isExitRiskRulesEnabled, isLiveEquityStopModifyEnabled, isTakeProfitEarlyEnabled, isEntryGreeksGateEnabled, isCorrelatedExposureCapEnabled, isOtmDeltaFloorEnabled, resolveOtmDeltaFloor } from './exit-risk-rules-flag.js';
 import { recordCorrelatedExposureBinding, type CorrelatedExposureVenue } from './correlated-exposure-ledger.js';
 import { isChurnLossBrakeEnabled, resolveSameSessionOpenCap } from './churn-loss-brake-flag.js';
+import { isMultiLegOpenPaused } from './multileg-open-pause-flag.js';
 import { recordConvictionDcaFill } from './conviction-dca-ledger.js';
 import { isScaleoutLadderEnabled } from './scaleout-ladder-flag.js';
 import { evaluateAndRecordScaleout } from './scaleout-ladder-ledger.js';
@@ -3537,6 +3538,21 @@ export class SignalEngine {
   }
 
   /**
+   * TRA-1410 (parent TRA-1406) — is the demo multi-leg (IC / verticals) OPEN
+   * guard armed? DEMO-SCOPED + DARK by default: always `false` on the live path
+   * and unless the board armed `ENABLE_OPTION_MULTILEG_PAUSE` (read through
+   * demo-flags.json). When true the demo combo-open chokepoints skip the open and
+   * log a reason, so every un-manageable combo (synthetic symbol → never
+   * mark-managed → force-scratched at $0) is retired until the durable
+   * defined-risk exit policy lands. Never touches a live open (live combos route
+   * through the advisory→capital bridge, which does not consult this flag).
+   */
+  private multiLegOpenPaused(): boolean {
+    if (this.mode === 'live') return false;
+    return isMultiLegOpenPaused(this.resolveDemoFlagEnv());
+  }
+
+  /**
    * TRA-1408 — record one NEW demo open against the per-name same-session churn
    * counter. Called by the open chokepoints ONLY after a position actually opened.
    * A no-op on the live path so the counter reflects demo churn only. Increments
@@ -4116,7 +4132,17 @@ export class SignalEngine {
                   earningsBeforeExpiry: execEarningsBeforeExpiry,
                   timestamp: asOf,
                 });
-                if (selectorResult.decision === 'signal') {
+                if (selectorResult.decision === 'signal' && this.multiLegOpenPaused()) {
+                  // TRA-1410 (parent TRA-1406) — pause the demo high-IVR breakout
+                  // combo open when the board arms ENABLE_OPTION_MULTILEG_PAUSE.
+                  // DARK by default + demo-only via {@link multiLegOpenPaused}, so
+                  // the live breakout-spread path is untouched.
+                  log.info('TRA-1410 multi-leg open paused — retired un-manageable demo combo', {
+                    sym,
+                    strategy: selectorResult.signal.strategy,
+                    source: 'highIVR-breakout-routing',
+                  });
+                } else if (selectorResult.decision === 'signal') {
                   // TRA-1200 — journal the high-IVR breakout spread open
                   // (previously this path passed NO journalSetup, so the spread
                   // never journalled: byStructure read 0 spreads and the
@@ -5826,7 +5852,16 @@ export class SignalEngine {
         if (res.result?.decision === 'signal') {
           const sig = res.result.signal;
           let routed = false;
-          if (isOptionPhaseBEnabled()) {
+          // TRA-1410 (parent TRA-1406) — pause the demo Phase-B combo open when
+          // the board arms ENABLE_OPTION_MULTILEG_PAUSE (un-manageable $0-scratch
+          // combos). DARK by default + demo-only via {@link multiLegOpenPaused}.
+          if (isOptionPhaseBEnabled() && this.multiLegOpenPaused()) {
+            log.info('TRA-1410 multi-leg open paused — retired un-manageable demo combo', {
+              symbol: sym,
+              strategy: sig.strategy,
+              source: 'phaseB-shadow-selector',
+            });
+          } else if (isOptionPhaseBEnabled()) {
             const opened = this.optionsAccount.openDefinedRiskSpread(
               shadowSignalToSpreadParams(sig, spot),
               'demo',
@@ -8239,6 +8274,23 @@ export class SignalEngine {
       typeof intent.maxLossUsd === 'number' &&
       typeof intent.maxProfitUsd === 'number'
     ) {
+      // TRA-1410 (parent TRA-1406) — multi-leg OPEN pause guard. Every combo the
+      // demo book opens closes at exactly $0 (100% scratch) because its synthetic
+      // symbol is never mark-managed per tick. When the board arms
+      // ENABLE_OPTION_MULTILEG_PAUSE (demo-flags.json), skip the open and log the
+      // reason rather than adding un-manageable noise. DARK by default (opens
+      // unchanged) and demo-only via {@link multiLegOpenPaused}; live combos route
+      // through the advisory→capital bridge and are untouched.
+      if (this.multiLegOpenPaused()) {
+        log.info('TRA-1410 multi-leg open paused — retired un-manageable demo combo', {
+          symbol: intent.ticker,
+          strategy: intent.strategy ?? 'defined_risk_spread',
+          legs: legs.length,
+          maxLossUsd: intent.maxLossUsd,
+          source: 'enterPaperOptionsIdea',
+        });
+        return null;
+      }
       // TRA-1103 — journal the AI-ideas defined-risk spread open (observe-only,
       // behind ENABLE_OPTION_TRADE_JOURNAL). `ivRank: null` (no IV-rank rides on
       // the idea intent and the no-cost rule applies — see the RV path above);
