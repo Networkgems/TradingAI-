@@ -397,6 +397,17 @@ export type {
   MultiLegPreTradeVerdict,
 } from './options/multi-leg-gate.js';
 export {
+  evaluateMultiLegExit,
+  buildOccSymbol,
+  DEFAULT_MULTILEG_EXIT_PARAMS,
+} from './options/multileg-exit.js';
+export type {
+  MultiLegExitParams,
+  MultiLegExitInput,
+  MultiLegExitDecision,
+  MultiLegExitReason,
+} from './options/multileg-exit.js';
+export {
   evaluatePortfolioGreeksGate,
   DEFAULT_PORTFOLIO_GREEKS_GATE,
 } from './options/portfolio-greeks-gate.js';

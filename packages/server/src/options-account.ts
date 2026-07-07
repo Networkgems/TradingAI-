@@ -1,6 +1,6 @@
 import { randomUUID } from 'crypto';
-import type { TradierOpenOptionPosition, ExitState, ExitParams, ExposurePositionRisk } from '@trading-app/engine';
-import { evaluateMultiLegPreTrade, DEFAULT_MAX_LOSS_PCT_CAP, maxLossCapUsd, evaluateExit, DEFAULT_EXIT_PARAMS, chandelierStop, chandelierExitTriggered, profitLockDecision, takeProfitEarlyDecision } from '@trading-app/engine';
+import type { TradierOpenOptionPosition, ExitState, ExitParams, ExposurePositionRisk, MultiLegExitParams } from '@trading-app/engine';
+import { evaluateMultiLegPreTrade, DEFAULT_MAX_LOSS_PCT_CAP, maxLossCapUsd, evaluateExit, DEFAULT_EXIT_PARAMS, chandelierStop, chandelierExitTriggered, profitLockDecision, takeProfitEarlyDecision, evaluateMultiLegExit, buildOccSymbol, blackScholesPrice, daysToExpiration } from '@trading-app/engine';
 import type { Side } from '@trading-app/engine';
 import type {
   AccountMode,
@@ -145,6 +145,24 @@ const r2 = (v: number): number => Math.round(v * 100) / 100;
  * of grace for a transient chain-fetch blip before the backstop engages.
  */
 const STALE_MARK_BACKSTOP_TICKS = 3;
+
+/**
+ * TRA-1418 (TRA-1417 build) — Black-Scholes backstop inputs for the per-tick
+ * combo net mark. The persisted `OptionLeg` carries no OCC symbol and no entry
+ * mark/IV, so when the OCC lookup misses (illiquid / after-hours legs never land
+ * in the mark map) the fallback reprices each leg off the underlying. To stay
+ * anchored to the REAL entry net (`markNet(entry) = -netUsd`), only the CHANGE in
+ * structure value is taken from Black-Scholes — bsNow(underlying now, DTE now) −
+ * bsEntry(underlying at entry, DTE at entry) — with a shared assumed IV and rate.
+ * Because the two BS prices are differenced with the same σ, the level of σ mostly
+ * scales the move magnitude, and per-leg errors partly cancel in the spread net,
+ * so a fixed literature-default σ is adequate for the demo forward test (the same
+ * "not final, the forward run tunes it" posture as the exit params). Mirrors the
+ * single-leg underlying-delta extrapolation backstop that already runs after
+ * `STALE_MARK_BACKSTOP_TICKS` misses (options-account.ts ~L1982).
+ */
+const COMBO_BS_ASSUMED_IV = 0.30;
+const COMBO_BS_RISK_FREE_RATE = 0.045;
 
 /**
  * TRA-1268 (TRA-1250 Rules 1-2) — per-tick inputs the options exit loop needs
@@ -1936,6 +1954,17 @@ export class PaperOptionsAccount {
      * precedence.
      */
     rvExitParams?: ExitParams,
+    /**
+     * TRA-1418 (TRA-1417 build, parent TRA-1406 / TRA-1410 option a) —
+     * {@link MultiLegExitParams} for the DEMO-only defined-risk combo exit policy.
+     * Present ⇔ the standalone `ENABLE_OPTION_MULTILEG_EXIT` flag is armed (caller
+     * scopes to `mode === 'demo'`). When present AND the position is a demo combo,
+     * the legacy blanket combo-skip is replaced by a real per-tick net mark +
+     * QuantTrader exit policy so the structure books a non-$0 WIN/LOSS. Absent → the
+     * legacy skip is byte-identical (combos held to manual close / expiry). Never
+     * affects single-leg or live positions.
+     */
+    multiLegExitParams?: MultiLegExitParams,
   ): OptionPosition[] {
     const closed: OptionPosition[] = [];
     const waitAndHold = options.waitAndHold === true;
@@ -1957,7 +1986,34 @@ export class PaperOptionsAccount {
       // are held to the user's manual close / expiry, so the per-tick exit
       // engine skips them entirely rather than synthesising a single-leg mark
       // that would misprice the structure.
-      if (opt.legs && opt.legs.length > 1) continue;
+      //
+      // TRA-1418 (TRA-1417 build) — EXCEPT when the demo-only
+      // `ENABLE_OPTION_MULTILEG_EXIT` policy is armed (`multiLegExitParams`
+      // present) on a DEMO combo: then the structure gets a real per-tick net
+      // mark + the QuantTrader defined-risk exit policy so it resolves to a
+      // non-$0 WIN/LOSS instead of a force-scratch. The flag-off path below is
+      // byte-identical to the legacy skip. Live combos, `waitAndHold` (broker
+      // mirroring — combos aren't leg-mirrored in v1), and an in-flight
+      // `pendingExit` keep the skip.
+      if (opt.legs && opt.legs.length > 1) {
+        if (
+          multiLegExitParams
+          && mode === 'demo'
+          && (opt.mode ?? 'demo') === 'demo'
+          && !waitAndHold
+          && !opt.pendingExit
+        ) {
+          const comboClosed = this.evaluateComboExit(
+            id,
+            opt,
+            underlyingPrices,
+            optionMarks,
+            multiLegExitParams,
+          );
+          if (comboClosed) closed.push(comboClosed);
+        }
+        continue;
+      }
       const isImported = opt.importedFromTradier === true;
       if (isImported) {
         // TRA-361 — imports flow through SL/TP1/trail when auto-management is
@@ -2395,6 +2451,171 @@ export class PaperOptionsAccount {
     }
 
     return closed;
+  }
+
+  /**
+   * TRA-1418 (TRA-1417 build) — current net liquidation value of a defined-risk
+   * combo, USD across all contracts: `Σ_legs legSign(leg) · legMark · 100 ·
+   * contracts` (legSign +1 buy / −1 sell). The baseline is `markNet(entry) =
+   * -netUsd`, so open P&L = `markNet(now) + netUsd`.
+   *
+   * Two mark sources, per the spec:
+   *   1. PRIMARY — reconstruct each leg's OCC symbol and read the existing
+   *      per-symbol mark map (the same map single-legs use). Requires ALL legs to
+   *      resolve so the net mixes only real marks; clears the stale counter.
+   *   2. FALLBACK — after `STALE_MARK_BACKSTOP_TICKS` consecutive OCC misses,
+   *      per-leg Black-Scholes reprice off the underlying. Only the CHANGE in
+   *      value (bsNow − bsEntry) is taken from BS and added to the real entry net
+   *      (`-netUsd`), mirroring the single-leg underlying-delta backstop, so the
+   *      structure stays anchored to its actual entry credit/debit.
+   *
+   * Returns `null` → HOLD (no synthetic scratch) when neither source is available
+   * this tick: still inside the stale-grace window, or the underlying is missing.
+   */
+  private comboMarkNet(
+    opt: OptionPosition,
+    underlyingPrices: Map<string, number>,
+    optionMarks: Map<string, number> | undefined,
+    nowMs: number,
+  ): number | null {
+    const legs = opt.legs;
+    if (!legs || legs.length < 2) return null;
+    // netUsd / maxProfit / maxLoss are all scaled by `contracts` at entry; use
+    // the same count so open-P&L fractions are consistent (combos never partial-
+    // exit, so contractsRemaining === contracts).
+    const contracts = opt.contracts;
+    const legSign = (action: OptionLeg['action']): number => (action === 'buy' ? 1 : -1);
+
+    // 1) PRIMARY — OCC lookup for every leg.
+    let allResolved = true;
+    let netFromMarks = 0;
+    for (const leg of legs) {
+      const occ = buildOccSymbol(opt.symbol, leg.expiration, leg.strike, leg.optionType);
+      const mark = occ ? optionMarks?.get(occ) : undefined;
+      if (typeof mark === 'number' && mark > 0) {
+        netFromMarks += legSign(leg.action) * mark * 100 * contracts;
+      } else {
+        allResolved = false;
+        break;
+      }
+    }
+    if (allResolved) {
+      opt.staleMarkTicks = 0;
+      return netFromMarks;
+    }
+
+    // Wait out the stale-grace window before the BS backstop, exactly as the
+    // single-leg mark path does — a single missed snapshot is a transient blip.
+    opt.staleMarkTicks = (opt.staleMarkTicks ?? 0) + 1;
+    if (opt.staleMarkTicks < STALE_MARK_BACKSTOP_TICKS) return null;
+
+    // 2) FALLBACK — per-leg BS reprice of the CHANGE, anchored at the entry net.
+    const underNow = underlyingPrices.get(opt.symbol);
+    if (underNow == null || !(underNow > 0)) return null;
+    const underEntry = opt.underlyingEntryPrice;
+    if (!(underEntry > 0)) return null;
+    if (typeof opt.netUsd !== 'number') return null;
+
+    let deltaNet = 0;
+    for (const leg of legs) {
+      const bsNow = blackScholesPrice({
+        spot: underNow,
+        strike: leg.strike,
+        timeToExpiryYears: daysToExpiration(leg.expiration, nowMs) / 365,
+        riskFreeRate: COMBO_BS_RISK_FREE_RATE,
+        volatility: COMBO_BS_ASSUMED_IV,
+        optionType: leg.optionType,
+      });
+      const bsEntry = blackScholesPrice({
+        spot: underEntry,
+        strike: leg.strike,
+        timeToExpiryYears: daysToExpiration(leg.expiration, opt.openedAt) / 365,
+        riskFreeRate: COMBO_BS_RISK_FREE_RATE,
+        volatility: COMBO_BS_ASSUMED_IV,
+        optionType: leg.optionType,
+      });
+      deltaNet += legSign(leg.action) * (bsNow - bsEntry) * 100 * contracts;
+    }
+    // markNet(now) = markNet(entry) + Δ = -netUsd + Δ.
+    return -opt.netUsd + deltaNet;
+  }
+
+  /**
+   * TRA-1418 (TRA-1417 build) — evaluate the DEMO-only defined-risk exit policy
+   * for one combo and, if it fires, book the close through the normal realized-
+   * P&L path so it lands in Closed-Today (and the option journal when on) as a
+   * non-$0 WIN/LOSS. Caller has already hard-gated `mode === 'demo'`, non-import,
+   * no pendingExit, not wait-and-hold. Returns the closed position snapshot, or
+   * `null` when the structure HOLDs (no mark this tick, min-hold not met, or no
+   * rule fired).
+   *
+   * Booking mirrors the single-position combo model (see {@link closeOption}):
+   * the reserved `maxLossUsd` came out of cash at entry, so a close returns that
+   * reservation plus the realized P&L. The realized P&L is the policy's band-
+   * clamped result, so the close can never exceed the defined risk already
+   * reserved. No demo slippage/fee haircut is applied — the combo's synthetic net
+   * isn't a tradeable single-contract mark and the clamp must hold exactly.
+   */
+  private evaluateComboExit(
+    id: string,
+    opt: OptionPosition,
+    underlyingPrices: Map<string, number>,
+    optionMarks: Map<string, number> | undefined,
+    params: MultiLegExitParams,
+  ): OptionPosition | null {
+    if (
+      typeof opt.netUsd !== 'number'
+      || typeof opt.maxProfitUsd !== 'number'
+      || typeof opt.maxLossUsd !== 'number'
+    ) {
+      return null;
+    }
+
+    const now = Date.now();
+    const markNetNow = this.comboMarkNet(opt, underlyingPrices, optionMarks, now);
+    // `barsHeld` is the count of prior evaluations: 0 on the entry tick (blocks a
+    // same-tick scratch — min_hold_bars) and ≥ 1 thereafter. Read BEFORE the
+    // increment so the very first evaluation sees 0.
+    const barsHeld = opt.comboExitBars ?? 0;
+    opt.comboExitBars = barsHeld + 1;
+    if (markNetNow === null) return null; // HOLD — no usable mark this tick.
+
+    const expiration = opt.expiration;
+    if (!expiration) return null;
+    const decision = evaluateMultiLegExit(
+      {
+        netUsd: opt.netUsd,
+        maxProfitUsd: opt.maxProfitUsd,
+        maxLossUsd: opt.maxLossUsd,
+        markNetNow,
+        dte: daysToExpiration(expiration, now),
+        entryDte: daysToExpiration(expiration, opt.openedAt),
+        barsHeld,
+      },
+      params,
+    );
+    if (!decision.shouldExit || decision.reason === null) return null;
+
+    const remainingContracts = opt.contractsRemaining;
+    const realized = decision.realizedPnlUsd;
+    // Synthetic per-share close mark so the standard combo close arithmetic
+    // (cash += mark × contracts × 100 == maxLossUsd + realized) books exactly the
+    // band-clamped realized P&L against the reserved capital.
+    const closeMark = opt.premiumPaid + realized / (remainingContracts * 100);
+    opt.pnl = (opt.pnl ?? 0) + realized;
+    opt.closedAt = now;
+    opt.currentPremium = closeMark;
+    opt.contractsRemaining = 0;
+    this.cash += closeMark * remainingContracts * 100;
+    this.equity += realized;
+    this.optionsPnlByMode.demo += realized;
+    this.openOptions.delete(id);
+    this.closedOptions.push({ ...opt });
+    // TRA-991 — fold the realized outcome onto this trade's journal row with the
+    // true exit reason (tp_capture / sl_credit / sl_debit / dte_time_stop /
+    // expiry_settle) so the resolved-combo distribution is attributable.
+    this.queueJournalClose(opt, decision.reason);
+    return { ...opt };
   }
 
   /**

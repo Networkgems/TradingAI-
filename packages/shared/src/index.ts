@@ -2406,6 +2406,16 @@ export interface OptionPosition {
    */
   staleMarkTicks?: number;
   /**
+   * TRA-1418 (TRA-1417 build, parent TRA-1406 / TRA-1410 option a) — number of
+   * per-tick combo-exit evaluations this defined-risk MULTI-LEG position has
+   * been through under the demo-only `ENABLE_OPTION_MULTILEG_EXIT` policy. Read
+   * BEFORE it is incremented so it doubles as the "bars held" count: it is 0 on
+   * the entry tick (enforcing `min_hold_bars` — no same-tick scratch) and ≥ 1 on
+   * every subsequent tick. Only ever touched on the combo branch; absent ↔ the
+   * flag has never evaluated this position (legacy / single-leg / flag-off).
+   */
+  comboExitBars?: number;
+  /**
    * TRA-613 (TRA-595 C5) — defined-risk MULTI-LEG spread combo. When present
    * (length ≥ 2) this position represents an AI-Options-Ideas defined-risk
    * structure (bull put spread, iron condor, debit spread, …) entered through

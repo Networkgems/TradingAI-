@@ -135,6 +135,16 @@ export const DEMO_FLAG_ALLOWLIST = [
   // the self-hosted host after QuantTrader forward-validates (no PM2/admin).
   'RV_EXIT_RETUNE_ENABLED',
   'RV_EXIT_RETUNE_CONFIRM_BARS',
+  // TRA-1418 (TRA-1417 build, parent TRA-1406 / TRA-1410 option a) — the DURABLE
+  // fix for the 100% $0-scratch combo closes: a per-tick combo net mark + the
+  // QuantTrader defined-risk exit policy (TP at 50% of max profit, credit 2× /
+  // debit 50% stop clamped to max loss, 21-DTE time-stop). STANDALONE flag (not
+  // under the EXIT_RISK_RULES master), consulted ONLY on the demo combo exit
+  // branch — hard-gated `mode === 'demo'`, so it can never manage a live combo.
+  // Default OFF ⇒ combos keep the legacy skip; non-secret, demo-only — safe for
+  // the file override so the board can arm it daemon-free (no PM2/admin) once
+  // QuantTrader forward-validates the resolved WIN/LOSS distribution.
+  'ENABLE_OPTION_MULTILEG_EXIT',
 ] as const;
 
 export const DEMO_FLAGS_FILENAME = 'demo-flags.json';
