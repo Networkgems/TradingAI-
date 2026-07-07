@@ -566,6 +566,11 @@ describe('TRA-895 options-pipeline probe', () => {
     expect(e.totalSignalCount).toBe(3);
     expect(e.watchlistSymbolCount).toBe(2);
     expect(e.openOptionsCount).toBe(3);
+    // TRA-1405 — the bare open-option fixtures carry no `legs` and no closed
+    // buffer / realized field, so the discriminators default cleanly.
+    expect(e.openOptionsComboCount).toBe(0);
+    expect(e.closedOptionsRecentCount).toBe(0);
+    expect(e.dailyRealizedOptionsPnl).toBeNull();
     expect(e.rvScanArmed).toBe(true);
     expect(e.blockedBy).toBeNull();
     expect(report.build).toBeDefined();
@@ -581,6 +586,39 @@ describe('TRA-895 options-pipeline probe', () => {
     // TRA-1114 — demo-only directional-entry gate is surfaced so the board can
     // verify the flip drives real demo fills from the probe. Off by default.
     expect(report.optionDemoDirectionalEnabled).toBe(false);
+  });
+
+  it('TRA-1405 — surfaces per-engine option-book composition (combos vs closed vs realized) so a $0-Calendar book is diagnosable without a login', () => {
+    // A book holding two multi-leg combos (never realize) + one single-leg, with
+    // a non-empty recent-closed buffer and a today-realized figure — the exact
+    // shape needed to tell "empty book" from "stuck-open combos" from "realizing
+    // normally" for e.g. admin vs Richard, joinable by index to /autonomous-demo.
+    const report = summarizeOptionsPipeline(
+      {
+        rvScannerConfigured: true,
+        rvBreakerOpen: false,
+        engines: [{
+          state: pipeState({
+            options: {
+              openOptions: [
+                { legs: [{}, {}] },      // iron condor / vertical → combo
+                { legs: [{}, {}, {}, {}] }, // 4-leg combo
+                { optionType: 'call' },  // single-leg (no legs)
+              ],
+              closedOptions: [{ pnl: 12 }, { pnl: -5 }],
+              dailyRealizedOptionsPnl: 7,
+            },
+          } as unknown as Partial<EngineState>),
+          mode: 'demo',
+        }],
+      },
+      NOW,
+    );
+    const e = report.engines[0]!;
+    expect(e.openOptionsCount).toBe(3);
+    expect(e.openOptionsComboCount).toBe(2);
+    expect(e.closedOptionsRecentCount).toBe(2);
+    expect(e.dailyRealizedOptionsPnl).toBe(7);
   });
 
   it('names the first failing gate so "no option signals" is diagnosable', () => {

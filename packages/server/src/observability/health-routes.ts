@@ -509,6 +509,32 @@ export interface OptionsPipelineEngineView {
   totalSignalCount: number;
   openOptionsCount: number;
   /**
+   * TRA-1405 — of the open options, how many are MULTI-LEG combos (iron condor /
+   * vertical). Combos are mark-managed only at close/expiry: `checkExits` skips
+   * them so they sit OPEN and never emit a realized CLOSE, whereas single-legs
+   * auto-close on SL/trail and DO realize onto the Calendar. A book whose open
+   * options are all combos can crater its equity (open MTM) while showing $0
+   * realized on the Calendar every day — this count is the discriminator for
+   * that failure mode without a per-user login.
+   */
+  openOptionsComboCount: number;
+  /**
+   * TRA-1405 — size of the engine's recent-CLOSED options buffer. Non-zero ⇒
+   * this book has closed (realized) option trades that flow to the Calendar's
+   * per-day options cell. Zero across a trading session ⇒ nothing realized.
+   */
+  closedOptionsRecentCount: number;
+  /**
+   * TRA-1405 — the book's today-realized options P&L (`dailyRealizedOptionsPnl`),
+   * the EXACT figure the Calendar's per-day options cell sums (eod-report.ts
+   * `optionsPnl`). Lets the board confirm, per demo engine and joinable by index
+   * to `/api/health/autonomous-demo` usernames, whether a given book (e.g. admin)
+   * is realizing option P&L onto its Calendar — the acceptance signal for
+   * TRA-1405 — without the admin login the issue was blocked on. `null` when the
+   * engine hasn't populated the field yet (pre-first-close / legacy snapshot).
+   */
+  dailyRealizedOptionsPnl: number | null;
+  /**
    * True iff every gate the per-tick RV options scan needs is satisfied right
    * now (scanner configured + breaker closed + auto-trade on + not halted +
    * market open). When false, `blockedBy` names the first failing gate so the
@@ -620,6 +646,12 @@ export function summarizeOptionsPipeline(
       optionSignalCount: state.signals.filter(s => s.type === 'relative_value').length,
       totalSignalCount: state.signals.length,
       openOptionsCount: state.options.openOptions?.length ?? 0,
+      // TRA-1405 — a position with ≥2 legs is a multi-leg combo (checkExits skips
+      // it ⇒ never realizes); single-leg (no `legs` / one leg) auto-closes.
+      openOptionsComboCount: (state.options.openOptions ?? [])
+        .filter(o => (o.legs?.length ?? 0) > 1).length,
+      closedOptionsRecentCount: state.options.closedOptions?.length ?? 0,
+      dailyRealizedOptionsPnl: state.options.dailyRealizedOptionsPnl ?? null,
       rvScanArmed: blockedBy === null,
       blockedBy,
     };
