@@ -798,3 +798,43 @@ export function generateEodReport(input: ReportInput, asOfDate?: string): EodRep
     ),
   };
 }
+
+/**
+ * TRA-1398 — decide whether persisting `next` (a freshly generated report for a
+ * day) over `existing` (the report already on disk for that day, or `null` when
+ * none exists) would be a destructive downgrade that must be skipped.
+ *
+ * The one dangerous case: the 21:00 ET archive writes today's report WITH the
+ * day's closed trades, then `archiveClosedTrades()` empties the in-memory
+ * ledger; a later re-run of the report generator for the SAME day (a Render
+ * redeploy after 21:00 re-fires the archive; a state refresh recomputes today)
+ * then produces an EMPTY report (`trades:[]`, `realizedPnl:0`) and clobbers the
+ * good file — zeroing the calendar cell. This is exactly the "editing demo
+ * starting equity erased today's P&L" bug on Richard's demo book.
+ *
+ * Return `true` (skip the write) ONLY when `next` is empty AND `existing`
+ * already carries realized content. A genuinely trade-less day whose file does
+ * not yet exist (or is itself empty) still writes, and any richer regeneration
+ * still upgrades — we block only the strict non-empty → empty downgrade.
+ */
+export function wouldClobberSettledReport(
+  next: { totalTrades: number; trades: readonly unknown[]; realizedPnl: number; optionsPnl: number },
+  existing:
+    | { trades?: readonly unknown[]; totalTrades?: number; realizedPnl?: number; optionsPnl?: number; combinedPnl?: number }
+    | null
+    | undefined,
+): boolean {
+  const nextIsEmpty =
+    next.totalTrades === 0
+    && next.trades.length === 0
+    && next.realizedPnl === 0
+    && next.optionsPnl === 0;
+  if (!nextIsEmpty || !existing) return false;
+  return (
+    (Array.isArray(existing.trades) && existing.trades.length > 0)
+    || (existing.totalTrades ?? 0) > 0
+    || (existing.realizedPnl ?? 0) !== 0
+    || (existing.optionsPnl ?? 0) !== 0
+    || (existing.combinedPnl ?? 0) !== 0
+  );
+}

@@ -6,7 +6,7 @@ import { existsSync } from 'fs';
 import { join, dirname } from 'path';
 import { fileURLToPath } from 'url';
 import { MarketScheduler, isMarketDay, isMarketDayIso, missedTradingDays, etDateString, isMarketOpen } from './scheduler.js';
-import { generateEodReport } from './reports/eod-report.js';
+import { generateEodReport, wouldClobberSettledReport } from './reports/eod-report.js';
 import { generateCryptoEodReport } from './reports/crypto-eod-report.js';
 import {
   listOptionTradeJournal,
@@ -931,6 +931,38 @@ async function generateAndSaveReport(
 
   const datePath = join(targetDir, `${finalReport.date}.json`);
   const mdPath = join(targetDir, `${finalReport.date}.md`);
+
+  // TRA-1398 — never let an EMPTY regeneration clobber a settled non-empty
+  // report for the same day. The 21:00 archive writes today WITH trades, then
+  // `archiveClosedTrades()` empties `allClosedPositions`. A later re-run of this
+  // function for TODAY — a Render redeploy after 21:00 resets the in-memory
+  // archive guard (`scheduler.ts` `lastArchiveDate`) and re-fires
+  // `runDailyCloseForAllUsers`, or a state refresh recomputes today — would then
+  // regenerate today's cell from the now-empty ledger (`trades:[]`,
+  // `realizedPnl:0`) and overwrite the good file, zeroing the calendar cell.
+  // That is the "editing demo starting equity erased today's P&L" report on
+  // Richard's demo book: the equity edit only rebased `totalEquity` and dated
+  // the clobber; the empty regeneration is what erased the trades. A genuinely
+  // trade-less first write of the day still writes (no existing file, or an
+  // existing empty one), and a later richer report still upgrades — we only
+  // block the strict downgrade of non-empty → empty.
+  if (!backfill) {
+    let existing: Parameters<typeof wouldClobberSettledReport>[1] = null;
+    try {
+      existing = JSON.parse(await readFile(datePath, 'utf-8')) as NonNullable<typeof existing>;
+    } catch {
+      // No existing file (ENOENT) or an unreadable/corrupt one → nothing richer
+      // to protect; `wouldClobberSettledReport(next, null)` returns false.
+    }
+    if (wouldClobberSettledReport(finalReport, existing)) {
+      log.warn('TRA-1398 skipped empty EOD regeneration over a settled report', {
+        username: ctx.username,
+        date: finalReport.date,
+        datePath,
+      });
+      return;
+    }
+  }
 
   const writes: Promise<void>[] = [
     writeFile(datePath, JSON.stringify(finalReport, null, 2), 'utf-8'),
