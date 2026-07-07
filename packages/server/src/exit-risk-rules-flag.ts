@@ -172,3 +172,25 @@ export function resolveRvExitConfirmBars(env: NodeJS.ProcessEnv = process.env): 
   }
   return RV_EXIT_RETUNE_CONFIRM_BARS_DEFAULT;
 }
+
+// TRA-1435 — minimum ARM floor for the book-level give-back cap (Rule 3). Today
+// the give-back cap arms at ANY positive peak, so a +$7 peak on a $2.2k book that
+// gives back ~$5 inside spread/noise latches a whole-session halt — STRICTER than
+// the sibling session-stop (which has a 0.5R arm). This sub-flag arms a minimum
+// floor: the give-back cap only trips once the day's peak reaches
+// `max(BOOK_GIVEBACK_ARM_ABS_FLOOR_USD, BOOK_GIVEBACK_ARM_FLOOR_R × book risk
+// unit)`. Gated by BOTH the `EXIT_RISK_RULES_ENABLED` master AND its own flag so
+// the give-back cap's arm behavior is a deliberate, revertible board/CTO arm
+// decision (validated by QuantTrader on the demo book). OFF by default preserves
+// the current (arm-at-any-peak) behavior — the caller passes a 0 arm floor, so
+// `bookGiveBackDecision` is byte-for-byte unchanged. Accepts 1/true/yes/on.
+export const BOOK_GIVEBACK_ARM_FLOOR_FLAG = 'BOOK_GIVEBACK_ARM_FLOOR_ENABLED';
+
+/**
+ * True iff the give-back cap's minimum arm floor (TRA-1435) is enabled. Requires
+ * the master exit-risk switch on as well — the sub-flag alone does nothing (the
+ * give-back cap itself only runs when `EXIT_RISK_RULES_ENABLED` is on).
+ */
+export function isBookGiveBackArmFloorEnabled(env: NodeJS.ProcessEnv = process.env): boolean {
+  return isExitRiskRulesEnabled(env) && flagOn(env[BOOK_GIVEBACK_ARM_FLOOR_FLAG]);
+}

@@ -2,7 +2,7 @@ import { OrbStrategy, BbFadeStrategy, IchimokuStrategy, SupertrendConfluenceStra
 import { buildExposureBuckets, DEFAULT_EXIT_PARAMS, DEFAULT_MULTILEG_EXIT_PARAMS } from '@trading-app/engine';
 import type { StrategySelectorInput, ContractQuote, OptionTrend, RvLongTrendSide, ExitState, ExitParams, MultiLegExitParams, SharedTickIndicators, RelativeValueScannerOptions, OptionChainRow, IvRvScannerOptions, IvRvMispricingCandidate, ExposureBucket, ExposurePositionRisk, CorrelatedExposureDecision } from '@trading-app/engine';
 import type { TradierAccountBalance } from '@trading-app/engine';
-import { WATCHLIST, isLiquidSwingSymbol, resolveEquitySwingModeEnabled, checkEquitySwingClose, MANAGED_ACCOUNT_RATIO, MAX_CONSECUTIVE_LOSSES, DAILY_DRAWDOWN_HALT_PCT, BOOK_SESSION_STOP_R, BOOK_GIVEBACK_CAP_PCT, TAKE_PROFIT_EARLY_CAPTURE_PCT, CORRELATED_EXPOSURE_CAP_PCT, CORRELATED_EXPOSURE_MIN_TRADE_RISK_PCT, LIVE_EQUITY_STOP_MODIFY_MIN_TICK_PCT, LIVE_EQUITY_STOP_MODIFY_MIN_TICK_ABS, LIVE_EQUITY_STOP_MODIFY_COOLDOWN_MS, DEFAULT_RISK_PER_TRADE, OPTIONS_PER_TICKET_DOLLAR_FLOOR, OPTIONS_POSITION_CAP_RATIO, aliasWatchlistSymbol, isLiveTradierOptionsEnabled, isStockMarketOpen, perPositionCap, resolveAutoManageImportedTradierOptions, resolveDemoCostModel, resolveHoldLiveOptionsOvernight, resolveSwingHoldOptions, resolveLiveTradeEquitiesTradier, resolveLiveEquityDcaAddsTradier, resolveManagedAccountRatio, resolveMarketReviewGatesEnabled, resolveRiskPerTrade, resolveRvDtePrefs, resolveTradierOptionsCreds, validateBracket, DEFAULT_RV_DTE_MIN, DEFAULT_RV_DTE_MAX, DEFAULT_RV_DTE_TARGET, scoreNewsSentiment, aggregateSymbolSentiment, aggregateFedSentiment, aggregateStockTwitsSentiment, dedupeStockTwitsMessages, mapCuratedMessagesBySymbol, nameAliasesFor, evaluateEquityDcaAdd, evaluateOptionDcaAdd, CONVICTION_DCA, EQUITY_DCA_MAX_SYMBOL_NOTIONAL_FRAC, capEquityAddQtyToSymbolNotional, blendedAverage, positionRiskDollars, minutesToSessionClose, getEasternUtcOffset, isAgentTradingWindowOpen } from '@trading-app/shared';
+import { WATCHLIST, isLiquidSwingSymbol, resolveEquitySwingModeEnabled, checkEquitySwingClose, MANAGED_ACCOUNT_RATIO, MAX_CONSECUTIVE_LOSSES, DAILY_DRAWDOWN_HALT_PCT, BOOK_SESSION_STOP_R, BOOK_GIVEBACK_CAP_PCT, BOOK_GIVEBACK_ARM_FLOOR_R, BOOK_GIVEBACK_ARM_ABS_FLOOR_USD, TAKE_PROFIT_EARLY_CAPTURE_PCT, CORRELATED_EXPOSURE_CAP_PCT, CORRELATED_EXPOSURE_MIN_TRADE_RISK_PCT, LIVE_EQUITY_STOP_MODIFY_MIN_TICK_PCT, LIVE_EQUITY_STOP_MODIFY_MIN_TICK_ABS, LIVE_EQUITY_STOP_MODIFY_COOLDOWN_MS, DEFAULT_RISK_PER_TRADE, OPTIONS_PER_TICKET_DOLLAR_FLOOR, OPTIONS_POSITION_CAP_RATIO, aliasWatchlistSymbol, isLiveTradierOptionsEnabled, isStockMarketOpen, perPositionCap, resolveAutoManageImportedTradierOptions, resolveDemoCostModel, resolveHoldLiveOptionsOvernight, resolveSwingHoldOptions, resolveLiveTradeEquitiesTradier, resolveLiveEquityDcaAddsTradier, resolveManagedAccountRatio, resolveMarketReviewGatesEnabled, resolveRiskPerTrade, resolveRvDtePrefs, resolveTradierOptionsCreds, validateBracket, DEFAULT_RV_DTE_MIN, DEFAULT_RV_DTE_MAX, DEFAULT_RV_DTE_TARGET, scoreNewsSentiment, aggregateSymbolSentiment, aggregateFedSentiment, aggregateStockTwitsSentiment, dedupeStockTwitsMessages, mapCuratedMessagesBySymbol, nameAliasesFor, evaluateEquityDcaAdd, evaluateOptionDcaAdd, CONVICTION_DCA, EQUITY_DCA_MAX_SYMBOL_NOTIONAL_FRAC, capEquityAddQtyToSymbolNotional, blendedAverage, positionRiskDollars, minutesToSessionClose, getEasternUtcOffset, isAgentTradingWindowOpen } from '@trading-app/shared';
 import type { TradeSignal, RelativeValueSignal, OtmMispricingSignal, Sma200Signal, Candle, OptionsAccountState, SignalType, Position, OptionPosition, AccountMode, AccountSettings, AccountState, NewsItem, SymbolSentiment, SocialSentiment, StockTwitsMessage, TechnicalSignalSnapshot, TradierEnv, MarketReview, MarketReviewGates, EngineMarketReviewState, GatedStrategyNote, AgentRecommendation, TradeProposal, AgentOrderAudit, GuardrailVerdict, OptionType, PositionAdvisorRow, AdvisorSellPlan, AdvisorDcaPlan } from '@trading-app/shared';
 import { shouldAutoConfirm } from '@trading-app/shared';
 // TRA-544 (TRA-529 P1) / TRA-747 (P2) — advisory multi-agent layer. ON suspends
@@ -52,7 +52,7 @@ import { isOptionShadowEnabled, isOptionPhaseBEnabled, emitShadowOptionSignal, s
 import { isOptionExecEnabled, isOptionEmaPullbackEnabled, isOptionVolumeBreakoutEnabled, resolveRvLongDteOverride, resolveRvMinDailyVolume, isOptionDemoDirectionalEnabled, isOptionIvRvScannerEnabled, isOptionIvRvRoutingEnabled, resolveIvRvRoutingOverride, isOptionShortPremiumScannerEnabled } from './option-exec-flag.js';
 import { scanIvRvFromSnapshot, recordIvRvScan } from './iv-rv-scanner.js';
 import { scanShortPremiumFromSnapshot, recordShortPremiumScan } from './short-premium-scanner.js';
-import { isExitRiskRulesEnabled, isLiveEquityStopModifyEnabled, isTakeProfitEarlyEnabled, isEntryGreeksGateEnabled, isCorrelatedExposureCapEnabled, isOtmDeltaFloorEnabled, resolveOtmDeltaFloor, isRvExitRetuneEnabled, resolveRvExitConfirmBars } from './exit-risk-rules-flag.js';
+import { isExitRiskRulesEnabled, isLiveEquityStopModifyEnabled, isTakeProfitEarlyEnabled, isEntryGreeksGateEnabled, isCorrelatedExposureCapEnabled, isOtmDeltaFloorEnabled, resolveOtmDeltaFloor, isRvExitRetuneEnabled, resolveRvExitConfirmBars, isBookGiveBackArmFloorEnabled } from './exit-risk-rules-flag.js';
 import { recordCorrelatedExposureBinding, type CorrelatedExposureVenue } from './correlated-exposure-ledger.js';
 import { isChurnLossBrakeEnabled, resolveSameSessionOpenCap } from './churn-loss-brake-flag.js';
 import { isMultiLegOpenPaused } from './multileg-open-pause-flag.js';
@@ -906,8 +906,14 @@ export class DailyRiskGovernor {
    * the discretionary book on the transition (idempotent thereafter). Callers
    * MUST gate invocation behind `EXIT_RISK_RULES_ENABLED`; when off this is
    * never called and `sessionHalted` stays false.
+   *
+   * TRA-1435 — `giveBackArmFloor` is the minimum peak (book currency) the day
+   * must reach before the GIVE-BACK cap can arm; the caller computes it from the
+   * `BOOK_GIVEBACK_ARM_FLOOR_ENABLED` sub-flag (0 when off ⇒ legacy arm-at-any-
+   * peak behavior, unchanged). The session stop keeps its own arm and is not
+   * affected.
    */
-  markBook(realizedPlusOpen: number, bookEquity: number): { tripped: boolean } {
+  markBook(realizedPlusOpen: number, bookEquity: number, giveBackArmFloor = 0): { tripped: boolean } {
     this.resetIfNewDay();
 
     // Monotonic intraday high-water mark of book gain, floored at 0.
@@ -922,6 +928,7 @@ export class DailyRiskGovernor {
       peakOpenGain: this.peakOpenGain,
       currentTotalPnl: realizedPlusOpen,
       sessionStopArmGain,
+      giveBackArmFloor,
     });
 
     if (!decision.shouldFlattenAndHalt || this.sessionHalted) {
@@ -2831,9 +2838,19 @@ export class SignalEngine {
     // `EXIT_RISK_RULES_ENABLED` — see markBook's contract. On the false→true
     // transition we flatten the discretionary paper book (live rides its resting
     // broker legs; new opens are blocked at both entry chokepoints regardless).
-    if (isExitRiskRulesEnabled(this.mode === 'live' ? process.env : this.resolveDemoFlagEnv())) {
+    const bookMarkEnv = this.mode === 'live' ? process.env : this.resolveDemoFlagEnv();
+    if (isExitRiskRulesEnabled(bookMarkEnv)) {
       const { realizedPlusOpen, bookEquity } = this.computeBookMark(prices);
-      const { tripped } = this.riskGovernor.markBook(realizedPlusOpen, bookEquity);
+      // TRA-1435 — minimum arm floor for the give-back cap so a trivial peak day
+      // can't latch a whole-session halt. 0 (unchanged) unless the board arms
+      // BOOK_GIVEBACK_ARM_FLOOR_ENABLED; then max($25, 0.5R of book equity).
+      const giveBackArmFloor = isBookGiveBackArmFloorEnabled(bookMarkEnv)
+        ? Math.max(
+            BOOK_GIVEBACK_ARM_ABS_FLOOR_USD,
+            BOOK_GIVEBACK_ARM_FLOOR_R * Math.max(0, bookEquity) * DEFAULT_RISK_PER_TRADE,
+          )
+        : 0;
+      const { tripped } = this.riskGovernor.markBook(realizedPlusOpen, bookEquity, giveBackArmFloor);
       if (tripped) {
         this.flattenOnBookHalt(prices, this.riskGovernor.getBookHaltReason() ?? 'book give-back halt');
       }

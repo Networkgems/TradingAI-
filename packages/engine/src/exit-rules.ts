@@ -232,6 +232,17 @@ export interface BookGiveBackParams {
    */
   sessionStopArmGain: number;
   giveBackCapPct?: number;
+  /**
+   * TRA-1435 — minimum ARM floor for the GIVE-BACK cap (NOT the session stop):
+   * the give-back cap only arms/trips once `peakOpenGain` reaches this absolute
+   * gain. Below it a trivial peak (e.g. +$7 on a $2.2k book that gives back $5
+   * inside spread/noise) can never latch a session halt. The caller computes it
+   * as `max(BOOK_GIVEBACK_ARM_ABS_FLOOR_USD, BOOK_GIVEBACK_ARM_FLOOR_R ×
+   * bookRiskUnit)` — mirroring `sessionStopArmGain` so the give-back cap is never
+   * stricter than the session stop at small peaks. Defaults to 0 (no floor →
+   * legacy behavior: the cap arms at any positive peak).
+   */
+  giveBackArmFloor?: number;
 }
 
 export type BookHaltReason = 'giveback_cap' | 'session_net_negative';
@@ -239,6 +250,11 @@ export type BookHaltReason = 'giveback_cap' | 'session_net_negative';
 export interface BookGiveBackDecision {
   /** Dollar floor: peakOpenGain × (1 − cap). Dropping below it trips the cap. */
   retainedFloor: number;
+  /**
+   * TRA-1435 — the give-back cap's minimum arm floor in force (0 ⇒ none). The cap
+   * is only live once `peakOpenGain ≥ giveBackArmFloor`.
+   */
+  giveBackArmFloor: number;
   /** True ⇒ flatten discretionary/open risk and halt NEW entries for the session. */
   shouldFlattenAndHalt: boolean;
   reason: BookHaltReason | null;
@@ -247,9 +263,11 @@ export interface BookGiveBackDecision {
 /**
  * Book-level give-back / session-stop decision.
  *
- *  - Give-back cap: once the book has a positive peak open gain, surrendering
- *    more than `giveBackCapPct` (40%) of it flattens and halts for the session.
- *    Example: peak +$1,599 → floor ≈ +$960; dropping below that trips the halt.
+ *  - Give-back cap: once the book has a positive peak open gain AT OR ABOVE the
+ *    `giveBackArmFloor` (TRA-1435), surrendering more than `giveBackCapPct` (40%)
+ *    of it flattens and halts for the session. Example: peak +$1,599 → floor ≈
+ *    +$960; dropping below that trips the halt. Below the arm floor a trivial
+ *    peak can never latch a halt (defaults to 0 ⇒ legacy: arms at any peak).
  *  - Session stop: if the book was up at least `sessionStopArmGain` (0.5R of
  *    book equity) and then goes net-negative, halt for the session.
  *
@@ -260,18 +278,25 @@ export function bookGiveBackDecision(p: BookGiveBackParams): BookGiveBackDecisio
   const cap = p.giveBackCapPct ?? BOOK_GIVEBACK_CAP_PCT;
   const peak = Math.max(0, p.peakOpenGain);
   const retainedFloor = peak * (1 - cap);
+  // TRA-1435 — the give-back cap's minimum arm floor (0 ⇒ none / legacy behavior).
+  // Clamp to ≥0 so a negative/NaN caller value never re-enables at any peak.
+  const giveBackArmFloor = Math.max(0, p.giveBackArmFloor ?? 0);
 
   // Session stop takes precedence — a net-negative book after a real up-move is
-  // the worst state and should latch regardless of the give-back arithmetic.
+  // the worst state and should latch regardless of the give-back arithmetic. Note
+  // this keeps its OWN arm (`sessionStopArmGain`) and is NOT gated by the
+  // give-back arm floor — a real up-move that flips net-negative always latches.
   if (p.sessionStopArmGain > 0 && peak >= p.sessionStopArmGain && p.currentTotalPnl < 0) {
-    return { retainedFloor, shouldFlattenAndHalt: true, reason: 'session_net_negative' };
+    return { retainedFloor, giveBackArmFloor, shouldFlattenAndHalt: true, reason: 'session_net_negative' };
   }
 
-  if (peak > 0 && p.currentTotalPnl < retainedFloor) {
-    return { retainedFloor, shouldFlattenAndHalt: true, reason: 'giveback_cap' };
+  // Give-back cap: only arms once the day's peak reaches the arm floor, so a
+  // tiny-peak day (peak below the floor) can never trip it.
+  if (peak > 0 && peak >= giveBackArmFloor && p.currentTotalPnl < retainedFloor) {
+    return { retainedFloor, giveBackArmFloor, shouldFlattenAndHalt: true, reason: 'giveback_cap' };
   }
 
-  return { retainedFloor, shouldFlattenAndHalt: false, reason: null };
+  return { retainedFloor, giveBackArmFloor, shouldFlattenAndHalt: false, reason: null };
 }
 
 // ─────────────────────────────────────────────────────────────────────────────

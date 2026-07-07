@@ -1983,6 +1983,15 @@ export const PROFIT_LOCK_TIGHTEN_GIVEBACK_R = 0.5;    // … tighten the give-ba
 // Rule 3 — book-level daily give-back cap (the board's headline ask)
 export const BOOK_GIVEBACK_CAP_PCT = 0.40;            // flatten + halt after surrendering >40% of the day's peak open gain
 export const BOOK_SESSION_STOP_R = 0.5;               // hard session stop if net-negative after being up > +0.5R of book equity
+// TRA-1435 — minimum ARM floor for the give-back cap so a trivial peak can never
+// latch a session halt. The cap only arms once the day's peakOpenGain reaches
+// max(BOOK_GIVEBACK_ARM_ABS_FLOOR_USD, BOOK_GIVEBACK_ARM_FLOOR_R × book risk unit),
+// where the book risk unit = DEFAULT_RISK_PER_TRADE × bookEquity (the same 1R the
+// session-stop uses). Mirrors BOOK_SESSION_STOP_R so the give-back cap is never
+// STRICTER than the session-stop at small peaks. Example: a $2,241 book → 0.5R =
+// $11.20, floor = max($25, $11.20) = $25, so a +$7 peak can't halt the day.
+export const BOOK_GIVEBACK_ARM_FLOOR_R = 0.5;         // arm the give-back cap once peak ≥ 0.5R of book equity …
+export const BOOK_GIVEBACK_ARM_ABS_FLOOR_USD = 25;    // … or +$25, whichever is greater
 
 // TRA-1294 — take-profit-early: the symmetric PROFIT-side mirror of the give-back
 // cap. Bank the win once a position has captured this fraction of its available

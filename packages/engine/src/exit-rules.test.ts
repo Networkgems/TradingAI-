@@ -183,6 +183,82 @@ describe('Rule 3 — book-level daily give-back cap', () => {
     expect(d.retainedFloor).toBe(750);
     expect(d.shouldFlattenAndHalt).toBe(false);
   });
+
+  // TRA-1435 — minimum ARM floor: a trivial peak day can never latch a halt.
+  // Book = $2,241 → 1R = 1% = $22.41, 0.5R = $11.20, arm floor = max($25, $11.20)
+  // = $25 (the same shape the wiring computes).
+  describe('minimum arm floor (TRA-1435)', () => {
+    const ARM_FLOOR = 25; // max($25, 0.5R of a $2.2k book)
+
+    it('(a) does NOT halt on a tiny-peak day below the arm floor (the observed bug)', () => {
+      // The Richard book today: peaked +$7, gave back to +$1.87 (well past the
+      // 40% cap: floor would be $4.20) — but the +$7 peak never reached the $25
+      // arm floor, so the give-back cap must NOT arm.
+      const d = bookGiveBackDecision({
+        peakOpenGain: 7,
+        currentTotalPnl: 1.87,
+        sessionStopArmGain: 11.2, // 0.5R of the $2.2k book
+        giveBackArmFloor: ARM_FLOOR,
+      });
+      expect(d.giveBackArmFloor).toBe(25);
+      expect(d.shouldFlattenAndHalt).toBe(false);
+      expect(d.reason).toBeNull();
+    });
+
+    it('(a-legacy) WOULD halt on the same tiny peak with no arm floor (flag-off behavior)', () => {
+      // Proves the change is behavior-preserving when the arm floor is 0: the
+      // caller passes 0 (flag off) and the legacy arm-at-any-peak halt fires.
+      const d = bookGiveBackDecision({ peakOpenGain: 7, currentTotalPnl: 1.87, sessionStopArmGain: 11.2 });
+      expect(d.giveBackArmFloor).toBe(0);
+      expect(d.shouldFlattenAndHalt).toBe(true);
+      expect(d.reason).toBe('giveback_cap');
+    });
+
+    it('(b) DOES halt once the peak clears the arm floor and gives back >40%', () => {
+      // Peak +$50 (≥ $25 floor), floor = $30; drop to +$25 (<$30) → halt as today.
+      const d = bookGiveBackDecision({
+        peakOpenGain: 50,
+        currentTotalPnl: 25,
+        sessionStopArmGain: 11.2,
+        giveBackArmFloor: ARM_FLOOR,
+      });
+      expect(d.retainedFloor).toBe(30);
+      expect(d.shouldFlattenAndHalt).toBe(true);
+      expect(d.reason).toBe('giveback_cap');
+    });
+
+    it('(c) the +$1,599 headline case is unchanged with an arm floor set', () => {
+      // A $25 arm floor is far below a +$1,599 peak, so the real give-back halt
+      // still fires exactly as before.
+      const d = bookGiveBackDecision({
+        peakOpenGain: 1599,
+        currentTotalPnl: 483,
+        sessionStopArmGain: 100,
+        giveBackArmFloor: ARM_FLOOR,
+      });
+      expect(d.shouldFlattenAndHalt).toBe(true);
+      expect(d.reason).toBe('giveback_cap');
+    });
+
+    it('the session stop is NOT gated by the give-back arm floor', () => {
+      // Peak +$15 is below the $25 give-back arm floor but at/above the $11.20
+      // session-stop arm; a flip net-negative must still latch the session stop.
+      const d = bookGiveBackDecision({
+        peakOpenGain: 15,
+        currentTotalPnl: -3,
+        sessionStopArmGain: 11.2,
+        giveBackArmFloor: ARM_FLOOR,
+      });
+      expect(d.shouldFlattenAndHalt).toBe(true);
+      expect(d.reason).toBe('session_net_negative');
+    });
+
+    it('a negative/NaN arm floor is clamped to 0 (cannot re-enable at any peak by accident)', () => {
+      const d = bookGiveBackDecision({ peakOpenGain: 7, currentTotalPnl: 1.87, sessionStopArmGain: 11.2, giveBackArmFloor: -100 });
+      expect(d.giveBackArmFloor).toBe(0);
+      expect(d.shouldFlattenAndHalt).toBe(true); // clamped to legacy arm-at-any-peak
+    });
+  });
 });
 
 describe('Rule 4 (TRA-1294) — take-profit-early', () => {

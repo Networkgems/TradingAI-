@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest';
-import { isExitRiskRulesEnabled, isLiveEquityStopModifyEnabled, isTakeProfitEarlyEnabled, isCorrelatedExposureCapEnabled, isOtmDeltaFloorEnabled, resolveOtmDeltaFloor, OTM_DELTA_FLOOR_DEFAULT, isRvExitRetuneEnabled, resolveRvExitConfirmBars, RV_EXIT_RETUNE_CONFIRM_BARS_DEFAULT } from './exit-risk-rules-flag.js';
+import { isExitRiskRulesEnabled, isLiveEquityStopModifyEnabled, isTakeProfitEarlyEnabled, isCorrelatedExposureCapEnabled, isOtmDeltaFloorEnabled, resolveOtmDeltaFloor, OTM_DELTA_FLOOR_DEFAULT, isRvExitRetuneEnabled, resolveRvExitConfirmBars, RV_EXIT_RETUNE_CONFIRM_BARS_DEFAULT, isBookGiveBackArmFloorEnabled } from './exit-risk-rules-flag.js';
 
 // TRA-1250 / TRA-1269 / TRA-1294 / TRA-1295 — master switch + the isolated sub-flags.
 
@@ -111,5 +111,25 @@ describe('isRvExitRetuneEnabled / resolveRvExitConfirmBars (TRA-1409)', () => {
         RV_EXIT_RETUNE_CONFIRM_BARS_DEFAULT,
       );
     }
+  });
+});
+
+describe('isBookGiveBackArmFloorEnabled (TRA-1435)', () => {
+  it('requires BOTH the master switch AND the sub-flag', () => {
+    // Sub-flag alone does nothing — the master must also be on (the give-back cap
+    // itself only runs when EXIT_RISK_RULES_ENABLED is on).
+    expect(isBookGiveBackArmFloorEnabled({ BOOK_GIVEBACK_ARM_FLOOR_ENABLED: 'true' })).toBe(false);
+    // Master alone does not arm the give-back floor (legacy arm-at-any-peak stays).
+    expect(isBookGiveBackArmFloorEnabled({ EXIT_RISK_RULES_ENABLED: 'true' })).toBe(false);
+    // Both on → enabled; accepts the usual truthy spellings.
+    for (const v of ['1', 'true', 'YES', ' on ']) {
+      expect(
+        isBookGiveBackArmFloorEnabled({ EXIT_RISK_RULES_ENABLED: 'true', BOOK_GIVEBACK_ARM_FLOOR_ENABLED: v }),
+      ).toBe(true);
+    }
+    // Master off wins even if the sub-flag is on.
+    expect(
+      isBookGiveBackArmFloorEnabled({ EXIT_RISK_RULES_ENABLED: 'off', BOOK_GIVEBACK_ARM_FLOOR_ENABLED: '1' }),
+    ).toBe(false);
   });
 });
