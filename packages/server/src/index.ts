@@ -9,6 +9,7 @@ import { MarketScheduler, isMarketDay, isMarketDayIso, missedTradingDays, etDate
 import { createFileArchiveDateStore } from './scheduler-state.js';
 import { generateEodReport, wouldClobberSettledReport } from './reports/eod-report.js';
 import { generateCryptoEodReport } from './reports/crypto-eod-report.js';
+import { aggregateDeskCalendar } from './reports/desk-calendar.js';
 import {
   listOptionTradeJournal,
   summarizeOptionTradeJournal,
@@ -4947,6 +4948,56 @@ app.get('/api/reports', requireAuth, async (req, res) => {
     });
   }
   res.json({ dates: [...new Set(dates)].sort().reverse() });
+});
+
+// TRA-1413 — DESK (all demo books) calendar, fed by the firm-wide Option-Trade
+// Journal. Board decision on TRA-1398 (picked C): keep the per-user Calendar
+// (`/api/reports*`) exactly as-is and add this SEPARATE, clearly-labelled view
+// for the whole fleet's demo option P&L. Source is `listOptionTradeJournal({
+// mode: 'demo' })` with NO user filter — the journal is firm-wide by design
+// (option A, adding a per-user field, was explicitly rejected). It carries no
+// balances/PII and no secrets (same basis as `/api/health/option-journal`), so
+// these two routes are unauthenticated, matching that readout. Registered BEFORE
+// `/api/reports/:date` so the literal `desk` segment can't be captured as a date.
+//
+// Shape parity: both routes return exactly what the Calendar grid already
+// consumes — `GET /api/reports/desk` → `{ dates: string[] }` (newest-first) and
+// `GET /api/reports/desk/:date` → the per-day `EodReport` cell — so the UI only
+// switches its `reportsPath`, not its rendering.
+app.get('/api/reports/desk', async (_req, res) => {
+  try {
+    const rows = await listOptionTradeJournal({ mode: 'demo' });
+    const cells = aggregateDeskCalendar(rows, Date.now());
+    res.json({ dates: [...cells.keys()].sort().reverse() });
+  } catch (err) {
+    log.warn('desk calendar date list failed', {
+      reason: err instanceof Error ? err.message : String(err),
+    });
+    res.status(500).json({ error: 'Failed to build desk calendar' });
+  }
+});
+
+app.get('/api/reports/desk/:date', async (req, res) => {
+  const { date } = req.params as Record<string, string>;
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(date)) {
+    res.status(400).json({ error: 'Invalid date format. Use YYYY-MM-DD.' });
+    return;
+  }
+  try {
+    const rows = await listOptionTradeJournal({ mode: 'demo' });
+    const cell = aggregateDeskCalendar(rows, Date.now()).get(date);
+    if (!cell) {
+      res.status(404).json({ error: `No desk report for ${date}` });
+      return;
+    }
+    res.json(cell);
+  } catch (err) {
+    log.warn('desk calendar day read failed', {
+      date,
+      reason: err instanceof Error ? err.message : String(err),
+    });
+    res.status(500).json({ error: 'Failed to build desk calendar day' });
+  }
 });
 
 app.get('/api/reports/:date', requireAuth, async (req, res) => {

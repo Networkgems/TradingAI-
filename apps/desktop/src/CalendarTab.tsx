@@ -415,25 +415,40 @@ export function CalendarTab({ token, httpUrl, reportsPath = '/api/reports', mode
   // app reload. Read-only: it only re-fetches saved reports, it does not
   // regenerate them (avoids writing into the wrong per-account bucket).
   const [refreshTick, setRefreshTick] = useState(0);
+  // TRA-1413 — data-source segment: 'account' = the existing per-user reports
+  // (unchanged), 'desk' = the firm-wide demo Option-Trade Journal aggregation
+  // (`/api/reports/desk`, all demo books, NOT this user's account). Only the
+  // data source switches; the grid/detail rendering is reused verbatim.
+  const [source, setSource] = useState<'account' | 'desk'>('account');
+  const isDesk = source === 'desk';
+
+  // TRA-1413 — when the Desk view is active the calendar reads the firm-wide
+  // journal endpoint instead of the per-user reports, and always uses the
+  // weekday (stocks) layout because the desk book is options-only (equity
+  // market hours, no weekend closes). The per-user path/market are untouched.
+  const reportsPathEff = isDesk ? '/api/reports/desk' : reportsPath;
+  const marketEff: CalendarMarket = isDesk ? 'stocks' : market;
 
   // TRA-244 — append `?mode=<bucket>` so server reads from the matching
-  // per-account folder (or omit when no mode is supplied).
+  // per-account folder (or omit when no mode is supplied). The Desk endpoint is
+  // firm-wide demo and ignores the query, so an appended mode is harmless there.
   const modeQuery = mode ? `?mode=${mode}` : '';
 
   // TRA-244 — flipping accounts must clear the cached month state so a brief
   // render of the previous bucket's rows can't leak through.
   // TRA-369 — also reset when toggling stocks ↔ crypto.
+  // TRA-1413 — also reset when toggling My Account ↔ Desk.
   useEffect(() => {
     setReports({});
     setSelectedDate(null);
-  }, [mode, reportsPath, market]);
+  }, [mode, reportsPathEff, marketEff]);
 
   useEffect(() => {
     let cancelled = false;
     async function load() {
       setLoading(true);
       try {
-        const r = await fetch(`${httpUrl}${reportsPath}${modeQuery}`, {
+        const r = await fetch(`${httpUrl}${reportsPathEff}${modeQuery}`, {
           headers: { Authorization: `Bearer ${token}` },
         });
         if (!r.ok || cancelled) return;
@@ -443,13 +458,13 @@ export function CalendarTab({ token, httpUrl, reportsPath = '/api/reports', mode
         // equity market is closed Sat/Sun, so any saved report with a weekend
         // date is stale/imported noise we shouldn't surface in totals or
         // monthly stats. Crypto keeps every day.
-        const filteredDates = market === 'stocks'
+        const filteredDates = marketEff === 'stocks'
           ? dates.filter(d => !isWeekendIso(d))
           : dates;
 
         const results = await Promise.all(
           filteredDates.map(d =>
-            fetch(`${httpUrl}${reportsPath}/${d}${modeQuery}`, { headers: { Authorization: `Bearer ${token}` } })
+            fetch(`${httpUrl}${reportsPathEff}/${d}${modeQuery}`, { headers: { Authorization: `Bearer ${token}` } })
               .then(res => (res.ok ? (res.json() as Promise<EodReport>) : null))
               .catch(() => null),
           ),
@@ -458,7 +473,7 @@ export function CalendarTab({ token, httpUrl, reportsPath = '/api/reports', mode
         const map: Record<string, EodReport> = {};
         for (const rep of results) {
           if (!rep) continue;
-          if (market === 'stocks' && isWeekendIso(rep.date)) continue;
+          if (marketEff === 'stocks' && isWeekendIso(rep.date)) continue;
           map[rep.date] = rep;
         }
         setReports(map);
@@ -468,7 +483,7 @@ export function CalendarTab({ token, httpUrl, reportsPath = '/api/reports', mode
     }
     load();
     return () => { cancelled = true; };
-  }, [token, httpUrl, reportsPath, modeQuery, market, refreshTick]);
+  }, [token, httpUrl, reportsPathEff, modeQuery, marketEff, refreshTick]);
 
   // TRA-219 — fetch a fresh copy of the selected day's report so the detail
   // view picks up trades that closed after the initial month load.
@@ -479,7 +494,7 @@ export function CalendarTab({ token, httpUrl, reportsPath = '/api/reports', mode
     async function loadDetail() {
       setDetailLoading(true);
       try {
-        const r = await fetch(`${httpUrl}${reportsPath}/${selectedDate}${modeQuery}`, {
+        const r = await fetch(`${httpUrl}${reportsPathEff}/${selectedDate}${modeQuery}`, {
           headers: { Authorization: `Bearer ${token}` },
         });
         if (!r.ok || cancelled) return;
@@ -491,7 +506,7 @@ export function CalendarTab({ token, httpUrl, reportsPath = '/api/reports', mode
     }
     loadDetail();
     return () => { cancelled = true; };
-  }, [selectedDate, token, httpUrl, reportsPath, modeQuery, reports]);
+  }, [selectedDate, token, httpUrl, reportsPathEff, modeQuery, reports]);
 
   function prevPeriod() {
     if (view === 'year') { setYear(y => y - 1); return; }
@@ -514,6 +529,18 @@ export function CalendarTab({ token, httpUrl, reportsPath = '/api/reports', mode
       <div className="cal-header">
         <h2 className="cal-title">P&amp;L Calendar</h2>
         <div className="cal-controls">
+          {/* TRA-1413 — data-source segment: per-user account book vs the
+              firm-wide demo Option-Trade Journal (all demo books). */}
+          <div className="cal-view-toggle" title="Switch between your account and the firm-wide demo desk">
+            <button
+              className={`cal-toggle-btn${!isDesk ? ' active' : ''}`}
+              onClick={() => { setSource('account'); setSelectedDate(null); }}
+            >My Account</button>
+            <button
+              className={`cal-toggle-btn${isDesk ? ' active' : ''}`}
+              onClick={() => { setSource('desk'); setSelectedDate(null); }}
+            >Desk (all demo books)</button>
+          </div>
           <div className="cal-view-toggle">
             <button
               className={`cal-toggle-btn${view === 'month' ? ' active' : ''}`}
@@ -549,20 +576,40 @@ export function CalendarTab({ token, httpUrl, reportsPath = '/api/reports', mode
           >
             &#8635; Refresh
           </button>
-          {/* TRA-568 — trade-history export (CSV/JSON) for the current user. */}
-          <button
-            type="button"
-            className="cal-export-btn"
-            onClick={() => setExportOpen(true)}
-            title="Export closed trades to CSV or JSON"
-          >
-            &#10515; Export
-          </button>
+          {/* TRA-568 — trade-history export (CSV/JSON) for the current user.
+              TRA-1413 — hidden in the Desk view: the export is per-user account
+              scoped, so it would not match the firm-wide desk aggregation. */}
+          {!isDesk && (
+            <button
+              type="button"
+              className="cal-export-btn"
+              onClick={() => setExportOpen(true)}
+              title="Export closed trades to CSV or JSON"
+            >
+              &#10515; Export
+            </button>
+          )}
         </div>
       </div>
 
       {exportOpen && (
         <ExportTradesModal token={token} httpUrl={httpUrl} onClose={() => setExportOpen(false)} />
+      )}
+
+      {/* TRA-1413 — make it unmistakable the Desk view is the firm-wide demo
+          forward-test (every demo book's option closes), NOT this user's
+          personal account. */}
+      {isDesk && (
+        <div className="cal-desk-banner" style={{
+          margin: '0.5rem 0 0.75rem', padding: '0.5rem 0.75rem', borderRadius: '6px',
+          background: 'rgba(99,102,241,0.12)', border: '1px solid rgba(99,102,241,0.35)',
+          fontSize: '0.82rem', lineHeight: 1.4,
+        }}>
+          <strong>Desk (all demo books)</strong> — firm-wide <em>demo</em> forward-test.
+          Each cell is the whole fleet's <strong>realized option</strong> P&amp;L for that day
+          (from the shared Option-Trade Journal), summed across every demo book — <em>not</em> your
+          personal account. Switch to <strong>My Account</strong> for your own book.
+        </div>
       )}
 
       {selectedDate && (
@@ -584,7 +631,7 @@ export function CalendarTab({ token, httpUrl, reportsPath = '/api/reports', mode
             month={month}
             reports={reports}
             onSelectDate={setSelectedDate}
-            cols={market === 'stocks' ? 5 : 7}
+            cols={marketEff === 'stocks' ? 5 : 7}
           />
           <MonthSummary year={year} month={month} reports={reports} />
           {/* TRA-1228 — the board asked why "today" reads low / flat vs the
