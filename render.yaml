@@ -488,6 +488,26 @@ services:
         value: "true"
       - key: RV_EXIT_RETUNE_CONFIRM_BARS
         value: "2"
+      # TRA-1408 (parent TRA-1406, board confirmation `3f248ea1` = accepted 07-07)
+      # — arm the per-name churn + same-day-loss brake on the DEMO book. GIS
+      # churned 95 closes for -$2,236 in one session while conviction-DCA kept
+      # ADDING to it; this (1) caps same-session re-entries per underlier at N=3
+      # and (2) halts a conviction-DCA add on any name net-negative on the ET day.
+      # STANDALONE flag, deliberately NOT under the master EXIT_RISK_RULES_ENABLED
+      # (above): the signal-engine consults it ONLY on the demo open chokepoints +
+      # demo conviction-DCA add loops (the live add-order path only shadow-logs and
+      # `churnOpenCapVerdict` no-ops on `mode === 'live'`), so setting it here can
+      # NEVER alter a live open or a live add. CHURN_SAME_SESSION_OPEN_CAP tunes the
+      # cap (default 3, code default is also 3). QuantTrader forward-validates from
+      # `GET /api/health/conviction-dca` + the option/equity journal (acceptance:
+      # no symbol exceeds the per-session cap; DCA never adds to a same-day
+      # net-negative name). Revert = clear this value + redeploy. NOTE: blueprint
+      # sync != autoDeploy on bqb1 (TRA-1289) — a push to main triggers autoDeploy,
+      # which is what makes this var take effect. Accepts 1/true/yes/on.
+      - key: ENABLE_CHURN_LOSS_BRAKE
+        value: "1"
+      - key: CHURN_SAME_SESSION_OPEN_CAP
+        value: "3"
       # TRA-1080 — event-loop/heap starvation watchdog. The watchdog itself is
       # ON by default in code (no env needed); these knobs are declared
       # `sync: false` so an operator can DISABLE or RETUNE it from the dashboard
