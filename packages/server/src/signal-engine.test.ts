@@ -5371,3 +5371,107 @@ describe('SignalEngine — IV-RV mispriced routing (TRA-1203)', () => {
     expect(fetchTradierDailyCandles).not.toHaveBeenCalled();
   });
 });
+
+// TRA-1408 (parent TRA-1406) — the per-name churn + same-day-loss brake. The
+// open-cap counter, the same-day-loss test, and the per-name ET-day realized
+// roll-up are private, so drive them via the same private-accessor cast the rest
+// of this suite uses. The wiring (open chokepoints / DCA add loops) is DEMO-scoped
+// and DARK unless ENABLE_CHURN_LOSS_BRAKE, which the 217 baseline tests confirm.
+describe('SignalEngine — churn + same-day-loss brake (TRA-1408)', () => {
+  type ChurnInternals = {
+    mode: 'demo' | 'live';
+    churnOpenCapVerdict: (symbol: string, now?: number) => { blocked: boolean; count: number; cap: number };
+    recordChurnOpen: (symbol: string, now?: number) => void;
+    isSameDayLoser: (realizedToday: number, unrealized: number) => boolean;
+    realizedEquityPnlToday: (symbol: string, etDay: string) => number;
+    allClosedPositions: Array<{ symbol: string; pnl?: number; closedAt?: number; mode?: 'demo' | 'live' }>;
+  };
+  const etDayNow = (): string =>
+    new Date().toLocaleDateString('en-CA', { timeZone: 'America/New_York' });
+
+  const savedEnv: Record<string, string | undefined> = {};
+  beforeEach(() => {
+    for (const k of ['ENABLE_CHURN_LOSS_BRAKE', 'CHURN_SAME_SESSION_OPEN_CAP', 'DATA_DIR']) {
+      savedEnv[k] = process.env[k];
+    }
+    // Route flag resolution straight through process.env (no demo-flags.json file).
+    delete process.env.DATA_DIR;
+  });
+  afterEach(() => {
+    for (const [k, v] of Object.entries(savedEnv)) {
+      if (v === undefined) delete process.env[k]; else process.env[k] = v;
+    }
+  });
+
+  it('is a no-op when the flag is off (never blocks a new open)', () => {
+    const engine = new SignalEngine({ ...DEFAULT_ACCOUNT_SETTINGS, mode: 'demo' });
+    const inner = engine as unknown as ChurnInternals;
+    delete process.env.ENABLE_CHURN_LOSS_BRAKE;
+    // Even after many opens the cap never binds while dark.
+    for (let i = 0; i < 10; i++) inner.recordChurnOpen('GIS');
+    expect(inner.churnOpenCapVerdict('GIS').blocked).toBe(false);
+  });
+
+  it('blocks a NEW open once a name hits the cap (default N=3); other names are independent', () => {
+    process.env.ENABLE_CHURN_LOSS_BRAKE = '1';
+    const engine = new SignalEngine({ ...DEFAULT_ACCOUNT_SETTINGS, mode: 'demo' });
+    const inner = engine as unknown as ChurnInternals;
+
+    // 0,1,2 opens all admitted; the 3rd puts the name at the cap and the next is blocked.
+    expect(inner.churnOpenCapVerdict('GIS')).toMatchObject({ blocked: false, count: 0, cap: 3 });
+    inner.recordChurnOpen('GIS');
+    inner.recordChurnOpen('GIS');
+    expect(inner.churnOpenCapVerdict('GIS')).toMatchObject({ blocked: false, count: 2 });
+    inner.recordChurnOpen('GIS'); // count → 3 == cap
+    expect(inner.churnOpenCapVerdict('GIS')).toMatchObject({ blocked: true, count: 3, cap: 3 });
+    // A different underlier is unaffected by GIS's churn.
+    expect(inner.churnOpenCapVerdict('AAPL').blocked).toBe(false);
+  });
+
+  it('honours the CHURN_SAME_SESSION_OPEN_CAP override', () => {
+    process.env.ENABLE_CHURN_LOSS_BRAKE = 'true';
+    process.env.CHURN_SAME_SESSION_OPEN_CAP = '1';
+    const engine = new SignalEngine({ ...DEFAULT_ACCOUNT_SETTINGS, mode: 'demo' });
+    const inner = engine as unknown as ChurnInternals;
+    expect(inner.churnOpenCapVerdict('GIS').cap).toBe(1);
+    inner.recordChurnOpen('GIS');
+    expect(inner.churnOpenCapVerdict('GIS').blocked).toBe(true);
+  });
+
+  it('never binds on the LIVE path (demo-scoped by construction)', () => {
+    process.env.ENABLE_CHURN_LOSS_BRAKE = '1';
+    process.env.CHURN_SAME_SESSION_OPEN_CAP = '1';
+    const engine = new SignalEngine({ ...DEFAULT_ACCOUNT_SETTINGS, mode: 'live' });
+    const inner = engine as unknown as ChurnInternals;
+    inner.recordChurnOpen('GIS'); // no-op on live
+    inner.recordChurnOpen('GIS');
+    expect(inner.churnOpenCapVerdict('GIS').blocked).toBe(false);
+  });
+
+  it('same-day-loss test: net-negative (realized + unrealized) halts, non-negative allows', () => {
+    const engine = new SignalEngine({ ...DEFAULT_ACCOUNT_SETTINGS, mode: 'demo' });
+    const inner = engine as unknown as ChurnInternals;
+    expect(inner.isSameDayLoser(-100, -50)).toBe(true);   // both negative → loser
+    expect(inner.isSameDayLoser(-100, 40)).toBe(true);    // still net negative
+    expect(inner.isSameDayLoser(-100, 100)).toBe(false);  // clawed back to flat → allow
+    expect(inner.isSameDayLoser(200, -50)).toBe(false);   // net positive → allow
+  });
+
+  it('rolls up per-name ET-day realized from demo closes only, scoped to today', () => {
+    const engine = new SignalEngine({ ...DEFAULT_ACCOUNT_SETTINGS, mode: 'demo' });
+    const inner = engine as unknown as ChurnInternals;
+    const today = Date.now();
+    const yesterday = today - 24 * 3600 * 1000;
+    inner.allClosedPositions.push(
+      { symbol: 'GIS', pnl: -800, closedAt: today, mode: 'demo' },
+      { symbol: 'GIS', pnl: -1436, closedAt: today, mode: 'demo' },  // GIS bleed today
+      { symbol: 'GIS', pnl: 500, closedAt: yesterday, mode: 'demo' }, // prior day — excluded
+      { symbol: 'GIS', pnl: 999, closedAt: today, mode: 'live' },     // live — excluded
+      { symbol: 'AAPL', pnl: 300, closedAt: today, mode: 'demo' },    // other name
+    );
+    const etDay = etDayNow();
+    expect(inner.realizedEquityPnlToday('GIS', etDay)).toBe(-2236); // matches the issue's proof case
+    expect(inner.realizedEquityPnlToday('AAPL', etDay)).toBe(300);
+    expect(inner.realizedEquityPnlToday('MSFT', etDay)).toBe(0);
+  });
+});

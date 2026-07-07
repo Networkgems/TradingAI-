@@ -61,6 +61,14 @@ describe('loadDemoFlagFile', () => {
     writeFlags({ TAKE_PROFIT_EARLY_ENABLED: 'true' });
     expect(loadDemoFlagFile(dir)).toEqual({ TAKE_PROFIT_EARLY_ENABLED: 'true' });
   });
+
+  it('honors the TRA-1408 churn/loss-brake demo flags (arm lever + tunable cap)', () => {
+    writeFlags({ ENABLE_CHURN_LOSS_BRAKE: 'true', CHURN_SAME_SESSION_OPEN_CAP: 5 });
+    expect(loadDemoFlagFile(dir)).toEqual({
+      ENABLE_CHURN_LOSS_BRAKE: 'true',
+      CHURN_SAME_SESSION_OPEN_CAP: '5',
+    });
+  });
 });
 
 describe('resolveDemoFlagEnv', () => {

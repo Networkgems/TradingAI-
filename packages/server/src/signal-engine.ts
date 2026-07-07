@@ -54,6 +54,7 @@ import { scanIvRvFromSnapshot, recordIvRvScan } from './iv-rv-scanner.js';
 import { scanShortPremiumFromSnapshot, recordShortPremiumScan } from './short-premium-scanner.js';
 import { isExitRiskRulesEnabled, isLiveEquityStopModifyEnabled, isTakeProfitEarlyEnabled, isEntryGreeksGateEnabled, isCorrelatedExposureCapEnabled, isOtmDeltaFloorEnabled, resolveOtmDeltaFloor } from './exit-risk-rules-flag.js';
 import { recordCorrelatedExposureBinding, type CorrelatedExposureVenue } from './correlated-exposure-ledger.js';
+import { isChurnLossBrakeEnabled, resolveSameSessionOpenCap } from './churn-loss-brake-flag.js';
 import { recordConvictionDcaFill } from './conviction-dca-ledger.js';
 import { isScaleoutLadderEnabled } from './scaleout-ladder-flag.js';
 import { evaluateAndRecordScaleout } from './scaleout-ladder-ledger.js';
@@ -1812,6 +1813,10 @@ export class SignalEngine {
   private dcaOptionTranches: Map<string, { qty: number; price: number }[]> = new Map();
   // TRA-964 — options adds executed per name in the current ET session (gate C).
   private dcaOptionAddsToday: Map<string, { etDay: string; count: number }> = new Map();
+  // TRA-1408 — NEW opens per underlier in the current ET session (the churn cap).
+  // Counts demo opens only (equity + option); keyed the same way as the DCA
+  // counters so it auto-resets on the ET-day roll without a separate day-roll.
+  private churnOpensToday: Map<string, { etDay: string; count: number }> = new Map();
   /** TRA-335 — Tradier order id (entry leg) → local Position id, used for reconcile. */
   private liveEquityOrderIds: Map<string, number | string> = new Map();
   /**
@@ -3454,6 +3459,13 @@ export class SignalEngine {
     // Entry = the signal's daily close (carried on `entryPrice`).
     const price = signal.entryPrice;
 
+    // TRA-1408 — per-name same-session open cap (DEMO-scoped, DARK until armed).
+    const churnCap = this.churnOpenCapVerdict(signal.symbol);
+    if (churnCap.blocked) {
+      signal.signalSkipReason = `churn brake: ${signal.symbol} hit same-session open cap (${churnCap.count}/${churnCap.cap})`;
+      return;
+    }
+
     // TRA-1301 (Rule 5) — correlated-exposure cap on the SMA-200 pullback swing
     // entry, consulted before the broker order (shares the equity chokepoint
     // helper). DARK until CORRELATED_EXPOSURE_CAP_ENABLED is armed.
@@ -3483,6 +3495,7 @@ export class SignalEngine {
       if (signal.forwardTestOnly) pos.forwardTestOnly = true;
       this.positionSignalType.set(pos.id, signal.type);
       this.emitFillAlert(pos, signal.type); // TRA-563 fill alert
+      this.recordChurnOpen(signal.symbol); // TRA-1408 per-name same-session churn counter
     }
   }
 
@@ -3498,6 +3511,100 @@ export class SignalEngine {
   private resolveDemoFlagEnv(): NodeJS.ProcessEnv {
     const dir = process.env.DATA_DIR;
     return dir ? resolveDemoFlagEnv(dir) : process.env;
+  }
+
+  /**
+   * TRA-1408 (parent TRA-1406) — per-name same-session OPEN cap. Returns the
+   * churn-brake verdict for opening a NEW position on `symbol`. DEMO-SCOPED and
+   * DARK by default: a no-op (`blocked:false`) unless `mode !== 'live'` AND the
+   * board armed `ENABLE_CHURN_LOSS_BRAKE` (read through demo-flags.json). Keys the
+   * count on the ET session exactly like the DCA per-name counters, so the cap
+   * auto-resets at the ET-day roll. Consulted at each demo open chokepoint BEFORE
+   * the position opens; the caller records the open via {@link recordChurnOpen}.
+   */
+  private churnOpenCapVerdict(
+    symbol: string,
+    now = Date.now(),
+  ): { blocked: boolean; count: number; cap: number } {
+    if (this.mode === 'live') return { blocked: false, count: 0, cap: 0 };
+    const env = this.resolveDemoFlagEnv();
+    if (!isChurnLossBrakeEnabled(env)) return { blocked: false, count: 0, cap: 0 };
+    const etDay = etDateString(new Date(now));
+    const rec = this.churnOpensToday.get(symbol);
+    const count = rec && rec.etDay === etDay ? rec.count : 0;
+    const cap = resolveSameSessionOpenCap(env);
+    return { blocked: count >= cap, count, cap };
+  }
+
+  /**
+   * TRA-1408 — record one NEW demo open against the per-name same-session churn
+   * counter. Called by the open chokepoints ONLY after a position actually opened.
+   * A no-op on the live path so the counter reflects demo churn only. Increments
+   * unconditionally (independent of the flag) so arming the brake mid-session sees
+   * an honest count; the count is cheap and self-resets on the ET-day roll.
+   */
+  private recordChurnOpen(symbol: string, now = Date.now()): void {
+    if (this.mode === 'live') return;
+    const etDay = etDateString(new Date(now));
+    const rec = this.churnOpensToday.get(symbol);
+    const count = rec && rec.etDay === etDay ? rec.count : 0;
+    this.churnOpensToday.set(symbol, { etDay, count: count + 1 });
+  }
+
+  /**
+   * TRA-1408 — the same-day-loss DCA brake test: is `symbol` net-negative on the
+   * ET day across REALIZED (today's closed demo trades) + UNREALIZED (open demo
+   * marks)? Consulted by the demo conviction-DCA add loops before an add fires;
+   * when true (and the flag is on) the add is skipped so the desk never averages
+   * into a same-day loser (the GIS pathology). `unrealized` is the open-position
+   * mark-to-market the caller already has in hand for the name.
+   *
+   * Realized is summed from {@link allClosedPositions} (equity) — the uncapped,
+   * per-ET-day list the caller filters — via `realizedEquityPnlToday`; the option
+   * loop passes its own realized total. Pure arithmetic; reads no order state.
+   */
+  private isSameDayLoser(realizedToday: number, unrealized: number): boolean {
+    return realizedToday + unrealized < 0;
+  }
+
+  /**
+   * TRA-1408 — realized demo P&L for `symbol` on the ET day `etDay`, summed from
+   * the uncapped {@link allClosedPositions} list (equity closes). A close counts
+   * when its mode is demo (legacy unstamped ⇒ demo), its symbol matches, and its
+   * `closedAt` falls on `etDay` in ET. The nightly 9 PM ET archive clears the
+   * list at the ET-day boundary, so within a session this is the full day's
+   * realized for the name. Pure read.
+   */
+  private realizedEquityPnlToday(symbol: string, etDay: string): number {
+    let sum = 0;
+    for (const p of this.allClosedPositions) {
+      if (p.symbol !== symbol) continue;
+      if ((p.mode ?? 'demo') !== 'demo') continue;
+      const closedAt = p.closedAt;
+      if (typeof closedAt !== 'number') continue;
+      if (etDateString(new Date(closedAt)) !== etDay) continue;
+      sum += p.pnl ?? 0;
+    }
+    return sum;
+  }
+
+  /**
+   * TRA-1408 — realized demo OPTIONS P&L for `symbol` on the ET day `etDay`,
+   * summed from the options account's UNCAPPED closed-demo list (the same source
+   * the EOD report uses, so a busy-day churn isn't silently truncated at 20). A
+   * close counts when its mode is demo (legacy unstamped ⇒ demo), its underlier
+   * matches, and its `closedAt` falls on `etDay` in ET. Pure read.
+   */
+  private realizedOptionPnlToday(symbol: string, etDay: string): number {
+    let sum = 0;
+    for (const o of this.optionsAccount.getClosedOptionsForMode('demo')) {
+      if (o.symbol !== symbol) continue;
+      const closedAt = o.closedAt;
+      if (typeof closedAt !== 'number') continue;
+      if (etDateString(new Date(closedAt)) !== etDay) continue;
+      sum += o.pnl ?? 0;
+    }
+    return sum;
   }
 
   /**
@@ -4267,6 +4374,19 @@ export class SignalEngine {
           }
         }
 
+        // TRA-1408 — per-name same-session open cap on the RV option entry
+        // (DEMO-scoped, DARK until ENABLE_CHURN_LOSS_BRAKE). Rejects a new open on
+        // a name that already hit N opens this ET session, before any Tradier
+        // mirror. Same containment as the greeks gate / correlated cap above.
+        const rvChurnCap = this.churnOpenCapVerdict(signal.symbol);
+        if (rvChurnCap.blocked) {
+          signal.signalSkipReason = `churn brake: ${signal.symbol} hit same-session open cap (${rvChurnCap.count}/${rvChurnCap.cap})`;
+          log.info('RV long rejected by churn brake (TRA-1408)', {
+            sym, count: rvChurnCap.count, cap: rvChurnCap.cap,
+          });
+          continue;
+        }
+
         // TRA-1301 (parent TRA-1295, Rule 5) — correlated-exposure cap on the
         // option entry. Groups on the UNDERLIER ticker + `equity` asset-class (an
         // option on an equity carries that name's directional risk), summing the
@@ -4310,6 +4430,7 @@ export class SignalEngine {
           optionCapScale,
         );
         if (!opened) continue;
+        this.recordChurnOpen(signal.symbol); // TRA-1408 per-name same-session churn counter
 
         // TRA-221 — when running live with Tradier configured, mirror the
         // paper open by submitting a real `buy_to_open` market order.
@@ -4553,6 +4674,25 @@ export class SignalEngine {
           continue;
         }
 
+        // TRA-1408 — per-name same-session open cap on the OTM entry (DEMO-scoped,
+        // DARK until ENABLE_CHURN_LOSS_BRAKE). Rejects a new open once this name
+        // has hit N opens this ET session (the churn pathology). Placed after the
+        // live-suppression bail so the demo book — the only book that opens here —
+        // is the one gated.
+        const otmChurnCap = this.churnOpenCapVerdict(signal.symbol);
+        if (otmChurnCap.blocked) {
+          signal.signalSkipReason = `churn brake: ${signal.symbol} hit same-session open cap (${otmChurnCap.count}/${otmChurnCap.cap})`;
+          this.recentSignals.unshift(signal); this.emitSignalAlert(signal);
+          if (this.recentSignals.length > MAX_SIGNALS) this.recentSignals.pop();
+          this.dailySignals.push({
+            id: signal.id, symbol: signal.symbol, type: 'otm_mispricing', firedAt: signal.timestamp,
+          });
+          log.info('OTM open rejected by churn brake (TRA-1408)', {
+            sym, count: otmChurnCap.count, cap: otmChurnCap.cap,
+          });
+          continue;
+        }
+
         // TRA-991/TRA-1103 — journal the OTM open (observe-only, behind
         // ENABLE_OPTION_TRADE_JOURNAL) so the demo book's OTM fills are captured
         // like the RV path. `ivRank` is the honest-unknown null (not computed on
@@ -4576,6 +4716,7 @@ export class SignalEngine {
           otmJournalSetup,
         );
         if (!opened) continue;
+        this.recordChurnOpen(signal.symbol); // TRA-1408 per-name same-session churn counter
 
         this.emitOptionFillAlert(opened);
         signal.mode = this.mode;
@@ -6235,6 +6376,33 @@ export class SignalEngine {
         continue;
       }
 
+      // TRA-1408 (parent TRA-1406) — same-day-loss brake: never average into a
+      // name that is net-negative on the ET day (the GIS pathology — DCA kept
+      // adding to a −$2,236 loser). DEMO-scoped + DARK until ENABLE_CHURN_LOSS_
+      // BRAKE (this branch is already demo-only; the live add path shadow-logs
+      // above). Net = today's REALIZED closes for the name + the open UNREALIZED
+      // mark across every open position on that name. On a net loss, skip the add.
+      if (isChurnLossBrakeEnabled(this.resolveDemoFlagEnv())) {
+        const brakeEtDay = etDateString(new Date(now));
+        const realizedToday = this.realizedEquityPnlToday(pos.symbol, brakeEtDay);
+        let unrealized = 0;
+        for (const q of demoOpen) {
+          if (q.symbol !== pos.symbol) continue;
+          const mult = q.side === 'buy' ? 1 : -1;
+          unrealized += (price - q.entryPrice) * q.quantity * mult;
+        }
+        if (this.isSameDayLoser(realizedToday, unrealized)) {
+          log.info('TRA-1408 conviction-DCA add halted — same-day net-negative name (demo)', {
+            symbol: pos.symbol, positionId: pos.id,
+            realizedToday: Number(realizedToday.toFixed(2)),
+            unrealized: Number(unrealized.toFixed(2)),
+            netEtDay: Number((realizedToday + unrealized).toFixed(2)),
+            wouldAddQty: verdict.qty, addPrice: price, reason: verdict.reason,
+          });
+          continue;
+        }
+      }
+
       const updated = this.account.addToPosition(pos.id, verdict.qty, price);
       if (!updated) continue;
       tranches.push({ qty: verdict.qty, price });
@@ -6583,6 +6751,32 @@ export class SignalEngine {
           projectedRisk: verdict.projectedRisk, riskBudget: R,
         });
         continue;
+      }
+
+      // TRA-1408 (parent TRA-1406) — same-day-loss brake on the options DCA path:
+      // never average into a name net-negative on the ET day. DEMO-scoped + DARK
+      // until ENABLE_CHURN_LOSS_BRAKE (this branch is already demo-only). Net =
+      // today's REALIZED option closes for the name + the open UNREALIZED premium
+      // mark ((currentPremium − premiumPaid)·100·contractsRemaining) across every
+      // open demo option on that underlier. On a net loss, skip the add.
+      if (isChurnLossBrakeEnabled(this.resolveDemoFlagEnv())) {
+        const brakeEtDay = etDateString(new Date(now));
+        const realizedToday = this.realizedOptionPnlToday(o.symbol, brakeEtDay);
+        let unrealized = 0;
+        for (const q of demoOpen) {
+          if (q.symbol !== o.symbol) continue;
+          unrealized += (q.currentPremium - q.premiumPaid) * 100 * q.contractsRemaining;
+        }
+        if (this.isSameDayLoser(realizedToday, unrealized)) {
+          log.info('TRA-1408 options conviction-DCA add halted — same-day net-negative name (demo)', {
+            symbol: o.symbol, optionId: o.id, optionSymbol: o.optionSymbol,
+            realizedToday: Number(realizedToday.toFixed(2)),
+            unrealized: Number(unrealized.toFixed(2)),
+            netEtDay: Number((realizedToday + unrealized).toFixed(2)),
+            wouldAddContracts: verdict.qty, addDebitPerContract, reason: verdict.reason,
+          });
+          continue;
+        }
       }
 
       const updated = acct.addToOptionPosition(o.id, verdict.qty, addDebitPerContract);
@@ -7047,6 +7241,19 @@ export class SignalEngine {
       return null;
     }
 
+    // TRA-1408 (parent TRA-1406) — per-name same-session OPEN cap. Rejects a new
+    // open once this symbol has hit N new opens this ET session (the GIS churn
+    // pathology). DEMO-SCOPED + DARK until ENABLE_CHURN_LOSS_BRAKE — a no-op on
+    // the live path and when the flag is off, so prod is unchanged. Checked here,
+    // before the broker order, so no Tradier OTOCO is submitted past the cap.
+    const churnCap = this.churnOpenCapVerdict(signal.symbol);
+    if (churnCap.blocked) {
+      signal.signalSkipReason = `churn brake: ${signal.symbol} hit same-session open cap (${churnCap.count}/${churnCap.cap})`;
+      this.recentSignals.unshift(signal); this.emitSignalAlert(signal);
+      if (this.recentSignals.length > MAX_SIGNALS) this.recentSignals.pop();
+      return null;
+    }
+
     // TRA-1301 (parent TRA-1295, Rule 5) — correlated-exposure cap. Consulted
     // BEFORE the broker order so a reject never reaches Tradier; scales the sized
     // qty down to the most-binding bucket's (underlying / asset-class) headroom, or
@@ -7113,6 +7320,7 @@ export class SignalEngine {
       pos.mode = this.mode;
       this.positionSignalType.set(pos.id, signal.type);
       this.emitFillAlert(pos, signal.type); // TRA-563 fill alert
+      this.recordChurnOpen(signal.symbol); // TRA-1408 per-name same-session churn counter
     }
 
     // Record signal for daily accuracy tracking

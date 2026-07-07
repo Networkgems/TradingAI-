@@ -102,6 +102,16 @@ export const DEMO_FLAG_ALLOWLIST = [
   // the self-hosted host after QuantTrader's forward-validation (no PM2/admin).
   'OTM_DELTA_FLOOR_ENABLED',
   'OTM_DELTA_FLOOR',
+  // TRA-1408 (parent TRA-1406 "less noise, more quality") — the per-name churn +
+  // same-day-loss brake. STANDALONE flag (not under the EXIT_RISK_RULES master),
+  // consulted ONLY on the demo open chokepoints + demo conviction-DCA add loops,
+  // so it can never alter a live open or a live add. Caps same-session re-entries
+  // per symbol and halts DCA adds into a same-day net-negative name. The
+  // CHURN_SAME_SESSION_OPEN_CAP numeric override tunes the cap (default 3).
+  // Non-secret, demo-only — safe for the file override so the board can flip it
+  // daemon-free on the self-hosted host after QuantTrader forward-validates.
+  'ENABLE_CHURN_LOSS_BRAKE',
+  'CHURN_SAME_SESSION_OPEN_CAP',
 ] as const;
 
 export const DEMO_FLAGS_FILENAME = 'demo-flags.json';
