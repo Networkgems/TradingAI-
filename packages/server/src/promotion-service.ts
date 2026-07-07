@@ -8,6 +8,7 @@ import {
 import { loadCryptoTradeSnapshot, loadStocksTradeSnapshot } from './trade-store.js';
 import { getStrategyRecord, getEffectiveThresholds } from './promotion-store.js';
 import { getAllUsers } from './users.js';
+import { isPromotionGateEnvAwareEnabled } from './promotion-gate-env-aware-flag.js';
 import { logger } from './observability/index.js';
 
 const log = logger.child({ module: 'promotion-service' });
@@ -154,6 +155,33 @@ function liveCryptoOn(s: AccountSettings): boolean {
   return s.mode === 'live' && s.cryptoAutoTradingEnabledLive === true;
 }
 
+/**
+ * TRA-1436 — does the resulting live config route OPTIONS orders to Tradier
+ * PRODUCTION (real money)? Sandbox (paper) uses simulated fills against real
+ * chains and risks zero real capital, so it is the intended paper-validation
+ * path and is NOT gated. The legacy un-suffixed default is `sandbox` (see
+ * AccountSettings.liveTradierEnvOptions), so an absent field reads as Sandbox.
+ */
+function optionsProductionIntent(s: AccountSettings): boolean {
+  return (s.liveTradierEnvOptions ?? 'sandbox') === 'production';
+}
+
+/**
+ * TRA-1436 — would the post-PUT settings place REAL-CAPITAL live orders, the
+ * state the TRA-532 promotion gate exists to guard?
+ *   • Crypto — Coinbase live has NO sandbox, so `mode==='live'` with crypto
+ *     auto-trading ON is always real capital and stays gated as-is (#2).
+ *   • Options — real capital ⇔ Tradier Environment = Production. Sandbox (paper)
+ *     risks zero real capital and must NOT be gated (#1); Production stays
+ *     fail-closed (#3).
+ * Used only when the environment-aware gate is armed; otherwise the legacy
+ * crypto-only trigger (`liveCryptoOn`) is preserved verbatim.
+ */
+function liveRealCapitalIntent(s: AccountSettings): boolean {
+  if (s.mode !== 'live') return false;
+  return liveCryptoOn(s) || optionsProductionIntent(s);
+}
+
 export interface LiveTransitionGateResult {
   /** True when the live transition is allowed (or irrelevant — not turning/keeping live). */
   allowed: boolean;
@@ -176,7 +204,17 @@ export async function evaluateLiveTransitionGate(
   username: string,
   updated: AccountSettings,
 ): Promise<LiveTransitionGateResult> {
-  if (!liveCryptoOn(updated)) return { allowed: true, blocked: [] };
+  // TRA-1436 — environment-aware trigger, behind PROMOTION_GATE_ENV_AWARE
+  // (default OFF ⇒ legacy crypto-only trigger, behaviour-preserving). When
+  // armed, the gate fires on real-capital intent: live crypto auto-trading (no
+  // sandbox) OR options routed to Tradier PRODUCTION. Tradier Sandbox (paper)
+  // risks zero real capital and is exempt — it IS the Stage-2 paper environment
+  // the gate demands, so blocking it is circular. This only ever LOOSENS the
+  // gate for zero-capital Sandbox; Production stays fail-closed.
+  const gateFires = isPromotionGateEnvAwareEnabled()
+    ? liveRealCapitalIntent(updated)
+    : liveCryptoOn(updated);
+  if (!gateFires) return { allowed: true, blocked: [] };
 
   const preset = resolveStrategyPreset(updated.activeStrategyPreset);
   const strategies = preset.enabledStrategies;

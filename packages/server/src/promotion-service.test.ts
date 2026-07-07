@@ -174,6 +174,91 @@ describe('TRA-532 promotion gate — end-to-end enforcement', () => {
   });
 });
 
+// TRA-1436 (parent TRA-1434) — the promotion gate must be ENVIRONMENT-AWARE when
+// armed: Live + Tradier Environment = Sandbox (paper) risks zero real capital and
+// is the intended paper-validation path, so it must NOT be blocked by strategy
+// promotion. Live + Tradier Production (real money) stays fail-closed. Behind the
+// default-OFF PROMOTION_GATE_ENV_AWARE flag ⇒ the legacy crypto-only trigger is
+// preserved verbatim until the board arms it. The flag is read from process.env
+// at call time, so we toggle it per-test.
+describe('TRA-1436 promotion gate — environment-aware (Tradier Sandbox exempt)', () => {
+  const FLAG = 'PROMOTION_GATE_ENV_AWARE';
+  const ENV_USER = 'env-aware-user'; // no promoted strategies seeded for this user
+
+  // Live options-only intent (crypto auto-trading OFF) on the DCA roster, whose
+  // 'dca' strategy is unpromoted for ENV_USER → the full gate would block it.
+  function liveOptions(env: 'sandbox' | 'production'): AccountSettings {
+    return {
+      mode: 'live',
+      cryptoAutoTradingEnabledLive: false,
+      activeStrategyPreset: 'crypto_core',
+      liveTradierEnvOptions: env,
+    } as AccountSettings;
+  }
+
+  it('(a) Live + Tradier Sandbox + unpromoted strategy → ALLOWED (zero real capital)', async () => {
+    process.env[FLAG] = '1';
+    try {
+      const gate = await svc.evaluateLiveTransitionGate(ENV_USER, liveOptions('sandbox'));
+      expect(gate.allowed).toBe(true);
+      expect(gate.blocked).toHaveLength(0);
+    } finally {
+      delete process.env[FLAG];
+    }
+  });
+
+  it('(b) Live + Tradier Production + unpromoted strategy → BLOCKED (real money, fail-closed)', async () => {
+    process.env[FLAG] = '1';
+    try {
+      const gate = await svc.evaluateLiveTransitionGate(ENV_USER, liveOptions('production'));
+      expect(gate.allowed).toBe(false);
+      expect(gate.blocked[0]?.strategyId).toBe('dca');
+    } finally {
+      delete process.env[FLAG];
+    }
+  });
+
+  it('(c) Live + Tradier Production + fully promoted strategy → ALLOWED (unchanged)', async () => {
+    // USER has dca fully promoted (backtest + paper + sign-off) from the
+    // end-to-end block above.
+    process.env[FLAG] = '1';
+    try {
+      const gate = await svc.evaluateLiveTransitionGate(USER, liveOptions('production'));
+      expect(gate.allowed).toBe(true);
+    } finally {
+      delete process.env[FLAG];
+    }
+  });
+
+  it('keeps crypto live gated as-is even with Tradier Sandbox (crypto has no sandbox)', async () => {
+    // Crypto auto-trading ON is always real capital → gated regardless of the
+    // Tradier options environment.
+    process.env[FLAG] = '1';
+    try {
+      const cryptoLiveSandbox = {
+        mode: 'live',
+        cryptoAutoTradingEnabledLive: true,
+        activeStrategyPreset: 'crypto_core',
+        liveTradierEnvOptions: 'sandbox',
+      } as AccountSettings;
+      const gate = await svc.evaluateLiveTransitionGate(ENV_USER, cryptoLiveSandbox);
+      expect(gate.allowed).toBe(false);
+      expect(gate.blocked[0]?.strategyId).toBe('dca');
+    } finally {
+      delete process.env[FLAG];
+    }
+  });
+
+  it('flag OFF (default) preserves the legacy crypto-only trigger — Production options NOT gated', async () => {
+    // With the flag off, an options-only live switch (crypto OFF) is allowed even
+    // to Production, because the legacy gate only fires on live crypto. This is
+    // the behaviour-preserving default until the board arms the change.
+    delete process.env[FLAG];
+    const gate = await svc.evaluateLiveTransitionGate(ENV_USER, liveOptions('production'));
+    expect(gate.allowed).toBe(true);
+  });
+});
+
 // TRA-541 — buildPromotionStatus must honor a registered TRA-540 optimization
 // verdict: the Stage-1 leg passes iff verdict.pass, regardless of how strong the
 // ingested headline metrics look.
