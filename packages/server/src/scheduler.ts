@@ -150,6 +150,38 @@ export interface EtTick {
 /** TRA-851 — per-tick callback that receives the current ET time. */
 export type RoutineTickCallback = (et: EtTick) => void | Promise<void>;
 
+/**
+ * TRA-1404 — persistence port for the 21:00 ET archive dedup key
+ * (`lastArchiveDate`). The scheduler itself stays fs-free (so its unit tests
+ * need no disk); the concrete file-backed store lives in `scheduler-state.ts`.
+ *
+ * Motivation: the archive gate (`this.lastArchiveDate !== todayKey`) is
+ * in-memory only. A Render redeploy AFTER 21:00 ET resets it to `''`, so the
+ * fresh process re-fires `runDailyCloseForAllUsers` for a day it already
+ * archived — wasteful full-close work every post-21:00 restart. (The TRA-1403
+ * write-layer guard already neutralizes the *harm* — the re-fire can no longer
+ * zero a settled calendar cell — so this only removes the redundant work.)
+ * Persisting the key across restarts skips the re-fire entirely, leaving
+ * `catchUpMissedEodReports` (writes only MISSING days) as the sole post-archive
+ * writer.
+ */
+export interface ArchiveDateStore {
+  /** The last-archived ET date (`YYYY-MM-DD`) from a prior process, or `''`/undefined if none. */
+  load(): string | undefined;
+  /** Persist `date` (`YYYY-MM-DD`) as the last-archived ET date. Best-effort — must not throw. */
+  save(date: string): void;
+}
+
+/** TRA-1404 — optional wiring passed to `MarketScheduler.start`. */
+export interface ScheduleOptions {
+  /**
+   * TRA-1404 — persists/restores the 21:00 ET archive dedup key across process
+   * restarts so a post-21:00 redeploy does not re-fire the daily close. Omit
+   * (e.g. in unit tests) to keep the in-memory-only behavior.
+   */
+  archiveDateStore?: ArchiveDateStore;
+}
+
 export interface ScheduleCallbacks {
   /** Fires at 4:05 PM ET on stock-market trading days (Mon–Fri, non-holiday). */
   onMarketClose?: EodTriggerCallback;
@@ -276,17 +308,35 @@ export class MarketScheduler {
   private lastMorningBriefDate = '';
   /** TRA-380 — last ET date the 3:55 PM option-chain recorder hook fired. Dedupes within the day. */
   private lastChainRecordDate = '';
+  /** TRA-1404 — persists `lastArchiveDate` so a post-21:00 restart doesn't re-fire the archive. */
+  private archiveDateStore: ArchiveDateStore | null = null;
 
   /**
    * Start polling. Accepts either a single market-close callback (legacy form)
    * or an object with separate `onMarketClose`, `onDaily`, and `onArchive`
    * callbacks. The first two fire at 4:05 PM ET; `onArchive` fires at 9:00 PM
    * ET every calendar day.
+   *
+   * TRA-1404 — pass `opts.archiveDateStore` to persist/restore the 21:00 ET
+   * archive dedup key across restarts (see `ArchiveDateStore`).
    */
-  start(callbacks: EodTriggerCallback | ScheduleCallbacks): void {
+  start(callbacks: EodTriggerCallback | ScheduleCallbacks, opts: ScheduleOptions = {}): void {
     if (this.timer) return;
     const cfg: ScheduleCallbacks =
       typeof callbacks === 'function' ? { onMarketClose: callbacks } : callbacks;
+
+    // TRA-1404 — restore the last-archived ET date from disk so a process that
+    // restarts AFTER 21:00 ET on an already-archived day does not re-fire the
+    // daily close. A not-yet-archived day restores a stale/empty key and still
+    // archives normally at 21:00.
+    if (opts.archiveDateStore) {
+      this.archiveDateStore = opts.archiveDateStore;
+      const restored = opts.archiveDateStore.load();
+      if (restored) {
+        this.lastArchiveDate = restored;
+        log.info('restored persisted archive dedup key', { lastArchiveDate: restored });
+      }
+    }
 
     // Check every 60 seconds
     this.timer = setInterval(() => {
@@ -360,6 +410,9 @@ export class MarketScheduler {
       if (hour >= 21) {
         if (cfg.onArchive && this.lastArchiveDate !== todayKey) {
           this.lastArchiveDate = todayKey;
+          // TRA-1404 — persist BEFORE running the close so a crash mid-close
+          // can't re-fire the archive on the next boot. Best-effort (never throws).
+          this.archiveDateStore?.save(todayKey);
           log.info('archive trigger fired', {
             date: todayKey,
             etTime: `${String(hour).padStart(2, '0')}:${String(minute).padStart(2, '0')} ET`,

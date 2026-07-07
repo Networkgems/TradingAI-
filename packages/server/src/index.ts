@@ -6,6 +6,7 @@ import { existsSync } from 'fs';
 import { join, dirname } from 'path';
 import { fileURLToPath } from 'url';
 import { MarketScheduler, isMarketDay, isMarketDayIso, missedTradingDays, etDateString, isMarketOpen } from './scheduler.js';
+import { createFileArchiveDateStore } from './scheduler-state.js';
 import { generateEodReport, wouldClobberSettledReport } from './reports/eod-report.js';
 import { generateCryptoEodReport } from './reports/crypto-eod-report.js';
 import {
@@ -935,9 +936,10 @@ async function generateAndSaveReport(
   // TRA-1398 — never let an EMPTY regeneration clobber a settled non-empty
   // report for the same day. The 21:00 archive writes today WITH trades, then
   // `archiveClosedTrades()` empties `allClosedPositions`. A later re-run of this
-  // function for TODAY — a Render redeploy after 21:00 resets the in-memory
-  // archive guard (`scheduler.ts` `lastArchiveDate`) and re-fires
-  // `runDailyCloseForAllUsers`, or a state refresh recomputes today — would then
+  // function for TODAY — historically a Render redeploy after 21:00 reset the
+  // in-memory archive guard (`scheduler.ts` `lastArchiveDate`) and re-fired
+  // `runDailyCloseForAllUsers` (now hardened by TRA-1404, which persists that
+  // guard across restarts), or a state refresh recomputes today — would then
   // regenerate today's cell from the now-empty ledger (`trades:[]`,
   // `realizedPnl:0`) and overwrite the good file, zeroing the calendar cell.
   // That is the "editing demo starting equity erased today's P&L" report on
@@ -7652,6 +7654,13 @@ scheduler.start({
           body: rendered.body,
         }),
     }),
+}, {
+  // TRA-1404 — persist the 21:00 ET archive dedup key to the persistent disk so
+  // a Render redeploy AFTER 21:00 ET doesn't re-fire the full daily close for a
+  // day already archived. Defense-in-depth atop the TRA-1403 write guard: it
+  // removes the redundant close work, leaving the missed-day catch-up as the
+  // sole post-archive writer.
+  archiveDateStore: createFileArchiveDateStore(),
 });
 
 httpServer.listen(PORT, () => {

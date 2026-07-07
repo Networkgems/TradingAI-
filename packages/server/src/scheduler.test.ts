@@ -602,6 +602,83 @@ describe('MarketScheduler — TRA-388 archive window', () => {
   });
 });
 
+// ── TRA-1404: persisted archive dedup key survives a post-21:00 restart ───────
+
+describe('MarketScheduler — TRA-1404 persisted archive dedup key', () => {
+  beforeEach(() => { vi.useFakeTimers(); });
+  afterEach(() => { vi.useRealTimers(); });
+
+  /** In-memory ArchiveDateStore standing in for the on-disk file across restarts. */
+  const makeStore = (initial = '') => {
+    let value = initial;
+    return {
+      load: vi.fn(() => value),
+      save: vi.fn((d: string) => { value = d; }),
+      /** Peek at what a "next boot" would restore. */
+      current: () => value,
+    };
+  };
+
+  // NB: UTC(2026,4,15,2,29) is 22:29 EDT on 2026-05-14 (ET = UTC-4), so the ET
+  // day the archive keys off is 2026-05-14 (matching the TRA-388 window tests).
+  it('persists the ET date to the store when the archive fires', () => {
+    vi.setSystemTime(new Date(Date.UTC(2026, 4, 15, 2, 29, 0)));
+    const onArchive = vi.fn();
+    const store = makeStore();
+    const scheduler = new MarketScheduler();
+    scheduler.start({ onArchive }, { archiveDateStore: store });
+
+    vi.advanceTimersByTime(60_000);
+    expect(onArchive).toHaveBeenCalledTimes(1);
+    expect(store.save).toHaveBeenCalledWith('2026-05-14');
+    expect(store.current()).toBe('2026-05-14');
+    scheduler.stop();
+  });
+
+  it('does NOT re-fire onArchive on a post-21:00 restart of an already-archived day', () => {
+    // Simulate a process that already archived 2026-05-14 (store carries the key),
+    // then redeploys and reboots at 22:29 ET the SAME day — the in-memory guard is
+    // fresh (''), but the restored key must suppress the re-fire.
+    vi.setSystemTime(new Date(Date.UTC(2026, 4, 15, 2, 29, 0)));
+    const onArchive = vi.fn();
+    const store = makeStore('2026-05-14');
+    const scheduler = new MarketScheduler();
+    scheduler.start({ onArchive }, { archiveDateStore: store });
+
+    // Run many ticks across the rest of the evening — none should fire.
+    for (let i = 0; i < 60; i++) vi.advanceTimersByTime(60_000);
+    expect(store.load).toHaveBeenCalled();
+    expect(onArchive).not.toHaveBeenCalled();
+    scheduler.stop();
+  });
+
+  it('still archives normally when the restored key is a PRIOR day', () => {
+    // Restart at 22:29 ET on 2026-05-14 carrying yesterday's (2026-05-13) key —
+    // today is not yet archived, so the archive must still fire exactly once.
+    vi.setSystemTime(new Date(Date.UTC(2026, 4, 15, 2, 29, 0)));
+    const onArchive = vi.fn();
+    const store = makeStore('2026-05-13');
+    const scheduler = new MarketScheduler();
+    scheduler.start({ onArchive }, { archiveDateStore: store });
+
+    vi.advanceTimersByTime(60_000);
+    expect(onArchive).toHaveBeenCalledTimes(1);
+    expect(store.current()).toBe('2026-05-14');
+    scheduler.stop();
+  });
+
+  it('is a no-op path when no store is provided (legacy in-memory behavior)', () => {
+    vi.setSystemTime(new Date(Date.UTC(2026, 4, 15, 2, 29, 0)));
+    const onArchive = vi.fn();
+    const scheduler = new MarketScheduler();
+    scheduler.start({ onArchive });
+
+    vi.advanceTimersByTime(60_000);
+    expect(onArchive).toHaveBeenCalledTimes(1);
+    scheduler.stop();
+  });
+});
+
 // ── TRA-388: missed-day catch-up ─────────────────────────────────────────────
 
 describe('isMarketDayIso', () => {
