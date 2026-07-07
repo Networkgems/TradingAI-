@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest';
-import { isExitRiskRulesEnabled, isLiveEquityStopModifyEnabled, isTakeProfitEarlyEnabled, isCorrelatedExposureCapEnabled } from './exit-risk-rules-flag.js';
+import { isExitRiskRulesEnabled, isLiveEquityStopModifyEnabled, isTakeProfitEarlyEnabled, isCorrelatedExposureCapEnabled, isOtmDeltaFloorEnabled, resolveOtmDeltaFloor, OTM_DELTA_FLOOR_DEFAULT } from './exit-risk-rules-flag.js';
 
 // TRA-1250 / TRA-1269 / TRA-1294 / TRA-1295 — master switch + the isolated sub-flags.
 
@@ -61,5 +61,28 @@ describe('isCorrelatedExposureCapEnabled (TRA-1295)', () => {
     expect(
       isCorrelatedExposureCapEnabled({ EXIT_RISK_RULES_ENABLED: 'off', CORRELATED_EXPOSURE_CAP_ENABLED: 'yes' }),
     ).toBe(false);
+  });
+});
+
+describe('isOtmDeltaFloorEnabled / resolveOtmDeltaFloor (TRA-1407)', () => {
+  it('is STANDALONE — off by default, accepts truthy spellings, not gated by the master', () => {
+    expect(isOtmDeltaFloorEnabled({})).toBe(false);
+    for (const v of ['1', 'true', 'YES', ' on ']) {
+      expect(isOtmDeltaFloorEnabled({ OTM_DELTA_FLOOR_ENABLED: v })).toBe(true);
+    }
+    // Decoupled from the exit-risk master (demo-scoped by the caller instead).
+    expect(isOtmDeltaFloorEnabled({ EXIT_RISK_RULES_ENABLED: 'true' })).toBe(false);
+    expect(
+      isOtmDeltaFloorEnabled({ EXIT_RISK_RULES_ENABLED: 'off', OTM_DELTA_FLOOR_ENABLED: '1' }),
+    ).toBe(true);
+  });
+
+  it('resolves the floor to the default when unset or malformed, and honours a valid override', () => {
+    expect(resolveOtmDeltaFloor({})).toBe(OTM_DELTA_FLOOR_DEFAULT);
+    expect(resolveOtmDeltaFloor({ OTM_DELTA_FLOOR: '0.35' })).toBe(0.35);
+    // Out-of-range / malformed → fall back to the default (never silently disable).
+    for (const bad of ['', 'abc', '0', '-0.2', '1', '1.5']) {
+      expect(resolveOtmDeltaFloor({ OTM_DELTA_FLOOR: bad })).toBe(OTM_DELTA_FLOOR_DEFAULT);
+    }
   });
 });

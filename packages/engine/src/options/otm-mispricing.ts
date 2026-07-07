@@ -75,6 +75,16 @@ export interface OtmScannerOptions {
   mispricingThresholdPct?: number;
   /** Number of neighbour strikes (each side) used when smoothing midIv (default 3). */
   ivSmoothingWindow?: number;
+  /**
+   * TRA-1407 — reject candidates whose |Black-Scholes delta| is below this floor
+   * (default 0 = no floor, preserving legacy far-OTM behaviour). The demo option
+   * journal showed the single_leg_otm sleeve bleeds entirely in low delta
+   * (Δ<0.15 avgR −0.075) while Δ≥0.45 makes avgR +0.55 — a floor drops the
+   * lottery-ticket tail without touching near-money reads. Applied post-greeks,
+   * so it filters the same `delta` that lands on each candidate. Callers pass the
+   * board-tuned floor (recommend 0.40) only when the OTM delta-floor flag is on.
+   */
+  minAbsDelta?: number;
   /** Override of `Date.now()` — test seam. */
   now?: number;
 }
@@ -87,6 +97,7 @@ const DEFAULTS: Required<Omit<OtmScannerOptions, 'now'>> = {
   minMark: 0.05,
   mispricingThresholdPct: 0.15,
   ivSmoothingWindow: 3,
+  minAbsDelta: 0,
 };
 
 function classify(mispricingPct: number, threshold: number): Mispricing {
@@ -208,6 +219,12 @@ export function findMispricedOtmContracts(
       optionType: row.optionType,
       dividendYield: opts.dividendYield,
     });
+
+    // TRA-1407 — delta floor: drop far-OTM lottery tickets whose |delta| is below
+    // the caller's floor. Off by default (minAbsDelta 0). A missing/NaN delta is
+    // treated as failing the floor when one is set (don't admit an un-scored
+    // contract past a hard risk gate).
+    if (opts.minAbsDelta > 0 && !(Math.abs(delta) >= opts.minAbsDelta)) continue;
 
     const mispricingPct = (mark - theo) / theo;
 

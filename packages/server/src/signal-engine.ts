@@ -52,7 +52,7 @@ import { isOptionShadowEnabled, isOptionPhaseBEnabled, emitShadowOptionSignal, s
 import { isOptionExecEnabled, isOptionEmaPullbackEnabled, isOptionVolumeBreakoutEnabled, resolveRvLongDteOverride, resolveRvMinDailyVolume, isOptionDemoDirectionalEnabled, isOptionIvRvScannerEnabled, isOptionIvRvRoutingEnabled, resolveIvRvRoutingOverride, isOptionShortPremiumScannerEnabled } from './option-exec-flag.js';
 import { scanIvRvFromSnapshot, recordIvRvScan } from './iv-rv-scanner.js';
 import { scanShortPremiumFromSnapshot, recordShortPremiumScan } from './short-premium-scanner.js';
-import { isExitRiskRulesEnabled, isLiveEquityStopModifyEnabled, isTakeProfitEarlyEnabled, isEntryGreeksGateEnabled, isCorrelatedExposureCapEnabled } from './exit-risk-rules-flag.js';
+import { isExitRiskRulesEnabled, isLiveEquityStopModifyEnabled, isTakeProfitEarlyEnabled, isEntryGreeksGateEnabled, isCorrelatedExposureCapEnabled, isOtmDeltaFloorEnabled, resolveOtmDeltaFloor } from './exit-risk-rules-flag.js';
 import { recordCorrelatedExposureBinding, type CorrelatedExposureVenue } from './correlated-exposure-ledger.js';
 import { recordConvictionDcaFill } from './conviction-dca-ledger.js';
 import { isScaleoutLadderEnabled } from './scaleout-ladder-flag.js';
@@ -4472,6 +4472,20 @@ export class SignalEngine {
     // on every call, identical to the RV path.
     const dtePrefs = { min: this.rvDteMin, max: this.rvDteMax, target: this.rvDteTarget };
 
+    // TRA-1407 (parent TRA-1406) — OTM entry delta floor. DEMO-SCOPED: only the
+    // demo book applies it, so the flag is structurally incapable of altering a
+    // live option open (matching the TRA-1293 greeks-gate / take-profit-early
+    // containment). When on, candidates below the resolved |delta| floor are
+    // dropped at the scanner, so the strongest `cheap` read that ALSO clears the
+    // floor is selected (rather than picking a lottery-ticket cheap and rejecting
+    // post-hoc). OFF by default — no change to the shipped far-OTM behaviour until
+    // the board flips it via demo-flags.json after QuantTrader forward-validates.
+    const demoEnv = this.resolveDemoFlagEnv();
+    const otmScanOpts =
+      this.mode === 'demo' && isOtmDeltaFloorEnabled(demoEnv)
+        ? { minAbsDelta: resolveOtmDeltaFloor(demoEnv) }
+        : undefined;
+
     for (const sym of activeSymbols) {
       // TRA-1231 — same iv-rv cap reservation as the RV scan above. The OTM
       // scan also runs before the iv-rv routing pass and shares the cap.
@@ -4481,7 +4495,7 @@ export class SignalEngine {
         && this.optionsAccount.optionsDailyRemaining() <= IV_RV_RESERVED_CAP_SLOTS
       ) break;
       try {
-        const result = await this.rvScanner.scanOtm(sym, undefined, dtePrefs);
+        const result = await this.rvScanner.scanOtm(sym, otmScanOpts, dtePrefs);
         if (result.reason !== 'ok' || result.candidates.length === 0) continue;
 
         // The scanner sorts by |mispricingPct|, so the first `cheap` candidate

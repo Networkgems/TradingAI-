@@ -93,6 +93,15 @@ export const DEMO_FLAG_ALLOWLIST = [
   // file override so a non-admin operator can arm the demo routing on the
   // self-hosted host (no PM2/admin).
   'CRYPTO_REGIME_TSMOM_DEMO_ROUTE_ENABLED',
+  // TRA-1407 (parent TRA-1406 "less noise, more quality") — arm the single_leg_otm
+  // entry delta floor on the DEMO book. STANDALONE flag (not under the
+  // EXIT_RISK_RULES master), and the signal-engine consults it ONLY on the
+  // `mode === 'demo'` OTM branch, so it can never alter a live option open. The
+  // OTM_DELTA_FLOOR numeric override tunes the floor (default 0.40). Non-secret,
+  // demo-only — safe for the file override so the board can flip it daemon-free on
+  // the self-hosted host after QuantTrader's forward-validation (no PM2/admin).
+  'OTM_DELTA_FLOOR_ENABLED',
+  'OTM_DELTA_FLOOR',
 ] as const;
 
 export const DEMO_FLAGS_FILENAME = 'demo-flags.json';

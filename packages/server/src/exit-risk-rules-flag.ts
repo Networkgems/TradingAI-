@@ -96,3 +96,39 @@ export const ENTRY_GREEKS_GATE_FLAG = 'ENTRY_GREEKS_GATE_ENABLED';
 export function isEntryGreeksGateEnabled(env: NodeJS.ProcessEnv = process.env): boolean {
   return isExitRiskRulesEnabled(env) && flagOn(env[ENTRY_GREEKS_GATE_FLAG]);
 }
+
+// TRA-1407 (parent TRA-1406 "less noise, more quality") — a minimum |delta| floor
+// on the single_leg_otm opener. The demo journal showed the OTM sleeve bleeds
+// entirely in low delta (Δ<0.15 avgR −0.075, −$6.2k) while Δ≥0.45 makes avgR
+// +0.55 — a floor flips the sleeve from ≈−$7.1k to +$7.9k by dropping the
+// lottery-ticket tail. A STANDALONE flag (NOT under the EXIT_RISK_RULES master):
+// the signal-engine consults it ONLY on the `mode === 'demo'` OTM branch, so it
+// is structurally incapable of altering a live option open, matching the
+// containment TAKE_PROFIT_EARLY_ENABLED / ENTRY_GREEKS_GATE use. This partially
+// walks back the TRA-1207 far-OTM thesis toward near-money, so it ships OFF by
+// default and the board flips it via demo-flags.json after QuantTrader's
+// forward-validation. OFF by default (1/true/yes/on).
+export const OTM_DELTA_FLOOR_FLAG = 'OTM_DELTA_FLOOR_ENABLED';
+/** Numeric override of the floor (default 0.40, the QuantTrader recommendation). */
+export const OTM_DELTA_FLOOR_VALUE = 'OTM_DELTA_FLOOR';
+export const OTM_DELTA_FLOOR_DEFAULT = 0.4;
+
+/** True iff the OTM delta floor is enabled (standalone; accepts 1/true/yes/on). */
+export function isOtmDeltaFloorEnabled(env: NodeJS.ProcessEnv = process.env): boolean {
+  return flagOn(env[OTM_DELTA_FLOOR_FLAG]);
+}
+
+/**
+ * Resolve the effective |delta| floor. Reads the optional numeric `OTM_DELTA_FLOOR`
+ * override, falling back to {@link OTM_DELTA_FLOOR_DEFAULT}. A malformed or
+ * out-of-range value (≤0 or ≥1 — a delta is a probability-like [0,1] magnitude)
+ * falls back to the default rather than silently disabling the gate.
+ */
+export function resolveOtmDeltaFloor(env: NodeJS.ProcessEnv = process.env): number {
+  const raw = env[OTM_DELTA_FLOOR_VALUE];
+  if (typeof raw === 'string' && raw.trim() !== '') {
+    const parsed = Number(raw);
+    if (Number.isFinite(parsed) && parsed > 0 && parsed < 1) return parsed;
+  }
+  return OTM_DELTA_FLOOR_DEFAULT;
+}

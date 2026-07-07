@@ -129,6 +129,30 @@ describe('findMispricedOtmContracts', () => {
     expect(findMispricedOtmContracts([liquidRow(110, 'call', 0.3)], 0)).toHaveLength(0);
   });
 
+  // TRA-1407 — minAbsDelta floor: drop far-OTM low-delta lottery tickets, keep
+  // the near-money reads. With SPOT=100 a 102 call sits ~0.44 delta while a 110
+  // call is ~0.16, so a 0.40 floor removes 110 but keeps 102.
+  it('drops candidates below the minAbsDelta floor but keeps near-money ones', () => {
+    const chain: OptionChainRow[] = [
+      liquidRow(102, 'call', 0.30), // near-money, |delta| ~0.44 → kept
+      liquidRow(110, 'call', 0.30), // far-OTM, |delta| ~0.16 → dropped by 0.40 floor
+    ];
+    const unfloored = findMispricedOtmContracts(chain, SPOT, { now: NOW });
+    expect(unfloored.map(r => r.strike).sort((a, b) => a - b)).toEqual([102, 110]);
+
+    const floored = findMispricedOtmContracts(chain, SPOT, { now: NOW, minAbsDelta: 0.4 });
+    expect(floored.map(r => r.strike)).toEqual([102]);
+    expect(Math.abs(floored[0].delta)).toBeGreaterThanOrEqual(0.4);
+  });
+
+  it('minAbsDelta of 0 is a no-op (legacy far-OTM behaviour preserved)', () => {
+    const chain = [liquidRow(110, 'call', 0.30)];
+    const withZero = findMispricedOtmContracts(chain, SPOT, { now: NOW, minAbsDelta: 0 });
+    const without = findMispricedOtmContracts(chain, SPOT, { now: NOW });
+    expect(withZero.map(r => r.strike)).toEqual(without.map(r => r.strike));
+    expect(withZero).toHaveLength(1);
+  });
+
   it('classifies a fairly-priced contract as fair', () => {
     const chain = [liquidRow(110, 'call', 0)];
     const result = findMispricedOtmContracts(chain, SPOT, { now: NOW });
