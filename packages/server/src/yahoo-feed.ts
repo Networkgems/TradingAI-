@@ -19,13 +19,32 @@ const YF_CALL_TIMEOUT_MS = 8_000;
 // burns the retry budget for nothing and risks extending the lock-out. Open the
 // breaker for a cool-down window so we fall through to Stooq fast.
 const RATE_LIMIT_COOLDOWN_MS = 90_000;
+// TRA-1391 — during the first BOOT_WINDOW_MS of process uptime, use a much
+// longer cooldown. The 90s base resets every 3rd 30s equity tick, re-arming
+// the ~450-symbol secondary Yahoo fan-out storm before the process has
+// stabilised and causing the bqb1 ~3-min health-timeout restart loop:
+//
+//   t=0   equity tick → secondary fan-out → 429/crumb → breaker trips (90s)
+//   t=30  tick → breaker open → skipped ✓
+//   t=60  tick → breaker open → skipped ✓
+//   t=91  breaker RESETS → next tick fires new storm → new stall → Render 5s timeout
+//   → Render restarts → t=0 again (self-perpetuating)
+//
+// With a 10-min boot cooldown the breaker stays open through the entire
+// Render health-probe window. After BOOT_WINDOW_MS the breaker reverts to
+// the 90s steady-state value, so RTH operation is unaffected.
+const BOOT_WINDOW_MS = 5 * 60_000;        // 5 min
+const BOOT_RATE_LIMIT_COOLDOWN_MS = 10 * 60_000; // 10 min
 let rateLimitedUntil = 0;
 function isRateLimited(): boolean {
   return Date.now() < rateLimitedUntil;
 }
 function tripBreaker(label: string, msg: string): void {
-  rateLimitedUntil = Date.now() + RATE_LIMIT_COOLDOWN_MS;
-  console.warn(`[yahoo-feed] circuit breaker tripped for ${RATE_LIMIT_COOLDOWN_MS / 1000}s after ${label}: ${msg}`);
+  const cooldownMs = process.uptime() * 1000 < BOOT_WINDOW_MS
+    ? BOOT_RATE_LIMIT_COOLDOWN_MS
+    : RATE_LIMIT_COOLDOWN_MS;
+  rateLimitedUntil = Date.now() + cooldownMs;
+  console.warn(`[yahoo-feed] circuit breaker tripped for ${cooldownMs / 1000}s after ${label}: ${msg}`);
 }
 function isRateLimitError(msg: string): boolean {
   return /\b429\b|Too Many Requests|crumb/i.test(msg);
@@ -1308,6 +1327,11 @@ export async function fetchQuotes(
 
   // Fan out the leftovers (symbols Tradier didn't return) to the secondary chain.
   const remaining = stale.filter((s) => !results.has(s));
+  // TRA-1391 — short-circuit immediately when the Yahoo breaker is open.
+  // withRetry already returns null for every symbol when isRateLimited() is true,
+  // so the existing loop just burns N Promise.all() round-trips with zero data
+  // gain and queues unnecessary microtask callbacks during the boot window.
+  if (remaining.length > 0 && isRateLimited()) return results;
   const QUOTE_BATCH = 5;
   let failures = 0;
   for (let i = 0; i < remaining.length; i += QUOTE_BATCH) {

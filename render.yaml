@@ -318,6 +318,20 @@ services:
       # value (flip the flag off). Accepts the usual truthy spellings (1/true/yes/on).
       - key: ENABLE_COLD_START_DAILY_PREFETCH
         value: "true"
+      # TRA-1391 — how long (ms) after an engine begins ticking the cold-start
+      # warmer above waits before its FIRST fetch. Leave unset for the safe
+      # default (150000 = 2.5 min, just past the 120s watchdog bootGrace). The
+      # warmer used to fire the instant ticking began, so on a cold cache its
+      # paced fan-out ran concurrently with the first (heaviest) ticks — a doubled
+      # paced storm through the one Coinbase pacer during exactly the window where
+      # the event-loop watchdog is muzzled (bootGrace) but Render's 5s HTTP probe
+      # is not. Any transient >5s stall there = ungraceful Render restart →
+      # re-cold-start → re-armed storm (the bqb1 ~3-min health-timeout restart
+      # loop). Deferring the warmer lets the first ticks clear the boot window
+      # alone; the cache is still front-loaded, just ~2.5 min later. Set `0` to
+      # restore the pre-fix fire-immediately behaviour; clamped to [0, 600000].
+      - key: COLD_START_DAILY_PREFETCH_BOOT_DELAY_MS
+        sync: false
       # TRA-1271 (parent TRA-1266 → TRA-1210) — turn ON the OBSERVE-ONLY CRYPTO
       # IGNITION SCANNER so the demo book accrues the forward sample that
       # confirms-or-kills the strict RVOL≥6 breakout edge. Same shape as the other

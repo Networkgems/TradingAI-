@@ -24,6 +24,7 @@ const sample = (over: Partial<WatchdogSample> = {}): WatchdogSample => ({
   heapPct: 100e6 / 1536e6,
   lagMeanMs: 5,
   lagMaxMs: 20,
+  rssBytes: 400e6,
   ...over,
 });
 
@@ -60,6 +61,51 @@ describe('resolveConfig', () => {
     expect(resolveConfig({ WATCHDOG_BOOT_GRACE_MS: '0' }).bootGraceMs).toBe(0); // disable allowed
     expect(resolveConfig({ WATCHDOG_BOOT_GRACE_MS: '30000' }).bootGraceMs).toBe(30_000);
     expect(resolveConfig({ WATCHDOG_BOOT_GRACE_MS: '9999999' }).bootGraceMs).toBe(1_800_000); // clamped down
+  });
+
+  it('TRA-1374 — RSS ceiling defaults to 1900MB, is env-tunable (MB→bytes), clamped, and 0 disables', () => {
+    expect(resolveConfig({}).rssMaxBytes).toBe(1_900 * 1e6);
+    expect(resolveConfig({ WATCHDOG_RSS_MAX_MB: '3500' }).rssMaxBytes).toBe(3_500 * 1e6);
+    expect(resolveConfig({ WATCHDOG_RSS_MAX_MB: '0' }).rssMaxBytes).toBe(0); // explicit disable
+    expect(resolveConfig({ WATCHDOG_RSS_MAX_MB: '-5' }).rssMaxBytes).toBe(0); // non-positive disables
+    expect(resolveConfig({ WATCHDOG_RSS_MAX_MB: '100' }).rssMaxBytes).toBe(256 * 1e6); // clamped up
+    expect(resolveConfig({ WATCHDOG_RSS_MAX_MB: '999999' }).rssMaxBytes).toBe(32_768 * 1e6); // clamped down
+    expect(resolveConfig({ WATCHDOG_RSS_MAX_MB: 'abc' }).rssMaxBytes).toBe(0); // non-numeric disables
+  });
+});
+
+describe('evaluateSample — TRA-1374 acute RSS trip', () => {
+  it('trips immediately on a single sample over the RSS ceiling (beats the cgroup OOM-137)', () => {
+    const c = cfg({ rssMaxBytes: 1_900e6 });
+    const state = freshState();
+    const decision = evaluateSample(sample({ rssBytes: 1_950e6 }), state, c);
+    expect(decision.trip).toBe(true);
+    expect(decision.reason).toBe('rss');
+  });
+
+  it('does not trip when RSS is below the ceiling even with a healthy heap', () => {
+    const c = cfg({ rssMaxBytes: 1_900e6 });
+    const state = freshState();
+    expect(evaluateSample(sample({ rssBytes: 1_800e6 }), state, c).trip).toBe(false);
+  });
+
+  it('fires even though the V8 heap is nowhere near its limit — the failure mode heap trip is blind to', () => {
+    const c = cfg({ rssMaxBytes: 1_900e6 });
+    const state = freshState();
+    // Low heap (native/external memory is the burst), high RSS.
+    const decision = evaluateSample(
+      sample({ heapUsedBytes: 200e6, heapPct: 200 / 1536, rssBytes: 1_920e6 }),
+      state,
+      c,
+    );
+    expect(decision.trip).toBe(true);
+    expect(decision.reason).toBe('rss');
+  });
+
+  it('is disabled when rssMaxBytes is 0 — no RSS trip regardless of RSS', () => {
+    const c = cfg({ rssMaxBytes: 0 });
+    const state = freshState();
+    expect(evaluateSample(sample({ rssBytes: 8_000e6 }), state, c).trip).toBe(false);
   });
 });
 
@@ -135,7 +181,7 @@ describe('startEventLoopWatchdog', () => {
     const trips: TripDecision[] = [];
     const handle = startEventLoopWatchdog({
       env: { WATCHDOG_BREACH_SAMPLES: '2', WATCHDOG_HEAP_PCT: '0.9', WATCHDOG_BOOT_GRACE_MS: '0' },
-      readHeap: () => ({ usedBytes: 1500e6, limitBytes: 1536e6 }),
+      readHeap: () => ({ usedBytes: 1500e6, limitBytes: 1536e6, rssBytes: 400e6 }),
       onTrip: d => trips.push(d),
     });
     expect(handle).not.toBeNull();
@@ -156,7 +202,7 @@ describe('startEventLoopWatchdog', () => {
     const trips: TripDecision[] = [];
     const handle = startEventLoopWatchdog({
       env: { WATCHDOG_BREACH_SAMPLES: '1', WATCHDOG_HEAP_PCT: '0.9', WATCHDOG_RESTART_ENABLED: 'false', WATCHDOG_BOOT_GRACE_MS: '0' },
-      readHeap: () => ({ usedBytes: 1500e6, limitBytes: 1536e6 }),
+      readHeap: () => ({ usedBytes: 1500e6, limitBytes: 1536e6, rssBytes: 400e6 }),
       onTrip: d => trips.push(d),
     });
     handle!.sampleNow();
@@ -171,7 +217,7 @@ describe('startEventLoopWatchdog', () => {
     const handle = startEventLoopWatchdog({
       // Heap pinned high so a single sample breaches (breachSamples=1); grace 120s.
       env: { WATCHDOG_BREACH_SAMPLES: '1', WATCHDOG_HEAP_PCT: '0.9', WATCHDOG_BOOT_GRACE_MS: '120000' },
-      readHeap: () => ({ usedBytes: 1500e6, limitBytes: 1536e6 }),
+      readHeap: () => ({ usedBytes: 1500e6, limitBytes: 1536e6, rssBytes: 400e6 }),
       now: () => clock,
       onTrip: d => trips.push(d),
     });
@@ -199,7 +245,7 @@ describe('startEventLoopWatchdog', () => {
     const trips: TripDecision[] = [];
     const handle = startEventLoopWatchdog({
       env: { WATCHDOG_BREACH_SAMPLES: '1', WATCHDOG_HEAP_PCT: '0.9', WATCHDOG_BOOT_GRACE_MS: '0' },
-      readHeap: () => ({ usedBytes: 1500e6, limitBytes: 1536e6 }),
+      readHeap: () => ({ usedBytes: 1500e6, limitBytes: 1536e6, rssBytes: 400e6 }),
       onTrip: d => trips.push(d),
     });
     handle!.sampleNow();
@@ -212,7 +258,7 @@ describe('startEventLoopWatchdog', () => {
     let clock = 1_000_000;
     const handle = startEventLoopWatchdog({
       env: { WATCHDOG_BREACH_SAMPLES: '5', WATCHDOG_HEAP_PCT: '0.95', WATCHDOG_BOOT_GRACE_MS: '120000' },
-      readHeap: () => ({ usedBytes: 100e6, limitBytes: 1536e6 }),
+      readHeap: () => ({ usedBytes: 100e6, limitBytes: 1536e6, rssBytes: 400e6 }),
       now: () => clock,
       onTrip: () => {},
     });
@@ -233,10 +279,28 @@ describe('startEventLoopWatchdog', () => {
     handle!.stop();
   });
 
+  it('TRA-1374 — fires onTrip with reason "rss" on a single RSS-ceiling breach (native-memory burst, low heap)', () => {
+    const trips: TripDecision[] = [];
+    const handle = startEventLoopWatchdog({
+      // Default heap/lag thresholds; RSS ceiling 1500MB, no boot grace.
+      env: { WATCHDOG_RSS_MAX_MB: '1500', WATCHDOG_BOOT_GRACE_MS: '0' },
+      // Heap is low (200MB/1536MB) — the burst is native/external memory, so the
+      // heap trip is blind to it. RSS reads above the ceiling.
+      readHeap: () => ({ usedBytes: 200e6, limitBytes: 1536e6, rssBytes: 1_560e6 }),
+      onTrip: d => trips.push(d),
+    });
+    handle!.sampleNow(); // one sample is enough — acute trip, no consecutive requirement
+    expect(trips).toHaveLength(1);
+    expect(trips[0]?.reason).toBe('rss');
+    expect(handle!.status().trippedReason).toBe('rss');
+    expect(handle!.status().lastSample?.rssBytes).toBe(1_560e6);
+    handle!.stop();
+  });
+
   it('publishes a snapshot with heap % and breach counters for the health probe', () => {
     const handle = startEventLoopWatchdog({
       env: { WATCHDOG_BREACH_SAMPLES: '5', WATCHDOG_HEAP_PCT: '0.95' },
-      readHeap: () => ({ usedBytes: 768e6, limitBytes: 1536e6 }),
+      readHeap: () => ({ usedBytes: 768e6, limitBytes: 1536e6, rssBytes: 400e6 }),
       onTrip: () => {},
     });
     handle!.sampleNow();

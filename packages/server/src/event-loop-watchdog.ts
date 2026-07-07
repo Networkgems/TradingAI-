@@ -28,6 +28,16 @@
 //      thrash that starves the loop). Restarting before the hard OOM gives a
 //      clean exit + flushed logs instead of an abrupt SIGKILL.
 //
+// TRA-1374 adds a third, ACUTE condition (single sample, no consecutive
+// requirement) for the failure the two above are blind to:
+//
+//   3. RSS ceiling — `process.memoryUsage().rss` vs an absolute container
+//      limit. The recurring bqb1 kill is `nonZeroExit: 137` (cgroup OOM-killer)
+//      driven by a sub-minute native/external-memory burst that lives OUTSIDE
+//      the V8 heap, so the heap watermark never sees it and the sustained trips
+//      can't react in time. One sample over the ceiling restarts cleanly NOW,
+//      beating the platform's hard kill.
+//
 // Monitoring is always cheap and always on; the RESTART action defaults ON
 // because the whole point of the ticket is "self-restarts cleanly … no hanging
 // 502 limbo" and the prod box has no operator-in-the-loop to flip a flag mid-
@@ -50,6 +60,7 @@ export const WATCHDOG_LAG_MS_VAR = 'WATCHDOG_LAG_MS';
 export const WATCHDOG_BREACH_SAMPLES_VAR = 'WATCHDOG_BREACH_SAMPLES';
 export const WATCHDOG_BLOCK_MS_VAR = 'WATCHDOG_BLOCK_MS';
 export const WATCHDOG_BOOT_GRACE_MS_VAR = 'WATCHDOG_BOOT_GRACE_MS';
+export const WATCHDOG_RSS_MAX_MB_VAR = 'WATCHDOG_RSS_MAX_MB';
 
 export interface WatchdogConfig {
   /** Master switch. When false, the watchdog never starts (zero overhead). */
@@ -74,6 +85,21 @@ export interface WatchdogConfig {
    * loose sustained threshold (10s of >2s mean lag) was a no-op against.
    */
   lagMaxMs: number;
+  /**
+   * TRA-1374 — acute RSS ceiling trip, in bytes (0 disables). The heap trip
+   * (`heapPct`) only sees the V8 heap; the recurring bqb1 kill is `nonZeroExit:
+   * 137` (cgroup SIGKILL) driven by a sub-minute RSS burst — native/external
+   * memory (HTTP response buffers from the full-universe crypto fan-out) that
+   * lives OUTSIDE the V8 heap and so never moves `heapUsed`. Steady RSS is only
+   * ~0.3-0.75 GB, then one heavy tick spikes RSS past the container ceiling
+   * faster than the sustained heap/lag trips (which need `breachSamples`
+   * consecutive windows) can react, so the platform hard-kills first — no clean
+   * exit, no flushed logs, no graceful state persist. This is an ACUTE
+   * single-sample trip (like `lagMaxMs`): one sample whose `process.memoryUsage()
+   * .rss` clears this ceiling restarts cleanly NOW, beating the cgroup kill. Set
+   * below the container's memory limit with headroom for the exit drain.
+   */
+  rssMaxBytes: number;
   /**
    * TRA-1084 — boot/warmup grace. The watchdog measures from process start, but
    * RESTART trips are suppressed until the process has been up this long. During
@@ -103,6 +129,14 @@ export const DEFAULT_WATCHDOG: WatchdogConfig = {
   // platform's hard kill. A 4s+ stall on a healthy box is itself pathology
   // (a full GC near the 1.5GB ceiling is ~1-2s), so a false trip is implausible.
   lagMaxMs: 4_000,
+  // TRA-1374 — 1900 MB: the live box is `plan: standard` (2 GB cgroup ceiling;
+  // see render.yaml). V8 old-space is pinned to 1536 MB, so a HEALTHY process
+  // (heap ≤1.5 GB + ~0.3-0.4 GB native/baseline) tops out well under this;
+  // steady RSS is only ~0.3-0.75 GB. Tripping at 1900 MB fires a clean restart
+  // in the ~100 MB gap before the 2 GB cgroup SIGKILL, converting the abrupt
+  // `nonZeroExit: 137` into a graceful exit + flushed logs. Raise this via
+  // WATCHDOG_RSS_MAX_MB if the box is moved to a larger plan; set 0 to disable.
+  rssMaxBytes: 1_900 * 1e6,
   // 120s: warmup's synchronous candle-load across N per-book engines blocks the
   // loop past lagMaxMs for a few seconds and was self-restarting the box mid-
   // warmup in an infinite loop. Trips are suppressed (but still logged) for the
@@ -135,7 +169,22 @@ export function resolveConfig(env: NodeJS.ProcessEnv = process.env): WatchdogCon
     breachSamples: Math.floor(envNum(env[WATCHDOG_BREACH_SAMPLES_VAR], DEFAULT_WATCHDOG.breachSamples, 1, 600)),
     lagMaxMs: envNum(env[WATCHDOG_BLOCK_MS_VAR], DEFAULT_WATCHDOG.lagMaxMs, 500, 600_000),
     bootGraceMs: envNum(env[WATCHDOG_BOOT_GRACE_MS_VAR], DEFAULT_WATCHDOG.bootGraceMs, 0, 1_800_000),
+    rssMaxBytes: resolveRssMaxBytes(env[WATCHDOG_RSS_MAX_MB_VAR]),
   };
+}
+
+/**
+ * TRA-1374 — RSS ceiling resolver. `0` (or an explicit disable spelling) turns
+ * the acute RSS trip off entirely; any other value is read as MB and clamped to
+ * a sane [256 MB, 32 GB] band before conversion to bytes. Kept separate from
+ * {@link envNum} so `0` can pass through as "disabled" rather than being clamped
+ * up to the 256 MB floor.
+ */
+function resolveRssMaxBytes(raw: string | undefined): number {
+  if (typeof raw !== 'string' || raw.trim() === '') return DEFAULT_WATCHDOG.rssMaxBytes;
+  const n = Number(raw.trim());
+  if (!Number.isFinite(n) || n <= 0) return 0; // explicit disable
+  return Math.min(Math.max(n, 256), 32_768) * 1e6;
 }
 
 /** A single resource reading evaluated against the trip thresholds. */
@@ -150,6 +199,8 @@ export interface WatchdogSample {
   lagMeanMs: number;
   /** Max event-loop lag over the sample window, ms. */
   lagMaxMs: number;
+  /** TRA-1374 — resident set size (bytes) from `process.memoryUsage().rss`. */
+  rssBytes: number;
 }
 
 /** Mutable breach counters carried between samples. */
@@ -160,7 +211,7 @@ export interface WatchdogState {
 
 export interface TripDecision {
   trip: boolean;
-  reason?: 'heap' | 'lag' | 'block';
+  reason?: 'heap' | 'lag' | 'block' | 'rss';
   detail?: string;
 }
 
@@ -177,6 +228,23 @@ export function evaluateSample(
   state.consecutiveHeapBreaches = sample.heapPct >= cfg.heapPct ? state.consecutiveHeapBreaches + 1 : 0;
   state.consecutiveLagBreaches = sample.lagMeanMs >= cfg.lagMs ? state.consecutiveLagBreaches + 1 : 0;
 
+  // TRA-1374 — acute RSS trip. Checked FIRST because it is the most time-
+  // critical failure mode: RSS this high means the cgroup OOM-killer (SIGKILL,
+  // `nonZeroExit: 137`) is about to fire. Unlike the heap/lag trips this needs
+  // no consecutive-sample confirmation — a single sample over the ceiling
+  // restarts cleanly NOW so the graceful exit beats the platform's hard kill.
+  // The native-memory burst that drives 137 lives outside the V8 heap, so the
+  // `heapPct` trip below is blind to it; this is the only trip that sees it.
+  if (cfg.rssMaxBytes > 0 && sample.rssBytes >= cfg.rssMaxBytes) {
+    return {
+      trip: true,
+      reason: 'rss',
+      detail:
+        `RSS ${(sample.rssBytes / 1e6).toFixed(0)}MB >= ${(cfg.rssMaxBytes / 1e6).toFixed(0)}MB ceiling ` +
+        `(heap ${(sample.heapUsedBytes / 1e6).toFixed(0)}MB / ${(sample.heapLimitBytes / 1e6).toFixed(0)}MB) — ` +
+        `native/external memory burst approaching the container limit, self-restarting before the cgroup OOM-137`,
+    };
+  }
   if (state.consecutiveHeapBreaches >= cfg.breachSamples) {
     return {
       trip: true,
@@ -217,7 +285,7 @@ export function evaluateSample(
 export interface WatchdogStatus {
   enabled: boolean;
   restartEnabled: boolean;
-  config: { sampleMs: number; heapPct: number; lagMs: number; breachSamples: number; lagMaxMs: number; bootGraceMs: number };
+  config: { sampleMs: number; heapPct: number; lagMs: number; breachSamples: number; lagMaxMs: number; bootGraceMs: number; rssMaxBytes: number };
   /** Most recent sample, or null before the first evaluation. */
   lastSample: (WatchdogSample & { atMs: number }) | null;
   /**
@@ -242,7 +310,7 @@ export interface WatchdogStatus {
   inBootGrace: boolean;
   /** True once a trip has fired (process is exiting). */
   tripped: boolean;
-  trippedReason: 'heap' | 'lag' | 'block' | null;
+  trippedReason: 'heap' | 'lag' | 'block' | 'rss' | null;
 }
 
 export interface WatchdogHandle {
@@ -260,7 +328,7 @@ export interface StartWatchdogOptions {
    */
   onTrip?: (decision: TripDecision, sample: WatchdogSample) => void;
   /** Heap reader seam (defaults to V8 + process.memoryUsage). */
-  readHeap?: () => { usedBytes: number; limitBytes: number };
+  readHeap?: () => { usedBytes: number; limitBytes: number; rssBytes: number };
   /** Clock seam for the boot-grace window (defaults to Date.now). */
   now?: () => number;
 }
@@ -272,9 +340,15 @@ export function getWatchdogStatus(): WatchdogStatus | null {
   return lastStatus;
 }
 
-function defaultReadHeap(): { usedBytes: number; limitBytes: number } {
+function defaultReadHeap(): { usedBytes: number; limitBytes: number; rssBytes: number } {
   const heap = getHeapStatistics();
-  return { usedBytes: heap.used_heap_size, limitBytes: heap.heap_size_limit };
+  return {
+    usedBytes: heap.used_heap_size,
+    limitBytes: heap.heap_size_limit,
+    // TRA-1374 — RSS is the number the cgroup OOM-killer watches; read it here so
+    // the acute RSS trip sees the native/external memory the V8 heap stats miss.
+    rssBytes: process.memoryUsage().rss,
+  };
 }
 
 /**
@@ -291,6 +365,7 @@ function defaultOnTrip(decision: TripDecision, sample: WatchdogSample): void {
     detail: decision.detail,
     heapUsedMB: Math.round(sample.heapUsedBytes / 1e6),
     heapLimitMB: Math.round(sample.heapLimitBytes / 1e6),
+    rssMB: Math.round(sample.rssBytes / 1e6),
     lagMeanMs: Math.round(sample.lagMeanMs),
     lagMaxMs: Math.round(sample.lagMaxMs),
   });
@@ -325,7 +400,7 @@ export function startEventLoopWatchdog(opts: StartWatchdogOptions = {}): Watchdo
   histogram.enable();
 
   let tripped = false;
-  let trippedReason: 'heap' | 'lag' | 'block' | null = null;
+  let trippedReason: 'heap' | 'lag' | 'block' | 'rss' | null = null;
 
   // TRA-1089 — steady-state lag observability. Peak excludes warmup so a boot
   // spike never masquerades as a steady-state regression; the ring keeps the
@@ -353,7 +428,7 @@ export function startEventLoopWatchdog(opts: StartWatchdogOptions = {}): Watchdo
     lastStatus = {
       enabled: cfg.enabled,
       restartEnabled: cfg.restartEnabled,
-      config: { sampleMs: cfg.sampleMs, heapPct: cfg.heapPct, lagMs: cfg.lagMs, breachSamples: cfg.breachSamples, lagMaxMs: cfg.lagMaxMs, bootGraceMs: cfg.bootGraceMs },
+      config: { sampleMs: cfg.sampleMs, heapPct: cfg.heapPct, lagMs: cfg.lagMs, breachSamples: cfg.breachSamples, lagMaxMs: cfg.lagMaxMs, bootGraceMs: cfg.bootGraceMs, rssMaxBytes: cfg.rssMaxBytes },
       lastSample: { ...sample, atMs },
       peakSinceBoot,
       recentHighLag: recentHighLag.slice(),
@@ -378,6 +453,7 @@ export function startEventLoopWatchdog(opts: StartWatchdogOptions = {}): Watchdo
       heapPct: heap.limitBytes > 0 ? heap.usedBytes / heap.limitBytes : 0,
       lagMeanMs: Number.isFinite(lagMeanMs) ? lagMeanMs : 0,
       lagMaxMs: Number.isFinite(lagMaxMs) ? lagMaxMs : 0,
+      rssBytes: heap.rssBytes,
     };
 
     const decision = evaluateSample(sample, state, cfg);
@@ -454,7 +530,7 @@ export function startEventLoopWatchdog(opts: StartWatchdogOptions = {}): Watchdo
         lastStatus ?? {
           enabled: cfg.enabled,
           restartEnabled: cfg.restartEnabled,
-          config: { sampleMs: cfg.sampleMs, heapPct: cfg.heapPct, lagMs: cfg.lagMs, breachSamples: cfg.breachSamples, lagMaxMs: cfg.lagMaxMs, bootGraceMs: cfg.bootGraceMs },
+          config: { sampleMs: cfg.sampleMs, heapPct: cfg.heapPct, lagMs: cfg.lagMs, breachSamples: cfg.breachSamples, lagMaxMs: cfg.lagMaxMs, bootGraceMs: cfg.bootGraceMs, rssMaxBytes: cfg.rssMaxBytes },
           lastSample: null,
           peakSinceBoot: null,
           recentHighLag: [],

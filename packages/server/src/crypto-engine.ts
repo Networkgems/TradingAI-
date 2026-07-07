@@ -46,7 +46,7 @@ import {
   listTradableCoinbaseUsdSymbols,
 } from './crypto-feed.js';
 import { isYahooBreakerOpen } from './yahoo-feed.js';
-import { isColdStartDailyPrefetchEnabled, resolveColdStartPrefetchPerMin, recordColdStartPrefetchRun } from './daily-prefetch-flag.js';
+import { isColdStartDailyPrefetchEnabled, resolveColdStartPrefetchPerMin, resolveColdStartPrefetchBootDelayMs, recordColdStartPrefetchRun } from './daily-prefetch-flag.js';
 import { evaluateFeedFreshness } from './feed-freshness.js';
 import { CryptoPaperAccount } from './crypto-account.js';
 import { CryptoLiveAccount } from './crypto-live-account.js';
@@ -380,6 +380,10 @@ export class CryptoSignalEngine {
   // TRA-1051 — one-shot guard so the cold-start daily-candle warmer fires at
   // most once per process even though `start()`/`refresh()` may be called again.
   private dailyPrefetchStarted = false;
+  // TRA-1391 — pending boot-warmer kickoff timer (the warmer is deferred past
+  // the watchdog bootGrace window so it doesn't stack on the fragile first
+  // ticks). Held so `stop()` can cancel a still-pending kickoff at shutdown.
+  private prefetchBootTimer: ReturnType<typeof setTimeout> | null = null;
   /**
    * TRA-407 (C5) — the in-progress tick's promise (resolved when idle).
    * `drain()` awaits this so a graceful shutdown finishes the current tick.
@@ -871,7 +875,27 @@ export class CryptoSignalEngine {
       // shares `refreshDailyCandles`'s pacer + breaker + 1h fetch-gate, so it can
       // only front-load the same fetches the tick loop would make, never duplicate
       // or out-pace the meter beyond its own self-throttled per-minute budget.
-      void this.warmDailyCandlesOnBoot();
+      //
+      // TRA-1391 — but DEFER that kickoff past the watchdog bootGrace window. On a
+      // cold cache the warmer's paced fan-out otherwise runs concurrently with the
+      // first (heaviest) ticks — a doubled paced storm through the one Coinbase
+      // pacer during exactly the window where the internal event-loop watchdog is
+      // muzzled but Render's 5s HTTP probe is not, so any transient >5s stall is an
+      // ungraceful Render restart that re-cold-starts the cache and re-arms the
+      // storm (the ~3-min TRA-1374 restart loop). Delay lets the first ticks run
+      // alone and clear the window; the warmer still front-loads the same cache,
+      // just later. `stop()` cancels a still-pending kickoff. A 0-delay env
+      // restores the pre-TRA-1391 fire-immediately behaviour.
+      const bootDelayMs = resolveColdStartPrefetchBootDelayMs();
+      if (bootDelayMs === 0) {
+        void this.warmDailyCandlesOnBoot();
+      } else {
+        this.prefetchBootTimer = setTimeout(() => {
+          this.prefetchBootTimer = null;
+          void this.warmDailyCandlesOnBoot();
+        }, bootDelayMs);
+        this.prefetchBootTimer.unref?.();
+      }
       this.tick();
       this.tickTimer = setInterval(() => this.tick(), 60_000);
     };
@@ -960,6 +984,13 @@ export class CryptoSignalEngine {
     if (this.tickTimer) {
       clearInterval(this.tickTimer);
       this.tickTimer = null;
+    }
+    // TRA-1391 — cancel a still-pending deferred boot-warmer kickoff so a
+    // shutdown between `start()` and the warmer's first fetch doesn't leave a
+    // dangling timer (and can't fire the warmer after teardown).
+    if (this.prefetchBootTimer) {
+      clearTimeout(this.prefetchBootTimer);
+      this.prefetchBootTimer = null;
     }
   }
 
