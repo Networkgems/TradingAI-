@@ -17,6 +17,7 @@ import {
   _resetCoinbaseAdvancedTradeBreakerForTests,
   _resetCoinbaseBreakerForTests,
   aggregate1hTo4h,
+  fetchCoinbaseDailyBars,
   fetchCoinbaseHourlyBars,
   fetchCoinbase4hBars,
   fillGrid4h,
@@ -282,6 +283,68 @@ describe('fetchCoinbaseHourlyBars', () => {
     const out = await fetchCoinbaseHourlyBars('BTC-USD', 1000, 1000);
     expect(out).toEqual([]);
     expect(fetchMock).not.toHaveBeenCalled();
+  });
+});
+
+describe('fetchCoinbaseDailyBars timeoutMs threading (TRA-1447)', () => {
+  beforeEach(() => {
+    vi.useFakeTimers();
+    _resetCoinbaseBreakerForTests();
+  });
+  afterEach(() => {
+    vi.useRealTimers();
+    vi.unstubAllGlobals();
+    _resetCoinbaseBreakerForTests();
+  });
+
+  // The fan-out-hardening flag in crypto-feed.ts passes `{ timeoutMs: 3000 }`
+  // (FEED_CALL_TIMEOUT_MS) so the pacer's inner AbortController aborts a hung
+  // Coinbase host at the SAME budget the caller's outer withTimeout waits on,
+  // instead of the pacer's 7s default. This asserts the option threads all the
+  // way from the daily wrapper through `fetchCoinbaseCandles` to the pacer.
+  it('aborts a hung daily fetch at the supplied timeout budget', async () => {
+    let seenSignal: AbortSignal | null = null;
+    vi.stubGlobal('fetch', vi.fn(async (_url: string | URL, init?: RequestInit) => {
+      const sig = init?.signal ?? null;
+      seenSignal = sig;
+      return new Promise<Response>((_resolve, reject) => {
+        if (!sig) return; // never resolves
+        const onAbort = () => reject(new DOMException('Aborted', 'AbortError'));
+        if (sig.aborted) onAbort();
+        else sig.addEventListener('abort', onAbort);
+      });
+    }));
+
+    const start = Date.UTC(2025, 0, 1);
+    const end = start + 260 * 24 * ONE_HOUR_MS;
+    const promise = fetchCoinbaseDailyBars('BTC-USD', start, end, { timeoutMs: 500 }).catch(e => e);
+    await vi.runAllTimersAsync();
+    const err = await promise;
+
+    expect(err).toBeInstanceOf(Error);
+    expect((err as Error).message).toMatch(/Coinbase fetch timed out after 500ms/);
+    expect(seenSignal).not.toBeNull();
+    expect(seenSignal!.aborted).toBe(true);
+  });
+
+  it('honours a different supplied budget (proves the value is threaded, not hard-coded)', async () => {
+    vi.stubGlobal('fetch', vi.fn(async (_url: string | URL, init?: RequestInit) => {
+      const sig = init?.signal ?? null;
+      return new Promise<Response>((_resolve, reject) => {
+        if (!sig) return;
+        const onAbort = () => reject(new DOMException('Aborted', 'AbortError'));
+        if (sig.aborted) onAbort();
+        else sig.addEventListener('abort', onAbort);
+      });
+    }));
+
+    const start = Date.UTC(2025, 0, 1);
+    const end = start + 260 * 24 * ONE_HOUR_MS;
+    const promise = fetchCoinbaseDailyBars('ETH-USD', start, end, { timeoutMs: 1_200 }).catch(e => e);
+    await vi.runAllTimersAsync();
+    const err = await promise;
+
+    expect((err as Error).message).toMatch(/timed out after 1200ms/);
   });
 });
 

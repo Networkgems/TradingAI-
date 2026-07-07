@@ -105,6 +105,52 @@ function withTimeout<T>(p: Promise<T>, ms: number, label: string): Promise<T> {
   });
 }
 
+/**
+ * TRA-1447 — flag-gated fan-out hardening for the crypto candle refresh.
+ *
+ * Root cause (recurrence of the TRA-1074 / TRA-1374 flap, filed as TRA-1444):
+ * under a degraded Render egress every Coinbase bar fetch hangs. The per-call
+ * `withTimeout` wrappers here (`fetchCryptoDailyBars` and the Advanced Trade
+ * candle path) give up at {@link FEED_CALL_TIMEOUT_MS} (3s), but the underlying
+ * host pacer's own AbortController runs to its 7s default. So on every hung
+ * symbol: (a) the paced dispatch chain stays occupied ~4s AFTER the caller has
+ * already abandoned the result — no new symbol can dispatch during that window —
+ * and (b) the pacer only records a breaker failure at 7s, so five consecutive
+ * hangs take ~35s to trip the per-source breaker instead of ~15s. Across the
+ * ~485-symbol universe that is the sustained event-loop-starving storm that
+ * drops Render's 5s health probe → process flap → 502.
+ *
+ * When enabled, we thread {@link FEED_CALL_TIMEOUT_MS} into the pacer's
+ * AbortController so the inner abort fires at the SAME budget the caller waits
+ * on: the chain frees immediately, there is never an overlapping 3s+7s timer
+ * pair per call, and each per-source breaker trips ~2.3× faster and starts
+ * fast-failing the rest of the storm. Success paths are unaffected — a fetch
+ * that had not answered within 3s was already discarded by the outer
+ * `withTimeout`, so aborting the socket at 3s changes no returned data.
+ *
+ * OFF by default → byte-identical prod behaviour (inner abort stays at 7s).
+ * Runtime-tunable (read per-call, so a `demo-flags.json` override lands without
+ * a redeploy). Arm on bqb1 for the soak: health stays 200 under a simulated
+ * full-universe upstream timeout.
+ */
+export const CRYPTO_FANOUT_HARDENING_FLAG = 'ENABLE_CRYPTO_FANOUT_HARDENING';
+
+export function isCryptoFanoutHardeningEnabled(env: NodeJS.ProcessEnv = process.env): boolean {
+  const raw = env[CRYPTO_FANOUT_HARDENING_FLAG];
+  if (typeof raw !== 'string') return false;
+  return ['1', 'true', 'yes', 'on'].includes(raw.trim().toLowerCase());
+}
+
+/**
+ * Per-call Coinbase pacer options. Returns `{ timeoutMs: FEED_CALL_TIMEOUT_MS }`
+ * to align the inner AbortController with the outer `withTimeout` when the
+ * hardening flag is on, or `undefined` (pacer's 7s default) when off. Evaluated
+ * at call time so a runtime flag flip takes effect without a restart.
+ */
+function coinbaseFetchOptions(): { timeoutMs: number } | undefined {
+  return isCryptoFanoutHardeningEnabled() ? { timeoutMs: FEED_CALL_TIMEOUT_MS } : undefined;
+}
+
 // Yahoo and crypto-feed share the same outbound IP, so a 429 on stock quotes also
 // applies to crypto quotes. Skip YF for crypto while the shared breaker is open and
 // fall straight through to CMC, instead of burning 8s per symbol on a doomed call.
@@ -455,6 +501,8 @@ export async function fetchCoinbaseAdvancedTradeCandles(
   granularitySeconds: 60 | 3_600 | 86_400,
   fromMs: number,
   toMs: number,
+  // TRA-1447 — optional per-fetch abort budget (see coinbaseFetchOptions).
+  options: { timeoutMs?: number } = {},
 ): Promise<Candle[]> {
   if (toMs <= fromMs) return [];
   const granEnum = COINBASE_AT_CANDLE_GRANULARITY[granularitySeconds];
@@ -480,6 +528,7 @@ export async function fetchCoinbaseAdvancedTradeCandles(
         paceCoinbaseAdvancedTradeFetch(
           `${COINBASE_ADVANCED_TRADE_BASE}/api/v3/brokerage/market/products/${encodeURIComponent(symbol)}/candles?${params.toString()}`,
           { headers: { 'User-Agent': 'TRA-438/1.0', Accept: 'application/json' } },
+          options,
         ),
         FEED_CALL_TIMEOUT_MS,
         `Coinbase AT candles(${symbol} ${granEnum})`,
@@ -740,7 +789,7 @@ export async function fetchCryptoDailyBars(symbol: string, count = 260): Promise
   // Primary: Coinbase Exchange.
   try {
     const bars = await withTimeout(
-      fetchCoinbaseDailyBars(symbol, fromMs, now),
+      fetchCoinbaseDailyBars(symbol, fromMs, now, coinbaseFetchOptions()),
       FEED_CALL_TIMEOUT_MS,
       `coinbase-1d(${symbol})`,
     );
@@ -762,7 +811,7 @@ export async function fetchCryptoDailyBars(symbol: string, count = 260): Promise
   // breaker is open AND Yahoo's per-IP breaker is open. Same volume>0 filter as
   // the Exchange path; the in-progress UTC day is retained when it has volume.
   try {
-    const atBars = await fetchCoinbaseAdvancedTradeCandles(symbol, 86_400, fromMs, now);
+    const atBars = await fetchCoinbaseAdvancedTradeCandles(symbol, 86_400, fromMs, now, coinbaseFetchOptions());
     const usable = atBars.filter(b => b.volume > 0);
     if (usable.length > 0) return usable.slice(-count);
   } catch (err: unknown) {
@@ -838,7 +887,7 @@ export async function fetchCrypto4hBars(symbol: string, count = 260): Promise<Ca
 
   // Primary: Coinbase Exchange (1H bars aggregated + gap-filled to 4H).
   try {
-    const bars = await fetchCoinbase4hBars(symbol, fromMs, now);
+    const bars = await fetchCoinbase4hBars(symbol, fromMs, now, coinbaseFetchOptions());
     if (bars.length > 0) return bars.slice(-count);
   } catch (err: unknown) {
     const msg = err instanceof Error ? err.message : String(err);
@@ -854,7 +903,7 @@ export async function fetchCrypto4hBars(symbol: string, count = 260): Promise<Ca
   // pipeline (`aggregate1hTo4h` + `fillGrid4h`) the Exchange path uses, so the
   // 4H grid stays contiguous and shape-identical regardless of the source.
   try {
-    const hourly = await fetchCoinbaseAdvancedTradeCandles(symbol, 3_600, fromMs, now);
+    const hourly = await fetchCoinbaseAdvancedTradeCandles(symbol, 3_600, fromMs, now, coinbaseFetchOptions());
     if (hourly.length > 0) {
       const aggregated = fillGrid4h(aggregate1hTo4h(hourly));
       if (aggregated.length > 0) return aggregated.slice(-count);
@@ -885,7 +934,7 @@ export async function fetchCryptoMinuteBars(symbol: string, count = 60): Promise
   // Primary: Coinbase Exchange.
   try {
     const bars = await withTimeout(
-      fetchCoinbaseMinuteBars(symbol, fromMs, now),
+      fetchCoinbaseMinuteBars(symbol, fromMs, now, coinbaseFetchOptions()),
       FEED_CALL_TIMEOUT_MS,
       `coinbase-1m(${symbol})`,
     );
@@ -909,7 +958,7 @@ export async function fetchCryptoMinuteBars(symbol: string, count = 60): Promise
   // breakers were open. Same in-progress-bar and 0-volume-gap drops as the
   // Exchange path so indicator math sees an identical series shape.
   try {
-    const atBars = await fetchCoinbaseAdvancedTradeCandles(symbol, 60, fromMs, now);
+    const atBars = await fetchCoinbaseAdvancedTradeCandles(symbol, 60, fromMs, now, coinbaseFetchOptions());
     const completed = atBars
       .filter(b => b.timestamp < currentMinuteStart)
       .filter(b => b.volume > 0);

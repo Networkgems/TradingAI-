@@ -308,6 +308,14 @@ async function fetchCoinbaseCandles(
   fromMs: number,
   toMs: number,
   label: string,
+  // TRA-1447 — optional per-fetch abort budget threaded to the host pacer.
+  // When set (by the crypto-feed fan-out hardening flag), the pacer's internal
+  // AbortController fires at this budget instead of its 7s default, so a hung
+  // Coinbase host frees the paced dispatch chain and records a breaker failure
+  // at the SAME instant the caller's outer `withTimeout` gives up — no ~4s of
+  // chain occupancy past the caller's abandon point, and ~2.3× faster breaker
+  // trips. Defaults to the pacer's own budget when unset (byte-identical).
+  options: { timeoutMs?: number } = {},
 ): Promise<Candle[]> {
   if (toMs <= fromMs) return [];
   const stepMs = MAX_CANDLES_PER_REQUEST * granularitySeconds * 1000;
@@ -321,7 +329,7 @@ async function fetchCoinbaseCandles(
     url.searchParams.set('start', new Date(cursor).toISOString());
     url.searchParams.set('end', new Date(winEnd).toISOString());
 
-    const res = await paceCoinbaseFetch(url.toString(), { headers: { 'User-Agent': 'TRA-267/1.0' } });
+    const res = await paceCoinbaseFetch(url.toString(), { headers: { 'User-Agent': 'TRA-267/1.0' } }, options);
     if (!res.ok) {
       const body = (await res.text()).slice(0, 200);
       throw new Error(`Coinbase ${res.status} for ${symbol} ${label} candles: ${body}`);
@@ -344,8 +352,9 @@ export async function fetchCoinbaseHourlyBars(
   symbol: string,
   fromMs: number,
   toMs: number,
+  options: { timeoutMs?: number } = {},
 ): Promise<Candle[]> {
-  return fetchCoinbaseCandles(symbol, GRANULARITY_1H, fromMs, toMs, '1h');
+  return fetchCoinbaseCandles(symbol, GRANULARITY_1H, fromMs, toMs, '1h', options);
 }
 
 /**
@@ -357,8 +366,9 @@ export async function fetchCoinbaseMinuteBars(
   symbol: string,
   fromMs: number,
   toMs: number,
+  options: { timeoutMs?: number } = {},
 ): Promise<Candle[]> {
-  return fetchCoinbaseCandles(symbol, GRANULARITY_1M, fromMs, toMs, '1m');
+  return fetchCoinbaseCandles(symbol, GRANULARITY_1M, fromMs, toMs, '1m', options);
 }
 
 /**
@@ -370,8 +380,9 @@ export async function fetchCoinbaseDailyBars(
   symbol: string,
   fromMs: number,
   toMs: number,
+  options: { timeoutMs?: number } = {},
 ): Promise<Candle[]> {
-  return fetchCoinbaseCandles(symbol, GRANULARITY_1D, fromMs, toMs, '1d');
+  return fetchCoinbaseCandles(symbol, GRANULARITY_1D, fromMs, toMs, '1d', options);
 }
 
 /**
@@ -515,8 +526,9 @@ export async function fetchCoinbase4hBars(
   symbol: string,
   fromMs: number,
   toMs: number,
+  options: { timeoutMs?: number } = {},
 ): Promise<Candle[]> {
-  const hourly = await fetchCoinbaseHourlyBars(symbol, fromMs, toMs);
+  const hourly = await fetchCoinbaseHourlyBars(symbol, fromMs, toMs, options);
   const filled = fillGrid4h(aggregate1hTo4h(hourly));
   const gaps = summarize4hGaps(filled);
   if (gaps.length > 0) {

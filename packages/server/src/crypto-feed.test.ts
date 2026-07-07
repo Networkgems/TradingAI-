@@ -6,11 +6,31 @@ import {
   fetchCoinbaseAdvancedTradeCandles,
   fetchCoinGeckoQuotes,
   isCoinGeckoBreakerOpen,
+  isCryptoFanoutHardeningEnabled,
   mapWithConcurrency,
   _resetCoinGeckoBreakerForTests,
   _resetCoinbaseProductCatalogForTests,
   _seedCoinbaseProductCatalogForTests,
 } from './crypto-feed.js';
+
+// TRA-1447 — the fan-out-hardening flag gates aligning the Coinbase pacer's
+// inner AbortController with the outer per-call feed timeout. OFF by default so
+// prod behaviour is byte-identical until armed; recognises the standard truthy
+// tokens the rest of the codebase's flag helpers accept.
+describe('isCryptoFanoutHardeningEnabled (TRA-1447)', () => {
+  it('is OFF by default (unset / empty / unrecognised)', () => {
+    expect(isCryptoFanoutHardeningEnabled({})).toBe(false);
+    expect(isCryptoFanoutHardeningEnabled({ ENABLE_CRYPTO_FANOUT_HARDENING: '' })).toBe(false);
+    expect(isCryptoFanoutHardeningEnabled({ ENABLE_CRYPTO_FANOUT_HARDENING: 'off' })).toBe(false);
+    expect(isCryptoFanoutHardeningEnabled({ ENABLE_CRYPTO_FANOUT_HARDENING: '0' })).toBe(false);
+  });
+
+  it('is ON for the standard truthy tokens, case/space-insensitive', () => {
+    for (const raw of ['1', 'true', 'TRUE', 'yes', 'on', ' On ']) {
+      expect(isCryptoFanoutHardeningEnabled({ ENABLE_CRYPTO_FANOUT_HARDENING: raw })).toBe(true);
+    }
+  });
+});
 
 // TRA-1387 — the bounded-concurrency map that caps how many per-symbol Coinbase
 // `/stats` request wrappers + native response buffers are in flight at once.
