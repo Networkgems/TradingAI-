@@ -508,6 +508,29 @@ services:
         value: "1"
       - key: CHURN_SAME_SESSION_OPEN_CAP
         value: "3"
+      # TRA-1447 (parent TRA-1444 → TRA-1448 durable-fix ask) — arm the crypto
+      # daily-bars fan-out hardening on bqb1. ROOT CAUSE of the recurring 502
+      # flap-back (TRA-1448, TRA-1074/1080-1084 signature): under degraded Render
+      # egress every Coinbase bar fetch hangs; the caller abandons at
+      # FEED_CALL_TIMEOUT_MS (3s) but the pacer's own AbortController ran to its 7s
+      # default, so each hung symbol clogged the paced dispatch chain ~4s past the
+      # abandon point AND the per-source breaker only tripped at 7s (~35s for 5
+      # consecutive hangs vs ~15s). Across ~485 symbols that sustained storm
+      # starves the loop → Render's 5s health probe fails → 502; a bare restart
+      # re-saturates on the next crypto tick (the watchdog below only converts the
+      # hang into a ~30s blip, it does not stop the re-saturation). This flag
+      # threads FEED_CALL_TIMEOUT_MS into BOTH host pacers (Exchange + Advanced
+      # Trade, daily/4h/minute) so the inner abort fires at the same 3s the caller
+      # already waits on: the chain frees immediately and each breaker trips ~2.3×
+      # faster, fast-failing the rest of the storm (breaker-open then short-circuits
+      # every remaining symbol with no fetch). BEHAVIOUR-NEUTRAL: no request-rate
+      # change (pacer still serialises identically), no trading/capital change, the
+      # success path is unchanged (a fetch unanswered at 3s was already discarded).
+      # Armed 07-07 as an incident mitigation (bqb1 = live-capital box actively
+      # flapping) — supersedes board conf `d98d3a42`; rollback = clear this value +
+      # redeploy. Accepts 1/true/yes/on.
+      - key: ENABLE_CRYPTO_FANOUT_HARDENING
+        value: "1"
       # TRA-1080 — event-loop/heap starvation watchdog. The watchdog itself is
       # ON by default in code (no env needed); these knobs are declared
       # `sync: false` so an operator can DISABLE or RETUNE it from the dashboard
