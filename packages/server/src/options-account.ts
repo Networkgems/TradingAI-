@@ -1,5 +1,5 @@
 import { randomUUID } from 'crypto';
-import type { TradierOpenOptionPosition, ExitState, ExposurePositionRisk } from '@trading-app/engine';
+import type { TradierOpenOptionPosition, ExitState, ExitParams, ExposurePositionRisk } from '@trading-app/engine';
 import { evaluateMultiLegPreTrade, DEFAULT_MAX_LOSS_PCT_CAP, maxLossCapUsd, evaluateExit, DEFAULT_EXIT_PARAMS, chandelierStop, chandelierExitTriggered, profitLockDecision, takeProfitEarlyDecision } from '@trading-app/engine';
 import type { Side } from '@trading-app/engine';
 import type {
@@ -1925,6 +1925,17 @@ export class PaperOptionsAccount {
      * live mark before the hard stop is reached.
      */
     exitRisk?: OptionExitRiskInput,
+    /**
+     * TRA-1409 (parent TRA-1406) — {@link ExitParams} for the single-leg RV
+     * structural-exit evaluation. Present ⇔ the demo-only `RV_EXIT_RETUNE_ENABLED`
+     * flag is armed (caller scopes to `mode === 'demo'`); carries the confirmed
+     * N-bar Supertrend-flip count so `supertrend_flip` requires a persisted flip
+     * instead of firing on a single whipsaw bar. Absent → {@link DEFAULT_EXIT_PARAMS}
+     * (legacy single-bar flip). Only tightens the STRUCTURAL flip; the risk-side
+     * chandelier / give-back / hard-SL block below is unaffected and keeps
+     * precedence.
+     */
+    rvExitParams?: ExitParams,
   ): OptionPosition[] {
     const closed: OptionPosition[] = [];
     const waitAndHold = options.waitAndHold === true;
@@ -2142,7 +2153,7 @@ export class PaperOptionsAccount {
         if (exitState) {
           const reason = evaluateExit(
             { ...exitState, currentPremium: mark, entryPremium: opt.premiumPaid },
-            DEFAULT_EXIT_PARAMS,
+            rvExitParams ?? DEFAULT_EXIT_PARAMS,
           );
           if (reason === 'supertrend_flip' || reason === 'ma20_close_through' || reason === 'time_stop') {
             if (waitAndHold) {

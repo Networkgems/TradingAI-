@@ -1,6 +1,6 @@
 import { OrbStrategy, BbFadeStrategy, IchimokuStrategy, SupertrendConfluenceStrategy, confluenceSide, supertrend, reversalChecklist, adx, atr, atrPct, donchian, supportResistance, blackScholesDelta, blackScholesGreeks, daysToExpiration, bookGiveBackDecision, correlatedExposureDecision, entryGreeksGateDecision, chandelierStop, stopModifyDecision, selectRvLongCandidate, selectShadowOptionSignal, emaPullbackTrigger, volumeConfirmedBreakout, TradierOptionsClient, TradierOrderClient, TRADIER_REJECTED_STATUSES, TRADIER_TERMINAL_STATUSES, evaluateSma200, SMA200_MIN_BARS, SMA200_DEBOUNCE_BARS, composeTechnicalSnapshot, resampleCandles, TF_BUCKET_MS, OptionsRiskBreaker, DEFAULT_OPTIONS_BREAKER_PARAMS } from '@trading-app/engine';
-import { buildExposureBuckets } from '@trading-app/engine';
-import type { StrategySelectorInput, ContractQuote, OptionTrend, RvLongTrendSide, ExitState, SharedTickIndicators, RelativeValueScannerOptions, OptionChainRow, IvRvScannerOptions, IvRvMispricingCandidate, ExposureBucket, ExposurePositionRisk, CorrelatedExposureDecision } from '@trading-app/engine';
+import { buildExposureBuckets, DEFAULT_EXIT_PARAMS } from '@trading-app/engine';
+import type { StrategySelectorInput, ContractQuote, OptionTrend, RvLongTrendSide, ExitState, ExitParams, SharedTickIndicators, RelativeValueScannerOptions, OptionChainRow, IvRvScannerOptions, IvRvMispricingCandidate, ExposureBucket, ExposurePositionRisk, CorrelatedExposureDecision } from '@trading-app/engine';
 import type { TradierAccountBalance } from '@trading-app/engine';
 import { WATCHLIST, isLiquidSwingSymbol, resolveEquitySwingModeEnabled, checkEquitySwingClose, MANAGED_ACCOUNT_RATIO, MAX_CONSECUTIVE_LOSSES, DAILY_DRAWDOWN_HALT_PCT, BOOK_SESSION_STOP_R, BOOK_GIVEBACK_CAP_PCT, TAKE_PROFIT_EARLY_CAPTURE_PCT, CORRELATED_EXPOSURE_CAP_PCT, CORRELATED_EXPOSURE_MIN_TRADE_RISK_PCT, LIVE_EQUITY_STOP_MODIFY_MIN_TICK_PCT, LIVE_EQUITY_STOP_MODIFY_MIN_TICK_ABS, LIVE_EQUITY_STOP_MODIFY_COOLDOWN_MS, DEFAULT_RISK_PER_TRADE, OPTIONS_PER_TICKET_DOLLAR_FLOOR, OPTIONS_POSITION_CAP_RATIO, aliasWatchlistSymbol, isLiveTradierOptionsEnabled, isStockMarketOpen, perPositionCap, resolveAutoManageImportedTradierOptions, resolveDemoCostModel, resolveHoldLiveOptionsOvernight, resolveSwingHoldOptions, resolveLiveTradeEquitiesTradier, resolveLiveEquityDcaAddsTradier, resolveManagedAccountRatio, resolveMarketReviewGatesEnabled, resolveRiskPerTrade, resolveRvDtePrefs, resolveTradierOptionsCreds, validateBracket, DEFAULT_RV_DTE_MIN, DEFAULT_RV_DTE_MAX, DEFAULT_RV_DTE_TARGET, scoreNewsSentiment, aggregateSymbolSentiment, aggregateFedSentiment, aggregateStockTwitsSentiment, dedupeStockTwitsMessages, mapCuratedMessagesBySymbol, nameAliasesFor, evaluateEquityDcaAdd, evaluateOptionDcaAdd, CONVICTION_DCA, EQUITY_DCA_MAX_SYMBOL_NOTIONAL_FRAC, capEquityAddQtyToSymbolNotional, blendedAverage, positionRiskDollars, minutesToSessionClose, getEasternUtcOffset, isAgentTradingWindowOpen } from '@trading-app/shared';
 import type { TradeSignal, RelativeValueSignal, OtmMispricingSignal, Sma200Signal, Candle, OptionsAccountState, SignalType, Position, OptionPosition, AccountMode, AccountSettings, AccountState, NewsItem, SymbolSentiment, SocialSentiment, StockTwitsMessage, TechnicalSignalSnapshot, TradierEnv, MarketReview, MarketReviewGates, EngineMarketReviewState, GatedStrategyNote, AgentRecommendation, TradeProposal, AgentOrderAudit, GuardrailVerdict, OptionType, PositionAdvisorRow, AdvisorSellPlan, AdvisorDcaPlan } from '@trading-app/shared';
@@ -52,7 +52,7 @@ import { isOptionShadowEnabled, isOptionPhaseBEnabled, emitShadowOptionSignal, s
 import { isOptionExecEnabled, isOptionEmaPullbackEnabled, isOptionVolumeBreakoutEnabled, resolveRvLongDteOverride, resolveRvMinDailyVolume, isOptionDemoDirectionalEnabled, isOptionIvRvScannerEnabled, isOptionIvRvRoutingEnabled, resolveIvRvRoutingOverride, isOptionShortPremiumScannerEnabled } from './option-exec-flag.js';
 import { scanIvRvFromSnapshot, recordIvRvScan } from './iv-rv-scanner.js';
 import { scanShortPremiumFromSnapshot, recordShortPremiumScan } from './short-premium-scanner.js';
-import { isExitRiskRulesEnabled, isLiveEquityStopModifyEnabled, isTakeProfitEarlyEnabled, isEntryGreeksGateEnabled, isCorrelatedExposureCapEnabled, isOtmDeltaFloorEnabled, resolveOtmDeltaFloor } from './exit-risk-rules-flag.js';
+import { isExitRiskRulesEnabled, isLiveEquityStopModifyEnabled, isTakeProfitEarlyEnabled, isEntryGreeksGateEnabled, isCorrelatedExposureCapEnabled, isOtmDeltaFloorEnabled, resolveOtmDeltaFloor, isRvExitRetuneEnabled, resolveRvExitConfirmBars } from './exit-risk-rules-flag.js';
 import { recordCorrelatedExposureBinding, type CorrelatedExposureVenue } from './correlated-exposure-ledger.js';
 import { isChurnLossBrakeEnabled, resolveSameSessionOpenCap } from './churn-loss-brake-flag.js';
 import { isMultiLegOpenPaused } from './multileg-open-pause-flag.js';
@@ -2712,6 +2712,14 @@ export class SignalEngine {
           const stBars = supertrend(series);
           const lastSt = [...stBars].reverse().find((b): b is NonNullable<(typeof stBars)[0]> => b != null);
           if (!lastSt) continue;
+          // TRA-1409 — the last few Supertrend directions (most-recent-last) so the
+          // RV exit re-tune can require a CONFIRMED N-bar flip. Its final element is
+          // this bar's direction (== supertrendDirection below). Cheap and always
+          // populated; the engine only consults it when the confirm-bars param > 1.
+          const recentSupertrendDirections = stBars
+            .filter((b): b is NonNullable<(typeof stBars)[0]> => b != null)
+            .slice(-4)
+            .map((b) => b.direction);
           const lastCandle = series[series.length - 1];
           const ma20Window = series.slice(-20);
           const ma20 = ma20Window.reduce((s, c) => s + c.close, 0) / ma20Window.length;
@@ -2722,6 +2730,7 @@ export class SignalEngine {
           stateMap.set(opt.id, {
             side: 'buy',
             supertrendDirection: lastSt.direction,
+            recentSupertrendDirections,
             underlyingClose: lastCandle.close,
             ma20,
             entryPremium: opt.premiumPaid,
@@ -2733,6 +2742,19 @@ export class SignalEngine {
         if (stateMap.size > 0) rvStructuralExitStates = stateMap;
       }
     }
+
+    // TRA-1409 (parent TRA-1406) — RV exit re-tune: when the standalone demo-only
+    // flag is armed, require a CONFIRMED N-bar Supertrend flip (QuantTrader
+    // variant (a), N=2 — TRA-1415) before the structural `supertrend_flip` exit
+    // fires, so RV winners survive to `ma20_close_through` instead of being
+    // chopped to breakeven by single-bar whipsaws. Scoped to `mode === 'demo'` so
+    // the LIVE exit path is structurally untouched; absent → legacy single-bar
+    // flip. Only ever makes the structural flip fire LESS — the risk-side
+    // chandelier / give-back / hard-SL exits keep precedence unchanged.
+    const rvExitParams: ExitParams | undefined =
+      this.mode === 'demo' && isRvExitRetuneEnabled(this.resolveDemoFlagEnv())
+        ? { ...DEFAULT_EXIT_PARAMS, supertrendFlipConfirmBars: resolveRvExitConfirmBars(this.resolveDemoFlagEnv()) }
+        : undefined;
 
     // TRA-1268 (TRA-1250 Rules 1-2) — underlying ATR(14) on 5m bars for the
     // options ATR chandelier trail + premium-R profit-lock. Dark unless
@@ -2753,6 +2775,7 @@ export class SignalEngine {
           { waitAndHold: liveOptionsMirroring },
           rvStructuralExitStates,
           optionExitRisk,
+          rvExitParams,
         )
       : [];
     if (liveOptionsMirroring && optsClosed.length > 0) {

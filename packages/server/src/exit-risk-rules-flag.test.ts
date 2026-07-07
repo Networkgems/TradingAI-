@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest';
-import { isExitRiskRulesEnabled, isLiveEquityStopModifyEnabled, isTakeProfitEarlyEnabled, isCorrelatedExposureCapEnabled, isOtmDeltaFloorEnabled, resolveOtmDeltaFloor, OTM_DELTA_FLOOR_DEFAULT } from './exit-risk-rules-flag.js';
+import { isExitRiskRulesEnabled, isLiveEquityStopModifyEnabled, isTakeProfitEarlyEnabled, isCorrelatedExposureCapEnabled, isOtmDeltaFloorEnabled, resolveOtmDeltaFloor, OTM_DELTA_FLOOR_DEFAULT, isRvExitRetuneEnabled, resolveRvExitConfirmBars, RV_EXIT_RETUNE_CONFIRM_BARS_DEFAULT } from './exit-risk-rules-flag.js';
 
 // TRA-1250 / TRA-1269 / TRA-1294 / TRA-1295 — master switch + the isolated sub-flags.
 
@@ -83,6 +83,33 @@ describe('isOtmDeltaFloorEnabled / resolveOtmDeltaFloor (TRA-1407)', () => {
     // Out-of-range / malformed → fall back to the default (never silently disable).
     for (const bad of ['', 'abc', '0', '-0.2', '1', '1.5']) {
       expect(resolveOtmDeltaFloor({ OTM_DELTA_FLOOR: bad })).toBe(OTM_DELTA_FLOOR_DEFAULT);
+    }
+  });
+});
+
+describe('isRvExitRetuneEnabled / resolveRvExitConfirmBars (TRA-1409)', () => {
+  it('is STANDALONE — off by default, accepts truthy spellings, not gated by the master', () => {
+    expect(isRvExitRetuneEnabled({})).toBe(false);
+    for (const v of ['1', 'true', 'YES', ' on ']) {
+      expect(isRvExitRetuneEnabled({ RV_EXIT_RETUNE_ENABLED: v })).toBe(true);
+    }
+    // Decoupled from the exit-risk master (demo-scoped by the caller instead).
+    expect(isRvExitRetuneEnabled({ EXIT_RISK_RULES_ENABLED: 'true' })).toBe(false);
+    expect(
+      isRvExitRetuneEnabled({ EXIT_RISK_RULES_ENABLED: 'off', RV_EXIT_RETUNE_ENABLED: '1' }),
+    ).toBe(true);
+  });
+
+  it('resolves confirm-bars to the default (2) when unset or malformed, honours a valid override', () => {
+    expect(resolveRvExitConfirmBars({})).toBe(RV_EXIT_RETUNE_CONFIRM_BARS_DEFAULT);
+    expect(RV_EXIT_RETUNE_CONFIRM_BARS_DEFAULT).toBe(2);
+    expect(resolveRvExitConfirmBars({ RV_EXIT_RETUNE_CONFIRM_BARS: '3' })).toBe(3);
+    expect(resolveRvExitConfirmBars({ RV_EXIT_RETUNE_CONFIRM_BARS: '1' })).toBe(1);
+    // Malformed / out-of-range / non-integer → fall back to the default.
+    for (const bad of ['', 'abc', '0', '-1', '2.5', '11']) {
+      expect(resolveRvExitConfirmBars({ RV_EXIT_RETUNE_CONFIRM_BARS: bad })).toBe(
+        RV_EXIT_RETUNE_CONFIRM_BARS_DEFAULT,
+      );
     }
   });
 });

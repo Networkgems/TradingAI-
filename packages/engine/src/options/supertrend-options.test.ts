@@ -10,6 +10,7 @@ import {
   optionTypeForSide,
   evaluateExit,
   sizeOptionContracts,
+  DEFAULT_EXIT_PARAMS,
   type ExpiryCandidate,
   type ExitState,
 } from './supertrend-options.js';
@@ -144,6 +145,66 @@ describe('evaluateExit (parameterized exit rules)', () => {
   });
   it('does not time-stop when the move followed through', () => {
     expect(evaluateExit({ ...base, barsHeld: 9, hadFollowThrough: true })).toBeNull();
+  });
+});
+
+describe('evaluateExit — TRA-1409 confirmed N-bar Supertrend flip', () => {
+  // Long call; underlying above MA20 and no premium move, so ONLY the flip logic
+  // can trigger an exit (isolates the confirm-bars behaviour).
+  const base: ExitState = {
+    side: 'buy',
+    supertrendDirection: 'red', // flipped against a long this bar
+    underlyingClose: 105,
+    ma20: 100,
+    entryPremium: 2,
+    currentPremium: 2,
+    barsHeld: 1,
+    hadFollowThrough: true,
+  };
+  const confirm2 = { ...DEFAULT_EXIT_PARAMS, supertrendFlipConfirmBars: 2 };
+
+  it('N=2 holds a single-bar flip (whipsaw not confirmed)', () => {
+    // Only the current bar is flipped → not yet 2 consecutive → hold.
+    expect(
+      evaluateExit({ ...base, recentSupertrendDirections: ['green', 'red'] }, confirm2),
+    ).toBeNull();
+  });
+  it('N=2 exits when the flip persists for 2 consecutive bars', () => {
+    expect(
+      evaluateExit({ ...base, recentSupertrendDirections: ['red', 'red'] }, confirm2),
+    ).toBe('supertrend_flip');
+  });
+  it('N=2 exits only on the LAST 2 bars being flipped (earlier greens ignored)', () => {
+    expect(
+      evaluateExit({ ...base, recentSupertrendDirections: ['green', 'red', 'red'] }, confirm2),
+    ).toBe('supertrend_flip');
+  });
+  it('N=2 holds conservatively when no recent-direction history is supplied', () => {
+    expect(evaluateExit({ ...base }, confirm2)).toBeNull();
+  });
+  it('N=1 (default) keeps the legacy single-bar flip exit', () => {
+    expect(evaluateExit({ ...base, recentSupertrendDirections: ['green', 'red'] })).toBe(
+      'supertrend_flip',
+    );
+  });
+  it('never suppresses a risk-side premium stop while a flip is unconfirmed', () => {
+    // Premium at -50% AND only a single-bar flip: the hard stop still wins.
+    expect(
+      evaluateExit(
+        { ...base, currentPremium: 1.0, recentSupertrendDirections: ['green', 'red'] },
+        confirm2,
+      ),
+    ).toBe('premium_stop');
+  });
+  it('falls through to ma20_close_through when the flip is held unconfirmed', () => {
+    // Single-bar flip held by N=2, but the underlying has closed through MA20 —
+    // the structural MA20 exit still fires (winners are not stranded).
+    expect(
+      evaluateExit(
+        { ...base, underlyingClose: 99, recentSupertrendDirections: ['green', 'red'] },
+        confirm2,
+      ),
+    ).toBe('ma20_close_through');
   });
 });
 

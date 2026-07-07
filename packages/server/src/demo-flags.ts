@@ -122,6 +122,19 @@ export const DEMO_FLAG_ALLOWLIST = [
   // retire-short-term daemon-free on the self-hosted host (no PM2/admin) the
   // moment QuantTrader confirms the $0 closes are dead weight vs a fixable bug.
   'ENABLE_OPTION_MULTILEG_PAUSE',
+  // TRA-1409 (parent TRA-1406 "less noise, more quality") — the RV single_leg
+  // exit re-tune: require a confirmed N-bar Supertrend flip (QuantTrader variant
+  // (a), N=2 — TRA-1415) before the structural `supertrend_flip` exit fires, so
+  // RV winners survive to the ma20_close_through cross instead of being chopped
+  // to breakeven by single-bar whipsaws. STANDALONE flag (not under the
+  // EXIT_RISK_RULES master), consulted ONLY on the demo RV exit branch — it can
+  // never alter a live option exit and only ever makes the structural flip fire
+  // LESS (risk-side chandelier/give-back/hard-SL keep precedence). The
+  // RV_EXIT_RETUNE_CONFIRM_BARS numeric override tunes N (default 2). Non-secret,
+  // demo-only — safe for the file override so the board can arm it daemon-free on
+  // the self-hosted host after QuantTrader forward-validates (no PM2/admin).
+  'RV_EXIT_RETUNE_ENABLED',
+  'RV_EXIT_RETUNE_CONFIRM_BARS',
 ] as const;
 
 export const DEMO_FLAGS_FILENAME = 'demo-flags.json';

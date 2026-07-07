@@ -132,3 +132,43 @@ export function resolveOtmDeltaFloor(env: NodeJS.ProcessEnv = process.env): numb
   }
   return OTM_DELTA_FLOOR_DEFAULT;
 }
+
+// TRA-1409 (parent TRA-1406 "less noise, more quality") — the RV single_leg exit
+// re-tune: require a CONFIRMED N-bar Supertrend flip before the structural
+// `supertrend_flip` exit fires (QuantTrader variant (a), N=2 — decision
+// TRA-1415). The 07-06 demo journal showed the single-bar supertrend_flip is the
+// scratch driver (202 exits, 97% scratch, +$318) vs the ma20_close_through winner
+// exit (80 exits, +$2,453); requiring 2 consecutive flipped bars drops whipsaws
+// so winners survive to the MA20 cross. A STANDALONE flag (NOT under the
+// EXIT_RISK_RULES master): the signal-engine consults it ONLY on the
+// `mode === 'demo'` RV branch, so it is structurally incapable of altering a live
+// option exit — matching the OTM_DELTA_FLOOR / TAKE_PROFIT_EARLY containment. It
+// only ever makes the STRUCTURAL flip fire LESS, never suppresses/loosens/delays
+// a risk-side exit (chandelier / give-back / hard SL run in their own block and
+// keep precedence). OFF by default; the board flips it via demo-flags.json after
+// QuantTrader's forward-validation (no PM2/admin). Accepts 1/true/yes/on.
+export const RV_EXIT_RETUNE_FLAG = 'RV_EXIT_RETUNE_ENABLED';
+/** Numeric override of the confirm-bars count (default 2, the QuantTrader pick). */
+export const RV_EXIT_RETUNE_CONFIRM_BARS_VALUE = 'RV_EXIT_RETUNE_CONFIRM_BARS';
+export const RV_EXIT_RETUNE_CONFIRM_BARS_DEFAULT = 2;
+
+/** True iff the RV exit re-tune is enabled (standalone; accepts 1/true/yes/on). */
+export function isRvExitRetuneEnabled(env: NodeJS.ProcessEnv = process.env): boolean {
+  return flagOn(env[RV_EXIT_RETUNE_FLAG]);
+}
+
+/**
+ * Resolve the effective RV Supertrend-flip confirm-bars count. Reads the optional
+ * integer `RV_EXIT_RETUNE_CONFIRM_BARS` override (clamped to a sane [1,10]),
+ * falling back to {@link RV_EXIT_RETUNE_CONFIRM_BARS_DEFAULT}. A malformed or
+ * out-of-range value falls back to the default rather than silently disabling the
+ * confirmation.
+ */
+export function resolveRvExitConfirmBars(env: NodeJS.ProcessEnv = process.env): number {
+  const raw = env[RV_EXIT_RETUNE_CONFIRM_BARS_VALUE];
+  if (typeof raw === 'string' && raw.trim() !== '') {
+    const parsed = Number(raw);
+    if (Number.isInteger(parsed) && parsed >= 1 && parsed <= 10) return parsed;
+  }
+  return RV_EXIT_RETUNE_CONFIRM_BARS_DEFAULT;
+}

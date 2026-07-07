@@ -206,6 +206,15 @@ export function optionTypeForSide(side: Side): OptionType {
 export interface ExitParams {
   /** Exit when Supertrend flips against the position. Default true. */
   supertrendFlipExit: boolean;
+  /**
+   * TRA-1409 — number of CONSECUTIVE bars the Supertrend must be flipped against
+   * the position before the `supertrend_flip` exit fires. Default 1 (legacy
+   * single-bar flip). Set >1 (RV demo sleeve = 2) to cut single-bar whipsaw
+   * scratches so winners survive to `ma20_close_through`. Only tightens when
+   * {@link ExitState.recentSupertrendDirections} is supplied; absent/short
+   * history holds the flip exit (conservative) rather than firing on one bar.
+   */
+  supertrendFlipConfirmBars?: number;
   /** Exit when the underlying closes through its MA20. Default true. */
   ma20CloseThroughExit: boolean;
   /** Premium stop as a fraction of entry premium (default -0.50 = -50%). */
@@ -218,6 +227,7 @@ export interface ExitParams {
 
 export const DEFAULT_EXIT_PARAMS: ExitParams = {
   supertrendFlipExit: true,
+  supertrendFlipConfirmBars: 1,
   ma20CloseThroughExit: true,
   premiumStopPct: -0.5,
   premiumTakeProfitPct: 1.0,
@@ -236,6 +246,14 @@ export interface ExitState {
   side: Side;
   /** Current Supertrend direction on the signal timeframe. */
   supertrendDirection: 'green' | 'red';
+  /**
+   * TRA-1409 — the last N Supertrend directions, MOST-RECENT-LAST (the final
+   * element is this bar's direction, equal to {@link supertrendDirection}). Used
+   * by {@link ExitParams.supertrendFlipConfirmBars} to require a multi-bar
+   * confirmed flip. Optional: when absent the exit falls back to the legacy
+   * single-bar behaviour.
+   */
+  recentSupertrendDirections?: readonly ('green' | 'red')[];
   /** Underlying close this bar. */
   underlyingClose: number;
   /** Underlying MA20 this bar. */
@@ -268,8 +286,27 @@ export function evaluateExit(state: ExitState, params: ExitParams = DEFAULT_EXIT
 
   // Structure-based exits.
   if (params.supertrendFlipExit) {
-    const flipped = state.side === 'buy' ? state.supertrendDirection === 'red' : state.supertrendDirection === 'green';
-    if (flipped) return 'supertrend_flip';
+    const flippedDir = state.side === 'buy' ? 'red' : 'green';
+    const flipped = state.supertrendDirection === flippedDir;
+    if (flipped) {
+      // TRA-1409 — optional N-bar confirmation. With supertrendFlipConfirmBars>1
+      // the flip must persist for that many consecutive bars against the position
+      // before it exits (cuts single-bar whipsaw scratches on the RV sleeve).
+      // N<=1 (the global default) keeps the legacy single-bar exit. When N>1 but
+      // no `recentSupertrendDirections` history is available, we HOLD the flip
+      // exit rather than fire on one bar — the other structural/time exits below
+      // still apply, and the risk-side stops are unaffected.
+      const confirmBars = params.supertrendFlipConfirmBars ?? 1;
+      if (confirmBars <= 1) return 'supertrend_flip';
+      const recent = state.recentSupertrendDirections;
+      if (
+        recent !== undefined &&
+        recent.length >= confirmBars &&
+        recent.slice(-confirmBars).every(d => d === flippedDir)
+      ) {
+        return 'supertrend_flip';
+      }
+    }
   }
   if (params.ma20CloseThroughExit) {
     const through = state.side === 'buy' ? state.underlyingClose < state.ma20 : state.underlyingClose > state.ma20;
