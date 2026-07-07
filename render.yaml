@@ -462,6 +462,32 @@ services:
       # separate board decision. Accepts 1/true/yes/on.
       - key: CRYPTO_REGIME_TSMOM_DEMO_ROUTE_ENABLED
         value: "1"
+      # TRA-1409 (parent TRA-1406 "less noise, more quality", board confirmation
+      # `1752d235` = accepted) — arm the RV single_leg EXIT RE-TUNE on the DEMO
+      # book: require a CONFIRMED N-bar Supertrend flip (QuantTrader variant (a),
+      # N=2 — decision TRA-1415) before the structural `supertrend_flip` exit
+      # fires, so RV winners survive to the `ma20_close_through` cross instead of
+      # being chopped to breakeven by single-bar whipsaws (07-06 demo journal:
+      # supertrend_flip = 202 exits / 97% scratch / +$318, vs ma20_close_through =
+      # 80 exits / +$2,453). STANDALONE flag, deliberately NOT under the master
+      # EXIT_RISK_RULES_ENABLED (above): the signal-engine consults it ONLY on the
+      # `mode === 'demo'` RV exit branch (signal-engine.ts `rvExitParams`), so
+      # setting it here can NEVER alter a live option exit, and it only ever makes
+      # the structural flip fire LESS — the risk-side chandelier / give-back /
+      # hard-SL exits keep precedence unchanged. `RV_EXIT_RETUNE_CONFIRM_BARS`
+      # pins N=2 (the validated variant; code default is also 2). QuantTrader
+      # forward-validates >=100 post-arm RV closes via `GET /api/health/option-journal`
+      # (`byStructure.single_leg_rv` / `byExitReason.supertrend_flip`) against the
+      # locked 744-close / +0.0243 avgR baseline (daily routine `6213da0a`). The
+      # option-journal is DATA_DIR-persisted (`option-trade-journal.jsonl`), so
+      # this redeploy preserves that baseline. Revert = clear this value + redeploy.
+      # NOTE: blueprint sync ≠ autoDeploy on bqb1 (TRA-1289) — a redeploy (which a
+      # push to main triggers via autoDeploy, or the DATA_DIR/demo-flags.json
+      # override) is needed for this var to take effect. Accepts 1/true/yes/on.
+      - key: RV_EXIT_RETUNE_ENABLED
+        value: "true"
+      - key: RV_EXIT_RETUNE_CONFIRM_BARS
+        value: "2"
       # TRA-1080 — event-loop/heap starvation watchdog. The watchdog itself is
       # ON by default in code (no env needed); these knobs are declared
       # `sync: false` so an operator can DISABLE or RETUNE it from the dashboard
