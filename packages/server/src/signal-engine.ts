@@ -6548,6 +6548,16 @@ export class SignalEngine {
     // ── OFF gate — INERT until an operator arms the live add path in live mode. ──
     if (this.mode !== 'live' || !this.liveEquityDcaAddsEnabled) return;
     if (!this.tradierLiveEquityClient) return;
+    // ── Sandbox-first (TRA-1439): this pass submits REAL Tradier add-orders, so
+    // until the production flip clears its own gates (TRA-382 live-equity OFF +
+    // CFO soak TRA-1393) it is HARD-restricted to the SANDBOX env — zero real
+    // capital. A production-env book (`liveTradierEnvOptions='production'`)
+    // no-ops here regardless of the arm flag; promoting to production is a
+    // separate, gated follow-up ({@link LIVE_EQUITY_DCA_PRODUCTION_ENABLED}) and
+    // is never reachable by flipping `liveEquityDcaAddsTradier` alone. The env
+    // here mirrors the equity client's env (both derive from
+    // `resolveTradierOptionsCreds(settings).env`).
+    if (!liveEquityDcaAddEnvAllowed(this.tradierEnv)) return;
     const live = Array.from(this.liveEquityPositions.values());
     if (live.length === 0) return;
 
@@ -10442,6 +10452,30 @@ export function shortBlockedOnCashAccount(
   balance: Pick<TradierAccountBalance, 'accountType'>,
 ): boolean {
   return side === 'sell' && balance.accountType === 'cash';
+}
+
+/**
+ * TRA-1439 — PRODUCTION-env gate for the LIVE conviction-DCA equity add path.
+ * The add path submits REAL broker orders, so it is HARD-restricted to the
+ * Tradier SANDBOX env (zero real capital) for evidence accrual. Promoting the
+ * add path to a PRODUCTION Tradier book is a separate, deliberately gated
+ * follow-up that stays blocked on TRA-382 (live equity OFF) + CFO soak
+ * TRA-1393; until that lands this constant is `false`, so a production-env book
+ * no-ops in {@link SignalEngine.evaluateLiveConvictionDcaAdds} regardless of the
+ * `liveEquityDcaAddsTradier` arm flag. Enabling production is NEVER reachable by
+ * flipping the arm flag alone.
+ */
+const LIVE_EQUITY_DCA_PRODUCTION_ENABLED = false;
+
+/**
+ * TRA-1439 — is the LIVE conviction-DCA equity add path permitted to submit
+ * broker add-orders on `env`? Sandbox-only (zero real capital) until the
+ * production gate opens ({@link LIVE_EQUITY_DCA_PRODUCTION_ENABLED}, blocked on
+ * TRA-382 + CFO soak TRA-1393). Pure + exported so the sandbox-first invariant
+ * is unit-testable without standing up the engine.
+ */
+export function liveEquityDcaAddEnvAllowed(env: TradierEnv): boolean {
+  return env === 'sandbox' || LIVE_EQUITY_DCA_PRODUCTION_ENABLED;
 }
 
 /**

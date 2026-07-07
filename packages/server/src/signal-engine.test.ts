@@ -14,7 +14,7 @@ import { fetchDailyCandles, fetchTradierDailyCandles } from './yahoo-feed.js';
 import { tmpdir } from 'os';
 import { join } from 'path';
 import { rmSync, writeFileSync } from 'fs';
-import { SignalEngine, sizeLiveEquityFromStop, shortBlockedOnCashAccount, isOccOptionSymbol, gateSignalOnReview, describeGatedStrategies, shouldBootArmLiveEquity, shouldBootArmLiveCrypto, shouldRunRelativeValueScan, shouldRunOtmScan, isLiveBrokerOperator, resolveLiveBrokerOperator, activeOptionsDailyLimit, activeEquityDailyLimit, _resetSharedShadowForTests, _sharedShadowRefreshDue, _claimSharedShadowRefresh, _endSharedShadowRefresh, _sharedShadowEvalDue, _claimSharedShadowEval } from './signal-engine.js';
+import { SignalEngine, sizeLiveEquityFromStop, shortBlockedOnCashAccount, isOccOptionSymbol, liveEquityDcaAddEnvAllowed, gateSignalOnReview, describeGatedStrategies, shouldBootArmLiveEquity, shouldBootArmLiveCrypto, shouldRunRelativeValueScan, shouldRunOtmScan, isLiveBrokerOperator, resolveLiveBrokerOperator, activeOptionsDailyLimit, activeEquityDailyLimit, _resetSharedShadowForTests, _sharedShadowRefreshDue, _claimSharedShadowRefresh, _endSharedShadowRefresh, _sharedShadowEvalDue, _claimSharedShadowEval } from './signal-engine.js';
 import { setShadowLedgerFileForTests } from './shadow-signal-ledger.js';
 import {
   setReversalShadowLedgerFileForTests,
@@ -1463,6 +1463,18 @@ describe('isOccOptionSymbol (TRA-1305 — options hard-exclude, checklist item 4
   it('is null/undefined safe', () => {
     expect(isOccOptionSymbol('')).toBe(false);
     expect(isOccOptionSymbol(undefined as unknown as string)).toBe(false);
+  });
+});
+
+describe('liveEquityDcaAddEnvAllowed (TRA-1439 — sandbox-first hard gate)', () => {
+  it('permits the live conviction-DCA add path on the SANDBOX env (zero real capital)', () => {
+    expect(liveEquityDcaAddEnvAllowed('sandbox')).toBe(true);
+  });
+  it('refuses the add path on a PRODUCTION env until the gate opens (TRA-382 + CFO soak TRA-1393)', () => {
+    // Belt-and-suspenders: production live-equity is separately OFF and the arm
+    // flag defaults false, but this guarantees flipping `liveEquityDcaAddsTradier`
+    // alone can NEVER reach a production broker submission from the add path.
+    expect(liveEquityDcaAddEnvAllowed('production')).toBe(false);
   });
 });
 
