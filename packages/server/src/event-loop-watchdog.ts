@@ -80,6 +80,18 @@ export interface PersistedTrip {
   heapUsedMB: number;
   heapLimitMB: number;
   rssMB: number;
+  /**
+   * TRA-1463 — off-heap attribution at the moment of an `rss` trip. `external` is
+   * Buffers/ArrayBuffers + other C++ objects bound to JS (this is where undici's
+   * unconsumed HTTP response bodies from the crypto fan-out land); `arrayBuffers`
+   * is the ArrayBuffer/SharedArrayBuffer slice of that. A `rss` trip with `external`
+   * near the RSS ceiling ⇒ retained response-body Buffers (fix: abort/cancel the
+   * body on ALL providers, not just Coinbase). A `rss` trip with a small `external`
+   * but a huge `rss` ⇒ native/malloc-arena fragmentation (fix: allocator tuning,
+   * e.g. MALLOC_ARENA_MAX). Optional so pre-existing trip files stay readable.
+   */
+  externalMB?: number;
+  arrayBuffersMB?: number;
   lagMeanMs: number;
   lagMaxMs: number;
 }
@@ -283,6 +295,16 @@ export interface WatchdogSample {
   lagMaxMs: number;
   /** TRA-1374 — resident set size (bytes) from `process.memoryUsage().rss`. */
   rssBytes: number;
+  /**
+   * TRA-1463 — off-heap breakdown from `process.memoryUsage()`. `externalBytes`
+   * is native memory bound to JS (Buffers/ArrayBuffers — where undici's
+   * unconsumed HTTP response bodies live); `arrayBuffersBytes` is the
+   * ArrayBuffer/SharedArrayBuffer slice of it. Used to attribute an `rss` trip
+   * to retained response buffers vs native fragmentation. Optional so custom
+   * `readHeap` test seams that don't provide them still typecheck (default 0).
+   */
+  externalBytes?: number;
+  arrayBuffersBytes?: number;
 }
 
 /** Mutable breach counters carried between samples. */
@@ -318,12 +340,22 @@ export function evaluateSample(
   // The native-memory burst that drives 137 lives outside the V8 heap, so the
   // `heapPct` trip below is blind to it; this is the only trip that sees it.
   if (cfg.rssMaxBytes > 0 && sample.rssBytes >= cfg.rssMaxBytes) {
+    // TRA-1463 — inline off-heap attribution so the breadcrumb `detail` alone
+    // separates the two rss failure modes: a large `ext` (external ≈ retained
+    // undici response-body Buffers from the crypto fan-out) points the fix at
+    // aborting/cancelling bodies on ALL providers; a small `ext` under a large
+    // rss points at native/malloc-arena fragmentation instead.
+    const extStr =
+      sample.externalBytes != null
+        ? `, ext ${(sample.externalBytes / 1e6).toFixed(0)}MB` +
+          (sample.arrayBuffersBytes != null ? ` (arrayBuffers ${(sample.arrayBuffersBytes / 1e6).toFixed(0)}MB)` : '')
+        : '';
     return {
       trip: true,
       reason: 'rss',
       detail:
         `RSS ${(sample.rssBytes / 1e6).toFixed(0)}MB >= ${(cfg.rssMaxBytes / 1e6).toFixed(0)}MB ceiling ` +
-        `(heap ${(sample.heapUsedBytes / 1e6).toFixed(0)}MB / ${(sample.heapLimitBytes / 1e6).toFixed(0)}MB) — ` +
+        `(heap ${(sample.heapUsedBytes / 1e6).toFixed(0)}MB / ${(sample.heapLimitBytes / 1e6).toFixed(0)}MB${extStr}) — ` +
         `native/external memory burst approaching the container limit, self-restarting before the cgroup OOM-137`,
     };
   }
@@ -381,6 +413,18 @@ export interface WatchdogStatus {
    */
   peakSinceBoot: { lagMaxMs: number; lagMeanMs: number; atMs: number } | null;
   /**
+   * TRA-1463 — steady-state RSS/off-heap high-water mark since boot. A single
+   * `lastSample` poll only shows the instantaneous RSS, so it cannot tell a slow
+   * off-heap leak apart from a healthy sawtooth (RSS that rises then GCs back).
+   * This running peak makes the session's worst RSS — and its `external` /
+   * `arrayBuffers` attribution — observable from ONE poll, so the ~85-min cycle
+   * can be classified as slow-leak (peak climbs monotonically toward the ceiling
+   * across the session) vs acute-burst (peak stays low until a single heavy tick)
+   * BEFORE the trip, without Render logs. Null until the first steady-state
+   * sample. Warmup samples excluded so the boot ramp never sets the peak.
+   */
+  peakRssSinceBoot: { rssBytes: number; externalBytes?: number; arrayBuffersBytes?: number; atMs: number } | null;
+  /**
    * Ring of the most recent steady-state samples whose `lagMaxMs` cleared the
    * high-lag record threshold, newest last. Gives the distribution of heavy
    * ticks over a session without needing Render logs (which only record trips).
@@ -417,7 +461,7 @@ export interface StartWatchdogOptions {
    */
   onTrip?: (decision: TripDecision, sample: WatchdogSample) => void;
   /** Heap reader seam (defaults to V8 + process.memoryUsage). */
-  readHeap?: () => { usedBytes: number; limitBytes: number; rssBytes: number };
+  readHeap?: () => { usedBytes: number; limitBytes: number; rssBytes: number; externalBytes?: number; arrayBuffersBytes?: number };
   /** Clock seam for the boot-grace window (defaults to Date.now). */
   now?: () => number;
 }
@@ -429,14 +473,20 @@ export function getWatchdogStatus(): WatchdogStatus | null {
   return lastStatus;
 }
 
-function defaultReadHeap(): { usedBytes: number; limitBytes: number; rssBytes: number } {
+function defaultReadHeap(): { usedBytes: number; limitBytes: number; rssBytes: number; externalBytes: number; arrayBuffersBytes: number } {
   const heap = getHeapStatistics();
+  // TRA-1374 — RSS is the number the cgroup OOM-killer watches; read it here so
+  // the acute RSS trip sees the native/external memory the V8 heap stats miss.
+  // TRA-1463 — same single memoryUsage() call also yields the off-heap breakdown
+  // (external / arrayBuffers) used to attribute an rss trip to retained response
+  // buffers vs native fragmentation.
+  const mem = process.memoryUsage();
   return {
     usedBytes: heap.used_heap_size,
     limitBytes: heap.heap_size_limit,
-    // TRA-1374 — RSS is the number the cgroup OOM-killer watches; read it here so
-    // the acute RSS trip sees the native/external memory the V8 heap stats miss.
-    rssBytes: process.memoryUsage().rss,
+    rssBytes: mem.rss,
+    externalBytes: mem.external,
+    arrayBuffersBytes: mem.arrayBuffers,
   };
 }
 
@@ -513,6 +563,7 @@ export function startEventLoopWatchdog(opts: StartWatchdogOptions = {}): Watchdo
   const HIGH_LAG_RECORD_MS = 1_000;
   const HIGH_LAG_RING_MAX = 32;
   let peakSinceBoot: { lagMaxMs: number; lagMeanMs: number; atMs: number } | null = null;
+  let peakRssSinceBoot: { rssBytes: number; externalBytes?: number; arrayBuffersBytes?: number; atMs: number } | null = null;
   const recentHighLag: Array<{ lagMaxMs: number; lagMeanMs: number; atMs: number }> = [];
 
   function publish(sample: WatchdogSample): void {
@@ -522,6 +573,16 @@ export function startEventLoopWatchdog(opts: StartWatchdogOptions = {}): Watchdo
     if (now() - startedAtMs >= cfg.bootGraceMs) {
       if (!peakSinceBoot || sample.lagMaxMs > peakSinceBoot.lagMaxMs) {
         peakSinceBoot = { lagMaxMs: sample.lagMaxMs, lagMeanMs: sample.lagMeanMs, atMs };
+      }
+      // TRA-1463 — RSS high-water mark (with off-heap attribution) so one poll
+      // reveals whether RSS is trending toward the ceiling across the session.
+      if (!peakRssSinceBoot || sample.rssBytes > peakRssSinceBoot.rssBytes) {
+        peakRssSinceBoot = {
+          rssBytes: sample.rssBytes,
+          externalBytes: sample.externalBytes,
+          arrayBuffersBytes: sample.arrayBuffersBytes,
+          atMs,
+        };
       }
       if (sample.lagMaxMs >= HIGH_LAG_RECORD_MS) {
         recentHighLag.push({ lagMaxMs: sample.lagMaxMs, lagMeanMs: sample.lagMeanMs, atMs });
@@ -534,6 +595,7 @@ export function startEventLoopWatchdog(opts: StartWatchdogOptions = {}): Watchdo
       config: { sampleMs: cfg.sampleMs, heapPct: cfg.heapPct, lagMs: cfg.lagMs, breachSamples: cfg.breachSamples, lagMaxMs: cfg.lagMaxMs, bootGraceMs: cfg.bootGraceMs, rssMaxBytes: cfg.rssMaxBytes },
       lastSample: { ...sample, atMs },
       peakSinceBoot,
+      peakRssSinceBoot,
       recentHighLag: recentHighLag.slice(),
       consecutiveHeapBreaches: state.consecutiveHeapBreaches,
       consecutiveLagBreaches: state.consecutiveLagBreaches,
@@ -558,6 +620,8 @@ export function startEventLoopWatchdog(opts: StartWatchdogOptions = {}): Watchdo
       lagMeanMs: Number.isFinite(lagMeanMs) ? lagMeanMs : 0,
       lagMaxMs: Number.isFinite(lagMaxMs) ? lagMaxMs : 0,
       rssBytes: heap.rssBytes,
+      externalBytes: heap.externalBytes,
+      arrayBuffersBytes: heap.arrayBuffersBytes,
     };
 
     const decision = evaluateSample(sample, state, cfg);
@@ -611,6 +675,8 @@ export function startEventLoopWatchdog(opts: StartWatchdogOptions = {}): Watchdo
             heapUsedMB: Math.round(sample.heapUsedBytes / 1e6),
             heapLimitMB: Math.round(sample.heapLimitBytes / 1e6),
             rssMB: Math.round(sample.rssBytes / 1e6),
+            externalMB: sample.externalBytes != null ? Math.round(sample.externalBytes / 1e6) : undefined,
+            arrayBuffersMB: sample.arrayBuffersBytes != null ? Math.round(sample.arrayBuffersBytes / 1e6) : undefined,
             lagMeanMs: Math.round(sample.lagMeanMs),
             lagMaxMs: Math.round(sample.lagMaxMs),
           },
@@ -657,6 +723,7 @@ export function startEventLoopWatchdog(opts: StartWatchdogOptions = {}): Watchdo
           config: { sampleMs: cfg.sampleMs, heapPct: cfg.heapPct, lagMs: cfg.lagMs, breachSamples: cfg.breachSamples, lagMaxMs: cfg.lagMaxMs, bootGraceMs: cfg.bootGraceMs, rssMaxBytes: cfg.rssMaxBytes },
           lastSample: null,
           peakSinceBoot: null,
+          peakRssSinceBoot: null,
           recentHighLag: [],
           consecutiveHeapBreaches: 0,
           consecutiveLagBreaches: 0,
