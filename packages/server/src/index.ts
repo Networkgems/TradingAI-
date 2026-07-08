@@ -46,7 +46,12 @@ import {
 // operator/agent flip ENABLE_AUTONOMOUS_DEMO_LOOP via <DATA_DIR>/demo-flags.json
 // on a host where the SYSTEM-owned PM2 daemon is unreachable (no dotenv loader,
 // env lives only in the saved process env). Secrets are never read from it.
-import { resolveDemoFlagEnv } from './demo-flags.js';
+import {
+  resolveDemoFlagEnv,
+  loadDemoFlagFile,
+  writeDemoFlagFile,
+  DEMO_FLAG_ALLOWLIST,
+} from './demo-flags.js';
 // TRA-1216 — observe-only perp funding-carry scanner + forward funding-history
 // accrual. Flag-checked before any fetch so ENABLE_PERP_FUNDING_CARRY_OBSERVE
 // off ⇒ zero cost/IO. Read-only: no order/entry/sizing path.
@@ -4116,6 +4121,64 @@ app.post('/api/admin/restart', requireAuth, requireAdmin, (req, res) => {
   setTimeout(() => {
     void gracefulShutdown('admin-restart');
   }, 250).unref?.();
+});
+
+// TRA-1481 (parent TRA-1408) — admin-only read/write of the allowlisted
+// <DATA_DIR>/demo-flags.json overlay over HTTP. WHY: on bqb1 (Render) a
+// render.yaml env addition stays DARK until a MANUAL blueprint sync — a plain
+// code autoDeploy does NOT re-sync env, and a non-admin agent has neither the
+// Render API key (TRA-969, blocked) nor a shell to write /data. That is exactly
+// how ENABLE_CHURN_LOSS_BRAKE=1 shipped "merged" (render.yaml) yet ran
+// `armed:false`. This surface closes that gap daemon-free: an admin flips any
+// allowlisted DEMO flag on the RUNNING process and the engine picks it up on the
+// next tick (demo-flags.json is re-read per resolve). STRICTLY bounded — the
+// write path only ever honours DEMO_FLAG_ALLOWLIST keys (secrets / non-demo /
+// live settings are rejected, never written), so it cannot inject a secret or
+// alter a live-capital setting. Admin-gated + audit-logged like /admin/restart.
+app.get('/api/admin/demo-flags', requireAuth, requireAdmin, (_req, res) => {
+  res.json({
+    ok: true,
+    dataDir: DATA_DIR,
+    // Current on-disk overlay (allowlisted keys only) …
+    flags: loadDemoFlagFile(DATA_DIR),
+    // … and the keys an admin is permitted to set here.
+    allowlist: [...DEMO_FLAG_ALLOWLIST],
+  });
+});
+
+app.post('/api/admin/demo-flags', requireAuth, requireAdmin, (req, res) => {
+  const authUser = res.locals['authUser'] as string;
+  const body = req.body as { flags?: unknown } | undefined;
+  const raw = body?.flags;
+  if (raw == null || typeof raw !== 'object' || Array.isArray(raw)) {
+    res
+      .status(400)
+      .json({ error: 'Body must be { flags: { KEY: value|null, … } }' });
+    return;
+  }
+  // Coerce to the accepted value shape; a null removes the key (revert to
+  // env/default), a string|number|boolean sets it. Anything else is dropped so
+  // the write helper never sees an object/array value.
+  const updates: Record<string, string | number | boolean | null> = {};
+  for (const [key, value] of Object.entries(raw as Record<string, unknown>)) {
+    if (
+      value === null ||
+      typeof value === 'string' ||
+      typeof value === 'number' ||
+      typeof value === 'boolean'
+    ) {
+      updates[key] = value;
+    }
+  }
+  const result = writeDemoFlagFile(DATA_DIR, updates);
+  // Audit the mutation with the requesting user (parity with /admin/restart).
+  log.warn('TRA-1481 admin demo-flags write', {
+    user: authUser,
+    applied: result.applied,
+    removed: result.removed,
+    rejected: result.rejected,
+  });
+  res.json({ ok: true, dataDir: DATA_DIR, ...result });
 });
 
 // ── News + research merge (TRA-227) ──────────────────────────────────────────

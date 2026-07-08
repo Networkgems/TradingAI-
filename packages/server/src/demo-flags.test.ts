@@ -12,6 +12,7 @@ import { join } from 'path';
 import {
   loadDemoFlagFile,
   resolveDemoFlagEnv,
+  writeDemoFlagFile,
   DEMO_FLAGS_FILENAME,
 } from './demo-flags.js';
 import { isAutonomousDemoLoopEnabled } from './autonomous-demo-loop.js';
@@ -83,6 +84,53 @@ describe('loadDemoFlagFile', () => {
       OPTION_DIRECTIONAL_MIN_AVG_DOLLAR_VOLUME: '300000',
       OPTION_DIRECTIONAL_MAX_OPENS_PER_NAME: '2',
     });
+  });
+});
+
+describe('writeDemoFlagFile (TRA-1481 — arm a demo flag on a shell-less running service)', () => {
+  it('creates the file and sets an allowlisted arm flag (round-trips through loadDemoFlagFile)', () => {
+    const r = writeDemoFlagFile(dir, { ENABLE_CHURN_LOSS_BRAKE: '1', CHURN_SAME_SESSION_OPEN_CAP: 3 });
+    expect(r.applied.sort()).toEqual(['CHURN_SAME_SESSION_OPEN_CAP', 'ENABLE_CHURN_LOSS_BRAKE']);
+    expect(r.rejected).toEqual([]);
+    expect(loadDemoFlagFile(dir)).toEqual({
+      ENABLE_CHURN_LOSS_BRAKE: '1',
+      CHURN_SAME_SESSION_OPEN_CAP: '3',
+    });
+  });
+
+  it('read-merge-write: preserves keys the caller does not mention', () => {
+    writeDemoFlagFile(dir, { ENABLE_AUTONOMOUS_DEMO_LOOP: '1' });
+    writeDemoFlagFile(dir, { ENABLE_CHURN_LOSS_BRAKE: '1' });
+    expect(loadDemoFlagFile(dir)).toEqual({
+      ENABLE_AUTONOMOUS_DEMO_LOOP: '1',
+      ENABLE_CHURN_LOSS_BRAKE: '1',
+    });
+  });
+
+  it('a null value REMOVES a key (revert to env/default)', () => {
+    writeDemoFlagFile(dir, { ENABLE_CHURN_LOSS_BRAKE: '1', ENABLE_AUTONOMOUS_DEMO_LOOP: '1' });
+    const r = writeDemoFlagFile(dir, { ENABLE_CHURN_LOSS_BRAKE: null });
+    expect(r.removed).toEqual(['ENABLE_CHURN_LOSS_BRAKE']);
+    expect(loadDemoFlagFile(dir)).toEqual({ ENABLE_AUTONOMOUS_DEMO_LOOP: '1' });
+  });
+
+  it('REJECTS non-allowlisted keys (a secret / live setting is never written)', () => {
+    const r = writeDemoFlagFile(dir, {
+      ENABLE_CHURN_LOSS_BRAKE: '1',
+      ADMIN_PASSWORD: 'leak',
+      TRADIER_ENV: 'production',
+    });
+    expect(r.applied).toEqual(['ENABLE_CHURN_LOSS_BRAKE']);
+    expect(r.rejected.sort()).toEqual(['ADMIN_PASSWORD', 'TRADIER_ENV']);
+    // The file only ever contains the allowlisted key.
+    expect(loadDemoFlagFile(dir)).toEqual({ ENABLE_CHURN_LOSS_BRAKE: '1' });
+  });
+
+  it('end-to-end: a write arms the flag through resolveDemoFlagEnv with no env var set', () => {
+    const base = {} as NodeJS.ProcessEnv;
+    expect(resolveDemoFlagEnv(dir, base)['ENABLE_CHURN_LOSS_BRAKE']).toBeUndefined();
+    writeDemoFlagFile(dir, { ENABLE_CHURN_LOSS_BRAKE: '1' });
+    expect(resolveDemoFlagEnv(dir, base)['ENABLE_CHURN_LOSS_BRAKE']).toBe('1');
   });
 });
 

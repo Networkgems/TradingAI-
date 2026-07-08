@@ -19,7 +19,7 @@
 // file is read on each resolve, so a flip is picked up on the next tick without
 // any PM2 / SYSTEM elevation (and survives a non-admin `redeploy --no-build`).
 
-import { readFileSync } from 'fs';
+import { readFileSync, writeFileSync, mkdirSync } from 'fs';
 import { join } from 'path';
 
 /**
@@ -220,4 +220,62 @@ export function resolveDemoFlagEnv(
   const file = loadDemoFlagFile(dataDir);
   if (Object.keys(file).length === 0) return baseEnv;
   return { ...baseEnv, ...file };
+}
+
+/**
+ * Result of a {@link writeDemoFlagFile} call: the resulting on-disk map plus a
+ * per-key disposition so the caller can audit-log exactly what changed.
+ */
+export interface WriteDemoFlagResult {
+  /** The full demo-flags.json map after the merge (allowlisted keys only). */
+  flags: Record<string, string>;
+  /** Keys set/updated to a value. */
+  applied: string[];
+  /** Keys removed (revert to process.env / code default). */
+  removed: string[];
+  /** Keys ignored because they are NOT on the allowlist (never written). */
+  rejected: string[];
+}
+
+/**
+ * TRA-1481 — merge `updates` into `<dataDir>/demo-flags.json` and write it back,
+ * so a NON-secret DEMO flag can be armed on a RUNNING service that has no shell
+ * and no PM2/blueprint access (the bqb1/Render gap: render.yaml env additions
+ * stay DARK until a MANUAL Render blueprint sync, which a non-admin agent cannot
+ * trigger — while a code autoDeploy does NOT re-sync env). This is the HTTP-side
+ * mirror of the file the self-hosted operator edits by hand.
+ *
+ * Read-merge-write: keys the caller does not mention are preserved. A key whose
+ * value is `null` is REMOVED (so a flag can be reverted to its env/default). The
+ * merge is STRICTLY allowlist-bounded — a non-allowlisted key (any secret, any
+ * non-demo setting) is IGNORED and returned in `rejected`, never written — so
+ * this path is structurally incapable of injecting a secret or touching a live
+ * setting. Values are coerced to strings so the file round-trips through
+ * {@link loadDemoFlagFile}. Throws only when `dataDir` is unwritable.
+ */
+export function writeDemoFlagFile(
+  dataDir: string,
+  updates: Record<string, string | number | boolean | null>,
+): WriteDemoFlagResult {
+  const allow = new Set<string>(DEMO_FLAG_ALLOWLIST);
+  const next: Record<string, string> = { ...loadDemoFlagFile(dataDir) };
+  const applied: string[] = [];
+  const removed: string[] = [];
+  const rejected: string[] = [];
+  for (const [key, value] of Object.entries(updates)) {
+    if (!allow.has(key)) {
+      rejected.push(key); // secret / non-demo key — never touch the file for it
+      continue;
+    }
+    if (value === null) {
+      delete next[key];
+      removed.push(key);
+      continue;
+    }
+    next[key] = String(value);
+    applied.push(key);
+  }
+  mkdirSync(dataDir, { recursive: true });
+  writeFileSync(join(dataDir, DEMO_FLAGS_FILENAME), `${JSON.stringify(next, null, 2)}\n`, 'utf8');
+  return { flags: next, applied, removed, rejected };
 }
