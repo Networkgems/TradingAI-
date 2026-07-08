@@ -16,6 +16,7 @@ import { join } from 'path';
 import { rmSync, writeFileSync } from 'fs';
 import { SignalEngine, sizeLiveEquityFromStop, shortBlockedOnCashAccount, isOccOptionSymbol, liveEquityDcaAddEnvAllowed, gateSignalOnReview, describeGatedStrategies, shouldBootArmLiveEquity, shouldBootArmLiveCrypto, shouldRunRelativeValueScan, shouldRunOtmScan, isLiveBrokerOperator, resolveLiveBrokerOperator, activeOptionsDailyLimit, activeEquityDailyLimit, _resetSharedShadowForTests, _sharedShadowRefreshDue, _claimSharedShadowRefresh, _endSharedShadowRefresh, _sharedShadowEvalDue, _claimSharedShadowEval } from './signal-engine.js';
 import { setShadowLedgerFileForTests } from './shadow-signal-ledger.js';
+import { clearDirectionalOpenLedger } from './directional-open-ledger.js';
 import {
   setReversalShadowLedgerFileForTests,
   buildReversalShadowOpen,
@@ -5446,6 +5447,10 @@ describe('SignalEngine — churn + same-day-loss brake (TRA-1408)', () => {
     }
     // Route flag resolution straight through process.env (no demo-flags.json file).
     delete process.env.DATA_DIR;
+    // TRA-1486 — the per-name cap now reads the module-global DURABLE open ledger
+    // (max of in-memory + persisted) so it survives reboots. That store is process-
+    // global, so reset it between cases to keep the per-name counts hermetic.
+    clearDirectionalOpenLedger();
   });
   afterEach(() => {
     for (const [k, v] of Object.entries(savedEnv)) {

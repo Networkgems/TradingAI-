@@ -40,6 +40,13 @@ import { isCryptoIgnitionEnabled, resolveIgnitionWatchlist } from '../crypto-ign
 import { summarizeIgnitionScans } from '../crypto-ignition-scanner.js';
 import { summarizeConvictionDca, resolveConvictionDcaDeployAnchor } from '../conviction-dca-ledger.js';
 import { summarizeChurnBrake } from '../churn-brake-ledger.js';
+import { summarizeDirectionalGate } from '../directional-open-ledger.js';
+import {
+  isDirectionalQualityGateEnabled,
+  resolveDirectionalQualityThresholds,
+  OPTION_DIRECTIONAL_QUALITY_GATE_FLAG,
+} from '../ignition-quality-gate.js';
+import { etDateString } from '../scheduler.js';
 import {
   isChurnLossBrakeEnabled,
   resolveSameSessionOpenCap,
@@ -1101,6 +1108,45 @@ export function registerLiveHealthRoutes(app: Express, deps: LiveHealthDeps): vo
         ? `ARMED (demo-only): rejects the ${cap + 1}th same-session open per name and halts a conviction-DCA add into a same-day net-negative name; live path unchanged.`
         : `DISARMED: set ${CHURN_LOSS_BRAKE_FLAG}=1 (render.yaml env or DATA_DIR/demo-flags.json) to arm on the demo book.`,
       ...summarizeChurnBrake(),
+    });
+  });
+
+  // TRA-1486 (parent TRA-1476) — unauthenticated, secrets-free readout of the demo
+  // directional quality/liquidity gate. The TRA-1485 forward grade could only INFER
+  // the gate's behaviour from `/api/reports/desk` (and found it leaking); this makes
+  // the enforcement deterministic in one read:
+  //   • `armed` + `thresholds` resolved through the SAME effective env the engine
+  //     consults (process.env layered with the DATA_DIR demo-flags.json overlay, file
+  //     wins) — answers "is the gate actually LIVE on the running process?";
+  //   • `openCountsBySymbol` — the DURABLE (reboot-survivable) per-name open counts
+  //     for the CURRENT ET day that the per-name cap consults, so a grader can verify
+  //     "≤ cap opens/name/ET-day for every name" directly (TRA-1486 D2 fix);
+  //   • `opensRejectedByCode` — since-boot rejects split by verdict code
+  //     (min_price / insufficient_liquidity_samples / min_dollar_volume /
+  //     per_name_cap), the direct evidence each floor is biting (incl. the D1 warmup
+  //     fail-closed).
+  // DEMO-ONLY by construction: the engine records here only on the demo directional
+  // chokepoint. No balances/PII — just flag, thresholds, symbol counts, reject codes.
+  app.get('/api/health/directional-quality-gate', (_req, res) => {
+    const dir = process.env.DATA_DIR;
+    const env = dir ? resolveDemoFlagEnv(dir) : process.env;
+    const armed = isDirectionalQualityGateEnabled(env);
+    const thresholds = resolveDirectionalQualityThresholds(env);
+    const etDay = etDateString(new Date(now()));
+    res.json({
+      ok: true,
+      time: new Date(now()).toISOString(),
+      build: resolveBuildInfo(),
+      flag: OPTION_DIRECTIONAL_QUALITY_GATE_FLAG,
+      armed,
+      demoOnly: true,
+      liveCapitalReachable: false,
+      etDay,
+      thresholds,
+      note: armed
+        ? `ARMED (demo-only): rejects a demo directional open below $${thresholds.minUnderlyingPrice} spot / $${thresholds.minAvgDollarVolume} avg $-vol, fails-closed under ${thresholds.minDollarVolumeSamples} real $-vol samples (warmup), and caps ${thresholds.maxOpensPerName} opens/name/ET-day (reboot-durable). Live options path unchanged.`
+        : `DISARMED: set ${OPTION_DIRECTIONAL_QUALITY_GATE_FLAG}=1 (render.yaml env or DATA_DIR/demo-flags.json) with the directional path enabled to arm on the demo book.`,
+      ...summarizeDirectionalGate(etDay),
     });
   });
 

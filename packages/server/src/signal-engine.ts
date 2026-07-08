@@ -68,9 +68,14 @@ import {
 import {
   isDirectionalQualityGateEnabled,
   resolveDirectionalQualityThresholds,
-  averageDollarVolume,
+  dollarVolumeStats,
   directionalQualityVerdict,
 } from './ignition-quality-gate.js';
+import {
+  recordDirectionalOpen,
+  directionalOpensFor,
+  recordDirectionalGateReject,
+} from './directional-open-ledger.js';
 import { isMultiLegOpenPaused } from './multileg-open-pause-flag.js';
 import { isMultiLegExitEnabled } from './multileg-exit-flag.js';
 import { recordConvictionDcaFill } from './conviction-dca-ledger.js';
@@ -3606,9 +3611,9 @@ export class SignalEngine {
     if (this.mode === 'live') return { blocked: false, count: 0, cap: 0 };
     const env = this.resolveDemoFlagEnv();
     if (!isChurnLossBrakeEnabled(env)) return { blocked: false, count: 0, cap: 0 };
-    const etDay = etDateString(new Date(now));
-    const rec = this.churnOpensToday.get(symbol);
-    const count = rec && rec.etDay === etDay ? rec.count : 0;
+    // TRA-1486 D2 — read through `opensTodayFor`, which maxes the in-memory counter
+    // with the reboot-durable JSONL count, so this cap survives a mid-session reboot.
+    const count = this.opensTodayFor(symbol, now);
     const cap = resolveSameSessionOpenCap(env);
     const blocked = count >= cap;
     // TRA-1481 — deterministic telemetry: every caller rejects the open on
@@ -3651,6 +3656,14 @@ export class SignalEngine {
     // `/api/health/churn-brake`'s per-name session counters never drift from the
     // enforcement counter above.
     recordChurnBrakeOpen(symbol, etDay);
+    // TRA-1486 D2 — ALSO write-through to the DURABLE per-name/ET-day ledger. The
+    // in-memory `churnOpensToday` above resets on every reboot, which is exactly why
+    // the per-name cap leaked on bqb1 (multiple reboots/session → count restarted at
+    // 0 → cap never bit). This JSONL survives the reboot, and `opensTodayFor` /
+    // `churnOpenCapVerdict` read the MAX of the two so the cap sees the real
+    // same-ET-day total after a mid-session restart. Demo-only (this method no-ops
+    // on the live path).
+    recordDirectionalOpen(symbol, etDay, now);
   }
 
   /**
@@ -3663,7 +3676,14 @@ export class SignalEngine {
   private opensTodayFor(symbol: string, now = Date.now()): number {
     const etDay = etDateString(new Date(now));
     const rec = this.churnOpensToday.get(symbol);
-    return rec && rec.etDay === etDay ? rec.count : 0;
+    const inMemory = rec && rec.etDay === etDay ? rec.count : 0;
+    // TRA-1486 D2 — take the MAX of the volatile in-memory counter and the durable
+    // JSONL count for this ET day. After a mid-session reboot the in-memory count is
+    // 0 but the durable count holds the real same-day total, so the cap keeps biting
+    // across restarts. The durable ledger never over-counts (one line per recorded
+    // open), so the max can only ever RAISE the count toward the truth, never below.
+    const durable = directionalOpensFor(symbol, etDay);
+    return Math.max(inMemory, durable);
   }
 
   /**
@@ -5473,10 +5493,15 @@ export class SignalEngine {
         // TRA-1408 per-name counter (recorded on a successful open below).
         const dqEnv = this.resolveDemoFlagEnv();
         if (isDirectionalQualityGateEnabled(dqEnv)) {
+          // TRA-1486 D1 — pass the real-bar SAMPLE COUNT alongside the $-volume mean
+          // so the verdict fails-CLOSED during shadow-series warmup instead of
+          // admitting on a 1-bar average (the AMPG leak in the first ~1h after boot).
+          const dv = dollarVolumeStats(series);
           const verdict = directionalQualityVerdict(
             {
               spot,
-              avgDollarVolume: averageDollarVolume(series),
+              avgDollarVolume: dv.avg,
+              dollarVolumeSamples: dv.samples,
               opensToday: this.opensTodayFor(sym, asOf),
             },
             resolveDirectionalQualityThresholds(dqEnv),
@@ -5485,6 +5510,10 @@ export class SignalEngine {
             log.info('demo directional rejected by quality/liquidity gate (TRA-1476)', {
               symbol: sym, code: verdict.code, reason: verdict.reason,
             });
+            // TRA-1486 — count the reject by code so `/api/health/directional-quality-gate`
+            // shows the gate enforcing (a future grade reads it instead of inferring
+            // from the desk report).
+            if (verdict.code !== 'ok') recordDirectionalGateReject(verdict.code, asOf);
             continue;
           }
         }

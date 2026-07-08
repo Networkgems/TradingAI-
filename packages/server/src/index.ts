@@ -124,6 +124,7 @@ import {
 } from './crypto-ignition-scanner.js';
 import { hydrateConvictionDcaFromDisk } from './conviction-dca-ledger.js';
 import { hydrateScaleoutLadderFromDisk } from './scaleout-ladder-ledger.js';
+import { hydrateDirectionalOpensFromDisk } from './directional-open-ledger.js';
 import { fetchCrypto4hBars } from './crypto-feed.js';
 import type { CryptoSignalEngine } from './crypto-engine.js';
 // TRA-1006 — automated pre/post-market analyst agent. Tick fns are flag-checked
@@ -2174,6 +2175,23 @@ async function runHourlyCryptoRegimeTsmom(): Promise<void> {
       fullExitCount: h.fullExitCount,
       positionCount: h.positionCount,
       lastTrimAt: h.lastTrimAt,
+    });
+  }
+}
+
+// TRA-1486 D2 (parent TRA-1476) — hydrate the DURABLE per-name/ET-day directional
+// open ledger and remember DATA_DIR for subsequent appends. This is the fix for the
+// per-name-cap leak: the in-memory `churnOpensToday` counter resets on every reboot
+// (bqb1 restarts multiple times/session), so the cap kept restarting at 0 and never
+// bit. Rebuilding the current-ET-day counts from disk lets the cap survive a
+// mid-session reboot. Best-effort; the ledger is compacted to a short retention
+// window on read so it stays tiny.
+{
+  const h = hydrateDirectionalOpensFromDisk(DATA_DIR);
+  if (h.records > 0) {
+    log.info('directional per-name open ledger hydrated (TRA-1486)', {
+      records: h.records,
+      days: h.days,
     });
   }
 }

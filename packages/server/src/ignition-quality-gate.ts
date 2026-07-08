@@ -40,6 +40,12 @@ export const OPTION_DIRECTIONAL_MIN_UNDERLYING_PRICE_VAR = 'OPTION_DIRECTIONAL_M
 export const OPTION_DIRECTIONAL_MIN_AVG_DOLLAR_VOLUME_VAR = 'OPTION_DIRECTIONAL_MIN_AVG_DOLLAR_VOLUME';
 /** Env override: max NEW directional opens per underlier per ET session. */
 export const OPTION_DIRECTIONAL_MAX_OPENS_PER_NAME_VAR = 'OPTION_DIRECTIONAL_MAX_OPENS_PER_NAME';
+/**
+ * Env override: minimum REAL (non-synthetic) shadow-series bars required before the
+ * $-volume floor is trusted. Below this the verdict FAILS-CLOSED (TRA-1486 D1) —
+ * see {@link OPTION_DIRECTIONAL_MIN_DOLLAR_VOLUME_SAMPLES_DEFAULT}.
+ */
+export const OPTION_DIRECTIONAL_MIN_DOLLAR_VOLUME_SAMPLES_VAR = 'OPTION_DIRECTIONAL_MIN_DOLLAR_VOLUME_SAMPLES';
 
 // PROVISIONAL defaults — QuantTrader confirms on TRA-1476. Sub-$5 names and the
 // per-bar $-volume floor together exclude the AMPG-class micro-cap; the per-name
@@ -47,6 +53,10 @@ export const OPTION_DIRECTIONAL_MAX_OPENS_PER_NAME_VAR = 'OPTION_DIRECTIONAL_MAX
 export const OPTION_DIRECTIONAL_MIN_UNDERLYING_PRICE_DEFAULT = 5;
 export const OPTION_DIRECTIONAL_MIN_AVG_DOLLAR_VOLUME_DEFAULT = 250_000;
 export const OPTION_DIRECTIONAL_MAX_OPENS_PER_NAME_DEFAULT = 3;
+// TRA-1486 D1: a $-volume average over 1–2 warmup bars is not a trustworthy
+// liquidity estimate (one thin print can look liquid, or a real name can look thin).
+// Require ≥3 real bars before the floor is trusted; below that, fail-CLOSED.
+export const OPTION_DIRECTIONAL_MIN_DOLLAR_VOLUME_SAMPLES_DEFAULT = 3;
 
 function flagOn(raw: string | undefined): boolean {
   if (typeof raw !== 'string') return false;
@@ -83,6 +93,8 @@ export interface DirectionalQualityThresholds {
   minAvgDollarVolume: number;
   /** Maximum NEW directional opens per name per ET session. */
   maxOpensPerName: number;
+  /** Minimum real shadow-series bars before the $-volume floor is trusted (fail-closed below). */
+  minDollarVolumeSamples: number;
 }
 
 /**
@@ -104,6 +116,9 @@ export function resolveDirectionalQualityThresholds(
     maxOpensPerName:
       parsePositiveInt(env[OPTION_DIRECTIONAL_MAX_OPENS_PER_NAME_VAR])
       ?? OPTION_DIRECTIONAL_MAX_OPENS_PER_NAME_DEFAULT,
+    minDollarVolumeSamples:
+      parsePositiveInt(env[OPTION_DIRECTIONAL_MIN_DOLLAR_VOLUME_SAMPLES_VAR])
+      ?? OPTION_DIRECTIONAL_MIN_DOLLAR_VOLUME_SAMPLES_DEFAULT,
   };
 }
 
@@ -117,6 +132,24 @@ export function resolveDirectionalQualityThresholds(
  * is clamped to 0 so a bad tick can't inflate the average.
  */
 export function averageDollarVolume(candles: readonly Candle[]): number {
+  return dollarVolumeStats(candles).avg;
+}
+
+export interface DollarVolumeStats {
+  /** Mean close×volume across the real bars (0 when there is no usable bar). */
+  avg: number;
+  /** Count of REAL (non-synthetic, finite, non-negative) bars the mean is over. */
+  samples: number;
+}
+
+/**
+ * Mean per-bar dollar-volume AND the real-bar sample count backing it. The count is
+ * what lets the caller distinguish "liquid name" from "estimate over 1 warmup bar":
+ * a small sample cannot be trusted (one thin print can look liquid, or a real name
+ * can look thin), so {@link directionalQualityVerdict} fails-CLOSED below the
+ * configured sample floor (TRA-1486 D1) rather than admitting on a warmup average.
+ */
+export function dollarVolumeStats(candles: readonly Candle[]): DollarVolumeStats {
   let sum = 0;
   let n = 0;
   for (const c of candles) {
@@ -126,22 +159,24 @@ export function averageDollarVolume(candles: readonly Candle[]): number {
     sum += dv;
     n += 1;
   }
-  return n > 0 ? sum / n : 0;
+  return { avg: n > 0 ? sum / n : 0, samples: n };
 }
 
 export interface DirectionalQualityInput {
   /** Underlier spot at evaluation. */
   spot: number;
-  /** Average per-bar dollar-volume from {@link averageDollarVolume}. */
+  /** Average per-bar dollar-volume from {@link dollarVolumeStats}. */
   avgDollarVolume: number;
+  /** Real-bar sample count backing {@link avgDollarVolume} (from {@link dollarVolumeStats}). */
+  dollarVolumeSamples: number;
   /** NEW directional opens already recorded for this name this ET session. */
   opensToday: number;
 }
 
 export interface DirectionalQualityVerdict {
   admitted: boolean;
-  /** Machine-tag of the failing rule (or null when admitted). */
-  code: 'ok' | 'min_price' | 'min_dollar_volume' | 'per_name_cap';
+  /** Machine-tag of the failing rule (or `ok` when admitted). */
+  code: 'ok' | 'min_price' | 'insufficient_liquidity_samples' | 'min_dollar_volume' | 'per_name_cap';
   /** Human-readable rejection reason (or null when admitted). */
   reason: string | null;
 }
@@ -159,14 +194,26 @@ export function directionalQualityVerdict(
   input: DirectionalQualityInput,
   thresholds: DirectionalQualityThresholds,
 ): DirectionalQualityVerdict {
-  const { spot, avgDollarVolume, opensToday } = input;
-  const { minUnderlyingPrice, minAvgDollarVolume, maxOpensPerName } = thresholds;
+  const { spot, avgDollarVolume, dollarVolumeSamples, opensToday } = input;
+  const { minUnderlyingPrice, minAvgDollarVolume, maxOpensPerName, minDollarVolumeSamples } = thresholds;
 
   if (!(spot >= minUnderlyingPrice)) {
     return {
       admitted: false,
       code: 'min_price',
       reason: `underlier $${spot.toFixed(2)} below min price $${minUnderlyingPrice.toFixed(2)}`,
+    };
+  }
+  // TRA-1486 D1 — fail-CLOSED during shadow-series warmup. A $-volume mean over too
+  // few real bars is not a trustworthy liquidity estimate, so reject rather than
+  // admit on it (the prior behaviour let AMPG-class names open in the first ~1h
+  // after boot before the 5m series warmed). Checked BEFORE the floor so the reason
+  // is "warming up", not a spurious pass/fail on a noisy 1-bar average.
+  if (!(dollarVolumeSamples >= minDollarVolumeSamples)) {
+    return {
+      admitted: false,
+      code: 'insufficient_liquidity_samples',
+      reason: `only ${dollarVolumeSamples} real $-volume sample(s); need ${minDollarVolumeSamples} (warmup fail-closed)`,
     };
   }
   if (!(avgDollarVolume >= minAvgDollarVolume)) {
