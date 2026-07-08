@@ -60,6 +60,12 @@ import { scanShortPremiumFromSnapshot, recordShortPremiumScan } from './short-pr
 import { isExitRiskRulesEnabled, isLiveEquityStopModifyEnabled, isTakeProfitEarlyEnabled, isEntryGreeksGateEnabled, isCorrelatedExposureCapEnabled, isOtmDeltaFloorEnabled, resolveOtmDeltaFloor, isRvExitRetuneEnabled, resolveRvExitConfirmBars, isBookGiveBackArmFloorEnabled } from './exit-risk-rules-flag.js';
 import { recordCorrelatedExposureBinding, type CorrelatedExposureVenue } from './correlated-exposure-ledger.js';
 import { isChurnLossBrakeEnabled, resolveSameSessionOpenCap } from './churn-loss-brake-flag.js';
+import {
+  isDirectionalQualityGateEnabled,
+  resolveDirectionalQualityThresholds,
+  averageDollarVolume,
+  directionalQualityVerdict,
+} from './ignition-quality-gate.js';
 import { isMultiLegOpenPaused } from './multileg-open-pause-flag.js';
 import { isMultiLegExitEnabled } from './multileg-exit-flag.js';
 import { recordConvictionDcaFill } from './conviction-dca-ledger.js';
@@ -3625,6 +3631,19 @@ export class SignalEngine {
   }
 
   /**
+   * TRA-1476 — NEW demo opens already recorded for `symbol` this ET session,
+   * read from the SAME {@link churnOpensToday} counter {@link recordChurnOpen}
+   * feeds (so the directional per-name cap and the TRA-1408 churn brake share one
+   * source of truth and both auto-reset at the ET-day roll). Pure read; 0 when the
+   * name has no open today.
+   */
+  private opensTodayFor(symbol: string, now = Date.now()): number {
+    const etDay = etDateString(new Date(now));
+    const rec = this.churnOpensToday.get(symbol);
+    return rec && rec.etDay === etDay ? rec.count : 0;
+  }
+
+  /**
    * TRA-1408 — the same-day-loss DCA brake test: is `symbol` net-negative on the
    * ET day across REALIZED (today's closed demo trades) + UNREALIZED (open demo
    * marks)? Consulted by the demo conviction-DCA add loops before an add fires;
@@ -5417,6 +5436,36 @@ export class SignalEngine {
         }
         if (best === null) continue;
 
+        // TRA-1476 (parent TRA-1471) — liquidity/quality + per-name churn gate on
+        // the directional "ignition" entry. This path stacked AMPG (a thin sub-$5
+        // micro-cap) 28× in one morning for −$432.50 because it had NO price /
+        // $-volume floor and NO per-name open cap — its only guard was the 1-hour
+        // SAME-OCC dedup above, which a drifting ATM strike sidesteps. DEMO-SCOPED
+        // + DARK until the board arms ENABLE_OPTION_DIRECTIONAL_QUALITY_GATE (read
+        // through demo-flags.json); layered on top of the directional flag so it
+        // can never bite a path that isn't running. Rejects here — BEFORE the
+        // paper open — with a surfaced reason, exactly like the RV greeks/churn
+        // gates. `spot` is the underlier; avg $-volume comes from the same 5m
+        // shadow series `series` the trend read above; opensToday shares the
+        // TRA-1408 per-name counter (recorded on a successful open below).
+        const dqEnv = this.resolveDemoFlagEnv();
+        if (isDirectionalQualityGateEnabled(dqEnv)) {
+          const verdict = directionalQualityVerdict(
+            {
+              spot,
+              avgDollarVolume: averageDollarVolume(series),
+              opensToday: this.opensTodayFor(sym, asOf),
+            },
+            resolveDirectionalQualityThresholds(dqEnv),
+          );
+          if (!verdict.admitted) {
+            log.info('demo directional rejected by quality/liquidity gate (TRA-1476)', {
+              symbol: sym, code: verdict.code, reason: verdict.reason,
+            });
+            continue;
+          }
+        }
+
         // TRA-1153 — populate the option-journal IV regime from THIS path. The
         // chain (`snap`) is already in hand here, so deriving ATM IV + IV-rank is
         // free and does NOT re-introduce the per-tick per-symbol chain fetch the
@@ -5518,6 +5567,12 @@ export class SignalEngine {
           directionalJournalSetup,
         );
         if (!opened) continue;
+
+        // TRA-1476 / TRA-1408 — record this directional open against the shared
+        // per-name same-session counter so BOTH the TRA-1476 per-name cap above
+        // and the TRA-1408 churn brake at the other open chokepoints see the
+        // directional stacking that previously escaped them (no-op on live).
+        this.recordChurnOpen(sym, asOf);
 
         this.emitOptionFillAlert(opened);
         signal.mode = this.mode;
