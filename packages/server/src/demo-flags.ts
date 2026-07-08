@@ -135,6 +135,12 @@ export const DEMO_FLAG_ALLOWLIST = [
   // the self-hosted host after QuantTrader forward-validates (no PM2/admin).
   'RV_EXIT_RETUNE_ENABLED',
   'RV_EXIT_RETUNE_CONFIRM_BARS',
+  // TRA-1480 (v2) — winner-protect loss threshold for the RV supertrend_flip
+  // exit. Consulted ONLY inside the demo RV branch that already requires
+  // RV_EXIT_RETUNE_ENABLED, so it can never touch a live exit. Non-secret,
+  // demo-only — allowlisted so the board can arm/re-tune/revert daemon-free on
+  // the self-hosted host (bqb1 arms via render.yaml + push).
+  'RV_EXIT_FLIP_MIN_LOSS_PCT',
   // TRA-1418 (TRA-1417 build, parent TRA-1406 / TRA-1410 option a) — the DURABLE
   // fix for the 100% $0-scratch combo closes: a per-tick combo net mark + the
   // QuantTrader defined-risk exit policy (TP at 50% of max profit, credit 2× /

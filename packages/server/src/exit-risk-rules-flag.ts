@@ -151,6 +151,17 @@ export const RV_EXIT_RETUNE_FLAG = 'RV_EXIT_RETUNE_ENABLED';
 /** Numeric override of the confirm-bars count (default 2, the QuantTrader pick). */
 export const RV_EXIT_RETUNE_CONFIRM_BARS_VALUE = 'RV_EXIT_RETUNE_CONFIRM_BARS';
 export const RV_EXIT_RETUNE_CONFIRM_BARS_DEFAULT = 2;
+// TRA-1480 (v2) — winner-protect P&L gate on the RV `supertrend_flip` exit. The
+// v1 2-bar confirm did NOT cut the churn: forward journal showed supertrend_flip
+// still 96.9% scratch (352 closed / +$425 ≈ breakeven pump) while the winner
+// exits — ma20_close_through (+$2.4k) and trail (+$21k) — pay. Root cause: a
+// confirmed flip still exits FLAT/WINNING RV positions at breakeven before MA20
+// develops. This override sets the loss threshold below which (and only below
+// which) the flip is allowed to fire; a flat-or-green position ignores the flip
+// and runs to ma20/trail. Absent/blank → undefined → v1 behaviour unchanged (no
+// silent behavioural change on redeploy of the already-armed v1). Expected loss
+// fraction in (-1, 0]; out-of-range/malformed falls back to undefined.
+export const RV_EXIT_FLIP_MIN_LOSS_PCT_VALUE = 'RV_EXIT_FLIP_MIN_LOSS_PCT';
 
 /** True iff the RV exit re-tune is enabled (standalone; accepts 1/true/yes/on). */
 export function isRvExitRetuneEnabled(env: NodeJS.ProcessEnv = process.env): boolean {
@@ -171,6 +182,26 @@ export function resolveRvExitConfirmBars(env: NodeJS.ProcessEnv = process.env): 
     if (Number.isInteger(parsed) && parsed >= 1 && parsed <= 10) return parsed;
   }
   return RV_EXIT_RETUNE_CONFIRM_BARS_DEFAULT;
+}
+
+/**
+ * Resolve the optional RV `supertrend_flip` winner-protect loss threshold
+ * (TRA-1480 v2). Reads {@link RV_EXIT_FLIP_MIN_LOSS_PCT_VALUE}; returns the
+ * parsed fraction only when it is a finite loss in the range (-1, 0], otherwise
+ * `undefined` (gate disabled → v1 flip-at-any-P&L behaviour preserved). A value
+ * of 0 suppresses the flip on ANY non-losing position. This is consulted only
+ * inside the demo RV exit branch that already requires `RV_EXIT_RETUNE_ENABLED`,
+ * so no separate enable flag is needed.
+ */
+export function resolveRvExitFlipMinLossPct(
+  env: NodeJS.ProcessEnv = process.env,
+): number | undefined {
+  const raw = env[RV_EXIT_FLIP_MIN_LOSS_PCT_VALUE];
+  if (typeof raw === 'string' && raw.trim() !== '') {
+    const parsed = Number(raw);
+    if (Number.isFinite(parsed) && parsed > -1 && parsed <= 0) return parsed;
+  }
+  return undefined;
 }
 
 // TRA-1435 — minimum ARM floor for the book-level give-back cap (Rule 3). Today

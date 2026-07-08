@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest';
-import { isExitRiskRulesEnabled, isLiveEquityStopModifyEnabled, isTakeProfitEarlyEnabled, isCorrelatedExposureCapEnabled, isOtmDeltaFloorEnabled, resolveOtmDeltaFloor, OTM_DELTA_FLOOR_DEFAULT, isRvExitRetuneEnabled, resolveRvExitConfirmBars, RV_EXIT_RETUNE_CONFIRM_BARS_DEFAULT, isBookGiveBackArmFloorEnabled } from './exit-risk-rules-flag.js';
+import { isExitRiskRulesEnabled, isLiveEquityStopModifyEnabled, isTakeProfitEarlyEnabled, isCorrelatedExposureCapEnabled, isOtmDeltaFloorEnabled, resolveOtmDeltaFloor, OTM_DELTA_FLOOR_DEFAULT, isRvExitRetuneEnabled, resolveRvExitConfirmBars, RV_EXIT_RETUNE_CONFIRM_BARS_DEFAULT, resolveRvExitFlipMinLossPct, isBookGiveBackArmFloorEnabled } from './exit-risk-rules-flag.js';
 
 // TRA-1250 / TRA-1269 / TRA-1294 / TRA-1295 — master switch + the isolated sub-flags.
 
@@ -110,6 +110,19 @@ describe('isRvExitRetuneEnabled / resolveRvExitConfirmBars (TRA-1409)', () => {
       expect(resolveRvExitConfirmBars({ RV_EXIT_RETUNE_CONFIRM_BARS: bad })).toBe(
         RV_EXIT_RETUNE_CONFIRM_BARS_DEFAULT,
       );
+    }
+  });
+
+  it('TRA-1480 v2 — resolves the flip winner-protect loss threshold, undefined when unset/malformed', () => {
+    // Unset → undefined → v1 behaviour (flip fires at any P&L) preserved.
+    expect(resolveRvExitFlipMinLossPct({})).toBeUndefined();
+    // Valid loss fractions in (-1, 0] are honoured, incl. 0 (suppress on any gain).
+    expect(resolveRvExitFlipMinLossPct({ RV_EXIT_FLIP_MIN_LOSS_PCT: '-0.2' })).toBe(-0.2);
+    expect(resolveRvExitFlipMinLossPct({ RV_EXIT_FLIP_MIN_LOSS_PCT: '0' })).toBe(0);
+    expect(resolveRvExitFlipMinLossPct({ RV_EXIT_FLIP_MIN_LOSS_PCT: '-0.999' })).toBe(-0.999);
+    // Malformed / out-of-range (positive, ≤ -1, non-numeric, blank) → undefined.
+    for (const bad of ['', ' ', 'abc', '0.1', '-1', '-1.5', 'NaN']) {
+      expect(resolveRvExitFlipMinLossPct({ RV_EXIT_FLIP_MIN_LOSS_PCT: bad })).toBeUndefined();
     }
   });
 });

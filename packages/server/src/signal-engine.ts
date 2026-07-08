@@ -57,7 +57,7 @@ import { isOptionShadowEnabled, isOptionPhaseBEnabled, emitShadowOptionSignal, s
 import { isOptionExecEnabled, isOptionEmaPullbackEnabled, isOptionVolumeBreakoutEnabled, resolveRvLongDteOverride, resolveRvMinDailyVolume, isOptionDemoDirectionalEnabled, isOptionIvRvScannerEnabled, isOptionIvRvRoutingEnabled, resolveIvRvRoutingOverride, isOptionShortPremiumScannerEnabled } from './option-exec-flag.js';
 import { scanIvRvFromSnapshot, recordIvRvScan } from './iv-rv-scanner.js';
 import { scanShortPremiumFromSnapshot, recordShortPremiumScan } from './short-premium-scanner.js';
-import { isExitRiskRulesEnabled, isLiveEquityStopModifyEnabled, isTakeProfitEarlyEnabled, isEntryGreeksGateEnabled, isCorrelatedExposureCapEnabled, isOtmDeltaFloorEnabled, resolveOtmDeltaFloor, isRvExitRetuneEnabled, resolveRvExitConfirmBars, isBookGiveBackArmFloorEnabled } from './exit-risk-rules-flag.js';
+import { isExitRiskRulesEnabled, isLiveEquityStopModifyEnabled, isTakeProfitEarlyEnabled, isEntryGreeksGateEnabled, isCorrelatedExposureCapEnabled, isOtmDeltaFloorEnabled, resolveOtmDeltaFloor, isRvExitRetuneEnabled, resolveRvExitConfirmBars, resolveRvExitFlipMinLossPct, isBookGiveBackArmFloorEnabled } from './exit-risk-rules-flag.js';
 import { recordCorrelatedExposureBinding, type CorrelatedExposureVenue } from './correlated-exposure-ledger.js';
 import { isChurnLossBrakeEnabled, resolveSameSessionOpenCap } from './churn-loss-brake-flag.js';
 import {
@@ -2770,9 +2770,17 @@ export class SignalEngine {
     // the LIVE exit path is structurally untouched; absent → legacy single-bar
     // flip. Only ever makes the structural flip fire LESS — the risk-side
     // chandelier / give-back / hard-SL exits keep precedence unchanged.
+    // TRA-1480 (v2) — additionally applies the winner-protect P&L gate
+    // (`supertrendFlipMinLossPctToExit`, from RV_EXIT_FLIP_MIN_LOSS_PCT) so a
+    // confirmed flip only exits a LOSING RV position; flat-or-green positions run
+    // to ma20/trail. Absent override → undefined → v1 (confirm-bars only).
     const rvExitParams: ExitParams | undefined =
       this.mode === 'demo' && isRvExitRetuneEnabled(this.resolveDemoFlagEnv())
-        ? { ...DEFAULT_EXIT_PARAMS, supertrendFlipConfirmBars: resolveRvExitConfirmBars(this.resolveDemoFlagEnv()) }
+        ? {
+            ...DEFAULT_EXIT_PARAMS,
+            supertrendFlipConfirmBars: resolveRvExitConfirmBars(this.resolveDemoFlagEnv()),
+            supertrendFlipMinLossPctToExit: resolveRvExitFlipMinLossPct(this.resolveDemoFlagEnv()),
+          }
         : undefined;
 
     // TRA-1268 (TRA-1250 Rules 1-2) — underlying ATR(14) on 5m bars for the

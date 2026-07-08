@@ -215,6 +215,21 @@ export interface ExitParams {
    * history holds the flip exit (conservative) rather than firing on one bar.
    */
   supertrendFlipConfirmBars?: number;
+  /**
+   * TRA-1480 (v2, TRA-1409 follow-up) — winner-protect P&L gate on the
+   * `supertrend_flip` structural exit. When set, a (confirmed) Supertrend flip
+   * only exits a position whose premium P&L is AT OR BELOW this fraction
+   * (a loss threshold, e.g. -0.20 = only flip-exit once down ≥20%). A
+   * flat-or-winning RV position IGNORES the flip and runs to
+   * `ma20_close_through` / `trail` / take-profit — the real winner exits.
+   * This fixes the v1 residual where the 2-bar-confirmed flip still scratched
+   * ~97% of RV exits at breakeven before MA20 developed. Undefined (the default)
+   * keeps the legacy behaviour: the flip fires at any P&L. The flip stays fully
+   * PROTECTIVE on real losers, and the risk-side stops are unaffected. Expected
+   * range (-1, 0]; a value ≤ {@link ExitParams.premiumStopPct} is harmless (the
+   * hard premium stop already fires first).
+   */
+  supertrendFlipMinLossPctToExit?: number;
   /** Exit when the underlying closes through its MA20. Default true. */
   ma20CloseThroughExit: boolean;
   /** Premium stop as a fraction of entry premium (default -0.50 = -50%). */
@@ -297,15 +312,23 @@ export function evaluateExit(state: ExitState, params: ExitParams = DEFAULT_EXIT
       // exit rather than fire on one bar — the other structural/time exits below
       // still apply, and the risk-side stops are unaffected.
       const confirmBars = params.supertrendFlipConfirmBars ?? 1;
-      if (confirmBars <= 1) return 'supertrend_flip';
       const recent = state.recentSupertrendDirections;
-      if (
-        recent !== undefined &&
-        recent.length >= confirmBars &&
-        recent.slice(-confirmBars).every(d => d === flippedDir)
-      ) {
-        return 'supertrend_flip';
-      }
+      const confirmed =
+        confirmBars <= 1 ||
+        (recent !== undefined &&
+          recent.length >= confirmBars &&
+          recent.slice(-confirmBars).every(d => d === flippedDir));
+      // TRA-1480 (v2) — winner-protect P&L gate. When
+      // `supertrendFlipMinLossPctToExit` is set, the confirmed flip only exits a
+      // position that is at/below that loss threshold; a flat-or-winning RV
+      // position ignores the flip and runs to `ma20_close_through` / `trail` /
+      // take-profit (the winner exits). Undefined = legacy (fires at any P&L).
+      // The flip stays PROTECTIVE on real losers; the hard premium stop already
+      // fired above so this never loosens a risk-side exit.
+      const pnlGateOpen =
+        params.supertrendFlipMinLossPctToExit === undefined ||
+        pnlPct <= params.supertrendFlipMinLossPctToExit;
+      if (confirmed && pnlGateOpen) return 'supertrend_flip';
     }
   }
   if (params.ma20CloseThroughExit) {

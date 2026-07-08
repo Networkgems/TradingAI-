@@ -208,6 +208,71 @@ describe('evaluateExit — TRA-1409 confirmed N-bar Supertrend flip', () => {
   });
 });
 
+describe('evaluateExit — TRA-1480 v2 winner-protect flip P&L gate', () => {
+  // Long call, flipped against the position this bar, underlying still above MA20
+  // so only the flip logic (and its P&L gate) can fire. entryPremium 2.
+  const base: ExitState = {
+    side: 'buy',
+    supertrendDirection: 'red', // flipped against a long
+    recentSupertrendDirections: ['red', 'red'], // 2-bar confirmed
+    underlyingClose: 105,
+    ma20: 100,
+    entryPremium: 2,
+    currentPremium: 2, // flat P&L
+    barsHeld: 1,
+    hadFollowThrough: true,
+  };
+  // v1 armed shape (confirm N=2) + v2 gate: only flip-exit once down ≥20%.
+  const gated = {
+    ...DEFAULT_EXIT_PARAMS,
+    supertrendFlipConfirmBars: 2,
+    supertrendFlipMinLossPctToExit: -0.2,
+  };
+
+  it('holds a confirmed flip on a FLAT position (winner runs to ma20)', () => {
+    // Flat P&L (0) is above the -20% threshold → flip suppressed, nothing else
+    // triggers (still above MA20) → hold.
+    expect(evaluateExit({ ...base }, gated)).toBeNull();
+  });
+  it('holds a confirmed flip on a WINNING position', () => {
+    expect(evaluateExit({ ...base, currentPremium: 2.6 /* +30% */ }, gated)).toBeNull();
+  });
+  it('still fires the confirmed flip once the loss reaches the threshold', () => {
+    // -25% premium (currentPremium 1.5) is below the -20% gate → protective flip.
+    expect(evaluateExit({ ...base, currentPremium: 1.5 }, gated)).toBe('supertrend_flip');
+  });
+  it('lets a flat, flip-suppressed position exit on ma20_close_through', () => {
+    // Gate suppresses the flip; underlying has closed through MA20 → winner exit.
+    expect(
+      evaluateExit({ ...base, currentPremium: 2, underlyingClose: 99 }, gated),
+    ).toBe('ma20_close_through');
+  });
+  it('gate never blocks the hard premium stop', () => {
+    // -50% premium hits the hard stop first regardless of the flip gate.
+    expect(evaluateExit({ ...base, currentPremium: 1.0 }, gated)).toBe('premium_stop');
+  });
+  it('undefined threshold = legacy: confirmed flip fires at any P&L', () => {
+    const v1 = { ...DEFAULT_EXIT_PARAMS, supertrendFlipConfirmBars: 2 };
+    expect(evaluateExit({ ...base, currentPremium: 2 }, v1)).toBe('supertrend_flip');
+  });
+  it('threshold 0 suppresses the flip on any non-losing position', () => {
+    const gate0 = { ...DEFAULT_EXIT_PARAMS, supertrendFlipMinLossPctToExit: 0 };
+    // Flat (0 <= 0) still allows the flip; a tiny gain suppresses it.
+    expect(evaluateExit({ ...base, currentPremium: 2 }, gate0)).toBe('supertrend_flip');
+    expect(evaluateExit({ ...base, currentPremium: 2.02 }, gate0)).toBeNull();
+  });
+  it('gate composes with confirm-bars: unconfirmed single-bar flip still holds', () => {
+    // Only the current bar flipped (green,red) under N=2 → unconfirmed → hold,
+    // independent of the P&L gate.
+    expect(
+      evaluateExit(
+        { ...base, recentSupertrendDirections: ['green', 'red'], currentPremium: 1.5 },
+        gated,
+      ),
+    ).toBeNull();
+  });
+});
+
 describe('sizeOptionContracts (risk manager + caps)', () => {
   function makeAccount(equity: number): AccountState {
     return { totalEquity: equity, availableCash: equity, openPositions: [], dailyPnl: 0 };
