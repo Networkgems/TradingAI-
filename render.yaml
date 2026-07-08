@@ -76,6 +76,38 @@ services:
       # of being promoted into old space and amplifying the thrash.
       - key: NODE_OPTIONS
         value: --max-old-space-size=1536 --max-semi-space-size=64
+      # TRA-1463 — cap glibc malloc arenas to bound native RSS fragmentation.
+      # ROOT-CAUSE of the residual ~85-min crash-restart cycle (the last gap the
+      # TRA-1447 crypto-fanout hardening did not close): live watchdog telemetry
+      # (57f99dd `externalMB`/`arrayBuffersMB`/`peakRssSinceBoot` on
+      # /api/health/watchdog) proved the driver is an OFF-HEAP RSS ceiling, NOT a
+      # JS heap leak and NOT event-loop starvation — across samples the V8 heap
+      # sawtooths low under GC (~6%), event-loop lag stays <150 ms (well under the
+      # 2 s watchdog threshold), and the *tracked* off-heap counters
+      # (external + arrayBuffers ≈ 4-9 MB) are tiny, yet RSS is the binding
+      # constraint (24 h peak ~1.53 GB per the `plan: standard` note above, vs the
+      # 1.9 GB watchdog rssMaxBytes / 2 GB container OOM only ~0.4-0.5 GB overhead).
+      # RSS retained far above the JS heap while `external` stays small is the
+      # signature of glibc arena fragmentation: by default glibc opens up to
+      # 8×nCPU arenas of up to 64 MB each, and the libuv threadpool + the crypto
+      # daily-bars fan-out's concurrent `fetch` bursts each grab per-thread arenas
+      # whose freed blocks are never returned to the OS. Under a burst those
+      # transient arena spikes push the ~1.53 GB steady state past the 1.9 GB
+      # watchdog / 2 GB OOM line ⇒ the ~85-min restart.
+      #
+      # Capping to 2 arenas is the standard, well-proven Node-on-glibc-container
+      # fix (typically 20-40% RSS reduction) and directly buys the headroom to hold
+      # a full ET RTH session (the TRA-1451 soak gate needs 7 h monotonic uptime).
+      # It is NATIVE-ALLOCATOR ONLY — orthogonal to the V8 --max-old-space GC
+      # tuning above (arenas are C malloc, not the GC heap) — and does NOT retune
+      # the TRA-1447 crypto pacer (respects the TRA-1463 non-goal). CPU is idle
+      # here (avg ~0.28 of 1 vCPU) so the slightly higher cross-thread malloc-lock
+      # contention from fewer arenas is negligible. Behaviour/rate/capital-neutral.
+      # Rollback = clear this value + redeploy. The 57f99dd watchdog breadcrumb is
+      # retained, so if a trip still occurs `lastTrip` will still record whether
+      # RSS is the driver (falsifiable). Ships via the git-push autoDeploy lever.
+      - key: MALLOC_ARENA_MAX
+        value: "2"
       - key: DATA_DIR
         value: /data
       - key: APP_URL
