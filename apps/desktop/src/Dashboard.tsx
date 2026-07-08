@@ -235,6 +235,7 @@ export default function Dashboard({ token, onLogout, onGoHome, onActivity, theme
           <CalendarTab
             token={token}
             httpUrl={HTTP_URL}
+            isAdmin={isAdmin}
             mode={
               accountMode === 'demo'
                 ? 'demo'
