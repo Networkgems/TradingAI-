@@ -9,6 +9,8 @@ import {
   getWatchdogStatus,
   resolveTripLogPath,
   readLastTrip,
+  resolveLivenessLogPath,
+  readLastLiveness,
   _resetWatchdogForTests,
   DEFAULT_WATCHDOG,
   type WatchdogConfig,
@@ -369,5 +371,75 @@ describe('TRA-1463 — durable trip-reason breadcrumb', () => {
     handle!.sampleNow(); // trips, but persistence must no-op
     expect(handle!.status().lastTrip).toBeNull();
     handle!.stop();
+  });
+});
+
+describe('TRA-1463 — periodic liveness breadcrumb (external-kill attribution)', () => {
+  it('resolveLivenessLogPath: DATA_DIR → file on the persistent disk, none → null (inert in dev)', () => {
+    expect(resolveLivenessLogPath({ DATA_DIR: '/data' })).toBe(join('/data', 'watchdog-liveness.json'));
+    expect(resolveLivenessLogPath({ WATCHDOG_LIVENESS_LOG_PATH: '/tmp/live.json' })).toBe('/tmp/live.json');
+    expect(resolveLivenessLogPath({})).toBeNull(); // no durable disk configured
+  });
+
+  it('writes a last-known-alive heartbeat that the NEXT boot surfaces as priorLiveness — even with NO watchdog trip', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'wd-live-'));
+    const path = join(dir, 'watchdog-liveness.json');
+    // Healthy box (no trip): the heartbeat still fires on the first steady-state sample.
+    const env = { WATCHDOG_LIVENESS_LOG_PATH: path, WATCHDOG_BOOT_GRACE_MS: '0' };
+
+    const first = startEventLoopWatchdog({
+      env,
+      readHeap: () => ({ usedBytes: 900e6, limitBytes: 1536e6, rssBytes: 1_450e6, externalBytes: 8e6, arrayBuffersBytes: 2e6 }),
+      onTrip: () => {},
+    });
+    first!.sampleNow();
+    first!.stop();
+
+    // Simulate an EXTERNAL kill: the process vanished WITHOUT a watchdog trip, so
+    // watchdog-last-trip.json was never written — but the liveness heartbeat was.
+    const live = readLastLiveness(env);
+    expect(live?.rssMB).toBe(1450);
+    expect(live?.externalMB).toBe(8);
+    expect(typeof live?.uptimeSec).toBe('number');
+
+    // Boot 2 (fresh): reads the dead instance's last-known RSS/uptime as priorLiveness,
+    // while lastTrip stays null — the exact signature of a SIGKILL 137 / SIGTERM death.
+    _resetWatchdogForTests();
+    const second = startEventLoopWatchdog({
+      env: { WATCHDOG_LIVENESS_LOG_PATH: path, WATCHDOG_BOOT_GRACE_MS: '0' },
+      readHeap: () => ({ usedBytes: 100e6, limitBytes: 1536e6, rssBytes: 300e6 }),
+      onTrip: () => {},
+    });
+    second!.sampleNow();
+    expect(second!.status().lastTrip).toBeNull();
+    expect(second!.status().priorLiveness?.rssMB).toBe(1450);
+    second!.stop();
+
+    rmSync(dir, { recursive: true, force: true });
+  });
+
+  it('is inert (no throw, no priorLiveness) when no durable disk is configured', () => {
+    const handle = startEventLoopWatchdog({
+      env: { WATCHDOG_BOOT_GRACE_MS: '0' }, // no DATA_DIR / liveness path
+      readHeap: () => ({ usedBytes: 200e6, limitBytes: 1536e6, rssBytes: 400e6 }),
+      onTrip: () => {},
+    });
+    handle!.sampleNow();
+    expect(handle!.status().priorLiveness).toBeNull();
+    handle!.stop();
+  });
+
+  it('honours WATCHDOG_LIVENESS_PERSIST=false (no heartbeat written)', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'wd-live-off-'));
+    const path = join(dir, 'watchdog-liveness.json');
+    const handle = startEventLoopWatchdog({
+      env: { WATCHDOG_LIVENESS_LOG_PATH: path, WATCHDOG_LIVENESS_PERSIST: 'false', WATCHDOG_BOOT_GRACE_MS: '0' },
+      readHeap: () => ({ usedBytes: 200e6, limitBytes: 1536e6, rssBytes: 400e6 }),
+      onTrip: () => {},
+    });
+    handle!.sampleNow();
+    expect(readLastLiveness({ WATCHDOG_LIVENESS_LOG_PATH: path })).toBeNull();
+    handle!.stop();
+    rmSync(dir, { recursive: true, force: true });
   });
 });

@@ -96,6 +96,49 @@ export interface PersistedTrip {
   lagMaxMs: number;
 }
 
+// TRA-1463 — periodic LIVENESS breadcrumb. `lastTrip` above only records a
+// death the watchdog itself caused (a clean self-exit through `persistTripRecord`
+// on line ~669). But the residual ~85-min bqb1 kill is `nonZeroExit: 137` — a
+// cgroup SIGKILL from a sub-minute RSS burst that overshoots the acute `rssMaxBytes`
+// ceiling INSIDE a single sample, so the platform kills the process before the
+// watchdog's exit path runs. That death persists NOTHING, so the next boot reads
+// `lastTrip: null` and the "OOM/SIGKILL 137 vs event-loop-starvation" question
+// (scope item 1) is structurally unanswerable from `lastTrip` alone — exactly the
+// blind spot that has kept this issue open. Fix: every process writes a tiny
+// last-known-alive snapshot to the DATA_DIR disk on a throttled cadence. After
+// ANY death — graceful trip, external SIGKILL 137, or health-check-timeout SIGTERM
+// — the next boot re-reads this file as `priorLiveness`: the uptime / RSS / off-heap
+// / lag at the last heartbeat before the box went dark. A `priorLiveness` with
+// uptime ≈ 85 min and RSS climbing toward the ceiling ⇒ the 137 burst still fires
+// (MALLOC_ARENA_MAX floor insufficient); a flat RSS with spiking lag ⇒ event-loop
+// starvation instead. Observability only — no behaviour/rate/capital change.
+// Env-disableable via WATCHDOG_LIVENESS_PERSIST=false.
+export const WATCHDOG_LIVENESS_PERSIST_VAR = 'WATCHDOG_LIVENESS_PERSIST';
+export const WATCHDOG_LIVENESS_INTERVAL_MS_VAR = 'WATCHDOG_LIVENESS_INTERVAL_MS';
+export const WATCHDOG_LIVENESS_LOG_PATH_VAR = 'WATCHDOG_LIVENESS_LOG_PATH';
+
+/**
+ * The last-known-alive snapshot, rewritten on a throttled cadence by the running
+ * process and re-read once by the NEXT boot. Unlike {@link PersistedTrip} this is
+ * written on a timer, not at death, so it survives a kill that bypasses the
+ * watchdog exit path (external SIGKILL 137 / health-check-timeout SIGTERM).
+ */
+export interface PersistedLiveness {
+  /** Wall-clock (ms) of this heartbeat write. */
+  atMs: number;
+  /** Process uptime (s) at the heartbeat — the last value before the box died. */
+  uptimeSec: number;
+  rssMB: number;
+  heapUsedMB: number;
+  heapLimitMB: number;
+  /** heapUsed / heap_size_limit at the heartbeat. */
+  heapPct: number;
+  externalMB?: number;
+  arrayBuffersMB?: number;
+  lagMeanMs: number;
+  lagMaxMs: number;
+}
+
 /**
  * Resolve the trip-breadcrumb path to `<DATA_DIR>/watchdog-last-trip.json` (the
  * Render persistent disk, so it survives the restart), or an explicit
@@ -143,6 +186,57 @@ function persistTripRecord(record: PersistedTrip, env: NodeJS.ProcessEnv = proce
     writeFileSync(path, JSON.stringify(record), 'utf8');
   } catch (err) {
     log.warn('failed to persist watchdog trip breadcrumb', { err: String(err) });
+  }
+}
+
+/**
+ * Resolve the liveness-breadcrumb path to `<DATA_DIR>/watchdog-liveness.json`, or
+ * an explicit WATCHDOG_LIVENESS_LOG_PATH override. Null when neither is set (local
+ * dev / tests) so the heartbeat is inert and never litters the working tree —
+ * mirrors {@link resolveTripLogPath}.
+ */
+export function resolveLivenessLogPath(env: NodeJS.ProcessEnv = process.env): string | null {
+  const explicit = env[WATCHDOG_LIVENESS_LOG_PATH_VAR];
+  if (typeof explicit === 'string' && explicit.trim() !== '') return explicit.trim();
+  const dataDir = env.DATA_DIR;
+  if (typeof dataDir === 'string' && dataDir.trim() !== '') {
+    return join(dataDir.trim(), 'watchdog-liveness.json');
+  }
+  return null;
+}
+
+/** Best-effort synchronous read of the prior process's last liveness heartbeat (null if none/unreadable). */
+export function readLastLiveness(env: NodeJS.ProcessEnv = process.env): PersistedLiveness | null {
+  try {
+    const path = resolveLivenessLogPath(env);
+    if (!path || !existsSync(path)) return null;
+    const raw = readFileSync(path, 'utf8');
+    const parsed = JSON.parse(raw) as PersistedLiveness;
+    if (!parsed || typeof parsed.uptimeSec !== 'number' || typeof parsed.rssMB !== 'number') return null;
+    return parsed;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Best-effort synchronous write of the liveness heartbeat. Synchronous like the
+ * trip write, but this runs on a throttled cadence during normal operation, so it
+ * is guarded by the caller's interval gate (see the `publish` heartbeat) to keep
+ * the added blocking to a ~200-byte write every WATCHDOG_LIVENESS_INTERVAL_MS
+ * (default 15s) — sub-millisecond, negligible against the ~0.3 vCPU load. Fully
+ * guarded — a write failure must never disturb the running box.
+ */
+function persistLivenessHeartbeat(record: PersistedLiveness, env: NodeJS.ProcessEnv = process.env): void {
+  if (!envBool(env[WATCHDOG_LIVENESS_PERSIST_VAR], true)) return;
+  try {
+    const path = resolveLivenessLogPath(env);
+    if (!path) return; // no durable disk configured (local/dev) — nothing to write
+    const dir = dirname(path);
+    if (!existsSync(dir)) mkdirSync(dir, { recursive: true });
+    writeFileSync(path, JSON.stringify(record), 'utf8');
+  } catch (err) {
+    log.warn('failed to persist watchdog liveness breadcrumb', { err: String(err) });
   }
 }
 
@@ -444,6 +538,17 @@ export interface WatchdogStatus {
    * died (heap-leak vs native/RSS burst vs CPU starvation) without Render logs.
    */
   lastTrip: PersistedTrip | null;
+  /**
+   * TRA-1463 — the PRIOR process's last liveness heartbeat, re-read from the
+   * DATA_DIR breadcrumb on boot. Unlike {@link lastTrip} this is written on a
+   * timer (not at death), so it captures the last-known RSS/lag/uptime even when
+   * the death bypassed the watchdog exit path — an external SIGKILL 137 (cgroup
+   * OOM burst) or a health-check-timeout SIGTERM. This is the field that finally
+   * distinguishes the residual ~85-min kill's cause: uptime ≈ 85 min + climbing
+   * RSS ⇒ RSS burst / 137; flat RSS + spiking lag ⇒ event-loop starvation. Null
+   * on a truly-fresh disk (no prior heartbeat).
+   */
+  priorLiveness: PersistedLiveness | null;
 }
 
 export interface WatchdogHandle {
@@ -547,6 +652,29 @@ export function startEventLoopWatchdog(opts: StartWatchdogOptions = {}): Watchdo
     });
   }
 
+  // TRA-1463 — the prior process's last liveness heartbeat, capturing the death
+  // the watchdog exit path could NOT (external SIGKILL 137 / health-check SIGTERM).
+  // Read once at boot; immutable thereafter (the running box overwrites the file,
+  // so only this boot-time snapshot reflects the DEAD instance's final state).
+  const priorLiveness = readLastLiveness(opts.env);
+  if (priorLiveness) {
+    const gapFromTrip = lastTrip ? Math.abs(priorLiveness.atMs - lastTrip.atMs) : null;
+    // Only shout about it when there is NO matching graceful trip — that is the
+    // external-kill case this breadcrumb exists to catch. (A graceful self-restart
+    // writes both files within the same second; suppress the redundant line then.)
+    if (!lastTrip || (gapFromTrip != null && gapFromTrip > 5_000)) {
+      log.warn('prior process died WITHOUT a watchdog trip — external kill (SIGKILL 137 / health-check SIGTERM) suspected', {
+        lastAliveUptimeSec: priorLiveness.uptimeSec,
+        lastAliveRssMB: priorLiveness.rssMB,
+        lastAliveExternalMB: priorLiveness.externalMB,
+        lastAliveHeapPct: Number(priorLiveness.heapPct.toFixed(3)),
+        lastAliveLagMaxMs: priorLiveness.lagMaxMs,
+      });
+    }
+  }
+  const livenessIntervalMs = envNum(opts.env?.[WATCHDOG_LIVENESS_INTERVAL_MS_VAR] ?? process.env[WATCHDOG_LIVENESS_INTERVAL_MS_VAR], 15_000, 1_000, 300_000);
+  let lastLivenessWriteMs = 0;
+
   // ns-resolution event-loop delay histogram. Reset each window so lag reflects
   // only the most recent sampleMs, not a since-boot cumulative average.
   const histogram: IntervalHistogram = monitorEventLoopDelay({ resolution: 20 });
@@ -589,6 +717,28 @@ export function startEventLoopWatchdog(opts: StartWatchdogOptions = {}): Watchdo
         if (recentHighLag.length > HIGH_LAG_RING_MAX) recentHighLag.shift();
       }
     }
+    // TRA-1463 — throttled last-known-alive heartbeat to the DATA_DIR disk. Written
+    // every livenessIntervalMs (default 15s) INCLUDING during boot grace, so a box
+    // that dies mid-warmup still leaves a trail. This is what the NEXT boot reads as
+    // `priorLiveness` to attribute a death the watchdog exit path never saw.
+    if (atMs - lastLivenessWriteMs >= livenessIntervalMs) {
+      lastLivenessWriteMs = atMs;
+      persistLivenessHeartbeat(
+        {
+          atMs,
+          uptimeSec: Math.round((now() - startedAtMs) / 1000),
+          rssMB: Math.round(sample.rssBytes / 1e6),
+          heapUsedMB: Math.round(sample.heapUsedBytes / 1e6),
+          heapLimitMB: Math.round(sample.heapLimitBytes / 1e6),
+          heapPct: sample.heapPct,
+          externalMB: sample.externalBytes != null ? Math.round(sample.externalBytes / 1e6) : undefined,
+          arrayBuffersMB: sample.arrayBuffersBytes != null ? Math.round(sample.arrayBuffersBytes / 1e6) : undefined,
+          lagMeanMs: Math.round(sample.lagMeanMs),
+          lagMaxMs: Math.round(sample.lagMaxMs),
+        },
+        opts.env,
+      );
+    }
     lastStatus = {
       enabled: cfg.enabled,
       restartEnabled: cfg.restartEnabled,
@@ -603,6 +753,7 @@ export function startEventLoopWatchdog(opts: StartWatchdogOptions = {}): Watchdo
       tripped,
       trippedReason,
       lastTrip,
+      priorLiveness,
     };
   }
 
@@ -731,6 +882,7 @@ export function startEventLoopWatchdog(opts: StartWatchdogOptions = {}): Watchdo
           tripped: false,
           trippedReason: null,
           lastTrip,
+          priorLiveness,
         }
       );
     },
