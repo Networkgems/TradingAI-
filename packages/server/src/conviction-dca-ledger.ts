@@ -28,6 +28,7 @@
 import { appendFileSync, mkdirSync, readFileSync } from 'fs';
 import { dirname, join } from 'path';
 import { logger } from './observability/index.js';
+import { timeSyncPhase } from './phase-timing.js';
 
 const log = logger.child({ module: 'conviction-dca-ledger' });
 
@@ -162,26 +163,30 @@ export function hydrateConvictionDcaFromDisk(dir: string): ConvictionDcaHydratio
   clearConvictionDcaLedger();
   dataDir = dir;
 
-  let raw = '';
-  try {
-    raw = readFileSync(convictionDcaLogPath(dir), 'utf8');
-  } catch {
-    raw = '';
-  }
-  for (const line of raw.split('\n')) {
-    const trimmed = line.trim();
-    if (trimmed === '') continue;
+  // TRA-1463 — boot-hydrate synchronous read+parse; wrap so a stall here is NAMED
+  // in the watchdog trip breadcrumb (`slowPhase`).
+  return timeSyncPhase('hydrate.convictionDca', () => {
+    let raw = '';
     try {
-      const fill = JSON.parse(trimmed) as ConvictionDcaFill;
-      if (typeof fill.ts === 'number' && Number.isFinite(fill.realizedRiskDollars)) {
-        applyFill(fill);
-      }
+      raw = readFileSync(convictionDcaLogPath(dir), 'utf8');
     } catch {
-      // skip a torn/partial trailing line rather than abort the hydrate
+      raw = '';
     }
-  }
+    for (const line of raw.split('\n')) {
+      const trimmed = line.trim();
+      if (trimmed === '') continue;
+      try {
+        const fill = JSON.parse(trimmed) as ConvictionDcaFill;
+        if (typeof fill.ts === 'number' && Number.isFinite(fill.realizedRiskDollars)) {
+          applyFill(fill);
+        }
+      } catch {
+        // skip a torn/partial trailing line rather than abort the hydrate
+      }
+    }
 
-  return { addCount, breachCount, firstAddAt, lastAddAt };
+    return { addCount, breachCount, firstAddAt, lastAddAt };
+  });
 }
 
 /**

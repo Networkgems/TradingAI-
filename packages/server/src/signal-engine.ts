@@ -30,6 +30,7 @@ import { evaluateExecutionGate, buildOrderAudit, killSwitchClear } from './agent
 import { recordExecutedOrder } from './agent-execution-caps-store.js';
 import { getUserMemorySync, recordInteractionOutcome } from './user-trading-memory-store.js';
 import { getLatestMarketReview } from './market-review.js';
+import { withPhase } from './phase-timing.js';
 import { getLatestReviewBlock } from './research-store.js';
 import { earningsInDaysSync } from './earnings-store.js';
 import { recordShadowSignal, resolveShadowSignal, resolveOutcome, openShadowSignalsSync, type ShadowSignalRecord } from './shadow-signal-ledger.js';
@@ -2409,7 +2410,10 @@ export class SignalEngine {
 
   private async runTickGuarded(): Promise<void> {
     try {
-      await this.doTick();
+      // TRA-1463 — hold the in-flight phase pointer across the tick so a synchronous
+      // block inside doTick is attributed to `signal.doTick` in the watchdog trip
+      // breadcrumb (`activePhase`), naming the subsystem that starved the loop.
+      await withPhase('signal.doTick', () => this.doTick());
     } catch (err: unknown) {
       log.error('tick error', { reason: err instanceof Error ? err.message : String(err) });
     } finally {

@@ -34,6 +34,7 @@ import {
   SCALE_OUT_TAKER_FEE_CRYPTO,
 } from '@trading-app/shared';
 import { logger } from './observability/index.js';
+import { timeSyncPhase } from './phase-timing.js';
 
 const log = logger.child({ module: 'scaleout-ladder-ledger' });
 
@@ -239,36 +240,41 @@ export function hydrateScaleoutLadderFromDisk(dir: string): ScaleoutLadderHydrat
   clearScaleoutLadderLedger();
   dataDir = dir;
 
-  let raw = '';
-  try {
-    raw = readFileSync(scaleoutLadderLogPath(dir), 'utf8');
-  } catch {
-    raw = '';
-  }
-  for (const line of raw.split('\n')) {
-    const trimmed = line.trim();
-    if (trimmed === '') continue;
+  // TRA-1463 — this synchronous readFileSync + split + per-line JSON.parse is one
+  // of the boot-hydrate candidates for the residual ~71s event-loop block; wrap it
+  // so a stall here is NAMED in the watchdog trip breadcrumb (`slowPhase`).
+  return timeSyncPhase('hydrate.scaleoutLadder', () => {
+    let raw = '';
     try {
-      const rec = JSON.parse(trimmed) as ScaleoutTrimRecord;
-      if (
-        typeof rec.ts === 'number' &&
-        typeof rec.positionId === 'string' &&
-        typeof rec.up === 'number'
-      ) {
-        applyTrim(rec);
-      }
+      raw = readFileSync(scaleoutLadderLogPath(dir), 'utf8');
     } catch {
-      // skip a torn/partial trailing line rather than abort the hydrate
+      raw = '';
     }
-  }
+    for (const line of raw.split('\n')) {
+      const trimmed = line.trim();
+      if (trimmed === '') continue;
+      try {
+        const rec = JSON.parse(trimmed) as ScaleoutTrimRecord;
+        if (
+          typeof rec.ts === 'number' &&
+          typeof rec.positionId === 'string' &&
+          typeof rec.up === 'number'
+        ) {
+          applyTrim(rec);
+        }
+      } catch {
+        // skip a torn/partial trailing line rather than abort the hydrate
+      }
+    }
 
-  return {
-    trimCount,
-    fullExitCount,
-    positionCount: firedRungs.size,
-    firstTrimAt,
-    lastTrimAt,
-  };
+    return {
+      trimCount,
+      fullExitCount,
+      positionCount: firedRungs.size,
+      firstTrimAt,
+      lastTrimAt,
+    };
+  });
 }
 
 // ── Health summary ────────────────────────────────────────────────────────────

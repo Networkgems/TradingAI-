@@ -51,6 +51,7 @@ import { getHeapStatistics } from 'node:v8';
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { logger, flushLogs } from './observability/index.js';
+import { getPhaseAttribution, type PhaseAttribution, type SlowPhase } from './phase-timing.js';
 
 const log = logger.child({ module: 'event-loop-watchdog' });
 
@@ -94,6 +95,23 @@ export interface PersistedTrip {
   arrayBuffersMB?: number;
   lagMeanMs: number;
   lagMaxMs: number;
+  /**
+   * TRA-1463 — synchronous-phase attribution at the moment of the trip. For a
+   * `block` trip (the residual bqb1 ~71s single-window stall) this names the
+   * instrumented synchronous phase whose wall time just crossed the slow
+   * threshold — i.e. the code that blocked the loop — turning the very next
+   * self-restart's breadcrumb into a NAMED culprit instead of a bare lag number.
+   * Optional so pre-existing trip files stay readable and non-`block` trips omit it.
+   */
+  slowPhase?: SlowPhase | null;
+  /**
+   * TRA-1463 — the async tick/driver phase IN FLIGHT at the moment of the trip.
+   * For a `block` occurring inside an async tick this names the SUBSYSTEM whose
+   * synchronous section starved the loop (e.g. `crypto.doTick`), even when the
+   * block was the last op before the fn returned (which clears `slowPhase`'s
+   * pointer). `elapsedMs` is how long that phase had been running at trip time.
+   */
+  activePhase?: { name: string; elapsedMs: number } | null;
 }
 
 // TRA-1463 — periodic LIVENESS breadcrumb. `lastTrip` above only records a
@@ -137,6 +155,21 @@ export interface PersistedLiveness {
   arrayBuffersMB?: number;
   lagMeanMs: number;
   lagMaxMs: number;
+  /**
+   * TRA-1463 — the most-recent slow synchronous phase recorded at the moment of
+   * this liveness heartbeat. On a death that bypasses the watchdog exit path
+   * (external SIGKILL 137 / health-check SIGTERM), the NEXT boot reads this as
+   * `priorLiveness.slowPhase` — the last synchronous phase that held the loop
+   * before the box went dark. Optional so older breadcrumbs stay readable.
+   */
+  slowPhase?: SlowPhase | null;
+  /**
+   * TRA-1463 — the async tick/driver phase in flight at this heartbeat. On an
+   * external kill (SIGKILL 137 / health-check SIGTERM) mid-block, the next boot's
+   * `priorLiveness.activePhase` names the subsystem that was executing when the
+   * box went dark. Optional so older breadcrumbs stay readable.
+   */
+  activePhase?: { name: string; elapsedMs: number } | null;
 }
 
 /**
@@ -549,6 +582,13 @@ export interface WatchdogStatus {
    * on a truly-fresh disk (no prior heartbeat).
    */
   priorLiveness: PersistedLiveness | null;
+  /**
+   * TRA-1463 — live synchronous-phase attribution: the most-recent slow phase and
+   * a short ring of prior ones. A single `/api/health/watchdog` poll after a block
+   * names which instrumented synchronous phase held the loop, WITHOUT waiting for a
+   * self-restart. Absent until the first slow phase is recorded.
+   */
+  phaseAttribution?: PhaseAttribution;
 }
 
 export interface WatchdogHandle {
@@ -569,6 +609,12 @@ export interface StartWatchdogOptions {
   readHeap?: () => { usedBytes: number; limitBytes: number; rssBytes: number; externalBytes?: number; arrayBuffersBytes?: number };
   /** Clock seam for the boot-grace window (defaults to Date.now). */
   now?: () => number;
+  /**
+   * TRA-1463 — synchronous-phase attribution reader (defaults to the phase-timing
+   * module getter). Injectable so tests can assert breadcrumb attribution without
+   * the global phase-timing state.
+   */
+  readPhaseAttribution?: () => PhaseAttribution;
 }
 
 let lastStatus: WatchdogStatus | null = null;
@@ -634,6 +680,7 @@ export function startEventLoopWatchdog(opts: StartWatchdogOptions = {}): Watchdo
 
   const readHeap = opts.readHeap ?? defaultReadHeap;
   const onTrip = opts.onTrip ?? defaultOnTrip;
+  const readPhaseAttribution = opts.readPhaseAttribution ?? getPhaseAttribution;
   const now = opts.now ?? Date.now;
   const startedAtMs = now();
   const state: WatchdogState = { consecutiveHeapBreaches: 0, consecutiveLagBreaches: 0 };
@@ -696,6 +743,10 @@ export function startEventLoopWatchdog(opts: StartWatchdogOptions = {}): Watchdo
 
   function publish(sample: WatchdogSample): void {
     const atMs = Date.now();
+    // TRA-1463 — read the slow-phase attribution once per publish so the liveness
+    // heartbeat, the trip breadcrumb, and the live status all reflect the same
+    // most-recent blocking phase.
+    const phaseAttribution = readPhaseAttribution();
     // Only fold steady-state (post-grace) samples into the peak/ring so warmup's
     // legitimate synchronous candle-load blocks don't pollute the evidence.
     if (now() - startedAtMs >= cfg.bootGraceMs) {
@@ -735,6 +786,8 @@ export function startEventLoopWatchdog(opts: StartWatchdogOptions = {}): Watchdo
           arrayBuffersMB: sample.arrayBuffersBytes != null ? Math.round(sample.arrayBuffersBytes / 1e6) : undefined,
           lagMeanMs: Math.round(sample.lagMeanMs),
           lagMaxMs: Math.round(sample.lagMaxMs),
+          slowPhase: phaseAttribution.lastSlowPhase,
+          activePhase: phaseAttribution.activePhase,
         },
         opts.env,
       );
@@ -754,6 +807,7 @@ export function startEventLoopWatchdog(opts: StartWatchdogOptions = {}): Watchdo
       trippedReason,
       lastTrip,
       priorLiveness,
+      phaseAttribution,
     };
   }
 
@@ -817,6 +871,9 @@ export function startEventLoopWatchdog(opts: StartWatchdogOptions = {}): Watchdo
       // restartEnabled is false (observe-only) so a dry-run box still records the
       // would-be trip. Synchronous + guarded; never blocks the exit.
       if (decision.reason) {
+        // TRA-1463 — read the phase attribution ONCE at trip time so slowPhase +
+        // activePhase reflect the same instant the loop was starved.
+        const tripAttribution = readPhaseAttribution();
         persistTripRecord(
           {
             reason: decision.reason,
@@ -830,6 +887,8 @@ export function startEventLoopWatchdog(opts: StartWatchdogOptions = {}): Watchdo
             arrayBuffersMB: sample.arrayBuffersBytes != null ? Math.round(sample.arrayBuffersBytes / 1e6) : undefined,
             lagMeanMs: Math.round(sample.lagMeanMs),
             lagMaxMs: Math.round(sample.lagMaxMs),
+            slowPhase: tripAttribution.lastSlowPhase,
+            activePhase: tripAttribution.activePhase,
           },
           opts.env,
         );

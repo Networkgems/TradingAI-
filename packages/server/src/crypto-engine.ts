@@ -46,6 +46,7 @@ import {
   listTradableCoinbaseUsdSymbols,
 } from './crypto-feed.js';
 import { isYahooBreakerOpen } from './yahoo-feed.js';
+import { withPhase } from './phase-timing.js';
 import { isColdStartDailyPrefetchEnabled, resolveColdStartPrefetchPerMin, resolveColdStartPrefetchBootDelayMs, recordColdStartPrefetchRun } from './daily-prefetch-flag.js';
 import { evaluateFeedFreshness } from './feed-freshness.js';
 import { CryptoPaperAccount } from './crypto-account.js';
@@ -1327,7 +1328,10 @@ export class CryptoSignalEngine {
 
   private async runTickGuarded(): Promise<void> {
     try {
-      await this.doTick();
+      // TRA-1463 — hold the in-flight phase pointer across the tick so a synchronous
+      // block inside doTick is attributed to `crypto.doTick` in the watchdog trip
+      // breadcrumb (`activePhase`), naming the subsystem that starved the loop.
+      await withPhase('crypto.doTick', () => this.doTick());
     } catch (err: unknown) {
       log.error('tick error', { reason: err instanceof Error ? err.message : String(err) });
     } finally {
