@@ -179,6 +179,61 @@ export const DEMO_FLAG_ALLOWLIST = [
 export const DEMO_FLAGS_FILENAME = 'demo-flags.json';
 
 /**
+ * TRA-1481 — board-ratified DEMO brakes that MUST be armed on the demo book but go
+ * DARK on bqb1/Render because the Render *blueprint env-sync is OFF*: a code
+ * autoDeploy ships new code but does NOT re-sync env from render.yaml (TRA-1289), so
+ * a `value` added to render.yaml AFTER the last manual blueprint sync never reaches
+ * the running process. `GET /api/health/churn-brake` proved this — `armed:false` on
+ * `d91b59a` despite render.yaml declaring `ENABLE_CHURN_LOSS_BRAKE: "1"` since
+ * `1e55e5c`, and the Render key needed for a blueprint sync is blocked (TRA-969).
+ *
+ * Each entry is a flag the board ALREADY RATIFIED `=1` in render.yaml for the demo
+ * book, whose value is that ratified arm. {@link renderRatifiedDemoDefaults} seeds
+ * these into the boot env ON RENDER ONLY, and only when the flag is set by NEITHER
+ * process.env NOR the demo-flags.json file — so the ratified arm self-heals across
+ * the env-sync gap and every redeploy, while an explicit operator/board value (env,
+ * or a demo-flags.json write via `/api/admin/demo-flags` — including a deliberate
+ * `=0` disarm, which wins because the file layers OVER env) is ALWAYS preserved. The
+ * flags' own defaults stay OFF (their unit contracts are untouched); this only
+ * re-delivers a render.yaml value the blueprint sync failed to apply.
+ *
+ * STRICT admission for an entry: (1) board-ratified `=1` in render.yaml, (2)
+ * demo-only / structurally incapable of touching live capital, (3) pure
+ * risk-reducing. Remove an entry the moment the board de-ratifies the flag.
+ */
+export const RENDER_RATIFIED_DEMO_DEFAULTS: Readonly<Record<string, string>> = {
+  // TRA-1408 / TRA-1481 — per-name churn + same-day-loss brake. render.yaml `=1`
+  // since `1e55e5c`; consulted ONLY on the demo branches (churnOpenCapVerdict bails
+  // on `mode==='live'`; the DCA-halt branches are demo-only), so it can never alter
+  // a live open or add. Board-ratified demo arm.
+  ENABLE_CHURN_LOSS_BRAKE: '1',
+};
+
+/**
+ * TRA-1481 — resolve which {@link RENDER_RATIFIED_DEMO_DEFAULTS} entries should be
+ * seeded into the boot env. Returns entries ONLY when running on Render
+ * (`env.RENDER` set — render.yaml is the source of truth there; the self-host, which
+ * has no blueprint, is never touched) AND the flag is absent from BOTH `env` and the
+ * existing `<dataDir>/demo-flags.json`, so an explicit value from either source is
+ * never overridden. The caller applies the result to `process.env` at boot. Pure
+ * (no side effects) so it is unit-testable with a fake env.
+ */
+export function renderRatifiedDemoDefaults(
+  dataDir: string,
+  env: NodeJS.ProcessEnv = process.env,
+): Record<string, string> {
+  if (!env.RENDER) return {}; // Render-only: render.yaml governs env there
+  const file = loadDemoFlagFile(dataDir);
+  const out: Record<string, string> = {};
+  for (const [key, value] of Object.entries(RENDER_RATIFIED_DEMO_DEFAULTS)) {
+    const inEnv = typeof env[key] === 'string' && env[key]!.trim() !== '';
+    const inFile = Object.prototype.hasOwnProperty.call(file, key);
+    if (!inEnv && !inFile) out[key] = value;
+  }
+  return out;
+}
+
+/**
  * Read allowlisted demo flags from `<dataDir>/demo-flags.json`. Returns an empty
  * object when the file is absent or malformed — the default, zero-override path.
  * Values are coerced to strings so they slot straight into a `ProcessEnv`.

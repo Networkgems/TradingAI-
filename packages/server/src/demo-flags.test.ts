@@ -13,6 +13,7 @@ import {
   loadDemoFlagFile,
   resolveDemoFlagEnv,
   writeDemoFlagFile,
+  renderRatifiedDemoDefaults,
   DEMO_FLAGS_FILENAME,
 } from './demo-flags.js';
 import { isAutonomousDemoLoopEnabled } from './autonomous-demo-loop.js';
@@ -131,6 +132,38 @@ describe('writeDemoFlagFile (TRA-1481 — arm a demo flag on a shell-less runnin
     expect(resolveDemoFlagEnv(dir, base)['ENABLE_CHURN_LOSS_BRAKE']).toBeUndefined();
     writeDemoFlagFile(dir, { ENABLE_CHURN_LOSS_BRAKE: '1' });
     expect(resolveDemoFlagEnv(dir, base)['ENABLE_CHURN_LOSS_BRAKE']).toBe('1');
+  });
+});
+
+describe('renderRatifiedDemoDefaults (TRA-1481 — self-heal the Render blueprint env-sync gap)', () => {
+  it('is a NO-OP off Render (self-host / local — no RENDER env)', () => {
+    expect(renderRatifiedDemoDefaults(dir, {} as NodeJS.ProcessEnv)).toEqual({});
+  });
+
+  it('seeds the board-ratified churn brake on Render when set by neither env nor file', () => {
+    const env = { RENDER: 'true' } as NodeJS.ProcessEnv;
+    expect(renderRatifiedDemoDefaults(dir, env)).toEqual({ ENABLE_CHURN_LOSS_BRAKE: '1' });
+  });
+
+  it('does NOT override an explicit env value (a synced blueprint / dashboard value wins)', () => {
+    const env = { RENDER: 'true', ENABLE_CHURN_LOSS_BRAKE: '0' } as NodeJS.ProcessEnv;
+    expect(renderRatifiedDemoDefaults(dir, env)).toEqual({});
+  });
+
+  it('does NOT override a demo-flags.json value — a board disarm via /api/admin/demo-flags is preserved', () => {
+    // The board POSTs a deliberate `=0` disarm; the file layers over env, so the
+    // seed must not re-arm it on the next boot.
+    writeDemoFlagFile(dir, { ENABLE_CHURN_LOSS_BRAKE: '0' });
+    const env = { RENDER: 'true' } as NodeJS.ProcessEnv;
+    expect(renderRatifiedDemoDefaults(dir, env)).toEqual({});
+  });
+
+  it('end-to-end: seeding the boot env arms the brake through the same overlay the engine reads', () => {
+    const env = { RENDER: 'true' } as NodeJS.ProcessEnv;
+    // Before the seed, the flag is dark on the running process (the bqb1 bug).
+    expect(resolveDemoFlagEnv(dir, env)['ENABLE_CHURN_LOSS_BRAKE']).toBeUndefined();
+    Object.assign(env, renderRatifiedDemoDefaults(dir, env)); // boot applies to process.env
+    expect(resolveDemoFlagEnv(dir, env)['ENABLE_CHURN_LOSS_BRAKE']).toBe('1');
   });
 });
 

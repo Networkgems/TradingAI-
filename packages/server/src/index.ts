@@ -50,6 +50,7 @@ import {
   resolveDemoFlagEnv,
   loadDemoFlagFile,
   writeDemoFlagFile,
+  renderRatifiedDemoDefaults,
   DEMO_FLAG_ALLOWLIST,
 } from './demo-flags.js';
 // TRA-1216 — observe-only perp funding-carry scanner + forward funding-history
@@ -453,6 +454,22 @@ const log = logger.child({ module: 'index' });
 const PORT = Number(process.env.PORT ?? 4242);
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const DATA_DIR = process.env.DATA_DIR ?? join(__dirname, '..', 'data');
+
+// TRA-1481 — self-heal the Render blueprint env-sync gap for board-ratified DEMO
+// brakes. On bqb1/Render an autoDeploy ships code but does NOT re-sync env from
+// render.yaml (TRA-1289), so `ENABLE_CHURN_LOSS_BRAKE:"1"` (ratified since 1e55e5c)
+// stayed DARK (`/api/health/churn-brake` → armed:false) and the Render key needed
+// for a blueprint sync is blocked (TRA-969). Seed the ratified arm into the boot env
+// ON RENDER ONLY, and only when it's set by NEITHER process.env NOR demo-flags.json,
+// so a board disarm via `/api/admin/demo-flags` (the file layers OVER env) still
+// wins and the self-host is untouched. DEMO-only ⇒ zero real-capital risk.
+for (const [key, value] of Object.entries(renderRatifiedDemoDefaults(DATA_DIR))) {
+  process.env[key] = value;
+  log.info('TRA-1481 seeded board-ratified demo flag on Render (blueprint-sync gap)', {
+    flag: key,
+    value,
+  });
+}
 
 // TRA-1008 — effective env for demo-loop flags: process.env with the
 // allowlisted <DATA_DIR>/demo-flags.json values layered on top. Re-read on each
