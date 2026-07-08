@@ -394,6 +394,15 @@ export class PaperOptionsAccount {
    */
   private lastEntryRejection: string | null = null;
   /**
+   * TRA-1475 — the owning demo book's username, stamped onto every journal OPEN
+   * (see {@link queueJournalOpen}) so the firm-wide DESK calendar fold can drop
+   * QA/test accounts. Bound after construction via {@link setOwner} from the
+   * per-user engine's {@link SignalEngine.setAlertUsername} wire-up. Undefined
+   * until bound (and for the ambient/no-user engine), so an un-owned open omits
+   * the field and the desk filter keeps it (can't classify).
+   */
+  private owner?: string;
+  /**
    * TRA-246 — realized options P&L split per account mode. Replaces the
    * single bucket-wide `optionsPnl` so `getStateForMode('demo')` no longer
    * surfaces P&L accrued by live-mode trades on the Demo dashboard. Every
@@ -517,6 +526,16 @@ export class PaperOptionsAccount {
     return this.tradierEnv;
   }
 
+  /**
+   * TRA-1475 — bind the owning demo book's username so journal OPEN rows carry an
+   * `account` the firm-wide DESK fold can filter QA/test books by. Idempotent and
+   * cheap; called from the per-user engine wire-up. Passing an empty string
+   * clears the owner (un-owned opens omit `account`).
+   */
+  setOwner(username: string): void {
+    this.owner = username && username.length > 0 ? username : undefined;
+  }
+
   /** TRA-361 — read the auto-manage-imports flag (tests / introspection). */
   isAutoManagingImportedTradierOptions(): boolean {
     return this.autoManageImportedTradierOptions;
@@ -581,6 +600,9 @@ export class PaperOptionsAccount {
       ...(typeof entrySlippageUsd === 'number' && Number.isFinite(entrySlippageUsd)
         ? { entrySlippageUsd }
         : {}),
+      // TRA-1475 — stamp the owning book so the DESK fold can exclude QA/test
+      // accounts. Only when bound (un-owned engines omit it → kept by the filter).
+      ...(this.owner ? { account: this.owner } : {}),
     };
     this.journalWrites = this.journalWrites
       .then(() => recordOptionTradeOpen(open))

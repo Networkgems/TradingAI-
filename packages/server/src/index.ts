@@ -11,6 +11,7 @@ import { generateEodReport, wouldClobberSettledReport } from './reports/eod-repo
 import { reconcilePnl } from './pnl-reconciliation.js';
 import { generateCryptoEodReport } from './reports/crypto-eod-report.js';
 import { aggregateDeskCalendar } from './reports/desk-calendar.js';
+import { excludeTestAccountRows } from './test-accounts.js';
 import {
   listOptionTradeJournal,
   summarizeOptionTradeJournal,
@@ -383,6 +384,7 @@ import {
   runFirstBootMigration,
   runTra237OptionsReset,
   runTra241CalendarReset,
+  runTra1472StaleCellCleanup,
   runTra301DemoFreshStart,
   runTra330CryptoEquityReset,
   runTra338MegaUsdCleanup,
@@ -621,6 +623,11 @@ await runTra237OptionsReset();
 // clean. Wipes per-user EOD reports + daily-snapshots before PnlTracker
 // reads them on first construction. Idempotent via marker file.
 await runTra241CalendarReset();
+// TRA-1475 (Part 2) — one-shot scrub of pre-TRA-594 corrupted demo calendar
+// cells (the frozen cumulative-optionsPnl leak repeated across consecutive
+// pre-2026-06-09 days). Deletes only the leaked historical cell files; post-fix
+// cells are never touched. Idempotent via marker file.
+await runTra1472StaleCellCleanup();
 // TRA-301 — full demo fresh-start: with the new strategy generation rolling
 // out for both Stocks and Crypto, the board asked to wipe every user's
 // persisted demo P&L, equity baselines, trade history, and calendar reports
@@ -5696,9 +5703,16 @@ app.get('/api/reports', requireAuth, async (req, res) => {
 // consumes — `GET /api/reports/desk` → `{ dates: string[] }` (newest-first) and
 // `GET /api/reports/desk/:date` → the per-day `EodReport` cell — so the UI only
 // switches its `reportsPath`, not its rendering.
-app.get('/api/reports/desk', requireAuth, requireAdmin, async (_req, res) => {
+app.get('/api/reports/desk', requireAuth, requireAdmin, async (req, res) => {
   try {
-    const rows = await listOptionTradeJournal({ mode: 'demo' });
+    // TRA-1475 — de-noise: drop QA/test books (`qa*`, `ctoverify*`, `monitor_qa`,
+    // …) so the firm Desk number reflects real books only. `?includeTest=1` opts
+    // the test churn back in for debugging. Legacy un-owned rows are kept.
+    const includeTest = req.query['includeTest'] === '1';
+    const rows = excludeTestAccountRows(
+      await listOptionTradeJournal({ mode: 'demo' }),
+      { includeTest },
+    );
     const cells = aggregateDeskCalendar(rows, Date.now());
     res.json({ dates: [...cells.keys()].sort().reverse() });
   } catch (err) {
@@ -5716,7 +5730,13 @@ app.get('/api/reports/desk/:date', requireAuth, requireAdmin, async (req, res) =
     return;
   }
   try {
-    const rows = await listOptionTradeJournal({ mode: 'demo' });
+    // TRA-1475 — same QA/test de-noise as the date-list route so a drilled-in
+    // day cell matches the (filtered) figure the grid shows.
+    const includeTest = req.query['includeTest'] === '1';
+    const rows = excludeTestAccountRows(
+      await listOptionTradeJournal({ mode: 'demo' }),
+      { includeTest },
+    );
     const cell = aggregateDeskCalendar(rows, Date.now()).get(date);
     if (!cell) {
       res.status(404).json({ error: `No desk report for ${date}` });

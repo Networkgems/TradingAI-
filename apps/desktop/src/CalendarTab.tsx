@@ -640,8 +640,9 @@ export function CalendarTab({ token, httpUrl, reportsPath = '/api/reports', mode
         }}>
           <strong>Desk (all demo books)</strong> — firm-wide <em>demo</em> forward-test.
           Each cell is the whole fleet's <strong>realized option</strong> P&amp;L for that day
-          (from the shared Option-Trade Journal), summed across every demo book — <em>not</em> your
-          personal account. Switch to <strong>My Account</strong> for your own book.
+          (from the shared Option-Trade Journal), summed across every real demo book — <em>not</em> your
+          personal account. QA/test accounts (e.g. <code>qa*</code>, <code>ctoverify*</code>) are
+          excluded (new closes only). Switch to <strong>My Account</strong> for your own book.
         </div>
       )}
 

@@ -1,5 +1,6 @@
 import { describe, it, expect } from 'vitest';
 import { aggregateDeskCalendar, buildDeskDayReport } from './desk-calendar.js';
+import { excludeTestAccountRows } from '../test-accounts.js';
 import type { OptionTradeJournalRecord } from '../option-trade-journal.js';
 
 // TRA-1413 — the DESK (all demo books) calendar folds the firm-wide demo
@@ -82,6 +83,34 @@ describe('aggregateDeskCalendar', () => {
     expect(row.kind).toBe('option');
     expect(row.pnl).toBe(25);
     expect(row.symbol).toBe('AAPL');
+  });
+});
+
+describe('DESK de-noise — excludeTestAccountRows feeding the fold (TRA-1475)', () => {
+  it('drops QA/test book closes from the day cell, keeps real + un-owned', () => {
+    const rows = [
+      closed({ id: 'real', closeTs: JUL01, realizedPnlUsd: 300, account: 'richard' }),
+      closed({ id: 'qa', closeTs: JUL01, realizedPnlUsd: 9000, account: 'qa_loop_7' }),
+      closed({ id: 'cto', closeTs: JUL01, realizedPnlUsd: 5000, account: 'ctoverify1' }),
+      closed({ id: 'legacy', closeTs: JUL01, realizedPnlUsd: 40 }), // un-owned → kept
+    ];
+    const cell = aggregateDeskCalendar(excludeTestAccountRows(rows), GEN).get('2026-07-01');
+    // only the real (300) + legacy un-owned (40) closes survive
+    expect(cell!.combinedPnl).toBe(340);
+    expect(cell!.totalTrades).toBe(2);
+  });
+
+  it('includeTest keeps the QA churn in the number', () => {
+    const rows = [
+      closed({ id: 'real', closeTs: JUL01, realizedPnlUsd: 300, account: 'richard' }),
+      closed({ id: 'qa', closeTs: JUL01, realizedPnlUsd: 9000, account: 'qa_loop_7' }),
+    ];
+    const cell = aggregateDeskCalendar(
+      excludeTestAccountRows(rows, { includeTest: true }),
+      GEN,
+    ).get('2026-07-01');
+    expect(cell!.combinedPnl).toBe(9300);
+    expect(cell!.totalTrades).toBe(2);
   });
 });
 
