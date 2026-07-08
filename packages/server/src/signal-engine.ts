@@ -10451,7 +10451,19 @@ export function shouldBootArmLiveEquity(
   // alongside `mode:'live'`, so {@link buildTradierLiveEquityClient} constructs the
   // PRODUCTION Tradier client (not sandbox). Operator scope (isLiveBrokerOperator)
   // and service prod-env still bound this to only the pinned `admin` engine on bqb1.
-  if (!resolveLiveTradeEquitiesTradier(settings)) return false;
+  //
+  // TRA-1482 — do NOT gate the boot-arm on the persisted `liveTradeEquitiesTradier`
+  // opt-out. That per-account toggle is the same un-durable class as the
+  // `liveTradierEnvOptions` gate TRA-1411 already removed: it is only settable via an
+  // admin-authed PUT /api/account/settings (unreachable on redeploy-only bqb1), so once
+  // the operator's persisted settings carried `liveTradeEquitiesTradier:false` (as they
+  // did after the aabcfc8a redeploy) the board-ratified arm went inert again —
+  // `liveEquityClientConfigured:false`, 132 live signals / 0 fills. The arm now derives
+  // PURELY from the always-present SERVICE env (operator pin + `TRADIER_ENV=production` +
+  // resolvable prod creds), and the boot-arm block in user-context force-persists
+  // `liveTradeEquitiesTradier:true` alongside `mode:'live'` so the constructed engine's
+  // {@link buildTradierLiveEquityClient} (which independently checks the toggle) actually
+  // arms. The durable kill-switch is unchanged: an empty `LIVE_EQUITY_BOOT_USER` disarms.
   // Prod creds must resolve — per-user PRODUCTION creds OR the operator's shared-env
   // `TRADIER_API_TOKEN`/`TRADIER_ACCOUNT_ID` fallback. Read the production fields
   // directly (not via resolveTradierOptionsCreds, whose env may still read 'sandbox'

@@ -695,11 +695,20 @@ async function createUserContext(username: string): Promise<UserContext> {
     // shouldBootArmLiveEquity already restricts this to the pinned operator on the prod
     // (TRADIER_ENV=production) service, so no non-operator / sandbox engine is affected.
     settings.liveTradierEnvOptions = 'production';
+    // TRA-1482 — also force the live-equity toggle ON. `buildTradierLiveEquityClient`
+    // independently gates on `resolveLiveTradeEquitiesTradier(settings)`, so a persisted
+    // `liveTradeEquitiesTradier:false` opt-out (unreachable to un-set on redeploy-only
+    // bqb1) left the engine unarmed even after this block flipped it to Live — the exact
+    // aabcfc8a regression (liveEquityClientConfigured:false / 132 skipped live signals).
+    // Persisting it true here makes the operator's durable state self-consistent so the
+    // arm survives every redeploy. Same operator/prod-env scope as above.
+    settings.liveTradeEquitiesTradier = true;
     try {
       await saveSettings(username, settings);
-      log.info('TRA-713/TRA-1411 boot-arm: forced production stocks engine to Live at boot', {
+      log.info('TRA-713/TRA-1411/TRA-1482 boot-arm: forced production stocks engine to Live at boot', {
         username,
         liveTradierEnvOptions: settings.liveTradierEnvOptions,
+        liveTradeEquitiesTradier: settings.liveTradeEquitiesTradier,
       });
     } catch (err: unknown) {
       log.warn('TRA-713 boot-arm: failed to persist forced live mode (engine still boots Live in-memory)', {

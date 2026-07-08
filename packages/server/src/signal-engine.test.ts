@@ -4187,9 +4187,32 @@ describe('shouldBootArmLiveEquity — TRA-713 persistent live-equity boot-arm', 
     expect(shouldBootArmLiveEquity(s, PIN, prodEnv())).toBe(false);
   });
 
-  it('respects an explicit liveTradeEquitiesTradier:false opt-out', () => {
+  it('TRA-1482: overrides a persisted liveTradeEquitiesTradier:false opt-out (un-durable per-account toggle)', () => {
+    // The persisted `liveTradeEquitiesTradier` opt-out is only settable via an admin-authed
+    // settings PUT (unreachable on redeploy-only bqb1). Gating the arm on it regressed the
+    // board-ratified boot-arm on the aabcfc8a redeploy (liveEquityClientConfigured:false /
+    // 132 skipped live signals) — the same un-durable class TRA-1411 removed for
+    // `liveTradierEnvOptions`. The arm now derives purely from the service env, and the
+    // boot-arm block force-persists the toggle true. The durable kill-switch is the empty pin.
     const s = { ...prodSettings(), liveTradeEquitiesTradier: false };
-    expect(shouldBootArmLiveEquity(s, PIN, prodEnv())).toBe(false);
+    expect(shouldBootArmLiveEquity(s, PIN, prodEnv())).toBe(true);
+  });
+
+  it('TRA-1482: arms the exact aabcfc8a bqb1 regression shape (unset pin + env-only creds + demo + opt-out)', () => {
+    // Reproduces the live regression: LIVE_EQUITY_BOOT_USER unset (bootArmPinConfigured:false
+    // → default "admin"), no per-user creds (server-env TRADIER_* fallback only), operator
+    // persisted mode:'demo' with liveTradeEquitiesTradier:false. Pre-TRA-1482 this returned
+    // false and the arm stayed inert across every redeploy.
+    const s: AccountSettings = {
+      ...DEFAULT_ACCOUNT_SETTINGS,
+      mode: 'demo',
+      liveTradeEquitiesTradier: false,
+      liveApiKeyOptionsProduction: '',
+      liveAccountIdOptionsProduction: '',
+    };
+    const env = prodEnv({ TRADIER_API_TOKEN: 'env-tok', TRADIER_ACCOUNT_ID: 'env-acct' });
+    delete env['LIVE_EQUITY_BOOT_USER'];
+    expect(shouldBootArmLiveEquity(s, 'admin', env)).toBe(true);
   });
 });
 
