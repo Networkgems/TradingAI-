@@ -154,6 +154,20 @@ export const DEMO_FLAG_ALLOWLIST = [
   // (caller passes a 0 arm floor). Non-secret, demo-safe — file override lets the
   // board arm it daemon-free (no PM2/admin) after QuantTrader forward-validates.
   'BOOK_GIVEBACK_ARM_FLOOR_ENABLED',
+  // TRA-1476 (parent TRA-1471, defense-in-depth with TRA-1408) — the
+  // liquidity/quality + per-name churn gate on the DEMO directional "ignition"
+  // entry path (that path stacked a thin sub-$5 micro-cap 28× in one morning for
+  // -$432.50). SUB-flag layered ON TOP of ENABLE_OPTION_DEMO_DIRECTIONAL — the
+  // signal-engine consults it ONLY on the demo directional chokepoint
+  // (`evaluateDemoDirectional`, hard-gated `mode === 'demo'`), so a file flip can
+  // NEVER alter a live open. The three numeric knobs tune the floors/cap (defaults
+  // 5 / 250000 / 3; QuantTrader's locked call is 10 / 300000 / 2). Non-secret,
+  // demo-only — allowlisted so the board can re-tune/revert daemon-free on the
+  // self-hosted host without a redeploy (bqb1 arms via render.yaml + push).
+  'ENABLE_OPTION_DIRECTIONAL_QUALITY_GATE',
+  'OPTION_DIRECTIONAL_MIN_UNDERLYING_PRICE',
+  'OPTION_DIRECTIONAL_MIN_AVG_DOLLAR_VOLUME',
+  'OPTION_DIRECTIONAL_MAX_OPENS_PER_NAME',
 ] as const;
 
 export const DEMO_FLAGS_FILENAME = 'demo-flags.json';

@@ -69,6 +69,21 @@ describe('loadDemoFlagFile', () => {
       CHURN_SAME_SESSION_OPEN_CAP: '5',
     });
   });
+
+  it('honors the TRA-1476 directional quality-gate demo flags (arm lever + tunable floors/cap)', () => {
+    writeFlags({
+      ENABLE_OPTION_DIRECTIONAL_QUALITY_GATE: 1,
+      OPTION_DIRECTIONAL_MIN_UNDERLYING_PRICE: 10,
+      OPTION_DIRECTIONAL_MIN_AVG_DOLLAR_VOLUME: '300000',
+      OPTION_DIRECTIONAL_MAX_OPENS_PER_NAME: 2,
+    });
+    expect(loadDemoFlagFile(dir)).toEqual({
+      ENABLE_OPTION_DIRECTIONAL_QUALITY_GATE: '1',
+      OPTION_DIRECTIONAL_MIN_UNDERLYING_PRICE: '10',
+      OPTION_DIRECTIONAL_MIN_AVG_DOLLAR_VOLUME: '300000',
+      OPTION_DIRECTIONAL_MAX_OPENS_PER_NAME: '2',
+    });
+  });
 });
 
 describe('resolveDemoFlagEnv', () => {

@@ -292,6 +292,37 @@ services:
       # this value. Accepts the usual truthy spellings (1/true/yes/on).
       - key: ENABLE_OPTION_DEMO_DIRECTIONAL
         value: "true"
+      # TRA-1476 (parent TRA-1471, defense-in-depth with TRA-1408) — arm the
+      # liquidity/quality + per-name churn gate on the DEMO directional entry above.
+      # WHY: on 2026-07-08 this directional call/put pass stacked AMPG (a thin sub-$5
+      # micro-cap) 28× in one morning for -$432.50 — the worst single-name drag of
+      # the day — because it had NO price / $-volume floor and NO per-name open cap
+      # (its only guard was a 1-hour SAME-OCC dedup a drifting ATM strike sidesteps),
+      # and it never fed the TRA-1408 churn counter so that brake couldn't see it.
+      # This SUB-flag (layered ON TOP of ENABLE_OPTION_DEMO_DIRECTIONAL above — it is
+      # inert unless that path is itself on) rejects a directional open when the
+      # underlier is sub-$10, per-5m-bar avg $-volume is below $300k, or the name
+      # already opened 2× this ET session. Thresholds are QuantTrader's locked call
+      # (TRA-1476 comment, 2026-07-08): $10 / $300000-per-5m-bar / 2-opens-per-name.
+      # DEMO-SCOPED BY CONSTRUCTION: the signal-engine consults it ONLY on the demo
+      # directional chokepoint (`evaluateDemoDirectional`), which is hard-gated
+      # `mode === 'demo'` and never mirrors to Tradier — so setting it here can NEVER
+      # alter a live equity/options open. It only ever makes the demo path open
+      # LESS. Forward-watch (QuantTrader, parent TRA-1471): confirm 0 sub-$10 /
+      # sub-$300k opens and <=2 opens/name/day; invalidation = a name we'd WANT gets
+      # rejected on the floors, or demo directional P&L doesn't beat the -$432.50
+      # AMPG baseline -> re-tune ($300k->$250k and/or cap 2->3), no live push. Revert
+      # = clear this value + redeploy. NOTE: blueprint sync != autoDeploy on bqb1
+      # (TRA-1289) — a push to main triggers autoDeploy, which is what makes these
+      # vars take effect. Accepts 1/true/yes/on.
+      - key: ENABLE_OPTION_DIRECTIONAL_QUALITY_GATE
+        value: "1"
+      - key: OPTION_DIRECTIONAL_MIN_UNDERLYING_PRICE
+        value: "10"
+      - key: OPTION_DIRECTIONAL_MIN_AVG_DOLLAR_VOLUME
+        value: "300000"
+      - key: OPTION_DIRECTIONAL_MAX_OPENS_PER_NAME
+        value: "2"
       # TRA-1292 — arm the OBSERVE-ONLY defined-risk SHORT-PREMIUM scanner (credit
       # spreads / iron condors) on the demo book. Each demo tick (market hours)
       # rides the SAME warm RV selector chain, computes realised vol from the
