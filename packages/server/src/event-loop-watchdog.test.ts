@@ -1,9 +1,14 @@
 import { describe, it, expect, afterEach } from 'vitest';
+import { mkdtempSync, rmSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import {
   resolveConfig,
   evaluateSample,
   startEventLoopWatchdog,
   getWatchdogStatus,
+  resolveTripLogPath,
+  readLastTrip,
   _resetWatchdogForTests,
   DEFAULT_WATCHDOG,
   type WatchdogConfig,
@@ -308,6 +313,61 @@ describe('startEventLoopWatchdog', () => {
     expect(status?.lastSample?.heapPct).toBeCloseTo(0.5, 5);
     expect(status?.tripped).toBe(false);
     expect(status?.config.breachSamples).toBe(5);
+    handle!.stop();
+  });
+});
+
+describe('TRA-1463 — durable trip-reason breadcrumb', () => {
+  it('resolveTripLogPath: DATA_DIR → file on the persistent disk, none → null (inert in dev)', () => {
+    expect(resolveTripLogPath({ DATA_DIR: '/data' })).toBe(join('/data', 'watchdog-last-trip.json'));
+    expect(resolveTripLogPath({ WATCHDOG_TRIP_LOG_PATH: '/tmp/x.json' })).toBe('/tmp/x.json');
+    expect(resolveTripLogPath({})).toBeNull(); // no durable disk configured
+  });
+
+  it('persists the trip on exit and re-reads it on the next boot as lastTrip', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'wd-trip-'));
+    const path = join(dir, 'watchdog-last-trip.json');
+    const env = { WATCHDOG_TRIP_LOG_PATH: path, WATCHDOG_RSS_MAX_MB: '1500', WATCHDOG_BOOT_GRACE_MS: '0' };
+
+    // Boot 1: a native-memory (RSS) burst trips the watchdog → breadcrumb written.
+    const first = startEventLoopWatchdog({
+      env,
+      readHeap: () => ({ usedBytes: 200e6, limitBytes: 1536e6, rssBytes: 1_560e6 }),
+      onTrip: () => {}, // don't actually exit the test runner
+    });
+    first!.sampleNow();
+    expect(first!.status().trippedReason).toBe('rss');
+    first!.stop();
+
+    const persisted = readLastTrip(env);
+    expect(persisted?.reason).toBe('rss');
+    expect(persisted?.rssMB).toBe(1560);
+    expect(typeof persisted?.uptimeSecAtTrip).toBe('number');
+
+    // Boot 2 (fresh, healthy): surfaces the PRIOR trip as lastTrip so the soak
+    // can read WHY the box died without any Render-log access.
+    _resetWatchdogForTests();
+    const second = startEventLoopWatchdog({
+      env: { WATCHDOG_TRIP_LOG_PATH: path, WATCHDOG_BOOT_GRACE_MS: '0' },
+      readHeap: () => ({ usedBytes: 100e6, limitBytes: 1536e6, rssBytes: 300e6 }),
+      onTrip: () => {},
+    });
+    second!.sampleNow();
+    expect(second!.status().tripped).toBe(false);
+    expect(second!.status().lastTrip?.reason).toBe('rss');
+    second!.stop();
+
+    rmSync(dir, { recursive: true, force: true });
+  });
+
+  it('is inert (no throw, no lastTrip) when no durable disk is configured', () => {
+    const handle = startEventLoopWatchdog({
+      env: { WATCHDOG_RSS_MAX_MB: '1500', WATCHDOG_BOOT_GRACE_MS: '0' }, // no DATA_DIR / path
+      readHeap: () => ({ usedBytes: 200e6, limitBytes: 1536e6, rssBytes: 1_560e6 }),
+      onTrip: () => {},
+    });
+    handle!.sampleNow(); // trips, but persistence must no-op
+    expect(handle!.status().lastTrip).toBeNull();
     handle!.stop();
   });
 });

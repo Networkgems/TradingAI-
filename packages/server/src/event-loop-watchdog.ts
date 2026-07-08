@@ -48,9 +48,91 @@
 
 import { monitorEventLoopDelay, type IntervalHistogram } from 'node:perf_hooks';
 import { getHeapStatistics } from 'node:v8';
+import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
+import { dirname, join } from 'node:path';
 import { logger, flushLogs } from './observability/index.js';
 
 const log = logger.child({ module: 'event-loop-watchdog' });
+
+// TRA-1463 — durable trip-reason breadcrumb. The trip reason (heap / lag /
+// block / rss) is logged to Render's stdout and held in the in-memory
+// `lastStatus`, but BOTH are wiped by the restart the trip causes — so after
+// the ~85-min bqb1 self-restart there is no queryable record of WHY it died,
+// which is exactly why scope item 1 ("OOM/SIGKILL 137 vs event-loop-starvation")
+// has stayed unresolved without Render-log access. We persist the trip record
+// to a tiny JSON file on the DATA_DIR persistent disk immediately before exit
+// and re-read it on the next boot, surfacing it on `/api/health/watchdog` as
+// `lastTrip`. This turns the very next self-restart into hard root-cause
+// evidence (reason + uptime-at-trip + heap/rss/lag at the moment of death) with
+// zero polling and no platform log access. Observability only — no behaviour,
+// rate, or capital change. Env-disableable via WATCHDOG_TRIP_PERSIST=false.
+export const WATCHDOG_TRIP_PERSIST_VAR = 'WATCHDOG_TRIP_PERSIST';
+export const WATCHDOG_TRIP_LOG_PATH_VAR = 'WATCHDOG_TRIP_LOG_PATH';
+
+/** A durable record of the most recent watchdog self-restart. */
+export interface PersistedTrip {
+  reason: 'heap' | 'lag' | 'block' | 'rss';
+  detail: string;
+  /** Wall-clock (ms) when the trip fired. */
+  atMs: number;
+  /** Process uptime (s) at the moment of trip — the ~85-min cap lands here. */
+  uptimeSecAtTrip: number;
+  heapUsedMB: number;
+  heapLimitMB: number;
+  rssMB: number;
+  lagMeanMs: number;
+  lagMaxMs: number;
+}
+
+/**
+ * Resolve the trip-breadcrumb path to `<DATA_DIR>/watchdog-last-trip.json` (the
+ * Render persistent disk, so it survives the restart), or an explicit
+ * WATCHDOG_TRIP_LOG_PATH override. Returns null when NEITHER is configured —
+ * i.e. local dev / unit tests with no durable disk — so persistence is inert
+ * there and never writes stray files into the working tree.
+ */
+export function resolveTripLogPath(env: NodeJS.ProcessEnv = process.env): string | null {
+  const explicit = env[WATCHDOG_TRIP_LOG_PATH_VAR];
+  if (typeof explicit === 'string' && explicit.trim() !== '') return explicit.trim();
+  const dataDir = env.DATA_DIR;
+  if (typeof dataDir === 'string' && dataDir.trim() !== '') {
+    return join(dataDir.trim(), 'watchdog-last-trip.json');
+  }
+  return null;
+}
+
+/** Best-effort synchronous read of the last persisted trip (null if none/unreadable). */
+export function readLastTrip(env: NodeJS.ProcessEnv = process.env): PersistedTrip | null {
+  try {
+    const path = resolveTripLogPath(env);
+    if (!path || !existsSync(path)) return null;
+    const raw = readFileSync(path, 'utf8');
+    const parsed = JSON.parse(raw) as PersistedTrip;
+    if (!parsed || typeof parsed.reason !== 'string') return null;
+    return parsed;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Best-effort SYNCHRONOUS write of the trip record just before exit. Sync (not
+ * async) on purpose: the process is exiting immediately, so an async write could
+ * be dropped; a small synchronous fs.writeFileSync completes before exit(1).
+ * Fully guarded — a write failure must never block the clean restart.
+ */
+function persistTripRecord(record: PersistedTrip, env: NodeJS.ProcessEnv = process.env): void {
+  if (!envBool(env[WATCHDOG_TRIP_PERSIST_VAR], true)) return;
+  try {
+    const path = resolveTripLogPath(env);
+    if (!path) return; // no durable disk configured (local/dev) — nothing to write
+    const dir = dirname(path);
+    if (!existsSync(dir)) mkdirSync(dir, { recursive: true });
+    writeFileSync(path, JSON.stringify(record), 'utf8');
+  } catch (err) {
+    log.warn('failed to persist watchdog trip breadcrumb', { err: String(err) });
+  }
+}
 
 export const WATCHDOG_ENABLED_VAR = 'WATCHDOG_ENABLED';
 export const WATCHDOG_RESTART_ENABLED_VAR = 'WATCHDOG_RESTART_ENABLED';
@@ -311,6 +393,13 @@ export interface WatchdogStatus {
   /** True once a trip has fired (process is exiting). */
   tripped: boolean;
   trippedReason: 'heap' | 'lag' | 'block' | 'rss' | null;
+  /**
+   * TRA-1463 — the LAST self-restart's trip record, re-read from the DATA_DIR
+   * breadcrumb on boot. Null on a truly-fresh box (no prior trip on disk). This
+   * is the field the soak/monitoring reads AFTER a restart to learn why the box
+   * died (heap-leak vs native/RSS burst vs CPU starvation) without Render logs.
+   */
+  lastTrip: PersistedTrip | null;
 }
 
 export interface WatchdogHandle {
@@ -394,6 +483,20 @@ export function startEventLoopWatchdog(opts: StartWatchdogOptions = {}): Watchdo
   const startedAtMs = now();
   const state: WatchdogState = { consecutiveHeapBreaches: 0, consecutiveLagBreaches: 0 };
 
+  // TRA-1463 — surface the PRIOR self-restart's cause (persisted to the DATA_DIR
+  // breadcrumb before the last exit). Read once at boot; immutable thereafter.
+  const lastTrip = readLastTrip(opts.env);
+  if (lastTrip) {
+    log.warn('prior watchdog self-restart detected on boot', {
+      reason: lastTrip.reason,
+      uptimeSecAtTrip: lastTrip.uptimeSecAtTrip,
+      rssMB: lastTrip.rssMB,
+      heapUsedMB: lastTrip.heapUsedMB,
+      lagMaxMs: lastTrip.lagMaxMs,
+      detail: lastTrip.detail,
+    });
+  }
+
   // ns-resolution event-loop delay histogram. Reset each window so lag reflects
   // only the most recent sampleMs, not a since-boot cumulative average.
   const histogram: IntervalHistogram = monitorEventLoopDelay({ resolution: 20 });
@@ -437,6 +540,7 @@ export function startEventLoopWatchdog(opts: StartWatchdogOptions = {}): Watchdo
       inBootGrace: now() - startedAtMs < cfg.bootGraceMs,
       tripped,
       trippedReason,
+      lastTrip,
     };
   }
 
@@ -493,6 +597,26 @@ export function startEventLoopWatchdog(opts: StartWatchdogOptions = {}): Watchdo
       tripped = true;
       trippedReason = decision.reason ?? null;
       publish(sample);
+      // TRA-1463 — write the durable breadcrumb BEFORE the restart action so the
+      // next boot can report exactly why this box died. Done even when
+      // restartEnabled is false (observe-only) so a dry-run box still records the
+      // would-be trip. Synchronous + guarded; never blocks the exit.
+      if (decision.reason) {
+        persistTripRecord(
+          {
+            reason: decision.reason,
+            detail: decision.detail ?? '',
+            atMs: Date.now(),
+            uptimeSecAtTrip: Math.round((now() - startedAtMs) / 1000),
+            heapUsedMB: Math.round(sample.heapUsedBytes / 1e6),
+            heapLimitMB: Math.round(sample.heapLimitBytes / 1e6),
+            rssMB: Math.round(sample.rssBytes / 1e6),
+            lagMeanMs: Math.round(sample.lagMeanMs),
+            lagMaxMs: Math.round(sample.lagMaxMs),
+          },
+          opts.env,
+        );
+      }
       if (cfg.restartEnabled) {
         onTrip(decision, sample);
       } else {
@@ -539,6 +663,7 @@ export function startEventLoopWatchdog(opts: StartWatchdogOptions = {}): Watchdo
           inBootGrace: now() - startedAtMs < cfg.bootGraceMs,
           tripped: false,
           trippedReason: null,
+          lastTrip,
         }
       );
     },
