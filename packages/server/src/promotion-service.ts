@@ -1,7 +1,16 @@
-import type { AccountSettings, PaperGateMetrics, Position, PromotionStatus } from '@trading-app/shared';
+import type {
+  AccountSettings,
+  AccumulationGateMetrics,
+  AccumulationPositionSample,
+  PaperGateMetrics,
+  Position,
+  PromotionStatus,
+} from '@trading-app/shared';
 import {
+  computeAccumulationGateMetrics,
   computePaperGateMetrics,
   evaluatePromotion,
+  promotionStrategyClass,
   resolveStrategyPreset,
   type PromotionTradeSample,
 } from '@trading-app/shared';
@@ -82,6 +91,53 @@ export async function collectPaperTrades(username: string, strategyId: string): 
 }
 
 /**
+ * TRA-1461 — a demo position maps 1:1 to an {@link AccumulationPositionSample}:
+ * `Position` already carries the blended `entryPrice` (cost basis), the fixed
+ * `stopLoss`, the accumulated `quantity`, the TRA-961 `dcaFills`/`dcaHold`
+ * accumulation fields, and the `openedAt`/`closedAt`/`exitReason` lifecycle the
+ * accumulation gate needs.
+ */
+function toAccumSample(p: Position): AccumulationPositionSample {
+  return {
+    side: p.side,
+    entryPrice: p.entryPrice,
+    stopLoss: p.stopLoss,
+    quantity: p.quantity,
+    fills: p.dcaFills,
+    hold: p.dcaHold,
+    openedAt: p.openedAt,
+    closedAt: p.closedAt,
+    exitReason: p.exitReason,
+  };
+}
+
+/**
+ * TRA-1461 — collect the monitored PAPER positions for an `accumulate`/hold-mode
+ * strategy. Unlike {@link collectPaperTrades} (closed-only) this returns the OPEN
+ * demo accumulation positions — which by construction never close — alongside any
+ * closed demo positions for the strategy (so the gate can spot a hold-mode
+ * violation, i.e. a held position sold outside its catastrophe stop). Scoped to
+ * Demo by `mode` and to the strategy by `signalType`. DCA is a crypto strategy,
+ * so the demo book is the crypto snapshot's open + demo-closed lists.
+ */
+export async function collectAccumulationPositions(username: string, strategyId: string): Promise<Position[]> {
+  const isDemo = (p: Position): boolean => p.mode === 'demo' || p.mode === undefined;
+  const matches = (p: Position): boolean => p.signalType === strategyId && isDemo(p);
+  const out: Position[] = [];
+  const crypto = await loadCryptoTradeSnapshot(username);
+  if (crypto) {
+    (crypto.openPositions ?? []).forEach(p => {
+      if (matches(p) && p.closedAt === undefined) out.push(p);
+    });
+    const closed = crypto.demoClosedPositions ?? crypto.closedPositions ?? [];
+    closed.forEach(p => {
+      if (matches(p) && p.closedAt !== undefined) out.push(p);
+    });
+  }
+  return out;
+}
+
+/**
  * Build the full `promotion_status` for one strategy: per-stage state, the
  * metrics computed from data, the overall `canGoLive` verdict, and the exact
  * blocked reasons. `username` scopes the paper ledger; backtest + sign-off are
@@ -96,13 +152,23 @@ export async function buildPromotionStatus(username: string, strategyId: string)
   // authoritative for Stage 1: the leg passes iff verdict.pass is true.
   const backtestVerdict = rec?.backtest?.verdict ?? null;
 
-  const paperTrades = await collectPaperTrades(username, strategyId);
-  const paper: PaperGateMetrics | null =
-    paperTrades.length > 0 ? computePaperGateMetrics(paperTrades.map(toSample)) : null;
+  // TRA-1461 — class-aware Stage 2. `accumulate` (hold-mode DCA) validates on
+  // accumulation correctness (open demo positions never close); `close` keeps
+  // the closed-trade PF/expectancy paper leg.
+  const strategyClass = promotionStrategyClass(strategyId);
+  let paper: PaperGateMetrics | null = null;
+  let accumulation: AccumulationGateMetrics | null = null;
+  if (strategyClass === 'accumulate') {
+    const positions = await collectAccumulationPositions(username, strategyId);
+    accumulation = positions.length > 0 ? computeAccumulationGateMetrics(positions.map(toAccumSample), Date.now()) : null;
+  } else {
+    const paperTrades = await collectPaperTrades(username, strategyId);
+    paper = paperTrades.length > 0 ? computePaperGateMetrics(paperTrades.map(toSample)) : null;
+  }
 
   const signoff = rec && rec.decisions.length > 0 ? 'present' : 'absent';
 
-  return evaluatePromotion({ strategyId, backtest, backtestVerdict, paper, signoff, thresholds });
+  return evaluatePromotion({ strategyId, strategyClass, backtest, backtestVerdict, paper, accumulation, signoff, thresholds });
 }
 
 /**
@@ -128,16 +194,28 @@ export async function buildPublicPromotionProbe(strategyId: string): Promise<Pro
   const backtest = rec?.backtest?.metrics ?? null;
   const backtestVerdict = rec?.backtest?.verdict ?? null;
 
-  const paperTrades: Position[] = [];
-  for (const u of getAllUsers()) {
-    paperTrades.push(...(await collectPaperTrades(u.username, strategyId)));
+  // TRA-1461 — class-aware Stage 2, aggregated across every user (see the
+  // authenticated {@link buildPromotionStatus} for the per-class rationale).
+  const strategyClass = promotionStrategyClass(strategyId);
+  let paper: PaperGateMetrics | null = null;
+  let accumulation: AccumulationGateMetrics | null = null;
+  if (strategyClass === 'accumulate') {
+    const positions: Position[] = [];
+    for (const u of getAllUsers()) {
+      positions.push(...(await collectAccumulationPositions(u.username, strategyId)));
+    }
+    accumulation = positions.length > 0 ? computeAccumulationGateMetrics(positions.map(toAccumSample), Date.now()) : null;
+  } else {
+    const paperTrades: Position[] = [];
+    for (const u of getAllUsers()) {
+      paperTrades.push(...(await collectPaperTrades(u.username, strategyId)));
+    }
+    paper = paperTrades.length > 0 ? computePaperGateMetrics(paperTrades.map(toSample)) : null;
   }
-  const paper: PaperGateMetrics | null =
-    paperTrades.length > 0 ? computePaperGateMetrics(paperTrades.map(toSample)) : null;
 
   const signoff = rec && rec.decisions.length > 0 ? 'present' : 'absent';
 
-  return evaluatePromotion({ strategyId, backtest, backtestVerdict, paper, signoff, thresholds });
+  return evaluatePromotion({ strategyId, strategyClass, backtest, backtestVerdict, paper, accumulation, signoff, thresholds });
 }
 
 /** Most recent paper metrics for a strategy, used when persisting a sign-off snapshot. */

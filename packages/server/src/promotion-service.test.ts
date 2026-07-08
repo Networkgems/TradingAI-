@@ -39,6 +39,29 @@ function paperTrade(pnl: number, i: number): Position {
   };
 }
 
+/**
+ * TRA-1461 — one OPEN demo DCA accumulation position. `dca` is an accumulate-
+ * class strategy, so its Stage-2 leg validates on accumulation correctness
+ * (fills built into a held, growing position over a time-based soak) rather than
+ * closed-trade PF/expectancy — a hold-mode strategy never closes by construction.
+ */
+function dcaAccumulation(fills: number, soakDays: number): Position {
+  return {
+    id: 'dca-accum-1',
+    symbol: 'BTC-USD',
+    side: 'buy',
+    signalType: 'dca',
+    entryPrice: 100,
+    quantity: fills, // one unit per fill
+    stopLoss: 90, // strictly below blended entry — fixed-stop risk invariant holds
+    takeProfit: 0, // hold-mode: no per-leg TP
+    openedAt: Date.now() - soakDays * DAY_MS,
+    dcaHold: true,
+    dcaFills: fills,
+    mode: 'demo',
+  };
+}
+
 function passingReport(): BacktestResult {
   return {
     sharpeRatio: 1.3,
@@ -64,12 +87,14 @@ beforeAll(async () => {
   store = await import('./promotion-store.js');
   tradeStore = await import('./trade-store.js');
 
-  // Seed 60 monitored dca paper trades (50 winners +1.5R, 10 losers -0.5R).
+  // Seed 60 monitored dca paper trades (50 winners +1.5R, 10 losers -0.5R) — kept
+  // so snapshotPaperMetrics still reflects a real ledger — PLUS the OPEN, held
+  // accumulation the Stage-2 accumulate leg actually gates on (TRA-1461).
   const closed = Array.from({ length: 60 }, (_, i) => paperTrade(i % 6 === 0 ? -0.5 : 1.5, i));
   await tradeStore.saveCryptoTradeSnapshot(USER, {
     version: 1,
     savedAt: new Date().toISOString(),
-    openPositions: [],
+    openPositions: [dcaAccumulation(10, 20)],
     closedPositions: closed,
     demoClosedPositions: closed,
     recentSignals: [],
@@ -108,8 +133,11 @@ describe('TRA-532 promotion gate — end-to-end enforcement', () => {
     });
     const status = await svc.buildPromotionStatus(USER, 'dca');
     expect(status.backtest.state).toBe('pass');
-    // Paper passes from the seeded ledger, but sign-off is still absent.
+    // TRA-1461 — dca is accumulate-class: Stage 2 passes from the seeded OPEN
+    // accumulation (not closed trades), but sign-off is still absent.
+    expect(status.strategyClass).toBe('accumulate');
     expect(status.paper.state).toBe('pass');
+    expect(status.paper.accumulation?.positionCount).toBe(1);
     expect(status.signoff).toBe('absent');
     expect(status.canGoLive).toBe(false);
 
@@ -259,6 +287,61 @@ describe('TRA-1436 promotion gate — environment-aware (Tradier Sandbox exempt)
   });
 });
 
+// TRA-1461 — a hold-mode DCA accumulation clears Stage 2 with ZERO closed
+// trades, proving the old structural blocker (paper leg required closed demo
+// trades a hold-mode strategy never produces) is gone — while still requiring
+// Stage 1 + Stage 3, so the live flip stays board-gated.
+describe('TRA-1461 accumulate-class Stage 2 — hold-mode DCA needs no closed trades', () => {
+  const ACC_USER = 'dca-holder';
+
+  it('is missing/blocked with no accumulation, and passes Stage 2 once a real soak exists', async () => {
+    // No positions at all → Stage 2 missing (and Stage 1/3 also block).
+    await tradeStore.saveCryptoTradeSnapshot(ACC_USER, {
+      version: 1,
+      savedAt: new Date().toISOString(),
+      openPositions: [],
+      closedPositions: [],
+      demoClosedPositions: [],
+      recentSignals: [],
+      account: { cash: 25_000, equity: 25_000, initialEquity: 25_000, openingEquityToday: 25_000 },
+    });
+    const empty = await svc.buildPromotionStatus(ACC_USER, 'dca');
+    expect(empty.strategyClass).toBe('accumulate');
+    expect(empty.paper.state).toBe('missing');
+    expect(empty.blockedReasons.join(' ')).toMatch(/Stage 2 \(accumulation\) missing/);
+
+    // A real, well-soaked accumulation with NO closed trades → Stage 2 passes.
+    await tradeStore.saveCryptoTradeSnapshot(ACC_USER, {
+      version: 1,
+      savedAt: new Date().toISOString(),
+      openPositions: [dcaAccumulation(10, 20)],
+      closedPositions: [],
+      demoClosedPositions: [],
+      recentSignals: [],
+      account: { cash: 25_000, equity: 25_000, initialEquity: 25_000, openingEquityToday: 25_000 },
+    });
+    const soaked = await svc.buildPromotionStatus(ACC_USER, 'dca');
+    expect(soaked.paper.state).toBe('pass');
+    expect(soaked.paper.metrics).toBeNull(); // no closed-trade PF/expectancy leg
+    expect(soaked.paper.accumulation?.totalFills).toBe(10);
+  });
+
+  it('fails Stage 2 when the soak is too short even with plenty of fills', async () => {
+    await tradeStore.saveCryptoTradeSnapshot(ACC_USER, {
+      version: 1,
+      savedAt: new Date().toISOString(),
+      openPositions: [dcaAccumulation(20, 3)], // 3-day soak < 14-day minimum
+      closedPositions: [],
+      demoClosedPositions: [],
+      recentSignals: [],
+      account: { cash: 25_000, equity: 25_000, initialEquity: 25_000, openingEquityToday: 25_000 },
+    });
+    const status = await svc.buildPromotionStatus(ACC_USER, 'dca');
+    expect(status.paper.state).toBe('fail');
+    expect(status.paper.failedChecks.join(' ')).toMatch(/soak/);
+  });
+});
+
 // TRA-541 — buildPromotionStatus must honor a registered TRA-540 optimization
 // verdict: the Stage-1 leg passes iff verdict.pass, regardless of how strong the
 // ingested headline metrics look.
@@ -329,13 +412,23 @@ describe('TRA-542 promotion gate — Stage 1 is fail-closed without a verdict', 
 // whose realized slippage runs above 1.5× modeled.
 describe('TRA-536 promotion gate — slippage check enforces once instrumented', () => {
   const SLIP_USER = 'carol';
+  // Slippage is a CLOSE-based Stage-2 check (it lives on the closed-trade paper
+  // leg), so it is exercised against a close-based crypto strategy — TRA-1461
+  // routes the accumulate-class `dca` to a leg with no slippage concept.
+  const SLIP_STRAT = 'bb_fade';
 
   function slipTrade(pnl: number, i: number, realized: number, modeled: number): Position {
-    return { ...paperTrade(pnl, i), id: `s${i}`, realizedSlippage: realized, modeledSlippage: modeled };
+    return {
+      ...paperTrade(pnl, i),
+      id: `s${i}`,
+      signalType: SLIP_STRAT,
+      realizedSlippage: realized,
+      modeledSlippage: modeled,
+    };
   }
 
   it('surfaces a non-null slippageRatio and blocks when realized > 1.5× modeled', async () => {
-    // 60 monitored dca trades that clear count / expectancy / Sharpe, but
+    // 60 monitored close-based trades that clear count / expectancy / Sharpe, but
     // each fill drifted 2× the modeled budget → ratio 2.0 > 1.5 cap.
     const closed = Array.from({ length: 60 }, (_, i) => slipTrade(i % 6 === 0 ? -0.5 : 1.5, i, 2, 1));
     await tradeStore.saveCryptoTradeSnapshot(SLIP_USER, {
@@ -348,9 +441,9 @@ describe('TRA-536 promotion gate — slippage check enforces once instrumented',
       account: { cash: 25_000, equity: 25_000, initialEquity: 25_000, openingEquityToday: 25_000 },
     });
 
-    const status = await svc.buildPromotionStatus(SLIP_USER, 'dca');
-    // backtest + sign-off were registered globally for dca earlier, so the
-    // only thing that can block this user is the paper slippage check.
+    const status = await svc.buildPromotionStatus(SLIP_USER, SLIP_STRAT);
+    // The close-based paper leg governs Stage 2 for this strategy; the slippage
+    // ratio is computed from the instrumented fills and fails above the cap.
     expect(status.paper.metrics?.slippageRatio).toBeCloseTo(2, 6);
     expect(status.paper.metrics?.slippageSampleSize).toBe(60);
     expect(status.paper.state).toBe('fail');
@@ -370,7 +463,7 @@ describe('TRA-536 promotion gate — slippage check enforces once instrumented',
       account: { cash: 25_000, equity: 25_000, initialEquity: 25_000, openingEquityToday: 25_000 },
     });
 
-    const status = await svc.buildPromotionStatus(SLIP_USER, 'dca');
+    const status = await svc.buildPromotionStatus(SLIP_USER, SLIP_STRAT);
     expect(status.paper.metrics?.slippageRatio).toBeCloseTo(1, 6);
     expect(status.paper.failedChecks.join(' ')).not.toMatch(/slippage/i);
     expect(status.paper.state).toBe('pass');
@@ -536,7 +629,7 @@ describe('TRA-803 public promotion probe — aggregates paper, keeps gate honest
     const status = await svc.buildPublicPromotionProbe(STRATEGY);
     const keys = Object.keys(status).sort();
     expect(keys).toEqual(
-      ['backtest', 'blockedReasons', 'canGoLive', 'paper', 'signoff', 'strategyId'].sort(),
+      ['backtest', 'blockedReasons', 'canGoLive', 'paper', 'signoff', 'strategyClass', 'strategyId'].sort(),
     );
   });
 });

@@ -39,7 +39,7 @@ export interface PromotionThresholds {
     maxDrawdownPct: number; // 0.20 == 20%
     minTradeCount: number;
   };
-  /** Stage 2 — paper / forward test (net). */
+  /** Stage 2 — paper / forward test (net). Close-based strategies only. */
   paper: {
     minTradeCount: number;
     minExpectancy: number;
@@ -48,6 +48,29 @@ export interface PromotionThresholds {
     minSharpe: number;
     /** Realized slippage must be ≤ this multiple of modeled slippage. */
     maxSlippageRatio: number;
+  };
+  /**
+   * TRA-1461 — Stage 2 for `accumulate`/hold-mode strategies (e.g. crypto DCA).
+   * A hold-mode strategy never closes positions by construction, so the
+   * closed-trade PF/expectancy `paper` leg above can never be satisfied. This
+   * leg instead validates **accumulation correctness** over a time-based paper
+   * soak: enough fills built into one growing position, held long enough, with
+   * no unintended sells and the fixed-stop risk invariant never breached. Same
+   * anti-gaming principle as the close-based leg — every figure is computed from
+   * the live paper book, never hand-entered (see {@link computeAccumulationGateMetrics}).
+   */
+  accumulation: {
+    /** ≥ this many total accumulation fills (entry + adds) across the open book. */
+    minFills: number;
+    /** ≥ this many open accumulation positions being monitored. */
+    minPositions: number;
+    /** The accumulation must have been building for ≥ this many days (time-based soak). */
+    minSoakDays: number;
+    /**
+     * Max tolerated closes that violated hold-mode (a held position sold by
+     * anything other than its catastrophe stop). 0 → any unintended sell fails.
+     */
+    maxUnintendedSells: number;
   };
 }
 
@@ -66,7 +89,39 @@ export const DEFAULT_PROMOTION_THRESHOLDS: PromotionThresholds = {
     minSharpe: 0.8,
     maxSlippageRatio: 1.5,
   },
+  accumulation: {
+    minFills: 8, // ≥ 8 fills proves "multiple fills averaging one growing position" is really running
+    minPositions: 1,
+    minSoakDays: 14, // a two-week forward soak, the accumulate-class analogue of the 50-trade count
+    maxUnintendedSells: 0, // a hold-mode strategy must never sell outside its catastrophe stop
+  },
 };
+
+// ── Strategy class (close-based vs accumulate/hold-mode) ─────────────────────
+
+/**
+ * TRA-1461 — the promotion-gate strategy class. Close-based strategies clear
+ * Stage 2 on the closed-trade PF/expectancy `paper` leg; `accumulate` (hold-
+ * mode) strategies never close by construction and clear Stage 2 on the
+ * accumulation-correctness leg instead. Everything about Stage 1 (the six-guard
+ * backtest verdict) and Stage 3 (sign-off) is identical for both classes — only
+ * the Stage-2 validator differs, so close-based rigor is untouched.
+ */
+export type PromotionStrategyClass = 'close' | 'accumulate';
+
+/**
+ * Strategy ids whose Stage-2 leg is validated on accumulation correctness
+ * rather than closed-trade metrics. `dca` is the crypto dollar-cost-averaging
+ * accumulation strategy (TRA-693/698, the `crypto_core` roster) — long-only,
+ * hold-mode, never closes on a take-profit. Kept as an explicit allowlist so a
+ * strategy defaults to the stricter close-based leg unless deliberately marked.
+ */
+export const ACCUMULATE_STRATEGY_IDS: ReadonlySet<string> = new Set(['dca']);
+
+/** Classify a strategy for the promotion gate. Unlisted ids are `close`-based. */
+export function promotionStrategyClass(strategyId: string): PromotionStrategyClass {
+  return ACCUMULATE_STRATEGY_IDS.has(strategyId) ? 'accumulate' : 'close';
+}
 
 // ── Metric shapes ────────────────────────────────────────────────────────────
 
@@ -162,6 +217,65 @@ export interface PromotionTradeSample {
   closedAt?: number;
 }
 
+/**
+ * TRA-1461 — one monitored paper position for an `accumulate`/hold-mode
+ * strategy. Structurally a subset of `@trading-app/shared` `Position` (the
+ * demo DCA book), so the service passes demo positions straight through. Unlike
+ * {@link PromotionTradeSample} these are NOT required to be closed — the whole
+ * point is that a hold-mode accumulation stays open. `fills` is the count of
+ * fills blended into the growing position (`Position.dcaFills`); `hold` is the
+ * TRA-961 `dcaHold` flag; `openedAt`/`closedAt` bound the soak.
+ */
+export interface AccumulationPositionSample {
+  /** 'buy' for a long accumulation (the only legal DCA side); 'sell' would be a spec breach. */
+  side: 'buy' | 'sell';
+  /** Blended average cost basis (`Position.entryPrice` after all fills). */
+  entryPrice: number;
+  /** Fixed protective (catastrophe) stop — never widened through entry by the add path. */
+  stopLoss: number;
+  /** Current total accumulated quantity. */
+  quantity: number;
+  /** Fills blended into this position (entry + adds). Defaults to 1 when absent. */
+  fills?: number;
+  /** True when this is a held DCA accumulation (per-leg TP suppressed). */
+  hold?: boolean;
+  /** Epoch ms the position was first opened (first fill). Bounds the soak. */
+  openedAt?: number;
+  /** Epoch ms the position closed, if it has. Open accumulations leave this absent. */
+  closedAt?: number;
+  /**
+   * Lifecycle path that closed the position, if closed. `'sl'` is the legitimate
+   * catastrophe-stop exit for a hold-mode strategy; any other reason on a held
+   * position is an unintended sell.
+   */
+  exitReason?: string;
+}
+
+/**
+ * TRA-1461 — computed accumulation metrics that feed the Stage-2 gate for
+ * `accumulate`/hold-mode strategies. All derived from the live paper book by
+ * {@link computeAccumulationGateMetrics}, never hand-entered.
+ */
+export interface AccumulationGateMetrics {
+  /** Open accumulation positions being monitored. */
+  positionCount: number;
+  /** Total fills (entry + adds) across the open positions — the accumulation activity. */
+  totalFills: number;
+  /** Days from the earliest open position's first fill to now (the soak length). */
+  soakDays: number;
+  /**
+   * Closes that violated hold-mode: a held position exited by anything other
+   * than its catastrophe stop (`exitReason !== 'sl'`). Must be 0.
+   */
+  unintendedSells: number;
+  /**
+   * Open positions whose fixed-stop risk invariant is broken — not a long, or
+   * the stop is at/above the blended entry (a widened/through-entry stop), or a
+   * non-positive quantity. Must be 0: the add path averages size, never the stop.
+   */
+  riskInvariantBreaches: number;
+}
+
 // ── Metric computation (from data) ───────────────────────────────────────────
 
 function stdev(xs: number[]): number {
@@ -181,6 +295,9 @@ export const PROFIT_FACTOR_CAP = 999;
 
 /** Milliseconds in one year — same basis the backtest runner uses for annualization. */
 const MS_PER_YEAR = 365.25 * 24 * 60 * 60 * 1_000;
+
+/** Milliseconds in one day — used to measure the accumulation paper soak. */
+const MS_PER_DAY = 24 * 60 * 60 * 1_000;
 
 /**
  * Minimum ledger span (in years) required to credibly annualize the paper
@@ -262,6 +379,52 @@ export function computePaperGateMetrics(trades: readonly PromotionTradeSample[])
     slippageRatio,
     slippageSampleSize,
   };
+}
+
+/**
+ * TRA-1461 — compute the Stage-2 accumulation metrics for a hold-mode strategy
+ * from its monitored paper book. `nowMs` is the wall-clock the soak is measured
+ * against (the caller passes `Date.now()`), kept as a parameter so this stays a
+ * pure function. Open positions (no `closedAt`) drive the count/fills/soak/
+ * risk-invariant; closed positions are inspected only to count hold-mode
+ * violations (a held position that sold outside its catastrophe stop).
+ */
+export function computeAccumulationGateMetrics(
+  positions: readonly AccumulationPositionSample[],
+  nowMs: number,
+): AccumulationGateMetrics {
+  let positionCount = 0;
+  let totalFills = 0;
+  let earliestOpenedAt = Infinity;
+  let riskInvariantBreaches = 0;
+  let unintendedSells = 0;
+
+  for (const p of positions) {
+    const isOpen = p.closedAt === undefined;
+    if (isOpen) {
+      positionCount += 1;
+      totalFills += Math.max(1, p.fills ?? 1);
+      if (typeof p.openedAt === 'number' && Number.isFinite(p.openedAt) && p.openedAt < earliestOpenedAt) {
+        earliestOpenedAt = p.openedAt;
+      }
+      // Long-only, positive size, and a stop strictly below the blended entry —
+      // the "average size, never the stop" invariant. Anything else is a breach.
+      const wellFormed =
+        p.side === 'buy' && p.quantity > 0 && Number.isFinite(p.entryPrice) && p.stopLoss < p.entryPrice;
+      if (!wellFormed) riskInvariantBreaches += 1;
+    } else if (p.hold === true && p.exitReason !== 'sl') {
+      // A held accumulation that closed by anything other than the catastrophe
+      // stop is an unintended sell (the hold semantics were not honored).
+      unintendedSells += 1;
+    }
+  }
+
+  const soakDays =
+    positionCount > 0 && Number.isFinite(earliestOpenedAt)
+      ? Math.max(0, (nowMs - earliestOpenedAt) / MS_PER_DAY)
+      : 0;
+
+  return { positionCount, totalFills, soakDays, unintendedSells, riskInvariantBreaches };
 }
 
 // ── Per-stage evaluation ─────────────────────────────────────────────────────
@@ -380,11 +543,57 @@ export function evaluatePaperGate(
   return { state: failed.length === 0 ? 'pass' : 'fail', failedChecks: failed };
 }
 
+/**
+ * TRA-1461 — Stage 2 for `accumulate`/hold-mode strategies. `metrics === null`
+ * or zero open positions ⇒ `missing` (no monitored accumulation yet), mirroring
+ * the close-based `missing` case. Otherwise the leg passes iff the accumulation
+ * has built enough fills across enough positions, soaked long enough, sold
+ * nothing it shouldn't have, and never breached the fixed-stop risk invariant.
+ *
+ * This is deliberately independent of PF/expectancy: a hold-mode strategy never
+ * realizes closed-trade P&L during the soak, so the validation is that the
+ * position-building itself matches spec — the same rigor, applied to what an
+ * accumulation actually produces. The close-based {@link evaluatePaperGate} is
+ * untouched, so close-based strategies keep their full PF/expectancy/Sharpe/
+ * slippage battery.
+ */
+export function evaluateAccumulationGate(
+  metrics: AccumulationGateMetrics | null,
+  thresholds: PromotionThresholds = DEFAULT_PROMOTION_THRESHOLDS,
+): StageEvaluation {
+  if (!metrics || metrics.positionCount === 0)
+    return { state: 'missing', failedChecks: ['no monitored accumulation positions recorded'] };
+  const t = thresholds.accumulation;
+  const failed: string[] = [];
+  if (!(metrics.positionCount >= t.minPositions))
+    failed.push(`accumulation positions ${fmt(metrics.positionCount)} < ${t.minPositions}`);
+  if (!(metrics.totalFills >= t.minFills))
+    failed.push(`accumulation fills ${fmt(metrics.totalFills)} < ${t.minFills}`);
+  if (!(metrics.soakDays >= t.minSoakDays))
+    failed.push(`paper soak ${fmt(metrics.soakDays)}d < ${t.minSoakDays}d`);
+  if (metrics.unintendedSells > t.maxUnintendedSells)
+    failed.push(
+      `${fmt(metrics.unintendedSells)} unintended sell(s) — a hold-mode strategy must only exit on its catastrophe stop`,
+    );
+  if (metrics.riskInvariantBreaches > 0)
+    failed.push(
+      `${fmt(metrics.riskInvariantBreaches)} position(s) breach the fixed-stop risk invariant (long-only, stop below blended entry)`,
+    );
+  return { state: failed.length === 0 ? 'pass' : 'fail', failedChecks: failed };
+}
+
 // ── Overall verdict ──────────────────────────────────────────────────────────
 
 /** Inputs to a full promotion evaluation for one strategy. */
 export interface PromotionEvaluationInput {
   strategyId: string;
+  /**
+   * TRA-1461 — the strategy class. `close` (default) runs the closed-trade
+   * Stage-2 `paper` leg; `accumulate` runs the accumulation-correctness leg on
+   * `accumulation` instead. Absent ⇒ `close` (back-compat: every existing caller
+   * that omits it keeps the exact close-based behavior).
+   */
+  strategyClass?: PromotionStrategyClass;
   /** Stage-1 metrics from the registered backtest report, or null if none registered. */
   backtest: BacktestGateMetrics | null;
   /**
@@ -392,8 +601,13 @@ export interface PromotionEvaluationInput {
    * it is authoritative for Stage 1 (see {@link evaluateBacktestGate}).
    */
   backtestVerdict?: BacktestGateVerdict | null;
-  /** Stage-2 metrics computed from the paper ledger, or null if none. */
+  /** Stage-2 metrics computed from the paper ledger, or null if none. Close-based only. */
   paper: PaperGateMetrics | null;
+  /**
+   * TRA-1461 — Stage-2 accumulation metrics for an `accumulate` strategy,
+   * computed from the demo book, or null if none. Ignored for `close` strategies.
+   */
+  accumulation?: AccumulationGateMetrics | null;
   /** Whether a Stage-3 sign-off (`promotion_decision`) record exists. */
   signoff: SignoffState;
   thresholds?: PromotionThresholds;
@@ -406,6 +620,8 @@ export interface PromotionEvaluationInput {
  */
 export interface PromotionStatus {
   strategyId: string;
+  /** TRA-1461 — which Stage-2 leg was applied (`close` PF/expectancy vs `accumulate`). */
+  strategyClass: PromotionStrategyClass;
   backtest: {
     state: PromotionStageState;
     metrics: BacktestGateMetrics | null;
@@ -417,10 +633,16 @@ export interface PromotionStatus {
     state: PromotionStageState;
     tradeCount: number;
     metrics: PaperGateMetrics | null;
+    /**
+     * TRA-1461 — accumulation metrics when `strategyClass === 'accumulate'`
+     * (the Stage-2 leg that gated an accumulate strategy). Null/absent for
+     * close-based strategies, which use `metrics`/`tradeCount` above.
+     */
+    accumulation?: AccumulationGateMetrics | null;
     failedChecks: string[];
   };
   signoff: SignoffState;
-  /** True iff backtest=pass AND paper=pass AND signoff=present. */
+  /** True iff backtest=pass AND stage-2=pass AND signoff=present. */
   canGoLive: boolean;
   /** Empty when `canGoLive`. Human-readable reasons the live transition is refused. */
   blockedReasons: string[];
@@ -433,18 +655,29 @@ export interface PromotionStatus {
  */
 export function evaluatePromotion(input: PromotionEvaluationInput): PromotionStatus {
   const thresholds = input.thresholds ?? DEFAULT_PROMOTION_THRESHOLDS;
+  const strategyClass: PromotionStrategyClass = input.strategyClass ?? 'close';
   const bt = evaluateBacktestGate(input.backtest, thresholds, input.backtestVerdict);
-  const paper = evaluatePaperGate(input.paper, input.backtest, thresholds);
+
+  // TRA-1461 — Stage 2 is class-aware: `accumulate` strategies (hold-mode DCA)
+  // validate on accumulation correctness; everyone else keeps the closed-trade
+  // PF/expectancy leg untouched.
+  const accumulation = strategyClass === 'accumulate' ? input.accumulation ?? null : null;
+  const stage2 =
+    strategyClass === 'accumulate'
+      ? evaluateAccumulationGate(accumulation, thresholds)
+      : evaluatePaperGate(input.paper, input.backtest, thresholds);
+  const stage2Label = strategyClass === 'accumulate' ? 'accumulation' : 'paper';
 
   const blockedReasons: string[] = [];
   if (bt.state !== 'pass')
     blockedReasons.push(`Stage 1 (backtest) ${bt.state}: ${bt.failedChecks.join('; ')}`);
-  if (paper.state !== 'pass')
-    blockedReasons.push(`Stage 2 (paper) ${paper.state}: ${paper.failedChecks.join('; ')}`);
+  if (stage2.state !== 'pass')
+    blockedReasons.push(`Stage 2 (${stage2Label}) ${stage2.state}: ${stage2.failedChecks.join('; ')}`);
   if (input.signoff !== 'present') blockedReasons.push('Stage 3 (sign-off) absent: no promotion_decision on record');
 
   return {
     strategyId: input.strategyId,
+    strategyClass,
     backtest: {
       state: bt.state,
       metrics: input.backtest,
@@ -452,10 +685,11 @@ export function evaluatePromotion(input: PromotionEvaluationInput): PromotionSta
       failedChecks: bt.failedChecks,
     },
     paper: {
-      state: paper.state,
+      state: stage2.state,
       tradeCount: input.paper?.tradeCount ?? 0,
-      metrics: input.paper,
-      failedChecks: paper.failedChecks,
+      metrics: strategyClass === 'accumulate' ? null : input.paper,
+      accumulation,
+      failedChecks: stage2.failedChecks,
     },
     signoff: input.signoff,
     canGoLive: blockedReasons.length === 0,

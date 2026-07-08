@@ -330,6 +330,8 @@ export function mergeThresholds(
   return {
     backtest: { ...base.backtest, ...(override.backtest ?? {}) },
     paper: { ...base.paper, ...(override.paper ?? {}) },
+    // TRA-1461 — merge the accumulate-class Stage-2 thresholds too.
+    accumulation: { ...base.accumulation, ...(override.accumulation ?? {}) },
   };
 }
 

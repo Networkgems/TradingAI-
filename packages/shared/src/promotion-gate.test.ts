@@ -1,11 +1,16 @@
 import { describe, it, expect } from 'vitest';
 import {
+  ACCUMULATE_STRATEGY_IDS,
   DEFAULT_PROMOTION_THRESHOLDS,
+  computeAccumulationGateMetrics,
   computePaperGateMetrics,
+  evaluateAccumulationGate,
   evaluateBacktestGate,
   evaluatePaperGate,
   evaluatePromotion,
+  promotionStrategyClass,
   PROFIT_FACTOR_CAP,
+  type AccumulationPositionSample,
   type BacktestGateMetrics,
   type PromotionTradeSample,
 } from './promotion-gate.js';
@@ -361,5 +366,172 @@ describe('evaluatePromotion — overall verdict (the one-line rule)', () => {
     expect(DEFAULT_PROMOTION_THRESHOLDS.paper.minSharpe).toBe(0.8);
     expect(DEFAULT_PROMOTION_THRESHOLDS.paper.minExpectancyVsBacktestRatio).toBe(0.5);
     expect(DEFAULT_PROMOTION_THRESHOLDS.paper.maxSlippageRatio).toBe(1.5);
+  });
+});
+
+// ── TRA-1461 — accumulate/hold-mode Stage-2 leg ──────────────────────────────
+
+const NOW = 100 * 365 * MS_PER_DAY; // a large fixed "now" so soak math is deterministic
+
+/** One OPEN demo accumulation position: long, well-formed stop, opened `soakDays` ago. */
+function accum(
+  fills: number,
+  soakDays: number,
+  extra: Partial<AccumulationPositionSample> = {},
+): AccumulationPositionSample {
+  return {
+    side: 'buy',
+    entryPrice: 100,
+    stopLoss: 90, // stop strictly below blended entry — risk invariant holds
+    quantity: fills, // one unit per fill
+    fills,
+    hold: true,
+    openedAt: NOW - soakDays * MS_PER_DAY,
+    ...extra,
+  };
+}
+
+describe('promotionStrategyClass — dca is the only accumulate strategy', () => {
+  it('classifies dca as accumulate and everything else as close', () => {
+    expect(promotionStrategyClass('dca')).toBe('accumulate');
+    expect(promotionStrategyClass('bb_fade')).toBe('close');
+    expect(promotionStrategyClass('supertrend_confluence')).toBe('close');
+    expect(ACCUMULATE_STRATEGY_IDS.has('dca')).toBe(true);
+  });
+});
+
+describe('computeAccumulationGateMetrics — derived from the demo book', () => {
+  it('sums fills over open positions and measures the soak from the earliest open', () => {
+    const m = computeAccumulationGateMetrics([accum(5, 20), accum(4, 30)], NOW);
+    expect(m.positionCount).toBe(2);
+    expect(m.totalFills).toBe(9);
+    expect(m.soakDays).toBeCloseTo(30, 6); // earliest open, 30 days ago
+    expect(m.unintendedSells).toBe(0);
+    expect(m.riskInvariantBreaches).toBe(0);
+  });
+
+  it('flags a stop at/above blended entry as a risk-invariant breach', () => {
+    const m = computeAccumulationGateMetrics([accum(10, 20, { stopLoss: 100 })], NOW);
+    expect(m.riskInvariantBreaches).toBe(1);
+  });
+
+  it('flags a short (non-long) accumulation as a risk-invariant breach', () => {
+    const m = computeAccumulationGateMetrics([accum(10, 20, { side: 'sell' })], NOW);
+    expect(m.riskInvariantBreaches).toBe(1);
+  });
+
+  it('counts a held position sold outside its catastrophe stop as an unintended sell', () => {
+    const closedTp: AccumulationPositionSample = {
+      side: 'buy', entryPrice: 100, stopLoss: 90, quantity: 5, fills: 5, hold: true,
+      openedAt: NOW - 40 * MS_PER_DAY, closedAt: NOW - 1 * MS_PER_DAY, exitReason: 'tp',
+    };
+    const closedSl: AccumulationPositionSample = { ...closedTp, exitReason: 'sl' };
+    const m = computeAccumulationGateMetrics([accum(10, 20), closedTp, closedSl], NOW);
+    expect(m.unintendedSells).toBe(1); // tp counts, sl does not
+    expect(m.positionCount).toBe(1); // only the open position
+  });
+});
+
+describe('evaluateAccumulationGate — accumulation correctness, not PF/expectancy', () => {
+  it('passes a well-formed, well-soaked accumulation', () => {
+    const m = computeAccumulationGateMetrics([accum(8, 14)], NOW);
+    expect(evaluateAccumulationGate(m).state).toBe('pass');
+  });
+
+  it('is missing when no accumulation positions are monitored', () => {
+    expect(evaluateAccumulationGate(null).state).toBe('missing');
+    expect(evaluateAccumulationGate(computeAccumulationGateMetrics([], NOW)).state).toBe('missing');
+  });
+
+  it('fails when too few fills or too short a soak', () => {
+    const tooFewFills = evaluateAccumulationGate(computeAccumulationGateMetrics([accum(3, 20)], NOW));
+    expect(tooFewFills.state).toBe('fail');
+    expect(tooFewFills.failedChecks.join(' ')).toMatch(/fills/);
+    const tooShort = evaluateAccumulationGate(computeAccumulationGateMetrics([accum(10, 5)], NOW));
+    expect(tooShort.state).toBe('fail');
+    expect(tooShort.failedChecks.join(' ')).toMatch(/soak/);
+  });
+
+  it('fails on any unintended sell or risk-invariant breach', () => {
+    const sell = evaluateAccumulationGate(
+      computeAccumulationGateMetrics(
+        [accum(10, 20), { side: 'buy', entryPrice: 100, stopLoss: 90, quantity: 1, fills: 1, hold: true, openedAt: NOW - 30 * MS_PER_DAY, closedAt: NOW, exitReason: 'tp' }],
+        NOW,
+      ),
+    );
+    expect(sell.state).toBe('fail');
+    expect(sell.failedChecks.join(' ')).toMatch(/unintended sell/);
+    const breach = evaluateAccumulationGate(computeAccumulationGateMetrics([accum(10, 20, { stopLoss: 110 })], NOW));
+    expect(breach.state).toBe('fail');
+    expect(breach.failedChecks.join(' ')).toMatch(/risk invariant/);
+  });
+});
+
+describe('evaluatePromotion — class-aware Stage 2', () => {
+  // Same variance-carrying ledger the overall-verdict suite uses so the paper
+  // leg genuinely passes (a zero-variance ledger yields a null Sharpe → fail).
+  const strongPaper = computePaperGateMetrics(
+    spaced(Array.from({ length: 60 }, (_, i) => (i % 6 === 0 ? -0.5 : 1.5))),
+  );
+  const goodAccum = computeAccumulationGateMetrics([accum(10, 20)], NOW);
+
+  it('an accumulate strategy clears live on Stage-1 verdict + accumulation + sign-off (no closed trades)', () => {
+    const r = evaluatePromotion({
+      strategyId: 'dca',
+      strategyClass: 'accumulate',
+      backtest: PASSING_BT,
+      backtestVerdict: { pass: true },
+      paper: null, // never any closed paper trades — the old structural blocker
+      accumulation: goodAccum,
+      signoff: 'present',
+    });
+    expect(r.strategyClass).toBe('accumulate');
+    expect(r.canGoLive).toBe(true);
+    expect(r.paper.accumulation).not.toBeNull();
+    expect(r.paper.metrics).toBeNull();
+  });
+
+  it('an accumulate strategy is blocked on Stage 2 when accumulation is missing', () => {
+    const r = evaluatePromotion({
+      strategyId: 'dca',
+      strategyClass: 'accumulate',
+      backtest: PASSING_BT,
+      backtestVerdict: { pass: true },
+      paper: null,
+      accumulation: null,
+      signoff: 'present',
+    });
+    expect(r.canGoLive).toBe(false);
+    expect(r.blockedReasons.join(' ')).toMatch(/Stage 2 \(accumulation\) missing/);
+  });
+
+  it('does NOT let closed-trade paper metrics promote an accumulate strategy', () => {
+    // Even a strong closed-trade paper ledger must not clear Stage 2 for an
+    // accumulate strategy — only accumulation correctness does.
+    const r = evaluatePromotion({
+      strategyId: 'dca',
+      strategyClass: 'accumulate',
+      backtest: PASSING_BT,
+      backtestVerdict: { pass: true },
+      paper: strongPaper,
+      accumulation: null,
+      signoff: 'present',
+    });
+    expect(r.canGoLive).toBe(false);
+  });
+
+  it('close-based strategies are unchanged: accumulation is ignored, paper leg still governs', () => {
+    const r = evaluatePromotion({
+      strategyId: 'bb_fade',
+      backtest: PASSING_BT,
+      backtestVerdict: { pass: true },
+      paper: strongPaper,
+      accumulation: goodAccum, // supplied but must be ignored for a close strategy
+      signoff: 'present',
+    });
+    expect(r.strategyClass).toBe('close');
+    expect(r.canGoLive).toBe(true);
+    expect(r.paper.metrics).not.toBeNull();
+    expect(r.paper.accumulation).toBeNull();
   });
 });
