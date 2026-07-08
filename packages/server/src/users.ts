@@ -1,9 +1,10 @@
-import { scrypt, randomBytes, timingSafeEqual } from 'node:crypto';
+import { scrypt, randomBytes, randomInt, timingSafeEqual } from 'node:crypto';
 import { promisify } from 'node:util';
 import { readFile, writeFile, mkdir } from 'fs/promises';
 import { existsSync } from 'fs';
 import { join, dirname } from 'path';
 import { fileURLToPath } from 'url';
+import { hashSecretValue, verifySecretHash } from './auth.js';
 import { logger } from './observability/index.js';
 
 const log = logger.child({ module: 'users' });
@@ -25,9 +26,31 @@ export interface User {
   // TRA-217 — admins can lock an account; locked users cannot log in until unlocked.
   // Older users.json files predate this field, so it's optional and defaults to false.
   locked?: boolean;
+  // TRA-1505 — opt-in email two-factor login. `enabled` gates the OTP challenge;
+  // `backupCodeHashes` are single-use recovery codes (HMAC hashes only, never
+  // plaintext) so a user whose email is unavailable can't get permanently locked
+  // out. Older users.json files predate this field, so it's optional.
+  twoFactor?: {
+    enabled: boolean;
+    backupCodeHashes?: string[];
+  };
 }
 
-export type SafeUser = Omit<User, 'passwordHash'>;
+// TRA-1505 — the client-facing shape never carries the password hash nor the
+// 2FA backup-code hashes; it exposes only whether 2FA is enabled.
+export type SafeUser = Omit<User, 'passwordHash' | 'twoFactor'> & {
+  twoFactor?: { enabled: boolean };
+};
+
+/** Strip all secret material from a user record for client responses. */
+export function toSafeUser(user: User): SafeUser {
+  const { passwordHash: _ph, twoFactor, ...rest } = user;
+  return {
+    ...rest,
+    locked: rest.locked ?? false,
+    ...(twoFactor ? { twoFactor: { enabled: twoFactor.enabled } } : {}),
+  };
+}
 
 let users: User[] = [];
 
@@ -124,7 +147,7 @@ export function getUserByEmail(email: string): User | undefined {
 }
 
 export function getAllUsers(): SafeUser[] {
-  return users.map(({ passwordHash: _ph, ...safe }) => ({ ...safe, locked: safe.locked ?? false }));
+  return users.map(toSafeUser);
 }
 
 export function isUserLocked(username: string): boolean {
@@ -200,6 +223,81 @@ export async function deleteUser(username: string): Promise<boolean> {
   const idx = users.findIndex(u => u.username === username);
   if (idx === -1) return false;
   users.splice(idx, 1);
+  await persistUsers();
+  return true;
+}
+
+// ── TRA-1505 — two-factor (email OTP) enrollment + backup codes ────────────────
+
+/** Number of single-use recovery codes minted when a user enables 2FA. */
+const BACKUP_CODE_COUNT = 10;
+
+export function isTwoFactorEnabled(username: string): boolean {
+  return !!getUser(username)?.twoFactor?.enabled;
+}
+
+export function getTwoFactorStatus(username: string): { enabled: boolean; backupCodesRemaining: number } {
+  const tf = getUser(username)?.twoFactor;
+  return {
+    enabled: !!tf?.enabled,
+    backupCodesRemaining: tf?.backupCodeHashes?.length ?? 0,
+  };
+}
+
+/** Generate a single human-friendly backup code, e.g. "4F2K-9QH3". */
+function generateBackupCode(): string {
+  const alphabet = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789'; // no ambiguous 0/O/1/I
+  const pick = (n: number) => Array.from({ length: n }, () => alphabet[randomInt(0, alphabet.length)]).join('');
+  return `${pick(4)}-${pick(4)}`;
+}
+
+/**
+ * Enable email 2FA for a user and mint a fresh set of single-use backup codes.
+ * Returns the PLAINTEXT codes exactly once (for the caller to show the user);
+ * only their hashes are persisted. Fails if the user has no email on file, since
+ * email is the phase-1 delivery channel.
+ */
+export async function enableTwoFactor(
+  username: string,
+): Promise<{ ok: true; backupCodes: string[] } | { ok: false; error: string }> {
+  const idx = users.findIndex(u => u.username === username);
+  if (idx === -1) return { ok: false, error: 'User not found' };
+  if (!users[idx].email || !users[idx].email.includes('@')) {
+    return { ok: false, error: 'Add a valid email to your account before enabling two-factor.' };
+  }
+  const backupCodes = Array.from({ length: BACKUP_CODE_COUNT }, generateBackupCode);
+  users[idx].twoFactor = {
+    enabled: true,
+    backupCodeHashes: backupCodes.map(hashSecretValue),
+  };
+  await persistUsers();
+  log.info('2fa: enabled', { username });
+  return { ok: true, backupCodes };
+}
+
+/** Disable 2FA and discard any remaining backup codes. */
+export async function disableTwoFactor(username: string): Promise<boolean> {
+  const idx = users.findIndex(u => u.username === username);
+  if (idx === -1) return false;
+  users[idx].twoFactor = { enabled: false };
+  await persistUsers();
+  log.info('2fa: disabled', { username });
+  return true;
+}
+
+/**
+ * Consume a single-use backup code as a recovery second factor. Returns true and
+ * removes the code on match; false otherwise. Never logs the submitted code.
+ */
+export async function consumeBackupCode(username: string, code: string): Promise<boolean> {
+  const idx = users.findIndex(u => u.username === username);
+  if (idx === -1) return false;
+  const hashes = users[idx].twoFactor?.backupCodeHashes;
+  if (!hashes || hashes.length === 0) return false;
+  const normalized = code.trim().toUpperCase();
+  const matchIdx = hashes.findIndex(h => verifySecretHash(normalized, h));
+  if (matchIdx === -1) return false;
+  hashes.splice(matchIdx, 1);
   await persistUsers();
   return true;
 }

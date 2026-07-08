@@ -11,6 +11,11 @@ let createToken: AuthModule['createToken'];
 let verifyToken: AuthModule['verifyToken'];
 let resolveTtlMs: AuthModule['resolveTtlMs'];
 let TOKEN_TTL_MS: AuthModule['TOKEN_TTL_MS'];
+let createPendingToken: AuthModule['createPendingToken'];
+let verifyPendingToken: AuthModule['verifyPendingToken'];
+let PENDING_TOKEN_TTL_MS: AuthModule['PENDING_TOKEN_TTL_MS'];
+let hashSecretValue: AuthModule['hashSecretValue'];
+let verifySecretHash: AuthModule['verifySecretHash'];
 
 const HOUR_MS = 60 * 60 * 1000;
 
@@ -20,6 +25,11 @@ beforeAll(async () => {
   verifyToken = mod.verifyToken;
   resolveTtlMs = mod.resolveTtlMs;
   TOKEN_TTL_MS = mod.TOKEN_TTL_MS;
+  createPendingToken = mod.createPendingToken;
+  verifyPendingToken = mod.verifyPendingToken;
+  PENDING_TOKEN_TTL_MS = mod.PENDING_TOKEN_TTL_MS;
+  hashSecretValue = mod.hashSecretValue;
+  verifySecretHash = mod.verifySecretHash;
 });
 
 describe('createToken / verifyToken — basic round-trip', () => {
@@ -103,5 +113,53 @@ describe('resolveTtlMs — AUTH_TOKEN_TTL_HOURS parsing', () => {
 
   it('exposes a 24h default through TOKEN_TTL_MS', () => {
     expect(TOKEN_TTL_MS).toBe(24 * HOUR_MS);
+  });
+});
+
+describe('pending-auth token (TRA-1505)', () => {
+  it('round-trips a pending token back to its subject', () => {
+    expect(verifyPendingToken(createPendingToken('alice'))).toBe('alice');
+  });
+
+  it('exposes a 10-minute default TTL', () => {
+    expect(PENDING_TOKEN_TTL_MS).toBe(10 * 60 * 1000);
+  });
+
+  it('rejects an expired pending token', () => {
+    const token = createPendingToken('alice', Date.now() - (PENDING_TOKEN_TTL_MS + 1000));
+    expect(verifyPendingToken(token)).toBeNull();
+  });
+
+  it('does NOT accept a pending token as a full session (verifyToken rejects it)', () => {
+    const pending = createPendingToken('alice');
+    expect(verifyToken(pending)).toBeNull();
+  });
+
+  it('does NOT accept a full session token via verifyPendingToken', () => {
+    const session = createToken('alice');
+    expect(verifyPendingToken(session)).toBeNull();
+  });
+
+  it('rejects a tampered pending token', () => {
+    const token = createPendingToken('alice');
+    const dot = token.lastIndexOf('.');
+    const forged = `${token.slice(0, dot)}.${token.slice(dot + 1)}AAAA`;
+    expect(verifyPendingToken(forged)).toBeNull();
+  });
+});
+
+describe('hashSecretValue / verifySecretHash (TRA-1505)', () => {
+  it('verifies a value against its own hash', () => {
+    const hash = hashSecretValue('123456');
+    expect(verifySecretHash('123456', hash)).toBe(true);
+  });
+
+  it('rejects a wrong value', () => {
+    const hash = hashSecretValue('123456');
+    expect(verifySecretHash('654321', hash)).toBe(false);
+  });
+
+  it('does not store the plaintext in the hash', () => {
+    expect(hashSecretValue('123456')).not.toContain('123456');
   });
 });

@@ -138,6 +138,77 @@ export async function sendPasswordResetEmail(
   await transport.sendMail({ from: SMTP_FROM, to: toEmail, subject, text, html });
 }
 
+function buildOtpEmail(username: string, code: string): { subject: string; text: string; html: string } {
+  const subject = 'TradingAI — Your login verification code';
+
+  const text = [
+    `Hi ${username},`,
+    '',
+    'Use this code to finish signing in to TradingAI:',
+    '',
+    `  ${code}`,
+    '',
+    'This code expires in 10 minutes and can be used once.',
+    '',
+    'If you did not just try to sign in, someone may have your password — reset it and contact support.',
+    '',
+    '— TradingAI',
+  ].join('\n');
+
+  const html = `<!DOCTYPE html>
+<html lang="en">
+<head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1"></head>
+<body style="margin:0;padding:0;background:#0d1117;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Helvetica,Arial,sans-serif;">
+  <table width="100%" cellpadding="0" cellspacing="0" style="background:#0d1117;padding:40px 20px;">
+    <tr><td align="center">
+      <table width="560" cellpadding="0" cellspacing="0" style="background:#161b22;border:1px solid #30363d;border-radius:8px;padding:40px;">
+        <tr><td>
+          <h1 style="color:#c9d1d9;font-size:24px;font-weight:600;margin:0 0 8px;">TradingAI</h1>
+          <p style="color:#8b949e;font-size:14px;margin:0 0 32px;">Login verification</p>
+          <p style="color:#c9d1d9;font-size:15px;margin:0 0 16px;">Hi <strong>${username}</strong>,</p>
+          <p style="color:#c9d1d9;font-size:15px;margin:0 0 24px;">
+            Enter this code in the app to finish signing in. It expires in <strong>10 minutes</strong>.
+          </p>
+          <div style="background:#0d1117;border:1px solid #30363d;border-radius:6px;padding:20px;text-align:center;margin:16px 0;">
+            <span style="font-family:monospace;font-size:32px;font-weight:700;letter-spacing:8px;color:#3fb950;">${code}</span>
+          </div>
+          <p style="color:#8b949e;font-size:13px;margin:24px 0 0;">
+            If you did not just try to sign in, someone may have your password. Reset it and contact support.
+          </p>
+        </td></tr>
+      </table>
+      <p style="color:#484f58;font-size:12px;margin-top:20px;">© ${new Date().getFullYear()} TradingAI. All rights reserved.</p>
+    </td></tr>
+  </table>
+</body>
+</html>`;
+
+  return { subject, text, html };
+}
+
+/**
+ * TRA-1505 — deliver a two-factor login code to a user's email. Mirrors the
+ * password-reset fallback: with no SMTP configured it prints the code to the
+ * operator's stdout (console, NOT the structured logger, so the short-lived
+ * secret never lands in the on-disk `app.jsonl` sink) so local runs still work.
+ */
+export async function sendOtpEmail(
+  toEmail: string,
+  username: string,
+  code: string,
+): Promise<void> {
+  const transport = getTransport();
+  const { subject, text, html } = buildOtpEmail(username, code);
+
+  if (!transport) {
+    console.log(`[email] 2FA login code for ${username} <${toEmail}> — no SMTP configured.`);
+    console.log(`[email]   Code: ${code}`);
+    return;
+  }
+
+  await transport.sendMail({ from: SMTP_FROM, to: toEmail, subject, text, html });
+}
+
 /**
  * TRA-406 — send an operational alert email to the addresses in `ALERT_EMAIL`
  * (comma-separated). No-ops cleanly when SMTP or `ALERT_EMAIL` is unconfigured

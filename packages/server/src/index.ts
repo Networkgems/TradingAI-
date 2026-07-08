@@ -160,7 +160,8 @@ import {
   liveBackfillWriteWindow,
   realizedOptionsPnlByCloseDate,
 } from './reports/tradier-reconcile.js';
-import { createToken, verifyToken, generateResetToken, consumeResetToken, initResetTokenStore } from './auth.js';
+import { createToken, verifyToken, createPendingToken, verifyPendingToken, generateResetToken, consumeResetToken, initResetTokenStore } from './auth.js';
+import { initTwoFactorStore, issueChallenge, resendChallenge, verifyChallenge } from './two-factor.js';
 import { initStateDb, getStateDb } from './sqlite.js'; // TRA-1052 — durable hot-state SQLite store
 import { checkThrottle, recordFailure, recordSuccess } from './auth-throttle.js';
 import { getSettings, loadSettings, mergeScopedRiskSettings, saveSettings } from './account-settings.js';
@@ -303,8 +304,14 @@ import {
   deleteUser,
   isUserLocked,
   setUserLocked,
+  toSafeUser,
+  isTwoFactorEnabled,
+  getTwoFactorStatus,
+  enableTwoFactor,
+  disableTwoFactor,
+  consumeBackupCode,
 } from './users.js';
-import { sendPasswordResetEmail } from './email.js';
+import { sendPasswordResetEmail, sendOtpEmail } from './email.js';
 import { startEventLoopWatchdog, type WatchdogHandle } from './event-loop-watchdog.js';
 import {
   logger,
@@ -483,6 +490,7 @@ await checkDataDirHealth();
 // Load users and reset tokens from persistent storage.
 await loadUsers();
 initResetTokenStore(DATA_DIR);
+initTwoFactorStore(DATA_DIR);
 
 // TRA-1052 (TRA-1045 R1) — open the durable hot-state SQLite store on the Render
 // disk (DATA_DIR) BEFORE any per-user context boots, so the agent-spend committed
@@ -3859,7 +3867,162 @@ app.post('/api/auth/login', async (req, res) => {
   // Valid credentials → wipe the brute-force counters for this caller/account.
   recordSuccess(ipKey);
   recordSuccess(userKey);
+
+  // TRA-1505 — if the account has email 2FA enabled, the password step is only
+  // the FIRST factor: issue a short-lived pending-auth token (NOT a session),
+  // email a one-time code, and require /api/auth/2fa/verify to finish. The
+  // pending token is useless against protected routes (verifyToken rejects it),
+  // so a "verified" client flag can never be trusted.
+  if (isTwoFactorEnabled(username)) {
+    const user = getUser(username);
+    if (user?.email) {
+      const { code } = issueChallenge(username);
+      try {
+        await sendOtpEmail(user.email, username, code);
+      } catch (err) {
+        log.error('auth: failed to send 2FA code', {
+          reason: err instanceof Error ? err.message : String(err),
+        });
+      }
+      res.json({ twoFactorRequired: true, pendingToken: createPendingToken(username) });
+      return;
+    }
+    // Enabled but no email on file (shouldn't happen — enrollment requires one).
+    // Fail safe by letting them in rather than locking them out permanently.
+    log.warn('auth: 2FA enabled but no email on file; skipping second factor', { username });
+  }
+
   res.json({ token: createToken(username) });
+});
+
+// TRA-1505 — complete the second factor. Accepts either the emailed OTP or a
+// single-use backup code. Only here (with a valid pending token) is a full
+// session minted. Throttled per-IP and per-user so the 6-digit code can't be
+// brute-forced.
+app.post('/api/auth/2fa/verify', async (req, res) => {
+  const { pendingToken, code } = req.body as { pendingToken?: string; code?: string };
+  if (typeof pendingToken !== 'string' || typeof code !== 'string') {
+    res.status(400).json({ error: 'pendingToken and code are required' });
+    return;
+  }
+  const username = verifyPendingToken(pendingToken);
+  if (!username) {
+    res.status(401).json({ error: 'Your login session expired. Please sign in again.' });
+    return;
+  }
+  const ipKey = `2fa:ip:${clientKey(req)}`;
+  const userKey = `2fa:user:${username.toLowerCase()}`;
+  if (rejectIfThrottled(res, [ipKey, userKey])) return;
+
+  const trimmed = code.trim();
+  // A dashed/alphabetic value is a backup recovery code; a plain numeric value is
+  // the emailed OTP.
+  const looksLikeBackupCode = /[a-zA-Z-]/.test(trimmed);
+  if (looksLikeBackupCode) {
+    if (await consumeBackupCode(username, trimmed)) {
+      recordSuccess(ipKey);
+      recordSuccess(userKey);
+      res.json({ token: createToken(username) });
+      return;
+    }
+    recordFailure(ipKey);
+    recordFailure(userKey);
+    res.status(401).json({ error: 'Invalid or already-used backup code.' });
+    return;
+  }
+
+  const result = verifyChallenge(username, trimmed);
+  if (result === 'ok') {
+    recordSuccess(ipKey);
+    recordSuccess(userKey);
+    res.json({ token: createToken(username) });
+    return;
+  }
+  recordFailure(ipKey);
+  recordFailure(userKey);
+  if (result === 'expired' || result === 'no_challenge') {
+    res.status(401).json({ error: 'Code expired. Request a new one.', code: 'expired' });
+    return;
+  }
+  if (result === 'too_many_attempts') {
+    res.status(429).json({ error: 'Too many wrong codes. Please sign in again.', code: 'too_many_attempts' });
+    return;
+  }
+  res.status(401).json({ error: 'Incorrect code. Try again.', code: 'invalid' });
+});
+
+// TRA-1505 — resend the emailed OTP for an in-flight challenge, rate-limited per
+// challenge (in two-factor.ts) and per-IP here.
+app.post('/api/auth/2fa/resend', async (req, res) => {
+  const { pendingToken } = req.body as { pendingToken?: string };
+  if (typeof pendingToken !== 'string') {
+    res.status(400).json({ error: 'pendingToken is required' });
+    return;
+  }
+  const username = verifyPendingToken(pendingToken);
+  if (!username) {
+    res.status(401).json({ error: 'Your login session expired. Please sign in again.' });
+    return;
+  }
+  const ipKey = `2fa-resend:ip:${clientKey(req)}`;
+  if (rejectIfThrottled(res, [ipKey])) return;
+  recordFailure(ipKey);
+
+  const result = resendChallenge(username);
+  if (!result.ok) {
+    if (result.reason === 'too_many_sends') {
+      res.status(429).json({ error: 'Too many codes requested. Please sign in again.' });
+      return;
+    }
+    res.status(401).json({ error: 'No active login to resend. Please sign in again.' });
+    return;
+  }
+  const user = getUser(username);
+  if (user?.email) {
+    try {
+      await sendOtpEmail(user.email, username, result.code);
+    } catch (err) {
+      log.error('auth: failed to resend 2FA code', {
+        reason: err instanceof Error ? err.message : String(err),
+      });
+    }
+  }
+  res.json({ ok: true, message: 'A new code has been sent.' });
+});
+
+// TRA-1505 — 2FA enrollment (authenticated). Enabling mints one-time backup
+// recovery codes returned exactly once; the client must show them to the user.
+app.get('/api/auth/2fa/status', requireAuth, (req, res) => {
+  const username = res.locals['authUser'] as string;
+  res.json(getTwoFactorStatus(username));
+});
+
+app.post('/api/auth/2fa/enable', requireAuth, async (req, res) => {
+  const username = res.locals['authUser'] as string;
+  // Re-authenticate with the current password before turning on a security
+  // control, so a hijacked session can't silently enroll (and lock out) a user.
+  const { password } = req.body as { password?: string };
+  if (typeof password !== 'string' || !(await validateUserCredentials(username, password))) {
+    res.status(401).json({ error: 'Current password is required to enable two-factor.' });
+    return;
+  }
+  const result = await enableTwoFactor(username);
+  if (!result.ok) {
+    res.status(400).json({ error: result.error });
+    return;
+  }
+  res.json({ ok: true, backupCodes: result.backupCodes });
+});
+
+app.post('/api/auth/2fa/disable', requireAuth, async (req, res) => {
+  const username = res.locals['authUser'] as string;
+  const { password } = req.body as { password?: string };
+  if (typeof password !== 'string' || !(await validateUserCredentials(username, password))) {
+    res.status(401).json({ error: 'Current password is required to disable two-factor.' });
+    return;
+  }
+  await disableTwoFactor(username);
+  res.json({ ok: true });
 });
 
 app.post('/api/auth/signup', async (req, res) => {
@@ -3965,8 +4128,7 @@ app.get('/api/auth/me', requireAuth, (req, res) => {
   const username = res.locals['authUser'] as string;
   const user = getUser(username);
   if (!user) { res.status(404).json({ error: 'User not found' }); return; }
-  const { passwordHash: _ph, ...safe } = user;
-  res.json(safe);
+  res.json(toSafeUser(user));
 });
 
 app.patch('/api/auth/me', requireAuth, async (req, res) => {

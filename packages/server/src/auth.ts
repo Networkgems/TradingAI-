@@ -62,15 +62,46 @@ function sign(encoded: string): string {
 }
 
 /**
- * Issue a signed session token. `issuedAt` defaults to now; an explicit value
- * exists for tests that need to simulate an aged token.
+ * TRA-1505 — keyed hash for short-lived secrets we must store but never keep in
+ * plaintext (email OTP codes, 2FA backup codes). Reuses the same server-side
+ * `SECRET` so a leaked on-disk store can't be reversed without it, and hands
+ * callers a constant-time comparator. Never log the plaintext input.
  */
-export function createToken(username: string, issuedAt: number = Date.now()): string {
-  const payload = Buffer.from(JSON.stringify({ sub: username, iat: issuedAt })).toString('base64url');
-  return `${payload}.${sign(payload)}`;
+export function hashSecretValue(value: string): string {
+  return createHmac('sha256', SECRET).update(value).digest('base64url');
 }
 
-export function verifyToken(token: string): string | null {
+/** Constant-time compare of a plaintext value against a `hashSecretValue` hash. */
+export function verifySecretHash(value: string, hash: string): boolean {
+  try {
+    const a = Buffer.from(hashSecretValue(value));
+    const b = Buffer.from(hash);
+    return a.length === b.length && timingSafeEqual(a, b);
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * TRA-1505 — pending-auth token TTL. After a correct password an enrolled user
+ * gets a *pending* token (not a full session) that only lets them complete the
+ * second factor; it expires fast so a stolen pending token is near-useless.
+ * Configurable via `AUTH_PENDING_TTL_MIN`; defaults to 10 minutes.
+ */
+export function resolvePendingTtlMs(raw: string | undefined): number {
+  const DEFAULT_MIN = 10;
+  const min = raw === undefined || raw.trim() === '' ? DEFAULT_MIN : Number(raw);
+  if (!Number.isFinite(min) || min <= 0) return DEFAULT_MIN * 60 * 1000;
+  return min * 60 * 1000;
+}
+
+export const PENDING_TOKEN_TTL_MS = resolvePendingTtlMs(process.env.AUTH_PENDING_TTL_MIN);
+
+/**
+ * Verify a token's signature and return its decoded payload, or null if the
+ * signature does not match. Shared by the session- and pending-token verifiers.
+ */
+function verifySignedPayload(token: string): Record<string, unknown> | null {
   const dot = token.lastIndexOf('.');
   if (dot === -1) return null;
   const payload = token.slice(0, dot);
@@ -84,17 +115,60 @@ export function verifyToken(token: string): string | null {
     return null;
   }
   try {
-    const data = JSON.parse(Buffer.from(payload, 'base64url').toString());
-    if (typeof data.sub !== 'string') return null;
-    // C1 (TRA-404): enforce a max token lifetime. `createToken` always stamps a
-    // numeric `iat`, so a token missing/!finite `iat` is malformed or forged →
-    // reject. Tokens older than TOKEN_TTL_MS are expired → reject.
-    if (typeof data.iat !== 'number' || !Number.isFinite(data.iat)) return null;
-    if (Date.now() - data.iat > TOKEN_TTL_MS) return null;
-    return data.sub;
+    return JSON.parse(Buffer.from(payload, 'base64url').toString()) as Record<string, unknown>;
   } catch {
     return null;
   }
+}
+
+/**
+ * Issue a signed session token. `issuedAt` defaults to now; an explicit value
+ * exists for tests that need to simulate an aged token.
+ */
+export function createToken(username: string, issuedAt: number = Date.now()): string {
+  const payload = Buffer.from(JSON.stringify({ sub: username, iat: issuedAt })).toString('base64url');
+  return `${payload}.${sign(payload)}`;
+}
+
+export function verifyToken(token: string): string | null {
+  const data = verifySignedPayload(token);
+  if (!data) return null;
+  if (typeof data['sub'] !== 'string') return null;
+  // TRA-1505: a pending-auth token (issued after password but before the second
+  // factor) must NEVER be accepted as a full session — reject it here so the
+  // client can't skip 2FA by presenting its pending token to a protected route.
+  if (data['typ'] === 'pending2fa') return null;
+  const iat = data['iat'];
+  // C1 (TRA-404): enforce a max token lifetime. `createToken` always stamps a
+  // numeric `iat`, so a token missing/!finite `iat` is malformed or forged →
+  // reject. Tokens older than TOKEN_TTL_MS are expired → reject.
+  if (typeof iat !== 'number' || !Number.isFinite(iat)) return null;
+  if (Date.now() - iat > TOKEN_TTL_MS) return null;
+  return data['sub'] as string;
+}
+
+/**
+ * TRA-1505 — issue a short-lived pending-auth token after a correct password
+ * when the account requires a second factor. It carries `typ: 'pending2fa'` so
+ * `verifyToken` refuses it as a session; only `/api/auth/2fa/verify` accepts it,
+ * and only to complete the OTP step.
+ */
+export function createPendingToken(username: string, issuedAt: number = Date.now()): string {
+  const payload = Buffer.from(
+    JSON.stringify({ sub: username, iat: issuedAt, typ: 'pending2fa' }),
+  ).toString('base64url');
+  return `${payload}.${sign(payload)}`;
+}
+
+export function verifyPendingToken(token: string): string | null {
+  const data = verifySignedPayload(token);
+  if (!data) return null;
+  if (typeof data['sub'] !== 'string') return null;
+  if (data['typ'] !== 'pending2fa') return null;
+  const iat = data['iat'];
+  if (typeof iat !== 'number' || !Number.isFinite(iat)) return null;
+  if (Date.now() - iat > PENDING_TOKEN_TTL_MS) return null;
+  return data['sub'] as string;
 }
 
 // ── Password reset tokens ─────────────────────────────────────────────────────
