@@ -207,6 +207,25 @@ export const RENDER_RATIFIED_DEMO_DEFAULTS: Readonly<Record<string, string>> = {
   // on `mode==='live'`; the DCA-halt branches are demo-only), so it can never alter
   // a live open or add. Board-ratified demo arm.
   ENABLE_CHURN_LOSS_BRAKE: '1',
+  // TRA-1493 (parent TRA-1476/TRA-1486) — the demo directional liquidity/quality +
+  // per-name churn gate. render.yaml ratified `ENABLE_OPTION_DIRECTIONAL_QUALITY_GATE:"1"`
+  // + the 10 / 300000 / 2 thresholds (QuantTrader's locked TRA-1476 call), but they
+  // were added AFTER the last manual blueprint sync so they stayed DARK on the
+  // e32727a autoDeploy (`/api/health/directional-quality-gate` → armed:false,
+  // maxOpensPerName:3 = the code default) — the exact TRA-1289 env-sync gap the churn
+  // brake hit. DEMO-only by construction: the gate is inert unless the demo
+  // directional path (ENABLE_OPTION_DEMO_DIRECTIONAL, already synced) is itself on,
+  // and the signal-engine consults it ONLY on the demo chokepoint (`mode==='demo'`,
+  // never mirrored to Tradier), so seeding it can NEVER touch a live open — it only
+  // ever makes the demo directional path open LESS. Pure risk-reducing: each seeded
+  // value is STRICTER than the code default (price 10>5, $-vol 300k>250k, cap 2<3).
+  // Seeding the numeric thresholds alongside the flag makes the RUNNING gate match
+  // render.yaml exactly (esp. the max-2/name/ET-day the TRA-1492 accept criteria
+  // require) and self-heal every redeploy. Board-ratified demo arm.
+  ENABLE_OPTION_DIRECTIONAL_QUALITY_GATE: '1',
+  OPTION_DIRECTIONAL_MIN_UNDERLYING_PRICE: '10',
+  OPTION_DIRECTIONAL_MIN_AVG_DOLLAR_VOLUME: '300000',
+  OPTION_DIRECTIONAL_MAX_OPENS_PER_NAME: '2',
 };
 
 /**

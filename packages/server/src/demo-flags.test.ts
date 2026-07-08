@@ -17,6 +17,7 @@ import {
   DEMO_FLAGS_FILENAME,
 } from './demo-flags.js';
 import { isAutonomousDemoLoopEnabled } from './autonomous-demo-loop.js';
+import { resolveDirectionalQualityThresholds } from './ignition-quality-gate.js';
 
 let dir: string;
 
@@ -140,20 +141,51 @@ describe('renderRatifiedDemoDefaults (TRA-1481 — self-heal the Render blueprin
     expect(renderRatifiedDemoDefaults(dir, {} as NodeJS.ProcessEnv)).toEqual({});
   });
 
-  it('seeds the board-ratified churn brake on Render when set by neither env nor file', () => {
+  it('seeds the board-ratified brakes on Render when set by neither env nor file', () => {
     const env = { RENDER: 'true' } as NodeJS.ProcessEnv;
-    expect(renderRatifiedDemoDefaults(dir, env)).toEqual({ ENABLE_CHURN_LOSS_BRAKE: '1' });
+    expect(renderRatifiedDemoDefaults(dir, env)).toEqual({
+      ENABLE_CHURN_LOSS_BRAKE: '1',
+      // TRA-1493 — the demo directional quality gate + its ratified thresholds
+      // self-heal the same env-sync gap (dark on the e32727a autoDeploy).
+      ENABLE_OPTION_DIRECTIONAL_QUALITY_GATE: '1',
+      OPTION_DIRECTIONAL_MIN_UNDERLYING_PRICE: '10',
+      OPTION_DIRECTIONAL_MIN_AVG_DOLLAR_VOLUME: '300000',
+      OPTION_DIRECTIONAL_MAX_OPENS_PER_NAME: '2',
+    });
   });
 
   it('does NOT override an explicit env value (a synced blueprint / dashboard value wins)', () => {
-    const env = { RENDER: 'true', ENABLE_CHURN_LOSS_BRAKE: '0' } as NodeJS.ProcessEnv;
+    const env = {
+      RENDER: 'true',
+      ENABLE_CHURN_LOSS_BRAKE: '0',
+      ENABLE_OPTION_DIRECTIONAL_QUALITY_GATE: '0',
+      OPTION_DIRECTIONAL_MIN_UNDERLYING_PRICE: '5',
+      OPTION_DIRECTIONAL_MIN_AVG_DOLLAR_VOLUME: '250000',
+      OPTION_DIRECTIONAL_MAX_OPENS_PER_NAME: '3',
+    } as NodeJS.ProcessEnv;
     expect(renderRatifiedDemoDefaults(dir, env)).toEqual({});
+  });
+
+  it('TRA-1493 — reconciles the per-name cap to the ratified max-2 when the code default (3) is dark', () => {
+    // The bug: on the e32727a autoDeploy the gate flag + cap never synced, so the
+    // running gate showed maxOpensPerName:3 (code default). The seed re-delivers
+    // render.yaml's ratified 2 so the TRA-1492 accept criteria (max-2/name/ET-day)
+    // are met and the arm survives every redeploy.
+    const env = { RENDER: 'true' } as NodeJS.ProcessEnv;
+    Object.assign(env, renderRatifiedDemoDefaults(dir, env));
+    expect(resolveDirectionalQualityThresholds(resolveDemoFlagEnv(dir, env)).maxOpensPerName).toBe(2);
   });
 
   it('does NOT override a demo-flags.json value — a board disarm via /api/admin/demo-flags is preserved', () => {
     // The board POSTs a deliberate `=0` disarm; the file layers over env, so the
     // seed must not re-arm it on the next boot.
-    writeDemoFlagFile(dir, { ENABLE_CHURN_LOSS_BRAKE: '0' });
+    writeDemoFlagFile(dir, {
+      ENABLE_CHURN_LOSS_BRAKE: '0',
+      ENABLE_OPTION_DIRECTIONAL_QUALITY_GATE: '0',
+      OPTION_DIRECTIONAL_MIN_UNDERLYING_PRICE: '5',
+      OPTION_DIRECTIONAL_MIN_AVG_DOLLAR_VOLUME: '250000',
+      OPTION_DIRECTIONAL_MAX_OPENS_PER_NAME: '3',
+    });
     const env = { RENDER: 'true' } as NodeJS.ProcessEnv;
     expect(renderRatifiedDemoDefaults(dir, env)).toEqual({});
   });
