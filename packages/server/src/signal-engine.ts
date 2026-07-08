@@ -1,4 +1,4 @@
-import { OrbStrategy, BbFadeStrategy, IchimokuStrategy, SupertrendConfluenceStrategy, confluenceSide, supertrend, reversalChecklist, adx, atr, atrPct, donchian, supportResistance, blackScholesDelta, blackScholesGreeks, daysToExpiration, bookGiveBackDecision, correlatedExposureDecision, entryGreeksGateDecision, chandelierStop, stopModifyDecision, selectRvLongCandidate, selectShadowOptionSignal, emaPullbackTrigger, volumeConfirmedBreakout, TradierOptionsClient, TradierOrderClient, TRADIER_REJECTED_STATUSES, TRADIER_TERMINAL_STATUSES, evaluateSma200, SMA200_MIN_BARS, SMA200_DEBOUNCE_BARS, composeTechnicalSnapshot, resampleCandles, TF_BUCKET_MS, OptionsRiskBreaker, DEFAULT_OPTIONS_BREAKER_PARAMS } from '@trading-app/engine';
+import { OrbStrategy, BbFadeStrategy, IchimokuStrategy, SupertrendConfluenceStrategy, confluenceSide, supertrend, supertrendLatest, reversalChecklist, adx, atr, atrPct, donchian, supportResistance, blackScholesDelta, blackScholesGreeks, daysToExpiration, bookGiveBackDecision, correlatedExposureDecision, entryGreeksGateDecision, chandelierStop, stopModifyDecision, selectRvLongCandidate, selectShadowOptionSignal, emaPullbackTrigger, volumeConfirmedBreakout, TradierOptionsClient, TradierOrderClient, TRADIER_REJECTED_STATUSES, TRADIER_TERMINAL_STATUSES, evaluateSma200, SMA200_MIN_BARS, SMA200_DEBOUNCE_BARS, composeTechnicalSnapshot, resampleCandles, TF_BUCKET_MS, OptionsRiskBreaker, DEFAULT_OPTIONS_BREAKER_PARAMS } from '@trading-app/engine';
 import { buildExposureBuckets, DEFAULT_EXIT_PARAMS, DEFAULT_MULTILEG_EXIT_PARAMS } from '@trading-app/engine';
 import type { StrategySelectorInput, ContractQuote, OptionTrend, RvLongTrendSide, ExitState, ExitParams, MultiLegExitParams, SharedTickIndicators, RelativeValueScannerOptions, OptionChainRow, IvRvScannerOptions, IvRvMispricingCandidate, ExposureBucket, ExposurePositionRisk, CorrelatedExposureDecision } from '@trading-app/engine';
 import type { TradierAccountBalance } from '@trading-app/engine';
@@ -40,7 +40,12 @@ import {
   resolveReversalShadowSignal,
   resolveReversalOutcome,
   openReversalShadowSignalsSync,
+  type ReversalShadowOpen,
 } from './reversal-shadow-ledger.js';
+import {
+  isPreTradeGateEnabled,
+  recordPreTradeGateDecision,
+} from './pre-trade-gate-ledger.js';
 import { ivRankSync, atmIvFromRows, recordDailyIv } from './iv-rank-store.js';
 import type { SentimentIcBand } from './option-trade-journal.js';
 import { listOptionTradeJournal } from './option-trade-journal.js';
@@ -5247,8 +5252,56 @@ export class SignalEngine {
           symbol: sym, reason: err instanceof Error ? err.message : String(err),
         });
       });
+      // TRA-1457 — SHADOW-FIRST universal pre-trade gate. Piggy-back on the same
+      // observe-only bracketed candidate to LOG a gate decision (MTF + volume +
+      // R:R>=1.5 + ATR stop). Gated OFF by default (ENABLE_PRE_TRADE_GATE); with
+      // the flag off this whole block is skipped, so zero cost / behavior change.
+      // NOTHING here routes or modifies an order — it only appends a decision row
+      // for QuantTrader's promotion A/B (TRA-789/1245 lineage).
+      this.recordPreTradeGate(sym, open, fiveMin);
     }
     this.labelOpenReversalShadowSignals();
+  }
+
+  /**
+   * TRA-1457 — derive the universal pre-trade gate inputs from the same 5m
+   * shadow series + reversal bracket and LOG a gate decision. The gate re-derives
+   * its OWN ATR stop (`k * ATR`) independent of the checklist bracket, per spec.
+   * Higher-timeframe trend = 1h Supertrend direction; RVOL = last-bar volume vs
+   * the trailing 20-bar mean. Flag-/env-gated and fire-and-forget so a bad read
+   * can't touch the tick or capital.
+   */
+  private recordPreTradeGate(sym: string, open: ReversalShadowOpen, fiveMin: Candle[]): void {
+    if (!isPreTradeGateEnabled()) return;
+    const lastBar = fiveMin[fiveMin.length - 1];
+    if (!lastBar) return;
+    const atrVal = atr(fiveMin) ?? 0;
+    const priorVols = fiveMin.slice(-21, -1).map((b) => b.volume);
+    const meanVol = priorVols.length > 0
+      ? priorVols.reduce((a, b) => a + b, 0) / priorVols.length
+      : 0;
+    const rvol = meanVol > 0 ? lastBar.volume / meanVol : 0;
+    const hourly = resampleCandles(fiveMin, TF_BUCKET_MS['1h']);
+    const stH = supertrendLatest(hourly);
+    const mtfTrend = stH ? (stH.direction === 'green' ? 1 : -1) : 0;
+    void recordPreTradeGateDecision({
+      id: `equity:${sym}:${open.side}:${lastBar.timestamp}`,
+      ts: lastBar.timestamp,
+      symbol: sym,
+      engine: 'equity',
+      input: {
+        entry: open.entry,
+        direction: open.side,
+        atr: atrVal,
+        mtfTrend,
+        rvol,
+        target: open.target,
+      },
+    }).catch((err: unknown) => {
+      reversalShadowLog.warn('pre-trade gate ledger append failed', {
+        symbol: sym, reason: err instanceof Error ? err.message : String(err),
+      });
+    });
   }
 
   /**

@@ -249,6 +249,12 @@ import {
   isReversalShadowEnabled,
   reversalHitRateByScore,
 } from './reversal-shadow-ledger.js';
+import {
+  initPreTradeGateLedger,
+  listPreTradeGateDecisions,
+  isPreTradeGateEnabled,
+  preTradeGateSummary,
+} from './pre-trade-gate-ledger.js';
 import { computeLearnedWeights } from './learned-signal-weights.js';
 import { isLearnedShrinkageEnabled } from './learned-shrinkage-flag.js';
 import {
@@ -672,6 +678,12 @@ await initOptionShadowLedger();
 // the read endpoint has history right after boot. The signal-engine tick appends
 // rows when ENABLE_REVERSAL_SHADOW is set; nothing here routes an order.
 await initReversalShadowLedger();
+
+// TRA-1457 — warm the SHADOW-FIRST universal pre-trade gate ledger so its read
+// endpoint has history right after boot. The signal-engine reversal shadow pass
+// appends decisions when ENABLE_PRE_TRADE_GATE is set (default OFF); nothing here
+// routes or modifies an order.
+await initPreTradeGateLedger();
 
 // TRA-850 — warm the persistent per-user trading-memory store from disk so the
 // synchronous `getUserMemorySync` read the advisory tick uses has each user's
@@ -4497,6 +4509,40 @@ app.get('/api/health/reversal-shadow-signals', async (req, res) => {
       reason: err instanceof Error ? err.message : String(err),
     });
     res.status(500).json({ error: 'Failed to read reversal shadow ledger' });
+  }
+});
+
+// TRA-1457 — read-only probe over the SHADOW-FIRST universal pre-trade gate
+// ledger (MTF + volume + R:R>=1.5 + ATR stop). Mirrors the shadow-signals probes:
+// returns the recent gate decisions plus the pass-rate + per-reason rejection
+// summary, and whether ENABLE_PRE_TRADE_GATE is on — so an empty ledger
+// ("flag off", the default while TRA-382 holds) is distinguishable from a
+// live-but-silent one. `?from=`/`?to=` are ms-epoch inclusive bounds on the
+// decision ts. No capital path: the gate only LOGS in this first cut; it never
+// blocks or modifies an order. The summary feeds the SAME A/B methodology as the
+// frozen NO-GO shadow-validation baseline (TRA-789/1245: E[R] -0.047R / 18.5%
+// hit), which QuantTrader (bf0ae543) reads to give a promotion GO/NO-GO.
+app.get('/api/health/pre-trade-gate', async (req, res) => {
+  const q = req.query as Record<string, unknown>;
+  const parseTs = (v: unknown): number | undefined => {
+    const n = Number(v);
+    return typeof v === 'string' && v !== '' && Number.isFinite(n) ? n : undefined;
+  };
+  try {
+    const decisions = await listPreTradeGateDecisions({ from: parseTs(q['from']), to: parseTs(q['to']) });
+    res.json({
+      issue: 'TRA-1457',
+      flagEnabled: isPreTradeGateEnabled(),
+      shadowValidationLineage: 'TRA-789/1245 (frozen NO-GO baseline: E[R] -0.047R / 18.5% hit)',
+      count: decisions.length,
+      summary: preTradeGateSummary(decisions),
+      decisions,
+    });
+  } catch (err) {
+    log.error('pre-trade-gate health probe failed', {
+      reason: err instanceof Error ? err.message : String(err),
+    });
+    res.status(500).json({ error: 'Failed to read pre-trade gate ledger' });
   }
 });
 

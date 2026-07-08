@@ -244,6 +244,15 @@ export type {
 } from './short-squeeze/short-squeeze.js';
 export { RegimeDetector, classifyRegime } from './regime.js';
 export type { Regime, RegimeDetectorOptions } from './regime.js';
+// TRA-1457 — universal pre-trade gate (pure): MTF + volume + R:R>=1.5 + ATR stop.
+export { evaluatePreTradeGate, DEFAULT_PRE_TRADE_GATE_CONFIG } from './pre-trade-gate.js';
+export type {
+  PreTradeDirection,
+  PreTradeGateReason,
+  PreTradeGateConfig,
+  PreTradeGateInput,
+  PreTradeGateResult,
+} from './pre-trade-gate.js';
 // TRA-1220 (parent TRA-1218) — crypto ADX/CHOP/ER regime classifier. DISTINCT
 // from `classifyRegime` above; the shared substrate rec #2 (regime-gated TSMOM)
 // imports.
