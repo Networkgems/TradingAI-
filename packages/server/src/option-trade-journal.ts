@@ -116,6 +116,17 @@ export interface OptionTradeJournalOpen {
    * them in bare `single_leg_rv`. Observe-only; never gates routing.
    */
   entryArchetype?: string;
+  /**
+   * TRA-1475 — the owning demo book's username, stamped so the firm-wide DESK
+   * fold (`reports/desk-calendar.ts`) can exclude QA/test accounts (`qa*`,
+   * `ctoverify*`, `monitor_qa`, …) that dominate the ~51-book demo fleet. Optional
+   * for back-compat: pre-TRA-1475 rows carry no `account` and are KEPT by the
+   * desk filter (they can't be classified). Bound off the per-user engine at
+   * context wire-up (`PaperOptionsAccount.setOwner`) and only stamped when known,
+   * so an un-owned open omits the field entirely. Observe-only; never gates
+   * routing and never crosses into the `live` book's learning.
+   */
+  account?: string;
 }
 
 /** The realized outcome, appended when the position closes. */

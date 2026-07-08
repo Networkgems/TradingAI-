@@ -8031,6 +8031,11 @@ export class SignalEngine {
   setAlertUsername(username: string): void {
     const changed = this.alertUsername !== username;
     this.alertUsername = username;
+    // TRA-1475 — stamp the owning book onto every options account so journal
+    // OPEN rows carry an `account` the firm-wide DESK calendar fold can filter
+    // QA/test books by. Both env buckets (sandbox/production) get the same owner;
+    // the demo journal only cares WHO opened it, not which Tradier env.
+    for (const acct of this.allOptionsAccounts()) acct.setOwner(username);
     // TRA-857 — the live Tradier order clients scope their shared `process.env`
     // cred fallback to the pinned operator (isLiveBrokerOperator). The
     // constructor runs before this binding, so for the operator those clients

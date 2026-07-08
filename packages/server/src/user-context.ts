@@ -28,6 +28,7 @@ import {
 import type { OptionsBucketSnapshot } from './trade-store.js';
 import type { TradierEnv } from '@trading-app/shared';
 import { getAllUsers } from './users.js';
+import { scrubStaleOptionsPnlCells } from './reports/stale-cell-cleanup.js';
 import { logger } from './observability/index.js';
 
 const log = logger.child({ module: 'user-context' });
@@ -340,6 +341,50 @@ export async function runTra241CalendarReset(): Promise<void> {
 
   await writeFile(markerFile, new Date().toISOString(), 'utf-8');
   log.info('migration TRA-241: complete — cleared calendar files.', { migration: 'TRA-241', fileCount, userCount });
+}
+
+/**
+ * TRA-1475 (Part 2) — one-shot scrub of pre-TRA-594 corrupted calendar cells.
+ *
+ * Before TRA-594 (~2026-06-09) the demo EOD report booked the mode's ALL-TIME
+ * cumulative options P&L into every calendar cell instead of the day's realized
+ * options P&L, so the same value froze across consecutive days (e.g. 158.28 on
+ * 06-03/04/05, -44.00 on 05-22/24/26). TRA-594 fixed it forward but never
+ * scrubbed the historical cells on disk. This deletes those leaked pre-cutoff
+ * cell files (the board's "remove the old corrupted cells"); the pure detector +
+ * fs scrub live in `reports/stale-cell-cleanup.ts`. Post-fix cells are never
+ * read or touched. Idempotent via marker `DATA_DIR/.tra-1472-stale-cells-cleaned`
+ * so it runs automatically on the next prod deploy.
+ */
+export async function runTra1472StaleCellCleanup(): Promise<void> {
+  const markerFile = join(DATA_DIR, '.tra-1472-stale-cells-cleaned');
+  if (existsSync(markerFile)) return;
+
+  let userCount = 0;
+  let cellCount = 0;
+  for (const u of getAllUsers()) {
+    try {
+      const demoReportsDir = join(userDataDir(u.username), 'reports', 'demo');
+      const removed = await scrubStaleOptionsPnlCells(demoReportsDir);
+      if (removed.length > 0) {
+        userCount += 1;
+        cellCount += removed.length;
+        log.info('migration TRA-1472: scrubbed stale cells for user', {
+          migration: 'TRA-1472', username: u.username, dates: removed,
+        });
+      }
+    } catch (err: unknown) {
+      log.warn('migration TRA-1472: scrub failed for user', {
+        migration: 'TRA-1472', username: u.username,
+        reason: err instanceof Error ? err.message : String(err),
+      });
+    }
+  }
+
+  await writeFile(markerFile, new Date().toISOString(), 'utf-8');
+  log.info('migration TRA-1472: complete — removed pre-TRA-594 stale cells.', {
+    migration: 'TRA-1472', cellCount, userCount,
+  });
 }
 
 /**
