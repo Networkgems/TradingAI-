@@ -384,7 +384,7 @@ function EodReportDetail({ report, onBack }: { report: EodReport; onBack: () => 
 export type CalendarMode = 'demo' | 'live' | 'sandbox';
 export type CalendarMarket = 'stocks' | 'crypto';
 
-export function CalendarTab({ token, httpUrl, reportsPath = '/api/reports', mode, market = 'stocks' }: {
+export function CalendarTab({ token, httpUrl, reportsPath = '/api/reports', mode, market = 'stocks', isAdmin = false }: {
   token: string;
   httpUrl: string;
   reportsPath?: string;
@@ -397,6 +397,11 @@ export function CalendarTab({ token, httpUrl, reportsPath = '/api/reports', mode
   // legacy/equity callers) to make the behaviour change opt-out for callers
   // that don't pass `market`.
   market?: CalendarMarket;
+  // TRA-1472 — admin operates the firm rather than a personal book, so the
+  // calendar opens on the firm-wide "Desk (all demo books)" view by default for
+  // admin. Regular users still default to their own "My Account" book. Defaults
+  // to false so legacy callers keep the per-user default.
+  isAdmin?: boolean;
 }) {
   const [view,    setView]    = useState<'month' | 'year'>('month');
   const [year,    setYear]    = useState(new Date().getFullYear());
@@ -419,7 +424,9 @@ export function CalendarTab({ token, httpUrl, reportsPath = '/api/reports', mode
   // (unchanged), 'desk' = the firm-wide demo Option-Trade Journal aggregation
   // (`/api/reports/desk`, all demo books, NOT this user's account). Only the
   // data source switches; the grid/detail rendering is reused verbatim.
-  const [source, setSource] = useState<'account' | 'desk'>('account');
+  // TRA-1472 — default admin to the firm Desk view (admin runs the firm, not a
+  // personal book); everyone else defaults to their own My Account book.
+  const [source, setSource] = useState<'account' | 'desk'>(isAdmin ? 'desk' : 'account');
   const isDesk = source === 'desk';
 
   // TRA-1413 — when the Desk view is active the calendar reads the firm-wide
@@ -524,6 +531,17 @@ export function CalendarTab({ token, httpUrl, reportsPath = '/api/reports', mode
   const availableDates = Object.keys(reports).sort().reverse();
   const selectedReport = selectedDate ? reports[selectedDate] : null;
 
+  // TRA-1472 — a personal book with no realized activity (no closed trades and
+  // $0 combined P&L across every loaded day) reads as "broken/empty" next to the
+  // firm Desk number. Mirror the Desk banner with a one-line note that explains
+  // the zero and points to the firm-wide Desk view, so an empty own-book is
+  // understood rather than read as a bug. Only shown in the My Account view once
+  // the load has settled and no per-day detail is open.
+  const accountHasActivity = Object.values(reports).some(
+    r => r.combinedPnl !== 0 || r.totalTrades > 0,
+  );
+  const showEmptyAccountNote = !isDesk && !loading && !selectedDate && !accountHasActivity;
+
   return (
     <div className="cal-panel">
       <div className="cal-header">
@@ -609,6 +627,29 @@ export function CalendarTab({ token, httpUrl, reportsPath = '/api/reports', mode
           Each cell is the whole fleet's <strong>realized option</strong> P&amp;L for that day
           (from the shared Option-Trade Journal), summed across every demo book — <em>not</em> your
           personal account. Switch to <strong>My Account</strong> for your own book.
+        </div>
+      )}
+
+      {/* TRA-1472 — My Account empty-state note: explain a near-zero personal
+          book and point to the firm-wide Desk view (mirrors the Desk banner). */}
+      {showEmptyAccountNote && (
+        <div className="cal-account-empty-note" style={{
+          margin: '0.5rem 0 0.75rem', padding: '0.5rem 0.75rem', borderRadius: '6px',
+          background: 'rgba(148,163,184,0.10)', border: '1px solid rgba(148,163,184,0.30)',
+          fontSize: '0.82rem', lineHeight: 1.4,
+        }}>
+          <strong>My Account</strong> shows only <em>your own</em> book. No realized closes
+          have landed here yet, so every day reads $0 — that's expected for a quiet or new
+          account, not a bug. To see the whole firm's demo option P&amp;L, switch to{' '}
+          <button
+            type="button"
+            className="cal-inline-link"
+            onClick={() => { setSource('desk'); setSelectedDate(null); }}
+            style={{
+              background: 'none', border: 'none', padding: 0, cursor: 'pointer',
+              color: 'rgb(129,140,248)', font: 'inherit', textDecoration: 'underline',
+            }}
+          >Desk (all demo books)</button>.
         </div>
       )}
 
