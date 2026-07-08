@@ -61,6 +61,11 @@ import { isExitRiskRulesEnabled, isLiveEquityStopModifyEnabled, isTakeProfitEarl
 import { recordCorrelatedExposureBinding, type CorrelatedExposureVenue } from './correlated-exposure-ledger.js';
 import { isChurnLossBrakeEnabled, resolveSameSessionOpenCap } from './churn-loss-brake-flag.js';
 import {
+  recordChurnBrakeOpen,
+  recordChurnBrakeOpenRejected,
+  recordChurnBrakeDcaHalt,
+} from './churn-brake-ledger.js';
+import {
   isDirectionalQualityGateEnabled,
   resolveDirectionalQualityThresholds,
   averageDollarVolume,
@@ -3605,7 +3610,13 @@ export class SignalEngine {
     const rec = this.churnOpensToday.get(symbol);
     const count = rec && rec.etDay === etDay ? rec.count : 0;
     const cap = resolveSameSessionOpenCap(env);
-    return { blocked: count >= cap, count, cap };
+    const blocked = count >= cap;
+    // TRA-1481 — deterministic telemetry: every caller rejects the open on
+    // `blocked`, so record the reject here (once per attempt) so the count of
+    // Nth+1 opens the cap actually refused is observable via
+    // `/api/health/churn-brake` instead of only inferable from desk churn.
+    if (blocked) recordChurnBrakeOpenRejected(symbol, count, cap, now);
+    return { blocked, count, cap };
   }
 
   /**
@@ -3636,6 +3647,10 @@ export class SignalEngine {
     const rec = this.churnOpensToday.get(symbol);
     const count = rec && rec.etDay === etDay ? rec.count : 0;
     this.churnOpensToday.set(symbol, { etDay, count: count + 1 });
+    // TRA-1481 — mirror into the telemetry ledger from this single chokepoint so
+    // `/api/health/churn-brake`'s per-name session counters never drift from the
+    // enforcement counter above.
+    recordChurnBrakeOpen(symbol, etDay);
   }
 
   /**
@@ -5474,6 +5489,24 @@ export class SignalEngine {
           }
         }
 
+        // TRA-1481 (parent TRA-1408) — enforce the same-session OPEN cap on THIS
+        // path. This directional "ignition" open is the dominant demo churner
+        // (near-ATM single-leg on AMPG/GIS/NVDA/TSLA), yet it only *recorded* the
+        // per-name counter below (`recordChurnOpen`) and never *consulted* it —
+        // so ENABLE_CHURN_LOSS_BRAKE was armed-but-inert here while the equity /
+        // RV / OTM chokepoints capped correctly. The TRA-1476 quality gate above
+        // is a SEPARATE flag with its own cap, so a name churned freely whenever
+        // that gate was off. Reject the Nth+1 open exactly like the other
+        // chokepoints; DEMO-SCOPED + DARK until ENABLE_CHURN_LOSS_BRAKE (caller is
+        // already demo-only), so the live options path is untouched.
+        const dirChurnCap = this.churnOpenCapVerdict(sym, asOf);
+        if (dirChurnCap.blocked) {
+          log.info('demo directional rejected by churn brake (TRA-1408)', {
+            symbol: sym, count: dirChurnCap.count, cap: dirChurnCap.cap,
+          });
+          continue;
+        }
+
         // TRA-1153 — populate the option-journal IV regime from THIS path. The
         // chain (`snap`) is already in hand here, so deriving ATM IV + IV-rank is
         // free and does NOT re-introduce the per-tick per-symbol chain fetch the
@@ -6595,13 +6628,15 @@ export class SignalEngine {
           unrealized += (price - q.entryPrice) * q.quantity * mult;
         }
         if (this.isSameDayLoser(realizedToday, unrealized)) {
+          const netEtDay = Number((realizedToday + unrealized).toFixed(2));
           log.info('TRA-1408 conviction-DCA add halted — same-day net-negative name (demo)', {
             symbol: pos.symbol, positionId: pos.id,
             realizedToday: Number(realizedToday.toFixed(2)),
             unrealized: Number(unrealized.toFixed(2)),
-            netEtDay: Number((realizedToday + unrealized).toFixed(2)),
+            netEtDay,
             wouldAddQty: verdict.qty, addPrice: price, reason: verdict.reason,
           });
+          recordChurnBrakeDcaHalt(pos.symbol, 'equity', netEtDay, now); // TRA-1481 telemetry
           continue;
         }
       }
@@ -6981,13 +7016,15 @@ export class SignalEngine {
           unrealized += (q.currentPremium - q.premiumPaid) * 100 * q.contractsRemaining;
         }
         if (this.isSameDayLoser(realizedToday, unrealized)) {
+          const netEtDay = Number((realizedToday + unrealized).toFixed(2));
           log.info('TRA-1408 options conviction-DCA add halted — same-day net-negative name (demo)', {
             symbol: o.symbol, optionId: o.id, optionSymbol: o.optionSymbol,
             realizedToday: Number(realizedToday.toFixed(2)),
             unrealized: Number(unrealized.toFixed(2)),
-            netEtDay: Number((realizedToday + unrealized).toFixed(2)),
+            netEtDay,
             wouldAddContracts: verdict.qty, addDebitPerContract, reason: verdict.reason,
           });
+          recordChurnBrakeDcaHalt(o.symbol, 'option', netEtDay, now); // TRA-1481 telemetry
           continue;
         }
       }

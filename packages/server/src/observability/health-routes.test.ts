@@ -25,6 +25,12 @@ import {
   type HealthUserContext,
 } from './health-routes.js';
 import type { OptionTradeJournalRecord } from '../option-trade-journal.js';
+import {
+  clearChurnBrakeLedger,
+  recordChurnBrakeOpen,
+  recordChurnBrakeOpenRejected,
+  recordChurnBrakeDcaHalt,
+} from '../churn-brake-ledger.js';
 import { checkStaleState } from './alerts.js';
 import { getRecentAlerts, __resetAlertsForTest } from './alerts.js';
 import type { EngineState, LiveEquityAcceptance } from '../signal-engine.js';
@@ -828,6 +834,76 @@ describe('TRA-1301 correlated-exposure cap health route', () => {
     expect(body.demoOnly).toBe(true);
     expect(body.liveCapitalReachable).toBe(false);
     expect(body.config.captureFrac).toBeCloseTo(0.6, 9);
+  });
+});
+
+describe('TRA-1481 churn-brake health route', () => {
+  beforeEach(() => clearChurnBrakeLedger());
+
+  it('serves GET /api/health/churn-brake unauthenticated, DARK + demo-only by default', () => {
+    const { app, routes } = fakeApp();
+    registerLiveHealthRoutes(app, {
+      requireAuth: ((_q: unknown, _s: unknown, n: () => void) => n()) as never,
+      userCtx: async () => ctx('admin', engineState()),
+      getSettings: () => settings(),
+      now: () => NOW,
+    });
+    const handlers = routes.get('/api/health/churn-brake')!;
+    expect(handlers).toHaveLength(1); // unauthenticated, like the other rule probes
+    const res = fakeRes();
+    handlers[0]!({}, res);
+    const body = res.body as {
+      ok: boolean;
+      flag: string;
+      armed: boolean;
+      cap: number;
+      demoOnly: boolean;
+      liveCapitalReachable: boolean;
+      opensRejected: number;
+      dcaAddsHalted: number;
+    };
+    expect(body.ok).toBe(true);
+    expect(body.flag).toBe('ENABLE_CHURN_LOSS_BRAKE');
+    expect(body.armed).toBe(false); // no env flag set in the test process
+    expect(body.cap).toBe(3); // default cap
+    expect(body.demoOnly).toBe(true);
+    expect(body.liveCapitalReachable).toBe(false);
+    expect(body.opensRejected).toBe(0);
+    expect(body.dcaAddsHalted).toBe(0);
+  });
+
+  it('reports armed + cap from env and folds the ledger counters', () => {
+    process.env.ENABLE_CHURN_LOSS_BRAKE = '1';
+    process.env.CHURN_SAME_SESSION_OPEN_CAP = '3';
+    recordChurnBrakeOpen('AMPG', '2026-07-08');
+    recordChurnBrakeOpenRejected('AMPG', 3, 3, NOW);
+    recordChurnBrakeDcaHalt('RIVN', 'equity', -120, NOW);
+    try {
+      const { app, routes } = fakeApp();
+      registerLiveHealthRoutes(app, {
+        requireAuth: ((_q: unknown, _s: unknown, n: () => void) => n()) as never,
+        userCtx: async () => ctx('admin', engineState()),
+        getSettings: () => settings(),
+        now: () => NOW,
+      });
+      const res = fakeRes();
+      routes.get('/api/health/churn-brake')![0]!({}, res);
+      const body = res.body as {
+        armed: boolean;
+        cap: number;
+        opensRejected: number;
+        dcaAddsHalted: number;
+        openCountsBySymbol: { symbol: string; count: number }[];
+      };
+      expect(body.armed).toBe(true);
+      expect(body.cap).toBe(3);
+      expect(body.opensRejected).toBe(1);
+      expect(body.dcaAddsHalted).toBe(1);
+      expect(body.openCountsBySymbol[0]).toMatchObject({ symbol: 'AMPG', count: 1 });
+    } finally {
+      delete process.env.ENABLE_CHURN_LOSS_BRAKE;
+      delete process.env.CHURN_SAME_SESSION_OPEN_CAP;
+    }
   });
 });
 

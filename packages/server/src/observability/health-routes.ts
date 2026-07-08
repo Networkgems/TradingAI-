@@ -39,6 +39,12 @@ import { summarizeRegimeTsmomDemoRoute } from '../crypto-regime-tsmom-demo-route
 import { isCryptoIgnitionEnabled, resolveIgnitionWatchlist } from '../crypto-ignition-flag.js';
 import { summarizeIgnitionScans } from '../crypto-ignition-scanner.js';
 import { summarizeConvictionDca, resolveConvictionDcaDeployAnchor } from '../conviction-dca-ledger.js';
+import { summarizeChurnBrake } from '../churn-brake-ledger.js';
+import {
+  isChurnLossBrakeEnabled,
+  resolveSameSessionOpenCap,
+  CHURN_LOSS_BRAKE_FLAG,
+} from '../churn-loss-brake-flag.js';
 import { isScaleoutLadderEnabled } from '../scaleout-ladder-flag.js';
 import { summarizeScaleoutLadder } from '../scaleout-ladder-ledger.js';
 import { isCorrelatedExposureCapEnabled, CORRELATED_EXPOSURE_CAP_FLAG, isTakeProfitEarlyEnabled, TAKE_PROFIT_EARLY_FLAG, isEntryGreeksGateEnabled, ENTRY_GREEKS_GATE_FLAG } from '../exit-risk-rules-flag.js';
@@ -1055,6 +1061,46 @@ export function registerLiveHealthRoutes(app: Express, deps: LiveHealthDeps): vo
       build: resolveBuildInfo(),
       enabled: CONVICTION_DCA.enabled,
       ...summarizeConvictionDca(resolveConvictionDcaDeployAnchor()),
+    });
+  });
+
+  // TRA-1481 (parent TRA-1408) — unauthenticated, secrets-free readout of the
+  // per-name churn + same-day-loss brake. QuantTrader could previously only INFER
+  // the brake state from `/api/reports/desk` churn — two full demo sessions before
+  // the "armed-but-inert" finding could be called. This surface makes it
+  // deterministic in one read:
+  //   • `armed` + `cap` resolved through the SAME effective env the signal-engine
+  //     consults (process.env layered with the DATA_DIR demo-flags.json overlay,
+  //     file wins) — so this answers "is ENABLE_CHURN_LOSS_BRAKE actually LIVE on
+  //     the running process?" directly, not just "is it merged to render.yaml?";
+  //   • `openCountsBySymbol` — the per-name NEW-open counters for the current ET
+  //     session (mirrors the engine's `churnOpensToday` from the shared chokepoint);
+  //   • `opensRejected` — opens the same-session cap actually refused (the direct
+  //     enforcement evidence);
+  //   • `dcaAddsHalted` — conviction-DCA adds the same-day-loss rule halted, split
+  //     equity/option.
+  // DEMO-ONLY by construction: the engine record/reject/halt helpers are no-ops on
+  // the live path, so every counter reflects the demo book. Counters are in-memory
+  // and reset on the ~daily reboot (same contract as `/api/health/live-equity`); a
+  // validation run reads them within a session. No balances/PII.
+  app.get('/api/health/churn-brake', (_req, res) => {
+    const dir = process.env.DATA_DIR;
+    const env = dir ? resolveDemoFlagEnv(dir) : process.env;
+    const armed = isChurnLossBrakeEnabled(env);
+    const cap = resolveSameSessionOpenCap(env);
+    res.json({
+      ok: true,
+      time: new Date(now()).toISOString(),
+      build: resolveBuildInfo(),
+      flag: CHURN_LOSS_BRAKE_FLAG,
+      armed,
+      cap,
+      demoOnly: true,
+      liveCapitalReachable: false,
+      note: armed
+        ? `ARMED (demo-only): rejects the ${cap + 1}th same-session open per name and halts a conviction-DCA add into a same-day net-negative name; live path unchanged.`
+        : `DISARMED: set ${CHURN_LOSS_BRAKE_FLAG}=1 (render.yaml env or DATA_DIR/demo-flags.json) to arm on the demo book.`,
+      ...summarizeChurnBrake(),
     });
   });
 
