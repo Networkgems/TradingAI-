@@ -151,6 +151,8 @@ export async function buildPromotionStatus(username: string, strategyId: string)
   // TRA-541 — when a TRA-540 optimization verdict was registered, it is
   // authoritative for Stage 1: the leg passes iff verdict.pass is true.
   const backtestVerdict = rec?.backtest?.verdict ?? null;
+  // TRA-1465 — the accumulate-class Stage-1 source (ignored for close strategies).
+  const accumulationBacktest = rec?.backtest?.accumulationBacktest ?? null;
 
   // TRA-1461 — class-aware Stage 2. `accumulate` (hold-mode DCA) validates on
   // accumulation correctness (open demo positions never close); `close` keeps
@@ -168,7 +170,7 @@ export async function buildPromotionStatus(username: string, strategyId: string)
 
   const signoff = rec && rec.decisions.length > 0 ? 'present' : 'absent';
 
-  return evaluatePromotion({ strategyId, strategyClass, backtest, backtestVerdict, paper, accumulation, signoff, thresholds });
+  return evaluatePromotion({ strategyId, strategyClass, backtest, backtestVerdict, accumulationBacktest, paper, accumulation, signoff, thresholds });
 }
 
 /**
@@ -193,6 +195,8 @@ export async function buildPublicPromotionProbe(strategyId: string): Promise<Pro
 
   const backtest = rec?.backtest?.metrics ?? null;
   const backtestVerdict = rec?.backtest?.verdict ?? null;
+  // TRA-1465 — the accumulate-class Stage-1 source (ignored for close strategies).
+  const accumulationBacktest = rec?.backtest?.accumulationBacktest ?? null;
 
   // TRA-1461 — class-aware Stage 2, aggregated across every user (see the
   // authenticated {@link buildPromotionStatus} for the per-class rationale).
@@ -215,7 +219,7 @@ export async function buildPublicPromotionProbe(strategyId: string): Promise<Pro
 
   const signoff = rec && rec.decisions.length > 0 ? 'present' : 'absent';
 
-  return evaluatePromotion({ strategyId, strategyClass, backtest, backtestVerdict, paper, accumulation, signoff, thresholds });
+  return evaluatePromotion({ strategyId, strategyClass, backtest, backtestVerdict, accumulationBacktest, paper, accumulation, signoff, thresholds });
 }
 
 /** Most recent paper metrics for a strategy, used when persisting a sign-off snapshot. */

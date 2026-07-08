@@ -8,6 +8,7 @@ import {
   deriveBacktestGateMetrics,
   registerBacktestReport,
   registerOptimizationVerdict,
+  registerAccumulationBacktestVerdict,
   recordSignoff,
   hasSignoff,
   getEffectiveThresholds,
@@ -19,8 +20,25 @@ import {
   getStrategyPaperMetrics,
   PromotionValidationError,
 } from './promotion-store.js';
-import { DEFAULT_PROMOTION_THRESHOLDS, evaluateBacktestGate } from '@trading-app/shared';
+import { DEFAULT_PROMOTION_THRESHOLDS, evaluateAccumulationBacktestGate, evaluateBacktestGate } from '@trading-app/shared';
+import type { AccumulationBacktestGateMetrics } from '@trading-app/shared';
 import type { BacktestResult, OptimizationReport, OptimizationVerdict } from '@trading-app/backtest';
+
+/** A passing accumulation-backtest verdict for the accumulate-class `dca` strategy (TRA-1465). */
+function accumBacktest(over: Partial<AccumulationBacktestGateMetrics> = {}): AccumulationBacktestGateMetrics {
+  return {
+    oosDays: 200,
+    deploymentRatio: 0.6,
+    valueInvestedMaxDrawdown: 0.2,
+    lumpSumMaxDrawdown: 0.4,
+    oosReturn: 0.3,
+    lumpSumReturn: 0.25,
+    cadenceVariantsTested: 3,
+    cadenceVariantsConsistent: 3,
+    feeAdjustedValueRatio: 1.05,
+    ...over,
+  };
+}
 
 let dir: string;
 
@@ -64,7 +82,7 @@ describe('registerBacktestReport + persistence', () => {
     await registerBacktestReport({ strategyId: 'bb_fade', report: report(), reportId: 'TRA-405', registeredBy: 'qt' });
     __resetPromotionStoreForTests(join(dir, 'promotion-gate.json'));
     const rec = await getStrategyRecord('bb_fade');
-    expect(rec?.backtest?.metrics.sharpe).toBe(1.3);
+    expect(rec?.backtest?.metrics?.sharpe).toBe(1.3);
     expect(rec?.backtest?.reportId).toBe('TRA-405');
     expect(rec?.backtest?.registeredBy).toBe('qt');
   });
@@ -89,8 +107,8 @@ describe('registerOptimizationVerdict — TRA-541 Stage-1 from a TRA-540 verdict
       registeredBy: 'qt',
     });
     // 1:1 mapping, no renaming.
-    expect(rec.backtest?.metrics.sharpe).toBe(report.verdict.backtestMetrics.sharpe);
-    expect(rec.backtest?.metrics.tradeCount).toBe(report.verdict.backtestMetrics.tradeCount);
+    expect(rec.backtest?.metrics?.sharpe).toBe(report.verdict.backtestMetrics.sharpe);
+    expect(rec.backtest?.metrics?.tradeCount).toBe(report.verdict.backtestMetrics.tradeCount);
     expect(rec.backtest?.verdict?.pass).toBe(report.verdict.pass);
     expect(rec.backtest?.blessedParams).toEqual(report.verdict.blessedParams);
 
@@ -140,6 +158,73 @@ describe('registerOptimizationVerdict — TRA-541 Stage-1 from a TRA-540 verdict
         reportId: 'bad',
         registeredBy: 'qt',
       }),
+    ).rejects.toThrow(PromotionValidationError);
+  });
+});
+
+describe('registerAccumulationBacktestVerdict — TRA-1465 accumulate Stage-1 leg', () => {
+  it('stores the accumulation metrics on the Stage-1 leg (metrics null) and round-trips from disk', async () => {
+    const rec = await registerAccumulationBacktestVerdict({
+      strategyId: 'dca',
+      metrics: accumBacktest(),
+      reportId: 'TRA-695',
+      registeredBy: 'qt',
+    });
+    expect(rec.backtest?.metrics).toBeNull(); // no close-based timing metrics
+    expect(rec.backtest?.accumulationBacktest?.oosDays).toBe(200);
+
+    __resetPromotionStoreForTests(join(dir, 'promotion-gate.json'));
+    const reloaded = await getStrategyRecord('dca');
+    expect(reloaded?.backtest?.accumulationBacktest?.deploymentRatio).toBe(0.6);
+    const stage1 = evaluateAccumulationBacktestGate(reloaded!.backtest!.accumulationBacktest!, DEFAULT_PROMOTION_THRESHOLDS);
+    expect(stage1.state).toBe('pass');
+  });
+
+  it('a degenerate accumulation verdict FAILS the Stage-1 leg (genuine NO-GO possible)', async () => {
+    await registerAccumulationBacktestVerdict({
+      strategyId: 'dca',
+      metrics: accumBacktest({ deploymentRatio: 0.02 }), // trend gate never fires
+      reportId: 'TRA-695-nogo',
+      registeredBy: 'qt',
+    });
+    const rec = await getStrategyRecord('dca');
+    const stage1 = evaluateAccumulationBacktestGate(rec!.backtest!.accumulationBacktest!, DEFAULT_PROMOTION_THRESHOLDS);
+    expect(stage1.state).toBe('fail');
+  });
+
+  it('rejects metrics missing a numeric field (anti hand-entry)', async () => {
+    await expect(
+      registerAccumulationBacktestVerdict({
+        strategyId: 'dca',
+        metrics: { oosDays: 200 } as unknown as AccumulationBacktestGateMetrics,
+        reportId: 'bad',
+        registeredBy: 'qt',
+      }),
+    ).rejects.toThrow(PromotionValidationError);
+  });
+
+  it('the two Stage-1 legs can never be crossed (class guards)', async () => {
+    // A six-guard timing verdict cannot clear an accumulate strategy…
+    await expect(
+      registerOptimizationVerdict({
+        strategyId: 'dca',
+        verdict: {
+          pass: true,
+          guards: {},
+          blessedParams: {},
+          backtestMetrics: { sharpe: 1.4, expectancy: 0.25, profitFactor: 1.7, maxDrawdown: 0.1, tradeCount: 120 },
+        } as OptimizationVerdict,
+        reportId: 'x',
+        registeredBy: 'qt',
+      }),
+    ).rejects.toThrow(PromotionValidationError);
+    // …a bare close-based backtest report cannot either…
+    await expect(
+      registerBacktestReport({ strategyId: 'dca', report: report(), reportId: 'x', registeredBy: 'qt' }),
+    ).rejects.toThrow(PromotionValidationError);
+    // …and an accumulation verdict cannot clear a close-based strategy.
+    await expect(
+      registerAccumulationBacktestVerdict({ strategyId: 'bb_fade', metrics: accumBacktest(), reportId: 'x', registeredBy: 'qt' }),
     ).rejects.toThrow(PromotionValidationError);
   });
 });

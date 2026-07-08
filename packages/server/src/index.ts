@@ -429,6 +429,7 @@ import {
 import {
   registerBacktestReport,
   registerOptimizationVerdict,
+  registerAccumulationBacktestVerdict,
   recordSignoff,
   listStrategyRecords,
   getEffectiveThresholds,
@@ -4876,6 +4877,47 @@ app.post('/api/promotion/optimization', requireAuth, requireAdmin, async (req, r
       reason: err instanceof Error ? err.message : String(err),
     });
     res.status(500).json({ error: 'Failed to register optimization verdict' });
+  }
+});
+
+// Stage 1 (TRA-1465) — register the accumulate-class backtest leg from a TRA-695
+// accumulation-backtest verdict. Admin-only. This is the accumulate analogue of
+// `POST /api/promotion/optimization`: a hold-mode DCA strategy has no per-trade
+// timing edge for the six-guard battery to certify, so its Stage 1 validates
+// accumulation ROBUSTNESS instead — the harness's OOS `metrics` (deployment
+// ratio, value/invested + lump-sum drawdowns/returns, cadence consistency,
+// fee-adjusted value ratio) are ingested 1:1 and then GATE the leg via
+// `evaluateAccumulationBacktestGate`. The store rejects this route for a
+// close-based strategy (and rejects a six-guard verdict for an accumulate
+// strategy), so the two Stage-1 legs can never be crossed.
+app.post('/api/promotion/accumulation-backtest', requireAuth, requireAdmin, async (req, res) => {
+  const username = res.locals['authUser'] as string;
+  try {
+    const body = req.body as { strategyId?: string; reportId?: string; metrics?: unknown };
+    if (!body?.strategyId || typeof body.strategyId !== 'string') {
+      res.status(400).json({ error: 'strategyId is required' });
+      return;
+    }
+    if (!body.metrics || typeof body.metrics !== 'object') {
+      res.status(400).json({ error: 'metrics (the TRA-695 accumulation-backtest metrics block) is required' });
+      return;
+    }
+    const rec = await registerAccumulationBacktestVerdict({
+      strategyId: body.strategyId,
+      metrics: body.metrics as Parameters<typeof registerAccumulationBacktestVerdict>[0]['metrics'],
+      reportId: typeof body.reportId === 'string' ? body.reportId : 'unspecified',
+      registeredBy: username,
+    });
+    res.status(201).json(rec);
+  } catch (err) {
+    if (err instanceof PromotionValidationError) {
+      res.status(400).json({ error: err.message });
+      return;
+    }
+    log.error('TRA-1465 register accumulation-backtest verdict failed', {
+      reason: err instanceof Error ? err.message : String(err),
+    });
+    res.status(500).json({ error: 'Failed to register accumulation-backtest verdict' });
   }
 });
 

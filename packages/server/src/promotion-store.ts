@@ -4,6 +4,7 @@ import { dirname, join } from 'path';
 import { fileURLToPath } from 'url';
 import { randomUUID } from 'crypto';
 import type {
+  AccumulationBacktestGateMetrics,
   BacktestGateMetrics,
   BacktestGateVerdict,
   PaperGateMetrics,
@@ -11,7 +12,7 @@ import type {
   PromotionThresholds,
   PromotionTradeSample,
 } from '@trading-app/shared';
-import { DEFAULT_PROMOTION_THRESHOLDS, computePaperGateMetrics } from '@trading-app/shared';
+import { DEFAULT_PROMOTION_THRESHOLDS, computePaperGateMetrics, promotionStrategyClass } from '@trading-app/shared';
 import type { BacktestResult, OptimizationVerdict } from '@trading-app/backtest';
 import { logger } from './observability/index.js';
 
@@ -40,7 +41,12 @@ function storeFile(): string {
 
 /** Stage-1 registration: the metrics picked from a computed backtest report. */
 export interface RegisteredBacktest {
-  metrics: BacktestGateMetrics;
+  /**
+   * Close-based Stage-1 metrics picked from a computed backtest report. `null`
+   * for an `accumulate`-class registration (TRA-1465), which has no per-trade
+   * timing metrics and carries `accumulationBacktest` instead.
+   */
+  metrics: BacktestGateMetrics | null;
   /** Free-form id of the source report/run (e.g. a TRA ticket or report filename). */
   reportId: string;
   registeredAt: string;
@@ -58,6 +64,16 @@ export interface RegisteredBacktest {
    * the strategy-opts overlay).
    */
   blessedParams?: Record<string, unknown>;
+  /**
+   * TRA-1465 — the accumulate-class Stage-1 verdict: accumulation-robustness
+   * metrics computed by the TRA-695 harness on an OOS window. Present ONLY for an
+   * `accumulate`-class registration (mutually exclusive with the close-based
+   * `metrics`/`verdict` above); it is the authoritative Stage-1 source for a DCA
+   * strategy. A six-guard timing verdict can never be stored here and vice-versa
+   * (enforced by {@link registerAccumulationBacktestVerdict} /
+   * {@link registerOptimizationVerdict} class guards).
+   */
+  accumulationBacktest?: AccumulationBacktestGateMetrics;
 }
 
 /**
@@ -241,6 +257,14 @@ export async function registerBacktestReport(args: {
   registeredBy: string;
 }): Promise<StrategyPromotionRecord> {
   if (!args.strategyId) throw new PromotionValidationError('strategyId is required');
+  // TRA-1465 — a close-based backtest report can never clear an accumulate
+  // Stage 1 (the six-guard timing battery is meaningless on hold-mode DCA).
+  if (promotionStrategyClass(args.strategyId) === 'accumulate') {
+    throw new PromotionValidationError(
+      `strategy "${args.strategyId}" is accumulate-class — register its Stage-1 leg via `
+        + `POST /api/promotion/accumulation-backtest, not a close-based backtest report`,
+    );
+  }
   const metrics = deriveBacktestGateMetrics(args.report);
   const store = await ensureLoaded();
   const rec = store.strategies[args.strategyId] ?? blankRecord(args.strategyId);
@@ -274,6 +298,14 @@ export async function registerOptimizationVerdict(args: {
   registeredBy: string;
 }): Promise<StrategyPromotionRecord> {
   if (!args.strategyId) throw new PromotionValidationError('strategyId is required');
+  // TRA-1465 — the TRA-540 six-guard timing verdict can never clear an
+  // accumulate Stage 1 (DCA has no per-trade timing edge to certify).
+  if (promotionStrategyClass(args.strategyId) === 'accumulate') {
+    throw new PromotionValidationError(
+      `strategy "${args.strategyId}" is accumulate-class — its Stage-1 leg is an accumulation-backtest `
+        + `verdict (POST /api/promotion/accumulation-backtest), not a six-guard timing verdict`,
+    );
+  }
   const v = args.verdict;
   if (!v || typeof v.pass !== 'boolean') {
     throw new PromotionValidationError('optimization verdict missing boolean `pass` flag');
@@ -310,6 +342,83 @@ export async function registerOptimizationVerdict(args: {
   return rec;
 }
 
+/** The nine numeric fields of an accumulation-backtest verdict, ingested 1:1. */
+const ACCUMULATION_BACKTEST_FIELDS: ReadonlyArray<keyof AccumulationBacktestGateMetrics> = [
+  'oosDays',
+  'deploymentRatio',
+  'valueInvestedMaxDrawdown',
+  'lumpSumMaxDrawdown',
+  'oosReturn',
+  'lumpSumReturn',
+  'cadenceVariantsTested',
+  'cadenceVariantsConsistent',
+  'feeAdjustedValueRatio',
+];
+
+/**
+ * TRA-1465 — register the accumulate-class Stage-1 leg from a TRA-695
+ * accumulation-backtest verdict. The `metrics` are the OOS accumulation-
+ * robustness figures the harness computed (deployment ratio, value/invested and
+ * lump-sum drawdowns/returns, cadence consistency, fee-adjusted value ratio);
+ * they are ingested 1:1 and then GATE the leg via
+ * `evaluateAccumulationBacktestGate` (the gate re-derives pass from the metrics
+ * vs the thresholds — a hand-entered `pass` with degenerate metrics still fails,
+ * the same anti-gaming stance as the close-based leg). Stored on
+ * `RegisteredBacktest.accumulationBacktest` with the close-based `metrics` left
+ * null. Rejects a `close`-class strategy so a timing strategy can never be
+ * cleared on the accumulation leg (the mirror of the accumulate guards on the
+ * close-based registration paths).
+ */
+export async function registerAccumulationBacktestVerdict(args: {
+  strategyId: string;
+  metrics: AccumulationBacktestGateMetrics;
+  reportId: string;
+  registeredBy: string;
+}): Promise<StrategyPromotionRecord> {
+  if (!args.strategyId) throw new PromotionValidationError('strategyId is required');
+  if (promotionStrategyClass(args.strategyId) !== 'accumulate') {
+    throw new PromotionValidationError(
+      `strategy "${args.strategyId}" is close-based — its Stage-1 leg is a six-guard timing verdict `
+        + `(POST /api/promotion/optimization), not an accumulation-backtest verdict`,
+    );
+  }
+  const m = args.metrics;
+  if (!m || typeof m !== 'object') {
+    throw new PromotionValidationError('accumulation-backtest verdict missing `metrics`');
+  }
+  for (const f of ACCUMULATION_BACKTEST_FIELDS) {
+    const val = (m as unknown as Record<string, unknown>)[f];
+    if (typeof val !== 'number' || !Number.isFinite(val)) {
+      throw new PromotionValidationError(`accumulation-backtest metrics missing numeric field: ${String(f)}`);
+    }
+  }
+  // Ingest exactly the certified fields — never trust extra keys off the wire.
+  const metrics: AccumulationBacktestGateMetrics = {
+    oosDays: m.oosDays,
+    deploymentRatio: m.deploymentRatio,
+    valueInvestedMaxDrawdown: m.valueInvestedMaxDrawdown,
+    lumpSumMaxDrawdown: m.lumpSumMaxDrawdown,
+    oosReturn: m.oosReturn,
+    lumpSumReturn: m.lumpSumReturn,
+    cadenceVariantsTested: m.cadenceVariantsTested,
+    cadenceVariantsConsistent: m.cadenceVariantsConsistent,
+    feeAdjustedValueRatio: m.feeAdjustedValueRatio,
+  };
+  const store = await ensureLoaded();
+  const rec = store.strategies[args.strategyId] ?? blankRecord(args.strategyId);
+  rec.backtest = {
+    metrics: null, // accumulate class has no close-based timing metrics
+    reportId: args.reportId || 'unspecified',
+    registeredAt: new Date().toISOString(),
+    registeredBy: args.registeredBy,
+    accumulationBacktest: metrics,
+  };
+  store.strategies[args.strategyId] = rec;
+  await persist();
+  log.info('registered accumulation-backtest verdict', { strategyId: args.strategyId, reportId: args.reportId });
+  return rec;
+}
+
 /** Whether a strategy currently has at least one recorded sign-off. */
 export async function hasSignoff(strategyId: string): Promise<boolean> {
   const rec = await getStrategyRecord(strategyId);
@@ -332,6 +441,8 @@ export function mergeThresholds(
     paper: { ...base.paper, ...(override.paper ?? {}) },
     // TRA-1461 — merge the accumulate-class Stage-2 thresholds too.
     accumulation: { ...base.accumulation, ...(override.accumulation ?? {}) },
+    // TRA-1465 — …and the accumulate-class Stage-1 thresholds.
+    accumulationBacktest: { ...base.accumulationBacktest, ...(override.accumulationBacktest ?? {}) },
   };
 }
 

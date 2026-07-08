@@ -72,6 +72,64 @@ export interface PromotionThresholds {
      */
     maxUnintendedSells: number;
   };
+  /**
+   * TRA-1465 — Stage 1 (backtest) for `accumulate`/hold-mode strategies (crypto
+   * DCA). The close-based `backtest` leg above certifies a **per-trade timing
+   * edge** survives out-of-sample via the TRA-540 six-guard overfitting battery.
+   * A DCA strategy has NO per-trade timing edge by construction — its return is
+   * market beta smoothed by cadence + a macro trend gate — so the six-guard
+   * battery runs degenerate/meaningless on it (TRA-695 never runs `runOptimization`
+   * on DCA). This leg instead certifies **accumulation robustness** on an OOS
+   * window: the trend gate actually fires (non-degenerate deployment), the
+   * value/invested drawdown is bounded, the accumulation beats a lump-sum
+   * buy-and-hold benchmark on drawdown and/or return (DCA's structural value
+   * prop), the result is robust across cadences, and fills survive a tiered
+   * per-fill cost model. Same anti-gaming principle as the close-based leg — every
+   * figure is computed from the OOS backtest by the harness, never hand-entered
+   * (see {@link evaluateAccumulationBacktestGate}). QuantTrader ratifies the final
+   * thresholds (TRA-1464); the values below are LeadDev's proposed v1 defaults.
+   */
+  accumulationBacktest: {
+    /** OOS backtest window must span ≥ this many days (a long-horizon DCA test). */
+    minOosDays: number;
+    /**
+     * Fraction of the OOS window in which the macro trend gate DEPLOYED capital
+     * must be ≥ this floor — the gate must actually fire; a near-zero deployment
+     * ratio is a degenerate strategy that never buys.
+     */
+    minDeploymentRatio: number;
+    /**
+     * …and ≤ this ceiling — the gate must also STAND DOWN sometimes. A ratio of
+     * ~1.0 means the trend gate never gated anything (it is not a gate at all,
+     * just unconditional buying), which is degenerate in the other direction.
+     */
+    maxDeploymentRatio: number;
+    /** Value/invested accumulation-curve max drawdown must be ≤ this fraction. */
+    maxValueInvestedDrawdownPct: number;
+    /**
+     * The accumulation must beat a lump-sum buy-and-hold benchmark over the same
+     * OOS window on DRAWDOWN by ≥ this fraction of the lump-sum's drawdown
+     * (0 → merely not worse). The benchmark check also passes on RETURN alone
+     * (accumulation OOS return ≥ lump-sum return), so a strategy that gives up a
+     * little drawdown for materially more return still clears — "on drawdown
+     * and/or return" per the spec.
+     */
+    minDrawdownImprovementVsLumpSum: number;
+    /**
+     * Fraction of the tested cadence variants (weekly/biweekly/monthly) that must
+     * be directionally consistent with the primary cadence (same sign of OOS
+     * return). 1.0 → all cadences must agree; a strategy that only works on one
+     * cadence is a fragile artifact, not a robust accumulation.
+     */
+    minCadenceConsistencyRatio: number;
+    /**
+     * Value/invested ratio net of the tiered per-fill cost model must be ≥ this
+     * (1.0 → fills are net-positive of fees; the cost model does not eat the
+     * accumulation). Guards against a strategy whose edge is entirely consumed by
+     * per-fill trading costs.
+     */
+    minFeeAdjustedValueRatio: number;
+  };
 }
 
 export const DEFAULT_PROMOTION_THRESHOLDS: PromotionThresholds = {
@@ -94,6 +152,17 @@ export const DEFAULT_PROMOTION_THRESHOLDS: PromotionThresholds = {
     minPositions: 1,
     minSoakDays: 14, // a two-week forward soak, the accumulate-class analogue of the 50-trade count
     maxUnintendedSells: 0, // a hold-mode strategy must never sell outside its catastrophe stop
+  },
+  // TRA-1465 — proposed v1 defaults for the accumulate-class Stage-1 leg;
+  // QuantTrader ratifies the final numbers via TRA-1464 (loosen-only overrides).
+  accumulationBacktest: {
+    minOosDays: 180, // a ~6-month OOS window — DCA's value prop shows over a horizon, the accumulate analogue of 100 trades
+    minDeploymentRatio: 0.25, // the trend gate must deploy in ≥ a quarter of the window (not a dead strategy)
+    maxDeploymentRatio: 0.98, // …and stand down at least sometimes (an ~always-on gate is no gate)
+    maxValueInvestedDrawdownPct: 0.35, // bounded accumulation-curve drawdown (DCA smooths beta but is still long the market)
+    minDrawdownImprovementVsLumpSum: 0, // must at least not be WORSE than lump-sum on drawdown (or beat it on return)
+    minCadenceConsistencyRatio: 1.0, // every tested cadence must agree in direction — no single-cadence artifacts
+    minFeeAdjustedValueRatio: 1.0, // fills net-positive of the tiered per-fill cost model
   },
 };
 
@@ -274,6 +343,44 @@ export interface AccumulationGateMetrics {
    * non-positive quantity. Must be 0: the add path averages size, never the stop.
    */
   riskInvariantBreaches: number;
+}
+
+/**
+ * TRA-1465 — Stage-1 accumulation-backtest metrics for an `accumulate`/hold-mode
+ * strategy, computed by the TRA-695 harness on an out-of-sample window and
+ * ingested 1:1 by the gate (never hand-entered — the anti-gaming principle of
+ * TRA-527 §3). These certify **accumulation robustness**, not a per-trade timing
+ * edge (which DCA does not have by construction), so they are the accumulate-
+ * class analogue of the close-based {@link BacktestGateMetrics} + six-guard
+ * {@link BacktestGateVerdict}. Judged by {@link evaluateAccumulationBacktestGate}.
+ */
+export interface AccumulationBacktestGateMetrics {
+  /** Length of the OOS backtest window, in days. */
+  oosDays: number;
+  /**
+   * Fraction (0..1) of the OOS window in which the macro trend gate deployed
+   * capital. Degenerate at 0 (never buys) and at 1 (never gates — unconditional
+   * buying); a healthy trend-gated DCA sits between the floor and the ceiling.
+   */
+  deploymentRatio: number;
+  /** Fractional max drawdown of the value/invested accumulation curve (the DCA-appropriate DD). */
+  valueInvestedMaxDrawdown: number;
+  /** Fractional max drawdown of a lump-sum buy-and-hold over the SAME OOS window (the benchmark). */
+  lumpSumMaxDrawdown: number;
+  /** Total return of the accumulation over the OOS window (value/invested − 1). */
+  oosReturn: number;
+  /** Total return of the lump-sum buy-and-hold benchmark over the same window. */
+  lumpSumReturn: number;
+  /** Cadence variants tested (e.g. weekly/biweekly/monthly → 3). */
+  cadenceVariantsTested: number;
+  /**
+   * Of the tested cadences, how many were directionally consistent with the
+   * primary cadence (same sign of OOS return). Equal to `cadenceVariantsTested`
+   * when every cadence agrees.
+   */
+  cadenceVariantsConsistent: number;
+  /** Value/invested ratio net of the tiered per-fill cost model (>1 ⇒ fills net-positive of fees). */
+  feeAdjustedValueRatio: number;
 }
 
 // ── Metric computation (from data) ───────────────────────────────────────────
@@ -504,6 +611,86 @@ export function evaluateBacktestGate(
 }
 
 /**
+ * TRA-1465 — Stage 1 for `accumulate`/hold-mode strategies. `metrics === null`
+ * means no accumulation-backtest verdict is registered for the strategy →
+ * `missing` (the accumulate analogue of the close-based Stage-1 `missing`). This
+ * mirrors the TRA-1461 Stage-2 pattern: the leg thresholds accumulation-
+ * robustness metrics directly (deriving pass from the data), rather than trusting
+ * a hand-entered `pass`. It is deliberately independent of PF/expectancy/Sharpe
+ * and of the six-guard overfitting battery — DCA has no per-trade timing edge to
+ * validate — so it certifies what an accumulation actually produces: a firing-but-
+ * not-degenerate trend gate, a bounded value/invested drawdown, an edge over
+ * lump-sum buy-and-hold, cadence robustness, and per-fill cost survival.
+ *
+ * The close-based {@link evaluateBacktestGate} (the full six-guard battery) is
+ * untouched, so close-based strategies keep their timing-alpha rigor; and because
+ * {@link evaluatePromotion} branches Stage 1 on `strategyClass`, a six-guard
+ * verdict can never clear an accumulate Stage 1 nor vice-versa. The gate can still
+ * render a genuine accumulate NO-GO (degenerate deployment, unbounded DD, loses to
+ * lump-sum on both axes, single-cadence artifact, or fees eating the edge).
+ */
+export function evaluateAccumulationBacktestGate(
+  metrics: AccumulationBacktestGateMetrics | null,
+  thresholds: PromotionThresholds = DEFAULT_PROMOTION_THRESHOLDS,
+): StageEvaluation {
+  if (!metrics)
+    return { state: 'missing', failedChecks: ['no accumulation-backtest verdict registered'] };
+  const t = thresholds.accumulationBacktest;
+  const failed: string[] = [];
+
+  if (!(metrics.oosDays >= t.minOosDays))
+    failed.push(`OOS window ${fmt(metrics.oosDays)}d < ${t.minOosDays}d`);
+
+  if (!(metrics.deploymentRatio >= t.minDeploymentRatio))
+    failed.push(
+      `deployment ratio ${fmt(metrics.deploymentRatio)} < ${fmt(t.minDeploymentRatio)} — trend gate barely fires (degenerate)`,
+    );
+  else if (!(metrics.deploymentRatio <= t.maxDeploymentRatio))
+    failed.push(
+      `deployment ratio ${fmt(metrics.deploymentRatio)} > ${fmt(t.maxDeploymentRatio)} — trend gate never stands down (not a gate)`,
+    );
+
+  if (!(metrics.valueInvestedMaxDrawdown <= t.maxValueInvestedDrawdownPct))
+    failed.push(
+      `value/invested drawdown ${fmt(metrics.valueInvestedMaxDrawdown)} > ${fmt(t.maxValueInvestedDrawdownPct)}`,
+    );
+
+  // Beats a lump-sum buy-and-hold benchmark on DRAWDOWN by ≥ the required
+  // fraction of the lump-sum's drawdown, OR on RETURN alone. `ddImprovement` is
+  // the fractional reduction in max drawdown vs lump-sum; when the lump-sum had
+  // no drawdown it is 1 iff the accumulation also had none, else 0 (can't beat a
+  // zero-DD benchmark on drawdown → must win on return).
+  const ddImprovement =
+    metrics.lumpSumMaxDrawdown > 0
+      ? (metrics.lumpSumMaxDrawdown - metrics.valueInvestedMaxDrawdown) / metrics.lumpSumMaxDrawdown
+      : metrics.valueInvestedMaxDrawdown <= 0
+        ? 1
+        : 0;
+  const beatsOnDrawdown = ddImprovement >= t.minDrawdownImprovementVsLumpSum;
+  const beatsOnReturn = metrics.oosReturn >= metrics.lumpSumReturn;
+  if (!beatsOnDrawdown && !beatsOnReturn)
+    failed.push(
+      `loses to lump-sum buy-and-hold on both drawdown (Δ ${fmt(ddImprovement)} < ${fmt(t.minDrawdownImprovementVsLumpSum)}) `
+        + `and return (${fmt(metrics.oosReturn)} < ${fmt(metrics.lumpSumReturn)})`,
+    );
+
+  const cadenceRatio =
+    metrics.cadenceVariantsTested > 0 ? metrics.cadenceVariantsConsistent / metrics.cadenceVariantsTested : 0;
+  if (!(cadenceRatio >= t.minCadenceConsistencyRatio))
+    failed.push(
+      `cadence consistency ${fmt(metrics.cadenceVariantsConsistent)}/${fmt(metrics.cadenceVariantsTested)} `
+        + `(${fmt(cadenceRatio)}) < ${fmt(t.minCadenceConsistencyRatio)} — not robust across cadences`,
+    );
+
+  if (!(metrics.feeAdjustedValueRatio >= t.minFeeAdjustedValueRatio))
+    failed.push(
+      `fee-adjusted value ratio ${fmt(metrics.feeAdjustedValueRatio)} < ${fmt(t.minFeeAdjustedValueRatio)} — per-fill costs eat the accumulation`,
+    );
+
+  return { state: failed.length === 0 ? 'pass' : 'fail', failedChecks: failed };
+}
+
+/**
  * Stage 2 — paper gate. `paper === null` means no paper metrics could be
  * computed (no monitored paper trades) → `missing`. The expectancy-vs-backtest
  * ratio check is skipped when backtest expectancy is unavailable (Stage 1 not
@@ -594,13 +781,21 @@ export interface PromotionEvaluationInput {
    * that omits it keeps the exact close-based behavior).
    */
   strategyClass?: PromotionStrategyClass;
-  /** Stage-1 metrics from the registered backtest report, or null if none registered. */
+  /** Stage-1 metrics from the registered backtest report, or null if none registered. Close-based only. */
   backtest: BacktestGateMetrics | null;
   /**
    * TRA-541 — the registered TRA-540 optimization verdict, if any. When present
-   * it is authoritative for Stage 1 (see {@link evaluateBacktestGate}).
+   * it is authoritative for Stage 1 (see {@link evaluateBacktestGate}). Close-based only.
    */
   backtestVerdict?: BacktestGateVerdict | null;
+  /**
+   * TRA-1465 — Stage-1 accumulation-backtest metrics for an `accumulate`
+   * strategy, computed by the TRA-695 harness on an OOS window, or null if none
+   * registered. Ignored for `close` strategies (which use `backtest` +
+   * `backtestVerdict`); it is the ONLY Stage-1 source consulted for an
+   * `accumulate` strategy, so a six-guard verdict can never clear it.
+   */
+  accumulationBacktest?: AccumulationBacktestGateMetrics | null;
   /** Stage-2 metrics computed from the paper ledger, or null if none. Close-based only. */
   paper: PaperGateMetrics | null;
   /**
@@ -625,8 +820,14 @@ export interface PromotionStatus {
   backtest: {
     state: PromotionStageState;
     metrics: BacktestGateMetrics | null;
-    /** TRA-541 — the optimization verdict that gated Stage 1, if one is registered. */
+    /** TRA-541 — the optimization verdict that gated Stage 1, if one is registered. Close-based only. */
     verdict?: BacktestGateVerdict | null;
+    /**
+     * TRA-1465 — accumulation-backtest metrics when `strategyClass === 'accumulate'`
+     * (the Stage-1 leg that gated an accumulate strategy). Null/absent for
+     * close-based strategies, which use `metrics`/`verdict` above.
+     */
+    accumulationBacktest?: AccumulationBacktestGateMetrics | null;
     failedChecks: string[];
   };
   paper: {
@@ -656,11 +857,23 @@ export interface PromotionStatus {
 export function evaluatePromotion(input: PromotionEvaluationInput): PromotionStatus {
   const thresholds = input.thresholds ?? DEFAULT_PROMOTION_THRESHOLDS;
   const strategyClass: PromotionStrategyClass = input.strategyClass ?? 'close';
-  const bt = evaluateBacktestGate(input.backtest, thresholds, input.backtestVerdict);
 
-  // TRA-1461 — Stage 2 is class-aware: `accumulate` strategies (hold-mode DCA)
-  // validate on accumulation correctness; everyone else keeps the closed-trade
-  // PF/expectancy leg untouched.
+  // TRA-1465 — Stage 1 is class-aware: `accumulate` strategies (hold-mode DCA)
+  // validate on accumulation robustness over an OOS window (they have no per-
+  // trade timing edge for the six-guard battery to certify); everyone else keeps
+  // the close-based six-guard backtest leg untouched. Reading ONLY the class's
+  // own Stage-1 source makes it impossible to clear an accumulate Stage 1 with a
+  // timing verdict, or a close Stage 1 with an accumulation verdict.
+  const accumulationBacktest = strategyClass === 'accumulate' ? input.accumulationBacktest ?? null : null;
+  const bt =
+    strategyClass === 'accumulate'
+      ? evaluateAccumulationBacktestGate(accumulationBacktest, thresholds)
+      : evaluateBacktestGate(input.backtest, thresholds, input.backtestVerdict);
+  const stage1Label = strategyClass === 'accumulate' ? 'accumulation backtest' : 'backtest';
+
+  // TRA-1461 — Stage 2 is class-aware: `accumulate` strategies validate on
+  // accumulation correctness; everyone else keeps the closed-trade PF/expectancy
+  // leg untouched.
   const accumulation = strategyClass === 'accumulate' ? input.accumulation ?? null : null;
   const stage2 =
     strategyClass === 'accumulate'
@@ -670,7 +883,7 @@ export function evaluatePromotion(input: PromotionEvaluationInput): PromotionSta
 
   const blockedReasons: string[] = [];
   if (bt.state !== 'pass')
-    blockedReasons.push(`Stage 1 (backtest) ${bt.state}: ${bt.failedChecks.join('; ')}`);
+    blockedReasons.push(`Stage 1 (${stage1Label}) ${bt.state}: ${bt.failedChecks.join('; ')}`);
   if (stage2.state !== 'pass')
     blockedReasons.push(`Stage 2 (${stage2Label}) ${stage2.state}: ${stage2.failedChecks.join('; ')}`);
   if (input.signoff !== 'present') blockedReasons.push('Stage 3 (sign-off) absent: no promotion_decision on record');
@@ -680,8 +893,9 @@ export function evaluatePromotion(input: PromotionEvaluationInput): PromotionSta
     strategyClass,
     backtest: {
       state: bt.state,
-      metrics: input.backtest,
-      verdict: input.backtestVerdict ?? null,
+      metrics: strategyClass === 'accumulate' ? null : input.backtest,
+      verdict: strategyClass === 'accumulate' ? null : input.backtestVerdict ?? null,
+      accumulationBacktest,
       failedChecks: bt.failedChecks,
     },
     paper: {

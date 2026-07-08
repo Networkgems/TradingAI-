@@ -72,6 +72,28 @@ function passingReport(): BacktestResult {
   } as BacktestResult;
 }
 
+/**
+ * TRA-1465 — a passing accumulation-backtest verdict for the accumulate-class
+ * `dca` strategy. DCA has no per-trade timing edge for the six-guard battery, so
+ * its Stage 1 is cleared with accumulation-robustness metrics (a long OOS window,
+ * a firing-but-not-degenerate trend gate, bounded drawdown that beats lump-sum,
+ * cadence robustness, and per-fill cost survival) rather than an optimization
+ * verdict — registering a six-guard verdict for `dca` is now rejected by the store.
+ */
+function passingAccumBacktestMetrics(): import('@trading-app/shared').AccumulationBacktestGateMetrics {
+  return {
+    oosDays: 200,
+    deploymentRatio: 0.6,
+    valueInvestedMaxDrawdown: 0.2,
+    lumpSumMaxDrawdown: 0.4,
+    oosReturn: 0.3,
+    lumpSumReturn: 0.25,
+    cadenceVariantsTested: 3,
+    cadenceVariantsConsistent: 3,
+    feeAdjustedValueRatio: 1.05,
+  };
+}
+
 // Settings whose RESULT runs live crypto auto-trading on the go-forward
 // DCA-only preset. TRA-697 retired the dca legacy roster, so the gate is
 // now exercised against `crypto_core` (enabledStrategies ['dca']), the only
@@ -111,28 +133,19 @@ describe('TRA-532 promotion gate — end-to-end enforcement', () => {
   });
 
   it('still blocks after only the backtest is registered (paper + sign-off missing)', async () => {
-    // TRA-542 — Stage 1 is fail-closed, so a passing TRA-540 optimization verdict
-    // (not the legacy bare backtest report) is what clears the leg.
-    const r = passingReport();
-    await store.registerOptimizationVerdict({
+    // TRA-1465 — dca is accumulate-class, so its Stage 1 is cleared by an
+    // accumulation-backtest verdict (accumulation robustness on an OOS window),
+    // NOT the six-guard timing verdict, which the store now rejects for dca.
+    await store.registerAccumulationBacktestVerdict({
       strategyId: 'dca',
-      verdict: {
-        pass: true,
-        guards: { G1: { pass: true, value: 0.8 } },
-        blessedParams: { strategy: 'dca', label: 'tra405' },
-        backtestMetrics: {
-          sharpe: r.sharpeRatio,
-          expectancy: r.expectancy,
-          profitFactor: r.profitFactor,
-          maxDrawdown: r.maxDrawdown,
-          tradeCount: r.totalTrades,
-        },
-      },
-      reportId: 'TRA-405',
+      metrics: passingAccumBacktestMetrics(),
+      reportId: 'TRA-695',
       registeredBy: 'qt',
     });
     const status = await svc.buildPromotionStatus(USER, 'dca');
     expect(status.backtest.state).toBe('pass');
+    expect(status.backtest.accumulationBacktest?.oosDays).toBe(200);
+    expect(status.backtest.metrics).toBeNull(); // no close-based timing metrics
     // TRA-1461 — dca is accumulate-class: Stage 2 passes from the seeded OPEN
     // accumulation (not closed trades), but sign-off is still absent.
     expect(status.strategyClass).toBe('accumulate');

@@ -4,16 +4,36 @@ import {
   DEFAULT_PROMOTION_THRESHOLDS,
   computeAccumulationGateMetrics,
   computePaperGateMetrics,
+  evaluateAccumulationBacktestGate,
   evaluateAccumulationGate,
   evaluateBacktestGate,
   evaluatePaperGate,
   evaluatePromotion,
   promotionStrategyClass,
   PROFIT_FACTOR_CAP,
+  type AccumulationBacktestGateMetrics,
   type AccumulationPositionSample,
   type BacktestGateMetrics,
   type PromotionTradeSample,
 } from './promotion-gate.js';
+
+/**
+ * TRA-1465 — an accumulation-backtest verdict that clears every accumulate
+ * Stage-1 threshold: a long OOS window, a firing-but-not-degenerate trend gate,
+ * a bounded value/invested drawdown that also beats lump-sum on both axes, all
+ * cadences consistent, and fills net-positive of fees.
+ */
+const PASSING_ACCUM_BT: AccumulationBacktestGateMetrics = {
+  oosDays: 200,
+  deploymentRatio: 0.6,
+  valueInvestedMaxDrawdown: 0.2,
+  lumpSumMaxDrawdown: 0.4,
+  oosReturn: 0.3,
+  lumpSumReturn: 0.25,
+  cadenceVariantsTested: 3,
+  cadenceVariantsConsistent: 3,
+  feeAdjustedValueRatio: 1.05,
+};
 
 // A backtest report that clears every Stage-1 threshold.
 const PASSING_BT: BacktestGateMetrics = {
@@ -475,18 +495,21 @@ describe('evaluatePromotion — class-aware Stage 2', () => {
   );
   const goodAccum = computeAccumulationGateMetrics([accum(10, 20)], NOW);
 
-  it('an accumulate strategy clears live on Stage-1 verdict + accumulation + sign-off (no closed trades)', () => {
+  it('an accumulate strategy clears live on Stage-1 accum-backtest + accumulation + sign-off (no closed trades)', () => {
     const r = evaluatePromotion({
       strategyId: 'dca',
       strategyClass: 'accumulate',
-      backtest: PASSING_BT,
-      backtestVerdict: { pass: true },
+      backtest: null, // no close-based timing metrics — DCA has none
+      accumulationBacktest: PASSING_ACCUM_BT, // TRA-1465 — accumulate Stage 1
       paper: null, // never any closed paper trades — the old structural blocker
       accumulation: goodAccum,
       signoff: 'present',
     });
     expect(r.strategyClass).toBe('accumulate');
     expect(r.canGoLive).toBe(true);
+    expect(r.backtest.state).toBe('pass');
+    expect(r.backtest.accumulationBacktest).not.toBeNull();
+    expect(r.backtest.metrics).toBeNull();
     expect(r.paper.accumulation).not.toBeNull();
     expect(r.paper.metrics).toBeNull();
   });
@@ -495,13 +518,14 @@ describe('evaluatePromotion — class-aware Stage 2', () => {
     const r = evaluatePromotion({
       strategyId: 'dca',
       strategyClass: 'accumulate',
-      backtest: PASSING_BT,
-      backtestVerdict: { pass: true },
+      backtest: null,
+      accumulationBacktest: PASSING_ACCUM_BT, // Stage 1 passes so only Stage 2 blocks
       paper: null,
       accumulation: null,
       signoff: 'present',
     });
     expect(r.canGoLive).toBe(false);
+    expect(r.backtest.state).toBe('pass');
     expect(r.blockedReasons.join(' ')).toMatch(/Stage 2 \(accumulation\) missing/);
   });
 
@@ -511,13 +535,31 @@ describe('evaluatePromotion — class-aware Stage 2', () => {
     const r = evaluatePromotion({
       strategyId: 'dca',
       strategyClass: 'accumulate',
-      backtest: PASSING_BT,
-      backtestVerdict: { pass: true },
+      backtest: null,
+      accumulationBacktest: PASSING_ACCUM_BT,
       paper: strongPaper,
       accumulation: null,
       signoff: 'present',
     });
     expect(r.canGoLive).toBe(false);
+  });
+
+  it('does NOT let a close-based six-guard verdict clear an accumulate Stage 1', () => {
+    // A timing verdict on the `backtest`/`backtestVerdict` fields is ignored for
+    // an accumulate strategy — Stage 1 reads ONLY the accumulation-backtest leg.
+    const r = evaluatePromotion({
+      strategyId: 'dca',
+      strategyClass: 'accumulate',
+      backtest: PASSING_BT,
+      backtestVerdict: { pass: true }, // would clear a close Stage 1 — must NOT clear accumulate
+      accumulationBacktest: null,
+      paper: null,
+      accumulation: goodAccum,
+      signoff: 'present',
+    });
+    expect(r.canGoLive).toBe(false);
+    expect(r.backtest.state).toBe('missing');
+    expect(r.blockedReasons.join(' ')).toMatch(/Stage 1 \(accumulation backtest\) missing/);
   });
 
   it('close-based strategies are unchanged: accumulation is ignored, paper leg still governs', () => {
@@ -533,5 +575,131 @@ describe('evaluatePromotion — class-aware Stage 2', () => {
     expect(r.canGoLive).toBe(true);
     expect(r.paper.metrics).not.toBeNull();
     expect(r.paper.accumulation).toBeNull();
+  });
+});
+
+// ── TRA-1465 — accumulate/hold-mode Stage-1 leg (accumulation backtest) ───────
+
+describe('evaluateAccumulationBacktestGate — accumulation robustness, not timing alpha', () => {
+  it('passes a robust accumulation backtest', () => {
+    expect(evaluateAccumulationBacktestGate(PASSING_ACCUM_BT).state).toBe('pass');
+  });
+
+  it('is missing when no accumulation-backtest verdict is registered', () => {
+    const r = evaluateAccumulationBacktestGate(null);
+    expect(r.state).toBe('missing');
+    expect(r.failedChecks.join(' ')).toMatch(/no accumulation-backtest verdict/);
+  });
+
+  it('fails a too-short OOS window', () => {
+    const r = evaluateAccumulationBacktestGate({ ...PASSING_ACCUM_BT, oosDays: 90 });
+    expect(r.state).toBe('fail');
+    expect(r.failedChecks.join(' ')).toMatch(/OOS window/);
+  });
+
+  it('fails a degenerate trend gate on both ends (never fires / never stands down)', () => {
+    const never = evaluateAccumulationBacktestGate({ ...PASSING_ACCUM_BT, deploymentRatio: 0.05 });
+    expect(never.state).toBe('fail');
+    expect(never.failedChecks.join(' ')).toMatch(/barely fires/);
+    const always = evaluateAccumulationBacktestGate({ ...PASSING_ACCUM_BT, deploymentRatio: 1.0 });
+    expect(always.state).toBe('fail');
+    expect(always.failedChecks.join(' ')).toMatch(/never stands down/);
+  });
+
+  it('fails an unbounded value/invested drawdown', () => {
+    const r = evaluateAccumulationBacktestGate({ ...PASSING_ACCUM_BT, valueInvestedMaxDrawdown: 0.5 });
+    expect(r.state).toBe('fail');
+    expect(r.failedChecks.join(' ')).toMatch(/value\/invested drawdown/);
+  });
+
+  it('fails when it loses to lump-sum on BOTH drawdown and return', () => {
+    // Worse drawdown than lump-sum AND worse return → no benchmark edge at all.
+    const r = evaluateAccumulationBacktestGate({
+      ...PASSING_ACCUM_BT,
+      valueInvestedMaxDrawdown: 0.3,
+      lumpSumMaxDrawdown: 0.25,
+      oosReturn: 0.1,
+      lumpSumReturn: 0.2,
+    });
+    expect(r.state).toBe('fail');
+    expect(r.failedChecks.join(' ')).toMatch(/loses to lump-sum/);
+  });
+
+  it('still passes when it gives up a little drawdown but wins on return (and/or)', () => {
+    // Slightly worse drawdown than lump-sum, but materially more return → clears
+    // the benchmark on the return axis.
+    const r = evaluateAccumulationBacktestGate({
+      ...PASSING_ACCUM_BT,
+      valueInvestedMaxDrawdown: 0.3,
+      lumpSumMaxDrawdown: 0.25,
+      oosReturn: 0.4,
+      lumpSumReturn: 0.2,
+    });
+    expect(r.state).toBe('pass');
+  });
+
+  it('fails a single-cadence artifact (cadences not directionally consistent)', () => {
+    const r = evaluateAccumulationBacktestGate({
+      ...PASSING_ACCUM_BT,
+      cadenceVariantsTested: 3,
+      cadenceVariantsConsistent: 2,
+    });
+    expect(r.state).toBe('fail');
+    expect(r.failedChecks.join(' ')).toMatch(/cadence consistency/);
+  });
+
+  it('fails when per-fill costs eat the accumulation', () => {
+    const r = evaluateAccumulationBacktestGate({ ...PASSING_ACCUM_BT, feeAdjustedValueRatio: 0.98 });
+    expect(r.state).toBe('fail');
+    expect(r.failedChecks.join(' ')).toMatch(/per-fill costs eat/);
+  });
+
+  it('default accumulation-backtest thresholds are the TRA-1465 v1 proposal', () => {
+    const t = DEFAULT_PROMOTION_THRESHOLDS.accumulationBacktest;
+    expect(t.minOosDays).toBe(180);
+    expect(t.minDeploymentRatio).toBe(0.25);
+    expect(t.maxDeploymentRatio).toBe(0.98);
+    expect(t.maxValueInvestedDrawdownPct).toBe(0.35);
+    expect(t.minDrawdownImprovementVsLumpSum).toBe(0);
+    expect(t.minCadenceConsistencyRatio).toBe(1.0);
+    expect(t.minFeeAdjustedValueRatio).toBe(1.0);
+  });
+});
+
+describe('evaluatePromotion — class-aware Stage 1 (TRA-1465)', () => {
+  const goodAccum = computeAccumulationGateMetrics([accum(10, 20)], NOW);
+
+  it('a close strategy still runs the six-guard Stage 1; an accumulation-backtest is ignored', () => {
+    const strongPaper = computePaperGateMetrics(
+      spaced(Array.from({ length: 60 }, (_, i) => (i % 6 === 0 ? -0.5 : 1.5))),
+    );
+    // Supply an accumulation-backtest on a close strategy — it must be ignored,
+    // and with no six-guard verdict the close Stage 1 fails closed (TRA-542).
+    const r = evaluatePromotion({
+      strategyId: 'bb_fade',
+      backtest: PASSING_BT,
+      accumulationBacktest: PASSING_ACCUM_BT, // ignored for a close strategy
+      paper: strongPaper,
+      signoff: 'present',
+    });
+    expect(r.strategyClass).toBe('close');
+    expect(r.canGoLive).toBe(false);
+    expect(r.backtest.state).toBe('fail'); // fail-closed: no six-guard verdict
+    expect(r.backtest.accumulationBacktest).toBeNull();
+  });
+
+  it('an accumulate strategy blocks on Stage 1 when the accumulation-backtest fails the battery', () => {
+    const r = evaluatePromotion({
+      strategyId: 'dca',
+      strategyClass: 'accumulate',
+      backtest: null,
+      accumulationBacktest: { ...PASSING_ACCUM_BT, deploymentRatio: 0.02 }, // degenerate gate
+      paper: null,
+      accumulation: goodAccum,
+      signoff: 'present',
+    });
+    expect(r.canGoLive).toBe(false);
+    expect(r.backtest.state).toBe('fail');
+    expect(r.blockedReasons.join(' ')).toMatch(/Stage 1 \(accumulation backtest\) fail/);
   });
 });
