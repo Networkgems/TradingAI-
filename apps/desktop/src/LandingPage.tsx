@@ -11,14 +11,14 @@ interface Props {
  * Public landing / front page (logged-out route, `authScreen='landing'`).
  *
  * Copy is shipped from the Marketing Copy Deck (TRA-752 §2 base; CEO/CFO signed
- * off) — see /TRA/issues/TRA-752#document-marketing-copy-deck. The §3 strategy
- * proof strip is aligned to the audited TRA-754 Features & Strategies deck
- * (source of truth: the TRA-753 feature audit): it lists exactly the SEVEN
- * strategies that run live and drops the decommissioned / backtest-only names
- * the audit does not back. Every claim maps to a `working` audit row or carries
- * the audit caveat; no invented performance/return numbers appear anywhere. The
- * Section 5 risk disclaimer is rendered in full in the footer and condensed
- * under the hero CTA.
+ * off) — see /TRA/issues/TRA-752#document-marketing-copy-deck. The TRA-1522
+ * honesty pass (grounded in the CTO's TRA-1479 demo→live audit) re-aligned the
+ * live-trading claims: equities trade live on a locked roster, while crypto
+ * runs demo evaluation only (LIVE_STRATEGY_PRESET="") — the copy no longer
+ * implies live real-money crypto or markets gate-failed crypto strategies as
+ * live. Every claim maps to a `working` audit row or carries the audit caveat;
+ * no invented performance/return numbers appear anywhere. The Section 5 risk
+ * disclaimer is rendered in full in the footer and condensed under the hero CTA.
  *
  * Visual direction: TRA-765 Visual / UI Spec (single-column rhythm, F-pattern
  * hierarchy, single high-contrast primary CTA, secondary actions as text
@@ -63,7 +63,7 @@ export default function LandingPage({ onStart, onFeatures, onSignIn }: Props) {
             </div>
             <p className="lp-cta-note">Starts in demo mode. Real-money trading is opt-in.</p>
             <p className="lp-cta-fineprint">
-              Trading involves substantial risk of loss. Not financial advice. Equities &amp; options start in demo; crypto is real-money only.
+              Trading involves substantial risk of loss. Not financial advice. Equities &amp; options start in demo. Crypto runs in demo evaluation today — live crypto trading is not currently enabled.
             </p>
           </div>
           <DashboardMock />
@@ -87,9 +87,9 @@ export default function LandingPage({ onStart, onFeatures, onSignIn }: Props) {
               <h2 className="lp-card-h">Always watching, never guessing</h2>
               <p className="lp-card-lead">Setups found for you, around the clock.</p>
               <p className="lp-card-b">
-                Named, tested strategies run live on a fixed 25 high-volume
-                stock universe and a curated crypto list, re-evaluated every 30
-                seconds.
+                Named, tested strategies scan a curated 25-symbol stock
+                watchlist and a crypto list every 30 seconds, and trade a
+                locked equity roster live.
               </p>
             </article>
             <article className="lp-card">
@@ -105,7 +105,7 @@ export default function LandingPage({ onStart, onFeatures, onSignIn }: Props) {
         </section>
 
         {/* ── 3. Strategy proof strip ───────────────────────────────────── */}
-        <section className="lp-section lp-strip" aria-label="Live strategies">
+        <section className="lp-section lp-strip" aria-label="Strategies">
           <div className="lp-chips">
             {[
               'Opening Range Breakout',
@@ -114,13 +114,13 @@ export default function LandingPage({ onStart, onFeatures, onSignIn }: Props) {
               'Ichimoku Cloud Breakout',
               'SMA-200 Trend Pullback',
               'Crypto Mean-Reversion',
-              'Crypto Perpetual Shorts',
             ].map((name) => (
               <span key={name} className="lp-chip">{name}</span>
             ))}
           </div>
           <p className="lp-chips-caption">
-            Seven live strategies across equities and crypto.
+            Rules-based strategies across equities and crypto — trading live on
+            equities, in demo evaluation on crypto.
           </p>
         </section>
 
@@ -203,9 +203,10 @@ export function RiskDisclaimer() {
         possible loss of your entire investment. Automated strategies can and do
         lose money; past or simulated performance does not guarantee future
         results. Equities and options start in demo mode — real-money trading is
-        opt-in and requires your own production broker credentials. Crypto is
-        real-money only and has no paper mode. You are solely responsible for
-        your trading decisions. No representation is made that any account will
+        opt-in and requires your own production broker credentials. Crypto
+        currently runs in demo evaluation only; live crypto trading is not
+        currently enabled, and if it is enabled it is real-money with no paper
+        sandbox. You are solely responsible for your trading decisions. No representation is made that any account will
         or is likely to achieve profits.
       </p>
     </section>
@@ -236,13 +237,13 @@ function DashboardMock() {
           <span className="lp-mock-panel-h">Signals</span>
           <div className="lp-mock-row"><span className="lp-tag lp-buy">BUY</span><span>NVDA · ORB</span></div>
           <div className="lp-mock-row"><span className="lp-tag lp-sell">EXIT</span><span>AAPL · BB-Fade</span></div>
-          <div className="lp-mock-row"><span className="lp-tag lp-buy">BUY</span><span>BTC · Mean-Rev</span></div>
+          <div className="lp-mock-row"><span className="lp-tag lp-buy">BUY</span><span>TSLA · SMA-200</span></div>
         </div>
         <div className="lp-mock-panel">
           <span className="lp-mock-panel-h">Positions</span>
           <div className="lp-mock-row"><span>MSFT</span><span className="lp-pos-up">open</span></div>
           <div className="lp-mock-row"><span>SPY</span><span className="lp-pos-up">open</span></div>
-          <div className="lp-mock-row"><span>ETH-PERP</span><span className="lp-pos-dn">short</span></div>
+          <div className="lp-mock-row"><span>AMZN</span><span className="lp-pos-up">open</span></div>
         </div>
         <div className="lp-mock-panel lp-mock-watch">
           <span className="lp-mock-panel-h">Watchlist · 25</span>
