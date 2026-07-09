@@ -119,28 +119,27 @@ export default function App() {
   );
 
   if (!token) {
+    // TRA-1520 — the landing & features pages use the `.lp` fixed dark palette
+    // (the light/dark toggle is a no-op there) and carry their own top nav with
+    // a Sign-in button. The floating toggle sat on top of that Sign-in button on
+    // mobile, making it untappable, so it is omitted on these two marketing
+    // screens. It still renders on the theme-respecting login/signup/forgot pages.
     if (authScreen === 'landing') {
       return (
-        <>
-          {floatingToggle}
-          <LandingPage
-            onStart={() => setAuthScreen('signup')}
-            onFeatures={() => setAuthScreen('features')}
-            onSignIn={() => setAuthScreen('login')}
-          />
-        </>
+        <LandingPage
+          onStart={() => setAuthScreen('signup')}
+          onFeatures={() => setAuthScreen('features')}
+          onSignIn={() => setAuthScreen('login')}
+        />
       );
     }
     if (authScreen === 'features') {
       return (
-        <>
-          {floatingToggle}
-          <FeaturesPage
-            onStart={() => setAuthScreen('signup')}
-            onHome={() => setAuthScreen('landing')}
-            onSignIn={() => setAuthScreen('login')}
-          />
-        </>
+        <FeaturesPage
+          onStart={() => setAuthScreen('signup')}
+          onHome={() => setAuthScreen('landing')}
+          onSignIn={() => setAuthScreen('login')}
+        />
       );
     }
     if (authScreen === 'forgot') {

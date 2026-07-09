@@ -1258,6 +1258,39 @@ tr:hover td { background: var(--bg-hover); }
   width: 100%;
   max-width: 380px;
   box-shadow: var(--shadow-modal);
+  /* TRA-1520 — never let a modal grow taller than the viewport; a centred card
+     that overflows pushes its top (and the X close button) off-screen. Cap the
+     height (minus the safe-area insets the backdrop reserves) and scroll the
+     overflow instead. Variants that manage their own scroll (`.modal-card-settings`,
+     `.modal-card-scroll`) override this below. */
+  max-height: calc(100vh - 2rem - env(safe-area-inset-top) - env(safe-area-inset-bottom));
+  overflow-y: auto;
+  overscroll-behavior: contain;
+}
+
+/* TRA-1520 — narrow modals whose bodies can run tall (Change Password, Account
+   Management). Split into a pinned header (title + X, always tappable) and a
+   scrolling body so the close button never clips off the top on mobile/web. */
+.modal-card-scroll {
+  padding: 0;
+  overflow: hidden;
+  display: flex;
+  flex-direction: column;
+}
+.modal-card-header {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  gap: 1rem;
+  padding: 1.25rem 1.5rem;
+  border-bottom: 1px solid var(--border);
+  flex-shrink: 0;
+}
+.modal-card-body {
+  overflow-y: auto;
+  overscroll-behavior: contain;
+  -webkit-overflow-scrolling: touch;
+  padding: 1.25rem 1.5rem;
 }
 
 /* Settings modal — wide enough for the SettingsPage form, scrolls when tall.
@@ -2008,8 +2041,12 @@ tr:hover td { background: var(--bg-hover); }
 
 .theme-toggle-floating {
   position: fixed;
-  top: 0.75rem;
-  right: 0.75rem;
+  /* TRA-1520 — offset by the device safe-area insets so the floating Dark-mode
+     toggle on the logged-out screens (login/landing/signup) drops below the
+     status bar / notch instead of tucking under it, where it was clipped and
+     untappable on mobile. */
+  top: calc(0.75rem + env(safe-area-inset-top));
+  right: calc(0.75rem + env(safe-area-inset-right));
   z-index: 150;
 }
 
@@ -2117,6 +2154,19 @@ tr:hover td { background: var(--bg-hover); }
   .eod-trades-table table {
     min-width: max-content;
   }
+
+  /* TRA-1520 — Dashboard bottom bar (Daily P&L, Daily/Open Opts P&L): the
+     nowrap stat row is wider than a phone, so the trailing stats were clipped
+     off the right edge with no way to reach them. Make the strip a horizontal
+     scroller and stop the individual stats from shrinking so they stay legible. */
+  .dashboard-footer {
+    flex-wrap: nowrap;
+    overflow-x: auto;
+    -webkit-overflow-scrolling: touch;
+    scrollbar-width: none;
+  }
+  .dashboard-footer::-webkit-scrollbar { display: none; }
+  .dashboard-footer__pnl { flex-shrink: 0; }
 
   /* Calendar: 2-column year grid */
   .cal-year-grid { grid-template-columns: repeat(2, 1fr); }
@@ -3349,6 +3399,15 @@ tr:hover td { background: var(--bg-hover); }
   max-width: 1080px;
   margin: 0 auto;
   padding: 1.1rem 1.5rem;
+}
+/* TRA-1520 — the public top nav sits flush against the viewport top, so on
+   mobile the Sign-in button tucked under the status bar / notch and was hard to
+   tap. Reserve the device safe-area insets on the top nav (footer keeps its
+   plain padding since it sits at the bottom of the scroll). */
+.lp-nav {
+  padding-top: calc(1.1rem + env(safe-area-inset-top));
+  padding-left: calc(1.5rem + env(safe-area-inset-left));
+  padding-right: calc(1.5rem + env(safe-area-inset-right));
 }
 .lp-footer {
   border-top: 1px solid var(--lp-border);

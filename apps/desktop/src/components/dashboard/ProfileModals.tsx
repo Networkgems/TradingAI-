@@ -66,12 +66,17 @@ export function ProfileModals({
   if (which === 'change-password') {
     return (
       <div className="modal-backdrop" onClick={onClose}>
-        <div className="modal-card" onClick={e => e.stopPropagation()}>
-          <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '1rem' }}>
+        {/* TRA-1520 — `modal-card-scroll` keeps the sticky header (title + X)
+            pinned while the body scrolls, so the close button is always
+            reachable on both mobile and web even when the content is tall. */}
+        <div className="modal-card modal-card-scroll" onClick={e => e.stopPropagation()}>
+          <div className="modal-card-header">
             <h3 style={{ fontSize: '0.95rem', fontWeight: 700 }}>Change Password</h3>
-            <button className="btn-secondary btn-sm" onClick={onClose}>&#x2715;</button>
+            <button className="btn-secondary btn-sm" aria-label="Close" onClick={onClose}>&#x2715;</button>
           </div>
-          <ChangePasswordSection token={token} httpUrl={httpUrl} />
+          <div className="modal-card-body">
+            <ChangePasswordSection token={token} httpUrl={httpUrl} />
+          </div>
         </div>
       </div>
     );
@@ -81,12 +86,16 @@ export function ProfileModals({
   if (!isAdmin) return null;
   return (
     <div className="modal-backdrop" onClick={onClose}>
-      <div className="modal-card" style={{ maxWidth: '660px' }} onClick={e => e.stopPropagation()}>
-        <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '1rem' }}>
+      {/* TRA-1520 — see change-password note above; the user list is long, so
+          the scroll + sticky close button matters most here. */}
+      <div className="modal-card modal-card-scroll" style={{ maxWidth: '660px' }} onClick={e => e.stopPropagation()}>
+        <div className="modal-card-header">
           <h3 style={{ fontSize: '0.95rem', fontWeight: 700 }}>Account Management</h3>
-          <button className="btn-secondary btn-sm" onClick={onClose}>&#x2715;</button>
+          <button className="btn-secondary btn-sm" aria-label="Close" onClick={onClose}>&#x2715;</button>
         </div>
-        <UserManagementSection token={token} httpUrl={httpUrl} />
+        <div className="modal-card-body">
+          <UserManagementSection token={token} httpUrl={httpUrl} />
+        </div>
       </div>
     </div>
   );
