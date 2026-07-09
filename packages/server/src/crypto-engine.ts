@@ -95,6 +95,50 @@ const EVAL_YIELD_EVERY = (() => {
 })();
 const yieldToEventLoop = (): Promise<void> => new Promise<void>(resolve => setImmediate(resolve));
 
+// TRA-1463 / TRA-1510 — global cap on how many per-user crypto engines may run
+// their `doTick` sweep concurrently. The watchdog breadcrumb on bqb1 attributed
+// the residual single-window event-loop block (lagMax 73686ms; live spans up to
+// 21295ms) to `crypto.doTick`, but NO inner `timeSyncPhase` sub-section ever
+// crossed the 1s slow threshold — the block is not one slow helper, it is the
+// AGGREGATE of N engines' sweeps landing in the same libuv check phase: each
+// `await yieldToEventLoop()` re-queues a `setImmediate`, and Node drains the
+// whole immediate queue (all N engines' next chunks) back-to-back before the
+// poll phase (HTTP health probe + watchdog lag sampler) gets a turn. Shrinking
+// the per-chunk stride (CRYPTO_EVAL_YIELD_EVERY) only scales one chunk; it does
+// nothing about N. Capping concurrent sweeps bounds one check phase to at most
+// K × one-chunk regardless of how many users are connected, so the single-window
+// starvation cannot grow with N. 0 (default) = unlimited = pre-TRA-1463
+// behaviour exactly; any finite value in [1,64] serialises past K in-flight
+// sweeps through a FIFO queue. Behaviour-preserving until armed via env so it
+// ships dark and can be validated on a soak like CRYPTO_EVAL_YIELD_EVERY.
+const CRYPTO_TICK_MAX_CONCURRENT = (() => {
+  const raw = Number(process.env.CRYPTO_TICK_MAX_CONCURRENT);
+  return Number.isFinite(raw) && raw >= 1 && raw <= 64 ? Math.floor(raw) : 0;
+})();
+let cryptoTickInFlight = 0;
+const cryptoTickWaiters: Array<() => void> = [];
+const acquireCryptoTickSlot = async (): Promise<void> => {
+  if (CRYPTO_TICK_MAX_CONCURRENT === 0) return; // unlimited — no gating
+  if (cryptoTickInFlight < CRYPTO_TICK_MAX_CONCURRENT) {
+    cryptoTickInFlight++;
+    return;
+  }
+  // At capacity — park until a releaser HANDS OVER its slot. The releaser
+  // transfers the slot without decrementing, so we must NOT increment on resume
+  // (otherwise a fresh caller slipping in between release-decrement and our
+  // resume would over-subscribe past K).
+  await new Promise<void>(resolve => cryptoTickWaiters.push(resolve));
+};
+const releaseCryptoTickSlot = (): void => {
+  if (CRYPTO_TICK_MAX_CONCURRENT === 0) return;
+  const next = cryptoTickWaiters.shift();
+  if (next) {
+    next(); // hand the slot straight to the next waiter; inFlight unchanged
+    return;
+  }
+  cryptoTickInFlight--;
+};
+
 // TRA-693 — shared across all CryptoSignalEngine instances (one per demo user).
 // Without sharing, each engine independently fetches the same daily candles on
 // every tick, saturating the shared AT pacer (150ms/req × 16 candles/tick × N
@@ -1348,6 +1392,14 @@ export class CryptoSignalEngine {
   }
 
   private async runTickGuarded(): Promise<void> {
+    // TRA-1463 / TRA-1510 — global concurrency gate. When armed
+    // (CRYPTO_TICK_MAX_CONCURRENT>0) this parks the sweep until fewer than K
+    // engines are mid-`doTick`, bounding one libuv check phase to K×one-chunk of
+    // synchronous work regardless of connected-user count (the confirmed driver
+    // of the single-window watchdog block). No-op when unarmed (default). The
+    // per-engine `tickRunning` flag above already coalesces this engine's own
+    // overlapping ticks, so a slow queue can't stack two sweeps for one user.
+    await acquireCryptoTickSlot();
     try {
       // TRA-1463 — hold the in-flight phase pointer across the tick so a synchronous
       // block inside doTick is attributed to `crypto.doTick` in the watchdog trip
@@ -1356,6 +1408,7 @@ export class CryptoSignalEngine {
     } catch (err: unknown) {
       log.error('tick error', { reason: err instanceof Error ? err.message : String(err) });
     } finally {
+      releaseCryptoTickSlot();
       this.tickRunning = false;
     }
   }
