@@ -46,7 +46,7 @@ import {
   listTradableCoinbaseUsdSymbols,
 } from './crypto-feed.js';
 import { isYahooBreakerOpen } from './yahoo-feed.js';
-import { withPhase } from './phase-timing.js';
+import { withPhase, timeSyncPhase } from './phase-timing.js';
 import { isColdStartDailyPrefetchEnabled, resolveColdStartPrefetchPerMin, resolveColdStartPrefetchBootDelayMs, recordColdStartPrefetchRun } from './daily-prefetch-flag.js';
 import { evaluateFeedFreshness } from './feed-freshness.js';
 import { CryptoPaperAccount } from './crypto-account.js';
@@ -1461,12 +1461,20 @@ export class CryptoSignalEngine {
 
     // TRA-230: drop stale or stop/target-crossed signals so the Signals tab
     // only shows entries that are still actionable.
-    this.pruneInvalidSignals(prices);
+    // TRA-1508 — finer synchronous-phase attribution inside `crypto.doTick`.
+    // TRA-1463 named the blocking *tick*; these `timeSyncPhase` wrappers name the
+    // exact unyielded synchronous *section* within it (the eval loops already
+    // yield every EVAL_YIELD_EVERY symbols, so a single-window ~71s block lives
+    // in one of these helpers). Observability only — a `Date.now()` pair per
+    // section, recorded only when it crosses PHASE_TIMING_SLOW_MS (1s).
+    timeSyncPhase('crypto.pruneSignals', () => this.pruneInvalidSignals(prices));
 
     // Broadcast watchlist state early so the UI populates without waiting for candles
     if (this.symbolState.size > 0) {
-      const earlyState = this.buildState();
-      for (const h of this.handlers) h(earlyState);
+      timeSyncPhase('crypto.buildState.early', () => {
+        const earlyState = this.buildState();
+        for (const h of this.handlers) h(earlyState);
+      });
     }
 
     // TRA-480 — candle refresh + freshness gate are shared between branches.
@@ -1531,30 +1539,34 @@ export class CryptoSignalEngine {
     // and satisfies the TRA-337 anti-ghost-price entry gate. Gated to non-
     // intraday ticks so minute strategies never enter off a stale daily close.
     if (!needsIntraday) {
-      for (const sym of activeSymbols) {
-        if (this.symbolState.get(sym)?.quoteStatus === 'ok') continue; // live quote already landed
-        const daily = sharedDailyCandleCache.get(sym);
-        if (!daily || daily.length === 0) continue;
-        const close = daily[daily.length - 1].close;
-        if (!(close > 0)) continue;
-        prices.set(sym, close);
-        quoteSources.set(sym, 'coinbase');
-        this.symbolState.set(sym, {
-          symbol: sym,
-          price: close,
-          volume: 0,
-          change: 0,
-          changePct: 0,
-          lastUpdated: Date.now(),
-          quoteStatus: 'ok',
-        });
-      }
+      // TRA-1508 — synchronous sweep over the full active universe; instrumented
+      // so a slow daily-close seed pass names itself in the watchdog breadcrumb.
+      timeSyncPhase('crypto.dailyCloseFallback', () => {
+        for (const sym of activeSymbols) {
+          if (this.symbolState.get(sym)?.quoteStatus === 'ok') continue; // live quote already landed
+          const daily = sharedDailyCandleCache.get(sym);
+          if (!daily || daily.length === 0) continue;
+          const close = daily[daily.length - 1].close;
+          if (!(close > 0)) continue;
+          prices.set(sym, close);
+          quoteSources.set(sym, 'coinbase');
+          this.symbolState.set(sym, {
+            symbol: sym,
+            price: close,
+            volume: 0,
+            change: 0,
+            changePct: 0,
+            lastUpdated: Date.now(),
+            quoteStatus: 'ok',
+          });
+        }
+      });
     }
 
     // TRA-418 — data-feed freshness gate. Run after the candle refresh above so
     // a symbol whose feed is down is detected from the (now-attempted) cache
     // age, marked `quoteStatus: 'stale'`, and excluded from signal evaluation.
-    const staleSymbols = this.markStaleSymbols(activeSymbols);
+    const staleSymbols = timeSyncPhase('crypto.markStale', () => this.markStaleSymbols(activeSymbols));
 
     // TRA-480 — demo branch ALWAYS runs, regardless of `this.mode`. The board
     // expects the demo dashboard to track `tra405_validated` deterministically
@@ -1581,8 +1593,10 @@ export class CryptoSignalEngine {
       this.lastNewsRefresh = Date.now();
     }
 
-    const state = this.buildState();
-    for (const h of this.handlers) h(state);
+    timeSyncPhase('crypto.buildState.final', () => {
+      const state = this.buildState();
+      for (const h of this.handlers) h(state);
+    });
   }
 
   /**
@@ -1603,7 +1617,11 @@ export class CryptoSignalEngine {
     // can't keep emitting skipped signals or absurd PnL on the same tick that
     // detects the breach. On rebase we also realign the persisted tracker so
     // a restart doesn't read back the corrupted equity-state.json.
-    if (this.account.enforceEquityInvariant(this.demoEquityTarget())) {
+    // TRA-1508 — the demo branch runs on EVERY tick (even in live mode, see
+    // `doTick`), so its two synchronous, unyielded calls (`enforceEquityInvariant`
+    // + `checkExits`) are per-tick block suspects. Instrument them so the next
+    // watchdog breadcrumb names them if either holds the loop.
+    if (timeSyncPhase('crypto.demo.enforceEquityInvariant', () => this.account.enforceEquityInvariant(this.demoEquityTarget()))) {
       if (this.tracker) {
         const equity = this.account.getEquity();
         this.tracker.setInitialEquity(equity);
@@ -1612,7 +1630,7 @@ export class CryptoSignalEngine {
       }
     }
 
-    const closed = this.account.checkExits(prices);
+    const closed = timeSyncPhase('crypto.demo.checkExits', () => this.account.checkExits(prices));
     if (closed.length > 0) {
       // TRA-231 — stamp `mode` for downstream UI metadata; the dashboard's
       // closed-positions visibility is enforced by TRA-242's per-mode
