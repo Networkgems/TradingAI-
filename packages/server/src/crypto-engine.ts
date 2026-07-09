@@ -80,7 +80,19 @@ const NEWS_REFRESH_MS = 5 * 60_000;
 // keeping any single synchronous span well under ~1s. `setImmediate` (vs
 // `setTimeout(0)`/microtask) runs after pending I/O callbacks, so queued HTTP
 // accepts are serviced before the next chunk resumes.
-const EVAL_YIELD_EVERY = 25;
+// TRA-1463 — env-tunable yield stride. TRA-1508's breadcrumb showed the 73s
+// single-window watchdog lag exceeds the largest single tick (21s): with ~N
+// per-user crypto engines all re-queuing their `setImmediate` yields into the
+// SAME event-loop check phase, one phase runs N engines × one 25-symbol chunk
+// back-to-back before the timers/poll phases (watchdog + HTTP listener) get a
+// turn. Shrinking the stride cuts that per-phase batch proportionally, so ops
+// can pull single-window starvation under Render's 5s health budget without a
+// redeploy. Default 25 preserves the TRA-1082 behaviour exactly; any finite
+// value in [1, 500] overrides it.
+const EVAL_YIELD_EVERY = (() => {
+  const raw = Number(process.env.CRYPTO_EVAL_YIELD_EVERY);
+  return Number.isFinite(raw) && raw >= 1 && raw <= 500 ? Math.floor(raw) : 25;
+})();
 const yieldToEventLoop = (): Promise<void> => new Promise<void>(resolve => setImmediate(resolve));
 
 // TRA-693 — shared across all CryptoSignalEngine instances (one per demo user).
@@ -1089,7 +1101,16 @@ export class CryptoSignalEngine {
   private getCorrelationMatrix(): CorrelationMatrix {
     const utcDay = Math.floor(Date.now() / 86_400_000);
     if (!this.correlationMatrix || this.correlationMatrixUtcDay !== utcDay) {
-      this.correlationMatrix = new CorrelationMatrix(sharedDailyCandleCache);
+      // TRA-1463 — attribution gap not covered by TRA-1508's per-tick-helper
+      // wrappers: this once-per-UTC-day rebuild runs over the FULL ~495-symbol
+      // daily cache and is triggered from clusterCapMultiplier INSIDE the eval
+      // loop — i.e. a single unyielded synchronous span BETWEEN two 25-symbol
+      // yields. Name it so a block here reads `crypto.correlationMatrix` in the
+      // watchdog breadcrumb instead of being masked by the surrounding tick.
+      this.correlationMatrix = timeSyncPhase(
+        'crypto.correlationMatrix',
+        () => new CorrelationMatrix(sharedDailyCandleCache),
+      );
       this.correlationMatrixUtcDay = utcDay;
     }
     return this.correlationMatrix;
