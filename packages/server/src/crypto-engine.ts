@@ -112,15 +112,29 @@ const yieldToEventLoop = (): Promise<void> => new Promise<void>(resolve => setIm
 // behaviour exactly; any finite value in [1,64] serialises past K in-flight
 // sweeps through a FIFO queue. Behaviour-preserving until armed via env so it
 // ships dark and can be validated on a soak like CRYPTO_EVAL_YIELD_EVERY.
-const CRYPTO_TICK_MAX_CONCURRENT = (() => {
+//
+// TRA-1515 — K is resolved LAZILY (memoised on the first `acquireCryptoTickSlot`
+// call) rather than as an import-time const, so a value SEEDED into process.env
+// at boot is honoured. The TRA-1481 boot-seed loop (index.ts) runs AFTER this
+// module is imported, so an import-time const would freeze at the pre-seed value
+// (0) and a durable env-reset backstop could never arm K. The first tick fires
+// well after boot seeding completes, so the memoised read picks up the seeded K.
+// Semantics are byte-for-byte identical to the old const (same parse, same
+// [1,64] clamp, same 0=unlimited default); only the read timing moved.
+let cryptoTickMaxConcurrentCache: number | null = null;
+const resolveCryptoTickMaxConcurrent = (): number => {
+  if (cryptoTickMaxConcurrentCache !== null) return cryptoTickMaxConcurrentCache;
   const raw = Number(process.env.CRYPTO_TICK_MAX_CONCURRENT);
-  return Number.isFinite(raw) && raw >= 1 && raw <= 64 ? Math.floor(raw) : 0;
-})();
+  cryptoTickMaxConcurrentCache =
+    Number.isFinite(raw) && raw >= 1 && raw <= 64 ? Math.floor(raw) : 0;
+  return cryptoTickMaxConcurrentCache;
+};
 let cryptoTickInFlight = 0;
 const cryptoTickWaiters: Array<() => void> = [];
 const acquireCryptoTickSlot = async (): Promise<void> => {
-  if (CRYPTO_TICK_MAX_CONCURRENT === 0) return; // unlimited — no gating
-  if (cryptoTickInFlight < CRYPTO_TICK_MAX_CONCURRENT) {
+  const cap = resolveCryptoTickMaxConcurrent();
+  if (cap === 0) return; // unlimited — no gating
+  if (cryptoTickInFlight < cap) {
     cryptoTickInFlight++;
     return;
   }
@@ -131,7 +145,9 @@ const acquireCryptoTickSlot = async (): Promise<void> => {
   await new Promise<void>(resolve => cryptoTickWaiters.push(resolve));
 };
 const releaseCryptoTickSlot = (): void => {
-  if (CRYPTO_TICK_MAX_CONCURRENT === 0) return;
+  // Memoised, so this reads the SAME K the matching acquire resolved — a mid-
+  // flight cap change can never strand `cryptoTickInFlight` above 0.
+  if (resolveCryptoTickMaxConcurrent() === 0) return;
   const next = cryptoTickWaiters.shift();
   if (next) {
     next(); // hand the slot straight to the next waiter; inFlight unchanged

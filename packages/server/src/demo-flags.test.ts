@@ -14,6 +14,7 @@ import {
   resolveDemoFlagEnv,
   writeDemoFlagFile,
   renderRatifiedDemoDefaults,
+  renderInfraDefaults,
   DEMO_FLAGS_FILENAME,
 } from './demo-flags.js';
 import { isAutonomousDemoLoopEnabled } from './autonomous-demo-loop.js';
@@ -239,6 +240,42 @@ describe('renderRatifiedDemoDefaults (TRA-1481 — self-heal the Render blueprin
     // The board's daemon-free disarm: the file layers OVER the seeded env and wins.
     writeFlags({ ENABLE_OPTION_COST_AWARE_GATE: '0' });
     expect(isOptionCostAwareGateEnabled(resolveDemoFlagEnv(dir, env))).toBe(false);
+  });
+});
+
+describe('renderInfraDefaults (TRA-1515 — durable-bake the crypto-tick concurrency cap across an env reset)', () => {
+  it('is a NO-OP off Render (self-host / local — no RENDER env)', () => {
+    expect(renderInfraDefaults({} as NodeJS.ProcessEnv)).toEqual({});
+  });
+
+  it('seeds CRYPTO_TICK_MAX_CONCURRENT=4 on Render when the API env was wiped (key unset)', () => {
+    const env = { RENDER: 'true' } as NodeJS.ProcessEnv;
+    expect(renderInfraDefaults(env)).toEqual({ CRYPTO_TICK_MAX_CONCURRENT: '4' });
+  });
+
+  it('does NOT override the API-set value on Render (a redeploy-durable arm wins)', () => {
+    const env = { RENDER: 'true', CRYPTO_TICK_MAX_CONCURRENT: '4' } as NodeJS.ProcessEnv;
+    expect(renderInfraDefaults(env)).toEqual({});
+  });
+
+  it('does NOT override a deliberate `0` disarm (a non-empty explicit value wins)', () => {
+    const env = { RENDER: 'true', CRYPTO_TICK_MAX_CONCURRENT: '0' } as NodeJS.ProcessEnv;
+    expect(renderInfraDefaults(env)).toEqual({});
+  });
+
+  it('re-seeds when the value is present-but-blank (whitespace ≡ unset, same as the demo seed)', () => {
+    const env = { RENDER: 'true', CRYPTO_TICK_MAX_CONCURRENT: '  ' } as NodeJS.ProcessEnv;
+    expect(renderInfraDefaults(env)).toEqual({ CRYPTO_TICK_MAX_CONCURRENT: '4' });
+  });
+
+  it('end-to-end: the seed lands the crypto-tick cap in the boot env for the lazy engine read', () => {
+    const env = { RENDER: 'true' } as NodeJS.ProcessEnv;
+    // Before the seed, K is dark on the running process (the env-reset tail).
+    expect(env.CRYPTO_TICK_MAX_CONCURRENT).toBeUndefined();
+    Object.assign(env, renderInfraDefaults(env)); // boot applies to process.env
+    // crypto-engine resolves K lazily on first tick — AFTER this boot seed — so
+    // it now reads 4 rather than the pre-seed code default 0.
+    expect(env.CRYPTO_TICK_MAX_CONCURRENT).toBe('4');
   });
 });
 

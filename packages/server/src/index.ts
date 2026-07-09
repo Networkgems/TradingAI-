@@ -53,6 +53,7 @@ import {
   loadDemoFlagFile,
   writeDemoFlagFile,
   renderRatifiedDemoDefaults,
+  renderInfraDefaults,
   DEMO_FLAG_ALLOWLIST,
 } from './demo-flags.js';
 // TRA-1216 — observe-only perp funding-carry scanner + forward funding-history
@@ -489,6 +490,23 @@ const DATA_DIR = process.env.DATA_DIR ?? join(__dirname, '..', 'data');
 for (const [key, value] of Object.entries(renderRatifiedDemoDefaults(DATA_DIR))) {
   process.env[key] = value;
   log.info('TRA-1481 seeded board-ratified demo flag on Render (blueprint-sync gap)', {
+    flag: key,
+    value,
+  });
+}
+
+// TRA-1515 (parent TRA-1463) — same blueprint-sync self-heal for INFRA/stability
+// env values (not demo flags). CRYPTO_TICK_MAX_CONCURRENT is the crypto-tick FIFO
+// cap that fixes the aggregate-doTick check-phase block; it is armed =4 via the
+// Render API (redeploy-durable) but reverts to the code default 0 (=unlimited =
+// pre-TRA-1463 crash cycle) if the API env is ever wiped. Seeding it here makes
+// the fix survive a full env reset too. Render-only, and only when unset by env
+// (an explicit operator/API value — including a deliberate `0` disarm — always
+// wins). crypto-engine reads K lazily (TRA-1515) so this boot seed is honoured
+// before the first tick. Capital-incapable ⇒ zero real-money risk.
+for (const [key, value] of Object.entries(renderInfraDefaults())) {
+  process.env[key] = value;
+  log.info('TRA-1515 seeded infra default on Render (blueprint-sync gap)', {
     flag: key,
     value,
   });

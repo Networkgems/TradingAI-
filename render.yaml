@@ -754,6 +754,20 @@ services:
       # redeploy. Accepts 1/true/yes/on.
       - key: ENABLE_CRYPTO_FANOUT_HARDENING
         value: "1"
+      # TRA-1463 / TRA-1510 / TRA-1515 — FIFO cap on how many per-user crypto
+      # engines may run their `doTick` sweep concurrently. Confirmed fix for the
+      # residual bqb1 crash cycle: N per-user sweeps were batching into a single
+      # libuv check phase (watchdog lagMax 73686ms, ~85min restart ceiling); the
+      # cap bounds one check phase to K×one-chunk regardless of connected users
+      # (validated soak: peakLag 246ms, held past the ceiling, RSS flat). 0/absent
+      # = unlimited = pre-TRA-1463 behaviour exactly; [1,64] = FIFO cap. Armed =4
+      # on the service via the Render API (redeploy-durable) and ALSO boot-seeded
+      # in code (renderInfraDefaults, TRA-1515) so it self-heals a full env reset;
+      # this blueprint entry is the source-of-truth record. Capital-incapable: it
+      # only serialises observe-only tick sweeps. NOTE: blueprint sync ≠ autoDeploy
+      # on bqb1 (TRA-1289) — the API env + the code seed are what actually arm it.
+      - key: CRYPTO_TICK_MAX_CONCURRENT
+        value: "4"
       # TRA-1080 — event-loop/heap starvation watchdog. The watchdog itself is
       # ON by default in code (no env needed); these knobs are declared
       # `sync: false` so an operator can DISABLE or RETUNE it from the dashboard

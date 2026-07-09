@@ -326,6 +326,57 @@ export function renderRatifiedDemoDefaults(
 }
 
 /**
+ * TRA-1515 (parent TRA-1463/TRA-1510) — infra/stability env values that MUST
+ * survive a full Render ENV RESET, not just a redeploy, and hit the SAME
+ * blueprint-sync gap as the demo brakes ({@link RENDER_RATIFIED_DEMO_DEFAULTS}):
+ * a render.yaml value added after the last manual blueprint sync never reaches
+ * the running process (TRA-1289), and the Render key needed for a sync is
+ * blocked (TRA-969). These are deliberately kept OUT of the demo-brake map so
+ * that map's "board-ratified DEMO flag" docstring stays honest — an entry here
+ * tunes the runtime, not the trading book.
+ *
+ * STRICT admission for an entry: (1) recorded in render.yaml as the blueprint
+ * source of truth, (2) structurally incapable of touching live capital, (3)
+ * pure risk/stability-reducing (a bounded value that only makes the process
+ * safer). Remove an entry the moment its render.yaml record is retired.
+ */
+export const RENDER_INFRA_DEFAULTS: Readonly<Record<string, string>> = {
+  // TRA-1463 / TRA-1510 / TRA-1515 — FIFO cap on concurrent crypto tick sweeps,
+  // the confirmed fix for the aggregate-`doTick` check-phase block (commit
+  // 4347676). Armed `=4` on the service via the Render API and validated on a
+  // bqb1 soak (peakLag 246ms vs 73686ms pre-fix, held past the ~85min crash
+  // ceiling). Capital-incapable: the gate only serialises observe-only tick
+  // sweeps; it opens / sizes / closes nothing. The API-set env makes it
+  // REDEPLOY-durable, but a full env reset would revert K to the code default 0
+  // (= unlimited = pre-TRA-1463), bringing the crash cycle back — so seed it
+  // here to self-heal that rare env-wipe tail. Read lazily by crypto-engine
+  // (TRA-1515) so this boot seed is picked up before the first tick.
+  CRYPTO_TICK_MAX_CONCURRENT: '4',
+};
+
+/**
+ * TRA-1515 — resolve which {@link RENDER_INFRA_DEFAULTS} entries should be
+ * seeded into the boot env. Returns entries ONLY when running on Render
+ * (`env.RENDER` set — render.yaml is the source of truth there; the self-host is
+ * never touched) AND the key is absent from `env`, so an explicit operator /
+ * API / dashboard value (including a deliberate `0` disarm, which is a non-empty
+ * string and therefore wins) is always preserved. These keys are NOT in the
+ * demo-flag allowlist, so `<dataDir>/demo-flags.json` cannot carry them and the
+ * file is intentionally not consulted. Pure (no side effects) for unit testing.
+ */
+export function renderInfraDefaults(
+  env: NodeJS.ProcessEnv = process.env,
+): Record<string, string> {
+  if (!env.RENDER) return {}; // Render-only: render.yaml governs env there
+  const out: Record<string, string> = {};
+  for (const [key, value] of Object.entries(RENDER_INFRA_DEFAULTS)) {
+    const inEnv = typeof env[key] === 'string' && env[key]!.trim() !== '';
+    if (!inEnv) out[key] = value;
+  }
+  return out;
+}
+
+/**
  * Read allowlisted demo flags from `<dataDir>/demo-flags.json`. Returns an empty
  * object when the file is absent or malformed — the default, zero-override path.
  * Values are coerced to strings so they slot straight into a `ProcessEnv`.
