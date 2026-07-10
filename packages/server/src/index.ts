@@ -451,6 +451,7 @@ import {
   ensureStrategyRegistered,
   PromotionValidationError,
 } from './promotion-store.js';
+import { seedDcaAccumulationBacktest } from './promotion-dca-seed.js';
 import {
   buildPromotionStatus,
   buildPublicPromotionProbe,
@@ -507,6 +508,18 @@ initStateDb(DATA_DIR);
 // `canGoLive=false`. Idempotent; never clobbers an existing record.
 await ensureStrategyRegistered('supertrend_confluence').catch(err =>
   log.warn('TRA-801 ensureStrategyRegistered(supertrend_confluence) failed', {
+    reason: err instanceof Error ? err.message : String(err),
+  }),
+);
+
+// TRA-1579 — seed the crypto-DCA Stage-1 accumulation-backtest verdict (TRA-1465
+// accumulate leg) so `dca` carries a REAL pass/fail Stage-1 on the go-live gate
+// instead of `missing` (parent TRA-1575). Idempotent + non-clobbering: a later
+// admin registration via `POST /api/promotion/accumulation-backtest` wins. Flips
+// no live flag — Stage-3 board sign-off still gates the live transition, and the
+// seeded verdict is FAIL on the current OOS data.
+await seedDcaAccumulationBacktest().catch(err =>
+  log.warn('TRA-1579 seedDcaAccumulationBacktest failed', {
     reason: err instanceof Error ? err.message : String(err),
   }),
 );
