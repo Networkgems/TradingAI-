@@ -152,6 +152,13 @@ function liveEngineWith(account: CryptoLiveAccount): CryptoSignalEngine {
 beforeEach(() => {
   vi.spyOn(console, 'log').mockImplementation(() => {});
   vi.spyOn(console, 'warn').mockImplementation(() => {});
+  // TRA-1580 — the engine now ships crypto-dark by default (kill switch). These
+  // tests exercise the tick/refresh sweep logic, so explicitly enable it.
+  process.env.CRYPTO_ENGINE_ENABLED = '1';
+});
+
+afterEach(() => {
+  delete process.env.CRYPTO_ENGINE_ENABLED;
 });
 
 async function freshFundedLiveAccount(usd = '100000'): Promise<{

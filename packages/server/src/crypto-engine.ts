@@ -57,6 +57,7 @@ import { FundingRateTracker } from './funding-rate-tracker.js';
 // does not import this module, so this is a one-way dependency (no cycle).
 import { isLiveBrokerOperator } from './signal-engine.js';
 import { isCorrelatedExposureCapEnabled } from './exit-risk-rules-flag.js';
+import { isCryptoEngineEnabled } from './crypto-engine-flag.js';
 import { recordCorrelatedExposureBinding } from './correlated-exposure-ledger.js';
 import type { PnlTracker } from './pnl-tracker.js';
 import { logger } from './observability/index.js';
@@ -921,6 +922,15 @@ export class CryptoSignalEngine {
     // a no-op so the `ensureUserContext`+`initUserContext` double-call can't leak a
     // second 60s interval or a second staggered boot tick.
     if (this.tickTimer) return;
+    // TRA-1580 — master kill switch for the options/stock-only Monday launch.
+    // When crypto is disabled (default) don't schedule the boot tick or the 60s
+    // interval at all: the ~395-symbol `crypto.doTick` Coinbase fan-out is the
+    // residual bqb1 crash driver (TRA-1463/1508), so the launch build simply
+    // never runs it. The engine object stays alive for report/state reads.
+    if (!isCryptoEngineEnabled()) {
+      log.info('crypto engine disabled (TRA-1580); not scheduling ticks', { mode: this.mode });
+      return;
+    }
     // TRA-345 — one-shot startup observability for the pinned strategy preset.
     // Prints the resolved preset id, enabled strategies, symbol filter, and the
     // raw `LIVE_STRATEGY_PRESET` env value the process actually saw. This is
@@ -1493,6 +1503,10 @@ export class CryptoSignalEngine {
   }
 
   private tick(): Promise<void> {
+    // TRA-1580 — bulletproof kill: even if a request-driven `refresh()` reaches
+    // here without a running interval (e.g. a watchlist edit endpoint), never
+    // run the bqb1-crashing `doTick` sweep while crypto is disabled.
+    if (!isCryptoEngineEnabled()) return this.activeTick;
     if (this.tickRunning) return this.activeTick;
     this.tickRunning = true;
     this.activeTick = this.runTickGuarded();
@@ -2760,6 +2774,8 @@ export class CryptoSignalEngine {
    * open, so a pure-spot live operator pays no overhead.
    */
   async tickFundingHourly(): Promise<void> {
+    // TRA-1580 — comprehensive kill: no crypto work at all while disabled.
+    if (!isCryptoEngineEnabled()) return;
     const tracker = this.fundingTracker;
     if (!tracker || this.mode !== 'live') return;
     try {

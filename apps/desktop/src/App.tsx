@@ -18,6 +18,14 @@ import './index.css';
 const IDLE_TIMEOUT_MS = 30 * 60 * 1000;
 const IDLE_WARN_MS = 2 * 60 * 1000;
 
+// TRA-1580 — crypto is dark for the options/stock-only Monday launch. Hide the
+// entire crypto surface: the home-screen crypto tile and the crypto dashboard.
+// A stored `tradingMode=crypto` from a prior session is redirected home so no
+// user can land on the crypto page. Paired with the server-side
+// CRYPTO_ENGINE_ENABLED kill switch (compiled OFF). Flip to `true` (and re-arm
+// the server flag) to restore crypto post-launch.
+const CRYPTO_UI_ENABLED = false;
+
 type AuthScreen = 'landing' | 'features' | 'login' | 'forgot' | 'signup';
 
 export default function App() {
@@ -30,7 +38,9 @@ export default function App() {
   );
   const [appMode, setAppMode] = useState<null | 'stocks' | 'crypto'>(() => {
     const stored = localStorage.getItem('tradingMode');
-    return stored === 'stocks' || stored === 'crypto' ? stored : null;
+    // TRA-1580 — never restore a stored crypto mode while crypto is dark.
+    if (stored === 'crypto' && CRYPTO_UI_ENABLED) return 'crypto';
+    return stored === 'stocks' ? 'stocks' : null;
   });
   const [idleWarning, setIdleWarning] = useState(false);
   const idleTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
@@ -89,6 +99,8 @@ export default function App() {
   }, [token]);
 
   function selectMode(mode: 'stocks' | 'crypto') {
+    // TRA-1580 — crypto surface is hidden; ignore any stray crypto selection.
+    if (mode === 'crypto' && !CRYPTO_UI_ENABLED) return;
     localStorage.setItem('tradingMode', mode);
     setAppMode(mode);
   }
@@ -169,8 +181,10 @@ export default function App() {
   if (!tokenChecked) return null;
 
   const mainContent = appMode === null
-    ? <DashboardSelector onSelect={selectMode} onLogout={handleLogout} theme={theme} onToggleTheme={toggleTheme} />
-    : appMode === 'crypto'
+    ? <DashboardSelector onSelect={selectMode} onLogout={handleLogout} theme={theme} onToggleTheme={toggleTheme} cryptoEnabled={CRYPTO_UI_ENABLED} />
+    // TRA-1580 — the crypto page only mounts while crypto is armed; otherwise
+    // every non-null mode falls through to the stocks/options dashboard.
+    : appMode === 'crypto' && CRYPTO_UI_ENABLED
       ? <CryptoDashboard token={token} onBack={goHome} onLogout={handleLogout} onActivity={() => resetIdleTimerRef.current()} theme={theme} onToggleTheme={toggleTheme} />
       : <Dashboard token={token} onLogout={handleLogout} onGoHome={goHome} onActivity={() => resetIdleTimerRef.current()} theme={theme} onToggleTheme={toggleTheme} />;
 
