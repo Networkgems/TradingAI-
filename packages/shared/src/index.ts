@@ -2822,8 +2822,41 @@ export const CRYPTO_DENYLIST: readonly string[] = [
   'RUNE-USD',
 ] as const;
 
+/**
+ * USD-quoted stablecoin / fiat-peg products on the Coinbase USD catalog.
+ *
+ * TRA-1545: The DEMO crypto_core DCA preset runs the full ~395-pair Coinbase
+ * USD universe (symbolFilter: null, TRA-693), which includes USD-quoted peg
+ * products that trade flat at ~$1. Momentum-/trend-gated DCA accumulation on a
+ * peg is degenerate — there is no trend to ride and the 200-day-EMA gate is
+ * meaningless on a flat line. PAX-USD was actually opened by demo DCA (observed
+ * in the TRA-1538 daily review), so these are excluded here.
+ *
+ * Only same-side USD pegs need listing: the crypto engine's `-USD` suffix
+ * filter already drops `*-USDC` / `*-EUR` quote products. `*-USDC` pegs (e.g.
+ * USDT-USDC) never reach here for the same reason; USDC itself has no `USDC-USD`
+ * product on Coinbase.
+ *
+ * Set confirmed against the live Coinbase Exchange catalog 2026-07-09
+ * (api.exchange.coinbase.com/products/<id>). Online today: USDT-USD, PAX-USD,
+ * USDS-USD. Delisted but retained for defense-in-depth against relisting:
+ * DAI-USD, GUSD-USD, PYUSD-USD, BUSD-USD, GYEN-USD (JPY peg). USDP-USD /
+ * LUSD-USD / RLUSD-USD / USDC-USD are not Coinbase products (404) and are
+ * omitted to avoid denylisting phantom ids.
+ */
+export const CRYPTO_STABLECOIN_DENYLIST: readonly string[] = [
+  'USDT-USD',
+  'PAX-USD',
+  'USDS-USD',
+  'DAI-USD',
+  'GUSD-USD',
+  'PYUSD-USD',
+  'BUSD-USD',
+  'GYEN-USD',
+] as const;
+
 const CRYPTO_DENYLIST_SET: ReadonlySet<string> = new Set(
-  CRYPTO_DENYLIST.map(s => s.toUpperCase()),
+  [...CRYPTO_DENYLIST, ...CRYPTO_STABLECOIN_DENYLIST].map(s => s.toUpperCase()),
 );
 
 export function isCryptoSymbolBlocked(symbol: string): boolean {
