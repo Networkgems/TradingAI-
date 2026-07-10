@@ -1137,6 +1137,14 @@ export default function SettingsPage({ token, httpUrl, context, onModeChange, on
   // `settings_persist_failed` code so the operator sees "disk write failed,
   // your changes are NOT saved" instead of the generic connection message.
   const [saveErrorKind, setSaveErrorKind] = useState<'network' | 'persist' | null>(null);
+  // TRA-1555 — the server rejects a save for reasons that have nothing to do
+  // with connectivity (e.g. the TRA-532 promotion gate 422, or a 500 while the
+  // gate is evaluated). Those responses carry a concrete, actionable `error`
+  // string, but the footer used to collapse every non-persist failure into the
+  // misleading "check server connection" — sending users who just saw the
+  // connection test go green down the wrong path. Capture the server's message
+  // so the footer can show *why* the save was refused.
+  const [saveErrorMessage, setSaveErrorMessage] = useState<string | null>(null);
   const [resetPending, setResetPending] = useState(false);
   const [isAdmin, setIsAdmin] = useState(false);
   const [coinbaseTestStatus, setCoinbaseTestStatus] = useState<'idle' | 'testing'>('idle');
@@ -1295,6 +1303,7 @@ export default function SettingsPage({ token, httpUrl, context, onModeChange, on
     e.preventDefault();
     setSaveStatus('saving');
     setSaveErrorKind(null);
+    setSaveErrorMessage(null);
     try {
       const r = await fetch(`${httpUrl}/api/account/settings`, {
         method: 'PUT',
@@ -1326,8 +1335,21 @@ export default function SettingsPage({ token, httpUrl, context, onModeChange, on
         // TRA-511 — discriminate the new `settings_persist_failed` code from
         // a generic non-OK so the footer can tell the user their changes did
         // NOT make it to disk, rather than the older ambiguous "Save failed".
-        const errData = await r.json().catch(() => null) as { code?: string } | null;
+        const errData = await r.json().catch(() => null) as { code?: string; error?: string } | null;
         setSaveErrorKind(errData?.code === 'settings_persist_failed' ? 'persist' : 'network');
+        // TRA-1555 — the server DID respond (so the connection is fine); surface
+        // its concrete reason instead of blaming the connection. Covers the
+        // promotion-gate 422 (`promotion_gate_blocked`), the gate-evaluation 500
+        // (`promotion_gate_error`), and any other structured `{ error }` body.
+        // If the server returned a bare status with no JSON body (e.g. an
+        // uncaught-exception 500), still report it as a *server* rejection with
+        // its HTTP status rather than blaming the network — the connection is
+        // demonstrably fine (the Test-connection calls just succeeded).
+        const serverMessage =
+          typeof errData?.error === 'string' && errData.error.trim().length > 0
+            ? errData.error.trim()
+            : `the server rejected the save (HTTP ${r.status}). Please retry; if it persists, contact support.`;
+        setSaveErrorMessage(serverMessage);
         setSaveStatus('error');
       }
     } catch {
@@ -2378,7 +2400,13 @@ export default function SettingsPage({ token, httpUrl, context, onModeChange, on
           )}
           {saveStatus === 'error' && saveErrorKind !== 'persist' && (
             <span className="save-error" data-testid="settings-save-state">
-              Save failed — check server connection.
+              {/* TRA-1555 — when the server responded with a concrete reason
+                  (e.g. the promotion gate blocked the live transition), show it
+                  verbatim. Only fall back to the connection message for a true
+                  network/parse failure where we never got a structured body. */}
+              {saveErrorMessage
+                ? `Save failed — ${saveErrorMessage}`
+                : 'Save failed — check server connection.'}
             </span>
           )}
           {saveStatus !== 'saving' && saveStatus !== 'error' && savedAtLabel && hasUnsavedChanges && (
