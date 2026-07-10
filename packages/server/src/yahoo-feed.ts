@@ -526,15 +526,16 @@ function nextMinuteBoundary(): number {
 
 // TRA-739: cold (non-active-interest) discovery symbols are cached this long
 // instead of just to the next minute boundary. The cold scan that pulls them
-// already runs on a ~5-min cadence, so a few-minute-stale bar set introduces no
-// discovery-latency regression — but it caps the PROCESS-GLOBAL Tradier
-// bar-pull rate. The per-minute cache (TRA-552/554) already deduped to ~1 pull
-// per symbol per minute, but with ~100 engines each cold-scanning + pulling
-// active-interest on unsynchronized phases, the union re-covered nearly the
-// whole ~364-symbol watchlist every minute (~265-320 req/min observed, above
-// the <200 budget). Pulling cold symbols once per ~5 min instead drops their
-// contribution to ~watchlist/5 ≈ 73/min, leaving headroom for the (smaller)
-// minute-fresh active-interest set.
+// runs on a ~5-min shard cadence, and the TTL is now held just below it
+// (TRA-1539) so a cold symbol re-pulls once per shard visit — a few-minute-stale
+// bar set introduces no discovery-latency regression while capping the
+// PROCESS-GLOBAL Tradier bar-pull rate. The per-minute cache (TRA-552/554)
+// already deduped to ~1 pull per symbol per minute, but with ~100 engines each
+// cold-scanning + pulling active-interest on unsynchronized phases, the union
+// re-covered nearly the whole ~364-symbol watchlist every minute (~265-320
+// req/min observed, above the <200 budget). Pulling cold symbols once per ~5 min
+// instead drops their contribution to ~watchlist/5 ≈ 73/min, leaving headroom
+// for the (smaller) minute-fresh active-interest set.
 //
 // TRA-739 follow-up: active-interest symbols previously used nextMinuteBoundary()
 // as their TTL, which can be just seconds away when a pull lands near a minute
@@ -550,15 +551,35 @@ function nextMinuteBoundary(): number {
 // symbols and cold ~364 symbols:
 //   hot:  served from 7-min MTF cache between MTF cycles --> 0/min
 //   MTF burst (every 10 min): ~100 unique symbol fetches / 60s = ~100/min
-//   cold: 364 / (COLD_BAR_CACHE_MS/60000) = 364/10 ≈ 36/min
-//   bar total ≈ 136/min  +  quote ~5 = ~141/min  → comfortable under 200.
+//   cold: 364 / (COLD_BAR_CACHE_MS/60000) ≈ 364/4 ≈ 73/min (shard-bound to ~5 min)
+//   bar total ≈ 173/min  +  quote ~5 = ~178/min  → under the 200 budget.
 // 90s hot TTL is safe because minute bars are immutable within their minute;
 // a signal engine ticking at 30s only misses a new bar for up to 60s after
 // it's appended -- acceptable discovery latency vs 2.5x budget overrun.
-// 10-min cold TTL matches the actual cold-scan discovery cadence (5-min shard
-// cycle × 2 for safety margin) so no discovery regression.
+//
+// TRA-1539: the cold TTL was 10 min ("5-min shard cycle × 2 for safety margin"),
+// but that "margin" made cold bars STALER, not safer. The cold-scan shard in the
+// signal engine visits each cold symbol every ~5 min (COLD_SCAN_INTERVAL=10 ×
+// 30s tick), yet a 10-min TTL let `canReuseCachedTradierBars` serve the cached
+// entry on the intervening shard visit — so a cold symbol's cached minute bars
+// only actually ADVANCED every ~10 min. Combined with the ~1-2 min lag of the
+// newest completed bar, a cold symbol's freshest cached bar routinely aged to
+// ~660-720s, brushing/crossing the equity feed-freshness gate
+// (MAX_CANDLE_AGE_MS = 720s in feed-freshness.ts). On a quiet tape the whole
+// tradable universe was cold at once (no open position / recent signal → nothing
+// marked active-interest), so their refresh windows drifted into alignment and
+// the risk-autopilot's "no active symbol is fresh" governor tripped a feed_stale
+// halt — silently skipping every equity/options entry until the next real pull.
+// (The deeper >900s spikes that tipped the whole set over at once were tick GAPS
+// from event-loop starvation — owned separately by TRA-1463/TRA-1508 — not a
+// provider outage: zero Tradier/Yahoo/Twelve-Data breaker trips in the incident
+// window.) Fix: hold the cold TTL BELOW the ~5-min shard cadence so every shard
+// visit forces a fresh upstream pull and the cache advances every ~5 min. Max
+// cold bar age is then ~shard cadence (300s) + newest-bar lag (~120s) + tick
+// jitter ≈ 450s — a ~270s margin under the 720s gate. Cold volume rises from
+// ~36/min to ~73/min, still under the <200/min budget (see math above).
 const HOT_BAR_CACHE_MS = 90_000;
-const COLD_BAR_CACHE_MS = 10 * 60_000;
+const COLD_BAR_CACHE_MS = 4 * 60_000;
 // TRA-739: the MTF technical snapshot fires every 5 min and requests count=2000
 // bars. Those pulls miss the 90s hot cache (expired long before the next 5-min
 // cycle) and re-hit Tradier for all active-interest symbols every 5 min, causing

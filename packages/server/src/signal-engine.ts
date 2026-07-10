@@ -95,7 +95,7 @@ import {
   MIN_RISK_THROTTLE,
 } from './risk-autopilot.js';
 import type { Regime } from '@trading-app/engine';
-import { fetchMinuteBars, fetchDailyCandles, fetchTradierDailyCandles, fetchQuotes, fetchStocksNews, isYahooBreakerOpen, setActiveInterestSymbols, setTradierStocksFeedClient } from './yahoo-feed.js';
+import { fetchMinuteBars, fetchMinuteBarsWithSource, fetchDailyCandles, fetchTradierDailyCandles, fetchQuotes, fetchStocksNews, isYahooBreakerOpen, setActiveInterestSymbols, setTradierStocksFeedClient } from './yahoo-feed.js';
 import { fetchStockTwitsStream, fetchStockTwitsUserStream, getCuratedStockTwitsAccounts } from './stocktwits-feed.js';
 import { evaluateFeedFreshness } from './feed-freshness.js';
 import { PaperAccount, type EquityExitRiskInput } from './paper-account.js';
@@ -4985,8 +4985,28 @@ export class SignalEngine {
   }
 
   private async refreshCandles(symbol: string): Promise<void> {
-    const bars = await fetchMinuteBars(symbol, 80);
-    if (bars.length > 0) this.candleCache.set(symbol, bars);
+    const { bars, source, cached } = await fetchMinuteBarsWithSource(symbol, 80);
+    if (bars.length === 0) return;
+    this.candleCache.set(symbol, bars);
+    // TRA-1539 — attribute residual staleness at the source. A feed OUTAGE trips a
+    // provider breaker and yields 0 bars (handled above: cache retains its prior,
+    // aging set). When we DO get bars but the freshest one is already old, the feed
+    // is up and the staleness is a CADENCE gap — the pull was served from cache
+    // (`cached`) or the symbol's last completed minute printed a while ago. Naming
+    // source+cached+age here (RTH only, above a soft threshold below the 720s gate)
+    // means the next feed_stale halt is explained without re-instrumenting.
+    const newest = bars[bars.length - 1]?.timestamp ?? 0;
+    const ageMs = Date.now() - newest;
+    const COLD_STALE_WARN_MS = 10 * 60_000; // 600s — within ~120s of the 720s gate
+    if (ageMs > COLD_STALE_WARN_MS && isStockMarketOpen()) {
+      log.warn('TRA-1539: cached minute bars near freshness gate', {
+        component: 'feed-freshness',
+        symbol,
+        source,
+        cached: cached ?? false,
+        ageSec: Math.round(ageMs / 1000),
+      });
+    }
   }
 
   /**
