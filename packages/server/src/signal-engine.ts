@@ -74,8 +74,10 @@ import {
 } from './ignition-quality-gate.js';
 import {
   recordDirectionalOpen,
+  anySleeveOpensFor,
   directionalOpensFor,
   recordDirectionalGateReject,
+  type OpenSleeve,
 } from './directional-open-ledger.js';
 import { isMultiLegOpenPaused } from './multileg-open-pause-flag.js';
 import { isMultiLegExitEnabled } from './multileg-exit-flag.js';
@@ -3650,7 +3652,7 @@ export class SignalEngine {
    * unconditionally (independent of the flag) so arming the brake mid-session sees
    * an honest count; the count is cheap and self-resets on the ET-day roll.
    */
-  private recordChurnOpen(symbol: string, now = Date.now()): void {
+  private recordChurnOpen(symbol: string, sleeve: OpenSleeve = 'other', now = Date.now()): void {
     if (this.mode === 'live') return;
     const etDay = etDateString(new Date(now));
     const rec = this.churnOpensToday.get(symbol);
@@ -3666,8 +3668,10 @@ export class SignalEngine {
     // 0 → cap never bit). This JSONL survives the reboot, and `opensTodayFor` /
     // `churnOpenCapVerdict` read the MAX of the two so the cap sees the real
     // same-ET-day total after a mid-session restart. Demo-only (this method no-ops
-    // on the live path).
-    recordDirectionalOpen(symbol, etDay, now);
+    // on the live path). TRA-1564 B2 — the `sleeve` tag scopes the record: only
+    // `directional` opens feed the directional quality-gate cap read + health view;
+    // every sleeve feeds the cross-sleeve churn count.
+    recordDirectionalOpen(symbol, etDay, sleeve, now);
   }
 
   /**
@@ -3686,8 +3690,25 @@ export class SignalEngine {
     // 0 but the durable count holds the real same-day total, so the cap keeps biting
     // across restarts. The durable ledger never over-counts (one line per recorded
     // open), so the max can only ever RAISE the count toward the truth, never below.
-    const durable = directionalOpensFor(symbol, etDay);
+    // TRA-1564 B2 — this is the CROSS-SLEEVE churn count (any sleeve), matching the
+    // TRA-1408 churn brake's cross-sleeve intent; the directional quality-gate cap
+    // reads the directional-only count via {@link directionalOpensTodayFor} instead.
+    const durable = anySleeveOpensFor(symbol, etDay);
     return Math.max(inMemory, durable);
+  }
+
+  /**
+   * TRA-1564 B2 — DIRECTIONAL-ONLY opens already recorded for `symbol` this ET
+   * session, the reboot-durable count the TRA-1476 directional quality-gate cap
+   * consults. Unlike {@link opensTodayFor} (which is cross-sleeve for the churn
+   * brake) this counts ONLY opens tagged `directional`, so an equity-swing / RV /
+   * OTM open on the same name never counts against the "≤ N directional opens/name"
+   * cap. Read straight from the durable ledger (it is bumped live on each directional
+   * open AND hydrated on boot, so it is already max(in-memory, durable)). Pure read;
+   * 0 when the name has no directional open today.
+   */
+  private directionalOpensTodayFor(symbol: string, now = Date.now()): number {
+    return directionalOpensFor(symbol, etDateString(new Date(now)));
   }
 
   /**
@@ -5513,8 +5534,8 @@ export class SignalEngine {
         // can never bite a path that isn't running. Rejects here — BEFORE the
         // paper open — with a surfaced reason, exactly like the RV greeks/churn
         // gates. `spot` is the underlier; avg $-volume comes from the same 5m
-        // shadow series `series` the trend read above; opensToday shares the
-        // TRA-1408 per-name counter (recorded on a successful open below).
+        // shadow series `series` the trend read above; opensToday is the
+        // DIRECTIONAL-only per-name count (recorded on a successful open below).
         const dqEnv = this.resolveDemoFlagEnv();
         if (isDirectionalQualityGateEnabled(dqEnv)) {
           // TRA-1486 D1 — pass the real-bar SAMPLE COUNT alongside the $-volume mean
@@ -5526,7 +5547,13 @@ export class SignalEngine {
               spot,
               avgDollarVolume: dv.avg,
               dollarVolumeSamples: dv.samples,
-              opensToday: this.opensTodayFor(sym, asOf),
+              // TRA-1564 B2 — DIRECTIONAL-only count. The prior read
+              // (`opensTodayFor`) was the CROSS-SLEEVE churn count, so an
+              // equity-swing / RV / OTM open on the same name counted against this
+              // "≤ N directional opens/name" cap — more restrictive than the AC and
+              // un-certifiable through the health view. This reads only opens tagged
+              // `directional`.
+              opensToday: this.directionalOpensTodayFor(sym, asOf),
             },
             resolveDirectionalQualityThresholds(dqEnv),
           );
@@ -5536,8 +5563,12 @@ export class SignalEngine {
             });
             // TRA-1486 — count the reject by code so `/api/health/directional-quality-gate`
             // shows the gate enforcing (a future grade reads it instead of inferring
-            // from the desk report).
-            if (verdict.code !== 'ok') recordDirectionalGateReject(verdict.code, asOf);
+            // from the desk report). TRA-1564 B1 — keyed by ET day + DURABLE, so the
+            // post-close re-grade fire still reads the RTH session's rejects after the
+            // daily close reboot (the in-memory since-boot counters were already `{}`).
+            if (verdict.code !== 'ok') {
+              recordDirectionalGateReject(verdict.code, etDateString(new Date(asOf)), asOf);
+            }
             continue;
           }
         }
@@ -5666,7 +5697,10 @@ export class SignalEngine {
         // per-name same-session counter so BOTH the TRA-1476 per-name cap above
         // and the TRA-1408 churn brake at the other open chokepoints see the
         // directional stacking that previously escaped them (no-op on live).
-        this.recordChurnOpen(sym, asOf);
+        // TRA-1564 B2 — tag the sleeve `directional` so this open feeds the
+        // directional-only cap read + health view (the other four chokepoints record
+        // as `other` and count toward the cross-sleeve churn brake only).
+        this.recordChurnOpen(sym, 'directional', asOf);
 
         this.emitOptionFillAlert(opened);
         signal.mode = this.mode;

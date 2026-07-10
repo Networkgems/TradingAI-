@@ -2196,9 +2196,12 @@ async function runHourlyCryptoRegimeTsmom(): Promise<void> {
 // window on read so it stays tiny.
 {
   const h = hydrateDirectionalOpensFromDisk(DATA_DIR);
-  if (h.records > 0) {
-    log.info('directional per-name open ledger hydrated (TRA-1486)', {
+  if (h.records > 0 || h.rejects > 0) {
+    // TRA-1564 B1 — `rejects` are now durable too, so a post-close re-grade reads the
+    // RTH session's gate rejects after the daily close reboot.
+    log.info('directional per-name open ledger hydrated (TRA-1486/TRA-1564)', {
       records: h.records,
+      rejects: h.rejects,
       days: h.days,
     });
   }

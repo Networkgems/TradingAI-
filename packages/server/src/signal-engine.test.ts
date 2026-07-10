@@ -5432,7 +5432,7 @@ describe('SignalEngine — churn + same-day-loss brake (TRA-1408)', () => {
   type ChurnInternals = {
     mode: 'demo' | 'live';
     churnOpenCapVerdict: (symbol: string, now?: number) => { blocked: boolean; count: number; cap: number };
-    recordChurnOpen: (symbol: string, now?: number) => void;
+    recordChurnOpen: (symbol: string, sleeve?: 'directional' | 'other', now?: number) => void;
     isSameDayLoser: (realizedToday: number, unrealized: number) => boolean;
     realizedEquityPnlToday: (symbol: string, etDay: string) => number;
     allClosedPositions: Array<{ symbol: string; pnl?: number; closedAt?: number; mode?: 'demo' | 'live' }>;

@@ -1118,13 +1118,17 @@ export function registerLiveHealthRoutes(app: Express, deps: LiveHealthDeps): vo
   //   • `armed` + `thresholds` resolved through the SAME effective env the engine
   //     consults (process.env layered with the DATA_DIR demo-flags.json overlay, file
   //     wins) — answers "is the gate actually LIVE on the running process?";
-  //   • `openCountsBySymbol` — the DURABLE (reboot-survivable) per-name open counts
-  //     for the CURRENT ET day that the per-name cap consults, so a grader can verify
-  //     "≤ cap opens/name/ET-day for every name" directly (TRA-1486 D2 fix);
-  //   • `opensRejectedByCode` — since-boot rejects split by verdict code
-  //     (min_price / insufficient_liquidity_samples / min_dollar_volume /
+  //   • `openCountsBySymbol` — the DURABLE (reboot-survivable), DIRECTIONAL-ONLY
+  //     per-name open counts for the CURRENT ET day that the per-name cap consults,
+  //     so a grader can verify "≤ cap DIRECTIONAL opens/name/ET-day for every name"
+  //     directly (TRA-1486 D2; scoped to the directional sleeve by TRA-1564 B2 — a
+  //     count here is no longer inflated by equity-swing / RV / OTM opens on the name);
+  //   • `opensRejectedByCode` — DURABLE rejects for the CURRENT ET day split by verdict
+  //     code (min_price / insufficient_liquidity_samples / min_dollar_volume /
   //     per_name_cap), the direct evidence each floor is biting (incl. the D1 warmup
-  //     fail-closed).
+  //     fail-closed). TRA-1564 B1 made these JSONL-backed + ET-day-keyed so a
+  //     post-close re-grade fire reads the RTH session's rejects after the daily
+  //     close reboot (they were in-memory since-boot before, already `{}` by then).
   // DEMO-ONLY by construction: the engine records here only on the demo directional
   // chokepoint. No balances/PII — just flag, thresholds, symbol counts, reject codes.
   app.get('/api/health/directional-quality-gate', (_req, res) => {
@@ -1144,7 +1148,7 @@ export function registerLiveHealthRoutes(app: Express, deps: LiveHealthDeps): vo
       etDay,
       thresholds,
       note: armed
-        ? `ARMED (demo-only): rejects a demo directional open below $${thresholds.minUnderlyingPrice} spot / $${thresholds.minAvgDollarVolume} avg $-vol, fails-closed under ${thresholds.minDollarVolumeSamples} real $-vol samples (warmup), and caps ${thresholds.maxOpensPerName} opens/name/ET-day (reboot-durable). Live options path unchanged.`
+        ? `ARMED (demo-only): rejects a demo directional open below $${thresholds.minUnderlyingPrice} spot / $${thresholds.minAvgDollarVolume} avg $-vol, fails-closed under ${thresholds.minDollarVolumeSamples} real $-vol samples (warmup), and caps ${thresholds.maxOpensPerName} DIRECTIONAL opens/name/ET-day (reboot-durable; openCountsBySymbol is directional-only). Live options path unchanged.`
         : `DISARMED: set ${OPTION_DIRECTIONAL_QUALITY_GATE_FLAG}=1 (render.yaml env or DATA_DIR/demo-flags.json) with the directional path enabled to arm on the demo book.`,
       ...summarizeDirectionalGate(etDay),
     });
