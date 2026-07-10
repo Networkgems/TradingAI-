@@ -239,7 +239,9 @@ export function evaluateSma200(symbol: string, candles: Candle[]): Sma200Evaluat
         rsi: rsi14,
         distAtr,
         trendQuality: true,
-        label: 'continuation — trend was already up',
+        // TRA-1542 — plain ASCII hyphen: an em-dash in signal.context
+        // mis-decoded downstream and rendered as mojibake.
+        label: 'continuation - trend was already up',
         timestamp: today.timestamp,
       });
     }
@@ -289,8 +291,10 @@ export function evaluateSma200(symbol: string, candles: Candle[]): Sma200Evaluat
       distAtr,
       trendQuality,
       goldenCross,
+      // TRA-1542 — ASCII hyphen (see note above): avoids em-dash mojibake
+      // when signal.context is serialized/rendered downstream.
       label: goldenCross
-        ? 'trend-change reclaim — golden cross confirmed'
+        ? 'trend-change reclaim - golden cross confirmed'
         : 'trend-change reclaim',
       timestamp: today.timestamp,
     });
