@@ -9,7 +9,8 @@
 import { timingSafeEqual } from 'node:crypto';
 import type { Express, Response, RequestHandler } from 'express';
 import { findMissingLiveCredentials, type AccountSettings } from '@trading-app/shared';
-import type { EngineState, LiveEquityAcceptance } from '../signal-engine.js';
+import type { EngineState, LiveEquityAcceptance, LiveSkipCategory } from '../signal-engine.js';
+import { LIVE_SKIP_CATEGORIES, emptyLiveSkipBreakdown } from '../signal-engine.js';
 import { resolveBuildInfo } from './build-info.js';
 import { summarizeLiveHealth, summarizeFeed } from './live-health.js';
 import { checkStaleState } from './alerts.js';
@@ -183,6 +184,14 @@ export interface LiveEquityAcceptanceReport {
     liveEquityMirrorsWithOrderId: number;
     liveSkipReasons: number;
   };
+  /**
+   * TRA-1573 — fleet-summed breakdown of `liveSkipReasons` by fixed category
+   * (see {@link LiveSkipCategory}). Distinguishes a benign by-design gate
+   * (`display_only_capital_gate` — no strategy in the TRA-817 manifest) from a
+   * real wiring gap (`client_not_configured`) on the unauth surface. Redacted:
+   * only constant category keys + counts, never a raw reason string.
+   */
+  liveSkipReasonBreakdown: Record<LiveSkipCategory, number>;
   /** Most recent live-equity mirror open across the fleet (ISO), or null. */
   lastLiveEquityFillAt: string | null;
   /**
@@ -221,7 +230,11 @@ export function aggregateLiveEquityAcceptance(
   const sum = (pick: (s: LiveEquityAcceptance) => number): number =>
     snapshots.reduce((acc, s) => acc + pick(s), 0);
   let lastFillMs = 0;
+  const liveSkipReasonBreakdown = emptyLiveSkipBreakdown();
   for (const s of snapshots) {
+    for (const c of LIVE_SKIP_CATEGORIES) {
+      liveSkipReasonBreakdown[c] += s.liveSkipReasonCategories?.[c] ?? 0;
+    }
     if (!s.lastLiveEquityFillAt) continue;
     const ms = Date.parse(s.lastLiveEquityFillAt);
     if (Number.isFinite(ms) && ms > lastFillMs) lastFillMs = ms;
@@ -243,6 +256,7 @@ export function aggregateLiveEquityAcceptance(
       liveEquityMirrorsWithOrderId: sum(s => s.liveEquityMirrorsWithOrderId),
       liveSkipReasons: sum(s => s.liveSkipReasonCount),
     },
+    liveSkipReasonBreakdown,
     lastLiveEquityFillAt: lastFillMs > 0 ? new Date(lastFillMs).toISOString() : null,
     serviceEnv: {
       tradierEnvProduction: (env['TRADIER_ENV'] ?? '').trim() === 'production',

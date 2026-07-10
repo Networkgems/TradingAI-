@@ -237,6 +237,69 @@ export interface EngineState {
  *   3. `liveEquityMirrorsWithOrderId` — engine mirrored the Tradier fill.
  *   4. `liveSkipReasonCount`         — broker-side rejects surfaced (not dropped).
  */
+/**
+ * TRA-1573 — the fixed, leak-free vocabulary a raw `liveSkipReason` is mapped
+ * to before it reaches the unauthenticated `/api/health/live-equity` probe.
+ * Only these constant labels are ever emitted — never the raw reason string
+ * (which can embed a symbol or `(n/m)` count). Ordered coarse -> specific.
+ */
+export type LiveSkipCategory =
+  /** Strategy is not in the TRA-817 capital-gate manifest — display-only by design. */
+  | 'display_only_capital_gate'
+  /** Live Tradier equity client is not wired (creds/toggle/mode) — a real wiring gap. */
+  | 'client_not_configured'
+  /** Agent live-routing gate not cleared (board+CTO go-live) — expected pre-go-live. */
+  | 'live_routing_gated'
+  /** Per-session daily equity trade cap reached — benign throttle. */
+  | 'daily_limit_reached'
+  /** OTM options live mirror intentionally unwired (demo/paper only). */
+  | 'otm_mirror_not_wired'
+  /** No quote / dedup / risk-manager gate declined the open — benign. */
+  | 'risk_or_quote_gate'
+  /** Broker (Tradier) rejected/cancelled the placement — a real broker-side reject. */
+  | 'broker_reject'
+  /** Anything not matched above. */
+  | 'other';
+
+/**
+ * TRA-1573 — map a raw `liveSkipReason` to a fixed {@link LiveSkipCategory}.
+ * Pure, allocation-light, and provably leak-free: the return value is drawn
+ * only from the constant union, so no symbol/price/count from the input can
+ * ever reach the redacted health surface. Match order is specific-first.
+ */
+export function categorizeLiveSkipReason(reason: string): LiveSkipCategory {
+  const r = reason.toLowerCase();
+  if (r.includes('capital-gate manifest') || r.includes('display-only')) return 'display_only_capital_gate';
+  if (r.includes('client not configured')) return 'client_not_configured';
+  if (r.includes('live routing disabled') || r.includes('go-live gate')) return 'live_routing_gated';
+  if (r.includes('daily equity limit')) return 'daily_limit_reached';
+  if (r.includes('otm live broker mirror not wired')) return 'otm_mirror_not_wired';
+  if (r.includes('reject') || r.includes('cancel')) return 'broker_reject';
+  if (r.includes('no quote') || r.includes('dedup') || r.includes('risk gate') || r.includes('not opened')) {
+    return 'risk_or_quote_gate';
+  }
+  return 'other';
+}
+
+/** TRA-1573 — the category union as a runtime array, for zero-init breakdown maps. */
+export const LIVE_SKIP_CATEGORIES: readonly LiveSkipCategory[] = [
+  'display_only_capital_gate',
+  'client_not_configured',
+  'live_routing_gated',
+  'daily_limit_reached',
+  'otm_mirror_not_wired',
+  'risk_or_quote_gate',
+  'broker_reject',
+  'other',
+];
+
+/** TRA-1573 — a fresh all-zero category breakdown (stable key order for JSON). */
+export function emptyLiveSkipBreakdown(): Record<LiveSkipCategory, number> {
+  const out = {} as Record<LiveSkipCategory, number>;
+  for (const c of LIVE_SKIP_CATEGORIES) out[c] = 0;
+  return out;
+}
+
 export interface LiveEquityAcceptance {
   /** Active engine mode at read time. */
   mode: 'demo' | 'live';
@@ -256,6 +319,14 @@ export interface LiveEquityAcceptance {
   liveEquityMirrorsWithOrderId: number;
   /** Count of recent live signals carrying a broker-side `liveSkipReason` (line 4). */
   liveSkipReasonCount: number;
+  /**
+   * TRA-1573 — redacted breakdown of WHY live signals skipped, keyed by a fixed
+   * category vocabulary (never the raw reason string, which can carry a symbol
+   * or a count). Lets the unauth health probe distinguish a benign gate
+   * (`display_only_capital_gate` — strategy not in the TRA-817 manifest) from a
+   * real wiring gap (`client_not_configured`) without reading source or logs.
+   */
+  liveSkipReasonCategories: Record<LiveSkipCategory, number>;
   /** True once a mirror exists with both OCO legs AND a captured order id. */
   firstLiveEquityFillConfirmed: boolean;
   /** ISO time of the most recent live-equity mirror open, or null. Coarse — no trade detail. */
@@ -9727,9 +9798,13 @@ export class SignalEngine {
     // Entry-leg order id captured — proves Tradier accepted the bracket.
     const mirrorsWithOrderId = mirrors.filter(p => this.liveEquityOrderIds.has(p.id)).length;
     const liveSignals = this.recentSignals.filter(s => s.mode === 'live');
-    const liveSkipReasonCount = liveSignals.filter(
-      s => typeof s.liveSkipReason === 'string' && s.liveSkipReason.length > 0,
-    ).length;
+    const liveSkipReasonCategories = emptyLiveSkipBreakdown();
+    let liveSkipReasonCount = 0;
+    for (const s of liveSignals) {
+      if (typeof s.liveSkipReason !== 'string' || s.liveSkipReason.length === 0) continue;
+      liveSkipReasonCount++;
+      liveSkipReasonCategories[categorizeLiveSkipReason(s.liveSkipReason)]++;
+    }
     let lastOpenedAt = 0;
     for (const p of mirrors) if (p.openedAt > lastOpenedAt) lastOpenedAt = p.openedAt;
     return {
@@ -9742,6 +9817,7 @@ export class SignalEngine {
       liveEquityBracketsWithBothLegs: bracketsWithBothLegs,
       liveEquityMirrorsWithOrderId: mirrorsWithOrderId,
       liveSkipReasonCount,
+      liveSkipReasonCategories,
       firstLiveEquityFillConfirmed: bracketsWithBothLegs > 0 && mirrorsWithOrderId > 0,
       lastLiveEquityFillAt: lastOpenedAt > 0 ? new Date(lastOpenedAt).toISOString() : null,
     };

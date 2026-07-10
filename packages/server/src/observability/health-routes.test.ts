@@ -34,6 +34,7 @@ import {
 import { checkStaleState } from './alerts.js';
 import { getRecentAlerts, __resetAlertsForTest } from './alerts.js';
 import type { EngineState, LiveEquityAcceptance } from '../signal-engine.js';
+import { categorizeLiveSkipReason, emptyLiveSkipBreakdown } from '../signal-engine.js';
 import type { AccountSettings } from '@trading-app/shared';
 
 const NOW = 2_000_000_000;
@@ -159,6 +160,7 @@ describe('TRA-580 live-equity acceptance probe', () => {
       liveEquityBracketsWithBothLegs: 0,
       liveEquityMirrorsWithOrderId: 0,
       liveSkipReasonCount: 0,
+      liveSkipReasonCategories: emptyLiveSkipBreakdown(),
       firstLiveEquityFillConfirmed: false,
       lastLiveEquityFillAt: null,
       ...over,
@@ -210,6 +212,7 @@ describe('TRA-580 live-equity acceptance probe', () => {
         'liveEngineCount',
         'liveEquityClientConfigured',
         'liveEquityTradingEnabled',
+        'liveSkipReasonBreakdown',
         'ok',
         'productionEngineCount',
         'serviceEnv',
@@ -219,6 +222,54 @@ describe('TRA-580 live-equity acceptance probe', () => {
     );
     // serviceEnv carries booleans only — never a credential value.
     expect(Object.values(report.serviceEnv).every(v => typeof v === 'boolean')).toBe(true);
+  });
+
+  it('TRA-1573 — maps raw skip reasons to a fixed, leak-free category vocabulary', () => {
+    expect(
+      categorizeLiveSkipReason(
+        'display-only: sma200_pullback is not registered in the TRA-817 capital-gate manifest (no out-of-sample pass)',
+      ),
+    ).toBe('display_only_capital_gate');
+    expect(categorizeLiveSkipReason('Tradier equity client not configured')).toBe('client_not_configured');
+    expect(
+      categorizeLiveSkipReason('agent gating: live routing disabled until board+CTO go-live gate is cleared'),
+    ).toBe('live_routing_gated');
+    expect(categorizeLiveSkipReason('daily equity limit reached (3/3)')).toBe('daily_limit_reached');
+    expect(categorizeLiveSkipReason('OTM live broker mirror not wired (demo/paper only)')).toBe('otm_mirror_not_wired');
+    expect(categorizeLiveSkipReason('AAPL not opened (no quote / dedup / risk gate)')).toBe('risk_or_quote_gate');
+    expect(categorizeLiveSkipReason('Tradier rejected the bracket order')).toBe('broker_reject');
+    expect(categorizeLiveSkipReason('some unrecognized future reason')).toBe('other');
+  });
+
+  it('TRA-1573 — fleet breakdown sums per-engine skip categories and stays redacted', () => {
+    const report = aggregateLiveEquityAcceptance(
+      [
+        snap({
+          liveSignalCount: 30,
+          liveSkipReasonCount: 30,
+          liveSkipReasonCategories: { ...emptyLiveSkipBreakdown(), display_only_capital_gate: 30 },
+        }),
+        snap({
+          liveSignalCount: 9,
+          liveSkipReasonCount: 9,
+          liveSkipReasonCategories: {
+            ...emptyLiveSkipBreakdown(),
+            display_only_capital_gate: 8,
+            risk_or_quote_gate: 1,
+          },
+        }),
+      ],
+      NOW,
+    );
+    // The by-design capital gate dominates — the 0-fills is NOT a wiring gap.
+    expect(report.liveSkipReasonBreakdown.display_only_capital_gate).toBe(38);
+    expect(report.liveSkipReasonBreakdown.risk_or_quote_gate).toBe(1);
+    expect(report.liveSkipReasonBreakdown.client_not_configured).toBe(0);
+    // Sum of the breakdown equals the flat skip count — no signals lost.
+    const total = Object.values(report.liveSkipReasonBreakdown).reduce((a, b) => a + b, 0);
+    expect(total).toBe(report.totals.liveSkipReasons);
+    // Redaction: every key is a constant category label, every value a number.
+    expect(Object.values(report.liveSkipReasonBreakdown).every(v => typeof v === 'number')).toBe(true);
   });
 
   it('TRA-715 — serviceEnv reflects injected env presence as booleans only', () => {
