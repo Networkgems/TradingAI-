@@ -171,8 +171,33 @@ export class PnlTracker {
       ...this.snapshots.map(s => s.closingEquity),
     );
 
+    // TRA-1557 — all-time P&L must reconcile with the booked daily-snapshot
+    // ledger, NOT the raw equity mark. `currentEquity - initialEquity` silently
+    // absorbs "un-booked equity re-anchors": when the server is down across a
+    // day boundary (the desktop is routinely closed overnight; a Render reboot
+    // does the same), `advanceDayIfNeeded()` / `syncOpeningEquity()` roll
+    // `openingEquity` forward to the current equity WITHOUT booking a snapshot
+    // for the elapsed day, so that equity delta never enters the daily ledger —
+    // yet it stays in `equity`, inflating the equity-mark all-time into a
+    // phantom gain that disagrees with the Calendar's realized track and with
+    // the weekly/monthly/yearly windows (which sum the booked ledger). On the
+    // admin demo book this surfaced as +$1,067 all-time vs a −$1,144 realized
+    // ledger — a ~$2,211 phantom.
+    //
+    // Derive all-time from the SAME booked ledger every other window uses, plus
+    // today's not-yet-booked running delta (`currentEquity - openingEquity`), so
+    // every P&L surface agrees. `dailyPnl` (the stock equity delta) — not
+    // `combinedPnl` — keeps the stock-only basis the equity-mark all-time always
+    // had (`totalEquity` excludes the separately-tracked options P&L), so this
+    // only removes the re-anchor leak and changes nothing on a continuously-run
+    // book: with every day booked, `openingEquity` telescopes to the last close
+    // and the sum collapses back to `currentEquity - initialEquity`.
+    const bookedStockPnl = this.snapshots.reduce((acc, s) => acc + s.dailyPnl, 0);
+    const todayRunning = currentEquity - this.state.openingEquity;
+    const allTimePnl = bookedStockPnl + todayRunning;
+
     return {
-      allTimePnl: currentEquity - this.initialEquity,
+      allTimePnl,
       weeklyPnl: sum(weekStart),
       monthlyPnl: sum(monthStart),
       yearlyPnl: sum(yearStart),
