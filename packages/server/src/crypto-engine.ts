@@ -139,6 +139,61 @@ const releaseCryptoTickSlot = (): void => {
   cryptoTickInFlight--;
 };
 
+// TRA-1565 — native-RSS relief for the residual bqb1 crash-loop (TRA-1463).
+// The confirmed forensic verdict (render.yaml MALLOC_ARENA_MAX note; watchdog
+// `externalMB`/`arrayBuffersMB` ≈ 4-9MB tiny vs RSS ratcheting to ~1.53GB) is
+// glibc arena fragmentation: the libuv threadpool + the crypto fan-out's
+// concurrent `fetch` bursts each grab per-thread arena blocks that glibc never
+// returns to the OS, so RSS ratchets to the arenas' peak high-water mark and
+// stays there — until a burst pushes it past the 1900MB watchdog / 2GB OOM line.
+// `MALLOC_ARENA_MAX=2` bounds the arena COUNT but not the fragmentation within
+// them, and did not hold the 2026-07-10 RTH soak (21 non-deploy restarts). This
+// relief is a pure-code lever on the two things the allocator tuning can't reach:
+//   (1) the request-driven full-sweep amplifier — every watchlist edit / scan
+//       fires a fire-and-forget full ~395-symbol `doTick`, so a burst of user
+//       edits multiplies the sweep rate (and its concurrent-fetch arena churn)
+//       far above the 60s timer cadence. When armed, `refresh()` coalesces those
+//       into a single debounced tick and broadcasts current state immediately, so
+//       the UI still updates without driving a fresh full sweep per request.
+//   (2) the daily-candle fan-out burst width — the loop dispatches CANDLE_BATCH
+//       (5) concurrent `fetch`es per batch; each concurrent fetch is a distinct
+//       arena grab. Narrowing the batch lowers the peak simultaneous native-buffer
+//       footprint, so the arena high-water mark settles lower.
+// Neither touches the TRA-1447 pacer rate/breaker, order routing, rates, or
+// capital — behaviour is identical except for refresh debounce + fetch pacing.
+//
+// Self-arming on Render (`RENDER` set) so it takes effect on bqb1 via the git-push
+// autoDeploy WITHOUT a blueprint env-sync (the TRA-1289/TRA-1481 gap that keeps
+// render.yaml `value:` additions dark). Explicit `CRYPTO_TICK_RSS_RELIEF=0/1`
+// always wins; OFF everywhere else ⇒ byte-identical local/test behaviour. Read at
+// call time so a flip lands without a restart.
+export const CRYPTO_TICK_RSS_RELIEF_FLAG = 'CRYPTO_TICK_RSS_RELIEF';
+export function isCryptoTickRssReliefEnabled(env: NodeJS.ProcessEnv = process.env): boolean {
+  const raw = env[CRYPTO_TICK_RSS_RELIEF_FLAG];
+  if (typeof raw === 'string' && raw.trim() !== '') {
+    return ['1', 'true', 'yes', 'on'].includes(raw.trim().toLowerCase());
+  }
+  return !!env.RENDER; // default: on in Render (bqb1), off elsewhere
+}
+
+// TRA-1565 — debounce window that collapses a burst of request-triggered
+// `refresh()` calls into a single coalesced tick. Env-tunable in [250, 30000]ms;
+// default 2500ms keeps the watchlist visibly fresh (state is broadcast
+// immediately regardless) while never firing more than one full sweep per window.
+function resolveCryptoRefreshDebounceMs(env: NodeJS.ProcessEnv = process.env): number {
+  const raw = Number(env['CRYPTO_REFRESH_DEBOUNCE_MS']);
+  return Number.isFinite(raw) && raw >= 250 && raw <= 30_000 ? Math.floor(raw) : 2_500;
+}
+
+// TRA-1565 — concurrent-fetch width for the per-tick daily-candle fan-out when
+// the relief is armed. Env-tunable in [1, 5]; default 2 narrows the CANDLE_BATCH
+// (5) arena-grab burst without serialising to 1 (which would ~2.5× the warm
+// wall-time). Unarmed keeps the legacy 5.
+function resolveCryptoDailyFetchConcurrency(env: NodeJS.ProcessEnv = process.env): number {
+  const raw = Number(env['CRYPTO_DAILY_FETCH_CONCURRENCY']);
+  return Number.isFinite(raw) && raw >= 1 && raw <= 5 ? Math.floor(raw) : 2;
+}
+
 // TRA-693 — shared across all CryptoSignalEngine instances (one per demo user).
 // Without sharing, each engine independently fetches the same daily candles on
 // every tick, saturating the shared AT pacer (150ms/req × 16 candles/tick × N
@@ -441,6 +496,10 @@ export class CryptoSignalEngine {
   // the watchdog bootGrace window so it doesn't stack on the fragile first
   // ticks). Held so `stop()` can cancel a still-pending kickoff at shutdown.
   private prefetchBootTimer: ReturnType<typeof setTimeout> | null = null;
+  // TRA-1565 — pending coalesced-refresh timer. When the RSS relief is armed a
+  // request-triggered `refresh()` schedules (at most) one debounced tick here
+  // instead of firing a full sweep per call. Held so `stop()` can cancel it.
+  private refreshDebounceTimer: ReturnType<typeof setTimeout> | null = null;
   /**
    * TRA-407 (C5) — the in-progress tick's promise (resolved when idle).
    * `drain()` awaits this so a graceful shutdown finishes the current tick.
@@ -1049,6 +1108,12 @@ export class CryptoSignalEngine {
       clearTimeout(this.prefetchBootTimer);
       this.prefetchBootTimer = null;
     }
+    // TRA-1565 — cancel a still-pending coalesced-refresh tick so a shutdown
+    // between a watchlist edit and the debounce firing leaves no dangling timer.
+    if (this.refreshDebounceTimer) {
+      clearTimeout(this.refreshDebounceTimer);
+      this.refreshDebounceTimer = null;
+    }
   }
 
   /**
@@ -1061,9 +1126,52 @@ export class CryptoSignalEngine {
   }
 
   refresh(): void {
+    // TRA-1565 — when the native-RSS relief is armed, never let a request handler
+    // drive a fresh full ~395-symbol sweep. A burst of watchlist edits / a scan
+    // would otherwise fire N fire-and-forget `doTick`s back-to-back, each a fresh
+    // concurrent-fetch arena-grab burst on top of the 60s timer cadence — the
+    // request-driven amplifier of the arena-fragmentation RSS ratchet (TRA-1463).
+    // Instead: broadcast the current state immediately (cheap, so the just-added/
+    // removed symbol shows at once) and coalesce the actual data sweep into a
+    // single debounced tick. Unarmed keeps the legacy fire-immediately behaviour.
+    if (isCryptoTickRssReliefEnabled()) {
+      this.broadcastCurrentState();
+      this.scheduleCoalescedRefresh();
+      return;
+    }
     this.tick().catch((err: unknown) => {
       log.error('refresh tick error', { reason: err instanceof Error ? err.message : String(err) });
     });
+  }
+
+  /**
+   * TRA-1565 — broadcast the current in-memory watchlist state to all handlers
+   * without running a data sweep. Used by the coalesced `refresh()` so a
+   * watchlist edit reflects in the UI immediately while the (bursty) fetch work
+   * is deferred to the next debounced tick. No-op before the first tick populates
+   * `symbolState`.
+   */
+  private broadcastCurrentState(): void {
+    if (this.symbolState.size === 0) return;
+    const state = this.buildState();
+    for (const h of this.handlers) h(state);
+  }
+
+  /**
+   * TRA-1565 — schedule (at most) one debounced full tick. A second `refresh()`
+   * inside the window is coalesced onto the pending timer, so N rapid edits
+   * collapse into a single sweep. `unref`'d so it never keeps the process alive;
+   * cancelled by {@link stop}.
+   */
+  private scheduleCoalescedRefresh(): void {
+    if (this.refreshDebounceTimer) return; // already pending — coalesced
+    this.refreshDebounceTimer = setTimeout(() => {
+      this.refreshDebounceTimer = null;
+      this.tick().catch((err: unknown) => {
+        log.error('coalesced refresh tick error', { reason: err instanceof Error ? err.message : String(err) });
+      });
+    }, resolveCryptoRefreshDebounceMs());
+    this.refreshDebounceTimer.unref?.();
   }
 
   getActiveSymbols(): string[] {
@@ -1583,7 +1691,12 @@ export class CryptoSignalEngine {
       .sort((a, b) => (sharedDailyFetchAt.get(a) ?? 0) - (sharedDailyFetchAt.get(b) ?? 0))
       .slice(0, DAILY_REFRESH_PER_TICK);
 
-    const CANDLE_BATCH = 5;
+    // TRA-1565 — each concurrent `fetch` in a batch is a distinct native-buffer
+    // arena grab; the batch width is therefore the peak simultaneous arena
+    // footprint of the candle fan-out. When the RSS relief is armed, narrow it
+    // (default 2) so the arena high-water mark settles lower without serialising
+    // to 1 (which would ~2.5× the warm wall-time). Unarmed keeps the legacy 5.
+    const CANDLE_BATCH = isCryptoTickRssReliefEnabled() ? resolveCryptoDailyFetchConcurrency() : 5;
     // Minute / 4H bars (intraday strategies only) still sweep the full active
     // set each tick — but only when an intraday strategy is enabled.
     if (needsIntraday) {

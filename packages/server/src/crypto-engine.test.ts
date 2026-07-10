@@ -19,7 +19,13 @@ import type {
 } from '@trading-app/engine';
 import type { TradeSignal } from '@trading-app/shared';
 
-import { CryptoSignalEngine, resolveLiveSingleSymbolShortCap, mergeCandles } from './crypto-engine.js';
+import {
+  CryptoSignalEngine,
+  resolveLiveSingleSymbolShortCap,
+  mergeCandles,
+  isCryptoTickRssReliefEnabled,
+  CRYPTO_TICK_RSS_RELIEF_FLAG,
+} from './crypto-engine.js';
 import type { Candle } from '@trading-app/shared';
 import {
   _seedCoinbaseProductCatalogForTests,
@@ -1129,5 +1135,96 @@ describe('mergeCandles — warm-cache eviction guard (TRA-593)', () => {
   it('returns the cache unchanged when the fresh fetch is empty', () => {
     const warm = series(80, 100);
     expect(mergeCandles(warm, [], 80)).toBe(warm);
+  });
+});
+
+// TRA-1565 — native-RSS relief: coalesce request-triggered `refresh()` sweeps so
+// a burst of watchlist edits / a scan cannot amplify the concurrent-fetch arena
+// churn that ratchets bqb1 RSS to the 1900MB self-restart ceiling (TRA-1463).
+describe('CryptoSignalEngine — TRA-1565 native-RSS relief (coalesced refresh)', () => {
+  interface RefreshInternals {
+    refresh: () => void;
+    stop: () => void;
+    tick: () => Promise<void>;
+    refreshDebounceTimer: ReturnType<typeof setTimeout> | null;
+  }
+
+  const armEnv = (value: string | undefined) => {
+    if (value === undefined) delete process.env[CRYPTO_TICK_RSS_RELIEF_FLAG];
+    else process.env[CRYPTO_TICK_RSS_RELIEF_FLAG] = value;
+  };
+
+  let savedFlag: string | undefined;
+  let savedRender: string | undefined;
+  beforeEach(() => {
+    savedFlag = process.env[CRYPTO_TICK_RSS_RELIEF_FLAG];
+    savedRender = process.env.RENDER;
+    vi.spyOn(console, 'log').mockImplementation(() => {});
+    vi.spyOn(console, 'warn').mockImplementation(() => {});
+  });
+  afterEach(() => {
+    armEnv(savedFlag);
+    if (savedRender === undefined) delete process.env.RENDER;
+    else process.env.RENDER = savedRender;
+    vi.useRealTimers();
+    vi.restoreAllMocks();
+  });
+
+  describe('isCryptoTickRssReliefEnabled precedence', () => {
+    it('explicit on/off always wins over the RENDER default', () => {
+      expect(isCryptoTickRssReliefEnabled({ CRYPTO_TICK_RSS_RELIEF: '1' })).toBe(true);
+      expect(isCryptoTickRssReliefEnabled({ CRYPTO_TICK_RSS_RELIEF: 'off', RENDER: 'true' })).toBe(false);
+      expect(isCryptoTickRssReliefEnabled({ CRYPTO_TICK_RSS_RELIEF: '0', RENDER: '1' })).toBe(false);
+    });
+    it('defaults ON under Render (self-arms across the env-sync gap) and OFF elsewhere', () => {
+      expect(isCryptoTickRssReliefEnabled({ RENDER: 'true' })).toBe(true);
+      expect(isCryptoTickRssReliefEnabled({})).toBe(false);
+    });
+  });
+
+  it('armed: a burst of refresh() calls fires at most ONE debounced tick, not one per call', () => {
+    armEnv('1');
+    vi.useFakeTimers();
+    const engine = new CryptoSignalEngine();
+    const internal = engine as unknown as RefreshInternals;
+    const tickSpy = vi.spyOn(internal, 'tick').mockResolvedValue(undefined);
+
+    internal.refresh();
+    internal.refresh();
+    internal.refresh();
+    // No immediate sweep — the request-driven amplifier is removed.
+    expect(tickSpy).not.toHaveBeenCalled();
+
+    vi.advanceTimersByTime(2_500);
+    // Exactly one sweep for the whole burst.
+    expect(tickSpy).toHaveBeenCalledTimes(1);
+    internal.stop();
+  });
+
+  it('unarmed: refresh() keeps the legacy fire-immediately behaviour (one sweep per call)', () => {
+    armEnv('0');
+    const engine = new CryptoSignalEngine();
+    const internal = engine as unknown as RefreshInternals;
+    const tickSpy = vi.spyOn(internal, 'tick').mockResolvedValue(undefined);
+
+    internal.refresh();
+    internal.refresh();
+    expect(tickSpy).toHaveBeenCalledTimes(2);
+  });
+
+  it('armed: stop() cancels a still-pending coalesced tick (no dangling sweep after shutdown)', () => {
+    armEnv('1');
+    vi.useFakeTimers();
+    const engine = new CryptoSignalEngine();
+    const internal = engine as unknown as RefreshInternals;
+    const tickSpy = vi.spyOn(internal, 'tick').mockResolvedValue(undefined);
+
+    internal.refresh();
+    expect(internal.refreshDebounceTimer).not.toBeNull();
+    internal.stop();
+    expect(internal.refreshDebounceTimer).toBeNull();
+
+    vi.advanceTimersByTime(10_000);
+    expect(tickSpy).not.toHaveBeenCalled();
   });
 });
