@@ -711,8 +711,11 @@ services:
       # rebuild roster. TRA-695 backtested DCA+swing and returned NO-GO on swing
       # (all 6 symbols) and beta-not-alpha on DCA, so on the TRA-693 gate (board
       # approval `cf17cc82`, 2026-06-07) the board adopted the recommended path:
-      # run `crypto_core` as a DCA-ONLY forward paper leg on {BTC-USD, SOL-USD}
-      # to accumulate genuine forward OOS evidence before any live capital. The
+      # run `crypto_core` as a DCA-ONLY forward paper leg to accumulate genuine
+      # forward OOS evidence before any live capital. TRA-1544 — this demo pin
+      # runs DCA across the FULL Coinbase-tradable USD universe (≈395 pairs,
+      # `symbolFilter: null`), NOT scoped to {BTC-USD, SOL-USD}; the {BTC,ETH,SOL}
+      # pin is LIVE-only (`crypto_core_live_majors`, TRA-1304). The
       # code default (`DEMO_PRESET_DEFAULT`) is already `crypto_core`; this key
       # makes the demo pin explicit and matches it so the deployed demo engine
       # actually runs the forward leg. It is paper money and reaches nothing live

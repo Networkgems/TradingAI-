@@ -608,10 +608,14 @@ export interface StrategyPreset {
  *                    engine only — the demo engine ignores it and runs
  *                    `DEMO_STRATEGY_PRESET` (default `crypto_core`), so the
  *                    live stand-down never blanks the paper-money demo board.
- *   • `crypto_core` — TRA-698 go-forward roster: DCA only, scoped to the
- *                     OOS-survivable liquid majors {BTC-USD, SOL-USD}. Demo/
- *                     paper-only forward leg; LIVE stays `no_trade` until the
- *                     leg proves out and the board re-approves under TRA-693.
+ *   • `crypto_core` — TRA-693 go-forward roster: DCA only, run across the
+ *                     FULL Coinbase-tradable USD universe (≈395 pairs,
+ *                     `symbolFilter: null`) per the board directive, NOT
+ *                     scoped to {BTC-USD, SOL-USD}. Demo/paper-only forward
+ *                     leg; LIVE stays `no_trade` until the leg proves out and
+ *                     the board re-approves. The {BTC,ETH,SOL} pin is the
+ *                     LIVE-only preset `crypto_core_live_majors` (TRA-1304),
+ *                     a separate object — do not conflate it with demo breadth.
  *
  * Future presets are added here without code changes elsewhere — the engine
  * resolves by id, the UI lists `Object.values(STRATEGY_PRESETS)`.
@@ -640,14 +644,21 @@ export const STRATEGY_PRESETS: Readonly<Record<StrategyPresetId, StrategyPreset>
   // accumulation core being the liquid majors {BTC-USD, SOL-USD}. On the
   // TRA-693 gate (board approval `cf17cc82`, 2026-06-07) the board adopted the
   // recommended path: DROP swing entirely and run `crypto_core` as a DCA-only
-  // forward paper leg on {BTC-USD, SOL-USD} before any live capital.
+  // forward paper leg before any live capital.
   //
-  // TRA-698 sets this go-forward config: DCA only, BTC/SOL only. Demo/paper
-  // only — the live cutover (`LIVE_STRATEGY_PRESET`) stays `no_trade`, owned by
-  // parent TRA-693 under board approval, and will not promote until the forward
-  // paper leg shows OOS-positive, risk-adjusted, after-cost results AND the
-  // board re-approves. The forward leg runs under the TRA-526 2%/trade hard cap
-  // and global kill-switch.
+  // NOTE (TRA-1544, corrected): the DEMO `crypto_core` preset is NOT scoped to
+  // {BTC-USD, SOL-USD}. Per the TRA-693 board directive the preset object runs
+  // DCA across the FULL Coinbase-tradable USD universe (≈395 pairs) with
+  // `symbolFilter: null` — see the `crypto_core` object below. The {BTC,SOL}
+  // set was TRA-695's OOS-survivable *finding*, and {BTC,ETH,SOL} is the
+  // LIVE-only universe pin, held in the separate `crypto_core_live_majors`
+  // preset (TRA-1304). Demo full-universe positions (e.g. INJ-USD, PAX-USD) are
+  // therefore expected roster behavior, not violations (see TRA-1541). The
+  // live cutover (`LIVE_STRATEGY_PRESET`) stays `no_trade`, owned by parent
+  // TRA-693 under board approval, and will not promote until the forward paper
+  // leg shows OOS-positive, risk-adjusted, after-cost results AND the board
+  // re-approves. The forward leg runs under the TRA-526 2%/trade hard cap and
+  // global kill-switch.
   crypto_core: {
     id: 'crypto_core',
     displayName: 'Crypto Core — DCA across all Coinbase-tradable cryptos',
