@@ -409,6 +409,7 @@ import {
   type AccountSettings,
   type NewsItem,
   type ResearchReport,
+  type EodReport,
   type StrategyPresetId,
   type Position,
   type OptionPosition,
@@ -5270,6 +5271,39 @@ app.get('/api/reports/latest', requireAuth, async (req, res) => {
   }
 });
 
+// TRA-1572 — the per-account DEMO calendar is fed by each user's *personal*
+// engine book, but the fleet's demo option trading flows through the shared,
+// firm-wide Option-Trade Journal (the Desk source). For the operator accounts
+// (admin, Richard) the personal demo book executes no trades, so every demo day
+// rendered as a blank ("--") or a hollow "$0.00" cell even though the firm demo
+// book had real realized P&L that day (e.g. 07-01 ≈ +$10.5k / 191 closes). The
+// board's directive on this ticket ("compare the calendar vs the trade/journal
+// data to update the calendar, and track daily P&L correctly going forward") is
+// to fold the durable journal into the per-account DEMO calendar so those empty
+// days fill from the same firm-wide truth the Desk view already shows.
+//
+// Fold rule: fill ONLY days where the personal book has nothing to say — a
+// missing file, or a hollow report (zero realized, zero options, zero trades).
+// A day the personal demo book *did* trade is authoritative and is left intact.
+// This reuses the exact `aggregateDeskCalendar` fold (demo-only, realized option
+// P&L keyed by ET close day) so the account and Desk views agree cell-for-cell.
+// Applies to DEMO only; live/sandbox keep their Tradier balance-truth path.
+async function demoJournalCalendarCells(): Promise<Map<string, EodReport>> {
+  const rows = await listOptionTradeJournal({ mode: 'demo' });
+  return aggregateDeskCalendar(rows, Date.now());
+}
+
+/** A personal report cell carries no realized activity → safe to fill from journal. */
+function isHollowReportCell(r: {
+  totalTrades?: number; realizedPnl?: number; optionsPnl?: number; combinedPnl?: number;
+} | null | undefined): boolean {
+  if (!r) return true;
+  return (r.totalTrades ?? 0) === 0
+    && (r.realizedPnl ?? 0) === 0
+    && (r.optionsPnl ?? 0) === 0
+    && (r.combinedPnl ?? 0) === 0;
+}
+
 app.get('/api/reports', requireAuth, async (req, res) => {
   const ctx = await userCtx(res);
   const mode = resolveStockReportMode(req, ctx.username);
@@ -5281,6 +5315,20 @@ app.get('/api/reports', requireAuth, async (req, res) => {
       .map(f => f.replace('.json', ''));
   } catch {
     dates = [];
+  }
+  // TRA-1572 — union in the firm-wide demo journal's trading days so a demo day
+  // the personal book never wrote a file for (07-03 / 07-08 / 07-09 on admin's
+  // book) still appears; the per-date route below serves the journal cell for it.
+  if (mode === 'demo') {
+    try {
+      const cells = await demoJournalCalendarCells();
+      for (const d of cells.keys()) dates.push(d);
+    } catch (err) {
+      log.warn('demo journal calendar date union failed', {
+        username: ctx.username,
+        reason: err instanceof Error ? err.message : String(err),
+      });
+    }
   }
   // TRA-1192 — surface today's running Live cell so the current day's P&L shows
   // before the 9 PM EOD snapshot writes a file for it. Only when a live anchor
@@ -5390,16 +5438,40 @@ app.get('/api/reports/:date', requireAuth, async (req, res) => {
       });
     }
   }
-  if (!fileExists) {
+  // TRA-1572 — DEMO fold: read the personal file (if any), and when the personal
+  // book has nothing for this day (no file, or a hollow zero cell) fill from the
+  // durable firm-wide demo Option-Trade Journal so the account calendar matches
+  // the Desk truth instead of a blank / $0.00. A day the personal book actually
+  // traded is authoritative and is served unchanged.
+  let personal: EodReport | null = null;
+  if (fileExists) {
+    try {
+      personal = JSON.parse(await readFile(filePath, 'utf-8')) as EodReport;
+    } catch {
+      res.status(500).json({ error: 'Failed to read report' });
+      return;
+    }
+  }
+  if (mode === 'demo' && isHollowReportCell(personal)) {
+    try {
+      const cell = (await demoJournalCalendarCells()).get(date);
+      if (cell && cell.totalTrades > 0) {
+        res.json(cell);
+        return;
+      }
+    } catch (err) {
+      log.warn('demo journal calendar day fold failed', {
+        username: ctx.username,
+        date,
+        reason: err instanceof Error ? err.message : String(err),
+      });
+    }
+  }
+  if (!personal) {
     res.status(404).json({ error: `No report for ${date}` });
     return;
   }
-  try {
-    const raw = await readFile(filePath, 'utf-8');
-    res.json(JSON.parse(raw));
-  } catch {
-    res.status(500).json({ error: 'Failed to read report' });
-  }
+  res.json(personal);
 });
 
 app.post('/api/reports/generate', requireAuth, async (_req, res) => {
