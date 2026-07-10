@@ -165,7 +165,7 @@ import { initTwoFactorStore, issueChallenge, resendChallenge, verifyChallenge } 
 import { initStateDb, getStateDb } from './sqlite.js'; // TRA-1052 — durable hot-state SQLite store
 import { checkThrottle, recordFailure, recordSuccess } from './auth-throttle.js';
 import { getSettings, loadSettings, mergeScopedRiskSettings, saveSettings } from './account-settings.js';
-import { resolveLiveBrokerOperator } from './signal-engine.js';
+import { resolveLiveBrokerOperator, isLiveBrokerOperator } from './signal-engine.js';
 import {
   initNotificationDispatcher,
   emitAlert,
@@ -396,6 +396,7 @@ import {
 } from './user-context.js';
 import {
   resolveTradierOptionsCreds,
+  isLiveTradierOptionsEnabled,
   STRATEGY_PRESETS,
   DEFAULT_STRATEGY_PRESET_ID,
   WATCHLIST,
@@ -4987,6 +4988,93 @@ app.get('/api/health/crypto-live', async (_req, res) => {
       reason: err instanceof Error ? err.message : String(err),
     });
     res.status(500).json({ ok: false, error: 'Failed to read crypto-live status' });
+  }
+});
+
+// TRA-1581 — UNAUTHENTICATED, secrets-free readout confirming the live OPTIONS
+// Tradier plumbing for the pinned operator: whether the resolved options broker
+// env is `production` and whether a live options order client would actually
+// construct (per-user prod creds OR the operator-scoped `TRADIER_*` env-var
+// fallback). This exists because `/api/health/live` names credentials and is
+// therefore auth-gated — and admin login + a pre-minted token both 401 against
+// bqb1's separate Render user store, so the board/desk cannot confirm the
+// Monday attended-canary plumbing prereq from there. Mirrors the TRA-1340
+// `/api/health/crypto-live` probe's contract: booleans + env label + a masked
+// account-id tail ONLY — never a token, secret, or full account id. The
+// options client `buildTradierLiveClient` uses `resolveTradierOptionsCreds(...)
+// .env` + the operator-scoped env fallback, so this replicates that exact
+// resolution (without placing an order) to answer "is prod options wired?".
+//
+// Reports the operator resolved from `LIVE_EQUITY_BOOT_USER` (default "admin",
+// TRA-716). On bqb1 the TRA-1411/TRA-1482 equity boot-arm already force-persists
+// `liveTradierEnvOptions:'production'` for that operator (same shared Tradier
+// account trades both equities and options per env), so a green readout here is
+// the physical proof the canary needs — NOT an autotrade arm (this probe wires
+// nothing and flips no flag).
+app.get('/api/health/options-live', async (_req, res) => {
+  try {
+    const operator = resolveLiveBrokerOperator();
+    const settings = await loadSettings(operator);
+    const mode = settings.mode === 'live' ? 'live' : 'demo';
+    const resolved = resolveTradierOptionsCreds(settings);
+    const optionsBrokerEnv = resolved.env;
+    const optionsRouted = isLiveTradierOptionsEnabled(settings);
+    // Per-user saved production creds (never their values — presence only).
+    const prodKeySaved = (settings.liveApiKeyOptionsProduction ?? '').trim().length > 0;
+    const prodAccountSaved = (settings.liveAccountIdOptionsProduction ?? '').trim().length > 0;
+    // Operator-scoped shared-env fallback — the exact precondition
+    // `buildTradierLiveClient` layers on for the pinned operator (TRA-857).
+    const allowEnvFallback = isLiveBrokerOperator(operator);
+    const prodEnvTokenPresent = (process.env['TRADIER_API_TOKEN'] ?? '').trim().length > 0;
+    const prodEnvAccountPresent = (process.env['TRADIER_ACCOUNT_ID'] ?? '').trim().length > 0;
+    // Replicate buildTradierLiveClient's resolution for the production env
+    // WITHOUT constructing a client / placing an order: per-user saved cred wins,
+    // else the operator-scoped env-var fallback.
+    const effectiveToken = (
+      resolved.apiToken
+      || (allowEnvFallback && optionsBrokerEnv === 'production' ? process.env['TRADIER_API_TOKEN'] : '')
+      || ''
+    ).trim();
+    const effectiveAccountId = (
+      resolved.accountId
+      || (allowEnvFallback && optionsBrokerEnv === 'production' ? process.env['TRADIER_ACCOUNT_ID'] : '')
+      || ''
+    ).trim();
+    // Would a LIVE production options order client construct? Mirrors
+    // buildTradierLiveClient: live mode + prod env + both creds resolve.
+    const optionsBrokerConfigured =
+      mode === 'live' && optionsBrokerEnv === 'production' && !!effectiveToken && !!effectiveAccountId;
+    // Masked tail only (last 4) so the desk can confirm it's the INTENDED live
+    // account without leaking the id. Tradier account ids are not secrets, but we
+    // stay strictly minimal to match the secrets-free probe contract.
+    const optionsAccountIdTail =
+      effectiveAccountId.length >= 4 ? `***${effectiveAccountId.slice(-4)}` : (effectiveAccountId ? '***' : null);
+    res.json({
+      ok: true,
+      issue: 'TRA-1581',
+      time: new Date().toISOString(),
+      build: resolveBuildInfo(),
+      operator,
+      mode,
+      // The two facts the board's Monday canary prereq turns on:
+      optionsBrokerEnv,
+      optionsBrokerConfigured,
+      // Supporting detail so a NO can be diagnosed without admin login.
+      optionsRouted,
+      prodCredsSaved: prodKeySaved && prodAccountSaved,
+      prodKeySaved,
+      prodAccountSaved,
+      prodEnvVarsPresent: prodEnvTokenPresent && prodEnvAccountPresent,
+      prodEnvTokenPresent,
+      prodEnvAccountPresent,
+      optionsAccountIdTail,
+      bootArmPinConfigured: (process.env['LIVE_EQUITY_BOOT_USER'] ?? '').trim().length > 0,
+    });
+  } catch (err) {
+    log.error('options-live health probe failed', {
+      reason: err instanceof Error ? err.message : String(err),
+    });
+    res.status(500).json({ ok: false, error: 'Failed to read options-live status' });
   }
 });
 
