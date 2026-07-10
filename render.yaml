@@ -587,6 +587,30 @@ services:
         value: "1"
       - key: CHURN_SAME_SESSION_OPEN_CAP
         value: "3"
+      # TRA-1407 (parent TRA-1406 "less noise, more quality", board accepted design
+      # A — blanket entry |Δ| floor >=0.40 — on card `99f84b84` 2026-07-07) — arm the
+      # OTM ENTRY DELTA FLOOR on the DEMO book. The demo option journal showed
+      # single_leg_otm bleeds entirely in the low-delta tail (Δ<0.15: n=303 avgR
+      # -0.075 / -$6.2k; sl-exits -$19.8k of deep-OTM contracts expiring worthless)
+      # while Δ>=0.45 makes avgR +0.55 / +$7.1k. This floors candidate selection at
+      # |BS delta| >= 0.40 (OTM_DELTA_FLOOR override; code default is also 0.40),
+      # dropping the lottery-ticket tail so the sleeve flips from ~-$7.1k to +$7.9k.
+      # STANDALONE flag, deliberately NOT under the master EXIT_RISK_RULES_ENABLED:
+      # runOtmScan passes the floor to scanOtm ONLY on the `mode === 'demo'` branch,
+      # so setting this can NEVER alter a live option open (same containment as
+      # ENTRY_GREEKS_GATE / TAKE_PROFIT_EARLY). Partially walks back the TRA-1207
+      # far-OTM thesis toward near-money — the board accepted that trade-off. Readout:
+      # `GET /api/health/option-journal` (`byStructure.single_leg_otm`). QuantTrader
+      # forward-validates: single_leg_otm avgR >= 0 over the next >=100 closes. The
+      # option-journal is DATA_DIR-persisted (`option-trade-journal.jsonl`), so this
+      # redeploy preserves the baseline. Revert = clear this value + redeploy. NOTE:
+      # blueprint sync != autoDeploy on bqb1 (TRA-1289) — a push to main triggers
+      # autoDeploy, which is what makes this var take effect (or the
+      # DATA_DIR/demo-flags.json override). Accepts 1/true/yes/on.
+      - key: OTM_DELTA_FLOOR_ENABLED
+        value: "1"
+      - key: OTM_DELTA_FLOOR
+        value: "0.40"
       # TRA-1447 (parent TRA-1444 → TRA-1448 durable-fix ask) — arm the crypto
       # daily-bars fan-out hardening on bqb1. ROOT CAUSE of the recurring 502
       # flap-back (TRA-1448, TRA-1074/1080-1084 signature): under degraded Render
