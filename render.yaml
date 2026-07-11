@@ -525,6 +525,25 @@ services:
       # 1/true/yes/on.
       - key: CORRELATED_EXPOSURE_CAP_ENABLED
         value: "1"
+      # TRA-1491 (parent TRA-1479 "Demo to Live", family options-rv-long) — DARK
+      # live-capital gate on the RV (relative-value) single-leg LONG options order
+      # path. Declared here EXPLICITLY OFF to document the shipped dark state and
+      # give a one-line arm point. The RV scan runs in both demo and live; in live
+      # the paper-book open is mirrored to a real Tradier buy_to_open (TRA-221).
+      # With this OFF (default), the ENTIRE live RV single-leg long entry — the
+      # live-book open AND its broker mirror — is suppressed before the open, so a
+      # live RV candidate creates no position and places no order (zero real-capital
+      # risk). When armed ("1"), the live entry ALSO inherits the ENTRY_GREEKS_GATE
+      # [0.30,0.40] / Δ-Θ discipline the demo path forward-samples, so what gets
+      # armed is exactly what was validated. Demo is unaffected regardless (gate is
+      # live-only). Read from process env ONLY — never the demo-flags.json override
+      # (this authorizes real orders). DO NOT flip to "1" without a separate
+      # `request_board_approval` with a per-name cap (Phase 4 of TRA-1491) — arming
+      # is gated on greeks-gate forward-sample sufficiency (TRA-1409 / TRA-1293) +
+      # sandbox fill validation (TRA-1436). NOTE: blueprint sync ≠ autoDeploy on
+      # bqb1 (TRA-1289) — a redeploy is needed to take effect. Accepts 1/true/yes/on.
+      - key: ENABLE_OPTION_LIVE_RV_LONG
+        value: "0"
       # TRA-1317 (parent TRA-1316, board interaction `7042a614` answer = demo) —
       # arm DEMO PAPER routing of the regime-gated TSMOM scanner so the crypto
       # dashboard shows movement and we accrue forward round-trip evidence at ZERO

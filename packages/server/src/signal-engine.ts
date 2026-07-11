@@ -55,7 +55,7 @@ import {
   optionJournalToStrategyRows,
 } from './strategy-introspection.js';
 import { isOptionShadowEnabled, isOptionPhaseBEnabled, emitShadowOptionSignal, shadowSignalToSpreadParams, OPTION_SHADOW_EMERGENCY_OFF, DEMO_SPREAD_MAX_LOSS_PCT_CAP } from './option-shadow-ledger.js';
-import { isOptionExecEnabled, isOptionEmaPullbackEnabled, isOptionVolumeBreakoutEnabled, resolveRvLongDteOverride, resolveRvMinDailyVolume, isOptionDemoDirectionalEnabled, isOptionIvRvScannerEnabled, isOptionIvRvRoutingEnabled, resolveIvRvRoutingOverride, isOptionShortPremiumScannerEnabled } from './option-exec-flag.js';
+import { isOptionExecEnabled, isOptionEmaPullbackEnabled, isOptionVolumeBreakoutEnabled, resolveRvLongDteOverride, resolveRvMinDailyVolume, isOptionDemoDirectionalEnabled, isOptionIvRvScannerEnabled, isOptionIvRvRoutingEnabled, resolveIvRvRoutingOverride, isOptionShortPremiumScannerEnabled, isOptionLiveRvLongEnabled } from './option-exec-flag.js';
 import { scanIvRvFromSnapshot, recordIvRvScan } from './iv-rv-scanner.js';
 import { scanShortPremiumFromSnapshot, recordShortPremiumScan } from './short-premium-scanner.js';
 import { isExitRiskRulesEnabled, isLiveEquityStopModifyEnabled, isTakeProfitEarlyEnabled, isEntryGreeksGateEnabled, isCorrelatedExposureCapEnabled, isOtmDeltaFloorEnabled, resolveOtmDeltaFloor, isRvExitRetuneEnabled, resolveRvExitConfirmBars, resolveRvExitFlipMinLossPct, isBookGiveBackArmFloorEnabled } from './exit-risk-rules-flag.js';
@@ -4585,7 +4585,17 @@ export class SignalEngine {
         // here via BS greeks (the RV candidate carries only delta); a missing
         // underlying spot leaves thetaPerDay=0 so the ratio gate abstains (data
         // gap must not silently reject) and only the delta band applies.
-        if (this.mode === 'demo' && isEntryGreeksGateEnabled(this.resolveDemoFlagEnv())) {
+        // TRA-1491 — the demo path forward-samples this gate at zero capital
+        // risk; the DARK live RV long path (when armed via
+        // ENABLE_OPTION_LIVE_RV_LONG) inherits the SAME [0.30,0.40] delta band +
+        // Δ/Θ floor discipline so what gets armed on real capital is exactly the
+        // greeks-gated entry the demo sample validated (Phase 2 pass bar,
+        // TRA-1293/TRA-1409). Live uses the process env; demo uses the demo-flag
+        // env (the live flag is never sourced from the demo-flags file override).
+        const greeksGateActive =
+          (this.mode === 'demo' && isEntryGreeksGateEnabled(this.resolveDemoFlagEnv()))
+          || (this.mode === 'live' && isOptionLiveRvLongEnabled(process.env));
+        if (greeksGateActive) {
           let thetaPerDay = 0;
           if (typeof underlyingSpot === 'number' && underlyingSpot > 0) {
             const greeks = blackScholesGreeks({
@@ -4662,6 +4672,23 @@ export class SignalEngine {
           }
         }
 
+        // TRA-1491 — DARK live-capital gate on the RV single-leg long path.
+        // The RV scan runs in both demo and live; in live the open below is
+        // immediately mirrored to a real Tradier buy_to_open (TRA-221). The
+        // board authorized BUILDING this live path (TRA-1479 checkbox, family
+        // options-rv-long) but NOT arming capital. Until ENABLE_OPTION_LIVE_RV_LONG
+        // is armed (a SEPARATE board approval), suppress the ENTIRE live RV entry
+        // here — before the open — so no live position is created and no order is
+        // placed (avoiding a broker-less phantom live fill). Default OFF ⇒ the
+        // shipped state is byte-for-byte inert on real capital. Demo is untouched
+        // (guard is live-only). Read from process env — never the demo-flags file.
+        if (this.mode === 'live' && !isOptionLiveRvLongEnabled(process.env)) {
+          signal.signalSkipReason =
+            'RV single-leg long live path dark (ENABLE_OPTION_LIVE_RV_LONG off) — build shipped, capital arm gated on board approval (TRA-1491)';
+          log.info('RV long live entry suppressed — dark flag off (TRA-1491)', { sym });
+          continue;
+        }
+
         const opened = this.optionsAccount.openOptionFromRvCandidate(
           signal,
           this.mode,
@@ -4692,6 +4719,12 @@ export class SignalEngine {
         // this entry mirror is gated by the flag.
         if (
           this.mode === 'live'
+          // TRA-1491 — defense-in-depth: the pre-open guard above already
+          // `continue`s in live when the dark flag is off (so we never reach an
+          // open here unarmed), but re-assert the flag on the broker-submit
+          // condition itself so no future refactor of the pre-open guard can let
+          // a real buy_to_open fire on an unarmed live book.
+          && isOptionLiveRvLongEnabled(process.env)
           && this.tradierLiveOptionsEnabled
           && this.tradierLiveClient
           && opened.optionSymbol

@@ -391,3 +391,39 @@ export function resolveOptionIdeasAutoExecuteTopN(env: NodeJS.ProcessEnv = proce
   if (n === undefined) return OPTION_IDEAS_AUTO_EXECUTE_DEFAULT_TOP_N;
   return Math.min(n, OPTION_IDEAS_AUTO_EXECUTE_MAX_TOP_N);
 }
+
+// --------------------------------------------------------------------------
+// TRA-1491 (parent TRA-1479 "Demo to Live", family options-rv-long) — DARK
+// live-capital gate on the RV (relative-value / reversion) single-leg LONG
+// options order path.
+//
+// The RV scan (`runRelativeValueScan`) runs in BOTH demo and live: in live the
+// paper-book open is immediately mirrored to a real Tradier `buy_to_open`
+// (TRA-221). The board authorized BUILDING this live path via the TRA-1479
+// checkbox interaction (accepted 2026-07-08 by `local-board`) but explicitly
+// did NOT arm real capital — arming is a SEPARATE `request_board_approval`.
+//
+// This flag is that separation. It is a SECRET-ADJACENT live toggle (it
+// authorizes real orders), so — unlike the demo flags — it is read ONLY from
+// the process env (never from the `demo-flags.json` file override) and is NOT
+// on the demo-flag allowlist. OFF by default ⇒ the entire live RV single-leg
+// long entry (the live-book open AND its Tradier mirror) is inert: a live RV
+// candidate opens nothing and places no order, so the shipped state carries
+// zero real-capital risk. When an operator arms it on `tradingai-bqb1` (only
+// after board approval + greeks-gate forward-sample sufficiency, TRA-1409 /
+// TRA-1293), the live entry additionally inherits the SAME PoP/delta greeks
+// gate the demo path forward-samples, so what gets armed is exactly what was
+// validated. Demo behaviour is byte-for-byte unchanged regardless (the gate is
+// live-mode only).
+// --------------------------------------------------------------------------
+
+export const OPTION_LIVE_RV_LONG_FLAG = 'ENABLE_OPTION_LIVE_RV_LONG';
+
+/**
+ * True iff the DARK live-capital RV single-leg long options order path is armed
+ * (accepts 1/true/yes/on). Default OFF. Read from the process env only — this is
+ * a live-order toggle, never sourced from the demo-flags file override.
+ */
+export function isOptionLiveRvLongEnabled(env: NodeJS.ProcessEnv = process.env): boolean {
+  return flagOn(env[OPTION_LIVE_RV_LONG_FLAG]);
+}

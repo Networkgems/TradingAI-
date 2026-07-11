@@ -9,6 +9,8 @@ import {
   isOptionIvRvScannerEnabled,
   isOptionIvRvRoutingEnabled,
   resolveIvRvRoutingOverride,
+  isOptionLiveRvLongEnabled,
+  OPTION_LIVE_RV_LONG_FLAG,
   OPTION_EXEC_FLAG,
   OPTION_EMA_PULLBACK_FLAG,
   OPTION_VOLUME_BREAKOUT_FLAG,
@@ -43,6 +45,28 @@ describe('isOptionDemoDirectionalEnabled (TRA-1114)', () => {
   it('is independent of the exec-selector flag (own switch)', () => {
     expect(isOptionDemoDirectionalEnabled({ [OPTION_EXEC_FLAG]: ON })).toBe(false);
     expect(isOptionExecEnabled({ [OPTION_DEMO_DIRECTIONAL_FLAG]: ON })).toBe(false);
+  });
+});
+
+describe('isOptionLiveRvLongEnabled (TRA-1491 dark live-capital gate)', () => {
+  it('is OFF by default (unset) so the shipped state places no live RV order', () => {
+    expect(isOptionLiveRvLongEnabled({})).toBe(false);
+  });
+
+  it('is armed only for explicit truthy values', () => {
+    expect(isOptionLiveRvLongEnabled({ [OPTION_LIVE_RV_LONG_FLAG]: '1' })).toBe(true);
+    expect(isOptionLiveRvLongEnabled({ [OPTION_LIVE_RV_LONG_FLAG]: 'true' })).toBe(true);
+    expect(isOptionLiveRvLongEnabled({ [OPTION_LIVE_RV_LONG_FLAG]: 'on' })).toBe(true);
+    expect(isOptionLiveRvLongEnabled({ [OPTION_LIVE_RV_LONG_FLAG]: '0' })).toBe(false);
+    expect(isOptionLiveRvLongEnabled({ [OPTION_LIVE_RV_LONG_FLAG]: 'off' })).toBe(false);
+    expect(isOptionLiveRvLongEnabled({ [OPTION_LIVE_RV_LONG_FLAG]: 'false' })).toBe(false);
+  });
+
+  it('is a STANDALONE live toggle — the demo/exec flags neither arm nor block it', () => {
+    // exec-selector on does not arm the live path
+    expect(isOptionLiveRvLongEnabled({ [OPTION_EXEC_FLAG]: ON })).toBe(false);
+    // and arming the live path does not turn on the exec-selector
+    expect(isOptionExecEnabled({ [OPTION_LIVE_RV_LONG_FLAG]: ON })).toBe(false);
   });
 });
 
