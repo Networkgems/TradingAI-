@@ -736,6 +736,13 @@ export interface OptionJournalReport {
   summary: OptionTradeJournalSummary;
   weights: OptionLearnedWeights;
   /**
+   * TRA-1591 — echoes the `sinceTs` cohort filter (epoch ms) when the caller
+   * passed one, so a grading poll can confirm the `summary` was scoped to the
+   * post-arm cohort rather than the cumulative pool. Absent on the unfiltered
+   * (cumulative) readout.
+   */
+  sinceTs?: number;
+  /**
    * TRA-1046 (TRA-1041c L1) — freshness of the learned-weights fold. `generation`
    * bumps on each recompute (a close event or TTL lapse), so a probe can confirm
    * the weights refreshed intraday after a demo trade closed rather than only at
@@ -781,22 +788,36 @@ export async function buildSourceQualityReport(
  * intraday refresh cache instead of being recomputed inline, so the readout shows
  * the same weights live selection would read and a `weightsFreshness.generation`
  * a probe can watch tick after a demo close.
+ *
+ * TRA-1591 — an optional `sinceTs` (epoch ms) restricts the `summary` fold to
+ * rows whose ENTRY timestamp (`openTs`) is `>= sinceTs`, so a post-arm cohort can
+ * be graded in isolation from the historical pool. Because the OTM entry delta
+ * floor (TRA-1407) rejects any entry with `|Δ| < 0.40` at open time, every
+ * post-arm `single_leg_otm` fill is floored by construction, so a `sinceTs`
+ * cohort == the floored cohort. Absent → identical output to before
+ * (regression-safe). `weights`/`weightsFreshness` are deliberately left over the
+ * FULL row set: the learned-weights fold and its cache generation are a
+ * process-global concern the cohort filter must not perturb.
  */
 export function buildOptionJournalReport(
   rows: Parameters<typeof summarizeOptionTradeJournal>[0],
   now: number,
   enabled: boolean,
   cached?: CachedOptionWeights,
+  sinceTs?: number,
 ): OptionJournalReport {
+  const summaryRows =
+    sinceTs === undefined ? rows : rows.filter((r) => r.openTs >= sinceTs);
   return {
     ok: true,
     time: new Date(now).toISOString(),
     build: resolveBuildInfo(),
     enabled,
     shrinkageEnabled: isLearnedShrinkageEnabled(),
-    summary: summarizeOptionTradeJournal(rows),
+    summary: summarizeOptionTradeJournal(summaryRows),
     weights: cached?.weights ?? computeOptionLearnedWeights(rows),
     ...(cached ? { weightsFreshness: cached.freshness } : {}),
+    ...(sinceTs === undefined ? {} : { sinceTs }),
   };
 }
 
@@ -1388,7 +1409,20 @@ export function registerLiveHealthRoutes(app: Express, deps: LiveHealthDeps): vo
     // shows the same fold live selection reads, plus a freshness generation a
     // probe can watch tick after a demo close.
     const cached = await optionWeightsCache().get();
-    const report = buildOptionJournalReport(rows, now(), isOptionTradeJournalEnabled(), cached);
+    // TRA-1591 — optional `?sinceTs=<epoch ms>` scopes the summary fold to the
+    // post-arm cohort (entry `openTs >= sinceTs`) so QT can grade the OTM entry
+    // delta floor (TRA-1407) in isolation from the historical low-delta bleed.
+    // A malformed / non-finite value is ignored → cumulative (unfiltered) output.
+    const sinceTsRaw = req.query['sinceTs'];
+    const sinceTsParsed = typeof sinceTsRaw === 'string' ? Number(sinceTsRaw) : NaN;
+    const sinceTs = Number.isFinite(sinceTsParsed) ? sinceTsParsed : undefined;
+    const report = buildOptionJournalReport(
+      rows,
+      now(),
+      isOptionTradeJournalEnabled(),
+      cached,
+      sinceTs,
+    );
     // TRA-1133 — opt-in row-level dump for the OOS validation harness (TRA-992 Step
     // 1). `?rows=demo` appends the RESOLVED demo rows (setup key + realizedR +
     // outcome) so an offline run can fold the journal leave-one-out. Same demo-only,

@@ -1049,4 +1049,51 @@ describe('buildOptionJournalReport', () => {
     expect(report.summary.total).toBe(0);
     expect(report.summary.byStructure).toHaveLength(0);
   });
+
+  // TRA-1591 — post-arm cohort filter for grading the OTM entry delta floor.
+  describe('sinceTs cohort filter', () => {
+    const armTs = NOW - 3_600_000; // arm boundary 1h ago
+    // pre-arm low-delta bleed loser (entryDelta 0.2, well before the floor)
+    const preArm: OptionTradeJournalRecord = {
+      ...closedRow,
+      id: 'pre',
+      structure: 'single_leg_otm',
+      openTs: armTs - 86_400_000,
+      entryDelta: 0.2,
+      outcome: 'LOSS',
+      realizedPnlUsd: -100,
+      realizedR: -1,
+    };
+    // post-arm floored winner (entryDelta 0.45 >= 0.40 by construction)
+    const postArm: OptionTradeJournalRecord = {
+      ...closedRow,
+      id: 'post',
+      structure: 'single_leg_otm',
+      openTs: armTs + 60_000,
+      entryDelta: 0.45,
+      outcome: 'WIN',
+      realizedPnlUsd: 200,
+      realizedR: 1,
+    };
+
+    it('absent sinceTs → cumulative pool (regression-safe)', () => {
+      const cumulative = buildOptionJournalReport([preArm, postArm], NOW, true);
+      const otm = cumulative.summary.byStructure.find((s) => s.structure === 'single_leg_otm');
+      expect(otm?.closed).toBe(2);
+      expect(otm?.realizedPnlUsd).toBe(100); // -100 + 200
+      expect(cumulative.sinceTs).toBeUndefined();
+    });
+
+    it('scopes summary.byStructure to entry openTs >= sinceTs', () => {
+      const cohort = buildOptionJournalReport([preArm, postArm], NOW, true, undefined, armTs);
+      const otm = cohort.summary.byStructure.find((s) => s.structure === 'single_leg_otm');
+      expect(otm?.closed).toBe(1); // only the post-arm floored fill
+      expect(otm?.avgR).toBe(1);
+      expect(otm?.winRate).toBe(1);
+      expect(otm?.realizedPnlUsd).toBe(200);
+      expect(cohort.sinceTs).toBe(armTs);
+      // Learned weights stay over the FULL row set — cohort filter must not perturb them.
+      expect(cohort.weights.generatedFrom.rows).toBe(2);
+    });
+  });
 });
