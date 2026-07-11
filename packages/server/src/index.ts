@@ -235,6 +235,8 @@ import {
   isOptionsProposalRailEnabled,
   isOptionDemoAutoConfirmEnabled,
   isOptionIdeasAutoExecuteEnabled,
+  isOptionLiveRvLongEnabled,
+  isOptionLiveDirectionalEnabled,
 } from './option-exec-flag.js';
 import { runIdeasAutoExecute } from './options-ideas-auto-execute.js';
 import {
@@ -5069,6 +5071,13 @@ app.get('/api/health/options-live', async (_req, res) => {
       prodEnvAccountPresent,
       optionsAccountIdTail,
       bootArmPinConfigured: (process.env['LIVE_EQUITY_BOOT_USER'] ?? '').trim().length > 0,
+      // TRA-1490 / TRA-1491 — DARK strategy arm-flag states so the board/QA can
+      // confirm (secrets-free) that the live single-leg option order paths are
+      // still OFF. Both default false; arming either is a SEPARATE board approval.
+      // `optionsBrokerConfigured` gates whether an armed flag could actually route
+      // — an armed flag with no live broker still places no order.
+      liveRvLongArmed: isOptionLiveRvLongEnabled(process.env),
+      liveDirectionalArmed: isOptionLiveDirectionalEnabled(process.env),
     });
   } catch (err) {
     log.error('options-live health probe failed', {

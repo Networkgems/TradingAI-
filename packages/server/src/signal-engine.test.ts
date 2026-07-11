@@ -38,6 +38,7 @@ import {
 } from './option-trade-journal.js';
 import {
   OPTION_DEMO_DIRECTIONAL_FLAG,
+  OPTION_LIVE_DIRECTIONAL_FLAG,
   OPTION_IV_RV_SCANNER_FLAG,
   OPTION_IV_RV_ROUTING_FLAG,
 } from './option-exec-flag.js';
@@ -5028,9 +5029,11 @@ describe('SignalEngine — demo directional option entry (TRA-1114)', () => {
     vi.useFakeTimers();
     vi.setSystemTime(TRADING_TIME); // 10:00 ET — inside the options trading window
     delete process.env[OPTION_DEMO_DIRECTIONAL_FLAG];
+    delete process.env[OPTION_LIVE_DIRECTIONAL_FLAG];
   });
   afterEach(() => {
     delete process.env[OPTION_DEMO_DIRECTIONAL_FLAG];
+    delete process.env[OPTION_LIVE_DIRECTIONAL_FLAG];
     vi.useRealTimers();
   });
 
@@ -5172,6 +5175,101 @@ describe('SignalEngine — demo directional option entry (TRA-1114)', () => {
       rmSync(journalFile, { force: true });
       rmSync(ivStoreFile, { force: true });
     }
+  });
+
+  // ─── TRA-1490 — DARK live directional (call/put) order path ────────────────
+  // Phase 1 dark build of the live options directional path. The SAME pass that
+  // opens demo calls/puts (TRA-1114) is the live order path; it runs in live ONLY
+  // when ENABLE_OPTION_LIVE_DIRECTIONAL is armed, and mirrors the paper open to a
+  // real Tradier buy_to_open via the shared broker seam. These lock the two
+  // safety-critical properties: (1) flag OFF in live is byte-for-byte inert — no
+  // live open, no broker call; (2) when armed, the path genuinely places a real
+  // order (proving it is a built path, not a stub).
+  interface DirLiveStub {
+    getAccountBalance: ReturnType<typeof vi.fn>;
+    getOptionQuote: ReturnType<typeof vi.fn>;
+    buyContractsLimit: ReturnType<typeof vi.fn>;
+    cancelOrder: ReturnType<typeof vi.fn>;
+    waitForOrderTerminalStatus: ReturnType<typeof vi.fn>;
+  }
+  function liveDirEngine(svc: RelativeValueScannerService, stub?: DirLiveStub): SignalEngine {
+    const engine = new SignalEngine(undefined, undefined, svc);
+    (engine as unknown as { mode: 'demo' | 'live' }).mode = 'live';
+    if (stub) (engine as unknown as { tradierLiveClient: unknown }).tradierLiveClient = stub;
+    (engine as unknown as { liveTradierBalance: unknown }).liveTradierBalance = {
+      totalEquity: 25_000, totalCash: 25_000, optionBuyingPower: 25_000, dayTradeBuyingPower: 25_000,
+    };
+    return engine;
+  }
+
+  it('live + flag OFF — opens nothing and never calls the broker (DARK, zero capital)', async () => {
+    const stub: DirLiveStub = {
+      getAccountBalance: vi.fn(),
+      getOptionQuote: vi.fn(),
+      buyContractsLimit: vi.fn(),
+      cancelOrder: vi.fn(),
+      waitForOrderTerminalStatus: vi.fn(),
+    };
+    const svc = scannerFor({ UPP: { symbol: 'UPP', spot: 100, expiration: '2024-07-19', rows: chainRows('UPP', 100) } });
+    const engine = liveDirEngine(svc, stub);
+    seedTrend(engine, 'UPP', sawUp(480));
+
+    await run(engine, ['UPP']);
+
+    // No live position and — critically — no order ever reached Tradier.
+    expect(engine.getState().options.openOptions).toHaveLength(0);
+    expect(stub.buyContractsLimit).not.toHaveBeenCalled();
+    expect(stub.waitForOrderTerminalStatus).not.toHaveBeenCalled();
+  });
+
+  it('live + flag ON (armed) — opens a live directional long AND mirrors a real buy_to_open', async () => {
+    process.env[OPTION_LIVE_DIRECTIONAL_FLAG] = '1';
+    const stub: DirLiveStub = {
+      getAccountBalance: vi.fn().mockResolvedValue({ totalEquity: 25_000, totalCash: 25_000, optionBuyingPower: 25_000 }),
+      // Tight quote around the ATM call mark (~2.0) so the smart-open walk fills.
+      getOptionQuote: vi.fn().mockResolvedValue({ symbol: 'UPPC100', bid: 1.96, ask: 2.04 }),
+      buyContractsLimit: vi.fn().mockResolvedValue({ id: 55, status: 'ok' }),
+      cancelOrder: vi.fn(),
+      waitForOrderTerminalStatus: vi.fn(async () => ({ id: 55, status: 'filled', exec_quantity: 1, avg_fill_price: 2.01 })),
+    };
+    const svc = scannerFor({ UPP: { symbol: 'UPP', spot: 100, expiration: '2024-07-19', rows: chainRows('UPP', 100) } });
+    const engine = liveDirEngine(svc, stub);
+    seedTrend(engine, 'UPP', sawUp(480));
+
+    await run(engine, ['UPP']);
+
+    // The built live path both opened a live-book position and placed a REAL order.
+    const open = engine.getState().options.openOptions;
+    expect(open).toHaveLength(1);
+    expect(open[0].optionType).toBe('call');
+    expect(stub.buyContractsLimit).toHaveBeenCalledTimes(1);
+  });
+
+  it('live + flag ON but broker rejects — voids the open and surfaces a live skip-reason (no phantom fill)', async () => {
+    process.env[OPTION_LIVE_DIRECTIONAL_FLAG] = '1';
+    const stub: DirLiveStub = {
+      getAccountBalance: vi.fn().mockResolvedValue({ totalEquity: 25_000, totalCash: 25_000, optionBuyingPower: 25_000 }),
+      getOptionQuote: vi.fn().mockResolvedValue({ symbol: 'UPPC100', bid: 1.96, ask: 2.04 }),
+      buyContractsLimit: vi.fn().mockResolvedValue({ id: 56, status: 'ok' }),
+      cancelOrder: vi.fn().mockResolvedValue(undefined),
+      waitForOrderTerminalStatus: vi.fn(async () => ({ id: 56, status: 'canceled', reason_description: 'insufficient buying power' })),
+    };
+    const svc = scannerFor({ UPP: { symbol: 'UPP', spot: 100, expiration: '2024-07-19', rows: chainRows('UPP', 100) } });
+    const engine = liveDirEngine(svc, stub);
+    seedTrend(engine, 'UPP', sawUp(480));
+
+    await run(engine, ['UPP']);
+
+    const state = engine.getState();
+    // The mirror submitted, Tradier canceled → the paper open is rolled back.
+    expect(stub.buyContractsLimit).toHaveBeenCalledTimes(1);
+    expect(state.options.openOptions).toHaveLength(0);
+    expect(state.options.dailyOptionsCount).toBe(0);
+    // The suppressed signal is surfaced with a live skip reason, not silently dropped.
+    const surfaced = state.signals.find(s => s.liveSkipReason);
+    expect(surfaced).toBeDefined();
+    expect(surfaced!.mode).toBe('live');
+    expect(surfaced!.liveSkipReason).toMatch(/rejected|insufficient/i);
   });
 });
 

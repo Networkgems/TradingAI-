@@ -55,7 +55,7 @@ import {
   optionJournalToStrategyRows,
 } from './strategy-introspection.js';
 import { isOptionShadowEnabled, isOptionPhaseBEnabled, emitShadowOptionSignal, shadowSignalToSpreadParams, OPTION_SHADOW_EMERGENCY_OFF, DEMO_SPREAD_MAX_LOSS_PCT_CAP } from './option-shadow-ledger.js';
-import { isOptionExecEnabled, isOptionEmaPullbackEnabled, isOptionVolumeBreakoutEnabled, resolveRvLongDteOverride, resolveRvMinDailyVolume, isOptionDemoDirectionalEnabled, isOptionIvRvScannerEnabled, isOptionIvRvRoutingEnabled, resolveIvRvRoutingOverride, isOptionShortPremiumScannerEnabled, isOptionLiveRvLongEnabled } from './option-exec-flag.js';
+import { isOptionExecEnabled, isOptionEmaPullbackEnabled, isOptionVolumeBreakoutEnabled, resolveRvLongDteOverride, resolveRvMinDailyVolume, isOptionDemoDirectionalEnabled, isOptionIvRvScannerEnabled, isOptionIvRvRoutingEnabled, resolveIvRvRoutingOverride, isOptionShortPremiumScannerEnabled, isOptionLiveRvLongEnabled, isOptionLiveDirectionalEnabled } from './option-exec-flag.js';
 import { scanIvRvFromSnapshot, recordIvRvScan } from './iv-rv-scanner.js';
 import { scanShortPremiumFromSnapshot, recordShortPremiumScan } from './short-premium-scanner.js';
 import { isExitRiskRulesEnabled, isLiveEquityStopModifyEnabled, isTakeProfitEarlyEnabled, isEntryGreeksGateEnabled, isCorrelatedExposureCapEnabled, isOtmDeltaFloorEnabled, resolveOtmDeltaFloor, isRvExitRetuneEnabled, resolveRvExitConfirmBars, resolveRvExitFlipMinLossPct, isBookGiveBackArmFloorEnabled } from './exit-risk-rules-flag.js';
@@ -3288,19 +3288,28 @@ export class SignalEngine {
       }
     }
 
-    // TRA-1114 — demo-only deterministic directional call/put entry. Board
-    // escalation (3rd time): plumbing is ON but no calls/puts ever fill in the
-    // demo paper book because the executing RV-anomaly path surfaces nothing
-    // (TRA-592) and the spread selector stands down when the demo IV-rank store
-    // is thin (`ivRank === null`). When the flag is on AND this is the demo book,
+    // TRA-1114 — deterministic directional call/put entry. Board escalation (3rd
+    // time): plumbing is ON but no calls/puts ever fill in the demo paper book
+    // because the executing RV-anomaly path surfaces nothing (TRA-592) and the
+    // spread selector stands down when the demo IV-rank store is thin
+    // (`ivRank === null`). When the demo flag is on AND this is the demo book,
     // open a near-ATM, trend-aligned single-leg long directly off the live chain
-    // so the board can SEE fills. Demo/paper only (no Tradier mirror, no live
-    // capital); gated to market hours and throttled on the RV cadence. Wholly
-    // skipped when the flag is off, so prod/live behaviour is unchanged.
+    // so the board can SEE fills (demo/paper only — no Tradier mirror, no live
+    // capital).
+    //
+    // TRA-1490 — the SAME pass is the DARK live directional order path (Phase 1
+    // dark build). It runs in live ONLY when `ENABLE_OPTION_LIVE_DIRECTIONAL` is
+    // armed (default OFF → live is byte-for-byte inert, no live open, no order);
+    // when armed it sizes off real Tradier equity and mirrors the open to a real
+    // `buy_to_open`. Arming real capital is a SEPARATE board approval gated on
+    // TRA-382 + TRA-1436. Gated to market hours and throttled on the RV cadence;
+    // wholly skipped when neither flag is on, so the default prod path is
+    // unchanged.
+    const directionalDemoOn = this.mode === 'demo' && isOptionDemoDirectionalEnabled();
+    const directionalLiveOn = this.mode === 'live' && isOptionLiveDirectionalEnabled(process.env);
     if (
-      this.mode === 'demo'
+      (directionalDemoOn || directionalLiveOn)
       && isStockMarketOpen()
-      && isOptionDemoDirectionalEnabled()
       && this.isAutoTradingEnabled()
       && !this.riskGovernor.isHalted()
       && !!this.rvScanner
@@ -4700,121 +4709,23 @@ export class SignalEngine {
         if (!opened) continue;
         this.recordChurnOpen(signal.symbol); // TRA-1408 per-name same-session churn counter
 
-        // TRA-221 — when running live with Tradier configured, mirror the
-        // paper open by submitting a real `buy_to_open` market order.
-        // TRA-319 — Tradier sometimes accepts the order synchronously (200 OK)
-        // and only later cancels it for "insufficient buying power" / margin
-        // limits. Previously the paper open stuck around as a phantom fill.
-        // Now we (a) pre-check Tradier's option buying power against the
-        // notional cost and skip the mirror with a paper-side rollback if
-        // it's insufficient, (b) wait briefly after submit for the order to
-        // reach a terminal state, and (c) void the paper position when
-        // Tradier rejects/cancels/expires the order so the dashboard never
-        // shows an "open" trade that doesn't exist on the broker.
-        // TRA-355 — defense-in-depth check on `tradierLiveOptionsEnabled`
-        // so a user on `liveTradierMarkets: 'equity'` never has `buy_to_open`
-        // hit Tradier even if the scan-level skip at line ~887 is ever
-        // bypassed by a future refactor. The client itself stays built when
-        // creds are present (TRA-332 balance refresh depends on it); only
-        // this entry mirror is gated by the flag.
+        // TRA-221 / TRA-319 / TRA-355 / TRA-374 — when running live with Tradier
+        // configured AND the dark RV-long flag is armed, mirror the paper open to
+        // a real `buy_to_open` through the shared smart-open broker seam
+        // ({@link mirrorLiveOptionOpen}: OBP/DTBP pre-checks + limit walk +
+        // void-on-reject). TRA-1491 — re-assert the arm flag on the broker-submit
+        // condition itself (defense-in-depth): the pre-open guard above already
+        // `continue`s in live when the flag is off, but re-checking here means no
+        // future refactor of that guard can let a real order fire on an unarmed
+        // live book. `tradierLiveOptionsEnabled` (TRA-355) keeps `buy_to_open`
+        // off Tradier for equity-only live users. The seam returns false and
+        // rolls the paper open back when the broker leg fails → skip the fill.
         if (
           this.mode === 'live'
-          // TRA-1491 — defense-in-depth: the pre-open guard above already
-          // `continue`s in live when the dark flag is off (so we never reach an
-          // open here unarmed), but re-assert the flag on the broker-submit
-          // condition itself so no future refactor of the pre-open guard can let
-          // a real buy_to_open fire on an unarmed live book.
           && isOptionLiveRvLongEnabled(process.env)
           && this.tradierLiveOptionsEnabled
-          && this.tradierLiveClient
-          && opened.optionSymbol
-          && opened.contracts > 0
         ) {
-          const notionalCost = opened.premiumPaid * opened.contracts * 100;
-          // TRA-332 — also surface the void reason on the dashboard so the
-          // user sees why no trade opened, not just a silent log line.
-          const tradierVoid = (reason: string): void => {
-            log.warn('voiding paper open', {
-              positionId: opened.id,
-              optionSymbol: opened.optionSymbol,
-              reason,
-            });
-            this.optionsAccount.voidOpenOption(opened.id);
-            surfaceLiveSkip(reason);
-          };
-
-          // Pre-check: refresh the Tradier balance if we have a non-stale
-          // snapshot, then bail before submitting an order we know will be
-          // rejected. `optionBuyingPower` is `null` for cash accounts on a
-          // raw payload — fall through to the post-submit reconciliation in
-          // that case rather than blocking trades.
-          const obp = this.liveTradierBalance?.optionBuyingPower;
-          if (typeof obp === 'number' && Number.isFinite(obp) && obp < notionalCost) {
-            tradierVoid(
-              `Tradier option buying power $${obp.toFixed(2)} < required $${notionalCost.toFixed(2)}`,
-            );
-            continue;
-          }
-          // TRA-483 — second-line DTBP guard right before the broker call.
-          // Mirrors the OBP pre-check above so a balance that arrives between
-          // the upstream signal-time gate and the broker submit still gets
-          // refused locally instead of relying on Tradier to cancel the
-          // order with the cryptic "insufficient day-trade buying power".
-          const dtbp = this.liveTradierBalance?.dayTradeBuyingPower;
-          if (typeof dtbp === 'number' && Number.isFinite(dtbp) && dtbp < notionalCost) {
-            tradierVoid(
-              `Tradier day-trade buying power $${dtbp.toFixed(2)} < required $${notionalCost.toFixed(2)}`,
-            );
-            continue;
-          }
-
-          // TRA-374 — replace the legacy market `buy_to_open` with the
-          // smart-open limit walk so we no longer pay the ask by default on
-          // wide-spread RV contracts. The walk starts at `mid + 1¢` and
-          // steps 0.25/0.5/0.75/1.0 toward the ask if unfilled. If the walk
-          // exhausts (final attempt = ask, still unfilled) we void the
-          // paper open with a clear skip reason rather than crossing through
-          // with a market order at a worse price.
-          let mirrored = false;
-          try {
-            const outcome = await submitSmartBuyToOpen(
-              this.tradierLiveClient,
-              opened.optionSymbol,
-              opened.contracts,
-            );
-            if (outcome.status === 'filled') {
-              const midStr = outcome.mid == null ? 'n/a' : `$${outcome.mid.toFixed(2)}`;
-              log.info('smart-open filled', {
-                component: 'smart-open',
-                avgFillPrice: outcome.avgFillPrice,
-                mid: midStr,
-                ask: outcome.ask,
-                walk: outcome.walk,
-                optionSymbol: opened.optionSymbol,
-                qty: opened.contracts,
-                order: outcome.orderId,
-              });
-              mirrored = true;
-            } else if (outcome.status === 'rejected') {
-              const idSuffix = outcome.orderId !== undefined ? ` ${outcome.orderId}` : '';
-              tradierVoid(`Tradier order${idSuffix} rejected: ${outcome.reason}`);
-              this.refreshTradierBalance().catch(() => {});
-              continue;
-            } else if (outcome.status === 'walk_exhausted') {
-              tradierVoid(outcome.reason);
-              this.refreshTradierBalance().catch(() => {});
-              continue;
-            } else {
-              // no_quote
-              tradierVoid(outcome.reason);
-              continue;
-            }
-          } catch (err: unknown) {
-            tradierVoid(
-              `Tradier live buy threw ${err instanceof Error ? err.message : String(err)}`,
-            );
-            continue;
-          }
+          const mirrored = await this.mirrorLiveOptionOpen(opened, surfaceLiveSkip);
           if (!mirrored) continue;
         }
 
@@ -4835,6 +4746,112 @@ export class SignalEngine {
       } catch (err: unknown) {
         log.warn('RV scan failed', { sym, reason: err instanceof Error ? err.message : String(err) });
       }
+    }
+  }
+
+  /**
+   * TRA-1490 / TRA-1491 — shared broker-submit seam for the DARK live single-leg
+   * option order paths (RV single-leg long + directional call/put).
+   *
+   * Mirrors a freshly-opened paper option to a REAL Tradier `buy_to_open` via the
+   * TRA-374 smart-open limit walk, with the same option-buying-power (TRA-319) /
+   * day-trade-buying-power (TRA-483) pre-checks and void-on-reject rollback
+   * (TRA-332) the RV path has always used — so both dark live routes share ONE
+   * audited broker path instead of divergent copies. Returns `true` when the
+   * paper open stands (the broker filled, or there is nothing to mirror against —
+   * no client / symbol / contracts — matching the pre-extraction behaviour where
+   * the mirror `if` simply didn't run); returns `false` when the open was voided
+   * (insufficient BP, no quote, rejected, walk-exhausted, or a thrown submit) and
+   * the caller must skip that fill.
+   *
+   * The CALLER owns the live arm-flag + `tradierLiveOptionsEnabled` gate (each
+   * path re-asserts its own dark flag there, defense-in-depth) BEFORE calling
+   * this; this seam assumes the mirror should be attempted and never reads a
+   * flag itself.
+   */
+  private async mirrorLiveOptionOpen(
+    opened: import('@trading-app/shared').OptionPosition,
+    surfaceLiveSkip: (reason: string) => void,
+  ): Promise<boolean> {
+    if (!this.tradierLiveClient || !opened.optionSymbol || !(opened.contracts > 0)) {
+      return true;
+    }
+    const notionalCost = opened.premiumPaid * opened.contracts * 100;
+    // TRA-332 — surface the void reason on the dashboard so the user sees why no
+    // trade opened, not just a silent log line.
+    const tradierVoid = (reason: string): void => {
+      log.warn('voiding paper open', {
+        positionId: opened.id,
+        optionSymbol: opened.optionSymbol,
+        reason,
+      });
+      this.optionsAccount.voidOpenOption(opened.id);
+      surfaceLiveSkip(reason);
+    };
+
+    // Pre-check: bail before submitting an order we know will be rejected.
+    // `optionBuyingPower` is `null` for cash accounts on a raw payload — fall
+    // through to the post-submit reconciliation in that case rather than blocking.
+    const obp = this.liveTradierBalance?.optionBuyingPower;
+    if (typeof obp === 'number' && Number.isFinite(obp) && obp < notionalCost) {
+      tradierVoid(
+        `Tradier option buying power $${obp.toFixed(2)} < required $${notionalCost.toFixed(2)}`,
+      );
+      return false;
+    }
+    // TRA-483 — second-line DTBP guard right before the broker call so a balance
+    // that arrives between the signal-time gate and the submit is still refused
+    // locally instead of relying on Tradier to cancel with a cryptic reason.
+    const dtbp = this.liveTradierBalance?.dayTradeBuyingPower;
+    if (typeof dtbp === 'number' && Number.isFinite(dtbp) && dtbp < notionalCost) {
+      tradierVoid(
+        `Tradier day-trade buying power $${dtbp.toFixed(2)} < required $${notionalCost.toFixed(2)}`,
+      );
+      return false;
+    }
+
+    // TRA-374 — smart-open limit walk (mid+1¢ stepping toward the ask) rather than
+    // paying the ask with a market order. A walk that exhausts voids the paper
+    // open with a clear skip reason instead of crossing through at a worse price.
+    try {
+      const outcome = await submitSmartBuyToOpen(
+        this.tradierLiveClient,
+        opened.optionSymbol,
+        opened.contracts,
+      );
+      if (outcome.status === 'filled') {
+        const midStr = outcome.mid == null ? 'n/a' : `$${outcome.mid.toFixed(2)}`;
+        log.info('smart-open filled', {
+          component: 'smart-open',
+          avgFillPrice: outcome.avgFillPrice,
+          mid: midStr,
+          ask: outcome.ask,
+          walk: outcome.walk,
+          optionSymbol: opened.optionSymbol,
+          qty: opened.contracts,
+          order: outcome.orderId,
+        });
+        return true;
+      }
+      if (outcome.status === 'rejected') {
+        const idSuffix = outcome.orderId !== undefined ? ` ${outcome.orderId}` : '';
+        tradierVoid(`Tradier order${idSuffix} rejected: ${outcome.reason}`);
+        this.refreshTradierBalance().catch(() => {});
+        return false;
+      }
+      if (outcome.status === 'walk_exhausted') {
+        tradierVoid(outcome.reason);
+        this.refreshTradierBalance().catch(() => {});
+        return false;
+      }
+      // no_quote
+      tradierVoid(outcome.reason);
+      return false;
+    } catch (err: unknown) {
+      tradierVoid(
+        `Tradier live buy threw ${err instanceof Error ? err.message : String(err)}`,
+      );
+      return false;
     }
   }
 
@@ -5574,23 +5591,31 @@ export class SignalEngine {
    * This pass closes that gap with a SIMPLE, deterministic rule: for each scanned
    * symbol read the SAME TRA-734 confluence trend the rest of the option stack
    * uses; pick the nearest-the-money LIQUID call (uptrend) or put (downtrend)
-   * from the live selector chain, and open ONE single-leg long in the DEMO paper
-   * book via {@link PaperOptionsAccount.openOptionFromRvCandidate} (`mode:'demo'`,
-   * no equity override → NO Tradier mirror, no live capital). Across the equity
+   * from the live selector chain, and open ONE single-leg long via
+   * {@link PaperOptionsAccount.openOptionFromRvCandidate}. Across the equity
    * watchlist some symbols trend up and some down, so the book reliably shows
    * BOTH a call and a put — the evidence the board has been asking for.
    *
+   * TRA-1490 — this is ALSO the DARK live directional order path (Phase 1 dark
+   * build). In demo it opens on the paper book with no equity override → NO
+   * Tradier mirror (byte-for-byte the TRA-1114 behaviour). In live it runs ONLY
+   * when the caller has confirmed `ENABLE_OPTION_LIVE_DIRECTIONAL` is armed (a
+   * SEPARATE board approval, gated on TRA-382 + TRA-1436); when armed it sizes
+   * off real Tradier equity and mirrors the paper open to a real `buy_to_open`
+   * via {@link mirrorLiveOptionOpen}. Default OFF ⇒ live never reaches here.
+   *
    * The account's own trading-window / dedup / daily-cap / sizing gates still
    * bound how many open; this method only feeds it directional entries. It is
-   * fire-and-forget per symbol — one bad chain can't take down the tick — and is
-   * caller-gated to `mode === 'demo'` + the flag, so live capital is never
-   * reachable from here. Live promotion stays gated on TRA-382 regardless.
+   * fire-and-forget per symbol — one bad chain can't take down the tick.
    */
   private async evaluateDemoDirectional(symbols: string[]): Promise<void> {
     // Defense-in-depth: the caller flag-/mode-gates, but re-check so a direct
-    // unit-test call also no-ops with the flag off and never touches Tradier or
-    // the live book.
-    if (!isOptionDemoDirectionalEnabled() || this.mode !== 'demo' || !this.rvScanner) return;
+    // unit-test call also no-ops with the flags off and never touches Tradier or
+    // the live book. Demo requires the demo flag; live requires the DARK live
+    // arm flag (read from process env only — never the demo-flags file override).
+    const demoOn = this.mode === 'demo' && isOptionDemoDirectionalEnabled();
+    const liveOn = this.mode === 'live' && isOptionLiveDirectionalEnabled(process.env);
+    if ((!demoOn && !liveOn) || !this.rvScanner) return;
 
     const asOf = Date.now();
     const dtePrefs = { min: this.rvDteMin, max: this.rvDteMax, target: this.rvDteTarget };
@@ -5786,12 +5811,47 @@ export class SignalEngine {
           sentimentIcBand: null,
           agentConviction: null,
         };
-        // Demo/paper open ONLY — `this.mode` is 'demo' (caller-gated), no equity
-        // override → no Tradier mirror. Account window/dedup/cap/sizing bound it.
+        // TRA-1490 — surface a live directional signal whose broker mirror was
+        // suppressed/voided instead of skipping silently (mirrors the RV path's
+        // `surfaceLiveSkip`). No-op wiring in demo (never invoked there).
+        const surfaceLiveSkip = (reason: string): void => {
+          signal.mode = 'live';
+          signal.liveSkipReason = reason;
+          this.recentSignals.unshift(signal);
+          this.emitSignalAlert(signal);
+          if (this.recentSignals.length > MAX_SIGNALS) this.recentSignals.pop();
+          this.dailySignals.push({
+            id: signal.id,
+            symbol: signal.symbol,
+            type: 'relative_value',
+            firedAt: signal.timestamp,
+          });
+          log.warn('live directional signal suppressed', { optionSymbol: signal.optionSymbol, reason });
+        };
+
+        // TRA-1490 — size off the user's REAL Tradier equity in live (the paper
+        // account is seeded from demo equity and never rebased on a live flip, so
+        // without this override the open would size for paper equity). Prefer
+        // `optionBuyingPower` (tightest), fall back to `totalEquity`. Demo passes
+        // `undefined` → paper-equity sizing, unchanged. TRA-355 defense-in-depth:
+        // require `tradierLiveOptionsEnabled` so equity-only live keeps paper
+        // sizing (and never mirrors below).
+        let liveEquity: number | undefined;
+        if (liveOn && this.tradierLiveOptionsEnabled && this.liveTradierBalance) {
+          const obp = this.liveTradierBalance.optionBuyingPower;
+          const total = this.liveTradierBalance.totalEquity;
+          liveEquity = typeof obp === 'number' && Number.isFinite(obp)
+            ? obp
+            : (Number.isFinite(total) ? total : undefined);
+        }
+
+        // Open on the active book. Demo: no equity override → no Tradier mirror
+        // (byte-for-byte TRA-1114). Live (armed): sizes off `liveEquity` and the
+        // paper open is mirrored to a real `buy_to_open` just below.
         const opened = this.optionsAccount.openOptionFromRvCandidate(
           signal,
           this.mode,
-          undefined,
+          liveEquity,
           spot,
           directionalJournalSetup,
         );
@@ -5800,11 +5860,27 @@ export class SignalEngine {
         // TRA-1476 / TRA-1408 — record this directional open against the shared
         // per-name same-session counter so BOTH the TRA-1476 per-name cap above
         // and the TRA-1408 churn brake at the other open chokepoints see the
-        // directional stacking that previously escaped them (no-op on live).
+        // directional stacking that previously escaped them.
         // TRA-1564 B2 — tag the sleeve `directional` so this open feeds the
         // directional-only cap read + health view (the other four chokepoints record
         // as `other` and count toward the cross-sleeve churn brake only).
         this.recordChurnOpen(sym, 'directional', asOf);
+
+        // TRA-1490 — DARK live-capital broker mirror. Re-assert the arm flag on
+        // the broker-submit condition itself (defense-in-depth): the caller +
+        // method guards already `return` in live when the flag is off, but
+        // re-check here so no future refactor can let a real `buy_to_open` fire on
+        // an unarmed live book. `tradierLiveOptionsEnabled` (TRA-355) keeps orders
+        // off Tradier for equity-only live users. The shared seam rolls the paper
+        // open back and surfaces the reason when the broker leg fails → skip.
+        if (
+          this.mode === 'live'
+          && isOptionLiveDirectionalEnabled(process.env)
+          && this.tradierLiveOptionsEnabled
+        ) {
+          const mirrored = await this.mirrorLiveOptionOpen(opened, surfaceLiveSkip);
+          if (!mirrored) continue;
+        }
 
         this.emitOptionFillAlert(opened);
         signal.mode = this.mode;
@@ -5817,7 +5893,8 @@ export class SignalEngine {
           type: 'relative_value',
           firedAt: signal.timestamp,
         });
-        log.info('demo directional option opened (TRA-1114)', {
+        log.info('directional option opened (TRA-1114/TRA-1490)', {
+          mode: this.mode,
           symbol: sym,
           optionType: signal.optionType,
           strike: signal.strike,

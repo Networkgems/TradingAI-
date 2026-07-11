@@ -427,3 +427,44 @@ export const OPTION_LIVE_RV_LONG_FLAG = 'ENABLE_OPTION_LIVE_RV_LONG';
 export function isOptionLiveRvLongEnabled(env: NodeJS.ProcessEnv = process.env): boolean {
   return flagOn(env[OPTION_LIVE_RV_LONG_FLAG]);
 }
+
+// --------------------------------------------------------------------------
+// TRA-1490 (parent TRA-1479 "Demo to Live", family options-directional) — DARK
+// live-capital gate on the deterministic DIRECTIONAL (near-ATM single-leg long
+// call/put) options order path.
+//
+// Unlike the RV single-leg long path (TRA-1491), which already ran in BOTH demo
+// and live, the directional "ignition" entry (`evaluateDemoDirectional`,
+// TRA-1114) has always been caller-gated to `mode === 'demo'` and opens with no
+// equity override → no Tradier mirror. There is no live directional order path
+// to "flip on"; this flag is what BUILDS one (Phase 1 of the TRA-1490 gated
+// promotion plan). The board authorized building the live path via the TRA-1479
+// checkbox interaction (accepted 2026-07-08 by `local-board`) but explicitly did
+// NOT arm real capital — arming is a SEPARATE `request_board_approval` gated on
+// the option-chain capture window (TRA-382) + sandbox forward-validation
+// (TRA-1436).
+//
+// Like the RV live flag, this is a SECRET-ADJACENT live toggle (it authorizes
+// real orders), so it is read ONLY from the process env (never the
+// `demo-flags.json` file override) and is NOT on the demo-flag allowlist. OFF by
+// default ⇒ the directional pass NEVER runs in live (the caller gate is
+// demo-OR-armed-live), no live position is created, and no Tradier order is
+// placed — the shipped state carries zero real-capital risk. When an operator
+// arms it on `tradingai-bqb1` (only after board approval), the live directional
+// entry sizes off the real Tradier equity and mirrors the paper open to a real
+// `buy_to_open` through the SAME audited smart-open broker seam the RV long path
+// uses. Demo behaviour is byte-for-byte unchanged regardless (the live gate is
+// live-mode only; the demo pass still keys off ENABLE_OPTION_DEMO_DIRECTIONAL).
+// --------------------------------------------------------------------------
+
+export const OPTION_LIVE_DIRECTIONAL_FLAG = 'ENABLE_OPTION_LIVE_DIRECTIONAL';
+
+/**
+ * True iff the DARK live-capital directional (call/put) single-leg options order
+ * path is armed (accepts 1/true/yes/on). Default OFF. Read from the process env
+ * only — this is a live-order toggle, never sourced from the demo-flags file
+ * override.
+ */
+export function isOptionLiveDirectionalEnabled(env: NodeJS.ProcessEnv = process.env): boolean {
+  return flagOn(env[OPTION_LIVE_DIRECTIONAL_FLAG]);
+}
