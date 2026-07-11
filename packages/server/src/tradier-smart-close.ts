@@ -26,7 +26,18 @@ const closeLog = logger.child({ module: 'tradier-smart-close' });
  *    or a wide-spread bid). Response is 409.
  */
 export type SmartSellOutcome =
-  | { status: 'filled'; orderId: number; avgFillPrice: number; limitPrice: number }
+  | {
+      status: 'filled';
+      orderId: number;
+      avgFillPrice: number;
+      limitPrice: number;
+      /**
+       * TRA-1601 — midpoint at the moment the helper pulled the quote, or `null`
+       * on a single-sided (`last`) path where a mid can't be triangulated. Lets
+       * the caller compute realised close-side slippage vs mid for telemetry.
+       */
+      mid: number | null;
+    }
   | { status: 'rejected'; orderId?: number; reason: string }
   | { status: 'pending'; orderId: number; limitPrice: number }
   | { status: 'no_quote'; reason: string };
@@ -126,6 +137,9 @@ export async function submitSmartSellToClose(
         orderId: order.id,
         avgFillPrice: typeof avgFill === 'number' && Number.isFinite(avgFill) ? avgFill : limitPrice,
         limitPrice,
+        // TRA-1601 — mid only exists on a two-sided (mid) path; a single-sided
+        // `last` fallback can't triangulate one, so telemetry drops the datum.
+        mid: limitPath.kind === 'mid' ? (limitPath.bid + limitPath.ask) / 2 : null,
       };
     }
     if (TRADIER_REJECTED_STATUSES.has(status)) {

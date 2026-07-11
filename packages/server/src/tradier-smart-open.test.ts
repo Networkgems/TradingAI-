@@ -1,5 +1,5 @@
 import { describe, it, expect, vi } from 'vitest';
-import { derivePricingPath, submitSmartBuyToOpen, SMART_BUY_WALK_FRACTIONS } from './tradier-smart-open.js';
+import { derivePricingPath, submitSmartBuyToOpen, SMART_BUY_WALK_FRACTIONS, buildWalkLimits } from './tradier-smart-open.js';
 import type {
   TradierOptionQuote,
   TradierOptionsClient,
@@ -233,5 +233,89 @@ describe('submitSmartBuyToOpen', () => {
     for (const call of buySpy.mock.calls) {
       expect(call[2]).toBeCloseTo(0.75, 2);
     }
+  });
+});
+
+// TRA-1601 (A) — the configurable chase ladder: buildWalkLimits geometry and
+// the new bounded cross-tick tail past the ask.
+describe('buildWalkLimits (TRA-1601 configurable ladder)', () => {
+  it('reproduces the TRA-374 schedule byte-for-byte on the default config', () => {
+    const limits = buildWalkLimits(
+      { kind: 'mid', bid: 1.0, ask: 1.2 },
+      { fractions: [0, 0.25, 0.5, 0.75, 1.0], stepWaitMs: 30_000, maxCrossTicks: 0, tickSize: 0.01 },
+    );
+    // mid 1.10: [mid+0.01, mid+0.25*0.1, mid+0.5*0.1, mid+0.75*0.1, ask]
+    expect(limits.map((x) => Number(x.toFixed(4)))).toEqual([1.11, 1.125, 1.15, 1.175, 1.2]);
+  });
+
+  it('appends bounded cross-tick steps past the ask when maxCrossTicks > 0', () => {
+    const limits = buildWalkLimits(
+      { kind: 'mid', bid: 1.0, ask: 1.2 },
+      { fractions: [0, 1.0], stepWaitMs: 1, maxCrossTicks: 2, tickSize: 0.01 },
+    );
+    // [mid+0.01, ask, ask+0.01, ask+0.02]
+    expect(limits.map((x) => Number(x.toFixed(4)))).toEqual([1.11, 1.2, 1.21, 1.22]);
+  });
+
+  it('ask-only path: N ask attempts then the cross-tick tail', () => {
+    const limits = buildWalkLimits(
+      { kind: 'ask_only', ask: 0.75 },
+      { fractions: [0, 0.5, 1], stepWaitMs: 1, maxCrossTicks: 1, tickSize: 0.01 },
+    );
+    expect(limits.map((x) => Number(x.toFixed(4)))).toEqual([0.75, 0.75, 0.75, 0.76]);
+  });
+});
+
+describe('submitSmartBuyToOpen — cross-tick config end to end', () => {
+  it('crosses one tick past the ask on the final attempt when configured', async () => {
+    // bid 1.00 / ask 1.20, maxCrossTicks 1 → after the ask attempt (1.20) the
+    // walk submits one more at 1.21 which fills.
+    const prices: number[] = [];
+    const buySpy = vi.fn(async (_s: string, _q: number, price: number) => {
+      prices.push(price);
+      return { id: 500 + prices.length, status: 'ok' } as TradierOrderResponse;
+    });
+    const waitSpy = vi.fn(async () =>
+      // fill only on the cross-tick attempt (the 6th submit)
+      prices.length >= 6
+        ? ({ id: 1, status: 'filled', avg_fill_price: 1.21 } as TradierOrderDetail)
+        : ({ id: 1, status: 'open' } as TradierOrderDetail),
+    );
+    const client = buildClient({
+      getOptionQuote: vi.fn(async () => ({ symbol: 'X', bid: 1.0, ask: 1.2 } as TradierOptionQuote)),
+      buyContractsLimit: buySpy,
+      waitForOrderTerminalStatus: waitSpy,
+      cancelOrder: vi.fn(async () => undefined),
+    });
+
+    const outcome = await submitSmartBuyToOpen(client, 'X', 1, {
+      timeoutMs: 1,
+      sleep: async () => {},
+      walk: { fractions: [0, 0.25, 0.5, 0.75, 1.0], stepWaitMs: 1, maxCrossTicks: 1, tickSize: 0.01 },
+    });
+
+    expect(outcome.status).toBe('filled');
+    expect((outcome as { walk: number }).walk).toBe(5); // one past the last fraction index (4)
+    expect(prices[prices.length - 1]).toBeCloseTo(1.21, 2);
+  });
+
+  it('defaults (no walk option) still stop AT the ask — never crosses it', async () => {
+    const prices: number[] = [];
+    const buySpy = vi.fn(async (_s: string, _q: number, price: number) => {
+      prices.push(price);
+      return { id: 1, status: 'ok' } as TradierOrderResponse;
+    });
+    const client = buildClient({
+      getOptionQuote: vi.fn(async () => ({ symbol: 'X', bid: 1.0, ask: 1.2 } as TradierOptionQuote)),
+      buyContractsLimit: buySpy,
+      waitForOrderTerminalStatus: vi.fn(async () => ({ id: 1, status: 'open' } as TradierOrderDetail)),
+      cancelOrder: vi.fn(async () => undefined),
+    });
+
+    const outcome = await submitSmartBuyToOpen(client, 'X', 1, { timeoutMs: 1, sleep: async () => {} });
+
+    expect(outcome.status).toBe('walk_exhausted');
+    // No price ever exceeds the ask.
+    expect(Math.max(...prices)).toBeCloseTo(1.2, 2);
   });
 });

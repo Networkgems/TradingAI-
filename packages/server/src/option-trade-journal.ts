@@ -173,7 +173,12 @@ export interface OptionTradeJournalRecord extends OptionTradeJournalOpen {
 // Append-only line shapes (discriminated by `kind`).
 type OpenLine = { kind: 'open'; rec: OptionTradeJournalOpen };
 type CloseLine = { kind: 'close'; id: string; close: OptionTradeJournalClose };
-type JournalLine = OpenLine | CloseLine;
+// TRA-1601 — amend the OPEN row's measured entry slippage. In LIVE the true
+// mark-vs-fill slippage isn't known until the smart-open mirror fills (the OPEN
+// row was written at `premiumPaid == rawMark`, so entrySlippageUsd was 0). This
+// line supersedes that value without an in-place rewrite.
+type AmendEntrySlippageLine = { kind: 'amend_entry_slippage'; id: string; entrySlippageUsd: number };
+type JournalLine = OpenLine | CloseLine | AmendEntrySlippageLine;
 
 function defaultStoreFile(): string {
   const root = process.env['DATA_DIR'] ?? join(__dirname, '..', 'data');
@@ -196,6 +201,17 @@ let cache: Map<string, OptionTradeJournalRecord> | null = null;
 function foldLine(map: Map<string, OptionTradeJournalRecord>, line: JournalLine): void {
   if (line.kind === 'open') {
     if (!map.has(line.rec.id)) map.set(line.rec.id, { ...line.rec, outcome: 'OPEN' });
+    return;
+  }
+  if (line.kind === 'amend_entry_slippage') {
+    // TRA-1601 — supersede the measured entry slippage on the existing row. A
+    // non-finite value is ignored; an amend for an unknown id is dropped (never
+    // resurrects a row that has no open).
+    const rec = map.get(line.id);
+    if (!rec) return;
+    if (typeof line.entrySlippageUsd === 'number' && Number.isFinite(line.entrySlippageUsd)) {
+      map.set(line.id, { ...rec, entrySlippageUsd: line.entrySlippageUsd });
+    }
     return;
   }
   const existing = map.get(line.id);
@@ -300,6 +316,31 @@ export async function recordOptionTradeOpen(open: OptionTradeJournalOpen): Promi
   log.info('option trade journal opened', {
     id: open.id, symbol: open.symbol, structure: open.structure, mode: open.mode,
   });
+  return true;
+}
+
+/**
+ * TRA-1601 — amend the MEASURED entry-side slippage on an already-open row.
+ * Used by the LIVE smart-open mirror: the OPEN row is written at
+ * `premiumPaid == rawMark` (entrySlippageUsd = 0) before the broker fill is
+ * known; once the smart-open walk fills we know the real avgFillPrice-vs-mid
+ * slippage and reconcile it back here. No-op (returns false) when the flag is
+ * off, the row is unknown, or it is already closed (an amend must not rewrite a
+ * settled round trip). Idempotent-safe: re-amending an open row with the same
+ * value is harmless.
+ */
+export async function recordOptionTradeEntrySlippage(
+  id: string,
+  entrySlippageUsd: number,
+): Promise<boolean> {
+  if (!isOptionTradeJournalEnabled()) return false;
+  if (!Number.isFinite(entrySlippageUsd)) return false;
+  const map = await ensureLoaded();
+  const existing = map.get(id);
+  if (!existing || existing.outcome !== 'OPEN') return false;
+  foldLine(map, { kind: 'amend_entry_slippage', id, entrySlippageUsd });
+  await appendLine({ kind: 'amend_entry_slippage', id, entrySlippageUsd });
+  log.info('option trade journal entry-slippage amended', { id, entrySlippageUsd });
   return true;
 }
 

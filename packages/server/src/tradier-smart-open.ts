@@ -12,6 +12,11 @@ import {
   dteFromExpiration,
   type DayTradingGuardrailConfig,
 } from '@trading-app/shared';
+import {
+  type MakerWalkConfig,
+  DEFAULT_MAKER_WALK_FRACTIONS,
+  resolveMakerWalkConfig,
+} from './option-maker-config.js';
 import { logger } from './observability/index.js';
 
 const openLog = logger.child({ module: 'tradier-smart-open' });
@@ -38,22 +43,44 @@ export type SmartBuyOutcome =
       orderId: number;
       avgFillPrice: number;
       limitPrice: number;
-      /** 0-indexed walk step that produced the fill (0 = mid+1¢, 4 = ask). */
+      /**
+       * 0-indexed walk step that produced the fill. `0 = mid+1¢`; the last
+       * fraction step is the ask; any step BEYOND `fractions.length − 1` is a
+       * bounded cross-tick step past the ask (TRA-1601 `maxCrossTicks`).
+       */
       walk: number;
       /** Midpoint at the moment the helper pulled the quote, or `null` on an ask-only path. */
       mid: number | null;
       /** Ask at the moment the helper pulled the quote. */
       ask: number;
+      /**
+       * TRA-1601 (telemetry) — wall-clock ms from the first order submit to the
+       * terminal `filled` poll. Feeds the maker-fill time-to-fill rollup.
+       */
+      timeToFillMs: number;
     }
   | { status: 'rejected'; orderId?: number; reason: string }
   | { status: 'walk_exhausted'; reason: string; lastLimitPrice: number }
   | { status: 'no_quote'; reason: string };
 
 export interface SmartBuyOptions {
-  /** Wait window per attempt (defaults to 30s — spec calls for a longer hold than smart-close). */
+  /**
+   * Wait window per attempt. Defaults to the resolved {@link MakerWalkConfig}
+   * `stepWaitMs` (30 s unless `OPTION_MAKER_STEP_WAIT_MS` overrides it). An
+   * explicit `timeoutMs` still wins for callers/tests that pass one.
+   */
   timeoutMs?: number;
+  /**
+   * TRA-1601 (deliverable A) — the configurable chase ladder. Defaults to
+   * {@link resolveMakerWalkConfig}(process.env), which is the byte-for-byte
+   * TRA-374 schedule unless the `OPTION_MAKER_*` env knobs override it.
+   * Injectable so tests exercise a specific ladder without touching env.
+   */
+  walk?: MakerWalkConfig;
   /** Injectable for tests so we don't need real timers. */
   sleep?: (ms: number) => Promise<void>;
+  /** Clock seam for the time-to-fill telemetry (ms epoch). Defaults to `Date.now`. */
+  clock?: () => number;
   /**
    * TRA-598 (C3) — no-day-trading guardrail config. Defaults to the shipped
    * {@link DAY_TRADING_GUARDRAIL}. The entry-DTE floor is enforced here as a
@@ -73,9 +100,11 @@ export interface SmartBuyOptions {
  * the ask. Attempt 4 lands exactly at the ask, after which we give up rather
  * than crossing through it.
  *
- * Exported for unit tests.
+ * TRA-1601 — this is now the DEFAULT of the configurable ladder; the live
+ * schedule comes from {@link resolveMakerWalkConfig}. Kept as a re-export of
+ * {@link DEFAULT_MAKER_WALK_FRACTIONS} for the existing unit tests.
  */
-export const SMART_BUY_WALK_FRACTIONS: readonly number[] = [0, 0.25, 0.5, 0.75, 1.0];
+export const SMART_BUY_WALK_FRACTIONS: readonly number[] = DEFAULT_MAKER_WALK_FRACTIONS;
 
 /**
  * TRA-374 — entry-side limit walk for a long option contract. Pulls a fresh
@@ -105,8 +134,13 @@ export async function submitSmartBuyToOpen(
   qty: number,
   options: SmartBuyOptions = {},
 ): Promise<SmartBuyOutcome> {
-  const timeoutMs = options.timeoutMs ?? 30_000;
+  // TRA-1601 (A) — the chase ladder is now configurable. Default resolves from
+  // env (byte-for-byte TRA-374 unless overridden). An explicit `timeoutMs`
+  // still wins over the ladder's `stepWaitMs` for callers that pass one.
+  const walkConfig = options.walk ?? resolveMakerWalkConfig();
+  const timeoutMs = options.timeoutMs ?? walkConfig.stepWaitMs;
   const sleep = options.sleep ?? ((ms) => new Promise<void>((r) => setTimeout(r, ms)));
+  const clock = options.clock ?? Date.now;
 
   // TRA-598 (C3) — no-day-trading backstop. The OCC symbol encodes the
   // expiration; refuse a sub-threshold-DTE `buy_to_open` before any broker call.
@@ -145,10 +179,16 @@ export async function submitSmartBuyToOpen(
     };
   }
 
+  // TRA-1601 (A) — materialise the full ladder of limit prices up front:
+  // the fraction walk (mid → ask) plus any bounded cross-tick steps past the
+  // ask. `walkLimits.length === walkConfig.fractions.length` when
+  // `maxCrossTicks === 0` (the byte-for-byte TRA-374 default).
+  const walkLimits = buildWalkLimits(path, walkConfig);
+  const startedAt = clock();
   let lastOrderId: number | undefined;
   let lastLimitPrice = 0;
-  for (let attempt = 0; attempt < SMART_BUY_WALK_FRACTIONS.length; attempt += 1) {
-    const limitPrice = roundToCent(priceForAttempt(path, attempt));
+  for (let attempt = 0; attempt < walkLimits.length; attempt += 1) {
+    const limitPrice = roundToCent(walkLimits[attempt]);
     // Tradier rejects limit prices ≤ 0 on equity options; bail with no_quote
     // instead of submitting a doomed order.
     if (!Number.isFinite(limitPrice) || limitPrice <= 0) {
@@ -186,6 +226,7 @@ export async function submitSmartBuyToOpen(
         walk: attempt,
         mid: path.kind === 'mid' ? (path.bid + path.ask) / 2 : null,
         ask: path.ask,
+        timeToFillMs: Math.max(0, clock() - startedAt),
       };
     }
     if (TRADIER_REJECTED_STATUSES.has(status)) {
@@ -258,24 +299,40 @@ export function derivePricingPath(quote: TradierOptionQuote | null): MidPath | A
 }
 
 /**
- * TRA-374 — limit price for the n-th attempt along the configured pricing
- * path. Mid path walks from `mid + 1¢` toward the ask:
- *  - attempt 0: mid + min(1¢, half-spread)
- *  - attempt 1: mid + 0.25 × (ask − mid)
- *  - attempt 2: mid + 0.50 × (ask − mid)
- *  - attempt 3: mid + 0.75 × (ask − mid)
- *  - attempt 4: ask
+ * TRA-1601 (A) — materialise the configured chase ladder into an ordered list
+ * of raw (pre-round) limit prices, one per attempt.
  *
- * On attempt 0 we cap the 1¢ bias at half the spread so we don't accidentally
- * jump past the ask on a 1-tick-wide quote (bid 0.20 / ask 0.21 → mid 0.205;
- * mid + 0.01 = 0.215 would already be over the ask). On ask-only paths the
- * limit is always the ask.
+ * Mid path (`config.fractions` mid→ask):
+ *  - fraction 0 → `mid + min(tick, half-spread)` (the `mid + 1¢` bias step). We
+ *    cap the tick bias at half the spread so a 1-tick-wide quote (bid 0.20 /
+ *    ask 0.21 → mid 0.205) doesn't jump past the ask on the very first step.
+ *  - fraction f (0 < f ≤ 1) → `mid + f × (ask − mid)` (f = 1 lands on the ask).
+ *  - then `maxCrossTicks` extra steps at `ask + k × tick` (k = 1…maxCrossTicks)
+ *    — the bounded "last resort" that crosses a few ticks past the ask.
+ *
+ * Ask-only path (one-sided quote — no bid to triangulate a midpoint): every
+ * fraction attempt is the ask (the same fill a market buy would produce),
+ * preserving the TRA-374 N-identical-ask-submits behaviour, followed by the
+ * same cross-tick tail.
+ *
+ * With the default config (`fractions = [0,0.25,0.5,0.75,1]`, `maxCrossTicks =
+ * 0`, `tick = 0.01`) this reproduces the TRA-374 schedule byte-for-byte.
+ * Exported for unit tests.
  */
-function priceForAttempt(path: MidPath | AskOnlyPath, attempt: number): number {
-  if (path.kind === 'ask_only') return path.ask;
+export function buildWalkLimits(path: MidPath | AskOnlyPath, config: MakerWalkConfig): number[] {
+  const tick = config.tickSize;
+  const limits: number[] = [];
+  if (path.kind === 'ask_only') {
+    for (let i = 0; i < config.fractions.length; i += 1) limits.push(path.ask);
+    for (let k = 1; k <= config.maxCrossTicks; k += 1) limits.push(path.ask + k * tick);
+    return limits;
+  }
   const mid = (path.bid + path.ask) / 2;
   const halfSpread = (path.ask - path.bid) / 2;
-  if (attempt === 0) return mid + Math.min(0.01, Math.max(0, halfSpread));
-  const fraction = SMART_BUY_WALK_FRACTIONS[Math.min(attempt, SMART_BUY_WALK_FRACTIONS.length - 1)] ?? 1;
-  return mid + (path.ask - mid) * fraction;
+  for (const f of config.fractions) {
+    if (f === 0) limits.push(mid + Math.min(tick, Math.max(0, halfSpread)));
+    else limits.push(mid + (path.ask - mid) * f);
+  }
+  for (let k = 1; k <= config.maxCrossTicks; k += 1) limits.push(path.ask + k * tick);
+  return limits;
 }

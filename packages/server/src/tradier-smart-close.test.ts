@@ -100,7 +100,15 @@ describe('submitSmartSellToClose', () => {
 
     const outcome = await submitSmartSellToClose(client, 'X', 2);
 
-    expect(outcome).toEqual({ status: 'filled', orderId: 100, avgFillPrice: 0.11, limitPrice: 0.11 });
+    // TRA-1601 — the filled outcome now carries the mid for close-side slippage
+    // telemetry: (0.05 + 0.17) / 2 = 0.11.
+    expect(outcome).toEqual({
+      status: 'filled',
+      orderId: 100,
+      avgFillPrice: 0.11,
+      limitPrice: 0.11,
+      mid: (0.05 + 0.17) / 2,
+    });
     // Midpoint of (0.05 + 0.17) / 2 = 0.11, rounded to a cent.
     expect(sellSpy).toHaveBeenCalledWith('X', 2, 0.11);
     // No cancellation on a clean fill.

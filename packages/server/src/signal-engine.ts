@@ -111,6 +111,8 @@ import {
   submitSmartSellToClose,
 } from './tradier-smart-close.js';
 import { submitSmartBuyToOpen } from './tradier-smart-open.js';
+import { recordMakerFill } from './option-maker-fill-ledger.js';
+import { recordOptionTradeEntrySlippage } from './option-trade-journal.js';
 import { isLiveEntryGatePassed } from './capital-gate-manifest.js';
 import { isSma200DemoForwardTestEnabled } from './sma200-forward-test-flag.js';
 import { resolveDemoFlagEnv } from './demo-flags.js';
@@ -4831,8 +4833,39 @@ export class SignalEngine {
           qty: opened.contracts,
           order: outcome.orderId,
         });
+        // TRA-1601 — reconcile the realised avgFillPrice-vs-mid slippage back
+        // into the journal + maker-fill telemetry. Fire-and-forget so a
+        // telemetry / journal write can never block or throw into the order
+        // path. Slippage is only measurable when we walked a real midpoint
+        // (mid path); an ask-only fill leaves entrySlippage unmeasured.
+        const realizedVsMidUsd =
+          outcome.mid == null
+            ? undefined
+            : (outcome.avgFillPrice - outcome.mid) * opened.contracts * 100;
+        if (realizedVsMidUsd !== undefined) {
+          recordOptionTradeEntrySlippage(opened.id, realizedVsMidUsd).catch(() => {});
+        }
+        recordMakerFill({
+          ts: Date.now(),
+          side: 'open',
+          mode: 'live',
+          symbol: opened.optionSymbol,
+          result: 'filled',
+          walk: outcome.walk,
+          timeToFillMs: outcome.timeToFillMs,
+          ...(realizedVsMidUsd !== undefined ? { realizedVsMidUsd } : {}),
+        }).catch(() => {});
         return true;
       }
+      // TRA-1601 — record the non-fill outcomes too so the fill-RATE denominator
+      // is every live chase, not just the fills.
+      recordMakerFill({
+        ts: Date.now(),
+        side: 'open',
+        mode: 'live',
+        symbol: opened.optionSymbol,
+        result: outcome.status,
+      }).catch(() => {});
       if (outcome.status === 'rejected') {
         const idSuffix = outcome.orderId !== undefined ? ` ${outcome.orderId}` : '';
         tradierVoid(`Tradier order${idSuffix} rejected: ${outcome.reason}`);
@@ -9324,6 +9357,18 @@ export class SignalEngine {
                   remainder,
                   { maxAttempts: 1 },
                 );
+                // TRA-1601 — close-side maker-fill telemetry for the remainder
+                // resubmit. Fire-and-forget; positive realizedVsMid = cost.
+                recordMakerFill({
+                  ts: Date.now(),
+                  side: 'close',
+                  mode: env === 'production' ? 'live' : 'demo',
+                  symbol: row.optionSymbol,
+                  result: resub.status,
+                  ...(resub.status === 'filled' && resub.mid != null
+                    ? { realizedVsMidUsd: (resub.mid - resub.avgFillPrice) * remainder * 100 }
+                    : {}),
+                }).catch(() => {});
                 if (resub.status === 'pending') {
                   acct.setPendingCloseOrderId(row.optionId, resub.orderId);
                   stillPending += 1;

@@ -74,6 +74,12 @@ import {
   computeOptionLearnedWeights,
   type OptionLearnedWeights,
 } from '../learned-option-weights.js';
+import {
+  listMakerFillEvents,
+  summarizeMakerFills,
+  isOptionMakerTelemetryEnabled,
+} from '../option-maker-fill-ledger.js';
+import { resolveMakerWalkConfig } from '../option-maker-config.js';
 import { isLearnedShrinkageEnabled } from '../learned-shrinkage-flag.js';
 import {
   optionWeightsCache,
@@ -1433,6 +1439,39 @@ export function registerLiveHealthRoutes(app: Express, deps: LiveHealthDeps): vo
       return;
     }
     res.json(report);
+  });
+
+  // TRA-1601 (TRA-1600 A/telemetry) — maker-fill routing readout. Surfaces the
+  // resolved chase ladder (steps / per-step wait / max cross ticks) plus the
+  // per-side fill-rate, avg realised-vs-mid, and time-to-fill rollup from the
+  // maker-fill ledger. Like /option-journal the ledger carries no balances/PII
+  // (just OCC symbols + fill geometry), so this is unauthenticated. `enabled`
+  // mirrors ENABLE_OPTION_MAKER_TELEMETRY so the board can see whether capture
+  // is armed; served empty (honest zero) when off. Optional `?mode=demo|live`
+  // and `?sinceTs=<epoch ms>` scope the fold to a post-arm / per-book cohort.
+  app.get('/api/health/option-maker-fills', async (req, res) => {
+    const modeRaw = req.query['mode'];
+    const mode = modeRaw === 'demo' || modeRaw === 'live' ? modeRaw : undefined;
+    const sinceRaw = req.query['sinceTs'];
+    const sinceParsed = typeof sinceRaw === 'string' ? Number(sinceRaw) : NaN;
+    const sinceTs = Number.isFinite(sinceParsed) ? sinceParsed : undefined;
+    const events = await listMakerFillEvents({ mode, sinceTs });
+    const enabled = isOptionMakerTelemetryEnabled();
+    const ladder = resolveMakerWalkConfig();
+    res.json({
+      ok: true,
+      time: new Date(now()).toISOString(),
+      enabled,
+      ladder: {
+        walkSteps: ladder.fractions,
+        stepWaitMs: ladder.stepWaitMs,
+        maxCrossTicks: ladder.maxCrossTicks,
+        tickSize: ladder.tickSize,
+      },
+      ...(mode ? { mode } : {}),
+      ...(sinceTs !== undefined ? { sinceTs } : {}),
+      summary: summarizeMakerFills(events, enabled),
+    });
   });
 
   // TRA-1000 — external-intel source-quality scorer readout. Folds the

@@ -370,6 +370,7 @@ import {
   DEFAULT_SHORT_SQUEEZE_THRESHOLDS,
 } from '@trading-app/engine';
 import { submitSmartSellToClose } from './tradier-smart-close.js';
+import { recordMakerFill } from './option-maker-fill-ledger.js';
 import type { TradierEnv } from '@trading-app/shared';
 import { fetchQuotes, fetchDailyCandles, fetchTradierDailyCandles, fetchShortInterestFundamentals } from './yahoo-feed.js';
 import {
@@ -6785,6 +6786,18 @@ app.post('/api/options/:id/close', requireAuth, async (req, res) => {
       return;
     }
     const outcome = await submitSmartSellToClose(client, optionSymbol, contracts);
+    // TRA-1601 — close-side maker-fill telemetry. Fire-and-forget; positive
+    // realizedVsMid = received below mid = cost. `production` is the live book.
+    recordMakerFill({
+      ts: Date.now(),
+      side: 'close',
+      mode: imported.env === 'production' ? 'live' : 'demo',
+      symbol: optionSymbol,
+      result: outcome.status,
+      ...(outcome.status === 'filled' && outcome.mid != null
+        ? { realizedVsMidUsd: (outcome.mid - outcome.avgFillPrice) * contracts * 100 }
+        : {}),
+    }).catch(() => {});
     if (outcome.status === 'no_quote') {
       log.warn('tradier-import sell_to_close aborted', {
         optionSymbol,
