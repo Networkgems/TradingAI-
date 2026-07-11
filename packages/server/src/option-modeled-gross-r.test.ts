@@ -1,0 +1,136 @@
+import { describe, it, expect } from 'vitest';
+import {
+  estimateModeledGrossR,
+  resolveModeledGrossRConfig,
+  DEFAULT_MODELED_GROSS_R_CONFIG,
+} from './option-modeled-gross-r.js';
+import { admitByCostAwareGate } from './option-cost-gate.js';
+
+// TRA-1602 (deliverable C of TRA-1600) — per-candidate modeled gross R estimator.
+// PROPOSED construction pending QuantTrader spec sign-off; these tests pin the
+// strawman's arithmetic so a spec change is a visible, intentional diff.
+
+describe('estimateModeledGrossR — RV/OTM 2:1 structures', () => {
+  it('reduces to 3·|delta| − 1 on a mark*1.5 / mark*0.75 (2:1) structure', () => {
+    // rewardR = (1.5m − m)/(m − 0.75m) = 0.5/0.25 = 2; winProb = |delta|.
+    // modeledGrossR = |delta|·2 − (1 − |delta|) = 3·|delta| − 1.
+    const mark = 2.0;
+    for (const delta of [0.3, 0.4, 0.5, 0.6, 0.7]) {
+      const est = estimateModeledGrossR({
+        mark,
+        delta,
+        targetPrice: mark * 1.5,
+        stopPrice: mark * 0.75,
+      });
+      expect(est.rewardR).toBeCloseTo(2, 10);
+      expect(est.rewardSource).toBe('target_stop');
+      expect(est.modeledGrossR).toBeCloseTo(3 * delta - 1, 10);
+    }
+  });
+
+  it('clears the shipped 0.8R options bar around |delta| ≈ 0.60', () => {
+    const mark = 3.0;
+    // Boundary is |delta| ≈ 0.60 (3·0.60 − 1 = 0.80); use deltas comfortably
+    // either side so the assertion is not at the float-exact 0.80 knife-edge.
+    const at61 = estimateModeledGrossR({ mark, delta: 0.61, targetPrice: mark * 1.5, stopPrice: mark * 0.75 });
+    const at59 = estimateModeledGrossR({ mark, delta: 0.59, targetPrice: mark * 1.5, stopPrice: mark * 0.75 });
+    // 3·0.61 − 1 = 0.83 → admits; 3·0.59 − 1 = 0.77 → rejects.
+    expect(admitByCostAwareGate(at61.modeledGrossR, 'single_leg_rv').admit).toBe(true);
+    expect(admitByCostAwareGate(at59.modeledGrossR, 'single_leg_otm').admit).toBe(false);
+  });
+
+  it('rejects a far-OTM lottery delta (0.40 floor) as scratch-tier', () => {
+    const mark = 0.5;
+    const est = estimateModeledGrossR({ mark, delta: 0.4, targetPrice: mark * 1.5, stopPrice: mark * 0.75 });
+    // 3·0.40 − 1 = 0.20R — well under the 0.8R options bar.
+    expect(est.modeledGrossR).toBeCloseTo(0.2, 10);
+    expect(admitByCostAwareGate(est.modeledGrossR, 'single_leg_otm').admit).toBe(false);
+  });
+
+  it('uses the real target/stop reward ratio, not a hardcoded 2, for skewed exits', () => {
+    // A 3:1 structure (target +75%, stop −25% of premium) at 0.5 delta.
+    const mark = 4.0;
+    const est = estimateModeledGrossR({ mark, delta: 0.5, targetPrice: mark * 1.75, stopPrice: mark * 0.75 });
+    expect(est.rewardR).toBeCloseTo(3, 10); // 0.75 / 0.25
+    expect(est.modeledGrossR).toBeCloseTo(0.5 * 3 - 0.5, 10); // 1.0R
+  });
+});
+
+describe('estimateModeledGrossR — directional path (no fixed target/stop)', () => {
+  it('falls back to the signal riskRewardRatio when target/stop are absent', () => {
+    const est = estimateModeledGrossR({ mark: 2.5, delta: 0.55, riskRewardRatio: 2 });
+    expect(est.rewardSource).toBe('risk_reward_ratio');
+    expect(est.rewardR).toBeCloseTo(2, 10);
+    expect(est.modeledGrossR).toBeCloseTo(3 * 0.55 - 1, 10); // 0.65R
+  });
+
+  it('falls back to the config default reward when neither target/stop nor ratio given', () => {
+    const est = estimateModeledGrossR({ mark: 2.5, delta: 0.55 });
+    expect(est.rewardSource).toBe('default');
+    expect(est.rewardR).toBeCloseTo(DEFAULT_MODELED_GROSS_R_CONFIG.defaultRewardR, 10);
+  });
+
+  it('rejects a near-ATM 0.50-delta directional read as scratch-tier under the bar', () => {
+    // 0/0 target/stop (the deterministic directional path) → default 2:1.
+    const est = estimateModeledGrossR({ mark: 2.5, delta: 0.5, targetPrice: 0, stopPrice: 0, riskRewardRatio: 2 });
+    expect(est.rewardSource).toBe('risk_reward_ratio'); // 0/0 is not a valid target/stop
+    expect(est.modeledGrossR).toBeCloseTo(0.5, 10); // 3·0.5 − 1
+    expect(admitByCostAwareGate(est.modeledGrossR, 'directional').admit).toBe(false);
+  });
+});
+
+describe('estimateModeledGrossR — guards', () => {
+  it('returns NaN (→ gate reject) on non-finite / non-positive mark or delta', () => {
+    for (const bad of [
+      { mark: Number.NaN, delta: 0.5 },
+      { mark: 0, delta: 0.5 },
+      { mark: -1, delta: 0.5 },
+      { mark: 2, delta: Number.NaN },
+      { mark: 2, delta: Number.POSITIVE_INFINITY },
+    ]) {
+      const est = estimateModeledGrossR(bad);
+      expect(Number.isNaN(est.modeledGrossR)).toBe(true);
+      expect(admitByCostAwareGate(est.modeledGrossR, 'single_leg_rv').admit).toBe(false);
+    }
+  });
+
+  it('uses |delta| — puts (negative delta) model identically to calls', () => {
+    const call = estimateModeledGrossR({ mark: 2, delta: 0.62, targetPrice: 3, stopPrice: 1.5 });
+    const put = estimateModeledGrossR({ mark: 2, delta: -0.62, targetPrice: 3, stopPrice: 1.5 });
+    expect(put.modeledGrossR).toBeCloseTo(call.modeledGrossR, 10);
+  });
+
+  it('caps the win probability so a deep-ITM ~1.0 delta is not near-certain', () => {
+    const est = estimateModeledGrossR({ mark: 5, delta: 0.99, targetPrice: 7.5, stopPrice: 3.75 });
+    expect(est.winProb).toBeCloseTo(DEFAULT_MODELED_GROSS_R_CONFIG.winProbCap, 10); // 0.95, not 0.99
+  });
+
+  it('ignores an inverted/degenerate target<stop and falls back to the ratio', () => {
+    const est = estimateModeledGrossR({ mark: 2, delta: 0.6, targetPrice: 1.5, stopPrice: 2.5, riskRewardRatio: 2 });
+    expect(est.rewardSource).toBe('risk_reward_ratio');
+  });
+});
+
+describe('resolveModeledGrossRConfig — env knobs', () => {
+  it('defaults to the proposed reference config when unset', () => {
+    expect(resolveModeledGrossRConfig({})).toEqual(DEFAULT_MODELED_GROSS_R_CONFIG);
+  });
+
+  it('applies a QuantTrader win-prob haircut multiplier', () => {
+    const cfg = resolveModeledGrossRConfig({ OPTION_COST_GATE_WIN_PROB_DELTA_MULT: '0.8' });
+    expect(cfg.winProbDeltaMultiplier).toBeCloseTo(0.8, 10);
+    // At 0.8× a 0.60 delta now models winProb 0.48 → 0.48·2 − 0.52 = 0.44R (rejected).
+    const est = estimateModeledGrossR({ mark: 2, delta: 0.6, targetPrice: 3, stopPrice: 1.5 }, cfg);
+    expect(est.modeledGrossR).toBeCloseTo(0.44, 10);
+    expect(admitByCostAwareGate(est.modeledGrossR, 'single_leg_rv').admit).toBe(false);
+  });
+
+  it('rejects malformed / out-of-bounds knobs and keeps the default', () => {
+    const cfg = resolveModeledGrossRConfig({
+      OPTION_COST_GATE_WIN_PROB_DELTA_MULT: 'abc',
+      OPTION_COST_GATE_DEFAULT_REWARD_R: '-3',
+      OPTION_COST_GATE_WIN_PROB_CAP: '2',
+    });
+    expect(cfg).toEqual(DEFAULT_MODELED_GROSS_R_CONFIG);
+  });
+});
