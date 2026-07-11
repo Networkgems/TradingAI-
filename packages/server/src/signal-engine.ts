@@ -1,4 +1,4 @@
-import { OrbStrategy, BbFadeStrategy, IchimokuStrategy, SupertrendConfluenceStrategy, confluenceSide, supertrend, supertrendLatest, reversalChecklist, adx, atr, atrPct, donchian, supportResistance, blackScholesDelta, blackScholesGreeks, daysToExpiration, bookGiveBackDecision, correlatedExposureDecision, entryGreeksGateDecision, chandelierStop, stopModifyDecision, selectRvLongCandidate, selectShadowOptionSignal, emaPullbackTrigger, volumeConfirmedBreakout, computePutCallRatio, rsi, TradierOptionsClient, TradierOrderClient, TRADIER_REJECTED_STATUSES, TRADIER_TERMINAL_STATUSES, evaluateSma200, SMA200_MIN_BARS, SMA200_DEBOUNCE_BARS, composeTechnicalSnapshot, resampleCandles, TF_BUCKET_MS, OptionsRiskBreaker, DEFAULT_OPTIONS_BREAKER_PARAMS } from '@trading-app/engine';
+import { OrbStrategy, BbFadeStrategy, IchimokuStrategy, SupertrendConfluenceStrategy, confluenceSide, supertrend, supertrendLatest, reversalChecklist, adx, atr, atrPct, donchian, supportResistance, blackScholesDelta, blackScholesGreeks, daysToExpiration, bookGiveBackDecision, correlatedExposureDecision, entryGreeksGateDecision, chandelierStop, stopModifyDecision, selectRvLongCandidate, selectShadowOptionSignal, emaPullbackTrigger, volumeConfirmedBreakout, computePutCallRatio, computeOiTotals, rsi, TradierOptionsClient, TradierOrderClient, TRADIER_REJECTED_STATUSES, TRADIER_TERMINAL_STATUSES, evaluateSma200, SMA200_MIN_BARS, SMA200_DEBOUNCE_BARS, composeTechnicalSnapshot, resampleCandles, TF_BUCKET_MS, OptionsRiskBreaker, DEFAULT_OPTIONS_BREAKER_PARAMS } from '@trading-app/engine';
 import { buildExposureBuckets, DEFAULT_EXIT_PARAMS, DEFAULT_MULTILEG_EXIT_PARAMS } from '@trading-app/engine';
 import type { StrategySelectorInput, ContractQuote, OptionTrend, RvLongTrendSide, ExitState, ExitParams, MultiLegExitParams, SharedTickIndicators, RelativeValueScannerOptions, OptionChainRow, IvRvScannerOptions, IvRvMispricingCandidate, ExposureBucket, ExposurePositionRisk, CorrelatedExposureDecision } from '@trading-app/engine';
 import type { TradierAccountBalance } from '@trading-app/engine';
@@ -56,6 +56,7 @@ import {
 } from './strategy-introspection.js';
 import { isOptionShadowEnabled, isOptionPhaseBEnabled, emitShadowOptionSignal, shadowSignalToSpreadParams, OPTION_SHADOW_EMERGENCY_OFF, DEMO_SPREAD_MAX_LOSS_PCT_CAP } from './option-shadow-ledger.js';
 import { isPcrShadowEnabled, recordPcrObservation, type PcrTrioVerdict } from './pcr-shadow-ledger.js';
+import { isOiShadowEnabled, recordOiObservation } from './oi-shadow-ledger.js';
 import { isOptionExecEnabled, isOptionEmaPullbackEnabled, isOptionVolumeBreakoutEnabled, resolveRvLongDteOverride, resolveRvMinDailyVolume, isOptionDemoDirectionalEnabled, isOptionIvRvScannerEnabled, isOptionIvRvRoutingEnabled, resolveIvRvRoutingOverride, isOptionShortPremiumScannerEnabled, isOptionLiveRvLongEnabled, isOptionLiveDirectionalEnabled } from './option-exec-flag.js';
 import { scanIvRvFromSnapshot, recordIvRvScan } from './iv-rv-scanner.js';
 import { scanShortPremiumFromSnapshot, recordShortPremiumScan } from './short-premium-scanner.js';
@@ -6426,6 +6427,60 @@ export class SignalEngine {
             await recordPcrObservation({ underlying: sym, asof: asOf, pcr, trio });
           } catch (err: unknown) {
             optionShadowLog.warn('pcr shadow capture threw', {
+              symbol: sym,
+              reason: err instanceof Error ? err.message : String(err),
+            });
+          }
+        }
+
+        // TRA-1610 (parent TRA-1607) — SHADOW Open-Interest-trend capture. Rides
+        // the SAME warm chain snapshot (zero extra Tradier fetch), flag-gated
+        // (ENABLE_OI_SHADOW, default OFF), observe-only. Folds Σ OI across the
+        // tracked expiry, then the ledger derives the session-over-session
+        // oiDelta/priceDelta and the price×OI 4-quadrant conviction read, stamped
+        // with the paired 21EMA+RSI+Vol trio verdict for QuantTrader's TRA-532
+        // gate. NEVER routes an order, never touches sizing/exits. OCC OI is a
+        // once-daily read, so the one-row-per-session dedup in the ledger keeps
+        // both legs of the quadrant on the same daily cadence.
+        if (isOiShadowEnabled()) {
+          try {
+            const oi = computeOiTotals(rows, { expiries: [expiration] });
+            const oiSwingSide: 'call' | 'put' | null =
+              decision?.side === 'buy' ? 'call' : decision?.side === 'sell' ? 'put' : null;
+            const oiRsiVal = rsi(series.map((c) => c.close));
+            const oiRsiOk = Number.isFinite(oiRsiVal);
+            let oiTrio: PcrTrioVerdict | null = null;
+            if (oiSwingSide) {
+              const emaFired = emaPullbackTrigger(series, oiSwingSide).fired;
+              const volConfirmed = volumeConfirmedBreakout(series, oiSwingSide).fired;
+              const inBand = oiRsiOk && oiRsiVal >= 50 && oiRsiVal <= 70;
+              oiTrio = {
+                side: oiSwingSide,
+                emaPullbackFired: emaFired,
+                rsi: oiRsiOk ? oiRsiVal : null,
+                rsiInMomentumBand: inBand,
+                volumeConfirmed: volConfirmed,
+                trioFired: emaFired && inBand && volConfirmed,
+              };
+            } else {
+              oiTrio = {
+                side: 'none',
+                emaPullbackFired: false,
+                rsi: oiRsiOk ? oiRsiVal : null,
+                rsiInMomentumBand: false,
+                volumeConfirmed: false,
+                trioFired: false,
+              };
+            }
+            await recordOiObservation({
+              underlying: sym,
+              asof: asOf,
+              oi,
+              underlyingClose: Number.isFinite(lastClose) ? lastClose : null,
+              trio: oiTrio,
+            });
+          } catch (err: unknown) {
+            optionShadowLog.warn('oi shadow capture threw', {
               symbol: sym,
               reason: err instanceof Error ? err.message : String(err),
             });

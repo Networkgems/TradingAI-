@@ -254,6 +254,7 @@ import { initIdeaJournal, listJournalEntries } from './options-idea-journal.js';
 import { initShadowLedger, listShadowSignals } from './shadow-signal-ledger.js';
 import { initOptionShadowLedger, listOptionShadowSignals, isOptionShadowEnabled, OPTION_SHADOW_EMERGENCY_OFF } from './option-shadow-ledger.js';
 import { initPcrShadowLedger, listPcrShadowSignals, isPcrShadowEnabled, usableSignalCount, PCR_Z_WINDOW_SESSIONS } from './pcr-shadow-ledger.js';
+import { initOiShadowLedger, listOiShadowSignals, isOiShadowEnabled, usableSignalCount as usableOiSignalCount } from './oi-shadow-ledger.js';
 import {
   initReversalShadowLedger,
   listReversalShadowSignals,
@@ -730,6 +731,13 @@ await initOptionShadowLedger();
 // shadow pass appends one row per underlying per session when ENABLE_PCR_SHADOW
 // is set; the capture is observe-only and never touches sizing or exits.
 await initPcrShadowLedger();
+
+// TRA-1610 (parent TRA-1607) — warm the flag-gated SHADOW Open-Interest-trend
+// ledger so the read endpoint has history right after boot. The signal-engine
+// option-shadow pass appends one row per underlying per session when
+// ENABLE_OI_SHADOW is set; the capture is observe-only and never touches sizing
+// or exits.
+await initOiShadowLedger();
 
 // TRA-921 (TRA-920 B) — warm the OBSERVE-ONLY reversal-checklist shadow ledger so
 // the read endpoint has history right after boot. The signal-engine tick appends
@@ -4799,6 +4807,34 @@ app.get('/api/health/pcr-shadow-signals', async (_req, res) => {
       reason: err instanceof Error ? err.message : String(err),
     });
     res.status(500).json({ error: 'Failed to read pcr shadow ledger' });
+  }
+});
+
+// TRA-1610 (parent TRA-1607) — read-only probe over the SHADOW Open-Interest-
+// trend ledger, open like the other shadow probes so QuantTrader can pull the
+// setup->quadrant dataset for the TRA-532 promotion gate without Render admin
+// creds. Reports the usable-signal count (rows carrying a non-null price x OI
+// quadrant read) against the >=200 promotion threshold plus the recent rows,
+// each stamped with its paired 21EMA+RSI+Vol trio verdict. Observe-only:
+// nothing here routes an order.
+app.get('/api/health/oi-shadow-signals', async (_req, res) => {
+  try {
+    const signals = await listOiShadowSignals();
+    const usable = usableOiSignalCount(signals);
+    res.json({
+      issue: 'TRA-1610',
+      flagEnabled: isOiShadowEnabled(),
+      promotionThreshold: 200,
+      count: signals.length,
+      usableCount: usable,
+      promotionReady: usable >= 200,
+      signals,
+    });
+  } catch (err) {
+    log.error('oi-shadow-signals health probe failed', {
+      reason: err instanceof Error ? err.message : String(err),
+    });
+    res.status(500).json({ error: 'Failed to read oi shadow ledger' });
   }
 });
 

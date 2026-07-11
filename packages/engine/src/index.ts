@@ -476,6 +476,21 @@ export type {
   PcrContrarian,
 } from './options/put-call-ratio.js';
 export {
+  computeOiTotals,
+  classifyOiQuadrant,
+  oiQuadrantToConviction,
+  OI_TREND_DEFAULTS,
+} from './options/oi-trend.js';
+export type {
+  OiTotals,
+  OiTotalsOptions,
+  OiQuadrant,
+  OiConviction,
+  OiQuadrantRead,
+  OiQuadrantReadOptions,
+  DeltaDirection,
+} from './options/oi-trend.js';
+export {
   emaPullbackTrigger,
   volumeConfirmedBreakout,
   EMA_PULLBACK_DEFAULTS,
