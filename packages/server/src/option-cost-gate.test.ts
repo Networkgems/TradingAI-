@@ -21,11 +21,11 @@ describe('isOptionCostAwareGateEnabled', () => {
   });
 });
 
-describe('admissionBarR — default config reproduces the plan headline', () => {
-  it('options structures resolve to the ~0.8R bar', () => {
-    // costModel 0.10 + 0.50 = 0.60, + 0.20 margin = 0.80, floored at 0.80.
+describe('admissionBarR — default config reproduces the plan headline (25%-premium R, TRA-1603)', () => {
+  it('options structures resolve to the ~1.25R bar', () => {
+    // costModel 0.05 + 1.00 = 1.05, + 0.20 margin = 1.25, above the 1.20 floor.
     for (const s of ['single_leg_otm', 'single_leg_rv', 'directional', 'bull_put']) {
-      expect(admissionBarR(s)).toBeCloseTo(0.8, 10);
+      expect(admissionBarR(s)).toBeCloseTo(1.25, 10);
     }
   });
 
@@ -36,9 +36,9 @@ describe('admissionBarR — default config reproduces the plan headline', () => 
   });
 
   it('the options floor lifts the bar above the pure cost model when set high', () => {
-    const cfg = { ...DEFAULT_COST_GATE_CONFIG, optionsMinGrossR: 1.0 };
-    expect(admissionBarR('single_leg_rv', cfg)).toBeCloseTo(1.0, 10);
-    // model bar (0.60+0.20=0.80) is below the 1.0 floor, so the floor wins.
+    const cfg = { ...DEFAULT_COST_GATE_CONFIG, optionsMinGrossR: 1.5 };
+    expect(admissionBarR('single_leg_rv', cfg)).toBeCloseTo(1.5, 10);
+    // model bar (1.05+0.20=1.25) is below the 1.5 floor, so the floor wins.
   });
 });
 
@@ -59,13 +59,13 @@ describe('structureCostR', () => {
 });
 
 describe('admitByCostAwareGate', () => {
-  it('admits an options idea at/above the 0.8R bar and rejects below', () => {
-    expect(admitByCostAwareGate(0.8, 'single_leg_rv').admit).toBe(true);
-    expect(admitByCostAwareGate(0.81, 'single_leg_otm').admit).toBe(true);
-    const rej = admitByCostAwareGate(0.2, 'single_leg_otm');
+  it('admits an options idea at/above the 1.25R bar and rejects below', () => {
+    expect(admitByCostAwareGate(1.25, 'single_leg_rv').admit).toBe(true);
+    expect(admitByCostAwareGate(1.26, 'single_leg_otm').admit).toBe(true);
+    const rej = admitByCostAwareGate(0.9, 'single_leg_otm');
     expect(rej.admit).toBe(false);
     expect(rej.reason).toMatch(/cost-aware gate/);
-    expect(rej.reason).toMatch(/0\.80R bar/);
+    expect(rej.reason).toMatch(/1\.25R bar/);
   });
 
   it('never admits on a non-finite modeled gross R', () => {
@@ -80,15 +80,15 @@ describe('admitByCostAwareGate', () => {
   });
 
   it('equity admits at a much lower gross than options', () => {
-    // 0.3R gross: rejected on options (< 0.8), admitted on equity (>= 0.22).
+    // 0.3R gross: rejected on options (< 1.25), admitted on equity (>= 0.22).
     expect(admitByCostAwareGate(0.3, 'single_leg_rv').admit).toBe(false);
     expect(admitByCostAwareGate(0.3, 'equity').admit).toBe(true);
   });
 
   it('surfaces the bar decomposition on the verdict', () => {
     const v = admitByCostAwareGate(0.5, 'single_leg_rv');
-    expect(v.barR).toBeCloseTo(0.8, 10);
-    expect(v.costModelR).toBeCloseTo(0.6, 10);
+    expect(v.barR).toBeCloseTo(1.25, 10);
+    expect(v.costModelR).toBeCloseTo(1.05, 10);
     expect(v.safetyMarginR).toBeCloseTo(0.2, 10);
   });
 });
@@ -118,7 +118,7 @@ describe('resolveCostGateConfig', () => {
       OPTION_COST_GATE_COMMISSION_R: '-1',
       OPTION_COST_GATE_MIN_GROSS_R: 'abc',
     });
-    expect(cfg.optionsCost.commissionR).toBeCloseTo(0.1, 10);
-    expect(cfg.optionsMinGrossR).toBeCloseTo(0.8, 10);
+    expect(cfg.optionsCost.commissionR).toBeCloseTo(0.05, 10);
+    expect(cfg.optionsMinGrossR).toBeCloseTo(1.2, 10);
   });
 });

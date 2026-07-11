@@ -70,15 +70,16 @@ function parseNonNegFloat(raw: string | undefined): number | undefined {
 /**
  * The per-structure cost inputs (R-multiples of the trade's at-risk basis).
  *  - `commissionR`: Tradier options commission, round trip. $0.35/contract each
- *    way = $0.70/contract; on a single-leg long with R≈$40–180 (40–60% of a
- *    $100–300 premium) that is ~0.05–0.10R — we default to the conservative
- *    upper end (0.10R). Bounded and unavoidable.
+ *    way = $0.70/contract; against the estimator's true R = 25% of premium
+ *    (R≈$50 on a $2.00 premium) that is ~0.014R — we default to a conservative
+ *    0.05R (TRA-1603). Bounded and unavoidable.
  *  - `makerAdjustedSpreadCrossR`: the residual bid-ask spread cross AFTER
- *    maker-fill routing (Lever A) recovers ~60–70% of the raw 0.70–0.78R spread
- *    bucket. The plan models post-maker residual at 0.22–0.29R; we default to a
- *    conservative 0.50R so the shipped options bar lands at the plan's headline
- *    ~0.8R (0.10 + 0.50 + 0.20 margin) until the MEASURED (D) rollup lets
- *    QuantTrader tighten it toward the modeled post-maker figure.
+ *    maker-fill routing (Lever A) recovers ~60–70% of the raw spread bucket.
+ *    Expressed in the estimator's 25%-of-premium R (TRA-1603 decision #3), the
+ *    plan's post-maker residual is ~0.44–0.58R; we default to a conservative
+ *    1.00R (the DOMINANT cost term) so the shipped options bar lands at ~1.25R
+ *    until the MEASURED (D) rollup lets QuantTrader tighten it toward the
+ *    measured post-maker figure.
  */
 export interface StructureCost {
   commissionR: number;
@@ -118,16 +119,39 @@ export interface CostGateConfig {
 
 /**
  * The shipped reference config. Options bar resolves to
- * 0.10 (commission) + 0.50 (maker-adjusted spread) + 0.20 (margin) = 0.80R,
- * floored at 0.80R — the plan's headline options admission bar. Equity bar
+ * 0.05 (commission) + 1.00 (maker-adjusted spread) + 0.20 (margin) = 1.25R,
+ * floored at 1.20R — the plan's headline options admission bar RESTATED to the
+ * estimator's canonical R unit (TRA-1603 sign-off, decision #3). Equity bar
  * resolves to 0.00 + 0.02 + 0.20 = 0.22R (kept low per the plan; equity is the
  * least cost-impaired leg).
+ *
+ * ── R-basis correction (TRA-1603, QuantTrader) ────────────────────────────────
+ * The estimator ({@link estimateModeledGrossR}) defines R as the trade's at-risk
+ * STOP distance = `mark - stop = 0.25·premium` (the RV/OTM sites stop at
+ * mark·0.75). The original shipped inputs (0.10 commission / 0.50 spread /
+ * 0.80 floor) were derived against a looser `R ≈ 40–60% of premium` — roughly
+ * 2× the true stop distance. Dollar cost is unit-invariant, so expressed against
+ * the smaller true R the cost multiple ~doubles: a worked $2.00-premium example
+ * modeled +0.80R gross yet lost ~$11/contract net under the old 0.80R bar. The
+ * inputs below are restated to the estimator's 25%-of-premium R so both sides of
+ * `modeledGrossR >= costModel + margin` share the same R unit (spread cross
+ * doubled 0.50→1.00; commission $0.70/contract vs R≈$50 ≈ 0.014, kept at a
+ * conservative 0.05; floor lifted 0.80→1.20). Effective bar ≈ 1.25R ⇒ admits at
+ * `3·|delta| − 1 ≥ 1.25`, i.e. |delta| ≥ ~0.75 — the intended "fire fewer,
+ * higher-edge" cut that rejects the far-OTM lottery deltas and near-ATM 0.50
+ * directional reads bleeding the demo book net-negative.
+ *
+ * These are INTERIM (modeled, not measured). Deliverable D's measured slippage
+ * ledger is the real source: as it accrues, pull SPREAD_CROSS_R toward the
+ * measured post-maker residual. `optionsMinGrossR` (the floor) is the fast RELAX
+ * knob if forward validation shows the ~0.75-delta bar starves the sample —
+ * lower it before touching the cost inputs.
  */
 export const DEFAULT_COST_GATE_CONFIG: CostGateConfig = {
-  optionsCost: { commissionR: 0.1, makerAdjustedSpreadCrossR: 0.5 },
+  optionsCost: { commissionR: 0.05, makerAdjustedSpreadCrossR: 1.0 },
   equityCost: { commissionR: 0.0, makerAdjustedSpreadCrossR: 0.02 },
   safetyMarginR: 0.2,
-  optionsMinGrossR: 0.8,
+  optionsMinGrossR: 1.2,
 };
 
 /**

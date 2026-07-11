@@ -28,21 +28,23 @@ describe('estimateModeledGrossR — RV/OTM 2:1 structures', () => {
     }
   });
 
-  it('clears the shipped 0.8R options bar around |delta| ≈ 0.60', () => {
+  it('clears the corrected 1.25R options bar around |delta| ≈ 0.75 (TRA-1603 R-basis)', () => {
     const mark = 3.0;
-    // Boundary is |delta| ≈ 0.60 (3·0.60 − 1 = 0.80); use deltas comfortably
-    // either side so the assertion is not at the float-exact 0.80 knife-edge.
-    const at61 = estimateModeledGrossR({ mark, delta: 0.61, targetPrice: mark * 1.5, stopPrice: mark * 0.75 });
-    const at59 = estimateModeledGrossR({ mark, delta: 0.59, targetPrice: mark * 1.5, stopPrice: mark * 0.75 });
-    // 3·0.61 − 1 = 0.83 → admits; 3·0.59 − 1 = 0.77 → rejects.
-    expect(admitByCostAwareGate(at61.modeledGrossR, 'single_leg_rv').admit).toBe(true);
-    expect(admitByCostAwareGate(at59.modeledGrossR, 'single_leg_otm').admit).toBe(false);
+    // The R-basis correction (TRA-1603 decision #3) restated the cost inputs to
+    // the estimator's 25%-premium R, lifting the effective options bar to ~1.25R.
+    // Boundary is now |delta| ≈ 0.75 (3·0.75 − 1 = 1.25); use deltas comfortably
+    // either side so the assertion is not at the float-exact 1.25 knife-edge.
+    const at77 = estimateModeledGrossR({ mark, delta: 0.77, targetPrice: mark * 1.5, stopPrice: mark * 0.75 });
+    const at73 = estimateModeledGrossR({ mark, delta: 0.73, targetPrice: mark * 1.5, stopPrice: mark * 0.75 });
+    // 3·0.77 − 1 = 1.31 → admits; 3·0.73 − 1 = 1.19 → rejects.
+    expect(admitByCostAwareGate(at77.modeledGrossR, 'single_leg_rv').admit).toBe(true);
+    expect(admitByCostAwareGate(at73.modeledGrossR, 'single_leg_otm').admit).toBe(false);
   });
 
   it('rejects a far-OTM lottery delta (0.40 floor) as scratch-tier', () => {
     const mark = 0.5;
     const est = estimateModeledGrossR({ mark, delta: 0.4, targetPrice: mark * 1.5, stopPrice: mark * 0.75 });
-    // 3·0.40 − 1 = 0.20R — well under the 0.8R options bar.
+    // 3·0.40 − 1 = 0.20R — well under the 1.25R options bar (TRA-1603).
     expect(est.modeledGrossR).toBeCloseTo(0.2, 10);
     expect(admitByCostAwareGate(est.modeledGrossR, 'single_leg_otm').admit).toBe(false);
   });

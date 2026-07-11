@@ -116,6 +116,21 @@ import { recordOptionTradeEntrySlippage } from './option-trade-journal.js';
 import { isLiveEntryGatePassed } from './capital-gate-manifest.js';
 import { isSma200DemoForwardTestEnabled } from './sma200-forward-test-flag.js';
 import { resolveDemoFlagEnv } from './demo-flags.js';
+// TRA-1602 (TRA-1600C) — per-candidate cost-aware fire bar on the executing
+// options opens (RV / OTM / directional). The estimator builds a modeled GROSS R
+// from local ingredients (mark, delta, target/stop); the gate nets the structure
+// cost exactly once and rejects scratch-tier ideas. QuantTrader owns the
+// thresholds (TRA-1603 sign-off). DEMO-ONLY + OFF by default at the call sites.
+import {
+  estimateModeledGrossR,
+  resolveModeledGrossRConfig,
+  type ModeledGrossRInputs,
+} from './option-modeled-gross-r.js';
+import {
+  admitByCostAwareGate,
+  isOptionCostAwareGateEnabled,
+  resolveCostGateConfig,
+} from './option-cost-gate.js';
 import type { RelativeValueScannerService } from './relative-value-scanner.js';
 import type { DailySignalRecord, ReportInput } from './reports/eod-report.js';
 import type { PnlTracker } from './pnl-tracker.js';
@@ -3684,6 +3699,43 @@ export class SignalEngine {
   }
 
   /**
+   * TRA-1602 (TRA-1600C, parent TRA-1599 cost-gap plan) — per-candidate
+   * COST-AWARE fire bar for the executing options opens (RV / OTM / directional).
+   *
+   * The executing option sleeves admit on a purely STRUCTURAL basis (delta / IVR
+   * / trend / DTE / greeks-gate / churn) with no per-candidate edge estimate, so
+   * a mass of ~0-edge scratch-tier ideas fire and bleed spread cross net-negative
+   * (measured −0.63R on the live-gate cohort). This gate builds the missing
+   * per-candidate modeled GROSS R ({@link estimateModeledGrossR}) from the local
+   * ingredients (mark, |delta| → win-prob, target/stop → reward:risk) and rejects
+   * any candidate whose modeled edge can't clear the structure's cost-aware bar
+   * ({@link admitByCostAwareGate}: commission + maker-adjusted spread cross +
+   * safety margin). GROSS-in: the gate nets the cost exactly once, so the
+   * estimator must NOT also net it (TRA-1603 decision #4).
+   *
+   * DEMO-ONLY + OFF by default. Enforced only when `mode === 'demo'` AND the
+   * operator has armed `ENABLE_OPTION_COST_AWARE_GATE` via demo-flags.json — the
+   * same containment the greeks-gate / churn-brake / correlated-cap use, so this
+   * flag is structurally incapable of rejecting a LIVE option open regardless of
+   * any service-wide env. Both the estimator config and the cost-gate config are
+   * env-overridable so QuantTrader can retune the delta→win-prob multiplier and
+   * the per-structure cost inputs from the option journal / measured slippage
+   * ledger (deliverable D) WITHOUT a code change.
+   *
+   * Returns a human-readable rejection reason when the candidate should be
+   * skipped, or `null` when admitted OR when the gate is inactive (no behaviour
+   * change — the caller opens exactly as before).
+   */
+  private costAwareGateReject(structure: string, inputs: ModeledGrossRInputs): string | null {
+    if (this.mode !== 'demo') return null;
+    const env = this.resolveDemoFlagEnv();
+    if (!isOptionCostAwareGateEnabled(env)) return null;
+    const estimate = estimateModeledGrossR(inputs, resolveModeledGrossRConfig(env));
+    const verdict = admitByCostAwareGate(estimate.modeledGrossR, structure, resolveCostGateConfig(env));
+    return verdict.admit ? null : verdict.reason;
+  }
+
+  /**
    * TRA-1408 (parent TRA-1406) — per-name same-session OPEN cap. Returns the
    * churn-brake verdict for opening a NEW position on `symbol`. DEMO-SCOPED and
    * DARK by default: a no-op (`blocked:false`) unless `mode !== 'live'` AND the
@@ -4449,6 +4501,25 @@ export class SignalEngine {
           sleeve: 'directional',
         };
 
+        // TRA-1602 (TRA-1600C) — per-candidate cost-aware fire bar. Reject
+        // scratch-tier RV longs whose modeled gross R can't clear the options
+        // structure's cost bar. DEMO-ONLY + OFF by default (see
+        // costAwareGateReject); ingredients are the candidate mark + delta and
+        // the just-derived take-profit / stop (2:1 R:R on the mark·1.5 / mark·0.75
+        // bracket). No-op unless the board arms ENABLE_OPTION_COST_AWARE_GATE.
+        const rvCostReject = this.costAwareGateReject('single_leg_rv', {
+          mark: cheap.mark,
+          delta: cheap.delta,
+          targetPrice: takeProfit,
+          stopPrice: stopLoss,
+          riskRewardRatio: signal.riskRewardRatio,
+        });
+        if (rvCostReject) {
+          signal.signalSkipReason = rvCostReject;
+          log.info('RV long rejected by cost-aware fire bar (TRA-1602)', { sym, reason: rvCostReject });
+          continue;
+        }
+
         // Dedup: same OCC fired in the last hour — avoid re-spamming the feed
         // when the chain stays cheap across multiple scans.
         const recentDup = this.recentSignals.find(
@@ -4978,6 +5049,25 @@ export class SignalEngine {
           mispricingPct: cheap.mispricingPct,
           delta: cheap.delta,
         };
+
+        // TRA-1602 (TRA-1600C) — per-candidate cost-aware fire bar on the OTM
+        // open. Same DEMO-ONLY + OFF-by-default gate as the RV path: reject a
+        // far-OTM lottery-delta candidate whose modeled gross R can't clear the
+        // options cost bar. Placed before the live-suppression bail; a no-op in
+        // live regardless (costAwareGateReject is mode==='demo'-gated). Ingredients
+        // are the OTM candidate mark + delta and its 2:1 take-profit / stop.
+        const otmCostReject = this.costAwareGateReject('single_leg_otm', {
+          mark: cheap.mark,
+          delta: cheap.delta,
+          targetPrice: takeProfit,
+          stopPrice: stopLoss,
+          riskRewardRatio: signal.riskRewardRatio,
+        });
+        if (otmCostReject) {
+          signal.signalSkipReason = otmCostReject;
+          log.info('OTM open rejected by cost-aware fire bar (TRA-1602)', { sym, reason: otmCostReject });
+          continue;
+        }
 
         // TRA-1207 — the live single-leg broker mirror (buy_to_open + DTBP
         // pre-check stack at ~:3400) is RV-specific and lives inside
@@ -5813,6 +5903,26 @@ export class SignalEngine {
           reason: `demo directional (TRA-1114): near-ATM ${wantType} on ${decision?.side === 'buy' ? 'uptrend' : 'downtrend'} confluence`,
           sleeve: 'directional',
         };
+
+        // TRA-1602 (TRA-1600C) — per-candidate cost-aware fire bar on the demo
+        // directional open. This near-ATM ~0.50-delta path is the dominant
+        // scratch churner; the cost bar (|delta| ≥ ~0.75 under the shipped config)
+        // rejects the ~0.50-delta reads that model below the net-cost line.
+        // DEMO-ONLY + OFF by default; caller is already demo/live-arm gated. This
+        // path carries no fixed target/stop (exits are trailed/managed at close),
+        // so rewardR falls back to the signal's riskRewardRatio (2.0) exactly as
+        // QuantTrader specced (TRA-1603 decision #2).
+        const dirCostReject = this.costAwareGateReject('directional', {
+          mark: best.mark,
+          delta: signal.delta,
+          riskRewardRatio: signal.riskRewardRatio,
+        });
+        if (dirCostReject) {
+          log.info('demo directional rejected by cost-aware fire bar (TRA-1602)', {
+            symbol: sym, reason: dirCostReject,
+          });
+          continue;
+        }
 
         // Dedup: same OCC opened/fired in the last hour — don't re-spam the feed
         // when the chain stays selected across multiple passes.
