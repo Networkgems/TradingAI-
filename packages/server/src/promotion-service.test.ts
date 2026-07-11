@@ -300,6 +300,80 @@ describe('TRA-1436 promotion gate — environment-aware (Tradier Sandbox exempt)
   });
 });
 
+// TRA-1590 — de-escalation exemption. A PUT that HOLDS or REDUCES real-capital
+// intent must never block on the current state's gate failure, so an operator
+// can always move toward safety. Only an axis the save NEWLY activates is gated.
+// ENV_USER has no promoted strategies, so any *escalating* save would block.
+describe('TRA-1590 promotion gate — de-escalation saves are never blocked', () => {
+  const FLAG = 'PROMOTION_GATE_ENV_AWARE';
+  const ENV_USER = 'env-aware-user';
+
+  const cryptoLive = (env: 'sandbox' | 'production'): AccountSettings =>
+    ({
+      mode: 'live',
+      cryptoAutoTradingEnabledLive: true,
+      activeStrategyPreset: 'crypto_core',
+      liveTradierEnvOptions: env,
+    } as AccountSettings);
+
+  it('legacy trigger — routing options prod → sandbox while live crypto stays ON is ALLOWED', async () => {
+    // The exact bqb1 deadlock: crypto already live+failing; the operator only
+    // wants to de-escalate options to sandbox. crypto axis is unchanged (on→on),
+    // so no NEW real-capital intent → the save must succeed.
+    delete process.env[FLAG];
+    const previous = cryptoLive('production');
+    const updated = cryptoLive('sandbox');
+    const gate = await svc.evaluateLiveTransitionGate(ENV_USER, updated, previous);
+    expect(gate.allowed).toBe(true);
+    expect(gate.blocked).toHaveLength(0);
+  });
+
+  it('env-aware — holding live crypto ON while options is already sandbox is ALLOWED', async () => {
+    process.env[FLAG] = '1';
+    try {
+      const previous = cryptoLive('sandbox');
+      const updated = cryptoLive('sandbox');
+      const gate = await svc.evaluateLiveTransitionGate(ENV_USER, updated, previous);
+      expect(gate.allowed).toBe(true);
+    } finally {
+      delete process.env[FLAG];
+    }
+  });
+
+  it('env-aware — NEWLY turning options → production still BLOCKS even while crypto is already ON', async () => {
+    // De-escalation must not leak: crypto already-on does not exempt a *new*
+    // options-production escalation in the same PUT.
+    process.env[FLAG] = '1';
+    try {
+      const previous = cryptoLive('sandbox');
+      const updated = cryptoLive('production');
+      const gate = await svc.evaluateLiveTransitionGate(ENV_USER, updated, previous);
+      expect(gate.allowed).toBe(false);
+      expect(gate.blocked[0]?.strategyId).toBe('dca');
+    } finally {
+      delete process.env[FLAG];
+    }
+  });
+
+  it('legacy trigger — NEWLY turning live crypto ON (from Demo) still BLOCKS', async () => {
+    delete process.env[FLAG];
+    const previous = { mode: 'demo', cryptoAutoTradingEnabledLive: false } as AccountSettings;
+    const updated = cryptoLive('sandbox');
+    const gate = await svc.evaluateLiveTransitionGate(ENV_USER, updated, previous);
+    expect(gate.allowed).toBe(false);
+    expect(gate.blocked[0]?.strategyId).toBe('dca');
+  });
+
+  it('omitting the previous snapshot preserves the pre-1590 fail-closed trigger', async () => {
+    // The crypto-start path passes no `previous`; every active axis reads as
+    // newly-on, so a gate-failing live crypto config still blocks.
+    delete process.env[FLAG];
+    const gate = await svc.evaluateLiveTransitionGate(ENV_USER, cryptoLive('sandbox'));
+    expect(gate.allowed).toBe(false);
+    expect(gate.blocked[0]?.strategyId).toBe('dca');
+  });
+});
+
 // TRA-1461 — a hold-mode DCA accumulation clears Stage 2 with ZERO closed
 // trades, proving the old structural blocker (paper leg required closed demo
 // trades a hold-mode strategy never produces) is gone — while still requiring

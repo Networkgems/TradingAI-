@@ -5839,7 +5839,11 @@ app.put('/api/account/settings', requireAuth, async (req, res) => {
   // gate only fires on results that turn/keep live ON — turning live OFF or
   // editing settings in Demo is never blocked (see evaluateLiveTransitionGate).
   try {
-    const gate = await evaluateLiveTransitionGate(username, updated);
+    // TRA-1590 — pass the pre-PUT snapshot so the gate exempts de-escalations
+    // (holding/reducing real-capital intent). Without it an operator whose live
+    // crypto path already fails the gate could not even route options back to
+    // sandbox, deadlocking every move toward safety.
+    const gate = await evaluateLiveTransitionGate(username, updated, current);
     if (!gate.allowed) {
       log.warn('TRA-532 refused live transition', { username, blocked: gate.blocked.map(b => b.strategyId) });
       res.status(422).json({

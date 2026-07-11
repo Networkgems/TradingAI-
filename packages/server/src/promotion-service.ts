@@ -264,6 +264,19 @@ function liveRealCapitalIntent(s: AccountSettings): boolean {
   return liveCryptoOn(s) || optionsProductionIntent(s);
 }
 
+/**
+ * TRA-1590 — the independent REAL-CAPITAL "intent axes" the promotion gate
+ * guards. Each is a distinct way the resulting live config would place
+ * real-money orders. De-escalation logic compares axes before/after a PUT and
+ * gates only an axis the save NEWLY activates, so an operator can always hold
+ * or reduce exposure (e.g. options production -> sandbox while live crypto,
+ * separately being wound down, stays on). A non-live mode has no axes active.
+ */
+function realCapitalIntentAxes(s: AccountSettings): { crypto: boolean; optionsProduction: boolean } {
+  if (s.mode !== 'live') return { crypto: false, optionsProduction: false };
+  return { crypto: liveCryptoOn(s), optionsProduction: optionsProductionIntent(s) };
+}
+
 export interface LiveTransitionGateResult {
   /** True when the live transition is allowed (or irrelevant — not turning/keeping live). */
   allowed: boolean;
@@ -281,10 +294,17 @@ export interface LiveTransitionGateResult {
  * Critically, it never blocks a PUT that turns live OFF or leaves it off — only
  * a PUT whose result is "live auto-trading ON" is gated — so a user can always
  * disable live or edit unrelated settings while in Demo.
+ *
+ * TRA-1590 — it also never blocks a de-escalation: when a `previous` snapshot is
+ * supplied, only a real-capital axis the save NEWLY activates is gated. Holding
+ * or reducing exposure (options production -> sandbox, or any edit that keeps an
+ * already-live axis unchanged) always saves, so an operator can move toward
+ * safety without first clearing a gate the current state already fails.
  */
 export async function evaluateLiveTransitionGate(
   username: string,
   updated: AccountSettings,
+  previous?: AccountSettings,
 ): Promise<LiveTransitionGateResult> {
   // TRA-1436 — environment-aware trigger, behind PROMOTION_GATE_ENV_AWARE
   // (default OFF ⇒ legacy crypto-only trigger, behaviour-preserving). When
@@ -293,9 +313,26 @@ export async function evaluateLiveTransitionGate(
   // risks zero real capital and is exempt — it IS the Stage-2 paper environment
   // the gate demands, so blocking it is circular. This only ever LOOSENS the
   // gate for zero-capital Sandbox; Production stays fail-closed.
-  const gateFires = isPromotionGateEnvAwareEnabled()
-    ? liveRealCapitalIntent(updated)
-    : liveCryptoOn(updated);
+  const envAware = isPromotionGateEnvAwareEnabled();
+
+  // TRA-1590 — de-escalation exemption. The gate exists to block a PUT that
+  // INCREASES real-capital intent; a PUT that merely holds or REDUCES it must
+  // never block, so an operator can always move toward safety even while a
+  // gate-failing live path is being wound down (e.g. route options
+  // production -> sandbox while live crypto stays on pending the board's
+  // disable). We compare the guarded axes before/after and fire ONLY on an axis
+  // the save newly activates. Without a `previous` snapshot (e.g. the
+  // TRA-575 crypto-start path) we treat every active axis as newly-on, which
+  // reproduces the pre-1590 fail-closed trigger verbatim.
+  const next = realCapitalIntentAxes(updated);
+  const prev = previous
+    ? realCapitalIntentAxes(previous)
+    : { crypto: false, optionsProduction: false };
+  const cryptoEscalates = next.crypto && !prev.crypto;
+  // The legacy crypto-only trigger never considered the options axis; keep it
+  // ungated there so the env-aware flag remains the only switch that arms it.
+  const optionsEscalates = envAware && next.optionsProduction && !prev.optionsProduction;
+  const gateFires = cryptoEscalates || optionsEscalates;
   if (!gateFires) return { allowed: true, blocked: [] };
 
   const preset = resolveStrategyPreset(updated.activeStrategyPreset);
