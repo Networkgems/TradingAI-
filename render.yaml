@@ -479,6 +479,26 @@ services:
       # needed for this to take effect on the running service. Accepts 1/true/yes/on.
       - key: EXIT_RISK_RULES_ENABLED
         value: "1"
+      # TRA-1435 (parent TRA-1434, board confirmation `812bb88f` = accepted, plus
+      # board comment "and also get that over to Live Production") — arm the
+      # MINIMUM ARM FLOOR on the book-level give-back cap so a trivial-peak day can
+      # never latch a whole-session halt. Sub-flag of the master EXIT_RISK_RULES_ENABLED
+      # (above, already "1"): with BOTH on, the give-back cap only arms once the day's
+      # peakOpenGain reaches max(BOOK_GIVEBACK_ARM_ABS_FLOOR_USD $25, BOOK_GIVEBACK_ARM_FLOOR_R
+      # 0.5R × book risk unit) — mirroring the session-stop's 0.5R arm so the cap is
+      # never STRICTER than the session-stop at small peaks. Fixes the observed halt
+      # (Richard book peaked +$7, gave back to +$1.87, halted the whole session). The
+      # session-stop (BOOK_SESSION_STOP_R) is deliberately NOT gated by this floor, so a
+      # small-peak day that flips NET-NEGATIVE still latches — downside fully protected;
+      # this only relaxes give-back noise off a trivial GREEN peak. Service-wide env, so
+      # it arms BOTH the demo book (demo-flags overlay base = process.env) AND the live
+      # book (reads process.env directly) in one shot — matching the board's demo+live ask.
+      # Behavior-preserving OFF when cleared. QuantTrader (TRA-1434) validates ≥5 sessions
+      # post-arm. NOTE: blueprint sync ≠ autoDeploy on bqb1 (TRA-1289) — this repo entry is
+      # the durable desired-state; the running service env-var was set via the Render API to
+      # apply immediately. Accepts 1/true/yes/on.
+      - key: BOOK_GIVEBACK_ARM_FLOOR_ENABLED
+        value: "1"
       # TRA-1294 (parent TRA-1290, board confirmation `73ef18b0`) — arm the
       # TAKE-PROFIT-EARLY auto-close (the PROFIT-side mirror of the give-back cap)
       # on the DEMO book. STANDALONE flag, deliberately NOT under
