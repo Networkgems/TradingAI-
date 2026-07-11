@@ -596,8 +596,15 @@ services:
       # (TRA-1289) — a redeploy (or the DATA_DIR/demo-flags.json override) is needed
       # for this var to take effect on the running service. Live promotion remains a
       # separate board decision. Accepts 1/true/yes/on.
+      # TRA-1440 KILL (board approved on TRA-1597 via checkbox interaction
+      # `a1acc1a3`, item `kill-1440-tsmom`, 07-11): regime-gated TSMOM is retired —
+      # forward expectancy -0.37R at n<20 with no path to positive. The demo paper
+      # route is turned OFF so we stop accruing dead-weight forward evidence; the
+      # QuantTrader-owned n>=20 auto-flip drivers (routines `42e8f0c1` / `f18c0a5c`)
+      # are being archived so it can never promote. Left as an explicit "0" (not
+      # deleted) to document the kill decision. Re-enabling is a fresh board call.
       - key: CRYPTO_REGIME_TSMOM_DEMO_ROUTE_ENABLED
-        value: "1"
+        value: "0"
       # TRA-1409 (parent TRA-1406 "less noise, more quality", board confirmation
       # `1752d235` = accepted) — arm the RV single_leg EXIT RE-TUNE on the DEMO
       # book: require a CONFIRMED N-bar Supertrend flip (QuantTrader variant (a),
@@ -624,6 +631,21 @@ services:
         value: "true"
       - key: RV_EXIT_RETUNE_CONFIRM_BARS
         value: "2"
+      # TRA-1480 (RV re-tune v2, parent TRA-1409; board approved on TRA-1597 via
+      # checkbox interaction `a1acc1a3`, item `rv-1409-demo-arm`, 07-11) — arm the
+      # winner-protect LOSS threshold for the RV `supertrend_flip` exit on the DEMO
+      # book. Consulted ONLY inside the demo RV branch that already requires
+      # RV_EXIT_RETUNE_ENABLED (above), so it can NEVER touch a live exit and moves
+      # ZERO real capital. Semantics: the structural supertrend_flip exit only fires
+      # once the position is at/under this loss fraction (-0.20 = -20%), so a winner
+      # riding above threshold is protected and survives to `ma20_close_through`.
+      # This starts QuantTrader's >=100-post-arm-close forward validation via
+      # `GET /api/health/option-journal` (`byStructure.single_leg_rv`) and unblocks
+      # the RV-long live-promotion path (TRA-1582). Revert = clear this value +
+      # redeploy. NOTE: blueprint sync != autoDeploy on bqb1 (TRA-1289) — the push
+      # to main triggers the redeploy via autoDeploy. Accepts a negative fraction.
+      - key: RV_EXIT_FLIP_MIN_LOSS_PCT
+        value: "-0.20"
       # TRA-1408 (parent TRA-1406, board confirmation `3f248ea1` = accepted 07-07)
       # — arm the per-name churn + same-day-loss brake on the DEMO book. GIS
       # churned 95 closes for -$2,236 in one session while conviction-DCA kept
