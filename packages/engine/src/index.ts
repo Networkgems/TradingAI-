@@ -464,6 +464,18 @@ export type {
   RvLongSelectionOptions,
 } from './options/relative-value.js';
 export {
+  computePutCallRatio,
+  pcrRegime,
+  pcrZScore,
+  PCR_DEFAULTS,
+} from './options/put-call-ratio.js';
+export type {
+  PutCallRatio,
+  PutCallRatioOptions,
+  PcrRegime,
+  PcrContrarian,
+} from './options/put-call-ratio.js';
+export {
   emaPullbackTrigger,
   volumeConfirmedBreakout,
   EMA_PULLBACK_DEFAULTS,

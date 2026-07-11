@@ -253,6 +253,7 @@ import { initIvRankStore, recordDailyIv, ivRankSync, atmIvFromRows } from './iv-
 import { initIdeaJournal, listJournalEntries } from './options-idea-journal.js';
 import { initShadowLedger, listShadowSignals } from './shadow-signal-ledger.js';
 import { initOptionShadowLedger, listOptionShadowSignals, isOptionShadowEnabled, OPTION_SHADOW_EMERGENCY_OFF } from './option-shadow-ledger.js';
+import { initPcrShadowLedger, listPcrShadowSignals, isPcrShadowEnabled, usableSignalCount, PCR_Z_WINDOW_SESSIONS } from './pcr-shadow-ledger.js';
 import {
   initReversalShadowLedger,
   listReversalShadowSignals,
@@ -723,6 +724,12 @@ await initShadowLedger();
 // appends to it is observe-only and OFF unless ENABLE_OPTION_SHADOW_SELECTOR is
 // set; nothing here routes an order.
 await initOptionShadowLedger();
+
+// TRA-1609 (parent TRA-1607) — warm the flag-gated SHADOW Put-Call-Ratio ledger
+// so the read endpoint has history right after boot. The signal-engine option-
+// shadow pass appends one row per underlying per session when ENABLE_PCR_SHADOW
+// is set; the capture is observe-only and never touches sizing or exits.
+await initPcrShadowLedger();
 
 // TRA-921 (TRA-920 B) — warm the OBSERVE-ONLY reversal-checklist shadow ledger so
 // the read endpoint has history right after boot. The signal-engine tick appends
@@ -4764,6 +4771,34 @@ app.get('/api/health/option-shadow-signals', async (_req, res) => {
       reason: err instanceof Error ? err.message : String(err),
     });
     res.status(500).json({ error: 'Failed to read option shadow ledger' });
+  }
+});
+
+// TRA-1609 (parent TRA-1607) — read-only probe over the SHADOW Put-Call-Ratio
+// ledger, open like the other shadow probes so QuantTrader can pull the setup->
+// PCR dataset for the TRA-532 promotion gate without Render admin creds. Reports
+// the usable-signal count (rows carrying a non-null ratio) against the ≥200
+// promotion threshold plus the recent rows, each stamped with its paired
+// 21EMA+RSI+Vol trio verdict. Observe-only: nothing here routes an order.
+app.get('/api/health/pcr-shadow-signals', async (_req, res) => {
+  try {
+    const signals = await listPcrShadowSignals();
+    const usable = usableSignalCount(signals);
+    res.json({
+      issue: 'TRA-1609',
+      flagEnabled: isPcrShadowEnabled(),
+      zWindowSessions: PCR_Z_WINDOW_SESSIONS,
+      promotionThreshold: 200,
+      count: signals.length,
+      usableCount: usable,
+      promotionReady: usable >= 200,
+      signals,
+    });
+  } catch (err) {
+    log.error('pcr-shadow-signals health probe failed', {
+      reason: err instanceof Error ? err.message : String(err),
+    });
+    res.status(500).json({ error: 'Failed to read pcr shadow ledger' });
   }
 });
 

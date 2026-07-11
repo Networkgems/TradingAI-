@@ -1,4 +1,4 @@
-import { OrbStrategy, BbFadeStrategy, IchimokuStrategy, SupertrendConfluenceStrategy, confluenceSide, supertrend, supertrendLatest, reversalChecklist, adx, atr, atrPct, donchian, supportResistance, blackScholesDelta, blackScholesGreeks, daysToExpiration, bookGiveBackDecision, correlatedExposureDecision, entryGreeksGateDecision, chandelierStop, stopModifyDecision, selectRvLongCandidate, selectShadowOptionSignal, emaPullbackTrigger, volumeConfirmedBreakout, TradierOptionsClient, TradierOrderClient, TRADIER_REJECTED_STATUSES, TRADIER_TERMINAL_STATUSES, evaluateSma200, SMA200_MIN_BARS, SMA200_DEBOUNCE_BARS, composeTechnicalSnapshot, resampleCandles, TF_BUCKET_MS, OptionsRiskBreaker, DEFAULT_OPTIONS_BREAKER_PARAMS } from '@trading-app/engine';
+import { OrbStrategy, BbFadeStrategy, IchimokuStrategy, SupertrendConfluenceStrategy, confluenceSide, supertrend, supertrendLatest, reversalChecklist, adx, atr, atrPct, donchian, supportResistance, blackScholesDelta, blackScholesGreeks, daysToExpiration, bookGiveBackDecision, correlatedExposureDecision, entryGreeksGateDecision, chandelierStop, stopModifyDecision, selectRvLongCandidate, selectShadowOptionSignal, emaPullbackTrigger, volumeConfirmedBreakout, computePutCallRatio, rsi, TradierOptionsClient, TradierOrderClient, TRADIER_REJECTED_STATUSES, TRADIER_TERMINAL_STATUSES, evaluateSma200, SMA200_MIN_BARS, SMA200_DEBOUNCE_BARS, composeTechnicalSnapshot, resampleCandles, TF_BUCKET_MS, OptionsRiskBreaker, DEFAULT_OPTIONS_BREAKER_PARAMS } from '@trading-app/engine';
 import { buildExposureBuckets, DEFAULT_EXIT_PARAMS, DEFAULT_MULTILEG_EXIT_PARAMS } from '@trading-app/engine';
 import type { StrategySelectorInput, ContractQuote, OptionTrend, RvLongTrendSide, ExitState, ExitParams, MultiLegExitParams, SharedTickIndicators, RelativeValueScannerOptions, OptionChainRow, IvRvScannerOptions, IvRvMispricingCandidate, ExposureBucket, ExposurePositionRisk, CorrelatedExposureDecision } from '@trading-app/engine';
 import type { TradierAccountBalance } from '@trading-app/engine';
@@ -55,6 +55,7 @@ import {
   optionJournalToStrategyRows,
 } from './strategy-introspection.js';
 import { isOptionShadowEnabled, isOptionPhaseBEnabled, emitShadowOptionSignal, shadowSignalToSpreadParams, OPTION_SHADOW_EMERGENCY_OFF, DEMO_SPREAD_MAX_LOSS_PCT_CAP } from './option-shadow-ledger.js';
+import { isPcrShadowEnabled, recordPcrObservation, type PcrTrioVerdict } from './pcr-shadow-ledger.js';
 import { isOptionExecEnabled, isOptionEmaPullbackEnabled, isOptionVolumeBreakoutEnabled, resolveRvLongDteOverride, resolveRvMinDailyVolume, isOptionDemoDirectionalEnabled, isOptionIvRvScannerEnabled, isOptionIvRvRoutingEnabled, resolveIvRvRoutingOverride, isOptionShortPremiumScannerEnabled, isOptionLiveRvLongEnabled, isOptionLiveDirectionalEnabled } from './option-exec-flag.js';
 import { scanIvRvFromSnapshot, recordIvRvScan } from './iv-rv-scanner.js';
 import { scanShortPremiumFromSnapshot, recordShortPremiumScan } from './short-premium-scanner.js';
@@ -6382,6 +6383,54 @@ export class SignalEngine {
             (decision.side === 'sell' && lastClose < channel.lower));
 
         const atrVal = atr(series) ?? 0;
+
+        // TRA-1609 (parent TRA-1607) — SHADOW Put-Call-Ratio capture. Rides the
+        // SAME warm chain snapshot the option-shadow selector just pulled, so it
+        // adds ZERO extra Tradier fetches and no per-tick memory pass of its own.
+        // Flag-gated (ENABLE_PCR_SHADOW, default OFF) and observe-only: it folds
+        // Σ put / Σ call across the tracked expiries into the ratio + regime +
+        // contrarian read and appends one row per underlying per session to the
+        // PCR shadow ledger, stamped with the paired 21EMA+RSI+Vol trio verdict
+        // so QuantTrader can measure incremental expectancy on the TRA-532 gate.
+        // NEVER routes an order, never touches sizing/exits.
+        if (isPcrShadowEnabled()) {
+          try {
+            const pcr = computePutCallRatio(rows, { expiries: [expiration] });
+            const swingSide: 'call' | 'put' | null =
+              decision?.side === 'buy' ? 'call' : decision?.side === 'sell' ? 'put' : null;
+            const rsiVal = rsi(series.map((c) => c.close));
+            const rsiOk = Number.isFinite(rsiVal);
+            let trio: PcrTrioVerdict | null = null;
+            if (swingSide) {
+              const emaFired = emaPullbackTrigger(series, swingSide).fired;
+              const volConfirmed = volumeConfirmedBreakout(series, swingSide).fired;
+              const inBand = rsiOk && rsiVal >= 50 && rsiVal <= 70;
+              trio = {
+                side: swingSide,
+                emaPullbackFired: emaFired,
+                rsi: rsiOk ? rsiVal : null,
+                rsiInMomentumBand: inBand,
+                volumeConfirmed: volConfirmed,
+                trioFired: emaFired && inBand && volConfirmed,
+              };
+            } else {
+              trio = {
+                side: 'none',
+                emaPullbackFired: false,
+                rsi: rsiOk ? rsiVal : null,
+                rsiInMomentumBand: false,
+                volumeConfirmed: false,
+                trioFired: false,
+              };
+            }
+            await recordPcrObservation({ underlying: sym, asof: asOf, pcr, trio });
+          } catch (err: unknown) {
+            optionShadowLog.warn('pcr shadow capture threw', {
+              symbol: sym,
+              reason: err instanceof Error ? err.message : String(err),
+            });
+          }
+        }
 
         // S/R swing zones (TRA-920) anchor the short strikes; reversal regime
         // (TRA-924) biases the mid-IVR dead zone toward an aligned spread.
