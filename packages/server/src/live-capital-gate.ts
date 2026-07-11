@@ -1,4 +1,5 @@
 import type { ForwardTestReport } from './options-forward-test.js';
+import { isOptionCostAwareGateEnabled, resolveCostGateConfig } from './option-cost-gate.js';
 
 // TRA-601 (TRA-595 C6) — the AI-Options-Ideas LIVE-CAPITAL GATE.
 //
@@ -49,6 +50,34 @@ export const LIVE_CAPITAL_GATE: LiveCapitalGateCriteria = {
   maxPopCalibrationGap: 0.1,
   maxMaxLossBreaches: 0,
 };
+
+/**
+ * TRA-1600 (parent TRA-1599, deliverable B) — resolve the live-capital gate
+ * criteria, applying the COST-AWARE raised expectancy bar when the cost-aware
+ * gate flag is on.
+ *
+ * The shipped gate admits any cost-NET expectancy strictly `> 0` — the flat
+ * "+0 gross" bar the TRA-1599 decomposition identified as the failure: on a
+ * high-scratch, thin-edge options book a marginally-positive cost-net figure
+ * still promotes a book whose per-idea net barely clears cost, with no buffer.
+ * Deliverable (B) replaces that with `modeledGrossR >= costModel + safetyMargin`.
+ * Because this gate already evaluates the cost-NET figure (net = gross − cost),
+ * that inequality is exactly `expectancyNetR >= safetyMargin` — so the cost-aware
+ * bar is applied here by lifting `minExpectancyR` from 0.0 to the configured
+ * safety margin (default 0.20R, shared with the per-open cost-gate).
+ *
+ * OFF by default: with `ENABLE_OPTION_COST_AWARE_GATE` unset this returns the
+ * shipped {@link LIVE_CAPITAL_GATE} byte-for-byte, so the gate's behaviour and
+ * the `/api/health/live-capital-gate` readout are unchanged until an operator
+ * opts in. The margin is env-tunable via `OPTION_COST_GATE_SAFETY_MARGIN_R`.
+ */
+export function resolveLiveCapitalGateCriteria(
+  env: NodeJS.ProcessEnv = process.env,
+): LiveCapitalGateCriteria {
+  if (!isOptionCostAwareGateEnabled(env)) return LIVE_CAPITAL_GATE;
+  const { safetyMarginR } = resolveCostGateConfig(env);
+  return { ...LIVE_CAPITAL_GATE, minExpectancyR: safetyMarginR };
+}
 
 export interface GateCriterionResult {
   name: string;

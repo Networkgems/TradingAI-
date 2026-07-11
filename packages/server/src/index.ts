@@ -278,7 +278,7 @@ import {
   buildForwardTestReport,
   defaultChainsDir,
 } from './options-forward-test.js';
-import { evaluateLiveCapitalGate, LIVE_CAPITAL_GATE } from './live-capital-gate.js';
+import { evaluateLiveCapitalGate, resolveLiveCapitalGateCriteria } from './live-capital-gate.js';
 import {
   loadProposalsScorecard,
   buildAiIdeasScorecard,
@@ -3387,13 +3387,17 @@ app.get('/api/health/live-capital-gate', async (_req, res) => {
     const entries = await listJournalEntries();
     const outcomes = await forwardTestIdeas(entries);
     const report = buildForwardTestReport(outcomes, { chainsDir: defaultChainsDir() });
-    const gate = evaluateLiveCapitalGate(report);
+    // TRA-1600 (B) — apply the cost-aware raised expectancy bar when the
+    // cost-aware gate flag is on; defaults to the shipped LIVE_CAPITAL_GATE
+    // (net > 0) when off, so the readout is unchanged until an operator opts in.
+    const gateCriteria = resolveLiveCapitalGateCriteria();
+    const gate = evaluateLiveCapitalGate(report, gateCriteria);
     res.json({
       passed: gate.passed,
       asOfDate: gate.asOfDate,
       summary: gate.summary,
       note: gate.note,
-      thresholds: LIVE_CAPITAL_GATE,
+      thresholds: gateCriteria,
       criteria: gate.criteria.map((c) => ({
         name: c.name,
         description: c.description,

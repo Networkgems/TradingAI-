@@ -546,6 +546,11 @@ export class PaperOptionsAccount {
     structure: string,
     atRiskUsd: number,
     setup: OptionTradeJournalSetup,
+    // TRA-1600 (D) — measured entry-side slippage USD (signed, positive = paid
+    // worse than mid). Optional so open sites that can't cheaply compute a
+    // mark-vs-fill (e.g. the multi-leg spread path) omit it and fold back
+    // unmeasured. In demo this is the modelled demoSlippagePct haircut.
+    entrySlippageUsd?: number,
   ): void {
     if (!isOptionTradeJournalEnabled()) return;
     const entryDte = position.expiration
@@ -571,6 +576,11 @@ export class PaperOptionsAccount {
       // TRA-1183 — only stamp the archetype when the caller supplied one, so
       // untagged opens omit the field entirely (folds back as undefined).
       ...(setup.entryArchetype ? { entryArchetype: setup.entryArchetype } : {}),
+      // TRA-1600 (D) — stamp the measured entry slippage only when the caller
+      // supplied a finite value, so unmeasured opens fold back as undefined.
+      ...(typeof entrySlippageUsd === 'number' && Number.isFinite(entrySlippageUsd)
+        ? { entrySlippageUsd }
+        : {}),
     };
     this.journalWrites = this.journalWrites
       .then(() => recordOptionTradeOpen(open))
@@ -1321,7 +1331,14 @@ export class PaperOptionsAccount {
 
     this.openOptions.set(position.id, position);
     // TRA-991 — journal the OTM single-leg setup (observe-only, behind the flag).
-    if (journalSetup) this.queueJournalOpen(position, 'single_leg_otm', totalCost, journalSetup);
+    // TRA-1600 (D) — measured entry slippage = signed (fill − mark) × contracts ×
+    // 100. In demo `premiumPaid` already carries the demoSlippagePct haircut, so
+    // this is the modelled spread-cross cost; in live premiumPaid == rawMark so it
+    // is 0 at open (the realised broker slippage reconciles via the mirror).
+    if (journalSetup) {
+      const entrySlippageUsd = (premiumPaid - rawMark) * contracts * 100;
+      this.queueJournalOpen(position, 'single_leg_otm', totalCost, journalSetup, entrySlippageUsd);
+    }
     return position;
   }
 
@@ -1450,7 +1467,11 @@ export class PaperOptionsAccount {
 
     this.openOptions.set(position.id, position);
     // TRA-991 — journal the RV single-leg setup (observe-only, behind the flag).
-    if (journalSetup) this.queueJournalOpen(position, 'single_leg_rv', totalCost, journalSetup);
+    // TRA-1600 (D) — measured entry slippage (see `openOptionFromCandidate`).
+    if (journalSetup) {
+      const entrySlippageUsd = (premiumPaid - rawMark) * contracts * 100;
+      this.queueJournalOpen(position, 'single_leg_rv', totalCost, journalSetup, entrySlippageUsd);
+    }
     return position;
   }
 

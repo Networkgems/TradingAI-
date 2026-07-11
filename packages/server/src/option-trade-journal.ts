@@ -116,6 +116,18 @@ export interface OptionTradeJournalOpen {
    * them in bare `single_leg_rv`. Observe-only; never gates routing.
    */
   entryArchetype?: string;
+  /**
+   * TRA-1600 (deliverable D) — MEASURED entry-side slippage in USD for this
+   * position: signed `(fillPremium − mark) × contracts × 100`. Positive = we paid
+   * WORSE than the mid (the spread-cross cost the TRA-1599 decomposition only
+   * *modeled*). In demo this is the modelled `demoSlippagePct` haircut applied at
+   * open; in live it is the realised broker avg-fill-vs-mid once the smart-open
+   * mirror reconciles. Optional so pre-TRA-1600 rows (and opens with no available
+   * mark) fold back as `undefined` and drop out of the slippage rollup rather than
+   * skewing it to zero. Observe-only; the rollup is what turns the parametric cost
+   * decomposition into a per-fill measurement that can feed the cost-aware gate.
+   */
+  entrySlippageUsd?: number;
 }
 
 /** The realized outcome, appended when the position closes. */
@@ -131,6 +143,16 @@ export interface OptionTradeJournalClose {
   exitReason: string;
   /** Calendar days held (open→close). */
   holdDays: number;
+  /**
+   * TRA-1600 (deliverable D) — MEASURED exit-side slippage in USD for this
+   * position: signed `(mark − fillPremium) × contracts × 100`, i.e. positive when
+   * the realised sell fill came in WORSE (lower) than the closing mid. Same
+   * convention as {@link OptionTradeJournalOpen.entrySlippageUsd} (positive =
+   * cost). Optional; `undefined` when no closing mark was captured. Entry + exit
+   * together are the measured per-round-trip spread-cross the gate's cost model
+   * can be recalibrated against.
+   */
+  exitSlippageUsd?: number;
 }
 
 /**
@@ -144,6 +166,8 @@ export interface OptionTradeJournalRecord extends OptionTradeJournalOpen {
   realizedR?: number;
   exitReason?: string;
   holdDays?: number;
+  /** TRA-1600 (D) — measured exit-side slippage USD, folded from the CLOSE row. */
+  exitSlippageUsd?: number;
 }
 
 // Append-only line shapes (discriminated by `kind`).
@@ -184,6 +208,10 @@ function foldLine(map: Map<string, OptionTradeJournalRecord>, line: JournalLine)
     realizedR: line.close.realizedR,
     exitReason: line.close.exitReason,
     holdDays: line.close.holdDays,
+    // TRA-1600 (D) — carry the measured exit slippage onto the folded record so
+    // the summary rollup can decompose the round-trip cost. Only overwritten when
+    // the close row carries a measurement (undefined leaves it absent).
+    ...(line.close.exitSlippageUsd !== undefined ? { exitSlippageUsd: line.close.exitSlippageUsd } : {}),
   });
 }
 
@@ -445,6 +473,40 @@ export interface OptionTradeJournalExitReasonStat {
 }
 
 /**
+ * TRA-1600 (deliverable D) — MEASURED per-fill slippage decomposition. Turns the
+ * TRA-1599 *parametric* cost model (spread cross ~0.70–0.78R, modeled from the
+ * wedge) into a measurement: the mean signed mark-vs-fill cost, in USD and in R
+ * (÷ atRiskUsd), for the entry side, the exit side, and the full round trip.
+ * `avgRoundTripCostR` is the number the cost-aware gate's per-structure cost
+ * model can be recalibrated against once enough fills carry a measurement.
+ *
+ * Sample counts are surfaced separately from the means so a thin sample reads as
+ * "n=3 measured", not a confident average — only rows that actually carry a
+ * slippage field contribute; unmeasured rows drop out rather than dragging the
+ * mean toward zero. Positive R = COST (we paid worse than mid).
+ */
+export interface OptionTradeJournalSlippageStat {
+  /** Rows (open or closed) carrying an entry-slippage measurement. */
+  entrySampled: number;
+  /** Closed rows carrying an exit-slippage measurement. */
+  exitSampled: number;
+  /** Closed rows carrying BOTH entry and exit measurements (a full round trip). */
+  roundTripSampled: number;
+  /** Mean entry slippage USD over entrySampled; null when none. Positive = cost. */
+  avgEntrySlippageUsd: number | null;
+  /** Mean exit slippage USD over exitSampled; null when none. Positive = cost. */
+  avgExitSlippageUsd: number | null;
+  /** Mean entry slippage R (÷ atRiskUsd) over entrySampled; null when none. */
+  avgEntrySlippageR: number | null;
+  /** Mean exit slippage R over exitSampled; null when none. */
+  avgExitSlippageR: number | null;
+  /** Mean round-trip (entry+exit) slippage R over roundTripSampled; null when none. */
+  avgRoundTripCostR: number | null;
+  /** Σ of all measured entry+exit slippage USD across the row set. */
+  totalSlippageUsd: number;
+}
+
+/**
  * TRA-991 — headline rollup over journal rows, shared by the
  * `/api/health/option-journal` readout and the EOD report section. Counts cover
  * all rows (open + closed); P&L / win-rate / avg-R are over RESOLVED (closed)
@@ -486,6 +548,13 @@ export interface OptionTradeJournalSummary {
    * attributed outcomes instead of a single blended book number.
    */
   byDte: OptionTradeJournalDteBandStat[];
+  /**
+   * TRA-1600 (D) — measured mark-vs-fill slippage decomposition over the row set.
+   * The spine that makes the TRA-1599 cost attribution *measured* rather than
+   * modeled; `avgRoundTripCostR` is the live-cost read the cost-aware gate can be
+   * recalibrated against.
+   */
+  slippage: OptionTradeJournalSlippageStat;
 }
 
 /**
@@ -618,6 +687,44 @@ export function summarizeOptionTradeJournal(
     }))
     .sort((a, b) => dteBandOrder.indexOf(a.band) - dteBandOrder.indexOf(b.band));
 
+  // TRA-1600 (D) — measured slippage decomposition. Only rows carrying a
+  // measurement contribute (unmeasured rows drop out rather than dragging the
+  // mean to zero); R is USD ÷ the entry-time atRiskUsd basis, guarded against a
+  // zero/negative basis. Entry side spans ALL rows (open + closed) since entry
+  // slippage is known at open; exit/round-trip span closed rows only.
+  const entrySlipRows = rows.filter(
+    (r) => typeof r.entrySlippageUsd === 'number' && Number.isFinite(r.entrySlippageUsd) && r.atRiskUsd > 0,
+  );
+  const exitSlipRows = closedRows.filter(
+    (r) => typeof r.exitSlippageUsd === 'number' && Number.isFinite(r.exitSlippageUsd) && r.atRiskUsd > 0,
+  );
+  const roundTripRows = closedRows.filter(
+    (r) =>
+      typeof r.entrySlippageUsd === 'number' &&
+      Number.isFinite(r.entrySlippageUsd) &&
+      typeof r.exitSlippageUsd === 'number' &&
+      Number.isFinite(r.exitSlippageUsd) &&
+      r.atRiskUsd > 0,
+  );
+  const meanOrNull = (vals: number[]): number | null =>
+    vals.length > 0 ? vals.reduce((a, v) => a + v, 0) / vals.length : null;
+  const totalSlippageUsd =
+    entrySlipRows.reduce((a, r) => a + (r.entrySlippageUsd ?? 0), 0) +
+    exitSlipRows.reduce((a, r) => a + (r.exitSlippageUsd ?? 0), 0);
+  const slippage: OptionTradeJournalSlippageStat = {
+    entrySampled: entrySlipRows.length,
+    exitSampled: exitSlipRows.length,
+    roundTripSampled: roundTripRows.length,
+    avgEntrySlippageUsd: meanOrNull(entrySlipRows.map((r) => r.entrySlippageUsd as number)),
+    avgExitSlippageUsd: meanOrNull(exitSlipRows.map((r) => r.exitSlippageUsd as number)),
+    avgEntrySlippageR: meanOrNull(entrySlipRows.map((r) => (r.entrySlippageUsd as number) / r.atRiskUsd)),
+    avgExitSlippageR: meanOrNull(exitSlipRows.map((r) => (r.exitSlippageUsd as number) / r.atRiskUsd)),
+    avgRoundTripCostR: meanOrNull(
+      roundTripRows.map((r) => ((r.entrySlippageUsd as number) + (r.exitSlippageUsd as number)) / r.atRiskUsd),
+    ),
+    totalSlippageUsd,
+  };
+
   return {
     total: rows.length,
     open: rows.length - closed,
@@ -632,5 +739,6 @@ export function summarizeOptionTradeJournal(
     byArchetype,
     byExitReason,
     byDte,
+    slippage,
   };
 }

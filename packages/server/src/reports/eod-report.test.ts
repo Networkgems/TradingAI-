@@ -500,6 +500,17 @@ describe('generateEodReport — TRA-594 calendar aggregation', () => {
         byArchetype: [],
         byExitReason: [],
         byDte: [],
+        slippage: {
+          entrySampled: 0,
+          exitSampled: 0,
+          roundTripSampled: 0,
+          avgEntrySlippageUsd: null,
+          avgExitSlippageUsd: null,
+          avgEntrySlippageR: null,
+          avgExitSlippageR: null,
+          avgRoundTripCostR: null,
+          totalSlippageUsd: 0,
+        },
       },
     });
 
