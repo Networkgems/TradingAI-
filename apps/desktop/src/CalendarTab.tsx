@@ -384,7 +384,7 @@ function EodReportDetail({ report, onBack }: { report: EodReport; onBack: () => 
 export type CalendarMode = 'demo' | 'live' | 'sandbox';
 export type CalendarMarket = 'stocks' | 'crypto';
 
-export function CalendarTab({ token, httpUrl, reportsPath = '/api/reports', mode, market = 'stocks' }: {
+export function CalendarTab({ token, httpUrl, reportsPath = '/api/reports', mode, market = 'stocks', isAdmin = false }: {
   token: string;
   httpUrl: string;
   reportsPath?: string;
@@ -397,6 +397,12 @@ export function CalendarTab({ token, httpUrl, reportsPath = '/api/reports', mode
   // legacy/equity callers) to make the behaviour change opt-out for callers
   // that don't pass `market`.
   market?: CalendarMarket;
+  // TRA-1604 — the firm-wide Desk calendar is admin-only. Non-admin accounts
+  // never see the Desk toggle and are pinned to their own account book; the
+  // server also enforces this (`/api/reports/desk*` requires admin), so this is
+  // a UI guard, not the security boundary. Defaults to false (least-privilege)
+  // so any caller that forgets to pass it hides the firm view.
+  isAdmin?: boolean;
 }) {
   const [view,    setView]    = useState<'month' | 'year'>('month');
   const [year,    setYear]    = useState(new Date().getFullYear());
@@ -420,7 +426,12 @@ export function CalendarTab({ token, httpUrl, reportsPath = '/api/reports', mode
   // (`/api/reports/desk`, all demo books, NOT this user's account). Only the
   // data source switches; the grid/detail rendering is reused verbatim.
   const [source, setSource] = useState<'account' | 'desk'>('account');
-  const isDesk = source === 'desk';
+  // TRA-1604 — the Desk (firm-wide) view is admin-only. A non-admin can never
+  // be in desk mode: the toggle is hidden below, and this guard forces the
+  // effective source back to 'account' even if `source` was somehow set to
+  // 'desk' (e.g. a stale value after an admin logs out), so no user account
+  // ever fetches the firm calendar.
+  const isDesk = isAdmin && source === 'desk';
 
   // TRA-1413 — when the Desk view is active the calendar reads the firm-wide
   // journal endpoint instead of the per-user reports, and always uses the
@@ -530,17 +541,22 @@ export function CalendarTab({ token, httpUrl, reportsPath = '/api/reports', mode
         <h2 className="cal-title">P&amp;L Calendar</h2>
         <div className="cal-controls">
           {/* TRA-1413 — data-source segment: per-user account book vs the
-              firm-wide demo Option-Trade Journal (all demo books). */}
-          <div className="cal-view-toggle" title="Switch between your account and the firm-wide demo desk">
-            <button
-              className={`cal-toggle-btn${!isDesk ? ' active' : ''}`}
-              onClick={() => { setSource('account'); setSelectedDate(null); }}
-            >My Account</button>
-            <button
-              className={`cal-toggle-btn${isDesk ? ' active' : ''}`}
-              onClick={() => { setSource('desk'); setSelectedDate(null); }}
-            >Desk (all demo books)</button>
-          </div>
+              firm-wide demo Option-Trade Journal (all demo books).
+              TRA-1604 — the Desk (firm-wide) view is admin-only, so the whole
+              segment is hidden for non-admin accounts, who only ever see their
+              own account calendar. The server enforces the same rule. */}
+          {isAdmin && (
+            <div className="cal-view-toggle" title="Switch between your account and the firm-wide demo desk">
+              <button
+                className={`cal-toggle-btn${!isDesk ? ' active' : ''}`}
+                onClick={() => { setSource('account'); setSelectedDate(null); }}
+              >My Account</button>
+              <button
+                className={`cal-toggle-btn${isDesk ? ' active' : ''}`}
+                onClick={() => { setSource('desk'); setSelectedDate(null); }}
+              >Desk (all demo books)</button>
+            </div>
+          )}
           <div className="cal-view-toggle">
             <button
               className={`cal-toggle-btn${view === 'month' ? ' active' : ''}`}

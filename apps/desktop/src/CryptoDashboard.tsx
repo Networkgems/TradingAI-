@@ -270,6 +270,8 @@ export default function CryptoDashboard({ token, onBack, onLogout, onActivity, t
             reportsPath="/api/crypto/reports"
             mode={accountMode}
             market="crypto"
+            // TRA-1604 — firm-wide Desk calendar is admin-only here too.
+            isAdmin={isAdmin}
           />
         )}
        </ErrorBoundary>

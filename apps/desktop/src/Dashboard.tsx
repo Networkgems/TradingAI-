@@ -240,6 +240,8 @@ export default function Dashboard({ token, onLogout, onGoHome, onActivity, theme
                 ? 'demo'
                 : tradierEnv === 'production' ? 'live' : 'sandbox'
             }
+            // TRA-1604 — gate the firm-wide Desk calendar to admin accounts.
+            isAdmin={isAdmin}
           />
         )}
 

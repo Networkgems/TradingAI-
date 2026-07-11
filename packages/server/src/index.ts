@@ -5469,16 +5469,22 @@ app.get('/api/reports', requireAuth, async (req, res) => {
 // (`/api/reports*`) exactly as-is and add this SEPARATE, clearly-labelled view
 // for the whole fleet's demo option P&L. Source is `listOptionTradeJournal({
 // mode: 'demo' })` with NO user filter — the journal is firm-wide by design
-// (option A, adding a per-user field, was explicitly rejected). It carries no
-// balances/PII and no secrets (same basis as `/api/health/option-journal`), so
-// these two routes are unauthenticated, matching that readout. Registered BEFORE
+// (option A, adding a per-user field, was explicitly rejected). Registered BEFORE
 // `/api/reports/:date` so the literal `desk` segment can't be captured as a date.
+//
+// TRA-1604 — the firm-wide desk calendar is now ADMIN-ONLY. Although the desk
+// aggregation carries no balances/PII/secrets, it exposes the whole fleet's
+// realized option P&L, which is firm-internal and must not be visible to
+// ordinary user accounts. Both routes therefore require `requireAuth +
+// requireAdmin`; a plain user account gets 401/403 and is kept to its own
+// per-account calendar (`/api/reports*`). This supersedes the earlier
+// "unauthenticated, same basis as /api/health/option-journal" rationale.
 //
 // Shape parity: both routes return exactly what the Calendar grid already
 // consumes — `GET /api/reports/desk` → `{ dates: string[] }` (newest-first) and
 // `GET /api/reports/desk/:date` → the per-day `EodReport` cell — so the UI only
 // switches its `reportsPath`, not its rendering.
-app.get('/api/reports/desk', async (_req, res) => {
+app.get('/api/reports/desk', requireAuth, requireAdmin, async (_req, res) => {
   try {
     const rows = await listOptionTradeJournal({ mode: 'demo' });
     const cells = aggregateDeskCalendar(rows, Date.now());
@@ -5491,7 +5497,7 @@ app.get('/api/reports/desk', async (_req, res) => {
   }
 });
 
-app.get('/api/reports/desk/:date', async (req, res) => {
+app.get('/api/reports/desk/:date', requireAuth, requireAdmin, async (req, res) => {
   const { date } = req.params as Record<string, string>;
   if (!/^\d{4}-\d{2}-\d{2}$/.test(date)) {
     res.status(400).json({ error: 'Invalid date format. Use YYYY-MM-DD.' });
