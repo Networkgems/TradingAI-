@@ -42,6 +42,13 @@ import { summarizeIgnitionScans } from '../crypto-ignition-scanner.js';
 import { summarizeConvictionDca, resolveConvictionDcaDeployAnchor } from '../conviction-dca-ledger.js';
 import { summarizeChurnBrake } from '../churn-brake-ledger.js';
 import { summarizeDirectionalGate } from '../directional-open-ledger.js';
+import { summarizeCostAwareGate } from '../cost-aware-gate-ledger.js';
+import {
+  isOptionCostAwareGateEnabled,
+  resolveCostGateConfig,
+  admissionBarR,
+  OPTION_COST_AWARE_GATE_FLAG,
+} from '../option-cost-gate.js';
 import {
   isDirectionalQualityGateEnabled,
   resolveDirectionalQualityThresholds,
@@ -1192,6 +1199,51 @@ export function registerLiveHealthRoutes(app: Express, deps: LiveHealthDeps): vo
         ? `ARMED (demo-only): rejects a demo directional open below $${thresholds.minUnderlyingPrice} spot / $${thresholds.minAvgDollarVolume} avg $-vol, fails-closed under ${thresholds.minDollarVolumeSamples} real $-vol samples (warmup), and caps ${thresholds.maxOpensPerName} DIRECTIONAL opens/name/ET-day (reboot-durable; openCountsBySymbol is directional-only). Live options path unchanged.`
         : `DISARMED: set ${OPTION_DIRECTIONAL_QUALITY_GATE_FLAG}=1 (render.yaml env or DATA_DIR/demo-flags.json) with the directional path enabled to arm on the demo book.`,
       ...summarizeDirectionalGate(etDay),
+    });
+  });
+
+  // TRA-1602 (TRA-1600C, parent TRA-1599) — unauthenticated, secrets-free readout of
+  // the per-candidate COST-AWARE options fire bar, armed on the demo book by board
+  // interaction `427b57ee`. A working admission gate's evidence is the trades that
+  // DIDN'T happen, so without this a grader can only INFER enforcement from desk
+  // churn (the TRA-1476 "armed-but-inert" trap that burned two demo sessions). One
+  // read answers:
+  //   • `armed` — resolved through the SAME effective env the engine consults
+  //     (process.env layered with the DATA_DIR demo-flags.json overlay, file wins),
+  //     so it reports whether the flag is LIVE on the running process, not merely
+  //     merged to render.yaml (the TRA-1289 blueprint-env-sync gap);
+  //   • `bars` — the effective admission bar per structure (cost model + safety
+  //     margin, floored), which is env-tunable, so a retune is visible immediately;
+  //   • `byStructure` — DURABLE (reboot-survivable, ET-day-keyed) admitted/rejected
+  //     counts plus the mean modeled gross R either side of the bar, so QuantTrader
+  //     can see whether the bar is biting on scratch-tier ideas or starving the book.
+  // DEMO-ONLY by construction: `costAwareGateReject` early-returns on `mode!=='demo'`
+  // and on the flag being off, so every counter reflects an armed DEMO book and this
+  // surface is structurally incapable of describing a live open. No balances/PII.
+  app.get('/api/health/cost-aware-gate', (_req, res) => {
+    const dir = process.env.DATA_DIR;
+    const env = dir ? resolveDemoFlagEnv(dir) : process.env;
+    const armed = isOptionCostAwareGateEnabled(env);
+    const config = resolveCostGateConfig(env);
+    const structures = ['single_leg_rv', 'single_leg_otm', 'directional'];
+    const bars: Record<string, number> = {};
+    for (const s of structures) bars[s] = admissionBarR(s, config);
+    const etDay = etDateString(new Date(now()));
+    res.json({
+      ok: true,
+      time: new Date(now()).toISOString(),
+      build: resolveBuildInfo(),
+      flag: OPTION_COST_AWARE_GATE_FLAG,
+      armed,
+      demoOnly: true,
+      liveCapitalReachable: false,
+      etDay,
+      bars,
+      config,
+      note: armed
+        ? `ARMED (demo-only): rejects a demo RV / OTM / directional open whose modeled GROSS R can't clear its structure's cost-aware bar (${structures.map((s) => `${s} ${bars[s]!.toFixed(2)}R`).join(', ')}). rejected>0 is the direct evidence the bar is biting. Live options admission unchanged.`
+        : `DISARMED: set ${OPTION_COST_AWARE_GATE_FLAG}=1 (render.yaml env or DATA_DIR/demo-flags.json) to arm on the demo book.`,
+      ...summarizeCostAwareGate(etDay),
     });
   });
 

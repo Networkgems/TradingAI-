@@ -271,6 +271,29 @@ services:
       # Accepts 1/true/yes/on.
       - key: ENABLE_NEWS_CATALYST_WATCHLIST
         value: "1"
+      # TRA-1602 (TRA-1600C, parent TRA-1599) — arm the per-candidate COST-AWARE
+      # FIRE BAR on the demo options opens (RV / OTM / directional). Board-ratified:
+      # request_confirmation `427b57ee` ACCEPTED, on top of QuantTrader's TRA-1603
+      # sign-off of the modeled-gross-R construction. The gate rejects a candidate
+      # whose modeled GROSS R can't clear its structure's cost-aware bar (commission
+      # + maker-adjusted spread cross + safety margin ⇒ ~1.25R on options), which is
+      # how we stop paying spread cross on the mass of ~0-edge scratch ideas that
+      # took the live-gate cohort to −0.63R net.
+      #
+      # SAFETY — DEMO-ONLY, PURE RISK-REDUCING. `costAwareGateReject` (signal-engine)
+      # early-returns on `mode !== 'demo'` BEFORE it reads this flag, so it cannot
+      # alter a LIVE option open regardless of any service-wide env; live admission
+      # stays gated on the separate dark flags (TRA-1490/1491 → TRA-1582/1588). It
+      # only ever makes the demo book open LESS — it can never create or up-size an
+      # open. QuantTrader forward-validates via `GET /api/health/cost-aware-gate`
+      # (armed / bars / admitted / rejected / avg modeled gross R either side).
+      # NOTE: blueprint sync != autoDeploy on bqb1 (TRA-1289) — the push to main
+      # triggers the redeploy via autoDeploy; the RENDER_RATIFIED_DEMO_DEFAULTS
+      # self-heal (demo-flags.ts) delivers the value. Daemon-free DISARM: write
+      # `{"ENABLE_OPTION_COST_AWARE_GATE":"0"}` via `/api/admin/demo-flags` — the file
+      # layers OVER env and wins. Accepts 1/true/yes/on.
+      - key: ENABLE_OPTION_COST_AWARE_GATE
+        value: "1"
       # TRA-967 / TRA-953 (TRA-908 Phase B) — turn OPTIONS PHASE-B PAPER
       # EXECUTION ON. Board-approved (approval c10b717e-294f-4718-8a7c-11a2cd18875f,
       # parallel to the shadow-flag approval 8fb26954 in TRA-942). Until this is

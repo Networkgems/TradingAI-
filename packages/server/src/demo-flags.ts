@@ -174,6 +174,24 @@ export const DEMO_FLAG_ALLOWLIST = [
   'OPTION_DIRECTIONAL_MIN_UNDERLYING_PRICE',
   'OPTION_DIRECTIONAL_MIN_AVG_DOLLAR_VOLUME',
   'OPTION_DIRECTIONAL_MAX_OPENS_PER_NAME',
+  // TRA-1602 (TRA-1600C, parent TRA-1599; QuantTrader-signed TRA-1603, board arm
+  // interaction `427b57ee`) — the per-candidate COST-AWARE fire bar on the demo
+  // RV / OTM / directional opens: reject a candidate whose modeled GROSS R can't
+  // clear its structure's cost-aware bar (commission + maker-adjusted spread cross
+  // + safety margin). The signal-engine consults it ONLY at `costAwareGateReject`,
+  // which hard-gates `mode === 'demo'`, so a file flip can NEVER alter a live open.
+  // Allowlisting the master + the tunables is what gives the board a daemon-free
+  // DISARM (a file `=0` layers OVER the render.yaml/boot-seed arm and wins) and lets
+  // QuantTrader retune the bar/estimator from the measured slippage ledger without a
+  // redeploy. Non-secret, demo-only.
+  'ENABLE_OPTION_COST_AWARE_GATE',
+  'OPTION_COST_GATE_MIN_GROSS_R',
+  'OPTION_COST_GATE_SAFETY_MARGIN_R',
+  'OPTION_COST_GATE_COMMISSION_R',
+  'OPTION_COST_GATE_SPREAD_CROSS_R',
+  'OPTION_COST_GATE_WIN_PROB_DELTA_MULT',
+  'OPTION_COST_GATE_DEFAULT_REWARD_R',
+  'OPTION_COST_GATE_WIN_PROB_CAP',
 ] as const;
 
 export const DEMO_FLAGS_FILENAME = 'demo-flags.json';
@@ -259,6 +277,28 @@ export const RENDER_RATIFIED_DEMO_DEFAULTS: Readonly<Record<string, string>> = {
   // redeploy. Starts QuantTrader's TRA-1630 forward-validation (D1 incremental
   // expectancy + D2 lean-hit-rate) via `GET /api/health/news-catalyst-signals`.
   ENABLE_NEWS_CATALYST_WATCHLIST: '1',
+  // TRA-1602 (TRA-1600C, parent TRA-1599) — arm the per-candidate COST-AWARE fire
+  // bar on the bqb1 demo desk. Board-ratified: request_confirmation `427b57ee`
+  // ACCEPTED ("Arm the cost-aware options fire bar on the DEMO book"), on top of
+  // QuantTrader's TRA-1603 CONDITIONAL ACCEPT of the modeled-gross-R construction
+  // (the R-basis retune it was conditional on shipped in `9e22117`). render.yaml
+  // ratifies `ENABLE_OPTION_COST_AWARE_GATE:"1"` alongside this entry, but a
+  // render.yaml `value` added AFTER the last manual blueprint sync stays DARK on a
+  // plain autoDeploy — the same TRA-1289 env-sync gap the churn brake / RV-retune /
+  // news-catalyst hit, so the self-heal is the durable arm.
+  //
+  // Meets STRICT admission: (1) board-ratified `=1`; (2) DEMO-ONLY by construction —
+  // `costAwareGateReject` (signal-engine) early-returns on `mode !== 'demo'` before
+  // it even reads the flag, so it is structurally incapable of touching a LIVE
+  // option open regardless of any service-wide env (live promotion stays on the
+  // separate dark flags TRA-1490/1491 → TRA-1582/1588); (3) PURE RISK-REDUCING — the
+  // gate only ever makes the demo book open LESS (it rejects candidates whose modeled
+  // gross R can't clear the cost bar; it can never create or up-size an open).
+  // An explicit `=0` in demo-flags.json still wins over this seed (the file layers
+  // OVER env), so the board keeps a daemon-free disarm. Arms QuantTrader's forward
+  // validation via `GET /api/health/cost-aware-gate` (armed / admitted / rejected /
+  // avg modeled gross R either side of the bar).
+  ENABLE_OPTION_COST_AWARE_GATE: '1',
 };
 
 /**

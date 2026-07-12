@@ -90,6 +90,7 @@ import {
   recordDirectionalGateReject,
   type OpenSleeve,
 } from './directional-open-ledger.js';
+import { recordCostAwareGateDecision } from './cost-aware-gate-ledger.js';
 import { isMultiLegOpenPaused } from './multileg-open-pause-flag.js';
 import { isMultiLegExitEnabled } from './multileg-exit-flag.js';
 import { recordConvictionDcaFill } from './conviction-dca-ledger.js';
@@ -3743,6 +3744,17 @@ export class SignalEngine {
     if (!isOptionCostAwareGateEnabled(env)) return null;
     const estimate = estimateModeledGrossR(inputs, resolveModeledGrossRConfig(env));
     const verdict = admitByCostAwareGate(estimate.modeledGrossR, structure, resolveCostGateConfig(env));
+    // TRA-1602 arm (board interaction `427b57ee`) — a working admission gate's
+    // evidence is the trades that DIDN'T happen, so record every armed verdict for
+    // `/api/health/cost-aware-gate`. Observe-only and demo-only (both early-returns
+    // above already fired), best-effort on IO — never breaks the trade pass.
+    recordCostAwareGateDecision(
+      structure,
+      verdict.admit,
+      verdict.modeledGrossR,
+      verdict.barR,
+      etDateString(new Date()),
+    );
     return verdict.admit ? null : verdict.reason;
   }
 

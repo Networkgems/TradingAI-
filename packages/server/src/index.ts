@@ -127,6 +127,7 @@ import {
 import { hydrateConvictionDcaFromDisk } from './conviction-dca-ledger.js';
 import { hydrateScaleoutLadderFromDisk } from './scaleout-ladder-ledger.js';
 import { hydrateDirectionalOpensFromDisk } from './directional-open-ledger.js';
+import { hydrateCostAwareGateFromDisk } from './cost-aware-gate-ledger.js';
 import { fetchCrypto4hBars } from './crypto-feed.js';
 import type { CryptoSignalEngine } from './crypto-engine.js';
 // TRA-1006 — automated pre/post-market analyst agent. Tick fns are flag-checked
@@ -2273,6 +2274,21 @@ async function runHourlyCryptoRegimeTsmom(): Promise<void> {
     log.info('directional per-name open ledger hydrated (TRA-1486/TRA-1564)', {
       records: h.records,
       rejects: h.rejects,
+      days: h.days,
+    });
+  }
+}
+
+// TRA-1602 (TRA-1600C) — rebuild the COST-AWARE fire-bar admit/reject ledger and
+// remember DATA_DIR for subsequent appends. Durable for the same reason the
+// directional rejects are (TRA-1564 B1): bqb1 reboots at/after the close, so an
+// in-memory since-boot counter reads empty by the time QuantTrader's post-close
+// grade fires. Best-effort; compacted to a 7-day window on read.
+{
+  const h = hydrateCostAwareGateFromDisk(DATA_DIR);
+  if (h.records > 0) {
+    log.info('cost-aware fire-bar ledger hydrated (TRA-1602)', {
+      records: h.records,
       days: h.days,
     });
   }

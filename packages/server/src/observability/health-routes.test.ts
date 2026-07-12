@@ -31,6 +31,8 @@ import {
   recordChurnBrakeOpenRejected,
   recordChurnBrakeDcaHalt,
 } from '../churn-brake-ledger.js';
+import { clearCostAwareGateLedger, recordCostAwareGateDecision } from '../cost-aware-gate-ledger.js';
+import { etDateString } from '../scheduler.js';
 import { checkStaleState } from './alerts.js';
 import { getRecentAlerts, __resetAlertsForTest } from './alerts.js';
 import type { EngineState, LiveEquityAcceptance } from '../signal-engine.js';
@@ -954,6 +956,81 @@ describe('TRA-1481 churn-brake health route', () => {
     } finally {
       delete process.env.ENABLE_CHURN_LOSS_BRAKE;
       delete process.env.CHURN_SAME_SESSION_OPEN_CAP;
+    }
+  });
+});
+
+describe('TRA-1602 cost-aware fire-bar health route', () => {
+  beforeEach(() => clearCostAwareGateLedger());
+  afterEach(() => clearCostAwareGateLedger());
+
+  it('serves GET /api/health/cost-aware-gate unauthenticated, DARK + demo-only by default', () => {
+    const { app, routes } = fakeApp();
+    registerLiveHealthRoutes(app, {
+      requireAuth: ((_q: unknown, _s: unknown, n: () => void) => n()) as never,
+      userCtx: async () => ctx('admin', engineState()),
+      getSettings: () => settings(),
+      now: () => NOW,
+    });
+    const handlers = routes.get('/api/health/cost-aware-gate')!;
+    expect(handlers).toHaveLength(1); // unauthenticated, like the other rule probes
+    const res = fakeRes();
+    handlers[0]!({}, res);
+    const body = res.body as {
+      ok: boolean;
+      flag: string;
+      armed: boolean;
+      demoOnly: boolean;
+      liveCapitalReachable: boolean;
+      bars: Record<string, number>;
+      admittedTotal: number;
+      rejectedTotal: number;
+    };
+    expect(body.ok).toBe(true);
+    expect(body.flag).toBe('ENABLE_OPTION_COST_AWARE_GATE');
+    expect(body.armed).toBe(false); // no env flag set in the test process
+    expect(body.demoOnly).toBe(true);
+    expect(body.liveCapitalReachable).toBe(false);
+    // The QT-retuned options bar (TRA-1603 decision #3): commission + maker-adjusted
+    // spread cross + safety margin, expressed against the estimator's 25%-premium R.
+    expect(body.bars['single_leg_rv']).toBeCloseTo(1.25, 2);
+    expect(body.bars['single_leg_otm']).toBeCloseTo(1.25, 2);
+    expect(body.admittedTotal).toBe(0);
+    expect(body.rejectedTotal).toBe(0);
+  });
+
+  it('reports armed from env and folds the durable admit/reject tallies', () => {
+    process.env.ENABLE_OPTION_COST_AWARE_GATE = '1';
+    const etDay = etDateString(new Date(NOW));
+    recordCostAwareGateDecision('single_leg_rv', true, 1.9, 1.25, etDay, NOW);
+    recordCostAwareGateDecision('single_leg_rv', false, 0.2, 1.25, etDay, NOW);
+    try {
+      const { app, routes } = fakeApp();
+      registerLiveHealthRoutes(app, {
+        requireAuth: ((_q: unknown, _s: unknown, n: () => void) => n()) as never,
+        userCtx: async () => ctx('admin', engineState()),
+        getSettings: () => settings(),
+        now: () => NOW,
+      });
+      const res = fakeRes();
+      routes.get('/api/health/cost-aware-gate')![0]!({}, res);
+      const body = res.body as {
+        armed: boolean;
+        admittedTotal: number;
+        rejectedTotal: number;
+        byStructure: { structure: string; admitted: number; rejected: number; avgRejectedGrossR: number | null }[];
+      };
+      expect(body.armed).toBe(true);
+      expect(body.admittedTotal).toBe(1);
+      expect(body.rejectedTotal).toBe(1); // the direct evidence the bar is biting
+      expect(body.byStructure[0]).toMatchObject({
+        structure: 'single_leg_rv',
+        admitted: 1,
+        rejected: 1,
+        avgRejectedGrossR: 0.2,
+      });
+    } finally {
+      delete process.env.ENABLE_OPTION_COST_AWARE_GATE;
     }
   });
 });

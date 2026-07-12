@@ -18,6 +18,7 @@ import {
 } from './demo-flags.js';
 import { isAutonomousDemoLoopEnabled } from './autonomous-demo-loop.js';
 import { resolveDirectionalQualityThresholds } from './ignition-quality-gate.js';
+import { isOptionCostAwareGateEnabled } from './option-cost-gate.js';
 
 let dir: string;
 
@@ -160,6 +161,10 @@ describe('renderRatifiedDemoDefaults (TRA-1481 — self-heal the Render blueprin
       // (observe-only: D1 adds watchlist names, D2 annotates the report + logs a
       // shadow lean; no order, no size, no exit). render.yaml ratifies `=1`.
       ENABLE_NEWS_CATALYST_WATCHLIST: '1',
+      // TRA-1602 — the per-candidate cost-aware fire bar on the demo RV / OTM /
+      // directional opens (board arm `427b57ee`, QT-signed TRA-1603); self-heals the
+      // same env-sync gap. Demo-only + pure risk-reducing (it only ever opens LESS).
+      ENABLE_OPTION_COST_AWARE_GATE: '1',
     });
   });
 
@@ -175,6 +180,7 @@ describe('renderRatifiedDemoDefaults (TRA-1481 — self-heal the Render blueprin
       RV_EXIT_RETUNE_CONFIRM_BARS: '3',
       RV_EXIT_FLIP_MIN_LOSS_PCT: '0',
       ENABLE_NEWS_CATALYST_WATCHLIST: '0',
+      ENABLE_OPTION_COST_AWARE_GATE: '0',
     } as NodeJS.ProcessEnv;
     expect(renderRatifiedDemoDefaults(dir, env)).toEqual({});
   });
@@ -201,6 +207,10 @@ describe('renderRatifiedDemoDefaults (TRA-1481 — self-heal the Render blueprin
       RV_EXIT_RETUNE_ENABLED: '0',
       RV_EXIT_RETUNE_CONFIRM_BARS: '3',
       RV_EXIT_FLIP_MIN_LOSS_PCT: '0',
+      // TRA-1602 — the cost-aware fire bar IS allowlisted (the engine reads it
+      // through the demo-flags overlay), so the board's daemon-free `=0` disarm goes
+      // in the file and must survive the boot seed.
+      ENABLE_OPTION_COST_AWARE_GATE: '0',
     });
     // TRA-1632 — the news-catalyst flag is NOT on the demo-flags.json allowlist
     // (isNewsCatalystEnabled reads raw process.env, so the file never reaches it);
@@ -216,6 +226,19 @@ describe('renderRatifiedDemoDefaults (TRA-1481 — self-heal the Render blueprin
     expect(resolveDemoFlagEnv(dir, env)['ENABLE_CHURN_LOSS_BRAKE']).toBeUndefined();
     Object.assign(env, renderRatifiedDemoDefaults(dir, env)); // boot applies to process.env
     expect(resolveDemoFlagEnv(dir, env)['ENABLE_CHURN_LOSS_BRAKE']).toBe('1');
+  });
+
+  it('TRA-1602 — the boot seed ARMS the cost-aware fire bar through the engine overlay, and a file `=0` disarms it', () => {
+    const env = { RENDER: 'true' } as NodeJS.ProcessEnv;
+    // Dark before the seed — the render.yaml `=1` never reached the process (TRA-1289).
+    expect(isOptionCostAwareGateEnabled(resolveDemoFlagEnv(dir, env))).toBe(false);
+
+    Object.assign(env, renderRatifiedDemoDefaults(dir, env)); // boot applies to process.env
+    expect(isOptionCostAwareGateEnabled(resolveDemoFlagEnv(dir, env))).toBe(true);
+
+    // The board's daemon-free disarm: the file layers OVER the seeded env and wins.
+    writeFlags({ ENABLE_OPTION_COST_AWARE_GATE: '0' });
+    expect(isOptionCostAwareGateEnabled(resolveDemoFlagEnv(dir, env))).toBe(false);
   });
 });
 
