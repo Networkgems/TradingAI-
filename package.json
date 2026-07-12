@@ -14,7 +14,8 @@
     "render:status": "node scripts/render-deploy-status.mjs",
     "typecheck": "pnpm -r --filter \"@trading-app/*\" build && pnpm -r typecheck",
     "lint": "eslint . --max-warnings 0",
-    "pretest": "pnpm --filter @trading-app/shared build && pnpm --filter @trading-app/engine build && pnpm --filter @trading-app/backtest build",
+    "check:stale-js": "node scripts/check-stale-js.mjs",
+    "pretest": "node scripts/check-stale-js.mjs && pnpm --filter @trading-app/shared build && pnpm --filter @trading-app/engine build && pnpm --filter @trading-app/backtest build",
     "test": "pnpm -r test"
   },
   "devDependencies": {

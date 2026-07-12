@@ -59,6 +59,12 @@ jobs:
       - name: Install dependencies
         run: pnpm install --frozen-lockfile
 
+      # TRA-1660 — runs before build/test: stale in-place `tsc` output shadows the
+      # TS sources and can make the suite pass against code we are not shipping.
+      # A green run below is only meaningful if this step is green first.
+      - name: Check for stale compiled output shadowing TS sources
+        run: pnpm check:stale-js
+
       - name: Build shared packages
         run: pnpm -r --filter './packages/**' build
 
