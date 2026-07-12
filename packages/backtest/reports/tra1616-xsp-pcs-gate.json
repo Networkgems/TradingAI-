@@ -1,0 +1,427 @@
+{
+  "generatedAt": "2026-07-12T14:18:45.643Z",
+  "issue": "TRA-1616",
+  "spec": "TRA-1615",
+  "strategyId": "xsp_atm_pcs_sma20",
+  "dataset": "SPX (^GSPC) daily bars (Yahoo) ÷10 → XSP terms, 2015-01-01 → 2025-12-30, on-disk cache",
+  "model": "Black-Scholes on realized-vol IV (VRP 1.05, floor 0.10); per-leg $0.65 comm; widening bid/ask fills, 1-tick ($0.05) floor",
+  "workingBase": 300,
+  "params": {
+    "dteCal": 14,
+    "strikeOffset": 0,
+    "slipMult": 1
+  },
+  "metrics": {
+    "tradeCount": 133,
+    "winRate": 0.37593984962406013,
+    "avgCredit": 0.20286732947735114,
+    "expectancyR": -0.4028518695412013,
+    "avgPnl": -32.70626811122479,
+    "totalPnl": -4349.9336587928965,
+    "sharpe": -2.5876001303915346,
+    "sortino": -2.139769722430965,
+    "profitFactor": 0.1729906849207749,
+    "maxDrawdownPct": 14.529452012101046,
+    "maxDrawdownDollars": 4358.835603630314,
+    "tailLoss": {
+      "worstR": -1.03722317490917,
+      "p01R": -1.035923474154309,
+      "p05R": -1.0326765106416012,
+      "worst5AvgR": -1.0351914509880775,
+      "tailRatio": 4.341976715056386
+    },
+    "avgHoldDays": 5.676691729323308,
+    "itmExpiryRate": 0.03007518796992481
+  },
+  "perRegime": [
+    {
+      "regime": "2015-2017 grind-up",
+      "metrics": {
+        "tradeCount": 65,
+        "winRate": 0.27692307692307694,
+        "avgCredit": 0.26040945832158374,
+        "expectancyR": -0.41427185305742353,
+        "avgPnl": -31.009352850086582,
+        "totalPnl": -2015.6079352556278,
+        "sharpe": -3.4458597727696803,
+        "sortino": -2.778826992113217,
+        "profitFactor": 0.18437259158143626,
+        "maxDrawdownPct": 6.817160048366374,
+        "maxDrawdownDollars": 2045.1480145099122,
+        "tailLoss": {
+          "worstR": -1.03722317490917,
+          "p01R": -1.03722317490917,
+          "p05R": -1.034938837300173,
+          "worst5AvgR": -1.0361348794569516,
+          "tailRatio": 2.997565198345655
+        },
+        "avgHoldDays": 4.969230769230769,
+        "itmExpiryRate": 0.015384615384615385
+      }
+    },
+    {
+      "regime": "Q4-2018 selloff",
+      "metrics": {
+        "tradeCount": 3,
+        "winRate": 0,
+        "avgCredit": 0.17492560003791166,
+        "expectancyR": -1.0048390440996238,
+        "avgPnl": -82.79830544287087,
+        "totalPnl": -248.39491632861262,
+        "sharpe": -149.1570937225415,
+        "sortino": -5.75804324849077,
+        "profitFactor": 0,
+        "maxDrawdownPct": 0.8279830544287088,
+        "maxDrawdownDollars": 248.39491632861262,
+        "tailLoss": {
+          "worstR": -1.0326765106416012,
+          "p01R": -1.0326765106416012,
+          "p05R": -1.0326765106416012,
+          "worst5AvgR": -1.0326765106416012,
+          "tailRatio": null
+        },
+        "avgHoldDays": 3.3333333333333335,
+        "itmExpiryRate": 0
+      }
+    },
+    {
+      "regime": "2019 recovery",
+      "metrics": {
+        "tradeCount": 12,
+        "winRate": 0.6666666666666666,
+        "avgCredit": 0.2319641780560243,
+        "expectancyR": -0.057122853075415335,
+        "avgPnl": -4.686415826431027,
+        "totalPnl": -56.23698991717232,
+        "sharpe": -0.3523996219109565,
+        "sortino": -0.39795507408364567,
+        "profitFactor": 0.7509438144120429,
+        "maxDrawdownPct": 0.4225184942958575,
+        "maxDrawdownDollars": 161.79243644097434,
+        "tailLoss": {
+          "worstR": -1.035923474154309,
+          "p01R": -1.035923474154309,
+          "p05R": -1.035923474154309,
+          "worst5AvgR": -1.035923474154309,
+          "tailRatio": 3.6571182700051996
+        },
+        "avgHoldDays": 7,
+        "itmExpiryRate": 0
+      }
+    },
+    {
+      "regime": "2020-2021 melt-up",
+      "metrics": {
+        "tradeCount": 17,
+        "winRate": 0.6470588235294118,
+        "avgCredit": 0.12507639030200793,
+        "expectancyR": -0.17679738806016468,
+        "avgPnl": -17.007386741695807,
+        "totalPnl": -289.12557460882874,
+        "sharpe": -1.1002855528647686,
+        "sortino": -1.0820218236061885,
+        "profitFactor": 0.3284960264595559,
+        "maxDrawdownPct": 0.9647645179046335,
+        "maxDrawdownDollars": 297.7470193712158,
+        "tailLoss": {
+          "worstR": -1.0281513194675385,
+          "p01R": -1.0281513194675385,
+          "p05R": -1.0281513194675385,
+          "worst5AvgR": -1.0281513194675385,
+          "tailRatio": 6.501117093757929
+        },
+        "avgHoldDays": 8,
+        "itmExpiryRate": 0.058823529411764705
+      }
+    },
+    {
+      "regime": "2022 bear",
+      "metrics": {
+        "tradeCount": 7,
+        "winRate": 0.14285714285714285,
+        "avgCredit": 0.06794392860538208,
+        "expectancyR": -0.8796356985653065,
+        "avgPnl": -81.33417856803321,
+        "totalPnl": -569.3392499762325,
+        "sharpe": -6.183664352788962,
+        "sortino": -2.3635196986432625,
+        "profitFactor": 0.0019791625264067602,
+        "maxDrawdownPct": 1.897797499920775,
+        "maxDrawdownDollars": 569.3392499762325,
+        "tailLoss": {
+          "worstR": -1.0296794349643912,
+          "p01R": -1.0296794349643912,
+          "p05R": -1.0296794349643912,
+          "worst5AvgR": -1.0296794349643912,
+          "tailRatio": 88.98352367109054
+        },
+        "avgHoldDays": 3,
+        "itmExpiryRate": 0
+      }
+    },
+    {
+      "regime": "2023-2024H1 bull",
+      "metrics": {
+        "tradeCount": 19,
+        "winRate": 0.3684210526315789,
+        "avgCredit": 0.1687596632540023,
+        "expectancyR": -0.527595689835386,
+        "avgPnl": -43.50771593786948,
+        "totalPnl": -826.64660281952,
+        "sharpe": -3.3121601004961785,
+        "sortino": -2.404712453053513,
+        "profitFactor": 0.10760388882663487,
+        "maxDrawdownPct": 2.7084871907815065,
+        "maxDrawdownDollars": 834.8997788814474,
+        "tailLoss": {
+          "worstR": -1.0323483953073205,
+          "p01R": -1.0323483953073205,
+          "p05R": -1.0323483953073205,
+          "worst5AvgR": -1.0323483953073205,
+          "tailRatio": 5.993806238718564
+        },
+        "avgHoldDays": 5.947368421052632,
+        "itmExpiryRate": 0.05263157894736842
+      }
+    },
+    {
+      "regime": "2024H2-2025Q1",
+      "metrics": {
+        "tradeCount": 3,
+        "winRate": 0.3333333333333333,
+        "avgCredit": 0.05570561328125212,
+        "expectancyR": -0.4180232406995634,
+        "avgPnl": -39.56322773437327,
+        "totalPnl": -118.68968320311981,
+        "sharpe": -2.486583017752987,
+        "sortino": -1.8183230946547164,
+        "profitFactor": 0.02754766972343248,
+        "maxDrawdownPct": 0.4023306491059704,
+        "maxDrawdownDollars": 122.05192944456644,
+        "tailLoss": {
+          "worstR": -1.027330103051616,
+          "p01R": -1.027330103051616,
+          "p05R": -1.027330103051616,
+          "worst5AvgR": -1.027330103051616,
+          "tailRatio": 29.130330546921613
+        },
+        "avgHoldDays": 7.333333333333333,
+        "itmExpiryRate": 0.3333333333333333
+      }
+    },
+    {
+      "regime": "2025 remainder",
+      "metrics": {
+        "tradeCount": 7,
+        "winRate": 0.5714285714285714,
+        "avgCredit": 0.11013378796530184,
+        "expectancyR": -0.3586062164417735,
+        "avgPnl": -32.27038666911137,
+        "totalPnl": -225.89270668377955,
+        "sharpe": -2.6081744928052744,
+        "sortino": -2.210899721708607,
+        "profitFactor": 0.147568039268971,
+        "maxDrawdownPct": 0.7826488384039891,
+        "maxDrawdownDollars": 234.79465152119673,
+        "tailLoss": {
+          "worstR": -1.0286746700909586,
+          "p01R": -1.0286746700909586,
+          "p05R": -1.0286746700909586,
+          "worst5AvgR": -1.0286746700909586,
+          "tailRatio": 8.993777512882364
+        },
+        "avgHoldDays": 6.571428571428571,
+        "itmExpiryRate": 0
+      }
+    }
+  ],
+  "oos": {
+    "isExpectancy": -0.3467,
+    "oosExpectancy": -0.5541,
+    "oosTradeCount": 36,
+    "oosSharpe": -1.0188
+  },
+  "trials": [
+    {
+      "label": "7DTE/ATM-0",
+      "expectancyR": -0.3018,
+      "sharpe": -1.865,
+      "tradeCount": 146
+    },
+    {
+      "label": "7DTE/ATM-1",
+      "expectancyR": -0.2881,
+      "sharpe": -2.031,
+      "tradeCount": 147
+    },
+    {
+      "label": "7DTE/ATM-2",
+      "expectancyR": -0.2599,
+      "sharpe": -2.039,
+      "tradeCount": 144
+    },
+    {
+      "label": "14DTE/ATM-0",
+      "expectancyR": -0.4029,
+      "sharpe": -2.588,
+      "tradeCount": 133
+    },
+    {
+      "label": "14DTE/ATM-1",
+      "expectancyR": -0.3646,
+      "sharpe": -2.596,
+      "tradeCount": 135
+    },
+    {
+      "label": "14DTE/ATM-2",
+      "expectancyR": -0.3316,
+      "sharpe": -2.602,
+      "tradeCount": 136
+    },
+    {
+      "label": "21DTE/ATM-0",
+      "expectancyR": -0.4483,
+      "sharpe": -2.924,
+      "tradeCount": 119
+    },
+    {
+      "label": "21DTE/ATM-1",
+      "expectancyR": -0.4104,
+      "sharpe": -2.918,
+      "tradeCount": 120
+    },
+    {
+      "label": "21DTE/ATM-2",
+      "expectancyR": -0.3757,
+      "sharpe": -2.924,
+      "tradeCount": 122
+    }
+  ],
+  "guards": {
+    "G1": {
+      "pass": false,
+      "value": 0
+    },
+    "G2": {
+      "pass": false,
+      "value": 0
+    },
+    "G3": {
+      "pass": true,
+      "value": 0.0172
+    },
+    "G4": {
+      "pass": false,
+      "value": -0.701
+    },
+    "G5": {
+      "pass": false,
+      "value": -2.2383
+    },
+    "G6": {
+      "pass": false,
+      "value": -0.4949
+    }
+  },
+  "backtestMetrics": {
+    "sharpe": -2.5876,
+    "expectancy": -0.4029,
+    "profitFactor": 0.173,
+    "maxDrawdown": 14.5295,
+    "tradeCount": 133
+  },
+  "verdict": {
+    "pass": false,
+    "guards": {
+      "G1": {
+        "pass": false,
+        "value": 0
+      },
+      "G2": {
+        "pass": false,
+        "value": 0
+      },
+      "G3": {
+        "pass": true,
+        "value": 0.0172
+      },
+      "G4": {
+        "pass": false,
+        "value": -0.701
+      },
+      "G5": {
+        "pass": false,
+        "value": -2.2383
+      },
+      "G6": {
+        "pass": false,
+        "value": -0.4949
+      }
+    },
+    "blessedParams": {
+      "strategy": "xsp_atm_pcs_sma20",
+      "dteCal": 14,
+      "strikeOffset": 0,
+      "slipMult": 1
+    },
+    "backtestMetrics": {
+      "sharpe": -2.5876,
+      "expectancy": -0.4029,
+      "profitFactor": 0.173,
+      "maxDrawdown": 14.5295,
+      "tradeCount": 133
+    }
+  },
+  "gate": {
+    "state": "fail",
+    "failedChecks": [
+      "optimization verdict FAIL — TRA-540 six-guard overfitting battery not all green (failed: G1, G2, G4, G5, G6)"
+    ]
+  },
+  "registrationBody": {
+    "strategyId": "xsp_atm_pcs_sma20",
+    "reportId": "TRA-1616-xsp-atm-pcs-2015-2025",
+    "verdict": {
+      "pass": false,
+      "guards": {
+        "G1": {
+          "pass": false,
+          "value": 0
+        },
+        "G2": {
+          "pass": false,
+          "value": 0
+        },
+        "G3": {
+          "pass": true,
+          "value": 0.0172
+        },
+        "G4": {
+          "pass": false,
+          "value": -0.701
+        },
+        "G5": {
+          "pass": false,
+          "value": -2.2383
+        },
+        "G6": {
+          "pass": false,
+          "value": -0.4949
+        }
+      },
+      "blessedParams": {
+        "strategy": "xsp_atm_pcs_sma20",
+        "dteCal": 14,
+        "strikeOffset": 0,
+        "slipMult": 1
+      },
+      "backtestMetrics": {
+        "sharpe": -2.5876,
+        "expectancy": -0.4029,
+        "profitFactor": 0.173,
+        "maxDrawdown": 14.5295,
+        "tradeCount": 133
+      }
+    }
+  }
+}
