@@ -14,7 +14,7 @@ import { fetchDailyCandles, fetchTradierDailyCandles } from './yahoo-feed.js';
 import { tmpdir } from 'os';
 import { join } from 'path';
 import { rmSync, writeFileSync } from 'fs';
-import { SignalEngine, sizeLiveEquityFromStop, shortBlockedOnCashAccount, isOccOptionSymbol, liveEquityDcaAddEnvAllowed, gateSignalOnReview, describeGatedStrategies, shouldBootArmLiveEquity, shouldBootArmLiveCrypto, shouldRunRelativeValueScan, shouldRunOtmScan, isLiveBrokerOperator, resolveLiveBrokerOperator, activeOptionsDailyLimit, activeEquityDailyLimit, _resetSharedShadowForTests, _sharedShadowRefreshDue, _claimSharedShadowRefresh, _endSharedShadowRefresh, _sharedShadowEvalDue, _claimSharedShadowEval } from './signal-engine.js';
+import { SignalEngine, sizeLiveEquityFromStop, shortBlockedOnCashAccount, isOccOptionSymbol, liveEquityDcaAddEnvAllowed, gateSignalOnReview, describeGatedStrategies, shouldBootArmLiveEquity, shouldBootArmLiveCrypto, resolveLiveBrokerArmDrift, shouldRunRelativeValueScan, shouldRunOtmScan, isLiveBrokerOperator, resolveLiveBrokerOperator, activeOptionsDailyLimit, activeEquityDailyLimit, _resetSharedShadowForTests, _sharedShadowRefreshDue, _claimSharedShadowRefresh, _endSharedShadowRefresh, _sharedShadowEvalDue, _claimSharedShadowEval } from './signal-engine.js';
 import { setShadowLedgerFileForTests } from './shadow-signal-ledger.js';
 import { clearDirectionalOpenLedger } from './directional-open-ledger.js';
 import {
@@ -4218,6 +4218,85 @@ describe('shouldBootArmLiveEquity — TRA-713 persistent live-equity boot-arm', 
     const env = prodEnv({ TRADIER_API_TOKEN: 'env-tok', TRADIER_ACCOUNT_ID: 'env-acct' });
     delete env['LIVE_EQUITY_BOOT_USER'];
     expect(shouldBootArmLiveEquity(s, 'admin', env)).toBe(true);
+  });
+});
+
+describe('resolveLiveBrokerArmDrift — TRA-1652 self-healing boot-arm convergence', () => {
+  const PIN = 'admin';
+  const prodEnv = (over: Record<string, string> = {}): NodeJS.ProcessEnv => ({
+    LIVE_EQUITY_BOOT_USER: PIN,
+    TRADIER_ENV: 'production',
+    TRADIER_API_TOKEN: 'env-tok',
+    TRADIER_ACCOUNT_ID: 'env-acct',
+    ...over,
+  });
+  /** The fully-converged operator: nothing left to repair. */
+  const armedSettings = (): AccountSettings => ({
+    ...DEFAULT_ACCOUNT_SETTINGS,
+    mode: 'live',
+    liveTradierEnvOptions: 'production',
+    liveTradeEquitiesTradier: true,
+  });
+
+  it('reports NO drift once the operator is fully converged (idempotent — a steady-state boot re-persists nothing)', () => {
+    expect(resolveLiveBrokerArmDrift(armedSettings(), PIN, prodEnv())).toEqual([]);
+  });
+
+  it('TRA-1652 REGRESSION: repairs a sandbox-drifted env even though mode is ALREADY live', () => {
+    // The exact bqb1 pre-open blocker. The operator is already `mode:'live'` (persisted by
+    // an earlier boot), but `liveTradierEnvOptions` has drifted back to 'sandbox'. The old
+    // `settings.mode !== 'live'` latch skipped the whole boot-arm block here, so the env
+    // selector could never be repaired: /api/health/options-live reported
+    // optionsBrokerEnv:'sandbox', optionsBrokerConfigured:false, and the SANDBOX account
+    // tail ***6703 instead of the signed-off production ***0154 — routing the board's
+    // attended <=$100 options canary into the Tradier sandbox.
+    const drifted: AccountSettings = { ...armedSettings(), liveTradierEnvOptions: 'sandbox' };
+    expect(resolveLiveBrokerArmDrift(drifted, PIN, prodEnv())).toEqual(['liveTradierEnvOptions']);
+  });
+
+  it('TRA-1652: repairs a liveTradeEquitiesTradier:false opt-out that drifted in while already live', () => {
+    const drifted: AccountSettings = { ...armedSettings(), liveTradeEquitiesTradier: false };
+    expect(resolveLiveBrokerArmDrift(drifted, PIN, prodEnv())).toEqual(['liveTradeEquitiesTradier']);
+  });
+
+  it('TRA-1652: an absent liveTradeEquitiesTradier is NOT drift (TRA-370 absent ⇔ true)', () => {
+    const s = { ...armedSettings() };
+    delete (s as Partial<AccountSettings>).liveTradeEquitiesTradier;
+    expect(resolveLiveBrokerArmDrift(s, PIN, prodEnv())).toEqual([]);
+  });
+
+  it('reports all three fields on a cold demo operator (the original TRA-713 first-boot arm)', () => {
+    const cold: AccountSettings = {
+      ...DEFAULT_ACCOUNT_SETTINGS,
+      mode: 'demo',
+      liveTradierEnvOptions: 'sandbox',
+      liveTradeEquitiesTradier: false,
+    };
+    expect(resolveLiveBrokerArmDrift(cold, PIN, prodEnv()))
+      .toEqual(['mode', 'liveTradierEnvOptions', 'liveTradeEquitiesTradier']);
+  });
+
+  it('never repairs a non-pinned user, however drifted (shared-account blast-radius guard)', () => {
+    const drifted: AccountSettings = { ...armedSettings(), liveTradierEnvOptions: 'sandbox' };
+    expect(resolveLiveBrokerArmDrift(drifted, 'someone-else', prodEnv())).toEqual([]);
+  });
+
+  it('never repairs on a non-production service (a sandbox deploy stays sandbox)', () => {
+    const drifted: AccountSettings = { ...armedSettings(), liveTradierEnvOptions: 'sandbox' };
+    expect(resolveLiveBrokerArmDrift(drifted, PIN, prodEnv({ TRADIER_ENV: 'sandbox' }))).toEqual([]);
+  });
+
+  it('the empty-pin kill-switch still disarms the repair entirely', () => {
+    const drifted: AccountSettings = { ...armedSettings(), liveTradierEnvOptions: 'sandbox' };
+    expect(resolveLiveBrokerArmDrift(drifted, PIN, prodEnv({ LIVE_EQUITY_BOOT_USER: '' }))).toEqual([]);
+  });
+
+  it('never repairs when no production creds resolve anywhere (never arm with no broker attached)', () => {
+    const drifted: AccountSettings = { ...armedSettings(), liveTradierEnvOptions: 'sandbox' };
+    const env = prodEnv();
+    delete env['TRADIER_API_TOKEN'];
+    delete env['TRADIER_ACCOUNT_ID'];
+    expect(resolveLiveBrokerArmDrift(drifted, PIN, env)).toEqual([]);
   });
 });
 

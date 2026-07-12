@@ -168,7 +168,7 @@ import { initTwoFactorStore, issueChallenge, resendChallenge, verifyChallenge } 
 import { initStateDb, getStateDb } from './sqlite.js'; // TRA-1052 — durable hot-state SQLite store
 import { checkThrottle, recordFailure, recordSuccess } from './auth-throttle.js';
 import { getSettings, loadSettings, mergeScopedRiskSettings, saveSettings } from './account-settings.js';
-import { resolveLiveBrokerOperator, isLiveBrokerOperator } from './signal-engine.js';
+import { resolveLiveBrokerOperator, isLiveBrokerOperator, shouldBootArmLiveEquity, resolveLiveBrokerArmDrift } from './signal-engine.js';
 import {
   initNotificationDispatcher,
   emitAlert,
@@ -5315,6 +5315,24 @@ app.get('/api/health/options-live', async (_req, res) => {
       prodEnvAccountPresent,
       optionsAccountIdTail,
       bootArmPinConfigured: (process.env['LIVE_EQUITY_BOOT_USER'] ?? '').trim().length > 0,
+      // TRA-1652 — WHY the routing resolves the way it does, so a red probe names
+      // its own cause instead of requiring an admin login nobody can perform on
+      // bqb1. All three are secrets-free (an env LABEL and two booleans/labels —
+      // same class as `optionsBrokerEnv`, which this route already returns).
+      //
+      // `serviceTradierEnv` is the SERVICE-level `TRADIER_ENV`. It is the gate the
+      // boot-arm derives prod intent from (TRA-1411), it is `sync: false` in
+      // render.yaml (dashboard-only), and it was previously invisible from outside
+      // — so a sandbox-routed operator was indistinguishable from a mis-set service
+      // env. `bootArmEligible` is the `shouldBootArmLiveEquity` verdict, i.e. "would
+      // a redeploy converge this operator onto the production arm?". `bootArmDrift`
+      // lists the persisted fields still off the ratified arm — it should be EMPTY on
+      // a healthy prod boot, because `createUserContext` repairs them at startup; a
+      // non-empty list here means the repair could not run (or something rewrote the
+      // operator after boot).
+      serviceTradierEnv: (process.env['TRADIER_ENV'] ?? '').trim() || null,
+      bootArmEligible: shouldBootArmLiveEquity(settings, operator),
+      bootArmDrift: resolveLiveBrokerArmDrift(settings, operator),
       // TRA-1490 / TRA-1491 — DARK strategy arm-flag states so the board/QA can
       // confirm (secrets-free) that the live single-leg option order paths are
       // still OFF. Both default false; arming either is a SEPARATE board approval.

@@ -3,7 +3,7 @@ import { existsSync } from 'fs';
 import { join, dirname } from 'path';
 import { fileURLToPath } from 'url';
 
-import { SignalEngine, shouldBootArmLiveEquity, shouldBootArmLiveCrypto } from './signal-engine.js';
+import { SignalEngine, shouldBootArmLiveCrypto, resolveLiveBrokerArmDrift } from './signal-engine.js';
 import { CryptoSignalEngine } from './crypto-engine.js';
 import { PnlTracker } from './pnl-tracker.js';
 import type { RelativeValueScannerService } from './relative-value-scanner.js';
@@ -729,7 +729,23 @@ async function createUserContext(username: string): Promise<UserContext> {
   // non-pinned user, so the shared prod Tradier account can never be armed
   // fleet-wide. `loadSettings` returns the cached reference, so mutating + saving
   // keeps cache, disk, and engine in agreement.
-  if (settings.mode !== 'live' && shouldBootArmLiveEquity(settings, username)) {
+  //
+  // TRA-1652 — this block is a CONVERGENCE step, not a one-shot initializer. It used
+  // to be latched behind `settings.mode !== 'live'`, so it only ever ran on the single
+  // boot that first flipped the operator demo → live. That left the arm unable to
+  // repair itself: once `mode:'live'` was persisted, a later drift of
+  // `liveTradierEnvOptions` back to `'sandbox'` (a settings PUT omitting the field
+  // defaults it to sandbox; a DATA_DIR restore predating TRA-1411 does the same) was
+  // PERMANENT, because the only writer of `'production'` was gated off by the very
+  // field it had already set. That is the TRA-1652 pre-open blocker QA caught on the
+  // TRA-1578 mirror: `mode: live` + `optionsBrokerEnv: sandbox` + the SANDBOX account
+  // tail `***6703` instead of the signed-off production `***0154`, which would have
+  // routed the board's attended <=$100 options canary into the Tradier sandbox.
+  // Re-deriving the drift set every boot means a plain redeploy always restores the
+  // ratified arm. Scope is unchanged (operator pin + TRADIER_ENV=production +
+  // resolvable prod creds, all inside `shouldBootArmLiveEquity`).
+  const armDrift = resolveLiveBrokerArmDrift(settings, username);
+  if (armDrift.length > 0) {
     settings.mode = 'live';
     // TRA-1411 — also persist production Tradier env so buildTradierLiveEquityClient
     // constructs the PRODUCTION order client (not sandbox). The persisted setting is
@@ -750,8 +766,13 @@ async function createUserContext(username: string): Promise<UserContext> {
     settings.liveTradeEquitiesTradier = true;
     try {
       await saveSettings(username, settings);
-      log.info('TRA-713/TRA-1411/TRA-1482 boot-arm: forced production stocks engine to Live at boot', {
+      log.info('TRA-713/TRA-1411/TRA-1482/TRA-1652 boot-arm: converged production stocks engine onto the ratified live arm', {
         username,
+        // TRA-1652 — which fields had DRIFTED and were repaired this boot. A
+        // recurring `liveTradierEnvOptions` here means something is still writing
+        // the operator back to sandbox between boots (look for a settings PUT).
+        repaired: armDrift,
+        mode: settings.mode,
         liveTradierEnvOptions: settings.liveTradierEnvOptions,
         liveTradeEquitiesTradier: settings.liveTradeEquitiesTradier,
       });

@@ -11103,6 +11103,59 @@ export function shouldBootArmLiveEquity(
 }
 
 /**
+ * TRA-1652 — the three persisted fields the live-equity/options boot-arm owns for
+ * the pinned operator, and which of them have DRIFTED away from the armed state.
+ * Empty array ⇔ the operator's persisted settings already match the arm.
+ */
+export type LiveBrokerArmField = 'mode' | 'liveTradierEnvOptions' | 'liveTradeEquitiesTradier';
+
+/**
+ * TRA-1652 — which boot-arm fields need force-persisting for `username` right now.
+ *
+ * The TRA-713/TRA-1411/TRA-1482 boot-arm block in `user-context.createUserContext`
+ * used to be latched behind `settings.mode !== 'live'`, i.e. it only ran on the ONE
+ * boot that first flipped the operator demo → live. That made it a one-shot
+ * initializer rather than a convergence loop, and left a permanent hole: once
+ * `mode:'live'` was persisted, any later drift of `liveTradierEnvOptions` back to
+ * `'sandbox'` (a settings PUT that omits the field defaults it to sandbox, or a
+ * DATA_DIR snapshot restored from before TRA-1411) could never be repaired, because
+ * the only code that writes `'production'` was gated off by the very field it had
+ * already set. On bqb1 that surfaced as the TRA-1652 pre-open blocker: `mode: live`
+ * but `optionsBrokerEnv: sandbox`, `optionsBrokerConfigured: false`, and the SANDBOX
+ * account tail `***6703` instead of the signed-off production `***0154` — so the
+ * board's attended options canary would have filled against the Tradier sandbox and
+ * proven nothing about the live path.
+ *
+ * Deriving the repair set per-boot instead makes the arm IDEMPOTENT and SELF-HEALING:
+ * every boot re-converges the operator's durable state onto the ratified arm, which is
+ * what "a plain `git push` configures the live broker" was always supposed to mean.
+ *
+ * Scope is UNCHANGED and still real-money-safe — {@link shouldBootArmLiveEquity} gates
+ * on the operator pin + service `TRADIER_ENV=production` + resolvable prod creds, so no
+ * non-operator engine and no sandbox service is ever touched. The durable kill-switch is
+ * likewise unchanged: `LIVE_EQUITY_BOOT_USER=""` disarms and this returns [].
+ *
+ * The trade-off this accepts deliberately: on the prod service the operator can no longer
+ * durably pin themselves to the Tradier SANDBOX env via a settings PUT — the next boot
+ * converges them back to production. That is the intended posture for the pinned prod
+ * operator (the arm is the source of truth, not a settings row an admin PUT can silently
+ * clobber); a sandbox-routed operator is what this bug WAS.
+ */
+export function resolveLiveBrokerArmDrift(
+  settings: AccountSettings,
+  username: string,
+  env: NodeJS.ProcessEnv = process.env,
+): LiveBrokerArmField[] {
+  if (!shouldBootArmLiveEquity(settings, username, env)) return [];
+  const drift: LiveBrokerArmField[] = [];
+  if ((settings.mode ?? 'demo') !== 'live') drift.push('mode');
+  if ((settings.liveTradierEnvOptions ?? 'sandbox') !== 'production') drift.push('liveTradierEnvOptions');
+  // TRA-370 — absent ↔ true, so only an EXPLICIT `false` is drift here.
+  if (settings.liveTradeEquitiesTradier === false) drift.push('liveTradeEquitiesTradier');
+  return drift;
+}
+
+/**
  * TRA-1340 — decide whether the production crypto engine should boot with LIVE
  * Coinbase auto-trading armed for the pinned operator, so a plain redeploy
  * activates the board-approved live crypto DCA arm WITHOUT an ADMIN_PASSWORD API
