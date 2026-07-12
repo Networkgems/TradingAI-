@@ -83,39 +83,107 @@ try {
 }
 
 // Presence only. The secret is never read, logged, or compared.
-if (/^password=.+$/m.test(filled)) {
-  console.log(`[check-push-auth] OK — a credential for ${host} is available; push can authenticate.`);
-  process.exit(0);
-}
+const present = /^password=.+$/m.test(filled);
 
-let unpushed = '';
-try {
-  const branch = git(['rev-parse', '--abbrev-ref', 'HEAD']);
-  unpushed = git(['log', '--oneline', `${REMOTE}/${branch}..HEAD`]);
-} catch {
-  /* no upstream ref cached — not important to the diagnosis */
-}
+const stranded = () => {
+  try {
+    const branch = git(['rev-parse', '--abbrev-ref', 'HEAD']);
+    return git(['log', '--oneline', `${REMOTE}/${branch}..HEAD`]);
+  } catch {
+    /* no upstream ref cached — not important to the diagnosis */
+    return '';
+  }
+};
 
-console.error(
-  `\n[check-push-auth] FAIL — no credential for ${host}, so a push to '${REMOTE}' cannot authenticate.\n\n` +
-    'DO NOT retry the push. It will not error — it will HANG, because Git Credential Manager\n' +
-    'blocks waiting for a prompt that a headless session can never answer.\n',
-);
-
-if (unpushed) {
+const reportStranded = () => {
+  const unpushed = stranded();
+  if (!unpushed) return;
   const n = unpushed.split('\n').length;
   console.error(`${n} commit(s) are already stranded locally and are NOT on the remote:\n`);
   for (const line of unpushed.split('\n')) console.error(`  ${line}`);
   console.error('');
+};
+
+if (!present) {
+  console.error(
+    `\n[check-push-auth] FAIL — no credential for ${host}, so a push to '${REMOTE}' cannot authenticate.\n\n` +
+      'DO NOT retry the push. It will not error — it will HANG, because Git Credential Manager\n' +
+      'blocks waiting for a prompt that a headless session can never answer.\n',
+  );
+  reportStranded();
+  console.error(
+    'Issuing a credential for a private repo is secret issuance, which no agent on this host\n' +
+      'can do. Tracked as TRA-1675.\n\n' +
+      'Fix (any one), then re-run this check:\n' +
+      `  1. export GH_TOKEN=<PAT with 'repo' scope>       # most durable for headless agents\n` +
+      `  2. seed the store once, interactively:  git push ${REMOTE} HEAD\n` +
+      '  3. use a token-embedded remote or deploy key\n\n' +
+      'Runbook: docs/runbook.md  §8 "GitHub credential for agent pushes"\n',
+  );
+  process.exit(1);
+}
+
+// PRESENCE IS NOT VALIDITY.
+// -------------------------
+// The store on this host holds a `gho_` GitHub OAuth access token, which EXPIRES on a
+// clock (GCM refreshes it from a companion refresh token). An expired-but-still-stored
+// token fills perfectly happily above — so a presence-only check prints OK and the push
+// then dies on a 401. That is the same false-GREEN shape this script exists to kill,
+// just moved one step down the pipe.
+//
+// So actually authenticate. `ls-remote` is the cheapest request that exercises the
+// credential end-to-end (~1s), and it is bounded and non-interactive here for the same
+// reason `credential fill` is: this check must never inherit the hang it detects.
+let probeErr = null;
+try {
+  git(['ls-remote', '--heads', REMOTE], {
+    timeout: 30_000,
+    killSignal: 'SIGKILL',
+    env: { ...process.env, GIT_TERMINAL_PROMPT: '0', GCM_INTERACTIVE: 'never' },
+  });
+} catch (err) {
+  probeErr = err;
+}
+
+if (!probeErr) {
+  console.log(`[check-push-auth] OK — the credential for ${host} authenticated against '${REMOTE}'; push can proceed.`);
+  process.exit(0);
+}
+
+const stderr = String(probeErr.stderr ?? '');
+const authFailed = /authentication failed|invalid username or password|could not read (username|password)|403|401|bad credentials|terminal prompts disabled/i.test(
+  stderr,
+);
+
+// An UNREACHABLE remote is not a bad credential, and must not be reported as one. Failing
+// closed on a network blip would block every push on the host for a cause a new token
+// cannot fix. It is also safe to pass here: a network error makes `git push` fail LOUDLY
+// and quickly. The hazard this guard exists for is the credential PROMPT, which hangs
+// silently — and a reachability failure cannot produce it.
+if (!authFailed) {
+  console.warn(
+    `[check-push-auth] WARN — a credential for ${host} is present, but '${REMOTE}' could not be reached, so\n` +
+      'it could not be verified. This is a reachability failure, not an auth failure; a push will\n' +
+      'fail loudly rather than hang. Proceeding.\n' +
+      `  ${stderr.trim().split('\n')[0] ?? probeErr.message}`,
+  );
+  process.exit(0);
 }
 
 console.error(
-  'This is a HUMAN action — issuing a credential for a private repo is secret issuance,\n' +
-    'and no agent on this host can do it. Tracked as TRA-1675.\n\n' +
-    'Fix (any one), then re-run this check:\n' +
-    `  1. export GH_TOKEN=<PAT with 'repo' scope>       # most durable for headless agents\n` +
-    `  2. seed the store once, interactively:  git push ${REMOTE} HEAD\n` +
-    '  3. use a token-embedded remote or deploy key\n\n' +
+  `\n[check-push-auth] FAIL — the stored credential for ${host} is present but REJECTED by '${REMOTE}'.\n\n` +
+    'It is stale, not missing: an expired or revoked token still sits in the credential store and\n' +
+    'fills on request, so "a credential exists" is true and worthless. A push will 401.\n',
+);
+reportStranded();
+console.error(
+  'This host authenticates with a `gho_` OAuth access token, which expires by design — so this\n' +
+    'state is EXPECTED to recur and is usually self-healing:\n\n' +
+    '  1. Wait and re-run. Git Credential Manager mints a fresh token from its refresh token;\n' +
+    '     the 2026-07-12 outage recovered on its own this way (TRA-1675).\n' +
+    `  2. Still failing? The refresh token is expired too. Re-seed interactively: git push ${REMOTE} HEAD\n` +
+    `  3. Durable headless fix: export GH_TOKEN=<PAT with 'repo' scope>  — a PAT does not rotate.\n\n` +
+    'Do NOT report work as shipped while this fails. Your commits are still local.\n' +
     'Runbook: docs/runbook.md  §8 "GitHub credential for agent pushes"\n',
 );
 process.exit(1);
