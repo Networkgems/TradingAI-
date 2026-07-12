@@ -1459,6 +1459,66 @@ export async function fetchStocksNews(symbols: readonly string[]): Promise<NewsI
   return items.slice(0, RESULT_CAP);
 }
 
+// TRA-1629 (TRA-1623A) — market-wide / topic news pull for catalyst discovery.
+//
+// `fetchStocksNews` above is *per-symbol-scoped*: it only pulls news for symbols
+// already on the watchlist, so it can annotate but never DISCOVER a catalyst
+// name. This sibling runs a set of non-symbol-scoped market/topic queries so the
+// news-catalyst source (news-catalyst-source.ts) has a broad headline stream to
+// map onto tickers. Keyless Yahoo search, $0 incremental cost — same provider as
+// `fetchStocksNews`. Returns items with a `summary` when Yahoo supplies one so
+// the lexicon scorer has both title + body to work with.
+export async function fetchMarketNews(extraQueries: readonly string[] = []): Promise<NewsItem[]> {
+  // Broad, catalyst-oriented topic queries. These surface market-moving headlines
+  // (earnings, upgrades/downgrades, M&A, guidance) that name a company without
+  // us having to know the ticker in advance.
+  const DEFAULT_QUERIES = [
+    'stock market movers today',
+    'earnings beat miss guidance',
+    'analyst upgrade downgrade price target',
+    'stocks surge plunge today',
+  ];
+  const queries = [...DEFAULT_QUERIES, ...extraQueries];
+  const PER_QUERY_NEWS = 12;
+  const RESULT_CAP = 60;
+
+  const items: NewsItem[] = [];
+  const seen = new Set<string>();
+  const collect = (
+    newsArr: ReadonlyArray<{
+      title?: string;
+      link?: string;
+      publisher?: string;
+      summary?: string;
+      providerPublishTime?: Date | number | string;
+    }>,
+  ): void => {
+    for (const n of newsArr) {
+      if (!n?.link || !n?.title || seen.has(n.link)) continue;
+      seen.add(n.link);
+      items.push({
+        title: n.title,
+        url: n.link,
+        source: n.publisher ?? 'Yahoo Finance',
+        publishedAt: toIsoTime(n.providerPublishTime),
+        ...(n.summary ? { summary: n.summary } : {}),
+      });
+    }
+  };
+
+  for (const q of queries) {
+    const r = await withRetry(
+      () => yf.search(q, { newsCount: PER_QUERY_NEWS, quotesCount: 0 }),
+      `search(market news "${q}")`,
+    );
+    if (r) collect(r.news ?? []);
+    await sleep(150);
+  }
+
+  items.sort((a, b) => b.publishedAt.localeCompare(a.publishedAt));
+  return items.slice(0, RESULT_CAP);
+}
+
 /** Test Yahoo Finance connectivity — returns a quote or throws. */
 export async function testYahooFinance(): Promise<{ symbol: string; price: number }> {
   const q = await withTimeout(yf.quote('AAPL'), YF_CALL_TIMEOUT_MS, 'quote(AAPL) health-check');

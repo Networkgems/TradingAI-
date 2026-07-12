@@ -42,6 +42,13 @@ import type {
 } from '@trading-app/shared';
 import { fetchDailyCandles, fetchQuote, fetchTradierDailyCandles } from './yahoo-feed.js';
 import { saveResearchReport } from './research-store.js';
+import { isNewsCatalystEnabled } from './news-catalyst-ledger.js';
+import {
+  buildSessionLeanInputs,
+  assembleNameLeans,
+  strongestLeaders,
+  renderLeanMarkdown,
+} from './news-catalyst-lean.js';
 import { logger } from './observability/index.js';
 
 const log = logger.child({ module: 'market-review' });
@@ -669,6 +676,28 @@ export async function generateMarketReview(
     },
   };
 
+  // TRA-1629 (TRA-1623A) — D2 calls-vs-puts per-name lean. Flag-gated (default
+  // OFF): when off this whole block is skipped and the review is byte-identical
+  // to the pre-TRA-1629 index-only output. OBSERVE-ONLY — the lean annotates the
+  // report body + seeds `reviewBlock.leaders`; it routes no order, sizes nothing,
+  // touches no exit. Never throws: a lean-build failure degrades to no section.
+  let leanMarkdown = '';
+  if (isNewsCatalystEnabled()) {
+    try {
+      const leanInputs = await buildSessionLeanInputs(gates.trendState ?? 'unknown', now.getTime());
+      const leans = assembleNameLeans(leanInputs);
+      if (leans.length > 0 && review.reviewBlock) {
+        review.reviewBlock.leaders = strongestLeaders(leans);
+        leanMarkdown = `\n\n${renderLeanMarkdown(leans)}`;
+      }
+    } catch (err) {
+      log.error('news-catalyst lean enrichment failed', {
+        reviewId: review.id,
+        reason: err instanceof Error ? err.message : String(err),
+      });
+    }
+  }
+
   // Persist the structured review (upsert by id).
   const all = await ensureLoaded();
   const idx = all.findIndex(r => r.id === review.id);
@@ -688,7 +717,7 @@ export async function generateMarketReview(
       id: `${kind}-${date}`,
       kind,
       title: `${kindLabel} Review — ${date} (auto)`,
-      bodyMarkdown: renderMarkdown(review),
+      bodyMarkdown: renderMarkdown(review) + leanMarkdown,
       publishedAt: review.generatedAt,
       tickers: [SPX_SYMBOL, VIX_SYMBOL, TNX_SYMBOL],
     });

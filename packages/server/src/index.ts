@@ -255,6 +255,7 @@ import { initShadowLedger, listShadowSignals } from './shadow-signal-ledger.js';
 import { initOptionShadowLedger, listOptionShadowSignals, isOptionShadowEnabled, OPTION_SHADOW_EMERGENCY_OFF } from './option-shadow-ledger.js';
 import { initPcrShadowLedger, listPcrShadowSignals, isPcrShadowEnabled, usableSignalCount, PCR_Z_WINDOW_SESSIONS } from './pcr-shadow-ledger.js';
 import { initOiShadowLedger, listOiShadowSignals, isOiShadowEnabled, usableSignalCount as usableOiSignalCount } from './oi-shadow-ledger.js';
+import { initNewsCatalystLedger, listNewsCatalystSignals, isNewsCatalystEnabled, chosenSignalCount } from './news-catalyst-ledger.js';
 import { initPcsShadowLedger, listPcsShadowSignals, isPcsShadowEnabled, settledSignalCount, PCS_SHADOW_STRATEGY_ID } from './pcs-shadow-ledger.js';
 import {
   initReversalShadowLedger,
@@ -739,6 +740,13 @@ await initPcrShadowLedger();
 // ENABLE_OI_SHADOW is set; the capture is observe-only and never touches sizing
 // or exits.
 await initOiShadowLedger();
+
+// TRA-1629 (parent TRA-1623) — warm the flag-gated SHADOW news-catalyst ledger so
+// the read endpoint has history right after boot. The pre-market watchlist build
+// appends one row per name per session when ENABLE_NEWS_CATALYST_WATCHLIST is set;
+// the capture is observe-only (D1 only ADDS names to watch, D2 annotates a report)
+// and never touches sizing or exits.
+await initNewsCatalystLedger();
 
 // TRA-1618 (parent TRA-1614) — warm the flag-gated SHADOW weekly-QQQ-PCS
 // forward-test ledger so the read endpoint + Stage-2 paper feed have history
@@ -4843,6 +4851,35 @@ app.get('/api/health/oi-shadow-signals', async (_req, res) => {
       reason: err instanceof Error ? err.message : String(err),
     });
     res.status(500).json({ error: 'Failed to read oi shadow ledger' });
+  }
+});
+
+// TRA-1629 (parent TRA-1623) — read-only probe over the SHADOW news-catalyst
+// ledger, open like the other shadow probes so QuantTrader can pull the
+// discovery dataset (per-name catalyst score + chosen/dropped + reason) for the
+// TRA-532 forward-validation window without Render admin creds. Reports the
+// CHOSEN-signal count (names actually injected into the watchlist — the
+// "name-day" numerator) against the ≥100 threshold, plus the recent rows.
+// Observe-only: D1 only ADDS names to watch, D2 annotates a report; nothing
+// here routes an order.
+app.get('/api/health/news-catalyst-signals', async (_req, res) => {
+  try {
+    const signals = await listNewsCatalystSignals();
+    const chosen = chosenSignalCount(signals);
+    res.json({
+      issue: 'TRA-1629',
+      flagEnabled: isNewsCatalystEnabled(),
+      promotionThreshold: 100,
+      count: signals.length,
+      chosenCount: chosen,
+      promotionReady: chosen >= 100,
+      signals,
+    });
+  } catch (err) {
+    log.error('news-catalyst-signals health probe failed', {
+      reason: err instanceof Error ? err.message : String(err),
+    });
+    res.status(500).json({ error: 'Failed to read news-catalyst ledger' });
   }
 });
 

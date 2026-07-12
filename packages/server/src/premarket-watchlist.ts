@@ -37,8 +37,11 @@ import { join } from 'path';
 import type { EodReport } from '@trading-app/shared';
 import { WATCHLIST, WATCHLIST_MIN_PRICE } from '@trading-app/shared';
 import { scanStocksMarket, type ScanResult } from './market-scanner.js';
-import { fetchQuotes } from './yahoo-feed.js';
-import { addStocksSymbol } from './watchlist-store.js';
+import { fetchQuotes, fetchMarketNews } from './yahoo-feed.js';
+import { addStocksSymbol, getStocksWatchlistData } from './watchlist-store.js';
+import { isNewsCatalystEnabled } from './news-catalyst-ledger.js';
+import { buildNewsCatalystPicks, fetchCatalystMetrics } from './news-catalyst-source.js';
+import { earningsInDaysSync } from './earnings-store.js';
 import { getSettings } from './account-settings.js';
 import {
   getAllUserContexts,
@@ -70,12 +73,18 @@ interface ScoredSymbol {
  *   - `volume`: pre-market most-actives. Liquidity for the engine's
  *     liquidity-gated entries.
  *   - `trending`: news / search trending. Lowest weight (noisy).
+ *   - `news_catalyst`: TRA-1629 — a name the news-catalyst discovery source
+ *     surfaced (fresh headline + non-neutral sentiment tilt + rel-vol/gap).
+ *     Weighted ABOVE `eod_mover` (5) and well above the noisy `trending` (1),
+ *     per the parent memo §4. Flag-gated (`ENABLE_NEWS_CATALYST_WATCHLIST`,
+ *     default OFF); the score is a discovery signal, not an order.
  */
 const WEIGHTS: Record<string, number> = {
+  news_catalyst: 6,
   eod_mover: 5,
-  eod_traded: 3,
   gainer: 4,
   loser: 4,
+  eod_traded: 3,
   volume: 3,
   trending: 1,
 };
@@ -106,6 +115,13 @@ async function loadLatestEodReport(ctx: UserContext): Promise<EodReport | null> 
 export function scoreSymbols(
   eod: EodReport | null,
   preMarket: ReadonlyArray<ScanResult>,
+  /**
+   * TRA-1629 — symbols the news-catalyst discovery source chose this run. Bumped
+   * under the `news_catalyst` source (the highest weight) so a fresh catalyst
+   * name outranks a plain price/volume mover. Empty (default) when the feature
+   * flag is off, so the scoring is byte-identical to the pre-TRA-1629 behaviour.
+   */
+  newsCatalyst: readonly string[] = [],
 ): ScoredSymbol[] {
   const scores = new Map<string, ScoredSymbol>();
 
@@ -130,6 +146,8 @@ export function scoreSymbols(
   }
 
   for (const r of preMarket) bump(r.symbol, r.reason);
+
+  for (const sym of newsCatalyst) bump(sym, 'news_catalyst');
 
   return [...scores.values()].sort((a, b) => b.score - a.score);
 }
@@ -234,7 +252,32 @@ export async function generateSmartWatchlist(ctx: UserContext): Promise<string[]
     });
   }
 
-  const ranked = scoreSymbols(eod, preMarketScan);
+  // TRA-1629 — flag-gated news-catalyst discovery source. Default OFF: when the
+  // flag is unset this is skipped entirely and `ranked` is byte-identical to the
+  // pre-TRA-1629 price/volume watchlist. Observe-only — it only ADDS names for
+  // the engine to watch and appends a shadow ledger; it routes no order.
+  let newsCatalyst: string[] = [];
+  if (isNewsCatalystEnabled()) {
+    try {
+      const hidden = new Set(
+        getStocksWatchlistData(ctx.username).hidden.map(s => s.toUpperCase()),
+      );
+      newsCatalyst = await buildNewsCatalystPicks({
+        fetchNews: () => fetchMarketNews(),
+        fetchMetrics: fetchCatalystMetrics,
+        earningsInDays: earningsInDaysSync,
+        now: Date.now(),
+        hidden,
+      });
+    } catch (err) {
+      log.warn('news-catalyst source failed', {
+        username: ctx.username,
+        reason: err instanceof Error ? err.message : String(err),
+      });
+    }
+  }
+
+  const ranked = scoreSymbols(eod, preMarketScan, newsCatalyst);
 
   // Skip names already in the base WATCHLIST — those are watched by default
   // and re-adding them would just clutter the per-user `stocks.added` audit.

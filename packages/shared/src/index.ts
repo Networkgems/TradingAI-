@@ -6,6 +6,7 @@ export * from './promotion-gate.js';
 
 // TRA-534 — News-sentiment scorer (lexicon-v1) + per-symbol aggregate.
 export * from './news-sentiment.js';
+export * from './news-catalyst.js';
 
 // TRA-602 — StockTwits social-sentiment aggregate.
 export * from './social-sentiment.js';
