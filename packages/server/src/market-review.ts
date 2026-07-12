@@ -49,6 +49,7 @@ import {
   strongestLeaders,
   renderLeanMarkdown,
 } from './news-catalyst-lean.js';
+import { recordCatalystLean } from './news-catalyst-lean-ledger.js';
 import { logger } from './observability/index.js';
 
 const log = logger.child({ module: 'market-review' });
@@ -689,6 +690,17 @@ export async function generateMarketReview(
       if (leans.length > 0 && review.reviewBlock) {
         review.reviewBlock.leaders = strongestLeaders(leans);
         leanMarkdown = `\n\n${renderLeanMarkdown(leans)}`;
+      }
+      // TRA-1632 — persist the resolved lean per name-day so QuantTrader can join
+      // it against realized next-day/3-day underlying direction offline (TRA-1630).
+      // PCR/OI are point-in-time and cannot be reconstructed retroactively, so the
+      // lean MUST be captured at review time. One row per name per ET session
+      // (first review wins). Still observe-only: this only records what the report
+      // already annotated — it routes no order, sizes nothing, touches no exit.
+      const inputBySym = new Map(leanInputs.map((i) => [i.symbol.toUpperCase(), i]));
+      for (const l of leans) {
+        const input = inputBySym.get(l.symbol);
+        if (input) await recordCatalystLean(input, l.lean, now.getTime());
       }
     } catch (err) {
       log.error('news-catalyst lean enrichment failed', {

@@ -242,6 +242,23 @@ export const RENDER_RATIFIED_DEMO_DEFAULTS: Readonly<Record<string, string>> = {
   RV_EXIT_RETUNE_ENABLED: '1',
   RV_EXIT_RETUNE_CONFIRM_BARS: '2',
   RV_EXIT_FLIP_MIN_LOSS_PCT: '-0.20',
+  // TRA-1632 (TRA-1623A, parent TRA-1630/TRA-1623) — arm the news-catalyst SHADOW
+  // window on the bqb1 demo desk. render.yaml ratifies `ENABLE_NEWS_CATALYST_WATCHLIST:"1"`
+  // (added alongside this entry), but a render.yaml `value` added AFTER the last
+  // manual blueprint sync stays DARK on a plain autoDeploy — the same TRA-1289
+  // env-sync gap the churn brake / RV-retune hit. This is an env-armed observe-only
+  // shadow flag (same class as ENABLE_OPTION_SHADOW_SELECTOR / ENABLE_REVERSAL_SHADOW):
+  // STRICTLY observe-only by construction — D1 only ADDS names to the watchlist
+  // (premarket-watchlist.ts:255-258) and D2 only ANNOTATES the report body /
+  // ReviewBlock.leaders + appends a shadow lean row (market-review.ts:680-683,
+  // news-catalyst-lean-ledger.ts), routing NO order, sizing nothing, touching no
+  // exit. Meets STRICT admission: (1) board-independent shadow class (no live capital,
+  // no board approval consumed), (2) structurally incapable of touching live capital,
+  // (3) pure observe-only. Seeds into the boot env on Render only when set by neither
+  // env nor demo-flags.json, so it self-heals across the env-sync gap and every
+  // redeploy. Starts QuantTrader's TRA-1630 forward-validation (D1 incremental
+  // expectancy + D2 lean-hit-rate) via `GET /api/health/news-catalyst-signals`.
+  ENABLE_NEWS_CATALYST_WATCHLIST: '1',
 };
 
 /**

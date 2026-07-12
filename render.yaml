@@ -253,6 +253,24 @@ services:
       #     ANTHROPIC_API_KEY (above) is set in the dashboard.
       - key: ENABLE_OPTION_SHADOW_SELECTOR
         value: "true"
+      # TRA-1632 (TRA-1623A, parent TRA-1630/TRA-1623) — arm the NEWS-CATALYST
+      # SHADOW window on the demo desk. Same observe-only shadow class as
+      # ENABLE_OPTION_SHADOW_SELECTOR (above) / ENABLE_REVERSAL_SHADOW (below):
+      # NO live capital, NO board approval consumed. D1 (`news_catalyst` watchlist
+      # source) only ADDS names to watch; D2 (the pre/post-market report lean) only
+      # ANNOTATES the report body / ReviewBlock.leaders and appends a shadow lean
+      # row — it routes NO order, sizes nothing, touches no exit. `isNewsCatalystEnabled()`
+      # reads raw process.env, so the durable arm is the RENDER_RATIFIED_DEMO_DEFAULTS
+      # self-heal (demo-flags.ts) which seeds this into the boot env on Render; this
+      # render.yaml entry keeps render.yaml the source of truth. QuantTrader forward-
+      # validates on TRA-1630 (D1 incremental expectancy + D2 lean-hit-rate) via
+      # `GET /api/health/news-catalyst-signals` (`flagEnabled/chosenCount/leanCount`).
+      # NOTE: blueprint sync != autoDeploy on bqb1 (TRA-1289) — the push to main
+      # triggers the redeploy via autoDeploy; the self-heal delivers the value.
+      # Revert = clear this value + remove the demo-defaults entry + redeploy.
+      # Accepts 1/true/yes/on.
+      - key: ENABLE_NEWS_CATALYST_WATCHLIST
+        value: "1"
       # TRA-967 / TRA-953 (TRA-908 Phase B) — turn OPTIONS PHASE-B PAPER
       # EXECUTION ON. Board-approved (approval c10b717e-294f-4718-8a7c-11a2cd18875f,
       # parallel to the shadow-flag approval 8fb26954 in TRA-942). Until this is

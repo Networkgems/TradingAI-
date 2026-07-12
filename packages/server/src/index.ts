@@ -256,6 +256,7 @@ import { initOptionShadowLedger, listOptionShadowSignals, isOptionShadowEnabled,
 import { initPcrShadowLedger, listPcrShadowSignals, isPcrShadowEnabled, usableSignalCount, PCR_Z_WINDOW_SESSIONS } from './pcr-shadow-ledger.js';
 import { initOiShadowLedger, listOiShadowSignals, isOiShadowEnabled, usableSignalCount as usableOiSignalCount } from './oi-shadow-ledger.js';
 import { initNewsCatalystLedger, listNewsCatalystSignals, isNewsCatalystEnabled, chosenSignalCount } from './news-catalyst-ledger.js';
+import { initNewsCatalystLeanLedger, listCatalystLeans, leanBreakdown } from './news-catalyst-lean-ledger.js';
 import { initPcsShadowLedger, listPcsShadowSignals, isPcsShadowEnabled, settledSignalCount, PCS_SHADOW_STRATEGY_ID } from './pcs-shadow-ledger.js';
 import {
   initReversalShadowLedger,
@@ -747,6 +748,13 @@ await initOiShadowLedger();
 // the capture is observe-only (D1 only ADDS names to watch, D2 annotates a report)
 // and never touches sizing or exits.
 await initNewsCatalystLedger();
+
+// TRA-1632 (parent TRA-1630/TRA-1623) — warm the flag-gated SHADOW D2 lean ledger
+// so the read endpoint has history right after boot. The post/pre-market review
+// appends one lean row per catalyst name per session when the same
+// ENABLE_NEWS_CATALYST_WATCHLIST flag is set; the capture is observe-only (the
+// lean only annotates the report) and never touches sizing or exits.
+await initNewsCatalystLeanLedger();
 
 // TRA-1618 (parent TRA-1614) — warm the flag-gated SHADOW weekly-QQQ-PCS
 // forward-test ledger so the read endpoint + Stage-2 paper feed have history
@@ -4866,6 +4874,10 @@ app.get('/api/health/news-catalyst-signals', async (_req, res) => {
   try {
     const signals = await listNewsCatalystSignals();
     const chosen = chosenSignalCount(signals);
+    // TRA-1632 — surface the persisted D2 lean rows alongside the D1 discovery
+    // rows so QuantTrader can grade lean-hit-rate (TRA-1630) from one probe. The
+    // lean is captured point-in-time (PCR/OI cannot be reconstructed later).
+    const leans = await listCatalystLeans();
     res.json({
       issue: 'TRA-1629',
       flagEnabled: isNewsCatalystEnabled(),
@@ -4874,6 +4886,10 @@ app.get('/api/health/news-catalyst-signals', async (_req, res) => {
       chosenCount: chosen,
       promotionReady: chosen >= 100,
       signals,
+      // TRA-1632 — D2 lean gradeability surface.
+      leanCount: leans.length,
+      leanBreakdown: leanBreakdown(leans),
+      leans,
     });
   } catch (err) {
     log.error('news-catalyst-signals health probe failed', {

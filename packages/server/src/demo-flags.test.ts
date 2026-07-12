@@ -156,6 +156,10 @@ describe('renderRatifiedDemoDefaults (TRA-1481 — self-heal the Render blueprin
       RV_EXIT_RETUNE_ENABLED: '1',
       RV_EXIT_RETUNE_CONFIRM_BARS: '2',
       RV_EXIT_FLIP_MIN_LOSS_PCT: '-0.20',
+      // TRA-1632 — the news-catalyst SHADOW flag self-heals the same env-sync gap
+      // (observe-only: D1 adds watchlist names, D2 annotates the report + logs a
+      // shadow lean; no order, no size, no exit). render.yaml ratifies `=1`.
+      ENABLE_NEWS_CATALYST_WATCHLIST: '1',
     });
   });
 
@@ -170,6 +174,7 @@ describe('renderRatifiedDemoDefaults (TRA-1481 — self-heal the Render blueprin
       RV_EXIT_RETUNE_ENABLED: '0',
       RV_EXIT_RETUNE_CONFIRM_BARS: '3',
       RV_EXIT_FLIP_MIN_LOSS_PCT: '0',
+      ENABLE_NEWS_CATALYST_WATCHLIST: '0',
     } as NodeJS.ProcessEnv;
     expect(renderRatifiedDemoDefaults(dir, env)).toEqual({});
   });
@@ -197,7 +202,11 @@ describe('renderRatifiedDemoDefaults (TRA-1481 — self-heal the Render blueprin
       RV_EXIT_RETUNE_CONFIRM_BARS: '3',
       RV_EXIT_FLIP_MIN_LOSS_PCT: '0',
     });
-    const env = { RENDER: 'true' } as NodeJS.ProcessEnv;
+    // TRA-1632 — the news-catalyst flag is NOT on the demo-flags.json allowlist
+    // (isNewsCatalystEnabled reads raw process.env, so the file never reaches it);
+    // its disarm path is an explicit env `=0` / cleared value, so set it here to
+    // keep this file-disarm case an exact no-op.
+    const env = { RENDER: 'true', ENABLE_NEWS_CATALYST_WATCHLIST: '0' } as NodeJS.ProcessEnv;
     expect(renderRatifiedDemoDefaults(dir, env)).toEqual({});
   });
 
