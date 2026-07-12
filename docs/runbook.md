@@ -138,6 +138,58 @@ scaling and alert response.
 
 ## 2. Deploy procedure
 
+### Launch-window deploy freeze (TRA-1653 / TRA-1665) — READ FIRST
+
+While the go-live soak is running, `tradingai-bqb1` is **pinned**: `autoDeploy=no`,
+`autoDeployTrigger=off`. Pushing to `main` deploys **nothing**. The build under
+soak is the one the launch ships.
+
+**The one rule: deploy by explicit commit id. Never "Deploy latest commit".**
+
+`main` HEAD is **not** the pinned build and drifts further from it every time
+anyone merges. "Deploy latest commit on `main`" therefore ships whatever else
+happened to land — un-soaked, unreviewed for this window, and it **restarts the
+process and resets the soak clock**. Deploying by SHA is immune to all of that.
+
+Render UI: *Manual Deploy → **Deploy a specific commit*** → paste the SHA.
+Never *Manual Deploy → Deploy latest commit*.
+
+**Emergency hotfix during the window** — this is the realistic path to a manual
+deploy, and it is exactly when someone clicks the wrong button. Do not branch from
+`main`. A branch tracking the running build is pre-staged for you:
+
+```bash
+git fetch origin
+git checkout -B hotfix-<TRA-xxxx> origin/launch-window-base  # == the RUNNING build
+git cherry-pick <fix-sha>                                    # the fix, and nothing else
+git push origin hotfix-<TRA-xxxx>
+git rev-parse HEAD                                           # ← deploy THIS SHA, by id
+```
+
+That ships the fix on top of the soaked build and drags nothing else along. Land
+the same fix on `main` afterwards, separately.
+
+**Freeze on `main`:** no commits touching runtime surface (`packages/**`,
+`render.yaml`, lockfiles) until the window closes. Docs/reports-only commits are
+fine — they cannot reach the running process. This keeps the drift bounded.
+
+> **Diagnostic trap — a pinned service is indistinguishable from a failed build.**
+> Your push does not deploy, and `/api/health/version` just keeps reporting the old
+> SHA, forever. It looks exactly like a broken build. **If your push does not
+> deploy, check `autoDeploy` on the service before you go hunting for a build
+> failure.** Note `autoDeploy` / `autoDeployTrigger` are **top-level** on the Render
+> service object — *not* under `serviceDetails`, where you will look first and find
+> nothing:
+>
+> ```bash
+> curl -s -H "Authorization: Bearer $RENDER_API_KEY" \
+>   https://api.render.com/v1/services/$RENDER_SERVICE_ID \
+>   | python -c "import sys,json;d=json.load(sys.stdin);print(d['autoDeploy'],d.get('autoDeployTrigger'))"
+> ```
+
+Lifting the freeze (after go-live sign-off, TRA-1648): set `autoDeploy=yes` /
+`autoDeployTrigger=commit` on the service, then delete `launch-window-base`.
+
 ### Standard deploy (self-hosted PM2)
 
 1. On the production machine, sync the target commit — deploys track `main`:
@@ -168,9 +220,11 @@ WebSocket (the UI populates).
 
 ### Render deploy status & failed-build logs (TRA-893)
 
-The public backend (`tradingai-bqb1`, §1) auto-deploys on push to `main`. To
-check whether the latest deploy went live and — when it **failed** — pull the
-build/deploy logs automatically (instead of opening the dashboard):
+The public backend (`tradingai-bqb1`, §1) auto-deploys on push to `main` **only
+while `autoDeploy` is on** — it is currently **off** (pinned; see *Launch-window
+deploy freeze* below, TRA-1653/TRA-1665). To check whether the latest deploy went
+live and — when it **failed** — pull the build/deploy logs automatically (instead
+of opening the dashboard):
 
 ```bash
 RENDER_API_KEY=rnd_… pnpm run render:status
