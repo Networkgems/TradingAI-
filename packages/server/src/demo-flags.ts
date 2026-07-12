@@ -226,6 +226,22 @@ export const RENDER_RATIFIED_DEMO_DEFAULTS: Readonly<Record<string, string>> = {
   OPTION_DIRECTIONAL_MIN_UNDERLYING_PRICE: '10',
   OPTION_DIRECTIONAL_MIN_AVG_DOLLAR_VOLUME: '300000',
   OPTION_DIRECTIONAL_MAX_OPENS_PER_NAME: '2',
+  // TRA-1409 / TRA-1480 — the RV single_leg exit re-tune + v2 winner-protect gate.
+  // render.yaml ratified `RV_EXIT_RETUNE_ENABLED:"true"` + `RV_EXIT_RETUNE_CONFIRM_BARS:"2"`
+  // (board conf `1752d235`) and the board approved arming `RV_EXIT_FLIP_MIN_LOSS_PCT:"-0.20"`
+  // on TRA-1597 (checkbox interaction `a1acc1a3`, item `rv-1409-demo-arm`, 07-11). All three
+  // were added to / live in render.yaml AFTER the last manual blueprint sync, so they stay
+  // DARK on a plain autoDeploy — the exact TRA-1289 env-sync gap the churn brake hit. DEMO-only
+  // by construction: the signal-engine consults this whole branch ONLY on the `mode==='demo'`
+  // RV exit path (`rvExitParams`), never mirrored to a live option exit, and it only ever makes
+  // the structural `supertrend_flip` exit fire LESS (risk-side chandelier / give-back / hard-SL
+  // keep precedence), so seeding it can NEVER touch a live exit. Seeding the confirm-bars +
+  // flip-loss numerics alongside the master makes the RUNNING gate match render.yaml exactly and
+  // self-heal every redeploy, arming QuantTrader's >=100-post-arm-close forward validation
+  // (TRA-1582 gate). Board-ratified demo arm.
+  RV_EXIT_RETUNE_ENABLED: '1',
+  RV_EXIT_RETUNE_CONFIRM_BARS: '2',
+  RV_EXIT_FLIP_MIN_LOSS_PCT: '-0.20',
 };
 
 /**

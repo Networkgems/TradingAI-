@@ -43,8 +43,27 @@ export function isRegimeTsmomEnabled(env: NodeJS.ProcessEnv = process.env): bool
 // OFF by default (1/true/yes/on). Live promotion remains a separate board decision.
 export const CRYPTO_REGIME_TSMOM_DEMO_ROUTE_FLAG = 'CRYPTO_REGIME_TSMOM_DEMO_ROUTE_ENABLED';
 
-/** True iff the DEMO paper-routing of regime-gated TSMOM transitions is armed. */
+// TRA-1440 KILL (board approved on TRA-1597 via checkbox interaction `a1acc1a3`,
+// item `kill-1440-tsmom`, 07-11) — regime-gated TSMOM is RETIRED. Forward
+// expectancy was -0.37R at n<20 with no path to positive, so the strategy is
+// permanently dead, not merely toggled off. This constant HARD-DISABLES the demo
+// paper route regardless of the env / demo-flags.json flag, because the running
+// bqb1 flag can only otherwise be cleared by a manual Render blueprint sync (the
+// key is blocked, TRA-969) or an admin demo-flags POST (no non-secret creds) —
+// neither self-serviceable. A plain redeploy (autoDeploy on push to main) is the
+// only lever we hold, so the kill lives in code. The QuantTrader-owned n>=20
+// auto-flip drivers (routines `42e8f0c1` / `f18c0a5c`) are archived so it can
+// never promote to live. Zero live capital was ever at risk — the route book is a
+// dedicated CryptoPaperAccount. Reviving TSMOM is a fresh board decision + flip.
+export const REGIME_TSMOM_DEMO_ROUTE_KILLED = true;
+
+/**
+ * True iff the DEMO paper-routing of regime-gated TSMOM transitions is armed.
+ * Hard-returns `false` while {@link REGIME_TSMOM_DEMO_ROUTE_KILLED} (the TRA-1440
+ * board kill) is set — the retired strategy never routes, whatever the flag says.
+ */
 export function isRegimeTsmomDemoRouteEnabled(env: NodeJS.ProcessEnv = process.env): boolean {
+  if (REGIME_TSMOM_DEMO_ROUTE_KILLED) return false;
   return flagOn(env[CRYPTO_REGIME_TSMOM_DEMO_ROUTE_FLAG]);
 }
 

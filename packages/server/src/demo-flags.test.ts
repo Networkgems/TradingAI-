@@ -151,6 +151,11 @@ describe('renderRatifiedDemoDefaults (TRA-1481 — self-heal the Render blueprin
       OPTION_DIRECTIONAL_MIN_UNDERLYING_PRICE: '10',
       OPTION_DIRECTIONAL_MIN_AVG_DOLLAR_VOLUME: '300000',
       OPTION_DIRECTIONAL_MAX_OPENS_PER_NAME: '2',
+      // TRA-1409 / TRA-1480 — the RV exit re-tune + v2 winner-protect gate
+      // (board approved on TRA-1597 checkbox `a1acc1a3`); self-heal the same gap.
+      RV_EXIT_RETUNE_ENABLED: '1',
+      RV_EXIT_RETUNE_CONFIRM_BARS: '2',
+      RV_EXIT_FLIP_MIN_LOSS_PCT: '-0.20',
     });
   });
 
@@ -162,6 +167,9 @@ describe('renderRatifiedDemoDefaults (TRA-1481 — self-heal the Render blueprin
       OPTION_DIRECTIONAL_MIN_UNDERLYING_PRICE: '5',
       OPTION_DIRECTIONAL_MIN_AVG_DOLLAR_VOLUME: '250000',
       OPTION_DIRECTIONAL_MAX_OPENS_PER_NAME: '3',
+      RV_EXIT_RETUNE_ENABLED: '0',
+      RV_EXIT_RETUNE_CONFIRM_BARS: '3',
+      RV_EXIT_FLIP_MIN_LOSS_PCT: '0',
     } as NodeJS.ProcessEnv;
     expect(renderRatifiedDemoDefaults(dir, env)).toEqual({});
   });
@@ -185,6 +193,9 @@ describe('renderRatifiedDemoDefaults (TRA-1481 — self-heal the Render blueprin
       OPTION_DIRECTIONAL_MIN_UNDERLYING_PRICE: '5',
       OPTION_DIRECTIONAL_MIN_AVG_DOLLAR_VOLUME: '250000',
       OPTION_DIRECTIONAL_MAX_OPENS_PER_NAME: '3',
+      RV_EXIT_RETUNE_ENABLED: '0',
+      RV_EXIT_RETUNE_CONFIRM_BARS: '3',
+      RV_EXIT_FLIP_MIN_LOSS_PCT: '0',
     });
     const env = { RENDER: 'true' } as NodeJS.ProcessEnv;
     expect(renderRatifiedDemoDefaults(dir, env)).toEqual({});
