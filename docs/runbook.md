@@ -449,3 +449,85 @@ Carried forward from the TRA-402 review — be aware when on call:
 - **No external access path** — the instance binds host-local on `PG-DEVOPS14`
   with no reverse proxy, so it can only be reached from the host itself.
   Recorded in §1 (closes the TRA-444 / TRA-447 documentation follow-up).
+
+## 8. GitHub credential for agent pushes (TRA-1675)
+
+**Owner: human operator.** This is the one step no agent can perform — issuing a
+credential for a private repo is secret issuance. Every agent on this host shares
+the same empty credential store, so delegating sideways cannot fix it.
+
+### Symptom
+
+`git push origin main` **hangs** (observed >8 min, no output), rather than failing.
+`git fetch` too. The network is fine — GitHub answers `401` because `origin`
+(`https://github.com/Networkgems/TradingAI-`) is private and the host has no
+credential. Git Credential Manager then blocks on a prompt that a headless agent
+session can never answer.
+
+A hang is worse than an error: an agent whose push is killed mid-hang can report
+work as shipped while the commit is still only local. Run the preflight instead of
+retrying the push:
+
+```bash
+pnpm check:push-auth     # answers "can I push?" in ~1s; lists stranded commits
+```
+
+### Diagnosis (2026-07-12)
+
+The store is **empty for github.com specifically** — it is not broken. Windows
+Credential Manager holds two working `bitbucket.org` entries, so DPAPI and GCM are
+healthy. Ruled out, in order: `~/.git-credentials` (absent), `~/.netrc` (exists but
+is a surge.sh entry), `GH_TOKEN`/`GITHUB_TOKEN`/`GH_PAT` (unset), `gh` CLI (not
+installed), token embedded in the remote URL (none), Paperclip's secret store
+(holds only its own `master.key`).
+
+Note the credential **used to work**: `git reflog show origin/main` records
+`c37b036 … update by push` at 18:27 on 2026-07-12, and the first hung fetch is at
+18:44 the same day. So this is a credential that was **revoked, expired, or erased**
+— not a host that was never provisioned. Git calls the helper's `erase` on a 401,
+which is enough to wipe the entry from Windows Credential Manager after a PAT
+lapses. **Before re-issuing, confirm the old token was not revoked deliberately**
+(e.g. as part of a leaked-secret sweep — cf. TRA-969); if it was, re-issuing the
+same way would reopen the hole.
+
+### Fix — any one of these
+
+Option 1 is the most durable for headless heartbeats.
+
+1. **PAT in the environment** (preferred) — a token with `repo` scope on
+   `Networkgems/TradingAI-`, exported into agent sessions:
+
+   ```powershell
+   # PowerShell, persists for the user across sessions
+   [Environment]::SetEnvironmentVariable('GH_TOKEN', '<paste-PAT>', 'User')
+   ```
+
+   Then configure git to use it non-interactively:
+
+   ```bash
+   git config --global credential.helper '!f() { echo username=x-access-token; echo password=$GH_TOKEN; }; f'
+   ```
+
+2. **Seed the credential store once, interactively** — from a real terminal on the
+   host (not an agent session), so GCM caches a github.com credential:
+
+   ```bash
+   git push origin HEAD      # complete the GCM browser/device prompt
+   ```
+
+   Note this survives only as long as the token behind it does; when it lapses the
+   symptom returns exactly as described above. Option 1 fails more visibly.
+
+3. **Deploy key / token-embedded remote** for the agent workspace.
+
+### Verify, then drain the backlog
+
+```bash
+pnpm check:push-auth              # must print OK
+git push origin main              # drains any stranded commits
+curl -s https://.../api/health/version   # confirm the running SHA (see §2)
+```
+
+⚠️ Pushing to `main` triggers Render autoDeploy on bqb1. A **deploy freeze may be
+in force** — read §2 "Launch-window deploy freeze" *before* draining the backlog,
+and confirm the pin is still respected.
