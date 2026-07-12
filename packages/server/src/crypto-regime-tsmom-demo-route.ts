@@ -102,7 +102,7 @@ export interface RegimeTsmomDemoRouteSnapshot {
 // ── Module-global route book + counters (backs the health demoRoute block) ────
 
 let dataDir: string | null = null;
-let account = new CryptoPaperAccount();
+let account: CryptoPaperAccount | null = null;
 let fillCount = 0;
 let closeCount = 0;
 let realizedR = 0;
@@ -110,6 +110,16 @@ let realizedPnl = 0;
 let firstFillAt: number | null = null;
 let lastFillAt: number | null = null;
 const recentFills: RegimeTsmomDemoFill[] = [];
+
+/**
+ * The route book, constructed on FIRST USE rather than at module scope. Constructing it
+ * eagerly made module init depend on the `CryptoPaperAccount` binding being ready, which
+ * it is not when the import graph is entered at crypto-account.ts (TRA-1674).
+ */
+function routeBook(): CryptoPaperAccount {
+  if (account == null) account = new CryptoPaperAccount();
+  return account;
+}
 
 export function regimeTsmomDemoRouteFillsPath(dir: string): string {
   return join(dir, REGIME_TSMOM_DEMO_ROUTE_FILLS_FILENAME);
@@ -122,7 +132,7 @@ export function regimeTsmomDemoRouteStatePath(dir: string): string {
 /** Test seam — reset the route book, counters, and configured dir to a clean slate. */
 export function clearRegimeTsmomDemoRoute(): void {
   dataDir = null;
-  account = new CryptoPaperAccount();
+  account = null; // lazily reconstructed by routeBook() on next use
   fillCount = 0;
   closeCount = 0;
   realizedR = 0;
@@ -173,7 +183,7 @@ function writeSnapshot(now: number): void {
   if (dataDir == null) return;
   const snapshot: RegimeTsmomDemoRouteSnapshot = {
     version: 1,
-    account: account.exportSnapshot(),
+    account: routeBook().exportSnapshot(),
     fillCount,
     closeCount,
     realizedR: round2(realizedR),
@@ -195,7 +205,7 @@ function writeSnapshot(now: number): void {
 /** The open route position for `symbol` (single long per symbol), or null. */
 function openPositionForSymbol(symbol: string): Position | null {
   const key = symbol.trim().toUpperCase();
-  for (const p of account.getState().openPositions) {
+  for (const p of routeBook().getState().openPositions) {
     if (p.symbol.trim().toUpperCase() === key) return p;
   }
   return null;
@@ -260,7 +270,7 @@ export function routeRegimeTsmomResults(
       const entry = r.wouldBeEntryPrice;
       if (entry == null || !(entry > 0) || !Number.isFinite(entry)) continue;
       if (openPositionForSymbol(symbol)) continue; // already long (single transition/bar)
-      const pos = account.openPosition(buildEntrySignal(symbol, entry, cfg), entry, 'coinbase');
+      const pos = routeBook().openPosition(buildEntrySignal(symbol, entry, cfg), entry, 'coinbase');
       if (!pos) continue; // sizing/cash rejected — no fill
       pos.signalType = ROUTE_SIGNAL_TYPE;
       pos.mode = 'demo';
@@ -283,7 +293,7 @@ export function routeRegimeTsmomResults(
       const pos = openPositionForSymbol(symbol);
       if (!pos) continue; // nothing to close (e.g. hydrated mid-trip mismatch)
       const exitPrice = r.roundTrip.exitPrice;
-      const closedPos = account.closePosition(pos.id, exitPrice);
+      const closedPos = routeBook().closePosition(pos.id, exitPrice);
       if (!closedPos) continue;
       const fill: RegimeTsmomDemoFill = {
         ts: now,
@@ -317,7 +327,7 @@ export function routeRegimeTsmomResults(
  * the board sees the routed longs as "movement". Read-only — a defensive copy.
  */
 export function getRegimeTsmomDemoRoutePositions(): Position[] {
-  return account.getState().openPositions.map((p) => ({
+  return routeBook().getState().openPositions.map((p) => ({
     ...p,
     signalType: ROUTE_SIGNAL_TYPE,
     mode: 'demo' as const,
@@ -351,9 +361,9 @@ export function hydrateRegimeTsmomDemoRouteFromDisk(dir: string): RegimeTsmomDem
   }
   if (snapshot && snapshot.account) {
     try {
-      account.importSnapshot(snapshot.account);
+      routeBook().importSnapshot(snapshot.account);
     } catch {
-      account = new CryptoPaperAccount();
+      account = new CryptoPaperAccount(); // corrupt snapshot ⇒ clean book
     }
     fillCount = Number.isFinite(snapshot.fillCount) ? snapshot.fillCount : 0;
     closeCount = Number.isFinite(snapshot.closeCount) ? snapshot.closeCount : 0;
@@ -364,7 +374,7 @@ export function hydrateRegimeTsmomDemoRouteFromDisk(dir: string): RegimeTsmomDem
   }
 
   return {
-    openPositions: account.getState().openPositions.length,
+    openPositions: routeBook().getState().openPositions.length,
     fillCount,
     closeCount,
     realizedR: round2(realizedR),
@@ -397,7 +407,7 @@ export interface RegimeTsmomDemoRouteSummary {
  */
 export function summarizeRegimeTsmomDemoRoute(): RegimeTsmomDemoRouteSummary {
   return {
-    openPositions: account.getState().openPositions.length,
+    openPositions: routeBook().getState().openPositions.length,
     fillCount,
     closeCount,
     lastFillAt,

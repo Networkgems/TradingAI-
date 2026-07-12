@@ -1,7 +1,12 @@
 import type { AccountState, Position, PositionQuoteSource, TradeSignal, SignalType } from '@trading-app/shared';
 import { DEFAULT_ACCOUNT_SETTINGS } from '@trading-app/shared';
 import { randomUUID } from 'crypto';
-import { logger } from './observability/index.js';
+// Import the logger from its own module, NOT the ./observability/index.js barrel: the
+// barrel re-exports ./health-routes.js, which reaches crypto-regime-tsmom-demo-route.ts,
+// which imports CryptoPaperAccount back from this file. Going through the barrel closes
+// that cycle and leaves this module's exports in TDZ for anyone entering the graph here
+// (TRA-1674).
+import { logger } from './observability/logger.js';
 
 const log = logger.child({ module: 'crypto-account' });
 
