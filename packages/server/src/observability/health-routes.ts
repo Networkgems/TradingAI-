@@ -64,7 +64,7 @@ import {
 } from '../churn-loss-brake-flag.js';
 import { isScaleoutLadderEnabled } from '../scaleout-ladder-flag.js';
 import { summarizeScaleoutLadder } from '../scaleout-ladder-ledger.js';
-import { isCorrelatedExposureCapEnabled, CORRELATED_EXPOSURE_CAP_FLAG, isTakeProfitEarlyEnabled, TAKE_PROFIT_EARLY_FLAG, isEntryGreeksGateEnabled, ENTRY_GREEKS_GATE_FLAG } from '../exit-risk-rules-flag.js';
+import { isCorrelatedExposureCapEnabled, CORRELATED_EXPOSURE_CAP_FLAG, isTakeProfitEarlyEnabled, TAKE_PROFIT_EARLY_FLAG, isEntryGreeksGateEnabled, ENTRY_GREEKS_GATE_FLAG, isEntryDeltaCeilingEnabled, resolveEntryDeltaCeiling, resolveEntryDeltaCeilingStructures, OPTION_ENTRY_DELTA_CEILING_FLAG } from '../exit-risk-rules-flag.js';
 import { summarizeCorrelatedExposureBindings } from '../correlated-exposure-ledger.js';
 import { CONVICTION_DCA, CORRELATED_EXPOSURE_CAP_PCT, CORRELATED_EXPOSURE_MIN_TRADE_RISK_PCT, TAKE_PROFIT_EARLY_CAPTURE_PCT, ENTRY_SHORT_DELTA_MIN, ENTRY_SHORT_DELTA_MAX, ENTRY_DELTA_THETA_RATIO_FLOOR, resolveEquitySwingModeEnabled, resolveEquitySwingUniverse, EQUITY_SWING_UNIVERSE, EQUITY_SWING_GUARDRAIL } from '@trading-app/shared';
 import { resolveDemoFlagEnv } from '../demo-flags.js';
@@ -1251,6 +1251,25 @@ export function registerLiveHealthRoutes(app: Express, deps: LiveHealthDeps): vo
       note: armed
         ? `ARMED (demo-only): rejects a demo RV / OTM / directional open whose modeled GROSS R can't clear its structure's cost-aware bar (${structures.map((s) => `${s} ${bars[s]!.toFixed(2)}R`).join(', ')}). rejected>0 is the direct evidence the bar is biting. Live options admission unchanged.`
         : `DISARMED: set ${OPTION_COST_AWARE_GATE_FLAG}=1 (render.yaml env or DATA_DIR/demo-flags.json) to arm on the demo book.`,
+      // TRA-1670 — the ceiling half of the entry band, reported on the SAME surface
+      // because it exists precisely to make a cut this gate cannot: the bar above is
+      // algebraically a delta FLOOR (admit ⟺ |Δ| ≥ (bar+1)/(mult·(rewardR+1)) =
+      // 0.495 at the shipped default), so it can never reject the top of the delta
+      // range. It is a SEPARATE flag with its own arm state — read both.
+      deltaCeiling: (() => {
+        const ceilingArmed = isEntryDeltaCeilingEnabled(env);
+        const ceilingStructures = resolveEntryDeltaCeilingStructures(env);
+        const ceiling = resolveEntryDeltaCeiling(env);
+        return {
+          flag: OPTION_ENTRY_DELTA_CEILING_FLAG,
+          armed: ceilingArmed,
+          ceiling,
+          structures: ceilingStructures,
+          note: ceilingArmed
+            ? `ARMED (demo-only): rejects a demo open on ${ceilingStructures.join(' / ')} with |Δ| > ${ceiling.toFixed(2)}. deltaCeilingRejected>0 (per structure below) is the direct evidence the ceiling is biting — it is tallied separately from the cost bar's admitted/rejected. Measured on OTM only (n=14 tail, NET −1.813R); forward-validation + invalidation live on TRA-1647.`
+            : `DISARMED: set ${OPTION_ENTRY_DELTA_CEILING_FLAG}=1 (DATA_DIR/demo-flags.json) to arm on the demo book.`,
+        };
+      })(),
       ...summarizeCostAwareGate(etDay),
     });
   });

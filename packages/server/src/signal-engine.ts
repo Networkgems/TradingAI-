@@ -69,7 +69,7 @@ import { selectWeeklyPcs } from '@trading-app/engine';
 import { isOptionExecEnabled, isOptionEmaPullbackEnabled, isOptionVolumeBreakoutEnabled, resolveRvLongDteOverride, resolveRvMinDailyVolume, isOptionDemoDirectionalEnabled, isOptionIvRvScannerEnabled, isOptionIvRvRoutingEnabled, resolveIvRvRoutingOverride, isOptionShortPremiumScannerEnabled, isOptionLiveRvLongEnabled, isOptionLiveDirectionalEnabled } from './option-exec-flag.js';
 import { scanIvRvFromSnapshot, recordIvRvScan } from './iv-rv-scanner.js';
 import { scanShortPremiumFromSnapshot, recordShortPremiumScan } from './short-premium-scanner.js';
-import { isExitRiskRulesEnabled, isLiveEquityStopModifyEnabled, isTakeProfitEarlyEnabled, isEntryGreeksGateEnabled, isCorrelatedExposureCapEnabled, isOtmDeltaFloorEnabled, resolveOtmDeltaFloor, isRvExitRetuneEnabled, resolveRvExitConfirmBars, resolveRvExitFlipMinLossPct, isBookGiveBackArmFloorEnabled } from './exit-risk-rules-flag.js';
+import { isExitRiskRulesEnabled, isLiveEquityStopModifyEnabled, isTakeProfitEarlyEnabled, isEntryGreeksGateEnabled, isCorrelatedExposureCapEnabled, isOtmDeltaFloorEnabled, resolveOtmDeltaFloor, entryDeltaCeilingReject, isRvExitRetuneEnabled, resolveRvExitConfirmBars, resolveRvExitFlipMinLossPct, isBookGiveBackArmFloorEnabled } from './exit-risk-rules-flag.js';
 import { recordCorrelatedExposureBinding, type CorrelatedExposureVenue } from './correlated-exposure-ledger.js';
 import { isChurnLossBrakeEnabled, resolveSameSessionOpenCap } from './churn-loss-brake-flag.js';
 import {
@@ -90,7 +90,7 @@ import {
   recordDirectionalGateReject,
   type OpenSleeve,
 } from './directional-open-ledger.js';
-import { recordCostAwareGateDecision } from './cost-aware-gate-ledger.js';
+import { recordCostAwareGateDecision, recordEntryDeltaCeilingReject } from './cost-aware-gate-ledger.js';
 import { isMultiLegOpenPaused } from './multileg-open-pause-flag.js';
 import { isMultiLegExitEnabled } from './multileg-exit-flag.js';
 import { recordConvictionDcaFill } from './conviction-dca-ledger.js';
@@ -3787,6 +3787,42 @@ export class SignalEngine {
   }
 
   /**
+   * TRA-1670 (TRA-1647B) — the OTHER edge of the entry band: the per-structure
+   * entry-delta CEILING.
+   *
+   * The cost-aware gate above is ALGEBRAICALLY A FLOOR — `admit ⟺ |Δ| ≥ (bar + 1) /
+   * (mult·(rewardR + 1))` — so a higher-delta contract is always MORE admissible and
+   * no retune of its knobs can make it reject the top of the delta range. But OTM's
+   * realized win rate tracks the gate's `winProb = |Δ|` model only up to ~0.50 and
+   * then BREAKS (0.077 realized vs 0.575 modeled in the 0.55–0.60 band), so the
+   * Δ > 0.55 tail is a measured net loser (n=14, −1.813R) that the cost gate is
+   * structurally incapable of cutting. This method cuts it.
+   *
+   * Same containment as `costAwareGateReject`: DEMO-ONLY (early-return on
+   * `mode !== 'demo'`) and OFF by default, so it cannot alter a live option open
+   * regardless of any service-wide env. SCOPED to `single_leg_otm` by default —
+   * the 0.55 is measured on OTM only and the other sleeves stay uncapped rather than
+   * inherit an extrapolated number (widen via OPTION_ENTRY_DELTA_CEILING_STRUCTURES).
+   *
+   * Returns a rejection reason when the candidate is above the ceiling, else `null`.
+   */
+  private entryDeltaCeilingRejectReason(structure: string, delta: number | null | undefined): string | null {
+    if (this.mode !== 'demo') return null;
+    const reason = entryDeltaCeilingReject(structure, delta, this.resolveDemoFlagEnv());
+    if (!reason) return null;
+    // A ceiling that is shipped, believed armed, and silently inert is the TRA-1486 /
+    // TRA-1407 failure twice over. Record every breach durably so
+    // `/api/health/cost-aware-gate` can PROVE it is biting. Best-effort — never breaks
+    // the trade pass.
+    recordEntryDeltaCeilingReject(
+      structure,
+      Math.abs(typeof delta === 'number' ? delta : 0),
+      etDateString(new Date()),
+    );
+    return reason;
+  }
+
+  /**
    * TRA-1662 — start a SHADOW maker chase for an option open. Observe-only: it
    * routes nothing, prices no fill, and cannot affect the position that was just
    * booked. The demo book fills at the mark and pays no spread, so this is the
@@ -4683,6 +4719,20 @@ export class SignalEngine {
           continue;
         }
 
+        // TRA-1670 — entry-delta ceiling. Wired here so the band is a per-structure
+        // map the board can widen without a redeploy, but INERT on RV by default: the
+        // 0.55 is measured on the OTM sleeve only, and QuantTrader's instruction was
+        // to leave the other sleeves uncapped rather than extrapolate the number
+        // (add `single_leg_rv` to OPTION_ENTRY_DELTA_CEILING_STRUCTURES to arm it).
+        const rvDeltaCeiling = this.entryDeltaCeilingRejectReason('single_leg_rv', cheap.delta);
+        if (rvDeltaCeiling) {
+          signal.signalSkipReason = rvDeltaCeiling;
+          log.info('RV long rejected by entry-delta ceiling (TRA-1670)', {
+            sym, delta: cheap.delta, reason: rvDeltaCeiling,
+          });
+          continue;
+        }
+
         // Dedup: same OCC fired in the last hour — avoid re-spamming the feed
         // when the chain stays cheap across multiple scans.
         const recentDup = this.recentSignals.find(
@@ -5234,6 +5284,28 @@ export class SignalEngine {
         if (otmCostReject) {
           signal.signalSkipReason = otmCostReject;
           log.info('OTM open rejected by cost-aware fire bar (TRA-1602)', { sym, reason: otmCostReject });
+          continue;
+        }
+
+        // TRA-1670 (TRA-1647B) — the ceiling half of the entry band, and the ONE cut
+        // the cost bar above is algebraically incapable of making (it is a delta
+        // FLOOR; see entryDeltaCeilingRejectReason). Rejects the measured Δ>0.55 OTM
+        // loss tail — where realized win rate COLLAPSES to 0.077 against a modeled
+        // 0.575 — after the cost bar has recorded its own verdict, so the two gates
+        // read independently in the ledger. DEMO-ONLY + OFF by default. The signal is
+        // surfaced with its skip reason (the churn-brake pattern) so the reject is
+        // visible on the feed and not just in the log.
+        const otmDeltaCeiling = this.entryDeltaCeilingRejectReason('single_leg_otm', cheap.delta);
+        if (otmDeltaCeiling) {
+          signal.signalSkipReason = otmDeltaCeiling;
+          this.recentSignals.unshift(signal); this.emitSignalAlert(signal);
+          if (this.recentSignals.length > MAX_SIGNALS) this.recentSignals.pop();
+          this.dailySignals.push({
+            id: signal.id, symbol: signal.symbol, type: 'otm_mispricing', firedAt: signal.timestamp,
+          });
+          log.info('OTM open rejected by entry-delta ceiling (TRA-1670)', {
+            sym, delta: cheap.delta, reason: otmDeltaCeiling,
+          });
           continue;
         }
 
@@ -6094,6 +6166,16 @@ export class SignalEngine {
         if (dirCostReject) {
           log.info('demo directional rejected by cost-aware fire bar (TRA-1602)', {
             symbol: sym, reason: dirCostReject,
+          });
+          continue;
+        }
+
+        // TRA-1670 — entry-delta ceiling. As on the RV path: wired so the map is
+        // real, INERT on `directional` by default (the 0.55 is an OTM measurement).
+        const dirDeltaCeiling = this.entryDeltaCeilingRejectReason('directional', signal.delta);
+        if (dirDeltaCeiling) {
+          log.info('demo directional rejected by entry-delta ceiling (TRA-1670)', {
+            symbol: sym, delta: signal.delta, reason: dirDeltaCeiling,
           });
           continue;
         }

@@ -285,6 +285,81 @@ describe('SignalEngine — relative-value scanner bridge', () => {
     expect(state.signals[0].symbol).toBe('AAPL');
   });
 
+  // TRA-1670 (TRA-1647B) — the entry-delta CEILING, end-to-end through the real OTM
+  // open path. QuantTrader's explicit ask on the ticket: "carry a test asserting the
+  // ceiling is REJECTING, not just present ... I'd rather the test fail loudly." The
+  // cost-aware gate cannot make this cut — it is algebraically a delta FLOOR — so if
+  // this assertion ever goes green-while-inert, the Δ>0.55 loss tail (n=14, NET
+  // −1.813R) is back in the book with nothing above it.
+  describe('entry-delta ceiling on the OTM open (TRA-1670)', () => {
+    const CEILING_ENV = ['OPTION_ENTRY_DELTA_CEILING_ENABLED', 'OPTION_ENTRY_DELTA_CEILING', 'DATA_DIR'] as const;
+    const saved: Record<string, string | undefined> = {};
+
+    beforeEach(() => {
+      for (const k of CEILING_ENV) saved[k] = process.env[k];
+      // Resolve flags straight through process.env (no demo-flags.json overlay).
+      delete process.env.DATA_DIR;
+    });
+    afterEach(() => {
+      for (const k of CEILING_ENV) {
+        if (saved[k] === undefined) delete process.env[k];
+        else process.env[k] = saved[k];
+      }
+    });
+
+    const scanFor = (delta: number): StubScanner => {
+      const scanner = new StubScanner();
+      scanner.scanOtm.mockResolvedValue({
+        symbol: 'AAPL',
+        spot: 195,
+        expiration: '2024-07-05',
+        candidates: [makeOtmCandidate({ delta })],
+        reason: 'ok',
+      });
+      return scanner;
+    };
+
+    const runOtm = async (scanner: StubScanner) => {
+      const engine = new SignalEngine(undefined, undefined, scanner);
+      await (engine as unknown as { runOtmScan: (s: string[]) => Promise<void> }).runOtmScan(['AAPL']);
+      return engine;
+    };
+
+    it('REJECTS a Δ=0.60 OTM candidate when armed — no position opens, reason surfaced', async () => {
+      process.env.OPTION_ENTRY_DELTA_CEILING_ENABLED = '1';
+      const engine = await runOtm(scanFor(0.60));
+
+      const state = engine.getState();
+      expect(state.options.openOptions).toHaveLength(0);
+      // The reject is VISIBLE (churn-brake pattern), not a silent drop.
+      expect(state.signals).toHaveLength(1);
+      expect(state.signals[0].signalSkipReason).toContain('entry delta ceiling');
+    });
+
+    it('ADMITS a Δ=0.50 OTM candidate when armed — the ceiling cuts the tail, not the sleeve', async () => {
+      process.env.OPTION_ENTRY_DELTA_CEILING_ENABLED = '1';
+      const engine = await runOtm(scanFor(0.50));
+
+      const state = engine.getState();
+      expect(state.options.openOptions).toHaveLength(1);
+      expect(state.options.openOptions[0]!.signalType).toBe('otm_mispricing');
+      expect(state.signals[0].signalSkipReason).toBeUndefined();
+    });
+
+    it('is DARK by default — the same Δ=0.60 candidate opens with the flag off', async () => {
+      delete process.env.OPTION_ENTRY_DELTA_CEILING_ENABLED;
+      const engine = await runOtm(scanFor(0.60));
+      expect(engine.getState().options.openOptions).toHaveLength(1);
+    });
+
+    it('honours the OPTION_ENTRY_DELTA_CEILING override (TRA-1647 invalidation = a retune)', async () => {
+      process.env.OPTION_ENTRY_DELTA_CEILING_ENABLED = '1';
+      process.env.OPTION_ENTRY_DELTA_CEILING = '0.70';
+      const engine = await runOtm(scanFor(0.60));
+      expect(engine.getState().options.openOptions).toHaveLength(1);
+    });
+  });
+
   it('runOtmScan ignores `expensive` OTM candidates (long-only path) (TRA-1207)', async () => {
     const scanner = new StubScanner();
     scanner.scanOtm.mockResolvedValue({

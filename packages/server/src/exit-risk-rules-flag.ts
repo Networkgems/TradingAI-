@@ -133,6 +133,108 @@ export function resolveOtmDeltaFloor(env: NodeJS.ProcessEnv = process.env): numb
   return OTM_DELTA_FLOOR_DEFAULT;
 }
 
+// TRA-1670 (TRA-1647B, parent TRA-1647) — the OTHER half of the band: a
+// per-structure entry-delta CEILING.
+//
+// ── WHY A SECOND KNOB AND NOT A RETUNE OF THE COST GATE ──────────────────────
+// The TRA-1602 cost-aware gate admits iff
+//   min(mult·|Δ|, cap)·(rewardR + 1) − 1  ≥  bar
+// which solves to |Δ| ≥ (bar + 1) / (mult · (rewardR + 1)) — an algebraic ONE-SIDED
+// FLOOR (|Δ| ≥ 0.495 at the shipped default). Raising delta always raises modeled R,
+// so a higher-delta contract is always MORE admissible and no setting of
+// mult / rewardR / cap / minGrossR can make the gate reject the top of the delta
+// range: they only slide the floor. The cost gate is therefore structurally
+// incapable of cutting the OTM loss tail, and only a ceiling can reach it.
+//
+// ── WHAT THE CEILING CUTS (QuantTrader, TRA-1670; numbers are theirs) ────────
+// Over 2,153 closed demo rows on the pinned build, net of the MEASURED 0.285R taker
+// cost (TRA-1656), the `single_leg_otm` sleeve under the floor+bar cut is n=75 /
+// NET +1.198R (t=2.07). Adding a 0.55 ceiling: n=61 / NET +1.889R (t=2.89). The
+// Δ>0.55 tail it removes is n=14 / NET −1.813R (t=−2.08). The mechanism — not just
+// the mean — is that OTM's realized win rate TRACKS the gate's `winProb = |Δ|` model
+// up to 0.50 (0.463 realized vs 0.475 modeled in 0.45–0.50) and then BREAKS
+// (0.55–0.60: 0.077 realized vs 0.575 modeled). The gate's monotonicity assumption
+// is provably false exactly where only a ceiling can reach.
+//
+// ── HONEST CAVEAT ────────────────────────────────────────────────────────────
+// n=14 in the tail, post-hoc on the same book that was graded (the TRA-992 /
+// TRA-1585 coin-flip trap). It ships DEMO-ONLY with zero capital at risk, and the
+// invalidation is written into TRA-1647: if Δ ∈ (0.55, 0.70] reaches n ≥ 30 with net
+// avgR > 0, DROP the ceiling.
+//
+// ── CONTAINMENT ──────────────────────────────────────────────────────────────
+// STANDALONE flag (NOT under the EXIT_RISK_RULES master), and the signal-engine
+// consults it only on a `mode === 'demo'` branch — structurally incapable of
+// altering a LIVE option open, matching the OTM_DELTA_FLOOR / cost-gate containment.
+// OFF by default. SCOPED, not global: the 0.55 number is measured on OTM ONLY, so
+// the structure list defaults to `single_leg_otm` alone and the other sleeves stay
+// UNCAPPED rather than inheriting an extrapolated number. The board can widen the
+// list (or retune the number) via demo-flags.json with no redeploy.
+export const OPTION_ENTRY_DELTA_CEILING_FLAG = 'OPTION_ENTRY_DELTA_CEILING_ENABLED';
+/** Numeric override of the ceiling (default 0.55, the QuantTrader measurement). */
+export const OPTION_ENTRY_DELTA_CEILING_VALUE = 'OPTION_ENTRY_DELTA_CEILING';
+export const OPTION_ENTRY_DELTA_CEILING_DEFAULT = 0.55;
+/** CSV override of the structures the ceiling applies to (default `single_leg_otm`). */
+export const OPTION_ENTRY_DELTA_CEILING_STRUCTURES_VALUE = 'OPTION_ENTRY_DELTA_CEILING_STRUCTURES';
+export const OPTION_ENTRY_DELTA_CEILING_STRUCTURES_DEFAULT: readonly string[] = ['single_leg_otm'];
+
+/** True iff the entry-delta ceiling is enabled (standalone; accepts 1/true/yes/on). */
+export function isEntryDeltaCeilingEnabled(env: NodeJS.ProcessEnv = process.env): boolean {
+  return flagOn(env[OPTION_ENTRY_DELTA_CEILING_FLAG]);
+}
+
+/**
+ * Resolve the effective |delta| ceiling. A malformed or out-of-range value (≤0 or
+ * ≥1 — a delta is a probability-like [0,1] magnitude) falls back to the default
+ * rather than silently disabling the cut.
+ */
+export function resolveEntryDeltaCeiling(env: NodeJS.ProcessEnv = process.env): number {
+  const raw = env[OPTION_ENTRY_DELTA_CEILING_VALUE];
+  if (typeof raw === 'string' && raw.trim() !== '') {
+    const parsed = Number(raw);
+    if (Number.isFinite(parsed) && parsed > 0 && parsed < 1) return parsed;
+  }
+  return OPTION_ENTRY_DELTA_CEILING_DEFAULT;
+}
+
+/**
+ * Resolve the structures the ceiling applies to. An empty / all-blank override
+ * falls back to the default (OTM only) — an operator cannot accidentally disarm
+ * the cut by blanking the list; disarming is what the flag is for.
+ */
+export function resolveEntryDeltaCeilingStructures(env: NodeJS.ProcessEnv = process.env): string[] {
+  const raw = env[OPTION_ENTRY_DELTA_CEILING_STRUCTURES_VALUE];
+  if (typeof raw === 'string' && raw.trim() !== '') {
+    const parsed = raw.split(',').map((s) => s.trim().toLowerCase()).filter((s) => s !== '');
+    if (parsed.length > 0) return parsed;
+  }
+  return [...OPTION_ENTRY_DELTA_CEILING_STRUCTURES_DEFAULT];
+}
+
+/**
+ * The ceiling verdict for one candidate: a human-readable rejection reason when
+ * `|delta|` is ABOVE the ceiling for a capped structure, or `null` when admitted /
+ * the structure is uncapped / the flag is off.
+ *
+ * A missing or non-finite delta is ADMITTED (honest-unknown): the ceiling's job is
+ * to cut a measured tail, and rejecting on an absent greek would silently starve a
+ * sleeve on a data outage rather than cut a loser. The floor upstream is what keeps
+ * a delta-less candidate out when that is wanted.
+ */
+export function entryDeltaCeilingReject(
+  structure: string,
+  delta: number | null | undefined,
+  env: NodeJS.ProcessEnv = process.env,
+): string | null {
+  if (!isEntryDeltaCeilingEnabled(env)) return null;
+  if (!resolveEntryDeltaCeilingStructures(env).includes(structure)) return null;
+  if (typeof delta !== 'number' || !Number.isFinite(delta)) return null;
+  const abs = Math.abs(delta);
+  const ceiling = resolveEntryDeltaCeiling(env);
+  if (abs <= ceiling) return null;
+  return `entry delta ceiling (TRA-1670): |Δ| ${abs.toFixed(3)} > ${ceiling.toFixed(2)} on ${structure}`;
+}
+
 // TRA-1409 (parent TRA-1406 "less noise, more quality") — the RV single_leg exit
 // re-tune: require a CONFIRMED N-bar Supertrend flip before the structural
 // `supertrend_flip` exit fires (QuantTrader variant (a), N=2 — decision

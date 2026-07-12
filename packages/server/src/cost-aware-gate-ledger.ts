@@ -43,6 +43,16 @@ export const COST_AWARE_GATE_LOG_FILENAME = 'cost-aware-gate.jsonl';
  */
 const RETAIN_MS = 7 * 24 * 60 * 60 * 1000;
 
+/**
+ * Which gate produced the record. `cost_bar` is the TRA-1602 modeled-gross-R bar
+ * (the original and only kind — records written before TRA-1670 have no `gate`
+ * field and hydrate as `cost_bar`). `delta_ceiling` is the TRA-1670 entry-delta
+ * ceiling, tallied SEPARATELY: it is a structural band edge, not a modeled-R
+ * verdict, so folding it into admitted/rejected would corrupt the cost bar's
+ * admit rate and its gross-R means.
+ */
+type CostGateKind = 'cost_bar' | 'delta_ceiling';
+
 /** One durable decision — a write-through of the verdict the gate just returned. */
 interface CostGateDecisionRecord {
   /** Decision time, ms epoch. */
@@ -57,6 +67,10 @@ interface CostGateDecisionRecord {
   grossR: number;
   /** The bar it had to clear (costModel + safety margin, floored). */
   barR: number;
+  /** Absent on pre-TRA-1670 records — hydrates as `cost_bar`. */
+  gate?: CostGateKind;
+  /** `delta_ceiling` records only: the |delta| that breached the ceiling. */
+  absDelta?: number;
 }
 
 interface StructureTally {
@@ -66,6 +80,10 @@ interface StructureTally {
   rejectedGrossRSum: number;
   /** Most recent effective bar seen for this structure (the config is env-tunable). */
   lastBarR: number;
+  /** TRA-1670 — candidates the entry-delta CEILING refused (disjoint from `rejected`). */
+  deltaCeilingRejected: number;
+  /** Sum of the |delta|s the ceiling refused, for the mean in the health view. */
+  deltaCeilingAbsDeltaSum: number;
 }
 
 // ── In-memory store (backs the durable counts + the health endpoint) ─────────
@@ -102,17 +120,31 @@ function apply(rec: CostGateDecisionRecord): void {
   }
   let tally = day.get(rec.structure);
   if (!tally) {
-    tally = { admitted: 0, rejected: 0, admittedGrossRSum: 0, rejectedGrossRSum: 0, lastBarR: rec.barR };
+    tally = {
+      admitted: 0,
+      rejected: 0,
+      admittedGrossRSum: 0,
+      rejectedGrossRSum: 0,
+      lastBarR: rec.barR,
+      deltaCeilingRejected: 0,
+      deltaCeilingAbsDeltaSum: 0,
+    };
     day.set(rec.structure, tally);
   }
-  if (rec.admit) {
+  if (rec.gate === 'delta_ceiling') {
+    // A ceiling breach carries no modeled R and no bar — tallied on its own axis so
+    // the cost bar's admit rate / gross-R means stay exactly what they were.
+    tally.deltaCeilingRejected += 1;
+    tally.deltaCeilingAbsDeltaSum += Number.isFinite(rec.absDelta) ? (rec.absDelta as number) : 0;
+  } else if (rec.admit) {
     tally.admitted += 1;
     tally.admittedGrossRSum += rec.grossR;
+    tally.lastBarR = rec.barR;
   } else {
     tally.rejected += 1;
     tally.rejectedGrossRSum += rec.grossR;
+    tally.lastBarR = rec.barR;
   }
-  tally.lastBarR = rec.barR;
   decisionsTotal += 1;
   lastDecisionAt = rec.ts;
 }
@@ -140,7 +172,40 @@ export function recordCostAwareGateDecision(
     admit,
     grossR: Number.isFinite(grossR) ? grossR : 0,
     barR: Number.isFinite(barR) ? barR : 0,
+    gate: 'cost_bar',
   };
+  applyAndAppend(rec);
+}
+
+/**
+ * TRA-1670 — record one ARMED-DEMO entry-delta CEILING reject. Same durability and
+ * containment as the cost-bar recorder above (the engine only reaches it on a
+ * `mode === 'demo'` branch with the ceiling flag on), and the same best-effort IO.
+ *
+ * This exists because a ceiling that is shipped, believed armed, and silently doing
+ * nothing is the exact failure the TRA-1486 quality gate and the TRA-1407 floor both
+ * hit. `deltaCeilingRejected > 0` on `/api/health/cost-aware-gate` is the direct,
+ * durable evidence the band's upper edge is BITING.
+ */
+export function recordEntryDeltaCeilingReject(
+  structure: string,
+  absDelta: number,
+  etDay: string,
+  now: number = Date.now(),
+): void {
+  applyAndAppend({
+    ts: now,
+    etDay,
+    structure,
+    admit: false,
+    grossR: 0,
+    barR: 0,
+    gate: 'delta_ceiling',
+    absDelta: Number.isFinite(absDelta) ? absDelta : 0,
+  });
+}
+
+function applyAndAppend(rec: CostGateDecisionRecord): void {
   apply(rec);
   if (dataDir == null) return;
   const path = costAwareGateLogPath(dataDir);
@@ -207,6 +272,11 @@ export function hydrateCostAwareGateFromDisk(dir: string, now: number = Date.now
       admit: rec.admit,
       grossR: Number.isFinite(rec.grossR) ? rec.grossR : 0,
       barR: Number.isFinite(rec.barR) ? rec.barR : 0,
+      // Pre-TRA-1670 lines carry no `gate` — they are cost-bar verdicts by construction.
+      gate: rec.gate === 'delta_ceiling' ? 'delta_ceiling' : 'cost_bar',
+      ...(rec.gate === 'delta_ceiling'
+        ? { absDelta: Number.isFinite(rec.absDelta) ? (rec.absDelta as number) : 0 }
+        : {}),
     };
     apply(clean);
     kept.push(JSON.stringify(clean));
@@ -244,6 +314,14 @@ export interface CostAwareGateStructureSummary {
   avgRejectedGrossR: number | null;
   /** Effective bar last applied to this structure. */
   barR: number;
+  /**
+   * TRA-1670 — candidates the entry-delta CEILING refused on this structure. Disjoint
+   * from `admitted`/`rejected` (which are the cost bar's): > 0 is the direct evidence
+   * the band's upper edge is biting.
+   */
+  deltaCeilingRejected: number;
+  /** Mean |delta| of the candidates the ceiling refused (null when none). */
+  avgDeltaCeilingAbsDelta: number | null;
 }
 
 export interface CostAwareGateSummary {
@@ -254,6 +332,8 @@ export interface CostAwareGateSummary {
   /** Candidates admitted / refused across all structures on the requested ET day. */
   admittedTotal: number;
   rejectedTotal: number;
+  /** TRA-1670 — entry-delta ceiling rejects across all structures on the requested ET day. */
+  deltaCeilingRejectedTotal: number;
   /** ms epoch of the last recorded decision (null if none yet). */
   lastDecisionAt: number | null;
 }
@@ -274,11 +354,13 @@ export function summarizeCostAwareGate(etDay: string): CostAwareGateSummary {
   const byStructure: CostAwareGateStructureSummary[] = [];
   let admittedTotal = 0;
   let rejectedTotal = 0;
+  let deltaCeilingRejectedTotal = 0;
   if (day) {
     for (const [structure, t] of day.entries()) {
       const decisions = t.admitted + t.rejected;
       admittedTotal += t.admitted;
       rejectedTotal += t.rejected;
+      deltaCeilingRejectedTotal += t.deltaCeilingRejected;
       byStructure.push({
         structure,
         admitted: t.admitted,
@@ -287,15 +369,23 @@ export function summarizeCostAwareGate(etDay: string): CostAwareGateSummary {
         avgAdmittedGrossR: t.admitted > 0 ? round(t.admittedGrossRSum / t.admitted) : null,
         avgRejectedGrossR: t.rejected > 0 ? round(t.rejectedGrossRSum / t.rejected) : null,
         barR: round(t.lastBarR),
+        deltaCeilingRejected: t.deltaCeilingRejected,
+        avgDeltaCeilingAbsDelta:
+          t.deltaCeilingRejected > 0 ? round(t.deltaCeilingAbsDeltaSum / t.deltaCeilingRejected) : null,
       });
     }
-    byStructure.sort((a, b) => b.admitted + b.rejected - (a.admitted + a.rejected));
+    byStructure.sort(
+      (a, b) =>
+        b.admitted + b.rejected + b.deltaCeilingRejected
+        - (a.admitted + a.rejected + a.deltaCeilingRejected),
+    );
   }
   return {
     decisionsRecorded: decisionsTotal,
     byStructure,
     admittedTotal,
     rejectedTotal,
+    deltaCeilingRejectedTotal,
     lastDecisionAt,
   };
 }

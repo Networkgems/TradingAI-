@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest';
-import { isExitRiskRulesEnabled, isLiveEquityStopModifyEnabled, isTakeProfitEarlyEnabled, isCorrelatedExposureCapEnabled, isOtmDeltaFloorEnabled, resolveOtmDeltaFloor, OTM_DELTA_FLOOR_DEFAULT, isRvExitRetuneEnabled, resolveRvExitConfirmBars, RV_EXIT_RETUNE_CONFIRM_BARS_DEFAULT, resolveRvExitFlipMinLossPct, isBookGiveBackArmFloorEnabled } from './exit-risk-rules-flag.js';
+import { isExitRiskRulesEnabled, isLiveEquityStopModifyEnabled, isTakeProfitEarlyEnabled, isCorrelatedExposureCapEnabled, isOtmDeltaFloorEnabled, resolveOtmDeltaFloor, OTM_DELTA_FLOOR_DEFAULT, isEntryDeltaCeilingEnabled, resolveEntryDeltaCeiling, resolveEntryDeltaCeilingStructures, entryDeltaCeilingReject, OPTION_ENTRY_DELTA_CEILING_DEFAULT, isRvExitRetuneEnabled, resolveRvExitConfirmBars, RV_EXIT_RETUNE_CONFIRM_BARS_DEFAULT, resolveRvExitFlipMinLossPct, isBookGiveBackArmFloorEnabled } from './exit-risk-rules-flag.js';
 
 // TRA-1250 / TRA-1269 / TRA-1294 / TRA-1295 — master switch + the isolated sub-flags.
 
@@ -84,6 +84,75 @@ describe('isOtmDeltaFloorEnabled / resolveOtmDeltaFloor (TRA-1407)', () => {
     for (const bad of ['', 'abc', '0', '-0.2', '1', '1.5']) {
       expect(resolveOtmDeltaFloor({ OTM_DELTA_FLOOR: bad })).toBe(OTM_DELTA_FLOOR_DEFAULT);
     }
+  });
+});
+
+// TRA-1670 (TRA-1647B) — the CEILING half of the entry-delta band. QuantTrader's
+// standing instruction on this ticket: "carry a test asserting the ceiling is
+// REJECTING, not just present" — a knob that is shipped, believed armed and silently
+// inert is the TRA-1486 / TRA-1407 failure mode twice over. These assert the verdict,
+// not the plumbing. The end-to-end proof (a Δ=0.60 candidate the ENGINE refuses to
+// open) lives in signal-engine.test.ts.
+describe('entry delta ceiling (TRA-1670)', () => {
+  const ARMED = { OPTION_ENTRY_DELTA_CEILING_ENABLED: '1' };
+
+  it('is STANDALONE — off by default, accepts truthy spellings, not gated by the master', () => {
+    expect(isEntryDeltaCeilingEnabled({})).toBe(false);
+    for (const v of ['1', 'true', 'YES', ' on ']) {
+      expect(isEntryDeltaCeilingEnabled({ OPTION_ENTRY_DELTA_CEILING_ENABLED: v })).toBe(true);
+    }
+    expect(isEntryDeltaCeilingEnabled({ EXIT_RISK_RULES_ENABLED: 'true' })).toBe(false);
+  });
+
+  it('REJECTS the measured OTM loss tail (|Δ| > 0.55) and ADMITS at/below the ceiling', () => {
+    // The two cases the ticket names explicitly.
+    expect(entryDeltaCeilingReject('single_leg_otm', 0.60, ARMED)).toBeTruthy();
+    expect(entryDeltaCeilingReject('single_leg_otm', 0.50, ARMED)).toBeNull();
+    // The boundary is inclusive-admit: 0.55 is the top of the KEEP band, not the tail.
+    expect(entryDeltaCeilingReject('single_leg_otm', 0.55, ARMED)).toBeNull();
+    expect(entryDeltaCeilingReject('single_leg_otm', 0.5501, ARMED)).toBeTruthy();
+    // Puts carry a negative delta — the cut is on the MAGNITUDE.
+    expect(entryDeltaCeilingReject('single_leg_otm', -0.60, ARMED)).toBeTruthy();
+    expect(entryDeltaCeilingReject('single_leg_otm', -0.50, ARMED)).toBeNull();
+  });
+
+  it('is INERT while disarmed — the tail passes untouched', () => {
+    expect(entryDeltaCeilingReject('single_leg_otm', 0.95, {})).toBeNull();
+  });
+
+  it('is SCOPED to single_leg_otm by default — RV / directional stay uncapped', () => {
+    // The 0.55 is measured on OTM only; the other sleeves must not inherit it.
+    expect(entryDeltaCeilingReject('single_leg_rv', 0.90, ARMED)).toBeNull();
+    expect(entryDeltaCeilingReject('directional', 0.90, ARMED)).toBeNull();
+    // ...but the board can widen the band via the structures override, no redeploy.
+    expect(
+      entryDeltaCeilingReject('single_leg_rv', 0.90, {
+        ...ARMED,
+        OPTION_ENTRY_DELTA_CEILING_STRUCTURES: 'single_leg_otm, single_leg_rv',
+      }),
+    ).toBeTruthy();
+  });
+
+  it('honours a valid numeric override and falls back to 0.55 on a malformed one', () => {
+    expect(resolveEntryDeltaCeiling({})).toBe(OPTION_ENTRY_DELTA_CEILING_DEFAULT);
+    expect(resolveEntryDeltaCeiling({ OPTION_ENTRY_DELTA_CEILING: '0.70' })).toBe(0.70);
+    // TRA-1647's invalidation is a RETUNE (0.55 → 0.70), so the override must bite.
+    expect(
+      entryDeltaCeilingReject('single_leg_otm', 0.60, { ...ARMED, OPTION_ENTRY_DELTA_CEILING: '0.70' }),
+    ).toBeNull();
+    // Malformed / out-of-range → the default, NEVER a silent disable.
+    for (const bad of ['', 'abc', '0', '-0.2', '1', '1.5']) {
+      expect(resolveEntryDeltaCeiling({ OPTION_ENTRY_DELTA_CEILING: bad })).toBe(OPTION_ENTRY_DELTA_CEILING_DEFAULT);
+    }
+    // A blanked structures list falls back to the default rather than disarming the cut.
+    expect(resolveEntryDeltaCeilingStructures({ OPTION_ENTRY_DELTA_CEILING_STRUCTURES: ' , ' }))
+      .toEqual(['single_leg_otm']);
+  });
+
+  it('ADMITS a candidate with no usable delta (honest-unknown, not a silent starve)', () => {
+    expect(entryDeltaCeilingReject('single_leg_otm', null, ARMED)).toBeNull();
+    expect(entryDeltaCeilingReject('single_leg_otm', undefined, ARMED)).toBeNull();
+    expect(entryDeltaCeilingReject('single_leg_otm', Number.NaN, ARMED)).toBeNull();
   });
 });
 

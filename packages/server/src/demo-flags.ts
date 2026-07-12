@@ -102,6 +102,20 @@ export const DEMO_FLAG_ALLOWLIST = [
   // the self-hosted host after QuantTrader's forward-validation (no PM2/admin).
   'OTM_DELTA_FLOOR_ENABLED',
   'OTM_DELTA_FLOOR',
+  // TRA-1670 (TRA-1647B, parent TRA-1647) — the CEILING half of the entry-delta band.
+  // The TRA-1602 cost gate is algebraically a delta FLOOR (admit ⟺ |Δ| ≥ (bar+1) /
+  // (mult·(rewardR+1))), so no retune of its seven knobs can cut the measured Δ>0.55
+  // OTM loss tail (n=14, NET −1.813R) where realized win rate collapses to 0.077
+  // against a modeled 0.575. STANDALONE flag consulted ONLY on the `mode === 'demo'`
+  // option-open branches, so it can never alter a live open — same containment as the
+  // floor above. OPTION_ENTRY_DELTA_CEILING tunes the number (default 0.55) and
+  // OPTION_ENTRY_DELTA_CEILING_STRUCTURES the sleeves it binds (default
+  // `single_leg_otm` alone — the 0.55 is measured on OTM only). Non-secret, demo-only,
+  // and n=14 post-hoc: the board WILL need to retune or drop this from the file
+  // without a redeploy once TRA-1647's forward validation reads out.
+  'OPTION_ENTRY_DELTA_CEILING_ENABLED',
+  'OPTION_ENTRY_DELTA_CEILING',
+  'OPTION_ENTRY_DELTA_CEILING_STRUCTURES',
   // TRA-1408 (parent TRA-1406 "less noise, more quality") — the per-name churn +
   // same-day-loss brake. STANDALONE flag (not under the EXIT_RISK_RULES master),
   // consulted ONLY on the demo open chokepoints + demo conviction-DCA add loops,
