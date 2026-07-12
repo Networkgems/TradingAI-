@@ -192,6 +192,13 @@ export const DEMO_FLAG_ALLOWLIST = [
   'OPTION_COST_GATE_WIN_PROB_DELTA_MULT',
   'OPTION_COST_GATE_DEFAULT_REWARD_R',
   'OPTION_COST_GATE_WIN_PROB_CAP',
+  // TRA-1662 (TRA-1600 A2) — the SHADOW maker-chase measurement. Pure telemetry:
+  // it re-polls the two-sided quote of a contract the demo book already opened and
+  // records what a maker chase WOULD have recovered. It routes no order, prices no
+  // fill, and the signal-engine hard-gates it on `mode === 'demo'`, so a file flip
+  // can never touch live capital. Allowlisted so the desk can arm/disarm the
+  // measurement without a redeploy. Non-secret, demo-only.
+  'ENABLE_OPTION_MAKER_SHADOW',
 ] as const;
 
 export const DEMO_FLAGS_FILENAME = 'demo-flags.json';
@@ -299,6 +306,20 @@ export const RENDER_RATIFIED_DEMO_DEFAULTS: Readonly<Record<string, string>> = {
   // validation via `GET /api/health/cost-aware-gate` (armed / admitted / rejected /
   // avg modeled gross R either side of the bar).
   ENABLE_OPTION_COST_AWARE_GATE: '1',
+
+  // TRA-1662 (TRA-1600 A2) — ARM the shadow maker-chase measurement on the demo
+  // book. This is the one number that decides whether the option book is viable:
+  // TRA-1647 showed both sleeves are net-negative at their MEASURED taker cross
+  // (TRA-1656), so only maker-fill routing (TRA-1601) can rescue them — and its
+  // "60-70% recovery" claim has never been measured, because the chase ladder and
+  // its telemetry both shipped OFF.
+  //
+  // Observe-only: it re-polls quotes for contracts the demo book ALREADY opened and
+  // records what a maker chase would have recovered. No order routing, no capital,
+  // no board gate — hence a boot-seed arm rather than an approval. An explicit `=0`
+  // in demo-flags.json still layers OVER this seed, so the desk keeps a daemon-free
+  // disarm. Reads out on `GET /api/health/option-maker-recovery`.
+  ENABLE_OPTION_MAKER_SHADOW: '1',
 };
 
 /**

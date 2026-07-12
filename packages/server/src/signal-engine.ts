@@ -124,6 +124,22 @@ import {
 } from './tradier-smart-close.js';
 import { submitSmartBuyToOpen } from './tradier-smart-open.js';
 import { recordMakerFill } from './option-maker-fill-ledger.js';
+import {
+  beginShadowChase,
+  advanceShadowChase,
+  activeRung,
+  recordShadowChase,
+  isOptionMakerShadowEnabled,
+  type ShadowChaseState,
+} from './option-maker-shadow.js';
+import { resolveMakerWalkConfig } from './option-maker-config.js';
+
+/**
+ * TRA-1662 — cap on concurrent in-flight shadow chases. A chase lives at most
+ * `steps × stepWaitMs` (default 150s ≈ 5 ticks), so steady state is a handful;
+ * this only bounds the pathological case where the tick stops draining them.
+ */
+const SHADOW_CHASE_MAX_IN_FLIGHT = 200;
 import { recordOptionTradeEntrySlippage } from './option-trade-journal.js';
 import { isLiveEntryGatePassed } from './capital-gate-manifest.js';
 import { isSma200DemoForwardTestEnabled } from './sma200-forward-test-flag.js';
@@ -1381,6 +1397,14 @@ export class SignalEngine {
    * scanner (IV skew fit + monotonic / no-arb checks).
    */
   private readonly rvScanner: RelativeValueScannerService | undefined;
+  /**
+   * TRA-1662 — in-flight SHADOW maker chases (observe-only). Each demo option
+   * open starts a counterfactual chase against the decision-time quote; the tick
+   * re-polls the contract's two-sided quote and walks the ladder. Memory-only —
+   * only terminal outcomes are durable. A restart drops the in-flight chases
+   * (they simply never record) rather than booking them at a flattering price.
+   */
+  private shadowChases: ShadowChaseState[] = [];
   /** Last successful RV scan timestamp — gates the 5-minute cadence. */
   private lastRvScanAt = 0;
   /** TRA-1207 — last OTM-mispricing scan timestamp; gates the 5-minute cadence. */
@@ -2780,6 +2804,10 @@ export class SignalEngine {
         reason: err instanceof Error ? err.message : String(err),
       });
     }
+    // TRA-1662 — walk the observe-only shadow maker chases before the mark
+    // refresh, so a chase reads the same-age chain snapshot the marks do.
+    await this.advanceShadowChases();
+
     const optionMarks = await this.refreshOptionMarks();
     // TRA-351 — push the freshly-fetched marks onto imported rows BEFORE
     // checkExits runs. checkExits skips imports (line 525 of options-account)
@@ -3756,6 +3784,114 @@ export class SignalEngine {
       etDateString(new Date()),
     );
     return verdict.admit ? null : verdict.reason;
+  }
+
+  /**
+   * TRA-1662 — start a SHADOW maker chase for an option open. Observe-only: it
+   * routes nothing, prices no fill, and cannot affect the position that was just
+   * booked. The demo book fills at the mark and pays no spread, so this is the
+   * only way to learn what a maker-routed version of this same open would have
+   * recovered.
+   *
+   * Demo-only by design: a LIVE open already routes a REAL chase through
+   * `submitSmartBuyToOpen` and records to the TRA-1601 maker-fill ledger — a
+   * shadow of a real chase would be measuring our own order.
+   *
+   * Fire-and-forget and totally defensive: any missing field just means no chase.
+   * Never throws into the open path.
+   */
+  private beginShadowMakerChase(
+    structure: string,
+    quote: { symbol?: string; expiration?: string; bid?: number; ask?: number },
+    opened: { optionSymbol?: string; contracts?: number },
+  ): void {
+    try {
+      if (this.mode !== 'demo') return;
+      if (!isOptionMakerShadowEnabled(this.resolveDemoFlagEnv())) return;
+      if (typeof this.rvScanner?.getOptionQuote !== 'function') return;
+
+      const { symbol, expiration, bid, ask } = quote;
+      const { optionSymbol, contracts } = opened;
+      if (!symbol || !expiration || !optionSymbol) return;
+      if (typeof bid !== 'number' || typeof ask !== 'number') return;
+      if (typeof contracts !== 'number' || !(contracts > 0)) return;
+
+      const state = beginShadowChase(
+        {
+          side: 'open',
+          structure,
+          mode: 'demo',
+          symbol,
+          expiration,
+          optionSymbol,
+          contracts,
+          bid,
+          ask,
+        },
+        resolveMakerWalkConfig(this.resolveDemoFlagEnv()),
+        Date.now(),
+      );
+      // `null` = one-sided / zero-width book. Such opens DROP OUT of the
+      // denominator rather than being booked as a free recovery.
+      if (!state) return;
+
+      // Bound the in-flight set. A chase lives at most `steps × stepWaitMs`
+      // (default 150s ≈ 5 ticks), so this cap is far above steady state; it only
+      // exists so a wedged tick can never grow the list without limit.
+      if (this.shadowChases.length >= SHADOW_CHASE_MAX_IN_FLIGHT) return;
+      this.shadowChases.push(state);
+    } catch {
+      // Telemetry must never break a trade pass.
+    }
+  }
+
+  /**
+   * TRA-1662 — advance every in-flight shadow chase against a freshly-polled
+   * two-sided quote, and durably record the ones that reach a terminal outcome
+   * (filled at a rung, or exhausted and chased to taker).
+   *
+   * Rides the scanner's warm chain cache — the same snapshot `refreshOptionMarks`
+   * already pulls each tick for these very contracts — so it adds ZERO Tradier
+   * calls in steady state. Never throws into the tick.
+   */
+  private async advanceShadowChases(): Promise<void> {
+    if (this.shadowChases.length === 0) return;
+    const getQuote = this.rvScanner?.getOptionQuote;
+    if (typeof getQuote !== 'function') {
+      this.shadowChases = [];
+      return;
+    }
+
+    const now = Date.now();
+    const stillResting: ShadowChaseState[] = [];
+    for (const chase of this.shadowChases) {
+      try {
+        const quote = await getQuote.call(
+          this.rvScanner,
+          chase.symbol,
+          chase.expiration,
+          chase.optionSymbol,
+        );
+        if (!quote) {
+          // Quote went dark. Keep resting while the ladder still has time to run;
+          // once it's exhausted we can't price the taker tail, so drop the chase
+          // rather than book it at a flattering zero.
+          if (activeRung(chase, now) !== null) stillResting.push(chase);
+          continue;
+        }
+        const event = advanceShadowChase(chase, quote, now);
+        if (!event) {
+          stillResting.push(chase);
+          continue;
+        }
+        // Pass the DEMO-FLAG-resolved arm state — the ledger must not re-read
+        // process.env, which never sees a demo-flags.json-only arm.
+        await recordShadowChase(event, isOptionMakerShadowEnabled(this.resolveDemoFlagEnv()));
+      } catch {
+        // Drop this chase; a measurement failure is never a trade failure.
+      }
+    }
+    this.shadowChases = stillResting;
   }
 
   /**
@@ -4808,6 +4944,8 @@ export class SignalEngine {
         );
         if (!opened) continue;
         this.recordChurnOpen(signal.symbol); // TRA-1408 per-name same-session churn counter
+        // TRA-1662 — shadow the maker chase this demo open did NOT route.
+        this.beginShadowMakerChase('single_leg_rv', signal, opened);
 
         // TRA-221 / TRA-319 / TRA-355 / TRA-374 — when running live with Tradier
         // configured AND the dark RV-long flag is armed, mirror the paper open to
@@ -5161,6 +5299,8 @@ export class SignalEngine {
         );
         if (!opened) continue;
         this.recordChurnOpen(signal.symbol); // TRA-1408 per-name same-session churn counter
+        // TRA-1662 — shadow the maker chase this demo open did NOT route.
+        this.beginShadowMakerChase('single_leg_otm', signal, opened);
 
         this.emitOptionFillAlert(opened);
         signal.mode = this.mode;
@@ -6033,6 +6173,8 @@ export class SignalEngine {
           directionalJournalSetup,
         );
         if (!opened) continue;
+        // TRA-1662 — shadow the maker chase this demo open did NOT route.
+        this.beginShadowMakerChase('directional', signal, opened);
 
         // TRA-1476 / TRA-1408 — record this directional open against the shared
         // per-name same-session counter so BOTH the TRA-1476 per-name cap above

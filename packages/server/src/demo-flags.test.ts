@@ -166,6 +166,11 @@ describe('renderRatifiedDemoDefaults (TRA-1481 — self-heal the Render blueprin
       // directional opens (board arm `427b57ee`, QT-signed TRA-1603); self-heals the
       // same env-sync gap. Demo-only + pure risk-reducing (it only ever opens LESS).
       ENABLE_OPTION_COST_AWARE_GATE: '1',
+      // TRA-1662 — the observe-only SHADOW maker-chase measurement. Self-heals the
+      // same env-sync gap. No order routing, no capital: it re-polls quotes for
+      // contracts the demo book already opened and records what a maker chase
+      // would have recovered.
+      ENABLE_OPTION_MAKER_SHADOW: '1',
     });
   });
 
@@ -182,6 +187,7 @@ describe('renderRatifiedDemoDefaults (TRA-1481 — self-heal the Render blueprin
       RV_EXIT_FLIP_MIN_LOSS_PCT: '0',
       ENABLE_NEWS_CATALYST_WATCHLIST: '0',
       ENABLE_OPTION_COST_AWARE_GATE: '0',
+      ENABLE_OPTION_MAKER_SHADOW: '0',
     } as NodeJS.ProcessEnv;
     expect(renderRatifiedDemoDefaults(dir, env)).toEqual({});
   });
@@ -212,6 +218,9 @@ describe('renderRatifiedDemoDefaults (TRA-1481 — self-heal the Render blueprin
       // through the demo-flags overlay), so the board's daemon-free `=0` disarm goes
       // in the file and must survive the boot seed.
       ENABLE_OPTION_COST_AWARE_GATE: '0',
+      // TRA-1662 — the shadow maker-chase measurement is likewise allowlisted, so its
+      // daemon-free `=0` disarm also lives in the file and must survive the seed.
+      ENABLE_OPTION_MAKER_SHADOW: '0',
     });
     // TRA-1632 — the news-catalyst flag is NOT on the demo-flags.json allowlist
     // (isNewsCatalystEnabled reads raw process.env, so the file never reaches it);

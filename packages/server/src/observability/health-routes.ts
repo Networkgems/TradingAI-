@@ -88,6 +88,12 @@ import {
   summarizeMakerFills,
   isOptionMakerTelemetryEnabled,
 } from '../option-maker-fill-ledger.js';
+import {
+  listShadowChases,
+  summarizeShadowRecovery,
+  isOptionMakerShadowEnabled,
+  BREAKEVEN_MAKER_RECOVERY,
+} from '../option-maker-shadow.js';
 import { resolveMakerWalkConfig } from '../option-maker-config.js';
 import { isLearnedShrinkageEnabled } from '../learned-shrinkage-flag.js';
 import {
@@ -1644,6 +1650,66 @@ export function registerLiveHealthRoutes(app: Express, deps: LiveHealthDeps): vo
       ...(mode ? { mode } : {}),
       ...(sinceTs !== undefined ? { sinceTs } : {}),
       summary: summarizeMakerFills(events, enabled),
+    });
+  });
+
+  // TRA-1662 (TRA-1600 A2) — the maker-fill RECOVERY readout. THE number that
+  // decides whether the options book is viable: what fraction of the spread a
+  // maker chase actually recovers, measured against every attempt rather than
+  // only the ones that filled.
+  //
+  // Carries no balances/PII (OCC symbols + fill geometry), so unauthenticated —
+  // same posture as /option-journal and /option-maker-fills. `enabled` mirrors
+  // ENABLE_OPTION_MAKER_SHADOW so a reader can see whether capture is armed;
+  // served empty (honest zero) when off.
+  app.get('/api/health/option-maker-recovery', async (req, res) => {
+    const modeRaw = req.query['mode'];
+    const mode = modeRaw === 'demo' || modeRaw === 'live' ? modeRaw : undefined;
+    const sinceRaw = req.query['sinceTs'];
+    const sinceParsed = typeof sinceRaw === 'string' ? Number(sinceRaw) : NaN;
+    const sinceTs = Number.isFinite(sinceParsed) ? sinceParsed : undefined;
+
+    const events = await listShadowChases({ mode, sinceTs });
+    const stats = summarizeShadowRecovery(events);
+    const ladder = resolveMakerWalkConfig();
+
+    // Grade each sleeve against the recovery it must clear to cover its own
+    // MEASURED taker cross (TRA-1656). `null` until the sleeve has attempts.
+    const verdicts = stats
+      .filter((s) => s.side === 'open' && BREAKEVEN_MAKER_RECOVERY[s.structure] !== undefined)
+      .map((s) => {
+        const breakeven = BREAKEVEN_MAKER_RECOVERY[s.structure] as number;
+        const measured = s.avgRecoveryPctAllAttempts;
+        return {
+          structure: s.structure,
+          attempts: s.attempts,
+          breakevenRecoveryPct: breakeven,
+          // ★ tail-aware expectancy — NOT the fills-only mean.
+          measuredRecoveryPctAllAttempts: measured,
+          coversItsOwnSpread: measured === null ? null : measured >= breakeven,
+        };
+      });
+
+    res.json({
+      ok: true,
+      time: new Date(now()).toISOString(),
+      enabled: isOptionMakerShadowEnabled(),
+      ladder: {
+        walkSteps: ladder.fractions,
+        stepWaitMs: ladder.stepWaitMs,
+        maxCrossTicks: ladder.maxCrossTicks,
+        tickSize: ladder.tickSize,
+      },
+      ...(mode ? { mode } : {}),
+      ...(sinceTs !== undefined ? { sinceTs } : {}),
+      note:
+        'Observe-only shadow of the maker chase each DEMO open did NOT route (demo fills at the mark, paying no spread). ' +
+        'recoveryPct = 1 − realizedCross/rawCross vs the decision-time mid. ' +
+        'avgRecoveryPctOnFills is SURVIVORSHIP-BIASED (filled chases only) and is NOT the decision number; ' +
+        'avgRecoveryPctAllAttempts prices the chase-to-taker tail across every attempt and IS. ' +
+        'Fills are counted only when the opposing touch reaches our resting limit, so the fill rate is a LOWER bound.',
+      verdicts,
+      byStructure: stats,
     });
   });
 

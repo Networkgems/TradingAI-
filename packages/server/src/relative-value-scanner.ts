@@ -188,6 +188,28 @@ export interface RelativeValueScannerService {
    * lacking usable bid/ask.
    */
   getOptionMark(symbol: string, expiration: string, optionSymbol: string): Promise<number | null>;
+  /**
+   * TRA-1662 — the TWO-SIDED quote for a contract, for the shadow maker-chase
+   * measurement. {@link getOptionMark} collapses the book to a scalar mid (and
+   * falls back to `last`), which is exactly the information a maker chase needs
+   * and cannot get: whether the ASK has come down to our resting limit.
+   *
+   * Rides the same cached snapshot as `scan()` / `getOptionMark()`, so polling an
+   * open position's quote on the engine tick costs ZERO extra Tradier calls when
+   * the cache is warm. Returns `null` for unknown contracts or a one-sided book —
+   * there is no `last` fallback, because a chase cannot rest against a print.
+   * Never trades.
+   *
+   * OPTIONAL on the interface: the shadow measurement is strictly additive and
+   * degrades gracefully. A scanner that cannot serve a two-sided quote simply
+   * produces no shadow chases (rather than a flattering half-measured one), so
+   * the capability is opt-in per implementation.
+   */
+  getOptionQuote?(
+    symbol: string,
+    expiration: string,
+    optionSymbol: string,
+  ): Promise<{ bid: number; ask: number } | null>;
   diagnostics(): RelativeValueScannerDiagnostics;
 }
 
@@ -416,6 +438,31 @@ export class TradierRelativeValueScannerService implements RelativeValueScannerS
     const ask = row.ask ?? 0;
     if (bid > 0 && ask > 0 && ask >= bid) return (bid + ask) / 2;
     if (typeof row.last === 'number' && row.last > 0) return row.last;
+    return null;
+  }
+
+  async getOptionQuote(
+    symbol: string,
+    expiration: string,
+    optionSymbol: string,
+  ): Promise<{ bid: number; ask: number } | null> {
+    if (!this.client) return null;
+    if (this.isBreakerOpen()) return null;
+    const upper = symbol.trim().toUpperCase();
+    let chain: OptionChainRow[];
+    try {
+      chain = await this.fetchChain(upper, expiration);
+    } catch (err) {
+      this.tripBreaker(`getChainSnapshot(${upper},${expiration}) failed`, err);
+      return null;
+    }
+    const row = chain.find((r) => r.optionSymbol === optionSymbol);
+    if (!row) return null;
+    const bid = row.bid ?? 0;
+    const ask = row.ask ?? 0;
+    // Two-sided and sane, or nothing. A one-sided book gives a maker chase no
+    // midpoint to rest against, and `last` is a print, not a resting price.
+    if (bid > 0 && ask > 0 && ask >= bid) return { bid, ask };
     return null;
   }
 
