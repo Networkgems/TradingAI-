@@ -24,7 +24,12 @@ import {
   buildOptionJournalReport,
   type HealthUserContext,
 } from './health-routes.js';
-import type { OptionTradeJournalRecord } from '../option-trade-journal.js';
+import type { OptionTradeJournalRecord, OptionTradeJournalOpen } from '../option-trade-journal.js';
+import {
+  OPTION_TRADE_JOURNAL_FLAG,
+  recordOptionTradeOpen,
+  setOptionTradeJournalFileForTests,
+} from '../option-trade-journal.js';
 import {
   clearChurnBrakeLedger,
   recordChurnBrakeOpen,
@@ -1172,5 +1177,131 @@ describe('buildOptionJournalReport', () => {
       // Learned weights stay over the FULL row set — cohort filter must not perturb them.
       expect(cohort.weights.generatedFrom.rows).toBe(2);
     });
+  });
+});
+
+// TRA-1656 (TRA-1602B) — the MEASURED option spread cross probe. Drives the real
+// registered route against a real (temp-file) journal so the whole path is
+// exercised: quote retention -> per-structure rollup -> retention statement.
+describe('GET /api/health/option-spread-cost (TRA-1656)', () => {
+  const JOURNAL = join(tmpdir(), `tra1656-spread-${Date.now()}.jsonl`);
+
+  beforeEach(() => {
+    process.env[OPTION_TRADE_JOURNAL_FLAG] = '1';
+    setOptionTradeJournalFileForTests(JOURNAL);
+  });
+  afterEach(async () => {
+    delete process.env[OPTION_TRADE_JOURNAL_FLAG];
+    setOptionTradeJournalFileForTests(null);
+    await rm(JOURNAL, { force: true });
+  });
+
+  function probe() {
+    const { app, routes } = fakeApp();
+    registerLiveHealthRoutes(app, {
+      requireAuth: ((_q: unknown, _s: unknown, n: () => void) => n()) as never,
+      userCtx: async () => ctx('admin', engineState()),
+      getSettings: () => settings(),
+      now: () => NOW,
+    });
+    return routes.get('/api/health/option-spread-cost')!;
+  }
+
+  const openRow = (
+    id: string,
+    structure: string,
+    quote: { entryBid: number; entryAsk: number; entryMarkUsd: number } | null,
+  ): OptionTradeJournalOpen => ({
+    id,
+    openTs: NOW,
+    symbol: 'AAPL',
+    structure,
+    mode: 'demo',
+    ivRank: 50,
+    trend: 'up',
+    sentiment: null,
+    sentimentIcBand: null,
+    entryDelta: 0.4,
+    entryDte: 30,
+    atRiskUsd: 200,
+    contracts: 1,
+    optionSymbol: 'AAPL260529C00200000',
+    ...(quote ?? {}),
+  });
+
+  it('is unauthenticated (secrets-free probe, one handler)', () => {
+    expect(probe()).toHaveLength(1);
+  });
+
+  it('states the RETENTION GAP explicitly when no row carries a fill-time quote', async () => {
+    // Pre-TRA-1656 rows: mark only, no bid/ask. This is the 2,153-trade history.
+    await recordOptionTradeOpen(openRow('legacy-1', 'single_leg_rv', null));
+    await recordOptionTradeOpen(openRow('legacy-2', 'single_leg_otm', null));
+
+    const res = fakeRes();
+    await probe()[0]!({}, res);
+    const body = res.body as {
+      n: number;
+      byStructure: unknown[];
+      retention: { rowsTotal: number; rowsWithFillTimeQuote: number; statement: string };
+    };
+
+    // The acceptance bar's escape hatch: say so, rather than report a fake number.
+    expect(body.n).toBe(0);
+    expect(body.byStructure).toEqual([]);
+    expect(body.retention.rowsTotal).toBe(2);
+    expect(body.retention.rowsWithFillTimeQuote).toBe(0);
+    expect(body.retention.statement).toContain('NOT RETAINED');
+  });
+
+  it('MEASURES avgSpreadCrossR per structure once rows retain a fill-time quote', async () => {
+    // RV: $2.00 mark, $0.12 spread => spreadPct 6% => crossR = 4 × 0.06 = 0.24R.
+    await recordOptionTradeOpen(
+      openRow('rv-1', 'single_leg_rv', { entryBid: 1.94, entryAsk: 2.06, entryMarkUsd: 2.0 }),
+    );
+    // OTM: $1.00 mark, $0.10 spread => spreadPct 10% => crossR = 0.40R.
+    await recordOptionTradeOpen(
+      openRow('otm-1', 'single_leg_otm', { entryBid: 0.95, entryAsk: 1.05, entryMarkUsd: 1.0 }),
+    );
+    // A legacy row with no quote must DROP OUT, not dilute the mean toward zero.
+    await recordOptionTradeOpen(openRow('legacy-3', 'single_leg_rv', null));
+
+    const res = fakeRes();
+    await probe()[0]!({}, res);
+    const body = res.body as {
+      n: number;
+      byStructure: Array<{ structure: string; n: number; avgSpreadCrossR: number; impliedBarR: number }>;
+      modeledInput: { makerAdjustedSpreadCrossR: number; barR: number };
+      retention: { rowsTotal: number; rowsWithFillTimeQuote: number };
+    };
+
+    expect(body.n).toBe(2);
+    expect(body.retention.rowsTotal).toBe(3); // the legacy row is counted but not measured
+    expect(body.retention.rowsWithFillTimeQuote).toBe(2);
+
+    const rv = body.byStructure.find((s) => s.structure === 'single_leg_rv')!;
+    const otm = body.byStructure.find((s) => s.structure === 'single_leg_otm')!;
+    expect(rv.n).toBe(1); // NOT 2 — the quote-less row dropped out
+    expect(rv.avgSpreadCrossR).toBeCloseTo(0.24, 6);
+    expect(otm.avgSpreadCrossR).toBeCloseTo(0.4, 6);
+
+    // The point of the ticket: the MEASURED cross is far below the gate's modeled
+    // 1.00R input, so the re-derived bar is far below the armed 1.25R bar.
+    expect(body.modeledInput.makerAdjustedSpreadCrossR).toBe(1.0);
+    expect(rv.avgSpreadCrossR).toBeLessThan(body.modeledInput.makerAdjustedSpreadCrossR);
+    expect(rv.impliedBarR).toBeLessThan(body.modeledInput.barR);
+  });
+
+  it('publishes the selection-independent ceilings that falsify the 1.00R input at n=0', async () => {
+    const res = fakeRes();
+    await probe()[0]!({}, res);
+    const body = res.body as {
+      modeledInput: { makerAdjustedSpreadCrossR: number };
+      ceilings: Record<string, { maxSpreadCrossR?: number }>;
+    };
+    // No fills at all, yet the bound still holds and still refutes the input.
+    expect(body.ceilings['single_leg_otm']!.maxSpreadCrossR).toBe(0.8);
+    expect(body.ceilings['single_leg_rv']!.maxSpreadCrossR).toBe(0.4);
+    expect(body.modeledInput.makerAdjustedSpreadCrossR).toBeGreaterThan(0.8);
   });
 });

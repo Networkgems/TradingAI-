@@ -129,6 +129,35 @@ export interface OptionTradeJournalOpen {
    */
   entrySlippageUsd?: number;
   /**
+   * TRA-1656 (TRA-1602B) — the fill-time two-sided QUOTE, retained so the option
+   * spread cross can be MEASURED instead of modeled.
+   *
+   * The cost-aware gate (TRA-1602) charges a `makerAdjustedSpreadCrossR = 1.00R`
+   * that its own comment admits is "INTERIM (modeled, not measured)", and before
+   * this ticket there was no way to check it: the scanners compute `bid`/`ask` and
+   * derive `mark = (bid + ask) / 2`, but only `mark` survived into the fill — the
+   * quote was dropped on the floor. Worse, the open row carried no contract
+   * identity either, so the 2,153 closed demo trades could not even be JOINED back
+   * to the recorded chain snapshots to recover their quotes. Both gaps are closed
+   * here: `optionSymbol` makes a row identifiable, and `entryBid`/`entryAsk` make
+   * the round-trip cross directly measurable as
+   * `(ask − bid) / (0.25 · entryMarkUsd)` (see `option-spread-cost.ts`).
+   *
+   * All optional: rows written before this commit fold back as `undefined` and DROP
+   * OUT of the spread-cost rollup rather than being counted as zero-cost fills.
+   * That means the measured `n` starts at 0 and accrues forward — the probe says so
+   * explicitly rather than reporting a falsely-cheap cross over unmeasured rows.
+   */
+  optionSymbol?: string;
+  /** TRA-1656 — per-share bid at fill. */
+  entryBid?: number;
+  /** TRA-1656 — per-share ask at fill. */
+  entryAsk?: number;
+  /** TRA-1656 — per-share mark (mid) the fill booked against. R = 0.25 × this. */
+  entryMarkUsd?: number;
+  /** TRA-1656 — contracts filled; the basis for the round-trip commission-in-R term. */
+  contracts?: number;
+  /**
    * TRA-1475 — the owning demo book's username, stamped so the firm-wide DESK
    * fold (`reports/desk-calendar.ts`) can exclude QA/test accounts (`qa*`,
    * `ctoverify*`, `monitor_qa`, …) that dominate the ~51-book demo fleet. Optional

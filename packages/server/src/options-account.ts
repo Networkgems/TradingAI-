@@ -117,6 +117,32 @@ const guardLog = logger.child({ module: 'day-trading-guardrail' });
 const accountLog = logger.child({ module: 'options-account' });
 
 /**
+ * TRA-1656 (TRA-1602B) — lift the fill-time two-sided quote off an option signal
+ * for the trade journal, so the round-trip spread cross can be MEASURED rather
+ * than modeled (`option-spread-cost.ts`).
+ *
+ * Both option signals ride `bid`/`ask` over from their scanner candidate, where
+ * the mark was derived as `(bid + ask) / 2` in the first place. They are optional
+ * on the signal (older/synthetic signals may carry no quote), so this returns
+ * `undefined` unless a sane two-sided book is present — an unmeasurable fill must
+ * DROP OUT of the cost rollup, never be folded in as a zero-cost fill.
+ *
+ * `mark` is taken as the RAW mark the fill priced against, not the demo-slipped
+ * `premiumPaid`: R is defined off the mid (stop = `mark · 0.75`), and mixing the
+ * slippage haircut into the R basis would double-count the very cost we measure.
+ */
+function quoteOf(
+  signal: { bid?: number; ask?: number },
+  rawMark: number,
+): { bid: number; ask: number; mark: number } | undefined {
+  const { bid, ask } = signal;
+  if (typeof bid !== 'number' || typeof ask !== 'number') return undefined;
+  if (!Number.isFinite(bid) || !Number.isFinite(ask) || !Number.isFinite(rawMark)) return undefined;
+  if (rawMark <= 0 || bid < 0 || ask <= 0 || ask < bid) return undefined;
+  return { bid, ask, mark: rawMark };
+}
+
+/**
  * TRA-462 — RV stop-loss premium with the dollar-distance floor. The stop
  * *distance* is `max(premium · slPct, slDollarFloor)` so a percentage stop can
  * never collapse to sub-tick on a low-premium contract (the TRA-461 failure
@@ -570,6 +596,15 @@ export class PaperOptionsAccount {
     // mark-vs-fill (e.g. the multi-leg spread path) omit it and fold back
     // unmeasured. In demo this is the modelled demoSlippagePct haircut.
     entrySlippageUsd?: number,
+    // TRA-1656 (TRA-1602B) — the fill-time two-sided QUOTE. The scanners already
+    // carry `bid`/`ask` on every candidate and derive `mark = (bid + ask) / 2`,
+    // but only `mark` used to survive into the fill, which is exactly why the
+    // gate's spread-cross input could never be checked against reality. Stamping
+    // the quote here makes the round-trip cross MEASURABLE per fill
+    // (`(ask − bid) / (0.25 · mark)` — see `option-spread-cost.ts`). Optional: an
+    // open with no quote in hand folds back unmeasured and drops out of the
+    // rollup rather than being counted as a zero-cost fill.
+    quote?: { bid: number; ask: number; mark: number },
   ): void {
     if (!isOptionTradeJournalEnabled()) return;
     const entryDte = position.expiration
@@ -599,6 +634,21 @@ export class PaperOptionsAccount {
       // supplied a finite value, so unmeasured opens fold back as undefined.
       ...(typeof entrySlippageUsd === 'number' && Number.isFinite(entrySlippageUsd)
         ? { entrySlippageUsd }
+        : {}),
+      // TRA-1656 — contract identity + fill-time quote. `optionSymbol` alone fixes
+      // a second gap the spread audit exposed: pre-TRA-1656 rows carried no OCC
+      // symbol, so a closed trade could not be joined back to the recorded chain
+      // snapshot to recover its quote. Future rows are backfillable even if the
+      // quote itself is somehow missing.
+      ...(position.optionSymbol ? { optionSymbol: position.optionSymbol } : {}),
+      ...(Number.isFinite(position.contracts) ? { contracts: position.contracts } : {}),
+      ...(quote
+        && Number.isFinite(quote.bid)
+        && Number.isFinite(quote.ask)
+        && Number.isFinite(quote.mark)
+        && quote.mark > 0
+        && quote.ask >= quote.bid
+        ? { entryBid: quote.bid, entryAsk: quote.ask, entryMarkUsd: quote.mark }
         : {}),
       // TRA-1475 — stamp the owning book so the DESK fold can exclude QA/test
       // accounts. Only when bound (un-owned engines omit it → kept by the filter).
@@ -1359,7 +1409,9 @@ export class PaperOptionsAccount {
     // is 0 at open (the realised broker slippage reconciles via the mirror).
     if (journalSetup) {
       const entrySlippageUsd = (premiumPaid - rawMark) * contracts * 100;
-      this.queueJournalOpen(position, 'single_leg_otm', totalCost, journalSetup, entrySlippageUsd);
+      // TRA-1656 — retain the fill-time quote so the spread cross is measured, not
+      // modeled. `signal.bid`/`signal.ask` ride along from the scanner candidate.
+      this.queueJournalOpen(position, 'single_leg_otm', totalCost, journalSetup, entrySlippageUsd, quoteOf(signal, rawMark));
     }
     return position;
   }
@@ -1492,7 +1544,8 @@ export class PaperOptionsAccount {
     // TRA-1600 (D) — measured entry slippage (see `openOptionFromCandidate`).
     if (journalSetup) {
       const entrySlippageUsd = (premiumPaid - rawMark) * contracts * 100;
-      this.queueJournalOpen(position, 'single_leg_rv', totalCost, journalSetup, entrySlippageUsd);
+      // TRA-1656 — retain the fill-time quote (see `openOptionFromCandidate`).
+      this.queueJournalOpen(position, 'single_leg_rv', totalCost, journalSetup, entrySlippageUsd, quoteOf(signal, rawMark));
     }
     return position;
   }

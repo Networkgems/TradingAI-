@@ -4509,6 +4509,10 @@ export class SignalEngine {
           strike: cheap.strike,
           expiration: cheap.expiration,
           mark: cheap.mark,
+          // TRA-1656 — carry the quote `mark` was derived from into the fill so the
+          // journal can retain it and the spread cross becomes measured, not modeled.
+          bid: cheap.bid,
+          ask: cheap.ask,
           fairPrice: cheap.fairPrice,
           mispricingPct: cheap.mispricingPct,
           zScore: cheap.zScore,
@@ -5068,6 +5072,9 @@ export class SignalEngine {
           strike: cheap.strike,
           expiration: cheap.expiration,
           mark: cheap.mark,
+          // TRA-1656 — see the RV builder: retain the fill-time quote.
+          bid: cheap.bid,
+          ask: cheap.ask,
           theo: cheap.theo,
           mispricingPct: cheap.mispricingPct,
           delta: cheap.delta,
@@ -5915,6 +5922,10 @@ export class SignalEngine {
           strike: best.row.strike,
           expiration,
           mark: best.mark,
+          // TRA-1656 — retain the fill-time quote for the `directional` sleeve too,
+          // so all three structures the cost gate governs are measurable.
+          bid: best.row.bid,
+          ask: best.row.ask,
           // Deterministic ATM directional entry — no skew-fit fields apply; report
           // the chosen mark as the reference so the journal/feed render cleanly.
           fairPrice: best.mark,

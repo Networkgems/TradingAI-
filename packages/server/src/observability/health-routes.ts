@@ -8,7 +8,7 @@
 
 import { timingSafeEqual } from 'node:crypto';
 import type { Express, Response, RequestHandler } from 'express';
-import { findMissingLiveCredentials, type AccountSettings } from '@trading-app/shared';
+import { findMissingLiveCredentials, DEFAULT_ACCOUNT_SETTINGS, type AccountSettings } from '@trading-app/shared';
 import type { EngineState, LiveEquityAcceptance, LiveSkipCategory } from '../signal-engine.js';
 import { LIVE_SKIP_CATEGORIES, emptyLiveSkipBreakdown } from '../signal-engine.js';
 import { resolveBuildInfo } from './build-info.js';
@@ -49,6 +49,8 @@ import {
   admissionBarR,
   OPTION_COST_AWARE_GATE_FLAG,
 } from '../option-cost-gate.js';
+import { summarizeSpreadCost, SLEEVE_SPREAD_CEILINGS } from '../option-spread-cost.js';
+import type { SpreadCostSample } from '../option-spread-cost.js';
 import {
   isDirectionalQualityGateEnabled,
   resolveDirectionalQualityThresholds,
@@ -1244,6 +1246,118 @@ export function registerLiveHealthRoutes(app: Express, deps: LiveHealthDeps): vo
         ? `ARMED (demo-only): rejects a demo RV / OTM / directional open whose modeled GROSS R can't clear its structure's cost-aware bar (${structures.map((s) => `${s} ${bars[s]!.toFixed(2)}R`).join(', ')}). rejected>0 is the direct evidence the bar is biting. Live options admission unchanged.`
         : `DISARMED: set ${OPTION_COST_AWARE_GATE_FLAG}=1 (render.yaml env or DATA_DIR/demo-flags.json) to arm on the demo book.`,
       ...summarizeCostAwareGate(etDay),
+    });
+  });
+
+  // TRA-1656 (TRA-1602B) — unauthenticated, secrets-free MEASURED option spread
+  // cross, in R units. The cost-aware bar (TRA-1602) charges a
+  // `makerAdjustedSpreadCrossR = 1.00R` that its own source comment concedes is
+  // "INTERIM (modeled, not measured)", and that unmeasured input is the DOMINANT
+  // term in the shipped 1.25R bar — so TRA-1647's "the book cannot cover its cost"
+  // is an artifact of it until it is checked. This probe is the check.
+  //
+  // Three independent readings, deliberately kept separate:
+  //
+  //  1. `measured` — the per-fill rollup over journal rows that retain a fill-time
+  //     quote. This is the number the ticket asks for. It reads 0 until TRA-1656
+  //     rows accrue (see `retention`), and it says so rather than reporting a
+  //     falsely-cheap cross computed over rows that never had a quote.
+  //  2. `retention` — the honest data statement. Pre-TRA-1656 opens dropped the
+  //     scanner's bid/ask AND carried no `optionSymbol`, so the 2,153 historical
+  //     closed trades can be neither measured nor joined back to a chain snapshot.
+  //     That gap is itself a finding and is reported, not hidden.
+  //  3. `ceilings` — the SELECTION-INDEPENDENT bound. The scanners hard-reject any
+  //     contract with `spreadPct > maxSpreadPct` (OTM 0.20, RV 0.10) before it can
+  //     be picked, and `spreadCrossR = 4 · spreadPct`, so no contract either sleeve
+  //     can possibly buy crosses above 0.80R / 0.40R. This holds with ZERO fills and
+  //     no distributional assumption — and it already falsifies the gate's 1.00R
+  //     input, which sits above both ceilings.
+  //
+  // Observe-only: reading this never routes an order or moves a bar.
+  app.get('/api/health/option-spread-cost', async (_req, res) => {
+    const dir = process.env.DATA_DIR;
+    const env = dir ? resolveDemoFlagEnv(dir) : process.env;
+    const config = resolveCostGateConfig(env);
+
+    const rows = await listOptionTradeJournal({ mode: 'demo' });
+    const samples: SpreadCostSample[] = [];
+    for (const r of rows) {
+      if (
+        typeof r.entryBid !== 'number'
+        || typeof r.entryAsk !== 'number'
+        || typeof r.entryMarkUsd !== 'number'
+      ) continue;
+      samples.push({
+        structure: r.structure,
+        quote: { bid: r.entryBid, ask: r.entryAsk, mark: r.entryMarkUsd },
+        ...(typeof r.contracts === 'number' ? { contracts: r.contracts } : {}),
+      });
+    }
+
+    const byStructure = summarizeSpreadCost(samples, { safetyMarginR: config.safetyMarginR });
+    const rowsWithQuote = samples.length;
+    const rowsTotal = rows.length;
+    const ACCEPTANCE_N = 50;
+    const shortfall = byStructure.filter((s) => s.n < ACCEPTANCE_N).map((s) => s.structure);
+
+    res.json({
+      ok: true,
+      time: new Date(now()).toISOString(),
+      build: resolveBuildInfo(),
+      demoOnly: true,
+      liveCapitalReachable: false,
+
+      // The gate input this probe exists to check.
+      modeledInput: {
+        makerAdjustedSpreadCrossR: config.optionsCost.makerAdjustedSpreadCrossR,
+        commissionR: config.optionsCost.commissionR,
+        safetyMarginR: config.safetyMarginR,
+        barR: admissionBarR('single_leg_otm', config),
+        source: 'MODELED — never measured (see option-cost-gate.ts)',
+      },
+
+      // (1) The measurement.
+      n: rowsWithQuote,
+      byStructure,
+
+      // (2) The retention statement — the finding when n is short.
+      retention: {
+        rowsTotal,
+        rowsWithFillTimeQuote: rowsWithQuote,
+        rowsWithoutFillTimeQuote: rowsTotal - rowsWithQuote,
+        acceptanceN: ACCEPTANCE_N,
+        structuresBelowAcceptanceN: shortfall,
+        statement:
+          rowsWithQuote === 0
+            ? 'FILL-TIME QUOTE DATA WAS NOT RETAINED for any existing row. Pre-TRA-1656 opens recorded only `mark` (the scanners computed bid/ask, derived mark = (bid+ask)/2, and dropped the quote), and carried no `optionSymbol` — so historical fills can be neither measured directly nor joined back to a recorded chain snapshot to recover their quotes. TRA-1656 ships the capture; `n` accrues from the first fill after deploy. Until then the SELECTION-INDEPENDENT `ceilings` below are the load-bearing evidence, and they already refute the 1.00R input.'
+            : `Measured over ${rowsWithQuote} of ${rowsTotal} demo journal rows that retain a fill-time quote. Rows without a quote DROP OUT (never counted as zero-cost fills), so this mean is not biased toward cheap.`,
+      },
+
+      // (3) The selection-independent bound — valid at n = 0.
+      ceilings: {
+        ...SLEEVE_SPREAD_CEILINGS,
+        note:
+          'spreadCrossR = (ask − bid) / (0.25 · mark) = 4 · spreadPct, and the scanners reject spreadPct > maxSpreadPct BEFORE selection. So no contract these sleeves can buy crosses above its ceiling — independent of which contracts get picked. The gate charges 1.00R, which is ABOVE both ceilings: it bills every candidate more than the worst contract the scanner is even allowed to admit.',
+      },
+
+      // (4) Why deliverable D's slippage ledger could never have supplied the number.
+      // `option-cost-gate.ts` names the D ledger as "the real source" for the spread
+      // cross — but the demo book prices fills at `mark × (1 + demoSlippagePct)` and
+      // `demoSlippagePct` DEFAULTS TO 0, so `entrySlippageUsd = (premiumPaid − mark)`
+      // is identically 0 on every demo fill. The ledger is structurally incapable of
+      // measuring a non-zero cost under the shipped defaults, which is precisely why
+      // the cross was still unmeasured when it became load-bearing. It also means the
+      // demo book's realized R is a MID-TO-MID number that pays no spread at all.
+      demoCostModel: {
+        demoSlippagePct: DEFAULT_ACCOUNT_SETTINGS.demoSlippagePct ?? 0,
+        demoFeePerContract: DEFAULT_ACCOUNT_SETTINGS.demoFeePerContract ?? 0,
+        slippageLedgerCanMeasureSpread: (DEFAULT_ACCOUNT_SETTINGS.demoSlippagePct ?? 0) > 0,
+        note:
+          'Demo fills book at mark × (1 + demoSlippagePct); the default is 0, so demo pays NO spread and NO commission. TRA-1600 deliverable D\'s entrySlippageUsd is therefore identically 0 on demo rows — it cannot supply the measured cross the cost gate defers to. Measuring the QUOTE (this probe) is the only route. Corollary: demo realized R is gross of spread, so any bar forward-validated on demo P&L (TRA-1647) is validated on a book that incurs no cost.',
+      },
+
+      rBasis:
+        'R = entryMark − stopPrice = 0.25 · entryMark (both option sites stop at mark·0.75). NOTE the journal\'s own `realizedR` divides by `atRiskUsd` = the FULL premium, a 4× different unit — `avgSpreadCrossRPremiumBasis` is given per structure so the two are never silently mixed.',
     });
   });
 

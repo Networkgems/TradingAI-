@@ -163,6 +163,15 @@ export interface OtmMispricingSignal extends TradeSignal {
   mispricingPct: number;
   /** Sign-adjusted Black-Scholes delta from the scanner. */
   delta: number;
+  /**
+   * TRA-1656 (TRA-1602B) — the fill-time two-sided quote `mark` was derived from
+   * (`mark = (bid + ask) / 2`). Carried through so the trade journal can retain it
+   * and the option spread cross can be MEASURED — `(ask − bid) / (0.25 · mark)` —
+   * instead of resting on the cost gate's unmeasured 1.00R input. Optional so a
+   * signal built without a chain quote folds back unmeasured.
+   */
+  bid?: number;
+  ask?: number;
 }
 
 /**
@@ -204,6 +213,13 @@ export interface RelativeValueSignal extends TradeSignal {
    * unambiguously, not blended with the separate vol-mispricing book.
    */
   sleeve?: 'directional';
+  /**
+   * TRA-1656 (TRA-1602B) — the fill-time two-sided quote `mark` was derived from.
+   * See {@link OtmMispricingSignal.bid}: retained on the journal row so the option
+   * spread cross is measured rather than modeled.
+   */
+  bid?: number;
+  ask?: number;
 }
 
 /**
