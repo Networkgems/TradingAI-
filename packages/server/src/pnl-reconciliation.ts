@@ -35,6 +35,33 @@ export const PNL_RECONCILIATION_CAVEATS = [
 /** Penny tolerance — a drift at or below this is treated as clean (rounding). */
 export const PNL_RECONCILE_TOLERANCE_USD = 0.01;
 
+/**
+ * TRA-1636 — default reconciliation baseline (inclusive ET `YYYY-MM-DD`). The
+ * TRA-1633 P&L fix shipped `634261c` on 2026-07-12; snapshots from before that
+ * ET day were written by the buggy code (stale repeated stock marks, all-time
+ * cumulative leaking into a day cell) and can never reconcile. Days on/after the
+ * baseline are the ones the fixed code produced. Override with the
+ * `PNL_RECONCILE_BASELINE_DATE` env var; set it to `none`/empty to evaluate all
+ * history (the pre-TRA-1636 behaviour).
+ */
+export const PNL_RECONCILE_DEFAULT_BASELINE_DATE = '2026-07-12';
+
+/**
+ * Resolve the active reconciliation baseline from the environment, falling back
+ * to {@link PNL_RECONCILE_DEFAULT_BASELINE_DATE}. Returns null (evaluate every
+ * day) when the override is explicitly cleared to `none`/`off`/`all`/empty or an
+ * unparseable value. Pure of side effects — callers pass `process.env`.
+ */
+export function resolvePnlBaselineDate(
+  env: Record<string, string | undefined> = {},
+): string | null {
+  const raw = env.PNL_RECONCILE_BASELINE_DATE;
+  if (raw == null) return PNL_RECONCILE_DEFAULT_BASELINE_DATE;
+  const v = raw.trim().toLowerCase();
+  if (v === '' || v === 'none' || v === 'off' || v === 'all' || v === '0') return null;
+  return /^\d{4}-\d{2}-\d{2}$/.test(raw.trim()) ? raw.trim() : PNL_RECONCILE_DEFAULT_BASELINE_DATE;
+}
+
 export interface PnlReconcileDay {
   date: string;
   /** EOD report `combinedPnl` for the day (null when no report file exists). */
@@ -45,15 +72,29 @@ export interface PnlReconcileDay {
   optionsDaily: number;
   /** eodCombined − (stockDaily + optionsDaily); 0 when no EOD file to compare. */
   drift: number;
+  /**
+   * TRA-1636 — true when `date` predates the reconciliation baseline, i.e. the
+   * snapshot was written by pre-fix (buggy) code. The row is still returned for
+   * transparency but its drift never affects `ok` / `offendingDates` / maxDrift.
+   */
+  belowBaseline: boolean;
 }
 
 export interface PnlReconcileResult {
   ok: boolean;
   days: PnlReconcileDay[];
   maxDriftUsd: number;
-  /** Dates whose |drift| exceeds the tolerance. */
+  /** Dates whose |drift| exceeds the tolerance (baseline-eligible days only). */
   offendingDates: string[];
   caveats: string[];
+  /**
+   * TRA-1636 — the baseline cutoff applied (inclusive ET day, `YYYY-MM-DD`), or
+   * null when no baseline was set (every day is evaluated). Days before this are
+   * reported but excluded from the pass/fail verdict.
+   */
+  baselineDate: string | null;
+  /** Count of rows skipped because they predate `baselineDate`. */
+  belowBaselineCount: number;
 }
 
 /**
@@ -61,10 +102,18 @@ export interface PnlReconcileResult {
  * decomposition for every day that has a persisted snapshot. A snapshot with no
  * matching EOD report file contributes a row with `eodCombined: null` and a
  * `drift` of 0 (nothing to compare — absence is not a mismatch).
+ *
+ * TRA-1636 — `baselineDate` (inclusive ET `YYYY-MM-DD`) is a data-integrity
+ * cutoff: rows with `date < baselineDate` were written by the pre-fix (buggy)
+ * TRA-1633 code and would keep the guard permanently red on stale legacy drift.
+ * They are still returned (flagged `belowBaseline`) for transparency but never
+ * contribute to `ok` / `offendingDates` / `maxDriftUsd`. Pass `null` to evaluate
+ * every day (the historical behaviour).
  */
 export function reconcilePnl(
   snapshots: ReadonlyArray<DailySnapshot>,
   eodCombinedByDate: ReadonlyMap<string, number>,
+  baselineDate: string | null = null,
 ): PnlReconcileResult {
   const days: PnlReconcileDay[] = [...snapshots]
     .sort((a, b) => a.date.localeCompare(b.date))
@@ -75,13 +124,15 @@ export function reconcilePnl(
         ? round2(eodCombinedByDate.get(s.date)!)
         : null;
       const drift = eodCombined == null ? 0 : round2(eodCombined - (stockDaily + optionsDaily));
-      return { date: s.date, eodCombined, stockDaily, optionsDaily, drift };
+      const belowBaseline = baselineDate != null && s.date < baselineDate;
+      return { date: s.date, eodCombined, stockDaily, optionsDaily, drift, belowBaseline };
     });
 
-  const offendingDates = days
+  const evaluated = days.filter(d => !d.belowBaseline);
+  const offendingDates = evaluated
     .filter(d => Math.abs(d.drift) > PNL_RECONCILE_TOLERANCE_USD)
     .map(d => d.date);
-  const maxDriftUsd = days.reduce((m, d) => Math.max(m, Math.abs(d.drift)), 0);
+  const maxDriftUsd = evaluated.reduce((m, d) => Math.max(m, Math.abs(d.drift)), 0);
 
   return {
     ok: offendingDates.length === 0,
@@ -89,6 +140,8 @@ export function reconcilePnl(
     maxDriftUsd: round2(maxDriftUsd),
     offendingDates,
     caveats: PNL_RECONCILIATION_CAVEATS,
+    baselineDate,
+    belowBaselineCount: days.length - evaluated.length,
   };
 }
 

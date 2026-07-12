@@ -1,5 +1,9 @@
 import { describe, it, expect } from 'vitest';
-import { reconcilePnl } from './pnl-reconciliation.js';
+import {
+  reconcilePnl,
+  resolvePnlBaselineDate,
+  PNL_RECONCILE_DEFAULT_BASELINE_DATE,
+} from './pnl-reconciliation.js';
 import type { DailySnapshot } from './pnl-tracker.js';
 
 // TRA-1633 FIX 3 — cross-surface reconciliation guard. The identity that must
@@ -65,5 +69,62 @@ describe('reconcilePnl', () => {
     const r = reconcilePnl(snaps, eod);
     expect(r.ok).toBe(true);
     expect(r.days[0].optionsDaily).toBe(0);
+  });
+
+  // TRA-1636 — baseline cutoff: pre-fix legacy rows must not keep the guard red.
+  describe('baseline cutoff (TRA-1636)', () => {
+    it('excludes below-baseline drift from the verdict but still reports the row', () => {
+      const snaps = [snap('2026-05-18', 277.38, 0), snap('2026-07-13', -20, 0)];
+      const eod = new Map([
+        ['2026-05-18', -19_471], // legacy pre-fix leak → drift ~-19,748
+        ['2026-07-13', -20],     // clean post-fix day
+      ]);
+      const r = reconcilePnl(snaps, eod, '2026-07-12');
+      expect(r.ok).toBe(true);
+      expect(r.offendingDates).toEqual([]);
+      expect(r.maxDriftUsd).toBe(0);
+      expect(r.baselineDate).toBe('2026-07-12');
+      expect(r.belowBaselineCount).toBe(1);
+      // the dirty legacy row is still surfaced, just flagged + excluded
+      const legacy = r.days.find(d => d.date === '2026-05-18')!;
+      expect(legacy.belowBaseline).toBe(true);
+      expect(Math.abs(legacy.drift)).toBeGreaterThan(1000);
+    });
+
+    it('still flags a post-baseline day that genuinely drifts', () => {
+      const snaps = [snap('2026-05-18', 277.38, 0), snap('2026-07-13', 100, 30)];
+      const eod = new Map([['2026-05-18', -19_471], ['2026-07-13', 175]]); // +45 drift
+      const r = reconcilePnl(snaps, eod, '2026-07-12');
+      expect(r.ok).toBe(false);
+      expect(r.offendingDates).toEqual(['2026-07-13']);
+      expect(r.maxDriftUsd).toBeCloseTo(45, 2);
+    });
+
+    it('evaluates every day when baseline is null (historical behaviour)', () => {
+      const snaps = [snap('2026-05-18', 277.38, 0)];
+      const eod = new Map([['2026-05-18', -19_471]]);
+      const r = reconcilePnl(snaps, eod, null);
+      expect(r.ok).toBe(false);
+      expect(r.belowBaselineCount).toBe(0);
+      expect(r.baselineDate).toBeNull();
+      expect(r.days[0].belowBaseline).toBe(false);
+    });
+  });
+
+  describe('resolvePnlBaselineDate (TRA-1636)', () => {
+    it('defaults to the post-fix baseline when unset', () => {
+      expect(resolvePnlBaselineDate({})).toBe(PNL_RECONCILE_DEFAULT_BASELINE_DATE);
+    });
+    it('honours a valid override', () => {
+      expect(resolvePnlBaselineDate({ PNL_RECONCILE_BASELINE_DATE: '2026-08-01' })).toBe('2026-08-01');
+    });
+    it('disables the cutoff on none/off/empty', () => {
+      for (const v of ['none', 'off', 'all', '', '  ', '0']) {
+        expect(resolvePnlBaselineDate({ PNL_RECONCILE_BASELINE_DATE: v })).toBeNull();
+      }
+    });
+    it('falls back to the default on an unparseable value', () => {
+      expect(resolvePnlBaselineDate({ PNL_RECONCILE_BASELINE_DATE: 'garbage' })).toBe(PNL_RECONCILE_DEFAULT_BASELINE_DATE);
+    });
   });
 });

@@ -8,7 +8,7 @@ import { fileURLToPath } from 'url';
 import { MarketScheduler, isMarketDay, isMarketDayIso, missedTradingDays, etDateString, isMarketOpen } from './scheduler.js';
 import { createFileArchiveDateStore } from './scheduler-state.js';
 import { generateEodReport, wouldClobberSettledReport } from './reports/eod-report.js';
-import { reconcilePnl } from './pnl-reconciliation.js';
+import { reconcilePnl, resolvePnlBaselineDate } from './pnl-reconciliation.js';
 import { generateCryptoEodReport } from './reports/crypto-eod-report.js';
 import { aggregateDeskCalendar } from './reports/desk-calendar.js';
 import { excludeTestAccountRows } from './test-accounts.js';
@@ -2892,6 +2892,9 @@ app.get('/api/health/crypto-dca-canary', (_req, res) => {
 // deltas only. On a clean box `maxDriftUsd == 0`.
 app.get('/api/health/pnl-reconciliation', async (_req, res) => {
   try {
+    // TRA-1636 — only evaluate days on/after the baseline; earlier rows were
+    // written by pre-fix code (TRA-1633) and would keep the guard red forever.
+    const baselineDate = resolvePnlBaselineDate(process.env);
     const engines = await Promise.all(
       getAllUserContexts().map(async ctx => {
         const mode = stockModeKey(getSettings(ctx.username));
@@ -2906,7 +2909,7 @@ app.get('/api/health/pnl-reconciliation', async (_req, res) => {
             if (typeof report.combinedPnl === 'number') eodByDate.set(s.date, report.combinedPnl);
           } catch { /* skip unreadable report file */ }
         }
-        return { username: ctx.username, mode, ...reconcilePnl(snapshots, eodByDate) };
+        return { username: ctx.username, mode, ...reconcilePnl(snapshots, eodByDate, baselineDate) };
       }),
     );
     const maxDriftUsd = engines.reduce((m, e) => Math.max(m, e.maxDriftUsd), 0);
@@ -2914,6 +2917,7 @@ app.get('/api/health/pnl-reconciliation', async (_req, res) => {
       time: new Date().toISOString(),
       ok: engines.every(e => e.ok),
       maxDriftUsd,
+      baselineDate,
       engines,
     });
   } catch (err) {
