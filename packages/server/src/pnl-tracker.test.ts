@@ -86,3 +86,73 @@ describe('TRA-1557 — allTimePnl reconciles with the booked daily-snapshot ledg
     expect(stats.yearlyPnl).toBeCloseTo(0, 6); // 2020 rows are before this year's start
   });
 });
+
+// TRA-1633 BUG 2 — the weekly/monthly/yearly windows summed each snapshot's
+// `combinedPnl`, which was booked from the mode's ALL-TIME cumulative options
+// P&L (`optionsAccount.optionsPnl`). So every window with option activity
+// inflated vs the Calendar — the same phantom class TRA-1557 removed from
+// all-time. The fix sums day-only `dailyPnl + optionsDailyPnl` instead.
+describe('TRA-1633 — window sums use day-only options, not cumulative combinedPnl', () => {
+  let dir: string;
+  beforeEach(() => { dir = mkdtempSync(join(tmpdir(), 'pnl-tracker-b2-')); });
+  afterEach(() => { rmSync(dir, { recursive: true, force: true }); });
+
+  // A snapshot whose combinedPnl is the (buggy) cumulative-options figure but
+  // whose dailyPnl / optionsDailyPnl are the honest day-only realized values.
+  const cumSnap = (
+    date: string, dailyPnl: number, optionsDailyPnl: number, cumulativeOptions: number,
+  ): DailySnapshot => ({
+    date,
+    openingEquity: 25_000,
+    closingEquity: 25_000 + dailyPnl,
+    dailyPnl,
+    optionsPnl: cumulativeOptions,                    // all-time cumulative (the old bug source)
+    optionsDailyPnl,                                  // day-only realized (the fix)
+    combinedPnl: dailyPnl + cumulativeOptions,        // inflated — must NOT be summed
+    trades: 1,
+  });
+
+  it('weekly/monthly/yearly sum day-only realized, ignoring cumulative-options carry', () => {
+    // Two past days this year, each with growing cumulative options but small
+    // day-only options. Dates fixed early-year so they fall in the yearly window.
+    const now = new Date();
+    const year = now.getFullYear();
+    // Guard: on Jan 1–3 there is no meaningful "earlier this year" window; the
+    // assertion below still holds (both sums 0) so no special-casing needed.
+    const d1 = `${year}-01-02`;
+    const d2 = `${year}-01-03`;
+
+    const t = new PnlTracker(dir, 25_000);
+    // Persist directly via saveSnapshot so the rows land on disk + in memory.
+    t.saveSnapshot(cumSnap(d1, 100, 20, 500));   // day-only 120, cumulative carries 500
+    t.saveSnapshot(cumSnap(d2, -30, 5, 800));    // day-only −25, cumulative carries 800
+
+    const today = new Date().toLocaleDateString('en-CA', { timeZone: 'America/New_York' });
+    const inYear = [d1, d2].filter(d => d < today && d >= `${year}-01-01`);
+    const expectedDayOnly = inYear.reduce((acc, d) =>
+      acc + (d === d1 ? 120 : -25), 0);
+
+    const stats = t.getCumulativeStats(24_970);
+    // Yearly window = Σ day-only (120 − 25 = 95 when both rows are past-today),
+    // NEVER the cumulative-inflated combinedPnl (which would be 100+500 + −30+800
+    // = 1370).
+    expect(stats.yearlyPnl).toBeCloseTo(expectedDayOnly, 6);
+    expect(stats.yearlyPnl).not.toBeCloseTo(1_370, 3);
+  });
+
+  it('treats a legacy snapshot with no optionsDailyPnl as stock-only (no phantom)', () => {
+    const year = new Date().getFullYear();
+    const d = `${year}-01-02`;
+    // Legacy row: no optionsDailyPnl field, combinedPnl carries cumulative options.
+    const legacy: DailySnapshot = {
+      date: d, openingEquity: 25_000, closingEquity: 25_100,
+      dailyPnl: 100, optionsPnl: 900, combinedPnl: 1_000, trades: 1,
+    };
+    const t = new PnlTracker(dir, 25_000);
+    t.saveSnapshot(legacy);
+
+    const today = new Date().toLocaleDateString('en-CA', { timeZone: 'America/New_York' });
+    const expected = d < today ? 100 : 0; // stock-only 100, not the 1,000 combined
+    expect(t.getCumulativeStats(25_100).yearlyPnl).toBeCloseTo(expected, 6);
+  });
+});

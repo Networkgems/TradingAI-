@@ -353,6 +353,67 @@ describe('generateEodReport', () => {
     expect(report.markdown).toContain('Sharpe');
   });
 
+  // TRA-1633 BUG 1 (AC-1) — the Trade Log Exit column must show the ACTUAL fill
+  // (`pos.exitPrice`), not the take-profit / stop TARGET. The SPCE-style case:
+  // a long that booked a LOSS must show an exit BELOW entry, and the row must
+  // reconcile with its own P&L / R:R.
+  it('shows the stored fill as Exit, not the target, for a booked-loss long', () => {
+    const today = new Date().toLocaleDateString('en-CA', { timeZone: 'America/New_York' });
+    const todayTs = new Date(`${today}T15:00:00`).getTime();
+
+    // SPCE-shaped: long, entry 3.93, take-profit 10.39, but the real fill exited
+    // at 2.66 (below entry) for a −$464.59 loss on 367 shares.
+    const spce = makePosition({
+      id: 'spce', symbol: 'SPCE', side: 'buy',
+      entryPrice: 3.93, takeProfit: 10.39, stopLoss: 2.66,
+      exitPrice: 2.6537, quantity: 367, pnl: -464.59,
+      openedAt: todayTs - 3600_000, closedAt: todayTs,
+    });
+
+    const report = generateEodReport({
+      state: makeEngineState(),
+      allClosedPositions: [spce],
+      dailySignals: [],
+      signalTypeMap: new Map([['spce', 'relative_value' as const]]),
+    });
+
+    const row = report.trades.find(t => t.id === 'spce')!;
+    expect(row.exitPrice).toBeCloseTo(2.6537, 4);   // the fill, NOT 10.39 target
+    expect(row.exitPrice).toBeLessThan(row.entryPrice); // below entry for a loss long
+    expect(row.pnl).toBeCloseTo(-464.59, 2);        // row reconciles with its P&L
+  });
+
+  // TRA-1633 BUG 1 — legacy fallback: a closed position with no stored fill
+  // still falls back to the target so old rows keep rendering.
+  it('falls back to the target Exit when no fill was stored (legacy rows)', () => {
+    const today = new Date().toLocaleDateString('en-CA', { timeZone: 'America/New_York' });
+    const todayTs = new Date(`${today}T15:00:00`).getTime();
+    const legacy = makePosition({
+      id: 'legacy', side: 'buy', entryPrice: 100, takeProfit: 104, stopLoss: 98,
+      quantity: 10, pnl: 40, openedAt: todayTs - 3600_000, closedAt: todayTs,
+      // no exitPrice
+    });
+    const report = generateEodReport({
+      state: makeEngineState(),
+      allClosedPositions: [legacy],
+      dailySignals: [],
+      signalTypeMap: new Map(),
+    });
+    expect(report.trades.find(t => t.id === 'legacy')!.exitPrice).toBe(104);
+  });
+
+  // TRA-1633 FIX 3 — leg-coverage note in the EOD markdown header.
+  it('emits the leg-coverage note in the report header', () => {
+    const report = generateEodReport({
+      state: makeEngineState(),
+      allClosedPositions: [],
+      dailySignals: [],
+      signalTypeMap: new Map(),
+    });
+    expect(report.markdown).toContain('Leg coverage (TRA-1633)');
+    expect(report.markdown).toContain('PnL tracker `dailyPnl` = stock-only');
+  });
+
   it('calculates unrealized P&L from open positions vs current prices', () => {
     const openPos = makePosition({
       id: 'open-pos',

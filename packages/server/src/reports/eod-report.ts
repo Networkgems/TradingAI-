@@ -24,6 +24,7 @@ import {
   buildRatificationQueueMarkdown,
   type HypothesisQueueHealth,
 } from '../ratification-bridge.js';
+import { PNL_LEG_COVERAGE_NOTE } from '../pnl-reconciliation.js';
 
 /** Signals fired today, keyed by signal id */
 export interface DailySignalRecord {
@@ -148,7 +149,15 @@ function computeTradeSharpe(rs: ReadonlyArray<number>): number {
 }
 
 function toTradeEntry(pos: Position, signalType: SignalType): EodTradeEntry {
-  const exitPrice = pos.side === 'buy' ? pos.takeProfit : pos.stopLoss;
+  // TRA-1633 BUG 1 — the displayed Exit must be the ACTUAL fill (`pos.exitPrice`,
+  // stamped on close in paper-account.ts / crypto-account.ts and the number that
+  // drives `pos.pnl`), NOT the take-profit / stop TARGET. Previously every row
+  // that didn't exit exactly at target was internally inconsistent — e.g. SPCE
+  // (report 2026-07-06) showed a long entry $3.93 → exit $10.39 yet a −$464.59
+  // P&L, because "$10.39" was the take-profit target, never the real exit.
+  // Target is kept only as a legacy fallback for old positions closed before the
+  // fill was persisted (`pos.exitPrice` absent).
+  const targetExit = pos.side === 'buy' ? pos.takeProfit : pos.stopLoss;
   const rr = calcRR(pos);
   return {
     id: pos.id,
@@ -156,7 +165,7 @@ function toTradeEntry(pos: Position, signalType: SignalType): EodTradeEntry {
     strategy: strategyLabel(signalType),
     side: pos.side,
     entryPrice: pos.entryPrice,
-    exitPrice: pos.closedAt ? exitPrice : pos.entryPrice,
+    exitPrice: pos.closedAt ? (pos.exitPrice ?? targetExit) : pos.entryPrice,
     quantity: pos.quantity,
     pnl: pos.pnl ?? 0,
     rr,
@@ -535,6 +544,8 @@ function buildMarkdown(
   ).join('\n');
 
   return `# Daily EOD Report — ${date}
+
+${PNL_LEG_COVERAGE_NOTE}
 
 ## P&L Summary
 | Metric | Value |

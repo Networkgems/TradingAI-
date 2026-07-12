@@ -8,6 +8,7 @@ import { fileURLToPath } from 'url';
 import { MarketScheduler, isMarketDay, isMarketDayIso, missedTradingDays, etDateString, isMarketOpen } from './scheduler.js';
 import { createFileArchiveDateStore } from './scheduler-state.js';
 import { generateEodReport, wouldClobberSettledReport } from './reports/eod-report.js';
+import { reconcilePnl } from './pnl-reconciliation.js';
 import { generateCryptoEodReport } from './reports/crypto-eod-report.js';
 import { aggregateDeskCalendar } from './reports/desk-calendar.js';
 import {
@@ -1093,6 +1094,11 @@ async function generateAndSaveReport(
       closingEquity: equitySnap.equity,
       dailyPnl: equitySnap.equity - ctx.tracker.getOpeningEquity(),
       optionsPnl: equitySnap.optionsPnl,
+      // TRA-1633 BUG 2 — persist the DAY-ONLY realized options figure (the same
+      // `finalReport.optionsPnl` the calendar cell uses = Σ options closed this
+      // ET day) so the weekly/monthly/yearly windows sum day-only, not the
+      // cumulative `equitySnap.optionsPnl` that inflated them.
+      optionsDailyPnl: finalReport.optionsPnl,
       combinedPnl: (equitySnap.equity - ctx.tracker.getOpeningEquity()) + equitySnap.optionsPnl,
       trades: finalSnapshot.allClosedPositions.length,
     });
@@ -1923,6 +1929,7 @@ async function generateAndSaveCryptoReport(ctx: UserContext): Promise<void> {
       closingEquity,
       dailyPnl: closingEquity - openingEquity,
       optionsPnl: 0,
+      optionsDailyPnl: 0, // TRA-1633 — crypto book has no options leg
       combinedPnl: closingEquity - openingEquity,
       trades: snapshot.allClosedPositions.length,
     });
@@ -2865,6 +2872,49 @@ app.get('/api/health/crypto-dca-canary', (_req, res) => {
       ...ctx.cryptoEngine.getCryptoDcaCanaryAcceptance(),
     })),
   });
+});
+
+// TRA-1633 FIX 3 — cross-surface P&L reconciliation guard (parent TRA-1597).
+// Per ET day, checks the one identity that MUST hold across the four surfaces:
+//   EOD.combinedPnl == stock dailyPnl (realized) + day-only options realized
+// and flags any |drift| > $0.01 with the offending date(s). The stock dailyPnl
+// and day-only options come from the persisted daily snapshots (the same ledger
+// the Calendar/cumulative windows read after this ticket's BUG 2 fix); the EOD
+// combined is read off the settled per-day report files. Public health probe,
+// matching /api/health/option-journal — demo book, no capital, redacted to P&L
+// deltas only. On a clean box `maxDriftUsd == 0`.
+app.get('/api/health/pnl-reconciliation', async (_req, res) => {
+  try {
+    const engines = await Promise.all(
+      getAllUserContexts().map(async ctx => {
+        const mode = stockModeKey(getSettings(ctx.username));
+        const dir = stockReportsDirFor(ctx, mode);
+        const snapshots = ctx.tracker.getSnapshots();
+        const eodByDate = new Map<string, number>();
+        for (const s of snapshots) {
+          const filePath = join(dir, `${s.date}.json`);
+          if (!existsSync(filePath)) continue;
+          try {
+            const report = JSON.parse(await readFile(filePath, 'utf-8')) as { combinedPnl?: number };
+            if (typeof report.combinedPnl === 'number') eodByDate.set(s.date, report.combinedPnl);
+          } catch { /* skip unreadable report file */ }
+        }
+        return { username: ctx.username, mode, ...reconcilePnl(snapshots, eodByDate) };
+      }),
+    );
+    const maxDriftUsd = engines.reduce((m, e) => Math.max(m, e.maxDriftUsd), 0);
+    res.json({
+      time: new Date().toISOString(),
+      ok: engines.every(e => e.ok),
+      maxDriftUsd,
+      engines,
+    });
+  } catch (err) {
+    log.warn('pnl-reconciliation probe failed', {
+      reason: err instanceof Error ? err.message : String(err),
+    });
+    res.status(500).json({ error: 'Failed to build P&L reconciliation' });
+  }
 });
 
 // TRA-406 — observability surface. Returns the recent in-memory alerts and the

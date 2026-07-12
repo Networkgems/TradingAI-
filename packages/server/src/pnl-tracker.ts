@@ -8,6 +8,18 @@ export interface DailySnapshot {
   dailyPnl: number;
   optionsPnl: number;
   combinedPnl: number;
+  /**
+   * TRA-1633 BUG 2 — the options P&L REALIZED on this ET day only (Σ options
+   * closed that day, same basis as EOD report `optionsPnl`). Distinct from
+   * `optionsPnl`, which was booked from the mode's ALL-TIME cumulative
+   * `optionsAccount.optionsPnl` and therefore inflated every weekly/monthly/
+   * yearly window that summed `combinedPnl`. The window sums now use
+   * `dailyPnl + optionsDailyPnl` so no cumulative-options carry leaks in —
+   * mirroring the TRA-1557 fix already applied to `allTimePnl`. Optional for
+   * back-compat with snapshots persisted before this field existed (treated as
+   * 0, so an old row contributes stock-only to the windows, never a phantom).
+   */
+  optionsDailyPnl?: number;
   trades: number;
 }
 
@@ -162,8 +174,18 @@ export class PnlTracker {
     const yearStart = `${now.getFullYear()}-01-01`;
 
     const past = this.snapshots.filter(s => s.date < today);
+    // TRA-1633 BUG 2 — sum DAY-ONLY realized (stock `dailyPnl` + day-only
+    // `optionsDailyPnl`) over each window, NOT the per-snapshot `combinedPnl`.
+    // `combinedPnl` carried the mode's ALL-TIME cumulative options total
+    // (`optionsPnl` booked from `optionsAccount.optionsPnl` at index.ts), so the
+    // weekly/monthly/yearly windows re-added the running options total on every
+    // day with option activity — the same phantom class TRA-1557 removed from
+    // `allTimePnl`. `optionsDailyPnl` is absent on legacy rows (→ 0), so they
+    // contribute stock-only rather than a phantom.
     const sum = (from: string) =>
-      past.filter(s => s.date >= from).reduce((acc, s) => acc + s.combinedPnl, 0);
+      past
+        .filter(s => s.date >= from)
+        .reduce((acc, s) => acc + s.dailyPnl + (s.optionsDailyPnl ?? 0), 0);
 
     const peakEquity = Math.max(
       this.initialEquity,
