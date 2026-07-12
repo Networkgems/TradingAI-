@@ -1468,15 +1468,18 @@ describe('isOccOptionSymbol (TRA-1305 — options hard-exclude, checklist item 4
   });
 });
 
-describe('liveEquityDcaAddEnvAllowed (TRA-1439 — sandbox-first hard gate)', () => {
+describe('liveEquityDcaAddEnvAllowed (TRA-1439 — sandbox-first gate; TRA-971 production opened)', () => {
   it('permits the live conviction-DCA add path on the SANDBOX env (zero real capital)', () => {
     expect(liveEquityDcaAddEnvAllowed('sandbox')).toBe(true);
   });
-  it('refuses the add path on a PRODUCTION env until the gate opens (TRA-382 + CFO soak TRA-1393)', () => {
-    // Belt-and-suspenders: production live-equity is separately OFF and the arm
-    // flag defaults false, but this guarantees flipping `liveEquityDcaAddsTradier`
-    // alone can NEVER reach a production broker submission from the add path.
-    expect(liveEquityDcaAddEnvAllowed('production')).toBe(false);
+  it('permits the add path on a PRODUCTION env now the board-ratified gate is OPEN (TRA-971/TRA-1597)', () => {
+    // Gate opened 07-11: demo evidence 456/0, QT live-$ nod, board approval
+    // `a1acc1a3` (dca-971-live). Named conditions satisfied — CFO soak TRA-1393
+    // `done`, TRA-382 data gate MET 38/30. The ENV layer now allows production;
+    // the belt-and-suspenders is preserved one level down — actual live
+    // submission still requires the independent `liveEquityDcaAddsTradier` arm on
+    // the LIVE AccountSettings, so opening this env gate alone moves no capital.
+    expect(liveEquityDcaAddEnvAllowed('production')).toBe(true);
   });
 });
 
