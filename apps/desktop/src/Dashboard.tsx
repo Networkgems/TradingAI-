@@ -235,14 +235,13 @@ export default function Dashboard({ token, onLogout, onGoHome, onActivity, theme
           <CalendarTab
             token={token}
             httpUrl={HTTP_URL}
+            // TRA-1604 — gate the firm-wide Desk calendar to admin accounts.
             isAdmin={isAdmin}
             mode={
               accountMode === 'demo'
                 ? 'demo'
                 : tradierEnv === 'production' ? 'live' : 'sandbox'
             }
-            // TRA-1604 — gate the firm-wide Desk calendar to admin accounts.
-            isAdmin={isAdmin}
           />
         )}
 
