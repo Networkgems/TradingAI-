@@ -10,9 +10,11 @@ import {
   recordPcrObservation,
   listPcrShadowSignals,
   usableSignalCount,
+  pcrSampleSufficiency,
   isPcrShadowEnabled,
   PCR_SHADOW_FLAG,
   type PcrTrioVerdict,
+  type PcrShadowRecord,
 } from './pcr-shadow-ledger.js';
 
 // A mid-RTH ET timestamp for a given day offset (days from 2026-06-16).
@@ -45,6 +47,12 @@ function pcrWith(pcrVolume: number): PutCallRatio {
   const putVol = Math.round(pcrVolume * callVol);
   return computePutCallRatio([row('put', 100, putVol), row('call', 105, callVol)]);
 }
+
+// A 10-session history alternating 0.5/1.5: mean 1.0, SAMPLE σ = sqrt(2.5/9).
+// 10 is the z floor (PCR_Z_MIN_SAMPLES) and n-1 is the Bessel correction — both
+// are the TRA-1663 fix, so the fixtures are shared by every z assertion below.
+const ALT = [0.5, 1.5, 0.5, 1.5, 0.5, 1.5, 0.5, 1.5, 0.5, 1.5];
+const SAMPLE_SD = Math.sqrt(2.5 / 9);
 
 const trio: PcrTrioVerdict = {
   side: 'call',
@@ -142,34 +150,57 @@ describe('recordPcrObservation', () => {
   });
 
   it('computes the z-score from prior sessions once enough history exists', async () => {
-    // Seed 4 prior sessions with pcrVolume {0.5, 1.5, 0.5, 1.5}: mean 1.0, σ 0.5.
-    const seeds = [0.5, 1.5, 0.5, 1.5];
-    for (let i = 0; i < seeds.length; i++) {
+    // 10 prior sessions alternating {0.5, 1.5}: mean 1.0, SAMPLE σ = sqrt(2.5/9).
+    for (let i = 0; i < 10; i++) {
       await recordPcrObservation({
         underlying: 'SPY',
         asof: etTs(i),
-        pcr: pcrWith(seeds[i]),
+        pcr: pcrWith(ALT[i]),
         trio,
       });
     }
-    // New session with pcrVolume 1.5 → z = (1.5 - 1.0)/0.5 = 1.0.
     const res = await recordPcrObservation({
       underlying: 'SPY',
-      asof: etTs(seeds.length),
+      asof: etTs(10),
       pcr: pcrWith(1.5),
       trio,
     });
-    expect(res.record!.pcrZ).toBeCloseTo(1.0, 6);
+    expect(res.record!.pcrZ).toBeCloseTo(0.5 / SAMPLE_SD, 6);
+  });
+
+  // TRA-1663 regression. The old minSamples=2 emitted a z from session 3 onward,
+  // off a 2-point POPULATION σ — biased low, so |z| came out biased high and the
+  // opening sessions of an append-only ledger manufactured extreme-|z| rows in
+  // exactly the buckets the TRA-532 promotion bar reads as edge.
+  it('emits pcrZ: null through the immature window, then a z at 10 trailing sessions', async () => {
+    const z: (number | null)[] = [];
+    for (let i = 0; i < 11; i++) {
+      const res = await recordPcrObservation({
+        underlying: 'SPY',
+        asof: etTs(i),
+        pcr: pcrWith(ALT[i % ALT.length]),
+        trio,
+      });
+      z.push(res.record!.pcrZ);
+    }
+    // Rows 0..9 see 0..9 trailing sessions — all below the floor.
+    expect(z.slice(0, 10)).toEqual(Array(10).fill(null));
+    // Row 10 is the first with 10 trailing sessions.
+    expect(z[10]).not.toBeNull();
+    // Rows still accrued while their z was null — usableSignalCount counts the
+    // ratio, not the z, so the floor costs the promotion window nothing.
+    expect(usableSignalCount(await listPcrShadowSignals())).toBe(11);
   });
 
   it('keeps per-underlying history separate for the z-score', async () => {
-    // SPY history is flat at 0.8; QQQ gets its own first observation → null z.
-    for (let i = 0; i < 3; i++) {
-      await recordPcrObservation({ underlying: 'SPY', asof: etTs(i), pcr: pcrWith(0.8), trio });
+    // SPY accrues a full mature window; QQQ's first observation still has no
+    // history of its own → null z (history must not pool across names).
+    for (let i = 0; i < 10; i++) {
+      await recordPcrObservation({ underlying: 'SPY', asof: etTs(i), pcr: pcrWith(ALT[i]), trio });
     }
     const qqq = await recordPcrObservation({
       underlying: 'QQQ',
-      asof: etTs(3),
+      asof: etTs(10),
       pcr: pcrWith(1.2),
       trio,
     });
@@ -193,21 +224,30 @@ describe('recordPcrObservation', () => {
   });
 
   it('an illiquid session does not leave a hole in the z basis', async () => {
-    await recordPcrObservation({ underlying: 'SPY', asof: etTs(0), pcr: pcrWith(0.5), trio });
-    await recordPcrObservation({ underlying: 'SPY', asof: etTs(1), pcr: pcrWith(1.5), trio });
-    // Illiquid session in the middle — contributes no pcrVolume.
+    // 10 usable sessions with an illiquid one wedged in the middle. The illiquid
+    // row carries no pcrVolume, so it is skipped by the z basis rather than
+    // counted as a session — the 10 usable priors still make a mature window.
     const illiquid = computePutCallRatio([row('put', 100, 50), row('call', 105, 50)]);
-    await recordPcrObservation({ underlying: 'SPY', asof: etTs(2), pcr: illiquid, trio });
-    await recordPcrObservation({ underlying: 'SPY', asof: etTs(3), pcr: pcrWith(0.5), trio });
-    await recordPcrObservation({ underlying: 'SPY', asof: etTs(4), pcr: pcrWith(1.5), trio });
-    // History for a new obs = {0.5, 1.5, 0.5, 1.5} (illiquid skipped): mean 1.0, σ 0.5.
+    for (let i = 0; i < 5; i++) {
+      await recordPcrObservation({ underlying: 'SPY', asof: etTs(i), pcr: pcrWith(ALT[i]), trio });
+    }
+    await recordPcrObservation({ underlying: 'SPY', asof: etTs(5), pcr: illiquid, trio });
+    for (let i = 5; i < 10; i++) {
+      await recordPcrObservation({
+        underlying: 'SPY',
+        asof: etTs(i + 1),
+        pcr: pcrWith(ALT[i]),
+        trio,
+      });
+    }
+    // History = the 10 usable priors (illiquid skipped): mean 1.0, sample σ.
     const res = await recordPcrObservation({
       underlying: 'SPY',
-      asof: etTs(5),
+      asof: etTs(11),
       pcr: pcrWith(1.5),
       trio,
     });
-    expect(res.record!.pcrZ).toBeCloseTo(1.0, 6);
+    expect(res.record!.pcrZ).toBeCloseTo(0.5 / SAMPLE_SD, 6);
   });
 
   it('survives a reload from the append-only file', async () => {
@@ -228,5 +268,105 @@ describe('usableSignalCount', () => {
     const illiquid = computePutCallRatio([row('put', 100, 50), row('call', 105, 50)]);
     await recordPcrObservation({ underlying: 'QQQ', asof: etTs(0), pcr: illiquid, trio: null });
     expect(usableSignalCount(await listPcrShadowSignals())).toBe(1);
+  });
+});
+
+// TRA-1663 — the promotion bar is four legs, not a row count.
+describe('pcrSampleSufficiency', () => {
+  // `names` underlyings x `sessions` ET sessions, one usable row each.
+  function grid(names: number, sessions: number): PcrShadowRecord[] {
+    const out: PcrShadowRecord[] = [];
+    for (let s = 0; s < sessions; s++) {
+      for (let u = 0; u < names; u++) {
+        out.push({
+          id: `N${u}:S${s}`,
+          session: `2026-06-${String(s + 1).padStart(2, '0')}`,
+          underlying: `N${u}`,
+          asof: etTs(s),
+          pcrVolume: 1.0,
+          pcrOi: 1.0,
+          pcrZ: null,
+          pcrRegime: 'neutral',
+          contrarian: null,
+          expiriesUsed: ['2026-08-21'],
+          putVolume: 1000,
+          callVolume: 1000,
+          aggregateVolume: 2000,
+          insufficientLiquidity: false,
+          reason: null,
+          trio,
+        });
+      }
+    }
+    return out;
+  }
+
+  it('fails closed on an empty ledger — 0 rows must not vacuously clear the concentration leg', () => {
+    const s = pcrSampleSufficiency([]);
+    expect(s.promotionReady).toBe(false);
+    expect(s.legs.nameConcentration).toBe(false);
+    expect(s.shortfall).toContain('no usable rows');
+  });
+
+  // The defect that made the old row-count bar wrong: 25 names x 9 sessions is
+  // 225 rows -> the old `usableCount >= 200` fired here, ~11 sessions short of
+  // the real bar, and the handoff it triggered would have bounced straight back.
+  it('is NOT ready at 225 rows spanning only 9 sessions', () => {
+    const s = pcrSampleSufficiency(grid(25, 9));
+    expect(s.usableCount).toBe(225);
+    expect(s.legs.usableCount).toBe(true); // the old bar's sole leg — passes
+    expect(s.sessionCount).toBe(9);
+    expect(s.legs.sessionCount).toBe(false); // the leg it never checked
+    expect(s.promotionReady).toBe(false);
+    expect(s.shortfall).toContain('sessionCount 9 < 20');
+  });
+
+  it('is ready at 25 names x 20 sessions — all four legs hold', () => {
+    const s = pcrSampleSufficiency(grid(25, 20));
+    expect(s).toMatchObject({
+      usableCount: 500,
+      sessionCount: 20,
+      underlyingCount: 25,
+      promotionReady: true,
+      shortfall: [],
+    });
+    expect(s.maxNameSharePct).toBeCloseTo(4, 6);
+  });
+
+  it('fails a sample dominated by one name even when every other leg holds', () => {
+    // 4 names x 20 sessions clears count/sessions, but only 4 underlyings and
+    // each holds 25% -> the underlying-count leg is what catches it.
+    const s = pcrSampleSufficiency(grid(4, 20));
+    expect(s.legs.usableCount).toBe(false); // 80 rows
+    expect(s.legs.underlyingCount).toBe(false);
+    expect(s.promotionReady).toBe(false);
+
+    // Now the concentration leg specifically: 5 names, 20 sessions, but one name
+    // carries 200 extra rows -> 50% share.
+    const skewed = [
+      ...grid(5, 20),
+      ...Array.from({ length: 200 }, (_, i) => ({
+        ...grid(1, 1)[0],
+        id: `N0:X${i}`,
+        underlying: 'N0',
+      })),
+    ];
+    const t = pcrSampleSufficiency(skewed);
+    expect(t.underlyingCount).toBe(5);
+    expect(t.sessionCount).toBe(20);
+    expect(t.usableCount).toBe(300); // 100 from the grid + 200 piled onto N0
+    expect(t.maxNameSharePct).toBeCloseTo(100 * (220 / 300), 6); // N0: 20 + 200
+    expect(t.legs.nameConcentration).toBe(false);
+    expect(t.promotionReady).toBe(false);
+  });
+
+  it('grades on USABLE rows only — illiquid rows inflate no leg', async () => {
+    const illiquid = computePutCallRatio([row('put', 100, 50), row('call', 105, 50)]);
+    await recordPcrObservation({ underlying: 'SPY', asof: etTs(0), pcr: pcrWith(0.8), trio });
+    await recordPcrObservation({ underlying: 'QQQ', asof: etTs(0), pcr: illiquid, trio: null });
+    const s = pcrSampleSufficiency(await listPcrShadowSignals());
+    expect(s.usableCount).toBe(1);
+    expect(s.underlyingCount).toBe(1); // QQQ's nulled row contributes nothing
+    expect(s.promotionReady).toBe(false);
   });
 });

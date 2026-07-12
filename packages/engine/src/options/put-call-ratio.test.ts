@@ -4,6 +4,7 @@ import {
   pcrRegime,
   pcrZScore,
   PCR_DEFAULTS,
+  PCR_Z_MIN_SAMPLES,
 } from './put-call-ratio.js';
 import type { OptionChainRow } from './otm-mispricing.js';
 
@@ -148,24 +149,59 @@ describe('pcrRegime', () => {
 });
 
 describe('pcrZScore', () => {
+  // A 10-sample history alternating 0.5/1.5: mean 1.0, sample σ (n-1) =
+  // sqrt(2.5/9) = 0.5270. Population σ would be 0.5 — the old, biased-low basis.
+  const TEN = [0.5, 1.5, 0.5, 1.5, 0.5, 1.5, 0.5, 1.5, 0.5, 1.5];
+  const SAMPLE_SD = Math.sqrt(2.5 / 9);
+
   it('returns null below the minimum sample size', () => {
     expect(pcrZScore(1.0, [])).toBeNull();
     expect(pcrZScore(1.0, [0.9])).toBeNull();
   });
-  it('returns null for a degenerate (zero-σ) sample', () => {
-    expect(pcrZScore(1.0, [0.8, 0.8, 0.8])).toBeNull();
+
+  // TRA-1663 — the defect this floor exists to kill. At n=2 the old default
+  // emitted a z off a 2-point population σ; both of these used to return a
+  // number, and the extremes they manufactured are what a promotion bar that
+  // hunts extreme-|z| buckets would have read as edge.
+  it('emits NO z until PCR_Z_MIN_SAMPLES trailing sessions exist', () => {
+    expect(PCR_Z_MIN_SAMPLES).toBe(10);
+    expect(pcrZScore(1.5, [0.5, 1.5])).toBeNull();
+    expect(pcrZScore(1.5, TEN.slice(0, 9))).toBeNull();
+    expect(pcrZScore(1.5, TEN)).not.toBeNull();
   });
+
+  it('returns null for a degenerate (zero-σ) sample even at a full window', () => {
+    expect(pcrZScore(1.0, Array(12).fill(0.8))).toBeNull();
+  });
+
+  it('uses the SAMPLE (n-1) σ, not the population σ', () => {
+    // Population σ = 0.5 would give z = 1.0; the Bessel-corrected σ gives 0.949.
+    // The old basis overstated |z| — exactly the extreme-manufacturing bias.
+    const z = pcrZScore(1.5, TEN)!;
+    expect(z).toBeCloseTo(0.5 / SAMPLE_SD, 10);
+    expect(z).toBeLessThan(1.0);
+  });
+
   it('computes a positive z for a value above the trailing mean', () => {
-    // history mean 1.0, population σ = sqrt(0.25) = 0.5; value 1.5 → z = 1.0
-    const z = pcrZScore(1.5, [0.5, 1.5, 0.5, 1.5]);
-    expect(z).toBeCloseTo(1.0, 10);
+    expect(pcrZScore(1.5, TEN)!).toBeGreaterThan(0);
   });
+
   it('computes a negative z for a value below the trailing mean', () => {
-    const z = pcrZScore(0.5, [0.5, 1.5, 0.5, 1.5]);
-    expect(z).toBeCloseTo(-1.0, 10);
+    expect(pcrZScore(0.5, TEN)!).toBeCloseTo(-0.5 / SAMPLE_SD, 10);
   });
+
   it('ignores non-finite history entries', () => {
-    const z = pcrZScore(1.5, [0.5, Number.NaN, 1.5, 0.5, 1.5]);
-    expect(z).toBeCloseTo(1.0, 10);
+    // The NaN is dropped, so this is the same 10-sample history as TEN.
+    const z = pcrZScore(1.5, [...TEN.slice(0, 5), Number.NaN, ...TEN.slice(5)]);
+    expect(z).toBeCloseTo(0.5 / SAMPLE_SD, 10);
+  });
+
+  it('a non-finite entry can drop the sample BELOW the floor → null, not a z', () => {
+    expect(pcrZScore(1.5, [...TEN.slice(0, 9), Number.NaN])).toBeNull();
+  });
+
+  it('never divides by zero when a caller passes a floor below 2', () => {
+    expect(pcrZScore(1.5, [0.5], 1)).toBeNull();
+    expect(pcrZScore(1.5, [], 0)).toBeNull();
   });
 });

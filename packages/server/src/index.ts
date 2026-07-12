@@ -257,7 +257,17 @@ import { initIvRankStore, recordDailyIv, ivRankSync, atmIvFromRows } from './iv-
 import { initIdeaJournal, listJournalEntries } from './options-idea-journal.js';
 import { initShadowLedger, listShadowSignals } from './shadow-signal-ledger.js';
 import { initOptionShadowLedger, listOptionShadowSignals, isOptionShadowEnabled, OPTION_SHADOW_EMERGENCY_OFF } from './option-shadow-ledger.js';
-import { initPcrShadowLedger, listPcrShadowSignals, isPcrShadowEnabled, usableSignalCount, PCR_Z_WINDOW_SESSIONS } from './pcr-shadow-ledger.js';
+import {
+  initPcrShadowLedger,
+  listPcrShadowSignals,
+  isPcrShadowEnabled,
+  pcrSampleSufficiency,
+  PCR_Z_WINDOW_SESSIONS,
+  PCR_PROMOTION_MIN_USABLE,
+  PCR_PROMOTION_MIN_SESSIONS,
+  PCR_PROMOTION_MIN_UNDERLYINGS,
+  PCR_PROMOTION_MAX_NAME_SHARE_PCT,
+} from './pcr-shadow-ledger.js';
 import { initOiShadowLedger, listOiShadowSignals, isOiShadowEnabled, usableSignalCount as usableOiSignalCount } from './oi-shadow-ledger.js';
 import { initNewsCatalystLedger, listNewsCatalystSignals, isNewsCatalystEnabled, chosenSignalCount } from './news-catalyst-ledger.js';
 import { initNewsCatalystLeanLedger, listCatalystLeans, leanBreakdown } from './news-catalyst-lean-ledger.js';
@@ -4904,21 +4914,37 @@ app.get('/api/health/option-shadow-signals', async (_req, res) => {
 // TRA-1609 (parent TRA-1607) — read-only probe over the SHADOW Put-Call-Ratio
 // ledger, open like the other shadow probes so QuantTrader can pull the setup->
 // PCR dataset for the TRA-532 promotion gate without Render admin creds. Reports
-// the usable-signal count (rows carrying a non-null ratio) against the ≥200
-// promotion threshold plus the recent rows, each stamped with its paired
-// 21EMA+RSI+Vol trio verdict. Observe-only: nothing here routes an order.
+// the recent rows (each stamped with its paired 21EMA+RSI+Vol trio verdict) and
+// grades the accrual against QuantTrader's FULL four-leg sample-sufficiency bar.
+//
+// TRA-1663: `promotionReady` used to be `usableCount >= 200` — a row count. The
+// watchlist is 25 names deduped to one row per underlying per session, so that
+// crosses 200 at session ~9 while the ≥20-session leg needs session ~20; the
+// handoff it triggered would have been ~11 sessions short of the real bar. The
+// per-leg breakdown is surfaced so the gap is visible without re-deriving it.
+// Observe-only: nothing here routes an order.
 app.get('/api/health/pcr-shadow-signals', async (_req, res) => {
   try {
     const signals = await listPcrShadowSignals();
-    const usable = usableSignalCount(signals);
+    const sufficiency = pcrSampleSufficiency(signals);
     res.json({
       issue: 'TRA-1609',
       flagEnabled: isPcrShadowEnabled(),
       zWindowSessions: PCR_Z_WINDOW_SESSIONS,
-      promotionThreshold: 200,
+      promotionBar: {
+        minUsableCount: PCR_PROMOTION_MIN_USABLE,
+        minSessionCount: PCR_PROMOTION_MIN_SESSIONS,
+        minUnderlyingCount: PCR_PROMOTION_MIN_UNDERLYINGS,
+        maxNameSharePct: PCR_PROMOTION_MAX_NAME_SHARE_PCT,
+      },
       count: signals.length,
-      usableCount: usable,
-      promotionReady: usable >= 200,
+      usableCount: sufficiency.usableCount,
+      sessionCount: sufficiency.sessionCount,
+      underlyingCount: sufficiency.underlyingCount,
+      maxNameSharePct: Number(sufficiency.maxNameSharePct.toFixed(2)),
+      legs: sufficiency.legs,
+      shortfall: sufficiency.shortfall,
+      promotionReady: sufficiency.promotionReady,
       signals,
     });
   } catch (err) {

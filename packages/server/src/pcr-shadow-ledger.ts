@@ -95,7 +95,11 @@ export interface PcrShadowRecord {
   pcrVolume: number | null;
   /** Σ put OI / Σ call OI — secondary. */
   pcrOi: number | null;
-  /** z-score of `pcrVolume` vs the trailing 20-session mean/σ. null until enough history. */
+  /**
+   * z-score of `pcrVolume` vs the trailing 20-session mean/sample-σ. null until
+   * at least `PCR_Z_MIN_SAMPLES` (10) trailing sessions exist — an honest
+   * unknown beats a z we cannot trust (TRA-1663).
+   */
   pcrZ: number | null;
   /** Face-value regime bucket from `pcrVolume`. */
   pcrRegime: PcrRegime | null;
@@ -267,4 +271,102 @@ export async function listPcrShadowSignals(): Promise<PcrShadowRecord[]> {
  */
 export function usableSignalCount(records: readonly PcrShadowRecord[]): number {
   return records.filter((r) => typeof r.pcrVolume === 'number').length;
+}
+
+// TRA-1663 — QuantTrader's sample-sufficiency bar, in code rather than in a
+// comment thread. `usableSignalCount` alone is a ROW count, and the watchlist is
+// 25 names deduped to one row per underlying per session (~23-25 rows/session),
+// so it crosses 200 at session ~9 while the ≥20-SESSION leg is not met until
+// session ~20. A `promotionReady` wired to the row count therefore goes true
+// ~11 sessions before the sample is actually promotable, and the handoff it
+// triggers would have to be bounced straight back.
+//
+// The legs exist because rows are NOT iid: a market-wide fear day lifts every
+// name's PCR together, so effective N tracks the number of SESSIONS, not the
+// number of rows. All four legs must hold.
+
+/** Usable rows required (the promotion denominator). */
+export const PCR_PROMOTION_MIN_USABLE = 200;
+/** Distinct ET sessions the usable rows must span — the real effective-N leg. */
+export const PCR_PROMOTION_MIN_SESSIONS = 20;
+/** Distinct underlyings the usable rows must cover. */
+export const PCR_PROMOTION_MIN_UNDERLYINGS = 5;
+/** No single underlying may exceed this share of the usable rows. */
+export const PCR_PROMOTION_MAX_NAME_SHARE_PCT = 40;
+
+/** Each leg of the promotion bar, plus the measured value behind it. */
+export interface PcrSampleSufficiency {
+  usableCount: number;
+  /** Distinct ET sessions represented among the usable rows. */
+  sessionCount: number;
+  /** Distinct underlyings represented among the usable rows. */
+  underlyingCount: number;
+  /** Largest single-underlying share of the usable rows, in percent (0 when empty). */
+  maxNameSharePct: number;
+  legs: {
+    usableCount: boolean;
+    sessionCount: boolean;
+    underlyingCount: boolean;
+    nameConcentration: boolean;
+  };
+  /** True only when ALL FOUR legs hold. */
+  promotionReady: boolean;
+  /** Human-readable reasons the bar is not met (empty when `promotionReady`). */
+  shortfall: string[];
+}
+
+/**
+ * Grade the accrued ledger against the full four-leg promotion bar. Every leg is
+ * a POSITIVE assertion evaluated over the USABLE rows only — an empty ledger
+ * fails (it does not vacuously pass the concentration leg), so this fails closed.
+ */
+export function pcrSampleSufficiency(
+  records: readonly PcrShadowRecord[],
+): PcrSampleSufficiency {
+  const usable = records.filter((r) => typeof r.pcrVolume === 'number');
+  const usableCount = usable.length;
+
+  const sessionCount = new Set(usable.map((r) => r.session)).size;
+
+  const perName = new Map<string, number>();
+  for (const r of usable) perName.set(r.underlying, (perName.get(r.underlying) ?? 0) + 1);
+  const underlyingCount = perName.size;
+  const maxNameSharePct =
+    usableCount === 0 ? 0 : (Math.max(...perName.values()) / usableCount) * 100;
+
+  const legs = {
+    usableCount: usableCount >= PCR_PROMOTION_MIN_USABLE,
+    sessionCount: sessionCount >= PCR_PROMOTION_MIN_SESSIONS,
+    underlyingCount: underlyingCount >= PCR_PROMOTION_MIN_UNDERLYINGS,
+    // Requires rows to exist: a 0-row ledger must not satisfy "no name >40%".
+    nameConcentration: usableCount > 0 && maxNameSharePct <= PCR_PROMOTION_MAX_NAME_SHARE_PCT,
+  };
+
+  const shortfall: string[] = [];
+  if (!legs.usableCount) {
+    shortfall.push(`usableCount ${usableCount} < ${PCR_PROMOTION_MIN_USABLE}`);
+  }
+  if (!legs.sessionCount) {
+    shortfall.push(`sessionCount ${sessionCount} < ${PCR_PROMOTION_MIN_SESSIONS}`);
+  }
+  if (!legs.underlyingCount) {
+    shortfall.push(`underlyingCount ${underlyingCount} < ${PCR_PROMOTION_MIN_UNDERLYINGS}`);
+  }
+  if (!legs.nameConcentration) {
+    shortfall.push(
+      usableCount === 0
+        ? 'no usable rows'
+        : `maxNameSharePct ${maxNameSharePct.toFixed(1)} > ${PCR_PROMOTION_MAX_NAME_SHARE_PCT}`,
+    );
+  }
+
+  return {
+    usableCount,
+    sessionCount,
+    underlyingCount,
+    maxNameSharePct,
+    legs,
+    promotionReady: Object.values(legs).every(Boolean),
+    shortfall,
+  };
 }

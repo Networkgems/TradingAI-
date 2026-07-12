@@ -198,18 +198,42 @@ export function computePutCallRatio(
 }
 
 /**
- * Z-score of `value` against a trailing `history` sample (population σ). Returns
- * null when the sample is too small (< `minSamples`, default 2) or degenerate
- * (σ = 0) — the caller records `pcr_z: null` rather than a spurious 0. The
- * article stresses the *change* in PCR over its own recent range, which this
- * captures: a fresh spike in put flow reads as a large positive z even when the
- * absolute ratio looks unremarkable.
+ * Trailing sessions required before a z-score is trustworthy enough to emit.
+ *
+ * TRA-1663: this was 2. At n=2 the σ estimate is worthless AND the divisor below
+ * was the POPULATION n (σ biased low ⇒ |z| biased HIGH — ~29% high at n=2), so
+ * the first handful of sessions systematically MANUFACTURED extreme-|z| rows.
+ * The PCR shadow ledger is append-only and QuantTrader's TRA-532 promotion bar
+ * hunts for edge precisely in the extreme-|z| buckets, so a fabricated extreme
+ * early in accrual is a false-GO pathway into live sizing (the TRA-1334
+ * Supertrend failure mode). Below the floor we emit `null` — the honest-unknown
+ * posture the codebase already takes for a thin-history `ivRank`.
+ *
+ * This is a FLOOR, not the window: {@link PCR_Z_WINDOW_SESSIONS} (20) still caps
+ * how much trailing history feeds the estimate.
  */
-export function pcrZScore(value: number, history: readonly number[], minSamples = 2): number | null {
+export const PCR_Z_MIN_SAMPLES = 10;
+
+/**
+ * Z-score of `value` against a trailing `history` sample, using the SAMPLE
+ * standard deviation (Bessel-corrected, n−1). Returns null when the sample is
+ * below `minSamples` (default {@link PCR_Z_MIN_SAMPLES}) or degenerate (σ ≈ 0) —
+ * the caller records `pcr_z: null` rather than a spurious value. The article
+ * stresses the *change* in PCR over its own recent range, which this captures: a
+ * fresh spike in put flow reads as a large positive z even when the absolute
+ * ratio looks unremarkable.
+ */
+export function pcrZScore(
+  value: number,
+  history: readonly number[],
+  minSamples: number = PCR_Z_MIN_SAMPLES,
+): number | null {
   const sample = history.filter((v) => Number.isFinite(v));
-  if (sample.length < minSamples) return null;
+  // The `< 2` leg is not redundant with `minSamples`: it keeps a caller-supplied
+  // floor of 0 or 1 from dividing by (n-1) = 0 and emitting ±Infinity.
+  if (sample.length < minSamples || sample.length < 2) return null;
   const mean = sample.reduce((a, b) => a + b, 0) / sample.length;
-  const variance = sample.reduce((a, b) => a + (b - mean) ** 2, 0) / sample.length;
+  const variance = sample.reduce((a, b) => a + (b - mean) ** 2, 0) / (sample.length - 1);
   const sd = Math.sqrt(variance);
   // A σ this small is a constant sample up to floating-point noise (PCR ratios
   // are O(1)); treat it as degenerate rather than emitting a spurious huge z.
