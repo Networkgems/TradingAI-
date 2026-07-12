@@ -57,6 +57,15 @@ import {
 import { isOptionShadowEnabled, isOptionPhaseBEnabled, emitShadowOptionSignal, shadowSignalToSpreadParams, OPTION_SHADOW_EMERGENCY_OFF, DEMO_SPREAD_MAX_LOSS_PCT_CAP } from './option-shadow-ledger.js';
 import { isPcrShadowEnabled, recordPcrObservation, type PcrTrioVerdict } from './pcr-shadow-ledger.js';
 import { isOiShadowEnabled, recordOiObservation } from './oi-shadow-ledger.js';
+import {
+  isPcsShadowEnabled,
+  recordWeeklyPcsEntry,
+  settleDuePcsEntries,
+  isWeeklyPcsEntryDay,
+  PCS_SHADOW_UNDERLYINGS,
+  PCS_ENTRY_DTE_BAND,
+} from './pcs-shadow-ledger.js';
+import { selectWeeklyPcs } from '@trading-app/engine';
 import { isOptionExecEnabled, isOptionEmaPullbackEnabled, isOptionVolumeBreakoutEnabled, resolveRvLongDteOverride, resolveRvMinDailyVolume, isOptionDemoDirectionalEnabled, isOptionIvRvScannerEnabled, isOptionIvRvRoutingEnabled, resolveIvRvRoutingOverride, isOptionShortPremiumScannerEnabled, isOptionLiveRvLongEnabled, isOptionLiveDirectionalEnabled } from './option-exec-flag.js';
 import { scanIvRvFromSnapshot, recordIvRvScan } from './iv-rv-scanner.js';
 import { scanShortPremiumFromSnapshot, recordShortPremiumScan } from './short-premium-scanner.js';
@@ -6481,6 +6490,40 @@ export class SignalEngine {
             });
           } catch (err: unknown) {
             optionShadowLog.warn('oi shadow capture threw', {
+              symbol: sym,
+              reason: err instanceof Error ? err.message : String(err),
+            });
+          }
+        }
+
+        // TRA-1618 (parent TRA-1614) — SHADOW weekly-QQQ-PCS forward test. Rides
+        // the SAME warm chain snapshot (zero extra Tradier fetch), flag-gated
+        // (ENABLE_PCS_SHADOW, default OFF), QQQ-only, observe-only ($0 live). Two
+        // legs: (a) settle any open spread whose expiry has passed against the
+        // current spot, freezing its realized R into the ledger; (b) on the weekly
+        // cadence (Friday) — and only when the tracked expiry is genuinely a
+        // ~weekly one (DTE band), so we never silently swap in a 30–45 DTE spread —
+        // select the ~10-15Δ 25-wide short-put spread the video sells and open ONE
+        // per weekly cycle (dedup lives in the ledger). The settled cycles feed the
+        // TRA-532 Stage-2 paper leg for `qqq_weekly_pcs`. The discretionary
+        // martingale rescue leg is DELIBERATELY not emitted (TRA-1617: it drives
+        // the 41:1 tail). NEVER routes an order, never touches sizing/exits.
+        if (isPcsShadowEnabled() && PCS_SHADOW_UNDERLYINGS.has(sym)) {
+          try {
+            await settleDuePcsEntries(asOf, () => (spot > 0 ? spot : null));
+            const inWeeklyBand =
+              daysToExpiry >= PCS_ENTRY_DTE_BAND[0] && daysToExpiry <= PCS_ENTRY_DTE_BAND[1];
+            if (isWeeklyPcsEntryDay(asOf) && inWeeklyBand) {
+              const puts = rows.filter((r) => r.optionType === 'put' && r.expiration === expiration);
+              const pcs = selectWeeklyPcs({ spot, dteDays: daysToExpiry, puts });
+              if (pcs) {
+                // Expiry ≈ the ET close of the tracked expiry day (20:00Z ≈ 16:00 ET).
+                const expiryMs = new Date(`${expiration}T20:00:00Z`).getTime();
+                await recordWeeklyPcsEntry({ underlying: sym, asof: asOf, signal: pcs, expiryMs });
+              }
+            }
+          } catch (err: unknown) {
+            optionShadowLog.warn('pcs shadow capture threw', {
               symbol: sym,
               reason: err instanceof Error ? err.message : String(err),
             });

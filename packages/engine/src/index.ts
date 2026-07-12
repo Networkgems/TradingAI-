@@ -491,6 +491,17 @@ export type {
   DeltaDirection,
 } from './options/oi-trend.js';
 export {
+  selectWeeklyPcs,
+  settleWeeklyPcs,
+  WEEKLY_PCS_DEFAULTS,
+} from './options/weekly-pcs-signal.js';
+export type {
+  PcsPutQuote,
+  WeeklyPcsParams,
+  WeeklyPcsSignal,
+  WeeklyPcsSettlement,
+} from './options/weekly-pcs-signal.js';
+export {
   emaPullbackTrigger,
   volumeConfirmedBreakout,
   EMA_PULLBACK_DEFAULTS,

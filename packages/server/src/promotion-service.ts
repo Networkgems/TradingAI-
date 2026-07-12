@@ -16,6 +16,7 @@ import {
 } from '@trading-app/shared';
 import { loadCryptoTradeSnapshot, loadStocksTradeSnapshot } from './trade-store.js';
 import { getStrategyRecord, getEffectiveThresholds } from './promotion-store.js';
+import { collectPcsShadowPaperSamples } from './pcs-shadow-ledger.js';
 import { getAllUsers } from './users.js';
 import { isPromotionGateEnvAwareEnabled } from './promotion-gate-env-aware-flag.js';
 import { logger } from './observability/index.js';
@@ -165,7 +166,14 @@ export async function buildPromotionStatus(username: string, strategyId: string)
     accumulation = positions.length > 0 ? computeAccumulationGateMetrics(positions.map(toAccumSample), Date.now()) : null;
   } else {
     const paperTrades = await collectPaperTrades(username, strategyId);
-    paper = paperTrades.length > 0 ? computePaperGateMetrics(paperTrades.map(toSample)) : null;
+    // TRA-1618 — the weekly QQQ PCS forward test accrues its Stage-2 fills in the
+    // durable PCS shadow ledger rather than the demo trade book, so union its
+    // settled samples in. Flag-gated (ENABLE_PCS_SHADOW, default OFF) and scoped
+    // to the base-PCS strategy id inside the collector, so it is inert for every
+    // other strategy and until the shadow leg is armed.
+    const shadowSamples = await collectPcsShadowPaperSamples(strategyId);
+    const samples = [...paperTrades.map(toSample), ...shadowSamples];
+    paper = samples.length > 0 ? computePaperGateMetrics(samples) : null;
   }
 
   const signoff = rec && rec.decisions.length > 0 ? 'present' : 'absent';
@@ -214,7 +222,12 @@ export async function buildPublicPromotionProbe(strategyId: string): Promise<Pro
     for (const u of getAllUsers()) {
       paperTrades.push(...(await collectPaperTrades(u.username, strategyId)));
     }
-    paper = paperTrades.length > 0 ? computePaperGateMetrics(paperTrades.map(toSample)) : null;
+    // TRA-1618 — union the weekly QQQ PCS forward-test samples (see the
+    // authenticated build path). The shadow ledger is global (not per-user), so
+    // it is collected once, not per user.
+    const shadowSamples = await collectPcsShadowPaperSamples(strategyId);
+    const samples = [...paperTrades.map(toSample), ...shadowSamples];
+    paper = samples.length > 0 ? computePaperGateMetrics(samples) : null;
   }
 
   const signoff = rec && rec.decisions.length > 0 ? 'present' : 'absent';

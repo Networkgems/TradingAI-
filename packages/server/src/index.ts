@@ -255,6 +255,7 @@ import { initShadowLedger, listShadowSignals } from './shadow-signal-ledger.js';
 import { initOptionShadowLedger, listOptionShadowSignals, isOptionShadowEnabled, OPTION_SHADOW_EMERGENCY_OFF } from './option-shadow-ledger.js';
 import { initPcrShadowLedger, listPcrShadowSignals, isPcrShadowEnabled, usableSignalCount, PCR_Z_WINDOW_SESSIONS } from './pcr-shadow-ledger.js';
 import { initOiShadowLedger, listOiShadowSignals, isOiShadowEnabled, usableSignalCount as usableOiSignalCount } from './oi-shadow-ledger.js';
+import { initPcsShadowLedger, listPcsShadowSignals, isPcsShadowEnabled, settledSignalCount, PCS_SHADOW_STRATEGY_ID } from './pcs-shadow-ledger.js';
 import {
   initReversalShadowLedger,
   listReversalShadowSignals,
@@ -738,6 +739,13 @@ await initPcrShadowLedger();
 // ENABLE_OI_SHADOW is set; the capture is observe-only and never touches sizing
 // or exits.
 await initOiShadowLedger();
+
+// TRA-1618 (parent TRA-1614) — warm the flag-gated SHADOW weekly-QQQ-PCS
+// forward-test ledger so the read endpoint + Stage-2 paper feed have history
+// right after boot. The signal-engine option-shadow pass opens one spread per
+// weekly cycle and settles due spreads when ENABLE_PCS_SHADOW is set; the
+// capture is observe-only ($0 live) and never routes an order.
+await initPcsShadowLedger();
 
 // TRA-921 (TRA-920 B) — warm the OBSERVE-ONLY reversal-checklist shadow ledger so
 // the read endpoint has history right after boot. The signal-engine tick appends
@@ -4835,6 +4843,36 @@ app.get('/api/health/oi-shadow-signals', async (_req, res) => {
       reason: err instanceof Error ? err.message : String(err),
     });
     res.status(500).json({ error: 'Failed to read oi shadow ledger' });
+  }
+});
+
+// TRA-1618 (parent TRA-1614) — read-only probe over the SHADOW weekly-QQQ-PCS
+// forward-test ledger, open like the other shadow probes so QuantTrader can pull
+// the accruing out-of-sample paper fills for the TRA-532 Stage-2 gate without
+// Render admin creds. Reports the settled-cycle count (the promotion
+// denominator) against the ≥200 threshold, plus the open/settled split and the
+// recent rows. Observe-only: nothing here routes an order; the base PCS only
+// (the martingale rescue is NOT auto-emitted — see the ledger header).
+app.get('/api/health/pcs-shadow-signals', async (_req, res) => {
+  try {
+    const signals = await listPcsShadowSignals();
+    const settled = settledSignalCount(signals);
+    res.json({
+      issue: 'TRA-1618',
+      flagEnabled: isPcsShadowEnabled(),
+      strategyId: PCS_SHADOW_STRATEGY_ID,
+      promotionThreshold: 200,
+      count: signals.length,
+      openCount: signals.filter((s) => s.status === 'open').length,
+      settledCount: settled,
+      promotionReady: settled >= 200,
+      signals,
+    });
+  } catch (err) {
+    log.error('pcs-shadow-signals health probe failed', {
+      reason: err instanceof Error ? err.message : String(err),
+    });
+    res.status(500).json({ error: 'Failed to read pcs shadow ledger' });
   }
 });
 
