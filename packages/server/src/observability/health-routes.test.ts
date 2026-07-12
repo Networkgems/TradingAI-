@@ -996,10 +996,11 @@ describe('TRA-1602 cost-aware fire-bar health route', () => {
     expect(body.armed).toBe(false); // no env flag set in the test process
     expect(body.demoOnly).toBe(true);
     expect(body.liveCapitalReachable).toBe(false);
-    // The QT-retuned options bar (TRA-1603 decision #3): commission + maker-adjusted
-    // spread cross + safety margin, expressed against the estimator's 25%-premium R.
-    expect(body.bars['single_leg_rv']).toBeCloseTo(1.25, 2);
-    expect(body.bars['single_leg_otm']).toBeCloseTo(1.25, 2);
+    // TRA-1661 — the options bar off the MEASURED spread cross: commission 0.05 +
+    // spread 0.235 (TRA-1656) + margin 0.20 = 0.485R, clear of the 0.30 floor.
+    // Was 1.25R against the refuted 1.00R modeled cross.
+    expect(body.bars['single_leg_rv']).toBeCloseTo(0.485, 3);
+    expect(body.bars['single_leg_otm']).toBeCloseTo(0.485, 3);
     expect(body.admittedTotal).toBe(0);
     expect(body.rejectedTotal).toBe(0);
   });
@@ -1130,6 +1131,45 @@ describe('buildOptionJournalReport', () => {
     expect(report.enabled).toBe(false);
     expect(report.summary.total).toBe(0);
     expect(report.summary.byStructure).toHaveLength(0);
+  });
+
+  // TRA-1661 (TRA-1647A) — the byDelta rollup must reach the WIRE, per structure and
+  // in both R bases. Without it QuantTrader cannot set the win-probability knob and
+  // the cost-aware gate cannot be validated at all, so this is the load-bearing
+  // contract of the ticket, not a nice-to-have.
+  it('serves a per-structure byDelta block with dispersion and both R bases', () => {
+    const rv = (id: string, delta: number, r: number): OptionTradeJournalRecord => ({
+      ...closedRow,
+      id,
+      structure: 'single_leg_rv',
+      entryDelta: delta,
+      realizedR: r,
+      realizedPnlUsd: r * 320,
+    });
+    const report = buildOptionJournalReport(
+      [rv('a', 0.32, 0.1), rv('b', 0.34, 0.2), { ...closedRow, id: 'c' }],
+      NOW,
+      true,
+    );
+
+    // Sleeves are split, never pooled — they are the confound.
+    const sleeves = report.summary.byDelta.map((s) => s.structure).sort();
+    expect(sleeves).toEqual(['bull_put', 'single_leg_rv']);
+
+    const rvSleeve = report.summary.byDelta.find((s) => s.structure === 'single_leg_rv')!;
+    expect(rvSleeve.gateBasisValid).toBe(true);
+    const band = rvSleeve.buckets.find((b) => b.bucket === '0.30-0.35')!;
+    expect(band.closed).toBe(2);
+    expect(band.avgRealizedR_premiumBasis).toBeCloseTo(0.15, 10);
+    expect(band.avgRealizedR_gateBasis).toBeCloseTo(0.6, 10); // gate R = 4 x premium R
+    expect(band.sdRealizedR_premiumBasis).not.toBeNull(); // the CI input — not optional
+    expect(band.seRealizedR_premiumBasis).not.toBeNull();
+
+    // A credit spread has no valid premium->gate conversion; it must say so rather
+    // than publish a number scaled by a factor that does not apply to it.
+    const spread = report.summary.byDelta.find((s) => s.structure === 'bull_put')!;
+    expect(spread.gateBasisValid).toBe(false);
+    expect(spread.buckets[0]!.avgRealizedR_gateBasis).toBeNull();
   });
 
   // TRA-1591 — post-arm cohort filter for grading the OTM entry delta floor.
@@ -1270,7 +1310,13 @@ describe('GET /api/health/option-spread-cost (TRA-1656)', () => {
     await probe()[0]!({}, res);
     const body = res.body as {
       n: number;
-      byStructure: Array<{ structure: string; n: number; avgSpreadCrossR: number; impliedBarR: number }>;
+      byStructure: Array<{
+        structure: string;
+        n: number;
+        avgSpreadCrossR: number;
+        avgCommissionR: number | null;
+        impliedBarR: number;
+      }>;
       modeledInput: { makerAdjustedSpreadCrossR: number; barR: number };
       retention: { rowsTotal: number; rowsWithFillTimeQuote: number };
     };
@@ -1285,23 +1331,31 @@ describe('GET /api/health/option-spread-cost (TRA-1656)', () => {
     expect(rv.avgSpreadCrossR).toBeCloseTo(0.24, 6);
     expect(otm.avgSpreadCrossR).toBeCloseTo(0.4, 6);
 
-    // The point of the ticket: the MEASURED cross is far below the gate's modeled
-    // 1.00R input, so the re-derived bar is far below the armed 1.25R bar.
-    expect(body.modeledInput.makerAdjustedSpreadCrossR).toBe(1.0);
-    expect(rv.avgSpreadCrossR).toBeLessThan(body.modeledInput.makerAdjustedSpreadCrossR);
-    expect(rv.impliedBarR).toBeLessThan(body.modeledInput.barR);
+    // TRA-1661 — the gate now ships the MEASURED cross (0.235R, TRA-1656) rather
+    // than the refuted 1.00R model, so the probe's headline comparison is no longer
+    // "measurement vs phantom" but "measurement vs the input it produced". Pinning
+    // the shipped input here is what makes a silent revert to 1.00R fail a test.
+    expect(body.modeledInput.makerAdjustedSpreadCrossR).toBe(0.235);
+    expect(body.modeledInput.barR).toBeCloseTo(0.485, 3);
+    // impliedBarR is re-derived from the MEASUREMENT (measured commission + measured
+    // cross + margin), not from the config's cost inputs — that independence is the
+    // whole point of the probe, and is what lets it re-falsify the gate if the two
+    // ever drift apart.
+    expect(rv.impliedBarR).toBeCloseTo((rv.avgCommissionR ?? 0.05) + rv.avgSpreadCrossR + 0.2, 6);
   });
 
-  it('publishes the selection-independent ceilings that falsify the 1.00R input at n=0', async () => {
+  it('publishes the selection-independent ceilings, and the shipped input now sits under them', async () => {
     const res = fakeRes();
     await probe()[0]!({}, res);
     const body = res.body as {
       modeledInput: { makerAdjustedSpreadCrossR: number };
       ceilings: Record<string, { maxSpreadCrossR?: number }>;
     };
-    // No fills at all, yet the bound still holds and still refutes the input.
+    // The bound holds with no fills at all — it is what refuted the old 1.00R input
+    // at n=0. TRA-1661's replacement (0.235R) sits under BOTH ceilings, i.e. it is
+    // feasible: it never charges more than the worst contract the scanner can pick.
     expect(body.ceilings['single_leg_otm']!.maxSpreadCrossR).toBe(0.8);
     expect(body.ceilings['single_leg_rv']!.maxSpreadCrossR).toBe(0.4);
-    expect(body.modeledInput.makerAdjustedSpreadCrossR).toBeGreaterThan(0.8);
+    expect(body.modeledInput.makerAdjustedSpreadCrossR).toBeLessThan(0.4);
   });
 });

@@ -3,6 +3,7 @@ import { existsSync } from 'fs';
 import { dirname, join } from 'path';
 import { fileURLToPath } from 'url';
 import { logger } from './observability/index.js';
+import { STOP_DISTANCE_FRACTION_OF_MARK } from './option-spread-cost.js';
 
 // TRA-990 (Learning A) — the option-trade JOURNAL: a durable, observe-only
 // setup -> outcome ledger for option positions (calls/puts, spreads and
@@ -553,6 +554,165 @@ export interface OptionTradeJournalExitReasonStat {
   avgEntryDte: number | null;
 }
 
+// ── TRA-1661 (TRA-1647A) — the byDelta rollup ────────────────────────────────
+//
+// The cost-aware gate's estimator is `modeledGrossR = winProb·rewardR − (1−winProb)`
+// with `winProb = |delta|` and `rewardR ≡ 2.0` (both open sites hard-code
+// `stop = mark·0.75`, `target = mark·1.5`), so it collapses to `3·|delta| − 1`.
+// Its ENTIRE content is therefore one claim: **realized gross R rises with entry
+// delta.** Nothing had ever tested that claim — the gate was armed on it anyway.
+//
+// The realized book contradicts it. Demo pays ZERO spread (`demoSlippagePct = 0`),
+// so demo realized R IS gross R, which makes the journal a valid calibration set
+// for a gross model. Across sleeves, the LOWER-delta sleeve realizes MORE gross R:
+// `single_leg_rv` at Δ∈[0.30,0.40] models +0.050R and realizes +0.111R (understated
+// ~2×), while `single_leg_otm` at Δ∈[0.40,0.50) models +0.350R and realizes +0.062R
+// (overstated ~5.6×). The slope points the wrong way.
+//
+// But that is a CONFOUNDED cross-sleeve comparison — different scanners, signals and
+// exit logic — so it refutes "trust the slope" without establishing the true slope.
+// Only a WITHIN-sleeve measurement can do that. This rollup is that measurement, and
+// it is why the split is per-structure and NEVER pooled: pooling re-introduces the
+// exact confound the comparison died of.
+//
+// ⚠ TWO R BASES, and they differ by 4× (TRA-1656 finding #5). The journal's
+// `realizedR` divides by `atRiskUsd` = the FULL PREMIUM. The gate's R is the STOP
+// distance = 0.25·premium. Reporting one number would invite exactly the
+// silent-unit-mismatch that produced the phantom 1.00R cost input, so every stat
+// below is emitted in BOTH bases, explicitly labelled. See {@link GATE_R_BASIS_STRUCTURES}.
+
+/**
+ * The structures whose journal `atRiskUsd` is the full premium AND whose stop is
+ * `mark·0.75` — i.e. the ones where the gate's R (the stop distance) is exactly
+ * `0.25 × the journal's R`, so the premium→gate basis conversion is a clean 4×.
+ * These are the long single-leg debit sleeves, which are also precisely the sleeves
+ * the cost-aware gate governs.
+ *
+ * Everything else (credit spreads, iron condors: `atRiskUsd` = width − credit, no
+ * `mark·0.75` stop) has NO valid conversion, so its gate-basis stats are emitted as
+ * `null` rather than as a wrong number scaled by a factor that does not apply there.
+ */
+export const GATE_R_BASIS_STRUCTURES: ReadonlySet<string> = new Set([
+  'single_leg',
+  'single_leg_otm',
+  'single_leg_rv',
+  'directional',
+]);
+
+/** Ratio between the two R bases: gateR = premiumR / 0.25 = 4 × premiumR. */
+const GATE_R_PER_PREMIUM_R = 1 / STOP_DISTANCE_FRACTION_OF_MARK;
+
+// Entry-|delta| bucket edges: width 0.05 across [0.20, 0.70], plus catch-alls.
+//
+// ⚠ Edges are derived by INTEGER arithmetic (hundredths ÷ 100), never by repeated
+// float addition or by `(d − min) / width`. Both of those misassign a delta sitting
+// EXACTLY on a boundary: in IEEE-754, `0.35 − 0.20 = 0.1499999999999999`, so
+// `floor(that / 0.05)` yields 2, not 3, and a 0.35-delta row lands in the [0.30,0.35)
+// band. That is not a hypothetical — the RV entry-greeks gate admits Δ∈[0.30,0.40]
+// and the OTM floor is exactly 0.40, so real rows pile up ON the edges this rollup
+// buckets by. Dividing an integer by 100 reproduces the same double the label prints,
+// so `d >= from` compares exactly.
+export const DELTA_BUCKET_MIN = 0.2;
+export const DELTA_BUCKET_MAX = 0.7;
+export const DELTA_BUCKET_WIDTH = 0.05;
+const DELTA_BUCKET_MIN_HUNDREDTHS = 20;
+const DELTA_BUCKET_MAX_HUNDREDTHS = 70;
+const DELTA_BUCKET_WIDTH_HUNDREDTHS = 5;
+
+const LOW_CATCH_ALL = `lt${DELTA_BUCKET_MIN.toFixed(2)}`;
+const HIGH_CATCH_ALL = `gte${DELTA_BUCKET_MAX.toFixed(2)}`;
+
+/** The half-open `[from, to)` bands, with exactly-representable edges. */
+const DELTA_BANDS: ReadonlyArray<{ from: number; to: number; label: string }> = (() => {
+  const bands: Array<{ from: number; to: number; label: string }> = [];
+  for (
+    let e = DELTA_BUCKET_MIN_HUNDREDTHS;
+    e < DELTA_BUCKET_MAX_HUNDREDTHS;
+    e += DELTA_BUCKET_WIDTH_HUNDREDTHS
+  ) {
+    const from = e / 100;
+    const to = (e + DELTA_BUCKET_WIDTH_HUNDREDTHS) / 100;
+    bands.push({ from, to, label: `${from.toFixed(2)}-${to.toFixed(2)}` });
+  }
+  return bands;
+})();
+
+/**
+ * TRA-1661 — bucket an entry |delta| into a 0.05-wide band over [0.20, 0.70], with
+ * `lt0.20` / `gte0.70` catch-alls so no closed row is silently dropped from the
+ * slope fit. Bands are half-open `[from, to)`. Sign is folded (the estimator's
+ * winProb is `|delta|`), and a non-finite delta falls to the low catch-all rather
+ * than corrupting a real band. Labels are stable strings so they survive JSON
+ * round-trips as object keys / chart categories.
+ */
+export function entryDeltaBucket(delta: number): string {
+  const d = Math.abs(delta);
+  if (!Number.isFinite(d) || d < DELTA_BUCKET_MIN) return LOW_CATCH_ALL;
+  if (d >= DELTA_BUCKET_MAX) return HIGH_CATCH_ALL;
+  const band = DELTA_BANDS.find((b) => d >= b.from && d < b.to);
+  return band?.label ?? HIGH_CATCH_ALL;
+}
+
+/** The canonical bucket order (ascending in delta), catch-alls at the ends. */
+export function deltaBucketOrder(): string[] {
+  return [LOW_CATCH_ALL, ...DELTA_BANDS.map((b) => b.label), HIGH_CATCH_ALL];
+}
+
+/**
+ * TRA-1661 — one entry-|delta| band's realized outcome, WITHIN a single structure.
+ *
+ * `sdRealizedR` is not garnish: with only a point estimate per bucket, a slope fit
+ * over these buckets cannot be distinguished from noise, which is precisely the
+ * TRA-992 / TRA-1585 coin-flip trap (a positive-looking mean whose CI straddles 0).
+ * The dispersion is what lets the re-grade put a confidence interval on the verdict.
+ */
+export interface OptionTradeJournalDeltaBucketStat {
+  /** Band label, e.g. `0.40-0.45`; `lt0.20` / `gte0.70` are the catch-alls. */
+  bucket: string;
+  /** Inclusive lower edge; null for the low catch-all. */
+  deltaFrom: number | null;
+  /** Exclusive upper edge; null for the high catch-all. */
+  deltaTo: number | null;
+  closed: number;
+  win: number;
+  /** WIN / closed within this band; null when none closed. */
+  winRate: number | null;
+  /** Σ realized P&L, USD, within this band. */
+  realizedPnlUsd: number;
+  /** Mean entry |delta| of the band's closed rows — where the mass actually sits. */
+  avgEntryDelta: number | null;
+  /** Mean realized R in the JOURNAL's basis (÷ atRiskUsd = full premium). */
+  avgRealizedR_premiumBasis: number | null;
+  /** Mean realized R in the GATE's basis (÷ stop distance = 0.25·premium) = 4×. Null when the structure has no valid conversion. */
+  avgRealizedR_gateBasis: number | null;
+  /** Sample SD (n−1) of realized R, premium basis; null when closed < 2. */
+  sdRealizedR_premiumBasis: number | null;
+  /** Sample SD (n−1) of realized R, gate basis; null when closed < 2 or no conversion. */
+  sdRealizedR_gateBasis: number | null;
+  /** Standard error of the mean (sd/√n), premium basis; null when closed < 2. */
+  seRealizedR_premiumBasis: number | null;
+  /** Standard error of the mean (sd/√n), gate basis; null when closed < 2 or no conversion. */
+  seRealizedR_gateBasis: number | null;
+}
+
+/**
+ * TRA-1661 — the per-structure delta rollup. Split per structure and NEVER pooled:
+ * the sleeves differ in scanner, signal and exit logic, so a pooled delta curve
+ * measures the sleeve mix, not the delta slope.
+ */
+export interface OptionTradeJournalDeltaStructureStat {
+  structure: string;
+  closed: number;
+  /**
+   * Whether `avgRealizedR_gateBasis` etc. are populated — true iff the structure's
+   * `atRiskUsd` is the full premium and its stop is `mark·0.75`, so the 4× premium→
+   * gate conversion holds. False (⇒ gate-basis fields null) for credit spreads.
+   */
+  gateBasisValid: boolean;
+  /** Bands ascending in delta, catch-alls at the ends. Empty bands are omitted. */
+  buckets: OptionTradeJournalDeltaBucketStat[];
+}
+
 /**
  * TRA-1600 (deliverable D) — MEASURED per-fill slippage decomposition. Turns the
  * TRA-1599 *parametric* cost model (spread cross ~0.70–0.78R, modeled from the
@@ -629,6 +789,15 @@ export interface OptionTradeJournalSummary {
    * attributed outcomes instead of a single blended book number.
    */
   byDte: OptionTradeJournalDteBandStat[];
+  /**
+   * TRA-1661 (TRA-1647A) — per-structure × entry-|delta| rollup over RESOLVED rows.
+   * The WITHIN-sleeve measurement of the cost gate estimator's one load-bearing
+   * claim ("realized gross R rises with entry delta"), which the cross-sleeve read
+   * contradicts but cannot cleanly refute. Carries SD/SE so the re-grade can put a
+   * CI on the slope instead of a point estimate, and both R bases so the gate's
+   * stop-distance R is never silently compared against the journal's premium R.
+   */
+  byDelta: OptionTradeJournalDeltaStructureStat[];
   /**
    * TRA-1600 (D) — measured mark-vs-fill slippage decomposition over the row set.
    * The spine that makes the TRA-1599 cost attribution *measured* rather than
@@ -768,6 +937,70 @@ export function summarizeOptionTradeJournal(
     }))
     .sort((a, b) => dteBandOrder.indexOf(a.band) - dteBandOrder.indexOf(b.band));
 
+  // TRA-1661 — per-structure × entry-|delta| rollup over RESOLVED rows. Grouped by
+  // structure FIRST (the sleeves are the confound; pooling them measures the sleeve
+  // mix, not the delta slope), then bucketed on entry |delta| in 0.05-wide bands.
+  // Both R bases are emitted per bucket: the journal divides by the full premium,
+  // the gate by the stop distance (0.25·premium), a 4× unit gap that has already
+  // produced one phantom cost input (TRA-1656 #5). SD is the SAMPLE sd (n−1) so a
+  // 1-row bucket reports null rather than a fake-confident 0 dispersion.
+  const byDeltaMap = new Map<string, OptionTradeJournalRecord[]>();
+  for (const r of closedRows) {
+    const list = byDeltaMap.get(r.structure) ?? [];
+    list.push(r);
+    byDeltaMap.set(r.structure, list);
+  }
+  const bucketOrder = deltaBucketOrder();
+  const byDelta: OptionTradeJournalDeltaStructureStat[] = [...byDeltaMap.entries()]
+    .map(([structure, structRows]) => {
+      const gateBasisValid = GATE_R_BASIS_STRUCTURES.has(structure);
+      const buckets = new Map<string, OptionTradeJournalRecord[]>();
+      for (const r of structRows) {
+        const key = entryDeltaBucket(r.entryDelta);
+        const list = buckets.get(key) ?? [];
+        list.push(r);
+        buckets.set(key, list);
+      }
+      const bucketStats: OptionTradeJournalDeltaBucketStat[] = [...buckets.entries()]
+        .map(([bucket, list]) => {
+          const n = list.length;
+          const rs = list.map((r) => r.realizedR ?? 0);
+          const mean = n > 0 ? rs.reduce((a, v) => a + v, 0) / n : null;
+          // Sample SD (n−1 denominator): the unbiased estimator of the population
+          // dispersion, which is what a CI on the mean needs. Undefined at n=1.
+          const sd =
+            n > 1 && mean !== null
+              ? Math.sqrt(rs.reduce((a, v) => a + (v - mean) ** 2, 0) / (n - 1))
+              : null;
+          const se = sd !== null && n > 1 ? sd / Math.sqrt(n) : null;
+          const toGate = (v: number | null): number | null =>
+            gateBasisValid && v !== null ? v * GATE_R_PER_PREMIUM_R : null;
+          // Surface the band edges so a consumer never has to parse the label. Read
+          // off the same exact band table the bucketing used — the catch-alls are
+          // open-ended on their outer side, hence the nulls.
+          const band = DELTA_BANDS.find((b) => b.label === bucket);
+          return {
+            bucket,
+            deltaFrom: band ? band.from : bucket === HIGH_CATCH_ALL ? DELTA_BUCKET_MAX : null,
+            deltaTo: band ? band.to : bucket === LOW_CATCH_ALL ? DELTA_BUCKET_MIN : null,
+            closed: n,
+            win: list.filter((r) => r.outcome === 'WIN').length,
+            winRate: n > 0 ? list.filter((r) => r.outcome === 'WIN').length / n : null,
+            realizedPnlUsd: list.reduce((a, r) => a + (r.realizedPnlUsd ?? 0), 0),
+            avgEntryDelta: meanOf(list, (x) => x.entryDelta),
+            avgRealizedR_premiumBasis: mean,
+            avgRealizedR_gateBasis: toGate(mean),
+            sdRealizedR_premiumBasis: sd,
+            sdRealizedR_gateBasis: toGate(sd),
+            seRealizedR_premiumBasis: se,
+            seRealizedR_gateBasis: toGate(se),
+          };
+        })
+        .sort((a, b) => bucketOrder.indexOf(a.bucket) - bucketOrder.indexOf(b.bucket));
+      return { structure, closed: structRows.length, gateBasisValid, buckets: bucketStats };
+    })
+    .sort((a, b) => b.closed - a.closed || a.structure.localeCompare(b.structure));
+
   // TRA-1600 (D) — measured slippage decomposition. Only rows carrying a
   // measurement contribute (unmeasured rows drop out rather than dragging the
   // mean to zero); R is USD ÷ the entry-time atRiskUsd basis, guarded against a
@@ -820,6 +1053,7 @@ export function summarizeOptionTradeJournal(
     byArchetype,
     byExitReason,
     byDte,
+    byDelta,
     slippage,
   };
 }

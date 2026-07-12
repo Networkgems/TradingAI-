@@ -157,8 +157,11 @@ export interface StructureSpreadCost {
   maxSpreadCrossR: number | null;
   /**
    * Re-derived admission bar for this structure from the MEASURED cross:
-   * `avgCommissionR + avgSpreadCrossR + safetyMargin`. This is what the gate's
-   * bar should be, versus the 1.25R it currently is.
+   * `avgCommissionR + avgSpreadCrossR + safetyMargin`. Derived from the
+   * MEASUREMENT, independently of whatever the gate's config currently charges —
+   * that independence is what lets this probe re-falsify the gate's cost input if
+   * the two ever drift apart (it is what refuted the original 1.00R input, and it
+   * is the check on the 0.235R that replaced it in TRA-1661).
    */
   impliedBarR: number;
 }

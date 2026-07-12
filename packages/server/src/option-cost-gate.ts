@@ -38,10 +38,11 @@ export const OPTION_COST_AWARE_GATE_FLAG = 'ENABLE_OPTION_COST_AWARE_GATE';
 // an unset/malformed env preserves the reference behaviour). QuantTrader retunes
 // these off the measured slippage rollup (deliverable D) as it accrues.
 //
-//  - MIN_GROSS_R: hard floor on the effective options admission bar. The plan
-//    calls for ~0.8R on options structures; this lets that be lifted/lowered
-//    without touching the per-structure cost inputs. When set it is the LOWER
-//    bound of the effective bar (the bar is max(costModel+margin, floor)).
+//  - MIN_GROSS_R: hard floor on the effective options admission bar (default
+//    0.30R — a non-binding backstop, NOT the intended bar). When set it is the
+//    LOWER bound of the effective bar (the bar is max(costModel+margin, floor)),
+//    so a floor above the cost model PINS the bar and makes the cost inputs
+//    inert. Retune it TOGETHER with COMMISSION_R / SPREAD_CROSS_R, never alone.
 //  - SAFETY_MARGIN_R: the buffer added on top of costModel (default 0.20R).
 //  - COMMISSION_R / SPREAD_CROSS_R: per-structure cost inputs (defaults below),
 //    overridable as a single blended options number for quick retunes.
@@ -73,13 +74,16 @@ function parseNonNegFloat(raw: string | undefined): number | undefined {
  *    way = $0.70/contract; against the estimator's true R = 25% of premium
  *    (R≈$50 on a $2.00 premium) that is ~0.014R — we default to a conservative
  *    0.05R (TRA-1603). Bounded and unavoidable.
- *  - `makerAdjustedSpreadCrossR`: the residual bid-ask spread cross AFTER
- *    maker-fill routing (Lever A) recovers ~60–70% of the raw spread bucket.
- *    Expressed in the estimator's 25%-of-premium R (TRA-1603 decision #3), the
- *    plan's post-maker residual is ~0.44–0.58R; we default to a conservative
- *    1.00R (the DOMINANT cost term) so the shipped options bar lands at ~1.25R
- *    until the MEASURED (D) rollup lets QuantTrader tighten it toward the
- *    measured post-maker figure.
+ *  - `makerAdjustedSpreadCrossR`: the round-trip bid-ask spread cross, in the
+ *    estimator's 25%-of-premium R. MEASURED (TRA-1656) over 38 days of recorded
+ *    chains, restricted to each sleeve's admissible universe: 0.235R mean on
+ *    `single_leg_otm` (median 0.175, p90 0.533, n=222,026) and 0.160R on
+ *    `single_leg_rv` (median 0.136, p90 0.324, n=94,548). See
+ *    {@link DEFAULT_COST_GATE_CONFIG} for why the blended default is the OTM
+ *    (worse) figure. This is a TAKER cross: it is not maker-adjusted, because
+ *    maker-fill routing (TRA-1601, Lever A) is dark and its recovery has never
+ *    been measured. Charging the full taker cross until it is, is the
+ *    conservative direction.
  */
 export interface StructureCost {
   commissionR: number;
@@ -113,45 +117,64 @@ export interface CostGateConfig {
   equityCost: StructureCost;
   /** Buffer added on top of costModel before admitting (default 0.20R). */
   safetyMarginR: number;
-  /** Hard floor on the effective OPTIONS admission bar (default 0.80R). */
+  /**
+   * Hard floor on the effective OPTIONS admission bar (default 0.30R). A
+   * backstop, not the bar: it only binds if the cost inputs collapse toward
+   * zero. When it sits ABOVE `costModel + safetyMargin` it pins the bar and the
+   * cost inputs stop mattering — see {@link DEFAULT_COST_GATE_CONFIG}.
+   */
   optionsMinGrossR: number;
 }
 
 /**
  * The shipped reference config. Options bar resolves to
- * 0.05 (commission) + 1.00 (maker-adjusted spread) + 0.20 (margin) = 1.25R,
- * floored at 1.20R — the plan's headline options admission bar RESTATED to the
- * estimator's canonical R unit (TRA-1603 sign-off, decision #3). Equity bar
- * resolves to 0.00 + 0.02 + 0.20 = 0.22R (kept low per the plan; equity is the
- * least cost-impaired leg).
+ * 0.05 (commission) + 0.235 (MEASURED spread cross) + 0.20 (margin) = 0.485R,
+ * clear of the 0.30R backstop floor. Equity bar resolves to
+ * 0.00 + 0.02 + 0.20 = 0.22R (kept low per the plan; equity is the least
+ * cost-impaired leg).
  *
- * ── R-basis correction (TRA-1603, QuantTrader) ────────────────────────────────
- * The estimator ({@link estimateModeledGrossR}) defines R as the trade's at-risk
- * STOP distance = `mark - stop = 0.25·premium` (the RV/OTM sites stop at
- * mark·0.75). The original shipped inputs (0.10 commission / 0.50 spread /
- * 0.80 floor) were derived against a looser `R ≈ 40–60% of premium` — roughly
- * 2× the true stop distance. Dollar cost is unit-invariant, so expressed against
- * the smaller true R the cost multiple ~doubles: a worked $2.00-premium example
- * modeled +0.80R gross yet lost ~$11/contract net under the old 0.80R bar. The
- * inputs below are restated to the estimator's 25%-of-premium R so both sides of
- * `modeledGrossR >= costModel + margin` share the same R unit (spread cross
- * doubled 0.50→1.00; commission $0.70/contract vs R≈$50 ≈ 0.014, kept at a
- * conservative 0.05; floor lifted 0.80→1.20). Effective bar ≈ 1.25R ⇒ admits at
- * `3·|delta| − 1 ≥ 1.25`, i.e. |delta| ≥ ~0.75 — the intended "fire fewer,
- * higher-edge" cut that rejects the far-OTM lottery deltas and near-ATM 0.50
- * directional reads bleeding the demo book net-negative.
+ * ── The 1.00R input was a DEFECT, not a preference (TRA-1656 → TRA-1661) ──────
+ * The prior default charged `makerAdjustedSpreadCrossR: 1.00`, justified by a
+ * chain of modeling (TRA-1599's parametric wedge, doubled into the 25%-premium R
+ * basis by TRA-1603) that no one had ever checked against a quote. TRA-1656
+ * checked it, two ways, and it fails both:
  *
- * These are INTERIM (modeled, not measured). Deliverable D's measured slippage
- * ledger is the real source: as it accrues, pull SPREAD_CROSS_R toward the
- * measured post-maker residual. `optionsMinGrossR` (the floor) is the fast RELAX
- * knob if forward validation shows the ~0.75-delta bar starves the sample —
- * lower it before touching the cost inputs.
+ *  1. STRUCTURALLY INFEASIBLE. The round-trip cross obeys the identity
+ *     `spreadCrossR = (ask − bid) / (0.25·mark) = 4 · spreadPct`, and the
+ *     scanners hard-reject `spreadPct` above 0.20 (OTM) / 0.10 (RV) BEFORE a
+ *     contract can be selected. So no admissible contract can cross above 0.80R
+ *     (OTM) or 0.40R (RV) — see `SLEEVE_SPREAD_CEILINGS` in `option-spread-cost.ts`.
+ *     A 1.00R input bills every candidate MORE than the worst contract the
+ *     scanner is even allowed to buy. That is refutable at n=0.
+ *  2. MEASURED 4–6× TOO HIGH. Over 38 days of recorded chains, restricted to each
+ *     sleeve's admissible universe: OTM mean 0.235R (n=222,026), RV mean 0.160R
+ *     (n=94,548).
+ *
+ * `makerAdjustedSpreadCrossR` is a SINGLE knob across every options sleeve, so a
+ * blended value must be conservative: we take the OTM (worse) 0.235R and apply it
+ * to all of them. It overcharges RV by ~0.075R — QuantTrader's call (TRA-1661),
+ * deliberate.
+ *
+ * ── The floor must move WITH the cost input ───────────────────────────────────
+ * {@link admissionBarR} returns `max(costModel + margin, optionsMinGrossR)`, so
+ * the floor PINS the bar: left at 1.20 it would hold the effective bar at 1.20R
+ * no matter what the spread cross says, and the measured input would be entirely
+ * inert — the gate would read as "retuned" while behaving identically. The 1.20
+ * floor was itself derived from the phantom 1.00R input (TRA-1603 decision #3),
+ * so it comes down with it. 0.30 keeps a non-binding backstop against a future
+ * cost-input collapse admitting everything. If you retune the cost inputs, CHECK
+ * THE FLOOR — moving one knob alone is a no-op in the binding direction.
+ *
+ * Effective bar 0.485R ⇒ admits at `3·|delta| − 1 ≥ 0.485`, i.e. |delta| ≥ ~0.50.
+ * Note the delta-slope in that estimator is itself unvalidated and is what
+ * TRA-1647 grades next off the `byDelta` journal rollup; this config fixes the
+ * COST side only.
  */
 export const DEFAULT_COST_GATE_CONFIG: CostGateConfig = {
-  optionsCost: { commissionR: 0.05, makerAdjustedSpreadCrossR: 1.0 },
+  optionsCost: { commissionR: 0.05, makerAdjustedSpreadCrossR: 0.235 },
   equityCost: { commissionR: 0.0, makerAdjustedSpreadCrossR: 0.02 },
   safetyMarginR: 0.2,
-  optionsMinGrossR: 1.2,
+  optionsMinGrossR: 0.3,
 };
 
 /**

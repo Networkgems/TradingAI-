@@ -1250,11 +1250,14 @@ export function registerLiveHealthRoutes(app: Express, deps: LiveHealthDeps): vo
   });
 
   // TRA-1656 (TRA-1602B) — unauthenticated, secrets-free MEASURED option spread
-  // cross, in R units. The cost-aware bar (TRA-1602) charges a
-  // `makerAdjustedSpreadCrossR = 1.00R` that its own source comment concedes is
-  // "INTERIM (modeled, not measured)", and that unmeasured input is the DOMINANT
-  // term in the shipped 1.25R bar — so TRA-1647's "the book cannot cover its cost"
-  // is an artifact of it until it is checked. This probe is the check.
+  // cross, in R units. This probe was built to CHECK the cost-aware bar's spread
+  // input, which was a modeled 1.00R the gate's own source comment conceded was
+  // "INTERIM (modeled, not measured)" — the DOMINANT term in the then-shipped
+  // 1.25R bar, so TRA-1647's "the book cannot cover its cost" was an artifact of
+  // it. The check failed the input (measured 0.235R OTM / 0.160R RV, and 1.00R is
+  // above both structural ceilings below), and TRA-1661 landed the measurement AS
+  // the shipped default. The probe now serves the ongoing job: keep the gate's
+  // input honest against the accruing measurement, and re-falsify it if it drifts.
   //
   // Three independent readings, deliberately kept separate:
   //
@@ -1270,8 +1273,9 @@ export function registerLiveHealthRoutes(app: Express, deps: LiveHealthDeps): vo
   //     contract with `spreadPct > maxSpreadPct` (OTM 0.20, RV 0.10) before it can
   //     be picked, and `spreadCrossR = 4 · spreadPct`, so no contract either sleeve
   //     can possibly buy crosses above 0.80R / 0.40R. This holds with ZERO fills and
-  //     no distributional assumption — and it already falsifies the gate's 1.00R
-  //     input, which sits above both ceilings.
+  //     no distributional assumption — it is what falsified the old 1.00R input at
+  //     n=0, and it is the cheapest check on any future retune: a cost input above a
+  //     sleeve's ceiling is infeasible by construction, no data required.
   //
   // Observe-only: reading this never routes an order or moves a bar.
   app.get('/api/health/option-spread-cost', async (_req, res) => {
@@ -1307,13 +1311,16 @@ export function registerLiveHealthRoutes(app: Express, deps: LiveHealthDeps): vo
       demoOnly: true,
       liveCapitalReachable: false,
 
-      // The gate input this probe exists to check.
+      // The gate input this probe exists to check. Key kept as `modeledInput` for
+      // consumer stability; `source` states its real provenance, which as of
+      // TRA-1661 is the measurement below rather than the refuted 1.00R model.
       modeledInput: {
         makerAdjustedSpreadCrossR: config.optionsCost.makerAdjustedSpreadCrossR,
         commissionR: config.optionsCost.commissionR,
         safetyMarginR: config.safetyMarginR,
         barR: admissionBarR('single_leg_otm', config),
-        source: 'MODELED — never measured (see option-cost-gate.ts)',
+        source:
+          'MEASURED (TRA-1656 → TRA-1661): shipped default 0.235R = the OTM-sleeve mean cross, applied blended across sleeves (conservative: it overcharges RV by ~0.075R). Overridable via OPTION_COST_GATE_SPREAD_CROSS_R.',
       },
 
       // (1) The measurement.

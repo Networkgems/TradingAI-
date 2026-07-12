@@ -76,16 +76,19 @@ describe('SLEEVE_SPREAD_CEILINGS — the selection-independent bound', () => {
     }
   });
 
-  it('shows the gate 1.00R spread input EXCEEDS every sleeve ceiling (it is infeasible)', () => {
-    // This is the core TRA-1656 finding: the gate charges a cost strictly higher
-    // than the worst contract the scanner is even allowed to select. No fills
-    // required to establish it.
+  it('holds the gate spread input BELOW every sleeve ceiling (feasibility, TRA-1661)', () => {
+    // The core TRA-1656 finding was that the then-shipped 1.00R input charged a
+    // cost strictly HIGHER than the worst contract the scanner is even allowed to
+    // select — infeasible, and refutable with no fills at all. TRA-1661 landed the
+    // measured 0.235R in its place. This test is the standing guard on that class
+    // of defect: any future cost input above a sleeve's ceiling is infeasible by
+    // construction, whatever the data says.
     const gateInput = DEFAULT_COST_GATE_CONFIG.optionsCost.makerAdjustedSpreadCrossR;
     for (const [name, sleeve] of Object.entries(SLEEVE_SPREAD_CEILINGS)) {
       expect(
         gateInput,
-        `${name}: gate charges ${gateInput}R but no admissible contract can cross more than ${sleeve.maxSpreadCrossR}R`,
-      ).toBeGreaterThan(sleeve.maxSpreadCrossR);
+        `${name}: gate charges ${gateInput}R but no admissible contract can cross more than ${sleeve.maxSpreadCrossR}R — infeasible by construction`,
+      ).toBeLessThan(sleeve.maxSpreadCrossR);
     }
   });
 });

@@ -28,23 +28,25 @@ describe('estimateModeledGrossR — RV/OTM 2:1 structures', () => {
     }
   });
 
-  it('clears the corrected 1.25R options bar around |delta| ≈ 0.75 (TRA-1603 R-basis)', () => {
+  it('clears the MEASURED-cost 0.485R options bar around |delta| ≈ 0.495 (TRA-1661)', () => {
     const mark = 3.0;
-    // The R-basis correction (TRA-1603 decision #3) restated the cost inputs to
-    // the estimator's 25%-premium R, lifting the effective options bar to ~1.25R.
-    // Boundary is now |delta| ≈ 0.75 (3·0.75 − 1 = 1.25); use deltas comfortably
-    // either side so the assertion is not at the float-exact 1.25 knife-edge.
-    const at77 = estimateModeledGrossR({ mark, delta: 0.77, targetPrice: mark * 1.5, stopPrice: mark * 0.75 });
-    const at73 = estimateModeledGrossR({ mark, delta: 0.73, targetPrice: mark * 1.5, stopPrice: mark * 0.75 });
-    // 3·0.77 − 1 = 1.31 → admits; 3·0.73 − 1 = 1.19 → rejects.
-    expect(admitByCostAwareGate(at77.modeledGrossR, 'single_leg_rv').admit).toBe(true);
-    expect(admitByCostAwareGate(at73.modeledGrossR, 'single_leg_otm').admit).toBe(false);
+    // TRA-1661 replaced the gate's phantom 1.00R spread input with the MEASURED
+    // 0.235R (TRA-1656) and unpinned the floor, dropping the effective options bar
+    // 1.25R → 0.485R. Under the same `3·|delta| − 1` estimator the admission
+    // boundary therefore moves 0.75 → ~0.495; use deltas comfortably either side so
+    // the assertion is not sitting on the float-exact knife-edge.
+    const at55 = estimateModeledGrossR({ mark, delta: 0.55, targetPrice: mark * 1.5, stopPrice: mark * 0.75 });
+    const at45 = estimateModeledGrossR({ mark, delta: 0.45, targetPrice: mark * 1.5, stopPrice: mark * 0.75 });
+    // 3·0.55 − 1 = 0.65 → admits; 3·0.45 − 1 = 0.35 → rejects.
+    expect(admitByCostAwareGate(at55.modeledGrossR, 'single_leg_rv').admit).toBe(true);
+    expect(admitByCostAwareGate(at45.modeledGrossR, 'single_leg_otm').admit).toBe(false);
   });
 
   it('rejects a far-OTM lottery delta (0.40 floor) as scratch-tier', () => {
     const mark = 0.5;
     const est = estimateModeledGrossR({ mark, delta: 0.4, targetPrice: mark * 1.5, stopPrice: mark * 0.75 });
-    // 3·0.40 − 1 = 0.20R — well under the 1.25R options bar (TRA-1603).
+    // 3·0.40 − 1 = 0.20R — still under the 0.485R options bar even after TRA-1661
+    // dropped it off the measured spread cross.
     expect(est.modeledGrossR).toBeCloseTo(0.2, 10);
     expect(admitByCostAwareGate(est.modeledGrossR, 'single_leg_otm').admit).toBe(false);
   });
@@ -72,12 +74,24 @@ describe('estimateModeledGrossR — directional path (no fixed target/stop)', ()
     expect(est.rewardR).toBeCloseTo(DEFAULT_MODELED_GROSS_R_CONFIG.defaultRewardR, 10);
   });
 
-  it('rejects a near-ATM 0.50-delta directional read as scratch-tier under the bar', () => {
+  it('⚠ ADMITS a near-ATM 0.50-delta directional read by 0.015R at the TRA-1661 bar', () => {
     // 0/0 target/stop (the deterministic directional path) → default 2:1.
     const est = estimateModeledGrossR({ mark: 2.5, delta: 0.5, targetPrice: 0, stopPrice: 0, riskRewardRatio: 2 });
     expect(est.rewardSource).toBe('risk_reward_ratio'); // 0/0 is not a valid target/stop
     expect(est.modeledGrossR).toBeCloseTo(0.5, 10); // 3·0.5 − 1
-    expect(admitByCostAwareGate(est.modeledGrossR, 'directional').admit).toBe(false);
+    // This assertion INVERTED at TRA-1661 and the flip is load-bearing, so it is
+    // pinned rather than quietly updated. The near-ATM ~0.50-delta directional open
+    // is the path `signal-engine.ts` calls "the dominant scratch churner", and
+    // rejecting it was a stated purpose of the TRA-1602 gate. Against the MEASURED
+    // cost bar (0.485R) it now CLEARS by 0.015R — because the 1.25R bar that used to
+    // reject it was built on a spread input TRA-1656 refuted, not because the trade
+    // got better. Whether 0.50-delta directional SHOULD fire is a live question for
+    // the TRA-1647 re-grade: it turns entirely on the estimator's delta-slope, which
+    // the realized book contradicts, and which the `byDelta` rollup exists to settle.
+    // Do not "fix" this by re-pinning the floor — that would make the measured cost
+    // input inert again (see DEFAULT_COST_GATE_CONFIG).
+    expect(admitByCostAwareGate(est.modeledGrossR, 'directional').admit).toBe(true);
+    expect(admitByCostAwareGate(est.modeledGrossR, 'directional').barR).toBeCloseTo(0.485, 3);
   });
 });
 
