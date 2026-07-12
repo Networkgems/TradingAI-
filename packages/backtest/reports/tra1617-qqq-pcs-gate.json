@@ -1,0 +1,430 @@
+{
+  "generatedAt": "2026-07-11T23:57:42.730Z",
+  "issue": "TRA-1617",
+  "strategyId": "qqq_weekly_pcs_rescue",
+  "dataset": "QQQ daily bars (Yahoo), 2015-01-01 → 2025-12-30, on-disk cache",
+  "model": "Black-Scholes on realized-vol IV (VRP 1.05); per-leg $0.65 comm; widening bid/ask fills",
+  "account": 10000,
+  "params": {
+    "shortPutDelta": 0.125,
+    "managedCloseMult": 1.5,
+    "rescueEnabled": true,
+    "slipMult": 1
+  },
+  "metrics": {
+    "tradeCount": 553,
+    "winRate": 0.6546112115732369,
+    "avgCredit": 0.41809754207000754,
+    "expectancyR": -0.004886410714637717,
+    "avgPnl": -12.104863671146168,
+    "totalPnl": -6693.989610143831,
+    "sharpe": -0.5052460691857119,
+    "sortino": -0.6644708054378948,
+    "profitFactor": 0.7345452781794513,
+    "maxDrawdownPct": 0.757659362485033,
+    "maxDrawdownDollars": 7576.593624850329,
+    "tailLoss": {
+      "worstR": -0.3779103611251728,
+      "p01R": -0.2743978915465038,
+      "p05R": -0.11599254167929761,
+      "worst5AvgR": -0.20205906204903326,
+      "tailRatio": 17.984415153347488
+    },
+    "breachRate": 0.12115732368896925,
+    "rescueSuccessRate": 0.8135593220338984
+  },
+  "perRegime": [
+    {
+      "regime": "2015-2017 grind-up",
+      "metrics": {
+        "tradeCount": 189,
+        "winRate": 0.6296296296296297,
+        "avgCredit": 0.11616592245164706,
+        "expectancyR": -0.005241836757798617,
+        "avgPnl": -13.062243318978995,
+        "totalPnl": -2468.76398728703,
+        "sharpe": -1.514022623327424,
+        "sortino": -1.508003021300862,
+        "profitFactor": 0.36263693271938285,
+        "maxDrawdownPct": 0.2468763987287026,
+        "maxDrawdownDollars": 2468.763987287026,
+        "tailLoss": {
+          "worstR": -0.19172612849688964,
+          "p01R": -0.15291191144273722,
+          "p05R": -0.04674238623800281,
+          "worst5AvgR": -0.09474012852468766,
+          "tailRatio": 40.28415798825322
+        },
+        "breachRate": 0.08994708994708994,
+        "rescueSuccessRate": 0.7058823529411765
+      }
+    },
+    {
+      "regime": "Q4-2018 selloff",
+      "metrics": {
+        "tradeCount": 13,
+        "winRate": 0.38461538461538464,
+        "avgCredit": 0.38132733852716594,
+        "expectancyR": -0.013782471368342755,
+        "avgPnl": -33.95293454692559,
+        "totalPnl": -441.3881491100327,
+        "sharpe": -2.6410097008429405,
+        "sortino": -2.5559110414264317,
+        "profitFactor": 0.306669306226912,
+        "maxDrawdownPct": 0.05006601282044552,
+        "maxDrawdownDollars": 501.53150005178213,
+        "tailLoss": {
+          "worstR": -0.12157582462596205,
+          "p01R": -0.12157582462596205,
+          "p05R": -0.12157582462596205,
+          "worst5AvgR": -0.12157582462596205,
+          "tailRatio": 7.653033026514653
+        },
+        "breachRate": 0.07692307692307693,
+        "rescueSuccessRate": 1
+      }
+    },
+    {
+      "regime": "2019 recovery",
+      "metrics": {
+        "tradeCount": 58,
+        "winRate": 0.6551724137931034,
+        "avgCredit": 0.2286416952692765,
+        "expectancyR": -0.006327896896449861,
+        "avgPnl": -15.713664320316726,
+        "totalPnl": -911.39253057837,
+        "sharpe": -1.1328624030172973,
+        "sortino": -1.1969748927617927,
+        "profitFactor": 0.5353795789380009,
+        "maxDrawdownPct": 0.12079847366105197,
+        "maxDrawdownDollars": 1246.7566915687312,
+        "tailLoss": {
+          "worstR": -0.17498848880429474,
+          "p01R": -0.17498848880429474,
+          "p05R": -0.10245352208460497,
+          "worst5AvgR": -0.1460865513147988,
+          "tailRatio": 15.674907057285285
+        },
+        "breachRate": 0.1206896551724138,
+        "rescueSuccessRate": 0.8571428571428571
+      }
+    },
+    {
+      "regime": "Mar-2020 COVID crash",
+      "metrics": {
+        "tradeCount": 9,
+        "winRate": 0.6666666666666666,
+        "avgCredit": 0.9485874956977115,
+        "expectancyR": 0.0545933051523913,
+        "avgPnl": 137.30556525518034,
+        "totalPnl": 1235.7500872966232,
+        "sharpe": 1.0592404589343445,
+        "sortino": 2.377977218866633,
+        "profitFactor": 1.7479835974833153,
+        "maxDrawdownPct": 0.12677177114421598,
+        "maxDrawdownDollars": 1570.7542818399997,
+        "tailLoss": {
+          "worstR": -0.3779103611251728,
+          "p01R": -0.3779103611251728,
+          "p05R": -0.3779103611251728,
+          "worst5AvgR": -0.3779103611251728,
+          "tailRatio": 1.925603724983841
+        },
+        "breachRate": 0.3333333333333333,
+        "rescueSuccessRate": 0.6666666666666666
+      }
+    },
+    {
+      "regime": "2020-2021 melt-up",
+      "metrics": {
+        "tradeCount": 83,
+        "winRate": 0.6746987951807228,
+        "avgCredit": 0.4936112171007562,
+        "expectancyR": -0.002265701810472953,
+        "avgPnl": -5.661092283857315,
+        "totalPnl": -469.8706595601572,
+        "sharpe": -0.27874533214451985,
+        "sortino": -0.3280522254971379,
+        "profitFactor": 0.8792226991937506,
+        "maxDrawdownPct": 0.12605852062902848,
+        "maxDrawdownDollars": 1374.6389597205434,
+        "tailLoss": {
+          "worstR": -0.2850361343877914,
+          "p01R": -0.2850361343877914,
+          "p05R": -0.11504461755019867,
+          "worst5AvgR": -0.18608520914389892,
+          "tailRatio": 11.408320927396304
+        },
+        "breachRate": 0.13253012048192772,
+        "rescueSuccessRate": 0.8
+      }
+    },
+    {
+      "regime": "2022 bear",
+      "metrics": {
+        "tradeCount": 51,
+        "winRate": 0.6666666666666666,
+        "avgCredit": 0.8142247522497962,
+        "expectancyR": -0.004253611321375757,
+        "avgPnl": -10.488445982020082,
+        "totalPnl": -534.9107450830242,
+        "sharpe": -0.4134999205542648,
+        "sortino": -0.4461909344091779,
+        "profitFactor": 0.8360465616102172,
+        "maxDrawdownPct": 0.12361461800328793,
+        "maxDrawdownDollars": 1309.2414435719202,
+        "tailLoss": {
+          "worstR": -0.3677598616670964,
+          "p01R": -0.3677598616670964,
+          "p05R": -0.1061642587699061,
+          "worst5AvgR": -0.2334876484732591,
+          "tailRatio": 11.0613418272975
+        },
+        "breachRate": 0.11764705882352941,
+        "rescueSuccessRate": 0.6666666666666666
+      }
+    },
+    {
+      "regime": "2023-2024 bull",
+      "metrics": {
+        "tradeCount": 80,
+        "winRate": 0.6875,
+        "avgCredit": 0.5165323077118028,
+        "expectancyR": -0.007055810573020446,
+        "avgPnl": -17.29350208152495,
+        "totalPnl": -1383.480166521996,
+        "sharpe": -0.9600627229676439,
+        "sortino": -1.0046952407677807,
+        "profitFactor": 0.6594647780110666,
+        "maxDrawdownPct": 0.15953100964559883,
+        "maxDrawdownDollars": 1635.517936344615,
+        "tailLoss": {
+          "worstR": -0.2712166645644722,
+          "p01R": -0.2712166645644722,
+          "p05R": -0.13129065986213206,
+          "worst5AvgR": -0.16857415771917886,
+          "tailRatio": 13.622488986542777
+        },
+        "breachRate": 0.15,
+        "rescueSuccessRate": 0.9
+      }
+    },
+    {
+      "regime": "Aug-2024 vol spike",
+      "metrics": {
+        "tradeCount": 5,
+        "winRate": 0.6,
+        "avgCredit": 1.0898320788483127,
+        "expectancyR": -0.04010510420684713,
+        "avgPnl": -97.00448824547263,
+        "totalPnl": -485.0224412273632,
+        "sharpe": -2.2564932857885838,
+        "sortino": -2.241123163428528,
+        "profitFactor": 0.41765674137302616,
+        "maxDrawdownPct": 0.05540885340731857,
+        "maxDrawdownDollars": 554.0885340731857,
+        "tailLoss": {
+          "worstR": -0.23055252130186712,
+          "p01R": -0.23055252130186712,
+          "p05R": -0.23055252130186712,
+          "worst5AvgR": -0.23055252130186712,
+          "tailRatio": 4.736746566134175
+        },
+        "breachRate": 0.2,
+        "rescueSuccessRate": 1
+      }
+    },
+    {
+      "regime": "2024H2-2025",
+      "metrics": {
+        "tradeCount": 65,
+        "winRate": 0.7076923076923077,
+        "avgCredit": 0.8189212590509876,
+        "expectancyR": -0.0074869197234523266,
+        "avgPnl": -18.99863104726887,
+        "totalPnl": -1234.9110180724765,
+        "sharpe": -0.6313079113512231,
+        "sortino": -0.6786666520102467,
+        "profitFactor": 0.7552130551990511,
+        "maxDrawdownPct": 0.23757578263911847,
+        "maxDrawdownDollars": 2456.227770034505,
+        "tailLoss": {
+          "worstR": -0.29515710011742186,
+          "p01R": -0.29515710011742186,
+          "p05R": -0.21231680605978415,
+          "worst5AvgR": -0.278591331893103,
+          "tailRatio": 8.546468529068585
+        },
+        "breachRate": 0.13846153846153847,
+        "rescueSuccessRate": 1
+      }
+    }
+  ],
+  "trials": [
+    {
+      "label": "Δ0.1/stop1.5",
+      "expectancyR": -0.0047,
+      "sharpe": -0.545,
+      "tradeCount": 551
+    },
+    {
+      "label": "Δ0.1/stop2",
+      "expectancyR": -0.0035,
+      "sharpe": -0.347,
+      "tradeCount": 551
+    },
+    {
+      "label": "Δ0.125/stop1.5",
+      "expectancyR": -0.0049,
+      "sharpe": -0.505,
+      "tradeCount": 553
+    },
+    {
+      "label": "Δ0.125/stop2",
+      "expectancyR": -0.0047,
+      "sharpe": -0.418,
+      "tradeCount": 553
+    },
+    {
+      "label": "Δ0.15/stop1.5",
+      "expectancyR": -0.0053,
+      "sharpe": -0.495,
+      "tradeCount": 553
+    },
+    {
+      "label": "Δ0.15/stop2",
+      "expectancyR": -0.0056,
+      "sharpe": -0.46,
+      "tradeCount": 553
+    }
+  ],
+  "guards": {
+    "G1": {
+      "pass": false,
+      "value": 0
+    },
+    "G2": {
+      "pass": false,
+      "value": 0.0438
+    },
+    "G3": {
+      "pass": false,
+      "value": 0.8321
+    },
+    "G4": {
+      "pass": false,
+      "value": -0.0157
+    },
+    "G5": {
+      "pass": false,
+      "value": -0.1015
+    },
+    "G6": {
+      "pass": false,
+      "value": -0.0098
+    }
+  },
+  "backtestMetrics": {
+    "sharpe": -0.5052,
+    "expectancy": -0.0049,
+    "profitFactor": 0.7345,
+    "maxDrawdown": 0.7577,
+    "tradeCount": 553
+  },
+  "verdict": {
+    "pass": false,
+    "guards": {
+      "G1": {
+        "pass": false,
+        "value": 0
+      },
+      "G2": {
+        "pass": false,
+        "value": 0.0438
+      },
+      "G3": {
+        "pass": false,
+        "value": 0.8321
+      },
+      "G4": {
+        "pass": false,
+        "value": -0.0157
+      },
+      "G5": {
+        "pass": false,
+        "value": -0.1015
+      },
+      "G6": {
+        "pass": false,
+        "value": -0.0098
+      }
+    },
+    "blessedParams": {
+      "strategy": "qqq_weekly_pcs_rescue",
+      "shortPutDelta": 0.125,
+      "managedCloseMult": 1.5,
+      "rescueEnabled": true,
+      "slipMult": 1
+    },
+    "backtestMetrics": {
+      "sharpe": -0.5052,
+      "expectancy": -0.0049,
+      "profitFactor": 0.7345,
+      "maxDrawdown": 0.7577,
+      "tradeCount": 553
+    }
+  },
+  "gate": {
+    "state": "fail",
+    "failedChecks": [
+      "optimization verdict FAIL — TRA-540 six-guard overfitting battery not all green (failed: G1, G2, G3, G4, G5, G6)"
+    ]
+  },
+  "registrationBody": {
+    "strategyId": "qqq_weekly_pcs_rescue",
+    "reportId": "TRA-1617-qqq-pcs-rescue-2015-2025",
+    "verdict": {
+      "pass": false,
+      "guards": {
+        "G1": {
+          "pass": false,
+          "value": 0
+        },
+        "G2": {
+          "pass": false,
+          "value": 0.0438
+        },
+        "G3": {
+          "pass": false,
+          "value": 0.8321
+        },
+        "G4": {
+          "pass": false,
+          "value": -0.0157
+        },
+        "G5": {
+          "pass": false,
+          "value": -0.1015
+        },
+        "G6": {
+          "pass": false,
+          "value": -0.0098
+        }
+      },
+      "blessedParams": {
+        "strategy": "qqq_weekly_pcs_rescue",
+        "shortPutDelta": 0.125,
+        "managedCloseMult": 1.5,
+        "rescueEnabled": true,
+        "slipMult": 1
+      },
+      "backtestMetrics": {
+        "sharpe": -0.5052,
+        "expectancy": -0.0049,
+        "profitFactor": 0.7345,
+        "maxDrawdown": 0.7577,
+        "tradeCount": 553
+      }
+    }
+  }
+}
