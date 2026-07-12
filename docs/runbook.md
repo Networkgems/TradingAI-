@@ -472,30 +472,37 @@ retrying the push:
 pnpm check:push-auth     # answers "can I push?" in ~1s; lists stranded commits
 ```
 
-### Diagnosis (2026-07-12)
+### Diagnosis (2026-07-12) — it is a rotating OAuth token, and it will recur
 
-The store is **empty for github.com specifically** — it is not broken. Windows
-Credential Manager holds two working `bitbucket.org` entries, so DPAPI and GCM are
-healthy. Ruled out, in order: `~/.git-credentials` (absent), `~/.netrc` (exists but
-is a surge.sh entry), `GH_TOKEN`/`GITHUB_TOKEN`/`GH_PAT` (unset), `gh` CLI (not
-installed), token embedded in the remote URL (none), Paperclip's secret store
-(holds only its own `master.key`).
+The host authenticates with a **`gho_` GitHub OAuth access token** (GCM generic
+credential `git:https://github.com`, user `Networkgems`). Those **expire on a clock**;
+GCM silently mints a replacement from a companion refresh token.
 
-Note the credential **used to work**: `git reflog show origin/main` records
-`c37b036 … update by push` at 18:27 on 2026-07-12, and the first hung fetch is at
-18:44 the same day. So this is a credential that was **revoked, expired, or erased**
-— not a host that was never provisioned. Git calls the helper's `erase` on a 401,
-which is enough to wipe the entry from Windows Credential Manager after a PAT
-lapses. **Before re-issuing, confirm the old token was not revoked deliberately**
-(e.g. as part of a leaked-secret sweep — cf. TRA-969); if it was, re-issuing the
-same way would reopen the hole.
+That is the whole explanation for the outage: the credential worked at 18:27, was gone
+by 18:44, and came back on its own. Nobody revoked it and nobody re-issued it — **it
+rotated, as designed**. So expect this to happen again. It is self-healing: wait and
+re-run. It only becomes a human ticket if it *stops* self-healing, which means the
+refresh token expired too.
+
+Two traps this cost us, both of the same shape — **presence is not validity**:
+
+- **An expired token does not leave the store.** It fills from `git credential fill`
+  perfectly happily. So any check that tests "is a password present?" prints OK and
+  hands you straight to a 401 on push. The preflight therefore **actually
+  authenticates** (`git ls-remote --heads`, ~1s, bounded and non-interactive).
+- **`git` does not read `$GH_TOKEN`.** That is a `gh` CLI convention, and `gh` is not
+  installed here (`credential.helper=manager`). Exporting the token and stopping there
+  leaves git with *no credential at all* — verified: with the helper disabled and the
+  token set, git reports `could not read Username`. The `credential.helper` line in
+  Option 1 below is not optional garnish; it is the part that makes the token work.
 
 ### Fix — any one of these
 
 Option 1 is the most durable for headless heartbeats.
 
-1. **PAT in the environment** (preferred) — a token with `repo` scope on
-   `Networkgems/TradingAI-`, exported into agent sessions:
+1. **PAT in the environment** (preferred) — a PAT does not rotate, so it removes the
+   recurrence entirely. Needs `repo` scope on `Networkgems/TradingAI-`. **Both steps are
+   required** — the export alone does nothing (see above):
 
    ```powershell
    # PowerShell, persists for the user across sessions

@@ -51,21 +51,32 @@ if (!/^https?:\/\//i.test(remoteUrl)) {
 
 const host = new URL(remoteUrl).host;
 
-// An embedded token in the remote URL is itself a credential.
-if (new URL(remoteUrl).password || new URL(remoteUrl).username) {
-  console.log(`[check-push-auth] OK — '${REMOTE}' carries credentials in its URL.`);
-  process.exit(0);
-}
+// NOTHING BELOW SHORT-CIRCUITS TO OK.
+// -----------------------------------
+// Every source here establishes only that a credential is PRESENT. Presence is not
+// validity — that is the whole lesson of this file — so none of them may pass on their
+// own. They gate the "no credential at all" failure; the ls-remote probe further down is
+// the sole arbiter of "can I actually push?", because it exercises exactly what `git
+// push` exercises.
+//
+// $GH_TOKEN in particular used to exit 0 here, and that was actively dangerous: git does
+// NOT read $GH_TOKEN. It is a `gh` CLI convention, and `gh` is not installed on this host
+// (credential.helper=manager, GCM only). Verified: with the helper disabled and the token
+// set, git reports `could not read Username` — it never looks at the variable. So the old
+// early exit meant that following this script's OWN advice ("export GH_TOKEN=<PAT>")
+// pinned the preflight GREEN forever while git quietly fell back to the rotating GCM
+// token — reinstating the original TRA-1675 hang behind a green light.
 
-// A token in the environment is the durable headless path; git can be pointed at it.
+// An embedded token in the remote URL is a credential git will genuinely use.
+const urlCred = Boolean(new URL(remoteUrl).password || new URL(remoteUrl).username);
+
+// An env token is NOT wired into git by default — see above. Tracked only so the failure
+// report can tell you the difference between "you set no token" and "you set a token git
+// cannot see".
 const envToken = ['GH_TOKEN', 'GITHUB_TOKEN', 'GH_PAT'].find((k) => (process.env[k] ?? '').trim() !== '');
-if (envToken) {
-  console.log(`[check-push-auth] OK — $${envToken} is set for ${host}.`);
-  process.exit(0);
-}
 
-// Otherwise: ask the credential helper, NON-INTERACTIVELY and with a hard bound, so
-// this check can never inherit the very hang it exists to detect.
+// Ask the credential helper, NON-INTERACTIVELY and with a hard bound, so this check can
+// never inherit the very hang it exists to detect.
 let filled = '';
 try {
   filled = execFileSync('git', ['credential', 'fill'], {
@@ -83,7 +94,13 @@ try {
 }
 
 // Presence only. The secret is never read, logged, or compared.
-const present = /^password=.+$/m.test(filled);
+const present = urlCred || /^password=.+$/m.test(filled);
+
+// A PAT is the durable headless fix — it does not rotate — but ONLY once git can see it.
+// Exporting it and stopping there is a no-op: git has no $GH_TOKEN convention.
+const PAT_REMEDY =
+  `  git config --global credential.https://github.com.helper '!f(){ echo username=x-access-token; echo "password=$GH_TOKEN"; }; f'\n` +
+  `  export GH_TOKEN=<PAT with 'repo' scope>   # the helper above is what makes git read this\n`;
 
 const stranded = () => {
   try {
@@ -111,11 +128,19 @@ if (!present) {
       'blocks waiting for a prompt that a headless session can never answer.\n',
   );
   reportStranded();
+  if (envToken) {
+    console.error(
+      `NOTE: $${envToken} IS set — but git cannot see it. $${envToken} is a \`gh\` CLI convention, and git\n` +
+        'has no such convention; it reads only credential.helper, a token-embedded remote URL, or\n' +
+        'GIT_ASKPASS. Exporting the token without wiring it in leaves you with no credential at all.\n',
+    );
+  }
   console.error(
     'Issuing a credential for a private repo is secret issuance, which no agent on this host\n' +
       'can do. Tracked as TRA-1675.\n\n' +
       'Fix (any one), then re-run this check:\n' +
-      `  1. export GH_TOKEN=<PAT with 'repo' scope>       # most durable for headless agents\n` +
+      '  1. wire a PAT into git — most durable for headless agents:\n' +
+      PAT_REMEDY +
       `  2. seed the store once, interactively:  git push ${REMOTE} HEAD\n` +
       '  3. use a token-embedded remote or deploy key\n\n' +
       'Runbook: docs/runbook.md  §8 "GitHub credential for agent pushes"\n',
@@ -182,7 +207,10 @@ console.error(
     '  1. Wait and re-run. Git Credential Manager mints a fresh token from its refresh token;\n' +
     '     the 2026-07-12 outage recovered on its own this way (TRA-1675).\n' +
     `  2. Still failing? The refresh token is expired too. Re-seed interactively: git push ${REMOTE} HEAD\n` +
-    `  3. Durable headless fix: export GH_TOKEN=<PAT with 'repo' scope>  — a PAT does not rotate.\n\n` +
+    '  3. Durable headless fix — a PAT does not rotate. Exporting it is NOT enough; git has no\n' +
+    '     $GH_TOKEN convention, so it must be wired into a credential helper:\n' +
+    PAT_REMEDY +
+    '\n' +
     'Do NOT report work as shipped while this fails. Your commits are still local.\n' +
     'Runbook: docs/runbook.md  §8 "GitHub credential for agent pushes"\n',
 );
