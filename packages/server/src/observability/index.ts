@@ -55,5 +55,16 @@ export type {
   FeedHealth,
   HealthStatus,
 } from './live-health.js';
-export { registerLiveHealthRoutes, runStaleStateCheck, aggregateLiveEquityAcceptance } from './health-routes.js';
-export type { LiveHealthDeps, HealthUserContext, HealthEngineLike, LiveEquityAcceptanceReport } from './health-routes.js';
+// TRA-1684 — `health-routes` is deliberately NOT re-exported here.
+//
+// It is a route registrar, not observability, and it pulls the crypto route graph
+// (`crypto-regime-tsmom-demo-route` -> `crypto-account`) behind it. Re-exporting it
+// from this barrel put that subgraph behind every `import { logger } from
+// './observability/index.js'` — 85 modules — and any one of them reachable from
+// health-routes closes an import cycle. That is exactly how TRA-1674 happened.
+//
+// Re-adding this line does not create one small cycle: it fuses 59 modules into a
+// single strongly-connected component (measured, `pnpm check:cycles`).
+//
+// Import it from './observability/health-routes.js' directly. `pnpm check:cycles`
+// fails the build if this edge comes back.

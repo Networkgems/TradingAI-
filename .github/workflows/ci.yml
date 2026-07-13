@@ -65,6 +65,13 @@ jobs:
       - name: Check for stale compiled output shadowing TS sources
         run: pnpm check:stale-js
 
+      # TRA-1684 — also before build/test. A circular import only throws from SOME
+      # entry points, so prod and the suite can enter the same graph through different
+      # doors and only one of them crashes (TRA-1674). A green suite below is not
+      # evidence the import graph is sound; this step is.
+      - name: Check for import cycles
+        run: pnpm check:cycles
+
       - name: Build shared packages
         run: pnpm -r --filter './packages/**' build
 

@@ -1,5 +1,9 @@
 import nodemailer from 'nodemailer';
-import { logger } from './observability/index.js';
+// TRA-1684 — the LEAF, not the barrel. `observability/index.js` re-exports `alerts.js`,
+// which imports this module back: email -> barrel -> alerts -> email. That cycle is live
+// today and `logger.child()` on the next line runs at module scope inside it — the exact
+// shape that made TRA-1674 throw. Importing the leaf breaks it.
+import { logger } from './observability/logger.js';
 
 const log = logger.child({ module: 'email' });
 

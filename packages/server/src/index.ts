@@ -353,9 +353,10 @@ import {
   recordBootAndCheckRestarts,
   checkTradeVolume,
   checkErrorSpike,
-  registerLiveHealthRoutes,
-  runStaleStateCheck,
 } from './observability/index.js';
+// TRA-1684 — from the module, not the barrel: the barrel re-export dragged the crypto
+// route graph behind every logger import and manufactured the TRA-1674 cycle.
+import { registerLiveHealthRoutes, runStaleStateCheck } from './observability/health-routes.js';
 import {
   rotateBackups,
   checkDataDirHealth,
