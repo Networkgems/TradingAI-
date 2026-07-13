@@ -269,6 +269,7 @@ import {
   PCR_PROMOTION_MIN_SESSIONS,
   PCR_PROMOTION_MIN_UNDERLYINGS,
   PCR_PROMOTION_MAX_NAME_SHARE_PCT,
+  PCR_PROMOTION_MIN_Z_SESSIONS,
 } from './pcr-shadow-ledger.js';
 import { initOiShadowLedger, listOiShadowSignals, isOiShadowEnabled, usableSignalCount as usableOiSignalCount } from './oi-shadow-ledger.js';
 import { initNewsCatalystLedger, listNewsCatalystSignals, isNewsCatalystEnabled, chosenSignalCount } from './news-catalyst-ledger.js';
@@ -4972,6 +4973,12 @@ app.get('/api/health/option-shadow-signals', async (_req, res) => {
 // crosses 200 at session ~9 while the ≥20-session leg needs session ~20; the
 // handoff it triggered would have been ~11 sessions short of the real bar. The
 // per-leg breakdown is surfaced so the gap is visible without re-deriving it.
+//
+// TRA-1676 added the fifth leg: `zSessionCount`. Legs 1-4 grade RATIO rows, but
+// the promotion read grades Z rows, and the z warm-up makes those two different
+// populations — at ledger session 20 the first four legs are green on 500 ratio
+// rows carrying only 10 z-bearing sessions. `zSessionCount` is surfaced next to
+// them so that gap is readable off the endpoint rather than re-derived.
 // Observe-only: nothing here routes an order.
 app.get('/api/health/pcr-shadow-signals', async (_req, res) => {
   try {
@@ -4986,12 +4993,14 @@ app.get('/api/health/pcr-shadow-signals', async (_req, res) => {
         minSessionCount: PCR_PROMOTION_MIN_SESSIONS,
         minUnderlyingCount: PCR_PROMOTION_MIN_UNDERLYINGS,
         maxNameSharePct: PCR_PROMOTION_MAX_NAME_SHARE_PCT,
+        minZSessionCount: PCR_PROMOTION_MIN_Z_SESSIONS,
       },
       count: signals.length,
       usableCount: sufficiency.usableCount,
       sessionCount: sufficiency.sessionCount,
       underlyingCount: sufficiency.underlyingCount,
       maxNameSharePct: Number(sufficiency.maxNameSharePct.toFixed(2)),
+      zSessionCount: sufficiency.zSessionCount,
       legs: sufficiency.legs,
       shortfall: sufficiency.shortfall,
       promotionReady: sufficiency.promotionReady,

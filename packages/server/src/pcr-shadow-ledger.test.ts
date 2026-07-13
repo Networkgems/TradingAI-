@@ -272,9 +272,13 @@ describe('usableSignalCount', () => {
 });
 
 // TRA-1663 — the promotion bar is four legs, not a row count.
+// TRA-1676 — and a fifth, because legs 1-4 grade ratio rows while the read grades z rows.
 describe('pcrSampleSufficiency', () => {
-  // `names` underlyings x `sessions` ET sessions, one usable row each.
-  function grid(names: number, sessions: number): PcrShadowRecord[] {
+  // `names` underlyings x `sessions` ET sessions, one usable row each. Rows from
+  // session index `zFrom` onward carry a z; earlier ones are the warm-up (null z),
+  // mirroring `trailingPcrVolume` — each name's z is null through its own 10th
+  // session. `zFrom: Infinity` (the default) = no row has a z at all.
+  function grid(names: number, sessions: number, zFrom = Infinity): PcrShadowRecord[] {
     const out: PcrShadowRecord[] = [];
     for (let s = 0; s < sessions; s++) {
       for (let u = 0; u < names; u++) {
@@ -285,7 +289,7 @@ describe('pcrSampleSufficiency', () => {
           asof: etTs(s),
           pcrVolume: 1.0,
           pcrOi: 1.0,
-          pcrZ: null,
+          pcrZ: s >= zFrom ? 1.2 : null,
           pcrRegime: 'neutral',
           contrarian: null,
           expiriesUsed: ['2026-08-21'],
@@ -301,11 +305,15 @@ describe('pcrSampleSufficiency', () => {
     return out;
   }
 
-  it('fails closed on an empty ledger — 0 rows must not vacuously clear the concentration leg', () => {
+  it('fails closed on an empty ledger — 0 rows must not vacuously clear the concentration or z leg', () => {
     const s = pcrSampleSufficiency([]);
     expect(s.promotionReady).toBe(false);
     expect(s.legs.nameConcentration).toBe(false);
     expect(s.shortfall).toContain('no usable rows');
+    // TRA-1676: the fifth leg must fail closed too.
+    expect(s.zSessionCount).toBe(0);
+    expect(s.legs.zSessionCount).toBe(false);
+    expect(s.shortfall).toContain('zSessionCount 0 < 20');
   });
 
   // The defect that made the old row-count bar wrong: 25 names x 9 sessions is
@@ -321,15 +329,19 @@ describe('pcrSampleSufficiency', () => {
     expect(s.shortfall).toContain('sessionCount 9 < 20');
   });
 
-  it('is ready at 25 names x 20 sessions — all four legs hold', () => {
-    const s = pcrSampleSufficiency(grid(25, 20));
+  // The green branch, and the only shape that produces it: 20 sessions of rows
+  // that ALL carry a z. If this ever goes red the gate can never release.
+  it('is ready at 25 names x 20 z-bearing sessions — all five legs hold', () => {
+    const s = pcrSampleSufficiency(grid(25, 20, 0));
     expect(s).toMatchObject({
       usableCount: 500,
       sessionCount: 20,
       underlyingCount: 25,
+      zSessionCount: 20,
       promotionReady: true,
       shortfall: [],
     });
+    expect(s.legs.zSessionCount).toBe(true);
     expect(s.maxNameSharePct).toBeCloseTo(4, 6);
   });
 
@@ -368,5 +380,69 @@ describe('pcrSampleSufficiency', () => {
     expect(s.usableCount).toBe(1);
     expect(s.underlyingCount).toBe(1); // QQQ's nulled row contributes nothing
     expect(s.promotionReady).toBe(false);
+  });
+
+  // TRA-1676 — the defect the four-leg bar could not see. The z warm-up means the
+  // ratio population and the z population are NOT the same rows, so a ledger can
+  // be green on all four ratio legs while the read's own sample is half-built.
+  describe('the fifth leg — z-bearing sessions', () => {
+    it('is NOT ready at 25 names x 20 sessions: 4 legs green on 500 ratio rows, but only 10 z-bearing sessions', () => {
+      // The real accrual: each name's z is null through its own 10th session, so
+      // at ledger session 20 the ledger carries 500 usable rows and 10 z sessions.
+      const s = pcrSampleSufficiency(grid(25, 20, 10));
+
+      // Every leg the old bar graded is green...
+      expect(s.usableCount).toBe(500);
+      expect(s.legs.usableCount).toBe(true);
+      expect(s.legs.sessionCount).toBe(true);
+      expect(s.legs.underlyingCount).toBe(true);
+      expect(s.legs.nameConcentration).toBe(true);
+
+      // ...and the sample the promotion read actually consumes is half the bar.
+      expect(s.zSessionCount).toBe(10);
+      expect(s.legs.zSessionCount).toBe(false);
+      expect(s.promotionReady).toBe(false);
+      expect(s.shortfall).toEqual(['zSessionCount 10 < 20']);
+    });
+
+    it('is ready at 25 names x 30 sessions — 10 warm-up + 20 z-bearing', () => {
+      const s = pcrSampleSufficiency(grid(25, 30, 10));
+      expect(s.sessionCount).toBe(30);
+      expect(s.zSessionCount).toBe(20);
+      expect(s.legs.zSessionCount).toBe(true);
+      expect(s.promotionReady).toBe(true);
+      expect(s.shortfall).toEqual([]);
+    });
+
+    // Boundary, from the failing side: one z-session short must still hold the gate.
+    it('holds at 19 z-bearing sessions and releases at exactly 20', () => {
+      const short = pcrSampleSufficiency(grid(25, 30, 11));
+      expect(short.zSessionCount).toBe(19);
+      expect(short.promotionReady).toBe(false);
+      expect(short.shortfall).toEqual(['zSessionCount 19 < 20']);
+
+      const exact = pcrSampleSufficiency(grid(25, 30, 10));
+      expect(exact.zSessionCount).toBe(20);
+      expect(exact.promotionReady).toBe(true);
+    });
+
+    it('counts SESSIONS, not z rows — 500 z rows on 10 sessions do not clear it', () => {
+      // Same 10 z-bearing sessions, but every name carries a z on each of them.
+      // A row-count leg would read 250 and feel roomy; the leg reads 10 and holds.
+      const s = pcrSampleSufficiency(grid(25, 20, 10));
+      const zRows = grid(25, 20, 10).filter((r) => typeof r.pcrZ === 'number').length;
+      expect(zRows).toBe(250);
+      expect(s.zSessionCount).toBe(10);
+      expect(s.promotionReady).toBe(false);
+    });
+
+    it('a z-bearing row is what counts the session — one name is enough, a null-z session is not', () => {
+      const rows = grid(3, 2); // 2 sessions, no z anywhere
+      expect(pcrSampleSufficiency(rows).zSessionCount).toBe(0);
+
+      // Give exactly ONE row in ONE session a z: that session, and only it, counts.
+      const withOneZ = rows.map((r, i) => (i === 0 ? { ...r, pcrZ: -2.4 } : r));
+      expect(pcrSampleSufficiency(withOneZ).zSessionCount).toBe(1);
+    });
   });
 });

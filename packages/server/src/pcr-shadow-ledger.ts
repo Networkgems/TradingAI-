@@ -283,7 +283,17 @@ export function usableSignalCount(records: readonly PcrShadowRecord[]): number {
 //
 // The legs exist because rows are NOT iid: a market-wide fear day lifts every
 // name's PCR together, so effective N tracks the number of SESSIONS, not the
-// number of rows. All four legs must hold.
+// number of rows. All five legs must hold.
+//
+// TRA-1676 — the four legs above grade RATIO rows; the promotion read grades Z
+// rows, and after TRA-1663 those are two different populations. `pcrZ` stays
+// null until a name has PCR_Z_MIN_SAMPLES (10) strictly-prior sessions of its
+// own, so at ledger session 20 all four legs are green on 500 ratio rows while
+// only 10 sessions carry a z at all. Half the effective N the session leg exists
+// to guarantee — and worst exactly where the read lives, since the extreme-|z|
+// buckets it hunts are produced by the same cross-name correlation that motivates
+// the session leg, so those rows plausibly collapse onto 1-3 macro days. The
+// fifth leg grades the population the read actually consumes.
 
 /** Usable rows required (the promotion denominator). */
 export const PCR_PROMOTION_MIN_USABLE = 200;
@@ -293,6 +303,12 @@ export const PCR_PROMOTION_MIN_SESSIONS = 20;
 export const PCR_PROMOTION_MIN_UNDERLYINGS = 5;
 /** No single underlying may exceed this share of the usable rows. */
 export const PCR_PROMOTION_MAX_NAME_SHARE_PCT = 40;
+/**
+ * Distinct ET sessions that must carry at least one z-BEARING row (TRA-1676).
+ * The effective-N leg for the promotion read itself: 10 warm-up sessions + 20
+ * z-bearing sessions = 30 ledger sessions before `promotionReady` can flip.
+ */
+export const PCR_PROMOTION_MIN_Z_SESSIONS = 20;
 
 /** Each leg of the promotion bar, plus the measured value behind it. */
 export interface PcrSampleSufficiency {
@@ -303,22 +319,28 @@ export interface PcrSampleSufficiency {
   underlyingCount: number;
   /** Largest single-underlying share of the usable rows, in percent (0 when empty). */
   maxNameSharePct: number;
+  /** Distinct ET sessions carrying >=1 row with a non-null `pcrZ` (TRA-1676). */
+  zSessionCount: number;
   legs: {
     usableCount: boolean;
     sessionCount: boolean;
     underlyingCount: boolean;
     nameConcentration: boolean;
+    zSessionCount: boolean;
   };
-  /** True only when ALL FOUR legs hold. */
+  /** True only when ALL FIVE legs hold. */
   promotionReady: boolean;
   /** Human-readable reasons the bar is not met (empty when `promotionReady`). */
   shortfall: string[];
 }
 
 /**
- * Grade the accrued ledger against the full four-leg promotion bar. Every leg is
- * a POSITIVE assertion evaluated over the USABLE rows only — an empty ledger
- * fails (it does not vacuously pass the concentration leg), so this fails closed.
+ * Grade the accrued ledger against the full five-leg promotion bar. Every leg is
+ * a POSITIVE assertion — an empty ledger fails all five (it does not vacuously
+ * pass the concentration leg, and 0 z-sessions is not >= 20), so this fails closed.
+ * Legs 1-4 are evaluated over the USABLE (non-null `pcrVolume`) rows; leg 5 is
+ * evaluated over the Z-BEARING rows, which `recordPcrObservation` guarantees are
+ * a subset of the usable ones — a null ratio never gets a z.
  */
 export function pcrSampleSufficiency(
   records: readonly PcrShadowRecord[],
@@ -327,6 +349,10 @@ export function pcrSampleSufficiency(
   const usableCount = usable.length;
 
   const sessionCount = new Set(usable.map((r) => r.session)).size;
+
+  const zSessionCount = new Set(
+    records.filter((r) => typeof r.pcrZ === 'number').map((r) => r.session),
+  ).size;
 
   const perName = new Map<string, number>();
   for (const r of usable) perName.set(r.underlying, (perName.get(r.underlying) ?? 0) + 1);
@@ -340,6 +366,7 @@ export function pcrSampleSufficiency(
     underlyingCount: underlyingCount >= PCR_PROMOTION_MIN_UNDERLYINGS,
     // Requires rows to exist: a 0-row ledger must not satisfy "no name >40%".
     nameConcentration: usableCount > 0 && maxNameSharePct <= PCR_PROMOTION_MAX_NAME_SHARE_PCT,
+    zSessionCount: zSessionCount >= PCR_PROMOTION_MIN_Z_SESSIONS,
   };
 
   const shortfall: string[] = [];
@@ -359,12 +386,16 @@ export function pcrSampleSufficiency(
         : `maxNameSharePct ${maxNameSharePct.toFixed(1)} > ${PCR_PROMOTION_MAX_NAME_SHARE_PCT}`,
     );
   }
+  if (!legs.zSessionCount) {
+    shortfall.push(`zSessionCount ${zSessionCount} < ${PCR_PROMOTION_MIN_Z_SESSIONS}`);
+  }
 
   return {
     usableCount,
     sessionCount,
     underlyingCount,
     maxNameSharePct,
+    zSessionCount,
     legs,
     promotionReady: Object.values(legs).every(Boolean),
     shortfall,
