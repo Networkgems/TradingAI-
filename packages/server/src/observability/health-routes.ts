@@ -45,6 +45,8 @@ import { summarizeDirectionalGate } from '../directional-open-ledger.js';
 import { summarizeEntryGreeksGate } from '../entry-greeks-ledger.js';
 import { RV_LONG_DELTA_FLOOR } from '@trading-app/engine';
 import { summarizeCostAwareGate } from '../cost-aware-gate-ledger.js';
+import { evaluateDurability } from '../durability.js'; // TRA-1681
+import { getStateDbStatus } from '../sqlite.js'; // TRA-1681
 import {
   isOptionCostAwareGateEnabled,
   resolveCostGateConfig,
@@ -1241,6 +1243,64 @@ export function registerLiveHealthRoutes(app: Express, deps: LiveHealthDeps): vo
   // DEMO-ONLY by construction: `costAwareGateReject` early-returns on `mode!=='demo'`
   // and on the flag being off, so every counter reflects an armed DEMO book and this
   // surface is structurally incapable of describing a live open. No balances/PII.
+  // TRA-1681 — IS ANYTHING ON THIS BOX ACTUALLY DURABLE?
+  //
+  // The one question every multi-session grade depends on and no existing surface could
+  // answer. Each durable store publishes its own local counters, and every one of them
+  // reads exactly the same on a box whose DATA_DIR is a directory inside the build
+  // bundle: the ledger hydrates (from a file it wrote this uptime), appends succeed (the
+  // path really is writable), `etDays[]` fills. Nothing throws. Nothing warns. The data
+  // is gone at the next redeploy.
+  //
+  // `checkDataDirHealth()` has computed the right predicate since TRA-140 — and sent it
+  // to `log.warn`. bqb1 exposes no log surface to a grader (no TRADING_ADMIN_*; public
+  // `/api/health/*` only), so the one fact that invalidates every durable count on the
+  // box was, in practice, unreadable by the person who needed it. This route is that fix:
+  // a fact that only reaches a log line does not exist downstream. Put it in the PAYLOAD.
+  //
+  // Read `ephemeral` FIRST. It is a property of the PATH, so it is decisive on the very
+  // first boot, before a single row exists — unlike `hydratedRecords`, which cannot tell
+  // a fresh persistent disk from a wiped ephemeral one.
+  //
+  // `ok` is TRUE only when nothing is broken AND nothing is unmeasured. An unmeasured
+  // guarantee is not a satisfied one (`corruptLines: null` means no load has run, never
+  // "a clean load"), and treating the two as the same is the exact false-green this whole
+  // chain of tickets is made of. No balances/PII — a path, some counters, and a verdict.
+  app.get('/api/health/durability', (_req, res) => {
+    const dataDir = process.env.DATA_DIR ?? null;
+    const etDay = etDateString(new Date(now()));
+    const ledger = summarizeCostAwareGate(etDay).durability;
+    const report = evaluateDurability({
+      // The LEDGER's resolved dir is the truth when it has one: it is the path bytes are
+      // actually appended to. `process.env.DATA_DIR` is what the operator *set*, and on a
+      // box where it is unset the two disagree in precisely the way that matters — the
+      // ledger falls back to a bundle path and writes there happily.
+      dataDir: ledger.dataDir ?? dataDir,
+      stateDb: getStateDbStatus(),
+      journal: getOptionTradeJournalIntegrity(),
+      ledger: { appendErrors: ledger.appendErrors },
+    });
+    res.json({
+      ok: report.ok,
+      time: new Date(now()).toISOString(),
+      build: resolveBuildInfo(),
+      // Spelled out rather than spread: `ephemeral` and `violations` are the two fields a
+      // grader acts on, and they belong above the fold, not wherever a spread happens to
+      // put them.
+      policy: report.policy,
+      dataDir: report.dataDir,
+      ephemeral: report.ephemeral,
+      stateDb: report.stateDb,
+      journal: report.journal,
+      ledger: report.ledger,
+      violations: report.violations,
+      unmeasured: report.unmeasured,
+      note: report.ok
+        ? 'Durable state is intact: DATA_DIR is on a persistent mount, the hot-state store is open, and the journal loaded clean. Counts on this box survive a redeploy.'
+        : `NOT DURABLE${report.violations.length > 0 ? ` — broken: ${report.violations.join(', ')}` : ''}${report.unmeasured.length > 0 ? ` — unmeasured (VOIDS a grade, does not stop a boot): ${report.unmeasured.join(', ')}` : ''}. Any multi-session window read off this box is VOID. Policy is '${report.policy}' (set DURABILITY_POLICY=refuse to make a broken guarantee stop the boot).`,
+    });
+  });
+
   app.get('/api/health/cost-aware-gate', (_req, res) => {
     const dir = process.env.DATA_DIR;
     const env = dir ? resolveDemoFlagEnv(dir) : process.env;

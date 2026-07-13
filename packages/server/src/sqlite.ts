@@ -6,13 +6,20 @@
 // lives under DATA_DIR so it sits on the Render persistent disk (render.yaml
 // `disk.mountPath: /data`), surviving restarts and redeploys.
 //
-// FAIL-SOFT BY DESIGN: `better-sqlite3` is a native module. If its prebuilt
-// binary is unavailable on a host (e.g. the install-script prebuild was skipped
-// — see the `pnpm.onlyBuiltDependencies` allowlist in the root package.json),
-// `initStateDb` swallows the error, `getStateDb()` returns null, and every
-// caller transparently falls back to its prior in-memory / JSON behaviour. The
-// boot path therefore NEVER throws because of this module — at worst the new
-// durability is silently disabled, which is exactly today's behaviour.
+// FAIL-SOFT BY DESIGN — and TRA-1681 is the bill for that. `better-sqlite3` is a
+// native module. If its prebuilt binary is unavailable on a host (e.g. the
+// install-script prebuild was skipped — see the `pnpm.onlyBuiltDependencies`
+// allowlist in the root package.json), `initStateDb` swallows the error,
+// `getStateDb()` returns null, and every caller transparently falls back to its
+// prior in-memory / JSON behaviour. The boot path therefore NEVER throws because of
+// this module — durable hot-state is just silently disabled, and the agent-spend cap
+// stops surviving restarts with one log line to say so.
+//
+// The swallow stays (a broken native module should not take the server down on its
+// own authority) but it is no longer SILENT: the failure is latched and published via
+// `getStateDbStatus()`, and `durability.ts` owns the single decision about whether a
+// box in that state is allowed to run. A fact that only reaches a log line does not
+// exist for anyone downstream — bqb1 exposes no log surface to a grader.
 import { join } from 'path';
 import { mkdirSync } from 'fs';
 import { createRequire } from 'module';
@@ -42,6 +49,8 @@ export const STATE_DB_FILENAME = 'state.db';
 
 let db: StateDb | null = null;
 let initialized = false;
+/** TRA-1681 — why the store did not open. Latched so the failure reaches the PAYLOAD. */
+let lastError: string | null = null;
 
 /**
  * Open (once) the shared SQLite state database under `dir` (DATA_DIR — the
@@ -65,12 +74,14 @@ export function initStateDb(dir: string): StateDb | null {
     handle.pragma('synchronous = NORMAL');
     handle.pragma('busy_timeout = 5000');
     db = handle;
+    lastError = null;
     log.info('SQLite state store opened', { path });
   } catch (err) {
     db = null;
+    lastError = err instanceof Error ? err.message : String(err);
     log.error(
       'SQLite state store unavailable — durable hot-state DISABLED (falling back to in-memory/JSON)',
-      { reason: err instanceof Error ? err.message : String(err) },
+      { reason: lastError },
     );
   }
   return db;
@@ -79,6 +90,20 @@ export function initStateDb(dir: string): StateDb | null {
 /** The shared state db, or null when persistence is unavailable/uninitialised. */
 export function getStateDb(): StateDb | null {
   return db;
+}
+
+/**
+ * TRA-1681 — did the durable hot-state store actually open, and if not, why?
+ *
+ * `initialized` is the field that keeps this HONEST. A null handle means two entirely
+ * different things: "the native module failed to load" (broken — the spend cap is not
+ * durable) and "nobody has called `initStateDb` yet" (a CLI, a unit test — not broken
+ * at all). Collapsing them to `available: false` would make every test run look like a
+ * production outage, and the guard that cried wolf gets disarmed. Read `initialized`
+ * first; `available: false` is only a violation once it is true.
+ */
+export function getStateDbStatus(): { available: boolean; reason: string | null; initialized: boolean } {
+  return { available: db !== null, reason: lastError, initialized };
 }
 
 /**
@@ -95,6 +120,7 @@ export function __setStateDbForTests(dir: string | null): StateDb | null {
   }
   db = null;
   initialized = false;
+  lastError = null;
   if (dir === null) return null;
   return initStateDb(dir);
 }

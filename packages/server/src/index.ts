@@ -167,7 +167,8 @@ import {
 } from './reports/tradier-reconcile.js';
 import { createToken, verifyToken, createPendingToken, verifyPendingToken, generateResetToken, consumeResetToken, initResetTokenStore } from './auth.js';
 import { initTwoFactorStore, issueChallenge, resendChallenge, verifyChallenge } from './two-factor.js';
-import { initStateDb, getStateDb } from './sqlite.js'; // TRA-1052 — durable hot-state SQLite store
+import { initStateDb, getStateDb, getStateDbStatus } from './sqlite.js'; // TRA-1052 — durable hot-state SQLite store
+import { evaluateDurability, enforceDurabilityPolicy } from './durability.js'; // TRA-1681 — fail CLOSED
 import { checkThrottle, recordFailure, recordSuccess } from './auth-throttle.js';
 import { getSettings, loadSettings, mergeScopedRiskSettings, saveSettings } from './account-settings.js';
 import { resolveLiveBrokerOperator, isLiveBrokerOperator, shouldBootArmLiveEquity, resolveLiveBrokerArmDrift } from './signal-engine.js';
@@ -543,6 +544,36 @@ initTwoFactorStore(DATA_DIR);
 // native binary is unavailable this disables durable hot-state and logs, but the
 // server still boots (stores fall back to in-memory/JSON).
 initStateDb(DATA_DIR);
+
+// TRA-1681 — THE FAIL-CLOSED GATE. Every durable store above fails open, each for its
+// own defensible local reason, and the sum of those reasons is a box that can run with
+// nothing durable under it while reading perfectly healthy. This is the one place that
+// looks at the whole picture and is allowed to say no.
+//
+// It runs HERE — after DATA_DIR is resolved and the state db has tried to open, before
+// any store hydrates or any engine tick fires — because the point of refusing is to
+// refuse BEFORE a sample starts accruing that nobody will be able to grade.
+//
+// Under the default policy (`observe`) this only logs: behaviour is byte-for-byte what
+// it was. Under `DURABILITY_POLICY=refuse` a KNOWN-BROKEN guarantee stops the boot.
+{
+  const report = evaluateDurability({ dataDir: DATA_DIR, stateDb: getStateDbStatus() });
+  if (report.violations.length > 0) {
+    log.error('TRA-1681 durable state is BROKEN', {
+      policy: report.policy,
+      violations: report.violations,
+      dataDir: report.dataDir,
+      ephemeral: report.ephemeral,
+    });
+  } else {
+    log.info('TRA-1681 durable state OK at boot', { policy: report.policy, dataDir: report.dataDir });
+  }
+  // Throws only under `refuse`. Deliberately NOT caught: a box that has been told to
+  // require durability and cannot provide it must not reach the engine. Refusing on
+  // `violations` only — the journal has not been read yet at this point, and refusing
+  // over a measurement that cannot exist yet would make the process unbootable.
+  enforceDurabilityPolicy(report);
+}
 
 // TRA-801 — ensure SupertrendConfluence has a promotion record so its Stage-2
 // paper accrual surfaces on the `GET /api/promotion/status` overview list (which

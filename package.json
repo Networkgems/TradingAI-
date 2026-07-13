@@ -34,7 +34,7 @@
     "pnpm": ">=9"
   },
   "pnpm": {
-    "//": "TRA-1052 — .npmrc sets approve-builds=false, so pnpm skips dependency install/build scripts unless allowlisted here. better-sqlite3 is a native module that relies on prebuild-install (an install script) to fetch its prebuilt binary; WITHOUT this entry the binary is silently absent and the server crashes on require. Listed explicitly so `pnpm install --frozen-lockfile` on Render fetches the prebuilt .node (no compilation, so no render-build OOM regression — TRA-1037/1038).",
+    "//": "TRA-1052 — .npmrc sets approve-builds=false, so pnpm skips dependency install/build scripts unless allowlisted here. better-sqlite3 is a native module that relies on prebuild-install (an install script) to fetch its prebuilt binary; WITHOUT this entry the binary is silently absent. TRA-1681 — this comment used to claim the server then 'crashes on require'. IT DOES NOT, and that wrong sentence is why the real risk looked self-announcing for months: sqlite.ts CATCHES the missing module, getStateDb() returns null, every caller falls back to in-memory, and the box boots and serves normally with the agent-spend cap NO LONGER DURABLE across restarts. The only signal is one log line, on a host that exposes no logs to a grader. `GET /api/health/durability` is now the readable verdict, and DURABILITY_POLICY=refuse is what makes it stop a boot. Listed explicitly so `pnpm install --frozen-lockfile` on Render fetches the prebuilt .node (no compilation, so no render-build OOM regression — TRA-1037/1038).",
     "onlyBuiltDependencies": [
       "better-sqlite3"
     ]

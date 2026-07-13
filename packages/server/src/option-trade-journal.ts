@@ -335,6 +335,21 @@ async function ensureLoaded(): Promise<Map<string, OptionTradeJournalRecord>> {
     log.warn('option trade journal skipped unparseable lines', { corruptLines, path });
   }
   integrity = { corruptLines, readError };
+
+  // TRA-1681 — do NOT cache a book we could not read.
+  //
+  // The empty map used to be memoised here unconditionally, so ONE failed read (a disk
+  // flap, an EIO, a mount that came up late) permanently pinned the journal to zero rows
+  // for the rest of the process lifetime. The read error was transient; the empty book
+  // was forever, and it read exactly like a desk that had never traded. Leaving `cache`
+  // null costs a re-read on the next call — a file read on a cold path — and buys back
+  // the ability to recover the moment the disk does.
+  //
+  // The integrity latch above is deliberately still SET, so a reader that came in during
+  // the outage can see `readError` and VOID rather than trust the zero (TRA-1690
+  // assertion 9). Fail closed on the GRADE, retry on the READ.
+  if (readError !== null) return map;
+
   cache = map;
   return cache;
 }

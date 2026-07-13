@@ -99,4 +99,34 @@ describe('option journal load integrity (TRA-1681)', () => {
 
     await rm(dirAsFile, { force: true, recursive: true });
   });
+
+  it('does not CACHE the empty book after a read error — the next read recovers', async () => {
+    // The fail-open, not the instrument. The empty map used to be memoised, so ONE
+    // failed read (a disk flap, a mount that came up late) pinned the journal to zero
+    // rows for the whole process lifetime. The error was transient; the empty book was
+    // forever — and it read exactly like a desk that had never traded.
+    //
+    // Note what this test does NOT do: it never re-calls setOptionTradeJournalFileForTests
+    // between the two reads. That seam clears the cache, and clearing the cache is
+    // precisely the thing the old code could only do by being restarted.
+    const flapping = join(tmpdir(), `tra1681-flap-${process.pid}-${counter++}.jsonl`);
+    await rm(flapping, { force: true, recursive: true });
+    const { mkdir } = await import('fs/promises');
+    await mkdir(flapping, { recursive: true }); // a directory ⇒ readFile throws EISDIR
+
+    setOptionTradeJournalFileForTests(flapping);
+    expect(await listOptionTradeJournal()).toEqual([]);
+    expect(getOptionTradeJournalIntegrity().readError).not.toBeNull();
+
+    // The disk comes back: same path, now a real journal with a real row.
+    await rm(flapping, { force: true, recursive: true });
+    await writeFile(flapping, `${JSON.stringify({ kind: 'open', rec: baseOpen({ id: 'recovered' }) })}\n`, 'utf-8');
+
+    const rows = await listOptionTradeJournal();
+
+    expect(rows.map((r) => r.id)).toEqual(['recovered']);
+    expect(getOptionTradeJournalIntegrity()).toEqual({ corruptLines: 0, readError: null });
+
+    await rm(flapping, { force: true, recursive: true });
+  });
 });
