@@ -75,6 +75,23 @@ describe('loadDemoFlagFile', () => {
     });
   });
 
+  // TRA-1682 — the entry-greeks gate was the ONLY option-entry gate with no daemon-free
+  // lever. TRA-1677 then found it algebraically impossible (short-premium band
+  // [0.30,0.40] vs a 0.45 selector floor — empty intersection, 100% reject), and there
+  // was no way to disarm it short of a Render env change that was itself behind a deploy
+  // pin: the failure and its remedy were locked behind the same door. It is non-secret and
+  // demo-only (the engine consults it solely on the `mode === 'demo'` branch), so it meets
+  // the same bar as the take-profit-early / OTM-floor / delta-ceiling levers above.
+  it('honors the TRA-1682 entry-greeks-gate demo flag (the arm/DISARM lever the impossible gate lacked)', () => {
+    // Both the gate and its EXIT_RISK_RULES master must be file-flippable, or the lever
+    // is only half there — `isEntryGreeksGateEnabled` requires the master too.
+    writeFlags({ ENTRY_GREEKS_GATE_ENABLED: 1, EXIT_RISK_RULES_ENABLED: 'true' });
+    expect(loadDemoFlagFile(dir)).toEqual({
+      ENTRY_GREEKS_GATE_ENABLED: '1',
+      EXIT_RISK_RULES_ENABLED: 'true',
+    });
+  });
+
   it('honors the TRA-1476 directional quality-gate demo flags (arm lever + tunable floors/cap)', () => {
     writeFlags({
       ENABLE_OPTION_DIRECTIONAL_QUALITY_GATE: 1,

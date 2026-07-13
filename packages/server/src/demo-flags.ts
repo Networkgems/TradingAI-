@@ -102,6 +102,18 @@ export const DEMO_FLAG_ALLOWLIST = [
   // the self-hosted host after QuantTrader's forward-validation (no PM2/admin).
   'OTM_DELTA_FLOOR_ENABLED',
   'OTM_DELTA_FLOOR',
+  // TRA-1682 (parent TRA-1680 → TRA-1677) — the TRA-1293 PoP/delta entry-greeks gate.
+  // Non-secret and DEMO-only by construction: the signal-engine consults this flag ONLY
+  // on the `mode === 'demo'` RV-long branch (live reads ENABLE_OPTION_LIVE_RV_LONG from
+  // process.env, never the file), so it is structurally incapable of altering a live
+  // option open — the same bar TAKE_PROFIT_EARLY_ENABLED / OTM_DELTA_FLOOR_ENABLED /
+  // OPTION_ENTRY_DELTA_CEILING_ENABLED already clear. It was the ONLY option-entry gate
+  // with no daemon-free lever, and TRA-1677 showed exactly why that matters: the gate
+  // turned out to be ALGEBRAICALLY IMPOSSIBLE (short-premium band [0.30,0.40] vs a
+  // selector floor of 0.45 — empty intersection, 100% reject) and there was no way to
+  // disarm it short of a Render env change, itself blocked behind a deploy pin. The
+  // failure and its remedy were locked behind the same door. Not again.
+  'ENTRY_GREEKS_GATE_ENABLED',
   // TRA-1670 (TRA-1647B, parent TRA-1647) — the CEILING half of the entry-delta band.
   // The TRA-1602 cost gate is algebraically a delta FLOOR (admit ⟺ |Δ| ≥ (bar+1) /
   // (mult·(rewardR+1))), so no retune of its seven knobs can cut the measured Δ>0.55

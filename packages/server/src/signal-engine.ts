@@ -91,6 +91,7 @@ import {
   type OpenSleeve,
 } from './directional-open-ledger.js';
 import { recordCostAwareGateDecision, recordEntryDeltaCeilingReject } from './cost-aware-gate-ledger.js';
+import { recordEntryGreeksVerdict } from './entry-greeks-ledger.js';
 import { isMultiLegOpenPaused } from './multileg-open-pause-flag.js';
 import { isMultiLegExitEnabled } from './multileg-exit-flag.js';
 import { recordConvictionDcaFill } from './conviction-dca-ledger.js';
@@ -4860,9 +4861,19 @@ export class SignalEngine {
           // TRA-1183 — tag ema-pullback (Trend-Pullback) single-leg fills so they
           // are countable distinctly from bare single_leg_rv in the journal
           // rollup. `emaPullbackReason` is non-null only when the EMA-pullback
-          // sub-flag admitted this long (computed at ~:3156); a bare RV long
-          // leaves it undefined and folds under the `unspecified` baseline.
-          ...(emaPullbackReason ? { entryArchetype: 'ema-pullback' } : {}),
+          // sub-flag admitted this long (computed at ~:3156).
+          //
+          // TRA-1682 — a bare RV long used to leave `entryArchetype` UNSET and fold
+          // into the `unspecified` rollup baseline. That baseline is not a cohort:
+          // it blended this (the selector-gated, greeks-gated RV long) with the
+          // ungated demo DIRECTIONAL opener and with `single_leg_otm` rows, all of
+          // which also journalled untagged. Every RV-structure grade taken off it was
+          // therefore unattributable — 416 of 1058 `single_leg_rv` rows carried
+          // |Δ| < 0.45, which `selectRvLongCandidate` is structurally incapable of
+          // emitting. Tag it explicitly so `rv-long` is a clean cohort key to grade on.
+          ...(emaPullbackReason
+            ? { entryArchetype: 'ema-pullback' }
+            : { entryArchetype: 'rv-long' }),
         };
 
         // TRA-1293 — PoP / delta entry gate + Delta/Theta ratio floor. HARD
@@ -4928,6 +4939,17 @@ export class SignalEngine {
             deltaBandMin: RV_LONG_DELTA_FLOOR,
             deltaBandMax: 1,
           });
+          // TRA-1682 — COUNT the verdict (durable, per ET day, by reason) so
+          // `/api/health/entry-greeks-gate` reports what the gate DID, not just that
+          // it is armed. Both branches record: the admit rate is the whole point.
+          // TRA-1677 is why — this gate was armed with an algebraically empty
+          // admissible set for a week and rejected 100% of RV longs, which is
+          // indistinguishable from a quiet tape when nothing counts. It also makes
+          // TRA-1293's own forward-sample (gate 2's rejection rate, the stated
+          // pre-live-promotion bar) takeable for the first time. Observe-only: the
+          // record happens AFTER the decision and never changes it.
+          const gateAsOf = Date.now();
+          recordEntryGreeksVerdict(gate.admitted, gate.reason, etDateString(new Date(gateAsOf)), 'rv-long', gateAsOf);
           if (!gate.admitted) {
             log.info('RV long rejected by PoP/delta entry gate (TRA-1293)', {
               sym,
@@ -6229,6 +6251,17 @@ export class SignalEngine {
           sentiment: null,
           sentimentIcBand: null,
           agentConviction: null,
+          // TRA-1682 — THE load-bearing tag. `openOptionFromRvCandidate` journals
+          // `structure: 'single_leg_rv'` unconditionally for all three of its callers,
+          // so this sleeve — the dominant demo churner, ungated by the |Δ|≥0.45
+          // selector AND by the TRA-1293 greeks gate — was landing in the same
+          // untagged bucket as the gated RV long and could not be told apart from it.
+          // The consequence was worse than bookkeeping: TRA-1680's impossible gate
+          // would have driven the true RV long to ZERO fills and the `single_leg_rv`
+          // fill count WOULD NOT HAVE MOVED, because directional kept feeding the same
+          // counter. A dead sleeve was undetectable by the exact metric we would have
+          // used to detect it. Forward-only — historical rows cannot be back-attributed.
+          entryArchetype: 'directional',
         };
         // TRA-1490 — surface a live directional signal whose broker mirror was
         // suppressed/voided instead of skipping silently (mirrors the RV path's

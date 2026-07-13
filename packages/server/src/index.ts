@@ -128,6 +128,7 @@ import {
 import { hydrateConvictionDcaFromDisk } from './conviction-dca-ledger.js';
 import { hydrateScaleoutLadderFromDisk } from './scaleout-ladder-ledger.js';
 import { hydrateDirectionalOpensFromDisk } from './directional-open-ledger.js';
+import { hydrateEntryGreeksGateFromDisk } from './entry-greeks-ledger.js';
 import { hydrateCostAwareGateFromDisk } from './cost-aware-gate-ledger.js';
 import { fetchCrypto4hBars } from './crypto-feed.js';
 import type { CryptoSignalEngine } from './crypto-engine.js';
@@ -2301,6 +2302,23 @@ async function runHourlyCryptoRegimeTsmom(): Promise<void> {
     // RTH session's gate rejects after the daily close reboot.
     log.info('directional per-name open ledger hydrated (TRA-1486/TRA-1564)', {
       records: h.records,
+      rejects: h.rejects,
+      days: h.days,
+    });
+  }
+}
+
+// TRA-1682 (parent TRA-1680 → TRA-1677) — rebuild the ENTRY-GREEKS gate's admit/reject
+// tally and remember DATA_DIR for subsequent appends. Durable for the same reason the
+// directional rejects are (TRA-1564 B1): bqb1 reboots at/after the close, so an
+// in-memory since-boot counter reads empty by the time a post-close grade fires — and
+// this particular counter is the one that would have caught TRA-1677's algebraically
+// impossible gate (100% reject, invisible for a week). Compacted to a 3-day window.
+{
+  const h = hydrateEntryGreeksGateFromDisk(DATA_DIR);
+  if (h.admitted > 0 || h.rejects > 0) {
+    log.info('entry-greeks gate ledger hydrated (TRA-1682)', {
+      admitted: h.admitted,
       rejects: h.rejects,
       days: h.days,
     });

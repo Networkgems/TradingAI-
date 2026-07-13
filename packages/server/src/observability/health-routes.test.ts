@@ -37,6 +37,7 @@ import {
   recordChurnBrakeDcaHalt,
 } from '../churn-brake-ledger.js';
 import { clearCostAwareGateLedger, recordCostAwareGateDecision } from '../cost-aware-gate-ledger.js';
+import { clearEntryGreeksLedger, recordEntryGreeksVerdict } from '../entry-greeks-ledger.js';
 import { etDateString } from '../scheduler.js';
 import { checkStaleState } from './alerts.js';
 import { getRecentAlerts, __resetAlertsForTest } from './alerts.js';
@@ -962,6 +963,107 @@ describe('TRA-1481 churn-brake health route', () => {
       delete process.env.ENABLE_CHURN_LOSS_BRAKE;
       delete process.env.CHURN_SAME_SESSION_OPEN_CAP;
     }
+  });
+});
+
+// TRA-1682 (parent TRA-1680 → TRA-1677) — the entry-greeks gate readout used to report
+// `enabled` + thresholds and NOTHING about what the gate did, which is how an
+// ALGEBRAICALLY IMPOSSIBLE gate (a [0.30,0.40] short-premium band applied to a sleeve
+// whose selector cannot emit |Δ| < 0.45 ⇒ 100% reject) stayed invisible for a week: a
+// gate rejecting everything and a tape offering nothing look identical when nothing
+// counts. These tests pin the counts, and the `starving` alarm that names the difference.
+describe('TRA-1682 entry-greeks-gate health route — admit/reject counts', () => {
+  const etDay = etDateString(new Date(NOW));
+  beforeEach(() => clearEntryGreeksLedger());
+  afterEach(() => clearEntryGreeksLedger());
+
+  function serve() {
+    const { app, routes } = fakeApp();
+    registerLiveHealthRoutes(app, {
+      requireAuth: ((_q: unknown, _s: unknown, n: () => void) => n()) as never,
+      userCtx: async () => ctx('admin', engineState()),
+      getSettings: () => settings(),
+      now: () => NOW,
+    });
+    const handlers = routes.get('/api/health/entry-greeks-gate')!;
+    expect(handlers).toHaveLength(1); // unauthenticated, like the other rule probes
+    const res = fakeRes();
+    handlers[0]!({}, res);
+    return res.body as {
+      ok: boolean;
+      flag: string;
+      enabled: boolean;
+      demoOnly: boolean;
+      liveCapitalReachable: boolean;
+      etDay: string;
+      config: { deltaBand: [number, number]; deltaThetaRatioFloor: number };
+      admitted: number;
+      rejectedByReason: Record<string, number>;
+      rejectedTotal: number;
+      evaluated: number;
+      admitRate: number | null;
+      starving: boolean;
+      warning?: string;
+    };
+  }
+
+  it('reports the EFFECTIVE delta band (the 0.45 selector floor), not the short-premium default', () => {
+    // The band the engine actually passes since `07ea3b1` is [RV_LONG_DELTA_FLOOR, 1].
+    // This surface used to advertise the library default [0.30,0.40] — an observability
+    // endpoint reporting a band the engine does not apply is how the bug hid.
+    const body = serve();
+    expect(body.ok).toBe(true);
+    expect(body.flag).toBe('ENTRY_GREEKS_GATE_ENABLED');
+    expect(body.demoOnly).toBe(true);
+    expect(body.liveCapitalReachable).toBe(false);
+    expect(body.etDay).toBe(etDay);
+    expect(body.config.deltaBand).toEqual([0.45, 1]);
+  });
+
+  it('an un-run gate reports evaluated 0 with admitRate NULL (not 0) and no warning', () => {
+    // "Nothing reached the gate" must never read the same as "the gate refused
+    // everything" — that ambiguity IS the TRA-1677 defect.
+    const body = serve();
+    expect(body.evaluated).toBe(0);
+    expect(body.admitted).toBe(0);
+    expect(body.admitRate).toBeNull();
+    expect(body.starving).toBe(false);
+    expect(body.warning).toBeUndefined();
+  });
+
+  it('folds the durable per-reason reject counts + the admit count for the ET day', () => {
+    recordEntryGreeksVerdict(true, null, etDay, 'rv-long', NOW);
+    recordEntryGreeksVerdict(true, null, etDay, 'rv-long', NOW);
+    recordEntryGreeksVerdict(true, null, etDay, 'rv-long', NOW);
+    recordEntryGreeksVerdict(false, 'delta_out_of_band', etDay, 'rv-long', NOW);
+    recordEntryGreeksVerdict(false, 'delta_theta_ratio_too_low', etDay, 'rv-long', NOW);
+    recordEntryGreeksVerdict(false, 'non_finite_greeks', etDay, 'rv-long', NOW);
+
+    const body = serve();
+    expect(body.admitted).toBe(3);
+    expect(body.rejectedByReason).toEqual({
+      delta_out_of_band: 1,
+      delta_theta_ratio_too_low: 1,
+      non_finite_greeks: 1,
+    });
+    expect(body.rejectedTotal).toBe(3);
+    expect(body.evaluated).toBe(6);
+    expect(body.admitRate).toBe(0.5);
+    expect(body.starving).toBe(false);
+    expect(body.warning).toBeUndefined();
+  });
+
+  it('an ALL-REJECT session is LOUD — starving + a warning naming the gate as suspect', () => {
+    // The exact TRA-1677 shape. This is the read that would have caught it on day one.
+    for (let i = 0; i < 25; i++) recordEntryGreeksVerdict(false, 'delta_out_of_band', etDay, 'rv-long', NOW);
+
+    const body = serve();
+    expect(body.evaluated).toBe(25);
+    expect(body.admitted).toBe(0);
+    expect(body.admitRate).toBe(0);
+    expect(body.starving).toBe(true);
+    expect(body.warning).toContain('admitted 0 of 25');
+    expect(body.warning).toContain('suspect the GATE');
   });
 });
 

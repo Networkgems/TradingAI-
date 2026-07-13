@@ -5396,6 +5396,81 @@ describe('SignalEngine — demo directional option entry (TRA-1114)', () => {
       const downRow = rows.find(r => r.symbol === 'DWN');
       expect(upRow!.trend).toBe('up'); // call ⇒ uptrend confluence
       expect(downRow!.trend).toBe('down'); // put ⇒ downtrend confluence
+      // TRA-1682 — the row still carries `structure: 'single_leg_rv'` (that string is
+      // hardcoded for all three `openOptionFromRvCandidate` callers), so the STRUCTURE
+      // alone can never identify this sleeve. The archetype is what separates it.
+      expect(rows.every(r => r.entryArchetype === 'directional')).toBe(true);
+    } finally {
+      delete process.env['ENABLE_OPTION_TRADE_JOURNAL'];
+      setOptionTradeJournalFileForTests(null);
+      rmSync(journalFile, { force: true });
+    }
+  });
+
+  // TRA-1682 — THE acceptance test. `openOptionFromRvCandidate` stamps
+  // `structure: 'single_leg_rv'` unconditionally, so all three of its callers land in
+  // ONE journal bucket. Two of them (the selector-gated + greeks-gated RV long, and the
+  // ungated demo DIRECTIONAL opener) also wrote NO `entryArchetype`, which made them
+  // indistinguishable — 416 of 1058 live `single_leg_rv` rows carried |Δ| < 0.45, a
+  // value `selectRvLongCandidate` cannot emit, i.e. directional fills wearing an RV
+  // label. Every RV-structure grade taken off that bucket was unattributable.
+  //
+  // The failure this pins down is worse than mislabeling: TRA-1680's algebraically
+  // impossible greeks gate would have driven the true RV long to ZERO fills while the
+  // `single_leg_rv` fill count DID NOT MOVE, because directional kept feeding the same
+  // counter. A dead sleeve was invisible to the exact metric we would have used to
+  // detect it. So: same structure, DISTINCT archetype — assert the partition directly.
+  //
+  // Caller 3 (`routeIvRvBuyPremium` → `iv-rv-buy-premium`) has always tagged itself and
+  // is pinned by its own test ("routing ON + journal ON — open is tagged entryArchetype
+  // iv-rv-buy-premium"); it is asserted distinct from these two here.
+  it('all three openOptionFromRvCandidate callers share structure single_leg_rv but produce DISTINCT archetypes (TRA-1682)', async () => {
+    process.env[OPTION_DEMO_DIRECTIONAL_FLAG] = 'true';
+    process.env['ENABLE_OPTION_TRADE_JOURNAL'] = '1';
+    const journalFile = join(tmpdir(), `tra1682-journal-${process.pid}.jsonl`);
+    setOptionTradeJournalFileForTests(journalFile);
+    try {
+      // One scanner serving BOTH callers: a `scan` RV candidate (AAPL, |Δ| in the
+      // 0.55–0.65 selector band) and a directional chain (UPP).
+      const svc: RelativeValueScannerService = {
+        scan: vi.fn(async (sym: string) => (sym === 'AAPL'
+          ? { symbol: 'AAPL', spot: 195, expiration: '2024-07-05', candidates: [makeCandidate()], reason: 'ok' as const }
+          : { symbol: sym, spot: null, expiration: null, candidates: [], reason: 'ok' as const })),
+        scanOtm: vi.fn(async () => ({ symbol: '', spot: null, expiration: null, candidates: [], reason: 'unavailable' as const })),
+        getSelectorChain: vi.fn(async (sym: string) => (sym === 'UPP'
+          ? { symbol: 'UPP', spot: 100, expiration: '2024-07-19', rows: chainRows('UPP', 100) }
+          : null)),
+        getOptionMark: vi.fn(async () => null),
+        diagnostics: vi.fn(() => ({ configured: true, breakerOpen: false, breakerOpenedAtMs: null, cacheSize: 0, expirationsCacheSize: 0, chainCacheMaxEntries: 64, expirationsCacheMaxEntries: 64 })),
+      };
+      const engine = new SignalEngine(undefined, undefined, svc);
+
+      // Caller 1 — the bare RV long (no ema-pullback reason ⇒ archetype `rv-long`).
+      seedRvTrend(engine, 'AAPL');
+      await (engine as unknown as { runRelativeValueScan: (s: string[]) => Promise<void> }).runRelativeValueScan(['AAPL']);
+      // Caller 2 — the demo directional opener (archetype `directional`).
+      seedTrend(engine, 'UPP', sawUp(480));
+      await run(engine, ['UPP']);
+      await engine.flushOptionTradeJournal();
+
+      const rows = await listOptionTradeJournal();
+      const rvRow = rows.find(r => r.symbol === 'AAPL');
+      const dirRow = rows.find(r => r.symbol === 'UPP');
+      expect(rvRow).toBeDefined();
+      expect(dirRow).toBeDefined();
+
+      // The bucket really is shared — this is the premise of the whole defect.
+      expect(rvRow!.structure).toBe('single_leg_rv');
+      expect(dirRow!.structure).toBe('single_leg_rv');
+
+      // …and the archetype now tells them apart. No row folds into `unspecified`.
+      expect(rvRow!.entryArchetype).toBe('rv-long');
+      expect(dirRow!.entryArchetype).toBe('directional');
+
+      // Pairwise distinct across all three callers (the third is `iv-rv-buy-premium`).
+      const archetypes = [rvRow!.entryArchetype, dirRow!.entryArchetype, 'iv-rv-buy-premium'];
+      expect(new Set(archetypes).size).toBe(3);
+      expect(archetypes).not.toContain(undefined);
     } finally {
       delete process.env['ENABLE_OPTION_TRADE_JOURNAL'];
       setOptionTradeJournalFileForTests(null);

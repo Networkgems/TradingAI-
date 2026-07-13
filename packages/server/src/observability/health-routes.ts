@@ -42,6 +42,8 @@ import { summarizeIgnitionScans } from '../crypto-ignition-scanner.js';
 import { summarizeConvictionDca, resolveConvictionDcaDeployAnchor } from '../conviction-dca-ledger.js';
 import { summarizeChurnBrake } from '../churn-brake-ledger.js';
 import { summarizeDirectionalGate } from '../directional-open-ledger.js';
+import { summarizeEntryGreeksGate } from '../entry-greeks-ledger.js';
+import { RV_LONG_DELTA_FLOOR } from '@trading-app/engine';
 import { summarizeCostAwareGate } from '../cost-aware-gate-ledger.js';
 import {
   isOptionCostAwareGateEnabled,
@@ -1452,10 +1454,20 @@ export function registerLiveHealthRoutes(app: Express, deps: LiveHealthDeps): vo
   // through the SAME path the engine consults (process.env layered with the
   // DATA_DIR demo-flags.json overlay, file wins) so `enabled` reflects the
   // EFFECTIVE switch. No balances/PII — just the flag + band/ratio thresholds.
+  // TRA-1682 — the readout now also reports what the gate DID (durable per-ET-day
+  // admit + reject-by-reason counts), not merely that it is armed. TRA-1677 is the
+  // reason: this gate was armed with an ALGEBRAICALLY EMPTY admissible set for a week
+  // — it rejected 100% of RV longs — and was invisible, because "gate rejects
+  // everything" and "tape offers nothing" produce the same observable (no fills) when
+  // nothing counts the admit rate. `starving` (evaluated ≥ 1, admitted 0) is that
+  // missing signal, stated out loud. It also makes TRA-1293's own forward-sample of
+  // gate 2's rejection rate — the stated pre-live-promotion bar — takeable at last.
   app.get('/api/health/entry-greeks-gate', (_req, res) => {
     const dir = process.env.DATA_DIR;
     const env = dir ? resolveDemoFlagEnv(dir) : process.env;
     const enabled = isEntryGreeksGateEnabled(env);
+    const etDay = etDateString(new Date(now()));
+    const counts = summarizeEntryGreeksGate(etDay);
     res.json({
       ok: true,
       time: new Date(now()).toISOString(),
@@ -1464,13 +1476,31 @@ export function registerLiveHealthRoutes(app: Express, deps: LiveHealthDeps): vo
       enabled,
       demoOnly: true,
       liveCapitalReachable: false,
+      etDay,
       config: {
-        shortDeltaBand: [ENTRY_SHORT_DELTA_MIN, ENTRY_SHORT_DELTA_MAX],
+        // TRA-1677 / TRA-1682 — the band the gate ACTUALLY enforces on the RV long is
+        // the selector's own floor ([RV_LONG_DELTA_FLOOR, 1]), passed explicitly at the
+        // gate site since `07ea3b1`. This surface used to advertise the library DEFAULT
+        // (`ENTRY_SHORT_DELTA_MIN/MAX` = the 0.30–0.40 SHORT-premium PoP band), which
+        // after that fix is no longer what runs — an observability endpoint reporting a
+        // band the engine does not apply is precisely how the impossible gate stayed
+        // hidden. Report the effective one, and keep the short band visible separately
+        // as the library default it is.
+        deltaBand: [RV_LONG_DELTA_FLOOR, 1],
         deltaThetaRatioFloor: ENTRY_DELTA_THETA_RATIO_FLOOR,
+        shortPremiumDefaultBand: [ENTRY_SHORT_DELTA_MIN, ENTRY_SHORT_DELTA_MAX],
       },
       note: enabled
-        ? 'ARMED (demo-only): rejects a demo RV-long entry whose short-strike |Δ| is outside 0.30–0.40 or whose |Δ|/|θ_per_day| is below the 6.0 floor (provisional); live options path unchanged.'
-        : 'DISARMED: set ENTRY_GREEKS_GATE_ENABLED=1 (render.yaml env or DATA_DIR/demo-flags.json) AND the EXIT_RISK_RULES_ENABLED master to arm on the demo book.',
+        ? `ARMED (demo-only): rejects a demo RV-long entry whose |Δ| is below the ${RV_LONG_DELTA_FLOOR} selector floor or whose |Δ|/|θ_per_day| is below the ${ENTRY_DELTA_THETA_RATIO_FLOOR} floor (provisional); live options path unchanged.`
+        : `DISARMED: set ${ENTRY_GREEKS_GATE_FLAG}=1 (render.yaml env or DATA_DIR/demo-flags.json — allowlisted since TRA-1682) AND the EXIT_RISK_RULES_ENABLED master to arm on the demo book.`,
+      ...counts,
+      // The loud part. An armed gate that admitted nothing all session is a SUSPECT
+      // GATE, not a quiet tape — do not grade the sleeve until this is explained.
+      ...(counts.starving
+        ? {
+            warning: `entry-greeks gate admitted 0 of ${counts.evaluated} candidates on ${etDay} — suspect the GATE, not the tape (TRA-1677: an impossible band reads exactly like no candidates).`,
+          }
+        : {}),
     });
   });
 
