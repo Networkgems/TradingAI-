@@ -55,6 +55,43 @@ export type {
   PboInput,
   PboResult,
 } from './overfitting-stats.js';
+// TRA-1664 — offline PCR shadow-ledger expectancy harness (parent TRA-1609).
+export {
+  runPcrExpectancy,
+  joinForwardReturns,
+  atrBySession,
+  cohortize,
+  pcrSideFor,
+  rawUpliftStat,
+  placeboUpliftStat,
+  placeboSidesBySession,
+  adjustedUpliftStat,
+  sessionClusteredBootstrap,
+  naiveRowBootstrap,
+  evaluateCell,
+  overfittingGuards,
+  sampleShape,
+  mulberry32,
+  PCR_UPLIFT_BAR_R,
+  PRIMARY_HORIZON,
+  HORIZONS,
+  MIN_INDEPENDENT_SESSIONS,
+} from './pcr-expectancy.js';
+export type {
+  PcrShadowRow,
+  DailyBar,
+  JoinedRow,
+  JoinResult,
+  JoinDiagnostics,
+  Cohorts,
+  CellResult,
+  OverfittingGuards,
+  PcrExpectancyReport,
+  PcrCarrier,
+  PcrInterpretation,
+  SampleShape,
+  Ci,
+} from './pcr-expectancy.js';
 export { partitionData, DataPartition } from './data-partition.js';
 export type { PartitionOptions, PartitionBoundaries } from './data-partition.js';
 export { runOptimization, enumerateTrials, STRATEGY_SPECS } from './run-optimization.js';
