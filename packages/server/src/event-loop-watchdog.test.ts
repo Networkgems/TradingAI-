@@ -12,6 +12,7 @@ import {
   resolveLivenessLogPath,
   readLastLiveness,
   _resetWatchdogForTests,
+  readCgroupMemoryLimitBytes,
   DEFAULT_WATCHDOG,
   type WatchdogConfig,
   type WatchdogSample,
@@ -37,7 +38,10 @@ const sample = (over: Partial<WatchdogSample> = {}): WatchdogSample => ({
 
 describe('resolveConfig', () => {
   it('is ON with restart ON by default (no env) — meets the self-restart acceptance', () => {
-    const c = resolveConfig({});
+    // cgroup limit injected as null: resolveConfig() otherwise READS THE REAL BOX (TRA-1687),
+    // so this assertion would pass on a dev laptop and fail on containerised CI. A test whose
+    // verdict depends on where it runs is not a test.
+    const c = resolveConfig({}, null);
     expect(c.enabled).toBe(true);
     expect(c.restartEnabled).toBe(true);
     expect(c).toEqual(DEFAULT_WATCHDOG);
@@ -70,14 +74,124 @@ describe('resolveConfig', () => {
     expect(resolveConfig({ WATCHDOG_BOOT_GRACE_MS: '9999999' }).bootGraceMs).toBe(1_800_000); // clamped down
   });
 
-  it('TRA-1374 — RSS ceiling defaults to 1900MB, is env-tunable (MB→bytes), clamped, and 0 disables', () => {
-    expect(resolveConfig({}).rssMaxBytes).toBe(1_900 * 1e6);
-    expect(resolveConfig({ WATCHDOG_RSS_MAX_MB: '3500' }).rssMaxBytes).toBe(3_500 * 1e6);
-    expect(resolveConfig({ WATCHDOG_RSS_MAX_MB: '0' }).rssMaxBytes).toBe(0); // explicit disable
-    expect(resolveConfig({ WATCHDOG_RSS_MAX_MB: '-5' }).rssMaxBytes).toBe(0); // non-positive disables
-    expect(resolveConfig({ WATCHDOG_RSS_MAX_MB: '100' }).rssMaxBytes).toBe(256 * 1e6); // clamped up
-    expect(resolveConfig({ WATCHDOG_RSS_MAX_MB: '999999' }).rssMaxBytes).toBe(32_768 * 1e6); // clamped down
-    expect(resolveConfig({ WATCHDOG_RSS_MAX_MB: 'abc' }).rssMaxBytes).toBe(0); // non-numeric disables
+  it('TRA-1374 — RSS ceiling is env-tunable (MB→bytes), clamped, and 0 disables', () => {
+    expect(resolveConfig({ WATCHDOG_RSS_MAX_MB: '3500' }, null).rssMaxBytes).toBe(3_500 * 1e6);
+    expect(resolveConfig({ WATCHDOG_RSS_MAX_MB: '0' }, null).rssMaxBytes).toBe(0); // explicit disable
+    expect(resolveConfig({ WATCHDOG_RSS_MAX_MB: '-5' }, null).rssMaxBytes).toBe(0); // non-positive disables
+    expect(resolveConfig({ WATCHDOG_RSS_MAX_MB: '100' }, null).rssMaxBytes).toBe(256 * 1e6); // clamped up
+    expect(resolveConfig({ WATCHDOG_RSS_MAX_MB: '999999' }, null).rssMaxBytes).toBe(32_768 * 1e6); // clamped down
+  });
+});
+
+// ---------------------------------------------------------------------------
+// TRA-1687 — the ceiling must be DERIVED FROM THE BOX, not hardcoded.
+//
+// The test this file used to carry read:
+//     expect(resolveConfig({}).rssMaxBytes).toBe(1_900 * 1e6);
+// It passed for months. It passed all the way through TRA-1683, while the guard it
+// was allegedly testing self-restarted a healthy engine ~40x per session. It passed
+// BECAUSE it asserted the constant instead of the property — THE TEST ENCODED THE BUG,
+// and a green suite is exactly how the defect stayed invisible.
+//
+// The property is not "the ceiling is 1900MB", nor "the ceiling is 3400MB" — that is
+// the same mistake with a fresher number, and it re-arms the moment the box is resized
+// again. The property is: THE CEILING TRACKS THE BOX. Every test below grades that.
+// ---------------------------------------------------------------------------
+const PRO_CGROUP = 4 * 1024 ** 3; // 4 GiB — bqb1 today
+const STANDARD_CGROUP = 2 * 1024 ** 3; // 2 GiB — bqb1 when 1900MB was written
+const OBSERVED_RTH_PEAK = 2_208 * 1e6; // highest RSS ever seen on a real session (TRA-1683)
+
+describe('TRA-1687 — RSS ceiling derives from the real cgroup limit', () => {
+  it('THE REGRESSION: with no override, the derived ceiling clears the real RTH working set', () => {
+    // This is the assertion whose absence cost us TRA-1683. 1900MB sat BELOW the
+    // 2.0-2.2GB working set, so the guard executed a healthy engine instead of saving it.
+    const c = resolveConfig({}, PRO_CGROUP);
+    expect(c.rssMaxSource).toBe('cgroup-derived');
+    expect(c.rssMaxBytes).toBeGreaterThan(OBSERVED_RTH_PEAK); // cannot fire on healthy load
+    expect(c.rssMaxBytes).toBeLessThan(PRO_CGROUP - 300e6); // can still pre-empt the SIGKILL
+    expect(c.cgroupLimitBytes).toBe(PRO_CGROUP);
+  });
+
+  it('the SAME code on a SMALLER box derives a SMALLER ceiling — it tracks the environment', () => {
+    // The whole defect in one assertion: identical source, identical env, different box.
+    // The old constant could not do this, which is why moving the box silently inverted it.
+    const pro = resolveConfig({}, PRO_CGROUP).rssMaxBytes;
+    const standard = resolveConfig({}, STANDARD_CGROUP).rssMaxBytes;
+    expect(standard).toBeLessThan(pro);
+    expect(standard).toBeLessThan(STANDARD_CGROUP);
+    expect(pro).toBeLessThan(PRO_CGROUP);
+  });
+
+  it('flags the EXACT TRA-1683 config as suspect instead of silently obeying it', () => {
+    // 1900MB on a 4GiB box: 44% of capacity, inside the healthy working set. This is the
+    // config that ran in prod for weeks. It is honoured (an operator override is not ours
+    // to silently raise) but it now SAYS SO OUT LOUD — the thing nothing ever did.
+    const c = resolveConfig({ WATCHDOG_RSS_MAX_MB: '1900' }, PRO_CGROUP);
+    expect(c.rssMaxBytes).toBe(1_900 * 1e6); // honoured, not overridden
+    expect(c.rssMaxSource).toBe('env-suspect');
+    expect(c.rssMaxWarning).toMatch(/44% of the 4295MB cgroup limit/);
+  });
+
+  it('clamps DOWN an override that could not pre-empt the kernel — the one safe direction', () => {
+    // A ceiling at/above the kill line is not a guard: the kernel gets there first and we
+    // take the abrupt 137 the trip exists to prevent. Clamping down can only make it fire
+    // earlier and more gracefully, so it is safe to do silently — and we still say so.
+    const c = resolveConfig({ WATCHDOG_RSS_MAX_MB: '4200' }, PRO_CGROUP);
+    expect(c.rssMaxSource).toBe('env-clamped');
+    expect(c.rssMaxBytes).toBeLessThan(PRO_CGROUP - 300e6);
+    expect(c.rssMaxWarning).toMatch(/kernel would SIGKILL first/);
+  });
+
+  it('a TYPO no longer silently removes the OOM guard', () => {
+    // Old behaviour: `resolveConfig({WATCHDOG_RSS_MAX_MB:'abc'}).rssMaxBytes === 0`. A
+    // fat-fingered env var DISABLED the guard and nothing anywhere said a word.
+    const c = resolveConfig({ WATCHDOG_RSS_MAX_MB: 'abc' }, PRO_CGROUP);
+    expect(c.rssMaxBytes).toBeGreaterThan(OBSERVED_RTH_PEAK); // guard still armed
+    expect(c.rssMaxSource).toBe('cgroup-derived');
+    expect(c.rssMaxWarning).toMatch(/is not a number/);
+  });
+
+  it('an explicit 0 still disables — the operator asked, so obey', () => {
+    const c = resolveConfig({ WATCHDOG_RSS_MAX_MB: '0' }, PRO_CGROUP);
+    expect(c.rssMaxBytes).toBe(0);
+    expect(c.rssMaxSource).toBe('disabled');
+    expect(c.rssMaxWarning).toBeNull();
+  });
+
+  it('no cgroup AND no override → guard OFF, loudly (there is no cgroup kill to pre-empt)', () => {
+    const c = resolveConfig({}, null);
+    expect(c.rssMaxBytes).toBe(0);
+    expect(c.rssMaxSource).toBe('unresolved-disabled');
+    expect(c.rssMaxWarning).toMatch(/RSS trip disabled/);
+  });
+});
+
+describe('TRA-1687 — readCgroupMemoryLimitBytes', () => {
+  const reader = (files: Record<string, string>) => (p: string) => {
+    if (!(p in files)) throw new Error('ENOENT');
+    return files[p];
+  };
+
+  it('reads the cgroup v2 limit', () => {
+    expect(readCgroupMemoryLimitBytes(reader({ '/sys/fs/cgroup/memory.max': '4294967296\n' }))).toBe(4294967296);
+  });
+
+  it('falls back to cgroup v1 when v2 is absent', () => {
+    const v1 = { '/sys/fs/cgroup/memory/memory.limit_in_bytes': '2147483648\n' };
+    expect(readCgroupMemoryLimitBytes(reader(v1))).toBe(2147483648);
+  });
+
+  it('treats BOTH spellings of "unlimited" as no-limit, not as a ceiling', () => {
+    // v2 says `max` -> NaN. v1 says a page-aligned 2^63 sentinel -> a finite number that
+    // would derive a ~9 EXABYTE ceiling: a guard that can never fire, dressed as a configured
+    // one. Silently-disabled-but-looks-armed is the worst state available, so reject both.
+    expect(readCgroupMemoryLimitBytes(reader({ '/sys/fs/cgroup/memory.max': 'max\n' }))).toBeNull();
+    const v1Unlimited = { '/sys/fs/cgroup/memory/memory.limit_in_bytes': '9223372036854771712\n' };
+    expect(readCgroupMemoryLimitBytes(reader(v1Unlimited))).toBeNull();
+  });
+
+  it('returns null off-container (no cgroup files at all)', () => {
+    expect(readCgroupMemoryLimitBytes(reader({}))).toBeNull();
   });
 });
 

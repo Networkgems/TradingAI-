@@ -322,6 +322,21 @@ export interface WatchdogConfig {
    */
   rssMaxBytes: number;
   /**
+   * TRA-1687 — the container's ACTUAL memory limit, read from the cgroup at
+   * boot; null when there is no readable cgroup (dev boxes: Windows, macOS).
+   *
+   * This is the number `rssMaxBytes` must sit below, and until TRA-1687 NOTHING
+   * in this system had ever read it. The watchdog took its ceiling from an env
+   * var, and the checker that graded that ceiling mapped Render's PLAN NAME
+   * through a lookup table (`pro -> 4096MB`). Both are claims ABOUT the box.
+   * This is a measurement OF it.
+   */
+  cgroupLimitBytes: number | null;
+  /** How `rssMaxBytes` was arrived at. Surfaced so a gate can grade the SOURCE, not just the value. */
+  rssMaxSource: RssCeilingSource;
+  /** Set when the resolved ceiling is suspect (see {@link resolveRssCeiling}); surfaced on /api/health/watchdog. */
+  rssMaxWarning: string | null;
+  /**
    * TRA-1084 — boot/warmup grace. The watchdog measures from process start, but
    * RESTART trips are suppressed until the process has been up this long. During
    * warmup the per-book engines synchronously load candle history for the full
@@ -350,34 +365,38 @@ export const DEFAULT_WATCHDOG: WatchdogConfig = {
   // platform's hard kill. A 4s+ stall on a healthy box is itself pathology
   // (a full GC near the 1.5GB ceiling is ~1-2s), so a false trip is implausible.
   lagMaxMs: 4_000,
-  // ⚠️ TRA-1683 — THIS DEFAULT IS STALE AND IS CORRECT FOR NO BOX WE RUN. It is
-  // load-bearing ONLY because the live service overrides it with
-  // WATCHDOG_RSS_MAX_MB=3400. If that env var is ever cleared, this constant
-  // takes over and RE-CREATES the defect described below. Do not treat an unset
-  // env var as "back to a safe default" — the safe value is not in this file.
+  // TRA-1687 — THERE IS NO LONGER A DEFAULT RSS CEILING IN THIS FILE, and that is
+  // the entire point. The old default (1900 MB) is deleted, not retuned.
   //
-  // TRA-1374 wrote 1900 MB against `plan: standard` (2 GB cgroup): trip ~100 MB
-  // below the kill line so the abrupt `nonZeroExit: 137` becomes a graceful exit
-  // + flushed logs. That was right — for a 2 GB box.
+  // History, because it is the whole argument: TRA-1374 wrote 1900 MB against
+  // `plan: standard` (2 GB cgroup) — trip ~100 MB below the kill line so an abrupt
+  // `nonZeroExit: 137` becomes a graceful exit with flushed logs. Correct, for a
+  // 2 GB box. The box was then moved to `plan: pro` (4 GB) in the Render DASHBOARD
+  // and nothing re-derived the constant. On 4 GB, 1900 MB is 47% of capacity —
+  // INSIDE the normal RTH working set (measured 2.0-2.2 GB). The guard INVERTED:
+  // instead of pre-empting an OOM it executed a perfectly healthy engine ~38-40
+  // times per RTH session (TRA-1683). A guard's constant encodes a PREMISE ABOUT
+  // ITS ENVIRONMENT; move the environment and the guard silently turns on its host.
   //
-  // The box was moved to `plan: pro` (4 GB) in the Render DASHBOARD, and nothing
-  // re-derived this constant. On 4 GB, 1900 MB is 47% of capacity — INSIDE the
-  // normal RTH working set (measured 2.0-2.2 GB). The guard INVERTED: instead of
-  // pre-empting an OOM it began executing a perfectly healthy engine, ~38-40
-  // times per RTH session (`reason: "rss"`, not lag), tearing down in-process
-  // position management each time. A guard's constant encodes a PREMISE ABOUT ITS
-  // ENVIRONMENT; move the environment and the guard silently turns on its host.
+  // Retuning the constant to 3400 would have fixed bqb1 and RE-ARMED THE SAME BOMB
+  // for the next resize. Note that 1900 was not "unsafe because it was low" — a low
+  // ceiling self-restarts a healthy engine and a high one cannot pre-empt the kill.
+  // A hardcoded ceiling is wrong in BOTH directions, so there is no safe constant to
+  // pick and no safe direction to err in. The only correct ceiling is one DERIVED
+  // FROM THE BOX AT BOOT.
   //
-  // Left at 1900 here only because the go-live content freeze (TRA-1653) pins the
-  // deployed commit — the fix shipped as env, zero new bytes. THE DURABLE FIX IS
-  // TO STOP HARDCODING A PREMISE ABOUT THE HOST: derive the ceiling from the
-  // actual cgroup limit at boot (`/sys/fs/cgroup/memory.max`) and bracket it,
-  // so resizing the box can never again invalidate the guard. Tracked as
-  // follow-up; `_default/tra1648_watchdog_ceiling_check.mjs` is the interim
-  // assertion (it grades the EFFECTIVE ceiling on the RUNNING process against
-  // the LIVE plan — never this constant, and never render.yaml).
-  // Set 0 to disable.
-  rssMaxBytes: 1_900 * 1e6,
+  // So: `resolveRssCeiling` reads the real cgroup limit (`/sys/fs/cgroup/memory.max`)
+  // and derives the ceiling from it. This field is the LAST-RESORT value used only
+  // when there is no cgroup to read AND no operator override — and it is 0
+  // (DISABLED), not a guess. Rationale: the RSS trip exists solely to pre-empt a
+  // cgroup OOM kill. Where no cgroup limit is readable there is no such kill to
+  // pre-empt, so a ceiling is pure downside — it can only fire on healthy load.
+  // An unresolved ceiling is surfaced as `rssMaxSource: 'unresolved-disabled'` with
+  // a warning, so it fails VISIBLY rather than silently guessing.
+  rssMaxBytes: 0,
+  cgroupLimitBytes: null,
+  rssMaxSource: 'unresolved-disabled',
+  rssMaxWarning: 'no cgroup limit readable and no WATCHDOG_RSS_MAX_MB set — RSS trip disabled',
   // 120s: warmup's synchronous candle-load across N per-book engines blocks the
   // loop past lagMaxMs for a few seconds and was self-restarting the box mid-
   // warmup in an infinite loop. Trips are suppressed (but still logged) for the
@@ -400,7 +419,11 @@ function envNum(raw: string | undefined, fallback: number, min: number, max: num
   return Math.min(Math.max(n, min), max);
 }
 
-export function resolveConfig(env: NodeJS.ProcessEnv = process.env): WatchdogConfig {
+export function resolveConfig(
+  env: NodeJS.ProcessEnv = process.env,
+  cgroupLimitBytes: number | null = readCgroupMemoryLimitBytes(),
+): WatchdogConfig {
+  const rss = resolveRssCeiling(env[WATCHDOG_RSS_MAX_MB_VAR], cgroupLimitBytes);
   return {
     enabled: envBool(env[WATCHDOG_ENABLED_VAR], DEFAULT_WATCHDOG.enabled),
     restartEnabled: envBool(env[WATCHDOG_RESTART_ENABLED_VAR], DEFAULT_WATCHDOG.restartEnabled),
@@ -410,22 +433,184 @@ export function resolveConfig(env: NodeJS.ProcessEnv = process.env): WatchdogCon
     breachSamples: Math.floor(envNum(env[WATCHDOG_BREACH_SAMPLES_VAR], DEFAULT_WATCHDOG.breachSamples, 1, 600)),
     lagMaxMs: envNum(env[WATCHDOG_BLOCK_MS_VAR], DEFAULT_WATCHDOG.lagMaxMs, 500, 600_000),
     bootGraceMs: envNum(env[WATCHDOG_BOOT_GRACE_MS_VAR], DEFAULT_WATCHDOG.bootGraceMs, 0, 1_800_000),
-    rssMaxBytes: resolveRssMaxBytes(env[WATCHDOG_RSS_MAX_MB_VAR]),
+    rssMaxBytes: rss.rssMaxBytes,
+    cgroupLimitBytes: rss.cgroupLimitBytes,
+    rssMaxSource: rss.rssMaxSource,
+    rssMaxWarning: rss.rssMaxWarning,
   };
 }
 
+/** Where the effective RSS ceiling came from. A gate should grade this, not only the number. */
+export type RssCeilingSource =
+  | 'cgroup-derived'      // no override; derived from the box's real memory limit. The healthy path.
+  | 'env'                 // operator override, and it brackets the box correctly.
+  | 'env-clamped'         // operator override sat too close to the kill line; clamped DOWN so it can still pre-empt.
+  | 'env-suspect'         // operator override is far below the box's capacity — the TRA-1683 shape. Honoured, but flagged.
+  | 'disabled'            // operator explicitly asked for no RSS trip (0).
+  | 'unresolved-disabled';// no cgroup, no override. Nothing to pre-empt; guard off, loudly.
+
+export interface RssCeilingResolution {
+  rssMaxBytes: number;
+  cgroupLimitBytes: number | null;
+  rssMaxSource: RssCeilingSource;
+  rssMaxWarning: string | null;
+}
+
 /**
- * TRA-1374 — RSS ceiling resolver. `0` (or an explicit disable spelling) turns
- * the acute RSS trip off entirely; any other value is read as MB and clamped to
- * a sane [256 MB, 32 GB] band before conversion to bytes. Kept separate from
- * {@link envNum} so `0` can pass through as "disabled" rather than being clamped
- * up to the 256 MB floor.
+ * TRA-1687 — the container's real memory limit, read from the cgroup.
+ *
+ * cgroup v2 exposes `/sys/fs/cgroup/memory.max`; v1 exposes
+ * `/sys/fs/cgroup/memory/memory.limit_in_bytes`. Both spell "unlimited"
+ * differently and BOTH SPELLINGS ARE TRAPS:
+ *   - v2 writes the literal string `max`  -> `Number('max')` is NaN.
+ *   - v1 writes a page-aligned ~2^63 sentinel (9223372036854771712) -> a perfectly
+ *     finite number that would derive a ~9 exabyte ceiling, i.e. a silently
+ *     DISABLED guard wearing the costume of a configured one.
+ * Treat both as "no limit" and return null, so the caller falls through to the
+ * explicit unresolved path rather than trusting a sentinel.
  */
-function resolveRssMaxBytes(raw: string | undefined): number {
-  if (typeof raw !== 'string' || raw.trim() === '') return DEFAULT_WATCHDOG.rssMaxBytes;
-  const n = Number(raw.trim());
-  if (!Number.isFinite(n) || n <= 0) return 0; // explicit disable
-  return Math.min(Math.max(n, 256), 32_768) * 1e6;
+export function readCgroupMemoryLimitBytes(
+  readFile: (path: string) => string = (path) => readFileSync(path, 'utf-8'),
+  paths: readonly string[] = CGROUP_LIMIT_PATHS,
+): number | null {
+  for (const path of paths) {
+    let raw: string;
+    try {
+      raw = readFile(path);
+    } catch {
+      continue; // not this cgroup version, or not a container at all
+    }
+    const trimmed = raw.trim();
+    if (trimmed === '' || trimmed === 'max') continue; // v2 "unlimited"
+    const n = Number(trimmed);
+    if (!Number.isFinite(n) || n <= 0) continue;
+    if (n >= UNLIMITED_SENTINEL_FLOOR_BYTES) continue; // v1 "unlimited" sentinel
+    return n;
+  }
+  return null;
+}
+
+export const CGROUP_LIMIT_PATHS = [
+  '/sys/fs/cgroup/memory.max', // cgroup v2 (Render runs this)
+  '/sys/fs/cgroup/memory/memory.limit_in_bytes', // cgroup v1
+] as const;
+
+/** At/above this, a cgroup "limit" is an unlimited sentinel, not a container size. */
+const UNLIMITED_SENTINEL_FLOOR_BYTES = 1024 ** 4; // 1 TiB
+
+/**
+ * Reserve below the cgroup limit for the exit drain. The trip must leave enough
+ * room to flush logs and persist state BEFORE the kernel's SIGKILL lands, and RSS
+ * can still climb during the drain. 700MB on a 4GB box puts the derived ceiling at
+ * ~3.4GB — comfortably above the measured 2.0-2.2GB RTH working set.
+ */
+export const CGROUP_EXIT_RESERVE_BYTES = 700 * 1e6;
+
+/**
+ * A ceiling within this distance of the kill line cannot do its job: the kernel
+ * gets there first and we take the abrupt `nonZeroExit: 137` the trip exists to
+ * prevent. Mirrors MIN_GAP_BELOW_CGROUP_MB in `_default/tra1648_watchdog_ceiling_check.mjs`.
+ */
+export const MIN_GAP_BELOW_CGROUP_BYTES = 300 * 1e6;
+
+/**
+ * Below this fraction of the box's capacity, a ceiling is inside plausible healthy
+ * working-set territory and is more likely to EXECUTE a healthy engine than to save
+ * it. That is precisely what 1900MB became when bqb1 moved to a 4GB plan (TRA-1683).
+ */
+const SUSPECT_CEILING_FRACTION = 0.5;
+
+/**
+ * TRA-1687 — resolve the acute RSS ceiling from the BOX, with the operator able to
+ * override but not able to silently break it.
+ *
+ * Precedence, and the reasoning for each branch:
+ *   1. Explicit disable (`0` / negative) -> off. The operator said so; obey.
+ *   2. An override that CANNOT PRE-EMPT THE KILL (>= limit - MIN_GAP) is clamped DOWN.
+ *      Clamping down is the one direction that is monotonically safe: it can only make
+ *      the guard fire earlier and more gracefully, never later than the kernel. A guard
+ *      that trips after the SIGKILL is not a guard.
+ *   3. An override far BELOW the box's capacity is HONOURED but flagged `env-suspect`.
+ *      We do NOT silently raise it: unlike clamping down, raising a ceiling the operator
+ *      chose is a permissive override and could mask a real leak. Make it VISIBLE and let
+ *      the gate (C9) grade it — the TRA-1683 failure was not that nobody could have known,
+ *      it was that nothing ever re-checked and nothing ever said so out loud.
+ *   4. No override -> derive from the cgroup. The healthy path, and it tracks the box
+ *      automatically: resize the plan and the ceiling follows, forever.
+ *   5. No override AND no cgroup -> DISABLED, loudly (see DEFAULT_WATCHDOG).
+ *
+ * Note (4) means an UNSET env var is no longer "a vote for the code default", which is
+ * what made the TRA-1683 default so dangerous — the code default WAS the bug.
+ *
+ * Garbage (`'abc'`) is treated as UNSET, not as a disable. A typo in an env var must not
+ * silently remove an OOM guard; it falls through to the derived ceiling and is flagged.
+ */
+export function resolveRssCeiling(
+  raw: string | undefined,
+  cgroupLimitBytes: number | null,
+): RssCeilingResolution {
+  const derived = cgroupLimitBytes === null
+    ? null
+    : Math.max(cgroupLimitBytes - CGROUP_EXIT_RESERVE_BYTES, 256 * 1e6);
+
+  const unresolved = (warning: string | null): RssCeilingResolution =>
+    derived === null
+      ? {
+          rssMaxBytes: 0,
+          cgroupLimitBytes,
+          rssMaxSource: 'unresolved-disabled',
+          rssMaxWarning: warning ?? DEFAULT_WATCHDOG.rssMaxWarning,
+        }
+      : { rssMaxBytes: derived, cgroupLimitBytes, rssMaxSource: 'cgroup-derived', rssMaxWarning: warning };
+
+  const trimmed = typeof raw === 'string' ? raw.trim() : '';
+  if (trimmed === '') return unresolved(null);
+
+  const n = Number(trimmed);
+  if (!Number.isFinite(n)) {
+    return unresolved(
+      `WATCHDOG_RSS_MAX_MB=${JSON.stringify(trimmed)} is not a number — ignored, ceiling derived from the cgroup instead`,
+    );
+  }
+  if (n <= 0) {
+    return { rssMaxBytes: 0, cgroupLimitBytes, rssMaxSource: 'disabled', rssMaxWarning: null };
+  }
+
+  const envBytes = Math.min(Math.max(n, 256), 32_768) * 1e6;
+
+  if (cgroupLimitBytes === null) {
+    // No box to bracket against. Honour the override — it is the only information we have.
+    return { rssMaxBytes: envBytes, cgroupLimitBytes, rssMaxSource: 'env', rssMaxWarning: null };
+  }
+
+  const mb = (b: number) => Math.round(b / 1e6);
+
+  if (envBytes >= cgroupLimitBytes - MIN_GAP_BELOW_CGROUP_BYTES) {
+    const clamped = Math.max(cgroupLimitBytes - CGROUP_EXIT_RESERVE_BYTES, 256 * 1e6);
+    return {
+      rssMaxBytes: clamped,
+      cgroupLimitBytes,
+      rssMaxSource: 'env-clamped',
+      rssMaxWarning:
+        `WATCHDOG_RSS_MAX_MB=${mb(envBytes)}MB leaves no room below the ${mb(cgroupLimitBytes)}MB cgroup limit ` +
+        `to exit gracefully — the kernel would SIGKILL first. Clamped down to ${mb(clamped)}MB.`,
+    };
+  }
+
+  if (envBytes < cgroupLimitBytes * SUSPECT_CEILING_FRACTION) {
+    return {
+      rssMaxBytes: envBytes,
+      cgroupLimitBytes,
+      rssMaxSource: 'env-suspect',
+      rssMaxWarning:
+        `WATCHDOG_RSS_MAX_MB=${mb(envBytes)}MB is only ` +
+        `${Math.round((envBytes / cgroupLimitBytes) * 100)}% of the ${mb(cgroupLimitBytes)}MB cgroup limit. ` +
+        `A ceiling this far below capacity may sit INSIDE the healthy working set and restart a healthy ` +
+        `engine (TRA-1683). Honoured, not overridden — but verify it is deliberate.`,
+    };
+  }
+
+  return { rssMaxBytes: envBytes, cgroupLimitBytes, rssMaxSource: 'env', rssMaxWarning: null };
 }
 
 /** A single resource reading evaluated against the trip thresholds. */
@@ -546,7 +731,26 @@ export function evaluateSample(
 export interface WatchdogStatus {
   enabled: boolean;
   restartEnabled: boolean;
-  config: { sampleMs: number; heapPct: number; lagMs: number; breachSamples: number; lagMaxMs: number; bootGraceMs: number; rssMaxBytes: number };
+  config: {
+    sampleMs: number;
+    heapPct: number;
+    lagMs: number;
+    breachSamples: number;
+    lagMaxMs: number;
+    bootGraceMs: number;
+    rssMaxBytes: number;
+    /**
+     * TRA-1687 — the box's REAL memory limit, measured at boot. Published so a gate
+     * can stop inferring it: `_default/tra1648_watchdog_ceiling_check.mjs` (C9) used to
+     * bracket the ceiling against a PLAN-NAME lookup table (`pro -> 4096MB`), which is a
+     * claim about Render's pricing tiers, not a reading of this container. One side of
+     * that bracket was measured and the other was asserted, and it printed as one word:
+     * BRACKETED. This field is what makes the upper side a measurement too.
+     */
+    cgroupLimitBytes: number | null;
+    rssMaxSource: RssCeilingSource;
+    rssMaxWarning: string | null;
+  };
   /** Most recent sample, or null before the first evaluation. */
   lastSample: (WatchdogSample & { atMs: number }) | null;
   /**
@@ -815,7 +1019,7 @@ export function startEventLoopWatchdog(opts: StartWatchdogOptions = {}): Watchdo
     lastStatus = {
       enabled: cfg.enabled,
       restartEnabled: cfg.restartEnabled,
-      config: { sampleMs: cfg.sampleMs, heapPct: cfg.heapPct, lagMs: cfg.lagMs, breachSamples: cfg.breachSamples, lagMaxMs: cfg.lagMaxMs, bootGraceMs: cfg.bootGraceMs, rssMaxBytes: cfg.rssMaxBytes },
+      config: { sampleMs: cfg.sampleMs, heapPct: cfg.heapPct, lagMs: cfg.lagMs, breachSamples: cfg.breachSamples, lagMaxMs: cfg.lagMaxMs, bootGraceMs: cfg.bootGraceMs, rssMaxBytes: cfg.rssMaxBytes, cgroupLimitBytes: cfg.cgroupLimitBytes, rssMaxSource: cfg.rssMaxSource, rssMaxWarning: cfg.rssMaxWarning },
       lastSample: { ...sample, atMs },
       peakSinceBoot,
       peakRssSinceBoot,
@@ -950,7 +1154,7 @@ export function startEventLoopWatchdog(opts: StartWatchdogOptions = {}): Watchdo
         lastStatus ?? {
           enabled: cfg.enabled,
           restartEnabled: cfg.restartEnabled,
-          config: { sampleMs: cfg.sampleMs, heapPct: cfg.heapPct, lagMs: cfg.lagMs, breachSamples: cfg.breachSamples, lagMaxMs: cfg.lagMaxMs, bootGraceMs: cfg.bootGraceMs, rssMaxBytes: cfg.rssMaxBytes },
+          config: { sampleMs: cfg.sampleMs, heapPct: cfg.heapPct, lagMs: cfg.lagMs, breachSamples: cfg.breachSamples, lagMaxMs: cfg.lagMaxMs, bootGraceMs: cfg.bootGraceMs, rssMaxBytes: cfg.rssMaxBytes, cgroupLimitBytes: cfg.cgroupLimitBytes, rssMaxSource: cfg.rssMaxSource, rssMaxWarning: cfg.rssMaxWarning },
           lastSample: null,
           peakSinceBoot: null,
           peakRssSinceBoot: null,
