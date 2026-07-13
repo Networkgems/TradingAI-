@@ -37,6 +37,11 @@ import {
   recordChurnBrakeDcaHalt,
 } from '../churn-brake-ledger.js';
 import { clearCostAwareGateLedger, recordCostAwareGateDecision } from '../cost-aware-gate-ledger.js';
+import { SCALEOUT_LADDER_FLAG } from '../scaleout-ladder-flag.js';
+import {
+  clearScaleoutLadderLedger,
+  runScaleoutLadderObservePass,
+} from '../scaleout-ladder-ledger.js';
 import { clearEntryGreeksLedger, recordEntryGreeksVerdict } from '../entry-greeks-ledger.js';
 import { etDateString } from '../scheduler.js';
 import { checkStaleState } from './alerts.js';
@@ -1515,5 +1520,92 @@ describe('GET /api/health/option-spread-cost (TRA-1656)', () => {
     expect(body.ceilings['single_leg_otm']!.maxSpreadCrossR).toBe(0.8);
     expect(body.ceilings['single_leg_rv']!.maxSpreadCrossR).toBe(0.4);
     expect(body.modeledInput.makerAdjustedSpreadCrossR).toBeLessThan(0.4);
+  });
+});
+
+// TRA-1729 — GET /api/health/scaleout-ladder must SERVE the observe-pass fields.
+//
+// This drives the real registrar and reads the response body, deliberately: the new
+// keys reach the payload through a `...summarizeScaleoutLadder()` SPREAD, so grepping
+// the route file for `observedPositionCount` finds nothing and would "prove" the key is
+// absent on a build that serves it perfectly. Only reading the served body settles it.
+describe('GET /api/health/scaleout-ladder — TRA-1729 observe-pass readout', () => {
+  const prior = process.env[SCALEOUT_LADDER_FLAG];
+
+  beforeEach(() => {
+    process.env[SCALEOUT_LADDER_FLAG] = '1'; // armed
+    clearScaleoutLadderLedger();
+  });
+  afterEach(() => {
+    if (prior === undefined) delete process.env[SCALEOUT_LADDER_FLAG];
+    else process.env[SCALEOUT_LADDER_FLAG] = prior;
+    clearScaleoutLadderLedger();
+  });
+
+  function ladderBody() {
+    const { app, routes } = fakeApp();
+    registerLiveHealthRoutes(app, {
+      requireAuth: ((_q: unknown, _s: unknown, n: () => void) => n()) as never,
+      userCtx: async () => ctx('admin', engineState()),
+      getSettings: () => settings(),
+      now: () => NOW,
+    });
+    const handlers = routes.get('/api/health/scaleout-ladder')!;
+    const res = fakeRes();
+    handlers[0]!({}, res);
+    return res.body as {
+      enabled: boolean;
+      trimCount: number;
+      observedPositionCount: number | null;
+      openPositionCount: number | null;
+      maxGainPctObserved: number | null;
+      maxGainPctLastPass: number | null;
+      lastObservePassAt: number | null;
+      observePassCount: number;
+      observeStatus: string;
+      firstRungUp: number;
+      blind: boolean;
+    };
+  }
+
+  it('ARMED + EMPTY BOOK serves the ALARM, not a byte-identical "still accruing"', () => {
+    runScaleoutLadderObservePass([], new Map(), 1_700_000_000_000);
+    const body = ladderBody();
+
+    expect(body.enabled).toBe(true);
+    expect(body.trimCount).toBe(0); // …exactly what a healthy patient ladder shows
+    expect(body.observedPositionCount).toBe(0); // …and THIS is what says it is blind
+    expect(body.observeStatus).toBe('blind');
+    expect(body.blind).toBe(true);
+    expect(body.lastObservePassAt).toBe(1_700_000_000_000);
+    expect(body.observePassCount).toBe(1);
+    expect(body.maxGainPctObserved).toBeNull(); // null = never measured, NOT 0
+  });
+
+  it('ARMED + a long UNDER the first rung serves the close-but-not-firing state', () => {
+    runScaleoutLadderObservePass(
+      [{ id: 'p1', symbol: 'AAPL', side: 'buy', entryPrice: 100, quantity: 100 }],
+      new Map([['AAPL', 124]]), // +24%, 1pp under the +25% rung
+      1_700_000_000_000,
+    );
+    const body = ladderBody();
+
+    expect(body.trimCount).toBe(0); // SAME trimCount as the blind case above…
+    expect(body.observedPositionCount).toBe(1); // …but it is demonstrably WATCHING
+    expect(body.openPositionCount).toBe(1);
+    expect(body.observeStatus).toBe('observing');
+    expect(body.blind).toBe(false);
+    expect(body.maxGainPctObserved).toBeCloseTo(0.24, 10);
+    expect(body.maxGainPctLastPass).toBeCloseTo(0.24, 10);
+    expect(body.firstRungUp).toBe(0.25); // 0.24 vs 0.25 — how close it got
+  });
+
+  it('DISARMED reads never_ran and is not reported as blind', () => {
+    process.env[SCALEOUT_LADDER_FLAG] = '0';
+    const body = ladderBody();
+    expect(body.enabled).toBe(false);
+    expect(body.observeStatus).toBe('never_ran');
+    expect(body.observedPositionCount).toBeNull(); // no reading ≠ read an empty book
+    expect(body.blind).toBe(false); // a flag that is OFF is not an alarm
   });
 });

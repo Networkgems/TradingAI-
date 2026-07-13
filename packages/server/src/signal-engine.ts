@@ -96,7 +96,7 @@ import { isMultiLegOpenPaused } from './multileg-open-pause-flag.js';
 import { isMultiLegExitEnabled } from './multileg-exit-flag.js';
 import { recordConvictionDcaFill } from './conviction-dca-ledger.js';
 import { isScaleoutLadderEnabled } from './scaleout-ladder-flag.js';
-import { evaluateAndRecordScaleout } from './scaleout-ladder-ledger.js';
+import { runScaleoutLadderObservePass } from './scaleout-ladder-ledger.js';
 import { etDateString } from './scheduler.js';
 // TRA-995 (epic-C, self-regulation) — the standing risk autopilot. A pure
 // tighten-only decision module; the governor below is its mutation boundary and
@@ -1477,36 +1477,13 @@ export class SignalEngine {
    * chandelier + give-back cap). Only called when `ENABLE_SCALEOUT_LADDER` is on.
    */
   private evaluateScaleoutLadder(prices: Map<string, number>): void {
-    for (const pos of this.account.getState().openPositions) {
-      const mark = prices.get(pos.symbol);
-      if (mark == null || !(mark > 0)) continue;
-      // Base size = current quantity of the (possibly scaled-in) position; the
-      // ladder trims a fraction OF this. The observe book never partially closes,
-      // so the current qty is the position's size for this forward sample.
-      const decision = evaluateAndRecordScaleout({
-        positionId: pos.id,
-        symbol: pos.symbol,
-        side: pos.side,
-        avgEntry: pos.entryPrice,
-        markPrice: mark,
-        baseQty: pos.quantity,
-        // -USD pairs are the crypto sleeve; everything else is equity (fee-rate pick).
-        assetClass: pos.symbol.toUpperCase().endsWith('-USD') ? 'crypto' : 'equity',
-        mode: 'demo',
-      });
-      for (const trim of decision.triggered) {
-        log.info('scale-out ladder intended trim (TRA-1300, observe-only)', {
-          symbol: pos.symbol,
-          positionId: pos.id,
-          gainPct: Number(decision.gainPct.toFixed(4)),
-          rungUp: trim.up,
-          sellPctBase: trim.sellPctBase,
-          trimQty: trim.trimQty,
-          netProceeds: Number(trim.netProceeds.toFixed(2)),
-          isFullExit: trim.isFullExit,
-        });
-      }
-    }
+    // TRA-1729 — the pass body lives in the ledger so a unit test can drive the SAME
+    // function this calls (a test that re-implemented the loop would prove nothing about
+    // the loop that actually runs). It records the pass UNCONDITIONALLY, including over
+    // an empty book — and `openPositions` here HAS been empty on every demo book for 8
+    // days, since all the demo flow is options. That is what `observedPositionCount: 0`
+    // now says out loud, instead of leaving `trimCount: 0` to be misread as "accruing".
+    runScaleoutLadderObservePass(this.account.getState().openPositions, prices);
   }
 
   /**

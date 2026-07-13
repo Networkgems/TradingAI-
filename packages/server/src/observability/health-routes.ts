@@ -1497,13 +1497,27 @@ export function registerLiveHealthRoutes(app: Express, deps: LiveHealthDeps): vo
   // DATA_DIR on boot so trimCount/fullExitCount/positionCount survive the ~daily demo
   // reboot. Always read-only: NO order is ever placed off these trims — the board
   // REJECTED the add-down ladder, and demo→routing graduation is a separate decision.
+  //
+  // TRA-1729 — it also reports THE OBSERVE PASS, not just the pass's output. `trimCount:0`
+  // on its own is what a patient ladder reports AND what a ladder iterating an empty book
+  // forever reports; it read the latter for 8 days while the TRA-1318 accrual gate waited
+  // on it. `observedPositionCount` / `observeStatus` / `lastObservePassAt` split the two.
+  // Still a pure readout — this ticket added NO book mutation and NO order path.
   app.get('/api/health/scaleout-ladder', (_req, res) => {
+    const summary = summarizeScaleoutLadder();
+    const enabled = isScaleoutLadderEnabled();
     res.json({
       ok: true,
       time: new Date(now()).toISOString(),
       build: resolveBuildInfo(),
-      enabled: isScaleoutLadderEnabled(),
-      ...summarizeScaleoutLadder(),
+      enabled,
+      ...summary,
+      // The alarm, spelled out so a poller does not have to re-derive it: armed, the
+      // pass is running, and it is watching NOTHING ⇒ trimCount can never increment and
+      // any accrual gate hanging off it is structurally dead, not "still accruing".
+      blind: enabled && summary.observeStatus === 'blind',
+      observeNote:
+        'observedPositionCount is what the LAST pass actually iterated: null = no pass since boot (says nothing about the book), 0 = it ran and saw an EMPTY book (the alarm — trimCount can never increment), >0 = genuinely watching. maxGainPctObserved is the durable all-time high-water of the favorable excursion (null = never measured, NOT 0); size it against firstRungUp to see how close the ladder has come to firing. The ladder observes the demo EQUITY book only (PaperAccount.openPositions) — it does NOT read the options book, deliberately (TRA-1729: the rungs are underlying-price moves; option premium clears +25% routinely and TRA-1294 already banks profit on that book).',
     });
   });
 
