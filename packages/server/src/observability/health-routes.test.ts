@@ -1274,6 +1274,62 @@ describe('buildOptionJournalReport', () => {
     expect(spread.buckets[0]!.avgRealizedR_gateBasis).toBeNull();
   });
 
+  // TRA-1691 — the byDelta rows must reach the wire keyed on the SLEEVE
+  // (`structure × entryArchetype`), not just the structure. This is the contract
+  // TRA-1690's |Δ| > 0.65 ceiling verdict is graded off: on the live book that tail is
+  // n=94, of which 37 are `iv-rv-buy-premium` wearing the `single_leg_rv` label. Without
+  // the archetype axis on the wire, the RV long's verdict silently eats another
+  // scanner's rows and QuantTrader cannot tell.
+  it('serves byDelta keyed on structure x entryArchetype, scopable by sinceTs', () => {
+    const tagTs = NOW - 3_600_000; // the tagging deploy boundary
+    const row = (
+      id: string,
+      openTs: number,
+      archetype: string | undefined,
+      r: number,
+    ): OptionTradeJournalRecord => ({
+      ...closedRow,
+      id,
+      openTs,
+      structure: 'single_leg_rv',
+      entryDelta: 0.66,
+      realizedR: r,
+      realizedPnlUsd: r * 320,
+      ...(archetype ? { entryArchetype: archetype } : {}),
+    });
+    const rows = [
+      row('legacy', tagTs - 1000, undefined, -0.5), // pre-tagging blend
+      row('rv1', tagTs + 1000, 'rv-long', -0.2),
+      row('rv2', tagTs + 2000, 'rv-long', -0.4),
+      row('ivrv', tagTs + 3000, 'iv-rv-buy-premium', 0.9), // a DIFFERENT sleeve, same structure
+    ];
+
+    const cumulative = buildOptionJournalReport(rows, NOW, true);
+    expect(cumulative.summary.byDelta.map((c) => c.cohort).sort()).toEqual([
+      'single_leg_rv::iv-rv-buy-premium',
+      'single_leg_rv::rv-long',
+      'single_leg_rv::unspecified',
+    ]);
+
+    // Scoped to the post-tagging cohort, `unspecified` is GONE — that is the check that
+    // tagging actually took effect on the running box, and the precondition for grading
+    // the tail at all (a growing `unspecified` post-deploy means tagging is broken).
+    const scoped = buildOptionJournalReport(rows, NOW, true, undefined, tagTs);
+    expect(scoped.sinceTs).toBe(tagTs);
+    expect(scoped.summary.byDelta.map((c) => c.cohort).sort()).toEqual([
+      'single_leg_rv::iv-rv-buy-premium',
+      'single_leg_rv::rv-long',
+    ]);
+
+    // And the RV long's tail is ITS OWN: −0.30R premium / −1.20R gate basis. Pooled with
+    // the premium buyer the same band reads +0.10R — the ceiling verdict flips sign.
+    const rvLong = scoped.summary.byDelta.find((c) => c.entryArchetype === 'rv-long')!;
+    const tail = rvLong.buckets.find((b) => b.bucket === '0.65-0.70')!;
+    expect(tail.closed).toBe(2);
+    expect(tail.avgRealizedR_premiumBasis).toBeCloseTo(-0.3, 10);
+    expect(tail.avgRealizedR_gateBasis).toBeCloseTo(-1.2, 10);
+  });
+
   // TRA-1591 — post-arm cohort filter for grading the OTM entry delta floor.
   describe('sinceTs cohort filter', () => {
     const armTs = NOW - 3_600_000; // arm boundary 1h ago

@@ -622,6 +622,18 @@ const DELTA_BUCKET_WIDTH_HUNDREDTHS = 5;
 const LOW_CATCH_ALL = `lt${DELTA_BUCKET_MIN.toFixed(2)}`;
 const HIGH_CATCH_ALL = `gte${DELTA_BUCKET_MAX.toFixed(2)}`;
 
+/**
+ * TRA-1691 — rows whose entry |delta| was never MEASURED. Distinct from `lt0.20`,
+ * and the distinction is load-bearing: `lt0.20` is not an inert catch-all, it is the
+ * exact band the OTM entry-delta FLOOR (TRA-1407) exists to cut. Folding an unmeasured
+ * row in there grades a missing measurement as evidence against low delta, and drags
+ * the band's mean toward the book mean — the same "a counter must report the effective
+ * reality, not a convenient default" failure as TRA-1682's `admitRate: null ≠ 0`.
+ * Currently n=0 on the live book (every row carries a finite delta); this keeps it
+ * that way *observably* rather than by assumption.
+ */
+const UNKNOWN_DELTA = 'unknown';
+
 /** The half-open `[from, to)` bands, with exactly-representable edges. */
 const DELTA_BANDS: ReadonlyArray<{ from: number; to: number; label: string }> = (() => {
   const bands: Array<{ from: number; to: number; label: string }> = [];
@@ -641,21 +653,29 @@ const DELTA_BANDS: ReadonlyArray<{ from: number; to: number; label: string }> = 
  * TRA-1661 — bucket an entry |delta| into a 0.05-wide band over [0.20, 0.70], with
  * `lt0.20` / `gte0.70` catch-alls so no closed row is silently dropped from the
  * slope fit. Bands are half-open `[from, to)`. Sign is folded (the estimator's
- * winProb is `|delta|`), and a non-finite delta falls to the low catch-all rather
- * than corrupting a real band. Labels are stable strings so they survive JSON
- * round-trips as object keys / chart categories.
+ * winProb is `|delta|`). Labels are stable strings so they survive JSON round-trips
+ * as object keys / chart categories.
+ *
+ * TRA-1691 — a non-finite delta goes to `unknown`, NOT to `lt0.20`. It used to go to
+ * `lt0.20`, which made an unmeasured row indistinguishable from a genuine 0.15-delta
+ * row inside the one band the delta floor is aimed at. See {@link UNKNOWN_DELTA}.
  */
 export function entryDeltaBucket(delta: number): string {
   const d = Math.abs(delta);
-  if (!Number.isFinite(d) || d < DELTA_BUCKET_MIN) return LOW_CATCH_ALL;
+  if (!Number.isFinite(d)) return UNKNOWN_DELTA;
+  if (d < DELTA_BUCKET_MIN) return LOW_CATCH_ALL;
   if (d >= DELTA_BUCKET_MAX) return HIGH_CATCH_ALL;
   const band = DELTA_BANDS.find((b) => d >= b.from && d < b.to);
   return band?.label ?? HIGH_CATCH_ALL;
 }
 
-/** The canonical bucket order (ascending in delta), catch-alls at the ends. */
+/**
+ * The canonical bucket order: ascending in delta, catch-alls at the ends, with
+ * `unknown` LAST — it is not a point on the delta axis, so it must never render as
+ * the leftmost (lowest-delta) band of a slope chart.
+ */
 export function deltaBucketOrder(): string[] {
-  return [LOW_CATCH_ALL, ...DELTA_BANDS.map((b) => b.label), HIGH_CATCH_ALL];
+  return [LOW_CATCH_ALL, ...DELTA_BANDS.map((b) => b.label), HIGH_CATCH_ALL, UNKNOWN_DELTA];
 }
 
 /**
@@ -696,17 +716,44 @@ export interface OptionTradeJournalDeltaBucketStat {
 }
 
 /**
- * TRA-1661 — the per-structure delta rollup. Split per structure and NEVER pooled:
- * the sleeves differ in scanner, signal and exit logic, so a pooled delta curve
- * measures the sleeve mix, not the delta slope.
+ * TRA-1691 — one COHORT of the delta rollup: a `structure × entryArchetype` pair.
+ *
+ * TRA-1661 shipped this keyed on `structure` alone, on the stated principle that
+ * "the sleeves are the confound; pooling them measures the sleeve mix, not the delta
+ * slope" — and then pooled three sleeves anyway, because `structure` is not the sleeve.
+ * `openOptionFromRvCandidate` journals `structure: 'single_leg_rv'` unconditionally for
+ * all of its callers (TRA-1682), so that one label carries the gated RV long, the
+ * ungated demo directional churner, and the IV-vs-RV premium buyer.
+ *
+ * That is not a theoretical confound. On the live book the |Δ| ≥ 0.65 tail — the exact
+ * population TRA-1690 grades — is **n=94, of which 37 are `iv-rv-buy-premium`**: a
+ * different scanner, different signal, different exit logic, wearing the same structure
+ * label. A per-structure read hands the RV-long verdict a 40% dose of another sleeve.
+ *
+ * `entryArchetype` is the sleeve. Keying on it is what makes the rollup measure what its
+ * own comment always claimed to.
  */
-export interface OptionTradeJournalDeltaStructureStat {
+export interface OptionTradeJournalDeltaCohortStat {
+  /** The journal `structure` label — the R-basis axis (see `gateBasisValid`). */
   structure: string;
+  /**
+   * The sleeve WITHIN that structure. `unspecified` = untagged, which for the RV
+   * structure is the pre-TRA-1682 blend and is NOT a gradeable sleeve: it is history.
+   * Tagging is forward-only (rows cannot be back-attributed), so a grade over a tagged
+   * sleeve must be scoped with `?sinceTs=` to the tagging deploy — and post-deploy the
+   * `single_leg_rv × unspecified` cohort must STOP GROWING. If it doesn't, tagging is
+   * broken, and this rollup is the place that shows it.
+   */
+  entryArchetype: string;
+  /** Stable `structure::entryArchetype` key, for use as a chart series / map key. */
+  cohort: string;
   closed: number;
   /**
-   * Whether `avgRealizedR_gateBasis` etc. are populated — true iff the structure's
+   * Whether `avgRealizedR_gateBasis` etc. are populated — true iff the STRUCTURE's
    * `atRiskUsd` is the full premium and its stop is `mark·0.75`, so the 4× premium→
-   * gate conversion holds. False (⇒ gate-basis fields null) for credit spreads.
+   * gate conversion holds. False (⇒ gate-basis fields null) for credit spreads. Keyed
+   * on structure, not archetype: the R basis is a property of the instrument, not of
+   * the scanner that picked it.
    */
   gateBasisValid: boolean;
   /** Bands ascending in delta, catch-alls at the ends. Empty bands are omitted. */
@@ -790,14 +837,16 @@ export interface OptionTradeJournalSummary {
    */
   byDte: OptionTradeJournalDteBandStat[];
   /**
-   * TRA-1661 (TRA-1647A) — per-structure × entry-|delta| rollup over RESOLVED rows.
-   * The WITHIN-sleeve measurement of the cost gate estimator's one load-bearing
-   * claim ("realized gross R rises with entry delta"), which the cross-sleeve read
-   * contradicts but cannot cleanly refute. Carries SD/SE so the re-grade can put a
-   * CI on the slope instead of a point estimate, and both R bases so the gate's
-   * stop-distance R is never silently compared against the journal's premium R.
+   * TRA-1661 (TRA-1647A), re-keyed by TRA-1691 — `structure × entryArchetype` ×
+   * entry-|delta| rollup over RESOLVED rows. The WITHIN-SLEEVE measurement of the cost
+   * gate estimator's one load-bearing claim ("realized gross R rises with entry delta"),
+   * which the cross-sleeve read contradicts but cannot cleanly refute. Carries SD/SE so
+   * a re-grade can put a CI on the slope instead of a point estimate, and both R bases
+   * so the gate's stop-distance R is never silently compared against the journal's
+   * premium R. Keyed on the ARCHETYPE because `structure` is not the sleeve — see
+   * {@link OptionTradeJournalDeltaCohortStat}.
    */
-  byDelta: OptionTradeJournalDeltaStructureStat[];
+  byDelta: OptionTradeJournalDeltaCohortStat[];
   /**
    * TRA-1600 (D) — measured mark-vs-fill slippage decomposition over the row set.
    * The spine that makes the TRA-1599 cost attribution *measured* rather than
@@ -937,22 +986,32 @@ export function summarizeOptionTradeJournal(
     }))
     .sort((a, b) => dteBandOrder.indexOf(a.band) - dteBandOrder.indexOf(b.band));
 
-  // TRA-1661 — per-structure × entry-|delta| rollup over RESOLVED rows. Grouped by
-  // structure FIRST (the sleeves are the confound; pooling them measures the sleeve
-  // mix, not the delta slope), then bucketed on entry |delta| in 0.05-wide bands.
-  // Both R bases are emitted per bucket: the journal divides by the full premium,
-  // the gate by the stop distance (0.25·premium), a 4× unit gap that has already
-  // produced one phantom cost input (TRA-1656 #5). SD is the SAMPLE sd (n−1) so a
-  // 1-row bucket reports null rather than a fake-confident 0 dispersion.
+  // TRA-1661, re-keyed by TRA-1691 — per-COHORT × entry-|delta| rollup over RESOLVED
+  // rows. The cohort is `structure × entryArchetype`, because the sleeve is the confound
+  // and `structure` is NOT the sleeve: one `single_leg_rv` label carries the gated RV
+  // long, the ungated demo directional churner and the IV-vs-RV premium buyer (TRA-1682).
+  // Grouping on structure alone re-introduced, one rollup over, the exact pooling this
+  // rollup's own comment was written to forbid. Then bucketed on entry |delta| in
+  // 0.05-wide bands.
+  //
+  // Both R bases are emitted per bucket: the journal divides by the full premium, the
+  // gate by the stop distance (0.25·premium), a 4× unit gap that has already produced one
+  // phantom cost input (TRA-1656 #5). SD is the SAMPLE sd (n−1) so a 1-row bucket reports
+  // null rather than a fake-confident 0 dispersion.
   const byDeltaMap = new Map<string, OptionTradeJournalRecord[]>();
   for (const r of closedRows) {
-    const list = byDeltaMap.get(r.structure) ?? [];
+    const cohort = `${r.structure}::${r.entryArchetype ?? 'unspecified'}`;
+    const list = byDeltaMap.get(cohort) ?? [];
     list.push(r);
-    byDeltaMap.set(r.structure, list);
+    byDeltaMap.set(cohort, list);
   }
   const bucketOrder = deltaBucketOrder();
-  const byDelta: OptionTradeJournalDeltaStructureStat[] = [...byDeltaMap.entries()]
-    .map(([structure, structRows]) => {
+  const byDelta: OptionTradeJournalDeltaCohortStat[] = [...byDeltaMap.entries()]
+    .map(([cohort, structRows]) => {
+      // Read the axes back off a representative row rather than splitting the key: an
+      // archetype label is free-form and could itself contain the separator.
+      const structure = structRows[0]!.structure;
+      const entryArchetype = structRows[0]!.entryArchetype ?? 'unspecified';
       const gateBasisValid = GATE_R_BASIS_STRUCTURES.has(structure);
       const buckets = new Map<string, OptionTradeJournalRecord[]>();
       for (const r of structRows) {
@@ -997,9 +1056,16 @@ export function summarizeOptionTradeJournal(
           };
         })
         .sort((a, b) => bucketOrder.indexOf(a.bucket) - bucketOrder.indexOf(b.bucket));
-      return { structure, closed: structRows.length, gateBasisValid, buckets: bucketStats };
+      return {
+        structure,
+        entryArchetype,
+        cohort,
+        closed: structRows.length,
+        gateBasisValid,
+        buckets: bucketStats,
+      };
     })
-    .sort((a, b) => b.closed - a.closed || a.structure.localeCompare(b.structure));
+    .sort((a, b) => b.closed - a.closed || a.cohort.localeCompare(b.cohort));
 
   // TRA-1600 (D) — measured slippage decomposition. Only rows carrying a
   // measurement contribute (unmeasured rows drop out rather than dragging the

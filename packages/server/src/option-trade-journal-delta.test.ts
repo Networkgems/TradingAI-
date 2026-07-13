@@ -44,12 +44,20 @@ describe('entryDeltaBucket', () => {
     expect(entryDeltaBucket(0.6999)).toBe('0.65-0.70');
   });
 
-  it('sends out-of-range and unusable deltas to the catch-alls, never dropping a row', () => {
+  it('sends out-of-range deltas to the catch-alls, never dropping a row', () => {
     expect(entryDeltaBucket(0.19)).toBe('lt0.20');
     expect(entryDeltaBucket(0)).toBe('lt0.20');
     expect(entryDeltaBucket(0.7)).toBe('gte0.70');
     expect(entryDeltaBucket(0.95)).toBe('gte0.70');
-    expect(entryDeltaBucket(Number.NaN)).toBe('lt0.20');
+  });
+
+  it('TRA-1691: an UNMEASURED delta is `unknown`, never `lt0.20`', () => {
+    // `lt0.20` is not an inert catch-all — it is the band the OTM entry-delta floor
+    // (TRA-1407) exists to cut. Folding an unmeasured row in there grades a missing
+    // measurement as evidence against low delta.
+    expect(entryDeltaBucket(Number.NaN)).toBe('unknown');
+    expect(entryDeltaBucket(Number.POSITIVE_INFINITY)).toBe('unknown');
+    expect(entryDeltaBucket(undefined as unknown as number)).toBe('unknown');
   });
 
   it('folds sign — the estimator uses |delta| (a 0.40-delta put is a 0.40 read)', () => {
@@ -58,11 +66,14 @@ describe('entryDeltaBucket', () => {
 
   it('deltaBucketOrder covers [0.20,0.70) in 10 bands plus 2 catch-alls, ascending', () => {
     const order = deltaBucketOrder();
-    expect(order).toHaveLength(12);
+    expect(order).toHaveLength(13);
     expect(order[0]).toBe('lt0.20');
     expect(order[1]).toBe('0.20-0.25');
     expect(order[10]).toBe('0.65-0.70');
     expect(order[11]).toBe('gte0.70');
+    // `unknown` is not a point on the delta axis, so it sorts LAST — never as the
+    // leftmost (lowest-delta) band of a slope chart.
+    expect(order[12]).toBe('unknown');
   });
 });
 
@@ -79,6 +90,90 @@ describe('summarizeOptionTradeJournal — byDelta (TRA-1661)', () => {
     const rv = byDelta.find((s) => s.structure === 'single_leg_rv')!;
     expect(otm.closed).toBe(2);
     expect(rv.closed).toBe(1);
+  });
+});
+
+describe('summarizeOptionTradeJournal — byDelta cohort key (TRA-1691)', () => {
+  // The structure label is NOT the sleeve. `openOptionFromRvCandidate` journals
+  // `structure: 'single_leg_rv'` for all of its callers (TRA-1682), so keying the
+  // rollup on structure pools the gated RV long with the ungated demo directional
+  // churner and the IV-vs-RV premium buyer — re-committing, one rollup over, the exact
+  // pooling TRA-1661's own comment forbids.
+  it('splits one structure into its ARCHETYPE sleeves — the tail is not one population', () => {
+    // This is the live shape, scaled down: the |Δ|≥0.65 tail on the running book is
+    // n=94, of which 37 are `iv-rv-buy-premium` — a 40% dose of a different scanner in
+    // a verdict that will be read as the RV long's.
+    const { byDelta } = summarizeOptionTradeJournal([
+      closed({ id: 'a', entryArchetype: 'rv-long', entryDelta: 0.66, realizedR: -0.2 }),
+      closed({ id: 'b', entryArchetype: 'rv-long', entryDelta: 0.67, realizedR: -0.4 }),
+      closed({ id: 'c', entryArchetype: 'iv-rv-buy-premium', entryDelta: 0.66, realizedR: 0.9 }),
+    ]);
+
+    expect(byDelta.map((c) => c.cohort).sort()).toEqual([
+      'single_leg_rv::iv-rv-buy-premium',
+      'single_leg_rv::rv-long',
+    ]);
+
+    const rvLong = byDelta.find((c) => c.cohort === 'single_leg_rv::rv-long')!;
+    expect(rvLong.structure).toBe('single_leg_rv');
+    expect(rvLong.entryArchetype).toBe('rv-long');
+    expect(rvLong.closed).toBe(2);
+    // The RV long's own tail: −0.30R premium basis. Pooled with the premium buyer it
+    // would read +0.10R — a sign flip, i.e. the ceiling verdict inverts.
+    const band = rvLong.buckets.find((b) => b.bucket === '0.65-0.70')!;
+    expect(band.avgRealizedR_premiumBasis).toBeCloseTo(-0.3, 10);
+    expect(band.avgRealizedR_gateBasis).toBeCloseTo(-1.2, 10); // 4x
+
+    const ivRv = byDelta.find((c) => c.cohort === 'single_leg_rv::iv-rv-buy-premium')!;
+    expect(ivRv.closed).toBe(1);
+    expect(ivRv.buckets[0]!.avgRealizedR_premiumBasis).toBeCloseTo(0.9, 10);
+  });
+
+  it('keeps the R basis keyed on the STRUCTURE, not the archetype', () => {
+    // The premium→gate 4× conversion is a property of the instrument (full-premium
+    // atRisk + mark·0.75 stop), not of the scanner that picked it. Every archetype
+    // inside a credit spread must still null the gate basis.
+    const { byDelta } = summarizeOptionTradeJournal([
+      closed({ id: 'a', structure: 'bull_put', entryArchetype: 'ema-pullback', entryDelta: 0.3 }),
+      closed({ id: 'b', structure: 'single_leg_rv', entryArchetype: 'ema-pullback', entryDelta: 0.3 }),
+    ]);
+    expect(byDelta.find((c) => c.structure === 'bull_put')!.gateBasisValid).toBe(false);
+    expect(byDelta.find((c) => c.structure === 'single_leg_rv')!.gateBasisValid).toBe(true);
+  });
+
+  it('folds UNTAGGED rows to `unspecified` — history, and it must stop growing post-deploy', () => {
+    // Tagging is forward-only: pre-TRA-1682 rows cannot be back-attributed, so the
+    // `unspecified` cohort is the historical blend. Post-deploy it must STOP GROWING —
+    // if it doesn't, tagging is broken, and this rollup is where that shows.
+    const { byDelta } = summarizeOptionTradeJournal([
+      closed({ id: 'a', entryDelta: 0.66 }), // untagged (legacy)
+      closed({ id: 'b', entryArchetype: 'rv-long', entryDelta: 0.66 }),
+    ]);
+    expect(byDelta.map((c) => c.cohort).sort()).toEqual([
+      'single_leg_rv::rv-long',
+      'single_leg_rv::unspecified',
+    ]);
+    expect(byDelta.find((c) => c.cohort === 'single_leg_rv::unspecified')!.closed).toBe(1);
+  });
+
+  it('quarantines an UNMEASURED delta in `unknown` instead of the floor-cut band', () => {
+    const { byDelta } = summarizeOptionTradeJournal([
+      closed({ id: 'a', entryDelta: Number.NaN, realizedR: -0.9 }),
+      closed({ id: 'b', entryDelta: 0.1, realizedR: 0.1 }),
+    ]);
+    const buckets = byDelta[0]!.buckets;
+    expect(buckets.map((b) => b.bucket)).toEqual(['lt0.20', 'unknown']);
+
+    // The genuine low-delta row keeps its own mean — the unmeasured row does not drag it.
+    const low = buckets.find((b) => b.bucket === 'lt0.20')!;
+    expect(low.closed).toBe(1);
+    expect(low.avgRealizedR_premiumBasis).toBeCloseTo(0.1, 10);
+
+    const unknown = buckets.find((b) => b.bucket === 'unknown')!;
+    expect(unknown.closed).toBe(1);
+    expect(unknown.deltaFrom).toBeNull();
+    expect(unknown.deltaTo).toBeNull();
+    expect(unknown.avgEntryDelta).toBeNull(); // no measurement to average
   });
 
   it('reports realized R in BOTH bases — gate R is 4x the journal R (TRA-1656 #5)', () => {
