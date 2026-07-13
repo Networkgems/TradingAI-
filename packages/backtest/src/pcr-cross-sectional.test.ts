@@ -9,7 +9,9 @@ import {
 } from './pcr-expectancy.js';
 import {
   PCR_STUDY_TRIALS,
+  POWER_CONSTRAINT,
   SELECTION_ONLY_CONSTRAINT,
+  XS_MIN_FAIL_SESSIONS,
   XS_MIN_SESSIONS,
   blockBootstrapSeries,
   crossSectionalContrasts,
@@ -18,6 +20,7 @@ import {
   pcrSideCaller,
   runPcrCrossSectional,
   sessionLevelPlaceboCaller,
+  xsCondemnRuling,
 } from './pcr-cross-sectional.js';
 import { synth } from './pcr-synth.fixture.js';
 
@@ -345,15 +348,17 @@ describe('POSITIVE control — the gate can RELEASE, and sooner than the primary
 });
 
 describe('THE THIRD BRANCH — three outcomes, three controls (TRA-1726)', () => {
-  it('FAIL control — an ANTI-SELECTIVE overlay is DECISIVELY refused at only 30 sessions', () => {
+  it('FAIL control — an ANTI-SELECTIVE overlay is DECISIVELY refused, 8/8 from N=45 up', () => {
     // Proves the condemn branch CAN FIRE. Without it, HELD-vs-FAIL could have collapsed
     // and the secondary would abstain forever — a gate that can never condemn is exactly
     // as broken as one that condemns everything.
     //
     // The sign-mirror of a real selection edge: we read the CONFIRMING interpretation of
-    // a ledger whose true selection edge is CONTRARIAN. The whole interval sits below the
-    // bar — positive evidence AGAINST — and it is decisive at 30 sessions.
-    for (const sessions of [30, 45, 60]) {
+    // a ledger whose true selection edge is CONTRARIAN. The true contrast is ~-1.6R, the
+    // whole interval sits far below the bar — positive evidence AGAINST — and it misses
+    // the bar by many times the interval's own half-width, so TRA-1756's margin term is
+    // satisfied comfortably. This is the KNOWN-BAD half of the two-sided control below.
+    for (const sessions of [45, 60, 90]) {
       for (let t = 0; t < 8; t++) {
         const { ledger, bars } = synth({
           sessions, seed: 5 + t * 101, edge: 'none', gamma: 2.0, crossSectionalEdge: 2.5,
@@ -362,22 +367,51 @@ describe('THE THIRD BRANCH — three outcomes, three controls (TRA-1726)', () =>
           iters: 400, seed: 11, primaryInterpretation: 'confirming',
         });
         expect(rep.verdict).toBe('FAIL');
-        // ASSERT THE PREDICATE, NOT THE LABEL.
-        expect(rep.primary!.clustered.hi).toBeLessThan(PCR_UPLIFT_BAR_R);
+        // ASSERT THE PREDICATE, NOT THE LABEL — and assert the SHARED one, never a
+        // retyped copy. A grader written from recall is a different grader.
+        expect(xsCondemnRuling(rep.primary!).decisive).toBe(true);
       }
     }
   }, 300000);
 
-  it('the rule is EXACTLY "CI upper bound < bar" — the label always matches the predicate', () => {
+  it('TRA-1756 R1: at 30 sessions the floor WITHHOLDS the kill, and says so', () => {
+    // The same anti-selective world at calendar N=30. The point estimate is just as damning,
+    // but the sample is too thin for a DECISIVE, IRREVERSIBLE verdict — so the branch
+    // withholds on 7 of 8 worlds and the report explains itself rather than going quiet.
+    //
+    // (1 of the 8 does condemn: `XS_MIN_FAIL_SESSIONS` counts USED sessions, and this world
+    // is so strongly cross-sectional that ~93% of its sessions survive, so it clears 30 used
+    // sessions at calendar 30. That is the floor behaving correctly, not leaking — it is
+    // gating on how much evidence there actually IS, which is the whole point.)
+    const counts: Record<string, number> = { PASS: 0, FAIL: 0, HELD: 0 };
+    let withheldReasons = 0;
+    for (let t = 0; t < 8; t++) {
+      const { ledger, bars } = synth({
+        sessions: 30, seed: 5 + t * 101, edge: 'none', gamma: 2.0, crossSectionalEdge: 2.5,
+      });
+      const rep = runPcrCrossSectional(ledger, bars, {
+        iters: 400, seed: 11, primaryInterpretation: 'confirming',
+      });
+      counts[rep.verdict]++;
+      if (rep.reasons.some((r) => /CONDEMNATION WITHHELD \(session floor\)/.test(r))) {
+        withheldReasons++;
+      }
+    }
+    expect(counts).toEqual({ PASS: 0, FAIL: 1, HELD: 7 });
+    // A silent withholding is how this gate would rot: the next reader sees a sub-bar
+    // interval sitting on a HELD, calls it a bug, and "fixes" it back into the coin flip.
+    expect(withheldReasons).toBe(7);
+  }, 300000);
+
+  it('the label ALWAYS matches `xsCondemnRuling` — one predicate, no second copy', () => {
     for (const edge of ['none', 'real'] as const) {
-      for (const xsEdge of [0, 2.5]) {
+      for (const xsEdge of [0, 0.04, 2.5]) {
         for (const sessions of [10, 30, 60]) {
           const { ledger, bars } = synth({
             sessions, seed: 77, edge, gamma: 2.0, crossSectionalEdge: xsEdge,
           });
           const rep = runPcrCrossSectional(ledger, bars, { iters: 300, seed: 11 });
-          const hi = rep.primary?.clustered.hi ?? NaN;
-          const decisive = Number.isFinite(hi) && hi < PCR_UPLIFT_BAR_R;
+          const decisive = rep.primary ? xsCondemnRuling(rep.primary).decisive : false;
 
           if (rep.verdict === 'FAIL') expect(decisive).toBe(true);
           else if (rep.verdict === 'HELD') expect(decisive).toBe(false);
@@ -421,6 +455,219 @@ describe('THE THIRD BRANCH — three outcomes, three controls (TRA-1726)', () =>
     expect(rep.verdict).toBe('HELD');
     expect(rep.shape.rows).toBe(0);
   });
+});
+
+// ---------------------------------------------------------------------------
+// TRA-1756 R1 — THE CONDEMN BRANCH MUST DISCRIMINATE.
+//
+// A FAIL retires the overlay. Before TRA-1756 the rule was `hi < bar`, and on a realistic
+// world that was a COIN FLIP WITH AN IRREVERSIBLE CONSEQUENCE: it fired on 9.5% of worlds
+// carrying a REAL +0.087R selection edge (1.7x the promotion bar) and on 17% of worlds
+// carrying none — a 7.5-point margin, which is noise.
+//
+// The controls below are TWO-SIDED, and that is the whole point. "Can the branch fire?" is
+// only HALF a control: a branch that fires on everything passes it, and so does a branch
+// that fires on nothing if you only ever check that it stayed quiet. The instrument must be
+// shown to FIRE ON A KNOWN-BAD *and* STAY SILENT ON A KNOWN-GOOD. Blind and clean render
+// identically, and this issue has already produced that same failure three times.
+//
+// The known-BAD is the anti-selective world (true contrast ~-1.6R — PCR anti-ranks the
+// names). The known-GOOD is `crossSectionalEdge: 0.04`, which is a genuine +0.087R edge
+// (measured on N=400 x 40 worlds: +0.0867R +/- 0.0131). It is 1.7x the +0.05R bar, so it is
+// exactly the kind of edge the study exists to find — and condemning it is a FALSE KILL.
+// ---------------------------------------------------------------------------
+
+/** A real, promotable selection edge: +0.087R +/- 0.013, i.e. 1.7x the +0.05R bar. */
+const REAL_EDGE_2X_BAR = 0.04;
+
+const failCount = (
+  sessions: number,
+  xsEdge: number,
+  interpretation: 'confirming' | 'contrarian',
+  worlds: number,
+): number => {
+  let fails = 0;
+  for (let t = 0; t < worlds; t++) {
+    const { ledger, bars } = synth({
+      sessions, seed: 300000 + t, edge: 'none', gamma: 2.0, crossSectionalEdge: xsEdge,
+    });
+    const rep = runPcrCrossSectional(ledger, bars, {
+      iters: 400, seed: 11, primaryInterpretation: interpretation,
+    });
+    if (rep.verdict === 'FAIL') fails++;
+  }
+  return fails;
+};
+
+describe('TRA-1756 R1 — the condemn branch DISCRIMINATES', () => {
+  it('FIRES on a known-BAD and is SILENT on a known-GOOD — at N=45 AND at N=60', () => {
+    // The two-sided control. Both halves must hold at the same N, or the branch is either
+    // decoration (never fires) or a coin flip (fires on anything).
+    for (const sessions of [45, 60]) {
+      // ...fires on a genuinely HARMFUL overlay: 8/8. The branch is not decoration.
+      expect(failCount(sessions, 2.5, 'confirming', 8)).toBe(8);
+      // ...and is SILENT on a world carrying a REAL, promotable +0.087R selection edge.
+      // 0/25 here; 0.5% measured over 200 worlds. Under the OLD rule this was 9.5% at
+      // N=45 and 6.5% at N=60 — i.e. a 1-in-11 chance of permanently retiring a signal
+      // that worked.
+      expect(failCount(sessions, REAL_EDGE_2X_BAR, 'contrarian', 25)).toBe(0);
+      // ...and silent on a zero-edge world too. FAIL is *correct* there, but it is not
+      // NEEDED — HELD already refuses to promote it, and abstaining costs nothing.
+      expect(failCount(sessions, 0, 'contrarian', 25)).toBe(0);
+    }
+  }, 600000);
+
+  it('THE SESSION FLOOR ALONE IS NOT THE FIX — it moves the coin flip to N=90', () => {
+    // The measurement that changed the remedy, and the reason this test exists.
+    //
+    // The review's R1 asked for a session floor and nothing else. Graded on 200 worlds/cell,
+    // a floor-only rule looks immaculate at N=45-60 and then the FALSE KILL CLIMBS BACK TO
+    // 6.5% AT N=90 — the exact window the study is actually read at — because once used
+    // sessions cross the floor, the old `hi < bar` coin flip simply resumes underneath it.
+    //
+    //   false kill on a real +0.087R edge   N=45   N=60   N=90   N=150
+    //   `hi < bar` (the old rule)            9.5%   6.5%   7.0%   4.0%
+    //   + session floor ONLY (R1 as asked)   1.0%   2.5%   6.5%   4.0%   <- DELAYS it
+    //   + floor AND margin (what shipped)    0.0%   0.5%   0.5%   0.0%   <- CURES it
+    //
+    // A CORRECT DIAGNOSIS IS NOT A CORRECT REMEDY. This test re-derives the two superseded
+    // rules ON THE SAME WORLDS and pins that they would still kill a real edge where the
+    // shipped rule does not. Without it, "0 false kills" is unfalsifiable — it reads the
+    // same whether the fix works or the branch is simply blind.
+    const worlds = 25;
+    const sessions = 90;
+    let oldRuleKills = 0;
+    let floorOnlyKills = 0;
+    let shippedKills = 0;
+
+    for (let t = 0; t < worlds; t++) {
+      const { ledger, bars } = synth({
+        sessions, seed: 300000 + t, edge: 'none', gamma: 2.0, crossSectionalEdge: REAL_EDGE_2X_BAR,
+      });
+      const rep = runPcrCrossSectional(ledger, bars, { iters: 400, seed: 11 });
+      const p = rep.primary!;
+      const hi = p.clustered.hi;
+
+      // The two SUPERSEDED rules, re-derived here deliberately — they no longer exist in
+      // the source, so a copy is the only way to grade them.
+      if (Number.isFinite(hi) && hi < PCR_UPLIFT_BAR_R) oldRuleKills++;
+      if (Number.isFinite(hi) && hi < PCR_UPLIFT_BAR_R && p.sessions >= XS_MIN_FAIL_SESSIONS) {
+        floorOnlyKills++;
+      }
+      // The SHIPPED rule — the shared predicate, not a copy.
+      if (xsCondemnRuling(p).decisive) shippedKills++;
+    }
+
+    // At N=90 the floor is already cleared, so it buys NOTHING: the floor-only rule kills
+    // exactly as often as the old one. This is the finding.
+    expect(floorOnlyKills).toBe(oldRuleKills);
+    expect(oldRuleKills).toBeGreaterThanOrEqual(2); // it really does kill real edges here
+    // The margin term is what does the work.
+    expect(shippedKills).toBeLessThan(oldRuleKills);
+    expect(shippedKills).toBeLessThanOrEqual(1);
+  }, 600000);
+
+  it('the floor counts USED sessions (~0.48 x calendar) — do NOT "fix" it to 60', () => {
+    // The trap that would have silently deleted the branch. The review asked for "no FAIL
+    // below N=60" meaning 60 CALENDAR sessions, but the code can only see sessions that
+    // carry a DEFINED contrast — the rest are dropped as empty-cohort. On a realistic
+    // (zero-to-small-edge) world that is about HALF of them.
+    //
+    // So `XS_MIN_FAIL_SESSIONS = 30` USED sessions IS calendar ~62. Writing the literal 60
+    // would push the branch out to calendar ~125 — past anything this study will reach —
+    // and a branch that never fires renders exactly like a branch that never needed to.
+    // The claim is the RATIO, so the ratio is what gets asserted. (Over 200 worlds the
+    // means are 21.6 / 29.2 / 43.3 used sessions at calendar 45 / 60 / 90; 12 worlds cannot
+    // resolve those to a decimal place, and pinning them here would be the same
+    // read-an-effect-off-too-few-worlds mistake this file exists to document.)
+    for (const calendar of [45, 60, 90]) {
+      const used: number[] = [];
+      for (let t = 0; t < 12; t++) {
+        const { ledger, bars } = synth({
+          sessions: calendar, seed: 300000 + t, edge: 'none', gamma: 2.0,
+        });
+        used.push(runPcrCrossSectional(ledger, bars, { iters: 200, seed: 11 }).primary!.sessions);
+      }
+      const ratio = mean(used) / calendar;
+      expect(ratio).toBeGreaterThan(0.4);
+      expect(ratio).toBeLessThan(0.55); // ~HALF. Emphatically NOT 1:1.
+    }
+    // 30 used sessions is the floor, and it lands where the review wanted it: calendar ~62.
+    expect(XS_MIN_FAIL_SESSIONS).toBe(30);
+  }, 300000);
+
+  it('the fix costs NO power — the positive control releases exactly as before', () => {
+    // A gate can always be made safe by wiring it shut. Pin that this one was not: the
+    // pre-TRA-1756 positive-control rows are reproduced to the world.
+    const counts = (sessions: number, xsEdge: number) => {
+      const c: Record<string, number> = { PASS: 0, FAIL: 0, HELD: 0 };
+      for (let t = 0; t < 8; t++) {
+        const { ledger, bars } = synth({
+          sessions, seed: 5 + t * 101, edge: 'none', gamma: 2.0, crossSectionalEdge: xsEdge,
+        });
+        c[runPcrCrossSectional(ledger, bars, { iters: 400, seed: 11 }).verdict]++;
+      }
+      return c;
+    };
+    expect(counts(45, 1.5).PASS).toBe(7); // unchanged
+    expect(counts(60, 1.5).PASS).toBe(8); // unchanged
+    expect(counts(45, 2.5).PASS).toBe(8); // unchanged
+  }, 300000);
+});
+
+// ---------------------------------------------------------------------------
+// TRA-1756 R2 — the POWER caveat travels with the number.
+// ---------------------------------------------------------------------------
+
+describe('TRA-1756 R2 — a HELD is NOT evidence of absence', () => {
+  it('stamps POWER_CONSTRAINT on every report, and into the reasons of every HELD', () => {
+    // Same reasoning that made SELECTION_ONLY_CONSTRAINT necessary, and it binds harder:
+    // that one guards the outcome we will probably never get (a PASS), this one guards the
+    // outcome we almost certainly WILL get. In November somebody reads "HELD" off a table,
+    // not this file, and "HELD" reads as "PCR does not rank names — drop it."
+    const { ledger, bars } = synth({ sessions: 45, seed: 300000, edge: 'none', gamma: 2.0 });
+    const held = runPcrCrossSectional(ledger, bars, { iters: 300, seed: 11 });
+
+    expect(held.verdict).toBe('HELD');
+    expect(held.power).toBe(POWER_CONSTRAINT);
+    expect(held.power).toMatch(/HELD IS NOT EVIDENCE OF ABSENCE/i);
+    expect(held.power).toMatch(/minimum detectable effect/i);
+    // ...and it is in the REASONS, not merely in a field somebody has to know to look up.
+    expect(held.reasons.some((r) => /HELD — READ THIS BEFORE ACTING ON IT/.test(r))).toBe(true);
+
+    // It ships on a PASS too — the number never travels without it.
+    const strong = synth({
+      sessions: 60, seed: 5, edge: 'none', gamma: 2.0, crossSectionalEdge: 2.5,
+    });
+    const pass = runPcrCrossSectional(strong.ledger, strong.bars, { iters: 400, seed: 11 });
+    expect(pass.verdict).toBe('PASS');
+    expect(pass.power).toBe(POWER_CONSTRAINT);
+  }, 120000);
+
+  it('the caveat is TRUE: the CI half-width is 4-6x the bar it is asked to grade', () => {
+    // POWER_CONSTRAINT is a claim about this estimator, so it is MEASURED, not asserted.
+    // A caveat nobody checked is just a comment.
+    //
+    // This one number is the whole of R2 and R3: the promotion bar is +0.05R and the
+    // instrument's resolution is 0.2-0.3R. The bar was chosen as a PROMOTION threshold and
+    // nobody ever checked it was a DETECTABLE one.
+    //
+    // The constant claims a BAND (0.2-0.3R), so the band is what gets asserted — not a
+    // decimal point estimate that 12 worlds cannot resolve. (Over 200 worlds: 0.309R at
+    // calendar 45, 0.286R at 60, 0.246R at 90, 0.203R at 150 — it shrinks with N, but
+    // nowhere near fast enough to reach the bar.)
+    for (const sessions of [45, 90]) {
+      const hws: number[] = [];
+      for (let t = 0; t < 12; t++) {
+        const { ledger, bars } = synth({ sessions, seed: 300000 + t, edge: 'none', gamma: 2.0 });
+        const p = runPcrCrossSectional(ledger, bars, { iters: 400, seed: 11 }).primary!;
+        if (Number.isFinite(p.clustered.hi)) hws.push((p.clustered.hi - p.clustered.lo) / 2);
+      }
+      expect(mean(hws)).toBeGreaterThan(0.2);
+      expect(mean(hws)).toBeLessThan(0.35);
+      expect(mean(hws)).toBeGreaterThan(4 * PCR_UPLIFT_BAR_R); // the bar is BELOW the noise floor
+    }
+  }, 300000);
 });
 
 // ---------------------------------------------------------------------------

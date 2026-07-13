@@ -97,6 +97,11 @@ export type {
 // contrast. Readable at ~45 sessions rather than the primary's ~90, but a PASS promotes
 // a PER-NAME SELECTION use ONLY and can never promote market timing — see
 // SELECTION_ONLY_CONSTRAINT, which is stamped into every report it produces.
+//
+// TRA-1756 — and a HELD is NOT evidence of absence: the +0.05R bar sits 4-6x BELOW the
+// noise floor of the estimator that grades it. POWER_CONSTRAINT is stamped alongside, and
+// `xsCondemnRuling` is the single shared predicate that decides whether a FAIL is even
+// permitted. Do not re-derive that rule at a call site.
 export {
   runPcrCrossSectional,
   crossSectionalContrasts,
@@ -107,13 +112,17 @@ export {
   blockBootstrapSeries,
   evaluateXsCell,
   xsOverfittingGuards,
+  xsCondemnRuling,
   SELECTION_ONLY_CONSTRAINT,
+  POWER_CONSTRAINT,
   XS_MIN_SESSIONS,
+  XS_MIN_FAIL_SESSIONS,
   XS_MIN_NAMES_PER_SESSION,
 } from './pcr-cross-sectional.js';
 export type {
   PcrCrossSectionalReport,
   XsCellResult,
+  XsCondemnRuling,
   XsGuards,
   XsSeries,
   XsDiagnostics,

@@ -224,6 +224,14 @@ console.log('SCOPE OF A SECONDARY PASS:');
 for (const chunk of secondary.constraint.match(/.{1,92}(\s|$)/g) ?? []) {
   console.log(`  ${chunk.trim()}`);
 }
+// TRA-1756 R2. And the POWER caveat travels with it, for exactly the same reason — except
+// that this one binds on the outcome we will ACTUALLY get. A HELD is the modal result of
+// this read, and "HELD" on a table reads as "PCR does not rank names, drop it".
+console.log();
+console.log('WHAT A SECONDARY *HELD* DOES AND DOES NOT MEAN:');
+for (const chunk of secondary.power.match(/.{1,92}(\s|$)/g) ?? []) {
+  console.log(`  ${chunk.trim()}`);
+}
 line('!');
 console.log();
 

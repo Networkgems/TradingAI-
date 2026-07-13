@@ -151,6 +151,31 @@ export const XS_MIN_NAMES_PER_SESSION = 5;
 export const XS_MIN_SESSIONS = 30;
 
 /**
+ * TRA-1756 R1. The FAIL branch's own floor, in USED sessions.
+ *
+ * *** THIS IS A COUNT OF USED SESSIONS, NOT OF CALENDAR SESSIONS. ***
+ *
+ * The review asked for "no FAIL below N=60", meaning 60 CALENDAR sessions. This code
+ * cannot see calendar sessions — `XsCellResult.sessions` counts the sessions that carry
+ * a DEFINED contrast, after `droppedTooFewNames` and `droppedEmptyCohort`. On a realistic
+ * (zero-to-small-edge) world those drops are severe and remarkably stable:
+ *
+ *     used ~= 0.48 x calendar    (measured: calendar 45/60/90/150 -> used 21.6/29.2/43.3/73.2)
+ *
+ * So 30 USED sessions IS calendar ~62, which is the review's N=60 to within the noise.
+ * Taking the "60" literally and writing `sessions >= 60` would have been a silent
+ * catastrophe: on a realistic world that is not reached until calendar ~125, so it would
+ * not have NARROWED the condemn branch, it would have DELETED it — and the deletion would
+ * have been invisible, because a branch that never fires and a branch that never needs to
+ * fire render identically in a passing test suite.
+ *
+ * It is deliberately a SEPARATE constant from `XS_MIN_SESSIONS` even though both are 30:
+ * they mean different things (one gates promotion, one gates condemnation) and a later
+ * reader must be able to move one without moving the other.
+ */
+export const XS_MIN_FAIL_SESSIONS = 30;
+
+/**
  * Re-exported for the CLI and the tests. Defined in `pcr-expectancy.ts` so the import
  * stays acyclic — see the doc comment there for why the primary's penalty goes UP when
  * this estimand is added.
@@ -171,6 +196,40 @@ export const SELECTION_ONLY_CONSTRAINT =
   'direction cancels out of it exactly — the estimand is blind to timing BY ' +
   'CONSTRUCTION and contains no information about whether to trade at all. Only the ' +
   'PRIMARY time-series read at N >= 90 sessions can promote a full overlay.';
+
+/**
+ * TRA-1756 R2. Stamped into every secondary report ALONGSIDE `SELECTION_ONLY_CONSTRAINT`,
+ * and printed by the CLI on PASS, FAIL and HELD alike.
+ *
+ * Same reasoning that made `SELECTION_ONLY_CONSTRAINT` necessary, and it applies twice
+ * over: in November somebody reads a verdict off a table, not this file, and a bare "HELD"
+ * reads as "PCR does not rank names — drop it." It does not mean that. It means the edge,
+ * if any, was smaller than the smallest edge this read can SEE.
+ *
+ * The numbers are measured, not asserted (12 worlds/cell for the PASS curve, 200/cell for
+ * the intervals):
+ *
+ *   true edge | vs bar | PASS at N=45 | PASS at N=90        session-clustered 90% CI
+ *   ----------+--------+--------------+-------------        HALF-WIDTH, zero-edge worlds:
+ *     +0.10R  |    2x  |     0/12     |     0/12              calendar N=45  -> 0.309R
+ *     +0.20R  |    4x  |     0/12     |     0/12              calendar N=60  -> 0.286R
+ *     +0.36R  |    7x  |     0/12     |     2/12              calendar N=90  -> 0.246R
+ *     +1.62R  |   32x  |    11/12     |    12/12              calendar N=150 -> 0.203R
+ *
+ * The half-width column is the whole story in one number: the instrument's resolution is
+ * 0.2-0.3R and the promotion bar is 0.05R. THE BAR IS 4-6x BELOW THE NOISE FLOOR OF THE
+ * ESTIMATOR THAT GRADES IT. The +0.05R bar was chosen as a PROMOTION threshold and nobody
+ * ever checked it was a DETECTABLE one (TRA-1756 R3: the primary has the same disease —
+ * its own positive control is 30x the bar and it musters 62% power at N=90 against it).
+ */
+export const POWER_CONSTRAINT =
+  'POWER. At N=45 sessions this read releases only on a selection edge of roughly +1.0R ' +
+  'or larger; edges below ~+0.4R are INVISIBLE to it at any N <= 90. The session-clustered ' +
+  '90% CI has a half-width of 0.2-0.3R against a +0.05R promotion bar, so the bar sits 4-6x ' +
+  'BELOW the noise floor of the estimator that grades it. *** A HELD IS NOT EVIDENCE OF ' +
+  'ABSENCE. *** It means "no edge larger than the minimum detectable effect" — NOT "no ' +
+  'edge", and NEVER "PCR does not rank names". Do not read a HELD as a reason to drop the ' +
+  'PCR overlay; the only thing it licenses is continuing to accrue sessions.';
 
 /**
  * Calls a side for EACH name in ONE session. Returns one entry per input row,
@@ -667,9 +726,118 @@ export function xsOverfittingGuards(
   return { trials, dsr, pbo, dsrEvaluable, pboEvaluable, notes };
 }
 
+/** The condemn branch's ruling, and — when it withholds — WHY. */
+export interface XsCondemnRuling {
+  /** True => the verdict may be FAIL: a DECISIVE, IRREVERSIBLE no-go. */
+  decisive: boolean;
+  /**
+   * Set when the STATUS-QUO rule (`hi < bar`) would have condemned and this rule REFUSED.
+   * It must be surfaced in the report: a reader who sees a sub-bar point estimate and a
+   * HELD is owed the reason, or they will "fix" the gate back to the coin flip.
+   */
+  withheld: string | null;
+}
+
+/**
+ * THE CONDEMN RULE — the single source of truth for whether a FAIL is permitted.
+ *
+ * The verdict calls this, and so does every test. NOBODY RETYPES IT. A grader written from
+ * recall is a different grader, and the one thing this issue has proved three times over is
+ * that a control which does not discriminate looks exactly like one that does.
+ *
+ * ===========================================================================
+ * TRA-1756 R1 — WHY `hi < bar` ALONE IS A COIN FLIP WITH AN IRREVERSIBLE CONSEQUENCE
+ * ===========================================================================
+ *
+ * A FAIL is a DECISIVE NO-GO (TRA-1726): it retires the overlay. It does not mean "not
+ * yet". So the ONLY costs that matter are:
+ *
+ *   - the FALSE KILL: condemning a world that carries a real, promotable edge, and
+ *   - REACHABILITY: a branch that can never fire certifies nothing (TRA-1726).
+ *
+ * The pre-TRA-1756 rule was `hi < bar` — condemn whenever the optimistic end of the
+ * interval fails to reach +0.05R. But the interval's own HALF-WIDTH is 0.2-0.3R, i.e.
+ * 4-6x the bar (see `POWER_CONSTRAINT`). Condemning on a hair's breadth with a ruler that
+ * wide is not evidence. Measured, 200 worlds/cell:
+ *
+ *                                       FALSE KILL on a real +0.087R edge (1.7x the bar)
+ *   rule                                 N=45    N=60    N=90   N=150
+ *   -----------------------------------  -----   -----   -----  -----
+ *   `hi < bar` (the old rule)             9.5%    6.5%    7.0%   4.0%     <- a coin flip
+ *   + session floor ONLY (R1 as written)  1.0%    2.5%    6.5%   4.0%     <- DELAYS it
+ *   + floor AND margin (this rule)        0.0%    0.5%    0.5%   0.0%     <- cures it
+ *
+ * *** THE FLOOR ALONE IS NOT THE FIX, AND THAT IS THE POINT OF THIS FUNCTION. ***
+ * The review's remedy was a session floor. It looks clean at N=45-60 and then the false
+ * kill CLIMBS BACK TO 6.5% AT N=90 — the exact window the study is actually read at —
+ * because once used-sessions cross the floor the old coin flip simply resumes. A floor
+ * moves the disease; it does not cure it. (A CORRECT DIAGNOSIS IS NOT A CORRECT REMEDY.)
+ *
+ * The second term is what cures it: *** THE SHORTFALL MUST EXCEED THE RESOLUTION. ***
+ * Condemn only if the gap from the bar down to the interval's optimistic end is BIGGER
+ * than the interval's own half-width — i.e. only if we missed the bar by more than we can
+ * measure. That is self-calibrating: it tightens automatically as the sample grows and it
+ * does not depend on the synthetic generator's R-scale, which is the one input TRA-1756 R3
+ * flags as never having been checked against the real ledger.
+ *
+ * And it costs NOTHING in reachability, which is the part that could have gone wrong: a
+ * genuinely HARMFUL overlay (a true contrast of ~-1.6R — PCR anti-ranking the names) is
+ * still condemned in *** 100% of worlds at every N from 45 to 150 ***. The branch is
+ * narrowed, not deleted. Three outcomes, all three reachable, exactly as TRA-1726 requires.
+ *
+ * The rule the review floated — "require the CI WIDTH to be smaller than the bar" — was
+ * measured and rejected: widths run 0.4-0.6R against a 0.05R bar, so it would need N in the
+ * thousands and the FAIL branch would be dead on arrival at every N this study will ever
+ * see. Dead-on-arrival is the failure TRA-1726 exists to prevent.
+ */
+export function xsCondemnRuling(
+  cell: Pick<XsCellResult, 'clustered' | 'sessions'>,
+): XsCondemnRuling {
+  const { lo, hi } = cell.clustered;
+
+  // IGNORANCE IS NOT CONDEMNATION (TRA-1726). A NaN interval is an abstention. The caller
+  // reports this case itself, so there is nothing to explain here.
+  if (!Number.isFinite(hi) || !Number.isFinite(lo)) return { decisive: false, withheld: null };
+
+  // The interval still reaches the bar: an ordinary HELD, nothing was withheld.
+  if (hi >= PCR_UPLIFT_BAR_R) return { decisive: false, withheld: null };
+
+  // Below here the OLD rule would have condemned. Both new terms must clear.
+  if (cell.sessions < XS_MIN_FAIL_SESSIONS) {
+    return {
+      decisive: false,
+      withheld:
+        `CONDEMNATION WITHHELD (session floor): the 90% CI upper bound ${hi.toFixed(4)}R is ` +
+        `below the ${PCR_UPLIFT_BAR_R}R bar, but only ${cell.sessions} sessions carry a defined ` +
+        `contrast (< ${XS_MIN_FAIL_SESSIONS}). A DECISIVE NO-GO is not available on a sample ` +
+        `this thin — at that size the branch fires on a real 1.7x-bar edge about as often as ` +
+        `on no edge at all. HELD. Waiting costs nothing; being decisive early is exactly when ` +
+        `the decision is worthless.`,
+    };
+  }
+
+  const halfWidth = (hi - lo) / 2;
+  const shortfall = PCR_UPLIFT_BAR_R - hi;
+  if (shortfall <= halfWidth) {
+    return {
+      decisive: false,
+      withheld:
+        `CONDEMNATION WITHHELD (resolution): the 90% CI upper bound ${hi.toFixed(4)}R is below ` +
+        `the ${PCR_UPLIFT_BAR_R}R bar, but only by ${shortfall.toFixed(4)}R — LESS THAN THE ` +
+        `INTERVAL'S OWN HALF-WIDTH of ${halfWidth.toFixed(4)}R. We missed the bar by less than ` +
+        `we can measure, so this is not positive evidence AGAINST the overlay; it is a ` +
+        `downward fluctuation of an instrument too coarse to grade its own bar. HELD.`,
+    };
+  }
+
+  return { decisive: true, withheld: null };
+}
+
 export interface PcrCrossSectionalReport {
   /** Stamped on every report. The number must never travel without this sentence. */
   constraint: string;
+  /** TRA-1756 R2. Stamped on every report, for the same reason `constraint` is. */
+  power: string;
   diagnostics: Record<number, JoinDiagnostics>;
   shape: SampleShape;
   cells: XsCellResult[];
@@ -679,10 +847,13 @@ export interface PcrCrossSectionalReport {
    * Three-valued and all three REACHABLE, on the TRA-1726 rule.
    *
    * - PASS — every leg AND both guards evaluable and passing. Promotes SELECTION ONLY.
-   * - FAIL — DECISIVE NO-GO: the clustered CI's UPPER bound sits below the +0.05R bar,
-   *   so even the optimistic end of the interval cannot clear it. Decisive at any N.
-   * - HELD — the interval straddles the bar, or is not evaluable, or the sample is below
-   *   the 30-session floor. NOT a NO-GO. Never a pass.
+   * - FAIL — DECISIVE NO-GO, on `xsCondemnRuling`: the clustered CI's upper bound sits
+   *   below the +0.05R bar BY MORE THAN THE INTERVAL'S OWN HALF-WIDTH, on at least
+   *   `XS_MIN_FAIL_SESSIONS` sessions. Irreversible, so it must rest on evidence the
+   *   instrument can actually resolve — see `xsCondemnRuling` for the measurements.
+   * - HELD — anything else: the interval reaches the bar, or is not evaluable, or the
+   *   sample is below a floor, or it missed the bar by less than it can measure. NOT a
+   *   NO-GO. Never a pass.
    *
    * A GATE WITH THREE OUTCOMES NEEDS THREE CONTROLS, and all three are pinned.
    */
@@ -751,6 +922,7 @@ export function runPcrCrossSectional(
   if (!primary) {
     return {
       constraint: SELECTION_ONLY_CONSTRAINT,
+      power: POWER_CONSTRAINT,
       diagnostics,
       shape,
       cells,
@@ -772,12 +944,15 @@ export function runPcrCrossSectional(
     guards.dsr?.pass === true &&
     guards.pbo?.pass === true;
 
-  // THE DECISIVE-NO-GO RULE (TRA-1726), applied verbatim to the secondary.
+  // THE DECISIVE-NO-GO RULE (TRA-1726 + TRA-1756 R1). ONE predicate, shared by the verdict
+  // and by every test — see `xsCondemnRuling`.
   //
-  // A FAIL must rest on POSITIVE evidence AGAINST, never on the mere ABSENCE of
-  // evidence for. IGNORANCE IS NOT CONDEMNATION: a NaN interval is HELD.
+  // A FAIL must rest on POSITIVE evidence AGAINST, never on the mere ABSENCE of evidence
+  // for. IGNORANCE IS NOT CONDEMNATION: a NaN interval is HELD — and so, now, is a
+  // shortfall smaller than the interval's own half-width, which is the same thing wearing
+  // a number.
   const hi = primary.clustered.hi;
-  const decisiveNoGo = Number.isFinite(hi) && hi < PCR_UPLIFT_BAR_R;
+  const ruling = xsCondemnRuling(primary);
 
   let verdict: 'PASS' | 'FAIL' | 'HELD';
   if (primary.pass && guardsPass) {
@@ -785,14 +960,18 @@ export function runPcrCrossSectional(
     reasons.push(
       `PASS — SELECTION USE ONLY. ${SELECTION_ONLY_CONSTRAINT}`,
     );
-  } else if (decisiveNoGo) {
+  } else if (ruling.decisive) {
     verdict = 'FAIL';
     reasons.push(
-      `DECISIVE NO-GO: session-clustered 90% CI upper bound ${hi.toFixed(4)}R < ` +
-        `${PCR_UPLIFT_BAR_R}R bar — even the optimistic end of the interval cannot clear it ` +
-        `(adjusted cross-sectional contrast ${primary.adjustedContrastR.toFixed(4)}R; raw ` +
-        `${primary.rawContrastR.toFixed(4)}R, of which ${primary.placeboContrastR.toFixed(4)}R ` +
-        `is earned by a zero-information "buy the relative laggard")`,
+      `DECISIVE NO-GO: session-clustered 90% CI upper bound ${hi.toFixed(4)}R falls short of ` +
+        `the ${PCR_UPLIFT_BAR_R}R bar by ${(PCR_UPLIFT_BAR_R - hi).toFixed(4)}R — MORE than the ` +
+        `interval's own half-width of ${((hi - primary.clustered.lo) / 2).toFixed(4)}R, on ` +
+        `${primary.sessions} sessions. Even the optimistic end of the interval cannot clear the ` +
+        `bar, and it misses by more than this instrument can resolve, so this is positive ` +
+        `evidence AGAINST (adjusted cross-sectional contrast ` +
+        `${primary.adjustedContrastR.toFixed(4)}R; raw ${primary.rawContrastR.toFixed(4)}R, of ` +
+        `which ${primary.placeboContrastR.toFixed(4)}R is earned by a zero-information "buy the ` +
+        `relative laggard")`,
     );
   } else {
     verdict = 'HELD';
@@ -801,6 +980,11 @@ export function runPcrCrossSectional(
         'HELD: the session-clustered CI is not evaluable on this sample — that is an ' +
           'abstention, not a NO-GO',
       );
+    } else if (ruling.withheld) {
+      // The old rule WOULD have condemned here. Say so, and say why we refused — otherwise
+      // the next reader sees a sub-bar interval sitting on a HELD, calls it a bug, and
+      // "fixes" the gate straight back into the coin flip.
+      reasons.push(`HELD: ${ruling.withheld}`);
     } else {
       reasons.push(
         `HELD: session-clustered 90% CI [${primary.clustered.lo.toFixed(4)}, ${hi.toFixed(4)}]R ` +
@@ -824,10 +1008,15 @@ export function runPcrCrossSectional(
     }
     if (guards.dsr && !guards.dsr.pass) reasons.push('HELD leg: DSR guard failed');
     if (guards.pbo && !guards.pbo.pass) reasons.push('HELD leg: PBO guard failed');
+    // TRA-1756 R2. A HELD is the MODAL outcome of this read and the one most likely to be
+    // misread — "PCR doesn't rank names, drop it". It does not say that. The power caveat
+    // ships INSIDE the verdict's own reasons, not just in a field somebody has to look up.
+    reasons.push(`HELD — READ THIS BEFORE ACTING ON IT. ${POWER_CONSTRAINT}`);
   }
 
   return {
     constraint: SELECTION_ONLY_CONSTRAINT,
+    power: POWER_CONSTRAINT,
     diagnostics,
     shape,
     cells,
