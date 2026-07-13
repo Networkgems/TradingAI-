@@ -254,13 +254,21 @@ export interface StockTwitsProbeResult {
  * status (unlike {@link fetchStockTwitsStream}, which degrades everything to
  * null). Used by `/api/health/sentiment-probe` to verify from bqb1's Render
  * egress whether the browser-header fingerprint now clears Cloudflare — without
- * waiting for the daily TRA-822 sweep. Deliberately does NOT trip the production
- * breaker on a 429, so a manual probe can't stall the real recorder.
+ * waiting for the daily TRA-822 sweep.
+ *
+ * The probe does not *trip* the breaker on a 429 (so a manual probe can't stall
+ * the real recorder), but it does *honor* an already-open one: those are separate
+ * directions. StockTwits throttles per-IP, so probing through an open breaker
+ * would spend the very cooldown the breaker is serving and can extend the
+ * throttle for the production recorder sharing that egress IP.
  */
 export async function probeStockTwits(symbol = 'AAPL'): Promise<StockTwitsProbeResult> {
   const now = Date.now();
   const breakerOpen = isStockTwitsBreakerOpen(now);
   const sym = symbol.toUpperCase();
+  if (breakerOpen) {
+    return { ok: false, status: null, messageCount: null, breakerOpen, reason: 'rate-limit breaker open' };
+  }
   const url = `https://api.stocktwits.com/api/2/streams/symbol/${encodeURIComponent(sym)}.json`;
   try {
     const resp = await withTimeout(

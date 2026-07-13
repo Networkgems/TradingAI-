@@ -453,6 +453,11 @@ export {
   selectRvLongCandidate,
   RV_LONG_DELTA_TARGET_MIN,
   RV_LONG_DELTA_TARGET_MAX,
+  // TRA-1677 — the RV long's hard far-OTM floor. The signal-engine's entry-greeks
+  // gate needs it to band-check against the SAME floor the selector enforces;
+  // without it the server had no way to name this bound and drifted onto the
+  // short-premium PoP band instead.
+  RV_LONG_DELTA_FLOOR,
   RV_LONG_DTE_ENTRY_MIN,
   RV_LONG_DTE_ENTRY_MAX,
 } from './options/relative-value.js';

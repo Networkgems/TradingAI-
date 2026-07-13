@@ -1,4 +1,4 @@
-import { OrbStrategy, BbFadeStrategy, IchimokuStrategy, SupertrendConfluenceStrategy, confluenceSide, supertrend, supertrendLatest, reversalChecklist, adx, atr, atrPct, donchian, supportResistance, blackScholesDelta, blackScholesGreeks, daysToExpiration, bookGiveBackDecision, correlatedExposureDecision, entryGreeksGateDecision, chandelierStop, stopModifyDecision, selectRvLongCandidate, selectShadowOptionSignal, emaPullbackTrigger, volumeConfirmedBreakout, computePutCallRatio, computeOiTotals, rsi, TradierOptionsClient, TradierOrderClient, TRADIER_REJECTED_STATUSES, TRADIER_TERMINAL_STATUSES, evaluateSma200, SMA200_MIN_BARS, SMA200_DEBOUNCE_BARS, composeTechnicalSnapshot, resampleCandles, TF_BUCKET_MS, OptionsRiskBreaker, DEFAULT_OPTIONS_BREAKER_PARAMS } from '@trading-app/engine';
+import { OrbStrategy, BbFadeStrategy, IchimokuStrategy, SupertrendConfluenceStrategy, confluenceSide, supertrend, supertrendLatest, reversalChecklist, adx, atr, atrPct, donchian, supportResistance, blackScholesDelta, blackScholesGreeks, daysToExpiration, bookGiveBackDecision, correlatedExposureDecision, entryGreeksGateDecision, chandelierStop, stopModifyDecision, selectRvLongCandidate, RV_LONG_DELTA_FLOOR, selectShadowOptionSignal, emaPullbackTrigger, volumeConfirmedBreakout, computePutCallRatio, computeOiTotals, rsi, TradierOptionsClient, TradierOrderClient, TRADIER_REJECTED_STATUSES, TRADIER_TERMINAL_STATUSES, evaluateSma200, SMA200_MIN_BARS, SMA200_DEBOUNCE_BARS, composeTechnicalSnapshot, resampleCandles, TF_BUCKET_MS, OptionsRiskBreaker, DEFAULT_OPTIONS_BREAKER_PARAMS } from '@trading-app/engine';
 import { buildExposureBuckets, DEFAULT_EXIT_PARAMS, DEFAULT_MULTILEG_EXIT_PARAMS } from '@trading-app/engine';
 import type { StrategySelectorInput, ContractQuote, OptionTrend, RvLongTrendSide, ExitState, ExitParams, MultiLegExitParams, SharedTickIndicators, RelativeValueScannerOptions, OptionChainRow, IvRvScannerOptions, IvRvMispricingCandidate, ExposureBucket, ExposurePositionRisk, CorrelatedExposureDecision } from '@trading-app/engine';
 import type { TradierAccountBalance } from '@trading-app/engine';
@@ -4903,10 +4903,30 @@ export class SignalEngine {
             });
             thetaPerDay = greeks.theta / 365;
           }
+          // TRA-1677 — the delta band applied here MUST be the RV long's own.
+          // `ENTRY_SHORT_DELTA_MIN/MAX` ([0.30,0.40]) is a SHORT-strike PoP band:
+          // it admits low delta and excludes high. `selectRvLongCandidate` can only
+          // ever hand us |delta| >= RV_LONG_DELTA_FLOOR (0.45, TRA-972), targeting
+          // 0.55–0.65. The two bands do not intersect, so passing the short band
+          // here rejected 100% of RV longs — not statistically, ALGEBRAICALLY. The
+          // sleeve was a no-op wherever this gate was armed, and read as "no
+          // candidates" rather than "impossible gate".
+          //
+          // The floor is the real intent ("so time decay works for us rather than
+          // bleeding a LOW-delta long" — that sentence describes a floor, and the
+          // 0.30–0.40 band inverts it). Delta discipline for this path lives in the
+          // selector (floor + 0.55–0.65 target); the entry CEILING is TRA-1670's
+          // separate, board-tunable knob (`entryDeltaCeilingRejectReason`, checked
+          // above and deliberately inert on RV). So gate 1 reduces to the selector's
+          // own floor, and the load-bearing check on this path is gate 2 — the
+          // Δ/Θ ratio floor, which is direction-agnostic and is what TRA-1293
+          // actually wanted: delta must outrun decay.
           const gate = entryGreeksGateDecision({
             shortDelta: cheap.delta,
             delta: cheap.delta,
             thetaPerDay,
+            deltaBandMin: RV_LONG_DELTA_FLOOR,
+            deltaBandMax: 1,
           });
           if (!gate.admitted) {
             log.info('RV long rejected by PoP/delta entry gate (TRA-1293)', {

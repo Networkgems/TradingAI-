@@ -6,10 +6,51 @@ import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 // retry/backoff hanging under vi.useFakeTimers(). Tests that need realised vol
 // seed dailyCloseCache via seedCloses(); the dedicated backfill test overrides
 // this mock per-case.
-vi.mock('./yahoo-feed.js', async (importActual) => {
-  const actual = await importActual<typeof import('./yahoo-feed.js')>();
-  return { ...actual, fetchDailyCandles: vi.fn(async () => []), fetchTradierDailyCandles: vi.fn(async () => []) };
-});
+//
+// TRA-1677 — this factory must NOT call `importActual()`. It used to:
+//
+//   vi.mock('./yahoo-feed.js', async (importActual) => {
+//     const actual = await importActual<...>();
+//     return { ...actual, fetchDailyCandles: vi.fn(async () => []), ... };
+//   });
+//
+// …and with that form the mock reached THIS file's own `fetchDailyCandles`
+// binding but NOT `signal-engine.ts`'s: the engine kept the real function and
+// went to the live Yahoo network mid-test. The stub and the code under test were
+// two different functions, so `expect(fetchDailyCandles).toHaveBeenCalled()` read
+// 0 calls while the engine was really fetching 260 bars over the wire. Both
+// TRA-1226/1230 backfill tests below failed for that reason alone — the product
+// code they cover is fine.
+//
+// The tell is that the assertion fails while the behaviour it asserts is actually
+// happening. `market-review.test.ts` mocks this same module with a plain factory
+// and its stub propagates correctly, which is the shape used here.
+//
+// Because a plain factory REPLACES the module, every binding any module in this
+// test's graph imports from yahoo-feed must be listed — a missing name is an
+// undefined import, not a silent pass-through.
+vi.mock('./yahoo-feed.js', () => ({
+  // Network seams the engine drives — inert by default; tests that need data
+  // override per-case with mockResolvedValueOnce.
+  fetchDailyCandles: vi.fn(async () => []),
+  fetchTradierDailyCandles: vi.fn(async () => []),
+  fetchMinuteBars: vi.fn(async () => []),
+  fetchMinuteBarsWithSource: vi.fn(async () => ({ bars: [], source: 'yahoo' as const })),
+  fetchQuote: vi.fn(async () => null),
+  fetchQuotes: vi.fn(async () => []),
+  fetchStocksNews: vi.fn(async () => []),
+  fetchMarketNews: vi.fn(async () => []),
+  fetchShortInterestFundamentals: vi.fn(async () => null),
+  // Pure/stateful helpers other modules in the graph import. Faithful enough to
+  // stand in; nothing in this file exercises them.
+  parseShortInterestFundamentals: vi.fn(() => null),
+  toIsoTime: vi.fn((t: Date | number | string | undefined | null) =>
+    new Date(t ?? 0).toISOString()),
+  isYahooBreakerOpen: vi.fn(() => false),
+  tripYahooBreakerFromExternal: vi.fn(),
+  setActiveInterestSymbols: vi.fn(),
+  setTradierStocksFeedClient: vi.fn(),
+}));
 import { fetchDailyCandles, fetchTradierDailyCandles } from './yahoo-feed.js';
 import { tmpdir } from 'os';
 import { join } from 'path';
@@ -41,6 +82,7 @@ import {
   OPTION_LIVE_DIRECTIONAL_FLAG,
   OPTION_IV_RV_SCANNER_FLAG,
   OPTION_IV_RV_ROUTING_FLAG,
+  OPTION_LIVE_RV_LONG_FLAG,
 } from './option-exec-flag.js';
 import { resetProposalStoreForTests, listProposals, getProposal } from './proposal-store.js';
 import { PaperAccount } from './paper-account.js';
@@ -818,6 +860,15 @@ describe('SignalEngine — legacy options snapshot routing (TRA-237)', () => {
 // consumed. This is the integration substitute for the Tradier sandbox
 // verification on a low-buying-power account.
 describe('SignalEngine — TRA-319 live RV mirror reconciliation', () => {
+  // TRA-1491 shipped a DARK live-capital gate that suppresses the ENTIRE live RV
+  // entry (paper open included) unless ENABLE_OPTION_LIVE_RV_LONG is armed. These
+  // tests exercise the ARMED path's mechanics — mirror reconciliation, sizing,
+  // void-on-reject — not the arming policy, so they arm the flag. The dark default
+  // gets its own coverage below ('live RV entry is suppressed while the dark flag
+  // is off'), which is what actually protects real capital. (TRA-1677)
+  beforeEach(() => { process.env[OPTION_LIVE_RV_LONG_FLAG] = '1'; });
+  afterEach(() => { delete process.env[OPTION_LIVE_RV_LONG_FLAG]; });
+
   type WaitOpts = { timeoutMs?: number; intervalMs?: number; sleep?: (ms: number) => Promise<void> };
   /**
    * TRA-374 — the entry mirror now goes through `submitSmartBuyToOpen`, which
@@ -905,6 +956,64 @@ describe('SignalEngine — TRA-319 live RV mirror reconciliation', () => {
     // Tradier reason_description. The exact prefix is "Tradier order N rejected:".
     expect(state.signals[0].liveSkipReason).toMatch(/rejected/);
     expect(state.signals[0].liveSkipReason).toContain('insufficient buying power');
+  });
+
+  // TRA-1677 — the tests in this block arm ENABLE_OPTION_LIVE_RV_LONG to reach the
+  // mirror mechanics. That arming is exactly what must NOT be true by default, so
+  // pin the dark default here: with the flag off, a live RV scan places NO broker
+  // order and opens NOTHING (not even on the paper book, which would render a
+  // phantom live fill with no broker behind it). This is the guard that keeps real
+  // capital untouched until the board arms the sleeve — without it, the beforeEach
+  // above would silently be the only statement this suite makes about the flag.
+  it('live RV entry is suppressed entirely while the dark flag is off (TRA-1491)', async () => {
+    delete process.env[OPTION_LIVE_RV_LONG_FLAG];
+    const stub: TradierLiveStub = {
+      getAccountBalance: vi.fn().mockResolvedValue({ totalEquity: 100_000, totalCash: 100_000, optionBuyingPower: 100_000 }),
+      getOptionQuote: vi.fn().mockResolvedValue(tightQuote()),
+      buyContractsLimit: vi.fn().mockResolvedValue({ id: 9, status: 'ok' }),
+      cancelOrder: vi.fn().mockResolvedValue(undefined),
+      waitForOrderTerminalStatus: vi.fn(async () => ({ id: 9, status: 'filled' })),
+    };
+    const engine = setupLiveEngine(stub, freshScanner());
+    (engine as unknown as { liveTradierBalance: unknown }).liveTradierBalance = {
+      totalEquity: 100_000, totalCash: 100_000, optionBuyingPower: 100_000,
+    };
+
+    await (engine as unknown as { runRelativeValueScan: (s: string[]) => Promise<void> }).runRelativeValueScan(['AAPL']);
+
+    // No broker order, and no paper position standing in for one.
+    expect(stub.buyContractsLimit).not.toHaveBeenCalled();
+    const state = engine.getState();
+    expect(state.options.openOptions).toHaveLength(0);
+    expect(state.options.dailyOptionsCount).toBe(0);
+  });
+
+  // TRA-1677 — regression on an ALGEBRAICALLY dead gate. The armed live RV path
+  // runs the TRA-1293 entry-greeks gate, which was handed `ENTRY_SHORT_DELTA_*`
+  // ([0.30,0.40] — a SHORT-strike PoP band). `selectRvLongCandidate` can only ever
+  // hand it |delta| >= RV_LONG_DELTA_FLOOR (0.45). Empty intersection ⇒ the gate
+  // rejected 100% of RV longs, so the sleeve was a silent no-op wherever it was
+  // armed and read as "no candidates" rather than "impossible gate". A 0.60-delta
+  // candidate — dead centre of the selector's own 0.55–0.65 target — must open.
+  it('armed live RV long admits the selector-targeted 0.60 delta (delta band is the RV long own, not the short-premium band)', async () => {
+    const stub: TradierLiveStub = {
+      getAccountBalance: vi.fn().mockResolvedValue({ totalEquity: 100_000, totalCash: 100_000, optionBuyingPower: 100_000 }),
+      getOptionQuote: vi.fn().mockResolvedValue(tightQuote()),
+      buyContractsLimit: vi.fn().mockResolvedValue({ id: 11, status: 'ok' }),
+      cancelOrder: vi.fn().mockResolvedValue(undefined),
+      waitForOrderTerminalStatus: vi.fn(async () => ({ id: 11, status: 'filled' })),
+    };
+    // 0.60 delta is the makeCandidate default and sits inside the selector's
+    // 0.55–0.65 target band — the gate must not treat it as out-of-band.
+    const engine = setupLiveEngine(stub, freshScanner());
+    (engine as unknown as { liveTradierBalance: unknown }).liveTradierBalance = {
+      totalEquity: 100_000, totalCash: 100_000, optionBuyingPower: 100_000,
+    };
+
+    await (engine as unknown as { runRelativeValueScan: (s: string[]) => Promise<void> }).runRelativeValueScan(['AAPL']);
+
+    expect(stub.buyContractsLimit).toHaveBeenCalledTimes(1);
+    expect(engine.getState().options.openOptions).toHaveLength(1);
   });
 
   // TRA-483 — when Tradier's day-trade buying power (PDT limit) hits $0 the
@@ -1170,6 +1279,10 @@ describe('SignalEngine — TRA-319 live RV mirror reconciliation', () => {
 //   • when even one contract won't fit, surface a clear `liveSkipReason` on
 //     the dashboard so the user can self-diagnose
 describe('SignalEngine — TRA-332 live sizing uses real Tradier equity', () => {
+  // TRA-1677 — armed-path mechanics; see the TRA-319 block for why.
+  beforeEach(() => { process.env[OPTION_LIVE_RV_LONG_FLAG] = '1'; });
+  afterEach(() => { delete process.env[OPTION_LIVE_RV_LONG_FLAG]; });
+
   type WaitOpts = { timeoutMs?: number; intervalMs?: number; sleep?: (ms: number) => Promise<void> };
   /**
    * TRA-374 — see the TRA-319 describe block above for the same stub-surface
@@ -3746,6 +3859,11 @@ describe('SignalEngine — TRA-416 partial-fill close reconciliation', () => {
 // both run on a live tick without either silently nulling the other. The board's
 // $550 DCA flow needs both legs operational against one Tradier production account.
 describe('SignalEngine — TRA-495 live stocks + options coexistence', () => {
+  // TRA-1677 — the options leg of this coexistence check is the live RV long, so
+  // it needs TRA-1491's dark flag armed; see the TRA-319 block.
+  beforeEach(() => { process.env[OPTION_LIVE_RV_LONG_FLAG] = '1'; });
+  afterEach(() => { delete process.env[OPTION_LIVE_RV_LONG_FLAG]; });
+
   type WaitOpts = { timeoutMs?: number; intervalMs?: number; sleep?: (ms: number) => Promise<void> };
 
   interface OptionsTradierStub {
