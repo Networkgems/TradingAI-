@@ -5,6 +5,8 @@ import { tmpdir } from 'os';
 import { join } from 'path';
 import {
   recordCostAwareGateDecision,
+  recordEntryDeltaCeilingReject,
+  recordEntryDeltaCeilingObserved,
   hydrateCostAwareGateFromDisk,
   summarizeCostAwareGate,
   clearCostAwareGateLedger,
@@ -125,5 +127,68 @@ describe('cost-aware-gate-ledger', () => {
     clearCostAwareGateLedger(); // no hydrate ⇒ no dataDir configured
     recordCostAwareGateDecision('directional', true, 1.9, 1.25, DAY, 1_001);
     expect(summarizeCostAwareGate(DAY).admittedTotal).toBe(1);
+  });
+
+  // TRA-1703 — an observed breach must survive a reboot AS AN OBSERVED BREACH.
+  //
+  // The hydrate sanitizer used to collapse every non-`delta_ceiling` kind to `cost_bar`,
+  // so a `delta_ceiling_observed` line replayed as a cost-bar ADMIT carrying grossR 0 /
+  // barR 0. That zeroed the observe counter, inflated `admitted`, dragged
+  // `avgAdmittedGrossR` toward zero and clobbered the reported bar to 0.00R — and then
+  // COMPACTION rewrote the file to the sanitized line, destroying the evidence on disk.
+  // The observe window (TRA-1690) reads exactly this counter.
+  it('survives a reboot: an OBSERVED breach rehydrates as observed, not as a cost-bar admit', () => {
+    hydrateCostAwareGateFromDisk(dir, 1_000);
+    recordCostAwareGateDecision('single_leg_rv', true, 1.4, 1.25, DAY, 1_001);
+    recordEntryDeltaCeilingObserved('single_leg_rv', 0.71, DAY, 1_002);
+    recordEntryDeltaCeilingReject('single_leg_otm', 0.68, DAY, 1_003);
+
+    clearCostAwareGateLedger();
+    hydrateCostAwareGateFromDisk(dir, 2_000);
+
+    const rv = summarizeCostAwareGate(DAY).byStructure.find((s) => s.structure === 'single_leg_rv');
+    expect(rv?.deltaCeilingObserved).toBe(1);
+    expect(rv?.avgDeltaCeilingObservedAbsDelta).toBeCloseTo(0.71, 4);
+    expect(rv?.deltaCeilingRejected).toBe(0);
+    // The breach traded, but it is NOT a cost-bar verdict — the bar never ruled on it.
+    expect(rv?.admitted).toBe(1); // the one real cost-bar admit, not two
+    expect(rv?.avgAdmittedGrossR).toBeCloseTo(1.4, 4); // not dragged to 0.7 by a phantom grossR-0 admit
+    expect(rv?.barR).toBeCloseTo(1.25, 4); // not clobbered to 0
+
+    const otm = summarizeCostAwareGate(DAY).byStructure.find((s) => s.structure === 'single_leg_otm');
+    expect(otm?.deltaCeilingRejected).toBe(1);
+    expect(otm?.deltaCeilingObserved).toBe(0);
+
+    // And the durable line still says what it was — compaction must not launder the kind.
+    const lines = readFileSync(costAwareGateLogPath(dir), 'utf8').trim().split('\n');
+    const kinds = lines.map((l) => JSON.parse(l).gate);
+    expect(kinds).toContain('delta_ceiling_observed');
+    expect(kinds).toContain('delta_ceiling');
+  });
+
+  // TRA-1703 — the observe window's ABORT tripwire is "deltaCeilingRejected > 0 on
+  // single_leg_rv AT ANY POINT IN THE WINDOW" (TRA-1690 §6). `byStructure` is scoped to
+  // ONE ET day by design, so that tripwire silently self-cleared at ET midnight: a reject
+  // on day 3 read as 0 from day 4 on, and the window would keep accruing while the sleeve
+  // it meant to measure was being cut. The retained rollup is the multi-day view.
+  it('rolls the retained window across ET days so a ceiling reject cannot self-clear at midnight', () => {
+    hydrateCostAwareGateFromDisk(dir, 1_000);
+    recordEntryDeltaCeilingReject('single_leg_rv', 0.7, '2026-07-13', 1_001);
+    recordEntryDeltaCeilingObserved('single_leg_rv', 0.66, '2026-07-13', 1_002);
+    recordEntryDeltaCeilingObserved('single_leg_rv', 0.69, '2026-07-14', 1_003);
+
+    // Read on 07-14: yesterday's reject is invisible to the day view...
+    const today = summarizeCostAwareGate('2026-07-14');
+    expect(today.deltaCeilingRejectedTotal).toBe(0);
+    expect(today.deltaCeilingObservedTotal).toBe(1);
+
+    // ...but the retained rollup still carries it. This is the tripwire.
+    expect(today.retained.etDays).toEqual(['2026-07-13', '2026-07-14']);
+    expect(today.retained.deltaCeilingRejectedTotal).toBe(1);
+    expect(today.retained.deltaCeilingObservedTotal).toBe(2);
+    const rv = today.retained.byStructure.find((s) => s.structure === 'single_leg_rv');
+    expect(rv?.deltaCeilingRejected).toBe(1);
+    expect(rv?.deltaCeilingObserved).toBe(2);
+    expect(today.retained.retentionDays).toBe(7);
   });
 });

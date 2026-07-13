@@ -313,6 +313,17 @@ export function hydrateCostAwareGateFromDisk(dir: string, now: number = Date.now
     if (typeof rec.etDay !== 'string' || rec.etDay === '') continue;
     if (typeof rec.structure !== 'string' || rec.structure === '') continue;
     if (typeof rec.admit !== 'boolean') continue;
+    // TRA-1703 — preserve the KIND. This used to collapse everything that was not
+    // `delta_ceiling` to `cost_bar`, which silently laundered every TRA-1689
+    // `delta_ceiling_observed` line into a cost-bar ADMIT carrying grossR 0 / barR 0:
+    // the observe counter reset to zero on every reboot, `admitted` gained a phantom,
+    // `avgAdmittedGrossR` was dragged toward 0 and the reported bar was clobbered to
+    // 0.00R. Worse, the compaction below rewrites the file to these sanitized lines, so
+    // the first boot after a breach DESTROYED the evidence on disk. An unlisted kind
+    // must fall back to `cost_bar` (that is how pre-TRA-1670 lines, which carry no
+    // `gate` at all, still hydrate) — but a kind we DO know must survive verbatim.
+    const gate: CostGateKind =
+      rec.gate === 'delta_ceiling' || rec.gate === 'delta_ceiling_observed' ? rec.gate : 'cost_bar';
     const clean: CostGateDecisionRecord = {
       ts: rec.ts,
       etDay: rec.etDay,
@@ -321,8 +332,8 @@ export function hydrateCostAwareGateFromDisk(dir: string, now: number = Date.now
       grossR: Number.isFinite(rec.grossR) ? rec.grossR : 0,
       barR: Number.isFinite(rec.barR) ? rec.barR : 0,
       // Pre-TRA-1670 lines carry no `gate` — they are cost-bar verdicts by construction.
-      gate: rec.gate === 'delta_ceiling' ? 'delta_ceiling' : 'cost_bar',
-      ...(rec.gate === 'delta_ceiling'
+      gate,
+      ...(gate !== 'cost_bar'
         ? { absDelta: Number.isFinite(rec.absDelta) ? (rec.absDelta as number) : 0 }
         : {}),
     };
@@ -380,6 +391,37 @@ export interface CostAwareGateStructureSummary {
   avgDeltaCeilingObservedAbsDelta: number | null;
 }
 
+/**
+ * TRA-1703 — the SAME fold, rolled across every retained ET day instead of one.
+ *
+ * The day view above is the right instrument for the cost bar: an admit rate is a
+ * property of a session. It is the WRONG instrument for a ceiling tripwire. TRA-1690's
+ * abort condition is "`deltaCeilingRejected > 0` on `single_leg_rv` AT ANY POINT IN THE
+ * WINDOW" — and an observe window long enough to reach n≥40 spans weeks. Read off the
+ * day view, a reject on day 3 reads 0 from day 4 onward: the tripwire that exists to
+ * catch "observe mode is not live and I am CUTTING the sleeve I meant to measure"
+ * silently re-arms itself at every ET midnight, which is the same false-GREEN shape as
+ * every other counter in this family (it reads identically in the pass and fail states).
+ *
+ * Horizon is `retentionDays` (7) — bounded by RETAIN_MS, not infinite. Stated in the
+ * payload so a reader cannot mistake it for "ever": a gap longer than this between reads
+ * voids the guarantee, and the honest place to say so is the field itself.
+ */
+export interface CostAwareGateRetainedSummary {
+  /** Every ET day still in the ledger, ascending. */
+  etDays: string[];
+  /** How many days back the ledger retains. A read gap wider than this can miss a reject. */
+  retentionDays: number;
+  /** Per-structure fold across ALL retained days, busiest first. */
+  byStructure: CostAwareGateStructureSummary[];
+  admittedTotal: number;
+  rejectedTotal: number;
+  /** The tripwire: > 0 means an ENFORCING ceiling cut this structure somewhere in the window. */
+  deltaCeilingRejectedTotal: number;
+  /** The measurement: > 0 with `deltaCeilingRejectedTotal === 0` is a tail being observed, not cut. */
+  deltaCeilingObservedTotal: number;
+}
+
 export interface CostAwareGateSummary {
   /** Total decisions recorded (live + hydrated, across retained days). */
   decisionsRecorded: number;
@@ -392,6 +434,12 @@ export interface CostAwareGateSummary {
   deltaCeilingRejectedTotal: number;
   /** TRA-1689 — observe-only ceiling breaches (COUNTED, then ADMITTED) across all structures. */
   deltaCeilingObservedTotal: number;
+  /**
+   * TRA-1703 — the multi-day roll. Every count above is scoped to ONE ET day; a ceiling
+   * tripwire read off a one-day counter self-clears at midnight. Read THIS for the
+   * ceiling, the day view for the cost bar.
+   */
+  retained: CostAwareGateRetainedSummary;
   /** ms epoch of the last recorded decision (null if none yet). */
   lastDecisionAt: number | null;
 }
@@ -401,57 +449,112 @@ function round(n: number, dp = 4): number {
   return Math.round(n * f) / f;
 }
 
-/**
- * Fold the store into the read-only health diagnostics for `etDay` (the current ET
- * day at the caller). Pure — no IO. An all-zero read on an ARMED gate means the gate
- * saw no candidates (no scan fired), NOT that it is inert; `rejected > 0` is the
- * direct evidence the bar is biting.
- */
-export function summarizeCostAwareGate(etDay: string): CostAwareGateSummary {
-  const day = byDay.get(etDay);
+/** Merge one day's tally for a structure into an accumulator (so N days fold like one). */
+function mergeTally(into: StructureTally, t: StructureTally): void {
+  into.admitted += t.admitted;
+  into.rejected += t.rejected;
+  into.admittedGrossRSum += t.admittedGrossRSum;
+  into.rejectedGrossRSum += t.rejectedGrossRSum;
+  into.deltaCeilingRejected += t.deltaCeilingRejected;
+  into.deltaCeilingAbsDeltaSum += t.deltaCeilingAbsDeltaSum;
+  into.deltaCeilingObserved += t.deltaCeilingObserved;
+  into.deltaCeilingObservedAbsDeltaSum += t.deltaCeilingObservedAbsDeltaSum;
+  // `lastBarR` is a LAST, not a sum — a ceiling record carries barR 0 and must not
+  // overwrite a real bar. Keep the most recent non-zero one we have seen.
+  if (t.lastBarR !== 0) into.lastBarR = t.lastBarR;
+}
+
+/** Fold a structure->tally map into the per-structure health rows, busiest first. */
+function foldStructures(acc: Map<string, StructureTally>): {
+  byStructure: CostAwareGateStructureSummary[];
+  admittedTotal: number;
+  rejectedTotal: number;
+  deltaCeilingRejectedTotal: number;
+  deltaCeilingObservedTotal: number;
+} {
   const byStructure: CostAwareGateStructureSummary[] = [];
   let admittedTotal = 0;
   let rejectedTotal = 0;
   let deltaCeilingRejectedTotal = 0;
   let deltaCeilingObservedTotal = 0;
-  if (day) {
+  for (const [structure, t] of acc.entries()) {
+    const decisions = t.admitted + t.rejected;
+    admittedTotal += t.admitted;
+    rejectedTotal += t.rejected;
+    deltaCeilingRejectedTotal += t.deltaCeilingRejected;
+    deltaCeilingObservedTotal += t.deltaCeilingObserved;
+    byStructure.push({
+      structure,
+      admitted: t.admitted,
+      rejected: t.rejected,
+      admitRate: decisions > 0 ? round(t.admitted / decisions) : 0,
+      avgAdmittedGrossR: t.admitted > 0 ? round(t.admittedGrossRSum / t.admitted) : null,
+      avgRejectedGrossR: t.rejected > 0 ? round(t.rejectedGrossRSum / t.rejected) : null,
+      barR: round(t.lastBarR),
+      deltaCeilingRejected: t.deltaCeilingRejected,
+      avgDeltaCeilingAbsDelta:
+        t.deltaCeilingRejected > 0 ? round(t.deltaCeilingAbsDeltaSum / t.deltaCeilingRejected) : null,
+      deltaCeilingObserved: t.deltaCeilingObserved,
+      avgDeltaCeilingObservedAbsDelta:
+        t.deltaCeilingObserved > 0
+          ? round(t.deltaCeilingObservedAbsDeltaSum / t.deltaCeilingObserved)
+          : null,
+    });
+  }
+  byStructure.sort(
+    (a, b) =>
+      b.admitted + b.rejected + b.deltaCeilingRejected + b.deltaCeilingObserved
+      - (a.admitted + a.rejected + a.deltaCeilingRejected + a.deltaCeilingObserved),
+  );
+  return { byStructure, admittedTotal, rejectedTotal, deltaCeilingRejectedTotal, deltaCeilingObservedTotal };
+}
+
+/** TRA-1703 — fold EVERY retained ET day. See {@link CostAwareGateRetainedSummary}. */
+function summarizeRetained(): CostAwareGateRetainedSummary {
+  const acc = new Map<string, StructureTally>();
+  for (const day of byDay.values()) {
     for (const [structure, t] of day.entries()) {
-      const decisions = t.admitted + t.rejected;
-      admittedTotal += t.admitted;
-      rejectedTotal += t.rejected;
-      deltaCeilingRejectedTotal += t.deltaCeilingRejected;
-      deltaCeilingObservedTotal += t.deltaCeilingObserved;
-      byStructure.push({
-        structure,
-        admitted: t.admitted,
-        rejected: t.rejected,
-        admitRate: decisions > 0 ? round(t.admitted / decisions) : 0,
-        avgAdmittedGrossR: t.admitted > 0 ? round(t.admittedGrossRSum / t.admitted) : null,
-        avgRejectedGrossR: t.rejected > 0 ? round(t.rejectedGrossRSum / t.rejected) : null,
-        barR: round(t.lastBarR),
-        deltaCeilingRejected: t.deltaCeilingRejected,
-        avgDeltaCeilingAbsDelta:
-          t.deltaCeilingRejected > 0 ? round(t.deltaCeilingAbsDeltaSum / t.deltaCeilingRejected) : null,
-        deltaCeilingObserved: t.deltaCeilingObserved,
-        avgDeltaCeilingObservedAbsDelta:
-          t.deltaCeilingObserved > 0
-            ? round(t.deltaCeilingObservedAbsDeltaSum / t.deltaCeilingObserved)
-            : null,
-      });
+      let into = acc.get(structure);
+      if (!into) {
+        into = {
+          admitted: 0,
+          rejected: 0,
+          admittedGrossRSum: 0,
+          rejectedGrossRSum: 0,
+          lastBarR: 0,
+          deltaCeilingRejected: 0,
+          deltaCeilingAbsDeltaSum: 0,
+          deltaCeilingObserved: 0,
+          deltaCeilingObservedAbsDeltaSum: 0,
+        };
+        acc.set(structure, into);
+      }
+      mergeTally(into, t);
     }
-    byStructure.sort(
-      (a, b) =>
-        b.admitted + b.rejected + b.deltaCeilingRejected + b.deltaCeilingObserved
-        - (a.admitted + a.rejected + a.deltaCeilingRejected + a.deltaCeilingObserved),
-    );
   }
   return {
+    etDays: [...byDay.keys()].sort(),
+    retentionDays: RETAIN_MS / (24 * 60 * 60 * 1000),
+    ...foldStructures(acc),
+  };
+}
+
+/**
+ * Fold the store into the read-only health diagnostics for `etDay` (the current ET
+ * day at the caller). Pure — no IO. An all-zero read on an ARMED gate means the gate
+ * saw no candidates (no scan fired), NOT that it is inert; `rejected > 0` is the
+ * direct evidence the bar is biting.
+ *
+ * Every count here is scoped to ONE ET day. For anything that must hold ACROSS a
+ * window — above all the entry-delta ceiling tripwire — read `retained` instead
+ * (TRA-1703): a one-day counter re-arms itself at midnight.
+ */
+export function summarizeCostAwareGate(etDay: string): CostAwareGateSummary {
+  const day = byDay.get(etDay);
+  return {
     decisionsRecorded: decisionsTotal,
-    byStructure,
-    admittedTotal,
-    rejectedTotal,
-    deltaCeilingRejectedTotal,
-    deltaCeilingObservedTotal,
+    ...foldStructures(day ?? new Map()),
+    retained: summarizeRetained(),
     lastDecisionAt,
   };
 }
