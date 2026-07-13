@@ -11,16 +11,20 @@ import {
   PCR_STUDY_TRIALS,
   POWER_CONSTRAINT,
   SELECTION_ONLY_CONSTRAINT,
+  XS_HW30_FEASIBILITY_R,
   XS_MIN_FAIL_SESSIONS,
   XS_MIN_SESSIONS,
+  XS_MIN_USED_SESSIONS_AT_30,
   blockBootstrapSeries,
   crossSectionalContrasts,
   crossSectionalPlaceboCaller,
   crossSectionalSeries,
+  evaluateXsCell,
   pcrSideCaller,
   runPcrCrossSectional,
   sessionLevelPlaceboCaller,
   xsCondemnRuling,
+  xsFeasibilityRuling,
 } from './pcr-cross-sectional.js';
 import { synth } from './pcr-synth.fixture.js';
 
@@ -748,4 +752,167 @@ describe('the multiplicity is PAID, not laundered', () => {
     expect(rep.cells).toHaveLength(12);
     expect(new Set(rep.cells.map((c) => c.horizon))).toEqual(new Set([3, 5, 10]));
   }, 60000);
+});
+
+// ===========================================================================
+// TRA-1800 — SPEC v3.1(C): the SECONDARY's N=30 FEASIBILITY KILL-GATE
+// ===========================================================================
+//
+// The gate is a PURE FUNCTION of (half-width, used sessions, calendar sessions), so it is
+// tested on CONSTRUCTED cells wherever the point is the RULE, and on the GENERATOR wherever
+// the point is what the rule will actually DO on data.
+//
+// Both matter, and for different reasons. A gate proven only on the generator is a gate
+// whose reachability you cannot see (the generator may simply never produce the input that
+// fires a branch). A gate proven only on constructed cells is a gate you have never watched
+// meet its subject. TRA-1726/TRA-1727 cost this study three separate non-discriminating
+// controls; every branch below is pinned to an EXACT state, never to `not.toBe(...)`.
+
+const xsCell = (hw: number, used: number) => ({
+  clustered: { lo: 0.1 - hw, hi: 0.1 + hw, point: 0.1, effective: 1000 },
+  sessions: used,
+});
+
+describe('TRA-1800 — the N=30 feasibility gate: ALL THREE STATES ARE REACHABLE', () => {
+  // TRA-1726's rule, applied to this gate. A gate that can only ever emit RETIRE certifies
+  // nothing — it is a foregone conclusion wearing a threshold. A gate that can only ever
+  // emit FEASIBLE is not a gate at all. Pin all three, on exact states.
+
+  it('FEASIBLE is REACHABLE — a tight interval on a broad cross-section passes', () => {
+    const r = xsFeasibilityRuling(xsCell(0.05, 20), 30);
+    expect(r.state).toBe('FEASIBLE');
+    expect(r.leg).toBe('pass');
+    // and it projects a terminal half-width that actually resolves the bar
+    expect(r.projectedHw90).toBeLessThanOrEqual(PCR_UPLIFT_BAR_R);
+  });
+
+  it('RETIRE (resolution) is REACHABLE — a wide interval fails, and ONLY on that leg', () => {
+    const r = xsFeasibilityRuling(xsCell(0.2, 20), 30);
+    expect(r.state).toBe('RETIRE');
+    expect(r.leg).toBe('resolution');
+    expect(r.projectedHw90).toBeGreaterThan(PCR_UPLIFT_BAR_R);
+  });
+
+  it('RETIRE (breadth) is REACHABLE — and it fires even on a PERFECT half-width', () => {
+    // *** THE LEG THE PRIMARY HAS NO ANALOGUE FOR. ***
+    // A half-width of 0.001R is a flawless resolution read. It does not matter: with 8 used
+    // sessions the terminal read projects to ~24, short of the 30 that BOTH verdict branches
+    // require, so N=90 could return NOTHING BUT HELD however good the data were. A gate that
+    // looked only at the half-width would wave this straight through into 60 more sessions
+    // of accrual for a number that can never be read.
+    const r = xsFeasibilityRuling(xsCell(0.001, 8), 30);
+    expect(r.state).toBe('RETIRE');
+    expect(r.leg).toBe('breadth');
+    expect(r.hw).toBeLessThan(XS_HW30_FEASIBILITY_R); // the resolution leg would have PASSED it
+  });
+
+  it('GATE_NOT_REACHED below 30 CALENDAR sessions — and it is NOT a pass', () => {
+    const r = xsFeasibilityRuling(xsCell(0.05, 20), 29);
+    expect(r.state).toBe('GATE_NOT_REACHED');
+    expect(r.leg).toBe(null);
+    expect(r.reason).toContain('NOT A PASS');
+  });
+
+  it('the threshold BINDS exactly at 0.073R — the boundary is not a rounding accident', () => {
+    expect(XS_HW30_FEASIBILITY_R).toBe(0.073);
+    expect(xsFeasibilityRuling(xsCell(0.073, 20), 30).state).toBe('FEASIBLE');
+    expect(xsFeasibilityRuling(xsCell(0.0731, 20), 30).state).toBe('RETIRE');
+  });
+
+  it('the breadth floor BINDS exactly at 12 USED sessions', () => {
+    expect(XS_MIN_USED_SESSIONS_AT_30).toBe(12);
+    expect(xsFeasibilityRuling(xsCell(0.05, 12), 30).state).toBe('FEASIBLE');
+    expect(xsFeasibilityRuling(xsCell(0.05, 11), 30).state).toBe('RETIRE');
+  });
+});
+
+describe('TRA-1800 — NON-EVALUABLE ⇒ RETIRE, and it INVERTS the condemn rule ON PURPOSE', () => {
+  it('a NaN interval RETIREs the study — a broken ledger must not buy an extension', () => {
+    const nan = { clustered: { lo: NaN, hi: NaN, point: NaN, effective: 0 }, sessions: 4 };
+    const r = xsFeasibilityRuling(nan, 30);
+    expect(r.state).toBe('RETIRE');
+    expect(r.leg).toBe('non-evaluable');
+  });
+
+  it('THE SAME NaN CELL: the CONDEMN rule ABSTAINS while the FEASIBILITY rule RETIREs', () => {
+    // *** THE DISCRIMINATING TEST OF THIS WHOLE ISSUE. ***
+    //
+    // These two rules look at the identical input and give OPPOSITE answers, and that is
+    // correct, because they are asking different questions:
+    //
+    //   xsCondemnRuling   — "is the OVERLAY bad?"  A NaN cannot say so. IGNORANCE IS NOT
+    //                       CONDEMNATION => abstain (HELD). Fail-closed AGAINST condemning.
+    //   xsFeasibilityRuling — "can the STUDY answer?" A NaN has ALREADY demonstrated it
+    //                       cannot => RETIRE. Fail-closed AGAINST accruing.
+    //
+    // Whoever next edits either rule will be tempted to "make them consistent". They are
+    // consistent — both fail CLOSED — and closed points in opposite directions here. Making
+    // them agree would turn one of them fail-OPEN, and the fail-open one would be the gate
+    // that lets an unreadable study spend four more months. Pinned so that edit breaks a test.
+    const nan = { clustered: { lo: NaN, hi: NaN, point: NaN, effective: 0 }, sessions: 4 };
+    expect(xsCondemnRuling(nan).decisive).toBe(false); // abstains
+    expect(xsFeasibilityRuling(nan, 30).state).toBe('RETIRE'); // retires
+  });
+});
+
+describe('TRA-1800 — what the gate DOES on the generator (and it is a kill)', () => {
+  // The honest, load-bearing prediction of Spec v3.1: WE EXPECT THIS GATE TO KILL THE STUDY
+  // AT N=30. On our best prior the secondary's hw(30) is ~0.30R against a 0.073R threshold —
+  // 4x above it. If this ever starts returning FEASIBLE on the synth, either the generator
+  // or the threshold has moved and the ruling must be re-opened BEFORE the flip.
+
+  it('at calendar N=30 the half-width is ~0.30R — 4x ABOVE the 0.073R gate, in EVERY world', () => {
+    for (const [label, edge, xs] of [
+      ['zero', 'none', 0],
+      ['market-factor edge', 'real', 0],
+      ['xs edge 1.5 (the positive control)', 'none', 1.5],
+    ] as const) {
+      const hws: number[] = [];
+      for (let s = 1; s <= 6; s++) {
+        const { ledger, bars } = synth({
+          sessions: 30, seed: 1000 + s, edge, gamma: 1.2, crossSectionalEdge: xs,
+        });
+        const { rows } = joinForwardReturns(ledger, bars, 5);
+        const cell = evaluateXsCell(rows, 5, 'raw', 'contrarian', { iters: 400, seed: 11 });
+        hws.push((cell.clustered.hi - cell.clustered.lo) / 2);
+        // and the GATE ITSELF says RETIRE — on every seed, in every world
+        expect(xsFeasibilityRuling(cell, 30).state).toBe(`RETIRE`);
+      }
+      const m = mean(hws);
+      expect(m, `${label}: hw(30)`).toBeGreaterThan(3 * XS_HW30_FEASIBILITY_R);
+      expect(m, `${label}: hw(30)`).toBeLessThan(0.45);
+    }
+  }, 120000);
+
+  it('the half-width is NOT state-dependent here — the primary\'s 3x inflation does NOT transfer', () => {
+    // TRA-1741 corrected the PRIMARY's power arithmetic because its half-width inflates
+    // 2.5-3x in the world where a promotion decision gets made (the edge enters through the
+    // MARKET FACTOR, so edge and noise scale together). The obvious move is to inherit that
+    // inflation factor here by analogy. IT WOULD BE WRONG: this estimand differences the
+    // market factor out exactly, so a per-NAME edge does not widen the contrast's variance.
+    //
+    // Measured: FLAT (if anything slightly narrower under a real cross-sectional edge). So
+    // for the SECONDARY — and only the secondary — the null-world half-width is a sound
+    // estimate of the act-world one. This is why the threshold needed no inflation term.
+    const hwOf = (xs: number) => {
+      const hws: number[] = [];
+      for (let s = 1; s <= 6; s++) {
+        const { ledger, bars } = synth({
+          sessions: 90, seed: 1000 + s, edge: 'none', gamma: 1.2, crossSectionalEdge: xs,
+        });
+        const { rows } = joinForwardReturns(ledger, bars, 5);
+        const cell = evaluateXsCell(rows, 5, 'raw', 'contrarian', { iters: 400, seed: 11 });
+        hws.push((cell.clustered.hi - cell.clustered.lo) / 2);
+      }
+      return mean(hws);
+    };
+    const nullWorld = hwOf(0);      // no cross-sectional edge
+    const actWorld = hwOf(1.5);     // a 32x-bar cross-sectional edge — where we would ACT
+
+    // The primary inflates by 2.5-3.2x across this same comparison. This estimand does not
+    // inflate AT ALL: pin the ratio inside a tight band around 1.
+    const ratio = actWorld / nullWorld;
+    expect(ratio, `act/null half-width ratio`).toBeGreaterThan(0.75);
+    expect(ratio, `act/null half-width ratio`).toBeLessThan(1.25);
+  }, 120000);
 });

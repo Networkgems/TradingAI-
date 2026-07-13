@@ -182,6 +182,134 @@ export const XS_MIN_FAIL_SESSIONS = 30;
  */
 export { PCR_STUDY_TRIALS };
 
+// ===========================================================================
+// SPEC v3.1(C) — THE SECONDARY'S N=30 FEASIBILITY KILL-GATE            TRA-1800
+// ===========================================================================
+//
+// Spec v3.1 (ruled on TRA-1741) puts a KILL GATE at calendar N=30: on the REAL ledger, if
+// the estimand cannot resolve its own bar, TRA-1609 is RETIRED and we do NOT accrue to 90.
+// The ruling gave the PRIMARY a number (`hw(30) <= 0.09R`) and left the SECONDARY without
+// one. A joint gate with a threshold on only one arm can kill only half the study, and a
+// HELD on the un-thresholded arm silently buys the extension the whole ruling exists to
+// forbid. This is that missing number, derived the same way.
+//
+// --- THE DERIVATION (the primary's number, recovered, then re-run for this estimand) ---
+//
+// "Feasible" means: THE TERMINAL READ AT N=90 CAN RESOLVE THE BAR. That is `hw(90) <= bar`
+// — at which point the decisive-FAIL branch becomes reachable AND the MDE comes down near
+// the bar. One criterion rescues both branches. Back-propagate it to the gate at N=30:
+//
+//     hw(N) = c * N^-p          =>   hw(30) = hw(90) * (90/30)^p = bar * 3^p
+//     THRESHOLD  T = bar * 3^p                                      <-- the general form
+//
+// The primary's ruled 0.09R is exactly this with p = 0.5:  0.05 * 3^0.5 = 0.0866 ~ 0.09R.
+//
+// *** SO THE ONLY ESTIMAND-SPECIFIC INPUT IS p, THE DECAY EXPONENT. AND p IS NOT 0.5. ***
+//
+// p = 0.5 is the textbook 1/sqrt(N) rate. It assumes i.i.d. observations. These are not:
+// the bootstrap is a MOVING-BLOCK resample over serially-dependent session contrasts (an
+// H-session forward return at session i shares H-1 of its days with the one at i+1), and
+// the used-session count grows sub-linearly in calendar sessions. Measured, this estimand's
+// half-width decays like N^-0.35, NOT N^-0.5 — it takes MORE data than the textbook rate to
+// buy the same resolution, so THE SAME hw AT N=30 IS WORSE NEWS THAN p=0.5 IMPLIES, and a
+// threshold built on p=0.5 IS TOO LOOSE.
+//
+//   fitted p, secondary, calendar N = 30..150, primary cell (H=5, raw, contrarian):
+//     zero edge ................ 0.386      market-factor edge, xs=0 . 0.349
+//     xs edge 0.3 .............. 0.356      xs edge 0.75 ............. 0.362
+//     xs edge 1.5 (pos ctl) .... 0.402
+//
+//   INDEPENDENT CONTROL — fitting `POWER_CONSTRAINT`'s OWN table above (TRA-1756 R2,
+//   measured at 200 worlds/cell, different seeds, different author): p = 0.354. It is not
+//   an artifact of one run's seeds. T depends ONLY on the RATIO hw(30)/hw(90), i.e. only
+//   on p, so the ~12% level disagreement between the two runs does not move the threshold.
+//
+//     T(p=0.500, the assumption) = 0.0866R      <- what the primary was given
+//     T(p=0.386, null world)     = 0.0764R
+//     T(p=0.349, fail-closed)    = 0.0733R      <- THE NUMBER, rounded DOWN to 0.073R
+//
+// FAIL-CLOSED means taking the SMALLEST p across the worlds we might be in: a slower decay
+// projects a LARGER hw(90), which is the harder thing to call feasible. Rounding is DOWN.
+//
+// --- WHY THIS ESTIMAND IS NOT STATE-DEPENDENT, AND THE PRIMARY IS ---
+//
+// TRA-1741's headline correction was that the PRIMARY's half-width is STATE-DEPENDENT: it
+// inflates 2.5-3x in the world where a promotion decision actually gets made (0.20R at a
+// zero edge -> 0.63R at a real one), because that edge is injected through the MARKET
+// FACTOR and the edge and the noise scale together. A power number read off the null world
+// is therefore not the power of the decision.
+//
+// *** THAT TRAP DOES NOT TRANSFER TO THIS ESTIMAND, AND THE REASON IS STRUCTURAL. ***
+//
+// Measured here: hw(30) is 0.326R at a zero edge and 0.296R at a 32x-bar cross-sectional
+// edge — FLAT, if anything slightly NARROWER. This estimand is a contrast between names
+// WITHIN one session, so the market factor differences out exactly (see THE DEMEANING IS A
+// NO-OP). A per-NAME edge does not inflate the contrast's variance the way a market-factor
+// edge inflates the primary's. So for the SECONDARY — and ONLY the secondary — the
+// null-world half-width IS a sound estimate of the act-world half-width.
+//
+// This is worth stating because the obvious move is to inherit the primary's 3x inflation
+// factor by analogy. It would be wrong, and it would be wrong in the CONSERVATIVE direction
+// here, which is how a wrong number survives review.
+
+/** The calendar session count at which Spec v3.1(A)'s feasibility gate is read. */
+export const XS_FEASIBILITY_GATE_N = 30;
+
+/**
+ * SPEC v3.1(C). The SECONDARY's N=30 feasibility kill-threshold, in R. TRA-1800.
+ *
+ * `hw_xs(30) <= 0.073R` => FEASIBLE, accrue on to the terminal read.
+ * `hw_xs(30) >  0.073R` => RETIRE. Non-evaluable => RETIRE. Fail-closed, both ways.
+ *
+ * = bar * 3^p with p = 0.349 (the fail-closed decay exponent), rounded DOWN. See above.
+ *
+ * TIGHTER than the primary's ruled 0.09R, and that is not a typo: this estimand's
+ * half-width decays MORE SLOWLY than the 1/sqrt(N) the primary's number assumed, so the
+ * same hw at N=30 buys LESS resolution at N=90. (The primary's own act-world p measures
+ * 0.335, which would put ITS threshold at 0.072R too — reported to the CTO on TRA-1741;
+ * changing a ruled number is not this file's call.)
+ *
+ * ON OUR BEST PRIOR (the synthetic) hw_xs(30) ~ 0.30R — 4x ABOVE THIS GATE. We therefore
+ * EXPECT this gate to kill the secondary at N=30, exactly as we expect the primary's to
+ * kill the primary. That is the POINT of Spec v3.1: spend six weeks and a flag, not four
+ * and a half months, and take the kill on REAL data rather than on a generator.
+ */
+export const XS_HW30_FEASIBILITY_R = 0.073;
+
+/**
+ * SPEC v3.1(C). The USED-session floor at the N=30 gate. TRA-1800.
+ *
+ * *** THE LEG THE PRIMARY HAS NO ANALOGUE FOR, AND THE ONE MOST LIKELY TO FIRE. ***
+ *
+ * The primary's N is calendar sessions. THIS estimand's N is USED sessions — a session
+ * enters only if it carries >= `XS_MIN_NAMES_PER_SESSION` (5) fired-trio names AND the PCR
+ * read splits them into two non-empty cohorts. Everything downstream is denominated in
+ * USED sessions: `XS_MIN_SESSIONS` (30, promotion), `XS_MIN_FAIL_SESSIONS` (30, condemn),
+ * and the block bootstrap itself (which returns NaN below 2*H = 10).
+ *
+ * So a secondary can have a beautiful half-width at N=30 and STILL be dead on arrival,
+ * because at the TERMINAL read it will not have the 30 used sessions that BOTH its verdict
+ * branches require. A half-width gate cannot see that. This one can.
+ *
+ * Derivation. The terminal read needs `used(90) >= 30`. The projection `used(90) = 3 *
+ * used(30)` is measured TIGHT on the synth (proj 60.7/63.8/63.1/72.7/84.8 vs actual
+ * 61.0/62.6/63.4/73.7/84.9 across five worlds) => `used(30) >= 10`. That is ALSO exactly
+ * the bootstrap's own evaluability floor (2*H = 10), so one number carries both reasons.
+ * Set at 12, not 10, for headroom against yield drift (sd of used(30) ~ 3.5 on the synth):
+ * 12 projects to 36 used sessions at N=90, ~20% clear of the 30 both branches need.
+ *
+ * 🔴 THE SYNTH GIVES NO PRIOR FOR THIS LEG, AND SAYS SO. On the synthetic ledger all 15
+ * names fire every session, so `droppedTooFewNames` is 0 in EVERY world and the 5-name
+ * minimum is NEVER exercised. The measured yield (0.67-0.94) is an artifact of a universe
+ * where the trio always fires broadly. THE REAL LEDGER'S CROSS-SECTIONAL BREADTH IS
+ * UNKNOWN. If the real trio fires on fewer than 5 names on most sessions, `used(30)` is
+ * near ZERO and the secondary is structurally unreadable at ANY N — and this leg is the
+ * only thing standing between us and accruing 90 sessions into an estimand that was never
+ * going to produce a number. Sibling of TRA-1810's uncalibrated R-scale: the generator is
+ * being asked a question about the real world that it has never been checked against.
+ */
+export const XS_MIN_USED_SESSIONS_AT_30 = 12;
+
 /**
  * Stamped verbatim into every secondary report, and printed by the CLI.
  *
@@ -831,6 +959,137 @@ export function xsCondemnRuling(
   }
 
   return { decisive: true, withheld: null };
+}
+
+/**
+ * The N=30 feasibility gate's ruling on the SECONDARY.
+ *
+ * - `GATE_NOT_REACHED` — fewer than `XS_FEASIBILITY_GATE_N` CALENDAR sessions have accrued.
+ *   Keep accruing. This is NOT a pass.
+ * - `FEASIBLE` — the estimand can resolve its own bar by the terminal read. Accrue on.
+ * - `RETIRE` — it cannot, or it cannot be evaluated at all. DECISIVE, and it retires the
+ *   secondary. Do not accrue to 90.
+ */
+export type XsFeasibilityState = 'GATE_NOT_REACHED' | 'FEASIBLE' | 'RETIRE';
+
+export interface XsFeasibilityRuling {
+  state: XsFeasibilityState;
+  /** The measured half-width at the gate, in R. NaN if the interval is not evaluable. */
+  hw: number;
+  /** USED sessions — the estimator's real N. Not calendar sessions. */
+  usedSessions: number;
+  /** hw * 3^-p — what the half-width is projected to be at the N=90 terminal read. */
+  projectedHw90: number;
+  /** Which leg decided it. `null` when the gate was not reached. */
+  leg: 'resolution' | 'breadth' | 'non-evaluable' | 'pass' | null;
+  reason: string;
+}
+
+/**
+ * SPEC v3.1(C) — THE SECONDARY'S N=30 FEASIBILITY KILL-GATE. TRA-1800.
+ *
+ * The single source of truth. The report calls this, and so does every test. NOBODY
+ * RETYPES IT — a grader written from recall is a different grader, and this study has now
+ * produced three separate controls that did not discriminate (TRA-1727) precisely because
+ * a second copy of a rule drifted from the first.
+ *
+ * Three legs, CONJUNCTIVE, all FAIL-CLOSED. Any one of them ⇒ RETIRE:
+ *
+ *   1. NON-EVALUABLE ⇒ RETIRE. A NaN interval, no defined contrast, an empty join. A
+ *      broken or empty ledger must NEVER buy an extension — per the ruling, that is
+ *      precisely how the last four months were lost. Note this INVERTS the sign of
+ *      `xsCondemnRuling`'s "IGNORANCE IS NOT CONDEMNATION": there, a NaN is an abstention
+ *      because a FAIL is a scientific claim ABOUT THE OVERLAY and you cannot make one from
+ *      ignorance. HERE, a NaN is a RETIRE because feasibility is a claim ABOUT THE STUDY,
+ *      and an instrument that cannot produce a number has ALREADY demonstrated it cannot
+ *      answer the question. THE TWO RULES DISAGREE ON PURPOSE. They are asking different
+ *      questions, and reading either as the other is how a fail-closed gate becomes a
+ *      fail-open one.
+ *   2. BREADTH ⇒ `usedSessions >= XS_MIN_USED_SESSIONS_AT_30`, else RETIRE. Projected used
+ *      sessions at N=90 would not clear the 30 that BOTH verdict branches require.
+ *   3. RESOLUTION ⇒ `hw <= XS_HW30_FEASIBILITY_R`, else RETIRE. The projected terminal
+ *      half-width cannot resolve the +0.05R bar.
+ *
+ * `calendarSessions` is passed EXPLICITLY and is not inferrable from the cell — `cell.sessions`
+ * is a count of USED sessions and confusing the two is the exact silent catastrophe
+ * `XS_MIN_FAIL_SESSIONS` documents above. Below the gate this returns `GATE_NOT_REACHED`
+ * rather than a verdict, so an early call cannot be mistaken for a pass.
+ */
+export function xsFeasibilityRuling(
+  cell: Pick<XsCellResult, 'clustered' | 'sessions'>,
+  calendarSessions: number,
+): XsFeasibilityRuling {
+  const { lo, hi } = cell.clustered;
+  const hw = (hi - lo) / 2;
+  const used = cell.sessions;
+  // p = 0.349, the fail-closed decay exponent the threshold is derived from.
+  const projectedHw90 = Number.isFinite(hw) ? hw * Math.pow(3, -0.349) : Number.NaN;
+  const base = { hw, usedSessions: used, projectedHw90 };
+
+  if (calendarSessions < XS_FEASIBILITY_GATE_N) {
+    return {
+      ...base,
+      state: 'GATE_NOT_REACHED',
+      leg: null,
+      reason:
+        `feasibility gate not reached: ${calendarSessions} < ${XS_FEASIBILITY_GATE_N} CALENDAR ` +
+        `sessions. Keep accruing. THIS IS NOT A PASS.`,
+    };
+  }
+
+  if (!Number.isFinite(hw) || !Number.isFinite(lo) || !Number.isFinite(hi)) {
+    return {
+      ...base,
+      state: 'RETIRE',
+      leg: 'non-evaluable',
+      reason:
+        `RETIRE (non-evaluable): at ${calendarSessions} calendar sessions the secondary's ` +
+        `session-clustered interval is not computable (${used} used session(s)). Spec v3.1 is ` +
+        `FAIL-CLOSED: an instrument that cannot produce a number at the gate has already shown ` +
+        `it cannot answer the question by N=90. A broken or empty ledger must never buy an ` +
+        `extension.`,
+    };
+  }
+
+  if (used < XS_MIN_USED_SESSIONS_AT_30) {
+    return {
+      ...base,
+      state: 'RETIRE',
+      leg: 'breadth',
+      reason:
+        `RETIRE (breadth): only ${used} of ${calendarSessions} calendar sessions carry a DEFINED ` +
+        `cross-sectional contrast (< ${XS_MIN_USED_SESSIONS_AT_30}). Projected used sessions at ` +
+        `the N=90 terminal read is ~${(3 * used).toFixed(0)}, short of the ${XS_MIN_SESSIONS} that ` +
+        `BOTH the PASS and the FAIL branch require — so the terminal read could return NOTHING BUT ` +
+        `HELD no matter what the data say. The half-width is irrelevant when the verdict is ` +
+        `structurally unreachable. Accruing to 90 would buy a number that cannot be read.`,
+    };
+  }
+
+  if (hw > XS_HW30_FEASIBILITY_R) {
+    return {
+      ...base,
+      state: 'RETIRE',
+      leg: 'resolution',
+      reason:
+        `RETIRE (resolution): session-clustered 90% CI half-width ${hw.toFixed(4)}R at the N=30 ` +
+        `gate exceeds the ${XS_HW30_FEASIBILITY_R}R feasibility threshold. Projected half-width at ` +
+        `the N=90 terminal read is ${projectedHw90.toFixed(4)}R — against a ${PCR_UPLIFT_BAR_R}R ` +
+        `bar. The instrument cannot resolve its own promotion bar at the terminal read, so the ` +
+        `read cannot answer the question and the remaining 60 sessions of accrual would be a ` +
+        `DELAY, NOT AN EXPERIMENT.`,
+    };
+  }
+
+  return {
+    ...base,
+    state: 'FEASIBLE',
+    leg: 'pass',
+    reason:
+      `FEASIBLE: half-width ${hw.toFixed(4)}R <= ${XS_HW30_FEASIBILITY_R}R on ${used} used ` +
+      `sessions. Projected ${projectedHw90.toFixed(4)}R at the N=90 terminal read, which resolves ` +
+      `the ${PCR_UPLIFT_BAR_R}R bar. Accrue on to the terminal read.`,
+  };
 }
 
 export interface PcrCrossSectionalReport {
