@@ -79,7 +79,9 @@ import {
   listOptionTradeJournal,
   summarizeOptionTradeJournal,
   isOptionTradeJournalEnabled,
+  getOptionTradeJournalIntegrity,
   type OptionTradeJournalSummary,
+  type OptionTradeJournalIntegrity,
 } from '../option-trade-journal.js';
 import {
   computeOptionLearnedWeights,
@@ -757,6 +759,14 @@ export interface OptionJournalReport {
    */
   shrinkageEnabled: boolean;
   summary: OptionTradeJournalSummary;
+  /**
+   * TRA-1681 — what the last journal load DROPPED (unparseable lines skipped,
+   * read errors that forced the empty-book fallback). A grade that passes on
+   * "this counter did not grow" cannot tell a clean load from one that silently
+   * lost the row it was watching for; this is how such a window VOIDs instead of
+   * certifying. `corruptLines: null` = not measured, never `0`.
+   */
+  integrity: OptionTradeJournalIntegrity;
   weights: OptionLearnedWeights;
   /**
    * TRA-1591 — echoes the `sinceTs` cohort filter (epoch ms) when the caller
@@ -838,6 +848,7 @@ export function buildOptionJournalReport(
     enabled,
     shrinkageEnabled: isLearnedShrinkageEnabled(),
     summary: summarizeOptionTradeJournal(summaryRows),
+    integrity: getOptionTradeJournalIntegrity(),
     weights: cached?.weights ?? computeOptionLearnedWeights(rows),
     ...(cached ? { weightsFreshness: cached.freshness } : {}),
     ...(sinceTs === undefined ? {} : { sinceTs }),

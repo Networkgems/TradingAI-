@@ -231,9 +231,43 @@ let storeFileOverride: string | null = null;
 export function setOptionTradeJournalFileForTests(path: string | null): void {
   storeFileOverride = path;
   cache = null;
+  integrity = UNMEASURED_INTEGRITY;
 }
 function storeFile(): string {
   return storeFileOverride ?? defaultStoreFile();
+}
+
+/**
+ * TRA-1681 — what the load DROPPED, as a first-class readable.
+ *
+ * `ensureLoaded` skips a line it cannot parse rather than losing the whole
+ * journal, and falls back to an empty book on a read error. Both were silent:
+ * a journal that dropped rows and one that dropped none read identically.
+ *
+ * That matters beyond hygiene. A crash mid-`appendFile` leaves a torn tail
+ * line, and the next append concatenates onto that fragment — so the torn line
+ * swallows the NEXT record too. Nothing ever decreases, so the file stays
+ * monotone; a row just never arrives. Any grade whose pass condition is "this
+ * counter did not grow" (TRA-1690's negative control) therefore reads a
+ * swallowed row as evidence of no leak. Counting the skips is what lets such a
+ * window VOID instead of certify.
+ *
+ * `corruptLines: null` means NOT MEASURED (no load has run yet) — never `0`,
+ * which is a real measurement of a clean file. See TRA-1707.
+ */
+export interface OptionTradeJournalIntegrity {
+  /** Unparseable lines skipped by the last load; `null` until a load has run. */
+  corruptLines: number | null;
+  /** Message from a failed read that forced the empty-book fallback, else `null`. */
+  readError: string | null;
+}
+
+const UNMEASURED_INTEGRITY: OptionTradeJournalIntegrity = { corruptLines: null, readError: null };
+let integrity: OptionTradeJournalIntegrity = UNMEASURED_INTEGRITY;
+
+/** Load-integrity counters for the journal file. See {@link OptionTradeJournalIntegrity}. */
+export function getOptionTradeJournalIntegrity(): OptionTradeJournalIntegrity {
+  return { ...integrity };
 }
 
 /** In-memory folded view: id -> latest record. */
@@ -276,6 +310,8 @@ async function ensureLoaded(): Promise<Map<string, OptionTradeJournalRecord>> {
   if (cache) return cache;
   const map = new Map<string, OptionTradeJournalRecord>();
   const path = storeFile();
+  let corruptLines = 0;
+  let readError: string | null = null;
   if (existsSync(path)) {
     try {
       const raw = await readFile(path, 'utf-8');
@@ -285,15 +321,20 @@ async function ensureLoaded(): Promise<Map<string, OptionTradeJournalRecord>> {
         try {
           foldLine(map, JSON.parse(trimmed) as JournalLine);
         } catch {
-          // Skip a single corrupt line rather than losing the whole journal.
+          // Skip a single corrupt line rather than losing the whole journal — but
+          // COUNT it, so a dropped row cannot pass for a clean load.
+          corruptLines += 1;
         }
       }
     } catch (err) {
-      log.error('failed to read option trade journal, starting empty', {
-        reason: err instanceof Error ? err.message : String(err),
-      });
+      readError = err instanceof Error ? err.message : String(err);
+      log.error('failed to read option trade journal, starting empty', { reason: readError });
     }
   }
+  if (corruptLines > 0) {
+    log.warn('option trade journal skipped unparseable lines', { corruptLines, path });
+  }
+  integrity = { corruptLines, readError };
   cache = map;
   return cache;
 }
