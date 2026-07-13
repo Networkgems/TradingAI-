@@ -7,6 +7,7 @@ import {
   joinForwardReturns,
   mulberry32,
   naiveRowBootstrap,
+  PCR_UPLIFT_BAR_R,
   pcrSideFor,
   placeboUpliftStat,
   rawUpliftStat,
@@ -363,11 +364,20 @@ describe('zero-edge control (NEGATIVE)', () => {
     expect(correctedFired).toBeLessThan(preRegisteredFired);
   });
 
-  it('returns FAIL or HELD — never PASS — end to end on a zero-edge ledger', () => {
+  it('ABSTAINS (HELD) end to end on a zero-edge ledger — the EXACT verdict, not merely "not PASS"', () => {
     const { ledger, bars } = synth({ sessions: 40, seed: 42, edge: 'none' });
     const report = runPcrExpectancy(ledger, bars, { iters: 500, seed: 11 });
 
-    expect(report.verdict).not.toBe('PASS');
+    // TRA-1726: assert the EXACT verdict. `not.toBe('PASS')` is what hid the type-II
+    // bug — it cannot tell a REJECTION from an ABSTENTION, and both render alike.
+    //
+    // A zero-edge ledger at 40 sessions is HELD, not FAIL: the clustered interval
+    // still STRADDLES the +0.05R bar, so the sample has not refuted the overlay — it
+    // has merely failed to support it. Condemning here would be a decision the
+    // evidence does not license. (See the anti-predictive control below for what a
+    // DECISIVE refutation actually looks like.)
+    expect(report.verdict).toBe('HELD');
+    expect(report.primary!.clustered.hi).toBeGreaterThanOrEqual(PCR_UPLIFT_BAR_R);
 
     // And it still PUBLISHES every pre-registered cell — 2 carriers x 2
     // interpretations x 3 horizons. Hiding the losers is how a cherry-pick hides.
@@ -397,14 +407,167 @@ describe('real-edge control (POSITIVE)', () => {
     expect(report.guards!.pbo!.pass).toBe(true);
   });
 
-  it('needs a REAL sample: the same genuine edge does NOT clear at the ~4-week window', () => {
+  it('needs a REAL sample: the same genuine edge is HELD — NOT condemned — at the ~4-week window', () => {
     // The corrected inference is honest about how much evidence it has. A strong true
     // edge measured over ~20 sessions is not promotable — not because the edge is
     // absent, but because 20 sessions cannot distinguish it from the artifact. This is
     // the sample-size message for TRA-1609's schedule, pinned as a test.
+    //
+    // TRA-1726: the EXACT verdict is HELD, and that is the whole point. This assertion
+    // used to read `not.toBe('PASS')`, under which the harness actually returned FAIL
+    // here and nobody noticed — a real edge, read at the window we had planned, was
+    // CONDEMNED. The assertion could not see the difference.
     const { ledger, bars } = synth({ sessions: 20, seed: 5, edge: 'real', gamma: 2.0 });
     const report = runPcrExpectancy(ledger, bars, { iters: 400, seed: 11 });
-    expect(report.verdict).not.toBe('PASS');
+    expect(report.verdict).toBe('HELD');
+  });
+});
+
+// ---------------------------------------------------------------------------
+// TRA-1726 — THE THREE-VALUED VERDICT.
+//
+// A GATE WITH THREE OUTCOMES NEEDS THREE CONTROLS. With only a PASS control and a
+// refusal control, PASS/FAIL/HELD collapses to PASS/not-PASS — and an unreachable
+// branch is then invisible. That is precisely how the type-II bug shipped: `HELD`
+// was unreachable above the 20-session floor, every non-PASS fell through to `FAIL`,
+// and every control asserted `not.toBe('PASS')` — which a rejection and an
+// abstention satisfy identically.
+//
+// So: one control per outcome, each asserting the EXACT verdict AND the PREDICATE
+// that is supposed to produce it.
+// ---------------------------------------------------------------------------
+
+describe('the decisive-NO-GO rule (TRA-1726)', () => {
+  /** [sessions, expected PASS count over the 8 seeds] */
+  const REAL_THIN: Array<[number, number]> = [[20, 4], [30, 3], [45, 4]];
+
+  it('HELD control — a GENUINE edge on a thin sample ABSTAINS; it is not condemned', () => {
+    // The regression this issue exists for. Under the old branch this matrix was
+    // FAIL 7/8, 6/8, 7/8 — a real overlay retired at the planned read on seven draws
+    // out of eight. FAIL is now the rare exception (the nominal tail of the ratified
+    // 90% CI), not the default for "we could not prove it".
+    for (const [sessions, expectedPass] of REAL_THIN) {
+      const counts: Record<string, number> = { PASS: 0, FAIL: 0, HELD: 0 };
+      for (let t = 0; t < 8; t++) {
+        const { ledger, bars } = synth({ sessions, seed: 5 + t * 101, edge: 'real', gamma: 2.0 });
+        counts[runPcrExpectancy(ledger, bars, { iters: 400, seed: 11 }).verdict]++;
+      }
+      expect(counts.FAIL).toBeLessThanOrEqual(1);     // at most 1 of 8 condemned
+      expect(counts.HELD).toBeGreaterThanOrEqual(3);  // the abstention branch is REACHABLE
+      expect(counts.PASS).toBe(expectedPass);
+    }
+  });
+
+  it('FAIL control — an ANTI-PREDICTIVE overlay is DECISIVELY refused, on a THIN sample', () => {
+    // The control that proves the check CAN FIRE. Without it, converting FAIL->HELD
+    // could have left FAIL unreachable — and a gate that can never condemn is exactly
+    // as broken as one that condemns everything: TRA-1609 would abstain forever.
+    //
+    // A genuinely HARMFUL overlay — the sign-mirror of a real edge, i.e. we read the
+    // CONFIRMING interpretation of a ledger whose true edge is contrarian — puts the
+    // WHOLE interval below the bar. That is positive evidence AGAINST, and it is
+    // decisive at only 30 sessions. This is the early exit the rule buys: we are not
+    // committing to a blind wait for 90 sessions to bin a bad overlay.
+    for (const sessions of [30, 45]) {
+      for (let t = 0; t < 8; t++) {
+        const { ledger, bars } = synth({ sessions, seed: 5 + t * 101, edge: 'real', gamma: 2.0 });
+        const report = runPcrExpectancy(ledger, bars, {
+          iters: 400,
+          seed: 11,
+          primaryInterpretation: 'confirming',
+        });
+        expect(report.verdict).toBe('FAIL');
+        // ASSERT THE PREDICATE, NOT THE LABEL: a FAIL must mean the optimistic end of
+        // the interval genuinely cannot reach the bar.
+        expect(report.primary!.clustered.hi).toBeLessThan(PCR_UPLIFT_BAR_R);
+      }
+    }
+  });
+
+  it('the rule is EXACTLY "CI upper bound < bar" — the label always matches the predicate', () => {
+    // A structural invariant over a mixed sweep. Whatever verdict comes out, it must
+    // be the one the STATED rule produces. This is what stops the three branches from
+    // silently drifting apart from their documented meanings again.
+    for (const edge of ['none', 'real'] as const) {
+      for (const sessions of [6, 20, 45]) {
+        const { ledger, bars } = synth({ sessions, seed: 77, edge, gamma: 2.0 });
+        const report = runPcrExpectancy(ledger, bars, { iters: 300, seed: 11 });
+        const hi = report.primary?.clustered.hi ?? NaN;
+        const decisive = Number.isFinite(hi) && hi < PCR_UPLIFT_BAR_R;
+
+        if (report.verdict === 'FAIL') {
+          expect(decisive).toBe(true);
+        } else if (report.verdict === 'HELD') {
+          // HELD is EITHER a straddling interval OR an inevaluable one — never a
+          // decisive refutation.
+          expect(decisive).toBe(false);
+        }
+      }
+    }
+  });
+
+  it('IGNORANCE IS NOT CONDEMNATION — an inevaluable CI is HELD, never FAIL', () => {
+    // 6 sessions: the block bootstrap cannot form two whole blocks, so the interval is
+    // NaN. A NaN upper bound must NOT satisfy `hi < bar` and drop into FAIL — that
+    // would condemn an overlay on the strength of having NO information about it.
+    const { ledger, bars } = synth({ sessions: 6, seed: 3, edge: 'real', gamma: 2.5 });
+    const report = runPcrExpectancy(ledger, bars, { iters: 300, seed: 11 });
+
+    expect(Number.isFinite(report.primary!.clustered.hi)).toBe(false);
+    expect(report.verdict).toBe('HELD');
+    expect(report.reasons.join(' ')).toMatch(/not evaluable/i);
+  });
+
+  it('MONOTONE TOWARD ABSTENTION — the rule never manufactures a PASS on zero edge', () => {
+    // The safety property that lets this land WITHOUT re-opening the pre-registration:
+    // the change can only ever convert FAIL -> HELD. PASS is evaluated FIRST and its
+    // legs are untouched, so no sample that used to be refused can now be promoted.
+    for (const sessions of [20, 45, 90]) {
+      for (let t = 0; t < 4; t++) {
+        const { ledger, bars } = synth({ sessions, seed: 300 + t * 17, edge: 'none' });
+        const report = runPcrExpectancy(ledger, bars, { iters: 300, seed: 11 });
+        // The one place a negative assertion belongs: this is a statement about the
+        // PASS branch ALONE (never promote noise), not a stand-in for a verdict we
+        // could not be bothered to name.
+        expect(report.verdict).not.toBe('PASS');
+      }
+    }
+  });
+
+  it('zero edge at the planned read CAN be decisively refused — N=90 => FAIL', () => {
+    // The early exit on the exact cell TRA-1726 asked to pin. Here the clustered
+    // interval HAS tightened under the +0.05R bar, so the sample genuinely refutes the
+    // overlay and the harness says so plainly. FAIL is a real, reachable outcome at
+    // the planned window — it is simply no longer the DEFAULT for "not PASS".
+    const { ledger, bars } = synth({ sessions: 90, seed: 42, edge: 'none' });
+    const report = runPcrExpectancy(ledger, bars, { iters: 500, seed: 11 });
+
+    expect(report.verdict).toBe('FAIL');
+    expect(report.primary!.clustered.hi).toBeLessThan(PCR_UPLIFT_BAR_R);
+    expect(report.reasons.join(' ')).toMatch(/DECISIVE NO-GO/);
+  });
+
+  it('KNOWN LIMITATION, pinned: on a USELESS overlay a decisive NO-GO is the MINORITY outcome', () => {
+    // The honest RATE, so nobody plans around the single seed above. A merely USELESS
+    // overlay (exactly zero edge — as opposed to a HARMFUL one, refused 8/8 at N=30)
+    // is decisively refused on only a MINORITY of draws even at the planned read: its
+    // interval usually still straddles the bar, so HELD is the MODAL verdict.
+    //
+    // Consequence for the TRA-1664 study plan, recorded here so it is not discovered
+    // in November: if PCR is pure noise, the most likely outcome at N=90 is HELD, not
+    // a clean FAIL — the study will most often want to keep accruing rather than
+    // retire. Retiring TRA-1609 on a NULL result therefore wants a separate
+    // PRECISION/FUTILITY stopping rule (retire once the interval is tight enough that
+    // a +0.05R effect WOULD have been seen). That is a change to the pre-registration
+    // and needs board sign-off; it is deliberately NOT smuggled in here.
+    const counts: Record<string, number> = { PASS: 0, FAIL: 0, HELD: 0 };
+    for (let t = 0; t < 8; t++) {
+      const { ledger, bars } = synth({ sessions: 90, seed: 5 + t * 101, edge: 'none' });
+      counts[runPcrExpectancy(ledger, bars, { iters: 300, seed: 11 }).verdict]++;
+    }
+    expect(counts.PASS).toBe(0);                    // never promotes noise (safety)
+    expect(counts.HELD).toBeGreaterThanOrEqual(6);  // ...but mostly ABSTAINS
+    expect(counts.FAIL).toBeLessThanOrEqual(2);     // ...and only sometimes refutes
   });
 });
 

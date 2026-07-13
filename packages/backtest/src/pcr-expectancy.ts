@@ -832,9 +832,15 @@ export interface PcrExpectancyReport {
   primary: CellResult | null;
   guards: OverfittingGuards | null;
   /**
-   * The pre-registered verdict. PASS demands EVERY leg: the primary cell's uplift
-   * bar, its session-clustered CI, the session floor, AND both overfitting guards
-   * EVALUABLE and passing. Anything not evaluable is HELD — never a pass.
+   * The pre-registered verdict, and all THREE values are reachable (TRA-1726).
+   *
+   * - PASS — EVERY leg: the primary cell's uplift bar, its session-clustered CI, the
+   *   session floor, AND both overfitting guards EVALUABLE and passing.
+   * - FAIL — a DECISIVE NO-GO, and nothing weaker: the primary cell's clustered CI
+   *   upper bound sits BELOW the +0.05R bar, so the optimistic end of the interval
+   *   cannot clear it. Decisive at any N. This is the verdict that retires TRA-1609.
+   * - HELD — the interval straddles the bar, or is not evaluable. The sample cannot
+   *   answer the question. NOT a NO-GO. Never a pass.
    */
   verdict: 'PASS' | 'FAIL' | 'HELD';
   reasons: string[];
@@ -919,31 +925,80 @@ export function runPcrExpectancy(
     guards.pboEvaluable &&
     guards.dsr?.pass === true &&
     guards.pbo?.pass === true;
-  const evaluable = guards.dsrEvaluable && guards.pboEvaluable && primary.legs.sessionFloor;
+
+  // THE DECISIVE-NO-GO RULE (TRA-1726).
+  //
+  // The verdict is three-valued, and all three values must be REACHABLE. They were
+  // not. The previous branch made HELD unreachable above the 20-session floor: once
+  // DSR, PBO and the session floor were merely EVALUABLE, every non-PASS fell
+  // through to FAIL. So a genuinely good overlay, read on a thin-but-legal sample,
+  // was CONDEMNED — 7 of 8 seeds at 20/30/45 sessions on the `edge:'real'`
+  // generator came back FAIL. That is a type-II error laundered as a decision, and
+  // FAIL is the verdict that retires the overlay for good.
+  //
+  // A FAIL must now rest on POSITIVE evidence AGAINST the overlay, not on the mere
+  // ABSENCE of evidence for it. The primary cell's session-clustered CI must lie
+  // ENTIRELY BELOW the promotion bar — even the optimistic end of the interval
+  // cannot clear +0.05R. That is decisive at ANY N, a thin sample included, which
+  // is what buys the early exit: a junk overlay still earns a decisive NO-GO the
+  // moment its interval tightens under the bar. We are not committing to a blind
+  // wait for 90 sessions.
+  //
+  // Two properties this rule preserves, deliberately:
+  //
+  //  1. STRICTLY MONOTONE TOWARD ABSTENTION. It can only ever convert a former FAIL
+  //     into HELD. It can NEVER manufacture a PASS: PASS is evaluated FIRST and its
+  //     legs are untouched. That is what makes it safe to land without re-opening
+  //     the pre-registration.
+  //
+  //  2. IGNORANCE IS NEVER CONDEMNATION. A non-evaluable / NaN interval is HELD —
+  //     never FAIL, never PASS. "Don't know" has its own verdict now, and the tests
+  //     assert the EXACT verdict: a `not.toBe('PASS')` assertion cannot tell a
+  //     rejection from an abstention, and that is precisely what hid this bug.
+  const ciUpper = primary.clustered.hi;
+  const decisiveNoGo = Number.isFinite(ciUpper) && ciUpper < PCR_UPLIFT_BAR_R;
 
   let verdict: 'PASS' | 'FAIL' | 'HELD';
-  if (!evaluable) {
-    // Not enough independent sessions to answer the question. This is NOT a FAIL
-    // (the overlay may yet be good) and it is emphatically NOT a PASS.
-    verdict = 'HELD';
-  } else if (primary.pass && guardsPass) {
+  if (primary.pass && guardsPass) {
     verdict = 'PASS';
-  } else {
+  } else if (decisiveNoGo) {
     verdict = 'FAIL';
+    reasons.push(
+      `DECISIVE NO-GO: session-clustered 90% CI upper bound ${ciUpper.toFixed(4)}R < ` +
+        `${PCR_UPLIFT_BAR_R}R bar — even the optimistic end of the interval cannot clear it ` +
+        `(bias-adjusted uplift ${primary.adjustedUpliftR.toFixed(4)}R; raw ` +
+        `${primary.rawUpliftR.toFixed(4)}R, of which ${primary.placeboUpliftR.toFixed(4)}R is ` +
+        `earned by a zero-information placebo)`,
+    );
+  } else {
+    verdict = 'HELD';
+    if (!Number.isFinite(ciUpper)) {
+      reasons.push(
+        'HELD: the session-clustered CI is not evaluable on this sample — that is an ' +
+          'abstention, not a NO-GO',
+      );
+    } else {
+      reasons.push(
+        `HELD: session-clustered 90% CI [${primary.clustered.lo.toFixed(4)}, ` +
+          `${ciUpper.toFixed(4)}]R STRADDLES the ${PCR_UPLIFT_BAR_R}R bar — the sample cannot ` +
+          `answer the question either way. Not a NO-GO; accrue more sessions.`,
+      );
+    }
+    // Publish WHICH legs are short, so a HELD is diagnosable and not just a shrug.
+    if (!primary.legs.sessionFloor) {
+      reasons.push(`HELD leg: below the ${MIN_INDEPENDENT_SESSIONS}-session floor`);
+    }
     if (!primary.legs.upliftBar) {
       reasons.push(
-        `bias-adjusted uplift ${primary.adjustedUpliftR.toFixed(4)}R < ${PCR_UPLIFT_BAR_R}R bar ` +
-          `(raw ${primary.rawUpliftR.toFixed(4)}R, of which ${primary.placeboUpliftR.toFixed(4)}R ` +
-          `is earned by a zero-information placebo)`,
+        `HELD leg: bias-adjusted uplift ${primary.adjustedUpliftR.toFixed(4)}R < ` +
+          `${PCR_UPLIFT_BAR_R}R bar (point estimate only — the interval still reaches it)`,
       );
     }
     if (!primary.legs.clusteredCiPositive) {
-      reasons.push(
-        `session-clustered 90% CI lower bound ${primary.clustered.lo.toFixed(4)} <= 0`,
-      );
+      reasons.push(`HELD leg: session-clustered 90% CI lower bound ${primary.clustered.lo.toFixed(4)} <= 0`);
     }
-    if (guards.dsr && !guards.dsr.pass) reasons.push('DSR guard failed');
-    if (guards.pbo && !guards.pbo.pass) reasons.push('PBO guard failed');
+    if (guards.dsr && !guards.dsr.pass) reasons.push('HELD leg: DSR guard failed');
+    if (guards.pbo && !guards.pbo.pass) reasons.push('HELD leg: PBO guard failed');
   }
 
   return { diagnostics, shape, cells, primary, guards, verdict, reasons };
