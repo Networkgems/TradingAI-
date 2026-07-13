@@ -5,10 +5,12 @@ import {
   cohortize,
   evaluateCell,
   joinForwardReturns,
+  mean,
   naiveRowBootstrap,
   PCR_UPLIFT_BAR_R,
   pcrSideFor,
   placeboUpliftStat,
+  PRIMARY_POWER_CONSTRAINT,
   rawUpliftStat,
   runPcrExpectancy,
   sessionClusteredBootstrap,
@@ -517,4 +519,89 @@ describe('fail-closed on a thin ledger', () => {
     const cell = evaluateCell(rows, 10, 'raw', 'contrarian', { iters: 200, seed: 1 });
     expect(cell.legs.clusteredCiPositive).toBe(false);
   });
+});
+
+// ---------------------------------------------------------------------------
+// TRA-1756 R3 — THE BAR WAS NEVER CHECKED FOR DETECTABILITY.
+//
+// TRA-1727's review found that the SECONDARY estimand can only release on an edge that does
+// not exist. The primary has the same disease and slightly worse: its MDE at the planned
+// N=90 read is ~+1.5R against a +0.05R promotion bar. The bar is a PROMOTION threshold —
+// "an edge this small is not worth trading" — and nobody ever checked it was a DETECTABLE
+// one. Both things are true at once, and only the first was ever a decision.
+//
+// These tests MEASURE the claim `PRIMARY_POWER_CONSTRAINT` makes. A caveat nobody checked
+// is just a comment, and this one is load-bearing for how the November verdict gets read.
+// ---------------------------------------------------------------------------
+
+describe('TRA-1756 R3 — the primary MDE, pinned', () => {
+  it('the CI half-width is 4-12x the bar it is asked to grade — the bar is UNDER the noise floor', () => {
+    // The mechanism behind the whole finding, in one number. And note the direction: the
+    // interval WIDENS as the true edge grows, so the instrument gets LESS precise exactly
+    // when there is something to see. That is why the power curve climbs so slowly.
+    //
+    // Measured (12 worlds/cell, N=90): zero edge -> 0.190R half-width at gamma 2.0 and
+    // 0.214R at gamma 1.2; the +1.48R positive control -> 0.612R. Against a +0.05R bar.
+    const halfWidthAt = (gamma: number, edge: 'none' | 'real'): number => {
+      const hws: number[] = [];
+      for (let t = 0; t < 12; t++) {
+        const { ledger, bars } = synth({ sessions: 90, seed: 1000 + t, edge, gamma });
+        const p = runPcrExpectancy(ledger, bars, { iters: 300, seed: 11 }).primary;
+        if (p && Number.isFinite(p.clustered.hi)) hws.push((p.clustered.hi - p.clustered.lo) / 2);
+      }
+      return mean(hws);
+    };
+
+    const zeroEdge = halfWidthAt(2.0, 'none');
+    const posControl = halfWidthAt(1.2, 'real');
+
+    expect(zeroEdge).toBeGreaterThan(3 * PCR_UPLIFT_BAR_R); // ~0.19R vs a 0.05R bar
+    expect(posControl).toBeGreaterThan(8 * PCR_UPLIFT_BAR_R); // ~0.61R
+    // ...and it gets WORSE, not better, when a real edge is present.
+    expect(posControl).toBeGreaterThan(zeroEdge);
+  }, 300000);
+
+  it('a SEVEN-TIMES-THE-BAR true edge is INVISIBLE to the primary at the planned N=90 read', () => {
+    // `gamma: 0.15` is a true bias-adjusted uplift of +0.33R (+/-0.07, N=250 x 15 worlds) —
+    // 6.6x the +0.05R promotion bar, and far larger than any PCR edge anyone has claimed.
+    //
+    // It releases ZERO times out of 12 at N=90. This is the number that makes the November
+    // read uninterpretable without the caveat: the study is being run at an N where an edge
+    // many times better than the bar cannot be distinguished from nothing.
+    let passes = 0;
+    for (let t = 0; t < 12; t++) {
+      const { ledger, bars } = synth({ sessions: 90, seed: 1000 + t, edge: 'real', gamma: 0.15 });
+      if (runPcrExpectancy(ledger, bars, { iters: 300, seed: 11 }).verdict === 'PASS') passes++;
+    }
+    expect(passes).toBe(0);
+  }, 300000);
+
+  it('the gate is NOT simply wired shut — its own 30x-the-bar positive control DOES release', () => {
+    // The other half of the two-sided control, and the reason the test above means anything.
+    // A gate that never releases would produce the identical 0/12 above. This one releases
+    // 7/12 on a +1.48R edge (gamma 1.2, the pre-registered `edge:'real'` control) — which is
+    // exactly the point: the ONLY thing it can see is ~30x the bar it is grading against.
+    let passes = 0;
+    for (let t = 0; t < 12; t++) {
+      const { ledger, bars } = synth({ sessions: 90, seed: 1000 + t, edge: 'real', gamma: 1.2 });
+      if (runPcrExpectancy(ledger, bars, { iters: 300, seed: 11 }).verdict === 'PASS') passes++;
+    }
+    expect(passes).toBeGreaterThanOrEqual(5); // MDE territory: ~58% power on a 30x-bar edge
+  }, 300000);
+
+  it('stamps PRIMARY_POWER_CONSTRAINT on every report, and into the reasons of every HELD', () => {
+    const { ledger, bars } = synth({ sessions: 90, seed: 1000, edge: 'none', gamma: 2.0 });
+    const rep = runPcrExpectancy(ledger, bars, { iters: 300, seed: 11 });
+
+    expect(rep.power).toBe(PRIMARY_POWER_CONSTRAINT);
+    expect(rep.power).toMatch(/HELD IS NOT EVIDENCE OF ABSENCE/i);
+    expect(rep.power).toMatch(/never checked to be a DETECTABLE one/i);
+    // The R-scale caveat must travel too — it is the one thing that could overturn all of
+    // this, and it cannot be checked until the real ledger has rows.
+    expect(rep.power).toMatch(/has NOT yet been calibrated against the real shadow ledger/i);
+
+    if (rep.verdict === 'HELD') {
+      expect(rep.reasons.some((r) => /HELD — READ THIS BEFORE ACTING ON IT/.test(r))).toBe(true);
+    }
+  }, 120000);
 });

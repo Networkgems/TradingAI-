@@ -17,8 +17,68 @@ import {
 // point of pre-registering is that the bar cannot move after the data is seen.
 // If you are changing a number below AFTER looking at a result, you are p-hacking.
 
-/** Incremental expectancy uplift the PCR overlay must clear, in R. */
+/**
+ * Incremental expectancy uplift the PCR overlay must clear, in R.
+ *
+ * *** TRA-1756 R3: THIS BAR WAS NEVER CHECKED FOR DETECTABILITY. See PRIMARY_POWER_CONSTRAINT. ***
+ * It is a PROMOTION threshold — "an edge this small is not worth trading" — and it is
+ * ~30x BELOW the smallest edge this study can actually SEE. Both facts are true at once,
+ * and the second one was nobody's decision; it was simply never measured.
+ */
 export const PCR_UPLIFT_BAR_R = 0.05;
+
+/**
+ * TRA-1756 R3. The PRIMARY's minimum detectable effect. Stamped into every primary report
+ * for the same reason TRA-1727's SELECTION_ONLY_CONSTRAINT is stamped into every secondary
+ * one: in November somebody reads a verdict off a table, not this file.
+ *
+ * The secondary (TRA-1727) was found to be unable to release on any edge we could plausibly
+ * find. THE PRIMARY HAS THE SAME DISEASE, AND SLIGHTLY WORSE. Measured on the shared synth,
+ * calibrating the generator's knob to an EFFECT SIZE first (nobody had ever done that —
+ * `gamma` is a coefficient, not an uplift) and only then reading power against it:
+ *
+ *   generator     | true uplift | vs the bar | PASS at N=45 | PASS at N=90 | half-width N=90
+ *   --------------+-------------+------------+--------------+--------------+----------------
+ *   zero edge     |   -0.04R    |     -      |     0/12     |     0/12     |  0.214R (g=1.2)
+ *                 |             |            |              |              |  0.190R (g=2.0)
+ *   real, g=0.15  |   +0.33R    |    6.6x    |     1/12     |     0/12     |  0.480R
+ *   real, g=0.3   |   +0.70R    |   14.1x    |     1/12     |     1/12     |  0.515R
+ *   real, g=0.6   |   +1.17R    |   23.5x    |     1/12     |     2/12     |  0.583R
+ *   real, g=1.2   |   +1.48R    |   29.7x    |     5/12     |     7/12     |  0.612R  <- the
+ *   real, g=2.0   |   +1.53R    |   30.6x    |     6/12     |     9/12     |  0.611R  positive
+ *                                                                                     control
+ *
+ * READ THE `g=0.3` ROW. A TRUE EDGE OF FOURTEEN TIMES THE PROMOTION BAR MUSTERS 8% POWER AT
+ * THE PLANNED N=90 READ. The MDE is ~+1.5R. The bar is +0.05R. The gate's own positive
+ * control (`edge:'real'`, gamma 1.2) is +1.48R — 30x the bar — and it only just releases.
+ *
+ * The right-hand column is the mechanism, and it is the number to remember: the
+ * session-clustered interval runs 0.19R to 0.61R at the HALF-width, against a bar of 0.05R.
+ * THE BAR SITS ROUGHLY 4x TO 12x BELOW THE NOISE FLOOR OF THE ESTIMATOR THAT GRADES IT.
+ * Worse, the interval WIDENS as the true edge grows (0.19R -> 0.61R), so the instrument gets
+ * LESS precise exactly when there is something to see — which is why the power curve climbs
+ * so slowly. (Noted on TRA-1741 and unexplained then; this is what it costs.)
+ *
+ * CONSEQUENCE FOR THE NOVEMBER READ: a HELD is the overwhelmingly likely outcome and it is
+ * NOT EVIDENCE OF ABSENCE. It means "no edge larger than ~+1.5R", which rules out nothing
+ * anyone ever believed about PCR. Do not read it as "PCR does not work — drop TRA-1609".
+ *
+ * THE ONE THING THAT COULD OVERTURN THIS: every number above is measured on ONE synthetic
+ * generator, whose R-scale (a 1-SD idiosyncratic move => ~1R of contrast) is what sets the
+ * MDE — and that scale has never been checked against the real shadow ledger, which does not
+ * yet have the rows to check it with. If the real cross-section is far more dispersed than
+ * the synth, the MDE in R stands but its PLAUSIBILITY reading softens. Calibrate it when the
+ * ledger has rows; until then this constant is a claim about the synth, stated as one.
+ */
+export const PRIMARY_POWER_CONSTRAINT =
+  'POWER. The minimum detectable effect of this PRIMARY read is roughly +1.5R at N=90 — about ' +
+  '30x the +0.05R promotion bar. A true uplift of +0.70R (FOURTEEN times the bar) still only ' +
+  'releases 1 time in 12. The session-clustered 90% CI runs 0.19-0.61R at the half-width, so the ' +
+  'bar sits roughly 4x to 12x BELOW the noise floor of the estimator that grades it: the bar was chosen ' +
+  'as a PROMOTION threshold and was never checked to be a DETECTABLE one. *** A HELD IS NOT ' +
+  'EVIDENCE OF ABSENCE. *** It means "no edge larger than the MDE" — it does NOT mean "no edge", ' +
+  'and it is NOT a reason to drop the PCR overlay. Measured on the synthetic generator, whose ' +
+  'R-scale has NOT yet been calibrated against the real shadow ledger (TRA-1756 R3).';
 /** Bootstrap confidence level — the binding CI is the session-clustered one. */
 export const PCR_BOOTSTRAP_CONFIDENCE = 0.9;
 /** Bootstrap resamples. Fixed so a run is reproducible from the seed alone. */
@@ -850,6 +910,12 @@ export function overfittingGuards(
 }
 
 export interface PcrExpectancyReport {
+  /**
+   * TRA-1756 R3. Stamped on every report. The verdict must never travel without it —
+   * above all a HELD, which is the outcome this study will almost certainly produce and
+   * the one that reads, wrongly, as "PCR does not work".
+   */
+  power: string;
   diagnostics: Record<number, JoinDiagnostics>;
   shape: SampleShape;
   cells: CellResult[];
@@ -923,6 +989,7 @@ export function runPcrExpectancy(
   const reasons: string[] = [];
   if (!primary) {
     return {
+      power: PRIMARY_POWER_CONSTRAINT,
       diagnostics,
       shape,
       cells,
@@ -1025,7 +1092,11 @@ export function runPcrExpectancy(
     }
     if (guards.dsr && !guards.dsr.pass) reasons.push('HELD leg: DSR guard failed');
     if (guards.pbo && !guards.pbo.pass) reasons.push('HELD leg: PBO guard failed');
+    // TRA-1756 R3. A HELD is the modal outcome of this read, and on its own it reads as
+    // "PCR does not work — retire TRA-1609". It does not say that, and it CANNOT: the MDE
+    // is ~30x the bar. The caveat ships INSIDE the verdict's reasons, not only in a field.
+    reasons.push(`HELD — READ THIS BEFORE ACTING ON IT. ${PRIMARY_POWER_CONSTRAINT}`);
   }
 
-  return { diagnostics, shape, cells, primary, guards, verdict, reasons };
+  return { power: PRIMARY_POWER_CONSTRAINT, diagnostics, shape, cells, primary, guards, verdict, reasons };
 }

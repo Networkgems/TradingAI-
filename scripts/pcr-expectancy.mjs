@@ -183,6 +183,13 @@ for (const r of report.reasons) console.log(`  - ${r}`);
 if (report.verdict === 'HELD') {
   console.log('\n  HELD is NOT a pass. It means the sample cannot answer the question yet.');
 }
+// TRA-1756 R3. The PRIMARY's power caveat, on every verdict — the bar is ~30x below this
+// read's minimum detectable effect, so a HELD rules out nothing anyone believed about PCR.
+console.log();
+console.log('WHAT A PRIMARY *HELD* DOES AND DOES NOT MEAN:');
+for (const chunk of report.power.match(/.{1,92}(\s|$)/g) ?? []) {
+  console.log(`  ${chunk.trim()}`);
+}
 
 // ---------------------------------------------------------------------------
 // TRA-1727 — THE SECONDARY (cross-sectional) ESTIMAND.
