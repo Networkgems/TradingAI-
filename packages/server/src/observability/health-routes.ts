@@ -68,6 +68,7 @@ import {
 } from '../churn-loss-brake-flag.js';
 import { isScaleoutLadderEnabled } from '../scaleout-ladder-flag.js';
 import { summarizeScaleoutLadder } from '../scaleout-ladder-ledger.js';
+import { summarizeEquityEntryFunnel } from '../equity-entry-funnel.js'; // TRA-1768
 import { isCorrelatedExposureCapEnabled, CORRELATED_EXPOSURE_CAP_FLAG, isTakeProfitEarlyEnabled, TAKE_PROFIT_EARLY_FLAG, isEntryGreeksGateEnabled, ENTRY_GREEKS_GATE_FLAG, isEntryDeltaCeilingEnabled, resolveEntryDeltaCeiling, resolveEntryDeltaCeilingStructures, resolveEntryDeltaCeilingMap, resolveEntryDeltaCeilingObserveStructures, OPTION_ENTRY_DELTA_CEILING_FLAG } from '../exit-risk-rules-flag.js';
 import { summarizeCorrelatedExposureBindings } from '../correlated-exposure-ledger.js';
 import { CONVICTION_DCA, CORRELATED_EXPOSURE_CAP_PCT, CORRELATED_EXPOSURE_MIN_TRADE_RISK_PCT, TAKE_PROFIT_EARLY_CAPTURE_PCT, ENTRY_SHORT_DELTA_MIN, ENTRY_SHORT_DELTA_MAX, ENTRY_DELTA_THETA_RATIO_FLOOR, resolveEquitySwingModeEnabled, resolveEquitySwingUniverse, EQUITY_SWING_UNIVERSE, EQUITY_SWING_GUARDRAIL } from '@trading-app/shared';
@@ -1484,6 +1485,45 @@ export function registerLiveHealthRoutes(app: Express, deps: LiveHealthDeps): vo
 
       rBasis:
         'R = entryMark − stopPrice = 0.25 · entryMark (both option sites stop at mark·0.75). NOTE the journal\'s own `realizedR` divides by `atRiskUsd` = the FULL premium, a 4× different unit — `avgSpreadCrossRPremiumBasis` is given per structure so the two are never silently mixed.',
+    });
+  });
+
+  // TRA-1768 (parent TRA-1318, surfaced by TRA-1729) — unauthenticated, secrets-free
+  // EQUITY ENTRY FUNNEL readout. EQUITY_SWING_MODE reports ACTIVE while the demo equity
+  // book has held ZERO positions — open or closed — for 8+ days, against 2,192 option
+  // rows. Nothing counted the rejections, so `no positions` could not be told apart from
+  // `no candidates`. This route splits them:
+  //
+  //   candidatesEvaluated: 0             ⇒ the signal side is DRY   (a STRATEGY problem)
+  //   candidatesEvaluated: N, admitted:0 ⇒ a guardrail ate them all (a CALIBRATION problem)
+  //                                        — and `rejectedByReason` names which one.
+  //
+  // Three-valued, same discipline as TRA-1729: `null` = NO READING, `0` = the pass ran
+  // and saw nothing, `>0` = real. A pass held at the four-way pass gate (market closed,
+  // halted, auto-trading off, strategies inactive) reports candidatesEvaluated: null and
+  // `passGateBlockedReason` — NOT `0`, which would libel the strategy for a shut market.
+  //
+  // demo and live are reported SEPARATELY and never pooled: the swing sleeve went live on
+  // TRA-955/1306 running the SAME entry logic, so `live.funnelStatus` is the one field
+  // that can tell a live sleeve holding NO RISK from a healthy sleeve that happens to be
+  // flat — states that are otherwise byte-identical on the wire.
+  //
+  // Pure readout. This ticket added NO book mutation, NO order path, and loosened NO
+  // guardrail — counting the rejections is the whole job.
+  app.get('/api/health/equity-entry-funnel', (_req, res) => {
+    const funnel = summarizeEquityEntryFunnel();
+    res.json({
+      ok: true,
+      time: new Date(now()).toISOString(),
+      build: resolveBuildInfo(),
+      swingModeEnabled: resolveEquitySwingModeEnabled(process.env),
+      demo: funnel.demo,
+      live: funnel.live,
+      // Load-bearing context for reading `candidatesBySource`: swing mode HARD-NULLS the
+      // two intraday churners, so a dry `deterministic` bucket is Ichimoku alone being
+      // quiet — not a broken scan.
+      intradayChurnersDisabled: resolveEquitySwingModeEnabled(process.env) ? ['orb', 'bbFade_1h'] : [],
+      note: 'candidatesEvaluated is three-valued: null = no ITERATED pass since boot (says nothing about the signal side), 0 = a pass ran and generated NO candidates (THE ALARM — the strategy is dry, no guardrail can be blamed), >0 = ideas exist. If candidatesEvaluated > 0 and admitted = 0, rejectedByReason names the guardrail eating them. passGateBlockedReason is set when the pass FIRED but never iterated (market closed / halted / auto-trading off) — that is NOT a strategy verdict and candidatesEvaluated stays null. Counters are SINCE-BOOT and in-memory by design: DATA_DIR is ephemeral (TRA-1719), so a durable counter here would be pinned at 0 forever; this instrument needs n=1 and reads correctly on the FIRST tick after a deploy. There is deliberately NO min_holding_days bucket — that guardrail gates discretionary CLOSES, never entries, so the bucket could never increment.',
     });
   });
 

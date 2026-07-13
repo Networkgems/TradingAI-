@@ -43,6 +43,14 @@ import {
   runScaleoutLadderObservePass,
 } from '../scaleout-ladder-ledger.js';
 import { clearEntryGreeksLedger, recordEntryGreeksVerdict } from '../entry-greeks-ledger.js';
+import {
+  beginEquityEntryPass,
+  recordEquityEntryPassGated,
+  recordEquityCandidate,
+  recordEquityEntryRejected,
+  __resetEquityEntryFunnelForTests,
+  type EquityEntryFunnelView,
+} from '../equity-entry-funnel.js';
 import { etDateString } from '../scheduler.js';
 import { checkStaleState } from './alerts.js';
 import { getRecentAlerts, __resetAlertsForTest } from './alerts.js';
@@ -1607,5 +1615,98 @@ describe('GET /api/health/scaleout-ladder — TRA-1729 observe-pass readout', ()
     expect(body.observeStatus).toBe('never_ran');
     expect(body.observedPositionCount).toBeNull(); // no reading ≠ read an empty book
     expect(body.blind).toBe(false); // a flag that is OFF is not an alarm
+  });
+});
+
+// TRA-1768 — the equity entry funnel route.
+//
+// Acceptance #3 is explicit: read the SERVED RESPONSE BODY, not the route file. A
+// literal-key grep over the source reads `0` even on a build that serves the key
+// (keys can arrive via a spread), so the only assertion worth anything is one that
+// invokes the registered handler and inspects what it actually emitted.
+describe('GET /api/health/equity-entry-funnel (TRA-1768)', () => {
+  beforeEach(() => {
+    __resetEquityEntryFunnelForTests();
+  });
+
+  afterEach(() => {
+    __resetEquityEntryFunnelForTests();
+  });
+
+  function funnelBody() {
+    const { app, routes } = fakeApp();
+    registerLiveHealthRoutes(app, {
+      requireAuth: ((_q: unknown, _s: unknown, n: () => void) => n()) as never,
+      userCtx: async () => ctx('admin', engineState()),
+      getSettings: () => settings(),
+      now: () => NOW,
+    });
+    const handlers = routes.get('/api/health/equity-entry-funnel')!;
+    const res = fakeRes();
+    handlers[0]!({}, res);
+    return res.body as {
+      ok: boolean;
+      demo: EquityEntryFunnelView;
+      live: EquityEntryFunnelView;
+      intradayChurnersDisabled: string[];
+    };
+  }
+
+  it('serves demo and live SEPARATELY, three-valued, with no pass since boot', () => {
+    const body = funnelBody();
+
+    expect(body.ok).toBe(true);
+    // No reading ≠ a dry signal side. Both books say so, independently.
+    expect(body.demo.funnelStatus).toBe('never_ran');
+    expect(body.live.funnelStatus).toBe('never_ran');
+    expect(body.demo.cumulative.candidatesEvaluated).toBeNull();
+    expect(body.live.cumulative.candidatesEvaluated).toBeNull();
+    expect(body.demo.passCount).toBe(0);
+  });
+
+  it('THE ALARM: a pass that ran and generated nothing serves candidatesEvaluated 0 / no_candidates', () => {
+    beginEquityEntryPass('demo', NOW);
+    const body = funnelBody();
+
+    expect(body.demo.lastPass.candidatesEvaluated).toBe(0);
+    expect(body.demo.funnelStatus).toBe('no_candidates');
+    expect(body.demo.passGateBlockedReason).toBeNull(); // it RAN — no gate to blame
+    expect(body.demo.lastPassAt).not.toBeNull();
+    // The live book is untouched and must NOT inherit demo's reading.
+    expect(body.live.funnelStatus).toBe('never_ran');
+  });
+
+  it('a gated pass serves the GATE, not a false zero', () => {
+    recordEquityEntryPassGated('demo', 'market_closed', NOW);
+    const body = funnelBody();
+
+    expect(body.demo.funnelStatus).toBe('gated');
+    expect(body.demo.passGateBlockedReason).toBe('market_closed');
+    expect(body.demo.cumulative.candidatesEvaluated).toBeNull(); // NOT 0
+    expect(body.demo.passCount).toBe(1); // the tick fired; gated ≠ never_ran
+  });
+
+  it('a candidate eaten by a guardrail serves the EATER by name', () => {
+    beginEquityEntryPass('demo', NOW);
+    recordEquityCandidate('demo', 'deterministic');
+    recordEquityEntryRejected('demo', 'churn_brake');
+    const body = funnelBody();
+
+    expect(body.demo.funnelStatus).toBe('all_rejected');
+    expect(body.demo.cumulative.candidatesEvaluated).toBe(1);
+    expect(body.demo.cumulative.admitted).toBe(0);
+    expect(body.demo.cumulative.rejectedByReason).toEqual({ churn_brake: 1 });
+    expect(body.demo.cumulative.candidatesBySource).toEqual({ deterministic: 1 });
+  });
+
+  it('surfaces that swing mode hard-nulls the intraday churners (context for a dry deterministic bucket)', () => {
+    const prior = process.env.EQUITY_SWING_MODE;
+    process.env.EQUITY_SWING_MODE = 'true';
+    try {
+      expect(funnelBody().intradayChurnersDisabled).toEqual(['orb', 'bbFade_1h']);
+    } finally {
+      if (prior === undefined) delete process.env.EQUITY_SWING_MODE;
+      else process.env.EQUITY_SWING_MODE = prior;
+    }
   });
 });
