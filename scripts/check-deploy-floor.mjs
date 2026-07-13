@@ -43,7 +43,16 @@ import { spawnSync } from 'node:child_process';
 const FLOOR = 'ef30c4c';
 
 // Each required commit, with what an id lacking it silently does to the window.
+//
+// 07ea3b1 is an ancestor of the floor, so the floor check alone already implies
+// it. It is asserted BY NAME anyway: it is TRA-1718's stated invalidation, and
+// "implied by the floor" is precisely the kind of inference that goes stale the
+// day someone moves the floor. An id without it does not merely mis-measure the
+// RV long — the sleeve admits ZERO candidates by construction (the selector
+// emits |delta| >= 0.45 into a gate that admits <= 0.40; empty intersection),
+// and an empty set reads exactly like a hostile tape.
 const REQUIRED = [
+  ['07ea3b1', 'TRA-1677', 'the RV long entry gate is algebraically impossible — sleeve admits 0, forever'],
   ['0ea97b7', 'TRA-1689', "one sleeve's ceiling knob moves another sleeve's measured band"],
   ['1f87e35', 'TRA-1682', "the demo directional opener wears the RV long's journal label"],
   ['f0cf9b8', 'TRA-1691', 'the rollup keys on structure, pooling three scanners as one cohort'],
