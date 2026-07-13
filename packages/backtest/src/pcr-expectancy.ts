@@ -36,6 +36,24 @@ export const PRIMARY_HORIZON = 5;
 export const HORIZONS = [3, 5, 10] as const;
 
 /**
+ * TOTAL multiplicity of the WHOLE PCR study, and the DSR trial count for BOTH reads.
+ *
+ * The PRIMARY (time-series) grid is 2 carriers x 2 interpretations x 3 horizons = 12
+ * cells. TRA-1727 adds a SECONDARY (cross-sectional) estimand that looks at the SAME
+ * grid = 12 more. 24 configurations have now been searched, and DSR must deflate by
+ * all 24 — on BOTH reads.
+ *
+ * ADDING A SECOND LOOK IS NOT FREE AND MUST NOT BE LAUNDERED AS ONE. If each read
+ * deflated by only its own 12, the study would take two independent shots at the bar
+ * while each shot reported the multiplicity of a single one — which is precisely the
+ * bias DSR exists to remove. So the primary's penalty goes UP when the secondary is
+ * added, and that cost is paid where it is incurred rather than hidden.
+ *
+ * Lives HERE, not in `pcr-cross-sectional.ts`, only to keep the import acyclic.
+ */
+export const PCR_STUDY_TRIALS = 24;
+
+/**
  * The two carriers of the PCR read (bar point 4 — reported separately).
  * - `raw`   — the face-value ratio level (its regime bucket).
  * - `zDelta`— the trailing-20-session z-score of the ratio. Only defined on
@@ -315,7 +333,7 @@ export function cohortize(
   return { trioAlone, agreeing, disagreeing, silent };
 }
 
-function mean(xs: readonly number[]): number {
+export function mean(xs: readonly number[]): number {
   if (xs.length === 0) return Number.NaN;
   return xs.reduce((s, x) => s + x, 0) / xs.length;
 }
@@ -340,7 +358,7 @@ export interface Ci {
   effective: number;
 }
 
-function percentile(sorted: readonly number[], p: number): number {
+export function percentile(sorted: readonly number[], p: number): number {
   if (sorted.length === 0) return Number.NaN;
   const i = (sorted.length - 1) * p;
   const lo = Math.floor(i);
@@ -729,8 +747,14 @@ export function overfittingGuards(
   primary: CellResult,
   /** Joined rows per horizon — the trial set spans horizons, not just the primary. */
   rowsByHorizon: Record<number, readonly JoinedRow[]> = {},
-  /** Total configurations looked at across the whole grid (the multiplicity penalty). */
-  gridSize = cells.length,
+  /**
+   * Total configurations looked at across the WHOLE STUDY — the multiplicity penalty.
+   *
+   * Defaults to the study-wide `PCR_STUDY_TRIALS` (24), NOT to this read's own cell
+   * count. TRA-1727 added a second estimand over the same grid, and the primary pays
+   * for it: a study that takes two shots at the bar must deflate by both.
+   */
+  gridSize = PCR_STUDY_TRIALS,
 ): OverfittingGuards {
   const notes: string[] = [];
   const sessions = [...new Set(rows.map((r) => r.session))].sort();
@@ -915,7 +939,9 @@ export function runPcrExpectancy(
     primaryHorizonCells,
     primary,
     rowsByHorizon,
-    cells.length, // full grid multiplicity — every cell we looked at
+    // FULL STUDY multiplicity — every cell we looked at across BOTH estimands (24),
+    // not just this read's own 12. TRA-1727's second look is not free.
+    PCR_STUDY_TRIALS,
   );
 
   reasons.push(...primary.notes, ...guards.notes);

@@ -76,6 +76,7 @@ export {
   PRIMARY_HORIZON,
   HORIZONS,
   MIN_INDEPENDENT_SESSIONS,
+  PCR_STUDY_TRIALS,
 } from './pcr-expectancy.js';
 export type {
   PcrShadowRow,
@@ -92,6 +93,33 @@ export type {
   SampleShape,
   Ci,
 } from './pcr-expectancy.js';
+// TRA-1727 — the SECONDARY pre-registered estimand: a session-demeaned CROSS-SECTIONAL
+// contrast. Readable at ~45 sessions rather than the primary's ~90, but a PASS promotes
+// a PER-NAME SELECTION use ONLY and can never promote market timing — see
+// SELECTION_ONLY_CONSTRAINT, which is stamped into every report it produces.
+export {
+  runPcrCrossSectional,
+  crossSectionalContrasts,
+  crossSectionalSeries,
+  crossSectionalPlaceboCaller,
+  sessionLevelPlaceboCaller,
+  pcrSideCaller,
+  blockBootstrapSeries,
+  evaluateXsCell,
+  xsOverfittingGuards,
+  SELECTION_ONLY_CONSTRAINT,
+  XS_MIN_SESSIONS,
+  XS_MIN_NAMES_PER_SESSION,
+} from './pcr-cross-sectional.js';
+export type {
+  PcrCrossSectionalReport,
+  XsCellResult,
+  XsGuards,
+  XsSeries,
+  XsDiagnostics,
+  SessionContrast,
+  SessionSideCaller,
+} from './pcr-cross-sectional.js';
 export { partitionData, DataPartition } from './data-partition.js';
 export type { PartitionOptions, PartitionBoundaries } from './data-partition.js';
 export { runOptimization, enumerateTrials, STRATEGY_SPECS } from './run-optimization.js';

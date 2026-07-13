@@ -5,7 +5,6 @@ import {
   cohortize,
   evaluateCell,
   joinForwardReturns,
-  mulberry32,
   naiveRowBootstrap,
   PCR_UPLIFT_BAR_R,
   pcrSideFor,
@@ -17,6 +16,11 @@ import {
   type JoinedRow,
   type PcrShadowRow,
 } from './pcr-expectancy.js';
+// The synthetic market moved to a shared fixture (TRA-1727) so the SECONDARY estimand
+// is controlled against the SAME generator as the primary rather than a copy of it.
+// The pinned seed-by-seed counts below are what prove the extraction was faithful: any
+// drift in the RNG consumption order would move them.
+import { session, synth } from './pcr-synth.fixture.js';
 
 // TRA-1664 — the harness's own gate.
 //
@@ -30,121 +34,6 @@ import {
 // passes the zero-edge test perfectly. So the POSITIVE control is equally
 // load-bearing — a ledger with a REAL injected edge must CLEAR. Only the two
 // together show the instrument DISCRIMINATES rather than merely declines.
-
-// ---------------------------------------------------------------------------
-// Synthetic market with the real watchlist's correlation structure.
-// ---------------------------------------------------------------------------
-
-/** 4 near-duplicate index exposures + a mega-cap-tech beta block + a few others. */
-const NAMES = [
-  'SPY', 'QQQ', 'IWM', 'DIA',
-  'AAPL', 'MSFT', 'NVDA', 'GOOGL', 'AMZN', 'META', 'AVGO',
-  'XOM', 'JPM', 'WMT', 'PFE',
-];
-
-/** Everything loads hard on the single market factor — that is the whole point. */
-const BETA: Record<string, number> = Object.fromEntries(
-  NAMES.map((n) => [
-    n,
-    ['SPY', 'QQQ', 'IWM', 'DIA'].includes(n) ? 1.0
-      : ['AAPL', 'MSFT', 'NVDA', 'GOOGL', 'AMZN', 'META', 'AVGO'].includes(n) ? 1.2
-      : 0.7,
-  ]),
-);
-
-const WARMUP = 20; // bars before the first ledger session (ATR(14) + trailing window)
-const TAIL = 15;   // bars after the last ledger session, so H=10 can resolve
-
-function session(i: number): string {
-  const d = new Date(Date.UTC(2026, 0, 5) + i * 86400000);
-  return d.toISOString().slice(0, 10);
-}
-
-function gauss(rng: () => number): number {
-  const u = Math.max(rng(), 1e-12);
-  return Math.sqrt(-2 * Math.log(u)) * Math.cos(2 * Math.PI * rng());
-}
-
-/**
- * Build a synthetic ledger + bars.
- *
- * `edge`:
- *  - 'none' — PCR is a function of the PRECEDING market window: fear rises AFTER a
- *             selloff. Realistic, and carries NO information about the future.
- *             TRUE FORWARD EDGE IS EXACTLY ZERO.
- *  - 'real' — PCR is a (noisy) function of the FORWARD window: fear rises BEFORE a
- *             rally, so the CONTRARIAN read is genuinely predictive.
- *             TRUE FORWARD EDGE IS POSITIVE.
- *
- * In both worlds the BARS are constructed identically — only the PCR generation
- * changes. That isolates exactly the thing under test.
- */
-function synth(opts: {
-  sessions: number;
-  seed: number;
-  edge: 'none' | 'real';
-  horizon?: number;
-  gamma?: number;
-}): { ledger: PcrShadowRow[]; bars: DailyBar[] } {
-  const { sessions: N, seed, edge } = opts;
-  const H = opts.horizon ?? 5;
-  const gamma = opts.gamma ?? 1.2;
-  const rng = mulberry32(seed);
-
-  const total = WARMUP + N + TAIL;
-  // One market factor per session — the source of the cross-name correlation.
-  const m: number[] = Array.from({ length: total }, () => gauss(rng));
-
-  const bars: DailyBar[] = [];
-  for (const name of NAMES) {
-    let px = 100;
-    for (let i = 0; i < total; i++) {
-      px = px * (1 + (BETA[name] * m[i] + 0.6 * gauss(rng)) * 0.01);
-      bars.push({
-        underlying: name,
-        session: session(i),
-        close: px,
-        high: px * (1 + Math.abs(gauss(rng)) * 0.004),
-        low: px * (1 - Math.abs(gauss(rng)) * 0.004),
-      });
-    }
-  }
-
-  const ledger: PcrShadowRow[] = [];
-  for (let s = 0; s < N; s++) {
-    const i = WARMUP + s;
-    // The PCR driver — the ONLY difference between the two worlds.
-    // Positive driver => high z => high PCR => "fear" => contrarian read = CALL.
-    const driver =
-      edge === 'real'
-        ? m.slice(i + 1, i + 1 + H).reduce((a, b) => a + b, 0) / Math.sqrt(H) //  fear PRECEDES a rally
-        : -m.slice(i - H + 1, i + 1).reduce((a, b) => a + b, 0) / Math.sqrt(H); // fear FOLLOWS a selloff
-
-    for (const name of NAMES) {
-      const z = gamma * driver + 0.8 * gauss(rng);
-      const pcrVolume = Math.max(0.05, 0.85 + 0.28 * z);
-      const regime = pcrVolume < 0.7 ? 'bullish' : pcrVolume > 1.0 ? 'bearish' : 'neutral';
-      const contrarian =
-        regime === 'bearish' ? 'bullish' : regime === 'bullish' ? 'bearish' : null;
-
-      ledger.push({
-        id: `${name}:${session(i)}`,
-        session: session(i),
-        underlying: name,
-        asof: i * 86400000,
-        pcrVolume,
-        pcrZ: z,
-        pcrRegime: regime,
-        contrarian,
-        // Every row is a fired trio on the long side, so the trio-alone baseline is
-        // the plain forward return and the overlay's only job is to beat it.
-        trio: { side: 'call', trioFired: true },
-      });
-    }
-  }
-
-  return { ledger, bars };
-}
 
 // ---------------------------------------------------------------------------
 // Mechanics
@@ -438,8 +327,25 @@ describe('real-edge control (POSITIVE)', () => {
 // ---------------------------------------------------------------------------
 
 describe('the decisive-NO-GO rule (TRA-1726)', () => {
-  /** [sessions, expected PASS count over the 8 seeds] */
-  const REAL_THIN: Array<[number, number]> = [[20, 4], [30, 3], [45, 4]];
+  /**
+   * [sessions, expected PASS count over the 8 seeds]
+   *
+   * RE-PINNED BY TRA-1727 (was 4 / 3 / 4). The secondary estimand added 12 more
+   * configurations to the study, so the DSR trial count went from 12 to 24 and the
+   * primary now deflates by the FULL study multiplicity. A stricter deflation promotes
+   * less on THIN samples, and these counts fell accordingly.
+   *
+   * THIS IS THE COST OF THE SECOND LOOK, PAID WHERE IT IS INCURRED. It is not a
+   * regression and it is not p-hacking: the movement is driven entirely by a declared
+   * method change measured on SYNTHETIC controls, before any real ledger row has been
+   * read, and it moves the gate toward ABSTENTION — the safe direction. The primary's
+   * own promotion window is N=90, where it still releases (the POSITIVE control above).
+   * These rows are all BELOW that window, where PASS was never the operative outcome.
+   *
+   * The two safety legs are unchanged and are what this test is really for: FAIL stays
+   * rare (a real edge is not condemned) and HELD stays reachable.
+   */
+  const REAL_THIN: Array<[number, number]> = [[20, 2], [30, 2], [45, 4]];
 
   it('HELD control — a GENUINE edge on a thin sample ABSTAINS; it is not condemned', () => {
     // The regression this issue exists for. Under the old branch this matrix was

@@ -30,7 +30,7 @@
 import { readFile } from 'node:fs/promises';
 import { existsSync } from 'node:fs';
 import { join } from 'node:path';
-import { runPcrExpectancy } from '../packages/backtest/dist/index.js';
+import { runPcrCrossSectional, runPcrExpectancy } from '../packages/backtest/dist/index.js';
 
 function arg(name, fallback = null) {
   const i = process.argv.indexOf(`--${name}`);
@@ -112,9 +112,12 @@ async function readBars(path) {
 const ledger = await readLedger(ledgerPath);
 const bars = await readBars(barsPath);
 const report = runPcrExpectancy(ledger, bars);
+// TRA-1727 — the SECONDARY estimand. Reported ALONGSIDE the primary, never instead of
+// it, and never as an alternative route to the same promotion.
+const secondary = runPcrCrossSectional(ledger, bars);
 
 if (asJson) {
-  console.log(JSON.stringify(report, null, 2));
+  console.log(JSON.stringify({ primary: report, secondary }, null, 2));
   process.exit(report.verdict === 'PASS' ? 0 : 1);
 }
 
@@ -175,11 +178,55 @@ if (report.guards) {
 }
 
 line('=');
-console.log(`VERDICT: ${report.verdict}`);
+console.log(`PRIMARY VERDICT (time-series — the ONLY path to a full overlay): ${report.verdict}`);
 for (const r of report.reasons) console.log(`  - ${r}`);
 if (report.verdict === 'HELD') {
   console.log('\n  HELD is NOT a pass. It means the sample cannot answer the question yet.');
 }
+
+// ---------------------------------------------------------------------------
+// TRA-1727 — THE SECONDARY (cross-sectional) ESTIMAND.
+// ---------------------------------------------------------------------------
+line('=');
+console.log('SECONDARY — session-demeaned CROSS-SECTIONAL contrast (TRA-1727)');
+console.log('  Does PCR RANK names WITHIN a session? Readable at ~45 sessions, not ~90 —');
+console.log('  but it answers a strictly NARROWER question. Read the constraint below.\n');
+console.log(
+  '  H  carrier  read        sess  names/s |  rawCon  placebo  ADJ_CON | clustered 90% CI',
+);
+line('·');
+for (const c of secondary.cells) {
+  const star = c === secondary.primary ? '*' : ' ';
+  console.log(
+    `${star}${String(c.horizon).padStart(3)}  ${c.carrier.padEnd(7)} ${c.interpretation.padEnd(11)} ` +
+      `${String(c.sessions).padStart(4)} ${f(c.meanNamesPerSession, 1).padStart(7)} | ` +
+      `${f(c.rawContrastR).padStart(7)} ${f(c.placeboContrastR).padStart(8)} ${f(c.adjustedContrastR).padStart(7)} | ` +
+      `[${f(c.clustered.lo).padStart(7)}, ${f(c.clustered.hi).padStart(7)}]`,
+  );
+}
+if (secondary.guards) {
+  const g = secondary.guards;
+  console.log(`\n  GUARDS   trials searched (WHOLE study, both estimands): ${g.trials}`);
+  console.log(
+    `  DSR  ${g.dsrEvaluable ? `SR ${f(g.dsr.observedSharpe)} vs SR* ${f(g.dsr.sharpeStar)}  ${g.dsr.pass ? 'PASS' : 'FAIL'}` : 'NOT EVALUABLE -> HELD'}`,
+  );
+  console.log(
+    `  PBO  ${g.pboEvaluable ? `${f(g.pbo.pbo)} (threshold ${g.pbo.threshold})  ${g.pbo.pass ? 'PASS' : 'FAIL'}` : 'NOT EVALUABLE -> HELD'}`,
+  );
+}
+console.log(`\nSECONDARY VERDICT: ${secondary.verdict}`);
+for (const r of secondary.reasons) console.log(`  - ${r}`);
+
+// The constraint travels WITH the number, always — including on a FAIL or a HELD, so
+// nobody reaches for this table later without it.
+line('!');
+console.log('SCOPE OF A SECONDARY PASS:');
+for (const chunk of secondary.constraint.match(/.{1,92}(\s|$)/g) ?? []) {
+  console.log(`  ${chunk.trim()}`);
+}
+line('!');
 console.log();
 
+// The exit code tracks the PRIMARY. The secondary can never, on its own, green a
+// promotion — so it must never be able to green this process either.
 process.exit(report.verdict === 'PASS' ? 0 : 1);
