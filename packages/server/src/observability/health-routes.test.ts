@@ -48,6 +48,8 @@ import {
   recordEquityEntryPassGated,
   recordEquityCandidate,
   recordEquityEntryRejected,
+  recordEquitySymbolEvaluated,
+  recordEquitySymbolSkipped,
   __resetEquityEntryFunnelForTests,
   type EquityEntryFunnelView,
 } from '../equity-entry-funnel.js';
@@ -1624,6 +1626,28 @@ describe('GET /api/health/scaleout-ladder — TRA-1729 observe-pass readout', ()
 // literal-key grep over the source reads `0` even on a build that serves the key
 // (keys can arrive via a spread), so the only assertion worth anything is one that
 // invokes the registered handler and inspects what it actually emitted.
+interface FunnelResponse {
+  ok: boolean;
+  demo: EquityEntryFunnelView;
+  live: EquityEntryFunnelView;
+  intradayChurnersDisabled: string[];
+  symbolReadRule: string;
+}
+
+function funnelBody(): FunnelResponse {
+  const { app, routes } = fakeApp();
+  registerLiveHealthRoutes(app, {
+    requireAuth: ((_q: unknown, _s: unknown, n: () => void) => n()) as never,
+    userCtx: async () => ctx('admin', engineState()),
+    getSettings: () => settings(),
+    now: () => NOW,
+  });
+  const handlers = routes.get('/api/health/equity-entry-funnel')!;
+  const res = fakeRes();
+  handlers[0]!({}, res);
+  return res.body as FunnelResponse;
+}
+
 describe('GET /api/health/equity-entry-funnel (TRA-1768)', () => {
   beforeEach(() => {
     __resetEquityEntryFunnelForTests();
@@ -1632,25 +1656,6 @@ describe('GET /api/health/equity-entry-funnel (TRA-1768)', () => {
   afterEach(() => {
     __resetEquityEntryFunnelForTests();
   });
-
-  function funnelBody() {
-    const { app, routes } = fakeApp();
-    registerLiveHealthRoutes(app, {
-      requireAuth: ((_q: unknown, _s: unknown, n: () => void) => n()) as never,
-      userCtx: async () => ctx('admin', engineState()),
-      getSettings: () => settings(),
-      now: () => NOW,
-    });
-    const handlers = routes.get('/api/health/equity-entry-funnel')!;
-    const res = fakeRes();
-    handlers[0]!({}, res);
-    return res.body as {
-      ok: boolean;
-      demo: EquityEntryFunnelView;
-      live: EquityEntryFunnelView;
-      intradayChurnersDisabled: string[];
-    };
-  }
 
   it('serves demo and live SEPARATELY, three-valued, with no pass since boot', () => {
     const body = funnelBody();
@@ -1665,7 +1670,7 @@ describe('GET /api/health/equity-entry-funnel (TRA-1768)', () => {
   });
 
   it('THE ALARM: a pass that ran and generated nothing serves candidatesEvaluated 0 / no_candidates', () => {
-    beginEquityEntryPass('demo', NOW);
+    beginEquityEntryPass('demo', { symbolsConsidered: 21, at: NOW });
     const body = funnelBody();
 
     expect(body.demo.lastPass.candidatesEvaluated).toBe(0);
@@ -1687,7 +1692,7 @@ describe('GET /api/health/equity-entry-funnel (TRA-1768)', () => {
   });
 
   it('a candidate eaten by a guardrail serves the EATER by name', () => {
-    beginEquityEntryPass('demo', NOW);
+    beginEquityEntryPass('demo', { symbolsConsidered: 21, at: NOW });
     recordEquityCandidate('demo', 'deterministic');
     recordEquityEntryRejected('demo', 'churn_brake');
     const body = funnelBody();
@@ -1708,5 +1713,81 @@ describe('GET /api/health/equity-entry-funnel (TRA-1768)', () => {
       if (prior === undefined) delete process.env.EQUITY_SWING_MODE;
       else process.env.EQUITY_SWING_MODE = prior;
     }
+  });
+});
+
+// TRA-1793 — the SYMBOL layer, on the wire.
+//
+// The unit tests prove the counters are right in memory. These prove they SURVIVE THE
+// ROUTE — because the whole point of this ticket is that `symbolsWithData` was correct
+// in memory too, and reached nothing but a `log.warn`. A fact that does not reach the
+// PAYLOAD does not exist downstream. So: invoke the handler, read the served body, and
+// then round-trip it through JSON, because the reader on the other end is `curl`.
+describe('GET /api/health/equity-entry-funnel — symbol layer (TRA-1793)', () => {
+  beforeEach(() => {
+    __resetEquityEntryFunnelForTests();
+  });
+
+  afterEach(() => {
+    __resetEquityEntryFunnelForTests();
+  });
+
+  /** What QuantTrader actually reads: the body as it comes back off the wire. */
+  const overTheWire = (): FunnelResponse => JSON.parse(JSON.stringify(funnelBody())) as FunnelResponse;
+
+  it('serves symbolsConsidered / symbolsEvaluated / symbolsSkippedByReason — per-pass AND cumulative', () => {
+    beginEquityEntryPass('demo', { symbolsConsidered: 3, at: NOW });
+    recordEquitySymbolSkipped('demo', 'stale_feed');
+    recordEquitySymbolSkipped('demo', 'stale_feed');
+    recordEquitySymbolEvaluated('demo');
+
+    const body = overTheWire();
+
+    expect(body.demo.lastPass.symbolsConsidered).toBe(3);
+    expect(body.demo.lastPass.symbolsEvaluated).toBe(1);
+    expect(body.demo.lastPass.symbolsSkippedByReason).toEqual({ stale_feed: 2 });
+    expect(body.demo.cumulative.symbolsConsidered).toBe(3);
+    expect(body.demo.cumulative.symbolsEvaluated).toBe(1);
+    expect(body.demo.cumulative.symbolsSkippedByReason).toEqual({ stale_feed: 2 });
+    // …and the live book, which swept nothing, is NOT pooled with it.
+    expect(body.live.cumulative.symbolsEvaluated).toBeNull();
+  });
+
+  it('THE ALARM on the wire: an iterated pass where every symbol was stale serves symbolsEvaluated 0 next to candidatesEvaluated 0', () => {
+    beginEquityEntryPass('demo', { symbolsConsidered: 21, at: NOW });
+    for (let i = 0; i < 21; i++) recordEquitySymbolSkipped('demo', 'stale_feed');
+
+    const body = overTheWire();
+
+    // Identical to a dry Ichimoku by TRA-1768's fields alone…
+    expect(body.demo.funnelStatus).toBe('no_candidates');
+    expect(body.demo.lastPass.candidatesEvaluated).toBe(0);
+    // …and separated from it by exactly one number, which is now on the wire.
+    expect(body.demo.lastPass.symbolsEvaluated).toBe(0);
+    expect(body.demo.lastPass.symbolsSkippedByReason).toEqual({ stale_feed: 21 });
+    // The rule that tells the reader which of the two it is ships WITH the reading —
+    // a read rule that lives only in a ticket is not held by whoever curls the route.
+    expect(body.symbolReadRule).toContain('Read symbolsEvaluated BEFORE candidatesEvaluated');
+  });
+
+  it('the nulls survive JSON serialization as PRESENT KEYS — an absent key is not a null, it is a void', () => {
+    recordEquityEntryPassGated('demo', 'market_closed', NOW);
+
+    const raw = JSON.stringify(funnelBody());
+    const body = JSON.parse(raw) as FunnelResponse;
+
+    // `JSON.stringify` drops `undefined` silently. If any of these were ever produced as
+    // `undefined` rather than `null`, the key would VANISH from the body and a reader
+    // doing `body.demo.lastPass.symbolsEvaluated ?? 0` would book a false zero on a GATED
+    // pass — the exact bug, re-minted in the field built to kill it. So assert PRESENCE
+    // first, and value second.
+    for (const key of ['symbolsConsidered', 'symbolsEvaluated', 'symbolsSkippedByReason'] as const) {
+      expect(Object.hasOwn(body.demo.lastPass, key)).toBe(true);
+      expect(Object.hasOwn(body.demo.cumulative, key)).toBe(true);
+      expect(body.demo.lastPass[key]).toBeNull();
+      expect(body.demo.cumulative[key]).toBeNull();
+    }
+    expect(body.demo.funnelStatus).toBe('gated'); // …and it is a GATE, not a verdict
+    expect(raw).toContain('"symbolsEvaluated":null'); // literally, on the wire
   });
 });

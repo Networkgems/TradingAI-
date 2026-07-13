@@ -1523,6 +1523,11 @@ export function registerLiveHealthRoutes(app: Express, deps: LiveHealthDeps): vo
       // two intraday churners, so a dry `deterministic` bucket is Ichimoku alone being
       // quiet — not a broken scan.
       intradayChurnersDisabled: resolveEquitySwingModeEnabled(process.env) ? ['orb', 'bbFade_1h'] : [],
+      // TRA-1793 — the read rule ABOVE `candidatesEvaluated`. `no_candidates` is itself two
+      // states, and they emit the same byte without this: symbolsEvaluated: 0 on an iterated
+      // pass means no strategy was EVER RUN (a DATA problem — cold cache, dead feed, empty
+      // universe), so the strategy cannot be indicted. Read symbolsEvaluated FIRST.
+      symbolReadRule: 'Read symbolsEvaluated BEFORE candidatesEvaluated. symbolsEvaluated > 0 with candidatesEvaluated = 0 ⇒ strategies RAN and were dry (a STRATEGY verdict). symbolsEvaluated = 0 on an ITERATED pass ⇒ NO strategy ever ran — candidatesEvaluated: 0 is then a DATA verdict, not a strategy one, and symbolsSkippedByReason names the cause (insufficient_candles = cold candle cache, stale_feed = TRA-418 dead equity feed during RTH, off_swing_universe = TRA-952, EXPECTED to be large and benign under swing mode: the universe is 21 of N watchlist names). symbolsEvaluated is null — never 0 — on a GATED pass, for the same reason candidatesEvaluated is.',
       note: 'candidatesEvaluated is three-valued: null = no ITERATED pass since boot (says nothing about the signal side), 0 = a pass ran and generated NO candidates (THE ALARM — the strategy is dry, no guardrail can be blamed), >0 = ideas exist. If candidatesEvaluated > 0 and admitted = 0, rejectedByReason names the guardrail eating them. passGateBlockedReason is set when the pass FIRED but never iterated (market closed / halted / auto-trading off) — that is NOT a strategy verdict and candidatesEvaluated stays null. Counters are SINCE-BOOT and in-memory by design: DATA_DIR is ephemeral (TRA-1719), so a durable counter here would be pinned at 0 forever; this instrument needs n=1 and reads correctly on the FIRST tick after a deploy. There is deliberately NO min_holding_days bucket — that guardrail gates discretionary CLOSES, never entries, so the bucket could never increment.',
     });
   });

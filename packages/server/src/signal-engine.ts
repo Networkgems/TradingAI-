@@ -100,12 +100,17 @@ import { runScaleoutLadderObservePass } from './scaleout-ladder-ledger.js';
 // TRA-1768 — READ-ONLY equity entry funnel counters. Pure side-effecting counters:
 // every call below is a no-op on the entry decision, and deleting them all must not
 // change a single fill. See equity-entry-funnel.ts for the three-valued contract.
+// TRA-1793 — the SYMBOL layer of the same instrument: a `continue` inside an iterating
+// pass re-creates the false zero one level down (every symbol skipped ⇒ "we looked and
+// found nothing"), so the sweep counts what it skips and why.
 import {
   beginEquityEntryPass,
   recordEquityEntryPassGated,
   recordEquityCandidate,
   recordEquityEntryRejected,
   recordEquityEntryAdmitted,
+  recordEquitySymbolEvaluated,
+  recordEquitySymbolSkipped,
   type EquityEntryPassGateReason,
 } from './equity-entry-funnel.js';
 import { etDateString } from './scheduler.js';
@@ -2553,6 +2558,81 @@ export class SignalEngine {
     setTradierStocksFeedClient(creds.apiToken, creds.env, this.feedContextKey);
   }
 
+  /**
+   * TRA-1793 — the equity entry universe sweep: which symbols reach strategy evaluation,
+   * and why the rest do not.
+   *
+   * This is EXTRACTED, not re-implemented. The three `continue`s below are the same three
+   * that have always sat at the top of the deterministic entry loop; the loop that ships
+   * calls this method, and so does the test. (A test that re-implements the loop proves
+   * nothing about the loop that runs — TRA-1793 acceptance #2.)
+   *
+   * Why it exists: `beginEquityEntryPass` proves the pass ITERATED, which under the
+   * TRA-1768 read rule makes `candidatesEvaluated: 0` a TRUE zero — "the signal never
+   * fires, a STRATEGY problem". But if every symbol is skipped here, the pass iterates,
+   * runs no strategy at all, and stamps that same byte. That would be a DATA problem
+   * (cold cache / dead feed / empty universe) wearing a strategy verdict's clothes. The
+   * skip counts are what separate them, so they go in the PAYLOAD — the old
+   * `symbolsWithData` local reached nothing but a `log.warn`, and a fact that only
+   * reaches a log line does not exist downstream.
+   *
+   * READ-ONLY, like the rest of the funnel: every `record*` call is a counter side effect.
+   * Deleting them would not change which symbols are returned, and no guardrail here is
+   * loosened — the swing universe, the candle floor and the freshness gate all still skip
+   * exactly what they skipped before. Counting is the whole job.
+   */
+  private async sweepEquityEntryUniverse(activeSymbols: string[]): Promise<Array<{ sym: string; candles: Candle[] }>> {
+    // The pass is ITERATING. From here `candidatesEvaluated` is a real number and a
+    // `0` is a TRUE zero — we looked and the signal side was dry.
+    beginEquityEntryPass(this.mode, { symbolsConsidered: activeSymbols.length });
+    // TRA-418 — data-feed freshness gate. During market hours a working feed
+    // delivers fresh minute bars every tick; when the latest cached bar has
+    // aged past the staleness threshold the equity feed (Tradier → Yahoo →
+    // Twelve Data cascade) is down, so we must not evaluate strategies off
+    // the stale candle cache — a dead feed would otherwise fire an entry on
+    // hours-old bars. Outside market hours bars are *expected* to be stale
+    // (no new prints), so the gate only applies while the market is open.
+    const equityFeedGateActive = isStockMarketOpen();
+    const freshnessNow = Date.now();
+    // TRA-952 — in swing mode, only the curated liquid universe is tradable;
+    // skip strategy evaluation entirely on off-universe (thin small-cap) names
+    // so the intraday churners never even fire on them. Expected to be the LARGEST
+    // skip bucket under EQUITY_SWING_MODE (21 of N names) and benign: it is reported
+    // so the other two buckets are readable against a known baseline.
+    const swingMode = this.equitySwingModeEnabled();
+    const evaluable: Array<{ sym: string; candles: Candle[] }> = [];
+    for (let symIdx = 0; symIdx < activeSymbols.length; symIdx++) {
+      const sym = activeSymbols[symIdx]!;
+      // TRA-1082 — yield to the event loop every EQUITY_EVAL_YIELD_EVERY symbols so the
+      // HTTP health probe is serviced mid-sweep; the whole universe would otherwise run
+      // as one synchronous burst, which is exactly what starved Render's 5s health check.
+      if (symIdx > 0 && symIdx % EQUITY_EVAL_YIELD_EVERY === 0) await yieldToEventLoop();
+      const candles = this.candleCache.get(sym) ?? [];
+      if (candles.length < 15) {
+        recordEquitySymbolSkipped(this.mode, 'insufficient_candles');
+        continue;
+      }
+      if (swingMode && !isLiquidSwingSymbol(sym)) {
+        recordEquitySymbolSkipped(this.mode, 'off_swing_universe');
+        continue;
+      }
+      if (equityFeedGateActive) {
+        const verdict = evaluateFeedFreshness({ candles }, freshnessNow);
+        if (verdict.stale) {
+          log.warn('equity feed stale; skipping signal evaluation', { sym, reason: verdict.reason });
+          recordEquitySymbolSkipped(this.mode, 'stale_feed');
+          continue;
+        }
+      }
+      recordEquitySymbolEvaluated(this.mode);
+      evaluable.push({ sym, candles });
+    }
+    if (evaluable.length === 0 && activeSymbols.length > 0) {
+      log.warn('tick: no symbols had sufficient candle data (market closed or data unavailable)');
+    }
+    return evaluable;
+  }
+
   private async doTick(): Promise<void> {
     if (Date.now() - this.lastNewsRefresh > NEWS_REFRESH_MS) {
       const news = await fetchStocksNews(this.getActiveSymbols());
@@ -3106,43 +3186,21 @@ export class SignalEngine {
               : null;
     if (equityPassGate !== null) recordEquityEntryPassGated(this.mode, equityPassGate);
     if (equityPassGate === null) {
-      // The pass is ITERATING. From here `candidatesEvaluated` is a real number and a
-      // `0` is a TRUE zero — we looked and the signal side was dry.
-      beginEquityEntryPass(this.mode);
-      let symbolsWithData = 0;
-      // TRA-418 — data-feed freshness gate. During market hours a working feed
-      // delivers fresh minute bars every tick; when the latest cached bar has
-      // aged past the staleness threshold the equity feed (Tradier → Yahoo →
-      // Twelve Data cascade) is down, so we must not evaluate strategies off
-      // the stale candle cache — a dead feed would otherwise fire an entry on
-      // hours-old bars. Outside market hours bars are *expected* to be stale
-      // (no new prints), so the gate only applies while the market is open.
-      const equityFeedGateActive = isStockMarketOpen();
-      const freshnessNow = Date.now();
+      // TRA-1793 — the universe sweep OPENS the pass and counts every symbol it skips.
+      // It is the loop; nothing here re-implements it.
+      const evaluable = await this.sweepEquityEntryUniverse(activeSymbols);
       // TRA-952 — in swing mode, only the curated liquid universe is tradable;
-      // skip strategy evaluation entirely on off-universe (thin small-cap) names
-      // so the intraday churners never even fire on them.
+      // the sweep above has already dropped the off-universe names.
       const swingMode = this.equitySwingModeEnabled();
       // Run strategies and collect new signals
-      for (let symIdx = 0; symIdx < activeSymbols.length; symIdx++) {
-        const sym = activeSymbols[symIdx];
+      for (let symIdx = 0; symIdx < evaluable.length; symIdx++) {
+        const { sym, candles } = evaluable[symIdx]!;
         // TRA-1082 — yield to the event loop every EQUITY_EVAL_YIELD_EVERY symbols
         // so the HTTP health probe is serviced mid-tick. This pass only awaits
         // when a signal actually fires (routeEquitySignal below); in a flat
         // market the whole universe runs as one synchronous burst with no yield,
         // which is exactly what starved Render's 5s health check.
         if (symIdx > 0 && symIdx % EQUITY_EVAL_YIELD_EVERY === 0) await yieldToEventLoop();
-        const candles = this.candleCache.get(sym) ?? [];
-        if (candles.length < 15) continue;
-        if (swingMode && !isLiquidSwingSymbol(sym)) continue;
-        if (equityFeedGateActive) {
-          const verdict = evaluateFeedFreshness({ candles }, freshnessNow);
-          if (verdict.stale) {
-            log.warn('equity feed stale; skipping signal evaluation', { sym, reason: verdict.reason });
-            continue;
-          }
-        }
-        symbolsWithData++;
 
         // TRA-952 — swing cadence: disable the intraday churners (ORB
         // opening-range breakout and the 1h-bar BbFade) whose tight intraday
@@ -3171,9 +3229,6 @@ export class SignalEngine {
           // live OTOCO mirror vs paper open).
           await this.routeEquitySignal(signal, prices.get(signal.symbol), 'deterministic');
         }
-      }
-      if (symbolsWithData === 0 && activeSymbols.length > 0) {
-        log.warn('tick: no symbols had sufficient candle data (market closed or data unavailable)');
       }
       // TRA-954 — conviction-DCA scale-in pass. Hard no-op unless
       // CONVICTION_DCA.enabled (ships false; live promotion gated on the

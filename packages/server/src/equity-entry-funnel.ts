@@ -112,6 +112,39 @@ export type EquityEntryPassGateReason =
   | 'market_closed';
 
 /**
+ * TRA-1793 — why a symbol inside an ITERATING pass never reached strategy evaluation.
+ *
+ * The hole this closes: the pass gate above proves the loop iterated, but three
+ * per-symbol `continue`s (signal-engine.ts) can skip EVERY symbol before a single
+ * strategy runs. The pass then produces zero candidates and stamps a TRUE
+ * `candidatesEvaluated: 0` — which the TRA-1768 read rule says is "the signal never
+ * fires, a STRATEGY problem". It would not be. It would be a DATA problem, and
+ * Ichimoku would be indicted for a stale feed or a cold cache. This is the same false
+ * zero TRA-1768 killed at the pass gate, one layer down: a `continue` inside an
+ * iterating pass re-creates it per-symbol. `symbolsEvaluated` is the one number that
+ * separates them — and until now it was a local whose only consumer was a `log.warn`.
+ * A fact that reaches nothing but a log line does not exist downstream.
+ *
+ * `off_swing_universe` is EXPECTED to be large and benign under EQUITY_SWING_MODE (the
+ * universe is 21 of N watchlist names). It is here so the other two buckets are
+ * readable against a known baseline — not as an alarm.
+ */
+export type EquitySymbolSkipReason =
+  | 'insufficient_candles'   // cold candle cache (< 15 bars) — e.g. shortly after a reboot
+  | 'off_swing_universe'     // TRA-952 — off the curated 21-name liquid swing universe
+  | 'stale_feed';            // TRA-418 — the equity feed is dead during RTH
+
+/**
+ * NOTE (TRA-1793) — the status enum is DELIBERATELY unchanged. A pass that iterated but
+ * evaluated no symbol still reports `no_candidates`, because QuantTrader's read rule
+ * (TRA-1794) is pre-registered against these five values and moving the goalposts under
+ * a pre-registered rule is how a verdict gets laundered. The DATA-vs-STRATEGY split is
+ * carried by the new `symbolsEvaluated` field instead:
+ *
+ *   no_candidates + symbolsEvaluated > 0  ⇒ strategies ran and were DRY   (STRATEGY)
+ *   no_candidates + symbolsEvaluated = 0  ⇒ no strategy ever ran          (DATA)
+ *                                           — symbolsSkippedByReason names why.
+ *
  * `never_ran`     — no pass since boot. Says NOTHING about the book.
  * `gated`         — passes fired, but every one was held at the pass gate; the loop
  *                   never iterated. NOT a strategy verdict — see passGateBlockedReason.
@@ -144,11 +177,19 @@ interface ModeLedger {
   lastPassAdmitted: number | null;
   lastPassRejected: Counter<EquityEntryRejectReason> | null;
 
+  /** TRA-1793 — the symbol layer of the last ITERATED pass. `null` until one has run. */
+  lastPassSymbolsConsidered: number | null;
+  lastPassSymbolsEvaluated: number | null;
+  lastPassSymbolsSkipped: Counter<EquitySymbolSkipReason> | null;
+
   /** Cumulative since boot. */
   cumCandidates: number;
   cumAdmitted: number;
   cumRejected: Counter<EquityEntryRejectReason>;
   cumBySource: Counter<EquityEntrySource>;
+  cumSymbolsConsidered: number;
+  cumSymbolsEvaluated: number;
+  cumSymbolsSkipped: Counter<EquitySymbolSkipReason>;
 }
 
 function emptyLedger(): ModeLedger {
@@ -162,10 +203,16 @@ function emptyLedger(): ModeLedger {
     lastPassCandidates: null,
     lastPassAdmitted: null,
     lastPassRejected: null,
+    lastPassSymbolsConsidered: null,
+    lastPassSymbolsEvaluated: null,
+    lastPassSymbolsSkipped: null,
     cumCandidates: 0,
     cumAdmitted: 0,
     cumRejected: {},
     cumBySource: {},
+    cumSymbolsConsidered: 0,
+    cumSymbolsEvaluated: 0,
+    cumSymbolsSkipped: {},
   };
 }
 
@@ -186,7 +233,15 @@ const LEDGERS: Record<EquityEntryMode, ModeLedger> = {
  * why `funnelStatus` keys off the cumulative counters, not `lastPass`: an SMA-200
  * candidate admitted during a gated tick must not read as `never_ran`.
  */
-const OPEN_PASS: Record<EquityEntryMode, { candidates: number; admitted: number; rejected: Counter<EquityEntryRejectReason> } | null> = {
+interface OpenPass {
+  candidates: number;
+  admitted: number;
+  rejected: Counter<EquityEntryRejectReason>;
+  symbolsEvaluated: number;
+  symbolsSkipped: Counter<EquitySymbolSkipReason>;
+}
+
+const OPEN_PASS: Record<EquityEntryMode, OpenPass | null> = {
   demo: null,
   live: null,
 };
@@ -200,18 +255,34 @@ function bump<K extends string>(c: Counter<K>, k: K): void {
  * from here `candidatesEvaluated` is a real number and `0` is a TRUE zero — the pass
  * looked and found nothing.
  */
-export function beginEquityEntryPass(mode: EquityEntryMode, at: number = Date.now()): void {
+export function beginEquityEntryPass(
+  mode: EquityEntryMode,
+  // TRA-1793 — an options object, not positional args: the previous signature was
+  // `(mode, at)`, and adding `symbolsConsidered` positionally would let an unmigrated
+  // `beginEquityEntryPass('demo', NOW)` silently book a 1.7e12-symbol universe. A
+  // required named field makes every stale call site a COMPILE error instead.
+  opts: {
+    /** Universe size this pass iterated (`activeSymbols.length`). */
+    symbolsConsidered: number;
+    at?: number;
+  },
+): void {
   const led = LEDGERS[mode];
+  const at = opts.at ?? Date.now();
   led.passCount += 1;
   led.iteratedPassCount += 1;
   led.lastPassAt = at;
   led.lastPassGateBlockedReason = null;
-  OPEN_PASS[mode] = { candidates: 0, admitted: 0, rejected: {} };
+  OPEN_PASS[mode] = { candidates: 0, admitted: 0, rejected: {}, symbolsEvaluated: 0, symbolsSkipped: {} };
   // Seed the last-pass fields immediately, so a pass that iterates and finds nothing
   // still reports `candidatesEvaluated: 0` (not null) even if no hook fires after this.
   led.lastPassCandidates = 0;
   led.lastPassAdmitted = 0;
   led.lastPassRejected = {};
+  led.lastPassSymbolsConsidered = opts.symbolsConsidered;
+  led.lastPassSymbolsEvaluated = 0;
+  led.lastPassSymbolsSkipped = {};
+  led.cumSymbolsConsidered += opts.symbolsConsidered;
 }
 
 /**
@@ -233,6 +304,33 @@ export function recordEquityEntryPassGated(
   led.lastPassAt = at;
   led.lastPassGateBlockedReason = reason;
   OPEN_PASS[mode] = null;
+}
+
+/**
+ * TRA-1793 — a symbol inside an iterating pass REACHED strategy evaluation.
+ *
+ * This is the number that separates a dry signal from a dead feed. `0` on an iterated
+ * pass is THE ALARM: no strategy was ever run, so nothing about the strategy can be
+ * concluded. Only counted inside an open pass — a symbol cannot be evaluated by a pass
+ * that never iterated, and stamping one outside would mint the false zero's inverse.
+ */
+export function recordEquitySymbolEvaluated(mode: EquityEntryMode): void {
+  const led = LEDGERS[mode];
+  const pass = OPEN_PASS[mode];
+  if (!pass) return;
+  led.cumSymbolsEvaluated += 1;
+  pass.symbolsEvaluated += 1;
+  led.lastPassSymbolsEvaluated = pass.symbolsEvaluated;
+}
+
+/** TRA-1793 — a symbol was SKIPPED before strategy evaluation, and this is why. */
+export function recordEquitySymbolSkipped(mode: EquityEntryMode, reason: EquitySymbolSkipReason): void {
+  const led = LEDGERS[mode];
+  const pass = OPEN_PASS[mode];
+  if (!pass) return;
+  bump(led.cumSymbolsSkipped, reason);
+  bump(pass.symbolsSkipped, reason);
+  led.lastPassSymbolsSkipped = { ...pass.symbolsSkipped };
 }
 
 /** One equity entry candidate was evaluated (i.e. reached the entry chokepoint). */
@@ -298,6 +396,11 @@ export interface EquityEntryFunnelView {
     candidatesEvaluated: number | null;
     admitted: number | null;
     rejectedByReason: Counter<EquityEntryRejectReason> | null;
+    /** TRA-1793 — universe size the pass iterated. */
+    symbolsConsidered: number | null;
+    /** TRA-1793 — symbols that reached strategy evaluation. `0` on an iterated pass is THE ALARM. */
+    symbolsEvaluated: number | null;
+    symbolsSkippedByReason: Counter<EquitySymbolSkipReason> | null;
   };
   /** Since boot. `candidatesEvaluated: 0` after an iterated pass is THE ALARM. */
   cumulative: {
@@ -305,6 +408,9 @@ export interface EquityEntryFunnelView {
     admitted: number | null;
     rejectedByReason: Counter<EquityEntryRejectReason> | null;
     candidatesBySource: Counter<EquityEntrySource> | null;
+    symbolsConsidered: number | null;
+    symbolsEvaluated: number | null;
+    symbolsSkippedByReason: Counter<EquitySymbolSkipReason> | null;
   };
 }
 
@@ -314,6 +420,14 @@ function viewFor(mode: EquityEntryMode): EquityEntryFunnelView {
   // candidate side — not a zero. `0` here must only ever mean "we looked and the
   // signal side was dry", because that reading is what indicts the strategy.
   const looked = led.iteratedPassCount > 0 || led.cumCandidates > 0;
+  // TRA-1793 — the SYMBOL counters are three-valued off a STRICTER predicate: only the
+  // deterministic sweep iterates a universe. `openSma200Pullback` runs on its own daily
+  // cadence and can mint a cumulative candidate while the deterministic pass was GATED
+  // (`looked === true`, `iteratedPassCount === 0`). Reporting `symbolsEvaluated: 0` in
+  // that state would say "we swept the universe and every symbol was skipped" when no
+  // sweep ever happened — the exact false zero this ticket exists to kill, re-minted in
+  // the field built to kill it.
+  const swept = led.iteratedPassCount > 0;
   return {
     funnelStatus: statusFor(led),
     passCount: led.passCount,
@@ -326,12 +440,18 @@ function viewFor(mode: EquityEntryMode): EquityEntryFunnelView {
       candidatesEvaluated: led.lastPassCandidates,
       admitted: led.lastPassAdmitted,
       rejectedByReason: led.lastPassRejected,
+      symbolsConsidered: led.lastPassSymbolsConsidered,
+      symbolsEvaluated: led.lastPassSymbolsEvaluated,
+      symbolsSkippedByReason: led.lastPassSymbolsSkipped,
     },
     cumulative: {
       candidatesEvaluated: looked ? led.cumCandidates : null,
       admitted: looked ? led.cumAdmitted : null,
       rejectedByReason: looked ? led.cumRejected : null,
       candidatesBySource: looked ? led.cumBySource : null,
+      symbolsConsidered: swept ? led.cumSymbolsConsidered : null,
+      symbolsEvaluated: swept ? led.cumSymbolsEvaluated : null,
+      symbolsSkippedByReason: swept ? led.cumSymbolsSkipped : null,
     },
   };
 }
