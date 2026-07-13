@@ -191,4 +191,64 @@ describe('cost-aware-gate-ledger', () => {
     expect(rv?.deltaCeilingObserved).toBe(2);
     expect(today.retained.retentionDays).toBe(7);
   });
+
+  // TRA-1707 — `apply()` seeded `lastBarR` from whatever record CREATED the (day, structure)
+  // tally. A ceiling record carries `barR: 0` (it has no modeled bar, correctly), and its own
+  // branch then never writes the field again. So a day whose FIRST candidate on a structure
+  // breached the ceiling opened with `barR: 0.00` on a structure whose bar is live —
+  // a live bar and an absent bar reading identically, the same false-zero shape as the stale
+  // `.js`, the impossible gate, and the laundered breach.
+  //
+  // `mergeTally()` already guarded this for the `retained` fold; the DAY view did not.
+  it('a ceiling record that CREATES the tally must not publish a live bar as 0 (TRA-1707)', () => {
+    hydrateCostAwareGateFromDisk(dir, 1_000);
+    // The day's first OTM candidate breaches the ENFORCING ceiling. No cost-bar decision yet.
+    recordEntryDeltaCeilingReject('single_leg_otm', 0.62, DAY, 1_001);
+
+    const otm = summarizeCostAwareGate(DAY).byStructure.find((s) => s.structure === 'single_leg_otm');
+    expect(otm?.deltaCeilingRejected).toBe(1);
+    // NOT 0: the bar was never measured today. 0 is a number a reader would act on.
+    expect(otm?.barR).toBeNull();
+    // Same rule, one field up: the bar ruled on NOTHING, so there is no rate to report.
+    // 0 here would be indistinguishable from a gate refusing 100% of candidates (TRA-1677).
+    expect(otm?.admitRate).toBeNull();
+    expect(otm?.admitted).toBe(0);
+    expect(otm?.rejected).toBe(0);
+  });
+
+  it('the first cost-bar decision sets the bar, and a later ceiling record never regresses it', () => {
+    hydrateCostAwareGateFromDisk(dir, 1_000);
+    recordEntryDeltaCeilingReject('single_leg_otm', 0.62, DAY, 1_001); // creates the tally, no bar
+    recordCostAwareGateDecision('single_leg_otm', true, 1.4, 0.485, DAY, 1_002); // the real bar lands
+    recordEntryDeltaCeilingReject('single_leg_otm', 0.71, DAY, 1_003); // must NOT clobber it back to 0
+
+    const otm = summarizeCostAwareGate(DAY).byStructure.find((s) => s.structure === 'single_leg_otm');
+    expect(otm?.barR).toBeCloseTo(0.485, 4);
+    expect(otm?.admitRate).toBe(1);
+    expect(otm?.deltaCeilingRejected).toBe(2);
+
+    // And it survives the reboot that TRA-1703 was about — through the retained fold too.
+    clearCostAwareGateLedger();
+    hydrateCostAwareGateFromDisk(dir, 2_000);
+    const after = summarizeCostAwareGate(DAY);
+    expect(after.byStructure.find((s) => s.structure === 'single_leg_otm')?.barR).toBeCloseTo(0.485, 4);
+    expect(after.retained.byStructure.find((s) => s.structure === 'single_leg_otm')?.barR).toBeCloseTo(
+      0.485,
+      4,
+    );
+  });
+
+  // The `retained` fold keys on structure across days. A day with ONLY ceiling records
+  // contributes no bar and must not erase the bar a real cost-bar day established.
+  it('a bar-less ceiling-only day does not erase a previous day\'s measured bar in the retained roll', () => {
+    hydrateCostAwareGateFromDisk(dir, 1_000);
+    recordCostAwareGateDecision('single_leg_otm', true, 1.4, 0.485, '2026-07-13', 1_001);
+    recordEntryDeltaCeilingReject('single_leg_otm', 0.7, '2026-07-14', 1_002); // ceiling-only day
+
+    const s = summarizeCostAwareGate('2026-07-14');
+    // The DAY view honestly reports "not measured today" — not 0.
+    expect(s.byStructure.find((x) => x.structure === 'single_leg_otm')?.barR).toBeNull();
+    // The retained roll still carries the last REAL bar.
+    expect(s.retained.byStructure.find((x) => x.structure === 'single_leg_otm')?.barR).toBeCloseTo(0.485, 4);
+  });
 });

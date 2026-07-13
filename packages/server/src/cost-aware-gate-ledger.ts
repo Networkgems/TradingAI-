@@ -83,8 +83,12 @@ interface StructureTally {
   rejected: number;
   admittedGrossRSum: number;
   rejectedGrossRSum: number;
-  /** Most recent effective bar seen for this structure (the config is env-tunable). */
-  lastBarR: number;
+  /**
+   * Most recent effective bar seen for this structure (the config is env-tunable).
+   * `null` until a COST-BAR decision lands: a ceiling record carries `barR: 0` and has no
+   * bar to report, so seeding from it would publish a live bar as 0.00 (TRA-1707).
+   */
+  lastBarR: number | null;
   /** TRA-1670 — candidates the entry-delta CEILING refused (disjoint from `rejected`). */
   deltaCeilingRejected: number;
   /** Sum of the |delta|s the ceiling refused, for the mean in the health view. */
@@ -134,7 +138,11 @@ function apply(rec: CostGateDecisionRecord): void {
       rejected: 0,
       admittedGrossRSum: 0,
       rejectedGrossRSum: 0,
-      lastBarR: rec.barR,
+      // NOT `rec.barR` — the record that CREATES this tally may be a ceiling record, which
+      // carries `barR: 0` and never writes the field again on its own branch. Seeding from it
+      // published `barR: 0.00` on a structure whose bar is live, and an absent bar and a live
+      // bar then read identically (TRA-1707). Only the cost-bar branches below may set it.
+      lastBarR: null,
       deltaCeilingRejected: 0,
       deltaCeilingAbsDeltaSum: 0,
       deltaCeilingObserved: 0,
@@ -365,14 +373,28 @@ export interface CostAwareGateStructureSummary {
   structure: string;
   admitted: number;
   rejected: number;
-  /** admitted / (admitted + rejected), 0 when no decisions. */
-  admitRate: number;
+  /**
+   * admitted / (admitted + rejected), **`null` when the bar ruled on nothing**.
+   *
+   * NOT 0. A 0% admit rate is the alarm condition — it is what an algebraically impossible
+   * gate looks like (TRA-1677, invisible for a week). If "no candidates" also rendered as 0,
+   * the alarm state and the quiet state would be the same number. Same rule the sibling
+   * entry-greeks ledger already follows (TRA-1682: `admitRate: null ≠ 0`).
+   */
+  admitRate: number | null;
   /** Mean modeled gross R of the candidates that CLEARED the bar (null when none). */
   avgAdmittedGrossR: number | null;
   /** Mean modeled gross R of the candidates the bar REFUSED (null when none). */
   avgRejectedGrossR: number | null;
-  /** Effective bar last applied to this structure. */
-  barR: number;
+  /**
+   * Effective bar last applied to this structure — **`null` until a cost-bar decision lands**.
+   *
+   * A ceiling record carries `barR: 0`, so a day that opens with a ceiling breach used to
+   * publish `barR: 0.00` on a structure whose bar was live: a live bar and an absent bar read
+   * identically (TRA-1707). `null` is the honest value for "not measured"; 0 is a number a
+   * reader will act on.
+   */
+  barR: number | null;
   /**
    * TRA-1670 — candidates the entry-delta CEILING refused on this structure. Disjoint
    * from `admitted`/`rejected` (which are the cost bar's): > 0 is the direct evidence
@@ -459,9 +481,11 @@ function mergeTally(into: StructureTally, t: StructureTally): void {
   into.deltaCeilingAbsDeltaSum += t.deltaCeilingAbsDeltaSum;
   into.deltaCeilingObserved += t.deltaCeilingObserved;
   into.deltaCeilingObservedAbsDeltaSum += t.deltaCeilingObservedAbsDeltaSum;
-  // `lastBarR` is a LAST, not a sum — a ceiling record carries barR 0 and must not
-  // overwrite a real bar. Keep the most recent non-zero one we have seen.
-  if (t.lastBarR !== 0) into.lastBarR = t.lastBarR;
+  // `lastBarR` is a LAST, not a sum — a day with no cost-bar decision has no bar to
+  // contribute and must not overwrite a real one. The sentinel is `null`, not 0: a day
+  // whose only records were ceiling breaches now carries `null` (TRA-1707), so a genuine
+  // bar of 0 is no longer indistinguishable from "never measured".
+  if (t.lastBarR !== null) into.lastBarR = t.lastBarR;
 }
 
 /** Fold a structure->tally map into the per-structure health rows, busiest first. */
@@ -487,10 +511,10 @@ function foldStructures(acc: Map<string, StructureTally>): {
       structure,
       admitted: t.admitted,
       rejected: t.rejected,
-      admitRate: decisions > 0 ? round(t.admitted / decisions) : 0,
+      admitRate: decisions > 0 ? round(t.admitted / decisions) : null,
       avgAdmittedGrossR: t.admitted > 0 ? round(t.admittedGrossRSum / t.admitted) : null,
       avgRejectedGrossR: t.rejected > 0 ? round(t.rejectedGrossRSum / t.rejected) : null,
-      barR: round(t.lastBarR),
+      barR: t.lastBarR === null ? null : round(t.lastBarR),
       deltaCeilingRejected: t.deltaCeilingRejected,
       avgDeltaCeilingAbsDelta:
         t.deltaCeilingRejected > 0 ? round(t.deltaCeilingAbsDeltaSum / t.deltaCeilingRejected) : null,
@@ -521,7 +545,7 @@ function summarizeRetained(): CostAwareGateRetainedSummary {
           rejected: 0,
           admittedGrossRSum: 0,
           rejectedGrossRSum: 0,
-          lastBarR: 0,
+          lastBarR: null,
           deltaCeilingRejected: 0,
           deltaCeilingAbsDeltaSum: 0,
           deltaCeilingObserved: 0,
