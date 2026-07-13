@@ -1,6 +1,6 @@
 // TRA-1602 (TRA-1600C) — durable admit/reject telemetry for the cost-aware fire bar.
 import { describe, it, expect, beforeEach, afterEach } from 'vitest';
-import { mkdtempSync, rmSync, readFileSync, writeFileSync } from 'fs';
+import { mkdirSync, mkdtempSync, rmSync, readFileSync, writeFileSync } from 'fs';
 import { tmpdir } from 'os';
 import { join } from 'path';
 import {
@@ -250,5 +250,84 @@ describe('cost-aware-gate-ledger', () => {
     expect(s.byStructure.find((x) => x.structure === 'single_leg_otm')?.barR).toBeNull();
     // The retained roll still carries the last REAL bar.
     expect(s.retained.byStructure.find((x) => x.structure === 'single_leg_otm')?.barR).toBeCloseTo(0.485, 4);
+  });
+
+  // ── TRA-1681: durability provenance ───────────────────────────────────────────
+  //
+  // `retained.etDays[]` was being read as a DATA_DIR proof (TRA-1690 assertion 6): empty
+  // ⇒ fail-open, non-empty ⇒ a durable floor exists. The first half holds. The second is
+  // FALSE, and these tests are here to keep it dead: `byDay` is fed by the live pass, so
+  // `etDays` populates from in-memory decisions whether or not a byte ever reached disk.
+  describe('durability (TRA-1681)', () => {
+    const realDataDir = process.env.DATA_DIR;
+    afterEach(() => {
+      if (realDataDir === undefined) delete process.env.DATA_DIR;
+      else process.env.DATA_DIR = realDataDir;
+    });
+
+    it('THE FALSE-PASS: a memory-only ledger still publishes a full etDays[] — only `durability` tells you nothing is on disk', () => {
+      // No hydrate ⇒ dataDir stays null ⇒ applyAndAppend early-returns before the write.
+      recordCostAwareGateDecision('single_leg_rv', true, 1.2, 0.4, DAY, 1_001);
+      recordEntryDeltaCeilingObserved('single_leg_rv', 0.72, DAY, 1_002);
+
+      const s = summarizeCostAwareGate(DAY);
+      // The instrument that was being trusted reads exactly like a healthy ledger:
+      expect(s.retained.etDays).toEqual([DAY]);
+      expect(s.retained.deltaCeilingObservedTotal).toBe(1);
+      expect(s.decisionsRecorded).toBe(2);
+      // ...while NOTHING is durable. This is the field that separates the two states.
+      expect(s.durability.dataDir).toBeNull();
+      expect(s.durability.ephemeral).toBe(true);
+      expect(s.durability.hydratedRecords).toBe(0);
+    });
+
+    it('an EPHEMERAL DATA_DIR (env unset ⇒ in-bundle fallback) writes and reads back cleanly, and is still flagged', () => {
+      // The prod shape: the fallback path is real and writable, so every IO check PASSES.
+      // mkdir succeeds, append succeeds, hydrate succeeds. Only the PATH gives it away.
+      delete process.env.DATA_DIR;
+      hydrateCostAwareGateFromDisk(dir, 1_000);
+      recordCostAwareGateDecision('single_leg_rv', true, 1.2, 0.4, DAY, 1_001);
+
+      const s = summarizeCostAwareGate(DAY);
+      expect(readFileSync(costAwareGateLogPath(dir), 'utf8')).toContain('single_leg_rv'); // the write WORKED
+      expect(s.retained.etDays).toEqual([DAY]); // and the counters look perfect
+      expect(s.durability.ephemeral).toBe(true); // ...on a disk that dies at the redeploy
+      expect(s.durability.appendErrors).toBe(0); // no error was ever raised. There is none to raise.
+    });
+
+    it('a DURABLE DATA_DIR is not flagged, and a reboot proves the floor via hydratedRecords', () => {
+      process.env.DATA_DIR = dir;
+      hydrateCostAwareGateFromDisk(dir, 1_000);
+      recordCostAwareGateDecision('single_leg_rv', true, 1.2, 0.4, DAY, 1_001);
+      recordEntryDeltaCeilingReject('single_leg_rv', 0.9, DAY, 1_002);
+      expect(summarizeCostAwareGate(DAY).durability).toMatchObject({
+        ephemeral: false,
+        hydratedRecords: 0, // first boot: a clean floor is legitimately empty...
+      });
+
+      // ...so the floor is only PROVEN by surviving a restart. Reboot against the same dir:
+      clearCostAwareGateLedger();
+      hydrateCostAwareGateFromDisk(dir, 2_000);
+
+      const s = summarizeCostAwareGate(DAY);
+      expect(s.durability).toMatchObject({ dataDir: dir, ephemeral: false, hydratedRecords: 2, hydratedDays: 1 });
+      expect(s.retained.deltaCeilingRejectedTotal).toBe(1); // the tripwire survived the reboot
+    });
+
+    it('a swallowed append is COUNTED — the tally shows a row that never reached disk', () => {
+      process.env.DATA_DIR = dir;
+      hydrateCostAwareGateFromDisk(dir, 1_000);
+      // Make the append throw (EISDIR) without breaking the trade pass: a directory where
+      // the log file belongs. mkdirSync(recursive) on the PARENT still succeeds.
+      rmSync(costAwareGateLogPath(dir), { force: true });
+      mkdirSync(costAwareGateLogPath(dir)); // exact path, not a file anymore
+
+      expect(() => recordCostAwareGateDecision('single_leg_rv', true, 1.2, 0.4, DAY, 1_001)).not.toThrow();
+
+      const s = summarizeCostAwareGate(DAY);
+      expect(s.retained.etDays).toEqual([DAY]); // the counter moved...
+      expect(s.durability.appendErrors).toBe(1); // ...and the row is NOT on disk. Loudly.
+      expect(s.durability.lastAppendError).toBeTruthy();
+    });
   });
 });

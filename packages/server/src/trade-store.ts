@@ -5,6 +5,7 @@ import { join, dirname } from 'path';
 import { fileURLToPath } from 'url';
 import type { AccountMode, Position, TradeSignal, OptionPosition, SignalType, TradierEnv } from '@trading-app/shared';
 import type { DailySignalRecord } from './reports/eod-report.js';
+import { isEphemeralDataDir } from './data-dir.js';
 import { logger } from './observability/index.js';
 
 const log = logger.child({ module: 'trade-store' });
@@ -384,10 +385,10 @@ export async function rotateBackups(): Promise<void> {
  * bundle). On Render, DATA_DIR should point to the mounted persistent disk.
  */
 export async function checkDataDirHealth(): Promise<void> {
-  const isEphemeral =
-    !process.env.DATA_DIR ||
-    DATA_DIR.includes('node_modules') ||
-    DATA_DIR.includes(`${'packages'}${process.platform === 'win32' ? '\\' : '/'}server`);
+  // TRA-1681 — shared with the durable ledgers, which now PUBLISH this verdict rather
+  // than only logging it. Two copies of the predicate would drift, and the copy that
+  // drifts is the one a grader is trusting.
+  const isEphemeral = isEphemeralDataDir(DATA_DIR);
 
   log.info('DATA_DIR resolved', { dataDir: DATA_DIR });
   if (isEphemeral) {

@@ -30,6 +30,7 @@
 
 import { appendFileSync, mkdirSync, readFileSync, writeFileSync } from 'fs';
 import { dirname, join } from 'path';
+import { isEphemeralDataDir } from './data-dir.js';
 import { logger } from './observability/index.js';
 
 const log = logger.child({ module: 'cost-aware-gate-ledger' });
@@ -111,6 +112,14 @@ const byDay = new Map<string, Map<string, StructureTally>>();
 /** Total decisions seen (live + hydrated) across retained days. */
 let decisionsTotal = 0;
 let lastDecisionAt: number | null = null;
+// TRA-1681 — durability provenance. `byDay` is fed by BOTH the boot hydrate and the
+// live pass, and once folded the two are indistinguishable. These say which.
+/** Records/days recovered FROM DISK at boot (0 after a reboot on an ephemeral mount). */
+let hydratedRecords = 0;
+let hydratedDays = 0;
+/** Appends that threw and were swallowed. > 0 ⇒ rows the counters show are NOT on disk. */
+let appendErrors = 0;
+let lastAppendError: string | null = null;
 
 export function costAwareGateLogPath(dir: string): string {
   return join(dir, COST_AWARE_GATE_LOG_FILENAME);
@@ -122,6 +131,10 @@ export function clearCostAwareGateLedger(): void {
   byDay.clear();
   decisionsTotal = 0;
   lastDecisionAt = null;
+  hydratedRecords = 0;
+  hydratedDays = 0;
+  appendErrors = 0;
+  lastAppendError = null;
 }
 
 /** Apply one decision to the in-memory tallies (shared by record + hydrate). */
@@ -262,6 +275,12 @@ export function recordEntryDeltaCeilingObserved(
 }
 
 function applyAndAppend(rec: CostGateDecisionRecord): void {
+  // NOTE the ordering, and that it is deliberate: the in-memory tally updates FIRST and
+  // UNCONDITIONALLY, then the disk write is attempted best-effort. That keeps accounting
+  // from ever breaking a trade pass — but it also means the counters this module publishes
+  // are NOT evidence that anything reached disk. A memory-only ledger (`dataDir == null`)
+  // and an append that threw both leave every count looking exactly as healthy as a clean
+  // durable write. `durability` below is the field that tells them apart (TRA-1681).
   apply(rec);
   if (dataDir == null) return;
   const path = costAwareGateLogPath(dataDir);
@@ -273,9 +292,11 @@ function applyAndAppend(rec: CostGateDecisionRecord): void {
   try {
     appendFileSync(path, JSON.stringify(rec) + '\n', 'utf8');
   } catch (err) {
-    log.warn('cost-aware-gate append failed', {
-      reason: err instanceof Error ? err.message : String(err),
-    });
+    // Swallowed so the trade pass survives — but COUNTED, so the swallow is not silent.
+    // An uncounted swallow is how a lost row reads identically to a written one.
+    appendErrors += 1;
+    lastAppendError = err instanceof Error ? err.message : String(err);
+    log.warn('cost-aware-gate append failed', { reason: lastAppendError });
   }
 }
 
@@ -364,6 +385,11 @@ export function hydrateCostAwareGateFromDisk(dir: string, now: number = Date.now
     }
   }
 
+  // TRA-1681 — freeze what came OFF DISK, before the live pass starts folding its own
+  // decisions into the same `byDay`. After the first live record the two are one map and
+  // no consumer can tell "recovered a week of history" from "this uptime, nothing under me".
+  hydratedRecords = kept.length;
+  hydratedDays = byDay.size;
   return { days: byDay.size, records: kept.length };
 }
 
@@ -444,6 +470,46 @@ export interface CostAwareGateRetainedSummary {
   deltaCeilingObservedTotal: number;
 }
 
+/**
+ * TRA-1681 — is anything this module reports actually ON DISK?
+ *
+ * Every other field in this payload is folded out of `byDay`, which is fed by the boot
+ * hydrate AND by the live pass, and the fold cannot tell them apart. So on a box whose
+ * DATA_DIR is ephemeral, the ledger still hydrates (from a file it wrote this uptime),
+ * still appends (successfully — the in-bundle fallback path is perfectly writable), and
+ * still publishes a full `retained.etDays[]`. **It reads exactly like a healthy durable
+ * ledger, right up until the redeploy that erases it.** No IO error is ever raised, so
+ * there is nothing for a try/catch to catch.
+ *
+ * That matters because `retained.etDays[]` non-empty is being used as a DATA_DIR proof
+ * (TRA-1690 assertion 6). It is not one: it is non-empty from this uptime's own in-memory
+ * decisions whether or not a durable byte was ever written. These fields are the proof.
+ *
+ * Read `ephemeral === false` FIRST. It is a property of the PATH, so it is true on the
+ * very first boot, before any row exists — unlike `hydratedRecords`, which cannot
+ * distinguish a fresh persistent disk from a wiped ephemeral one.
+ */
+export interface CostAwareGateDurability {
+  /** Resolved append target. `null` = memory-only: no boot hydrate ran, NOTHING is durable. */
+  dataDir: string | null;
+  /**
+   * TRUE ⇒ every count in this payload dies on the next redeploy. A hard VOID for any
+   * multi-session window: there is no durable floor under the numbers.
+   */
+  ephemeral: boolean;
+  /** Records recovered FROM DISK at boot. Distinguishes a real floor from this-uptime-only. */
+  hydratedRecords: number;
+  /** Distinct ET days recovered FROM DISK at boot. */
+  hydratedDays: number;
+  /**
+   * Appends that threw and were SWALLOWED (the write is best-effort so accounting can
+   * never break a trade pass). > 0 ⇒ the counters above overstate what is on disk.
+   */
+  appendErrors: number;
+  /** Message from the most recent swallowed append (null when none). */
+  lastAppendError: string | null;
+}
+
 export interface CostAwareGateSummary {
   /** Total decisions recorded (live + hydrated, across retained days). */
   decisionsRecorded: number;
@@ -462,6 +528,11 @@ export interface CostAwareGateSummary {
    * ceiling, the day view for the cost bar.
    */
   retained: CostAwareGateRetainedSummary;
+  /**
+   * TRA-1681 — whether ANY of the above survives a reboot. Check this BEFORE reading a
+   * count off a multi-session window; see {@link CostAwareGateDurability}.
+   */
+  durability: CostAwareGateDurability;
   /** ms epoch of the last recorded decision (null if none yet). */
   lastDecisionAt: number | null;
 }
@@ -579,6 +650,14 @@ export function summarizeCostAwareGate(etDay: string): CostAwareGateSummary {
     decisionsRecorded: decisionsTotal,
     ...foldStructures(day ?? new Map()),
     retained: summarizeRetained(),
+    durability: {
+      dataDir,
+      ephemeral: isEphemeralDataDir(dataDir),
+      hydratedRecords,
+      hydratedDays,
+      appendErrors,
+      lastAppendError,
+    },
     lastDecisionAt,
   };
 }
