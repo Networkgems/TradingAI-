@@ -66,7 +66,7 @@ import {
 } from '../churn-loss-brake-flag.js';
 import { isScaleoutLadderEnabled } from '../scaleout-ladder-flag.js';
 import { summarizeScaleoutLadder } from '../scaleout-ladder-ledger.js';
-import { isCorrelatedExposureCapEnabled, CORRELATED_EXPOSURE_CAP_FLAG, isTakeProfitEarlyEnabled, TAKE_PROFIT_EARLY_FLAG, isEntryGreeksGateEnabled, ENTRY_GREEKS_GATE_FLAG, isEntryDeltaCeilingEnabled, resolveEntryDeltaCeiling, resolveEntryDeltaCeilingStructures, OPTION_ENTRY_DELTA_CEILING_FLAG } from '../exit-risk-rules-flag.js';
+import { isCorrelatedExposureCapEnabled, CORRELATED_EXPOSURE_CAP_FLAG, isTakeProfitEarlyEnabled, TAKE_PROFIT_EARLY_FLAG, isEntryGreeksGateEnabled, ENTRY_GREEKS_GATE_FLAG, isEntryDeltaCeilingEnabled, resolveEntryDeltaCeiling, resolveEntryDeltaCeilingStructures, resolveEntryDeltaCeilingMap, resolveEntryDeltaCeilingObserveStructures, OPTION_ENTRY_DELTA_CEILING_FLAG } from '../exit-risk-rules-flag.js';
 import { summarizeCorrelatedExposureBindings } from '../correlated-exposure-ledger.js';
 import { CONVICTION_DCA, CORRELATED_EXPOSURE_CAP_PCT, CORRELATED_EXPOSURE_MIN_TRADE_RISK_PCT, TAKE_PROFIT_EARLY_CAPTURE_PCT, ENTRY_SHORT_DELTA_MIN, ENTRY_SHORT_DELTA_MAX, ENTRY_DELTA_THETA_RATIO_FLOOR, resolveEquitySwingModeEnabled, resolveEquitySwingUniverse, EQUITY_SWING_UNIVERSE, EQUITY_SWING_GUARDRAIL } from '@trading-app/shared';
 import { resolveDemoFlagEnv } from '../demo-flags.js';
@@ -1262,13 +1262,34 @@ export function registerLiveHealthRoutes(app: Express, deps: LiveHealthDeps): vo
         const ceilingArmed = isEntryDeltaCeilingEnabled(env);
         const ceilingStructures = resolveEntryDeltaCeilingStructures(env);
         const ceiling = resolveEntryDeltaCeiling(env);
+        // TRA-1689 — report the EFFECTIVE ceiling PER STRUCTURE and which of them merely
+        // OBSERVE. `ceiling` below is only the global default a bare structure inherits;
+        // publishing that alone is how an impossible gate hides (TRA-1682: the probe
+        // advertised the library default while the engine passed something else). A
+        // reader must be able to see, per sleeve, the number that actually applies and
+        // whether a breach of it stops a trade or merely counts one.
+        const effective = resolveEntryDeltaCeilingMap(env);
+        const observeOnly = resolveEntryDeltaCeilingObserveStructures(env)
+          .filter((s) => effective.has(s));
+        const perStructure = [...effective.entries()].map(([structure, value]) => ({
+          structure,
+          ceiling: value,
+          mode: observeOnly.includes(structure) ? ('observe' as const) : ('enforce' as const),
+        }));
+        const enforcing = perStructure.filter((s) => s.mode === 'enforce');
+        const describe = (s: { structure: string; ceiling: number }): string =>
+          `${s.structure} |Δ|>${s.ceiling.toFixed(2)}`;
         return {
           flag: OPTION_ENTRY_DELTA_CEILING_FLAG,
           armed: ceilingArmed,
+          /** The GLOBAL default a bare structure inherits — NOT necessarily what any sleeve uses. */
           ceiling,
           structures: ceilingStructures,
+          /** The effective ceiling + enforce/observe mode per structure. This is the truth. */
+          perStructure,
+          observeOnly,
           note: ceilingArmed
-            ? `ARMED (demo-only): rejects a demo open on ${ceilingStructures.join(' / ')} with |Δ| > ${ceiling.toFixed(2)}. deltaCeilingRejected>0 (per structure below) is the direct evidence the ceiling is biting — it is tallied separately from the cost bar's admitted/rejected. Measured on OTM only (n=14 tail, NET −1.813R); forward-validation + invalidation live on TRA-1647.`
+            ? `ARMED (demo-only). ENFORCING (rejects the open): ${enforcing.length > 0 ? enforcing.map(describe).join(', ') : 'none'}. OBSERVE-ONLY (counts the breach, ADMITS the open — TRA-1689): ${observeOnly.length > 0 ? perStructure.filter((s) => s.mode === 'observe').map(describe).join(', ') : 'none'}. deltaCeilingRejected>0 per structure below is the evidence an ENFORCING ceiling is biting; deltaCeilingObserved>0 is a tail being MEASURED while it still trades. The two are never summed. Ceilings are measured PER SLEEVE (OTM 0.55: n=14 tail, NET −1.813R) — do not extrapolate one sleeve's number onto another; give it its own via the name:value form.`
             : `DISARMED: set ${OPTION_ENTRY_DELTA_CEILING_FLAG}=1 (DATA_DIR/demo-flags.json) to arm on the demo book.`,
         };
       })(),

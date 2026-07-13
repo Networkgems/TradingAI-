@@ -128,6 +128,14 @@ export const DEMO_FLAG_ALLOWLIST = [
   'OPTION_ENTRY_DELTA_CEILING_ENABLED',
   'OPTION_ENTRY_DELTA_CEILING',
   'OPTION_ENTRY_DELTA_CEILING_STRUCTURES',
+  // TRA-1689 — the structures the ceiling OBSERVES rather than ENFORCES (a breach is
+  // counted, then admitted). Same containment as the three above: demo-only, consulted
+  // only on the `mode === 'demo'` open branches. Allowlisted because the whole value of
+  // observe-only is that it can be turned on to MEASURE a tail and off again without a
+  // redeploy — a lever that needs a deploy to pull is not a lever during a deploy pin,
+  // which is exactly the trap TRA-1677 walked into (the impossible gate and its disarm
+  // switch were locked behind the same door).
+  'OPTION_ENTRY_DELTA_CEILING_OBSERVE_STRUCTURES',
   // TRA-1408 (parent TRA-1406 "less noise, more quality") — the per-name churn +
   // same-day-loss brake. STANDALONE flag (not under the EXIT_RISK_RULES master),
   // consulted ONLY on the demo open chokepoints + demo conviction-DCA add loops,

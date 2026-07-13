@@ -174,9 +174,34 @@ export const OPTION_ENTRY_DELTA_CEILING_FLAG = 'OPTION_ENTRY_DELTA_CEILING_ENABL
 /** Numeric override of the ceiling (default 0.55, the QuantTrader measurement). */
 export const OPTION_ENTRY_DELTA_CEILING_VALUE = 'OPTION_ENTRY_DELTA_CEILING';
 export const OPTION_ENTRY_DELTA_CEILING_DEFAULT = 0.55;
-/** CSV override of the structures the ceiling applies to (default `single_leg_otm`). */
+/**
+ * CSV override of the structures the ceiling applies to (default `single_leg_otm`).
+ *
+ * TRA-1689 — each entry is `name` or `name:ceiling`. A BARE name inherits the global
+ * OPTION_ENTRY_DELTA_CEILING; `name:value` gives that structure ITS OWN ceiling.
+ *
+ *   single_leg_otm,single_leg_rv:0.65   → OTM cut at the global 0.55, RV at 0.65
+ *
+ * The per-structure form exists because the number is MEASURED PER SLEEVE and the
+ * global scalar silently coupled them: arming RV at 0.65 the only way the old config
+ * allowed (add it to the list, set the global to 0.65) also dragged OTM's ceiling from
+ * 0.55 to 0.65 — re-admitting the exact n=14 / NET −1.813R tail TRA-1670 shipped to
+ * cut. One demo-flags edit, no redeploy, no error, and the health endpoint still read
+ * ARMED. A band measured on one sleeve must not be reachable from another sleeve's knob.
+ */
 export const OPTION_ENTRY_DELTA_CEILING_STRUCTURES_VALUE = 'OPTION_ENTRY_DELTA_CEILING_STRUCTURES';
 export const OPTION_ENTRY_DELTA_CEILING_STRUCTURES_DEFAULT: readonly string[] = ['single_leg_otm'];
+/**
+ * TRA-1689 — CSV of structures the ceiling OBSERVES rather than ENFORCES. A breach on
+ * an observe-only structure is COUNTED (its own ledger axis) and then ADMITTED: the
+ * open proceeds exactly as if the ceiling were off.
+ *
+ * This is the only way to answer "is the tail above X actually a loser on THIS sleeve?"
+ * without betting the sleeve on the answer. Arming a ceiling to find out costs you every
+ * trade above it; observing costs nothing and yields the same n. Empty by default —
+ * every listed structure ENFORCES unless it appears here.
+ */
+export const OPTION_ENTRY_DELTA_CEILING_OBSERVE_VALUE = 'OPTION_ENTRY_DELTA_CEILING_OBSERVE_STRUCTURES';
 
 /** True iff the entry-delta ceiling is enabled (standalone; accepts 1/true/yes/on). */
 export function isEntryDeltaCeilingEnabled(env: NodeJS.ProcessEnv = process.env): boolean {
@@ -198,41 +223,119 @@ export function resolveEntryDeltaCeiling(env: NodeJS.ProcessEnv = process.env): 
 }
 
 /**
- * Resolve the structures the ceiling applies to. An empty / all-blank override
- * falls back to the default (OTM only) — an operator cannot accidentally disarm
- * the cut by blanking the list; disarming is what the flag is for.
+ * TRA-1689 — resolve the EFFECTIVE ceiling map: structure -> its own |delta| ceiling.
+ *
+ * Each CSV entry is `name` (inherits the global OPTION_ENTRY_DELTA_CEILING) or
+ * `name:value` (that structure's own number). An out-of-range or malformed `:value`
+ * falls back to the global rather than dropping the structure — a typo in the number
+ * must never silently UNCAP a sleeve the operator plainly meant to cap.
+ *
+ * An empty / all-blank override falls back to the default (OTM only) — an operator
+ * cannot accidentally disarm the cut by blanking the list; disarming is what the
+ * flag is for.
  */
-export function resolveEntryDeltaCeilingStructures(env: NodeJS.ProcessEnv = process.env): string[] {
+export function resolveEntryDeltaCeilingMap(env: NodeJS.ProcessEnv = process.env): Map<string, number> {
+  const globalCeiling = resolveEntryDeltaCeiling(env);
   const raw = env[OPTION_ENTRY_DELTA_CEILING_STRUCTURES_VALUE];
-  if (typeof raw === 'string' && raw.trim() !== '') {
-    const parsed = raw.split(',').map((s) => s.trim().toLowerCase()).filter((s) => s !== '');
-    if (parsed.length > 0) return parsed;
+  const entries = typeof raw === 'string' && raw.trim() !== ''
+    ? raw.split(',').map((s) => s.trim().toLowerCase()).filter((s) => s !== '')
+    : [];
+  const source = entries.length > 0 ? entries : [...OPTION_ENTRY_DELTA_CEILING_STRUCTURES_DEFAULT];
+
+  const map = new Map<string, number>();
+  for (const entry of source) {
+    const sep = entry.indexOf(':');
+    if (sep < 0) {
+      map.set(entry, globalCeiling);
+      continue;
+    }
+    const name = entry.slice(0, sep).trim();
+    if (name === '') continue;
+    const parsed = Number(entry.slice(sep + 1).trim());
+    const valid = Number.isFinite(parsed) && parsed > 0 && parsed < 1;
+    map.set(name, valid ? parsed : globalCeiling);
   }
-  return [...OPTION_ENTRY_DELTA_CEILING_STRUCTURES_DEFAULT];
+  return map;
 }
 
 /**
- * The ceiling verdict for one candidate: a human-readable rejection reason when
- * `|delta|` is ABOVE the ceiling for a capped structure, or `null` when admitted /
- * the structure is uncapped / the flag is off.
+ * Resolve the structures the ceiling applies to (names only — the numbers live in
+ * `resolveEntryDeltaCeilingMap`). Kept for the health view and existing callers.
+ */
+export function resolveEntryDeltaCeilingStructures(env: NodeJS.ProcessEnv = process.env): string[] {
+  return [...resolveEntryDeltaCeilingMap(env).keys()];
+}
+
+/**
+ * TRA-1689 — the structures whose breaches are OBSERVED, not enforced. Empty by
+ * default. Listing a structure here that is not in the ceiling map does nothing:
+ * observation is a property of an armed ceiling, not a way to arm one.
+ */
+export function resolveEntryDeltaCeilingObserveStructures(
+  env: NodeJS.ProcessEnv = process.env,
+): string[] {
+  const raw = env[OPTION_ENTRY_DELTA_CEILING_OBSERVE_VALUE];
+  if (typeof raw !== 'string' || raw.trim() === '') return [];
+  return raw.split(',').map((s) => s.trim().toLowerCase()).filter((s) => s !== '');
+}
+
+/** The ceiling's verdict on one candidate. */
+export interface EntryDeltaCeilingVerdict {
+  /** True iff |delta| exceeded this structure's ceiling. */
+  breached: boolean;
+  /** True iff the breach must BLOCK the open (false = observe-only: count and admit). */
+  enforced: boolean;
+  /** The ceiling this structure was actually measured against (null when uncapped/off). */
+  ceiling: number | null;
+  /** Human-readable reason — present on ANY breach, enforced or merely observed. */
+  reason: string | null;
+}
+
+const ADMITTED: EntryDeltaCeilingVerdict = { breached: false, enforced: false, ceiling: null, reason: null };
+
+/**
+ * The ceiling verdict for one candidate.
  *
  * A missing or non-finite delta is ADMITTED (honest-unknown): the ceiling's job is
  * to cut a measured tail, and rejecting on an absent greek would silently starve a
  * sleeve on a data outage rather than cut a loser. The floor upstream is what keeps
  * a delta-less candidate out when that is wanted.
  */
+export function entryDeltaCeilingVerdict(
+  structure: string,
+  delta: number | null | undefined,
+  env: NodeJS.ProcessEnv = process.env,
+): EntryDeltaCeilingVerdict {
+  if (!isEntryDeltaCeilingEnabled(env)) return ADMITTED;
+  const ceiling = resolveEntryDeltaCeilingMap(env).get(structure);
+  if (ceiling === undefined) return ADMITTED;
+  if (typeof delta !== 'number' || !Number.isFinite(delta)) return ADMITTED;
+  const abs = Math.abs(delta);
+  if (abs <= ceiling) return { breached: false, enforced: false, ceiling, reason: null };
+
+  const enforced = !resolveEntryDeltaCeilingObserveStructures(env).includes(structure);
+  const suffix = enforced ? '' : ' [OBSERVE-ONLY: counted, not blocked]';
+  return {
+    breached: true,
+    enforced,
+    ceiling,
+    reason: `entry delta ceiling (TRA-1670): |Δ| ${abs.toFixed(3)} > ${ceiling.toFixed(2)} on ${structure}${suffix}`,
+  };
+}
+
+/**
+ * The ceiling's BLOCKING verdict: a rejection reason only when the breach actually
+ * stops the open. An observe-only breach returns `null` here — it did not reject
+ * anything, and a caller that treats it as a rejection would be lying about what the
+ * engine did (TRA-1682). Use `entryDeltaCeilingVerdict` when you need to COUNT breaches.
+ */
 export function entryDeltaCeilingReject(
   structure: string,
   delta: number | null | undefined,
   env: NodeJS.ProcessEnv = process.env,
 ): string | null {
-  if (!isEntryDeltaCeilingEnabled(env)) return null;
-  if (!resolveEntryDeltaCeilingStructures(env).includes(structure)) return null;
-  if (typeof delta !== 'number' || !Number.isFinite(delta)) return null;
-  const abs = Math.abs(delta);
-  const ceiling = resolveEntryDeltaCeiling(env);
-  if (abs <= ceiling) return null;
-  return `entry delta ceiling (TRA-1670): |Δ| ${abs.toFixed(3)} > ${ceiling.toFixed(2)} on ${structure}`;
+  const verdict = entryDeltaCeilingVerdict(structure, delta, env);
+  return verdict.breached && verdict.enforced ? verdict.reason : null;
 }
 
 // TRA-1409 (parent TRA-1406 "less noise, more quality") — the RV single_leg exit

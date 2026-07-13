@@ -1,4 +1,6 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
+import { summarizeCostAwareGate, clearCostAwareGateLedger } from './cost-aware-gate-ledger.js';
+import { etDateString } from './scheduler.js';
 // TRA-1226 — evaluateIvRvScan now backfills the underlying's daily closes from
 // the equity feed when the in-process dailyCloseCache is cold (the iv-rv option
 // universe is NOT the set the TRA-533 technical-snapshot pass warms). Stub the
@@ -334,13 +336,20 @@ describe('SignalEngine — relative-value scanner bridge', () => {
   // this assertion ever goes green-while-inert, the Δ>0.55 loss tail (n=14, NET
   // −1.813R) is back in the book with nothing above it.
   describe('entry-delta ceiling on the OTM open (TRA-1670)', () => {
-    const CEILING_ENV = ['OPTION_ENTRY_DELTA_CEILING_ENABLED', 'OPTION_ENTRY_DELTA_CEILING', 'DATA_DIR'] as const;
+    const CEILING_ENV = [
+      'OPTION_ENTRY_DELTA_CEILING_ENABLED',
+      'OPTION_ENTRY_DELTA_CEILING',
+      'OPTION_ENTRY_DELTA_CEILING_STRUCTURES',
+      'OPTION_ENTRY_DELTA_CEILING_OBSERVE_STRUCTURES',
+      'DATA_DIR',
+    ] as const;
     const saved: Record<string, string | undefined> = {};
 
     beforeEach(() => {
       for (const k of CEILING_ENV) saved[k] = process.env[k];
       // Resolve flags straight through process.env (no demo-flags.json overlay).
       delete process.env.DATA_DIR;
+      clearCostAwareGateLedger();
     });
     afterEach(() => {
       for (const k of CEILING_ENV) {
@@ -399,6 +408,42 @@ describe('SignalEngine — relative-value scanner bridge', () => {
       process.env.OPTION_ENTRY_DELTA_CEILING = '0.70';
       const engine = await runOtm(scanFor(0.60));
       expect(engine.getState().options.openOptions).toHaveLength(1);
+    });
+
+    // TRA-1689 — the per-structure form. Arming another sleeve at a looser number must
+    // not drag OTM's MEASURED 0.55 up with it; under the old global scalar it did, and
+    // the Δ>0.55 loss tail (n=14, NET −1.813R) came back with no error and no log line.
+    it('arming RV at 0.65 leaves the OTM ceiling at 0.55 — the Δ=0.60 tail is still cut', async () => {
+      process.env.OPTION_ENTRY_DELTA_CEILING_ENABLED = '1';
+      process.env.OPTION_ENTRY_DELTA_CEILING_STRUCTURES = 'single_leg_otm,single_leg_rv:0.65';
+      const engine = await runOtm(scanFor(0.60));
+
+      expect(engine.getState().options.openOptions).toHaveLength(0);
+      expect(engine.getState().signals[0]!.signalSkipReason).toContain('entry delta ceiling');
+    });
+
+    // TRA-1689 — observe-only. The breach is COUNTED and the trade STILL OPENS: that is
+    // what lets a ceiling accrue an n on the tail it wants to cut before the sleeve pays
+    // for the guess. An observed breach must never land on the REJECTED counter — one is
+    // a trade that did not happen, the other is a trade that did (TRA-1682).
+    it('OBSERVE-ONLY: a Δ=0.60 breach OPENS, and is counted as observed — never as rejected', async () => {
+      process.env.OPTION_ENTRY_DELTA_CEILING_ENABLED = '1';
+      process.env.OPTION_ENTRY_DELTA_CEILING_OBSERVE_STRUCTURES = 'single_leg_otm';
+      const engine = await runOtm(scanFor(0.60));
+
+      // The open PROCEEDED — same as if the ceiling were off.
+      const state = engine.getState();
+      expect(state.options.openOptions).toHaveLength(1);
+      expect(state.signals[0]!.signalSkipReason).toBeUndefined();
+
+      // ...but the breach is on the books, on its OWN axis.
+      const summary = summarizeCostAwareGate(etDateString(new Date()));
+      const otm = summary.byStructure.find((s) => s.structure === 'single_leg_otm');
+      expect(otm?.deltaCeilingObserved).toBe(1);
+      expect(otm?.avgDeltaCeilingObservedAbsDelta).toBeCloseTo(0.60, 5);
+      expect(otm?.deltaCeilingRejected).toBe(0);
+      expect(summary.deltaCeilingRejectedTotal).toBe(0);
+      expect(summary.deltaCeilingObservedTotal).toBe(1);
     });
   });
 

@@ -51,7 +51,12 @@ const RETAIN_MS = 7 * 24 * 60 * 60 * 1000;
  * verdict, so folding it into admitted/rejected would corrupt the cost bar's
  * admit rate and its gross-R means.
  */
-type CostGateKind = 'cost_bar' | 'delta_ceiling';
+// `delta_ceiling_observed` (TRA-1689) is a breach the ceiling COUNTED and then ADMITTED
+// — an observe-only structure. It is a separate kind, not a flag on `delta_ceiling`,
+// because the two must never be summed: one is a trade that did not happen, the other is
+// a trade that DID. Conflating them would report a sleeve as cut while it was still
+// trading the tail (the TRA-1682 lesson, one gate over).
+type CostGateKind = 'cost_bar' | 'delta_ceiling' | 'delta_ceiling_observed';
 
 /** One durable decision — a write-through of the verdict the gate just returned. */
 interface CostGateDecisionRecord {
@@ -84,6 +89,10 @@ interface StructureTally {
   deltaCeilingRejected: number;
   /** Sum of the |delta|s the ceiling refused, for the mean in the health view. */
   deltaCeilingAbsDeltaSum: number;
+  /** TRA-1689 — breaches COUNTED and ADMITTED on an observe-only structure. These TRADED. */
+  deltaCeilingObserved: number;
+  /** Sum of the |delta|s of the observed (admitted) breaches. */
+  deltaCeilingObservedAbsDeltaSum: number;
 }
 
 // ── In-memory store (backs the durable counts + the health endpoint) ─────────
@@ -128,6 +137,8 @@ function apply(rec: CostGateDecisionRecord): void {
       lastBarR: rec.barR,
       deltaCeilingRejected: 0,
       deltaCeilingAbsDeltaSum: 0,
+      deltaCeilingObserved: 0,
+      deltaCeilingObservedAbsDeltaSum: 0,
     };
     day.set(rec.structure, tally);
   }
@@ -136,6 +147,12 @@ function apply(rec: CostGateDecisionRecord): void {
     // the cost bar's admit rate / gross-R means stay exactly what they were.
     tally.deltaCeilingRejected += 1;
     tally.deltaCeilingAbsDeltaSum += Number.isFinite(rec.absDelta) ? (rec.absDelta as number) : 0;
+  } else if (rec.gate === 'delta_ceiling_observed') {
+    // TRA-1689 — the ceiling SAW this one and let it through. Its own axis: it must
+    // never inflate `deltaCeilingRejected` (nothing was rejected) and it must never
+    // touch the cost bar's admitted/rejected (that gate did not rule on it here).
+    tally.deltaCeilingObserved += 1;
+    tally.deltaCeilingObservedAbsDeltaSum += Number.isFinite(rec.absDelta) ? (rec.absDelta as number) : 0;
   } else if (rec.admit) {
     tally.admitted += 1;
     tally.admittedGrossRSum += rec.grossR;
@@ -201,6 +218,37 @@ export function recordEntryDeltaCeilingReject(
     grossR: 0,
     barR: 0,
     gate: 'delta_ceiling',
+    absDelta: Number.isFinite(absDelta) ? absDelta : 0,
+  });
+}
+
+/**
+ * TRA-1689 — record one OBSERVE-ONLY entry-delta ceiling breach: the |delta| was above
+ * the structure's ceiling and the open proceeded anyway.
+ *
+ * `admit: true`, because it was admitted. That field is the durable record of what the
+ * engine ACTUALLY DID, and an observed breach that wrote `admit: false` would replay out
+ * of the JSONL as a trade that never happened.
+ *
+ * This is what makes a ceiling measurable before it is trusted: the tail accrues an n and
+ * a realized R while the sleeve keeps trading it. Arming a ceiling to find out whether the
+ * tail is a loser costs you every trade above it — and if you were wrong, you never learn,
+ * because the evidence is exactly the trades you refused to take.
+ */
+export function recordEntryDeltaCeilingObserved(
+  structure: string,
+  absDelta: number,
+  etDay: string,
+  now: number = Date.now(),
+): void {
+  applyAndAppend({
+    ts: now,
+    etDay,
+    structure,
+    admit: true,
+    grossR: 0,
+    barR: 0,
+    gate: 'delta_ceiling_observed',
     absDelta: Number.isFinite(absDelta) ? absDelta : 0,
   });
 }
@@ -322,6 +370,14 @@ export interface CostAwareGateStructureSummary {
   deltaCeilingRejected: number;
   /** Mean |delta| of the candidates the ceiling refused (null when none). */
   avgDeltaCeilingAbsDelta: number | null;
+  /**
+   * TRA-1689 — breaches the ceiling COUNTED and ADMITTED on this structure (observe-only).
+   * These OPENED. `deltaCeilingObserved > 0` with `deltaCeilingRejected === 0` is a sleeve
+   * whose tail is being MEASURED, not cut.
+   */
+  deltaCeilingObserved: number;
+  /** Mean |delta| of the observed (admitted) breaches (null when none). */
+  avgDeltaCeilingObservedAbsDelta: number | null;
 }
 
 export interface CostAwareGateSummary {
@@ -334,6 +390,8 @@ export interface CostAwareGateSummary {
   rejectedTotal: number;
   /** TRA-1670 — entry-delta ceiling rejects across all structures on the requested ET day. */
   deltaCeilingRejectedTotal: number;
+  /** TRA-1689 — observe-only ceiling breaches (COUNTED, then ADMITTED) across all structures. */
+  deltaCeilingObservedTotal: number;
   /** ms epoch of the last recorded decision (null if none yet). */
   lastDecisionAt: number | null;
 }
@@ -355,12 +413,14 @@ export function summarizeCostAwareGate(etDay: string): CostAwareGateSummary {
   let admittedTotal = 0;
   let rejectedTotal = 0;
   let deltaCeilingRejectedTotal = 0;
+  let deltaCeilingObservedTotal = 0;
   if (day) {
     for (const [structure, t] of day.entries()) {
       const decisions = t.admitted + t.rejected;
       admittedTotal += t.admitted;
       rejectedTotal += t.rejected;
       deltaCeilingRejectedTotal += t.deltaCeilingRejected;
+      deltaCeilingObservedTotal += t.deltaCeilingObserved;
       byStructure.push({
         structure,
         admitted: t.admitted,
@@ -372,12 +432,17 @@ export function summarizeCostAwareGate(etDay: string): CostAwareGateSummary {
         deltaCeilingRejected: t.deltaCeilingRejected,
         avgDeltaCeilingAbsDelta:
           t.deltaCeilingRejected > 0 ? round(t.deltaCeilingAbsDeltaSum / t.deltaCeilingRejected) : null,
+        deltaCeilingObserved: t.deltaCeilingObserved,
+        avgDeltaCeilingObservedAbsDelta:
+          t.deltaCeilingObserved > 0
+            ? round(t.deltaCeilingObservedAbsDeltaSum / t.deltaCeilingObserved)
+            : null,
       });
     }
     byStructure.sort(
       (a, b) =>
-        b.admitted + b.rejected + b.deltaCeilingRejected
-        - (a.admitted + a.rejected + a.deltaCeilingRejected),
+        b.admitted + b.rejected + b.deltaCeilingRejected + b.deltaCeilingObserved
+        - (a.admitted + a.rejected + a.deltaCeilingRejected + a.deltaCeilingObserved),
     );
   }
   return {
@@ -386,6 +451,7 @@ export function summarizeCostAwareGate(etDay: string): CostAwareGateSummary {
     admittedTotal,
     rejectedTotal,
     deltaCeilingRejectedTotal,
+    deltaCeilingObservedTotal,
     lastDecisionAt,
   };
 }

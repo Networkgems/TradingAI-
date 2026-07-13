@@ -69,7 +69,7 @@ import { selectWeeklyPcs } from '@trading-app/engine';
 import { isOptionExecEnabled, isOptionEmaPullbackEnabled, isOptionVolumeBreakoutEnabled, resolveRvLongDteOverride, resolveRvMinDailyVolume, isOptionDemoDirectionalEnabled, isOptionIvRvScannerEnabled, isOptionIvRvRoutingEnabled, resolveIvRvRoutingOverride, isOptionShortPremiumScannerEnabled, isOptionLiveRvLongEnabled, isOptionLiveDirectionalEnabled } from './option-exec-flag.js';
 import { scanIvRvFromSnapshot, recordIvRvScan } from './iv-rv-scanner.js';
 import { scanShortPremiumFromSnapshot, recordShortPremiumScan } from './short-premium-scanner.js';
-import { isExitRiskRulesEnabled, isLiveEquityStopModifyEnabled, isTakeProfitEarlyEnabled, isEntryGreeksGateEnabled, isCorrelatedExposureCapEnabled, isOtmDeltaFloorEnabled, resolveOtmDeltaFloor, entryDeltaCeilingReject, isRvExitRetuneEnabled, resolveRvExitConfirmBars, resolveRvExitFlipMinLossPct, isBookGiveBackArmFloorEnabled } from './exit-risk-rules-flag.js';
+import { isExitRiskRulesEnabled, isLiveEquityStopModifyEnabled, isTakeProfitEarlyEnabled, isEntryGreeksGateEnabled, isCorrelatedExposureCapEnabled, isOtmDeltaFloorEnabled, resolveOtmDeltaFloor, entryDeltaCeilingVerdict, isRvExitRetuneEnabled, resolveRvExitConfirmBars, resolveRvExitFlipMinLossPct, isBookGiveBackArmFloorEnabled } from './exit-risk-rules-flag.js';
 import { recordCorrelatedExposureBinding, type CorrelatedExposureVenue } from './correlated-exposure-ledger.js';
 import { isChurnLossBrakeEnabled, resolveSameSessionOpenCap } from './churn-loss-brake-flag.js';
 import {
@@ -90,7 +90,7 @@ import {
   recordDirectionalGateReject,
   type OpenSleeve,
 } from './directional-open-ledger.js';
-import { recordCostAwareGateDecision, recordEntryDeltaCeilingReject } from './cost-aware-gate-ledger.js';
+import { recordCostAwareGateDecision, recordEntryDeltaCeilingReject, recordEntryDeltaCeilingObserved } from './cost-aware-gate-ledger.js';
 import { recordEntryGreeksVerdict } from './entry-greeks-ledger.js';
 import { isMultiLegOpenPaused } from './multileg-open-pause-flag.js';
 import { isMultiLegExitEnabled } from './multileg-exit-flag.js';
@@ -3805,22 +3805,36 @@ export class SignalEngine {
    * the 0.55 is measured on OTM only and the other sleeves stay uncapped rather than
    * inherit an extrapolated number (widen via OPTION_ENTRY_DELTA_CEILING_STRUCTURES).
    *
-   * Returns a rejection reason when the candidate is above the ceiling, else `null`.
+   * Returns a rejection reason when the candidate is above the ceiling AND that
+   * structure ENFORCES it, else `null`.
+   *
+   * TRA-1689 — a structure listed in OPTION_ENTRY_DELTA_CEILING_OBSERVE_STRUCTURES is
+   * measured, not cut: the breach is recorded on its own ledger axis and this returns
+   * `null`, so the open proceeds. That distinction is the whole point — it lets a
+   * ceiling accrue an n on the tail it wants to cut BEFORE the sleeve pays for it.
    */
   private entryDeltaCeilingRejectReason(structure: string, delta: number | null | undefined): string | null {
     if (this.mode !== 'demo') return null;
-    const reason = entryDeltaCeilingReject(structure, delta, this.resolveDemoFlagEnv());
-    if (!reason) return null;
+    const verdict = entryDeltaCeilingVerdict(structure, delta, this.resolveDemoFlagEnv());
+    if (!verdict.breached) return null;
+
     // A ceiling that is shipped, believed armed, and silently inert is the TRA-1486 /
     // TRA-1407 failure twice over. Record every breach durably so
     // `/api/health/cost-aware-gate` can PROVE it is biting. Best-effort — never breaks
-    // the trade pass.
-    recordEntryDeltaCeilingReject(
-      structure,
-      Math.abs(typeof delta === 'number' ? delta : 0),
-      etDateString(new Date()),
-    );
-    return reason;
+    // the trade pass. Enforced and observed land on SEPARATE counters: one is a trade
+    // that did not happen, the other is a trade that did (TRA-1682 — a counter must
+    // report what the engine actually did, not what the config intended).
+    const absDelta = Math.abs(typeof delta === 'number' ? delta : 0);
+    const etDay = etDateString(new Date());
+    if (verdict.enforced) {
+      recordEntryDeltaCeilingReject(structure, absDelta, etDay);
+      return verdict.reason;
+    }
+    recordEntryDeltaCeilingObserved(structure, absDelta, etDay);
+    log.info('entry-delta ceiling breach OBSERVED, not blocked (TRA-1689)', {
+      structure, delta, ceiling: verdict.ceiling,
+    });
+    return null;
   }
 
   /**

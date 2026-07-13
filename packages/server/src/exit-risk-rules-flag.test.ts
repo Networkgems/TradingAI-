@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest';
-import { isExitRiskRulesEnabled, isLiveEquityStopModifyEnabled, isTakeProfitEarlyEnabled, isCorrelatedExposureCapEnabled, isOtmDeltaFloorEnabled, resolveOtmDeltaFloor, OTM_DELTA_FLOOR_DEFAULT, isEntryDeltaCeilingEnabled, resolveEntryDeltaCeiling, resolveEntryDeltaCeilingStructures, entryDeltaCeilingReject, OPTION_ENTRY_DELTA_CEILING_DEFAULT, isRvExitRetuneEnabled, resolveRvExitConfirmBars, RV_EXIT_RETUNE_CONFIRM_BARS_DEFAULT, resolveRvExitFlipMinLossPct, isBookGiveBackArmFloorEnabled } from './exit-risk-rules-flag.js';
+import { isExitRiskRulesEnabled, isLiveEquityStopModifyEnabled, isTakeProfitEarlyEnabled, isCorrelatedExposureCapEnabled, isOtmDeltaFloorEnabled, resolveOtmDeltaFloor, OTM_DELTA_FLOOR_DEFAULT, isEntryDeltaCeilingEnabled, resolveEntryDeltaCeiling, resolveEntryDeltaCeilingStructures, resolveEntryDeltaCeilingMap, resolveEntryDeltaCeilingObserveStructures, entryDeltaCeilingReject, entryDeltaCeilingVerdict, OPTION_ENTRY_DELTA_CEILING_DEFAULT, isRvExitRetuneEnabled, resolveRvExitConfirmBars, RV_EXIT_RETUNE_CONFIRM_BARS_DEFAULT, resolveRvExitFlipMinLossPct, isBookGiveBackArmFloorEnabled } from './exit-risk-rules-flag.js';
 
 // TRA-1250 / TRA-1269 / TRA-1294 / TRA-1295 — master switch + the isolated sub-flags.
 
@@ -153,6 +153,96 @@ describe('entry delta ceiling (TRA-1670)', () => {
     expect(entryDeltaCeilingReject('single_leg_otm', null, ARMED)).toBeNull();
     expect(entryDeltaCeilingReject('single_leg_otm', undefined, ARMED)).toBeNull();
     expect(entryDeltaCeilingReject('single_leg_otm', Number.NaN, ARMED)).toBeNull();
+  });
+});
+
+describe('per-structure entry delta ceilings (TRA-1689)', () => {
+  const ARMED = { OPTION_ENTRY_DELTA_CEILING_ENABLED: '1' };
+
+  // THE BUG THIS SHIPPED FOR. The ceiling number used to be a single global scalar, so
+  // the only way to arm RV at 0.65 was to set the global to 0.65 — which silently moved
+  // OTM's MEASURED 0.55 ceiling to 0.65 too, re-admitting the exact n=14 / NET −1.813R
+  // tail TRA-1670 exists to cut. A band measured on one sleeve must not be reachable
+  // from another sleeve's knob.
+  it('arming RV at 0.65 does NOT move OTM off its measured 0.55', () => {
+    const env = {
+      ...ARMED,
+      OPTION_ENTRY_DELTA_CEILING_STRUCTURES: 'single_leg_otm,single_leg_rv:0.65',
+    };
+    // RV gets its own, looser number.
+    expect(entryDeltaCeilingReject('single_leg_rv', 0.60, env)).toBeNull();
+    expect(entryDeltaCeilingReject('single_leg_rv', 0.70, env)).toBeTruthy();
+    // OTM is UNMOVED — 0.60 is still cut. This is the assertion that would have failed
+    // under the old global-scalar config.
+    expect(entryDeltaCeilingReject('single_leg_otm', 0.60, env)).toBeTruthy();
+    expect(entryDeltaCeilingReject('single_leg_otm', 0.50, env)).toBeNull();
+
+    expect(resolveEntryDeltaCeilingMap(env).get('single_leg_otm')).toBe(0.55);
+    expect(resolveEntryDeltaCeilingMap(env).get('single_leg_rv')).toBe(0.65);
+  });
+
+  it('a bare structure inherits the global ceiling; name:value overrides it', () => {
+    const env = {
+      ...ARMED,
+      OPTION_ENTRY_DELTA_CEILING: '0.50',
+      OPTION_ENTRY_DELTA_CEILING_STRUCTURES: 'single_leg_otm,directional:0.80',
+    };
+    const map = resolveEntryDeltaCeilingMap(env);
+    expect(map.get('single_leg_otm')).toBe(0.50);
+    expect(map.get('directional')).toBe(0.80);
+    expect(map.has('single_leg_rv')).toBe(false);
+  });
+
+  it('a malformed :value falls back to the global rather than UNCAPPING the sleeve', () => {
+    for (const bad of ['abc', '', '0', '-0.2', '1', '1.5']) {
+      const env = {
+        ...ARMED,
+        OPTION_ENTRY_DELTA_CEILING_STRUCTURES: `single_leg_rv:${bad}`,
+      };
+      expect(resolveEntryDeltaCeilingMap(env).get('single_leg_rv'))
+        .toBe(OPTION_ENTRY_DELTA_CEILING_DEFAULT);
+      // A typo in the number must not turn the cut OFF — it stays capped at the default.
+      expect(entryDeltaCeilingReject('single_leg_rv', 0.90, env)).toBeTruthy();
+    }
+  });
+
+  it('OBSERVE-ONLY: the breach is reported but does NOT reject the open', () => {
+    const env = {
+      ...ARMED,
+      OPTION_ENTRY_DELTA_CEILING_STRUCTURES: 'single_leg_otm,single_leg_rv:0.65',
+      OPTION_ENTRY_DELTA_CEILING_OBSERVE_STRUCTURES: 'single_leg_rv',
+    };
+    const verdict = entryDeltaCeilingVerdict('single_leg_rv', 0.80, env);
+    expect(verdict.breached).toBe(true);
+    expect(verdict.enforced).toBe(false);
+    expect(verdict.ceiling).toBe(0.65);
+    expect(verdict.reason).toContain('OBSERVE-ONLY');
+    // The blocking verdict is NULL — the trade goes on. A caller that treated the
+    // breach as a rejection would be lying about what the engine did.
+    expect(entryDeltaCeilingReject('single_leg_rv', 0.80, env)).toBeNull();
+
+    // ...and OTM, not listed as observe-only, still ENFORCES.
+    expect(entryDeltaCeilingVerdict('single_leg_otm', 0.80, env).enforced).toBe(true);
+    expect(entryDeltaCeilingReject('single_leg_otm', 0.80, env)).toBeTruthy();
+  });
+
+  it('observing a structure the ceiling does not cover arms nothing', () => {
+    const env = {
+      ...ARMED,
+      OPTION_ENTRY_DELTA_CEILING_OBSERVE_STRUCTURES: 'single_leg_rv',
+    };
+    // RV is not in the (default OTM-only) ceiling map, so there is nothing to observe.
+    expect(entryDeltaCeilingVerdict('single_leg_rv', 0.95, env).breached).toBe(false);
+    expect(resolveEntryDeltaCeilingObserveStructures(env)).toEqual(['single_leg_rv']);
+  });
+
+  it('is inert while the flag is OFF, observe list or not', () => {
+    const env = {
+      OPTION_ENTRY_DELTA_CEILING_STRUCTURES: 'single_leg_otm,single_leg_rv:0.65',
+      OPTION_ENTRY_DELTA_CEILING_OBSERVE_STRUCTURES: 'single_leg_rv',
+    };
+    expect(entryDeltaCeilingVerdict('single_leg_rv', 0.95, env).breached).toBe(false);
+    expect(entryDeltaCeilingVerdict('single_leg_otm', 0.95, env).breached).toBe(false);
   });
 });
 
