@@ -106,11 +106,24 @@ scaling and alert response.
   News-tab POST path) down until a human re-runs the bootstrap (TRA-491). A
   scheduled task **`PM2 Resurrect`** — registered by
   [`ops/install-pm2-autostart.ps1`](../ops/install-pm2-autostart.ps1), running
-  [`ops/pm2-resurrect-boot.ps1`](../ops/pm2-resurrect-boot.ps1) — now runs
+  [`ops/pm2-resurrect-boot.ps1`](../ops/pm2-resurrect-boot.ps1) — runs
   **`pm2 resurrect` at machine start as `LOCAL_SYSTEM`**, so the daemon +
   `trading-server` come back up unattended. **Keep the resurrect file current:**
   run **`npx pm2 save` whenever you change the running process set** (after any
   `pm2 start`/`delete`), or a reboot restores a stale list.
+  - ✅ **Verify it, don't assume it** — `ops/verify-pm2-autostart.ps1` (no admin
+    needed, exit `0`=armed / `1`=not). **Shipping the scripts is not the same as
+    installing the task**, and the failure is *silent*: on 2026-07-12 PG-DEVOPS14
+    rebooted with the task never registered, and `trading-server` stayed down
+    **~16.7h** until a human restarted it — TRA-491 all over again, while this
+    runbook claimed autostart was in place. Run the verifier after any host
+    rebuild, profile reset, or PM2 change.
+  - ⚠️ **The installer must be run ELEVATED, on the host** (`Register-ScheduledTask`
+    with a `SYSTEM` principal returns `Access is denied.` otherwise — agents are
+    not elevated and *cannot* install this). It stages the boot wrapper to
+    `C:\ProgramData\TradingAI\ops\` and points the task there **on purpose**: a task
+    pointed into a repo/agent-workspace checkout decays into a dangling path when
+    that tree is reset or wiped, and a dangling boot task fails silently.
   - ⚠️ **Daemon ownership after a reboot.** Because the task runs as
     `LOCAL_SYSTEM`, after a reboot the PM2 daemon is owned by `SYSTEM`, so a
     **non-elevated** `npx pm2 …` fails with `connect EPERM \\.\pipe\rpc.sock`
