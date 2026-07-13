@@ -350,13 +350,33 @@ export const DEFAULT_WATCHDOG: WatchdogConfig = {
   // platform's hard kill. A 4s+ stall on a healthy box is itself pathology
   // (a full GC near the 1.5GB ceiling is ~1-2s), so a false trip is implausible.
   lagMaxMs: 4_000,
-  // TRA-1374 — 1900 MB: the live box is `plan: standard` (2 GB cgroup ceiling;
-  // see render.yaml). V8 old-space is pinned to 1536 MB, so a HEALTHY process
-  // (heap ≤1.5 GB + ~0.3-0.4 GB native/baseline) tops out well under this;
-  // steady RSS is only ~0.3-0.75 GB. Tripping at 1900 MB fires a clean restart
-  // in the ~100 MB gap before the 2 GB cgroup SIGKILL, converting the abrupt
-  // `nonZeroExit: 137` into a graceful exit + flushed logs. Raise this via
-  // WATCHDOG_RSS_MAX_MB if the box is moved to a larger plan; set 0 to disable.
+  // ⚠️ TRA-1683 — THIS DEFAULT IS STALE AND IS CORRECT FOR NO BOX WE RUN. It is
+  // load-bearing ONLY because the live service overrides it with
+  // WATCHDOG_RSS_MAX_MB=3400. If that env var is ever cleared, this constant
+  // takes over and RE-CREATES the defect described below. Do not treat an unset
+  // env var as "back to a safe default" — the safe value is not in this file.
+  //
+  // TRA-1374 wrote 1900 MB against `plan: standard` (2 GB cgroup): trip ~100 MB
+  // below the kill line so the abrupt `nonZeroExit: 137` becomes a graceful exit
+  // + flushed logs. That was right — for a 2 GB box.
+  //
+  // The box was moved to `plan: pro` (4 GB) in the Render DASHBOARD, and nothing
+  // re-derived this constant. On 4 GB, 1900 MB is 47% of capacity — INSIDE the
+  // normal RTH working set (measured 2.0-2.2 GB). The guard INVERTED: instead of
+  // pre-empting an OOM it began executing a perfectly healthy engine, ~38-40
+  // times per RTH session (`reason: "rss"`, not lag), tearing down in-process
+  // position management each time. A guard's constant encodes a PREMISE ABOUT ITS
+  // ENVIRONMENT; move the environment and the guard silently turns on its host.
+  //
+  // Left at 1900 here only because the go-live content freeze (TRA-1653) pins the
+  // deployed commit — the fix shipped as env, zero new bytes. THE DURABLE FIX IS
+  // TO STOP HARDCODING A PREMISE ABOUT THE HOST: derive the ceiling from the
+  // actual cgroup limit at boot (`/sys/fs/cgroup/memory.max`) and bracket it,
+  // so resizing the box can never again invalidate the guard. Tracked as
+  // follow-up; `_default/tra1648_watchdog_ceiling_check.mjs` is the interim
+  // assertion (it grades the EFFECTIVE ceiling on the RUNNING process against
+  // the LIVE plan — never this constant, and never render.yaml).
+  // Set 0 to disable.
   rssMaxBytes: 1_900 * 1e6,
   // 120s: warmup's synchronous candle-load across N per-book engines blocks the
   // loop past lagMaxMs for a few seconds and was self-restarting the box mid-

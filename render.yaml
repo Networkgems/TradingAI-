@@ -36,15 +36,35 @@ services:
   - type: web
     name: tradingai-bqb1
     runtime: node
-    # TRA-1038 — MUST be `standard` (2 GB), NOT `starter` (512 MB). The live
-    # service `srv-d7mb7rr7uimc73ev0chg` runs `standard` and its 24 h memory
-    # peak is ~1.53 GB (avg ~0.7 GB) — well above starter's 512 MB ceiling, so a
-    # blueprint re-apply at `starter` would OOM the public demo on boot. This
-    # line previously read `starter` and was a latent footgun; do not revert it
-    # without first trimming steady-state memory below 512 MB (tracked as a
-    # cost-optimization follow-up). CPU avg ~0.28 / peak ~0.96 of 1 vCPU is fine
-    # on standard.
-    plan: standard
+    # TRA-1683 — `pro` (4 GB). THIS LINE IS LOAD-BEARING FOR THE WATCHDOG.
+    #
+    # It read `standard` (2 GB) until 2026-07-12 while the live service
+    # `srv-d7mb7rr7uimc73ev0chg` had ALREADY been moved to `pro` in the Render
+    # dashboard (TRA-1634). Nothing re-checked the constants derived from it, so
+    # the event-loop watchdog kept its `rssMaxBytes` default of 1900 MB — sized
+    # to trip ~100 MB BELOW a 2 GB cgroup — which on a 4 GB box is 47% of
+    # capacity, i.e. INSIDE the normal RTH working set (2.0-2.2 GB). The guard
+    # inverted: it stopped pre-empting the OOM and started executing a healthy
+    # engine roughly every 7 minutes (38-40 self-restarts per RTH session).
+    #
+    # So: `plan` is not a billing detail. Three constants are derived from it,
+    # and MOVING THE PLAN SILENTLY INVALIDATES ALL THREE:
+    #   1. WATCHDOG_RSS_MAX_MB  — must sit ABOVE the RTH working set and BELOW
+    #                             the cgroup kill line. Now 3400 (see below).
+    #   2. NODE_OPTIONS --max-old-space-size — the V8 old-space cap.
+    #   3. MALLOC_ARENA_MAX     — its rationale is quoted against the RSS budget.
+    #
+    # If you change this line, you MUST re-derive 1-3 in the same commit, and
+    # `_default/tra1648_watchdog_ceiling_check.mjs` must still grade BRACKETED
+    # (it reads the plan from the Render API and the EFFECTIVE ceiling from the
+    # running process — never from this file, because this file was the lie).
+    #
+    # Do NOT revert to `standard`: the measured RTH peak is 2208 MB, which is
+    # already ABOVE standard's entire 2048 MB cgroup — and that figure is a
+    # LOWER BOUND, because the watchdog truncated every sample above 1900 MB.
+    # That is why TRA-1635 (right-size pro -> standard) is a hard NO-GO.
+    # `starter` (512 MB) would OOM on boot. CPU avg ~0.28 / peak ~0.96 of 1 vCPU.
+    plan: pro
     buildCommand: pnpm install --frozen-lockfile && pnpm run web:build
     startCommand: node packages/server/dist/index.js
     healthCheckPath: /api/health
@@ -63,17 +83,27 @@ services:
         value: production
       - key: NODE_VERSION
         value: 20.19.0
-      # TRA-1080 — pin the V8 old-space ceiling. The service runs `standard`
-      # (2 GB RAM); without this, V8 auto-sizes the old-space heap and on a 2 GB
-      # box GC only gets aggressive very late, so the per-tick growth during RTH
-      # drives back-to-back full GCs near the ceiling (the "GC thrash" that
-      # starves the event loop and kills the HTTP listener). Pinning to 1536 MB
-      # leaves ~512 MB headroom for RSS/native/buffers (24h peak ~1.53 GB total
-      # per the `plan: standard` note above) and makes the heap watchdog's
-      # `heap_size_limit` deterministic. Lower this if the box is ever moved to a
-      # smaller plan. `--max-semi-space-size=64` enlarges the young generation so
-      # short-lived per-tick allocations are collected by cheap scavenges instead
-      # of being promoted into old space and amplifying the thrash.
+      # TRA-1080 — pin the V8 old-space ceiling. Without this, V8 auto-sizes the
+      # old-space heap, GC only gets aggressive very late, and the per-tick
+      # growth during RTH drives back-to-back full GCs near the ceiling (the "GC
+      # thrash" that starves the event loop and kills the HTTP listener).
+      # Pinning makes the heap watchdog's `heap_size_limit` deterministic.
+      # `--max-semi-space-size=64` enlarges the young generation so short-lived
+      # per-tick allocations are collected by cheap scavenges instead of being
+      # promoted into old space and amplifying the thrash.
+      #
+      # TRA-1683 — 1536 MB was ORIGINALLY derived from the (then-believed) 2 GB
+      # `standard` box: "1536 heap + ~512 native = 2 GB". That premise is dead —
+      # the box is `pro` (4 GB). The VALUE IS DELIBERATELY RETAINED ANYWAY, and
+      # that is a decision, not neglect:
+      #   - Measured RTH heap peaks at ~475 MB against this 1536 MB cap (~31%).
+      #     There is no observed heap pressure, so there is nothing to fix.
+      #   - RAISING it would be counter-productive: a bigger old space means GC
+      #     runs later, which INCREASES RSS — and RSS is the binding constraint
+      #     on this box (it is what the cgroup OOM-killer and the watchdog both
+      #     watch). The cap currently helps bound the very metric under scrutiny.
+      # Re-derive only with evidence of actual heap pressure (heap approaching
+      # the cap), not merely because the box got bigger.
       - key: NODE_OPTIONS
         value: --max-old-space-size=1536 --max-semi-space-size=64
       # TRA-1463 — cap glibc malloc arenas to bound native RSS fragmentation.
@@ -85,8 +115,12 @@ services:
       # sawtooths low under GC (~6%), event-loop lag stays <150 ms (well under the
       # 2 s watchdog threshold), and the *tracked* off-heap counters
       # (external + arrayBuffers ≈ 4-9 MB) are tiny, yet RSS is the binding
-      # constraint (24 h peak ~1.53 GB per the `plan: standard` note above, vs the
-      # 1.9 GB watchdog rssMaxBytes / 2 GB container OOM only ~0.4-0.5 GB overhead).
+      # constraint (TRA-1683: the RSS budget quoted here — "1.53 GB steady vs the
+      # 1.9 GB watchdog / 2 GB OOM" — was the STANDARD-plan budget and is now
+      # stale; on `pro` the line is 3400 MB watchdog / 4 GB OOM against a 2.0-2.2 GB
+      # RTH working set. The DIAGNOSIS is unaffected and the fix below is retained:
+      # RSS-not-heap is still the binding constraint, so bounding native arena
+      # fragmentation is if anything MORE relevant now, not less).
       # RSS retained far above the JS heap while `external` stays small is the
       # signature of glibc arena fragmentation: by default glibc opens up to
       # 8×nCPU arenas of up to 64 MB each, and the libuv threadpool + the crypto
@@ -794,6 +828,28 @@ services:
         sync: false
       - key: WATCHDOG_BLOCK_MS
         sync: false
+      # TRA-1683 — the RSS ceiling, and the ONLY watchdog key here carrying a
+      # `value:` instead of `sync: false`. That asymmetry is deliberate.
+      #
+      # Its siblings above are dashboard-owned (`sync: false` = "a blueprint
+      # apply must not touch this"). If WATCHDOG_RSS_MAX_MB were declared the
+      # same way — or, as it was until now, NOT DECLARED AT ALL — then a
+      # blueprint apply would leave it unset, the code default of 1900 MB would
+      # take over, and the exact defect this issue fixed would silently return
+      # on a 4 GB box: the guard killing a healthy engine every ~7 minutes.
+      # An UNDECLARED env var is not a neutral omission; it is a vote for the
+      # code default, and here the code default is the bug.
+      #
+      # 3400 MB is bracketed: ABOVE the 2.0-2.2 GB RTH working set (so it does
+      # not fire on healthy load) and BELOW the 4096 MB `pro` cgroup with ~700 MB
+      # to spare (so a genuine runaway still trips gracefully and pre-empts the
+      # abrupt SIGKILL/`nonZeroExit: 137`). It preserves the guard's original
+      # design intent, which `standard`'s 1900/2048 expressed on the old box.
+      # COUPLED TO `plan:` ABOVE — re-derive both together, and verify with
+      # `_default/tra1648_watchdog_ceiling_check.mjs` (asserts the bracket
+      # against the LIVE plan and the RUNNING process, not against this file).
+      - key: WATCHDOG_RSS_MAX_MB
+        value: "3400"
       # TRA-713 — persistent live-equity boot-arm (board-ratified approval
       # 979c77c1). FIX for "prod equity Live reverts to demo on restart": the
       # original arm lived only in the running engine's in-memory `mode`, so every
